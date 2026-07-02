@@ -1,0 +1,25 @@
+# Agent/harness (host-specific)
+.claude
+.mcp.json
+.serena/
+
+# Godot
+godot/.godot/
+godot/.import/
+*.import.log
+
+# Build outputs
+build/
+dist/
+*.pck
+*.wasm.map
+
+# Engine build caches / heavy artifacts
+docker/engine/cache/
+docker/engine/templates/*.zip
+.emscripten_cache/
+
+# Node / misc
+node_modules/
+*.log
+.DS_Store

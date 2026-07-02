@@ -14,9 +14,10 @@ dist/
 *.pck
 *.wasm.map
 
-# Engine build caches / heavy artifacts
+# Engine build caches / heavy artifacts (rebuildable via scripts/build.sh)
 docker/engine/cache/
 docker/engine/templates/*.zip
+docker/engine/bin/
 .emscripten_cache/
 
 # Node / misc

@@ -1,0 +1,7 @@
+VOXIVERSE engine build
+date            : 2026-07-02T21:35:51Z
+godot_ref       : 4.4.1-stable (49a5bc7b616bd04689a2c89e89bda41f50241464)
+godot_voxel_ref : v1.4.1 (903d1fb3ee6e06df4c3bf52bb9e035f3a83a245c)
+emcc            : emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 3.1.64 (a1fe3902bf73a3802eae0357d273d0e37ea79898)
+module_in_web   : yes
+templates       : web_debug.zip web_release.zip 

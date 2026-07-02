@@ -1,0 +1,45 @@
+; Engine configuration file.
+; VOXIVERSE — grass test environment (Godot 4.4)
+;
+; Renderer is LOCKED to the GL Compatibility backend: it is the most reliable
+; path for the Web/HTML5 export the project ships to voxiverse.game-host.org.
+
+config_version=5
+
+[application]
+
+config/name="VOXIVERSE"
+config/description="Voxel immersive simulation engine — grass test environment."
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.4", "GL Compatibility")
+config/icon="res://assets/textures/grass.png"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+; Web export: allow the canvas to grab keyboard focus on click.
+window/per_pixel_transparency/allowed=false
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+; Even, flat ambient look — no directional sun, no shadows.
+lights_and_shadows/use_physical_light_units=false
+textures/vram_compression/import_etc2_astc=true
+
+[voxel]
+
+; godot_voxel (Zylann) VoxelEngine task-pool sizing. On the web/Emscripten build
+; the pthread pool is FIXED and pre-allocated; VoxelEngine's default sizing
+; (~ratio_over_max * CPU_count) spawns more threads than the pool has, exhausting
+; it -> meshing tasks deadlock -> blank world. Pin the pool to exactly 1 thread:
+;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
+;         = clamp(floor(0.0 * ...), 1, ...) = 1
+; The world is small and static, so one mesher thread fills it quickly.
+threads/count/minimum=1
+threads/count/ratio_over_max=0.0
+threads/count/margin_below_max=0
+threads/main/time_budget_ms=12

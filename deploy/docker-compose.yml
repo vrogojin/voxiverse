@@ -1,0 +1,64 @@
+# VOXIVERSE — live deploy of the Godot web export at
+# https://voxiverse.game-host.org
+#
+# The container terminates its own TLS on :443 and self-registers with the
+# shared HAProxy (SNI SSL-passthrough) via ssl-manager. Host ports 80/443 are
+# owned by HAProxy — this service publishes NOTHING to the host.
+#
+# Bring up:   docker compose -f deploy/docker-compose.yml up -d --build
+# Redeploy:   scripts/deploy.sh   (rebuilds against the current build/web/)
+name: voxiverse
+
+services:
+  voxiverse-game:
+    container_name: voxiverse-game        # MUST be stable — HAProxy routes by this name
+    hostname: voxiverse-game              # ssl-manager registers $(hostname); keep it stable
+    image: voxiverse-game:latest
+    build:
+      context: ../docker/server
+    restart: unless-stopped
+
+    networks:
+      - haproxy-net
+
+    volumes:
+      # The Godot web export, served live. Point VOXIVERSE_WEB_ROOT at your
+      # checkout's build/web (absolute path required by Docker bind mounts).
+      - ${VOXIVERSE_WEB_ROOT:-/home/vrogojin/voxiverse/build/web}:/srv/web:ro
+      # Persist Let's Encrypt material across rebuilds/restarts so we don't
+      # re-issue (and risk rate limits) on every deploy.
+      - voxiverse-letsencrypt:/etc/letsencrypt
+
+    environment:
+      # --- ssl-manager: cert + HAProxy self-registration ---
+      SSL_DOMAIN:       voxiverse.game-host.org
+      SSL_ADMIN_EMAIL:  ${SSL_ADMIN_EMAIL:-vladimir.rogojin@blockyinnovations.com}
+      HAPROXY_HOST:     haproxy
+      HAPROXY_API_PORT: "8404"
+      SSL_HTTPS_PORT:   "443"
+      APP_HTTP_PORT:    "8080"
+      # Flip these for dry runs (avoid burning LE production limits):
+      #   SSL_STAGING=true    -> Let's Encrypt staging CA (untrusted, high limits)
+      #   SSL_TEST_MODE=true  -> self-signed, no ACME at all
+      SSL_STAGING:      ${SSL_STAGING:-false}
+      SSL_TEST_MODE:    ${SSL_TEST_MODE:-false}
+
+    expose:
+      - "80"
+      - "443"
+      - "8080"
+
+    healthcheck:
+      # -k because staging/self-signed certs are valid deploy states.
+      test: ["CMD", "curl", "-skf", "-o", "/dev/null", "https://localhost:443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+networks:
+  haproxy-net:
+    external: true
+
+volumes:
+  voxiverse-letsencrypt:

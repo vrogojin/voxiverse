@@ -1,0 +1,67 @@
+# VOXIVERSE — cross-origin-isolated static server for the Godot 4 web export.
+# Rendered from this template at container start (envsubst) so the domain and
+# ports are configurable. Only ${SSL_DOMAIN} / ${SSL_HTTPS_PORT} / ${APP_HTTP_PORT}
+# are substituted — nginx runtime vars ($uri, $host, …) are left untouched.
+
+# --- Plain HTTP upstream for the ssl-manager port-80 proxy ------------------
+# ssl-manager runs an HTTP proxy on :80 that serves ACME challenges and proxies
+# everything else to this port. We just bounce real traffic to HTTPS.
+server {
+    listen ${APP_HTTP_PORT} default_server;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+# --- HTTPS: the game ---------------------------------------------------------
+server {
+    listen ${SSL_HTTPS_PORT} ssl;
+    http2 on;
+    server_name ${SSL_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SSL_DOMAIN}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root  /srv/web;
+    index index.html;
+
+    # --- Cross-origin isolation (REQUIRED for Godot 4 threaded WASM) --------
+    # Defined once, at server scope. Locations below deliberately use only
+    # `expires`/`try_files` (never their own add_header) so these headers are
+    # inherited everywhere — nginx drops inherited add_header the moment a
+    # location declares its own.
+    add_header Cross-Origin-Opener-Policy   "same-origin"  always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin"  always;
+    add_header X-Content-Type-Options       "nosniff"      always;
+
+    # HTML entrypoints: never cache (so redeploys are picked up immediately).
+    location = / {
+        try_files /index.html =404;
+        expires -1;
+    }
+    location ~* \.html$ {
+        expires -1;
+    }
+
+    # Immutable-ish engine assets: cache hard. Godot exports use stable names,
+    # so we key cache-busting on redeploys via the short HTML TTL above.
+    location ~* \.(wasm|pck|js|mjs|worker\.js|audio\.worklet\.js|png|jpg|jpeg|svg|webp|ico|ttf|woff2?)$ {
+        expires 30d;
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # Lightweight health endpoint for local/haproxy checks.
+    location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+}

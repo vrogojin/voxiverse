@@ -60,6 +60,14 @@ func _ready() -> void:
 
 	_capture_mouse()
 
+## Set the initial facing (yaw about Y) and camera pitch. Call after the player
+## is in the tree (the camera is built in _ready).
+func set_initial_look(yaw: float, pitch: float) -> void:
+	rotation.y = yaw
+	_pitch = clampf(pitch, -1.5, 1.5)
+	if _camera != null:
+		_camera.rotation.x = _pitch
+
 func _capture_mouse() -> void:
 	# Web quirk (Godot #102209): after Esc the pointer won't re-lock unless we
 	# cycle through VISIBLE first. Harmless on desktop.

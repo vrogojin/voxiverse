@@ -57,19 +57,22 @@ static func _blade(x: float, y: float) -> float:
 	return sin(x * 0.9 + _fbm(x * 1.7, y * 0.3) * 6.0) * 0.5 + 0.5
 
 ## Build and return the grass texture as an Image.
+## High-contrast: light/dark grass patches + vertical blade streaks + fine
+## micro-detail, so texturing is clearly visible on blocky voxel faces.
 static func build_image() -> Image:
 	var img := Image.create(SIZE, SIZE, false, Image.FORMAT_RGBA8)
 	for y in SIZE:
 		for x in SIZE:
-			var n := _fbm(x, y)
-			var b := _blade(x, y)
-			var r := 46.0 + n * 40.0 - b * 14.0
-			var g := 120.0 + n * 70.0 - b * 22.0
-			var bl := 38.0 + n * 26.0 - b * 10.0
-			var tint := _value_noise(x, y, 1.0 / SIZE) - 0.5
-			r += tint * 22.0
-			g += tint * 10.0
-			bl += tint * 6.0
+			var pn := _value_noise(x, y, 2.0 / SIZE)   # light/dark patches
+			var bd := _blade(x, y)                     # vertical blades
+			var micro := _fbm(x, y)                    # fine detail
+			var l := 0.45 + 0.55 * pn
+			l *= (0.72 + 0.28 * bd)
+			l += (micro - 0.5) * 0.28
+			l = clampf(l, 0.15, 1.12)
+			var r := 30.0 + 70.0 * l
+			var g := 40.0 + 152.0 * l
+			var bl := 24.0 + 46.0 * l
 			img.set_pixel(x, y, Color(
 				clampf(r, 0, 255) / 255.0,
 				clampf(g, 0, 255) / 255.0,

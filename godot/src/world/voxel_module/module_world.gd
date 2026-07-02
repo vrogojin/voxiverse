@@ -82,10 +82,24 @@ func _configure_library(library: Object, grass_material: Material) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
+	# CRITICAL for a visible texture: give the cube a 1x1 tile atlas and point
+	# every face at tile (0,0). The default atlas_size_in_tiles is (0,0), which
+	# produces DEGENERATE UVs — every face samples a single texel and the grass
+	# reads as flat solid green. With a 1x1 atlas each face's UVs span 0..1, so
+	# the whole 64x64 grass texture shows per face.
+	if cube.has_method("set_atlas_size_in_tiles"):
+		cube.call("set_atlas_size_in_tiles", Vector2i(1, 1))
+	if cube.has_method("set_tile"):
+		for side in 6:  # VoxelBlockyModel.SIDE_* : 0..5 (all cube faces)
+			cube.call("set_tile", side, Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
 		cube.call("set_material_override", 0, grass_material)
 
 	var id: Variant = library.call("add_model", cube)
+	# bake() regenerates model geometry + UVs from the tile/atlas config; without
+	# it the UVs above never take effect.
+	if library.has_method("bake"):
+		library.call("bake")
 	if typeof(id) == TYPE_INT:
 		return id
 	# Fallback: derive from the models array (cube is the last entry).

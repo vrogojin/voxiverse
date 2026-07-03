@@ -163,14 +163,21 @@ func _move(delta: float) -> void:
 	# up requires a JUMP (intended — no auto-step).
 	var feet_y := global_position.y
 	var delta_move := wish * speed * delta
-	if delta_move.x != 0.0 and world.blocked(
-			global_position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x,
-			global_position.z, feet_y):
-		delta_move.x = 0.0
-	if delta_move.z != 0.0 and world.blocked(
-			global_position.x,
-			global_position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z, feet_y):
-		delta_move.z = 0.0
+	# Test each axis at the leading edge, AND at both perpendicular corners of the
+	# capsule (± radius), so a wall touching only one corner (or reached by a
+	# diagonal move) still stops us instead of letting the capsule clip through it.
+	if delta_move.x != 0.0:
+		var lead_x := global_position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x
+		if world.blocked(lead_x, global_position.z, feet_y) \
+				or world.blocked(lead_x, global_position.z - PLAYER_RADIUS, feet_y) \
+				or world.blocked(lead_x, global_position.z + PLAYER_RADIUS, feet_y):
+			delta_move.x = 0.0
+	if delta_move.z != 0.0:
+		var lead_z := global_position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z
+		if world.blocked(global_position.x, lead_z, feet_y) \
+				or world.blocked(global_position.x - PLAYER_RADIUS, lead_z, feet_y) \
+				or world.blocked(global_position.x + PLAYER_RADIUS, lead_z, feet_y):
+			delta_move.z = 0.0
 	# The surviving delta goes THROUGH the physics engine so we still collide with the
 	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces also
 	# block us, but _push_bodies shoves them aside so we advance). One slide pass lets

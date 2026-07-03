@@ -161,17 +161,28 @@ func _collapse_unsupported(center: Vector3i) -> void:
 		xi += 1
 	var y_lo := y_lo_top - 2
 
-	# Flood support up from every solid seed on the bottom row.
+	# Seed support from every solid cell on the region BOUNDARY shell — the bottom
+	# row (deep bulk) AND the 4 side faces. A cell touching a side face connects to
+	# untouched terrain OUTSIDE the search box, which we conservatively treat as
+	# supported. Seeding only the bottom row would wrongly flag a shelf propped from
+	# outside the box as floating and carve it away; biasing toward "supported" at
+	# the boundary means we never destroy genuinely-supported terrain (a floater
+	# from the dig sits near the box CENTRE, so it is still detected).
 	var supported: Dictionary = {}
 	var stack: Array[Vector3i] = []
 	xi = x0
 	while xi <= x1:
 		var zi := z0
 		while zi <= z1:
-			var seed := Vector3i(xi, y_lo, zi)
-			if _cell_solid(seed):
-				supported[seed] = true
-				stack.append(seed)
+			var on_boundary := xi == x0 or xi == x1 or zi == z0 or zi == z1
+			var y := y_lo
+			while y <= y_hi:
+				if (on_boundary or y == y_lo) and _cell_solid(Vector3i(xi, y, zi)):
+					var seed := Vector3i(xi, y, zi)
+					if not supported.has(seed):
+						supported[seed] = true
+						stack.append(seed)
+				y += 1
 			zi += 1
 		xi += 1
 	while not stack.is_empty():
@@ -224,7 +235,9 @@ func _collapse_unsupported(center: Vector3i) -> void:
 		for c: Vector3i in comp:
 			_removed[c] = true
 			_carve_cell(c)
-		VoxelBody.spawn_loose(self, comp, GrassMaterial.build(), self)
+		# Reuse the shared grass material (GrassMaterial.build() is uncached — it
+		# would alloc a material + reload the texture on every collapse).
+		VoxelBody.spawn_loose(self, comp, _grass_material, self)
 
 # --- analytic world queries (path-agnostic) ------------------------------------
 

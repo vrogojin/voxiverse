@@ -47,8 +47,7 @@ func _setup_environment() -> void:
 	# render edge, so the terrain boundary at 256 is hidden and the horizon reads
 	# as haze. A ground-level player is IMMERSED in the world, so fog must be
 	# distance-based (crisp nearby, dissolving far) — NOT a dense low-altitude
-	# "sea", which would wash out the grass right at the player's feet. Distant
-	# snow-capped peaks (~150 blocks out) show through as pale, hazed silhouettes.
+	# "sea", which would wash out the grass right at the player's feet.
 	var r := float(TerrainConfig.RENDER_RADIUS_BLOCKS)
 	env.fog_enabled = true
 	env.fog_mode = Environment.FOG_MODE_DEPTH

@@ -17,7 +17,6 @@ var materials: MaterialRegistry
 var using_module: bool = false
 
 var _grass_material: StandardMaterial3D
-var _snow_material: StandardMaterial3D
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
@@ -32,7 +31,6 @@ func _ready() -> void:
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
 	_grass_material = GrassMaterial.build()
-	_snow_material = GrassMaterial.build_snow()
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -58,7 +56,7 @@ func _setup_module_path() -> void:
 		return
 	var world := script.new() as Node3D
 	add_child(world)
-	if world.call("setup", _grass_material, _snow_material):
+	if world.call("setup", _grass_material):
 		_module_world = world
 		using_module = true
 	else:
@@ -68,7 +66,7 @@ func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
 	_streamer.name = "ChunkStreamer"
 	add_child(_streamer)
-	_streamer.setup(_grass_material, _snow_material, self)
+	_streamer.setup(_grass_material, self)
 
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:

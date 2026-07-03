@@ -25,7 +25,7 @@ var _terrain: Node3D
 var _viewer: Node
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
-func setup(grass_material: Material, snow_material: Material) -> bool:
+func setup(grass_material: Material) -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
 		return false
 
@@ -38,7 +38,7 @@ func setup(grass_material: Material, snow_material: Material) -> bool:
 	if library == null or mesher == null:
 		return false
 
-	if not _configure_library(library, grass_material, snow_material):
+	if not _configure_library(library, grass_material):
 		return false
 
 	var generator: Object = _make_generator()
@@ -59,8 +59,8 @@ func setup(grass_material: Material, snow_material: Material) -> bool:
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)
-	# NOTE: no terrain-wide material_override — that would mask the per-model snow
-	# material. Each block model (grass id 1, snow id 2) carries its own material.
+	# The grass block model (id 1) carries its own material; no terrain-wide
+	# material_override needed.
 	add_child(_terrain)
 	return true
 
@@ -92,21 +92,20 @@ func attach_viewer(player: Node3D) -> void:
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
 
-## Build the library: air=0, grass cube=1, snow cube=2. Returns true on success.
-func _configure_library(library: Object, grass_material: Material, snow_material: Material) -> bool:
+## Build the library: air=0, grass cube=1. Returns true on success.
+func _configure_library(library: Object, grass_material: Material) -> bool:
 	# Index 0 = air. Without this the first cube would land at id 0 (= air).
 	if ClassDB.class_exists("VoxelBlockyModelEmpty"):
 		library.call("add_model", ClassDB.instantiate("VoxelBlockyModelEmpty"))
 
 	var grass_id: int = _add_cube(library, grass_material)
-	var snow_id: int = _add_cube(library, snow_material)
 	# bake() regenerates model geometry + UVs from the tile/atlas config; without
 	# it the tile/atlas UV setup below never takes effect.
 	if library.has_method("bake"):
 		library.call("bake")
 
-	# The generator writes SurfaceModel ids; the library order must match them.
-	return grass_id == SurfaceModel.GRASS_ID and snow_id == SurfaceModel.SNOW_ID
+	# The generator writes SurfaceModel's grass id; the library order must match.
+	return grass_id == SurfaceModel.GRASS_ID
 
 ## Add one textured cube model, returning its library id.
 func _add_cube(library: Object, material: Material) -> int:
@@ -131,9 +130,8 @@ func _add_cube(library: Object, material: Material) -> int:
 	return ((models as Array).size() - 1) if models is Array else -1
 
 ## Compile the VoxelGeneratorScript subclass at runtime (see header for why it
-## can't be a normal committed script). Fills grass below the shared heightmap
-## and the temperature-chosen surface block (grass/snow) on top, so it matches
-## the fallback exactly. The surface choice runs through SurfaceModel.
+## can't be a normal committed script). Fills grass at and below the shared
+## heightmap, air above — matching the fallback exactly.
 func _make_generator() -> Object:
 	var src := """
 extends VoxelGeneratorScript
@@ -166,20 +164,17 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Whole block above every surface -> all air (leave buffer default 0).
 	if oy > max_h:
 		return
-	# Whole block strictly below every surface -> all solid grass (fast path,
-	# no surface voxel here so no snow).
+	# Whole block strictly below every surface -> all solid grass (fast path).
 	if (oy + size.y) <= min_h:
 		buffer.fill(grass_id, ch)
 		return
-	# Mixed: grass below the surface, the temperature-chosen block on top.
+	# Mixed: grass at and below the surface, air above.
 	for z in range(size.z):
 		for x in range(size.x):
 			var h = heights[z * size.x + x]
-			var surface_id = SurfaceModel.block_id_at(ox + x, oz + z)
 			var top = clampi(h - oy + 1, 0, size.y)
 			for y in range(top):
-				var wy = oy + y
-				buffer.set_voxel(surface_id if wy == h else grass_id, x, y, z, ch)
+				buffer.set_voxel(grass_id, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
 	gen_script.source_code = src

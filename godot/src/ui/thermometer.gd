@@ -56,8 +56,9 @@ func _process(_delta: float) -> void:
 	if aimed.get("hit", false):
 		var v: Vector3i = aimed["voxel"]
 		var vt := env.temperature(Vector3(v.x + 0.5, v.y + 0.5, v.z + 0.5))
-		# Name the surface material at the aimed column via the same state machine.
-		var mat_name := "snow" if SurfaceModel.block_id_at(v.x, v.z) == SurfaceModel.SNOW_ID else "grass"
+		# The ground surface is a single material today (grass); block_id_at routes
+		# through the material framework so more surface states would show here.
+		var mat_name := "grass" if SurfaceModel.block_id_at(v.x, v.z) == SurfaceModel.GRASS_ID else "?"
 		aim_txt = "aim: %s %s  %.1f °C" % [mat_name, str(v), vt]
 	var mode := "FLY" if player.flying else "WALK"
 	_info_label.text = "%s | %s\nWASD move  Shift run  Space jump  F fly  Esc free" % [mode, aim_txt]

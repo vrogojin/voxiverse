@@ -32,11 +32,11 @@ are independent: rendering reads only the look, simulation reads only the physic
 the current state's transitions in order and returns the first one whose
 condition fires (`VoxelStateTransition.is_triggered`), else the current state.
 
-`grass` ships as a single static state `default` (unbreakable: `break_force =
-INF`) with **no** transitions, so it never changes — but the mechanism runs for
-it every frame like any other material. `material_registry.gd` includes a
-commented, ready-to-uncomment example of a temperature-driven `grass -> frosted`
-transition to show exactly how ice/water/steam-style materials will be authored.
+The ground `surface` material (`sim/surface_model.gd`) ships as a single state
+`grass` (unbreakable: `break_force = INF`) with **no** transitions, so it never
+changes — but `block_id_at` still resolves it through the material framework, so
+adding more surface states (mud, sand, ice, …) and temperature/light/current
+transitions is a pure data change here, with no mesher or HUD edits.
 
 ## 3. Per-voxel environment fields
 
@@ -59,20 +59,18 @@ stubs ready to be fleshed out:
 
 ## 4. Temperature model (the formula)
 
-Air temperature varies with **altitude** via an atmospheric lapse rate (warm at
-sea level, cold on the peaks — this is what drives the snow caps in §7). Ground
-uses a surface/depth model whose surface tracks the LOCAL air temperature at that
-column's height, then relaxes exponentially toward a stable subsurface value with
-depth.
+Air is a **uniform 21.5 °C** (DESIGN §1). Ground uses a surface/depth model: the
+exposed surface sits a touch above air (sun-warmed), then relaxes exponentially
+toward a stable subsurface value with depth.
 
 ```
-air(y)         = T_SEA_LEVEL - LAPSE_RATE * y        (y in blocks/metres)
+air                                    = T_AIR
 
 cell is air (cell_y > surface_y):
-    T = air(cell_y)
+    T = T_AIR
 
 cell is ground (depth = surface_y - cell_y >= 0):
-    T_surface = air(surface_y) + SURFACE_OFFSET
+    T_surface = T_AIR + SURFACE_OFFSET
     T = T_DEEP + (T_surface - T_DEEP) * exp(-depth / DECAY_DEPTH)
 ```
 
@@ -80,21 +78,19 @@ with the constants (in `per_voxel_environment.gd`):
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `T_SEA_LEVEL` | 21.5 °C | air temperature at `y = 0` (DESIGN §1) |
-| `LAPSE_RATE` | 2.2 °C/block | air-temperature drop per block of altitude |
-| `SURFACE_OFFSET` | +1.5 °C | sun-warmed surface sits this much above local air |
+| `T_AIR` | 21.5 °C | uniform air temperature (DESIGN §1) |
+| `SURFACE_OFFSET` | +1.5 °C | sun-warmed exposed surface sits this much above air |
 | `T_DEEP` | 12.0 °C | stable subsurface temperature the deep ground trends to |
 | `DECAY_DEPTH` | 4.0 m | e-folding depth of the exponential relaxation |
 
-`LAPSE_RATE` is **exaggerated for gameplay**: this world's terrain tops out near
-~19 blocks, so a realistic lapse (~0.0065 °C/m) would never freeze. At 2.2 °C
-per block the snow line (surface ≤ 0 °C) sits around y ≈ 11 — the top ~15-20% of
-hills — and peaks are clearly sub-zero, so the thermometer visibly changes as the
-player climbs or descends. The HUD's **Air temp** and **Ground temp** read this
-model directly (no special-casing).
+The HUD's **Air temp** and **Ground temp** read this model directly (no
+special-casing). Verified headlessly with Godot 4.4: air = 21.5 °C everywhere;
+exposed ground surface = 23.0 °C; deep ground trends to 12.0 °C.
 
-Verified headlessly with Godot 4.4: air(0)=21.5, air(10)=-0.5, air(19)=-20.3;
-ground surface at y=8 = 5.4 °C; snow covers ~24% of the terrain.
+> An earlier iteration made air fall with altitude (a lapse rate) to drive
+> temperature-based snow caps on tall mountains. The mountains were removed for
+> the physics sandbox (terrain is now gentle, shallow hills), so the lapse rate
+> and the snow state were dropped and air returned to a uniform value.
 
 ## 5. Light model
 
@@ -108,39 +104,26 @@ depth  > 0:  light = exp(-depth / LIGHT_DEPTH)      LIGHT_DEPTH = 1.5 m
 
 Normalised to `[0, 1]`. (Verified: air = 1.0, 5 m deep = 0.036.)
 
-## 6. Snow caps — the environment→state→look triad
+## 6. The surface material (single state today)
 
-Snow caps are the first end-to-end use of the core triad: a per-voxel
-environment field drives a material state transition that yields a distinct look.
-
-`SurfaceModel` (`sim/surface_model.gd`) owns one ground **surface** material with
-two states — `grass` (default) and `snow` — carrying full physics/look and a
-`block_id` (air=0, grass=1, snow=2). Temperature transitions connect them:
-
-```
-grass --(temperature <= 0 °C)--> snow
-snow  --(temperature >  0 °C)--> grass
-```
-
-`SurfaceModel.block_id_at(x, z)` samples the environment at the column's surface
-voxel and runs `VoxelMaterialDef.resolve_state(...)` — the SAME state machine
-from §2 — to decide the surface block. There is no ad-hoc `if` in any mesher.
+`SurfaceModel` (`sim/surface_model.gd`) owns one ground **surface** material.
+Today it ships a single state — `grass` (block id: air=0, grass=1) — so the world
+is uniformly grass, but the decision still runs through the material framework:
+`SurfaceModel.block_id_at(x, z)` returns the material's default-state `block_id`
+via the §2 machinery, so there is no ad-hoc `if` in any mesher.
 
 Both rendering paths call this one function, so they always agree:
-* **godot_voxel path** — the generator writes `block_id_at` for the top voxel and
-  grass below; the blocky library has cube models at ids 1 (grass) and 2 (snow),
-  each with its own material (atlas `(1,1)` + per-face tile `(0,0)` + `bake()` so
-  UVs span 0..1 — see the degenerate-UV note in the code).
-* **GDScript fallback** — `ChunkMesher` greedy-merges top faces by (height,
-  surface id) and routes the top block's faces to the grass/snow surface, deeper
-  walls to grass.
+* **godot_voxel path** — the generator fills grass at and below the heightmap,
+  air above; the blocky library has cube models at id 0 (air) and 1 (grass), the
+  grass cube carrying its own material (atlas `(1,1)` + per-face tile `(0,0)` +
+  `bake()` so UVs span 0..1 — see the degenerate-UV note in the code).
+* **GDScript fallback** — `ChunkMesher` greedy-merges top faces by height and
+  emits one grass wall per downward step.
 
-Verified headlessly on the module binary: warm column (h=8) → surface id 1
-(grass), cold peak (h=17) → surface id 2 (snow) with grass beneath; library holds
-3 models; fallback chunk emits both grass and snow surfaces.
-
-Extending to more surface materials (mud, sand, ice) is just more states +
-transitions here and one more library id — no mesher or HUD changes.
+To add surface variety (mud, sand, ice, snow) you add more `VoxelState`s +
+transitions in `SurfaceModel`, one more library id, and route the mesher's
+surface faces by the resolved `block_id` — no HUD or player changes. The engine
+supported temperature-driven snow this way in an earlier iteration (see §4).
 
 ## 7. Why this extends cleanly
 

@@ -11,16 +11,14 @@ extends Node3D
 const BUILD_BUDGET := 4
 
 var _grass_material: Material
-var _snow_material: Material
 var _world: WorldManager                         # supplies effective (edited) heights
 var _radius_chunks: int
 var _center := Vector2i(2147483647, 0)          # force first update
 var _chunks := {}                                # Vector2i -> MeshInstance3D
 var _queue: Array[Vector2i] = []                 # pending builds, nearest first
 
-func setup(grass_material: Material, snow_material: Material, world: WorldManager = null) -> void:
+func setup(grass_material: Material, world: WorldManager = null) -> void:
 	_grass_material = grass_material
-	_snow_material = snow_material
 	_world = world
 	var n := TerrainConfig.CHUNK_SIZE
 	_radius_chunks = int(ceil(float(TerrainConfig.RENDER_RADIUS_BLOCKS) / n))
@@ -66,7 +64,7 @@ func _process(_delta: float) -> void:
 		built += 1
 
 func _build_chunk(key: Vector2i) -> void:
-	var mesh := ChunkMesher.build(key.x, key.y, _grass_material, _snow_material, _world)
+	var mesh := ChunkMesher.build(key.x, key.y, _grass_material, _world)
 	var inst := MeshInstance3D.new()
 	inst.name = "Chunk_%d_%d" % [key.x, key.y]
 	if mesh != null:
@@ -94,7 +92,7 @@ func _rebuild_chunk(key: Vector2i) -> void:
 	var inst: MeshInstance3D = _chunks[key]
 	if not is_instance_valid(inst):
 		return
-	inst.mesh = ChunkMesher.build(key.x, key.y, _grass_material, _snow_material, _world)
+	inst.mesh = ChunkMesher.build(key.x, key.y, _grass_material, _world)
 
 ## True once the initial ring around the player has finished building.
 func is_ready_around_player() -> bool:

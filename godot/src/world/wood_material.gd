@@ -2,7 +2,7 @@ class_name WoodMaterial
 extends RefCounted
 ## Builds the shared wooden-block material used by the physics pillars.
 ##
-## Unshaded (matching the grass/snow surfaces — flat ambient look, no sun) with a
+## Unshaded (matching the grass surface — flat ambient look, no sun) with a
 ## procedurally-generated 64x64 wood-grain texture baked at runtime into an
 ## ImageTexture. Runtime generation means there is no PNG asset to import, so this
 ## works identically headless and on the web export. UVs from the voxel-body

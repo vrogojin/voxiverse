@@ -25,20 +25,23 @@ var _terrain: Node3D
 var _viewer: Node
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
-func setup(grass_material: Material) -> bool:
+func setup(grass_material: Material, snow_material: Material) -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
 		return false
+
+	# Warm the surface state machine on THIS (main) thread before the generator
+	# runs on the voxel worker thread — avoids a lazy-init race.
+	SurfaceModel.ensure_ready()
 
 	var library: Object = ClassDB.instantiate("VoxelBlockyLibrary")
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
 	if library == null or mesher == null:
 		return false
 
-	var grass_id := _configure_library(library, grass_material)
-	if grass_id < 1:
+	if not _configure_library(library, grass_material, snow_material):
 		return false
 
-	var generator: Object = _make_generator(grass_id)
+	var generator: Object = _make_generator()
 	if generator == null:
 		return false
 
@@ -56,11 +59,24 @@ func setup(grass_material: Material) -> bool:
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)
-	# Terrain-wide override guarantees the grass texture even if a per-model
-	# material path differs; it overrides all library materials.
-	_set_if(_terrain, "material_override", grass_material)
+	# NOTE: no terrain-wide material_override — that would mask the per-model snow
+	# material. Each block model (grass id 1, snow id 2) carries its own material.
 	add_child(_terrain)
 	return true
+
+## Carve one voxel to air (block breaking). Uses the terrain's VoxelTool to set
+## the TYPE channel to 0 (the empty/air model), which triggers a local remesh.
+## Driven through strings so this file still parses without the module present.
+func remove_voxel(cell: Vector3i) -> void:
+	if _terrain == null or not _terrain.has_method("get_voxel_tool"):
+		return
+	var vt: Object = _terrain.call("get_voxel_tool")
+	if vt == null:
+		return
+	# VoxelBuffer.CHANNEL_TYPE == 0; VoxelTool.MODE_SET == 0 (default).
+	_set_if(vt, "channel", 0)
+	_set_if(vt, "mode", 0)
+	vt.call("set_voxel", cell, 0)
 
 ## Attach a VoxelViewer to the player so the terrain streams around them.
 func attach_viewer(player: Node3D) -> void:
@@ -70,53 +86,57 @@ func attach_viewer(player: Node3D) -> void:
 	if _viewer == null:
 		return
 	_set_if(_viewer, "view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	# Stretch the stream vertically so tall mountain caps load without paying for
+	# a bigger horizontal radius.
+	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
 
-## Build the library: air (empty) at id 0, grass cube at id 1. Returns grass id.
-func _configure_library(library: Object, grass_material: Material) -> int:
-	# Index 0 = air. Without this the cube would land at id 0 and render AS air.
+## Build the library: air=0, grass cube=1, snow cube=2. Returns true on success.
+func _configure_library(library: Object, grass_material: Material, snow_material: Material) -> bool:
+	# Index 0 = air. Without this the first cube would land at id 0 (= air).
 	if ClassDB.class_exists("VoxelBlockyModelEmpty"):
 		library.call("add_model", ClassDB.instantiate("VoxelBlockyModelEmpty"))
 
+	var grass_id: int = _add_cube(library, grass_material)
+	var snow_id: int = _add_cube(library, snow_material)
+	# bake() regenerates model geometry + UVs from the tile/atlas config; without
+	# it the tile/atlas UV setup below never takes effect.
+	if library.has_method("bake"):
+		library.call("bake")
+
+	# The generator writes SurfaceModel ids; the library order must match them.
+	return grass_id == SurfaceModel.GRASS_ID and snow_id == SurfaceModel.SNOW_ID
+
+## Add one textured cube model, returning its library id.
+func _add_cube(library: Object, material: Material) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
-	# CRITICAL for a visible texture: give the cube a 1x1 tile atlas and point
-	# every face at tile (0,0). The default atlas_size_in_tiles is (0,0), which
-	# produces DEGENERATE UVs — every face samples a single texel and the grass
-	# reads as flat solid green. With a 1x1 atlas each face's UVs span 0..1, so
-	# the whole 64x64 grass texture shows per face.
+	# CRITICAL for a visible texture: 1x1 tile atlas with every face at tile
+	# (0,0). The default atlas_size_in_tiles is (0,0) → DEGENERATE UVs (every
+	# face samples one texel → flat solid colour). A 1x1 atlas gives 0..1 UVs so
+	# the whole 64x64 texture shows per face.
 	if cube.has_method("set_atlas_size_in_tiles"):
 		cube.call("set_atlas_size_in_tiles", Vector2i(1, 1))
 	if cube.has_method("set_tile"):
 		for side in 6:  # VoxelBlockyModel.SIDE_* : 0..5 (all cube faces)
 			cube.call("set_tile", side, Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
-		cube.call("set_material_override", 0, grass_material)
-
+		cube.call("set_material_override", 0, material)
 	var id: Variant = library.call("add_model", cube)
-	# bake() regenerates model geometry + UVs from the tile/atlas config; without
-	# it the UVs above never take effect.
-	if library.has_method("bake"):
-		library.call("bake")
 	if typeof(id) == TYPE_INT:
 		return id
-	# Fallback: derive from the models array (cube is the last entry).
 	var models: Variant = library.get("models")
-	if models is Array and (models as Array).size() > 0:
-		return (models as Array).size() - 1
-	return 1
+	return ((models as Array).size() - 1) if models is Array else -1
 
 ## Compile the VoxelGeneratorScript subclass at runtime (see header for why it
 ## can't be a normal committed script). Fills grass below the shared heightmap
-## into CHANNEL_TYPE, so it matches the fallback exactly. `grass_id` is injected
-## so it always agrees with the library index.
-func _make_generator(grass_id: int) -> Object:
+## and the temperature-chosen surface block (grass/snow) on top, so it matches
+## the fallback exactly. The surface choice runs through SurfaceModel.
+func _make_generator() -> Object:
 	var src := """
 extends VoxelGeneratorScript
-
-var grass_id := 1
 
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
@@ -129,6 +149,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var oy = origin_in_voxels.y
 	var oz = origin_in_voxels.z
 	var ch = VoxelBuffer.CHANNEL_TYPE
+	var grass_id = SurfaceModel.GRASS_ID
 
 	# Surface heights for this block's columns, plus the block's height range.
 	var heights = []
@@ -145,16 +166,20 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Whole block above every surface -> all air (leave buffer default 0).
 	if oy > max_h:
 		return
-	# Whole block at/below every surface -> all solid grass (fast path).
-	if (oy + size.y - 1) <= min_h:
+	# Whole block strictly below every surface -> all solid grass (fast path,
+	# no surface voxel here so no snow).
+	if (oy + size.y) <= min_h:
 		buffer.fill(grass_id, ch)
 		return
-	# Mixed: fill each column up to its surface height.
+	# Mixed: grass below the surface, the temperature-chosen block on top.
 	for z in range(size.z):
 		for x in range(size.x):
-			var top = clampi(heights[z * size.x + x] - oy + 1, 0, size.y)
+			var h = heights[z * size.x + x]
+			var surface_id = SurfaceModel.block_id_at(ox + x, oz + z)
+			var top = clampi(h - oy + 1, 0, size.y)
 			for y in range(top):
-				buffer.set_voxel(grass_id, x, y, z, ch)
+				var wy = oy + y
+				buffer.set_voxel(surface_id if wy == h else grass_id, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
 	gen_script.source_code = src
@@ -162,9 +187,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	if err != OK:
 		push_warning("[module_world] generator compile failed: %d" % err)
 		return null
-	var gen: Object = gen_script.new()
-	gen.set("grass_id", grass_id)
-	return gen
+	return gen_script.new()
 
 # --- helpers -------------------------------------------------------------------
 # Set a property only if the object actually exposes it (avoids error spam if a

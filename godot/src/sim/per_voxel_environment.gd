@@ -10,20 +10,33 @@ extends RefCounted
 ## defaults as stubs, ready to be fleshed out for the full engine.
 
 # --- temperature model ---------------------------------------------------------
-# Air is the ambient/environment temperature. Ground is a simple surface/depth
-# model: the top grass block is warmed slightly above air (sun on the surface),
-# and temperature relaxes exponentially toward a stable subsurface value with
-# depth:
+# Air temperature now varies with ALTITUDE via an atmospheric lapse rate: warm at
+# sea level, cold on the peaks. This is what drives snow caps (§ SurfaceModel).
 #
-#   depth   = surface_y - voxel_y                 (0 at the top grass block)
-#   T_ground(depth) = T_DEEP + (T_SURFACE - T_DEEP) * exp(-depth / DECAY_DEPTH)
+#   air(y) = T_SEA_LEVEL - LAPSE_RATE * y          (y in blocks/metres)
 #
-# so T_ground(0) = T_SURFACE = 23.0 C and T_ground(inf) -> T_DEEP = 12.0 C.
-const T_AIR := 21.5            # ambient air temperature, deg C (DESIGN §1)
-const SURFACE_OFFSET := 1.5    # top grass sits this much above air
-const T_SURFACE := T_AIR + SURFACE_OFFSET
+# Ground uses the same surface/depth model as before, but the SURFACE tracks the
+# LOCAL air at that column's height (so high ground is cold too), then relaxes
+# exponentially toward a stable subsurface value with depth:
+#
+#   depth        = surface_y - voxel_y             (0 at the top surface block)
+#   T_surface    = air(surface_y) + SURFACE_OFFSET (sun-warmed local surface)
+#   T_ground(d)  = T_DEEP + (T_surface - T_DEEP) * exp(-d / DECAY_DEPTH)
+#
+# At sea level air = 21.5 C. LAPSE_RATE is calibrated so air crosses 0 C at
+# y ~= 200 (21.5 / 0.1075 ~= 200) — snow therefore appears only on the genuinely
+# high, 200+ mountain peaks (the surface freezes, with the +1.5 offset, a touch
+# above y = 200). The thermometer reads ~21.5 at sea level and drops smoothly to
+# sub-zero on the peaks.
+const T_SEA_LEVEL := 21.5      # air temperature at y = 0, deg C (DESIGN §1)
+const LAPSE_RATE := 0.1075     # air temperature drop per block of altitude, deg C
+const SURFACE_OFFSET := 1.5    # sun-warmed surface sits this much above local air
 const T_DEEP := 12.0           # stable subsurface temperature, deg C
 const DECAY_DEPTH := 4.0       # e-folding depth, metres
+
+## Air temperature at altitude y (blocks). Public so SurfaceModel/HUD can reuse.
+static func air_temperature(y: float) -> float:
+	return T_SEA_LEVEL - LAPSE_RATE * y
 
 # --- light model ---------------------------------------------------------------
 # Air and the exposed surface block are fully lit (1.0); light attenuates
@@ -48,10 +61,15 @@ static func _depth(c: Vector3i) -> int:
 
 ## Temperature in degrees Celsius at the voxel containing `pos`.
 func temperature(pos: Vector3) -> float:
-	var d := _depth(_cell(pos))
-	if d < 0:
-		return T_AIR
-	return T_DEEP + (T_SURFACE - T_DEEP) * exp(-float(d) / DECAY_DEPTH)
+	var c := _cell(pos)
+	var surface := TerrainConfig.height_at(c.x, c.z)
+	if c.y > surface:                          # air voxel
+		return air_temperature(float(c.y))
+	# Ground: surface tracks LOCAL air at this column's height, then relaxes to
+	# the stable subsurface temperature with depth.
+	var depth := surface - c.y
+	var t_surface := air_temperature(float(surface)) + SURFACE_OFFSET
+	return T_DEEP + (t_surface - T_DEEP) * exp(-float(depth) / DECAY_DEPTH)
 
 ## Normalised light level [0..1] at the voxel containing `pos`.
 func light(pos: Vector3) -> float:

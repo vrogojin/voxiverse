@@ -7,6 +7,10 @@ extends Resource
 ## the two never need to know about each other.
 
 @export var state_name: StringName = &"default"
+## Mesher/library block id for this state's LOOK (air=0, grass=1, snow=2, …).
+## Lets the state machine's output map straight onto a voxel block id, shared by
+## the godot_voxel library and the GDScript fallback. -1 = unset.
+@export var block_id: int = -1
 
 @export_group("Physics")
 ## Mass of one voxel of this state, in kilograms (1 m^3 cell).

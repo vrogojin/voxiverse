@@ -10,14 +10,18 @@ extends Node3D
 ## Chunks meshed per frame while catching up. Keeps frame time bounded.
 const BUILD_BUDGET := 4
 
-var _material: Material
+var _grass_material: Material
+var _snow_material: Material
+var _world: WorldManager                         # supplies effective (edited) heights
 var _radius_chunks: int
 var _center := Vector2i(2147483647, 0)          # force first update
 var _chunks := {}                                # Vector2i -> MeshInstance3D
 var _queue: Array[Vector2i] = []                 # pending builds, nearest first
 
-func setup(material: Material) -> void:
-	_material = material
+func setup(grass_material: Material, snow_material: Material, world: WorldManager = null) -> void:
+	_grass_material = grass_material
+	_snow_material = snow_material
+	_world = world
 	var n := TerrainConfig.CHUNK_SIZE
 	_radius_chunks = int(ceil(float(TerrainConfig.RENDER_RADIUS_BLOCKS) / n))
 
@@ -62,13 +66,35 @@ func _process(_delta: float) -> void:
 		built += 1
 
 func _build_chunk(key: Vector2i) -> void:
-	var mesh := ChunkMesher.build(key.x, key.y, _material)
+	var mesh := ChunkMesher.build(key.x, key.y, _grass_material, _snow_material, _world)
 	var inst := MeshInstance3D.new()
 	inst.name = "Chunk_%d_%d" % [key.x, key.y]
 	if mesh != null:
 		inst.mesh = mesh
 	add_child(inst)
 	_chunks[key] = inst
+
+## Rebuild the chunk(s) touched by an edit at world `cell`. Removing a block lowers
+## a column, which also changes the exposed side faces of neighbouring columns, so
+## rebuild the neighbour chunk too when the cell sits on a chunk border.
+func remesh_cell(cell: Vector3i) -> void:
+	var n := TerrainConfig.CHUNK_SIZE
+	var base := Vector2i(floori(float(cell.x) / n), floori(float(cell.z) / n))
+	_rebuild_chunk(base)
+	var lx := posmod(cell.x, n)
+	var lz := posmod(cell.z, n)
+	if lx == 0: _rebuild_chunk(base + Vector2i(-1, 0))
+	if lx == n - 1: _rebuild_chunk(base + Vector2i(1, 0))
+	if lz == 0: _rebuild_chunk(base + Vector2i(0, -1))
+	if lz == n - 1: _rebuild_chunk(base + Vector2i(0, 1))
+
+func _rebuild_chunk(key: Vector2i) -> void:
+	if not _chunks.has(key):
+		return
+	var inst: MeshInstance3D = _chunks[key]
+	if not is_instance_valid(inst):
+		return
+	inst.mesh = ChunkMesher.build(key.x, key.y, _grass_material, _snow_material, _world)
 
 ## True once the initial ring around the player has finished building.
 func is_ready_around_player() -> bool:

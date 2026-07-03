@@ -59,41 +59,42 @@ stubs ready to be fleshed out:
 
 ## 4. Temperature model (the formula)
 
-Air is the ambient environment temperature. Ground uses a simple surface/depth
-model: the exposed top grass block is warmed slightly above air (sun on the
-surface), and temperature relaxes exponentially toward a stable subsurface value
-as depth increases.
-
-Let `surface_y = height_at(x, z)` (the y of the topmost grass block) and, for a
-solid cell, `depth = surface_y - cell_y` (0 at the top block, increasing
-downward). Then:
+Air temperature varies with **altitude** via an atmospheric lapse rate (warm at
+sea level, cold on the peaks — this is what drives the snow caps in §7). Ground
+uses a surface/depth model whose surface tracks the LOCAL air temperature at that
+column's height, then relaxes exponentially toward a stable subsurface value with
+depth.
 
 ```
-depth < 0  (cell is air, at/above surface):
-    T = T_AIR = 21.5 °C
+air(y)         = T_SEA_LEVEL - LAPSE_RATE * y        (y in blocks/metres)
 
-depth >= 0 (cell is grass/ground):
-    T = T_DEEP + (T_SURFACE - T_DEEP) * exp(-depth / DECAY_DEPTH)
+cell is air (cell_y > surface_y):
+    T = air(cell_y)
+
+cell is ground (depth = surface_y - cell_y >= 0):
+    T_surface = air(surface_y) + SURFACE_OFFSET
+    T = T_DEEP + (T_surface - T_DEEP) * exp(-depth / DECAY_DEPTH)
 ```
 
 with the constants (in `per_voxel_environment.gd`):
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `T_AIR` | 21.5 °C | ambient air temperature (DESIGN §1) |
-| `SURFACE_OFFSET` | +1.5 °C | how much the sun-warmed top grass sits above air |
-| `T_SURFACE` | 23.0 °C | `T_AIR + SURFACE_OFFSET`, the temperature at `depth = 0` |
+| `T_SEA_LEVEL` | 21.5 °C | air temperature at `y = 0` (DESIGN §1) |
+| `LAPSE_RATE` | 2.2 °C/block | air-temperature drop per block of altitude |
+| `SURFACE_OFFSET` | +1.5 °C | sun-warmed surface sits this much above local air |
 | `T_DEEP` | 12.0 °C | stable subsurface temperature the deep ground trends to |
 | `DECAY_DEPTH` | 4.0 m | e-folding depth of the exponential relaxation |
 
-Properties: continuous and monotonic in depth; `T_ground(0) = 23.0 °C`,
-`T_ground(∞) → 12.0 °C`. The thermometer's **Air temp** reads the air voxel at
-the player's head (always 21.5 °C) and **Ground temp** reads the grass voxel
-directly under the player's feet (≈ 23.0 °C at the surface) — both through this
-model, with no special-casing in the HUD.
+`LAPSE_RATE` is **exaggerated for gameplay**: this world's terrain tops out near
+~19 blocks, so a realistic lapse (~0.0065 °C/m) would never freeze. At 2.2 °C
+per block the snow line (surface ≤ 0 °C) sits around y ≈ 11 — the top ~15-20% of
+hills — and peaks are clearly sub-zero, so the thermometer visibly changes as the
+player climbs or descends. The HUD's **Air temp** and **Ground temp** read this
+model directly (no special-casing).
 
-Verified headlessly with Godot 4.4: air = 21.5, surface = 23.0, and a cell 20 m
-down = 12.07 °C.
+Verified headlessly with Godot 4.4: air(0)=21.5, air(10)=-0.5, air(19)=-20.3;
+ground surface at y=8 = 5.4 °C; snow covers ~24% of the terrain.
 
 ## 5. Light model
 
@@ -107,7 +108,41 @@ depth  > 0:  light = exp(-depth / LIGHT_DEPTH)      LIGHT_DEPTH = 1.5 m
 
 Normalised to `[0, 1]`. (Verified: air = 1.0, 5 m deep = 0.036.)
 
-## 6. Why this extends cleanly
+## 6. Snow caps — the environment→state→look triad
+
+Snow caps are the first end-to-end use of the core triad: a per-voxel
+environment field drives a material state transition that yields a distinct look.
+
+`SurfaceModel` (`sim/surface_model.gd`) owns one ground **surface** material with
+two states — `grass` (default) and `snow` — carrying full physics/look and a
+`block_id` (air=0, grass=1, snow=2). Temperature transitions connect them:
+
+```
+grass --(temperature <= 0 °C)--> snow
+snow  --(temperature >  0 °C)--> grass
+```
+
+`SurfaceModel.block_id_at(x, z)` samples the environment at the column's surface
+voxel and runs `VoxelMaterialDef.resolve_state(...)` — the SAME state machine
+from §2 — to decide the surface block. There is no ad-hoc `if` in any mesher.
+
+Both rendering paths call this one function, so they always agree:
+* **godot_voxel path** — the generator writes `block_id_at` for the top voxel and
+  grass below; the blocky library has cube models at ids 1 (grass) and 2 (snow),
+  each with its own material (atlas `(1,1)` + per-face tile `(0,0)` + `bake()` so
+  UVs span 0..1 — see the degenerate-UV note in the code).
+* **GDScript fallback** — `ChunkMesher` greedy-merges top faces by (height,
+  surface id) and routes the top block's faces to the grass/snow surface, deeper
+  walls to grass.
+
+Verified headlessly on the module binary: warm column (h=8) → surface id 1
+(grass), cold peak (h=17) → surface id 2 (snow) with grass beneath; library holds
+3 models; fallback chunk emits both grass and snow surfaces.
+
+Extending to more surface materials (mud, sand, ice) is just more states +
+transitions here and one more library id — no mesher or HUD changes.
+
+## 7. Why this extends cleanly
 
 The full engine (DESIGN §8) wants multi-material voxels, richer state machines
 (ice ↔ water ↔ steam driven by temperature/light/current), and more fields. That

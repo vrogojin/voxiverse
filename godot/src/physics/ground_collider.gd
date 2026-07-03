@@ -1,52 +1,49 @@
 class_name GroundCollider
 extends StaticBody3D
 ## Physics collision for the terrain around the player, so voxel bodies (falling /
-## pushed wooden blocks) rest on and collide with the ground. The rendered terrain
+## pushed blocks) rest on and collide with the ground. The rendered terrain
 ## (godot_voxel or the GDScript fallback) has no colliders — the player moves and
 ## raycasts analytically — so this is the ONE piece of real terrain collision,
-## kept small and local for cheapness.
+## kept small and local for cheapness. The player never touches it (its movement
+## is analytic); it exists purely for the rigid bodies.
 ##
-## It is a single HeightMapShape3D covering a square region centred on the player.
-## We deliberately use a heightfield, NOT a per-quad trimesh: a ConcavePolygonShape
-## built from thousands of 1x1 quads has an "internal edge" problem — resting
-## bodies fall through the seams between triangles. A HeightMapShape is a single
-## seam-free surface, so pieces rest on it reliably. Sample heights come from
-## WorldManager.effective_height (the noise heightmap MINUS blocks the player has
-## broken), so a dug-out pit becomes a dip a block can settle into.
+## It is a TRUE VOXEL collider: for every column in a region around the player we
+## emit one box per CONTIGUOUS RUN of solid, non-broken cells. A plain column is a
+## single tall box; a column with a horizontal tunnel dug through it becomes TWO
+## boxes (floor run + ceiling run) with a real air gap between — so a block dropped
+## over a tunnel falls INTO it instead of resting on a phantom shelf. (An earlier
+## HeightMapShape stored one height per column and physically could not represent a
+## tunnel; a per-quad trimesh hits Godot's "internal edge" fall-through bug. Convex
+## boxes avoid both problems.)
 ##
-## Trade-off: a heightfield interpolates smoothly between samples, so tall steps
-## read as short ramps rather than crisp voxel walls. On the gentle shallow hills
-## this is invisible (the collider is not drawn) and worth it for rock-solid
-## resting. The player never touches this collider (its movement is analytic); it
-## exists purely for the wooden bodies.
+## Shapes are attached directly to the body via PhysicsServer3D (one shared body,
+## no per-box nodes) so rebuilds — on an 8-block move or a terrain edit — stay
+## cheap even though there are ~R² boxes.
 
-const REGION := 65            # heightmap sample grid is REGION x REGION (odd -> centred)
-const HALF := (REGION - 1) / 2
+const R := 14                # region half-extent in columns (covers +/-14 blocks)
 const REBUILD_DIST := 8       # rebuild once the player drifts this far from centre
+const DEPTH := 32             # emit solid this far below the region's lowest surface
 
 const GROUND_FRICTION := 0.6  # grippy enough that dropped pieces rest, not slide
 const GROUND_BOUNCE := 0.0    # no bouncing off the terrain
 
 var world: WorldManager
-var _shape: HeightMapShape3D
 var _center := Vector2i(0x7fffffff, 0)   # force first build
+# Pool of box shapes reused across rebuilds (resized in place) so a rebuild does
+# no allocation — only PhysicsServer re-attach. Grows to the peak box count.
+var _pool: Array[BoxShape3D] = []
+var _used := 0                            # boxes attached this rebuild
 
 func setup(world_ref: WorldManager) -> void:
 	world = world_ref
 	collision_layer = 1 << 0    # terrain ground layer
 	collision_mask = 0          # static; it does not need to detect anything
-	# No-bounce, medium-friction ground so dropped voxel pieces come to rest and
-	# don't slide or bounce weirdly on impact.
+	# The body stays at the origin; box transforms carry absolute world positions.
+	global_position = Vector3.ZERO
 	var pm := PhysicsMaterial.new()
 	pm.friction = GROUND_FRICTION
 	pm.bounce = GROUND_BOUNCE
 	physics_material_override = pm
-	_shape = HeightMapShape3D.new()
-	_shape.map_width = REGION
-	_shape.map_depth = REGION
-	var cs := CollisionShape3D.new()
-	cs.shape = _shape
-	add_child(cs)
 
 ## Follow the player; rebuild when they cross out of the current region's core.
 func update(player_pos: Vector3) -> void:
@@ -64,16 +61,59 @@ func rebuild_now() -> void:
 func _rebuild() -> void:
 	if world == null:
 		return
-	# The heightfield is centred on the body origin, samples spaced 1 unit apart.
-	# Place the body at the integer centre column so every grid vertex lands on an
-	# integer world column, and fill each vertex with that column's walkable top
-	# (effective height + 1). Body y stays 0, so stored heights ARE world y.
-	global_position = Vector3(float(_center.x), 0.0, float(_center.y))
-	var data := PackedFloat32Array()
-	data.resize(REGION * REGION)
-	for j in REGION:
-		var wz := _center.y + j - HALF
-		for i in REGION:
-			var wx := _center.x + i - HALF
-			data[j * REGION + i] = float(world.effective_height(wx, wz) + 1)
-	_shape.map_data = data
+	var rid := get_rid()
+	PhysicsServer3D.body_clear_shapes(rid)
+	_used = 0
+
+	var span := 2 * R + 1
+	var x0 := _center.x - R
+	var z0 := _center.y - R
+
+	# Cache column heights once (height_at re-evaluates noise, so don't call twice)
+	# and find the lowest surface → how deep to make the solid floor.
+	var heights := PackedInt32Array()
+	heights.resize(span * span)
+	var min_h := 0x7fffffff
+	for i in span:
+		for j in span:
+			var h := TerrainConfig.height_at(x0 + i, z0 + j)
+			heights[i * span + j] = h
+			if h < min_h:
+				min_h = h
+	var y_lo := min_h - DEPTH
+
+	# One box per contiguous run of solid, non-broken cells in each column.
+	for i in span:
+		var x := x0 + i
+		for j in span:
+			var z := z0 + j
+			var h := heights[i * span + j]
+			var run_start := 0x7fffffff
+			var y := y_lo
+			while y <= h:
+				# y <= h ⇒ the heightmap fills this cell; it is air only if broken out.
+				if world.is_removed(Vector3i(x, y, z)):
+					if run_start != 0x7fffffff:
+						_add_box(rid, x, z, run_start, y)   # run [run_start, y-1] → [run_start, y]
+						run_start = 0x7fffffff
+				elif run_start == 0x7fffffff:
+					run_start = y
+				y += 1
+			if run_start != 0x7fffffff:
+				_add_box(rid, x, z, run_start, h + 1)       # top run up to the surface
+
+## Attach one box covering the solid cells [y_bottom, y_top-1] of column (x, z),
+## i.e. the world volume [y_bottom, y_top]. Reuses a pooled BoxShape (resized in
+## place) so a rebuild allocates nothing. Translation-only transform → no scaled
+## collision shapes.
+func _add_box(rid: RID, x: int, z: int, y_bottom: int, y_top: int) -> void:
+	var box: BoxShape3D
+	if _used < _pool.size():
+		box = _pool[_used]
+	else:
+		box = BoxShape3D.new()
+		_pool.append(box)
+	box.size = Vector3(1.0, float(y_top - y_bottom), 1.0)
+	_used += 1
+	var t := Transform3D(Basis(), Vector3(x + 0.5, (float(y_bottom) + float(y_top)) * 0.5, z + 0.5))
+	PhysicsServer3D.body_add_shape(rid, box.get_rid(), t)

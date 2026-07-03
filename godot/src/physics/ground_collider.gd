@@ -58,6 +58,14 @@ func rebuild_now() -> void:
 	if _center.x != 0x7fffffff:
 		_rebuild()
 
+## Re-attach the shapes if we re-enter the tree. Server-added shapes on a node
+## body are cleared by Godot on tree exit; if this collider is ever reparented,
+## rebuild so bodies don't fall through until the next move/edit. (First ENTER_TREE
+## runs before setup(), when world is null, so it safely no-ops then.)
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_ENTER_TREE and world != null and _center.x != 0x7fffffff:
+		_rebuild()
+
 func _rebuild() -> void:
 	if world == null:
 		return
@@ -88,8 +96,13 @@ func _rebuild() -> void:
 		for j in span:
 			var z := z0 + j
 			var h := heights[i * span + j]
-			var run_start := 0x7fffffff
+			# Start at y_lo, but if the player dug a shaft deeper than DEPTH below the
+			# region's lowest surface, descend to the true solid floor so the shaft
+			# still gets a floor box. Only deep-dug columns pay for this loop.
 			var y := y_lo
+			while world.is_removed(Vector3i(x, y, z)):
+				y -= 1
+			var run_start := 0x7fffffff
 			while y <= h:
 				# y <= h ⇒ the heightmap fills this cell; it is air only if broken out.
 				if world.is_removed(Vector3i(x, y, z)):

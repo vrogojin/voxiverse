@@ -17,9 +17,8 @@ func has(id: StringName) -> bool:
 	return _by_id.has(id)
 
 ## Build the default registry for the test environment. Registers the ground
-## `surface` material — a single data-driven material whose grass/snow states and
-## temperature transitions live in SurfaceModel (the single source of truth for
-## the environment→state→look triad). More materials register the same way.
+## `surface` material — a single data-driven material whose (currently one) grass
+## state lives in SurfaceModel. More materials/states register the same way.
 static func build_default() -> MaterialRegistry:
 	var reg := MaterialRegistry.new()
 	reg.register(SurfaceModel.material())

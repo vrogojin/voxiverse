@@ -1,6 +1,6 @@
 class_name GrassMaterial
 extends RefCounted
-## Builds the shared StandardMaterial3D surface materials (grass and snow).
+## Builds the shared grass surface StandardMaterial3D.
 ##
 ## Unshaded so the world reads as evenly, flatly lit regardless of light setup
 ## (DESIGN §1: ambient/omnidirectional only, no sun, no shadows). The albedo
@@ -8,15 +8,10 @@ extends RefCounted
 ## in world-metre units, so a 1 m voxel face shows exactly one texture tile.
 
 const TEXTURE_PATH := "res://assets/textures/grass.png"
-const SNOW_TEXTURE_PATH := "res://assets/textures/snow.png"
 
 ## Grass surface material.
 static func build() -> StandardMaterial3D:
 	return _build(TEXTURE_PATH, Color(0.30, 0.55, 0.24))
-
-## Snow surface material.
-static func build_snow() -> StandardMaterial3D:
-	return _build(SNOW_TEXTURE_PATH, Color(0.92, 0.95, 1.0))
 
 static func _build(texture_path: String, fallback_color: Color) -> StandardMaterial3D:
 	var mat := StandardMaterial3D.new()

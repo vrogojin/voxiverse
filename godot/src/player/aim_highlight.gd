@@ -2,9 +2,11 @@ class_name AimHighlight
 extends MeshInstance3D
 ## A wireframe cube outline drawn around the block the player is currently aiming
 ## at (and would break with a left-click). It reads clearly over any texture — a
-## grass voxel, a wooden face — because it is an UNSHADED line mesh rendered with
-## depth-testing disabled, so the 12 edges always show through the surface they
-## hug rather than z-fighting into it.
+## grass voxel, a wooden face — because it is an UNSHADED line mesh. It respects
+## the depth buffer like normal in-world geometry: edges on the exposed near faces
+## of the target block draw, while edges behind the block (or occluded by an
+## intervening block/pillar) are correctly hidden. The INFLATE bump lifts the 12
+## edges just proud of the block faces so they read crisply without z-fighting.
 ##
 ## The mesh is a unit cube spanning body-LOCAL [0, 1] on every axis, matching the
 ## convention that voxel cell `c` occupies the unit cube [c, c+1]. It is inflated
@@ -15,9 +17,10 @@ extends MeshInstance3D
 ## tumbling/rotating VoxelBody as faithfully as a static terrain voxel.
 
 ## How far past the unit cube the outline is pushed, per axis, around the cube
-## centre. 1.03 ≈ 1.5 cm of clearance on a 1 m block — enough to clear the face
-## without looking detached.
-const INFLATE := 1.03
+## centre. 1.06 ≈ 3 cm of clearance on a 1 m block — enough to lift the lines off
+## the coplanar block faces so depth-tested rendering shows them without z-fighting
+## shimmer, while still hugging the block closely enough to read as its outline.
+const INFLATE := 1.06
 
 func _ready() -> void:
 	# Live in world space: the player parents us but its own translation/rotation
@@ -42,7 +45,7 @@ func hide_it() -> void:
 
 ## Build the 12-edge outline of the unit cube [0,1]^3 as a PRIMITIVE_LINES mesh,
 ## inflated by INFLATE about the cube centre, with a bright unshaded material that
-## ignores depth so it is always visible.
+## respects the depth buffer so closer opaque geometry occludes it.
 func _build_wire_cube() -> ArrayMesh:
 	# Inflate each of the two corner coordinates (0 and 1) about the centre 0.5.
 	const CENTER := 0.5
@@ -76,14 +79,16 @@ func _build_wire_cube() -> ArrayMesh:
 	mesh_out.surface_set_material(0, _build_material())
 	return mesh_out
 
-## Unshaded, depth-test-disabled bright cyan so the outline shows through the
-## block it surrounds regardless of lighting or the texture underneath.
+## Unshaded bright cyan so the outline reads over any texture regardless of
+## lighting. Depth testing stays ON so the wireframe is occluded by closer opaque
+## geometry — an intervening block hides the edges behind it, exactly like normal
+## in-world geometry — while the INFLATE clearance keeps the near edges crisp.
 func _build_material() -> StandardMaterial3D:
 	var mat := StandardMaterial3D.new()
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.albedo_color = Color(0.1, 1.0, 1.0)   # bright cyan
 	mat.vertex_color_use_as_albedo = false
-	mat.no_depth_test = true                  # always visible through geometry
+	mat.no_depth_test = false                 # respect depth buffer: occluded by closer geometry
 	# Lines have no back/front; disable culling so orientation never hides an edge.
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	return mat

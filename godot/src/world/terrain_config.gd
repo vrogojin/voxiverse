@@ -15,9 +15,8 @@ extends RefCounted
 ##
 ## Shape is intentionally CALM now: gentle, open, shallow rolling hills only (the
 ## craggy mountain archipelagos were removed so the physics sandbox — falling and
-## breakable blocks — plays out on near-flat, walkable ground). Heights stay well
-## below the snowline, so the world is uniformly grass. Deterministic (fixed
-## seeds); infinite/streaming.
+## breakable blocks — plays out on near-flat, walkable ground). The world is
+## uniformly grass. Deterministic (fixed seeds); infinite/streaming.
 
 const SEED := 20260702
 

@@ -17,7 +17,6 @@ var materials: MaterialRegistry
 var using_module: bool = false
 
 var _grass_material: StandardMaterial3D
-var _snow_material: StandardMaterial3D
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
@@ -32,7 +31,6 @@ func _ready() -> void:
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
 	_grass_material = GrassMaterial.build()
-	_snow_material = GrassMaterial.build_snow()
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -58,7 +56,7 @@ func _setup_module_path() -> void:
 		return
 	var world := script.new() as Node3D
 	add_child(world)
-	if world.call("setup", _grass_material, _snow_material):
+	if world.call("setup", _grass_material):
 		_module_world = world
 		using_module = true
 	else:
@@ -68,7 +66,7 @@ func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
 	_streamer.name = "ChunkStreamer"
 	add_child(_streamer)
-	_streamer.setup(_grass_material, _snow_material, self)
+	_streamer.setup(_grass_material, self)
 
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
@@ -98,19 +96,148 @@ func effective_height(x: int, z: int) -> int:
 		h -= 1
 	return h
 
-## Break the terrain voxel at `cell`. Returns true if a solid block was removed.
-## Mirrors the edit into the active render path and refreshes ground collision.
+## Break the terrain voxel at `cell` (PLAYER-INITIATED). Returns true if a solid
+## block was removed. Mirrors the edit into the active render path, then runs a
+## local support analysis so any terrain left floating by the dig drops as loose
+## rigid bodies, and finally refreshes ground collision.
 func break_terrain(cell: Vector3i) -> bool:
 	if _removed.has(cell) or not TerrainConfig.is_solid(cell.x, cell.y, cell.z):
 		return false
 	_removed[cell] = true
+	_carve_cell(cell)
+	_collapse_unsupported(cell)   # only from the player break — never from a spawn
+	if _ground != null:
+		_ground.rebuild_now()
+	return true
+
+## Mark-free carve: remove `cell` from the active render path only (the caller owns
+## the `_removed` overlay + ground rebuild). Shared by break_terrain and the
+## collapse pass so the godot_voxel / fallback plumbing lives in one place.
+func _carve_cell(cell: Vector3i) -> void:
 	if using_module and _module_world != null:
 		_module_world.call("remove_voxel", cell)
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
-	if _ground != null:
-		_ground.rebuild_now()
-	return true
+
+# --- terrain collapse (unsupported blocks fall) --------------------------------
+
+## Half-extent of the square column region the collapse scan examines around a break.
+const _COLLAPSE_RADIUS := 5
+
+## The 6 axis neighbours, reused by the support flood-fill and the component grouping.
+const _NEIGHBORS_6: Array[Vector3i] = [
+	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
+	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
+	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
+
+## Local support analysis around a just-broken cell: any solid, non-broken terrain
+## no longer connected (through solid cells) to the always-supported bottom row
+## becomes falling rigid bodies. Cheap on the common case (flat digging undercuts
+## nothing → the flood-fill reaches every cell → zero floaters → early return).
+##
+## MUST be called only from the player-initiated break_terrain, never from a spawn
+## path, so it cannot recurse.
+func _collapse_unsupported(center: Vector3i) -> void:
+	var x0 := center.x - _COLLAPSE_RADIUS
+	var x1 := center.x + _COLLAPSE_RADIUS
+	var z0 := center.z - _COLLAPSE_RADIUS
+	var z1 := center.z + _COLLAPSE_RADIUS
+
+	# Vertical bounds: top = tallest column in the region; bottom = shortest column
+	# minus 2, a row that is solid in every column and connects to the untouched bulk.
+	var y_hi := -0x3FFFFFFF
+	var y_lo_top := 0x3FFFFFFF
+	var xi := x0
+	while xi <= x1:
+		var zi := z0
+		while zi <= z1:
+			var h := TerrainConfig.height_at(xi, zi)
+			if h > y_hi:
+				y_hi = h
+			if h < y_lo_top:
+				y_lo_top = h
+			zi += 1
+		xi += 1
+	var y_lo := y_lo_top - 2
+
+	# Seed support from every solid cell on the region BOUNDARY shell — the bottom
+	# row (deep bulk) AND the 4 side faces. A cell touching a side face connects to
+	# untouched terrain OUTSIDE the search box, which we conservatively treat as
+	# supported. Seeding only the bottom row would wrongly flag a shelf propped from
+	# outside the box as floating and carve it away; biasing toward "supported" at
+	# the boundary means we never destroy genuinely-supported terrain (a floater
+	# from the dig sits near the box CENTRE, so it is still detected).
+	var supported: Dictionary = {}
+	var stack: Array[Vector3i] = []
+	xi = x0
+	while xi <= x1:
+		var zi := z0
+		while zi <= z1:
+			var on_boundary := xi == x0 or xi == x1 or zi == z0 or zi == z1
+			var y := y_lo
+			while y <= y_hi:
+				if (on_boundary or y == y_lo) and _cell_solid(Vector3i(xi, y, zi)):
+					var seed := Vector3i(xi, y, zi)
+					if not supported.has(seed):
+						supported[seed] = true
+						stack.append(seed)
+				y += 1
+			zi += 1
+		xi += 1
+	while not stack.is_empty():
+		var c: Vector3i = stack.pop_back()
+		for d: Vector3i in _NEIGHBORS_6:
+			var nc := c + d
+			if nc.x < x0 or nc.x > x1 or nc.z < z0 or nc.z > z1 or nc.y < y_lo or nc.y > y_hi:
+				continue
+			if supported.has(nc):
+				continue
+			if _cell_solid(nc):
+				supported[nc] = true
+				stack.append(nc)
+
+	# Collect solid cells the flood never reached — these are floating.
+	var floating: Dictionary = {}
+	xi = x0
+	while xi <= x1:
+		var zi := z0
+		while zi <= z1:
+			var y := y_lo
+			while y <= y_hi:
+				var c := Vector3i(xi, y, zi)
+				if _cell_solid(c) and not supported.has(c):
+					floating[c] = true
+				y += 1
+			zi += 1
+		xi += 1
+	if floating.is_empty():
+		return   # common case: nothing undercut, spawn nothing
+
+	# Group floaters into 6-neighbour connected components; each becomes one body.
+	var seen: Dictionary = {}
+	for start: Vector3i in floating.keys():
+		if seen.has(start):
+			continue
+		var comp: Array[Vector3i] = []
+		var cstack: Array[Vector3i] = [start]
+		seen[start] = true
+		while not cstack.is_empty():
+			var c: Vector3i = cstack.pop_back()
+			comp.append(c)
+			for d: Vector3i in _NEIGHBORS_6:
+				var nc := c + d
+				if floating.has(nc) and not seen.has(nc):
+					seen[nc] = true
+					cstack.append(nc)
+		# Carve every cell of the component out of the terrain, then drop it as a body
+		# positioned exactly where those cells were (grass, since these are ground).
+		for c: Vector3i in comp:
+			_removed[c] = true
+			_carve_cell(c)
+		# Reuse the shared grass material (GrassMaterial.build() is uncached — it
+		# would alloc a material + reload the texture on every collapse).
+		VoxelBody.spawn_loose(self, comp, _grass_material, self)
 
 # --- analytic world queries (path-agnostic) ------------------------------------
 
@@ -119,35 +246,42 @@ func break_terrain(cell: Vector3i) -> bool:
 func surface_y(x: float, z: float) -> float:
 	return float(effective_height(int(floor(x)), int(floor(z))) + 1)
 
-## Analytic step height: the player can walk UP a step this tall (≈ one block).
-const STEP_UP := 1.1
-
 ## The y the player should stand at in column (x, z) given their current feet
-## height. Unlike surface_y (always the column TOP), this lets the player descend
-## into a pit/shaft they dug and walk INTO a tunnel instead of being snapped back
-## up to the original surface.
-##
-## Two regimes, keyed on whether the feet cell is undisturbed solid rock:
-##   * EMBEDDED (walked horizontally into a hillside — the terrain has no collider,
-##     so nothing stops that): can't tunnel through undug rock, so pop up onto the
-##     column's surface (effective top). This climbs steps/hills in one step, never
-##     leaving the player clipped one block inside the wall.
-##   * OPEN AIR or a DUG POCKET: land on the first block below that has AIR directly
-##     above it — the actual standable surface — so a shaft/tunnel floor is honoured
-##     rather than the buried rock at the feet.
-## Ground is solid all the way down, so a surface is always found.
+## height. Plain, NO-CLIMB floor: scan DOWN from the feet for the first solid block
+## that has AIR directly above it (the actual standable surface) and stand on its
+## top. Crucially it does NOT pop the player up to the column top when the feet cell
+## is buried — walling into a hillside must not teleport the player onto the hilltop.
+## Horizontal movement into terrain is now stopped by blocked() (the player queries
+## it per-axis), so the feet are always at or just above an air-topped surface and a
+## valid floor is always found; the scan honours dug shafts/tunnels below as well.
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
-	var fcell := int(floor(feet_y + (STEP_UP - 1.0)))   # feet, plus a small step-up bias
-	if _cell_solid(Vector3i(xi, fcell, zi)):
-		return float(effective_height(xi, zi) + 1)
-	var y := fcell
+	# Start at the feet, but never above the column's noise top (nothing solid lives
+	# higher than that, so there is no point scanning empty air above the surface).
+	var start := mini(int(floor(feet_y + 0.5)), TerrainConfig.height_at(xi, zi))
+	var y := start
 	while y > -1024:
 		if _cell_solid(Vector3i(xi, y, zi)) and not _cell_solid(Vector3i(xi, y + 1, zi)):
 			return float(y + 1)
 		y -= 1
 	return float(effective_height(xi, zi) + 1)
+
+## True if any solid, non-broken terrain cell overlaps the player's vertical body
+## span at column (floor(x), floor(z)). The player is ~1.8 m tall standing with feet
+## at feet_y; the player agent calls this per-axis to stop horizontal movement into
+## a wall (the terrain itself is collider-less, so nothing else does).
+func blocked(x: float, z: float, feet_y: float) -> bool:
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	var y_lo := int(floor(feet_y + 0.1))
+	var y_hi := int(floor(feet_y + 1.7))
+	var y := y_lo
+	while y <= y_hi:
+		if _cell_solid(Vector3i(xi, y, zi)):
+			return true
+		y += 1
+	return false
 
 func is_solid(pos: Vector3) -> bool:
 	var cell := Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))

@@ -86,8 +86,8 @@ func attach_viewer(player: Node3D) -> void:
 	if _viewer == null:
 		return
 	_set_if(_viewer, "view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
-	# Stretch the stream vertically so tall mountain caps load without paying for
-	# a bigger horizontal radius.
+	# Vertical stream ratio (1.0 now that terrain is shallow; kept configurable in
+	# TerrainConfig should tall terrain return).
 	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)

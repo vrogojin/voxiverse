@@ -51,8 +51,8 @@ func _ready() -> void:
 	_camera = Camera3D.new()
 	_camera.name = "Camera3D"
 	_camera.position = Vector3(0, eye_height, 0)
-	# Generous far plane so tall (200+) mountain caps within stream range are
-	# never clipped (a cap can be ~350 blocks away in 3D); fog hides the rest.
+	# Generous far plane so terrain across the full stream range is never clipped;
+	# fog hides the boundary well before the edge.
 	_camera.far = float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
 	add_child(_camera)

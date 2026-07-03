@@ -123,23 +123,31 @@ func surface_y(x: float, z: float) -> float:
 const STEP_UP := 1.1
 
 ## The y the player should stand at in column (x, z) given their current feet
-## height. Unlike surface_y (always the column TOP), this scans DOWNWARD from just
-## above the feet for the first solid, non-broken block — so the player can descend
-## into a pit or shaft they dug and walk INTO a tunnel, instead of being snapped
-## back up to the original surface. Blocks whose top is more than STEP_UP above the
-## feet (walls, tunnel ceilings) are never treated as floor, so you don't teleport
-## up onto them. Ground is solid all the way down, so this always finds a floor.
+## height. Unlike surface_y (always the column TOP), this lets the player descend
+## into a pit/shaft they dug and walk INTO a tunnel instead of being snapped back
+## up to the original surface.
+##
+## Two regimes, keyed on whether the feet cell is undisturbed solid rock:
+##   * EMBEDDED (walked horizontally into a hillside — the terrain has no collider,
+##     so nothing stops that): can't tunnel through undug rock, so pop up onto the
+##     column's surface (effective top). This climbs steps/hills in one step, never
+##     leaving the player clipped one block inside the wall.
+##   * OPEN AIR or a DUG POCKET: land on the first block below that has AIR directly
+##     above it — the actual standable surface — so a shaft/tunnel floor is honoured
+##     rather than the buried rock at the feet.
+## Ground is solid all the way down, so a surface is always found.
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
-	# Highest block whose TOP (y+1) can be at most STEP_UP above the feet.
-	var y := int(floor(feet_y + (STEP_UP - 1.0)))
-	y = mini(y, TerrainConfig.height_at(xi, zi))   # nothing solid above the surface
+	var fcell := int(floor(feet_y + (STEP_UP - 1.0)))   # feet, plus a small step-up bias
+	if _cell_solid(Vector3i(xi, fcell, zi)):
+		return float(effective_height(xi, zi) + 1)
+	var y := fcell
 	while y > -1024:
-		if TerrainConfig.is_solid(xi, y, zi) and not _removed.has(Vector3i(xi, y, zi)):
+		if _cell_solid(Vector3i(xi, y, zi)) and not _cell_solid(Vector3i(xi, y + 1, zi)):
 			return float(y + 1)
 		y -= 1
-	return float(y + 1)
+	return float(effective_height(xi, zi) + 1)
 
 func is_solid(pos: Vector3) -> bool:
 	var cell := Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))

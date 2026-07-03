@@ -28,7 +28,15 @@ extends RigidBody3D
 const BLOCK_MASS := 12.0          # kg per voxel block (shared contract w/ player push_force)
 
 # Dynamics for detached (activated) pieces — see _apply_dynamic_props().
-const DYN_ANGULAR_DAMP := 4.0     # strong: drop mostly straight, no chaotic tumbling
+# Angular damping scales with block count so a heavier cluster resists flipping far
+# more than a light one: the player leans ~700 N down on a piece it stands on, which
+# torques a small piece over — a large slab must shrug that off. Curve (per cell n):
+#   angular_damp = min(BASE + PER_CELL*(n-1), MAX)
+#   n=1 -> 4.0 (a lone block can still be tipped/pushed), n=4 -> 11.5,
+#   n=8 -> 21.5, n>=9 -> 24.0 (a broad slab is effectively unflippable under load).
+const DYN_ANGULAR_DAMP := 4.0          # base: a single detached block (still tippable)
+const DYN_ANGULAR_DAMP_PER_CELL := 2.5 # extra angular damp added per additional block
+const DYN_ANGULAR_DAMP_MAX := 24.0     # clamp: an 8+ block slab stops flipping under load
 const DYN_LINEAR_DAMP := 0.1      # gentle: settle without floating
 const DYN_FRICTION := 0.5         # wood-on-ground grip (rest, yet still pushable @1200N)
 const DYN_BOUNCE := 0.0           # no bouncing on impact
@@ -41,6 +49,10 @@ var cells: Dictionary = {}        # Vector3i -> true (body-local voxel coords)
 var material: StandardMaterial3D
 var world: WorldManager           # for the ground-contact (grounded) test
 var activated: bool = false       # false = pristine frozen pillar; true = dynamic
+# True only for wood pillars (and the pieces they break into). Gates the wood-tint
+# variant swap: a spawn_loose body carries an explicit material (e.g. grass ground)
+# and must KEEP it — it is never re-tinted. Only wood_pillar bodies claim variants.
+var wood_pillar: bool = false
 
 # Distinct wood tint per dynamic body so adjacent loose pieces (and loose vs.
 # untouched pillars) read as separate objects. Deterministic: each dynamic body
@@ -71,12 +83,36 @@ static func spawn_pillar(parent: Node, wx: int, wz: int, base_y: float,
 		height: int, world_ref: WorldManager) -> VoxelBody:
 	var b := VoxelBody.new()
 	b.material = WoodMaterial.build()
+	b.wood_pillar = true              # eligible for the per-piece wood-tint variants
 	b.world = world_ref
 	for k in height:
 		b.cells[Vector3i(0, k, 0)] = true
 	parent.add_child(b)
 	b.global_position = Vector3(float(wx), base_y, float(wz))
 	b._rebuild()
+	return b
+
+## Spawn an already-dynamic loose body whose LOCAL cells are the given world cells,
+## at identity transform — so the blocks render exactly where they sat in the world
+## and then fall (used for terrain collapse). The passed `material` is used AS-IS:
+## these are typically grass ground blocks and must NOT be re-tinted to wood, so the
+## body is left non-wood (wood_pillar = false) and never claims a tint variant.
+## Returns null for an empty cell list.
+static func spawn_loose(parent: Node, world_cells: Array,
+		material: StandardMaterial3D, world_ref: WorldManager) -> VoxelBody:
+	if world_cells.is_empty():
+		return null
+	var b := VoxelBody.new()
+	b.material = material              # keep the caller's material verbatim (no wood tint)
+	b.wood_pillar = false             # ineligible for wood-tint variants
+	b.world = world_ref
+	for c: Vector3i in world_cells:
+		b.cells[c] = true
+	b.activated = true                # born dynamic: _rebuild() unfreezes + applies props
+	parent.add_child(b)
+	b.global_transform = Transform3D.IDENTITY   # local cells == world cells
+	b._rebuild()                      # sets freeze = false (activated) + dynamic props
+	b.sleeping = false                # wake so it falls immediately
 	return b
 
 ## Break the voxel at body-local `cell`. Removes it, then splits the remaining
@@ -136,11 +172,13 @@ func _wake_if_dynamic() -> void:
 		sleeping = false
 
 ## Transition THIS body from pristine-frozen to dynamic: it lost contact with the
-## ground and must fall. Give it a distinct tint (so it reads as a loose piece,
-## not a standing pillar) before the caller's _rebuild() applies the new material.
+## ground and must fall. A wood pillar gets a distinct tint (so it reads as a loose
+## piece, not a standing pillar) before the caller's _rebuild() applies the material;
+## a non-wood body (e.g. a spawn_loose ground block) keeps its given material.
 func _activate_self() -> void:
 	activated = true
-	material = _next_variant_material()
+	if wood_pillar:                   # only wood pillars re-tint; loose bodies keep theirs
+		material = _next_variant_material()
 
 ## Claim the next deterministic wood tint. Cheap, no randomness — each dynamic
 ## body gets its own index so adjacent loose pieces differ visibly.
@@ -167,8 +205,16 @@ static func _dyn_physics_material() -> PhysicsMaterial:
 func _apply_dynamic_props() -> void:
 	if not activated:
 		return
-	angular_damp = DYN_ANGULAR_DAMP
+	# Flip resistance scales with block count (see the DYN_ANGULAR_DAMP_* constants):
+	# a lone block stays tippable/pushable, while a large slab barely rotates under the
+	# player's downward lean, so it can be stood on without tipping or running away.
+	var n := cells.size()
+	angular_damp = minf(DYN_ANGULAR_DAMP + DYN_ANGULAR_DAMP_PER_CELL * float(n - 1),
+			DYN_ANGULAR_DAMP_MAX)
 	linear_damp = DYN_LINEAR_DAMP
+	# AUTO center of mass: it settles low and broad for wide/flat clusters, which is
+	# naturally stable and reinforces the angular-damp-based flip resistance.
+	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_AUTO
 	physics_material_override = _dyn_physics_material()
 	continuous_cd = true
 
@@ -195,10 +241,12 @@ func _spawn_detached(comp: Dictionary, lin: Vector3, ang: Vector3) -> void:
 	nb.world = world
 	nb.cells = comp
 	nb.activated = true                # detached pieces are always dynamic
-	# Distinct tint so this loose piece is visually separable from its neighbours
-	# and from the untouched pillars. Assigned BEFORE _rebuild() so the mesh shows
-	# it (the dynamic damping/material/ccd are likewise applied inside _rebuild).
-	nb.material = _next_variant_material()
+	nb.wood_pillar = wood_pillar       # inherit tint-eligibility from the parent cluster
+	# A wood piece gets a distinct tint so it reads as separate from its neighbours and
+	# the untouched pillars; a non-wood (loose) piece keeps the parent's exact material.
+	# Assigned BEFORE _rebuild() so the mesh shows it (dynamic damping/material/ccd are
+	# likewise applied inside _rebuild).
+	nb.material = _next_variant_material() if wood_pillar else material
 	get_parent().add_child(nb)
 	nb.global_transform = global_transform
 	nb._rebuild()

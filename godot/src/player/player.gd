@@ -34,6 +34,8 @@ signal aimed_voxel_changed(info: Dictionary)
 @export var push_force := 1200.0
 
 const WOOD_LAYER_MASK := 1 << 1           # voxel bodies live on collision layer 2
+const PLAYER_RADIUS := 0.4                # capsule radius; the wall-block probe reach
+const PLAYER_WEIGHT := 700.0              # N (~70 kg) pressed down onto a piece we stand on
 
 var world: WorldManager                   # injected by Main before _ready
 var flying := false
@@ -152,25 +154,71 @@ func _move(delta: float) -> void:
 
 	var speed := run_speed if running else walk_speed
 	_horiz_vel = wish * speed
-	# Horizontal move THROUGH the physics engine so we actually collide with the
-	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces
-	# also block us, but _push_bodies shoves them out of the way so we advance).
-	# One slide pass lets us glide along a wall instead of sticking to it. The
-	# player's collision_mask is wood-only, so terrain is unaffected (still climbed
-	# analytically below).
-	_move_horizontal(wish * speed * delta)
+	# Terrain has no collider, so terrain WALLS are enforced analytically here: the
+	# player must be STOPPED by an upward step (never climbed, never teleported), yet
+	# still able to slide along it. Test each axis independently — probe one radius
+	# ahead plus the intended delta and zero that component if solid terrain overlaps
+	# the player's vertical span there. Descending/flat ground has air ahead at feet
+	# level (not blocked), so movement stays free; only upward steps block, so going
+	# up requires a JUMP (intended — no auto-step).
+	var feet_y := global_position.y
+	var delta_move := wish * speed * delta
+	if delta_move.x != 0.0 and world.blocked(
+			global_position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x,
+			global_position.z, feet_y):
+		delta_move.x = 0.0
+	if delta_move.z != 0.0 and world.blocked(
+			global_position.x,
+			global_position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z, feet_y):
+		delta_move.z = 0.0
+	# The surviving delta goes THROUGH the physics engine so we still collide with the
+	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces also
+	# block us, but _push_bodies shoves them aside so we advance). One slide pass lets
+	# us glide along a wood wall instead of sticking to it. The player's collision_mask
+	# is wood-only, so terrain is unaffected (handled by the analytic test above).
+	_move_horizontal(delta_move)
 
 	# Analytic gravity + floor. floor_under() scans down from the feet, so we can
 	# descend into pits/shafts and enter tunnels we've dug instead of being snapped
 	# back to the original surface.
 	velocity.y -= gravity * delta
 	global_position.y += velocity.y * delta
-	var floor_y := world.floor_under(global_position.x, global_position.z, global_position.y)
+	var terrain_floor := world.floor_under(global_position.x, global_position.z, global_position.y)
+	var floor_y := terrain_floor
+
+	# Stand ON a detached voxel body directly under the feet instead of falling
+	# through it (and, below, press our weight into it so it does not squirt out).
+	# Short physics ray straight down from just above the feet, wood layer only.
+	var piece: VoxelBody = null
+	var piece_point := Vector3.ZERO
+	var space := get_world_3d().direct_space_state
+	var rq := PhysicsRayQueryParameters3D.create(
+		global_position + Vector3(0, 0.05, 0), global_position + Vector3(0, -0.6, 0))
+	rq.collision_mask = WOOD_LAYER_MASK
+	rq.collide_with_bodies = true
+	rq.exclude = [get_rid()]
+	var rhit := space.intersect_ray(rq)
+	if not rhit.is_empty() and rhit.get("collider") is VoxelBody:
+		var piece_top: float = (rhit["position"] as Vector3).y
+		# Only stand on it when its top is at/above the terrain floor; otherwise the
+		# terrain wins and we ignore a piece that is really below the ground.
+		if piece_top >= terrain_floor:
+			piece = rhit["collider"] as VoxelBody
+			piece_point = rhit["position"]
+			floor_y = maxf(terrain_floor, piece_top)
+
 	if global_position.y <= floor_y:
 		global_position.y = floor_y
 		velocity.y = 0.0
 		if Input.is_key_pressed(KEY_SPACE):
 			velocity.y = jump_velocity
+
+	# While actually resting on the piece (not jumping off it), press the player's
+	# weight DOWN into the body at the CONTACT OFFSET (not its centre): a light piece
+	# can tip and a heavy one resists, so it holds us up instead of being launched.
+	if piece != null and global_position.y <= floor_y + 0.05 and velocity.y <= 0.0:
+		piece.apply_force(Vector3(0, -PLAYER_WEIGHT, 0),
+			piece_point - piece.global_transform.origin)
 
 ## Move horizontally against the wooden blocks with a single slide, so pillars are
 ## solid obstacles. Uses move_and_collide (not move_and_slide) to keep the vertical

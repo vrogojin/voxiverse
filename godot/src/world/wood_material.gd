@@ -1,6 +1,7 @@
 class_name WoodMaterial
 extends RefCounted
-## Builds the shared wooden-block material used by the physics pillars.
+## Builds the shared wooden-block material used by wood voxels (tree trunks and
+## the detached wood+leaf bodies from chopping them).
 ##
 ## Unshaded (matching the grass surface — flat ambient look, no sun) with a
 ## procedurally-generated 64x64 wood-grain texture baked at runtime into an
@@ -13,36 +14,6 @@ const SIZE := 64
 const SEED := 61803
 
 static var _cached: StandardMaterial3D
-static var _variants: Dictionary = {}   # index -> tinted StandardMaterial3D
-
-## A DISTINCT wood variant for a detached/dynamic piece: same baked grain texture
-## as the shared material, but with a small deterministic albedo tint so adjacent
-## loose pieces (and loose vs. untouched pillars) show a visible seam. The plain
-## standing pillars keep the untinted build(); only broken-off pieces get these.
-##
-## The tint stays clearly "wood": a gentle hue rotation around the warm brown plus
-## a mild brightness wobble, both driven by `index` (no randomness). Cached per
-## index so repeat rebuilds reuse one material.
-static func build_variant(index: int) -> StandardMaterial3D:
-	if _variants.has(index):
-		return _variants[index] as StandardMaterial3D
-	var base := build()
-	var mat := base.duplicate() as StandardMaterial3D
-	# Golden-ratio (0.618) fractional stepping spreads successive indices far apart
-	# in colour and never repeats; the mapped ranges keep every variant close to
-	# the base warm brown so it still clearly reads as "wood".
-	var g := fposmod(float(index) * 0.61803399, 1.0)           # well-spread in [0,1)
-	var g2 := fposmod(float(index) * 0.38196601, 1.0)          # a second decorrelated dial
-	var hue_shift := (g - 0.5) * 0.14                          # +/- ~25 deg of hue
-	var val_shift := 0.86 + 0.14 * g2                          # 0.86 .. 1.0 brightness
-	var base_col := Color(0.72, 0.5, 0.32)                     # representative wood brown
-	var h := fposmod(base_col.h + hue_shift, 1.0)
-	var tint := Color.from_hsv(h, base_col.s, clampf(base_col.v * val_shift, 0.0, 1.0), 1.0)
-	# Modulate (not replace) the texture: vertex_color_use_as_albedo stays true, so
-	# the grain still shows through the tint.
-	mat.albedo_color = tint
-	_variants[index] = mat
-	return mat
 
 ## Shared wooden-block material (built once, reused by every VoxelBody).
 static func build() -> StandardMaterial3D:

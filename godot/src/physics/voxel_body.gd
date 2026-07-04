@@ -1,31 +1,53 @@
 class_name VoxelBody
 extends RigidBody3D
-## A physical, breakable cluster of voxel blocks (the physics sandbox's building
-## block — the wooden pillars are made of these).
+## A physical, breakable cluster of voxel blocks (the physics sandbox / detached
+## terrain chunks — chopped tree trunks+canopies and collapsed soil become these).
 ##
-## A VoxelBody owns a set of local voxel cells (`cells`: Vector3i -> true) where
-## cell `c` occupies the unit cube [c, c+1] in body-LOCAL space. From that set it
-## builds, in `_rebuild()`:
+## A VoxelBody owns a set of local voxel cells (`cells`: Vector3i -> int block_id)
+## where cell `c` occupies the unit cube [c, c+1] in body-LOCAL space. From that
+## set it builds, in `_rebuild()`:
 ##   * a MeshInstance3D of only the EXPOSED faces (a face is drawn when the
-##     neighbouring cell is empty), textured with the wood material, and
+##     neighbouring cell is empty), one surface per distinct block id, each
+##     surface textured with `BlockMaterials.get_for(id)` — wood is NEVER
+##     recolored, and
 ##   * one BoxShape3D collider per cell, so the cluster collides blockily with the
 ##     ground and with other bodies, and
-##   * a mass proportional to the block count.
+##   * a mass = sum of `BlockCatalog.mass_of(id)` over its cells.
 ##
 ## Breaking (`break_cell`) removes one cell, then recomputes the CONNECTED
 ## COMPONENTS of what remains: if the cluster fell into several disconnected
-## pieces, each piece becomes its own independent VoxelBody. This is the
-## "detach / split one mesh into several separate meshes" behaviour — the piece
-## that is no longer resting on the ground drops and tumbles under gravity and can
-## be pushed around; a piece still sitting on the ground stays put.
+## pieces, each piece becomes its own independent VoxelBody, carrying its cells'
+## ids. This is the "detach / split one mesh into several separate meshes"
+## behaviour — the piece that is no longer resting on the ground drops and can be
+## pushed around; a piece still sitting on the ground stays put.
 ##
-## FREEZE model: a pristine, untouched pillar spawns FROZEN (freeze_mode = STATIC)
-## so thin stacks stand perfectly still instead of toppling on spawn. The first
-## break "activates" the affected pieces: any component that has lost contact with
-## the ground unfreezes and becomes fully dynamic. Once a body is dynamic it stays
-## dynamic (so it remains pushable) — only never-disturbed pillars are frozen.
+## FREEZE model:
+##   * A pristine, untouched cluster spawns FROZEN (freeze_mode = STATIC) so thin
+##     stacks stand perfectly still instead of toppling on spawn. The first break
+##     "activates" any component that has lost ground contact — it unfreezes and
+##     becomes fully dynamic.
+##   * SANDBOX vs GROUND (§12): a body is "sandbox-dynamic" iff it contains at
+##     least one WOOD cell (chopped trunks/canopies stay pushable — the fun
+##     sandbox). Every other body (pure grass/dirt/stone, or leaf-only) is a
+##     "ground body". A ground body still spawns dynamic and still takes the
+##     detach kick, but once it is grounded AND nearly at rest it RE-FREEZES to
+##     STATIC (`_physics_process`) so a single soil block can be jumped on or
+##     shoved without moving or tipping. If a frozen ground body later loses its
+##     support (a neighbour is dug out) it unfreezes and falls again. The one
+##     predicate `_grounded()` is authoritative both ways. Wood bodies never
+##     auto-freeze.
 
-const BLOCK_MASS := 12.0          # kg per voxel block (shared contract w/ player push_force)
+# A slight, mass-independent momentum given to every piece that detaches because
+# of a break with a finite breaker position — "the block hops away from you as
+# you knock it loose". A velocity ADD (not an impulse) so a 21-cell canopy and a
+# 1-cell chip both drift at the same gentle ~1.2 m/s.
+const DETACH_KICK_SPEED := 1.2         # m/s
+
+# A ground body counts as "at rest" (and re-freezes) below these thresholds.
+const SETTLE_LINEAR := 0.15            # m/s
+const SETTLE_ANGULAR := 0.15           # rad/s
+const SETTLE_RECHECK_FRAMES := 12      # frozen ground bodies re-test support this often
+const SUPPORT_PROBE := 0.25            # m: downward ray length under a body's underside
 
 # Dynamics for detached (activated) pieces — see _apply_dynamic_props().
 # Angular damping scales with block count so a heavier cluster resists flipping far
@@ -38,26 +60,17 @@ const DYN_ANGULAR_DAMP := 4.0          # base: a single detached block (still ti
 const DYN_ANGULAR_DAMP_PER_CELL := 2.5 # extra angular damp added per additional block
 const DYN_ANGULAR_DAMP_MAX := 24.0     # clamp: an 8+ block slab stops flipping under load
 const DYN_LINEAR_DAMP := 0.1      # gentle: settle without floating
-const DYN_FRICTION := 0.5         # wood-on-ground grip (rest, yet still pushable @1200N)
+const DYN_FRICTION := 0.5         # on-ground grip (rest, yet still pushable @1200N)
 const DYN_BOUNCE := 0.0           # no bouncing on impact
 
 # Collision layers: 1 = terrain ground, 2 = voxel bodies, 4 = player capsule.
 const LAYER_BODY := 1 << 1        # this body lives on layer 2
 const MASK_BODY := (1 << 0) | (1 << 1) | (1 << 2)   # collide w/ ground+bodies+player
 
-var cells: Dictionary = {}        # Vector3i -> true (body-local voxel coords)
-var material: StandardMaterial3D
+var cells: Dictionary = {}        # Vector3i -> int block_id (body-local voxel coords)
 var world: WorldManager           # for the ground-contact (grounded) test
-var activated: bool = false       # false = pristine frozen pillar; true = dynamic
-# True only for wood pillars (and the pieces they break into). Gates the wood-tint
-# variant swap: a spawn_loose body carries an explicit material (e.g. grass ground)
-# and must KEEP it — it is never re-tinted. Only wood_pillar bodies claim variants.
-var wood_pillar: bool = false
-
-# Distinct wood tint per dynamic body so adjacent loose pieces (and loose vs.
-# untouched pillars) read as separate objects. Deterministic: each dynamic body
-# claims the next index. Frozen pristine pillars never touch this.
-static var _variant_counter: int = 0
+var activated: bool = false       # false = pristine frozen cluster; true = dynamic
+var _recheck := 0                 # countdown for the throttled frozen-body support re-test
 
 # Shared, no-bounce, medium-friction physics material for dynamic pieces. Built
 # once and reused (RigidBody3D shares it freely — it is immutable here).
@@ -77,49 +90,36 @@ func _init() -> void:
 	collision_layer = LAYER_BODY
 	collision_mask = MASK_BODY
 
-## Spawn a vertical pillar of `height` wooden blocks at world column (wx, wz) with
-## its base block resting on top of the ground at `base_y`. Returns the body.
-static func spawn_pillar(parent: Node, wx: int, wz: int, base_y: float,
-		height: int, world_ref: WorldManager) -> VoxelBody:
-	var b := VoxelBody.new()
-	b.material = WoodMaterial.build()
-	b.wood_pillar = true              # eligible for the per-piece wood-tint variants
-	b.world = world_ref
-	for k in height:
-		b.cells[Vector3i(0, k, 0)] = true
-	parent.add_child(b)
-	b.global_position = Vector3(float(wx), base_y, float(wz))
-	b._rebuild()
-	return b
-
-## Spawn an already-dynamic loose body whose LOCAL cells are the given world cells,
-## at identity transform — so the blocks render exactly where they sat in the world
-## and then fall (used for terrain collapse). The passed `material` is used AS-IS:
-## these are typically grass ground blocks and must NOT be re-tinted to wood, so the
-## body is left non-wood (wood_pillar = false) and never claims a tint variant.
-## Returns null for an empty cell list.
-static func spawn_loose(parent: Node, world_cells: Array,
-		material: StandardMaterial3D, world_ref: WorldManager) -> VoxelBody:
-	if world_cells.is_empty():
+## Spawn an already-dynamic loose body whose LOCAL cells are the given WORLD cells
+## (identity transform, so the blocks render exactly where they sat in the world
+## and then fall — used for terrain collapse and chopped canopies). Visual
+## materials and mass are resolved internally from the per-cell ids. If
+## `kick_from` is finite the new body gets a slight momentum away from it.
+## Returns null for an empty dictionary.
+static func spawn_loose(parent: Node, cell_ids: Dictionary,
+		world_ref: WorldManager, kick_from: Vector3 = Vector3.INF) -> VoxelBody:
+	if cell_ids.is_empty():
 		return null
 	var b := VoxelBody.new()
-	b.material = material              # keep the caller's material verbatim (no wood tint)
-	b.wood_pillar = false             # ineligible for wood-tint variants
 	b.world = world_ref
-	for c: Vector3i in world_cells:
-		b.cells[c] = true
+	b.cells = cell_ids.duplicate()    # take our own copy; caller keeps its dict
 	b.activated = true                # born dynamic: _rebuild() unfreezes + applies props
 	parent.add_child(b)
 	b.global_transform = Transform3D.IDENTITY   # local cells == world cells
 	b._rebuild()                      # sets freeze = false (activated) + dynamic props
 	b.sleeping = false                # wake so it falls immediately
+	_apply_kick(b, kick_from)         # slight away-from-breaker momentum (no-op if infinite)
 	return b
 
 ## Break the voxel at body-local `cell`. Removes it, then splits the remaining
-## cluster into connected components, spawning detached pieces as their own bodies.
-func break_cell(cell: Vector3i) -> void:
+## cluster into connected components, spawning detached pieces as their own
+## bodies. If `from_pos` is finite (a real breaker position), every piece that
+## DETACHES because of this break — including this body itself if it unfreezes —
+## gets a slight velocity kick directly away from `from_pos`.
+func break_cell(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> void:
 	if not cells.has(cell):
 		return
+	var was_frozen := freeze          # captured so a settled/pristine body kicks on unfreeze
 	cells.erase(cell)
 	if cells.is_empty():
 		queue_free()
@@ -130,8 +130,11 @@ func break_cell(cell: Vector3i) -> void:
 		cells = comps[0]
 		if not activated and not _grounded(cells):
 			_activate_self()          # lost its footing -> it must fall
-		_rebuild()
+		_rebuild()                    # activated bodies unfreeze here (freeze = not activated)
 		_wake_if_dynamic()
+		# It "unfroze" if it was frozen and can no longer find the ground -> kick it away.
+		if was_frozen and not _grounded(cells):
+			_apply_kick(self, from_pos)
 		return
 
 	# Multiple pieces. Decide which component this body keeps; the rest detach.
@@ -141,13 +144,20 @@ func break_cell(cell: Vector3i) -> void:
 	for i in comps.size():
 		if i == keep:
 			continue
-		_spawn_detached(comps[i], lin, ang)
+		_spawn_detached(comps[i], lin, ang, from_pos)   # each detached piece is kicked
 
 	cells = comps[keep]
 	if not activated and not _grounded(cells):
 		_activate_self()
 	_rebuild()
 	_wake_if_dynamic()
+	if was_frozen and not _grounded(cells):
+		_apply_kick(self, from_pos)
+
+## Block id stored at body-local `cell`; 0 (AIR) if the body has no such cell.
+func cell_block_id(cell: Vector3i) -> int:
+	var id: int = cells.get(cell, 0)
+	return id
 
 ## Map a world-space ray hit (position + surface normal) to the body-local cell
 ## that was struck, so a click can break exactly the block the player pointed at.
@@ -165,6 +175,42 @@ func cell_at_hit(hit_pos: Vector3, hit_normal: Vector3) -> Vector3i:
 func block_count() -> int:
 	return cells.size()
 
+# --- settle / freeze (§12) ------------------------------------------------------
+
+## Ground bodies re-freeze once at rest so they can be jumped on / shoved without
+## moving or tipping; if support is later dug out they fall again. Wood bodies are
+## sandbox-dynamic and are left alone here. Runs only for activated bodies.
+func _physics_process(_delta: float) -> void:
+	if not activated or _has_wood():
+		return
+	if not freeze:
+		# Dynamic ground body: freeze once it has landed and stopped.
+		if _grounded(cells) \
+				and linear_velocity.length() < SETTLE_LINEAR \
+				and angular_velocity.length() < SETTLE_ANGULAR:
+			linear_velocity = Vector3.ZERO
+			angular_velocity = Vector3.ZERO
+			freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
+			freeze = true
+	else:
+		# Settled ground body: periodically re-test support; if it lost it (support
+		# dug out), resume falling. Throttled — a static block needs no per-frame check.
+		_recheck -= 1
+		if _recheck <= 0:
+			_recheck = SETTLE_RECHECK_FRAMES
+			if not _grounded(cells):
+				freeze = false
+				sleeping = false
+
+## True iff this cluster contains at least one WOOD cell -> sandbox-dynamic
+## (never auto-freezes). Everything else is a ground body.
+func _has_wood() -> bool:
+	for c: Vector3i in cells.keys():
+		var id: int = cells[c]
+		if id == BlockCatalog.WOOD:
+			return true
+	return false
+
 # --- internals -----------------------------------------------------------------
 
 func _wake_if_dynamic() -> void:
@@ -172,20 +218,30 @@ func _wake_if_dynamic() -> void:
 		sleeping = false
 
 ## Transition THIS body from pristine-frozen to dynamic: it lost contact with the
-## ground and must fall. A wood pillar gets a distinct tint (so it reads as a loose
-## piece, not a standing pillar) before the caller's _rebuild() applies the material;
-## a non-wood body (e.g. a spawn_loose ground block) keeps its given material.
+## ground and must fall.
 func _activate_self() -> void:
 	activated = true
-	if wood_pillar:                   # only wood pillars re-tint; loose bodies keep theirs
-		material = _next_variant_material()
 
-## Claim the next deterministic wood tint. Cheap, no randomness — each dynamic
-## body gets its own index so adjacent loose pieces differ visibly.
-func _next_variant_material() -> StandardMaterial3D:
-	var idx := _variant_counter
-	_variant_counter += 1
-	return WoodMaterial.build_variant(idx)
+## Mean of the body-local cell centres (used to aim the detach kick away from the
+## breaker). Body-local; transform with `global_transform` for a world point.
+func _cells_center() -> Vector3:
+	var sum := Vector3.ZERO
+	for c: Vector3i in cells.keys():
+		sum += Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
+	return sum / float(maxi(1, cells.size()))
+
+## Give `body` a slight velocity directly away from `from_pos` (a velocity ADD, so
+## the push is uniform across masses). No-op when `from_pos` is not finite.
+static func _apply_kick(body: VoxelBody, from_pos: Vector3) -> void:
+	if not from_pos.is_finite():
+		return
+	if not body.is_inside_tree():     # transform not live yet; skip (kick needs it)
+		return
+	var center := body.global_transform * body._cells_center()
+	var dir := center - from_pos
+	if dir.length() < 0.001:
+		dir = Vector3.UP
+	body.linear_velocity += dir.normalized() * DETACH_KICK_SPEED
 
 ## Shared physics material for dynamic pieces: some friction so they come to rest
 ## (yet a 1200 N push still shifts small piles), and zero bounce.
@@ -200,8 +256,8 @@ static func _dyn_physics_material() -> PhysicsMaterial:
 ## Apply the falling/settling dynamics to a dynamic body: strong angular damping
 ## (drop straight, no chaotic toppling), light linear damping, no-bounce friction
 ## material, and continuous collision detection (no tunnelling/jitter through the
-## trimesh ground at impact). Harmless to set on a frozen pillar (inert while
-## frozen), so it is keyed on `activated` and left off untouched pillars.
+## trimesh ground at impact). Harmless to set on a frozen body (inert while
+## frozen), so it is keyed on `activated`.
 func _apply_dynamic_props() -> void:
 	if not activated:
 		return
@@ -218,7 +274,7 @@ func _apply_dynamic_props() -> void:
 	physics_material_override = _dyn_physics_material()
 	continuous_cd = true
 
-## Which component this body retains. A pristine pillar keeps the piece still
+## Which component this body retains. A pristine cluster keeps the piece still
 ## resting on the ground (it stays frozen); a body that is already dynamic keeps
 ## its largest piece (identity/least churn) and lets the rest fly off.
 func _choose_keep(comps: Array) -> int:
@@ -236,29 +292,25 @@ func _choose_keep(comps: Array) -> int:
 			best_i = i
 	return best_i
 
-func _spawn_detached(comp: Dictionary, lin: Vector3, ang: Vector3) -> void:
+func _spawn_detached(comp: Dictionary, lin: Vector3, ang: Vector3, from_pos: Vector3) -> void:
 	var nb := VoxelBody.new()
 	nb.world = world
-	nb.cells = comp
+	nb.cells = comp                    # carries the detached cells' ids
 	nb.activated = true                # detached pieces are always dynamic
-	nb.wood_pillar = wood_pillar       # inherit tint-eligibility from the parent cluster
-	# A wood piece gets a distinct tint so it reads as separate from its neighbours and
-	# the untouched pillars; a non-wood (loose) piece keeps the parent's exact material.
-	# Assigned BEFORE _rebuild() so the mesh shows it (dynamic damping/material/ccd are
-	# likewise applied inside _rebuild).
-	nb.material = _next_variant_material() if wood_pillar else material
 	get_parent().add_child(nb)
 	nb.global_transform = global_transform
 	nb._rebuild()
 	nb.freeze = false
 	nb.linear_velocity = lin
 	# Only inherit spin from a parent that was ALREADY moving. Detaching from a
-	# frozen pristine pillar must NOT induce spin, else the piece topples in a
+	# frozen pristine cluster must NOT induce spin, else the piece topples in a
 	# random direction instead of dropping onto its flat base.
 	nb.angular_velocity = ang if activated else Vector3.ZERO
 	nb.sleeping = false
+	_apply_kick(nb, from_pos)          # slight away-from-breaker momentum
 
-## Connected components of `cells` under 6-neighbour adjacency.
+## Connected components of `cells` under 6-neighbour adjacency. Each returned
+## Dictionary carries the same Vector3i -> int block_id entries as `cells`.
 func _components() -> Array:
 	var comps: Array = []
 	var seen: Dictionary = {}
@@ -270,7 +322,7 @@ func _components() -> Array:
 		seen[start] = true
 		while not stack.is_empty():
 			var c: Vector3i = stack.pop_back()
-			comp[c] = true
+			comp[c] = cells[c]            # carry the id through the split
 			for d in _DIRS:
 				var nc: Vector3i = c + d
 				if cells.has(nc) and not seen.has(nc):
@@ -280,15 +332,50 @@ func _components() -> Array:
 	return comps
 
 ## True when any cell of `comp` is resting on (or below) the terrain surface, in
-## the body's CURRENT world orientation. Used only while the body is still a
-## pristine frozen pillar, so the orientation is upright and the test is exact.
+## the body's CURRENT world orientation. The one predicate that governs both
+## re-freezing (settle) and un-freezing (support broken) for ground bodies.
 func _grounded(comp: Dictionary) -> bool:
 	if world == null:
 		return true
+	# Fast analytic check: any cell at/below the terrain heightmap surface.
 	for c: Vector3i in comp.keys():
 		var wp := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
 		if wp.y <= world.surface_y(wp.x, wp.z) + 0.2:
 			return true
+	# Otherwise: resting on a STABLE support — the static ground collider (which
+	# also carries trees & placed blocks) or another already-frozen VoxelBody. This
+	# lets soil-on-soil stacks and blocks resting on a placed tower settle too. A
+	# support that is itself a still-moving (unfrozen) body does NOT count, so a
+	# stack settles bottom-up instead of an upper block freezing mid-air.
+	return _resting_on_support(comp)
+
+## Downward physics probe under the body's exposed underside cells: true iff it
+## rests on the static ground collider or a frozen body.
+func _resting_on_support(comp: Dictionary) -> bool:
+	if not is_inside_tree():
+		return false
+	var space := get_world_3d().direct_space_state
+	if space == null:
+		return false
+	for c: Vector3i in comp.keys():
+		# Only cells with no body cell directly beneath them have an exposed underside.
+		if comp.has(Vector3i(c.x, c.y - 1, c.z)):
+			continue
+		var base := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
+		var q := PhysicsRayQueryParameters3D.create(
+			base + Vector3(0.0, 0.05, 0.0),
+			base - Vector3(0.0, SUPPORT_PROBE, 0.0),
+			(1 << 0) | (1 << 1))          # ground layer + body layer (never the player)
+		q.exclude = [get_rid()]
+		var hit := space.intersect_ray(q)
+		if hit.is_empty():
+			continue
+		var col: Object = hit.get("collider")
+		if col is VoxelBody:
+			if (col as VoxelBody).freeze:   # a settled block is a stable floor
+				return true
+		else:
+			return true                     # static ground collider (terrain/trees/placed)
 	return false
 
 func _nearest_cell(p_local: Vector3) -> Vector3i:
@@ -308,17 +395,27 @@ func _rebuild() -> void:
 		if child is MeshInstance3D or child is CollisionShape3D:
 			child.queue_free()
 
-	# Exposed-face mesh.
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	# Exposed-face mesh, grouped by block id -> one surface (and one material) per
+	# distinct id present. Different-id neighbours share no face (opaque blocks),
+	# so the interior-face rule is unchanged.
+	var mesh := ArrayMesh.new()
+	var tools: Dictionary = {}          # int block_id -> SurfaceTool
 	for c: Vector3i in cells.keys():
+		var id: int = cells[c]
 		for d in _DIRS:
 			if not cells.has(c + d):
+				var st: SurfaceTool = tools.get(id, null)
+				if st == null:
+					st = SurfaceTool.new()
+					st.begin(Mesh.PRIMITIVE_TRIANGLES)
+					tools[id] = st
 				_emit_face(st, c, d)
-	var mesh := ArrayMesh.new()
-	st.commit(mesh)
-	if mesh.get_surface_count() > 0:
-		mesh.surface_set_material(0, material)
+	for id: int in tools.keys():
+		var st: SurfaceTool = tools[id]
+		var surf_index := mesh.get_surface_count()
+		st.commit(mesh)
+		if mesh.get_surface_count() > surf_index:
+			mesh.surface_set_material(surf_index, BlockMaterials.get_for(id))
 	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
 	add_child(mi)
@@ -332,7 +429,12 @@ func _rebuild() -> void:
 		cs.position = Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
 		add_child(cs)
 
-	mass = maxf(1.0, float(cells.size()) * BLOCK_MASS)
+	# Mass = sum of per-cell catalog masses (floor at 1 kg so a body is never zero).
+	var m := 0.0
+	for c: Vector3i in cells.keys():
+		var id: int = cells[c]
+		m += BlockCatalog.mass_of(id)
+	mass = maxf(1.0, m)
 	freeze = not activated
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces
 

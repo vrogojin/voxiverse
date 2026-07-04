@@ -17,9 +17,21 @@ func has(id: StringName) -> bool:
 	return _by_id.has(id)
 
 ## Build the default registry for the test environment. Registers the ground
-## `surface` material — a single data-driven material whose (currently one) grass
-## state lives in SurfaceModel. More materials/states register the same way.
+## `surface` material (whose grass state lives in SurfaceModel) PLUS one
+## data-driven material per BlockCatalog entry (id = the block name StringName,
+## single state), so the registry knows every block material. More materials/
+## states register the same way.
 static func build_default() -> MaterialRegistry:
 	var reg := MaterialRegistry.new()
 	reg.register(SurfaceModel.material())
+	BlockCatalog.ensure_ready()
+	for block_id in range(1, BlockCatalog.COUNT):
+		var state: VoxelState = BlockCatalog.state_of(block_id)
+		if state == null:
+			continue
+		var def := VoxelMaterialDef.new()
+		def.id = state.state_name
+		def.states = [state]
+		def.default_state_index = 0
+		reg.register(def)
 	return reg

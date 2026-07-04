@@ -38,6 +38,7 @@ const PLAYER_RADIUS := 0.4                # capsule radius; the wall-block probe
 const PLAYER_WEIGHT := 700.0              # N (~70 kg) pressed down onto a piece we stand on
 
 var world: WorldManager                   # injected by Main before _ready
+var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
 var flying := false
 
 var _camera: Camera3D
@@ -46,7 +47,7 @@ var _capsule: CapsuleShape3D
 var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
-var _highlight: AimHighlight              # wireframe cage on the block we aim at
+var _highlight: AimHighlight              # brightened face on the block we aim at
 
 func _ready() -> void:
 	# Build the camera rig in code to keep scenes minimal and robust.
@@ -80,8 +81,8 @@ func _ready() -> void:
 	collision_layer = 1 << 2
 	collision_mask = WOOD_LAYER_MASK
 
-	# Aim highlight: a world-space wireframe cage on whatever block we'd break.
-	# top_level (set in its _ready) keeps it independent of the player transform.
+	# Aim highlight: a world-space brightened face on whatever block we'd break or
+	# build against. top_level (set in its _ready) keeps it independent of us.
 	_highlight = AimHighlight.new()
 	_highlight.name = "AimHighlight"
 	add_child(_highlight)
@@ -112,7 +113,23 @@ func _unhandled_input(event: InputEvent) -> void:
 			_capture_mouse()
 		elif event.button_index == MOUSE_BUTTON_LEFT:
 			_try_break()
+		elif event.button_index == MOUSE_BUTTON_RIGHT:
+			_try_place()
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			# Minecraft direction: wheel-down moves the selector RIGHT. Each tick
+			# arrives as a pressed+released pair; we act on pressed only (the branch
+			# already filters to event.pressed), so one step per physical notch.
+			if inventory != null:
+				inventory.scroll(1)
+		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			if inventory != null:
+				inventory.scroll(-1)
 	elif event is InputEventKey and event.pressed and not event.echo:
+		# 1-9 select the matching hotbar slot (KEY_1..KEY_9 are consecutive).
+		if event.keycode >= KEY_1 and event.keycode <= KEY_9:
+			if inventory != null:
+				inventory.select_slot(event.keycode - KEY_1)
+			return
 		match event.keycode:
 			KEY_ESCAPE:
 				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -245,10 +262,13 @@ func _move_horizontal(motion: Vector3) -> void:
 ## targets the ground.
 ##
 ## Returns a Dictionary describing the winner:
-##   {"kind": "wood",    "body": VoxelBody, "cell": Vector3i, "xform": Transform3D}
-##   {"kind": "terrain", "body": null,      "cell": Vector3i, "xform": Transform3D}
-##   {"kind": "none",    "body": null,      "cell": Vector3i.ZERO, "xform": identity}
-## `xform` is the WORLD transform that drops a unit cube exactly on the block:
+##   {"kind": "wood",    "body": VoxelBody, "cell": Vector3i, "normal": Vector3i, "xform": Transform3D}
+##   {"kind": "terrain", "body": null,      "cell": Vector3i, "normal": Vector3i, "xform": Transform3D}
+##   {"kind": "none",    "body": null,      "cell": Vector3i.ZERO, "normal": Vector3i.ZERO, "xform": identity}
+## `normal` is the struck FACE's unit axis in the TARGET's LOCAL frame (the world
+## frame for terrain): it drives the face highlight and is the direction to place
+## a new block (target cell + normal). `xform` is the WORLD transform that drops a
+## unit cube exactly on the block:
 ##   * terrain — a pure translation to the cell corner (block occupies [c, c+1]);
 ##   * wood    — the body's global_transform composed with that translation, so a
 ##               tumbling/rotating body carries the cube with it.
@@ -260,6 +280,7 @@ func _current_target() -> Dictionary:
 	var wood_dist := INF
 	var wood_body: VoxelBody = null
 	var wood_cell := Vector3i.ZERO
+	var wood_normal := Vector3i.ZERO
 	var space := get_world_3d().direct_space_state
 	var q := PhysicsRayQueryParameters3D.create(origin, origin + dir * break_reach)
 	q.collision_mask = WOOD_LAYER_MASK
@@ -270,43 +291,107 @@ func _current_target() -> Dictionary:
 		wood_body = hit["collider"]
 		wood_dist = origin.distance_to(hit["position"])
 		wood_cell = wood_body.cell_at_hit(hit["position"], hit["normal"])
+		# Convert the world-space hit normal into the body's local frame and snap
+		# it to the dominant signed axis — the face of the LOCAL cell cube struck.
+		var hit_n := hit["normal"] as Vector3
+		var nl := (wood_body.global_transform.basis.inverse() * hit_n).normalized()
+		wood_normal = _dominant_axis(nl)
 
-	# Terrain (analytic voxel DDA in world space).
+	# Terrain (analytic voxel DDA in world space; DDA already reports the face).
 	var terr_dist := INF
 	var terr_cell := Vector3i.ZERO
+	var terr_normal := Vector3i.ZERO
 	var info := world.aimed_voxel(origin, dir, break_reach)
 	if info.get("hit", false):
 		terr_dist = origin.distance_to(info["position"])
 		terr_cell = info["voxel"]
+		terr_normal = info["normal"]
 
 	# Nearest wins; ties go to wood (it is physically in front of the terrain).
 	if wood_body != null and wood_dist <= terr_dist:
 		var xf := wood_body.global_transform * Transform3D(Basis(), Vector3(wood_cell))
-		return {"kind": "wood", "body": wood_body, "cell": wood_cell, "xform": xf}
+		return {"kind": "wood", "body": wood_body, "cell": wood_cell, "normal": wood_normal, "xform": xf}
 	if terr_dist < INF:
 		var xf := Transform3D(Basis(), Vector3(terr_cell))
-		return {"kind": "terrain", "body": null, "cell": terr_cell, "xform": xf}
-	return {"kind": "none", "body": null, "cell": Vector3i.ZERO, "xform": Transform3D()}
+		return {"kind": "terrain", "body": null, "cell": terr_cell, "normal": terr_normal, "xform": xf}
+	return {"kind": "none", "body": null, "cell": Vector3i.ZERO, "normal": Vector3i.ZERO, "xform": Transform3D()}
 
-## Left-click: break the block resolved by _current_target(). Behaviour is
-## identical to before — pointing at a pillar breaks the pillar, pointing at the
-## ground digs the ground.
+## The unit axis (as a signed Vector3i) of `v`'s largest-magnitude component —
+## snaps an approximate face normal to one of the 6 cube faces.
+func _dominant_axis(v: Vector3) -> Vector3i:
+	var ax := absf(v.x)
+	var ay := absf(v.y)
+	var az := absf(v.z)
+	if ax >= ay and ax >= az:
+		return Vector3i(1 if v.x >= 0.0 else -1, 0, 0)
+	if ay >= az:
+		return Vector3i(0, 1 if v.y >= 0.0 else -1, 0)
+	return Vector3i(0, 0, 1 if v.z >= 0.0 else -1)
+
+## Left-click: break the block resolved by _current_target() and collect it into
+## the hotbar. Pointing at a wood body breaks that body's cell; pointing at the
+## ground digs terrain (trees and placed blocks are terrain). We pass our own
+## position as the breaker so any detached loose piece gets a slight kick away.
 func _try_break() -> void:
 	var target := _current_target()
 	match String(target["kind"]):
 		"wood":
-			(target["body"] as VoxelBody).break_cell(target["cell"])
+			var body := target["body"] as VoxelBody
+			var cell: Vector3i = target["cell"]
+			var id := body.cell_block_id(cell)      # capture BEFORE breaking
+			body.break_cell(cell, global_position)  # kick away from us
+			if id > 0 and inventory != null:
+				inventory.add(id, 1)                # surplus silently lost (full-hotbar rule)
 		"terrain":
-			world.break_terrain(target["cell"])
+			var cell: Vector3i = target["cell"]
+			var id := world.break_terrain(cell, global_position)
+			if id > 0 and inventory != null:
+				inventory.add(id, 1)
 
-## Keep the wireframe cage sitting on whatever block we would break this frame,
-## or hide it when nothing is in range.
+## Right-click: place the selected hotbar block against the aimed TERRAIN face.
+## Placement attaches to terrain only (trees/placed blocks are terrain) — aiming
+## at a loose moving body places nothing, since a block glued to empty air beside
+## a tumbling body would float. We reject cells that would overlap the player;
+## `place_block` rejects occupied cells; we only pay on success.
+func _try_place() -> void:
+	if inventory == null:
+		return
+	var id := inventory.selected_block_id()
+	if id == 0:
+		return                                    # empty slot
+	var target := _current_target()
+	if String(target["kind"]) != "terrain":
+		return                                    # no building against moving rigid bodies
+	var base_cell: Vector3i = target["cell"]
+	var nrm: Vector3i = target["normal"]
+	var place_cell := base_cell + nrm
+	if _cell_intersects_player(place_cell):
+		return
+	if world.place_block(place_cell, id):
+		inventory.consume_selected(1)             # only pay on success
+
+## AABB overlap: player box (center (px, feet+0.9, pz), half-extents
+## (PLAYER_RADIUS, 0.9, PLAYER_RADIUS) — i.e. feet up to 1.8 m) vs cell cube
+## [c, c+1), with a small epsilon so a block level with our feet plane in the NEXT
+## column is still allowed.
+func _cell_intersects_player(cell: Vector3i) -> bool:
+	const EPS := 0.001
+	var lo := Vector3(cell)
+	var hi := lo + Vector3.ONE
+	var pmin := global_position + Vector3(-PLAYER_RADIUS, 0.0, -PLAYER_RADIUS)
+	var pmax := global_position + Vector3(PLAYER_RADIUS, 1.8, PLAYER_RADIUS)
+	return pmin.x < hi.x - EPS and pmax.x > lo.x + EPS \
+		and pmin.y < hi.y - EPS and pmax.y > lo.y + EPS \
+		and pmin.z < hi.z - EPS and pmax.z > lo.z + EPS
+
+## Keep the face highlight sitting on whatever block we would break/build this
+## frame, or hide it when nothing is in range.
 func _update_highlight() -> void:
 	var target := _current_target()
 	if String(target["kind"]) == "none":
 		_highlight.hide_it()
 	else:
-		_highlight.show_at(target["xform"])
+		_highlight.show_face(target["xform"], target["normal"])
 
 ## Shove any dynamic wooden block the player walks into, so blocks can be pushed
 ## around. Frozen (undisturbed) pillars ignore the query cheaply.

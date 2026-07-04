@@ -56,9 +56,10 @@ func _process(_delta: float) -> void:
 	if aimed.get("hit", false):
 		var v: Vector3i = aimed["voxel"]
 		var vt := env.temperature(Vector3(v.x + 0.5, v.y + 0.5, v.z + 0.5))
-		# The ground surface is a single material today (grass); block_id_at routes
-		# through the material framework so more surface states would show here.
-		var mat_name := "grass" if SurfaceModel.block_id_at(v.x, v.z) == SurfaceModel.GRASS_ID else "?"
+		# Composed cell query -> real material name for whatever block is aimed
+		# (grass/dirt/stone/wood/leaf/placed), via the authoritative BlockCatalog.
+		var id: int = world.block_id_at(v)
+		var mat_name := BlockCatalog.name_of(id)
 		aim_txt = "aim: %s %s  %.1f °C" % [mat_name, str(v), vt]
 	var mode := "FLY" if player.flying else "WALK"
-	_info_label.text = "%s | %s\nWASD move  Shift run  Space jump  F fly  Esc free" % [mode, aim_txt]
+	_info_label.text = "%s | %s\nWASD move  Shift run  Space jump  F fly  1-9/wheel slot  LMB break  RMB place  Esc free" % [mode, aim_txt]

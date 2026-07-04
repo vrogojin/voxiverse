@@ -16,21 +16,24 @@ var environment: PerVoxelEnvironment
 var materials: MaterialRegistry
 var using_module: bool = false
 
-var _grass_material: StandardMaterial3D
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 
-# Terrain edit overlay: cells the player has broken out of the heightmap. This is
-# the gameplay source of truth (floor + raycast consult it); each render path
-# mirrors it (godot_voxel carves via VoxelTool, the fallback remeshes the chunk).
-var _removed: Dictionary = {}         # Vector3i -> true
+# Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
+# collapse consult it), mirrored into whichever render path runs. This one
+# dictionary replaces the old `_removed` set: 0 = dug to air, >0 = player-placed
+# block id. `block_id_at(cell)` = edits-overlay-else-generated is THE cell query.
+var _edits: Dictionary = {}           # Vector3i -> int block_id (0 = air, >0 = placed)
+# Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
+# placed block does NOT lower it). Only bounds the collider's above-surface scan.
+var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
 
 func _ready() -> void:
 	environment = PerVoxelEnvironment.new()
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
-	_grass_material = GrassMaterial.build()
+	BlockCatalog.ensure_ready()
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -56,7 +59,7 @@ func _setup_module_path() -> void:
 		return
 	var world := script.new() as Node3D
 	add_child(world)
-	if world.call("setup", _grass_material):
+	if world.call("setup"):
 		_module_world = world
 		using_module = true
 	else:
@@ -66,7 +69,7 @@ func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
 	_streamer.name = "ChunkStreamer"
 	add_child(_streamer)
-	_streamer.setup(_grass_material, self)
+	_streamer.setup(self)
 
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
@@ -81,41 +84,91 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _ground != null:
 		_ground.update(player_pos)
 
-# --- terrain editing (block breaking) ------------------------------------------
+# --- terrain editing (block breaking + placing) --------------------------------
 
-## True if cell has been broken out of the terrain heightmap.
+## Universal composed cell query: edit overlay first, else generated terrain+trees.
+## THE cell query — floor/blocked/DDA/collider/collapse all go through it, so the
+## edit overlay, the layered terrain and the trees always agree.
+func block_id_at(cell: Vector3i) -> int:
+	var e: int = _edits.get(cell, -1)
+	if e >= 0:
+		return e
+	return TerrainConfig.generated_block(cell.x, cell.y, cell.z)
+
+## Composed solidity (public now; the old private _cell_solid delegates to it).
+func cell_solid(cell: Vector3i) -> bool:
+	return block_id_at(cell) != BlockCatalog.AIR
+
+## True if the cell was dug out (edit overlay says air). Used by fast column loops
+## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
+## below the heightmap.
 func is_removed(cell: Vector3i) -> bool:
-	return _removed.has(cell)
+	return _edits.get(cell, -1) == 0
+
+## Highest y the player ever PLACED a block at in column (x, z); returns a deep
+## negative sentinel when the column has no placements. (Bounds collider scans.)
+func placed_top(x: int, z: int) -> int:
+	return _placed_top.get(Vector2i(x, z), -0x40000000)
+
+## Read-only view of the edit overlay (Vector3i -> int block_id; 0 = dug air,
+## >0 = placed). The fallback mesher reads placed (id > 0) cells from it.
+func placed_cells() -> Dictionary:
+	return _edits
 
 ## Topmost still-solid column height at (x, z): the noise height, lowered past any
 ## blocks the player has broken from the top. Because every column is solid all
-## the way down, this always finds a block — the ground is never hollow.
+## the way down, this always finds a block — the ground is never hollow. (Ignores
+## placed blocks ABOVE the heightmap; those are handled by placed_cells/placed_top.)
 func effective_height(x: int, z: int) -> int:
 	var h := TerrainConfig.height_at(x, z)
-	while _removed.has(Vector3i(x, h, z)):
+	while is_removed(Vector3i(x, h, z)):
 		h -= 1
 	return h
 
-## Break the terrain voxel at `cell` (PLAYER-INITIATED). Returns true if a solid
-## block was removed. Mirrors the edit into the active render path, then runs a
-## local support analysis so any terrain left floating by the dig drops as loose
-## rigid bodies, and finally refreshes ground collision.
-func break_terrain(cell: Vector3i) -> bool:
-	if _removed.has(cell) or not TerrainConfig.is_solid(cell.x, cell.y, cell.z):
+## Break the block at `cell` (terrain, layers, tree cells, placed blocks alike).
+## Returns the BROKEN BLOCK ID (>0) on success, 0 if the cell was already air.
+## `from_pos` (the breaker's position) propagates to the collapse pass so any
+## detached floating cluster gets a slight kick away from the breaker; pass
+## Vector3.INF (default) for "no kick". Mirrors into the active render path, runs
+## a local support analysis so undercut terrain drops as loose rigid bodies, then
+## refreshes ground collision.
+func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
+	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
+		return 0
+	var id: int = block_id_at(cell)     # capture BEFORE carving
+	_edits[cell] = 0
+	_paint_cell(cell, 0)
+	_collapse_unsupported(cell, from_pos)   # only from the player break — never a spawn
+	if _ground != null:
+		_ground.rebuild_now()
+	return id
+
+## Place one block of `block_id` into `cell`. Fails (returns false, no state
+## change) if the cell is not air (composed query) or block_id is invalid (<=0 or
+## >= BlockCatalog.COUNT). On success writes the overlay, updates _placed_top,
+## mirrors into the active render path and rebuilds the ground collider.
+## Player-overlap is the CALLER's check (the world doesn't know where the player is).
+func place_block(cell: Vector3i, block_id: int) -> bool:
+	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.COUNT:
 		return false
-	_removed[cell] = true
-	_carve_cell(cell)
-	_collapse_unsupported(cell)   # only from the player break — never from a spawn
+	if cell_solid(cell):
+		return false
+	_edits[cell] = block_id
+	var key := Vector2i(cell.x, cell.z)
+	var prev: int = _placed_top.get(key, -0x40000000)
+	if cell.y > prev:
+		_placed_top[key] = cell.y
+	_paint_cell(cell, block_id)
 	if _ground != null:
 		_ground.rebuild_now()
 	return true
 
-## Mark-free carve: remove `cell` from the active render path only (the caller owns
-## the `_removed` overlay + ground rebuild). Shared by break_terrain and the
-## collapse pass so the godot_voxel / fallback plumbing lives in one place.
-func _carve_cell(cell: Vector3i) -> void:
+## Mirror one cell's block id into the active render path (0 = carve to air).
+## Shared by break/place/collapse so the godot_voxel / fallback plumbing lives in
+## one place. The caller owns the `_edits` overlay + ground rebuild.
+func _paint_cell(cell: Vector3i, block_id: int) -> void:
 	if using_module and _module_world != null:
-		_module_world.call("remove_voxel", cell)
+		_module_world.call("set_cell", cell, block_id)
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
 
@@ -138,27 +191,32 @@ const _NEIGHBORS_6: Array[Vector3i] = [
 ##
 ## MUST be called only from the player-initiated break_terrain, never from a spawn
 ## path, so it cannot recurse.
-func _collapse_unsupported(center: Vector3i) -> void:
+func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
 	var x0 := center.x - _COLLAPSE_RADIUS
 	var x1 := center.x + _COLLAPSE_RADIUS
 	var z0 := center.z - _COLLAPSE_RADIUS
 	var z1 := center.z + _COLLAPSE_RADIUS
 
-	# Vertical bounds: top = tallest column in the region; bottom = shortest column
-	# minus 2, a row that is solid in every column and connects to the untouched bulk.
-	var y_hi := -0x3FFFFFFF
+	# Vertical bounds: top = tallest column PLUS the max tree/placed height above the
+	# surface (so canopies and player towers participate in the support analysis);
+	# bottom = shortest column minus 2, a row solid in every column that connects to
+	# the untouched bulk.
+	var max_h := -0x3FFFFFFF
 	var y_lo_top := 0x3FFFFFFF
+	var placed_hi := -0x40000000
 	var xi := x0
 	while xi <= x1:
 		var zi := z0
 		while zi <= z1:
 			var h := TerrainConfig.height_at(xi, zi)
-			if h > y_hi:
-				y_hi = h
+			if h > max_h:
+				max_h = h
 			if h < y_lo_top:
 				y_lo_top = h
+			placed_hi = maxi(placed_hi, placed_top(xi, zi))
 			zi += 1
 		xi += 1
+	var y_hi := maxi(max_h + TreeGen.MAX_ABOVE_SURFACE, placed_hi)
 	var y_lo := y_lo_top - 2
 
 	# Seed support from every solid cell on the region BOUNDARY shell — the bottom
@@ -230,14 +288,17 @@ func _collapse_unsupported(center: Vector3i) -> void:
 				if floating.has(nc) and not seen.has(nc):
 					seen[nc] = true
 					cstack.append(nc)
-		# Carve every cell of the component out of the terrain, then drop it as a body
-		# positioned exactly where those cells were (grass, since these are ground).
+		# Capture each cell's block id BEFORE carving (so mixed grass/dirt/stone and
+		# wood+leaf canopies keep their materials), then carve the component out of the
+		# terrain and drop it as one loose body — VoxelBody resolves materials + masses
+		# from the ids itself. from_pos kicks the cluster away from the breaker.
+		var comp_ids: Dictionary = {}   # Vector3i -> int block_id
 		for c: Vector3i in comp:
-			_removed[c] = true
-			_carve_cell(c)
-		# Reuse the shared grass material (GrassMaterial.build() is uncached — it
-		# would alloc a material + reload the texture on every collapse).
-		VoxelBody.spawn_loose(self, comp, _grass_material, self)
+			comp_ids[c] = block_id_at(c)
+		for c: Vector3i in comp:
+			_edits[c] = 0
+			_paint_cell(c, 0)
+		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
 
 # --- analytic world queries (path-agnostic) ------------------------------------
 
@@ -257,9 +318,10 @@ func surface_y(x: float, z: float) -> float:
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
-	# Start at the feet, but never above the column's noise top (nothing solid lives
-	# higher than that, so there is no point scanning empty air above the surface).
-	var start := mini(int(floor(feet_y + 0.5)), TerrainConfig.height_at(xi, zi))
+	# Start at the feet directly (NO clamp to the noise top): players stand on trees
+	# and placed towers ABOVE the heightmap, and clamping down would teleport them
+	# off. Scan length is bounded by the fall distance — cheap.
+	var start := int(floor(feet_y + 0.5))
 	var y := start
 	while y > -1024:
 		if _cell_solid(Vector3i(xi, y, zi)) and not _cell_solid(Vector3i(xi, y + 1, zi)):
@@ -284,8 +346,7 @@ func blocked(x: float, z: float, feet_y: float) -> bool:
 	return false
 
 func is_solid(pos: Vector3) -> bool:
-	var cell := Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))
-	return TerrainConfig.is_solid_pos(pos) and not _removed.has(cell)
+	return cell_solid(Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z))))
 
 ## Voxel-DDA ray (Amanatides & Woo) against the heightmap. Returns
 ## {hit, voxel:Vector3i, normal:Vector3i, position:Vector3}.
@@ -322,10 +383,11 @@ func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictio
 	return {"hit": false, "voxel": Vector3i.ZERO, "normal": Vector3i.ZERO,
 		"position": origin + d * max_dist}
 
-# A cell is a solid ray target only if the heightmap fills it AND it has not been
-# broken out (removed cells are air the ray passes through).
+# Internal alias kept for the collapse pass + DDA; delegates to the composed
+# public query (edit overlay first, else generated terrain + trees), so removed
+# cells are air and placed/tree cells are solid ray/collapse targets.
 func _cell_solid(cell: Vector3i) -> bool:
-	return TerrainConfig.is_solid(cell.x, cell.y, cell.z) and not _removed.has(cell)
+	return cell_solid(cell)
 
 # Distance along one axis to the first integer boundary in the ray's direction.
 static func _first_cross(o: float, dir: float) -> float:

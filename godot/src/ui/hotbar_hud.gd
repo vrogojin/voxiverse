@@ -29,13 +29,20 @@ func _ready() -> void:
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(root)
 
+	# A full-width band pinned to the BOTTOM of the screen, with its slots packed
+	# CENTER — reliably bottom-centre regardless of viewport size. (Relying on
+	# CENTER_BOTTOM + grow is fragile: the container's zero-size rect at build time
+	# gets pinned to a corner. Full-width + ALIGNMENT_CENTER avoids that entirely.)
 	var hbox := HBoxContainer.new()
 	hbox.add_theme_constant_override("separation", 4)
+	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(hbox)
-	hbox.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	hbox.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	hbox.grow_vertical = Control.GROW_DIRECTION_BEGIN
-	hbox.offset_bottom = -16.0
+	hbox.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+	hbox.offset_left = 0.0
+	hbox.offset_right = 0.0
+	hbox.offset_top = -float(SLOT_PX + 20)   # height band tall enough for one slot row
+	hbox.offset_bottom = -16.0                # lift off the very bottom edge
 
 	for i: int in range(Inventory.SLOT_COUNT):
 		_build_slot(hbox)

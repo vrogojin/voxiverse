@@ -25,6 +25,11 @@ const BASE_HEIGHT := 5.0        # average ground height
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
 const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
 
+# --- stone layer (its OWN, decorrelated relief) --------------------------------
+const STONE_BASE := 3.0         # average stone-surface height
+const STONE_AMPLITUDE := 3.5    # stone's own hills
+const DIRT_MIN_DEPTH := 3       # stone top is at least this far below the grass top
+
 ## Render radius around the player, in blocks (DESIGN §1). Drives the fallback
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
@@ -39,6 +44,7 @@ const CHUNK_SIZE := 32
 # Lazily-created noise stack shared by every consumer.
 static var _hills: FastNoiseLite     # gentle base terrain
 static var _detail: FastNoiseLite    # small-scale bumpiness
+static var _stone: FastNoiseLite     # stone surface, own relief (decorrelated)
 
 static func _ensure_noise() -> void:
 	if _hills != null:
@@ -56,6 +62,16 @@ static func _ensure_noise() -> void:
 	_detail.seed = SEED + 7919
 	_detail.frequency = 0.05
 
+	# Decorrelated from _hills in BOTH seed and frequency, so stone hills do not
+	# coincide with grass hills — the stone surface follows its own relief.
+	_stone = FastNoiseLite.new()
+	_stone.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	_stone.seed = SEED + 4443
+	_stone.frequency = 0.017
+	_stone.fractal_type = FastNoiseLite.FRACTAL_FBM
+	_stone.fractal_octaves = 2
+	_stone.fractal_gain = 0.5
+
 ## Surface height (integer y of the topmost surface block) at world column (x, z).
 static func height_at(x: int, z: int) -> int:
 	_ensure_noise()
@@ -67,9 +83,33 @@ static func height_at(x: int, z: int) -> int:
 	h += _detail.get_noise_2d(fx, fz) * DETAIL_AMPLITUDE
 	return int(floor(h))
 
-## True when cell (x, y, z) is solid; false for air.
+## Raw stone-surface height from stone's OWN noise, BEFORE the grass clamp
+## (ranges ≈ -1..6). generated_block clamps this to at least DIRT_MIN_DEPTH below
+## the grass top, so stone never pokes through the dirt band.
+static func stone_height_at(x: int, z: int) -> int:
+	_ensure_noise()
+	return int(floor(STONE_BASE + _stone.get_noise_2d(float(x), float(z)) * STONE_AMPLITUDE))
+
+## Pure generation (no edits): which block id the WORLD GENERATOR puts at (x,y,z).
+## THE terrain function — both render paths, the analytic queries, the collider
+## and the collapse pass all derive from it, so they agree by construction.
+## Per column: grass ONLY at the surface cell y==g; a dirt band of thickness >= 2
+## between grass and stone_top = min(stone_height, g-3); stone all the way down
+## (columns are never hollow); wood/leaf trees above the surface.
+static func generated_block(x: int, y: int, z: int) -> int:
+	var g := height_at(x, z)
+	if y > g:
+		return TreeGen.block_at(x, y, z)            # wood/leaf above the surface, else AIR
+	if y == g:
+		return BlockCatalog.GRASS                    # grass ONLY at the surface cell
+	var stone_top := mini(stone_height_at(x, z), g - DIRT_MIN_DEPTH)
+	return BlockCatalog.STONE if y <= stone_top else BlockCatalog.DIRT
+
+## True when cell (x, y, z) is solid; false for air. Now the composed terrain +
+## tree query, so tree cells are solid for every existing consumer (floor,
+## blocked, DDA, collider). height_at keeps its meaning (grass heightmap top).
 static func is_solid(x: int, y: int, z: int) -> bool:
-	return y <= height_at(x, z)
+	return generated_block(x, y, z) != BlockCatalog.AIR
 
 ## Convenience: solidity from a world-space position (floored to a cell).
 static func is_solid_pos(p: Vector3) -> bool:

@@ -112,8 +112,20 @@ func _rebuild() -> void:
 				elif run_start == 0x7fffffff:
 					run_start = y
 				y += 1
+			# Continue ABOVE the heightmap for tree cells (trunk/canopy) and placed
+			# blocks, using the composed cell query. A run left open at the surface
+			# (grass top) merges straight into a trunk/placed block sitting on it.
+			var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(x, z))
+			while y <= y_top:
+				if world.block_id_at(Vector3i(x, y, z)) != 0:
+					if run_start == 0x7fffffff:
+						run_start = y
+				elif run_start != 0x7fffffff:
+					_add_box(rid, x, z, run_start, y)
+					run_start = 0x7fffffff
+				y += 1
 			if run_start != 0x7fffffff:
-				_add_box(rid, x, z, run_start, h + 1)       # top run up to the surface
+				_add_box(rid, x, z, run_start, y_top + 1)   # top run (surface / tree / tower)
 
 ## Attach one box covering the solid cells [y_bottom, y_top-1] of column (x, z),
 ## i.e. the world volume [y_bottom, y_top]. Reuses a pooled BoxShape (resized in

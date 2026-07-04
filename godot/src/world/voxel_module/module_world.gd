@@ -25,20 +25,23 @@ var _terrain: Node3D
 var _viewer: Node
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
-func setup(grass_material: Material) -> bool:
+func setup() -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
 		return false
 
-	# Warm the surface state machine on THIS (main) thread before the generator
-	# runs on the voxel worker thread — avoids a lazy-init race.
+	# Warm the surface state machine, block catalog AND the terrain noise stack on
+	# THIS (main) thread before the generator runs on the voxel worker thread —
+	# avoids a lazy-init race (the generator now samples the stone noise too).
 	SurfaceModel.ensure_ready()
+	BlockCatalog.ensure_ready()
+	TerrainConfig.height_at(0, 0)   # forces _ensure_noise() (hills + detail + stone)
 
 	var library: Object = ClassDB.instantiate("VoxelBlockyLibrary")
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
 	if library == null or mesher == null:
 		return false
 
-	if not _configure_library(library, grass_material):
+	if not _configure_library(library):
 		return false
 
 	var generator: Object = _make_generator()
@@ -59,15 +62,15 @@ func setup(grass_material: Material) -> bool:
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)
-	# The grass block model (id 1) carries its own material; no terrain-wide
+	# Each block model (ids 1..5) carries its own material; no terrain-wide
 	# material_override needed.
 	add_child(_terrain)
 	return true
 
-## Carve one voxel to air (block breaking). Uses the terrain's VoxelTool to set
-## the TYPE channel to 0 (the empty/air model), which triggers a local remesh.
-## Driven through strings so this file still parses without the module present.
-func remove_voxel(cell: Vector3i) -> void:
+## Set one voxel to `block_id` (0 = air/break, >0 = place). Uses the terrain's
+## VoxelTool to write the TYPE channel, which triggers a local remesh. Driven
+## through strings so this file still parses without the module present.
+func set_cell(cell: Vector3i, block_id: int) -> void:
 	if _terrain == null or not _terrain.has_method("get_voxel_tool"):
 		return
 	var vt: Object = _terrain.call("get_voxel_tool")
@@ -76,7 +79,7 @@ func remove_voxel(cell: Vector3i) -> void:
 	# VoxelBuffer.CHANNEL_TYPE == 0; VoxelTool.MODE_SET == 0 (default).
 	_set_if(vt, "channel", 0)
 	_set_if(vt, "mode", 0)
-	vt.call("set_voxel", cell, 0)
+	vt.call("set_voxel", cell, block_id)
 
 ## Attach a VoxelViewer to the player so the terrain streams around them.
 func attach_viewer(player: Node3D) -> void:
@@ -92,20 +95,32 @@ func attach_viewer(player: Node3D) -> void:
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
 
-## Build the library: air=0, grass cube=1. Returns true on success.
-func _configure_library(library: Object, grass_material: Material) -> bool:
+## Build the library: air=0, then grass/dirt/stone/wood/leaf cubes at ids 1..5.
+## The model index MUST equal the BlockCatalog id (the generator + edit path write
+## those ids), so each add is asserted — a mismatch silently recolours the world.
+## Returns true on success.
+func _configure_library(library: Object) -> bool:
 	# Index 0 = air. Without this the first cube would land at id 0 (= air).
 	if ClassDB.class_exists("VoxelBlockyModelEmpty"):
 		library.call("add_model", ClassDB.instantiate("VoxelBlockyModelEmpty"))
 
-	var grass_id: int = _add_cube(library, grass_material)
+	# EXACT order after air: grass, dirt, stone, wood, leaf. grass/wood carry the
+	# textured materials; dirt/stone/leaf carry flat solid-colour materials. The
+	# 1x1 atlas is harmless for the solid ones and uniform for all.
+	var ids: Array[int] = [
+		BlockCatalog.GRASS, BlockCatalog.DIRT, BlockCatalog.STONE,
+		BlockCatalog.WOOD, BlockCatalog.LEAF,
+	]
+	for block_id: int in ids:
+		var got: int = _add_cube(library, BlockMaterials.get_for(block_id))
+		if got != block_id:
+			return false
+
 	# bake() regenerates model geometry + UVs from the tile/atlas config; without
-	# it the tile/atlas UV setup below never takes effect.
+	# it the tile/atlas UV setup never takes effect.
 	if library.has_method("bake"):
 		library.call("bake")
-
-	# The generator writes SurfaceModel's grass id; the library order must match.
-	return grass_id == SurfaceModel.GRASS_ID
+	return true
 
 ## Add one textured cube model, returning its library id.
 func _add_cube(library: Object, material: Material) -> int:
@@ -130,8 +145,9 @@ func _add_cube(library: Object, material: Material) -> int:
 	return ((models as Array).size() - 1) if models is Array else -1
 
 ## Compile the VoxelGeneratorScript subclass at runtime (see header for why it
-## can't be a normal committed script). Fills grass at and below the shared
-## heightmap, air above — matching the fallback exactly.
+## can't be a normal committed script). Writes the layered stackup (stone / dirt /
+## grass) and the tree overlay (wood / leaf) exactly as TerrainConfig.generated_block
+## defines it, so the module path and the analytic queries agree by construction.
 func _make_generator() -> Object:
 	var src := """
 extends VoxelGeneratorScript
@@ -147,34 +163,51 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var oy = origin_in_voxels.y
 	var oz = origin_in_voxels.z
 	var ch = VoxelBuffer.CHANNEL_TYPE
-	var grass_id = SurfaceModel.GRASS_ID
+	var grass_id = BlockCatalog.GRASS
+	var dirt_id = BlockCatalog.DIRT
+	var stone_id = BlockCatalog.STONE
+	var max_above = TreeGen.MAX_ABOVE_SURFACE
+	var dirt_min = TerrainConfig.DIRT_MIN_DEPTH
 
-	# Surface heights for this block's columns, plus the block's height range.
-	var heights = []
-	heights.resize(size.x * size.z)
-	var min_h = 0x7fffffff
+	# Per-column grass top g and stone top st = min(stone_noise, g - dirt_min).
+	var gs = []
+	gs.resize(size.x * size.z)
+	var sts = []
+	sts.resize(size.x * size.z)
 	var max_h = -0x7fffffff
 	for z in range(size.z):
 		for x in range(size.x):
-			var h = TerrainConfig.height_at(ox + x, oz + z)
-			heights[z * size.x + x] = h
-			if h < min_h: min_h = h
-			if h > max_h: max_h = h
+			var wx = ox + x
+			var wz = oz + z
+			var g = TerrainConfig.height_at(wx, wz)
+			var st = min(TerrainConfig.stone_height_at(wx, wz), g - dirt_min)
+			var idx = z * size.x + x
+			gs[idx] = g
+			sts[idx] = st
+			if g > max_h: max_h = g
 
-	# Whole block above every surface -> all air (leave buffer default 0).
-	if oy > max_h:
+	# Whole block above every surface + tree cap -> all air (leave buffer default 0).
+	if oy > max_h + max_above:
 		return
-	# Whole block strictly below every surface -> all solid grass (fast path).
-	if (oy + size.y) <= min_h:
-		buffer.fill(grass_id, ch)
-		return
-	# Mixed: grass at and below the surface, air above.
+
 	for z in range(size.z):
 		for x in range(size.x):
-			var h = heights[z * size.x + x]
-			var top = clampi(h - oy + 1, 0, size.y)
-			for y in range(top):
-				buffer.set_voxel(grass_id, x, y, z, ch)
+			var idx = z * size.x + x
+			var g = gs[idx]
+			var st = sts[idx]
+			var wx = ox + x
+			var wz = oz + z
+			for y in range(size.y):
+				var wy = oy + y
+				var id = 0
+				if wy < g:
+					id = stone_id if wy <= st else dirt_id
+				elif wy == g:
+					id = grass_id
+				elif wy <= g + max_above:
+					id = TreeGen.block_at(wx, wy, wz)
+				if id != 0:
+					buffer.set_voxel(id, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
 	gen_script.source_code = src

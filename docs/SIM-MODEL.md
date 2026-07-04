@@ -104,26 +104,54 @@ depth  > 0:  light = exp(-depth / LIGHT_DEPTH)      LIGHT_DEPTH = 1.5 m
 
 Normalised to `[0, 1]`. (Verified: air = 1.0, 5 m deep = 0.036.)
 
-## 6. The surface material (single state today)
+## 6. The block catalog (five materials today)
 
-`SurfaceModel` (`sim/surface_model.gd`) owns one ground **surface** material.
-Today it ships a single state — `grass` (block id: air=0, grass=1) — so the world
-is uniformly grass, but the decision still runs through the material framework:
-`SurfaceModel.block_id_at(x, z)` returns the material's default-state `block_id`
-via the §2 machinery, so there is no ad-hoc `if` in any mesher.
+`BlockCatalog` (`sim/block_catalog.gd`) is the authoritative block-id table, built
+on the §2 `VoxelState` framework so ids, masses, colours and names live in one
+place. Everyone reads from it: physics reads masses, the render layer reads
+ids/looks, the hotbar UI reads colours/names.
 
-Both rendering paths call this one function, so they always agree:
-* **godot_voxel path** — the generator fills grass at and below the heightmap,
-  air above; the blocky library has cube models at id 0 (air) and 1 (grass), the
-  grass cube carrying its own material (atlas `(1,1)` + per-face tile `(0,0)` +
-  `bake()` so UVs span 0..1 — see the degenerate-UV note in the code).
-* **GDScript fallback** — `ChunkMesher` greedy-merges top faces by height and
-  emits one grass wall per downward step.
+| id | name | mass (kg/voxel) | look | notes |
+|----|-------|-----------------|------|-------|
+| 0 | air | — | — | passable |
+| 1 | grass | 750 | baked grass PNG | generated **only** as the top cell of a column |
+| 2 | dirt | 900 | solid brown | band under grass |
+| 3 | stone | **1500 (heaviest)** | solid grey | deep layer, own noise, ≥3 below grass |
+| 4 | wood | **80 (lightest)** | baked wood grain (never tinted) | tree trunks; the pushable sandbox |
+| 5 | leaf | 100 | solid dark green | tree canopy |
 
-To add surface variety (mud, sand, ice, snow) you add more `VoxelState`s +
-transitions in `SurfaceModel`, one more library id, and route the mesher's
-surface faces by the resolved `block_id` — no HUD or player changes. The engine
-supported temperature-driven snow this way in an earlier iteration (see §4).
+`SurfaceModel` keeps `GRASS_ID` (== `BlockCatalog.GRASS`) and delegates mass/break
+to the catalog; `BlockMaterials.get_for(id)` supplies the cached render material
+per id (textured for grass/wood, solid-colour swatch for dirt/stone/leaf).
+
+**Layered terrain (`TerrainConfig.generated_block(x,y,z)`).** A column is grass at
+the surface `g = height_at(x,z)`, then a dirt band, then stone from
+`stone_top = min(stone_height_at(x,z), g-3)` downward (never hollow). `stone_height_at`
+uses a **second, decorrelated noise field**, so the stone relief has its own hills
+that don't coincide with the grass surface and always sit ≥3 blocks deeper.
+
+**Trees (`world/tree_gen.gd`).** A deterministic, hash-of-position overlay (no
+per-run randomness, so both render paths and reloads agree): patches of wood-trunk
++ leaf-canopy trees scattered over the terrain, produced by the same
+`generated_block` both paths derive from. Chopping a trunk detaches the canopy as a
+mixed wood+leaf `VoxelBody` via the collapse pass. Trees replaced the old wooden
+test pillars.
+
+**Editing.** `WorldManager` holds one sparse edit overlay (`_edits: Vector3i→id`;
+0 = dug to air, >0 = player-placed). `block_id_at(cell)` = overlay-else-generated is
+THE cell query for floor/raycast/collider/collapse. Breaking returns the broken id
+(→ hotbar); right-click `place_block` writes the overlay, mirrors into the active
+render path, and rebuilds the local ground collider.
+
+Both rendering paths agree because both derive from `generated_block` + the overlay:
+* **godot_voxel path** — the generator writes stone/dirt/grass runs + tree cells;
+  the blocky library has cube models 0..5 in catalog-id order (asserted at build).
+* **GDScript fallback** — `ChunkMesher` emits one surface per present id, banding
+  hillsides by material and cube-rendering trees & placed blocks (safety-net grade).
+
+Adding a material is still a data change: extend `BlockCatalog`, add one library id
++ a `BlockMaterials` entry, and (for generation) a rule in `generated_block` — no
+HUD or player changes. Temperature-driven states (snow/ice/water) drop in the same way (see §4).
 
 ## 7. Why this extends cleanly
 

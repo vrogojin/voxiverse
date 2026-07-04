@@ -1,94 +1,112 @@
 class_name AimHighlight
 extends MeshInstance3D
-## A wireframe cube outline drawn around the block the player is currently aiming
-## at (and would break with a left-click). It reads clearly over any texture — a
-## grass voxel, a wooden face — because it is an UNSHADED line mesh. It respects
-## the depth buffer like normal in-world geometry: edges on the exposed near faces
-## of the target block draw, while edges behind the block (or occluded by an
-## intervening block/pillar) are correctly hidden. The INFLATE bump lifts the 12
-## edges just proud of the block faces so they read crisply without z-fighting.
+## Brightens the FACE of the block the player is currently aiming at (and would
+## break with a left-click, or build against with a right-click). Instead of a
+## wireframe cage, it is a single unit quad laid flat on the aimed face, floated a
+## hair proud of it (LIFT) to avoid z-fighting, drawn UNSHADED with ADDITIVE
+## blending so it literally brightens whatever texture is underneath — a grass
+## voxel, a wooden face — regardless of lighting.
 ##
-## The mesh is a unit cube spanning body-LOCAL [0, 1] on every axis, matching the
-## convention that voxel cell `c` occupies the unit cube [c, c+1]. It is inflated
-## a hair (INFLATE) around its centre so the outline sits just proud of the block
-## faces instead of coplanar with them. Positioning is done entirely through the
-## node transform: `show_at(xform)` drops the [0,1] cube exactly onto the target
-## block, and because the caller passes a full Transform3D the outline tracks a
-## tumbling/rotating VoxelBody as faithfully as a static terrain voxel.
+## Depth testing stays ON (no_depth_test = false), so an intervening block hides
+## the face highlight exactly like normal in-world geometry — the same occlusion
+## guarantee the old wireframe established (walk behind a rise and the highlight
+## on a block beyond it disappears).
+##
+## Positioning is entirely through the node transform. The caller supplies the
+## full block transform (`cell_xform`, the WORLD transform of the unit cube on the
+## target block — for a tumbling VoxelBody it carries the body's rotation) plus the
+## struck face's unit normal in the block's LOCAL frame; a static 6-entry LUT maps
+## that normal to the transform that carries the flat local quad onto the matching
+## face of the unit cube [0,1]^3. Because `cell_xform` is the same transform the
+## wireframe used, the face quad tracks moving bodies as faithfully as static
+## terrain.
 
-## How far past the unit cube the outline is pushed, per axis, around the cube
-## centre. 1.06 ≈ 3 cm of clearance on a 1 m block — enough to lift the lines off
-## the coplanar block faces so depth-tested rendering shows them without z-fighting
-## shimmer, while still hugging the block closely enough to read as its outline.
-const INFLATE := 1.06
+## Metres the quad floats off the face, along the face normal, so the additive
+## quad sits just proud of the coplanar block face and never z-fights with it.
+const LIFT := 0.004
+
+## Face lookup table: block-local unit normal (Vector3i) -> the Transform3D that
+## maps the flat local quad [0,1]x[0,1] (in the XZ plane at y=0, normal +Y) onto
+## that face of the unit cube [0,1]^3, lifted LIFT outward along the normal. Built
+## once, lazily, and shared by every highlight instance (static).
+static var _FACE: Dictionary = {}
 
 func _ready() -> void:
 	# Live in world space: the player parents us but its own translation/rotation
-	# must not drag the outline around — show_at() supplies an absolute transform.
+	# must not drag the highlight around — show_face() supplies an absolute
+	# transform composed from the target block's transform and the face LUT.
 	top_level = true
-	mesh = _build_wire_cube()
+	_ensure_lut()
+	mesh = _build_quad()
 	visible = false
 
-## Snap the outline onto a target block. `xform` is the WORLD transform that maps
-## the local [0,1] unit cube onto the block: for terrain it is a pure translation
-## to the cell corner; for a wooden block it also carries the body's rotation so
-## the cage tumbles with the piece.
-func show_at(xform: Transform3D) -> void:
-	global_transform = xform
+## Snap the highlight onto the aimed face. `cell_xform` is the WORLD transform of
+## the target block's unit cube (pure translation for terrain; body transform
+## composed with the cell offset for a wooden block). `normal` is the struck
+## face's unit axis in the block's LOCAL frame — the LUT places the quad on that
+## face, lifted proud of it.
+func show_face(cell_xform: Transform3D, normal: Vector3i) -> void:
+	var face: Transform3D = _FACE.get(normal, Transform3D())
+	global_transform = cell_xform * face
 	visible = true
 
-## Nothing is targeted (out of reach / pointing at sky) — stop drawing the cage.
+## Nothing is targeted (out of reach / pointing at sky) — stop drawing.
 func hide_it() -> void:
 	visible = false
 
 # --- internals -----------------------------------------------------------------
 
-## Build the 12-edge outline of the unit cube [0,1]^3 as a PRIMITIVE_LINES mesh,
-## inflated by INFLATE about the cube centre, with a bright unshaded material that
-## respects the depth buffer so closer opaque geometry occludes it.
-func _build_wire_cube() -> ArrayMesh:
-	# Inflate each of the two corner coordinates (0 and 1) about the centre 0.5.
-	const CENTER := 0.5
-	var lo := CENTER + (0.0 - CENTER) * INFLATE   # slightly below 0
-	var hi := CENTER + (1.0 - CENTER) * INFLATE   # slightly above 1
+## Build the static face LUT once. Each entry carries the flat quad (u along local
+## X, v along local Z, at y=0) onto one face of the unit cube so it fully covers
+## that face's [0,1]x[0,1] square, offset LIFT outward along the face normal.
+static func _ensure_lut() -> void:
+	if not _FACE.is_empty():
+		return
+	# Top / bottom: the quad already lies in the XZ plane, just lift it in Y.
+	_FACE[Vector3i.UP] = Transform3D(Basis(), Vector3(0.0, 1.0 + LIFT, 0.0))
+	_FACE[Vector3i.DOWN] = Transform3D(Basis(), Vector3(0.0, -LIFT, 0.0))
+	# Sides: rotate the quad upright so local X->Y (or Z) spans the vertical face.
+	# Basis columns are the images of local X, Y, Z; local Y becomes the outward
+	# normal. Origins place x/z at the face and lift it LIFT outward.
+	_FACE[Vector3i.RIGHT] = Transform3D(
+		Basis(Vector3(0.0, 1.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)),
+		Vector3(1.0 + LIFT, 0.0, 0.0))
+	_FACE[Vector3i.LEFT] = Transform3D(
+		Basis(Vector3(0.0, 1.0, 0.0), Vector3(-1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)),
+		Vector3(-LIFT, 0.0, 0.0))
+	_FACE[Vector3i.BACK] = Transform3D(
+		Basis(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), Vector3(0.0, 1.0, 0.0)),
+		Vector3(0.0, 0.0, 1.0 + LIFT))
+	_FACE[Vector3i.FORWARD] = Transform3D(
+		Basis(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), Vector3(0.0, 1.0, 0.0)),
+		Vector3(0.0, 0.0, -LIFT))
 
-	# The 8 corners of the inflated cube.
-	var c: Array[Vector3] = [
-		Vector3(lo, lo, lo), Vector3(hi, lo, lo),
-		Vector3(hi, lo, hi), Vector3(lo, lo, hi),
-		Vector3(lo, hi, lo), Vector3(hi, hi, lo),
-		Vector3(hi, hi, hi), Vector3(lo, hi, hi),
-	]
-	# 12 edges as corner-index pairs: 4 bottom, 4 top, 4 verticals.
-	var edges: Array[int] = [
-		0, 1, 1, 2, 2, 3, 3, 0,   # bottom rectangle
-		4, 5, 5, 6, 6, 7, 7, 4,   # top rectangle
-		0, 4, 1, 5, 2, 6, 3, 7,   # vertical struts
-	]
-
-	var verts := PackedVector3Array()
-	for idx: int in edges:
-		verts.append(c[idx])
-
+## One unit quad [0,1]x[0,1] in the local XZ plane at y=0 (two triangles), built
+## once, with the additive unshaded material.
+func _build_quad() -> ArrayMesh:
+	var verts := PackedVector3Array([
+		Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(1.0, 0.0, 1.0),
+		Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 1.0), Vector3(0.0, 0.0, 1.0),
+	])
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts
 
 	var mesh_out := ArrayMesh.new()
-	mesh_out.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
+	mesh_out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	mesh_out.surface_set_material(0, _build_material())
 	return mesh_out
 
-## Unshaded bright cyan so the outline reads over any texture regardless of
-## lighting. Depth testing stays ON so the wireframe is occluded by closer opaque
-## geometry — an intervening block hides the edges behind it, exactly like normal
-## in-world geometry — while the INFLATE clearance keeps the near edges crisp.
+## Unshaded additive white-ish quad: ADD blending brightens whatever is under it,
+## so the aimed face reads as "lit up" over any texture. Depth test stays ON so a
+## closer block occludes it (preserving the wireframe's occlusion behaviour), and
+## culling is disabled so the single quad shows from either side.
 func _build_material() -> StandardMaterial3D:
 	var mat := StandardMaterial3D.new()
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_color = Color(0.1, 1.0, 1.0)   # bright cyan
-	mat.vertex_color_use_as_albedo = false
-	mat.no_depth_test = false                 # respect depth buffer: occluded by closer geometry
-	# Lines have no back/front; disable culling so orientation never hides an edge.
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	mat.albedo_color = Color(0.55, 0.55, 0.55)
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mat.no_depth_test = false   # respect depth buffer: occluded by closer geometry
 	return mat

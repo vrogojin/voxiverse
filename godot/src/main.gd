@@ -17,15 +17,23 @@ func _ready() -> void:
 	var player := Player.new()
 	player.name = "Player"
 	player.world = world
+	# Minecraft-style hotbar inventory: one model, injected into Player (break/place)
+	# and the HotbarHUD. Starts EMPTY — the loop is break-first-then-place.
+	var inv := Inventory.new()
+	player.inventory = inv
 	add_child(player)
-	# Spawn on flat, open ground looking out over the gentle hills, with a small
-	# field of wooden pillars a few steps ahead as the physics/breaking sandbox.
+	# Spawn on flat, open ground looking out over the gentle hills. The physics/
+	# breaking sandbox is now the deterministic trees from the generator (chop a
+	# trunk and the canopy detaches as a loose body).
 	var col := _find_flat(0, 0)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
 	world.on_player_ready(player)
 
-	_spawn_pillars(world, col)
+	var hotbar := HotbarHUD.new()
+	hotbar.name = "HotbarHUD"
+	hotbar.inventory = inv
+	add_child(hotbar)
 
 	var hud := ThermometerHUD.new()
 	hud.name = "ThermometerHUD"
@@ -65,7 +73,7 @@ func _setup_environment() -> void:
 	add_child(we)
 
 ## Find the FLATTEST column near (cx, cz): the one whose 3x3 neighbourhood varies
-## least in height, so the player and the wooden pillars start on even ground.
+## least in height, so the player starts on even ground.
 func _find_flat(cx: int, cz: int) -> Vector2i:
 	var best := Vector2i(cx, cz)
 	var best_spread := 0x7fffffff
@@ -87,18 +95,3 @@ func _find_flat(cx: int, cz: int) -> Vector2i:
 			if spread == 0:
 				return best
 	return best
-
-## Spawn a small field of wooden pillars a few steps ahead of the spawn (the
-## player looks down -Z). Each is a stack of wooden blocks resting on its own
-## column, ready to be broken apart and knocked around.
-func _spawn_pillars(world: WorldManager, spawn: Vector2i) -> void:
-	# (dx, dz) offset from spawn, and pillar height in blocks. All ahead (-z).
-	var layout := [
-		[-3, -5, 5], [-1, -6, 7], [1, -6, 4],
-		[3, -5, 6], [-2, -9, 8], [2, -9, 5],
-	]
-	for p in layout:
-		var wx: int = spawn.x + p[0]
-		var wz: int = spawn.y + p[1]
-		var base_y := world.surface_y(wx, wz)
-		VoxelBody.spawn_pillar(world, wx, wz, base_y, p[2], world)

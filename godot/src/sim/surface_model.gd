@@ -13,23 +13,25 @@ extends RefCounted
 ## (air=0, grass=1), keeping the godot_voxel generator and the GDScript fallback
 ## in agreement.
 
-const GRASS_ID := 1
+## Kept for backward compatibility but now delegated to the authoritative catalog.
+const GRASS_ID := BlockCatalog.GRASS
 
 static var _material: VoxelMaterialDef
 
 ## Lazily build the surface material + its (currently trivial) state machine
 ## (idempotent). Call once on the main thread before meshing to avoid a race if
-## generation is threaded.
+## generation is threaded. Also warms the BlockCatalog so masses/colors/break
+## forces come from the one authoritative table.
 static func ensure_ready() -> void:
 	if _material != null:
 		return
+	BlockCatalog.ensure_ready()
 
-	var grass := VoxelState.new()
-	grass.state_name = &"grass"
-	grass.block_id = GRASS_ID
-	grass.break_force = INF          # unbreakable ground surface (DESIGN §1)
-	grass.density = 1500.0
-	grass.mass = 1500.0
+	# Reuse the catalog's grass state so mass/break_force stay in one place; add
+	# the surface texture for the LOOK (the catalog carries physics + swatch only).
+	# Grass is now BREAKABLE (its old break_force = INF is dropped) so the
+	# break→inventory loop works — the catalog sets a finite break_force.
+	var grass: VoxelState = BlockCatalog.state_of(BlockCatalog.GRASS)
 	grass.albedo = 0.25
 	grass.texture = load(GrassMaterial.TEXTURE_PATH) as Texture2D
 

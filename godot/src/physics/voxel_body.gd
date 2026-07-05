@@ -318,10 +318,18 @@ static func _dyn_physics_material() -> PhysicsMaterial:
 	return _dyn_phys_mat
 
 ## Apply the falling/settling dynamics to a dynamic body: strong angular damping
-## (drop straight, no chaotic toppling), light linear damping, no-bounce friction
-## material, and continuous collision detection (no tunnelling/jitter through the
-## trimesh ground at impact). Harmless to set on a frozen body (inert while
-## frozen), so it is keyed on `activated`.
+## (drop straight, no chaotic toppling), light linear damping, and a no-bounce friction
+## material. Harmless to set on a frozen body (inert while frozen), so it is keyed on
+## `activated`.
+##
+## NO continuous CD (PERF — the "breaking is heavy" fix). CCD was originally enabled to stop
+## tunnelling through a TRIMESH ground; but the ground is no longer a trimesh — GroundCollider
+## emits thick box RUNS (DEPTH=32 below the region floor), so a falling block hits a solid
+## metres-thick wall. Even a canopy dropping from 8 blocks impacts at ~12 m/s = 0.2 m per 1/60
+## sub-step, well inside a 1 m ground box: it cannot tunnel. Meanwhile CCD runs a swept test per
+## shape per sub-step, and a detached canopy is a ~25-box COMPOUND body — that swept cost, times
+## the sub-step catch-up at low FPS, was a large slice of the 20-40 ms physics spikes while
+## debris fell. Discrete collision against thick boxes is correct here and far cheaper.
 func _apply_dynamic_props() -> void:
 	if not activated:
 		return
@@ -336,7 +344,7 @@ func _apply_dynamic_props() -> void:
 	# naturally stable and reinforces the angular-damp-based flip resistance.
 	center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_AUTO
 	physics_material_override = _dyn_physics_material()
-	continuous_cd = true
+	continuous_cd = false        # thick box ground → no tunnelling; CCD swept tests were a spike (see above)
 
 ## Which component this body retains. A pristine cluster keeps the piece still
 ## resting on the ground (it stays frozen); a body that is already dynamic keeps

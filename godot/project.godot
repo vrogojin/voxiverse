@@ -30,6 +30,21 @@ renderer/rendering_method.mobile="gl_compatibility"
 lights_and_shadows/use_physical_light_units=false
 textures/vram_compression/import_etc2_astc=true
 
+[physics]
+
+; Web / low-FPS SAFETY CAP on physics sub-step catch-up (the "breaking must never tank the
+; frame" rule). At the engine default of 8, a single slow RENDER frame (a godot_voxel mesh
+; upload spike, a GL-compat pipeline compile) lets the physics server run up to 8 sub-steps
+; THAT frame to catch back up to real time — each sub-step re-solving every falling VoxelBody
+; against the ~1300-box ground collider. So one render hitch is MULTIPLIED into a physics
+; stall, which drops the next frame, which needs even more catch-up: the spiral that pinned us
+; at 7-30 fps whenever a tree was falling. Capped at 2, a render spike costs at most 2 physics
+; sub-steps; under sustained low FPS the loose debris simply falls in slight slow-motion
+; (game-time dilation) instead of freezing the whole game. A voxel sandbox tolerates a block
+; settling a hair slower far better than a 9 fps freeze — the settle logic is time-based, not
+; frame-based, so behaviour is unchanged, only its worst-case per-frame cost is bounded.
+common/max_physics_steps_per_frame=2
+
 [voxel]
 
 ; godot_voxel (Zylann) VoxelEngine task-pool sizing. On the web/Emscripten build

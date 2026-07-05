@@ -50,6 +50,11 @@ var _next_arid := 0                     # next free library model index / ARID t
 const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
+# One shared ArrayMesh per shape modifier, reused across every material (geometry
+# depends only on the modifier). Keeps the manifest's mesh RESOURCES at distinct-shape
+# count (<=79) instead of materials×shapes (474) — the material differs only via the
+# per-model override, so mesh allocation/upload is not multiplied by the palette.
+var _shape_mesh_cache: Dictionary = {}   # int modifier -> ArrayMesh
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
@@ -70,14 +75,20 @@ func setup() -> bool:
 	if library == null or mesher == null:
 		return false
 
+	# Per-phase timing (printed to the JS console on web) — pinpoints any load stall.
+	var _t_warm := Time.get_ticks_msec()
 	if not _configure_library(library):
 		return false
+	var _t_lib := Time.get_ticks_msec()
 
 	# Pre-bake + FREEZE the generator appearance manifest (RMS §6.5 / VDS §8.3) BEFORE the
 	# generator is wired in and the worker can run: every (surface material, modifier)
 	# pair worldgen smoothing can emit gets an ARID + baked VoxelBlockyModelMesh now, on
 	# this (main) thread. After this the worker only reads the frozen `_gen_arid` array.
 	_build_gen_manifest(library)
+	var _t_manifest := Time.get_ticks_msec()
+	print("[module_world] setup timing: configure_library=%d ms  manifest(bake+meshes)=%d ms" % [
+		_t_lib - _t_warm, _t_manifest - _t_lib])
 
 	var generator: Object = _make_generator()
 	if generator == null:
@@ -345,15 +356,19 @@ func _make_shape_model(modifier: int, material: Material) -> Object:
 	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
 	if model == null:
 		return null
-	var geom := ShapeMesh.build(modifier)
-	var amesh := ArrayMesh.new()
-	var surf := []
-	surf.resize(Mesh.ARRAY_MAX)
-	surf[Mesh.ARRAY_VERTEX] = geom["verts"]
-	surf[Mesh.ARRAY_NORMAL] = geom["normals"]
-	surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
-	surf[Mesh.ARRAY_INDEX] = geom["indices"]
-	amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+	# Share one ArrayMesh per shape across all materials (see _shape_mesh_cache).
+	var amesh: ArrayMesh = _shape_mesh_cache.get(modifier, null)
+	if amesh == null:
+		var geom := ShapeMesh.build(modifier)
+		amesh = ArrayMesh.new()
+		var surf := []
+		surf.resize(Mesh.ARRAY_MAX)
+		surf[Mesh.ARRAY_VERTEX] = geom["verts"]
+		surf[Mesh.ARRAY_NORMAL] = geom["normals"]
+		surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
+		surf[Mesh.ARRAY_INDEX] = geom["indices"]
+		amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+		_shape_mesh_cache[modifier] = amesh
 	if model.has_method("set_mesh"):
 		model.call("set_mesh", amesh)
 	else:

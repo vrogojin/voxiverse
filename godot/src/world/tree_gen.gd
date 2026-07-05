@@ -22,8 +22,8 @@ const MAX_ABOVE_SURFACE := 7       # trunk max 6 + 1 canopy cap layer
 ## Sentinel "no tree" base (y is a deep negative so no world cell ever matches).
 const _NO_TREE := Vector3i(0, -0x40000000, 0)
 
-## Deterministic hash in [0,1) for an integer lattice + salt (same integer family
-## as WoodMaterial._hash; no floats until the final divide).
+## Deterministic hash in [0,1) for an integer lattice + salt (same integer-mix
+## family as TexturePackBaker._hash; no floats until the final divide).
 static func _hash01(ix: int, iz: int, salt: int) -> float:
 	var n := (ix * 374761393 + iz * 668265263 + salt * 362437) & 0x7FFFFFFF
 	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF

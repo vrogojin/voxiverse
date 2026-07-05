@@ -12,7 +12,7 @@ config/name="VOXIVERSE"
 config/description="Voxel immersive simulation engine — grass test environment."
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.4", "GL Compatibility")
-config/icon="res://assets/textures/grass.png"
+config/icon="res://assets/textures/pack/grass.png"
 
 [display]
 

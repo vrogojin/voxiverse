@@ -26,6 +26,7 @@ func _initialize() -> void:
 	_test_stone_relief()
 	_test_tree()
 	_test_masses()
+	_test_materials()
 	_test_inventory()
 	_test_world_loop()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -116,6 +117,27 @@ func _test_masses() -> void:
 	var mw := BlockCatalog.mass_of(WOOD)
 	print("    stone=%.0f dirt=%.0f grass=%.0f leaf=%.0f wood=%.0f" % [ms, md, mg, ml, mw])
 	_ok(ms > md and md > mg and mg > ml and ml > mw and mw > 0.0, "stone>dirt>grass>leaf>wood>0")
+
+# 8. Every solid block id yields a non-null, textured, crisp-pixel material.
+func _test_materials() -> void:
+	print("[8] block render materials")
+	_ok(BlockMaterials.get_for(BlockCatalog.AIR) == null, "AIR has no material")
+	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
+		var nm := BlockCatalog.name_of(id)
+		var mat: StandardMaterial3D = BlockMaterials.get_for(id)
+		_ok(mat != null, "%s has a material" % nm)
+		if mat == null:
+			continue
+		var tex: Texture2D = mat.albedo_texture
+		_ok(tex != null, "%s material is textured (not a flat swatch)" % nm)
+		_ok(tex != null and tex.get_width() == 128 and tex.get_height() == 128,
+			"%s texture is 128x128" % nm)
+		_ok(mat.texture_filter == BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS,
+			"%s uses NEAREST filter (crisp pixel-art)" % nm)
+		_ok(mat.shading_mode == BaseMaterial3D.SHADING_MODE_UNSHADED,
+			"%s is unshaded (flat ambient look)" % nm)
+	# Cache identity: repeated lookups reuse the one material instance.
+	_ok(BlockMaterials.get_for(STONE) == BlockMaterials.get_for(STONE), "material cache reuses instance")
 
 # 6. Inventory stacking / selection / consume.
 func _test_inventory() -> void:

@@ -107,9 +107,28 @@ func cell_value_at(cell: Vector3i) -> int:
 func block_id_at(cell: Vector3i) -> int:
 	return CellCodec.mat(cell_value_at(cell))
 
-## Composed solidity (public now; the old private _cell_solid delegates to it).
+## Composed solidity — the MATERIAL half of the merged analytic-physics contract
+## (INTEGRATION-DECISIONS §3): a cell is solid iff its material passes the solidity
+## gate (`solidity_of(mat) >= 0.5`). Resolves the packed value ONCE, then gates on
+## the material only — a shaped (ramp) cell IS solid; where inside the cell it
+## collides is expressed by the interval functions (`_occ_span`), never by this
+## boolean. Byte-identical to the old `!= AIR` test for the current world (AIR → 0.0,
+## every core material → 1.0). `_cell_solid`/`is_solid` are aliases of this.
 func cell_solid(cell: Vector3i) -> bool:
-	return block_id_at(cell) != BlockCatalog.AIR
+	return BlockCatalog.solidity_of(CellCodec.mat(cell_value_at(cell))) >= 0.5
+
+## THE occupancy-composition helper (INTEGRATION-DECISIONS §3): material solidity
+## GATES, modifier SHAPES. Returns the filled vertical interval (lo, hi) of packed
+## cell value `v` at footprint (fx, fz); `Vector2.ZERO` = no occupancy (air / water /
+## lava / powder_snow via the material gate, or a shape empty at this footprint).
+## The four analytic queries and the collider all compose against this ONE helper,
+## so the material gate and the shape test can never disagree. Full-cube today →
+## (0, 1) for every solid cell, so callers reduce branch-for-branch to today's code
+## (one extra solidity read); P5's ShapeCodec fills the sub-cube intervals.
+func _occ_span(v: int, fx: float, fz: float) -> Vector2:
+	if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5:   # 1) MATERIAL GATE
+		return Vector2.ZERO
+	return ShapeCodec.span(CellCodec.modifier(v), fx, fz)  # 2) SHAPE (modifier 0 -> (0,1))
 
 ## True if the cell was dug out (edit overlay says air). Used by fast column loops
 ## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
@@ -343,16 +362,32 @@ func surface_y(x: float, z: float) -> float:
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
+	var fx := x - float(xi)   # in-cell footprint (ignored by full cubes; used by P5 shapes)
+	var fz := z - float(zi)
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
 	# off. Scan length is bounded by the fall distance — cheap.
 	var start := int(floor(feet_y + 0.5))
 	var y := start
+	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
+	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
+	# seafloor, while a solid cell yields its filled interval — the floor is the top of
+	# the first occupied cell that has an empty span directly above (its top = span.y;
+	# 1.0 for a full cube ⇒ float(y+1), byte-identical to the old solid/air-above test).
 	while y > -1024:
-		if _cell_solid(Vector3i(xi, y, zi)) and not _cell_solid(Vector3i(xi, y + 1, zi)):
-			return float(y + 1)
+		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+			return float(y) + here.y
 		y -= 1
 	return float(effective_height(xi, zi) + 1)
+
+## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2).
+## P5 SEAM: once sub-cube shapes exist, `blocked` gains the SVS §5.2 floor-then-
+## headroom auto-step (a ramp/slab surface `<= STEP_MAX` above the feet is walked
+## up, not blocked). It is INERT for the current world — a full cube's rise is 1.0 m
+## > STEP_MAX, so every full cube still blocks — so P2 keeps the plain body-span
+## occupancy scan below (byte-identical) and defers the auto-step to when ramps land.
+const STEP_MAX := 0.55
 
 ## True if any solid, non-broken terrain cell overlaps the player's vertical body
 ## span at column (floor(x), floor(z)). The player is ~1.8 m tall standing with feet
@@ -361,11 +396,17 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 func blocked(x: float, z: float, feet_y: float) -> bool:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
+	var fx := x - float(xi)
+	var fz := z - float(zi)
 	var y_lo := int(floor(feet_y + 0.1))
 	var y_hi := int(floor(feet_y + 1.7))
 	var y := y_lo
+	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
+	# a non-solid material (water) yields the empty span and does NOT block, while a
+	# full cube (span (0,1) ≠ ZERO) blocks exactly as before — byte-identical to the
+	# old `_cell_solid` body-span scan for the current all-full-cube world.
 	while y <= y_hi:
-		if _cell_solid(Vector3i(xi, y, zi)):
+		if _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz) != Vector2.ZERO:
 			return true
 		y += 1
 	return false
@@ -375,6 +416,14 @@ func is_solid(pos: Vector3) -> bool:
 
 ## Voxel-DDA ray (Amanatides & Woo) against the heightmap. Returns
 ## {hit, voxel:Vector3i, normal:Vector3i, position:Vector3}.
+##
+## Merged contract (INTEGRATION-DECISIONS §3): the DDA cell walk is unchanged; each
+## cell is tested by the MATERIAL gate first (`cell_solid` = solidity ≥ 0.5), so the
+## ray passes THROUGH non-solid materials (water/lava) and targets what's behind
+## them. A hit on a solid cell reports the cell-BOUNDARY crossing (today's fast path,
+## exact for modifier 0). P5 SEAM: for a shaped (ramp) cell, `cell_solid` still gates
+## entry, then an in-cell surface ray test (SVS §5.3) refines the hit point/normal
+## within the cell — full cubes need no refinement, so the boundary hit stands.
 func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
 	var d := dir.normalized()
 	var cell := Vector3i(int(floor(origin.x)), int(floor(origin.y)), int(floor(origin.z)))
@@ -413,6 +462,28 @@ func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictio
 # cells are air and placed/tree cells are solid ray/collapse targets.
 func _cell_solid(cell: Vector3i) -> bool:
 	return cell_solid(cell)
+
+## Render-only face-cull composition (INTEGRATION-DECISIONS §3): does the neighbour
+## whose PACKED value is `nb_value` occlude the shared face of a cell in cull-group
+## `my_group` (the viewed material's `transparency_index_of`)? True iff BOTH:
+##   (1) the neighbour's MATERIAL occludes — it is solid AND its transparency index
+##       is ≤ my_group (the transparency-index rule: an opaque neighbour always
+##       occludes; you see THROUGH a more-transparent one, e.g. stone behind glass);
+##   (2) its facing side profile fully covers the shared face (`face` = the
+##       neighbour-direction index; modifier 0 ⇒ trivially full — today's fast path).
+## Static/pure (no world state). For the current all-opaque, full-cube world this is
+## exactly `cell_solid(neighbour)`, so it ships as the SEAM P3's translucent
+## materials (glass/water) fill in — the fallback mesher's cull test is deliberately
+## left on `cell_solid` until then (see chunk_mesher._emit_cube) to guarantee the
+## byte-identical visual gate; the module path's culling is config (transparency_index),
+## unchanged.
+static func occludes_face(nb_value: int, my_group: int, face: int = 0) -> bool:
+	var nb_mat := CellCodec.mat(nb_value)
+	if BlockCatalog.solidity_of(nb_mat) < 0.5:
+		return false                                   # air / water / lava never occlude
+	if BlockCatalog.transparency_index_of(nb_mat) > my_group:
+		return false                                   # see through a more-transparent neighbour
+	return ShapeCodec.side_profile_full(CellCodec.modifier(nb_value), face)
 
 # Distance along one axis to the first integer boundary in the ray's direction.
 static func _first_cross(o: float, dir: float) -> float:

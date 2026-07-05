@@ -86,6 +86,28 @@ static func name_of(block_id: int) -> String:
 static func is_solid_id(block_id: int) -> bool:
 	return block_id > AIR and block_id < COUNT
 
+## Material solidity (0 = passable like air, 1 = full solid block) for `block_id` —
+## the GATE of the merged analytic-physics contract (INTEGRATION-DECISIONS §3): a
+## cell contributes collision geometry iff `solidity_of(mat) >= 0.5`. AIR and any
+## out-of-range id have no VoxelState → 0.0 (non-solid); every core material → 1.0.
+## Future fluids (water/lava/powder_snow) ship solidity < 0.5 and drop out here.
+static func solidity_of(block_id: int) -> float:
+	var s := state_of(block_id)
+	return s.solidity if s != null else 0.0
+
+## Render cull-group / transparency index (WGC §5.2, INTEGRATION-DECISIONS §3):
+## 0 = fully opaque, higher = more transparent. Composed by `WorldManager.occludes_face`:
+## an opaque neighbour always occludes; a translucent neighbour occludes only cells
+## of the same-or-higher transparency group (glass-behind-glass culls, but
+## glass-behind-stone does not). Derived from the material's `translucence`; AIR /
+## out of range → a huge value (a null material never occludes anything). Every core
+## material is opaque today (index 0), so occludes_face reduces to cell_solid.
+static func transparency_index_of(block_id: int) -> int:
+	var s := state_of(block_id)
+	if s == null:
+		return 0x7FFFFFFF
+	return 0 if s.translucence <= 0.0 else 1
+
 ## Structural strength anchors `(P, H, D)` for `block_id`; Vector3i(0,0,0) for AIR.
 static func anchors_of(block_id: int) -> Vector3i:
 	var s := state_of(block_id)

@@ -52,11 +52,21 @@ static func canonical(v: int) -> int:
 	var m := mat(v)
 	if m == BlockCatalog.AIR:
 		return 0                              # air never carries modifier/state
-	return pack(m, _canonical_modifier(modifier(v)), _validate_state(m, state(v)))
+	return pack(m, _canonical_modifier(m, modifier(v)), _validate_state(m, state(v)))
 
 ## P5 hook — corner-height canonicalization (FULL-cube shapes → 0, corner-value
-## clamp; VOXEL-DATA-STRUCTURE §3.2). Pass-through until the modifier axis lands.
-static func _canonical_modifier(modifier_bits: int) -> int:
+## clamp; VOXEL-DATA-STRUCTURE §3.2). The corner-height math is P5; P2 wires only
+## the INTEGRATION-DECISIONS §3 addendum: `modifier != 0` requires a solid material
+## (`solidity_of(mat) >= 0.5`). A modifier on a non-solid material — a "ramp of
+## water" — is invalid, not merely unusual (VDS §3.1's "fails validation, not
+## encoding"); it strips to full cube (0) with a logged warning, so the merged
+## material gate may soundly ignore modifiers on non-solid cells. Solid materials'
+## modifiers pass through unchanged today.
+static func _canonical_modifier(material: int, modifier_bits: int) -> int:
+	if modifier_bits != 0 and BlockCatalog.solidity_of(material) < 0.5:
+		push_warning("CellCodec: modifier %d on non-solid material %d is invalid — stripped to full cube (0)"
+			% [modifier_bits, material])
+		return 0
 	return modifier_bits
 
 ## P6 hook — validate state bits against the material's declared state_layout

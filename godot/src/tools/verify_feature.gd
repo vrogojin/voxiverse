@@ -30,6 +30,7 @@ func _initialize() -> void:
 	_test_inventory()
 	_test_cell_codec()
 	_test_material_data()
+	_test_merged_physics()
 	_test_world_loop()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -281,6 +282,98 @@ func _test_material_data() -> void:
 		var s: VoxelState = BlockCatalog.state_of(id)
 		_ok(s != null and is_equal_approx(s.attachment, 1.0),
 			"%s attachment == 1.0" % BlockCatalog.name_of(id))
+
+# P2. Merged analytic-physics contract (INTEGRATION-DECISIONS §3): the material
+# solidity gate, the _occ_span composition, the canonicalization addendum, and — the
+# load-bearing invariant — floor_under/blocked/aimed_voxel BYTE-IDENTICAL to their
+# pre-P2 behaviour on the current all-solid full-cube world.
+func _test_merged_physics() -> void:
+	print("[P2] merged analytic-physics contract")
+	# (i) solidity gate: AIR + out-of-range non-solid; every core material solid.
+	_ok(BlockCatalog.solidity_of(BlockCatalog.AIR) < 0.5, "AIR solidity < 0.5 (non-solid, gated out)")
+	_ok(BlockCatalog.solidity_of(99) < 0.5, "out-of-range material is non-solid (null state -> 0.0)")
+	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
+		_ok(BlockCatalog.solidity_of(id) >= 0.5, "%s solidity >= 0.5 (solid)" % BlockCatalog.name_of(id))
+
+	var world: WorldManager = WorldManager.new()
+	world.name = "WorldManagerP2"
+	get_root().add_child(world)
+
+	# (ii) cell_solid == (solidity_of(block_id_at) >= 0.5) across a spread of
+	# generated + air cells (the composition rule, not a re-derivation).
+	var solid_checked := 0
+	for x in range(-40, 40, 13):
+		for z in range(-40, 40, 17):
+			var g: int = TerrainConfig.height_at(x, z)
+			for y in [g + 5, g + 1, g, g - 1, g - 8]:
+				var c := Vector3i(x, y, z)
+				var expected := BlockCatalog.solidity_of(world.block_id_at(c)) >= 0.5
+				_ok(world.cell_solid(c) == expected, "cell_solid == solidity gate @ " + str(c))
+				solid_checked += 1
+	print("    cell_solid==gate checked %d cells" % solid_checked)
+
+	# (iii) _occ_span: solid full cube -> (0,1); air and any non-solid material
+	# (out-of-range mat, ANY modifier) -> ZERO (the material gate wins over the shape).
+	_ok(world._occ_span(CellCodec.pack(STONE), 0.5, 0.5) == Vector2(0.0, 1.0),
+		"_occ_span(solid full cube) == (0,1)")
+	_ok(world._occ_span(0, 0.5, 0.5) == Vector2.ZERO, "_occ_span(air) == ZERO")
+	_ok(world._occ_span(CellCodec.pack(99, 5, 0), 0.5, 0.5) == Vector2.ZERO,
+		"_occ_span(non-solid material + modifier) == ZERO (material gate wins)")
+	# gate logic on a synthetic sub-0.5 material (SI §7 fluid/soft band).
+	var synth := VoxelState.new()
+	synth.solidity = 0.3
+	_ok(synth.solidity < 0.5, "synthetic VoxelState solidity 0.3 fails the >= 0.5 gate")
+
+	# (iv) canonicalization addendum: modifier != 0 on a non-solid material strips to
+	# full cube (0), material kept; a solid material keeps its modifier (P5 clamps it).
+	var stripped := CellCodec.canonical(CellCodec.pack(99, 5, 3))
+	_ok(CellCodec.mat(stripped) == 99 and CellCodec.modifier(stripped) == 0,
+		"canonical strips modifier on non-solid material (mat kept, modifier 0)")
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, 7, 0))) == 7,
+		"canonical keeps modifier on a solid material (no strip)")
+
+	# (v) BYTE-IDENTITY: floor_under / blocked / aimed_voxel == known expected values
+	# on untouched terrain. Bare-surface columns only (skip tree columns, whose above-
+	# surface cells are solid) so the expected values are the plain grass surface.
+	var phys_checked := 0
+	for x in range(-30, 30, 11):
+		for z in range(-30, 30, 9):
+			var g: int = TerrainConfig.height_at(x, z)
+			var clear := true
+			for yy in range(g + 1, g + 5):
+				if world.cell_solid(Vector3i(x, yy, z)):
+					clear = false
+					break
+			if not clear:
+				continue
+			var fx := float(x) + 0.5
+			var fz := float(z) + 0.5
+			# floor is the top of the surface (grass) cell = g + 1.
+			_ok(is_equal_approx(world.floor_under(fx, fz, float(g + 1) + 0.3), float(g + 1)),
+				"floor_under == surface top g+1 @ (%d,%d)" % [x, z])
+			# open air above the surface does not block...
+			_ok(world.blocked(fx, fz, float(g + 1) + 0.3) == false, "not blocked in open air @ (%d,%d)" % [x, z])
+			# ...but a body span intruding into the solid ground does.
+			_ok(world.blocked(fx, fz, float(g) - 0.5) == true, "blocked when body overlaps ground @ (%d,%d)" % [x, z])
+			# a ray straight down from above hits the surface cell (g) with an UP normal.
+			var hit := world.aimed_voxel(Vector3(fx, float(g) + 4.0, fz), Vector3(0, -1, 0), 16.0)
+			_ok(hit["hit"] and hit["voxel"] == Vector3i(x, g, z) and hit["normal"] == Vector3i.UP,
+				"aimed_voxel down hits surface cell (up normal) @ (%d,%d)" % [x, z])
+			phys_checked += 1
+	_ok(phys_checked > 0, "byte-identity sampled %d bare-surface columns" % phys_checked)
+	print("    byte-identity checked %d columns" % phys_checked)
+
+	# (vi) occludes_face reduces to cell_solid for the current all-opaque full-cube
+	# world (the seam P3's translucent materials fill): an opaque solid neighbour
+	# occludes; air does not.
+	for id in [GRASS, STONE, WOOD, LEAF]:
+		_ok(WorldManager.occludes_face(CellCodec.pack(id), 0, 0) == true,
+			"occludes_face(opaque solid %s) == true" % BlockCatalog.name_of(id))
+	_ok(WorldManager.occludes_face(0, 0, 0) == false, "occludes_face(air) == false")
+	_ok(WorldManager.occludes_face(CellCodec.pack(99), 0, 0) == false,
+		"occludes_face(non-solid material) == false")
+
+	world.queue_free()
 
 # 4/5. Live world edit loop: break returns id, place mutates + collider rebuilds.
 func _test_world_loop() -> void:

@@ -38,6 +38,19 @@ var _cube_arid: PackedInt32Array        # LRID -> cube ARID (preallocated; == LR
 var _arid_by_key: Dictionary = {}       # (lrid | modifier<<16) -> ARID (MAIN THREAD ONLY)
 var _next_arid := 0                     # next free library model index / ARID to allocate
 
+# --- generator appearance manifest (VDS §8.1/§8.3, RMS §6.5) --------------------
+# Every (surface material, modifier) pair worldgen can emit (P5b-2 terrain smoothing)
+# is pre-allocated + baked + FROZEN into this flat array at PATH ACTIVATION (setup(),
+# before the viewer/worker attaches), keyed by `mat * _GEN_STRIDE + modifier`. The
+# voxel worker (the runtime generator) reads ONLY this array + `_cube_arid` — both
+# fixed-size, never resized after freeze — so it maps a shaped generated cell to a baked
+# ARID with zero allocation/bake (removing P5b-1's flagged concurrent-bake risk for
+# generated shapes). A slot left -1 renders that shape as the material's plain cube
+# (wrong silhouette, correct substance, never a hole — VDS §8.1 exhaustion policy).
+const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
+var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
+var _generator: Object                   # the runtime-compiled generator (kept for verify)
+
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
@@ -60,9 +73,16 @@ func setup() -> bool:
 	if not _configure_library(library):
 		return false
 
+	# Pre-bake + FREEZE the generator appearance manifest (RMS §6.5 / VDS §8.3) BEFORE the
+	# generator is wired in and the worker can run: every (surface material, modifier)
+	# pair worldgen smoothing can emit gets an ARID + baked VoxelBlockyModelMesh now, on
+	# this (main) thread. After this the worker only reads the frozen `_gen_arid` array.
+	_build_gen_manifest(library)
+
 	var generator: Object = _make_generator()
 	if generator == null:
 		return false
+	_generator = generator
 
 	if mesher.has_method("set_library"):
 		mesher.call("set_library", library)
@@ -112,6 +132,12 @@ func arid_for(mat: int, modifier: int) -> int:
 		return 0
 	if modifier == 0:
 		return _cube_arid_of(mat)
+	# Reuse a manifest-baked generated shape (no duplicate model/bake) when the placed
+	# (material, modifier) is one worldgen already emits — e.g. placing a grass ramp
+	# identical to a smoothed terrain ramp.
+	var gslot := mat * _GEN_STRIDE + modifier
+	if modifier < _GEN_STRIDE and gslot < _gen_arid.size() and _gen_arid[gslot] >= 0:
+		return _gen_arid[gslot]
 	var key := mat | (modifier << 16)                  # vstate is 0 in P5b-1
 	if _arid_by_key.has(key):
 		return int(_arid_by_key[key])
@@ -141,6 +167,71 @@ func _cube_arid_of(mat: int) -> int:
 ## == the library model count. Used by verify to fence the lazy append (VDS §8.1).
 func appearance_count() -> int:
 	return _next_arid
+
+## Pre-allocate + bake the generator's appearance manifest and FREEZE it into
+## `_gen_arid` (VDS §8.1/§8.3, RMS §6.5). Each (surface material, modifier) pair the
+## smoothing worldgen can emit becomes a once-baked VoxelBlockyModelMesh whose library
+## index MUST equal the ARID being allocated (the anti-drift assert, generalised from
+## `_add_cube`). After this returns, the voxel worker maps (mat, modifier) → ARID via
+## `_gen_arid[mat*_GEN_STRIDE + modifier]` with zero allocation/bake. Best-effort: a
+## slot left -1 (e.g. the module lacks VoxelBlockyModelMesh, or an ARID drift aborts the
+## build) renders that shape as the material's plain cube — never a hole.
+func _build_gen_manifest(library: Object) -> void:
+	var total := _cube_arid.size()                       # == BlockCatalog.count()
+	_gen_arid = PackedInt32Array()
+	_gen_arid.resize(total * _GEN_STRIDE)
+	_gen_arid.fill(-1)
+	var mats := TerrainConfig.appearance_surface_materials()
+	var mods := TerrainConfig.appearance_modifiers()
+	var appended := 0
+	for mat: int in mats:
+		if mat <= BlockCatalog.AIR or mat >= total:
+			continue
+		var material: Material = BlockMaterials.get_for(mat)
+		for modifier: int in mods:
+			if modifier <= 0 or modifier >= _GEN_STRIDE:
+				continue
+			var model: Object = _make_shape_model(modifier, material)
+			if model == null:
+				continue                                 # no mesh-model class → cube fallback
+			var expected := _next_arid
+			var got: int = _add_model(library, model)
+			if got != expected:
+				push_warning("[module_world] manifest ARID drift: add_model %d != expected %d" % [got, expected])
+				return                                   # leave the rest -1 (cube fallback)
+			_next_arid += 1
+			_gen_arid[mat * _GEN_STRIDE + modifier] = got
+			appended += 1
+	if appended > 0 and library.has_method("bake"):
+		library.call("bake")                             # one batched bake for the whole manifest
+	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes" % appended)
+
+## Forward (mat, modifier) → ARID exactly as the voxel worker resolves it: AIR → 0, a
+## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube
+## fallback when that slot was never baked). Main-thread mirror of the generator's inline
+## resolve — verify asserts the generated TYPE buffer equals this over a sample grid.
+func gen_arid_for(mat: int, modifier: int) -> int:
+	if mat == BlockCatalog.AIR:
+		return 0
+	if modifier == 0:
+		return _cube_arid_of(mat)
+	var slot := mat * _GEN_STRIDE + modifier
+	if modifier > 0 and modifier < _GEN_STRIDE and slot < _gen_arid.size() and _gen_arid[slot] >= 0:
+		return _gen_arid[slot]
+	return _cube_arid_of(mat)
+
+## True if (mat, modifier) is pre-baked in the frozen manifest (or is a plain cube,
+## always baked) — so the voxel worker never needs a lazy bake for it (VDS §8.3 gate).
+func is_manifest_baked(mat: int, modifier: int) -> bool:
+	if modifier == 0:
+		return mat >= 0 and mat < _cube_arid.size()
+	var slot := mat * _GEN_STRIDE + modifier
+	return modifier < _GEN_STRIDE and slot < _gen_arid.size() and _gen_arid[slot] >= 0
+
+## The runtime generator instance (verify's both-path ARID round-trip drives it
+## directly). Null until setup() succeeds.
+func get_generator() -> Object:
+	return _generator
 
 ## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
 ## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
@@ -272,6 +363,13 @@ func _make_generator() -> Object:
 	var src := """
 extends VoxelGeneratorScript
 
+# Frozen appearance tables set by the loader (main thread) BEFORE this generator runs.
+# The worker reads them ONLY (never resized/mutated after freeze), so mapping a shaped
+# generated cell to its baked ARID is allocation-free and race-free (VDS §8.3).
+var cube_arid: PackedInt32Array         # LRID -> cube ARID
+var gen_arid: PackedInt32Array          # (mat*GEN_STRIDE + modifier) -> ARID; -1 = not baked
+const GEN_STRIDE := 256
+
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
 
@@ -285,6 +383,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var ch = VoxelBuffer.CHANNEL_TYPE
 	var sea = TerrainConfig.SEA_LEVEL
 	var max_above = TreeGen.MAX_ABOVE_SURFACE
+	var ncube = cube_arid.size()
+	var ngen = gen_arid.size()
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
 	# noise sampling and no allocation.
@@ -317,8 +417,24 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			for y in range(size.y):
 				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt)
 				var id = CellCodec.mat(v)
-				if id != 0:
-					buffer.set_voxel(id, x, y, z, ch)
+				if id == 0:
+					continue
+				# Map (material, modifier) -> baked ARID via the frozen tables (VDS §8.1).
+				# A full cube (the overwhelming common case, incl. all sub-surface + flat
+				# terrain) writes its cube ARID (== LRID for bootstrap) -> byte-identical
+				# TYPE to the pre-smoothing world. A smoothed surface/cap cell writes its
+				# pre-baked manifest ARID; -1 (unbaked) falls back to the plain cube.
+				var modifier = CellCodec.modifier(v)
+				var arid = 0
+				if modifier == 0:
+					arid = cube_arid[id] if id < ncube else id
+				else:
+					var slot = id * GEN_STRIDE + modifier
+					if modifier < GEN_STRIDE and slot < ngen and gen_arid[slot] >= 0:
+						arid = gen_arid[slot]
+					else:
+						arid = cube_arid[id] if id < ncube else id
+				buffer.set_voxel(arid, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
 	gen_script.source_code = src
@@ -326,7 +442,11 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	if err != OK:
 		push_warning("[module_world] generator compile failed: %d" % err)
 		return null
-	return gen_script.new()
+	var gen: Object = gen_script.new()
+	# Publish the frozen tables to the worker-side generator (read-only from here on).
+	gen.set("cube_arid", _cube_arid)
+	gen.set("gen_arid", _gen_arid)
+	return gen
 
 # --- helpers -------------------------------------------------------------------
 # Set a property only if the object actually exposes it (avoids error spam if a

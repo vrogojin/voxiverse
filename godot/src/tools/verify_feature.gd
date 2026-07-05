@@ -25,6 +25,7 @@ func _initialize() -> void:
 	TerrainConfig.warm_up()
 	_test_stackup()
 	_test_worldgen()
+	_test_smoothing()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -293,26 +294,43 @@ func _find_highland() -> Vector2i:
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
 
-# Both render paths agree: instantiate the module generator (only when the
-# godot_voxel module is compiled in) and compare its VoxelBuffer output to the
-# analytic generated_block over several 16^3 blocks spanning bedrock..sea.
+# Both render paths agree (WGC §7.2 + SVS §10.6): build the module world (library +
+# FROZEN appearance manifest), drive its generator over several 16³ blocks (now
+# INCLUDING a block guaranteed to hold smoothed surface cells), and assert every TYPE
+# value it writes equals the manifest's ARID for generated_cell's (material, modifier) —
+# i.e. decoding each ARID reproduces (mat, modifier) exactly. Also fences the P5b-2
+# invariants: shaped cells appear (smoothing active), every shaped generated cell is
+# PRE-BAKED in the frozen manifest (the worker never lazy-bakes), and generating never
+# grows the ARID table (the worker only reads the frozen arrays).
 func _test_both_paths() -> void:
 	if not ClassDB.class_exists("VoxelTerrain") or not ClassDB.class_exists("VoxelBuffer"):
 		print("    (godot_voxel module absent — both-path determinism runs on module builds only)")
 		return
 	var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
-	var gen: Object = mw.call("_make_generator")
-	_ok(gen != null, "module generator compiles")
+	get_root().add_child(mw)
+	var built: bool = mw.call("setup")
+	_ok(built, "both-path: module world builds (library + frozen appearance manifest)")
+	if not built:
+		mw.queue_free()
+		return
+	var gen: Object = mw.call("get_generator")
+	_ok(gen != null, "both-path: generator available after setup")
 	if gen == null:
-		mw.free()
+		mw.queue_free()
 		return
 	var ch := 0                                   # VoxelBuffer.CHANNEL_TYPE
 	var origins := [
 		Vector3i(0, -64, 0), Vector3i(0, -16, 0), Vector3i(48, 0, 48),
 		Vector3i(-80, -32, 16), Vector3i(128, -8, -64), Vector3i(-256, 0, 320),
 	]
+	# Guarantee the sample includes shaped surface cells: add a 16³ block known to hold one.
+	var shaped_block := _find_shaped_block()
+	if shaped_block.x != 0x7fffffff:
+		origins.append(shaped_block)
 	var mismatches := 0
 	var cells := 0
+	var shaped_cells := 0
+	var uncovered := 0
 	for origin: Vector3i in origins:
 		var buf: Object = ClassDB.instantiate("VoxelBuffer")
 		buf.call("create", 16, 16, 16)
@@ -323,13 +341,203 @@ func _test_both_paths() -> void:
 			for lx in range(16):
 				for ly in range(16):
 					var got: int = int(buf.call("get_voxel", lx, ly, lz, ch))
-					var expected: int = TerrainConfig.generated_block(origin.x + lx, origin.y + ly, origin.z + lz)
+					var v: int = TerrainConfig.generated_cell(origin.x + lx, origin.y + ly, origin.z + lz)
+					var mat: int = CellCodec.mat(v)
+					var modifier: int = CellCodec.modifier(v)
+					var expected: int = int(mw.call("gen_arid_for", mat, modifier))
 					if got != expected:
 						mismatches += 1
+					if mat != BlockCatalog.AIR and modifier != 0:
+						shaped_cells += 1
+						if not bool(mw.call("is_manifest_baked", mat, modifier)):
+							uncovered += 1
 					cells += 1
-	_ok(mismatches == 0, "module generator == generated_block over %d cells (%d mismatches)" % [cells, mismatches])
-	print("    both-path determinism checked %d cells" % cells)
-	mw.free()
+	_ok(mismatches == 0, "module generator TYPE == manifest arid_for(mat,modifier) over %d cells (%d mismatches)" % [cells, mismatches])
+	_ok(shaped_cells > 0, "both-path sample includes shaped surface cells (%d) — smoothing active" % shaped_cells)
+	_ok(uncovered == 0, "every shaped generated cell is PRE-BAKED in the frozen manifest (%d uncovered) — worker never lazy-bakes" % uncovered)
+	# The generator only READS the frozen arrays — generating must not grow the ARID table.
+	var ac := int(mw.call("appearance_count"))
+	var buf2: Object = ClassDB.instantiate("VoxelBuffer")
+	buf2.call("create", 16, 16, 16)
+	gen.call("_generate_block", buf2, origins[0], 0)
+	_ok(int(mw.call("appearance_count")) == ac, "generator allocates/bakes NO ARID on the worker (count stable at %d)" % ac)
+	print("    both-path determinism checked %d cells (%d shaped)" % [cells, shaped_cells])
+	mw.queue_free()
+
+## A 16³ block origin (16-aligned) known to contain a smoothed (shaped) surface cell, or
+## (0x7fffffff,_,_) if none found near origin — so the both-path test always samples the
+## smoothing, not just flat plains.
+func _find_shaped_block() -> Vector3i:
+	for x in range(-256, 256, 4):
+		for z in range(-256, 256, 4):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			if CellCodec.modifier(TerrainConfig.generated_cell(x, g, z)) != 0:
+				return Vector3i(floori(x / 16.0) * 16, floori(g / 16.0) * 16, floori(z / 16.0) * 16)
+	return Vector3i(0x7fffffff, 0, 0)
+
+# P5b-2. Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1): the natural world
+# now emits sub-voxel shapes at the walkable surface. Asserts determinism (same seed →
+# same modifiers, mat+modifier), flat-ground regression safety (byte-identical plain
+# blocks), that smoothing actually engages, that the material projection is untouched,
+# tree bases stay FULL-topped, no fall-through (solid full cubes below the surface), and
+# the surface is continuously WALKABLE (floor_under monotone/continuous up a smoothed
+# step, no cliff steeper than the source heightmap). Both-path + manifest coverage are
+# fenced in _test_both_paths (run from _test_worldgen).
+func _test_smoothing() -> void:
+	print("[P5b-2] deterministic terrain smoothing (sub-voxel surface shapes)")
+
+	# (a) DETERMINISM: generated_cell (material AND modifier) identical on re-sample.
+	var det_ok := true
+	for x in range(-150, 150, 7):
+		for z in range(-150, 150, 11):
+			var g: int = TerrainConfig.height_at(x, z)
+			for y in [g, g + 1]:
+				if TerrainConfig.generated_cell(x, y, z) != TerrainConfig.generated_cell(x, y, z):
+					det_ok = false
+	_ok(det_ok, "generated_cell (material + modifier) is deterministic on re-sample")
+
+	# (b) SMOOTHING ENGAGES over a wide land sweep; every surface modifier is a BOTTOM
+	# corner-height code (corners ≤ 2, anchor BOTTOM); the MATERIAL projection is unchanged
+	# (generated_block == mat, so smoothing minted no new material and no stackup shifts).
+	var shaped := 0
+	var surface_cells := 0
+	var range_ok := true
+	var mat_ok := true
+	for x in range(-400, 400, 3):
+		for z in range(-400, 400, 3):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			var v: int = TerrainConfig.generated_cell(x, g, z)
+			surface_cells += 1
+			if CellCodec.mat(v) != TerrainConfig.generated_block(x, g, z):
+				mat_ok = false
+			var modifier: int = CellCodec.modifier(v)
+			if modifier != 0:
+				shaped += 1
+				var c := ShapeCodec.corners(modifier)
+				if c.x > 2 or c.y > 2 or c.z > 2 or c.w > 2 \
+						or ShapeCodec.anchor(modifier) != ShapeCodec.ANCHOR_BOTTOM:
+					range_ok = false
+	print("    surface sweep: %d land cells, %d shaped" % [surface_cells, shaped])
+	_ok(shaped > 0, "smoothing engages: at least one shaped surface cell over the sweep (%d)" % shaped)
+	_ok(range_ok, "every surface modifier is a BOTTOM corner-height code (corners ≤ 2)")
+	_ok(mat_ok, "smoothing leaves the material projection unchanged (generated_block == mat)")
+
+	# (c) FLAT-GROUND REGRESSION SAFE: on a naturally flat 5×5 patch the surface cell is a
+	# PLAIN FULL cube (modifier 0 → byte-identical to a plain block) with no cap above it.
+	var patch := _flat_patch5()
+	if patch.x != 0x7fffffff:
+		var fx := patch.x
+		var fz := patch.y
+		var fg: int = TerrainConfig.height_at(fx, fz)
+		_ok(CellCodec.modifier(TerrainConfig.generated_cell(fx, fg, fz)) == 0,
+			"flat patch: surface cell is FULL (modifier 0)")
+		_ok(TerrainConfig.generated_cell(fx, fg, fz) == TerrainConfig.generated_block(fx, fg, fz),
+			"flat patch: generated_cell == bare material id (byte-identical plain packed value)")
+		_ok(TerrainConfig.generated_block(fx, fg + 1, fz) == 0,
+			"flat patch: no cap cell above a flat surface (g+1 is air)")
+	else:
+		_ok(false, "found a flat 5×5 patch to fence flat-ground regression safety")
+
+	# (d) TREE BASES stay FULL-topped: the surface cell under a trunk base is a full cube
+	# so trunks never float on a ramp corner (SVS §8.1 tree exception).
+	var tree_ok := true
+	var tree_checked := 0
+	for gx in range(-160, 160):
+		if tree_checked >= 8:
+			break
+		for gz in range(-160, 160):
+			if tree_checked >= 8:
+				break
+			if not TreeGen.has_tree(gx, gz):
+				continue
+			var base: Vector3i = TreeGen.tree_base(gx, gz)
+			if base.y < TerrainConfig.SEA_LEVEL:
+				continue
+			if CellCodec.modifier(TerrainConfig.generated_cell(base.x, base.y, base.z)) != 0:
+				tree_ok = false
+			tree_checked += 1
+	_ok(tree_checked > 0 and tree_ok, "tree-base columns keep a FULL surface cell (checked %d)" % tree_checked)
+
+	# (e) NO FALL-THROUGH: only y==g / y==g+1 carry modifiers; every cell below the surface
+	# stays a solid FULL cube, so the analytic downward floor scan can never miss.
+	var nofall_ok := true
+	for x in range(-80, 80, 9):
+		for z in range(-80, 80, 11):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			for y in [g, g - 1, g - 3]:
+				if not TerrainConfig.is_solid(x, y, z):
+					nofall_ok = false
+				if y < g and CellCodec.modifier(TerrainConfig.generated_cell(x, y, z)) != 0:
+					nofall_ok = false
+	_ok(nofall_ok, "no fall-through: columns are solid full cubes below the smoothed surface")
+
+	# (f) WALKABILITY: across a naturally sloped land region the standable surface is
+	# continuous (no jump > STEP_MAX between adjacent footprints) and always finite.
+	_test_smoothing_walkable()
+
+# The standable surface over a smoothed 1-block step is continuous and walkable: sample
+# floor_under densely across a found 1-step land slope on a live WorldManager and assert
+# no adjacent-sample jump exceeds STEP_MAX (so the player auto-steps up it) and no sample
+# falls through. A continuous floor IS the walkability guarantee — blocked() auto-steps
+# exactly the same STEP_MAX rise floor_under exposes here.
+func _test_smoothing_walkable() -> void:
+	var spot := Vector2i(0x7fffffff, 0)
+	for x in range(-200, 200):
+		for z in range(-200, 200):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g <= TerrainConfig.SEA_LEVEL:
+				continue
+			# a gentle 1-step up to the +x neighbour, ≤1 elsewhere on the walk axis.
+			if TerrainConfig.height_at(x + 1, z) != g + 1:
+				continue
+			if absi(TerrainConfig.height_at(x - 1, z) - g) > 1:
+				continue
+			# clear above both columns so the floor scan hits the surface/cap, not a tree.
+			var clear := true
+			for xx in [x, x + 1]:
+				for yy in range(g + 2, g + 6):
+					if TerrainConfig.is_solid(xx, yy, z):
+						clear = false
+						break
+				if not clear:
+					break
+			if clear:
+				spot = Vector2i(x, z)
+				break
+		if spot.x != 0x7fffffff:
+			break
+	if spot.x == 0x7fffffff:
+		print("    (no clear 1-step land slope found near origin — walkability sweep skipped)")
+		_ok(true, "walkability sweep skipped (no 1-step land slope near origin)")
+		return
+	var world: WorldManager = _struct_world("P5bWalk")
+	var g: int = TerrainConfig.height_at(spot.x, spot.y)
+	var z := float(spot.y) + 0.5
+	var finite_ok := true
+	var cont_ok := true
+	var max_jump := 0.0
+	var prev := world.floor_under(float(spot.x) - 0.4, z, float(g) + 5.0)
+	var xx := float(spot.x) - 0.4
+	while xx <= float(spot.x) + 1.6:
+		var f := world.floor_under(xx, z, float(g) + 5.0)
+		if f <= -1000.0:
+			finite_ok = false
+		var jump := absf(f - prev)
+		if jump > max_jump:
+			max_jump = jump
+		if jump > WorldManager.STEP_MAX + 1e-3:
+			cont_ok = false
+		prev = f
+		xx += 0.1
+	_ok(finite_ok, "walkability: floor_under always finite across the slope (no fall-through)")
+	_ok(cont_ok, "walkability: standable surface continuous up the smoothed 1-step (max jump %.3f ≤ STEP_MAX)" % max_jump)
+	world.queue_free()
 
 # 3. Trees exist, are well formed and deterministic; species are biome-keyed and
 # a SPRUCE is found in taiga/snowy (WGC §6.7). Oak stays a valid tree.
@@ -911,6 +1119,12 @@ func _test_merged_physics() -> void:
 					clear = false
 					break
 			if not clear:
+				continue
+			# P5b-2: skip a column whose (smoothed) surface cell is shaped — its standable
+			# floor is fractional (cell.y + H(fx,fz)), not g+1, and aimed_voxel returns an
+			# in-cell surface hit; both are covered by _test_smoothing. Byte-identity to the
+			# pre-P2 behaviour applies to FULL-cube surface columns only.
+			if CellCodec.modifier(TerrainConfig.generated_cell(x, g, z)) != 0:
 				continue
 			var fx := float(x) + 0.5
 			var fz := float(z) + 0.5

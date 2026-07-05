@@ -325,6 +325,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	if _bedrock_at(x, y, z):
 		return _ID_BEDROCK
 	if y > g:
+		# Smoothing CAP cell (SUB-VOXEL-SMOOTHING §8.1): a land column whose neighbours
+		# rise grows a partial grass lip one cell above its surface, bridging a 1-block
+		# step up into a continuous slope. Land only (g >= SEA_LEVEL) so a cap never
+		# displaces the sea fill. Returns AIR (falls through) when no cap grows here.
+		if y == g + 1 and g >= SEA_LEVEL:
+			var cap := _surface_cap(x, z, g, biome)
+			if cap != BlockCatalog.AIR:
+				return cap
 		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
@@ -333,7 +341,119 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	if id == BlockCatalog.STONE:
 		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
 		id = _ore_at(x, y, z, id, biome, c)   # host-aware ore lattice
+	# Smoothing SURFACE shape (SVS §8.1): reshape the walkable top cell of a land column
+	# into a corner-height ramp/slab whose surface fits the four neighbouring column
+	# tops. Only the MODIFIER changes — the material projection (generated_block) is
+	# untouched, so every material/stackup invariant holds; cells below the surface stay
+	# solid full cubes, so the analytic floor scan can never fall through.
+	if y == g and g >= SEA_LEVEL:
+		return _smoothed_surface(x, z, g, id)
 	return id
+
+# ------------------------------------------------------------------------------
+# Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1). The walkable surface
+# cell — and, on a rising neighbour, a one-cell cap above it — is reshaped into a
+# corner-height partial fill whose top fits the four surrounding integer column tops,
+# so a 1-block stair-step reads as a continuous ramp. PURE + DETERMINISTIC: derived
+# only from height_at (the integer column tops both render paths already share) and
+# the TreeGen overlay — NO noise resampling, NO randi()/Time — so the module generator
+# (which calls resolve_cell) and the analytic generated_cell agree by construction, and
+# re-running with the same SEED yields identical modifiers. Slopes up to 1 block/cell
+# smooth fully; steeper terrain saturates the {0,1,2} half-block clamp and stays blocky
+# (§8 non-goal: cliffs read as cliffs).
+
+## The four corner target heights T (world-y, in blocks) at the lattice corners of the
+## cell column (x, z): (T00, T10, T11, T01) at corners (x,z),(x+1,z),(x+1,z+1),(x,z+1)
+## in the ShapeCodec corner order. Each corner target is the mean of the walk-surfaces
+## (height_at + 1) of the four columns meeting at that corner (SVS §8.1). Local (a 3×3
+## column-top stencil), crack-free (neighbouring cells share these corner targets so the
+## composed surface is C0), and IDENTICAL for both generators (only height_at is read).
+static func _corner_targets(x: int, z: int) -> Vector4:
+	var t_nn := float(height_at(x - 1, z - 1) + 1)
+	var t_0n := float(height_at(x,     z - 1) + 1)
+	var t_pn := float(height_at(x + 1, z - 1) + 1)
+	var t_n0 := float(height_at(x - 1, z)     + 1)
+	var t_00 := float(height_at(x,     z)     + 1)
+	var t_p0 := float(height_at(x + 1, z)     + 1)
+	var t_np := float(height_at(x - 1, z + 1) + 1)
+	var t_0p := float(height_at(x,     z + 1) + 1)
+	var t_pp := float(height_at(x + 1, z + 1) + 1)
+	return Vector4(
+		(t_nn + t_0n + t_n0 + t_00) * 0.25,   # corner (x, z)
+		(t_0n + t_pn + t_00 + t_p0) * 0.25,   # corner (x+1, z)
+		(t_00 + t_p0 + t_0p + t_pp) * 0.25,   # corner (x+1, z+1)
+		(t_n0 + t_00 + t_np + t_0p) * 0.25)   # corner (x, z+1)
+
+## The BOTTOM-anchored corner-height modifier for a cell whose floor is at `base_y`,
+## quantized to half-blocks and clamped to {0,1,2}. Returns 0 (FULL cube) when the
+## surface reaches the ceiling at every corner (flat ground → byte-identical to a plain
+## block) OR is cut to the floor at every corner (empty).
+static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
+	var by := float(base_y)
+	var c00 := clampi(roundi((targets.x - by) * 2.0), 0, 2)
+	var c10 := clampi(roundi((targets.y - by) * 2.0), 0, 2)
+	var c11 := clampi(roundi((targets.z - by) * 2.0), 0, 2)
+	var c01 := clampi(roundi((targets.w - by) * 2.0), 0, 2)
+	if c00 == 2 and c10 == 2 and c11 == 2 and c01 == 2:
+		return 0
+	if c00 == 0 and c10 == 0 and c11 == 0 and c01 == 0:
+		return 0
+	return ShapeCodec.make_modifier(c00, c10, c11, c01, ShapeCodec.ANCHOR_BOTTOM)
+
+## The packed SURFACE cell value at (x, g, z): the biome-top material `mat` reshaped by
+## the smoothing modifier, or the plain material when flat OR under a tree base (a tree
+## cell resting on the surface forces it FULL so trunks never float on a ramp corner —
+## SVS §8.1 tree exception).
+static func _smoothed_surface(x: int, z: int, g: int, mat: int) -> int:
+	if TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR:
+		return mat                                    # a tree cell rests here → keep FULL
+	var m := _modifier_from_targets(_corner_targets(x, z), g)
+	if m == 0:
+		return mat
+	return CellCodec.pack(mat, m)
+
+## The packed CAP cell value at (x, g+1, z), or AIR (0) when no cap grows here (flat
+## ground, a >1-block cliff that saturates to a full block, or a tree cell owning the
+## cell). The cap is the column's surface material, shaped by the SAME corner targets as
+## the surface cell below it, so the two form one crack-free continuous slope.
+static func _surface_cap(x: int, z: int, g: int, biome: int) -> int:
+	if TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR:
+		return BlockCatalog.AIR                       # tree overlay owns this cell
+	var m := _modifier_from_targets(_corner_targets(x, z), g + 1)
+	if m == 0:
+		return BlockCatalog.AIR                       # no lip (flat) or a full-block step (kept blocky)
+	return CellCodec.pack(_biome_top(biome, x, z), m)
+
+## The appearance manifest (RUNTIME-MATERIAL-STREAMING §6.5 / VOXEL-DATA-STRUCTURE
+## §8.1/§8.3): the exact set of (surface material, modifier) pairs this smoothing
+## generator can emit. The module path pre-allocates + bakes + FREEZES their ARIDs at
+## path activation (before the voxel worker runs), so the worker maps (mat, modifier) →
+## ARID by reading a frozen array and never allocates or bakes a model itself.
+
+## The land surface materials smoothing can shape — every biome top `_biome_top` can
+## return for a land column. Ocean/underwater floors are never smoothed (g < SEA_LEVEL).
+static func appearance_surface_materials() -> PackedInt32Array:
+	_ensure_ids()
+	return PackedInt32Array([
+		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL,
+	])
+
+## Every corner-height modifier the smoothing can emit: all BOTTOM-anchored corner
+## tuples in {0,1,2}⁴ except all-2 (the FULL cube — served by the eager cube ARID) and
+## all-0 (also the FULL-cube encoding 0). 79 shapes; the module bakes materials × these
+## once at setup. All BOTTOM-anchored, so each modifier is < 256 (dense manifest slot).
+static func appearance_modifiers() -> PackedInt32Array:
+	var out := PackedInt32Array()
+	for c00 in 3:
+		for c10 in 3:
+			for c11 in 3:
+				for c01 in 3:
+					if c00 == 2 and c10 == 2 and c11 == 2 and c01 == 2:
+						continue
+					if c00 == 0 and c10 == 0 and c11 == 0 and c01 == 0:
+						continue
+					out.append(ShapeCodec.make_modifier(c00, c10, c11, c01, ShapeCodec.ANCHOR_BOTTOM))
+	return out
 
 # --- stage: bedrock floor (WGC §6.1) ------------------------------------------
 static func _bedrock_at(x: int, y: int, z: int) -> bool:

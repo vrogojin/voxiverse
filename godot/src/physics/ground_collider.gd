@@ -109,20 +109,28 @@ func _rebuild() -> void:
 			var run_start := 0x7fffffff
 			while y <= h:
 				# y <= h ⇒ the heightmap fills this cell; it is air only if broken out.
-				# A single overlay lookup (same cost as is_removed) also catches a placed
-				# SHAPED cell here (dug then a ramp/slab placed): it interrupts the box run
-				# and contributes convex prisms instead of a box (SVS §5.4). Generated cells
-				# below the surface are always full cubes in P5b-1 (no worldgen smoothing).
+				# A single overlay lookup (same cost as is_removed) catches a placed SHAPED
+				# cell here (dug then a ramp/slab placed). At the heightmap TOP (y == h),
+				# where P5b-2 worldgen may have smoothed the surface into a ramp/slab, one
+				# composed read picks up the GENERATED shape too. Sub-surface generated cells
+				# are always full cubes, so the fast overlay read suffices below the top.
+				# Either way a shaped cell breaks the box run and contributes convex prisms
+				# instead of a box (SVS §5.4).
 				var ov: int = world.placed_cells().get(Vector3i(x, y, z), -1)
+				var modifier := 0
+				if ov > 0:
+					modifier = CellCodec.modifier(ov)
+				elif ov < 0 and y == h:
+					modifier = CellCodec.modifier(world.cell_value_at(Vector3i(x, y, z)))
 				if ov == 0:                                 # dug to air
 					if run_start != 0x7fffffff:
 						_add_box(rid, x, z, run_start, y)   # run [run_start, y-1] → [run_start, y]
 						run_start = 0x7fffffff
-				elif ov > 0 and CellCodec.modifier(ov) != 0:   # placed shaped cell
+				elif modifier != 0:                         # shaped cell (placed or smoothed top)
 					if run_start != 0x7fffffff:
 						_add_box(rid, x, z, run_start, y)
 						run_start = 0x7fffffff
-					_add_prisms(rid, x, y, z, CellCodec.modifier(ov))
+					_add_prisms(rid, x, y, z, modifier)
 				elif run_start == 0x7fffffff:
 					run_start = y
 				y += 1

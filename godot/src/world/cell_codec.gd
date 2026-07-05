@@ -18,6 +18,12 @@ extends RefCounted
 
 const MAT_MASK := 0xFFFF
 
+## Modifier sub-fields (VDS §3.2 / SUB-VOXEL §3.1). Corner heights live in bits 0..7
+## (two bits each), the anchor in bit 8, a family tag in bit 15.
+const MOD_CORNERS_MASK := 0xFF
+const MOD_ANC_BIT := 1 << 8
+const MOD_FAM_BIT := 1 << 15
+
 ## Material (LRID) — low 16 bits.
 static func mat(v: int) -> int:
 	return v & MAT_MASK
@@ -52,22 +58,49 @@ static func canonical(v: int) -> int:
 	var m := mat(v)
 	if m == BlockCatalog.AIR:
 		return 0                              # air never carries modifier/state
-	return pack(m, _canonical_modifier(m, modifier(v)), _validate_state(m, state(v)))
+	var cm := _canonical_modifier(m, modifier(v))
+	# A canonicalized corner-height shape with all four corners 0 but a nonzero
+	# encoding (e.g. a TOP anchor bit) is an EMPTY shape — the cell is AIR (VDS §3.2 /
+	# SUB-VOXEL §3.1). Modifier 0 (the FULL-cube encoding) is deliberately excluded.
+	if cm != 0 and (cm & MOD_FAM_BIT) == 0 and (cm & MOD_CORNERS_MASK) == 0:
+		return 0
+	return pack(m, cm, _validate_state(m, state(v)))
 
-## P5 hook — corner-height canonicalization (FULL-cube shapes → 0, corner-value
-## clamp; VOXEL-DATA-STRUCTURE §3.2). The corner-height math is P5; P2 wires only
-## the INTEGRATION-DECISIONS §3 addendum: `modifier != 0` requires a solid material
-## (`solidity_of(mat) >= 0.5`). A modifier on a non-solid material — a "ramp of
-## water" — is invalid, not merely unusual (VDS §3.1's "fails validation, not
-## encoding"); it strips to full cube (0) with a logged warning, so the merged
-## material gate may soundly ignore modifiers on non-solid cells. Solid materials'
-## modifiers pass through unchanged today.
+## Corner-height canonicalization (VOXEL-DATA-STRUCTURE §3.2 / SUB-VOXEL §3.1), the
+## packing half of the split `ShapeCodec` (VDS §13.1.2). Guarantees each geometric
+## shape maps to a UNIQUE modifier int (needed for mesher keying + equality):
+##   * INTEGRATION-DECISIONS §3 addendum: `modifier != 0` on a non-solid material — a
+##     "ramp of water" — strips to full cube (0) with a logged warning, so the merged
+##     material gate may soundly ignore modifiers on non-solid cells;
+##   * corner value 3 (the 2-bit slot permits it) clamps to 2;
+##   * all-corners-2 (BOTTOM or TOP) collapses to modifier 0 (FULL cube), so a flat
+##     surface generates byte-identical values to a plain block.
+## The all-corners-0 (empty-shape → AIR) collapse lives in `canonical` above, since it
+## zeroes the whole cell value, not just the modifier.
 static func _canonical_modifier(material: int, modifier_bits: int) -> int:
+	# Merged-contract gate (INTEGRATION-DECISIONS §3): a modifier on a non-solid
+	# material — a "ramp of water" — is invalid; strip to full cube (0), log once.
 	if modifier_bits != 0 and BlockCatalog.solidity_of(material) < 0.5:
 		push_warning("CellCodec: modifier %d on non-solid material %d is invalid — stripped to full cube (0)"
 			% [modifier_bits, material])
 		return 0
-	return modifier_bits
+	if modifier_bits == 0:
+		return 0                              # FULL cube (fast path)
+	# Future shape families (FAM = 1) carry no corner-height semantics — pass through.
+	if modifier_bits & MOD_FAM_BIT:
+		return modifier_bits & 0xFFFF
+	# Corner-height family: clamp each 2-bit corner (value 3 → 2, VDS §3.2).
+	var c0 := mini(modifier_bits & 3, 2)
+	var c1 := mini((modifier_bits >> 2) & 3, 2)
+	var c2 := mini((modifier_bits >> 4) & 3, 2)
+	var c3 := mini((modifier_bits >> 6) & 3, 2)
+	# All-corners-2 (BOTTOM or TOP) is the FULL cube → modifier 0 (so a flat surface
+	# generates byte-identical values to a plain block). Collapsing here BEFORE the
+	# anchor is re-applied is what maps both anchor variants to 0.
+	if c0 == 2 and c1 == 2 and c2 == 2 and c3 == 2:
+		return 0
+	var anc := modifier_bits & MOD_ANC_BIT
+	return c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | anc
 
 ## P6 hook — validate state bits against the material's declared state_layout
 ## (VOXEL-DATA-STRUCTURE §3.2/§10.3), clamping unknown bits. Pass-through until

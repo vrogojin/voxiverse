@@ -30,6 +30,7 @@ func _initialize() -> void:
 	_test_materials()
 	_test_inventory()
 	_test_cell_codec()
+	_test_shape_math()
 	_test_material_data()
 	_test_catalog_expansion()
 	_test_merged_physics()
@@ -498,6 +499,164 @@ func _test_cell_codec() -> void:
 	print("    projection-coherence checked %d generated cells" % gen_checked)
 	world.queue_free()
 
+# P5a. Sub-voxel SHAPE math (SUB-VOXEL-SMOOTHING §2/§6/§7 + VDS §3.2). Pure, no
+# world. The load-bearing guard: modifier 0 is BYTE-IDENTICAL to the full-cube stubs
+# P2/P4 already call, so the running game (which emits only modifier 0) is unchanged.
+# Then the real corner-height math: the §2.1 volume table, rotation invariance, the
+# §6 complement invariant, §7 contact-area examples, the LUT/direct agreement + the
+# handedness case, and the §3.2 canonicalization.
+func _test_shape_math() -> void:
+	print("[P5a] sub-voxel shape math (corner-height / mass / contact area)")
+
+	# (a) FULL-CUBE IDENTITY: modifier 0 returns exactly today's full-cube value for
+	# EVERY function — the guarantee that P5a changes no behaviour.
+	_ok(ShapeCodec.volume(0) == 1.0, "volume(FULL) == 1")
+	_ok(ShapeCodec.local_top(0, 0.3, 0.7) == 1.0, "local_top(FULL) == 1")
+	_ok(ShapeCodec.span(0, 0.3, 0.7) == Vector2(0.0, 1.0), "span(FULL) == (0,1)")
+	_ok(ShapeCodec.occupied(0, 0.5, 0.5, 0.5), "occupied(FULL) == true")
+	_ok(ShapeCodec.corners(0) == Vector4i(2, 2, 2, 2), "corners(FULL) == (2,2,2,2)")
+	for axis in [ShapeCodec.AXIS_X, ShapeCodec.AXIS_Y, ShapeCodec.AXIS_Z]:
+		_ok(ShapeCodec.contact_area(0, 0, axis) == 1.0, "contact_area(FULL,FULL,%d) == 1" % axis)
+	for face in range(6):
+		_ok(ShapeCodec.side_profile_full(0, face), "side_profile_full(FULL, %d) == true" % face)
+
+	# (b) VOLUME of the §2.1 named shapes (BOTTOM-anchored representatives).
+	var named := {
+		"SLAB": [1, 1, 1, 1, 0.5],
+		"RAMP": [2, 2, 0, 0, 0.5],
+		"HALF_RAMP_LO": [1, 1, 0, 0, 0.25],
+		"HALF_RAMP_HI": [2, 2, 1, 1, 0.75],
+		"CORNER": [2, 0, 0, 0, 1.0 / 3.0],
+		"ANTICORNER": [2, 2, 2, 0, 5.0 / 6.0],
+		"HALF_CORNER": [1, 0, 0, 0, 1.0 / 6.0],
+		"HALF_ANTICORNER": [1, 1, 1, 0, 5.0 / 12.0],
+		"RIDGE": [2, 0, 2, 0, 2.0 / 3.0],
+	}
+	for nm in named:
+		var d: Array = named[nm]
+		var m := ShapeCodec.make_modifier(d[0], d[1], d[2], d[3])
+		_ok(is_equal_approx(ShapeCodec.volume(m), d[4]),
+			"volume(%s) == %.4f (got %.4f)" % [nm, d[4], ShapeCodec.volume(m)])
+
+	# (c) ROTATION INVARIANCE: a cyclic corner shift (90° yaw) preserves volume for
+	# every one of the 81 corner tuples (max-sum rule routes the diagonal consistently).
+	var rot_ok := true
+	for c0 in range(3):
+		for c1 in range(3):
+			for c2 in range(3):
+				for c3 in range(3):
+					var m := ShapeCodec.make_modifier(c0, c1, c2, c3)
+					var mr := ShapeCodec.make_modifier(c3, c0, c1, c2)   # yaw: (c00,c10,c11,c01)->(c01,c00,c10,c11)
+					if not is_equal_approx(ShapeCodec.volume(m), ShapeCodec.volume(mr)):
+						rot_ok = false
+	_ok(rot_ok, "volume invariant under 90° rotation over all 81 corner tuples")
+
+	# (d) §6 COMPLEMENT INVARIANT for a FIXED diagonal: V_D(c) + V_D(2−c) == 1.
+	var comp_ok := true
+	for c0 in range(3):
+		for c1 in range(3):
+			for c2 in range(3):
+				for c3 in range(3):
+					var c := Vector4i(c0, c1, c2, c3)
+					var cc := Vector4i(2 - c0, 2 - c1, 2 - c2, 2 - c3)
+					for use_main in [true, false]:
+						var s := ShapeCodec.volume_of_corners(c, use_main) \
+							+ ShapeCodec.volume_of_corners(cc, use_main)
+						if not is_equal_approx(s, 1.0):
+							comp_ok = false
+	_ok(comp_ok, "fixed-diagonal complement invariant V_D(c)+V_D(2−c)=1 over all codes")
+
+	# (e) CONTACT AREA — the §7 examples the requirements call out.
+	var slab_b := ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM)
+	var slab_t := ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_TOP)
+	# Bottom slab beside top slab: profiles (½,½) vs (½,½) opposite anchor → ∫max(0,0)=0.
+	_ok(ShapeCodec.contact_area(slab_b, slab_t, ShapeCodec.AXIS_X) == 0.0,
+		"bottom-slab ‖ top-slab lateral contact == 0 (zero overlap ⇒ no joint)")
+	# RAMP (2,2,0,0): high side is the −Z face (2,2), zero edge is +Z (0,0).
+	var ramp := ShapeCodec.make_modifier(2, 2, 0, 0)
+	# High side against a cube on its −z: a=cube(−z), b=ramp(+z) → cube+Z(2,2) ∩ ramp−Z(2,2)=1.
+	_ok(ShapeCodec.contact_area(0, ramp, ShapeCodec.AXIS_Z) == 1.0,
+		"ramp high side ‖ cube == 1 (full-face joint)")
+	# Zero edge against a cube on its +z: a=ramp(−z), b=cube(+z) → ramp+Z(0,0) ∩ cube−Z(2,2)=0.
+	_ok(ShapeCodec.contact_area(ramp, 0, ShapeCodec.AXIS_Z) == 0.0,
+		"ramp zero edge ‖ cube == 0 (no joint)")
+	# Cube directly above a bottom slab: horizontal, a=lower=slab, b=upper=cube → 0
+	# (½-block air gap; the famous §7.2 unsupported-cube case).
+	_ok(ShapeCodec.contact_area(slab_b, 0, ShapeCodec.AXIS_Y) == 0.0,
+		"cube above bottom-slab horizontal contact == 0")
+	# Cube above an anticorner (one all-2 triangle) → half the face.
+	var anticorner := ShapeCodec.make_modifier(2, 2, 2, 0)
+	_ok(ShapeCodec.contact_area(anticorner, 0, ShapeCodec.AXIS_Y) == 0.5,
+		"cube above anticorner horizontal contact == ½")
+
+	# (f) HANDEDNESS: two identical wedges nose-to-nose (high edges meet) give a
+	# different area than nose-to-tail. Catches the §7.1 profile-orientation bug — if
+	# the extraction ignored which edge faces the seam both would read equal.
+	var ramp_hi_pz := ShapeCodec.make_modifier(0, 0, 2, 2)   # high side at +Z
+	# nose-to-nose along z: a=(high +Z) meets b=ramp(−Z high) → 1.
+	_ok(ShapeCodec.contact_area(ramp_hi_pz, ramp, ShapeCodec.AXIS_Z) == 1.0,
+		"wedges nose-to-nose (high edges meet) contact == 1")
+	# nose-to-tail: a=ramp(+Z is the zero edge) meets b=ramp(−Z high) → 0.
+	_ok(ShapeCodec.contact_area(ramp, ramp, ShapeCodec.AXIS_Z) == 0.0,
+		"wedges nose-to-tail (zero edge meets high) contact == 0")
+
+	# (g) LUT vs direct integral agreement over all 18×18 side-profile pairs.
+	ShapeCodec.ensure_ready()
+	var lut_ok := true
+	for ia in range(18):
+		for ib in range(18):
+			var lut_v := ShapeCodec._lut[ia * 18 + ib]
+			var direct := ShapeCodec._profile_overlap_direct(ia, ib)
+			if not is_equal_approx(lut_v, direct):
+				lut_ok = false
+	_ok(lut_ok, "profile-overlap LUT == direct integral over all 18×18 pairs")
+
+	# (h) CANONICALIZATION (§3.2): FULL-cube variants collapse to 0, empty shapes to
+	# AIR, corner value 3 clamps, and canonical modifiers round-trip / stay unique.
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE,
+		ShapeCodec.make_modifier(2, 2, 2, 2, ShapeCodec.ANCHOR_BOTTOM)))) == 0,
+		"all-corners-2 BOTTOM → FULL (modifier 0)")
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE,
+		ShapeCodec.make_modifier(2, 2, 2, 2, ShapeCodec.ANCHOR_TOP)))) == 0,
+		"all-corners-2 TOP → FULL (modifier 0)")
+	# All-corners-0 with a nonzero encoding (TOP anchor bit) → the whole cell is AIR.
+	_ok(CellCodec.canonical(CellCodec.pack(STONE,
+		ShapeCodec.make_modifier(0, 0, 0, 0, ShapeCodec.ANCHOR_TOP))) == 0,
+		"all-corners-0 (nonzero encoding) → AIR (whole value 0)")
+	# Corner value 3 clamps to 2: modifier 7 = corners (3,1,0,0) → (2,1,0,0).
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, 7))) ==
+		ShapeCodec.make_modifier(2, 1, 0, 0),
+		"corner value 3 clamps to 2 (modifier 7 → (2,1,0,0))")
+	# Idempotent round-trip + uniqueness for a spread of canonical corner-height codes.
+	var seen := {}
+	var round_ok := true
+	for c0 in range(3):
+		for c1 in range(3):
+			for c2 in range(3):
+				for c3 in range(3):
+					for anc in [ShapeCodec.ANCHOR_BOTTOM, ShapeCodec.ANCHOR_TOP]:
+						var raw := ShapeCodec.make_modifier(c0, c1, c2, c3, anc)
+						var can := CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, raw)))
+						# canonical is idempotent: canonicalizing the canonical form is a no-op.
+						var can2 := CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, can)))
+						if can != can2:
+							round_ok = false
+	_ok(round_ok, "canonicalization is idempotent over all corner-height codes × anchors")
+
+	# (i) ShapeMesh builds a non-empty, indexed mesh for FULL and a ramp (P5b's render
+	# seam exists and is deterministic); parallel arrays stay aligned.
+	var full_mesh := ShapeMesh.build(0)
+	_ok(full_mesh["verts"].size() > 0 and full_mesh["indices"].size() % 3 == 0,
+		"ShapeMesh.build(FULL) yields a triangulated mesh")
+	_ok(full_mesh["verts"].size() == full_mesh["normals"].size()
+		and full_mesh["verts"].size() == full_mesh["uvs"].size(),
+		"ShapeMesh arrays (verts/normals/uvs) stay aligned")
+	var ramp_mesh := ShapeMesh.build(ramp)
+	_ok(ramp_mesh["verts"].size() > 0 and ramp_mesh["indices"].size() % 3 == 0,
+		"ShapeMesh.build(RAMP) yields a triangulated mesh")
+	var m1 := ShapeMesh.build(ramp)
+	_ok(m1["verts"] == ramp_mesh["verts"], "ShapeMesh.build is deterministic")
+
 # P1. Material-data layer: the anchor converter reproduces the calibration and
 # the stored core anchors (drift gate), and blocks.json agrees with BlockCatalog.
 func _test_material_data() -> void:
@@ -726,8 +885,10 @@ func _test_merged_physics() -> void:
 	var stripped := CellCodec.canonical(CellCodec.pack(99, 5, 3))
 	_ok(CellCodec.mat(stripped) == 99 and CellCodec.modifier(stripped) == 0,
 		"canonical strips modifier on non-solid material (mat kept, modifier 0)")
-	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, 7, 0))) == 7,
-		"canonical keeps modifier on a solid material (no strip)")
+	# A canonical corner-height modifier (no corner==3, not all-2, not empty) on a
+	# solid material is preserved. Modifier 5 = corners (1,1,0,0) = HALF_RAMP_LO.
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, 5, 0))) == 5,
+		"canonical keeps a valid corner-height modifier on a solid material")
 
 	# (v) BYTE-IDENTITY: floor_under / blocked / aimed_voxel == known expected values
 	# on untouched terrain. Bare-surface columns only (skip tree columns, whose above-

@@ -20,8 +20,22 @@ extends Resource
 @export var density: float = 1500.0
 ## Force (newtons) needed to break/detach this voxel. INF = unbreakable.
 @export var break_force: float = INF
-## How strongly this voxel stays attached to neighbours (0..1).
+## Joint participation multiplier (default 1.0; 0.0 = does not bond, e.g. sand).
+## Composed as `att_A · att_B` on a joint's tension/shear/moment capacities only
+## (never the compression path) — INTEGRATION-DECISIONS §1.4. Superseded the old
+## scalar "attachment strength" reading; the real (tension, shear) strengths now
+## live in `strength_anchors`.
 @export_range(0.0, 1.0) var attachment: float = 1.0
+## Structural strength anchors `(P, H, D)` — max pillar height, max horizontal
+## shelf, max dangling depth (three small integers with direct in-game meaning;
+## SI §7 / INTEGRATION-DECISIONS §1.1). The structural solver derives σ_c=P·m·g,
+## σ_s=H·m·g, σ_t=D·m·g, M₀=σ_s·H/2 from these + mass — the single source of
+## truth for joint/node capacities. NOT precomputed here.
+@export var strength_anchors: Vector3i = Vector3i(1, 1, 1)
+## Structural family keying the anchor converter's branch and solver behaviour:
+## `&"rock"`/`&"soil"`/`&"timber"`/`&"foliage"`/`&"brittle"`/`&"granular"`/
+## `&"metal"`/`&"soft"`/`&"fluid"`/`&"bedrock"` (INTEGRATION-DECISIONS §1.2/§1.3).
+@export var structural_class: StringName = &"rock"
 ## Fluid/gas permeability (0 = sealed, 1 = fully permeable).
 @export_range(0.0, 1.0) var permeability: float = 0.0
 ## Fraction of incident light reflected (0..1).

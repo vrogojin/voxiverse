@@ -29,6 +29,7 @@ func _initialize() -> void:
 	_test_materials()
 	_test_inventory()
 	_test_cell_codec()
+	_test_material_data()
 	_test_world_loop()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -226,6 +227,60 @@ func _test_cell_codec() -> void:
 				gen_checked += 1
 	print("    projection-coherence checked %d generated cells" % gen_checked)
 	world.queue_free()
+
+# P1. Material-data layer: the anchor converter reproduces the calibration and
+# the stored core anchors (drift gate), and blocks.json agrees with BlockCatalog.
+func _test_material_data() -> void:
+	print("[P1] material data + anchor converter")
+	# (b) the three §1.2 calibration anchors, as pure-math converter asserts.
+	_ok(AnchorConverter.propose_anchors({"C": 100.0, "T": 10.0}, &"rock") == Vector3i(64, 6, 4),
+		"converter: stone (C100,T10,rock) -> (64,6,4)")
+	_ok(AnchorConverter.propose_anchors({"C": 50.0, "T": 90.0}, &"timber") == Vector3i(36, 24, 16),
+		"converter: wood (C50,T90,timber) -> (36,24,16)")
+	_ok(AnchorConverter.propose_anchors({"cohesion": 25.0}, &"soil") == Vector3i(4, 2, 1),
+		"converter: dirt (c=25,soil) -> (4,2,1) [1.5 rounds up to H=2]")
+	# grass is a second soil anchor (§1.2 table) — proves the branch, not just dirt.
+	_ok(AnchorConverter.propose_anchors({"cohesion": 30.0}, &"soil") == Vector3i(4, 2, 1),
+		"converter: grass (c=30,soil) -> (4,2,1)")
+	# round-half-up is load-bearing: 1.5 -> 2, and it is the normative helper form.
+	_ok(AnchorConverter._round_half_up(1.5) == 2 and AnchorConverter._round_half_up(0.5) == 1,
+		"round-half-up: 1.5->2, 0.5->1 (dirt H depends on this)")
+
+	# (a) DRIFT GATE: for every non-air core record not marked anchors_override,
+	# propose_anchors(priors, class) == the anchors stored in BlockCatalog.
+	var records := BlockCatalog.load_data()
+	_ok(not records.is_empty(), "blocks.json loads with a `blocks` array")
+	var seen_core := 0
+	for rec: Variant in records:
+		if not (rec is Dictionary):
+			continue
+		var id := int(rec.get("id", -1))
+		if id <= BlockCatalog.AIR or id >= BlockCatalog.COUNT:
+			continue                          # air + (future) non-core rows
+		seen_core += 1
+		var nm := String(rec.get("name", "?"))
+		var cls := StringName(String(rec.get("structural_class", "rock")))
+		var priors: Dictionary = rec.get("priors", {})
+		var proposed := AnchorConverter.propose_anchors(priors, cls)
+		var stored := BlockCatalog.anchors_of(id)
+		if bool(rec.get("anchors_override", false)):
+			continue                          # tuned value — gate does not apply
+		_ok(proposed == stored,
+			"drift gate '%s': propose%s == stored %s" % [nm, str(proposed), str(stored)])
+	_ok(seen_core == BlockCatalog.COUNT - 1, "drift gate covered all %d non-air core materials (%d)"
+		% [BlockCatalog.COUNT - 1, seen_core])
+
+	# (c) blocks.json <-> BlockCatalog consistency (ids/mass/anchors/class/swatch/
+	# break_force/attachment) — the golden "consts asserted against data" check.
+	var mismatches := BlockCatalog.check_against_data()
+	_ok(mismatches.is_empty(), "blocks.json matches BlockCatalog: " + ", ".join(mismatches))
+
+	# (d) attachment defaults to 1.0 for every core material (only sand/gravel,
+	# not yet in the catalog, will ship 0.0 participation — §1.4).
+	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
+		var s: VoxelState = BlockCatalog.state_of(id)
+		_ok(s != null and is_equal_approx(s.attachment, 1.0),
+			"%s attachment == 1.0" % BlockCatalog.name_of(id))
 
 # 4/5. Live world edit loop: break returns id, place mutates + collider rebuilds.
 func _test_world_loop() -> void:

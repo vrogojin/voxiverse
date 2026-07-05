@@ -111,6 +111,32 @@ func set_cell(idx: int, packed: int, meta: Variant = null) -> void:
 	else:
 		_meta.erase(idx)
 
+## Zone-bundle variant of `set_cell` (RUNTIME-MATERIAL-STREAMING §2.6): record a present cell
+## keyed by an explicit container IDENTITY string — the cross-session "<gmid>#<state>" key from
+## `BlockCatalog.key_of` — instead of deriving the session-local material NAME from the live
+## catalog. A zone bundle binds each such key to a GMID + manifest document, so a chunk resolves
+## by GLOBAL identity: never a session-local dense id (which is per-session), and never a
+## collidable alias NAME (two different materials may share a state name like "solid"). The
+## modifier/state/metadata axes are recorded exactly as `set_cell` does. `identity` must be a
+## real key — air's key is the literal "air"; the empty string is the UNSET sentinel and is
+## rejected (an unset cell is simply never recorded).
+func set_cell_keyed(idx: int, identity: String, modifier: int, state: int, meta: Variant = null) -> void:
+	assert(idx >= 0 and idx < CELLS, "ZoneChunk.set_cell_keyed: local index out of range")
+	assert(identity != UNSET_NAME, "ZoneChunk.set_cell_keyed: identity must not be the UNSET sentinel")
+	_mat_name[idx] = identity
+	if modifier != 0:
+		_modifier[idx] = modifier
+	else:
+		_modifier.erase(idx)
+	if state != 0:
+		_state[idx] = state
+	else:
+		_state.erase(idx)
+	if meta != null and meta is Dictionary and not (meta as Dictionary).is_empty():
+		_meta[idx] = (meta as Dictionary).duplicate(true)
+	else:
+		_meta.erase(idx)
+
 # --- decoded queries (used by WorldManager.load_edits and the verify harness) ---------
 
 ## Sorted-ascending local indices of the present (stored) cells.

@@ -41,6 +41,7 @@ func _initialize() -> void:
 	_test_metadata()
 	_test_zonechunk()
 	_test_dynamic_catalog()
+	_test_zone_bundle()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -2122,6 +2123,203 @@ func _synthetic_document(mat_name: String, state_name: String, mass: float, swat
 	st.tint = swatch
 	st.structural_class = &"rock"
 	st.strength_anchors = Vector3i(8, 4, 2)
+	var def := VoxelMaterialDef.new()
+	def.id = StringName(mat_name)
+	def.states = [st]
+	def.default_state_index = 0
+	return MaterialDocument.to_document(def)
+
+# P6c-2. Zone bundles (RUNTIME-MATERIAL-STREAMING §2.6/§3.4/§5, §11 remainder): the final piece
+# of runtime material streaming — a self-contained payload (manifest + id-map + ZoneChunk(s)) that
+# carries the block MATERIALS a receiver has never seen alongside the voxel data, keyed by
+# cross-session GMID. Asserts: (1) ZONE-BUNDLE ROUND-TRIP — a region of synthetic streamed
+# materials (+ shapes + state + a metadata cell + a dug-to-air cell) saves → bundle bytes → loads
+# into a FRESH bootstrap-only catalog with every cell's (material-by-GMID, modifier, state) +
+# metadata identical (the manifest made it self-contained); (2) SHUFFLED-LOAD-ORDER GMID ROUND-TRIP
+# (the crux) — a session that pre-registers the SAME materials in the REVERSE order (so dense LRIDs
+# differ) loads the bundle correctly by GMID, proving dense ids never cross the boundary; (3) DEDUP
+# — loading a bundle whose GMIDs are already registered reuses their LRIDs (no duplicates); (4)
+# SCALE SANITY — 1000 register_material calls allocate monotonic bounded LRIDs, the facade still
+# answers, and (module path) the batched ARID bake handles a large library without error. Runs
+# LAST and resets the catalog around each phase, so the count()==77 bootstrap asserts above stand.
+func _test_zone_bundle() -> void:
+	print("[P6c-2] zone bundles (manifest + id-map + bulk inject) + shuffled-load-order round-trip")
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # a non-zero (wedge) modifier
+
+	# ---- SESSION A: fresh catalog; register 3 synthetic materials in order X, Y, Z ----------
+	BlockCatalog.reset_session()
+	var base := BlockCatalog.count()                   # bootstrap-only baseline (77)
+	var doc_x := _bundle_doc("voxiverse:alfa", "solid", 800.0, Color(0.9, 0.1, 0.1, 1.0), false)
+	var doc_y := _bundle_doc("voxiverse:bravo", "solid", 900.0, Color(0.1, 0.9, 0.1, 1.0), false)
+	var doc_z := _bundle_doc("voxiverse:charlie", "chest", 1000.0, Color(0.1, 0.1, 0.9, 1.0), true)
+	var gx := MaterialDocument.gmid_of(doc_x)
+	var gy := MaterialDocument.gmid_of(doc_y)
+	var gz := MaterialDocument.gmid_of(doc_z)
+	_ok(gx != gy and gy != gz and gx != gz, "bundle: three synthetic materials have distinct GMIDs")
+	var kx := String(gx) + "#solid"
+	var ky := String(gy) + "#solid"
+	var kz := String(gz) + "#chest"
+	MaterialRegistry.register_document(doc_x)
+	MaterialRegistry.register_document(doc_y)
+	MaterialRegistry.register_document(doc_z)
+	var lA_x := BlockCatalog.lrid_of(StringName(kx))
+	var lA_y := BlockCatalog.lrid_of(StringName(ky))
+	var lA_z := BlockCatalog.lrid_of(StringName(kz))
+	_ok(lA_x == base and lA_y == base + 1 and lA_z == base + 2,
+		"bundle: session A assigns dense LRIDs in registration order X,Y,Z (%d,%d,%d)" % [lA_x, lA_y, lA_z])
+
+	# Build a supported region of edits using them (mirrors the P6b live-save pattern).
+	var patch := _flat_patch5()
+	if patch.x == 0x7fffffff:
+		_ok(false, "P6c-2: found a flat patch for the zone-bundle round-trip")
+		BlockCatalog.reset_session()
+		return
+	var px := patch.x
+	var pz := patch.y
+	var pg: int = TerrainConfig.height_at(px, pz)
+	var wA := _struct_world("P6c2Save")
+	var c_x := Vector3i(px, pg + 1, pz)                # alfa cube (rests on the grass surface)
+	var c_y := Vector3i(px, pg + 2, pz)                # bravo ramp on top
+	var c_z := Vector3i(px, pg + 3, pz)                # charlie (block-entity): state + metadata
+	var c_air := Vector3i(px + 1, pg, pz)              # a dug-to-air cell (present, value 0)
+	_ok(wA.place_block(c_x, CellCodec.pack(lA_x)), "bundle: place alfa cube")
+	_ok(wA.place_block(c_y, CellCodec.pack(lA_y, RAMP)), "bundle: place bravo ramp")
+	_ok(wA.place_block(c_z, CellCodec.pack(lA_z)), "bundle: place charlie block-entity cube")
+	_ok(wA.set_state(c_z, 5), "bundle: set a state on the charlie cell")
+	var live_doc := {"label": "vault", "locked": true, "fill": 0.5}
+	_ok(wA.set_metadata(c_z, live_doc), "bundle: attach metadata to the charlie cell")
+	_ok(wA.break_terrain(c_air, Vector3.INF) > 0, "bundle: dig a surface cell to air")
+
+	# Record the cross-session expectation (GMID + axes) for every cell.
+	var cells := [c_x, c_y, c_z, c_air]
+	var expect := {}
+	for c: Vector3i in cells:
+		var v := wA.cell_value_at(c)
+		expect[c] = {"gmid": BlockCatalog.gmid_of(CellCodec.mat(v)),
+			"mod": CellCodec.modifier(v), "state": CellCodec.state(v)}
+
+	var region_set := {}
+	for c: Vector3i in cells:
+		region_set[WorldManager.region_origin_of(c)] = true
+	var bundle := wA.save_bundle(region_set.keys())
+	_ok(bundle.material_count() == 3, "bundle: manifest holds 3 materials (got %d)" % bundle.material_count())
+	var idmap := bundle.id_map()
+	_ok(idmap.has(ZoneBundle.AIR_KEY), "bundle: id-map includes the reserved 'air' key (no document needed)")
+	_ok(idmap.has(kx) and idmap.has(kz),
+		"bundle: id-map binds container ids to cross-session '<gmid>#<state>' keys")
+	var bytes := bundle.to_bytes()
+	_ok(bytes.size() > 0, "bundle: serializes to bytes (%d)" % bytes.size())
+	_ok(ZoneBundle.from_bytes(bytes).to_bytes() == bytes, "bundle: to_bytes→from_bytes→to_bytes is byte-stable")
+	wA.queue_free()
+
+	# ---- (1) ZONE-BUNDLE ROUND-TRIP into a FRESH catalog state ------------------------------
+	BlockCatalog.reset_session()
+	_ok(BlockCatalog.count() == base, "round-trip: fresh session is bootstrap-only again (%d)" % BlockCatalog.count())
+	_ok(BlockCatalog.lrid_of(StringName(kx)) < 0, "round-trip: alfa is UNKNOWN to the fresh catalog before load")
+	var wB := _struct_world("P6c2Load")
+	wB.load_bundle(ZoneBundle.from_bytes(bytes))
+	var rt_ok := true
+	for c: Vector3i in cells:
+		var v := wB.cell_value_at(c)
+		var e: Dictionary = expect[c]
+		if BlockCatalog.gmid_of(CellCodec.mat(v)) != e["gmid"] \
+				or CellCodec.modifier(v) != e["mod"] or CellCodec.state(v) != e["state"]:
+			rt_ok = false
+	_ok(rt_ok, "round-trip: every cell's (material-by-GMID, modifier, state) restored exactly")
+	_ok(wB.has_metadata(c_z) and wB.get_metadata(c_z) == _json_norm(live_doc),
+		"round-trip: block-entity metadata restored (material learned from the bundle manifest)")
+	_ok(wB.block_id_at(c_air) == BlockCatalog.AIR, "round-trip: the dug-to-air cell restored as air")
+	_ok(BlockCatalog.is_resolved(BlockCatalog.lrid_of(StringName(kx))),
+		"round-trip: manifest materials registered + RESOLVED (self-contained bundle)")
+	wB.queue_free()
+
+	# ---- (2) SHUFFLED-LOAD-ORDER GMID ROUND-TRIP (the crux) ---------------------------------
+	# A fresh session pre-registers the SAME materials in the REVERSE order, so their dense LRIDs
+	# differ from session A. Loading the bundle must resolve every cell by GMID regardless.
+	BlockCatalog.reset_session()
+	MaterialRegistry.register_document(doc_z)          # reverse order: Z, Y, X
+	MaterialRegistry.register_document(doc_y)
+	MaterialRegistry.register_document(doc_x)
+	var lC_z := BlockCatalog.lrid_of(StringName(kz))
+	var lC_x := BlockCatalog.lrid_of(StringName(kx))
+	_ok(lC_z == base and lC_x == base + 2,
+		"shuffled: session C assigns LRIDs in reverse order (Z=%d, X=%d)" % [lC_z, lC_x])
+	_ok(lC_x != lA_x and lC_z != lA_z,
+		"shuffled: dense LRIDs DIFFER between sessions (alfa %d→%d, charlie %d→%d)" % [lA_x, lC_x, lA_z, lC_z])
+	var cnt_before := BlockCatalog.count()
+	var wC := _struct_world("P6c2Shuffle")
+	wC.load_bundle(ZoneBundle.from_bytes(bytes))
+	var sh_ok := true
+	for c: Vector3i in cells:
+		var v := wC.cell_value_at(c)
+		var e: Dictionary = expect[c]
+		if BlockCatalog.gmid_of(CellCodec.mat(v)) != e["gmid"] \
+				or CellCodec.modifier(v) != e["mod"] or CellCodec.state(v) != e["state"]:
+			sh_ok = false
+	_ok(sh_ok, "shuffled: cells resolve by GMID to the right materials despite different dense ids")
+	_ok(CellCodec.mat(wC.cell_value_at(c_x)) == lC_x and lC_x != lA_x,
+		"shuffled: alfa cell resolved to session C's dense id (%d), not the saved id (%d) — dense ids never travel" % [lC_x, lA_x])
+
+	# ---- (3) DEDUP: an already-registered GMID reuses its LRID (no duplicate) ----------------
+	_ok(BlockCatalog.count() == cnt_before,
+		"dedup: load_bundle allocated NO new LRIDs (all 3 GMIDs already registered) — count stable at %d" % cnt_before)
+	_ok(BlockCatalog.lrid_of(StringName(kx)) == lC_x, "dedup: alfa reused its pre-registered LRID (no duplicate)")
+	wC.queue_free()
+
+	# ---- (4) SCALE SANITY (headless proxy for §7.2; the true 4k/8k wasm bake is deferred) ----
+	BlockCatalog.reset_session()
+	var scale_base := BlockCatalog.count()
+	var N := 1000
+	var mono_ok := true
+	var last_lrid := scale_base - 1
+	for i in range(N):
+		var d := _bundle_doc("voxiverse:scale_%d" % i, "solid", 100.0 + float(i), Color(0.5, 0.5, 0.5, 1.0), false)
+		var lr := BlockCatalog.register_material(MaterialDocument.gmid_of(d), MaterialDocument.from_document(d))
+		if lr != last_lrid + 1 or lr >= BlockCatalog.CAPACITY:
+			mono_ok = false
+		last_lrid = lr
+	_ok(mono_ok, "scale: %d register_material calls allocate MONOTONIC, bounded LRIDs (< CAPACITY)" % N)
+	_ok(BlockCatalog.count() == scale_base + N, "scale: catalog grew by exactly %d (count %d)" % [N, BlockCatalog.count()])
+	var facade_ok := true
+	for i: int in [0, N / 2, N - 1]:
+		var lr: int = scale_base + i
+		if not is_equal_approx(BlockCatalog.mass_of(lr), 100.0 + float(i)) \
+				or BlockCatalog.name_of(lr) != "solid" or not BlockCatalog.is_resolved(lr):
+			facade_ok = false
+	_ok(facade_ok, "scale: the catalog facade answers mass/name/resolved correctly at scale")
+	if ClassDB.class_exists("VoxelTerrain"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		var built: bool = mw.call("setup")
+		_ok(built, "scale: module world builds its library at %d materials (batched bake OK)" % BlockCatalog.count())
+		if built:
+			var ac0: int = mw.call("appearance_count")
+			var arid: int = mw.call("arid_for", scale_base + N - 1, 0)
+			_ok(arid >= 0 and bool(mw.call("can_render", arid)),
+				"scale: a streamed material's cube ARID bakes + renders (never a hole)")
+			_ok(int(mw.call("appearance_count")) >= ac0, "scale: appearance table grew without drift/error")
+		mw.queue_free()
+		print("    NOTE: true 4k/8k wasm bake benchmark needs a browser (SharedArrayBuffer/COOP-COEP) — deferred (RMS §3.2 / §10 Phase 4).")
+	else:
+		print("    (godot_voxel module absent — scale-sanity ARID bake path checked on module builds only)")
+
+	# Leave the catalog reset to bootstrap so the run ends in a clean, documented state.
+	BlockCatalog.reset_session()
+
+# Serialize a synthetic single-state material for the zone-bundle tests, with an optional
+# block-entity capability (so a bundle can carry a metadata-bearing cell). float32-exact
+# swatch/mass so the document byte-round-trips stably (GMID stability, RMS §2.2).
+func _bundle_doc(mat_name: String, state_name: String, mass: float, swatch: Color, block_entity: bool) -> PackedByteArray:
+	var st := VoxelState.new()
+	st.state_name = StringName(state_name)
+	st.mass = mass
+	st.density = mass
+	st.break_force = 800.0
+	st.solidity = 1.0
+	st.tint = swatch
+	st.structural_class = &"rock"
+	st.strength_anchors = Vector3i(64, 32, 16)
+	st.has_block_entity = block_entity
 	var def := VoxelMaterialDef.new()
 	def.id = StringName(mat_name)
 	def.states = [st]

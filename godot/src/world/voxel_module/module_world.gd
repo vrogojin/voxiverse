@@ -121,6 +121,74 @@ func set_cell(cell: Vector3i, packed: int) -> void:
 	_set_if(vt, "mode", 0)
 	vt.call("set_voxel", cell, arid)
 
+## Bulk-inject a set of edited cells into the render path (RMS §3.4, F10 — the module-path
+## primitive for whole-zone injection without per-voxel VoxelTool calls). `cells` maps world
+## Vector3i → PACKED cell value; the caller (WorldManager.load_bundle) has ALREADY written the
+## overlay (rule-1 truth), so this only mirrors the render. Cells are grouped by godot_voxel
+## DATA BLOCK; a block that is already loaded (in a viewer's range) is seeded from its current
+## voxels (VoxelTool.copy — so untouched generated/edited cells keep their value), has the
+## injected cells' ARIDs written into that buffer, and is handed to `try_set_block_data` in ONE
+## call (F10). Blocks not yet loaded (e.g. headless verify, or outside every viewer) can't take
+## a block-data set (try_set_block_data would ignore them), so they fall back to per-cell
+## `set_cell`; the overlay remains the truth regardless. Safe when the module lacks any needed
+## method (falls back to per-cell). Driven through strings so this file parses without the module.
+func bulk_inject(cells: Dictionary) -> void:
+	if _terrain == null or cells.is_empty():
+		return
+	var can_bulk := ClassDB.class_exists("VoxelBuffer") \
+		and _terrain.has_method("try_set_block_data") and _terrain.has_method("voxel_to_data_block") \
+		and _terrain.has_method("data_block_to_voxel") and _terrain.has_method("get_data_block_size") \
+		and _terrain.has_method("has_data_block") and _terrain.has_method("get_voxel_tool")
+	if not can_bulk:
+		for cell: Vector3i in cells.keys():
+			set_cell(cell, int(cells[cell]))
+		return
+	var bs := int(_terrain.call("get_data_block_size"))
+	# Group world cells by their data-block coordinate.
+	var by_block := {}
+	for cell: Vector3i in cells.keys():
+		var bpos: Vector3i = _terrain.call("voxel_to_data_block", cell)
+		if not by_block.has(bpos):
+			by_block[bpos] = ([] as Array)
+		(by_block[bpos] as Array).append(cell)
+	var vt: Object = _terrain.call("get_voxel_tool")
+	for bpos: Vector3i in by_block.keys():
+		var block_cells: Array = by_block[bpos]
+		var applied := false
+		# Only attempt the bulk set for a LOADED block (else try_set_block_data ignores it and
+		# copy would read empty data — clobbering the block to air). Loaded ⇒ copy reads the real
+		# voxels, we overwrite our cells, and try_set_block_data replaces the block in one call.
+		if bs > 0 and vt != null and bool(_terrain.call("has_data_block", bpos)):
+			var buf: Object = _seeded_block_buffer(bs, bpos, vt)
+			if buf != null:
+				var origin: Vector3i = _terrain.call("data_block_to_voxel", bpos)
+				for cell: Vector3i in block_cells:
+					var packed := int(cells[cell])
+					var lc := cell - origin
+					# VoxelBuffer.CHANNEL_TYPE == 0.
+					buf.call("set_voxel", arid_for(CellCodec.mat(packed), CellCodec.modifier(packed)),
+						lc.x, lc.y, lc.z, 0)
+				applied = bool(_terrain.call("try_set_block_data", bpos, buf))
+		if not applied:
+			for cell: Vector3i in block_cells:
+				set_cell(cell, int(cells[cell]))
+
+## Build a VoxelBuffer for data block `bpos` seeded from its CURRENT voxels (VoxelTool.copy on
+## the TYPE channel), so cells we do not touch keep their value after `try_set_block_data`
+## replaces the whole block. 16-bit TYPE depth (F6) so ARIDs up to 65535 fit. Null on failure.
+func _seeded_block_buffer(bs: int, bpos: Vector3i, vt: Object) -> Object:
+	var buf: Object = ClassDB.instantiate("VoxelBuffer")
+	if buf == null or not buf.has_method("create"):
+		return null
+	buf.call("create", bs, bs, bs)
+	if buf.has_method("set_channel_depth"):
+		buf.call("set_channel_depth", 0, 1)          # CHANNEL_TYPE, DEPTH_16_BIT
+	if vt.has_method("copy"):
+		_set_if(vt, "channel", 0)
+		var origin: Vector3i = _terrain.call("data_block_to_voxel", bpos)
+		vt.call("copy", origin, buf, 1 << 0)         # channels mask: TYPE only
+	return buf
+
 ## Resolve (LRID, modifier) → ARID, allocating a shaped ARID lazily (MAIN THREAD).
 ## AIR → 0; a full cube → the eager cube ARID; a shaped value appends a
 ## VoxelBlockyModelMesh (built from ShapeMesh) whose model index MUST equal the ARID

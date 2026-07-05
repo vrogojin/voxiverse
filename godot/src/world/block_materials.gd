@@ -41,6 +41,14 @@ static func get_for(block_id: int) -> StandardMaterial3D:
 	_cache[block_id] = mat
 	return mat
 
+## Drop the entire per-id render-material cache (RUNTIME-MATERIAL-STREAMING §2.6 session
+## boundary): a fresh session (world-load / peer session) may bind a given dense LRID to a
+## DIFFERENT material, so its cached StandardMaterial3D must not persist across a
+## `BlockCatalog.reset_session()`. Gameplay never calls this mid-session (LRIDs are stable,
+## §7.4) — it pairs with the catalog session reset. The next `get_for` rebuilds fresh looks.
+static func reset_cache() -> void:
+	_cache.clear()
+
 ## Update the EXISTING cached Material for `block_id` in place from the catalog look
 ## (RUNTIME-MATERIAL-STREAMING §5.3): when an UNRESOLVED placeholder LRID late-resolves
 ## to a real material, the swatch/emission are swapped into the same StandardMaterial3D

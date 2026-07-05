@@ -241,7 +241,11 @@ func place_block(cell: Vector3i, value: int) -> bool:
 ##
 ## Zero-cost default: with an empty `_meta` and no `meta` argument (today's every write),
 ## the settlement collapses to a single `is_empty()` check — gameplay stays byte-identical.
-func _write_cell(cell: Vector3i, packed: int, meta: Variant = null) -> void:
+## `paint` (default true) mirrors the cell into the active render path immediately. It is
+## set false ONLY by `load_bundle` on the module path, which coalesces the render into ONE
+## bulk `try_set_block_data` pass (RMS §3.4) after the overlay is fully written — the overlay
+## update itself (the gameplay truth) is unconditional.
+func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool = true) -> void:
 	packed = CellCodec.canonical(packed)
 	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
 		_meta[cell] = meta                       # the one write that (re)sets metadata
@@ -251,7 +255,8 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null) -> void:
 			_meta.erase(cell)                    # material change / break settles it
 			block_entity_orphaned.emit(cell, old_meta)
 	_edits[cell] = packed
-	_paint_cell(cell, packed)
+	if paint:
+		_paint_cell(cell, packed)
 
 # --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
 
@@ -418,6 +423,89 @@ static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 	return cell.x >= origin.x and cell.x < origin.x + s \
 		and cell.y >= origin.y and cell.y < origin.y + s \
 		and cell.z >= origin.z and cell.z < origin.z + s
+
+# --- zone bundles: streamed material payloads (RMS §2.6/§3.4/§5) ----------------
+# The final piece of runtime material streaming: a ZoneBundle packages one or more regions'
+# edit overlay TOGETHER WITH the material documents the receiver needs (manifest), keyed by
+# cross-session GMID, so acquiring a remote zone brings materials the local client has never
+# seen. Dense LRIDs never travel — they are container-local, translated by GMID at the boundary
+# (RMS §2.1). This is additive; nothing in the live loop calls it (gameplay is byte-identical).
+# Transport / signing / trust are out of scope (RMS §9.3): this is the payload FORMAT only.
+
+## Serialize the edit overlay (+ per-cell metadata) within `regions` (each a 32-aligned origin,
+## use `region_origin_of`) into a self-contained ZoneBundle. Each present cell is recorded by its
+## cross-session "<gmid>#<state>" key (`ZoneChunk.set_cell_keyed`), and every referenced material's
+## document is gathered into the bundle manifest (from the content store when held, else
+## reconstructed byte-identically from the catalog def, RMS §2.2). Regions with no edits are
+## skipped. Container-local ids are compact (per-chunk palettes) and independent of this session's
+## dense LRID assignment — the whole point (RMS §2.6).
+func save_bundle(regions: Array) -> ZoneBundle:
+	var bundle := ZoneBundle.new()
+	var s := ZoneChunk.SIZE
+	for region_origin: Vector3i in regions:
+		var cells := {}
+		for cell: Vector3i in _edits.keys():
+			if _in_region(cell, region_origin, s):
+				cells[cell] = true
+		for cell: Vector3i in _meta.keys():
+			if _in_region(cell, region_origin, s):
+				cells[cell] = true
+		if cells.is_empty():
+			continue
+		var zc := ZoneChunk.new()
+		for cell: Vector3i in cells.keys():
+			var v := cell_value_at(cell)
+			var mat := CellCodec.mat(v)
+			bundle.reference_material(mat)           # gather its manifest document (skips air)
+			var local := cell - region_origin
+			zc.set_cell_keyed(ZoneChunk.local_index(local.x, local.y, local.z),
+				String(BlockCatalog.key_of(mat)), CellCodec.modifier(v), CellCodec.state(v),
+				_meta.get(cell, null))
+		bundle.add_chunk(region_origin, zc)
+	return bundle
+
+## Apply a ZoneBundle into this world (RMS §2.6/§3.4). First registers the manifest (dedup by
+## GMID — an already-known material reuses its session LRID, an unknown one gets a fresh LRID,
+## a key with no/rejected document degrades to an UNRESOLVED placeholder so data stays lossless,
+## RMS §8). Then translates every chunk cell's container key → THIS session's LRID and applies
+## it: the overlay (`_edits` + metadata) is updated through the single write choke point (rule-1
+## truth, both paths). Render mirroring: on the module path one BULK `try_set_block_data` pass
+## (F10); on the fallback path per-cell through `_write_cell`. Loose bodies / collapse are NOT
+## re-run (a loaded zone is authored data, not a live edit); the ground collider is rebuilt once.
+func load_bundle(bundle: ZoneBundle) -> void:
+	bundle.register_manifest()
+	var key_to_lrid := {}
+	for key: String in bundle.id_map():
+		key_to_lrid[key] = bundle.resolve_key(key)
+
+	var placeholder_id := BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+	var collected := {}                              # Vector3i -> int packed cell value
+	var metas := {}                                  # Vector3i -> Dictionary
+	for entry: Dictionary in bundle.chunks():
+		var region_origin: Vector3i = entry["origin"]
+		var chunk: ZoneChunk = entry["chunk"]
+		for idx: int in chunk.present_indices():
+			var key := chunk.material_name_at(idx)
+			var lrid := int(key_to_lrid.get(key, -1))
+			if lrid < 0:
+				lrid = placeholder_id
+				push_error("WorldManager.load_bundle: unresolvable key '%s' — substituting placeholder '%s'"
+					% [key, ZoneChunk.PLACEHOLDER_MATERIAL])
+			var world_cell := region_origin + ZoneChunk.from_local_index(idx)
+			collected[world_cell] = CellCodec.pack(lrid, chunk.modifier_at(idx), chunk.state_at(idx))
+			var m: Variant = chunk.meta_at(idx)
+			if m != null:
+				metas[world_cell] = m
+
+	# Overlay is written for every cell (both paths). On the module path defer per-cell paint and
+	# mirror the render in ONE bulk pass; on the fallback path _write_cell remeshes per cell.
+	var use_bulk: bool = using_module and _module_world != null and _module_world.has_method("bulk_inject")
+	for world_cell: Vector3i in collected.keys():
+		_write_cell(world_cell, collected[world_cell], metas.get(world_cell, null), not use_bulk)
+	if use_bulk:
+		_module_world.call("bulk_inject", collected)
+	if _ground != null:
+		_ground.rebuild_now()
 
 # --- terrain collapse (unsupported/overloaded blocks fall) ---------------------
 # The support analysis itself lives in StructuralSolver (STRUCTURAL-INTEGRITY §5);

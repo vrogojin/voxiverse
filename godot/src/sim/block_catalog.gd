@@ -104,6 +104,19 @@ static func ensure_ready() -> void:
 		assert(lrid == id, "bootstrap LRID %d != id %d (append order broke)" % [lrid, id])
 	_assert_frozen_core()
 
+## Session-boundary reset (RMS §2.6): drop the entire session table and re-register the
+## bootstrap set, modelling a DISTINCT process/peer/world-load that allocates dense LRIDs
+## from scratch — so the same GMIDs registered in a different order land on DIFFERENT dense
+## LRIDs than another session did. This is exactly the boundary a zone bundle must survive:
+## dense ids never travel, GMIDs do (RMS §2.1). GAMEPLAY NEVER CALLS THIS — LRIDs are never
+## recycled/reordered mid-session (§7.4); it exists for world-load / peer-session boundaries
+## and the zone-bundle round-trip proof. Also clears BlockMaterials' per-LRID render cache so
+## a reused dense id never keeps a stale look from the previous session (§5.3).
+static func reset_session() -> void:
+	_ready = false
+	BlockMaterials.reset_cache()
+	ensure_ready()
+
 ## Reset + preallocate the session table (once). Fixed-capacity arrays never resized
 ## again (RMS §6.1).
 static func _init_table() -> void:
@@ -334,6 +347,16 @@ static func state_of(block_id: int) -> VoxelState:
 	if block_id <= AIR or block_id >= _count:
 		return null
 	return _states[block_id]
+
+## The owning VoxelMaterialDef for `lrid` (shared across its states); null for AIR / out of
+## range. Used by the zone-bundle writer to reconstruct a material's document (RMS §5) when
+## its exact bytes are not held in the content store — `to_document(def_of(lrid))` reproduces
+## the byte-identical document, hence the same GMID (RMS §2.2).
+static func def_of(lrid: int) -> VoxelMaterialDef:
+	ensure_ready()
+	if lrid <= AIR or lrid >= _count:
+		return null
+	return _defs[lrid]
 
 ## Mass in kg for one voxel of `block_id`; 0.0 for AIR / out of range.
 static func mass_of(block_id: int) -> float:

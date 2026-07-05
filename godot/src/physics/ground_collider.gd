@@ -41,12 +41,22 @@ const GROUND_FRICTION := 0.6  # grippy enough that dropped pieces rest, not slid
 const GROUND_BOUNCE := 0.0    # no bouncing off the terrain
 const TERRAIN_LAYER := 1 << 0 # the "terrain ground" collision layer loose bodies collide with
 
-## Amortization budget: columns processed per update() (per physics frame). The build has two
-## passes (all heights → find the region floor → then shapes), so the full region settles in
-## ~ceil(2*(2R+1)^2 / COLS_PER_FRAME) frames. Sized so one slice (column queries + PhysicsServer
-## shape adds) stays a low-single-digit ms on wasm — the whole point is that no ONE frame pays
-## the full cost. Tunable.
+## Amortization budget for the HEIGHTS pass: columns (surface-noise queries) sampled per update().
+## PHASE_HEIGHTS work is ~one column_profile() per unit, so bounding it by columns is exact. Sized so
+## one height slice stays a low-single-digit ms on wasm.
 const COLS_PER_FRAME := 32
+## Amortization budget for the SHAPES/TRIM pass: PhysicsServer3D shape OPS (set/add/remove) per
+## update(). This is the "breaking multiple blocks in succession is heavy" fix. PHASE_SHAPES emits a
+## VARIABLE, unbounded number of shapes per column (a plain column is 1 box, but a tower / dug tunnel
+## / tree column emits several), so bounding the slice by COLUMNS let a dense 32-column slice balloon
+## to 60-100+ PhysicsServer ops ≈ 20-40 ms on wasm — and during a rapid strip-mine the debounced
+## rebuilds ran back-to-back, so those op-heavy slices recurred every few frames and tanked FPS to
+## 7-14 while debris was loose. Bounding the shape/trim pass by OPS instead makes each slice a FLAT
+## low-single-digit ms regardless of terrain density: a slice yields as soon as it has performed this
+## many ops (always after finishing the current column, so build state stays consistent). The SETTLED
+## shape set is byte-identical — only the scheduling changed (the double-buffer contract). A tall
+## single column can overshoot by its own height, which is tiny (a handful of runs). Tunable.
+const OPS_PER_FRAME := 40
 ## Only a LARGE jump (a teleport) re-anchors an in-progress build; a normal walk lets the build
 ## FINISH (the next drift then starts a fresh one), so a fast walk can't thrash the builder into
 ## never completing. 2*R ⇒ restart only once the player has left the region being built.
@@ -148,25 +158,25 @@ func update(player_pos: Vector3) -> void:
 		# A build is running: only a big jump re-anchors it; otherwise let it finish.
 		if _drift(_target, _build_center) >= RESTART_DRIFT:
 			_begin_build(_target)
-		_advance_build(COLS_PER_FRAME)
+		_advance_build(false)
 		return
 	# Session-first build: no collider exists yet → complete NOW so spawn/load has collision.
 	if _live_center.x == 0x7fffffff:
 		_begin_build(_target)
-		_advance_build(0x7fffffff)
+		_advance_build(true)
 		return
 	# Reopening from gated with the RETAINED live set too far to serve a freshly-woken faller during
 	# a sliced rebuild → build synchronously so the body always has ground under it. (The common case
 	# — break near where you already stand — keeps the covering live set and pays NO sync rebuild.)
 	if was_gated and _drift(_target, _live_center) >= REBUILD_DIST:
 		_begin_build(_target)
-		_advance_build(0x7fffffff)
+		_advance_build(true)
 		return
 	# Player-drift rebuild (walked far): incremental — the slightly-stale but nearby live set keeps
 	# colliding during the slice (the existing double-buffer contract).
 	if _drift(_target, _live_center) >= REBUILD_DIST:
 		_begin_build(_target)
-		_advance_build(COLS_PER_FRAME)
+		_advance_build(false)
 		return
 	# Edit rebuild: DEBOUNCED. A burst of breaks coalesces into ≤ 1 incremental rebuild — no per-block
 	# dirty-cycle restart, and NEVER a synchronous full rebuild from the edit path (that was the
@@ -176,7 +186,7 @@ func update(player_pos: Vector3) -> void:
 		_edit_idle += 1
 		if _edit_idle >= DEBOUNCE_FRAMES or _edit_age >= MAX_LATENCY_FRAMES:
 			_begin_build(_target)
-			_advance_build(COLS_PER_FRAME)
+			_advance_build(false)
 
 ## Ask for a rebuild at the current centre (called after a terrain edit). Non-blocking and
 ## DEBOUNCED (P2): merely marks dirty and resets the "edits paused" counter, so a burst of breaks
@@ -209,7 +219,7 @@ func _notification(what: int) -> void:
 		_live = -1
 		_live_center = Vector2i(0x7fffffff, 0)
 		_begin_build(_target)
-		_advance_build(0x7fffffff)
+		_advance_build(true)
 
 static func _drift(a: Vector2i, b: Vector2i) -> int:
 	return maxi(absi(a.x - b.x), absi(a.y - b.y))    # Chebyshev distance in columns
@@ -225,18 +235,27 @@ func _begin_build(center: Vector2i) -> void:
 	_build_pc.clear()
 	_dirty = false
 
-## Process up to `budget` column-ops of the current build. PHASE_HEIGHTS samples every column's
-## surface (to find the region floor y_lo); PHASE_SHAPES re-points the staging body's shape slots
-## in place (reuse, no clear); PHASE_TRIM removes any surplus leftover slots. On completion, swaps
-## live↔staging by toggling collision_layer. Every phase is bounded by `budget` → flat per frame.
-func _advance_build(budget: int) -> void:
+## Advance the current build by one slice. PHASE_HEIGHTS samples every column's surface (to find the
+## region floor y_lo); PHASE_SHAPES re-points the staging body's shape slots in place (reuse, no
+## clear); PHASE_TRIM removes any surplus leftover slots. On completion, swaps live↔staging by
+## toggling collision_layer.
+##
+## `sync == true` runs the whole build to completion in this one call (the first / reopen-too-far
+## build, so a freshly-woken faller has ground immediately). `sync == false` is the AMORTIZED slice:
+## HEIGHTS yields after COLS_PER_FRAME columns; SHAPES/TRIM yield after OPS_PER_FRAME PhysicsServer
+## shape ops. Bounding the shape pass by OPS (not columns) is the multi-break-heaviness fix — see
+## OPS_PER_FRAME: a dense column emits several shapes, so a fixed column budget produced 20-40 ms
+## op-heavy slices, whereas a fixed OP budget keeps every slice flat regardless of terrain density.
+## The slice always yields at a COLUMN boundary (after _emit_column returns), so build state is
+## consistent; the settled shape set is byte-identical to a synchronous rebuild.
+func _advance_build(sync: bool) -> void:
 	var span := 2 * R + 1
 	var total := span * span
 	var x0 := _build_center.x - R
 	var z0 := _build_center.y - R
 	_slice_ops = 0
-	var done := 0
-	while done < budget:
+	var cols_done := 0
+	while true:
 		if _phase == PHASE_HEIGHTS:
 			if _build_i < total:
 				var i := _build_i / span
@@ -246,7 +265,9 @@ func _advance_build(budget: int) -> void:
 				if h < _build_min_h:
 					_build_min_h = h
 				_build_i += 1
-				done += 1
+				cols_done += 1
+				if not sync and cols_done >= COLS_PER_FRAME:
+					return                              # heights slice: bounded by column count
 			else:
 				# Heights done → region floor known. Begin the shape pass by REUSING the staging
 				# body's existing slots in place (no body_clear_shapes spike). Its shapes are all
@@ -265,7 +286,8 @@ func _advance_build(budget: int) -> void:
 				var j := _build_i % span
 				_emit_column(_build_staging, x0 + i, z0 + j, _build_heights[_build_i])
 				_build_i += 1
-				done += 1
+				if not sync and _slice_ops >= OPS_PER_FRAME:
+					return                              # shapes slice: bounded by PhysicsServer ops
 			else:
 				# All columns emitted. If the new set uses FEWER slots than the staging body had,
 				# trim the surplus leftover slots (also budgeted); else it is complete.
@@ -280,7 +302,8 @@ func _advance_build(budget: int) -> void:
 				PhysicsServer3D.body_remove_shape(_body[_build_staging].get_rid(), _build_trim - 1)
 				_build_trim -= 1
 				_slice_ops += 1
-				done += 1
+				if not sync and _slice_ops >= OPS_PER_FRAME:
+					return                              # trim slice: bounded by PhysicsServer ops
 			else:
 				_finish_build()
 				return

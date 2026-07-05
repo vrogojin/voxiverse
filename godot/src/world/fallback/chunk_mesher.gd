@@ -202,11 +202,18 @@ static func _emit_placed(tools: Dictionary, world: WorldManager,
 			continue
 		_emit_cube(tools, world, cell, id)
 
-# --- cube emission: faces of `cell` (id) where the 6-neighbour is air -----------
+# --- cube emission: faces of `cell` (id) not occluded by the 6-neighbour ---------
+# A face is culled iff the neighbour OCCLUDES it per the transparency-index rule
+# (WGC §5.2, WorldManager.occludes_face) — the single owner mirrored from the module
+# path. For the current all-opaque world this reduces to `cell_solid(neighbour)`
+# (byte-identical), and it also does the right thing for a placed glass/water block:
+# the shared face between a solid and a MORE-transparent neighbour is NOT culled, so
+# you see the solid through the pane and translucent-behind-translucent culls once.
 static func _emit_cube(tools: Dictionary, world: WorldManager, cell: Vector3i, id: int) -> void:
+	var my_group: int = BlockCatalog.transparency_index_of(id)
 	for f in _CUBE_FACES:
 		var nrm: Vector3i = f["n"]
-		if world.cell_solid(cell + nrm):
+		if WorldManager.occludes_face(world.cell_value_at(cell + nrm), my_group):
 			continue
 		var b := Vector3(cell)
 		_quad(_tool_for(tools, id), Vector3(nrm),

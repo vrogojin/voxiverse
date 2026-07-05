@@ -46,6 +46,12 @@ extends Resource
 @export var emission: float = 0.0
 ## Collidability/occupancy (0 = passable like air, 1 = full solid block).
 @export_range(0.0, 1.0) var solidity: float = 1.0
+## Render transparency / face-cull group (WGC §5.1): 0 = fully opaque, higher = more
+## transparent. Mapped 1:1 onto the godot_voxel blocky `transparency_index`; the
+## fallback mirrors it through `WorldManager.occludes_face`. A face of a cell in group
+## G is culled by a neighbour whose group ≤ G (an opaque group-0 neighbour occludes
+## everything; you see THROUGH a higher-group neighbour). Every opaque material is 0.
+@export var cull_group: int = 0
 
 @export_group("Look")
 ## Surface texture for this state (grass PNG for grass).

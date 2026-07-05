@@ -25,7 +25,7 @@ static func build_default() -> MaterialRegistry:
 	var reg := MaterialRegistry.new()
 	reg.register(SurfaceModel.material())
 	BlockCatalog.ensure_ready()
-	for block_id in range(1, BlockCatalog.COUNT):
+	for block_id in range(1, BlockCatalog.count()):
 		var state: VoxelState = BlockCatalog.state_of(block_id)
 		if state == null:
 			continue

@@ -1,15 +1,20 @@
 class_name BlockCatalog
 extends RefCounted
-## Authoritative block-id table (DESIGN §1.1). Everyone reads ids, masses, looks
-## from here: physics reads masses, world/UI read ids/colors/names. Built on the
-## existing VoxelState framework so the sim layer stays the source of truth.
+## Authoritative block-id table (DESIGN §1.1, WORLDGEN-CATALOG §3-§4). Everyone reads
+## ids, masses, looks from here: physics reads masses, world/UI read ids/colors/names.
+## Built on the VoxelState framework so the sim layer stays the source of truth.
 ##
-## Block ids are DENSE (0..COUNT-1) and shared by the godot_voxel blocky library
-## (model index == id), the fallback mesher, the edit overlay, VoxelBody cells,
-## and inventory stacks. The library-order invariant (module_world asserts each
-## returned model id equals the const here) is the single most fragile coupling —
-## a swap silently recolours the world — so these consts are the one place ids
-## live.
+## DATA-DRIVEN (WGC §4): `ensure_ready()` loads `assets/blocks.json` into the per-id
+## VoxelState array — record order IS the dense id (APPEND-ONLY file). `count()` is
+## derived from the data (77 today: `core` ids 0-5 + `world` ids 6-76). The frozen
+## core consts below (AIR..LEAF, `CORE_COUNT`) are KEPT and ASSERTED against the loaded
+## data (`_assert_frozen_core`), so a reorder/renumber of the core is a hard failure,
+## not a silent recolour. The `extended` tier (WGC §3.1) streams ids in later (P6).
+##
+## Block ids are DENSE (0..count()-1) and shared by the godot_voxel blocky library
+## (model index == id), the fallback mesher, the edit overlay, VoxelBody cells, and
+## inventory stacks. The library-order invariant (module_world asserts each returned
+## model id equals the id here, now over ALL ids) is the single most fragile coupling.
 
 const AIR := 0
 const GRASS := 1
@@ -17,33 +22,115 @@ const DIRT := 2
 const STONE := 3
 const WOOD := 4
 const LEAF := 5
-const COUNT := 6                      # ids are 0..COUNT-1, dense
+const CORE_COUNT := 6                 # frozen core ids 0..CORE_COUNT-1 (always loaded)
 
-# Lazily-built VoxelStates indexed by block id. Index AIR stays null (air carries
-# no state). Built on the main thread via ensure_ready() before any meshing/sim.
+## The data-driven catalog authoring source (WGC §4). Loaded once by ensure_ready();
+## also read by verify/tooling. Web export ships it (export_presets include_filter).
+const DATA_PATH := "res://assets/blocks.json"
+
+# Lazily-built VoxelStates indexed by block id. Index AIR stays null (air carries no
+# state). Built on the main thread via ensure_ready() before any meshing/sim.
 static var _states: Array[VoxelState] = []
+static var _id_by_name: Dictionary = {}    # StringName -> int (name AND alias -> id)
 
-## Idempotent; builds the per-id VoxelStates (main thread). Safe to call from
-## SurfaceModel.ensure_ready() and repeatedly (same pattern as SurfaceModel).
+## Idempotent; loads blocks.json and builds the per-id VoxelStates (main thread).
+## Safe to call from SurfaceModel.ensure_ready() / module_world.setup() and repeatedly.
 static func ensure_ready() -> void:
 	if not _states.is_empty():
 		return
-	_states.resize(COUNT)
+	var records := load_data()
+	if records.is_empty():
+		# The live web demo is non-negotiable (CLAUDE.md): if the JSON failed to ship
+		# or parse, fall back to the frozen core built in code so the world still loads,
+		# and shout loudly so CI/verify catches the export misconfig.
+		push_error("[BlockCatalog] could not load %s — falling back to frozen core only" % DATA_PATH)
+		_build_core_fallback()
+		return
+	# Size by the highest id so the array is dense; ids are assigned by record order.
+	var max_id := -1
+	for rec: Variant in records:
+		if rec is Dictionary and rec.has("id"):
+			max_id = maxi(max_id, int(rec["id"]))
+	_states.resize(max_id + 1)
+	_id_by_name.clear()
+	for rec: Variant in records:
+		if not (rec is Dictionary and rec.has("id")):
+			continue
+		var id := int(rec["id"])
+		var nm := String(rec.get("name", ""))
+		_id_by_name[StringName(nm)] = id
+		if rec.has("alias") and rec["alias"] != null:
+			_id_by_name[StringName(String(rec["alias"]))] = id
+		if id == AIR:
+			_states[id] = null            # air carries no state
+			continue
+		_states[id] = _from_record(rec)
+	_assert_frozen_core()
+
+## Build one VoxelState from a blocks.json record. Missing break_force -> INF
+## (bedrock/water/lava); missing render -> opaque (cull_group 0, no glow).
+static func _from_record(rec: Dictionary) -> VoxelState:
+	var s := VoxelState.new()
+	s.state_name = StringName(String(rec.get("name", "?")))
+	s.block_id = int(rec.get("id", -1))
+	s.mass = float(rec.get("mass", 0.0))
+	s.density = s.mass
+	if rec.has("break_force"):
+		s.break_force = float(rec["break_force"])
+	# else: VoxelState default INF (unbreakable / fluid — outside the mining model)
+	var sw: Variant = rec.get("swatch", [])
+	if sw is Array and (sw as Array).size() >= 3:
+		var a := float(sw[3]) if (sw as Array).size() >= 4 else 1.0
+		s.tint = Color(float(sw[0]), float(sw[1]), float(sw[2]), a)
+	var an: Variant = rec.get("anchors", [1, 1, 1])
+	if an is Array and (an as Array).size() == 3:
+		s.strength_anchors = Vector3i(int(an[0]), int(an[1]), int(an[2]))
+	s.structural_class = StringName(String(rec.get("structural_class", "rock")))
+	s.attachment = float(rec.get("attachment", 1.0))
+	s.solidity = float(rec.get("solidity", 1.0))
+	s.permeability = float(rec.get("permeability", 0.0))
+	s.translucence = float(rec.get("translucence", 0.0))
+	var rnd: Variant = rec.get("render", {})
+	if rnd is Dictionary:
+		s.cull_group = int((rnd as Dictionary).get("cull_group", 0))
+		s.glow = float((rnd as Dictionary).get("emissive", 0.0))
+		s.emission = s.glow
+	return s
+
+## Frozen-core tripwire (WGC §3.1 "consts asserted against data"): the loaded core
+## ids/names/masses/anchors must match the hard-frozen values. A drift here means the
+## file was reordered/renumbered or a core value was silently changed — fail loudly.
+static func _assert_frozen_core() -> void:
+	assert(_states.size() >= CORE_COUNT, "blocks.json has fewer than the %d core ids" % CORE_COUNT)
+	assert(id_of(&"grass") == GRASS and id_of(&"dirt") == DIRT and id_of(&"stone") == STONE
+		and id_of(&"wood") == WOOD and id_of(&"leaf") == LEAF,
+		"core ids drifted from the frozen consts (blocks.json reorder?)")
+	assert(id_of(&"oak_log") == WOOD and id_of(&"oak_leaves") == LEAF,
+		"core aliases (oak_log/oak_leaves) do not resolve to the frozen ids")
+	assert(is_equal_approx(mass_of(STONE), 1500.0) and is_equal_approx(mass_of(WOOD), 80.0)
+		and is_equal_approx(mass_of(GRASS), 750.0),
+		"core masses drifted from the frozen values")
+	assert(anchors_of(STONE) == Vector3i(64, 6, 4) and anchors_of(WOOD) == Vector3i(36, 24, 16),
+		"core anchors drifted from the frozen values")
+
+## In-code frozen core, built only when blocks.json cannot be loaded (web export
+## misconfig safety net). Mirrors the ids 0-5 rows of blocks.json exactly.
+static func _build_core_fallback() -> void:
+	_states.resize(CORE_COUNT)
+	_id_by_name.clear()
 	_states[AIR] = null
-	# mass (kg / 1 m³ voxel), break_force (N), swatch/solid colour, structural
-	# anchors (P,H,D) + class. Masses per the §12 addendum ordering: stone
-	# heaviest, wood lightest. Anchors/classes are the calibrated core values
-	# (STRUCTURAL-INTEGRITY §2.4, INTEGRATION-DECISIONS §1.2/§1.3) and are ASSERTED
-	# against assets/blocks.json (WGC §3.1 "consts asserted against data").
-	_states[GRASS] = _make(GRASS, &"grass", 750.0, 800.0, Color(0.30, 0.55, 0.24), Vector3i(4, 2, 1), &"soil")
-	_states[DIRT] = _make(DIRT, &"dirt", 900.0, 900.0, Color(0.45, 0.31, 0.18), Vector3i(4, 2, 1), &"soil")
-	_states[STONE] = _make(STONE, &"stone", 1500.0, 2500.0, Color(0.52, 0.52, 0.55), Vector3i(64, 6, 4), &"rock")
-	_states[WOOD] = _make(WOOD, &"wood", 80.0, 600.0, Color(0.62, 0.44, 0.26), Vector3i(36, 24, 16), &"timber")
-	_states[LEAF] = _make(LEAF, &"leaf", 100.0, 100.0, Color(0.13, 0.42, 0.12), Vector3i(4, 3, 2), &"foliage")
+	_id_by_name[&"air"] = AIR
+	_make(GRASS, &"grass", 750.0, 800.0, Color(0.30, 0.55, 0.24), Vector3i(4, 2, 1), &"soil")
+	_make(DIRT, &"dirt", 900.0, 900.0, Color(0.45, 0.31, 0.18), Vector3i(4, 2, 1), &"soil")
+	_make(STONE, &"stone", 1500.0, 2500.0, Color(0.52, 0.52, 0.55), Vector3i(64, 6, 4), &"rock")
+	_make(WOOD, &"wood", 80.0, 600.0, Color(0.62, 0.44, 0.26), Vector3i(36, 24, 16), &"timber")
+	_make(LEAF, &"leaf", 100.0, 100.0, Color(0.13, 0.42, 0.12), Vector3i(4, 3, 2), &"foliage")
+	_id_by_name[&"oak_log"] = WOOD
+	_id_by_name[&"oak_leaves"] = LEAF
 
 static func _make(block_id: int, state_name: StringName, mass: float,
 		break_force: float, swatch: Color, strength_anchors := Vector3i(1, 1, 1),
-		structural_class := &"rock") -> VoxelState:
+		structural_class := &"rock") -> void:
 	var s := VoxelState.new()
 	s.state_name = state_name
 	s.block_id = block_id
@@ -53,14 +140,24 @@ static func _make(block_id: int, state_name: StringName, mass: float,
 	s.tint = swatch
 	s.strength_anchors = strength_anchors
 	s.structural_class = structural_class
-	# attachment stays at VoxelState's 1.0 default (joint participation multiplier);
-	# only sand/gravel will ship 0.0 once they enter the catalog (§1.4).
-	return s
+	_states[block_id] = s
+	_id_by_name[state_name] = block_id
+
+## Total number of loaded block ids (dense 0..count()-1). Derived from the data (77
+## for core+world today), NOT a hardcoded const — WGC §3.1/§4.
+static func count() -> int:
+	ensure_ready()
+	return _states.size()
+
+## Dense id for a material NAME or ALIAS StringName (WGC §4); -1 if unknown.
+static func id_of(material_name: StringName) -> int:
+	ensure_ready()
+	return int(_id_by_name.get(material_name, -1))
 
 ## The VoxelState for `block_id`; null for AIR or out of range.
 static func state_of(block_id: int) -> VoxelState:
 	ensure_ready()
-	if block_id <= AIR or block_id >= COUNT:
+	if block_id <= AIR or block_id >= _states.size():
 		return null
 	return _states[block_id]
 
@@ -69,8 +166,8 @@ static func mass_of(block_id: int) -> float:
 	var s := state_of(block_id)
 	return s.mass if s != null else 0.0
 
-## Swatch / solid-material colour for `block_id` (hotbar UI + solid materials).
-## Returns opaque black for AIR / out of range (callers guard AIR themselves).
+## Swatch / solid-material colour (with alpha) for `block_id` (hotbar UI + solid
+## materials). Returns opaque black for AIR / out of range (callers guard AIR).
 static func color_of(block_id: int) -> Color:
 	var s := state_of(block_id)
 	return s.tint if s != null else Color(0, 0, 0)
@@ -82,31 +179,51 @@ static func name_of(block_id: int) -> String:
 	var s := state_of(block_id)
 	return String(s.state_name) if s != null else "air"
 
-## True for any non-air block id within range.
+## True for any non-air block id within range (a VALID placeable id, NOT a solidity
+## test — solidity is `solidity_of`).
 static func is_solid_id(block_id: int) -> bool:
-	return block_id > AIR and block_id < COUNT
+	return block_id > AIR and block_id < count()
 
 ## Material solidity (0 = passable like air, 1 = full solid block) for `block_id` —
-## the GATE of the merged analytic-physics contract (INTEGRATION-DECISIONS §3): a
-## cell contributes collision geometry iff `solidity_of(mat) >= 0.5`. AIR and any
-## out-of-range id have no VoxelState → 0.0 (non-solid); every core material → 1.0.
-## Future fluids (water/lava/powder_snow) ship solidity < 0.5 and drop out here.
+## the GATE of the merged analytic-physics contract (INTEGRATION-DECISIONS §3): a cell
+## contributes collision geometry iff `solidity_of(mat) >= 0.5`. AIR / out-of-range →
+## 0.0 (non-solid); fluids (water/lava) and powder_snow ship solidity < 0.5.
 static func solidity_of(block_id: int) -> float:
 	var s := state_of(block_id)
 	return s.solidity if s != null else 0.0
 
-## Render cull-group / transparency index (WGC §5.2, INTEGRATION-DECISIONS §3):
-## 0 = fully opaque, higher = more transparent. Composed by `WorldManager.occludes_face`:
-## an opaque neighbour always occludes; a translucent neighbour occludes only cells
-## of the same-or-higher transparency group (glass-behind-glass culls, but
-## glass-behind-stone does not). Derived from the material's `translucence`; AIR /
-## out of range → a huge value (a null material never occludes anything). Every core
-## material is opaque today (index 0), so occludes_face reduces to cell_solid.
+## Render cull-group / transparency index (WGC §5.1, INTEGRATION-DECISIONS §3):
+## 0 = fully opaque, higher = more transparent. Mapped 1:1 onto the godot_voxel blocky
+## `transparency_index` and mirrored by `WorldManager.occludes_face`. Read from the
+## material's `cull_group` (blocks.json render block). AIR / out of range → a huge value
+## (a null material never occludes anything). Every core material is opaque (0).
 static func transparency_index_of(block_id: int) -> int:
 	var s := state_of(block_id)
 	if s == null:
 		return 0x7FFFFFFF
-	return 0 if s.translucence <= 0.0 else 1
+	return s.cull_group
+
+## Alias of `transparency_index_of` under the WGC §3.3 "cull group" name.
+static func cull_group_of(block_id: int) -> int:
+	return transparency_index_of(block_id)
+
+## Render description for `block_id`: {mode, cull_group, emissive, alpha, translucent,
+## emissive_glow}. Consumed by BlockMaterials to build opaque/translucent/emissive
+## materials without re-deriving the rules. Empty for AIR / out of range.
+static func render_def_of(block_id: int) -> Dictionary:
+	var s := state_of(block_id)
+	if s == null:
+		return {}
+	var translucent := s.cull_group > 0
+	var mode := "translucent" if translucent else ("emissive" if s.glow > 0.0 else "opaque")
+	return {
+		"mode": mode,
+		"cull_group": s.cull_group,
+		"translucent": translucent,
+		"emissive": s.glow > 0.0,
+		"emissive_glow": s.glow,
+		"alpha": s.tint.a,
+	}
 
 ## Structural strength anchors `(P, H, D)` for `block_id`; Vector3i(0,0,0) for AIR.
 static func anchors_of(block_id: int) -> Vector3i:
@@ -119,16 +236,10 @@ static func class_of(block_id: int) -> StringName:
 	return s.structural_class if s != null else &""
 
 # ---------------------------------------------------------------------------
-# blocks.json golden authoring source (WGC §3.1: consts asserted against data).
-# The catalog above is the runtime source of truth; this data file is the
-# authoring source P3 extends. `check_against_data()` proves they never diverge.
+# blocks.json parsing + the golden "consts asserted against data" check.
 
-## The data-driven catalog authoring source (loaded only by verify / tooling —
-## the runtime path reads the consts above, not this file).
-const DATA_PATH := "res://assets/blocks.json"
-
-## Parse blocks.json into an Array of record Dictionaries. Empty on failure
-## (the caller reports "could not load"). Offline/verify only — never runtime.
+## Parse blocks.json into an Array of record Dictionaries. Empty on failure (the
+## caller reports "could not load").
 static func load_data(path := DATA_PATH) -> Array:
 	if not FileAccess.file_exists(path):
 		return []
@@ -139,9 +250,11 @@ static func load_data(path := DATA_PATH) -> Array:
 	var blocks: Variant = parsed["blocks"]
 	return blocks if blocks is Array else []
 
-## Assert the hardcoded core consts/values (ids, masses, anchors, class, swatch,
+## Assert the frozen core consts/values (ids, masses, anchors, class, swatch,
 ## break_force, attachment) match assets/blocks.json for the frozen core ids
-## 0..COUNT-1. Returns a list of discrepancies; empty == the golden file agrees.
+## 0..CORE_COUNT-1. Returns a list of discrepancies; empty == the golden file agrees.
+## (Since ensure_ready now loads FROM the file, this is a redundant tripwire that also
+## guards the fallback-built core and any offline edit that skipped a re-verify.)
 static func check_against_data(path := DATA_PATH) -> PackedStringArray:
 	ensure_ready()
 	var out := PackedStringArray()
@@ -149,12 +262,11 @@ static func check_against_data(path := DATA_PATH) -> PackedStringArray:
 	if records.is_empty():
 		out.append("could not load %s (or it has no `blocks` array)" % path)
 		return out
-	# Index by name so record order in the file does not have to match ours.
 	var by_name := {}
 	for rec: Variant in records:
 		if rec is Dictionary and rec.has("name"):
 			by_name[String(rec["name"])] = rec
-	for id in range(COUNT):
+	for id in range(CORE_COUNT):
 		var nm := name_of(id)
 		if not by_name.has(nm):
 			out.append("blocks.json missing record for '%s' (id %d)" % [nm, id])
@@ -163,7 +275,7 @@ static func check_against_data(path := DATA_PATH) -> PackedStringArray:
 		if int(rec.get("id", -1)) != id:
 			out.append("'%s' id: json=%s const=%d" % [nm, str(rec.get("id")), id])
 		if id == AIR:
-			continue                          # air carries no state to compare
+			continue
 		var s := _states[id]
 		if not is_equal_approx(float(rec.get("mass", -1.0)), s.mass):
 			out.append("'%s' mass: json=%s catalog=%.3f" % [nm, str(rec.get("mass")), s.mass])

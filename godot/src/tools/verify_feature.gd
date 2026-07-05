@@ -30,6 +30,7 @@ func _initialize() -> void:
 	_test_inventory()
 	_test_cell_codec()
 	_test_material_data()
+	_test_catalog_expansion()
 	_test_merged_physics()
 	_test_world_loop()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -256,8 +257,8 @@ func _test_material_data() -> void:
 		if not (rec is Dictionary):
 			continue
 		var id := int(rec.get("id", -1))
-		if id <= BlockCatalog.AIR or id >= BlockCatalog.COUNT:
-			continue                          # air + (future) non-core rows
+		if id <= BlockCatalog.AIR or id >= BlockCatalog.CORE_COUNT:
+			continue                          # air + world/extended rows (covered by _test_catalog_expansion)
 		seen_core += 1
 		var nm := String(rec.get("name", "?"))
 		var cls := StringName(String(rec.get("structural_class", "rock")))
@@ -268,8 +269,8 @@ func _test_material_data() -> void:
 			continue                          # tuned value — gate does not apply
 		_ok(proposed == stored,
 			"drift gate '%s': propose%s == stored %s" % [nm, str(proposed), str(stored)])
-	_ok(seen_core == BlockCatalog.COUNT - 1, "drift gate covered all %d non-air core materials (%d)"
-		% [BlockCatalog.COUNT - 1, seen_core])
+	_ok(seen_core == BlockCatalog.CORE_COUNT - 1, "drift gate covered all %d non-air core materials (%d)"
+		% [BlockCatalog.CORE_COUNT - 1, seen_core])
 
 	# (c) blocks.json <-> BlockCatalog consistency (ids/mass/anchors/class/swatch/
 	# break_force/attachment) — the golden "consts asserted against data" check.
@@ -282,6 +283,133 @@ func _test_material_data() -> void:
 		var s: VoxelState = BlockCatalog.state_of(id)
 		_ok(s != null and is_equal_approx(s.attachment, 1.0),
 			"%s attachment == 1.0" % BlockCatalog.name_of(id))
+
+# P3a. Catalog expansion (WGC §3-§5): the core+world catalog fully resolves, the
+# drift gate covers every non-core material, translucency is authored on both the sim
+# and render sides, glass/water have the right solidity split, and the module library-
+# order invariant holds for ALL ids (not just the frozen 5).
+func _test_catalog_expansion() -> void:
+	print("[P3a] catalog expansion + translucent rendering")
+	var n := BlockCatalog.count()
+	_ok(n == 77, "catalog holds 77 materials (core+world), got %d" % n)
+
+	# (a) every id 0..count-1 resolves to state + mass + solidity + a render material,
+	# id<->name round-trips, and non-air names are unique.
+	var names := {}
+	for id in range(1, n):
+		var s: VoxelState = BlockCatalog.state_of(id)
+		_ok(s != null, "id %d resolves to a VoxelState" % id)
+		if s == null:
+			continue
+		var nm := BlockCatalog.name_of(id)
+		_ok(BlockCatalog.id_of(StringName(nm)) == id, "id_of(name_of(%d)) round-trips (%s)" % [id, nm])
+		_ok(not names.has(nm), "material name '%s' is unique" % nm)
+		names[nm] = true
+		_ok(BlockCatalog.mass_of(id) > 0.0, "%s has mass > 0" % nm)
+		_ok(BlockCatalog.solidity_of(id) >= 0.0, "%s has a solidity" % nm)
+		_ok(BlockMaterials.get_for(id) != null, "%s yields a non-null render material" % nm)
+	# aliases resolve to their frozen core ids (WGC §3.1).
+	_ok(BlockCatalog.id_of(&"oak_log") == BlockCatalog.WOOD, "alias oak_log -> WOOD")
+	_ok(BlockCatalog.id_of(&"oak_leaves") == BlockCatalog.LEAF, "alias oak_leaves -> LEAF")
+
+	# (b) DRIFT GATE over every non-core, non-override record with a structural class:
+	# propose_anchors(priors, class) == the stored anchors. (Fluid/bedrock/non-solid
+	# sentinel classes propose ZERO and store [0,0,0]; timber/rock/soil/etc reproduce.)
+	var records := BlockCatalog.load_data()
+	var world_checked := 0
+	var world_covered := 0
+	for rec: Variant in records:
+		if not (rec is Dictionary):
+			continue
+		var id := int(rec.get("id", -1))
+		if id < BlockCatalog.CORE_COUNT or id >= n:
+			continue                          # core handled by _test_material_data
+		world_checked += 1
+		if bool(rec.get("anchors_override", false)):
+			continue                          # tuned value (snow_block, powder_snow) — gate skips
+		var nm := String(rec.get("name", "?"))
+		var cls := StringName(String(rec.get("structural_class", "rock")))
+		var priors: Dictionary = rec.get("priors", {})
+		var proposed := AnchorConverter.propose_anchors(priors, cls)
+		var stored := BlockCatalog.anchors_of(id)
+		_ok(proposed == stored, "drift gate '%s': propose%s == stored %s" % [nm, str(proposed), str(stored)])
+		world_covered += 1
+	_ok(world_checked == n - BlockCatalog.CORE_COUNT, "iterated all %d world records (%d)"
+		% [n - BlockCatalog.CORE_COUNT, world_checked])
+	_ok(world_covered > 60, "drift gate covered %d non-override world materials" % world_covered)
+
+	# (c) translucency authored on BOTH sides for glass/water/ice; solidity split.
+	var glass := BlockCatalog.id_of(&"glass")
+	var water := BlockCatalog.id_of(&"water")
+	var ice := BlockCatalog.id_of(&"ice")
+	_ok(glass > 0 and water > 0 and ice > 0, "glass/water/ice ids resolve")
+	# sim side: translucence > 0.
+	_ok(BlockCatalog.state_of(glass).translucence > 0.0, "glass sim-translucence > 0")
+	_ok(BlockCatalog.state_of(water).translucence > 0.0, "water sim-translucence > 0")
+	# solidity: glass is a solid block, water is non-solid (you wade through it).
+	_ok(BlockCatalog.solidity_of(glass) >= 0.5, "glass is solid (solidity >= 0.5)")
+	_ok(BlockCatalog.solidity_of(water) < 0.5, "water is non-solid (solidity < 0.5)")
+	# render side: translucent materials have a real transparency mode + a cull group.
+	for tid in [glass, water, ice]:
+		var m: StandardMaterial3D = BlockMaterials.get_for(tid)
+		_ok(m != null and m.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED,
+			"%s render material is transparency-enabled" % BlockCatalog.name_of(tid))
+		_ok(BlockCatalog.cull_group_of(tid) != 0, "%s has a non-zero cull group" % BlockCatalog.name_of(tid))
+	# an opaque material (stone) stays opaque, cull group 0.
+	_ok(BlockCatalog.cull_group_of(BlockCatalog.STONE) == 0, "stone cull group is 0 (opaque)")
+	_ok(BlockMaterials.get_for(BlockCatalog.STONE).transparency == BaseMaterial3D.TRANSPARENCY_DISABLED,
+		"stone render material is opaque (transparency disabled)")
+
+	# (d) occludes_face transparency-index truth table (WGC §5.1). occludes_face(nb, my)
+	# answers "does neighbour `nb` occlude the face of a cell whose cull group is `my`?"
+	# — false when nb is non-solid OR more transparent than `my` (index(nb) > my).
+	var g := BlockCatalog.cull_group_of(glass)                              # 3
+	var red := BlockCatalog.id_of(&"red_stained_glass")
+	var blue := BlockCatalog.id_of(&"blue_stained_glass")
+	var rg := BlockCatalog.cull_group_of(red)                              # 6
+	var bg := BlockCatalog.cull_group_of(blue)                             # 7
+	# opaque stone (group 0) behind a glass pane: the GLASS face against stone is culled
+	# (stone is opaque, index 0 <= 3), the STONE face is drawn (glass index 3 > 0).
+	_ok(WorldManager.occludes_face(CellCodec.pack(BlockCatalog.STONE), g) == true,
+		"stone(0) occludes a glass(3) face (opaque neighbour always occludes)")
+	_ok(WorldManager.occludes_face(CellCodec.pack(glass), 0) == false,
+		"glass(3) does NOT occlude an opaque(0) cell's face (you see stone through the pane)")
+	# glass|glass: equal index => occluded (no internal faces inside a glass wall).
+	_ok(WorldManager.occludes_face(CellCodec.pack(glass), g) == true, "glass|glass culls (equal index)")
+	# red(6) | blue(7): exactly one face. A red neighbour occludes a blue cell's face
+	# (6 <= 7); a blue neighbour does NOT occlude a red cell's face (7 > 6).
+	_ok(WorldManager.occludes_face(CellCodec.pack(red), bg) == true, "red(6) occludes blue(7) face (6<=7)")
+	_ok(WorldManager.occludes_face(CellCodec.pack(blue), rg) == false, "blue(7) does NOT occlude red(6) face (7>6)")
+	# water is non-solid: it never occludes anything (you always see the cell behind it).
+	_ok(WorldManager.occludes_face(CellCodec.pack(water), 0) == false, "water is non-solid: never occludes opaque")
+	_ok(WorldManager.occludes_face(CellCodec.pack(water), g) == false, "water is non-solid: never occludes glass")
+
+	# (e) placement: a solid translucent block (glass) places + reads back; a non-solid
+	# fluid (water) is rejected from the hotbar (WGC §6.3).
+	var world: WorldManager = WorldManager.new()
+	world.name = "WorldManagerP3a"
+	get_root().add_child(world)
+	var cx := 20
+	var cz := 21
+	var gg: int = TerrainConfig.height_at(cx, cz)
+	_ok(world.place_block(Vector3i(cx, gg + 1, cz), glass), "place glass succeeds")
+	_ok(world.block_id_at(Vector3i(cx, gg + 1, cz)) == glass, "placed glass reads back")
+	_ok(world.place_block(Vector3i(cx, gg + 2, cz), water) == false, "placing water is rejected (non-solid)")
+
+	world.queue_free()
+
+	# (f) module library-order invariant for ALL ids: build the module world directly
+	# (synchronously — a SceneTree script defers a child's _ready(), so we cannot read
+	# WorldManager.using_module here). setup() returns true only when _configure_library
+	# asserted every model index == id across the WHOLE catalog; a mismatch returns false.
+	if ClassDB.class_exists("VoxelTerrain"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		var built: bool = mw.call("setup")
+		_ok(built, "module library built with model_index==id for all %d ids" % n)
+		mw.queue_free()
+	else:
+		print("    (godot_voxel module absent — library-order assert exercised on module builds only)")
 
 # P2. Merged analytic-physics contract (INTEGRATION-DECISIONS §3): the material
 # solidity gate, the _occ_span composition, the canonicalization addendum, and — the

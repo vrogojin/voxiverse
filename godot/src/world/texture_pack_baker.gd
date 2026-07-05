@@ -33,11 +33,42 @@ const OUT_DIR := "res://assets/textures/pack"
 static func _spec() -> Array:
 	return [
 		# out name    src tile              keep_alpha  backing
+		# --- frozen core ---
 		{"out": "grass", "src": "grass_top",     "keep_alpha": false, "backing": Color(0.24, 0.42, 0.18)},
 		{"out": "dirt",  "src": "dirt",          "keep_alpha": false, "backing": Color(0.36, 0.25, 0.15)},
 		{"out": "stone", "src": "stone_generic", "keep_alpha": false, "backing": Color(0.50, 0.50, 0.52)},
 		{"out": "wood",  "src": "oak_log_side",  "keep_alpha": false, "backing": Color(0.45, 0.32, 0.18)},
 		{"out": "leaf",  "src": "oak_leaves",    "keep_alpha": false, "backing": Color(0.09, 0.20, 0.08)},
+		# --- world-tier stones (WGC §3.3): closest CC0 tile per material ---
+		{"out": "bedrock",         "src": "gabbro",         "keep_alpha": false, "backing": Color(0.34, 0.34, 0.34)},
+		{"out": "deepslate",       "src": "slate",          "keep_alpha": false, "backing": Color(0.28, 0.28, 0.30)},
+		{"out": "granite",         "src": "granite",        "keep_alpha": false, "backing": Color(0.58, 0.40, 0.33)},
+		{"out": "diorite",         "src": "diorite",        "keep_alpha": false, "backing": Color(0.74, 0.74, 0.75)},
+		{"out": "andesite",        "src": "rhyolite",       "keep_alpha": false, "backing": Color(0.50, 0.50, 0.52)},
+		{"out": "tuff",            "src": "schist",         "keep_alpha": false, "backing": Color(0.43, 0.44, 0.41)},
+		{"out": "calcite",         "src": "marble",         "keep_alpha": false, "backing": Color(0.88, 0.88, 0.86)},
+		{"out": "dripstone_block", "src": "limestone",      "keep_alpha": false, "backing": Color(0.49, 0.39, 0.33)},
+		{"out": "sandstone",       "src": "sandstone",      "keep_alpha": false, "backing": Color(0.86, 0.81, 0.64)},
+		{"out": "obsidian",        "src": "obsidian",       "keep_alpha": false, "backing": Color(0.06, 0.04, 0.10)},
+		{"out": "amethyst_block",  "src": "amethyst",       "keep_alpha": false, "backing": Color(0.53, 0.38, 0.75)},
+		# --- soils / surface ---
+		{"out": "mud",         "src": "mud",       "keep_alpha": false, "backing": Color(0.24, 0.23, 0.24)},
+		{"out": "sand",        "src": "sand_ugly", "keep_alpha": false, "backing": Color(0.86, 0.83, 0.63)},
+		{"out": "gravel",      "src": "gravel",    "keep_alpha": false, "backing": Color(0.51, 0.50, 0.49)},
+		{"out": "snow_block",  "src": "snow",      "keep_alpha": false, "backing": Color(0.96, 0.99, 0.99)},
+		# --- cryo (ice_glacier used opaque; the ice MATERIAL applies alpha, WGC §5.1) ---
+		{"out": "ice",         "src": "ice_glacier", "keep_alpha": false, "backing": Color(0.49, 0.68, 1.00)},
+		# --- tree species (nearest CC0 species tile) ---
+		{"out": "spruce_log",    "src": "pine_log_side",       "keep_alpha": false, "backing": Color(0.29, 0.21, 0.13)},
+		{"out": "spruce_leaves", "src": "pine_leaves",         "keep_alpha": false, "backing": Color(0.15, 0.24, 0.14)},
+		{"out": "birch_log",     "src": "beech_log_side",      "keep_alpha": false, "backing": Color(0.78, 0.75, 0.66)},
+		{"out": "birch_leaves",  "src": "beech_leaves",        "keep_alpha": false, "backing": Color(0.28, 0.42, 0.16)},
+		{"out": "jungle_log",    "src": "eucalyptus_log_side", "keep_alpha": false, "backing": Color(0.34, 0.27, 0.15)},
+		{"out": "jungle_leaves", "src": "eucalyptus_leaves",   "keep_alpha": false, "backing": Color(0.16, 0.36, 0.07)},
+		{"out": "acacia_log",    "src": "maple_log_side",      "keep_alpha": false, "backing": Color(0.43, 0.40, 0.36)},
+		{"out": "acacia_leaves", "src": "maple_leaves",        "keep_alpha": false, "backing": Color(0.28, 0.42, 0.11)},
+		# --- glass (translucent: KEEP source alpha so the pane reads see-through) ---
+		{"out": "glass",         "src": "glass",              "keep_alpha": true,  "backing": Color(1, 1, 1)},
 	]
 
 ## Bake every tile in the spec. Returns OK if all succeeded.

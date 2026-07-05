@@ -176,13 +176,16 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	return id
 
 ## Place one block of `block_id` into `cell`. Fails (returns false, no state
-## change) if the cell is not air (composed query) or block_id is invalid (<=0 or
-## >= BlockCatalog.COUNT). On success writes the overlay, updates _placed_top,
+## change) if the cell is not air (composed query), block_id is invalid (<=0 or
+## >= BlockCatalog.count()), or the material is non-solid (water/lava/powder_snow —
+## WGC §6.3). On success writes the overlay, updates _placed_top,
 ## mirrors into the active render path and rebuilds the ground collider.
 ## Player-overlap is the CALLER's check (the world doesn't know where the player is).
 func place_block(cell: Vector3i, block_id: int) -> bool:
-	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.COUNT:
+	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.count():
 		return false
+	if BlockCatalog.solidity_of(block_id) < 0.5:
+		return false                       # no placing water/lava/powder_snow from the hotbar (WGC §6.3)
 	if cell_solid(cell):
 		return false
 	_write_cell(cell, CellCodec.pack(block_id))   # full cube, default state

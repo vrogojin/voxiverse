@@ -62,7 +62,7 @@ func setup() -> bool:
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)
-	# Each block model (ids 1..5) carries its own material; no terrain-wide
+	# Each block model (ids 1..count()-1) carries its own material; no terrain-wide
 	# material_override needed.
 	add_child(_terrain)
 	return true
@@ -95,25 +95,27 @@ func attach_viewer(player: Node3D) -> void:
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
 
-## Build the library: air=0, then grass/dirt/stone/wood/leaf cubes at ids 1..5.
-## The model index MUST equal the BlockCatalog id (the generator + edit path write
-## those ids), so each add is asserted — a mismatch silently recolours the world.
-## Returns true on success.
+## Build the library: air=0, then a cube model for EVERY BlockCatalog id in dense
+## order (WGC §5.1). The model index MUST equal the BlockCatalog id (the generator +
+## edit path write those ids), so each add is asserted over ALL ids — a mismatch
+## silently recolours the world. Translucent materials (glass/water/ice, cull_group
+## > 0) get their `transparency_index` set so the blocky mesher culls faces per the
+## transparency-index rule (§5.1). Returns true on success.
 func _configure_library(library: Object) -> bool:
 	# Index 0 = air. Without this the first cube would land at id 0 (= air).
 	if ClassDB.class_exists("VoxelBlockyModelEmpty"):
 		library.call("add_model", ClassDB.instantiate("VoxelBlockyModelEmpty"))
 
-	# EXACT order after air: grass, dirt, stone, wood, leaf. grass/wood carry the
-	# textured materials; dirt/stone/leaf carry flat solid-colour materials. The
-	# 1x1 atlas is harmless for the solid ones and uniform for all.
-	var ids: Array[int] = [
-		BlockCatalog.GRASS, BlockCatalog.DIRT, BlockCatalog.STONE,
-		BlockCatalog.WOOD, BlockCatalog.LEAF,
-	]
-	for block_id: int in ids:
-		var got: int = _add_cube(library, BlockMaterials.get_for(block_id))
+	# Ids 1..count()-1 in order: each carries its own BlockMaterials material (textured
+	# where a tile exists, else a flat swatch; translucent/emissive per the catalog). The
+	# 1x1 atlas is uniform for all. The library-order invariant is now machine-checked at
+	# every id, not just the frozen 5.
+	var total := BlockCatalog.count()
+	for block_id in range(1, total):
+		var cull_group: int = BlockCatalog.cull_group_of(block_id)
+		var got: int = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
 		if got != block_id:
+			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
 
 	# bake() regenerates model geometry + UVs from the tile/atlas config; without
@@ -122,8 +124,12 @@ func _configure_library(library: Object) -> bool:
 		library.call("bake")
 	return true
 
-## Add one textured cube model, returning its library id.
-func _add_cube(library: Object, material: Material) -> int:
+## Add one textured cube model, returning its library id. `cull_group` (0 = opaque)
+## maps 1:1 onto VoxelBlockyModel.transparency_index (WGC §5.1): the blocky mesher
+## culls a face against a neighbour whose index is <= this model's, so glass-behind-
+## glass culls but stone-behind-glass draws. The alpha blend itself lives on the
+## material; the index only governs face culling.
+func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
@@ -138,6 +144,11 @@ func _add_cube(library: Object, material: Material) -> int:
 			cube.call("set_tile", side, Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
 		cube.call("set_material_override", 0, material)
+	# Transparency index for face culling (WGC §5.1). Opaque (0) is the godot_voxel
+	# default, so only translucent models need it; guarded so the call is harmless if
+	# the module drops the setter between versions.
+	if cull_group > 0 and cube.has_method("set_transparency_index"):
+		cube.call("set_transparency_index", cull_group)
 	var id: Variant = library.call("add_model", cube)
 	if typeof(id) == TYPE_INT:
 		return id

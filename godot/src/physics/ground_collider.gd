@@ -55,8 +55,14 @@ const COLS_PER_FRAME := 32
 ## low-single-digit ms regardless of terrain density: a slice yields as soon as it has performed this
 ## many ops (always after finishing the current column, so build state stays consistent). The SETTLED
 ## shape set is byte-identical — only the scheduling changed (the double-buffer contract). A tall
-## single column can overshoot by its own height, which is tiny (a handful of runs). Tunable.
-const OPS_PER_FRAME := 40
+## single column can overshoot by its own height, which is tiny (a handful of runs).
+##
+## Sized for the WEAK target device (Intel HD via wasm, where a PhysicsServer op costs several times
+## a fast host): 24 ops keeps a slice well under a 60 fps frame even there, with headroom for render.
+## The cost is a marginally slower BACKGROUND fill (the full region settles over ~1.5 s of frames
+## after a drift/edit) — invisible, because a covering live set keeps colliding during the slice and
+## VoxelBody settling confirms support analytically (never trusting the in-progress set). Tunable.
+const OPS_PER_FRAME := 24
 ## Only a LARGE jump (a teleport) re-anchors an in-progress build; a normal walk lets the build
 ## FINISH (the next drift then starts a fresh one), so a fast walk can't thrash the builder into
 ## never completing. 2*R ⇒ restart only once the player has left the region being built.

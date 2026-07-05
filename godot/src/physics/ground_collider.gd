@@ -52,8 +52,9 @@ const COLS_PER_FRAME := 32
 ## never completing. 2*R ⇒ restart only once the player has left the region being built.
 const RESTART_DRIFT := 2 * R
 
-# Build phases: idle, sampling column heights (to find the region floor), emitting shapes.
-enum { PHASE_IDLE, PHASE_HEIGHTS, PHASE_SHAPES }
+# Build phases: idle, sampling column heights (region floor), emitting shapes, trimming the
+# staging body's surplus leftover shapes (when the new set is smaller than the previous one).
+enum { PHASE_IDLE, PHASE_HEIGHTS, PHASE_SHAPES, PHASE_TRIM }
 
 var world: WorldManager
 
@@ -77,9 +78,17 @@ var _build_i := 0                             # next column index into the span 
 var _build_heights := PackedInt32Array()
 var _build_min_h := 0
 var _build_ylo := 0
-var _build_used := 0                          # boxes attached to staging so far this pass
-var _build_cused := 0                         # prisms attached to staging so far this pass
+var _build_used := 0                          # box POOL slots consumed so far this pass
+var _build_cused := 0                         # prism POOL slots consumed so far this pass
 var _build_pc: Dictionary = {}                # per-build column-profile memo (height + biome)
+# Shape REUSE (no clear-all-then-add-all spike): each pass re-points the staging body's EXISTING
+# shape slots in place (body_set_shape + body_set_shape_transform) instead of body_clear_shapes +
+# re-add, then trims any surplus. _build_slot is the running body-slot index (boxes+prisms
+# interleaved); _build_prev_count is how many slots the staging body already had at pass start.
+var _build_slot := 0
+var _build_prev_count := 0
+var _build_trim := 0                          # next surplus slot to remove (during PHASE_TRIM)
+var _slice_ops := 0                           # PhysicsServer shape ops in the most recent update()
 
 func setup(world_ref: WorldManager) -> void:
 	world = world_ref
@@ -151,13 +160,15 @@ func _begin_build(center: Vector2i) -> void:
 	_dirty = false
 
 ## Process up to `budget` column-ops of the current build. PHASE_HEIGHTS samples every column's
-## surface (to find the region floor y_lo); PHASE_SHAPES emits each column's boxes/prisms into
-## the staging body. On completion, swaps live↔staging by toggling collision_layer.
+## surface (to find the region floor y_lo); PHASE_SHAPES re-points the staging body's shape slots
+## in place (reuse, no clear); PHASE_TRIM removes any surplus leftover slots. On completion, swaps
+## live↔staging by toggling collision_layer. Every phase is bounded by `budget` → flat per frame.
 func _advance_build(budget: int) -> void:
 	var span := 2 * R + 1
 	var total := span * span
 	var x0 := _build_center.x - R
 	var z0 := _build_center.y - R
+	_slice_ops = 0
 	var done := 0
 	while done < budget:
 		if _phase == PHASE_HEIGHTS:
@@ -171,20 +182,38 @@ func _advance_build(budget: int) -> void:
 				_build_i += 1
 				done += 1
 			else:
-				# Heights done → region floor known. Clear the staging body's OLD shapes (one
-				# call; the pooled shape resources persist) and start the shape pass.
+				# Heights done → region floor known. Begin the shape pass by REUSING the staging
+				# body's existing slots in place (no body_clear_shapes spike). Its shapes are all
+				# stale (from 2 builds ago) but the body is inert (layer 0), so re-pointing them
+				# across frames is invisible to physics until the swap.
 				_build_ylo = _build_min_h - DEPTH
-				PhysicsServer3D.body_clear_shapes(_body[_build_staging].get_rid())
+				_build_prev_count = PhysicsServer3D.body_get_shape_count(_body[_build_staging].get_rid())
 				_build_used = 0
 				_build_cused = 0
+				_build_slot = 0
 				_phase = PHASE_SHAPES
 				_build_i = 0
-		else:  # PHASE_SHAPES
+		elif _phase == PHASE_SHAPES:
 			if _build_i < total:
 				var i := _build_i / span
 				var j := _build_i % span
 				_emit_column(_build_staging, x0 + i, z0 + j, _build_heights[_build_i])
 				_build_i += 1
+				done += 1
+			else:
+				# All columns emitted. If the new set uses FEWER slots than the staging body had,
+				# trim the surplus leftover slots (also budgeted); else it is complete.
+				if _build_slot < _build_prev_count:
+					_build_trim = _build_prev_count
+					_phase = PHASE_TRIM
+				else:
+					_finish_build()
+					return
+		else:  # PHASE_TRIM — remove surplus slots from the end (index-stable for kept slots)
+			if _build_trim > _build_slot:
+				PhysicsServer3D.body_remove_shape(_body[_build_staging].get_rid(), _build_trim - 1)
+				_build_trim -= 1
+				_slice_ops += 1
 				done += 1
 			else:
 				_finish_build()
@@ -290,7 +319,21 @@ func _add_box(bidx: int, x: int, z: int, y_bottom: int, y_top: int) -> void:
 	box.size = Vector3(1.0, float(y_top - y_bottom), 1.0)
 	_build_used += 1
 	var t := Transform3D(Basis(), Vector3(x + 0.5, (float(y_bottom) + float(y_top)) * 0.5, z + 0.5))
-	PhysicsServer3D.body_add_shape(_body[bidx].get_rid(), box.get_rid(), t)
+	_attach(bidx, box.get_rid(), t)
+
+## Attach a shape at the next body slot, REUSING an existing slot in place when the staging body
+## still has one (body_set_shape + body_set_shape_transform → no clear/add churn), else appending.
+## The pooled BoxShape3D/ConvexPolygonShape3D resource is edited before this, so re-pointing a
+## reused slot at it updates the collision geometry with no allocation and no clear-all spike.
+func _attach(bidx: int, shape_rid: RID, t: Transform3D) -> void:
+	var rid := _body[bidx].get_rid()
+	if _build_slot < _build_prev_count:
+		PhysicsServer3D.body_set_shape(rid, _build_slot, shape_rid)
+		PhysicsServer3D.body_set_shape_transform(rid, _build_slot, t)
+	else:
+		PhysicsServer3D.body_add_shape(rid, shape_rid, t)
+	_build_slot += 1
+	_slice_ops += 1
 
 ## Attach the ≤ 2 convex prisms of a shaped solid cell at (x, y, z) to body `bidx` (SVS §5.4):
 ## each surface triangle extruded to the anchor face is a convex triangular prism, so loose
@@ -319,7 +362,7 @@ func _add_prisms(bidx: int, x: int, y: int, z: int, modifier: int) -> void:
 			pool.append(shape)
 		shape.points = pts
 		_build_cused += 1
-		PhysicsServer3D.body_add_shape(_body[bidx].get_rid(), shape.get_rid(), Transform3D.IDENTITY)
+		_attach(bidx, shape.get_rid(), Transform3D.IDENTITY)
 
 # --- accessors (used by the headless verify to inspect the collider) -----------
 
@@ -331,3 +374,8 @@ func active_rid() -> RID:
 ## True while an incremental (re)build is in progress (not yet swapped live).
 func is_building() -> bool:
 	return _phase != PHASE_IDLE
+
+## PhysicsServer shape ops (set/add/remove) performed in the most recent update() call — the
+## per-frame collider churn. Bounded per frame (never the whole region); used by verify.
+func last_slice_ops() -> int:
+	return _slice_ops

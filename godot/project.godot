@@ -42,4 +42,10 @@ textures/vram_compression/import_etc2_astc=true
 threads/count/minimum=1
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
-threads/main/time_budget_ms=12
+; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
+; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input
+; while streaming, so movement stutters. 4 ms (~24% of a frame) keeps the user loop
+; responsive; finished meshes just apply over a few more frames (fill LOOKS marginally
+; slower, FPS stays smooth — the explicit priority). Not lower: 3 ms noticeably slows
+; the visible fill for little extra smoothness headroom; 4 is the balance point.
+threads/main/time_budget_ms=4

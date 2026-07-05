@@ -846,15 +846,18 @@ func _test_collider_amortized() -> void:
 	var ncx := cx + GroundCollider.REBUILD_DIST
 	var ncz := cz + GroundCollider.REBUILD_DIST
 	var np := Vector3(float(ncx) + 0.5, float(g) + 2.0, float(ncz) + 0.5)
+	var region_total := (2 * GroundCollider.R + 1) * (2 * GroundCollider.R + 1)
 	gc.update(np)
 	_ok(gc.is_building(), "amortized: one update() after an 8-block drift advances only a slice (region NOT built in one call)")
 	# The live set is untouched during the transition — bodies keep colliding with the old set.
 	_ok(gc.active_rid() == rid0 and PhysicsServer3D.body_get_shape_count(rid0) == n0,
 		"amortized: live collider unchanged mid-transition (double-buffered; no partial set)")
-	# Pump to completion; count frames.
+	# Pump to completion; count frames and track the worst per-frame shape churn.
 	var frames := 1
+	var max_ops := gc.last_slice_ops()
 	while gc.is_building() and frames <= 4000:
 		gc.update(np)
+		max_ops = maxi(max_ops, gc.last_slice_ops())
 		frames += 1
 	_ok(frames > 1, "amortized: incremental build spreads across K>1 frames (K=%d)" % frames)
 	_ok(not gc.is_building(), "amortized: incremental build settles")
@@ -864,6 +867,26 @@ func _test_collider_amortized() -> void:
 	var act := _collider_col(gc.active_rid(), ncx, ncz)
 	var ref := _ref_col_heavy(cw, ncx, ncz, Vector2i(ncx, ncz))
 	_ok(_cols_equal(act, ref), "amortized: settled shapes == full-rebuild output at the new centre (byte-identical)")
+	# A SECOND drift builds into the body that already holds a full set → exercises the SHAPE
+	# REUSE path (body_set_shape in place, not clear-all+add-all) + any trim. Churn must stay
+	# bounded here too — this is the periodic clear-spike the fix removes.
+	var ncx2 := ncx + GroundCollider.REBUILD_DIST
+	var ncz2 := ncz + GroundCollider.REBUILD_DIST
+	var np2 := Vector3(float(ncx2) + 0.5, float(g) + 2.0, float(ncz2) + 0.5)
+	var f2 := 0
+	while f2 <= 4000:
+		gc.update(np2)
+		max_ops = maxi(max_ops, gc.last_slice_ops())
+		f2 += 1
+		if not gc.is_building():
+			break
+	print("    amortized: worst per-frame shape churn = %d ops (region ~%d shapes / %d columns) over 2 rebuilds"
+		% [max_ops, n0, region_total])
+	_ok(max_ops > 0, "amortized: (re)build does bounded work each frame (>0 ops)")
+	_ok(max_ops < region_total, "amortized: NO single update() churns the whole region (%d ops << %d columns / ~%d shapes)" % [max_ops, region_total, n0])
+	var act2 := _collider_col(gc.active_rid(), ncx2, ncz2)
+	var ref2 := _ref_col_heavy(cw, ncx2, ncz2, Vector2i(ncx2, ncz2))
+	_ok(_cols_equal(act2, ref2), "amortized: reuse-path rebuild settles byte-identical to a full rebuild")
 	gc.queue_free()
 	cw.queue_free()
 

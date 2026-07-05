@@ -169,6 +169,9 @@ func _test_worldgen_air_bounds() -> void:
 # (so no cube-fallback where the player is); any far-region straggler cube-falls-back gracefully.
 func _test_manifest_trim() -> void:
 	print("[1c] appearance manifest trim (bake only emitted shapes)")
+	if not TerrainConfig.SMOOTHING_ENABLED:
+		_ok(TerrainConfig.emitted_modifiers().size() == 0, "smoothing OFF: manifest bakes 0 shaped models")
+		return
 	var emitted := TerrainConfig.emitted_modifiers()
 	var full := TerrainConfig.appearance_modifiers()
 	var mats := TerrainConfig.appearance_surface_materials().size()
@@ -432,8 +435,11 @@ func _test_both_paths() -> void:
 							uncovered += 1
 					cells += 1
 	_ok(mismatches == 0, "module generator TYPE == manifest arid_for(mat,modifier) over %d cells (%d mismatches)" % [cells, mismatches])
-	_ok(shaped_cells > 0, "both-path sample includes shaped surface cells (%d) — smoothing active" % shaped_cells)
-	_ok(uncovered == 0, "every shaped generated cell is PRE-BAKED in the frozen manifest (%d uncovered) — worker never lazy-bakes" % uncovered)
+	if TerrainConfig.SMOOTHING_ENABLED:
+		_ok(shaped_cells > 0, "both-path sample includes shaped surface cells (%d) — smoothing active" % shaped_cells)
+		_ok(uncovered == 0, "every shaped generated cell is PRE-BAKED in the frozen manifest (%d uncovered) — worker never lazy-bakes" % uncovered)
+	else:
+		_ok(shaped_cells == 0, "smoothing OFF: both-path sample has no shaped cells (%d)" % shaped_cells)
 	# The generator only READS the frozen arrays — generating must not grow the ARID table.
 	var ac := int(mw.call("appearance_count"))
 	var buf2: Object = ClassDB.instantiate("VoxelBuffer")
@@ -541,7 +547,10 @@ func _test_smoothing() -> void:
 						or ShapeCodec.anchor(modifier) != ShapeCodec.ANCHOR_BOTTOM:
 					range_ok = false
 	print("    surface sweep: %d land cells, %d shaped" % [surface_cells, shaped])
-	_ok(shaped > 0, "smoothing engages: at least one shaped surface cell over the sweep (%d)" % shaped)
+	if TerrainConfig.SMOOTHING_ENABLED:
+		_ok(shaped > 0, "smoothing engages: at least one shaped surface cell over the sweep (%d)" % shaped)
+	else:
+		_ok(shaped == 0, "smoothing OFF: no shaped surface cells over the sweep (%d)" % shaped)
 	_ok(range_ok, "every surface modifier is a BOTTOM corner-height code (corners ≤ 2)")
 	_ok(mat_ok, "smoothing leaves the material projection unchanged (generated_block == mat)")
 
@@ -606,6 +615,9 @@ func _test_smoothing() -> void:
 # falls through. A continuous floor IS the walkability guarantee — blocked() auto-steps
 # exactly the same STEP_MAX rise floor_under exposes here.
 func _test_smoothing_walkable() -> void:
+	if not TerrainConfig.SMOOTHING_ENABLED:
+		print("    smoothing-walkable — SKIPPED (smoothing OFF)")
+		return
 	var spot := Vector2i(0x7fffffff, 0)
 	for x in range(-200, 200):
 		for z in range(-200, 200):

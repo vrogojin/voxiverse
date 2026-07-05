@@ -29,6 +29,13 @@ extends RefCounted
 
 const SEED := 20260702
 
+## DIAGNOSTIC A/B TOGGLE (SUB-VOXEL-SMOOTHING). When false, terrain smoothing is fully OFF:
+## the surface cell is a plain FULL cube (no ramp/slab reshape), no grass CAP lip grows, and the
+## appearance manifest bakes ZERO shaped models — the world is cube-only like pre-P5. Flip to true
+## to restore full smoothing (a genuine one-line change; no smoothing math is altered, only gated).
+## Currently OFF to A/B whether smoothing (and its per-shape meshing) causes the in-game jerkiness.
+const SMOOTHING_ENABLED := false
+
 # --- vertical structure (WGC §6.1, our scale) ---------------------------------
 const WORLD_BOTTOM_Y := -64      # world floor; below is void (unreachable)
 const BEDROCK_TOP_Y := -59       # bedrock gradient: 100% at -64 -> 0% at -59
@@ -454,6 +461,8 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 ## cell resting on the surface forces it FULL so trunks never float on a ramp corner —
 ## SVS §8.1 tree exception).
 static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return mat                                    # diagnostic: cube-only surface
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return mat                                    # a tree cell rests here → keep FULL
 	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g)
@@ -466,6 +475,8 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -
 ## cell). The cap is the column's surface material, shaped by the SAME corner targets as
 ## the surface cell below it, so the two form one crack-free continuous slope.
 static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return BlockCatalog.AIR                       # diagnostic: no cap cells
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
 	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
@@ -489,6 +500,8 @@ static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> i
 ## would emit for the top cell (0 == FULL cube: underwater floor, a tree-owned top, or flat/steep
 ## ground; nonzero == a ramp/slab). No material/biome/strata/ore branches are evaluated.
 static func surface_modifier(x: int, z: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return 0                                      # diagnostic: cube-only surface
 	var g := _col_h(x, z, pcache)
 	if g < SEA_LEVEL:
 		return 0                                      # underwater floor is never smoothed (full cube)
@@ -502,6 +515,8 @@ static func surface_modifier(x: int, z: int, pcache = null) -> int:
 ## is a non-air biome top, so the collider needs only this modifier (nonzero → shaped prism cell;
 ## 0 → the cap cell is AIR/handed to the tree overlay).
 static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return 0                                      # diagnostic: no cap cells
 	var g := _col_h(x, z, pcache)
 	if g < SEA_LEVEL:
 		return 0
@@ -555,6 +570,8 @@ const _EMIT_SAMPLE_R := 160
 static var _emitted_ready := false
 static var _emitted_mods := PackedInt32Array()
 static func emitted_modifiers() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
 	if _emitted_ready:
 		return _emitted_mods
 	_ensure_noise()

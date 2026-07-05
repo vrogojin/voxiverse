@@ -34,6 +34,7 @@ func _initialize() -> void:
 	_test_catalog_expansion()
 	_test_merged_physics()
 	_test_world_loop()
+	_test_structural()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -846,3 +847,284 @@ func _count_voxel_bodies(n: Node) -> int:
 			c += 1
 		c += _count_voxel_bodies(ch)
 	return c
+
+# P4. Structural-integrity solver (STRUCTURAL-INTEGRITY §8 + INTEGRATION-DECISIONS):
+# the per-material capacities as pure-math asserts (the anchors become executable
+# σ's), then LIVE builds via the edit overlay whose collapse thresholds ARE the
+# anchors — pillars (P, compression), dangling chains (D, tension), horizontal
+# cantilevers (H, shear+moment), falling sand (participation), per-joint
+# reinforcement, and the preserved tree-chop (pass 0). Every threshold uses the
+# exact integer-Newton capacities, so binding "exactly at capacity" is not flaky.
+func _test_structural() -> void:
+	print("[P4] structural integrity solver")
+	_struct_math_asserts()
+	var patch := _flat_patch5()
+	if patch.x == 0x7fffffff:
+		_ok(false, "found a flat clear grass patch for structural builds")
+		return
+	var cx := patch.x
+	var cz := patch.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	print("    flat 5x5 patch at (%d,%d) g=%d" % [cx, cz, g])
+
+	# Pillars — the P (compression) anchor: a pillar of P stands, P+1 crushes at base.
+	_struct_pillar(DIRT, 4, cx, cz, g)
+	_struct_pillar(WOOD, 36, cx, cz, g)
+	_struct_pillar(STONE, 64, cx, cz, g)
+	# Dangling chains — the D (tension) anchor.
+	_struct_dangle(DIRT, 1, cx, cz, g)
+	_struct_dangle(WOOD, 16, cx, cz, g)
+	_struct_dangle(STONE, 4, cx, cz, g)
+	# Horizontal cantilevers — the H (shear+moment) anchor.
+	_struct_cantilever(DIRT, 2, cx, cz, g)
+	_struct_cantilever(WOOD, 24, cx, cz, g)
+	_struct_cantilever(STONE, 6, cx, cz, g)
+	# Falling sand — the participation (attachment=0) audit.
+	_struct_sand(cx, cz, g)
+	# Per-joint reinforcement raises capacity in the live solver.
+	_struct_reinforcement(cx, cz, g)
+	# Tree-chop unchanged (pass 0).
+	_struct_tree_chop()
+
+# Pure-math capacity asserts (no world): the anchors + mass reproduce σ_c/σ_t/σ_s/M₀
+# in the integer-Newton domain, the mixed wood/stone joint, the φ plateau (=1 across
+# today's world) and the endpoints, and the cement reinforcement bonus.
+func _struct_math_asserts() -> void:
+	# σ_c=P·w, σ_s=H·w, σ_t=D·w, M₀=σ_s·H/2 with w=round(m·g). dirt m=900 → w=8829.
+	_ok(StructuralModel.weight_int(DIRT) == 8829, "w_int(dirt)=8829")
+	_ok(StructuralModel.sigma_c(DIRT) == 35316 and StructuralModel.sigma_t(DIRT) == 8829
+		and StructuralModel.sigma_s(DIRT) == 17658 and StructuralModel.moment0(DIRT) == 17658,
+		"dirt σ_c/σ_t/σ_s/M₀ = 35316/8829/17658/17658")
+	# stone m=1500 → w=14715; (64,6,4).
+	_ok(StructuralModel.sigma_c(STONE) == 941760 and StructuralModel.sigma_t(STONE) == 58860
+		and StructuralModel.sigma_s(STONE) == 88290 and StructuralModel.moment0(STONE) == 264870,
+		"stone σ_c/σ_t/σ_s/M₀ = 941760/58860/88290/264870")
+	# wood m=80 → w=785; (36,24,16).
+	_ok(StructuralModel.sigma_c(WOOD) == 28260 and StructuralModel.sigma_t(WOOD) == 12560
+		and StructuralModel.sigma_s(WOOD) == 18840 and StructuralModel.moment0(WOOD) == 226080,
+		"wood σ_c/σ_t/σ_s/M₀ = 28260/12560/18840/226080")
+	# Mixed wood/stone tension joint (SI §4 worked example): F_t = ½(σ_t,wood+σ_t,stone).
+	var ft_ws := StructuralModel.joint_ft(WOOD, STONE, 21.5, 0, 1.0)
+	_ok(ft_ws == 35710, "mixed wood/stone F_t = ½(12560+58860) = 35710 (got %d)" % ft_ws)
+	_ok(2 * StructuralModel.weight_int(STONE) <= ft_ws and 3 * StructuralModel.weight_int(STONE) > ft_ws,
+		"mixed joint: 2 stones dangle under wood, a 3rd snaps")
+	# φ plateau (=1) across today's world; frost strengthens soil; heat fails timber.
+	_ok(is_equal_approx(StructuralModel.phi(12.0, &"soil"), 1.0)
+		and is_equal_approx(StructuralModel.phi(21.5, &"rock"), 1.0)
+		and is_equal_approx(StructuralModel.phi(23.0, &"timber"), 1.0),
+		"φ = 1 on the plateau (deep mine == surface behaviour)")
+	_ok(is_equal_approx(StructuralModel.phi(-10.0, &"soil"), 3.0), "φ_soil(−10°C) = 3.0 (frost cementation)")
+	_ok(is_equal_approx(StructuralModel.phi(300.0, &"timber"), StructuralModel.PHI_MIN),
+		"φ_timber(300°C) = φ_min (heat failure)")
+	# Cement reinforcement (id 2): F_t = σ_t + R_t on a stone joint.
+	var ft_bare := StructuralModel.joint_ft(STONE, STONE, 21.5, 0, 1.0)
+	var ft_cem := StructuralModel.joint_ft(STONE, STONE, 21.5, 2, 1.0)
+	_ok(ft_bare == 58860 and ft_cem == 98860, "cement raises stone F_t 58860 → 98860 (+R_t)")
+
+# The first (lowest x, then z) naturally-flat 5x5 grass patch clear to g+69 above —
+# the deterministic test bed. Its centre support cell is confined bulk once a block
+# sits on it (all 6 neighbours solid), so a pillar/tower base bears the FULL column
+# and crushes at its own σ_c rather than punching through the ground.
+func _flat_patch5() -> Vector2i:
+	for x in range(-256, 256):
+		for z in range(-256, 256):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g <= TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.generated_block(x, g, z) != GRASS:
+				continue
+			var flat := true
+			for dx in range(-2, 3):
+				for dz in range(-2, 3):
+					if TerrainConfig.height_at(x + dx, z + dz) != g \
+							or TerrainConfig.generated_block(x + dx, g + 1, z + dz) != 0:
+						flat = false
+						break
+				if not flat:
+					break
+			if not flat:
+				continue
+			var clear := true
+			for dx in range(-2, 3):
+				for dz in range(-2, 3):
+					for yy in range(g + 1, g + 70):
+						if TerrainConfig.generated_block(x + dx, yy, z + dz) != 0:
+							clear = false
+							break
+					if not clear:
+						break
+				if not clear:
+					break
+			if clear:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+func _struct_world(nm: String) -> WorldManager:
+	var w := WorldManager.new()
+	w.name = nm
+	get_root().add_child(w)
+	return w
+
+# Pillar of `mat`: P cells stand, P+1 crushes at the base (compression, σ_c=P·w).
+func _struct_pillar(mat: int, cap_p: int, cx: int, cz: int, g: int) -> void:
+	var w := _struct_world("P4Pillar_%d" % mat)
+	var nm := BlockCatalog.name_of(mat)
+	var b0 := _count_voxel_bodies(w)
+	var built := true
+	for k in range(1, cap_p + 1):
+		if not w.place_block(Vector3i(cx, g + k, cz), mat):
+			built = false
+	var base := Vector3i(cx, g + 1, cz)
+	_ok(built and _count_voxel_bodies(w) == b0 and w.block_id_at(base) == mat,
+		"%s pillar of %d STANDS (no debris, base solid)" % [nm, cap_p])
+	w.place_block(Vector3i(cx, g + cap_p + 1, cz), mat)
+	_ok(_count_voxel_bodies(w) > b0 and w.block_id_at(base) != mat,
+		"%s pillar of %d COLLAPSES (base crushed, debris spawned)" % [nm, cap_p + 1])
+	w.queue_free()
+
+# Dangling chain of `mat` hung from a stone tower's arm: D cells hold, D+1 snaps the
+# top joint (tension, σ_t=D·w). The arm is the test material so the tested joint is
+# same-material; the tower is stone so it never self-collapses under the extra load.
+func _struct_dangle(mat: int, cap_d: int, cx: int, cz: int, g: int) -> void:
+	var w := _struct_world("P4Dangle_%d" % mat)
+	var nm := BlockCatalog.name_of(mat)
+	var h_tower := cap_d + 3
+	for k in range(1, h_tower + 1):
+		w.place_block(Vector3i(cx, g + k, cz), STONE)
+	var yy := g + h_tower
+	w.place_block(Vector3i(cx + 1, yy, cz), mat)   # arm base (off the tower)
+	w.place_block(Vector3i(cx + 2, yy, cz), mat)   # arm tip (clears the tower body)
+	var b0 := _count_voxel_bodies(w)
+	var top := Vector3i(cx + 2, yy - 1, cz)
+	var built := true
+	for k in range(1, cap_d + 1):
+		if not w.place_block(Vector3i(cx + 2, yy - k, cz), mat):
+			built = false
+	_ok(built and _count_voxel_bodies(w) == b0 and w.block_id_at(top) == mat,
+		"%s dangling chain of %d HOLDS" % [nm, cap_d])
+	w.place_block(Vector3i(cx + 2, yy - cap_d - 1, cz), mat)
+	_ok(_count_voxel_bodies(w) > b0 and w.block_id_at(top) != mat,
+		"%s dangling chain of %d SNAPS at the top joint" % [nm, cap_d + 1])
+	w.queue_free()
+
+# Horizontal cantilever of `mat` off a same-material braced wall: H cells hold, H+1
+# detaches (root shear σ_s=H·w binds, moment M₀ binds together at H). The wall is
+# elevated so the beam has air below; weak dirt keeps a short beam (low wall), strong
+# wood/stone use a tall wall so their long beams clear the terrain.
+func _struct_cantilever(mat: int, cap_h: int, cx: int, cz: int, g: int) -> void:
+	var w := _struct_world("P4Cant_%d" % mat)
+	var nm := BlockCatalog.name_of(mat)
+	var h_wall := 4 if mat == DIRT else 14
+	for k in range(1, h_wall + 1):
+		for dz in [-1, 0, 1]:
+			w.place_block(Vector3i(cx, g + k, cz + dz), mat)   # 3-wide braced wall
+	var yy := g + h_wall
+	var b0 := _count_voxel_bodies(w)
+	var root := Vector3i(cx + 1, yy, cz)
+	var built := true
+	for k in range(1, cap_h + 1):
+		if not w.place_block(Vector3i(cx + k, yy, cz), mat):
+			built = false
+	_ok(built and _count_voxel_bodies(w) == b0 and w.block_id_at(root) == mat,
+		"%s cantilever of %d HOLDS" % [nm, cap_h])
+	w.place_block(Vector3i(cx + cap_h + 1, yy, cz), mat)
+	_ok(_count_voxel_bodies(w) > b0 and w.block_id_at(root) != mat,
+		"%s cantilever of %d DETACHES at the root" % [nm, cap_h + 1])
+	w.queue_free()
+
+# Falling sand — the participation (attachment = 0.0) audit (INTEGRATION-DECISIONS §1.3).
+func _struct_sand(cx: int, cz: int, g: int) -> void:
+	var w := _struct_world("P4Sand")
+	var SAND := BlockCatalog.id_of(&"sand")
+	_ok(SAND > 0, "sand id resolves")
+	if SAND <= 0:
+		w.queue_free()
+		return
+	# (a) sand side-attached to a stone wall with air below FALLS — the att_A·att_B=0
+	# product zeroes the sand↔stone joint the arithmetic mean would keep glued.
+	w.place_block(Vector3i(cx, g + 1, cz), STONE)
+	w.place_block(Vector3i(cx, g + 2, cz), STONE)
+	var b0 := _count_voxel_bodies(w)
+	var spot := Vector3i(cx + 1, g + 2, cz)          # beside the stone top, air below
+	w.place_block(spot, SAND)
+	_ok(_count_voxel_bodies(w) > b0 and w.block_id_at(spot) != SAND,
+		"undercut sand side-attached to a stone wall FALLS (participation 0)")
+	# contrast: a DIRT block (participation 1) in the same spot HOLDS as a 1-shelf.
+	var b1 := _count_voxel_bodies(w)
+	w.place_block(spot, DIRT)
+	_ok(_count_voxel_bodies(w) == b1 and w.block_id_at(spot) == DIRT,
+		"a dirt shelf of 1 off the same wall HOLDS (participation 1 — contrast)")
+	# (b) a sand block on solid ground STANDS (pure compression routing).
+	var heap := Vector3i(cx - 2, g + 1, cz)
+	var b2 := _count_voxel_bodies(w)
+	w.place_block(heap, SAND)
+	_ok(_count_voxel_bodies(w) == b2 and w.block_id_at(heap) == SAND,
+		"a sand block on solid ground STANDS (compression, not participation)")
+	# (c) a sand column of 4 CRUSHES its base (P=3): 3 stands, the 4th crushes.
+	var scol := cx + 2
+	var b3 := _count_voxel_bodies(w)
+	for k in range(1, 4):
+		w.place_block(Vector3i(scol, g + k, cz), SAND)
+	_ok(_count_voxel_bodies(w) == b3 and w.block_id_at(Vector3i(scol, g + 1, cz)) == SAND,
+		"sand column of 3 STANDS (P=3)")
+	w.place_block(Vector3i(scol, g + 4, cz), SAND)
+	_ok(_count_voxel_bodies(w) > b3 and w.block_id_at(Vector3i(scol, g + 1, cz)) != SAND,
+		"sand column of 4 CRUSHES its base (P=3)")
+	w.queue_free()
+
+# Per-joint reinforcement in the live solver: a stone dangling chain of 5 (bare
+# σ_t=4·w ⇒ the plain stone anchor is 4/5, snaps) HOLDS once every joint on its load
+# path is cemented (F_t 58860 → 98860). Same structure, reinforcement flips it.
+func _struct_reinforcement(cx: int, cz: int, g: int) -> void:
+	var w := _struct_world("P4Reinf")
+	var chain := 5
+	var h_tower := chain + 3
+	for k in range(1, h_tower + 1):
+		w.place_block(Vector3i(cx, g + k, cz), STONE)
+	var yy := g + h_tower
+	# Pre-cement the WHOLE load path (joints may be reinforced before the cells exist;
+	# the store is keyed by cell pair, queried only for existing solid pairs).
+	w.reinforce_joint(Vector3i(cx + 1, yy, cz), Vector3i(cx, yy, cz), 2)          # arm base ↔ tower
+	w.reinforce_joint(Vector3i(cx + 2, yy, cz), Vector3i(cx + 1, yy, cz), 2)      # arm tip ↔ arm base
+	w.reinforce_joint(Vector3i(cx + 2, yy - 1, cz), Vector3i(cx + 2, yy, cz), 2)  # chain top ↔ arm tip
+	for k in range(1, chain + 1):
+		w.reinforce_joint(Vector3i(cx + 2, yy - k - 1, cz), Vector3i(cx + 2, yy - k, cz), 2)
+	w.place_block(Vector3i(cx + 1, yy, cz), STONE)
+	w.place_block(Vector3i(cx + 2, yy, cz), STONE)
+	var b0 := _count_voxel_bodies(w)
+	var top := Vector3i(cx + 2, yy - 1, cz)
+	var built := true
+	for k in range(1, chain + 1):
+		if not w.place_block(Vector3i(cx + 2, yy - k, cz), STONE):
+			built = false
+	_ok(built and _count_voxel_bodies(w) == b0 and w.block_id_at(top) == STONE,
+		"cemented stone chain of 5 HOLDS (bare stone snaps at 5 — reinforcement raised F_t)")
+	w.queue_free()
+
+# Tree-chop is decided by pass 0 (connectivity), unchanged: chopping the lowest trunk
+# cell detaches the whole canopy as one kicked VoxelBody — the invariant that cannot regress.
+func _struct_tree_chop() -> void:
+	var w := _struct_world("P4Tree")
+	var SPRUCE_LOG := BlockCatalog.id_of(&"spruce_log")
+	var BIRCH_LOG := BlockCatalog.id_of(&"birch_log")
+	var log_ids := {WOOD: true, SPRUCE_LOG: true, BIRCH_LOG: true}
+	var chopped := false
+	for gx in range(-120, 120):
+		for gz in range(-120, 120):
+			if chopped:
+				break
+			if not TreeGen.has_tree(gx, gz):
+				continue
+			var base: Vector3i = TreeGen.tree_base(gx, gz)
+			var trunk := Vector3i(base.x, base.y + 1, base.z)
+			if not log_ids.has(w.block_id_at(trunk)):
+				continue
+			var n0 := _count_voxel_bodies(w)
+			w.break_terrain(trunk, Vector3(base.x + 0.5, base.y - 2.0, base.z + 0.5))
+			_ok(_count_voxel_bodies(w) > n0, "tree-chop still detaches the canopy (pass 0 preserved)")
+			chopped = true
+			break
+		if chopped:
+			break
+	_ok(chopped, "found and chopped a tree trunk")
+	w.queue_free()

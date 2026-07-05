@@ -32,6 +32,12 @@ var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = a
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
+# Sparse per-joint reinforcement (glue/weld/cement; STRUCTURAL-INTEGRITY §4.2/§7):
+# canonical key Vector4i(min_cell.x, .y, .z, axis) -> reinforcement id. Lives
+# OUTSIDE the four cell axes (it is per-FACE, not per-cell). The structural solver
+# reads it via `joint_mod`; breaking a block leaves stale entries harmless (a joint
+# with a missing cell is never queried).
+var _joint_mods: Dictionary = {}      # Vector4i -> int reinforcement id
 
 func _ready() -> void:
 	environment = PerVoxelEnvironment.new()
@@ -170,7 +176,7 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 		return 0
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
-	_collapse_unsupported(cell, from_pos)   # only from the player break — never a spawn
+	_structural_update(cell, from_pos)  # only from the player break — never a spawn
 	if _ground != null:
 		_ground.rebuild_now()
 	return id
@@ -193,6 +199,10 @@ func place_block(cell: Vector3i, block_id: int) -> bool:
 	var prev: int = _placed_top.get(key, -0x40000000)
 	if cell.y > prev:
 		_placed_top[key] = cell.y
+	# The placement SUCCEEDS, then the structure is judged (SI §6): an over-tall
+	# pillar crushes, an undercut/unsupported placement detaches. No breaker kick on
+	# a placement collapse (from_pos = Vector3.INF).
+	_structural_update(cell, Vector3.INF)
 	if _ground != null:
 		_ground.rebuild_now()
 	return true
@@ -218,109 +228,39 @@ func _paint_cell(cell: Vector3i, block_id: int) -> void:
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
 
-# --- terrain collapse (unsupported blocks fall) --------------------------------
+# --- terrain collapse (unsupported/overloaded blocks fall) ---------------------
+# The support analysis itself lives in StructuralSolver (STRUCTURAL-INTEGRITY §5);
+# WorldManager owns only the resulting carve + VoxelBody spawn (_structural_update).
 
-## Half-extent of the square column region the collapse scan examines around a break.
-const _COLLAPSE_RADIUS := 5
-
-## The 6 axis neighbours, reused by the support flood-fill and the component grouping.
+## The 6 axis neighbours, reused by the component grouping (and formerly the flood).
 const _NEIGHBORS_6: Array[Vector3i] = [
 	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
 	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
 	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
 ]
 
-## Local support analysis around a just-broken cell: any solid, non-broken terrain
-## no longer connected (through solid cells) to the always-supported bottom row
-## becomes falling rigid bodies. Cheap on the common case (flat digging undercuts
-## nothing → the flood-fill reaches every cell → zero floaters → early return).
+## Structural-integrity update around a just-edited cell (STRUCTURAL-INTEGRITY §6):
+## the StructuralSolver decides which cells detach or crumble (pass 0 connectivity —
+## today's flood, so tree-chop is preserved — plus load-bearing flow + moment audit
+## for player builds), and this function carves that set out and drops the 6-connected
+## components as loose VoxelBody debris, exactly as the old collapse did. Cheap on the
+## common case: flat digging that undercuts nothing early-outs inside solve() (pass 0
+## reaches everything, pass 1 finds no overload → the solver returns an empty set).
 ##
-## MUST be called only from the player-initiated break_terrain, never from a spawn
-## path, so it cannot recurse.
-func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
-	var x0 := center.x - _COLLAPSE_RADIUS
-	var x1 := center.x + _COLLAPSE_RADIUS
-	var z0 := center.z - _COLLAPSE_RADIUS
-	var z1 := center.z + _COLLAPSE_RADIUS
+## MUST be called only from the player-initiated break_terrain / place_block, never
+## from a spawn path, so it cannot recurse (a landing VoxelBody is physics-side).
+func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
+	var falling: Dictionary = StructuralSolver.solve(self, center)
+	if falling.is_empty():
+		return   # common case: nothing detaches, spawn nothing
 
-	# Vertical bounds: top = tallest column PLUS the max tree/placed height above the
-	# surface (so canopies and player towers participate in the support analysis);
-	# bottom = shortest column minus 2, a row solid in every column that connects to
-	# the untouched bulk.
-	var max_h := -0x3FFFFFFF
-	var y_lo_top := 0x3FFFFFFF
-	var placed_hi := -0x40000000
-	var xi := x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var h := TerrainConfig.height_at(xi, zi)
-			if h > max_h:
-				max_h = h
-			if h < y_lo_top:
-				y_lo_top = h
-			placed_hi = maxi(placed_hi, placed_top(xi, zi))
-			zi += 1
-		xi += 1
-	var y_hi := maxi(max_h + TreeGen.MAX_ABOVE_SURFACE, placed_hi)
-	var y_lo := y_lo_top - 2
-
-	# Seed support from every solid cell on the region BOUNDARY shell — the bottom
-	# row (deep bulk) AND the 4 side faces. A cell touching a side face connects to
-	# untouched terrain OUTSIDE the search box, which we conservatively treat as
-	# supported. Seeding only the bottom row would wrongly flag a shelf propped from
-	# outside the box as floating and carve it away; biasing toward "supported" at
-	# the boundary means we never destroy genuinely-supported terrain (a floater
-	# from the dig sits near the box CENTRE, so it is still detected).
-	var supported: Dictionary = {}
-	var stack: Array[Vector3i] = []
-	xi = x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var on_boundary := xi == x0 or xi == x1 or zi == z0 or zi == z1
-			var y := y_lo
-			while y <= y_hi:
-				if (on_boundary or y == y_lo) and _cell_solid(Vector3i(xi, y, zi)):
-					var seed := Vector3i(xi, y, zi)
-					if not supported.has(seed):
-						supported[seed] = true
-						stack.append(seed)
-				y += 1
-			zi += 1
-		xi += 1
-	while not stack.is_empty():
-		var c: Vector3i = stack.pop_back()
-		for d: Vector3i in _NEIGHBORS_6:
-			var nc := c + d
-			if nc.x < x0 or nc.x > x1 or nc.z < z0 or nc.z > z1 or nc.y < y_lo or nc.y > y_hi:
-				continue
-			if supported.has(nc):
-				continue
-			if _cell_solid(nc):
-				supported[nc] = true
-				stack.append(nc)
-
-	# Collect solid cells the flood never reached — these are floating.
-	var floating: Dictionary = {}
-	xi = x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var y := y_lo
-			while y <= y_hi:
-				var c := Vector3i(xi, y, zi)
-				if _cell_solid(c) and not supported.has(c):
-					floating[c] = true
-				y += 1
-			zi += 1
-		xi += 1
-	if floating.is_empty():
-		return   # common case: nothing undercut, spawn nothing
-
-	# Group floaters into 6-neighbour connected components; each becomes one body.
+	# Group the detaching cells into 6-neighbour connected components; each becomes
+	# one body. Capture each cell's PACKED value BEFORE carving (so mixed grass/dirt/
+	# stone and wood+leaf canopies keep their materials and, later, shape/state), then
+	# carve the component and drop it as one loose body. from_pos kicks it away from
+	# the breaker (Vector3.INF on a placement collapse = no kick).
 	var seen: Dictionary = {}
-	for start: Vector3i in floating.keys():
+	for start: Vector3i in falling.keys():
 		if seen.has(start):
 			continue
 		var comp: Array[Vector3i] = []
@@ -331,21 +271,41 @@ func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
 			comp.append(c)
 			for d: Vector3i in _NEIGHBORS_6:
 				var nc := c + d
-				if floating.has(nc) and not seen.has(nc):
+				if falling.has(nc) and not seen.has(nc):
 					seen[nc] = true
 					cstack.append(nc)
-		# Capture each cell's PACKED value BEFORE carving (so mixed grass/dirt/stone and
-		# wood+leaf canopies keep their materials — and, once modifiers/state land, their
-		# shape and variant too), then carve the component out of the terrain and drop it
-		# as one loose body — VoxelBody projects materials + masses from the packed values
-		# itself. A bare id is a valid packed value, so this is byte-identical today.
-		# from_pos kicks the cluster away from the breaker.
 		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
 			comp_ids[c] = cell_value_at(c)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
+
+# --- per-joint reinforcement (STRUCTURAL-INTEGRITY §4.2/§7) ---------------------
+
+## The canonical unordered joint key for the pair of 6-adjacent cells (a, b): the
+## component-wise-smaller cell + the axis they differ on (0=x, 1=y, 2=z).
+static func _joint_key(a: Vector3i, b: Vector3i) -> Vector4i:
+	var axis := 0 if a.x != b.x else (1 if a.y != b.y else 2)
+	return Vector4i(mini(a.x, b.x), mini(a.y, b.y), mini(a.z, b.z), axis)
+
+## Reinforcement id on the joint between 6-adjacent cells (a, b); 0 = unreinforced.
+## The structural solver reads this for every joint's F_t/F_s/M₀ (StructuralModel).
+func joint_mod(a: Vector3i, b: Vector3i) -> int:
+	return int(_joint_mods.get(_joint_key(a, b), 0))
+
+## Reinforce the joint between the two 6-adjacent cells with `reinf_id` (a
+## StructuralModel reinforcement id; 0 clears it). Returns false if the cells are
+## not 6-adjacent. One reinforcement per joint (placing a new one replaces the old).
+func reinforce_joint(a: Vector3i, b: Vector3i, reinf_id: int) -> bool:
+	var diff := b - a
+	if absi(diff.x) + absi(diff.y) + absi(diff.z) != 1:
+		return false
+	if reinf_id == 0:
+		_joint_mods.erase(_joint_key(a, b))
+	else:
+		_joint_mods[_joint_key(a, b)] = reinf_id
+	return true
 
 # --- analytic world queries (path-agnostic) ------------------------------------
 

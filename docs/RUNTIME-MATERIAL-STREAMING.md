@@ -188,6 +188,16 @@ through the same streaming path (its worldgen needs a manifest — §6.5).
 * **Peers:** identical rule — a zone bundle is just a container. Two peers
   *always* have different LRID tables; it never matters because LRIDs never
   travel.
+* **Payload layout (revised — VDS §5):** the container's voxel data payload
+  now adopts `docs/VOXEL-DATA-STRUCTURE.md` §5 **ZoneChunk** layers rather than
+  one flat id-remapped body. Each ZoneChunk carries its **own material palette**
+  of container-local ids (one palette per 32³ chunk, resolved through this
+  section's id-map header), plus the optional sparse modifier/state/metadata
+  layers. The container-local palette *is* the "compact on save" mechanism, now
+  scoped per chunk instead of per container body. The **id-map header
+  (index → GMID#state string) is unchanged** — it remains the one place a
+  container-local id is bound to a global identity; per-chunk palette ids index
+  into it. (VDS §13.2.4.)
 
 Rejected alternative — *deterministic global dense ids* (e.g. sort by GMID):
 would force renumbering (= full-world remap + remesh, impossible per F7) every
@@ -215,26 +225,39 @@ var _bake_pending := false
 
 ## Called by WorldManager when the catalog grew. Appends one cube model per new
 ## LRID (same _add_cube as setup, material from BlockMaterials.get_for(lrid))
-## and asserts the returned index == the LRID — the library-order invariant,
-## now enforced at runtime, forever.
+## and asserts the returned model index == the allocated ARID — the library-order
+## invariant (VDS §8.1), now enforced at runtime, forever. (For the bootstrap
+## cube set, ARID == LRID; see the supersession banner.)
 func append_models_up_to(catalog_count: int) -> void: ...
 
 ## Deferred, coalesced: one bake() per frame at most, regardless of how many
-## materials arrived (F2: bake is a full O(N) rebake — never per-material).
+## models arrived (F2: bake is a full O(N) rebake — never per-model).
 func _flush_bake() -> void:
     _lib.call("bake")
     _baked_model_count = _lib_model_count
 
-## True when `lrid` is safe to write into the voxel TYPE channel.
-func can_render_id(lrid: int) -> bool:
-    return lrid < _baked_model_count
+## True when `arid` (an appearance render id, VDS §8.1) is safe to write into
+## the voxel TYPE channel.
+func can_render(arid: int) -> bool:
+    return arid < _baked_model_count
+
+## The gameplay-facing gate: is this cell's *composed appearance* baked yet?
+## Resolves (material, modifier, visual-state) → ARID (VDS §8.1) then checks it.
+## Replaces the old bare-LRID `can_render_id`, so the gate now covers shaped and
+## visual-state combos, not just plain cubes.
+func can_render_cell(mat: int, modifier: int, vstate: int) -> bool:
+    var arid: int = arid_of(mat, modifier, vstate)   # -1 until baked
+    return arid >= 0 and can_render(arid)
 ```
 
-Ordering protocol (the load pipeline, §7, enforces it): **catalog register →
-append_models → bake → only then may the LRID be written into voxel data.**
-Because both the catalog and the library are append-only and fed from a single
-main-thread loader, indexes stay in lockstep by construction; the runtime
-assertion makes drift a loud failure instead of a silently recoloured world
+Ordering protocol (the load pipeline, §7, enforces it): **catalog/appearance
+register → append model → bake → only then may that appearance (ARID) be written
+into voxel data.** `_paint_cell` gates on `can_render_cell` (the composed
+appearance), **not** on the bare LRID — a cell whose material is baked but whose
+shape/visual-state combo is not yet baked must not be painted. Because both the
+catalog and the library are append-only and fed from a single main-thread loader,
+indexes stay in lockstep by construction; the runtime assertion makes drift a
+loud failure instead of a silently recoloured world
 (the exact failure mode the current `_configure_library` assert guards).
 
 ### 3.2 Costs, and the web single-thread cap
@@ -286,11 +309,11 @@ semantics belong to the persistence workstream, flagged §9.3).
 `world.block_id_at()` and resolves looks via `BlockMaterials.get_for(id)`; it
 has **no** count-based assumptions. `ChunkStreamer` doesn't know ids exist. The
 only changes: `BlockMaterials` goes registry-backed (§6.2) and gains the same
-`can_render_id()` gate trivially satisfied (no bake step — a material is
-renderable the moment its catalog entry exists). Both paths therefore expose
-one predicate with one meaning; gameplay code gates on
-`WorldManager.can_render_id()` which delegates to the active path. **Two paths,
-one behaviour, preserved.**
+`can_render_cell()` gate trivially satisfied (no bake step — a shaped/visual-state
+appearance is renderable the moment its `ShapeMesh`/material variant exists).
+Both paths therefore expose one predicate with one meaning; gameplay code gates
+on `WorldManager.can_render_cell()` which delegates to the active path.
+**Two paths, one behaviour, preserved.**
 
 ### 4.2 VoxelBody
 
@@ -319,7 +342,8 @@ arrives the cells are already correct).
 Every `>= BlockCatalog.COUNT` range check (e.g. `WorldManager.place_block`,
 `BlockCatalog.is_solid_id`) becomes a catalog lookup:
 `BlockCatalog.is_valid_id(id)` = `id > 0 and id < catalog.count()`, **plus**
-the render gate `can_render_id(id)` before painting. `COUNT` the const is
+the render gate `can_render_cell(mat, modifier, vstate)` on the composed
+appearance before painting. `COUNT` the const is
 retired in favour of `BlockCatalog.count()` (Phase 1 keeps a deprecated alias
 so diffs stay small).
 
@@ -335,10 +359,16 @@ shape+orientation *beyond* a bare id. This design's contract with it:
   multiplies straight into the 65k ceiling, F1/F6.)
 * If sub-voxel rendering on the module path is realized as extra blocky models
   (e.g. N shape models per material), those models are **look-layer entries
-  above the material LRID space**: allocated in a reserved upper band of the
-  library and mapped (LRID, shape) → model index by the sub-voxel layer itself.
-  Serialized data still stores (material id-map entry + shape payload), never
-  raw model indices. — *Assumption flagged for that workstream to confirm.*
+  above the material LRID space**: ~~allocated in a reserved upper band of the
+  library and mapped (LRID, shape) → model index by the sub-voxel layer
+  itself~~. Serialized data still stores (material id-map entry + shape payload),
+  never raw model indices.
+  > **Superseded (VDS §8.1):** the "reserved upper band" is retired — shape and
+  > visual-state models interleave in the one append-only model space as **ARIDs**
+  > (one per used `(LRID, modifier, visual-state)` combo, `add_model() == ARID`
+  > asserted), lazily allocated rather than pre-banded. The identity contract
+  > above (id spaces never fork per shape; serialized data carries material +
+  > shape payload, never model indices) is unchanged and confirmed.
 
 ---
 
@@ -361,14 +391,20 @@ is a non-issue). Top-level:
   "voxiverse_material": 1,
   "name": "voxiverse:basalt",
   "default_state": "solid",
+  "state_layout": [],
+  "visual_mask": 0,
+  "has_block_entity": false,
   "states": [
     {
       "name": "solid",
       "physics": {
         "mass": 2900.0, "density": 2900.0, "break_force": 3200.0,
-        "attachment": 1.0, "permeability": 0.0, "albedo": 0.12,
+        "permeability": 0.0, "albedo": 0.12,
         "translucence": 0.0, "emission": 0.0, "solidity": 1.0,
-        "sandbox_dynamic": false
+        "sandbox_dynamic": false,
+        "structural_class": "rock",
+        "strength_anchors": [74, 7, 4],
+        "priors": { "analog": "rock", "C": 120.0, "T": 12.0 }
       },
       "look": {
         "swatch": [0.20, 0.19, 0.22, 1.0],
@@ -384,9 +420,12 @@ is a non-issue). Top-level:
     {
       "name": "molten",
       "physics": { "mass": 2650.0, "density": 2650.0, "break_force": 50.0,
-                   "attachment": 0.1, "permeability": 0.6, "albedo": 0.05,
+                   "permeability": 0.6, "albedo": 0.05,
                    "translucence": 0.1, "emission": 4.0, "solidity": 0.8,
-                   "sandbox_dynamic": false },
+                   "sandbox_dynamic": false,
+                   "structural_class": "rock",
+                   "strength_anchors": [4, 1, 1], "anchors_override": true,
+                   "priors": { "analog": "rock", "C": 6.0, "T": 0.5 } },
       "look": { "swatch": [0.95, 0.35, 0.05, 1.0],
                 "texture": "tex:sha256:77b0…e02",
                 "tint": [1.0, 1.0, 1.0, 1.0], "glow": 3.0 },
@@ -407,6 +446,43 @@ resource's default), each `transitions[j]` → `VoxelStateTransition`
 §6.3). `VoxelState.block_id` is **not** serialized — it *is* the LRID,
 assigned at registration; a document never contains dense ids.
 
+**Structural-integrity fields (physics block; `docs/INTEGRATION-DECISIONS.md`
+Decision A).** The gameplay-facing strength truth is stored, not derived at
+runtime:
+
+* `strength_anchors: [P, H, D]` — the anchor triple (max pillar height, max
+  horizontal shelf, max dangling depth; three small ints, SI §7). This is what
+  the solver calibrates against; `σ_c/σ_t/σ_s` and joint capacities are
+  **computed** from anchors + mass, never stored.
+* `structural_class` — a StringName selecting the converter branch and
+  `κ_class` (e.g. `"rock"`, `"timber"`, `"brittle"`, `"soil"`, `"granular"`,
+  `"fluid"`, `"bedrock"`).
+* `priors` — the physical priors `(analog, C [MPa], T [MPa])` for stress-governed
+  materials, or `cohesion c [kPa]` for soils. Retained as **provenance** so
+  anchors can be re-proposed if mass is rebalanced; they feed the offline
+  converter (INTEGRATION-DECISIONS §1.2/§1.3) that *proposes* anchors.
+* `anchors_override: bool` (optional, default `false`) — set `true` when the
+  stored anchors are hand-tuned away from the converter's proposal (molten,
+  above). `verify_feature.gd`'s **drift gate** asserts
+  `propose_anchors(priors, class) == strength_anchors` for every record **not**
+  so flagged, keeping priors and anchors from silently diverging.
+* `attachment: float` — the **joint participation multiplier** (SI §7 /
+  INTEGRATION-DECISIONS §1.4), *not* a strength. Default `1.0` (composed as
+  `att_A · att_B` on tension/shear/moment capacities only — never the
+  compression path); it **appears in the document only when ≠ 1.0**, and in v1
+  is non-default solely for `sand`/`gravel` (`0.0`, so undercut granular cells
+  do not hang). The old scalar `A` (0..1) column from WGC §3.4 is superseded and
+  is *not* this field.
+
+**State/appearance keys (top level; VDS §10.3).** `state_layout` (an ordered
+list of `{name, bits}` packed LSB-first, default `[]`), `visual_mask` (which
+state bits affect appearance, default `0`), and `has_block_entity` (whether
+cells of this material may carry metadata, default `false`) are
+forward-compatible: old documents omit them and keep their GMIDs; old engines
+ignore them (§2.2 hash-over-bytes is unaffected). Basalt above declares the
+trivial defaults; a facing/lit machine would populate `state_layout` and
+`visual_mask` per VDS §10.3.
+
 Validation on ingest (before registration): schema version supported, ≥1
 state, `default_state` exists, transition targets exist, all numerics finite,
 `mass > 0` for `solidity > 0` states, states count sane (cap: 16). A document
@@ -414,6 +490,14 @@ failing validation is rejected whole (→ requester keeps/creates the
 UNRESOLVED placeholder for its GMID, §8) — never half-registered.
 
 ### 5.3 Texture references (seam with the textures workstream)
+
+> **Future work (INTEGRATION-DECISIONS §D):** the content-addressed
+> `tex:<algo>:<hash>` scheme and the async `TextureStore` described below are a
+> **forward seam owned by the textures workstream**, not this milestone. The
+> **static** texture pipeline stands for now (CC0 pack → deterministic bake →
+> committed `pack/<name>.png` → `BlockTextures.TILES`, `docs/TEXTURES.md`); the
+> stable material-name file keys it uses are exactly what a content-addressed
+> store will hash, so nothing here needs to change to adopt it later.
 
 `look.texture` is a content-addressed asset id, format
 `tex:<algo>:<hash-hex>` (assumed `sha256`; **flagged assumption** — the
@@ -500,17 +584,23 @@ VoxelState through the catalog like everyone else; still no special-casing.)
 
 ### 6.5 The generator manifest (gating rule for worldgen)
 
-The runtime-compiled module generator (and `TerrainConfig.generated_block`)
-emit ids for terrain/trees. Rule: **a generator declares its material
-manifest — the exact LRID set it may emit — and `WorldManager` activates the
-render path only after that manifest is registered *and* baked.** Today the
-manifest is the bootstrap set (trivially satisfied in `_ready`). When
-WORLDGEN-CATALOG lands its worldgen (hundreds of materials), its biome
-generator declares them and they stream+bake once before terrain starts —
-"no fixed library at start" means *no library baked before its manifest is
-known*, not "terrain may reference materials that aren't loaded".
-*Assumption flagged for WORLDGEN-CATALOG: worldgen materials are enumerable
-per-generator (per-biome-set) ahead of chunk generation.*
+The runtime-compiled module generator (and `TerrainConfig.generated_cell`)
+emit enriched cells for terrain/trees. Rule: **a generator declares its
+appearance manifest — the exact set of `(material, modifier)` pairs it may emit
+(not just the bare material set) — and `WorldManager` activates the render path
+only after that manifest is registered *and* baked** (so every ARID the
+generator can produce, VDS §8.1, exists before the voxel worker can reference
+it). Today the manifest is the bootstrap set of plain cubes (trivially satisfied
+in `_ready`). When WORLDGEN-CATALOG lands its worldgen (hundreds of materials)
+and SUB-VOXEL lands terrain smoothing (surface cells carry modifiers, VDS §4.2),
+its biome generator declares the full `(material, modifier)` appearance set and
+they stream+bake once before terrain starts — "no fixed library at start" means
+*no library baked before its appearance manifest is known*, not "terrain may
+reference appearances that aren't baked". Extends VDS §8.3's appearance-manifest
+gate.
+*Assumption flagged for WORLDGEN-CATALOG: worldgen appearances — materials ×
+the smoothing shapes they emit — are enumerable per-generator (per-biome-set)
+ahead of chunk generation.*
 
 ---
 
@@ -579,8 +669,8 @@ is: restart — a mid-session full renumber is designed out on purpose).
 | **Late resolution** | When real bytes arrive, validate → fill the *existing* LRIDs in place (states matched by name; document states not referenced by any id-map get fresh LRIDs). Physics updates live; look updates via texture swap. No remesh needed — model geometry (cube) is unchanged. |
 | **Document fails validation / hash mismatch** (bytes don't hash to the requested GMID) | Reject whole; stay UNRESOLVED; log with both hashes. Never trust a peer's claimed GMID — always re-hash received bytes. |
 | **Texture missing/slow** | §5.3: swatch-tinted placeholder, swap-in on arrival. |
-| **`add_model` returns index ≠ LRID** (library-order drift) | Assert/crash in dev; in release: push_error + hard-disable further streaming (frozen library is safe; drifted library recolours the world — worse). |
-| **LRID painted before bake** (gating bug) | F5: invisible cell, no crash. Detected by a debug check in `_paint_cell` (`can_render_id`); repaired by re-painting the cell after the batch bake. |
+| **`add_model` returns index ≠ ARID** (library-order drift; ARID per VDS §8.1) | Assert/crash in dev; in release: push_error + hard-disable further streaming (frozen library is safe; drifted library recolours the world — worse). |
+| **Cell painted before bake** (gating bug) | F5: invisible cell, no crash. Detected by a debug check in `_paint_cell` (`can_render_cell`); repaired by re-painting the cell after the batch bake. |
 | **Library full** (65,536) | Loader refuses registration (loud); placeholder path keeps data lossless. Practically unreachable (§7.4). |
 | **Two documents, same alias** | Irrelevant — aliases are display-only (§2.2). |
 | **Same document loaded twice / from two zones** | Same bytes ⇒ same GMID ⇒ idempotent registration ⇒ same LRIDs. Free dedup. |
@@ -590,11 +680,15 @@ is: restart — a mid-session full renumber is designed out on purpose).
 ## 9. Interactions & flagged assumptions (sibling seams)
 
 ### 9.1 Structural integrity (`docs/STRUCTURAL-INTEGRITY.md`)
-Durability/attachment parameters ride in the document's `physics` block —
-`VoxelState` already exports `break_force`/`attachment`, so streaming carries
-whatever fields that design adds, as long as they live on VoxelState (assumed)
-and are plain numerics (assumed). `sandbox_dynamic` (§4.2) should be ratified
-there. **No impact on the id model.**
+Structural parameters ride in the document's `physics` block (§5.2, ratified by
+`docs/INTEGRATION-DECISIONS.md` Decision A): `strength_anchors: [P,H,D]`,
+`structural_class`, optional `anchors_override`, the `priors` provenance block,
+and `attachment` (the joint participation multiplier, §1.4 — *not* a durability
+scalar). `VoxelState` exports these as plain numerics, so streaming carries them
+unchanged; `break_force` stays the tool-facing mining-effort number (SI §4
+orthogonality). `sandbox_dynamic` (§4.2) is ratified there. The offline anchor
+converter and the drift gate live in tooling/`verify_feature.gd`, not in this
+load path. **No impact on the id model.**
 
 ### 9.2 Minecraft-parity catalog (`docs/WORLDGEN-CATALOG.md`)
 Assumed: (a) it emits its hundreds of materials as §5.2 documents (it is the
@@ -615,12 +709,14 @@ receivers MUST re-hash), signing/trust.
 Assumed: `tex:<algo>:<hash>` ids (§5.3), the 3-member TextureStore contract,
 and LRU + placeholder ownership living there. This design's only hard need:
 **texture identity is content-addressed and texture delivery is async and
-main-thread.**
+main-thread.** Per INTEGRATION-DECISIONS §D this content-addressed store +
+async `TextureStore` are **future** work owned by that workstream; the static
+pipeline (`docs/TEXTURES.md`) is the current milestone.
 
 ### 9.5 Sub-voxel (`docs/SUB-VOXEL-SMOOTHING.md`)
-§4.5: material id ≠ shape; shape payload is separate; any per-shape blocky
-models live in a reserved library band above the material LRIDs and never
-appear in serialized data.
+§4.5: material id ≠ shape; shape payload is separate; per-shape blocky models
+are **ARIDs** in the one append-only model space (VDS §8.1 — the reserved-band
+model is superseded) and never appear in serialized data.
 
 ---
 
@@ -635,9 +731,10 @@ store (bytes in `user://materials/<gmid>`). Verify: all existing
 `verify_feature.gd` green (bootstrap LRIDs == old consts).
 
 **Phase 2 — Runtime library growth (module path)**
-`grew` signal → `append_models_up_to` + batched `bake()` (§3.1); `can_render_id`
-on both paths + gate in `_paint_cell`/`place_block`; runtime library-order
-assert. Verify: register a synthetic material mid-run, place/break/collapse it
+`grew` signal → `append_models_up_to` + batched `bake()` (§3.1);
+`can_render`/`can_render_cell` on both paths + gate in `_paint_cell`/`place_block`;
+runtime library-order assert (`add_model() == ARID`). Verify: register a synthetic
+material mid-run, place/break/collapse it
 on **both** paths headlessly.
 
 **Phase 3 — Containers: id-map save/load**
@@ -668,13 +765,14 @@ Add, following the existing `_ok()` pattern (each phase lands its block):
    twice → identical `PackedInt32Array` both times; `count()` unchanged after
    the second.
 3. **Runtime library-order invariant (module path only, skipped on fallback):**
-   for each newly registered state, the module's appended model index == LRID
-   (surface the assert's result to the test), and `can_render_id(lrid)` flips
+   for each newly appended model, the module's returned model index == the
+   allocated ARID (VDS §8.1; == LRID for the bootstrap cube set) — surface the
+   assert's result to the test — and `can_render_cell(mat, 0, 0)` flips
    false→true across the batch bake.
 4. **Bake batching:** register N=32 materials in one frame → module bake
    counter increments by exactly 1.
 5. **Live loop with a streamed material:** register synthetic "testium"
-   (mass 1234), `place_block` succeeds only after `can_render_id`;
+   (mass 1234), `place_block` succeeds only after `can_render_cell`;
    `block_id_at` returns its LRID; `break_terrain` returns it; a spawned
    VoxelBody of it has `mass == 1234`; hotbar name/colour read through the
    catalog.
@@ -708,13 +806,16 @@ Add, following the existing `_ok()` pattern (each phase lands its block):
 * **Library-order drift.** The single deadliest failure inherited from today
   (a swap silently recolours the world). Countered by: single main-thread
   loader as the only writer to both append-only sequences, the runtime
-  `add_model() == LRID` assert, and streaming hard-disable on violation (§8).
-  Residual risk: a *future* contributor adding a model to the library outside
-  the loader (e.g. a sub-voxel shape model interleaved mid-band) — hence the
-  reserved-upper-band rule in §4.5; the assert catches it in dev.
+  `add_model() == ARID` assert (VDS §8.1), and streaming hard-disable on
+  violation (§8). Residual risk: a *future* contributor adding a model to the
+  library outside the loader (e.g. a sub-voxel shape model) — now bounded by the
+  ARID discipline (VDS §8.1 supersedes §4.5's reserved-upper-band model: shape/
+  visual-state models interleave in the one append-only model space, each with
+  `add_model() == ARID` asserted); the assert catches an out-of-band append in
+  dev.
 * **Chunk meshed before its material loads.** Cannot happen from worldgen
   (generator manifest gate, §6.5) or from edits/zones (paint gate on
-  `can_render_id`, §3.1). If a gating bug ships anyway, F5 bounds the damage
+  `can_render_cell`, §3.1). If a gating bug ships anyway, F5 bounds the damage
   at invisible cells + a logged error, repaired by local repaint — never a
   crash, never wrong-material rendering.
 * **Web thread starvation.** The two hazards: (1) bake holding the write lock
@@ -767,8 +868,13 @@ Add, following the existing `_ok()` pattern (each phase lands its block):
    container-local.** (Pattern validated by upstream `VoxelBlockyTypeLibrary`,
    F8.)
 4. **Module path grows one live library: append + batched full re-bake**,
-   guarded by the runtime `model index == LRID` assert and the
-   `can_render_id` paint gate. No pre-allocated ranges, no library swaps.
+   guarded by the runtime `add_model() == ARID` assert (VDS §8.1) and the
+   `can_render_cell` paint gate on the composed appearance. No pre-allocated
+   ranges, no library swaps. The append+batched-bake mechanics and all bake-cost
+   analysis (§3, §7.2) are **unchanged** by the ARID model — they now simply
+   cover appearance-model appends (one model per used `(material, modifier,
+   visual-state)` combo) rather than one model per LRID; a bake still re-bakes
+   the whole library once per arrival burst, cost O(models). (VDS §13.2.6.)
 5. **Per-LRID Material instances are stable; textures swap in-place** — one
    mechanism serves async texture arrival, placeholder degradation, and
    far-zone eviction, with zero rebake/remesh on all three, on both render

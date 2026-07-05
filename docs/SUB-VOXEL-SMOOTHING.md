@@ -144,71 +144,106 @@ occupancy function; the encoding reserves bits for that (§3).
 `WorldManager.block_id_at(cell)` stays THE cell query (rule 1) — but the
 canonical cell **value** becomes a packed 64-bit GDScript int, and
 `block_id_at` returns its low bits. There is still exactly *one* composed
-overlay-else-generated query; material and shape are two projections of it, so
-they can never disagree.
+overlay-else-generated query; material, modifier and state are projections of
+it, so they can never disagree.
 
-Bit layout (`ShapeCodec` constants; 25 bits used of 64):
+Bit layout — shape+anchor no longer live in the packed cell int's high bits;
+they move onto the separate 16-bit **modifier axis** (`VOXEL-DATA-STRUCTURE.md`
+§3.2, which supersedes this section — see the banner). The full cell value is
+VDS §3.3's three scalar axes packed into one 64-bit int:
 
 ```
-bits  0..15   material/block id        (BlockCatalog id; 16 bits)
-bits 16..23   corner heights           (c00 | c10<<2 | c11<<4 | c01<<6, each 0..2)
-bit  24       anchor                   (0 = BOTTOM, 1 = TOP)
-bits 25..31   reserved                 (future: reinforcement, damage, 3rd family)
+cell value:  MATERIAL LRID [bits 0..15] | MODIFIER [bits 16..31] | STATE [bits 32..47]
+
+modifier field (16 bits, VDS §3.2 — FAM 0 = the corner-height family below):
+ bit  15      FAM        0 = corner-height family; 1 = reserved future family
+ bits 9..14   reserved = 0
+ bit  8       ANC        anchor (0 = BOTTOM, 1 = TOP)
+ bits 0..7    corner heights   (c00 | c10<<2 | c11<<4 | c01<<6, each 0..2)
 ```
 
-Semantics and normalization (enforced by `ShapeCodec.canonical(v)` at every
-write — generator output, `place_block`, collapse capture):
+Future work relocation (was "bits 25..31 reserved"): future shape families use
+the **FAM** bit (modifier bit 15); scalar per-cell stats (damage, growth) belong
+on the **state axis** (VDS §3.2), *not* here; per-joint reinforcement stays in
+the structural model's `_joint_mods` store (STRUCTURAL-INTEGRITY §7), outside
+all four axes.
 
-* **Shape field 0 (all corners 0, anchor 0) means FULL CUBE.** Every existing
+Semantics and normalization (enforced by `CellCodec.canonical(v)` at every
+write — generator output, `place_block`, collapse capture — the packing half of
+the old `ShapeCodec`, migrated per item #4 below; the rules below now apply to
+the **modifier field**, verbatim from the original shape-field design):
+
+* **Modifier field 0 (all corners 0, anchor 0) means FULL CUBE.** Every existing
   plain id already stored in `_edits`, produced by `generated_block`, or held in
   `VoxelBody.cells` is therefore already a valid packed value meaning "full cube
   of that material" — zero migration, zero behaviour change.
-* Whole value 0 = AIR (air never carries a shape).
-* All-corners-0 with a nonzero shape-field encoding is normalized to AIR; a
-  BOTTOM shape with all corners 2 is normalized to shape 0 (FULL). TOP anchor
-  with all corners 2 normalizes to FULL too. This keeps every geometric shape a
-  *unique* int (needed for equality tests and the mesher keying).
+* Whole value 0 = AIR (air never carries a modifier or state).
+* All-corners-0 with a nonzero modifier encoding is normalized to AIR; a
+  BOTTOM shape with all corners 2 is normalized to modifier 0 (FULL). TOP anchor
+  with all corners 2 normalizes to FULL too. Corner value 3 (the 2-bit slot
+  permits it) clamps to 2 at write. This keeps every geometric shape a *unique*
+  modifier int (needed for equality tests and the mesher keying).
+* **A non-solid material may not carry a shape** (merged analytic-physics
+  contract, INTEGRATION-DECISIONS §3): `modifier != 0` requires
+  `BlockCatalog.solidity_of(mat) >= 0.5`; a violation (e.g. a "ramp of water")
+  strips to modifier 0 and logs a validation error. This guarantees the material
+  gate may soundly ignore modifiers on non-solid cells.
 
-New/changed API (all in `WorldManager` + a new `src/world/shape_codec.gd`):
+New/changed API. **`ShapeCodec` splits in two** (VDS §13.1.2): the
+packing/projection half migrates to **`CellCodec`** (operates on the 64-bit
+packed cell value, VDS §3.3); the geometry/physics *math* half stays in
+**`ShapeCodec`**, re-keyed to take a **16-bit modifier** instead of the old
+9-bit shape field.
 
 ```gdscript
-# ShapeCodec (static, pure — the single source of shape math)
-static func mat(v: int) -> int:            return v & 0xFFFF
-static func shape(v: int) -> int:          return (v >> 16) & 0x1FF
-static func pack(mat: int, shape: int) -> int
-static func canonical(v: int) -> int
-static func corners(v: int) -> Vector4i    # (c00, c10, c11, c01), FULL -> (2,2,2,2)
-static func is_full(v: int) -> bool        # shape field == 0
-static func volume(v: int) -> float        # §6
-static func local_top(v: int, fx: float, fz: float) -> float      # §5
-static func occupied(v: int, fx: float, fy: float, fz: float) -> bool
-static func side_profile(v: int, face: int) -> Vector3i           # §7 (anchor, e0, e1)
-static func contact_area(v_a: int, v_b: int, axis: int) -> float  # §7
+# CellCodec (static, pure — packing/projection; VDS §3.3 is authoritative)
+static func mat(v: int) -> int:       return v & 0xFFFF
+static func modifier(v: int) -> int:  return (v >> 16) & 0xFFFF
+static func state(v: int) -> int:     return (v >> 32) & 0xFFFF
+static func pack(mat: int, modifier := 0, state := 0) -> int
+static func canonical(v: int) -> int  # air-zeroing + modifier canonical form + state validation
+static func is_plain(v: int) -> bool  # (v >> 16) == 0 -> full cube, state 0
+
+# ShapeCodec (static, pure — the shape MATH, re-keyed to a 16-bit modifier)
+static func corners(m: int) -> Vector4i    # (c00, c10, c11, c01), FULL(0) -> (2,2,2,2)
+static func is_full(m: int) -> bool        # modifier field == 0
+static func volume(m: int) -> float        # §6
+static func local_top(m: int, fx: float, fz: float) -> float      # §5
+static func occupied(m: int, fx: float, fy: float, fz: float) -> bool
+static func span(m: int, fx: float, fz: float) -> Vector2         # §5 occupancy interval
+static func side_profile(m: int, face: int) -> Vector3i           # §7 (anchor, e0, e1)
+static func contact_area(m_a: int, m_b: int, axis: int) -> float  # §7
+static func surface_tris(m: int) -> Array                         # §5.3 (1–2 planes)
 
 # WorldManager
-func cell_value_at(cell: Vector3i) -> int:      # THE query (packed)
+func cell_value_at(cell: Vector3i) -> int:      # THE query (packed, VDS §3.3)
     var e: int = _edits.get(cell, -1)
     if e >= 0: return e
     return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
 
 func block_id_at(cell: Vector3i) -> int:        # unchanged contract: material id
-    return ShapeCodec.mat(cell_value_at(cell))
+    return CellCodec.mat(cell_value_at(cell))
 
-func cell_solid(cell: Vector3i) -> bool:        # unchanged: any material present
-    return block_id_at(cell) != BlockCatalog.AIR
+func cell_solid(cell: Vector3i) -> bool:        # merged contract: material-solidity gate
+    return BlockCatalog.solidity_of(block_id_at(cell)) >= 0.5   # INTEGRATION-DECISIONS §3
 ```
+
+`cell_solid` is now **material-only**: a ramp cell IS solid — partial geometry
+is expressed by the interval functions (§5), never by this boolean. See
+INTEGRATION-DECISIONS §3 for the normative composition (material gate, then
+shape) shared with the worldgen-catalog workstream.
 
 `_edits` stores packed values (0 = dug air, as today). `TerrainConfig` gains
 `generated_cell(x,y,z) -> int` (packed); `generated_block` remains as
-`ShapeCodec.mat(generated_cell(...))` for existing callers.
+`CellCodec.mat(generated_cell(...))` for existing callers.
 
 Call sites that must mask (audit list — everything else keeps calling
 `block_id_at` and is untouched by construction): `place_block` id validation
-(validate `ShapeCodec.mat`, store canonical packed), `break_terrain` return
+(validate `CellCodec.mat`, store canonical packed), `break_terrain` return
 (return material for the hotbar, volume separately — §9),
-`VoxelBody._has_wood` / mass loop / mesh keying (mask for material, read shape
-for geometry), `chunk_mesher._cell_id` (already material via `block_id_at`),
-module `set_cell` (translate packed → library id, §4.1).
+`VoxelBody._has_wood` / mass loop / mesh keying (mask for material, read the
+modifier for geometry), `chunk_mesher._cell_id` (already material via
+`block_id_at`), module `set_cell` (translate packed → ARID, §4.1).
 
 ### 3.2 Rejected alternatives
 
@@ -251,33 +286,37 @@ models (supported in the pinned godot_voxel v1.4.1 — it is the mechanism the
 module ships for stairs-like non-cube blocky models; built via ClassDB strings
 exactly like `VoxelBlockyModelCube` today, then `library.bake()`).
 
-* **Library layout (dense, derived, asserted):** model id
-  `lib_id(mat, shape_index) = 1 + (mat − 1) * S + shape_index`, where
-  `shape_index` 0 = FULL (a `VoxelBlockyModelCube`, exactly today's model) and
-  1..S−1 enumerate the 161 partial codes in a fixed canonical order owned by
-  `ShapeCodec`. `S = 162`. With 5 materials that is 811 models — well inside the
-  16-bit TYPE channel (no `VoxelBuffer` depth change), and bake cost is trivial
-  (each model ≤ ~10 triangles). The mapping and its inverse live *only* in
-  `ShapeCodec.lib_id(v)` / `ShapeCodec.from_lib_id(id)` and are
-  roundtrip-asserted at setup (same style as today's `_add_cube` id assert) —
-  this remap is the one place the module path could diverge, so it is fenced by
-  verify (§10).
+* **Library layout (lazy ARIDs, not a product formula):** the earlier
+  `lib_id(mat, shape) = 1 + (mat − 1)·S + shape` product mapping — with its
+  `S = 162` models-per-material pre-bake and ~404-material cap — is **deleted**
+  (superseded by VDS §8.1; see banner). Partial shapes are instead registered as
+  **ARIDs** (Appearance Render IDs): a session-local, append-only,
+  lazily-allocated id per `(LRID, modifier, state & visual_mask)` combination
+  *actually in use*, equal by construction to its `VoxelBlockyLibrary` model
+  index. The plain-cube ARID is allocated eagerly at material registration
+  (exactly today's cube model); shaped ARIDs are appended **lazily on first use**
+  (generator manifest, `place_block`, `set_cell`) as `VoxelBlockyModelMesh` built
+  from `ShapeMesh`, riding the existing batched `bake()`. Capacity is bounded by
+  shapes-*in-use* (thousands), not by a `material × 162` product.
+  **Anti-drift invariant:** `add_model()`'s returned index must equal the ARID
+  being allocated, asserted at every append (the streaming library-order-drift
+  guard, generalized) — this is the one place the module path could diverge, so
+  it is fenced by verify (§10). ARIDs never serialize; material identity (LRID)
+  is untouched.
 * **Generator:** the runtime-compiled `VoxelGeneratorScript` calls
-  `TerrainConfig.generated_cell` and writes `ShapeCodec.lib_id(...)` into the
-  TYPE channel (today it writes the raw id, which equals `lib_id(mat, FULL)` by
-  the layout above — flat ground produces byte-identical buffers to today).
-* **`set_cell`:** translate the packed value through `ShapeCodec.lib_id` before
+  `TerrainConfig.generated_cell` and writes the **ARID** for that
+  (material, modifier) into the TYPE channel via the manifest-frozen appearance
+  table (VDS §8.1/§8.3). Bootstrap materials register first in const order, so
+  ARIDs 1..5 == LRIDs 1..5 == today's model ids and a flat all-cube world still
+  produces byte-identical TYPE buffers to today.
+* **`set_cell`:** resolve the packed value's (material, modifier, visual-state)
+  to its ARID — allocating lazily on the main thread if unseen — before
   `VoxelTool.set_voxel`.
 * Face culling between partial neighbours uses godot_voxel's baked side-pattern
   matching (the same machinery that culls stairs). It culls a side only when the
   neighbour's side pattern fully covers it; partially-covered pairs keep both
   faces (hidden overdraw inside slopes — cosmetically invisible, noted as
   accepted cost).
-* **SEAM (streaming):** the module TYPE channel now carries `mat × shape`
-  products. 16-bit caps at ~404 materials × 162 shapes. If
-  RUNTIME-MATERIAL-STREAMING introduces per-chunk local palettes for the module
-  path, palette entries must be (local material, shape) pairs *or* the TYPE
-  channel widened to 32-bit; either works, but it must be decided in that doc.
 
 ### 4.2 GDScript fallback (`chunk_mesher.gd`)
 
@@ -335,10 +374,14 @@ Revisit only if the art direction changes to organic terrain.
 
 ## 5. Analytic physics (stays analytic)
 
-The whole point: no trimesh, closed form, identical across paths. The key
-property of the corner-height family (both anchors) is **columnar occupancy** —
-at any footprint point `(fx, fz)` inside a cell, the filled set is a single
-vertical interval:
+The whole point: no trimesh, closed form, identical across paths. **These
+functions implement the merged analytic-physics contract normative in
+INTEGRATION-DECISIONS §3: the material-solidity gate (`solidity_of ≥ 0.5`)
+is applied FIRST — a non-solid material (air/water/lava/powder_snow) yields the
+empty occupancy span and its modifier is ignored everywhere — and only then does
+the shape test run.** The key property of the corner-height family (both
+anchors) is **columnar occupancy** — at any footprint point `(fx, fz)` inside a
+*solid* cell, the filled set is a single vertical interval:
 
 ```
 BOTTOM:  [0, H(fx,fz)]            TOP:  [1 − H(fx,fz), 1]         FULL: [0,1]
@@ -346,12 +389,17 @@ BOTTOM:  [0, H(fx,fz)]            TOP:  [1 − H(fx,fz), 1]         FULL: [0,1]
 
 where `H(fx,fz)` interpolates the corner heights (in blocks, = c/2) linearly on
 the triangle containing `(fx,fz)` under the §2 diagonal rule. Everything below
-derives from three per-cell functions on `ShapeCodec`:
+derives from three per-cell functions on `ShapeCodec` (re-keyed to the 16-bit
+modifier, §3.1/#4), composed with the material gate via the one helper both
+workstreams implement against (INTEGRATION-DECISIONS §3):
 
 ```gdscript
-local_top(v, fx, fz)     # walkable top at that footprint: BOTTOM -> H; TOP -> 1.0 if H > 0 else 0.0; FULL -> 1
-occupied(v, fx, fy, fz)  # point-in-fill: interval test above
-span(v, fx, fz)          # the (lo, hi) occupancy interval, for headroom checks
+# _occ_span(v, fx, fz): the composition — material gate, then shape.
+#   return Vector2.ZERO if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5
+#   else ShapeCodec.span(CellCodec.modifier(v), fx, fz)      # modifier 0 -> (0,1)
+local_top(m, fx, fz)     # walkable top at that footprint: BOTTOM -> H; TOP -> 1.0 if H > 0 else 0.0; FULL -> 1
+occupied(m, fx, fy, fz)  # point-in-fill: interval test above
+span(m, fx, fz)          # the (lo, hi) occupancy interval, for headroom checks
 ```
 
 ### 5.1 `floor_under(x, z, feet_y)` — ramps become continuous floors
@@ -365,14 +413,17 @@ func floor_under(x, z, feet_y) -> float:
     y = floori(feet_y + 0.5)
     while y > -1024:
         v = cell_value_at(Vector3i(xi, y, zi))
-        t = ShapeCodec.local_top(v, fx, fz)
+        if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5:   # material gate first
+            y -= 1; continue                                   # water/air scanned THROUGH (-> seafloor)
+        t = ShapeCodec.local_top(CellCodec.modifier(v), fx, fz)
         if t > 0.0 and _headroom_clear(xi, zi, fx, fz, y + t):
             return float(y) + t
         y -= 1
     return surface fallback (unchanged)
 ```
 
-`_headroom_clear` checks that the occupancy intervals of the cells overlapping
+`_headroom_clear` checks that the occupancy intervals (via `_occ_span`, so
+non-solid cells contribute the empty span) of the cells overlapping
 `[floor, floor + 1.8]` at `(fx, fz)` are empty in that range (a TOP-anchored
 slab two cells up correctly blocks standing; the *same* ramp cell whose top you
 stand on trivially passes since its interval ends at the floor). As the player
@@ -396,6 +447,9 @@ func blocked(x, z, feet_y) -> bool:
     return not _headroom_clear(floori(x), floori(z), frac(x), frac(z), top)
 ```
 
+Because it composes over the merged `floor_under`/`_occ_span`, the material gate
+comes for free: a non-solid cell (water/lava) yields the empty span, so it never
+blocks; a full cube still does; ramps auto-step (INTEGRATION-DECISIONS §3).
 The player then snaps feet to `floor_under` as it already does each frame, so
 crossing into a ramp cell raises the feet by ≤ slope × step ≈ 0.1 m/frame —
 smooth ascent with zero new player-side machinery beyond the constant.
@@ -404,8 +458,11 @@ cubes (rise 1.0) still block, exactly as today on flat/blocky ground.
 
 ### 5.3 `aimed_voxel` — DDA with an in-cell surface test
 
-The DDA cell walk is unchanged. On reaching a non-FULL, non-air cell, instead of
-"hit at the cell boundary", run a closed-form in-cell test. **Completeness
+The DDA cell walk is unchanged. Per cell the **material gate runs first**: a
+non-solid material (water/lava) is **skipped** — the DDA continues, so aiming
+targets *through* water (INTEGRATION-DECISIONS §3). On reaching a solid cell:
+modifier 0 ⇒ today's boundary hit (fast path); a solid non-FULL cell runs a
+closed-form in-cell test instead of "hit at the cell boundary". **Completeness
 argument:** every boundary face of a corner-height shape lies either *on* the
 cell's own boundary (sides, anchor face) — covered by testing occupancy at the
 ray's entry point `t_in` — or on the 1–2 surface triangles — covered by two
@@ -413,10 +470,12 @@ ray/plane tests. There are no other surfaces, so:
 
 ```gdscript
 func _ray_vs_partial(v, cell, origin, d, t_in, t_out) -> Dictionary:
+    # caller has already applied the material gate; a non-solid cell never reaches here
+    var m := CellCodec.modifier(v)
     p_in = origin + d * t_in - Vector3(cell)
-    if ShapeCodec.occupied(v, p_in.x, p_in.y, p_in.z):
+    if ShapeCodec.occupied(m, p_in.x, p_in.y, p_in.z):
         return hit at t_in, normal = the DDA face normal (unchanged contract)
-    for tri in ShapeCodec.surface_tris(v):          # 1 or 2 planes
+    for tri in ShapeCodec.surface_tris(m):          # 1 or 2 planes
         t = ray_plane(tri.plane, origin, d)
         if t_in <= t <= t_out and tri.contains_xz(origin + d * t - cell):
             return hit at t, voxel = cell,
@@ -433,23 +492,31 @@ naturally handles this because a miss just continues the walk.
 
 ### 5.4 `GroundCollider`
 
-Boxes stay for FULL cells. Partial cells within the collider radius contribute
-the same ≤ 2 convex prisms as VoxelBody cells (§4.3), so loose `VoxelBody`
-pieces rest/slide on ramps correctly. The *player* never touches these (player
-ground contact is `floor_under`/`blocked`, unchanged policy).
+Boxes stay for solid-material modifier-0 cells. Solid partial cells within the
+collider radius contribute the same ≤ 2 convex prisms as VoxelBody cells (§4.3),
+so loose `VoxelBody` pieces rest/slide on ramps correctly. Non-solid materials
+(water/lava/powder_snow) contribute **nothing** (material gate,
+INTEGRATION-DECISIONS §3). The *player* never touches these (player ground
+contact is `floor_under`/`blocked`, unchanged policy).
 
 ### 5.5 Collapse & support scan
 
-`_collapse_unsupported` keeps its flood fill, but adjacency between two solid
-cells requires `ShapeCodec.contact_area(vA, vB, axis) > AREA_EPS` (§7) instead
-of mere mutual solidity — a ramp resting its zero-height edge against a
-neighbour gives no support and correctly detaches. `AREA_EPS = 1/64` (see §11).
-**SEAM (structural integrity):** that doc owns what "support" means beyond
-binary connectivity (strength thresholds, mass-weighted attachment). Our
-deliverables into it are exactly: `contact_area(vA, vB, axis) ∈ [0,1]` (fraction
-of the shared face), `volume(v) ∈ (0,1]`, and `mass(v) = density × volume`. The
-collapse flood fill described here is the *interim* binary consumer; when the
-structural model lands, it replaces the predicate, not the geometry functions.
+`_collapse_unsupported` keeps its flood fill. Its graph nodes are `cell_solid`
+cells — i.e. `solidity_of(mat) ≥ 0.5`, so water/lava/powder_snow never enter the
+graph (merged contract, INTEGRATION-DECISIONS §3). Adjacency between two solid
+cells requires
+`ShapeCodec.contact_area(CellCodec.modifier(vA), CellCodec.modifier(vB), axis) > AREA_EPS`
+(§7) instead of mere mutual solidity — a ramp resting its zero-height edge
+against a neighbour gives no support and correctly detaches. `AREA_EPS = 1/64`
+(see §11). **SEAM (structural integrity):** that doc owns what "support" means
+beyond binary connectivity (strength thresholds, mass-weighted attachment); its
+joint capacities multiply this contact factor by material participation and
+temperature (INTEGRATION-DECISIONS §1.3/§3). Our deliverables into it are
+exactly: `contact_area(modifier_a, modifier_b, axis) ∈ [0,1]` (fraction of the
+shared face), `volume(modifier) ∈ (0,1]`, and
+`mass(v) = density × volume(modifier)`. The collapse flood fill described here
+is the *interim* binary consumer; when the structural model lands, it replaces
+the predicate, not the geometry functions.
 
 ---
 
@@ -655,9 +722,11 @@ same encoding.
   complements don't tile exactly under per-shape max-sum diagonals (§6), so
   everything else requires air, as today.
 * **Collapse / loose bodies:** the collapse pass captures packed values into
-  `comp_ids`; `VoxelBody` carries them, so a detaching slope chunk keeps its
-  ramp faces and its reduced mass (a broken ramp genuinely drops a
-  half-mass partial body — requirement 2 end-to-end). `VoxelBody.break_cell`
+  `comp_ids` — the full 64-bit cell value, so this now naturally carries the
+  material, the modifier **and** the state axis (VDS §3.3); `VoxelBody` carries
+  them, so a detaching slope chunk keeps its ramp faces and its reduced mass (a
+  broken ramp genuinely drops a half-mass partial body — requirement 2
+  end-to-end). `VoxelBody.break_cell`
   connectivity uses the same `contact_area > AREA_EPS` adjacency as the world
   collapse (one rule everywhere).
 * **Aiming:** the DDA already returns the sub-cell hit (§5.3); breaking targets
@@ -669,11 +738,14 @@ same encoding.
 
 New test funcs, same `_ok` pattern; all pure-logic + live WorldManager, headless:
 
-1. **`_test_shape_codec`** — for all 162 codes × a material:
-   `canonical(pack(...))` roundtrips; all-corners-0 → AIR; all-corners-2 BOTTOM
-   → FULL (shape field 0); plain legacy ids decode as FULL of that material;
-   `lib_id`/`from_lib_id` roundtrip for every (material, shape) pair (fences the
-   module remap, §4.1).
+1. **`_test_cell_codec`** — for all 162 modifier codes × a material:
+   `CellCodec.canonical(CellCodec.pack(...))` roundtrips; all-corners-0 → AIR;
+   all-corners-2 BOTTOM → FULL (modifier 0); plain legacy ids decode as FULL of
+   that material (modifier 0, state 0); `modifier != 0` on a non-solid material
+   strips to modifier 0 with a logged error (§3.1); the **ARID table**
+   roundtrips — `add_model()`'s returned index == the allocated ARID for every
+   (material, modifier) combination registered (fences the module append,
+   §4.1 / VDS §8.1).
 2. **`_test_partial_mass`** — `volume(FULL)=1`, `SLAB=½`, `RAMP=½` for all 4
    rotations, `CORNER=1/3` for all 4 rotations (the max-sum rule),
    `HALF_CORNER=1/6`; rotation invariance `V(rot(c)) == V(c)` over all codes ×
@@ -704,11 +776,12 @@ New test funcs, same `_ok` pattern; all pure-logic + live WorldManager, headless
    every generated corner code obeys the clamp range; tree-base columns are
    FULL-topped.
 6. **`_test_paths_agree`** — only one render path exists per binary, so path
-   agreement is asserted at the *shared sources*: the module generator writes
-   `lib_id(generated_cell(...))` (assert on a sample grid that decoding the
-   generator's buffer values reproduces `generated_cell` exactly), and both
-   meshers consume the same `ShapeMesh.build` (assert its vertex set for
-   canonical shapes matches the expected geometry table).
+   agreement is asserted at the *shared sources*: the module generator writes the
+   **ARID** of `generated_cell(...)` (assert on a sample grid that mapping each
+   ARID in the generator's buffer back through the appearance table reproduces
+   `generated_cell`'s (material, modifier) exactly), and both meshers consume the
+   same `ShapeMesh.build` (assert its vertex set for canonical shapes matches the
+   expected geometry table).
 
 ---
 
@@ -732,9 +805,10 @@ New test funcs, same `_ok` pattern; all pure-logic + live WorldManager, headless
 * **Encoding overflow / aliasing:** material must fit 16 bits — `place_block`
   masks before range-checking, `canonical()` rejects corner value 3 (2-bit slot
   allows it) by clamping at write. The one true divergence risk is the module
-  library remap (`lib_id`), which is why it is a pure `ShapeCodec` function with
-  an exhaustive roundtrip in verify and a setup-time assert (mirroring today's
-  `_add_cube` assert). Legacy `_edits` ints and `VoxelBody.cells` are valid
+  appearance remap — the `(LRID, modifier, visual_state) → ARID` allocation (VDS
+  §8.1), guarded by an `add_model() == ARID` assert at every append (generalising
+  today's `_add_cube` assert) plus an exhaustive `CellCodec`/`ShapeCodec`
+  roundtrip in verify. Legacy `_edits` ints and `VoxelBody.cells` are valid
   packed values by construction (shape 0 = FULL) — no migration path to get
   wrong.
 * **Path divergence:** every shape-dependent computation (geometry, volume,

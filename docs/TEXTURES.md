@@ -167,3 +167,8 @@ base tiles already in `src/` for the naturals that workstream is likely to add:
 - **Transparent blocks** (glass, leaves-with-cut-outs): the baker supports
   `keep_alpha`; the material would need alpha-scissor/transparency wired for the
   authentic see-through look (deferred to keep the web build robust).
+- **Content-addressed asset ids + async loading**: `tex:<algo>:<hash>` asset
+  ids and the async `TextureStore` contract (`request`/`ready`/`get_if_loaded`,
+  see `RUNTIME-MATERIAL-STREAMING.md` §5.3/§9.4) are this workstream's future
+  deliverable — the current static pack → bake → `BlockTextures.TILES`
+  pipeline stands as-is for this milestone.

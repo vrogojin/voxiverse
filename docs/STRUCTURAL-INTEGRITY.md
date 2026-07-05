@@ -156,12 +156,23 @@ and moment checks and `H+1` fails both. **The model reproduces 4/2/1 (dirt),
 ### 2.5 Deriving parameters for new materials (the self-serve method)
 
 This is the contract the Minecraft-parity catalog workstream
-(`docs/WORLDGEN-CATALOG.md`) consumes. For each new block:
+(`docs/WORLDGEN-CATALOG.md`) consumes. **Normative:** the anchor triple is
+*proposed by the pinned `(ρ, C, T) → (P, H, D)` converter* — the stress branch
+(`INTEGRATION-DECISIONS.md` §1.2, constants βc = log₂(16/9), βt = log₃2,
+k_s = 1.5, κ_brittle = ⅓) for stress-governed materials, and the soil/cohesion
+branch (§1.3, class-keyed) for `&"soil"` / `&"granular"`. That converter
+reproduces the §2.4 calibration (dirt 4/2/1, wood 36/24/16, stone 64/6/4)
+exactly, and a drift gate (§8) keeps stored anchors and priors from silently
+diverging. For each new block:
 
 1. Pick the block's mass `m` (kg per full voxel) as today.
-2. Pick an **anchor triple `(P, H, D)`** — three small integers with direct
-   in-game meaning ("how tall a pillar / long a shelf / deep a hanging
-   chain"). Use the archetype table as a starting point and tune per block:
+2. **Accept or tune the converter's proposal** for the **anchor triple
+   `(P, H, D)`** — three small integers with direct in-game meaning ("how tall
+   a pillar / long a shelf / deep a hanging chain"). The converter proposes from
+   the catalog priors; a designer may override any proposal (mark the record
+   `"anchors_override": true`, per INTEGRATION-DECISIONS §1.1). The archetype
+   table below is **guidance only** — a sanity band the proposals should land in,
+   no longer the derivation method:
 
    | archetype | (P, H, D) guidance | examples |
    |---|---|---|
@@ -174,9 +185,10 @@ This is the contract the Minecraft-parity catalog workstream
 
 3. Everything else is computed: `σ_c = P·m·g`, `σ_t = D·m·g`,
    `σ_s = H·m·g`, `M₀ = σ_s·H/2`.
-4. Pick a **structural class** (`&"soil"`, `&"rock"`, `&"timber"`,
-   `&"foliage"`, `&"metal"`, `&"brittle"`) selecting the temperature curve
-   φ (§4.1).
+4. Pick a **structural class** (`&"soil"`, `&"granular"`, `&"rock"`,
+   `&"timber"`, `&"foliage"`, `&"metal"`, `&"brittle"`) — it both selects the
+   temperature curve φ (§4.1) **and** chooses the converter branch (§1.2 vs
+   §1.3), never the input magnitude.
 
 Note the anchors are *per block*, not per density: a denser variant of the
 same archetype keeps its `(P, H, D)` and its absolute strengths scale with
@@ -233,9 +245,9 @@ Two mechanisms provide this, one explicit and one emergent:
 A joint exists between every pair of 6-adjacent solid cells. Its capacities:
 
 ```
-F_t(joint) = a · [ ½·(σ_t,A·φ_A(T) + σ_t,B·φ_B(T)) · k_R + R_t·φ_R(T) ]
-F_s(joint) = a · [ ½·(σ_s,A·φ_A(T) + σ_s,B·φ_B(T)) · k_R + R_s·φ_R(T) ]
-M₀(joint)  = a^(3/2) · [ ½·(M₀,A·φ_A(T) + M₀,B·φ_B(T)) · k_R + R_s·φ_R(T)·½ ]
+F_t(joint) = a · att_A·att_B · [ ½·(σ_t,A·φ_A(T) + σ_t,B·φ_B(T)) · k_R + R_t·φ_R(T) ]
+F_s(joint) = a · att_A·att_B · [ ½·(σ_s,A·φ_A(T) + σ_s,B·φ_B(T)) · k_R + R_s·φ_R(T) ]
+M₀(joint)  = a^(3/2) · att_A·att_B · [ ½·(M₀,A·φ_A(T) + M₀,B·φ_B(T)) · k_R + R_s·φ_R(T)·½ ]
 ```
 
 where:
@@ -245,7 +257,19 @@ where:
   each side's temperature factor applied *before* averaging so a wood–stone
   joint in a fire fails on the wood side's collapse, not on an averaged
   fiction. For same-material joints the mean degenerates to the material
-  value, so the §2 calibration is untouched.
+  value, so the §2 calibration is untouched. **The arithmetic-mean rule itself
+  is unchanged.**
+* `att_A`, `att_B` — the two materials' **joint participation multipliers**
+  (`VoxelState.attachment`, §7; default 1.0). Their product multiplies the whole
+  bracketed tension/shear/moment term — **never** the compression path
+  (down-edges stay capacity-∞; bearing is the node's σ_c). With every v1
+  material at 1.0 the entire §2 calibration is untouched; sand/gravel ship
+  `attachment = 0.0`, which forces `F_t = F_s = M₀ = 0` on *every* joint they
+  participate in — including a mixed sand–stone joint — closing the mixed-joint
+  falling-sand hole the arithmetic mean could not express on its own (the worked
+  failure — sand glued to a stone wall staying up nine times over — is in
+  INTEGRATION-DECISIONS §1.3). Sand heaps still stand via the compression path;
+  a sand column still crushes at `P`.
 * `T` — joint temperature = mean of `PerVoxelEnvironment.temperature()` at
   the two cell centres. `φ` — the temperature factor (§4.1).
 * `k_R`, `R_t`, `R_s`, `φ_R` — reinforcement (§4.2). Unreinforced:
@@ -302,6 +326,16 @@ surface temperature. Design:
   | metal | 1.0 | 400 | 1200 |
   | brittle (glass, ice) | ice: melts — its φ curve *is* its identity: φ=1 below −5 °C, ramp to φ_min at 0 °C | | |
 
+> **⚠ Frozen-sea dependency (SEAM, mirrors WGC's).** Ice's brittle φ curve
+> makes generated sea ice structurally sound **only below −5 °C**. But
+> `PerVoxelEnvironment` today reports ~21.5 °C everywhere, at which
+> `φ_brittle(21 °C) = φ_min = 0.05` renders a generated ice sheet tissue paper
+> (breaking one block would shed the surrounding sheet each event). **Ordering
+> constraint:** biome-keyed surface temperature (snowy < −5 °C) must land in
+> `PerVoxelEnvironment` *before* this pass 2 judges generated ice — or ice
+> worldgen ships after it does (INTEGRATION-DECISIONS §1.5 risk 3, edit D-24;
+> WORLDGEN-CATALOG §6.7/§11.9 carry the mirror SEAM).
+
 φ multiplies `σ_t`, `σ_s` and `M₀` (M₀ is derived from σ_s, so it scales
 once, with σ_s). `σ_c` is temperature-independent in v1 (the requirement
 names attachment only); flagged as a natural extension.
@@ -332,15 +366,20 @@ old); breaking either block deletes the joint's entry.
 
 Every joint capacity above carries the factor `a` = contact area fraction.
 For today's full blocks `a = 1` always. The sub-voxel partial-fill
-workstream (`docs/SUB-VOXEL-SMOOTHING.md`) plugs in here: partial cells have
-mass `density × fill_fraction` (they already own that) and their joints get
-`a` = the overlapping face area of the two partial shapes, with **`a = 0`
-(zero overlap) meaning no joint at all**. Force capacities scale linearly
-with `a`; moment capacity scales `a^(3/2)` (section modulus ∝ width×height²;
-shrinking both dimensions by √a gives a^{3/2}). **Assumption flagged:** the
-sub-voxel workstream exposes a
-`contact_area(cell_a, cell_b) -> float` query; until it lands, the solver
-hardcodes 1.0 behind one function.
+workstream (`docs/SUB-VOXEL-SMOOTHING.md`) plugs in here, **re-keyed to the
+modifier axis** per VDS §13.3: a partial cell's mass is
+`density(LRID) × ShapeCodec.volume(modifier)` (no separate `fill_fraction`
+field — the shape *is* the modifier), and the solver reads
+`contact_area(cell_a, cell_b, axis) -> float` — which resolves each cell's shape
+via `modifier_at` through WorldManager's composed cell query — as the
+overlapping face area of the two partial shapes across the joint's `axis`, with
+**`a = 0` (zero overlap) meaning no joint at all**. Force capacities scale
+linearly with `a`; moment capacity scales `a^(3/2)` (section modulus ∝
+width×height²; shrinking both dimensions by √a gives a^{3/2}). Per-joint
+reinforcement (`_joint_mods`, §7) is **not** absorbed into the modifier/state
+axes — it is per-face, not per-cell — and stays unchanged (VDS §13.3).
+**Assumption flagged:** until the sub-voxel workstream lands `contact_area`, the
+solver hardcodes 1.0 behind that one function.
 
 ---
 
@@ -511,13 +550,20 @@ does not re-enter the structural model; documented limitation §9).
   * new: `strength_anchors: Vector3i` — `(P, H, D)`; the σ's are computed,
     not stored (single source of truth = anchors + mass).
   * new: `structural_class: StringName` — selects the φ curve.
-  * `attachment: float (0..1)` — redefined as the *joint participation
-    multiplier* applied on top of the computed capacities (1.0 = normal;
-    0.0 = never forms joints, e.g. future sand). Default 1.0 keeps all
-    calibration intact.
-  * `solidity < 1` cells contribute their solidity as a default contact
-    area until the sub-voxel workstream provides a real query (§4.3).
+  * `attachment: float` — redefined as the *joint participation multiplier*
+    applied on top of the computed capacities (1.0 = normal; 0.0 = never forms
+    joints, e.g. sand/gravel — §4). Default 1.0 keeps all calibration intact;
+    stored only when ≠ 1.0.
   * `mass`, `density`, `break_force` unchanged in meaning.
+
+  Ratified as written above (`strength_anchors: Vector3i`, `structural_class`,
+  `attachment` = participation multiplier — INTEGRATION-DECISIONS §5 edit 28).
+  **The solver's "solid cell" predicate is `WorldManager.cell_solid`** (material
+  solidity ≥ 0.5, per Decision C in INTEGRATION-DECISIONS §3): §1's "every solid
+  cell is a node" formally means solidity ≥ 0.5, so `powder_snow`, `water` and
+  `lava` never enter the structural graph. Contact area is the modifier-axis
+  query (§4.3, VDS §13.3), superseding any per-cell `solidity`-as-contact-area
+  default.
 * **`BlockCatalog._make(...)`** gains `(anchors: Vector3i, sclass:
   StringName)` args; the §2.4 table lives there — this is the one place the
   MC-parity catalog extends.
@@ -558,11 +604,29 @@ become executable assertions:
   at the top joint (assert body with `D+1` cells).
 * **Mixed joint**: wood anchor block, hang stone beneath: 2 hold, 3rd
   falls (35 708 N vs 44 145 N — exact numbers in §4).
+* **Falling sand (participation, `attachment = 0.0`)**: (a) a single sand
+  block side-attached to a stone wall, then undercut → it **falls** (the
+  `att_A·att_B = 0` product zeroes the sand–stone joint the arithmetic mean
+  would otherwise keep glued — INTEGRATION-DECISIONS §1.3); (b) a sand heap on
+  solid ground **stands** (pure compression routing, participation never touches
+  the compression path); (c) a sand column of 4 **crushes its base**
+  (`P = 3`) → base cell air/crushed, ≥1 body spawned.
 * **Bracing**: 2×2 dirt pillar holds 10 courses, fails at 11.
 * **Temperature plateau**: assert `φ = 1` at 12 °C, 21.5 °C, 23 °C (deep
   mine == surface behaviour); assert `φ_soil(−10) = 3.0`,
   `φ_timber(300) = φ_min` via direct `StructuralModel` calls (no world
   needed — pure functions).
+* **Converter drift gate** (pure-math, no world): for every catalog record not
+  marked `"anchors_override": true`, assert
+  `StructuralModel.propose_anchors(priors, structural_class) == stored anchors`
+  — priors and shipped anchors can never silently diverge (INTEGRATION-DECISIONS
+  §1.1). This pins the round-half-up helper (dirt's `H` exists only because
+  1.5 → 2).
+* **Converter calibration anchors** (pure-math): assert the §1.2 table's three
+  pinned anchors reproduce exactly — stone `(C=100, T=10, rock) → (64, 6, 4)`,
+  wood/oak `(C=50, T=90, timber) → (36, 24, 16)`, dirt
+  `(c=25 kPa, soil) → (4, 2, 1)` — so the converter constants
+  (βc = log₂(16/9), βt = log₃2, k_s = 1.5) stay locked to §2.4.
 * **Reinforcement**: stone line with cement joints reaches 8 (vs 6 bare).
 * **Solver purity**: run the pillar test twice (both render paths if
   available) → identical detach sets (determinism / path-agnosticism).

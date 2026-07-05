@@ -177,24 +177,25 @@ and [Ore](https://minecraft.wiki/w/Ore) wiki pages):
   - mineral family: `mass = ρ_real × 0.556` (anchor: stone 2700→1500),
   - wood logs: `mass = ρ_real × 0.114` (anchor: oak 700→80),
   - organics/cryo/fluids: hand-placed on the same scale, ordering-checked in §10.
-- **Durability D** (the existing `break_force`, newtons) and **attachment A**
-  (0–1) must come from the ⚠SEAM structural-integrity derivation method. Until
-  that lands, the tables carry **provisional stand-ins** anchored to today's
-  values so nothing regresses:
-  - rock family: `D = 2500 · (C/100 MPa)^0.75` (anchor: stone C=100 → 2500 N),
-  - wood family: `D = 600 · (C∥/50 MPa)^0.75` (anchor: oak C∥=50 → 600 N),
-  - `A = clamp(T/10 MPa, 0.02, 1.0)` (anchor: stone T=10 → 1.0),
-  - soils don't fit a compressive prior (cohesion-dominated): hand values, and we
-    flag to the sibling that its method **needs a soil/cohesion branch**.
-  - Ores: host rock ± 10 % (D ×1.1, mass = host + mineral enrichment).
-  The **real contract** with the sibling is the *priors* columns (analog, ρ, C,
-  T) — recompute D/A with their method and only the two columns change.
-  - Note: today every block implicitly has `attachment = 1.0` (the `VoxelState`
-    default; `BlockCatalog._make` never sets it). This table assigns real values
-    (sand 0.05, glass 0.1, …). Attachment is currently **unread** by the collapse
-    pass (binary flood-fill), so this is data-only until the sibling consumes it
-    — but flagging: once consumed, sand/gravel columns will behave very
-    differently (they should — falling sand is the point).
+- **`break_force`** (newtons — the tool-facing "how hard to mine" number, which
+  STRUCTURAL-INTEGRITY §4 declares **orthogonal to structural strength**). The
+  `D` power-laws below are **retained solely as the `break_force` derivation** and
+  carry no structural reading (the letter *D* is now reserved for the dangle
+  anchor):
+  - rock family: `break_force = 2500 · (C/100 MPa)^0.75` (anchor: stone C=100 → 2500 N),
+  - wood family: `break_force = 600 · (C∥/50 MPa)^0.75` (anchor: oak C∥=50 → 600 N),
+  - Ores: host rock ± 10 % (`break_force` ×1.1, mass = host + mineral enrichment).
+- **Structural anchors `(P, H, D)` + `structural_class`** are NOT derived in this
+  doc. They come from the pinned `(ρ,C,T)→(P,H,D)` converter (stress branch,
+  INTEGRATION-DECISIONS §1.2) and the soil/cohesion branch (§1.3) — the soil
+  branch this doc originally flagged as missing has been **delivered** there. The
+  catalog's job is only to commit the *priors* (analog, ρ, C, T) plus the numeric
+  cohesion values (§3.4); the converter proposes the anchors and a
+  `verify_feature.gd` drift gate keeps priors and anchors from silently diverging
+  (INTEGRATION-DECISIONS §1.1). The scalar `attachment A` column is **superseded
+  and deleted** (§1.4) — its meaning is absorbed by the anchor-derived (σ_t, σ_s)
+  pair; the surviving `attachment` field is redefined as the joint
+  **participation multiplier** (default 1.0, non-1.0 only for sand/gravel = 0.0).
 
 ### 3.3 Catalog table — identity, look, render class
 
@@ -321,63 +322,83 @@ them): `orange/magenta/light_blue/yellow/lime/pink/gray/light_gray/cyan/purple/`
 `smooth_basalt`, `basalt`, `sculk`, `bone_block` (≈ 41 names; texture workstream
 gets the full list as data).
 
-### 3.4 Structural priors table (the ⚠SEAM structural-integrity contract)
+### 3.4 Structural priors + anchors table
 
 Columns: real-world analog, real density ρ (kg/m³), compressive prior C (MPa),
-tensile prior T (MPa) → game mass (kg/voxel), provisional durability D (N),
-provisional attachment A. **D and A get recomputed by the sibling's method; ρ/C/T
-are the inputs we commit to.**
+tensile prior T (MPa), game mass (kg/voxel), `break_force` (N — the mining-effort
+number, the former `D` column renamed per INTEGRATION-DECISIONS §1.4),
+`structural_class`, and the anchor triple `(P, H, D)`. **ρ/C/T (and cohesion `c`
+for soils) are the priors we commit to; `class` + `(P,H,D)` are the converter's
+proposal — INTEGRATION-DECISIONS §1.2 (stress branch) / §1.3 (soil branch) is the
+authoritative source, reproduced here so the catalog is self-contained; a designer
+may override any triple via `anchors_override`.** The scalar `attachment A` column
+is deleted (§1.4); sand/gravel additionally ship `attachment = 0.0` (participation).
 
-| name | analog | ρ | C | T | mass | D | A |
-|---|---|---|---|---|---|---|---|
-| grass | sod/topsoil (legacy) | — | — | (cohesion ~30 kPa) | 750* | 800* | 0.6 |
-| dirt | loam (legacy) | — | — | (cohesion ~25 kPa) | 900* | 900* | 0.6 |
-| stone | generic competent rock | 2700 | 100 | 10 | 1500* | 2500* | 1.0 |
-| wood/oak_log | oak, along grain | 700 | 50 | ~90 (∥ grain) | 80* | 600* | 1.0 |
-| leaf | foliage (legacy) | — | — | — | 100* | 100* | 0.15 |
-| bedrock | (unbreakable by decree) | — | ∞ | ∞ | 3000 | ∞ | 1.0 |
-| deepslate | slate/gneiss | 2900 | 150 | 15 | 1610 | 3390 | 1.0 |
-| granite | granite | 2650 | 130 | 8 | 1470 | 3040 | 0.8 |
-| diorite | diorite | 2800 | 120 | 8 | 1560 | 2870 | 0.8 |
-| andesite | andesite | 2750 | 120 | 8 | 1530 | 2870 | 0.8 |
-| tuff | volcanic tuff | 1600 | 30 | 2 | 890 | 1010 | 0.2 |
-| calcite | calcite/marble | 2710 | 50 | 4 | 1510 | 1490 | 0.4 |
-| dripstone_block | limestone | 2400 | 60 | 5 | 1330 | 1700 | 0.5 |
-| sandstone / red_sandstone | sandstone | 2300 | 60 | 4 | 1280 | 1700 | 0.4 |
-| sulfur_block | native sulfur | 2070 | 20 | 1 | 1150 | 750 | 0.1 |
-| cinnabar_block | cinnabar-bearing rock | 3000 | 70 | 5 | 1670 | 1910 | 0.5 |
-| *_ore (stone host) | host +10 % | — | — | — | 1450–2200 | 2750 | 1.0 |
-| deepslate_*_ore | host +10 % | — | — | — | 1560–2310 | 3730 | 1.0 |
-| coarse_dirt / podzol / mycelium | dry loam (soil branch) | 1600 | — | cohesion | 900/850/800 | 850/820/820 | 0.5/0.55/0.55 |
-| mud | saturated clay-silt | 1800 | — | cohesion | 1000 | 500 | 0.35 |
-| clay | stiff clay | 1750 | — | cohesion ~100 kPa | 970 | 1000 | 0.7 |
-| sand / red_sand | dry sand, cohesionless | 1600 | — | ~0 | 890 | 400 | **0.05** |
-| gravel | loose gravel, cohesionless | 1700 | — | ~0 | 945 | 500 | 0.08 |
-| snow_block | compacted snow | 500 | 1 | 0.1 | 280 | 250 | 0.3 |
-| moss_block | moss mat | 320 | — | fibrous | 180 | 200 | 0.25 |
-| water | water (fluid) | 1000 | — | — | 560 | — (unbreakable-as-fluid) | 0 |
-| lava | molten basalt (fluid) | 2770 | — | — | 1540 | — | 0 |
-| ice | lake ice | 917 | 8 | 3 | 510 | 380 | 0.3 |
-| packed_ice | glacial ice | 920 | 10 | 3.5 | 520 | 440 | 0.35 |
-| blue_ice | dense glacial ice | 921 | 12 | 4 | 530 | 510 | 0.4 |
-| powder_snow | fresh powder | 200 | ~0 | ~0 | 110 | 30 | 0.02 |
-| spruce_log | spruce ∥ grain | 450 | 40 | high ∥ | 50 | 510 | 1.0 |
-| birch_log | birch ∥ grain | 640 | 45 | high ∥ | 70 | 555 | 1.0 |
-| jungle_log | keruing/mahogany | 660 | 52 | high ∥ | 75 | 620 | 1.0 |
-| acacia_log | acacia | 830 | 60 | high ∥ | 95 | 690 | 1.0 |
-| dark_oak_log | black oak | 790 | 58 | high ∥ | 90 | 670 | 1.0 |
-| cherry_log | cherry | 570 | 45 | high ∥ | 65 | 555 | 1.0 |
-| *_leaves | foliage | — | — | — | 90–110 | 100 | 0.15 |
-| glass / stained | soda-lime glass, **brittle**: moderate compression, near-zero practical tension (flaw-governed, ~1 MPa design) | 2500 | 50 | **1** | 1390 | 1490 | **0.1** |
-| tinted_glass | thicker/laminated glass | 2600 | 55 | 1 | 1450 | 1600 | 0.1 |
-| terracotta family | fired clay | 2000 | 25 | 3 | 1110 | 890 | 0.3 |
-| obsidian | dense volcanic glass (gameplay-toughest) | 2400 | 300 | 5 | 1330 | 5700 | 0.5 |
-| amethyst_block | quartz aggregate | 2650 | 80 | 5 | 1470 | 2110 | 0.5 |
+| name | analog | ρ | C | T | mass | break_force | class | (P,H,D) |
+|---|---|---|---|---|---|---|---|---|
+| grass | sod/topsoil (legacy) | — | — | c=30 kPa | 750* | 800* | soil | (4, 2, 1) |
+| dirt | loam (legacy) | — | — | c=25 kPa | 900* | 900* | soil | (4, 2, 1) |
+| stone | generic competent rock | 2700 | 100 | 10 | 1500* | 2500* | rock | (64, 6, 4) |
+| wood/oak_log | oak, along grain | 700 | 50 | 90 (∥ grain) | 80* | 600* | timber | (36, 24, 16) |
+| leaf | foliage (legacy) | — | — | — | 100* | 100* | foliage | (4, 3, 2) |
+| bedrock | (unbreakable by decree) | — | ∞ | ∞ | 3000 | ∞ | bedrock | — (∞ caps, no anchors) |
+| deepslate | slate/gneiss | 2900 | 150 | 15 | 1610 | 3390 | rock | (90, 8, 5) |
+| granite | granite | 2650 | 130 | 8 | 1470 | 3040 | rock | (80, 5, 3) |
+| diorite | diorite | 2800 | 120 | 8 | 1560 | 2870 | rock | (74, 5, 3) |
+| andesite | andesite | 2750 | 120 | 8 | 1530 | 2870 | rock | (74, 5, 3) |
+| tuff | volcanic tuff | 1600 | 30 | 2 | 890 | 1010 | rock | (24, 2, 1) |
+| calcite | calcite/marble | 2710 | 50 | 4 | 1510 | 1490 | rock | (36, 3, 2) |
+| dripstone_block | limestone | 2400 | 60 | 5 | 1330 | 1700 | rock | (42, 4, 3) † |
+| sandstone / red_sandstone | sandstone | 2300 | 60 | 4 | 1280 | 1700 | rock | (42, 3, 2) |
+| sulfur_block | native sulfur | 2070 | 20 | 1 | 1150 | 750 | rock | (17, 1, 1) † |
+| cinnabar_block | cinnabar-bearing rock | 3000 | 70 | 5 | 1670 | 1910 | rock | (48, 4, 3) † |
+| *_ore (stone host) | host +10 % | — | — | — | 1450–2200 | 2750 | rock (host) | (64, 6, 4) inherit host |
+| deepslate_*_ore | host +10 % | — | — | — | 1560–2310 | 3730 | rock (host) | (90, 8, 5) inherit host |
+| coarse_dirt / podzol / mycelium | dry loam (soil branch) | 1600 | — | c=20 kPa | 900/850/800 | 850/820/820 | soil | (4, 1, 1) |
+| mud | saturated clay-silt | 1800 | — | c=10 kPa | 1000 | 500 | soil | (3, 1, 1) |
+| clay | stiff clay | 1750 | — | c=100 kPa | 970 | 1000 | soil | (8, 3, 2) |
+| sand / red_sand | dry sand, cohesionless | 1600 | — | c=0 | 890 | 400 | granular | (3, 1, 0) + attachment 0.0 |
+| gravel | loose gravel, cohesionless | 1700 | — | c=2 kPa | 945 | 500 | granular | (3, 1, 0) + attachment 0.0 |
+| snow_block | compacted snow | 500 | 1 | 0.1 | 280 | 250 | soft | (3, 2, 1) ‡ |
+| moss_block | moss mat | 320 | — | fibrous | 180 | 200 | foliage | (4, 3, 2) † |
+| water | water (fluid) | 1000 | — | — | 560 | — (fluid) | fluid | — (outside solver) |
+| lava | molten basalt (fluid) | 2770 | — | — | 1540 | — | fluid | — (outside solver) |
+| ice | lake ice | 917 | 8 | 3 | 510 | 380 | brittle | (3, 3, 2) |
+| packed_ice | glacial ice | 920 | 10 | 3.5 | 520 | 440 | brittle | (3, 3, 2) |
+| blue_ice | dense glacial ice | 921 | 12 | 4 | 530 | 510 | brittle | (4, 3, 2) |
+| powder_snow | fresh powder | 200 | ~0 | ~0 | 110 | 30 | non-solid | — (solidity<0.5, outside solver) |
+| spruce_log | spruce ∥ grain | 450 | 40 | 72 | 50 | 510 | timber | (30, 21, 14) |
+| birch_log | birch ∥ grain | 640 | 45 | 81 | 70 | 555 | timber | (33, 22, 15) |
+| jungle_log | keruing/mahogany | 660 | 52 | 94 | 75 | 620 | timber | (37, 25, 16) |
+| acacia_log | acacia | 830 | 60 | 108 | 95 | 690 | timber | (42, 27, 18) |
+| dark_oak_log | black oak | 790 | 58 | 104 | 90 | 670 | timber | (41, 26, 18) |
+| cherry_log | cherry | 570 | 45 | 81 | 65 | 555 | timber | (33, 22, 15) |
+| *_leaves | foliage | — | — | — | 90–110 | 100 | foliage | (4, 3, 2) |
+| glass / stained | soda-lime glass, **brittle**: moderate compression, near-zero practical tension (flaw-governed, ~1 MPa design) | 2500 | 50 | **1** | 1390 | 1490 | brittle | (12, 1, 1) |
+| tinted_glass | thicker/laminated glass | 2600 | 55 | 1 | 1450 | 1600 | brittle | (13, 1, 1) |
+| terracotta family | fired clay | 2000 | 25 | 3 | 1110 | 890 | rock | (20, 3, 2) |
+| obsidian | dense volcanic glass (gameplay-toughest) | 2400 | 300 | 5 | 1330 | 5700 | rock | (159, 4, 3) |
+| amethyst_block | quartz aggregate | 2650 | 80 | 5 | 1470 | 2110 | rock | (53, 4, 3) |
 
 \* frozen legacy value, not recomputed. The §12-addendum ordering invariant
 generalises to: *bedrock > deepslate family > stone family > terracotta/glass >
 soils > cryo > water > leaves ≥ logs*, with **logs the lightest solid family**
 (spruce 50 … acacia 95 < leaf 100) — asserted in §10.
+
+**† Assigned by the branch rule, not individually listed in INTEGRATION-DECISIONS
+§1.2** (dripstone_block, sulfur_block, cinnabar_block computed via the stress
+converter from their C/T priors; moss_block by the foliage archetype, matching
+leaf) — INTEGRATION-DECISIONS §1.2 remains authoritative if it later lists them.
+**‡ snow_block** is the first expected `anchors_override`: the converter
+floor-clamps it to (1, 1, 1); the shipped value is the recommended hand-tune
+(3, 2, 1) (INTEGRATION-DECISIONS §1.2, SI soft archetype).
+**Species-log tensile default `T = 1.8·C`** (pinned by oak: 90 = 1.8·50) — the
+committed T column for spruce/birch/jungle/acacia/dark_oak/cherry logs above uses
+it; overridable per species (INTEGRATION-DECISIONS §1.2).
+**Sand / gravel** additionally carry `attachment = 0.0` (the joint participation
+multiplier, §1.4): D = 0 stops them dangling, and participation 0 stops them
+gluing to a side wall — undercut sand falls even against stone, while sand heaps
+still stand on pure compression routing.
 
 ---
 
@@ -389,12 +410,25 @@ IS the id. Schema per record:
 
 ```json
 { "name": "glass", "alias": null, "tier": "world",
-  "mass": 1390.0, "break_force": 1490.0, "attachment": 0.10,
+  "mass": 1390.0, "break_force": 1490.0,
+  "anchors": [12, 1, 1], "structural_class": "brittle",
   "permeability": 0.0, "translucence": 0.95, "solidity": 1.0,
   "swatch": "#ffffff", "render": { "mode": "translucent", "alpha": 0.30,
       "cull_group": 3, "emissive": 0.0 },
-  "priors": { "analog": "soda-lime glass", "rho": 2500, "C": 50, "T": 1 } }
+  "priors": { "analog": "soda-lime glass", "rho": 2500, "C": 50, "T": 1 },
+  "state_layout": null, "visual_mask": null, "has_block_entity": false }
 ```
+
+Field notes (INTEGRATION-DECISIONS §1.1/§1.4): **`anchors` = the `(P,H,D)`
+strength triple** and **`structural_class`** are the stored gameplay truth
+(replacing the deleted scalar `attachment` column). `priors` is retained as
+provenance so the converter can re-propose anchors when mass is rebalanced — a
+`verify_feature.gd` **drift gate** asserts `propose_anchors(priors, class) ==
+anchors` for every record lacking `"anchors_override": true`. The `attachment`
+key is the joint **participation multiplier** (default 1.0, so it is **omitted
+unless ≠ 1.0** — only sand/gravel ship `"attachment": 0.0`); it is not a strength.
+`state_layout` / `visual_mask` / `has_block_entity` (VDS §10.3) are
+forward-compatible optionals — `null`/`false` for every v1 material.
 
 Why JSON, not `.tres`: (a) diffable/reviewable — a 77-record table in a resource
 file is opaque in PRs; (b) trivially consumed by the texture workstream and any
@@ -582,6 +616,16 @@ static func generated_block(x: int, y: int, z: int) -> int:
 `WorldManager.cell_solid` changes from `id != AIR` to
 `BlockCatalog.solidity_of(id) >= 0.5`. Effects, audited per consumer:
 
+> **Merged-contract pointer (INTEGRATION-DECISIONS §3):** this section is
+> **layer 1 — the material-solidity gate** of the one analytic-physics contract.
+> The sub-voxel workstream's in-cell shape tests (ramp floors, occupancy
+> intervals) are **layer 2 — modifier shapes**. They are composed into a **single
+> implementation**: the material gate decides *whether* a cell contributes
+> collision geometry; the modifier decides *where* inside it. See
+> INTEGRATION-DECISIONS §3 for the merged `cell_solid` / `floor_under` /
+> `blocked` / `aimed_voxel` / `occludes_face` signatures and the `_occ_span`
+> composition helper both workstreams implement against.
+
 - **water / lava / powder_snow are non-colliding**: `blocked()` lets the player
   walk into the sea, `floor_under` scans through water to the seafloor — the
   player wades/sinks and walks on the bottom. Swimming/buoyancy/breath and lava
@@ -712,6 +756,15 @@ blob size); §10 asserts measured rates within ×⅓…×3 of the table per ore.
   biome `snowy` → ICE (frozen cap; ice is solid — you can walk the frozen sea,
   and breaking it exposes non-solid water below: the first genuinely
   Minecraft-feeling emergent interaction this design ships).
+  - ⚠SEAM (INTEGRATION-DECISIONS §1.5 risk 3): generated sea ice is
+    **structurally dependent on biome-keyed surface temperature landing in
+    `PerVoxelEnvironment` first**. `PerVoxelEnvironment` today reports ~21 °C air
+    everywhere; the structural sibling's brittle-ice curve gives φ_brittle(21 °C)
+    = 0.05, which makes a frozen sheet structurally tissue-paper (σ_s·φ ≈ 750 N ≪
+    one ice block's ~5 kN — breaking one block would shed the surrounding sheet
+    each event). **Ordering constraint:** snowy-biome surface temperature
+    (< −5 °C) must land in `PerVoxelEnvironment` (WGC Phase 2) *before*
+    STRUCTURAL-INTEGRITY pass 2 goes live — or ice worldgen ships after it does.
 - Beaches/seafloors come from the biome table (rules 1–2).
 - **TreeGen** keeps its grid/patch/containment machinery verbatim and gains a
   species layer: `species_of(gx, gz)` = biome of the base column + one hash
@@ -930,6 +983,12 @@ Each phase independently shippable and verified headlessly before the next.
    "ground" under a boat is the seafloor: fine, but the HUD's "Ground temp"
    over deep ocean is a 14 m-deep value — cosmetic oddity, noted for the sim
    workstream ⚠SEAM: water temperature model).
+   ⚠SEAM (INTEGRATION-DECISIONS §1.5 risk 3): the *same* uniform-temperature gap
+   is a structural bug for frozen-sea ice — φ_brittle(21 °C) = 0.05 makes
+   generated snowy-biome sea ice tissue-paper under the structural sibling, so
+   breaking one block sheds the surrounding sheet. Biome-keyed surface
+   temperature (snowy < −5 °C) in `PerVoxelEnvironment` must land before
+   STRUCTURAL-INTEGRITY pass 2 (ordering constraint, §6.7).
 10. **Placing-then-breaking in water leaves air holes** (§6.3) — intended-for-now
    quirk; becomes wrong the day fluids flow. Tracked here so fluid-sim work
    knows to migrate overlay-0-in-sea cells.

@@ -820,7 +820,9 @@ that streaming must carry `strength_anchors`/`structural_class` is unaffected
 flagged to that workstream:** temperature-dependent attachment reads state
 *only* via PerVoxelEnvironment, never via the state axis — if a future material
 wants a "weakened" flag, it is a state bit the solver may read through
-`state_field`, not a new store.
+`state_field`, not a new store. `attachment` on `VoxelState` is the **joint
+participation multiplier** per INTEGRATION-DECISIONS §1.4 (default 1.0;
+sand/gravel 0.0); the catalog's scalar `A` column is superseded/deleted.
 
 ---
 

@@ -189,6 +189,11 @@ func is_edited_column(x: int, z: int) -> bool:
 # game AND the headless verify (where _ready is deferred). The set is tiny (typically 0–a few), so
 # the per-frame scan is negligible.
 
+## Metres around a terrain/body edit within which dormant debris is woken (dormant-by-default
+## reactivation). Generous enough to catch a local debris pile so a whole small stack reactivates
+## together; a rare taller stack self-heals on the next nearby edit.
+const _WAKE_RADIUS := 6.0
+
 ## Number of active loose VoxelBodies (debris) in the world.
 func active_body_count() -> int:
 	var n := 0
@@ -197,24 +202,34 @@ func active_body_count() -> int:
 			n += 1
 	return n
 
-## True iff any loose VoxelBody exists at all.
+## True iff any loose VoxelBody exists at all (dormant or awake).
 func has_active_bodies() -> bool:
 	for c in get_children():
 		if c is VoxelBody:
 			return true
 	return false
 
-## True iff a loose VoxelBody is within `radius` columns (Chebyshev, horizontal) of `center`. A
-## body's world column is its spawn cell (cells are body-local; IDENTITY-or-parent frame at spawn)
-## offset by its rigid-body displacement (global_position) — bodies fall vertically, so this tracks
-## them cheaply as they drop/shove. THE collider gate: with no body near, the collider stays idle.
+## Number of AWAKE (simulating) loose bodies — dormant (frozen / sleeping) debris is excluded.
+func awake_body_count() -> int:
+	var n := 0
+	for c in get_children():
+		if c is VoxelBody and (c as VoxelBody).is_awake():
+			n += 1
+	return n
+
+## True iff an AWAKE loose VoxelBody is within `radius` columns (Chebyshev, horizontal) of `center`.
+## THE collider gate (DORMANT-BY-DEFAULT): a FROZEN ground body or a SLEEPING wood body does NOT
+## count, so once nearby debris settles the collider returns to idle even though the (now-static)
+## bodies still sit there — a pile of settled debris near the player costs nothing. Only a moving/
+## falling body keeps the collider active. A body's world column is its spawn cell offset by its
+## rigid-body displacement (global_position), so a dropping/shoved body is tracked cheaply.
 func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
 	for c in get_children():
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
-		if vb.cells.is_empty():
-			continue                        # a body mid-free (emptied) — ignore
+		if vb.cells.is_empty() or not vb.is_awake():
+			continue                        # emptied (mid-free) or DORMANT → does not hold the collider on
 		var home := _body_home_column(vb)
 		var gp := vb.global_position
 		var wx := home.x + int(floor(gp.x))
@@ -222,6 +237,26 @@ func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
 		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
 			return true
 	return false
+
+## Wake every dormant loose body whose cells are within `radius` metres of world point `p` — the
+## disturbance reactivation path (DORMANT-BY-DEFAULT): a break/collapse/placement near settled
+## debris wakes it so it re-tests support and falls if undermined, else re-settles. Called on every
+## terrain/body edit; comprehensive so a body can never be left floating with its support removed.
+func wake_bodies_near(p: Vector3, radius: float) -> void:
+	var r2 := radius * radius
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty() or vb.is_awake():
+			continue                        # already awake → nothing to do
+		var xf := vb.global_transform
+		for k: Vector3i in vb.cells:
+			var wp: Vector3 = xf * Vector3(k.x + 0.5, k.y + 0.5, k.z + 0.5)
+			if wp.distance_squared_to(p) <= r2:
+				vb.wake()
+				break                       # this body is awake now; move to the next
+	return
 
 ## A representative local column (x, z) of a VoxelBody's cells (first key). Added to global_position
 ## it gives the body's current world column (coarse; enough for the gate radius).
@@ -253,6 +288,9 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
 	_structural_update(cell, from_pos)  # only from the player break — never a spawn
+	# Disturbance: wake dormant debris near the break so anything that just lost its support falls
+	# (dormant-by-default reactivation). The new-body spawns from _structural_update are already awake.
+	wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)
 	if _ground != null:
 		_ground.rebuild_now()
 	return id
@@ -283,6 +321,7 @@ func place_block(cell: Vector3i, value: int) -> bool:
 	# pillar crushes, an undercut/unsupported placement detaches. No breaker kick on
 	# a placement collapse (from_pos = Vector3.INF).
 	_structural_update(cell, Vector3.INF)
+	wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)   # disturbance: reactivate nearby dormant debris
 	if _ground != null:
 		_ground.rebuild_now()
 	return true

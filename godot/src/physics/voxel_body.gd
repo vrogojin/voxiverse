@@ -46,7 +46,6 @@ const DETACH_KICK_SPEED := 1.2         # m/s
 # A ground body counts as "at rest" (and re-freezes) below these thresholds.
 const SETTLE_LINEAR := 0.15            # m/s
 const SETTLE_ANGULAR := 0.15           # rad/s
-const SETTLE_RECHECK_FRAMES := 12      # frozen ground bodies re-test support this often
 const SUPPORT_PROBE := 0.25            # m: downward ray length under a body's underside
 
 # Dynamics for detached (activated) pieces — see _apply_dynamic_props().
@@ -70,7 +69,7 @@ const MASK_BODY := (1 << 0) | (1 << 1) | (1 << 2)   # collide w/ ground+bodies+p
 var cells: Dictionary = {}        # Vector3i -> int PACKED cell value (body-local coords)
 var world: WorldManager           # for the ground-contact (grounded) test
 var activated: bool = false       # false = pristine frozen cluster; true = dynamic
-var _recheck := 0                 # countdown for the throttled frozen-body support re-test
+var _is_wood := false             # cached _has_wood() — wood is sandbox-dynamic (Godot sleep/wake)
 
 # Shared, no-bounce, medium-friction physics material for dynamic pieces. Built
 # once and reused (RigidBody3D shares it freely — it is immutable here).
@@ -120,6 +119,9 @@ func break_cell(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> void:
 	if not cells.has(cell):
 		return
 	var was_frozen := freeze          # captured so a settled/pristine body kicks on unfreeze
+	# Disturbance: wake dormant debris resting on/near this body's broken cell (dormant-by-default).
+	if world != null:
+		world.wake_bodies_near(global_transform * Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), 6.0)
 	cells.erase(cell)
 	if cells.is_empty():
 		queue_free()
@@ -175,35 +177,56 @@ func cell_at_hit(hit_pos: Vector3, hit_normal: Vector3) -> Vector3i:
 func block_count() -> int:
 	return cells.size()
 
-# --- settle / freeze (§12) ------------------------------------------------------
+# --- settle / freeze / dormancy (§12; DORMANT-BY-DEFAULT PHYSICS) ----------------
+# The world holds MANY persistent physical objects, so physics is dormant-by-default and active
+# only on disturbance. A dropping GROUND body freezes to STATIC once it lands + stops (dormant,
+# immovable furniture) and DISABLES its own _physics_process → ZERO per-frame script cost. A WOOD
+# body is sandbox-dynamic (Godot can_sleep sleeps it at rest; contact/push auto-wakes it) and also
+# runs no _physics_process. A dormant body reactivates via wake() — driven by WorldManager.
+# wake_bodies_near() on any nearby terrain/body edit (break/collapse/place) and by break_cell —
+# then re-simulates and re-settles. The collider gate counts only AWAKE bodies (is_awake), so a
+# pile of settled debris near the player costs nothing.
 
-## Ground bodies re-freeze once at rest so they can be jumped on / shoved without
-## moving or tipping; if support is later dug out they fall again. Wood bodies are
-## sandbox-dynamic and are left alone here. Runs only for activated bodies.
+## Ground bodies re-freeze once at rest so they can be jumped on / shoved without moving or
+## tipping. Runs ONLY for a dynamic (dropping) ground body — _refresh_dormancy() keeps
+## _physics_process OFF for wood, frozen and pristine bodies, so dormant debris is free.
 func _physics_process(_delta: float) -> void:
-	if not activated or _has_wood():
-		return
-	if not freeze:
-		# Dynamic ground body: freeze once it has landed and stopped.
-		if _grounded(cells) \
-				and linear_velocity.length() < SETTLE_LINEAR \
-				and angular_velocity.length() < SETTLE_ANGULAR:
-			linear_velocity = Vector3.ZERO
-			angular_velocity = Vector3.ZERO
-			freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
-			freeze = true
-	else:
-		# Settled ground body: periodically re-test support; if it lost it (support
-		# dug out), resume falling. Throttled — a static block needs no per-frame check.
-		_recheck -= 1
-		if _recheck <= 0:
-			_recheck = SETTLE_RECHECK_FRAMES
-			if not _grounded(cells):
-				freeze = false
-				sleeping = false
+	if not activated or _is_wood or freeze:
+		return                                       # defensive; _physics_process is off in these states
+	# Dynamic ground body: freeze once it has landed and stopped → dormant (zero per-frame cost).
+	if _grounded(cells) \
+			and linear_velocity.length() < SETTLE_LINEAR \
+			and angular_velocity.length() < SETTLE_ANGULAR:
+		linear_velocity = Vector3.ZERO
+		angular_velocity = Vector3.ZERO
+		freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
+		freeze = true
+		set_physics_process(false)                   # DORMANT: no more per-frame script work
 
-## True iff this cluster contains at least one WOOD cell -> sandbox-dynamic
-## (never auto-freezes). Everything else is a ground body.
+## Reactivate a dormant body on disturbance: unfreeze → dynamic → re-enable the settle loop, so it
+## falls if it lost support or re-settles (+re-freezes) if still supported. Wood just clears the
+## Godot sleep. Idempotent and cheap. Called by WorldManager.wake_bodies_near / break_cell.
+func wake() -> void:
+	if _is_wood:
+		sleeping = false
+		return
+	activated = true
+	freeze = false
+	sleeping = false
+	set_physics_process(true)
+
+## AWAKE = simulating (dynamic and not asleep). The collider gate counts only awake bodies, so
+## frozen ground debris and sleeping wood are dormant and keep the collider idle.
+func is_awake() -> bool:
+	return not freeze and not sleeping
+
+## Enable per-frame settle logic ONLY for a dynamic (dropping) ground body; wood, a frozen
+## (dormant) ground body, and a pristine cluster do ZERO per-frame script work.
+func _refresh_dormancy() -> void:
+	set_physics_process(activated and not _is_wood and not freeze)
+
+## True iff this cluster contains at least one WOOD cell -> sandbox-dynamic (never auto-freezes).
+## Everything else is a ground body. Cached into `_is_wood` at _rebuild (avoids a per-frame scan).
 func _has_wood() -> bool:
 	for c: Vector3i in cells.keys():
 		if CellCodec.mat(cells[c]) == BlockCatalog.WOOD:
@@ -444,6 +467,8 @@ func _rebuild() -> void:
 	mass = maxf(1.0, m)
 	freeze = not activated
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces
+	_is_wood = _has_wood()      # cache once (avoids a per-frame cell scan in the settle loop)
+	_refresh_dormancy()         # dormant bodies run NO _physics_process
 
 ## Lazily begin (once) and return the SurfaceTool for material `id`.
 func _tool_for_body(tools: Dictionary, id: int) -> SurfaceTool:

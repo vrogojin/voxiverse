@@ -33,6 +33,7 @@ func _initialize() -> void:
 	_test_collider_overlay_cases()
 	_test_collider_amortized()
 	_test_collider_gate()
+	_test_physics_dormancy()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -1057,6 +1058,74 @@ func _test_collider_gate() -> void:
 	_ok(cw.active_body_count() == 0 and not cw.has_active_bodies(), "gate: body-count decrements when the body is freed (%d)" % cw.active_body_count())
 	gc.queue_free()
 	cw.queue_free()
+
+# 2f. DORMANT-BY-DEFAULT PHYSICS. The world holds many persistent bodies, so physics must be
+# dormant unless disturbed: a settled body freezes (→ zero per-frame cost), the collider counts
+# ONLY awake bodies (a pile of frozen debris near the player costs nothing), and a break/contact
+# wakes dormant bodies. Proven end-to-end here.
+func _test_physics_dormancy() -> void:
+	print("[2f] dormant-by-default physics (freeze settled / gate on awake / wake on disturbance)")
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var w := WorldManager.new()
+	w.name = "Dormancy"
+	get_root().add_child(w)
+	var gc := GroundCollider.new()
+	get_root().add_child(gc)
+	gc.setup(w)
+	var center := Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5)
+	# A ground body resting on the surface (grounded via the analytic check, no physics stepping).
+	var body := VoxelBody.spawn_loose(w, {Vector3i(cx, g + 1, cz): STONE}, w)
+	_ok(body != null and body.is_awake(), "dormancy: freshly-spawned body is AWAKE")
+	_ok(w.awake_body_count() == 1, "dormancy: awake count 1 after spawn")
+	gc.update(center)
+	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
+		"dormancy: collider active while a body is awake")
+
+	# (1) settle → freeze within a few ticks; the frozen body then does NO per-frame work.
+	var froze := false
+	for _tick in range(8):
+		body._physics_process(0.016)
+		if body.freeze:
+			froze = true
+			break
+	_ok(froze, "dormancy: a grounded, at-rest body freezes within a few ticks")
+	_ok(not body.is_awake() and not body.is_physics_processing(),
+		"dormancy: a frozen body is DORMANT — not awake, _physics_process OFF (zero per-frame cost)")
+	_ok(w.awake_body_count() == 0, "dormancy: awake count drops to 0 once settled (body still present)")
+
+	# (2) collider returns to IDLE with only a FROZEN body near — zero rebuild churn.
+	var churn := 0
+	for step in range(20):
+		gc.update(Vector3(float(cx + step) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+		churn += gc.last_slice_ops()
+	_ok(churn == 0 and not gc.active_rid().is_valid(),
+		"dormancy: only a FROZEN body near → collider idle, ZERO rebuild churn (churn=%d)" % churn)
+
+	# (3) wake-on-break: digging the surface under the frozen body wakes it → collider reactivates.
+	w.break_terrain(Vector3i(cx, g, cz))
+	_ok(body.is_awake() and body.is_physics_processing(), "dormancy: a break near a frozen body WAKES it (dynamic again)")
+	_ok(w.awake_body_count() == 1, "dormancy: awake count back to 1 after wake-on-break")
+	gc.update(center)
+	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
+		"dormancy: the woken body reactivates the collider (ground for the faller)")
+	gc.queue_free()
+	w.queue_free()
+
+	# (4) wake-on-contact for WOOD (sandbox-dynamic): a sleeping wood body is dormant; Godot wakes it
+	# on contact/push (impulse) — modelled here by wake() clearing the sleep.
+	var w2 := WorldManager.new()
+	w2.name = "DormancyWood"
+	get_root().add_child(w2)
+	var wood := VoxelBody.spawn_loose(w2, {Vector3i(cx, g + 1, cz): WOOD}, w2)
+	_ok(wood != null and wood._is_wood, "dormancy: wood body is sandbox-dynamic (never auto-freezes)")
+	wood.sleeping = true                          # Godot auto-sleeps a wood body at rest
+	_ok(not wood.is_awake() and w2.awake_body_count() == 0, "dormancy: a SLEEPING wood body is dormant (not counted)")
+	wood.wake()                                   # contact/push wakes it (Godot-native; modelled by wake())
+	_ok(wood.is_awake() and w2.awake_body_count() == 1, "dormancy: contact/push wakes the sleeping wood body")
+	w2.queue_free()
 
 ## Drive an incremental GroundCollider (re)build to completion by pumping update() (simulating
 ## physics frames), so a test can read the settled shape set. Bounded so a bug can't hang verify.

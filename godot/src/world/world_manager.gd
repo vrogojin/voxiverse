@@ -12,6 +12,13 @@ extends Node3D
 
 signal path_selected(using_module: bool)
 
+## Emitted when a cell's per-cell METADATA is DROPPED by a material change or break
+## (VOXEL-DATA-STRUCTURE §14 P1 / §11): `_write_cell` settles the orphaned document
+## through this signal so a future system (e.g. spilling a chest's contents as
+## pickups) can react. No consumer is required today. Never fired by `set_state`
+## (the one write that PRESERVES metadata) or by `set_metadata` (an explicit update).
+signal block_entity_orphaned(cell: Vector3i, old_meta: Dictionary)
+
 var environment: PerVoxelEnvironment
 var materials: MaterialRegistry
 var using_module: bool = false
@@ -29,6 +36,14 @@ var _ground: GroundCollider           # local blocky physics collider
 # "dug to air". `cell_value_at(cell)` = edits-overlay-else-generated is THE cell
 # query; `block_id_at` is its material projection.
 var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = air)
+# Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
+# ONLY the rare cells that carry a block-entity document (container inventory, sign
+# text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
+# it is settled by the same write choke point and NEVER queried for "what's solid".
+# The zero-cost-default guarantee: a metadata-free world keeps this EMPTY (O(1), zero
+# per-cell cost), and `_write_cell` skips it entirely while it is empty. Main-thread,
+# lifecycle-locked: only set_metadata (write) / break/place/collapse (settle) touch it.
+var _meta: Dictionary = {}            # Vector3i -> Dictionary (JSON-subset document)
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
@@ -212,15 +227,113 @@ func place_block(cell: Vector3i, value: int) -> bool:
 	return true
 
 ## THE single write choke point (VOXEL-DATA-STRUCTURE §7.2): the ONLY function
-## that mutates a cell's overlay value. break/place/collapse all route here. It
-## canonicalizes the packed value (air-zeroing + P5/P6 hooks), stores it in
-## `_edits`, and mirrors the resulting MATERIAL into the active render path. Keeps
-## every existing semantic — a bare id in, a bare id painted — while making the
-## overlay shape/state-ready. (Metadata settlement lands in P1.)
-func _write_cell(cell: Vector3i, packed: int) -> void:
+## that mutates a cell's overlay value, now owning ALL FOUR axes. break/place/collapse
+## all route here. It canonicalizes the packed value (air-zeroing + P5/P6 hooks),
+## stores it in `_edits`, SETTLES the cell's metadata, and mirrors the resulting
+## MATERIAL into the active render path.
+##
+## Metadata settlement (the leak-proof invariant, §7.2/§16): a write DROPS the cell's
+## existing metadata unless the SAME call supplies replacement `meta` for a block-entity
+## material. break/place/collapse never pass `meta`, so they always drop+orphan any
+## existing document — there is no code path that changes a cell's material and skips
+## metadata cleanup, because there is only one write function. `set_state` re-passes the
+## existing document (same material → block-entity) so it is PRESERVED without an orphan.
+##
+## Zero-cost default: with an empty `_meta` and no `meta` argument (today's every write),
+## the settlement collapses to a single `is_empty()` check — gameplay stays byte-identical.
+func _write_cell(cell: Vector3i, packed: int, meta: Variant = null) -> void:
 	packed = CellCodec.canonical(packed)
+	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
+		_meta[cell] = meta                       # the one write that (re)sets metadata
+	elif not _meta.is_empty():
+		var old_meta: Variant = _meta.get(cell, null)
+		if old_meta != null:
+			_meta.erase(cell)                    # material change / break settles it
+			block_entity_orphaned.emit(cell, old_meta)
 	_edits[cell] = packed
 	_paint_cell(cell, packed)
+
+# --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
+
+## Serialized-metadata size cap per cell (§16): the unbounded axis by nature, so
+## `set_metadata` refuses (and logs) any document over this. Chest-heavy legit docs
+## sit far below it.
+const META_MAX_BYTES := 16 * 1024
+
+## Attach/replace the block-entity METADATA document at `cell`. Validates loudly and
+## returns false (no state change) if: the cell's MATERIAL is not a block-entity
+## material (`has_block_entity` false — incl. air), the document is not JSON-representable
+## (§3.2: String keys; bool/int/float/String/Array/Dictionary values; NO Object refs, NO
+## NaN/INF), or it exceeds the §16 size cap. Stores a DEEP COPY so later caller mutations
+## cannot alias the stored document. Keeps the scalar axes (`_edits`) untouched; fires no
+## orphan signal (an explicit update is not a drop).
+func set_metadata(cell: Vector3i, meta: Dictionary) -> bool:
+	var mat := CellCodec.mat(cell_value_at(cell))
+	if not BlockCatalog.has_block_entity(mat):
+		push_error("WorldManager.set_metadata: material %d at %s is not a block-entity material (rejected)" % [mat, cell])
+		return false
+	if not _metadata_dict_ok(meta):
+		push_error("WorldManager.set_metadata: document at %s is not JSON-representable (Object/NaN/INF or non-String key) — rejected" % cell)
+		return false
+	if JSON.stringify(meta).to_utf8_buffer().size() > META_MAX_BYTES:
+		push_error("WorldManager.set_metadata: document at %s exceeds the %d-byte cap — rejected" % [cell, META_MAX_BYTES])
+		return false
+	_meta[cell] = meta.duplicate(true)
+	return true
+
+## The block-entity METADATA document at `cell`; an EMPTY dict when the cell carries
+## none. Returns a DEEP COPY — mutating it never changes the stored document (route
+## real updates through `set_metadata`).
+func get_metadata(cell: Vector3i) -> Dictionary:
+	var m: Variant = _meta.get(cell, null)
+	return (m as Dictionary).duplicate(true) if m != null else {}
+
+## True iff `cell` currently carries a metadata document.
+func has_metadata(cell: Vector3i) -> bool:
+	return _meta.has(cell)
+
+## Set the STATE axis (bits 32..47) of `cell`, keeping its material + modifier and
+## PRESERVING any metadata (the one write that does — §11). Returns false on air.
+## The state bits are canonicalized/validated through `CellCodec` (today's validator is
+## pass-through; no material declares a state layout yet, so any value round-trips).
+func set_state(cell: Vector3i, state_bits: int) -> bool:
+	var v := cell_value_at(cell)
+	var mat := CellCodec.mat(v)
+	if mat == BlockCatalog.AIR:
+		return false                             # air carries no state
+	var new_packed := CellCodec.pack(mat, CellCodec.modifier(v), state_bits)
+	# Re-pass the existing document so the choke point KEEPS it (same material → still a
+	# block-entity) rather than orphaning it: set_state is a behavioural, not material, edit.
+	_write_cell(cell, new_packed, _meta.get(cell, null))
+	return true
+
+## JSON-subset validator (§3.2): a metadata document restricted to String keys and
+## bool/int/finite-float/String/Array/Dictionary values, recursively. Rejects Object
+## references (they cannot serialize / cross threads) and NaN/INF (they break byte-stable
+## round-trips). Pure/static so it is trivially testable.
+static func _metadata_dict_ok(d: Dictionary) -> bool:
+	for k: Variant in d.keys():
+		if typeof(k) != TYPE_STRING:
+			return false
+		if not _metadata_value_ok(d[k]):
+			return false
+	return true
+
+static func _metadata_value_ok(v: Variant) -> bool:
+	match typeof(v):
+		TYPE_BOOL, TYPE_INT, TYPE_STRING:
+			return true
+		TYPE_FLOAT:
+			return is_finite(v)                  # no NaN / INF (byte-stable round-trips)
+		TYPE_ARRAY:
+			for e: Variant in v:
+				if not _metadata_value_ok(e):
+					return false
+			return true
+		TYPE_DICTIONARY:
+			return _metadata_dict_ok(v)
+		_:
+			return false                         # Object refs and every other type rejected
 
 ## Mirror one cell's PACKED value into the active render path (0 = carve to air).
 ## Shared by _write_cell so the godot_voxel / fallback plumbing lives in one place.

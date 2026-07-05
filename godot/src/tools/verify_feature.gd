@@ -38,6 +38,7 @@ func _initialize() -> void:
 	_test_world_loop()
 	_test_structural()
 	_test_shapes_live()
+	_test_metadata()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1639,3 +1640,124 @@ func _struct_tree_chop() -> void:
 			break
 	_ok(chopped, "found and chopped a tree trunk")
 	w.queue_free()
+
+# P6a. Per-cell METADATA store + STATE-axis lifecycle (VDS §14 P1 / §15.3 leak tests).
+# No shipped material declares has_block_entity yet (like state layouts), so the test
+# flips the flag on a live VoxelState to exercise the machinery, then restores it —
+# gameplay data stays byte-identical. Asserts: (a) zero-cost default (empty _meta on a
+# metadata-free world), (b) round-trip through get_metadata, (c) break + collapse FREE
+# metadata and fire the orphan signal, (d) non-block-entity materials reject metadata,
+# (e) the JSON-subset validator rejects Object/NaN/INF/oversize, (f) set_state round-trips
+# through the state projection and PRESERVES metadata with no orphan.
+func _test_metadata() -> void:
+	print("[P6a] per-cell metadata store + state-axis lifecycle")
+	var world: WorldManager = _struct_world("P6aMeta")
+	var orphans: Array = []
+	world.block_entity_orphaned.connect(func(c: Vector3i, m: Dictionary) -> void: orphans.append([c, m]))
+
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var cell := Vector3i(cx, g + 1, cz)
+
+	# (a) ZERO-COST DEFAULT: a pristine world has an EMPTY _meta, and plain cube
+	# place/break edits never allocate a metadata entry.
+	_ok(world._meta.size() == 0, "zero-cost default: _meta empty on a pristine world")
+	world.place_block(cell, STONE)
+	world.break_terrain(cell, Vector3.INF)
+	world.place_block(cell, STONE)
+	_ok(world._meta.size() == 0, "plain place/break creates NO metadata entries (zero-cost default holds)")
+	_ok(orphans.is_empty(), "no orphan signal from plain edits")
+	world.break_terrain(cell, Vector3.INF)
+
+	# has_block_entity is false for every shipped material until we flip one.
+	var BE := STONE
+	var st: VoxelState = BlockCatalog.state_of(BE)
+	var prev_flag := st.has_block_entity
+	_ok(not BlockCatalog.has_block_entity(BE), "has_block_entity is false for shipped materials (default)")
+	st.has_block_entity = true
+	_ok(BlockCatalog.has_block_entity(BE), "has_block_entity true after the flag is set")
+
+	# (d) metadata on a NON-block-entity material is rejected, writes nothing.
+	_ok(world.place_block(cell, GRASS), "place a grass cell (non block-entity)")
+	_ok(world.set_metadata(cell, {"k": 1}) == false, "set_metadata REJECTED on a non-block-entity material")
+	_ok(world._meta.size() == 0, "rejected metadata wrote nothing")
+	world.break_terrain(cell, Vector3.INF)
+
+	# (b) ROUND-TRIP on a block-entity cell (nested doc: bool/int/float/String/Array/Dict).
+	_ok(world.place_block(cell, BE), "place a block-entity cell")
+	var doc := {"label": "chest", "count": 7, "open": false, "items": [1, 2, 3], "sub": {"x": 1.5}}
+	_ok(world.set_metadata(cell, doc), "set_metadata on the block-entity cell succeeds")
+	_ok(world.has_metadata(cell), "has_metadata true after set")
+	_ok(world._meta.size() == 1, "exactly one metadata entry stored")
+	_ok(world.get_metadata(cell) == doc, "get_metadata round-trips the document (deep equal)")
+	# returned document is a COPY — mutating it must not change the stored state.
+	var got := world.get_metadata(cell)
+	got["count"] = 999
+	_ok(world.get_metadata(cell)["count"] == 7, "get_metadata returns a copy (no aliasing into the store)")
+
+	# (e) JSON-subset validator rejects an Object, NaN, INF, a non-String key, and an
+	# oversize document; every rejection leaves the good document intact (validate-first).
+	_ok(world.set_metadata(cell, {"bad": world}) == false, "validator rejects an Object value")
+	_ok(world.set_metadata(cell, {"nan": NAN}) == false, "validator rejects a NaN float")
+	_ok(world.set_metadata(cell, {"inf": INF}) == false, "validator rejects an INF float")
+	_ok(world.set_metadata(cell, {1: "int-key"}) == false, "validator rejects a non-String key")
+	var big := ""
+	for _i in range(WorldManager.META_MAX_BYTES + 100):
+		big += "x"
+	_ok(world.set_metadata(cell, {"blob": big}) == false, "validator rejects an oversize document (> cap)")
+	_ok(world.get_metadata(cell) == doc, "all rejected writes left the good document intact")
+
+	# (f) set_state round-trips through the state projection + canonical, and PRESERVES
+	# metadata (the one write that does) with no orphan.
+	orphans.clear()
+	_ok(world.set_state(cell, 5), "set_state succeeds on the block-entity cell")
+	_ok(CellCodec.state(world.cell_value_at(cell)) == 5, "state axis reads back 5 (projection + canonical)")
+	_ok(world.block_id_at(cell) == BE, "set_state left the material projection unchanged")
+	_ok(world.get_metadata(cell) == doc, "set_state KEPT the metadata (preserving write)")
+	_ok(orphans.is_empty(), "set_state fired NO orphan signal")
+	_ok(world.set_state(Vector3i(cx, g + 40, cz), 3) == false, "set_state on an air cell fails")
+
+	# (c) BREAK frees the metadata (_meta shrinks back) + fires the orphan once with the doc.
+	orphans.clear()
+	_ok(world.break_terrain(cell, Vector3.INF) == BE, "break returns the material id (hotbar contract intact)")
+	_ok(world._meta.size() == 0, "break FREED the metadata entry (_meta shrank back to 0)")
+	_ok(not world.has_metadata(cell), "has_metadata false after break")
+	_ok(orphans.size() == 1, "break fired the orphan signal exactly once")
+	if orphans.size() == 1:
+		_ok(orphans[0][0] == cell and orphans[0][1] == doc, "orphan carried the cell + the old document")
+	world.queue_free()
+
+	# (c') COLLAPSE-undercut also frees metadata (the historically-forgotten path, §16):
+	# a block-entity cell riding a cluster that detaches is carved through _write_cell(c,0),
+	# so its metadata is freed + orphaned. Build a stone pillar with a 1-shelf block-entity
+	# cell on top, set metadata, then break the pillar top so the shelf loses support.
+	var patch := _flat_patch5()
+	if patch.x != 0x7fffffff:
+		var px := patch.x
+		var pz := patch.y
+		var pg: int = TerrainConfig.height_at(px, pz)
+		var w2 := _struct_world("P6aCollapse")
+		var orphans2: Array = []
+		w2.block_entity_orphaned.connect(func(c: Vector3i, m: Dictionary) -> void: orphans2.append([c, m]))
+		for k in range(1, 4):
+			w2.place_block(Vector3i(px, pg + k, pz), BE)       # pillar of 3
+		var shelf := Vector3i(px + 1, pg + 3, pz)              # 1-shelf off the pillar top (air below)
+		_ok(w2.place_block(shelf, BE) and w2.block_id_at(shelf) == BE, "collapse: 1-shelf block-entity cell HOLDS")
+		var sdoc := {"note": "spawner", "runs": 42}
+		_ok(w2.set_metadata(shelf, sdoc) and w2.has_metadata(shelf), "collapse: metadata set on the shelf cell")
+		orphans2.clear()
+		w2.break_terrain(Vector3i(px, pg + 3, pz), Vector3.INF)   # remove the shelf's support
+		_ok(not w2.has_metadata(shelf) and w2.block_id_at(shelf) != BE,
+			"collapse: undercut shelf detached and its metadata was FREED")
+		var found_orphan := false
+		for o: Array in orphans2:
+			if o[0] == shelf and o[1] == sdoc:
+				found_orphan = true
+		_ok(found_orphan, "collapse: orphan signal fired for the carved block-entity cell with its doc")
+		w2.queue_free()
+	else:
+		_ok(false, "collapse: found a flat patch for the collapse-frees-metadata test")
+
+	st.has_block_entity = prev_flag                            # restore (gameplay data untouched)

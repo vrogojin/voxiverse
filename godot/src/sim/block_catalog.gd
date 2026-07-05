@@ -90,6 +90,10 @@ static func _from_record(rec: Dictionary) -> VoxelState:
 	s.solidity = float(rec.get("solidity", 1.0))
 	s.permeability = float(rec.get("permeability", 0.0))
 	s.translucence = float(rec.get("translucence", 0.0))
+	# Optional block-entity capability (VDS §3.1); default false. Read via .get like
+	# every other optional key (alias/render/anchors_override) — no record bloat and
+	# no material declares it yet, so gameplay + the drift gate are untouched.
+	s.has_block_entity = bool(rec.get("has_block_entity", false))
 	var rnd: Variant = rec.get("render", {})
 	if rnd is Dictionary:
 		s.cull_group = int((rnd as Dictionary).get("cull_group", 0))
@@ -246,6 +250,14 @@ static func anchors_of(block_id: int) -> Vector3i:
 static func class_of(block_id: int) -> StringName:
 	var s := state_of(block_id)
 	return s.structural_class if s != null else &""
+
+## True iff `block_id` may carry per-cell METADATA (VDS §3.1). AIR / out of range →
+## false (null state). The GATE of `WorldManager.set_metadata`: writing metadata to a
+## material that returns false here is a validation error. Default false for every
+## shipped material (no block entities in the catalog yet).
+static func has_block_entity(block_id: int) -> bool:
+	var s := state_of(block_id)
+	return s != null and s.has_block_entity
 
 # ---------------------------------------------------------------------------
 # blocks.json parsing + the golden "consts asserted against data" check.

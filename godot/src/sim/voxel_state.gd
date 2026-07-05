@@ -12,6 +12,15 @@ extends Resource
 ## the godot_voxel library and the GDScript fallback. -1 = unset.
 @export var block_id: int = -1
 
+## Block-entity capability (VOXEL-DATA-STRUCTURE §3.1): true iff cells of this
+## material may carry per-cell METADATA (container inventories, sign text, machine
+## progress — the Minecraft TileEntity / Luanti node-metadata analogue). Default
+## false; a metadata write to a non-block-entity material is a validation error
+## (WorldManager.set_metadata). Metadata never encodes solidity/occupancy/mass — it
+## can never disagree with the scalar axes about "what is here". No shipped material
+## declares it yet (like state layouts), so this is inert for today's catalog.
+@export var has_block_entity: bool = false
+
 @export_group("Physics")
 ## Mass of one voxel of this state, in kilograms (1 m^3 cell).
 @export var mass: float = 1500.0

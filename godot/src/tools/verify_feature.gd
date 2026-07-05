@@ -40,6 +40,7 @@ func _initialize() -> void:
 	_test_shapes_live()
 	_test_metadata()
 	_test_zonechunk()
+	_test_dynamic_catalog()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1965,3 +1966,164 @@ func _test_zonechunk() -> void:
 	w4.queue_free()
 
 	be_state.has_block_entity = prev_be                  # restore (gameplay data untouched)
+
+# P6c-1. Dynamic material catalog (RUNTIME-MATERIAL-STREAMING §2/§5/§6/§7/§8, §11 subset):
+# the GMID⇄LRID identity model + material-document serialization + placeholder/late
+# resolution — the core of runtime material streaming. Asserts: (a) the STATIC FACADE is
+# unchanged — every existing catalog query returns today's values and the pre-P6c golden
+# asserts stay green (the bootstrap catalog behaves exactly as today; streaming is inert
+# until used); (c) GMID = sha256 of the exact document bytes (same bytes → same GMID, a
+# changed field → a different GMID); (b) register_material of a SYNTHETIC material returns
+# a fresh LRID, to_document→from_document round-trips it byte-stably, and it RENDERS on
+# both paths (ARID lazily allocated via P5's table on the module path); (d) an unknown GMID
+# → an UNRESOLVED magenta placeholder registered under the TRUE GMID (data round-trips
+# losslessly); (e) late-resolution fills the SAME LRID in place (id unchanged, physics/look
+# now real, the Material instance swapped in place with no rebake). Runs LAST so the
+# synthetic materials it appends never perturb the count()==77 bootstrap assertions above.
+func _test_dynamic_catalog() -> void:
+	print("[P6c-1] dynamic material catalog (GMID ⇄ LRID + streaming)")
+
+	# (a) STATIC FACADE UNCHANGED: the bootstrap catalog behaves exactly as today.
+	_ok(BlockCatalog.count() == 77, "static facade: count() still 77 (bootstrap = core+world)")
+	_ok(BlockCatalog.key_of(0) == &"air", "static facade: LRID 0 is the reserved 'air' key")
+	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
+		var nm := BlockCatalog.name_of(id)
+		_ok(BlockCatalog.id_of(StringName(nm)) == id, "static facade: id_of(name_of(%d)) == %d" % [id, id])
+		_ok(BlockCatalog.is_resolved(id), "static facade: bootstrap material %s is RESOLVED" % nm)
+	# aliases still resolve to the frozen core ids (unchanged behaviour).
+	_ok(BlockCatalog.id_of(&"oak_log") == WOOD and BlockCatalog.id_of(&"oak_leaves") == LEAF,
+		"static facade: core aliases (oak_log/oak_leaves) still resolve to WOOD/LEAF")
+	# every bootstrap LRID now carries a stable "<sha256 gmid>#<state>" key that round-trips.
+	var key_stone := BlockCatalog.key_of(STONE)
+	_ok(String(key_stone).begins_with("sha256:") and String(key_stone).ends_with("#stone"),
+		"static facade: stone key is '<sha256 gmid>#stone' (got %s)" % key_stone)
+	_ok(BlockCatalog.lrid_of(key_stone) == STONE, "static facade: lrid_of(key_of(STONE)) round-trips")
+	_ok(String(BlockCatalog.gmid_of(STONE)).begins_with("sha256:"), "static facade: stone has a sha256 GMID")
+	# the pre-P6c golden asserts still hold (redundant tripwire over unchanged data).
+	_ok(BlockCatalog.check_against_data().is_empty(), "static facade: golden blocks.json↔catalog check still green")
+	_ok(is_equal_approx(BlockCatalog.mass_of(STONE), 1500.0) and BlockCatalog.anchors_of(WOOD) == Vector3i(36, 24, 16),
+		"static facade: core masses/anchors unchanged")
+
+	# (c) GMID = sha256 over the document bytes (RMS §2.2): same bytes → same GMID; a
+	# changed field → a different GMID (content-addressed, no canonicalization trap).
+	var doc_a := _synthetic_document("voxiverse:testium", "solid", 1234.0, Color(0.5, 0.25, 0.75, 1.0))
+	var gmid_a := MaterialDocument.gmid_of(doc_a)
+	_ok(String(gmid_a).begins_with("sha256:") and String(gmid_a).length() == 71,
+		"GMID is 'sha256:' + 64 hex chars (got %s)" % gmid_a)
+	var doc_a2 := _synthetic_document("voxiverse:testium", "solid", 1234.0, Color(0.5, 0.25, 0.75, 1.0))
+	_ok(doc_a2 == doc_a, "GMID: an identical def serializes to identical bytes (deterministic)")
+	_ok(MaterialDocument.gmid_of(doc_a2) == gmid_a, "GMID stable: same bytes → same GMID")
+	var doc_b := _synthetic_document("voxiverse:testium", "solid", 1235.0, Color(0.5, 0.25, 0.75, 1.0))  # mass 1234→1235
+	_ok(MaterialDocument.gmid_of(doc_b) != gmid_a, "GMID: a changed field (mass) → a different GMID")
+
+	# (b) REGISTER a synthetic material at runtime → a fresh LRID; the document round-trips
+	# byte-stably (from→to reproduces the GMID); it renders.
+	var before := BlockCatalog.count()
+	var def_a := MaterialDocument.from_document(doc_a)
+	_ok(def_a != null, "from_document parses the synthetic material")
+	_ok(MaterialDocument.gmid_of(MaterialDocument.to_document(def_a)) == gmid_a,
+		"document round-trip: to_document(from_document(bytes)) reproduces the GMID (byte-stable)")
+	var lrid_a := BlockCatalog.register_material(gmid_a, def_a)
+	_ok(lrid_a >= before, "register_material returns a FRESH LRID (>= old count %d, got %d)" % [before, lrid_a])
+	_ok(BlockCatalog.count() == before + 1, "register_material appended exactly one LRID (single-state material)")
+	_ok(is_equal_approx(BlockCatalog.mass_of(lrid_a), 1234.0), "streamed material mass reads through the facade (1234)")
+	_ok(BlockCatalog.name_of(lrid_a) == "solid", "streamed material name reads through the facade")
+	_ok(BlockCatalog.is_solid_id(lrid_a) and BlockCatalog.is_resolved(lrid_a), "streamed material is a valid RESOLVED id")
+	_ok(BlockCatalog.gmid_of(lrid_a) == gmid_a, "streamed material's LRID maps back to its GMID")
+	_ok(BlockCatalog.lrid_of(BlockCatalog.key_of(lrid_a)) == lrid_a, "streamed material key round-trips to its LRID")
+	# idempotent: re-registering the same (gmid, state) returns the SAME LRID, appends nothing.
+	_ok(BlockCatalog.register_material(gmid_a, MaterialDocument.from_document(doc_a)) == lrid_a,
+		"register_material idempotent: same (gmid,state) → same LRID")
+	_ok(BlockCatalog.count() == before + 1, "idempotent re-registration appended nothing")
+	# it RENDERS on the fallback path: a live LRID always yields a non-null material.
+	_ok(BlockMaterials.get_for(lrid_a) != null, "streamed material renders (fallback: non-null material)")
+	# MaterialRegistry.register_document is the ingestion funnel (validate → GMID → register → store bytes).
+	var doc_reg := _synthetic_document("voxiverse:regium", "solid", 555.0, Color(0.25, 0.5, 0.25, 1.0))
+	var gmid_reg := MaterialRegistry.register_document(doc_reg)
+	_ok(gmid_reg == MaterialDocument.gmid_of(doc_reg), "register_document returns the content GMID")
+	_ok(MaterialRegistry.has_document(gmid_reg) and MaterialRegistry.document_bytes(gmid_reg) == doc_reg,
+		"register_document keeps the exact bytes in the content store")
+	_ok(BlockCatalog.lrid_of(StringName(String(gmid_reg) + "#solid")) >= 0, "register_document registered the material")
+	# a malformed document is rejected WHOLE (count unchanged, GMID unresolved).
+	var cnt_pre_bad := BlockCatalog.count()
+	_ok(MaterialRegistry.register_document("{\"voxiverse_material\":1}".to_utf8_buffer()) == &"",
+		"register_document rejects a malformed document (no states) → empty GMID")
+	_ok(BlockCatalog.count() == cnt_pre_bad, "rejected document appended nothing (count unchanged)")
+
+	# module path: a material registered AFTER setup has no cube ARID yet; arid_for lazily
+	# bakes one so the ARID is renderable (never a hole, F5), growing the appearance table.
+	if ClassDB.class_exists("VoxelTerrain"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		var built: bool = mw.call("setup")
+		_ok(built, "streaming render: module world builds")
+		if built:
+			var ac0: int = mw.call("appearance_count")
+			var doc_r := _synthetic_document("voxiverse:renderium", "solid", 900.0, Color(0.5, 0.75, 0.25, 1.0))
+			var lrid_r := BlockCatalog.register_material(MaterialDocument.gmid_of(doc_r), MaterialDocument.from_document(doc_r))
+			_ok(lrid_r >= 0, "streaming render: material registered after setup")
+			var arid_r: int = mw.call("arid_for", lrid_r, 0)
+			_ok(arid_r >= 0 and bool(mw.call("can_render", arid_r)),
+				"streaming render: lazy cube ARID is baked + renderable (never a hole)")
+			_ok(int(mw.call("appearance_count")) == ac0 + 1,
+				"streaming render: exactly one cube model appended + baked for the streamed LRID")
+			_ok(int(mw.call("arid_for", lrid_r, 0)) == arid_r,
+				"streaming render: cube ARID stable on re-lookup (no duplicate append)")
+			_ok(int(mw.call("appearance_count")) == ac0 + 1, "streaming render: no duplicate model for the same LRID")
+		mw.queue_free()
+	else:
+		print("    (godot_voxel module absent — streamed-material ARID checked on module builds only)")
+
+	# (d) UNKNOWN GMID → an UNRESOLVED magenta placeholder under the TRUE GMID (RMS §8):
+	# world data round-trips losslessly (the cell keeps its true identity), only the
+	# behaviour/look are provisional.
+	var doc_p := _synthetic_document("voxiverse:latium", "solid", 4321.0, Color(0.25, 0.5, 0.75, 1.0))
+	var gmid_p := MaterialDocument.gmid_of(doc_p)
+	var cnt_before_p := BlockCatalog.count()
+	var lrid_p := BlockCatalog.register_placeholder(gmid_p, &"solid")
+	_ok(lrid_p >= cnt_before_p, "placeholder: an unknown GMID registers a fresh LRID")
+	_ok(BlockCatalog.count() == cnt_before_p + 1, "placeholder: appended exactly one LRID")
+	_ok(not BlockCatalog.is_resolved(lrid_p), "placeholder: the LRID is UNRESOLVED")
+	_ok(BlockCatalog.gmid_of(lrid_p) == gmid_p, "placeholder: registered under the TRUE GMID (identity preserved)")
+	_ok(BlockCatalog.color_of(lrid_p) == Color(1, 0, 1, 1), "placeholder: magenta look")
+	_ok(is_equal_approx(BlockCatalog.mass_of(lrid_p), 1000.0), "placeholder: default physics (mass 1000)")
+	_ok(BlockCatalog.solidity_of(lrid_p) >= 0.5 and BlockCatalog.is_solid_id(lrid_p),
+		"placeholder: solid + valid placeable id (data loads losslessly)")
+	# establish the placeholder's magenta render material so late-resolution must swap it.
+	var mat_p: StandardMaterial3D = BlockMaterials.get_for(lrid_p)
+	_ok(mat_p != null and mat_p.albedo_color == Color(1, 0, 1, 1), "placeholder: renders the magenta swatch")
+	# idempotent: re-requesting the same placeholder returns the SAME LRID.
+	_ok(BlockCatalog.register_placeholder(gmid_p, &"solid") == lrid_p, "placeholder: idempotent (same LRID)")
+
+	# (e) LATE RESOLUTION: supplying the real document resolves the SAME LRID in place —
+	# id unchanged, physics/look now real, the Material instance swapped in place.
+	var def_p := MaterialDocument.from_document(doc_p)
+	var lrid_resolved := BlockCatalog.register_material(gmid_p, def_p)
+	_ok(lrid_resolved == lrid_p, "late resolution: the SAME LRID resolved in place (id unchanged)")
+	_ok(BlockCatalog.count() == cnt_before_p + 1, "late resolution: NO new LRID appended")
+	_ok(BlockCatalog.is_resolved(lrid_p), "late resolution: the LRID is now RESOLVED")
+	_ok(is_equal_approx(BlockCatalog.mass_of(lrid_p), 4321.0), "late resolution: physics now real (mass 4321)")
+	_ok(BlockCatalog.name_of(lrid_p) == "solid", "late resolution: the name resolves")
+	_ok(BlockCatalog.color_of(lrid_p) == Color(0.25, 0.5, 0.75, 1.0), "late resolution: look now real (catalog swatch)")
+	# the SAME cached Material instance was swapped in place — no new instance, no rebake.
+	_ok(BlockMaterials.get_for(lrid_p) == mat_p, "late resolution: same Material instance (in-place swap)")
+	_ok(mat_p.albedo_color == Color(0.25, 0.5, 0.75, 1.0), "late resolution: the material look swapped to the real colour")
+
+# Serialize a synthetic single-state material to its document bytes (a test fixture for
+# the streaming path). Uses float32-exact swatch/mass values so the JSON round-trip is
+# byte-stable (GMID assertions above rely on it).
+func _synthetic_document(mat_name: String, state_name: String, mass: float, swatch: Color) -> PackedByteArray:
+	var st := VoxelState.new()
+	st.state_name = StringName(state_name)
+	st.mass = mass
+	st.density = mass
+	st.break_force = 800.0
+	st.solidity = 1.0
+	st.tint = swatch
+	st.structural_class = &"rock"
+	st.strength_anchors = Vector3i(8, 4, 2)
+	var def := VoxelMaterialDef.new()
+	def.id = StringName(mat_name)
+	def.states = [st]
+	def.default_state_index = 0
+	return MaterialDocument.to_document(def)

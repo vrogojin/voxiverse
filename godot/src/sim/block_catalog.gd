@@ -4,17 +4,30 @@ extends RefCounted
 ## ids, masses, looks from here: physics reads masses, world/UI read ids/colors/names.
 ## Built on the VoxelState framework so the sim layer stays the source of truth.
 ##
-## DATA-DRIVEN (WGC §4): `ensure_ready()` loads `assets/blocks.json` into the per-id
-## VoxelState array — record order IS the dense id (APPEND-ONLY file). `count()` is
-## derived from the data (77 today: `core` ids 0-5 + `world` ids 6-76). The frozen
-## core consts below (AIR..LEAF, `CORE_COUNT`) are KEPT and ASSERTED against the loaded
-## data (`_assert_frozen_core`), so a reorder/renumber of the core is a hard failure,
-## not a silent recolour. The `extended` tier (WGC §3.1) streams ids in later (P6).
+## DYNAMIC CATALOG behind a STATIC FACADE (RUNTIME-MATERIAL-STREAMING §6.1): the fixed
+## per-id arrays are now a session table keyed by GMID (RMS §2.4) with an APPEND-ONLY
+## LRID counter — materials can be registered at runtime (`register_material`) without a
+## restart. The query API below (`state_of`/`mass_of`/`color_of`/`name_of`/`is_solid_id`/
+## `id_of`/`solidity_of`/`anchors_of`/`class_of`/`has_block_entity`/`count`) keeps its
+## EXACT signatures, so the rule "everyone reads ids/masses/looks from BlockCatalog"
+## survives untouched — callers cannot tell the catalog grew.
+##
+## IDENTITY (RMS §2): a Local Render ID (LRID, the dense int callers use) is allocated
+## per (material, state) and NEVER recycled/reordered in a session (F4/§7.4). A Global
+## Material ID (GMID, content hash of the material document) is the cross-session/peer
+## identity; LRIDs never travel, GMIDs do. `_by_key` maps "<gmid>#<state>" → LRID.
+##
+## BOOTSTRAP SET (RMS §2.5): today's core+world materials from `assets/blocks.json` are
+## registered first thing at `ensure_ready()` IN DENSE ID ORDER, pinning their LRIDs to
+## exactly today's ids (0..76) — the frozen core consts (AIR..LEAF, `CORE_COUNT`) are
+## KEPT and ASSERTED against the loaded data (`_assert_frozen_core`), so a reorder/
+## renumber is a hard failure, not a silent recolour. AIR==0 is a permanent reserved
+## LRID (air is absence — no document; its key is the literal "air").
 ##
 ## Block ids are DENSE (0..count()-1) and shared by the godot_voxel blocky library
-## (model index == id), the fallback mesher, the edit overlay, VoxelBody cells, and
-## inventory stacks. The library-order invariant (module_world asserts each returned
-## model id equals the id here, now over ALL ids) is the single most fragile coupling.
+## (model index == id for the bootstrap set), the fallback mesher, the edit overlay,
+## VoxelBody cells, and inventory stacks. The library-order invariant is the single most
+## fragile coupling.
 
 const AIR := 0
 const GRASS := 1
@@ -28,16 +41,38 @@ const CORE_COUNT := 6                 # frozen core ids 0..CORE_COUNT-1 (always 
 ## also read by verify/tooling. Web export ships it (export_presets include_filter).
 const DATA_PATH := "res://assets/blocks.json"
 
-# Lazily-built VoxelStates indexed by block id. Index AIR stays null (air carries no
-# state). Built on the main thread via ensure_ready() before any meshing/sim.
-static var _states: Array[VoxelState] = []
-static var _id_by_name: Dictionary = {}    # StringName -> int (name AND alias -> id)
+## Fixed session-table capacity = the 16-bit TYPE-channel ceiling (godot_voxel
+## MAX_MODELS, RMS F1/F6). The table arrays are preallocated to this ONCE and never
+## resized, so a growing catalog never reallocates under a concurrent worker-thread
+## reader (RMS §6.1 publish-before-use discipline); `_count` is published only after a
+## row is fully built.
+const CAPACITY := 65536
 
-## Idempotent; loads blocks.json and builds the per-id VoxelStates (main thread).
-## Safe to call from SurfaceModel.ensure_ready() / module_world.setup() and repeatedly.
+## Per-LRID resolution status (RMS §7.1/§8): a RESOLVED row has real physics+look; an
+## UNRESOLVED row is a placeholder registered under a known GMID whose document has not
+## arrived yet (magenta look, default physics) — world data round-trips losslessly and
+## late-resolution fills the SAME LRID in place.
+enum { RESOLVED = 0, UNRESOLVED = 1 }
+
+# --- session table (index == LRID; entry 0 is reserved AIR) ---------------------
+static var _ready := false
+static var _count := 0                              # published dense count (0..count()-1)
+static var _states: Array[VoxelState] = []          # LRID -> VoxelState (null for AIR)
+static var _keys: PackedStringArray = PackedStringArray()   # LRID -> "<gmid>#<state>" ("air" for AIR)
+static var _defs: Array[VoxelMaterialDef] = []      # LRID -> owning material def (null for AIR)
+static var _status: PackedByteArray = PackedByteArray()     # LRID -> RESOLVED | UNRESOLVED
+static var _by_key: Dictionary = {}                 # "<gmid>#<state>" -> int LRID (reverse index)
+static var _id_by_name: Dictionary = {}             # StringName -> int (name AND alias -> LRID)
+
+## Idempotent; preallocates the table and registers the bootstrap set from blocks.json
+## (main thread). Safe to call from SurfaceModel.ensure_ready() / module_world.setup()
+## and repeatedly. `_ready` is set BEFORE registering so the re-entrant ensure_ready()
+## inside register_material is a no-op (no recursion).
 static func ensure_ready() -> void:
-	if not _states.is_empty():
+	if _ready:
 		return
+	_ready = true
+	_init_table()
 	var records := load_data()
 	if records.is_empty():
 		# The live web demo is non-negotiable (CLAUDE.md): if the JSON failed to ship
@@ -46,26 +81,164 @@ static func ensure_ready() -> void:
 		push_error("[BlockCatalog] could not load %s — falling back to frozen core only" % DATA_PATH)
 		_build_core_fallback()
 		return
-	# Size by the highest id so the array is dense; ids are assigned by record order.
+	# Register in DENSE ID ORDER so each bootstrap LRID lands exactly on today's id.
+	var by_id := {}
 	var max_id := -1
 	for rec: Variant in records:
 		if rec is Dictionary and rec.has("id"):
+			by_id[int(rec["id"])] = rec
 			max_id = maxi(max_id, int(rec["id"]))
-	_states.resize(max_id + 1)
-	_id_by_name.clear()
-	for rec: Variant in records:
-		if not (rec is Dictionary and rec.has("id")):
-			continue
-		var id := int(rec["id"])
-		var nm := String(rec.get("name", ""))
-		_id_by_name[StringName(nm)] = id
-		if rec.has("alias") and rec["alias"] != null:
-			_id_by_name[StringName(String(rec["alias"]))] = id
+	for id in range(0, max_id + 1):
 		if id == AIR:
-			_states[id] = null            # air carries no state
+			_append_air()
 			continue
-		_states[id] = _from_record(rec)
+		if not by_id.has(id):
+			push_error("[BlockCatalog] blocks.json has a hole at id %d (dense catalog requires contiguous ids)" % id)
+			continue
+		var rec: Dictionary = by_id[id]
+		var st := _from_record(rec)
+		var alias: StringName = &""
+		if rec.has("alias") and rec["alias"] != null:
+			alias = StringName(String(rec["alias"]))
+		var lrid := _register_bootstrap_state(st, alias)
+		assert(lrid == id, "bootstrap LRID %d != id %d (append order broke)" % [lrid, id])
 	_assert_frozen_core()
+
+## Reset + preallocate the session table (once). Fixed-capacity arrays never resized
+## again (RMS §6.1).
+static func _init_table() -> void:
+	_count = 0
+	_by_key.clear()
+	_id_by_name.clear()
+	_states.resize(CAPACITY)
+	_defs.resize(CAPACITY)
+	_keys.resize(CAPACITY)
+	_status.resize(CAPACITY)
+
+## Reserve LRID 0 for AIR: null state, literal "air" key/name, no document (RMS §2.5).
+static func _append_air() -> void:
+	_states[AIR] = null
+	_defs[AIR] = null
+	_keys[AIR] = "air"
+	_status[AIR] = RESOLVED
+	_by_key["air"] = AIR
+	_id_by_name[&"air"] = AIR
+	_count = 1
+
+## Build a single-state material def around `st`, hash its document to a GMID, and
+## register it (bootstrap path). Also maps the optional alias to the new LRID.
+static func _register_bootstrap_state(st: VoxelState, alias: StringName) -> int:
+	var def := VoxelMaterialDef.new()
+	def.id = st.state_name
+	def.states = [st]
+	def.default_state_index = 0
+	var gmid := MaterialDocument.gmid_of(MaterialDocument.to_document(def))
+	var lrid := register_material(gmid, def)
+	if alias != &"" and lrid > 0:
+		_id_by_name[alias] = lrid
+	return lrid
+
+# ---------------------------------------------------------------------------
+# Runtime registration (RMS §6.1) — the append-only heart of streaming.
+
+## Register a material's states behind the static facade, one LRID per (gmid, state) in
+## document order (RMS §2.3/§6.1). Returns the LRID of the material's DEFAULT state (the
+## id a freshly-placed cell of this material carries). APPEND-ONLY and IDEMPOTENT:
+## re-registering an already-present (gmid, state) reuses its LRID and changes nothing.
+## LATE RESOLUTION (RMS §8): if the (gmid, state) exists as an UNRESOLVED placeholder,
+## the real state fills that SAME LRID in place (physics/look become real, id unchanged).
+static func register_material(gmid: StringName, def: VoxelMaterialDef) -> int:
+	ensure_ready()
+	if def == null or def.states.is_empty():
+		return -1
+	var default_name := ""
+	var ds := def.get_default_state()
+	if ds != null:
+		default_name = String(ds.state_name)
+	var default_lrid := -1
+	for st: VoxelState in def.states:
+		var key := _key(gmid, st.state_name)
+		var lrid: int
+		if _by_key.has(key):
+			lrid = int(_by_key[key])
+			if _status[lrid] == UNRESOLVED:
+				# Late resolution: fill the placeholder LRID in place — no new id.
+				st.block_id = lrid
+				_states[lrid] = st
+				_defs[lrid] = def
+				_status[lrid] = RESOLVED
+				_register_name(def.id, lrid)
+				_register_name(st.state_name, lrid)
+				BlockMaterials.refresh(lrid)         # swap the placeholder look in place (§5.3)
+			# else: already resolved — idempotent, leave untouched.
+		else:
+			lrid = _append(key, st, def, RESOLVED)
+			_register_name(def.id, lrid)
+			_register_name(st.state_name, lrid)
+		if String(st.state_name) == default_name:
+			default_lrid = lrid
+	if default_lrid < 0 and not def.states.is_empty():
+		default_lrid = int(_by_key.get(_key(gmid, def.states[0].state_name), -1))
+	return default_lrid
+
+## Register an UNRESOLVED placeholder LRID for a known (gmid, state) whose document is
+## not available (RMS §8): default physics (mass 1000, break_force 1000, solidity 1),
+## magenta look — so world data referencing this GMID loads losslessly (cells keep their
+## true identity) and late-resolution can fill the SAME LRID. Idempotent.
+static func register_placeholder(gmid: StringName, state_name: StringName) -> int:
+	ensure_ready()
+	var key := _key(gmid, state_name)
+	if _by_key.has(key):
+		return int(_by_key[key])
+	var st := _make_placeholder_state(state_name)
+	var def := VoxelMaterialDef.new()
+	def.id = state_name
+	def.states = [st]
+	def.default_state_index = 0
+	var lrid := _append(key, st, def, UNRESOLVED)
+	_register_name(state_name, lrid)
+	return lrid
+
+## Append one (state) row at the next free LRID and PUBLISH the count last (RMS §6.1).
+## Sets state.block_id to the allocated LRID (its look id, shared by both render paths).
+static func _append(key: String, st: VoxelState, def: VoxelMaterialDef, status: int) -> int:
+	var lrid := _count
+	if lrid >= CAPACITY:
+		push_error("[BlockCatalog] session catalog full (%d) — refusing further registrations" % CAPACITY)
+		return -1
+	st.block_id = lrid
+	_states[lrid] = st
+	_defs[lrid] = def
+	_keys[lrid] = key
+	_status[lrid] = status
+	_by_key[key] = lrid
+	_count = lrid + 1                                # publish AFTER the row is fully built
+	return lrid
+
+## The magenta-checker default state of an UNRESOLVED placeholder (RMS §8).
+static func _make_placeholder_state(state_name: StringName) -> VoxelState:
+	var s := VoxelState.new()
+	s.state_name = state_name
+	s.mass = 1000.0
+	s.density = 1000.0
+	s.break_force = 1000.0
+	s.solidity = 1.0
+	s.tint = Color(1.0, 0.0, 1.0, 1.0)              # magenta — the universal "missing" swatch
+	s.structural_class = &"rock"
+	s.strength_anchors = Vector3i(1, 1, 1)
+	return s
+
+## The "<gmid>#<state>" reverse-index key (RMS §2.3).
+static func _key(gmid: StringName, state_name: StringName) -> String:
+	return "%s#%s" % [String(gmid), String(state_name)]
+
+## Map a name/alias to an LRID, first-writer-wins so a streamed material can never
+## clobber a bootstrap name (aliases are non-authoritative, RMS §2.2).
+static func _register_name(nm: StringName, lrid: int) -> void:
+	if nm != &"" and not _id_by_name.has(nm):
+		_id_by_name[nm] = lrid
+
+# ---------------------------------------------------------------------------
 
 ## Build one VoxelState from a blocks.json record. Missing break_force -> INF
 ## (bedrock/water/lava); missing render -> opaque (cull_group 0, no glow).
@@ -105,7 +278,7 @@ static func _from_record(rec: Dictionary) -> VoxelState:
 ## ids/names/masses/anchors must match the hard-frozen values. A drift here means the
 ## file was reordered/renumbered or a core value was silently changed — fail loudly.
 static func _assert_frozen_core() -> void:
-	assert(_states.size() >= CORE_COUNT, "blocks.json has fewer than the %d core ids" % CORE_COUNT)
+	assert(_count >= CORE_COUNT, "blocks.json has fewer than the %d core ids" % CORE_COUNT)
 	assert(id_of(&"grass") == GRASS and id_of(&"dirt") == DIRT and id_of(&"stone") == STONE
 		and id_of(&"wood") == WOOD and id_of(&"leaf") == LEAF,
 		"core ids drifted from the frozen consts (blocks.json reorder?)")
@@ -118,12 +291,10 @@ static func _assert_frozen_core() -> void:
 		"core anchors drifted from the frozen values")
 
 ## In-code frozen core, built only when blocks.json cannot be loaded (web export
-## misconfig safety net). Mirrors the ids 0-5 rows of blocks.json exactly.
+## misconfig safety net). Mirrors the ids 0-5 rows of blocks.json exactly — registered
+## through the SAME dynamic path so LRIDs still land on the frozen consts.
 static func _build_core_fallback() -> void:
-	_states.resize(CORE_COUNT)
-	_id_by_name.clear()
-	_states[AIR] = null
-	_id_by_name[&"air"] = AIR
+	_append_air()
 	_make(GRASS, &"grass", 750.0, 800.0, Color(0.30, 0.55, 0.24), Vector3i(4, 2, 1), &"soil")
 	_make(DIRT, &"dirt", 900.0, 900.0, Color(0.45, 0.31, 0.18), Vector3i(4, 2, 1), &"soil")
 	_make(STONE, &"stone", 1500.0, 2500.0, Color(0.52, 0.52, 0.55), Vector3i(64, 6, 4), &"rock")
@@ -137,21 +308,20 @@ static func _make(block_id: int, state_name: StringName, mass: float,
 		structural_class := &"rock") -> void:
 	var s := VoxelState.new()
 	s.state_name = state_name
-	s.block_id = block_id
 	s.mass = mass
 	s.density = mass
 	s.break_force = break_force
 	s.tint = swatch
 	s.strength_anchors = strength_anchors
 	s.structural_class = structural_class
-	_states[block_id] = s
-	_id_by_name[state_name] = block_id
+	var lrid := _register_bootstrap_state(s, &"")
+	assert(lrid == block_id, "fallback-core LRID %d != id %d" % [lrid, block_id])
 
-## Total number of loaded block ids (dense 0..count()-1). Derived from the data (77
-## for core+world today), NOT a hardcoded const — WGC §3.1/§4.
+## Total number of live block ids (dense 0..count()-1). Derived from the session table
+## (77 for core+world at start; grows as materials stream in) — WGC §3.1/§4, RMS §6.1.
 static func count() -> int:
 	ensure_ready()
-	return _states.size()
+	return _count
 
 ## Dense id for a material NAME or ALIAS StringName (WGC §4); -1 if unknown.
 static func id_of(material_name: StringName) -> int:
@@ -161,7 +331,7 @@ static func id_of(material_name: StringName) -> int:
 ## The VoxelState for `block_id`; null for AIR or out of range.
 static func state_of(block_id: int) -> VoxelState:
 	ensure_ready()
-	if block_id <= AIR or block_id >= _states.size():
+	if block_id <= AIR or block_id >= _count:
 		return null
 	return _states[block_id]
 
@@ -258,6 +428,38 @@ static func class_of(block_id: int) -> StringName:
 static func has_block_entity(block_id: int) -> bool:
 	var s := state_of(block_id)
 	return s != null and s.has_block_entity
+
+# ---------------------------------------------------------------------------
+# GMID ⇄ LRID identity queries (RMS §6.1) — the streaming-facing surface. Callers that
+# don't stream never touch these; the query API above stays the one everyone reads.
+
+## LRID for a serialized "<gmid>#<state>" reference, or -1 if not registered this
+## session (RMS §2.4). The load-side translation entry point.
+static func lrid_of(key: StringName) -> int:
+	ensure_ready()
+	return int(_by_key.get(String(key), -1))
+
+## The serialized "<gmid>#<state>" key an LRID means ("air" for AIR, "" out of range).
+## The save-side translation: dense LRID → cross-session identity.
+static func key_of(lrid: int) -> StringName:
+	ensure_ready()
+	if lrid < 0 or lrid >= _count:
+		return &""
+	return StringName(_keys[lrid])
+
+## The GMID an LRID belongs to (the "<gmid>" part of its key; "air" for AIR).
+static func gmid_of(lrid: int) -> StringName:
+	var k := String(key_of(lrid))
+	var hash_pos := k.find("#")
+	return StringName(k.substr(0, hash_pos)) if hash_pos >= 0 else StringName(k)
+
+## True iff `lrid` is RESOLVED (real physics+look); false for an UNRESOLVED placeholder
+## (RMS §8). AIR and out-of-range read as resolved/false-safe.
+static func is_resolved(lrid: int) -> bool:
+	ensure_ready()
+	if lrid < 0 or lrid >= _count:
+		return false
+	return _status[lrid] == RESOLVED
 
 # ---------------------------------------------------------------------------
 # blocks.json parsing + the golden "consts asserted against data" check.

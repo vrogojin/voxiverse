@@ -41,6 +41,27 @@ static func get_for(block_id: int) -> StandardMaterial3D:
 	_cache[block_id] = mat
 	return mat
 
+## Update the EXISTING cached Material for `block_id` in place from the catalog look
+## (RUNTIME-MATERIAL-STREAMING §5.3): when an UNRESOLVED placeholder LRID late-resolves
+## to a real material, the swatch/emission are swapped into the same StandardMaterial3D
+## instance every holder already references (library model override, fallback surface,
+## VoxelBody surface) — so the look updates everywhere with no rebake/remesh. A no-op if
+## nothing has cached this id yet (the next `get_for` builds it fresh from the real look).
+static func refresh(block_id: int) -> void:
+	var mat: StandardMaterial3D = _cache.get(block_id, null)
+	if mat == null:
+		return
+	var color := BlockCatalog.color_of(block_id)
+	# Flat-swatch materials (no tile, the placeholder + streamed-material case) carry the
+	# colour in albedo_color; textured materials tint white and keep the texture.
+	if mat.albedo_texture == null:
+		mat.albedo_color = color
+	var rd := BlockCatalog.render_def_of(block_id)
+	if rd.get("emissive", false):
+		mat.emission_enabled = true
+		mat.emission = Color(color.r, color.g, color.b)
+		mat.emission_energy_multiplier = float(rd.get("emissive_glow", 1.0))
+
 ## Textured material for a block face. Unshaded (DESIGN §1: flat ambient look, no
 ## sun/shadows) and double-sided so newly-exposed inner faces read correctly after
 ## a break regardless of winding. NEAREST filter keeps the pixel-art look crisp;

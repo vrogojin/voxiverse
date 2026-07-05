@@ -157,11 +157,47 @@ func arid_for(mat: int, modifier: int) -> int:
 		_library.call("bake")                          # one batched re-bake per novel shape
 	return got
 
-## The eager plain-cube ARID for a material (== LRID for bootstrap materials).
+## The plain-cube ARID for a material (== LRID for the bootstrap set). A material
+## registered AFTER setup (runtime streaming, RMS §3.1) has no cube model yet — allocate
+## one lazily so writing its ARID never renders a hole (F5 safety net). Cube ARIDs of
+## streamed LRIDs may drift from the LRID (shaped ARIDs already occupy the low model
+## indices) — harmless: nothing outside this module mirror ever sees an ARID (VDS §8.1).
 func _cube_arid_of(mat: int) -> int:
-	if mat >= 0 and mat < _cube_arid.size():
+	if mat >= 0 and mat < _cube_arid.size() and _cube_arid[mat] >= 0:
 		return _cube_arid[mat]
-	return mat                                         # defensive: table not built yet
+	return _append_cube_for(mat)
+
+## Lazily append + bake a plain-cube model for a streamed LRID (MAIN THREAD ONLY —
+## `set_cell`/`arid_for` never run on the voxel worker). Grows the LRID→cube-ARID table
+## to cover `mat`, asserts `add_model()` returns the expected model index (the anti-drift
+## guard, VDS §8.1), and re-bakes. Returns the new ARID, or a defensive fallback on
+## drift/absent library (never crashes).
+func _append_cube_for(mat: int) -> int:
+	if _library == null:
+		return mat
+	if mat >= _cube_arid.size():
+		var old := _cube_arid.size()
+		_cube_arid.resize(mat + 1)
+		for i in range(old, mat + 1):
+			_cube_arid[i] = -1
+	if _cube_arid[mat] >= 0:
+		return _cube_arid[mat]
+	var expected := _next_arid
+	var got: int = _add_cube(_library, BlockMaterials.get_for(mat), BlockCatalog.cull_group_of(mat))
+	if got != expected:
+		push_warning("[module_world] streamed cube ARID drift: add_model %d != expected %d" % [got, expected])
+		return got if got >= 0 else mat
+	_next_arid += 1
+	_cube_arid[mat] = got
+	if _library.has_method("bake"):
+		_library.call("bake")                          # one batched re-bake per streamed material
+	return got
+
+## True when `arid` is baked into the live library and therefore safe to write into the
+## voxel TYPE channel (RMS §3.1 paint gate). All appended models are baked eagerly, so
+## the baked count equals the appended count (`_next_arid`).
+func can_render(arid: int) -> bool:
+	return arid >= 0 and arid < _next_arid
 
 ## Total appearance ids allocated so far (cube ARIDs + lazily-baked shaped ARIDs) —
 ## == the library model count. Used by verify to fence the lazy append (VDS §8.1).

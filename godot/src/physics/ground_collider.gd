@@ -33,6 +33,9 @@ var _center := Vector2i(0x7fffffff, 0)   # force first build
 # no allocation — only PhysicsServer re-attach. Grows to the peak box count.
 var _pool: Array[BoxShape3D] = []
 var _used := 0                            # boxes attached this rebuild
+# Parallel pool of convex prisms for shaped (ramp/slab) solid cells (SVS §5.4).
+var _cpool: Array[ConvexPolygonShape3D] = []
+var _cused := 0
 
 func setup(world_ref: WorldManager) -> void:
 	world = world_ref
@@ -72,6 +75,7 @@ func _rebuild() -> void:
 	var rid := get_rid()
 	PhysicsServer3D.body_clear_shapes(rid)
 	_used = 0
+	_cused = 0
 
 	var span := 2 * R + 1
 	var x0 := _center.x - R
@@ -105,10 +109,20 @@ func _rebuild() -> void:
 			var run_start := 0x7fffffff
 			while y <= h:
 				# y <= h ⇒ the heightmap fills this cell; it is air only if broken out.
-				if world.is_removed(Vector3i(x, y, z)):
+				# A single overlay lookup (same cost as is_removed) also catches a placed
+				# SHAPED cell here (dug then a ramp/slab placed): it interrupts the box run
+				# and contributes convex prisms instead of a box (SVS §5.4). Generated cells
+				# below the surface are always full cubes in P5b-1 (no worldgen smoothing).
+				var ov: int = world.placed_cells().get(Vector3i(x, y, z), -1)
+				if ov == 0:                                 # dug to air
 					if run_start != 0x7fffffff:
 						_add_box(rid, x, z, run_start, y)   # run [run_start, y-1] → [run_start, y]
 						run_start = 0x7fffffff
+				elif ov > 0 and CellCodec.modifier(ov) != 0:   # placed shaped cell
+					if run_start != 0x7fffffff:
+						_add_box(rid, x, z, run_start, y)
+						run_start = 0x7fffffff
+					_add_prisms(rid, x, y, z, CellCodec.modifier(ov))
 				elif run_start == 0x7fffffff:
 					run_start = y
 				y += 1
@@ -117,7 +131,17 @@ func _rebuild() -> void:
 			# (grass top) merges straight into a trunk/placed block sitting on it.
 			var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(x, z))
 			while y <= y_top:
-				if world.block_id_at(Vector3i(x, y, z)) != 0:
+				# One composed read: a shaped placed cell (ramp/slab on the ground — the
+				# common case) breaks the box run and contributes convex prisms (SVS §5.4);
+				# full cubes (trees / placed blocks) extend the run as before.
+				var v: int = world.cell_value_at(Vector3i(x, y, z))
+				var mat: int = CellCodec.mat(v)
+				if mat != BlockCatalog.AIR and CellCodec.modifier(v) != 0:
+					if run_start != 0x7fffffff:
+						_add_box(rid, x, z, run_start, y)
+						run_start = 0x7fffffff
+					_add_prisms(rid, x, y, z, CellCodec.modifier(v))
+				elif mat != BlockCatalog.AIR:
 					if run_start == 0x7fffffff:
 						run_start = y
 				elif run_start != 0x7fffffff:
@@ -142,3 +166,33 @@ func _add_box(rid: RID, x: int, z: int, y_bottom: int, y_top: int) -> void:
 	_used += 1
 	var t := Transform3D(Basis(), Vector3(x + 0.5, (float(y_bottom) + float(y_top)) * 0.5, z + 0.5))
 	PhysicsServer3D.body_add_shape(rid, box.get_rid(), t)
+
+## Attach the ≤ 2 convex prisms of a shaped solid cell at (x, y, z) (SVS §5.4): each
+## surface triangle extruded to the anchor face (BOTTOM: y=0; TOP: y=1) is a convex
+## triangular prism, so loose bodies rest/slide on a placed ramp correctly. World-space
+## points, identity transform; degenerate (zero-height) triangles are skipped. Reuses a
+## pooled ConvexPolygonShape3D (its points replaced in place) so a rebuild allocates
+## nothing steady-state.
+func _add_prisms(rid: RID, x: int, y: int, z: int, modifier: int) -> void:
+	var base_y := 0.0 if ShapeCodec.anchor(modifier) == ShapeCodec.ANCHOR_BOTTOM else 1.0
+	var origin := Vector3(x, y, z)
+	for tri: Dictionary in ShapeCodec.surface_tris(modifier):
+		var pts := PackedVector3Array()
+		var nondegen := false
+		for key in ["v0", "v1", "v2"]:
+			var sp: Vector3 = tri[key]
+			if absf(sp.y - base_y) > 1e-4:
+				nondegen = true
+			pts.append(origin + sp)
+			pts.append(origin + Vector3(sp.x, base_y, sp.z))
+		if not nondegen:
+			continue
+		var shape: ConvexPolygonShape3D
+		if _cused < _cpool.size():
+			shape = _cpool[_cused]
+		else:
+			shape = ConvexPolygonShape3D.new()
+			_cpool.append(shape)
+		shape.points = pts
+		_cused += 1
+		PhysicsServer3D.body_add_shape(rid, shape.get_rid(), Transform3D.IDENTITY)

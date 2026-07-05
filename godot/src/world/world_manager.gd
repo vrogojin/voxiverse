@@ -181,20 +181,24 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 		_ground.rebuild_now()
 	return id
 
-## Place one block of `block_id` into `cell`. Fails (returns false, no state
-## change) if the cell is not air (composed query), block_id is invalid (<=0 or
-## >= BlockCatalog.count()), or the material is non-solid (water/lava/powder_snow —
-## WGC §6.3). On success writes the overlay, updates _placed_top,
-## mirrors into the active render path and rebuilds the ground collider.
-## Player-overlap is the CALLER's check (the world doesn't know where the player is).
-func place_block(cell: Vector3i, block_id: int) -> bool:
+## Place a block into `cell`. `value` is a PACKED cell value (CellCodec) so a shaped
+## partial cell (material + modifier — a ramp/slab, SUB-VOXEL-SMOOTHING §9) can be
+## placed; a bare block id is a valid packed value meaning "full cube", so the
+## historical `place_block(cell, id)` call site is unchanged. Fails (returns false,
+## no state change) if the cell is not air (composed query), the MATERIAL is invalid
+## (<=0 or >= count()) or non-solid (water/lava/powder_snow — WGC §6.3). On success
+## writes the CANONICAL overlay value (canonicalization strips a modifier that can't
+## apply, e.g. a corner-3 clamp), updates _placed_top, mirrors into the active render
+## path and rebuilds the ground collider. Player-overlap is the CALLER's check.
+func place_block(cell: Vector3i, value: int) -> bool:
+	var block_id := CellCodec.mat(value)
 	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.count():
 		return false
 	if BlockCatalog.solidity_of(block_id) < 0.5:
 		return false                       # no placing water/lava/powder_snow from the hotbar (WGC §6.3)
 	if cell_solid(cell):
 		return false
-	_write_cell(cell, CellCodec.pack(block_id))   # full cube, default state
+	_write_cell(cell, value)              # _write_cell canonicalizes (full cube if value was a bare id)
 	var key := Vector2i(cell.x, cell.z)
 	var prev: int = _placed_top.get(key, -0x40000000)
 	if cell.y > prev:
@@ -216,15 +220,17 @@ func place_block(cell: Vector3i, block_id: int) -> bool:
 func _write_cell(cell: Vector3i, packed: int) -> void:
 	packed = CellCodec.canonical(packed)
 	_edits[cell] = packed
-	_paint_cell(cell, CellCodec.mat(packed))
+	_paint_cell(cell, packed)
 
-## Mirror one cell's MATERIAL id into the active render path (0 = carve to air).
-## Shared by _write_cell so the godot_voxel / fallback plumbing lives in one
-## place. The caller (_write_cell) owns the `_edits` overlay; break/place own the
-## ground rebuild.
-func _paint_cell(cell: Vector3i, block_id: int) -> void:
+## Mirror one cell's PACKED value into the active render path (0 = carve to air).
+## Shared by _write_cell so the godot_voxel / fallback plumbing lives in one place.
+## The module path resolves the (material, modifier) to a baked appearance id (ARID,
+## VDS §8.1) so a placed ramp/slab renders its shape; the fallback re-reads the world
+## query when it remeshes the cell, so it only needs the cell coordinate. The caller
+## (_write_cell) owns the `_edits` overlay; break/place own the ground rebuild.
+func _paint_cell(cell: Vector3i, packed: int) -> void:
 	if using_module and _module_world != null:
-		_module_world.call("set_cell", cell, block_id)
+		_module_world.call("set_cell", cell, packed)
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
 
@@ -344,35 +350,54 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 		y -= 1
 	return float(effective_height(xi, zi) + 1)
 
-## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2).
-## P5 SEAM: once sub-cube shapes exist, `blocked` gains the SVS §5.2 floor-then-
-## headroom auto-step (a ramp/slab surface `<= STEP_MAX` above the feet is walked
-## up, not blocked). It is INERT for the current world — a full cube's rise is 1.0 m
-## > STEP_MAX, so every full cube still blocks — so P2 keeps the plain body-span
-## occupancy scan below (byte-identical) and defers the auto-step to when ramps land.
+## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
+## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical
+## to flat/blocky ground); a ramp/slab surface `<= STEP_MAX` above the feet is walked
+## up, not blocked (the deliberate half-slab-as-stairs side effect).
 const STEP_MAX := 0.55
+## Player standing body height (feet → head) used for the headroom test.
+const _BODY_HEIGHT := 1.8
+const _EPS := 1e-6
 
-## True if any solid, non-broken terrain cell overlaps the player's vertical body
-## span at column (floor(x), floor(z)). The player is ~1.8 m tall standing with feet
-## at feet_y; the player agent calls this per-axis to stop horizontal movement into
-## a wall (the terrain itself is collider-less, so nothing else does).
+## True if the player cannot stand at column (floor(x), floor(z)) with feet at feet_y
+## because the standable surface just ahead is too tall to step onto (> STEP_MAX above
+## the feet) OR the body would clip a solid cell overhead (SUB-VOXEL-SMOOTHING §5.2).
+## Composes over the merged `floor_under`/`_occ_span`, so the material gate comes for
+## free (water never blocks) and shapes auto-step. BYTE-IDENTICAL for the current
+## all-full-cube world: a full cube ahead raises the standable surface 1.0 m (> STEP_MAX
+## → wall), a body span overlapping the ground finds its surface far above the buried
+## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)
 	var fz := z - float(zi)
-	var y_lo := int(floor(feet_y + 0.1))
-	var y_hi := int(floor(feet_y + 1.7))
-	var y := y_lo
-	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
-	# a non-solid material (water) yields the empty span and does NOT block, while a
-	# full cube (span (0,1) ≠ ZERO) blocks exactly as before — byte-identical to the
-	# old `_cell_solid` body-span scan for the current all-full-cube world.
+	# Standable height at the target column, allowing an auto-step up to STEP_MAX.
+	var top := floor_under(x, z, feet_y + STEP_MAX)
+	if top - feet_y > STEP_MAX:
+		return true                                    # rise too big → wall (a full cube's 1.0 always is)
+	# Headroom above the (possibly auto-stepped) floor: the body must not clip a solid
+	# cell in (top, top + body height) at this footprint.
+	return not _headroom_clear(xi, zi, fx, fz, top)
+
+## True if the player's body column (top .. top + body height) at footprint (fx, fz)
+## in column (xi, zi) is clear of solid occupancy (SVS §5.2). The cell whose top the
+## player stands on ends exactly at `top`, so it never counts as a clip (its interval
+## upper bound == top, tested with an epsilon bias). A TOP-anchored slab / full cube
+## overhead correctly blocks standing.
+func _headroom_clear(xi: int, zi: int, fx: float, fz: float, top: float) -> bool:
+	var head := top + _BODY_HEIGHT
+	var y := int(floor(top))
+	var y_hi := int(floor(head - _EPS))
 	while y <= y_hi:
-		if _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz) != Vector2.ZERO:
-			return true
+		var sp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		if sp != Vector2.ZERO:
+			var occ_lo := float(y) + sp.x
+			var occ_hi := float(y) + sp.y
+			if occ_hi > top + _EPS and occ_lo < head - _EPS:
+				return false
 		y += 1
-	return false
+	return true
 
 func is_solid(pos: Vector3) -> bool:
 	return cell_solid(Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z))))
@@ -415,10 +440,71 @@ func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictio
 			cell.z += step.z; t = t_max.z; t_max.z += t_delta.z
 			normal = Vector3i(0, 0, -step.z)
 		if _cell_solid(cell):
-			return {"hit": true, "voxel": cell, "normal": normal,
-				"position": origin + d * t}
+			var v := cell_value_at(cell)
+			var m := CellCodec.modifier(v)
+			if m == 0:
+				return {"hit": true, "voxel": cell, "normal": normal,
+					"position": origin + d * t}   # full cube: boundary hit (unchanged fast path)
+			# Shaped cell (SVS §5.3): in-cell surface test. t is the entry into this
+			# cell; the exit is the next boundary crossing on any axis.
+			var t_out: float = minf(t_max.x, minf(t_max.y, t_max.z))
+			var res := _ray_vs_partial(m, cell, origin, d, t, t_out, normal)
+			if not res.is_empty():
+				return res
+			# Miss: the ray passed through the empty part of the cell — continue the DDA.
 	return {"hit": false, "voxel": Vector3i.ZERO, "normal": Vector3i.ZERO,
 		"position": origin + d * max_dist}
+
+## In-cell ray test against a shaped (non-full) solid cell (SUB-VOXEL-SMOOTHING §5.3).
+## The caller has already applied the material gate. Completeness: every boundary face
+## of a corner-height shape is either on the cell boundary (covered by the entry-point
+## occupancy test) or on the 1–2 surface triangles (covered by ray/plane tests). The
+## reported `normal` stays axis-aligned (the DDA face for a boundary hit, UP/DOWN for a
+## surface hit) to preserve the break/place adjacency contract; the true sloped normal
+## is exposed as `surface_normal`. Empty dict = miss (the DDA continues).
+func _ray_vs_partial(m: int, cell: Vector3i, origin: Vector3, d: Vector3,
+		t_in: float, t_out: float, dda_normal: Vector3i) -> Dictionary:
+	var base := Vector3(cell)
+	var p_in := origin + d * t_in - base
+	if ShapeCodec.occupied(m, p_in.x, p_in.y, p_in.z):
+		return {"hit": true, "voxel": cell, "normal": dda_normal,
+			"position": origin + d * t_in, "surface_normal": Vector3(dda_normal)}
+	var place_n := Vector3i.UP if ShapeCodec.anchor(m) == ShapeCodec.ANCHOR_BOTTOM else Vector3i.DOWN
+	var p0 := origin - base
+	for tri: Dictionary in ShapeCodec.surface_tris(m):
+		var pn: Vector3 = tri["normal"]
+		var denom := d.dot(pn)
+		if absf(denom) < 1e-9:
+			continue                                   # ray parallel to the surface plane
+		var th := (Vector3(tri["v0"]) - p0).dot(pn) / denom
+		if th < t_in - _EPS or th > t_out + _EPS:
+			continue                                   # plane hit outside this cell's ray span
+		var hp := p0 + d * th
+		if _point_in_tri_xz(hp, tri["v0"], tri["v1"], tri["v2"]):
+			return {"hit": true, "voxel": cell, "normal": place_n,
+				"position": origin + d * th, "surface_normal": pn}
+	return {}
+
+## True if the XZ projection of point `p` lies inside triangle (a, b, c) — the surface
+## is a single-valued height field over XZ, so XZ containment is exact. Barycentric.
+func _point_in_tri_xz(p: Vector3, a: Vector3, b: Vector3, c: Vector3) -> bool:
+	var v0x := c.x - a.x
+	var v0z := c.z - a.z
+	var v1x := b.x - a.x
+	var v1z := b.z - a.z
+	var v2x := p.x - a.x
+	var v2z := p.z - a.z
+	var d00 := v0x * v0x + v0z * v0z
+	var d01 := v0x * v1x + v0z * v1z
+	var d11 := v1x * v1x + v1z * v1z
+	var d20 := v2x * v0x + v2z * v0z
+	var d21 := v2x * v1x + v2z * v1z
+	var denom := d00 * d11 - d01 * d01
+	if absf(denom) < 1e-12:
+		return false                                   # degenerate triangle (no XZ area)
+	var u := (d11 * d20 - d01 * d21) / denom
+	var vv := (d00 * d21 - d01 * d20) / denom
+	return u >= -_EPS and vv >= -_EPS and u + vv <= 1.0 + _EPS
 
 # Internal alias kept for the collapse pass + DDA; delegates to the composed
 # public query (edit overlay first, else generated terrain + trees), so removed

@@ -36,6 +36,7 @@ func _initialize() -> void:
 	_test_merged_physics()
 	_test_world_loop()
 	_test_structural()
+	_test_shapes_live()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1000,6 +1001,141 @@ func _test_world_loop() -> void:
 			break
 	_ok(chopped, "found and chopped a tree trunk")
 	world.queue_free()
+
+# P5b-1. Sub-voxel shapes wired END-TO-END for PLACED cells (SUB-VOXEL-SMOOTHING
+# §4/§5/§9): the module ARID appearance table (lazy shaped model, add_model()==ARID),
+# the analytic physics seams (fractional floor, STEP_MAX auto-step, in-cell ray), a
+# partial VoxelBody (mass = density × ½), and structural attachment by real contact
+# area (zero overlap ⇒ detach). Worldgen is NOT smoothed here, so only player-placed
+# cells can be shaped — full-cube gameplay stays byte-identical (fenced by the P2/P4
+# byte-identity tests above).
+func _test_shapes_live() -> void:
+	print("[P5b-1] sub-voxel shapes live (render ARIDs + analytic physics + dig/place)")
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # descending along +z: H(fx,fz) = 1 − fz
+	var SLAB := ShapeCodec.make_modifier(1, 1, 1, 1)    # flat half-block, rise 0.5
+
+	# (a) MODULE ARID appearance table: the plain-cube ARID equals the LRID (bootstrap),
+	# a shaped value lazily appends ONE VoxelBlockyModelMesh whose model index == the
+	# allocated ARID (the anti-drift assert, VDS §8.1), and a repeat lookup re-uses it.
+	if ClassDB.class_exists("VoxelTerrain"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		var built: bool = mw.call("setup")
+		_ok(built, "shapes-live: module world builds")
+		if built:
+			_ok(int(mw.call("arid_for", STONE, 0)) == STONE, "shapes-live: cube ARID == LRID (bootstrap)")
+			var before: int = mw.call("appearance_count")
+			var arid: int = mw.call("arid_for", STONE, RAMP)
+			_ok(arid == before, "shapes-live: shaped ARID == prior model count (add_model()==ARID held)")
+			_ok(int(mw.call("appearance_count")) == before + 1, "shapes-live: exactly one shaped model appended")
+			_ok(int(mw.call("arid_for", STONE, RAMP)) == arid, "shapes-live: shaped ARID stable on re-lookup (no duplicate append)")
+			_ok(int(mw.call("appearance_count")) == before + 1, "shapes-live: no duplicate ARID for the same shape")
+		mw.queue_free()
+	else:
+		print("    (godot_voxel module absent — ARID appearance table checked on module builds only)")
+
+	# A clear grass column for the physics/dig-place asserts.
+	var world: WorldManager = _struct_world("P5bShapes")
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var rc := Vector3i(cx, g + 1, cz)   # the surface-adjacent air cell (ramp sits on grass)
+
+	# (b) PLACE a shaped value; the ONE world query reports it solid + shaped (both render
+	# paths read this query, so they agree by construction), and the fallback mesher emits
+	# real shape geometry for the placed ramp's chunk.
+	_ok(world.place_block(rc, CellCodec.pack(GRASS, RAMP)), "shapes-live: place a grass RAMP")
+	_ok(world.cell_solid(rc), "shapes-live: placed ramp cell is solid (material gate)")
+	_ok(CellCodec.modifier(world.cell_value_at(rc)) == RAMP, "shapes-live: placed cell carries the ramp modifier")
+	var n := TerrainConfig.CHUNK_SIZE
+	var fb_mesh := ChunkMesher.build(floori(float(cx) / float(n)), floori(float(cz) / float(n)), world)
+	_ok(fb_mesh != null and fb_mesh.get_surface_count() > 0, "shapes-live: fallback mesher builds the ramp chunk (partial geometry)")
+
+	# (c) floor_under is a CONTINUOUS in-cell floor: it varies with the footprint along
+	# the ramp axis and equals cell.y + H(fx,fz) — a boundary-only test would be constant.
+	var f02 := world.floor_under(cx + 0.5, cz + 0.2, float(g) + 3.0)
+	var f05 := world.floor_under(cx + 0.5, cz + 0.5, float(g) + 3.0)
+	var f08 := world.floor_under(cx + 0.5, cz + 0.8, float(g) + 3.0)
+	_ok(f02 > f05 and f05 > f08, "shapes-live: floor_under monotone across the ramp (%.3f>%.3f>%.3f)" % [f02, f05, f08])
+	_ok(is_equal_approx(f02, float(g + 1) + (1.0 - 0.2)), "shapes-live: floor_under == cell.y + H at fz=0.2 (%.3f)" % f02)
+	_ok(is_equal_approx(f08, float(g + 1) + (1.0 - 0.8)), "shapes-live: floor_under == cell.y + H at fz=0.8 (%.3f)" % f08)
+
+	# (e) aimed_voxel hits the IN-CELL surface (not the cell boundary): a downward ray at
+	# a high-H footprint hits higher than at a low-H footprint, both inside the ramp cell.
+	var hit_hi := world.aimed_voxel(Vector3(cx + 0.5, float(g) + 8.0, cz + 0.2), Vector3(0, -1, 0), 32.0)
+	_ok(hit_hi.get("hit", false) and hit_hi["voxel"] == rc, "shapes-live: ray-down hits the ramp cell")
+	_ok(is_equal_approx((hit_hi["position"] as Vector3).y, float(g + 1) + 0.8),
+		"shapes-live: ray hits in-cell surface at cell.y+H=%.2f (got %.3f)" % [float(g + 1) + 0.8, (hit_hi["position"] as Vector3).y])
+	_ok(hit_hi["normal"] == Vector3i.UP, "shapes-live: ramp surface hit reports UP normal (placement adjacency)")
+	var hit_lo := world.aimed_voxel(Vector3(cx + 0.5, float(g) + 8.0, cz + 0.8), Vector3(0, -1, 0), 32.0)
+	_ok(hit_lo.get("hit", false) and is_equal_approx((hit_lo["position"] as Vector3).y, float(g + 1) + 0.2),
+		"shapes-live: ray-down at a lower-H footprint hits lower (in-cell, not boundary)")
+	# Tunnelling guard: an oblique ray through the ramp's empty upper wedge (entering the
+	# low +z side, rising) exits without ever crossing the surface — it must NOT hit the ramp.
+	var thru := world.aimed_voxel(Vector3(cx + 0.5, float(g) + 1.95, cz + 1.4),
+		Vector3(0.0, 0.1, -1.0).normalized(), 8.0)
+	_ok(not (thru.get("hit", false) and thru["voxel"] == rc),
+		"shapes-live: oblique ray through the empty wedge does not hit the ramp (tunnelling guard)")
+
+	# (f) breaking a placed shaped cell returns its MATERIAL (hotbar contract intact).
+	_ok(world.break_terrain(rc, Vector3.INF) == GRASS, "shapes-live: break_terrain returns the ramp's material (GRASS)")
+
+	# (d) blocked() auto-steps a half-slab (rise 0.5 <= STEP_MAX) but a full cube (rise
+	# 1.0) still walls — the byte-identical full-cube gate plus the new ramp/slab step.
+	_ok(world.place_block(rc, CellCodec.pack(GRASS, SLAB)), "shapes-live: place a half-slab to step onto")
+	_ok(world.blocked(cx + 0.5, cz + 0.5, float(g + 1)) == false, "shapes-live: half-slab auto-stepped (rise 0.5 <= STEP_MAX)")
+	world.break_terrain(rc, Vector3.INF)
+	_ok(world.place_block(rc, STONE), "shapes-live: place a full cube")
+	_ok(world.blocked(cx + 0.5, cz + 0.5, float(g + 1)) == true, "shapes-live: full cube blocks (rise 1.0 > STEP_MAX)")
+	world.queue_free()
+
+	# (f cont.) a loose VoxelBody made of one stone RAMP weighs density × fill-fraction.
+	var mworld: WorldManager = _struct_world("P5bMass")
+	var vb := VoxelBody.spawn_loose(mworld, {Vector3i.ZERO: CellCodec.pack(STONE, RAMP)}, mworld)
+	_ok(vb != null, "shapes-live: spawn a partial stone-ramp VoxelBody")
+	if vb != null:
+		_ok(is_equal_approx(vb.mass, BlockCatalog.mass_of(STONE) * 0.5),
+			"shapes-live: partial VoxelBody mass == density × ½ = %.1f (got %.1f)" % [BlockCatalog.mass_of(STONE) * 0.5, vb.mass])
+	mworld.queue_free()
+
+	# (g) STRUCTURAL attachment is by real contact-area (SVS §7, canonical −/+ order):
+	# a ramp arm whose HIGH edge meets the tower (full-face overlap) ATTACHES; the same
+	# arm whose ZERO edge meets the tower (no overlap ⇒ no joint) DETACHES.
+	_test_shapes_attach()
+
+func _test_shapes_attach() -> void:
+	var patch := _flat_patch5()
+	if patch.x == 0x7fffffff:
+		_ok(false, "shapes-live: found a flat patch for the attachment test")
+		return
+	var cx := patch.x
+	var cz := patch.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var tower := 5
+	# Full-overlap: the ramp's −X face (corners c00,c01) is the HIGH edge (2,2) toward the
+	# tower → full-face contact → the arm holds.
+	var wa := _struct_world("P5bAttachFull")
+	for k in range(1, tower + 1):
+		wa.place_block(Vector3i(cx, g + k, cz), STONE)
+	var yy := g + tower
+	var b0 := _count_voxel_bodies(wa)
+	var arm := Vector3i(cx + 1, yy, cz)
+	_ok(wa.place_block(arm, CellCodec.pack(STONE, ShapeCodec.make_modifier(2, 0, 0, 2))),
+		"shapes-live: place full-overlap ramp arm")
+	_ok(_count_voxel_bodies(wa) == b0 and wa.block_id_at(arm) == STONE,
+		"shapes-live: full-overlap ramp arm ATTACHES (holds on the tower)")
+	wa.queue_free()
+	# Zero-overlap: the ramp's −X face is the ZERO edge (0,0) toward the tower → no joint
+	# → the arm has no support → it detaches as a VoxelBody.
+	var wb := _struct_world("P5bAttachZero")
+	for k in range(1, tower + 1):
+		wb.place_block(Vector3i(cx, g + k, cz), STONE)
+	var b1 := _count_voxel_bodies(wb)
+	wb.place_block(arm, CellCodec.pack(STONE, ShapeCodec.make_modifier(0, 2, 2, 0)))
+	_ok(_count_voxel_bodies(wb) > b1 and wb.block_id_at(arm) != STONE,
+		"shapes-live: zero-overlap ramp arm DETACHES (zero contact ⇒ no joint)")
+	wb.queue_free()
 
 func _count_voxel_bodies(n: Node) -> int:
 	var c := 0

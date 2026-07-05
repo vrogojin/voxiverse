@@ -239,7 +239,17 @@ static func _pass2(world: Object, solid: Dictionary, foundation: Dictionary,
 				var vid := _mat(world, v)
 				var t := _joint_temp(world, u, v)
 				var reinf: int = world.joint_mod(u, v)
-				var area := ShapeCodec.contact_area(umod, CellCodec.modifier(world.cell_value_at(v)), _axis(dir))
+				# contact_area is NOT symmetric for shaped cells (SVS §7.1 / P5a note):
+				# mod_a is the −axis side, mod_b the +axis side. dir is a unit axis vector,
+				# so its sign says which of u/v is the −side — feed them in that canonical
+				# order so a placed slab/ramp attaches only by real overlap area (zero
+				# overlap ⇒ a zero-capacity joint ⇒ it detaches).
+				var vmod := CellCodec.modifier(world.cell_value_at(v))
+				var area: float
+				if dir.x + dir.y + dir.z > 0:
+					area = ShapeCodec.contact_area(umod, vmod, _axis(dir))   # u −side, v +side
+				else:
+					area = ShapeCodec.contact_area(vmod, umod, _axis(dir))   # v −side, u +side
 				if dir.y > 0:
 					cap = StructuralModel.joint_ft(uid, vid, t, reinf, area)   # tension up
 				else:

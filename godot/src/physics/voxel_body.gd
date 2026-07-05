@@ -400,15 +400,17 @@ func _rebuild() -> void:
 	var mesh := ArrayMesh.new()
 	var tools: Dictionary = {}          # int block_id -> SurfaceTool
 	for c: Vector3i in cells.keys():
-		var id: int = CellCodec.mat(cells[c])   # surfaces group by MATERIAL
-		for d in _DIRS:
-			if not cells.has(c + d):
-				var st: SurfaceTool = tools.get(id, null)
-				if st == null:
-					st = SurfaceTool.new()
-					st.begin(Mesh.PRIMITIVE_TRIANGLES)
-					tools[id] = st
-				_emit_face(st, c, d)
+		var packed: int = cells[c]
+		var id: int = CellCodec.mat(packed)   # surfaces group by MATERIAL
+		var modifier: int = CellCodec.modifier(packed)
+		if modifier != 0:
+			# Shaped cell: emit its partial geometry from the shared ShapeMesh (SVS §4.3)
+			# so a broken ramp keeps its ramp faces. No interior-face culling (cosmetic).
+			_emit_shape(_tool_for_body(tools, id), c, modifier)
+		else:
+			for d in _DIRS:
+				if not cells.has(c + d):
+					_emit_face(_tool_for_body(tools, id), c, d)
 	for id: int in tools.keys():
 		var st: SurfaceTool = tools[id]
 		var surf_index := mesh.get_surface_count()
@@ -419,22 +421,78 @@ func _rebuild() -> void:
 	mi.mesh = mesh
 	add_child(mi)
 
-	# One box collider per cell.
+	# One collider per cell: a box for a full cube; for a shaped cell, ≤ 2 convex prisms
+	# (each top triangle extruded to the anchor face — always convex; SVS §4.3), so a
+	# loose ramp collides on its true slope, not a phantom cube.
 	for c: Vector3i in cells.keys():
-		var shape := BoxShape3D.new()
-		shape.size = Vector3(1, 1, 1)
-		var cs := CollisionShape3D.new()
-		cs.shape = shape
-		cs.position = Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
-		add_child(cs)
+		var modifier: int = CellCodec.modifier(cells[c])
+		if modifier != 0:
+			_add_prism_colliders(c, modifier)
+		else:
+			var shape := BoxShape3D.new()
+			shape.size = Vector3(1, 1, 1)
+			var cs := CollisionShape3D.new()
+			cs.shape = shape
+			cs.position = Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
+			add_child(cs)
 
-	# Mass = sum of per-cell catalog masses (floor at 1 kg so a body is never zero).
+	# Mass = Σ density × fill-fraction (SVS §6): a detached half-ramp of stone weighs
+	# 375 kg, not 1500. Full cubes reduce to the catalog mass exactly. Floor at 1 kg.
 	var m := 0.0
 	for c: Vector3i in cells.keys():
-		m += BlockCatalog.mass_of(CellCodec.mat(cells[c]))
+		m += BlockCatalog.mass_of_value(cells[c])
 	mass = maxf(1.0, m)
 	freeze = not activated
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces
+
+## Lazily begin (once) and return the SurfaceTool for material `id`.
+func _tool_for_body(tools: Dictionary, id: int) -> SurfaceTool:
+	var st: SurfaceTool = tools.get(id, null)
+	if st == null:
+		st = SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		tools[id] = st
+	return st
+
+## Emit a shaped cell's full ShapeMesh geometry (body-local, translated to `c`) into
+## the material SurfaceTool — the shared render seam (SVS §4), so a loose ramp shows
+## the same faces as the world ramp did.
+func _emit_shape(st: SurfaceTool, c: Vector3i, modifier: int) -> void:
+	var geom := ShapeMesh.build(modifier)
+	var verts: PackedVector3Array = geom["verts"]
+	var normals: PackedVector3Array = geom["normals"]
+	var uvs: PackedVector2Array = geom["uvs"]
+	var indices: PackedInt32Array = geom["indices"]
+	var base := Vector3(c)
+	for i in indices:
+		st.set_normal(normals[i])
+		st.set_uv(uvs[i])
+		st.add_vertex(base + verts[i])
+
+## Add ≤ 2 convex prism colliders for a shaped cell (SVS §4.3): each surface triangle
+## extruded down to the anchor face (BOTTOM: y=0; TOP: y=1) is a convex triangular
+## prism. A degenerate triangle (all corners flush with the anchor plane — zero volume)
+## is skipped. Points are body-local (cells are body-local), so the shape's transform
+## is identity.
+func _add_prism_colliders(c: Vector3i, modifier: int) -> void:
+	var base_y := 0.0 if ShapeCodec.anchor(modifier) == ShapeCodec.ANCHOR_BOTTOM else 1.0
+	var origin := Vector3(c)
+	for tri: Dictionary in ShapeCodec.surface_tris(modifier):
+		var pts := PackedVector3Array()
+		var nondegen := false
+		for key in ["v0", "v1", "v2"]:
+			var sp: Vector3 = tri[key]
+			if absf(sp.y - base_y) > 1e-4:
+				nondegen = true
+			pts.append(origin + sp)
+			pts.append(origin + Vector3(sp.x, base_y, sp.z))
+		if not nondegen:
+			continue
+		var shape := ConvexPolygonShape3D.new()
+		shape.points = pts
+		var cs := CollisionShape3D.new()
+		cs.shape = shape
+		add_child(cs)
 
 ## Emit the exposed face of cell `c` on side `d` (unit metre quad, one texture
 ## tile). Double-sided material makes winding irrelevant.

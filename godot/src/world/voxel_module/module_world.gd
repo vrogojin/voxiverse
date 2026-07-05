@@ -24,6 +24,20 @@ extends Node3D
 var _terrain: Node3D
 var _viewer: Node
 
+# --- appearance table (ARIDs, VOXEL-DATA-STRUCTURE §8.1) ------------------------
+# The TYPE channel carries an Appearance Render ID (ARID) — a session-local, append-
+# only dense id per (LRID, modifier) combination in use, equal by construction to its
+# VoxelBlockyLibrary model index. Plain-cube ARIDs are allocated EAGERLY at material
+# registration (bootstrap: cube ARID == LRID, so a flat all-cube world writes byte-
+# identical TYPE buffers to today); shaped ARIDs are appended LAZILY on the MAIN thread
+# on first `set_cell` of a shaped value, as a VoxelBlockyModelMesh built from ShapeMesh
+# riding the batched bake(). The generator (voxel worker) only ever emits modifier 0,
+# so it writes the cube ARID directly and never touches the lazy table.
+var _library: Object                    # the VoxelBlockyLibrary (kept for lazy appends + re-bake)
+var _cube_arid: PackedInt32Array        # LRID -> cube ARID (preallocated; == LRID for bootstrap)
+var _arid_by_key: Dictionary = {}       # (lrid | modifier<<16) -> ARID (MAIN THREAD ONLY)
+var _next_arid := 0                     # next free library model index / ARID to allocate
+
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
@@ -69,19 +83,98 @@ func setup() -> bool:
 	add_child(_terrain)
 	return true
 
-## Set one voxel to `block_id` (0 = air/break, >0 = place). Uses the terrain's
-## VoxelTool to write the TYPE channel, which triggers a local remesh. Driven
-## through strings so this file still parses without the module present.
-func set_cell(cell: Vector3i, block_id: int) -> void:
+## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
+## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
+## (main) thread if unseen (VDS §8.2) — and writes THAT into the TYPE channel, which
+## triggers a local remesh. A plain full cube resolves to its cube ARID (== LRID for
+## bootstrap), so this is byte-identical to the old id write for the current world.
+## Driven through strings so this file still parses without the module present.
+func set_cell(cell: Vector3i, packed: int) -> void:
 	if _terrain == null or not _terrain.has_method("get_voxel_tool"):
 		return
 	var vt: Object = _terrain.call("get_voxel_tool")
 	if vt == null:
 		return
+	var arid := arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
 	# VoxelBuffer.CHANNEL_TYPE == 0; VoxelTool.MODE_SET == 0 (default).
 	_set_if(vt, "channel", 0)
 	_set_if(vt, "mode", 0)
-	vt.call("set_voxel", cell, block_id)
+	vt.call("set_voxel", cell, arid)
+
+## Resolve (LRID, modifier) → ARID, allocating a shaped ARID lazily (MAIN THREAD).
+## AIR → 0; a full cube → the eager cube ARID; a shaped value appends a
+## VoxelBlockyModelMesh (built from ShapeMesh) whose model index MUST equal the ARID
+## being allocated (the streaming anti-drift assert, VDS §8.1) and re-bakes. On any
+## failure it falls back to the material's plain-cube ARID — a wrong silhouette but
+## correct substance, never a hole. Returns the ARID (>= 0), or the cube ARID on drift.
+func arid_for(mat: int, modifier: int) -> int:
+	if mat == BlockCatalog.AIR:
+		return 0
+	if modifier == 0:
+		return _cube_arid_of(mat)
+	var key := mat | (modifier << 16)                  # vstate is 0 in P5b-1
+	if _arid_by_key.has(key):
+		return int(_arid_by_key[key])
+	if _library == null:
+		return _cube_arid_of(mat)
+	var model: Object = _make_shape_model(modifier, BlockMaterials.get_for(mat))
+	if model == null:
+		return _cube_arid_of(mat)
+	var expected := _next_arid
+	var got: int = _add_model(_library, model)
+	if got != expected:
+		push_warning("[module_world] ARID drift: add_model returned %d, expected %d" % [got, expected])
+		return _cube_arid_of(mat)
+	_next_arid += 1
+	_arid_by_key[key] = got
+	if _library.has_method("bake"):
+		_library.call("bake")                          # one batched re-bake per novel shape
+	return got
+
+## The eager plain-cube ARID for a material (== LRID for bootstrap materials).
+func _cube_arid_of(mat: int) -> int:
+	if mat >= 0 and mat < _cube_arid.size():
+		return _cube_arid[mat]
+	return mat                                         # defensive: table not built yet
+
+## Total appearance ids allocated so far (cube ARIDs + lazily-baked shaped ARIDs) —
+## == the library model count. Used by verify to fence the lazy append (VDS §8.1).
+func appearance_count() -> int:
+	return _next_arid
+
+## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
+## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
+func _make_shape_model(modifier: int, material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var geom := ShapeMesh.build(modifier)
+	var amesh := ArrayMesh.new()
+	var surf := []
+	surf.resize(Mesh.ARRAY_MAX)
+	surf[Mesh.ARRAY_VERTEX] = geom["verts"]
+	surf[Mesh.ARRAY_NORMAL] = geom["normals"]
+	surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
+	surf[Mesh.ARRAY_INDEX] = geom["indices"]
+	amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, material)
+	return model
+
+## Append a model to the library and return its index (int return, else models-array
+## size — mirrors _add_cube's version-robust read).
+func _add_model(library: Object, model: Object) -> int:
+	var id: Variant = library.call("add_model", model)
+	if typeof(id) == TYPE_INT:
+		return id
+	var models: Variant = library.get("models")
+	return ((models as Array).size() - 1) if models is Array else -1
 
 ## Attach a VoxelViewer to the player so the terrain streams around them.
 func attach_viewer(player: Node3D) -> void:
@@ -104,21 +197,33 @@ func attach_viewer(player: Node3D) -> void:
 ## > 0) get their `transparency_index` set so the blocky mesher culls faces per the
 ## transparency-index rule (§5.1). Returns true on success.
 func _configure_library(library: Object) -> bool:
+	# Keep the library so shaped ARIDs can be appended + re-baked lazily (VDS §8.1).
+	_library = library
+	var total := BlockCatalog.count()
+	# LRID -> cube ARID table; air (0) -> 0, each cube ARID == LRID for bootstrap.
+	_cube_arid = PackedInt32Array()
+	_cube_arid.resize(total)
+
 	# Index 0 = air. Without this the first cube would land at id 0 (= air).
 	if ClassDB.class_exists("VoxelBlockyModelEmpty"):
 		library.call("add_model", ClassDB.instantiate("VoxelBlockyModelEmpty"))
+	_cube_arid[BlockCatalog.AIR] = 0
 
 	# Ids 1..count()-1 in order: each carries its own BlockMaterials material (textured
 	# where a tile exists, else a flat swatch; translucent/emissive per the catalog). The
-	# 1x1 atlas is uniform for all. The library-order invariant is now machine-checked at
-	# every id, not just the frozen 5.
-	var total := BlockCatalog.count()
+	# 1x1 atlas is uniform for all. The library-order invariant (cube ARID == LRID) is
+	# machine-checked at every id, not just the frozen 5.
 	for block_id in range(1, total):
 		var cull_group: int = BlockCatalog.cull_group_of(block_id)
 		var got: int = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
 		if got != block_id:
 			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
+		_cube_arid[block_id] = got
+
+	# Every model appended so far (air + the cubes) occupies indices 0..total-1, so the
+	# next free ARID (the first lazily-baked shaped model) is `total`.
+	_next_arid = total
 
 	# bake() regenerates model geometry + UVs from the tile/atlas config; without
 	# it the tile/atlas UV setup never takes effect.

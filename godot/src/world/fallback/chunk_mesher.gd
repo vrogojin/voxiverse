@@ -193,14 +193,20 @@ static func _emit_one_tree(tools: Dictionary, world: WorldManager,
 static func _emit_placed(tools: Dictionary, world: WorldManager,
 		n: int, x0: int, z0: int) -> void:
 	for cell: Vector3i in world.placed_cells().keys():
-		# placed_cells() values are PACKED cell values; the mesher needs the MATERIAL
-		# only (a bare id is a plain packed value, so this is identical today).
-		var id: int = CellCodec.mat(world.placed_cells()[cell])
+		# placed_cells() values are PACKED cell values. A full cube (modifier 0) emits
+		# the culled cube faces as before; a shaped placed cell (ramp/slab, SVS §4.2)
+		# emits its partial geometry from the shared ShapeMesh instead.
+		var packed: int = world.placed_cells()[cell]
+		var id: int = CellCodec.mat(packed)
 		if id <= BlockCatalog.AIR:
 			continue
 		if cell.x < x0 or cell.x >= x0 + n or cell.z < z0 or cell.z >= z0 + n:
 			continue
-		_emit_cube(tools, world, cell, id)
+		var modifier: int = CellCodec.modifier(packed)
+		if modifier == 0:
+			_emit_cube(tools, world, cell, id)
+		else:
+			_emit_shaped(tools, cell, id, modifier)
 
 # --- cube emission: faces of `cell` (id) not occluded by the 6-neighbour ---------
 # A face is culled iff the neighbour OCCLUDES it per the transparency-index rule
@@ -220,6 +226,26 @@ static func _emit_cube(tools: Dictionary, world: WorldManager, cell: Vector3i, i
 			b + (f["a"] as Vector3), b + (f["b"] as Vector3),
 			b + (f["c"] as Vector3), b + (f["d"] as Vector3),
 			Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1))
+
+# --- shaped (partial) placed cell: emit the shared ShapeMesh geometry -------------
+# The ONE render seam (SVS §4): both paths consume ShapeMesh.build, so a placed ramp/
+# slab looks identical on the module and fallback paths. We emit the full unit-cell
+# shape geometry (surface tris + anchor face + side trapezoids) translated to the cell,
+# without inter-cell face culling — the hidden interior overdraw is cosmetically
+# invisible and gameplay never reads geometry (rule 2). Only PLACED cells can be shaped
+# in P5b-1 (worldgen still emits full cubes), so this touches the placed pass only.
+static func _emit_shaped(tools: Dictionary, cell: Vector3i, id: int, modifier: int) -> void:
+	var geom := ShapeMesh.build(modifier)
+	var verts: PackedVector3Array = geom["verts"]
+	var normals: PackedVector3Array = geom["normals"]
+	var uvs: PackedVector2Array = geom["uvs"]
+	var indices: PackedInt32Array = geom["indices"]
+	var st := _tool_for(tools, id)
+	var base := Vector3(cell)
+	for i in indices:
+		st.set_normal(normals[i])
+		st.set_uv(uvs[i])
+		st.add_vertex(base + verts[i])
 
 # The 6 cube faces: outward normal + 4 corner offsets (winding is irrelevant —
 # the materials are double-sided/unshaded).

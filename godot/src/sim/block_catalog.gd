@@ -166,6 +166,18 @@ static func mass_of(block_id: int) -> float:
 	var s := state_of(block_id)
 	return s.mass if s != null else 0.0
 
+## Mass in kg of a PACKED cell value (SUB-VOXEL-SMOOTHING §6): the full-cube mass
+## scaled by the shape's fill fraction, `density × volume(modifier)`. A full-cube
+## value (modifier 0) is exactly `mass_of(mat)`, so this is byte-identical for the
+## current world; a stone RAMP (volume ½) weighs half a full stone cube. Used by
+## VoxelBody._rebuild and anything mass-aware about partial cells.
+static func mass_of_value(packed: int) -> float:
+	var m := mass_of(CellCodec.mat(packed))
+	var modifier := CellCodec.modifier(packed)
+	if modifier == 0:
+		return m
+	return m * ShapeCodec.volume(modifier)
+
 ## Swatch / solid-material colour (with alpha) for `block_id` (hotbar UI + solid
 ## materials). Returns opaque black for AIR / out of range (callers guard AIR).
 static func color_of(block_id: int) -> Color:

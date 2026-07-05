@@ -48,6 +48,19 @@ const SETTLE_LINEAR := 0.15            # m/s
 const SETTLE_ANGULAR := 0.15           # rad/s
 const SUPPORT_PROBE := 0.25            # m: downward ray length under a body's underside
 
+# DWELL BEFORE FREEZE (P0 — the "let it fully stop" fix). A real physics engine only
+# sleeps a body once it has stayed below the velocity tolerance for a SUSTAINED time
+# (Godot's physics/3d/time_before_sleep default is 0.5 s). Freezing on a single calm
+# frame catches a body at a bounce apex / a rock's turnaround and freezes it mid-air.
+# So we require SETTLE_DWELL_SEC of continuous calm; any hot frame RESETS the timer.
+const SETTLE_DWELL_SEC := 0.5          # sustained sub-threshold time required to freeze
+const SETTLE_RETRY_SEC := 0.25         # calm-but-unsupported: re-check support this often
+# Anti-livelock: a body micro-jittering on a convex corner never reaches SETTLE_LINEAR
+# but is, for gameplay purposes, at rest. If it stays "coarsely calm" this long we
+# freeze it anyway so it can't hold the collider gate on indefinitely.
+const SETTLE_COARSE_LINEAR := 0.30     # m/s: the "coarsely calm" band
+const SETTLE_COARSE_SEC := 10.0        # s of coarse-calm after which we force-freeze
+
 # Dynamics for detached (activated) pieces — see _apply_dynamic_props().
 # Angular damping scales with block count so a heavier cluster resists flipping far
 # more than a light one: the player leans ~700 N down on a piece it stands on, which
@@ -70,6 +83,8 @@ var cells: Dictionary = {}        # Vector3i -> int PACKED cell value (body-loca
 var world: WorldManager           # for the ground-contact (grounded) test
 var activated: bool = false       # false = pristine frozen cluster; true = dynamic
 var _is_wood := false             # cached _has_wood() — wood is sandbox-dynamic (Godot sleep/wake)
+var _settle_timer := 0.0          # s of continuous calm accumulated (reset by any hot frame)
+var _coarse_timer := 0.0          # s of continuous coarse-calm (anti-livelock escape)
 
 # Shared, no-bounce, medium-friction physics material for dynamic pieces. Built
 # once and reused (RigidBody3D shares it freely — it is immutable here).
@@ -190,18 +205,43 @@ func block_count() -> int:
 ## Ground bodies re-freeze once at rest so they can be jumped on / shoved without moving or
 ## tipping. Runs ONLY for a dynamic (dropping) ground body — _refresh_dormancy() keeps
 ## _physics_process OFF for wood, frozen and pristine bodies, so dormant debris is free.
-func _physics_process(_delta: float) -> void:
+##
+## DWELL MODEL (P0): a body freezes only after SETTLE_DWELL_SEC of CONTINUOUS calm — any
+## frame above the velocity thresholds resets the timer, so a single near-zero frame at a
+## bounce apex can never freeze it mid-air. Support (_grounded) is evaluated ONLY at dwell
+## expiry (not every frame), and if it is calm-but-unsupported we retry shortly instead of
+## freezing in the air. A coarse-calm escape prevents a corner-jittering body from holding
+## the collider gate on forever.
+func _physics_process(delta: float) -> void:
 	if not activated or _is_wood or freeze:
 		return                                       # defensive; _physics_process is off in these states
-	# Dynamic ground body: freeze once it has landed and stopped → dormant (zero per-frame cost).
-	if _grounded(cells) \
-			and linear_velocity.length() < SETTLE_LINEAR \
-			and angular_velocity.length() < SETTLE_ANGULAR:
-		linear_velocity = Vector3.ZERO
-		angular_velocity = Vector3.ZERO
-		freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
-		freeze = true
-		set_physics_process(false)                   # DORMANT: no more per-frame script work
+	var lin := linear_velocity.length()
+	var ang := angular_velocity.length()
+	if lin >= SETTLE_LINEAR or ang >= SETTLE_ANGULAR:
+		_settle_timer = 0.0                          # a hot frame resets the dwell (Box2D/Jolt rule)
+		_coarse_timer = (_coarse_timer + delta) if lin < SETTLE_COARSE_LINEAR else 0.0
+		if _coarse_timer < SETTLE_COARSE_SEC:
+			return
+		# else: prolonged sub-0.3 m/s micro-jitter → treat as settled (anti-livelock), fall through
+	else:
+		_settle_timer += delta
+		if _settle_timer < SETTLE_DWELL_SEC:
+			return
+	# Sustained calm reached. Confirm the body is actually supported before freezing —
+	# a body hovering calmly with its support dug out must keep falling, not freeze in air.
+	if not _grounded(cells):
+		_settle_timer = SETTLE_DWELL_SEC - SETTLE_RETRY_SEC   # calm but unsupported: retry in ~0.25 s
+		return
+	_freeze_dormant()
+
+## Land the body: zero its motion, freeze to STATIC, and stop per-frame script work → DORMANT
+## (zero cost). Extracted so P1 can hook AABB caching / dormant-grid registration here.
+func _freeze_dormant() -> void:
+	linear_velocity = Vector3.ZERO
+	angular_velocity = Vector3.ZERO
+	freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
+	freeze = true
+	set_physics_process(false)                       # DORMANT: no more per-frame script work
 
 ## Reactivate a dormant body on disturbance: unfreeze → dynamic → re-enable the settle loop, so it
 ## falls if it lost support or re-settles (+re-freezes) if still supported. Wood just clears the
@@ -213,6 +253,8 @@ func wake() -> void:
 	activated = true
 	freeze = false
 	sleeping = false
+	_settle_timer = 0.0                              # start the dwell fresh on reactivation
+	_coarse_timer = 0.0
 	set_physics_process(true)
 
 ## AWAKE = simulating (dynamic and not asleep). The collider gate counts only awake bodies, so
@@ -359,20 +401,36 @@ func _components() -> Array:
 func _grounded(comp: Dictionary) -> bool:
 	if world == null:
 		return true
-	# Fast analytic check: any cell at/below the terrain heightmap surface.
+	# 1) Fast analytic check: any cell at/below the terrain heightmap surface.
 	for c: Vector3i in comp.keys():
 		var wp := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
 		if wp.y <= world.surface_y(wp.x, wp.z) + 0.2:
 			return true
-	# Otherwise: resting on a STABLE support — the static ground collider (which
-	# also carries trees & placed blocks) or another already-frozen VoxelBody. This
-	# lets soil-on-soil stacks and blocks resting on a placed tower settle too. A
-	# support that is itself a still-moving (unfrozen) body does NOT count, so a
-	# stack settles bottom-up instead of an upper block freezing mid-air.
+	# 2) Analytic cell-below check (P0): for each exposed-underside cell, ask THE cell
+	# query whether the world cell directly beneath its base is solid. This is the
+	# gameplay truth (terrain + trees + placed blocks), always FRESH — so it never
+	# confirms support on a phantom shelf left in a debounced/stale ground collider
+	# (the failure mode a raycast against the collider is prone to). Replaces most
+	# raycasts; only genuine body-on-body support falls through to (3).
+	for c: Vector3i in comp.keys():
+		if comp.has(Vector3i(c.x, c.y - 1, c.z)):
+			continue                              # not an exposed underside cell
+		var base := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
+		var below := Vector3i(floori(base.x), floori(base.y - 0.05), floori(base.z))
+		if world.cell_solid(below):
+			return true
+	# 3) Otherwise: resting on a STABLE support — another already-frozen VoxelBody
+	# (terrain/trees/placed are handled analytically above, so this now catches only
+	# body-on-body stacks). A support that is itself a still-moving (unfrozen) body
+	# does NOT count, so a stack settles bottom-up instead of an upper block freezing
+	# mid-air.
 	return _resting_on_support(comp)
 
-## Downward physics probe under the body's exposed underside cells: true iff it
-## rests on the static ground collider or a frozen body.
+## Downward physics probe under the body's exposed underside cells: true iff it rests on
+## another FROZEN VoxelBody. Terrain/trees/placed support is answered analytically in
+## _grounded (step 2), so this query is restricted to the BODY layer only — it must NOT
+## consult the ground collider, whose shapes can lag an edit by up to the rebuild debounce
+## (confirming support on a phantom shelf). Body-on-body only.
 func _resting_on_support(comp: Dictionary) -> bool:
 	if not is_inside_tree():
 		return false
@@ -387,17 +445,14 @@ func _resting_on_support(comp: Dictionary) -> bool:
 		var q := PhysicsRayQueryParameters3D.create(
 			base + Vector3(0.0, 0.05, 0.0),
 			base - Vector3(0.0, SUPPORT_PROBE, 0.0),
-			(1 << 0) | (1 << 1))          # ground layer + body layer (never the player)
+			1 << 1)                       # BODY layer only (terrain is analytic; never the player)
 		q.exclude = [get_rid()]
 		var hit := space.intersect_ray(q)
 		if hit.is_empty():
 			continue
 		var col: Object = hit.get("collider")
-		if col is VoxelBody:
-			if (col as VoxelBody).freeze:   # a settled block is a stable floor
-				return true
-		else:
-			return true                     # static ground collider (terrain/trees/placed)
+		if col is VoxelBody and (col as VoxelBody).freeze:   # a settled block is a stable floor
+			return true
 	return false
 
 func _nearest_cell(p_local: Vector3) -> Vector3i:

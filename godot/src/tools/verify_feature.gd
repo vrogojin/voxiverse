@@ -1047,11 +1047,18 @@ func _test_collider_gate() -> void:
 	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
 		"gate: first body spawn → collider builds immediately (ground for the falling body)")
 
-	# (c) Fly 200 blocks from the debris → gate idles again (exploration after a break leaves debris
-	# behind, and the collider must NOT keep churning around the departing player).
+	# (c) Fly 200 blocks from the debris → gate turns OFF (exploration after a break leaves debris
+	# behind, and the collider must NOT keep churning around the departing player). P2: the gate now
+	# RETAINS its shape set while off (so reactivation pays no synchronous rebuild), so active_rid()
+	# stays valid — the invariant is that it does ZERO further rebuild work while gated.
 	gc.update(Vector3(float(cx + 200) + 0.5, float(g) + 2.0, float(cz) + 0.5))
-	_ok(not gc.active_rid().is_valid() and not gc.is_building(),
-		"gate: flying 200 blocks from the debris → collider idles (no churn while exploring)")
+	_ok(gc.is_gated() and not gc.is_building(),
+		"gate: flying 200 blocks from the debris → collider gated OFF (idle, shapes retained)")
+	var churn_far := 0
+	for step in range(20):
+		gc.update(Vector3(float(cx + 200 + step) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+		churn_far += gc.last_slice_ops()
+	_ok(churn_far == 0, "gate: ZERO rebuild churn while gated + exploring away (churn=%d)" % churn_far)
 
 	# (d) Free the body → count decrements.
 	body.free()
@@ -1084,25 +1091,47 @@ func _test_physics_dormancy() -> void:
 	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
 		"dormancy: collider active while a body is awake")
 
-	# (1) settle → freeze within a few ticks; the frozen body then does NO per-frame work.
+	# (1) DWELL BEFORE FREEZE (P0). A grounded, at-rest body must NOT freeze on a single calm frame
+	# (that caught bodies mid-bounce, freezing them in mid-air) — it freezes only after
+	# SETTLE_DWELL_SEC of CONTINUOUS calm. At 0.016 s/tick, 0.5 s ≈ 32 ticks.
+	var dwell_ticks := int(ceil(VoxelBody.SETTLE_DWELL_SEC / 0.016))
+	for _tick in range(dwell_ticks - 3):
+		body._physics_process(0.016)
+	_ok(not body.freeze, "dormancy: body does NOT freeze before the settle dwell elapses (~%d ticks)" % dwell_ticks)
+	# A hot frame mid-dwell RESETS the timer — a body cannot freeze at a bounce apex / zero-crossing.
+	body.linear_velocity = Vector3(1.0, 0.0, 0.0)
+	body._physics_process(0.016)
+	body.linear_velocity = Vector3.ZERO
+	_ok(not body.freeze, "dormancy: a hot frame mid-dwell resets the timer (no premature mid-motion freeze)")
+	# Now let the full dwell elapse with sustained calm → it freezes → dormant.
 	var froze := false
-	for _tick in range(8):
+	for _tick in range(dwell_ticks + 4):
 		body._physics_process(0.016)
 		if body.freeze:
 			froze = true
 			break
-	_ok(froze, "dormancy: a grounded, at-rest body freezes within a few ticks")
+	_ok(froze, "dormancy: after SETTLE_DWELL_SEC of sustained calm, a grounded body freezes")
 	_ok(not body.is_awake() and not body.is_physics_processing(),
 		"dormancy: a frozen body is DORMANT — not awake, _physics_process OFF (zero per-frame cost)")
 	_ok(w.awake_body_count() == 0, "dormancy: awake count drops to 0 once settled (body still present)")
 
-	# (2) collider returns to IDLE with only a FROZEN body near — zero rebuild churn.
+	# (1b) A calm but UNSUPPORTED body must NEVER freeze — it has to keep falling, not freeze in
+	# mid-air. (Support is confirmed analytically at dwell expiry; no ground below → no freeze.)
+	var airborne := VoxelBody.spawn_loose(w, {Vector3i(cx, g + 30, cz): STONE}, w)
+	for _tick in range(dwell_ticks + 10):
+		airborne._physics_process(0.016)
+	_ok(not airborne.freeze, "dormancy: a calm but unsupported body never freezes mid-air (keeps falling)")
+	airborne.free()
+
+	# (2) collider stays GATED with only a FROZEN body near — zero rebuild churn. P2: the gate now
+	# RETAINS shapes while off (active_rid stays valid), so the invariant is ZERO further work, not a
+	# discarded shape set.
 	var churn := 0
 	for step in range(20):
 		gc.update(Vector3(float(cx + step) + 0.5, float(g) + 2.0, float(cz) + 0.5))
 		churn += gc.last_slice_ops()
-	_ok(churn == 0 and not gc.active_rid().is_valid(),
-		"dormancy: only a FROZEN body near → collider idle, ZERO rebuild churn (churn=%d)" % churn)
+	_ok(churn == 0 and gc.is_gated(),
+		"dormancy: only a FROZEN body near → collider gated (shapes retained), ZERO rebuild churn (churn=%d)" % churn)
 
 	# (3) wake-on-break: digging the surface under the frozen body wakes it → collider reactivates.
 	w.break_terrain(Vector3i(cx, g, cz))
@@ -1128,11 +1157,13 @@ func _test_physics_dormancy() -> void:
 	w2.queue_free()
 
 ## Drive an incremental GroundCollider (re)build to completion by pumping update() (simulating
-## physics frames), so a test can read the settled shape set. Bounded so a bug can't hang verify.
+## physics frames), so a test can read the settled shape set. Pumps through the P2 edit DEBOUNCE
+## (a pending rebuild has not started building yet) AND the incremental build. Bounded so a bug
+## can't hang verify.
 func _settle_collider(gc: GroundCollider, center: Vector3) -> void:
 	for _i in range(6000):
 		gc.update(center)
-		if not gc.is_building():
+		if not gc.is_building() and not gc.is_pending():
 			return
 
 ## Read the collider's emitted shapes at column (cx,cz) straight from PhysicsServer, grouped

@@ -57,6 +57,16 @@ const RESTART_DRIFT := 2 * R
 ## no collision here, and the player is analytic).
 const _GATE_RADIUS := R + REBUILD_DIST
 
+## EDIT-REBUILD DEBOUNCE (P2 — the "breaking each block is expensive" fix). A terrain edit only
+## marks the collider dirty; the rebuild is deferred until edits PAUSE (DEBOUNCE_FRAMES with no new
+## edit) or MAX_LATENCY_FRAMES elapse since the first edit of the burst — whichever comes first. So
+## a fast strip-mine coalesces a burst of breaks into ≤ 1 incremental rebuild instead of restarting
+## the dirty cycle per block. Frame-based (not wall-clock) so it is deterministic in the headless
+## verify. At ~60 fps: 15 ≈ 0.25 s debounce, 60 ≈ 1.0 s max latency. Safe because settling confirms
+## support ANALYTICALLY (VoxelBody._grounded), never trusting a briefly-stale collider.
+const DEBOUNCE_FRAMES := 15
+const MAX_LATENCY_FRAMES := 60
+
 # Build phases: idle, sampling column heights (region floor), emitting shapes, trimming the
 # staging body's surplus leftover shapes (when the new set is smaller than the previous one).
 enum { PHASE_IDLE, PHASE_HEIGHTS, PHASE_SHAPES, PHASE_TRIM }
@@ -74,6 +84,9 @@ var _cpool: Array = [[], []]                  # per-body Array[ConvexPolygonShap
 var _live_center := Vector2i(0x7fffffff, 0)   # centre of the LIVE shape set (sentinel = none)
 var _target := Vector2i(0x7fffffff, 0)        # latest requested centre (player's column)
 var _dirty := false                           # an edit asked for a rebuild at the current centre
+var _gated := false                           # true while the active-body gate is OFF (idle; shapes RETAINED)
+var _edit_age := 0                            # frames since the FIRST pending edit of the current burst
+var _edit_idle := 0                           # frames since the LAST edit (resets to 0 on every rebuild_now)
 
 # Incremental build state (valid while _phase != PHASE_IDLE).
 var _phase := PHASE_IDLE
@@ -127,44 +140,66 @@ func update(player_pos: Vector3) -> void:
 		return
 	_target = Vector2i(int(floor(player_pos.x)), int(floor(player_pos.z)))
 	if not world.has_active_bodies_near(_target, _GATE_RADIUS):
-		_go_idle()                          # nothing to collide with here → do no rebuild work
+		_gate_off()                         # nothing to collide with → stop work, KEEP shapes
 		return
+	var was_gated := _gated
+	_gated = false
 	if _phase != PHASE_IDLE:
 		# A build is running: only a big jump re-anchors it; otherwise let it finish.
 		if _drift(_target, _build_center) >= RESTART_DRIFT:
 			_begin_build(_target)
 		_advance_build(COLS_PER_FRAME)
 		return
-	var first := _live_center.x == 0x7fffffff
-	var need := first or _dirty or _drift(_target, _live_center) >= REBUILD_DIST
-	if not need:
+	# Session-first build: no collider exists yet → complete NOW so spawn/load has collision.
+	if _live_center.x == 0x7fffffff:
+		_begin_build(_target)
+		_advance_build(0x7fffffff)
 		return
-	_begin_build(_target)
-	# The very first build (no collider exists yet) completes NOW so spawn/load has collision
-	# immediately; every later rebuild is sliced across frames.
-	_advance_build(0x7fffffff if first else COLS_PER_FRAME)
+	# Reopening from gated with the RETAINED live set too far to serve a freshly-woken faller during
+	# a sliced rebuild → build synchronously so the body always has ground under it. (The common case
+	# — break near where you already stand — keeps the covering live set and pays NO sync rebuild.)
+	if was_gated and _drift(_target, _live_center) >= REBUILD_DIST:
+		_begin_build(_target)
+		_advance_build(0x7fffffff)
+		return
+	# Player-drift rebuild (walked far): incremental — the slightly-stale but nearby live set keeps
+	# colliding during the slice (the existing double-buffer contract).
+	if _drift(_target, _live_center) >= REBUILD_DIST:
+		_begin_build(_target)
+		_advance_build(COLS_PER_FRAME)
+		return
+	# Edit rebuild: DEBOUNCED. A burst of breaks coalesces into ≤ 1 incremental rebuild — no per-block
+	# dirty-cycle restart, and NEVER a synchronous full rebuild from the edit path (that was the
+	# ~100 ms stall). Build once edits pause (idle) or the max latency elapses.
+	if _dirty:
+		_edit_age += 1
+		_edit_idle += 1
+		if _edit_idle >= DEBOUNCE_FRAMES or _edit_age >= MAX_LATENCY_FRAMES:
+			_begin_build(_target)
+			_advance_build(COLS_PER_FRAME)
 
-## Ask for a rebuild at the current centre (called after a terrain edit). Non-blocking: the
-## next update() frames build it incrementally — an edit tolerates a slightly-stale collider
-## for the few frames it takes to settle (the live set keeps colliding meanwhile).
+## Ask for a rebuild at the current centre (called after a terrain edit). Non-blocking and
+## DEBOUNCED (P2): merely marks dirty and resets the "edits paused" counter, so a burst of breaks
+## coalesces into one deferred incremental rebuild (see update()). An edit tolerates a slightly-stale
+## collider for the few frames until it settles — VoxelBody settling confirms support analytically,
+## never trusting the collider, so the staleness is safe.
 func rebuild_now() -> void:
-	if _live_center.x != 0x7fffffff:
-		_dirty = true
+	if _live_center.x == 0x7fffffff:
+		return                              # nothing built yet; the first update() builds it
+	if not _dirty:
+		_edit_age = 0                       # first edit of a burst: start the max-latency clock
+	_dirty = true
+	_edit_idle = 0                          # every new edit resets the debounce window
 
-## Drop to IDLE (no loose body near): clear both bodies' shapes, cancel any in-progress build, and
-## reset to the "never built" state so the NEXT time a body appears the gate forces an immediate
-## synchronous first build (falling body gets ground at once). Cheap no-op when already idle.
-func _go_idle() -> void:
-	if _live == -1 and _phase == PHASE_IDLE and _live_center.x == 0x7fffffff:
-		return                              # already idle
-	for b: StaticBody3D in _body:
-		PhysicsServer3D.body_clear_shapes(b.get_rid())
-		b.collision_layer = 0               # inert
-	_live = -1
-	_live_center = Vector2i(0x7fffffff, 0)
-	_phase = PHASE_IDLE
-	_dirty = false
-	_slice_ops = 0
+## Gate OFF (no loose body near): stop doing rebuild work but RETAIN the live shape set and all
+## build state (P2 — the anti-stall change). The player is analytic and frozen debris never consults
+## the collider, so a retained (possibly slightly-stale) live set costs nothing and is harmless while
+## gated — and reactivation then needs no synchronous full rebuild (the old _go_idle() discarded the
+## shapes, forcing a ~100 ms rebuild on the next wake). Any in-progress build is simply paused; it
+## resumes (or re-anchors) when the gate reopens. Cheap idempotent no-op.
+func _gate_off() -> void:
+	_gated = true
+	_slice_ops = 0                          # a gated frame does ZERO rebuild work
 
 ## Re-attach after re-entering the tree. Server-added shapes on a body are cleared by Godot on
 ## tree exit; if this collider is ever reparented, rebuild synchronously so bodies don't fall
@@ -405,6 +440,17 @@ func active_rid() -> RID:
 ## True while an incremental (re)build is in progress (not yet swapped live).
 func is_building() -> bool:
 	return _phase != PHASE_IDLE
+
+## True while the active-body gate is OFF: the collider is idle (doing no rebuild work) but RETAINS
+## its last live shape set (P2). Distinct from the old discard-on-idle: active_rid() stays valid.
+func is_gated() -> bool:
+	return _gated
+
+## True while an edit-triggered rebuild is PENDING but has not yet begun (debounce window, P2). A
+## caller that must observe the post-edit shape set (e.g. the headless verify) has to pump update()
+## until BOTH is_pending() and is_building() are false.
+func is_pending() -> bool:
+	return _dirty
 
 ## PhysicsServer shape ops (set/add/remove) performed in the most recent update() call — the
 ## per-frame collider churn. Bounded per frame (never the whole region); used by verify.

@@ -540,6 +540,74 @@ static func appearance_modifiers() -> PackedInt32Array:
 					out.append(ShapeCodec.make_modifier(c00, c10, c11, c01, ShapeCodec.ANCHOR_BOTTOM))
 	return out
 
+## The modifier subset the smoother ACTUALLY emits — the module path bakes materials × THIS
+## (not × all 79 of appearance_modifiers()), so it pre-bakes far fewer VoxelBlockyModelMesh at
+## load. Each bake reads the model's geometry back from the GPU (getBufferSubData → WebGL pipeline
+## stall), so 474 → this-count cuts the load pause proportionally. Any modifier NOT in this set
+## cube-falls-back on the worker (graceful, never a hole; verify asserts this set covers the
+## smoother's real output). Computed ONCE (main thread) by a deterministic wide-area sample of the
+## surface + cap smoothing modifiers over a land region: the modifier is a pure function of the
+## LOCAL height stencil (biome-independent), so a wide land patch captures essentially the whole
+## set. It is a SUPERSET of the truly-emitted set — it ignores the tree-suppression exception (a
+## shape a tree would force to full cube is still baked; harmless, just unused). Cached statically;
+## only ever called from the manifest bake (main thread) + verify, never the voxel worker.
+const _EMIT_SAMPLE_R := 160
+static var _emitted_ready := false
+static var _emitted_mods := PackedInt32Array()
+static func emitted_modifiers() -> PackedInt32Array:
+	if _emitted_ready:
+		return _emitted_mods
+	_ensure_noise()
+	var c := find_spawn()                             # deterministic land centre
+	var r := _EMIT_SAMPLE_R
+	var span := 2 * r + 3                              # +1 stencil padding on each side
+	# One height_at per column over the padded region (adjacent columns share stencil samples,
+	# so a shared grid turns the 9-per-column corner stencil into O(1) lookups).
+	var hg := PackedInt32Array()
+	hg.resize(span * span)
+	for i in span:
+		var wx := c.x - r - 1 + i
+		for j in span:
+			hg[i * span + j] = height_at(wx, c.y - r - 1 + j)
+	var seen := {}
+	for i in range(1, span - 1):
+		for j in range(1, span - 1):
+			var g: int = hg[i * span + j]
+			if g < SEA_LEVEL:
+				continue                              # underwater is never smoothed
+			var t := _corner_targets_grid(hg, span, i, j)
+			var sm := _modifier_from_targets(t, g)        # surface cell
+			if sm != 0:
+				seen[sm] = true
+			var cm := _modifier_from_targets(t, g + 1)    # cap cell (same corner targets)
+			if cm != 0:
+				seen[cm] = true
+	var out := PackedInt32Array()
+	for m: int in seen.keys():
+		out.append(m)
+	out.sort()
+	_emitted_mods = out
+	_emitted_ready = true
+	return _emitted_mods
+
+## _corner_targets for grid column (i, j) — identical corner formula to _corner_targets(x, z),
+## reading the precomputed height grid instead of re-sampling height_at.
+static func _corner_targets_grid(hg: PackedInt32Array, span: int, i: int, j: int) -> Vector4:
+	var t_nn := float(hg[(i - 1) * span + (j - 1)] + 1)
+	var t_0n := float(hg[i * span + (j - 1)] + 1)
+	var t_pn := float(hg[(i + 1) * span + (j - 1)] + 1)
+	var t_n0 := float(hg[(i - 1) * span + j] + 1)
+	var t_00 := float(hg[i * span + j] + 1)
+	var t_p0 := float(hg[(i + 1) * span + j] + 1)
+	var t_np := float(hg[(i - 1) * span + (j + 1)] + 1)
+	var t_0p := float(hg[i * span + (j + 1)] + 1)
+	var t_pp := float(hg[(i + 1) * span + (j + 1)] + 1)
+	return Vector4(
+		(t_nn + t_0n + t_n0 + t_00) * 0.25,
+		(t_0n + t_pn + t_00 + t_p0) * 0.25,
+		(t_00 + t_p0 + t_0p + t_pp) * 0.25,
+		(t_n0 + t_00 + t_np + t_0p) * 0.25)
+
 # --- stage: bedrock floor (WGC §6.1) ------------------------------------------
 static func _bedrock_at(x: int, y: int, z: int) -> bool:
 	if y <= WORLD_BOTTOM_Y:

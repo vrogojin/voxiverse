@@ -26,6 +26,7 @@ func _initialize() -> void:
 	_test_stackup()
 	_test_worldgen()
 	_test_worldgen_air_bounds()
+	_test_manifest_trim()
 	_test_smoothing()
 	_test_collider_cheap_queries()
 	_test_collider_overlay_cases()
@@ -161,6 +162,43 @@ func _test_worldgen_air_bounds() -> void:
 					air_below_ok = false
 	_ok(air_above_ok, "no generated cell above MAX_SURFACE_Y+max_above (=%d) — above early-out skips only air" % above_y)
 	_ok(air_below_ok, "no generated cell below the bedrock floor (y < %d) — below early-out skips only air" % TerrainConfig.BEDROCK_FLOOR)
+
+# 1c. Appearance-manifest trim (PERF, fewer GPU readbacks at load). The module bakes materials ×
+# emitted_modifiers() (a wide-area sample), not × all 79 corner tuples. Assert the set is actually
+# trimmed and that it COVERS every smoothed shape the generator emits over the spawn play-area
+# (so no cube-fallback where the player is); any far-region straggler cube-falls-back gracefully.
+func _test_manifest_trim() -> void:
+	print("[1c] appearance manifest trim (bake only emitted shapes)")
+	var emitted := TerrainConfig.emitted_modifiers()
+	var full := TerrainConfig.appearance_modifiers()
+	var mats := TerrainConfig.appearance_surface_materials().size()
+	var eset := {}
+	for m: int in emitted:
+		eset[m] = true
+	_ok(emitted.size() > 0, "emitted modifier set is non-empty (%d)" % emitted.size())
+	_ok(emitted.size() < full.size(), "emitted set is TRIMMED vs the full %d corner tuples (%d)" % [full.size(), emitted.size()])
+	# Coverage over the spawn play-area, using the REAL tree-aware surface/cap queries: every
+	# smoothed shape the generator emits there must be in the baked set (no cube-fallback there).
+	var s := TerrainConfig.find_spawn()
+	var uncovered := 0
+	var emitted_seen := 0
+	for dx in range(-150, 150, 3):
+		for dz in range(-150, 150, 3):
+			var x := s.x + dx
+			var z := s.y + dz
+			var sm := TerrainConfig.surface_modifier(x, z)
+			if sm != 0:
+				emitted_seen += 1
+				if not eset.has(sm):
+					uncovered += 1
+			var cm := TerrainConfig.surface_cap_modifier(x, z)
+			if cm != 0:
+				emitted_seen += 1
+				if not eset.has(cm):
+					uncovered += 1
+	_ok(uncovered == 0, "baked set covers every smoothed shape over the spawn play-area (%d seen, %d uncovered)" % [emitted_seen, uncovered])
+	print("    manifest trim: %d emitted modifiers (full %d) → %d materials x %d = %d baked (was %d)"
+		% [emitted.size(), full.size(), mats, emitted.size(), mats * emitted.size(), mats * full.size()])
 
 # 2. The Minecraft-adapted worldgen pipeline (WGC §6): biomes, ores, sea/ice,
 # beaches, cold-biome surface temperature, and — CRITICAL — both render paths

@@ -297,7 +297,10 @@ func _build_gen_manifest(library: Object) -> void:
 	_gen_arid.resize(total * _GEN_STRIDE)
 	_gen_arid.fill(-1)
 	var mats := TerrainConfig.appearance_surface_materials()
-	var mods := TerrainConfig.appearance_modifiers()
+	# Bake materials × only the modifiers the smoother ACTUALLY emits (a wide-area sample), NOT
+	# all 79 corner tuples — each baked model triggers a GPU geometry readback (getBufferSubData),
+	# so this cuts the load stall. Unbaked shapes cube-fall-back on the worker (never a hole).
+	var mods := TerrainConfig.emitted_modifiers()
 	var appended := 0
 	for mat: int in mats:
 		if mat <= BlockCatalog.AIR or mat >= total:
@@ -319,7 +322,8 @@ func _build_gen_manifest(library: Object) -> void:
 			appended += 1
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake for the whole manifest
-	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes" % appended)
+	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
+		% [appended, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
 
 ## Forward (mat, modifier) → ARID exactly as the voxel worker resolves it: AIR → 0, a
 ## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube

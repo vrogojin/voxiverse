@@ -28,6 +28,7 @@ func _initialize() -> void:
 	_test_smoothing()
 	_test_collider_cheap_queries()
 	_test_collider_overlay_cases()
+	_test_collider_amortized()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -630,28 +631,36 @@ func _test_collider_cheap_queries() -> void:
 		% [reps, old_us, new_us, (float(old_us) / maxf(1.0, float(new_us)))])
 	_ok(new_us < old_us, "collider-cheap: light query strategy is cheaper than full generated_cell (%d us < %d us)" % [new_us, old_us])
 
-	# Cost proof #2 — a REAL GroundCollider rebuild (the actual freeze site): build a world,
-	# force the player far so the first update() triggers one full _rebuild, and time it.
-	# This is the honest absolute cost of the rebuild that used to stutter the main thread.
-	# Drive a GroundCollider directly (a bare WorldManager answers the cell queries from the
-	# generated terrain + empty overlay). Alternate the player between two far-apart columns
-	# so EVERY update() forces a fresh full 29x29 _rebuild (> REBUILD_DIST), and time the batch.
+	# Cost proof #2 — worst-case SINGLE-FRAME collider cost, old vs new scheduling. Drive a real
+	# GroundCollider directly (a bare WorldManager answers the cell queries). The FIRST build is
+	# synchronous (= the old whole-region single-frame cost — the walking stutter); a drift then
+	# triggers the AMORTIZED rebuild, whose worst single update() slice must be a small fraction.
 	var cw := WorldManager.new()
 	cw.name = "ColliderPerfWorld"
 	get_root().add_child(cw)
 	var gc := GroundCollider.new()
 	get_root().add_child(gc)
 	gc.setup(cw)
-	var crid: RID = gc.get_rid()
-	var iters := 20
-	var rt0 := Time.get_ticks_usec()
-	for k in range(iters):
-		var off := 100.0 if (k % 2) == 0 else -100.0
-		gc.update(Vector3(float(s.x) + off, 40.0, float(s.y) + off))
-	var rebuild_us := (Time.get_ticks_usec() - rt0) / float(iters)
-	var nshapes := PhysicsServer3D.body_get_shape_count(crid)
-	print("    real GroundCollider._rebuild (29x29 columns): %.1f us/rebuild native (avg of %d, %d shapes)" % [rebuild_us, iters, nshapes])
-	_ok(nshapes > 0, "collider-cheap: real collider rebuild emitted shapes (%d)" % nshapes)
+	var bt0 := Time.get_ticks_usec()
+	gc.update(Vector3(float(s.x) + 0.5, 40.0, float(s.y) + 0.5))     # first build = synchronous
+	var full_us := Time.get_ticks_usec() - bt0
+	var nshapes := PhysicsServer3D.body_get_shape_count(gc.active_rid())
+	# Drift REBUILD_DIST blocks → an incremental rebuild; time each update() slice to completion.
+	var np := Vector3(float(s.x) + 0.5 + float(GroundCollider.REBUILD_DIST), 40.0, float(s.y) + 0.5 + float(GroundCollider.REBUILD_DIST))
+	var max_slice := 0
+	var frames := 0
+	while true:
+		var s0 := Time.get_ticks_usec()
+		gc.update(np)
+		max_slice = maxi(max_slice, Time.get_ticks_usec() - s0)
+		frames += 1
+		if not gc.is_building() or frames > 4000:
+			break
+	print("    collider single-frame cost: OLD whole-region=%d us  vs  NEW worst incremental slice=%d us over %d frames (%d shapes)"
+		% [full_us, max_slice, frames, nshapes])
+	_ok(nshapes > 0, "collider-cheap: first (synchronous) build emitted shapes (%d)" % nshapes)
+	_ok(frames > 1, "collider-cheap: incremental rebuild spreads across K>1 frames (K=%d)" % frames)
+	_ok(max_slice * 2 < full_us, "collider-cheap: worst single-frame slice (%d us) is well under the whole-region cost (%d us)" % [max_slice, full_us])
 	gc.queue_free()
 	cw.queue_free()
 
@@ -678,16 +687,17 @@ func _test_collider_overlay_cases() -> void:
 	var gd := GroundCollider.new()
 	get_root().add_child(gd)
 	gd.setup(wd)
-	var rd: RID = gd.get_rid()
-	gd.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))   # first build → centre (cx,cz)
+	var dcenter := Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5)
+	gd.update(dcenter)                                                     # first build → centre (cx,cz)
 	var dug_ys := [g, g - 1, g - 2]                                        # dig the top 3 solid cells
 	var dug_ok := true
 	for dy: int in dug_ys:
 		if wd.break_terrain(Vector3i(cx, dy, cz)) <= 0:
 			dug_ok = false
 	gd.rebuild_now()                                                       # rebuild over the dug overlay
+	_settle_collider(gd, dcenter)                                          # drive the incremental build to completion
 	_ok(dug_ok, "dug shaft: broke 3 surface cells (overlay = air)")
-	var act_d := _collider_col(rd, cx, cz)
+	var act_d := _collider_col(gd.active_rid(), cx, cz)
 	var ref_d := _ref_col_heavy(wd, cx, cz, Vector2i(cx, cz))
 	_ok(_cols_equal(act_d, ref_d), "dug shaft: collider shapes == OLD heavy-path shapes (byte-identical)")
 	# No box may span any carved-air cell [dy, dy+1].
@@ -717,14 +727,15 @@ func _test_collider_overlay_cases() -> void:
 	var gp := GroundCollider.new()
 	get_root().add_child(gp)
 	gp.setup(wp)
-	var rp: RID = gp.get_rid()
-	gp.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+	var pcenter := Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5)
+	gp.update(pcenter)
 	var slab_mod := ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM)   # a half-slab
 	var placed_cube := wp.place_block(Vector3i(cx, g + 1, cz), STONE)                # full cube on the surface
 	var placed_slab := wp.place_block(Vector3i(cx, g + 2, cz), CellCodec.pack(STONE, slab_mod))
 	gp.rebuild_now()
+	_settle_collider(gp, pcenter)
 	_ok(placed_cube and placed_slab, "placed structure: full cube (g+1) + slab (g+2) accepted")
-	var act_p := _collider_col(rp, cx, cz)
+	var act_p := _collider_col(gp.active_rid(), cx, cz)
 	var ref_p := _ref_col_heavy(wp, cx, cz, Vector2i(cx, cz))
 	_ok(_cols_equal(act_p, ref_p), "placed structure: collider shapes == OLD heavy-path shapes (byte-identical)")
 	# The full cube at g+1 is covered by a solid box.
@@ -737,6 +748,58 @@ func _test_collider_overlay_cases() -> void:
 	_ok(act_p["prisms"].has(g + 2), "placed structure: shaped slab at g+2 emits a convex prism")
 	gp.queue_free()
 	wp.queue_free()
+
+# 2d. GroundCollider AMORTIZED rebuild (frame-budgeted + double-buffered). Proves the walking
+# stutter is gone: no single update() pays the whole-region cost, the live collider keeps
+# colliding mid-transition, and the SETTLED shapes are byte-identical to a full rebuild.
+func _test_collider_amortized() -> void:
+	print("[2d] collider amortized rebuild (frame-budgeted, double-buffered)")
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var cw: WorldManager = _struct_world("ColAmort")
+	var gc := GroundCollider.new()
+	get_root().add_child(gc)
+	gc.setup(cw)
+	# First build is synchronous → the world has collision immediately at spawn/load.
+	gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+	_ok(not gc.is_building(), "amortized: first build completes synchronously (immediate collision)")
+	var n0 := PhysicsServer3D.body_get_shape_count(gc.active_rid())
+	_ok(n0 > 0, "amortized: first build emitted shapes (%d)" % n0)
+	var rid0 := gc.active_rid()
+	# Drift REBUILD_DIST blocks → an incremental rebuild. ONE update() must NOT finish it.
+	var ncx := cx + GroundCollider.REBUILD_DIST
+	var ncz := cz + GroundCollider.REBUILD_DIST
+	var np := Vector3(float(ncx) + 0.5, float(g) + 2.0, float(ncz) + 0.5)
+	gc.update(np)
+	_ok(gc.is_building(), "amortized: one update() after an 8-block drift advances only a slice (region NOT built in one call)")
+	# The live set is untouched during the transition — bodies keep colliding with the old set.
+	_ok(gc.active_rid() == rid0 and PhysicsServer3D.body_get_shape_count(rid0) == n0,
+		"amortized: live collider unchanged mid-transition (double-buffered; no partial set)")
+	# Pump to completion; count frames.
+	var frames := 1
+	while gc.is_building() and frames <= 4000:
+		gc.update(np)
+		frames += 1
+	_ok(frames > 1, "amortized: incremental build spreads across K>1 frames (K=%d)" % frames)
+	_ok(not gc.is_building(), "amortized: incremental build settles")
+	# Settled shapes at the NEW centre == a full synchronous rebuild's output (byte-identical),
+	# and the buffer actually swapped (live RID changed).
+	_ok(gc.active_rid() != rid0, "amortized: buffer swapped to the freshly-built body")
+	var act := _collider_col(gc.active_rid(), ncx, ncz)
+	var ref := _ref_col_heavy(cw, ncx, ncz, Vector2i(ncx, ncz))
+	_ok(_cols_equal(act, ref), "amortized: settled shapes == full-rebuild output at the new centre (byte-identical)")
+	gc.queue_free()
+	cw.queue_free()
+
+## Drive an incremental GroundCollider (re)build to completion by pumping update() (simulating
+## physics frames), so a test can read the settled shape set. Bounded so a bug can't hang verify.
+func _settle_collider(gc: GroundCollider, center: Vector3) -> void:
+	for _i in range(6000):
+		gc.update(center)
+		if not gc.is_building():
+			return
 
 ## Read the collider's emitted shapes at column (cx,cz) straight from PhysicsServer, grouped
 ## as box vertical-spans (Vector2(bottom,top)) and prism cell-ys — so a test can compare the
@@ -1481,17 +1544,14 @@ func _test_world_loop() -> void:
 	_ok(world.break_terrain(c, Vector3.INF) == 0, "double-break returns 0")
 	# ground collider rebuilds on edit (shape count changes across a place above surface)
 	var ground: GroundCollider = world.get_node_or_null("GroundCollider")
-	var before := -1
 	var after := -1
-	if ground != null:
-		before = PhysicsServer3D.body_get_shape_count(ground.get_rid())
 	var placed := world.place_block(c, STONE)
 	_ok(placed, "place_block STONE succeeds")
 	_ok(world.block_id_at(c) == STONE, "cell is stone after place")
 	_ok(world.place_block(c, STONE) == false, "place into occupied cell fails")
 	_ok(world.place_block(Vector3i(cx, g + 1, cz), 0) == false, "place invalid id fails")
-	if ground != null:
-		after = PhysicsServer3D.body_get_shape_count(ground.get_rid())
+	if ground != null and ground.active_rid().is_valid():
+		after = PhysicsServer3D.body_get_shape_count(ground.active_rid())
 		_ok(after > 0, "ground collider has shapes (%d)" % after)
 
 	# tree chop: break a trunk cell with a finite breaker pos -> canopy detaches as a

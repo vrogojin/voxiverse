@@ -36,6 +36,12 @@ var _ground: GroundCollider           # local blocky physics collider
 # "dug to air". `cell_value_at(cell)` = edits-overlay-else-generated is THE cell
 # query; `block_id_at` is its material projection.
 var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = air)
+# Per-column edit INDEX (PERF, GroundCollider fast path): the set of columns Vector2i(x, z)
+# that have ANY overlay entry (dug or placed). Edits never leave `_edits` (a dug cell stays
+# as value 0), so this only grows — maintained in the single write choke point. The collider
+# skips its per-cell overlay scan on columns absent here (their overlay is empty), collapsing
+# the region's ~30k Vector3i lookups to the handful of genuinely-edited columns.
+var _edit_columns: Dictionary = {}    # Vector2i(x, z) -> true
 # Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
 # ONLY the rare cells that carry a block-entity document (container inventory, sign
 # text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
@@ -169,6 +175,11 @@ func placed_top(x: int, z: int) -> int:
 func placed_cells() -> Dictionary:
 	return _edits
 
+## True if column (x, z) has ANY overlay edit (dug or placed) — the collider's fast-path gate
+## (PERF): an unedited column's overlay is empty, so the collider skips its per-cell scan there.
+func is_edited_column(x: int, z: int) -> bool:
+	return _edit_columns.has(Vector2i(x, z))
+
 ## Topmost still-solid column height at (x, z): the noise height, lowered past any
 ## blocks the player has broken from the top. Because every column is solid all
 ## the way down, this always finds a block — the ground is never hollow. (Ignores
@@ -254,6 +265,8 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 		if old_meta != null:
 			_meta.erase(cell)                    # material change / break settles it
 			block_entity_orphaned.emit(cell, old_meta)
+	if not _edits.has(cell):
+		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
 	_edits[cell] = packed
 	if paint:
 		_paint_cell(cell, packed)

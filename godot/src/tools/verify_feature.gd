@@ -39,6 +39,7 @@ func _initialize() -> void:
 	_test_structural()
 	_test_shapes_live()
 	_test_metadata()
+	_test_zonechunk()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1761,3 +1762,206 @@ func _test_metadata() -> void:
 		_ok(false, "collapse: found a flat patch for the collapse-frees-metadata test")
 
 	st.has_block_entity = prev_flag                            # restore (gameplay data untouched)
+
+# JSON-canonical normalization of a metadata document: the exact form it takes after one
+# round-trip through the §5 UTF-8-JSON metadata layer. JSON has no int/float distinction,
+# so bare ints normalize to float; everything else (strings, bools, finite floats, arrays,
+# nested dicts, key set) is preserved. This IS the metadata fidelity guarantee for a
+# JSON-based layer, and lets the round-trip assert exact deep-equality against it.
+func _json_norm(d: Dictionary) -> Variant:
+	return JSON.parse_string(JSON.stringify(d))
+
+# P6b. ZoneChunk container + edit-overlay save/load (VOXEL-DATA-STRUCTURE §5/§15). Asserts:
+# (a) round-trip fidelity — a region mixing full cubes, shaped cells (non-zero modifier), a
+# state-bearing cell, a dug-to-air cell and a metadata-bearing block-entity cell serializes
+# → deserializes with every cell's (material, modifier, state) exact and metadata canonical;
+# unset cells stay absent (fall back to the generator). Both the raw container round-trip
+# AND the live save_edits/load_edits path (through _write_cell) are exercised. (b) zero-cost —
+# an all-cube chunk carries NO modifier/state/metadata layers (layer_flags bits clear) and
+# lands near the §5.5 ~8.2 KiB budget; uniform air / empty-overlay chunks are a handful of
+# bytes. (c) id-map stability — a chunk deserialized under a DIFFERENT dense-id assignment
+# (a remap resolver) resolves materials by NAME, not by the saving session's ids. (d) an
+# unknown material name resolves to a logged placeholder, never a crash.
+func _test_zonechunk() -> void:
+	print("[P6b] ZoneChunk container + edit-overlay save/load")
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # non-zero modifier (a wedge)
+	var SLAB := ShapeCodec.make_modifier(1, 1, 1, 1)    # non-zero modifier (a half-slab)
+
+	# ---- (a1) RAW CONTAINER round-trip fidelity ------------------------------------
+	# Build a chunk directly (the container is a dumb byte store — canonicalization is the
+	# world's job, so we feed already-canonical packed values and expect an exact echo).
+	var i_cube := ZoneChunk.local_index(1, 1, 1)
+	var i_ramp := ZoneChunk.local_index(2, 1, 1)
+	var i_state := ZoneChunk.local_index(3, 1, 1)
+	var i_both := ZoneChunk.local_index(4, 1, 1)        # shaped AND state-bearing
+	var i_air := ZoneChunk.local_index(5, 1, 1)         # a dug-to-air edit (present, value 0)
+	var i_meta := ZoneChunk.local_index(6, 1, 1)        # metadata-bearing
+	var i_unset := ZoneChunk.local_index(7, 1, 1)       # never set → must stay absent
+
+	var v_cube := CellCodec.pack(STONE)
+	var v_ramp := CellCodec.pack(GRASS, RAMP)
+	var v_state := CellCodec.pack(WOOD, 0, 5)
+	var v_both := CellCodec.pack(STONE, SLAB, 3)
+	# A JSON-round-trip-STABLE document (only strings/bools/finite floats/nested) so the
+	# reloaded document deep-equals the original EXACTLY, and a second doc with a bare int
+	# to fence the canonical-JSON (int→float) normalization.
+	var doc := {"label": "chest", "fill": 0.5, "open": false, "tags": ["a", "b"], "sub": {"ratio": 1.25}}
+	var doc_int := {"count": 7, "name": "spawner"}
+
+	var zc := ZoneChunk.new()
+	zc.set_cell(i_cube, v_cube)
+	zc.set_cell(i_ramp, v_ramp)
+	zc.set_cell(i_state, v_state)
+	zc.set_cell(i_both, v_both)
+	zc.set_cell(i_air, 0)                                # air is a REAL present material
+	zc.set_cell(i_meta, v_cube, doc)
+
+	var bytes := zc.to_bytes()
+	var zc2 := ZoneChunk.from_bytes(bytes)
+
+	_ok(zc2.present_count() == 6, "raw round-trip: present cell count preserved (6, got %d)" % zc2.present_count())
+	_ok(zc2.material_name_at(i_cube) == "stone" and zc2.modifier_at(i_cube) == 0 and zc2.state_at(i_cube) == 0,
+		"raw round-trip: full cube (stone, mod 0, state 0) exact")
+	_ok(zc2.material_name_at(i_ramp) == "grass" and zc2.modifier_at(i_ramp) == RAMP and zc2.state_at(i_ramp) == 0,
+		"raw round-trip: shaped cell (grass ramp modifier) exact")
+	_ok(zc2.material_name_at(i_state) == "wood" and zc2.modifier_at(i_state) == 0 and zc2.state_at(i_state) == 5,
+		"raw round-trip: state-bearing cell (wood, state 5) exact")
+	_ok(zc2.material_name_at(i_both) == "stone" and zc2.modifier_at(i_both) == SLAB and zc2.state_at(i_both) == 3,
+		"raw round-trip: shaped+stated cell (stone, slab, state 3) exact")
+	_ok(zc2.material_name_at(i_air) == "air" and zc2.modifier_at(i_air) == 0,
+		"raw round-trip: dug-to-air cell present as 'air' (distinct from unset)")
+	_ok(zc2.meta_at(i_meta) != null and zc2.meta_at(i_meta) == doc,
+		"raw round-trip: metadata document deep-equals the original (JSON-stable doc)")
+	_ok(zc2.material_name_at(i_unset) == "" and not zc2.present_indices().has(i_unset),
+		"raw round-trip: an unset cell stays ABSENT (falls back to the generator on load)")
+
+	# metadata with a bare int normalizes to its canonical-JSON form (int → float) and is
+	# otherwise exact — the honest fidelity guarantee of a UTF-8-JSON metadata layer.
+	var zc3 := ZoneChunk.new()
+	zc3.set_cell(i_meta, v_cube, doc_int)
+	var zc3b := ZoneChunk.from_bytes(zc3.to_bytes())
+	_ok(zc3b.meta_at(i_meta) == _json_norm(doc_int),
+		"raw round-trip: int-bearing metadata equals its canonical-JSON form (7 → 7.0)")
+
+	# ---- (b) ZERO-COST DEFAULT ------------------------------------------------------
+	# An all-cube chunk: every one of the 32768 cells present as a full cube over a 4-material
+	# palette (2-bit indices). NO modifier/state/metadata layers, size near the §5.5 budget.
+	var mats := [BlockCatalog.AIR, GRASS, DIRT, STONE]
+	var allcube := ZoneChunk.new()
+	for idx in range(ZoneChunk.CELLS):
+		allcube.set_cell(idx, CellCodec.pack(mats[idx & 3]))
+	_ok(allcube.layer_flags() == 0, "zero-cost: all-cube chunk has NO modifier/state/meta layers (flags == 0)")
+	var allcube_size := allcube.to_bytes().size()
+	print("    all-cube 32^3 chunk serializes to %d bytes (§5.5 target ~8.2 KiB)" % allcube_size)
+	_ok(allcube_size >= 8192 and allcube_size <= 8400,
+		"zero-cost: all-cube chunk size ~8.2 KiB (2-bit dense material layer only, got %d)" % allcube_size)
+	# a round-trip of the all-cube chunk still resolves every cell to its material.
+	var allcube2 := ZoneChunk.from_bytes(allcube.to_bytes())
+	var dense_ok := allcube2.present_count() == ZoneChunk.CELLS
+	for idx in [0, 1, 2, 3, 100, 32767]:                 # cell idx carries material mats[idx & 3]
+		if allcube2.material_name_at(idx) != BlockCatalog.name_of(mats[idx & 3]):
+			dense_ok = false
+	_ok(dense_ok, "zero-cost: all-cube chunk round-trips (dense material layer intact)")
+	# uniform all-air (all present, one palette entry) and an empty overlay (all unset) are tiny.
+	var alluniform := ZoneChunk.new()
+	for idx in range(ZoneChunk.CELLS):
+		alluniform.set_cell(idx, 0)                      # every cell present as air
+	var uniform_size := alluniform.to_bytes().size()
+	_ok(uniform_size <= 16, "zero-cost: uniform all-air chunk is a handful of bytes (%d, no index array)" % uniform_size)
+	var empty_size := ZoneChunk.new().to_bytes().size()
+	_ok(empty_size <= 16, "zero-cost: empty (all-unset) overlay chunk is a handful of bytes (%d)" % empty_size)
+
+	# ---- (a2) LIVE save_edits / load_edits through the write choke point -------------
+	# Build a supported pillar of edits (full cube + shaped + state + block-entity metadata)
+	# on a flat patch, save the overlay to bytes, and load into a FRESH world; assert every
+	# edited cell round-trips exactly and an UNEDITED cell falls back to the generator.
+	var patch := _flat_patch5()
+	if patch.x == 0x7fffffff:
+		_ok(false, "P6b: found a flat patch for the live save/load round-trip")
+		return
+	var px := patch.x
+	var pz := patch.y
+	var pg: int = TerrainConfig.height_at(px, pz)
+	# Flip a block-entity capability on so the metadata cell keeps its document (as _test_metadata does).
+	var BE := STONE
+	var be_state: VoxelState = BlockCatalog.state_of(BE)
+	var prev_be := be_state.has_block_entity
+	be_state.has_block_entity = true
+
+	var w1 := _struct_world("P6bSave")
+	var c_cube := Vector3i(px, pg + 1, pz)               # rests on the grass surface
+	var c_ramp := Vector3i(px, pg + 2, pz)               # on top of the cube
+	var c_be := Vector3i(px, pg + 3, pz)                 # block-entity cell on top
+	_ok(w1.place_block(c_cube, CellCodec.pack(STONE)), "live save: place a full cube (supported)")
+	_ok(w1.place_block(c_ramp, CellCodec.pack(GRASS, RAMP)), "live save: place a shaped ramp on top")
+	_ok(w1.set_state(c_cube, 5), "live save: set a state on the cube cell")
+	_ok(w1.place_block(c_be, CellCodec.pack(BE)), "live save: place the block-entity cell")
+	var live_doc := {"label": "furnace", "lit": true, "progress": 0.75}
+	_ok(w1.set_metadata(c_be, live_doc), "live save: attach metadata to the block-entity cell")
+
+	var edited := [c_cube, c_ramp, c_be]
+	# a deep-ground cell we NEVER edit — must fall back to the generator after load.
+	var c_unedited := Vector3i(px, pg - 5, pz)
+	var unedited_gen := TerrainConfig.generated_cell(c_unedited.x, c_unedited.y, c_unedited.z)
+
+	# Round-trip every touched 32^3 region through bytes into a fresh world.
+	var regions := {}
+	for c: Vector3i in edited:
+		regions[WorldManager.region_origin_of(c)] = true
+	var w2 := _struct_world("P6bLoad")
+	for ro: Vector3i in regions.keys():
+		var region_bytes := w1.save_edits(ro).to_bytes()
+		w2.load_edits(ro, ZoneChunk.from_bytes(region_bytes))
+
+	var fidelity_ok := true
+	for c: Vector3i in edited:
+		if w2.cell_value_at(c) != w1.cell_value_at(c):
+			fidelity_ok = false
+	_ok(fidelity_ok, "live save/load: every edited cell's packed value (mat|modifier|state) restored exactly")
+	_ok(CellCodec.mat(w2.cell_value_at(c_cube)) == STONE and CellCodec.state(w2.cell_value_at(c_cube)) == 5,
+		"live save/load: the state axis survived the round-trip (stone, state 5)")
+	_ok(CellCodec.modifier(w2.cell_value_at(c_ramp)) == RAMP,
+		"live save/load: the shaped ramp modifier survived the round-trip")
+	_ok(w2.has_metadata(c_be) and w2.get_metadata(c_be) == _json_norm(live_doc),
+		"live save/load: block-entity metadata restored (canonical-JSON, through _write_cell)")
+	_ok(w2.cell_value_at(c_unedited) == unedited_gen,
+		"live save/load: an UNEDITED cell falls back to the generated function (not clobbered)")
+	w1.queue_free()
+	w2.queue_free()
+
+	# ---- (c) ID-MAP STABILITY (materials travel by NAME, not by dense id) ------------
+	# Serialize a stone cell, then load it under a resolver that maps names to DIFFERENT
+	# dense ids than the saving session used. The loaded material must follow the NAME.
+	var zc_stone := ZoneChunk.new()
+	var i_s := ZoneChunk.local_index(0, 0, 0)
+	zc_stone.set_cell(i_s, CellCodec.pack(STONE))
+	var loaded_stone := ZoneChunk.from_bytes(zc_stone.to_bytes())
+	var remap := func(nm: StringName) -> int:
+		if nm == &"stone":
+			return DIRT                                  # deliberately a DIFFERENT id than STONE
+		return BlockCatalog.id_of(nm)
+	var w3 := _struct_world("P6bRemap")
+	var s_cell := Vector3i(0, 40, 0)                     # air far above ground — placing an edit is unconstrained
+	w3.load_edits(WorldManager.region_origin_of(s_cell), loaded_stone, remap)
+	# region_origin_of(s_cell) + local(0,0,0) lands at the region origin; assert THAT cell.
+	var s_target := WorldManager.region_origin_of(s_cell) + ZoneChunk.from_local_index(i_s)
+	_ok(w3.block_id_at(s_target) == DIRT,
+		"id-map stability: 'stone' resolved by NAME to the remapped id (DIRT), not the saved id")
+	w3.queue_free()
+
+	# ---- (d) UNKNOWN NAME → PLACEHOLDER (no crash) -----------------------------------
+	# A resolver that fails to resolve every name; a wood cell must load as the placeholder
+	# material (stone), loudly, without crashing or losing the edit.
+	var zc_wood := ZoneChunk.new()
+	zc_wood.set_cell(i_s, CellCodec.pack(WOOD))
+	var loaded_wood := ZoneChunk.from_bytes(zc_wood.to_bytes())
+	var unknown := func(_nm: StringName) -> int: return -1
+	var w4 := _struct_world("P6bUnknown")
+	w4.load_edits(WorldManager.region_origin_of(s_cell), loaded_wood, unknown)
+	var placeholder_id := BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+	_ok(w4.block_id_at(s_target) == placeholder_id and placeholder_id > 0,
+		"unknown name: unresolved material loaded as the placeholder (stone), no crash, edit kept")
+	_ok(w4.block_id_at(s_target) != WOOD, "unknown name: placeholder is distinct from the saved material")
+	w4.queue_free()
+
+	be_state.has_block_entity = prev_be                  # restore (gameplay data untouched)

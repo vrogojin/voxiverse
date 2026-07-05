@@ -347,6 +347,78 @@ func _paint_cell(cell: Vector3i, packed: int) -> void:
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
 
+# --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------
+# The generated world is a pure function (tier 2) and is NEVER serialized; only the edit
+# overlay — the world's deviations from that function — needs persisting. `save_edits`
+# compacts the overlay (+ metadata) for one 32³ region into a ZoneChunk; `load_edits`
+# applies one back through the single write choke point, so the overlay and metadata are
+# restored identically. This is additive: nothing in the live break/place/collapse loop
+# calls it, so gameplay is byte-identical whether or not a save ever happens.
+
+## The 32-aligned min-corner cell of the ZoneChunk region that contains `cell`.
+static func region_origin_of(cell: Vector3i) -> Vector3i:
+	var s := ZoneChunk.SIZE
+	return Vector3i(_floor_div(cell.x, s) * s, _floor_div(cell.y, s) * s, _floor_div(cell.z, s) * s)
+
+static func _floor_div(a: int, b: int) -> int:
+	# Floored (not truncated) integer division, so negative coordinates snap DOWN to their
+	# region origin (−1 → −32 for SIZE 32, not 0), keeping regions a clean tiling of the grid.
+	var q := a / b
+	if (a % b) != 0 and ((a < 0) != (b < 0)):
+		q -= 1
+	return q
+
+## Serialize the edit overlay (+ per-cell metadata) within the 32³ region whose min corner
+## is `region_origin` (must be 32-aligned — use `region_origin_of`) into a ZoneChunk. Only
+## edited cells occupy the chunk; unedited cells are absent and fall back to the generated
+## function on load (tier composition, §4). A region with no edits yields a uniform (unset)
+## chunk that serializes to a handful of bytes (§5.5).
+func save_edits(region_origin: Vector3i) -> ZoneChunk:
+	var zc := ZoneChunk.new()
+	var s := ZoneChunk.SIZE
+	# Union of edited cells and metadata-bearing cells in the region (a metadata cell is
+	# always an edited block-entity cell today, but unioning is leak-proof regardless).
+	var cells := {}
+	for cell: Vector3i in _edits.keys():
+		if _in_region(cell, region_origin, s):
+			cells[cell] = true
+	for cell: Vector3i in _meta.keys():
+		if _in_region(cell, region_origin, s):
+			cells[cell] = true
+	for cell: Vector3i in cells.keys():
+		var local := cell - region_origin
+		var idx := ZoneChunk.local_index(local.x, local.y, local.z)
+		zc.set_cell(idx, cell_value_at(cell), _meta.get(cell, null))
+	return zc
+
+## Apply a ZoneChunk's present cells back into the overlay at `region_origin`, routing every
+## cell through the single write choke point (`_write_cell`) so the material/modifier/state
+## axes AND the metadata document are restored exactly as saved. Materials resolve by NAME
+## through `resolver` (a `Callable(name: StringName) -> int`; default `BlockCatalog.id_of`),
+## so a chunk stays valid even if the runtime catalog assigns different dense ids than the
+## saving session did (VDS §10.1). An unknown name resolves to a logged placeholder material
+## (never a crash, never data loss of the shape/state bits — §16).
+func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = Callable()) -> void:
+	for idx: int in chunk.present_indices():
+		var name := chunk.material_name_at(idx)
+		var id := -1
+		if resolver.is_valid():
+			id = int(resolver.call(StringName(name)))
+		else:
+			id = BlockCatalog.id_of(StringName(name))
+		if id < 0:
+			id = BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+			push_error("WorldManager.load_edits: unknown material name '%s' — substituting placeholder '%s'"
+				% [name, ZoneChunk.PLACEHOLDER_MATERIAL])
+		var packed := CellCodec.pack(id, chunk.modifier_at(idx), chunk.state_at(idx))
+		var local := ZoneChunk.from_local_index(idx)
+		_write_cell(region_origin + local, packed, chunk.meta_at(idx))
+
+static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
+	return cell.x >= origin.x and cell.x < origin.x + s \
+		and cell.y >= origin.y and cell.y < origin.y + s \
+		and cell.z >= origin.z and cell.z < origin.z + s
+
 # --- terrain collapse (unsupported/overloaded blocks fall) ---------------------
 # The support analysis itself lives in StructuralSolver (STRUCTURAL-INTEGRITY §5);
 # WorldManager owns only the resulting carve + VoxelBody spawn (_structural_update).

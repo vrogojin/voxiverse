@@ -67,7 +67,7 @@ const DYN_BOUNCE := 0.0           # no bouncing on impact
 const LAYER_BODY := 1 << 1        # this body lives on layer 2
 const MASK_BODY := (1 << 0) | (1 << 1) | (1 << 2)   # collide w/ ground+bodies+player
 
-var cells: Dictionary = {}        # Vector3i -> int block_id (body-local voxel coords)
+var cells: Dictionary = {}        # Vector3i -> int PACKED cell value (body-local coords)
 var world: WorldManager           # for the ground-contact (grounded) test
 var activated: bool = false       # false = pristine frozen cluster; true = dynamic
 var _recheck := 0                 # countdown for the throttled frozen-body support re-test
@@ -154,10 +154,10 @@ func break_cell(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> void:
 	if was_frozen and not _grounded(cells):
 		_apply_kick(self, from_pos)
 
-## Block id stored at body-local `cell`; 0 (AIR) if the body has no such cell.
+## Material id at body-local `cell`; 0 (AIR) if the body has no such cell. Cells
+## store packed values (a bare id is plain), so we project the material out.
 func cell_block_id(cell: Vector3i) -> int:
-	var id: int = cells.get(cell, 0)
-	return id
+	return CellCodec.mat(cells.get(cell, 0))
 
 ## Map a world-space ray hit (position + surface normal) to the body-local cell
 ## that was struck, so a click can break exactly the block the player pointed at.
@@ -206,8 +206,7 @@ func _physics_process(_delta: float) -> void:
 ## (never auto-freezes). Everything else is a ground body.
 func _has_wood() -> bool:
 	for c: Vector3i in cells.keys():
-		var id: int = cells[c]
-		if id == BlockCatalog.WOOD:
+		if CellCodec.mat(cells[c]) == BlockCatalog.WOOD:
 			return true
 	return false
 
@@ -401,7 +400,7 @@ func _rebuild() -> void:
 	var mesh := ArrayMesh.new()
 	var tools: Dictionary = {}          # int block_id -> SurfaceTool
 	for c: Vector3i in cells.keys():
-		var id: int = cells[c]
+		var id: int = CellCodec.mat(cells[c])   # surfaces group by MATERIAL
 		for d in _DIRS:
 			if not cells.has(c + d):
 				var st: SurfaceTool = tools.get(id, null)
@@ -432,8 +431,7 @@ func _rebuild() -> void:
 	# Mass = sum of per-cell catalog masses (floor at 1 kg so a body is never zero).
 	var m := 0.0
 	for c: Vector3i in cells.keys():
-		var id: int = cells[c]
-		m += BlockCatalog.mass_of(id)
+		m += BlockCatalog.mass_of(CellCodec.mat(cells[c]))
 	mass = maxf(1.0, m)
 	freeze = not activated
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces

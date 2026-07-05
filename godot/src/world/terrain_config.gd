@@ -90,13 +90,19 @@ static func stone_height_at(x: int, z: int) -> int:
 	_ensure_noise()
 	return int(floor(STONE_BASE + _stone.get_noise_2d(float(x), float(z)) * STONE_AMPLITUDE))
 
-## Pure generation (no edits): which block id the WORLD GENERATOR puts at (x,y,z).
-## THE terrain function — both render paths, the analytic queries, the collider
-## and the collapse pass all derive from it, so they agree by construction.
+## Pure generation (no edits): the PACKED cell value the WORLD GENERATOR puts at
+## (x,y,z) — VOXEL-DATA-STRUCTURE §7.1 tier 2. THE terrain function: both render
+## paths, the analytic queries, the collider and the collapse pass all derive
+## from it (via generated_block / cell_value_at), so they agree by construction.
 ## Per column: grass ONLY at the surface cell y==g; a dirt band of thickness >= 2
 ## between grass and stone_top = min(stone_height, g-3); stone all the way down
 ## (columns are never hollow); wood/leaf trees above the surface.
-static func generated_block(x: int, y: int, z: int) -> int:
+##
+## P0: the generated world is all plain full cubes in their default state, so the
+## packed value equals the bare material id (modifier 0, state 0). The terrain
+## smoothing workstream (SUB-VOXEL) will emit non-zero modifiers here without
+## touching a single caller of generated_block.
+static func generated_cell(x: int, y: int, z: int) -> int:
 	var g := height_at(x, z)
 	if y > g:
 		return TreeGen.block_at(x, y, z)            # wood/leaf above the surface, else AIR
@@ -104,6 +110,13 @@ static func generated_block(x: int, y: int, z: int) -> int:
 		return BlockCatalog.GRASS                    # grass ONLY at the surface cell
 	var stone_top := mini(stone_height_at(x, z), g - DIRT_MIN_DEPTH)
 	return BlockCatalog.STONE if y <= stone_top else BlockCatalog.DIRT
+
+## Material id the generator puts at (x,y,z) — the material projection of the
+## packed generated_cell(). Unchanged contract: every existing caller (analytic
+## queries, both meshers, the collider, the collapse pass, the sim layer) reads
+## this exact 0..COUNT-1 id.
+static func generated_block(x: int, y: int, z: int) -> int:
+	return CellCodec.mat(generated_cell(x, y, z))
 
 ## True when cell (x, y, z) is solid; false for air. Now the composed terrain +
 ## tree query, so tree cells are solid for every existing consumer (floor,

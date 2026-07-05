@@ -22,9 +22,13 @@ var _ground: GroundCollider           # local blocky physics collider
 
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
-# dictionary replaces the old `_removed` set: 0 = dug to air, >0 = player-placed
-# block id. `block_id_at(cell)` = edits-overlay-else-generated is THE cell query.
-var _edits: Dictionary = {}           # Vector3i -> int block_id (0 = air, >0 = placed)
+# dictionary replaces the old `_removed` set: 0 = dug to air, >0 = solid cell.
+# Values are PACKED cell values (CellCodec: material | modifier<<16 | state<<32);
+# a bare block id is a valid packed value meaning "full cube, state 0", so every
+# value stored today is already canonical and no migration is needed. 0 stays
+# "dug to air". `cell_value_at(cell)` = edits-overlay-else-generated is THE cell
+# query; `block_id_at` is its material projection.
+var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = air)
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
@@ -86,14 +90,22 @@ func update_streaming(player_pos: Vector3) -> void:
 
 # --- terrain editing (block breaking + placing) --------------------------------
 
-## Universal composed cell query: edit overlay first, else generated terrain+trees.
-## THE cell query — floor/blocked/DDA/collider/collapse all go through it, so the
-## edit overlay, the layered terrain and the trees always agree.
-func block_id_at(cell: Vector3i) -> int:
+## THE composed cell query (VOXEL-DATA-STRUCTURE §7.1): edit overlay first, else
+## generated terrain+trees. Returns the full PACKED cell value (material |
+## modifier<<16 | state<<32); material/modifier/state are bit-projections of this
+## one int, so they cannot desync. There is no second lookup that could disagree.
+func cell_value_at(cell: Vector3i) -> int:
 	var e: int = _edits.get(cell, -1)
 	if e >= 0:
-		return e
-	return TerrainConfig.generated_block(cell.x, cell.y, cell.z)
+		return e                                    # overlay (already canonical)
+	return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+
+## Material id at `cell` — the material projection of the composed query. UNCHANGED
+## contract: every existing call site (floor, blocked, DDA, collider, collapse,
+## both meshers, catalog/sim checks) sees the exact same 0..COUNT-1 id it always
+## did, because a bare id is a canonical packed value. THE cell query for gameplay.
+func block_id_at(cell: Vector3i) -> int:
+	return CellCodec.mat(cell_value_at(cell))
 
 ## Composed solidity (public now; the old private _cell_solid delegates to it).
 func cell_solid(cell: Vector3i) -> bool:
@@ -110,8 +122,10 @@ func is_removed(cell: Vector3i) -> bool:
 func placed_top(x: int, z: int) -> int:
 	return _placed_top.get(Vector2i(x, z), -0x40000000)
 
-## Read-only view of the edit overlay (Vector3i -> int block_id; 0 = dug air,
-## >0 = placed). The fallback mesher reads placed (id > 0) cells from it.
+## Read-only view of the edit overlay (Vector3i -> int PACKED cell value; 0 = dug
+## air, >0 = solid). The fallback mesher reads placed (value > 0) cells from it and
+## MUST project the material via CellCodec.mat (a bare id is a plain packed value,
+## so it is identical today) rather than treating the raw value as a block id.
 func placed_cells() -> Dictionary:
 	return _edits
 
@@ -135,9 +149,8 @@ func effective_height(x: int, z: int) -> int:
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
 		return 0
-	var id: int = block_id_at(cell)     # capture BEFORE carving
-	_edits[cell] = 0
-	_paint_cell(cell, 0)
+	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
+	_write_cell(cell, 0)                # dig to air (0 = canonical air)
 	_collapse_unsupported(cell, from_pos)   # only from the player break — never a spawn
 	if _ground != null:
 		_ground.rebuild_now()
@@ -153,19 +166,30 @@ func place_block(cell: Vector3i, block_id: int) -> bool:
 		return false
 	if cell_solid(cell):
 		return false
-	_edits[cell] = block_id
+	_write_cell(cell, CellCodec.pack(block_id))   # full cube, default state
 	var key := Vector2i(cell.x, cell.z)
 	var prev: int = _placed_top.get(key, -0x40000000)
 	if cell.y > prev:
 		_placed_top[key] = cell.y
-	_paint_cell(cell, block_id)
 	if _ground != null:
 		_ground.rebuild_now()
 	return true
 
-## Mirror one cell's block id into the active render path (0 = carve to air).
-## Shared by break/place/collapse so the godot_voxel / fallback plumbing lives in
-## one place. The caller owns the `_edits` overlay + ground rebuild.
+## THE single write choke point (VOXEL-DATA-STRUCTURE §7.2): the ONLY function
+## that mutates a cell's overlay value. break/place/collapse all route here. It
+## canonicalizes the packed value (air-zeroing + P5/P6 hooks), stores it in
+## `_edits`, and mirrors the resulting MATERIAL into the active render path. Keeps
+## every existing semantic — a bare id in, a bare id painted — while making the
+## overlay shape/state-ready. (Metadata settlement lands in P1.)
+func _write_cell(cell: Vector3i, packed: int) -> void:
+	packed = CellCodec.canonical(packed)
+	_edits[cell] = packed
+	_paint_cell(cell, CellCodec.mat(packed))
+
+## Mirror one cell's MATERIAL id into the active render path (0 = carve to air).
+## Shared by _write_cell so the godot_voxel / fallback plumbing lives in one
+## place. The caller (_write_cell) owns the `_edits` overlay; break/place own the
+## ground rebuild.
 func _paint_cell(cell: Vector3i, block_id: int) -> void:
 	if using_module and _module_world != null:
 		_module_world.call("set_cell", cell, block_id)
@@ -288,16 +312,17 @@ func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
 				if floating.has(nc) and not seen.has(nc):
 					seen[nc] = true
 					cstack.append(nc)
-		# Capture each cell's block id BEFORE carving (so mixed grass/dirt/stone and
-		# wood+leaf canopies keep their materials), then carve the component out of the
-		# terrain and drop it as one loose body — VoxelBody resolves materials + masses
-		# from the ids itself. from_pos kicks the cluster away from the breaker.
-		var comp_ids: Dictionary = {}   # Vector3i -> int block_id
+		# Capture each cell's PACKED value BEFORE carving (so mixed grass/dirt/stone and
+		# wood+leaf canopies keep their materials — and, once modifiers/state land, their
+		# shape and variant too), then carve the component out of the terrain and drop it
+		# as one loose body — VoxelBody projects materials + masses from the packed values
+		# itself. A bare id is a valid packed value, so this is byte-identical today.
+		# from_pos kicks the cluster away from the breaker.
+		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
-			comp_ids[c] = block_id_at(c)
+			comp_ids[c] = cell_value_at(c)
 		for c: Vector3i in comp:
-			_edits[c] = 0
-			_paint_cell(c, 0)
+			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
 
 # --- analytic world queries (path-agnostic) ------------------------------------

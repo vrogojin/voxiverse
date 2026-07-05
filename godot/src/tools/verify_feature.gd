@@ -28,6 +28,7 @@ func _initialize() -> void:
 	_test_masses()
 	_test_materials()
 	_test_inventory()
+	_test_cell_codec()
 	_test_world_loop()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -157,6 +158,74 @@ func _test_inventory() -> void:
 	inv.select_slot(0)
 	inv.scroll(-1)
 	_ok(inv.selected_index() == Inventory.SLOT_COUNT - 1, "scroll -1 from 0 wraps to last")
+
+# 9. CellCodec packing + the packed overlay: pack/unpack round-trip, bare-id
+# equivalence, air-zeroing canonicalization, and projection coherence
+# (block_id_at == mat(cell_value_at)) on a live WorldManager and the generator.
+func _test_cell_codec() -> void:
+	print("[9] CellCodec + packed overlay")
+	# (b) pack/unpack round-trip for sample (mat, modifier, state) triples.
+	var triples := [
+		[GRASS, 0, 0], [STONE, 5, 0], [WOOD, 0, 7], [LEAF, 42, 1000],
+		[DIRT, 0xFFFF, 0xFFFF], [GRASS, 0xABCD, 0x1234],
+	]
+	for t in triples:
+		var m: int = t[0]
+		var mod: int = t[1]
+		var st: int = t[2]
+		var v := CellCodec.pack(m, mod, st)
+		_ok(CellCodec.mat(v) == m and CellCodec.modifier(v) == mod and CellCodec.state(v) == st,
+			"pack/unpack round-trip (%d,%d,%d)" % [m, mod, st])
+	# (d) a bare legacy id IS a valid packed value == pack(id, 0, 0), and is_plain.
+	for id in [BlockCatalog.AIR, GRASS, DIRT, STONE, WOOD, LEAF]:
+		_ok(CellCodec.pack(id) == id, "bare id %d == pack(id,0,0)" % id)
+		_ok(CellCodec.mat(id) == id, "mat(bare id %d) == id" % id)
+		_ok(CellCodec.is_plain(id), "is_plain(bare id %d)" % id)
+	# (c) canonicalization: 0 stays 0, air-zeroing drops stray modifier/state,
+	# a bare solid id is already canonical, shaped/stated cells are not plain.
+	_ok(CellCodec.canonical(0) == 0, "canonical(0) == 0")
+	_ok(CellCodec.canonical(CellCodec.pack(BlockCatalog.AIR, 5, 3)) == 0,
+		"canonical(air with modifier+state) == 0 (air-zeroing)")
+	_ok(CellCodec.canonical(STONE) == STONE, "canonical(bare stone) == stone")
+	_ok(not CellCodec.is_plain(CellCodec.pack(STONE, 1, 0)), "shaped stone is not plain")
+	_ok(not CellCodec.is_plain(CellCodec.pack(STONE, 0, 1)), "stated stone is not plain")
+
+	# (a) projection coherence on a LIVE WorldManager across edited + generated + air.
+	var world: WorldManager = WorldManager.new()
+	world.name = "WorldManagerCodec"
+	get_root().add_child(world)
+	var cx := 12
+	var cz := 12
+	var g: int = TerrainConfig.height_at(cx, cz)
+	_ok(world.place_block(Vector3i(cx, g + 1, cz), STONE), "codec: place a stone")
+	# The overlay stores a canonical PLAIN packed value for a placed cube (checked
+	# BEFORE any break — digging the grass under it would collapse it into a body).
+	_ok(world.cell_value_at(Vector3i(cx, g + 1, cz)) == STONE, "placed stone stored as plain packed value")
+	_ok(CellCodec.is_plain(world.cell_value_at(Vector3i(cx, g + 1, cz))), "placed stone overlay value is_plain")
+	_ok(world.break_terrain(Vector3i(cx, g, cz), Vector3.INF) == GRASS, "codec: dig the surface grass")
+	var samples: Array[Vector3i] = [
+		Vector3i(cx, g + 1, cz),        # placed stone (overlay)
+		Vector3i(cx, g, cz),            # dug air (overlay, value 0)
+		Vector3i(cx, g - 2, cz),        # generated dirt/stone
+		Vector3i(cx, g - 20, cz),       # deep generated stone
+		Vector3i(cx, g + 40, cz),       # air far above (generated)
+		Vector3i(cx + 5, g, cz + 5),    # untouched surface grass
+	]
+	for c: Vector3i in samples:
+		_ok(world.block_id_at(c) == CellCodec.mat(world.cell_value_at(c)),
+			"projection coherence block_id_at==mat(cell_value_at) @ " + str(c))
+	_ok(world.cell_value_at(Vector3i(cx, g, cz)) == 0, "dug cell stored as 0 (air)")
+	# generated_block is exactly the material projection of generated_cell.
+	var gen_checked := 0
+	for x in range(-60, 60, 17):
+		for z in range(-60, 60, 19):
+			var gg: int = TerrainConfig.height_at(x, z)
+			for y in [gg + 2, gg, gg - 1, gg - 5]:
+				_ok(TerrainConfig.generated_block(x, y, z) == CellCodec.mat(TerrainConfig.generated_cell(x, y, z)),
+					"generated_block == mat(generated_cell) @ (%d,%d,%d)" % [x, y, z])
+				gen_checked += 1
+	print("    projection-coherence checked %d generated cells" % gen_checked)
+	world.queue_free()
 
 # 4/5. Live world edit loop: break returns id, place mutates + collider rebuilds.
 func _test_world_loop() -> void:

@@ -193,7 +193,9 @@ static func _emit_one_tree(tools: Dictionary, world: WorldManager,
 static func _emit_placed(tools: Dictionary, world: WorldManager,
 		n: int, x0: int, z0: int) -> void:
 	for cell: Vector3i in world.placed_cells().keys():
-		var id: int = world.placed_cells()[cell]
+		# placed_cells() values are PACKED cell values; the mesher needs the MATERIAL
+		# only (a bare id is a plain packed value, so this is identical today).
+		var id: int = CellCodec.mat(world.placed_cells()[cell])
 		if id <= BlockCatalog.AIR:
 			continue
 		if cell.x < x0 or cell.x >= x0 + n or cell.z < z0 or cell.z >= z0 + n:

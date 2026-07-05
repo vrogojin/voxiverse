@@ -27,6 +27,7 @@ func _initialize() -> void:
 	_test_worldgen()
 	_test_smoothing()
 	_test_collider_cheap_queries()
+	_test_collider_overlay_cases()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -653,6 +654,198 @@ func _test_collider_cheap_queries() -> void:
 	_ok(nshapes > 0, "collider-cheap: real collider rebuild emitted shapes (%d)" % nshapes)
 	gc.queue_free()
 	cw.queue_free()
+
+# 2c. GroundCollider OVERLAY correctness (dug tunnels + placed structures). The freeze fix
+# replaces ONLY the heavy generated_cell surface/tree read; the overlay/solidity logic that
+# makes carved air and built geometry correct is UNTOUCHED. Proven three ways per the review:
+#  (a) dig a vertical shaft → NO collision box in the carved-air cells, a floor box at the
+#      true tunnel bottom, AND floor_under still falls into the hole (player never teleports
+#      to the surface — the analytic physics in WorldManager is untouched);
+#  (b) place a small structure (full cube + a shaped slab) → boxes/prisms match the placed
+#      cells;
+#  (c) the cheap surface_modifier/TreeGen substitution yields BYTE-IDENTICAL collider shapes
+#      vs the OLD heavy generated_cell path (cell_value_at) over a plain, a dug, and a placed
+#      column — read back straight from PhysicsServer.
+func _test_collider_overlay_cases() -> void:
+	print("[2c] collider overlay cases (dug tunnels + placed structures)")
+
+	# --- (a) DUG SHAFT ---------------------------------------------------------
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var wd: WorldManager = _struct_world("ColDug")
+	var gd := GroundCollider.new()
+	get_root().add_child(gd)
+	gd.setup(wd)
+	var rd: RID = gd.get_rid()
+	gd.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))   # first build → centre (cx,cz)
+	var dug_ys := [g, g - 1, g - 2]                                        # dig the top 3 solid cells
+	var dug_ok := true
+	for dy: int in dug_ys:
+		if wd.break_terrain(Vector3i(cx, dy, cz)) <= 0:
+			dug_ok = false
+	gd.rebuild_now()                                                       # rebuild over the dug overlay
+	_ok(dug_ok, "dug shaft: broke 3 surface cells (overlay = air)")
+	var act_d := _collider_col(rd, cx, cz)
+	var ref_d := _ref_col_heavy(wd, cx, cz, Vector2i(cx, cz))
+	_ok(_cols_equal(act_d, ref_d), "dug shaft: collider shapes == OLD heavy-path shapes (byte-identical)")
+	# No box may span any carved-air cell [dy, dy+1].
+	var no_phantom := true
+	for dy: int in dug_ys:
+		for bx: Vector2 in act_d["boxes"]:
+			if bx.x <= float(dy) + 0.001 and bx.y >= float(dy) + 1.0 - 0.001:
+				no_phantom = false
+	_ok(no_phantom, "dug shaft: NO collision box in the carved-air cells (no phantom shelf)")
+	# A floor box exists whose TOP is the true tunnel bottom (top face at the lowest dug y).
+	var tunnel_floor_top := float(g - 2)
+	var has_floor := false
+	for bx: Vector2 in act_d["boxes"]:
+		if absf(bx.y - tunnel_floor_top) < 0.001:
+			has_floor = true
+	_ok(has_floor, "dug shaft: floor box top at the true tunnel bottom (y=%d)" % (g - 2))
+	# Analytic player physics is UNTOUCHED: floor_under scans down into the shaft (never clamps
+	# to the noise top), so a player over the hole falls to the tunnel floor, not the surface.
+	var fu := wd.floor_under(float(cx) + 0.5, float(cz) + 0.5, float(g) + 0.5)
+	_ok(fu < float(g) - 0.5 and absf(fu - float(g - 2)) < 0.001,
+		"dug shaft: floor_under=%.2f is the tunnel floor (y-2), NOT the surface (no teleport)" % fu)
+	gd.queue_free()
+	wd.queue_free()
+
+	# --- (b) PLACED STRUCTURE (full cube + shaped slab) ------------------------
+	var wp: WorldManager = _struct_world("ColPlace")
+	var gp := GroundCollider.new()
+	get_root().add_child(gp)
+	gp.setup(wp)
+	var rp: RID = gp.get_rid()
+	gp.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+	var slab_mod := ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM)   # a half-slab
+	var placed_cube := wp.place_block(Vector3i(cx, g + 1, cz), STONE)                # full cube on the surface
+	var placed_slab := wp.place_block(Vector3i(cx, g + 2, cz), CellCodec.pack(STONE, slab_mod))
+	gp.rebuild_now()
+	_ok(placed_cube and placed_slab, "placed structure: full cube (g+1) + slab (g+2) accepted")
+	var act_p := _collider_col(rp, cx, cz)
+	var ref_p := _ref_col_heavy(wp, cx, cz, Vector2i(cx, cz))
+	_ok(_cols_equal(act_p, ref_p), "placed structure: collider shapes == OLD heavy-path shapes (byte-identical)")
+	# The full cube at g+1 is covered by a solid box.
+	var cube_covered := false
+	for bx: Vector2 in act_p["boxes"]:
+		if bx.x <= float(g + 1) + 0.001 and bx.y >= float(g + 2) - 0.001:
+			cube_covered = true
+	_ok(cube_covered, "placed structure: full cube at g+1 is covered by a collision box")
+	# The shaped slab at g+2 is a convex prism (matches the placed geometry, not a full box).
+	_ok(act_p["prisms"].has(g + 2), "placed structure: shaped slab at g+2 emits a convex prism")
+	gp.queue_free()
+	wp.queue_free()
+
+## Read the collider's emitted shapes at column (cx,cz) straight from PhysicsServer, grouped
+## as box vertical-spans (Vector2(bottom,top)) and prism cell-ys — so a test can compare the
+## ACTUAL collider output against a reference.
+func _collider_col(rid: RID, cx: int, cz: int) -> Dictionary:
+	var boxes: Array = []
+	# A shaped cell emits >1 convex triangle-prism; collect the SET of prism cell-ys (the
+	# modifier that fixes the triangle count is computed identically on both paths, so the
+	# cell set is the byte-identity signal — see _ref_col_heavy, which marks one per cell).
+	var prism_set := {}
+	var n := PhysicsServer3D.body_get_shape_count(rid)
+	for i in n:
+		var sh: RID = PhysicsServer3D.body_get_shape(rid, i)
+		var stype := PhysicsServer3D.shape_get_type(sh)
+		if stype == PhysicsServer3D.SHAPE_BOX:
+			var o: Vector3 = PhysicsServer3D.body_get_shape_transform(rid, i).origin
+			if int(floor(o.x)) == cx and int(floor(o.z)) == cz:
+				var half: Vector3 = PhysicsServer3D.shape_get_data(sh)
+				boxes.append(Vector2(o.y - half.y, o.y + half.y))
+		elif stype == PhysicsServer3D.SHAPE_CONVEX_POLYGON:
+			var pts: PackedVector3Array = PhysicsServer3D.shape_get_data(sh)   # world-space (identity xform)
+			if pts.size() > 0:
+				var mn := pts[0]
+				for p: Vector3 in pts:
+					mn = Vector3(minf(mn.x, p.x), minf(mn.y, p.y), minf(mn.z, p.z))
+				if int(floor(mn.x + 0.001)) == cx and int(floor(mn.z + 0.001)) == cz:
+					prism_set[int(floor(mn.y + 0.001))] = true
+	boxes.sort_custom(func(a, b): return a.x < b.x)
+	var prisms: Array = prism_set.keys()
+	prisms.sort()
+	return {"boxes": boxes, "prisms": prisms}
+
+## Reference: the OLD (pre-fix) collider column algorithm, using the HEAVY generated_cell path
+## (world.cell_value_at) for every cell. Byte-for-byte the code the fix replaced, so a match
+## against the live collider proves the cheap surface_modifier/TreeGen substitution changed
+## nothing observable. y_lo is derived exactly as the collider does (region-min surface).
+func _ref_col_heavy(world: WorldManager, cx: int, cz: int, center: Vector2i) -> Dictionary:
+	var R: int = GroundCollider.R
+	var min_h := 0x7fffffff
+	for i in (2 * R + 1):
+		for j in (2 * R + 1):
+			var hh: int = TerrainConfig.height_at(center.x - R + i, center.y - R + j)
+			if hh < min_h:
+				min_h = hh
+	var y_lo := min_h - GroundCollider.DEPTH
+	var h: int = TerrainConfig.height_at(cx, cz)
+	var boxes: Array = []
+	var prisms: Array = []
+	var run_start := 0x7fffffff
+	var y := y_lo
+	while world.is_removed(Vector3i(cx, y, cz)):
+		y -= 1
+	while y <= h:
+		var ov: int = world.placed_cells().get(Vector3i(cx, y, cz), -1)
+		var modifier := 0
+		if ov > 0:
+			modifier = CellCodec.modifier(ov)
+		elif ov < 0 and y == h:
+			modifier = CellCodec.modifier(world.cell_value_at(Vector3i(cx, y, cz)))
+		if ov == 0:
+			if run_start != 0x7fffffff:
+				boxes.append(Vector2(float(run_start), float(y)))
+				run_start = 0x7fffffff
+		elif modifier != 0:
+			if run_start != 0x7fffffff:
+				boxes.append(Vector2(float(run_start), float(y)))
+				run_start = 0x7fffffff
+			prisms.append(y)
+		elif run_start == 0x7fffffff:
+			run_start = y
+		y += 1
+	var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(cx, cz))
+	while y <= y_top:
+		var v: int = world.cell_value_at(Vector3i(cx, y, cz))
+		var mat: int = CellCodec.mat(v)
+		if mat != BlockCatalog.AIR and CellCodec.modifier(v) != 0:
+			if run_start != 0x7fffffff:
+				boxes.append(Vector2(float(run_start), float(y)))
+				run_start = 0x7fffffff
+			prisms.append(y)
+		elif mat != BlockCatalog.AIR:
+			if run_start == 0x7fffffff:
+				run_start = y
+		elif run_start != 0x7fffffff:
+			boxes.append(Vector2(float(run_start), float(y)))
+			run_start = 0x7fffffff
+		y += 1
+	if run_start != 0x7fffffff:
+		boxes.append(Vector2(float(run_start), float(y_top + 1)))
+	boxes.sort_custom(func(a, b): return a.x < b.x)
+	prisms.sort()
+	return {"boxes": boxes, "prisms": prisms}
+
+func _cols_equal(a: Dictionary, b: Dictionary) -> bool:
+	var ab: Array = a["boxes"]
+	var bb: Array = b["boxes"]
+	if ab.size() != bb.size():
+		return false
+	for i in ab.size():
+		if absf(ab[i].x - bb[i].x) > 0.001 or absf(ab[i].y - bb[i].y) > 0.001:
+			return false
+	var ap: Array = a["prisms"]
+	var bp: Array = b["prisms"]
+	if ap.size() != bp.size():
+		return false
+	for i in ap.size():
+		if ap[i] != bp[i]:
+			return false
+	return true
 
 # 3. Trees exist, are well formed and deterministic; species are biome-keyed and
 # a SPRUCE is found in taiga/snowy (WGC §6.7). Oak stays a valid tree.

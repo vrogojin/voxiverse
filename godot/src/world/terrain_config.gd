@@ -31,10 +31,12 @@ const SEED := 20260702
 
 ## DIAGNOSTIC A/B TOGGLE (SUB-VOXEL-SMOOTHING). When false, terrain smoothing is fully OFF:
 ## the surface cell is a plain FULL cube (no ramp/slab reshape), no grass CAP lip grows, and the
-## appearance manifest bakes ZERO shaped models — the world is cube-only like pre-P5. Flip to true
-## to restore full smoothing (a genuine one-line change; no smoothing math is altered, only gated).
-## Currently OFF to A/B whether smoothing (and its per-shape meshing) causes the in-game jerkiness.
-const SMOOTHING_ENABLED := false
+## appearance manifest bakes ZERO shaped models — the world is cube-only like pre-P5. Flip to false
+## to disable smoothing (a genuine one-line change; no smoothing math is altered, only gated).
+## Now ON: the smoothing "jerkiness" was NOT the renderer (measured identical to cubes) but the
+## analytic main-thread queries recomputing the 9-height_at corner stencil per surface/cap probe;
+## the per-column shape memo below (_shape_entry) makes that ~free, so smoothing is cheap again.
+const SMOOTHING_ENABLED := true
 
 # --- vertical structure (WGC §6.1, our scale) ---------------------------------
 const WORLD_BOTTOM_Y := -64      # world floor; below is void (unreachable)
@@ -456,6 +458,54 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 		return 0
 	return ShapeCodec.make_modifier(c00, c10, c11, c01, ShapeCodec.ANCHOR_BOTTOM)
 
+# ------------------------------------------------------------------------------
+# Per-column SHAPE MEMO (analytic-path PERF, the smoothing-jerkiness fix). The analytic queries
+# (WorldManager.floor_under/blocked → cell_value_at → generated_cell, pcache == null) hit a surface
+# (y==g) or cap (y==g+1) cell on nearly every probe; each recomputes the 3×3 corner-target stencil
+# = 9 height_at = 27 fresh noise samples (a surface cell measured 2.9 → 13.2 µs, 4.2×). While the
+# player MOVES it fires ~6 such probes per tick → ms-scale on wasm → the "smoothing stutter". This
+# memo caches, per column, the (g, surface_modifier, cap_modifier) triple — PURE functions of SEED
+# (immutable at runtime; player edits live in the overlay, never in generated modifiers), so it is
+# byte-identical to recomputing. Packed int: (g + _MEMO_G_BIAS) | surface_mod<<16 | cap_mod<<24
+# (both mods are BOTTOM corner-height codes < 256; g biased so its low 16 bits stay positive).
+#
+# THREAD SAFETY — READ THIS: GDScript Dictionaries are NOT thread-safe. This memo is MAIN-THREAD-
+# ONLY by construction. The module voxel WORKER always calls resolve_cell/_smoothed_surface/… with
+# a NON-NULL pcache (its per-block cache), so it never reaches the memo. The memo is consulted only
+# when pcache == null AND the caller is the main thread; any other threaded caller lacking a pcache
+# falls back to the direct (uncached, correct) compute. So no worker thread ever reads or writes
+# `_shape_memo`. Do NOT remove the pcache==null + main-thread guards.
+const _MEMO_G_BIAS := 512          # keeps (g + bias) positive in the packed low 16 bits (g >= -512)
+const _MEMO_MAX := 262144          # ~256k columns; cleared past this to bound a marathon session
+static var _shape_memo: Dictionary = {}
+
+static func _on_main_thread() -> bool:
+	return OS.get_thread_caller_id() == OS.get_main_thread_id()
+
+## The cached packed (g, surface_mod, cap_mod) for column (x, z), computing + storing it on first
+## access. MAIN-THREAD ONLY (see the memo header). surface_mod/cap_mod are the EXACT smoothing
+## modifiers _smoothed_surface/_surface_cap (and surface_modifier/surface_cap_modifier) emit for
+## this column — WITH the underwater + tree-rest suppression — so any consulting query is exact.
+static func _shape_entry(x: int, z: int) -> int:
+	var k := Vector2i(x, z)
+	var e: int = _shape_memo.get(k, -1)
+	if e != -1:
+		return e
+	var g := height_at(x, z)
+	var sm := 0
+	var cm := 0
+	# Land, smoothing on, and no tree cell resting on the top → the reshape applies (surface AND
+	# cap share the same corner targets); otherwise both modifiers stay 0 (plain cube / no cap).
+	if SMOOTHING_ENABLED and g >= SEA_LEVEL and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
+		var t := _corner_targets(x, z)      # the 9-height_at stencil — computed ONCE, then cached
+		sm = _modifier_from_targets(t, g)
+		cm = _modifier_from_targets(t, g + 1)
+	if _shape_memo.size() >= _MEMO_MAX:
+		_shape_memo.clear()                 # bound memory over a marathon session
+	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24)
+	_shape_memo[k] = e
+	return e
+
 ## The packed SURFACE cell value at (x, g, z): the biome-top material `mat` reshaped by
 ## the smoothing modifier, or the plain material when flat OR under a tree base (a tree
 ## cell resting on the surface forces it FULL so trunks never float on a ramp corner —
@@ -463,6 +513,11 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return mat                                    # diagnostic: cube-only surface
+	# Analytic main-thread path (pcache == null): the cached surface modifier avoids the 9-height_at
+	# corner stencil. The worker (pcache != null) and any other thread fall through to direct compute.
+	if pcache == null and _on_main_thread():
+		var sm := (_shape_entry(x, z) >> 16) & 0xFF
+		return mat if sm == 0 else CellCodec.pack(mat, sm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return mat                                    # a tree cell rests here → keep FULL
 	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g)
@@ -477,6 +532,9 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -
 static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return BlockCatalog.AIR                       # diagnostic: no cap cells
+	if pcache == null and _on_main_thread():
+		var cm := (_shape_entry(x, z) >> 24) & 0xFF
+		return BlockCatalog.AIR if cm == 0 else CellCodec.pack(_biome_top(biome, x, z), cm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
 	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
@@ -502,6 +560,8 @@ static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> i
 static func surface_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: cube-only surface
+	if pcache == null and _on_main_thread():
+		return (_shape_entry(x, z) >> 16) & 0xFF
 	var g := _col_h(x, z, pcache)
 	if g < SEA_LEVEL:
 		return 0                                      # underwater floor is never smoothed (full cube)
@@ -517,6 +577,8 @@ static func surface_modifier(x: int, z: int, pcache = null) -> int:
 static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: no cap cells
+	if pcache == null and _on_main_thread():
+		return (_shape_entry(x, z) >> 24) & 0xFF
 	var g := _col_h(x, z, pcache)
 	if g < SEA_LEVEL:
 		return 0

@@ -28,6 +28,7 @@ func _initialize() -> void:
 	_test_worldgen_air_bounds()
 	_test_manifest_trim()
 	_test_smoothing()
+	_test_shape_memo()
 	_test_collider_cheap_queries()
 	_test_collider_overlay_cases()
 	_test_collider_amortized()
@@ -510,6 +511,68 @@ func _find_shaped_block() -> Vector3i:
 # the surface is continuously WALKABLE (floor_under monotone/continuous up a smoothed
 # step, no cliff steeper than the source heightmap). Both-path + manifest coverage are
 # fenced in _test_both_paths (run from _test_worldgen).
+
+# P5b-3. Per-column SHAPE MEMO exactness (the analytic-path smoothing-jerkiness fix). The main-
+# thread analytic queries consult TerrainConfig._shape_memo; a non-null pcache bypasses it and
+# computes directly. Assert the MEMO path returns EXACTLY the direct compute for surface_modifier,
+# surface_cap_modifier AND the fully-generated cell's modifier over a wide sample — proving the
+# cache is byte-identical (no cheap-vs-correct divergence), so gameplay/rendering are unchanged.
+func _test_shape_memo() -> void:
+	print("[P5b-3] per-column shape memo == direct compute (analytic path)")
+	if not TerrainConfig.SMOOTHING_ENABLED:
+		_ok(true, "smoothing OFF: shape memo returns 0 (no shapes) — skipped")
+		return
+	var s := TerrainConfig.find_spawn()
+	var exact := true
+	var shaped := 0
+	var checked := 0
+	for dx in range(-160, 160, 3):
+		for dz in range(-160, 160, 3):
+			var x := s.x + dx
+			var z := s.y + dz
+			var g: int = TerrainConfig.height_at(x, z)
+			# Memo path (pcache == null, main thread) vs direct compute (non-null pcache bypasses memo).
+			var memo_sm := TerrainConfig.surface_modifier(x, z)
+			var memo_cm := TerrainConfig.surface_cap_modifier(x, z)
+			var direct_sm := TerrainConfig.surface_modifier(x, z, {})
+			var direct_cm := TerrainConfig.surface_cap_modifier(x, z, {})
+			if memo_sm != direct_sm or memo_cm != direct_cm:
+				exact = false
+			# The memoized modifier must also equal what the FULL generated_cell carries at g / g+1.
+			if memo_sm != CellCodec.modifier(TerrainConfig.generated_cell(x, g, z)):
+				exact = false
+			if memo_cm != CellCodec.modifier(TerrainConfig.generated_cell(x, g + 1, z)):
+				exact = false
+			if memo_sm != 0 or memo_cm != 0:
+				shaped += 1
+			checked += 1
+	_ok(checked > 0, "shape memo: sampled %d columns" % checked)
+	_ok(shaped > 0, "shape memo: sample includes shaped columns (%d) — memo exercised on real shapes" % shaped)
+	_ok(exact, "shape memo path == direct compute == generated_cell modifier over the whole sample (cache is exact)")
+
+	# Cost: the actual analytic surface query (generated_cell at y==g), memo-WARM, vs the direct
+	# 9-height_at corner-stencil recompute the memo removes from every moving-player probe.
+	var reps := 5
+	var cols := 3600
+	for dx in range(0, 60):
+		for dz in range(0, 60):
+			TerrainConfig.surface_modifier(s.x + dx, s.y + dz)     # warm the memo
+	var tw0 := Time.get_ticks_usec()
+	for _r in range(reps):
+		for dx in range(0, 60):
+			for dz in range(0, 60):
+				var g2: int = TerrainConfig.height_at(s.x + dx, s.y + dz)
+				var _v := TerrainConfig.generated_cell(s.x + dx, g2, s.y + dz)   # memo HIT
+	var memo_us := float(Time.get_ticks_usec() - tw0) / float(reps * cols)
+	var td0 := Time.get_ticks_usec()
+	for _r in range(reps):
+		for dx in range(0, 60):
+			for dz in range(0, 60):
+				var _m := TerrainConfig.surface_modifier(s.x + dx, s.y + dz, {})  # direct 9-height_at compute
+	var direct_us := float(Time.get_ticks_usec() - td0) / float(reps * cols)
+	print("    shape-memo cost: analytic surface query (generated_cell, memo-warm) = %.2f us/query; direct corner-stencil recompute = %.2f us/query" % [memo_us, direct_us])
+	_ok(memo_us < direct_us, "memo-warm analytic query (%.2f us) cheaper than the direct corner-stencil recompute (%.2f us)" % [memo_us, direct_us])
+
 func _test_smoothing() -> void:
 	print("[P5b-2] deterministic terrain smoothing (sub-voxel surface shapes)")
 

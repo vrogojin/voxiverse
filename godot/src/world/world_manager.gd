@@ -180,6 +180,56 @@ func placed_cells() -> Dictionary:
 func is_edited_column(x: int, z: int) -> bool:
 	return _edit_columns.has(Vector2i(x, z))
 
+# --- loose-body gate (PERF, GroundCollider exploration-jerkiness fix) ----------
+# The ground collider exists ONLY to catch loose VoxelBodies; the player moves analytically and
+# never touches it. So the collider is gated on whether any loose body is present/near — with none,
+# it does zero rebuild work. Every loose VoxelBody is a DIRECT child of this WorldManager (both
+# spawn paths — spawn_loose(self, …) and VoxelBody._spawn_detached via get_parent()), so the set is
+# just the VoxelBody children; deriving it on demand (no signal/_ready dependency) is robust in the
+# game AND the headless verify (where _ready is deferred). The set is tiny (typically 0–a few), so
+# the per-frame scan is negligible.
+
+## Number of active loose VoxelBodies (debris) in the world.
+func active_body_count() -> int:
+	var n := 0
+	for c in get_children():
+		if c is VoxelBody:
+			n += 1
+	return n
+
+## True iff any loose VoxelBody exists at all.
+func has_active_bodies() -> bool:
+	for c in get_children():
+		if c is VoxelBody:
+			return true
+	return false
+
+## True iff a loose VoxelBody is within `radius` columns (Chebyshev, horizontal) of `center`. A
+## body's world column is its spawn cell (cells are body-local; IDENTITY-or-parent frame at spawn)
+## offset by its rigid-body displacement (global_position) — bodies fall vertically, so this tracks
+## them cheaply as they drop/shove. THE collider gate: with no body near, the collider stays idle.
+func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty():
+			continue                        # a body mid-free (emptied) — ignore
+		var home := _body_home_column(vb)
+		var gp := vb.global_position
+		var wx := home.x + int(floor(gp.x))
+		var wz := home.y + int(floor(gp.z))
+		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
+			return true
+	return false
+
+## A representative local column (x, z) of a VoxelBody's cells (first key). Added to global_position
+## it gives the body's current world column (coarse; enough for the gate radius).
+func _body_home_column(vb: VoxelBody) -> Vector2i:
+	for k: Vector3i in vb.cells:
+		return Vector2i(k.x, k.z)
+	return Vector2i(0, 0)
+
 ## Topmost still-solid column height at (x, z): the noise height, lowered past any
 ## blocks the player has broken from the top. Because every column is solid all
 ## the way down, this always finds a block — the ground is never hollow. (Ignores

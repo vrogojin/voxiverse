@@ -32,6 +32,7 @@ func _initialize() -> void:
 	_test_collider_cheap_queries()
 	_test_collider_overlay_cases()
 	_test_collider_amortized()
+	_test_collider_gate()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -828,6 +829,7 @@ func _test_collider_cheap_queries() -> void:
 	var gc := GroundCollider.new()
 	get_root().add_child(gc)
 	gc.setup(cw)
+	VoxelBody.spawn_loose(cw, {Vector3i(s.x, 40, s.y): STONE}, cw)   # active-body gate: keep the collider live
 	var bt0 := Time.get_ticks_usec()
 	gc.update(Vector3(float(s.x) + 0.5, 40.0, float(s.y) + 0.5))     # first build = synchronous
 	var full_us := Time.get_ticks_usec() - bt0
@@ -874,6 +876,7 @@ func _test_collider_overlay_cases() -> void:
 	var gd := GroundCollider.new()
 	get_root().add_child(gd)
 	gd.setup(wd)
+	VoxelBody.spawn_loose(wd, {Vector3i(cx, g + 20, cz): STONE}, wd)       # active-body gate: keep the collider live
 	var dcenter := Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5)
 	gd.update(dcenter)                                                     # first build → centre (cx,cz)
 	var dug_ys := [g, g - 1, g - 2]                                        # dig the top 3 solid cells
@@ -914,6 +917,7 @@ func _test_collider_overlay_cases() -> void:
 	var gp := GroundCollider.new()
 	get_root().add_child(gp)
 	gp.setup(wp)
+	VoxelBody.spawn_loose(wp, {Vector3i(cx, g + 20, cz): STONE}, wp)       # active-body gate: keep the collider live
 	var pcenter := Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5)
 	gp.update(pcenter)
 	var slab_mod := ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM)   # a half-slab
@@ -949,6 +953,7 @@ func _test_collider_amortized() -> void:
 	var gc := GroundCollider.new()
 	get_root().add_child(gc)
 	gc.setup(cw)
+	VoxelBody.spawn_loose(cw, {Vector3i(cx, g + 20, cz): STONE}, cw)       # active-body gate: keep the collider live
 	# First build is synchronous → the world has collision immediately at spawn/load.
 	gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
 	_ok(not gc.is_building(), "amortized: first build completes synchronously (immediate collision)")
@@ -1000,6 +1005,56 @@ func _test_collider_amortized() -> void:
 	var act2 := _collider_col(gc.active_rid(), ncx2, ncz2)
 	var ref2 := _ref_col_heavy(cw, ncx2, ncz2, Vector2i(ncx2, ncz2))
 	_ok(_cols_equal(act2, ref2), "amortized: reuse-path rebuild settles byte-identical to a full rebuild")
+	gc.queue_free()
+	cw.queue_free()
+
+# 2e. GroundCollider ACTIVE-BODY GATE (the exploration-jerkiness fix). The collider only serves
+# loose VoxelBodies; the player is analytic. So with NO body near, update() must do ZERO work
+# (the per-distance stutter while flying was this rebuild-on-drift cycle). Prove: (a) zero bodies
+# → a long moving path drives NO build / zero shape churn; (b) spawning a body activates it and
+# forces an immediate build (ground for the faller); (c) flying far from the debris idles it again;
+# (d) the body count increments on spawn and decrements on free.
+func _test_collider_gate() -> void:
+	print("[2e] collider active-body gate (no rebuild while nothing is loose)")
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var cw := WorldManager.new()
+	cw.name = "ColGate"
+	get_root().add_child(cw)
+	var gc := GroundCollider.new()
+	get_root().add_child(gc)
+	gc.setup(cw)
+	# (a) ZERO loose bodies: a 40-step moving path must produce NO build and NO shape churn.
+	_ok(cw.active_body_count() == 0, "gate: no loose bodies initially (count %d)" % cw.active_body_count())
+	var churn := 0
+	var ever_built := false
+	for step in range(40):
+		gc.update(Vector3(float(cx + step * 2) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+		churn += gc.last_slice_ops()
+		if gc.is_building() or gc.active_rid().is_valid():
+			ever_built = true
+	_ok(churn == 0 and not ever_built,
+		"gate: zero loose bodies → ZERO collider work over a 40-step moving path (churn=%d, built=%s)" % [churn, str(ever_built)])
+
+	# (b) Spawn a loose body near the player → gate activates → collider builds IMMEDIATELY.
+	var body := VoxelBody.spawn_loose(cw, {Vector3i(cx, g + 20, cz): STONE}, cw)
+	_ok(cw.active_body_count() == 1 and cw.has_active_bodies(), "gate: body-count increments on spawn (%d)" % cw.active_body_count())
+	_ok(cw.has_active_bodies_near(Vector2i(cx, cz), GroundCollider.R), "gate: has_active_bodies_near true for the nearby body")
+	gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
+		"gate: first body spawn → collider builds immediately (ground for the falling body)")
+
+	# (c) Fly 200 blocks from the debris → gate idles again (exploration after a break leaves debris
+	# behind, and the collider must NOT keep churning around the departing player).
+	gc.update(Vector3(float(cx + 200) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+	_ok(not gc.active_rid().is_valid() and not gc.is_building(),
+		"gate: flying 200 blocks from the debris → collider idles (no churn while exploring)")
+
+	# (d) Free the body → count decrements.
+	body.free()
+	_ok(cw.active_body_count() == 0 and not cw.has_active_bodies(), "gate: body-count decrements when the body is freed (%d)" % cw.active_body_count())
 	gc.queue_free()
 	cw.queue_free()
 

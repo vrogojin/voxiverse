@@ -51,6 +51,11 @@ const COLS_PER_FRAME := 32
 ## FINISH (the next drift then starts a fresh one), so a fast walk can't thrash the builder into
 ## never completing. 2*R ⇒ restart only once the player has left the region being built.
 const RESTART_DRIFT := 2 * R
+## Active-body gate radius (columns): the collider is maintained only while a loose VoxelBody is
+## within this Chebyshev distance of the player. R + REBUILD_DIST so a body sitting at the region
+## edge stays served across a full drift cycle; beyond it the collider idles (a body that far needs
+## no collision here, and the player is analytic).
+const _GATE_RADIUS := R + REBUILD_DIST
 
 # Build phases: idle, sampling column heights (region floor), emitting shapes, trimming the
 # staging body's surplus leftover shapes (when the new set is smaller than the previous one).
@@ -109,10 +114,21 @@ func setup(world_ref: WorldManager) -> void:
 
 ## Follow the player; drive the incremental (re)build. Returns quickly every frame — a fast
 ## walk just keeps moving the target and the incremental build chases it (see RESTART_DRIFT).
+##
+## ACTIVE-BODY GATE (the exploration-jerkiness fix): the collider exists ONLY to catch loose
+## VoxelBodies (falling/pushed debris) — the player is analytic and never uses it. So when NO loose
+## body is near the player, this does ZERO work (early-return, collider left idle). Exploring /
+## flying with nothing broken → no rebuild churn at all; the per-distance stutter (which scaled with
+## movement speed = the rebuild-on-drift cycle) disappears. A body spawned by a break/place, or one
+## that drifts within range, re-activates the collider and (from idle) forces an immediate
+## synchronous build so the falling body always has ground.
 func update(player_pos: Vector3) -> void:
 	if world == null:
 		return
 	_target = Vector2i(int(floor(player_pos.x)), int(floor(player_pos.z)))
+	if not world.has_active_bodies_near(_target, _GATE_RADIUS):
+		_go_idle()                          # nothing to collide with here → do no rebuild work
+		return
 	if _phase != PHASE_IDLE:
 		# A build is running: only a big jump re-anchors it; otherwise let it finish.
 		if _drift(_target, _build_center) >= RESTART_DRIFT:
@@ -134,6 +150,21 @@ func update(player_pos: Vector3) -> void:
 func rebuild_now() -> void:
 	if _live_center.x != 0x7fffffff:
 		_dirty = true
+
+## Drop to IDLE (no loose body near): clear both bodies' shapes, cancel any in-progress build, and
+## reset to the "never built" state so the NEXT time a body appears the gate forces an immediate
+## synchronous first build (falling body gets ground at once). Cheap no-op when already idle.
+func _go_idle() -> void:
+	if _live == -1 and _phase == PHASE_IDLE and _live_center.x == 0x7fffffff:
+		return                              # already idle
+	for b: StaticBody3D in _body:
+		PhysicsServer3D.body_clear_shapes(b.get_rid())
+		b.collision_layer = 0               # inert
+	_live = -1
+	_live_center = Vector2i(0x7fffffff, 0)
+	_phase = PHASE_IDLE
+	_dirty = false
+	_slice_ops = 0
 
 ## Re-attach after re-entering the tree. Server-added shapes on a body are cleared by Godot on
 ## tree exit; if this collider is ever reparented, rebuild synchronously so bodies don't fall

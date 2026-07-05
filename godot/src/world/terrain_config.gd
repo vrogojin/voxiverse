@@ -45,9 +45,28 @@ const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
-## The godot_voxel viewer streams a (vertically stretched) sphere. Terrain is
-## shallow, so no vertical stretch is needed — keep it at 1.0.
-const VIEWER_VERTICAL_RATIO := 1.0
+## The godot_voxel viewer streams a vertically-scaled sphere: the vertical view radius is
+## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS). The world content is only
+## ~94 blocks tall (bedrock y=-64 .. treetops ~y=30), so a 1.0 ratio streamed a ±256 vertical
+## sphere that is mostly empty air — thousands of blocks each paying the per-column profile pass
+## on the single (web-capped) voxel thread. 0.2 limits streaming to a ~±51-block slab around the
+## viewer, deferring the deep subsurface until the player descends. PURE CONFIG: a block streams
+## identically whenever it DOES stream (only WHEN it streams changes), so determinism and the
+## generated output are unaffected; analytic physics + the collider read TerrainConfig directly
+## (not the mesh), so collision below the streamed slab is unchanged.
+const VIEWER_VERTICAL_RATIO := 0.2
+
+## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
+## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
+## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +
+## DETAIL_AMPLITUDE(1) = 20 (each FastNoiseLite term is bounded to [-1,1]; Godot normalizes FBM),
+## + 4 margin. A large-sample assert in verify_feature confirms the bound so the early-out can
+## NEVER skip real content (a too-low bound would punch holes in the world).
+const MAX_SURFACE_Y := 24
+
+## The world floor: the lowest SOLID cell is bedrock at y = WORLD_BOTTOM_Y; y < WORLD_BOTTOM_Y is
+## void (air). A block whose whole extent is below this generates nothing (generator skips it).
+const BEDROCK_FLOOR := WORLD_BOTTOM_Y
 
 ## Chunk edge length in voxels for the fallback streamer.
 const CHUNK_SIZE := 32

@@ -505,6 +505,16 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var ncube = cube_arid.size()
 	var ngen = gen_arid.size()
 
+	# CHEAP all-air early-outs, BEFORE the per-column profile pass (PERF): a block entirely above
+	# ALL possible content (the proven surface bound + tallest tree, and above the sea cap) or
+	# entirely below the bedrock floor generates nothing, so it must not pay the ~column-profile
+	# pass at all. Uses only CONSTANTS (no noise). MAX_SURFACE_Y is a proven upper bound on
+	# height_at (verify asserts it), so this can never skip a block that holds real content.
+	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
+		return
+	if oy + size.y <= TerrainConfig.BEDROCK_FLOOR:
+		return
+
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
 	# noise sampling and no allocation.
 	var profs = []

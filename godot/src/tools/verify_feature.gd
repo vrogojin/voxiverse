@@ -25,6 +25,7 @@ func _initialize() -> void:
 	TerrainConfig.warm_up()
 	_test_stackup()
 	_test_worldgen()
+	_test_worldgen_air_bounds()
 	_test_smoothing()
 	_test_collider_cheap_queries()
 	_test_collider_overlay_cases()
@@ -127,6 +128,39 @@ func _grass_column() -> Vector2i:
 			if clear:
 				return Vector2i(x, z)
 	return s
+
+# 1b. Air-skip bounds (PERF, generator all-air early-outs). MAX_SURFACE_Y must be a TRUE upper
+# bound on the surface so the module generator can skip blocks above the terrain WITHOUT ever
+# skipping real content (a too-low bound would punch holes). Prove it over a wide sample, and
+# prove nothing generates above MAX_SURFACE_Y+max_above or below the bedrock floor (exactly the
+# volumes the early-outs skip).
+func _test_worldgen_air_bounds() -> void:
+	print("[1b] air-skip bounds (MAX_SURFACE_Y upper bound / all-air above+below)")
+	var max_seen := -0x7fffffff
+	# Wide, dense sample of the surface (cheap height_at) — the bound must hold everywhere.
+	for x in range(-420, 420, 5):
+		for z in range(-420, 420, 5):
+			var h: int = TerrainConfig.height_at(x, z)
+			if h > max_seen:
+				max_seen = h
+	_ok(max_seen <= TerrainConfig.MAX_SURFACE_Y,
+		"MAX_SURFACE_Y (%d) is a true upper bound on height_at over a wide sample (max seen %d)"
+		% [TerrainConfig.MAX_SURFACE_Y, max_seen])
+	# Nothing (solid, cap, tree or sea) generates above MAX_SURFACE_Y+max_above, nor below the
+	# bedrock floor — exactly the two volumes the generator early-outs drop.
+	var above_y := TerrainConfig.MAX_SURFACE_Y + TreeGen.MAX_ABOVE_SURFACE
+	var air_above_ok := true
+	var air_below_ok := true
+	for x in range(-240, 240, 17):
+		for z in range(-240, 240, 17):
+			for y in range(above_y + 1, above_y + 31):
+				if TerrainConfig.generated_cell(x, y, z) != BlockCatalog.AIR:
+					air_above_ok = false
+			for y in range(TerrainConfig.BEDROCK_FLOOR - 16, TerrainConfig.BEDROCK_FLOOR):
+				if TerrainConfig.generated_cell(x, y, z) != BlockCatalog.AIR:
+					air_below_ok = false
+	_ok(air_above_ok, "no generated cell above MAX_SURFACE_Y+max_above (=%d) — above early-out skips only air" % above_y)
+	_ok(air_below_ok, "no generated cell below the bedrock floor (y < %d) — below early-out skips only air" % TerrainConfig.BEDROCK_FLOOR)
 
 # 2. The Minecraft-adapted worldgen pipeline (WGC §6): biomes, ores, sea/ice,
 # beaches, cold-biome surface temperature, and — CRITICAL — both render paths
@@ -369,7 +403,47 @@ func _test_both_paths() -> void:
 	gen.call("_generate_block", buf2, origins[0], 0)
 	_ok(int(mw.call("appearance_count")) == ac, "generator allocates/bakes NO ARID on the worker (count stable at %d)" % ac)
 	print("    both-path determinism checked %d cells (%d shaped)" % [cells, shaped_cells])
+
+	# All-air early-outs (PERF): a block entirely ABOVE content and one entirely BELOW bedrock
+	# must generate ALL AIR via the cheap early-out (no column-profile pass) — verify the output
+	# is all-air, and that it costs a tiny fraction of a content block.
+	var air_above := Vector3i(0, TerrainConfig.MAX_SURFACE_Y + TreeGen.MAX_ABOVE_SURFACE + 14, 0)   # oy=48
+	var air_below := Vector3i(0, TerrainConfig.BEDROCK_FLOOR - 16, 0)                                # oy+16 <= floor
+	var content_origin := Vector3i(48, 0, 48)
+	_ok(_module_block_all_air(mw, air_above), "block entirely above MAX_SURFACE_Y+max_above generates ALL AIR (early-out)")
+	_ok(_module_block_all_air(mw, air_below), "block entirely below the bedrock floor generates ALL AIR (early-out)")
+	var reps := 8
+	var bA: Object = ClassDB.instantiate("VoxelBuffer")
+	bA.call("create", 16, 16, 16)
+	var ta0 := Time.get_ticks_usec()
+	for _r in range(reps):
+		gen.call("_generate_block", bA, air_above, 0)
+	var air_us := float(Time.get_ticks_usec() - ta0) / float(reps)
+	var tc0 := Time.get_ticks_usec()
+	for _r in range(reps):
+		gen.call("_generate_block", bA, content_origin, 0)
+	var content_us := float(Time.get_ticks_usec() - tc0) / float(reps)
+	print("    air-block gen cost: all-air=%.1f us/block  vs  content=%.1f us/block (%.0fx cheaper)"
+		% [air_us, content_us, content_us / maxf(0.1, air_us)])
+	_ok(air_us < content_us, "all-air block generation is far cheaper than a content block (early-out hit)")
 	mw.queue_free()
+
+## True iff the module generator writes ALL AIR (TYPE channel 0) for the 16³ block at `origin`.
+func _module_block_all_air(mw: Node, origin: Vector3i) -> bool:
+	var gen: Object = mw.call("get_generator")
+	if gen == null:
+		return false
+	var buf: Object = ClassDB.instantiate("VoxelBuffer")
+	buf.call("create", 16, 16, 16)
+	if buf.has_method("fill"):
+		buf.call("fill", 0, 0)
+	gen.call("_generate_block", buf, origin, 0)
+	for lz in range(16):
+		for lx in range(16):
+			for ly in range(16):
+				if int(buf.call("get_voxel", lx, ly, lz, 0)) != 0:
+					return false
+	return true
 
 ## A 16³ block origin (16-aligned) known to contain a smoothed (shaped) surface cell, or
 ## (0x7fffffff,_,_) if none found near origin — so the both-path test always samples the

@@ -29,12 +29,14 @@ func setup() -> bool:
 	if not ClassDB.class_exists("VoxelTerrain"):
 		return false
 
-	# Warm the surface state machine, block catalog AND the terrain noise stack on
-	# THIS (main) thread before the generator runs on the voxel worker thread —
-	# avoids a lazy-init race (the generator now samples the stone noise too).
+	# Warm the surface state machine, block catalog AND every terrain lazy
+	# singleton (noise stack + material id cache + TreeGen species ids) on THIS
+	# (main) thread before the generator runs on the voxel worker thread — a lazily
+	# built noise/id table first touched on the worker thread is a data race and
+	# the project's worst-case bug class (WGC §7.4).
 	SurfaceModel.ensure_ready()
 	BlockCatalog.ensure_ready()
-	TerrainConfig.height_at(0, 0)   # forces _ensure_noise() (hills + detail + stone)
+	TerrainConfig.warm_up()
 
 	var library: Object = ClassDB.instantiate("VoxelBlockyLibrary")
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
@@ -156,9 +158,11 @@ func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
 	return ((models as Array).size() - 1) if models is Array else -1
 
 ## Compile the VoxelGeneratorScript subclass at runtime (see header for why it
-## can't be a normal committed script). Writes the layered stackup (stone / dirt /
-## grass) and the tree overlay (wood / leaf) exactly as TerrainConfig.generated_block
-## defines it, so the module path and the analytic queries agree by construction.
+## can't be a normal committed script). SINGLE SOURCE OF TRUTH (WGC §7.2): this
+## does NOT re-implement the pipeline — it caches one TerrainConfig.column_profile
+## (a value-type Vector4, no allocation) per column and calls
+## TerrainConfig.resolve_cell per cell, the exact functions the analytic queries
+## use, so the module path and TerrainConfig.generated_block agree by construction.
 func _make_generator() -> Object:
 	var src := """
 extends VoxelGeneratorScript
@@ -174,49 +178,40 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var oy = origin_in_voxels.y
 	var oz = origin_in_voxels.z
 	var ch = VoxelBuffer.CHANNEL_TYPE
-	var grass_id = BlockCatalog.GRASS
-	var dirt_id = BlockCatalog.DIRT
-	var stone_id = BlockCatalog.STONE
+	var sea = TerrainConfig.SEA_LEVEL
 	var max_above = TreeGen.MAX_ABOVE_SURFACE
-	var dirt_min = TerrainConfig.DIRT_MIN_DEPTH
 
-	# Per-column grass top g and stone top st = min(stone_noise, g - dirt_min).
-	var gs = []
-	gs.resize(size.x * size.z)
-	var sts = []
-	sts.resize(size.x * size.z)
+	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
+	# noise sampling and no allocation.
+	var profs = []
+	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
 	for z in range(size.z):
 		for x in range(size.x):
-			var wx = ox + x
-			var wz = oz + z
-			var g = TerrainConfig.height_at(wx, wz)
-			var st = min(TerrainConfig.stone_height_at(wx, wz), g - dirt_min)
-			var idx = z * size.x + x
-			gs[idx] = g
-			sts[idx] = st
-			if g > max_h: max_h = g
+			var p = TerrainConfig.column_profile(ox + x, oz + z)
+			profs[z * size.x + x] = p
+			if int(p.x) > max_h: max_h = int(p.x)
 
-	# Whole block above every surface + tree cap -> all air (leave buffer default 0).
-	if oy > max_h + max_above:
+	# Whole block above every surface + tree cap AND above the sea cap -> all air
+	# (leave buffer default 0). The sea term matters over deep ocean, where the
+	# solid top is far below SEA_LEVEL but water still fills up to it.
+	var top = max_h + max_above
+	if sea > top: top = sea
+	if oy > top:
 		return
 
 	for z in range(size.z):
 		for x in range(size.x):
-			var idx = z * size.x + x
-			var g = gs[idx]
-			var st = sts[idx]
+			var p = profs[z * size.x + x]
+			var g = int(p.x)
+			var biome = int(p.y)
+			var cc = p.z
+			var tt = p.w
 			var wx = ox + x
 			var wz = oz + z
 			for y in range(size.y):
-				var wy = oy + y
-				var id = 0
-				if wy < g:
-					id = stone_id if wy <= st else dirt_id
-				elif wy == g:
-					id = grass_id
-				elif wy <= g + max_above:
-					id = TreeGen.block_at(wx, wy, wz)
+				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt)
+				var id = CellCodec.mat(v)
 				if id != 0:
 					buffer.set_voxel(id, x, y, z, ch)
 """

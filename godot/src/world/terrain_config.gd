@@ -1,50 +1,133 @@
 class_name TerrainConfig
 extends RefCounted
-## Single source of truth for the world's shape.
+## Single source of truth for the world's shape (WORLDGEN-CATALOG §6, the
+## Minecraft-adapted worldgen pipeline).
 ##
 ## Both the pure-GDScript fallback mesher AND the godot_voxel module generator
 ## build the terrain from these functions, and the per-voxel environment model
 ## and the player's analytic ground/ray logic sample the same functions. This is
 ## what keeps "the world" one concept regardless of which rendering path runs.
 ##
-## Convention: 1 voxel = 1 metre. A voxel at integer cell (x, y, z) is SOLID
-## when y <= height_at(x, z); everything above is air. The world is a pure
-## heightmap (no overhangs), which keeps the player and raycasts fully analytic.
-## Because every column is solid all the way down, the ground is NOT hollow: dig
-## a block out from under yourself and there is always another block beneath.
+## SINGLE SOURCE OF TRUTH (WGC §7.2): the pipeline lives entirely in this file.
+## The module generator does NOT re-implement any of it — it caches one
+## `column_profile()` (a value-type Vector4, no allocation) per column and calls
+## `resolve_cell()` per cell, the exact same functions `generated_cell()` uses.
+## Both render paths therefore agree by construction; there is no second copy of
+## the logic that could drift.
 ##
-## Shape is intentionally CALM now: gentle, open, shallow rolling hills only (the
-## craggy mountain archipelagos were removed so the physics sandbox — falling and
-## breakable blocks — plays out on near-flat, walkable ground). The world is
-## uniformly grass. Deterministic (fixed seeds); infinite/streaming.
+## Convention: 1 voxel = 1 metre. `height_at(x,z)` is the y of the topmost SOLID
+## ground cell `g` (water/ice sit ABOVE it, up to SEA_LEVEL). The world is a pure
+## heightmap above bedrock — no 3D caves/overhangs (WGC §6.8 staged decision: we
+## stay heightmap-only so the analytic, collider-less player physics stays sound;
+## the player can never fall through the world). Below y = WORLD_BOTTOM_Y is void,
+## unreachable because the bedrock floor is unbreakable.
+##
+## DETERMINISM (WGC §7): every decision is FastNoiseLite with a const seed derived
+## from SEED + a documented salt, or a hash-of-position (`_hash01_3d`). No
+## randi()/randf(), no per-run state. Intra-process agreement (module generator vs
+## analytic queries vs collapse) is exact — same functions, same binary.
 
 const SEED := 20260702
 
-# --- gentle, shallow base hills ------------------------------------------------
-const BASE_HEIGHT := 5.0        # average ground height
+# --- vertical structure (WGC §6.1, our scale) ---------------------------------
+const WORLD_BOTTOM_Y := -64      # world floor; below is void (unreachable)
+const BEDROCK_TOP_Y := -59       # bedrock gradient: 100% at -64 -> 0% at -59
+const DEEPSLATE_FULL_Y := -24    # below here: always deepslate
+const DEEPSLATE_TOP_Y := -16     # above here: always stone; dithered band between
+const SEA_LEVEL := 0             # air below SEA_LEVEL fills with water (ice cap when cold)
+
+# --- gentle, shallow base hills (unchanged; the c~0 plains preserve today's look)
+const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
 const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
-
-# --- stone layer (its OWN, decorrelated relief) --------------------------------
-const STONE_BASE := 3.0         # average stone-surface height
-const STONE_AMPLITUDE := 3.5    # stone's own hills
-const DIRT_MIN_DEPTH := 3       # stone top is at least this far below the grass top
 
 ## Render radius around the player, in blocks (DESIGN §1). Drives the fallback
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
-## The godot_voxel viewer streams a (vertically stretched) sphere. The terrain is
-## now shallow, so no vertical stretch is needed — keep it at 1.0.
+## The godot_voxel viewer streams a (vertically stretched) sphere. Terrain is
+## shallow, so no vertical stretch is needed — keep it at 1.0.
 const VIEWER_VERTICAL_RATIO := 1.0
 
 ## Chunk edge length in voxels for the fallback streamer.
 const CHUNK_SIZE := 32
 
-# Lazily-created noise stack shared by every consumer.
-static var _hills: FastNoiseLite     # gentle base terrain
-static var _detail: FastNoiseLite    # small-scale bumpiness
-static var _stone: FastNoiseLite     # stone surface, own relief (decorrelated)
+# --- biomes (WGC §6.4) --------------------------------------------------------
+# Plain int consts (not an enum) so the runtime-compiled module generator and
+# TreeGen can reference TerrainConfig.B_* directly.
+const B_OCEAN := 0
+const B_BEACH := 1
+const B_BADLANDS := 2
+const B_DESERT := 3
+const B_SWAMP := 4
+const B_SNOWY := 5
+const B_TAIGA := 6
+const B_FOREST := 7
+const B_PLAINS := 8
+
+# --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
+# TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds) and
+# the 7xx hashing salts below.
+const _SALT_BEDROCK := 701
+const _SALT_DEEP := 702
+const _SALT_STRATA_EXIST := 711
+const _SALT_STRATA_JX := 712
+const _SALT_STRATA_JY := 713
+const _SALT_STRATA_JZ := 714
+const _SALT_STRATA_VAR := 715
+const _SALT_STRATA_R := 716
+const _SALT_ORE_EXIST := 721
+const _SALT_ORE_JX := 722
+const _SALT_ORE_JY := 723
+const _SALT_ORE_JZ := 724
+const _SALT_ORE_PICK := 725
+const _SALT_ORE_R := 726
+const _SALT_BAND := 731
+const _SALT_PODZOL := 741
+
+# --- ore depth table (WGC §6.6; y-range/peak/weight, triangle distributions) ---
+# index: 0 coal, 1 copper, 2 iron, 3 gold, 4 redstone, 5 lapis, 6 diamond, 7 emerald
+const _ORE_YMIN := [-8, -16, -56, -60, -64, -52, -64, -8]
+const _ORE_YMAX := [16, 12, 12, -8, -24, -6, -40, 16]
+const _ORE_PEAK := [8, 4, -8, -32, -56, -28, -58, 12]
+const _ORE_WEIGHT := [30.0, 25.0, 25.0, 10.0, 14.0, 8.0, 6.0, 3.0]
+const _ORE_EMERALD := 7           # emerald ore index in the table
+const _ORE_GOLD := 3              # gold ore index in the table
+
+const _STRATA_L := 16            # strata lattice cell size (WGC §6.5)
+const _ORE_L := 6                # ore-attempt lattice cell size (WGC §6.6)
+
+# --- lazily-built noise stack shared by every consumer ------------------------
+static var _hills: FastNoiseLite       # gentle base terrain
+static var _detail: FastNoiseLite      # small-scale bumpiness
+static var _continent: FastNoiseLite   # continentalness (ocean <-> inland)
+static var _temperature: FastNoiseLite # climate temperature
+static var _humidity: FastNoiseLite    # climate humidity
+
+# --- cached material ids (resolved once from the data-driven catalog) ---------
+static var _ids_ready := false
+static var _ID_BEDROCK := 0
+static var _ID_DEEPSLATE := 0
+static var _ID_WATER := 0
+static var _ID_ICE := 0
+static var _ID_SAND := 0
+static var _ID_RED_SAND := 0
+static var _ID_GRAVEL := 0
+static var _ID_SANDSTONE := 0
+static var _ID_RED_SANDSTONE := 0
+static var _ID_SNOW := 0
+static var _ID_MUD := 0
+static var _ID_PODZOL := 0
+static var _ID_SULFUR := 0
+static var _ID_CINNABAR := 0
+static var _STRATA_SEQ: Array[int] = []   # granite,diorite,andesite,tuff,calcite,dripstone
+static var _BAND_SEQ: Array[int] = []      # 7 terracotta ids (badlands strata)
+static var _ORE_STONE: Array[int] = []     # ids 18..25
+static var _ORE_DEEP: Array[int] = []      # ids 26..33
+
+# ------------------------------------------------------------------------------
+# Warm-up + lazy init (WGC §7.4 — MUST run on the main thread before the voxel
+# worker thread generates, or a lazily-built singleton is a data race).
 
 static func _ensure_noise() -> void:
 	if _hills != null:
@@ -62,68 +145,428 @@ static func _ensure_noise() -> void:
 	_detail.seed = SEED + 7919
 	_detail.frequency = 0.05
 
-	# Decorrelated from _hills in BOTH seed and frequency, so stone hills do not
-	# coincide with grass hills — the stone surface follows its own relief.
-	_stone = FastNoiseLite.new()
-	_stone.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	_stone.seed = SEED + 4443
-	_stone.frequency = 0.017
-	_stone.fractal_type = FastNoiseLite.FRACTAL_FBM
-	_stone.fractal_octaves = 2
-	_stone.fractal_gain = 0.5
+	# Three low-frequency climate/shape noises (WGC §6.4).
+	_continent = _make_climate(SEED + 101, 0.0015)
+	_temperature = _make_climate(SEED + 102, 0.002)
+	_humidity = _make_climate(SEED + 103, 0.002)
 
-## Surface height (integer y of the topmost surface block) at world column (x, z).
+static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
+	var n := FastNoiseLite.new()
+	n.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	n.seed = sd
+	n.frequency = freq
+	n.fractal_type = FastNoiseLite.FRACTAL_FBM
+	n.fractal_octaves = 2
+	n.fractal_gain = 0.5
+	return n
+
+## Resolve every material id the generator can emit, once, from the catalog.
+static func _ensure_ids() -> void:
+	if _ids_ready:
+		return
+	BlockCatalog.ensure_ready()
+	_ID_BEDROCK = BlockCatalog.id_of(&"bedrock")
+	_ID_DEEPSLATE = BlockCatalog.id_of(&"deepslate")
+	_ID_WATER = BlockCatalog.id_of(&"water")
+	_ID_ICE = BlockCatalog.id_of(&"ice")
+	_ID_SAND = BlockCatalog.id_of(&"sand")
+	_ID_RED_SAND = BlockCatalog.id_of(&"red_sand")
+	_ID_GRAVEL = BlockCatalog.id_of(&"gravel")
+	_ID_SANDSTONE = BlockCatalog.id_of(&"sandstone")
+	_ID_RED_SANDSTONE = BlockCatalog.id_of(&"red_sandstone")
+	_ID_SNOW = BlockCatalog.id_of(&"snow_block")
+	_ID_MUD = BlockCatalog.id_of(&"mud")
+	_ID_PODZOL = BlockCatalog.id_of(&"podzol")
+	_ID_SULFUR = BlockCatalog.id_of(&"sulfur_block")
+	_ID_CINNABAR = BlockCatalog.id_of(&"cinnabar_block")
+	_STRATA_SEQ = [
+		BlockCatalog.id_of(&"granite"), BlockCatalog.id_of(&"diorite"),
+		BlockCatalog.id_of(&"andesite"), BlockCatalog.id_of(&"tuff"),
+		BlockCatalog.id_of(&"calcite"), BlockCatalog.id_of(&"dripstone_block"),
+	]
+	_BAND_SEQ = [
+		BlockCatalog.id_of(&"terracotta"), BlockCatalog.id_of(&"white_terracotta"),
+		BlockCatalog.id_of(&"orange_terracotta"), BlockCatalog.id_of(&"yellow_terracotta"),
+		BlockCatalog.id_of(&"brown_terracotta"), BlockCatalog.id_of(&"red_terracotta"),
+		BlockCatalog.id_of(&"light_gray_terracotta"),
+	]
+	# Ore ids are contiguous: stone hosts 18..25, deepslate hosts 26..33, both in
+	# the coal/copper/iron/gold/redstone/lapis/diamond/emerald order of the table.
+	_ORE_STONE = [
+		BlockCatalog.id_of(&"coal_ore"), BlockCatalog.id_of(&"copper_ore"),
+		BlockCatalog.id_of(&"iron_ore"), BlockCatalog.id_of(&"gold_ore"),
+		BlockCatalog.id_of(&"redstone_ore"), BlockCatalog.id_of(&"lapis_ore"),
+		BlockCatalog.id_of(&"diamond_ore"), BlockCatalog.id_of(&"emerald_ore"),
+	]
+	_ORE_DEEP = [
+		BlockCatalog.id_of(&"deepslate_coal_ore"), BlockCatalog.id_of(&"deepslate_copper_ore"),
+		BlockCatalog.id_of(&"deepslate_iron_ore"), BlockCatalog.id_of(&"deepslate_gold_ore"),
+		BlockCatalog.id_of(&"deepslate_redstone_ore"), BlockCatalog.id_of(&"deepslate_lapis_ore"),
+		BlockCatalog.id_of(&"deepslate_diamond_ore"), BlockCatalog.id_of(&"deepslate_emerald_ore"),
+	]
+	_ids_ready = true
+
+## Warm EVERY lazy singleton on the calling (main) thread (WGC §7.4). module_world
+## calls this before creating the terrain so the voxel worker thread never races a
+## half-built noise/id/species table into existence.
+static func warm_up() -> void:
+	_ensure_noise()
+	_ensure_ids()
+	TreeGen.warm_up()
+
+## Deterministic hash in [0,1) for an integer lattice + salt (3D form of the
+## TreeGen._hash01 integer-mix family; no floats until the final divide).
+static func _hash01_3d(ix: int, iy: int, iz: int, salt: int) -> float:
+	var n := (ix * 374761393 + iy * 668265263 + iz * 2246822519 + salt * 362437) & 0x7FFFFFFF
+	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF
+	n = n ^ (n >> 16)
+	return float(n & 0xFFFF) / 65536.0
+
+# ------------------------------------------------------------------------------
+# Stage 1-2: continent spline height + biome selection.
+
+## Continentalness noise at (x, z), roughly [-1, 1] (ocean <-> inland).
+static func continent_at(x: int, z: int) -> float:
+	_ensure_noise()
+	return _continent.get_noise_2d(float(x), float(z))
+
+## Continental height offset via the 4-knot spline (WGC §6.4). Plains (c ~ 0) map
+## to offset ~0 so the c~0 world is a subset of today's demo terrain.
+static func _continent_offset(c: float) -> float:
+	if c <= -1.0:
+		return -14.0
+	if c < -0.45:
+		return _knot(c, -1.0, -0.45, -14.0, -6.0)
+	if c < -0.15:
+		return _knot(c, -0.45, -0.15, -6.0, 0.0)
+	if c < 0.4:
+		return _knot(c, -0.15, 0.4, 0.0, 2.0)
+	if c < 1.0:
+		return _knot(c, 0.4, 1.0, 2.0, 11.0)
+	return 11.0
+
+static func _knot(c: float, c0: float, c1: float, v0: float, v1: float) -> float:
+	return v0 + (v1 - v0) * (c - c0) / (c1 - c0)
+
+static func _height_c(c: float, fx: float, fz: float) -> int:
+	var base := BASE_HEIGHT + _continent_offset(c)
+	var h := base + _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
+	h += _detail.get_noise_2d(fx, fz) * DETAIL_AMPLITUDE
+	return int(floor(h))
+
+## Surface height (integer y of the topmost SOLID ground cell) at column (x, z).
+## Water/ice sit ABOVE this, up to SEA_LEVEL. UNCHANGED contract for every caller
+## (PerVoxelEnvironment depth model, effective_height, floor scans, TreeGen).
 static func height_at(x: int, z: int) -> int:
 	_ensure_noise()
 	var fx := float(x)
 	var fz := float(z)
+	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
 
-	# Gentle, open, shallow base hills + a touch of fine bumpiness.
-	var h := BASE_HEIGHT + _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
-	h += _detail.get_noise_2d(fx, fz) * DETAIL_AMPLITUDE
-	return int(floor(h))
+## Biome enum (B_*) at column (x, z) — ordered first-match rule chain (WGC §6.4).
+static func _biome(c: float, t: float, h: float, g: int) -> int:
+	if c < -0.32:
+		return B_OCEAN
+	# Beaches ring the coast: near sea level AND continentally coastal (the c gate
+	# keeps inland lowland dips from speckling as sand — WGC §9 noise-smoothness).
+	if c < 0.25 and g >= SEA_LEVEL - 2 and g <= SEA_LEVEL + 2:
+		return B_BEACH
+	if t > 0.45 and h < -0.45:
+		return B_BADLANDS
+	if t > 0.45 and h < 0.0:
+		return B_DESERT
+	if t > 0.15 and h > 0.5:
+		return B_SWAMP
+	if t < -0.55:
+		return B_SNOWY
+	if t < -0.15:
+		return B_TAIGA
+	if h > 0.1:
+		return B_FOREST
+	return B_PLAINS
 
-## Raw stone-surface height from stone's OWN noise, BEFORE the grass clamp
-## (ranges ≈ -1..6). generated_block clamps this to at least DIRT_MIN_DEPTH below
-## the grass top, so stone never pokes through the dirt band.
-static func stone_height_at(x: int, z: int) -> int:
+## Biome enum at column (x, z). Public: TreeGen (species) and PerVoxelEnvironment
+## (surface temperature) key off it.
+static func biome_at(x: int, z: int) -> int:
+	return int(column_profile(x, z).y)
+
+## The per-column profile every downstream stage needs, as a VALUE-TYPE Vector4
+## (no heap allocation, so it is cheap to cache per column in the module
+## generator): (g = solid height, biome enum, c = continentalness, t = temperature).
+static func column_profile(x: int, z: int) -> Vector4:
 	_ensure_noise()
-	return int(floor(STONE_BASE + _stone.get_noise_2d(float(x), float(z)) * STONE_AMPLITUDE))
+	var fx := float(x)
+	var fz := float(z)
+	var c := _continent.get_noise_2d(fx, fz)
+	var t := _temperature.get_noise_2d(fx, fz)
+	var hh := _humidity.get_noise_2d(fx, fz)
+	var g := _height_c(c, fx, fz)
+	return Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+
+# ------------------------------------------------------------------------------
+# The composed cell function (WGC §6.2). generated_cell derives the column
+# profile then delegates to resolve_cell; the module generator caches the profile
+# and calls resolve_cell directly. Both go through the SAME resolve_cell.
 
 ## Pure generation (no edits): the PACKED cell value the WORLD GENERATOR puts at
-## (x,y,z) — VOXEL-DATA-STRUCTURE §7.1 tier 2. THE terrain function: both render
-## paths, the analytic queries, the collider and the collapse pass all derive
-## from it (via generated_block / cell_value_at), so they agree by construction.
-## Per column: grass ONLY at the surface cell y==g; a dirt band of thickness >= 2
-## between grass and stone_top = min(stone_height, g-3); stone all the way down
-## (columns are never hollow); wood/leaf trees above the surface.
-##
-## P0: the generated world is all plain full cubes in their default state, so the
-## packed value equals the bare material id (modifier 0, state 0). The terrain
-## smoothing workstream (SUB-VOXEL) will emit non-zero modifiers here without
-## touching a single caller of generated_block.
+## (x,y,z) — VOXEL-DATA-STRUCTURE §7.1 tier 2. THE terrain function.
 static func generated_cell(x: int, y: int, z: int) -> int:
-	var g := height_at(x, z)
+	var p := column_profile(x, z)
+	return resolve_cell(x, y, z, int(p.x), int(p.y), p.z, p.w)
+
+## The per-cell pipeline given a column's precomputed profile scalars (g, biome,
+## c, t). Returns the PACKED cell value (== bare material id today; sub-voxel adds
+## modifiers later). This is the single hot function both render paths share.
+static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
+	if not _ids_ready:
+		_ensure_ids()
+	if y < WORLD_BOTTOM_Y:
+		return BlockCatalog.AIR
+	if _bedrock_at(x, y, z):
+		return _ID_BEDROCK
 	if y > g:
-		return TreeGen.block_at(x, y, z)            # wood/leaf above the surface, else AIR
+		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
+		if y <= SEA_LEVEL:
+			return _sea_block(t, y)
+		return TreeGen.block_at(x, y, z)
+	var id := _surface_rule(x, y, z, g, biome, c, t)
+	if id == BlockCatalog.STONE:
+		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
+		id = _ore_at(x, y, z, id, biome, c)   # host-aware ore lattice
+	return id
+
+# --- stage: bedrock floor (WGC §6.1) ------------------------------------------
+static func _bedrock_at(x: int, y: int, z: int) -> bool:
+	if y <= WORLD_BOTTOM_Y:
+		return true                          # y == -64: 100%
+	if y >= BEDROCK_TOP_Y:
+		return false                         # y >= -59: 0% (no bedrock above -59)
+	var p := float(BEDROCK_TOP_Y - y) / float(BEDROCK_TOP_Y - WORLD_BOTTOM_Y)
+	return _hash01_3d(x, y, z, _SALT_BEDROCK) < p
+
+# --- stage: sea / ice (WGC §6.7) ----------------------------------------------
+# Ice caps the very surface of COLD columns (t < -0.55, i.e. snowy biomes and
+# frozen oceans); water fills the rest. Cold columns also report sub-zero surface
+# air (PerVoxelEnvironment), so the generated sheet is structurally sound ice
+# rather than tissue-paper (INTEGRATION-DECISIONS §1.5 frozen-sea seam).
+static func _sea_block(t: float, y: int) -> int:
+	if y == SEA_LEVEL and t < -0.55:
+		return _ID_ICE
+	return _ID_WATER
+
+# --- stage: surface rule (WGC §6.5) -------------------------------------------
+static func _surface_rule(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
+	var underwater := g < SEA_LEVEL
 	if y == g:
-		return BlockCatalog.GRASS                    # grass ONLY at the surface cell
-	var stone_top := mini(stone_height_at(x, z), g - DIRT_MIN_DEPTH)
-	return BlockCatalog.STONE if y <= stone_top else BlockCatalog.DIRT
+		if underwater:
+			return _underwater_floor(biome, x, z, t)   # no grass below sea level
+		return _biome_top(biome, x, z)
+	var depth := g - y                                  # >= 1 here
+	if depth <= _filler_depth(biome):
+		return _biome_filler(biome, x, y, z, depth, t)
+	return BlockCatalog.STONE
+
+static func _biome_top(biome: int, x: int, z: int) -> int:
+	match biome:
+		B_BEACH, B_DESERT:
+			return _ID_SAND
+		B_BADLANDS:
+			return _ID_RED_SAND
+		B_SWAMP:
+			return _ID_MUD
+		B_SNOWY:
+			return _ID_SNOW
+		B_TAIGA:
+			return _ID_PODZOL if _hash01_3d(x, 0, z, _SALT_PODZOL) < 0.20 else BlockCatalog.GRASS
+		B_OCEAN:
+			return _ID_SAND
+		_:
+			return BlockCatalog.GRASS
+
+static func _underwater_floor(biome: int, x: int, z: int, t: float) -> int:
+	match biome:
+		B_OCEAN:
+			return _ID_SAND if t > 0.0 else _ID_GRAVEL
+		B_BEACH, B_DESERT:
+			return _ID_SAND
+		B_BADLANDS:
+			return _ID_RED_SAND
+		B_SWAMP:
+			return _ID_MUD
+		_:
+			return _ID_GRAVEL
+
+static func _filler_depth(biome: int) -> int:
+	match biome:
+		B_BADLANDS:
+			return 12       # terracotta bands(8) + red_sandstone(4)
+		B_DESERT:
+			return 7        # sand(3) + sandstone(4)
+		B_BEACH:
+			return 6        # sand(3) + sandstone(3)
+		B_SWAMP:
+			return 5        # mud(3) + dirt(2)
+		B_OCEAN:
+			return 3        # a few blocks of floor sediment
+		_:
+			return 3        # snowy/taiga/forest/plains: dirt(3)
+
+static func _biome_filler(biome: int, x: int, y: int, z: int, depth: int, t: float) -> int:
+	match biome:
+		B_BEACH, B_DESERT:
+			return _ID_SAND if depth <= 3 else _ID_SANDSTONE
+		B_BADLANDS:
+			return _band_color(x, y, z) if depth <= 8 else _ID_RED_SANDSTONE
+		B_SWAMP:
+			return _ID_MUD if depth <= 3 else BlockCatalog.DIRT
+		B_OCEAN:
+			return _underwater_floor(B_OCEAN, x, z, t)
+		_:
+			return BlockCatalog.DIRT
+
+## Badlands terracotta banding: a slowly-drifting stack of the 7 terracotta ids,
+## shifted by a 512-column hash lattice (MC-style). posmod (not %) so bands do not
+## mirror-glitch below y = 0 (WGC §11.11).
+static func _band_color(x: int, y: int, z: int) -> int:
+	var shift := int(_hash01_3d(floori(x / 512.0), 0, floori(z / 512.0), _SALT_BAND) * 7.0)
+	return _BAND_SEQ[posmod(y + shift, _BAND_SEQ.size())]
+
+# --- stage: deepslate gradient + strata blobs (WGC §6.5) ----------------------
+static func _deep_family(x: int, y: int, z: int) -> int:
+	var base := BlockCatalog.STONE
+	if y < DEEPSLATE_FULL_Y:
+		base = _ID_DEEPSLATE
+	elif y <= DEEPSLATE_TOP_Y:
+		var band := DEEPSLATE_TOP_Y - DEEPSLATE_FULL_Y   # 8
+		if _hash01_3d(x, y, z, _SALT_DEEP) < float(DEEPSLATE_TOP_Y - y) / float(band):
+			base = _ID_DEEPSLATE
+	var variant := _strata_at(x, y, z)
+	if variant >= 0:
+		if base == BlockCatalog.STONE:
+			return variant                       # granite/diorite/... replace stone
+		# In the deepslate region deepslate stays dominant; only the deep sulfur/
+		# cinnabar pockets punch through it (WGC §6.5).
+		if variant == _ID_SULFUR or variant == _ID_CINNABAR:
+			return variant
+	return base
+
+## Strata blob at (x,y,z) or -1. One 16^3 lattice; the blob centre is jitter-
+## clamped so centre +/- radius stays inside its lattice cell (the TreeGen
+## containment trick), so a query consults exactly ONE lattice cell.
+static func _strata_at(x: int, y: int, z: int) -> int:
+	var lx := floori(x / float(_STRATA_L))
+	var ly := floori(y / float(_STRATA_L))
+	var lz := floori(z / float(_STRATA_L))
+	if _hash01_3d(lx, ly, lz, _SALT_STRATA_EXIST) >= 0.25:
+		return -1
+	var r := 3 + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_R) * 5.0)    # 3..7
+	var span := maxi(_STRATA_L - 2 * r, 0)
+	var cx := lx * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JX) * float(span + 1))
+	var cy := ly * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JY) * float(span + 1))
+	var cz := lz * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JZ) * float(span + 1))
+	var dx := x - cx
+	var dy := y - cy
+	var dz := z - cz
+	if dx * dx + dy * dy + dz * dz > r * r:
+		return -1
+	# Deep pockets (below -32): rare sulfur/cinnabar; otherwise a common stone strata.
+	if cy < -32:
+		var d := _hash01_3d(lx, ly, lz, _SALT_STRATA_VAR + 1)
+		if d < 0.10:
+			return _ID_SULFUR
+		if d < 0.20:
+			return _ID_CINNABAR
+	var h := _hash01_3d(lx, ly, lz, _SALT_STRATA_VAR)
+	return _STRATA_SEQ[int(h * float(_STRATA_SEQ.size())) % _STRATA_SEQ.size()]
+
+# --- stage: ores (WGC §6.6) — deterministic lattice, triangle distributions ---
+static func _ore_at(x: int, y: int, z: int, host: int, biome: int, c: float) -> int:
+	if host != BlockCatalog.STONE and host != _ID_DEEPSLATE:
+		return host                              # ore only replaces stone/deepslate
+	var lx := floori(x / float(_ORE_L))
+	var ly := floori(y / float(_ORE_L))
+	var lz := floori(z / float(_ORE_L))
+	if _hash01_3d(lx, ly, lz, _SALT_ORE_EXIST) >= 0.55:
+		return host
+	var r := 1 + int(_hash01_3d(lx, ly, lz, _SALT_ORE_R) * 2.0)   # 1..2
+	var span := maxi(_ORE_L - 2 * r, 0)
+	var cx := lx * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JX) * float(span + 1))
+	var cy := ly * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JY) * float(span + 1))
+	var cz := lz * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JZ) * float(span + 1))
+	var dx := x - cx
+	var dy := y - cy
+	var dz := z - cz
+	if dx * dx + dy * dy + dz * dz > r * r:
+		return host
+	# Ore TYPE is decided once per blob (at its centre y); the individual voxel is
+	# clipped to that ore's own y-band, so e.g. diamond never appears above -40.
+	var ore := _pick_ore(cy, biome, c, lx, ly, lz)
+	if ore < 0 or _ore_density(ore, y) <= 0.0:
+		return host
+	return _ORE_DEEP[ore] if host == _ID_DEEPSLATE else _ORE_STONE[ore]
+
+## Triangle (or edge) distribution density for ore `i` at world y, in [0,1].
+static func _ore_density(i: int, y: int) -> float:
+	var ymin: int = _ORE_YMIN[i]
+	var ymax: int = _ORE_YMAX[i]
+	var peak: int = _ORE_PEAK[i]
+	if y < ymin or y > ymax:
+		return 0.0
+	if y <= peak:
+		return 1.0 if peak == ymin else float(y - ymin) / float(peak - ymin)
+	return 1.0 if ymax == peak else float(ymax - y) / float(ymax - peak)
+
+static func _eff_weight(i: int, y: int, biome: int, c: float) -> float:
+	if i == _ORE_EMERALD and c <= 0.4:
+		return 0.0                               # emerald: highlands (c>0.4) only
+	var w: float = _ORE_WEIGHT[i] * _ore_density(i, y)
+	if i == _ORE_GOLD and biome == B_BADLANDS:
+		w *= 4.0                                 # badlands gold bonus (MC parity)
+	return w
+
+static func _pick_ore(y: int, biome: int, c: float, lx: int, ly: int, lz: int) -> int:
+	var total := 0.0
+	for i in 8:
+		total += _eff_weight(i, y, biome, c)
+	if total <= 0.0:
+		return -1
+	var r := _hash01_3d(lx, ly, lz, _SALT_ORE_PICK) * total
+	var acc := 0.0
+	for i in 8:
+		acc += _eff_weight(i, y, biome, c)
+		if r < acc:
+			return i
+	return 7
+
+# ------------------------------------------------------------------------------
+# Material projection + solidity helpers (unchanged contract).
 
 ## Material id the generator puts at (x,y,z) — the material projection of the
-## packed generated_cell(). Unchanged contract: every existing caller (analytic
-## queries, both meshers, the collider, the collapse pass, the sim layer) reads
-## this exact 0..COUNT-1 id.
+## packed generated_cell(). Every existing caller reads this exact 0..COUNT-1 id.
 static func generated_block(x: int, y: int, z: int) -> int:
 	return CellCodec.mat(generated_cell(x, y, z))
 
-## True when cell (x, y, z) is solid; false for air. Now the composed terrain +
-## tree query, so tree cells are solid for every existing consumer (floor,
-## blocked, DDA, collider). height_at keeps its meaning (grass heightmap top).
+## True when cell (x, y, z) is a SOLID material (solidity gate, WGC §6.3): water/
+## lava/powder_snow are non-solid even though generated_block returns their id.
 static func is_solid(x: int, y: int, z: int) -> bool:
-	return generated_block(x, y, z) != BlockCatalog.AIR
+	return BlockCatalog.solidity_of(generated_block(x, y, z)) >= 0.5
 
 ## Convenience: solidity from a world-space position (floored to a cell).
 static func is_solid_pos(p: Vector3) -> bool:
 	return is_solid(int(floor(p.x)), int(floor(p.y)), int(floor(p.z)))
+
+# ------------------------------------------------------------------------------
+# Spawn selection (WGC §8): origin is seed-dependent and may be ocean, so scan
+# outward from (0,0) for the first temperate land column above the sea.
+static func find_spawn() -> Vector2i:
+	for radius in range(0, 512, 4):
+		for a in range(0, 360, 15):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			var p := column_profile(x, z)
+			var g := int(p.x)
+			var b := int(p.y)
+			if g > SEA_LEVEL + 1 and (b == B_PLAINS or b == B_FOREST):
+				return Vector2i(x, z)
+	return Vector2i(0, 0)

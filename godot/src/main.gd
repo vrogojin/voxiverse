@@ -22,10 +22,13 @@ func _ready() -> void:
 	var inv := Inventory.new()
 	player.inventory = inv
 	add_child(player)
-	# Spawn on flat, open ground looking out over the gentle hills. The physics/
-	# breaking sandbox is now the deterministic trees from the generator (chop a
-	# trunk and the canopy detaches as a loose body).
-	var col := _find_flat(0, 0)
+	# Spawn on flat, open ground looking out over the gentle hills. The world is
+	# now biome/continent-shaped, so origin can be ocean — find_spawn() scans out
+	# for a temperate land column above the sea (WGC §8), then _find_flat picks the
+	# flattest spot near it. The physics/breaking sandbox is the deterministic
+	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
+	var spawn := TerrainConfig.find_spawn()
+	var col := _find_flat(spawn.x, spawn.y)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
 	world.on_player_ready(player)

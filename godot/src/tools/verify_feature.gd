@@ -22,8 +22,9 @@ func _ok(cond: bool, msg: String) -> void:
 
 func _initialize() -> void:
 	BlockCatalog.ensure_ready()
+	TerrainConfig.warm_up()
 	_test_stackup()
-	_test_stone_relief()
+	_test_worldgen()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -36,80 +37,345 @@ func _initialize() -> void:
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
-# 1. Layered stackup: grass only at surface, >=2 dirt, stone >=3 below, no hollow.
+# 1. Vertical stackup (WGC §6.1/§6.5): a bedrock floor, columns SOLID from bedrock
+# up to their surface (no hollow, no overhang — the player can never fall through
+# the world), the surface cell is solid biome ground, and deepslate replaces stone
+# below the transition. No bedrock above -59; no grass below sea level.
 func _test_stackup() -> void:
-	print("[1] terrain stackup")
+	print("[1] terrain vertical stackup (bedrock / solid columns / no fall-through)")
+	var BEDROCK := BlockCatalog.id_of(&"bedrock")
+	var DEEPSLATE := BlockCatalog.id_of(&"deepslate")
+	var WB: int = TerrainConfig.WORLD_BOTTOM_Y
+	var SEA: int = TerrainConfig.SEA_LEVEL
 	var checked := 0
-	for x in range(-300, 300, 7):
-		for z in range(-300, 300, 53):
+	for x in range(-360, 360, 37):
+		for z in range(-360, 360, 41):
 			var g: int = TerrainConfig.height_at(x, z)
-			_ok(TerrainConfig.generated_block(x, g, z) == GRASS, "grass at surface (%d,%d)" % [x, z])
-			_ok(TerrainConfig.generated_block(x, g - 1, z) == DIRT, "dirt at g-1 (%d,%d)" % [x, z])
-			_ok(TerrainConfig.generated_block(x, g - 2, z) == DIRT, "dirt at g-2 (%d,%d)" % [x, z])
-			# no grass anywhere below the surface
-			for y in range(g - 1, g - 8, -1):
-				_ok(TerrainConfig.generated_block(x, y, z) != GRASS, "no grass below surface (%d,%d,%d)" % [x, y, z])
-			var s: int = TerrainConfig.stone_height_at(x, z)
-			var stone_top: int = mini(s, g - TerrainConfig.DIRT_MIN_DEPTH)
-			_ok(stone_top <= g - 3, "stone_top <= g-3 (%d,%d)" % [x, z])
-			_ok(TerrainConfig.generated_block(x, stone_top, z) == STONE, "stone at stone_top (%d,%d)" % [x, z])
-			_ok(TerrainConfig.generated_block(x, stone_top + 1, z) == DIRT, "dirt above stone_top (%d,%d)" % [x, z])
-			# never hollow: deep cell is solid
-			_ok(TerrainConfig.generated_block(x, stone_top - 20, z) == STONE, "deep stone solid (%d,%d)" % [x, z])
+			# bedrock floor: y == WORLD_BOTTOM_Y is always bedrock.
+			_ok(TerrainConfig.generated_block(x, WB, z) == BEDROCK, "bedrock at world floor (%d,%d)" % [x, z])
+			# no bedrock above -59 (BEDROCK_TOP_Y).
+			for y in [-59, -50, -30, -10, g]:
+				_ok(TerrainConfig.generated_block(x, y, z) != BEDROCK, "no bedrock above -59 @ (%d,%d,%d)" % [x, y, z])
+			# surface cell is SOLID ground (never air/water at the solid top g).
+			_ok(TerrainConfig.is_solid(x, g, z), "surface cell g is solid (%d,%d)" % [x, z])
+			# NO FALL-THROUGH: every cell from just above bedrock up to g is solid.
+			var solid_col := true
+			for y in [WB + 3, -50, -40, -24, -16, -8, g - 3, g]:
+				if y <= g and not TerrainConfig.is_solid(x, y, z):
+					solid_col = false
+			_ok(solid_col, "column solid bedrock..surface, no hollow (%d,%d)" % [x, z])
+			# deepslate dominates below the full-deepslate line; stone above the band.
+			_ok(_is_deepslate_family(TerrainConfig.generated_block(x, -40, z)),
+				"deepslate family at y=-40 (%d,%d)" % [x, z])
+			# no grass below sea level (underwater columns get a seafloor, not grass).
+			if g < SEA:
+				_ok(TerrainConfig.generated_block(x, g, z) != GRASS, "no grass below sea @ (%d,%d) g=%d" % [x, z, g])
 			checked += 1
 	print("    checked %d columns" % checked)
+	# deepslate gradient boundaries: none above the top line, all below the full line.
+	var above := 0
+	var below := 0
+	for x in range(0, 200, 13):
+		for z in range(0, 200, 17):
+			if TerrainConfig.generated_block(x, -8, z) == DEEPSLATE:
+				above += 1
+			if TerrainConfig.generated_block(x, -40, z) != DEEPSLATE \
+					and not _is_deepslate_family(TerrainConfig.generated_block(x, -40, z)):
+				below += 1
+	_ok(above == 0, "no deepslate above the transition (y=-8): %d" % above)
+	_ok(below == 0, "everything at y=-40 is deepslate family: %d non-deepslate" % below)
 
-# 2. Stone has its OWN relief, not a constant offset of the grass height.
-func _test_stone_relief() -> void:
-	print("[2] stone relief is its own noise")
-	var vals := {}
-	var offset_vals := {}
-	for x in range(0, 400, 11):
-		for z in range(0, 400, 13):
+# Is `id` a deepslate-family block (deepslate itself, a deepslate ore, or a rare
+# deep sulfur/cinnabar pocket that the strata pass punches through it)?
+func _is_deepslate_family(id: int) -> bool:
+	if id == BlockCatalog.id_of(&"deepslate"):
+		return true
+	if id >= BlockCatalog.id_of(&"deepslate_coal_ore") and id <= BlockCatalog.id_of(&"deepslate_emerald_ore"):
+		return true
+	return id == BlockCatalog.id_of(&"sulfur_block") or id == BlockCatalog.id_of(&"cinnabar_block")
+
+# A deterministic PLAINS/FOREST land column above the sea with a clear (tree-free)
+# grass surface — the well-defined ground the edit-loop tests need in a now
+# biome-varied world.
+func _grass_column() -> Vector2i:
+	var s: Vector2i = TerrainConfig.find_spawn()
+	for dz in range(0, 48):
+		for dx in range(0, 48):
+			var x := s.x + dx
+			var z := s.y + dz
 			var g: int = TerrainConfig.height_at(x, z)
-			var s: int = TerrainConfig.stone_height_at(x, z)
-			vals[s] = true
-			offset_vals[(g - 3) - mini(s, g - 3)] = true
-	_ok(vals.size() > 3, "stone_height_at is non-constant (%d distinct)" % vals.size())
-	_ok(offset_vals.size() > 1, "stone_top - (g-3) varies (%d distinct) => own hills" % offset_vals.size())
+			if g <= TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.generated_block(x, g, z) != GRASS:
+				continue
+			var clear := true
+			for yy in range(g + 1, g + 7):
+				if TerrainConfig.generated_block(x, yy, z) != 0:
+					clear = false
+					break
+			if clear:
+				return Vector2i(x, z)
+	return s
 
-# 3. A tree exists somewhere and is well formed (deterministic).
-func _test_tree() -> void:
-	print("[3] tree generation")
-	var found := false
-	for gx in range(0, 200):
-		for gz in range(0, 200):
-			if TreeGen.has_tree(gx, gz):
-				var base: Vector3i = TreeGen.tree_base(gx, gz)
-				var base2: Vector3i = TreeGen.tree_base(gx, gz)
-				_ok(base == base2, "tree_base deterministic")
-				var bx := base.x
-				var bz := base.z
-				var gy: int = TerrainConfig.height_at(bx, bz)
-				_ok(base.y == gy, "tree base y == ground height")
-				_ok(TerrainConfig.generated_block(bx, gy, bz) == GRASS, "grass under trunk")
-				# trunk: at least one wood cell straight above the base
-				var wood_cells := 0
-				var leaf_cells := 0
-				for y in range(gy + 1, gy + TreeGen.MAX_ABOVE_SURFACE + 1):
-					var b: int = TreeGen.block_at(bx, y, bz)
-					if b == WOOD:
-						wood_cells += 1
-				# canopy: count leaves in the tree's footprint
-				for dx in range(-1, 2):
-					for dz in range(-1, 2):
-						for y in range(gy + 1, gy + TreeGen.MAX_ABOVE_SURFACE + 2):
-							if TreeGen.block_at(bx + dx, y, bz + dz) == LEAF:
-								leaf_cells += 1
-				_ok(wood_cells >= TreeGen.TRUNK_MIN, "trunk has >= TRUNK_MIN wood (%d)" % wood_cells)
-				_ok(leaf_cells >= 5, "canopy has leaves (%d)" % leaf_cells)
-				# generated_block agrees (trees win above surface)
-				_ok(TerrainConfig.generated_block(bx, gy + 1, bz) == WOOD, "generated_block sees trunk")
-				found = true
+# 2. The Minecraft-adapted worldgen pipeline (WGC §6): biomes, ores, sea/ice,
+# beaches, cold-biome surface temperature, and — CRITICAL — both render paths
+# agreeing byte-for-byte (the module generator vs the analytic generated_block).
+func _test_worldgen() -> void:
+	print("[2] worldgen pipeline (biomes / ores / sea / ice / determinism)")
+
+	# (a) biome determinism + coverage: two calls agree, and a big sample shows
+	# real biome variation (the continent/climate noises actually shape the world).
+	_ok(TerrainConfig.biome_at(100, 100) == TerrainConfig.biome_at(100, 100), "biome_at deterministic")
+	var biomes := {}
+	for x in range(-1000, 1000, 47):
+		for z in range(-1000, 1000, 53):
+			biomes[TerrainConfig.biome_at(x, z)] = true
+	_ok(biomes.size() >= 5, "biome coverage >= 5 distinct in a 2000^2 sample (got %d)" % biomes.size())
+
+	# (b) sea: every underwater column is water-filled up to SEA_LEVEL and there is
+	# NO water above it; the sea is walked-through (non-solid, the P2 gate).
+	var SEA: int = TerrainConfig.SEA_LEVEL
+	var WATER := BlockCatalog.id_of(&"water")
+	var ICE := BlockCatalog.id_of(&"ice")
+	var found_ocean := false
+	var sea_ok := true
+	for x in range(-800, 800, 31):
+		for z in range(-800, 800, 37):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g >= SEA:
+				continue
+			found_ocean = true
+			# a cell in the water column (just under the surface) is water or ice...
+			var mid: int = TerrainConfig.generated_block(x, SEA - 1, z) if SEA - 1 > g else TerrainConfig.generated_block(x, g + 1, z)
+			if mid != WATER and mid != ICE:
+				sea_ok = false
+			# ...and there is no water ABOVE the sea surface.
+			if TerrainConfig.generated_block(x, SEA + 2, z) == WATER:
+				sea_ok = false
+	_ok(found_ocean, "at least one ocean/underwater column exists")
+	_ok(sea_ok, "sea fills up to SEA_LEVEL and never above it")
+	_ok(BlockCatalog.solidity_of(WATER) < 0.5, "water is non-solid (waded through)")
+
+	# (c) sea ICE on a cold column, structurally backed by sub-zero surface temp.
+	var env := PerVoxelEnvironment.new()
+	var cold := _find_cold_sea()
+	if cold.x != 0x7fffffff:
+		var cx := cold.x
+		var cz := cold.y
+		_ok(TerrainConfig.generated_block(cx, SEA, cz) == ICE, "cold sea surface is ICE (%d,%d)" % [cx, cz])
+		_ok(BlockCatalog.solidity_of(ICE) >= 0.5, "ICE is solid (walk the frozen sea)")
+		# breaking the ice would expose non-solid water below.
+		_ok(BlockCatalog.solidity_of(TerrainConfig.generated_block(cx, SEA - 1, cz)) < 0.5,
+			"water under the ice is non-solid (%d,%d)" % [cx, cz])
+		var ice_temp := env.temperature(Vector3(cx + 0.5, SEA + 0.5, cz + 0.5))
+		_ok(ice_temp < -5.0, "cold-sea surface temperature < -5 C (got %.1f)" % ice_temp)
+	else:
+		_ok(false, "no cold sea column found to exercise ICE (widen the scan?)")
+
+	# a temperate land column reads ~room temperature at the surface (unchanged model).
+	var land := _grass_column()
+	var lg: int = TerrainConfig.height_at(land.x, land.y)
+	var land_temp := env.temperature(Vector3(land.x + 0.5, float(lg) + 0.5, land.y + 0.5))
+	_ok(land_temp > 15.0, "temperate land surface temperature is warm (got %.1f)" % land_temp)
+
+	# (d) beaches: sand appears on a found coastline (a column at sea +/- 2).
+	var BEACH_SAND := BlockCatalog.id_of(&"sand")
+	var found_beach := false
+	for x in range(-800, 800, 19):
+		for z in range(-800, 800, 23):
+			if found_beach:
 				break
-		if found:
-			break
-	_ok(found, "at least one tree exists in [0,200)^2 grid")
+			if TerrainConfig.biome_at(x, z) == TerrainConfig.B_BEACH:
+				var bg: int = TerrainConfig.height_at(x, z)
+				if TerrainConfig.generated_block(x, bg, z) == BEACH_SAND:
+					found_beach = true
+	_ok(found_beach, "beach sand present on a found coastline")
+
+	# (e) ores (WGC §6.6): scan a deep volume, assert every ore present, hosts are
+	# stone/deepslate only (ores sit below the surface), deepslate variants only
+	# below the transition, diamond never above -40, coal >> diamond.
+	_test_ores()
+
+	# (f) BOTH-PATH DETERMINISM (WGC §7.2, the hardest invariant): the module
+	# generator's output must equal generated_block for every cell it writes.
+	_test_both_paths()
+
+# Cold underwater column (climate temperature < -0.55, solid top below sea) whose
+# surface freezes to ice. Returns (0x7fffffff, _) if none found in the scan.
+func _find_cold_sea() -> Vector2i:
+	# g <= SEA-2 guarantees at least one WATER cell under the surface ICE cap.
+	for x in range(-1200, 1200, 17):
+		for z in range(-1200, 1200, 19):
+			var p := TerrainConfig.column_profile(x, z)
+			if p.w < -0.55 and int(p.x) <= TerrainConfig.SEA_LEVEL - 2:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+# Ore distribution over a deep sampled volume.
+func _test_ores() -> void:
+	var ore_names := ["coal_ore", "copper_ore", "iron_ore", "gold_ore",
+		"redstone_ore", "lapis_ore", "diamond_ore", "emerald_ore"]
+	var stone_lo := BlockCatalog.id_of(&"coal_ore")          # 18
+	var stone_hi := BlockCatalog.id_of(&"emerald_ore")       # 25
+	var deep_lo := BlockCatalog.id_of(&"deepslate_coal_ore") # 26
+	var deep_hi := BlockCatalog.id_of(&"deepslate_emerald_ore") # 33
+	var diamond := BlockCatalog.id_of(&"diamond_ore")
+	var deep_diamond := BlockCatalog.id_of(&"deepslate_diamond_ore")
+	var STONE := BlockCatalog.STONE
+	var DEEPSLATE := BlockCatalog.id_of(&"deepslate")
+	var counts := PackedInt32Array()
+	counts.resize(8)
+	var host_vol := 0
+	var below_surface_ok := true
+	var deep_placement_ok := true
+	var diamond_ok := true
+	for x in range(0, 96):
+		for z in range(0, 96):
+			var g: int = TerrainConfig.height_at(x, z)
+			for y in range(-64, 16):
+				if y >= g:
+					break
+				var id: int = TerrainConfig.generated_block(x, y, z)
+				var is_stone_ore := id >= stone_lo and id <= stone_hi
+				var is_deep_ore := id >= deep_lo and id <= deep_hi
+				if id == STONE or id == DEEPSLATE or is_stone_ore or is_deep_ore:
+					host_vol += 1
+				if is_stone_ore or is_deep_ore:
+					var idx := (id - stone_lo) if is_stone_ore else (id - deep_lo)
+					counts[idx] += 1
+					if y >= g:
+						below_surface_ok = false
+					if is_deep_ore and y >= TerrainConfig.DEEPSLATE_TOP_Y:
+						deep_placement_ok = false
+					if (id == diamond or id == deep_diamond) and y > -40:
+						diamond_ok = false
+	var total_ore := 0
+	for i in 8:
+		total_ore += counts[i]
+	print("    ore counts: %s (host volume %d)" % [str(counts), host_vol])
+	_ok(host_vol > 0, "sampled a non-empty deep-stone volume")
+	var frac := float(total_ore) / float(maxi(host_vol, 1))
+	_ok(frac > 0.002 and frac < 0.08, "ore fraction of deep-stone volume in [0.2%%,8%%] (got %.3f%%)" % (frac * 100.0))
+	# Every ore EXCEPT emerald (highland-gated, exercised separately) is present.
+	for i in 7:
+		_ok(counts[i] > 0, "ore '%s' present in the sample (%d)" % [ore_names[i], counts[i]])
+	_ok(below_surface_ok, "ores only host in stone/deepslate below the surface")
+	_ok(deep_placement_ok, "deepslate ores only below the deepslate transition (-16)")
+	_ok(diamond_ok, "diamond never generates above y=-40")
+
+	# Emerald is highland-only (continent c > 0.4, WGC §6.6): find a highland region
+	# and confirm emerald generates there (and NOT in the flat sample above).
+	_ok(counts[7] == 0, "no emerald in the low-continent sample (highland-gated)")
+	var emerald := BlockCatalog.id_of(&"emerald_ore")
+	var hi := _find_highland()
+	if hi.x != 0x7fffffff:
+		var em := 0
+		for x in range(hi.x - 40, hi.x + 40):
+			for z in range(hi.y - 40, hi.y + 40):
+				if TerrainConfig.continent_at(x, z) <= 0.4:
+					continue
+				var g: int = TerrainConfig.height_at(x, z)
+				for y in range(-8, mini(g, 16)):
+					if TerrainConfig.generated_block(x, y, z) == emerald:
+						em += 1
+		_ok(em > 0, "emerald generates in a highland region (found %d)" % em)
+	else:
+		print("    (no highland c>0.4 region found near origin — emerald scan skipped)")
+
+## A highland column (continent c > 0.45) or (0x7fffffff, _) if none found nearby.
+func _find_highland() -> Vector2i:
+	for x in range(-1500, 1500, 13):
+		for z in range(-1500, 1500, 17):
+			if TerrainConfig.continent_at(x, z) > 0.45:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+# Both render paths agree: instantiate the module generator (only when the
+# godot_voxel module is compiled in) and compare its VoxelBuffer output to the
+# analytic generated_block over several 16^3 blocks spanning bedrock..sea.
+func _test_both_paths() -> void:
+	if not ClassDB.class_exists("VoxelTerrain") or not ClassDB.class_exists("VoxelBuffer"):
+		print("    (godot_voxel module absent — both-path determinism runs on module builds only)")
+		return
+	var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+	var gen: Object = mw.call("_make_generator")
+	_ok(gen != null, "module generator compiles")
+	if gen == null:
+		mw.free()
+		return
+	var ch := 0                                   # VoxelBuffer.CHANNEL_TYPE
+	var origins := [
+		Vector3i(0, -64, 0), Vector3i(0, -16, 0), Vector3i(48, 0, 48),
+		Vector3i(-80, -32, 16), Vector3i(128, -8, -64), Vector3i(-256, 0, 320),
+	]
+	var mismatches := 0
+	var cells := 0
+	for origin: Vector3i in origins:
+		var buf: Object = ClassDB.instantiate("VoxelBuffer")
+		buf.call("create", 16, 16, 16)
+		if buf.has_method("fill"):
+			buf.call("fill", 0, ch)
+		gen.call("_generate_block", buf, origin, 0)
+		for lz in range(16):
+			for lx in range(16):
+				for ly in range(16):
+					var got: int = int(buf.call("get_voxel", lx, ly, lz, ch))
+					var expected: int = TerrainConfig.generated_block(origin.x + lx, origin.y + ly, origin.z + lz)
+					if got != expected:
+						mismatches += 1
+					cells += 1
+	_ok(mismatches == 0, "module generator == generated_block over %d cells (%d mismatches)" % [cells, mismatches])
+	print("    both-path determinism checked %d cells" % cells)
+	mw.free()
+
+# 3. Trees exist, are well formed and deterministic; species are biome-keyed and
+# a SPRUCE is found in taiga/snowy (WGC §6.7). Oak stays a valid tree.
+func _test_tree() -> void:
+	print("[3] tree generation (species + biome gate)")
+	var SPRUCE_LOG := BlockCatalog.id_of(&"spruce_log")
+	var SPRUCE_LEAF := BlockCatalog.id_of(&"spruce_leaves")
+	var BIRCH_LOG := BlockCatalog.id_of(&"birch_log")
+	var log_ids := {WOOD: true, SPRUCE_LOG: true, BIRCH_LOG: true}
+	var found := false
+	var found_spruce := false
+	for gx in range(-200, 200):
+		for gz in range(-200, 200):
+			if not TreeGen.has_tree(gx, gz):
+				continue
+			var base: Vector3i = TreeGen.tree_base(gx, gz)
+			var species := TreeGen.block_at(base.x, base.y + 1, base.z)
+			if species == SPRUCE_LOG:
+				found_spruce = true
+			if found:
+				continue
+			var base2: Vector3i = TreeGen.tree_base(gx, gz)
+			_ok(base == base2, "tree_base deterministic")
+			var bx := base.x
+			var bz := base.z
+			var gy: int = TerrainConfig.height_at(bx, bz)
+			_ok(base.y == gy, "tree base y == ground height")
+			# ground under the trunk is a solid biome top, above sea (no submerged trees).
+			_ok(TerrainConfig.is_solid(bx, gy, bz) and gy > TerrainConfig.SEA_LEVEL, "solid ground above sea under trunk")
+			# trunk: a run of log cells straight above the base.
+			var trunk_cells := 0
+			var leaf_cells := 0
+			for y in range(gy + 1, gy + TreeGen.MAX_ABOVE_SURFACE + 1):
+				if log_ids.has(TreeGen.block_at(bx, y, bz)):
+					trunk_cells += 1
+			# canopy: count leaf cells (any species) in the tree's footprint.
+			for dx in range(-2, 3):
+				for dz in range(-2, 3):
+					for y in range(gy + 1, gy + TreeGen.MAX_ABOVE_SURFACE + 2):
+						var b: int = TreeGen.block_at(bx + dx, y, bz + dz)
+						if b == LEAF or b == SPRUCE_LEAF or b == BlockCatalog.id_of(&"birch_leaves"):
+							leaf_cells += 1
+			_ok(trunk_cells >= TreeGen.TRUNK_MIN, "trunk has >= TRUNK_MIN logs (%d)" % trunk_cells)
+			_ok(leaf_cells >= 5, "canopy has leaves (%d)" % leaf_cells)
+			_ok(log_ids.has(TerrainConfig.generated_block(bx, gy + 1, bz)), "generated_block sees a trunk log")
+			found = true
+		# keep scanning for a spruce even after the first (oak) tree is validated.
+	_ok(found, "at least one tree exists in the sampled grid")
+	_ok(found_spruce, "a spruce tree (spruce_log trunk) is found in a cold biome")
 
 # 7. Mass ordering: stone heaviest, wood lightest, all > 0.
 func _test_masses() -> void:
@@ -197,8 +463,9 @@ func _test_cell_codec() -> void:
 	var world: WorldManager = WorldManager.new()
 	world.name = "WorldManagerCodec"
 	get_root().add_child(world)
-	var cx := 12
-	var cz := 12
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
 	var g: int = TerrainConfig.height_at(cx, cz)
 	_ok(world.place_block(Vector3i(cx, g + 1, cz), STONE), "codec: place a stone")
 	# The overlay stores a canonical PLAIN packed value for a placed cube (checked
@@ -389,8 +656,9 @@ func _test_catalog_expansion() -> void:
 	var world: WorldManager = WorldManager.new()
 	world.name = "WorldManagerP3a"
 	get_root().add_child(world)
-	var cx := 20
-	var cz := 21
+	var gcol := _grass_column()
+	var cx := gcol.x
+	var cz := gcol.y
 	var gg: int = TerrainConfig.height_at(cx, cz)
 	_ok(world.place_block(Vector3i(cx, gg + 1, cz), glass), "place glass succeeds")
 	_ok(world.block_id_at(Vector3i(cx, gg + 1, cz)) == glass, "placed glass reads back")
@@ -464,9 +732,16 @@ func _test_merged_physics() -> void:
 	# on untouched terrain. Bare-surface columns only (skip tree columns, whose above-
 	# surface cells are solid) so the expected values are the plain grass surface.
 	var phys_checked := 0
-	for x in range(-30, 30, 11):
-		for z in range(-30, 30, 9):
+	# Wide sample so land columns are guaranteed regardless of where origin lands in
+	# the now continent-shaped world; ocean/tree/frozen columns are skipped below.
+	for x in range(-200, 200, 23):
+		for z in range(-200, 200, 19):
 			var g: int = TerrainConfig.height_at(x, z)
+			# Skip underwater columns (water above the seafloor is legitimately
+			# non-solid, but the "plain grass surface" expectations below assume a dry
+			# land column) and any column whose above-surface cells are occupied.
+			if g <= TerrainConfig.SEA_LEVEL:
+				continue
 			var clear := true
 			for yy in range(g + 1, g + 5):
 				if world.cell_solid(Vector3i(x, yy, z)):
@@ -509,8 +784,9 @@ func _test_world_loop() -> void:
 	var world: WorldManager = WorldManager.new()
 	world.name = "WorldManager"
 	get_root().add_child(world)   # _ready() picks the render path + builds the collider
-	var cx := 4
-	var cz := 4
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
 	var g: int = TerrainConfig.height_at(cx, cz)
 	var c := Vector3i(cx, g, cz)
 	_ok(world.block_id_at(c) == GRASS, "surface cell is grass")
@@ -534,19 +810,26 @@ func _test_world_loop() -> void:
 		_ok(after > 0, "ground collider has shapes (%d)" % after)
 
 	# tree chop: break a trunk cell with a finite breaker pos -> canopy detaches as a
-	# kicked VoxelBody (invariant 4). Find a tree, chop its lowest trunk cell.
+	# kicked VoxelBody (invariant 4). Find any tree (any species), chop its lowest
+	# trunk cell. Wide scan so a tree is found wherever the land biomes fall.
+	var SPRUCE_LOG := BlockCatalog.id_of(&"spruce_log")
+	var BIRCH_LOG := BlockCatalog.id_of(&"birch_log")
+	var log_ids := {WOOD: true, SPRUCE_LOG: true, BIRCH_LOG: true}
 	var chopped := false
-	for gx in range(0, 60):
-		for gz in range(0, 60):
+	for gx in range(-120, 120):
+		for gz in range(-120, 120):
+			if chopped:
+				break
 			if not TreeGen.has_tree(gx, gz):
 				continue
 			var base: Vector3i = TreeGen.tree_base(gx, gz)
 			var trunk := Vector3i(base.x, base.y + 1, base.z)
-			if world.block_id_at(trunk) != WOOD:
+			var trunk_id := world.block_id_at(trunk)
+			if not log_ids.has(trunk_id):
 				continue
 			var n_bodies_before := _count_voxel_bodies(world)
 			var id := world.break_terrain(trunk, Vector3(base.x + 0.5, base.y - 2.0, base.z + 0.5))
-			_ok(id == WOOD, "chopped trunk returns WOOD (got %d)" % id)
+			_ok(id == trunk_id, "chopped trunk returns its log id (got %d)" % id)
 			var n_bodies_after := _count_voxel_bodies(world)
 			_ok(n_bodies_after > n_bodies_before, "canopy detached into a VoxelBody (%d->%d)" % [n_bodies_before, n_bodies_after])
 			chopped = true

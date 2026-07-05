@@ -106,6 +106,17 @@ func setup() -> bool:
 	_set_if(_terrain, "mesher", mesher)
 	_set_if(_terrain, "generator", generator)
 	_set_if(_terrain, "max_view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
+	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
+	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
+	# not triangle count — is what collapses the frame rate once the full radius streams
+	# in. 32³ blocks cover 2×2×2 as much ground each, cutting the draw-call count ~4-8×
+	# for the SAME view distance and the SAME smoothing. Trade-off: a block edit remeshes
+	# a larger block, but that runs on the voxel worker and the main-thread mesh APPLY is
+	# already capped (voxel/threads/main/time_budget_ms=4), so it is not a frame stall.
+	# Data blocks stay 16³ (bulk_inject groups by data block), so edit injection is
+	# unaffected. Valid values are 16 or 32 only.
+	_set_if(_terrain, "mesh_block_size", 32)
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)

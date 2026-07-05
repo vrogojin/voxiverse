@@ -44,6 +44,13 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
+	# Diagnostic perf logger (temporary): prints FPS + render/memory metrics to the
+	# console every second so a live session can be characterised. Remove post-tuning.
+	var perf := PerfLogger.new()
+	perf.name = "PerfLogger"
+	perf.setup(world)
+	add_child(perf)
+
 func _setup_environment() -> void:
 	var env := Environment.new()
 

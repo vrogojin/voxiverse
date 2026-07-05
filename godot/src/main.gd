@@ -51,6 +51,19 @@ func _ready() -> void:
 	perf.setup(world)
 	add_child(perf)
 
+	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
+	# Compatibility renderer compiles each material pipeline synchronously on the main
+	# thread the first time it is DRAWN, so on a real device every distinct look
+	# stutters (800–950 ms via ANGLE) the first time it scrolls into view during
+	# exploration. ShaderPrewarm draws one instance of every material/mesh-format
+	# combination for a few frames, hidden behind a "Loading…" overlay, so ANGLE does
+	# all the compiles up front. The player is FROZEN until it reports finished.
+	player.frozen = true
+	var prewarm := ShaderPrewarm.new()
+	prewarm.name = "ShaderPrewarm"
+	add_child(prewarm)
+	prewarm.begin(player, func() -> void: player.frozen = false)
+
 func _setup_environment() -> void:
 	var env := Environment.new()
 

@@ -50,6 +50,7 @@ func _initialize() -> void:
 	_test_zonechunk()
 	_test_dynamic_catalog()
 	_test_zone_bundle()
+	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -3054,3 +3055,83 @@ func _bundle_doc(mat_name: String, state_name: String, mass: float, swatch: Colo
 	def.states = [st]
 	def.default_state_index = 0
 	return MaterialDocument.to_document(def)
+
+# Shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). Headless has NO GPU so we
+# cannot assert pipelines actually compiled; instead we fence the ENUMERATION and
+# LIFECYCLE that guarantee the on-device warm-up is a complete SUPERSET: a cube with a
+# real material for EVERY non-AIR block id (a skipped id = a residual gameplay spike), a
+# shaped mesh for every emitted smoothing modifier, no empty/null-material instance, and
+# a clean teardown that frees the whole pile after the frame budget.
+func _test_shader_prewarm() -> void:
+	print("[prewarm] shader/material pipeline pre-warm enumeration + lifecycle")
+	BlockCatalog.ensure_ready()
+	var prewarm: ShaderPrewarm = ShaderPrewarm.new()
+	get_root().add_child(prewarm)
+	var count := prewarm.spawn_warmups(Transform3D.IDENTITY)
+	_ok(count == prewarm.warmup_instance_count(), "prewarm: spawn count == warmup_instance_count() (%d)" % count)
+	_ok(count == prewarm.live_mesh_instance_count(), "prewarm: every spawned job is a live MeshInstance3D child (%d)" % count)
+
+	# (a) one cube per non-AIR block id — no id skipped (a skipped id = a residual spike).
+	var non_air := BlockCatalog.count() - 1
+	var cube_ids := prewarm.warmed_cube_ids()
+	_ok(cube_ids.size() == non_air, "prewarm: one warm-up cube per non-AIR block id (%d cubes, %d non-AIR ids)" % [cube_ids.size(), non_air])
+	var cube_set := {}
+	for id: int in cube_ids:
+		cube_set[id] = true
+	var all_ids := true
+	for id in range(1, BlockCatalog.count()):
+		if not cube_set.has(id):
+			all_ids = false
+	_ok(all_ids, "prewarm: no non-AIR block id is skipped (every id 1..count-1 has a cube)")
+
+	# (b) shaped warm-up covers every emitted smoothing modifier.
+	var emitted := TerrainConfig.emitted_modifiers()
+	var shaped_set := {}
+	for m in prewarm.warmed_shape_modifiers():
+		shaped_set[m] = true
+	var all_mods := true
+	for m in emitted:
+		if not shaped_set.has(m):
+			all_mods = false
+	_ok(all_mods, "prewarm: shaped warm-up covers every emitted modifier (%d emitted, %d shaped)" % [emitted.size(), shaped_set.size()])
+	_ok(count >= non_air + emitted.size(), "prewarm: total superset >= cubes + shaped-per-modifier (%d >= %d)" % [count, non_air + emitted.size()])
+
+	# (c) every warm-up instance has a mesh (>=1 surface) WITH a material set — an empty
+	#     or null-material instance would warm nothing.
+	var geom_ok := true
+	var mats_seen := {}
+	for c in prewarm.get_children():
+		if not (c is MeshInstance3D):
+			continue
+		var mi := c as MeshInstance3D
+		var mesh := mi.mesh
+		if mesh == null or mesh.get_surface_count() < 1:
+			geom_ok = false
+			continue
+		var mat := mesh.surface_get_material(0)
+		if mat == null:
+			geom_ok = false
+			continue
+		mats_seen[mat.get_instance_id()] = true
+	_ok(geom_ok, "prewarm: every warm-up instance has a mesh (>=1 surface) with a material set")
+
+	# (d) the real per-id material of every non-AIR id appears among the warmed materials.
+	var mats_ok := true
+	for id in range(1, BlockCatalog.count()):
+		var mat := BlockMaterials.get_for(id)
+		if mat == null or not mats_seen.has(mat.get_instance_id()):
+			mats_ok = false
+	_ok(mats_ok, "prewarm: the real BlockMaterials material of every non-AIR id is warmed")
+
+	print("    prewarm superset: %d cubes + %d shaped = %d instances (WARMUP_FRAMES=%d)"
+		% [cube_ids.size(), count - cube_ids.size(), count, ShaderPrewarm.WARMUP_FRAMES])
+
+	# (e) LIFECYCLE: driving the frame countdown frees the whole pile, then finishes.
+	var done := [false]
+	prewarm.finished.connect(func() -> void: done[0] = true)
+	for _f in range(ShaderPrewarm.WARMUP_FRAMES):
+		prewarm._process(0.016)
+	_ok(prewarm.live_mesh_instance_count() == 0, "prewarm: warm-up meshes freed after WARMUP_FRAMES (%d frames)" % ShaderPrewarm.WARMUP_FRAMES)
+	prewarm._process(0.016)   # one more frame: overlay + self teardown; finished fires
+	_ok(done[0], "prewarm: finished signal fires after the frame budget (player re-enabled here)")
+	_ok(prewarm.warmup_instance_count() == 0, "prewarm: tracked instance list cleared on teardown")

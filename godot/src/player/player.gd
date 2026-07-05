@@ -40,6 +40,11 @@ const PLAYER_WEIGHT := 700.0              # N (~70 kg) pressed down onto a piece
 var world: WorldManager                   # injected by Main before _ready
 var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
 var flying := false
+## Input gate. While true the player cannot move, look, break or place — Main holds
+## this during the load-time shader pre-warm (RENDER-STREAMING-SPIKES) so the hidden
+## warm-up pile in front of the camera is never disturbed, then clears it when the
+## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
+var frozen := false
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -103,7 +108,14 @@ func _capture_mouse() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
+## The camera's world transform — the ShaderPrewarm places its hidden warm-up pile in
+## front of it. Falls back to the player transform before the camera rig is built.
+func camera_global_transform() -> Transform3D:
+	return _camera.global_transform if _camera != null else global_transform
+
 func _unhandled_input(event: InputEvent) -> void:
+	if frozen:
+		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		rotate_y(-event.relative.x * mouse_sensitivity)
 		_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
@@ -138,7 +150,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				velocity = Vector3.ZERO
 
 func _physics_process(delta: float) -> void:
-	if world == null:
+	if frozen or world == null:
 		return
 	_move(delta)
 	world.update_streaming(global_position)

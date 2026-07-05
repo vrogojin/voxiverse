@@ -39,11 +39,13 @@ textures/vram_compression/import_etc2_astc=true
 ; (ratio 0.0 -> deterministic + device-independent, never scaling with CPU), sized
 ; to fit the pre-baked pool with headroom for the main + other engine threads:
 ;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
-;         = clamp(floor(0.0 * ...), 3, ...) = 3
-; EXPERIMENT (fill-speed): 3 worker threads parallelise the deterministic, per-chunk
-; -independent worldgen+meshing (~3x throughput). If the pre-baked pthread pool is too
-; small this deadlocks -> blank world; revert minimum to 1 if so.
-threads/count/minimum=3
+;         = clamp(floor(0.0 * ...), 2, ...) = 2
+; Fill-speed vs smoothness balance: worldgen is deterministic + per-chunk independent,
+; so worker threads parallelise it safely. 3 threads generate fast but FLOOD the single
+; main-thread mesh-apply (GPU upload must be main-thread) and oversubscribe low-core
+; laptops -> stutter. 2 keeps ~2x throughput without overrunning the consumer. The
+; pre-baked pthread pool proven to hold >=3 (3 loaded without deadlock).
+threads/count/minimum=2
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +

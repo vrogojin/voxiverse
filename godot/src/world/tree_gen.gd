@@ -89,7 +89,7 @@ static func _species_for(biome: int, gx: int, gz: int) -> int:
 ## True iff grid cell (gx, gz) hosts a tree (patch gate AND per-cell gate AND the
 ## biome gate). The two cheap hash gates run first, so the biome lookup only fires
 ## for the ~13% of grid cells that pass them.
-static func has_tree(gx: int, gz: int) -> bool:
+static func has_tree(gx: int, gz: int, pcache = null) -> bool:
 	var px := floori(float(gx) / float(P))
 	var pz := floori(float(gz) / float(P))
 	if _hash01(px, pz, 11) >= PATCH_CHANCE:
@@ -97,7 +97,7 @@ static func has_tree(gx: int, gz: int) -> bool:
 	if _hash01(gx, gz, 22) >= TREE_CHANCE:
 		return false
 	var b := _base_pos(gx, gz)
-	return _species_for(TerrainConfig.biome_at(b.x, b.y), gx, gz) != SP_NONE
+	return _species_for(TerrainConfig.biome_at(b.x, b.y, pcache), gx, gz) != SP_NONE
 
 ## Base of the grid cell's tree: (bx, gy, bz) where gy = ground height of the
 ## tree's OWN base column. Returns _NO_TREE when the grid cell has no tree.
@@ -120,18 +120,18 @@ static func _spruce_trunk_height(gx: int, gz: int) -> int:
 ## costs a handful of integer hashes (+ biome lookup for the base when a tree
 ## exists). Trees whose base is at/below sea level are suppressed (the sea fills
 ## those cells), so no submerged half-trees poke through the water.
-static func block_at(x: int, y: int, z: int) -> int:
+static func block_at(x: int, y: int, z: int, pcache = null) -> int:
 	var gx := floori(float(x) / float(G))
 	var gz := floori(float(z) / float(G))
-	if not has_tree(gx, gz):
+	if not has_tree(gx, gz, pcache):
 		return BlockCatalog.AIR
 	var b := _base_pos(gx, gz)
 	var bx := b.x
 	var bz := b.y
-	var gy := TerrainConfig.height_at(bx, bz)
+	var gy := TerrainConfig.column_top(bx, bz, pcache)
 	if gy <= TerrainConfig.SEA_LEVEL:
 		return BlockCatalog.AIR
-	var species := _species_for(TerrainConfig.biome_at(bx, bz), gx, gz)
+	var species := _species_for(TerrainConfig.biome_at(bx, bz, pcache), gx, gz)
 	var dx := x - bx
 	var dz := z - bz
 	match species:

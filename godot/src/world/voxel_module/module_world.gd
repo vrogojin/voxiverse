@@ -510,9 +510,17 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var profs = []
 	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
+	# Per-block column-profile memo (Vector2i -> Vector4) for the smoothing corner-target
+	# stencil AND the tree overlay (PERF): each surface/cap cell samples a 3x3 column-top
+	# stencil that overlaps its neighbours', and TreeGen re-derives its base-column biome per
+	# cell — so without a memo columns are re-noised many times per block. Seeded here from the
+	# profile pass and reused by resolve_cell -> smoothing + TreeGen.block_at; it only pads +1
+	# at block edges. LOCAL to this _generate_block frame -> each voxel worker owns its own dict;
+	# never shared across threads. Values are the exact column_profile -> output byte-identical.
+	var pcache = {}
 	for z in range(size.z):
 		for x in range(size.x):
-			var p = TerrainConfig.column_profile(ox + x, oz + z)
+			var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
 			profs[z * size.x + x] = p
 			if int(p.x) > max_h: max_h = int(p.x)
 
@@ -534,7 +542,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			var wx = ox + x
 			var wz = oz + z
 			for y in range(size.y):
-				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt)
+				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache)
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue

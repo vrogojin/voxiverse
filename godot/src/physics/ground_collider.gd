@@ -81,14 +81,20 @@ func _rebuild() -> void:
 	var x0 := _center.x - R
 	var z0 := _center.y - R
 
-	# Cache column heights once (height_at re-evaluates noise, so don't call twice)
-	# and find the lowest surface → how deep to make the solid floor.
+	# Per-rebuild column-profile memo shared with the LIGHT surface/cap queries AND the tree
+	# overlay below, so their 3x3 corner-target stencils and TreeGen's per-cell base-column
+	# biome lookups reuse each column (height + biome) instead of re-running the noise stack
+	# (PERF — this, with the light queries, is the freeze fix). Main thread only (the collider
+	# runs off Player movement); a fresh local dict per rebuild -> never shared across threads.
+	var pc := {}
+	# Resolve each column's profile once (height + biome), reused everywhere below, and find
+	# the lowest surface → how deep to make the solid floor.
 	var heights := PackedInt32Array()
 	heights.resize(span * span)
 	var min_h := 0x7fffffff
 	for i in span:
 		for j in span:
-			var h := TerrainConfig.height_at(x0 + i, z0 + j)
+			var h := int(TerrainConfig.column_profile(x0 + i, z0 + j, pc).x)
 			heights[i * span + j] = h
 			if h < min_h:
 				min_h = h
@@ -111,17 +117,18 @@ func _rebuild() -> void:
 				# y <= h ⇒ the heightmap fills this cell; it is air only if broken out.
 				# A single overlay lookup (same cost as is_removed) catches a placed SHAPED
 				# cell here (dug then a ramp/slab placed). At the heightmap TOP (y == h),
-				# where P5b-2 worldgen may have smoothed the surface into a ramp/slab, one
-				# composed read picks up the GENERATED shape too. Sub-surface generated cells
-				# are always full cubes, so the fast overlay read suffices below the top.
-				# Either way a shaped cell breaks the box run and contributes convex prisms
-				# instead of a box (SVS §5.4).
+				# where P5b-2 worldgen may have smoothed the surface into a ramp/slab, the
+				# LIGHT surface_modifier query picks up the GENERATED shape — WITHOUT running
+				# the ~12x-heavier generated_cell material/biome/strata/ore pipeline (the
+				# collider needs only the shape). Sub-surface generated cells are always full
+				# cubes, so the fast overlay read suffices below the top. Either way a shaped
+				# cell breaks the box run and contributes convex prisms instead of a box (SVS §5.4).
 				var ov: int = world.placed_cells().get(Vector3i(x, y, z), -1)
 				var modifier := 0
 				if ov > 0:
 					modifier = CellCodec.modifier(ov)
 				elif ov < 0 and y == h:
-					modifier = CellCodec.modifier(world.cell_value_at(Vector3i(x, y, z)))
+					modifier = TerrainConfig.surface_modifier(x, z, pc)
 				if ov == 0:                                 # dug to air
 					if run_start != 0x7fffffff:
 						_add_box(rid, x, z, run_start, y)   # run [run_start, y-1] → [run_start, y]
@@ -139,17 +146,36 @@ func _rebuild() -> void:
 			# (grass top) merges straight into a trunk/placed block sitting on it.
 			var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(x, z))
 			while y <= y_top:
-				# One composed read: a shaped placed cell (ramp/slab on the ground — the
-				# common case) breaks the box run and contributes convex prisms (SVS §5.4);
-				# full cubes (trees / placed blocks) extend the run as before.
-				var v: int = world.cell_value_at(Vector3i(x, y, z))
-				var mat: int = CellCodec.mat(v)
-				if mat != BlockCatalog.AIR and CellCodec.modifier(v) != 0:
+				# Composed occupancy from CHEAP queries only (PERF freeze fix): the edit
+				# overlay (placed / dug), a smoothed grass CAP lip at y == h+1 (light modifier
+				# query), sea fill for underwater columns, else the TreeGen overlay hash — never
+				# the ~12x-heavier generated_cell. Byte-identical to the old composed cell read:
+				# a shaped cell (placed ramp/slab or a generated cap) breaks the box run and
+				# contributes convex prisms (SVS §5.4); full cubes (trees / sea / placed blocks)
+				# extend the run as before.
+				var ov: int = world.placed_cells().get(Vector3i(x, y, z), -1)
+				var solid := false
+				var modifier := 0
+				if ov > 0:                                  # placed block (full cube or shaped)
+					solid = true
+					modifier = CellCodec.modifier(ov)
+				elif ov == 0:                               # dug to air
+					pass
+				else:                                       # generated cell above the heightmap top
+					if y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
+						modifier = TerrainConfig.surface_cap_modifier(x, z, pc)
+					if modifier != 0:
+						solid = true                        # smoothed grass cap → prism
+					elif y <= TerrainConfig.SEA_LEVEL:
+						solid = true                        # sea fill (water/ice) → full-cube box
+					elif TreeGen.block_at(x, y, z, pc) != BlockCatalog.AIR:
+						solid = true                        # tree wood/leaf → full-cube box
+				if solid and modifier != 0:
 					if run_start != 0x7fffffff:
 						_add_box(rid, x, z, run_start, y)
 						run_start = 0x7fffffff
-					_add_prisms(rid, x, y, z, CellCodec.modifier(v))
-				elif mat != BlockCatalog.AIR:
+					_add_prisms(rid, x, y, z, modifier)
+				elif solid:
 					if run_start == 0x7fffffff:
 						run_start = y
 				elif run_start != 0x7fffffff:

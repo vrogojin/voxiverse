@@ -26,6 +26,7 @@ func _initialize() -> void:
 	_test_stackup()
 	_test_worldgen()
 	_test_smoothing()
+	_test_collider_cheap_queries()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -542,6 +543,116 @@ func _test_smoothing_walkable() -> void:
 	_ok(finite_ok, "walkability: floor_under always finite across the slope (no fall-through)")
 	_ok(cont_ok, "walkability: standable surface continuous up the smoothed 1-step (max jump %.3f ≤ STEP_MAX)" % max_jump)
 	world.queue_free()
+
+# 2b. GroundCollider cheap queries (PERF freeze fix): the collider now reads the surface
+# SHAPE from the LIGHT TerrainConfig.surface_modifier / surface_cap_modifier queries and
+# TreeGen.block_at instead of the ~12x-heavier generated_cell. Prove that (a) the light
+# modifier queries are byte-identical to the full generation at the surface + cap cell, and
+# (b) above the cap, generated cells are only tree/sea/air (full cubes, modifier 0) — so
+# TreeGen.block_at + the sea test are sound substitutes and collision geometry is unchanged.
+# Also demonstrate the query is dramatically cheaper (the actual freeze fix).
+func _test_collider_cheap_queries() -> void:
+	print("[2b] collider cheap queries (light surface/cap modifier == full generation)")
+	var s: Vector2i = TerrainConfig.find_spawn()
+	var checked := 0
+	var surf_ok := true
+	var cap_ok := true
+	var above_ok := true
+	# Sweep a wide patch so it spans varied terrain (ramps, caps, trees, and — outward —
+	# possibly water), exercising every branch of the light queries.
+	for dz in range(-40, 40):
+		for dx in range(-40, 40):
+			var x := s.x + dx
+			var z := s.y + dz
+			var g: int = TerrainConfig.height_at(x, z)
+			# (a) surface modifier: light query == modifier of the fully generated top cell.
+			if TerrainConfig.surface_modifier(x, z) != CellCodec.modifier(TerrainConfig.generated_cell(x, g, z)):
+				surf_ok = false
+			# (a') cap modifier: light query == modifier of the fully generated cell one above.
+			if TerrainConfig.surface_cap_modifier(x, z) != CellCodec.modifier(TerrainConfig.generated_cell(x, g + 1, z)):
+				cap_ok = false
+			# (b) above the cap the collider substitutes TreeGen.block_at + a sea test for
+			# generated_cell; that is sound only if every generated cell there is a full cube
+			# (modifier 0) AND, when solid, is a tree cell or sea fill.
+			for y in range(g + 2, g + TreeGen.MAX_ABOVE_SURFACE + 1):
+				var v: int = TerrainConfig.generated_cell(x, y, z)
+				if CellCodec.mat(v) == BlockCatalog.AIR:
+					continue
+				if CellCodec.modifier(v) != 0:
+					above_ok = false                         # no shaped generated cell above the cap
+				var is_tree: bool = TreeGen.block_at(x, y, z) != BlockCatalog.AIR
+				var is_sea: bool = y <= TerrainConfig.SEA_LEVEL
+				if not (is_tree or is_sea):
+					above_ok = false
+			checked += 1
+	_ok(checked > 0, "collider-cheap: swept %d columns around spawn" % checked)
+	_ok(surf_ok, "collider-cheap: surface_modifier(x,z) == modifier(generated_cell(x, h, z)) over the whole sweep")
+	_ok(cap_ok, "collider-cheap: surface_cap_modifier(x,z) == modifier(generated_cell(x, h+1, z)) over the whole sweep")
+	_ok(above_ok, "collider-cheap: above the cap, generated cells are only tree/sea (modifier 0) — cheap substitutes are sound")
+
+	# Cost proof: over the same region, time the OLD strategy (full generated_cell at the
+	# top + through the above-surface column) vs the NEW light strategy the collider now
+	# uses. The light path must be dramatically cheaper (this IS the freeze fix). Correctness
+	# above is the gate; this timing is a soft assert (light does strictly less work).
+	var reps := 3
+	var t0 := Time.get_ticks_usec()
+	for _r in range(reps):
+		for dz in range(-14, 15):
+			for dx in range(-14, 15):
+				var x := s.x + dx
+				var z := s.y + dz
+				var g: int = TerrainConfig.height_at(x, z)
+				var acc := 0
+				acc += CellCodec.modifier(TerrainConfig.generated_cell(x, g, z))   # old: top read
+				for y in range(g + 1, g + TreeGen.MAX_ABOVE_SURFACE + 1):
+					acc += CellCodec.mat(TerrainConfig.generated_cell(x, y, z))    # old: above-surface reads
+	var old_us := Time.get_ticks_usec() - t0
+	var t1 := Time.get_ticks_usec()
+	for _r in range(reps):
+		var hc := {}
+		for dz in range(-14, 15):
+			for dx in range(-14, 15):
+				var x := s.x + dx
+				var z := s.y + dz
+				var g: int = TerrainConfig.height_at(x, z)
+				var acc := 0
+				acc += TerrainConfig.surface_modifier(x, z, hc)                    # new: light top
+				for y in range(g + 1, g + TreeGen.MAX_ABOVE_SURFACE + 1):
+					if y == g + 1:
+						acc += TerrainConfig.surface_cap_modifier(x, z, hc)        # new: light cap
+					elif y <= TerrainConfig.SEA_LEVEL:
+						acc += 1
+					else:
+						acc += CellCodec.mat(TreeGen.block_at(x, y, z))            # new: cheap hash
+	var new_us := Time.get_ticks_usec() - t1
+	print("    per-cell region query cost (29x29, x%d): full-generated_cell=%d us  light=%d us  (%.1fx cheaper)"
+		% [reps, old_us, new_us, (float(old_us) / maxf(1.0, float(new_us)))])
+	_ok(new_us < old_us, "collider-cheap: light query strategy is cheaper than full generated_cell (%d us < %d us)" % [new_us, old_us])
+
+	# Cost proof #2 — a REAL GroundCollider rebuild (the actual freeze site): build a world,
+	# force the player far so the first update() triggers one full _rebuild, and time it.
+	# This is the honest absolute cost of the rebuild that used to stutter the main thread.
+	# Drive a GroundCollider directly (a bare WorldManager answers the cell queries from the
+	# generated terrain + empty overlay). Alternate the player between two far-apart columns
+	# so EVERY update() forces a fresh full 29x29 _rebuild (> REBUILD_DIST), and time the batch.
+	var cw := WorldManager.new()
+	cw.name = "ColliderPerfWorld"
+	get_root().add_child(cw)
+	var gc := GroundCollider.new()
+	get_root().add_child(gc)
+	gc.setup(cw)
+	var crid: RID = gc.get_rid()
+	var iters := 20
+	var rt0 := Time.get_ticks_usec()
+	for k in range(iters):
+		var off := 100.0 if (k % 2) == 0 else -100.0
+		gc.update(Vector3(float(s.x) + off, 40.0, float(s.y) + off))
+	var rebuild_us := (Time.get_ticks_usec() - rt0) / float(iters)
+	var nshapes := PhysicsServer3D.body_get_shape_count(crid)
+	print("    real GroundCollider._rebuild (29x29 columns): %.1f us/rebuild native (avg of %d, %d shapes)" % [rebuild_us, iters, nshapes])
+	_ok(nshapes > 0, "collider-cheap: real collider rebuild emitted shapes (%d)" % nshapes)
+	gc.queue_free()
+	cw.queue_free()
 
 # 3. Trees exist, are well formed and deterministic; species are biome-keyed and
 # a SPRUCE is found in taiga/snowy (WGC §6.7). Oak stays a valid tree.

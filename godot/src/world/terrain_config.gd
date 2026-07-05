@@ -286,14 +286,26 @@ static func _biome(c: float, t: float, h: float, g: int) -> int:
 	return B_PLAINS
 
 ## Biome enum at column (x, z). Public: TreeGen (species) and PerVoxelEnvironment
-## (surface temperature) key off it.
-static func biome_at(x: int, z: int) -> int:
-	return int(column_profile(x, z).y)
+## (surface temperature) key off it. `pcache` (optional) is the shared per-pass column
+## memo (see column_profile) so a hot caller — the collider, the module worker — resolves
+## the biome without re-running the climate noises.
+static func biome_at(x: int, z: int, pcache = null) -> int:
+	return int(column_profile(x, z, pcache).y)
 
 ## The per-column profile every downstream stage needs, as a VALUE-TYPE Vector4
 ## (no heap allocation, so it is cheap to cache per column in the module
 ## generator): (g = solid height, biome enum, c = continentalness, t = temperature).
-static func column_profile(x: int, z: int) -> Vector4:
+## `pcache` (optional): a per-pass memo (Dictionary Vector2i -> Vector4) owned by ONE
+## caller's stack frame (a module worker's _generate_block, a collider rebuild) — never
+## shared across threads. It only avoids RE-running the (continent/temperature/humidity +
+## height) noise stack for a column already resolved this pass; the returned value is
+## exactly the uncached column_profile, so worldgen output stays byte-identical and
+## deterministic. Non-null -> memoize; null -> compute directly (the analytic path).
+static func column_profile(x: int, z: int, pcache = null) -> Vector4:
+	if pcache != null:
+		var ck := Vector2i(x, z)
+		if pcache.has(ck):
+			return pcache[ck]
 	_ensure_noise()
 	var fx := float(x)
 	var fz := float(z)
@@ -301,7 +313,10 @@ static func column_profile(x: int, z: int) -> Vector4:
 	var t := _temperature.get_noise_2d(fx, fz)
 	var hh := _humidity.get_noise_2d(fx, fz)
 	var g := _height_c(c, fx, fz)
-	return Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+	var prof := Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+	if pcache != null:
+		pcache[Vector2i(x, z)] = prof
+	return prof
 
 # ------------------------------------------------------------------------------
 # The composed cell function (WGC §6.2). generated_cell derives the column
@@ -317,7 +332,7 @@ static func generated_cell(x: int, y: int, z: int) -> int:
 ## The per-cell pipeline given a column's precomputed profile scalars (g, biome,
 ## c, t). Returns the PACKED cell value (== bare material id today; sub-voxel adds
 ## modifiers later). This is the single hot function both render paths share.
-static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
+static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null) -> int:
 	if not _ids_ready:
 		_ensure_ids()
 	if y < WORLD_BOTTOM_Y:
@@ -330,13 +345,13 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		# step up into a continuous slope. Land only (g >= SEA_LEVEL) so a cap never
 		# displaces the sea fill. Returns AIR (falls through) when no cap grows here.
 		if y == g + 1 and g >= SEA_LEVEL:
-			var cap := _surface_cap(x, z, g, biome)
+			var cap := _surface_cap(x, z, g, biome, pcache)
 			if cap != BlockCatalog.AIR:
 				return cap
 		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
-		return TreeGen.block_at(x, y, z)
+		return TreeGen.block_at(x, y, z, pcache)
 	var id := _surface_rule(x, y, z, g, biome, c, t)
 	if id == BlockCatalog.STONE:
 		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
@@ -347,7 +362,7 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# untouched, so every material/stackup invariant holds; cells below the surface stay
 	# solid full cubes, so the analytic floor scan can never fall through.
 	if y == g and g >= SEA_LEVEL:
-		return _smoothed_surface(x, z, g, id)
+		return _smoothed_surface(x, z, g, id, pcache)
 	return id
 
 # ------------------------------------------------------------------------------
@@ -368,16 +383,31 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 ## (height_at + 1) of the four columns meeting at that corner (SVS §8.1). Local (a 3×3
 ## column-top stencil), crack-free (neighbouring cells share these corner targets so the
 ## composed surface is C0), and IDENTICAL for both generators (only height_at is read).
-static func _corner_targets(x: int, z: int) -> Vector4:
-	var t_nn := float(height_at(x - 1, z - 1) + 1)
-	var t_0n := float(height_at(x,     z - 1) + 1)
-	var t_pn := float(height_at(x + 1, z - 1) + 1)
-	var t_n0 := float(height_at(x - 1, z)     + 1)
-	var t_00 := float(height_at(x,     z)     + 1)
-	var t_p0 := float(height_at(x + 1, z)     + 1)
-	var t_np := float(height_at(x - 1, z + 1) + 1)
-	var t_0p := float(height_at(x,     z + 1) + 1)
-	var t_pp := float(height_at(x + 1, z + 1) + 1)
+## The column's SOLID surface height with the OPTIONAL per-pass memo (PERF). `pcache`, when
+## non-null, is the shared column_profile memo (see column_profile) — so the smoothing
+## corner-target stencil, which samples a 3x3 of column tops that overlaps its neighbours',
+## reuses each column top instead of re-noising it. Returns exactly height_at(x, z) either
+## way (int(column_profile.x) == height_at by construction), so worldgen output is unchanged.
+## `pcache == null` -> the cheap direct height_at (the analytic path — no profile allocation).
+static func _col_h(x: int, z: int, pcache) -> int:
+	if pcache == null:
+		return height_at(x, z)
+	return int(column_profile(x, z, pcache).x)
+
+## Public cache-aware column top for TreeGen (so its base-column height read shares the memo).
+static func column_top(x: int, z: int, pcache = null) -> int:
+	return _col_h(x, z, pcache)
+
+static func _corner_targets(x: int, z: int, pcache = null) -> Vector4:
+	var t_nn := float(_col_h(x - 1, z - 1, pcache) + 1)
+	var t_0n := float(_col_h(x,     z - 1, pcache) + 1)
+	var t_pn := float(_col_h(x + 1, z - 1, pcache) + 1)
+	var t_n0 := float(_col_h(x - 1, z,     pcache) + 1)
+	var t_00 := float(_col_h(x,     z,     pcache) + 1)
+	var t_p0 := float(_col_h(x + 1, z,     pcache) + 1)
+	var t_np := float(_col_h(x - 1, z + 1, pcache) + 1)
+	var t_0p := float(_col_h(x,     z + 1, pcache) + 1)
+	var t_pp := float(_col_h(x + 1, z + 1, pcache) + 1)
 	return Vector4(
 		(t_nn + t_0n + t_n0 + t_00) * 0.25,   # corner (x, z)
 		(t_0n + t_pn + t_00 + t_p0) * 0.25,   # corner (x+1, z)
@@ -404,10 +434,10 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 ## the smoothing modifier, or the plain material when flat OR under a tree base (a tree
 ## cell resting on the surface forces it FULL so trunks never float on a ramp corner —
 ## SVS §8.1 tree exception).
-static func _smoothed_surface(x: int, z: int, g: int, mat: int) -> int:
-	if TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR:
+static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -> int:
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return mat                                    # a tree cell rests here → keep FULL
-	var m := _modifier_from_targets(_corner_targets(x, z), g)
+	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g)
 	if m == 0:
 		return mat
 	return CellCodec.pack(mat, m)
@@ -416,13 +446,49 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int) -> int:
 ## ground, a >1-block cliff that saturates to a full block, or a tree cell owning the
 ## cell). The cap is the column's surface material, shaped by the SAME corner targets as
 ## the surface cell below it, so the two form one crack-free continuous slope.
-static func _surface_cap(x: int, z: int, g: int, biome: int) -> int:
-	if TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR:
+static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> int:
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
-	var m := _modifier_from_targets(_corner_targets(x, z), g + 1)
+	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
 	if m == 0:
 		return BlockCatalog.AIR                       # no lip (flat) or a full-block step (kept blocky)
 	return CellCodec.pack(_biome_top(biome, x, z), m)
+
+# ------------------------------------------------------------------------------
+# LIGHT collider queries (PERF, GroundCollider freeze fix). The ground collider needs,
+# per surface cell, ONLY the smoothing SHAPE (modifier) — never the material, ores,
+# strata, biome or deepslate gradient. These reproduce the smoothing modifier of the
+# top (and cap) cell WITHOUT running the ~12x-heavier generated_cell/resolve_cell
+# pipeline: they touch only height_at (via the shared corner-target stencil) and the
+# TreeGen overlay hash. By construction each equals CellCodec.modifier(generated_cell(...))
+# at that cell (proven in verify_feature._test_collider_cheap_queries), so collision
+# geometry stays byte-identical while a rebuild makes ZERO generated_cell calls.
+# `hcache` (optional) is the same per-pass height memo _corner_targets uses.
+
+## The smoothing MODIFIER of the SURFACE cell at (x, height_at(x,z), z). Equals
+## CellCodec.modifier(generated_cell(x, height_at(x,z), z)) — the exact shape _smoothed_surface
+## would emit for the top cell (0 == FULL cube: underwater floor, a tree-owned top, or flat/steep
+## ground; nonzero == a ramp/slab). No material/biome/strata/ore branches are evaluated.
+static func surface_modifier(x: int, z: int, pcache = null) -> int:
+	var g := _col_h(x, z, pcache)
+	if g < SEA_LEVEL:
+		return 0                                      # underwater floor is never smoothed (full cube)
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
+		return 0                                      # a tree cell rests on the top → kept FULL
+	return _modifier_from_targets(_corner_targets(x, z, pcache), g)
+
+## The smoothing MODIFIER of the CAP cell at (x, height_at(x,z)+1, z), or 0 when no cap
+## grows here (flat/steep, tree-owned, or underwater). Equals
+## CellCodec.modifier(generated_cell(x, height_at(x,z)+1, z)) — when nonzero the cap's material
+## is a non-air biome top, so the collider needs only this modifier (nonzero → shaped prism cell;
+## 0 → the cap cell is AIR/handed to the tree overlay).
+static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
+	var g := _col_h(x, z, pcache)
+	if g < SEA_LEVEL:
+		return 0
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
+		return 0
+	return _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
 
 ## The appearance manifest (RUNTIME-MATERIAL-STREAMING §6.5 / VOXEL-DATA-STRUCTURE
 ## §8.1/§8.3): the exact set of (surface material, modifier) pairs this smoothing

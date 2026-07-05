@@ -35,11 +35,15 @@ textures/vram_compression/import_etc2_astc=true
 ; godot_voxel (Zylann) VoxelEngine task-pool sizing. On the web/Emscripten build
 ; the pthread pool is FIXED and pre-allocated; VoxelEngine's default sizing
 ; (~ratio_over_max * CPU_count) spawns more threads than the pool has, exhausting
-; it -> meshing tasks deadlock -> blank world. Pin the pool to exactly 1 thread:
+; it -> meshing tasks deadlock -> blank world. So the count is a FIXED minimum
+; (ratio 0.0 -> deterministic + device-independent, never scaling with CPU), sized
+; to fit the pre-baked pool with headroom for the main + other engine threads:
 ;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
-;         = clamp(floor(0.0 * ...), 1, ...) = 1
-; The world is small and static, so one mesher thread fills it quickly.
-threads/count/minimum=1
+;         = clamp(floor(0.0 * ...), 3, ...) = 3
+; EXPERIMENT (fill-speed): 3 worker threads parallelise the deterministic, per-chunk
+; -independent worldgen+meshing (~3x throughput). If the pre-baked pthread pool is too
+; small this deadlocks -> blank world; revert minimum to 1 if so.
+threads/count/minimum=3
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +

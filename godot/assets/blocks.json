@@ -1,0 +1,2467 @@
+{
+  "$schema_note": "VOXIVERSE data-driven block catalog (WORLDGEN-CATALOG \u00a74). BlockCatalog.ensure_ready() loads this file into the runtime VoxelState array (record order IS the dense id; APPEND-ONLY). The frozen core consts (AIR..LEAF) are ASSERTED against ids 0-5 here; every non-override record's anchors are pinned by the verify drift gate to AnchorConverter.propose_anchors(priors, structural_class). swatch is [r,g,b,a] floats; render.cull_group maps 1:1 onto the blocky transparency_index. Optional has_block_entity (bool, default false) marks a material whose cells may carry per-cell metadata (VOXEL-DATA-STRUCTURE \u00a73.1); no shipped material declares it yet. Tiers: core (0-5, frozen), world (6-76, always loaded); extended streams later (WGC \u00a73.1).",
+  "version": 2,
+  "count": 77,
+  "blocks": [
+    {
+      "name": "air",
+      "id": 0,
+      "tier": "core",
+      "mass": 0.0,
+      "swatch": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "structural_class": "none",
+      "anchors": [
+        0,
+        0,
+        0
+      ],
+      "priors": {},
+      "solidity": 0.0,
+      "permeability": 1.0,
+      "translucence": 1.0
+    },
+    {
+      "name": "grass",
+      "id": 1,
+      "tier": "core",
+      "mass": 750.0,
+      "break_force": 800.0,
+      "swatch": [
+        0.3,
+        0.55,
+        0.24,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        4,
+        2,
+        1
+      ],
+      "priors": {
+        "analog": "sod/topsoil",
+        "cohesion": 30.0
+      },
+      "attachment": 1.0,
+      "solidity": 1.0,
+      "permeability": 0.2,
+      "translucence": 0.0
+    },
+    {
+      "name": "dirt",
+      "id": 2,
+      "tier": "core",
+      "mass": 900.0,
+      "break_force": 900.0,
+      "swatch": [
+        0.45,
+        0.31,
+        0.18,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        4,
+        2,
+        1
+      ],
+      "priors": {
+        "analog": "loam",
+        "cohesion": 25.0
+      },
+      "attachment": 1.0,
+      "solidity": 1.0,
+      "permeability": 0.2,
+      "translucence": 0.0
+    },
+    {
+      "name": "stone",
+      "id": 3,
+      "tier": "core",
+      "mass": 1500.0,
+      "break_force": 2500.0,
+      "swatch": [
+        0.52,
+        0.52,
+        0.55,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "generic competent rock",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "attachment": 1.0,
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0
+    },
+    {
+      "name": "wood",
+      "alias": "oak_log",
+      "id": 4,
+      "tier": "core",
+      "mass": 80.0,
+      "break_force": 600.0,
+      "swatch": [
+        0.62,
+        0.44,
+        0.26,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        36,
+        24,
+        16
+      ],
+      "priors": {
+        "analog": "oak, along grain",
+        "density": 700.0,
+        "C": 50.0,
+        "T": 90.0
+      },
+      "attachment": 1.0,
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0
+    },
+    {
+      "name": "leaf",
+      "alias": "oak_leaves",
+      "id": 5,
+      "tier": "core",
+      "mass": 100.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.13,
+        0.42,
+        0.12,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "attachment": 1.0,
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3
+    },
+    {
+      "name": "bedrock",
+      "id": 6,
+      "tier": "world",
+      "mass": 3000.0,
+      "swatch": [
+        0.337,
+        0.337,
+        0.337,
+        1.0
+      ],
+      "structural_class": "bedrock",
+      "anchors": [
+        0,
+        0,
+        0
+      ],
+      "priors": {},
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate",
+      "id": 7,
+      "tier": "world",
+      "mass": 1610.0,
+      "swatch": [
+        0.275,
+        0.275,
+        0.294,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "slate/gneiss",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 3390.0
+    },
+    {
+      "name": "granite",
+      "id": 8,
+      "tier": "world",
+      "mass": 1470.0,
+      "swatch": [
+        0.584,
+        0.404,
+        0.333,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        80,
+        5,
+        3
+      ],
+      "priors": {
+        "analog": "granite",
+        "density": 2650.0,
+        "C": 130.0,
+        "T": 8.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 3040.0
+    },
+    {
+      "name": "diorite",
+      "id": 9,
+      "tier": "world",
+      "mass": 1560.0,
+      "swatch": [
+        0.737,
+        0.737,
+        0.745,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        74,
+        5,
+        3
+      ],
+      "priors": {
+        "analog": "diorite",
+        "density": 2800.0,
+        "C": 120.0,
+        "T": 8.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 2870.0
+    },
+    {
+      "name": "andesite",
+      "id": 10,
+      "tier": "world",
+      "mass": 1530.0,
+      "swatch": [
+        0.502,
+        0.502,
+        0.522,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        74,
+        5,
+        3
+      ],
+      "priors": {
+        "analog": "andesite",
+        "density": 2750.0,
+        "C": 120.0,
+        "T": 8.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 2870.0
+    },
+    {
+      "name": "tuff",
+      "id": 11,
+      "tier": "world",
+      "mass": 890.0,
+      "swatch": [
+        0.427,
+        0.435,
+        0.408,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        24,
+        2,
+        1
+      ],
+      "priors": {
+        "analog": "volcanic tuff",
+        "density": 1600.0,
+        "C": 30.0,
+        "T": 2.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.1,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1010.0
+    },
+    {
+      "name": "calcite",
+      "id": 12,
+      "tier": "world",
+      "mass": 1510.0,
+      "swatch": [
+        0.875,
+        0.878,
+        0.863,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        36,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "calcite/marble",
+        "density": 2710.0,
+        "C": 50.0,
+        "T": 4.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1490.0
+    },
+    {
+      "name": "dripstone_block",
+      "id": 13,
+      "tier": "world",
+      "mass": 1330.0,
+      "swatch": [
+        0.49,
+        0.388,
+        0.325,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        42,
+        4,
+        3
+      ],
+      "priors": {
+        "analog": "limestone",
+        "density": 2400.0,
+        "C": 60.0,
+        "T": 5.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.1,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1700.0
+    },
+    {
+      "name": "sandstone",
+      "id": 14,
+      "tier": "world",
+      "mass": 1280.0,
+      "swatch": [
+        0.859,
+        0.812,
+        0.639,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        42,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "sandstone",
+        "density": 2300.0,
+        "C": 60.0,
+        "T": 4.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.1,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1700.0
+    },
+    {
+      "name": "red_sandstone",
+      "id": 15,
+      "tier": "world",
+      "mass": 1280.0,
+      "swatch": [
+        0.729,
+        0.388,
+        0.114,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        42,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "sandstone",
+        "density": 2300.0,
+        "C": 60.0,
+        "T": 4.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.1,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1700.0
+    },
+    {
+      "name": "sulfur_block",
+      "id": 16,
+      "tier": "world",
+      "mass": 1150.0,
+      "swatch": [
+        0.847,
+        0.788,
+        0.235,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        17,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "native sulfur",
+        "density": 2070.0,
+        "C": 20.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 750.0
+    },
+    {
+      "name": "cinnabar_block",
+      "id": 17,
+      "tier": "world",
+      "mass": 1670.0,
+      "swatch": [
+        0.561,
+        0.227,
+        0.196,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        48,
+        4,
+        3
+      ],
+      "priors": {
+        "analog": "cinnabar-bearing rock",
+        "density": 3000.0,
+        "C": 70.0,
+        "T": 5.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "break_force": 1910.0
+    },
+    {
+      "name": "coal_ore",
+      "id": 18,
+      "tier": "world",
+      "mass": 1450.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.333,
+        0.333,
+        0.353,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "copper_ore",
+      "id": 19,
+      "tier": "world",
+      "mass": 1550.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.541,
+        0.416,
+        0.306,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "iron_ore",
+      "id": 20,
+      "tier": "world",
+      "mass": 1700.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.561,
+        0.49,
+        0.451,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "gold_ore",
+      "id": 21,
+      "tier": "world",
+      "mass": 2000.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.588,
+        0.518,
+        0.247,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "redstone_ore",
+      "id": 22,
+      "tier": "world",
+      "mass": 1600.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.49,
+        0.29,
+        0.29,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "lapis_ore",
+      "id": 23,
+      "tier": "world",
+      "mass": 1650.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.29,
+        0.353,
+        0.502,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "diamond_ore",
+      "id": 24,
+      "tier": "world",
+      "mass": 1550.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.427,
+        0.612,
+        0.62,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "emerald_ore",
+      "id": 25,
+      "tier": "world",
+      "mass": 1600.0,
+      "break_force": 2750.0,
+      "swatch": [
+        0.365,
+        0.561,
+        0.408,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "stone host",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_coal_ore",
+      "id": 26,
+      "tier": "world",
+      "mass": 1560.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.22,
+        0.22,
+        0.235,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_copper_ore",
+      "id": 27,
+      "tier": "world",
+      "mass": 1660.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.373,
+        0.29,
+        0.22,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_iron_ore",
+      "id": 28,
+      "tier": "world",
+      "mass": 1810.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.388,
+        0.341,
+        0.314,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_gold_ore",
+      "id": 29,
+      "tier": "world",
+      "mass": 2110.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.416,
+        0.365,
+        0.18,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_redstone_ore",
+      "id": 30,
+      "tier": "world",
+      "mass": 1710.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.341,
+        0.204,
+        0.204,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_lapis_ore",
+      "id": 31,
+      "tier": "world",
+      "mass": 1760.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.204,
+        0.247,
+        0.353,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_diamond_ore",
+      "id": 32,
+      "tier": "world",
+      "mass": 1660.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.298,
+        0.427,
+        0.435,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "deepslate_emerald_ore",
+      "id": 33,
+      "tier": "world",
+      "mass": 1710.0,
+      "break_force": 3730.0,
+      "swatch": [
+        0.255,
+        0.388,
+        0.282,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "deepslate host",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "coarse_dirt",
+      "id": 34,
+      "tier": "world",
+      "mass": 900.0,
+      "break_force": 850.0,
+      "swatch": [
+        0.416,
+        0.298,
+        0.2,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        4,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "dry loam",
+        "cohesion": 20.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.25,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "podzol",
+      "id": 35,
+      "tier": "world",
+      "mass": 850.0,
+      "break_force": 820.0,
+      "swatch": [
+        0.478,
+        0.329,
+        0.188,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        4,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "dry loam",
+        "cohesion": 20.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.2,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "mycelium",
+      "id": 36,
+      "tier": "world",
+      "mass": 800.0,
+      "break_force": 820.0,
+      "swatch": [
+        0.435,
+        0.384,
+        0.396,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        4,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "dry loam",
+        "cohesion": 20.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.2,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "mud",
+      "id": 37,
+      "tier": "world",
+      "mass": 1000.0,
+      "break_force": 500.0,
+      "swatch": [
+        0.235,
+        0.227,
+        0.239,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        3,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "saturated clay-silt",
+        "cohesion": 10.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.1,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "clay",
+      "id": 38,
+      "tier": "world",
+      "mass": 970.0,
+      "break_force": 1000.0,
+      "swatch": [
+        0.604,
+        0.639,
+        0.702,
+        1.0
+      ],
+      "structural_class": "soil",
+      "anchors": [
+        8,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "stiff clay",
+        "cohesion": 100.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.02,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "sand",
+      "id": 39,
+      "tier": "world",
+      "mass": 890.0,
+      "break_force": 400.0,
+      "swatch": [
+        0.859,
+        0.827,
+        0.627,
+        1.0
+      ],
+      "structural_class": "granular",
+      "anchors": [
+        3,
+        1,
+        0
+      ],
+      "priors": {
+        "analog": "dry sand, cohesionless",
+        "cohesion": 0.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.35,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "attachment": 0.0
+    },
+    {
+      "name": "red_sand",
+      "id": 40,
+      "tier": "world",
+      "mass": 890.0,
+      "break_force": 400.0,
+      "swatch": [
+        0.745,
+        0.404,
+        0.129,
+        1.0
+      ],
+      "structural_class": "granular",
+      "anchors": [
+        3,
+        1,
+        0
+      ],
+      "priors": {
+        "analog": "dry sand, cohesionless",
+        "cohesion": 0.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.35,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "attachment": 0.0
+    },
+    {
+      "name": "gravel",
+      "id": 41,
+      "tier": "world",
+      "mass": 945.0,
+      "break_force": 500.0,
+      "swatch": [
+        0.514,
+        0.498,
+        0.494,
+        1.0
+      ],
+      "structural_class": "granular",
+      "anchors": [
+        3,
+        1,
+        0
+      ],
+      "priors": {
+        "analog": "loose gravel, cohesionless",
+        "cohesion": 2.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.4,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "attachment": 0.0
+    },
+    {
+      "name": "snow_block",
+      "id": 42,
+      "tier": "world",
+      "mass": 280.0,
+      "break_force": 250.0,
+      "swatch": [
+        0.957,
+        0.992,
+        0.992,
+        1.0
+      ],
+      "structural_class": "soft",
+      "anchors": [
+        3,
+        2,
+        1
+      ],
+      "anchors_override": true,
+      "priors": {
+        "analog": "compacted snow",
+        "density": 500.0,
+        "C": 1.0,
+        "T": 0.1
+      },
+      "solidity": 1.0,
+      "permeability": 0.5,
+      "translucence": 0.1,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "moss_block",
+      "id": 43,
+      "tier": "world",
+      "mass": 180.0,
+      "break_force": 200.0,
+      "swatch": [
+        0.349,
+        0.455,
+        0.173,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "moss mat"
+      },
+      "solidity": 1.0,
+      "permeability": 0.6,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "water",
+      "id": 44,
+      "tier": "world",
+      "mass": 560.0,
+      "swatch": [
+        0.247,
+        0.463,
+        0.894,
+        0.65
+      ],
+      "structural_class": "fluid",
+      "anchors": [
+        0,
+        0,
+        0
+      ],
+      "priors": {
+        "analog": "water (fluid)",
+        "density": 1000.0
+      },
+      "solidity": 0.0,
+      "permeability": 1.0,
+      "translucence": 0.6,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.65,
+        "cull_group": 1,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "lava",
+      "id": 45,
+      "tier": "world",
+      "mass": 1540.0,
+      "swatch": [
+        0.831,
+        0.353,
+        0.071,
+        1.0
+      ],
+      "structural_class": "fluid",
+      "anchors": [
+        0,
+        0,
+        0
+      ],
+      "priors": {
+        "analog": "molten basalt (fluid)",
+        "density": 2770.0
+      },
+      "solidity": 0.0,
+      "permeability": 0.3,
+      "translucence": 0.0,
+      "render": {
+        "mode": "emissive",
+        "cull_group": 0,
+        "emissive": 1.0
+      }
+    },
+    {
+      "name": "ice",
+      "id": 46,
+      "tier": "world",
+      "mass": 510.0,
+      "break_force": 380.0,
+      "swatch": [
+        0.49,
+        0.678,
+        1.0,
+        0.84
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        3,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "lake ice",
+        "density": 917.0,
+        "C": 8.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.7,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.84,
+        "cull_group": 2,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "packed_ice",
+      "id": 47,
+      "tier": "world",
+      "mass": 520.0,
+      "break_force": 440.0,
+      "swatch": [
+        0.541,
+        0.71,
+        0.992,
+        1.0
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        3,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "glacial ice",
+        "density": 920.0,
+        "C": 10.0,
+        "T": 3.5
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "blue_ice",
+      "id": 48,
+      "tier": "world",
+      "mass": 530.0,
+      "break_force": 510.0,
+      "swatch": [
+        0.455,
+        0.659,
+        0.992,
+        1.0
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "dense glacial ice",
+        "density": 921.0,
+        "C": 12.0,
+        "T": 4.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.2,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "powder_snow",
+      "id": 49,
+      "tier": "world",
+      "mass": 110.0,
+      "break_force": 30.0,
+      "swatch": [
+        0.973,
+        0.992,
+        0.992,
+        1.0
+      ],
+      "structural_class": "non-solid",
+      "anchors": [
+        0,
+        0,
+        0
+      ],
+      "anchors_override": true,
+      "priors": {
+        "analog": "fresh powder"
+      },
+      "solidity": 0.15,
+      "permeability": 0.8,
+      "translucence": 0.2,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "spruce_log",
+      "id": 50,
+      "tier": "world",
+      "mass": 50.0,
+      "break_force": 510.0,
+      "swatch": [
+        0.29,
+        0.208,
+        0.125,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        30,
+        21,
+        14
+      ],
+      "priors": {
+        "analog": "spruce log, along grain",
+        "C": 40.0,
+        "T": 72.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "spruce_leaves",
+      "id": 51,
+      "tier": "world",
+      "mass": 100.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.251,
+        0.341,
+        0.235,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "birch_log",
+      "id": 52,
+      "tier": "world",
+      "mass": 70.0,
+      "break_force": 555.0,
+      "swatch": [
+        0.784,
+        0.753,
+        0.659,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        33,
+        22,
+        15
+      ],
+      "priors": {
+        "analog": "birch log, along grain",
+        "C": 45.0,
+        "T": 81.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "birch_leaves",
+      "id": 53,
+      "tier": "world",
+      "mass": 100.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.502,
+        0.655,
+        0.333,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "jungle_log",
+      "id": 54,
+      "tier": "world",
+      "mass": 75.0,
+      "break_force": 620.0,
+      "swatch": [
+        0.341,
+        0.267,
+        0.153,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        37,
+        25,
+        16
+      ],
+      "priors": {
+        "analog": "jungle log, along grain",
+        "C": 52.0,
+        "T": 94.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "jungle_leaves",
+      "id": 55,
+      "tier": "world",
+      "mass": 100.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.282,
+        0.58,
+        0.122,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "acacia_log",
+      "id": 56,
+      "tier": "world",
+      "mass": 95.0,
+      "break_force": 690.0,
+      "swatch": [
+        0.427,
+        0.396,
+        0.361,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        42,
+        27,
+        18
+      ],
+      "priors": {
+        "analog": "acacia log, along grain",
+        "C": 60.0,
+        "T": 108.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "acacia_leaves",
+      "id": 57,
+      "tier": "world",
+      "mass": 105.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.404,
+        0.604,
+        0.18,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "dark_oak_log",
+      "id": 58,
+      "tier": "world",
+      "mass": 90.0,
+      "break_force": 670.0,
+      "swatch": [
+        0.247,
+        0.176,
+        0.09,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        41,
+        26,
+        18
+      ],
+      "priors": {
+        "analog": "dark_oak log, along grain",
+        "C": 58.0,
+        "T": 104.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "dark_oak_leaves",
+      "id": 59,
+      "tier": "world",
+      "mass": 100.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.173,
+        0.369,
+        0.071,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "cherry_log",
+      "id": 60,
+      "tier": "world",
+      "mass": 65.0,
+      "break_force": 555.0,
+      "swatch": [
+        0.333,
+        0.157,
+        0.243,
+        1.0
+      ],
+      "structural_class": "timber",
+      "anchors": [
+        33,
+        22,
+        15
+      ],
+      "priors": {
+        "analog": "cherry log, along grain",
+        "C": 45.0,
+        "T": 81.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "cherry_leaves",
+      "id": 61,
+      "tier": "world",
+      "mass": 95.0,
+      "break_force": 100.0,
+      "swatch": [
+        0.941,
+        0.706,
+        0.804,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "foliage"
+      },
+      "solidity": 1.0,
+      "permeability": 0.9,
+      "translucence": 0.3,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "glass",
+      "id": 62,
+      "tier": "world",
+      "mass": 1390.0,
+      "break_force": 1490.0,
+      "swatch": [
+        1.0,
+        1.0,
+        1.0,
+        0.3
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        12,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "soda-lime glass",
+        "density": 2500.0,
+        "C": 50.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.95,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.3,
+        "cull_group": 3,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "tinted_glass",
+      "id": 63,
+      "tier": "world",
+      "mass": 1450.0,
+      "break_force": 1600.0,
+      "swatch": [
+        0.169,
+        0.149,
+        0.2,
+        0.85
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        13,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "laminated glass",
+        "density": 2600.0,
+        "C": 55.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.85,
+        "cull_group": 4,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "white_stained_glass",
+      "id": 64,
+      "tier": "world",
+      "mass": 1390.0,
+      "break_force": 1490.0,
+      "swatch": [
+        1.0,
+        1.0,
+        1.0,
+        0.55
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        12,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "soda-lime glass",
+        "density": 2500.0,
+        "C": 50.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.5,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.55,
+        "cull_group": 5,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "red_stained_glass",
+      "id": 65,
+      "tier": "world",
+      "mass": 1390.0,
+      "break_force": 1490.0,
+      "swatch": [
+        0.69,
+        0.18,
+        0.149,
+        0.55
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        12,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "soda-lime glass",
+        "density": 2500.0,
+        "C": 50.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.5,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.55,
+        "cull_group": 6,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "blue_stained_glass",
+      "id": 66,
+      "tier": "world",
+      "mass": 1390.0,
+      "break_force": 1490.0,
+      "swatch": [
+        0.235,
+        0.267,
+        0.667,
+        0.55
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        12,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "soda-lime glass",
+        "density": 2500.0,
+        "C": 50.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.5,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.55,
+        "cull_group": 7,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "green_stained_glass",
+      "id": 67,
+      "tier": "world",
+      "mass": 1390.0,
+      "break_force": 1490.0,
+      "swatch": [
+        0.369,
+        0.486,
+        0.086,
+        0.55
+      ],
+      "structural_class": "brittle",
+      "anchors": [
+        12,
+        1,
+        1
+      ],
+      "priors": {
+        "analog": "soda-lime glass",
+        "density": 2500.0,
+        "C": 50.0,
+        "T": 1.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.5,
+      "render": {
+        "mode": "translucent",
+        "alpha": 0.55,
+        "cull_group": 8,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "terracotta",
+      "id": 68,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.596,
+        0.373,
+        0.271,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "white_terracotta",
+      "id": 69,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.824,
+        0.698,
+        0.631,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "orange_terracotta",
+      "id": 70,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.635,
+        0.329,
+        0.149,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "yellow_terracotta",
+      "id": 71,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.729,
+        0.522,
+        0.137,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "brown_terracotta",
+      "id": 72,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.302,
+        0.2,
+        0.141,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "red_terracotta",
+      "id": 73,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.561,
+        0.239,
+        0.184,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "light_gray_terracotta",
+      "id": 74,
+      "tier": "world",
+      "mass": 1110.0,
+      "break_force": 890.0,
+      "swatch": [
+        0.529,
+        0.42,
+        0.384,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        20,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "fired clay",
+        "density": 2000.0,
+        "C": 25.0,
+        "T": 3.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "obsidian",
+      "id": 75,
+      "tier": "world",
+      "mass": 1330.0,
+      "break_force": 5700.0,
+      "swatch": [
+        0.063,
+        0.043,
+        0.098,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        159,
+        4,
+        3
+      ],
+      "priors": {
+        "analog": "dense volcanic glass",
+        "density": 2400.0,
+        "C": 300.0,
+        "T": 5.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "amethyst_block",
+      "id": 76,
+      "tier": "world",
+      "mass": 1470.0,
+      "break_force": 2110.0,
+      "swatch": [
+        0.525,
+        0.384,
+        0.749,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        53,
+        4,
+        3
+      ],
+      "priors": {
+        "analog": "quartz aggregate",
+        "density": 2650.0,
+        "C": 80.0,
+        "T": 5.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    }
+  ]
+}

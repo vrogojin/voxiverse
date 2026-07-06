@@ -12,7 +12,7 @@ config/name="VOXIVERSE"
 config/description="Voxel immersive simulation engine — grass test environment."
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.4", "GL Compatibility")
-config/icon="res://assets/textures/grass.png"
+config/icon="res://assets/textures/pack/grass.png"
 
 [display]
 
@@ -30,16 +30,43 @@ renderer/rendering_method.mobile="gl_compatibility"
 lights_and_shadows/use_physical_light_units=false
 textures/vram_compression/import_etc2_astc=true
 
+[physics]
+
+; Web / low-FPS SAFETY CAP on physics sub-step catch-up (the "breaking must never tank the
+; frame" rule). At the engine default of 8, a single slow RENDER frame (a godot_voxel mesh
+; upload spike, a GL-compat pipeline compile) lets the physics server run up to 8 sub-steps
+; THAT frame to catch back up to real time — each sub-step re-solving every falling VoxelBody
+; against the ~1300-box ground collider. So one render hitch is MULTIPLIED into a physics
+; stall, which drops the next frame, which needs even more catch-up: the spiral that pinned us
+; at 7-30 fps whenever a tree was falling. Capped at 2, a render spike costs at most 2 physics
+; sub-steps; under sustained low FPS the loose debris simply falls in slight slow-motion
+; (game-time dilation) instead of freezing the whole game. A voxel sandbox tolerates a block
+; settling a hair slower far better than a 9 fps freeze — the settle logic is time-based, not
+; frame-based, so behaviour is unchanged, only its worst-case per-frame cost is bounded.
+common/max_physics_steps_per_frame=2
+
 [voxel]
 
 ; godot_voxel (Zylann) VoxelEngine task-pool sizing. On the web/Emscripten build
 ; the pthread pool is FIXED and pre-allocated; VoxelEngine's default sizing
 ; (~ratio_over_max * CPU_count) spawns more threads than the pool has, exhausting
-; it -> meshing tasks deadlock -> blank world. Pin the pool to exactly 1 thread:
+; it -> meshing tasks deadlock -> blank world. So the count is a FIXED minimum
+; (ratio 0.0 -> deterministic + device-independent, never scaling with CPU), sized
+; to fit the pre-baked pool with headroom for the main + other engine threads:
 ;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
-;         = clamp(floor(0.0 * ...), 1, ...) = 1
-; The world is small and static, so one mesher thread fills it quickly.
-threads/count/minimum=1
+;         = clamp(floor(0.0 * ...), 2, ...) = 2
+; Fill-speed vs smoothness balance: worldgen is deterministic + per-chunk independent,
+; so worker threads parallelise it safely. 3 threads generate fast but FLOOD the single
+; main-thread mesh-apply (GPU upload must be main-thread) and oversubscribe low-core
+; laptops -> stutter. 2 keeps ~2x throughput without overrunning the consumer. The
+; pre-baked pthread pool proven to hold >=3 (3 loaded without deadlock).
+threads/count/minimum=2
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
-threads/main/time_budget_ms=12
+; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
+; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input
+; while streaming, so movement stutters. 4 ms (~24% of a frame) keeps the user loop
+; responsive; finished meshes just apply over a few more frames (fill LOOKS marginally
+; slower, FPS stays smooth — the explicit priority). Not lower: 3 ms noticeably slows
+; the visible fill for little extra smoothness headroom; 4 is the balance point.
+threads/main/time_budget_ms=4

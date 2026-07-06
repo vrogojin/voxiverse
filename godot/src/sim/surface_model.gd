@@ -33,7 +33,7 @@ static func ensure_ready() -> void:
 	# break→inventory loop works — the catalog sets a finite break_force.
 	var grass: VoxelState = BlockCatalog.state_of(BlockCatalog.GRASS)
 	grass.albedo = 0.25
-	grass.texture = load(GrassMaterial.TEXTURE_PATH) as Texture2D
+	grass.texture = BlockTextures.texture_for(BlockCatalog.GRASS)
 
 	var mat := VoxelMaterialDef.new()
 	mat.id = &"surface"

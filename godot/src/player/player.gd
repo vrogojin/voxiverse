@@ -40,10 +40,16 @@ const PLAYER_WEIGHT := 700.0              # N (~70 kg) pressed down onto a piece
 var world: WorldManager                   # injected by Main before _ready
 var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
 var flying := false
+## Input gate. While true the player cannot move, look, break or place — Main holds
+## this during the load-time shader pre-warm (RENDER-STREAMING-SPIKES) so the hidden
+## warm-up pile in front of the camera is never disturbed, then clears it when the
+## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
+var frozen := false
 
 var _camera: Camera3D
 var _ray: RayCast3D
 var _capsule: CapsuleShape3D
+var _body_shape: CollisionShape3D        # the player's capsule collider (disabled while flying)
 var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
@@ -73,10 +79,10 @@ func _ready() -> void:
 	_capsule = CapsuleShape3D.new()
 	_capsule.height = 1.8
 	_capsule.radius = 0.4
-	var shape := CollisionShape3D.new()
-	shape.shape = _capsule
-	shape.position = Vector3(0, 0.9, 0)
-	add_child(shape)
+	_body_shape = CollisionShape3D.new()
+	_body_shape.shape = _capsule
+	_body_shape.position = Vector3(0, 0.9, 0)
+	add_child(_body_shape)
 	# Player on layer 4; collide only with the wooden blocks (layer 2).
 	collision_layer = 1 << 2
 	collision_mask = WOOD_LAYER_MASK
@@ -103,7 +109,14 @@ func _capture_mouse() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
+## The camera's world transform — the ShaderPrewarm places its hidden warm-up pile in
+## front of it. Falls back to the player transform before the camera rig is built.
+func camera_global_transform() -> Transform3D:
+	return _camera.global_transform if _camera != null else global_transform
+
 func _unhandled_input(event: InputEvent) -> void:
+	if frozen:
+		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		rotate_y(-event.relative.x * mouse_sensitivity)
 		_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
@@ -136,9 +149,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_F:
 				flying = not flying
 				velocity = Vector3.ZERO
+				# Fly is a GUARANTEED escape hatch: while airborne the capsule is
+				# disabled so no loose body can collide with (and therefore shove or
+				# wedge) the player. Re-enabled on landing. See _move_horizontal.
+				if _body_shape != null:
+					_body_shape.disabled = flying
 
 func _physics_process(delta: float) -> void:
-	if world == null:
+	if frozen or world == null:
 		return
 	_move(delta)
 	world.update_streaming(global_position)
@@ -200,7 +218,14 @@ func _move(delta: float) -> void:
 	# block us, but _push_bodies shoves them aside so we advance). One slide pass lets
 	# us glide along a wood wall instead of sticking to it. The player's collision_mask
 	# is wood-only, so terrain is unaffected (handled by the analytic test above).
-	_move_horizontal(delta_move)
+	#
+	# Only call move_and_collide when there is real motion to apply. move_and_collide
+	# performs depenetration recovery even for a ZERO move, so calling it while the
+	# analytic test has fully blocked us (delta_move == 0) would let a loose body that
+	# has drifted into the capsule shove us — the seed of the rubber-band trap. When
+	# terrain blocks us we simply stay put.
+	if delta_move.length_squared() > 0.0:
+		_move_horizontal(delta_move, wish)
 
 	# Analytic gravity + floor. floor_under() scans down from the feet, so we can
 	# descend into pits/shafts and enter tunnels we've dug instead of being snapped
@@ -248,11 +273,31 @@ func _move(delta: float) -> void:
 ## solid obstacles. Uses move_and_collide (not move_and_slide) to keep the vertical
 ## axis fully analytic (floor_under handles descent/tunnels, which the terrain has
 ## no collider for).
-func _move_horizontal(motion: Vector3) -> void:
+##
+## RUBBER-BAND TRAP GUARANTEE (must hold at ANY frame rate): move_and_collide performs
+## depenetration recovery when the capsule starts a move already overlapping a body. A
+## loose VoxelBody the player is pushing drifts into the capsule between ticks — more so
+## at low FPS, where the rigid body gets several physics sub-steps per rendered frame —
+## so that recovery can eject the player BACKWARD. Holding the key then drives the player
+## straight back in, producing an infinite forward/back rubber-band. To make that
+## impossible: horizontal motion may advance, slide, or STOP, but it may never net-oppose
+## the movement intent `wish`. If the resolved displacement points against `wish`, we
+## revert to where this tick began — the worst case is a clean stop, never a shove.
+func _move_horizontal(motion: Vector3, wish: Vector3) -> void:
+	var start := global_position
 	var coll := move_and_collide(motion)
 	if coll != null:
 		var slide := coll.get_remainder().slide(coll.get_normal())
 		move_and_collide(slide)
+	if wish.length_squared() > 0.0:
+		var moved := global_position - start
+		moved.y = 0.0
+		# A pure sideways slide has a ~0 along-wish component (kept); only a clearly
+		# backward net displacement is a rubber-band eject, which we undo. The epsilon
+		# tolerates float noise and legitimate corner slides.
+		if moved.dot(wish) < -0.001:
+			global_position.x = start.x
+			global_position.z = start.z
 
 ## Resolve the exact block the player is pointing at within break_reach, using the
 ## SAME "nearest of (physics-ray-hits-wood, analytic-DDA-hits-terrain)" contest

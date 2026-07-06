@@ -12,6 +12,13 @@ extends Node3D
 
 signal path_selected(using_module: bool)
 
+## Emitted when a cell's per-cell METADATA is DROPPED by a material change or break
+## (VOXEL-DATA-STRUCTURE §14 P1 / §11): `_write_cell` settles the orphaned document
+## through this signal so a future system (e.g. spilling a chest's contents as
+## pickups) can react. No consumer is required today. Never fired by `set_state`
+## (the one write that PRESERVES metadata) or by `set_metadata` (an explicit update).
+signal block_entity_orphaned(cell: Vector3i, old_meta: Dictionary)
+
 var environment: PerVoxelEnvironment
 var materials: MaterialRegistry
 var using_module: bool = false
@@ -22,12 +29,36 @@ var _ground: GroundCollider           # local blocky physics collider
 
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
-# dictionary replaces the old `_removed` set: 0 = dug to air, >0 = player-placed
-# block id. `block_id_at(cell)` = edits-overlay-else-generated is THE cell query.
-var _edits: Dictionary = {}           # Vector3i -> int block_id (0 = air, >0 = placed)
+# dictionary replaces the old `_removed` set: 0 = dug to air, >0 = solid cell.
+# Values are PACKED cell values (CellCodec: material | modifier<<16 | state<<32);
+# a bare block id is a valid packed value meaning "full cube, state 0", so every
+# value stored today is already canonical and no migration is needed. 0 stays
+# "dug to air". `cell_value_at(cell)` = edits-overlay-else-generated is THE cell
+# query; `block_id_at` is its material projection.
+var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = air)
+# Per-column edit INDEX (PERF, GroundCollider fast path): the set of columns Vector2i(x, z)
+# that have ANY overlay entry (dug or placed). Edits never leave `_edits` (a dug cell stays
+# as value 0), so this only grows — maintained in the single write choke point. The collider
+# skips its per-cell overlay scan on columns absent here (their overlay is empty), collapsing
+# the region's ~30k Vector3i lookups to the handful of genuinely-edited columns.
+var _edit_columns: Dictionary = {}    # Vector2i(x, z) -> true
+# Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
+# ONLY the rare cells that carry a block-entity document (container inventory, sign
+# text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
+# it is settled by the same write choke point and NEVER queried for "what's solid".
+# The zero-cost-default guarantee: a metadata-free world keeps this EMPTY (O(1), zero
+# per-cell cost), and `_write_cell` skips it entirely while it is empty. Main-thread,
+# lifecycle-locked: only set_metadata (write) / break/place/collapse (settle) touch it.
+var _meta: Dictionary = {}            # Vector3i -> Dictionary (JSON-subset document)
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
+# Sparse per-joint reinforcement (glue/weld/cement; STRUCTURAL-INTEGRITY §4.2/§7):
+# canonical key Vector4i(min_cell.x, .y, .z, axis) -> reinforcement id. Lives
+# OUTSIDE the four cell axes (it is per-FACE, not per-cell). The structural solver
+# reads it via `joint_mod`; breaking a block leaves stale entries harmless (a joint
+# with a missing cell is never queried).
+var _joint_mods: Dictionary = {}      # Vector4i -> int reinforcement id
 
 func _ready() -> void:
 	environment = PerVoxelEnvironment.new()
@@ -84,20 +115,57 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _ground != null:
 		_ground.update(player_pos)
 
+## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
+## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the
+## overlay. On the MODULE path it asks godot_voxel (is_area_meshed) over a near box; on the FALLBACK
+## path it returns true immediately (the fallback chunk format is already warmed by the prewarm grid,
+## so no extra hold is needed). Half-extents cover the near, always-first-to-mesh view.
+func initial_view_meshed(center: Vector3) -> bool:
+	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
+		return bool(_module_world.call("area_meshed", center, Vector3(40.0, 32.0, 40.0)))
+	return true                                     # fallback path / no module → no terrain-format hold
+
 # --- terrain editing (block breaking + placing) --------------------------------
 
-## Universal composed cell query: edit overlay first, else generated terrain+trees.
-## THE cell query — floor/blocked/DDA/collider/collapse all go through it, so the
-## edit overlay, the layered terrain and the trees always agree.
-func block_id_at(cell: Vector3i) -> int:
+## THE composed cell query (VOXEL-DATA-STRUCTURE §7.1): edit overlay first, else
+## generated terrain+trees. Returns the full PACKED cell value (material |
+## modifier<<16 | state<<32); material/modifier/state are bit-projections of this
+## one int, so they cannot desync. There is no second lookup that could disagree.
+func cell_value_at(cell: Vector3i) -> int:
 	var e: int = _edits.get(cell, -1)
 	if e >= 0:
-		return e
-	return TerrainConfig.generated_block(cell.x, cell.y, cell.z)
+		return e                                    # overlay (already canonical)
+	return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
 
-## Composed solidity (public now; the old private _cell_solid delegates to it).
+## Material id at `cell` — the material projection of the composed query. UNCHANGED
+## contract: every existing call site (floor, blocked, DDA, collider, collapse,
+## both meshers, catalog/sim checks) sees the exact same 0..COUNT-1 id it always
+## did, because a bare id is a canonical packed value. THE cell query for gameplay.
+func block_id_at(cell: Vector3i) -> int:
+	return CellCodec.mat(cell_value_at(cell))
+
+## Composed solidity — the MATERIAL half of the merged analytic-physics contract
+## (INTEGRATION-DECISIONS §3): a cell is solid iff its material passes the solidity
+## gate (`solidity_of(mat) >= 0.5`). Resolves the packed value ONCE, then gates on
+## the material only — a shaped (ramp) cell IS solid; where inside the cell it
+## collides is expressed by the interval functions (`_occ_span`), never by this
+## boolean. Byte-identical to the old `!= AIR` test for the current world (AIR → 0.0,
+## every core material → 1.0). `_cell_solid`/`is_solid` are aliases of this.
 func cell_solid(cell: Vector3i) -> bool:
-	return block_id_at(cell) != BlockCatalog.AIR
+	return BlockCatalog.solidity_of(CellCodec.mat(cell_value_at(cell))) >= 0.5
+
+## THE occupancy-composition helper (INTEGRATION-DECISIONS §3): material solidity
+## GATES, modifier SHAPES. Returns the filled vertical interval (lo, hi) of packed
+## cell value `v` at footprint (fx, fz); `Vector2.ZERO` = no occupancy (air / water /
+## lava / powder_snow via the material gate, or a shape empty at this footprint).
+## The four analytic queries and the collider all compose against this ONE helper,
+## so the material gate and the shape test can never disagree. Full-cube today →
+## (0, 1) for every solid cell, so callers reduce branch-for-branch to today's code
+## (one extra solidity read); P5's ShapeCodec fills the sub-cube intervals.
+func _occ_span(v: int, fx: float, fz: float) -> Vector2:
+	if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5:   # 1) MATERIAL GATE
+		return Vector2.ZERO
+	return ShapeCodec.span(CellCodec.modifier(v), fx, fz)  # 2) SHAPE (modifier 0 -> (0,1))
 
 ## True if the cell was dug out (edit overlay says air). Used by fast column loops
 ## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
@@ -110,10 +178,122 @@ func is_removed(cell: Vector3i) -> bool:
 func placed_top(x: int, z: int) -> int:
 	return _placed_top.get(Vector2i(x, z), -0x40000000)
 
-## Read-only view of the edit overlay (Vector3i -> int block_id; 0 = dug air,
-## >0 = placed). The fallback mesher reads placed (id > 0) cells from it.
+## Read-only view of the edit overlay (Vector3i -> int PACKED cell value; 0 = dug
+## air, >0 = solid). The fallback mesher reads placed (value > 0) cells from it and
+## MUST project the material via CellCodec.mat (a bare id is a plain packed value,
+## so it is identical today) rather than treating the raw value as a block id.
 func placed_cells() -> Dictionary:
 	return _edits
+
+## True if column (x, z) has ANY overlay edit (dug or placed) — the collider's fast-path gate
+## (PERF): an unedited column's overlay is empty, so the collider skips its per-cell scan there.
+func is_edited_column(x: int, z: int) -> bool:
+	return _edit_columns.has(Vector2i(x, z))
+
+# --- loose-body gate (PERF, GroundCollider exploration-jerkiness fix) ----------
+# The ground collider exists ONLY to catch loose VoxelBodies; the player moves analytically and
+# never touches it. So the collider is gated on whether any loose body is present/near — with none,
+# it does zero rebuild work. Every loose VoxelBody is a DIRECT child of this WorldManager (both
+# spawn paths — spawn_loose(self, …) and VoxelBody._spawn_detached via get_parent()), so the set is
+# just the VoxelBody children; deriving it on demand (no signal/_ready dependency) is robust in the
+# game AND the headless verify (where _ready is deferred). The set is tiny (typically 0–a few), so
+# the per-frame scan is negligible.
+
+## Metres around a terrain/body edit within which dormant debris is woken (dormant-by-default
+## reactivation). Generous enough to catch a local debris pile so a whole small stack reactivates
+## together; a rare taller stack self-heals on the next nearby edit.
+const _WAKE_RADIUS := 6.0
+
+## Number of active loose VoxelBodies (debris) in the world.
+func active_body_count() -> int:
+	var n := 0
+	for c in get_children():
+		if c is VoxelBody:
+			n += 1
+	return n
+
+## True iff any loose VoxelBody exists at all (dormant or awake).
+func has_active_bodies() -> bool:
+	for c in get_children():
+		if c is VoxelBody:
+			return true
+	return false
+
+## Number of AWAKE (simulating) loose bodies — dormant (frozen / sleeping) debris is excluded.
+func awake_body_count() -> int:
+	var n := 0
+	for c in get_children():
+		if c is VoxelBody and (c as VoxelBody).is_awake():
+			n += 1
+	return n
+
+## True iff an AWAKE loose VoxelBody is within `radius` columns (Chebyshev, horizontal) of `center`.
+## THE collider gate (DORMANT-BY-DEFAULT): a FROZEN ground body or a SLEEPING wood body does NOT
+## count, so once nearby debris settles the collider returns to idle even though the (now-static)
+## bodies still sit there — a pile of settled debris near the player costs nothing. Only a moving/
+## falling body keeps the collider active. A body's world column is its spawn cell offset by its
+## rigid-body displacement (global_position), so a dropping/shoved body is tracked cheaply.
+func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty() or not vb.is_awake():
+			continue                        # emptied (mid-free) or DORMANT → does not hold the collider on
+		var home := _body_home_column(vb)
+		var gp := vb.global_position
+		var wx := home.x + int(floor(gp.x))
+		var wz := home.y + int(floor(gp.z))
+		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
+			return true
+	return false
+
+## The world column (wx, wz) of a representative AWAKE loose body within `radius` columns (Chebyshev)
+## of `center`, or Vector2i(0x7fffffff, 0) if none. GroundCollider centres its bootstrap CORE on the
+## actual faller (which may be a few blocks from the player — a break happens at reach distance)
+## rather than on the player, so a small core reliably covers the body that needs ground. Mirrors the
+## body-tracking of has_active_bodies_near exactly (same awake/home-column logic).
+func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty() or not vb.is_awake():
+			continue
+		var home := _body_home_column(vb)
+		var gp := vb.global_position
+		var wx := home.x + int(floor(gp.x))
+		var wz := home.y + int(floor(gp.z))
+		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
+			return Vector2i(wx, wz)
+	return Vector2i(0x7fffffff, 0)
+
+## Wake every dormant loose body whose cells are within `radius` metres of world point `p` — the
+## disturbance reactivation path (DORMANT-BY-DEFAULT): a break/collapse/placement near settled
+## debris wakes it so it re-tests support and falls if undermined, else re-settles. Called on every
+## terrain/body edit; comprehensive so a body can never be left floating with its support removed.
+func wake_bodies_near(p: Vector3, radius: float) -> void:
+	var r2 := radius * radius
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty() or vb.is_awake():
+			continue                        # already awake → nothing to do
+		var xf := vb.global_transform
+		for k: Vector3i in vb.cells:
+			var wp: Vector3 = xf * Vector3(k.x + 0.5, k.y + 0.5, k.z + 0.5)
+			if wp.distance_squared_to(p) <= r2:
+				vb.wake()
+				break                       # this body is awake now; move to the next
+	return
+
+## A representative local column (x, z) of a VoxelBody's cells (first key). Added to global_position
+## it gives the body's current world column (coarse; enough for the gate radius).
+func _body_home_column(vb: VoxelBody) -> Vector2i:
+	for k: Vector3i in vb.cells:
+		return Vector2i(k.x, k.z)
+	return Vector2i(0, 0)
 
 ## Topmost still-solid column height at (x, z): the noise height, lowered past any
 ## blocks the player has broken from the top. Because every column is solid all
@@ -135,146 +315,363 @@ func effective_height(x: int, z: int) -> int:
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
 		return 0
-	var id: int = block_id_at(cell)     # capture BEFORE carving
-	_edits[cell] = 0
-	_paint_cell(cell, 0)
-	_collapse_unsupported(cell, from_pos)   # only from the player break — never a spawn
+	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
+	_write_cell(cell, 0)                # dig to air (0 = canonical air)
+	_structural_update(cell, from_pos)  # only from the player break — never a spawn
+	# Disturbance: wake dormant debris near the break so anything that just lost its support falls
+	# (dormant-by-default reactivation). The new-body spawns from _structural_update are already awake.
+	wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)
 	if _ground != null:
 		_ground.rebuild_now()
 	return id
 
-## Place one block of `block_id` into `cell`. Fails (returns false, no state
-## change) if the cell is not air (composed query) or block_id is invalid (<=0 or
-## >= BlockCatalog.COUNT). On success writes the overlay, updates _placed_top,
-## mirrors into the active render path and rebuilds the ground collider.
-## Player-overlap is the CALLER's check (the world doesn't know where the player is).
-func place_block(cell: Vector3i, block_id: int) -> bool:
-	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.COUNT:
+## Place a block into `cell`. `value` is a PACKED cell value (CellCodec) so a shaped
+## partial cell (material + modifier — a ramp/slab, SUB-VOXEL-SMOOTHING §9) can be
+## placed; a bare block id is a valid packed value meaning "full cube", so the
+## historical `place_block(cell, id)` call site is unchanged. Fails (returns false,
+## no state change) if the cell is not air (composed query), the MATERIAL is invalid
+## (<=0 or >= count()) or non-solid (water/lava/powder_snow — WGC §6.3). On success
+## writes the CANONICAL overlay value (canonicalization strips a modifier that can't
+## apply, e.g. a corner-3 clamp), updates _placed_top, mirrors into the active render
+## path and rebuilds the ground collider. Player-overlap is the CALLER's check.
+func place_block(cell: Vector3i, value: int) -> bool:
+	var block_id := CellCodec.mat(value)
+	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.count():
 		return false
+	if BlockCatalog.solidity_of(block_id) < 0.5:
+		return false                       # no placing water/lava/powder_snow from the hotbar (WGC §6.3)
 	if cell_solid(cell):
 		return false
-	_edits[cell] = block_id
+	_write_cell(cell, value)              # _write_cell canonicalizes (full cube if value was a bare id)
 	var key := Vector2i(cell.x, cell.z)
 	var prev: int = _placed_top.get(key, -0x40000000)
 	if cell.y > prev:
 		_placed_top[key] = cell.y
-	_paint_cell(cell, block_id)
+	# The placement SUCCEEDS, then the structure is judged (SI §6): an over-tall
+	# pillar crushes, an undercut/unsupported placement detaches. No breaker kick on
+	# a placement collapse (from_pos = Vector3.INF).
+	_structural_update(cell, Vector3.INF)
+	wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)   # disturbance: reactivate nearby dormant debris
 	if _ground != null:
 		_ground.rebuild_now()
 	return true
 
-## Mirror one cell's block id into the active render path (0 = carve to air).
-## Shared by break/place/collapse so the godot_voxel / fallback plumbing lives in
-## one place. The caller owns the `_edits` overlay + ground rebuild.
-func _paint_cell(cell: Vector3i, block_id: int) -> void:
+## THE single write choke point (VOXEL-DATA-STRUCTURE §7.2): the ONLY function
+## that mutates a cell's overlay value, now owning ALL FOUR axes. break/place/collapse
+## all route here. It canonicalizes the packed value (air-zeroing + P5/P6 hooks),
+## stores it in `_edits`, SETTLES the cell's metadata, and mirrors the resulting
+## MATERIAL into the active render path.
+##
+## Metadata settlement (the leak-proof invariant, §7.2/§16): a write DROPS the cell's
+## existing metadata unless the SAME call supplies replacement `meta` for a block-entity
+## material. break/place/collapse never pass `meta`, so they always drop+orphan any
+## existing document — there is no code path that changes a cell's material and skips
+## metadata cleanup, because there is only one write function. `set_state` re-passes the
+## existing document (same material → block-entity) so it is PRESERVED without an orphan.
+##
+## Zero-cost default: with an empty `_meta` and no `meta` argument (today's every write),
+## the settlement collapses to a single `is_empty()` check — gameplay stays byte-identical.
+## `paint` (default true) mirrors the cell into the active render path immediately. It is
+## set false ONLY by `load_bundle` on the module path, which coalesces the render into ONE
+## bulk `try_set_block_data` pass (RMS §3.4) after the overlay is fully written — the overlay
+## update itself (the gameplay truth) is unconditional.
+func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool = true) -> void:
+	packed = CellCodec.canonical(packed)
+	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
+		_meta[cell] = meta                       # the one write that (re)sets metadata
+	elif not _meta.is_empty():
+		var old_meta: Variant = _meta.get(cell, null)
+		if old_meta != null:
+			_meta.erase(cell)                    # material change / break settles it
+			block_entity_orphaned.emit(cell, old_meta)
+	if not _edits.has(cell):
+		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
+	_edits[cell] = packed
+	if paint:
+		_paint_cell(cell, packed)
+
+# --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
+
+## Serialized-metadata size cap per cell (§16): the unbounded axis by nature, so
+## `set_metadata` refuses (and logs) any document over this. Chest-heavy legit docs
+## sit far below it.
+const META_MAX_BYTES := 16 * 1024
+
+## Attach/replace the block-entity METADATA document at `cell`. Validates loudly and
+## returns false (no state change) if: the cell's MATERIAL is not a block-entity
+## material (`has_block_entity` false — incl. air), the document is not JSON-representable
+## (§3.2: String keys; bool/int/float/String/Array/Dictionary values; NO Object refs, NO
+## NaN/INF), or it exceeds the §16 size cap. Stores a DEEP COPY so later caller mutations
+## cannot alias the stored document. Keeps the scalar axes (`_edits`) untouched; fires no
+## orphan signal (an explicit update is not a drop).
+func set_metadata(cell: Vector3i, meta: Dictionary) -> bool:
+	var mat := CellCodec.mat(cell_value_at(cell))
+	if not BlockCatalog.has_block_entity(mat):
+		push_error("WorldManager.set_metadata: material %d at %s is not a block-entity material (rejected)" % [mat, cell])
+		return false
+	if not _metadata_dict_ok(meta):
+		push_error("WorldManager.set_metadata: document at %s is not JSON-representable (Object/NaN/INF or non-String key) — rejected" % cell)
+		return false
+	if JSON.stringify(meta).to_utf8_buffer().size() > META_MAX_BYTES:
+		push_error("WorldManager.set_metadata: document at %s exceeds the %d-byte cap — rejected" % [cell, META_MAX_BYTES])
+		return false
+	_meta[cell] = meta.duplicate(true)
+	return true
+
+## The block-entity METADATA document at `cell`; an EMPTY dict when the cell carries
+## none. Returns a DEEP COPY — mutating it never changes the stored document (route
+## real updates through `set_metadata`).
+func get_metadata(cell: Vector3i) -> Dictionary:
+	var m: Variant = _meta.get(cell, null)
+	return (m as Dictionary).duplicate(true) if m != null else {}
+
+## True iff `cell` currently carries a metadata document.
+func has_metadata(cell: Vector3i) -> bool:
+	return _meta.has(cell)
+
+## Set the STATE axis (bits 32..47) of `cell`, keeping its material + modifier and
+## PRESERVING any metadata (the one write that does — §11). Returns false on air.
+## The state bits are canonicalized/validated through `CellCodec` (today's validator is
+## pass-through; no material declares a state layout yet, so any value round-trips).
+func set_state(cell: Vector3i, state_bits: int) -> bool:
+	var v := cell_value_at(cell)
+	var mat := CellCodec.mat(v)
+	if mat == BlockCatalog.AIR:
+		return false                             # air carries no state
+	var new_packed := CellCodec.pack(mat, CellCodec.modifier(v), state_bits)
+	# Re-pass the existing document so the choke point KEEPS it (same material → still a
+	# block-entity) rather than orphaning it: set_state is a behavioural, not material, edit.
+	_write_cell(cell, new_packed, _meta.get(cell, null))
+	return true
+
+## JSON-subset validator (§3.2): a metadata document restricted to String keys and
+## bool/int/finite-float/String/Array/Dictionary values, recursively. Rejects Object
+## references (they cannot serialize / cross threads) and NaN/INF (they break byte-stable
+## round-trips). Pure/static so it is trivially testable.
+static func _metadata_dict_ok(d: Dictionary) -> bool:
+	for k: Variant in d.keys():
+		if typeof(k) != TYPE_STRING:
+			return false
+		if not _metadata_value_ok(d[k]):
+			return false
+	return true
+
+static func _metadata_value_ok(v: Variant) -> bool:
+	match typeof(v):
+		TYPE_BOOL, TYPE_INT, TYPE_STRING:
+			return true
+		TYPE_FLOAT:
+			return is_finite(v)                  # no NaN / INF (byte-stable round-trips)
+		TYPE_ARRAY:
+			for e: Variant in v:
+				if not _metadata_value_ok(e):
+					return false
+			return true
+		TYPE_DICTIONARY:
+			return _metadata_dict_ok(v)
+		_:
+			return false                         # Object refs and every other type rejected
+
+## Mirror one cell's PACKED value into the active render path (0 = carve to air).
+## Shared by _write_cell so the godot_voxel / fallback plumbing lives in one place.
+## The module path resolves the (material, modifier) to a baked appearance id (ARID,
+## VDS §8.1) so a placed ramp/slab renders its shape; the fallback re-reads the world
+## query when it remeshes the cell, so it only needs the cell coordinate. The caller
+## (_write_cell) owns the `_edits` overlay; break/place own the ground rebuild.
+func _paint_cell(cell: Vector3i, packed: int) -> void:
 	if using_module and _module_world != null:
-		_module_world.call("set_cell", cell, block_id)
+		_module_world.call("set_cell", cell, packed)
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
 
-# --- terrain collapse (unsupported blocks fall) --------------------------------
+# --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------
+# The generated world is a pure function (tier 2) and is NEVER serialized; only the edit
+# overlay — the world's deviations from that function — needs persisting. `save_edits`
+# compacts the overlay (+ metadata) for one 32³ region into a ZoneChunk; `load_edits`
+# applies one back through the single write choke point, so the overlay and metadata are
+# restored identically. This is additive: nothing in the live break/place/collapse loop
+# calls it, so gameplay is byte-identical whether or not a save ever happens.
 
-## Half-extent of the square column region the collapse scan examines around a break.
-const _COLLAPSE_RADIUS := 5
+## The 32-aligned min-corner cell of the ZoneChunk region that contains `cell`.
+static func region_origin_of(cell: Vector3i) -> Vector3i:
+	var s := ZoneChunk.SIZE
+	return Vector3i(_floor_div(cell.x, s) * s, _floor_div(cell.y, s) * s, _floor_div(cell.z, s) * s)
 
-## The 6 axis neighbours, reused by the support flood-fill and the component grouping.
+static func _floor_div(a: int, b: int) -> int:
+	# Floored (not truncated) integer division, so negative coordinates snap DOWN to their
+	# region origin (−1 → −32 for SIZE 32, not 0), keeping regions a clean tiling of the grid.
+	var q := a / b
+	if (a % b) != 0 and ((a < 0) != (b < 0)):
+		q -= 1
+	return q
+
+## Serialize the edit overlay (+ per-cell metadata) within the 32³ region whose min corner
+## is `region_origin` (must be 32-aligned — use `region_origin_of`) into a ZoneChunk. Only
+## edited cells occupy the chunk; unedited cells are absent and fall back to the generated
+## function on load (tier composition, §4). A region with no edits yields a uniform (unset)
+## chunk that serializes to a handful of bytes (§5.5).
+func save_edits(region_origin: Vector3i) -> ZoneChunk:
+	var zc := ZoneChunk.new()
+	var s := ZoneChunk.SIZE
+	# Union of edited cells and metadata-bearing cells in the region (a metadata cell is
+	# always an edited block-entity cell today, but unioning is leak-proof regardless).
+	var cells := {}
+	for cell: Vector3i in _edits.keys():
+		if _in_region(cell, region_origin, s):
+			cells[cell] = true
+	for cell: Vector3i in _meta.keys():
+		if _in_region(cell, region_origin, s):
+			cells[cell] = true
+	for cell: Vector3i in cells.keys():
+		var local := cell - region_origin
+		var idx := ZoneChunk.local_index(local.x, local.y, local.z)
+		zc.set_cell(idx, cell_value_at(cell), _meta.get(cell, null))
+	return zc
+
+## Apply a ZoneChunk's present cells back into the overlay at `region_origin`, routing every
+## cell through the single write choke point (`_write_cell`) so the material/modifier/state
+## axes AND the metadata document are restored exactly as saved. Materials resolve by NAME
+## through `resolver` (a `Callable(name: StringName) -> int`; default `BlockCatalog.id_of`),
+## so a chunk stays valid even if the runtime catalog assigns different dense ids than the
+## saving session did (VDS §10.1). An unknown name resolves to a logged placeholder material
+## (never a crash, never data loss of the shape/state bits — §16).
+func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = Callable()) -> void:
+	for idx: int in chunk.present_indices():
+		var name := chunk.material_name_at(idx)
+		var id := -1
+		if resolver.is_valid():
+			id = int(resolver.call(StringName(name)))
+		else:
+			id = BlockCatalog.id_of(StringName(name))
+		if id < 0:
+			id = BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+			push_error("WorldManager.load_edits: unknown material name '%s' — substituting placeholder '%s'"
+				% [name, ZoneChunk.PLACEHOLDER_MATERIAL])
+		var packed := CellCodec.pack(id, chunk.modifier_at(idx), chunk.state_at(idx))
+		var local := ZoneChunk.from_local_index(idx)
+		_write_cell(region_origin + local, packed, chunk.meta_at(idx))
+
+static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
+	return cell.x >= origin.x and cell.x < origin.x + s \
+		and cell.y >= origin.y and cell.y < origin.y + s \
+		and cell.z >= origin.z and cell.z < origin.z + s
+
+# --- zone bundles: streamed material payloads (RMS §2.6/§3.4/§5) ----------------
+# The final piece of runtime material streaming: a ZoneBundle packages one or more regions'
+# edit overlay TOGETHER WITH the material documents the receiver needs (manifest), keyed by
+# cross-session GMID, so acquiring a remote zone brings materials the local client has never
+# seen. Dense LRIDs never travel — they are container-local, translated by GMID at the boundary
+# (RMS §2.1). This is additive; nothing in the live loop calls it (gameplay is byte-identical).
+# Transport / signing / trust are out of scope (RMS §9.3): this is the payload FORMAT only.
+
+## Serialize the edit overlay (+ per-cell metadata) within `regions` (each a 32-aligned origin,
+## use `region_origin_of`) into a self-contained ZoneBundle. Each present cell is recorded by its
+## cross-session "<gmid>#<state>" key (`ZoneChunk.set_cell_keyed`), and every referenced material's
+## document is gathered into the bundle manifest (from the content store when held, else
+## reconstructed byte-identically from the catalog def, RMS §2.2). Regions with no edits are
+## skipped. Container-local ids are compact (per-chunk palettes) and independent of this session's
+## dense LRID assignment — the whole point (RMS §2.6).
+func save_bundle(regions: Array) -> ZoneBundle:
+	var bundle := ZoneBundle.new()
+	var s := ZoneChunk.SIZE
+	for region_origin: Vector3i in regions:
+		var cells := {}
+		for cell: Vector3i in _edits.keys():
+			if _in_region(cell, region_origin, s):
+				cells[cell] = true
+		for cell: Vector3i in _meta.keys():
+			if _in_region(cell, region_origin, s):
+				cells[cell] = true
+		if cells.is_empty():
+			continue
+		var zc := ZoneChunk.new()
+		for cell: Vector3i in cells.keys():
+			var v := cell_value_at(cell)
+			var mat := CellCodec.mat(v)
+			bundle.reference_material(mat)           # gather its manifest document (skips air)
+			var local := cell - region_origin
+			zc.set_cell_keyed(ZoneChunk.local_index(local.x, local.y, local.z),
+				String(BlockCatalog.key_of(mat)), CellCodec.modifier(v), CellCodec.state(v),
+				_meta.get(cell, null))
+		bundle.add_chunk(region_origin, zc)
+	return bundle
+
+## Apply a ZoneBundle into this world (RMS §2.6/§3.4). First registers the manifest (dedup by
+## GMID — an already-known material reuses its session LRID, an unknown one gets a fresh LRID,
+## a key with no/rejected document degrades to an UNRESOLVED placeholder so data stays lossless,
+## RMS §8). Then translates every chunk cell's container key → THIS session's LRID and applies
+## it: the overlay (`_edits` + metadata) is updated through the single write choke point (rule-1
+## truth, both paths). Render mirroring: on the module path one BULK `try_set_block_data` pass
+## (F10); on the fallback path per-cell through `_write_cell`. Loose bodies / collapse are NOT
+## re-run (a loaded zone is authored data, not a live edit); the ground collider is rebuilt once.
+func load_bundle(bundle: ZoneBundle) -> void:
+	bundle.register_manifest()
+	var key_to_lrid := {}
+	for key: String in bundle.id_map():
+		key_to_lrid[key] = bundle.resolve_key(key)
+
+	var placeholder_id := BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+	var collected := {}                              # Vector3i -> int packed cell value
+	var metas := {}                                  # Vector3i -> Dictionary
+	for entry: Dictionary in bundle.chunks():
+		var region_origin: Vector3i = entry["origin"]
+		var chunk: ZoneChunk = entry["chunk"]
+		for idx: int in chunk.present_indices():
+			var key := chunk.material_name_at(idx)
+			var lrid := int(key_to_lrid.get(key, -1))
+			if lrid < 0:
+				lrid = placeholder_id
+				push_error("WorldManager.load_bundle: unresolvable key '%s' — substituting placeholder '%s'"
+					% [key, ZoneChunk.PLACEHOLDER_MATERIAL])
+			var world_cell := region_origin + ZoneChunk.from_local_index(idx)
+			collected[world_cell] = CellCodec.pack(lrid, chunk.modifier_at(idx), chunk.state_at(idx))
+			var m: Variant = chunk.meta_at(idx)
+			if m != null:
+				metas[world_cell] = m
+
+	# Overlay is written for every cell (both paths). On the module path defer per-cell paint and
+	# mirror the render in ONE bulk pass; on the fallback path _write_cell remeshes per cell.
+	var use_bulk: bool = using_module and _module_world != null and _module_world.has_method("bulk_inject")
+	for world_cell: Vector3i in collected.keys():
+		_write_cell(world_cell, collected[world_cell], metas.get(world_cell, null), not use_bulk)
+	if use_bulk:
+		_module_world.call("bulk_inject", collected)
+	if _ground != null:
+		_ground.rebuild_now()
+
+# --- terrain collapse (unsupported/overloaded blocks fall) ---------------------
+# The support analysis itself lives in StructuralSolver (STRUCTURAL-INTEGRITY §5);
+# WorldManager owns only the resulting carve + VoxelBody spawn (_structural_update).
+
+## The 6 axis neighbours, reused by the component grouping (and formerly the flood).
 const _NEIGHBORS_6: Array[Vector3i] = [
 	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
 	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
 	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
 ]
 
-## Local support analysis around a just-broken cell: any solid, non-broken terrain
-## no longer connected (through solid cells) to the always-supported bottom row
-## becomes falling rigid bodies. Cheap on the common case (flat digging undercuts
-## nothing → the flood-fill reaches every cell → zero floaters → early return).
+## Structural-integrity update around a just-edited cell (STRUCTURAL-INTEGRITY §6):
+## the StructuralSolver decides which cells detach or crumble (pass 0 connectivity —
+## today's flood, so tree-chop is preserved — plus load-bearing flow + moment audit
+## for player builds), and this function carves that set out and drops the 6-connected
+## components as loose VoxelBody debris, exactly as the old collapse did. Cheap on the
+## common case: flat digging that undercuts nothing early-outs inside solve() (pass 0
+## reaches everything, pass 1 finds no overload → the solver returns an empty set).
 ##
-## MUST be called only from the player-initiated break_terrain, never from a spawn
-## path, so it cannot recurse.
-func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
-	var x0 := center.x - _COLLAPSE_RADIUS
-	var x1 := center.x + _COLLAPSE_RADIUS
-	var z0 := center.z - _COLLAPSE_RADIUS
-	var z1 := center.z + _COLLAPSE_RADIUS
+## MUST be called only from the player-initiated break_terrain / place_block, never
+## from a spawn path, so it cannot recurse (a landing VoxelBody is physics-side).
+func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
+	var falling: Dictionary = StructuralSolver.solve(self, center)
+	if falling.is_empty():
+		return   # common case: nothing detaches, spawn nothing
 
-	# Vertical bounds: top = tallest column PLUS the max tree/placed height above the
-	# surface (so canopies and player towers participate in the support analysis);
-	# bottom = shortest column minus 2, a row solid in every column that connects to
-	# the untouched bulk.
-	var max_h := -0x3FFFFFFF
-	var y_lo_top := 0x3FFFFFFF
-	var placed_hi := -0x40000000
-	var xi := x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var h := TerrainConfig.height_at(xi, zi)
-			if h > max_h:
-				max_h = h
-			if h < y_lo_top:
-				y_lo_top = h
-			placed_hi = maxi(placed_hi, placed_top(xi, zi))
-			zi += 1
-		xi += 1
-	var y_hi := maxi(max_h + TreeGen.MAX_ABOVE_SURFACE, placed_hi)
-	var y_lo := y_lo_top - 2
-
-	# Seed support from every solid cell on the region BOUNDARY shell — the bottom
-	# row (deep bulk) AND the 4 side faces. A cell touching a side face connects to
-	# untouched terrain OUTSIDE the search box, which we conservatively treat as
-	# supported. Seeding only the bottom row would wrongly flag a shelf propped from
-	# outside the box as floating and carve it away; biasing toward "supported" at
-	# the boundary means we never destroy genuinely-supported terrain (a floater
-	# from the dig sits near the box CENTRE, so it is still detected).
-	var supported: Dictionary = {}
-	var stack: Array[Vector3i] = []
-	xi = x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var on_boundary := xi == x0 or xi == x1 or zi == z0 or zi == z1
-			var y := y_lo
-			while y <= y_hi:
-				if (on_boundary or y == y_lo) and _cell_solid(Vector3i(xi, y, zi)):
-					var seed := Vector3i(xi, y, zi)
-					if not supported.has(seed):
-						supported[seed] = true
-						stack.append(seed)
-				y += 1
-			zi += 1
-		xi += 1
-	while not stack.is_empty():
-		var c: Vector3i = stack.pop_back()
-		for d: Vector3i in _NEIGHBORS_6:
-			var nc := c + d
-			if nc.x < x0 or nc.x > x1 or nc.z < z0 or nc.z > z1 or nc.y < y_lo or nc.y > y_hi:
-				continue
-			if supported.has(nc):
-				continue
-			if _cell_solid(nc):
-				supported[nc] = true
-				stack.append(nc)
-
-	# Collect solid cells the flood never reached — these are floating.
-	var floating: Dictionary = {}
-	xi = x0
-	while xi <= x1:
-		var zi := z0
-		while zi <= z1:
-			var y := y_lo
-			while y <= y_hi:
-				var c := Vector3i(xi, y, zi)
-				if _cell_solid(c) and not supported.has(c):
-					floating[c] = true
-				y += 1
-			zi += 1
-		xi += 1
-	if floating.is_empty():
-		return   # common case: nothing undercut, spawn nothing
-
-	# Group floaters into 6-neighbour connected components; each becomes one body.
+	# Group the detaching cells into 6-neighbour connected components; each becomes
+	# one body. Capture each cell's PACKED value BEFORE carving (so mixed grass/dirt/
+	# stone and wood+leaf canopies keep their materials and, later, shape/state), then
+	# carve the component and drop it as one loose body. from_pos kicks it away from
+	# the breaker (Vector3.INF on a placement collapse = no kick).
 	var seen: Dictionary = {}
-	for start: Vector3i in floating.keys():
+	for start: Vector3i in falling.keys():
 		if seen.has(start):
 			continue
 		var comp: Array[Vector3i] = []
@@ -285,20 +682,41 @@ func _collapse_unsupported(center: Vector3i, from_pos: Vector3) -> void:
 			comp.append(c)
 			for d: Vector3i in _NEIGHBORS_6:
 				var nc := c + d
-				if floating.has(nc) and not seen.has(nc):
+				if falling.has(nc) and not seen.has(nc):
 					seen[nc] = true
 					cstack.append(nc)
-		# Capture each cell's block id BEFORE carving (so mixed grass/dirt/stone and
-		# wood+leaf canopies keep their materials), then carve the component out of the
-		# terrain and drop it as one loose body — VoxelBody resolves materials + masses
-		# from the ids itself. from_pos kicks the cluster away from the breaker.
-		var comp_ids: Dictionary = {}   # Vector3i -> int block_id
+		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
-			comp_ids[c] = block_id_at(c)
+			comp_ids[c] = cell_value_at(c)
 		for c: Vector3i in comp:
-			_edits[c] = 0
-			_paint_cell(c, 0)
+			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
+
+# --- per-joint reinforcement (STRUCTURAL-INTEGRITY §4.2/§7) ---------------------
+
+## The canonical unordered joint key for the pair of 6-adjacent cells (a, b): the
+## component-wise-smaller cell + the axis they differ on (0=x, 1=y, 2=z).
+static func _joint_key(a: Vector3i, b: Vector3i) -> Vector4i:
+	var axis := 0 if a.x != b.x else (1 if a.y != b.y else 2)
+	return Vector4i(mini(a.x, b.x), mini(a.y, b.y), mini(a.z, b.z), axis)
+
+## Reinforcement id on the joint between 6-adjacent cells (a, b); 0 = unreinforced.
+## The structural solver reads this for every joint's F_t/F_s/M₀ (StructuralModel).
+func joint_mod(a: Vector3i, b: Vector3i) -> int:
+	return int(_joint_mods.get(_joint_key(a, b), 0))
+
+## Reinforce the joint between the two 6-adjacent cells with `reinf_id` (a
+## StructuralModel reinforcement id; 0 clears it). Returns false if the cells are
+## not 6-adjacent. One reinforcement per joint (placing a new one replaces the old).
+func reinforce_joint(a: Vector3i, b: Vector3i, reinf_id: int) -> bool:
+	var diff := b - a
+	if absi(diff.x) + absi(diff.y) + absi(diff.z) != 1:
+		return false
+	if reinf_id == 0:
+		_joint_mods.erase(_joint_key(a, b))
+	else:
+		_joint_mods[_joint_key(a, b)] = reinf_id
+	return true
 
 # --- analytic world queries (path-agnostic) ------------------------------------
 
@@ -318,38 +736,87 @@ func surface_y(x: float, z: float) -> float:
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
+	var fx := x - float(xi)   # in-cell footprint (ignored by full cubes; used by P5 shapes)
+	var fz := z - float(zi)
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
 	# off. Scan length is bounded by the fall distance — cheap.
 	var start := int(floor(feet_y + 0.5))
 	var y := start
+	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
+	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
+	# seafloor, while a solid cell yields its filled interval — the floor is the top of
+	# the first occupied cell that has an empty span directly above (its top = span.y;
+	# 1.0 for a full cube ⇒ float(y+1), byte-identical to the old solid/air-above test).
 	while y > -1024:
-		if _cell_solid(Vector3i(xi, y, zi)) and not _cell_solid(Vector3i(xi, y + 1, zi)):
-			return float(y + 1)
+		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+			return float(y) + here.y
 		y -= 1
 	return float(effective_height(xi, zi) + 1)
 
-## True if any solid, non-broken terrain cell overlaps the player's vertical body
-## span at column (floor(x), floor(z)). The player is ~1.8 m tall standing with feet
-## at feet_y; the player agent calls this per-axis to stop horizontal movement into
-## a wall (the terrain itself is collider-less, so nothing else does).
+## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
+## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical
+## to flat/blocky ground); a ramp/slab surface `<= STEP_MAX` above the feet is walked
+## up, not blocked (the deliberate half-slab-as-stairs side effect).
+const STEP_MAX := 0.55
+## Player standing body height (feet → head) used for the headroom test.
+const _BODY_HEIGHT := 1.8
+const _EPS := 1e-6
+
+## True if the player cannot stand at column (floor(x), floor(z)) with feet at feet_y
+## because the standable surface just ahead is too tall to step onto (> STEP_MAX above
+## the feet) OR the body would clip a solid cell overhead (SUB-VOXEL-SMOOTHING §5.2).
+## Composes over the merged `floor_under`/`_occ_span`, so the material gate comes for
+## free (water never blocks) and shapes auto-step. BYTE-IDENTICAL for the current
+## all-full-cube world: a full cube ahead raises the standable surface 1.0 m (> STEP_MAX
+## → wall), a body span overlapping the ground finds its surface far above the buried
+## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
-	var y_lo := int(floor(feet_y + 0.1))
-	var y_hi := int(floor(feet_y + 1.7))
-	var y := y_lo
+	var fx := x - float(xi)
+	var fz := z - float(zi)
+	# Standable height at the target column, allowing an auto-step up to STEP_MAX.
+	var top := floor_under(x, z, feet_y + STEP_MAX)
+	if top - feet_y > STEP_MAX:
+		return true                                    # rise too big → wall (a full cube's 1.0 always is)
+	# Headroom above the (possibly auto-stepped) floor: the body must not clip a solid
+	# cell in (top, top + body height) at this footprint.
+	return not _headroom_clear(xi, zi, fx, fz, top)
+
+## True if the player's body column (top .. top + body height) at footprint (fx, fz)
+## in column (xi, zi) is clear of solid occupancy (SVS §5.2). The cell whose top the
+## player stands on ends exactly at `top`, so it never counts as a clip (its interval
+## upper bound == top, tested with an epsilon bias). A TOP-anchored slab / full cube
+## overhead correctly blocks standing.
+func _headroom_clear(xi: int, zi: int, fx: float, fz: float, top: float) -> bool:
+	var head := top + _BODY_HEIGHT
+	var y := int(floor(top))
+	var y_hi := int(floor(head - _EPS))
 	while y <= y_hi:
-		if _cell_solid(Vector3i(xi, y, zi)):
-			return true
+		var sp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		if sp != Vector2.ZERO:
+			var occ_lo := float(y) + sp.x
+			var occ_hi := float(y) + sp.y
+			if occ_hi > top + _EPS and occ_lo < head - _EPS:
+				return false
 		y += 1
-	return false
+	return true
 
 func is_solid(pos: Vector3) -> bool:
 	return cell_solid(Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z))))
 
 ## Voxel-DDA ray (Amanatides & Woo) against the heightmap. Returns
 ## {hit, voxel:Vector3i, normal:Vector3i, position:Vector3}.
+##
+## Merged contract (INTEGRATION-DECISIONS §3): the DDA cell walk is unchanged; each
+## cell is tested by the MATERIAL gate first (`cell_solid` = solidity ≥ 0.5), so the
+## ray passes THROUGH non-solid materials (water/lava) and targets what's behind
+## them. A hit on a solid cell reports the cell-BOUNDARY crossing (today's fast path,
+## exact for modifier 0). P5 SEAM: for a shaped (ramp) cell, `cell_solid` still gates
+## entry, then an in-cell surface ray test (SVS §5.3) refines the hit point/normal
+## within the cell — full cubes need no refinement, so the boundary hit stands.
 func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
 	var d := dir.normalized()
 	var cell := Vector3i(int(floor(origin.x)), int(floor(origin.y)), int(floor(origin.z)))
@@ -378,16 +845,99 @@ func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictio
 			cell.z += step.z; t = t_max.z; t_max.z += t_delta.z
 			normal = Vector3i(0, 0, -step.z)
 		if _cell_solid(cell):
-			return {"hit": true, "voxel": cell, "normal": normal,
-				"position": origin + d * t}
+			var v := cell_value_at(cell)
+			var m := CellCodec.modifier(v)
+			if m == 0:
+				return {"hit": true, "voxel": cell, "normal": normal,
+					"position": origin + d * t}   # full cube: boundary hit (unchanged fast path)
+			# Shaped cell (SVS §5.3): in-cell surface test. t is the entry into this
+			# cell; the exit is the next boundary crossing on any axis.
+			var t_out: float = minf(t_max.x, minf(t_max.y, t_max.z))
+			var res := _ray_vs_partial(m, cell, origin, d, t, t_out, normal)
+			if not res.is_empty():
+				return res
+			# Miss: the ray passed through the empty part of the cell — continue the DDA.
 	return {"hit": false, "voxel": Vector3i.ZERO, "normal": Vector3i.ZERO,
 		"position": origin + d * max_dist}
+
+## In-cell ray test against a shaped (non-full) solid cell (SUB-VOXEL-SMOOTHING §5.3).
+## The caller has already applied the material gate. Completeness: every boundary face
+## of a corner-height shape is either on the cell boundary (covered by the entry-point
+## occupancy test) or on the 1–2 surface triangles (covered by ray/plane tests). The
+## reported `normal` stays axis-aligned (the DDA face for a boundary hit, UP/DOWN for a
+## surface hit) to preserve the break/place adjacency contract; the true sloped normal
+## is exposed as `surface_normal`. Empty dict = miss (the DDA continues).
+func _ray_vs_partial(m: int, cell: Vector3i, origin: Vector3, d: Vector3,
+		t_in: float, t_out: float, dda_normal: Vector3i) -> Dictionary:
+	var base := Vector3(cell)
+	var p_in := origin + d * t_in - base
+	if ShapeCodec.occupied(m, p_in.x, p_in.y, p_in.z):
+		return {"hit": true, "voxel": cell, "normal": dda_normal,
+			"position": origin + d * t_in, "surface_normal": Vector3(dda_normal)}
+	var place_n := Vector3i.UP if ShapeCodec.anchor(m) == ShapeCodec.ANCHOR_BOTTOM else Vector3i.DOWN
+	var p0 := origin - base
+	for tri: Dictionary in ShapeCodec.surface_tris(m):
+		var pn: Vector3 = tri["normal"]
+		var denom := d.dot(pn)
+		if absf(denom) < 1e-9:
+			continue                                   # ray parallel to the surface plane
+		var th := (Vector3(tri["v0"]) - p0).dot(pn) / denom
+		if th < t_in - _EPS or th > t_out + _EPS:
+			continue                                   # plane hit outside this cell's ray span
+		var hp := p0 + d * th
+		if _point_in_tri_xz(hp, tri["v0"], tri["v1"], tri["v2"]):
+			return {"hit": true, "voxel": cell, "normal": place_n,
+				"position": origin + d * th, "surface_normal": pn}
+	return {}
+
+## True if the XZ projection of point `p` lies inside triangle (a, b, c) — the surface
+## is a single-valued height field over XZ, so XZ containment is exact. Barycentric.
+func _point_in_tri_xz(p: Vector3, a: Vector3, b: Vector3, c: Vector3) -> bool:
+	var v0x := c.x - a.x
+	var v0z := c.z - a.z
+	var v1x := b.x - a.x
+	var v1z := b.z - a.z
+	var v2x := p.x - a.x
+	var v2z := p.z - a.z
+	var d00 := v0x * v0x + v0z * v0z
+	var d01 := v0x * v1x + v0z * v1z
+	var d11 := v1x * v1x + v1z * v1z
+	var d20 := v2x * v0x + v2z * v0z
+	var d21 := v2x * v1x + v2z * v1z
+	var denom := d00 * d11 - d01 * d01
+	if absf(denom) < 1e-12:
+		return false                                   # degenerate triangle (no XZ area)
+	var u := (d11 * d20 - d01 * d21) / denom
+	var vv := (d00 * d21 - d01 * d20) / denom
+	return u >= -_EPS and vv >= -_EPS and u + vv <= 1.0 + _EPS
 
 # Internal alias kept for the collapse pass + DDA; delegates to the composed
 # public query (edit overlay first, else generated terrain + trees), so removed
 # cells are air and placed/tree cells are solid ray/collapse targets.
 func _cell_solid(cell: Vector3i) -> bool:
 	return cell_solid(cell)
+
+## Render-only face-cull composition (INTEGRATION-DECISIONS §3): does the neighbour
+## whose PACKED value is `nb_value` occlude the shared face of a cell in cull-group
+## `my_group` (the viewed material's `transparency_index_of`)? True iff BOTH:
+##   (1) the neighbour's MATERIAL occludes — it is solid AND its transparency index
+##       is ≤ my_group (the transparency-index rule: an opaque neighbour always
+##       occludes; you see THROUGH a more-transparent one, e.g. stone behind glass);
+##   (2) its facing side profile fully covers the shared face (`face` = the
+##       neighbour-direction index; modifier 0 ⇒ trivially full — today's fast path).
+## Static/pure (no world state). For the current all-opaque, full-cube world this is
+## exactly `cell_solid(neighbour)`, so it ships as the SEAM P3's translucent
+## materials (glass/water) fill in — the fallback mesher's cull test is deliberately
+## left on `cell_solid` until then (see chunk_mesher._emit_cube) to guarantee the
+## byte-identical visual gate; the module path's culling is config (transparency_index),
+## unchanged.
+static func occludes_face(nb_value: int, my_group: int, face: int = 0) -> bool:
+	var nb_mat := CellCodec.mat(nb_value)
+	if BlockCatalog.solidity_of(nb_mat) < 0.5:
+		return false                                   # air / water / lava never occlude
+	if BlockCatalog.transparency_index_of(nb_mat) > my_group:
+		return false                                   # see through a more-transparent neighbour
+	return ShapeCodec.side_profile_full(CellCodec.modifier(nb_value), face)
 
 # Distance along one axis to the first integer boundary in the ray's direction.
 static func _first_cross(o: float, dir: float) -> float:

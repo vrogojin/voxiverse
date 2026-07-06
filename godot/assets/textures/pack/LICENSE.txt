@@ -1,0 +1,24 @@
+VOXIVERSE block texture pack
+=============================
+
+Base tiles (godot/assets/textures/pack/src/*.png)
+-------------------------------------------------
+Source pack : "16*16 Block Textures" + "16x16 Block Texture Set"
+Author      : ARoachIFoundOnMyPillow
+Hosted at   : https://opengameart.org/content/1616-block-textures
+              https://opengameart.org/content/16x16-block-texture-set
+Downloaded  : blocks_2.zip (98.5 KB) from
+              https://opengameart.org/sites/default/files/blocks_2.zip
+License     : CC0 1.0 Universal (Creative Commons Zero, Public Domain Dedication)
+              https://creativecommons.org/publicdomain/zero/1.0/
+
+CC0 places the work in the public domain: no attribution is legally required and
+redistribution / modification / commercial use are all permitted. We nonetheless
+credit the author here as a courtesy and to record provenance.
+
+Enhanced tiles (godot/assets/textures/pack/*.png)
+-------------------------------------------------
+The pack/*.png files the engine actually loads are derived from the CC0 base tiles
+by src/world/texture_pack_baker.gd (deterministic upscale + high-resolution
+sub-pixel detail; see docs/TEXTURES.md). As derivatives of CC0 work plus original
+procedural detail authored for this project, they are likewise released CC0.

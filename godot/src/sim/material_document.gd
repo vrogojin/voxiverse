@@ -64,6 +64,11 @@ static func _state_doc(st: VoxelState, mat_name: StringName) -> Dictionary:
 	}
 	if is_finite(st.break_force):
 		physics["break_force"] = st.break_force
+	# Liquid identity (MULTI-LIQUID §2.1): OMITTED when 0 so every non-liquid material's
+	# document — hence its GMID — stays byte-identical. Only water/lava serialize it (safe:
+	# liquids are never placeable/serialized into a zone bundle).
+	if st.liquid_kind != 0:
+		physics["liquid_kind"] = st.liquid_kind
 	var look := {
 		"swatch": [st.tint.r, st.tint.g, st.tint.b, st.tint.a],
 		"texture": String(mat_name),                 # static name reference (§5.3 / Decision D)
@@ -185,6 +190,8 @@ static func _state_from(sraw: Dictionary, block_entity: bool) -> VoxelState:
 			st.attachment = float(p["attachment"])
 		if p.has("cull_group"):
 			st.cull_group = int(p["cull_group"])
+		if p.has("liquid_kind"):
+			st.liquid_kind = int(p["liquid_kind"])
 		if p.has("structural_class"):
 			st.structural_class = StringName(String(p["structural_class"]))
 		var an: Variant = p.get("strength_anchors", null)

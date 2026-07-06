@@ -43,7 +43,12 @@ const WORLD_BOTTOM_Y := -64      # world floor; below is void (unreachable)
 const BEDROCK_TOP_Y := -59       # bedrock gradient: 100% at -64 -> 0% at -59
 const DEEPSLATE_FULL_Y := -24    # below here: always deepslate
 const DEEPSLATE_TOP_Y := -16     # above here: always stone; dithered band between
-const SEA_LEVEL := 0             # air below SEA_LEVEL fills with water (ice cap when cold)
+const SEA_LEVEL := 0             # air below SEA_LEVEL fills with liquid (ice cap when cold, lava when hot)
+
+## Climate regime thresholds for the sea fill (MULTI-LIQUID §2.4). Frozen (t < -0.55) → ice cap;
+## molten (t >= LAVA_SEA_T) → the sea fill IS lava; temperate in between → water. Frozen and molten
+## are DISJOINT bands, so _sea_liquid_kind (the single regime authority) never has to reconcile them.
+const LAVA_SEA_T := 0.60         # extreme-hot ocean regions: the sea fill IS lava (molten seas)
 
 ## The render height of the water surface: the top cell of every open-water column and every
 ## smoothed shore composite renders its water at SEA_LEVEL + WATER_SURFACE_HEIGHT, a slightly sunk
@@ -154,6 +159,7 @@ static var _ids_ready := false
 static var _ID_BEDROCK := 0
 static var _ID_DEEPSLATE := 0
 static var _ID_WATER := 0
+static var _ID_LAVA := 0
 static var _ID_ICE := 0
 static var _ID_SAND := 0
 static var _ID_RED_SAND := 0
@@ -213,6 +219,7 @@ static func _ensure_ids() -> void:
 	_ID_BEDROCK = BlockCatalog.id_of(&"bedrock")
 	_ID_DEEPSLATE = BlockCatalog.id_of(&"deepslate")
 	_ID_WATER = BlockCatalog.id_of(&"water")
+	_ID_LAVA = BlockCatalog.id_of(&"lava")
 	_ID_ICE = BlockCatalog.id_of(&"ice")
 	_ID_SAND = BlockCatalog.id_of(&"sand")
 	_ID_RED_SAND = BlockCatalog.id_of(&"red_sand")
@@ -399,14 +406,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		# partial lip one cell above its surface, bridging a 1-block step up into a continuous slope.
 		# WATER-SHORE §3.6: underwater caps are now ON — a submerged step descends smoothly over
 		# multiple cells instead of ending in an abrupt half-block ledge. An underwater cap is the
-		# UNDERWATER-FLOOR material (via _surface_cap) and fills its remainder with water through
-		# _with_shore_water (level 9 exactly at the water line, level 10 below). A LAND cap
-		# (g >= SEA_LEVEL ⇒ y = g+1 > SEA_LEVEL) is a NO-OP under _with_shore_water (its y > SEA_LEVEL
+		# UNDERWATER-FLOOR material (via _surface_cap) and fills its remainder with liquid through
+		# _with_shore_liquid (level 9 exactly at the water line, level 10 below). A LAND cap
+		# (g >= SEA_LEVEL ⇒ y = g+1 > SEA_LEVEL) is a NO-OP under _with_shore_liquid (its y > SEA_LEVEL
 		# guard), so land caps stay byte-identical. Returns AIR (falls through) when no cap grows here.
 		if y == g + 1:
 			var cap := _surface_cap(x, z, g, biome, t, pcache)
 			if cap != BlockCatalog.AIR:
-				return _with_shore_water(cap, y, t)
+				return _with_shore_liquid(cap, y, t)
 		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
@@ -421,24 +428,26 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# material/stackup invariant holds; cells below the surface stay solid full cubes, so the
 	# analytic floor scan can never fall through. WATER-SHORE §3: the g >= SEA_LEVEL gate is
 	# GONE (underwater floors smooth too), and the smoothed surface is composed with the
-	# generated-liquid rule so a shore/floor cell also records the water filling its remainder.
+	# generated-liquid rule so a shore/floor cell also records the liquid filling its remainder.
 	if y == g:
-		return _with_shore_water(_smoothed_surface(x, z, g, id, pcache), y, t)
+		return _with_shore_liquid(_smoothed_surface(x, z, g, id, pcache), y, t)
 	return id
 
-## Compose the generated-liquid rule (WATER-SHORE §3) onto a SURFACE cell value: a cell at or
-## below the water line whose solid surface leaves a remainder (modifier != 0) also holds water
-## filling that remainder, top at 0.9 (level 9) when it IS the water line, else full (level 10).
-## PURE: reads only (v, y, t). No-op above the water line, on a full-cube surface (no remainder,
-## nothing to fill), and in the frozen regime at the water line (ice cube / bare frozen ramp —
-## the sheet ends crisply). Water strictly below the ice (y < SEA_LEVEL) is liquid as normal.
-static func _with_shore_water(v: int, y: int, t: float) -> int:
+## Compose the generated-liquid rule (WATER-SHORE §3, MULTI-LIQUID §2.4) onto a SURFACE cell value:
+## a cell at or below the water line whose solid surface leaves a remainder (modifier != 0) also
+## holds LIQUID filling that remainder, top at 0.9 (level 9) when it IS the water line, else full
+## (level 10). The liquid KIND is the column's sea regime (_sea_liquid_kind(t)), so shore AND
+## submerged composites of a molten sea carry LIQ_LAVA. PURE: reads only (v, y, t). No-op above the
+## water line, on a full-cube surface (no remainder), and in the frozen regime at the water line
+## (ice cube / bare frozen ramp — the sheet ends crisply). Liquid strictly below the ice
+## (y < SEA_LEVEL) fills as normal. Byte-identical to the water-only predecessor for t < LAVA_SEA_T.
+static func _with_shore_liquid(v: int, y: int, t: float) -> int:
 	if y > SEA_LEVEL or CellCodec.modifier(v) == 0:
 		return v
 	if y == SEA_LEVEL and t < -0.55:
 		return v                                          # frozen shore: ice regime, no liquid overlay
 	var lvl := CellCodec.LIQ_LEVEL_SURFACE if y == SEA_LEVEL else CellCodec.LIQ_LEVEL_FULL
-	return CellCodec.with_liquid(v, CellCodec.LIQ_WATER, lvl)
+	return CellCodec.with_liquid(v, _sea_liquid_kind(t), lvl)
 
 # ------------------------------------------------------------------------------
 # Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1). The walkable surface
@@ -581,9 +590,9 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -
 ## ground, a >1-block cliff that saturates to a full block, or a tree cell owning the
 ## cell). The cap is the column's surface material (biome top on land, underwater-floor material
 ## when submerged — WATER-SHORE §3.6), shaped by the SAME corner targets as the surface cell below
-## it, so the two form one crack-free continuous slope. Above the water line _with_shore_water (in
+## it, so the two form one crack-free continuous slope. Above the water line _with_shore_liquid (in
 ## resolve_cell) is a no-op, so land caps stay byte-identical; underwater it fills the remainder
-## with water (level 9 at the water line, 10 below).
+## with the sea's liquid (level 9 at the water line, 10 below).
 static func _surface_cap(x: int, z: int, g: int, biome: int, t: float, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return BlockCatalog.AIR                       # diagnostic: no cap cells
@@ -774,15 +783,24 @@ static func _bedrock_at(x: int, y: int, z: int) -> bool:
 # frozen oceans); water fills the rest. Cold columns also report sub-zero surface
 # air (PerVoxelEnvironment), so the generated sheet is structurally sound ice
 # rather than tissue-paper (INTEGRATION-DECISIONS §1.5 frozen-sea seam).
+## The liquid KIND of the sea fill for climate t (MULTI-LIQUID §2.4). THE single regime authority
+## consumed by _sea_block AND _with_shore_liquid, so open-water, shore and submerged composites of
+## one column can never disagree on kind. Frozen handling (t < -0.55 → an ice cap at the surface
+## cell) stays where it is: ice is a SOLID regime, disjoint from LAVA_SEA_T, not a liquid kind.
+static func _sea_liquid_kind(t: float) -> int:
+	return CellCodec.LIQ_LAVA if t >= LAVA_SEA_T else CellCodec.LIQ_WATER
+
 static func _sea_block(t: float, y: int) -> int:
+	var kind := _sea_liquid_kind(t)                   # water / molten regime (frozen handled below)
+	var lrid := BlockCatalog.liquid_lrid_of(kind)     # water → 44, lava → 45
 	if y == SEA_LEVEL:
 		if t < -0.55:
 			return _ID_ICE                            # frozen cap (unchanged; no liquid overlay)
-		# The open-water surface cell: water MATERIAL carrying a liquid(WATER, 9) overlay so the
-		# renderer draws the sunk 0.9 slab instead of a full cube (WATER-SHORE §3.1).
-		return CellCodec.pack(_ID_WATER, 0, 0,
-			CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE))
-	return _ID_WATER                                  # deep water: bare id (§2.3.5 canonical full water)
+		# The open surface cell: the liquid MATERIAL carrying a liquid(kind, 9) overlay so the
+		# renderer draws the sunk 0.9 slab instead of a full cube (WATER-SHORE §3.1, kind-parameterized).
+		return CellCodec.pack(lrid, 0, 0,
+			CellCodec.make_liquid(kind, CellCodec.LIQ_LEVEL_SURFACE))
+	return lrid                                       # deep liquid: bare id (§2.3.5 canonical full liquid)
 
 # --- stage: surface rule (WGC §6.5) -------------------------------------------
 static func _surface_rule(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
@@ -1001,20 +1019,41 @@ static func find_spawn() -> Vector2i:
 				return Vector2i(x, z)
 	return Vector2i(0, 0)
 
-## The first column at exactly the water line (g == SEA_LEVEL), scanned outward from origin with
-## the same deterministic pattern as find_spawn (radius 0..512 step 4, 15° steps). It is the centre
-## of the coastal sample emitted_modifiers()/emitted_shore_pairs() use so the underwater-floor and
-## shore-composite shapes are captured. Deterministic, main-thread, setup/verify-time only;
-## Vector2i(0, 0) fallback if no coastline is found within 512 (WATER-SHORE §3.5).
-static func find_coast() -> Vector2i:
-	for radius in range(0, 512, 4):
+## Sentinel returned by find_coast_of when no coast of the requested kind is found in range.
+const _COAST_NONE := Vector2i(0x7fffffff, 0x7fffffff)
+
+## The first column at exactly the water line (g == SEA_LEVEL) whose SEA REGIME is `kind`
+## (MULTI-LIQUID §2.4) — i.e. non-frozen (t >= -0.55) AND _sea_liquid_kind(t) == kind — scanned
+## outward from origin with the find_spawn pattern (radius step 4, 15° steps). Water coasts are
+## common (radius 512); lava coasts are rare (temperature freq 0.002 → hundreds-of-blocks climate
+## regions, same rarity class as frozen oceans), so the lava scan extends to 1024. Returns
+## _COAST_NONE if none is found, in which case per-kind SHORE-pair sampling is skipped — safe,
+## because emitted_submerged_pairs is material-complete regardless (distant seas still get their
+## submerged twins; only unsampled shore pairs degrade to the dry border, never a hole).
+## Deterministic, main-thread, setup/verify-time only.
+static func find_coast_of(kind: int) -> Vector2i:
+	var max_r := 1024 if kind == CellCodec.LIQ_LAVA else 512
+	for radius in range(0, max_r, 4):
 		for a in range(0, 360, 15):
 			var rad := deg_to_rad(float(a))
 			var x := int(round(cos(rad) * float(radius)))
 			var z := int(round(sin(rad) * float(radius)))
-			if height_at(x, z) == SEA_LEVEL:
-				return Vector2i(x, z)
-	return Vector2i(0, 0)
+			if height_at(x, z) != SEA_LEVEL:
+				continue
+			var t := column_profile(x, z).w
+			if t < -0.55:
+				continue                              # frozen: ice regime, not a liquid coast
+			if _sea_liquid_kind(t) != kind:
+				continue                              # a different liquid regime
+			return Vector2i(x, z)
+	return _COAST_NONE
+
+## The nearest WATER coastline centre, for the coastal manifest sample
+## (emitted_modifiers()/emitted_shore_pairs()) and verify. Water-compat wrapper over find_coast_of;
+## preserves the historical Vector2i(0, 0) fallback for callers that index into the result.
+static func find_coast() -> Vector2i:
+	var c := find_coast_of(CellCodec.LIQ_WATER)
+	return Vector2i(0, 0) if c == _COAST_NONE else c
 
 ## The sampled set of (surface material, modifier) pairs a SHORE composite actually emits at the
 ## LEVEL-9 water line (WATER-SHORE §3.5/§3.6), each encoded as the SAME slot the module manifest
@@ -1032,18 +1071,27 @@ static func find_coast() -> Vector2i:
 ## completeness (a rare unsampled pair renders as the DRY shaped model on the worker: a notch,
 ## never a hole). Cached statically; main-thread setup/verify only, never the voxel worker.
 const _SHORE_STRIDE := 256
-static var _shore_ready := false
-static var _shore_pairs := PackedInt32Array()
-static func emitted_shore_pairs() -> PackedInt32Array:
+static var _shore_pairs_by_kind: Dictionary = {}     # liquid kind -> cached PackedInt32Array of shore pairs
+static func emitted_shore_pairs(kind := CellCodec.LIQ_WATER) -> PackedInt32Array:
 	if not SMOOTHING_ENABLED:
 		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
-	if _shore_ready:
-		return _shore_pairs
+	if _shore_pairs_by_kind.has(kind):
+		return _shore_pairs_by_kind[kind]
 	_ensure_noise()
 	_ensure_ids()
-	var c := find_coast()
+	var out := PackedInt32Array()
+	var c := find_coast_of(kind)
+	if c == _COAST_NONE:
+		# No coast of this kind in range (e.g. a lava sea outside the scan radius for this seed):
+		# skip shore-pair sampling. emitted_submerged_pairs is material-complete regardless, so the
+		# sea still gets its submerged twins; only unsampled shore pairs degrade to the dry border.
+		_shore_pairs_by_kind[kind] = out
+		return out
 	var r := _EMIT_SAMPLE_R
 	var seen := {}
+	# (1) SURFACE composites — columns exactly at the water line (g == SEA_LEVEL) whose sea regime
+	# is `kind` (non-frozen AND _sea_liquid_kind == kind, generalizing the old frozen-only skip; this
+	# also stops water sampling from wandering into a molten shore). Their material is the biome top.
 	for dx in range(-r, r + 1):
 		var x := c.x + dx
 		for dz in range(-r, r + 1):
@@ -1051,8 +1099,8 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 			if height_at(x, z) != SEA_LEVEL:
 				continue                              # shore composites live exactly at the water line
 			var p := column_profile(x, z)             # climate noise only for the few water-line columns
-			if p.w < -0.55:
-				continue                              # frozen shore: ice regime, no water composite
+			if p.w < -0.55 or _sea_liquid_kind(p.w) != kind:
+				continue                              # ice regime, or a different liquid regime
 			var sm := surface_modifier(x, z, {})      # direct compute (a fresh pcache avoids memo pollution)
 			if sm == 0:
 				continue
@@ -1067,19 +1115,17 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 			if height_at(x, z) != SEA_LEVEL - 1:
 				continue                              # water-line caps grow from the column just below
 			var p := column_profile(x, z)
-			if p.w < -0.55:
-				continue                              # frozen shore: ice regime, no water composite
+			if p.w < -0.55 or _sea_liquid_kind(p.w) != kind:
+				continue                              # ice regime, or a different liquid regime
 			var cm := surface_cap_modifier(x, z, {})  # direct compute (a fresh pcache avoids memo pollution)
 			if cm == 0:
 				continue
 			seen[_underwater_floor(int(p.y), x, z, p.w) * _SHORE_STRIDE + cm] = true
-	var out := PackedInt32Array()
 	for s: int in seen.keys():
 		out.append(s)
 	out.sort()
-	_shore_pairs = out
-	_shore_ready = true
-	return _shore_pairs
+	_shore_pairs_by_kind[kind] = out
+	return out
 
 ## The (surface material, modifier) pairs a SUBMERGED composite emits BELOW the water line — the
 ## companion set to emitted_shore_pairs() that NATIVE WATERLOGGING needs (WATERLOGGING.md §4.3
@@ -1094,7 +1140,11 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 ## an unused twin (harmless); a missing pair falls back to the dry shape (a border, never a hole).
 ## Encoded as mat * _SHORE_STRIDE + modifier, matching emitted_shore_pairs()/the module manifest slot.
 ## Main-thread setup/verify only (calls emitted_modifiers, which is not worker-safe); never the worker.
-static func emitted_submerged_pairs() -> PackedInt32Array:
+## MULTI-LIQUID §2.4: the `kind` argument is accepted so Stream C can call this per liquid, but the
+## CONTENT is kind-independent — a molten sea's underwater floor reuses _underwater_floor (hot ocean
+## → sand), so the four floor materials × emitted modifiers cover every submerged composite of ANY
+## liquid. Kept material-complete (never a spatial sample) so distant/unfound seas still get twins.
+static func emitted_submerged_pairs(_kind := CellCodec.LIQ_WATER) -> PackedInt32Array:
 	if not SMOOTHING_ENABLED:
 		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
 	_ensure_ids()

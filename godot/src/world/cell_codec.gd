@@ -37,14 +37,20 @@ const LIQ_FIELD_MASK := 0x3F
 const LIQ_KIND_MASK := 0x3
 const LIQ_NONE := 0
 const LIQ_WATER := 1
+const LIQ_LAVA := 2               # was reserved (WATER-SHORE §2.1); kind 3 stays reserved for a third liquid
 const LIQ_LEVEL_SURFACE := 9      # top at 0.9 — the water-line cell
 const LIQ_LEVEL_FULL := 10        # top at 1.0 — submerged composite
+
+## Liquid-kind name → value map (MULTI-LIQUID §2.1). This codec is the single authority
+## on the LIQ_KIND bit meanings; BlockCatalog resolves blocks.json "liquid_kind" strings
+## through this map. Extend with the next reserved value (3) when a third liquid lands.
+const LIQ_KIND_BY_NAME := {&"water": LIQ_WATER, &"lava": LIQ_LAVA}
 
 ## The 6-bit liquid field (kind + level) — 0 means "no liquid".
 static func liquid_field(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_FIELD_MASK
 
-## Liquid kind (0 = none, 1 = water, 2..3 reserved).
+## Liquid kind (0 = none, 1 = water, 2 = lava, 3 reserved).
 static func liquid_kind(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_KIND_MASK
 
@@ -191,9 +197,10 @@ static func _canonical_liquid(material: int, canonical_mod: int, liquid: int) ->
 		return 0
 	# The overlay kind on a solid composite is an OVERLAY liquid (independent of the solid
 	# host material, so liquid_kind_of(host) does not apply here). Validate it against the
-	# known-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
-	# survive on a solid host either. v1 ships only WATER; extend when lava lands.
-	if kind > LIQ_WATER:
+	# DECLARED-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
+	# survive on a solid host either. Any KNOWN kind (water, lava, a future third) may
+	# waterlog a solid composite; only a genuinely unknown/reserved kind is stripped.
+	if not BlockCatalog.is_liquid_kind_known(kind):
 		push_warning("CellCodec: unknown liquid kind %d on solid composite (material %d) — stripped"
 			% [kind, material])
 		return 0

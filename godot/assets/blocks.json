@@ -1402,6 +1402,7 @@
       "name": "water",
       "id": 44,
       "tier": "world",
+      "liquid_kind": "water",
       "mass": 560.0,
       "swatch": [
         0.247,
@@ -1433,6 +1434,7 @@
       "name": "lava",
       "id": 45,
       "tier": "world",
+      "liquid_kind": "lava",
       "mass": 1540.0,
       "swatch": [
         0.831,

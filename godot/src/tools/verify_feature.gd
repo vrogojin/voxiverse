@@ -51,6 +51,7 @@ func _initialize() -> void:
 	_test_shapes_live()
 	_test_fallback_water()
 	_test_waterlogging()
+	_test_multi_liquid_lava()
 	_test_metadata()
 	_test_zonechunk()
 	_test_dynamic_catalog()
@@ -227,8 +228,9 @@ func _test_worldgen() -> void:
 			biomes[TerrainConfig.biome_at(x, z)] = true
 	_ok(biomes.size() >= 5, "biome coverage >= 5 distinct in a 2000^2 sample (got %d)" % biomes.size())
 
-	# (b) sea: every underwater column is water-filled up to SEA_LEVEL and there is
-	# NO water above it; the sea is walked-through (non-solid, the P2 gate).
+	# (b) sea: every underwater column is liquid-filled (water, or lava over a molten ocean —
+	# MULTI-LIQUID §2.4) up to SEA_LEVEL and there is NO water above it; the sea is walked-through
+	# (non-solid, the P2 gate).
 	var SEA: int = TerrainConfig.SEA_LEVEL
 	var WATER := BlockCatalog.id_of(&"water")
 	var ICE := BlockCatalog.id_of(&"ice")
@@ -240,16 +242,20 @@ func _test_worldgen() -> void:
 			if g >= SEA:
 				continue
 			found_ocean = true
-			# a cell in the water column (just under the surface) is water or ice — OR, where an
-			# underwater smoothing CAP grows there (WATER-SHORE §3.6), a shaped cap composite of the
-			# underwater-floor material (it fills its own remainder with water up to the water line, or
-			# is a bare ramp in the frozen regime). Only a PLAIN solid full cube would be a real
-			# "solid floating in the sea" bug.
+			# a cell in the sea column (just under the surface) is the LIQUID of the column's climate
+			# regime — water, OR lava over a molten (t >= LAVA_SEA_T) ocean (MULTI-LIQUID §2.4) — or
+			# ice, OR, where an underwater smoothing CAP grows there (WATER-SHORE §3.6), a shaped cap
+			# composite of the underwater-floor material (it fills its own remainder with liquid up to
+			# the water line, or is a bare ramp in the frozen regime). Only a PLAIN solid full cube
+			# would be a real "solid floating in the sea" bug.
 			var my: int = SEA - 1 if SEA - 1 > g else g + 1
 			var midv: int = TerrainConfig.generated_cell(x, my, z)
 			var mid: int = CellCodec.mat(midv)
 			var is_cap: bool = my == g + 1 and CellCodec.modifier(midv) != 0
-			if mid != WATER and mid != ICE and not is_cap:
+			# The expected sea-fill material for this column's regime (retargeted from a bare == WATER
+			# check to _sea_liquid_kind so a molten sea's lava fill passes rather than flips — risk 5).
+			var reg_liq: int = BlockCatalog.liquid_lrid_of(TerrainConfig._sea_liquid_kind(TerrainConfig.column_profile(x, z).w))
+			if mid != reg_liq and mid != ICE and not is_cap:
 				sea_ok = false
 			# ...and there is no water ABOVE the sea surface.
 			if TerrainConfig.generated_block(x, SEA + 2, z) == WATER:
@@ -2391,6 +2397,273 @@ func _test_waterlogging() -> void:
 				print("    (no baked twin pair or water material — mesh-level border proof skipped)")
 	mw.queue_free()
 
+# MULTI-LIQUID Stream E (MULTI-LIQUID.md §5): lava is a first-class liquid — GENERATED (the
+# climate-keyed molten sea, §2.4), CANONICALIZED like water (the codec keeps a known kind on a
+# solid composite and strips an unknown one, rule 6), and RENDERED BORDERLESS within itself with a
+# crisp boundary against water (the opaque-fluid culling audit, §2.3). Five parts, mirroring the
+# WATER-SHORE / WATERLOGGING structure for the lava kind: (1) CODEC pins, (2) DATA MODEL +
+# GMID byte-identity, (3) WORLDGEN molten sea, (4) both-path ARID per kind (module-guarded),
+# (5) the MESH-LEVEL border-killer + crisp inter-liquid boundary (module + mesher guarded).
+func _test_multi_liquid_lava() -> void:
+	print("[MULTI-LIQUID] lava — generated / canonicalized / rendered borderless (MULTI-LIQUID §5)")
+	var LAVA := BlockCatalog.id_of(&"lava")
+	var WATER := BlockCatalog.id_of(&"water")
+	var SEA: int = TerrainConfig.SEA_LEVEL
+	var S := CellCodec.LIQ_LEVEL_SURFACE
+	var F := CellCodec.LIQ_LEVEL_FULL
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # a real (wedge) modifier: a solid composite host
+	_ok(LAVA > 0, "lava id resolves (id_of(&\"lava\") = %d)" % LAVA)
+
+	# ---- (1) CODEC pins: rule 6 keeps a KNOWN kind on a solid composite, strips an unknown one ----
+	# is_liquid_kind_known is rule 6's gate: water + lava are declared, kind 3 is reserved, NONE never.
+	_ok(BlockCatalog.is_liquid_kind_known(CellCodec.LIQ_WATER), "codec: is_liquid_kind_known(WATER) == true")
+	_ok(BlockCatalog.is_liquid_kind_known(CellCodec.LIQ_LAVA), "codec: is_liquid_kind_known(LAVA) == true")
+	_ok(not BlockCatalog.is_liquid_kind_known(3), "codec: is_liquid_kind_known(3, reserved) == false")
+	_ok(not BlockCatalog.is_liquid_kind_known(CellCodec.LIQ_NONE), "codec: is_liquid_kind_known(NONE) == false")
+	# A LAVA overlay on a SOLID composite (modifier != 0) is KEPT bit-exactly (rule 6, known kind).
+	var lava_comp := CellCodec.canonical(CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(CellCodec.LIQ_LAVA, S)))
+	_ok(CellCodec.liquid_kind(lava_comp) == CellCodec.LIQ_LAVA and CellCodec.liquid_level(lava_comp) == S
+			and CellCodec.mat(lava_comp) == STONE and CellCodec.modifier(lava_comp) == RAMP,
+		"codec: canonical KEEPS liquid(LAVA, 9) on a solid composite (rule 6, known kind)")
+	# An UNKNOWN kind (3) on the same solid composite is STRIPPED (rule 6 gate), material/modifier kept.
+	var unk := CellCodec.canonical(CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(3, 5)))
+	_ok(CellCodec.liquid_field(unk) == 0 and CellCodec.mat(unk) == STONE and CellCodec.modifier(unk) == RAMP,
+		"codec: canonical STRIPS unknown liquid kind 3 on a solid composite (rule 6), mat/modifier kept")
+	# (lava, 10) on the LAVA material → the bare lava id (rule 5: no dual encoding of full lava).
+	_ok(CellCodec.canonical(CellCodec.pack(LAVA, 0, 0, CellCodec.make_liquid(CellCodec.LIQ_LAVA, F))) == LAVA,
+		"codec: canonical (lava,10) on lava → bare lava id (rule 5)")
+	# bits 54..63 stay 0 after packing a lava composite (the liquid field never leaks into reserved bits).
+	_ok((CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(CellCodec.LIQ_LAVA, S)) >> 54) == 0,
+		"codec: bits 54..63 == 0 after packing a lava composite")
+
+	# ---- (2) DATA MODEL: material liquid identity + GMID byte-identity (omit-when-zero) ------------
+	_ok(BlockCatalog.liquid_kind_of(WATER) == CellCodec.LIQ_WATER, "data: liquid_kind_of(water) == LIQ_WATER")
+	_ok(BlockCatalog.liquid_kind_of(LAVA) == CellCodec.LIQ_LAVA, "data: liquid_kind_of(lava) == LIQ_LAVA")
+	_ok(BlockCatalog.liquid_kind_of(STONE) == CellCodec.LIQ_NONE, "data: liquid_kind_of(a solid, stone) == LIQ_NONE")
+	_ok(BlockCatalog.liquid_lrid_of(CellCodec.LIQ_LAVA) == LAVA, "data: liquid_lrid_of(LIQ_LAVA) == id_of(&\"lava\")")
+	_ok(BlockCatalog.liquid_lrid_of(CellCodec.LIQ_WATER) == WATER, "data: liquid_lrid_of(LIQ_WATER) == id_of(&\"water\")")
+	_ok(BlockCatalog.cull_group_of(LAVA) == 0, "data: cull_group_of(lava) == 0 (opaque fluid — the sliver-fix trigger)")
+	# GMID byte-identity: a NON-liquid material's serialized document OMITS "liquid_kind" (so its GMID is
+	# byte-identical to before the field existed); water AND lava DO carry it (safe: never serialized into
+	# a zone bundle — placement rejects non-solid, capture strips the liquid axis). Byte-level substring.
+	var stone_doc := MaterialDocument.to_document(BlockCatalog.def_of(STONE)).get_string_from_utf8()
+	var dirt_doc := MaterialDocument.to_document(BlockCatalog.def_of(DIRT)).get_string_from_utf8()
+	var water_doc := MaterialDocument.to_document(BlockCatalog.def_of(WATER)).get_string_from_utf8()
+	var lava_doc := MaterialDocument.to_document(BlockCatalog.def_of(LAVA)).get_string_from_utf8()
+	_ok(stone_doc.find("liquid_kind") == -1, "data: a non-liquid material (stone) document OMITS liquid_kind (GMID byte-identity)")
+	_ok(dirt_doc.find("liquid_kind") == -1, "data: a non-liquid material (dirt) document OMITS liquid_kind (GMID byte-identity)")
+	_ok(water_doc.find("liquid_kind") != -1, "data: the water document CARRIES liquid_kind (declared liquid)")
+	_ok(lava_doc.find("liquid_kind") != -1, "data: the lava document CARRIES liquid_kind (declared liquid)")
+
+	# ---- (3) WORLDGEN: the climate-keyed molten sea exists & is deterministic (§2.4) --------------
+	# A molten ocean exists for the known seed (rare — temperature freq 0.002); a not-found here is a
+	# LOUD failure, never a silent pass (§5 Stream E: a vacuous skip must not masquerade as green).
+	var molten := _find_molten_column()
+	_ok(molten.x != 0x7fffffff, "worldgen: a molten-sea column (t >= LAVA_SEA_T, g < SEA_LEVEL) exists for the seed")
+	if molten.x != 0x7fffffff:
+		var mt: float = TerrainConfig.column_profile(molten.x, molten.y).w
+		var mg: int = TerrainConfig.height_at(molten.x, molten.y)
+		_ok(mt >= TerrainConfig.LAVA_SEA_T and mg < SEA, "worldgen: molten column t=%.3f >= LAVA_SEA_T and g=%d < SEA" % [mt, mg])
+		# The sea-fill SURFACE cell at the water line is the LAVA material carrying liquid(LAVA, 9).
+		var msurf := TerrainConfig.generated_cell(molten.x, SEA, molten.y)
+		_ok(CellCodec.mat(msurf) == LAVA and CellCodec.liquid_kind(msurf) == CellCodec.LIQ_LAVA
+				and CellCodec.liquid_level(msurf) == S,
+			"worldgen: molten sea SURFACE cell (y==SEA) is lava + liquid(LAVA, 9)")
+		# Deep molten sea (y == SEA-1) is the BARE lava id (canonical full lava, byte-stable).
+		_ok(TerrainConfig.generated_cell(molten.x, SEA - 1, molten.y) == LAVA,
+			"worldgen: molten sea at SEA-1 is the BARE lava id (canonical full lava)")
+		# DETERMINISM incl. the liquid bits (48+): a full-int re-sample of the surface cell is identical.
+		_ok(TerrainConfig.generated_cell(molten.x, SEA, molten.y) == msurf,
+			"worldgen: molten sea-fill cell (incl. liquid bits 48+) is deterministic on re-sample")
+		# A molten SHORE/SUBMERGED composite, if the terrain grows one near the sea, carries LIQ_LAVA:
+		# a SOLID terrain material + a surface modifier + a lava liquid overlay (level 10 submerged).
+		var msub := _find_molten_submerged(molten)
+		if msub.x != 0x7fffffff:
+			var sg: int = TerrainConfig.height_at(msub.x, msub.y)
+			var sc := TerrainConfig.generated_cell(msub.x, sg, msub.y)
+			_ok(BlockCatalog.solidity_of(CellCodec.mat(sc)) >= 0.5 and CellCodec.modifier(sc) != 0,
+				"worldgen: molten submerged composite is a SOLID terrain material + a surface modifier")
+			_ok(CellCodec.liquid_kind(sc) == CellCodec.LIQ_LAVA and CellCodec.liquid_level(sc) == F,
+				"worldgen: molten submerged composite carries liquid(LAVA, 10) — full-fill lava")
+		else:
+			print("    (no smoothed molten-floor composite found near the molten sea — submerged-lava assert skipped)")
+	# BYTE-IDENTITY of the temperate regime: a NON-molten (t < LAVA_SEA_T) open-water column STILL
+	# generates WATER sea fill — the molten regime flips ONLY hot oceans, everything else is unchanged.
+	var ow := _find_open_water(false)
+	if ow.x != 0x7fffffff:
+		var owt: float = TerrainConfig.column_profile(ow.x, ow.y).w
+		var owsurf := TerrainConfig.generated_cell(ow.x, SEA, ow.y)
+		_ok(owt < TerrainConfig.LAVA_SEA_T, "worldgen: the open-water column is temperate (t=%.3f < LAVA_SEA_T)" % owt)
+		_ok(CellCodec.mat(owsurf) == WATER and CellCodec.liquid_kind(owsurf) == CellCodec.LIQ_WATER,
+			"worldgen: a temperate column STILL generates WATER sea fill (byte-identity — regime flips only hot oceans)")
+		_ok(TerrainConfig._sea_liquid_kind(owt) == CellCodec.LIQ_WATER
+				and TerrainConfig._sea_liquid_kind(0.7) == CellCodec.LIQ_LAVA,
+			"worldgen: _sea_liquid_kind is the single regime authority (temperate → WATER, 0.7 → LAVA)")
+
+	# ---- (4) BOTH-PATH ARID per kind (module-guarded, mirroring the water case) --------------------
+	if not (ClassDB.class_exists("VoxelTerrain") and ClassDB.class_exists("VoxelBuffer")):
+		print("    (godot_voxel module absent — per-kind ARID + mesh-level lava proofs run on module builds only)")
+		return
+	var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+	get_root().add_child(mw)
+	var built: bool = mw.call("setup")
+	_ok(built, "lava-arid: module world builds (water + lava fluids registered)")
+	if not built:
+		mw.queue_free()
+		return
+
+	# Deep lava (bare id, level 0) and surface lava (level 9, modifier 0) share ONE lava fluid ARID —
+	# exactly like deep/surface water — so a molten ocean interior and its skin render as one fluid.
+	var deep_lava := int(mw.call("gen_arid_for", LAVA, 0, 0, CellCodec.LIQ_LAVA))
+	var surf_lava := int(mw.call("gen_arid_for", LAVA, 0, S, CellCodec.LIQ_LAVA))
+	_ok(deep_lava == surf_lava,
+		"lava-arid: deep lava (lvl 0) and surface lava (lvl 9) share ONE fluid ARID (%d == %d)" % [deep_lava, surf_lava])
+	# Water and lava fluid ARIDs are DIFFERENT (distinct fluid_index → a crisp water/lava boundary,
+	# never a mutual cull). The setup log shows surface ARIDs water=44, lava=45.
+	var surf_water := int(mw.call("gen_arid_for", WATER, 0, S, CellCodec.LIQ_WATER))
+	_ok(surf_water != surf_lava,
+		"lava-arid: water and lava fluid ARIDs DIFFER (%d != %d — distinct fluid_index)" % [surf_water, surf_lava])
+	# A real emitted LAVA composite pair resolves to its lava twin (level 9 == level 10), != the dry shape.
+	var lava_pairs := {}
+	for slot: int in TerrainConfig.emitted_submerged_pairs(CellCodec.LIQ_LAVA):
+		lava_pairs[slot] = true
+	for slot: int in TerrainConfig.emitted_shore_pairs(CellCodec.LIQ_LAVA):
+		lava_pairs[slot] = true
+	var lava_twin_mat := -1
+	var lava_twin_mod := -1
+	var lava_checked := 0
+	var lava_same_twin := 0
+	var lava_covered := 0
+	for slot: int in lava_pairs.keys():
+		var m := slot / 256
+		var md := slot % 256
+		if m <= BlockCatalog.AIR or m >= BlockCatalog.count() or md <= 0:
+			continue
+		var t9 := int(mw.call("gen_arid_for", m, md, S, CellCodec.LIQ_LAVA))
+		var t10 := int(mw.call("gen_arid_for", m, md, F, CellCodec.LIQ_LAVA))
+		var dry := int(mw.call("gen_arid_for", m, md, 0, CellCodec.LIQ_LAVA))
+		lava_checked += 1
+		if t9 == t10:
+			lava_same_twin += 1
+		if t10 != dry:
+			lava_covered += 1
+			if lava_twin_mat < 0:
+				lava_twin_mat = m
+				lava_twin_mod = md
+	_ok(lava_checked > 0, "lava-arid: emitted lava composite pairs to check (%d shore∪submerged)" % lava_checked)
+	_ok(lava_same_twin == lava_checked,
+		"lava-arid: level-9 and level-10 resolve to the SAME lava twin for every pair (%d/%d) — one lava fluid" % [lava_same_twin, lava_checked])
+	_ok(lava_covered * 10 >= lava_checked * 9,
+		"lava-arid: >=90%% of emitted lava composite pairs have a baked twin != dry shape (%d/%d)" % [lava_covered, lava_checked])
+	# A lava twin ARID is DISJOINT from a water twin ARID for the same (mat, modifier) — the kind-keyed
+	# tables never mis-skin lava as water (risk 3). Only when BOTH kinds baked that pair.
+	if lava_twin_mat >= 0:
+		var l_twin := int(mw.call("gen_arid_for", lava_twin_mat, lava_twin_mod, F, CellCodec.LIQ_LAVA))
+		var w_twin := int(mw.call("gen_arid_for", lava_twin_mat, lava_twin_mod, F, CellCodec.LIQ_WATER))
+		if w_twin != int(mw.call("gen_arid_for", lava_twin_mat, lava_twin_mod, 0)):   # water baked this pair too
+			_ok(l_twin != w_twin,
+				"lava-arid: a lava twin ARID is DISJOINT from the water twin for the same (mat %d, mod %d) — no mis-skin" % [lava_twin_mat, lava_twin_mod])
+	print("    lava twins: %d pairs checked, %d covered (twin != dry), %d share-one-fluid" % [lava_checked, lava_covered, lava_same_twin])
+
+	# Drive the module generator over the molten sea block: every LAVA-carrying TYPE it writes equals
+	# gen_arid_for(mat, modifier, level, LIQ_LAVA) — the worker reads the kind from the packed value, so
+	# a lava cell resolves through the lava tables (anti-drift + consistency, the both-path invariant).
+	if molten.x != 0x7fffffff:
+		var gen: Object = mw.call("get_generator")
+		if gen != null:
+			var bx := floori(molten.x / 16.0) * 16
+			var bz := floori(molten.y / 16.0) * 16
+			var origins := [Vector3i(bx, -16, bz), Vector3i(bx, 0, bz)]
+			var lava_cells := 0
+			var lava_mismatch := 0
+			for origin: Vector3i in origins:
+				var buf: Object = ClassDB.instantiate("VoxelBuffer")
+				buf.call("create", 16, 16, 16)
+				if buf.has_method("fill"):
+					buf.call("fill", 0, 0)
+				gen.call("_generate_block", buf, origin, 0)
+				for lz in range(16):
+					for lx in range(16):
+						for ly in range(16):
+							var v: int = TerrainConfig.generated_cell(origin.x + lx, origin.y + ly, origin.z + lz)
+							var mat: int = CellCodec.mat(v)
+							if mat != LAVA and CellCodec.liquid_kind(v) != CellCodec.LIQ_LAVA:
+								continue
+							lava_cells += 1
+							var got: int = int(buf.call("get_voxel", lx, ly, lz, 0))
+							var kind: int = CellCodec.liquid_kind(v)
+							if kind == CellCodec.LIQ_NONE:
+								kind = CellCodec.LIQ_LAVA          # a bare lava id defaults to its own kind
+							var expected: int = int(mw.call("gen_arid_for", mat, CellCodec.modifier(v), CellCodec.liquid_level(v), kind))
+							if got != expected:
+								lava_mismatch += 1
+			_ok(lava_cells > 0, "lava-arid: the molten sea block sample contains lava cells (%d)" % lava_cells)
+			_ok(lava_mismatch == 0,
+				"lava-arid: module TYPE == gen_arid_for(mat, modifier, level, LIQ_LAVA) over %d lava cells (%d mismatches)" % [lava_cells, lava_mismatch])
+
+	# ---- (5) MESH-LEVEL border-killer for LAVA + crisp water/lava boundary (risk 1, risk 2) --------
+	# The durable regression guard: actually mesh a LAVA twin beside pure LAVA and assert the shared
+	# LAVA face is CULLED (borderless) while the terrain ramp is present (no hole) — mirroring the water
+	# mesh test in _test_waterlogging but for the lava kind. Then the CRISP inter-liquid boundary: a
+	# WATER cell beside a LAVA cell does NOT cull (different fluid_index → both faces drawn). A
+	# differential over isolated vs adjacent meshes (adjacency can only REMOVE faces, never add).
+	if ClassDB.class_exists("VoxelMesherBlocky") and lava_twin_mat >= 0:
+		var lib: Object = mw.get("_library")
+		var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+		if lib != null and mesher != null and mesher.has_method("set_library") and mesher.has_method("build_mesh"):
+			mesher.call("set_library", lib)
+			var minp: int = mesher.call("get_minimum_padding")
+			var maxp: int = mesher.call("get_maximum_padding")
+			var lava_mat: Object = BlockMaterials.get_for(LAVA)
+			var water_mat: Object = BlockMaterials.get_for(WATER)
+			var terr_mat: Object = BlockMaterials.get_for(lava_twin_mat)
+			var lava_arid := int(mw.call("arid_for_cell", LAVA))
+			var water_arid := int(mw.call("arid_for_cell", WATER))
+			var lava_twin_arid := int(mw.call("arid_for_cell",
+				CellCodec.pack(lava_twin_mat, lava_twin_mod, 0, CellCodec.make_liquid(CellCodec.LIQ_LAVA, F))))
+			var b := minp + 1
+			var span := minp + maxp + 4
+			# Mesh a cell layout; return a Dictionary {surface material -> total vertex count}.
+			var mesh_counts := func(cells: Array) -> Dictionary:
+				var buf: Object = ClassDB.instantiate("VoxelBuffer")
+				buf.call("set_channel_depth", 0, 1)         # CHANNEL_TYPE, DEPTH_16_BIT (ARIDs exceed 255)
+				buf.call("create", span, span, span)
+				buf.call("fill", 0, 0)                       # air
+				for c in cells:
+					var p: Vector3i = c[0]
+					buf.call("set_voxel", int(c[1]), p.x, p.y, p.z, 0)
+				var msh: Object = mesher.call("build_mesh", buf, [], {})
+				var out := {}
+				if msh != null:
+					for i in msh.get_surface_count():
+						var mm: Object = msh.surface_get_material(i)
+						var nn := (msh.surface_get_arrays(i)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+						out[mm] = int(out.get(mm, 0)) + nn
+				return out
+			var lv := func(d: Dictionary) -> int: return int(d.get(lava_mat, 0))
+			var wv := func(d: Dictionary) -> int: return int(d.get(water_mat, 0))
+			var tv := func(d: Dictionary) -> int: return int(d.get(terr_mat, 0))
+			if lava_mat != null and water_mat != null:
+				var twin_only: Dictionary = mesh_counts.call([[Vector3i(b, b, b), lava_twin_arid]])
+				var lava_only: Dictionary = mesh_counts.call([[Vector3i(b, b, b), lava_arid]])
+				var lava_adj: Dictionary = mesh_counts.call([[Vector3i(b, b, b), lava_twin_arid], [Vector3i(b + 1, b, b), lava_arid]])
+				_ok(tv.call(twin_only) > 0, "lava-mesh: the lava twin renders its opaque terrain ramp — no hole (%d terrain verts)" % tv.call(twin_only))
+				_ok(lv.call(twin_only) > 0 and lv.call(lava_only) > 0,
+					"lava-mesh: twin and pure lava each render lava faces in isolation (%d, %d)" % [lv.call(twin_only), lv.call(lava_only)])
+				_ok(lv.call(lava_adj) < lv.call(twin_only) + lv.call(lava_only),
+					"lava-mesh: shared twin↔lava face is CULLED — borderless (combined %d < isolated sum %d)" % [lv.call(lava_adj), lv.call(twin_only) + lv.call(lava_only)])
+				# Crisp inter-liquid boundary: a WATER cell beside a LAVA cell does NOT cull (different
+				# fluid_index) — the total water+lava verts are PRESERVED (adjacency can only remove faces).
+				var water_only: Dictionary = mesh_counts.call([[Vector3i(b, b, b), water_arid]])
+				var wl_adj: Dictionary = mesh_counts.call([[Vector3i(b, b, b), water_arid], [Vector3i(b + 1, b, b), lava_arid]])
+				var wl_sum: int = int(wv.call(wl_adj)) + int(lv.call(wl_adj))
+				var iso_sum: int = int(wv.call(water_only)) + int(lv.call(lava_only))
+				_ok(wl_sum >= iso_sum,
+					"lava-mesh: water beside lava is NOT culled — crisp boundary (combined %d >= isolated sum %d)" % [wl_sum, iso_sum])
+				print("    lava-mesh: twin(lava=%d,terr=%d) lava=%d twin+lava=%d (<%d ⇒ border culled); water|lava %d (>=%d ⇒ boundary drawn)"
+					% [lv.call(twin_only), tv.call(twin_only), lv.call(lava_only), lv.call(lava_adj), lv.call(twin_only) + lv.call(lava_only), wl_sum, iso_sum])
+	mw.queue_free()
+
 func _test_shapes_live() -> void:
 	print("[P5b-1] sub-voxel shapes live (render ARIDs + analytic physics + dig/place)")
 	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # descending along +z: H(fx,fz) = 1 − fz
@@ -3979,6 +4252,42 @@ func _find_frozen_shore() -> Vector2i:
 			if TerrainConfig.height_at(x, z) != TerrainConfig.SEA_LEVEL:
 				continue
 			if TerrainConfig.column_profile(x, z).w >= -0.55:
+				continue
+			if TerrainConfig.surface_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first MOLTEN-SEA column (MULTI-LIQUID §2.4): an underwater column (g < SEA_LEVEL) whose
+## climate temperature is in the molten regime (t >= LAVA_SEA_T), so its sea fill IS lava. Molten
+## oceans are rare (temperature freq 0.002 → hundreds-of-blocks climate regions, same class as
+## frozen oceans), so this is a WIDE scan (biased toward the lava coast if one is in range, then a
+## dense outward sweep). Returns the (0x7fffffff, _) sentinel if none — the caller asserts LOUDLY.
+func _find_molten_column() -> Vector2i:
+	var lc := TerrainConfig.find_coast_of(CellCodec.LIQ_LAVA)
+	if lc.x != 0x7fffffff:
+		for dx in range(-60, 61):
+			for dz in range(-60, 61):
+				var p := TerrainConfig.column_profile(lc.x + dx, lc.y + dz)
+				if p.w >= TerrainConfig.LAVA_SEA_T and int(p.x) < TerrainConfig.SEA_LEVEL:
+					return Vector2i(lc.x + dx, lc.y + dz)
+	for x in range(-1400, 1400, 5):
+		for z in range(-1400, 1400, 5):
+			var p := TerrainConfig.column_profile(x, z)
+			if p.w >= TerrainConfig.LAVA_SEA_T and int(p.x) < TerrainConfig.SEA_LEVEL:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first smoothed MOLTEN-FLOOR composite near a known molten column `m`: an underwater column
+## (g < SEA_LEVEL) in the molten regime (t >= LAVA_SEA_T) with a nonzero surface modifier — a
+## submerged composite whose liquid overlay is LIQ_LAVA (level 10). Sentinel if the terrain grows no
+## smoothed molten floor in the sampled region (the caller then prints a skip, never a silent pass).
+func _find_molten_submerged(m: Vector2i) -> Vector2i:
+	for dx in range(-48, 49):
+		for dz in range(-48, 49):
+			var x := m.x + dx
+			var z := m.y + dz
+			var p := TerrainConfig.column_profile(x, z)
+			if int(p.x) >= TerrainConfig.SEA_LEVEL or p.w < TerrainConfig.LAVA_SEA_T:
 				continue
 			if TerrainConfig.surface_modifier(x, z) != 0:
 				return Vector2i(x, z)

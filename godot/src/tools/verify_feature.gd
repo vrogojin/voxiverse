@@ -57,6 +57,7 @@ func _initialize() -> void:
 	_test_dynamic_catalog()
 	_test_zone_bundle()
 	_test_snowy_world()
+	_test_snow_layer_codec()
 	_test_mountains()
 	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -3867,6 +3868,43 @@ func _bundle_doc(mat_name: String, state_name: String, mass: float, swatch: Colo
 	# stays legal through _validate_state (the charlie cell carries state 5) — retarget, don't weaken.
 	def.state_layout = [&"s0", &"s1", &"s2"]
 	return MaterialDocument.to_document(def)
+
+# SNOW ACCUMULATION Phase A1 (SNOW-ACCUMULATION.md §1): the LAYER shape family — variable-height
+# snow depth (tenths) on the modifier axis. Fences make_layer's canonical mapping (10→full cube,
+# 5→the corner slab 85, 0→AIR, 1..4/6..9→FAM), the is_layer/layer_level/snow_tenths accessors, and
+# canonical()'s handling of FAM modifiers (round-trip, empty→AIR, unknown-kind/reserved→full cube,
+# non-solid strip). Physics/render branches (ShapeCodec, mesher, worldgen) land in later A1/A2 steps.
+func _test_snow_layer_codec() -> void:
+	print("[SNOW-A1] LAYER shape family codec")
+	var WATER_ID := BlockCatalog.id_of(&"water")
+	# make_layer canonical mapping
+	_ok(CellCodec.make_layer(10) == 0, "make_layer(10) == 0 (full cube)")
+	_ok(CellCodec.make_layer(5) == CellCodec.LAYER_SLAB_MODIFIER, "make_layer(5) == 85 (corner slab)")
+	_ok(CellCodec.LAYER_SLAB_MODIFIER == ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM),
+		"LAYER_SLAB_MODIFIER == make_modifier(1,1,1,1,BOTTOM)")
+	_ok(CellCodec.make_layer(0) == CellCodec.MOD_FAM_BIT, "make_layer(0) == MOD_FAM_BIT (empty marker)")
+	for lv in [1, 2, 3, 4, 6, 7, 8, 9]:
+		var m := CellCodec.make_layer(lv)
+		_ok(CellCodec.is_layer(m), "make_layer(%d) is a FAM LAYER" % lv)
+		_ok(CellCodec.layer_level(m) == lv, "layer_level(make_layer(%d)) == %d" % [lv, lv])
+		_ok(CellCodec.snow_tenths(m) == lv, "snow_tenths(FAM layer %d) == %d" % [lv, lv])
+	# is_layer / snow_tenths on the non-FAM canonical forms (level 5 == 85, level 10 == 0)
+	_ok(not CellCodec.is_layer(85) and CellCodec.snow_tenths(85) == 5, "level-5 slab (85): not FAM, snow_tenths 5")
+	_ok(not CellCodec.is_layer(0) and CellCodec.snow_tenths(0) == 10, "full cube (0): not FAM, snow_tenths 10")
+	# canonical() on a solid host: a level-3 layer round-trips; raw FAM level 10 → full cube; raw
+	# FAM level 0 → AIR (whole cell zeroed); unknown kind / reserved bit → full cube.
+	var l3 := CellCodec.pack(STONE, CellCodec.make_layer(3))
+	_ok(CellCodec.canonical(l3) == l3, "canonical stable on a level-3 layer (solid host)")
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, CellCodec.MOD_FAM_BIT | 10))) == 0,
+		"raw FAM level 10 → full cube (0)")
+	_ok(CellCodec.canonical(CellCodec.pack(STONE, CellCodec.MOD_FAM_BIT)) == 0, "raw FAM level 0 → AIR (cell zeroed)")
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, CellCodec.MOD_FAM_BIT | (1 << CellCodec.MOD_FAM_KIND_SHIFT)))) == 0,
+		"unknown FAM kind → full cube")
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, CellCodec.MOD_FAM_BIT | (1 << 4)))) == 0,
+		"FAM reserved bit set → full cube")
+	# a FAM LAYER on a NON-solid material strips (no 'layer of water') — the merged-contract gate
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(WATER_ID, CellCodec.make_layer(3)))) == 0,
+		"FAM layer on a non-solid material strips to full cube")
 
 # M1 SNOWY WORLD (M1-SNOWY-WORLD.md): the STATE axis (snow_capped), the absolute-altitude
 # climate temperature model, snow-cap render variants, and the deep-frozen half-slab. Fences the

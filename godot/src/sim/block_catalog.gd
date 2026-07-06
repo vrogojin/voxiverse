@@ -108,7 +108,12 @@ static func ensure_ready() -> void:
 		var lr: Variant = rec.get("state_layout", [])
 		if lr is Array:
 			for nm: Variant in lr:
-				layout.append(StringName(String(nm)))
+				var sn := StringName(String(nm))
+				# The STATE axis is 16 bits, one per name; drop overflow past 16 and duplicate
+				# names (which would alias two bits) defensively — _layout_mask assumes clean input.
+				if layout.size() >= 16 or layout.has(sn):
+					continue
+				layout.append(sn)
 		var lrid := _register_bootstrap_state(st, alias, layout)
 		assert(lrid == id, "bootstrap LRID %d != id %d (append order broke)" % [lrid, id])
 	_assert_frozen_core()
@@ -463,7 +468,7 @@ static func state_mask_of(lrid: int) -> int:
 static func _layout_mask(def: VoxelMaterialDef) -> int:
 	if def == null:
 		return 0
-	var n := def.state_layout.size()
+	var n := mini(def.state_layout.size(), 16)       # STATE axis is 16 bits — never emit past bit 15
 	return ((1 << n) - 1) if n > 0 else 0
 
 ## Liquid identity of a material (MULTI-LIQUID §2.1): the CellCodec LIQ_KIND value this

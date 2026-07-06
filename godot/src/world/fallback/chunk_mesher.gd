@@ -78,7 +78,12 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 			topids[lz * n + lx] = _look_of(vtop)
 			topmods[lz * n + lx] = CellCodec.modifier(vtop)
 			var vcap := world.cell_value_at(Vector3i(x0 + lx, h + 1, z0 + lz))
-			if CellCodec.modifier(vcap) != 0 and BlockCatalog.solidity_of(CellCodec.mat(vcap)) >= 0.5:
+			# Only a cap whose BOTTOM face FULLY covers the footprint (a bottom-anchored slab, all
+			# corners >= 1 — the snow half-slab, or a full-cover lip) may suppress the surface top
+			# quad: its solid underside is coincident with that quad, so drawing both z-fights. A
+			# PARTIAL/wedge lip (any 0 corner) or a top-anchored cap does NOT cover the whole floor,
+			# so the surface top quad must stay or the exposed remainder becomes a hole (M1 §6.4).
+			if BlockCatalog.solidity_of(CellCodec.mat(vcap)) >= 0.5 and ShapeCodec.bottom_face_covers(CellCodec.modifier(vcap)):
 				capshaped[lz * n + lx] = 1
 
 	# One SurfaceTool per LOOK KEY present (lazily begun on first face).

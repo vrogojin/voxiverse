@@ -500,6 +500,10 @@ static func _with_snow_state(v: int, g: int, t: float) -> int:
 ## the shape memo and resolve_cell share ONE predicate. Cheap gate (sm/cm/g) first; the
 ## column_profile + surface_temperature eval fires only on flat land columns. Deterministic
 ## (pure function of SEED — no randi/Time), so the shape memo stays byte-identical to recompute.
+# NOTE: the snow half-slab rides the SMOOTHING code path — every caller (_shape_entry, _surface_cap,
+# surface_cap_modifier) evaluates it only inside their `SMOOTHING_ENABLED` branch, so toggling the
+# diagnostic `SMOOTHING_ENABLED := false` also removes all snow slabs. Deliberate (slabs share the
+# cap-cell machinery); consistent across every path, so the collider contract never diverges.
 static func _slab_fires(x: int, z: int, g: int, sm: int, cm: int, pcache) -> bool:
 	if sm != 0 or cm != 0 or g < SEA_LEVEL:
 		return false

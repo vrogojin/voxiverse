@@ -149,8 +149,16 @@ static func from_document(bytes: PackedByteArray) -> VoxelMaterialDef:
 	var layout: Array[StringName] = []
 	var lr: Variant = doc.get("state_layout", [])
 	if lr is Array:
+		# The STATE axis is 16 bits and each name claims one; a layout wider than 16, or with a
+		# duplicate name (which would alias two bits), is malformed — reject rather than silently
+		# build an over-wide/aliased mask (_layout_mask would emit bits past bit 15).
+		if (lr as Array).size() > 16:
+			return null
 		for nm: Variant in lr:
-			layout.append(StringName(String(nm)))
+			var sn := StringName(String(nm))
+			if layout.has(sn):
+				return null
+			layout.append(sn)
 	# Transition targets must exist. A target names EITHER another VoxelState OR a declared
 	# STATE-axis layout bit (M1 snow_capped): a "to_state" that is a layout name SETS that bit
 	# rather than switching VoxelState, so it is a valid target. Without this, a cappable

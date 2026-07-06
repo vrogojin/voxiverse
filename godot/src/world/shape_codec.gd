@@ -81,6 +81,22 @@ static func anchor(m: int) -> int:
 static func is_full(m: int) -> bool:
 	return m == 0
 
+## True when this shape's BOTTOM face fully tiles the cell floor with NO taper — a
+## bottom-anchored shape whose four corners are ALL >= 1, so every column of the cell
+## has material resting on the floor (the underside is a solid, unbroken quad at y=0).
+## The FULL cube (m==0, corners 2,2,2,2) qualifies. A partial WEDGE with any 0 corner
+## does NOT (its floor is exposed along that edge), and a TOP-anchored shape hangs from
+## the ceiling so its bottom is up at H, not on the floor. Used by the fallback mesher to
+## decide when a cap cell's underside fully occludes the surface cell's top quad below it
+## (M1 §6.4): only a full-cover slab may suppress that quad — a taper would leave a hole.
+static func bottom_face_covers(m: int) -> bool:
+	if m == 0:
+		return true
+	if anchor(m) != ANCHOR_BOTTOM:
+		return false
+	var c := corners(m)
+	return c.x >= 1 and c.y >= 1 and c.z >= 1 and c.w >= 1
+
 ## Pack four corner heights + anchor into a modifier (does NOT canonicalize — a raw
 ## builder for worldgen/tests; run through `CellCodec.canonical` for the canonical
 ## form). All-2 BOTTOM here yields 0xAA, not 0.

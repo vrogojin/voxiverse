@@ -454,7 +454,10 @@ func set_state(cell: Vector3i, state_bits: int) -> bool:
 ## wins; a target naming a `state_layout` bit SETS that bit, a target naming the DEFAULT state name
 ## CLEARS all layout bits (the snow melts back). The write routes through set_state → _write_cell →
 ## `_edits` (overlay-persisted, re-meshed), authoritative over generation — a melt can never be
-## un-melted by re-streaming (same guarantee as break/place).
+## un-melted by re-streaming (same guarantee as break/place). MAIN THREAD ONLY (writes the
+## non-thread-safe `_edits`); never call from the voxel worker. The SET (freeze) edge self-gates to
+## the exposed generated surface cell so a buried cappable cell can't spuriously freeze; a future
+## non-surface transition would need its own condition rather than reusing that gate.
 func apply_state_transitions(cell: Vector3i) -> bool:
 	var v := cell_value_at(cell)
 	var mat := CellCodec.mat(v)
@@ -466,8 +469,17 @@ func apply_state_transitions(cell: Vector3i) -> bool:
 	var st := def.get_default_state()
 	if st == null or st.transitions.is_empty():
 		return false
+	if environment == null:
+		return false                                 # sim query not wired (deferred _ready) — nothing to sample
 	var mask := BlockCatalog.state_mask_of(mat)
 	var state_bits := CellCodec.state(v)
+	# A deposition state (snow_capped) only forms on the EXPOSED generated surface cell, never on
+	# buried material: a buried cappable cell (stone/sand underground) reads sub-zero ground
+	# temperature and would otherwise spuriously freeze, breaking the "worldgen is the fixed point"
+	# invariant. So the SET (freeze) edge is gated to the generated surface height; the CLEAR (melt)
+	# edge is ungated — clearing a stray bit anywhere is always safe. (M1 conservative gate; the M2
+	# disturbance tick will define the exposed-surface set including edits.)
+	var is_surface_cell := cell.y == TerrainConfig.height_at(cell.x, cell.z)
 	var sample := environment.sample(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
 	for t: VoxelStateTransition in st.transitions:
 		if not t.is_triggered(sample):
@@ -475,6 +487,8 @@ func apply_state_transitions(cell: Vector3i) -> bool:
 		var idx := def.state_layout.find(t.to_state)
 		var new_bits: int
 		if idx >= 0:
+			if not is_surface_cell:
+				continue                             # a SET edge only fires on the exposed surface cell
 			new_bits = state_bits | (1 << idx)       # target is a STATE-axis bit → set it
 		elif t.to_state == st.state_name:
 			new_bits = state_bits & ~mask            # target is the default state → clear the layout bits

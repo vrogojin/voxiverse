@@ -3855,6 +3855,17 @@ func _test_snowy_world() -> void:
 	_ok(SNOW == 1, "STATE_SNOW_CAPPED == bit 0 (== 1)")
 	_ok(TerrainConfig.SNOW_SLAB_MODIFIER == ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM),
 		"SNOW_SLAB_MODIFIER == make_modifier(1,1,1,1,ANCHOR_BOTTOM)")
+	# bottom_face_covers: the fallback-mesher top-quad-suppression predicate (steelman critical). A
+	# full-cover bottom slab may suppress the surface top quad; a partial wedge or top cap may NOT
+	# (its taper would leave a hole).
+	_ok(ShapeCodec.bottom_face_covers(0), "bottom_face_covers: full cube covers")
+	_ok(ShapeCodec.bottom_face_covers(TerrainConfig.SNOW_SLAB_MODIFIER), "bottom_face_covers: snow half-slab covers")
+	_ok(ShapeCodec.bottom_face_covers(ShapeCodec.make_modifier(1, 2, 2, 1, ShapeCodec.ANCHOR_BOTTOM)),
+		"bottom_face_covers: bottom shape with all corners >= 1 covers")
+	_ok(not ShapeCodec.bottom_face_covers(ShapeCodec.make_modifier(0, 1, 1, 0, ShapeCodec.ANCHOR_BOTTOM)),
+		"bottom_face_covers: partial wedge lip (a 0 corner) does NOT cover — the hole case is drawn")
+	_ok(not ShapeCodec.bottom_face_covers(ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_TOP)),
+		"bottom_face_covers: top-anchored cap does NOT cover the floor")
 	var gdef := BlockCatalog.def_of(GRASS)
 	_ok(gdef != null and gdef.state_layout.size() == 1 and gdef.state_layout[0] == &"snow_capped",
 		"grass.state_layout[0] == &\"snow_capped\"")
@@ -4024,6 +4035,13 @@ func _test_snowy_world() -> void:
 			"collider: surface_cap_modifier == 85 at the slab column")
 		_ok(TerrainConfig.surface_cap_modifier(slab.x, slab.y) == CellCodec.modifier(TerrainConfig.generated_cell(slab.x, sg + 1, slab.y)),
 			"collider: surface_cap_modifier == modifier(generated_cell(g+1)) at the slab column (contract)")
+		# The collider AND the module worker run the WORKER-DIRECT path (non-null pcache), not the
+		# main-thread memo — assert it returns the same 85 for the slab column, closing the memo-vs-
+		# direct byte-identity gap on the single most load-bearing invariant (steelman finding).
+		_ok(TerrainConfig.surface_cap_modifier(slab.x, slab.y, {}) == TerrainConfig.SNOW_SLAB_MODIFIER,
+			"collider: worker-direct surface_cap_modifier(.,.,{}) == 85 at the slab column")
+		_ok(TerrainConfig.surface_cap_modifier(slab.x, slab.y, {}) == TerrainConfig.surface_cap_modifier(slab.x, slab.y),
+			"collider: worker-direct == memo surface_cap_modifier at the slab column")
 		# Mass of the half-slab: 280 * 0.5 = 140 kg.
 		_ok(absf(BlockCatalog.mass_of_value(CellCodec.pack(SNOW_ID, TerrainConfig.SNOW_SLAB_MODIFIER)) - 140.0) < 0.5,
 			"mass_of_value(pack(snow, 85)) == 140 kg")

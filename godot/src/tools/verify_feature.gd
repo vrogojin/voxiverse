@@ -4053,6 +4053,12 @@ func _test_snowy_world() -> void:
 		w.queue_free()
 
 	# --- (8) half-slab physics + collider cheap-query contract (ADR §8 item 8) ---
+	# INTERIM: the fixed half-slab is disabled (TerrainConfig.SNOW_SLABS_ENABLED=false) pending the
+	# snow-accumulation feature that replaces it. The slab machinery + pins below stay live as the
+	# accumulation baseline; run them only when the flag is on so no slab column is required to exist.
+	if not TerrainConfig.SNOW_SLABS_ENABLED:
+		print("    [M1] snow half-slabs disabled (interim) — physics/collider slab checks skipped")
+		return                                        # item 8 is the last block in this test
 	var slab := _find_slab_column()
 	if slab.x == 0x7fffffff:
 		_ok(false, "M1: found a snow half-slab column (deep-frozen flat) for the physics checks")

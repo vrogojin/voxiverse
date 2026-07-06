@@ -57,6 +57,13 @@ const LAVA_SEA_T := 0.60         # extreme-hot ocean regions: the sea fill IS la
 ## terrain lands) altitude — not just B_SNOWY.
 const SNOW_SLAB_T := -4.0
 
+## INTERIM (2026-07-06): the fixed half-block snow slab reads too blocky and cannot blend (½-block
+## granularity + it only fires on flat columns, so there is no slope to grade into). Disabled until
+## the snow-ACCUMULATION feature (variable-height fill that grades uneven terrain into a flat white
+## surface + a bounded snowfall sim) replaces it. Flip to true only to A/B the old slab look; the
+## machinery + verify pins stay live so the accumulation work has a baseline to build on.
+const SNOW_SLABS_ENABLED := false
+
 ## The snow half-slab shape (M1 ADR §6.1): an all-corners-1 BOTTOM slab (walkable — top +0.5 ≤
 ## STEP_MAX; breakable → snow_block, mass 280·½ = 140 kg). Verify-pinned == make_modifier(1,1,1,1,
 ## ANCHOR_BOTTOM). Emitted as CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER): no liquid, no state.
@@ -569,6 +576,8 @@ static func _with_snow_state(v: int, g: int, t: float) -> int:
 # diagnostic `SMOOTHING_ENABLED := false` also removes all snow slabs. Deliberate (slabs share the
 # cap-cell machinery); consistent across every path, so the collider contract never diverges.
 static func _slab_fires(x: int, z: int, g: int, sm: int, cm: int, pcache) -> bool:
+	if not SNOW_SLABS_ENABLED:
+		return false                                  # INTERIM: slabs disabled until accumulation replaces them
 	if sm != 0 or cm != 0 or g < SEA_LEVEL:
 		return false
 	if ClimateModel.surface_temperature(g, column_profile(x, z, pcache).w) >= SNOW_SLAB_T:

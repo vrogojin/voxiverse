@@ -59,11 +59,13 @@ static func braced_sigma_c(id: int, n_lat: int) -> int:
 # --- temperature factor φ(T) (SI §4.1) ------------------------------------------
 
 ## Per-class φ parameters: [φ_frost, T_frost_full, T_cold_on, T_hot_on, T_fail] (°C).
-## The plateau [cold_on, hot_on] maps to φ = 1 and — for every class — covers the
-## entire current world (air 21.5 °C, surface 23 °C, deep 12 °C all sit inside it),
-## so the anchor numbers hold EVERYWHERE today; temperature only bites once future
-## content pushes T out of the band. Brittle (ice) is the sole class that weakens as
-## it warms toward 0 °C (melting): φ = 1 below −5 °C, ramping to φ_min at 0 °C.
+## The plateau [cold_on, hot_on] maps to φ = 1 and — for every non-brittle class —
+## covers the entire current world (surface 21.5 °C, the 3 °C deep plateau, and the
+## 27 °C geothermal bedrock floor all sit inside it), so the anchor numbers hold
+## EVERYWHERE today; temperature only bites once future content pushes T out of the
+## band. Brittle (ice) is the sole class that weakens as it warms toward 0 °C
+## (melting): φ = 1 below −5 °C, ramping to φ_min at 0 °C — which is why a frozen
+## sea's ice must read sub-zero (PerVoxelEnvironment frozen-sea seam), or it detaches.
 static func _phi_params(sclass: StringName) -> Array:
 	match sclass:
 		&"soil":    return [3.0, -10.0, 0.0, 150.0, 800.0]

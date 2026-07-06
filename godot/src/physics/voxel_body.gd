@@ -171,6 +171,22 @@ func break_cell(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> void:
 	if was_frozen and not _grounded(cells):
 		_apply_kick(self, from_pos)
 
+## Attach a new full-cube cell of `block_id` at body-LOCAL `local_cell` — the
+## right-click "build onto a detached mesh" path. Rejects a non-positive id (AIR is
+## not a block) or an already-occupied cell. On success the cell joins the store as
+## a plain full cube (a bare id is modifier-0 / state-0) and the body is rebuilt
+## through the SAME `_rebuild()` path `break_cell` uses, so its mesh (with the new
+## cell's BlockMaterials material), per-cell colliders and mass all stay consistent;
+## the body is then woken so it re-simulates under the added weight. Returns true iff
+## the cell was added.
+func add_cell(local_cell: Vector3i, block_id: int) -> bool:
+	if block_id <= 0 or cells.has(local_cell):
+		return false
+	cells[local_cell] = block_id      # bare id == plain full cube (modifier 0, state 0)
+	_rebuild()                        # remesh + recollider + recompute mass, like break_cell
+	_wake_if_dynamic()                # the extra mass may unbalance it → let physics reconsider
+	return true
+
 ## Material id at body-local `cell`; 0 (AIR) if the body has no such cell. Cells
 ## store packed values (a bare id is plain), so we project the material out.
 func cell_block_id(cell: Vector3i) -> int:

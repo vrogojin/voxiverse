@@ -804,6 +804,32 @@ func _headroom_clear(xi: int, zi: int, fx: float, fz: float, top: float) -> bool
 		y += 1
 	return true
 
+## Lowest solid UNDERSIDE overhead a rising head sweeps into, or INF if clear. Scans
+## every cell the head passes through — from `from_head_y` up to `to_head_y` — at the
+## footprint (x, z), the upward mirror of `floor_under`'s downward scan, so a fast rise
+## (frame hitch) cannot tunnel a thin ceiling. Each cell is tested by the shape-aware
+## `_occ_span` (material gate for free: water/lava yield the empty span and are scanned
+## THROUGH), and the returned value is the occupied cell's lower bound — a top-anchored
+## slab stops the head at its true underside, a full cube at the integer cell floor. A
+## cell whose occupancy starts at/below where the head already is (occ_lo < from_head_y)
+## is ignored: the head is already clear there, only NEW occupancy overhead constrains
+## the move. BYTE-IDENTICAL to a single full-cube point test for the current world.
+func ceiling_scan(x: float, z: float, from_head_y: float, to_head_y: float) -> float:
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	var fx := x - float(xi)
+	var fz := z - float(zi)
+	var y := int(floor(from_head_y))
+	var y_hi := int(floor(to_head_y))
+	while y <= y_hi:
+		var sp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		if sp != Vector2.ZERO:
+			var occ_lo := float(y) + sp.x
+			if occ_lo >= from_head_y - _EPS:
+				return occ_lo
+		y += 1
+	return INF
+
 func is_solid(pos: Vector3) -> bool:
 	return cell_solid(Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z))))
 

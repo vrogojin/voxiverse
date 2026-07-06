@@ -35,7 +35,9 @@ signal aimed_voxel_changed(info: Dictionary)
 
 const WOOD_LAYER_MASK := 1 << 1           # voxel bodies live on collision layer 2
 const PLAYER_RADIUS := 0.4                # capsule radius; the wall-block probe reach
+const PLAYER_HEIGHT := 1.8                # capsule height; feet at origin, head top this far up
 const PLAYER_WEIGHT := 700.0              # N (~70 kg) pressed down onto a piece we stand on
+const CEILING_EPS := 0.001               # keep the head a hair below the ceiling face (no clip)
 
 var world: WorldManager                   # injected by Main before _ready
 var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
@@ -53,7 +55,6 @@ var _body_shape: CollisionShape3D        # the player's capsule collider (disabl
 var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
-var _highlight: AimHighlight              # brightened face on the block we aim at
 
 func _ready() -> void:
 	# Build the camera rig in code to keep scenes minimal and robust.
@@ -87,11 +88,12 @@ func _ready() -> void:
 	collision_layer = 1 << 2
 	collision_mask = WOOD_LAYER_MASK
 
-	# Aim highlight: a world-space brightened face on whatever block we'd break or
-	# build against. top_level (set in its _ready) keeps it independent of us.
-	_highlight = AimHighlight.new()
-	_highlight.name = "AimHighlight"
-	add_child(_highlight)
+	# Screen-centre crosshair (a small "+"). We deliberately do NOT highlight the
+	# aimed face any more — a fixed reticle reads cleaner and never occludes the
+	# block we are about to break/build against.
+	var crosshair := Crosshair.new()
+	crosshair.name = "Crosshair"
+	add_child(crosshair)
 
 	_capture_mouse()
 
@@ -162,7 +164,6 @@ func _physics_process(delta: float) -> void:
 	world.update_streaming(global_position)
 	_push_bodies(delta)
 	_update_aim()
-	_update_highlight()
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.
@@ -231,7 +232,27 @@ func _move(delta: float) -> void:
 	# descend into pits/shafts and enter tunnels we've dug instead of being snapped
 	# back to the original surface.
 	velocity.y -= gravity * delta
+	var prev_head_y := global_position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
 	global_position.y += velocity.y * delta
+
+	# Analytic CEILING (SWEPT + shape-aware): while rising, the head must not pass into
+	# a solid cell overhead (jump under a low ceiling and you bonk it, like a wall stops
+	# horizontal motion). We SCAN every cell the head sweeps through this frame — from
+	# prev_head_y up to the new head — mirroring floor_under's per-cell scan so a fast
+	# rise during a frame hitch cannot TUNNEL a thin ceiling (point-sampling only the
+	# endpoint would jump a 1-block ceiling at ~0.2 s frames). The scan uses the shape-
+	# aware occupied span (WorldManager._occ_span), so a top-anchored slab stops the head
+	# at its true underside — matching the floor/wall shape contract, not a material-only
+	# point test. Clamp the feet so the head sits just below that underside and kill the
+	# upward velocity. Descending/flat motion (velocity.y <= 0) is skipped, so standing
+	# and open-sky jumps behave exactly as before.
+	if velocity.y > 0.0:
+		var new_head_y := global_position.y + PLAYER_HEIGHT
+		var ceiling_y := _ceiling_under(prev_head_y, new_head_y)
+		if new_head_y > ceiling_y:
+			global_position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
+			velocity.y = 0.0
+
 	var terrain_floor := world.floor_under(global_position.x, global_position.z, global_position.y)
 	var floor_y := terrain_floor
 
@@ -298,6 +319,25 @@ func _move_horizontal(motion: Vector3, wish: Vector3) -> void:
 		if moved.dot(wish) < -0.001:
 			global_position.x = start.x
 			global_position.z = start.z
+
+## The lowest solid underside the player's head sweeps into as it rises from
+## `from_head_y` to `to_head_y` this frame, or INF if the swept range is clear. Probes
+## the footprint centre AND the four corners (± PLAYER_RADIUS in x and z) — the same
+## corner spirit as the horizontal wall checks, so a ceiling covering only one corner
+## still stops the head — and takes the LOWEST underside across them. Each column is a
+## swept, shape-aware scan (WorldManager.ceiling_scan): mirroring floor_under it walks
+## every cell in the head's vertical range (no tunneling) and reads the true occupied
+## span (top-anchored slabs stop at their underside). No trimesh collision.
+func _ceiling_under(from_head_y: float, to_head_y: float) -> float:
+	var px := global_position.x
+	var pz := global_position.z
+	var r := PLAYER_RADIUS
+	var lo := world.ceiling_scan(px, pz, from_head_y, to_head_y)
+	lo = minf(lo, world.ceiling_scan(px - r, pz - r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px - r, pz + r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px + r, pz - r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px + r, pz + r, from_head_y, to_head_y))
+	return lo
 
 ## Resolve the exact block the player is pointing at within break_reach, using the
 ## SAME "nearest of (physics-ray-hits-wood, analytic-DDA-hits-terrain)" contest
@@ -393,11 +433,17 @@ func _try_break() -> void:
 			if id > 0 and inventory != null:
 				inventory.add(id, 1)
 
-## Right-click: place the selected hotbar block against the aimed TERRAIN face.
-## Placement attaches to terrain only (trees/placed blocks are terrain) — aiming
-## at a loose moving body places nothing, since a block glued to empty air beside
-## a tumbling body would float. We reject cells that would overlap the player;
-## `place_block` rejects occupied cells; we only pay on success.
+## Right-click: place the selected hotbar block against the aimed face — either
+## TERRAIN (trees/placed blocks are terrain) or a detached VoxelBody, so you can
+## build both on the ground and onto a loose piece. The new block goes in the empty
+## neighbour cell across the struck face (`cell + normal`). We only pay on success.
+##   * terrain — reject cells that would overlap the player; `place_block` rejects
+##     occupied cells.
+##   * wood    — attach into the body's LOCAL frame via `add_cell`, which rejects an
+##     occupied cell. The player-overlap guard is terrain-only: a body cell attaching
+##     into the player's space is a rare edge case on a moving/rotating body (the
+##     guard's AABB is world-axis-aligned and would not match the body's frame), so
+##     we deliberately skip it there and keep the terrain guard intact.
 func _try_place() -> void:
 	if inventory == null:
 		return
@@ -405,15 +451,20 @@ func _try_place() -> void:
 	if id == 0:
 		return                                    # empty slot
 	var target := _current_target()
-	if String(target["kind"]) != "terrain":
-		return                                    # no building against moving rigid bodies
-	var base_cell: Vector3i = target["cell"]
-	var nrm: Vector3i = target["normal"]
-	var place_cell := base_cell + nrm
-	if _cell_intersects_player(place_cell):
-		return
-	if world.place_block(place_cell, id):
-		inventory.consume_selected(1)             # only pay on success
+	match String(target["kind"]):
+		"terrain":
+			var base_cell: Vector3i = target["cell"]
+			var nrm: Vector3i = target["normal"]
+			var place_cell := base_cell + nrm
+			if _cell_intersects_player(place_cell):
+				return
+			if world.place_block(place_cell, id):
+				inventory.consume_selected(1)     # only pay on success
+		"wood":
+			var body := target["body"] as VoxelBody
+			var local_cell: Vector3i = target["cell"] + target["normal"]
+			if body.add_cell(local_cell, id):
+				inventory.consume_selected(1)     # only pay on success
 
 ## AABB overlap: player box (center (px, feet+0.9, pz), half-extents
 ## (PLAYER_RADIUS, 0.9, PLAYER_RADIUS) — i.e. feet up to 1.8 m) vs cell cube
@@ -428,15 +479,6 @@ func _cell_intersects_player(cell: Vector3i) -> bool:
 	return pmin.x < hi.x - EPS and pmax.x > lo.x + EPS \
 		and pmin.y < hi.y - EPS and pmax.y > lo.y + EPS \
 		and pmin.z < hi.z - EPS and pmax.z > lo.z + EPS
-
-## Keep the face highlight sitting on whatever block we would break/build this
-## frame, or hide it when nothing is in range.
-func _update_highlight() -> void:
-	var target := _current_target()
-	if String(target["kind"]) == "none":
-		_highlight.hide_it()
-	else:
-		_highlight.show_face(target["xform"], target["normal"])
 
 ## Shove any dynamic wooden block the player walks into, so blocks can be pushed
 ## around. Frozen (undisturbed) pillars ignore the query cheaply.

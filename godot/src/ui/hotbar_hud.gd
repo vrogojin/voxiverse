@@ -10,6 +10,7 @@ const SWATCH_PX := 34
 
 var _panels: Array[PanelContainer] = []
 var _swatches: Array[ColorRect] = []
+var _tiles: Array[TextureRect] = []
 var _labels: Array[Label] = []
 var _normal_style: StyleBoxFlat
 var _selected_style: StyleBoxFlat
@@ -64,6 +65,18 @@ func _build_slot(hbox: HBoxContainer) -> void:
 	var center := CenterContainer.new()
 	panel.add_child(center)
 
+	# The block's real tile (the enhanced CC0 pack, BlockTextures) — the preferred
+	# look, NEAREST-filtered so the down-scaled tile stays crisp pixel-art. The flat
+	# swatch below it is the fallback for blocks with no tile (texture_for == null).
+	var tile := TextureRect.new()
+	tile.custom_minimum_size = Vector2(SWATCH_PX, SWATCH_PX)
+	tile.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	tile.stretch_mode = TextureRect.STRETCH_SCALE
+	tile.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	tile.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tile.visible = false
+	center.add_child(tile)
+
 	var swatch := ColorRect.new()
 	swatch.custom_minimum_size = Vector2(SWATCH_PX, SWATCH_PX)
 	swatch.visible = false
@@ -81,6 +94,7 @@ func _build_slot(hbox: HBoxContainer) -> void:
 
 	_panels.append(panel)
 	_swatches.append(swatch)
+	_tiles.append(tile)
 	_labels.append(label)
 
 func _make_style(bg: Color, border: Color, width: int) -> StyleBoxFlat:
@@ -103,13 +117,24 @@ func _refresh_slot(i: int) -> void:
 	var id: int = s["id"]
 	var cnt: int = s["count"]
 	var swatch := _swatches[i]
+	var tile := _tiles[i]
 	var label := _labels[i]
 	if id == 0:
+		tile.visible = false
 		swatch.visible = false
 		label.visible = false
 	else:
-		swatch.color = BlockCatalog.color_of(id)
-		swatch.visible = true
+		# Show the block's real tile when it has one; fall back to the flat swatch
+		# for tile-less blocks (BlockTextures.texture_for == null).
+		var tex := BlockTextures.texture_for(id)
+		if tex != null:
+			tile.texture = tex
+			tile.visible = true
+			swatch.visible = false
+		else:
+			swatch.color = BlockCatalog.color_of(id)
+			swatch.visible = true
+			tile.visible = false
 		label.text = str(cnt)
 		label.visible = true
 

@@ -3905,6 +3905,28 @@ func _test_snow_layer_codec() -> void:
 	# a FAM LAYER on a NON-solid material strips (no 'layer of water') — the merged-contract gate
 	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(WATER_ID, CellCodec.make_layer(3)))) == 0,
 		"FAM layer on a non-solid material strips to full cube")
+	# ShapeCodec LAYER queries (the physics/render closed forms, SNOW-ACCUMULATION §1.4)
+	var m3 := CellCodec.make_layer(3)      # a 0.3 uniform layer (FAM)
+	_ok(absf(ShapeCodec.height_at(m3, 0.25, 0.75) - 0.3) < 1e-6, "height_at(layer 3) == 0.3 (flat over the footprint)")
+	_ok(ShapeCodec.span(m3, 0.5, 0.5) == Vector2(0.0, 0.3), "span(layer 3) == (0, 0.3)")
+	_ok(ShapeCodec.occupied(m3, 0.5, 0.2, 0.5) and not ShapeCodec.occupied(m3, 0.5, 0.4, 0.5), "occupied(layer 3): 0.2 in, 0.4 out")
+	_ok(absf(ShapeCodec.local_top(m3, 0.5, 0.5) - 0.3) < 1e-6, "local_top(layer 3) == 0.3")
+	_ok(absf(ShapeCodec.volume(m3) - 0.3) < 1e-6 and absf(ShapeCodec.volume(CellCodec.make_layer(7)) - 0.7) < 1e-6, "volume(layer 3/7) == 0.3/0.7")
+	_ok(ShapeCodec.side_profile_full(m3, ShapeCodec.FACE_NY) and not ShapeCodec.side_profile_full(m3, ShapeCodec.FACE_PY) \
+		and not ShapeCodec.side_profile_full(m3, ShapeCodec.FACE_PX), "side_profile_full(layer): only the floor (NY) is covered")
+	_ok(ShapeCodec.bottom_face_covers(m3), "bottom_face_covers(layer) == true (uniform floor)")
+	var tris: Array = ShapeCodec.surface_tris(m3)
+	var tris_ok := tris.size() == 2
+	for tri: Dictionary in tris:
+		for k in ["v0", "v1", "v2"]:
+			if absf((tri[k] as Vector3).y - 0.3) > 1e-6:
+				tris_ok = false
+		if (tri["normal"] as Vector3).y <= 0.0:
+			tris_ok = false
+	_ok(tris_ok, "surface_tris(layer 3): 2 tris, all verts at y=0.3, normals up")
+	var SNOW_ID2 := BlockCatalog.id_of(&"snow_block")
+	_ok(absf(BlockCatalog.mass_of_value(CellCodec.pack(SNOW_ID2, CellCodec.make_layer(2))) - 280.0 * 0.2) < 0.5,
+		"mass_of_value(snow layer 2) == 56 kg (280 * 0.2)")
 
 # M1 SNOWY WORLD (M1-SNOWY-WORLD.md): the STATE axis (snow_capped), the absolute-altitude
 # climate temperature model, snow-cap render variants, and the deep-frozen half-slab. Fences the

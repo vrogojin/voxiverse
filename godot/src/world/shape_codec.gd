@@ -71,7 +71,18 @@ static func ensure_ready() -> void:
 static func corners(m: int) -> Vector4i:
 	if m == 0:
 		return Vector4i(2, 2, 2, 2)
+	if CellCodec.is_layer(m):
+		# A FAM LAYER has no corner heights; return a DEFENSIVE uniform half-block quantization
+		# (clamped ≥1 so it is never the empty shape) for the corner-only consumers that are
+		# approximate for snow anyway (side_profile / the structural LUT). The PRECISE queries
+		# (height_at, volume, span, side_profile_full, surface_tris) branch on is_layer directly.
+		var q := clampi(roundi(_layer_h(m) * 2.0), 1, 2)
+		return Vector4i(q, q, q, q)
 	return Vector4i(mini(m & 3, 2), mini((m >> 2) & 3, 2), mini((m >> 4) & 3, 2), mini((m >> 6) & 3, 2))
+
+## Snow LAYER height in blocks ∈ (0, 1) — the FAM LAYER level in tenths. Only valid for is_layer(m).
+static func _layer_h(m: int) -> float:
+	return float(CellCodec.layer_level(m)) / 10.0
 
 ## Anchor (0 BOTTOM, 1 TOP). FULL → BOTTOM.
 static func anchor(m: int) -> int:
@@ -110,6 +121,8 @@ static func make_modifier(c00: int, c10: int, c11: int, c01: int, anc: int = 0) 
 static func volume(m: int) -> float:
 	if m == 0:
 		return 1.0
+	if CellCodec.is_layer(m):
+		return _layer_h(m)                       # a uniform layer of height h fills fraction h
 	var c := corners(m)
 	var sa := c.x + c.z          # c00 + c11
 	var sb := c.y + c.w          # c10 + c01
@@ -160,6 +173,8 @@ static func _height_half(c: Vector4i, fx: float, fz: float) -> float:
 static func height_at(m: int, fx: float, fz: float) -> float:
 	if m == 0:
 		return 1.0
+	if CellCodec.is_layer(m):
+		return _layer_h(m)                       # flat top at h everywhere (span/occupied/local_top follow)
 	return _height_half(corners(m), fx, fz) * 0.5
 
 # --- analytic physics (§5) ------------------------------------------------------
@@ -226,6 +241,8 @@ static func side_profile(m: int, face: int) -> Vector3i:
 static func side_profile_full(m: int, face: int) -> bool:
 	if m == 0:
 		return true
+	if CellCodec.is_layer(m):
+		return face == FACE_NY                   # a 0<h<1 uniform bottom layer covers ONLY the floor face
 	var c := corners(m)
 	var anc := anchor(m)
 	match face:
@@ -409,6 +426,15 @@ static func _region_intersect_area(ra: Vector2i, rb: Vector2i) -> float:
 ## {v0, v1, v2, normal} in cell-local coordinates — the ray/plane targets for the
 ## `aimed_voxel` in-cell test (P5b). FULL → the flat top at y=1.
 static func surface_tris(m: int) -> Array:
+	if CellCodec.is_layer(m):
+		# The walkable top of a uniform layer: one flat quad at y=h, normal UP (feeds the DDA aim
+		# ray and the collider prisms). Diagonal is irrelevant for a flat surface.
+		var h := _layer_h(m)
+		var q00 := Vector3(0, h, 0)
+		var q10 := Vector3(1, h, 0)
+		var q11 := Vector3(1, h, 1)
+		var q01 := Vector3(0, h, 1)
+		return [_tri(q00, q10, q11, ANCHOR_BOTTOM), _tri(q00, q11, q01, ANCHOR_BOTTOM)]
 	var c := corners(m)
 	var anc := anchor(m)
 	# Corner surface y in blocks: BOTTOM tops at H, TOP surface at 1−H.

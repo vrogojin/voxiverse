@@ -2326,6 +2326,69 @@ func _test_waterlogging() -> void:
 	var ac := int(mw.call("appearance_count"))
 	var _probe := int(mw.call("gen_arid_for", WATER, 0, S))
 	_ok(int(mw.call("appearance_count")) == ac, "waterlog: twin/fluid ARIDs frozen at setup (count stable at %d)" % ac)
+
+	# (5) MESH-LEVEL border-killer proof (durable regression guard): actually run the blocky mesher
+	# on a waterlogged twin beside pure water and assert the SHARED water face is CULLED (no border)
+	# while the terrain ramp is still emitted (no hole). (1)-(4) prove the WIRING; this proves the
+	# rendered geometry, so a future change can't silently reintroduce the border. Guarded to module
+	# builds that can mesh a VoxelBuffer headlessly; a differential over three meshes so it does not
+	# depend on exact fluid face counts (which vary with corner heights).
+	if ClassDB.class_exists("VoxelMesherBlocky"):
+		var lib: Object = mw.get("_library")
+		var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+		if lib != null and mesher != null and mesher.has_method("set_library") and mesher.has_method("build_mesh"):
+			mesher.call("set_library", lib)
+			var minp: int = mesher.call("get_minimum_padding")
+			var maxp: int = mesher.call("get_maximum_padding")
+			var water_mat: Object = BlockMaterials.get_for(WATER)
+			# Pick a real emitted composite pair that actually baked a twin (twin ARID != dry ARID).
+			var tmat := -1
+			var tmod := -1
+			for slot: int in pairs.keys():
+				var m := slot / 256
+				var md := slot % 256
+				if m > BlockCatalog.AIR and m < BlockCatalog.count() and md > 0 \
+						and int(mw.call("gen_arid_for", m, md, F)) != int(mw.call("gen_arid_for", m, md, 0)):
+					tmat = m
+					tmod = md
+					break
+			if tmat >= 0 and water_mat != null:
+				var terr_mat: Object = BlockMaterials.get_for(tmat)
+				var water_arid := int(mw.call("arid_for_cell", WATER))
+				var twin_arid := int(mw.call("arid_for_cell", CellCodec.pack(tmat, tmod, 0, CellCodec.make_liquid(CellCodec.LIQ_WATER, F))))
+				var b := minp + 1
+				var span := minp + maxp + 4
+				var mesh_verts := func(cells: Array) -> Array:
+					var buf: Object = ClassDB.instantiate("VoxelBuffer")
+					buf.call("set_channel_depth", 0, 1)          # CHANNEL_TYPE, DEPTH_16_BIT (ARIDs exceed 255)
+					buf.call("create", span, span, span)
+					buf.call("fill", 0, 0)                        # air
+					for c in cells:
+						var p: Vector3i = c[0]
+						buf.call("set_voxel", int(c[1]), p.x, p.y, p.z, 0)
+					var msh: Object = mesher.call("build_mesh", buf, [], {})
+					var wv := 0
+					var tv := 0
+					if msh != null:
+						for i in msh.get_surface_count():
+							var mm: Object = msh.surface_get_material(i)
+							var nn := (msh.surface_get_arrays(i)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+							if mm == water_mat:
+								wv += nn
+							elif mm == terr_mat:
+								tv += nn
+					return [wv, tv]
+				var ta: Array = mesh_verts.call([[Vector3i(b, b, b), twin_arid]])                                   # twin alone
+				var wa: Array = mesh_verts.call([[Vector3i(b, b, b), water_arid]])                                  # water alone
+				var tw: Array = mesh_verts.call([[Vector3i(b, b, b), twin_arid], [Vector3i(b + 1, b, b), water_arid]])  # adjacent
+				_ok(int(ta[1]) > 0, "waterlog-mesh: waterlogged twin renders its opaque terrain ramp — no hole (%d terrain verts)" % int(ta[1]))
+				_ok(int(ta[0]) > 0 and int(wa[0]) > 0, "waterlog-mesh: twin and water each render water faces in isolation (%d, %d)" % [int(ta[0]), int(wa[0])])
+				_ok(int(tw[0]) < int(ta[0]) + int(wa[0]),
+					"waterlog-mesh: shared twin↔water face is CULLED — borderless (combined %d < isolated sum %d)" % [int(tw[0]), int(ta[0]) + int(wa[0])])
+				print("    waterlog-mesh: twin(water=%d,terr=%d) water=%d twin+water=%d (<%d ⇒ border culled)"
+					% [int(ta[0]), int(ta[1]), int(wa[0]), int(tw[0]), int(ta[0]) + int(wa[0])])
+			else:
+				print("    (no baked twin pair or water material — mesh-level border proof skipped)")
 	mw.queue_free()
 
 func _test_shapes_live() -> void:

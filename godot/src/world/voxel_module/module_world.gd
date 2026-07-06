@@ -263,8 +263,9 @@ func _seeded_block_buffer(bs: int, bpos: Vector3i, vt: Object) -> Object:
 ## `_water_surface_arid` for the open-water surface cell (modifier 0), the wet composite ARID
 ## for a shore composite (modifier != 0) — then falls through to the DRY resolve (`arid_for`)
 ## when the water model was not baked (graceful: water cube / dry shape, never a hole).
-## Liquid-10 (submerged) and liquid-0 values go straight to the dry resolve — submerged
-## composites render their terrain shape only. Player edits never produce liquid values
+## Liquid-10 (submerged) resolves to the SAME waterlogged twin as its liquid-9 sibling when
+## native waterlogging is enabled (so submerged water culls seamlessly — the last underwater
+## border); on a legacy engine it falls through to the dry resolve. Player edits never produce liquid values
 ## (placement rejects non-solid materials, break writes 0), so this is worldgen-mirror only.
 func arid_for_cell(packed: int) -> int:
 	var lvl := CellCodec.liquid_level(packed)

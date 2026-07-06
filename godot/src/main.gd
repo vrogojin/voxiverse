@@ -44,13 +44,6 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
-	# Diagnostic perf logger (temporary): prints FPS + render/memory metrics to the
-	# console every second so a live session can be characterised. Remove post-tuning.
-	var perf := PerfLogger.new()
-	perf.name = "PerfLogger"
-	perf.setup(world)
-	add_child(perf)
-
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look

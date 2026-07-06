@@ -45,11 +45,13 @@ const DEEPSLATE_FULL_Y := -24    # below here: always deepslate
 const DEEPSLATE_TOP_Y := -16     # above here: always stone; dithered band between
 const SEA_LEVEL := 0             # air below SEA_LEVEL fills with water (ice cap when cold)
 
-## The render height of the water surface (WATER-SHORE §3): the top cell of every open-water
-## column and every smoothed shore composite renders its water at SEA_LEVEL + 0.9, a slightly
-## sunk slab rather than a full cube. Pinned to CellCodec.LIQ_LEVEL_SURFACE (tenths) by verify
-## (roundi(WATER_SURFACE_HEIGHT * 10.0) == LIQ_LEVEL_SURFACE).
-const WATER_SURFACE_HEIGHT := 0.9
+## The render height of the water surface: the top cell of every open-water column and every
+## smoothed shore composite renders its water at SEA_LEVEL + WATER_SURFACE_HEIGHT, a slightly sunk
+## surface rather than a full cube. Set to 0.9375 = godot_voxel's native fluid TOP_HEIGHT
+## (blocky_baked_library.h) so the LEGACY GDScript fallback water plane and the NATIVE-waterlogging
+## fluid surface (WATERLOGGING.md §4.7) sit at the SAME height. Still rounds to
+## CellCodec.LIQ_LEVEL_SURFACE=9 tenths (roundi(0.9375*10)=9), the water-line level pinned by verify.
+const WATER_SURFACE_HEIGHT := 0.9375
 
 # --- gentle, shallow base hills (unchanged; the c~0 plains preserve today's look)
 const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
@@ -1078,3 +1080,28 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 	_shore_pairs = out
 	_shore_ready = true
 	return _shore_pairs
+
+## The (surface material, modifier) pairs a SUBMERGED composite emits BELOW the water line — the
+## companion set to emitted_shore_pairs() that NATIVE WATERLOGGING needs (WATERLOGGING.md §4.3
+## COVERAGE / §4.5). A submerged composite is a solid ramp filled with water to the top (liquid 10):
+## its surface cell (y == g, g < SEA_LEVEL) and any cap cell landing below the line are always the
+## UNDERWATER-FLOOR material — sand / gravel / red_sand / mud — shaped by a corner-height modifier.
+## So the complete material axis is those four, and the modifier axis is the smoother's emitted set
+## (emitted_modifiers, a superset sample); their cross-product is the pairs whose waterlogged twin
+## must be baked so submerged water culls seamlessly against the surrounding water (no border).
+## Deterministic + material-COMPLETE (unlike a spatial sample, all four floor materials are always
+## covered regardless of which biomes ring the found coast). A rare truly-unemitted pair just bakes
+## an unused twin (harmless); a missing pair falls back to the dry shape (a border, never a hole).
+## Encoded as mat * _SHORE_STRIDE + modifier, matching emitted_shore_pairs()/the module manifest slot.
+## Main-thread setup/verify only (calls emitted_modifiers, which is not worker-safe); never the worker.
+static func emitted_submerged_pairs() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
+	_ensure_ids()
+	var mats := PackedInt32Array([_ID_SAND, _ID_GRAVEL, _ID_RED_SAND, _ID_MUD])
+	var mods := emitted_modifiers()
+	var out := PackedInt32Array()
+	for mat: int in mats:
+		for m: int in mods:
+			out.append(mat * _SHORE_STRIDE + m)
+	return out

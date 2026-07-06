@@ -50,6 +50,7 @@ func _initialize() -> void:
 	_test_structural()
 	_test_shapes_live()
 	_test_fallback_water()
+	_test_waterlogging()
 	_test_metadata()
 	_test_zonechunk()
 	_test_dynamic_catalog()
@@ -521,15 +522,14 @@ func _test_both_paths() -> void:
 	_ok(int(mw.call("appearance_count")) == ac, "generator allocates/bakes NO ARID on the worker (count stable at %d)" % ac)
 	print("    both-path determinism checked %d cells (%d shaped, %d liquid-carrying)" % [cells, shaped_cells, liquid_cells])
 
-	# WATER-SHORE §8 item 7 — LIQUID-AWARE ARID MIRROR over COASTAL blocks. Stream B extends
-	# gen_arid_for(mat, modifier, liquid_level) so the module worker's per-cell ARID is mirrored:
-	# an open-water surface cell (level 9, modifier 0, water material) → the 0.9 water-slab ARID;
-	# a shore composite (level 9, modifier != 0) → its baked WET model ARID; a submerged floor
-	# composite (level 10) → the DRY shape ARID. Drive the generator over 16³ blocks chosen to
-	# straddle the found coastline (surface + composites at y==0) and the smoothed seafloor
+	# LIQUID-AWARE ARID MIRROR over COASTAL blocks. gen_arid_for(mat, modifier, liquid_level) mirrors
+	# the module worker's per-cell ARID: an open-water surface cell (level 9, modifier 0, water
+	# material) → the open-water surface model ARID (native: the pure fluid; legacy: the 0.9 slab);
+	# a shore composite (level 9, modifier != 0) → its water/twin model ARID; a submerged floor
+	# composite (level 10) → the waterlogged TWIN when native waterlogging is on (so it culls against
+	# the surrounding water — no border), else the DRY shape ARID. Drive the generator over 16³ blocks
+	# chosen to straddle the found coastline (surface + composites at y==0) and the smoothed seafloor
 	# (submerged composites below y==0), and assert TYPE == gen_arid_for(mat, modifier, level).
-	# DEPENDS ON STREAM B: until its module changes land, gen_arid_for is 2-arg and this reports
-	# mismatches — expected, the integrated verify is authoritative.
 	var WATER_ID := BlockCatalog.id_of(&"water")
 	var shore := _find_shore_composite()
 	var uw := _find_uw_smoothed()
@@ -584,7 +584,7 @@ func _test_both_paths() -> void:
 							else:
 								composite_seen += 1                 # shore composite → wet-model ARID
 						elif level == CellCodec.LIQ_LEVEL_FULL:
-							submerged_seen += 1                     # submerged floor composite → dry ARID
+							submerged_seen += 1                     # submerged floor composite → twin (native) / dry (legacy)
 						w_cells += 1
 		print("    both-path coast: %d cells (%d surface-water, %d composites, %d submerged)"
 			% [w_cells, surf_water_seen, composite_seen, submerged_seen])
@@ -594,9 +594,9 @@ func _test_both_paths() -> void:
 		if have_ow or have_shore:
 			_ok(surf_water_seen > 0, "both-path (coast): sampled open-water surface cells (level 9, water slab) — %d" % surf_water_seen)
 		if have_shore:
-			_ok(composite_seen > 0, "both-path (coast): sampled shore composite cells (level 9, modifier != 0, wet model) — %d" % composite_seen)
+			_ok(composite_seen > 0, "both-path (coast): sampled shore composite cells (level 9, modifier != 0, wet/twin model) — %d" % composite_seen)
 		if have_uw:
-			_ok(submerged_seen > 0, "both-path (coast): sampled submerged floor composite cells (level 10, dry ARID) — %d" % submerged_seen)
+			_ok(submerged_seen > 0, "both-path (coast): sampled submerged floor composite cells (level 10) — %d" % submerged_seen)
 		_ok(int(mw.call("appearance_count")) == ac_coast, "both-path (coast): wet/slab ARIDs are frozen at setup — driving coastal blocks bakes NO new ARID (count stable at %d)" % ac_coast)
 
 	# All-air early-outs (PERF): a block entirely ABOVE content and one entirely BELOW bedrock
@@ -2232,6 +2232,102 @@ func _mesh_surface_for(mesh: ArrayMesh, mat: Material) -> int:
 			return i
 	return -1
 
+# NATIVE WATERLOGGING (WATERLOGGING.md §4.8): the game wires godot_voxel's solid+fluid co-fill so
+# EVERY water cell — pure water, shore composites (liquid 9) AND submerged composites (liquid 10) —
+# shares ONE fluid_index and culls together, killing the shore/submerged border. This asserts the
+# wiring at the ARID layer (module-guarded; the built engine must expose the patched API):
+#   * the native API is present (VoxelBlockyModelFluid + set_waterlog_fluid);
+#   * pure deep water and surface water resolve to the SAME fluid ARID (no top seam);
+#   * for every emitted composite pair, the level-9 and level-10 resolves are the SAME waterlogged
+#     twin (all water shares one fluid, shore AND below) and that twin DIFFERS from the dry shape
+#     (the border-killer: submerged now waterlogs instead of drawing a dry ramp beside a water wall);
+#   * the twin manifest is frozen at setup (the worker never lazy-bakes).
+# On an OLD engine (no patch) the game keeps the legacy composite path — this reports and skips.
+func _test_waterlogging() -> void:
+	print("[WATERLOGGING] native solid+fluid co-fill wiring (WATERLOGGING.md §4)")
+	if not ClassDB.class_exists("VoxelTerrain") or not ClassDB.class_exists("VoxelBuffer"):
+		print("    (godot_voxel module absent — waterlogging wiring runs on module builds only)")
+		return
+	var have_fluid := ClassDB.class_exists("VoxelBlockyModelFluid")
+	var mesh_probe: Object = ClassDB.instantiate("VoxelBlockyModelMesh") if ClassDB.class_exists("VoxelBlockyModelMesh") else null
+	var have_waterlog: bool = mesh_probe != null and mesh_probe.has_method("set_waterlog_fluid")
+	if not (have_fluid and have_waterlog):
+		print("    (engine lacks native waterlogging API: VoxelBlockyModelFluid=%s set_waterlog_fluid=%s — legacy composite path, skipping)"
+			% [have_fluid, have_waterlog])
+		return
+	_ok(have_fluid, "waterlog: engine exposes VoxelBlockyModelFluid (pure-water fluid model)")
+	_ok(have_waterlog, "waterlog: a VoxelBlockyModelMesh instance has set_waterlog_fluid (co-fill API)")
+
+	var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+	get_root().add_child(mw)
+	var built: bool = mw.call("setup")
+	_ok(built, "waterlog: module world builds with native waterlogging enabled")
+	if not built:
+		mw.queue_free()
+		return
+
+	var WATER := BlockCatalog.id_of(&"water")
+	var S := CellCodec.LIQ_LEVEL_SURFACE
+	var F := CellCodec.LIQ_LEVEL_FULL
+
+	# (1) Pure water shares ONE model: deep (level 0) and surface (level 9) → the same fluid ARID.
+	var deep_water := int(mw.call("gen_arid_for", WATER, 0, 0))
+	var surf_water := int(mw.call("gen_arid_for", WATER, 0, S))
+	_ok(deep_water == surf_water,
+		"waterlog: deep water (lvl 0) and surface water (lvl 9) share ONE fluid ARID (%d == %d)" % [deep_water, surf_water])
+
+	# (2) Twin coverage + the border-killer invariant over every emitted composite pair.
+	var pairs := {}
+	for slot: int in TerrainConfig.emitted_shore_pairs():
+		pairs[slot] = true
+	for slot: int in TerrainConfig.emitted_submerged_pairs():
+		pairs[slot] = true
+	var checked := 0
+	var same_twin := 0
+	var covered := 0
+	for slot: int in pairs.keys():
+		var mat := slot / 256
+		var modifier := slot % 256
+		if mat <= BlockCatalog.AIR or mat >= BlockCatalog.count() or modifier <= 0:
+			continue
+		var t9 := int(mw.call("gen_arid_for", mat, modifier, S))
+		var t10 := int(mw.call("gen_arid_for", mat, modifier, F))
+		var dry := int(mw.call("gen_arid_for", mat, modifier, 0))
+		checked += 1
+		if t9 == t10:
+			same_twin += 1                          # shore & submerged share one twin (one fluid)
+		if t10 != dry:
+			covered += 1                            # a baked twin (unbaked pairs degrade to the dry shape)
+	_ok(checked > 0, "waterlog: emitted composite pairs to check (%d shore∪submerged)" % checked)
+	_ok(same_twin == checked,
+		"waterlog: level-9 and level-10 resolve to the SAME twin for every pair (%d/%d) — all water shares one fluid" % [same_twin, checked])
+	# The manifest bakes exactly this union, so coverage should be ~100%; require a strong majority so a
+	# wholesale bake failure is caught while a handful of degenerate pairs may fall back to the dry shape.
+	_ok(covered * 10 >= checked * 9,
+		"waterlog: >=90%% of emitted composite pairs have a baked waterlogged twin != dry shape (%d/%d)" % [covered, checked])
+	print("    waterlog twins: %d pairs checked, %d covered (twin != dry), %d share-one-fluid" % [checked, covered, same_twin])
+
+	# (3) A concrete submerged column resolves to its twin, not the dry ramp (the visible seafloor fix).
+	var uw := _find_uw_smoothed()
+	if uw.x != 0x7fffffff:
+		var ug: int = TerrainConfig.height_at(uw.x, uw.y)
+		var uc := TerrainConfig.generated_cell(uw.x, ug, uw.y)
+		var umat := CellCodec.mat(uc)
+		var umod := CellCodec.modifier(uc)
+		if umod != 0 and CellCodec.liquid_level(uc) == F:
+			var utwin := int(mw.call("gen_arid_for", umat, umod, F))
+			var udry := int(mw.call("gen_arid_for", umat, umod, 0))
+			_ok(utwin != udry,
+				"waterlog: a real submerged composite (mat %d, mod %d) maps to its waterlogged twin, not the dry ramp (twin %d != dry %d)" % [umat, umod, utwin, udry])
+	else:
+		print("    (no smoothed underwater column found near the coast — concrete submerged assert skipped)")
+
+	# (4) The twin/fluid ARIDs are FROZEN at setup — resolving them bakes nothing new.
+	var ac := int(mw.call("appearance_count"))
+	var _probe := int(mw.call("gen_arid_for", WATER, 0, S))
+	_ok(int(mw.call("appearance_count")) == ac, "waterlog: twin/fluid ARIDs frozen at setup (count stable at %d)" % ac)
+	mw.queue_free()
+
 func _test_shapes_live() -> void:
 	print("[P5b-1] sub-voxel shapes live (render ARIDs + analytic physics + dig/place)")
 	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # descending along +z: H(fx,fz) = 1 − fz
@@ -3445,9 +3541,10 @@ func _test_water_shore() -> void:
 	var W9 := CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE)
 
 	# ---- item 1: CODEC — pack/project round-trip + canonicalization -----------------
-	# Constant pin: WATER_SURFACE_HEIGHT (0.9) is exactly the surface level in tenths.
+	# Constant pin: WATER_SURFACE_HEIGHT (now 0.9375 = native fluid TOP_HEIGHT) still rounds to the
+	# water-line level (LIQ_LEVEL_SURFACE=9) in tenths, so the liquid-9 water-line encoding is intact.
 	_ok(roundi(TerrainConfig.WATER_SURFACE_HEIGHT * 10.0) == CellCodec.LIQ_LEVEL_SURFACE,
-		"codec: roundi(WATER_SURFACE_HEIGHT*10) == LIQ_LEVEL_SURFACE (%d)" % CellCodec.LIQ_LEVEL_SURFACE)
+		"codec: roundi(WATER_SURFACE_HEIGHT*10) == LIQ_LEVEL_SURFACE (%d) — 0.9375 rounds to level 9" % CellCodec.LIQ_LEVEL_SURFACE)
 
 	# pack/project round-trip over kinds × levels: the liquid FIELD projects back exactly and never
 	# perturbs the material/modifier/state axes (a solid host with a modifier, so nothing is stripped).

@@ -843,6 +843,12 @@ static func appearance_surface_materials() -> PackedInt32Array:
 	_ensure_ids()
 	return PackedInt32Array([
 		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL, _ID_GRAVEL,
+		# STONE tops the Mountains biome (bare rock). Without it, the smoothing that shapes a
+		# mountain's corner-height surface cells has no baked DRY model, so uncapped rock slopes
+		# cube-fall-back and render BLOCKY while the analytic collider sees the smooth ramp — a
+		# visible render/physics mismatch on the flanks below the snow line. Baking stone smooths
+		# them (shape meshes are shared per-modifier across materials → +models, no new readbacks).
+		BlockCatalog.STONE,
 	])
 
 ## The BAKED snow-cap material set (M1 ADR §2.2, extended by the Mountains biome): the cappable surface

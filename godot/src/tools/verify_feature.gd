@@ -2766,12 +2766,15 @@ func _test_shapes_live() -> void:
 		var built: bool = mw.call("setup")
 		_ok(built, "shapes-live: module world builds")
 		if built:
-			_ok(int(mw.call("arid_for", STONE, 0)) == STONE, "shapes-live: cube ARID == LRID (bootstrap)")
+			# DIRT (not in appearance_surface_materials, so its shapes are NOT pre-baked) exercises the
+			# LAZY shape-append path. STONE moved into the pre-baked set to smooth mountain rock, so a
+			# (STONE, RAMP) lookup now reuses a manifest ARID and no longer appends.
+			_ok(int(mw.call("arid_for", DIRT, 0)) == DIRT, "shapes-live: cube ARID == LRID (bootstrap)")
 			var before: int = mw.call("appearance_count")
-			var arid: int = mw.call("arid_for", STONE, RAMP)
+			var arid: int = mw.call("arid_for", DIRT, RAMP)
 			_ok(arid == before, "shapes-live: shaped ARID == prior model count (add_model()==ARID held)")
 			_ok(int(mw.call("appearance_count")) == before + 1, "shapes-live: exactly one shaped model appended")
-			_ok(int(mw.call("arid_for", STONE, RAMP)) == arid, "shapes-live: shaped ARID stable on re-lookup (no duplicate append)")
+			_ok(int(mw.call("arid_for", DIRT, RAMP)) == arid, "shapes-live: shaped ARID stable on re-lookup (no duplicate append)")
 			_ok(int(mw.call("appearance_count")) == before + 1, "shapes-live: no duplicate ARID for the same shape")
 		mw.queue_free()
 	else:

@@ -25,6 +25,7 @@ func _initialize() -> void:
 	TerrainConfig.warm_up()
 	_test_stackup()
 	_test_worldgen()
+	_test_temperature()
 	_test_worldgen_air_bounds()
 	_test_manifest_trim()
 	_test_smoothing()
@@ -246,8 +247,8 @@ func _test_worldgen() -> void:
 	_ok(sea_ok, "sea fills up to SEA_LEVEL and never above it")
 	_ok(BlockCatalog.solidity_of(WATER) < 0.5, "water is non-solid (waded through)")
 
-	# (c) sea ICE on a cold column, structurally backed by sub-zero surface temp.
-	var env := PerVoxelEnvironment.new()
+	# (c) sea ICE on a cold column. Ice generation is CLIMATE-driven (climate t < -0.55),
+	# independent of the temperature model — see _test_temperature for the model itself.
 	var cold := _find_cold_sea()
 	if cold.x != 0x7fffffff:
 		var cx := cold.x
@@ -257,16 +258,8 @@ func _test_worldgen() -> void:
 		# breaking the ice would expose non-solid water below.
 		_ok(BlockCatalog.solidity_of(TerrainConfig.generated_block(cx, SEA - 1, cz)) < 0.5,
 			"water under the ice is non-solid (%d,%d)" % [cx, cz])
-		var ice_temp := env.temperature(Vector3(cx + 0.5, SEA + 0.5, cz + 0.5))
-		_ok(ice_temp < -5.0, "cold-sea surface temperature < -5 C (got %.1f)" % ice_temp)
 	else:
 		_ok(false, "no cold sea column found to exercise ICE (widen the scan?)")
-
-	# a temperate land column reads ~room temperature at the surface (unchanged model).
-	var land := _grass_column()
-	var lg: int = TerrainConfig.height_at(land.x, land.y)
-	var land_temp := env.temperature(Vector3(land.x + 0.5, float(lg) + 0.5, land.y + 0.5))
-	_ok(land_temp > 15.0, "temperate land surface temperature is warm (got %.1f)" % land_temp)
 
 	# (d) beaches: sand appears on a found coastline (a column at sea +/- 2).
 	var BEACH_SAND := BlockCatalog.id_of(&"sand")
@@ -300,6 +293,62 @@ func _find_cold_sea() -> Vector2i:
 			if p.w < -0.55 and int(p.x) <= TerrainConfig.SEA_LEVEL - 2:
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
+
+# 2b. The reworked (biome-independent) piecewise temperature model (PerVoxelEnvironment):
+#   - every column's surface reads 21.5 C (air AND surface block),
+#   - air cools linearly to 0 C at y = 256 (clamped above),
+#   - ground cools 1 C/block to a 3 C plateau, then a geothermal rise of 1 C/block
+#     in the 24 blocks above bedrock (3 C at y=-40 → 27 C at the y=-64 bedrock floor).
+# Values are exact floats, so the tolerances are tight.
+func _test_temperature() -> void:
+	print("[2b] temperature model (surface 21.5 / altitude→0@256 / depth→3 plateau / geothermal→27)")
+	var env := PerVoxelEnvironment.new()
+	var land := _grass_column()
+	var g: int = TerrainConfig.height_at(land.x, land.y)
+	var fx := float(land.x) + 0.5
+	var fz := float(land.y) + 0.5
+
+	# (a) surface: the exposed block AND the surface air both read the 21.5 C baseline.
+	var t_surf := env.temperature(Vector3(fx, float(g) + 0.5, fz))
+	_ok(absf(t_surf - 21.5) < 0.05, "surface block reads 21.5 C (got %.2f)" % t_surf)
+	_ok(absf(PerVoxelEnvironment.surface_air_temperature(land.x, land.y) - 21.5) < 0.01,
+		"surface air temperature is the 21.5 C baseline")
+	_ok(absf(PerVoxelEnvironment.air_temperature(TerrainConfig.BASE_HEIGHT) - 21.5) < 0.01,
+		"air_temperature at baseline height is 21.5 C")
+
+	# (b) altitude: air cools to 0 C at y=256, clamps at 0 above, and drops monotonically.
+	var t_top := env.temperature(Vector3(fx, 256.5, fz))
+	_ok(absf(t_top) < 0.05, "air at y=256 reads 0 C (got %.2f)" % t_top)
+	_ok(env.temperature(Vector3(fx, 320.5, fz)) <= 0.001, "air above y=256 clamps at 0 C")
+	_ok(absf(PerVoxelEnvironment.air_temperature(256.0)) < 0.05, "air_temperature(256) is 0 C")
+	var t_a10 := env.temperature(Vector3(fx, float(g + 10) + 0.5, fz))
+	var t_a100 := env.temperature(Vector3(fx, float(g + 100) + 0.5, fz))
+	_ok(t_a10 < 21.5 and t_a100 < t_a10, "air temperature drops with altitude (%.2f > %.2f)" % [t_a10, t_a100])
+	# continuity at the surface seam: air one block up is just under 21.5.
+	var t_air1 := env.temperature(Vector3(fx, float(g + 1) + 0.5, fz))
+	_ok(t_air1 < 21.5 and 21.5 - t_air1 < 0.2, "air one block above surface ~21.5 (got %.2f)" % t_air1)
+
+	# (c) underground: -1 C per block of depth down to a 3 C plateau.
+	var t_d1 := env.temperature(Vector3(fx, float(g - 1) + 0.5, fz))
+	_ok(absf(t_d1 - 20.5) < 0.05, "one block deep reads 20.5 C (got %.2f)" % t_d1)
+	var t_d5 := env.temperature(Vector3(fx, float(g - 5) + 0.5, fz))
+	_ok(absf(t_d5 - 16.5) < 0.05, "five blocks deep reads 16.5 C (got %.2f)" % t_d5)
+	var t_plateau := env.temperature(Vector3(fx, float(g - 25) + 0.5, fz))   # d=25 (>18.5), y>-40
+	_ok(absf(t_plateau - 3.0) < 0.05, "deep block hits the 3 C plateau (got %.2f)" % t_plateau)
+
+	# (d) geothermal rise in the 24 blocks above bedrock (column-independent).
+	var t_geo0 := env.temperature(Vector3(fx, -40.0 + 0.5, fz))
+	_ok(absf(t_geo0 - 3.0) < 0.05, "geothermal start y=-40 reads 3 C (got %.2f)" % t_geo0)
+	var t_geo_mid := env.temperature(Vector3(fx, -52.0 + 0.5, fz))
+	_ok(absf(t_geo_mid - 15.0) < 0.05, "geothermal mid y=-52 reads 15 C (got %.2f)" % t_geo_mid)
+	var t_bedrock := env.temperature(Vector3(fx, -64.0 + 0.5, fz))
+	_ok(absf(t_bedrock - 27.0) < 0.05, "bedrock y=-64 reads 27 C (got %.2f)" % t_bedrock)
+
+	# (e) biome independence: a cold-sea surface no longer reads sub-zero (old model dropped).
+	var cold := _find_cold_sea()
+	if cold.x != 0x7fffffff:
+		var cst := env.temperature(Vector3(float(cold.x) + 0.5, float(TerrainConfig.SEA_LEVEL) + 0.5, float(cold.y) + 0.5))
+		_ok(cst > 15.0, "cold-sea surface is biome-independent room-ish air (got %.2f)" % cst)
 
 # Ore distribution over a deep sampled volume.
 func _test_ores() -> void:

@@ -238,6 +238,26 @@ func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
 			return true
 	return false
 
+## The world column (wx, wz) of a representative AWAKE loose body within `radius` columns (Chebyshev)
+## of `center`, or Vector2i(0x7fffffff, 0) if none. GroundCollider centres its bootstrap CORE on the
+## actual faller (which may be a few blocks from the player — a break happens at reach distance)
+## rather than on the player, so a small core reliably covers the body that needs ground. Mirrors the
+## body-tracking of has_active_bodies_near exactly (same awake/home-column logic).
+func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
+	for c in get_children():
+		if not (c is VoxelBody):
+			continue
+		var vb := c as VoxelBody
+		if vb.cells.is_empty() or not vb.is_awake():
+			continue
+		var home := _body_home_column(vb)
+		var gp := vb.global_position
+		var wx := home.x + int(floor(gp.x))
+		var wz := home.y + int(floor(gp.z))
+		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
+			return Vector2i(wx, wz)
+	return Vector2i(0x7fffffff, 0)
+
 ## Wake every dormant loose body whose cells are within `radius` metres of world point `p` — the
 ## disturbance reactivation path (DORMANT-BY-DEFAULT): a break/collapse/placement near settled
 ## debris wakes it so it re-tests support and falls if undermined, else re-settles. Called on every

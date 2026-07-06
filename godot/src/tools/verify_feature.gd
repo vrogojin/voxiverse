@@ -821,10 +821,11 @@ func _test_collider_cheap_queries() -> void:
 		% [reps, old_us, new_us, (float(old_us) / maxf(1.0, float(new_us)))])
 	_ok(new_us < old_us, "collider-cheap: light query strategy is cheaper than full generated_cell (%d us < %d us)" % [new_us, old_us])
 
-	# Cost proof #2 — worst-case SINGLE-FRAME collider cost, old vs new scheduling. Drive a real
-	# GroundCollider directly (a bare WorldManager answers the cell queries). The FIRST build is
-	# synchronous (= the old whole-region single-frame cost — the walking stutter); a drift then
-	# triggers the AMORTIZED rebuild, whose worst single update() slice must be a small fraction.
+	# Cost proof #2 — worst-case SINGLE-FRAME collider cost with CORE-THEN-FILL. Drive a real
+	# GroundCollider directly (a bare WorldManager answers the cell queries). The first build is now a
+	# small synchronous CORE around the faller (the ONLY synchronous cost — replacing the old ~368ms
+	# whole-region stall); the full region then fills incrementally, and each fill slice must be a
+	# small fraction of even that core build.
 	var cw := WorldManager.new()
 	cw.name = "ColliderPerfWorld"
 	get_root().add_child(cw)
@@ -833,25 +834,27 @@ func _test_collider_cheap_queries() -> void:
 	gc.setup(cw)
 	VoxelBody.spawn_loose(cw, {Vector3i(s.x, 40, s.y): STONE}, cw)   # active-body gate: keep the collider live
 	var bt0 := Time.get_ticks_usec()
-	gc.update(Vector3(float(s.x) + 0.5, 40.0, float(s.y) + 0.5))     # first build = synchronous
-	var full_us := Time.get_ticks_usec() - bt0
-	var nshapes := PhysicsServer3D.body_get_shape_count(gc.active_rid())
-	# Drift REBUILD_DIST blocks → an incremental rebuild; time each update() slice to completion.
-	var np := Vector3(float(s.x) + 0.5 + float(GroundCollider.REBUILD_DIST), 40.0, float(s.y) + 0.5 + float(GroundCollider.REBUILD_DIST))
+	gc.update(Vector3(float(s.x) + 0.5, 40.0, float(s.y) + 0.5))     # first build = synchronous CORE + one fill slice
+	var core_us := Time.get_ticks_usec() - bt0
+	var core_shapes := PhysicsServer3D.body_get_shape_count(gc.active_rid())
+	# Pump the incremental fill to completion; time each update() slice.
+	var here := Vector3(float(s.x) + 0.5, 40.0, float(s.y) + 0.5)
 	var max_slice := 0
 	var frames := 0
 	while true:
 		var s0 := Time.get_ticks_usec()
-		gc.update(np)
+		gc.update(here)
 		max_slice = maxi(max_slice, Time.get_ticks_usec() - s0)
 		frames += 1
-		if not gc.is_building() or frames > 4000:
+		if not gc.is_building() or frames > 6000:
 			break
-	print("    collider single-frame cost: OLD whole-region=%d us  vs  NEW worst incremental slice=%d us over %d frames (%d shapes)"
-		% [full_us, max_slice, frames, nshapes])
-	_ok(nshapes > 0, "collider-cheap: first (synchronous) build emitted shapes (%d)" % nshapes)
-	_ok(frames > 1, "collider-cheap: incremental rebuild spreads across K>1 frames (K=%d)" % frames)
-	_ok(max_slice * 2 < full_us, "collider-cheap: worst single-frame slice (%d us) is well under the whole-region cost (%d us)" % [max_slice, full_us])
+	var full_shapes := PhysicsServer3D.body_get_shape_count(gc.active_rid())
+	print("    collider single-frame cost: synchronous CORE=%d us (%d shapes)  vs  worst fill slice=%d us over %d frames (full region %d shapes)"
+		% [core_us, core_shapes, max_slice, frames, full_shapes])
+	_ok(core_shapes > 0, "collider-cheap: the immediate core build emitted shapes (%d)" % core_shapes)
+	_ok(full_shapes > core_shapes, "collider-cheap: the full region (%d shapes) fills in behind the smaller core (%d)" % [full_shapes, core_shapes])
+	_ok(frames > 1, "collider-cheap: the fill spreads across K>1 frames (K=%d)" % frames)
+	_ok(max_slice * 2 < core_us, "collider-cheap: worst fill slice (%d us) is well under even the core build (%d us)" % [max_slice, core_us])
 	gc.queue_free()
 	cw.queue_free()
 
@@ -956,11 +959,21 @@ func _test_collider_amortized() -> void:
 	get_root().add_child(gc)
 	gc.setup(cw)
 	VoxelBody.spawn_loose(cw, {Vector3i(cx, g + 20, cz): STONE}, cw)       # active-body gate: keep the collider live
-	# First build is synchronous → the world has collision immediately at spawn/load.
+	# CORE-THEN-FILL: the first build makes a small CORE live IMMEDIATELY (ground for the faller) and
+	# fills the full R region incrementally behind it — no ~368ms whole-region synchronous stall.
 	gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
-	_ok(not gc.is_building(), "amortized: first build completes synchronously (immediate collision)")
+	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
+		"amortized: first build makes a CORE live immediately (collision for the faller)")
+	_ok(gc.is_building(), "amortized: full region fills incrementally behind the core (core-then-fill)")
+	var core_n := PhysicsServer3D.body_get_shape_count(gc.active_rid())
+	# Pump the fill to completion so the FULL region is live for the rest of the test.
+	var boot_f := 0
+	while gc.is_building() and boot_f <= 6000:
+		gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+		boot_f += 1
+	_ok(not gc.is_building(), "amortized: core-then-fill completes (full region live)")
 	var n0 := PhysicsServer3D.body_get_shape_count(gc.active_rid())
-	_ok(n0 > 0, "amortized: first build emitted shapes (%d)" % n0)
+	_ok(n0 > core_n, "amortized: settled full region (%d shapes) is larger than the bootstrap core (%d)" % [n0, core_n])
 	var rid0 := gc.active_rid()
 	# Drift REBUILD_DIST blocks → an incremental rebuild. ONE update() must NOT finish it.
 	var ncx := cx + GroundCollider.REBUILD_DIST
@@ -1046,7 +1059,12 @@ func _test_collider_gate() -> void:
 	_ok(cw.has_active_bodies_near(Vector2i(cx, cz), GroundCollider.R), "gate: has_active_bodies_near true for the nearby body")
 	gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
 	_ok(gc.active_rid().is_valid() and PhysicsServer3D.body_get_shape_count(gc.active_rid()) > 0,
-		"gate: first body spawn → collider builds immediately (ground for the falling body)")
+		"gate: first body spawn → collider bootstraps a core immediately (ground for the falling body)")
+	# Let the core-then-fill finish so the collider is idle (not mid-fill) before we fly away.
+	var gate_f := 0
+	while gc.is_building() and gate_f <= 6000:
+		gc.update(Vector3(float(cx) + 0.5, float(g) + 2.0, float(cz) + 0.5))
+		gate_f += 1
 
 	# (c) Fly 200 blocks from the debris → gate turns OFF (exploration after a break leaves debris
 	# behind, and the collider must NOT keep churning around the departing player). P2: the gate now

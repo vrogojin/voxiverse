@@ -36,6 +36,13 @@ extends Node3D
 const R := 14                # region half-extent in columns (covers +/-14 blocks)
 const REBUILD_DIST := 8       # (re)build once the player drifts this far from the LIVE centre
 const DEPTH := 32             # emit solid this far below the region's lowest surface
+## Half-extent (columns) of the immediate synchronous CORE built around a freshly-woken faller before
+## the full R region fills incrementally behind it (see _build_core / core-then-fill). A break happens
+## at reach distance and a chopped tree's pieces spread a few blocks, so ±4 (a 9×9 core) reliably
+## covers the faller and its neighbours through the ~1.4 s the full fill takes; (2*CORE_R+1)^2 = 81
+## columns is ~1/10 of the (2R+1)^2 = 841 region, turning the old ~368 ms whole-region synchronous
+## stall into a ~one-frame core build.
+const CORE_R := 4
 
 const GROUND_FRICTION := 0.6  # grippy enough that dropped pieces rest, not slide
 const GROUND_BOUNCE := 0.0    # no bouncing off the terrain
@@ -149,8 +156,8 @@ func setup(world_ref: WorldManager) -> void:
 ## body is near the player, this does ZERO work (early-return, collider left idle). Exploring /
 ## flying with nothing broken → no rebuild churn at all; the per-distance stutter (which scaled with
 ## movement speed = the rebuild-on-drift cycle) disappears. A body spawned by a break/place, or one
-## that drifts within range, re-activates the collider and (from idle) forces an immediate
-## synchronous build so the falling body always has ground.
+## that drifts within range, re-activates the collider and (from idle) bootstraps a small CORE so the
+## falling body has ground THIS frame, while the full region fills incrementally behind it.
 func update(player_pos: Vector3) -> void:
 	if world == null:
 		return
@@ -166,17 +173,22 @@ func update(player_pos: Vector3) -> void:
 			_begin_build(_target)
 		_advance_build(false)
 		return
-	# Session-first build: no collider exists yet → complete NOW so spawn/load has collision.
+	# Session-first build: no collider exists yet → CORE-THEN-FILL. A small synchronous core centred on
+	# the faller goes live THIS frame (ground immediately), then the full R region fills incrementally
+	# behind it — replacing the old ~368 ms whole-region synchronous stall with a ~one-frame core build.
 	if _live_center.x == 0x7fffffff:
+		_bootstrap_core(_target)
 		_begin_build(_target)
-		_advance_build(true)
+		_advance_build(false)
 		return
-	# Reopening from gated with the RETAINED live set too far to serve a freshly-woken faller during
-	# a sliced rebuild → build synchronously so the body always has ground under it. (The common case
-	# — break near where you already stand — keeps the covering live set and pays NO sync rebuild.)
+	# Reopening from gated with the RETAINED live set too far to serve a freshly-woken faller during a
+	# sliced rebuild → same core-then-fill: bootstrap immediate ground under the faller, fill the rest
+	# incrementally. (The common case — break near where you already stand — keeps the covering live set
+	# and pays NO core rebuild.)
 	if was_gated and _drift(_target, _live_center) >= REBUILD_DIST:
+		_bootstrap_core(_target)
 		_begin_build(_target)
-		_advance_build(true)
+		_advance_build(false)
 		return
 	# Player-drift rebuild (walked far): incremental — the slightly-stale but nearby live set keeps
 	# colliding during the slice (the existing double-buffer contract).
@@ -229,6 +241,63 @@ func _notification(what: int) -> void:
 
 static func _drift(a: Vector2i, b: Vector2i) -> int:
 	return maxi(absi(a.x - b.x), absi(a.y - b.y))    # Chebyshev distance in columns
+
+# --- core-then-fill bootstrap --------------------------------------------------
+
+## Find the faller and build the immediate CORE around it. The gate is open because an awake body is
+## within _GATE_RADIUS of the player, so centre the core on THAT body (a break happens at reach
+## distance — the faller can be a few blocks from the player); fall back to the player column if the
+## body vanished between the gate check and here.
+func _bootstrap_core(player_target: Vector2i) -> void:
+	var fc := world.active_body_column_near(player_target, _GATE_RADIUS)
+	_build_core(fc if fc.x != 0x7fffffff else player_target)
+
+## Build a small (CORE_R) synchronous collider centred on `center` into the currently-inert double-
+## buffer body and make it LIVE immediately, so a freshly-spawned/woken faller has ground THIS frame
+## without paying the whole-region synchronous cost. The full R region then fills incrementally behind
+## it (update() calls _begin_build + _advance_build right after this); when that completes the buffer
+## swaps and this core body goes inert — the core is a transient bootstrap and the settled result is
+## byte-identical to a full rebuild. Reuses _emit_column, so core shapes are byte-identical to the
+## full build's shapes for the same columns (only y_lo differs: core uses the CORE's local floor,
+## which is ≥ the region floor — still DEPTH deep under the faller, and irrelevant once the full set
+## swaps in). Uses the shared build-state vars (_build_ylo/_build_staging/_build_used/_build_cused/
+## _build_slot/_build_prev_count/_build_pc); all are re-initialised by _begin_build + the HEIGHTS→
+## SHAPES transition before the incremental fill's shape pass touches them, so there is no carryover.
+func _build_core(center: Vector2i) -> void:
+	_build_pc.clear()
+	var bidx := (_live + 1) % 2                       # build into the inert body (becomes live)
+	var cspan := 2 * CORE_R + 1
+	var hs := PackedInt32Array()
+	hs.resize(cspan * cspan)
+	var core_min := 0x7fffffff
+	var k := 0
+	for dz in range(-CORE_R, CORE_R + 1):
+		for dx in range(-CORE_R, CORE_R + 1):
+			var h := int(TerrainConfig.column_profile(center.x + dx, center.y + dz, _build_pc).x)
+			hs[k] = h
+			if h < core_min:
+				core_min = h
+			k += 1
+	_build_ylo = core_min - DEPTH
+	_build_staging = bidx
+	_build_prev_count = PhysicsServer3D.body_get_shape_count(_body[bidx].get_rid())
+	_build_used = 0
+	_build_cused = 0
+	_build_slot = 0
+	k = 0
+	for dz in range(-CORE_R, CORE_R + 1):
+		for dx in range(-CORE_R, CORE_R + 1):
+			_emit_column(bidx, center.x + dx, center.y + dz, hs[k])
+			k += 1
+	# Trim any surplus slots this body kept from a previous, larger life (index-stable from the end).
+	while _build_prev_count > _build_slot:
+		PhysicsServer3D.body_remove_shape(_body[bidx].get_rid(), _build_prev_count - 1)
+		_build_prev_count -= 1
+	# Swap the core live immediately (O(1) layer toggle); the old live body (if any) goes inert.
+	_body[bidx].collision_layer = TERRAIN_LAYER
+	if _live >= 0 and _live != bidx:
+		_body[_live].collision_layer = 0
+	_live = bidx
 
 # --- incremental build --------------------------------------------------------
 

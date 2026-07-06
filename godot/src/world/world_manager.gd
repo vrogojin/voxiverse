@@ -431,8 +431,9 @@ func has_metadata(cell: Vector3i) -> bool:
 
 ## Set the STATE axis (bits 32..47) of `cell`, keeping its material + modifier and
 ## PRESERVING any metadata (the one write that does — §11). Returns false on air.
-## The state bits are canonicalized/validated through `CellCodec` (today's validator is
-## pass-through; no material declares a state layout yet, so any value round-trips).
+## The state bits are canonicalized/validated through `CellCodec._validate_state`, which masks
+## them against the material's declared `state_layout` (M1: undeclared bits silently drop to 0;
+## an UNRESOLVED placeholder keeps its bits permissively).
 func set_state(cell: Vector3i, state_bits: int) -> bool:
 	var v := cell_value_at(cell)
 	var mat := CellCodec.mat(v)
@@ -443,6 +444,48 @@ func set_state(cell: Vector3i, state_bits: int) -> bool:
 	# block-entity) rather than orphaning it: set_state is a behavioural, not material, edit.
 	_write_cell(cell, new_packed, _meta.get(cell, null))
 	return true
+
+## Evaluate the material state machine at `cell` and, if a transition fires, apply the new STATE
+## bits (M1 snowy-world ADR §4.2 — the melt/freeze EVALUATOR primitive). Returns true iff the cell's
+## state changed. This is the live, dormant-by-default machine: there is NO periodic tick / global
+## sweep / disturbance hook in M1 — worldgen already produces the fixed point of the transition
+## (cap and melt share ONE zero crossing), so a call at a generated cell does nothing; a warm column
+## holding a stray capped value melts it, a cold column caps bare grass. First-triggered transition
+## wins; a target naming a `state_layout` bit SETS that bit, a target naming the DEFAULT state name
+## CLEARS all layout bits (the snow melts back). The write routes through set_state → _write_cell →
+## `_edits` (overlay-persisted, re-meshed), authoritative over generation — a melt can never be
+## un-melted by re-streaming (same guarantee as break/place).
+func apply_state_transitions(cell: Vector3i) -> bool:
+	var v := cell_value_at(cell)
+	var mat := CellCodec.mat(v)
+	if mat == BlockCatalog.AIR:
+		return false
+	var def := BlockCatalog.def_of(mat)
+	if def == null:
+		return false
+	var st := def.get_default_state()
+	if st == null or st.transitions.is_empty():
+		return false
+	var mask := BlockCatalog.state_mask_of(mat)
+	var state_bits := CellCodec.state(v)
+	var sample := environment.sample(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
+	for t: VoxelStateTransition in st.transitions:
+		if not t.is_triggered(sample):
+			continue
+		var idx := def.state_layout.find(t.to_state)
+		var new_bits: int
+		if idx >= 0:
+			new_bits = state_bits | (1 << idx)       # target is a STATE-axis bit → set it
+		elif t.to_state == st.state_name:
+			new_bits = state_bits & ~mask            # target is the default state → clear the layout bits
+		else:
+			continue                                 # unresolvable target → try the next transition
+		# First TRIGGERED-and-resolvable transition wins (disjoint predicates make this safe): apply
+		# it if it changes the state, else report no change (idempotent).
+		if new_bits != state_bits:
+			return set_state(cell, new_bits)
+		return false
+	return false
 
 ## JSON-subset validator (§3.2): a metadata document restricted to String keys and
 ## bool/int/finite-float/String/Array/Dictionary values, recursively. Rejects Object

@@ -56,6 +56,7 @@ func _initialize() -> void:
 	_test_zonechunk()
 	_test_dynamic_catalog()
 	_test_zone_bundle()
+	_test_snowy_world()
 	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -190,6 +191,9 @@ func _test_manifest_trim() -> void:
 		eset[m] = true
 	_ok(emitted.size() > 0, "emitted modifier set is non-empty (%d)" % emitted.size())
 	_ok(emitted.size() < full.size(), "emitted set is TRIMMED vs the full %d corner tuples (%d)" % [full.size(), emitted.size()])
+	# M1 (ADR §6.4 / §8 item 9): the snow half-slab modifier (85) is unioned into the emitted set so
+	# the module path ALWAYS bakes (snow_block, 85) even though the temperate sample won't contain it.
+	_ok(eset.has(TerrainConfig.SNOW_SLAB_MODIFIER), "emitted set contains the snow half-slab modifier (%d)" % TerrainConfig.SNOW_SLAB_MODIFIER)
 	# Coverage over the spawn play-area, using the REAL tree-aware surface/cap queries: every
 	# smoothed shape the generator emits there must be in the baked set (no cube-fallback there).
 	var s := TerrainConfig.find_spawn()
@@ -318,38 +322,43 @@ func _find_cold_sea() -> Vector2i:
 #     in the 24 blocks above bedrock (3 C at y=-40 → 27 C at the y=-64 bedrock floor).
 # Values are exact floats, so the tolerances are tight.
 func _test_temperature() -> void:
-	print("[2b] temperature model (surface 21.5 / altitude→0@256 / depth→3 plateau / geothermal→27)")
+	print("[2b] temperature model (absolute-altitude lapse: 0@y=96 / depth→3 plateau / geothermal→27)")
 	var env := PerVoxelEnvironment.new()
 	var land := _grass_column()
 	var g: int = TerrainConfig.height_at(land.x, land.y)
 	var fx := float(land.x) + 0.5
 	var fz := float(land.y) + 0.5
+	# M1 (ADR §3.4): a temperate column's surface temperature is 21.5 − LAPSE·g, NOT a flat 21.5.
+	var t_climate: float = TerrainConfig.column_profile(land.x, land.y).w
+	var st_surf: float = ClimateModel.surface_temperature(g, t_climate)          # 21.5 − 0.224·g
 
-	# (a) surface: the exposed block AND the surface air both read the 21.5 C baseline.
+	# (a) surface: the exposed block AND the surface air read the column's own surface temperature.
 	var t_surf := env.temperature(Vector3(fx, float(g) + 0.5, fz))
-	_ok(absf(t_surf - 21.5) < 0.05, "surface block reads 21.5 C (got %.2f)" % t_surf)
-	_ok(absf(PerVoxelEnvironment.surface_air_temperature(land.x, land.y) - 21.5) < 0.01,
-		"surface air temperature is the 21.5 C baseline")
-	_ok(absf(PerVoxelEnvironment.air_temperature(TerrainConfig.BASE_HEIGHT) - 21.5) < 0.01,
-		"air_temperature at baseline height is 21.5 C")
+	_ok(absf(t_surf - st_surf) < 0.05, "surface block reads 21.5 − 0.224·g = %.2f C (got %.2f)" % [st_surf, t_surf])
+	_ok(absf(PerVoxelEnvironment.surface_air_temperature(land.x, land.y) - st_surf) < 0.01,
+		"surface air temperature == the column's surface anchor")
+	_ok(absf(PerVoxelEnvironment.air_temperature(TerrainConfig.BASE_HEIGHT) - ClimateModel.air_temperature(TerrainConfig.BASE_HEIGHT, ClimateModel.CLIMATE_TEMPERATE)) < 0.01,
+		"air_temperature(baseline) == the temperate lapse value")
 
-	# (b) altitude: air cools to 0 C at y=256, clamps at 0 above, and drops monotonically.
+	# (b) altitude: air reaches 0 C at y=96 (temperate), goes NEGATIVE above (no clamp), drops monotonically.
+	var t_96 := env.temperature(Vector3(fx, 96.5, fz))
+	_ok(t_96 < 1.0, "air at y=96 is near 0 C (got %.2f)" % t_96)
+	_ok(absf(PerVoxelEnvironment.air_temperature(96.0, ClimateModel.CLIMATE_TEMPERATE)) < 0.05, "air_temperature(96) is 0 C")
+	_ok(PerVoxelEnvironment.air_temperature(256.0, ClimateModel.CLIMATE_TEMPERATE) < -30.0, "air_temperature(256) is well below 0 (no clamp)")
 	var t_top := env.temperature(Vector3(fx, 256.5, fz))
-	_ok(absf(t_top) < 0.05, "air at y=256 reads 0 C (got %.2f)" % t_top)
-	_ok(env.temperature(Vector3(fx, 320.5, fz)) <= 0.001, "air above y=256 clamps at 0 C")
-	_ok(absf(PerVoxelEnvironment.air_temperature(256.0)) < 0.05, "air_temperature(256) is 0 C")
+	_ok(t_top < -30.0, "air at y=256 reads far below 0 C (got %.2f)" % t_top)
 	var t_a10 := env.temperature(Vector3(fx, float(g + 10) + 0.5, fz))
 	var t_a100 := env.temperature(Vector3(fx, float(g + 100) + 0.5, fz))
-	_ok(t_a10 < 21.5 and t_a100 < t_a10, "air temperature drops with altitude (%.2f > %.2f)" % [t_a10, t_a100])
-	# continuity at the surface seam: air one block up is just under 21.5.
+	_ok(t_a10 < st_surf and t_a100 < t_a10, "air temperature drops with altitude (%.2f > %.2f)" % [t_a10, t_a100])
+	# continuity at the surface seam: air one block up is just under the surface anchor.
 	var t_air1 := env.temperature(Vector3(fx, float(g + 1) + 0.5, fz))
-	_ok(t_air1 < 21.5 and 21.5 - t_air1 < 0.2, "air one block above surface ~21.5 (got %.2f)" % t_air1)
+	_ok(t_air1 < st_surf and st_surf - t_air1 < 0.3, "air one block above surface ~surface anchor (got %.2f)" % t_air1)
 
-	# (c) underground: -1 C per block of depth down to a 3 C plateau.
+	# (c) underground: -1 C per block of depth down to a 3 C plateau (off the surface anchor).
 	var t_d1 := env.temperature(Vector3(fx, float(g - 1) + 0.5, fz))
-	_ok(absf(t_d1 - 20.5) < 0.05, "one block deep reads 20.5 C (got %.2f)" % t_d1)
+	_ok(absf(t_d1 - (st_surf - 1.0)) < 0.05, "one block deep reads surface−1 = %.2f C (got %.2f)" % [st_surf - 1.0, t_d1])
 	var t_d5 := env.temperature(Vector3(fx, float(g - 5) + 0.5, fz))
-	_ok(absf(t_d5 - 16.5) < 0.05, "five blocks deep reads 16.5 C (got %.2f)" % t_d5)
+	_ok(absf(t_d5 - (st_surf - 5.0)) < 0.05, "five blocks deep reads surface−5 = %.2f C (got %.2f)" % [st_surf - 5.0, t_d5])
 	var t_plateau := env.temperature(Vector3(fx, float(g - 25) + 0.5, fz))   # d=25 (>18.5), y>-40
 	_ok(absf(t_plateau - 3.0) < 0.05, "deep block hits the 3 C plateau (got %.2f)" % t_plateau)
 
@@ -485,7 +494,13 @@ func _test_both_paths() -> void:
 	var cells := 0
 	var liquid_cells := 0
 	var shaped_cells := 0
+	var capped_cells := 0
 	var uncovered := 0
+	# M1 (ADR §6/§8): guarantee the sample straddles the COLD band so snow-capped + half-slab cells
+	# are exercised. Append a 16³ block known to hold a capped surface cell (if this seed has one).
+	var capped_block := _find_capped_block()
+	if capped_block.x != 0x7fffffff:
+		origins.append(capped_block)
 	for origin: Vector3i in origins:
 		var buf: Object = ClassDB.instantiate("VoxelBuffer")
 		buf.call("create", 16, 16, 16)
@@ -504,17 +519,24 @@ func _test_both_paths() -> void:
 					# slab ARID, shore composites (level 9, modifier != 0) → their wet-model ARID, and
 					# submerged composites (level 10) / dry cells (level 0) → the dry resolve, exactly
 					# as gen_arid_for(mat, modifier, liquid_level) does on the worker (Stream B contract).
-					var expected: int = int(mw.call("gen_arid_for", mat, modifier, CellCodec.liquid_level(v)))
+					# M1 (§5.2): mirror the worker's FULL per-cell resolve — pass the liquid kind AND the
+					# STATE axis so a snow-capped cell → its snow-variant ARID and a slab → the dry (snow, 85)
+					# ARID, exactly as the worker's inline resolve does.
+					var expected: int = int(mw.call("gen_arid_for", mat, modifier, CellCodec.liquid_level(v), CellCodec.liquid_kind(v), CellCodec.state(v)))
 					if got != expected:
 						mismatches += 1
 					if CellCodec.liquid_field(v) != 0:
 						liquid_cells += 1
+					if CellCodec.has_state(v, CellCodec.STATE_SNOW_CAPPED):
+						capped_cells += 1
 					if mat != BlockCatalog.AIR and modifier != 0:
 						shaped_cells += 1
 						if not bool(mw.call("is_manifest_baked", mat, modifier)):
 							uncovered += 1
 					cells += 1
-	_ok(mismatches == 0, "module generator TYPE == manifest arid_for(mat,modifier) over %d cells (%d mismatches)" % [cells, mismatches])
+	_ok(mismatches == 0, "module generator TYPE == gen_arid_for(mat,modifier,level,kind,state) over %d cells (%d mismatches)" % [cells, mismatches])
+	if capped_block.x != 0x7fffffff:
+		_ok(capped_cells > 0, "both-path sample straddles the COLD band: %d snow-capped cells present" % capped_cells)
 	if TerrainConfig.SMOOTHING_ENABLED:
 		_ok(shaped_cells > 0, "both-path sample includes shaped surface cells (%d) — smoothing active" % shaped_cells)
 		_ok(uncovered == 0, "every shaped generated cell is PRE-BAKED in the frozen manifest (%d uncovered) — worker never lazy-bakes" % uncovered)
@@ -579,7 +601,7 @@ func _test_both_paths() -> void:
 						var modifier: int = CellCodec.modifier(v)
 						var level: int = CellCodec.liquid_level(v)
 						var got: int = int(buf.call("get_voxel", lx, ly, lz, ch))
-						var expected: int = int(mw.call("gen_arid_for", mat, modifier, level))
+						var expected: int = int(mw.call("gen_arid_for", mat, modifier, level, CellCodec.liquid_kind(v), CellCodec.state(v)))
 						if got != expected:
 							w_mismatch += 1
 						if level == CellCodec.LIQ_LEVEL_SURFACE:
@@ -627,6 +649,30 @@ func _test_both_paths() -> void:
 	print("    air-block gen cost: all-air=%.1f us/block  vs  content=%.1f us/block (%.0fx cheaper)"
 		% [air_us, content_us, content_us / maxf(0.1, air_us)])
 	_ok(air_us < content_us, "all-air block generation is far cheaper than a content block (early-out hit)")
+
+	# --- M1 snow-cap state-variant render mirror (ADR §5, §8 item 6) --------------------------------
+	# _snow_arid is frozen at setup: driving the generator (above) baked NO new ARID; the snow-variant
+	# ARID for a capped cell differs from the plain-material ARID and matches the mirror; an UNBAKED
+	# state pair (stone — declared cappable but never baked) falls back to the plain look, never 0.
+	var snow_bit := CellCodec.STATE_SNOW_CAPPED
+	var grass_plain := int(mw.call("arid_for_cell", CellCodec.pack(GRASS, 0, 0)))
+	var grass_snow := int(mw.call("arid_for_cell", CellCodec.pack(GRASS, 0, snow_bit)))
+	_ok(grass_snow != grass_plain, "capped grass ARID (%d) differs from plain grass ARID (%d)" % [grass_snow, grass_plain])
+	_ok(grass_snow == int(mw.call("gen_arid_for", GRASS, 0, 0, CellCodec.LIQ_WATER, snow_bit)),
+		"arid_for_cell(capped grass) == gen_arid_for(grass, …, state) mirror")
+	# stone: declared cappable but UNBAKED (worldgen never stamps it) → the snow slot is -1, so the
+	# capped value falls back to the plain stone cube ARID (never a hole, §5.5).
+	var stone_plain := int(mw.call("arid_for_cell", CellCodec.pack(STONE, 0, 0)))
+	var stone_snow := int(mw.call("arid_for_cell", CellCodec.pack(STONE, 0, snow_bit)))
+	_ok(stone_snow == stone_plain and stone_snow > 0, "unbaked capped stone falls back to the plain stone ARID (%d), never a hole" % stone_snow)
+	# The generator does not bake a snow ARID on the worker either (frozen table).
+	var ac_snow := int(mw.call("appearance_count"))
+	var bufS: Object = ClassDB.instantiate("VoxelBuffer")
+	bufS.call("create", 16, 16, 16)
+	if capped_block.x != 0x7fffffff:
+		gen.call("_generate_block", bufS, capped_block, 0)
+	_ok(int(mw.call("appearance_count")) == ac_snow, "generating a capped block bakes NO new ARID (snow table frozen at %d)" % ac_snow)
+
 	mw.queue_free()
 
 ## True iff the module generator writes ALL AIR (TYPE channel 0) for the 16³ block at `origin`.
@@ -656,6 +702,19 @@ func _find_shaped_block() -> Vector3i:
 			if g < TerrainConfig.SEA_LEVEL:
 				continue
 			if CellCodec.modifier(TerrainConfig.generated_cell(x, g, z)) != 0:
+				return Vector3i(floori(x / 16.0) * 16, floori(g / 16.0) * 16, floori(z / 16.0) * 16)
+	return Vector3i(0x7fffffff, 0, 0)
+
+## A 16³ block origin (16-aligned) known to contain a snow-CAPPED surface cell (M1 §6/§8), or
+## (0x7fffffff,_,_) if this seed has none reachable near origin — so the both-path test straddles
+## the cold band and exercises the snow-variant + slab render path.
+func _find_capped_block() -> Vector3i:
+	for x in range(-384, 384, 3):
+		for z in range(-384, 384, 3):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			if CellCodec.has_state(TerrainConfig.generated_cell(x, g, z), CellCodec.STATE_SNOW_CAPPED):
 				return Vector3i(floori(x / 16.0) * 16, floori(g / 16.0) * 16, floori(z / 16.0) * 16)
 	return Vector3i(0x7fffffff, 0, 0)
 
@@ -3118,6 +3177,11 @@ func _test_metadata() -> void:
 	_ok(not BlockCatalog.has_block_entity(BE), "has_block_entity is false for shipped materials (default)")
 	st.has_block_entity = true
 	_ok(BlockCatalog.has_block_entity(BE), "has_block_entity true after the flag is set")
+	# M1 retarget (ADR §1.5): stone is now a cappable material with a 1-bit state_layout, but this
+	# test exercises the STATE AXIS generically with value 5 (0b101). Widen stone's mask to ≥3 bits
+	# FOR THIS TEST so 5 stays legal through _validate_state (retarget the sweep, don't weaken it).
+	var prev_mask := BlockCatalog.state_mask_of(BE)
+	BlockCatalog._state_mask[BE] = 0x7
 
 	# (d) metadata on a NON-block-entity material is rejected, writes nothing.
 	_ok(world.place_block(cell, GRASS), "place a grass cell (non block-entity)")
@@ -3201,6 +3265,7 @@ func _test_metadata() -> void:
 		_ok(false, "collapse: found a flat patch for the collapse-frees-metadata test")
 
 	st.has_block_entity = prev_flag                            # restore (gameplay data untouched)
+	BlockCatalog._state_mask[BE] = prev_mask                   # restore stone's real 1-bit mask
 
 # JSON-canonical normalization of a metadata document: the exact form it takes after one
 # round-trip through the §5 UTF-8-JSON metadata layer. JSON has no int/float distinction,
@@ -3326,6 +3391,10 @@ func _test_zonechunk() -> void:
 	var be_state: VoxelState = BlockCatalog.state_of(BE)
 	var prev_be := be_state.has_block_entity
 	be_state.has_block_entity = true
+	# M1 retarget (ADR §1.5): widen stone's 1-bit state mask so this state-axis test's value 5 stays
+	# legal through _validate_state; restored below with prev_be.
+	var prev_be_mask := BlockCatalog.state_mask_of(BE)
+	BlockCatalog._state_mask[BE] = 0x7
 
 	var w1 := _struct_world("P6bSave")
 	var c_cube := Vector3i(px, pg + 1, pz)               # rests on the grass surface
@@ -3404,6 +3473,7 @@ func _test_zonechunk() -> void:
 	w4.queue_free()
 
 	be_state.has_block_entity = prev_be                  # restore (gameplay data untouched)
+	BlockCatalog._state_mask[BE] = prev_be_mask          # restore stone's real 1-bit mask
 
 # P6c-1. Dynamic material catalog (RUNTIME-MATERIAL-STREAMING §2/§5/§6/§7/§8, §11 subset):
 # the GMID⇄LRID identity model + material-document serialization + placeholder/late
@@ -3761,7 +3831,237 @@ func _bundle_doc(mat_name: String, state_name: String, mass: float, swatch: Colo
 	def.id = StringName(mat_name)
 	def.states = [st]
 	def.default_state_index = 0
+	# M1 retarget (ADR §1.5): a ≥3-entry STATE-axis layout so a bundle cell's state value up to 7
+	# stays legal through _validate_state (the charlie cell carries state 5) — retarget, don't weaken.
+	def.state_layout = [&"s0", &"s1", &"s2"]
 	return MaterialDocument.to_document(def)
+
+# M1 SNOWY WORLD (M1-SNOWY-WORLD.md): the STATE axis (snow_capped), the absolute-altitude
+# climate temperature model, snow-cap render variants, and the deep-frozen half-slab. Fences the
+# codec constants + canonical masking, the deterministic worldgen invariants (cap predicate,
+# state ⊥ liquid disjointness, the Risk-1 altitude-reachability gap), the melt/freeze evaluator
+# firing end-to-end through _edits, and the half-slab physics + collider cheap-query contract.
+func _test_snowy_world() -> void:
+	print("[M1] snowy world (state axis, climate temperature, snow-cap variants, half-slab)")
+	var env := PerVoxelEnvironment.new()
+	var SNOW := CellCodec.STATE_SNOW_CAPPED
+	var PODZOL := BlockCatalog.id_of(&"podzol")
+	var SAND := BlockCatalog.id_of(&"sand")
+	var WATER := BlockCatalog.id_of(&"water")
+	var SNOW_ID := BlockCatalog.id_of(&"snow_block")
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # a real (wedge) modifier
+
+	# --- (1) codec + climate constants (ADR §8 item 1) ---
+	_ok(SNOW == 1, "STATE_SNOW_CAPPED == bit 0 (== 1)")
+	_ok(TerrainConfig.SNOW_SLAB_MODIFIER == ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_BOTTOM),
+		"SNOW_SLAB_MODIFIER == make_modifier(1,1,1,1,ANCHOR_BOTTOM)")
+	var gdef := BlockCatalog.def_of(GRASS)
+	_ok(gdef != null and gdef.state_layout.size() == 1 and gdef.state_layout[0] == &"snow_capped",
+		"grass.state_layout[0] == &\"snow_capped\"")
+	_ok(BlockCatalog.state_mask_of(GRASS) == 1 and BlockCatalog.state_mask_of(PODZOL) == 1
+		and BlockCatalog.state_mask_of(SAND) == 1 and BlockCatalog.state_mask_of(STONE) == 1,
+		"grass/podzol/sand/stone each declare the 1-bit snow_capped mask")
+	_ok(BlockCatalog.state_mask_of(DIRT) == 0 and BlockCatalog.state_mask_of(WATER) == 0
+		and BlockCatalog.state_mask_of(BlockCatalog.AIR) == 0,
+		"dirt/water/air declare no state (mask 0)")
+	# canonical keeps snow_capped on a cappable cube AND ramp; strips it on non-cappable dirt/water.
+	_ok(CellCodec.has_state(CellCodec.canonical(CellCodec.pack(GRASS, 0, SNOW)), SNOW),
+		"canonical keeps snow_capped on a grass cube")
+	_ok(CellCodec.has_state(CellCodec.canonical(CellCodec.pack(GRASS, RAMP, SNOW)), SNOW),
+		"canonical keeps snow_capped on a grass ramp")
+	_ok(CellCodec.has_state(CellCodec.canonical(CellCodec.pack(STONE, 0, SNOW)), SNOW),
+		"canonical keeps snow_capped on a stone cube (declared cappable, though worldgen never stamps it)")
+	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(DIRT, 0, SNOW))) == 0,
+		"canonical STRIPS snow_capped on dirt (not cappable)")
+	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(WATER, 0, SNOW))) == 0,
+		"canonical STRIPS snow_capped on water (not cappable)")
+	# undeclared bits (1<<3) masked to 0 on grass, keeping only the declared snow_capped bit.
+	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(GRASS, 0, (1 << 3) | SNOW))) == SNOW,
+		"canonical masks undeclared state bits on grass (keeps only snow_capped)")
+	# air-zeroing with a state bit; high bits stay 0.
+	_ok(CellCodec.canonical(CellCodec.pack(BlockCatalog.AIR, 0, SNOW)) == 0,
+		"canonical air-zeroes a cell even with a stray state bit")
+	_ok((CellCodec.pack(GRASS, 0, SNOW) >> 54) == 0, "bits 54..63 stay 0 with a state bit set")
+	# with_state / has_state.
+	var wsv := CellCodec.with_state(CellCodec.pack(GRASS, RAMP), SNOW)
+	_ok(CellCodec.state(wsv) == SNOW and CellCodec.mat(wsv) == GRASS and CellCodec.modifier(wsv) == RAMP,
+		"with_state sets the STATE field, leaving material + modifier intact")
+	# canonical(generated_cell) == generated_cell on a capped column (idempotent through the hook).
+	# placeholder permissiveness (ADR §8 item 2): an UNRESOLVED placeholder keeps its bits.
+	var ph := BlockCatalog.register_placeholder(&"sha256:snowyworldphantom", &"phantom")
+	_ok(BlockCatalog.state_mask_of(ph) == 0xFFFF, "UNRESOLVED placeholder mask is permissive (0xFFFF)")
+	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(ph, 0, 5))) == 5,
+		"placeholder keeps its state bits through canonical (RMS §8 lossless)")
+	# ClimateModel constants.
+	_ok(absf(ClimateModel.surface_temperature(0, 0.0) - 21.5) < 1e-4, "surface_temperature(0, 0.0) == 21.5")
+	_ok(absf(ClimateModel.surface_temperature(96, 0.0)) < 1e-3, "surface_temperature(96, 0.0) == 0 (±ε)")
+	_ok(absf(ClimateModel.climate_base(-0.6) - (-8.0)) < 1e-4, "climate_base(-0.6) == -8")
+	_ok(absf(ClimateModel.climate_base(0.0) - 21.5) < 1e-4, "climate_base(0.0) == 21.5")
+	_ok(absf(ClimateModel.climate_base(-0.35) - 6.75) < 0.02, "climate_base(-0.35) ≈ 6.75")
+
+	# --- (4) worldgen invariants over a wide deterministic scan (ADR §8 item 4) ---
+	var scan_capped := 0
+	var scan_bare_temperate := 0
+	var both_liq_state := 0
+	var cap_pred_ok := true
+	for x in range(-300, 300, 5):
+		for z in range(-300, 300, 5):
+			var g: int = TerrainConfig.height_at(x, z)
+			var v := TerrainConfig.generated_cell(x, g, z)
+			if CellCodec.liquid_field(v) != 0 and CellCodec.has_state(v, SNOW):
+				both_liq_state += 1                       # state ⊥ liquid disjointness (§1.6)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			var t: float = TerrainConfig.column_profile(x, z).w
+			if CellCodec.has_state(v, SNOW):
+				scan_capped += 1
+				if BlockCatalog.state_mask_of(CellCodec.mat(v)) & SNOW == 0:
+					cap_pred_ok = false                   # a cap only on a cappable material
+				if ClimateModel.surface_temperature(g, t) >= 0.0:
+					cap_pred_ok = false                   # a cap only where surface temp < 0
+			elif ClimateModel.surface_temperature(g, t) >= 0.0:
+				scan_bare_temperate += 1                  # a bare, temperate-surface land column
+	_ok(both_liq_state == 0, "state ⊥ liquid: NO generated cell carries both snow_capped and a liquid overlay (%d violations)" % both_liq_state)
+	_ok(cap_pred_ok, "cap predicate exact: every capped column is a cappable material with surface_temperature < 0")
+	_ok(scan_capped > 0, "worldgen produces snow-capped columns for this seed (%d in the scan)" % scan_capped)
+	_ok(scan_bare_temperate > 0, "worldgen produces bare temperate columns (state 0) (%d)" % scan_bare_temperate)
+
+	# (a) a specific capped column: cap set, mat/modifier match the material projection, temp < 0, canonical stable.
+	var cap := _find_capped_column()
+	if cap.x == 0x7fffffff:
+		_ok(false, "M1: found a snow-capped column for the worldgen sweep")
+	else:
+		var cg: int = TerrainConfig.height_at(cap.x, cap.y)
+		var cv := TerrainConfig.generated_cell(cap.x, cg, cap.y)
+		var ct: float = TerrainConfig.column_profile(cap.x, cap.y).w
+		_ok(CellCodec.has_state(cv, SNOW), "capped column: surface cell carries snow_capped")
+		_ok(BlockCatalog.state_mask_of(CellCodec.mat(cv)) & SNOW != 0, "capped column: material is cappable")
+		_ok(ClimateModel.surface_temperature(cg, ct) < 0.0, "capped column: surface_temperature < 0")
+		_ok(env.temperature(Vector3(float(cap.x) + 0.5, float(cg) + 0.5, float(cap.y) + 0.5)) < 0.0, "capped column: sampled ground temperature < 0")
+		_ok(CellCodec.canonical(cv) == cv, "capped column: canonical(generated_cell) == generated_cell")
+
+	# (b) a warm-edge temperate column is BARE and reads >= 0.
+	var warm := _grass_column()
+	var wg: int = TerrainConfig.height_at(warm.x, warm.y)
+	var wv := TerrainConfig.generated_cell(warm.x, wg, warm.y)
+	_ok(not CellCodec.has_state(wv, SNOW), "temperate grass column is BARE (state 0)")
+	_ok(env.temperature(Vector3(float(warm.x) + 0.5, float(wg) + 0.5, float(warm.y) + 0.5)) >= 0.0, "temperate surface reads >= 0 C")
+
+	# (f) altitude-cap probe + Risk 1 documentation.
+	_ok(ClimateModel.surface_temperature(97, 0.0) < 0.0, "altitude mechanism: temperate surface goes sub-zero above y=96")
+	var alt_cap_found := false
+	for x in range(-400, 400, 7):
+		for z in range(-400, 400, 7):
+			var t: float = TerrainConfig.column_profile(x, z).w
+			if t < ClimateModel.CLIMATE_TEMPERATE:
+				continue                                  # only TEMPERATE columns test altitude-only caps
+			var g: int = TerrainConfig.height_at(x, z)
+			if g >= TerrainConfig.SEA_LEVEL and ClimateModel.surface_temperature(g, t) < 0.0:
+				alt_cap_found = true
+				break
+		if alt_cap_found:
+			break
+	print("    altitude-cap reachability: temperate column sub-zero by ALTITUDE alone = %s (Risk 1: expected none this seed)" % ("FOUND" if alt_cap_found else "none"))
+	_ok(not alt_cap_found, "Risk 1 documented: NO temperate column reaches sub-zero by altitude alone (max y≈20 << 96)")
+
+	# --- (7) melt/freeze transition fires end-to-end through _edits (ADR §8 item 7) ---
+	if cap.x != 0x7fffffff:
+		var w := _struct_world("M1Melt")
+		if w.environment == null:
+			w.environment = env                       # headless _struct_world defers _ready; wire the sim query
+		var cg2: int = TerrainConfig.height_at(cap.x, cap.y)
+		var ccell := Vector3i(cap.x, cg2, cap.y)
+		var cval := w.cell_value_at(ccell)
+		_ok(w.apply_state_transitions(ccell) == false, "capped column is the transition fixed point: no melt fires")
+		_ok(CellCodec.has_state(w.cell_value_at(ccell), SNOW), "capped column still capped after apply")
+		# Copy the capped value into a WARM column: it MELTS, persists in _edits, and is idempotent.
+		var wcell := Vector3i(warm.x, wg, warm.y)
+		w._write_cell(wcell, cval)
+		_ok(CellCodec.has_state(w.cell_value_at(wcell), SNOW), "capped value copied into the warm column")
+		_ok(w.apply_state_transitions(wcell) == true, "warm column MELTS the copied cap (transition fired)")
+		_ok(not CellCodec.has_state(w.cell_value_at(wcell), SNOW), "melt cleared the snow_capped bit")
+		_ok(w._edits.has(wcell) and not CellCodec.has_state(int(w._edits[wcell]), SNOW), "melt persisted in _edits (overlay authoritative)")
+		_ok(w.apply_state_transitions(wcell) == false, "second apply is idempotent (no further change)")
+		# Reverse edge: bare cappable material in the COLD column re-caps.
+		w._write_cell(ccell, CellCodec.with_state(cval, 0))
+		_ok(not CellCodec.has_state(w.cell_value_at(ccell), SNOW), "bared the cold-column surface cell")
+		_ok(w.apply_state_transitions(ccell) == true, "cold column RE-CAPS bare cappable material (reverse transition fired)")
+		_ok(CellCodec.has_state(w.cell_value_at(ccell), SNOW), "re-cap set the snow_capped bit")
+		# Fallback mesher: a chunk over the capped column commits the surface with the snow variant.
+		var cmat := CellCodec.mat(cval)
+		var cxk := floori(cap.x / float(TerrainConfig.CHUNK_SIZE))
+		var czk := floori(cap.y / float(TerrainConfig.CHUNK_SIZE))
+		# Re-cap the overlay so the chunk actually meshes a capped top (the melt/bare edits above are local).
+		w._write_cell(ccell, cval)
+		var mesh: ArrayMesh = ChunkMesher.build(cxk, czk, w)
+		var found_snow_mat := false
+		if mesh != null:
+			for si in range(mesh.get_surface_count()):
+				if mesh.surface_get_material(si) == BlockMaterials.snow_capped_for(cmat):
+					found_snow_mat = true
+		_ok(found_snow_mat, "fallback chunk over the capped column commits a surface with the snow-cap variant material")
+		_ok(BlockMaterials.snow_capped_for(cmat) != BlockMaterials.get_for(cmat), "snow_capped_for(mat) is a distinct material from the plain material")
+		w.queue_free()
+
+	# --- (8) half-slab physics + collider cheap-query contract (ADR §8 item 8) ---
+	var slab := _find_slab_column()
+	if slab.x == 0x7fffffff:
+		_ok(false, "M1: found a snow half-slab column (deep-frozen flat) for the physics checks")
+	else:
+		var sg: int = TerrainConfig.height_at(slab.x, slab.y)
+		var st2: float = TerrainConfig.column_profile(slab.x, slab.y).w
+		var slab_cell := Vector3i(slab.x, sg + 1, slab.y)
+		var sv := TerrainConfig.generated_cell(slab_cell.x, slab_cell.y, slab_cell.z)
+		_ok(CellCodec.mat(sv) == SNOW_ID and CellCodec.modifier(sv) == TerrainConfig.SNOW_SLAB_MODIFIER,
+			"deep-frozen flat grows a snow half-slab (snow_block, modifier 85) at g+1")
+		_ok(CellCodec.state(sv) == 0 and CellCodec.liquid_field(sv) == 0, "the slab carries no state and no liquid")
+		_ok(ClimateModel.surface_temperature(sg, st2) < TerrainConfig.SNOW_SLAB_T, "slab column: surface_temperature < SNOW_SLAB_T (-4)")
+		# The surface cell UNDER the slab is a flat capped top (surface_temp < -4 < 0 → also capped).
+		_ok(CellCodec.modifier(TerrainConfig.generated_cell(slab.x, sg, slab.y)) == 0, "slab column: the surface cell below is a flat full cube")
+		# Collider cheap-query contract at the slab column (extends the machine-checked area).
+		_ok(TerrainConfig.surface_modifier(slab.x, slab.y) == 0, "collider: surface_modifier == 0 at the slab column")
+		_ok(TerrainConfig.surface_cap_modifier(slab.x, slab.y) == TerrainConfig.SNOW_SLAB_MODIFIER,
+			"collider: surface_cap_modifier == 85 at the slab column")
+		_ok(TerrainConfig.surface_cap_modifier(slab.x, slab.y) == CellCodec.modifier(TerrainConfig.generated_cell(slab.x, sg + 1, slab.y)),
+			"collider: surface_cap_modifier == modifier(generated_cell(g+1)) at the slab column (contract)")
+		# Mass of the half-slab: 280 * 0.5 = 140 kg.
+		_ok(absf(BlockCatalog.mass_of_value(CellCodec.pack(SNOW_ID, TerrainConfig.SNOW_SLAB_MODIFIER)) - 140.0) < 0.5,
+			"mass_of_value(pack(snow, 85)) == 140 kg")
+		# Physics: floor stands on the slab top (g + 1.5), auto-steps onto it, and breaks to snow_block.
+		var wm := _struct_world("M1Slab")
+		var fx := float(slab.x) + 0.5
+		var fz := float(slab.y) + 0.5
+		var fl := wm.floor_under(fx, fz, float(sg + 3))
+		_ok(absf(fl - (float(sg + 1) + 0.5)) < 1e-3, "floor_under stands on the slab top == g + 1.5 (got %.3f)" % fl)
+		_ok(not wm.blocked(fx, fz, float(sg + 1)), "blocked auto-steps onto the slab (rise 0.5 <= STEP_MAX)")
+		_ok(wm.break_terrain(slab_cell) == SNOW_ID, "break_terrain on the slab yields the snow_block id")
+		wm.queue_free()
+
+## A column (x, z) whose GENERATED surface cell carries the snow_capped state (M1), or
+## (0x7fffffff, _) if this seed has none reachable near origin.
+func _find_capped_column() -> Vector2i:
+	for x in range(-384, 384, 3):
+		for z in range(-384, 384, 3):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			if CellCodec.has_state(TerrainConfig.generated_cell(x, g, z), CellCodec.STATE_SNOW_CAPPED):
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## A column (x, z) whose GENERATED g+1 cell is the snow half-slab (M1), or (0x7fffffff, _) if none.
+func _find_slab_column() -> Vector2i:
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+	for x in range(-512, 512, 2):
+		for z in range(-512, 512, 2):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL:
+				continue
+			var gc := TerrainConfig.generated_cell(x, g + 1, z)
+			if CellCodec.mat(gc) == snow_id and CellCodec.modifier(gc) == TerrainConfig.SNOW_SLAB_MODIFIER:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
 
 # Shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). Headless has NO GPU so we
 # cannot assert pipelines actually compiled; instead we fence the ENUMERATION and

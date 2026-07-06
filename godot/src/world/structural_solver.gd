@@ -427,7 +427,7 @@ static func _mat(world: Object, c: Vector3i) -> int:
 static func _joint_temp(world: Object, u: Vector3i, v: Vector3i) -> float:
 	var env: Object = world.environment
 	if env == null:
-		return PerVoxelEnvironment.T_AIR
+		return ClimateModel.T_SEA_LEVEL         # no environment: the temperate sea-level baseline (21.5)
 	var tu: float = env.temperature(Vector3(u.x + 0.5, u.y + 0.5, u.z + 0.5))
 	var tv: float = env.temperature(Vector3(v.x + 0.5, v.y + 0.5, v.z + 0.5))
 	return (tu + tv) * 0.5

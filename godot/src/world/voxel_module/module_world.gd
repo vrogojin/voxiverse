@@ -51,6 +51,15 @@ const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0x
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
 
+# --- snow-cap state variant table (M1 snowy-world ADR §5) -----------------------
+# A PARALLEL per-state frozen table (the liquid-twin discipline), NOT a re-keyed _gen_arid: for
+# each cappable material (grass/podzol/sand) and each emitted modifier (incl. the plain cube at
+# modifier 0), the snow-VARIANT model's ARID, keyed `mat*_GEN_STRIDE + modifier`. Baked + FROZEN
+# at setup before the worker wires, sampled/dense, dry/plain fallback on an unbaked slot — never a
+# hole (a bare cap, wrong skin but correct substance). Shaped variants REUSE _shape_mesh_cache
+# (zero new ArrayMeshes / GPU readbacks); the cube variant is a fresh cube with the snow material.
+var _snow_arid: PackedInt32Array         # (mat*_GEN_STRIDE + modifier) -> snow-variant ARID; -1 = not baked; frozen at setup
+
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
 # LIQ_WATER=1, LIQ_LAVA=2, a third reserved at 3); index 0 (LIQ_NONE) is unused, so every table
@@ -247,8 +256,9 @@ func bulk_inject(cells: Dictionary) -> void:
 				for cell: Vector3i in block_cells:
 					var packed := int(cells[cell])
 					var lc := cell - origin
-					# VoxelBuffer.CHANNEL_TYPE == 0.
-					buf.call("set_voxel", arid_for(CellCodec.mat(packed), CellCodec.modifier(packed)),
+					# VoxelBuffer.CHANNEL_TYPE == 0. arid_for_cell (not arid_for) so a bundle-loaded capped /
+					# liquid cell renders its full look — arid_for drops the state axis (M1 ADR §5.2).
+					buf.call("set_voxel", arid_for_cell(packed),
 						lc.x, lc.y, lc.z, 0)
 				applied = bool(_terrain.call("try_set_block_data", bpos, buf))
 		if not applied:
@@ -311,6 +321,15 @@ func arid_for_cell(packed: int) -> int:
 					var wslot := mat * _GEN_STRIDE + modifier
 					if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 						return twin[wslot]
+	# Snow-cap state variant (M1 ADR §5.2): a capped cell (state bit set, no liquid — liquid wins if
+	# both ever coexist) resolves to its frozen snow-variant ARID; an unbaked (mat, modifier) snow
+	# slot falls through to the plain look (a bare cap, wrong skin but correct substance, never a hole).
+	if lf == 0 and CellCodec.has_state(packed, CellCodec.STATE_SNOW_CAPPED):
+		var smat := CellCodec.mat(packed)
+		var smod := CellCodec.modifier(packed)
+		var sslot := smat * _GEN_STRIDE + smod
+		if smod < _GEN_STRIDE and sslot < _snow_arid.size() and _snow_arid[sslot] >= 0:
+			return _snow_arid[sslot]
 	return arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
 
 ## Resolve (LRID, modifier) → ARID, allocating a shaped ARID lazily (MAIN THREAD).
@@ -440,16 +459,69 @@ func _build_gen_manifest(library: Object) -> void:
 	var wet := _build_wet_manifest(library, total)
 	appended += wet
 
+	# Snow-cap state variants (M1 ADR §5.2): a snow-variant cube + snow-variant shape per emitted
+	# modifier for each cappable material, frozen into `_snow_arid`. Reuses _shape_mesh_cache for the
+	# shapes (zero new ArrayMeshes / GPU readbacks). Same anti-drift discipline; a drift leaves the
+	# rest -1 (plain-look fallback, never a hole).
+	var snow := _build_snow_manifest(library, total)
+	appended += snow
+
 	if appended > 0 and library.has_method("bake"):
-		library.call("bake")                             # one batched bake: dry shapes + water models
+		library.call("bake")                             # one batched bake: dry shapes + water + snow models
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
-		% [appended - wet, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+		% [appended - wet - snow, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+	print("[module_world] baked snow manifest: %d snow-cap variant models for %d cappable materials"
+		% [snow, TerrainConfig.snow_cappable_materials().size()])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
 	else:
 		print("[module_world] baked legacy water manifest: %d models (water slab ARID=%d; non-water liquids render as plain cubes)"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER]])
+
+## Bake the snow-cap state VARIANT models and freeze them into `_snow_arid` (M1 ADR §5.2). For each
+## cappable material (grass/podzol/sand) it appends: a snow-variant CUBE at slot `mat*_GEN_STRIDE+0`
+## (a full capped cell), then a snow-variant SHAPE at each emitted modifier (`mat*_GEN_STRIDE+mod`),
+## REUSING `_shape_mesh_cache[modifier]` so no new ArrayMesh / GPU readback is created — only the
+## per-model material override differs (BlockMaterials.snow_capped_for). Returns the count appended.
+## Same anti-drift discipline as the dry loop (add_model() == expected ARID); a drift aborts, leaving
+## the rest -1 (the plain look falls back on the worker — a bare cap, never a hole, §5.5). Called on
+## the MAIN thread inside setup(); appends but does not bake (the caller does one batched bake).
+func _build_snow_manifest(library: Object, total: int) -> int:
+	_snow_arid = PackedInt32Array()
+	_snow_arid.resize(total * _GEN_STRIDE)
+	_snow_arid.fill(-1)
+	var mods := TerrainConfig.emitted_modifiers()
+	var appended := 0
+	for mat: int in TerrainConfig.snow_cappable_materials():
+		if mat <= BlockCatalog.AIR or mat >= total:
+			continue
+		var variant: Material = BlockMaterials.snow_capped_for(mat)
+		# The snow-variant CUBE (a full capped cell) at modifier 0.
+		var expected := _next_arid
+		var got: int = _add_cube(library, variant, BlockCatalog.cull_group_of(mat))
+		if got != expected:
+			push_warning("[module_world] snow manifest cube ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended                              # abort snow manifest; dry + water manifests stand
+		_next_arid += 1
+		_snow_arid[mat * _GEN_STRIDE + 0] = got
+		appended += 1
+		# The snow-variant SHAPES (reuse the shared dry ArrayMesh; only the material override differs).
+		for modifier: int in mods:
+			if modifier <= 0 or modifier >= _GEN_STRIDE:
+				continue
+			var model: Object = _make_shape_model(modifier, variant)
+			if model == null:
+				continue                                 # no mesh-model class → cube/plain fallback
+			var exp2 := _next_arid
+			var got2: int = _add_model(library, model)
+			if got2 != exp2:
+				push_warning("[module_world] snow manifest ARID drift: add_model %d != expected %d" % [got2, exp2])
+				return appended
+			_next_arid += 1
+			_snow_arid[mat * _GEN_STRIDE + modifier] = got2
+			appended += 1
+	return appended
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into
 ## `_gen_twin_arid[kind]`. Returns the fresh PackedInt32Array so the caller can fill it in place.
@@ -571,7 +643,7 @@ func _build_waterlog_manifest(library: Object, total: int, kind: int) -> int:
 ## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube
 ## fallback when that slot was never baked). Main-thread mirror of the generator's inline
 ## resolve — verify asserts the generated TYPE buffer equals this over a sample grid.
-func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := CellCodec.LIQ_WATER) -> int:
+func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := CellCodec.LIQ_WATER, state := 0) -> int:
 	if mat == BlockCatalog.AIR:
 		return 0
 	# Level-9 (the liquid line) resolves through the KIND's frozen tables, exactly as the worker does.
@@ -597,6 +669,14 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 			if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 				return twin[wslot]
 		# unbaked submerged twin → dry shape (fall through)
+	# Snow-cap state variant mirror (M1 ADR §5.2): a capped cell (state bit set, no liquid) resolves
+	# to its frozen snow-variant ARID, exactly as arid_for_cell / the worker do. `state` defaults 0 so
+	# pre-M1 callers are unchanged; verify passes STATE_SNOW_CAPPED to mirror a capped cell.
+	if liquid_level == 0 and (state & CellCodec.STATE_SNOW_CAPPED) != 0:
+		var sslot := mat * _GEN_STRIDE + modifier
+		if modifier < _GEN_STRIDE and sslot < _snow_arid.size() and _snow_arid[sslot] >= 0:
+			return _snow_arid[sslot]
+		# unbaked snow slot → plain look (fall through)
 	if modifier == 0:
 		return _cube_arid_of(mat)
 	var slot := mat * _GEN_STRIDE + modifier
@@ -968,6 +1048,7 @@ var cube_arid: PackedInt32Array         # LRID -> cube ARID
 var gen_arid: PackedInt32Array          # (mat*GEN_STRIDE + modifier) -> ARID; -1 = not baked
 var gen_twin_arid: Array                # kind -> PackedInt32Array (mat*GEN_STRIDE+mod -> twin ARID); null = no such liquid
 var surface_arid: PackedInt32Array      # kind -> liquid-surface cell model ARID; -1 = not baked
+var snow_arid: PackedInt32Array         # (mat*GEN_STRIDE + modifier) -> snow-cap variant ARID; -1 = not baked (M1)
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
 
@@ -986,6 +1067,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var max_above = TreeGen.MAX_ABOVE_SURFACE
 	var ncube = cube_arid.size()
 	var ngen = gen_arid.size()
+	var nsnow = snow_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
 	# `gen_twin_arid` Array per cell — zero allocation. null = that kind has no registered fluid.
@@ -1097,6 +1179,21 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[slot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif ((v >> 32) & 1) != 0:
+					# Snow-cap state variant (M1 ADR §5.2): a capped cell (state bit 0 set, no liquid) → its
+					# frozen snow-variant ARID; an unbaked snow slot falls back to the plain cube/shape (a bare
+					# cap, never a hole). One masked shift on the hot path; taken only for the rare stated cells.
+					var sslot = id * GEN_STRIDE + modifier
+					if modifier < GEN_STRIDE and sslot < nsnow and snow_arid[sslot] >= 0:
+						arid = snow_arid[sslot]
+					elif modifier == 0:
+						arid = cube_arid[id] if id < ncube else id
+					else:
+						var gslot = id * GEN_STRIDE + modifier
+						if modifier < GEN_STRIDE and gslot < ngen and gen_arid[gslot] >= 0:
+							arid = gen_arid[gslot]
+						else:
+							arid = cube_arid[id] if id < ncube else id
 				elif modifier == 0:
 					arid = cube_arid[id] if id < ncube else id
 				else:
@@ -1119,6 +1216,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_arid", _gen_arid)
 	gen.set("gen_twin_arid", _gen_twin_arid)             # kind -> waterlogged-twin / wet composites
 	gen.set("surface_arid", _surface_arid)               # kind -> open-liquid surface model (slab or fluid)
+	gen.set("snow_arid", _snow_arid)                     # M1 §5.2: (mat*STRIDE+mod) -> snow-cap variant ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	return gen
 

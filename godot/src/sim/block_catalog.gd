@@ -64,6 +64,7 @@ static var _status: PackedByteArray = PackedByteArray()     # LRID -> RESOLVED |
 static var _by_key: Dictionary = {}                 # "<gmid>#<state>" -> int LRID (reverse index)
 static var _id_by_name: Dictionary = {}             # StringName -> int (name AND alias -> LRID)
 static var _lrid_by_liquid_kind: Dictionary = {}    # CellCodec liquid kind -> LRID (reverse map, first-declared wins; MULTI-LIQUID §2.1)
+static var _state_mask: PackedInt32Array = PackedInt32Array()   # LRID -> STATE-axis mask (low state_layout.size() bits; 0xFFFF for an UNRESOLVED placeholder)
 
 ## Idempotent; preallocates the table and registers the bootstrap set from blocks.json
 ## (main thread). Safe to call from SurfaceModel.ensure_ready() / module_world.setup()
@@ -101,7 +102,14 @@ static func ensure_ready() -> void:
 		var alias: StringName = &""
 		if rec.has("alias") and rec["alias"] != null:
 			alias = StringName(String(rec["alias"]))
-		var lrid := _register_bootstrap_state(st, alias)
+		# Optional STATE-axis layout (VDS §10.3, M1): a "state_layout" name list on the record
+		# declares the material's ordered state bits (empty for all but grass/podzol/sand/stone).
+		var layout: Array[StringName] = []
+		var lr: Variant = rec.get("state_layout", [])
+		if lr is Array:
+			for nm: Variant in lr:
+				layout.append(StringName(String(nm)))
+		var lrid := _register_bootstrap_state(st, alias, layout)
 		assert(lrid == id, "bootstrap LRID %d != id %d (append order broke)" % [lrid, id])
 	_assert_frozen_core()
 	_build_liquid_index()
@@ -130,6 +138,7 @@ static func _init_table() -> void:
 	_defs.resize(CAPACITY)
 	_keys.resize(CAPACITY)
 	_status.resize(CAPACITY)
+	_state_mask.resize(CAPACITY)                     # zero-filled: AIR + every non-stated LRID → mask 0
 
 ## Reserve LRID 0 for AIR: null state, literal "air" key/name, no document (RMS §2.5).
 static func _append_air() -> void:
@@ -143,11 +152,12 @@ static func _append_air() -> void:
 
 ## Build a single-state material def around `st`, hash its document to a GMID, and
 ## register it (bootstrap path). Also maps the optional alias to the new LRID.
-static func _register_bootstrap_state(st: VoxelState, alias: StringName) -> int:
+static func _register_bootstrap_state(st: VoxelState, alias: StringName, layout: Array[StringName] = []) -> int:
 	var def := VoxelMaterialDef.new()
 	def.id = st.state_name
 	def.states = [st]
 	def.default_state_index = 0
+	def.state_layout = layout                        # STATE-axis bit names (feeds the GMID + state_mask)
 	var gmid := MaterialDocument.gmid_of(MaterialDocument.to_document(def))
 	var lrid := register_material(gmid, def)
 	if alias != &"" and lrid > 0:
@@ -183,6 +193,7 @@ static func register_material(gmid: StringName, def: VoxelMaterialDef) -> int:
 				_states[lrid] = st
 				_defs[lrid] = def
 				_status[lrid] = RESOLVED
+				_state_mask[lrid] = _layout_mask(def)    # placeholder 0xFFFF → the real layout mask
 				_register_name(def.id, lrid)
 				_register_name(st.state_name, lrid)
 				BlockMaterials.refresh(lrid)         # swap the placeholder look in place (§5.3)
@@ -227,6 +238,10 @@ static func _append(key: String, st: VoxelState, def: VoxelMaterialDef, status: 
 	_defs[lrid] = def
 	_keys[lrid] = key
 	_status[lrid] = status
+	# STATE-axis mask (M1): the low state_layout.size() bits, or 0xFFFF for an UNRESOLVED
+	# placeholder whose layout is unknown — permissive so bits loaded from a zone bundle survive
+	# until the real document resolves (RMS §8 losslessness). Set BEFORE publishing _count.
+	_state_mask[lrid] = 0xFFFF if status == UNRESOLVED else _layout_mask(def)
 	_by_key[key] = lrid
 	_count = lrid + 1                                # publish AFTER the row is fully built
 	return lrid
@@ -298,6 +313,21 @@ static func _from_record(rec: Dictionary) -> VoxelState:
 		s.cull_group = int((rnd as Dictionary).get("cull_group", 0))
 		s.glow = float((rnd as Dictionary).get("emissive", 0.0))
 		s.emission = s.glow
+	# Optional STATE-axis transitions (VDS §10.3, M1): the same shape MaterialDocument parses,
+	# reusing its comparator map. A "to_state" that names a state_layout bit SETS that bit (the
+	# STATE machine's evaluator resolves it); an own-state-name target clears the layout bits.
+	# Only cappable materials carry this, so every other state's transitions stay empty.
+	var trs: Variant = rec.get("transitions", [])
+	if trs is Array:
+		for traw: Variant in trs:
+			if not (traw is Dictionary):
+				continue
+			var t := VoxelStateTransition.new()
+			t.to_state = StringName(String((traw as Dictionary).get("to", "")))
+			t.field = String((traw as Dictionary).get("field", "temperature"))
+			t.comparator = MaterialDocument._str_to_cmp(String((traw as Dictionary).get("cmp", "<")))
+			t.threshold = float((traw as Dictionary).get("threshold", 0.0))
+			s.transitions.append(t)
 	return s
 
 ## Frozen-core tripwire (WGC §3.1 "consts asserted against data"): the loaded core
@@ -413,6 +443,28 @@ static func is_solid_id(block_id: int) -> bool:
 static func solidity_of(block_id: int) -> float:
 	var s := state_of(block_id)
 	return s.solidity if s != null else 0.0
+
+## The STATE-axis MASK for `lrid` (M1 snowy-world, VDS §10.3): the set of valid STATE bits for
+## this material — the low `state_layout.size()` bits (O(1), filled per-LRID at registration).
+## Two edge rules: AIR / out-of-range → 0 (air never carries state); an UNRESOLVED placeholder →
+## 0xFFFF (permissive — its layout is unknown, so stripping would lose bits loaded before late
+## resolution; render falls back to the plain look, the real mask governs after resolution). The
+## codec's `_validate_state` masks a cell's raw state bits against this; the snow-cap worldgen
+## predicate gates on `state_mask_of(mat) & STATE_SNOW_CAPPED` (catalog declaration is the one
+## authority, so stone is accepted-but-never-produced without a second list). Worker-safe: the
+## backing array is fixed-capacity (never resized), so a concurrent reader never races a realloc.
+static func state_mask_of(lrid: int) -> int:
+	ensure_ready()
+	if lrid <= AIR or lrid >= _count:
+		return 0
+	return _state_mask[lrid]
+
+## The STATE-axis mask a resolved def declares: the low `state_layout.size()` bits.
+static func _layout_mask(def: VoxelMaterialDef) -> int:
+	if def == null:
+		return 0
+	var n := def.state_layout.size()
+	return ((1 << n) - 1) if n > 0 else 0
 
 ## Liquid identity of a material (MULTI-LIQUID §2.1): the CellCodec LIQ_KIND value this
 ## material declares (water → LIQ_WATER, lava → LIQ_LAVA, …), LIQ_NONE for every non-liquid.

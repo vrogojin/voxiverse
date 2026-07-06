@@ -15,8 +15,8 @@ A first-person voxel sandbox:
 - **Grass texture:** procedurally generated **64×64** RGBA texture (green noise + subtle blades/tint), baked to PNG at build time, applied to the grass material.
 - **Player / "FPS":** first-person controller — walk/run/jump, mouse-look (pointer-lock in browser), plus a fly/noclip toggle. A **look-at interaction ray** probes the voxel the player is aiming at (feeds thermometer + future material inspection).
 - **Thermometer:** always-on **HUD** readout showing two live values:
-  - **Air temp** = temperature of the air voxel at the player's head → **21.5 °C** (the ambient/environment temperature).
-  - **Ground temp** = temperature of the voxel directly under the player, derived from the **per-voxel environment model** (§3), not a hardcoded constant.
+  - **Air temp** = temperature of the air voxel at the player's head. **21.5 °C is the temperate SEA-LEVEL baseline**, not a global constant (M1 snowy-world, `docs/M1-SNOWY-WORLD.md` §3): it is the climate offset for a temperate column (climate noise `t ≥ −0.15`) at `y = 0`, from which an **absolute-altitude lapse** subtracts ~0.224 °C/block (0 °C at **y = 96**, negative above with no clamp — `ClimateModel`). Winter biomes carry a **climate offset**: a snowy column (`t < −0.55`) reads **−8 °C** at sea level, with the taiga fringe ramping linearly between −8 and 21.5. So a low temperate column reads ~21.5, a frozen sea-level column ~−8, and a frozen peak colder still by altitude — the snow line climbs with elevation within a cold biome.
+  - **Ground temp** = temperature of the voxel directly under the player, derived from the **per-voxel environment model** (§3): it cools from the column's own surface anchor toward a 3 °C plateau at 1 °C/block (signed — permafrost warms downward), plus the geothermal rise near bedrock.
 - **Units:** Celsius.
 
 ## 2. Engine tech decision (LOCKED)
@@ -32,7 +32,7 @@ Model a small, *correctly-abstracted* slice now so it extends to the full engine
 - **Voxel material** — data-driven resource (`VoxelMaterialDef`): id, states, per-state physics (mass/density, break force, attachment, permeability, albedo, translucence, emission, solidity) + look (texture, tint, glow). Ship one material now: `grass`.
 - **Voxel state & transitions** — a material defines state transitions keyed on environment (temperature/light/current). Grass has one static state now, but the *mechanism* must exist.
 - **Per-voxel environment fields** — an interface exposing, per voxel position: `temperature, light, pressure, electric_current, magnetic_field, gravity`. Implement `temperature` and `light` for real; stub the rest returning sane defaults.
-  - `temperature(pos)`: air voxels → 21.5 °C. Ground/grass voxels → a **simple surface/depth model**: e.g. surface grass tracks air with a small offset and deeper voxels trend toward a stable subsurface temperature; document the formula. The thermometer reads through this interface — no special-casing in the HUD.
+  - `temperature(pos)`: air voxels → a **per-climate, absolute-altitude** value (21.5 °C is the temperate **sea-level** baseline; 0 °C at y = 96; winter biomes offset down to −8 °C at sea level — `ClimateModel`, M1). Ground voxels → a **surface/depth model**: cool from the column's surface anchor toward a stable subsurface plateau, plus geothermal rise near bedrock; document the formula. The thermometer reads through this interface — no special-casing in the HUD.
 - Keep this layer **decoupled** from rendering so future materials/fields drop in without touching the mesher.
 
 ## 4. Repository layout

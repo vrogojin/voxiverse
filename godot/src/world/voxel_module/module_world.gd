@@ -60,6 +60,17 @@ var _generator: Object                   # the runtime-compiled generator (kept 
 # (zero new ArrayMeshes / GPU readbacks); the cube variant is a fresh cube with the snow material.
 var _snow_arid: PackedInt32Array         # (mat*_GEN_STRIDE + modifier) -> snow-variant ARID; -1 = not baked; frozen at setup
 
+# --- snow LAYER shape family table (SNOW-ACCUMULATION §1.5) ----------------------
+# The FAM LAYER modifier is >= 0x8000 (bit 15) and CANNOT slot the 256-stride _gen_arid (re-keying to
+# 65536 would balloon every table). So a DEDICATED tiny table keyed by LEVEL (the M1 _snow_arid
+# discipline: a parallel per-value frozen table, not a re-keyed stride): index = level (1..4, 6..9),
+# snow_block ONLY (the curated LAYER material). Level 5 == the corner slab (85, in _gen_arid) and level
+# 10 == the full cube (0), so those two indices stay -1 and resolve via the cube/gen tables instead.
+# Baked + FROZEN at setup before the worker wires, published to the worker generator; an unbaked slot
+# falls back to the snow cube (too-tall, right substance, never a hole — the §1.5 safety default).
+var _layer_arid: PackedInt32Array        # level -> snow_block LAYER ARID; -1 = not baked; frozen at setup
+var _snow_id := -1                        # cached BlockCatalog.id_of(&"snow_block") (main thread)
+
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
 # LIQ_WATER=1, LIQ_LAVA=2, a third reserved at 3); index 0 (LIQ_NONE) is unused, so every table
@@ -343,6 +354,13 @@ func arid_for(mat: int, modifier: int) -> int:
 		return 0
 	if modifier == 0:
 		return _cube_arid_of(mat)
+	# FAM LAYER (SNOW-ACCUMULATION §1.5): snow depth on the modifier axis. A snow_block layer reuses
+	# the pre-baked LEVEL table; any other material or an uncached level falls through to the lazy
+	# ShapeMesh append below (ShapeMesh.build handles LAYER), keyed on the raw FAM modifier.
+	if CellCodec.is_layer(modifier):
+		var lvl := CellCodec.layer_level(modifier)
+		if mat == _snow_id_of() and lvl >= 0 and lvl < _layer_arid.size() and _layer_arid[lvl] >= 0:
+			return _layer_arid[lvl]
 	# Reuse a manifest-baked generated shape (no duplicate model/bake) when the placed
 	# (material, modifier) is one worldgen already emits — e.g. placing a grass ramp
 	# identical to a smoothed terrain ramp.
@@ -466,12 +484,18 @@ func _build_gen_manifest(library: Object) -> void:
 	var snow := _build_snow_manifest(library, total)
 	appended += snow
 
+	# Snow LAYER shape family (SNOW-ACCUMULATION §1.5): the variable-height snow depth on the FAM
+	# modifier axis, keyed by LEVEL in the dedicated `_layer_arid` table (snow_block only).
+	var layers := _build_layer_manifest(library)
+	appended += layers
+
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow models
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
-		% [appended - wet - snow, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+		% [appended - wet - snow - layers, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
 	print("[module_world] baked snow manifest: %d snow-cap variant models for %d cappable materials"
 		% [snow, TerrainConfig.snow_cappable_materials().size()])
+	print("[module_world] baked snow LAYER manifest: %d snow_block depth-level models (SNOW-ACCUMULATION §1.5)" % layers)
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -523,6 +547,44 @@ func _build_snow_manifest(library: Object, total: int) -> int:
 			_snow_arid[mat * _GEN_STRIDE + modifier] = got2
 			appended += 1
 	return appended
+
+## Bake the snow LAYER shape models and freeze them into `_layer_arid` (SNOW-ACCUMULATION §1.5). For
+## each canonical FAM level (1..4, 6..9 — level 5 == the corner slab 85 already in `_gen_arid`, level
+## 10 == the full cube) it appends a snow_block LAYER model (a thin flat slab at level/10) and records
+## its ARID at index = level. Returns the count appended. The ArrayMesh is shared via `_shape_mesh_cache`
+## keyed on the raw FAM modifier (bit 15 keeps it disjoint from every corner/wet/slab key). Same
+## anti-drift discipline as the dry loop; a drift aborts, leaving the rest -1 (the snow cube falls back
+## on the worker — a too-tall block, never a hole). Called on the MAIN thread inside setup(); appends
+## but does not bake (the caller does one batched bake).
+func _build_layer_manifest(library: Object) -> int:
+	_layer_arid = PackedInt32Array()
+	_layer_arid.resize(11)                               # index = level 0..10
+	_layer_arid.fill(-1)
+	var snow_id := _snow_id_of()
+	if snow_id <= BlockCatalog.AIR:
+		return 0
+	var variant: Material = BlockMaterials.get_for(snow_id)
+	var appended := 0
+	for level in [1, 2, 3, 4, 6, 7, 8, 9]:
+		var modifier := CellCodec.make_layer(level)      # the raw FAM modifier for this level
+		var model: Object = _make_shape_model(modifier, variant)
+		if model == null:
+			continue                                     # no mesh-model class → snow-cube fallback
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] layer manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended                              # abort layer manifest; dry/water/snow stand
+		_next_arid += 1
+		_layer_arid[level] = got
+		appended += 1
+	return appended
+
+## The snow_block LRID, resolved once (main thread; BlockCatalog.ensure_ready() ran in setup()).
+func _snow_id_of() -> int:
+	if _snow_id < 0:
+		_snow_id = BlockCatalog.id_of(&"snow_block")
+	return _snow_id
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into
 ## `_gen_twin_arid[kind]`. Returns the fresh PackedInt32Array so the caller can fill it in place.
@@ -678,6 +740,14 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 		if modifier < _GEN_STRIDE and sslot < _snow_arid.size() and _snow_arid[sslot] >= 0:
 			return _snow_arid[sslot]
 		# unbaked snow slot → plain look (fall through)
+	# FAM LAYER mirror (SNOW-ACCUMULATION §1.5): a snow depth level resolves through the dedicated
+	# level table exactly as the worker does; snow_block only, cube fallback for any other material /
+	# unbaked level (a too-tall snow cube, never a hole).
+	if CellCodec.is_layer(modifier):
+		var lvl := CellCodec.layer_level(modifier)
+		if mat == _snow_id_of() and lvl < _layer_arid.size() and _layer_arid[lvl] >= 0:
+			return _layer_arid[lvl]
+		return _cube_arid_of(mat)
 	if modifier == 0:
 		return _cube_arid_of(mat)
 	var slot := mat * _GEN_STRIDE + modifier
@@ -690,6 +760,10 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 func is_manifest_baked(mat: int, modifier: int) -> bool:
 	if modifier == 0:
 		return mat >= 0 and mat < _cube_arid.size()
+	# FAM LAYER (SNOW-ACCUMULATION §1.5): baked iff snow_block AND its level table slot is set.
+	if CellCodec.is_layer(modifier):
+		var lvl := CellCodec.layer_level(modifier)
+		return mat == _snow_id_of() and lvl >= 0 and lvl < _layer_arid.size() and _layer_arid[lvl] >= 0
 	var slot := mat * _GEN_STRIDE + modifier
 	return modifier < _GEN_STRIDE and slot < _gen_arid.size() and _gen_arid[slot] >= 0
 
@@ -1050,6 +1124,8 @@ var gen_arid: PackedInt32Array          # (mat*GEN_STRIDE + modifier) -> ARID; -
 var gen_twin_arid: Array                # kind -> PackedInt32Array (mat*GEN_STRIDE+mod -> twin ARID); null = no such liquid
 var surface_arid: PackedInt32Array      # kind -> liquid-surface cell model ARID; -1 = not baked
 var snow_arid: PackedInt32Array         # (mat*GEN_STRIDE + modifier) -> snow-cap variant ARID; -1 = not baked (M1)
+var layer_arid: PackedInt32Array        # level -> snow_block LAYER ARID; -1 = not baked (SNOW-ACCUMULATION §1.5)
+var snow_id := -1                        # snow_block LRID (the curated LAYER material)
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
 
@@ -1065,10 +1141,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var oz = origin_in_voxels.z
 	var ch = VoxelBuffer.CHANNEL_TYPE
 	var sea = TerrainConfig.SEA_LEVEL
-	var max_above = TreeGen.MAX_ABOVE_SURFACE
+	# max_above bounds the above-surface content the early-outs must not skip: the tallest tree AND the
+	# deepest snow accumulation (SNOW-ACCUMULATION §3.2 raises it by SNOW_FILL_MAX_CELLS). Trees dominate
+	# today, but taking the max keeps the all-air early-out sound if either bound ever changes.
+	var max_above = max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS)
 	var ncube = cube_arid.size()
 	var ngen = gen_arid.size()
 	var nsnow = snow_arid.size()
+	var nlayer = layer_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
 	# `gen_twin_arid` Array per cell — zero allocation. null = that kind has no registered fluid.
@@ -1195,6 +1275,16 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[gslot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif (modifier & 0x8000) != 0:
+					# FAM LAYER (SNOW-ACCUMULATION 1.5): snow depth level (tenths) resolves through the
+					# dedicated LEVEL table (a FAM modifier is >= 0x8000 and can't slot the 256-stride).
+					# snow_block only; any other material or an unbaked level falls back to the snow cube
+					# (too-tall, right substance, NEVER a hole -- the 1.5 safety default).
+					var lvl = modifier & 0xF
+					if id == snow_id and lvl < nlayer and layer_arid[lvl] >= 0:
+						arid = layer_arid[lvl]
+					else:
+						arid = cube_arid[id] if id < ncube else id
 				elif modifier == 0:
 					arid = cube_arid[id] if id < ncube else id
 				else:
@@ -1218,6 +1308,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_twin_arid", _gen_twin_arid)             # kind -> waterlogged-twin / wet composites
 	gen.set("surface_arid", _surface_arid)               # kind -> open-liquid surface model (slab or fluid)
 	gen.set("snow_arid", _snow_arid)                     # M1 §5.2: (mat*STRIDE+mod) -> snow-cap variant ARID
+	gen.set("layer_arid", _layer_arid)                   # SNOW-ACCUMULATION §1.5: level -> snow_block LAYER ARID
+	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	return gen
 

@@ -92,6 +92,7 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 	_emit_sides(tools, world, hmap, topmods, stride, n, x0, z0)
 	if world != null:
 		_emit_terrain_shapes(tools, world, hmap, stride, n, x0, z0)
+		_emit_snow(tools, world, hmap, stride, n, x0, z0)
 		_emit_trees(tools, world, n, x0, z0)
 		_emit_placed(tools, world, n, x0, z0)
 		_emit_water(tools, world, hmap, stride, n, x0, z0)
@@ -227,6 +228,35 @@ static func _emit_terrain_shapes(tools: Dictionary, world: WorldManager,
 			var mc: int = CellCodec.modifier(vc)
 			if mc != 0 and BlockCatalog.solidity_of(CellCodec.mat(vc)) >= 0.5:
 				_emit_shaped(tools, Vector3i(wx, h + 1, wz), _look_of(vc), mc)
+
+# --- stacked snow: cubes + a top LAYER for the accumulated snow above the surface ---
+# SNOW-ACCUMULATION §2.8. Like the sea/ice cells, the accumulated snow cells (SNOW-ACCUMULATION
+# Decision 3) sit ABOVE the solid heightmap top, so they are invisible to _emit_tops/_emit_sides
+# (which skin effective_height). This pass draws them: for each column it scans the bounded band
+# above the surface top (h+1 .. h + SNOW_FILL_MAX_CELLS) and, for every generated snow_block cell,
+# emits a culled CUBE (a full snow cell, modifier 0) or the shared ShapeMesh (a top LAYER / the level-5
+# slab). It reads only the composed cell query (cell_value_at), so it derives from the same resolve_cell
+# output as the module path (the §5.1 parity statement). The surface top quad's z-fight is already
+# suppressed by the capshaped marking (bottom_face_covers(LAYER/cube) == true) in build().
+static func _emit_snow(tools: Dictionary, world: WorldManager, hmap: PackedInt32Array,
+		stride: int, n: int, x0: int, z0: int) -> void:
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+	var max_up := TerrainConfig.SNOW_FILL_MAX_CELLS + 1
+	for lz in n:
+		for lx in n:
+			var h := hmap[(lz + 1) * stride + (lx + 1)]
+			var wx := x0 + lx
+			var wz := z0 + lz
+			for dy in range(1, max_up + 1):
+				var cell := Vector3i(wx, h + dy, wz)
+				var v := world.cell_value_at(cell)
+				if CellCodec.mat(v) != snow_id:
+					continue                              # cap cell / air / handled elsewhere
+				var modifier := CellCodec.modifier(v)
+				if modifier == 0:
+					_emit_cube(tools, world, cell, snow_id)   # a full snow cell (culled faces)
+				else:
+					_emit_shaped(tools, cell, _look_of(v), modifier)   # a top LAYER / slab
 
 # --- trees: cubes for genuine tree cells overlapping the chunk ------------------
 static func _emit_trees(tools: Dictionary, world: WorldManager,

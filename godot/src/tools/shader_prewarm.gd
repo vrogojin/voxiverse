@@ -42,14 +42,45 @@ extends Node3D
 ##   in a tight grid ~2 m directly in front of the player's camera, small (0.2 m), so
 ##   none are frustum-culled and all are past the near plane — then a full-screen
 ##   opaque overlay covers the pile (and the terrain streaming in) from the user.
+##
+## THE MODULE-FORMAT GAP → a second phase. The grid above warms every material on the
+##   GDScript/VoxelBody vertex format (which IS the format of gameplay debris meshes),
+##   but the live build draws TERRAIN through the godot_voxel module's own
+##   VoxelMesherBlocky vertex format — a DISTINCT Compatibility pipeline the grid cannot
+##   reproduce. The module meshes async on the (web-capped) single voxel thread and
+##   usually finishes the first chunks only AFTER the grid frames, so that pipeline used
+##   to compile in gameplay (the ~568 ms first-chunk stall). Rather than guess the
+##   module's exact vertex format, PHASE 2 warms the REAL thing by construction: after
+##   freeing the grid it HOLDS the overlay while the streamed near view meshes + renders
+##   behind it (polling WorldManager.initial_view_meshed → VoxelTerrain.is_area_meshed as
+##   an early-out, within a floor/cap window), so the module pipeline compiles hidden,
+##   then lifts. See WARMUP_FRAMES / the TERRAIN_* constants and _process().
 
 signal finished
 
-## Rendered frames the warm-up pile is kept alive. They are all drawn on the FIRST
-## frame, so most compiles happen at once; the margin covers a driver that defers a
-## few. Meshes are freed at WARMUP_FRAMES, the overlay one frame later (so the first
-## clean gameplay frame is already warm), then this node frees itself.
+## Rendered frames the warm-up PILE (the in-front grid) is kept alive. It is all drawn on the FIRST
+## frame, so its compiles happen at once; the margin covers a driver that defers a few. The pile is
+## freed at WARMUP_FRAMES — but on a MODULE build the overlay is then HELD through a second phase (see
+## below) until the real streamed terrain has drawn behind it, so its pipeline compiles hidden too.
 const WARMUP_FRAMES := 12
+
+## PHASE 2 — TERRAIN-MESHED HOLD (module builds; the ~568 ms first-chunk stall fix). The grid pile warms
+## every material on the GDScript/VoxelBody vertex format, but the live build draws terrain through the
+## godot_voxel module's OWN VoxelMesherBlocky format — a DISTINCT GL-Compatibility pipeline the pile
+## cannot cover. The module meshes async on the (web-capped) single voxel thread and usually finishes
+## the first chunks only AFTER WARMUP_FRAMES, so that pipeline used to compile in gameplay (the 568 ms
+## spike). So after freeing the pile we KEEP the overlay up (module builds only) for a bounded window
+## that lets the near view mesh + render + compile behind it, then lift:
+##   * We POLL the module for the near view being meshed (WorldManager.initial_view_meshed →
+##     VoxelTerrain.is_area_meshed) as an EARLY-OUT — but we do NOT rely on it alone, because it can't
+##     be validated headlessly (meshing is render-gated) and could report a vacuous early true.
+##   * A FLOOR (TERRAIN_MIN_HOLD_SEC) guarantees enough real frames pass for the compile to happen
+##     hidden even if the poll returns true immediately; a CAP (TERRAIN_MAX_WAIT_SEC) guarantees the
+##     loader never hangs if the poll never confirms. So the module hold is a predictable
+##     [FLOOR, CAP] window, adaptive within it. Fallback / non-module builds skip the hold entirely
+##     (their vertex format is already warmed by the grid pile).
+const TERRAIN_MIN_HOLD_SEC := 1.5      # floor: minimum module-build hold, so the near view meshes+compiles hidden
+const TERRAIN_MAX_WAIT_SEC := 4.0      # cap: lift even if is_area_meshed never confirms — never hang the loader
 
 ## Warm-up cube edge length (m). Small so the whole superset fits inside the frustum
 ## a couple of metres ahead of the camera.
@@ -88,6 +119,10 @@ var _overlay: CanvasLayer = null              # full-screen "Loading…" cover
 var _on_done: Callable = Callable()           # main.gd re-enables the player here
 var _frame := 0                               # rendered-frame counter
 var _finished := false
+var _watch_terrain := false                   # PHASE 2 enabled? set by begin() (real boot), not by spawn_warmups()
+var _wait_time := 0.0                          # accumulated seconds in the terrain-meshed hold
+var _watch_world: Node = null                  # WorldManager to poll for initial_view_meshed (PHASE 2)
+var _warm_center := Vector3.ZERO               # camera world position the near-view AABB is built around
 
 ## Kick off the warm-up: spawn the superset pile in front of `player`'s camera, raise
 ## the "Loading…" overlay, and begin the frame countdown. `on_done` (and the
@@ -95,8 +130,12 @@ var _finished := false
 ## torn down — main.gd re-enables the player there.
 func begin(player: Node3D, on_done: Callable = Callable()) -> void:
 	_on_done = on_done
+	_watch_terrain = true                     # real boot → run PHASE 2 (hold for the streamed terrain)
 	transform = Transform3D.IDENTITY          # instances are placed in WORLD coords below
 	var cam := _camera_xform(player)
+	_warm_center = cam.origin                  # near-view AABB centre for PHASE 2's is_area_meshed poll
+	if player != null:
+		_watch_world = player.get("world") as Node    # WorldManager (main.gd injects it); null-safe
 	spawn_warmups(cam)
 	_raise_overlay()
 	set_process(true)
@@ -157,17 +196,40 @@ func live_mesh_instance_count() -> int:
 
 # --- frame countdown / teardown ------------------------------------------------
 
-## Each RENDERED frame advances the countdown. The pile is drawn every frame it lives,
-## so the compiles happen on the first frame; WARMUP_FRAMES is margin. At the budget we
-## free the meshes, one frame later the overlay (first clean gameplay frame is warm),
-## then finish and free ourselves.
-func _process(_delta: float) -> void:
+## Each RENDERED frame advances the state machine. PHASE 1 (frames 1..WARMUP_FRAMES): the grid pile is
+## drawn every frame, so its pipeline compiles happen on the first frame; free the pile at the budget.
+## PHASE 2 (module builds only, _watch_terrain): keep the overlay up while the streamed near view
+## meshes + renders behind it — lifting early once WorldManager.initial_view_meshed confirms, within
+## the [TERRAIN_MIN_HOLD_SEC, TERRAIN_MAX_WAIT_SEC] window so the compile frame lands hidden and the
+## loader never hangs. Non-module builds and the headless verify's spawn_warmups path (no _watch_terrain)
+## keep the original lifecycle: free at WARMUP_FRAMES, finish the next frame.
+func _process(delta: float) -> void:
 	if _finished:
 		return
 	_frame += 1
+	# PHASE 1 — grid warm.
+	if _frame < WARMUP_FRAMES:
+		return
 	if _frame == WARMUP_FRAMES:
-		_free_meshes()
-	elif _frame >= WARMUP_FRAMES + 1:
+		_free_meshes()                        # pile compiles done → drop it (also stops it inflating draws)
+		return
+	# _frame > WARMUP_FRAMES.
+	if not _watch_terrain:
+		_finish()                             # verify / no-world path: original lifecycle
+		return
+	# PHASE 2 — terrain-meshed hold (module builds only). The path selection is DEFERRED, so check
+	# using_module HERE (not in begin()). Fallback / no-module builds need no hold — the grid already
+	# warmed their vertex format — so finish immediately (the original lifecycle).
+	if _watch_world == null or not bool(_watch_world.get("using_module")):
+		_finish()
+		return
+	# Module build: hold within a bounded [FLOOR, CAP] window, lifting early once the near view is
+	# meshed (so its render+compile frame lands hidden), else at the cap so we never hang.
+	_wait_time += delta
+	var meshed := true
+	if _watch_world.has_method("initial_view_meshed"):
+		meshed = bool(_watch_world.call("initial_view_meshed", _warm_center))
+	if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) or _wait_time >= TERRAIN_MAX_WAIT_SEC:
 		_finish()
 
 ## Free (and detach) the warm-up meshes. Detaching via remove_child makes the child

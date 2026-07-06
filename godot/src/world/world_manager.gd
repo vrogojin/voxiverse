@@ -115,6 +115,16 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _ground != null:
 		_ground.update(player_pos)
 
+## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
+## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the
+## overlay. On the MODULE path it asks godot_voxel (is_area_meshed) over a near box; on the FALLBACK
+## path it returns true immediately (the fallback chunk format is already warmed by the prewarm grid,
+## so no extra hold is needed). Half-extents cover the near, always-first-to-mesh view.
+func initial_view_meshed(center: Vector3) -> bool:
+	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
+		return bool(_module_world.call("area_meshed", center, Vector3(40.0, 32.0, 40.0)))
+	return true                                     # fallback path / no module → no terrain-format hold
+
 # --- terrain editing (block breaking + placing) --------------------------------
 
 ## THE composed cell query (VOXEL-DATA-STRUCTURE §7.1): edit overlay first, else

@@ -3153,3 +3153,21 @@ func _test_shader_prewarm() -> void:
 	prewarm._process(0.016)   # one more frame: overlay + self teardown; finished fires
 	_ok(done[0], "prewarm: finished signal fires after the frame budget (player re-enabled here)")
 	_ok(prewarm.warmup_instance_count() == 0, "prewarm: tracked instance list cleared on teardown")
+
+	# (f) PHASE 2 TERMINATION GUARANTEE. begin() enables the module-only terrain-meshed hold; a bare
+	# player (no WorldManager → not a module build) must SKIP the hold and finish immediately, so a
+	# fallback/non-module build never pays a load penalty and the prewarm always terminates.
+	var pw2: ShaderPrewarm = ShaderPrewarm.new()
+	get_root().add_child(pw2)
+	var dummy := Node3D.new()
+	get_root().add_child(dummy)
+	var done2 := [false]
+	pw2.finished.connect(func() -> void: done2[0] = true)
+	pw2.begin(dummy, Callable())
+	var guard := 0
+	while not done2[0] and guard < 100000:
+		pw2._process(1.0)
+		guard += 1
+	_ok(done2[0], "prewarm: PHASE 2 finishes (no module → hold skipped; never hangs)")
+	_ok(pw2.live_mesh_instance_count() == 0, "prewarm: PHASE 2 tears the pile down on finish")
+	dummy.queue_free()

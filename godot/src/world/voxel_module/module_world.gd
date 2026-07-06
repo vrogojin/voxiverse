@@ -415,6 +415,16 @@ func attach_viewer(player: Node3D) -> void:
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
 
+## True once every mesh block intersecting the axis-aligned box of half-extents `half` around world
+## point `center` has been MESHED (its surface applied to the scene, so it renders next frame). Used by
+## ShaderPrewarm's PHASE 2 to hold the "Loading…" overlay until the near view has actually drawn —
+## letting the module's VoxelMesherBlocky pipeline compile hidden. Returns false if the module lacks
+## is_area_meshed (older build → prewarm falls back to its timeout).
+func area_meshed(center: Vector3, half: Vector3) -> bool:
+	if _terrain == null or not _terrain.has_method("is_area_meshed"):
+		return false
+	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
 ## Build the library: air=0, then a cube model for EVERY BlockCatalog id in dense
 ## order (WGC §5.1). The model index MUST equal the BlockCatalog id (the generator +
 ## edit path write those ids), so each add is asserted over ALL ids — a mismatch

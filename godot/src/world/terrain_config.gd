@@ -56,6 +56,15 @@ const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
 const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
 
+# --- beach shelf (WATER-SHORE follow-up): a smooth near-shore seafloor gradient -----------------
+# Across a shallow window around the water line, _height_c fades out the high-frequency surface
+# noise so the near-shore floor follows the gentle continental slope — a smooth shallow shelf the
+# surface+cap smoothing grades into a continuous descent — instead of noisy >1-block steps that
+# saturate the half-block corner codec. Zero on inland land and in deep water (both byte-identical).
+const SHELF_TOP := 1.0          # blend begins 1 block ABOVE the water line (includes the beach)
+const SHELF_DEPTH := 5.0        # ...and fades back out by 5 blocks BELOW it (deep water untouched)
+const SHELF_HILLS_KEEP := 0.35  # fraction of the low-frequency hills kept in the shelf (soft texture)
+
 ## Render radius around the player, in blocks (DESIGN §1). Drives the fallback
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
@@ -284,8 +293,18 @@ static func _knot(c: float, c0: float, c1: float, v0: float, v1: float) -> float
 
 static func _height_c(c: float, fx: float, fz: float) -> int:
 	var base := BASE_HEIGHT + _continent_offset(c)
-	var h := base + _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
-	h += _detail.get_noise_2d(fx, fz) * DETAIL_AMPLITUDE
+	var hills := _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
+	var h := base + hills + _detail.get_noise_2d(fx, fz) * DETAIL_AMPLITUDE
+	# Beach shelf (WATER-SHORE follow-up, see the SHELF_* consts): a smooth window around the water
+	# line blends the noisy height toward the gentle continental slope (base + a little hills, no
+	# detail), so the near-shore seafloor descends smoothly instead of in noisy >1-block steps the
+	# corner-height smoothing can't grade. `w` is a smooth bump: 0 on inland land (depth < -SHELF_TOP)
+	# AND in deep water (depth > SHELF_DEPTH) — both stay BYTE-IDENTICAL — peaking in the shallow band
+	# between. PURE/DETERMINISTIC: a smooth function of the same noise + position (no randi/Time).
+	var depth := float(SEA_LEVEL) - h
+	var w := clampf(smoothstep(-SHELF_TOP, 0.5, depth) - smoothstep(SHELF_DEPTH - 1.5, SHELF_DEPTH, depth), 0.0, 1.0)
+	if w > 0.0:
+		h = lerp(h, base + hills * SHELF_HILLS_KEEP, w)
 	return int(floor(h))
 
 ## Surface height (integer y of the topmost SOLID ground cell) at column (x, z).

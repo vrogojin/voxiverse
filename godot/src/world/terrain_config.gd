@@ -45,6 +45,12 @@ const DEEPSLATE_FULL_Y := -24    # below here: always deepslate
 const DEEPSLATE_TOP_Y := -16     # above here: always stone; dithered band between
 const SEA_LEVEL := 0             # air below SEA_LEVEL fills with water (ice cap when cold)
 
+## The render height of the water surface (WATER-SHORE §3): the top cell of every open-water
+## column and every smoothed shore composite renders its water at SEA_LEVEL + 0.9, a slightly
+## sunk slab rather than a full cube. Pinned to CellCodec.LIQ_LEVEL_SURFACE (tenths) by verify
+## (roundi(WATER_SURFACE_HEIGHT * 10.0) == LIQ_LEVEL_SURFACE).
+const WATER_SURFACE_HEIGHT := 0.9
+
 # --- gentle, shallow base hills (unchanged; the c~0 plains preserve today's look)
 const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
@@ -384,14 +390,30 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	if id == BlockCatalog.STONE:
 		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
 		id = _ore_at(x, y, z, id, biome, c)   # host-aware ore lattice
-	# Smoothing SURFACE shape (SVS §8.1): reshape the walkable top cell of a land column
-	# into a corner-height ramp/slab whose surface fits the four neighbouring column
-	# tops. Only the MODIFIER changes — the material projection (generated_block) is
-	# untouched, so every material/stackup invariant holds; cells below the surface stay
-	# solid full cubes, so the analytic floor scan can never fall through.
-	if y == g and g >= SEA_LEVEL:
-		return _smoothed_surface(x, z, g, id, pcache)
+	# Smoothing SURFACE shape (SVS §8.1): reshape the walkable top cell of a column into a
+	# corner-height ramp/slab whose surface fits the four neighbouring column tops. Only the
+	# MODIFIER changes — the material projection (generated_block) is untouched, so every
+	# material/stackup invariant holds; cells below the surface stay solid full cubes, so the
+	# analytic floor scan can never fall through. WATER-SHORE §3: the g >= SEA_LEVEL gate is
+	# GONE (underwater floors smooth too), and the smoothed surface is composed with the
+	# generated-liquid rule so a shore/floor cell also records the water filling its remainder.
+	if y == g:
+		return _with_shore_water(_smoothed_surface(x, z, g, id, pcache), y, t)
 	return id
+
+## Compose the generated-liquid rule (WATER-SHORE §3) onto a SURFACE cell value: a cell at or
+## below the water line whose solid surface leaves a remainder (modifier != 0) also holds water
+## filling that remainder, top at 0.9 (level 9) when it IS the water line, else full (level 10).
+## PURE: reads only (v, y, t). No-op above the water line, on a full-cube surface (no remainder,
+## nothing to fill), and in the frozen regime at the water line (ice cube / bare frozen ramp —
+## the sheet ends crisply). Water strictly below the ice (y < SEA_LEVEL) is liquid as normal.
+static func _with_shore_water(v: int, y: int, t: float) -> int:
+	if y > SEA_LEVEL or CellCodec.modifier(v) == 0:
+		return v
+	if y == SEA_LEVEL and t < -0.55:
+		return v                                          # frozen shore: ice regime, no liquid overlay
+	var lvl := CellCodec.LIQ_LEVEL_SURFACE if y == SEA_LEVEL else CellCodec.LIQ_LEVEL_FULL
+	return CellCodec.with_liquid(v, CellCodec.LIQ_WATER, lvl)
 
 # ------------------------------------------------------------------------------
 # Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1). The walkable surface
@@ -485,7 +507,8 @@ static func _on_main_thread() -> bool:
 ## The cached packed (g, surface_mod, cap_mod) for column (x, z), computing + storing it on first
 ## access. MAIN-THREAD ONLY (see the memo header). surface_mod/cap_mod are the EXACT smoothing
 ## modifiers _smoothed_surface/_surface_cap (and surface_modifier/surface_cap_modifier) emit for
-## this column — WITH the underwater + tree-rest suppression — so any consulting query is exact.
+## this column — surface_mod covers underwater floors too, cap_mod stays land-only (WATER-SHORE
+## §3.3/§3.6), WITH the tree-rest suppression — so any consulting query is exact.
 static func _shape_entry(x: int, z: int) -> int:
 	var k := Vector2i(x, z)
 	var e: int = _shape_memo.get(k, -1)
@@ -494,12 +517,16 @@ static func _shape_entry(x: int, z: int) -> int:
 	var g := height_at(x, z)
 	var sm := 0
 	var cm := 0
-	# Land, smoothing on, and no tree cell resting on the top → the reshape applies (surface AND
-	# cap share the same corner targets); otherwise both modifiers stay 0 (plain cube / no cap).
-	if SMOOTHING_ENABLED and g >= SEA_LEVEL and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
+	# Smoothing on and no tree cell resting on the top → the reshape applies. WATER-SHORE §3.3:
+	# the SURFACE modifier is now computed for underwater floors too (g < SEA_LEVEL); only the
+	# CAP stays LAND-ONLY (g >= SEA_LEVEL, §3.6 — no underwater caps in v1). Otherwise both
+	# modifiers stay 0 (plain cube / no cap). The TreeGen probe returns AIR over ocean columns
+	# (trees are biome-gated off ocean/beach), so the uniform check keeps one code path.
+	if SMOOTHING_ENABLED and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
 		var t := _corner_targets(x, z)      # the 9-height_at stencil — computed ONCE, then cached
 		sm = _modifier_from_targets(t, g)
-		cm = _modifier_from_targets(t, g + 1)
+		if g >= SEA_LEVEL:
+			cm = _modifier_from_targets(t, g + 1)
 	if _shape_memo.size() >= _MEMO_MAX:
 		_shape_memo.clear()                 # bound memory over a marathon session
 	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24)
@@ -555,16 +582,16 @@ static func _surface_cap(x: int, z: int, g: int, biome: int, pcache = null) -> i
 
 ## The smoothing MODIFIER of the SURFACE cell at (x, height_at(x,z), z). Equals
 ## CellCodec.modifier(generated_cell(x, height_at(x,z), z)) — the exact shape _smoothed_surface
-## would emit for the top cell (0 == FULL cube: underwater floor, a tree-owned top, or flat/steep
-## ground; nonzero == a ramp/slab). No material/biome/strata/ore branches are evaluated.
+## would emit for the top cell (0 == FULL cube: a tree-owned top or flat/steep ground; nonzero ==
+## a ramp/slab). WATER-SHORE §3.4: underwater floors (g < SEA_LEVEL) now smooth too, so this has
+## no sea-level gate — both this direct branch and the memo agree over water. No material/biome/
+## strata/ore branches are evaluated.
 static func surface_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: cube-only surface
 	if pcache == null and _on_main_thread():
 		return (_shape_entry(x, z) >> 16) & 0xFF
 	var g := _col_h(x, z, pcache)
-	if g < SEA_LEVEL:
-		return 0                                      # underwater floor is never smoothed (full cube)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return 0                                      # a tree cell rests on the top → kept FULL
 	return _modifier_from_targets(_corner_targets(x, z, pcache), g)
@@ -573,7 +600,9 @@ static func surface_modifier(x: int, z: int, pcache = null) -> int:
 ## grows here (flat/steep, tree-owned, or underwater). Equals
 ## CellCodec.modifier(generated_cell(x, height_at(x,z)+1, z)) — when nonzero the cap's material
 ## is a non-air biome top, so the collider needs only this modifier (nonzero → shaped prism cell;
-## 0 → the cap cell is AIR/handed to the tree overlay).
+## 0 → the cap cell is AIR/handed to the tree overlay). WATER-SHORE §3.6: caps stay LAND-ONLY
+## (g < SEA_LEVEL → 0) even though the SURFACE cell below now smooths underwater — no underwater
+## caps in v1 (a submerged 1-block step keeps a residual half-block ledge, minor through water).
 static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: no cap cells
@@ -581,7 +610,7 @@ static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 		return (_shape_entry(x, z) >> 24) & 0xFF
 	var g := _col_h(x, z, pcache)
 	if g < SEA_LEVEL:
-		return 0
+		return 0                                      # caps are land-only (§3.6): no underwater caps
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return 0
 	return _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
@@ -592,12 +621,14 @@ static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 ## path activation (before the voxel worker runs), so the worker maps (mat, modifier) →
 ## ARID by reading a frozen array and never allocates or bakes a model itself.
 
-## The land surface materials smoothing can shape — every biome top `_biome_top` can
-## return for a land column. Ocean/underwater floors are never smoothed (g < SEA_LEVEL).
+## The surface materials smoothing can shape — every material `_biome_top` (land) OR
+## `_underwater_floor` (WATER-SHORE §3: underwater floors now smooth too) can return.
+## Gravel is the one `_underwater_floor` material not already a land top; sand/red_sand/
+## mud are shared. The module bakes these × emitted_modifiers() at setup.
 static func appearance_surface_materials() -> PackedInt32Array:
 	_ensure_ids()
 	return PackedInt32Array([
-		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL,
+		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL, _ID_GRAVEL,
 	])
 
 ## Every corner-height modifier the smoothing can emit: all BOTTOM-anchored corner
@@ -623,11 +654,14 @@ static func appearance_modifiers() -> PackedInt32Array:
 ## stall), so 474 → this-count cuts the load pause proportionally. Any modifier NOT in this set
 ## cube-falls-back on the worker (graceful, never a hole; verify asserts this set covers the
 ## smoother's real output). Computed ONCE (main thread) by a deterministic wide-area sample of the
-## surface + cap smoothing modifiers over a land region: the modifier is a pure function of the
-## LOCAL height stencil (biome-independent), so a wide land patch captures essentially the whole
-## set. It is a SUPERSET of the truly-emitted set — it ignores the tree-suppression exception (a
-## shape a tree would force to full cube is still baked; harmless, just unused). Cached statically;
-## only ever called from the manifest bake (main thread) + verify, never the voxel worker.
+## surface + cap smoothing modifiers: the modifier is a pure function of the LOCAL height stencil
+## (biome-independent), so a wide patch captures essentially the whole set. WATER-SHORE §3.5: the
+## sample now (a) no longer skips underwater columns — SURFACE modifiers are collected for
+## g < SEA_LEVEL too (caps stay land-only) — and (b) unions TWO deterministic centres, find_spawn()
+## (inland) and find_coast() (coastline/ocean), so the coastal floor shapes are covered. It is a
+## SUPERSET of the truly-emitted set — it ignores the tree-suppression exception (a shape a tree
+## would force to full cube is still baked; harmless, just unused). Cached statically; only ever
+## called from the manifest bake (main thread) + verify, never the voxel worker.
 const _EMIT_SAMPLE_R := 160
 static var _emitted_ready := false
 static var _emitted_mods := PackedInt32Array()
@@ -637,30 +671,9 @@ static func emitted_modifiers() -> PackedInt32Array:
 	if _emitted_ready:
 		return _emitted_mods
 	_ensure_noise()
-	var c := find_spawn()                             # deterministic land centre
-	var r := _EMIT_SAMPLE_R
-	var span := 2 * r + 3                              # +1 stencil padding on each side
-	# One height_at per column over the padded region (adjacent columns share stencil samples,
-	# so a shared grid turns the 9-per-column corner stencil into O(1) lookups).
-	var hg := PackedInt32Array()
-	hg.resize(span * span)
-	for i in span:
-		var wx := c.x - r - 1 + i
-		for j in span:
-			hg[i * span + j] = height_at(wx, c.y - r - 1 + j)
 	var seen := {}
-	for i in range(1, span - 1):
-		for j in range(1, span - 1):
-			var g: int = hg[i * span + j]
-			if g < SEA_LEVEL:
-				continue                              # underwater is never smoothed
-			var t := _corner_targets_grid(hg, span, i, j)
-			var sm := _modifier_from_targets(t, g)        # surface cell
-			if sm != 0:
-				seen[sm] = true
-			var cm := _modifier_from_targets(t, g + 1)    # cap cell (same corner targets)
-			if cm != 0:
-				seen[cm] = true
+	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)   # inland land shapes
+	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)   # coastline + underwater floor shapes (§3.5)
 	var out := PackedInt32Array()
 	for m: int in seen.keys():
 		out.append(m)
@@ -668,6 +681,31 @@ static func emitted_modifiers() -> PackedInt32Array:
 	_emitted_mods = out
 	_emitted_ready = true
 	return _emitted_mods
+
+## Accumulate into `seen` every surface (and land-only cap) smoothing modifier emitted over the
+## (2r+1)² region centred on `center`. SURFACE modifiers are collected at every column including
+## underwater (WATER-SHORE §3.5); CAP modifiers only where g >= SEA_LEVEL (caps land-only, §3.6).
+static func _sample_emitted(center: Vector2i, r: int, seen: Dictionary) -> void:
+	var span := 2 * r + 3                              # +1 stencil padding on each side
+	# One height_at per column over the padded region (adjacent columns share stencil samples,
+	# so a shared grid turns the 9-per-column corner stencil into O(1) lookups).
+	var hg := PackedInt32Array()
+	hg.resize(span * span)
+	for i in span:
+		var wx := center.x - r - 1 + i
+		for j in span:
+			hg[i * span + j] = height_at(wx, center.y - r - 1 + j)
+	for i in range(1, span - 1):
+		for j in range(1, span - 1):
+			var g: int = hg[i * span + j]
+			var t := _corner_targets_grid(hg, span, i, j)
+			var sm := _modifier_from_targets(t, g)        # surface cell (land OR underwater floor)
+			if sm != 0:
+				seen[sm] = true
+			if g >= SEA_LEVEL:                            # cap cell (same corner targets) — land only
+				var cm := _modifier_from_targets(t, g + 1)
+				if cm != 0:
+					seen[cm] = true
 
 ## _corner_targets for grid column (i, j) — identical corner formula to _corner_targets(x, z),
 ## reading the precomputed height grid instead of re-sampling height_at.
@@ -702,9 +740,14 @@ static func _bedrock_at(x: int, y: int, z: int) -> bool:
 # air (PerVoxelEnvironment), so the generated sheet is structurally sound ice
 # rather than tissue-paper (INTEGRATION-DECISIONS §1.5 frozen-sea seam).
 static func _sea_block(t: float, y: int) -> int:
-	if y == SEA_LEVEL and t < -0.55:
-		return _ID_ICE
-	return _ID_WATER
+	if y == SEA_LEVEL:
+		if t < -0.55:
+			return _ID_ICE                            # frozen cap (unchanged; no liquid overlay)
+		# The open-water surface cell: water MATERIAL carrying a liquid(WATER, 9) overlay so the
+		# renderer draws the sunk 0.9 slab instead of a full cube (WATER-SHORE §3.1).
+		return CellCodec.pack(_ID_WATER, 0, 0,
+			CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE))
+	return _ID_WATER                                  # deep water: bare id (§2.3.5 canonical full water)
 
 # --- stage: surface rule (WGC §6.5) -------------------------------------------
 static func _surface_rule(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
@@ -922,3 +965,61 @@ static func find_spawn() -> Vector2i:
 			if g > SEA_LEVEL + 1 and (b == B_PLAINS or b == B_FOREST):
 				return Vector2i(x, z)
 	return Vector2i(0, 0)
+
+## The first column at exactly the water line (g == SEA_LEVEL), scanned outward from origin with
+## the same deterministic pattern as find_spawn (radius 0..512 step 4, 15° steps). It is the centre
+## of the coastal sample emitted_modifiers()/emitted_shore_pairs() use so the underwater-floor and
+## shore-composite shapes are captured. Deterministic, main-thread, setup/verify-time only;
+## Vector2i(0, 0) fallback if no coastline is found within 512 (WATER-SHORE §3.5).
+static func find_coast() -> Vector2i:
+	for radius in range(0, 512, 4):
+		for a in range(0, 360, 15):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			if height_at(x, z) == SEA_LEVEL:
+				return Vector2i(x, z)
+	return Vector2i(0, 0)
+
+## The sampled set of (surface material, modifier) pairs a SHORE composite actually emits
+## (WATER-SHORE §3.5), each encoded as the SAME slot the module manifest uses: mat * 256 + modifier.
+## Sampled over the find_coast()-centred region: every column at exactly the water line
+## (g == SEA_LEVEL), non-frozen (column_profile().w >= -0.55), with a nonzero surface modifier
+## records `_biome_top(biome, x, z) * 256 + sm` (a shore composite's material is its biome top, not
+## an underwater-floor material — g == SEA_LEVEL is not < SEA_LEVEL). Like emitted_modifiers() it is
+## a deliberate superset/sample — correctness never depends on completeness (a rare unsampled pair
+## renders as the DRY shaped model on the worker: a notch, never a hole). Cached statically;
+## main-thread setup/verify only, never the voxel worker.
+const _SHORE_STRIDE := 256
+static var _shore_ready := false
+static var _shore_pairs := PackedInt32Array()
+static func emitted_shore_pairs() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
+	if _shore_ready:
+		return _shore_pairs
+	_ensure_noise()
+	_ensure_ids()
+	var c := find_coast()
+	var r := _EMIT_SAMPLE_R
+	var seen := {}
+	for dx in range(-r, r + 1):
+		var x := c.x + dx
+		for dz in range(-r, r + 1):
+			var z := c.y + dz
+			if height_at(x, z) != SEA_LEVEL:
+				continue                              # shore composites live exactly at the water line
+			var p := column_profile(x, z)             # climate noise only for the few water-line columns
+			if p.w < -0.55:
+				continue                              # frozen shore: ice regime, no water composite
+			var sm := surface_modifier(x, z, {})      # direct compute (a fresh pcache avoids memo pollution)
+			if sm == 0:
+				continue
+			seen[_biome_top(int(p.y), x, z) * _SHORE_STRIDE + sm] = true
+	var out := PackedInt32Array()
+	for s: int in seen.keys():
+		out.append(s)
+	out.sort()
+	_shore_pairs = out
+	_shore_ready = true
+	return _shore_pairs

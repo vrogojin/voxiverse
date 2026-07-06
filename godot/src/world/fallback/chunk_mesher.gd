@@ -16,6 +16,20 @@ extends RefCounted
 ##   * TREES: tree cells overlapping the chunk emit cubes (faces where the neighbour
 ##     is air), for the genuine, unchopped, non-buried tree cells only.
 ##   * PLACED blocks: player-placed cells (edit id > 0) emit cubes the same way.
+##   * WATER (WATER-SHORE §5.2): the sea/ice cells sit ABOVE the solid height and so
+##     are invisible to the passes above. `_emit_water` draws the water LINE — one
+##     horizontal 0.9-high quad per open-water OR shore-composite column — and the ice
+##     cube for frozen sea. Underwater smoothed floor ramps need NO code here: they are
+##     GENERATED shaped surface cells, so `_emit_terrain_shapes` (§5.1) already emits
+##     them once worldgen carries the underwater surface modifier.
+##
+## WATER PARITY (WATER-SHORE §5.3): gameplay parity with the module path is exact by
+## construction — both paths read the same `resolve_cell` output and the same physics
+## queries (this pass reads block_id_at / cell_value_at only, never geometry). Visual
+## parity for water is DELIBERATELY RELAXED on this safety-net path. Accepted gaps
+## (documented fidelity class, not bugs): no vertical water SIDE faces where water meets
+## air laterally (a dug channel wall shows no water pane); no underwater tint faces
+## (level-10 submerged composites render terrain-only, as the module path also does).
 ##
 ## Emits one ArrayMesh with up to 5 surfaces (one per block id present), each with
 ## its BlockMaterials material. Cell (x,y,z) spans [x,x+1]³. UVs are 1 tile / face.
@@ -62,6 +76,7 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 		_emit_terrain_shapes(tools, world, hmap, stride, n, x0, z0)
 		_emit_trees(tools, world, n, x0, z0)
 		_emit_placed(tools, world, n, x0, z0)
+		_emit_water(tools, world, hmap, stride, n, x0, z0)
 
 	if tools.is_empty():
 		return null
@@ -252,6 +267,53 @@ static func _emit_placed(tools: Dictionary, world: WorldManager,
 			_emit_cube(tools, world, cell, id)
 		else:
 			_emit_shaped(tools, cell, id, modifier)
+
+# --- water surface: one 0.9 quad per water/composite column; ice cube for frozen sea ---
+# WATER-SHORE §5.2. The fallback is a heightmap skin over effective_height, so sea/ice
+# cells (non-solid water sits ABOVE the solid height) are never touched by _emit_tops /
+# _emit_sides. This pass draws the water LINE — one horizontal quad at SEA_LEVEL + 0.9
+# per column that has water at the water line — plus the ice cap for frozen sea. It reads
+# only the shared cell queries (block_id_at / cell_value_at), so it derives from exactly
+# the same resolve_cell output as the module path (WATER-SHORE §5.3 parity statement).
+static func _emit_water(tools: Dictionary, world: WorldManager, hmap: PackedInt32Array,
+		stride: int, n: int, x0: int, z0: int) -> void:
+	var sea := TerrainConfig.SEA_LEVEL
+	var water_id := BlockCatalog.id_of(&"water")
+	var ice_id := BlockCatalog.id_of(&"ice")
+	for lz in n:
+		for lx in n:
+			var h := hmap[(lz + 1) * stride + (lx + 1)]
+			var wx := x0 + lx
+			var wz := z0 + lz
+			if h < sea:
+				# Open water / submerged column: what sits at the water line?
+				var id := world.block_id_at(Vector3i(wx, sea, wz))
+				if BlockCatalog.liquid_kind_of(id) == CellCodec.LIQ_WATER:
+					_water_top_quad(tools, water_id, wx, wz)      # the sunk 0.9 surface plane
+				elif id == ice_id:
+					_emit_cube(tools, world, Vector3i(wx, sea, wz), id)  # frozen sea cap
+				# else: overlay projects a player-placed/dug cell (block_id_at wins) → emit
+				# nothing, so a shaft dug below sea level stays dry.
+			elif h == sea:
+				# Potential shore composite: the surface cell (y == h == SEA_LEVEL) carries a
+				# liquid(WATER, 9) overlay iff smoothed and non-frozen. Same plane as above.
+				var v := world.cell_value_at(Vector3i(wx, h, wz))
+				if CellCodec.liquid_level(v) == CellCodec.LIQ_LEVEL_SURFACE:
+					_water_top_quad(tools, water_id, wx, wz)
+
+## One horizontal water quad for column (wx, wz) at y = SEA_LEVEL + WATER_SURFACE_HEIGHT,
+## world-planar UVs (matching _emit_tops). Continuous plane across cases 1 and 2 above.
+static func _water_top_quad(tools: Dictionary, water_id: int, wx: int, wz: int) -> void:
+	var y := float(TerrainConfig.SEA_LEVEL) + TerrainConfig.WATER_SURFACE_HEIGHT
+	var wx0 := float(wx)
+	var wz0 := float(wz)
+	var wx1 := wx0 + 1.0
+	var wz1 := wz0 + 1.0
+	_quad(_tool_for(tools, water_id), Vector3.UP,
+		Vector3(wx0, y, wz0), Vector3(wx0, y, wz1),
+		Vector3(wx1, y, wz1), Vector3(wx1, y, wz0),
+		Vector2(wx0, wz0), Vector2(wx0, wz1),
+		Vector2(wx1, wz1), Vector2(wx1, wz0))
 
 # --- cube emission: faces of `cell` (id) not occluded by the 6-neighbour ---------
 # A face is culled iff the neighbour OCCLUDES it per the transparency-index rule

@@ -50,6 +50,25 @@ var _next_arid := 0                     # next free library model index / ARID t
 const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
+
+# --- WATER-SHORE water appearance (WATER-SHORE §4.2) ---------------------------
+# Two more frozen publications baked at setup (same discipline as `_gen_arid`), BEFORE the
+# generator is wired, so the worker only reads them (zero allocation, race-free):
+#   * `_gen_wet_arid` — the WET COMPOSITE model (terrain ramp + water fill to y=0.9) for each
+#     (surface material, modifier) shore pair worldgen emits, keyed by the SAME slot the shore
+#     sample uses (`mat * _GEN_STRIDE + modifier`, == TerrainConfig.emitted_shore_pairs slot).
+#     A slot left -1 (unbaked shore pair) falls back to the DRY shaped model then the cube —
+#     a notch, never a hole.
+#   * `_water_surface_arid` — the ONE 0.9 open-water surface slab model; -1 falls back to the
+#     water cube ARID (wrong water top only, never a hole).
+# The wet fill is modifier-INDEPENDENT (WATER-SHORE §4.3), so its ArrayMesh is shared across
+# materials via `_shape_mesh_cache` keyed `modifier | _WET_MESH_FLAG` (distinct from the dry
+# shape-mesh keys), keeping the manifest at one model per emitted shore pair (no water-shape
+# multiplier).
+var _gen_wet_arid: PackedInt32Array      # (mat*_GEN_STRIDE + modifier) -> wet ARID; -1 = not baked
+var _water_surface_arid := -1            # the 0.9 water-slab model's ARID; -1 = not baked
+var _water_id := -1                      # cached BlockCatalog.id_of(&"water") (main thread)
+const _WET_MESH_FLAG := 1 << 20          # _shape_mesh_cache key bit for wet composite meshes
 # One shared ArrayMesh per shape modifier, reused across every material (geometry
 # depends only on the modifier). Keeps the manifest's mesh RESOURCES at distinct-shape
 # count (<=79) instead of materials×shapes (474) — the material differs only via the
@@ -137,7 +156,7 @@ func set_cell(cell: Vector3i, packed: int) -> void:
 	var vt: Object = _terrain.call("get_voxel_tool")
 	if vt == null:
 		return
-	var arid := arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
+	var arid := arid_for_cell(packed)
 	# VoxelBuffer.CHANNEL_TYPE == 0; VoxelTool.MODE_SET == 0 (default).
 	_set_if(vt, "channel", 0)
 	_set_if(vt, "mode", 0)
@@ -210,6 +229,27 @@ func _seeded_block_buffer(bs: int, bpos: Vector3i, vt: Object) -> Object:
 		var origin: Vector3i = _terrain.call("data_block_to_voxel", bpos)
 		vt.call("copy", origin, buf, 1 << 0)         # channels mask: TYPE only
 	return buf
+
+## Resolve a full PACKED cell value → ARID, honouring the WATER-SHORE liquid rule (§4.6).
+## A liquid-9 value (the water line) consults the frozen water tables first —
+## `_water_surface_arid` for the open-water surface cell (modifier 0), the wet composite ARID
+## for a shore composite (modifier != 0) — then falls through to the DRY resolve (`arid_for`)
+## when the water model was not baked (graceful: water cube / dry shape, never a hole).
+## Liquid-10 (submerged) and liquid-0 values go straight to the dry resolve — submerged
+## composites render their terrain shape only. Player edits never produce liquid values
+## (placement rejects non-solid materials, break writes 0), so this is worldgen-mirror only.
+func arid_for_cell(packed: int) -> int:
+	if CellCodec.liquid_level(packed) == CellCodec.LIQ_LEVEL_SURFACE:
+		var mat := CellCodec.mat(packed)
+		var modifier := CellCodec.modifier(packed)
+		if modifier == 0:
+			if _water_surface_arid >= 0:
+				return _water_surface_arid                 # else fall through: water cube via arid_for
+		else:
+			var wslot := mat * _GEN_STRIDE + modifier
+			if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+				return _gen_wet_arid[wslot]                # else fall through: dry shape via arid_for
+	return arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
 
 ## Resolve (LRID, modifier) → ARID, allocating a shaped ARID lazily (MAIN THREAD).
 ## AIR → 0; a full cube → the eager cube ARID; a shaped value appends a
@@ -331,18 +371,79 @@ func _build_gen_manifest(library: Object) -> void:
 			_next_arid += 1
 			_gen_arid[mat * _GEN_STRIDE + modifier] = got
 			appended += 1
+
+	# WATER-SHORE water models (§4.2): wet composites for every emitted shore pair, then the ONE
+	# open-water surface slab. Same anti-drift discipline (add_model() == expected ARID); any drift
+	# aborts the water manifest (leaving -1 / cube fallback) but keeps the dry manifest intact.
+	var wet := _build_wet_manifest(library, total)
+	appended += wet
+
 	if appended > 0 and library.has_method("bake"):
-		library.call("bake")                             # one batched bake for the whole manifest
+		library.call("bake")                             # one batched bake: dry shapes + wet + slab
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
-		% [appended, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+		% [appended - wet, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+	print("[module_world] baked water manifest: %d wet shore composites + %d water slab (slab ARID=%d)"
+		% [wet - (1 if _water_surface_arid >= 0 else 0), 1 if _water_surface_arid >= 0 else 0, _water_surface_arid])
+
+## Bake the WATER-SHORE water appearance into `_gen_wet_arid` + `_water_surface_arid`
+## (WATER-SHORE §4.2), appending (but NOT baking — the caller does one batched bake) to
+## `library`. Returns the number of models appended. Each append asserts `add_model()`
+## returns the expected ARID (anti-drift); a drift aborts, leaving the rest -1 (graceful
+## dry-shape/cube fallback). Wet composites are `|emitted_shore_pairs|` (a sampled coastal
+## set — tens, not hundreds) + 1 slab. Called on the MAIN thread inside setup().
+func _build_wet_manifest(library: Object, total: int) -> int:
+	_gen_wet_arid = PackedInt32Array()
+	_gen_wet_arid.resize(total * _GEN_STRIDE)
+	_gen_wet_arid.fill(-1)
+	var water_mat: Material = BlockMaterials.get_for(_water_id_of())
+	var appended := 0
+	for slot: int in TerrainConfig.emitted_shore_pairs():
+		var mat := slot / _GEN_STRIDE                    # decode: slot = mat*256 + modifier
+		var modifier := slot % _GEN_STRIDE
+		if mat <= BlockCatalog.AIR or mat >= total or modifier <= 0 or modifier >= _GEN_STRIDE:
+			continue
+		if _gen_wet_arid[slot] >= 0:
+			continue                                     # a duplicate sample pair
+		var model: Object = _make_wet_model(modifier, BlockMaterials.get_for(mat), water_mat)
+		if model == null:
+			continue                                     # no mesh-model class → dry-shape fallback
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] wet manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended                              # abort water manifest; dry manifest stands
+		_next_arid += 1
+		_gen_wet_arid[slot] = got
+		appended += 1
+	# The one open-water surface slab.
+	var slab: Object = _make_slab_model(water_mat)
+	if slab != null:
+		var expected := _next_arid
+		var got: int = _add_model(library, slab)
+		if got != expected:
+			push_warning("[module_world] water slab ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended
+		_next_arid += 1
+		_water_surface_arid = got
+		appended += 1
+	return appended
 
 ## Forward (mat, modifier) → ARID exactly as the voxel worker resolves it: AIR → 0, a
 ## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube
 ## fallback when that slot was never baked). Main-thread mirror of the generator's inline
 ## resolve — verify asserts the generated TYPE buffer equals this over a sample grid.
-func gen_arid_for(mat: int, modifier: int) -> int:
+func gen_arid_for(mat: int, modifier: int, liquid_level := 0) -> int:
 	if mat == BlockCatalog.AIR:
 		return 0
+	# WATER-SHORE §4.6: liquid-9 (the water line) resolves through the frozen water tables,
+	# exactly as the worker does. liquid-10 (submerged) and liquid-0 fall to the dry resolve.
+	if liquid_level == CellCodec.LIQ_LEVEL_SURFACE:
+		if modifier == 0:
+			return _water_surface_arid if _water_surface_arid >= 0 else _cube_arid_of(mat)
+		var wslot := mat * _GEN_STRIDE + modifier
+		if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+			return _gen_wet_arid[wslot]
+		# unbaked wet pair → dry shape (fall through)
 	if modifier == 0:
 		return _cube_arid_of(mat)
 	var slot := mat * _GEN_STRIDE + modifier
@@ -374,15 +475,8 @@ func _make_shape_model(modifier: int, material: Material) -> Object:
 	# Share one ArrayMesh per shape across all materials (see _shape_mesh_cache).
 	var amesh: ArrayMesh = _shape_mesh_cache.get(modifier, null)
 	if amesh == null:
-		var geom := ShapeMesh.build(modifier)
 		amesh = ArrayMesh.new()
-		var surf := []
-		surf.resize(Mesh.ARRAY_MAX)
-		surf[Mesh.ARRAY_VERTEX] = geom["verts"]
-		surf[Mesh.ARRAY_NORMAL] = geom["normals"]
-		surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
-		surf[Mesh.ARRAY_INDEX] = geom["indices"]
-		amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+		_add_surface(amesh, ShapeMesh.build(modifier))
 		_shape_mesh_cache[modifier] = amesh
 	if model.has_method("set_mesh"):
 		model.call("set_mesh", amesh)
@@ -391,6 +485,89 @@ func _make_shape_model(modifier: int, material: Material) -> Object:
 	if model.has_method("set_material_override"):
 		model.call("set_material_override", 0, material)
 	return model
+
+## Build the WET COMPOSITE model (WATER-SHORE §4.3): a VoxelBlockyModelMesh whose ArrayMesh
+## has TWO surfaces — surface 0 = the terrain ramp (ShapeMesh.build(modifier), terrain
+## material), surface 1 = the water fill (WaterMesh.shore_fill(), water material). The model
+## stays OPAQUE (transparency_index 0, the godot_voxel default — NOT set): its occlusion role
+## is the terrain ramp, so adjacent water (index 1) can never cull the ramp's side trapezoids
+## (no holes in terrain seen through water, §4.4). The water fill is modifier-independent, so
+## the combined ArrayMesh is shared across every material for a given modifier via
+## `_shape_mesh_cache` keyed `modifier | _WET_MESH_FLAG` (the material differs only via the
+## per-surface override). Returns null when the module lacks the mesh-model class.
+func _make_wet_model(modifier: int, terrain_material: Material, water_material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var key := modifier | _WET_MESH_FLAG
+	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, ShapeMesh.build(modifier))    # surface 0: terrain ramp
+		_add_surface(amesh, WaterMesh.shore_fill())       # surface 1: water fill to 0.9
+		_shape_mesh_cache[key] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, terrain_material)
+		model.call("set_material_override", 1, water_material)
+	# Make the OPAQUE role explicit (transparency_index 0). This is load-bearing: it is what
+	# stops adjacent water (index 1) from culling the terrain ramp's side trapezoids (§4.4 —
+	# no holes seen through water). Setting it here rather than relying on the godot_voxel
+	# default guards against a future default change silently opening those holes.
+	if model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", 0)
+	return model
+
+## Build the open-water surface SLAB model (WATER-SHORE §4.2): a VoxelBlockyModelMesh from
+## WaterMesh.surface_slab() (top at y=0.9), water material, transparency_index ==
+## BlockCatalog.cull_group_of(water) (== 1, matching the water cube) so slab↔cube face culling
+## behaves. Returns null when the module lacks the mesh-model class.
+func _make_slab_model(water_material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var key := _WET_MESH_FLAG | 0xFFFF                    # a fixed slab key, distinct from any modifier
+	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, WaterMesh.surface_slab())
+		_shape_mesh_cache[key] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, water_material)
+	var cull_group: int = BlockCatalog.cull_group_of(_water_id_of())
+	if cull_group > 0 and model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", cull_group)
+	return model
+
+## Append one {verts, normals, uvs, indices} geometry dict as a triangle surface on `amesh`.
+## Shared by the shape/wet/slab builders so the ShapeMesh/WaterMesh dict format is unpacked
+## in exactly one place.
+func _add_surface(amesh: ArrayMesh, geom: Dictionary) -> void:
+	var surf := []
+	surf.resize(Mesh.ARRAY_MAX)
+	surf[Mesh.ARRAY_VERTEX] = geom["verts"]
+	surf[Mesh.ARRAY_NORMAL] = geom["normals"]
+	surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
+	surf[Mesh.ARRAY_INDEX] = geom["indices"]
+	amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+
+## The water material's BlockCatalog id, resolved once (main thread; BlockCatalog.ensure_ready()
+## already ran in setup()). Used for the water material + cull group of both water models.
+func _water_id_of() -> int:
+	if _water_id < 0:
+		_water_id = BlockCatalog.id_of(&"water")
+	return _water_id
 
 ## Append a model to the library and return its index (int return, else models-array
 ## size — mirrors _add_cube's version-robust read).
@@ -512,6 +689,8 @@ extends VoxelGeneratorScript
 # generated cell to its baked ARID is allocation-free and race-free (VDS §8.3).
 var cube_arid: PackedInt32Array         # LRID -> cube ARID
 var gen_arid: PackedInt32Array          # (mat*GEN_STRIDE + modifier) -> ARID; -1 = not baked
+var gen_wet_arid: PackedInt32Array      # (mat*GEN_STRIDE + modifier) -> wet ARID; -1 = not baked (WATER-SHORE)
+var water_surface_arid := -1            # the 0.9 open-water slab ARID; -1 = not baked (WATER-SHORE)
 const GEN_STRIDE := 256
 
 func _get_used_channels_mask() -> int:
@@ -529,6 +708,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var max_above = TreeGen.MAX_ABOVE_SURFACE
 	var ncube = cube_arid.size()
 	var ngen = gen_arid.size()
+	var nwet = gen_wet_arid.size()
 
 	# CHEAP all-air early-outs, BEFORE the per-column profile pass (PERF): a block entirely above
 	# ALL possible content (the proven surface bound + tallest tree, and above the sea cap) or
@@ -588,7 +768,24 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				# pre-baked manifest ARID; -1 (unbaked) falls back to the plain cube.
 				var modifier = CellCodec.modifier(v)
 				var arid = 0
-				if modifier == 0:
+				# WATER-SHORE §4.5: a liquid-9 cell (the water line) resolves through the frozen
+				# water tables — the 0.9 slab for open water (modifier 0), the wet composite for a
+				# shore ramp (modifier != 0) — degrading to dry-shape then cube, never a hole. The
+				# deep-water / sub-surface fast paths below are UNCHANGED (liquid_level is 0 there):
+				# a level-10 submerged composite deliberately falls into the dry-shape resolve.
+				var lvl = CellCodec.liquid_level(v)
+				if lvl == CellCodec.LIQ_LEVEL_SURFACE:
+					if modifier == 0:
+						arid = water_surface_arid if water_surface_arid >= 0 else (cube_arid[id] if id < ncube else id)
+					else:
+						var wslot = id * GEN_STRIDE + modifier
+						if modifier < GEN_STRIDE and wslot < nwet and gen_wet_arid[wslot] >= 0:
+							arid = gen_wet_arid[wslot]
+						elif modifier < GEN_STRIDE and wslot < ngen and gen_arid[wslot] >= 0:
+							arid = gen_arid[wslot]
+						else:
+							arid = cube_arid[id] if id < ncube else id
+				elif modifier == 0:
 					arid = cube_arid[id] if id < ncube else id
 				else:
 					var slot = id * GEN_STRIDE + modifier
@@ -608,6 +805,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Publish the frozen tables to the worker-side generator (read-only from here on).
 	gen.set("cube_arid", _cube_arid)
 	gen.set("gen_arid", _gen_arid)
+	gen.set("gen_wet_arid", _gen_wet_arid)               # WATER-SHORE wet composites (§4.2)
+	gen.set("water_surface_arid", _water_surface_arid)   # WATER-SHORE 0.9 slab (§4.2)
 	return gen
 
 # --- helpers -------------------------------------------------------------------

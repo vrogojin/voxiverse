@@ -51,6 +51,18 @@ const GEO_RATE := 1.0         # geothermal rise, 1 C per block toward bedrock (r
 # The y at which the geothermal rise begins (3 C here, climbing below it to the floor).
 const _GEO_REF_Y := TerrainConfig.WORLD_BOTTOM_Y + GEO_SPAN   # -64 + 24 = -40
 
+# Frozen-sea seam (structural dependency, do not remove). A generated sea-ice sheet
+# sits at y = SEA_LEVEL, ABOVE the ocean-floor surface, so to this heightmap model it
+# is an "air" voxel. `ice` is structural class "brittle", whose φ(T) curve is SOUND
+# (φ=1) only below ~−5 C and collapses toward φ_min as it warms to 0 C. If the sheet
+# read the ~21 C surface air, StructuralSolver would treat it as tissue-paper and
+# detach the (vertically unsupported) sheet on the first nearby break. So a
+# climatically FROZEN OCEAN column keeps its sea-level air/ice sub-zero. LAND stays at
+# the 21.5 C baseline for EVERY biome per the rework spec — only frozen *oceans* are
+# cold, and only at/below the water line where the ice actually sits.
+const CLIMATE_FROZEN := -0.55   # column_profile().w below this = snowy/frozen climate
+const T_FROZEN_SEA := -8.0      # sea-level air/ice temperature over a frozen ocean, deg C
+
 ## Air temperature at altitude `y` above a `baseline` height: 21.5 C at/below the
 ## baseline, cooling linearly to 0 C at ALT_ZERO_Y and clamped at 0 C above it.
 static func _air_at(y: float, baseline: float) -> float:
@@ -97,6 +109,11 @@ func temperature(pos: Vector3) -> float:
 	var c := _cell(pos)
 	var surface := TerrainConfig.height_at(c.x, c.z)
 	if c.y > surface:                          # air voxel (incl. water/sea ice above the floor)
+		# Frozen-sea seam: a frozen OCEAN column's sea-level air/ice stays sub-zero so
+		# the brittle-ice structural curve reads the sheet as sound (see const block).
+		if surface < TerrainConfig.SEA_LEVEL and c.y <= TerrainConfig.SEA_LEVEL \
+				and TerrainConfig.column_profile(c.x, c.z).w < CLIMATE_FROZEN:
+			return T_FROZEN_SEA
 		return _air_at(float(c.y), float(surface))
 	# Ground: cool 1 C per block down (floored at 3 C), overridden by the geothermal
 	# rise in the 24 blocks above bedrock (3 C at y=-40, climbing to 27 C at y=-64).

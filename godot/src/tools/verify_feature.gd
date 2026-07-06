@@ -35,6 +35,7 @@ func _initialize() -> void:
 	_test_collider_amortized()
 	_test_collider_gate()
 	_test_physics_dormancy()
+	_test_ceiling_scan()
 	_test_tree()
 	_test_masses()
 	_test_materials()
@@ -344,11 +345,13 @@ func _test_temperature() -> void:
 	var t_bedrock := env.temperature(Vector3(fx, -64.0 + 0.5, fz))
 	_ok(absf(t_bedrock - 27.0) < 0.05, "bedrock y=-64 reads 27 C (got %.2f)" % t_bedrock)
 
-	# (e) biome independence: a cold-sea surface no longer reads sub-zero (old model dropped).
+	# (e) frozen-sea seam: LAND is 21.5 C at every biome, but a frozen OCEAN column's
+	# sea-level ice/air stays sub-zero so the brittle-ice structural curve reads the
+	# sheet as sound (not tissue-paper). Restores the invariant the rework had severed.
 	var cold := _find_cold_sea()
 	if cold.x != 0x7fffffff:
 		var cst := env.temperature(Vector3(float(cold.x) + 0.5, float(TerrainConfig.SEA_LEVEL) + 0.5, float(cold.y) + 0.5))
-		_ok(cst > 15.0, "cold-sea surface is biome-independent room-ish air (got %.2f)" % cst)
+		_ok(cst < -5.0, "frozen-sea surface ice/air stays sub-zero for sound ice (got %.2f)" % cst)
 
 # Ore distribution over a deep sampled volume.
 func _test_ores() -> void:
@@ -729,6 +732,40 @@ func _test_smoothing() -> void:
 # no adjacent-sample jump exceeds STEP_MAX (so the player auto-steps up it) and no sample
 # falls through. A continuous floor IS the walkability guarantee — blocked() auto-steps
 # exactly the same STEP_MAX rise floor_under exposes here.
+## Ceiling collision query (player.gd issue #2). WorldManager.ceiling_scan is the SWEPT,
+## shape-aware upward mirror of floor_under: it must find a ceiling's underside anywhere
+## in the head's swept range (so a fast rise / frame hitch can't TUNNEL a thin ceiling)
+## and return INF for a clear range. The real ceiling in a heightmap world is a DUG
+## TUNNEL — dig an interior cell and the solid terrain directly above it is the ceiling
+## (it stays supported, unlike a floating placed block, which the collapse pass detaches).
+func _test_ceiling_scan() -> void:
+	var world: WorldManager = _struct_world("CeilScan")
+	var spawn := TerrainConfig.find_spawn()
+	var cx := spawn.x
+	var cz := spawn.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	if g < TerrainConfig.SEA_LEVEL + 4:
+		_ok(true, "ceiling-scan skipped (no tall land column at spawn, g=%d)" % g)
+		world.queue_free()
+		return
+	var dig := Vector3i(cx, g - 3, cz)                 # an interior solid cell — stays supported
+	var dug := world.break_terrain(dig, Vector3.INF)
+	_ok(dug > 0, "ceiling-scan: dug an interior test cell at %s (id %d)" % [str(dig), dug])
+	var underside := float(dig.y + 1)                  # solid terrain above the dug air = ceiling
+	var fx := float(cx) + 0.5
+	var fz := float(cz) + 0.5
+	# (a) NO TUNNEL: sweep from inside the dug cell up to WELL ABOVE the surface (open
+	# air). A point test at the range END (air) would read "clear"; the swept scan must
+	# still find the INTERMEDIATE solid ceiling's underside.
+	var from_h := float(dig.y) + 0.1
+	var hit := world.ceiling_scan(fx, fz, from_h, float(g) + 5.0)
+	_ok(absf(hit - underside) < 1e-3,
+		"ceiling-scan: swept scan finds the intermediate ceiling underside %.2f (got %.2f)" % [underside, hit])
+	# (b) CLEAR range fully in open air above the surface returns INF (no false positive).
+	var clear := world.ceiling_scan(fx, fz, float(g) + 2.0, float(g) + 4.0)
+	_ok(clear == INF, "ceiling-scan: a clear open-air head range returns INF (got %.2f)" % clear)
+	world.queue_free()
+
 func _test_smoothing_walkable() -> void:
 	if not TerrainConfig.SMOOTHING_ENABLED:
 		print("    smoothing-walkable — SKIPPED (smoothing OFF)")

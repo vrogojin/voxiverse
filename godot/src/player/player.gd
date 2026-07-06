@@ -232,19 +232,24 @@ func _move(delta: float) -> void:
 	# descend into pits/shafts and enter tunnels we've dug instead of being snapped
 	# back to the original surface.
 	velocity.y -= gravity * delta
+	var prev_head_y := global_position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
 	global_position.y += velocity.y * delta
 
-	# Analytic CEILING: while rising, the head must not enter a solid cell overhead
-	# (jump under a low ceiling and you bonk it, exactly like a wall stops horizontal
-	# motion). The head top is PLAYER_HEIGHT above the feet; if the cell it moved into
-	# is solid we clamp the feet so the head sits just below that cell's bottom face
-	# and kill the upward velocity. Same analytic solidity query as the walls/floor —
-	# no trimesh collision. Descending/flat motion has velocity.y <= 0 and is skipped,
-	# so standing and open-sky jumps behave exactly as before.
+	# Analytic CEILING (SWEPT + shape-aware): while rising, the head must not pass into
+	# a solid cell overhead (jump under a low ceiling and you bonk it, like a wall stops
+	# horizontal motion). We SCAN every cell the head sweeps through this frame — from
+	# prev_head_y up to the new head — mirroring floor_under's per-cell scan so a fast
+	# rise during a frame hitch cannot TUNNEL a thin ceiling (point-sampling only the
+	# endpoint would jump a 1-block ceiling at ~0.2 s frames). The scan uses the shape-
+	# aware occupied span (WorldManager._occ_span), so a top-anchored slab stops the head
+	# at its true underside — matching the floor/wall shape contract, not a material-only
+	# point test. Clamp the feet so the head sits just below that underside and kill the
+	# upward velocity. Descending/flat motion (velocity.y <= 0) is skipped, so standing
+	# and open-sky jumps behave exactly as before.
 	if velocity.y > 0.0:
-		var head_y := global_position.y + PLAYER_HEIGHT
-		if _head_blocked(head_y):
-			var ceiling_y := floorf(head_y)          # bottom face of the solid cell overhead
+		var new_head_y := global_position.y + PLAYER_HEIGHT
+		var ceiling_y := _ceiling_under(prev_head_y, new_head_y)
+		if new_head_y > ceiling_y:
 			global_position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
 			velocity.y = 0.0
 
@@ -315,19 +320,24 @@ func _move_horizontal(motion: Vector3, wish: Vector3) -> void:
 			global_position.x = start.x
 			global_position.z = start.z
 
-## True iff a solid cell overlaps the player's head at world height `head_y`. Tests
-## the head centre AND the four footprint corners (± PLAYER_RADIUS in x and z), the
-## same corner-probe spirit as the horizontal wall checks, so a ceiling block that
-## covers only one corner of the capsule still stops the head. Uses the analytic
-## point solidity query (world.is_solid) — no trimesh collision.
-func _head_blocked(head_y: float) -> bool:
+## The lowest solid underside the player's head sweeps into as it rises from
+## `from_head_y` to `to_head_y` this frame, or INF if the swept range is clear. Probes
+## the footprint centre AND the four corners (± PLAYER_RADIUS in x and z) — the same
+## corner spirit as the horizontal wall checks, so a ceiling covering only one corner
+## still stops the head — and takes the LOWEST underside across them. Each column is a
+## swept, shape-aware scan (WorldManager.ceiling_scan): mirroring floor_under it walks
+## every cell in the head's vertical range (no tunneling) and reads the true occupied
+## span (top-anchored slabs stop at their underside). No trimesh collision.
+func _ceiling_under(from_head_y: float, to_head_y: float) -> float:
 	var px := global_position.x
 	var pz := global_position.z
-	return world.is_solid(Vector3(px, head_y, pz)) \
-		or world.is_solid(Vector3(px - PLAYER_RADIUS, head_y, pz - PLAYER_RADIUS)) \
-		or world.is_solid(Vector3(px - PLAYER_RADIUS, head_y, pz + PLAYER_RADIUS)) \
-		or world.is_solid(Vector3(px + PLAYER_RADIUS, head_y, pz - PLAYER_RADIUS)) \
-		or world.is_solid(Vector3(px + PLAYER_RADIUS, head_y, pz + PLAYER_RADIUS))
+	var r := PLAYER_RADIUS
+	var lo := world.ceiling_scan(px, pz, from_head_y, to_head_y)
+	lo = minf(lo, world.ceiling_scan(px - r, pz - r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px - r, pz + r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px + r, pz - r, from_head_y, to_head_y))
+	lo = minf(lo, world.ceiling_scan(px + r, pz + r, from_head_y, to_head_y))
+	return lo
 
 ## Resolve the exact block the player is pointing at within break_reach, using the
 ## SAME "nearest of (physics-ray-hits-wood, analytic-DDA-hits-terrain)" contest

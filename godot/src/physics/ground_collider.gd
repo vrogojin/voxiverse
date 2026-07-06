@@ -432,8 +432,14 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		elif run_start == 0x7fffffff:
 			run_start = y
 		y += 1
-	# Above the heightmap: a placed cell (overlay), a smoothed grass CAP lip at y==h+1 (light
-	# query), sea fill for underwater columns, else the tree overlay hash — no generated_cell.
+	# Above the heightmap: a placed cell (overlay), the SNOW accumulation stack (light query), a smoothed
+	# grass CAP lip at y==h+1 (light query), sea fill for underwater columns, else the tree overlay hash
+	# — no generated_cell. Snow (SNOW-ACCUMULATION §3.4): the snow_stack_at light query gives the column's
+	# stack (whole cubes + a fractional top LAYER, and whether a lip owns g+1); the plane [h+1, h+1+D/10]
+	# fills the air cells so a body settles on the true snow top — the prisms come free via surface_tris.
+	var snow := TerrainConfig.snow_stack_at(x, z, _build_pc)
+	var s_depth := ((snow >> 4) & 0xF) * 10 + (snow & 0xF)   # D in tenths (0 = no snow)
+	var s_capped := (snow >> 8) & 1                          # a smoothing lip owns g+1 (snow from g+2)
 	var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(x, z))
 	while y <= y_top:
 		var ov := -1
@@ -447,10 +453,23 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		elif ov == 0:                               # dug to air
 			pass
 		else:                                       # generated cell above the heightmap top
-			if y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
+			# Snow accumulation cell? The lip (if any) owns g+1, so exclude it from the snow plane there.
+			var remaining := -1
+			if s_depth > 0 and h >= TerrainConfig.SEA_LEVEL and not (s_capped == 1 and y == h + 1):
+				remaining = s_depth - (y - (h + 1)) * 10
+			if remaining >= 10:
+				solid = true                        # a full snow cube → box run
+			elif remaining >= 1:
+				solid = true
+				modifier = CellCodec.make_layer(remaining)   # the fractional top LAYER → prism
+			elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
 				modifier = TerrainConfig.surface_cap_modifier(x, z, _build_pc)
-			if modifier != 0:
-				solid = true                        # smoothed grass cap → prism
+				if modifier != 0:
+					solid = true                    # smoothed grass cap lip → prism
+				elif y <= TerrainConfig.SEA_LEVEL:
+					solid = true                    # sea fill (water/ice) → full-cube box
+				elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+					solid = true                    # tree wood/leaf → full-cube box
 			elif y <= TerrainConfig.SEA_LEVEL:
 				solid = true                        # sea fill (water/ice) → full-cube box
 			elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:

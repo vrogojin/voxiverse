@@ -50,23 +50,22 @@ const SEA_LEVEL := 0             # air below SEA_LEVEL fills with liquid (ice ca
 ## are DISJOINT bands, so _sea_liquid_kind (the single regime authority) never has to reconcile them.
 const LAVA_SEA_T := 0.60         # extreme-hot ocean regions: the sea fill IS lava (molten seas)
 
-## Snow half-slab trigger (M1 snowy-world ADR §6.2): a flat, tree-free land column whose SURFACE
-## temperature (ClimateModel) is below this accumulates a bottom half-slab of snow one cell above
-## its surface. −4 < 0, so every slab column is also snow-capped (a consistent stack). Keyed on the
-## surface temperature, NOT the biome, so it fires on deep-frozen flats by climate OR (once tall
-## terrain lands) altitude — not just B_SNOWY.
-const SNOW_SLAB_T := -4.0
+## Snow-ACCUMULATION baseline (SNOW-ACCUMULATION Decision 3.2): the STATIC, pure-SEED snow depth D
+## (tenths of a block above the solid top g) — the feature has its look with the sim OFF. Two composed
+## terms, both keyed on the ONE temperature authority (ClimateModel.surface_temperature, the same zero
+## crossing as the M1 cap/melt), so all three snow authorities agree at the boundary. This REPLACES the
+## fixed all-corners-1 half-slab (M1 Decision 6): every column that slabbed now carries D ≥ 5.
+const SNOW_T0 := 0.0                 # depth begins strictly below freezing (matches the cap stamp)
+const SNOW_BLANKET_PER_C := 0.4      # blanket tenths per °C below zero (a thin terrain-following crust)
+const SNOW_BLANKET_MAX := 3          # blanket cap: a 0.3 dusting-to-crust (what dusts peaks that poke through)
+const SNOW_FILL_PER_C := 1.5         # fill-plane tenths per °C below zero (the flatness term)
+const SNOW_FILL_MAX_CELLS := 4       # fill never exceeds 4 blocks above g (deep-gully clamp)
+const SNOW_REF_LATTICE := 8          # smoothed-terrain reference lattice pitch (blocks) for h_ref
 
-## INTERIM (2026-07-06): the fixed half-block snow slab reads too blocky and cannot blend (½-block
-## granularity + it only fires on flat columns, so there is no slope to grade into). Disabled until
-## the snow-ACCUMULATION feature (variable-height fill that grades uneven terrain into a flat white
-## surface + a bounded snowfall sim) replaces it. Flip to true only to A/B the old slab look; the
-## machinery + verify pins stay live so the accumulation work has a baseline to build on.
-const SNOW_SLABS_ENABLED := false
-
-## The snow half-slab shape (M1 ADR §6.1): an all-corners-1 BOTTOM slab (walkable — top +0.5 ≤
-## STEP_MAX; breakable → snow_block, mass 280·½ = 140 kg). Verify-pinned == make_modifier(1,1,1,1,
-## ANCHOR_BOTTOM). Emitted as CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER): no liquid, no state.
+## The 0.5 uniform layer's canonical modifier == CellCodec.LAYER_SLAB_MODIFIER (an all-corners-1 BOTTOM
+## slab, ShapeCodec.make_modifier(1,1,1,1,BOTTOM) == 85). REPURPOSED from the removed fixed slab to "the
+## canonical encoding of snow LAYER level 5" (SNOW-ACCUMULATION §1.3 rule 5); it stays baked (level 5 of
+## the snow stack emits it on snow_block) and the emitted-modifier union keeps it in the manifest.
 const SNOW_SLAB_MODIFIER := 85
 
 ## The render height of the water surface: the top cell of every open-water column and every
@@ -491,10 +490,16 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		if y == g + 1:
 			var cap := _surface_cap(x, z, g, biome, t, pcache)
 			if cap != BlockCatalog.AIR:
-				# _surface_cap emits EITHER a smoothing lip (which gains the snow-cap STATE on a
-				# cold column) OR the deep-frozen half-slab (snow_block — state-/liquid-free, both
-				# composition wrappers no-op on it, M1 ADR §6). One return covers both cases.
+				# _surface_cap emits a smoothing lip (which gains the snow-cap STATE on a cold column).
+				# The lip keeps PRIORITY over snow at g+1 (SNOW-ACCUMULATION §3.3: Phase A2 keeps the dry
+				# lip; the in-ramp fill nibble is Phase B), so snow stacks from g+2 on a capped column.
 				return _with_snow_state(_with_shore_liquid(cap, y, t), g, t)
+		# Snow accumulation (SNOW-ACCUMULATION Decision 3): on a COLD column the AIR cells above g fill
+		# with snow up to the climate baseline — full snow_block cubes below, one fractional LAYER at the
+		# top. Composed AFTER the cap check (the lip owns g+1) and BEFORE the sea/tree returns.
+		var snow := _snow_stack(x, y, z, g, t, pcache)
+		if snow != BlockCatalog.AIR:
+			return snow
 		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
@@ -565,24 +570,109 @@ static func _with_snow_state(v: int, g: int, t: float) -> int:
 		return v
 	return CellCodec.with_state(v, CellCodec.STATE_SNOW_CAPPED)
 
-## True iff a snow half-slab grows at (x, g+1, z) (M1 ADR §6.2): a FLAT (both raw smoothing
-## modifiers 0), tree-free land column at/above sea level whose SURFACE temperature is below
-## SNOW_SLAB_T. Given the already-computed raw smoothing modifiers so the collider cheap query,
-## the shape memo and resolve_cell share ONE predicate. Cheap gate (sm/cm/g) first; the
-## column_profile + surface_temperature eval fires only on flat land columns. Deterministic
-## (pure function of SEED — no randi/Time), so the shape memo stays byte-identical to recompute.
-# NOTE: the snow half-slab rides the SMOOTHING code path — every caller (_shape_entry, _surface_cap,
-# surface_cap_modifier) evaluates it only inside their `SMOOTHING_ENABLED` branch, so toggling the
-# diagnostic `SMOOTHING_ENABLED := false` also removes all snow slabs. Deliberate (slabs share the
-# cap-cell machinery); consistent across every path, so the collider contract never diverges.
-static func _slab_fires(x: int, z: int, g: int, sm: int, cm: int, pcache) -> bool:
-	if not SNOW_SLABS_ENABLED:
-		return false                                  # INTERIM: slabs disabled until accumulation replaces them
-	if sm != 0 or cm != 0 or g < SEA_LEVEL:
-		return false
-	if ClimateModel.surface_temperature(g, column_profile(x, z, pcache).w) >= SNOW_SLAB_T:
-		return false
-	return TreeGen.block_at(x, g + 1, z, pcache) == BlockCatalog.AIR
+# ------------------------------------------------------------------------------
+# Snow accumulation baseline (SNOW-ACCUMULATION Decision 3). PURE SEED functions: the static snow
+# depth is a deterministic function of climate + the smoothed terrain lattice, so the module worker
+# (pcache != null), the analytic main-thread queries (pcache == null), the shape memo AND both render
+# paths agree by construction, and re-running with the same SEED is byte-identical. The non-snow world
+# stays BYTE-IDENTICAL: every function early-outs to 0/AIR unless surface_temperature(g, t) < 0.
+
+## The column's total snow depth D in TENTHS above the solid top g (§3.2), or 0 when the column carries
+## no snow. Gates, in order: the sea gate (no snow fill on underwater floors — the _with_snow_state
+## guard), the temperature gate (D=0 unless surface_temperature < SNOW_T0 — the ONE authority the cap/
+## melt share), and the tree gate (bare under a canopy). Then D = max(blanket, fill): a thin
+## terrain-following crust, and a fill that converges low spots toward the slowly-varying snow plane P
+## over the SNOW_REF_LATTICE-smoothed h_ref — the flatness term. `pcache` threads the shared height memo.
+static func _snow_depth(x: int, z: int, g: int, t: float, pcache) -> int:
+	if g < SEA_LEVEL:
+		return 0                                      # no snow fill on underwater floors
+	var ts := ClimateModel.surface_temperature(g, t)
+	if ts >= SNOW_T0:
+		return 0                                      # warm surface → no snow (temperate world byte-identical)
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
+		return 0                                      # bare under a tree canopy (the tree gate)
+	var neg := -ts                                     # > 0 here
+	var d_blanket := clampi(roundi(SNOW_BLANKET_PER_C * neg), 0, SNOW_BLANKET_MAX)
+	var p := _h_ref(x, z, pcache) + 1.0 + minf(SNOW_FILL_PER_C * neg, 10.0 * float(SNOW_FILL_MAX_CELLS)) / 10.0
+	var fill_blocks := clampf(p - float(g + 1), 0.0, float(SNOW_FILL_MAX_CELLS))
+	var d_fill := roundi(fill_blocks * 10.0)
+	return maxi(d_blanket, d_fill)
+
+## The slowly-varying reference terrain height at (x,z): height_at bilinearly interpolated over a
+## SNOW_REF_LATTICE lattice of samples (§3.2). Deterministic, 4 lattice height reads (memoized through
+## the shared column_profile pcache when non-null), so a low spot's h_ref sits ABOVE its own g and the
+## fill plane P rises above it — the mechanism that fills gullies flat while ridges keep only a blanket.
+static func _h_ref(x: int, z: int, pcache) -> float:
+	var l := SNOW_REF_LATTICE
+	var x0 := floori(x / float(l)) * l
+	var z0 := floori(z / float(l)) * l
+	var x1 := x0 + l
+	var z1 := z0 + l
+	var h00 := float(_col_h(x0, z0, pcache))
+	var h10 := float(_col_h(x1, z0, pcache))
+	var h01 := float(_col_h(x0, z1, pcache))
+	var h11 := float(_col_h(x1, z1, pcache))
+	var tx := float(x - x0) / float(l)
+	var tz := float(z - z0) / float(l)
+	return lerpf(lerpf(h00, h10, tx), lerpf(h01, h11, tx), tz)
+
+## The generated snow CELL at (x,y,z) above the solid top g of a cold column, or AIR when this cell holds
+## no snow. Depth D (tenths) fills the air cells above g up to the plane [g+1, g+1+D/10]: a cell whose
+## remaining depth ≥ 10 is a full snow_block cube (modifier 0), the fractional top is a snow LAYER
+## (make_layer). resolve_cell handles the g+1 cap BEFORE this (the lip keeps priority), so on a capped
+## column this is reached only for y ≥ g+2 — its `below` term then already accounts for the g+1 cell the
+## lip occupies (the plane is absolute, so the stack above the lip is exactly the plane's remainder).
+static func _snow_stack(x: int, y: int, z: int, g: int, t: float, pcache) -> int:
+	var d := _snow_depth(x, z, g, t, pcache)
+	if d <= 0:
+		return BlockCatalog.AIR
+	var remaining := d - (y - (g + 1)) * 10           # tenths of snow whose bottom is at/above this cell's floor
+	if remaining <= 0:
+		return BlockCatalog.AIR
+	if remaining >= 10:
+		return CellCodec.pack(_ID_SNOW, 0)             # a full snow cube
+	return CellCodec.pack(_ID_SNOW, CellCodec.make_layer(remaining))   # the fractional top LAYER
+
+## The column's snow byte (§3.4): (whole << 4) | top, where whole = D/10 (full snow cubes, 0..
+## SNOW_FILL_MAX_CELLS) and top = D % 10 (the fractional top LAYER level, 0..9). The ONE shared predicate
+## the memo and the worker-direct path both derive from, so they cannot diverge. 0 = no snow.
+static func _snow_stack_byte(x: int, z: int, g: int, t: float, pcache) -> int:
+	var d := _snow_depth(x, z, g, t, pcache)
+	if d <= 0:
+		return 0
+	return ((d / 10) << 4) | (d % 10)
+
+## The MODIFIER of the g+1 snow cell for a column with snow byte `byte` and NO smoothing lip (the uncapped
+## case): a full snow cube (whole ≥ 1 ⇒ D ≥ 10) → 0; a fractional-only stack (top > 0) → make_layer(top);
+## no snow → 0. Equals CellCodec.modifier(generated_cell(g+1)) by construction — the collider cheap-query
+## contract for a snowy uncapped column (§3.4).
+static func _cap_snow_modifier(byte: int) -> int:
+	if ((byte >> 4) & 0xF) >= 1:
+		return 0                                       # g+1 is a full snow cube (D >= 10)
+	var top := byte & 0xF
+	return CellCodec.make_layer(top) if top > 0 else 0
+
+## The collider's LIGHT snow query (§3.4): the column's snow stack packed as (capped << 8) | (whole << 4)
+## | top — capped = a smoothing lip owns g+1 (snow then stacks from g+2), whole/top the full-cube count +
+## fractional top LAYER level. 0 = no snow. NO generated_cell calls (the light-query family contract).
+## Main thread with pcache == null reads the shape memo; a non-null pcache (the collider rebuild / worker)
+## computes directly — both byte-identical (pure SEED functions).
+static func snow_stack_at(x: int, z: int, pcache = null) -> int:
+	if pcache == null and _on_main_thread():
+		var e := _shape_entry(x, z)
+		var byte: int = (e >> 32) & 0xFF
+		if byte == 0:
+			return 0
+		var capped := 1 if (((e >> 24) & 0xFF) != 0) else 0
+		return (capped << 8) | byte
+	var g := _col_h(x, z, pcache)
+	var byte2 := _snow_stack_byte(x, z, g, column_profile(x, z, pcache).w, pcache)
+	if byte2 == 0:
+		return 0
+	var cm := 0
+	if SMOOTHING_ENABLED and TreeGen.block_at(x, g + 1, z, pcache) == BlockCatalog.AIR:
+		cm = _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
+	return ((1 if cm != 0 else 0) << 8) | byte2
 
 # ------------------------------------------------------------------------------
 # Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1). The walkable surface
@@ -697,21 +787,20 @@ static func _shape_entry(x: int, z: int) -> int:
 	# than an abrupt half-block ledge. Otherwise both modifiers stay 0 (plain cube / no cap). The
 	# TreeGen probe returns AIR over ocean columns (trees are biome-gated off ocean/beach), so the
 	# uniform check keeps one code path.
-	var slab := 0
+	var snow_byte := 0
 	if SMOOTHING_ENABLED and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
 		var t := _corner_targets(x, z)      # the 9-height_at stencil — computed ONCE, then cached
 		sm = _modifier_from_targets(t, g)
 		cm = _modifier_from_targets(t, g + 1)
-		# Snow half-slab (M1 ADR §6.3): a deep-frozen FLAT column (sm==cm==0) grows a snow slab at
-		# g+1, so the GENERATED cap modifier there is SNOW_SLAB_MODIFIER. Cache the DECISION in a
-		# dedicated bit (32) — NOT in the cap byte — so a legit smoothing 85-lip (raw cm) stays a
-		# biome-top cap while the collider cheap query + render cap read the fold as an O(1) lookup.
-		# Deterministic (climate/altitude are pure SEED functions), so the memo is byte-identical.
-		if cm == 0 and _slab_fires(x, z, g, sm, cm, null):
-			slab = 1
+	# Snow accumulation byte (SNOW-ACCUMULATION §3.4): bits 32..39 = (whole << 4) | top — the column's
+	# full-cube count + fractional top LAYER level above g, REPLACING the removed fixed-slab bit. Derived
+	# from the ONE shared _snow_stack_byte predicate (its sea/warm/tree gates make it 0 on the non-snow
+	# world, so a temperate/underwater memo entry is byte-identical), pure SEED functions → byte-identical
+	# to recompute. cm (bits 24..31) stays the raw smoothing lip; a lip owns g+1, so snow stacks from g+2.
+	snow_byte = _snow_stack_byte(x, z, g, column_profile(x, z).w, null)
 	if _shape_memo.size() >= _MEMO_MAX:
 		_shape_memo.clear()                 # bound memory over a marathon session
-	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24) | (slab << 32)
+	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24) | (snow_byte << 32)
 	_shape_memo[k] = e
 	return e
 
@@ -746,20 +835,14 @@ static func _surface_cap(x: int, z: int, g: int, biome: int, t: float, pcache = 
 		return BlockCatalog.AIR                       # diagnostic: no cap cells
 	if pcache == null and _on_main_thread():
 		var e := _shape_entry(x, z)
-		if (e >> 32) & 1:
-			return CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER)   # deep-frozen half-slab (M1 §6)
 		var cm := (e >> 24) & 0xFF
 		return BlockCatalog.AIR if cm == 0 else CellCodec.pack(_cap_material(biome, x, z, t, g), cm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
-	var tg := _corner_targets(x, z, pcache)
-	var m := _modifier_from_targets(tg, g + 1)
-	if m == 0:
-		# No smoothing lip — a deep-frozen flat column grows a snow half-slab here instead (§6.2).
-		if _slab_fires(x, z, g, _modifier_from_targets(tg, g), 0, pcache):
-			return CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER)
-		return BlockCatalog.AIR                       # no lip (flat) or a full-block step (kept blocky)
-	return CellCodec.pack(_cap_material(biome, x, z, t, g), m)
+	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
+	# No smoothing lip → AIR (resolve_cell then stacks the snow accumulation at g+1); a nonzero lip owns
+	# the cell (snow stacks from g+2 on a capped column — SNOW-ACCUMULATION §3.3).
+	return BlockCatalog.AIR if m == 0 else CellCodec.pack(_cap_material(biome, x, z, t, g), m)
 
 ## The cap cell's MATERIAL. A LAND cap (g >= SEA_LEVEL, so the cap cell y=g+1 sits above the water
 ## line) is the column's biome top; an UNDERWATER cap (g < SEA_LEVEL) is the underwater-floor
@@ -805,24 +888,24 @@ static func surface_modifier(x: int, z: int, pcache = null) -> int:
 ## abrupt half-block ledge. The query is material-independent, so the same value holds on land and
 ## underwater; both the memo and the direct branch agree over water.
 static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
-	if not SMOOTHING_ENABLED:
-		return 0                                      # diagnostic: no cap cells
 	if pcache == null and _on_main_thread():
 		var e := _shape_entry(x, z)
-		# A deep-frozen flat column's g+1 cell is a snow half-slab (M1 ADR §6.3): its generated
-		# modifier is SNOW_SLAB_MODIFIER, so the collider must see a solid shaped prism there.
-		return SNOW_SLAB_MODIFIER if ((e >> 32) & 1) else ((e >> 24) & 0xFF)
+		var cm0: int = (e >> 24) & 0xFF
+		if cm0 != 0:
+			return cm0                                # a smoothing lip owns g+1 (Phase A2: the dry lip)
+		# No lip → the g+1 cell is the snow accumulation cell (SNOW-ACCUMULATION §3.4): a full snow
+		# cube (0), a fractional LAYER (make_layer), or nothing (0). Matches modifier(generated_cell(g+1)).
+		return _cap_snow_modifier((e >> 32) & 0xFF)
 	var g := _col_h(x, z, pcache)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
-		return 0
-	var tg := _corner_targets(x, z, pcache)
-	var cm := _modifier_from_targets(tg, g + 1)
+		return 0                                      # a tree cell owns g+1 (generated modifier 0)
+	var cm := 0
+	if SMOOTHING_ENABLED:
+		cm = _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
 	if cm != 0:
 		return cm
-	# No smoothing lip — a deep-frozen flat column's g+1 cell is the snow half-slab (modifier 85).
-	if _slab_fires(x, z, g, _modifier_from_targets(tg, g), 0, pcache):
-		return SNOW_SLAB_MODIFIER
-	return 0
+	# No smoothing lip — the g+1 cell is the snow accumulation cell (SNOW-ACCUMULATION §3.4).
+	return _cap_snow_modifier(_snow_stack_byte(x, z, g, column_profile(x, z, pcache).w, pcache))
 
 ## The appearance manifest (RUNTIME-MATERIAL-STREAMING §6.5 / VOXEL-DATA-STRUCTURE
 ## §8.1/§8.3): the exact set of (surface material, modifier) pairs this smoothing

@@ -239,9 +239,16 @@ func _test_worldgen() -> void:
 			if g >= SEA:
 				continue
 			found_ocean = true
-			# a cell in the water column (just under the surface) is water or ice...
-			var mid: int = TerrainConfig.generated_block(x, SEA - 1, z) if SEA - 1 > g else TerrainConfig.generated_block(x, g + 1, z)
-			if mid != WATER and mid != ICE:
+			# a cell in the water column (just under the surface) is water or ice — OR, where an
+			# underwater smoothing CAP grows there (WATER-SHORE §3.6), a shaped cap composite of the
+			# underwater-floor material (it fills its own remainder with water up to the water line, or
+			# is a bare ramp in the frozen regime). Only a PLAIN solid full cube would be a real
+			# "solid floating in the sea" bug.
+			var my: int = SEA - 1 if SEA - 1 > g else g + 1
+			var midv: int = TerrainConfig.generated_cell(x, my, z)
+			var mid: int = CellCodec.mat(midv)
+			var is_cap: bool = my == g + 1 and CellCodec.modifier(midv) != 0
+			if mid != WATER and mid != ICE and not is_cap:
 				sea_ok = false
 			# ...and there is no water ABOVE the sea surface.
 			if TerrainConfig.generated_block(x, SEA + 2, z) == WATER:
@@ -670,7 +677,7 @@ func _test_shape_memo() -> void:
 	var shaped := 0
 	var checked := 0
 	var uw_cols := 0
-	var uw_caps_land_only := true                     # underwater columns must never grow a cap (§3.6)
+	var uw_caps_seen := 0                              # underwater columns that DO grow a cap (§3.6: underwater caps ON)
 	for dx in range(-160, 160, 3):
 		for dz in range(-160, 160, 3):
 			var x := s.x + dx
@@ -692,14 +699,14 @@ func _test_shape_memo() -> void:
 				shaped += 1
 			if g < TerrainConfig.SEA_LEVEL:
 				uw_cols += 1
-				if memo_cm != 0:                      # WATER-SHORE §3.6: no underwater caps in v1
-					uw_caps_land_only = false
+				if memo_cm != 0:                      # WATER-SHORE §3.6: underwater caps are now ON
+					uw_caps_seen += 1
 			checked += 1
 	_ok(checked > 0, "shape memo: sampled %d columns" % checked)
 	_ok(shaped > 0, "shape memo: sample includes shaped columns (%d) — memo exercised on real shapes" % shaped)
 	_ok(uw_cols > 0, "shape memo: coast sweep spans underwater columns (%d) — memo exercised below sea level" % uw_cols)
-	_ok(uw_caps_land_only, "shape memo: underwater columns grow NO cap (caps stay land-only, §3.6)")
-	_ok(exact, "shape memo path == direct compute == generated_cell modifier over the whole sample (cache is exact)")
+	_ok(uw_caps_seen > 0, "shape memo: underwater columns CAN grow a cap (%d) — underwater caps ON (§3.6)" % uw_caps_seen)
+	_ok(exact, "shape memo path == direct compute == generated_cell modifier over the whole sample (incl. underwater caps — cache is exact)")
 
 	# Cost: the actual analytic surface query (generated_cell at y==g), memo-WARM, vs the direct
 	# 9-height_at corner-stencil recompute the memo removes from every moving-player probe.
@@ -1452,7 +1459,18 @@ func _ref_col_heavy(world: WorldManager, cx: int, cz: int, center: Vector2i) -> 
 	while y <= y_top:
 		var v: int = world.cell_value_at(Vector3i(cx, y, cz))
 		var mat: int = CellCodec.mat(v)
-		if mat != BlockCatalog.AIR and CellCodec.modifier(v) != 0:
+		var modifier: int = CellCodec.modifier(v)
+		# The collider keeps UNDERWATER cap cells as full sea-fill BOXES — its cap-prism emission is
+		# land-only (ground_collider.gd:450, gated h >= SEA_LEVEL) because the player never stands
+		# underwater and debris floats on the sea fill. WATER-SHORE §3.6 grows the underwater cap in
+		# WORLDGEN (for RENDER), so cell_value_at(x, h+1, z) now carries a shaped composite; mirror
+		# the collider's conservative PHYSICS model here by coarsening a submerged generated cap
+		# (not a placed block) to sea fill (modifier 0 → box), so this heavy reference stays a faithful
+		# model of the UNCHANGED collider. (This is a test-model correction, not a collider change.)
+		if modifier != 0 and y == h + 1 and h < TerrainConfig.SEA_LEVEL \
+				and not world.placed_cells().has(Vector3i(cx, y, cz)):
+			modifier = 0
+		if mat != BlockCatalog.AIR and modifier != 0:
 			if run_start != 0x7fffffff:
 				boxes.append(Vector2(float(run_start), float(y)))
 				run_start = 0x7fffffff
@@ -3508,6 +3526,27 @@ func _test_water_shore() -> void:
 		_ok(CellCodec.modifier(uc) != 0, "worldgen: submerged floor composite is shaped (modifier != 0)")
 		_ok(CellCodec.liquid_kind(uc) == CellCodec.LIQ_WATER and CellCodec.liquid_level(uc) == CellCodec.LIQ_LEVEL_FULL,
 			"worldgen: submerged floor composite carries liquid(WATER, 10) — full-fill")
+	# A non-frozen underwater column that GROWS a cap (WATER-SHORE §3.6 — underwater caps ON): its
+	# cap cell at y=g+1 is a COMPOSITE of the UNDERWATER-FLOOR material (sand/gravel/red_sand/mud —
+	# NOT a land biome top), shaped, filling its remainder with water: level 9 when the cap sits
+	# exactly at the water line (g == SEA-1), else level 10 (submerged).
+	var uwcap := _find_uw_cap()
+	if uwcap.x == 0x7fffffff:
+		print("    (no non-frozen underwater cap column found near the coast — underwater-cap worldgen assert skipped)")
+	else:
+		var cg: int = TerrainConfig.height_at(uwcap.x, uwcap.y)
+		var capc := TerrainConfig.generated_cell(uwcap.x, cg + 1, uwcap.y)
+		var capmat := CellCodec.mat(capc)
+		var uw_mats := {
+			BlockCatalog.id_of(&"sand"): true, BlockCatalog.id_of(&"gravel"): true,
+			BlockCatalog.id_of(&"red_sand"): true, BlockCatalog.id_of(&"mud"): true,
+		}
+		_ok(CellCodec.modifier(capc) != 0, "worldgen: underwater cap cell (y=g+1) is shaped (modifier != 0)")
+		_ok(uw_mats.has(capmat),
+			"worldgen: underwater cap material is an underwater-floor material (sand/gravel/red_sand/mud), not a land biome-top")
+		var want_lvl: int = CellCodec.LIQ_LEVEL_SURFACE if cg + 1 == SEA else CellCodec.LIQ_LEVEL_FULL
+		_ok(CellCodec.liquid_kind(capc) == CellCodec.LIQ_WATER and CellCodec.liquid_level(capc) == want_lvl,
+			"worldgen: underwater cap fills its remainder with water (level %d, %s)" % [want_lvl, "water line" if cg + 1 == SEA else "submerged"])
 	# Open water: mat water + level 9 at SEA_LEVEL; the bare water id at SEA_LEVEL-1 (byte-identity).
 	var ow := _find_open_water(false)
 	if ow.x == 0x7fffffff:
@@ -3628,11 +3667,31 @@ func _test_water_shore() -> void:
 		var uncovered_shore := 0
 		var uw_surface_seen := 0
 		var shore_pairs_seen := 0
+		var uw_cap_wet_seen := 0                          # LEVEL-9 water-line cap composites (§3.6)
+		var uw_cap_dry_seen := 0                          # LEVEL-10 submerged cap composites (§3.6)
 		for dx in range(-150, 151, 3):
 			var x := c.x + dx
 			for dz in range(-150, 151, 3):
 				var z := c.y + dz
 				var g: int = TerrainConfig.height_at(x, z)
+				# Underwater CAP composites (WATER-SHORE §3.6): checked independently of the surface
+				# modifier — a flat cell beside a rising neighbour has cm != 0 with sm == 0. A cap at
+				# the water line (g == SEA-1) is a LEVEL-9 WET composite → its pair ∈ emitted_shore_pairs();
+				# a deeper cap (g < SEA-1) is a LEVEL-10 DRY composite → in the dry manifest.
+				if g < SEA and TerrainConfig.column_profile(x, z).w >= -0.55:
+					var cm := TerrainConfig.surface_cap_modifier(x, z)
+					if cm != 0:
+						var capmat := TerrainConfig.generated_block(x, g + 1, z)
+						if g + 1 == SEA:                     # water-line cap → LEVEL-9 wet composite
+							uw_cap_wet_seen += 1
+							if not shore_set.has(capmat * 256 + cm):
+								uncovered_shore += 1
+						else:                                # submerged cap → LEVEL-10 dry composite
+							uw_cap_dry_seen += 1
+							if not mat_set.has(capmat):
+								uncovered_mat += 1
+							if not mod_set.has(cm):
+								uncovered_mod += 1
 				var sm := TerrainConfig.surface_modifier(x, z)
 				if sm == 0:
 					continue
@@ -3647,10 +3706,11 @@ func _test_water_shore() -> void:
 					var slot := TerrainConfig.generated_block(x, g, z) * 256 + sm
 					if not shore_set.has(slot):
 						uncovered_shore += 1
+		print("    manifest: uw cap composites seen — %d wet (level 9), %d dry (level 10)" % [uw_cap_wet_seen, uw_cap_dry_seen])
 		_ok(uw_surface_seen > 0, "manifest: underwater surface sweep found shaped floor cells (%d)" % uw_surface_seen)
-		_ok(uncovered_mat == 0, "manifest: every underwater surface material ∈ appearance_surface_materials (gravel present) — %d uncovered" % uncovered_mat)
-		_ok(uncovered_mod == 0, "manifest: every underwater surface modifier ∈ emitted_modifiers — %d uncovered" % uncovered_mod)
-		_ok(uncovered_shore == 0, "manifest: every non-frozen shore pair ∈ emitted_shore_pairs (superset) — %d uncovered of %d seen" % [uncovered_shore, shore_pairs_seen])
+		_ok(uncovered_mat == 0, "manifest: every underwater surface/dry-cap material ∈ appearance_surface_materials (gravel present) — %d uncovered" % uncovered_mat)
+		_ok(uncovered_mod == 0, "manifest: every underwater surface/dry-cap modifier ∈ emitted_modifiers — %d uncovered" % uncovered_mod)
+		_ok(uncovered_shore == 0, "manifest: every non-frozen shore/water-line-cap pair ∈ emitted_shore_pairs (superset) — %d uncovered of %d surface + %d wet-cap seen" % [uncovered_shore, shore_pairs_seen, uw_cap_wet_seen])
 
 	# ---- item 8 (6): COLLIDER — underwater surface prisms + debris floats on water ---
 	var uwc := _find_open_water(true)   # a non-frozen open-water column that is ALSO smoothed
@@ -3709,9 +3769,30 @@ func _find_uw_smoothed() -> Vector2i:
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
 
-## The first OPEN-WATER column near the coast with at least one water cell above the floor
-## (g <= SEA_LEVEL-2), non-frozen. `must_be_smoothed` also requires a nonzero surface modifier
-## (a smoothed seafloor) — used by the collider sweep to exercise underwater surface prisms.
+## The first non-frozen UNDERWATER column near the coast that GROWS a cap (WATER-SHORE §3.6):
+## g < SEA_LEVEL with a nonzero surface_cap_modifier. Its cap cell at y=g+1 is a submerged (or, at
+## g==SEA_LEVEL-1, water-line) composite of the underwater-floor material. Non-frozen so the
+## water-line case carries a clean liquid overlay (a frozen water-line cap is the ice regime).
+func _find_uw_cap() -> Vector2i:
+	var c := TerrainConfig.find_coast()
+	for dx in range(-160, 161):
+		var x := c.x + dx
+		for dz in range(-160, 161):
+			var z := c.y + dz
+			if TerrainConfig.height_at(x, z) >= TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.column_profile(x, z).w < -0.55:
+				continue                                     # frozen: ice regime at the water line
+			if TerrainConfig.surface_cap_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first OPEN-WATER column near the coast with at least one CLEAR water cell above the floor
+## (g <= SEA_LEVEL-2), non-frozen, and NO smoothing cap growing on it (WATER-SHORE §3.6): a cap at
+## g+1 is a solid composite that would intercept both the SEA_LEVEL-1 byte-identity read and a
+## floor_under scan, so "open water" excludes it — the water column above the smoothed seafloor is
+## unobstructed. `must_be_smoothed` also requires a nonzero surface modifier (a smoothed seafloor) —
+## used by the collider sweep to exercise underwater surface prisms.
 func _find_open_water(must_be_smoothed: bool) -> Vector2i:
 	var c := TerrainConfig.find_coast()
 	for dx in range(-160, 161):
@@ -3723,6 +3804,8 @@ func _find_open_water(must_be_smoothed: bool) -> Vector2i:
 				continue
 			if TerrainConfig.column_profile(x, z).w < -0.55:
 				continue                                     # frozen: ICE cap, not open water
+			if TerrainConfig.surface_cap_modifier(x, z) != 0:
+				continue                                     # a cap would obstruct the clear water column
 			if must_be_smoothed and TerrainConfig.surface_modifier(x, z) == 0:
 				continue
 			return Vector2i(x, z)

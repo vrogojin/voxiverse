@@ -27,13 +27,7 @@ func _ready() -> void:
 	# for a temperate land column above the sea (WGC §8), then _find_flat picks the
 	# flattest spot near it. The physics/breaking sandbox is the deterministic
 	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
-	# DEMO OVERRIDE (multi-liquid): spawn at the lava coast (216, 383) — walkable land ~18
-	# blocks from the nearest molten sea — so the borderless-lava feature is visible on load
-	# instead of a ~458-block walk from the normal temperate spawn. The WORLD is unchanged;
-	# only the player's starting column differs. Revert by setting DEMO_SPAWN.x = 0x7fffffff
-	# (falls back to find_spawn()). find_spawn() itself is untouched (manifest/tests still use it).
-	const DEMO_SPAWN := Vector2i(216, 383)
-	var spawn := DEMO_SPAWN if DEMO_SPAWN.x != 0x7fffffff else TerrainConfig.find_spawn()
+	var spawn := TerrainConfig.find_spawn()
 	var col := _find_flat(spawn.x, spawn.y)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)

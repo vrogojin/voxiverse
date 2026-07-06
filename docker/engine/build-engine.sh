@@ -58,6 +58,30 @@ clone_pinned() {
 clone_pinned "https://github.com/godotengine/godot.git"      "${SRC}"       "${GODOT_REF}"
 clone_pinned "https://github.com/Zylann/godot_voxel.git"     "${VOXEL_DIR}" "${VOXEL_REF}"
 
+# ---------------------------------------------------------------------------
+# 1b. Apply in-repo patches to godot_voxel.
+#     clone_pinned() just did `git checkout -f <ref>` above, so the module tree
+#     is pristine — applying here is idempotent per run. A patch that fails to
+#     apply is FATAL: a silently-unpatched build is the #1 failure mode.
+#     Patches are mounted read-only at /patches (see scripts/build.sh).
+# ---------------------------------------------------------------------------
+PATCH_DIR=/patches/godot_voxel
+PATCHES_APPLIED=""
+if [ -d "${PATCH_DIR}" ]; then
+  shopt -s nullglob
+  for p in "${PATCH_DIR}"/*.patch; do
+    log "Applying godot_voxel patch: $(basename "${p}")"
+    if ! git -C "${VOXEL_DIR}" apply --whitespace=nowarn "${p}"; then
+      warn "FAILED to apply ${p} — refusing to build a silently-unpatched engine."
+      exit 1
+    fi
+    PATCHES_APPLIED="${PATCHES_APPLIED} $(basename "${p}"):$(sha256sum "${p}" | cut -d' ' -f1)"
+  done
+  shopt -u nullglob
+fi
+[ -z "${PATCHES_APPLIED}" ] && PATCHES_APPLIED=" (none)"
+log "godot_voxel patches:${PATCHES_APPLIED}"
+
 log "Toolchain versions"
 echo "  Godot ref     : ${GODOT_REF}   ($(git -C "${SRC}" rev-parse --short HEAD))"
 echo "  godot_voxel   : ${VOXEL_REF}   ($(git -C "${VOXEL_DIR}" rev-parse --short HEAD))"
@@ -156,6 +180,7 @@ fi
   echo "date            : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "godot_ref       : ${GODOT_REF} ($(git -C "${SRC}" rev-parse HEAD))"
   echo "godot_voxel_ref : ${VOXEL_REF} ($(git -C "${VOXEL_DIR}" rev-parse HEAD 2>/dev/null || echo n/a))"
+  echo "voxel_patches   :${PATCHES_APPLIED}"
   echo "emcc            : $(emcc --version | head -n1)"
   echo "module_in_web   : ${MODULE_IN_WEB}"
   echo "templates       : $(ls -1 "${OUT}/templates"/*.zip 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"

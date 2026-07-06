@@ -687,7 +687,11 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 					cstack.append(nc)
 		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
-			comp_ids[c] = cell_value_at(c)
+			# Strip the liquid overlay (WATER-SHORE §6): a detaching shore ramp must not
+			# take the ocean with it. The liquid axis is worldgen-only; mass/mesh key off
+			# mat/modifier and would ignore the bits, but the contract is "liquid never
+			# leaves worldgen", so we drop it at the VoxelBody capture boundary.
+			comp_ids[c] = CellCodec.strip_liquid(cell_value_at(c))
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)

@@ -41,6 +41,7 @@ func _initialize() -> void:
 	_test_materials()
 	_test_inventory()
 	_test_cell_codec()
+	_test_water_shore()
 	_test_shape_math()
 	_test_material_data()
 	_test_catalog_expansion()
@@ -48,6 +49,8 @@ func _initialize() -> void:
 	_test_world_loop()
 	_test_structural()
 	_test_shapes_live()
+	_test_fallback_water()
+	_test_waterlogging()
 	_test_metadata()
 	_test_zonechunk()
 	_test_dynamic_catalog()
@@ -237,9 +240,16 @@ func _test_worldgen() -> void:
 			if g >= SEA:
 				continue
 			found_ocean = true
-			# a cell in the water column (just under the surface) is water or ice...
-			var mid: int = TerrainConfig.generated_block(x, SEA - 1, z) if SEA - 1 > g else TerrainConfig.generated_block(x, g + 1, z)
-			if mid != WATER and mid != ICE:
+			# a cell in the water column (just under the surface) is water or ice — OR, where an
+			# underwater smoothing CAP grows there (WATER-SHORE §3.6), a shaped cap composite of the
+			# underwater-floor material (it fills its own remainder with water up to the water line, or
+			# is a bare ramp in the frozen regime). Only a PLAIN solid full cube would be a real
+			# "solid floating in the sea" bug.
+			var my: int = SEA - 1 if SEA - 1 > g else g + 1
+			var midv: int = TerrainConfig.generated_cell(x, my, z)
+			var mid: int = CellCodec.mat(midv)
+			var is_cap: bool = my == g + 1 and CellCodec.modifier(midv) != 0
+			if mid != WATER and mid != ICE and not is_cap:
 				sea_ok = false
 			# ...and there is no water ABOVE the sea surface.
 			if TerrainConfig.generated_block(x, SEA + 2, z) == WATER:
@@ -467,6 +477,7 @@ func _test_both_paths() -> void:
 		origins.append(shaped_block)
 	var mismatches := 0
 	var cells := 0
+	var liquid_cells := 0
 	var shaped_cells := 0
 	var uncovered := 0
 	for origin: Vector3i in origins:
@@ -482,9 +493,16 @@ func _test_both_paths() -> void:
 					var v: int = TerrainConfig.generated_cell(origin.x + lx, origin.y + ly, origin.z + lz)
 					var mat: int = CellCodec.mat(v)
 					var modifier: int = CellCodec.modifier(v)
-					var expected: int = int(mw.call("gen_arid_for", mat, modifier))
+					# WATER-SHORE §8 item 7: mirror the worker's LIQUID-AWARE resolve by passing the
+					# cell's liquid level — open-water surface cells (level 9, modifier 0) → the 0.9
+					# slab ARID, shore composites (level 9, modifier != 0) → their wet-model ARID, and
+					# submerged composites (level 10) / dry cells (level 0) → the dry resolve, exactly
+					# as gen_arid_for(mat, modifier, liquid_level) does on the worker (Stream B contract).
+					var expected: int = int(mw.call("gen_arid_for", mat, modifier, CellCodec.liquid_level(v)))
 					if got != expected:
 						mismatches += 1
+					if CellCodec.liquid_field(v) != 0:
+						liquid_cells += 1
 					if mat != BlockCatalog.AIR and modifier != 0:
 						shaped_cells += 1
 						if not bool(mw.call("is_manifest_baked", mat, modifier)):
@@ -502,7 +520,84 @@ func _test_both_paths() -> void:
 	buf2.call("create", 16, 16, 16)
 	gen.call("_generate_block", buf2, origins[0], 0)
 	_ok(int(mw.call("appearance_count")) == ac, "generator allocates/bakes NO ARID on the worker (count stable at %d)" % ac)
-	print("    both-path determinism checked %d cells (%d shaped)" % [cells, shaped_cells])
+	print("    both-path determinism checked %d cells (%d shaped, %d liquid-carrying)" % [cells, shaped_cells, liquid_cells])
+
+	# LIQUID-AWARE ARID MIRROR over COASTAL blocks. gen_arid_for(mat, modifier, liquid_level) mirrors
+	# the module worker's per-cell ARID: an open-water surface cell (level 9, modifier 0, water
+	# material) → the open-water surface model ARID (native: the pure fluid; legacy: the 0.9 slab);
+	# a shore composite (level 9, modifier != 0) → its water/twin model ARID; a submerged floor
+	# composite (level 10) → the waterlogged TWIN when native waterlogging is on (so it culls against
+	# the surrounding water — no border), else the DRY shape ARID. Drive the generator over 16³ blocks
+	# chosen to straddle the found coastline (surface + composites at y==0) and the smoothed seafloor
+	# (submerged composites below y==0), and assert TYPE == gen_arid_for(mat, modifier, level).
+	var WATER_ID := BlockCatalog.id_of(&"water")
+	var shore := _find_shore_composite()
+	var uw := _find_uw_smoothed()
+	var ow := _find_open_water(false)      # a non-frozen open-water column (its SEA_LEVEL cell = the 0.9 slab)
+	var coast_origins: Array[Vector3i] = []
+	var have_shore := shore.x != 0x7fffffff
+	var have_uw := uw.x != 0x7fffffff
+	var have_ow := ow.x != 0x7fffffff
+	if have_shore:
+		coast_origins.append(Vector3i(floori(shore.x / 16.0) * 16, floori(float(TerrainConfig.SEA_LEVEL) / 16.0) * 16, floori(shore.y / 16.0) * 16))
+	if have_uw:
+		var ug: int = TerrainConfig.height_at(uw.x, uw.y)
+		coast_origins.append(Vector3i(floori(uw.x / 16.0) * 16, floori(ug / 16.0) * 16, floori(uw.y / 16.0) * 16))
+	if have_ow:
+		# Drive an OPEN-WATER block too so the surface-water (level-9, modifier-0 slab) class is
+		# sampled reliably, not left to whether the shore block's ocean side happened to land in it.
+		coast_origins.append(Vector3i(floori(ow.x / 16.0) * 16, floori(float(TerrainConfig.SEA_LEVEL) / 16.0) * 16, floori(ow.y / 16.0) * 16))
+	if coast_origins.is_empty():
+		_ok(false, "both-path (coast): found a coastal block to drive the liquid-aware ARID mirror")
+	else:
+		var ac_coast: int = mw.call("appearance_count")
+		var slab_arid := int(mw.call("gen_arid_for", WATER_ID, 0, CellCodec.LIQ_LEVEL_SURFACE))
+		var w_mismatch := 0
+		var w_cells := 0
+		var surf_water_seen := 0
+		var composite_seen := 0
+		var submerged_seen := 0
+		for origin: Vector3i in coast_origins:
+			var buf: Object = ClassDB.instantiate("VoxelBuffer")
+			buf.call("create", 16, 16, 16)
+			if buf.has_method("fill"):
+				buf.call("fill", 0, ch)
+			gen.call("_generate_block", buf, origin, 0)
+			for lz in range(16):
+				for lx in range(16):
+					for ly in range(16):
+						var v: int = TerrainConfig.generated_cell(origin.x + lx, origin.y + ly, origin.z + lz)
+						var mat: int = CellCodec.mat(v)
+						if mat == BlockCatalog.AIR:
+							continue
+						var modifier: int = CellCodec.modifier(v)
+						var level: int = CellCodec.liquid_level(v)
+						var got: int = int(buf.call("get_voxel", lx, ly, lz, ch))
+						var expected: int = int(mw.call("gen_arid_for", mat, modifier, level))
+						if got != expected:
+							w_mismatch += 1
+						if level == CellCodec.LIQ_LEVEL_SURFACE:
+							if modifier == 0 and BlockCatalog.liquid_kind_of(mat) == CellCodec.LIQ_WATER:
+								surf_water_seen += 1
+								if got != slab_arid:                # open-water surface → water-slab ARID
+									w_mismatch += 1
+							else:
+								composite_seen += 1                 # shore composite → wet-model ARID
+						elif level == CellCodec.LIQ_LEVEL_FULL:
+							submerged_seen += 1                     # submerged floor composite → twin (native) / dry (legacy)
+						w_cells += 1
+		print("    both-path coast: %d cells (%d surface-water, %d composites, %d submerged)"
+			% [w_cells, surf_water_seen, composite_seen, submerged_seen])
+		_ok(w_mismatch == 0, "both-path (coast): module TYPE == gen_arid_for(mat, modifier, level) over %d coastal cells (%d mismatches)" % [w_cells, w_mismatch])
+		# Class coverage — each guarded by whether its source column was actually found, so an
+		# atypical coast under-samples honestly instead of a vacuous pass or a flaky false-fail.
+		if have_ow or have_shore:
+			_ok(surf_water_seen > 0, "both-path (coast): sampled open-water surface cells (level 9, water slab) — %d" % surf_water_seen)
+		if have_shore:
+			_ok(composite_seen > 0, "both-path (coast): sampled shore composite cells (level 9, modifier != 0, wet/twin model) — %d" % composite_seen)
+		if have_uw:
+			_ok(submerged_seen > 0, "both-path (coast): sampled submerged floor composite cells (level 10) — %d" % submerged_seen)
+		_ok(int(mw.call("appearance_count")) == ac_coast, "both-path (coast): wet/slab ARIDs are frozen at setup — driving coastal blocks bakes NO new ARID (count stable at %d)" % ac_coast)
 
 	# All-air early-outs (PERF): a block entirely ABOVE content and one entirely BELOW bedrock
 	# must generate ALL AIR via the cheap early-out (no column-profile pass) — verify the output
@@ -577,10 +672,12 @@ func _test_shape_memo() -> void:
 	if not TerrainConfig.SMOOTHING_ENABLED:
 		_ok(true, "smoothing OFF: shape memo returns 0 (no shapes) — skipped")
 		return
-	var s := TerrainConfig.find_spawn()
+	var s := TerrainConfig.find_coast()               # coast centre so the sweep spans below sea level (WATER-SHORE §3)
 	var exact := true
 	var shaped := 0
 	var checked := 0
+	var uw_cols := 0
+	var uw_caps_seen := 0                              # underwater columns that DO grow a cap (§3.6: underwater caps ON)
 	for dx in range(-160, 160, 3):
 		for dz in range(-160, 160, 3):
 			var x := s.x + dx
@@ -600,10 +697,16 @@ func _test_shape_memo() -> void:
 				exact = false
 			if memo_sm != 0 or memo_cm != 0:
 				shaped += 1
+			if g < TerrainConfig.SEA_LEVEL:
+				uw_cols += 1
+				if memo_cm != 0:                      # WATER-SHORE §3.6: underwater caps are now ON
+					uw_caps_seen += 1
 			checked += 1
 	_ok(checked > 0, "shape memo: sampled %d columns" % checked)
 	_ok(shaped > 0, "shape memo: sample includes shaped columns (%d) — memo exercised on real shapes" % shaped)
-	_ok(exact, "shape memo path == direct compute == generated_cell modifier over the whole sample (cache is exact)")
+	_ok(uw_cols > 0, "shape memo: coast sweep spans underwater columns (%d) — memo exercised below sea level" % uw_cols)
+	_ok(uw_caps_seen > 0, "shape memo: underwater columns CAN grow a cap (%d) — underwater caps ON (§3.6)" % uw_caps_seen)
+	_ok(exact, "shape memo path == direct compute == generated_cell modifier over the whole sample (incl. underwater caps — cache is exact)")
 
 	# Cost: the actual analytic surface query (generated_cell at y==g), memo-WARM, vs the direct
 	# 9-height_at corner-stencil recompute the memo removes from every moving-player probe.
@@ -641,18 +744,21 @@ func _test_smoothing() -> void:
 					det_ok = false
 	_ok(det_ok, "generated_cell (material + modifier) is deterministic on re-sample")
 
-	# (b) SMOOTHING ENGAGES over a wide land sweep; every surface modifier is a BOTTOM
-	# corner-height code (corners ≤ 2, anchor BOTTOM); the MATERIAL projection is unchanged
-	# (generated_block == mat, so smoothing minted no new material and no stackup shifts).
+	# (b) SMOOTHING ENGAGES over a wide sweep that now spans BOTH land and the underwater floor;
+	# every surface modifier is a BOTTOM corner-height code (corners ≤ 2, anchor BOTTOM); the
+	# MATERIAL projection is unchanged (generated_block == mat, so smoothing minted no new material
+	# and no stackup shifts). WATER-SHORE §3: underwater floor surface cells (g < SEA_LEVEL) now
+	# smooth too, and a smoothed one is a submerged composite carrying a FULL-fill water overlay
+	# (liquid WATER, level 10) — the old `g < SEA_LEVEL → modifier 0` suppression is gone.
 	var shaped := 0
+	var underwater_shaped := 0
 	var surface_cells := 0
 	var range_ok := true
 	var mat_ok := true
+	var uw_liquid_ok := true
 	for x in range(-400, 400, 3):
 		for z in range(-400, 400, 3):
 			var g: int = TerrainConfig.height_at(x, z)
-			if g < TerrainConfig.SEA_LEVEL:
-				continue
 			var v: int = TerrainConfig.generated_cell(x, g, z)
 			surface_cells += 1
 			if CellCodec.mat(v) != TerrainConfig.generated_block(x, g, z):
@@ -664,9 +770,17 @@ func _test_smoothing() -> void:
 				if c.x > 2 or c.y > 2 or c.z > 2 or c.w > 2 \
 						or ShapeCodec.anchor(modifier) != ShapeCodec.ANCHOR_BOTTOM:
 					range_ok = false
-	print("    surface sweep: %d land cells, %d shaped" % [surface_cells, shaped])
+				if g < TerrainConfig.SEA_LEVEL:
+					underwater_shaped += 1
+					# A smoothed underwater floor cell is a submerged composite: full-fill water.
+					if CellCodec.liquid_kind(v) != CellCodec.LIQ_WATER \
+							or CellCodec.liquid_level(v) != CellCodec.LIQ_LEVEL_FULL:
+						uw_liquid_ok = false
+	print("    surface sweep: %d cells, %d shaped (%d underwater)" % [surface_cells, shaped, underwater_shaped])
 	if TerrainConfig.SMOOTHING_ENABLED:
 		_ok(shaped > 0, "smoothing engages: at least one shaped surface cell over the sweep (%d)" % shaped)
+		_ok(underwater_shaped > 0, "underwater floor smoothing engages: shaped surface cells below sea level (%d)" % underwater_shaped)
+		_ok(uw_liquid_ok, "every smoothed underwater floor cell carries a full-fill water overlay (WATER, level 10)")
 	else:
 		_ok(shaped == 0, "smoothing OFF: no shaped surface cells over the sweep (%d)" % shaped)
 	_ok(range_ok, "every surface modifier is a BOTTOM corner-height code (corners ≤ 2)")
@@ -1345,7 +1459,18 @@ func _ref_col_heavy(world: WorldManager, cx: int, cz: int, center: Vector2i) -> 
 	while y <= y_top:
 		var v: int = world.cell_value_at(Vector3i(cx, y, cz))
 		var mat: int = CellCodec.mat(v)
-		if mat != BlockCatalog.AIR and CellCodec.modifier(v) != 0:
+		var modifier: int = CellCodec.modifier(v)
+		# The collider keeps UNDERWATER cap cells as full sea-fill BOXES — its cap-prism emission is
+		# land-only (ground_collider.gd:450, gated h >= SEA_LEVEL) because the player never stands
+		# underwater and debris floats on the sea fill. WATER-SHORE §3.6 grows the underwater cap in
+		# WORLDGEN (for RENDER), so cell_value_at(x, h+1, z) now carries a shaped composite; mirror
+		# the collider's conservative PHYSICS model here by coarsening a submerged generated cap
+		# (not a placed block) to sea fill (modifier 0 → box), so this heavy reference stays a faithful
+		# model of the UNCHANGED collider. (This is a test-model correction, not a collider change.)
+		if modifier != 0 and y == h + 1 and h < TerrainConfig.SEA_LEVEL \
+				and not world.placed_cells().has(Vector3i(cx, y, cz)):
+			modifier = 0
+		if mat != BlockCatalog.AIR and modifier != 0:
 			if run_start != 0x7fffffff:
 				boxes.append(Vector2(float(run_start), float(y)))
 				run_start = 0x7fffffff
@@ -2061,6 +2186,211 @@ func _test_world_loop() -> void:
 # area (zero overlap ⇒ detach). Worldgen is NOT smoothed here, so only player-placed
 # cells can be shaped — full-cube gameplay stays byte-identical (fenced by the P2/P4
 # byte-identity tests above).
+## WATER-SHORE §5.2 — the FALLBACK mesher's new _emit_water pass renders the sea (the module
+## path is the live/playable one; this is the safety net). The rest of the suite never meshes a
+## coastal or oceanic chunk, so the water quads and ice cubes are otherwise green-but-unproven.
+## Here we build REAL coastal + frozen chunks and inspect the returned ArrayMesh geometry — the
+## presence and exact 0.9 height are headlessly assertable (sort order / z-fight are manual QA).
+func _test_fallback_water() -> void:
+	print("[WATER-SHORE] fallback mesher water pass (_emit_water)")
+	var n := TerrainConfig.CHUNK_SIZE
+	var water_mat: Material = BlockMaterials.get_for(BlockCatalog.id_of(&"water"))
+	var ice_mat: Material = BlockMaterials.get_for(BlockCatalog.id_of(&"ice"))
+	var water_y := float(TerrainConfig.SEA_LEVEL) + TerrainConfig.WATER_SURFACE_HEIGHT
+	var world := _struct_world("WSFallback")
+
+	# (a) A coastal/open-water chunk emits a water surface, and EVERY water vertex sits exactly on
+	# the 0.9 plane — catches a missing pass, a wrong height, or stray water geometry anywhere.
+	var ow := _find_open_water(false)
+	if ow.x != 0x7fffffff:
+		var mesh := ChunkMesher.build(floori(float(ow.x) / float(n)), floori(float(ow.y) / float(n)), world)
+		var si := _mesh_surface_for(mesh, water_mat)
+		_ok(si >= 0, "fallback water: coastal chunk emits a water surface")
+		if si >= 0:
+			var verts: PackedVector3Array = mesh.surface_get_arrays(si)[Mesh.ARRAY_VERTEX]
+			var all_on_plane := verts.size() > 0
+			for v in verts:
+				if absf(v.y - water_y) >= 1.0e-4:
+					all_on_plane = false
+					break
+			_ok(all_on_plane, "fallback water: every water vertex is exactly at y == SEA_LEVEL + 0.9 (%.2f)" % water_y)
+
+	# (b) A frozen open-ocean chunk renders its sea-ice surface (this pass fixed it being invisible).
+	var cold := _find_cold_sea()
+	if cold.x != 0x7fffffff:
+		var mesh2 := ChunkMesher.build(floori(float(cold.x) / float(n)), floori(float(cold.y) / float(n)), world)
+		_ok(mesh2 != null and _mesh_surface_for(mesh2, ice_mat) >= 0,
+			"fallback water: frozen-ocean chunk renders a sea-ice surface")
+	world.queue_free()
+
+## Index of the ArrayMesh surface whose material == `mat`, or -1 (null-safe).
+func _mesh_surface_for(mesh: ArrayMesh, mat: Material) -> int:
+	if mesh == null:
+		return -1
+	for i in mesh.get_surface_count():
+		if mesh.surface_get_material(i) == mat:
+			return i
+	return -1
+
+# NATIVE WATERLOGGING (WATERLOGGING.md §4.8): the game wires godot_voxel's solid+fluid co-fill so
+# EVERY water cell — pure water, shore composites (liquid 9) AND submerged composites (liquid 10) —
+# shares ONE fluid_index and culls together, killing the shore/submerged border. This asserts the
+# wiring at the ARID layer (module-guarded; the built engine must expose the patched API):
+#   * the native API is present (VoxelBlockyModelFluid + set_waterlog_fluid);
+#   * pure deep water and surface water resolve to the SAME fluid ARID (no top seam);
+#   * for every emitted composite pair, the level-9 and level-10 resolves are the SAME waterlogged
+#     twin (all water shares one fluid, shore AND below) and that twin DIFFERS from the dry shape
+#     (the border-killer: submerged now waterlogs instead of drawing a dry ramp beside a water wall);
+#   * the twin manifest is frozen at setup (the worker never lazy-bakes).
+# On an OLD engine (no patch) the game keeps the legacy composite path — this reports and skips.
+func _test_waterlogging() -> void:
+	print("[WATERLOGGING] native solid+fluid co-fill wiring (WATERLOGGING.md §4)")
+	if not ClassDB.class_exists("VoxelTerrain") or not ClassDB.class_exists("VoxelBuffer"):
+		print("    (godot_voxel module absent — waterlogging wiring runs on module builds only)")
+		return
+	var have_fluid := ClassDB.class_exists("VoxelBlockyModelFluid")
+	var mesh_probe: Object = ClassDB.instantiate("VoxelBlockyModelMesh") if ClassDB.class_exists("VoxelBlockyModelMesh") else null
+	var have_waterlog: bool = mesh_probe != null and mesh_probe.has_method("set_waterlog_fluid")
+	if not (have_fluid and have_waterlog):
+		print("    (engine lacks native waterlogging API: VoxelBlockyModelFluid=%s set_waterlog_fluid=%s — legacy composite path, skipping)"
+			% [have_fluid, have_waterlog])
+		return
+	_ok(have_fluid, "waterlog: engine exposes VoxelBlockyModelFluid (pure-water fluid model)")
+	_ok(have_waterlog, "waterlog: a VoxelBlockyModelMesh instance has set_waterlog_fluid (co-fill API)")
+
+	var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+	get_root().add_child(mw)
+	var built: bool = mw.call("setup")
+	_ok(built, "waterlog: module world builds with native waterlogging enabled")
+	if not built:
+		mw.queue_free()
+		return
+
+	var WATER := BlockCatalog.id_of(&"water")
+	var S := CellCodec.LIQ_LEVEL_SURFACE
+	var F := CellCodec.LIQ_LEVEL_FULL
+
+	# (1) Pure water shares ONE model: deep (level 0) and surface (level 9) → the same fluid ARID.
+	var deep_water := int(mw.call("gen_arid_for", WATER, 0, 0))
+	var surf_water := int(mw.call("gen_arid_for", WATER, 0, S))
+	_ok(deep_water == surf_water,
+		"waterlog: deep water (lvl 0) and surface water (lvl 9) share ONE fluid ARID (%d == %d)" % [deep_water, surf_water])
+
+	# (2) Twin coverage + the border-killer invariant over every emitted composite pair.
+	var pairs := {}
+	for slot: int in TerrainConfig.emitted_shore_pairs():
+		pairs[slot] = true
+	for slot: int in TerrainConfig.emitted_submerged_pairs():
+		pairs[slot] = true
+	var checked := 0
+	var same_twin := 0
+	var covered := 0
+	for slot: int in pairs.keys():
+		var mat := slot / 256
+		var modifier := slot % 256
+		if mat <= BlockCatalog.AIR or mat >= BlockCatalog.count() or modifier <= 0:
+			continue
+		var t9 := int(mw.call("gen_arid_for", mat, modifier, S))
+		var t10 := int(mw.call("gen_arid_for", mat, modifier, F))
+		var dry := int(mw.call("gen_arid_for", mat, modifier, 0))
+		checked += 1
+		if t9 == t10:
+			same_twin += 1                          # shore & submerged share one twin (one fluid)
+		if t10 != dry:
+			covered += 1                            # a baked twin (unbaked pairs degrade to the dry shape)
+	_ok(checked > 0, "waterlog: emitted composite pairs to check (%d shore∪submerged)" % checked)
+	_ok(same_twin == checked,
+		"waterlog: level-9 and level-10 resolve to the SAME twin for every pair (%d/%d) — all water shares one fluid" % [same_twin, checked])
+	# The manifest bakes exactly this union, so coverage should be ~100%; require a strong majority so a
+	# wholesale bake failure is caught while a handful of degenerate pairs may fall back to the dry shape.
+	_ok(covered * 10 >= checked * 9,
+		"waterlog: >=90%% of emitted composite pairs have a baked waterlogged twin != dry shape (%d/%d)" % [covered, checked])
+	print("    waterlog twins: %d pairs checked, %d covered (twin != dry), %d share-one-fluid" % [checked, covered, same_twin])
+
+	# (3) A concrete submerged column resolves to its twin, not the dry ramp (the visible seafloor fix).
+	var uw := _find_uw_smoothed()
+	if uw.x != 0x7fffffff:
+		var ug: int = TerrainConfig.height_at(uw.x, uw.y)
+		var uc := TerrainConfig.generated_cell(uw.x, ug, uw.y)
+		var umat := CellCodec.mat(uc)
+		var umod := CellCodec.modifier(uc)
+		if umod != 0 and CellCodec.liquid_level(uc) == F:
+			var utwin := int(mw.call("gen_arid_for", umat, umod, F))
+			var udry := int(mw.call("gen_arid_for", umat, umod, 0))
+			_ok(utwin != udry,
+				"waterlog: a real submerged composite (mat %d, mod %d) maps to its waterlogged twin, not the dry ramp (twin %d != dry %d)" % [umat, umod, utwin, udry])
+	else:
+		print("    (no smoothed underwater column found near the coast — concrete submerged assert skipped)")
+
+	# (4) The twin/fluid ARIDs are FROZEN at setup — resolving them bakes nothing new.
+	var ac := int(mw.call("appearance_count"))
+	var _probe := int(mw.call("gen_arid_for", WATER, 0, S))
+	_ok(int(mw.call("appearance_count")) == ac, "waterlog: twin/fluid ARIDs frozen at setup (count stable at %d)" % ac)
+
+	# (5) MESH-LEVEL border-killer proof (durable regression guard): actually run the blocky mesher
+	# on a waterlogged twin beside pure water and assert the SHARED water face is CULLED (no border)
+	# while the terrain ramp is still emitted (no hole). (1)-(4) prove the WIRING; this proves the
+	# rendered geometry, so a future change can't silently reintroduce the border. Guarded to module
+	# builds that can mesh a VoxelBuffer headlessly; a differential over three meshes so it does not
+	# depend on exact fluid face counts (which vary with corner heights).
+	if ClassDB.class_exists("VoxelMesherBlocky"):
+		var lib: Object = mw.get("_library")
+		var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+		if lib != null and mesher != null and mesher.has_method("set_library") and mesher.has_method("build_mesh"):
+			mesher.call("set_library", lib)
+			var minp: int = mesher.call("get_minimum_padding")
+			var maxp: int = mesher.call("get_maximum_padding")
+			var water_mat: Object = BlockMaterials.get_for(WATER)
+			# Pick a real emitted composite pair that actually baked a twin (twin ARID != dry ARID).
+			var tmat := -1
+			var tmod := -1
+			for slot: int in pairs.keys():
+				var m := slot / 256
+				var md := slot % 256
+				if m > BlockCatalog.AIR and m < BlockCatalog.count() and md > 0 \
+						and int(mw.call("gen_arid_for", m, md, F)) != int(mw.call("gen_arid_for", m, md, 0)):
+					tmat = m
+					tmod = md
+					break
+			if tmat >= 0 and water_mat != null:
+				var terr_mat: Object = BlockMaterials.get_for(tmat)
+				var water_arid := int(mw.call("arid_for_cell", WATER))
+				var twin_arid := int(mw.call("arid_for_cell", CellCodec.pack(tmat, tmod, 0, CellCodec.make_liquid(CellCodec.LIQ_WATER, F))))
+				var b := minp + 1
+				var span := minp + maxp + 4
+				var mesh_verts := func(cells: Array) -> Array:
+					var buf: Object = ClassDB.instantiate("VoxelBuffer")
+					buf.call("set_channel_depth", 0, 1)          # CHANNEL_TYPE, DEPTH_16_BIT (ARIDs exceed 255)
+					buf.call("create", span, span, span)
+					buf.call("fill", 0, 0)                        # air
+					for c in cells:
+						var p: Vector3i = c[0]
+						buf.call("set_voxel", int(c[1]), p.x, p.y, p.z, 0)
+					var msh: Object = mesher.call("build_mesh", buf, [], {})
+					var wv := 0
+					var tv := 0
+					if msh != null:
+						for i in msh.get_surface_count():
+							var mm: Object = msh.surface_get_material(i)
+							var nn := (msh.surface_get_arrays(i)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+							if mm == water_mat:
+								wv += nn
+							elif mm == terr_mat:
+								tv += nn
+					return [wv, tv]
+				var ta: Array = mesh_verts.call([[Vector3i(b, b, b), twin_arid]])                                   # twin alone
+				var wa: Array = mesh_verts.call([[Vector3i(b, b, b), water_arid]])                                  # water alone
+				var tw: Array = mesh_verts.call([[Vector3i(b, b, b), twin_arid], [Vector3i(b + 1, b, b), water_arid]])  # adjacent
+				_ok(int(ta[1]) > 0, "waterlog-mesh: waterlogged twin renders its opaque terrain ramp — no hole (%d terrain verts)" % int(ta[1]))
+				_ok(int(ta[0]) > 0 and int(wa[0]) > 0, "waterlog-mesh: twin and water each render water faces in isolation (%d, %d)" % [int(ta[0]), int(wa[0])])
+				_ok(int(tw[0]) < int(ta[0]) + int(wa[0]),
+					"waterlog-mesh: shared twin↔water face is CULLED — borderless (combined %d < isolated sum %d)" % [int(tw[0]), int(ta[0]) + int(wa[0])])
+				print("    waterlog-mesh: twin(water=%d,terr=%d) water=%d twin+water=%d (<%d ⇒ border culled)"
+					% [int(ta[0]), int(ta[1]), int(wa[0]), int(tw[0]), int(ta[0]) + int(wa[0])])
+			else:
+				print("    (no baked twin pair or water material — mesh-level border proof skipped)")
+	mw.queue_free()
+
 func _test_shapes_live() -> void:
 	print("[P5b-1] sub-voxel shapes live (render ARIDs + analytic physics + dig/place)")
 	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # descending along +z: H(fx,fz) = 1 − fz
@@ -3257,3 +3587,399 @@ func _test_shader_prewarm() -> void:
 	_ok(done2[0], "prewarm: PHASE 2 finishes (no module → hold skipped; never hangs)")
 	_ok(pw2.live_mesh_instance_count() == 0, "prewarm: PHASE 2 tears the pile down on finish")
 	dummy.queue_free()
+
+# WATER-SHORE §8 (items 1–6 + collider 8) — composite water-over-terrain cells, the 0.9 water
+# surface, and underwater floor smoothing. The liquid axis (CellCodec bits 48..53) is a pure
+# render+sim overlay: no physics function reads it, and it is worldgen-only (player actions never
+# fabricate liquid bits). This test fences the codec, the generated-liquid rule, the physics
+# transparency of the axis, the manifest coverage, and the collider. Module-path ARID mirroring
+# (item 7) lives in _test_both_paths. (Item 5b ZoneChunk liquid round-trip is DEFERRED OUT of v1
+# per the doc's ORCHESTRATOR DEVIATION banner — liquid is never serialized, so it is not tested.)
+func _test_water_shore() -> void:
+	print("[WATER-SHORE] composite shore cells / 0.9 water surface / underwater floor smoothing")
+	var SEA: int = TerrainConfig.SEA_LEVEL
+	var WATER := BlockCatalog.id_of(&"water")
+	var ICE := BlockCatalog.id_of(&"ice")
+	var RAMP := ShapeCodec.make_modifier(2, 2, 0, 0)   # a real (wedge) modifier: a composite anchor
+	var W9 := CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE)
+
+	# ---- item 1: CODEC — pack/project round-trip + canonicalization -----------------
+	# Constant pin: WATER_SURFACE_HEIGHT (now 0.9375 = native fluid TOP_HEIGHT) still rounds to the
+	# water-line level (LIQ_LEVEL_SURFACE=9) in tenths, so the liquid-9 water-line encoding is intact.
+	_ok(roundi(TerrainConfig.WATER_SURFACE_HEIGHT * 10.0) == CellCodec.LIQ_LEVEL_SURFACE,
+		"codec: roundi(WATER_SURFACE_HEIGHT*10) == LIQ_LEVEL_SURFACE (%d) — 0.9375 rounds to level 9" % CellCodec.LIQ_LEVEL_SURFACE)
+
+	# pack/project round-trip over kinds × levels: the liquid FIELD projects back exactly and never
+	# perturbs the material/modifier/state axes (a solid host with a modifier, so nothing is stripped).
+	var rt_ok := true
+	var axes_ok := true
+	for k in range(0, 4):
+		for lvl in range(0, 16):
+			var field := CellCodec.make_liquid(k, lvl)
+			var v := CellCodec.pack(STONE, RAMP, 7, field)
+			if CellCodec.liquid_kind(v) != (k & CellCodec.LIQ_KIND_MASK) or CellCodec.liquid_level(v) != (lvl & 0xF) \
+					or CellCodec.liquid_field(v) != field:
+				rt_ok = false
+			if CellCodec.mat(v) != STONE or CellCodec.modifier(v) != RAMP or CellCodec.state(v) != 7:
+				axes_ok = false
+			if (v >> 54) != 0:                                   # bits 54..62 and bit 63 clear after pack
+				axes_ok = false
+	_ok(rt_ok, "codec: liquid pack/project round-trips over kinds × levels")
+	_ok(axes_ok, "codec: liquid field never perturbs mat/modifier/state; bits 54..63 == 0 after pack")
+	_ok(CellCodec.liquid_top(CellCodec.pack(STONE, RAMP, 0, W9)) == 0.9, "codec: liquid_top == level/10 (0.9 at level 9)")
+
+	# canonicalization rules (§2.3): each violation strips to the canonical form.
+	_ok(CellCodec.canonical(CellCodec.pack(BlockCatalog.AIR, 0, 0, W9)) == 0,
+		"codec canon: liquid on AIR → whole value 0 (rule 1)")
+	_ok(CellCodec.liquid_field(CellCodec.canonical(CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(0, 5)))) == 0,
+		"codec canon: kind 0 with a level → field 0 (rule 2)")
+	_ok(CellCodec.liquid_field(CellCodec.canonical(CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(CellCodec.LIQ_WATER, 0)))) == 0,
+		"codec canon: a kind with level 0 → field 0 (rule 3)")
+	# level > 10 clamps to 10 on a solid composite host (a modifier != 0 keeps liquid, rule 6).
+	_ok(CellCodec.liquid_level(CellCodec.canonical(CellCodec.pack(STONE, RAMP, 0, CellCodec.make_liquid(CellCodec.LIQ_WATER, 11)))) == CellCodec.LIQ_LEVEL_FULL,
+		"codec canon: level 11 clamps to 10 (rule 4)")
+	# (water, 10) on the water material → the bare water id (rule 5: no dual encoding of full water).
+	_ok(CellCodec.canonical(CellCodec.pack(WATER, 0, 0, CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_FULL))) == WATER,
+		"codec canon: (water,10) on water → bare water id (rule 5)")
+	# liquid on a solid FULL cube (modifier 0) strips (rule 6, waterlogged full cubes out of v1).
+	_ok(CellCodec.liquid_field(CellCodec.canonical(CellCodec.pack(STONE, 0, 0, W9))) == 0 \
+			and CellCodec.mat(CellCodec.canonical(CellCodec.pack(STONE, 0, 0, W9))) == STONE,
+		"codec canon: liquid on a solid full cube strips (rule 6), material kept")
+	# kind ≠ the non-solid host's own liquid identity strips (rule 5): kind 2 on the water material.
+	_ok(CellCodec.liquid_field(CellCodec.canonical(CellCodec.pack(WATER, 0, 0, CellCodec.make_liquid(2, 5)))) == 0,
+		"codec canon: liquid kind ≠ non-solid host identity strips (rule 5)")
+	# modifier-on-water STILL strips (the untouched non-solid-modifier invariant), while a matching
+	# WATER liquid at level 9 is KEPT — i.e. the open-water surface cell: bare water + liquid(WATER,9).
+	var wsurf := CellCodec.canonical(CellCodec.pack(WATER, RAMP, 0, W9))
+	_ok(CellCodec.modifier(wsurf) == 0, "codec canon: modifier on water STILL strips (untouched non-solid invariant)")
+	_ok(CellCodec.liquid_kind(wsurf) == CellCodec.LIQ_WATER and CellCodec.liquid_level(wsurf) == CellCodec.LIQ_LEVEL_SURFACE,
+		"codec canon: water-material + level-9 liquid is KEPT (the open-water surface cell)")
+	# is_plain false for any liquid-carrying value; strip_liquid is exact.
+	_ok(not CellCodec.is_plain(CellCodec.pack(STONE, 0, 0, W9)), "codec: is_plain false for a liquid-carrying value")
+	_ok(not CellCodec.is_plain(CellCodec.pack(WATER, 0, 0, W9)), "codec: is_plain false for the water-surface value")
+	_ok(CellCodec.strip_liquid(CellCodec.pack(STONE, RAMP, 5, W9)) == CellCodec.pack(STONE, RAMP, 5, 0),
+		"codec: strip_liquid clears ONLY the liquid field (mat/modifier/state kept)")
+	# PRESERVATION PIN (§2.2): canonical(with_liquid(valid composite)) keeps the field bit-exactly —
+	# guards the historical pack()/canonical() drops-bits-≥48 bug from regressing.
+	var comp := CellCodec.with_liquid(CellCodec.pack(GRASS, RAMP), CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE)
+	var comp_can := CellCodec.canonical(comp)
+	_ok(CellCodec.liquid_field(comp_can) == W9 and CellCodec.modifier(comp_can) == RAMP and CellCodec.mat(comp_can) == GRASS,
+		"codec: canonical(with_liquid(valid composite)) PRESERVES the liquid field (bits ≥48 not dropped)")
+
+	# ---- item 2: WORLDGEN — the composite exists ------------------------------------
+	var shore := _find_shore_composite()
+	if shore.x == 0x7fffffff:
+		_ok(false, "worldgen: found a non-frozen shore composite column (g == SEA_LEVEL, surface_modifier != 0)")
+	else:
+		var sc := TerrainConfig.generated_cell(shore.x, SEA, shore.y)
+		_ok(BlockCatalog.solidity_of(CellCodec.mat(sc)) >= 0.5, "worldgen: shore composite has a SOLID terrain material")
+		_ok(CellCodec.modifier(sc) != 0, "worldgen: shore composite carries a surface modifier (a shaped ramp)")
+		_ok(CellCodec.liquid_kind(sc) == CellCodec.LIQ_WATER and CellCodec.liquid_level(sc) == CellCodec.LIQ_LEVEL_SURFACE,
+			"worldgen: shore composite carries liquid(WATER, 9) — water to the 0.9 line")
+	# A smoothed underwater floor column → submerged composite carrying liquid(WATER, 10).
+	var uw := _find_uw_smoothed()
+	if uw.x == 0x7fffffff:
+		_ok(false, "worldgen: found a smoothed underwater floor column (g < SEA_LEVEL, surface_modifier != 0)")
+	else:
+		var ug: int = TerrainConfig.height_at(uw.x, uw.y)
+		var uc := TerrainConfig.generated_cell(uw.x, ug, uw.y)
+		_ok(CellCodec.modifier(uc) != 0, "worldgen: submerged floor composite is shaped (modifier != 0)")
+		_ok(CellCodec.liquid_kind(uc) == CellCodec.LIQ_WATER and CellCodec.liquid_level(uc) == CellCodec.LIQ_LEVEL_FULL,
+			"worldgen: submerged floor composite carries liquid(WATER, 10) — full-fill")
+	# A non-frozen underwater column that GROWS a cap (WATER-SHORE §3.6 — underwater caps ON): its
+	# cap cell at y=g+1 is a COMPOSITE of the UNDERWATER-FLOOR material (sand/gravel/red_sand/mud —
+	# NOT a land biome top), shaped, filling its remainder with water: level 9 when the cap sits
+	# exactly at the water line (g == SEA-1), else level 10 (submerged).
+	var uwcap := _find_uw_cap()
+	if uwcap.x == 0x7fffffff:
+		print("    (no non-frozen underwater cap column found near the coast — underwater-cap worldgen assert skipped)")
+	else:
+		var cg: int = TerrainConfig.height_at(uwcap.x, uwcap.y)
+		var capc := TerrainConfig.generated_cell(uwcap.x, cg + 1, uwcap.y)
+		var capmat := CellCodec.mat(capc)
+		var uw_mats := {
+			BlockCatalog.id_of(&"sand"): true, BlockCatalog.id_of(&"gravel"): true,
+			BlockCatalog.id_of(&"red_sand"): true, BlockCatalog.id_of(&"mud"): true,
+		}
+		_ok(CellCodec.modifier(capc) != 0, "worldgen: underwater cap cell (y=g+1) is shaped (modifier != 0)")
+		_ok(uw_mats.has(capmat),
+			"worldgen: underwater cap material is an underwater-floor material (sand/gravel/red_sand/mud), not a land biome-top")
+		var want_lvl: int = CellCodec.LIQ_LEVEL_SURFACE if cg + 1 == SEA else CellCodec.LIQ_LEVEL_FULL
+		_ok(CellCodec.liquid_kind(capc) == CellCodec.LIQ_WATER and CellCodec.liquid_level(capc) == want_lvl,
+			"worldgen: underwater cap fills its remainder with water (level %d, %s)" % [want_lvl, "water line" if cg + 1 == SEA else "submerged"])
+	# Open water: mat water + level 9 at SEA_LEVEL; the bare water id at SEA_LEVEL-1 (byte-identity).
+	var ow := _find_open_water(false)
+	if ow.x == 0x7fffffff:
+		_ok(false, "worldgen: found a non-frozen open-water column (g <= SEA_LEVEL-2)")
+	else:
+		var owg: int = TerrainConfig.height_at(ow.x, ow.y)
+		var surf := TerrainConfig.generated_cell(ow.x, SEA, ow.y)
+		_ok(CellCodec.mat(surf) == WATER and CellCodec.liquid_level(surf) == CellCodec.LIQ_LEVEL_SURFACE,
+			"worldgen: open water at SEA_LEVEL is the water material + liquid level 9")
+		_ok(TerrainConfig.generated_cell(ow.x, SEA - 1, ow.y) == WATER,
+			"worldgen: open water at SEA_LEVEL-1 is the BARE water id (deep-water byte-identity)")
+		# A deep flat floor cell is a bare id with no liquid — byte-identical to generated_block.
+		var floor_cell := TerrainConfig.generated_cell(ow.x, owg, ow.y)
+		if CellCodec.modifier(floor_cell) == 0:
+			_ok(CellCodec.liquid_field(floor_cell) == 0 and floor_cell == TerrainConfig.generated_block(ow.x, owg, ow.y),
+				"worldgen: a FLAT underwater floor cell is a bare id, liquid 0 (byte-identity)")
+	# Frozen ocean surface → ice, field 0; the sheet ends crisply (no liquid overlay).
+	var cold := _find_cold_sea()
+	if cold.x != 0x7fffffff:
+		var fc := TerrainConfig.generated_cell(cold.x, SEA, cold.y)
+		_ok(CellCodec.mat(fc) == ICE and CellCodec.liquid_field(fc) == 0,
+			"worldgen: frozen ocean surface is ICE with NO liquid overlay (crisp sheet)")
+	else:
+		_ok(false, "worldgen: found a cold sea column to fence the frozen-surface rule")
+	# Frozen smoothed shore (g == SEA_LEVEL, t < -0.55, modifier != 0) → bare ramp, field 0 (rare;
+	# assert only when the terrain provides one).
+	var fshore := _find_frozen_shore()
+	if fshore.x != 0x7fffffff:
+		var fsc := TerrainConfig.generated_cell(fshore.x, SEA, fshore.y)
+		_ok(CellCodec.modifier(fsc) != 0 and CellCodec.liquid_field(fsc) == 0,
+			"worldgen: a frozen smoothed shore cell is a bare ramp with NO liquid overlay")
+	else:
+		print("    (no frozen smoothed shore column found near origin — frozen-shore worldgen assert skipped)")
+
+	# ---- item 3: underwater smoothing ENGAGES & AGREES ------------------------------
+	var c := TerrainConfig.find_coast()
+	var uw_sm_seen := 0
+	var agree_ok := true
+	var det_ok := true
+	for dx in range(-150, 151, 3):
+		var x := c.x + dx
+		for dz in range(-150, 151, 3):
+			var z := c.y + dz
+			var g: int = TerrainConfig.height_at(x, z)
+			if g >= SEA:
+				continue
+			var v := TerrainConfig.generated_cell(x, g, z)
+			# surface_modifier(x,z) == modifier(generated_cell) below sea level too (§3.4).
+			if TerrainConfig.surface_modifier(x, z) != CellCodec.modifier(v):
+				agree_ok = false
+			# determinism INCLUDING the liquid bits (48+): a full-int re-sample is identical.
+			if v != TerrainConfig.generated_cell(x, g, z):
+				det_ok = false
+			if CellCodec.modifier(v) != 0:
+				uw_sm_seen += 1
+	_ok(uw_sm_seen > 0, "smoothing: an ocean-crossing sweep has underwater smoothed columns (%d)" % uw_sm_seen)
+	_ok(agree_ok, "smoothing: surface_modifier(x,z) == modifier(generated_cell(x,g,z)) for underwater columns")
+	_ok(det_ok, "smoothing: generated_cell (incl. liquid bits 48+) is deterministic on re-sample")
+
+	# ---- item 4: PHYSICS through water (the axis is invisible to physics) -----------
+	var pw: WorldManager = _struct_world("WaterPhysics")
+	if shore.x != 0x7fffffff:
+		var sm := TerrainConfig.surface_modifier(shore.x, shore.y)
+		var fx := float(shore.x) + 0.5
+		var fz := float(shore.y) + 0.5
+		var expect_top := float(SEA) + ShapeCodec.local_top(sm, 0.5, 0.5)
+		# floor_under stands on the terrain RAMP inside the composite cell (the water is not floor).
+		var fu := pw.floor_under(fx, fz, float(SEA) + 3.0)
+		_ok(is_equal_approx(fu, expect_top),
+			"physics: floor_under over a composite == g + local_top(sm) = %.3f (got %.3f)" % [expect_top, fu])
+		# wading the shore ramp is not blocked (open air/water above the ramp surface).
+		_ok(pw.blocked(fx, fz, expect_top + 0.05) == false, "physics: blocked() false wading the shore ramp")
+		# a ray straight down hits the composite's ramp IN-CELL (not the water overlay), UP normal.
+		var hit := pw.aimed_voxel(Vector3(fx, float(SEA) + 4.0, fz), Vector3(0, -1, 0), 16.0)
+		_ok(hit.get("hit", false) and hit["voxel"] == Vector3i(shore.x, SEA, shore.y) and hit["normal"] == Vector3i.UP,
+			"physics: aimed_voxel from above hits the composite ramp cell (through the water)")
+		# breaking the composite returns its TERRAIN material and leaves the cell dry air.
+		var mat_here := TerrainConfig.generated_block(shore.x, SEA, shore.y)
+		var broke := pw.break_terrain(Vector3i(shore.x, SEA, shore.y), Vector3.INF)
+		_ok(broke == mat_here, "physics: break_terrain on a composite returns the terrain material (%d)" % mat_here)
+		_ok(pw.block_id_at(Vector3i(shore.x, SEA, shore.y)) == 0 and pw.cell_value_at(Vector3i(shore.x, SEA, shore.y)) == 0,
+			"physics: the broken composite cell is dry air (overlay 0, no liquid)")
+		# a scripted break/place loop never writes a liquid-carrying overlay value (worldgen-only axis).
+		pw.place_block(Vector3i(shore.x, SEA, shore.y), STONE)
+		pw.break_terrain(Vector3i(shore.x, SEA, shore.y), Vector3.INF)
+		pw.place_block(Vector3i(shore.x, SEA, shore.y), GRASS)
+		var no_liquid := true
+		for ev: int in pw._edits.values():
+			if CellCodec.liquid_field(ev) != 0:
+				no_liquid = false
+		_ok(no_liquid, "physics: after a scripted break/place loop, _edits carries NO liquid value (worldgen-only)")
+	# floor_under over open water reaches the smoothed seafloor (water is waded through).
+	if ow.x != 0x7fffffff:
+		var owg: int = TerrainConfig.height_at(ow.x, ow.y)
+		var ow_sm := TerrainConfig.surface_modifier(ow.x, ow.y)
+		var owf := pw.floor_under(float(ow.x) + 0.5, float(ow.y) + 0.5, float(SEA) + 3.0)
+		_ok(owf < float(SEA), "physics: floor_under falls THROUGH open water (below the water line, got %.3f)" % owf)
+		_ok(is_equal_approx(owf, float(owg) + ShapeCodec.local_top(ow_sm, 0.5, 0.5)),
+			"physics: floor_under over open water reaches the smoothed seafloor (g + local_top)")
+	pw.queue_free()
+
+	# ---- item 5: MANIFEST coverage --------------------------------------------------
+	# Every (mat, modifier) an underwater surface sweep emits is covered by the dry manifest sets
+	# (gravel now in appearance_surface_materials); every non-frozen shore-emitted pair ∈
+	# emitted_shore_pairs() (superset language, mirroring the existing emitted-modifiers assert).
+	if TerrainConfig.SMOOTHING_ENABLED:
+		var mat_set := {}
+		for m: int in TerrainConfig.appearance_surface_materials():
+			mat_set[m] = true
+		var mod_set := {}
+		for m: int in TerrainConfig.emitted_modifiers():
+			mod_set[m] = true
+		var shore_set := {}
+		for s: int in TerrainConfig.emitted_shore_pairs():
+			shore_set[s] = true
+		var uncovered_mat := 0
+		var uncovered_mod := 0
+		var uncovered_shore := 0
+		var uw_surface_seen := 0
+		var shore_pairs_seen := 0
+		var uw_cap_wet_seen := 0                          # LEVEL-9 water-line cap composites (§3.6)
+		var uw_cap_dry_seen := 0                          # LEVEL-10 submerged cap composites (§3.6)
+		for dx in range(-150, 151, 3):
+			var x := c.x + dx
+			for dz in range(-150, 151, 3):
+				var z := c.y + dz
+				var g: int = TerrainConfig.height_at(x, z)
+				# Underwater CAP composites (WATER-SHORE §3.6): checked independently of the surface
+				# modifier — a flat cell beside a rising neighbour has cm != 0 with sm == 0. A cap at
+				# the water line (g == SEA-1) is a LEVEL-9 WET composite → its pair ∈ emitted_shore_pairs();
+				# a deeper cap (g < SEA-1) is a LEVEL-10 DRY composite → in the dry manifest.
+				if g < SEA and TerrainConfig.column_profile(x, z).w >= -0.55:
+					var cm := TerrainConfig.surface_cap_modifier(x, z)
+					if cm != 0:
+						var capmat := TerrainConfig.generated_block(x, g + 1, z)
+						if g + 1 == SEA:                     # water-line cap → LEVEL-9 wet composite
+							uw_cap_wet_seen += 1
+							if not shore_set.has(capmat * 256 + cm):
+								uncovered_shore += 1
+						else:                                # submerged cap → LEVEL-10 dry composite
+							uw_cap_dry_seen += 1
+							if not mat_set.has(capmat):
+								uncovered_mat += 1
+							if not mod_set.has(cm):
+								uncovered_mod += 1
+				var sm := TerrainConfig.surface_modifier(x, z)
+				if sm == 0:
+					continue
+				if g < SEA:                                  # underwater floor surface cell
+					uw_surface_seen += 1
+					if not mat_set.has(TerrainConfig.generated_block(x, g, z)):
+						uncovered_mat += 1
+					if not mod_set.has(sm):
+						uncovered_mod += 1
+				elif g == SEA and TerrainConfig.column_profile(x, z).w >= -0.55:   # non-frozen shore composite
+					shore_pairs_seen += 1
+					var slot := TerrainConfig.generated_block(x, g, z) * 256 + sm
+					if not shore_set.has(slot):
+						uncovered_shore += 1
+		print("    manifest: uw cap composites seen — %d wet (level 9), %d dry (level 10)" % [uw_cap_wet_seen, uw_cap_dry_seen])
+		_ok(uw_surface_seen > 0, "manifest: underwater surface sweep found shaped floor cells (%d)" % uw_surface_seen)
+		_ok(uncovered_mat == 0, "manifest: every underwater surface/dry-cap material ∈ appearance_surface_materials (gravel present) — %d uncovered" % uncovered_mat)
+		_ok(uncovered_mod == 0, "manifest: every underwater surface/dry-cap modifier ∈ emitted_modifiers — %d uncovered" % uncovered_mod)
+		_ok(uncovered_shore == 0, "manifest: every non-frozen shore/water-line-cap pair ∈ emitted_shore_pairs (superset) — %d uncovered of %d surface + %d wet-cap seen" % [uncovered_shore, shore_pairs_seen, uw_cap_wet_seen])
+
+	# ---- item 8 (6): COLLIDER — underwater surface prisms + debris floats on water ---
+	var uwc := _find_open_water(true)   # a non-frozen open-water column that is ALSO smoothed
+	if uwc.x == 0x7fffffff:
+		print("    (no non-frozen smoothed underwater column found — collider water sweep skipped)")
+	else:
+		var cw: WorldManager = _struct_world("WaterCollider")
+		var gc := GroundCollider.new()
+		get_root().add_child(gc)
+		gc.setup(cw)
+		VoxelBody.spawn_loose(cw, {Vector3i(uwc.x, SEA + 20, uwc.y): STONE}, cw)   # active-body gate
+		var center := Vector3(float(uwc.x) + 0.5, float(SEA) + 20.0, float(uwc.y) + 0.5)
+		gc.update(center)
+		_settle_collider(gc, center)
+		var act := _collider_col(gc.active_rid(), uwc.x, uwc.y)
+		var ref := _ref_col_heavy(cw, uwc.x, uwc.y, Vector2i(uwc.x, uwc.y))
+		_ok(_cols_equal(act, ref), "collider: underwater column shapes == heavy-path reference (byte-identical incl. surface prism)")
+		var uwg: int = TerrainConfig.height_at(uwc.x, uwc.y)
+		_ok((act["prisms"] as Array).has(uwg), "collider: the smoothed underwater floor emits a surface PRISM at g=%d" % uwg)
+		# loose-debris-floats-on-water: the sea fill emits a box whose top is the SEA_LEVEL+1 surface.
+		var floats := false
+		for bx: Vector2 in act["boxes"]:
+			if absf(bx.y - float(SEA + 1)) < 0.001:
+				floats = true
+		_ok(floats, "collider: loose debris floats on water (sea-fill box tops out at SEA_LEVEL+1)")
+		gc.queue_free()
+		cw.queue_free()
+
+## The first non-frozen SHORE COMPOSITE column near the coast: g == SEA_LEVEL with a nonzero
+## surface modifier (a shaped water-line cell). Scans the find_coast()-centred region.
+func _find_shore_composite() -> Vector2i:
+	var c := TerrainConfig.find_coast()
+	for dx in range(-160, 161):
+		var x := c.x + dx
+		for dz in range(-160, 161):
+			var z := c.y + dz
+			if TerrainConfig.height_at(x, z) != TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.column_profile(x, z).w < -0.55:
+				continue                                     # frozen shore: ice regime (no composite)
+			if TerrainConfig.surface_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first smoothed UNDERWATER FLOOR column near the coast: g < SEA_LEVEL with a nonzero
+## surface modifier (a submerged composite).
+func _find_uw_smoothed() -> Vector2i:
+	var c := TerrainConfig.find_coast()
+	for dx in range(-160, 161):
+		var x := c.x + dx
+		for dz in range(-160, 161):
+			var z := c.y + dz
+			if TerrainConfig.height_at(x, z) >= TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.surface_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first non-frozen UNDERWATER column near the coast that GROWS a cap (WATER-SHORE §3.6):
+## g < SEA_LEVEL with a nonzero surface_cap_modifier. Its cap cell at y=g+1 is a submerged (or, at
+## g==SEA_LEVEL-1, water-line) composite of the underwater-floor material. Non-frozen so the
+## water-line case carries a clean liquid overlay (a frozen water-line cap is the ice regime).
+func _find_uw_cap() -> Vector2i:
+	var c := TerrainConfig.find_coast()
+	for dx in range(-160, 161):
+		var x := c.x + dx
+		for dz in range(-160, 161):
+			var z := c.y + dz
+			if TerrainConfig.height_at(x, z) >= TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.column_profile(x, z).w < -0.55:
+				continue                                     # frozen: ice regime at the water line
+			if TerrainConfig.surface_cap_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first OPEN-WATER column near the coast with at least one CLEAR water cell above the floor
+## (g <= SEA_LEVEL-2), non-frozen, and NO smoothing cap growing on it (WATER-SHORE §3.6): a cap at
+## g+1 is a solid composite that would intercept both the SEA_LEVEL-1 byte-identity read and a
+## floor_under scan, so "open water" excludes it — the water column above the smoothed seafloor is
+## unobstructed. `must_be_smoothed` also requires a nonzero surface modifier (a smoothed seafloor) —
+## used by the collider sweep to exercise underwater surface prisms.
+func _find_open_water(must_be_smoothed: bool) -> Vector2i:
+	var c := TerrainConfig.find_coast()
+	for dx in range(-160, 161):
+		var x := c.x + dx
+		for dz in range(-160, 161):
+			var z := c.y + dz
+			var g: int = TerrainConfig.height_at(x, z)
+			if g > TerrainConfig.SEA_LEVEL - 2:
+				continue
+			if TerrainConfig.column_profile(x, z).w < -0.55:
+				continue                                     # frozen: ICE cap, not open water
+			if TerrainConfig.surface_cap_modifier(x, z) != 0:
+				continue                                     # a cap would obstruct the clear water column
+			if must_be_smoothed and TerrainConfig.surface_modifier(x, z) == 0:
+				continue
+			return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## The first FROZEN smoothed shore column (g == SEA_LEVEL, t < -0.55, surface_modifier != 0), or
+## the (0x7fffffff, _) sentinel — a wide outward scan (frozen beaches are rare).
+func _find_frozen_shore() -> Vector2i:
+	for x in range(-1200, 1200, 7):
+		for z in range(-1200, 1200, 11):
+			if TerrainConfig.height_at(x, z) != TerrainConfig.SEA_LEVEL:
+				continue
+			if TerrainConfig.column_profile(x, z).w >= -0.55:
+				continue
+			if TerrainConfig.surface_modifier(x, z) != 0:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)

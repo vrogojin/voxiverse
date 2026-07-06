@@ -63,6 +63,7 @@ static var _defs: Array[VoxelMaterialDef] = []      # LRID -> owning material de
 static var _status: PackedByteArray = PackedByteArray()     # LRID -> RESOLVED | UNRESOLVED
 static var _by_key: Dictionary = {}                 # "<gmid>#<state>" -> int LRID (reverse index)
 static var _id_by_name: Dictionary = {}             # StringName -> int (name AND alias -> LRID)
+static var _water_lrid := -1                        # cached id_of(&"water") for liquid_kind_of (WATER-SHORE §2.4)
 
 ## Idempotent; preallocates the table and registers the bootstrap set from blocks.json
 ## (main thread). Safe to call from SurfaceModel.ensure_ready() / module_world.setup()
@@ -121,6 +122,7 @@ static func reset_session() -> void:
 ## again (RMS §6.1).
 static func _init_table() -> void:
 	_count = 0
+	_water_lrid = -1                                # re-resolve per session (LRIDs may differ, RMS §2.6)
 	_by_key.clear()
 	_id_by_name.clear()
 	_states.resize(CAPACITY)
@@ -400,6 +402,16 @@ static func is_solid_id(block_id: int) -> bool:
 static func solidity_of(block_id: int) -> float:
 	var s := state_of(block_id)
 	return s.solidity if s != null else 0.0
+
+## Liquid identity of a material (WATER-SHORE §2.4): CellCodec.LIQ_WATER for the water
+## material, LIQ_NONE otherwise. CellCodec._canonical_liquid uses this to gate which liquid
+## kind a non-solid host may legally carry. The water LRID is resolved once per session
+## (name-keyed, matching how TerrainConfig caches _ID_WATER); a data-driven "liquid_kind"
+## key in blocks.json is a future nicety.
+static func liquid_kind_of(block_id: int) -> int:
+	if _water_lrid == -1:
+		_water_lrid = id_of(&"water")               # -1 if water is absent (fallback core)
+	return CellCodec.LIQ_WATER if _water_lrid > 0 and block_id == _water_lrid else CellCodec.LIQ_NONE
 
 ## Render cull-group / transparency index (WGC §5.1, INTEGRATION-DECISIONS §3):
 ## 0 = fully opaque, higher = more transparent. Mapped 1:1 onto the godot_voxel blocky

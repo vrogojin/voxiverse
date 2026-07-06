@@ -58,6 +58,7 @@ docker run --rm \
   -v "${CACHE_DIR}:/work" \
   -v "${TEMPLATES_DIR}:/out/templates" \
   -v "${BIN_DIR}:/out/bin" \
+  -v "${ENGINE_DIR}/patches:/patches:ro" \
   "${ENGINE_IMAGE}"
 
 echo

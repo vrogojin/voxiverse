@@ -1,0 +1,536 @@
+diff --git a/meshers/blocky/blocky_baked_library.h b/meshers/blocky/blocky_baked_library.h
+index 065d303..7766a3b 100644
+--- a/meshers/blocky/blocky_baked_library.h
++++ b/meshers/blocky/blocky_baked_library.h
+@@ -126,6 +126,12 @@ struct BakedModel {
+ 	bool cutout_sides_enabled = false;
+ 	uint8_t fluid_index = NULL_FLUID_INDEX;
+ 	uint8_t fluid_level;
++	// Waterlogging: model has BOTH regular (solid) surfaces AND a fluid.
++	// When true, fluid_index/fluid_level describe the fluid co-filling this voxel.
++	bool waterlogged = false;
++	// Transparency index used for the FLUID faces' visibility test. The model's own
++	// transparency_index describes the (opaque) solid part.
++	uint8_t fluid_transparency_index = 0;
+ 	bool lod_skirts;
+ 
+ 	uint32_t box_collision_mask;
+@@ -134,6 +140,13 @@ struct BakedModel {
+ 	inline void clear() {
+ 		model.clear();
+ 		empty = true;
++		// Stock only resets `model` and `empty`, leaving fluid state stale across
++		// re-bakes (baked models are reused). Reset it so waterlogging is correct
++		// when a model slot changes class between bakes.
++		fluid_index = NULL_FLUID_INDEX;
++		fluid_level = 0;
++		waterlogged = false;
++		fluid_transparency_index = 0;
+ 	}
+ };
+ 
+@@ -182,6 +195,11 @@ struct BakedLibrary {
+ 
+ 	unsigned int indexed_materials_count = 0;
+ 
++	// Index of the all-set 32x32 side pattern (the "full face" pattern). Used as the
++	// fluid's side pattern in the waterlogged fluid pass so its faces cull like a full
++	// cube. NULL_INDEX (0xFFFFFFFF) when unset / not needed.
++	uint32_t full_side_pattern_index = 0xFFFFFFFF;
++
+ 	inline bool has_model(uint32_t i) const {
+ 		return i < models.size();
+ 	}
+diff --git a/meshers/blocky/blocky_fluids_meshing_impl.h b/meshers/blocky/blocky_fluids_meshing_impl.h
+index b6e4afd..25c1699 100644
+--- a/meshers/blocky/blocky_fluids_meshing_impl.h
++++ b/meshers/blocky/blocky_fluids_meshing_impl.h
+@@ -386,8 +386,13 @@ bool generate_fluid_model(
+ 	}
+ 
+ 	if (fluid_top_covered) {
+-		// Expected to be empty, but also provides material ID. Not great tho
+-		out_model_surfaces = to_span(voxel.model.surfaces);
++		// Provide the fluid material through an EMPTY surface. Using voxel.model.surfaces
++		// here (stock) would re-emit the SOLID's geometry for waterlogged models — their
++		// surfaces are not empty — causing double-draw / z-fighting. fluid_top_surface was
++		// cleared above (no geometry); give it the fluid material id.
++		fluid_top_surface.material_id = fluid.material_id;
++		fluid_top_surface.collision_enabled = false;
++		out_model_surfaces = to_single_element_span(fluid_top_surface);
+ 	} else {
+ 		out_model_surfaces = to_single_element_span(fluid_top_surface);
+ 	}
+diff --git a/meshers/blocky/voxel_blocky_library_base.cpp b/meshers/blocky/voxel_blocky_library_base.cpp
+index 50b8fa6..76498a3 100644
+--- a/meshers/blocky/voxel_blocky_library_base.cpp
++++ b/meshers/blocky/voxel_blocky_library_base.cpp
+@@ -708,8 +708,10 @@ void generate_side_culling_matrix(BakedLibrary &baked_data) {
+ 		for (uint16_t side = 0; side < Cube::SIDE_COUNT; ++side) {
+ 			std::bitset<RASTER_SIZE * RASTER_SIZE> bitmap;
+ 
+-			if (model_data.fluid_index != VoxelBlockyModel::NULL_FLUID_INDEX) {
++			if (model_data.fluid_index != VoxelBlockyModel::NULL_FLUID_INDEX && !model_data.waterlogged) {
+ 				// Fluids don't have per-model static geometry, but their culling rules are still similar to a cube.
++				// (Waterlogged models fall into the `else` branch: their side patterns are their SOLID geometry,
++				// so neighbours cull against the opaque solid, never the water. This keeps terrain hole-free.)
+ 				// There is never a side on the top, it's either slightly lower (not on the side) or culled by
+ 				// neighboring water. But we still need to fill bits as if there was one, otherwise the bottom of water
+ 				// voxels would not get culled when stacked with other water voxels
+@@ -767,6 +769,28 @@ void generate_side_culling_matrix(BakedLibrary &baked_data) {
+ 		} // side
+ 	} // type
+ 
++	// Persist the full-face pattern index so the waterlogged fluid pass can reference it.
++	baked_data.full_side_pattern_index = full_side_pattern_index;
++	// If no model produced the full pattern but some model is waterlogged, append one so the
++	// fluid pass has a valid full-face pattern to cull against (patterns are deduplicated, so
++	// in practice a full cube or pure fluid already created it — this is a safety net).
++	if (full_side_pattern_index == VoxelBlockyLibraryBase::NULL_INDEX) {
++		bool any_waterlogged = false;
++		for (const BakedModel &m : baked_data.models) {
++			if (m.waterlogged) {
++				any_waterlogged = true;
++				break;
++			}
++		}
++		if (any_waterlogged) {
++			full_side_pattern_index = patterns.size();
++			Pattern full_pattern;
++			full_pattern.bitmap.set();
++			patterns.push_back(full_pattern);
++			baked_data.full_side_pattern_index = full_side_pattern_index;
++		}
++	}
++
+ 	// Find which pattern occludes which
+ 
+ 	baked_data.side_pattern_count = patterns.size();
+diff --git a/meshers/blocky/voxel_blocky_model.cpp b/meshers/blocky/voxel_blocky_model.cpp
+index c3509d7..3d1bbbc 100644
+--- a/meshers/blocky/voxel_blocky_model.cpp
++++ b/meshers/blocky/voxel_blocky_model.cpp
+@@ -7,6 +7,7 @@
+ #include "../../util/godot/core/string.h"
+ #include "../../util/math/conv.h"
+ #include "../../util/string/format.h"
++#include "../../constants/voxel_string_names.h"
+ #include "blocky_material_indexer.h"
+ #include "blocky_model_baking_context.h"
+ #include "voxel_blocky_library.h"
+@@ -15,6 +16,7 @@
+ #include "voxel_mesher_blocky.h"
+ 
+ #include "voxel_blocky_model_cube.h"
++#include "voxel_blocky_model_fluid.h"
+ 
+ namespace zylann::voxel {
+ 
+@@ -204,6 +206,52 @@ bool VoxelBlockyModel::get_lod_skirts_enabled() const {
+ 	return _lod_skirts;
+ }
+ 
++void VoxelBlockyModel::set_waterlog_fluid(Ref<VoxelBlockyFluid> fluid) {
++	if (fluid == _waterlog_fluid) {
++		return;
++	}
++	if (_waterlog_fluid.is_valid()) {
++		_waterlog_fluid->disconnect(
++				VoxelStringNames::get_singleton().changed,
++				callable_mp(this, &VoxelBlockyModel::_on_waterlog_fluid_changed)
++		);
++	}
++	_waterlog_fluid = fluid;
++	if (_waterlog_fluid.is_valid()) {
++		_waterlog_fluid->connect(
++				VoxelStringNames::get_singleton().changed,
++				callable_mp(this, &VoxelBlockyModel::_on_waterlog_fluid_changed)
++		);
++	}
++	emit_changed();
++}
++
++Ref<VoxelBlockyFluid> VoxelBlockyModel::get_waterlog_fluid() const {
++	return _waterlog_fluid;
++}
++
++void VoxelBlockyModel::set_waterlog_level(int level) {
++	_waterlog_level = math::clamp(level, 0, VoxelBlockyModelFluid::MAX_LEVELS - 1);
++	emit_changed();
++}
++
++int VoxelBlockyModel::get_waterlog_level() const {
++	return _waterlog_level;
++}
++
++void VoxelBlockyModel::set_waterlog_fluid_transparency_index(int i) {
++	_waterlog_fluid_transparency_index = math::clamp(i, 0, 255);
++	emit_changed();
++}
++
++int VoxelBlockyModel::get_waterlog_fluid_transparency_index() const {
++	return _waterlog_fluid_transparency_index;
++}
++
++void VoxelBlockyModel::_on_waterlog_fluid_changed() {
++	emit_changed();
++}
++
+ void VoxelBlockyModel::set_surface_count(unsigned int new_count) {
+ 	if (new_count != _surface_count) {
+ 		_surface_count = new_count;
+@@ -261,6 +309,22 @@ void VoxelBlockyModel::bake(blocky::ModelBakingContext &ctx) const {
+ 			surface.collision_enabled = surface_params.collision_enabled;
+ 		}
+ 	}
++
++	// Waterlogging: a non-empty solid model can additionally carry a fluid so a single voxel
++	// renders both. Feature-detected game-side; stock models leave _waterlog_fluid null and are
++	// unaffected (waterlogged stays false).
++	if (_waterlog_fluid.is_valid() && !baked_data.empty) {
++		const uint8_t fluid_index =
++				blocky::get_or_register_fluid(_waterlog_fluid, ctx.indexed_fluids, ctx.baked_fluids);
++		if (fluid_index != blocky::NULL_FLUID_INDEX) {
++			baked_data.fluid_index = fluid_index;
++			baked_data.fluid_level = _waterlog_level;
++			baked_data.waterlogged = true;
++			baked_data.fluid_transparency_index = _waterlog_fluid_transparency_index;
++			blocky::BakedFluid &bf = ctx.baked_fluids[fluid_index];
++			bf.max_level = math::max(static_cast<uint8_t>(_waterlog_level), bf.max_level);
++		}
++	}
+ }
+ 
+ TypedArray<AABB> VoxelBlockyModel::_b_get_collision_aabbs() const {
+@@ -341,6 +405,10 @@ void VoxelBlockyModel::copy_base_properties_from(const VoxelBlockyModel &src) {
+ 	_color = src._color;
+ 	_collision_aabbs = src._collision_aabbs;
+ 	_collision_mask = src._collision_mask;
++	// Waterlog fields (Ref copied without re-wiring the `changed` signal, like material overrides).
++	_waterlog_fluid = src._waterlog_fluid;
++	_waterlog_level = src._waterlog_level;
++	_waterlog_fluid_transparency_index = src._waterlog_fluid_transparency_index;
+ }
+ 
+ Ref<Mesh> VoxelBlockyModel::get_preview_mesh() const {
+@@ -608,6 +676,19 @@ void VoxelBlockyModel::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_lod_skirts_enabled", "enabled"), &VoxelBlockyModel::set_lod_skirts_enabled);
+ 	ClassDB::bind_method(D_METHOD("get_lod_skirts_enabled"), &VoxelBlockyModel::get_lod_skirts_enabled);
+ 
++	ClassDB::bind_method(D_METHOD("set_waterlog_fluid", "fluid"), &VoxelBlockyModel::set_waterlog_fluid);
++	ClassDB::bind_method(D_METHOD("get_waterlog_fluid"), &VoxelBlockyModel::get_waterlog_fluid);
++	ClassDB::bind_method(D_METHOD("set_waterlog_level", "level"), &VoxelBlockyModel::set_waterlog_level);
++	ClassDB::bind_method(D_METHOD("get_waterlog_level"), &VoxelBlockyModel::get_waterlog_level);
++	ClassDB::bind_method(
++			D_METHOD("set_waterlog_fluid_transparency_index", "i"),
++			&VoxelBlockyModel::set_waterlog_fluid_transparency_index
++	);
++	ClassDB::bind_method(
++			D_METHOD("get_waterlog_fluid_transparency_index"),
++			&VoxelBlockyModel::get_waterlog_fluid_transparency_index
++	);
++
+ 	// TODO Update to StringName in Godot 4
+ 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "color"), "set_color", "get_color");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "transparency_index"), "set_transparency_index", "get_transparency_index");
+@@ -634,6 +715,25 @@ void VoxelBlockyModel::_bind_methods() {
+ 			"get_collision_mask"
+ 	);
+ 
++	ADD_GROUP("Waterlog", "waterlog_");
++
++	ADD_PROPERTY(
++			PropertyInfo(
++					Variant::OBJECT,
++					"waterlog_fluid",
++					PROPERTY_HINT_RESOURCE_TYPE,
++					VoxelBlockyFluid::get_class_static()
++			),
++			"set_waterlog_fluid",
++			"get_waterlog_fluid"
++	);
++	ADD_PROPERTY(PropertyInfo(Variant::INT, "waterlog_level"), "set_waterlog_level", "get_waterlog_level");
++	ADD_PROPERTY(
++			PropertyInfo(Variant::INT, "waterlog_fluid_transparency_index"),
++			"set_waterlog_fluid_transparency_index",
++			"get_waterlog_fluid_transparency_index"
++	);
++
+ 	// Note: rotation property is currently exposed only in derived classes.
+ 	// It will not necessarily be supported by all derived classes.
+ 
+diff --git a/meshers/blocky/voxel_blocky_model.h b/meshers/blocky/voxel_blocky_model.h
+index 13a9e7c..1e3392a 100644
+--- a/meshers/blocky/voxel_blocky_model.h
++++ b/meshers/blocky/voxel_blocky_model.h
+@@ -11,6 +11,7 @@
+ #include "../../util/math/vector2f.h"
+ #include "../../util/math/vector3f.h"
+ #include "blocky_baked_library.h"
++#include "voxel_blocky_fluid.h"
+ 
+ namespace zylann::voxel {
+ 
+@@ -90,6 +91,18 @@ public:
+ 	void set_lod_skirts_enabled(bool rt);
+ 	bool get_lod_skirts_enabled() const;
+ 
++	// Waterlogging: a regular (non-empty) model can additionally carry a fluid, so a single
++	// voxel renders BOTH an opaque solid and water (borderless, culling against neighbouring
++	// water). Assigning a null fluid disables it (stock behaviour). Covers Mesh and Cube models.
++	void set_waterlog_fluid(Ref<VoxelBlockyFluid> fluid);
++	Ref<VoxelBlockyFluid> get_waterlog_fluid() const;
++	void set_waterlog_level(int level);
++	int get_waterlog_level() const;
++	// Transparency index the FLUID faces compare against neighbours (the solid uses the regular
++	// transparency_index). Typically the water cull group.
++	void set_waterlog_fluid_transparency_index(int i);
++	int get_waterlog_fluid_transparency_index() const;
++
+ 	//------------------------------------------
+ 	// Properties for internal usage only
+ 
+@@ -145,6 +158,8 @@ protected:
+ private:
+ 	static void _bind_methods();
+ 
++	void _on_waterlog_fluid_changed();
++
+ 	TypedArray<AABB> _b_get_collision_aabbs() const;
+ 	void _b_set_collision_aabbs(TypedArray<AABB> array);
+ 	void _b_rotate_90(Vector3i::Axis axis, bool clockwise);
+@@ -179,6 +194,11 @@ private:
+ 
+ 	bool _lod_skirts = true;
+ 
++	// Waterlogging (null fluid = not waterlogged).
++	Ref<VoxelBlockyFluid> _waterlog_fluid;
++	uint8_t _waterlog_level = 0;
++	uint8_t _waterlog_fluid_transparency_index = 1;
++
+ 	Color _color;
+ 
+ 	LegacyProperties _legacy_properties;
+diff --git a/meshers/blocky/voxel_blocky_model_fluid.cpp b/meshers/blocky/voxel_blocky_model_fluid.cpp
+index 8678392..525eac0 100644
+--- a/meshers/blocky/voxel_blocky_model_fluid.cpp
++++ b/meshers/blocky/voxel_blocky_model_fluid.cpp
+@@ -92,6 +92,34 @@ Ref<Mesh> VoxelBlockyModelFluid::get_preview_mesh() const {
+ 
+ namespace blocky {
+ 
++uint8_t get_or_register_fluid(
++		const Ref<VoxelBlockyFluid> &fluid,
++		StdVector<Ref<VoxelBlockyFluid>> &indexed_fluids,
++		StdVector<BakedFluid> &baked_fluids
++) {
++	if (fluid.is_null()) {
++		return NULL_FLUID_INDEX;
++	}
++
++	size_t fluid_index;
++	if (!find(indexed_fluids, fluid, fluid_index)) {
++		fluid_index = indexed_fluids.size();
++
++		if (fluid_index >= VoxelBlockyLibraryBase::MAX_FLUIDS) {
++			ZN_PRINT_ERROR("Reached maximum fluids");
++			return NULL_FLUID_INDEX;
++		}
++
++		indexed_fluids.push_back(fluid);
++	}
++
++	if (fluid_index >= baked_fluids.size()) {
++		baked_fluids.resize(fluid_index + 1);
++	}
++
++	return static_cast<uint8_t>(fluid_index);
++}
++
+ void bake_fluid_model(
+ 		const VoxelBlockyModelFluid &fluid_model,
+ 		BakedModel &baked_model,
+@@ -108,25 +136,14 @@ void bake_fluid_model(
+ 		return;
+ 	}
+ 
+-	size_t fluid_index;
+-	if (!find(indexed_fluids, fluid, fluid_index)) {
+-		fluid_index = indexed_fluids.size();
+-
+-		if (fluid_index >= VoxelBlockyLibraryBase::MAX_FLUIDS) {
+-			ZN_PRINT_ERROR("Reached maximum fluids");
+-			return;
+-		}
+-
+-		indexed_fluids.push_back(fluid);
++	const uint8_t fluid_index = get_or_register_fluid(fluid, indexed_fluids, baked_fluids);
++	if (fluid_index == NULL_FLUID_INDEX) {
++		return;
+ 	}
+ 
+ 	baked_model.fluid_index = fluid_index;
+ 	baked_model.empty = false;
+ 
+-	if (fluid_index >= baked_fluids.size()) {
+-		baked_fluids.resize(fluid_index + 1);
+-	}
+-
+ 	BakedFluid &baked_fluid = baked_fluids[fluid_index];
+ 
+ 	// TODO Allow more than one model with the same level?
+diff --git a/meshers/blocky/voxel_blocky_model_fluid.h b/meshers/blocky/voxel_blocky_model_fluid.h
+index e4e6928..ea9b1d8 100644
+--- a/meshers/blocky/voxel_blocky_model_fluid.h
++++ b/meshers/blocky/voxel_blocky_model_fluid.h
+@@ -39,6 +39,19 @@ private:
+ 	unsigned int _level = 0;
+ };
+ 
++namespace blocky {
++
++// Find-or-append a fluid into the baking context's indexed fluids, resizing baked_fluids to match.
++// Returns the fluid index, or NULL_FLUID_INDEX on failure (null fluid or fluid limit reached).
++// Shared by pure-fluid baking and waterlogged-model baking so both use one registration path.
++uint8_t get_or_register_fluid(
++		const Ref<VoxelBlockyFluid> &fluid,
++		StdVector<Ref<VoxelBlockyFluid>> &indexed_fluids,
++		StdVector<BakedFluid> &baked_fluids
++);
++
++} // namespace blocky
++
+ } // namespace zylann::voxel
+ 
+ #endif // VOXEL_BLOCKY_MODEL_FLUID_H
+diff --git a/meshers/blocky/voxel_mesher_blocky.cpp b/meshers/blocky/voxel_mesher_blocky.cpp
+index 6ec8c05..5f047ce 100644
+--- a/meshers/blocky/voxel_mesher_blocky.cpp
++++ b/meshers/blocky/voxel_mesher_blocky.cpp
+@@ -143,8 +143,9 @@ void generate_mesh(
+ 				const BakedModel &voxel = library.models[voxel_id];
+ 				const BakedModel::Model &model = voxel.model;
+ 
+-				// Calculate visibility of sides
+-				uint32_t visible_sides_mask = 0;
++				// Calculate visibility of sides (this is the SOLID mask; the fluid pass of a
++				// waterlogged voxel recomputes its own mask independently below).
++				uint32_t solid_visible_sides_mask = 0;
+ 				for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
+ 					if ((model.empty_sides_mask & (1 << side)) != 0) {
+ 						// This side is empty
+@@ -156,6 +157,17 @@ void generate_mesh(
+ 					// Invalid voxels are treated like air
+ 					if (neighbor_voxel_id < library.models.size()) {
+ 						const BakedModel &other_vt = library.models[neighbor_voxel_id];
++
++						// Same-fluid short-circuit (pure fluids only): a fluid voxel's faces are never
++						// drawn against a neighbour carrying the same fluid — INCLUDING waterlogged
++						// neighbours, whose side patterns describe their solid, not their water. A
++						// waterlogged voxel's own solid faces must NOT be affected here (its fluid runs
++						// in the dedicated pass below), hence the !voxel.waterlogged guard.
++						if (voxel.fluid_index != NULL_FLUID_INDEX && !voxel.waterlogged &&
++								other_vt.fluid_index == voxel.fluid_index) {
++							continue;
++						}
++
+ 						if (!is_face_visible_regardless_of_shape(voxel, other_vt)) {
+ 							// Visibility depends on the shape
+ 							if (!is_face_visible_according_to_shape(library, voxel, other_vt, side)) {
+@@ -165,9 +177,17 @@ void generate_mesh(
+ 						}
+ 					}
+ 
+-					visible_sides_mask |= (1 << side);
++					solid_visible_sides_mask |= (1 << side);
+ 				}
+ 
++				// Waterlogged voxels render BOTH their solid (pass 0) and a fluid (pass 1).
++				// Regular models and pure fluids run a single pass. The long emission block
++				// below is unchanged; it is merely wrapped in this pass loop, reading the
++				// per-pass locals `model_surface_count`, `model_surfaces`, `model_sides_surfaces`
++				// and `visible_sides_mask`.
++				const bool waterlogged = voxel.waterlogged;
++				const int pass_count = waterlogged ? 2 : 1;
++				for (int pass = 0; pass < pass_count; ++pass) {
+ 				uint8_t model_surface_count = model.surface_count;
+ 
+ 				Span<const BakedModel::Surface> model_surfaces = to_span(model.surfaces);
+@@ -175,10 +195,47 @@ void generate_mesh(
+ 				const FixedArray<FixedArray<BakedModel::SideSurface, MAX_SURFACES>, Cube::SIDE_COUNT>
+ 						*model_sides_surfaces = &model.sides_surfaces;
+ 
++				// Pass 0 uses the solid mask; the fluid pass overrides it below.
++				uint32_t visible_sides_mask = solid_visible_sides_mask;
++
+ 				// Hybrid approach: extract cube faces and decimate those that aren't visible,
+ 				// and still allow voxels to have geometry that is not a cube.
+ 
+-				if (voxel.fluid_index != NULL_FLUID_INDEX) {
++				// Fluid pass: the sole pass for a pure fluid, or pass 1 for a waterlogged model.
++				if (pass == 1 || (voxel.fluid_index != NULL_FLUID_INDEX && !waterlogged)) {
++					if (pass == 1) {
++						// Compute the FLUID visibility mask independently of the solid's patterns
++						// and empty-sides. The fluid presents the full-face pattern; its top is
++						// generated inside generate_fluid_model, so it is skipped here (like the
++						// baked fluid's empty top side).
++						visible_sides_mask = 0;
++						for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
++							if (side == Cube::SIDE_POSITIVE_Y) {
++								continue;
++							}
++							const uint32_t nid = type_buffer[voxel_index + side_neighbor_lut[side]];
++							if (nid < library.models.size()) {
++								const BakedModel &other = library.models[nid];
++								if (other.fluid_index == voxel.fluid_index) {
++									// Borderless rule: same fluid never draws a shared face.
++									continue;
++								}
++								if (!(other.empty ||
++											other.transparency_index > voxel.fluid_transparency_index ||
++											!other.culls_neighbors)) {
++									const unsigned int ai = library.full_side_pattern_index;
++									if (ai != VoxelBlockyLibraryBase::NULL_INDEX) {
++										const unsigned int bi =
++												other.model.side_pattern_indices[Cube::g_opposite_side[side]];
++										if (ai == bi || library.get_side_pattern_occlusion(bi, ai)) {
++											continue;
++										}
++									}
++								}
++							}
++							visible_sides_mask |= (1 << side);
++						}
++					}
+ 					if (!generate_fluid_model(
+ 								voxel,
+ 								type_buffer,
+@@ -191,6 +248,8 @@ void generate_mesh(
+ 								model_surfaces,
+ 								model_sides_surfaces
+ 						)) {
++						// Ocean-interior fast path: skip only the fluid pass (pass 0 solid, if
++						// any, was already emitted for waterlogged voxels).
+ 						continue;
+ 					}
+ 					model_surface_count = 1;
+@@ -207,8 +266,9 @@ void generate_mesh(
+ 					const FixedArray<BakedModel::SideSurface, MAX_SURFACES> *side_surfaces =
+ 							&((*model_sides_surfaces)[side]);
+ 
+-					// Might be only partially visible
+-					if (voxel.cutout_sides_enabled) {
++					// Might be only partially visible.
++					// Cutouts belong to the solid (pass 0); fluids never cut.
++					if (pass == 0 && voxel.cutout_sides_enabled) {
+ 						const uint32_t neighbor_voxel_id = type_buffer[voxel_index + side_neighbor_lut[side]];
+ 
+ 						// Invalid voxels are treated like air
+@@ -469,6 +529,7 @@ void generate_mesh(
+ 
+ 					index_offset += vertex_count;
+ 				}
++				} // pass loop (solid pass 0, fluid pass 1 for waterlogged)
+ 			}
+ 		}
+ 	}

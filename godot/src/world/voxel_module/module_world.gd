@@ -50,6 +50,42 @@ var _next_arid := 0                     # next free library model index / ARID t
 const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
+
+# --- water appearance (WATER-SHORE §4.2 / WATERLOGGING §4) ----------------------
+# Two frozen publications baked at setup (same discipline as `_gen_arid`), BEFORE the
+# generator is wired, so the worker only reads them (zero allocation, race-free):
+#   * `_gen_wet_arid` — the WATERLOGGED-TWIN model for each co-filled (surface material,
+#     modifier) composite pair worldgen emits, keyed `mat * _GEN_STRIDE + modifier`. Two
+#     engine-dependent flavours:
+#       - NATIVE WATERLOGGING (WATERLOGGING.md, `_waterlog_enabled`): a VoxelBlockyModelMesh
+#         of the DRY terrain ramp that ADDITIONALLY carries the shared fluid (set_waterlog_*),
+#         so its water culls seamlessly against every other water cell (pure and composite,
+#         shore AND submerged) — no border. ONE twin per shape covers BOTH the water-line
+#         (liquid 9) and submerged (liquid 10) composites (the engine picks the fill height
+#         from the cell above), so BOTH route here.
+#       - LEGACY composite (old engine): the WET COMPOSITE model (terrain ramp + a 0.9 water
+#         slab surface) as before — used only at the water line (liquid 9); submerged stays dry.
+#     A slot left -1 (unbaked pair) falls back to the DRY shaped model then the cube — a
+#     notch/border, never a hole.
+#   * `_water_surface_arid` — the open-water surface cell's model ARID. Native: the water LRID's
+#     PURE FLUID model (== `_cube_arid[water]`); legacy: the ONE 0.9 water-slab model. -1 falls
+#     back to the water cube ARID (wrong water top only, never a hole).
+# The legacy wet fill is modifier-INDEPENDENT (WATER-SHORE §4.3), so its ArrayMesh is shared
+# across materials via `_shape_mesh_cache` keyed `modifier | _WET_MESH_FLAG`. The native twin
+# instead REUSES the dry `_shape_mesh_cache[modifier]` ArrayMesh directly (its solid IS the dry
+# ramp), so no water-shape mesh multiplier at all.
+var _gen_wet_arid: PackedInt32Array      # (mat*_GEN_STRIDE + modifier) -> wet/twin ARID; -1 = not baked
+var _water_surface_arid := -1            # open-water surface cell model ARID; -1 = not baked
+var _water_id := -1                      # cached BlockCatalog.id_of(&"water") (main thread)
+const _WET_MESH_FLAG := 1 << 20          # _shape_mesh_cache key bit for LEGACY wet composite meshes
+# --- NATIVE WATERLOGGING (WATERLOGGING.md §4) ----------------------------------
+# Feature-detected in setup(): true when the running engine exposes godot_voxel's native
+# solid+fluid co-fill (VoxelBlockyModelFluid + VoxelBlockyModel.set_waterlog_fluid). When true,
+# pure water renders as a VoxelBlockyModelFluid and every co-filled composite as a waterlogged
+# twin, so all water shares ONE fluid_index and culls together (no shore/submerged border). When
+# false (old binary), the LEGACY slab+wet-composite path below is used unchanged (graceful degrade).
+var _waterlog_enabled := false
+var _water_fluid: Object = null          # the ONE shared VoxelBlockyFluid (water material); null unless enabled
 # One shared ArrayMesh per shape modifier, reused across every material (geometry
 # depends only on the modifier). Keeps the manifest's mesh RESOURCES at distinct-shape
 # count (<=79) instead of materials×shapes (474) — the material differs only via the
@@ -69,6 +105,17 @@ func setup() -> bool:
 	SurfaceModel.ensure_ready()
 	BlockCatalog.ensure_ready()
 	TerrainConfig.warm_up()
+
+	# Feature-detect native waterlogging (WATERLOGGING.md §4). When present, build the ONE shared
+	# VoxelBlockyFluid NOW — before _configure_library (which turns the water LRID into a pure fluid
+	# model referencing it) and _build_gen_manifest (which bakes waterlogged twins referencing it).
+	# On any instantiate failure we fall back to the legacy composite path (never a crash).
+	_waterlog_enabled = _detect_waterlog()
+	if _waterlog_enabled:
+		_water_fluid = _make_water_fluid()
+		if _water_fluid == null:
+			_waterlog_enabled = false
+	print("[module_world] native waterlogging: %s" % ("ENABLED" if _waterlog_enabled else "absent (legacy composite path)"))
 
 	var library: Object = ClassDB.instantiate("VoxelBlockyLibrary")
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
@@ -137,7 +184,7 @@ func set_cell(cell: Vector3i, packed: int) -> void:
 	var vt: Object = _terrain.call("get_voxel_tool")
 	if vt == null:
 		return
-	var arid := arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
+	var arid := arid_for_cell(packed)
 	# VoxelBuffer.CHANNEL_TYPE == 0; VoxelTool.MODE_SET == 0 (default).
 	_set_if(vt, "channel", 0)
 	_set_if(vt, "mode", 0)
@@ -210,6 +257,40 @@ func _seeded_block_buffer(bs: int, bpos: Vector3i, vt: Object) -> Object:
 		var origin: Vector3i = _terrain.call("data_block_to_voxel", bpos)
 		vt.call("copy", origin, buf, 1 << 0)         # channels mask: TYPE only
 	return buf
+
+## Resolve a full PACKED cell value → ARID, honouring the WATER-SHORE liquid rule (§4.6).
+## A liquid-9 value (the water line) consults the frozen water tables first —
+## `_water_surface_arid` for the open-water surface cell (modifier 0), the wet composite ARID
+## for a shore composite (modifier != 0) — then falls through to the DRY resolve (`arid_for`)
+## when the water model was not baked (graceful: water cube / dry shape, never a hole).
+## Liquid-10 (submerged) resolves to the SAME waterlogged twin as its liquid-9 sibling when
+## native waterlogging is enabled (so submerged water culls seamlessly — the last underwater
+## border); on a legacy engine it falls through to the dry resolve. Player edits never produce liquid values
+## (placement rejects non-solid materials, break writes 0), so this is worldgen-mirror only.
+func arid_for_cell(packed: int) -> int:
+	var lvl := CellCodec.liquid_level(packed)
+	if lvl == CellCodec.LIQ_LEVEL_SURFACE:
+		var mat := CellCodec.mat(packed)
+		var modifier := CellCodec.modifier(packed)
+		if modifier == 0:
+			if _water_surface_arid >= 0:
+				return _water_surface_arid                 # else fall through: water cube via arid_for
+		else:
+			var wslot := mat * _GEN_STRIDE + modifier
+			if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+				return _gen_wet_arid[wslot]                # else fall through: dry shape via arid_for
+	elif _waterlog_enabled and lvl == CellCodec.LIQ_LEVEL_FULL:
+		# Native waterlogging (WATERLOGGING §4.5): a SUBMERGED composite (liquid 10, modifier != 0)
+		# resolves to the SAME waterlogged twin as its water-line (liquid 9) sibling, so submerged
+		# water culls seamlessly against the surrounding water cubes/composites — the last underwater
+		# border. -1 (unbaked) falls through to the dry shape (a border, never a hole).
+		var mat := CellCodec.mat(packed)
+		var modifier := CellCodec.modifier(packed)
+		if modifier != 0:
+			var wslot := mat * _GEN_STRIDE + modifier
+			if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+				return _gen_wet_arid[wslot]
+	return arid_for(CellCodec.mat(packed), CellCodec.modifier(packed))
 
 ## Resolve (LRID, modifier) → ARID, allocating a shaped ARID lazily (MAIN THREAD).
 ## AIR → 0; a full cube → the eager cube ARID; a shaped value appends a
@@ -331,18 +412,139 @@ func _build_gen_manifest(library: Object) -> void:
 			_next_arid += 1
 			_gen_arid[mat * _GEN_STRIDE + modifier] = got
 			appended += 1
+
+	# Water models: NATIVE waterlogged twins (WATERLOGGING §4) or LEGACY wet composites + slab
+	# (WATER-SHORE §4.2). Same anti-drift discipline (add_model() == expected ARID); any drift aborts
+	# the water manifest (leaving -1 / cube fallback) but keeps the dry manifest intact.
+	var wet := _build_wet_manifest(library, total)
+	appended += wet
+
 	if appended > 0 and library.has_method("bake"):
-		library.call("bake")                             # one batched bake for the whole manifest
+		library.call("bake")                             # one batched bake: dry shapes + water models
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
-		% [appended, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+		% [appended - wet, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+	if _waterlog_enabled:
+		print("[module_world] baked waterlog manifest: %d waterlogged composite twins + pure-fluid water (surface ARID=%d)"
+			% [wet, _water_surface_arid])
+	else:
+		print("[module_world] baked water manifest: %d wet shore composites + %d water slab (slab ARID=%d)"
+			% [wet - (1 if _water_surface_arid >= 0 else 0), 1 if _water_surface_arid >= 0 else 0, _water_surface_arid])
+
+## Bake the water appearance into `_gen_wet_arid` + `_water_surface_arid`, appending (but NOT
+## baking — the caller does one batched bake) to `library`. Returns the number of models appended.
+## Each append asserts `add_model()` returns the expected ARID (anti-drift); a drift aborts,
+## leaving the rest -1 (graceful dry-shape/cube fallback). Two flavours by `_waterlog_enabled`:
+##   * NATIVE (WATERLOGGING §4): one waterlogged twin per co-filled composite pair — the UNION of
+##     the water-line shore pairs (TerrainConfig.emitted_shore_pairs, liquid 9) and the SUBMERGED
+##     floor pairs (emitted_submerged_pairs, liquid 10) — so BOTH cull as one fluid (no border).
+##     Open-water surface cells reuse the water LRID's pure fluid model (no slab appended).
+##   * LEGACY (WATER-SHORE §4.2): a wet composite per shore pair + the ONE 0.9 open-water slab.
+## Called on the MAIN thread inside setup().
+func _build_wet_manifest(library: Object, total: int) -> int:
+	_gen_wet_arid = PackedInt32Array()
+	_gen_wet_arid.resize(total * _GEN_STRIDE)
+	_gen_wet_arid.fill(-1)
+	if _waterlog_enabled:
+		return _build_waterlog_manifest(library, total)
+	var water_mat: Material = BlockMaterials.get_for(_water_id_of())
+	var appended := 0
+	for slot: int in TerrainConfig.emitted_shore_pairs():
+		var mat := slot / _GEN_STRIDE                    # decode: slot = mat*256 + modifier
+		var modifier := slot % _GEN_STRIDE
+		if mat <= BlockCatalog.AIR or mat >= total or modifier <= 0 or modifier >= _GEN_STRIDE:
+			continue
+		if _gen_wet_arid[slot] >= 0:
+			continue                                     # a duplicate sample pair
+		var model: Object = _make_wet_model(modifier, BlockMaterials.get_for(mat), water_mat)
+		if model == null:
+			continue                                     # no mesh-model class → dry-shape fallback
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] wet manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended                              # abort water manifest; dry manifest stands
+		_next_arid += 1
+		_gen_wet_arid[slot] = got
+		appended += 1
+	# The one open-water surface slab.
+	var slab: Object = _make_slab_model(water_mat)
+	if slab != null:
+		var expected := _next_arid
+		var got: int = _add_model(library, slab)
+		if got != expected:
+			push_warning("[module_world] water slab ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended
+		_next_arid += 1
+		_water_surface_arid = got
+		appended += 1
+	return appended
+
+## Native-waterlogging water manifest (WATERLOGGING §4.3-4.5). Bakes ONE waterlogged twin per
+## co-filled composite (surface material, modifier) pair — the DRY terrain ramp additionally
+## carrying the shared fluid — over the UNION of the shore (liquid 9) and submerged (liquid 10)
+## emitted pairs, so every water cell (pure, shore, submerged) shares one fluid_index and culls
+## together (the whole point: no border at the water line OR below it). Open-water surface cells
+## resolve to the water LRID's pure fluid model (`_cube_arid[water]`), so NO slab is appended.
+## Anti-drift as above; a drift aborts, leaving unbaked pairs -1 (dry-shape fallback: a border,
+## never a hole). Twin count printed (bound: hundreds — |uw floor mats| × |emitted modifiers| +
+## the shore pairs). Called on the MAIN thread inside setup(); appends but does not bake.
+func _build_waterlog_manifest(library: Object, total: int) -> int:
+	# Union the water-line shore pairs and the submerged floor pairs (dedup by slot). ONE twin per
+	# shape serves both liquid 9 and liquid 10 (the engine fills to 0.9375 at the line, full when
+	# covered), so a shared set is exactly right.
+	var pairs := {}
+	for slot: int in TerrainConfig.emitted_shore_pairs():
+		pairs[slot] = true
+	for slot: int in TerrainConfig.emitted_submerged_pairs():
+		pairs[slot] = true
+	var appended := 0
+	for slot: int in pairs.keys():
+		var mat := slot / _GEN_STRIDE                    # decode: slot = mat*256 + modifier
+		var modifier := slot % _GEN_STRIDE
+		if mat <= BlockCatalog.AIR or mat >= total or modifier <= 0 or modifier >= _GEN_STRIDE:
+			continue
+		if _gen_wet_arid[slot] >= 0:
+			continue                                     # a duplicate pair (shore ∩ submerged)
+		var model: Object = _make_waterlogged_model(modifier, BlockMaterials.get_for(mat))
+		if model == null:
+			continue                                     # no mesh/waterlog API → dry-shape fallback
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] waterlog manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended                              # abort water manifest; dry manifest stands
+		_next_arid += 1
+		_gen_wet_arid[slot] = got
+		appended += 1
+	# Open-water surface cells (liquid 9, modifier 0) render as the water LRID's pure fluid model.
+	_water_surface_arid = _cube_arid_of(_water_id_of())
+	print("[module_world] waterlog twins baked: %d (of %d unique composite pairs; water surface → fluid ARID %d)"
+		% [appended, pairs.size(), _water_surface_arid])
+	return appended
 
 ## Forward (mat, modifier) → ARID exactly as the voxel worker resolves it: AIR → 0, a
 ## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube
 ## fallback when that slot was never baked). Main-thread mirror of the generator's inline
 ## resolve — verify asserts the generated TYPE buffer equals this over a sample grid.
-func gen_arid_for(mat: int, modifier: int) -> int:
+func gen_arid_for(mat: int, modifier: int, liquid_level := 0) -> int:
 	if mat == BlockCatalog.AIR:
 		return 0
+	# Liquid-9 (the water line) resolves through the frozen water tables, exactly as the worker does.
+	# Liquid-10 (submerged): NATIVE waterlogging routes it to the SAME twin table (WATERLOGGING §4.5)
+	# so submerged water culls seamlessly; the LEGACY path leaves it to the dry resolve. Liquid-0
+	# always falls to the dry resolve.
+	if liquid_level == CellCodec.LIQ_LEVEL_SURFACE:
+		if modifier == 0:
+			return _water_surface_arid if _water_surface_arid >= 0 else _cube_arid_of(mat)
+		var wslot := mat * _GEN_STRIDE + modifier
+		if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+			return _gen_wet_arid[wslot]
+		# unbaked wet pair → dry shape (fall through)
+	elif _waterlog_enabled and liquid_level == CellCodec.LIQ_LEVEL_FULL and modifier != 0:
+		var wslot := mat * _GEN_STRIDE + modifier
+		if modifier < _GEN_STRIDE and wslot < _gen_wet_arid.size() and _gen_wet_arid[wslot] >= 0:
+			return _gen_wet_arid[wslot]
+		# unbaked submerged twin → dry shape (fall through)
 	if modifier == 0:
 		return _cube_arid_of(mat)
 	var slot := mat * _GEN_STRIDE + modifier
@@ -374,15 +576,8 @@ func _make_shape_model(modifier: int, material: Material) -> Object:
 	# Share one ArrayMesh per shape across all materials (see _shape_mesh_cache).
 	var amesh: ArrayMesh = _shape_mesh_cache.get(modifier, null)
 	if amesh == null:
-		var geom := ShapeMesh.build(modifier)
 		amesh = ArrayMesh.new()
-		var surf := []
-		surf.resize(Mesh.ARRAY_MAX)
-		surf[Mesh.ARRAY_VERTEX] = geom["verts"]
-		surf[Mesh.ARRAY_NORMAL] = geom["normals"]
-		surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
-		surf[Mesh.ARRAY_INDEX] = geom["indices"]
-		amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+		_add_surface(amesh, ShapeMesh.build(modifier))
 		_shape_mesh_cache[modifier] = amesh
 	if model.has_method("set_mesh"):
 		model.call("set_mesh", amesh)
@@ -391,6 +586,175 @@ func _make_shape_model(modifier: int, material: Material) -> Object:
 	if model.has_method("set_material_override"):
 		model.call("set_material_override", 0, material)
 	return model
+
+## True when the running godot_voxel exposes NATIVE waterlogging (WATERLOGGING.md §4): the
+## VoxelBlockyModelFluid class (pure water) AND VoxelBlockyModel.set_waterlog_fluid (co-fill).
+## Probed via ClassDB + a live has_method so the check is exact against the linked binary, not a
+## version guess — an old editor/web template silently keeps the legacy composite path.
+func _detect_waterlog() -> bool:
+	if not ClassDB.class_exists("VoxelBlockyModelFluid") or not ClassDB.class_exists("VoxelBlockyFluid"):
+		return false
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return false
+	var probe: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	return probe != null and probe.has_method("set_waterlog_fluid")
+
+## The ONE shared VoxelBlockyFluid (WATERLOGGING §4.1): water material + no downhill dip (a single
+## registered level renders every water cell flat at TOP_HEIGHT). Referenced by the pure fluid
+## water model AND every waterlogged twin, so all water lands in one fluid_index / material bucket.
+## Returns null if the class is unavailable (setup() then disables waterlogging).
+func _make_water_fluid() -> Object:
+	var fluid: Object = ClassDB.instantiate("VoxelBlockyFluid")
+	if fluid == null:
+		return null
+	if fluid.has_method("set_material"):
+		fluid.call("set_material", BlockMaterials.get_for(_water_id_of()))
+	if fluid.has_method("set_dip_when_flowing_down"):
+		fluid.call("set_dip_when_flowing_down", false)
+	return fluid
+
+## The PURE-FLUID water model (WATERLOGGING §4.2): a VoxelBlockyModelFluid at level 1 (= max, so
+## its surface sits at the engine TOP_HEIGHT 0.9375) carrying the shared fluid. Its material comes
+## from the fluid; transparency_index == the water cull group (matching the legacy water cube) so
+## fluid↔opaque culling is unchanged. Replaces the water LRID's cube in _configure_library, keeping
+## the index==LRID invariant. Deep water columns cull to nothing inside the body (ocean fast path —
+## fewer triangles than cube water). Returns null if the class is unavailable.
+func _make_water_fluid_model() -> Object:
+	if _water_fluid == null or not ClassDB.class_exists("VoxelBlockyModelFluid"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelFluid")
+	if model == null:
+		return null
+	if model.has_method("set_fluid"):
+		model.call("set_fluid", _water_fluid)
+	if model.has_method("set_level"):
+		model.call("set_level", 1)
+	var cull_group: int = BlockCatalog.cull_group_of(_water_id_of())
+	if cull_group > 0 and model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", cull_group)
+	return model
+
+## Build a WATERLOGGED TWIN (WATERLOGGING §4.3): a VoxelBlockyModelMesh of the DRY terrain ramp
+## (reusing the SAME `_shape_mesh_cache[modifier]` ArrayMesh the dry shape uses — the solid IS the
+## dry ramp, no water geometry baked in) that ADDITIONALLY carries the shared fluid via the native
+## waterlog properties. The SOLID stays opaque (transparency_index 0 — load-bearing: neighbours
+## judge this cell by its solid ramp, never its water, so no terrain holes) while its FLUID faces
+## use the water cull group, so they cull seamlessly against every other water cell (pure, shore,
+## submerged) sharing the fluid — the border-killer. `set_waterlog_level(1)` = full fill (the engine
+## drops it to the 0.9375 line when uncovered, forces 1.0 when covered). Returns null when the
+## mesh-model class or the waterlog API is unavailable (→ dry-shape fallback, a border not a hole).
+func _make_waterlogged_model(modifier: int, terrain_material: Material) -> Object:
+	if _water_fluid == null or not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null or not model.has_method("set_waterlog_fluid"):
+		return null
+	# Reuse the DRY shape mesh (plain `modifier` key), shared with _make_shape_model.
+	var amesh: ArrayMesh = _shape_mesh_cache.get(modifier, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, ShapeMesh.build(modifier))
+		_shape_mesh_cache[modifier] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, terrain_material)
+	# The solid part is opaque (transparency_index 0) — keeps neighbours culling against the ramp,
+	# never the water (no terrain holes, WATERLOGGING §5 risk 2). Set explicitly, not by default.
+	if model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", 0)
+	var cull_group: int = BlockCatalog.cull_group_of(_water_id_of())
+	model.call("set_waterlog_fluid", _water_fluid)
+	if model.has_method("set_waterlog_level"):
+		model.call("set_waterlog_level", 1)
+	if model.has_method("set_waterlog_fluid_transparency_index"):
+		model.call("set_waterlog_fluid_transparency_index", cull_group)
+	return model
+
+## Build the WET COMPOSITE model (WATER-SHORE §4.3): a VoxelBlockyModelMesh whose ArrayMesh
+## has TWO surfaces — surface 0 = the terrain ramp (ShapeMesh.build(modifier), terrain
+## material), surface 1 = the water fill (WaterMesh.shore_fill(), water material). The model
+## stays OPAQUE (transparency_index 0, the godot_voxel default — NOT set): its occlusion role
+## is the terrain ramp, so adjacent water (index 1) can never cull the ramp's side trapezoids
+## (no holes in terrain seen through water, §4.4). The water fill is modifier-independent, so
+## the combined ArrayMesh is shared across every material for a given modifier via
+## `_shape_mesh_cache` keyed `modifier | _WET_MESH_FLAG` (the material differs only via the
+## per-surface override). Returns null when the module lacks the mesh-model class.
+func _make_wet_model(modifier: int, terrain_material: Material, water_material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var key := modifier | _WET_MESH_FLAG
+	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, ShapeMesh.build(modifier))    # surface 0: terrain ramp
+		_add_surface(amesh, WaterMesh.shore_fill())       # surface 1: water fill to 0.9
+		_shape_mesh_cache[key] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, terrain_material)
+		model.call("set_material_override", 1, water_material)
+	# Make the OPAQUE role explicit (transparency_index 0). This is load-bearing: it is what
+	# stops adjacent water (index 1) from culling the terrain ramp's side trapezoids (§4.4 —
+	# no holes seen through water). Setting it here rather than relying on the godot_voxel
+	# default guards against a future default change silently opening those holes.
+	if model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", 0)
+	return model
+
+## Build the open-water surface SLAB model (WATER-SHORE §4.2): a VoxelBlockyModelMesh from
+## WaterMesh.surface_slab() (top at y=0.9), water material, transparency_index ==
+## BlockCatalog.cull_group_of(water) (== 1, matching the water cube) so slab↔cube face culling
+## behaves. Returns null when the module lacks the mesh-model class.
+func _make_slab_model(water_material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var key := _WET_MESH_FLAG | 0xFFFF                    # a fixed slab key, distinct from any modifier
+	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, WaterMesh.surface_slab())
+		_shape_mesh_cache[key] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, water_material)
+	var cull_group: int = BlockCatalog.cull_group_of(_water_id_of())
+	if cull_group > 0 and model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", cull_group)
+	return model
+
+## Append one {verts, normals, uvs, indices} geometry dict as a triangle surface on `amesh`.
+## Shared by the shape/wet/slab builders so the ShapeMesh/WaterMesh dict format is unpacked
+## in exactly one place.
+func _add_surface(amesh: ArrayMesh, geom: Dictionary) -> void:
+	var surf := []
+	surf.resize(Mesh.ARRAY_MAX)
+	surf[Mesh.ARRAY_VERTEX] = geom["verts"]
+	surf[Mesh.ARRAY_NORMAL] = geom["normals"]
+	surf[Mesh.ARRAY_TEX_UV] = geom["uvs"]
+	surf[Mesh.ARRAY_INDEX] = geom["indices"]
+	amesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+
+## The water material's BlockCatalog id, resolved once (main thread; BlockCatalog.ensure_ready()
+## already ran in setup()). Used for the water material + cull group of both water models.
+func _water_id_of() -> int:
+	if _water_id < 0:
+		_water_id = BlockCatalog.id_of(&"water")
+	return _water_id
 
 ## Append a model to the library and return its index (int return, else models-array
 ## size — mirrors _add_cube's version-robust read).
@@ -448,9 +812,18 @@ func _configure_library(library: Object) -> bool:
 	# where a tile exists, else a flat swatch; translucent/emissive per the catalog). The
 	# 1x1 atlas is uniform for all. The library-order invariant (cube ARID == LRID) is
 	# machine-checked at every id, not just the frozen 5.
+	var water_id := _water_id_of()
 	for block_id in range(1, total):
 		var cull_group: int = BlockCatalog.cull_group_of(block_id)
-		var got: int = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+		var got: int
+		if _waterlog_enabled and block_id == water_id:
+			# The water LRID renders as a PURE FLUID model (WATERLOGGING §4.2), not a cube — so deep
+			# water culls internally and every water cell shares the one fluid. Falls back to a cube
+			# if the fluid model can't be built, preserving the index==LRID invariant either way.
+			var fluid_model: Object = _make_water_fluid_model()
+			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+		else:
+			got = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
 		if got != block_id:
 			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
@@ -512,6 +885,9 @@ extends VoxelGeneratorScript
 # generated cell to its baked ARID is allocation-free and race-free (VDS §8.3).
 var cube_arid: PackedInt32Array         # LRID -> cube ARID
 var gen_arid: PackedInt32Array          # (mat*GEN_STRIDE + modifier) -> ARID; -1 = not baked
+var gen_wet_arid: PackedInt32Array      # (mat*GEN_STRIDE + modifier) -> wet/twin ARID; -1 = not baked
+var water_surface_arid := -1            # open-water surface cell model ARID; -1 = not baked
+var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
 
 func _get_used_channels_mask() -> int:
@@ -529,6 +905,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var max_above = TreeGen.MAX_ABOVE_SURFACE
 	var ncube = cube_arid.size()
 	var ngen = gen_arid.size()
+	var nwet = gen_wet_arid.size()
 
 	# CHEAP all-air early-outs, BEFORE the per-column profile pass (PERF): a block entirely above
 	# ALL possible content (the proven surface bound + tallest tree, and above the sea cap) or
@@ -588,7 +965,34 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				# pre-baked manifest ARID; -1 (unbaked) falls back to the plain cube.
 				var modifier = CellCodec.modifier(v)
 				var arid = 0
-				if modifier == 0:
+				# Liquid-9 (the water line): the frozen water tables — the open-water surface model for
+				# modifier 0 (native: the pure fluid ARID; legacy: the 0.9 slab), the wet/twin model for
+				# a composite (modifier != 0) — degrading to dry-shape then cube, never a hole.
+				# Liquid-10 (submerged composite): NATIVE waterlogging routes it to the SAME twin table
+				# (WATERLOGGING §4.5) so submerged water culls seamlessly against the water around it (the
+				# last underwater border); LEGACY leaves it to the dry-shape resolve below (a border).
+				# Liquid-0 (deep water / sub-surface): the UNCHANGED cube/shape fast paths.
+				var lvl = CellCodec.liquid_level(v)
+				if lvl == CellCodec.LIQ_LEVEL_SURFACE:
+					if modifier == 0:
+						arid = water_surface_arid if water_surface_arid >= 0 else (cube_arid[id] if id < ncube else id)
+					else:
+						var wslot = id * GEN_STRIDE + modifier
+						if modifier < GEN_STRIDE and wslot < nwet and gen_wet_arid[wslot] >= 0:
+							arid = gen_wet_arid[wslot]
+						elif modifier < GEN_STRIDE and wslot < ngen and gen_arid[wslot] >= 0:
+							arid = gen_arid[wslot]
+						else:
+							arid = cube_arid[id] if id < ncube else id
+				elif waterlog and lvl == CellCodec.LIQ_LEVEL_FULL and modifier != 0:
+					var wslot = id * GEN_STRIDE + modifier
+					if modifier < GEN_STRIDE and wslot < nwet and gen_wet_arid[wslot] >= 0:
+						arid = gen_wet_arid[wslot]
+					elif modifier < GEN_STRIDE and wslot < ngen and gen_arid[wslot] >= 0:
+						arid = gen_arid[wslot]
+					else:
+						arid = cube_arid[id] if id < ncube else id
+				elif modifier == 0:
 					arid = cube_arid[id] if id < ncube else id
 				else:
 					var slot = id * GEN_STRIDE + modifier
@@ -608,6 +1012,9 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Publish the frozen tables to the worker-side generator (read-only from here on).
 	gen.set("cube_arid", _cube_arid)
 	gen.set("gen_arid", _gen_arid)
+	gen.set("gen_wet_arid", _gen_wet_arid)               # wet composites / waterlogged twins
+	gen.set("water_surface_arid", _water_surface_arid)   # open-water surface model (slab or fluid)
+	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	return gen
 
 # --- helpers -------------------------------------------------------------------

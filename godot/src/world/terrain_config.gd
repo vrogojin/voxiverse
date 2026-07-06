@@ -75,6 +75,25 @@ const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
 const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
 
+# --- Mountains biome (a SEPARATE, TALL biome — does NOT touch hills/plains) --------------------
+# A dedicated LOW-frequency mask noise (_mountain, seed SEED+104, freq 0.0008 — broader than the
+# 0.0015 continent noise, so ranges are coherent, not speckled) carves a few broad ranges. Where the
+# mask (smoothstepped to [0,1]) AND an inland guard (smoothstep on continentalness) are BOTH nonzero,
+# _height_c ADDS mountain_uplift = factor * MOUNTAIN_AMPLITUDE. The factor is EXACTLY 0 outside
+# mountain regions (mask <= MASK_LO, OR coastal c <= C_LO), so `h` there is bit-for-bit unchanged and
+# the whole non-mountain world stays BYTE-IDENTICAL (proven in verify). A full-mask inland peak reaches
+# base(6..16) + 92 ≈ y=98..112 — ABOVE the y=96 freezing altitude (ClimateModel.ALT_ZERO_Y) — so the
+# ALREADY-WIRED altitude snow cap (a surface caps iff surface_temperature < 0) whitens the peaks with
+# NO new cap code. Mountain tops are bare `stone` (rock peaks), added to the baked cappable set so a
+# high stone cap renders white on BOTH paths. Lower flanks (factor below the biome threshold) keep
+# their surrounding climate biome (grass/forest slopes), below the freeze line, bare.
+const MOUNTAIN_AMPLITUDE := 92.0    # full-mask uplift in blocks (a full peak ≈ inland base + this)
+const MOUNTAIN_MASK_LO := 0.35      # mask noise <= this -> factor 0 (world byte-identical); a flank begins here
+const MOUNTAIN_MASK_HI := 0.68      # mask noise >= this -> full peak (factor's mask term = 1)
+const MOUNTAIN_C_LO := 0.05         # continentalness <= this (coast/ocean) -> no uplift (mountains are inland)
+const MOUNTAIN_C_HI := 0.35         # ...fully inland (mask term ungated) at/above this
+const MOUNTAIN_BIOME_T := 0.35      # a column whose mountain FACTOR exceeds this is classified B_MOUNTAINS
+
 # --- beach shelf (WATER-SHORE follow-up): a smooth near-shore seafloor gradient -----------------
 # Across a shallow window around the water line, _height_c fades out the high-frequency surface
 # noise so the near-shore floor follows the gentle continental slope — a smooth shallow shelf the
@@ -88,24 +107,31 @@ const SHELF_HILLS_KEEP := 0.35  # fraction of the low-frequency hills kept in th
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
-## The godot_voxel viewer streams a vertically-scaled sphere: the vertical view radius is
-## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS). The world content is only
-## ~94 blocks tall (bedrock y=-64 .. treetops ~y=30), so a 1.0 ratio streamed a ±256 vertical
-## sphere that is mostly empty air — thousands of blocks each paying the per-column profile pass
-## on the single (web-capped) voxel thread. 0.2 limits streaming to a ~±51-block slab around the
-## viewer, deferring the deep subsurface until the player descends. PURE CONFIG: a block streams
-## identically whenever it DOES stream (only WHEN it streams changes), so determinism and the
-## generated output are unaffected; analytic physics + the collider read TerrainConfig directly
-## (not the mesh), so collision below the streamed slab is unchanged.
-const VIEWER_VERTICAL_RATIO := 0.2
+## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
+## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the
+## world was only ~94 blocks tall (bedrock y=-64 .. treetops ~y=30) and 0.2 (±51-block slab) sufficed.
+## Mountains now reach y≈112, so a SEA-LEVEL player (y≈5) must stream ~107 blocks UP to SEE a peak
+## within the render radius; 0.5 gives a ±128-block slab (0.5·256) that covers the tallest peak from
+## sea level with margin AND, when the player stands ON a peak (y≈108), still streams down past sea
+## level. PERF TRADE-OFF (bounded, deliberate): the streamed vertical slab grows 2×51→2×128 ≈ 2.5×, so
+## ~2.5× more DATA/MESH blocks stream vertically — but the extra blocks are mostly air above the terrain
+## (cheap early-out, below) or interior stone (faces culled); the meshed SURFACE area grows only by the
+## mountains themselves. Horizontal radius is UNCHANGED. PURE CONFIG: a block streams identically
+## whenever it DOES stream (only WHEN changes), so determinism/output are unaffected; analytic physics +
+## the collider read TerrainConfig directly (not the mesh), so collision is unchanged.
+const VIEWER_VERTICAL_RATIO := 0.5
 
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
 ## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +
-## DETAIL_AMPLITUDE(1) = 20 (each FastNoiseLite term is bounded to [-1,1]; Godot normalizes FBM),
-## + 4 margin. A large-sample assert in verify_feature confirms the bound so the early-out can
-## NEVER skip real content (a too-low bound would punch holes in the world).
-const MAX_SURFACE_Y := 24
+## DETAIL_AMPLITUDE(1) + max mountain_uplift (MOUNTAIN_AMPLITUDE(92) · full factor 1.0) = 112 (each
+## FastNoiseLite term is bounded to [-1,1]; Godot normalizes FBM; the mountain factor is a product of
+## two smoothsteps in [0,1]), + 4 margin. A large-sample assert in verify_feature confirms the bound so
+## the early-out can NEVER skip real content (a too-low bound would punch holes in the world). PERF
+## NOTE: raising this from 24 to 116 means the CHEAP constant early-out no longer catches mid-altitude
+## air blocks over FLAT terrain — they pay one column-profile pass before the tighter per-block max_h
+## early-out rejects them. Bounded by the streamed vertical slab; accepted for the Mountains milestone.
+const MAX_SURFACE_Y := 116
 
 ## The world floor: the lowest SOLID cell is bedrock at y = WORLD_BOTTOM_Y; y < WORLD_BOTTOM_Y is
 ## void (air). A block whose whole extent is below this generates nothing (generator skips it).
@@ -126,6 +152,7 @@ const B_SNOWY := 5
 const B_TAIGA := 6
 const B_FOREST := 7
 const B_PLAINS := 8
+const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds) and
@@ -165,6 +192,7 @@ static var _detail: FastNoiseLite      # small-scale bumpiness
 static var _continent: FastNoiseLite   # continentalness (ocean <-> inland)
 static var _temperature: FastNoiseLite # climate temperature
 static var _humidity: FastNoiseLite    # climate humidity
+static var _mountain: FastNoiseLite    # Mountains-biome mask (broad, low-frequency ranges)
 
 # --- cached material ids (resolved once from the data-driven catalog) ---------
 static var _ids_ready := false
@@ -212,6 +240,12 @@ static func _ensure_noise() -> void:
 	_continent = _make_climate(SEED + 101, 0.0015)
 	_temperature = _make_climate(SEED + 102, 0.002)
 	_humidity = _make_climate(SEED + 103, 0.002)
+
+	# Mountains-biome mask (SEPARATE from hills): its OWN low-frequency noise (freq 0.0008 < the 0.0015
+	# continent noise) so mountain ranges are BROAD and coherent rather than speckled. Warmed here on the
+	# MAIN thread (WGC §7.4) before the voxel worker runs — a lazily-built noise first-touched on the
+	# worker is the project's worst data-race class.
+	_mountain = _make_climate(SEED + 104, 0.0008)
 
 static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
 	var n := FastNoiseLite.new()
@@ -312,6 +346,18 @@ static func _continent_offset(c: float) -> float:
 static func _knot(c: float, c0: float, c1: float, v0: float, v1: float) -> float:
 	return v0 + (v1 - v0) * (c - c0) / (c1 - c0)
 
+## The Mountains-biome uplift FACTOR in [0,1] at column (fx, fz) of continentalness `c`: the mask noise
+## smoothstepped over [MASK_LO, MASK_HI], gated by an inland smoothstep over [C_LO, C_HI]. It is EXACTLY
+## 0.0 wherever the mask noise <= MASK_LO (Godot's smoothstep returns 0 at/below edge0) OR the column is
+## coastal (c <= C_LO) — so `_height_c` adds nothing there and those columns stay BYTE-IDENTICAL. PURE +
+## DETERMINISTIC (one FastNoiseLite sample + two smoothsteps of SEED/position; no randi/Time), so both
+## render paths and the analytic queries agree by construction. Callers _ensure_noise() first.
+static func _mountain_factor(c: float, fx: float, fz: float) -> float:
+	var m := smoothstep(MOUNTAIN_MASK_LO, MOUNTAIN_MASK_HI, _mountain.get_noise_2d(fx, fz))
+	if m <= 0.0:
+		return 0.0                                   # not a mountain here -> uplift 0 (byte-identical world)
+	return m * smoothstep(MOUNTAIN_C_LO, MOUNTAIN_C_HI, c)
+
 static func _height_c(c: float, fx: float, fz: float) -> int:
 	var base := BASE_HEIGHT + _continent_offset(c)
 	var hills := _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
@@ -326,6 +372,11 @@ static func _height_c(c: float, fx: float, fz: float) -> int:
 	var w := clampf(smoothstep(-SHELF_TOP, 0.5, depth) - smoothstep(SHELF_DEPTH - 1.5, SHELF_DEPTH, depth), 0.0, 1.0)
 	if w > 0.0:
 		h = lerp(h, base + hills * SHELF_HILLS_KEEP, w)
+	# Mountains biome (SEPARATE tall term; does NOT touch the hills above). Added AFTER the beach shelf —
+	# mountains are inland (C_LO gate) so their shelf `w` is 0 anyway, keeping every coastal column
+	# byte-identical. The factor is exactly 0 outside mountain regions, so `h` is bit-for-bit unchanged
+	# there; a full-mask inland peak gains up to MOUNTAIN_AMPLITUDE blocks, crossing the y=96 freeze line.
+	h += _mountain_factor(c, fx, fz) * MOUNTAIN_AMPLITUDE
 	return int(floor(h))
 
 ## Surface height (integer y of the topmost SOLID ground cell) at column (x, z).
@@ -337,14 +388,21 @@ static func height_at(x: int, z: int) -> int:
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
 
-## Biome enum (B_*) at column (x, z) — ordered first-match rule chain (WGC §6.4).
-static func _biome(c: float, t: float, h: float, g: int) -> int:
+## Biome enum (B_*) at column (x, z) — ordered first-match rule chain (WGC §6.4). `mountain` is the
+## precomputed Mountains-biome factor (0 outside mountain regions); a column whose factor exceeds
+## MOUNTAIN_BIOME_T is a mountain regardless of climate (a tall peak reads as rock; its snow cap then
+## depends on altitude+climate via the existing surface_temperature predicate). Checked AFTER ocean/beach
+## so the coast is never a mountain, and BEFORE the climate biomes so tall inland ground of ANY climate
+## becomes B_MOUNTAINS. Below the threshold (foothills/flanks) the column keeps its climate biome.
+static func _biome(c: float, t: float, h: float, g: int, mountain: float) -> int:
 	if c < -0.32:
 		return B_OCEAN
 	# Beaches ring the coast: near sea level AND continentally coastal (the c gate
 	# keeps inland lowland dips from speckling as sand — WGC §9 noise-smoothness).
 	if c < 0.25 and g >= SEA_LEVEL - 2 and g <= SEA_LEVEL + 2:
 		return B_BEACH
+	if mountain > MOUNTAIN_BIOME_T:
+		return B_MOUNTAINS
 	if t > 0.45 and h < -0.45:
 		return B_BADLANDS
 	if t > 0.45 and h < 0.0:
@@ -387,7 +445,8 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 	var t := _temperature.get_noise_2d(fx, fz)
 	var hh := _humidity.get_noise_2d(fx, fz)
 	var g := _height_c(c, fx, fz)
-	var prof := Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+	var mtn := _mountain_factor(c, fx, fz)
+	var prof := Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
 	if pcache != null:
 		pcache[Vector2i(x, z)] = prof
 	return prof
@@ -434,7 +493,12 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 			return _sea_block(t, y)
 		return TreeGen.block_at(x, y, z, pcache)
 	var id := _surface_rule(x, y, z, g, biome, c, t)
-	if id == BlockCatalog.STONE:
+	# The stone -> deepslate/strata/ore rewrite applies to INTERIOR stone only (y < g). A B_MOUNTAINS
+	# column tops with STONE at y == g (its cappable rock peak); guarding on `y < g` keeps that top a
+	# PLAIN, cappable stone cell (a strata blob or surface ore would silently break its snow cap). This
+	# is BYTE-IDENTICAL for every pre-existing biome — no _biome_top / _underwater_floor ever returns
+	# STONE, so the y == g branch was never a stone cell before Mountains (only interior fill was).
+	if id == BlockCatalog.STONE and y < g:
 		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
 		id = _ore_at(x, y, z, id, biome, c)   # host-aware ore lattice
 	# Smoothing SURFACE shape (SVS §8.1): reshape the walkable top cell of a column into a
@@ -477,8 +541,8 @@ static func _with_shore_liquid(v: int, y: int, t: float) -> int:
 ##   * underwater column (g < SEA_LEVEL): no land cap;
 ##   * wet shore composite (liquid_field != 0): state ⊥ liquid at the stamping level (§1.6);
 ##   * material not declared cappable (state_mask_of(mat) & STATE_SNOW_CAPPED == 0): bare —
-##     the catalog declaration is the one authority, so stone is accepted-but-never-produced
-##     (worldgen never tops a column with stone) and snow_block/red_sand/mud are excluded;
+##     the catalog declaration is the one authority; stone IS now produced (B_MOUNTAINS tops columns
+##     with stone, so high stone peaks cap), while snow_block/red_sand/mud stay excluded;
 ##   * warm surface (surface_temperature ≥ 0): bare.
 ## Any column that returns `v` unchanged keeps its byte-identical state-0 value. Reads only
 ## scalars already in resolve_cell → no extra noise sampling on the hot path.
@@ -760,23 +824,29 @@ static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 ## The surface materials smoothing can shape — every material `_biome_top` (land) OR
 ## `_underwater_floor` (WATER-SHORE §3: underwater floors now smooth too) can return.
 ## Gravel is the one `_underwater_floor` material not already a land top; sand/red_sand/
-## mud are shared. The module bakes these × emitted_modifiers() at setup.
+## mud are shared. The module bakes these × emitted_modifiers() at setup. STONE (the
+## `_biome_top(B_MOUNTAINS)` rock peak) is DELIBERATELY excluded from the DRY set: a SNOW-CAPPED
+## stone cell is baked via `_snow_arid` (snow_cappable_materials, so visible peaks smooth), while an
+## UNCAPPED shaped stone cell (the bare lower flank, below the freeze line) cube-falls-back on the
+## worker — a natural blocky-rock look, a documented graceful degrade (§5.5) that keeps the pre-baked
+## model count (and web load pause) down and preserves stone's lazy-append path (_test_shapes_live).
 static func appearance_surface_materials() -> PackedInt32Array:
 	_ensure_ids()
 	return PackedInt32Array([
 		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL, _ID_GRAVEL,
 	])
 
-## The BAKED snow-cap material set (M1 ADR §2.2): the cappable surface materials the module path
-## bakes a snow-VARIANT model for (cube + each emitted modifier). grass / podzol / sand — the
-## materials a cold surface column can top with. stone is declared cappable (codec/state machine
-## accept a stone cap) but worldgen NEVER stamps it (`_biome_top` never returns stone), so it is
-## inert and UNBAKED — a stone cap would fall back to the plain look, never a hole (§5.5). The
-## STAMP gate is the catalog declaration (state_mask_of & STATE_SNOW_CAPPED), so this list only
-## governs which variants get baked, not which are accepted.
+## The BAKED snow-cap material set (M1 ADR §2.2, extended by the Mountains biome): the cappable surface
+## materials the module path bakes a snow-VARIANT model for (cube + each emitted modifier). grass /
+## podzol / sand top cold LOW columns; STONE now tops B_MOUNTAINS peaks (`_biome_top(B_MOUNTAINS)`), and
+## those peaks cross the y=96 freeze line, so stone is a REAL cappable top — baking its snow variant is
+## what makes high stone caps render WHITE (an unbaked cap would silently fall back to plain rock, §5.5).
+## The STAMP gate is still the catalog declaration (state_mask_of & STATE_SNOW_CAPPED); this list only
+## governs which variants get baked. Budget: 4 mats × (cube + ~emitted modifiers + slab) ≈ 170–250
+## models, below the 280–420 manifest budget.
 static func snow_cappable_materials() -> PackedInt32Array:
 	_ensure_ids()
-	return PackedInt32Array([BlockCatalog.GRASS, _ID_PODZOL, _ID_SAND])
+	return PackedInt32Array([BlockCatalog.GRASS, _ID_PODZOL, _ID_SAND, BlockCatalog.STONE])
 
 ## Every corner-height modifier the smoothing can emit: all BOTTOM-anchored corner
 ## tuples in {0,1,2}⁴ except all-2 (the FULL cube — served by the eager cube ARID) and
@@ -819,8 +889,17 @@ static func emitted_modifiers() -> PackedInt32Array:
 		return _emitted_mods
 	_ensure_noise()
 	var seen := {}
-	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)   # inland land shapes
-	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)   # coastline + underwater floor shapes (§3.5)
+	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
+	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
+	# Mountains biome: its gently-sloped stone flanks emit corner-height modifiers NOT present in the
+	# temperate spawn/coast samples — mountains alone reach ~60 of the 61 globally-emitted modifiers
+	# (every gentle-slope orientation occurs). A snow-capped stone peak cell whose modifier is unbaked
+	# would fall back to a plain cube: an INVISIBLE cap AND a lost shape (§5.5). So sample SEVERAL
+	# angularly-spread mountain massifs — enough that emitted_modifiers() reaches the complete reachable
+	# set (verify asserts a wide mountain scan emits NO modifier missing from this set). One-time setup
+	# cost (main thread); never the voxel worker.
+	for mc: Vector2i in find_mountains(6):
+		_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
 	# The snow half-slab modifier (M1 ADR §6.4): worldgen emits (snow_block, 85) on deep-frozen
 	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
 	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
@@ -933,6 +1012,8 @@ static func _biome_top(biome: int, x: int, z: int) -> int:
 			return _ID_SNOW
 		B_TAIGA:
 			return _ID_PODZOL if _hash01_3d(x, 0, z, _SALT_PODZOL) < 0.20 else BlockCatalog.GRASS
+		B_MOUNTAINS:
+			return BlockCatalog.STONE     # bare rock peak (cappable — declared in blocks.json + baked set)
 		B_OCEAN:
 			return _ID_SAND
 		_:
@@ -963,6 +1044,8 @@ static func _filler_depth(biome: int) -> int:
 			return 5        # mud(3) + dirt(2)
 		B_OCEAN:
 			return 3        # a few blocks of floor sediment
+		B_MOUNTAINS:
+			return 0        # bare rock: no dirt filler, straight to stone/deepslate under the surface
 		_:
 			return 3        # snowy/taiga/forest/plains: dirt(3)
 
@@ -1125,6 +1208,43 @@ static func find_spawn() -> Vector2i:
 			if g > SEA_LEVEL + 1 and (b == B_PLAINS or b == B_FOREST):
 				return Vector2i(x, z)
 	return Vector2i(0, 0)
+
+## The nearest TALL B_MOUNTAINS column (a real peak, g well above sea) scanned outward from origin with
+## the find_spawn pattern. Used ONLY at setup/verify (never the voxel worker) to seed emitted_modifiers()
+## with the mountain-flank stone shapes so snow-capped peaks bake their variant models (visible caps).
+## Mountains cover ~3% of the world for this seed, so the scan resolves quickly; the fallback (no
+## mountain in range — not the case for this seed) re-samples spawn, which is harmless (superset-safe).
+static func find_mountain() -> Vector2i:
+	var ms := find_mountains(1)
+	return ms[0] if ms.size() > 0 else find_spawn()
+
+## Up to `count` DISTINCT tall B_MOUNTAINS massifs (peaks g > SEA_LEVEL + 40), one per angular sector,
+## scanned outward from origin. Angularly spread + de-duplicated (>= 400 blocks apart) so the returned
+## centres land on DIFFERENT massifs with different slope orientations — together their emitted-modifier
+## sample reaches the complete reachable set (no invisible caps). Falls back to spawn if none found (not
+## the case for this seed). Setup/verify only (calls column_profile widely); never the voxel worker.
+static func find_mountains(count: int) -> Array:
+	var out: Array = []
+	for radius in range(0, 3072, 8):
+		for a in range(0, 360, 6):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			var p := column_profile(x, z)
+			if int(p.y) != B_MOUNTAINS or int(p.x) <= SEA_LEVEL + 40:
+				continue
+			var far := true
+			for c: Vector2i in out:
+				if Vector2(x - c.x, z - c.y).length() < 400.0:
+					far = false
+					break
+			if far:
+				out.append(Vector2i(x, z))
+				if out.size() >= count:
+					return out
+	if out.is_empty():
+		out.append(find_spawn())
+	return out
 
 ## Sentinel returned by find_coast_of when no coast of the requested kind is found in range.
 const _COAST_NONE := Vector2i(0x7fffffff, 0x7fffffff)

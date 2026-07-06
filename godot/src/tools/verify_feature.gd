@@ -57,6 +57,7 @@ func _initialize() -> void:
 	_test_dynamic_catalog()
 	_test_zone_bundle()
 	_test_snowy_world()
+	_test_mountains()
 	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -155,8 +156,20 @@ func _test_worldgen_air_bounds() -> void:
 			var h: int = TerrainConfig.height_at(x, z)
 			if h > max_seen:
 				max_seen = h
+	# The Mountains biome is the new tall term — explicitly stress the bound over several mountain massifs
+	# (they sit far from origin, outside the box above) so MAX_SURFACE_Y is proven to bound real PEAKS.
+	var mtn_max := -0x7fffffff
+	for mc: Vector2i in TerrainConfig.find_mountains(6):
+		for dx in range(-160, 161, 2):
+			for dz in range(-160, 161, 2):
+				var h2: int = TerrainConfig.height_at(mc.x + dx, mc.y + dz)
+				if h2 > max_seen:
+					max_seen = h2
+				if h2 > mtn_max:
+					mtn_max = h2
+	_ok(mtn_max > TerrainConfig.SEA_LEVEL + 40, "Mountains produce genuinely TALL peaks (max mountain height %d)" % mtn_max)
 	_ok(max_seen <= TerrainConfig.MAX_SURFACE_Y,
-		"MAX_SURFACE_Y (%d) is a true upper bound on height_at over a wide sample (max seen %d)"
+		"MAX_SURFACE_Y (%d) is a true upper bound on height_at over a wide sample INCLUDING mountain peaks (max seen %d)"
 		% [TerrainConfig.MAX_SURFACE_Y, max_seen])
 	# Nothing (solid, cap, tree or sea) generates above MAX_SURFACE_Y+max_above, nor below the
 	# bedrock floor — exactly the two volumes the generator early-outs drop.
@@ -171,7 +184,15 @@ func _test_worldgen_air_bounds() -> void:
 			for y in range(TerrainConfig.BEDROCK_FLOOR - 16, TerrainConfig.BEDROCK_FLOOR):
 				if TerrainConfig.generated_cell(x, y, z) != BlockCatalog.AIR:
 					air_below_ok = false
-	_ok(air_above_ok, "no generated cell above MAX_SURFACE_Y+max_above (=%d) — above early-out skips only air" % above_y)
+	# ...and specifically ABOVE the tallest mountain peaks (the new tall content) — the early-out must not
+	# be tricked into skipping a peak, and nothing generates above the raised bound over a mountain.
+	for mc: Vector2i in TerrainConfig.find_mountains(6):
+		for dx in range(-160, 161, 11):
+			for dz in range(-160, 161, 11):
+				for y in range(above_y + 1, above_y + 31):
+					if TerrainConfig.generated_cell(mc.x + dx, y, mc.y + dz) != BlockCatalog.AIR:
+						air_above_ok = false
+	_ok(air_above_ok, "no generated cell above MAX_SURFACE_Y+max_above (=%d) — above early-out skips only air (incl. over mountains)" % above_y)
 	_ok(air_below_ok, "no generated cell below the bedrock floor (y < %d) — below early-out skips only air" % TerrainConfig.BEDROCK_FLOOR)
 
 # 1c. Appearance-manifest trim (PERF, fewer GPU readbacks at load). The module bakes materials ×
@@ -662,9 +683,17 @@ func _test_both_paths() -> void:
 		"arid_for_cell(capped grass) == gen_arid_for(grass, …, state) mirror")
 	# stone: declared cappable but UNBAKED (worldgen never stamps it) → the snow slot is -1, so the
 	# capped value falls back to the plain stone cube ARID (never a hole, §5.5).
+	# stone: now a REAL baked mountain top (Mountains biome) — its snow variant IS baked, so a capped
+	# stone cell renders the variant (differs from plain stone), mirroring grass. This is what makes high
+	# stone peaks render WHITE. A NON-cappable material with a stray snow bit still falls back (never a hole).
 	var stone_plain := int(mw.call("arid_for_cell", CellCodec.pack(STONE, 0, 0)))
 	var stone_snow := int(mw.call("arid_for_cell", CellCodec.pack(STONE, 0, snow_bit)))
-	_ok(stone_snow == stone_plain and stone_snow > 0, "unbaked capped stone falls back to the plain stone ARID (%d), never a hole" % stone_snow)
+	_ok(stone_snow != stone_plain and stone_snow > 0, "capped stone renders the BAKED snow variant ARID (%d), differs from plain stone (%d)" % [stone_snow, stone_plain])
+	_ok(stone_snow == int(mw.call("gen_arid_for", STONE, 0, 0, CellCodec.LIQ_WATER, snow_bit)),
+		"arid_for_cell(capped stone) == gen_arid_for(stone, …, state) mirror")
+	var dirt_plain := int(mw.call("arid_for_cell", CellCodec.pack(DIRT, 0, 0)))
+	var dirt_snow := int(mw.call("arid_for_cell", CellCodec.pack(DIRT, 0, snow_bit)))
+	_ok(dirt_snow == dirt_plain and dirt_snow > 0, "unbaked capped dirt falls back to the plain dirt ARID (%d), never a hole" % dirt_snow)
 	# The generator does not bake a snow ARID on the worker either (frozen table).
 	var ac_snow := int(mw.call("appearance_count"))
 	var bufS: Object = ClassDB.instantiate("VoxelBuffer")
@@ -3881,7 +3910,7 @@ func _test_snowy_world() -> void:
 	_ok(CellCodec.has_state(CellCodec.canonical(CellCodec.pack(GRASS, RAMP, SNOW)), SNOW),
 		"canonical keeps snow_capped on a grass ramp")
 	_ok(CellCodec.has_state(CellCodec.canonical(CellCodec.pack(STONE, 0, SNOW)), SNOW),
-		"canonical keeps snow_capped on a stone cube (declared cappable, though worldgen never stamps it)")
+		"canonical keeps snow_capped on a stone cube (cappable — now stamped on B_MOUNTAINS peaks)")
 	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(DIRT, 0, SNOW))) == 0,
 		"canonical STRIPS snow_capped on dirt (not cappable)")
 	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(WATER, 0, SNOW))) == 0,
@@ -3958,22 +3987,31 @@ func _test_snowy_world() -> void:
 	_ok(not CellCodec.has_state(wv, SNOW), "temperate grass column is BARE (state 0)")
 	_ok(env.temperature(Vector3(float(warm.x) + 0.5, float(wg) + 0.5, float(warm.y) + 0.5)) >= 0.0, "temperate surface reads >= 0 C")
 
-	# (f) altitude-cap probe + Risk 1 documentation.
+	# (f) altitude-cap reachability — NOW SATISFIED by the Mountains biome (the M1 Risk-1 gap is closed).
+	# Tall stone peaks cross the y=96 freeze line, so a TEMPERATE (t >= CLIMATE_TEMPERATE) column reaches
+	# sub-zero SURFACE temperature by ALTITUDE alone. This FLIPS the old "expected none this seed" assert.
 	_ok(ClimateModel.surface_temperature(97, 0.0) < 0.0, "altitude mechanism: temperate surface goes sub-zero above y=96")
 	var alt_cap_found := false
-	for x in range(-400, 400, 7):
-		for z in range(-400, 400, 7):
-			var t: float = TerrainConfig.column_profile(x, z).w
-			if t < ClimateModel.CLIMATE_TEMPERATE:
-				continue                                  # only TEMPERATE columns test altitude-only caps
-			var g: int = TerrainConfig.height_at(x, z)
-			if g >= TerrainConfig.SEA_LEVEL and ClimateModel.surface_temperature(g, t) < 0.0:
-				alt_cap_found = true
+	var alt_cap_at := Vector2i.ZERO
+	for mc: Vector2i in TerrainConfig.find_mountains(6):
+		for dx in range(-160, 161, 3):
+			for dz in range(-160, 161, 3):
+				var ax := mc.x + dx
+				var az := mc.y + dz
+				var p := TerrainConfig.column_profile(ax, az)
+				if p.w < ClimateModel.CLIMATE_TEMPERATE:
+					continue                              # only TEMPERATE columns test altitude-only caps
+				var gg := int(p.x)
+				if gg >= TerrainConfig.SEA_LEVEL and ClimateModel.surface_temperature(gg, p.w) < 0.0:
+					alt_cap_found = true
+					alt_cap_at = Vector2i(ax, az)
+					break
+			if alt_cap_found:
 				break
 		if alt_cap_found:
 			break
-	print("    altitude-cap reachability: temperate column sub-zero by ALTITUDE alone = %s (Risk 1: expected none this seed)" % ("FOUND" if alt_cap_found else "none"))
-	_ok(not alt_cap_found, "Risk 1 documented: NO temperate column reaches sub-zero by altitude alone (max y≈20 << 96)")
+	print("    altitude-cap reachability: TEMPERATE column sub-zero by ALTITUDE alone = %s (%s)" % [("FOUND" if alt_cap_found else "none"), alt_cap_at])
+	_ok(alt_cap_found, "Mountains close the Risk-1 gap: a TEMPERATE column now reaches sub-zero surface by ALTITUDE alone (peak crosses y=96)")
 
 	# --- (7) melt/freeze transition fires end-to-end through _edits (ADR §8 item 7) ---
 	if cap.x != 0x7fffffff:
@@ -4079,6 +4117,111 @@ func _find_slab_column() -> Vector2i:
 			if CellCodec.mat(gc) == snow_id and CellCodec.modifier(gc) == TerrainConfig.SNOW_SLAB_MODIFIER:
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
+
+# Mountains biome (SEPARATE tall biome; altitude snow caps). Proves: a real B_MOUNTAINS peak crosses the
+# y=96 freeze line and carries the snow_capped state on bare STONE; the cap predicate holds; the capped
+# peak renders the BAKED snow variant on BOTH paths (module ARID mirror + generator TYPE buffer; fallback
+# look material); peaks are solid full cubes below the surface (floor-scan safe); and the NON-mountain
+# world (mountain factor == 0) is byte-identical.
+func _test_mountains() -> void:
+	print("[MTN] Mountains biome (tall stone peaks + altitude snow caps)")
+	var SNOW := CellCodec.STATE_SNOW_CAPPED
+	# (1) locate the TALLEST peak across several mountain massifs (not every massif crosses y=96;
+	# scan a spread of them and keep the global tallest B_MOUNTAINS column). Deterministic, loud-fail.
+	var massifs := TerrainConfig.find_mountains(12)
+	_ok(massifs.size() > 0, "found B_MOUNTAINS massifs")
+	if massifs.is_empty():
+		return
+	var peak := Vector2i(0x7fffffff, 0)
+	var peak_g := -0x7fffffff
+	for mc: Vector2i in massifs:
+		for dx in range(-160, 161):
+			for dz in range(-160, 161):
+				var x := mc.x + dx
+				var z := mc.y + dz
+				var p := TerrainConfig.column_profile(x, z)
+				if int(p.y) != TerrainConfig.B_MOUNTAINS:
+					continue
+				var g := int(p.x)
+				if g > peak_g:
+					peak_g = g
+					peak = Vector2i(x, z)
+	_ok(peak.x != 0x7fffffff, "found a B_MOUNTAINS column (tallest peak at %s, g=%d)" % [peak, peak_g])
+	_ok(peak_g > 96, "mountain peak crosses the y=96 freeze line (peak g = %d)" % peak_g)
+
+	# (2) the peak surface cell: bare STONE, cappable, snow_capped state set, surface_temperature < 0.
+	var pt: float = TerrainConfig.column_profile(peak.x, peak.y).w
+	var pv := TerrainConfig.generated_cell(peak.x, peak_g, peak.y)
+	_ok(CellCodec.mat(pv) == STONE, "mountain peak top is bare STONE (id %d)" % CellCodec.mat(pv))
+	_ok(BlockCatalog.state_mask_of(STONE) & SNOW != 0, "stone is a declared cappable material")
+	_ok(ClimateModel.surface_temperature(peak_g, pt) < 0.0, "peak surface_temperature < 0 (%.2f C)" % ClimateModel.surface_temperature(peak_g, pt))
+	_ok(CellCodec.has_state(pv, SNOW), "mountain peak surface cell carries the snow_capped state")
+	_ok(CellCodec.canonical(pv) == pv, "capped peak cell is canonical-stable")
+	var env := PerVoxelEnvironment.new()
+	_ok(env.temperature(Vector3(float(peak.x) + 0.5, float(peak_g) + 0.5, float(peak.y) + 0.5)) < 0.0, "sampled ground temperature at the peak < 0")
+
+	# (3) peaks are SOLID full cubes below the surface — the analytic floor scan can never fall through.
+	var solid_ok := true
+	for dyy in range(1, 12):
+		if BlockCatalog.solidity_of(TerrainConfig.generated_block(peak.x, peak_g - dyy, peak.y)) < 0.5:
+			solid_ok = false
+	_ok(solid_ok, "mountain interior below the peak is solid full cubes (no fall-through)")
+
+	# (4) byte-identity of the NON-mountain world: where the mountain FACTOR is exactly 0 the uplift term
+	# is `+= 0.0`, so height/biome/cell are bit-for-bit the pre-change values. Prove the demo spawn and the
+	# vast majority of a wide lowland scan are factor 0 (untouched); every factor-0 column is non-mountain.
+	var spawn := TerrainConfig.find_spawn()
+	var sc: float = TerrainConfig.column_profile(spawn.x, spawn.y).z
+	_ok(TerrainConfig._mountain_factor(sc, float(spawn.x), float(spawn.y)) == 0.0, "find_spawn() column has mountain factor 0 (byte-identical, untouched)")
+	var demo := Vector2i(-187, 289)
+	var dc: float = TerrainConfig.column_profile(demo.x, demo.y).z
+	_ok(TerrainConfig._mountain_factor(dc, float(demo.x), float(demo.y)) == 0.0, "snow-demo spawn (-187,289) has mountain factor 0 (byte-identical)")
+	var zero_cols := 0
+	var total_cols := 0
+	var factor0_never_mtn := true
+	for x in range(-400, 400, 8):
+		for z in range(-400, 400, 8):
+			var pp := TerrainConfig.column_profile(x, z)
+			var f := TerrainConfig._mountain_factor(pp.z, float(x), float(z))
+			total_cols += 1
+			if f == 0.0:
+				zero_cols += 1
+				if int(pp.y) == TerrainConfig.B_MOUNTAINS:
+					factor0_never_mtn = false
+	_ok(factor0_never_mtn, "no factor-0 column is ever classified B_MOUNTAINS")
+	_ok(zero_cols * 100 >= total_cols * 80, "most of the world is untouched by mountains (factor 0 in %d/%d cols near origin)" % [zero_cols, total_cols])
+
+	# (5) BOTH render paths render the capped stone peak WHITE (not plain rock).
+	# Fallback look: the snow variant material differs from the plain stone material.
+	_ok(BlockMaterials.snow_capped_for(STONE) != BlockMaterials.get_for(STONE), "fallback: capped-stone look material differs from plain stone")
+	# Module path: arid_for_cell(peak cell) is the baked snow variant, differs from the plain-stone ARID at
+	# the same modifier, and matches the gen_arid_for mirror; the generated TYPE buffer agrees.
+	if ClassDB.class_exists("VoxelTerrain") and ClassDB.class_exists("VoxelBuffer"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		if bool(mw.call("setup")):
+			var pmod := CellCodec.modifier(pv)
+			var capped_arid := int(mw.call("arid_for_cell", pv))
+			var plain_pv := CellCodec.pack(STONE, pmod, 0)
+			var plain_arid := int(mw.call("arid_for_cell", plain_pv))
+			_ok(capped_arid > 0 and capped_arid != plain_arid, "module: capped peak cell (modifier %d) renders a baked snow variant ARID (%d) != plain stone (%d)" % [pmod, capped_arid, plain_arid])
+			_ok(capped_arid == int(mw.call("gen_arid_for", STONE, pmod, CellCodec.liquid_level(pv), CellCodec.liquid_kind(pv), SNOW)), "module: arid_for_cell(peak) == gen_arid_for mirror")
+			# Generate the block containing the peak cell and confirm its TYPE == the mirror (worker path).
+			var gen: Object = mw.call("get_generator")
+			if gen != null:
+				var bx := int(floor(float(peak.x) / 16.0)) * 16
+				var by := int(floor(float(peak_g) / 16.0)) * 16
+				var bz := int(floor(float(peak.y) / 16.0)) * 16
+				var buf: Object = ClassDB.instantiate("VoxelBuffer")
+				buf.call("create", 16, 16, 16)
+				gen.call("_generate_block", buf, Vector3i(bx, by, bz), 0)
+				var got := int(buf.call("get_voxel", peak.x - bx, peak_g - by, peak.y - bz, 0))
+				_ok(got == capped_arid, "module: generated TYPE at the peak cell (%d) == capped variant ARID (%d)" % [got, capped_arid])
+		else:
+			_ok(false, "module: world builds for the mountain render check")
+		mw.queue_free()
+	else:
+		print("    (godot_voxel module absent — module-path peak render check runs on module builds only)")
 
 
 # Shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). Headless has NO GPU so we

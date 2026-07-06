@@ -429,7 +429,17 @@ zero textures).
 ## Decision 9 — Risks / open issues
 
 1. **HARD REACHABILITY GAP — altitude caps on temperate peaks are INERT for this seed
-   (accepted per user scope decision).** Max ground height = `BASE_HEIGHT(5) + max
+   (accepted per user scope decision).**
+   > **UPDATE (Mountains biome milestone):** this gap is now **CLOSED**. A separate, tall
+   > **B_MOUNTAINS** biome (a low-frequency mask term added in `_height_c`, gated to inland columns,
+   > exactly 0 elsewhere so the rest of the world stays byte-identical) raises peaks to y≈100–112,
+   > crossing the y=96 freeze line. The already-wired altitude cap (`surface_temperature < 0`) whitens
+   > those peaks with no new cap code; `stone` was added to `snow_cappable_materials()` (baked set) so
+   > bare-rock peaks render white on both paths. `MAX_SURFACE_Y` 24→116 and `VIEWER_VERTICAL_RATIO`
+   > 0.2→0.5 (bounded ~2.5× vertical stream) support the taller terrain. The verify altitude-cap probe
+   > was FLIPPED from "expected none" to "FOUND". See the Mountains commit on `feat/voxiverse-multi-liquid`.
+
+   Max ground height (pre-Mountains) = `BASE_HEIGHT(5) + max
    continent_offset(11) + HILLS_AMPLITUDE(3) + DETAIL_AMPLITUDE(1) = 20`; `MAX_SURFACE_Y =
    24` is the verify-proven bound. Temperate freezing altitude = y=96. A reachable temperate
    peak (y≈20) reads `21.5 − 0.224·20 = 17 °C` — never sub-zero. So the unified predicate is

@@ -480,7 +480,8 @@ func _build_gen_manifest(library: Object) -> void:
 			% [wet, _surface_arid[CellCodec.LIQ_WATER]])
 
 ## Bake the snow-cap state VARIANT models and freeze them into `_snow_arid` (M1 ADR §5.2). For each
-## cappable material (grass/podzol/sand) it appends: a snow-variant CUBE at slot `mat*_GEN_STRIDE+0`
+## cappable material (grass/podzol/sand/stone — stone tops B_MOUNTAINS peaks) it appends: a snow-variant
+## CUBE at slot `mat*_GEN_STRIDE+0`
 ## (a full capped cell), then a snow-variant SHAPE at each emitted modifier (`mat*_GEN_STRIDE+mod`),
 ## REUSING `_shape_mesh_cache[modifier]` so no new ArrayMesh / GPU readback is created — only the
 ## per-model material override differs (BlockMaterials.snow_capped_for). Returns the count appended.

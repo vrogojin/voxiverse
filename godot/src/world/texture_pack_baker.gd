@@ -53,7 +53,7 @@ static func _spec() -> Array:
 		{"out": "amethyst_block",  "src": "amethyst",       "keep_alpha": false, "backing": Color(0.53, 0.38, 0.75)},
 		# --- soils / surface ---
 		{"out": "mud",         "src": "mud",       "keep_alpha": false, "backing": Color(0.24, 0.23, 0.24)},
-		{"out": "sand",        "src": "sand_ugly", "keep_alpha": false, "backing": Color(0.86, 0.83, 0.63)},
+		{"out": "sand",        "src": "sand",      "keep_alpha": false, "backing": Color(0.86, 0.83, 0.63)},
 		{"out": "gravel",      "src": "gravel",    "keep_alpha": false, "backing": Color(0.51, 0.50, 0.49)},
 		{"out": "snow_block",  "src": "snow",      "keep_alpha": false, "backing": Color(0.96, 0.99, 0.99)},
 		# --- cryo (ice_glacier used opaque; the ice MATERIAL applies alpha, WGC §5.1) ---

@@ -44,6 +44,14 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
+	# Diagnostic performance overlay (top-right): FPS, main-thread proc/phys ms, draw
+	# calls + primitives (GPU load), and godot_voxel pending-task counts (worker
+	# saturation). Lets us see the real frame-drop bottleneck in the browser. Remove
+	# once perf is settled.
+	var perf := PerfHUD.new()
+	perf.name = "PerfHUD"
+	add_child(perf)
+
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look

@@ -168,6 +168,14 @@ func spawn_warmups(place_xform: Transform3D) -> int:
 			jobs.append([_build_shape_mesh(modifier, mat), mat])
 			_shaped_mods[modifier] = true
 
+	# 3) The FAR-FIELD material on its OWN vertex format (position + normal + COLOR, NO uv) —
+	#    a distinct GL-Compatibility pipeline that would otherwise compile (~800–950 ms via ANGLE)
+	#    on the first far tile drawn in gameplay. LOD-DESIGN §5.2 belt-and-braces (the coarse-first
+	#    queue also commits ring-3 tiles during the load hold). Only when the far field is enabled.
+	if FarTerrain.ENABLED:
+		var far_mat := FarTerrain.make_material()
+		jobs.append([_build_far_warm_mesh(far_mat), far_mat])
+
 	_place_grid(jobs, place_xform)
 	return _instances.size()
 
@@ -351,6 +359,28 @@ func _emit_cube_face(st: SurfaceTool, d: Vector3i) -> void:
 		st.set_uv(uv[idx])
 		st.set_color(col)
 		st.add_vertex(v[idx])
+
+## A minimal ArrayMesh on the FAR-FIELD vertex format (position + normal + COLOR, no UV) so the
+## far material's GL-Compatibility pipeline compiles here rather than on the first far tile drawn.
+## Two triangles (one quad) is enough to exercise the format; `mat` is set on surface 0.
+func _build_far_warm_mesh(mat: Material) -> ArrayMesh:
+	var verts := PackedVector3Array([
+		Vector3(0, 0, 0), Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(1, 0, 0)])
+	var up := Vector3(0, 1, 0)
+	var normals := PackedVector3Array([up, up, up, up])
+	var colors := PackedColorArray([Color(1, 1, 1), Color(1, 1, 1), Color(1, 1, 1), Color(1, 1, 1)])
+	var indices := PackedInt32Array([0, 1, 2, 0, 2, 3])
+	var surf := []
+	surf.resize(Mesh.ARRAY_MAX)
+	surf[Mesh.ARRAY_VERTEX] = verts
+	surf[Mesh.ARRAY_NORMAL] = normals
+	surf[Mesh.ARRAY_COLOR] = colors
+	surf[Mesh.ARRAY_INDEX] = indices
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
+	if mesh.get_surface_count() > 0:
+		mesh.surface_set_material(0, mat)
+	return mesh
 
 ## A shaped-cell ArrayMesh built from ShapeMesh.build — the SAME ARRAY layout the module
 ## library (module_world._make_shape_model) and VoxelBody consume, so the shaped vertex

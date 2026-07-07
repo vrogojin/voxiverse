@@ -62,8 +62,10 @@ func _ready() -> void:
 	_camera.name = "Camera3D"
 	_camera.position = Vector3(0, eye_height, 0)
 	# Generous far plane so terrain across the full stream range is never clipped;
-	# fog hides the boundary well before the edge.
-	_camera.far = float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
+	# fog hides the boundary well before the edge. With the far field enabled the plane
+	# must reach past R_FAR (LOD-DESIGN §3.5) so the distant rings are not frustum-clipped;
+	# disabled → today's near-only value.
+	_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
 	add_child(_camera)
 

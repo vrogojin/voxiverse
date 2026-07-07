@@ -26,6 +26,7 @@ var using_module: bool = false
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
+var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
@@ -77,6 +78,15 @@ func _ready() -> void:
 	add_child(_ground)
 	_ground.setup(self)
 
+	# Far-distance terrain layer (LOD-DESIGN): render-only, collision-free, voxel-worker-free —
+	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
+	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
+	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
+	if FarTerrain.ENABLED:
+		_far = FarTerrain.new()
+		_far.name = "FarTerrain"
+		add_child(_far)
+
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
@@ -114,6 +124,8 @@ func update_streaming(player_pos: Vector3) -> void:
 		_streamer.update_center(player_pos)
 	if _ground != null:
 		_ground.update(player_pos)
+	if _far != null:
+		_far.update_center(player_pos)
 
 ## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
 ## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the

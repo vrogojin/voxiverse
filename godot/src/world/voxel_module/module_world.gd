@@ -71,6 +71,19 @@ var _snow_arid: PackedInt32Array         # (mat*_GEN_STRIDE + modifier) -> snow-
 var _layer_arid: PackedInt32Array        # level -> snow_block LAYER ARID; -1 = not baked; frozen at setup
 var _snow_id := -1                        # cached BlockCatalog.id_of(&"snow_block") (main thread)
 
+# --- snow-FILL composite tables (SNOW-ACCUMULATION §2.6/§2.7) --------------------
+# Curated 2-surface baked composites — surface 0 the snow-capped terrain ramp, surface 1 the snow LAYER
+# fill (the wet-composite pattern, but snow instead of water). ONE table per curated fill level
+# L∈{3,5,8,10}, keyed `mat*_GEN_STRIDE + modifier` (corner modifiers < 256, so the stride is valid).
+# The render maps the true tenth-level UP to the nearest baked level (feet slightly dusted, never
+# floating). A -1 slot (unbaked pair) degrades on the worker to the M1 snow-cap SKIN → the dry ramp →
+# the cube (the §2.7 ladder, never a hole). Baked + FROZEN at setup before the worker wires.
+var _comp_arid_l3: PackedInt32Array
+var _comp_arid_l5: PackedInt32Array
+var _comp_arid_l8: PackedInt32Array
+var _comp_arid_l10: PackedInt32Array
+const _COMP_MESH_FLAG := 1 << 22         # _shape_mesh_cache key bit for snow-fill composite meshes
+
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
 # LIQ_WATER=1, LIQ_LAVA=2, a third reserved at 3); index 0 (LIQ_NONE) is unused, so every table
@@ -332,6 +345,15 @@ func arid_for_cell(packed: int) -> int:
 					var wslot := mat * _GEN_STRIDE + modifier
 					if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 						return twin[wslot]
+	# Snow-FILL composite (SNOW-ACCUMULATION §2.6): a terrain ramp buried/filled by the snow plane wins
+	# over the plain snow-cap skin (a filled cell is always cold ⇒ also capped). The true level rounds UP
+	# to a baked {3,5,8,10}; an unbaked composite falls through to the snow-cap skin below (the ladder).
+	if lf == 0:
+		var ffill := CellCodec.snow_fill(packed)
+		if ffill != 0:
+			var ca := _comp_arid_of(CellCodec.mat(packed), CellCodec.modifier(packed), ffill)
+			if ca >= 0:
+				return ca
 	# Snow-cap state variant (M1 ADR §5.2): a capped cell (state bit set, no liquid — liquid wins if
 	# both ever coexist) resolves to its frozen snow-variant ARID; an unbaked (mat, modifier) snow
 	# slot falls through to the plain look (a bare cap, wrong skin but correct substance, never a hole).
@@ -489,6 +511,11 @@ func _build_gen_manifest(library: Object) -> void:
 	var layers := _build_layer_manifest(library)
 	appended += layers
 
+	# Snow-FILL composites (SNOW-ACCUMULATION §2.6/§2.7): the curated 2-surface baked models for a
+	# terrain ramp buried/filled by the snow plane, at levels {3,5,8,10} — the largest bake line item.
+	var comps := _build_comp_manifest(library, total)
+	appended += comps
+
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow models
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
@@ -496,6 +523,8 @@ func _build_gen_manifest(library: Object) -> void:
 	print("[module_world] baked snow manifest: %d snow-cap variant models for %d cappable materials"
 		% [snow, TerrainConfig.snow_cappable_materials().size()])
 	print("[module_world] baked snow LAYER manifest: %d snow_block depth-level models (SNOW-ACCUMULATION §1.5)" % layers)
+	print("[module_world] baked snow-FILL composites: %d models over %d cold (mat,modifier) pairs x levels {3,5,8,10} (SNOW-ACCUMULATION §2.7)"
+		% [comps, TerrainConfig.emitted_cold_pairs().size()])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -579,6 +608,94 @@ func _build_layer_manifest(library: Object) -> int:
 		_layer_arid[level] = got
 		appended += 1
 	return appended
+
+## Bake the snow-FILL composite models and freeze them into `_comp_arid_l{3,5,8,10}` (SNOW-ACCUMULATION
+## §2.6/§2.7). For each cold (surface/cap material, corner modifier) pair TerrainConfig.emitted_cold_pairs()
+## samples, appends ONE 2-surface model per curated level: surface 0 = the snow-CAPPED terrain ramp (a
+## filled cell is always cold ⇒ capped, so the exposed ramp reads white), surface 1 = the snow LAYER fill
+## at the level. Meshes are shared across materials per (modifier, level) via `_shape_mesh_cache`; only the
+## per-surface material override differs. Same anti-drift discipline as the dry loop; a drift aborts,
+## leaving the rest -1 (the M1 cap skin / dry ramp falls back on the worker — never a hole). Called on the
+## MAIN thread inside setup(); appends but does not bake (the caller does one batched bake). Returns the
+## count appended. This is the §2.7 bake-budget line item; the trim ladder is levels {5,10} then dropping
+## stone composites (safe because the fallback ends at the M1 skin, not a hole).
+func _build_comp_manifest(library: Object, total: int) -> int:
+	_comp_arid_l3 = PackedInt32Array(); _comp_arid_l3.resize(total * _GEN_STRIDE); _comp_arid_l3.fill(-1)
+	_comp_arid_l5 = PackedInt32Array(); _comp_arid_l5.resize(total * _GEN_STRIDE); _comp_arid_l5.fill(-1)
+	_comp_arid_l8 = PackedInt32Array(); _comp_arid_l8.resize(total * _GEN_STRIDE); _comp_arid_l8.fill(-1)
+	_comp_arid_l10 = PackedInt32Array(); _comp_arid_l10.resize(total * _GEN_STRIDE); _comp_arid_l10.fill(-1)
+	var snow_mat: Material = BlockMaterials.get_for(_snow_id_of())
+	var appended := 0
+	for slot: int in TerrainConfig.emitted_cold_pairs():
+		var mat := slot / _GEN_STRIDE
+		var modifier := slot % _GEN_STRIDE
+		if mat <= BlockCatalog.AIR or mat >= total or modifier <= 0 or modifier >= _GEN_STRIDE:
+			continue
+		if CellCodec.is_layer(modifier):
+			continue                                     # a LAYER cap is baked in _layer_arid, not here
+		var skin: Material = BlockMaterials.snow_capped_for(mat)   # surface-0 = the capped ramp (cold ⇒ white)
+		for level in [3, 5, 8, 10]:
+			var model: Object = _make_composite_model(modifier, level, skin, snow_mat)
+			if model == null:
+				continue                                 # no mesh-model class → cap-skin/dry fallback
+			var expected := _next_arid
+			var got: int = _add_model(library, model)
+			if got != expected:
+				push_warning("[module_world] comp manifest ARID drift (L%d): add_model %d != expected %d" % [level, got, expected])
+				return appended                          # abort composites; dry/snow/layer manifests stand
+			_next_arid += 1
+			match level:
+				3: _comp_arid_l3[slot] = got
+				5: _comp_arid_l5[slot] = got
+				8: _comp_arid_l8[slot] = got
+				10: _comp_arid_l10[slot] = got
+			appended += 1
+	return appended
+
+## Build a snow-FILL composite VoxelBlockyModelMesh (SNOW-ACCUMULATION §2.6): surface 0 = the terrain
+## ramp (ShapeMesh.build(modifier), the snow-capped skin material), surface 1 = the snow LAYER fill at
+## `level` (ShapeMesh.build(make_layer(level)), the snow_block material). The snow surface is lifted a
+## deterministic +0.001 to kill the coplanar z-fight when a ramp triangle sits exactly at the plane. The
+## model stays OPAQUE (transparency_index 0) — its occlusion role is the terrain ramp, so adjacent snow
+## can never cull it. The combined ArrayMesh is shared across materials per (modifier, level) via
+## `_shape_mesh_cache` (the _COMP_MESH_FLAG keyspace, disjoint from corner/FAM/wet keys). Null when the
+## module lacks the mesh-model class.
+func _make_composite_model(modifier: int, level: int, terrain_material: Material, snow_material: Material) -> Object:
+	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
+		return null
+	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
+	if model == null:
+		return null
+	var key := modifier | (level << 8) | _COMP_MESH_FLAG
+	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, ShapeMesh.build(modifier))          # surface 0: the (capped) terrain ramp
+		_add_surface(amesh, _snow_fill_geom(level))             # surface 1: the snow LAYER fill (eps-lifted)
+		_shape_mesh_cache[key] = amesh
+	if model.has_method("set_mesh"):
+		model.call("set_mesh", amesh)
+	else:
+		_set_if(model, "mesh", amesh)
+	if model.has_method("set_material_override"):
+		model.call("set_material_override", 0, terrain_material)
+		model.call("set_material_override", 1, snow_material)
+	if model.has_method("set_transparency_index"):
+		model.call("set_transparency_index", 0)                 # opaque: the ramp is the occlusion role
+	return model
+
+## The snow LAYER fill geometry at `level`, lifted +0.001 in y so a coplanar ramp triangle (only at
+## level 5 vs corners-1) never z-fights the snow plane (SNOW-ACCUMULATION §2.6 epsilon). make_layer(10)
+## == 0 → a full cube (the buried case); make_layer(5) == 85 → the half-slab; 3/8 → thin FAM slabs.
+func _snow_fill_geom(level: int) -> Dictionary:
+	var geom := ShapeMesh.build(CellCodec.make_layer(level))
+	var verts: PackedVector3Array = geom["verts"]
+	var lifted := PackedVector3Array()
+	lifted.resize(verts.size())
+	for i in verts.size():
+		lifted[i] = verts[i] + Vector3(0.0, 0.001, 0.0)
+	geom["verts"] = lifted
+	return geom
 
 ## The snow_block LRID, resolved once (main thread; BlockCatalog.ensure_ready() ran in setup()).
 func _snow_id_of() -> int:
@@ -702,6 +819,38 @@ func _build_waterlog_manifest(library: Object, total: int, kind: int) -> int:
 		% [kind, appended, pairs.size(), _surface_arid[kind]])
 	return appended
 
+## The snow-FILL composite ARID for (mat, modifier) at true fill `level` (tenths), rounding the level UP
+## to the nearest baked {3,5,8,10}, or -1 when that composite pair was never baked (→ the §2.7 fallback
+## ladder). Shared by arid_for_cell + gen_arid_for (the main-thread mirrors of the worker's fill branch).
+func _comp_arid_of(mat: int, modifier: int, level: int) -> int:
+	if modifier <= 0 or modifier >= _GEN_STRIDE:
+		return -1
+	var table := _comp_table_for(_comp_round_up(level))
+	if table.is_empty():
+		return -1
+	var slot := mat * _GEN_STRIDE + modifier
+	if slot < table.size() and table[slot] >= 0:
+		return table[slot]
+	return -1
+
+## The nearest baked composite level ≥ `level` (render never lower than physics — §2.7 round-UP).
+func _comp_round_up(level: int) -> int:
+	if level <= 3:
+		return 3
+	if level <= 5:
+		return 5
+	if level <= 8:
+		return 8
+	return 10
+
+## The frozen composite table for a rounded level {3,5,8,10}.
+func _comp_table_for(rounded_level: int) -> PackedInt32Array:
+	match rounded_level:
+		3: return _comp_arid_l3
+		5: return _comp_arid_l5
+		8: return _comp_arid_l8
+		_: return _comp_arid_l10
+
 ## Forward (mat, modifier) → ARID exactly as the voxel worker resolves it: AIR → 0, a
 ## full cube → its eager cube ARID, a shaped value → the frozen manifest ARID (cube
 ## fallback when that slot was never baked). Main-thread mirror of the generator's inline
@@ -732,6 +881,15 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 			if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 				return twin[wslot]
 		# unbaked submerged twin → dry shape (fall through)
+	# Snow-FILL composite mirror (SNOW-ACCUMULATION §2.6): a filled ramp resolves to its curated composite
+	# ARID (rounding the level UP), exactly as arid_for_cell / the worker do — checked BEFORE the snow-cap
+	# skin (a filled cell is always also capped). `state` carries the fill nibble (bits 1..4).
+	if liquid_level == 0:
+		var gfill := (state >> CellCodec.STATE_SNOW_FILL_SHIFT) & 0xF
+		if gfill != 0:
+			var gca := _comp_arid_of(mat, modifier, gfill)
+			if gca >= 0:
+				return gca
 	# Snow-cap state variant mirror (M1 ADR §5.2): a capped cell (state bit set, no liquid) resolves
 	# to its frozen snow-variant ARID, exactly as arid_for_cell / the worker do. `state` defaults 0 so
 	# pre-M1 callers are unchanged; verify passes STATE_SNOW_CAPPED to mirror a capped cell.
@@ -1125,6 +1283,10 @@ var gen_twin_arid: Array                # kind -> PackedInt32Array (mat*GEN_STRI
 var surface_arid: PackedInt32Array      # kind -> liquid-surface cell model ARID; -1 = not baked
 var snow_arid: PackedInt32Array         # (mat*GEN_STRIDE + modifier) -> snow-cap variant ARID; -1 = not baked (M1)
 var layer_arid: PackedInt32Array        # level -> snow_block LAYER ARID; -1 = not baked (SNOW-ACCUMULATION §1.5)
+var comp_l3: PackedInt32Array           # (mat*GEN_STRIDE+mod) -> snow-fill composite ARID at level 3 (SNOW-ACCUMULATION §2.6)
+var comp_l5: PackedInt32Array
+var comp_l8: PackedInt32Array
+var comp_l10: PackedInt32Array
 var snow_id := -1                        # snow_block LRID (the curated LAYER material)
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
@@ -1260,6 +1422,25 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[slot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif ((v >> 33) & 0xF) != 0:
+					# Snow-FILL composite (SNOW-ACCUMULATION 2.6): a terrain ramp buried/filled by the snow
+					# plane. The fill nibble (STATE bits 1..4 = value bits 33..36) rounds UP to a curated
+					# level {3,5,8,10}; checked BEFORE snow_capped (a filled cell is always also capped).
+					# Ladder: composite -> snow-cap skin -> dry ramp -> cube (never a hole -- 2.7).
+					var flvl = (v >> 33) & 0xF
+					var ctab = comp_l3
+					if flvl > 8: ctab = comp_l10
+					elif flvl > 5: ctab = comp_l8
+					elif flvl > 3: ctab = comp_l5
+					var cslot = id * GEN_STRIDE + modifier
+					if modifier < GEN_STRIDE and cslot < ctab.size() and ctab[cslot] >= 0:
+						arid = ctab[cslot]
+					elif modifier < GEN_STRIDE and cslot < nsnow and snow_arid[cslot] >= 0:
+						arid = snow_arid[cslot]            # ladder: the M1 snow-cap skin
+					elif modifier < GEN_STRIDE and cslot < ngen and gen_arid[cslot] >= 0:
+						arid = gen_arid[cslot]             # ladder: the dry ramp
+					else:
+						arid = cube_arid[id] if id < ncube else id
 				elif ((v >> 32) & 1) != 0:
 					# Snow-cap state variant (M1 ADR §5.2): a capped cell (state bit 0 set, no liquid) → its
 					# frozen snow-variant ARID; an unbaked snow slot falls back to the plain cube/shape (a bare
@@ -1309,6 +1490,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("surface_arid", _surface_arid)               # kind -> open-liquid surface model (slab or fluid)
 	gen.set("snow_arid", _snow_arid)                     # M1 §5.2: (mat*STRIDE+mod) -> snow-cap variant ARID
 	gen.set("layer_arid", _layer_arid)                   # SNOW-ACCUMULATION §1.5: level -> snow_block LAYER ARID
+	gen.set("comp_l3", _comp_arid_l3)                    # SNOW-ACCUMULATION §2.6: snow-fill composite ARIDs
+	gen.set("comp_l5", _comp_arid_l5)
+	gen.set("comp_l8", _comp_arid_l8)
+	gen.set("comp_l10", _comp_arid_l10)
 	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	return gen

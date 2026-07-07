@@ -4423,7 +4423,10 @@ func _test_mountains() -> void:
 			var plain_pv := CellCodec.pack(STONE, pmod, 0)
 			var plain_arid := int(mw.call("arid_for_cell", plain_pv))
 			_ok(capped_arid > 0 and capped_arid != plain_arid, "module: capped peak cell (modifier %d) renders a baked snow variant ARID (%d) != plain stone (%d)" % [pmod, capped_arid, plain_arid])
-			_ok(capped_arid == int(mw.call("gen_arid_for", STONE, pmod, CellCodec.liquid_level(pv), CellCodec.liquid_kind(pv), SNOW)), "module: arid_for_cell(peak) == gen_arid_for mirror")
+			# SNOW-ACCUMULATION: pass the peak cell's ACTUAL state (a cold ramp peak now also carries the
+			# snow-fill nibble → a composite; a full-cube peak carries only snow_capped → the cap skin) so the
+			# mirror sees the same axis the worker does.
+			_ok(capped_arid == int(mw.call("gen_arid_for", STONE, pmod, CellCodec.liquid_level(pv), CellCodec.liquid_kind(pv), CellCodec.state(pv))), "module: arid_for_cell(peak) == gen_arid_for mirror")
 			# Generate the block containing the peak cell and confirm its TYPE == the mirror (worker path).
 			var gen: Object = mw.call("get_generator")
 			if gen != null:

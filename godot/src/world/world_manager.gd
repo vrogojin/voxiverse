@@ -19,6 +19,15 @@ signal path_selected(using_module: bool)
 ## (the one write that PRESERVES metadata) or by `set_metadata` (an explicit update).
 signal block_entity_orphaned(cell: Vector3i, old_meta: Dictionary)
 
+## Emitted after EVERY cell overlay write (break / place / collapse-carve / snowfall sim /
+## zone load) with the cell and its new canonical PACKED value. The single write choke
+## point (`_write_cell`) fires it as its LAST line, so it is complete by construction —
+## the same completeness argument metadata settlement makes. PortalManager listens to
+## tear down a linked frame whose ring/interior an edit disturbs (PORTALS §3.4.3); no
+## consumer is required, and the handler is a single O(1) dict probe per emit (the
+## snowfall sim's frequent writes stay negligible).
+signal cell_edited(cell: Vector3i, packed: int)
+
 var environment: PerVoxelEnvironment
 var materials: MaterialRegistry
 var using_module: bool = false
@@ -445,6 +454,11 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	_edits[cell] = packed
 	if paint:
 		_paint_cell(cell, packed)
+	# Fire the per-cell edit signal LAST, after the overlay and render mirror are settled,
+	# so any listener (PortalManager teardown) reads a consistent world. Emitted on every
+	# write path — including paint-deferred bulk zone loads — since a zone load can bury a
+	# frame just as a break/place can (PORTALS §3.4.3).
+	cell_edited.emit(cell, packed)
 
 # --- snowfall-sim support (SNOW-ACCUMULATION Decision 4) ------------------------
 # Three tiny primitives the SnowfallSystem composes over the ONE write choke point. It never bypasses

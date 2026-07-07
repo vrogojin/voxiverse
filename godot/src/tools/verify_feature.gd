@@ -65,6 +65,7 @@ func _initialize() -> void:
 	_test_sharp_slope()
 	_test_shader_prewarm()
 	_test_lod_far_field()
+	_test_portal_items()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6328,3 +6329,54 @@ func _find_molten_submerged(m: Vector2i) -> Vector2i:
 			if TerrainConfig.surface_modifier(x, z) != 0:
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
+
+# ---------------------------------------------------------------------------------
+# PORTALS (see docs/PORTALS.md). Headless invariants for the see-through linked
+# portal subsystem: items/inventory, the cell_edited signal, frame detection,
+# the manager registry/teardown, and the off-axis window-frustum math. All run with
+# no GPU (render_enabled = false on the manager); the live visual is eyeballed after
+# deploy (PORTALS §3.7).
+# ---------------------------------------------------------------------------------
+
+# PORTALS §3.7 — Inventory/ItemCatalog + the cell_edited emission contract (Stage 0).
+func _test_portal_items() -> void:
+	print("[portals] items + cell_edited signal")
+	# ItemCatalog facade: tools live in the negative id space, disjoint from blocks.
+	_ok(ItemCatalog.is_item(ItemCatalog.PORTAL_LINKER), "PORTAL_LINKER is an item")
+	_ok(not ItemCatalog.is_item(GRASS), "a block id is not an item")
+	_ok(ItemCatalog.max_stack_of(ItemCatalog.PORTAL_LINKER) == 1, "tool stack cap is 1")
+	# Inventory: item add caps at 1 total (a tool is unique).
+	var inv := Inventory.new()
+	_ok(inv.add(ItemCatalog.PORTAL_LINKER, 1) == 0, "add 1 linker absorbed")
+	_ok(inv.slot(0)["id"] == ItemCatalog.PORTAL_LINKER and inv.slot(0)["count"] == 1, "linker in slot0, count 1")
+	_ok(inv.add(ItemCatalog.PORTAL_LINKER, 1) == 1, "second linker refused (already at cap)")
+	var inv2 := Inventory.new()
+	_ok(inv2.add(ItemCatalog.PORTAL_LINKER, 2) == 1, "add 2 linkers -> 1 surplus (cap 1)")
+	_ok(inv2.slot(0)["count"] == 1 and inv2.slot(1)["id"] == 0, "the tool uses exactly one slot")
+	_ok(inv2.add(0, 5) == 5, "add(0,5) still a no-op returning 5")
+	# Block stacking byte-identical (regression: the add() guard/cap change must not touch blocks).
+	var inv3 := Inventory.new()
+	_ok(inv3.add(GRASS, 70) == 0, "add 70 grass absorbed")
+	_ok(inv3.slot(0)["count"] == 64 and inv3.slot(1)["count"] == 6, "grass splits 64 + 6 (block path unchanged)")
+	# selected_block_id() may now return a negative id.
+	inv.select_slot(0)
+	_ok(inv.selected_block_id() == ItemCatalog.PORTAL_LINKER, "selected_block_id returns the tool id")
+
+	# cell_edited: emitted exactly once per break_terrain / place_block, at the cell.
+	var world: WorldManager = WorldManager.new()
+	world.name = "WorldManagerPortalItems"
+	get_root().add_child(world)
+	var counter := {"n": 0, "last": Vector3i.ZERO}
+	world.cell_edited.connect(func(cell: Vector3i, _packed: int) -> void:
+		counter["n"] = int(counter["n"]) + 1
+		counter["last"] = cell)
+	var col := _grass_column()
+	var g: int = TerrainConfig.height_at(col.x, col.y)
+	var top := Vector3i(col.x, g + 1, col.y)
+	counter["n"] = 0
+	_ok(world.place_block(top, STONE), "place a stone on the grass column")
+	_ok(counter["n"] == 1 and counter["last"] == top, "place_block emits cell_edited once at the cell")
+	counter["n"] = 0
+	_ok(world.break_terrain(top) == STONE, "break the placed stone")
+	_ok(counter["n"] == 1 and counter["last"] == top, "break_terrain emits cell_edited once at the cell")
+	world.queue_free()

@@ -123,6 +123,13 @@ func _refresh_slot(i: int) -> void:
 		tile.visible = false
 		swatch.visible = false
 		label.visible = false
+	elif ItemCatalog.is_item(id):
+		# A non-block ITEM (tool): flat swatch, no count label (stack-1). BlockTextures /
+		# BlockCatalog are never queried with a negative id (PORTALS §3.2.3).
+		swatch.color = ItemCatalog.color_of(id)
+		swatch.visible = true
+		tile.visible = false
+		label.visible = false
 	else:
 		# Show the block's real tile when it has one; fall back to the flat swatch
 		# for tile-less blocks (BlockTextures.texture_for == null).

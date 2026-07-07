@@ -41,6 +41,7 @@ const CEILING_EPS := 0.001               # keep the head a hair below the ceilin
 
 var world: WorldManager                   # injected by Main before _ready
 var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
+var portals: Node = null                   # PortalManager, injected by Main; may be null (standalone/verify) — RMB tool routing
 var flying := false
 ## Input gate. While true the player cannot move, look, break or place — Main holds
 ## this during the load-time shader pre-warm (RENDER-STREAMING-SPIKES) so the hidden
@@ -452,6 +453,9 @@ func _try_place() -> void:
 	var id := inventory.selected_block_id()
 	if id == 0:
 		return                                    # empty slot
+	if id < 0:
+		_use_tool(id)                             # a non-block ITEM (tool) — RMB uses it instead of placing
+		return
 	var target := _current_target()
 	match String(target["kind"]):
 		"terrain":
@@ -467,6 +471,16 @@ func _try_place() -> void:
 			var local_cell: Vector3i = target["cell"] + target["normal"]
 			if body.add_cell(local_cell, id):
 				inventory.consume_selected(1)     # only pay on success
+
+## Use the selected non-block ITEM (negative id) against the currently-aimed target.
+## Reuses the EXACT same aim contract as break/place (`_current_target()`), so tool use
+## and the crosshair can never disagree. A no-op when `portals` is unset (standalone /
+## headless verify) — the tool routing is injected by Main only in the live game.
+func _use_tool(id: int) -> void:
+	if portals == null:
+		return
+	if id == ItemCatalog.PORTAL_LINKER:
+		portals.use_linker(_current_target())
 
 ## AABB overlap: player box (center (px, feet+0.9, pz), half-extents
 ## (PLAYER_RADIUS, 0.9, PLAYER_RADIUS) — i.e. feet up to 1.8 m) vs cell cube

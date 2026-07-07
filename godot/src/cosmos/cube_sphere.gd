@@ -363,6 +363,17 @@ static func _ensure_edge_table(n: int) -> void:
 			table[face * 4 + side] = _gen_edge(face, side, n)
 	_edge_cache[n] = table
 
+## COSMOS crash-fix (WGC §7.4): eagerly build the edge-remap table for `n` on the MAIN thread so a
+## curved-mode voxel WORKER thread never triggers the lazy `_ensure_edge_table` build concurrently
+## with a main-thread fold (FarTerrain / collider / PerVoxelEnvironment / player queries all fold
+## near a face edge). `_edge_cache` is a plain static Dictionary of Arrays; a concurrent read of a
+## half-inserted entry corrupts the container → "Out of bounds get index" / "index out of bounds" in
+## the worker (the browser hang). Called from TerrainConfig.warm_up() before the worker attaches, so
+## every subsequent fold is a pure concurrent READ of a fully-built, never-mutated table (safe). A
+## no-op once built. FLAT_WORLD never folds, so it need not (and does not) call this.
+static func warm_edge_tables(n: int) -> void:
+	_ensure_edge_table(n)
+
 ## Generate one {b, m, t} unfold entry for (face, side) at resolution n.
 static func _gen_edge(face: int, side: int, n: int) -> Dictionary:
 	# Exit axis (the neighbour's outward normal): the axis you head toward crossing this side.

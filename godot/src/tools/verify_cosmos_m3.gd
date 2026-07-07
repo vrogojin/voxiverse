@@ -45,6 +45,7 @@ func _initialize() -> void:
 	_test_d4_fold_matches_m0()         # (c)
 	_test_home_face_flip()             # (d)
 	_test_curved_render_integration()  # (e)
+	_test_edge_table_race_safety()     # (f) crash-fix regression
 	# Leave the shared active face back on HOME_FACE so a subsequent run in the same process is clean.
 	TC.set_active_face(CS.HOME_FACE)
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -281,3 +282,56 @@ func _test_curved_render_integration() -> void:
 	_ok(we.overlay_at(wc_seam) == CellCodec.pack(BlockCatalog.STONE),
 		"overlay_at reads the across-seam edit via its window cell (folds to the global key)")
 	w.free(); w2.free(); we.free()
+
+# ---------------------------------------------------------------------------------------
+# (f) CRASH-FIX REGRESSION — the CubeSphere edge-remap table is a lazily-built static Dictionary/
+# Array. In curved mode the worldgen fold runs on BOTH the voxel WORKER and the main thread; if the
+# worker first-touches the lazy build while the main thread folds concurrently, the shared container
+# corrupts → the worker dies with "index out of bounds" (the browser hang this suite guards against).
+# The fix pre-builds the table on the main thread in TerrainConfig.warm_up() (via
+# CubeSphere.warm_edge_tables) BEFORE the worker attaches, so every later fold is a pure concurrent
+# READ of a frozen table. This test reproduces the exact hazard: WARM first, then storm fold_cell
+# from many threads (incl. the main thread) over out-of-range columns (the WEST/EAST edge strips),
+# and assert every fold returns a valid neighbour face with NO error/crash — and matches the
+# single-threaded reference. Pre-fix this SIGSEGVs; post-fix it is deterministic and clean.
+# ---------------------------------------------------------------------------------------
+func _test_edge_table_race_safety() -> void:
+	print("[f] CRASH-FIX — edge-remap table is race-safe once warm_edge_tables() has pre-built it (WGC §7.4)")
+	var n := CS.n_for(CS.HOME_BODY)
+	# The fix under test: pre-build on the main thread (TerrainConfig.warm_up already did this when
+	# curved; call explicitly so the test stands alone regardless of the FLAT_WORLD const).
+	CS.warm_edge_tables(n)
+	# Single-threaded reference for a set of out-of-range (edge-strip) columns.
+	var cols := []
+	var ref := []
+	for k in range(64):
+		var col := Vector2i(-1 - (k % 40), (k * 131) % n)   # WEST spill (in-range j)
+		cols.append(col)
+		var g := CS.fold_cell(CS.HOME_FACE, col.x, col.y, n)
+		ref.append(int(g["face"]) * 1000000007 + int(g["i"]) * 131 + int(g["j"]))
+	# Concurrent storm: every thread folds the SAME columns many times; a corrupt table would crash or
+	# return a face outside [0, 6). Each thread accumulates a mismatch count against the reference.
+	var mism := [0]
+	var lock := Mutex.new()
+	var worker := func(_seed: int) -> void:
+		var local := 0
+		for _rep in range(2000):
+			for idx in range(cols.size()):
+				var col: Vector2i = cols[idx]
+				var g := CS.fold_cell(CS.HOME_FACE, col.x, col.y, n)
+				var f := int(g["face"])
+				if f < 0 or f >= 6:
+					local += 1
+					continue
+				if f * 1000000007 + int(g["i"]) * 131 + int(g["j"]) != int(ref[idx]):
+					local += 1
+		lock.lock(); mism[0] += local; lock.unlock()
+	var threads := []
+	for i in range(6):
+		var t := Thread.new()
+		t.start(worker.bind(i))
+		threads.append(t)
+	worker.call(999)   # the main thread folds concurrently too
+	for t in threads:
+		t.wait_to_finish()
+	_ok(mism[0] == 0, "concurrent edge folds across %d threads are race-free after warm_edge_tables (mismatches=%d)" % [threads.size() + 1, mism[0]])

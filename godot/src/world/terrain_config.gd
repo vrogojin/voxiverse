@@ -324,6 +324,14 @@ static func warm_up() -> void:
 	_ensure_noise()
 	_ensure_ids()
 	TreeGen.warm_up()
+	# COSMOS crash-fix (WGC §7.4): in curved mode the worldgen fold (LatticeNav → CubeSphere.fold_cell)
+	# reads a lazily-built static edge-remap table. If the voxel WORKER first-touches that build while a
+	# main-thread fold (FarTerrain / collider / HUD / player query) runs concurrently, the shared static
+	# Dictionary/Array corrupts → the worker dies with "index out of bounds" (the browser hang). Build it
+	# NOW on the main thread (warm_up runs in module setup before the worker attaches) so every later fold
+	# is a pure concurrent READ of a frozen table. FLAT_WORLD never folds, so this is skipped there.
+	if not CubeSphere.FLAT_WORLD:
+		CubeSphere.warm_edge_tables(CubeSphere.n_for(CubeSphere.HOME_BODY))
 
 ## Deterministic hash in [0,1) for an integer lattice + salt (3D form of the
 ## TreeGen._hash01 integer-mix family; no floats until the final divide).
@@ -1359,8 +1367,17 @@ static func emitted_modifiers() -> PackedInt32Array:
 		return _emitted_mods
 	_ensure_noise()
 	var seen := {}
-	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
-	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
+	# COSMOS perf (curved-demo load stall): the spatial sample below runs find_spawn/find_coast/
+	# find_mountains + several 160-radius height scans, each ~3× costlier in curved mode (every
+	# height_at is a 3D-noise fold, and find_coast_of scans to radius 512/1024). It exists only to
+	# catch stray corner modifiers, but the unconditional union of the FULL corner-tuple family +
+	# the snow slab (below) is already a SUPERSET of everything it can find (every _modifier_from_
+	# targets output is a member of appearance_modifiers()). So in curved mode we SKIP the sample
+	# entirely — the emitted set is identical (union-dominated) and the ~6 s scan is gone. FLAT_WORLD
+	# keeps the exact sample path → byte-identical.
+	if CubeSphere.FLAT_WORLD:
+		_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
+		_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
 	# Mountains biome: its gently-sloped stone flanks emit corner-height modifiers NOT present in the
 	# temperate spawn/coast samples — mountains alone reach ~60 of the 61 globally-emitted modifiers
 	# (every gentle-slope orientation occurs). A snow-capped stone peak cell whose modifier is unbaked
@@ -1368,8 +1385,8 @@ static func emitted_modifiers() -> PackedInt32Array:
 	# angularly-spread mountain massifs — enough that emitted_modifiers() reaches the complete reachable
 	# set (verify asserts a wide mountain scan emits NO modifier missing from this set). One-time setup
 	# cost (main thread); never the voxel worker.
-	for mc: Vector2i in find_mountains(6):
-		_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
+		for mc: Vector2i in find_mountains(6):
+			_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
 	# The snow half-slab modifier (M1 ADR §6.4): worldgen emits (snow_block, 85) on deep-frozen
 	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
 	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
@@ -1852,6 +1869,16 @@ static func emitted_shore_pairs(kind := CellCodec.LIQ_WATER) -> PackedInt32Array
 	_ensure_noise()
 	_ensure_ids()
 	var out := PackedInt32Array()
+	# COSMOS perf (curved-demo load stall): this spatial sample calls find_coast_of (a radius-512/1024
+	# scan) + a 160-radius region scan, each ~3× costlier per column in curved mode, purely to catch
+	# SHORE (level-9) composite pairs. The waterlog manifest ALSO unions emitted_submerged_pairs, which
+	# is analytically material-complete (every fill material × the full corner family), so every real
+	# co-filled cell still gets a baked twin without this sample; an unsampled shore pair degrades to
+	# the dry border (a notch, never a hole). Skip it in curved mode (the pole home face has no nearby
+	# unfrozen coast anyway → the scan finds none and wastes the full radius). FLAT keeps it exact.
+	if not CubeSphere.FLAT_WORLD:
+		_shore_pairs_by_kind[kind] = out
+		return out
 	var c := find_coast_of(kind)
 	if c == _COAST_NONE:
 		# No coast of this kind in range (e.g. a lava sea outside the scan radius for this seed):

@@ -47,6 +47,14 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
+	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
+	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
+	# on-device (esp. the M4 seam-handoff frame/memory budget). DEMO instrumentation — revert
+	# before any PR to main.
+	var perf := PerfHUD.new()
+	perf.name = "PerfHUD"
+	add_child(perf)
+
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look

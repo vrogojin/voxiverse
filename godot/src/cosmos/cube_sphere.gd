@@ -48,6 +48,37 @@ const FACE_V := [
 	[ 0, 0, 1], [ 0, 0, 1], [ 0, 0, 1], [ 0, 0, 1], [-1, 0, 0], [ 1, 0, 0],
 ]  # v^  (j axis)
 
+# COSMOS frozen-epoch / F4 (docs/COSMOS-AUDIT.md §3.2 item 1): container-FREE axis accessors for the
+# worker hot path. Indexing the nested `const` Arrays above (`FACE_N[face]` → an inner Array) increments
+# that inner Array's copy-on-write refcount, and CONCURRENT `_ref` from the voxel worker pool + the main
+# thread corrupts it (Godot array.cpp:61 "!success") → "Out of bounds get index" → the worker crash /
+# vox_blocks=0. The flat path never hit this because its const-array reads return INTS (no inner
+# refcount). These match-of-literals return a Vector3i VALUE (no container, no refcount), so every
+# concurrent direction sample is lock-free by construction. The nested FACE_* consts stay for the
+# main-thread-only setup (_gen_edge / corner tables), which never races the worker.
+static func _axis_n(face: int) -> Vector3i:
+	match face:
+		0: return Vector3i(1, 0, 0)
+		1: return Vector3i(-1, 0, 0)
+		2: return Vector3i(0, 1, 0)
+		3: return Vector3i(0, -1, 0)
+		4: return Vector3i(0, 0, 1)
+		_: return Vector3i(0, 0, -1)
+
+static func _axis_u(face: int) -> Vector3i:
+	match face:
+		0: return Vector3i(0, 1, 0)
+		1: return Vector3i(0, -1, 0)
+		2: return Vector3i(-1, 0, 0)
+		3: return Vector3i(1, 0, 0)
+		_: return Vector3i(0, 1, 0)
+
+static func _axis_v(face: int) -> Vector3i:
+	match face:
+		4: return Vector3i(-1, 0, 0)
+		5: return Vector3i(1, 0, 0)
+		_: return Vector3i(0, 0, 1)
+
 # Side ids for the edge-remap tables (§4.2). A "side" is the face edge the window can spill
 # across: EAST = past i=N-1 (a=+1), WEST = past i=0 (a=-1), NORTH = past j=N-1 (b=+1),
 # SOUTH = past j=0 (b=-1).
@@ -170,27 +201,34 @@ static func face_cell_to_dir(face: int, fi: float, fj: float, n: int) -> DVec3:
 	var b := 2.0 * (fj + 0.5) / float(n) - 1.0
 	var u := warp(a)                             # THE warp (equal-angle, §2)
 	var v := warp(b)
-	var nn: Array = FACE_N[face]
-	var uu: Array = FACE_U[face]
-	var vv: Array = FACE_V[face]
+	var nn := _axis_n(face)   # container-free (F4): Vector3i value, no inner-Array refcount race
+	var uu := _axis_u(face)
+	var vv := _axis_v(face)
 	var d := DVec3.new(
-		float(nn[0]) + u * float(uu[0]) + v * float(vv[0]),
-		float(nn[1]) + u * float(uu[1]) + v * float(vv[1]),
-		float(nn[2]) + u * float(uu[2]) + v * float(vv[2]),
+		float(nn.x) + u * float(uu.x) + v * float(vv.x),
+		float(nn.y) + u * float(uu.y) + v * float(vv.y),
+		float(nn.z) + u * float(uu.z) + v * float(vv.z),
 	)
-	return d.normalized()
+	# Normalize IN PLACE (F4): avoid the extra DVec3 `.normalized()` allocates — one fewer RefCounted per
+	# column on the worker hot path. Value-identical (same f64 x/l arithmetic).
+	var l := d.length()
+	if l != 0.0:
+		d.x /= l
+		d.y /= l
+		d.z /= l
+	return d
 
 ## unit direction -> {face, fi, fj} (§1.2). face = argmax|component|; the warp is inverted
 ## per axis. Because it recovers u,v as ratios dot(d,u^)/dot(d,n^) and dot(d,v^)/dot(d,n^),
 ## the normalization factor cancels exactly — this is what makes the round-trip robust.
 static func dir_to_face_cell(d: DVec3, n: int) -> Dictionary:
 	var face := face_of_dir(d)
-	var nn: Array = FACE_N[face]
-	var uu: Array = FACE_U[face]
-	var vv: Array = FACE_V[face]
-	var nc := d.x * float(nn[0]) + d.y * float(nn[1]) + d.z * float(nn[2])  # dot(d, n^) = 1/L > 0
-	var uc := d.x * float(uu[0]) + d.y * float(uu[1]) + d.z * float(uu[2])  # dot(d, u^) = u/L
-	var vc := d.x * float(vv[0]) + d.y * float(vv[1]) + d.z * float(vv[2])  # dot(d, v^) = v/L
+	var nn := _axis_n(face)   # container-free (F4)
+	var uu := _axis_u(face)
+	var vv := _axis_v(face)
+	var nc := d.x * float(nn.x) + d.y * float(nn.y) + d.z * float(nn.z)  # dot(d, n^) = 1/L > 0
+	var uc := d.x * float(uu.x) + d.y * float(uu.y) + d.z * float(uu.z)  # dot(d, u^) = u/L
+	var vc := d.x * float(vv.x) + d.y * float(vv.y) + d.z * float(vv.z)  # dot(d, v^) = v/L
 	var u := uc / nc
 	var v := vc / nc
 	var a := unwarp(u)
@@ -204,12 +242,12 @@ static func dir_to_face_cell(d: DVec3, n: int) -> Dictionary:
 ## boundary). Returns {face, fa, fb} as floats.
 static func dir_to_face_cell_f(d: DVec3, n: int) -> Dictionary:
 	var face := face_of_dir(d)
-	var nn: Array = FACE_N[face]
-	var uu: Array = FACE_U[face]
-	var vv: Array = FACE_V[face]
-	var nc := d.x * float(nn[0]) + d.y * float(nn[1]) + d.z * float(nn[2])
-	var uc := d.x * float(uu[0]) + d.y * float(uu[1]) + d.z * float(uu[2])
-	var vc := d.x * float(vv[0]) + d.y * float(vv[1]) + d.z * float(vv[2])
+	var nn := _axis_n(face)   # container-free (F4)
+	var uu := _axis_u(face)
+	var vv := _axis_v(face)
+	var nc := d.x * float(nn.x) + d.y * float(nn.y) + d.z * float(nn.z)
+	var uc := d.x * float(uu.x) + d.y * float(uu.y) + d.z * float(uu.z)
+	var vc := d.x * float(vv.x) + d.y * float(vv.y) + d.z * float(vv.z)
 	var a := unwarp(uc / nc)
 	var b := unwarp(vc / nc)
 	return {

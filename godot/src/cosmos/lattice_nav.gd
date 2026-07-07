@@ -37,6 +37,13 @@ static func neighbor(face: int, i: int, j: int, di: int, dj: int, n: int) -> Dic
 ## an edge first (§4.3/§4.4). THE noise-domain accessor the curved worldgen samples so 3D noise
 ## is seam-continuous. Corner quadrant (fold face −1): the raw off-face direction (M5 stub).
 static func dir_of(face: int, i: int, j: int, n: int) -> CubeSphere.DVec3:
+	# In-range fast path (COSMOS-AUDIT F4): >99.9 % of columns are in [0, N) and fold to the identity,
+	# so skip CubeSphere.fold_cell entirely — no per-column Dictionary allocation. This is value-identical
+	# (fold_cell returns {face, i, j} unchanged for an in-range column) and cuts the curved worker's
+	# per-cell RefCounted/Dictionary churn (which, under extreme concurrent contention, was the residual
+	# non-determinism source once the _active_face / nested-container races were removed).
+	if i >= 0 and i < n and j >= 0 and j < n:
+		return CubeSphere.face_cell_to_dir(face, float(i), float(j), n)
 	var g := CubeSphere.fold_cell(face, i, j, n)
 	var gf: int = g["face"]
 	if gf < 0:

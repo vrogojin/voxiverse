@@ -334,7 +334,7 @@ func arid_for_cell(packed: int) -> int:
 	# SHARP-SLOPE (§4.2): a generated SLOPE cell (FAM bit 15, land-only so lf==0) resolves through the
 	# dedicated frozen slope tables — the snow-capped twin when capped, else the dry slope model; an
 	# unbaked payload falls through to arid_for → plain cube (wrong silhouette, right substance).
-	if lf == 0 and (CellCodec.modifier(packed) & CellCodec.MOD_FAM_BIT) != 0:
+	if lf == 0 and CellCodec.is_slope(CellCodec.modifier(packed)):
 		var pmat := CellCodec.mat(packed)
 		var payload := CellCodec.modifier(packed) & 0xFFF
 		var pslot := pmat * _SLOPE_STRIDE + payload
@@ -749,7 +749,7 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 		# unbaked submerged twin → dry shape (fall through)
 	# SHARP-SLOPE (§4.2) mirror: a generated SLOPE cell (FAM bit 15, land-only) → the dedicated slope
 	# tables (snow twin when capped), exactly as arid_for_cell / the worker do.
-	if liquid_level == 0 and (modifier & CellCodec.MOD_FAM_BIT) != 0:
+	if liquid_level == 0 and CellCodec.is_slope(modifier):
 		var pslot := mat * _SLOPE_STRIDE + (modifier & 0xFFF)
 		if (state & CellCodec.STATE_SNOW_CAPPED) != 0 and pslot < _snow_slope_arid.size() and _snow_slope_arid[pslot] >= 0:
 			return _snow_slope_arid[pslot]
@@ -776,7 +776,7 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 func is_manifest_baked(mat: int, modifier: int) -> bool:
 	if modifier == 0:
 		return mat >= 0 and mat < _cube_arid.size()
-	if (modifier & CellCodec.MOD_FAM_BIT) != 0:            # SHARP-SLOPE: dedicated slope table
+	if CellCodec.is_slope(modifier):                      # SHARP-SLOPE: dedicated slope table (kind 1 only)
 		var pslot := mat * _SLOPE_STRIDE + (modifier & 0xFFF)
 		return pslot < _slope_arid.size() and _slope_arid[pslot] >= 0
 	var slot := mat * _GEN_STRIDE + modifier
@@ -1144,7 +1144,11 @@ var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-c
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
 const SLOPE_STRIDE := 4096
-const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape (SHARP-SLOPE kind 1)
+const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape
+const FAM_KIND_SHIFT := 12               # bits 14..12 select the FAM family kind
+const FAM_KIND_MASK := 0x7
+const FAM_SLOPE := 1                     # kind 1 = SLOPE; only kind 1 routes to the slope table (a future
+                                        # kind-0 LAYER modifier must NOT be mis-indexed here)
 
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
@@ -1275,8 +1279,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[slot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
-				elif (modifier & FAM_BIT) != 0:
-					# SHARP-SLOPE (§4.2): a generated SLOPE cell (FAM bit 15, land-only) -> the dedicated
+				elif (modifier & FAM_BIT) != 0 and ((modifier >> FAM_KIND_SHIFT) & FAM_KIND_MASK) == FAM_SLOPE:
+					# SHARP-SLOPE (§4.2): a generated SLOPE cell (FAM bit 15 + kind 1, land-only) -> the dedicated
 					# slope tables (snow-capped twin when capped, else dry slope); an unbaked payload cube-
 					# falls-back (never a hole). BEFORE the generic snow arm so a capped slope routes here.
 					var pslot = id * SLOPE_STRIDE + (modifier & 0xFFF)

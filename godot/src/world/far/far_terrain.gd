@@ -22,7 +22,13 @@ extends Node3D
 const ENABLED := true
 
 const R_FAR := 3072.0
-const INNER_HOLE := 192.0                 # RENDER_RADIUS_BLOCKS − 64
+const INNER_HOLE := 192.0                 # flat: RENDER_RADIUS_BLOCKS − 64 (near voxel field covers 0..256)
+## Curved near hole: the planet streams a smaller near voxel field (CURVED_RENDER_RADIUS_BLOCKS = 128),
+## so the far LOD must start filling closer in — just inside the near radius (128 − 16 overlap) so no
+## gap-ring opens between the near field and ring 0. inner_hole() picks the right one per world mode.
+const INNER_HOLE_CURVED := 112.0
+static func inner_hole() -> float:
+	return INNER_HOLE if CubeSphere.FLAT_WORLD else INNER_HOLE_CURVED
 
 ## Ring table (LOD-DESIGN §1.2): {outer_m, cell_m, tile_m, grid}. Each ring's cell is
 ## ≈ 2% of its inner radius (a constant screen-space-error target); cell doubles ring
@@ -147,11 +153,12 @@ func _recompute(e: Vector2) -> void:
 ## (covered by the near voxel field). LOD-DESIGN §1.5.
 func _compute_desired(e: Vector2) -> Dictionary:
 	var desired: Dictionary = {}
+	var hole := inner_hole()                 # flat 192 / curved 112 (matches the near voxel radius)
 	for ring in range(RING_TABLE.size()):
 		var rd: Dictionary = RING_TABLE[ring]
 		var tile := float(rd["tile_m"])
 		var outer := float(rd["outer_m"])
-		var inner := INNER_HOLE if ring == 0 else float(RING_TABLE[ring - 1]["outer_m"])
+		var inner := hole if ring == 0 else float(RING_TABLE[ring - 1]["outer_m"])
 		var tris := _tris_per_tile(rd)
 		var lo_x := floori((e.x - outer) / tile)
 		var hi_x := floori((e.x + outer) / tile)
@@ -162,7 +169,7 @@ func _compute_desired(e: Vector2) -> Dictionary:
 				var blo := Vector2(float(tx) * tile, float(tz) * tile)
 				var bhi := blo + Vector2(tile, tile)
 				var maxd := _box_max_dist(e, blo, bhi)
-				if maxd <= INNER_HOLE:
+				if maxd <= hole:
 					continue                        # entirely inside the near-field hole
 				var mind := _box_min_dist(e, blo, bhi)
 				if mind <= outer and maxd >= inner:

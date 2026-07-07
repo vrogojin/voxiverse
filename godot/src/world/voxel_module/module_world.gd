@@ -216,7 +216,10 @@ func setup() -> bool:
 		return false
 	_set_if(_terrain, "mesher", mesher)
 	_set_if(_terrain, "generator", generator)
-	_set_if(_terrain, "max_view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
+	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
+	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
+	_set_if(_terrain, "max_view_distance", TerrainConfig.near_render_radius())
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -1054,7 +1057,7 @@ func restream() -> void:
 		return
 	_set_if(new_terrain, "mesher", _mesher)
 	_set_if(new_terrain, "generator", generator)
-	_set_if(new_terrain, "max_view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	_set_if(new_terrain, "max_view_distance", TerrainConfig.near_render_radius())
 	_set_if(new_terrain, "mesh_block_size", 32)
 	_set_if(new_terrain, "generate_collisions", false)
 	if old_terrain != null:
@@ -1309,7 +1312,7 @@ func attach_viewer(player: Node3D) -> void:
 	_viewer = ClassDB.instantiate("VoxelViewer") as Node
 	if _viewer == null:
 		return
-	_set_if(_viewer, "view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	_set_if(_viewer, "view_distance", TerrainConfig.near_render_radius())
 	# Vertical stream ratio (1.0 now that terrain is shallow; kept configurable in
 	# TerrainConfig should tall terrain return).
 	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)

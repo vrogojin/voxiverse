@@ -118,6 +118,21 @@ const SHELF_HILLS_KEEP := 0.35  # fraction of the low-frequency hills kept in th
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
+## Curved (COSMOS) near-field render radius. The flat world's per-column worldgen is one cheap 2D
+## noise stack; the CURVED world's is a ~8× get_noise_3d + f64 cube-sphere fold per column (§3.5), so
+## streaming the full 256-block near sphere on the web's 2 voxel worker threads takes minutes ("chunks
+## generate veeery slowly"). The far LOD field (FarTerrain) already draws everything past the near hole
+## from a cheap coarse height mesh, so the near voxel field only needs to cover the walk-around
+## neighbourhood. 128 blocks of full-detail voxels ≈ (128/256)³ ≈ 1/8 the data blocks of 256 → ~8×
+## faster curved streaming, with the far LOD (its inner hole moved to match — see FarTerrain) filling
+## the rest seamlessly. FLAT_WORLD is unaffected (near_render_radius() returns the full 256).
+const CURVED_RENDER_RADIUS_BLOCKS := 128
+
+## THE near-field render radius the module viewer/terrain actually use: the full 256 in the flat world,
+## the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet. Flat callers get the byte-identical 256.
+static func near_render_radius() -> int:
+	return RENDER_RADIUS_BLOCKS if CubeSphere.FLAT_WORLD else CURVED_RENDER_RADIUS_BLOCKS
+
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
 ## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the
 ## world was only ~94 blocks tall (bedrock y=-64 .. treetops ~y=30) and 0.2 (±51-block slab) sufficed.

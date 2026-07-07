@@ -27,13 +27,7 @@ func _ready() -> void:
 	# for a temperate land column above the sea (WGC §8), then _find_flat picks the
 	# flattest spot near it. The physics/breaking sandbox is the deterministic
 	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
-	# TEMPORARY mountain-demo spawn — drops the player on a foothill (g≈58) ~117 blocks SW of a
-	# snow-capped peak (g≈97, summit to the NE) so the new Mountains biome + ALTITUDE snow caps are
-	# testable without the ~1300-block trek from origin: bare rock slope below the y=96 freeze line,
-	# white cap above it. The spot is fairly flat (verified). REVERT before the PR — restore
-	# `var spawn := TerrainConfig.find_spawn()`. (The snowy-biome demo spawn was Vector2i(-187, 289).)
-	const MOUNTAIN_DEMO_SPAWN := Vector2i(1224, 378)
-	var spawn := MOUNTAIN_DEMO_SPAWN
+	var spawn := TerrainConfig.find_spawn()
 	var col := _find_flat(spawn.x, spawn.y)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
@@ -49,14 +43,6 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
-
-	# Diagnostic performance overlay (top-right): FPS, main-thread proc/phys ms, draw
-	# calls + primitives (GPU load), and godot_voxel pending-task counts (worker
-	# saturation). Lets us see the real frame-drop bottleneck in the browser. Remove
-	# once perf is settled.
-	var perf := PerfHUD.new()
-	perf.name = "PerfHUD"
-	add_child(perf)
 
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main

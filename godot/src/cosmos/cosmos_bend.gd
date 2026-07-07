@@ -40,11 +40,16 @@ static var _globals_ready := false
 static func ensure_globals() -> void:
 	if _globals_ready:
 		return
-	if typeof(RenderingServer.global_shader_parameter_get(U_ORIGIN)) == TYPE_NIL:
-		RenderingServer.global_shader_parameter_add(U_ORIGIN, RenderingServer.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
-	if typeof(RenderingServer.global_shader_parameter_get(U_RADIUS)) == TYPE_NIL:
-		RenderingServer.global_shader_parameter_add(
-			U_RADIUS, RenderingServer.GLOBAL_VAR_TYPE_FLOAT, float(CubeSphere.radius_for(CubeSphere.HOME_BODY)))
+	# Register the two globals exactly ONCE per process (the `_globals_ready` latch below gates it).
+	# We must NOT probe with `global_shader_parameter_get` first: that RenderingServer call is
+	# EDITOR-ONLY and, in a GLES3/Compatibility export (the browser build), spams
+	# "This function should never be used outside the editor" every frame and tanks perf (it is a
+	# synchronous server round-trip). `_add` is idempotent-safe here because the latch guarantees a
+	# single call; the SET side (set_camera) never reads back. `global_shader_parameter_list()` would
+	# be another non-editor existence check, but the latch makes any check unnecessary.
+	RenderingServer.global_shader_parameter_add(U_ORIGIN, RenderingServer.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
+	RenderingServer.global_shader_parameter_add(
+		U_RADIUS, RenderingServer.GLOBAL_VAR_TYPE_FLOAT, float(CubeSphere.radius_for(CubeSphere.HOME_BODY)))
 	_globals_ready = true
 
 ## Push the current camera position (window/scene space) into the bend origin global uniform. The

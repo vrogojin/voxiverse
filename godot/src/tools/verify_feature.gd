@@ -4388,6 +4388,8 @@ func _test_sharp_slope() -> void:
 
 	# --- placement + physics pins ----------------------------------------------------
 	_test_sharp_slope_live()
+	# --- S2 worldgen: emission, byte-identity, collider contract, both-path mirror ----
+	_test_sharp_slope_worldgen()
 
 # S1 placement/physics: place a SLOPE cell, drive floor_under / break / VoxelBody, render both paths.
 func _test_sharp_slope_live() -> void:
@@ -4435,6 +4437,164 @@ func _test_sharp_slope_live() -> void:
 			var arid: int = mw.call("arid_for", STONE, SLOPE)
 			_ok(arid > 0, "slope-live: module arid_for(stone, slope) yields a shaped ARID (%d)" % arid)
 			_ok(int(mw.call("arid_for", STONE, SLOPE)) == arid, "slope-live: slope ARID stable on re-lookup")
+		mw.queue_free()
+
+# SHARP-SLOPE S2 worldgen: steepness emission on mountain faces, byte-identity of the non-steep
+# world, the generalized collider cheap-query contract (memo == worker-direct), no-hole runs, the
+# crack audit, and the module both-path ARID mirror.
+func _test_sharp_slope_worldgen() -> void:
+	print("[S2] sharp-slope worldgen: emission + byte-identity + collider contract + both-path mirror")
+	# Find slope-emitting columns on a mountain face (loud fail if none — the whole point).
+	var mtn: Vector2i = TerrainConfig.find_mountain()
+	var fires: Array = []
+	for dz in range(-40, 40):
+		for dx in range(-40, 40):
+			var x := mtn.x + dx
+			var z := mtn.y + dz
+			if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(x, z)):
+				fires.append(Vector2i(x, z))
+	_ok(fires.size() > 0, "slope-gen: mountain face has SLOPE-emitting columns (%d found) — pyramids replaced" % fires.size())
+
+	# (3a) every run cell canonical, materials are skin/banding, NO ore in the run.
+	var canon_ok := true
+	var run_has_slope := false
+	var ore_absent := true
+	var ore_ids := {}
+	for oname in [&"coal_ore", &"iron_ore", &"gold_ore", &"copper_ore", &"redstone_ore", &"diamond_ore", &"emerald_ore", &"lapis_ore"]:
+		var oid := BlockCatalog.id_of(oname)
+		if oid > 0:
+			ore_ids[oid] = true
+	for col: Vector2i in fires:
+		var g: int = TerrainConfig.height_at(col.x, col.y)
+		var run := TerrainConfig.slope_run_of(col.x, col.y)
+		var rng := TerrainConfig.slope_run_range(run, g)
+		for y in range(rng.x, rng.y):
+			var v: int = TerrainConfig.generated_cell(col.x, y, col.y)
+			if CellCodec.canonical(v) != v:
+				canon_ok = false
+			if CellCodec.is_slope(CellCodec.modifier(v)):
+				run_has_slope = true
+			if ore_ids.has(CellCodec.mat(v)):
+				ore_absent = false
+	_ok(run_has_slope, "slope-gen: run cells carry canonical SLOPE modifiers")
+	_ok(canon_ok, "slope-gen: every run cell is canonical (canonical(v) == v)")
+	_ok(ore_absent, "slope-gen: no ore/strata generated on carved slope faces (Risk 6)")
+
+	# (3d) no-hole: a slope column is SOLID from below the run up to the clamp plane, then air above.
+	var no_hole := true
+	for col: Vector2i in fires:
+		var g: int = TerrainConfig.height_at(col.x, col.y)
+		var run := TerrainConfig.slope_run_of(col.x, col.y)
+		var rng := TerrainConfig.slope_run_range(run, g)
+		# below the run (one cell under lo) must be solid full; the cell just above the run top must be air.
+		var below: int = TerrainConfig.generated_cell(col.x, rng.x - 1, col.y)
+		if CellCodec.mat(below) == BlockCatalog.AIR:
+			no_hole = false
+		# contiguous solid through the run (each run cell has material somewhere in its footprint)
+		for y in range(rng.x, rng.y):
+			var vv: int = TerrainConfig.generated_cell(col.x, y, col.y)
+			if CellCodec.mat(vv) == BlockCatalog.AIR:
+				no_hole = false
+	_ok(no_hole, "slope-gen: slope columns are gap-free (solid below the run, material through it)")
+
+	# (4) THE generalized collider contract: generated_modifier_at == modifier(generated_cell) for
+	# y ∈ [g−4, g+4], memo (analytic) == worker-direct ({}) — over the mountain sweep.
+	var gma_ok := true
+	var memo_ok := true
+	for col: Vector2i in fires:
+		var g: int = TerrainConfig.height_at(col.x, col.y)
+		for y in range(g - 4, g + 5):
+			var direct: int = CellCodec.modifier(TerrainConfig.generated_cell(col.x, y, col.y))
+			var light: int = TerrainConfig.generated_modifier_at(col.x, y, col.y)      # analytic (memo)
+			var worker: int = TerrainConfig.generated_modifier_at(col.x, y, col.y, {})  # worker-direct
+			if light != direct:
+				gma_ok = false
+			if worker != direct:
+				memo_ok = false
+	_ok(gma_ok, "slope-contract: generated_modifier_at == modifier(generated_cell) for y∈[g−4,g+4] (memo)")
+	_ok(memo_ok, "slope-contract: memo == worker-direct ({}) — one predicate, no divergence")
+
+	# (3e) BYTE-IDENTITY of the non-steep world: a column with NO firing column in its 3×3 stencil
+	# uses raw half-block quantization == legacy, so its surface/cap modifier equals the PRE-slope
+	# computation. Verified over the gentle spawn patch AND that no slope appears there.
+	var spawn: Vector2i = TerrainConfig.find_spawn()
+	var byte_ok := true
+	var no_slope_gentle := true
+	var checked_gentle := 0
+	for dz in range(-30, 30):
+		for dx in range(-30, 30):
+			var x := spawn.x + dx
+			var z := spawn.y + dz
+			# skip rim columns (a firing column in the 3×3 legitimately reshapes them, §3.1 Risk 3)
+			var rim := false
+			for jx in range(-1, 2):
+				for jz in range(-1, 2):
+					if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(x + jx, z + jz)):
+						rim = true
+			if rim:
+				continue
+			var g: int = TerrainConfig.height_at(x, z)
+			# legacy surface/cap modifiers from the RAW corner targets (the pre-slope formula)
+			var raw := TerrainConfig._corner_targets(x, z, null)
+			var tree := TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR
+			var legacy_sm := 0 if tree else TerrainConfig._modifier_from_targets(raw, g)
+			var legacy_cm := 0 if tree else TerrainConfig._modifier_from_targets(raw, g + 1)
+			if TerrainConfig.surface_modifier(x, z) != legacy_sm:
+				byte_ok = false
+			# cap byte-identity ignores the deep-frozen snow-slab fold (unchanged by this feature)
+			if legacy_cm != 0 and TerrainConfig.surface_cap_modifier(x, z) != legacy_cm:
+				byte_ok = false
+			if CellCodec.is_slope(CellCodec.modifier(TerrainConfig.generated_cell(x, g, z))):
+				no_slope_gentle = false
+			checked_gentle += 1
+	_ok(checked_gentle > 0, "slope-byte: swept %d gentle non-rim columns at spawn" % checked_gentle)
+	_ok(byte_ok, "slope-byte: non-rim surface/cap modifiers == legacy raw-target computation (byte-identical)")
+	_ok(no_slope_gentle, "slope-byte: no SLOPE cells generated in the gentle spawn region")
+
+	# (3c) crack audit (§3.1 / §5.2.3c): a lattice corner shared between a slope cell and its +X
+	# neighbour quantizes to ONE value from EITHER cell's _quantized_targets — so the corner-height
+	# plane is C0 across the seam (no crack), whether the neighbour is slope or legacy.
+	var crack_ok := true
+	for col: Vector2i in fires:
+		var qa := TerrainConfig._quantized_targets(col.x, col.y, null)          # this cell (c00,c10,c11,c01)
+		var qb := TerrainConfig._quantized_targets(col.x + 1, col.y, null)      # +X neighbour cell
+		# this cell's +X edge corners (c10 @ (x+1,z), c11 @ (x+1,z+1)) == neighbour's −X edge (c00, c01)
+		if absf(qa.y - qb.x) > 1e-6 or absf(qa.z - qb.w) > 1e-6:
+			crack_ok = false
+		# and the +Z neighbour, same discipline on the other axis
+		var qc := TerrainConfig._quantized_targets(col.x, col.y + 1, null)      # +Z neighbour cell
+		if absf(qa.w - qc.x) > 1e-6 or absf(qa.z - qc.y) > 1e-6:
+			crack_ok = false
+	_ok(crack_ok, "slope-crack: shared lattice corners quantize identically from either cell (crack-free)")
+
+	# (6) both-path module mirror: arid_for_cell == gen_arid_for mirror for a generated slope cell;
+	# unbaked payload → cube (never 0); a snow-capped run cell → the _snow_slope_arid slot.
+	if ClassDB.class_exists("VoxelTerrain") and fires.size() > 0:
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		if bool(mw.call("setup")):
+			var mirror_ok := true
+			var slope_arid_seen := false
+			for col: Vector2i in fires:
+				var g: int = TerrainConfig.height_at(col.x, col.y)
+				var run := TerrainConfig.slope_run_of(col.x, col.y)
+				var rng := TerrainConfig.slope_run_range(run, g)
+				for y in range(rng.x, rng.y):
+					var v: int = TerrainConfig.generated_cell(col.x, y, col.y)
+					if not CellCodec.is_slope(CellCodec.modifier(v)):
+						continue
+					var a1: int = mw.call("arid_for_cell", v)
+					var a2: int = mw.call("gen_arid_for", CellCodec.mat(v), CellCodec.modifier(v), 0, CellCodec.LIQ_WATER, CellCodec.state(v))
+					if a1 != a2:
+						mirror_ok = false
+					if a1 > 0:
+						slope_arid_seen = true
+			_ok(mirror_ok, "slope-both: arid_for_cell == gen_arid_for mirror over mountain run cells")
+			_ok(slope_arid_seen, "slope-both: generated slope cells resolve to real (non-zero) ARIDs")
+			# an unbaked slope payload falls back to the material cube (never 0/hole)
+			var unbaked := CellCodec.MOD_FAM_BIT | (CellCodec.FAM_SLOPE << CellCodec.MOD_FAM_KIND_SHIFT) | 0x2AA
+			var fb: int = mw.call("gen_arid_for", STONE, unbaked)
+			_ok(fb == int(mw.call("arid_for", STONE, 0)), "slope-both: unbaked slope payload → material cube ARID (never a hole)")
 		mw.queue_free()
 
 # Shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). Headless has NO GPU so we

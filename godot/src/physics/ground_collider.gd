@@ -408,9 +408,13 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		while world.is_removed(Vector3i(x, y, z)):
 			y -= 1
 	var run_start := 0x7fffffff
+	# SHARP-SLOPE §3.6: fetch the column's packed SLOPE run ONCE (0 = no run) so per-cell modifiers
+	# derive by arithmetic (slope_run_modifier_at) — no per-cell generated_cell OR light-query storm.
+	var srun := TerrainConfig.slope_run_of(x, z, _build_pc)
 	# Sub-surface: the heightmap fills every cell up to h; it is air only where dug out (overlay
 	# 0). At the top (y == h) the LIGHT surface_modifier picks up a smoothed ramp/slab WITHOUT the
-	# heavy generated_cell pipeline. Sub-surface generated cells are always full cubes.
+	# heavy generated_cell pipeline. A slope column instead carves a run of shaped cells here (which
+	# can start BELOW h). Sub-surface generated cells outside the run are always full cubes.
 	while y <= h:
 		var ov := -1
 		if edited:
@@ -418,6 +422,8 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		var modifier := 0
 		if ov > 0:
 			modifier = CellCodec.modifier(ov)
+		elif ov < 0 and srun != 0:
+			modifier = TerrainConfig.slope_run_modifier_at(srun, h, y)   # run cell (0 = full below run)
 		elif ov < 0 and y == h:
 			modifier = TerrainConfig.surface_modifier(x, z, _build_pc)
 		if ov == 0:                                 # dug to air → no box here
@@ -447,10 +453,12 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		elif ov == 0:                               # dug to air
 			pass
 		else:                                       # generated cell above the heightmap top
-			if y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
+			if srun != 0:
+				modifier = TerrainConfig.slope_run_modifier_at(srun, h, y)   # run cap cell (≤ hi−1)
+			elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
 				modifier = TerrainConfig.surface_cap_modifier(x, z, _build_pc)
 			if modifier != 0:
-				solid = true                        # smoothed grass cap → prism
+				solid = true                        # smoothed grass cap / slope run cell → prism
 			elif y <= TerrainConfig.SEA_LEVEL:
 				solid = true                        # sea fill (water/ice) → full-cube box
 			elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:

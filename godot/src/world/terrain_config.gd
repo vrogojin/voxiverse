@@ -1563,3 +1563,50 @@ static func emitted_submerged_pairs(_kind := CellCodec.LIQ_WATER) -> PackedInt32
 		for m: int in mods:
 			out.append(mat * _SHORE_STRIDE + m)
 	return out
+
+## The sampled (surface material, SLOPE payload) pairs worldgen emits (SHARP-SLOPE §4.1) — the module
+## pre-bakes + FREEZES their ARIDs into `_slope_arid`/`_snow_slope_arid`. Encoded `mat * _SLOPE_STRIDE
+## + payload` (payload = the 12-bit slope modifier low bits). A deterministic spatial sample over
+## find_mountains(6) ∪ find_spawn() run cells — mountains dominate but 2-block hill/badland steps fire
+## too. Superset/sample, like emitted_shore_pairs: a rare unsampled pair cube-falls-back on the worker
+## (a transient blocky cell, never a hole). Cached statically; main-thread setup/verify only.
+const _SLOPE_STRIDE := 4096
+const _SLOPE_SAMPLE_R := 32
+static var _slope_pairs_ready := false
+static var _slope_pairs := PackedInt32Array()
+static func emitted_slope_pairs() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()                     # diagnostic: no slope meshes to bake
+	if _slope_pairs_ready:
+		return _slope_pairs
+	_ensure_noise()
+	_ensure_ids()
+	var seen := {}
+	var centres: Array = find_mountains(6)
+	centres.append(find_spawn())
+	for ctr: Vector2i in centres:
+		var pc := {}
+		for dx in range(-_SLOPE_SAMPLE_R, _SLOPE_SAMPLE_R + 1):
+			var x := ctr.x + dx
+			for dz in range(-_SLOPE_SAMPLE_R, _SLOPE_SAMPLE_R + 1):
+				var z := ctr.y + dz
+				var prof := column_profile(x, z, pc)
+				var g := int(prof.x)
+				if not _slope_fires_only(x, z, g, pc):
+					continue
+				var tw := _slope_whole_targets(x, z, pc)
+				var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
+				var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
+				for y in range(lo, hi):
+					var v := resolve_cell(x, y, z, g, int(prof.y), prof.z, prof.w, pc)
+					var mat := CellCodec.mat(v)
+					var mod := CellCodec.modifier(v)
+					if mat != BlockCatalog.AIR and CellCodec.is_slope(mod):
+						seen[mat * _SLOPE_STRIDE + (mod & 0xFFF)] = true
+	var out := PackedInt32Array()
+	for s: int in seen.keys():
+		out.append(s)
+	out.sort()
+	_slope_pairs = out
+	_slope_pairs_ready = true
+	return _slope_pairs

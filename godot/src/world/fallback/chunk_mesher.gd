@@ -216,6 +216,22 @@ static func _emit_terrain_shapes(tools: Dictionary, world: WorldManager,
 			var h := hmap[(lz + 1) * stride + (lx + 1)]
 			var wx := x0 + lx
 			var wz := z0 + lz
+			# SHARP-SLOPE §4.3: a steep SLOPE column emits its whole vertical RUN [lo, hi−1] of shaped
+			# cells (carve below h, caps above h+1), not just h/h+1. Rare buried full cells between the
+			# heightmap top and the run start are emitted as cubes so the fallback stays hole-free.
+			var run := TerrainConfig.slope_run_of(wx, wz)
+			if TerrainConfig.slope_run_fires(run):
+				var rng := TerrainConfig.slope_run_range(run, h)
+				for yy in range(h + 1, rng.x):
+					var vf: int = world.cell_value_at(Vector3i(wx, yy, wz))
+					if CellCodec.modifier(vf) == 0 and BlockCatalog.solidity_of(CellCodec.mat(vf)) >= 0.5:
+						_emit_shaped(tools, Vector3i(wx, yy, wz), _look_of(vf), 0)   # full cube
+				for yy in range(rng.x, rng.y):
+					var vv: int = world.cell_value_at(Vector3i(wx, yy, wz))
+					var mm: int = CellCodec.modifier(vv)
+					if mm != 0 and BlockCatalog.solidity_of(CellCodec.mat(vv)) >= 0.5:
+						_emit_shaped(tools, Vector3i(wx, yy, wz), _look_of(vv), mm)
+				continue
 			# Surface cell (y = h): a smoothing-shaped top emits ShapeMesh geometry.
 			var vs: int = world.cell_value_at(Vector3i(wx, h, wz))
 			var ms: int = CellCodec.modifier(vs)

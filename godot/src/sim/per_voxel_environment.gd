@@ -10,78 +10,56 @@ extends RefCounted
 ## defaults as stubs, ready to be fleshed out for the full engine.
 
 # --- temperature model ---------------------------------------------------------
-# A SIMPLE, BIOME-INDEPENDENT piecewise profile (DESIGN §1, temperature rework).
-# Every column's SURFACE reads the same normal room temperature (21.5 C for BOTH
-# the air voxel and the exposed surface block); the four regions below join up
-# continuously. "Baseline height" here just means each column's own surface, i.e.
-# `TerrainConfig.height_at(x, z)` (the y of the topmost solid ground cell) — the
-# model is derived only from that heightmap, so it is identical for both render
-# paths and needs no meshing.
+# ABSOLUTE-ALTITUDE lapse off a per-climate SEA-LEVEL baseline (M1 snowy-world ADR §3;
+# DESIGN §1 amended). The one authority for the curve is ClimateModel — a pure,
+# dependency-free sink that BOTH this class (THE temperature query interface, engine rule 2)
+# AND TerrainConfig (the snow-cap worldgen predicate) call, so the two can never disagree at
+# the snow-line boundary and no const-cycle forms between them.
 #
-# Let  surface = height_at(x, z),  and for a ground voxel  depth d = surface - y.
+# The OLD per-column re-anchoring (every surface pinned to 21.5) is GONE — it made altitude
+# irrelevant. Let  surface = height_at(x, z),  t = column_profile(x, z).w (climate noise),
+# and for a ground voxel  depth d = surface - y:
 #
-#   AIR (y > surface):  linear from 21.5 C at y = surface down to 0 C at y = 256,
-#       then clamped at 0 C above 256. Anchored per-column at the surface (=21.5)
-#       and globally at ALT_ZERO_Y (=0), so the slope is (256 - surface)/21.5
-#       blocks per degree — ~11.9 blocks/°C for a sea-level column (surface≈0),
-#       ~11.7 blocks/°C for the baseline hills (surface≈5). This guarantees 21.5
-#       at the surface of EVERY column and 0 at altitude 256.
+#   climate offset:  ClimateModel.climate_base(t) — 21.5 C at SEA LEVEL for a temperate column
+#       (t ≥ −0.15), −8 C for a frozen biome (t < −0.55), C0-linear between (B_TAIGA ramp).
+#   altitude lapse:  ~0.224 C/block. The SAME line anchors both the air voxels and the ground's
+#       surface temperature, so surface↔air is exact and monotone.
 #
-#   GROUND (y <= surface):  the maximum of two curves —
-#       cool = max(21.5 - d, 3.0)                      # −1 C per block of depth,
-#                                                        # plateauing at 3 C (d≥18.5)
-#       geo  = 3.0 + max(0, (WORLD_BOTTOM_Y+24) - y)   # +1 C per block below y=-40
-#       T_ground = max(cool, geo)
-#     Near the surface `cool` dominates: 21.5 at d=0, 20.5 one block down, reaching
-#     the 3 C floor at depth 18.5. A flat 3 C plateau then sits between the cooling
-#     zone and the geothermal rise. In the 24 blocks just above bedrock, `geo`
-#     dominates and climbs 1 C per block from 3 C at y=-40 to 27 C at the bedrock
-#     floor (y = WORLD_BOTTOM_Y = -64). BEDROCK REFERENCE: bedrock occupies the
-#     very bottom of the world (100% at y=-64), so the geothermal "24 blocks till
-#     the bedrock" band is measured from WORLD_BOTTOM_Y (-64) upward → y ∈ [-64,-40].
-#     The two curves meet continuously (both = 3 C at y=-40), and the surface block
-#     (d=0) reads exactly 21.5 C.
-const T_AIR := 21.5           # surface baseline temperature, deg C (air AND surface block)
-const ALT_ZERO_Y := 256       # altitude at which air cools to 0 C (requirement 2)
-const T_SURFACE := T_AIR      # the surface block reads the same 21.5 C as the surface air
-const COOL_RATE := 1.0        # ground cools 1 C per block of depth (requirement 3)
-const COOL_FLOOR := 3.0       # cooling plateau, deg C (reached at depth 18.5)
+#   AIR (y > surface):  ClimateModel.air_temperature(y, t) — 0 C at y=96 for a temperate column,
+#       NEGATIVE above with NO clamp (a y=256 air voxel ≈ −35.8 C). Monotone-decreasing forever.
+#   GROUND (y ≤ surface):  cool from the surface anchor toward the 3 C plateau at 1 C/block,
+#       SIGNED (a cold column's permafrost WARMS downward toward the plateau), plus the
+#       geothermal excess (GEO_RATE·(−40 − y) for y < −40) — 3 C at y=−40 climbing to 27 C at
+#       the bedrock floor (y = WORLD_BOTTOM_Y = −64). Deep ground forgets the surface anchor
+#       (toward saturates at 3), so the geothermal pins are altitude/biome-independent.
+#
+# FROZEN-SEA SEAM (structural dependency, do not remove). A generated sea-ice sheet sits at
+# y = SEA_LEVEL, ABOVE the ocean floor, so to this heightmap model it is an "air" voxel. `ice`
+# is structural class "brittle", SOUND (φ=1) only below ~−5 C. So a climatically FROZEN OCEAN
+# column keeps its sea-level air/ice at exactly T_FROZEN_SEA (−8) — else StructuralSolver would
+# read the (vertically unsupported) sheet as tissue-paper and detach it on the first nearby
+# break. This branch is now CONSISTENT WITH the general model (a frozen column reads ≈ −8 at sea
+# level anyway) but stays explicit to CLAMP the ice zone to exactly −8 (pinned).
+const CLIMATE_FROZEN := ClimateModel.CLIMATE_FROZEN   # alias — frozen-ocean seam threshold (structural dep)
+const T_FROZEN_SEA := ClimateModel.T_FROZEN_SEA       # alias — frozen sea-level air/ice temperature, −8 C
+const COOL_RATE := 1.0        # ground cools 1 C per block of depth toward the plateau
+const COOL_FLOOR := 3.0       # cooling plateau, deg C
 const GEO_SPAN := 24          # geothermal rise band: this many blocks above bedrock
-const GEO_RATE := 1.0         # geothermal rise, 1 C per block toward bedrock (requirement 4)
+const GEO_RATE := 1.0         # geothermal rise, 1 C per block toward bedrock
 # The y at which the geothermal rise begins (3 C here, climbing below it to the floor).
 const _GEO_REF_Y := TerrainConfig.WORLD_BOTTOM_Y + GEO_SPAN   # -64 + 24 = -40
 
-# Frozen-sea seam (structural dependency, do not remove). A generated sea-ice sheet
-# sits at y = SEA_LEVEL, ABOVE the ocean-floor surface, so to this heightmap model it
-# is an "air" voxel. `ice` is structural class "brittle", whose φ(T) curve is SOUND
-# (φ=1) only below ~−5 C and collapses toward φ_min as it warms to 0 C. If the sheet
-# read the ~21 C surface air, StructuralSolver would treat it as tissue-paper and
-# detach the (vertically unsupported) sheet on the first nearby break. So a
-# climatically FROZEN OCEAN column keeps its sea-level air/ice sub-zero. LAND stays at
-# the 21.5 C baseline for EVERY biome per the rework spec — only frozen *oceans* are
-# cold, and only at/below the water line where the ice actually sits.
-const CLIMATE_FROZEN := -0.55   # column_profile().w below this = snowy/frozen climate
-const T_FROZEN_SEA := -8.0      # sea-level air/ice temperature over a frozen ocean, deg C
+## Surface AIR temperature at column (x, z): the climate offset minus the altitude lapse at the
+## column's own solid surface (ClimateModel). Public so the HUD/state machine can reuse it.
+static func surface_air_temperature(x: int, z: int) -> float:
+	var surface := TerrainConfig.height_at(x, z)
+	return ClimateModel.surface_temperature(surface, TerrainConfig.column_profile(x, z).w)
 
-## Air temperature at altitude `y` above a `baseline` height: 21.5 C at/below the
-## baseline, cooling linearly to 0 C at ALT_ZERO_Y and clamped at 0 C above it.
-static func _air_at(y: float, baseline: float) -> float:
-	if y <= baseline:
-		return T_SURFACE
-	if y >= float(ALT_ZERO_Y):
-		return 0.0
-	return T_SURFACE * (float(ALT_ZERO_Y) - y) / (float(ALT_ZERO_Y) - baseline)
-
-## Air temperature at altitude `y`. Public so the HUD/state machine can reuse it.
-## Uses the nominal baseline hills height (TerrainConfig.BASE_HEIGHT) as the
-## surface anchor for a generic column: 21.5 C at/below it, dropping to 0 C at 256.
-static func air_temperature(y: float) -> float:
-	return _air_at(y, TerrainConfig.BASE_HEIGHT)
-
-## Surface air temperature at column (x, z). Biome-independent now: every column's
-## surface air is the 21.5 C baseline (the air/ground meet point of the model).
-static func surface_air_temperature(_x: int, _z: int) -> float:
-	return T_SURFACE
+## Air temperature at altitude `y` for climate `t` (default: temperate). Public so the HUD/state
+## machine can reuse it; the absolute-altitude lapse (0 C at y=96 for a temperate column, negative
+## above). The 1-arg call reads a temperate column.
+static func air_temperature(y: float, t: float = ClimateModel.CLIMATE_TEMPERATE) -> float:
+	return ClimateModel.air_temperature(y, t)
 
 # --- light model ---------------------------------------------------------------
 # Air and the exposed surface block are fully lit (1.0); light attenuates
@@ -109,18 +87,21 @@ func temperature(pos: Vector3) -> float:
 	var c := _cell(pos)
 	var surface := TerrainConfig.height_at(c.x, c.z)
 	if c.y > surface:                          # air voxel (incl. water/sea ice above the floor)
-		# Frozen-sea seam: a frozen OCEAN column's sea-level air/ice stays sub-zero so
-		# the brittle-ice structural curve reads the sheet as sound (see const block).
+		# Frozen-sea seam (verbatim): a frozen OCEAN column's sea-level air/ice stays exactly
+		# −8 so the brittle-ice structural curve reads the sheet as sound (see const block).
 		if surface < TerrainConfig.SEA_LEVEL and c.y <= TerrainConfig.SEA_LEVEL \
 				and TerrainConfig.column_profile(c.x, c.z).w < CLIMATE_FROZEN:
 			return T_FROZEN_SEA
-		return _air_at(float(c.y), float(surface))
-	# Ground: cool 1 C per block down (floored at 3 C), overridden by the geothermal
-	# rise in the 24 blocks above bedrock (3 C at y=-40, climbing to 27 C at y=-64).
-	var depth := surface - c.y
-	var cool := maxf(T_SURFACE - COOL_RATE * float(depth), COOL_FLOOR)
-	var geo := COOL_FLOOR + GEO_RATE * maxf(0.0, float(_GEO_REF_Y - c.y))
-	return maxf(cool, geo)
+		return ClimateModel.air_temperature(float(c.y), TerrainConfig.column_profile(c.x, c.z).w)
+	# Ground: cool from the surface anchor toward the 3 C plateau at COOL_RATE/block, SIGNED
+	# (a cold column with ts < COOL_FLOOR warms downward toward the plateau — permafrost), plus
+	# the geothermal excess in the 24 blocks above bedrock (3 C at y=-40, climbing to 27 C at y=-64).
+	var ts := ClimateModel.surface_temperature(surface, TerrainConfig.column_profile(c.x, c.z).w)
+	var d := surface - c.y
+	var toward := maxf(ts - COOL_RATE * float(d), COOL_FLOOR) if ts >= COOL_FLOOR \
+		else minf(ts + COOL_RATE * float(d), COOL_FLOOR)
+	var geo := GEO_RATE * maxf(0.0, float(_GEO_REF_Y - c.y))
+	return toward + geo
 
 ## Normalised light level [0..1] at the voxel containing `pos`.
 func light(pos: Vector3) -> float:

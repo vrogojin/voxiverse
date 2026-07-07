@@ -12,6 +12,7 @@ extends RefCounted
 
 # Cache keyed by block id so repeat lookups reuse one material.
 static var _cache: Dictionary = {}    # int block_id -> StandardMaterial3D
+static var _snow_cache: Dictionary = {}   # int base block_id -> StandardMaterial3D (snow-capped variant, M1)
 
 ## Render material for `block_id`; null for AIR. Cached across calls. Opaque blocks
 ## get a textured (or flat-swatch) unshaded material; translucent blocks (glass/water/
@@ -41,6 +42,29 @@ static func get_for(block_id: int) -> StandardMaterial3D:
 	_cache[block_id] = mat
 	return mat
 
+## The SNOW-CAPPED variant render material for `base_id` (M1 ADR §5.3): the snow_block texture
+## through the standard textured recipe, tinted `lerp(WHITE, color_of(base_id), 0.18)` — a
+## whole-cell reskin toward snow that keeps a subtle base hue. Cached per base id. Used by BOTH
+## render paths for a `snow_capped` grass/podzol/sand cell (the module bakes it into snow-variant
+## models; the fallback commits the surface with it). Zero new texture assets (reuses snow_block's
+## tile); a base id with no snow_block tile falls back to a flat snow-tinted swatch. v2 (top/side
+## split) stays deferred (MAX_SURFACES contention).
+static func snow_capped_for(base_id: int) -> StandardMaterial3D:
+	var cached: StandardMaterial3D = _snow_cache.get(base_id, null)
+	if cached != null:
+		return cached
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+	var tex := BlockTextures.texture_for(snow_id)
+	var tint: Color = lerp(Color.WHITE, BlockCatalog.color_of(base_id), 0.18)
+	var mat: StandardMaterial3D
+	if tex != null:
+		mat = _textured(tex)
+		mat.albedo_color = tint            # tint the (white) snow texture toward the base hue
+	else:
+		mat = _solid(tint)
+	_snow_cache[base_id] = mat
+	return mat
+
 ## Drop the entire per-id render-material cache (RUNTIME-MATERIAL-STREAMING §2.6 session
 ## boundary): a fresh session (world-load / peer session) may bind a given dense LRID to a
 ## DIFFERENT material, so its cached StandardMaterial3D must not persist across a
@@ -48,6 +72,7 @@ static func get_for(block_id: int) -> StandardMaterial3D:
 ## §7.4) — it pairs with the catalog session reset. The next `get_for` rebuilds fresh looks.
 static func reset_cache() -> void:
 	_cache.clear()
+	_snow_cache.clear()             # snow-cap variants (M1) rebind per session too
 
 ## Update the EXISTING cached Material for `block_id` in place from the catalog look
 ## (RUNTIME-MATERIAL-STREAMING §5.3): when an UNRESOLVED placeholder LRID late-resolves

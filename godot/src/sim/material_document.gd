@@ -30,11 +30,17 @@ const MAX_STATES := 16
 ## same def always produces the same bytes, hence the same GMID.
 static func to_document(def: VoxelMaterialDef) -> PackedByteArray:
 	var default_state := def.get_default_state()
+	# STATE-axis layout (VDS §10.3): the declared ordered bit-name list. EMPTY (`[]`) for every
+	# material with no behavioural state variant, so its bytes/GMID stay byte-identical to before
+	# M1 — only the cappable materials (grass/podzol/sand/stone) serialize a non-empty layout.
+	var layout := []
+	for nm: StringName in def.state_layout:
+		layout.append(String(nm))
 	var doc := {
 		"voxiverse_material": SCHEMA_VERSION,
 		"name": String(def.id),
 		"default_state": String(default_state.state_name) if default_state != null else "",
-		"state_layout": [],                          # VDS §10.3 — trivial default this milestone
+		"state_layout": layout,                      # VDS §10.3 — declared STATE-axis bit names
 		"visual_mask": 0,
 		"has_block_entity": default_state.has_block_entity if default_state != null else false,
 		"states": [],
@@ -64,6 +70,11 @@ static func _state_doc(st: VoxelState, mat_name: StringName) -> Dictionary:
 	}
 	if is_finite(st.break_force):
 		physics["break_force"] = st.break_force
+	# Liquid identity (MULTI-LIQUID §2.1): OMITTED when 0 so every non-liquid material's
+	# document — hence its GMID — stays byte-identical. Only water/lava serialize it (safe:
+	# liquids are never placeable/serialized into a zone bundle).
+	if st.liquid_kind != 0:
+		physics["liquid_kind"] = st.liquid_kind
 	var look := {
 		"swatch": [st.tint.r, st.tint.g, st.tint.b, st.tint.a],
 		"texture": String(mat_name),                 # static name reference (§5.3 / Decision D)
@@ -134,15 +145,34 @@ static func from_document(bytes: PackedByteArray) -> VoxelMaterialDef:
 			break
 	if di < 0:
 		return null
-	# transition targets must exist.
+	# STATE-axis layout (VDS §10.3): parse the declared ordered bit names back onto the def.
+	var layout: Array[StringName] = []
+	var lr: Variant = doc.get("state_layout", [])
+	if lr is Array:
+		# The STATE axis is 16 bits and each name claims one; a layout wider than 16, or with a
+		# duplicate name (which would alias two bits), is malformed — reject rather than silently
+		# build an over-wide/aliased mask (_layout_mask would emit bits past bit 15).
+		if (lr as Array).size() > 16:
+			return null
+		for nm: Variant in lr:
+			var sn := StringName(String(nm))
+			if layout.has(sn):
+				return null
+			layout.append(sn)
+	# Transition targets must exist. A target names EITHER another VoxelState OR a declared
+	# STATE-axis layout bit (M1 snow_capped): a "to_state" that is a layout name SETS that bit
+	# rather than switching VoxelState, so it is a valid target. Without this, a cappable
+	# material's own document (which serializes its snow_capped transition) would be rejected by
+	# its round-trip (_test_dynamic_catalog / the bootstrap frozen-core fallback tripwire).
 	for st: VoxelState in states:
 		for t: VoxelStateTransition in st.transitions:
-			if not names.has(String(t.to_state)):
+			if not names.has(String(t.to_state)) and not layout.has(t.to_state):
 				return null
 	var def := VoxelMaterialDef.new()
 	def.id = StringName(String(doc.get("name", "")))
 	def.states = states
 	def.default_state_index = di
+	def.state_layout = layout
 	return def
 
 ## Build one VoxelState from a states[] entry, validating every present numeric is
@@ -185,6 +215,8 @@ static func _state_from(sraw: Dictionary, block_entity: bool) -> VoxelState:
 			st.attachment = float(p["attachment"])
 		if p.has("cull_group"):
 			st.cull_group = int(p["cull_group"])
+		if p.has("liquid_kind"):
+			st.liquid_kind = int(p["liquid_kind"])
 		if p.has("structural_class"):
 			st.structural_class = StringName(String(p["structural_class"]))
 		var an: Variant = p.get("strength_anchors", null)

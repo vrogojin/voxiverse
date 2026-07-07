@@ -43,7 +43,31 @@ const WORLD_BOTTOM_Y := -64      # world floor; below is void (unreachable)
 const BEDROCK_TOP_Y := -59       # bedrock gradient: 100% at -64 -> 0% at -59
 const DEEPSLATE_FULL_Y := -24    # below here: always deepslate
 const DEEPSLATE_TOP_Y := -16     # above here: always stone; dithered band between
-const SEA_LEVEL := 0             # air below SEA_LEVEL fills with water (ice cap when cold)
+const SEA_LEVEL := 0             # air below SEA_LEVEL fills with liquid (ice cap when cold, lava when hot)
+
+## Climate regime thresholds for the sea fill (MULTI-LIQUID §2.4). Frozen (t < -0.55) → ice cap;
+## molten (t >= LAVA_SEA_T) → the sea fill IS lava; temperate in between → water. Frozen and molten
+## are DISJOINT bands, so _sea_liquid_kind (the single regime authority) never has to reconcile them.
+const LAVA_SEA_T := 0.60         # extreme-hot ocean regions: the sea fill IS lava (molten seas)
+
+## Snow half-slab trigger (M1 snowy-world ADR §6.2): a flat, tree-free land column whose SURFACE
+## temperature (ClimateModel) is below this accumulates a bottom half-slab of snow one cell above
+## its surface. −4 < 0, so every slab column is also snow-capped (a consistent stack). Keyed on the
+## surface temperature, NOT the biome, so it fires on deep-frozen flats by climate OR (once tall
+## terrain lands) altitude — not just B_SNOWY.
+const SNOW_SLAB_T := -4.0
+
+## INTERIM (2026-07-06): the fixed half-block snow slab reads too blocky and cannot blend (½-block
+## granularity + it only fires on flat columns, so there is no slope to grade into). Disabled until
+## the snow-ACCUMULATION feature (variable-height fill that grades uneven terrain into a flat white
+## surface + a bounded snowfall sim) replaces it. Flip to true only to A/B the old slab look; the
+## machinery + verify pins stay live so the accumulation work has a baseline to build on.
+const SNOW_SLABS_ENABLED := false
+
+## The snow half-slab shape (M1 ADR §6.1): an all-corners-1 BOTTOM slab (walkable — top +0.5 ≤
+## STEP_MAX; breakable → snow_block, mass 280·½ = 140 kg). Verify-pinned == make_modifier(1,1,1,1,
+## ANCHOR_BOTTOM). Emitted as CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER): no liquid, no state.
+const SNOW_SLAB_MODIFIER := 85
 
 ## The render height of the water surface: the top cell of every open-water column and every
 ## smoothed shore composite renders its water at SEA_LEVEL + WATER_SURFACE_HEIGHT, a slightly sunk
@@ -58,6 +82,25 @@ const BASE_HEIGHT := 5.0        # average ground height at the coast/plains
 const HILLS_AMPLITUDE := 3.0    # shallow rolling hills (open, walkable)
 const DETAIL_AMPLITUDE := 1.0   # small-scale bumpiness on top
 
+# --- Mountains biome (a SEPARATE, TALL biome — does NOT touch hills/plains) --------------------
+# A dedicated LOW-frequency mask noise (_mountain, seed SEED+104, freq 0.0008 — broader than the
+# 0.0015 continent noise, so ranges are coherent, not speckled) carves a few broad ranges. Where the
+# mask (smoothstepped to [0,1]) AND an inland guard (smoothstep on continentalness) are BOTH nonzero,
+# _height_c ADDS mountain_uplift = factor * MOUNTAIN_AMPLITUDE. The factor is EXACTLY 0 outside
+# mountain regions (mask <= MASK_LO, OR coastal c <= C_LO), so `h` there is bit-for-bit unchanged and
+# the whole non-mountain world stays BYTE-IDENTICAL (proven in verify). A full-mask inland peak reaches
+# base(6..16) + 92 ≈ y=98..112 — ABOVE the y=96 freezing altitude (ClimateModel.ALT_ZERO_Y) — so the
+# ALREADY-WIRED altitude snow cap (a surface caps iff surface_temperature < 0) whitens the peaks with
+# NO new cap code. Mountain tops are bare `stone` (rock peaks), added to the baked cappable set so a
+# high stone cap renders white on BOTH paths. Lower flanks (factor below the biome threshold) keep
+# their surrounding climate biome (grass/forest slopes), below the freeze line, bare.
+const MOUNTAIN_AMPLITUDE := 92.0    # full-mask uplift in blocks (a full peak ≈ inland base + this)
+const MOUNTAIN_MASK_LO := 0.35      # mask noise <= this -> factor 0 (world byte-identical); a flank begins here
+const MOUNTAIN_MASK_HI := 0.68      # mask noise >= this -> full peak (factor's mask term = 1)
+const MOUNTAIN_C_LO := 0.05         # continentalness <= this (coast/ocean) -> no uplift (mountains are inland)
+const MOUNTAIN_C_HI := 0.35         # ...fully inland (mask term ungated) at/above this
+const MOUNTAIN_BIOME_T := 0.35      # a column whose mountain FACTOR exceeds this is classified B_MOUNTAINS
+
 # --- beach shelf (WATER-SHORE follow-up): a smooth near-shore seafloor gradient -----------------
 # Across a shallow window around the water line, _height_c fades out the high-frequency surface
 # noise so the near-shore floor follows the gentle continental slope — a smooth shallow shelf the
@@ -71,24 +114,31 @@ const SHELF_HILLS_KEEP := 0.35  # fraction of the low-frequency hills kept in th
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
-## The godot_voxel viewer streams a vertically-scaled sphere: the vertical view radius is
-## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS). The world content is only
-## ~94 blocks tall (bedrock y=-64 .. treetops ~y=30), so a 1.0 ratio streamed a ±256 vertical
-## sphere that is mostly empty air — thousands of blocks each paying the per-column profile pass
-## on the single (web-capped) voxel thread. 0.2 limits streaming to a ~±51-block slab around the
-## viewer, deferring the deep subsurface until the player descends. PURE CONFIG: a block streams
-## identically whenever it DOES stream (only WHEN it streams changes), so determinism and the
-## generated output are unaffected; analytic physics + the collider read TerrainConfig directly
-## (not the mesh), so collision below the streamed slab is unchanged.
-const VIEWER_VERTICAL_RATIO := 0.2
+## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
+## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the
+## world was only ~94 blocks tall (bedrock y=-64 .. treetops ~y=30) and 0.2 (±51-block slab) sufficed.
+## Mountains now reach y≈112, so a SEA-LEVEL player (y≈5) must stream ~107 blocks UP to SEE a peak
+## within the render radius; 0.5 gives a ±128-block slab (0.5·256) that covers the tallest peak from
+## sea level with margin AND, when the player stands ON a peak (y≈108), still streams down past sea
+## level. PERF TRADE-OFF (bounded, deliberate): the streamed vertical slab grows 2×51→2×128 ≈ 2.5×, so
+## ~2.5× more DATA/MESH blocks stream vertically — but the extra blocks are mostly air above the terrain
+## (cheap early-out, below) or interior stone (faces culled); the meshed SURFACE area grows only by the
+## mountains themselves. Horizontal radius is UNCHANGED. PURE CONFIG: a block streams identically
+## whenever it DOES stream (only WHEN changes), so determinism/output are unaffected; analytic physics +
+## the collider read TerrainConfig directly (not the mesh), so collision is unchanged.
+const VIEWER_VERTICAL_RATIO := 0.5
 
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
 ## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +
-## DETAIL_AMPLITUDE(1) = 20 (each FastNoiseLite term is bounded to [-1,1]; Godot normalizes FBM),
-## + 4 margin. A large-sample assert in verify_feature confirms the bound so the early-out can
-## NEVER skip real content (a too-low bound would punch holes in the world).
-const MAX_SURFACE_Y := 24
+## DETAIL_AMPLITUDE(1) + max mountain_uplift (MOUNTAIN_AMPLITUDE(92) · full factor 1.0) = 112 (each
+## FastNoiseLite term is bounded to [-1,1]; Godot normalizes FBM; the mountain factor is a product of
+## two smoothsteps in [0,1]), + 4 margin. A large-sample assert in verify_feature confirms the bound so
+## the early-out can NEVER skip real content (a too-low bound would punch holes in the world). PERF
+## NOTE: raising this from 24 to 116 means the CHEAP constant early-out no longer catches mid-altitude
+## air blocks over FLAT terrain — they pay one column-profile pass before the tighter per-block max_h
+## early-out rejects them. Bounded by the streamed vertical slab; accepted for the Mountains milestone.
+const MAX_SURFACE_Y := 116
 
 ## The world floor: the lowest SOLID cell is bedrock at y = WORLD_BOTTOM_Y; y < WORLD_BOTTOM_Y is
 ## void (air). A block whose whole extent is below this generates nothing (generator skips it).
@@ -109,6 +159,7 @@ const B_SNOWY := 5
 const B_TAIGA := 6
 const B_FOREST := 7
 const B_PLAINS := 8
+const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds) and
@@ -148,12 +199,14 @@ static var _detail: FastNoiseLite      # small-scale bumpiness
 static var _continent: FastNoiseLite   # continentalness (ocean <-> inland)
 static var _temperature: FastNoiseLite # climate temperature
 static var _humidity: FastNoiseLite    # climate humidity
+static var _mountain: FastNoiseLite    # Mountains-biome mask (broad, low-frequency ranges)
 
 # --- cached material ids (resolved once from the data-driven catalog) ---------
 static var _ids_ready := false
 static var _ID_BEDROCK := 0
 static var _ID_DEEPSLATE := 0
 static var _ID_WATER := 0
+static var _ID_LAVA := 0
 static var _ID_ICE := 0
 static var _ID_SAND := 0
 static var _ID_RED_SAND := 0
@@ -195,6 +248,12 @@ static func _ensure_noise() -> void:
 	_temperature = _make_climate(SEED + 102, 0.002)
 	_humidity = _make_climate(SEED + 103, 0.002)
 
+	# Mountains-biome mask (SEPARATE from hills): its OWN low-frequency noise (freq 0.0008 < the 0.0015
+	# continent noise) so mountain ranges are BROAD and coherent rather than speckled. Warmed here on the
+	# MAIN thread (WGC §7.4) before the voxel worker runs — a lazily-built noise first-touched on the
+	# worker is the project's worst data-race class.
+	_mountain = _make_climate(SEED + 104, 0.0008)
+
 static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
 	var n := FastNoiseLite.new()
 	n.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
@@ -213,6 +272,7 @@ static func _ensure_ids() -> void:
 	_ID_BEDROCK = BlockCatalog.id_of(&"bedrock")
 	_ID_DEEPSLATE = BlockCatalog.id_of(&"deepslate")
 	_ID_WATER = BlockCatalog.id_of(&"water")
+	_ID_LAVA = BlockCatalog.id_of(&"lava")
 	_ID_ICE = BlockCatalog.id_of(&"ice")
 	_ID_SAND = BlockCatalog.id_of(&"sand")
 	_ID_RED_SAND = BlockCatalog.id_of(&"red_sand")
@@ -293,6 +353,18 @@ static func _continent_offset(c: float) -> float:
 static func _knot(c: float, c0: float, c1: float, v0: float, v1: float) -> float:
 	return v0 + (v1 - v0) * (c - c0) / (c1 - c0)
 
+## The Mountains-biome uplift FACTOR in [0,1] at column (fx, fz) of continentalness `c`: the mask noise
+## smoothstepped over [MASK_LO, MASK_HI], gated by an inland smoothstep over [C_LO, C_HI]. It is EXACTLY
+## 0.0 wherever the mask noise <= MASK_LO (Godot's smoothstep returns 0 at/below edge0) OR the column is
+## coastal (c <= C_LO) — so `_height_c` adds nothing there and those columns stay BYTE-IDENTICAL. PURE +
+## DETERMINISTIC (one FastNoiseLite sample + two smoothsteps of SEED/position; no randi/Time), so both
+## render paths and the analytic queries agree by construction. Callers _ensure_noise() first.
+static func _mountain_factor(c: float, fx: float, fz: float) -> float:
+	var m := smoothstep(MOUNTAIN_MASK_LO, MOUNTAIN_MASK_HI, _mountain.get_noise_2d(fx, fz))
+	if m <= 0.0:
+		return 0.0                                   # not a mountain here -> uplift 0 (byte-identical world)
+	return m * smoothstep(MOUNTAIN_C_LO, MOUNTAIN_C_HI, c)
+
 static func _height_c(c: float, fx: float, fz: float) -> int:
 	var base := BASE_HEIGHT + _continent_offset(c)
 	var hills := _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
@@ -307,6 +379,11 @@ static func _height_c(c: float, fx: float, fz: float) -> int:
 	var w := clampf(smoothstep(-SHELF_TOP, 0.5, depth) - smoothstep(SHELF_DEPTH - 1.5, SHELF_DEPTH, depth), 0.0, 1.0)
 	if w > 0.0:
 		h = lerp(h, base + hills * SHELF_HILLS_KEEP, w)
+	# Mountains biome (SEPARATE tall term; does NOT touch the hills above). Added AFTER the beach shelf —
+	# mountains are inland (C_LO gate) so their shelf `w` is 0 anyway, keeping every coastal column
+	# byte-identical. The factor is exactly 0 outside mountain regions, so `h` is bit-for-bit unchanged
+	# there; a full-mask inland peak gains up to MOUNTAIN_AMPLITUDE blocks, crossing the y=96 freeze line.
+	h += _mountain_factor(c, fx, fz) * MOUNTAIN_AMPLITUDE
 	return int(floor(h))
 
 ## Surface height (integer y of the topmost SOLID ground cell) at column (x, z).
@@ -318,14 +395,21 @@ static func height_at(x: int, z: int) -> int:
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
 
-## Biome enum (B_*) at column (x, z) — ordered first-match rule chain (WGC §6.4).
-static func _biome(c: float, t: float, h: float, g: int) -> int:
+## Biome enum (B_*) at column (x, z) — ordered first-match rule chain (WGC §6.4). `mountain` is the
+## precomputed Mountains-biome factor (0 outside mountain regions); a column whose factor exceeds
+## MOUNTAIN_BIOME_T is a mountain regardless of climate (a tall peak reads as rock; its snow cap then
+## depends on altitude+climate via the existing surface_temperature predicate). Checked AFTER ocean/beach
+## so the coast is never a mountain, and BEFORE the climate biomes so tall inland ground of ANY climate
+## becomes B_MOUNTAINS. Below the threshold (foothills/flanks) the column keeps its climate biome.
+static func _biome(c: float, t: float, h: float, g: int, mountain: float) -> int:
 	if c < -0.32:
 		return B_OCEAN
 	# Beaches ring the coast: near sea level AND continentally coastal (the c gate
 	# keeps inland lowland dips from speckling as sand — WGC §9 noise-smoothness).
 	if c < 0.25 and g >= SEA_LEVEL - 2 and g <= SEA_LEVEL + 2:
 		return B_BEACH
+	if mountain > MOUNTAIN_BIOME_T:
+		return B_MOUNTAINS
 	if t > 0.45 and h < -0.45:
 		return B_BADLANDS
 	if t > 0.45 and h < 0.0:
@@ -368,7 +452,8 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 	var t := _temperature.get_noise_2d(fx, fz)
 	var hh := _humidity.get_noise_2d(fx, fz)
 	var g := _height_c(c, fx, fz)
-	var prof := Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+	var mtn := _mountain_factor(c, fx, fz)
+	var prof := Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
 	if pcache != null:
 		pcache[Vector2i(x, z)] = prof
 	return prof
@@ -399,20 +484,28 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		# partial lip one cell above its surface, bridging a 1-block step up into a continuous slope.
 		# WATER-SHORE §3.6: underwater caps are now ON — a submerged step descends smoothly over
 		# multiple cells instead of ending in an abrupt half-block ledge. An underwater cap is the
-		# UNDERWATER-FLOOR material (via _surface_cap) and fills its remainder with water through
-		# _with_shore_water (level 9 exactly at the water line, level 10 below). A LAND cap
-		# (g >= SEA_LEVEL ⇒ y = g+1 > SEA_LEVEL) is a NO-OP under _with_shore_water (its y > SEA_LEVEL
+		# UNDERWATER-FLOOR material (via _surface_cap) and fills its remainder with liquid through
+		# _with_shore_liquid (level 9 exactly at the water line, level 10 below). A LAND cap
+		# (g >= SEA_LEVEL ⇒ y = g+1 > SEA_LEVEL) is a NO-OP under _with_shore_liquid (its y > SEA_LEVEL
 		# guard), so land caps stay byte-identical. Returns AIR (falls through) when no cap grows here.
 		if y == g + 1:
 			var cap := _surface_cap(x, z, g, biome, t, pcache)
 			if cap != BlockCatalog.AIR:
-				return _with_shore_water(cap, y, t)
+				# _surface_cap emits EITHER a smoothing lip (which gains the snow-cap STATE on a
+				# cold column) OR the deep-frozen half-slab (snow_block — state-/liquid-free, both
+				# composition wrappers no-op on it, M1 ADR §6). One return covers both cases.
+				return _with_snow_state(_with_shore_liquid(cap, y, t), g, t)
 		# Above the solid ground: sea fill (g < y <= SEA_LEVEL) else the tree overlay.
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
 		return TreeGen.block_at(x, y, z, pcache)
 	var id := _surface_rule(x, y, z, g, biome, c, t)
-	if id == BlockCatalog.STONE:
+	# The stone -> deepslate/strata/ore rewrite applies to INTERIOR stone only (y < g). A B_MOUNTAINS
+	# column tops with STONE at y == g (its cappable rock peak); guarding on `y < g` keeps that top a
+	# PLAIN, cappable stone cell (a strata blob or surface ore would silently break its snow cap). This
+	# is BYTE-IDENTICAL for every pre-existing biome — no _biome_top / _underwater_floor ever returns
+	# STONE, so the y == g branch was never a stone cell before Mountains (only interior fill was).
+	if id == BlockCatalog.STONE and y < g:
 		id = _deep_family(x, y, z)      # stone -> deepslate gradient + strata blobs
 		id = _ore_at(x, y, z, id, biome, c)   # host-aware ore lattice
 	# Smoothing SURFACE shape (SVS §8.1): reshape the walkable top cell of a column into a
@@ -421,24 +514,75 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# material/stackup invariant holds; cells below the surface stay solid full cubes, so the
 	# analytic floor scan can never fall through. WATER-SHORE §3: the g >= SEA_LEVEL gate is
 	# GONE (underwater floors smooth too), and the smoothed surface is composed with the
-	# generated-liquid rule so a shore/floor cell also records the water filling its remainder.
+	# generated-liquid rule so a shore/floor cell also records the liquid filling its remainder.
 	if y == g:
-		return _with_shore_water(_smoothed_surface(x, z, g, id, pcache), y, t)
+		# Snow-cap STATE (M1 ADR §2.3): composed OUTSIDE _with_shore_liquid on the surface cell.
+		# A cold-enough cappable surface (surface_temperature < 0) gains the snow_capped bit; wet
+		# shore composites and underwater columns are excluded (disjointness), so this is a no-op
+		# for every temperate/wet column (byte-identical state axis).
+		return _with_snow_state(_with_shore_liquid(_smoothed_surface(x, z, g, id, pcache), y, t), g, t)
 	return id
 
-## Compose the generated-liquid rule (WATER-SHORE §3) onto a SURFACE cell value: a cell at or
-## below the water line whose solid surface leaves a remainder (modifier != 0) also holds water
-## filling that remainder, top at 0.9 (level 9) when it IS the water line, else full (level 10).
-## PURE: reads only (v, y, t). No-op above the water line, on a full-cube surface (no remainder,
-## nothing to fill), and in the frozen regime at the water line (ice cube / bare frozen ramp —
-## the sheet ends crisply). Water strictly below the ice (y < SEA_LEVEL) is liquid as normal.
-static func _with_shore_water(v: int, y: int, t: float) -> int:
+## Compose the generated-liquid rule (WATER-SHORE §3, MULTI-LIQUID §2.4) onto a SURFACE cell value:
+## a cell at or below the water line whose solid surface leaves a remainder (modifier != 0) also
+## holds LIQUID filling that remainder, top at 0.9 (level 9) when it IS the water line, else full
+## (level 10). The liquid KIND is the column's sea regime (_sea_liquid_kind(t)), so shore AND
+## submerged composites of a molten sea carry LIQ_LAVA. PURE: reads only (v, y, t). No-op above the
+## water line, on a full-cube surface (no remainder), and in the frozen regime at the water line
+## (ice cube / bare frozen ramp — the sheet ends crisply). Liquid strictly below the ice
+## (y < SEA_LEVEL) fills as normal. Byte-identical to the water-only predecessor for t < LAVA_SEA_T.
+static func _with_shore_liquid(v: int, y: int, t: float) -> int:
 	if y > SEA_LEVEL or CellCodec.modifier(v) == 0:
 		return v
 	if y == SEA_LEVEL and t < -0.55:
 		return v                                          # frozen shore: ice regime, no liquid overlay
 	var lvl := CellCodec.LIQ_LEVEL_SURFACE if y == SEA_LEVEL else CellCodec.LIQ_LEVEL_FULL
-	return CellCodec.with_liquid(v, CellCodec.LIQ_WATER, lvl)
+	return CellCodec.with_liquid(v, _sea_liquid_kind(t), lvl)
+
+## Compose the snow-cap STATE (M1 ADR §2.3) onto a surface-appearance cell value `v` whose
+## column surface is at `g`, climate `t`. THE one regime authority for the state axis (the
+## `_with_shore_liquid` pattern), keyed on the column's SURFACE temperature: a cell is
+## `snow_capped` iff ClimateModel.surface_temperature(g, t) < 0. The cap and melt predicates
+## then share ONE zero crossing on ONE field (worldgen stamps `< 0`, the transition melts
+## `>= 0`), so they agree at the boundary. Guards, in order:
+##   * underwater column (g < SEA_LEVEL): no land cap;
+##   * wet shore composite (liquid_field != 0): state ⊥ liquid at the stamping level (§1.6);
+##   * material not declared cappable (state_mask_of(mat) & STATE_SNOW_CAPPED == 0): bare —
+##     the catalog declaration is the one authority; stone IS now produced (B_MOUNTAINS tops columns
+##     with stone, so high stone peaks cap), while snow_block/red_sand/mud stay excluded;
+##   * warm surface (surface_temperature ≥ 0): bare.
+## Any column that returns `v` unchanged keeps its byte-identical state-0 value. Reads only
+## scalars already in resolve_cell → no extra noise sampling on the hot path.
+static func _with_snow_state(v: int, g: int, t: float) -> int:
+	if g < SEA_LEVEL:
+		return v
+	if CellCodec.liquid_field(v) != 0:
+		return v
+	var mat := CellCodec.mat(v)
+	if BlockCatalog.state_mask_of(mat) & CellCodec.STATE_SNOW_CAPPED == 0:
+		return v
+	if ClimateModel.surface_temperature(g, t) >= 0.0:
+		return v
+	return CellCodec.with_state(v, CellCodec.STATE_SNOW_CAPPED)
+
+## True iff a snow half-slab grows at (x, g+1, z) (M1 ADR §6.2): a FLAT (both raw smoothing
+## modifiers 0), tree-free land column at/above sea level whose SURFACE temperature is below
+## SNOW_SLAB_T. Given the already-computed raw smoothing modifiers so the collider cheap query,
+## the shape memo and resolve_cell share ONE predicate. Cheap gate (sm/cm/g) first; the
+## column_profile + surface_temperature eval fires only on flat land columns. Deterministic
+## (pure function of SEED — no randi/Time), so the shape memo stays byte-identical to recompute.
+# NOTE: the snow half-slab rides the SMOOTHING code path — every caller (_shape_entry, _surface_cap,
+# surface_cap_modifier) evaluates it only inside their `SMOOTHING_ENABLED` branch, so toggling the
+# diagnostic `SMOOTHING_ENABLED := false` also removes all snow slabs. Deliberate (slabs share the
+# cap-cell machinery); consistent across every path, so the collider contract never diverges.
+static func _slab_fires(x: int, z: int, g: int, sm: int, cm: int, pcache) -> bool:
+	if not SNOW_SLABS_ENABLED:
+		return false                                  # INTERIM: slabs disabled until accumulation replaces them
+	if sm != 0 or cm != 0 or g < SEA_LEVEL:
+		return false
+	if ClimateModel.surface_temperature(g, column_profile(x, z, pcache).w) >= SNOW_SLAB_T:
+		return false
+	return TreeGen.block_at(x, g + 1, z, pcache) == BlockCatalog.AIR
 
 # ------------------------------------------------------------------------------
 # Deterministic terrain smoothing (SUB-VOXEL-SMOOTHING §8.1). The walkable surface
@@ -511,10 +655,15 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 # (y==g) or cap (y==g+1) cell on nearly every probe; each recomputes the 3×3 corner-target stencil
 # = 9 height_at = 27 fresh noise samples (a surface cell measured 2.9 → 13.2 µs, 4.2×). While the
 # player MOVES it fires ~6 such probes per tick → ms-scale on wasm → the "smoothing stutter". This
-# memo caches, per column, the (g, surface_modifier, cap_modifier) triple — PURE functions of SEED
-# (immutable at runtime; player edits live in the overlay, never in generated modifiers), so it is
-# byte-identical to recomputing. Packed int: (g + _MEMO_G_BIAS) | surface_mod<<16 | cap_mod<<24
-# (both mods are BOTTOM corner-height codes < 256; g biased so its low 16 bits stay positive).
+# memo caches, per column, the (g, surface_modifier, cap_modifier, snow_slab) quad — PURE functions
+# of SEED (immutable at runtime; player edits live in the overlay, never in generated modifiers), so
+# it is byte-identical to recomputing. Packed int: (g + _MEMO_G_BIAS) | surface_mod<<16 | cap_mod<<24
+# | snow_slab<<32 (both mods are BOTTOM corner-height codes < 256; g biased so its low 16 bits stay
+# positive; the snow-slab flag rides bit 32 of the 64-bit int, so the raw cap byte stays a pure
+# smoothing modifier and a legit 85-lip is never confused with the slab). M1 ADR §6.3: the cap byte
+# / slab flag now depend on climate+altitude, but those are STILL pure deterministic functions of
+# SEED (no randi/Time), so the memo remains byte-identical to recompute — the memo's old "shape is
+# biome-independent" note is amended, but the thread-safety reasoning is unchanged.
 #
 # THREAD SAFETY — READ THIS: GDScript Dictionaries are NOT thread-safe. This memo is MAIN-THREAD-
 # ONLY by construction. The module voxel WORKER always calls resolve_cell/_smoothed_surface/… with
@@ -548,13 +697,21 @@ static func _shape_entry(x: int, z: int) -> int:
 	# than an abrupt half-block ledge. Otherwise both modifiers stay 0 (plain cube / no cap). The
 	# TreeGen probe returns AIR over ocean columns (trees are biome-gated off ocean/beach), so the
 	# uniform check keeps one code path.
+	var slab := 0
 	if SMOOTHING_ENABLED and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
 		var t := _corner_targets(x, z)      # the 9-height_at stencil — computed ONCE, then cached
 		sm = _modifier_from_targets(t, g)
 		cm = _modifier_from_targets(t, g + 1)
+		# Snow half-slab (M1 ADR §6.3): a deep-frozen FLAT column (sm==cm==0) grows a snow slab at
+		# g+1, so the GENERATED cap modifier there is SNOW_SLAB_MODIFIER. Cache the DECISION in a
+		# dedicated bit (32) — NOT in the cap byte — so a legit smoothing 85-lip (raw cm) stays a
+		# biome-top cap while the collider cheap query + render cap read the fold as an O(1) lookup.
+		# Deterministic (climate/altitude are pure SEED functions), so the memo is byte-identical.
+		if cm == 0 and _slab_fires(x, z, g, sm, cm, null):
+			slab = 1
 	if _shape_memo.size() >= _MEMO_MAX:
 		_shape_memo.clear()                 # bound memory over a marathon session
-	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24)
+	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24) | (slab << 32)
 	_shape_memo[k] = e
 	return e
 
@@ -581,19 +738,26 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -
 ## ground, a >1-block cliff that saturates to a full block, or a tree cell owning the
 ## cell). The cap is the column's surface material (biome top on land, underwater-floor material
 ## when submerged — WATER-SHORE §3.6), shaped by the SAME corner targets as the surface cell below
-## it, so the two form one crack-free continuous slope. Above the water line _with_shore_water (in
+## it, so the two form one crack-free continuous slope. Above the water line _with_shore_liquid (in
 ## resolve_cell) is a no-op, so land caps stay byte-identical; underwater it fills the remainder
-## with water (level 9 at the water line, 10 below).
+## with the sea's liquid (level 9 at the water line, 10 below).
 static func _surface_cap(x: int, z: int, g: int, biome: int, t: float, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return BlockCatalog.AIR                       # diagnostic: no cap cells
 	if pcache == null and _on_main_thread():
-		var cm := (_shape_entry(x, z) >> 24) & 0xFF
+		var e := _shape_entry(x, z)
+		if (e >> 32) & 1:
+			return CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER)   # deep-frozen half-slab (M1 §6)
+		var cm := (e >> 24) & 0xFF
 		return BlockCatalog.AIR if cm == 0 else CellCodec.pack(_cap_material(biome, x, z, t, g), cm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
-	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
+	var tg := _corner_targets(x, z, pcache)
+	var m := _modifier_from_targets(tg, g + 1)
 	if m == 0:
+		# No smoothing lip — a deep-frozen flat column grows a snow half-slab here instead (§6.2).
+		if _slab_fires(x, z, g, _modifier_from_targets(tg, g), 0, pcache):
+			return CellCodec.pack(_ID_SNOW, SNOW_SLAB_MODIFIER)
 		return BlockCatalog.AIR                       # no lip (flat) or a full-block step (kept blocky)
 	return CellCodec.pack(_cap_material(biome, x, z, t, g), m)
 
@@ -644,11 +808,21 @@ static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: no cap cells
 	if pcache == null and _on_main_thread():
-		return (_shape_entry(x, z) >> 24) & 0xFF
+		var e := _shape_entry(x, z)
+		# A deep-frozen flat column's g+1 cell is a snow half-slab (M1 ADR §6.3): its generated
+		# modifier is SNOW_SLAB_MODIFIER, so the collider must see a solid shaped prism there.
+		return SNOW_SLAB_MODIFIER if ((e >> 32) & 1) else ((e >> 24) & 0xFF)
 	var g := _col_h(x, z, pcache)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return 0
-	return _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
+	var tg := _corner_targets(x, z, pcache)
+	var cm := _modifier_from_targets(tg, g + 1)
+	if cm != 0:
+		return cm
+	# No smoothing lip — a deep-frozen flat column's g+1 cell is the snow half-slab (modifier 85).
+	if _slab_fires(x, z, g, _modifier_from_targets(tg, g), 0, pcache):
+		return SNOW_SLAB_MODIFIER
+	return 0
 
 ## The appearance manifest (RUNTIME-MATERIAL-STREAMING §6.5 / VOXEL-DATA-STRUCTURE
 ## §8.1/§8.3): the exact set of (surface material, modifier) pairs this smoothing
@@ -659,12 +833,35 @@ static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 ## The surface materials smoothing can shape — every material `_biome_top` (land) OR
 ## `_underwater_floor` (WATER-SHORE §3: underwater floors now smooth too) can return.
 ## Gravel is the one `_underwater_floor` material not already a land top; sand/red_sand/
-## mud are shared. The module bakes these × emitted_modifiers() at setup.
+## mud are shared. The module bakes these × emitted_modifiers() at setup. STONE (the
+## `_biome_top(B_MOUNTAINS)` rock peak) is DELIBERATELY excluded from the DRY set: a SNOW-CAPPED
+## stone cell is baked via `_snow_arid` (snow_cappable_materials, so visible peaks smooth), while an
+## UNCAPPED shaped stone cell (the bare lower flank, below the freeze line) cube-falls-back on the
+## worker — a natural blocky-rock look, a documented graceful degrade (§5.5) that keeps the pre-baked
+## model count (and web load pause) down and preserves stone's lazy-append path (_test_shapes_live).
 static func appearance_surface_materials() -> PackedInt32Array:
 	_ensure_ids()
 	return PackedInt32Array([
 		BlockCatalog.GRASS, _ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL, _ID_GRAVEL,
+		# STONE tops the Mountains biome (bare rock). Without it, the smoothing that shapes a
+		# mountain's corner-height surface cells has no baked DRY model, so uncapped rock slopes
+		# cube-fall-back and render BLOCKY while the analytic collider sees the smooth ramp — a
+		# visible render/physics mismatch on the flanks below the snow line. Baking stone smooths
+		# them (shape meshes are shared per-modifier across materials → +models, no new readbacks).
+		BlockCatalog.STONE,
 	])
+
+## The BAKED snow-cap material set (M1 ADR §2.2, extended by the Mountains biome): the cappable surface
+## materials the module path bakes a snow-VARIANT model for (cube + each emitted modifier). grass /
+## podzol / sand top cold LOW columns; STONE now tops B_MOUNTAINS peaks (`_biome_top(B_MOUNTAINS)`), and
+## those peaks cross the y=96 freeze line, so stone is a REAL cappable top — baking its snow variant is
+## what makes high stone caps render WHITE (an unbaked cap would silently fall back to plain rock, §5.5).
+## The STAMP gate is still the catalog declaration (state_mask_of & STATE_SNOW_CAPPED); this list only
+## governs which variants get baked. Budget: 4 mats × (cube + ~emitted modifiers + slab) ≈ 170–250
+## models, below the 280–420 manifest budget.
+static func snow_cappable_materials() -> PackedInt32Array:
+	_ensure_ids()
+	return PackedInt32Array([BlockCatalog.GRASS, _ID_PODZOL, _ID_SAND, BlockCatalog.STONE])
 
 ## Every corner-height modifier the smoothing can emit: all BOTTOM-anchored corner
 ## tuples in {0,1,2}⁴ except all-2 (the FULL cube — served by the eager cube ARID) and
@@ -707,8 +904,21 @@ static func emitted_modifiers() -> PackedInt32Array:
 		return _emitted_mods
 	_ensure_noise()
 	var seen := {}
-	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)   # inland land shapes
-	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)   # coastline + underwater floor shapes (§3.5)
+	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
+	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
+	# Mountains biome: its gently-sloped stone flanks emit corner-height modifiers NOT present in the
+	# temperate spawn/coast samples — mountains alone reach ~60 of the 61 globally-emitted modifiers
+	# (every gentle-slope orientation occurs). A snow-capped stone peak cell whose modifier is unbaked
+	# would fall back to a plain cube: an INVISIBLE cap AND a lost shape (§5.5). So sample SEVERAL
+	# angularly-spread mountain massifs — enough that emitted_modifiers() reaches the complete reachable
+	# set (verify asserts a wide mountain scan emits NO modifier missing from this set). One-time setup
+	# cost (main thread); never the voxel worker.
+	for mc: Vector2i in find_mountains(6):
+		_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
+	# The snow half-slab modifier (M1 ADR §6.4): worldgen emits (snow_block, 85) on deep-frozen
+	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
+	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
+	seen[SNOW_SLAB_MODIFIER] = true
 	var out := PackedInt32Array()
 	for m: int in seen.keys():
 		out.append(m)
@@ -774,15 +984,24 @@ static func _bedrock_at(x: int, y: int, z: int) -> bool:
 # frozen oceans); water fills the rest. Cold columns also report sub-zero surface
 # air (PerVoxelEnvironment), so the generated sheet is structurally sound ice
 # rather than tissue-paper (INTEGRATION-DECISIONS §1.5 frozen-sea seam).
+## The liquid KIND of the sea fill for climate t (MULTI-LIQUID §2.4). THE single regime authority
+## consumed by _sea_block AND _with_shore_liquid, so open-water, shore and submerged composites of
+## one column can never disagree on kind. Frozen handling (t < -0.55 → an ice cap at the surface
+## cell) stays where it is: ice is a SOLID regime, disjoint from LAVA_SEA_T, not a liquid kind.
+static func _sea_liquid_kind(t: float) -> int:
+	return CellCodec.LIQ_LAVA if t >= LAVA_SEA_T else CellCodec.LIQ_WATER
+
 static func _sea_block(t: float, y: int) -> int:
+	var kind := _sea_liquid_kind(t)                   # water / molten regime (frozen handled below)
+	var lrid := BlockCatalog.liquid_lrid_of(kind)     # water → 44, lava → 45
 	if y == SEA_LEVEL:
 		if t < -0.55:
 			return _ID_ICE                            # frozen cap (unchanged; no liquid overlay)
-		# The open-water surface cell: water MATERIAL carrying a liquid(WATER, 9) overlay so the
-		# renderer draws the sunk 0.9 slab instead of a full cube (WATER-SHORE §3.1).
-		return CellCodec.pack(_ID_WATER, 0, 0,
-			CellCodec.make_liquid(CellCodec.LIQ_WATER, CellCodec.LIQ_LEVEL_SURFACE))
-	return _ID_WATER                                  # deep water: bare id (§2.3.5 canonical full water)
+		# The open surface cell: the liquid MATERIAL carrying a liquid(kind, 9) overlay so the
+		# renderer draws the sunk 0.9 slab instead of a full cube (WATER-SHORE §3.1, kind-parameterized).
+		return CellCodec.pack(lrid, 0, 0,
+			CellCodec.make_liquid(kind, CellCodec.LIQ_LEVEL_SURFACE))
+	return lrid                                       # deep liquid: bare id (§2.3.5 canonical full liquid)
 
 # --- stage: surface rule (WGC §6.5) -------------------------------------------
 static func _surface_rule(x: int, y: int, z: int, g: int, biome: int, c: float, t: float) -> int:
@@ -808,6 +1027,8 @@ static func _biome_top(biome: int, x: int, z: int) -> int:
 			return _ID_SNOW
 		B_TAIGA:
 			return _ID_PODZOL if _hash01_3d(x, 0, z, _SALT_PODZOL) < 0.20 else BlockCatalog.GRASS
+		B_MOUNTAINS:
+			return BlockCatalog.STONE     # bare rock peak (cappable — declared in blocks.json + baked set)
 		B_OCEAN:
 			return _ID_SAND
 		_:
@@ -838,6 +1059,8 @@ static func _filler_depth(biome: int) -> int:
 			return 5        # mud(3) + dirt(2)
 		B_OCEAN:
 			return 3        # a few blocks of floor sediment
+		B_MOUNTAINS:
+			return 0        # bare rock: no dirt filler, straight to stone/deepslate under the surface
 		_:
 			return 3        # snowy/taiga/forest/plains: dirt(3)
 
@@ -1001,20 +1224,78 @@ static func find_spawn() -> Vector2i:
 				return Vector2i(x, z)
 	return Vector2i(0, 0)
 
-## The first column at exactly the water line (g == SEA_LEVEL), scanned outward from origin with
-## the same deterministic pattern as find_spawn (radius 0..512 step 4, 15° steps). It is the centre
-## of the coastal sample emitted_modifiers()/emitted_shore_pairs() use so the underwater-floor and
-## shore-composite shapes are captured. Deterministic, main-thread, setup/verify-time only;
-## Vector2i(0, 0) fallback if no coastline is found within 512 (WATER-SHORE §3.5).
-static func find_coast() -> Vector2i:
-	for radius in range(0, 512, 4):
+## The nearest TALL B_MOUNTAINS column (a real peak, g well above sea) scanned outward from origin with
+## the find_spawn pattern. Used ONLY at setup/verify (never the voxel worker) to seed emitted_modifiers()
+## with the mountain-flank stone shapes so snow-capped peaks bake their variant models (visible caps).
+## Mountains cover ~3% of the world for this seed, so the scan resolves quickly; the fallback (no
+## mountain in range — not the case for this seed) re-samples spawn, which is harmless (superset-safe).
+static func find_mountain() -> Vector2i:
+	var ms := find_mountains(1)
+	return ms[0] if ms.size() > 0 else find_spawn()
+
+## Up to `count` DISTINCT tall B_MOUNTAINS massifs (peaks g > SEA_LEVEL + 40), one per angular sector,
+## scanned outward from origin. Angularly spread + de-duplicated (>= 400 blocks apart) so the returned
+## centres land on DIFFERENT massifs with different slope orientations — together their emitted-modifier
+## sample reaches the complete reachable set (no invisible caps). Falls back to spawn if none found (not
+## the case for this seed). Setup/verify only (calls column_profile widely); never the voxel worker.
+static func find_mountains(count: int) -> Array:
+	var out: Array = []
+	for radius in range(0, 3072, 8):
+		for a in range(0, 360, 6):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			var p := column_profile(x, z)
+			if int(p.y) != B_MOUNTAINS or int(p.x) <= SEA_LEVEL + 40:
+				continue
+			var far := true
+			for c: Vector2i in out:
+				if Vector2(x - c.x, z - c.y).length() < 400.0:
+					far = false
+					break
+			if far:
+				out.append(Vector2i(x, z))
+				if out.size() >= count:
+					return out
+	if out.is_empty():
+		out.append(find_spawn())
+	return out
+
+## Sentinel returned by find_coast_of when no coast of the requested kind is found in range.
+const _COAST_NONE := Vector2i(0x7fffffff, 0x7fffffff)
+
+## The first column at exactly the water line (g == SEA_LEVEL) whose SEA REGIME is `kind`
+## (MULTI-LIQUID §2.4) — i.e. non-frozen (t >= -0.55) AND _sea_liquid_kind(t) == kind — scanned
+## outward from origin with the find_spawn pattern (radius step 4, 15° steps). Water coasts are
+## common (radius 512); lava coasts are rare (temperature freq 0.002 → hundreds-of-blocks climate
+## regions, same rarity class as frozen oceans), so the lava scan extends to 1024. Returns
+## _COAST_NONE if none is found, in which case per-kind SHORE-pair sampling is skipped — safe,
+## because emitted_submerged_pairs is material-complete regardless (distant seas still get their
+## submerged twins; only unsampled shore pairs degrade to the dry border, never a hole).
+## Deterministic, main-thread, setup/verify-time only.
+static func find_coast_of(kind: int) -> Vector2i:
+	var max_r := 1024 if kind == CellCodec.LIQ_LAVA else 512
+	for radius in range(0, max_r, 4):
 		for a in range(0, 360, 15):
 			var rad := deg_to_rad(float(a))
 			var x := int(round(cos(rad) * float(radius)))
 			var z := int(round(sin(rad) * float(radius)))
-			if height_at(x, z) == SEA_LEVEL:
-				return Vector2i(x, z)
-	return Vector2i(0, 0)
+			if height_at(x, z) != SEA_LEVEL:
+				continue
+			var t := column_profile(x, z).w
+			if t < -0.55:
+				continue                              # frozen: ice regime, not a liquid coast
+			if _sea_liquid_kind(t) != kind:
+				continue                              # a different liquid regime
+			return Vector2i(x, z)
+	return _COAST_NONE
+
+## The nearest WATER coastline centre, for the coastal manifest sample
+## (emitted_modifiers()/emitted_shore_pairs()) and verify. Water-compat wrapper over find_coast_of;
+## preserves the historical Vector2i(0, 0) fallback for callers that index into the result.
+static func find_coast() -> Vector2i:
+	var c := find_coast_of(CellCodec.LIQ_WATER)
+	return Vector2i(0, 0) if c == _COAST_NONE else c
 
 ## The sampled set of (surface material, modifier) pairs a SHORE composite actually emits at the
 ## LEVEL-9 water line (WATER-SHORE §3.5/§3.6), each encoded as the SAME slot the module manifest
@@ -1032,18 +1313,27 @@ static func find_coast() -> Vector2i:
 ## completeness (a rare unsampled pair renders as the DRY shaped model on the worker: a notch,
 ## never a hole). Cached statically; main-thread setup/verify only, never the voxel worker.
 const _SHORE_STRIDE := 256
-static var _shore_ready := false
-static var _shore_pairs := PackedInt32Array()
-static func emitted_shore_pairs() -> PackedInt32Array:
+static var _shore_pairs_by_kind: Dictionary = {}     # liquid kind -> cached PackedInt32Array of shore pairs
+static func emitted_shore_pairs(kind := CellCodec.LIQ_WATER) -> PackedInt32Array:
 	if not SMOOTHING_ENABLED:
 		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
-	if _shore_ready:
-		return _shore_pairs
+	if _shore_pairs_by_kind.has(kind):
+		return _shore_pairs_by_kind[kind]
 	_ensure_noise()
 	_ensure_ids()
-	var c := find_coast()
+	var out := PackedInt32Array()
+	var c := find_coast_of(kind)
+	if c == _COAST_NONE:
+		# No coast of this kind in range (e.g. a lava sea outside the scan radius for this seed):
+		# skip shore-pair sampling. emitted_submerged_pairs is material-complete regardless, so the
+		# sea still gets its submerged twins; only unsampled shore pairs degrade to the dry border.
+		_shore_pairs_by_kind[kind] = out
+		return out
 	var r := _EMIT_SAMPLE_R
 	var seen := {}
+	# (1) SURFACE composites — columns exactly at the water line (g == SEA_LEVEL) whose sea regime
+	# is `kind` (non-frozen AND _sea_liquid_kind == kind, generalizing the old frozen-only skip; this
+	# also stops water sampling from wandering into a molten shore). Their material is the biome top.
 	for dx in range(-r, r + 1):
 		var x := c.x + dx
 		for dz in range(-r, r + 1):
@@ -1051,8 +1341,8 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 			if height_at(x, z) != SEA_LEVEL:
 				continue                              # shore composites live exactly at the water line
 			var p := column_profile(x, z)             # climate noise only for the few water-line columns
-			if p.w < -0.55:
-				continue                              # frozen shore: ice regime, no water composite
+			if p.w < -0.55 or _sea_liquid_kind(p.w) != kind:
+				continue                              # ice regime, or a different liquid regime
 			var sm := surface_modifier(x, z, {})      # direct compute (a fresh pcache avoids memo pollution)
 			if sm == 0:
 				continue
@@ -1067,19 +1357,17 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 			if height_at(x, z) != SEA_LEVEL - 1:
 				continue                              # water-line caps grow from the column just below
 			var p := column_profile(x, z)
-			if p.w < -0.55:
-				continue                              # frozen shore: ice regime, no water composite
+			if p.w < -0.55 or _sea_liquid_kind(p.w) != kind:
+				continue                              # ice regime, or a different liquid regime
 			var cm := surface_cap_modifier(x, z, {})  # direct compute (a fresh pcache avoids memo pollution)
 			if cm == 0:
 				continue
 			seen[_underwater_floor(int(p.y), x, z, p.w) * _SHORE_STRIDE + cm] = true
-	var out := PackedInt32Array()
 	for s: int in seen.keys():
 		out.append(s)
 	out.sort()
-	_shore_pairs = out
-	_shore_ready = true
-	return _shore_pairs
+	_shore_pairs_by_kind[kind] = out
+	return out
 
 ## The (surface material, modifier) pairs a SUBMERGED composite emits BELOW the water line — the
 ## companion set to emitted_shore_pairs() that NATIVE WATERLOGGING needs (WATERLOGGING.md §4.3
@@ -1094,7 +1382,11 @@ static func emitted_shore_pairs() -> PackedInt32Array:
 ## an unused twin (harmless); a missing pair falls back to the dry shape (a border, never a hole).
 ## Encoded as mat * _SHORE_STRIDE + modifier, matching emitted_shore_pairs()/the module manifest slot.
 ## Main-thread setup/verify only (calls emitted_modifiers, which is not worker-safe); never the worker.
-static func emitted_submerged_pairs() -> PackedInt32Array:
+## MULTI-LIQUID §2.4: the `kind` argument is accepted so Stream C can call this per liquid, but the
+## CONTENT is kind-independent — a molten sea's underwater floor reuses _underwater_floor (hot ocean
+## → sand), so the four floor materials × emitted modifiers cover every submerged composite of ANY
+## liquid. Kept material-complete (never a spatial sample) so distant/unfound seas still get twins.
+static func emitted_submerged_pairs(_kind := CellCodec.LIQ_WATER) -> PackedInt32Array:
 	if not SMOOTHING_ENABLED:
 		return PackedInt32Array()                     # diagnostic: no shaped meshes to bake
 	_ensure_ids()

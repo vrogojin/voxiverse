@@ -21,6 +21,13 @@ extends Resource
 ## declares it yet (like state layouts), so this is inert for today's catalog.
 @export var has_block_entity: bool = false
 
+## Liquid identity of this material (MULTI-LIQUID §2.1): the CellCodec LIQ_KIND value this
+## material IS as a liquid — 0 = not a liquid (the default for every solid), LIQ_WATER for
+## water, LIQ_LAVA for lava. Parsed from the optional blocks.json "liquid_kind" name key
+## (BlockCatalog._from_record). BlockCatalog.liquid_kind_of/liquid_lrid_of read it; the
+## material document OMITS it when 0 so every non-liquid GMID stays byte-identical.
+@export var liquid_kind: int = 0
+
 @export_group("Physics")
 ## Mass of one voxel of this state, in kilograms (1 m^3 cell).
 @export var mass: float = 1500.0

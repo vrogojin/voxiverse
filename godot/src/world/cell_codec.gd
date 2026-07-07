@@ -37,14 +37,43 @@ const LIQ_FIELD_MASK := 0x3F
 const LIQ_KIND_MASK := 0x3
 const LIQ_NONE := 0
 const LIQ_WATER := 1
+const LIQ_LAVA := 2               # was reserved (WATER-SHORE §2.1); kind 3 stays reserved for a third liquid
 const LIQ_LEVEL_SURFACE := 9      # top at 0.9 — the water-line cell
 const LIQ_LEVEL_FULL := 10        # top at 1.0 — submerged composite
+
+## Liquid-kind name → value map (MULTI-LIQUID §2.1). This codec is the single authority
+## on the LIQ_KIND bit meanings; BlockCatalog resolves blocks.json "liquid_kind" strings
+## through this map. Extend with the next reserved value (3) when a third liquid lands.
+const LIQ_KIND_BY_NAME := {&"water": LIQ_WATER, &"lava": LIQ_LAVA}
+
+## STATE axis (VDS §3.2/§10.3): behavioural variants of a material, bits 32..47. Positional +
+## per-material — the name at index i of a material's `state_layout` names bit i, and the material's
+## valid-bit mask is `BlockCatalog.state_mask_of`. `snow_capped` is bit 0 (M1 snowy world), pinned
+## to index 0 on every material that declares it (verify), so this GLOBAL shorthand is safe for
+## worldgen/render. State is disjoint from the liquid overlay at the STAMPING level (worldgen never
+## produces both on one cell); the codec does not forbid the combination.
+const STATE_SNOW_CAPPED := 1                     # bit 0 of STATE (bits 32..47)
+
+## STATE-bit name → value map (mirrors LIQ_KIND_BY_NAME). The reverse global shorthand for
+## worldgen/render; per-material bit MEANING still comes from each material's declared state_layout.
+const STATE_BIT_BY_NAME := {&"snow_capped": STATE_SNOW_CAPPED}
+
+## The 16-bit STATE field (bits 32..47) of a packed cell.
+const STATE_MASK := 0xFFFF
+
+## True iff the cell's STATE field has (all of) `bit` set.
+static func has_state(v: int, bit: int) -> bool:
+	return (state(v) & bit) != 0
+
+## Replace the STATE field of `v` with `bits`, leaving material/modifier/liquid intact.
+static func with_state(v: int, bits: int) -> int:
+	return (v & ~(STATE_MASK << 32)) | ((bits & STATE_MASK) << 32)
 
 ## The 6-bit liquid field (kind + level) — 0 means "no liquid".
 static func liquid_field(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_FIELD_MASK
 
-## Liquid kind (0 = none, 1 = water, 2..3 reserved).
+## Liquid kind (0 = none, 1 = water, 2 = lava, 3 reserved).
 static func liquid_kind(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_KIND_MASK
 
@@ -150,10 +179,14 @@ static func _canonical_modifier(material: int, modifier_bits: int) -> int:
 	return c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | anc
 
 ## P6 hook — validate state bits against the material's declared state_layout
-## (VOXEL-DATA-STRUCTURE §3.2/§10.3), clamping unknown bits. Pass-through until
-## the state machinery lands.
-static func _validate_state(_material: int, state_bits: int) -> int:
-	return state_bits
+## (VOXEL-DATA-STRUCTURE §3.2/§10.3, M1 snowy world): undeclared bits are silently masked
+## to 0 (the "0 is absent" convention — not a warning). The mask is the low
+## `state_layout.size()` bits (BlockCatalog.state_mask_of): AIR/out-of-range → 0 (air carries
+## no state); an UNRESOLVED placeholder → 0xFFFF (permissive, keeps bits until late resolution).
+static func _validate_state(material: int, state_bits: int) -> int:
+	if state_bits == 0:
+		return 0
+	return state_bits & BlockCatalog.state_mask_of(material)
 
 ## Liquid-axis canonicalization (WATER-SHORE §2.3). Takes the cell's material, its
 ## ALREADY-canonicalized modifier, and the raw 6-bit liquid field; returns the canonical
@@ -191,9 +224,10 @@ static func _canonical_liquid(material: int, canonical_mod: int, liquid: int) ->
 		return 0
 	# The overlay kind on a solid composite is an OVERLAY liquid (independent of the solid
 	# host material, so liquid_kind_of(host) does not apply here). Validate it against the
-	# known-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
-	# survive on a solid host either. v1 ships only WATER; extend when lava lands.
-	if kind > LIQ_WATER:
+	# DECLARED-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
+	# survive on a solid host either. Any KNOWN kind (water, lava, a future third) may
+	# waterlog a solid composite; only a genuinely unknown/reserved kind is stripped.
+	if not BlockCatalog.is_liquid_kind_known(kind):
 		push_warning("CellCodec: unknown liquid kind %d on solid composite (material %d) — stripped"
 			% [kind, material])
 		return 0

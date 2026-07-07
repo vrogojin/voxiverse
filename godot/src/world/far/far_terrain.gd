@@ -83,7 +83,12 @@ static func make_material() -> StandardMaterial3D:
 	m.roughness = 1.0
 	m.metallic = 0.0
 	m.metallic_specular = 0.0                # no sun in the scene → specular is moot; keep it off
-	m.cull_mode = BaseMaterial3D.CULL_BACK
+	# CULL_DISABLED (was CULL_BACK): the far surface is a single-sided heightmap whose triangle
+	# winding must otherwise exactly match Godot's front-face convention — a fragile dependency that,
+	# if backwards, culls EVERY ground tile and leaves only the vertical skirt walls visible (a "grid
+	# of vertical planes"). Double-siding a distant low-poly mesh is negligible and removes the
+	# winding dependency entirely; there is no sun, so the missing back-face lighting is moot.
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
 	return m
 
 # --- streaming entry point (LOD-DESIGN §4.1) ----------------------------------

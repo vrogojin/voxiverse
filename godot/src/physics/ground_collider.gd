@@ -407,6 +407,14 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 	if edited:
 		while world.is_removed(Vector3i(x, y, z)):
 			y -= 1
+	# Snow accumulation (SNOW-ACCUMULATION §3.4) — computed HERE (before the sub-surface loop) so the
+	# SURFACE cell can compose the fill too: the snow_stack_at light query gives the column's stack (whole
+	# cubes + a fractional top LAYER) and whether a lip owns g+1. A snow-FILLED ramp/lip is buried up to
+	# its snow plane (§2.4), so the collider covers max(terrain shape, fill) — a body rests on the true
+	# snow top, matching _occ_span (no generated_cell; the prisms come free via surface_tris).
+	var snow := TerrainConfig.snow_stack_at(x, z, _build_pc)
+	var s_depth := ((snow >> 4) & 0xF) * 10 + (snow & 0xF)   # D in tenths (0 = no snow)
+	var s_capped := (snow >> 8) & 1                          # a smoothing lip owns g+1 (snow from g+2)
 	var run_start := 0x7fffffff
 	# Sub-surface: the heightmap fills every cell up to h; it is air only where dug out (overlay
 	# 0). At the top (y == h) the LIGHT surface_modifier picks up a smoothed ramp/slab WITHOUT the
@@ -420,6 +428,8 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 			modifier = CellCodec.modifier(ov)
 		elif ov < 0 and y == h:
 			modifier = TerrainConfig.surface_modifier(x, z, _build_pc)
+			if modifier != 0 and s_depth > 0:
+				modifier = 0                        # SNOW-ACCUMULATION §2.4: the ramp is BURIED (fill 10) → a FULL cell
 		if ov == 0:                                 # dug to air → no box here
 			if run_start != 0x7fffffff:
 				_add_box(bidx, x, z, run_start, y)
@@ -432,14 +442,10 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		elif run_start == 0x7fffffff:
 			run_start = y
 		y += 1
-	# Above the heightmap: a placed cell (overlay), the SNOW accumulation stack (light query), a smoothed
-	# grass CAP lip at y==h+1 (light query), sea fill for underwater columns, else the tree overlay hash
-	# — no generated_cell. Snow (SNOW-ACCUMULATION §3.4): the snow_stack_at light query gives the column's
-	# stack (whole cubes + a fractional top LAYER, and whether a lip owns g+1); the plane [h+1, h+1+D/10]
-	# fills the air cells so a body settles on the true snow top — the prisms come free via surface_tris.
-	var snow := TerrainConfig.snow_stack_at(x, z, _build_pc)
-	var s_depth := ((snow >> 4) & 0xF) * 10 + (snow & 0xF)   # D in tenths (0 = no snow)
-	var s_capped := (snow >> 8) & 1                          # a smoothing lip owns g+1 (snow from g+2)
+	# Above the heightmap: a placed cell (overlay), the SNOW accumulation stack, a smoothed grass CAP lip
+	# at y==h+1 (which — SNOW-ACCUMULATION §3.3 — also fills to its snow plane), sea fill for underwater
+	# columns, else the tree overlay hash — no generated_cell. The plane [h+1, h+1+D/10] fills the air
+	# cells so a body settles on the true snow top.
 	var y_top := maxi(h + TreeGen.MAX_ABOVE_SURFACE, world.placed_top(x, z))
 	while y <= y_top:
 		var ov := -1
@@ -447,6 +453,7 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 			ov = world.placed_cells().get(Vector3i(x, y, z), -1)
 		var solid := false
 		var modifier := 0
+		var snow_fill_mod := 0                      # a snow LAYER co-emitted with a partially-filled lip
 		if ov > 0:                                  # placed block (full cube or shaped)
 			solid = true
 			modifier = CellCodec.modifier(ov)
@@ -463,9 +470,20 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 				solid = true
 				modifier = CellCodec.make_layer(remaining)   # the fractional top LAYER → prism
 			elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
-				modifier = TerrainConfig.surface_cap_modifier(x, z, _build_pc)
-				if modifier != 0:
-					solid = true                    # smoothed grass cap lip → prism
+				var lip := TerrainConfig.surface_cap_modifier(x, z, _build_pc)
+				if lip != 0:
+					solid = true                    # smoothed grass cap lip
+					if s_depth > 0:
+						# The lip fills to its snow plane min(D,10) (SNOW-ACCUMULATION §3.3): BURIED (fill 10)
+						# → a FULL cell; partial → the lip ramp prisms PLUS the snow LAYER prisms.
+						var lf := mini(s_depth, 10)
+						if lf >= 10:
+							modifier = 0             # buried lip → FULL cell (box run)
+						else:
+							modifier = lip
+							snow_fill_mod = CellCodec.make_layer(lf)
+					else:
+						modifier = lip
 				elif y <= TerrainConfig.SEA_LEVEL:
 					solid = true                    # sea fill (water/ice) → full-cube box
 				elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
@@ -479,6 +497,8 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 				_add_box(bidx, x, z, run_start, y)
 				run_start = 0x7fffffff
 			_add_prisms(bidx, x, y, z, modifier)
+			if snow_fill_mod != 0:
+				_add_prisms(bidx, x, y, z, snow_fill_mod)   # co-emit the partial lip's snow LAYER
 		elif solid:
 			if run_start == 0x7fffffff:
 				run_start = y

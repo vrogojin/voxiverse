@@ -217,17 +217,23 @@ static func _emit_terrain_shapes(tools: Dictionary, world: WorldManager,
 			var h := hmap[(lz + 1) * stride + (lx + 1)]
 			var wx := x0 + lx
 			var wz := z0 + lz
-			# Surface cell (y = h): a smoothing-shaped top emits ShapeMesh geometry.
-			var vs: int = world.cell_value_at(Vector3i(wx, h, wz))
+			# Surface cell (y = h): a smoothing-shaped top emits ShapeMesh geometry, and — SNOW-ACCUMULATION
+			# §2.8 — a snow-FILLED ramp DUAL-EMITs the snow LAYER fill on top (the module's composite, sans
+			# baking). Same (mat, state, modifier) projection on both paths.
+			var cs := Vector3i(wx, h, wz)
+			var vs: int = world.cell_value_at(cs)
 			var ms: int = CellCodec.modifier(vs)
 			if ms != 0 and BlockCatalog.solidity_of(CellCodec.mat(vs)) >= 0.5:
-				_emit_shaped(tools, Vector3i(wx, h, wz), _look_of(vs), ms)
+				_emit_shaped(tools, cs, _look_of(vs), ms)
+				_emit_snow_fill(tools, cs, CellCodec.snow_fill(vs))
 			# Cap cell (y = h+1): a partial grass lip above the surface on a rising
 			# neighbour (generated, not placed — placed cells are handled by _emit_placed).
-			var vc: int = world.cell_value_at(Vector3i(wx, h + 1, wz))
+			var cc := Vector3i(wx, h + 1, wz)
+			var vc: int = world.cell_value_at(cc)
 			var mc: int = CellCodec.modifier(vc)
 			if mc != 0 and BlockCatalog.solidity_of(CellCodec.mat(vc)) >= 0.5:
-				_emit_shaped(tools, Vector3i(wx, h + 1, wz), _look_of(vc), mc)
+				_emit_shaped(tools, cc, _look_of(vc), mc)
+				_emit_snow_fill(tools, cc, CellCodec.snow_fill(vc))
 
 # --- stacked snow: cubes + a top LAYER for the accumulated snow above the surface ---
 # SNOW-ACCUMULATION §2.8. Like the sea/ice cells, the accumulated snow cells (SNOW-ACCUMULATION
@@ -257,6 +263,18 @@ static func _emit_snow(tools: Dictionary, world: WorldManager, hmap: PackedInt32
 					_emit_cube(tools, world, cell, snow_id)   # a full snow cell (culled faces)
 				else:
 					_emit_shaped(tools, cell, _look_of(v), modifier)   # a top LAYER / slab
+
+# --- snow FILL: the snow LAYER a filled ramp carries (SNOW-ACCUMULATION §2.8) ------
+# A cold ramp surface/lip cell buries its remainder with a flat snow plane at `fill/10`. The fallback
+# dual-emits it as a second ShapeMesh (snow_block LAYER) at the fill level — the fill plane rounds UP to
+# the same curated {3,5,8,10} the module bakes, so BOTH paths show the snow at one height (parity). The
+# snow's portion inside the opaque ramp is hidden interior overdraw (gameplay never reads geometry).
+static func _emit_snow_fill(tools: Dictionary, cell: Vector3i, fill_level: int) -> void:
+	if fill_level <= 0:
+		return
+	var rl := 3 if fill_level <= 3 else (5 if fill_level <= 5 else (8 if fill_level <= 8 else 10))
+	# make_layer(10) == 0 → a full snow cube (the buried case); 5 → the half-slab; 3/8 → thin FAM slabs.
+	_emit_shaped(tools, cell, BlockCatalog.id_of(&"snow_block"), CellCodec.make_layer(rl))
 
 # --- trees: cubes for genuine tree cells overlapping the chunk ------------------
 static func _emit_trees(tools: Dictionary, world: WorldManager,

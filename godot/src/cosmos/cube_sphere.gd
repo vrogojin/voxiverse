@@ -1,0 +1,437 @@
+extends RefCounted
+class_name CubeSphere
+## COSMOS M0 — the cube-sphere math kernel (docs/COSMOS-PLANET-TOPOLOGY.md §1.2, §1.3,
+## §4.2, §5.2/§5.3). Pure, deterministic f64 scalar math. NO engine dependencies, NO
+## `randi()`/`Time` — every function is a pure function of its arguments.
+##
+## PRECISION NOTE (the load-bearing constraint): GDScript `float` is IEEE-754 f64 but
+## `Vector3` is f32. Using `Vector3` for the direction math would FAIL the exact
+## `cell -> dir -> cell` round-trip gate (§9 M0). All direction math therefore runs on the
+## `DVec3` inner class below (three f64 fields) — NEVER `Vector3`. GDScript ints are 64-bit,
+## so the 43-bit global edit key (§1.3) fits with room to spare.
+##
+## The two normative functions (§1.2) are `face_cell_to_dir` and `dir_to_face_cell`; the
+## equal-angle warp is isolated behind `warp()`/`unwarp()` so a later distortion-tuning pass
+## can swap it without touching topology, remap tables, or persistence (§1.2, §11.1).
+
+# ---------------------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------------------
+
+const QUARTER_PI := PI / 4.0
+
+## The persistence region grid tiles each face 32^3 (ZoneChunk.SIZE); N is a multiple of 32
+## so no region ever straddles a face (§1.1, §8.2).
+const REGION_SIZE := 32
+
+## Corner-zone constants (§5.3) — carried here so later milestones (M5) read them from the
+## single kernel source. `CORNER_SEA_R`: worldgen forces deep ocean within this many cells of
+## a cube corner; `CORNER_LOCK_R`: edits are refused within this many cells of a corner column.
+const CORNER_SEA_R := 48
+const CORNER_LOCK_R := 8
+
+## 1/sqrt(3): the |z| of every cube corner direction; asin(1/sqrt3) = 35.264 deg is the
+## latitude the 8 corners are parked at with the poles-on-face-centres orientation (§5.2).
+const INV_SQRT3 := 0.5773502691896258
+
+# Per-face local axes (§1.1). Faces are numbered by outward normal in the body-fixed frame:
+# 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z, with +Z = spin axis (north). Faces 4/5 are polar (face
+# centres at the poles, §5.2); faces 0-3 tile the equatorial belt. Stored as integer axis
+# triples (each is +/- a unit axis) so the reflection generator below stays exact-integer.
+const FACE_N := [
+	[ 1, 0, 0], [-1, 0, 0], [ 0, 1, 0], [ 0,-1, 0], [ 0, 0, 1], [ 0, 0,-1],
+]  # n^  (outward normal)
+const FACE_U := [
+	[ 0, 1, 0], [ 0,-1, 0], [-1, 0, 0], [ 1, 0, 0], [ 0, 1, 0], [ 0, 1, 0],
+]  # u^  (i axis)
+const FACE_V := [
+	[ 0, 0, 1], [ 0, 0, 1], [ 0, 0, 1], [ 0, 0, 1], [-1, 0, 0], [ 1, 0, 0],
+]  # v^  (j axis)
+
+# Side ids for the edge-remap tables (§4.2). A "side" is the face edge the window can spill
+# across: EAST = past i=N-1 (a=+1), WEST = past i=0 (a=-1), NORTH = past j=N-1 (b=+1),
+# SOUTH = past j=0 (b=-1).
+const SIDE_EAST := 0   # +i
+const SIDE_WEST := 1   # -i
+const SIDE_NORTH := 2  # +j
+const SIDE_SOUTH := 3  # -j
+
+# Per-body N (cells per face edge) and datum radius R in blocks (§1.1 table). N is 32-aligned.
+const BODY_N := {
+	"earth": 10016,   # = 313 * 32
+	"mars": 5312,
+	"mercury": 3840,
+	"moon": 2720,
+}
+const BODY_R := {
+	"earth": 6371,
+	"mars": 3390,
+	"mercury": 2440,
+	"moon": 1737,
+}
+
+# Edge-remap table cache, keyed by N (the affine offsets scale with N). Built on first use.
+static var _edge_cache: Dictionary = {}
+
+# ---------------------------------------------------------------------------------------
+# DVec3 — a minimal three-f64 vector. Deliberately NOT Vector3 (which is f32); the exact
+# round-trip gate depends on f64 all the way through the direction math.
+# ---------------------------------------------------------------------------------------
+class DVec3:
+	var x: float
+	var y: float
+	var z: float
+
+	func _init(px := 0.0, py := 0.0, pz := 0.0) -> void:
+		x = px
+		y = py
+		z = pz
+
+	func length() -> float:
+		return sqrt(x * x + y * y + z * z)
+
+	func normalized() -> DVec3:
+		var l := length()
+		if l == 0.0:
+			return DVec3.new()
+		return DVec3.new(x / l, y / l, z / l)
+
+	func dot(o: DVec3) -> float:
+		return x * o.x + y * o.y + z * o.z
+
+	## Angular distance (radians) to another (assumed unit) direction. Uses acos of the
+	## clamped dot — good enough for the "are these two cells one apart?" adjacency check.
+	func angle_to(o: DVec3) -> float:
+		return acos(clampf(dot(o), -1.0, 1.0))
+
+# ---------------------------------------------------------------------------------------
+# The warp (§2). Isolated so it can be swapped later without touching topology/tables.
+# ---------------------------------------------------------------------------------------
+
+## The equal-angle (tangent) warp: face parameter a in [-1,1] -> plane coordinate u.
+static func warp(a: float) -> float:
+	return tan(a * QUARTER_PI)
+
+## Exact inverse of warp() in f64 (tan/atan are inverses to < 1 ULP).
+static func unwarp(u: float) -> float:
+	return atan(u) / QUARTER_PI
+
+# ---------------------------------------------------------------------------------------
+# The two normative functions (§1.2)
+# ---------------------------------------------------------------------------------------
+
+## face/cell -> unit direction in the body-fixed frame (f64 scalar math, §1.2). `fi`/`fj`
+## are floats so callers can request off-cell or off-face points, but for a lattice cell
+## pass the integer indices.
+static func face_cell_to_dir(face: int, fi: float, fj: float, n: int) -> DVec3:
+	var a := 2.0 * (fi + 0.5) / float(n) - 1.0   # [-1, 1] across the face
+	var b := 2.0 * (fj + 0.5) / float(n) - 1.0
+	var u := warp(a)                             # THE warp (equal-angle, §2)
+	var v := warp(b)
+	var nn: Array = FACE_N[face]
+	var uu: Array = FACE_U[face]
+	var vv: Array = FACE_V[face]
+	var d := DVec3.new(
+		float(nn[0]) + u * float(uu[0]) + v * float(vv[0]),
+		float(nn[1]) + u * float(uu[1]) + v * float(vv[1]),
+		float(nn[2]) + u * float(uu[2]) + v * float(vv[2]),
+	)
+	return d.normalized()
+
+## unit direction -> {face, fi, fj} (§1.2). face = argmax|component|; the warp is inverted
+## per axis. Because it recovers u,v as ratios dot(d,u^)/dot(d,n^) and dot(d,v^)/dot(d,n^),
+## the normalization factor cancels exactly — this is what makes the round-trip robust.
+static func dir_to_face_cell(d: DVec3, n: int) -> Dictionary:
+	var face := face_of_dir(d)
+	var nn: Array = FACE_N[face]
+	var uu: Array = FACE_U[face]
+	var vv: Array = FACE_V[face]
+	var nc := d.x * float(nn[0]) + d.y * float(nn[1]) + d.z * float(nn[2])  # dot(d, n^) = 1/L > 0
+	var uc := d.x * float(uu[0]) + d.y * float(uu[1]) + d.z * float(uu[2])  # dot(d, u^) = u/L
+	var vc := d.x * float(vv[0]) + d.y * float(vv[1]) + d.z * float(vv[2])  # dot(d, v^) = v/L
+	var u := uc / nc
+	var v := vc / nc
+	var a := unwarp(u)
+	var b := unwarp(v)
+	var fi := roundi((a + 1.0) * float(n) * 0.5 - 0.5)
+	var fj := roundi((b + 1.0) * float(n) * 0.5 - 0.5)
+	return {"face": face, "fi": fi, "fj": fj}
+
+## Continuous (un-rounded) inverse — used by the round-trip test to measure the precision
+## margin (how far the recovered float lands from the integer, and thus from the rounding
+## boundary). Returns {face, fa, fb} as floats.
+static func dir_to_face_cell_f(d: DVec3, n: int) -> Dictionary:
+	var face := face_of_dir(d)
+	var nn: Array = FACE_N[face]
+	var uu: Array = FACE_U[face]
+	var vv: Array = FACE_V[face]
+	var nc := d.x * float(nn[0]) + d.y * float(nn[1]) + d.z * float(nn[2])
+	var uc := d.x * float(uu[0]) + d.y * float(uu[1]) + d.z * float(uu[2])
+	var vc := d.x * float(vv[0]) + d.y * float(vv[1]) + d.z * float(vv[2])
+	var a := unwarp(uc / nc)
+	var b := unwarp(vc / nc)
+	return {
+		"face": face,
+		"fa": (a + 1.0) * float(n) * 0.5 - 0.5,
+		"fb": (b + 1.0) * float(n) * 0.5 - 0.5,
+	}
+
+## face = argmax|component|, with the sign of the dominant component selecting which of the
+## two faces on that axis. Cell centres never lie exactly on an edge/corner (a = (2*fi+1)/N - 1
+## is never +/-1 for integer fi), so this is unambiguous for every real cell.
+static func face_of_dir(d: DVec3) -> int:
+	var ax := absf(d.x)
+	var ay := absf(d.y)
+	var az := absf(d.z)
+	if ax >= ay and ax >= az:
+		return 0 if d.x > 0.0 else 1
+	elif ay >= az:
+		return 2 if d.y > 0.0 else 3
+	else:
+		return 4 if d.z > 0.0 else 5
+
+## World-space point of a lattice cell (§1.2): P = (R + r) * face_cell_to_dir(...).
+static func world_point(face: int, fi: float, fj: float, r: float, radius: float, n: int) -> DVec3:
+	var d := face_cell_to_dir(face, fi, fj, n)
+	var s := radius + r
+	return DVec3.new(d.x * s, d.y * s, d.z * s)
+
+# ---------------------------------------------------------------------------------------
+# The global edit key (§1.3): key = face<<40 | i<<26 | j<<12 | (r+2048)
+#   3 bits face | 14 bits i | 14 bits j | 12 bits (r+2048)   -> 43 bits, fits int64.
+# 14 bits holds N <= 16384 (Earth's 10016 fits); 12 bits holds r in [-2048, +2047].
+# ---------------------------------------------------------------------------------------
+
+static func edit_key(face: int, i: int, j: int, r: int) -> int:
+	return (face << 40) | (i << 26) | (j << 12) | (r + 2048)
+
+static func key_face(key: int) -> int:
+	return (key >> 40) & 0x7
+
+static func key_i(key: int) -> int:
+	return (key >> 26) & 0x3FFF
+
+static func key_j(key: int) -> int:
+	return (key >> 12) & 0x3FFF
+
+static func key_r(key: int) -> int:
+	return (key & 0xFFF) - 2048
+
+static func unpack_key(key: int) -> Dictionary:
+	return {"face": key_face(key), "i": key_i(key), "j": key_j(key), "r": key_r(key)}
+
+## The region-key prefix (§1.3): the same layout over region indices (i>>5, j>>5, r/32).
+## Every cell in one 32^3 region shares this key; adjacent regions differ. Used to extend
+## `region_origin_of` and the ZoneChunk/ZoneBundle stores to (body, face, region_i/j/r).
+static func region_key(face: int, i: int, j: int, r: int) -> int:
+	var ri := i >> 5
+	var rj := j >> 5
+	var rr := _floordiv(r, REGION_SIZE)      # floor division, correct for negative r
+	return (face << 40) | (ri << 26) | (rj << 12) | (rr + 2048)
+
+# ---------------------------------------------------------------------------------------
+# Edge-remap tables (§4.2) — GENERATED at first use from the §1.1 axis table, then cached.
+#
+# The remap is the RIGID unfold of the extended window (§4.3), NOT the gnomonic
+# classification of off-edge cells. Off-edge, a "straight" index line kinks in ground truth
+# (§4.6); the design keeps INDICES exact by using an exact D4 (dihedral) index map + integer
+# offset, absorbing the kink as a ground-truth metric lie. Generation:
+#
+#   1. mirror map A->B: the cube reflection R that swaps the two face normals maps A's
+#      equal-angle grid onto B's exactly (R is a cube symmetry, so it preserves the whole
+#      construction). Sampling three interior cells and classifying R*dir recovers the exact
+#      integer affine map {M_mirror, t_mirror} (A's cell <-> its across-edge mirror in B).
+#   2. compose with the side's in-range reflection so an OUT-of-range window cell folds to the
+#      correct B cell: unfold = mirror . reflect_side.
+#
+# Each entry: {b:int, m:[m00,m01,m10,m11], t:[t0,t1]} with (i',j') = M*(i,j) + t, r untouched.
+# ---------------------------------------------------------------------------------------
+
+## Returns the remap entry for crossing `side` of `face` (Dictionary {b, m, t}) for a given N.
+static func edge_remap(face: int, side: int, n: int) -> Dictionary:
+	_ensure_edge_table(n)
+	return _edge_cache[n][face * 4 + side]
+
+## Fold a window cell that has spilled across exactly ONE face edge back to its true global
+## (face, i, j). Returns {face, i, j}. In-range cells are the identity. A cell out of range in
+## BOTH i and j is a corner quadrant (§5.3) — undefined here (handled at M5); this returns
+## {face:-1,...} for that case so callers can detect it.
+static func fold_cell(face: int, i: int, j: int, n: int) -> Dictionary:
+	var oi := i < 0 or i >= n
+	var oj := j < 0 or j >= n
+	if not oi and not oj:
+		return {"face": face, "i": i, "j": j}
+	if oi and oj:
+		return {"face": -1, "i": i, "j": j}   # corner quadrant, §5.3 (M5)
+	var side := -1
+	if i >= n:
+		side = SIDE_EAST
+	elif i < 0:
+		side = SIDE_WEST
+	elif j >= n:
+		side = SIDE_NORTH
+	else:
+		side = SIDE_SOUTH
+	var e := edge_remap(face, side, n)
+	var m: Array = e["m"]
+	var t: Array = e["t"]
+	return {
+		"face": int(e["b"]),
+		"i": m[0] * i + m[1] * j + t[0],
+		"j": m[2] * i + m[3] * j + t[1],
+	}
+
+static func _ensure_edge_table(n: int) -> void:
+	if _edge_cache.has(n):
+		return
+	var table: Array = []
+	table.resize(24)
+	for face in range(6):
+		for side in range(4):
+			table[face * 4 + side] = _gen_edge(face, side, n)
+	_edge_cache[n] = table
+
+## Generate one {b, m, t} unfold entry for (face, side) at resolution n.
+static func _gen_edge(face: int, side: int, n: int) -> Dictionary:
+	# Exit axis (the neighbour's outward normal): the axis you head toward crossing this side.
+	var uu: Array = FACE_U[face]
+	var vv: Array = FACE_V[face]
+	var exit_axis: Array
+	match side:
+		SIDE_EAST:  exit_axis = uu                     # +u^
+		SIDE_WEST:  exit_axis = [-uu[0], -uu[1], -uu[2]]  # -u^
+		SIDE_NORTH: exit_axis = vv                     # +v^
+		_:          exit_axis = [-vv[0], -vv[1], -vv[2]]  # -v^ (SOUTH)
+	var b := _face_of_axis(exit_axis)
+
+	# The cube reflection R that swaps n^_A <-> n^_B: R = I - w w^T with w = n_A - n_B
+	# (|w|^2 = 2 for orthogonal unit axes, so the factor 2/|w|^2 = 1 and R is exact-integer).
+	var na: Array = FACE_N[face]
+	var nb: Array = FACE_N[b]
+	var w := [na[0] - nb[0], na[1] - nb[1], na[2] - nb[2]]
+	var rmat := _reflection_matrix(w)
+
+	# mirror map A->B: sample three interior cells, classify R*dir, read off the affine map.
+	var half := n / 2
+	var q0 := _classify_reflected(face, half, half, rmat, n)
+	var qi := _classify_reflected(face, half + 1, half, rmat, n)
+	var qj := _classify_reflected(face, half, half + 1, rmat, n)
+	# columns of M_mirror are the images of the i- and j- unit steps.
+	var mm := [
+		int(qi["fi"]) - int(q0["fi"]), int(qj["fi"]) - int(q0["fi"]),
+		int(qi["fj"]) - int(q0["fj"]), int(qj["fj"]) - int(q0["fj"]),
+	]
+	var tm := [
+		int(q0["fi"]) - (mm[0] * half + mm[1] * half),
+		int(q0["fj"]) - (mm[2] * half + mm[3] * half),
+	]
+
+	# side reflection (folds the out-of-range coordinate back in range before the mirror):
+	#   EAST  (i>=N): i -> 2N-1-i        WEST  (i<0): i -> -1-i
+	#   NORTH (j>=N): j -> 2N-1-j        SOUTH (j<0): j -> -1-j
+	var mr: Array
+	var tr: Array
+	match side:
+		SIDE_EAST:  mr = [-1, 0, 0, 1]; tr = [2 * n - 1, 0]
+		SIDE_WEST:  mr = [-1, 0, 0, 1]; tr = [-1, 0]
+		SIDE_NORTH: mr = [1, 0, 0, -1]; tr = [0, 2 * n - 1]
+		_:          mr = [1, 0, 0, -1]; tr = [0, -1]
+
+	# unfold = mirror . reflect_side  (apply the side reflection first, then the mirror).
+	var comp := _compose(mm, tm, mr, tr)
+	return {"b": b, "m": comp["m"], "t": comp["t"]}
+
+## Classify R*face_cell_to_dir(face, i, j) -> {face, fi, fj} (exact integer, cells interior).
+static func _classify_reflected(face: int, i: int, j: int, rmat: Array, n: int) -> Dictionary:
+	var d := face_cell_to_dir(face, i, j, n)
+	var rd := DVec3.new(
+		rmat[0] * d.x + rmat[1] * d.y + rmat[2] * d.z,
+		rmat[3] * d.x + rmat[4] * d.y + rmat[5] * d.z,
+		rmat[6] * d.x + rmat[7] * d.y + rmat[8] * d.z,
+	)
+	return dir_to_face_cell(rd, n)
+
+## R = I - w w^T for integer axis vector w with |w|^2 = 2. Row-major 3x3 flat array.
+static func _reflection_matrix(w: Array) -> Array:
+	var m := []
+	m.resize(9)
+	for p in range(3):
+		for q in range(3):
+			var iden := 1 if p == q else 0
+			m[p * 3 + q] = iden - w[p] * w[q]
+	return m
+
+## Compose two 2D affine maps: result = A . B  (apply B first, then A).
+static func _compose(am: Array, at: Array, bm: Array, bt: Array) -> Dictionary:
+	var m := [
+		am[0] * bm[0] + am[1] * bm[2], am[0] * bm[1] + am[1] * bm[3],
+		am[2] * bm[0] + am[3] * bm[2], am[2] * bm[1] + am[3] * bm[3],
+	]
+	var t := [
+		am[0] * bt[0] + am[1] * bt[1] + at[0],
+		am[2] * bt[0] + am[3] * bt[1] + at[1],
+	]
+	return {"m": m, "t": t}
+
+## Face index whose outward normal is the given axis vector (+/- unit axis).
+static func _face_of_axis(axis: Array) -> int:
+	for f in range(6):
+		var nn: Array = FACE_N[f]
+		if nn[0] == axis[0] and nn[1] == axis[1] and nn[2] == axis[2]:
+			return f
+	return -1
+
+# ---------------------------------------------------------------------------------------
+# Corner tables (§5.2 / §5.3): the 8 valence-3 cube corners.
+# ---------------------------------------------------------------------------------------
+
+## Signs of the 8 cube corner directions (sx, sy, sz), each direction = (sx,sy,sz)/sqrt(3).
+const CORNER_SIGNS := [
+	[ 1, 1, 1], [ 1, 1,-1], [ 1,-1, 1], [ 1,-1,-1],
+	[-1, 1, 1], [-1, 1,-1], [-1,-1, 1], [-1,-1,-1],
+]
+
+## Unit direction to cube corner k (0..7).
+static func corner_dir(k: int) -> DVec3:
+	var s: Array = CORNER_SIGNS[k]
+	return DVec3.new(float(s[0]) * INV_SQRT3, float(s[1]) * INV_SQRT3, float(s[2]) * INV_SQRT3)
+
+## The 3 faces meeting at corner k, and each face's corner cell (i, j) at that corner, for a
+## given N. Returns an Array of 3 dicts {face, i, j}. A corner cell's i is N-1 where the
+## corner direction has a positive projection on that face's u^, else 0 (likewise j for v^).
+static func corner_cells(k: int, n: int) -> Array:
+	var s: Array = CORNER_SIGNS[k]
+	var faces := [
+		0 if s[0] > 0 else 1,   # the X face
+		2 if s[1] > 0 else 3,   # the Y face
+		4 if s[2] > 0 else 5,   # the Z face
+	]
+	var out: Array = []
+	for f in faces:
+		var uu: Array = FACE_U[f]
+		var vv: Array = FACE_V[f]
+		var du: int = s[0] * uu[0] + s[1] * uu[1] + s[2] * uu[2]   # sign of corner . u^
+		var dv: int = s[0] * vv[0] + s[1] * vv[1] + s[2] * vv[2]   # sign of corner . v^
+		out.append({
+			"face": f,
+			"i": (n - 1) if du > 0 else 0,
+			"j": (n - 1) if dv > 0 else 0,
+		})
+	return out
+
+# ---------------------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------------------
+
+## Floor division of integers (GDScript `/` truncates toward zero; this floors for negatives).
+static func _floordiv(a: int, b: int) -> int:
+	var q := a / b
+	if (a % b != 0) and ((a < 0) != (b < 0)):
+		q -= 1
+	return q
+
+static func n_for(body: String) -> int:
+	return int(BODY_N.get(body, 0))
+
+static func radius_for(body: String) -> int:
+	return int(BODY_R.get(body, 0))

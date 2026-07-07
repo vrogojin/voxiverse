@@ -23,6 +23,14 @@ var environment: PerVoxelEnvironment
 var materials: MaterialRegistry
 var using_module: bool = false
 
+# COSMOS M2 — the floating-origin chart (docs/COSMOS-PLANET-TOPOLOGY.md §3.1/§3.2). NULL in
+# FLAT_WORLD (the default): the edit store keys by Vector3i window cell and every query is
+# BYTE-IDENTICAL to the pre-M2 flat world. Non-null ONLY in curved mode (installed in _ready when
+# CubeSphere.FLAT_WORLD is false, or injected by the M2 verify): the `_edits`/`_meta` overlays then
+# key by the 43-bit GLOBAL edit key (§1.3) so an edit is found again by its global identity across
+# any origin re-anchor or home face, and worldgen reads the window-independent GLOBAL cell (§8.2).
+var _chart: CosmosChart = null
+
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
@@ -65,6 +73,12 @@ func _ready() -> void:
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
 	BlockCatalog.ensure_ready()
+
+	# COSMOS M2 (§3.1/§3.2): in curved mode install the floating-origin chart on the home face at
+	# the identity origin, so the overlay keys globally and the origin can re-anchor as the player
+	# walks. FLAT_WORLD (the default) leaves `_chart` null → Vector3i keying → byte-identical.
+	if not CubeSphere.FLAT_WORLD:
+		_chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -132,10 +146,25 @@ func initial_view_meshed(center: Vector3) -> bool:
 ## modifier<<16 | state<<32); material/modifier/state are bit-projections of this
 ## one int, so they cannot desync. There is no second lookup that could disagree.
 func cell_value_at(cell: Vector3i) -> int:
-	var e: int = _edits.get(cell, -1)
+	var e: int = _edits.get(_edit_key(cell), -1)
 	if e >= 0:
 		return e                                    # overlay (already canonical)
-	return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+	if _chart == null:
+		return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+	# COSMOS M2 (§3.1/§8.2): fold the window cell to its GLOBAL cell FIRST, then generate. Worldgen
+	# is thereby a pure function of the global cell — window-INDEPENDENT — so it is byte-identical
+	# no matter where the chart is anchored (the determinism the far-from-spawn streaming needs).
+	var g := _chart.to_global(cell)
+	return TerrainConfig.generated_cell_global(int(g["face"]), int(g["i"]), int(g["j"]), int(g["r"]))
+
+## COSMOS M2 (§1.3): THE overlay key for a window cell. FLAT_WORLD / no chart → the Vector3i window
+## cell itself (byte-identical to the pre-M2 store). Curved → the 43-bit GLOBAL edit key, so an edit
+## survives origin re-anchors and home-face flips (its key is its global identity, not its window
+## position). Returned as a Variant because Dictionary keys are the Vector3i or the int transparently.
+func _edit_key(cell: Vector3i) -> Variant:
+	if _chart == null:
+		return cell
+	return _chart.to_global_key(cell)
 
 ## Material id at `cell` — the material projection of the composed query. UNCHANGED
 ## contract: every existing call site (floor, blocked, DDA, collider, collapse,
@@ -171,7 +200,7 @@ func _occ_span(v: int, fx: float, fz: float) -> Vector2:
 ## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
 ## below the heightmap.
 func is_removed(cell: Vector3i) -> bool:
-	return _edits.get(cell, -1) == 0
+	return _edits.get(_edit_key(cell), -1) == 0
 
 ## Highest y the player ever PLACED a block at in column (x, z); returns a deep
 ## negative sentinel when the column has no placements. (Bounds collider scans.)
@@ -313,7 +342,7 @@ func effective_height(x: int, z: int) -> int:
 ## a local support analysis so undercut terrain drops as loose rigid bodies, then
 ## refreshes ground collision.
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
-	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
+	if _edits.get(_edit_key(cell), -1) == 0 or not cell_solid(cell):
 		return 0
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
@@ -377,16 +406,20 @@ func place_block(cell: Vector3i, value: int) -> bool:
 ## update itself (the gameplay truth) is unconditional.
 func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool = true) -> void:
 	packed = CellCodec.canonical(packed)
+	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
+	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider
+	# fast-path index) and is re-keyed by −Δ on a re-anchor (_shift_window_bookkeeping).
+	var ek: Variant = _edit_key(cell)
 	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
-		_meta[cell] = meta                       # the one write that (re)sets metadata
+		_meta[ek] = meta                         # the one write that (re)sets metadata
 	elif not _meta.is_empty():
-		var old_meta: Variant = _meta.get(cell, null)
+		var old_meta: Variant = _meta.get(ek, null)
 		if old_meta != null:
-			_meta.erase(cell)                    # material change / break settles it
+			_meta.erase(ek)                      # material change / break settles it
 			block_entity_orphaned.emit(cell, old_meta)
-	if not _edits.has(cell):
+	if not _edits.has(ek):
 		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
-	_edits[cell] = packed
+	_edits[ek] = packed
 	if paint:
 		_paint_cell(cell, packed)
 
@@ -415,19 +448,19 @@ func set_metadata(cell: Vector3i, meta: Dictionary) -> bool:
 	if JSON.stringify(meta).to_utf8_buffer().size() > META_MAX_BYTES:
 		push_error("WorldManager.set_metadata: document at %s exceeds the %d-byte cap — rejected" % [cell, META_MAX_BYTES])
 		return false
-	_meta[cell] = meta.duplicate(true)
+	_meta[_edit_key(cell)] = meta.duplicate(true)
 	return true
 
 ## The block-entity METADATA document at `cell`; an EMPTY dict when the cell carries
 ## none. Returns a DEEP COPY — mutating it never changes the stored document (route
 ## real updates through `set_metadata`).
 func get_metadata(cell: Vector3i) -> Dictionary:
-	var m: Variant = _meta.get(cell, null)
+	var m: Variant = _meta.get(_edit_key(cell), null)
 	return (m as Dictionary).duplicate(true) if m != null else {}
 
 ## True iff `cell` currently carries a metadata document.
 func has_metadata(cell: Vector3i) -> bool:
-	return _meta.has(cell)
+	return _meta.has(_edit_key(cell))
 
 ## Set the STATE axis (bits 32..47) of `cell`, keeping its material + modifier and
 ## PRESERVING any metadata (the one write that does — §11). Returns false on air.
@@ -441,7 +474,7 @@ func set_state(cell: Vector3i, state_bits: int) -> bool:
 	var new_packed := CellCodec.pack(mat, CellCodec.modifier(v), state_bits)
 	# Re-pass the existing document so the choke point KEEPS it (same material → still a
 	# block-entity) rather than orphaning it: set_state is a behavioural, not material, edit.
-	_write_cell(cell, new_packed, _meta.get(cell, null))
+	_write_cell(cell, new_packed, _meta.get(_edit_key(cell), null))
 	return true
 
 ## JSON-subset validator (§3.2): a metadata document restricted to String keys and
@@ -483,6 +516,116 @@ func _paint_cell(cell: Vector3i, packed: int) -> void:
 		_module_world.call("set_cell", cell, packed)
 	elif _streamer != null:
 		_streamer.remesh_cell(cell)
+
+# --- COSMOS M2: the floating-origin chart + re-anchor (docs/COSMOS-PLANET-TOPOLOGY.md §3.2) -----
+# The whole intra-face floating-origin mechanism. FLAT_WORLD keeps `_chart` null, so every method
+# here is a byte-identical no-op (maybe_reanchor returns Vector3.ZERO, install_chart is never called
+# by the live path). Curved mode installs a chart in _ready; the M2 verify injects one directly.
+
+## Install (or replace) the floating-origin chart, switching the overlay to GLOBAL-key mode. Public
+## so the M2 verify can exercise the curved store without flipping the FLAT_WORLD const.
+func install_chart(chart: CosmosChart) -> void:
+	_chart = chart
+
+## The active chart, or null in FLAT_WORLD. Read-only accessor.
+func chart() -> CosmosChart:
+	return _chart
+
+## COSMOS M2 (§3.2): re-anchor the floating origin if the player has walked past the trigger.
+## Returns the WORLD-space shift the caller (the player) must SUBTRACT from its position so the
+## world stays continuous — Vector3.ZERO when there is no chart or no shift is due (FLAT_WORLD →
+## byte-identical no-op). The shift is an EXACT INTEGER translation of the window origin: existing
+## edits (global-keyed) are untouched, no cell changes its window identity relative to the player,
+## no content re-streams (pop = 0). Render nodes carry window-space geometry, so they are translated
+## by −Δ to keep their already-built meshes at the same world position while the origin moves.
+func maybe_reanchor(player_pos: Vector3) -> Vector3:
+	if _chart == null or not _chart.needs_reanchor(player_pos):
+		return Vector3.ZERO
+	var d := _chart.reanchor(player_pos)
+	if d == Vector2i.ZERO:
+		return Vector3.ZERO
+	var shift := Vector3(float(d.x), 0.0, float(d.y))
+	_shift_window_bookkeeping(d)
+	if _module_world != null:
+		_module_world.position -= shift
+	if _streamer != null:
+		_streamer.position -= shift
+	if _ground != null:
+		_ground.position -= shift
+	return shift
+
+## Re-key the WINDOW-space bookkeeping (which the global-keyed `_edits`/`_meta` are NOT part of) by
+## −Δ so it stays consistent after an origin shift: a window column (x, z) becomes (x − Δi, z − Δj).
+## These are collider/PERF indices only; the small dicts hold just the genuinely-edited columns.
+func _shift_window_bookkeeping(d: Vector2i) -> void:
+	var new_cols := {}
+	for k: Vector2i in _edit_columns.keys():
+		new_cols[k - d] = true
+	_edit_columns = new_cols
+	var new_top := {}
+	for k: Vector2i in _placed_top.keys():
+		new_top[k - d] = _placed_top[k]
+	_placed_top = new_top
+	if not _joint_mods.is_empty():
+		var new_j := {}
+		for k: Vector4i in _joint_mods.keys():
+			new_j[Vector4i(k.x - d.x, k.y, k.z - d.y, k.w)] = _joint_mods[k]
+		_joint_mods = new_j
+
+# --- COSMOS M2: per-(body,face) region persistence (§1.1/§1.3) -----------------
+# The curved twin of region_origin_of + save_edits/load_edits: the ZoneChunk region grid keyed by
+# the GLOBAL region key (face, region_i, region_j, region_r). N is 32-aligned (§1.1) so no region
+# straddles a face. These require an installed chart; the FLAT_WORLD Vector3i path above is
+# untouched. Additive — nothing in the live loop calls them (byte-identical whether a save happens).
+
+## The global region key (§1.3) of a window cell — THE per-(body,face) ZoneChunk key on the sphere.
+func region_key_of(cell: Vector3i) -> int:
+	return _chart.to_region_key(cell)
+
+## Curved-mode region SAVE: compact the global-keyed overlay for the one 32³ region identified by
+## `region_key` into a ZoneChunk. The region's local index order mirrors the window axes
+## (x, y, z) = (i, r, j), matching the FLAT save_edits layout so a chunk reads back the same way.
+func save_region(region_key: int) -> ZoneChunk:
+	var zc := ZoneChunk.new()
+	for k: int in _edits.keys():
+		var g := CubeSphere.unpack_key(k)
+		var gi := int(g["i"]); var gj := int(g["j"]); var gr := int(g["r"])
+		if CubeSphere.region_key(int(g["face"]), gi, gj, gr) != region_key:
+			continue
+		var idx := ZoneChunk.local_index(gi & 31, posmod(gr, 32), gj & 31)
+		zc.set_cell(idx, int(_edits[k]), _meta.get(k, null))
+	return zc
+
+## Curved-mode region LOAD: apply a ZoneChunk's cells back into the overlay for the region
+## `region_key`, routing each through the single write choke point (so the global key AND metadata
+## restore exactly). The chunk was saved by a global region key, so it re-materializes at the same
+## GLOBAL cells regardless of the chart's CURRENT origin — the persistence twin of edit-survival.
+func load_region(region_key: int, chunk: ZoneChunk, resolver: Callable = Callable()) -> void:
+	var rface := CubeSphere.key_face(region_key)
+	var ri := CubeSphere.key_i(region_key) << 5
+	var rj := CubeSphere.key_j(region_key) << 5
+	var rr := CubeSphere.key_r(region_key) * ZoneChunk.SIZE
+	for idx: int in chunk.present_indices():
+		var name := chunk.material_name_at(idx)
+		var id := -1
+		if resolver.is_valid():
+			id = int(resolver.call(StringName(name)))
+		else:
+			id = BlockCatalog.id_of(StringName(name))
+		if id < 0:
+			id = BlockCatalog.id_of(ZoneChunk.PLACEHOLDER_MATERIAL)
+			push_error("WorldManager.load_region: unknown material name '%s' — substituting placeholder '%s'"
+				% [name, ZoneChunk.PLACEHOLDER_MATERIAL])
+		var packed := CellCodec.pack(id, chunk.modifier_at(idx), chunk.state_at(idx))
+		var local := ZoneChunk.from_local_index(idx)
+		# global cell → window cell (global − origin); _write_cell re-derives the same global key.
+		var gi := ri + local.x
+		var gr := rr + local.y
+		var gj := rj + local.z
+		var win := Vector3i(gi - _chart.i_org, gr, gj - _chart.j_org)
+		if rface != _chart.face:
+			continue                                # a region off the home face (M3 territory) is skipped
+		_write_cell(win, packed, chunk.meta_at(idx))
 
 # --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------
 # The generated world is a pure function (tier 2) and is NEVER serialized; only the edit

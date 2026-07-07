@@ -173,6 +173,13 @@ func _physics_process(delta: float) -> void:
 		return
 	_move(delta)
 	world.update_streaming(global_position)
+	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
+	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
+	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
+	# this is a byte-identical no-op today.
+	var reanchor_shift := world.maybe_reanchor(global_position)
+	if reanchor_shift != Vector3.ZERO:
+		global_position -= reanchor_shift
 	_push_bodies(delta)
 	_update_aim()
 

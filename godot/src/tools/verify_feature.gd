@@ -4235,6 +4235,87 @@ func _test_snow_composites() -> void:
 		_ok(bm.z >= 8 and bm.y <= 1.1 and bm.x >= 2.0,
 			"shallow basin: %d-col snowy depression flattens terrain spread %.0f → snow-surface spread %.2f (<= 1 tenth+1, steelman 5c)" % [int(bm.z), bm.x, bm.y])
 
+	# --- (5d) WIDE DISTANT-COLD completeness sweep: every exposed snow-fill composite cell — anywhere in
+	#         the infinite world, well OUTSIDE the sampled cold windows — resolves to a BAKED composite
+	#         (render >= physics, never floating). This pins the enumeration fix for the module-vs-fallback
+	#         parity break: the old spatial sample only baked composites near find_cold()+find_mountains(6),
+	#         so a distant cold partial lip degraded to the M1 cap skin (no fill plane) while physics used
+	#         the true fill — the walkable snow floated up to ~0.9 block above the render. The enumeration
+	#         bakes snow_fill_materials() × appearance_modifiers() completely, so this sweep must find 0
+	#         unbaked composites and 0 floats. Two independent gates: (i) pure-terrain — every swept
+	#         composite pair (mat, modifier) is in emitted_cold_pairs(); (ii) module-guarded — arid_for_cell
+	#         resolves each cell to the composite ARID (_comp_arid_of >= 0), which renders the fill plane. --
+	var baked := {}
+	for slot: int in TerrainConfig.emitted_cold_pairs():
+		baked[slot] = true
+	# Distant regions, all far OUTSIDE the old _EMIT_SAMPLE_R (160) windows: the (0,4000) cold ring from
+	# the defect report, find_cold()'s own fringe (where 0<D<10 partial lips live), and mountains BEYOND
+	# the six the old bake sampled.
+	var regions: Array = [
+		[TerrainConfig.find_cold(), 160, 6],
+		[Vector2i(0, 4000), 300, 8],
+		[Vector2i(4000, 0), 240, 8],
+		[Vector2i(-3000, 3000), 240, 8],
+	]
+	var far_mtns := TerrainConfig.find_mountains(12)
+	for mi in range(6, far_mtns.size()):                       # mountains beyond the sampled 6
+		regions.append([far_mtns[mi], 140, 8])
+	var comp_cells: Array = []                                 # packed generated composite cell values
+	var partial_lips := 0                                      # exposed cells with 0<fill<10 (the float class)
+	for reg in regions:
+		var ctr: Vector2i = reg[0]
+		var rr: int = reg[1]
+		var st: int = reg[2]
+		for dx in range(-rr, rr + 1, st):
+			var x := ctr.x + dx
+			for dz in range(-rr, rr + 1, st):
+				var z := ctr.y + dz
+				var p := TerrainConfig.column_profile(x, z)
+				var g := int(p.x)
+				if g < TerrainConfig.SEA_LEVEL:
+					continue
+				if ClimateModel.surface_temperature(g, p.w) >= 0.0:
+					continue                                  # only cold columns carry the fill
+				for yy in [g, g + 1]:                          # the exposed surface ramp AND the smoothing lip
+					var v := TerrainConfig.generated_cell(x, yy, z)
+					var f := CellCodec.snow_fill(v)
+					var m := CellCodec.modifier(v)
+					if f > 0 and m > 0 and not CellCodec.is_layer(m):
+						comp_cells.append(v)
+						if f < 10:
+							partial_lips += 1
+	# (i) pure-terrain completeness: every swept composite pair is in the baked enumeration.
+	var unbaked := 0
+	var unbaked_eg := 0
+	for v in comp_cells:
+		var slot := CellCodec.mat(v) * 256 + CellCodec.modifier(v)
+		if not baked.has(slot):
+			unbaked += 1
+			if unbaked_eg == 0:
+				unbaked_eg = v
+	print("    distant-cold sweep: %d exposed snow-fill composite cells (%d partial lips 0<D<10), %d regions" % [comp_cells.size(), partial_lips, regions.size()])
+	_ok(comp_cells.size() > 0, "distant-cold sweep: sampled exposed snow-fill composite cells far outside the old windows (%d)" % comp_cells.size())
+	_ok(partial_lips > 0, "distant-cold sweep: sampled PARTIAL lips (0<D<10 — the floating-render class the fix targets) (%d)" % partial_lips)
+	_ok(unbaked == 0, "distant-cold sweep: EVERY exposed composite pair is in emitted_cold_pairs() — 0 unbaked (else mat %d mod %d floats)" % [CellCodec.mat(unbaked_eg), CellCodec.modifier(unbaked_eg)])
+	# (ii) module-guarded: arid_for_cell resolves every composite to a real composite ARID (the fill plane),
+	#      never the degraded cap-skin — render >= physics, never floating, on the live module worker path.
+	if ClassDB.class_exists("VoxelTerrain") and ClassDB.class_exists("VoxelBuffer"):
+		var mwd: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mwd)
+		if bool(mwd.call("setup")):
+			var floats := 0
+			var floats_eg := 0
+			var checked := 0
+			for v in comp_cells:
+				var ca := int(mwd.call("_comp_arid_of", CellCodec.mat(v), CellCodec.modifier(v), CellCodec.snow_fill(v)))
+				checked += 1
+				if ca < 0:
+					floats += 1
+					if floats_eg == 0:
+						floats_eg = v
+			_ok(floats == 0, "distant-cold sweep (module): all %d exposed composites resolve to a baked fill-plane ARID — 0 floats (else mat %d mod %d fill %d)" % [checked, CellCodec.mat(floats_eg), CellCodec.modifier(floats_eg), CellCodec.snow_fill(floats_eg)])
+		mwd.queue_free()
+
 ## THE occupancy-span composition the WorldManager uses (mirror of its private _occ_span), so a test can
 ## assert the collider's coverage equals ⋃ _occ_span over a column: material gate, shape span, then the
 ## snow fill raising the walkable top to max(shape, fill/10).

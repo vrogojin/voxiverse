@@ -1395,13 +1395,32 @@ static func find_cold() -> Vector2i:
 				return Vector2i(x, z)
 	return find_mountain()
 
-## The sampled set of (surface/cap material, modifier) pairs a SNOW-FILL composite emits over the cold
-## region (SNOW-ACCUMULATION §2.7), each encoded `mat * _SHORE_STRIDE + modifier` (the emitted_shore_pairs
-## slot). Two families over the find_cold() + find_mountains() centres, at every column whose SURFACE is
-## cold (surface_temperature < 0) and above the sea: (1) the buried SURFACE ramp `_biome_top * 256 + sm`
-## (fill 10), (2) the smoothing LIP `_cap_material * 256 + cm` (a corner cap, NOT a LAYER). A deliberate
-## superset/sample — a rare unsampled pair degrades to the M1 snow-cap skin then the dry ramp on the
-## worker (never a hole). Cached statically; main-thread setup/verify only, never the voxel worker.
+## The materials whose blocks.json state_layout DECLARES the snow-fill nibble (SNOW-ACCUMULATION §2.2):
+## grass, stone, podzol, sand, snow_block. Only on these does a stamped fill survive canonicalization and
+## reach physics (_occ_span reads snow_fill only after _validate_state masks undeclared bits), so ONLY
+## these can render — or, when their composite is unbaked, FLOAT — a snow-fill COMPOSITE. Superset of
+## snow_cappable_materials() by snow_block (whose own B_SNOWY ramps fill, but which is not a snow-CAP
+## base). The module bakes this set × appearance_modifiers() × {3,5,8,10}. Keep in lockstep with the
+## `state_layout` entries in blocks.json (verify pins the layout on exactly these five).
+static func snow_fill_materials() -> PackedInt32Array:
+	_ensure_ids()
+	return PackedInt32Array([BlockCatalog.GRASS, BlockCatalog.STONE, _ID_PODZOL, _ID_SAND, _ID_SNOW])
+
+## The COMPLETE, bounded set of (surface/cap material, corner modifier) pairs a SNOW-FILL composite can
+## emit ANYWHERE in the infinite world (SNOW-ACCUMULATION §2.7), each encoded `mat * _SHORE_STRIDE +
+## modifier` (the slot the module bake decodes). This REPLACES the earlier find_cold()+find_mountains(6)
+## SPATIAL SAMPLE within `_EMIT_SAMPLE_R`: that sample baked only composites occurring inside those
+## windows, so a cold (cap_material, cm) composite OUTSIDE them degraded on the module worker to the M1
+## snow-cap skin (a white ramp with NO fill plane) while physics used the true fill nibble — the walkable
+## snow surface then FLOATED up to ~0.9 block above the rendered ramp on any distant cold partial lip (a
+## module-vs-fallback parity break: the fallback mesher dual-emits the fill plane unconditionally). The
+## fix mirrors the DRY manifest's material × emitted_modifiers completeness and the sharp-slope
+## enumeration: the FULL Cartesian product of snow_fill_materials() (the fill-carrying materials — the
+## only ones that can float) × appearance_modifiers() (the complete 79-shape BOTTOM-anchored corner family
+## the smoother can emit; every one is < 256, a dense slot). The bake consumer applies the four render
+## levels {3,5,8,10} per pair. Bounded (5 × 79 = 395 pairs) and material-complete: every exposed
+## partial-lip composite anywhere resolves to a baked model (render >= physics, never floating). Cached
+## statically; main-thread setup/verify only, never the voxel worker.
 static var _cold_pairs_ready := false
 static var _cold_pairs := PackedInt32Array()
 static func emitted_cold_pairs() -> PackedInt32Array:
@@ -1409,38 +1428,15 @@ static func emitted_cold_pairs() -> PackedInt32Array:
 		return PackedInt32Array()
 	if _cold_pairs_ready:
 		return _cold_pairs
-	_ensure_noise()
 	_ensure_ids()
-	var seen := {}
-	_sample_cold(find_cold(), _EMIT_SAMPLE_R, seen)
-	for mc: Vector2i in find_mountains(6):
-		_sample_cold(mc, _EMIT_SAMPLE_R, seen)
 	var out := PackedInt32Array()
-	for s: int in seen.keys():
-		out.append(s)
+	for mat: int in snow_fill_materials():
+		for modifier: int in appearance_modifiers():
+			out.append(mat * _SHORE_STRIDE + modifier)  # every modifier < 256 → a valid dense slot
 	out.sort()
 	_cold_pairs = out
 	_cold_pairs_ready = true
 	return _cold_pairs
-
-## Accumulate into `seen` every snow-fill composite pair over the (2r+1)² region centred on `center`.
-static func _sample_cold(center: Vector2i, r: int, seen: Dictionary) -> void:
-	for dx in range(-r, r + 1):
-		var x := center.x + dx
-		for dz in range(-r, r + 1):
-			var z := center.y + dz
-			var p := column_profile(x, z)
-			var g := int(p.x)
-			if g < SEA_LEVEL:
-				continue                                  # no snow fill on underwater floors
-			if ClimateModel.surface_temperature(g, p.w) >= 0.0:
-				continue                                  # only cold columns carry the fill
-			var sm := surface_modifier(x, z, {})          # fresh pcache avoids memo pollution
-			if sm != 0:
-				seen[_biome_top(int(p.y), x, z) * _SHORE_STRIDE + sm] = true
-			var cm := surface_cap_modifier(x, z, {})
-			if cm != 0 and not CellCodec.is_layer(cm):     # a corner lip (a LAYER cap is baked in _layer_arid)
-				seen[_cap_material(int(p.y), x, z, p.w, g) * _SHORE_STRIDE + cm] = true
 
 ## Sentinel returned by find_coast_of when no coast of the requested kind is found in range.
 const _COAST_NONE := Vector2i(0x7fffffff, 0x7fffffff)

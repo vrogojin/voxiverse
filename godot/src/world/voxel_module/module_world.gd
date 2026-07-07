@@ -1378,6 +1378,7 @@ var snow_id := -1                        # snow_block LRID (the curated LAYER ma
 var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
+var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
 const GEN_STRIDE := 256
 const SLOPE_STRIDE := 4096
 const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape
@@ -1403,6 +1404,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# today, but taking the max keeps the all-air early-out sound if either bound ever changes.
 	var max_above = max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS)
 	var ncube = cube_arid.size()
+	var mcount = model_count                 # actual baked library model count — the OOB fence (see write site)
 	var ngen = gen_arid.size()
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
@@ -1583,6 +1585,15 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						arid = gen_arid[slot]
 					else:
 						arid = cube_arid[id] if id < ncube else id
+				# OOB FENCE (VDS 8.1 exhaustion policy) — runs for EVERY cell after the arid resolve: a
+				# stray/unbaked payload degrades to a valid cube, NEVER an out-of-range model index. The
+				# blocky mesher (C++/wasm) indexes its baked-model array by this value, so any arid outside
+				# [0, model_count) is an out-of-bounds worker crash. Every branch above already cube-falls-
+				# back; this only fires if a table held a stale index or a web bake truncated the library
+				# below _next_arid, clamping to the material cube, else air (model 0 is always empty).
+				if arid < 0 or arid >= mcount:
+					var cf = cube_arid[id] if id < ncube else 0
+					arid = cf if (cf >= 0 and cf < mcount) else 0
 				buffer.set_voxel(arid, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
@@ -1607,7 +1618,21 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
+	# The OOB fence upper bound (VDS §8.1): the ACTUAL baked model count, read back from the library
+	# (not _next_arid) so that if a web bake ever truncated the models array below what we appended, the
+	# generator still never writes an index past what the mesher can address. Falls back to _next_arid
+	# when the library doesn't expose its models array.
+	gen.set("model_count", _library_model_count())
 	return gen
+
+## The actual number of models in the baked library (the arid upper bound for the worker's OOB fence).
+## Reads the live `models` array size when exposed; else the append count `_next_arid`.
+func _library_model_count() -> int:
+	if _library != null:
+		var models: Variant = _library.get("models")
+		if models is Array:
+			return (models as Array).size()
+	return _next_arid
 
 # --- helpers -------------------------------------------------------------------
 # Set a property only if the object actually exposes it (avoids error spam if a

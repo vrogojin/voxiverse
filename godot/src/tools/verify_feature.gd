@@ -59,6 +59,7 @@ func _initialize() -> void:
 	_test_snowy_world()
 	_test_mountains()
 	_test_shader_prewarm()
+	_test_lod_far_field()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -4330,6 +4331,272 @@ func _test_shader_prewarm() -> void:
 	_ok(done2[0], "prewarm: PHASE 2 finishes (no module → hold skipped; never hangs)")
 	_ok(pw2.live_mesh_instance_count() == 0, "prewarm: PHASE 2 tears the pile down on finish")
 	dummy.queue_free()
+
+# LOD far-field terrain (LOD-DESIGN §6). Headless can't see GPU output, so we pin the CPU-side
+# invariants: mesh vertex heights == the height_at-derived render surface at every lattice point,
+# the under-bias guarantee at the seam, ring coverage + hard-cap budgets, no-hole streaming order,
+# determinism, the data-driven palette, and the open-ocean collapse. The visual (banding, draw-call
+# headroom, the seam in motion) is validated by the user on the deployed /lod build.
+func _test_lod_far_field() -> void:
+	print("[LOD] far-field terrain (lattice identity / coverage / budgets / palette / determinism)")
+	var SEA: int = TerrainConfig.SEA_LEVEL
+	var spawn := Vector2i(1224, 378)         # the mountain-foothill demo spawn (land — non-collapsed tiles)
+	var sea_y := float(SEA) + TerrainConfig.WATER_SURFACE_HEIGHT - FarTerrain.BIAS_SEA
+	_ok(absf(sea_y - 0.6875) <= 1e-4, "far sea surface == 0.6875 (SEA_LEVEL + 0.9375 − BIAS_SEA)")
+
+	# (1) LATTICE IDENTITY (invariant 1): build one tile per ring around spawn; every interior vertex
+	# height equals the render surface r(x,z) recomputed independently from height_at/column_profile.
+	var clamped_seen := 0
+	for ring in range(FarTerrain.RING_TABLE.size()):
+		var rd: Dictionary = FarTerrain.RING_TABLE[ring]
+		var tile := float(rd["tile_m"])
+		var tc := Vector2i(floori(float(spawn.x) / tile), floori(float(spawn.y) / tile))
+		var a := FarMeshBuilder.build_arrays(ring, tc)
+		_ok(not bool(a["collapsed"]), "ring %d spawn tile is a full mesh (land, not the ocean collapse)" % ring)
+		if bool(a["collapsed"]):
+			continue
+		var grid: int = a["grid"]
+		var cell: float = a["cell"]
+		var origin: Vector2 = a["origin"]
+		var verts: PackedVector3Array = a["verts"]
+		var side := grid + 1
+		var worst := 0.0
+		var pos_ok := true
+		for i in range(0, grid + 1):
+			for j in range(0, grid + 1):
+				var wx := int(origin.x) + i * int(cell)
+				var wz := int(origin.y) + j * int(cell)
+				var exp := _far_expected_r(wx, wz, sea_y)
+				var v := verts[i * side + j]
+				worst = maxf(worst, absf(v.y - exp["r"]))
+				if absf(v.x - float(wx)) > 1e-3 or absf(v.z - float(wz)) > 1e-3:
+					pos_ok = false
+				if bool(exp["clamped"]):
+					clamped_seen += 1
+		_ok(pos_ok, "ring %d: every lattice vertex sits at its world (x,z)" % ring)
+		_ok(worst <= 1e-4, "ring %d: every vertex height == height_at-derived r (worst Δ=%.6f ≤ 1e-4)" % [ring, worst])
+
+	# (2) UNDER-BIAS (invariant 2): over ≥500 dry-land columns in the 192–320 seam band, the far
+	# surface sits below even a maximally-down-smoothed voxel cell (≤ height_at − 0.4).
+	var dry := 0
+	var under_ok := true
+	var rr := 192
+	while rr < 320:
+		var ang := 0
+		while ang < 360:
+			var wx := spawn.x + int(round(cos(deg_to_rad(float(ang))) * float(rr)))
+			var wz := spawn.y + int(round(sin(deg_to_rad(float(ang))) * float(rr)))
+			var s := FarMeshBuilder.sample_point(wx, wz)
+			if int(s["g"]) >= SEA and not bool(s["clamped"]):
+				dry += 1
+				if float(s["r"]) > float(TerrainConfig.height_at(wx, wz)) - 0.4:
+					under_ok = false
+			ang += 7
+		rr += 2
+	_ok(dry >= 500, "under-bias sampled ≥ 500 dry-land seam columns (%d)" % dry)
+	_ok(under_ok, "under-bias: far surface ≤ height_at − 0.4 at every dry seam column (never above the voxel walk)")
+
+	# (3) DETERMINISM (invariant 5): the same (ring, tile_coord, SEED) → byte-identical arrays.
+	var b1 := FarMeshBuilder.build_arrays(0, Vector2i(floori(1224.0 / 256.0), floori(378.0 / 256.0)))
+	var b2 := FarMeshBuilder.build_arrays(0, Vector2i(floori(1224.0 / 256.0), floori(378.0 / 256.0)))
+	_ok(b1["verts"] == b2["verts"] and b1["normals"] == b2["normals"]
+		and b1["colors"] == b2["colors"] and b1["indices"] == b2["indices"],
+		"determinism: two builds of one tile are byte-identical (verts/normals/colors/indices)")
+
+	# (4) COVERAGE + BUDGETS (invariants 3 + 4) via a live FarTerrain, drained synchronously.
+	var far := FarTerrain.new()
+	get_root().add_child(far)
+	var eval_a := Vector3(float(spawn.x), 60.0, float(spawn.y))
+	far.update_center(eval_a)
+	far.drain_for_test()
+	var ea := Vector2(eval_a.x, eval_a.z)
+	# no tile AABB entirely inside INNER_HOLE, and coverage of the full annulus with no gap.
+	var no_inner := true
+	for key in far.live_keys():
+		if _far_tile_maxdist(key, ea) <= FarTerrain.INNER_HOLE:
+			no_inner = false
+	_ok(no_inner, "coverage: no live tile AABB lies entirely inside the 192 m near-field hole")
+	var covered := true
+	var rad := 196.0
+	while rad <= FarTerrain.R_FAR - 4.0:
+		var ang2 := 0
+		while ang2 < 360:
+			var p := ea + Vector2(cos(deg_to_rad(float(ang2))), sin(deg_to_rad(float(ang2)))) * rad
+			if not _far_point_covered(far, p):
+				covered = false
+			ang2 += 30
+		rad += 128.0
+	_ok(covered, "coverage: the union of live tiles covers the annulus [192, 3072] with no gap")
+	_ok(far.live_tile_count() <= FarTerrain.FAR_MAX_TILES, "budget: live tiles ≤ FAR_MAX_TILES (%d ≤ %d)" % [far.live_tile_count(), FarTerrain.FAR_MAX_TILES])
+	_ok(far.live_tile_count() <= FarTerrain.FAR_MAX_DRAWS, "budget: far draw calls ≤ FAR_MAX_DRAWS (%d ≤ %d)" % [far.live_tile_count(), FarTerrain.FAR_MAX_DRAWS])
+	_ok(far.total_live_tris() <= FarTerrain.FAR_MAX_TRIS, "budget: total far triangles ≤ FAR_MAX_TRIS (%d ≤ %d)" % [far.total_live_tris(), FarTerrain.FAR_MAX_TRIS])
+	print("    far-field budget @ spawn: %d tiles / %d draws / %d tris" % [far.live_tile_count(), far.live_tile_count(), far.total_live_tris()])
+
+	# (5) NO-HOLE STREAMING ORDER (invariant §4.2): a 64 m step re-centers; stale tiles must keep
+	# rendering until their replacements commit, so coverage of the still-desired overlap never drops.
+	var eval_b := Vector3(eval_a.x + 96.0, 60.0, eval_a.z)   # > FAR_RECENTER_STEP
+	var eb := Vector2(eval_b.x, eval_b.z)
+	far.update_center(eval_b)                                # recompute only — NOT yet drained
+	var hole_free := true
+	var rad3 := 260.0
+	while rad3 <= 1600.0:                                    # sample the A/B overlap region
+		var ang3 := 0
+		while ang3 < 360:
+			var p := eb + Vector2(cos(deg_to_rad(float(ang3))), sin(deg_to_rad(float(ang3)))) * rad3
+			# a point still inside A's annulus was covered before the move; it must stay covered now.
+			if ea.distance_to(p) >= FarTerrain.INNER_HOLE and ea.distance_to(p) <= FarTerrain.R_FAR - 4.0:
+				if not _far_point_covered(far, p):
+					hole_free = false
+			ang3 += 30
+		rad3 += 128.0
+	_ok(hole_free, "no-hole: after a 64 m recenter, still-desired coverage is preserved before new tiles commit")
+	far.drain_for_test()
+	var all_desired := true
+	for key in far.live_keys():
+		if not far.desired_info(key).has("ring"):
+			all_desired = false
+	_ok(all_desired, "no-hole: after draining, every live tile is in the desired set (stale ones evicted)")
+	_ok(far.live_tile_count() <= FarTerrain.FAR_MAX_DRAWS, "eviction: live tile count stays bounded after re-center (%d)" % far.live_tile_count())
+	far.queue_free()
+
+	# (6) PALETTE PINS (invariant 6): the data-driven far colours reproduce snow line + sea regimes.
+	FarPalette.ensure_ready()
+	var C_SNOW := BlockCatalog.color_of(BlockCatalog.id_of(&"snow_block"))
+	var C_WATER := BlockCatalog.color_of(BlockCatalog.id_of(&"water"))
+	var C_LAVA := BlockCatalog.color_of(BlockCatalog.id_of(&"lava"))
+	var C_ICE := BlockCatalog.color_of(BlockCatalog.id_of(&"ice"))
+	# a peak above the y=96 freeze line whitens.
+	var peak := _far_find_peak()
+	if peak.x != 0x7fffffff:
+		var pt: float = TerrainConfig.column_profile(peak.x, peak.y).w
+		var pg: int = TerrainConfig.height_at(peak.x, peak.y)
+		_ok(FarPalette.color_for(pg, TerrainConfig.B_MOUNTAINS, pt, false) == C_SNOW,
+			"palette: mountain peak above y=96 → snow colour (g=%d)" % pg)
+	else:
+		_ok(false, "palette: located a tall peak for the snow-line pin")
+	# sea regimes by temperature (the exact frozen / molten thresholds).
+	_ok(FarPalette.sea_color(0.70) == C_LAVA, "palette: t ≥ LAVA_SEA_T sea → lava colour")
+	_ok(FarPalette.sea_color(-0.70) == C_ICE, "palette: t < CLIMATE_FROZEN sea → ice colour")
+	_ok(FarPalette.sea_color(0.0) == C_WATER, "palette: temperate sea → water colour")
+	# a real deep-ocean clamped vertex reads water.
+	var ocean := _far_find_deep_ocean()
+	if ocean.x != 0x7fffffff:
+		var ot: float = TerrainConfig.column_profile(ocean.x, ocean.y).w
+		var og: int = TerrainConfig.height_at(ocean.x, ocean.y)
+		if ot >= ClimateModel.CLIMATE_FROZEN and ot < TerrainConfig.LAVA_SEA_T:
+			_ok(FarPalette.color_for(og, TerrainConfig.B_OCEAN, ot, true) == C_WATER,
+				"palette: temperate deep-ocean clamped vertex → water colour")
+	else:
+		print("    (no deep temperate ocean tile found in range — the synthetic sea_color pins still fence the regime)")
+
+	# (7) OPEN-OCEAN COLLAPSE (§2.5): an all-sea tile emits exactly 2 triangles.
+	var otile := _far_find_ocean_tile()
+	if int(otile["found"]):
+		var oa := FarMeshBuilder.build_arrays(int(otile["ring"]), otile["tc"])
+		_ok(bool(oa["collapsed"]) and int(oa["tri_count"]) == 2, "collapse: an all-sea tile emits exactly 2 triangles")
+	else:
+		print("    (no fully-open-ocean 256 m tile found in the scanned range — collapse path exercised by unit geometry only)")
+
+	# (8) SOFT PERF PIN (the _test_collider_amortized style): one 64-grid tile sampling pass ≤ 25 ms
+	# headless (a slow-machine safety margin; the real budget is FAR_BUILD_BUDGET_MS on device).
+	var t0 := Time.get_ticks_usec()
+	var _pj := FarMeshBuilder.build_arrays(0, Vector2i(floori(1224.0 / 256.0), floori(378.0 / 256.0)))
+	var build_ms := float(Time.get_ticks_usec() - t0) / 1000.0
+	_ok(build_ms <= 25.0, "perf: one 64-grid far tile builds in ≤ 25 ms headless (%.2f ms)" % build_ms)
+
+## The far render surface r(x,z) recomputed independently from height_at/column_profile
+## (LOD-DESIGN §2.2) — verify's oracle for the lattice-identity invariant.
+func _far_expected_r(wx: int, wz: int, sea_y: float) -> Dictionary:
+	var g: int = int(TerrainConfig.column_profile(wx, wz).x)
+	var land := float(g) + 1.0 - FarTerrain.BIAS_LAND
+	if g >= TerrainConfig.SEA_LEVEL:
+		return {"r": land, "clamped": false}
+	if land < sea_y:
+		return {"r": sea_y, "clamped": true}
+	return {"r": land, "clamped": false}
+
+## Max distance from `e` to a live tile's world AABB (for the "no tile inside 192" check).
+func _far_tile_maxdist(key: Vector3i, e: Vector2) -> float:
+	var rd: Dictionary = FarTerrain.RING_TABLE[key.x]
+	var tile := float(rd["tile_m"])
+	var lo := Vector2(float(key.y) * tile, float(key.z) * tile)
+	return FarTerrain._box_max_dist(e, lo, lo + Vector2(tile, tile))
+
+## True iff world point `p` lies inside some live tile's XZ AABB (coverage test).
+func _far_point_covered(far: FarTerrain, p: Vector2) -> bool:
+	for key in far.live_keys():
+		var rd: Dictionary = FarTerrain.RING_TABLE[key.x]
+		var tile := float(rd["tile_m"])
+		var lo := Vector2(float(key.y) * tile, float(key.z) * tile)
+		if p.x >= lo.x and p.x <= lo.x + tile and p.y >= lo.y and p.y <= lo.y + tile:
+			return true
+	return false
+
+## The tallest B_MOUNTAINS peak column near origin (mirrors _test_mountains); sentinel if none.
+func _far_find_peak() -> Vector2i:
+	var massifs := TerrainConfig.find_mountains(8)
+	var peak := Vector2i(0x7fffffff, 0)
+	var peak_g := -0x7fffffff
+	for mc: Vector2i in massifs:
+		for dx in range(-120, 121, 3):
+			for dz in range(-120, 121, 3):
+				var x := mc.x + dx
+				var z := mc.y + dz
+				var p := TerrainConfig.column_profile(x, z)
+				if int(p.y) != TerrainConfig.B_MOUNTAINS:
+					continue
+				if int(p.x) > peak_g and int(p.x) > 96:
+					peak_g = int(p.x)
+					peak = Vector2i(x, z)
+	return peak
+
+## A deep-ocean column (g well below sea level) scanned outward from origin; sentinel if none.
+func _far_find_deep_ocean() -> Vector2i:
+	for radius in range(0, 3072, 16):
+		for a in range(0, 360, 12):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			if TerrainConfig.height_at(x, z) <= TerrainConfig.SEA_LEVEL - 6:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+## A ring-0 (256 m) tile whose every interior lattice column is a clamped sea vertex, so the
+## open-ocean collapse fires. Cheap-prunes candidates (5 probe points) before the full scan; returns
+## {found:bool, ring:int, tc:Vector2i}. Sentinel-safe: found=0 when none lies in range.
+func _far_find_ocean_tile() -> Dictionary:
+	var seed := _far_find_deep_ocean()
+	if seed.x == 0x7fffffff:
+		return {"found": 0}
+	var tile := int(FarTerrain.RING_TABLE[0]["tile_m"])
+	var grid := int(FarTerrain.RING_TABLE[0]["grid"])
+	var cell := int(FarTerrain.RING_TABLE[0]["cell_m"])
+	var base := Vector2i(floori(float(seed.x) / float(tile)), floori(float(seed.y) / float(tile)))
+	for dtx in range(-4, 5):
+		for dtz in range(-4, 5):
+			var tc := base + Vector2i(dtx, dtz)
+			var ox := tc.x * tile
+			var oz := tc.y * tile
+			# cheap prune: 4 corners + centre must all be clamped sea.
+			var probe_ok := true
+			for pp in [Vector2i(0, 0), Vector2i(grid, 0), Vector2i(0, grid), Vector2i(grid, grid), Vector2i(grid / 2, grid / 2)]:
+				if not bool(FarMeshBuilder.sample_point(ox + pp.x * cell, oz + pp.y * cell)["clamped"]):
+					probe_ok = false
+					break
+			if not probe_ok:
+				continue
+			# full confirm: every interior column clamped.
+			var all_sea := true
+			for i in range(0, grid + 1):
+				for j in range(0, grid + 1):
+					if not bool(FarMeshBuilder.sample_point(ox + i * cell, oz + j * cell)["clamped"]):
+						all_sea = false
+						break
+				if not all_sea:
+					break
+			if all_sea:
+				return {"found": 1, "ring": 0, "tc": tc}
+	return {"found": 0}
 
 # WATER-SHORE §8 (items 1–6 + collider 8) — composite water-over-terrain cells, the 0.9 water
 # surface, and underwater floor smoothing. The liquid axis (CellCodec bits 48..53) is a pure

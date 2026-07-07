@@ -149,17 +149,22 @@ static func assemble(job: Dictionary) -> Dictionary:
 
 	# Skirts: extrude every tile edge straight down (LOD-DESIGN §1.4). Skirt vertices copy
 	# their top vertex's normal + colour (no dark walls). Per-edge (non-deduplicated) so the
-	# vertex count is exactly grid²+... ≤ the 16-bit / 4,485-vertex pin.
+	# vertex count is exactly grid²+... ≤ the 16-bit / 4,485-vertex pin. Skirt quads are
+	# DOUBLE-SIDED (both windings): the player sits at the ring centre, so at a boundary the
+	# covering skirt must be seen whether distant terrain RISES away from the player or falls
+	# toward it — no single winding covers both, so a one-sided skirt leaks sky on every rising
+	# ridge (LOD-DESIGN §1.4). Only the thin skirt walls are doubled, keeping the top surface
+	# single-sided CULL_BACK — no whole-surface overdraw, no extra draw call.
 	var skirt_depth := float(FarTerrain.SKIRT_CELLS) * cell
-	# min-x, max-x, min-z, max-z edges with their outward horizontal directions.
+	# min-x, max-x, min-z, max-z edges (each skirt quad is emitted double-sided — see _wall_quad).
 	_add_skirt(verts, normals, vcolors, indices, side, skirt_depth,
-		_border_indices(side, grid, 0), Vector3(-1, 0, 0))     # min-x (i=0, j varies)
+		_border_indices(side, grid, 0))     # min-x (i=0, j varies)
 	_add_skirt(verts, normals, vcolors, indices, side, skirt_depth,
-		_border_indices(side, grid, 1), Vector3(1, 0, 0))      # max-x (i=grid)
+		_border_indices(side, grid, 1))     # max-x (i=grid)
 	_add_skirt(verts, normals, vcolors, indices, side, skirt_depth,
-		_border_indices(side, grid, 2), Vector3(0, 0, -1))     # min-z (j=0)
+		_border_indices(side, grid, 2))     # min-z (j=0)
 	_add_skirt(verts, normals, vcolors, indices, side, skirt_depth,
-		_border_indices(side, grid, 3), Vector3(0, 0, 1))      # max-z (j=grid)
+		_border_indices(side, grid, 3))     # max-z (j=grid)
 
 	return {
 		"verts": verts, "normals": normals, "colors": vcolors, "indices": indices,
@@ -213,10 +218,10 @@ static func _border_indices(side: int, grid: int, edge: int) -> PackedInt32Array
 				out.append(i * side + grid)
 	return out
 
-## Extrude one border edge downward and stitch the wall, winding each quad to face `outward`.
+## Extrude one border edge downward and stitch the double-sided wall.
 static func _add_skirt(verts: PackedVector3Array, normals: PackedVector3Array,
 		vcolors: PackedColorArray, indices: PackedInt32Array, _side: int,
-		depth: float, border: PackedInt32Array, outward: Vector3) -> void:
+		depth: float, border: PackedInt32Array) -> void:
 	var n := border.size()
 	if n < 2:
 		return
@@ -230,17 +235,21 @@ static func _add_skirt(verts: PackedVector3Array, normals: PackedVector3Array,
 		vcolors.append(vcolors[top])
 		skirt[k] = si
 	for k in range(n - 1):
-		_wall_quad(verts, indices, border[k], border[k + 1], skirt[k + 1], skirt[k], outward)
+		_wall_quad(indices, border[k], border[k + 1], skirt[k + 1], skirt[k])
 
-## Two triangles for the wall quad (top a→b, bottom under b→under a), wound so the front
-## face points `outward`.
-static func _wall_quad(verts: PackedVector3Array, indices: PackedInt32Array,
-		ta: int, tb: int, sb: int, sa: int, outward: Vector3) -> void:
-	var nrm := (verts[tb] - verts[ta]).cross(verts[sb] - verts[ta])
-	if nrm.dot(outward) >= 0.0:
-		indices.append_array([ta, tb, sb, ta, sb, sa])
-	else:
-		indices.append_array([ta, sb, tb, ta, sa, sb])
+## The wall quad (top a→b, bottom under b→under a) emitted DOUBLE-SIDED — both triangle
+## windings. Winding is intentionally NOT chosen: a centre viewer must see the covering skirt
+## on both rising boundaries (the ring's own edge faces away) and falling ones (it faces
+## toward), which no single winding achieves; emitting both is the robust crack seal
+## (LOD-DESIGN §1.4). It costs 4 skirt tris/quad instead of 2, doubling only the thin skirt
+## walls (~6% of a tile's tris) — far cheaper than a CULL_DISABLED material, which would either
+## overdraw the whole top surface or split the tile into a second draw call.
+static func _wall_quad(indices: PackedInt32Array,
+		ta: int, tb: int, sb: int, sa: int) -> void:
+	indices.append_array([
+		ta, tb, sb, ta, sb, sa,                 # front winding
+		ta, sb, tb, ta, sa, sb,                 # back winding
+	])
 
 ## The open-ocean collapse quad (LOD-DESIGN §2.5): 4 verts, 2 tris, +Y normals, corner
 ## colours preserved so an ice/lava/water regime boundary across the tile still shows.

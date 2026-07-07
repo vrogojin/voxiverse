@@ -42,7 +42,14 @@ const FAR_BUILD_BUDGET_MS := 3.0           # main-thread sampling budget per fra
 const MAX_COMMITS_PER_FRAME := 1
 const SAMPLE_STEP_COLUMNS := 1024          # profiling slice size (LOD-DESIGN §2.6)
 const FAR_MAX_TILES := 120                 # hard caps — trim outermost-first, warn
-const FAR_MAX_TRIS := 450000
+## Raised from 450k: double-sided skirts (LOD-DESIGN §1.4) lift per-tile tris, so the pure
+## geometric worst case (every tile full-mesh, worst boundary alignment, no ocean collapse)
+## is ≈ 554k (measured by sweep); the mountain-foothill spawn is ≈ 478k. 600k clears that
+## absolute worst with headroom so no inland mountain position trims the horizon silhouette,
+## while still catching genuine runaway. Web-safe: skirt-doubling adds only INDICES (16-bit,
+## ≤ 4,485 verts/tile unchanged), so GPU memory stays in the 10–20 MB envelope (LOD-DESIGN
+## §1.2/§6.6); tile/draw counts are separately capped below (89 desired max < 96 draws).
+const FAR_MAX_TRIS := 600000
 const FAR_MAX_DRAWS := 96
 const FAR_CAMERA_FAR := 3840.0             # player.gd camera.far override when ENABLED
 const FOG_BEGIN := 115.0                   # main.gd fog when ENABLED (LOD-DESIGN §3.4)
@@ -83,11 +90,13 @@ static func make_material() -> StandardMaterial3D:
 	m.roughness = 1.0
 	m.metallic = 0.0
 	m.metallic_specular = 0.0                # no sun in the scene → specular is moot; keep it off
-	# CULL_BACK with the top-surface winding now fixed to face UP (see FarMeshBuilder). The original
+	# CULL_BACK with the top-surface winding fixed to face UP (see FarMeshBuilder). The original
 	# winding faced DOWN: CULL_BACK culled the whole surface → only the vertical skirts showed ("grid
 	# of bars"); CULL_DISABLED then rendered its underside ("terrain from underground"). With the
 	# winding reversed, CULL_BACK draws the correct top surface viewed from above and drops the
-	# underside/back-face clutter.
+	# underside/back-face clutter. The SKIRTS are made double-sided in geometry (both windings, see
+	# FarMeshBuilder._wall_quad), NOT via the material — so the top stays single-sided and cheap
+	# while the skirt still seals rising-boundary cracks from the centre viewer (LOD-DESIGN §1.4).
 	m.cull_mode = BaseMaterial3D.CULL_BACK
 	return m
 
@@ -187,7 +196,8 @@ func _apply_caps(desired: Dictionary) -> Dictionary:
 
 static func _tris_per_tile(rd: Dictionary) -> int:
 	var grid: int = rd["grid"]
-	return grid * grid * 2 + 8 * grid           # surface + 4 edges × grid segments × 2
+	# surface (grid²×2) + double-sided skirts (4 edges × grid segments × 2 tris × 2 faces).
+	return grid * grid * 2 + 16 * grid
 
 static func _box_min_dist(e: Vector2, lo: Vector2, hi: Vector2) -> float:
 	var dx := maxf(maxf(lo.x - e.x, e.x - hi.x), 0.0)

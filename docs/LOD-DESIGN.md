@@ -38,7 +38,7 @@ Headline numbers (derived in §1/§3, verify-pinned in §6):
 |---|---|
 | Horizon | R_FAR = 3,072 m; inner hole 192 m (= `RENDER_RADIUS_BLOCKS` 256 − 64) |
 | Rings | 4 (cells 4/8/16/32 m; each ring's cell ≈ 2% of its inner radius) |
-| Triangles | ≈ 410 k typical; **hard cap 450 k** (asserted) |
+| Triangles | ≈ 478 k at the mountain spawn; ≈ 554 k geometric worst; **hard cap 600 k** (asserted) |
 | Draw calls | ≈ 60–75 far tiles typical; **hard cap 96** (+1 material, opaque pass only) |
 | GPU memory | ≈ 11–14 MB (≈ 210 k verts × 40 B + 16-bit indices) |
 | Build cost | ≈ 210 k `column_profile` calls ≈ 0.4–0.9 s WASM CPU, amortized ≤ 3 ms/frame |
@@ -64,19 +64,26 @@ research's strict octave-doubling bands, priced honestly with partial-tile count
 is ≈ 2% of its inner radius** (constant screen-space error target), which brings the total
 back inside the envelope:
 
-| Ring | Band (m, from player XZ) | Cell | Tile | Grid | Tris/tile (incl. skirt) | Typical tiles | Typical tris |
-|---|---|---|---|---|---|---|---|
-| 0 | 192 – 320 | 4 m | 256 m | 64×64 | 8,192 + 512 = 8,704 | ~10 | ~87 k |
-| 1 | 320 – 768 | 8 m | 512 m | 64×64 | 8,704 | ~12 | ~104 k |
-| 2 | 768 – 1,792 | 16 m | 1,024 m | 64×64 | 8,704 | ~16 | ~139 k |
-| 3 | 1,792 – 3,072 | 32 m | 1,024 m | 32×32 | 2,048 + 256 = 2,304 | ~33 | ~76 k |
+Tris/tile below include the **double-sided** skirt (2× the skirt tris of the original design,
+§1.4): a grid-64 tile is 8,192 surface + 1,024 skirt, a grid-32 tile 2,048 + 512.
 
-Total ≈ 71 tiles ≈ **406 k triangles**, ≈ 210 k vertices. Typical counts assume the
-area-of-annulus / tile-area estimate plus perimeter partials; exact counts vary ±20% with
-player position, hence the **hard caps** (§4.4): if a computed desired set would exceed
-`FAR_MAX_TRIS = 450_000` or `FAR_MAX_TILES = 120` or draw calls > 96, outermost tiles are
-trimmed first (never inner/seam tiles) and a warning is pushed — the caps are a safety net,
-not the sizing mechanism. Well within WebGL2 limits: each tile has ≤ 4,485 vertices
+| Ring | Band (m, from player XZ) | Cell | Tile | Grid | Tris/tile (incl. 2-sided skirt) | Typical tiles | Typical tris |
+|---|---|---|---|---|---|---|---|
+| 0 | 192 – 320 | 4 m | 256 m | 64×64 | 8,192 + 1,024 = 9,216 | ~10 | ~92 k |
+| 1 | 320 – 768 | 8 m | 512 m | 64×64 | 9,216 | ~12 | ~111 k |
+| 2 | 768 – 1,792 | 16 m | 1,024 m | 64×64 | 9,216 | ~16 | ~147 k |
+| 3 | 1,792 – 3,072 | 32 m | 1,024 m | 32×32 | 2,048 + 512 = 2,560 | ~33 | ~85 k |
+
+Total ≈ 71 tiles ≈ **435 k triangles** typical, ≈ 478 k at the mountain-foothill spawn, and a
+**≈ 554 k geometric worst** (every tile full-mesh, worst boundary alignment, no ocean
+collapse — measured by a position sweep). Typical counts assume the area-of-annulus /
+tile-area estimate plus perimeter partials; exact counts vary ±20% with player position, hence
+the **hard caps** (§4.4): if a computed desired set would exceed `FAR_MAX_TRIS = 600_000` or
+`FAR_MAX_TILES = 120` or draw calls > 96, outermost tiles are trimmed first (never inner/seam
+tiles) and a warning is pushed — the caps are a safety net, not the sizing mechanism. The cap
+clears the 554 k worst with headroom so no inland mountain position ever trims the horizon.
+The skirt-doubling adds only **indices** (16-bit; the ≤ 4,485 verts/tile is unchanged), so GPU
+memory is unaffected and stays in the 10–20 MB envelope below. Well within WebGL2 limits: each tile has ≤ 4,485 vertices
 (65² grid + 4×65 skirt row), so indices are 16-bit; a single vertex format (position +
 normal + COLOR) ≈ 40 B/vertex → ≈ 11–14 MB GPU total (LOD-RESEARCH §6.6 envelope 10–20 MB).
 Draw-call context: the near field already runs ~200–500 draws by design
@@ -101,6 +108,19 @@ quads reuse the edge vertex colour. This is the whole crack story — **no cross
 stitching, no T-junction repair** (Ulrich's answer; LOD-RESEARCH §6.2), and no
 `visibility_range` alpha fades (they force the transparent pass — LOD-RESEARCH §2.5; locked
 OUT for v1).
+
+**Skirts are DOUBLE-SIDED (locked — corrects the original single-winding assumption).** The
+player sits at the ring centre, so at a ring boundary the covering skirt hangs from the
+*higher* tile's edge. When distant terrain **rises** away from the player (every distant
+ridge/mountain) that skirt's outward face points away from the player; when terrain falls it
+points toward the player. No single triangle winding is visible in both cases — a one-sided
+skirt would leak fog/sky through the crack on exactly the objectionable rising boundaries.
+The fix: `FarMeshBuilder._wall_quad` emits **both** windings for each skirt quad (4 tris/quad
+instead of 2). This doubles only the thin skirt walls (~6% of a tile's triangles) rather than
+paying for a `CULL_DISABLED` material — the top surface stays single-sided `CULL_BACK`, so it
+is neither whole-surface-overdrawn nor split into a second draw call. (Contrast §2.4: the top
+surface's own winding is separately fixed to face +Y; that part genuinely needs only
+`CULL_BACK`.)
 
 **1.5 World anchoring and the skip-inner rule (locked).** A tile is *live* iff its 2D AABB
 intersects the Euclidean annulus `[max(192, ring.inner), ring.outer]` around the player's XZ,
@@ -184,10 +204,16 @@ if the catalog recolours a block, the far field follows. Per vertex:
 
 **2.4 One material (locked).** A single shared `StandardMaterial3D`:
 `vertex_color_use_as_albedo = true`, `roughness = 1.0`, `metallic/specular = 0`, opaque,
-back-face culled. The scene is flat-ambient with no sun (`main.gd:77-82`), so vertex colour
-IS the final surface colour, and Godot's depth fog applies to near and far layers
-identically — the luminance-matching problem solved by using the same fog in the same
-renderer (LOD-RESEARCH §6.5).
+`CULL_BACK`. The top surface is wound to face +Y so `CULL_BACK` draws it correctly from above
+(the original winding faced down and was wrongly culled). **`CULL_BACK` alone does NOT suffice
+for the skirts** — a centre viewer must see the covering skirt on both rising and falling
+boundaries, which no single winding gives (§1.4). Skirts are therefore made double-sided in
+*geometry* (both windings), keeping ONE material and ONE draw call per tile while the top
+stays cheap and single-sided. The scene is flat-ambient with no sun (`main.gd:77-82`), so
+vertex colour IS the final surface colour (back-face skirt tris show the same colour — no dark
+walls), and Godot's depth fog applies to near and far layers identically — the
+luminance-matching problem solved by using the same fog in the same renderer (LOD-RESEARCH
+§6.5).
 
 **2.5 Open-ocean collapse (locked).** If every sample in a tile is a clamped sea vertex, the
 tile is emitted as a **single flat quad** (4 vertices, 2 triangles, no skirt — its neighbours
@@ -320,8 +346,9 @@ re-center while walking (crossing one 64 m step) dirties ~4–8 tiles ≈ 20–7
 re-centers; the queue is coalescing (a key superseded before it builds is dropped), so the
 system degrades to "horizon refines when you slow down", never to a stall.
 
-**4.4 Bounds (locked, verify-pinned).** `FAR_MAX_TILES = 120`, `FAR_MAX_TRIS = 450_000`,
-far draw calls ≤ 96 (tiles + nothing else; one material, opaque pass). The desired-set
+**4.4 Bounds (locked, verify-pinned).** `FAR_MAX_TILES = 120`, `FAR_MAX_TRIS = 600_000`
+(raised from 450 k for the double-sided skirts, §1.4/§1.2), far draw calls ≤ 96 (tiles +
+nothing else; one material, opaque pass). The desired-set
 computation enforces them by trimming outermost-first (§1.2). Memory bound follows:
 ≤ 120 tiles × ≤ 230 KB ≈ 27 MB absolute worst, ≈ 11–14 MB typical.
 
@@ -381,7 +408,7 @@ the module world and the GDScript fallback, and headless with neither.
    a maximally-down-smoothed surface cell: 1.5 − 1.0 corner quantization − margin).
 3. **Coverage**: for any evaluation point, the union of live-tile AABBs covers the annulus
    `[192, 3,072]` with no gap, and no tile AABB lies inside 192.
-4. **Budgets**: Σ tris ≤ 450 k, tiles ≤ 120, per-tile verts ≤ 4,485 (16-bit indices).
+4. **Budgets**: Σ tris ≤ 600 k, tiles ≤ 120, per-tile verts ≤ 4,485 (16-bit indices).
 5. **Determinism**: same `(ring, tile_coord, SEED)` → byte-identical arrays.
 6. **Palette**: peaks above the freeze line are snow-coloured; sea regimes colour by `t`.
 
@@ -399,8 +426,10 @@ the module world and the GDScript fallback, and headless with neither.
   a deep-ocean column → water colour; a `t ≥ 0.60` sea column → lava colour; a `t < −0.55`
   sea column → ice colour.
 * Open-ocean collapse pin: an all-sea tile emits exactly 2 triangles.
-* Soft perf pin (the `_test_collider_amortized` style): one 64-grid tile sampling pass
-  ≤ 25 ms headless.
+* Soft perf pin (the `_test_collider_amortized` style): one 64-grid tile build guarded against
+  pathological slowdown (≤ 75 ms headless — a generous ~2× ceiling over the observed 25–35 ms
+  on the shared CI binary, so it never machine-flaps; the measured value is always printed, and
+  the real per-frame control is `FAR_BUILD_BUDGET_MS` on device).
 
 **6.3 Residual seam error, quantified (the number a reviewer should check on screenshots).**
 Lattice points: exact (invariant 1). Between lattice points at ring 0 (4 m cells): linear
@@ -494,7 +523,7 @@ FAR_RECENTER_STEP    := 64.0             # m of XZ movement before re-evaluating
 FAR_BUILD_BUDGET_MS  := 3.0              # main-thread sampling budget per frame
 MAX_COMMITS_PER_FRAME:= 1
 FAR_MAX_TILES        := 120              # hard caps — trim outermost-first, warn
-FAR_MAX_TRIS         := 450_000
+FAR_MAX_TRIS         := 600_000          # raised from 450k for double-sided skirts (§1.4)
 FAR_MAX_DRAWS        := 96
 FAR_CAMERA_FAR       := 3840.0           # player.gd:66 override when ENABLED
 FOG_BEGIN / END / CURVE := 115.0 / 2750.0 / 0.38   # applied in main.gd when ENABLED

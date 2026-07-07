@@ -32,6 +32,19 @@ var _mesher: Object                     # the VoxelMesherBlocky (kept so restrea
 # NEW generator (new face) and restreams, rather than mutating the face workers are reading.
 var _gen_face := CubeSphere.HOME_FACE
 
+# COSMOS Stage 4 — post-flip view-distance ramp (kills the seam-cross freeze without moving spawn).
+# A home-face flip recreates the VoxelTerrain; jamming its max_view_distance to the full near radius in
+# one step re-queues the ENTIRE near disk (~2.6k blocks) in a single process pass → the 2 web workers +
+# the main-thread mesh-apply flood → the multi-second input-dead freeze. Instead the fresh terrain starts
+# at RAMP_START_BLOCKS and grows to the target over RAMP_SECONDS, so the nearest ring meshes first and
+# worker load ramps in instead of spiking (the far LOD, now frame-correct, covers the gap). The FINAL
+# view is identical — this is pure load-shaping. Active only in the ~1-2s after a flip restream.
+const RAMP_START_BLOCKS := 48.0
+const RAMP_SECONDS := 1.5
+var _ramp_active := false
+var _ramp_view := 0.0
+var _ramp_target := 0.0
+
 # --- appearance table (ARIDs, VOXEL-DATA-STRUCTURE §8.1) ------------------------
 # The TYPE channel carries an Appearance Render ID (ARID) — a session-local, append-
 # only dense id per (LRID, modifier) combination in use, equal by construction to its
@@ -237,7 +250,26 @@ func setup() -> bool:
 	# Each block model (ids 1..count()-1) carries its own material; no terrain-wide
 	# material_override needed.
 	add_child(_terrain)
+	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
+	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
+	set_process(false)
 	return true
+
+## COSMOS Stage 4 — drive the post-flip view-distance ramp. Grows the fresh terrain's max_view_distance
+## from RAMP_START_BLOCKS to the near radius over RAMP_SECONDS so the near field streams in smoothly
+## after a home-face flip instead of freezing on a single full-disk request pass. Self-disables when the
+## target is reached; dormant (processing off) at every other time.
+func _process(delta: float) -> void:
+	if not _ramp_active:
+		set_process(false)
+		return
+	var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
+	_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
+	if _terrain != null:
+		_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
+	if _ramp_view >= _ramp_target:
+		_ramp_active = false
+		set_process(false)
 
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
@@ -1057,7 +1089,8 @@ func restream() -> void:
 		return
 	_set_if(new_terrain, "mesher", _mesher)
 	_set_if(new_terrain, "generator", generator)
-	_set_if(new_terrain, "max_view_distance", TerrainConfig.near_render_radius())
+	# Stage 4: start small and ramp up in _process (below) instead of flooding the full disk at once.
+	_set_if(new_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
 	_set_if(new_terrain, "mesh_block_size", 32)
 	_set_if(new_terrain, "generate_collisions", false)
 	if old_terrain != null:
@@ -1067,6 +1100,14 @@ func restream() -> void:
 	add_child(new_terrain)
 	_terrain = new_terrain
 	_generator = generator
+	# Kick off the view-distance ramp so the near field fills in over ~RAMP_SECONDS rather than in one
+	# freezing pass. If the target is already within the start radius (never, at radius 128/256) it is a
+	# no-op. FLAT_WORLD only reaches restream() via a flip, which never fires without a chart — so flat
+	# play never ramps and stays byte-identical.
+	_ramp_target = float(TerrainConfig.near_render_radius())
+	_ramp_view = RAMP_START_BLOCKS
+	_ramp_active = _ramp_target > RAMP_START_BLOCKS
+	set_process(_ramp_active)
 
 ## Whether the OOB fence has clamped a stale/unbaked ARID this session (COSMOS-AUDIT F8 telemetry — a
 ## real out-of-range must never pass silently). Verify asserts this stays false over a clean run.

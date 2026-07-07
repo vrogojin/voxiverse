@@ -63,7 +63,7 @@ const FOG_END := 2750.0
 const FOG_CURVE := 0.38
 
 # --- runtime state ------------------------------------------------------------
-var _material: StandardMaterial3D
+var _material: Material                     # StandardMaterial3D (FLAT) or the CosmosBend far ShaderMaterial (curved)
 var _live: Dictionary = {}                 # key Vector3i(ring,tx,tz) -> MeshInstance3D
 var _live_tris: Dictionary = {}            # key -> int tri count (committed)
 var _desired: Dictionary = {}              # key -> {ring, tc, min_dist, tris}
@@ -76,6 +76,13 @@ var _warned_caps := false
 var _active_key                            # Variant: Vector3i or null
 var _active_job: Dictionary = {}
 var _active_done := false
+
+# COSMOS M3: after a home-face flip re-bases the chart onto a neighbour face, this node's global-index
+# frame (its `position` offset) jumps by a large delta. The still-world-correct tiles from the old
+# frame are reparented here as a WORLD-FIXED cover so the horizon never blanks while the new frame
+# streams in; it is freed the moment the new frame has produced coverage. Null except mid-handoff.
+# FLAT_WORLD / no chart never flips, so this stays null and the node stays at position ZERO.
+var _cover: Node3D = null
 
 func _ready() -> void:
 	if not ENABLED:
@@ -90,7 +97,17 @@ func _ready() -> void:
 
 ## The one shared far material (LOD-DESIGN §2.4). Static so ShaderPrewarm warms the
 ## exact same material/vertex-format pipeline this node draws with.
-static func make_material() -> StandardMaterial3D:
+##
+## COSMOS Stage 3: in curved mode return the CosmosBend far ShaderMaterial so distant tiles bend with
+## the planet exactly like the near voxel field (no near-bent/far-flat seam at the hole). FLAT_WORLD
+## keeps the StandardMaterial3D below byte-identical — and because ShaderPrewarm builds through THIS
+## function, the bend pipeline is warmed at load, not on the first far tile drawn in gameplay.
+static func make_material() -> Material:
+	if not CubeSphere.FLAT_WORLD:
+		CosmosBend.ensure_globals()
+		var sm := ShaderMaterial.new()
+		sm.shader = CosmosBend.far_shader()
+		return sm
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true
 	m.roughness = 1.0
@@ -114,7 +131,12 @@ static func make_material() -> StandardMaterial3D:
 func update_center(pos: Vector3) -> void:
 	if not ENABLED:
 		return
-	var e := Vector2(pos.x, pos.z)
+	# COSMOS: this node lives in the GLOBAL-index frame (its `position` is −(i_org, 0, j_org), kept in
+	# lockstep with the near voxel field by WorldManager on every re-anchor/flip). So the eval point —
+	# and thus every tile lattice point sampled from it — must be expressed in that same global frame,
+	# `player_world − position`, exactly the column the near field renders at this world spot. In
+	# FLAT_WORLD `position` is permanently ZERO, so this is `Vector2(pos.x, pos.z)` byte-for-byte.
+	var e := Vector2(pos.x - position.x, pos.z - position.z)
 	if _has_eval and e.distance_to(_eval_point) < FAR_RECENTER_STEP:
 		return
 	_eval_point = e
@@ -125,6 +147,44 @@ func update_center(pos: Vector3) -> void:
 ## deliberately NOT implemented in v1 (a dug pit subtends < 0.3° at 192 m).
 func invalidate_tiles(_region: Rect2i) -> void:
 	pass
+
+## COSMOS M3 home-face flip handoff (Fable Stage 1). The chart re-based onto a neighbour face, so this
+## node's global-index frame jumped to `new_pos` = −(i_org, 0, j_org) on the new face. The current
+## live tiles are still WORLD-correct (the flip is teleport-free), so stash them under a world-fixed
+## cover — the horizon stays up while the new frame streams in behind it — then adopt the new frame and
+## force a full recompute. Main-thread only, touches no voxel worker. No-op with no live tiles.
+func rebase_to(new_pos: Vector3) -> void:
+	if not ENABLED:
+		return
+	var old_pos := position
+	# Drop any prior cover first (its terrain is now two flips stale — no longer trustworthy).
+	if _cover != null and is_instance_valid(_cover):
+		_cover.queue_free()
+	_cover = null
+	if not _live.is_empty():
+		var cover := Node3D.new()
+		cover.name = "FarStaleCover"
+		add_child(cover)
+		# Keep every reparented tile at its exact current WORLD position. After self.position = new_pos
+		# below, the cover's world origin must remain old_pos, so cover.position = old_pos − new_pos and
+		# each tile's local (old-frame global) coords are left untouched: world = new_pos + (old_pos −
+		# new_pos) + global_old = old_pos + global_old, its original world spot.
+		cover.position = old_pos - new_pos
+		for key in _live.keys():
+			var mi = _live[key]
+			if is_instance_valid(mi):
+				remove_child(mi)
+				cover.add_child(mi)
+		_cover = cover
+	_live.clear()
+	_live_tris.clear()
+	_desired.clear()
+	_queue.clear()
+	_active_key = null
+	_active_job = {}
+	_active_done = false
+	position = new_pos
+	_has_eval = false                          # next update_center recomputes in the new frame
 
 # --- desired-set computation + reconciliation ---------------------------------
 
@@ -257,6 +317,12 @@ func _process(_delta: float) -> void:
 	if not ENABLED:
 		return
 	_drain(FAR_BUILD_BUDGET_MS)
+	# Retire the post-flip stale cover once the new frame has produced real coverage (queue drained AND
+	# at least one new tile is live), so the handoff shows no blank and leaves nothing lingering.
+	if _cover != null and _live.size() > 0 and not has_pending_build():
+		if is_instance_valid(_cover):
+			_cover.queue_free()
+		_cover = null
 
 func _drain(budget_ms: float) -> void:
 	var t0 := Time.get_ticks_usec()

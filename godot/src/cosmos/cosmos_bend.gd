@@ -31,6 +31,7 @@ const _EPS := 1e-6
 
 static var _opaque_shader: Shader = null
 static var _translucent_shader: Shader = null
+static var _far_shader: Shader = null
 static var _globals_ready := false
 
 ## Register the two global shader uniforms (idempotent). A `global uniform` referenced by a shader
@@ -127,6 +128,31 @@ void fragment() {
 }
 """ % _VERTEX_BEND
 	_translucent_shader = s
+	return s
+
+## The FAR-FIELD bend shader (COSMOS Stage 3): the SAME sphere bend applied to the LOD heightmap tiles,
+## so the distant silhouette curves with the planet by the identical sagitta formula as the near voxel
+## field — instead of floating flat above the true horizon (the near-bent / far-flat seam). The
+## ShaderMaterial mirror of FarTerrain.make_material()'s StandardMaterial3D: unshaded, CULL_BACK (the far
+## top is single-sided, wound up; skirts are double-sided in geometry), vertex-colour albedo, no texture.
+## The bend reads MODEL_MATRIX, so it is correct with the far node offset into the global-index frame.
+## Only built when CubeSphere.FLAT_WORLD is false; FLAT keeps the StandardMaterial3D byte-identical.
+static func far_shader() -> Shader:
+	if _far_shader != null:
+		return _far_shader
+	var s := Shader.new()
+	s.code = """
+shader_type spatial;
+render_mode unshaded, cull_back;
+global uniform vec3 cosmos_bend_origin;
+global uniform float cosmos_radius;
+void vertex() {
+%s}
+void fragment() {
+	ALBEDO = COLOR.rgb;
+}
+""" % _VERTEX_BEND
+	_far_shader = s
 	return s
 
 ## The exact-sphere horizon distance (blocks) for an eye `eye_height` above the datum on a body of

@@ -115,6 +115,12 @@ func _ready() -> void:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
 		add_child(_far)
+		# COSMOS: the far layer renders in the GLOBAL-index frame, offset −(i_org, 0, j_org) so its
+		# tiles sample the SAME global column the near voxel field renders at each world spot (Fable
+		# Stage 1). At spawn the chart is at (0,0) → ZERO; kept in lockstep on re-anchor/flip below.
+		# FLAT_WORLD (no chart) leaves it at ZERO → byte-identical to the pre-COSMOS far layer.
+		if _chart != null:
+			_far.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
 
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
@@ -783,6 +789,11 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 		_streamer.position -= shift
 	if _ground != null:
 		_ground.position -= shift
+	# The far layer shares the near field's global-index frame, so it re-anchors by the SAME −Δ:
+	# already-built (global-coord) tiles keep their world position and stay aligned with the near
+	# surface (Fable Stage 1). Any live post-flip cover is a child, so it rides along automatically.
+	if _far != null:
+		_far.position -= shift
 	return shift
 
 ## COSMOS M3 (§4.5): the home-face flip. When the player has crossed FLIP_HYST cells PAST a face
@@ -817,6 +828,11 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 		_module_world.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
 		if _module_world.has_method("set_home_face"):
 			_module_world.call("set_home_face", _chart.face)
+	# Re-base the far layer onto the new face's global frame (Fable Stage 1). It stashes its still-
+	# world-correct tiles as a cover so the horizon holds while the near field restreams behind it —
+	# the intended visual bridge that keeps the seam crossing from blanking the mid-to-far distance.
+	if _far != null:
+		_far.rebase_to(Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org)))
 	# HARD RESTREAM the fallback streamer + collider (the module was restreamed by set_home_face above).
 	_restream()
 	print("[WorldManager] home-face flip %d → %d (hard restream)" % [int(res["from_face"]), int(res["to_face"])])

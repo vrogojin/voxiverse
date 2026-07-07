@@ -648,15 +648,37 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 		return false                                  # corner quadrant — deferred to M5
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
 	TerrainConfig.set_active_face(_chart.face)
-	# The window-space collider indices are re-based onto the new face's index map; the simplest
-	# sound thing on a hard restream is to drop them (they refill as the collider rebuilds).
-	_edit_columns = {}
-	_placed_top = {}
+	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed
+	# `_edits`/`_meta` are untouched (edits are preserved), but `_edit_columns`/`_placed_top` are
+	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the
+	# new window (a home-face-only join now maps onto the neighbour face) — the collider stays exact.
+	_rebuild_window_indices()
 	# HARD RESTREAM: the render nodes carried the old face's content, which no longer matches the
 	# window. Drop + rebuild around the player (fallback fully; module keeps the far-field cover).
 	_restream()
 	print("[WorldManager] home-face flip %d → %d (hard restream)" % [int(res["from_face"]), int(res["to_face"])])
 	return true
+
+## Rebuild the window-keyed PERF indices (`_edit_columns`, `_placed_top`) from the global-keyed
+## overlay after a home-face flip re-bases the window (§4.5). Every edit's global cell is unfolded
+## back into the current window; edits whose cell is not reachable in this window (far off-face)
+## simply do not index a column here — they re-index when the home face flips to their face. Keeps
+## the collider's fast-path gate + above-surface scan exact after the flip.
+func _rebuild_window_indices() -> void:
+	_edit_columns = {}
+	_placed_top = {}
+	for k: int in _edits.keys():
+		var g := CubeSphere.unpack_key(k)
+		var win := _chart.window_of_global(int(g["face"]), int(g["i"]), int(g["j"]))
+		if not bool(win["found"]):
+			continue
+		var col := Vector2i(int(win["x"]), int(win["z"]))
+		_edit_columns[col] = true
+		if int(_edits[k]) > 0:                            # a PLACED (non-air) cell raises the high-water mark
+			var r := int(g["r"])
+			var prev: int = _placed_top.get(col, -0x40000000)
+			if r > prev:
+				_placed_top[col] = r
 
 ## Drop and rebuild the near render + collider after a home-face flip (§4.5 hard restream). Guarded
 ## so it is a safe no-op in the headless verify (no streamer / module / collider nodes exist there).

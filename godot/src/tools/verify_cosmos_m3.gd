@@ -212,6 +212,9 @@ func _test_home_face_flip() -> void:
 	var wback: Dictionary = chart.window_of_global(int(ge["face"]), int(ge["i"]), int(ge["j"]))
 	_ok(bool(wback["found"]) and w.cell_value_at(Vector3i(int(wback["x"]), int(ge["r"]), int(wback["z"]))) == packed,
 		"the edit is FOUND AGAIN after the flip (full value intact)")
+	# The window-keyed collider index is rebuilt from the overlay onto the new face (fallback fully).
+	_ok(bool(wback["found"]) and w.is_edited_column(int(wback["x"]), int(wback["z"])),
+		"the collider's window edit-column index is rebuilt onto the new face after the flip")
 
 	# Worldgen determinism: the same global cell generates identically before/after the flip.
 	var wprobe2: Dictionary = chart.window_of_global(int(g_probe["face"]), int(g_probe["i"]), int(g_probe["j"]))

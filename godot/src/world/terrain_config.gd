@@ -470,18 +470,30 @@ static func biome_at(x: int, z: int, pcache = null) -> int:
 ## exactly the uncached column_profile, so worldgen output stays byte-identical and
 ## deterministic. Non-null -> memoize; null -> compute directly (the analytic path).
 static func column_profile(x: int, z: int, pcache = null) -> Vector4:
-	if pcache != null:
-		var ck := Vector2i(x, z)
-		if pcache.has(ck):
-			return pcache[ck]
+	# COSMOS frozen-epoch (F1): a GenCtx (the worker path) carries the immutable face + a memo keyed by
+	# (face, x, z); a plain Dictionary (legacy / analytic worker) or null memoizes by (x, z) and reads
+	# `_active_face` (main-thread only). In FLAT_WORLD a GenCtx is never used, so the flat path below is
+	# reached only through the Dictionary/null branch and stays byte-identical.
+	var memo: Variant = pcache
+	var face := _active_face
+	var ck: Variant
+	if pcache is GenCtx:
+		memo = pcache.memo
+		face = pcache.face
+		ck = Vector3i(face, x, z)
+	else:
+		ck = Vector2i(x, z)
+	if memo != null:
+		if memo.has(ck):
+			return memo[ck]
 	_ensure_noise()
 	var prof: Vector4
 	if not CubeSphere.FLAT_WORLD:
-		# COSMOS M1 (§3.5)/M3 (§4.5): the current home-face window column (i, j) = (x, z), sampled from
-		# 3D noise along d̂. `_active_face` tracks the home face across a flip (§4.5), so the analytic +
-		# main-thread generated queries follow the player onto the neighbour face after a crossing.
-		# The curved profile threads the SAME feature pipeline (mountains/climate/biome) — see _curved_profile.
-		prof = _curved_profile(_active_face, x, z)
+		# COSMOS M1 (§3.5)/M3 (§4.5): the home-face lattice column (i, j) = (x, z), sampled from 3D noise
+		# along d̂. `face` is `ctx.face` on the worker (an immutable snapshot) or `_active_face` on the
+		# main thread — never a mutable global read from a worker. The curved profile threads the SAME
+		# feature pipeline (mountains/climate/biome) and folds across an edge — see _curved_profile.
+		prof = _curved_profile(face, x, z)
 	else:
 		var fx := float(x)
 		var fz := float(z)
@@ -491,8 +503,8 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 		var g := _height_c(c, fx, fz)
 		var mtn := _mountain_factor(c, fx, fz)
 		prof = Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
-	if pcache != null:
-		pcache[Vector2i(x, z)] = prof
+	if memo != null:
+		memo[ck] = prof
 	return prof
 
 # ------------------------------------------------------------------------------
@@ -513,6 +525,21 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 # column_profile, which must follow the player when the home face flips (§4.5). WorldManager keeps
 # this in sync with the chart's face (install/flip). FLAT_WORLD never reads it (default HOME_FACE).
 static var _active_face := CubeSphere.HOME_FACE
+
+## COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 2, F1): the immutable per-generation
+## snapshot the curved worldgen reads INSTEAD of the mutable global `_active_face`. It carries the cube
+## face the query is homed on plus a per-pass column memo. A voxel worker builds ONE of these per
+## `_generate_block` frame (LOCAL to that stack frame, never shared across threads) and threads it as
+## the `pcache` argument through every column query; the curved branches then read `ctx.face` — a
+## VALUE captured on the worker — so no worker ever reads the main-thread-mutated `_active_face`. The
+## analytic main-thread path keeps passing a plain Dictionary / null and reads `_active_face` (which
+## only the main thread ever mutates, on a home-face flip). This is the whole race fix: the face stops
+## being a hidden mutable global on the worker hot path and becomes an immutable parameter.
+class GenCtx extends RefCounted:
+	var face: int = CubeSphere.HOME_FACE
+	var memo: Dictionary = {}
+	func _init(p_face: int = CubeSphere.HOME_FACE) -> void:
+		face = p_face
 
 ## The active home face (read-only accessor).
 static func active_face() -> int:
@@ -593,8 +620,49 @@ static func generated_cell_global(face: int, i: int, j: int, r: int) -> int:
 		return generated_cell(i, r, j)
 	if not _ids_ready:
 		_ensure_ids()
-	var p := _curved_profile(face, i, j)
-	return resolve_cell(i, r, j, int(p.x), int(p.y), p.z, p.w)
+	# COSMOS frozen-epoch (F1/F2): thread the TRUE face through a GenCtx so every nested stencil / snow /
+	# tree read inside resolve_cell folds neighbours on THIS cell's face (not the mutable `_active_face`).
+	# The worker path (`_generate_block`) does the identical thing with its own frozen ctx, so a
+	# module-generated cell is byte-identical to this analytic cell — render == physics across seams.
+	var ctx := _acquire_ctx(face)
+	var p := column_profile(i, j, ctx)
+	return resolve_cell(i, r, j, int(p.x), int(p.y), p.z, p.w, ctx)
+
+## A GenCtx for a single face-explicit query. On the main thread it reuses ONE cleared scratch context
+## (no per-call allocation on the hot analytic cell path); off the main thread (e.g. a verify worker)
+## it allocates a fresh one so the scratch is never shared across threads.
+static var _analytic_ctx: GenCtx = null
+static func _acquire_ctx(face: int) -> GenCtx:
+	if _on_main_thread():
+		if _analytic_ctx == null:
+			_analytic_ctx = GenCtx.new(face)
+		else:
+			_analytic_ctx.face = face
+			_analytic_ctx.memo.clear()
+		return _analytic_ctx
+	return GenCtx.new(face)
+
+## THE curved worker generator entry (COSMOS-AUDIT §3.2 items 2–3, F1/F2). The voxel worker calls this
+## per column with its FROZEN home face `gen_face` (an immutable per-generator snapshot — NEVER the
+## mutable `_active_face`) and the raw voxel column (vx, vz), which is the global home-face index
+## column (the floating origin is folded into the terrain-node transform, §3.2). It FOLDS the column to
+## its true global (face, i, j) ONCE via `ctx`, resolves it, and returns BOTH the profile (for the
+## block's air/height early-outs) and the packed cell — hashing every position feature (bedrock, ore,
+## strata, tree, smoothing) on the TRUE global column so it is window-independent and identical to the
+## analytic generated_cell_global. `ctx.face` is set to the folded true face here; the caller reuses
+## the same ctx (its memo is shared across the block, keyed by (face, i, j)).
+static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx) -> Vector3i:
+	# Fold (gen_face, vx, vz) → the true global column, EXACTLY as CosmosChart.to_global_column does for
+	# the analytic path. A corner quadrant (fold face < 0) falls back to the raw home-face coords — the
+	# same deterministic fallback the chart uses (§5.3 M5 stub; that zone is deep-ocean-masked).
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var g := CubeSphere.fold_cell(gen_face, vx, vz, n)
+	var tf := int(g["face"])
+	if tf < 0:
+		ctx.face = gen_face
+		return Vector3i(gen_face, vx, vz)
+	ctx.face = tf
+	return Vector3i(tf, int(g["i"]), int(g["j"]))
 
 # ------------------------------------------------------------------------------
 # The composed cell function (WGC §6.2). generated_cell derives the column
@@ -1157,6 +1225,11 @@ static func _on_main_thread() -> bool:
 ## this column — BOTH surface_mod AND cap_mod cover underwater floors (WATER-SHORE §3.3/§3.6:
 ## underwater caps are ON), WITH the tree-rest suppression — so any consulting query is exact.
 static func _shape_entry(x: int, z: int) -> int:
+	# MAIN-THREAD ONLY (the memo is a plain Dictionary — not thread-safe). Every caller already gates on
+	# `pcache == null and _on_main_thread()`; this assert makes a violated invariant fail LOUDLY in a
+	# debug/verify build instead of silently racing the Dictionary (COSMOS-AUDIT §3.2 items 4–5). The
+	# voxel worker always threads a non-null GenCtx, so it never reaches this function.
+	assert(_on_main_thread(), "TerrainConfig._shape_entry reached off the main thread — memo race")
 	var k := Vector2i(x, z)
 	var e: int = _shape_memo.get(k, -1)
 	if e != -1:

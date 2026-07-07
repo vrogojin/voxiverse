@@ -17,12 +17,20 @@ extends Node3D
 ##
 ## WEB THREADING: on Emscripten the pthread pool is fixed-size. godot_voxel's
 ## VoxelEngine sizes its task pool from CPU count and would exhaust the pool
-## (deadlock -> no meshes -> blank world). We cap it to 1 thread via the
-## `voxel/threads/count/*` project settings (see project.godot); that pool is
-## created at engine start from those settings.
+## (deadlock -> no meshes -> blank world). We pin it to a FIXED 2 worker threads
+## via the `voxel/threads/count/*` project settings (project.godot:63,
+## minimum=2, ratio_over_max=0.0 → device-independent); that pool is created at
+## engine start from those settings. Worldgen is per-block independent and (in
+## curved mode) a pure function of the frozen gen_face, so >=2 workers parallelise
+## it race-free (COSMOS-AUDIT §3.2).
 
 var _terrain: Node3D
 var _viewer: Node
+var _mesher: Object                     # the VoxelMesherBlocky (kept so restream can rebuild the terrain)
+# COSMOS frozen-epoch (docs/COSMOS-AUDIT.md §3.2 items 3–4): the cube face this generator epoch is
+# homed on. Frozen onto each generator instance as `gen_face` at creation; a home-face flip creates a
+# NEW generator (new face) and restreams, rather than mutating the face workers are reading.
+var _gen_face := CubeSphere.HOME_FACE
 
 # --- appearance table (ARIDs, VOXEL-DATA-STRUCTURE §8.1) ------------------------
 # The TYPE channel carries an Appearance Render ID (ARID) — a session-local, append-
@@ -201,6 +209,7 @@ func setup() -> bool:
 		mesher.call("set_library", library)
 	else:
 		_set_if(mesher, "library", library)
+	_mesher = mesher
 
 	_terrain = ClassDB.instantiate("VoxelTerrain") as Node3D
 	if _terrain == null:
@@ -1017,6 +1026,54 @@ func is_manifest_baked(mat: int, modifier: int) -> bool:
 func get_generator() -> Object:
 	return _generator
 
+## COSMOS frozen-epoch home-face flip (COSMOS-AUDIT §3.2 item 4, F3). Install a NEW generator epoch
+## homed on `face` and hard-restream. NEVER mutates the live generator's gen_face (workers read it):
+## the old generator is discarded, any in-flight worker task holding it finishes harmlessly and its
+## block is dropped by the restream. This is exactly the shape M4's dual-window handoff needs (two
+## generators, two frozen faces, concurrently). WorldManager also repositions this node so the new
+## voxel coordinate frame maps to the new face's global indices.
+func set_home_face(face: int) -> void:
+	_gen_face = face
+	restream()
+
+## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
+## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
+## GDScript fallback had one, so a module flip left stale face-A meshes standing (COSMOS-AUDIT F3).
+## Recreating the VoxelTerrain node guarantees old-epoch blocks are gone and the new generator is used.
+## The player's global VoxelViewer keeps streaming the new terrain (viewers are engine-global). A no-op
+## if the module is unavailable.
+func restream() -> void:
+	if not ClassDB.class_exists("VoxelTerrain") or _mesher == null:
+		return
+	var generator: Object = _make_generator()
+	if generator == null:
+		return
+	var old_terrain := _terrain
+	var new_terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if new_terrain == null:
+		return
+	_set_if(new_terrain, "mesher", _mesher)
+	_set_if(new_terrain, "generator", generator)
+	_set_if(new_terrain, "max_view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	_set_if(new_terrain, "mesh_block_size", 32)
+	_set_if(new_terrain, "generate_collisions", false)
+	if old_terrain != null:
+		new_terrain.position = old_terrain.position   # preserve the module's coordinate offset
+		remove_child(old_terrain)
+		old_terrain.queue_free()
+	add_child(new_terrain)
+	_terrain = new_terrain
+	_generator = generator
+
+## Whether the OOB fence has clamped a stale/unbaked ARID this session (COSMOS-AUDIT F8 telemetry — a
+## real out-of-range must never pass silently). Verify asserts this stays false over a clean run.
+func oob_seen() -> bool:
+	return _generator != null and bool(_generator.get("oob_seen"))
+
+## The generator's frozen home face (COSMOS-AUDIT §3.2 item 3) — for verify / the dual-window handoff.
+func gen_home_face() -> int:
+	return _gen_face
+
 ## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
 ## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
 func _make_shape_model(modifier: int, material: Material) -> Object:
@@ -1379,6 +1436,17 @@ var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
+# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): the IMMUTABLE home face + face-edge cell count this
+# generator epoch is homed on, set once by the loader before this generator runs. The worker folds each
+# column with `gen_face` (NEVER the mutable TerrainConfig._active_face), so home-face flips can never
+# race generation — a flip installs a NEW generator with a new gen_face and restreams (module_world).
+var gen_face := 0
+var gen_n := 0
+var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
+# OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
+# is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
+# write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
+var oob_seen := false
 const GEN_STRIDE := 256
 const SLOPE_STRIDE := 4096
 const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape
@@ -1432,19 +1500,38 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var profs = []
 	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
-	# Per-block column-profile memo (Vector2i -> Vector4) for the smoothing corner-target
-	# stencil AND the tree overlay (PERF): each surface/cap cell samples a 3x3 column-top
-	# stencil that overlaps its neighbours', and TreeGen re-derives its base-column biome per
-	# cell — so without a memo columns are re-noised many times per block. Seeded here from the
-	# profile pass and reused by resolve_cell -> smoothing + TreeGen.block_at; it only pads +1
-	# at block edges. LOCAL to this _generate_block frame -> each voxel worker owns its own dict;
-	# never shared across threads. Values are the exact column_profile -> output byte-identical.
-	var pcache = {}
-	for z in range(size.z):
-		for x in range(size.x):
-			var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
-			profs[z * size.x + x] = p
-			if int(p.x) > max_h: max_h = int(p.x)
+	# Per-block generation context (LOCAL to this _generate_block frame → each voxel worker owns its
+	# own; NEVER shared across threads). FLAT: a plain Dictionary column memo (Vector2i → Vector4),
+	# byte-identical to before. CURVED (COSMOS-AUDIT §3.2 items 2–3, F1/F2): a GenCtx carrying the
+	# FROZEN gen_face — the worker folds every column to its TRUE global (face, i, j) with THIS
+	# immutable face (never TerrainConfig._active_face) and hashes bedrock/ore/strata/tree/smoothing on
+	# the true column, so a module-generated cell is byte-identical to the analytic generated_cell_global
+	# (render == physics across a seam) and no home-face flip can race generation.
+	var pcache
+	var rxs   # per-column resolve i (true global column i) — curved only
+	var rzs   # per-column resolve j
+	var rfs   # per-column true face
+	if flat_world:
+		pcache = {}
+		for z in range(size.z):
+			for x in range(size.x):
+				var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
+				profs[z * size.x + x] = p
+				if int(p.x) > max_h: max_h = int(p.x)
+	else:
+		pcache = TerrainConfig.GenCtx.new(gen_face)
+		rxs = PackedInt32Array(); rxs.resize(size.x * size.z)
+		rzs = PackedInt32Array(); rzs.resize(size.x * size.z)
+		rfs = PackedInt32Array(); rfs.resize(size.x * size.z)
+		for z in range(size.z):
+			for x in range(size.x):
+				var idx = z * size.x + x
+				# Fold (gen_face, voxel column) → true global column ONCE; sets pcache.face to the true face.
+				var tc = TerrainConfig.worker_fold_column(gen_face, ox + x, oz + z, pcache)
+				rfs[idx] = tc.x; rxs[idx] = tc.y; rzs[idx] = tc.z
+				var p = TerrainConfig.column_profile(tc.y, tc.z, pcache)
+				profs[idx] = p
+				if int(p.x) > max_h: max_h = int(p.x)
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
@@ -1456,13 +1543,23 @@ func _generate_block(buffer, origin_in_voxels, lod):
 
 	for z in range(size.z):
 		for x in range(size.x):
-			var p = profs[z * size.x + x]
+			var idx2 = z * size.x + x
+			var p = profs[idx2]
 			var g = int(p.x)
 			var biome = int(p.y)
 			var cc = p.z
 			var tt = p.w
-			var wx = ox + x
-			var wz = oz + z
+			var wx
+			var wz
+			if flat_world:
+				wx = ox + x
+				wz = oz + z
+			else:
+				# The TRUE global column this voxel column folds to; restore its face for the nested
+				# smoothing/snow/tree stencil folds inside resolve_cell (COSMOS-AUDIT §3.2 items 2–3).
+				wx = rxs[idx2]
+				wz = rzs[idx2]
+				pcache.face = rfs[idx2]
 			for y in range(size.y):
 				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache)
 				var id = CellCodec.mat(v)
@@ -1594,6 +1691,9 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				if arid < 0 or arid >= mcount:
 					var cf = cube_arid[id] if id < ncube else 0
 					arid = cf if (cf >= 0 and cf < mcount) else 0
+					if not oob_seen:
+						oob_seen = true       # write-once telemetry (idempotent → race-safe); surfaced by verify
+						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
@@ -1618,6 +1718,12 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
+	# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): freeze this epoch's home face + n + flat flag
+	# onto the generator instance. The worker reads these IMMUTABLE snapshots (never _active_face), so a
+	# home-face flip creates a fresh generator (new gen_face) + restream rather than mutating under workers.
+	gen.set("flat_world", CubeSphere.FLAT_WORLD)
+	gen.set("gen_face", _gen_face)
+	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
 	# The OOB fence upper bound (VDS §8.1): the ACTUAL baked model count, read back from the library
 	# (not _next_arid) so that if a web bake ever truncated the models array below what we appended, the
 	# generator still never writes an index past what the mesher can address. Falls back to _next_arid

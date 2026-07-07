@@ -808,8 +808,16 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the
 	# new window (a home-face-only join now maps onto the neighbour face) — the collider stays exact.
 	_rebuild_window_indices()
-	# HARD RESTREAM: the render nodes carried the old face's content, which no longer matches the
-	# window. Drop + rebuild around the player (fallback fully; module keeps the far-field cover).
+	# COSMOS frozen-epoch flip (COSMOS-AUDIT §3.2 item 4, F3): reposition the module so its voxel
+	# coordinate frame maps to the NEW face's global indices (voxel = window − node.position = global
+	# index; the flip re-bases i_org/j_org), then install a NEW generator epoch (new frozen gen_face)
+	# and hard-restream so stale face-A meshes are dropped. The old generator is never mutated — any
+	# in-flight worker task finishes on the old face and its block is discarded by the restream.
+	if _module_world != null:
+		_module_world.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
+		if _module_world.has_method("set_home_face"):
+			_module_world.call("set_home_face", _chart.face)
+	# HARD RESTREAM the fallback streamer + collider (the module was restreamed by set_home_face above).
 	_restream()
 	print("[WorldManager] home-face flip %d → %d (hard restream)" % [int(res["from_face"]), int(res["to_face"])])
 	return true
@@ -840,8 +848,8 @@ func _rebuild_window_indices() -> void:
 func _restream() -> void:
 	if _streamer != null and _streamer.has_method("restream"):
 		_streamer.restream()
-	if _module_world != null and _module_world.has_method("restream"):
-		_module_world.call("restream")
+	# NOTE: the module path is restreamed by set_home_face() in maybe_flip_home_face (the epoch swap),
+	# not here, so a flip installs the new generator epoch and drops old-face meshes in one step (F3).
 	if _ground != null:
 		_ground.rebuild_now()
 

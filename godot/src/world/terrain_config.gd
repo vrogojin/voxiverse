@@ -1602,14 +1602,63 @@ static func emitted_submerged_pairs(_kind := CellCodec.LIQ_WATER) -> PackedInt32
 			out.append(mat * _SHORE_STRIDE + m)
 	return out
 
-## The sampled (surface material, SLOPE payload) pairs worldgen emits (SHARP-SLOPE §4.1) — the module
-## pre-bakes + FREEZES their ARIDs into `_slope_arid`/`_snow_slope_arid`. Encoded `mat * _SLOPE_STRIDE
-## + payload` (payload = the 12-bit slope modifier low bits). A deterministic spatial sample over
-## find_mountains(6) ∪ find_spawn() run cells — mountains dominate but 2-block hill/badland steps fire
-## too. Superset/sample, like emitted_shore_pairs: a rare unsampled pair cube-falls-back on the worker
-## (a transient blocky cell, never a hole). Cached statically; main-thread setup/verify only.
+## Every canonical SLOPE payload worldgen can emit (SHARP-SLOPE §4.1 completeness, DEFECT 1 fix) —
+## enumerated ANALYTICALLY, not spatially sampled, so NO emitted slope can cube-fall-back on the
+## module (web) path (the pre-DEFECT sample of find_mountains(6)∪find_spawn() at r=32 baked ~83 of
+## these and left ~25% of worldgen's real payloads unbaked → pyramids reappeared on far mountains).
+## A run cell carries make_slope(Tw − y); across a run [lo, hi−1] its deltas span
+## [−(SLOPE_MAX_SPREAD−1), SLOPE_MAX_SPREAD] with corner spread ≤ SLOPE_MAX_SPREAD (subtracting the
+## per-cell y is spread-invariant). So enumerate EVERY delta tuple in that closed box with spread ≤
+## SLOPE_MAX_SPREAD, canonicalize (rules 1/2/3 drop the full/empty/legacy-collapsible tuples — those
+## are NOT slope cells), and keep the 12-bit payloads that stay SLOPE. Deterministic, biome/seed-
+## independent, complete: 430 payloads for SLOPE_MAX_SPREAD = 3. Cached; main-thread setup/verify only.
 const _SLOPE_STRIDE := 4096
-const _SLOPE_SAMPLE_R := 32
+static var _slope_payloads_ready := false
+static var _slope_payloads := PackedInt32Array()
+static func all_slope_payloads() -> PackedInt32Array:
+	if _slope_payloads_ready:
+		return _slope_payloads
+	var seen := {}
+	for d00 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+		for d10 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+			for d11 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+				for d01 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+					var mn := mini(mini(d00, d10), mini(d11, d01))
+					var mx := maxi(maxi(d00, d10), maxi(d11, d01))
+					if mx - mn > SLOPE_MAX_SPREAD:
+						continue                          # steeper than a run cell can carry
+					var m := CellCodec.make_slope(d00, d10, d11, d01)
+					if CellCodec.is_slope(m):             # canonical: not full/empty/legacy-collapsed
+						seen[m & 0xFFF] = true
+	var out := PackedInt32Array()
+	for p: int in seen.keys():
+		out.append(p)
+	out.sort()
+	_slope_payloads = out
+	_slope_payloads_ready = true
+	return _slope_payloads
+
+## Every SURFACE material worldgen can skin a SLOPE cell with (SHARP-SLOPE §4.1). A slope cell's
+## material is the biome top skin (y ≥ g, via _cap_material → _biome_top, LAND biomes only since
+## slopes are land-only, g ≥ SEA_LEVEL) or the carve banding (y < g, via _surface_rule → _biome_filler,
+## depth ≤ 3). Land tops give GRASS / SAND / RED_SAND / MUD / SNOW / PODZOL / STONE (GRAVEL is
+## underwater-only, so never a land slope skin); the carve adds DIRT (the default forest/taiga/snowy
+## filler) and STONE (bare Mountains rock). The rare badlands terracotta / sandstone carve bands (a
+## >2-block/cell badlands-wall edge, Risk 2) are left to the cube fallback to keep the bake bounded —
+## the physics stays EXACT there (render-larger-than-physics, the benign direction).
+static func all_slope_materials() -> PackedInt32Array:
+	_ensure_ids()
+	return PackedInt32Array([
+		BlockCatalog.GRASS, BlockCatalog.DIRT, BlockCatalog.STONE,
+		_ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL,
+	])
+
+## The (surface material, SLOPE payload) pairs the module path pre-bakes + FREEZES into
+## `_slope_arid`/`_snow_slope_arid` — the COMPLETE cross product `all_slope_materials() ×
+## all_slope_payloads()` (SHARP-SLOPE §4.1, DEFECT 1). Encoded `mat * _SLOPE_STRIDE + payload`.
+## Complete for every worldgen-reachable payload on every dense slope skin, so no generated slope
+## cell (mountains especially) silhouette-mismatches the collider by cube-falling-back. Cached;
+## main-thread setup/verify only.
 static var _slope_pairs_ready := false
 static var _slope_pairs := PackedInt32Array()
 static func emitted_slope_pairs() -> PackedInt32Array:
@@ -1617,33 +1666,12 @@ static func emitted_slope_pairs() -> PackedInt32Array:
 		return PackedInt32Array()                     # diagnostic: no slope meshes to bake
 	if _slope_pairs_ready:
 		return _slope_pairs
-	_ensure_noise()
 	_ensure_ids()
-	var seen := {}
-	var centres: Array = find_mountains(6)
-	centres.append(find_spawn())
-	for ctr: Vector2i in centres:
-		var pc := {}
-		for dx in range(-_SLOPE_SAMPLE_R, _SLOPE_SAMPLE_R + 1):
-			var x := ctr.x + dx
-			for dz in range(-_SLOPE_SAMPLE_R, _SLOPE_SAMPLE_R + 1):
-				var z := ctr.y + dz
-				var prof := column_profile(x, z, pc)
-				var g := int(prof.x)
-				if not _slope_fires_only(x, z, g, pc):
-					continue
-				var tw := _slope_whole_targets(x, z, pc)
-				var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
-				var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
-				for y in range(lo, hi):
-					var v := resolve_cell(x, y, z, g, int(prof.y), prof.z, prof.w, pc)
-					var mat := CellCodec.mat(v)
-					var mod := CellCodec.modifier(v)
-					if mat != BlockCatalog.AIR and CellCodec.is_slope(mod):
-						seen[mat * _SLOPE_STRIDE + (mod & 0xFFF)] = true
+	var payloads := all_slope_payloads()
 	var out := PackedInt32Array()
-	for s: int in seen.keys():
-		out.append(s)
+	for mat: int in all_slope_materials():
+		for p: int in payloads:
+			out.append(mat * _SLOPE_STRIDE + p)
 	out.sort()
 	_slope_pairs = out
 	_slope_pairs_ready = true

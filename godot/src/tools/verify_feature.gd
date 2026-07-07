@@ -4668,6 +4668,98 @@ func _test_sharp_slope_worldgen() -> void:
 			crack_ok = false
 	_ok(crack_ok, "slope-crack: shared lattice corners quantize identically from either cell (crack-free)")
 
+	# (DEFECT 1) baked-set COMPLETENESS (mirrors _test_manifest_trim's emitted_modifiers coverage): a
+	# WIDE mountain sweep must emit NO slope payload absent from all_slope_payloads() and NO (mat,payload)
+	# pair absent from emitted_slope_pairs(). An unbaked pair cube-falls-back on the module (web) path —
+	# the pyramids the pre-DEFECT r=32 sample let reappear on far mountains. Analytic set → 0 unbaked.
+	var baked := {}
+	for p: int in TerrainConfig.emitted_slope_pairs():
+		baked[p] = true
+	var pay_set := {}
+	for p: int in TerrainConfig.all_slope_payloads():
+		pay_set[p] = true
+	var slope_cells := 0
+	var unbaked_pairs := 0
+	var unbaked_payloads := 0
+	for dz in range(-70, 70):
+		for dx in range(-70, 70):
+			var x := mtn.x + dx
+			var z := mtn.y + dz
+			var run := TerrainConfig.slope_run_of(x, z)
+			if not TerrainConfig.slope_run_fires(run):
+				continue
+			var g: int = TerrainConfig.height_at(x, z)
+			var rng := TerrainConfig.slope_run_range(run, g)
+			for y in range(rng.x, rng.y):
+				var v: int = TerrainConfig.generated_cell(x, y, z)
+				var mod: int = CellCodec.modifier(v)
+				if not CellCodec.is_slope(mod):
+					continue
+				slope_cells += 1
+				var payload: int = mod & 0xFFF
+				if not pay_set.has(payload):
+					unbaked_payloads += 1
+				if not baked.has(CellCodec.mat(v) * TerrainConfig._SLOPE_STRIDE + payload):
+					unbaked_pairs += 1
+	_ok(slope_cells > 0, "slope-complete: wide mountain sweep produced %d slope cells" % slope_cells)
+	_ok(unbaked_payloads == 0, "slope-complete: every emitted payload ∈ all_slope_payloads() (%d unbaked)" % unbaked_payloads)
+	_ok(unbaked_pairs == 0, "slope-complete: every emitted (mat,payload) ∈ emitted_slope_pairs() — no cube fallback (%d unbaked of %d cells)" % [unbaked_pairs, slope_cells])
+
+	# (DEFECT 2) "don't touch hills": the 45° widening (a column whose corner-target plane escapes the
+	# ONE-cell window [g,g+1] but stays within the TWO-cell window [g,g+2] — the 1–2 block/cell band)
+	# fires SLOPE only in B_MOUNTAINS. Every NON-mountain column in that band must emit NO slope AND keep
+	# its g+1 cap modifier BYTE-IDENTICAL to the legacy formula; a mountain column in the same band DOES
+	# still emit SLOPE (the ladder kill is preserved where it matters).
+	var hill_band := 0
+	var mtn_band := 0
+	var mtn_band_fires := 0
+	var hill_no_slope := true
+	var hill_byte := true
+	for cc: Vector2i in [spawn, TerrainConfig.find_coast(), mtn]:  # mtn supplies B_MOUNTAINS band columns
+		for dz in range(-120, 120, 2):
+			for dx in range(-120, 120, 2):
+				var x := cc.x + dx
+				var z := cc.y + dz
+				var g: int = TerrainConfig.height_at(x, z)
+				if g < TerrainConfig.SEA_LEVEL:
+					continue
+				var raw := TerrainConfig._corner_targets(x, z, null)
+				var q0 := roundi(raw.x * 4.0)
+				var q1 := roundi(raw.y * 4.0)
+				var q2 := roundi(raw.z * 4.0)
+				var q3 := roundi(raw.w * 4.0)
+				var lo_r: int = mini(mini(q0, q1), mini(q2, q3))
+				var hi_r: int = maxi(maxi(q0, q1), maxi(q2, q3))
+				var escapes_two := lo_r < g * 4 or hi_r > (g + 2) * 4
+				var escapes_one := lo_r < g * 4 or hi_r > (g + 1) * 4
+				if escapes_two or not escapes_one:
+					continue                          # not the 1–2 block/cell (~45°) band
+				if int(TerrainConfig.column_profile(x, z).y) == TerrainConfig.B_MOUNTAINS:
+					mtn_band += 1
+					if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(x, z)):
+						mtn_band_fires += 1
+					continue
+				# NON-mountain 45° band: skip rim columns (a firing neighbour legitimately reshapes them)
+				var rim := false
+				for jx in range(-1, 2):
+					for jz in range(-1, 2):
+						if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(x + jx, z + jz)):
+							rim = true
+				if rim:
+					continue
+				hill_band += 1
+				if CellCodec.is_slope(CellCodec.modifier(TerrainConfig.generated_cell(x, g, z))) \
+						or CellCodec.is_slope(CellCodec.modifier(TerrainConfig.generated_cell(x, g + 1, z))):
+					hill_no_slope = false
+				var tree := TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR
+				var legacy_cm := 0 if tree else TerrainConfig._modifier_from_targets(raw, g + 1)
+				if legacy_cm != 0 and TerrainConfig.surface_cap_modifier(x, z) != legacy_cm:
+					hill_byte = false
+	_ok(hill_band > 0, "slope-hills: swept %d non-mountain 45° band columns (the widening must skip these)" % hill_band)
+	_ok(hill_no_slope, "slope-hills: NO SLOPE cell on non-mountain 45° columns (hills byte-identical, DEFECT 2)")
+	_ok(hill_byte, "slope-hills: non-mountain 45° g+1 caps == legacy formula (hills untouched)")
+	_ok(mtn_band_fires > 0, "slope-hills: mountain columns in the same 45° band DO emit SLOPE (%d of %d) — ladder kill kept" % [mtn_band_fires, mtn_band])
+
 	# (6) both-path module mirror: arid_for_cell == gen_arid_for mirror for a generated slope cell;
 	# unbaked payload → cube (never 0); a snow-capped run cell → the _snow_slope_arid slot.
 	if ClassDB.class_exists("VoxelTerrain") and fires.size() > 0:
@@ -4676,6 +4768,7 @@ func _test_sharp_slope_worldgen() -> void:
 		if bool(mw.call("setup")):
 			var mirror_ok := true
 			var slope_arid_seen := false
+			var cube_fallbacks := 0                  # DEFECT 1: a slope cell resolving to its plain cube ARID
 			for col: Vector2i in fires:
 				var g: int = TerrainConfig.height_at(col.x, col.y)
 				var run := TerrainConfig.slope_run_of(col.x, col.y)
@@ -4690,8 +4783,11 @@ func _test_sharp_slope_worldgen() -> void:
 						mirror_ok = false
 					if a1 > 0:
 						slope_arid_seen = true
+					if a1 == int(mw.call("arid_for", CellCodec.mat(v), 0)):
+						cube_fallbacks += 1          # baked-set complete => this must never happen
 			_ok(mirror_ok, "slope-both: arid_for_cell == gen_arid_for mirror over mountain run cells")
 			_ok(slope_arid_seen, "slope-both: generated slope cells resolve to real (non-zero) ARIDs")
+			_ok(cube_fallbacks == 0, "slope-both: every generated slope cell resolves to a NON-cube ARID (%d fell back)" % cube_fallbacks)
 			# an unbaked slope payload falls back to the material cube (never 0/hole)
 			var unbaked := CellCodec.MOD_FAM_BIT | (CellCodec.FAM_SLOPE << CellCodec.MOD_FAM_KIND_SHIFT) | 0x2AA
 			var fb: int = mw.call("gen_arid_for", STONE, unbaked)

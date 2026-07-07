@@ -1404,7 +1404,15 @@ static func find_mountain() -> Vector2i:
 ## centres land on DIFFERENT massifs with different slope orientations — together their emitted-modifier
 ## sample reaches the complete reachable set (no invisible caps). Falls back to spawn if none found (not
 ## the case for this seed). Setup/verify only (calls column_profile widely); never the voxel worker.
+static var _mountains_cache: Dictionary = {}          # count -> Array (pure deterministic; setup/verify only)
 static func find_mountains(count: int) -> Array:
+	if _mountains_cache.has(count):
+		return _mountains_cache[count]
+	var out := _find_mountains_scan(count)
+	_mountains_cache[count] = out
+	return out
+
+static func _find_mountains_scan(count: int) -> Array:
 	var out: Array = []
 	for radius in range(0, 3072, 8):
 		for a in range(0, 360, 6):

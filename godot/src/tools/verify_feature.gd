@@ -60,6 +60,7 @@ func _initialize() -> void:
 	_test_snow_layer_codec()
 	_test_snow_accumulation()
 	_test_snow_composites()
+	_test_snow_sim()
 	_test_mountains()
 	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -4348,6 +4349,208 @@ func _find_snow_column() -> Vector2i:
 			if (((TerrainConfig.snow_stack_at(x, z, {}) >> 4) & 0xF) >= 1):
 				return Vector2i(x, z)
 	return Vector2i(0x7fffffff, 0)
+
+## A cold, tree-free, DEEP (whole >= 1) snowy column whose terrain is FLAT over a SIM-scale neighbourhood
+## (so a single sim step's writes stay within ≤ 4 godot_voxel data blocks), or (0x7fffffff, _) if none.
+func _find_flat_snow_column() -> Vector2i:
+	for x in range(-512, 512, 4):
+		for z in range(-512, 512, 4):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g < TerrainConfig.SEA_LEVEL + 1:
+				continue
+			var pk := TerrainConfig.snow_stack_at(x, z, {})
+			if pk == 0 or ((pk >> 4) & 0xF) < 1:
+				continue                                     # need a full snow cube (deep, clean stack floor)
+			if TreeGen.block_at(x, g + 1, z) != BlockCatalog.AIR:
+				continue
+			var lo := 0x7fffffff
+			var hi := -0x7fffffff
+			var ok := true
+			for dx in range(-16, 17, 4):
+				for dz in range(-16, 17, 4):
+					var gg: int = TerrainConfig.height_at(x + dx, z + dz)
+					if gg < TerrainConfig.SEA_LEVEL:
+						ok = false
+					lo = mini(lo, gg)
+					hi = maxi(hi, gg)
+			if ok and (hi - lo) <= 6:
+				return Vector2i(x, z)
+	return Vector2i(0x7fffffff, 0)
+
+# SNOW-ACCUMULATION Phase C (Decision 4 — the snowfall SIM). Verify item 6 (§5.2): a deterministic
+# SCRIPTED run (fixed step count + fixed player column) proves S grows only inside the active region,
+# per-step writes ≤ MAX_CELL_WRITES, touched data blocks ≤ 4, every delta lives in `_edits` and survives a
+# ZoneChunk save/load round-trip, two identical runs are byte-identical, growth is +1 tenth on ONE cell,
+# the storm cap holds, the budget counter tracks, and melt decrements while skipping baseline-equal writes.
+func _test_snow_sim() -> void:
+	print("[SNOW-C] snowfall sim (bounded growth/melt, tile rotation, budget, determinism)")
+	var SNOW_ID := BlockCatalog.id_of(&"snow_block")
+
+	var col := _find_flat_snow_column()
+	if col.x == 0x7fffffff:
+		_ok(false, "SNOW-C: found a flat, deep, tree-free snowy column to simulate on")
+		return
+	var far := Vector2i(col.x + 4096, col.y + 4096)     # a player column that never blocks the tested cell
+
+	# ---- (1) GROWTH is exactly +1 tenth on ONE cell, deterministic given (SEED, step, column) ----------
+	var wg := _struct_world("SnowC_grow")
+	var sfg := SnowfallSystem.new()
+	sfg.setup(wg)
+	_ok(sfg != null, "SnowfallSystem constructs + binds to a WorldManager")
+	# Advance the weather phase to a step where THIS column is snowing (deterministic search).
+	var snowing_step := -1
+	for k in range(0, 600):
+		sfg.step_counter = k
+		if sfg.is_snowing(col.x, col.y):
+			snowing_step = k
+			break
+	_ok(snowing_step >= 0, "found a snowing step for the test column (weather gate fires)")
+	var d0 := sfg.column_depth(col.x, col.y)
+	var base0 := sfg.baseline_depth(col.x, col.y)
+	_ok(d0 == base0 and d0 > 0, "fresh column: dynamic depth == baseline (%d tenths), from cells only" % d0)
+	var cells0 := sfg.snow_cells
+	var wrote := sfg._process_column(col.x, col.y, far)
+	_ok(wrote == 1, "one snowing step writes exactly ONE cell (got %d)" % wrote)
+	_ok(sfg.column_depth(col.x, col.y) == d0 + 1, "growth raised the column depth by exactly +1 tenth")
+	_ok(sfg.snow_cells == cells0 + 1, "the budget counter incremented by 1 (a new snow-authored cell)")
+	# The delta lives in `_edits` as a snow cell, and re-reading depth from cells is stable.
+	var found_edit := false
+	for c: Vector3i in wg.placed_cells().keys():
+		if CellCodec.mat(wg.placed_cells()[c]) == SNOW_ID:
+			found_edit = true
+	_ok(found_edit, "the growth delta is present in `_edits` as a snow cell")
+	# Growth on the SAME column when NOT snowing does nothing.
+	sfg.step_counter = -1                                # force a non-snowing phase search
+	var quiet_step := -1
+	for k in range(0, 600):
+		sfg.step_counter = k
+		if not sfg.is_snowing(col.x, col.y):
+			quiet_step = k
+			break
+	if quiet_step >= 0:
+		var d_before := sfg.column_depth(col.x, col.y)
+		sfg._process_column(col.x, col.y, far)
+		_ok(sfg.column_depth(col.x, col.y) == d_before, "no growth on a NON-snowing step (weather gate closed)")
+	wg.queue_free()
+
+	# ---- (2) SCRIPTED RUN: bounded per-step, region-confined, growth happens, budget consistent --------
+	const STEPS := 160
+	var wa := _struct_world("SnowC_runA")
+	var sfa := SnowfallSystem.new()
+	sfa.setup(wa)
+	var max_writes := 0
+	var max_blocks := 0
+	var region_ok := true
+	for i in range(STEPS):
+		sfa.step_now(col)
+		max_writes = maxi(max_writes, sfa.last_writes)
+		# touched data blocks this step (16³) — the anti-remesh-storm bound
+		var blocks := {}
+		for c: Vector3i in sfa.last_step_cells:
+			blocks[Vector3i(_fdiv16(c.x), _fdiv16(c.y), _fdiv16(c.z))] = true
+			if maxi(absi(c.x - col.x), absi(c.z - col.y)) > SnowfallSystem.SIM_RADIUS:
+				region_ok = false
+		max_blocks = maxi(max_blocks, blocks.size())
+	_ok(max_writes <= SnowfallSystem.MAX_CELL_WRITES, "every step wrote ≤ MAX_CELL_WRITES cells (peak %d ≤ %d)" % [max_writes, SnowfallSystem.MAX_CELL_WRITES])
+	_ok(max_blocks <= 4, "every step touched ≤ 4 data blocks (peak %d)" % max_blocks)
+	_ok(region_ok, "every write landed inside the active region (Chebyshev ≤ SIM_RADIUS of the player)")
+	# Growth actually happened, and EVERY snow edit is inside the region.
+	var snow_edits := 0
+	var all_in_region := true
+	for c: Vector3i in wa.placed_cells().keys():
+		if CellCodec.mat(wa.placed_cells()[c]) != SNOW_ID:
+			continue
+		snow_edits += 1
+		if maxi(absi(c.x - col.x), absi(c.z - col.y)) > SnowfallSystem.SIM_RADIUS:
+			all_in_region = false
+	_ok(snow_edits > 0, "the scripted run GREW snow (%d snow cells authored into `_edits`)" % snow_edits)
+	_ok(all_in_region, "all authored snow cells lie inside the active region (no growth outside visited tiles)")
+	_ok(sfa.snow_cells == snow_edits, "budget counter == the actual snow-authored cell count (%d)" % snow_edits)
+	_ok(sfa.snow_cells < SnowfallSystem.SNOW_EDIT_BUDGET, "snow-edit count stays under the hard budget")
+
+	# ---- (3) STORM CAP: no column grows past D_baseline + SNOW_STORM_EXTRA ------------------------------
+	var cap_ok := true
+	for c: Vector3i in wa.placed_cells().keys():
+		if CellCodec.mat(wa.placed_cells()[c]) != SNOW_ID:
+			continue
+		var d := sfa.column_depth(c.x, c.z)
+		var b := sfa.baseline_depth(c.x, c.z)
+		if d > b + SnowfallSystem.SNOW_STORM_EXTRA:
+			cap_ok = false
+	_ok(cap_ok, "no column exceeds the storm ceiling D_baseline + SNOW_STORM_EXTRA (%d tenths)" % SnowfallSystem.SNOW_STORM_EXTRA)
+
+	# ---- (4) DETERMINISM: a second identical run is byte-identical in `_edits` -------------------------
+	var wb := _struct_world("SnowC_runB")
+	var sfb := SnowfallSystem.new()
+	sfb.setup(wb)
+	for i in range(STEPS):
+		sfb.step_now(col)
+	var det_ok := wa.placed_cells().size() == wb.placed_cells().size()
+	if det_ok:
+		for c: Vector3i in wa.placed_cells().keys():
+			if not wb.placed_cells().has(c) or wb.placed_cells()[c] != wa.placed_cells()[c]:
+				det_ok = false
+				break
+	_ok(det_ok, "two identical scripted runs are byte-identical in `_edits` (deterministic)")
+
+	# ---- (5) PERSISTENCE: ZoneChunk save/load round-trip reproduces every snow delta -------------------
+	var regions := {}
+	for c: Vector3i in wa.placed_cells().keys():
+		regions[WorldManager.region_origin_of(c)] = true
+	var wc := _struct_world("SnowC_load")
+	for ro: Vector3i in regions.keys():
+		wc.load_edits(ro, wa.save_edits(ro))
+	var rt_ok := wc.placed_cells().size() == wa.placed_cells().size()
+	if rt_ok:
+		for c: Vector3i in wa.placed_cells().keys():
+			if not wc.placed_cells().has(c) or wc.placed_cells()[c] != wa.placed_cells()[c]:
+				rt_ok = false
+				break
+	_ok(rt_ok, "every snow delta survives a ZoneChunk save/load round-trip identically")
+	wa.queue_free()
+	wb.queue_free()
+	wc.queue_free()
+
+	# ---- (6) MELT: warm column decrements toward 0, skipping baseline-equal writes, budget tracks ------
+	var m := _find_flat_land_column()                    # warm, flat, cap-free, tree-free
+	if m.x == 0x7fffffff:
+		_ok(false, "SNOW-C: found a warm flat column to melt on")
+	else:
+		var wm := _struct_world("SnowC_melt")
+		var sfm := SnowfallSystem.new()
+		sfm.setup(wm)
+		var mg: int = TerrainConfig.height_at(m.x, m.y)
+		# Seed a 1.2-block leftover snow stack (a full cube + a 0.2 LAYER) as if the sim had grown it, then
+		# let the warm surface melt it. snow_cells is set to match the two authored cells.
+		wm._write_cell(Vector3i(m.x, mg + 1, m.y), CellCodec.pack(SNOW_ID, 0))
+		wm._write_cell(Vector3i(m.x, mg + 2, m.y), CellCodec.pack(SNOW_ID, CellCodec.make_layer(2)))
+		sfm.snow_cells = 2
+		var mfar := Vector2i(m.x + 4096, m.y + 4096)
+		var d_prev := sfm.column_depth(m.x, m.y)
+		_ok(d_prev == 12, "seeded warm column reads a 12-tenth dynamic stack (from cells)")
+		var monotone := true
+		var steps_used := 0
+		for i in range(20):
+			if sfm.column_depth(m.x, m.y) == 0:
+				break
+			sfm._process_column(m.x, m.y, mfar)
+			var d_now := sfm.column_depth(m.x, m.y)
+			if d_now != d_prev - 1:
+				monotone = false
+			d_prev = d_now
+			steps_used += 1
+		_ok(monotone and sfm.column_depth(m.x, m.y) == 0, "melt decrements exactly 1 tenth/step down to 0 (%d steps)" % steps_used)
+		_ok(not wm.has_edit(Vector3i(m.x, mg + 1, m.y)) and not wm.has_edit(Vector3i(m.x, mg + 2, m.y)),
+			"melted-to-baseline cells were REVERTED, not written baseline-equal (no leftover `_edits`)")
+		_ok(sfm.snow_cells == 0, "budget counter returned to 0 as the reverts freed every snow cell")
+		wm.queue_free()
+
+## Floored /16 (a godot_voxel data block is 16³) for the touched-block count.
+static func _fdiv16(a: int) -> int:
+	var q := a / 16
+	if (a % 16) != 0 and a < 0:
+		q -= 1
+	return q
 
 # M1 SNOWY WORLD (M1-SNOWY-WORLD.md): the STATE axis (snow_capped), the absolute-altitude
 # climate temperature model, snow-cap render variants, and the deep-frozen half-slab. Fences the

@@ -27,6 +27,15 @@ var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 
+# The dormant-by-default snowfall SIMULATION (SNOW-ACCUMULATION Decision 4). Owned here and stepped from
+# `_process` on the MAIN thread; it grows/melts the variable-height snow around the player by writing
+# through the ONE choke point (`_write_cell` → `_edits`), so its output is persisted exactly like a
+# break/place edit. It is INERT until the player's position has been reported at least once (so it never
+# runs during the frozen prewarm, or in a headless world that has no player).
+var _snowfall: SnowfallSystem
+var _last_player_pos: Vector3 = Vector3.ZERO
+var _have_player_pos: bool = false
+
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
 # dictionary replaces the old `_removed` set: 0 = dug to air, >0 = solid cell.
@@ -77,9 +86,21 @@ func _ready() -> void:
 	add_child(_ground)
 	_ground.setup(self)
 
+	# The snowfall sim reads/writes the SAME overlay + generation both render paths derive from, so it is
+	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
+	_snowfall = SnowfallSystem.new()
+	_snowfall.setup(self)
+
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
+
+## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
+## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
+## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
+func _process(delta: float) -> void:
+	if _snowfall != null and _have_player_pos:
+		_snowfall.process(delta, _last_player_pos)
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -114,6 +135,10 @@ func update_streaming(player_pos: Vector3) -> void:
 		_streamer.update_center(player_pos)
 	if _ground != null:
 		_ground.update(player_pos)
+	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
+	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
+	_last_player_pos = player_pos
+	_have_player_pos = true
 
 ## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
 ## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the
@@ -409,6 +434,32 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	_edits[cell] = packed
 	if paint:
 		_paint_cell(cell, packed)
+
+# --- snowfall-sim support (SNOW-ACCUMULATION Decision 4) ------------------------
+# Three tiny primitives the SnowfallSystem composes over the ONE write choke point. It never bypasses
+# `_write_cell`; these only add the read + the baseline-revert + the debounced rebuild it needs.
+
+## True iff `cell` currently carries an overlay edit (dug air OR a placed/sim value). The sim uses this to
+## tell an in-place snow bump (already an edit) from ADDING a new snow cell (budget accounting), and to
+## refuse burying a NON-snow edit.
+func has_edit(cell: Vector3i) -> bool:
+	return _edits.has(cell)
+
+## Drop `cell`'s overlay edit so it reverts to its pure GENERATED value, and repaint that value into the
+## active render path. The sim calls this when a melting snow cell reaches its bare baseline: storing a
+## baseline-equal edit would be wasted (§4.4 "never write a cell whose new value equals its generated
+## value"), so the edit is removed instead. Safe for snow (no metadata); `_edit_columns` intentionally
+## keeps its entry (it only ever grows — a stale empty-overlay column just costs the collider one skip).
+func sim_revert_cell(cell: Vector3i) -> void:
+	if _edits.erase(cell):
+		_paint_cell(cell, TerrainConfig.generated_cell(cell.x, cell.y, cell.z))
+
+## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
+## The collider's own debounce coalesces further, and its loose-body gate means it does zero work unless a
+## body is actually nearby — a settled pile near the player costs nothing.
+func sim_ground_rebuild() -> void:
+	if _ground != null:
+		_ground.rebuild_now()
 
 # --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
 

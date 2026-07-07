@@ -161,8 +161,10 @@ const B_PLAINS := 8
 const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
-# TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds) and
-# the 7xx hashing salts below.
+# TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds), 104
+# (Mountains mask), and the 7xx hashing salts below. SnowfallSystem owns 105 (the
+# SEED+105 weather-gate noise, SNOW-ACCUMULATION §4.3) — recorded here so the one-place
+# registry stays collision-free even though the noise object lives in the sim class.
 const _SALT_BEDROCK := 701
 const _SALT_DEEP := 702
 const _SALT_STRATA_EXIST := 711

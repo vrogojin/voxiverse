@@ -77,9 +77,18 @@ func _setup_environment() -> void:
 	env.fog_mode = Environment.FOG_MODE_DEPTH
 	env.fog_light_color = SKY_COLOR
 	env.fog_light_energy = 1.0
-	env.fog_depth_begin = r * 0.45    # ~115: crisp near/mid terrain, then fade
-	env.fog_depth_end = r * 0.95      # ~243: fully occluded before the 256 edge
-	env.fog_depth_curve = 0.9         # soft, slightly front-loaded ramp
+	if FarTerrain.ENABLED:
+		# Far field present (LOD-DESIGN §3.4): retune the 243 m wall into a ~2,750 m haze so
+		# the distant mountains/coastlines read as silhouettes and dissolve into the horizon at
+		# the R_FAR rim. Front-loaded curve keeps the seam band at ~26–49% (washing the residuals)
+		# while the 115–192 near band stays crisper than today.
+		env.fog_depth_begin = FarTerrain.FOG_BEGIN   # 115: unchanged near feel
+		env.fog_depth_end = FarTerrain.FOG_END       # 2750: opaque before the 3,072 rim
+		env.fog_depth_curve = FarTerrain.FOG_CURVE   # 0.38
+	else:
+		env.fog_depth_begin = r * 0.45    # ~115: crisp near/mid terrain, then fade
+		env.fog_depth_end = r * 0.95      # ~243: fully occluded before the 256 edge
+		env.fog_depth_curve = 0.9         # soft, slightly front-loaded ramp
 	env.fog_sky_affect = 0.0          # keep the sky pure at the horizon
 	env.fog_density = 1.0
 

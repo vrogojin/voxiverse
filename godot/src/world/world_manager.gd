@@ -26,6 +26,7 @@ var using_module: bool = false
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
+var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 
 # The dormant-by-default snowfall SIMULATION (SNOW-ACCUMULATION Decision 4). Owned here and stepped from
 # `_process` on the MAIN thread; it grows/melts the variable-height snow around the player by writing
@@ -90,6 +91,14 @@ func _ready() -> void:
 	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
 	_snowfall = SnowfallSystem.new()
 	_snowfall.setup(self)
+	# Far-distance terrain layer (LOD-DESIGN): render-only, collision-free, voxel-worker-free —
+	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
+	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
+	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
+	if FarTerrain.ENABLED:
+		_far = FarTerrain.new()
+		_far.name = "FarTerrain"
+		add_child(_far)
 
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
@@ -139,6 +148,8 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	if _far != null:
+		_far.update_center(player_pos)
 
 ## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
 ## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the

@@ -405,10 +405,24 @@ static func _curved_profile(face: int, i: int, j: int) -> Vector4:
 	var py := d.y * rr
 	var pz := d.z * rr
 	var c := _continent.get_noise_3d(px, py, pz)
-	var t := _temperature.get_noise_3d(px, py, pz)
+	var t := _latitude_temperature(d.z, _temperature.get_noise_3d(px, py, pz))
 	var hh := _humidity.get_noise_3d(px, py, pz)
 	var g := _height_c3(c, px, py, pz)
 	return Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+
+## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
+## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
+## temperature `t` (the Vector4.w that drives biome selection AND PerVoxelEnvironment) is anchored
+## to latitude — warm (+1) at the equator, cold (−1) at the poles (face-4/5 centres, §5.2) — and
+## only gently perturbed by the low-frequency temperature noise so biomes still vary within a band.
+## PURE + DETERMINISTIC: a function of (d.z, SEED noise) only, replacing the flat world's pure-noise
+## `t`. LATITUDE_GAIN dominates so the profile is monotonic-ish in latitude (verify-pinned, §9 M2);
+## NOISE_GAIN keeps enough spread that a pole reads frozen (t < −0.55) and the equator temperate.
+const _LAT_GAIN := 0.80          # weight of the latitude term (dominant → monotonic-ish climate)
+const _LAT_NOISE_GAIN := 0.30    # weight of the temperature noise (local variety within the band)
+static func _latitude_temperature(dz: float, noise_t: float) -> float:
+	var lat_term := 1.0 - 2.0 * absf(dz)        # +1 at the equator (|z|=0) … −1 at a pole (|z|=1)
+	return clampf(_LAT_GAIN * lat_term + _LAT_NOISE_GAIN * noise_t, -1.0, 1.0)
 
 ## The 3D-noise twin of _height_c (§3.5): identical spline + shelf shaping, sampling hills/detail
 ## from get_noise_3d at the sphere point (px, py, pz) instead of get_noise_2d(fx, fz).

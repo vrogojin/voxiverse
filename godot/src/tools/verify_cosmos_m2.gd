@@ -89,7 +89,10 @@ func _test_edit_survives_reanchor() -> void:
 	var chart := CHART.new(CS.HOME_BODY, CS.HOME_FACE, 0, 0)
 	w.install_chart(chart)
 	var wc := Vector3i(100, 5, 200)
-	var packed := CellCodec.pack(BlockCatalog.STONE, 0, 7)   # material + a state to prove the full value survives
+	# A grass cell carrying the snow_capped STATE bit — a VALID state (grass declares snow_capped in its
+	# state_layout) so it survives the merged CellCodec.canonical write choke point; this proves the full
+	# value (material + state axis) survives the re-anchor via the global key, not just the material.
+	var packed := CellCodec.canonical(CellCodec.pack(BlockCatalog.id_of(&"grass"), 0, CellCodec.STATE_SNOW_CAPPED))
 	w._write_cell(wc, packed)
 	var key := chart.to_global_key(wc)
 
@@ -104,7 +107,7 @@ func _test_edit_survives_reanchor() -> void:
 	_ok(chart.to_global_key(wc_after) == key, "the physical cell's global key is unchanged across the shift")
 	_ok(w._edits.has(key) and w._edits.size() == 1, "the overlay entry is untouched by the shift (still one, same key)")
 	_ok(w.cell_value_at(wc_after) == packed, "the edit is FOUND AGAIN at its new window cell, full value intact")
-	_ok(CellCodec.state(w.cell_value_at(wc_after)) == 7, "the state axis survived the re-anchor")
+	_ok(CellCodec.state(w.cell_value_at(wc_after)) == CellCodec.STATE_SNOW_CAPPED, "the state axis survived the re-anchor")
 
 	# Block-entity metadata survives the same way (global-keyed).
 	var be := BlockCatalog.STONE
@@ -276,10 +279,14 @@ func _test_flat_byte_identity() -> void:
 	_ok(w.chart() == null, "a fresh world has no chart (FLAT_WORLD configuration)")
 	var wc := Vector3i(12, 7, -34)
 	var packed := CellCodec.pack(BlockCatalog.STONE, 0, 3)
+	# _write_cell funnels through CellCodec.canonical (the merged feature write choke point): STONE has no
+	# valid state bits, so its stored form is the canonicalized value. The point of this check is the flat
+	# Vector3i keying + readback, so compare against what the write actually stores (byte-identical to main).
+	var stored := CellCodec.canonical(packed)
 	w._write_cell(wc, packed)
 	_ok(w._edits.has(wc), "the overlay keys by the Vector3i WINDOW cell (pre-M2)")
 	_ok(typeof(w._edits.keys()[0]) == TYPE_VECTOR3I, "the overlay key is a Vector3i, not a packed int")
-	_ok(w.cell_value_at(wc) == packed, "cell_value_at reads the Vector3i-keyed edit back (state intact)")
+	_ok(w.cell_value_at(wc) == stored, "cell_value_at reads the Vector3i-keyed edit back (canonicalized)")
 	_ok(w.is_removed(Vector3i(0, 200, 0)) == false, "is_removed on an unedited cell is false")
 	w._write_cell(Vector3i(0, 200, 0), 0)   # dig to air
 	_ok(w.is_removed(Vector3i(0, 200, 0)), "is_removed on a dug cell is true (Vector3i key)")

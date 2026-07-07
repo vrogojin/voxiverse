@@ -71,15 +71,51 @@ static func ensure_ready() -> void:
 static func corners(m: int) -> Vector4i:
 	if m == 0:
 		return Vector4i(2, 2, 2, 2)
+	if CellCodec.is_layer(m):
+		# A FAM LAYER has no corner heights; return a DEFENSIVE uniform half-block quantization
+		# (clamped ≥1 so it is never the empty shape) for the corner-only consumers that are
+		# approximate for snow anyway (side_profile / the structural LUT). The PRECISE queries
+		# (height_at, volume, span, side_profile_full, surface_tris) branch on is_layer directly.
+		var q := clampi(roundi(_layer_h(m) * 2.0), 1, 2)
+		return Vector4i(q, q, q, q)
+	if CellCodec.is_slope(m):
+		# Defensive quantization (SHARP-SLOPE §2.2): per corner clampi(2·d_i, 0, 2), so any consumer
+		# missed by the is_slope sweep degrades to the nearest legacy shape, never nonsense.
+		var d := CellCodec.slope_deltas(m)
+		return Vector4i(clampi(2 * d.x, 0, 2), clampi(2 * d.y, 0, 2), clampi(2 * d.z, 0, 2), clampi(2 * d.w, 0, 2))
 	return Vector4i(mini(m & 3, 2), mini((m >> 2) & 3, 2), mini((m >> 4) & 3, 2), mini((m >> 6) & 3, 2))
 
-## Anchor (0 BOTTOM, 1 TOP). FULL → BOTTOM.
+## Snow LAYER height in blocks ∈ (0, 1) — the FAM LAYER level in tenths. Only valid for is_layer(m).
+static func _layer_h(m: int) -> float:
+	return float(CellCodec.layer_level(m)) / 10.0
+
+## Anchor (0 BOTTOM, 1 TOP). FULL → BOTTOM. SLOPE → BOTTOM (always; SHARP-SLOPE §2.2).
 static func anchor(m: int) -> int:
+	if CellCodec.is_slope(m):
+		return ANCHOR_BOTTOM
 	return (m >> 8) & 1
 
 ## True when the modifier is the FULL cube (field == 0).
 static func is_full(m: int) -> bool:
 	return m == 0
+
+## True when this shape's BOTTOM face fully tiles the cell floor with NO taper — a
+## bottom-anchored shape whose four corners are ALL >= 1, so every column of the cell
+## has material resting on the floor (the underside is a solid, unbroken quad at y=0).
+## The FULL cube (m==0, corners 2,2,2,2) qualifies. A partial WEDGE with any 0 corner
+## does NOT (its floor is exposed along that edge), and a TOP-anchored shape hangs from
+## the ceiling so its bottom is up at H, not on the floor. Used by the fallback mesher to
+## decide when a cap cell's underside fully occludes the surface cell's top quad below it
+## (M1 §6.4): only a full-cover slab may suppress that quad — a taper would leave a hole.
+static func bottom_face_covers(m: int) -> bool:
+	if m == 0:
+		return true
+	if CellCodec.is_slope(m):
+		return false                          # SHARP-SLOPE §2.2: min d ≤ 0 → floor exposed somewhere
+	if anchor(m) != ANCHOR_BOTTOM:
+		return false
+	var c := corners(m)
+	return c.x >= 1 and c.y >= 1 and c.z >= 1 and c.w >= 1
 
 ## Pack four corner heights + anchor into a modifier (does NOT canonicalize — a raw
 ## builder for worldgen/tests; run through `CellCodec.canonical` for the canonical
@@ -94,10 +130,34 @@ static func make_modifier(c00: int, c10: int, c11: int, c01: int, anc: int = 0) 
 static func volume(m: int) -> float:
 	if m == 0:
 		return 1.0
+	if CellCodec.is_layer(m):
+		return _layer_h(m)                       # a uniform layer of height h fills fraction h
+	if CellCodec.is_slope(m):
+		return _slope_volume(CellCodec.slope_deltas(m))
 	var c := corners(m)
 	var sa := c.x + c.z          # c00 + c11
 	var sb := c.y + c.w          # c10 + c01
 	return float(2 * maxi(sa, sb) + mini(sa, sb)) / 12.0
+
+## Snow-fill volume (SNOW-ACCUMULATION §2.5): the fraction of the cell filled by a flat snow plane at
+## height `level/10` sitting ABOVE the terrain shape `m` — i.e. ∫∫ max(0, s − H(fx,fz)) over the unit
+## footprint, the positive part of the plane-minus-ramp integral. `break_terrain` yields `280·this`
+## kg of snow. Deterministic numeric quadrature (a fixed grid); precision is cosmetic, but the sign and
+## monotonicity in `level` are exact (verify pins it against a Monte-Carlo sample). FULL cube / LAYER →
+## 0 (no terrain remainder to fill; snow-on-snow is Decision 4's business).
+static func fill_volume(m: int, level: int) -> float:
+	var s := float(clampi(level, 0, 10)) / 10.0
+	if m == 0 or CellCodec.is_layer(m):
+		return 0.0
+	const N := 16
+	var cell := 1.0 / float(N)
+	var vol := 0.0
+	for i in N:
+		var fx := (float(i) + 0.5) * cell
+		for j in N:
+			var fz := (float(j) + 0.5) * cell
+			vol += maxf(0.0, s - height_at(m, fx, fz))
+	return vol * cell * cell
 
 ## Fill fraction for a FIXED diagonal (main = the (0,0)-(1,1) split), NOT the max-sum
 ## rule — `V_main = (2·sA + sB)/12`. Exists so verify can fence the §6 complement
@@ -144,7 +204,78 @@ static func _height_half(c: Vector4i, fx: float, fz: float) -> float:
 static func height_at(m: int, fx: float, fz: float) -> float:
 	if m == 0:
 		return 1.0
+	if CellCodec.is_layer(m):
+		return _layer_h(m)                       # flat top at h everywhere (span/occupied/local_top follow)
+	if CellCodec.is_slope(m):
+		return clampf(_plane_at(CellCodec.slope_deltas(m), fx, fz), 0.0, 1.0)
 	return _height_half(corners(m), fx, fz) * 0.5
+
+## The SLOPE corner-plane value D(fx, fz) in BLOCKS (signed, UNCLAMPED) — the same max-sum diagonal
+## rule as _height_half but over signed whole-block deltas (SHARP-SLOPE §2.1). The comparison
+## d00+d11 ≥ d10+d01 is invariant under the uniform −1 shift between run cells, so every cell of a
+## run splits on the SAME diagonal (exact vertical tiling). The occupied top surface is clamp(D,0,1).
+static func _plane_at(d: Vector4i, fx: float, fz: float) -> float:
+	var c00 := float(d.x)
+	var c10 := float(d.y)
+	var c11 := float(d.z)
+	var c01 := float(d.w)
+	if (d.x + d.z) >= (d.y + d.w):
+		if fz <= fx:
+			return c00 + (c10 - c00) * fx + (c11 - c10) * fz
+		return c00 + (c11 - c01) * fx + (c01 - c00) * fz
+	if fx + fz <= 1.0:
+		return c00 + (c10 - c00) * fx + (c01 - c00) * fz
+	return (c10 + c01 - c11) + (c11 - c01) * fx + (c11 - c10) * fz
+
+## Fill fraction of a clipped-plane SLOPE shape (SHARP-SLOPE §2.2 `volume`): ∫ clamp(D, 0, 1) over
+## the unit square = Σ over the two max-sum triangles of [I⁺(a,b,c) − I⁺(a−1,b−1,c−1)], the
+## positive-part triangle integral identity ∫clamp(f,0,1) = ∫max(0,f) − ∫max(0,f−1).
+static func _slope_volume(d: Vector4i) -> float:
+	var a := float(d.x)
+	var b := float(d.y)
+	var cc := float(d.z)
+	var dd := float(d.w)
+	if (d.x + d.z) >= (d.y + d.w):
+		return _clip_tri_vol(a, b, cc) + _clip_tri_vol(a, cc, dd)   # (d00,d10,d11)+(d00,d11,d01)
+	return _clip_tri_vol(a, b, dd) + _clip_tri_vol(b, cc, dd)       # (d00,d10,d01)+(d10,d11,d01)
+
+## ∫ clamp(linear, 0, 1) over one half-unit-square triangle (area ½), vertex values a,b,c.
+static func _clip_tri_vol(a: float, b: float, c: float) -> float:
+	return _int_pos_tri(a, b, c) - _int_pos_tri(a - 1.0, b - 1.0, c - 1.0)
+
+## ∫ max(0, linear) over one half-unit-square triangle (area ½) whose vertex values are a,b,c
+## (SHARP-SLOPE §2.2). Closed forms: all ≥ 0 → (a+b+c)/6; all ≤ 0 → 0; one positive p (others q,r)
+## → p³/(6·(p−q)·(p−r)); one negative n (others p,q) → (a+b+c)/6 − n³/(6·(n−p)·(n−q)).
+static func _int_pos_tri(a: float, b: float, c: float) -> float:
+	var lo := minf(a, minf(b, c))
+	if lo >= 0.0:
+		return (a + b + c) / 6.0
+	var hi := maxf(a, maxf(b, c))
+	if hi <= 0.0:
+		return 0.0
+	var npos := int(a > 0.0) + int(b > 0.0) + int(c > 0.0)
+	if npos == 1:
+		var p := a if a > 0.0 else (b if b > 0.0 else c)
+		var q: float
+		var r: float
+		if a > 0.0:
+			q = b; r = c
+		elif b > 0.0:
+			q = a; r = c
+		else:
+			q = a; r = b
+		return p * p * p / (6.0 * (p - q) * (p - r))
+	# npos == 2: exactly one negative n, others p, q (both ≥ 0)
+	var nn := a if a < 0.0 else (b if b < 0.0 else c)
+	var pp: float
+	var qq: float
+	if a < 0.0:
+		pp = b; qq = c
+	elif b < 0.0:
+		pp = a; qq = c
+	else:
+		pp = a; qq = b
+	return (a + b + c) / 6.0 - nn * nn * nn / (6.0 * (nn - pp) * (nn - qq))
 
 # --- analytic physics (§5) ------------------------------------------------------
 
@@ -210,6 +341,28 @@ static func side_profile(m: int, face: int) -> Vector3i:
 static func side_profile_full(m: int, face: int) -> bool:
 	if m == 0:
 		return true
+	if CellCodec.is_layer(m):
+		return face == FACE_NY                   # a 0<h<1 uniform bottom layer covers ONLY the floor face
+	if CellCodec.is_slope(m):
+		# SHARP-SLOPE §2.2: lateral face covered iff both edge deltas ≥ 1 (H ≡ 1 along the edge).
+		# FACE_PY never (a full-height plane everywhere is canonically full). FACE_NY covered iff
+		# min(d) ≥ 0 (floor touched everywhere except measure-zero corners; a min ≤ −1 exposes a
+		# positive-area region → must NOT occlude the cell below).
+		var d := CellCodec.slope_deltas(m)
+		match face:
+			FACE_PX:
+				return d.y >= 1 and d.z >= 1
+			FACE_NX:
+				return d.x >= 1 and d.w >= 1
+			FACE_PZ:
+				return d.w >= 1 and d.z >= 1
+			FACE_NZ:
+				return d.x >= 1 and d.y >= 1
+			FACE_PY:
+				return false
+			FACE_NY:
+				return mini(mini(d.x, d.y), mini(d.z, d.w)) >= 0
+		return false
 	var c := corners(m)
 	var anc := anchor(m)
 	match face:
@@ -247,6 +400,12 @@ static func side_profile_full(m: int, face: int) -> bool:
 static func contact_area(mod_a: int, mod_b: int, axis: int) -> float:
 	if mod_a == 0 and mod_b == 0:
 		return 1.0                                   # full-cube fast path (today's world)
+	# SLOPE partner (SHARP-SLOPE §2.2): bypass the half-quantized LUT / region machinery — a SLOPE
+	# edge profile is clamp(lerp(e0,e1),0,1), continuous, not a {0,1,2} half-step.
+	if CellCodec.is_slope(mod_a) or CellCodec.is_slope(mod_b):
+		if axis == AXIS_Y:
+			return _slope_horizontal_contact(mod_a, mod_b)
+		return _slope_lateral_contact(mod_a, mod_b, axis)
 	if axis == AXIS_Y:
 		return _horizontal_contact(mod_a, mod_b)     # §7.2
 	ensure_ready()
@@ -393,6 +552,17 @@ static func _region_intersect_area(ra: Vector2i, rb: Vector2i) -> float:
 ## {v0, v1, v2, normal} in cell-local coordinates — the ray/plane targets for the
 ## `aimed_voxel` in-cell test (P5b). FULL → the flat top at y=1.
 static func surface_tris(m: int) -> Array:
+	if CellCodec.is_layer(m):
+		# The walkable top of a uniform layer: one flat quad at y=h, normal UP (feeds the DDA aim
+		# ray and the collider prisms). Diagonal is irrelevant for a flat surface.
+		var h := _layer_h(m)
+		var q00 := Vector3(0, h, 0)
+		var q10 := Vector3(1, h, 0)
+		var q11 := Vector3(1, h, 1)
+		var q01 := Vector3(0, h, 1)
+		return [_tri(q00, q10, q11, ANCHOR_BOTTOM), _tri(q00, q11, q01, ANCHOR_BOTTOM)]
+	if CellCodec.is_slope(m):
+		return _slope_surface_tris(CellCodec.slope_deltas(m))
 	var c := corners(m)
 	var anc := anchor(m)
 	# Corner surface y in blocks: BOTTOM tops at H, TOP surface at 1−H.
@@ -429,3 +599,216 @@ static func _tri(a: Vector3, b: Vector3, c: Vector3, anc: int) -> Dictionary:
 		c = t
 		n = -n
 	return {"v0": a, "v1": b, "v2": c, "normal": n}
+
+# --- SLOPE geometry (SHARP-SLOPE §2.2/§2.3) -------------------------------------
+
+## The two max-sum footprint triangles (as XZ Vector2 corner triples) of a SLOPE tuple.
+static func _slope_foot_tris(d: Vector4i) -> Array:
+	if (d.x + d.z) >= (d.y + d.w):
+		return [
+			[Vector2(0, 0), Vector2(1, 0), Vector2(1, 1)],   # d00,d10,d11
+			[Vector2(0, 0), Vector2(1, 1), Vector2(0, 1)]]   # d00,d11,d01
+	return [
+		[Vector2(0, 0), Vector2(1, 0), Vector2(0, 1)],       # d00,d10,d01
+		[Vector2(1, 0), Vector2(1, 1), Vector2(0, 1)]]       # d10,d11,d01
+
+## Clip a convex XZ polygon by the half-plane {_plane_at(d) − thr ≥ 0} (keep_above) or ≤ 0.
+static func _clip_plane_2d(poly: Array, d: Vector4i, thr: float, keep_above: bool) -> Array:
+	if poly.size() < 3:
+		return []
+	var out: Array = []
+	var n := poly.size()
+	for i in n:
+		var cur: Vector2 = poly[i]
+		var nxt: Vector2 = poly[(i + 1) % n]
+		var sc := _plane_at(d, cur.x, cur.y) - thr
+		var sn := _plane_at(d, nxt.x, nxt.y) - thr
+		if not keep_above:
+			sc = -sc
+			sn = -sn
+		if sc >= 0.0:
+			out.append(cur)
+		if (sc >= 0.0) != (sn >= 0.0):
+			var t := sc / (sc - sn)
+			out.append(cur + (nxt - cur) * t)
+	return out
+
+## SLOPE surface triangles (SHARP-SLOPE §2.2, LOAD-BEARING for collider prisms): per max-sum
+## footprint triangle, the PLATEAU {D ≥ 1} region emits flat tris at y = 1 (normal UP → full-height
+## prisms), the BAND {0 < D < 1} region emits tris on the plane y = D (true sloped normal); the
+## empty region {D ≤ 0} emits nothing. Each clipped polygon fan-triangulates.
+static func _slope_surface_tris(d: Vector4i) -> Array:
+	var tris: Array = []
+	for ft: Array in _slope_foot_tris(d):
+		# plateau {D ≥ 1} → flat at y = 1
+		var plat := _clip_plane_2d(ft, d, 1.0, true)
+		_fan_flat(plat, 1.0, ANCHOR_BOTTOM, tris)
+		# band {0 ≤ D ≤ 1} → on the plane y = D
+		var band := _clip_plane_2d(ft, d, 0.0, true)
+		band = _clip_plane_2d(band, d, 1.0, false)
+		if band.size() >= 3:
+			for i in range(1, band.size() - 1):
+				_append_tri(_slope_lift(d, band[0]), _slope_lift(d, band[i]), _slope_lift(d, band[i + 1]), ANCHOR_BOTTOM, tris)
+	return tris
+
+## Append a non-degenerate triangle (skips slivers from polygon clipping — a zero-area tri has no
+## surface and would extrude to a zero-volume prism anyway).
+static func _append_tri(a: Vector3, b: Vector3, c: Vector3, anc: int, out: Array) -> void:
+	if (b - a).cross(c - a).length() < _EPS:
+		return
+	out.append(_tri(a, b, c, anc))
+
+## The BOTTOM face polygons of a SLOPE cell: the {D > 0} footprint at y = 0, normal DOWN (the empty
+## region has no underside). For the ShapeMesh builder.
+static func slope_bottom_tris(m: int) -> Array:
+	var d := CellCodec.slope_deltas(m)
+	var tris: Array = []
+	for ft: Array in _slope_foot_tris(d):
+		var region := _clip_plane_2d(ft, d, 0.0, true)   # D ≥ 0
+		_fan_flat(region, 0.0, ANCHOR_TOP, tris)         # normal DOWN
+	return tris
+
+## Fan-triangulate an XZ polygon into flat tris at height `y` with outward normal per `anc`.
+static func _fan_flat(poly: Array, y: float, anc: int, out: Array) -> void:
+	if poly.size() < 3:
+		return
+	for i in range(1, poly.size() - 1):
+		_append_tri(
+			Vector3(poly[0].x, y, poly[0].y),
+			Vector3(poly[i].x, y, poly[i].y),
+			Vector3(poly[i + 1].x, y, poly[i + 1].y), anc, out)
+
+## Lift an XZ point to the clamped SLOPE surface (fx, clamp(D,0,1), fz).
+static func _slope_lift(d: Vector4i, v: Vector2) -> Vector3:
+	return Vector3(v.x, clampf(_plane_at(d, v.x, v.y), 0.0, 1.0), v.y)
+
+# --- SLOPE contact area (SHARP-SLOPE §2.2) --------------------------------------
+
+## A lateral-face profile as [anchor, h0, h1] in BLOCKS: the profile is clamp(lerp(h0,h1,t), 0, 1)
+## across the face's tangent t ∈ [0,1]. Uniform for SLOPE (BOTTOM, raw block deltas), legacy
+## (its anchor, half-block corner heights) and FULL (BOTTOM, 1, 1).
+static func _profile_hab(m: int, axis: int, positive: bool) -> Array:
+	if m == 0:
+		return [ANCHOR_BOTTOM, 1.0, 1.0]
+	if CellCodec.is_slope(m):
+		var d := CellCodec.slope_deltas(m)
+		var e0: int
+		var e1: int
+		if axis == AXIS_X:
+			if positive:
+				e0 = d.y; e1 = d.z            # +X: c10,c11
+			else:
+				e0 = d.x; e1 = d.w            # −X: c00,c01
+		else:
+			if positive:
+				e0 = d.w; e1 = d.z            # +Z: c01,c11
+			else:
+				e0 = d.x; e1 = d.y            # −Z: c00,c10
+		return [ANCHOR_BOTTOM, float(e0), float(e1)]
+	var c := corners(m)
+	var le0: int
+	var le1: int
+	if axis == AXIS_X:
+		if positive:
+			le0 = c.y; le1 = c.z
+		else:
+			le0 = c.x; le1 = c.w
+	else:
+		if positive:
+			le0 = c.w; le1 = c.z
+		else:
+			le0 = c.x; le1 = c.y
+	return [anchor(m), float(le0) * 0.5, float(le1) * 0.5]
+
+## Add the t ∈ (0,1) where lerp(h0,h1,t) crosses 0 or 1 (the clamp knots of a profile).
+static func _add_clip_knots(knots: Array, h0: float, h1: float) -> void:
+	if absf(h1 - h0) < _EPS:
+		return
+	for target: float in [0.0, 1.0]:
+		var t := (target - h0) / (h1 - h0)
+		if t > _EPS and t < 1.0 - _EPS:
+			knots.append(t)
+
+## Lateral (X/Z) shared-face contact when at least one cell is a SLOPE: integrate the overlap of
+## two clamped-linear edge profiles, subdividing [0,1] at both profiles' clamp knots so each segment
+## is linear-in-both — then _integral_min (same anchor) / _integral_pos (opposite) per segment.
+static func _slope_lateral_contact(mod_a: int, mod_b: int, axis: int) -> float:
+	var pa := _profile_hab(mod_a, axis, true)     # a's +axis face
+	var pb := _profile_hab(mod_b, axis, false)    # b's −axis face
+	var same: bool = pa[0] == pb[0]
+	var knots: Array = [0.0, 1.0]
+	_add_clip_knots(knots, pa[1], pa[2])
+	_add_clip_knots(knots, pb[1], pb[2])
+	knots.sort()
+	var total := 0.0
+	for i in range(knots.size() - 1):
+		var t0: float = knots[i]
+		var t1: float = knots[i + 1]
+		if t1 - t0 <= _EPS:
+			continue
+		var a0 := clampf(lerpf(pa[1], pa[2], t0), 0.0, 1.0)
+		var a1 := clampf(lerpf(pa[1], pa[2], t1), 0.0, 1.0)
+		var b0 := clampf(lerpf(pb[1], pb[2], t0), 0.0, 1.0)
+		var b1 := clampf(lerpf(pb[1], pb[2], t1), 0.0, 1.0)
+		var seg := _integral_min(a0, a1, b0, b1) if same else _integral_pos(a0 + b0 - 1.0, a1 + b1 - 1.0)
+		total += seg * (t1 - t0)
+	return total
+
+## Horizontal (AXIS_Y) shared-face contact when at least one cell is a SLOPE: the area of
+## intersection of the LOWER cell's top-reaching region and the UPPER cell's bottom-reaching region.
+## The unit square is split into 4 quarter-triangles (compatible with BOTH cells' max-sum diagonals,
+## so each region membership is LINEAR per quarter); clip each quarter by both memberships, shoelace.
+static func _slope_horizontal_contact(mod_a: int, mod_b: int) -> float:
+	var sq := [Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1)]
+	var ctr := Vector2(0.5, 0.5)
+	var total := 0.0
+	for i in 4:
+		var quad: Array = [sq[i], sq[(i + 1) % 4], ctr]
+		quad = _clip_membership(quad, mod_a, true)    # lower top-reaching
+		quad = _clip_membership(quad, mod_b, false)   # upper bottom-reaching
+		total += _poly_area(quad)
+	return total
+
+## Signed membership of (fx,fz) in a cell's shared-face-reaching region (≥ 0 inside). is_lower →
+## top-reaching (reaches y=1); else bottom-reaching (reaches y=0). Linear within a quarter-triangle.
+static func _membership(m: int, is_lower: bool, fx: float, fz: float) -> float:
+	if m == 0:
+		return 1.0                                    # full cube reaches both faces everywhere
+	if CellCodec.is_slope(m):
+		var val := _plane_at(CellCodec.slope_deltas(m), fx, fz)
+		return (val - 1.0) if is_lower else (val - _EPS)   # D ≥ 1 (top) / D > 0 (bottom)
+	var anc := anchor(m)
+	var h := _height_half(corners(m), fx, fz) * 0.5   # blocks
+	if is_lower:
+		return 1.0 if anc == ANCHOR_TOP else (h - 1.0)     # TOP hangs (reaches top); BOTTOM: H ≥ 1
+	return (h - 1.0) if anc == ANCHOR_TOP else 1.0         # TOP bottom region {H=1}; BOTTOM: whole face
+
+## Sutherland–Hodgman clip of a convex polygon by {membership ≥ 0} (linear within a quarter).
+static func _clip_membership(poly: Array, m: int, is_lower: bool) -> Array:
+	if poly.size() < 3:
+		return []
+	var out: Array = []
+	var n := poly.size()
+	for i in n:
+		var cur: Vector2 = poly[i]
+		var nxt: Vector2 = poly[(i + 1) % n]
+		var sc := _membership(m, is_lower, cur.x, cur.y)
+		var sn := _membership(m, is_lower, nxt.x, nxt.y)
+		if sc >= 0.0:
+			out.append(cur)
+		if (sc >= 0.0) != (sn >= 0.0):
+			var t := sc / (sc - sn)
+			out.append(cur + (nxt - cur) * t)
+	return out
+
+## Shoelace area of a simple XZ polygon.
+static func _poly_area(poly: Array) -> float:
+	if poly.size() < 3:
+		return 0.0
+	var a := 0.0
+	var n := poly.size()
+	for i in n:
+		var p: Vector2 = poly[i]
+		var q: Vector2 = poly[(i + 1) % n]
+		a += p.x * q.y - q.x * p.y
+	return absf(a) * 0.5

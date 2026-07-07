@@ -28,6 +28,113 @@ const MOD_CORNERS_MASK := 0xFF
 const MOD_ANC_BIT := 1 << 8
 const MOD_FAM_BIT := 1 << 15
 
+## FAM shape-family dispatch (SNOW-ACCUMULATION §1.2 / SHARP-SLOPE §1.1). When MOD_FAM_BIT is set
+## the corner-height semantics do NOT apply; the 3-bit KIND field (bits 14..12) selects the family
+## and the low bits carry family-specific data. kind 0 = LAYER (snow accumulation), kind 1 = SLOPE
+## (sharp mountain faces). Any other kind (or a malformed payload) strips to full cube + warns in
+## _canonical_modifier. The bare marker MOD_FAM_BIT (no kind, no payload) is the shared "empty FAM
+## shape" → collapsed to AIR by canonical().
+const MOD_FAM_KIND_SHIFT := 12
+const MOD_FAM_KIND_MASK := 0x7                  # bits 14..12
+const FAM_LAYER := 0
+const FAM_SLOPE := 1
+
+## --- FAM_LAYER (kind 0), SNOW-ACCUMULATION §1.2 -------------------------------------------------
+## A UNIFORM thin layer — a flat top at height `level/10` block, BOTTOM-anchored — with the level
+## (tenths, 1..9) in bits 3..0 and bits 11..4 reserved 0. The variable-height snow depth (0→1) that
+## replaces the fixed half-slab.
+const MOD_LAYER_LEVEL_MASK := 0xF               # bits 3..0 — layer level in tenths
+## Canonical form of LAYER level 5 (== a 0.5 uniform layer): the all-corners-1 BOTTOM slab
+## (ShapeCodec.make_modifier(1,1,1,1,BOTTOM) == 85), so level 5 reuses the already-baked,
+## collider-proven slab shape instead of a distinct FAM value (SNOW-ACCUMULATION §1.3 rule 5).
+const LAYER_SLAB_MODIFIER := 85
+
+## The canonical modifier for a snow LAYER of `level` tenths (1..10): level 10 → 0 (full cube;
+## no dual encoding of a full cell), 5 → the corner slab (85), 1..4/6..9 → the FAM LAYER value,
+## and level ≤ 0 → the empty marker MOD_FAM_BIT (canonical() then zeroes the whole cell to AIR).
+static func make_layer(level: int) -> int:
+	var lv := clampi(level, 0, 10)
+	if lv <= 0:
+		return MOD_FAM_BIT                       # empty layer → canonical() collapses the cell to AIR
+	if lv >= 10:
+		return 0                                 # full cube
+	if lv == 5:
+		return LAYER_SLAB_MODIFIER               # 0.5 uniform layer == the baked corner slab
+	return MOD_FAM_BIT | lv                      # FAM LAYER, levels 1..4 / 6..9
+
+## True when `m` is a FAM LAYER modifier (kind 0, reserved bits clear) — the case the ShapeCodec
+## queries branch on. NOTE: the level-5 (85) and level-10 (0) canonical forms are NOT FAM values,
+## so is_layer is false for them; use snow_tenths() for the level of ANY canonical snow modifier.
+static func is_layer(m: int) -> bool:
+	return (m & MOD_FAM_BIT) != 0 and ((m >> 4) & 0x7FF) == 0
+
+## The level (tenths) of a FAM LAYER modifier — the raw low nibble. Only valid when is_layer(m);
+## for the non-FAM canonical forms (the 85 slab, the 0 full cube) use snow_tenths().
+static func layer_level(m: int) -> int:
+	return m & MOD_LAYER_LEVEL_MASK
+
+## Snow depth in tenths for a CANONICAL snow modifier (only meaningful on a snow cell): a FAM
+## LAYER → its level; the corner slab (85) → 5; the full cube (0) → 10. Any other modifier → 0.
+static func snow_tenths(m: int) -> int:
+	if is_layer(m):
+		return m & MOD_LAYER_LEVEL_MASK
+	if m == LAYER_SLAB_MODIFIER:
+		return 5
+	if m == 0:
+		return 10
+	return 0
+
+## --- FAM_SLOPE (kind 1), SHARP-SLOPE §1.2 ------------------------------------------------------
+## Four 3-bit signed WHOLE-block corner deltas, bias +3, packed low-bits-first in ShapeCodec corner
+## order (c00 @ bits 0..2, c10 @ 3..5, c11 @ 6..8, c01 @ 9..11). `k_i = d_i + 3`, `d_i ∈ {−3..+4}` =
+## the height of corner i's terrain plane above THIS cell's floor, in blocks. Always BOTTOM-anchored
+## (no anchor bit under FAM). The encoding is total — all 4096 payloads decode to a valid tuple.
+const MOD_SLOPE_BIAS := 3
+
+## True iff `m` is a canonical SLOPE modifier (FAM bit set AND kind field == FAM_SLOPE).
+static func is_slope(m: int) -> bool:
+	return (m & MOD_FAM_BIT) != 0 and ((m >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK) == FAM_SLOPE
+
+## Biased-decode a SLOPE modifier to its four signed WHOLE-block corner deltas (d00, d10, d11, d01),
+## in ShapeCodec corner order. Assumes is_slope(m); on any other value the result is meaningless.
+static func slope_deltas(m: int) -> Vector4i:
+	return Vector4i(
+		(m & 7) - MOD_SLOPE_BIAS,
+		((m >> 3) & 7) - MOD_SLOPE_BIAS,
+		((m >> 6) & 7) - MOD_SLOPE_BIAS,
+		((m >> 9) & 7) - MOD_SLOPE_BIAS)
+
+## Build the CANONICAL modifier for a SLOPE cell whose four corner terrain-plane heights above the
+## cell FLOOR are (d00, d10, d11, d01) whole blocks (SHARP-SLOPE §1.2/§1.3). Applies the same
+## canonical collapse rules _canonical_modifier's SLOPE branch does, so a hand-built slope is
+## already in canonical form: full cube (all d ≥ 1 → 0), empty (all d ≤ 0 → MOD_FAM_BIT, which
+## canonical() collapses to AIR), legacy-expressible (all d ∈ {0,1} → the corner modifier), else
+## the raw SLOPE encoding.
+static func make_slope(d00: int, d10: int, d11: int, d01: int) -> int:
+	return _canonical_slope(d00, d10, d11, d01)
+
+## The raw (non-canonical) SLOPE bit encoding for a delta tuple — clamps each delta to {−3..+4}.
+static func _slope_raw(d00: int, d10: int, d11: int, d01: int) -> int:
+	var k00 := clampi(d00 + MOD_SLOPE_BIAS, 0, 7)
+	var k10 := clampi(d10 + MOD_SLOPE_BIAS, 0, 7)
+	var k11 := clampi(d11 + MOD_SLOPE_BIAS, 0, 7)
+	var k01 := clampi(d01 + MOD_SLOPE_BIAS, 0, 7)
+	return MOD_FAM_BIT | (FAM_SLOPE << MOD_FAM_KIND_SHIFT) | (k01 << 9) | (k11 << 6) | (k10 << 3) | k00
+
+## Canonicalize a SLOPE delta tuple (SHARP-SLOPE §1.3): rules 1 (full) / 2 (empty) / 3 (legacy
+## collapse) / 4 (keep). ONE authority shared by make_slope and _canonical_modifier so a shape maps
+## to a unique modifier int (mesher keying + equality).
+static func _canonical_slope(d00: int, d10: int, d11: int, d01: int) -> int:
+	if d00 >= 1 and d10 >= 1 and d11 >= 1 and d01 >= 1:
+		return 0                              # rule 1: full cube (plane at/above the ceiling everywhere)
+	if d00 <= 0 and d10 <= 0 and d11 <= 0 and d01 <= 0:
+		return MOD_FAM_BIT                    # rule 2: empty (shared FAM marker → AIR via canonical())
+	if d00 >= 0 and d00 <= 1 and d10 >= 0 and d10 <= 1 and d11 >= 0 and d11 <= 1 and d01 >= 0 and d01 <= 1:
+		# rule 3: every delta in [0,1] → the clip is inert, so the clipped plane IS the legacy linear
+		# ramp; use the legacy corner encoding (reuses the collider-proven baked models).
+		return ShapeCodec.make_modifier(2 * d00, 2 * d10, 2 * d11, 2 * d01, ShapeCodec.ANCHOR_BOTTOM)
+	return _slope_raw(d00, d10, d11, d01)     # rule 4: keep the tuple
+
 ## Liquid axis (WATER-SHORE §2): bits 48..53. Kind in 48..49, level (tenths) in 50..53.
 ## A pure render+sim overlay orthogonal to material/modifier/state — no physics function
 ## reads it. Field 0 = no liquid (zero-cost default). The bare water id is THE canonical
@@ -37,14 +144,63 @@ const LIQ_FIELD_MASK := 0x3F
 const LIQ_KIND_MASK := 0x3
 const LIQ_NONE := 0
 const LIQ_WATER := 1
+const LIQ_LAVA := 2               # was reserved (WATER-SHORE §2.1); kind 3 stays reserved for a third liquid
 const LIQ_LEVEL_SURFACE := 9      # top at 0.9 — the water-line cell
 const LIQ_LEVEL_FULL := 10        # top at 1.0 — submerged composite
+
+## Liquid-kind name → value map (MULTI-LIQUID §2.1). This codec is the single authority
+## on the LIQ_KIND bit meanings; BlockCatalog resolves blocks.json "liquid_kind" strings
+## through this map. Extend with the next reserved value (3) when a third liquid lands.
+const LIQ_KIND_BY_NAME := {&"water": LIQ_WATER, &"lava": LIQ_LAVA}
+
+## STATE axis (VDS §3.2/§10.3): behavioural variants of a material, bits 32..47. Positional +
+## per-material — the name at index i of a material's `state_layout` names bit i, and the material's
+## valid-bit mask is `BlockCatalog.state_mask_of`. `snow_capped` is bit 0 (M1 snowy world), pinned
+## to index 0 on every material that declares it (verify), so this GLOBAL shorthand is safe for
+## worldgen/render. State is disjoint from the liquid overlay at the STAMPING level (worldgen never
+## produces both on one cell); the codec does not forbid the combination.
+const STATE_SNOW_CAPPED := 1                     # bit 0 of STATE (bits 32..47)
+
+## Snow-fill nibble (SNOW-ACCUMULATION Decision 2.2): STATE bits 1..4 = the SNOW_FILL level in tenths
+## (0 = none, 1..10 = the plane height inside a terrain remainder). It rides the STATE axis because the
+## composite's identity IS a state variant (MULTI-MATERIAL §3a). The four bit NAMES on the declaring
+## materials are `snow_fill_b0..b3` (binary weights), with `snow_capped` staying pinned at index 0.
+const STATE_SNOW_FILL_SHIFT := 1                 # bits 1..4 of STATE
+const STATE_SNOW_FILL_MASK := 0xF << STATE_SNOW_FILL_SHIFT
+
+## STATE-bit name → value map (mirrors LIQ_KIND_BY_NAME). The reverse global shorthand for
+## worldgen/render; per-material bit MEANING still comes from each material's declared state_layout.
+const STATE_BIT_BY_NAME := {&"snow_capped": STATE_SNOW_CAPPED}
+
+## The snow-fill level (tenths, 0..10) carried by `v` — the plane height inside the cell's terrain
+## remainder (SNOW-ACCUMULATION §2.2). 0 = no fill. Only meaningful on a solid partial (ramp) cell of a
+## declaring material; canonical() strips it everywhere else.
+static func snow_fill(v: int) -> int:
+	return (state(v) >> STATE_SNOW_FILL_SHIFT) & 0xF
+
+## Set the snow-fill level (tenths) of `v`, leaving snow_capped + any other state bits, plus
+## material/modifier/liquid, intact. Route real writes through canonical() (WorldManager._write_cell).
+static func with_snow_fill(v: int, level: int) -> int:
+	var st := state(v) & ~STATE_SNOW_FILL_MASK
+	st |= (clampi(level, 0, 15) & 0xF) << STATE_SNOW_FILL_SHIFT
+	return with_state(v, st)
+
+## The 16-bit STATE field (bits 32..47) of a packed cell.
+const STATE_MASK := 0xFFFF
+
+## True iff the cell's STATE field has (all of) `bit` set.
+static func has_state(v: int, bit: int) -> bool:
+	return (state(v) & bit) != 0
+
+## Replace the STATE field of `v` with `bits`, leaving material/modifier/liquid intact.
+static func with_state(v: int, bits: int) -> int:
+	return (v & ~(STATE_MASK << 32)) | ((bits & STATE_MASK) << 32)
 
 ## The 6-bit liquid field (kind + level) — 0 means "no liquid".
 static func liquid_field(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_FIELD_MASK
 
-## Liquid kind (0 = none, 1 = water, 2..3 reserved).
+## Liquid kind (0 = none, 1 = water, 2 = lava, 3 reserved).
 static func liquid_kind(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_KIND_MASK
 
@@ -106,12 +262,17 @@ static func canonical(v: int) -> int:
 	if m == BlockCatalog.AIR:
 		return 0                              # air never carries modifier/state/liquid
 	var cm := _canonical_modifier(m, modifier(v))
-	# A canonicalized corner-height shape with all four corners 0 but a nonzero
-	# encoding (e.g. a TOP anchor bit) is an EMPTY shape — the cell is AIR (VDS §3.2 /
-	# SUB-VOXEL §3.1). Modifier 0 (the FULL-cube encoding) is deliberately excluded.
+	# A canonicalized shape with NO occupied volume is an EMPTY shape → the cell is AIR (VDS §3.2 /
+	# SUB-VOXEL §3.1). The shared empty-FAM marker (MOD_FAM_BIT bare, no kind/payload) covers BOTH a
+	# FAM LAYER of level 0 (snow) and an empty SLOPE (SHARP-SLOPE §1.3 rule 2).
+	if cm == MOD_FAM_BIT:
+		return 0                              # empty FAM shape (LAYER level 0 / empty SLOPE) → AIR
+	# A canonicalized corner-height shape with all four corners 0 but a nonzero encoding (e.g. a TOP
+	# anchor bit) is also EMPTY. Modifier 0 (the FULL-cube encoding) is deliberately excluded.
 	if cm != 0 and (cm & MOD_FAM_BIT) == 0 and (cm & MOD_CORNERS_MASK) == 0:
 		return 0
-	return pack(m, cm, _validate_state(m, state(v)), _canonical_liquid(m, cm, liquid_field(v)))
+	return pack(m, cm, _canonical_snow_fill(m, cm, _validate_state(m, state(v))),
+		_canonical_liquid(m, cm, liquid_field(v)))
 
 ## Corner-height canonicalization (VOXEL-DATA-STRUCTURE §3.2 / SUB-VOXEL §3.1), the
 ## packing half of the split `ShapeCodec` (VDS §13.1.2). Guarantees each geometric
@@ -133,9 +294,28 @@ static func _canonical_modifier(material: int, modifier_bits: int) -> int:
 		return 0
 	if modifier_bits == 0:
 		return 0                              # FULL cube (fast path)
-	# Future shape families (FAM = 1) carry no corner-height semantics — pass through.
+	# FAM shape families (bit 15): dispatch on the KIND field (SNOW-ACCUMULATION §1.3 / SHARP-SLOPE
+	# §1.3). The bare empty marker passes through (canonical() collapses it to AIR); kind 0 = LAYER
+	# canonicalizes via make_layer (snow), kind 1 = SLOPE via the shared _canonical_slope; a LAYER
+	# with a nonzero reserved band, or any other kind, is malformed → strip to full cube + warn (the
+	# "ramp of water" discipline). This keeps ONE modifier int per geometric shape across BOTH families.
 	if modifier_bits & MOD_FAM_BIT:
-		return modifier_bits & 0xFFFF
+		if modifier_bits == MOD_FAM_BIT:
+			return MOD_FAM_BIT                # bare empty-FAM marker → AIR (via canonical())
+		var kind := (modifier_bits >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK
+		if kind == FAM_LAYER:
+			var reserved := (modifier_bits >> 4) & 0xFF
+			if reserved != 0:
+				push_warning("CellCodec: malformed FAM LAYER (reserved %d) — stripped to full cube (0)"
+					% reserved)
+				return 0
+			return make_layer(modifier_bits & MOD_LAYER_LEVEL_MASK)
+		if kind == FAM_SLOPE:
+			var d := slope_deltas(modifier_bits)
+			return _canonical_slope(d.x, d.y, d.z, d.w)
+		push_warning("CellCodec: unknown FAM kind %d in modifier %d — stripped to full cube (0)"
+			% [kind, modifier_bits])
+		return 0
 	# Corner-height family: clamp each 2-bit corner (value 3 → 2, VDS §3.2).
 	var c0 := mini(modifier_bits & 3, 2)
 	var c1 := mini((modifier_bits >> 2) & 3, 2)
@@ -150,10 +330,43 @@ static func _canonical_modifier(material: int, modifier_bits: int) -> int:
 	return c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | anc
 
 ## P6 hook — validate state bits against the material's declared state_layout
-## (VOXEL-DATA-STRUCTURE §3.2/§10.3), clamping unknown bits. Pass-through until
-## the state machinery lands.
-static func _validate_state(_material: int, state_bits: int) -> int:
+## (VOXEL-DATA-STRUCTURE §3.2/§10.3, M1 snowy world): undeclared bits are silently masked
+## to 0 (the "0 is absent" convention — not a warning). The mask is the low
+## `state_layout.size()` bits (BlockCatalog.state_mask_of): AIR/out-of-range → 0 (air carries
+## no state); an UNRESOLVED placeholder → 0xFFFF (permissive, keeps bits until late resolution).
+static func _validate_state(material: int, state_bits: int) -> int:
+	if state_bits == 0:
+		return 0
+	return state_bits & BlockCatalog.state_mask_of(material)
+
+## Snow-fill canonicalization (SNOW-ACCUMULATION §2.3), mirroring `_canonical_liquid` rule-for-rule.
+## Takes the cell's material, its ALREADY-canonicalized modifier, and the ALREADY-validated STATE
+## bits; returns the canonical STATE (the fill nibble adjusted, other state bits untouched). A stripped
+## fill is simply "absent" (0 in the nibble); a genuine violation logs. The fill can ONLY sit on a
+## SOLID PARTIAL (corner-height ramp) cell — never on air (canonical() zeroed it), non-solid, a full
+## cube (no remainder), or a LAYER (snow-on-snow is just a higher level, Decision 4 owns it).
+static func _canonical_snow_fill(material: int, canonical_mod: int, state_bits: int) -> int:
+	var fill := (state_bits >> STATE_SNOW_FILL_SHIFT) & 0xF
+	if fill == 0:
+		return state_bits                         # rule 1: absent
+	var stripped := state_bits & ~STATE_SNOW_FILL_MASK
+	if BlockCatalog.solidity_of(material) < 0.5:
+		return stripped                           # rule 3: no snow-filled water
+	if canonical_mod == 0:
+		return stripped                           # rule 4: a full cube has no remainder to fill
+	if (canonical_mod & MOD_FAM_BIT) != 0:
+		return stripped                           # rule 5: fill on a LAYER — snow-on-snow, not a fill
+	# rule 6: a plane at/below the terrain minimum everywhere adds nothing (corner half-units → 5 tenths).
+	if fill <= 5 * _min_corner(canonical_mod):
+		return stripped
+	if fill > 10:
+		return (state_bits & ~STATE_SNOW_FILL_MASK) | (10 << STATE_SNOW_FILL_SHIFT)   # rule 2: clamp
 	return state_bits
+
+## The smallest of a corner-height modifier's four 2-bit corners (half-block units 0..2) — the terrain
+## minimum used by `_canonical_snow_fill` rule 6. `canonical_mod` is a non-zero, non-FAM modifier.
+static func _min_corner(m: int) -> int:
+	return mini(mini(m & 3, (m >> 2) & 3), mini((m >> 4) & 3, (m >> 6) & 3))
 
 ## Liquid-axis canonicalization (WATER-SHORE §2.3). Takes the cell's material, its
 ## ALREADY-canonicalized modifier, and the raw 6-bit liquid field; returns the canonical
@@ -191,9 +404,10 @@ static func _canonical_liquid(material: int, canonical_mod: int, liquid: int) ->
 		return 0
 	# The overlay kind on a solid composite is an OVERLAY liquid (independent of the solid
 	# host material, so liquid_kind_of(host) does not apply here). Validate it against the
-	# known-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
-	# survive on a solid host either. v1 ships only WATER; extend when lava lands.
-	if kind > LIQ_WATER:
+	# DECLARED-liquid set — mirroring rule 5's kind check so a reserved/garbage kind can't
+	# survive on a solid host either. Any KNOWN kind (water, lava, a future third) may
+	# waterlog a solid composite; only a genuinely unknown/reserved kind is stripped.
+	if not BlockCatalog.is_liquid_kind_known(kind):
 		push_warning("CellCodec: unknown liquid kind %d on solid composite (material %d) — stripped"
 			% [kind, material])
 		return 0

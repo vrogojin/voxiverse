@@ -11,6 +11,14 @@ extends Resource
 @export var states: Array[VoxelState] = []
 @export var default_state_index: int = 0
 
+## The ordered STATE-axis bit layout (VOXEL-DATA-STRUCTURE §10.3): the name at index i
+## names bit i of a packed cell's STATE field, and this material's state mask is the low
+## `state_layout.size()` bits (BlockCatalog.state_mask_of). Empty for every material with
+## no behavioural state variant, and serialized as `[]` (MaterialDocument), so a non-stated
+## material's document — hence its GMID — stays byte-identical. "snow_capped" is index 0 on
+## every material that declares it (M1: grass/podzol/sand/stone).
+@export var state_layout: Array[StringName] = []
+
 func get_default_state() -> VoxelState:
 	if states.is_empty():
 		return null

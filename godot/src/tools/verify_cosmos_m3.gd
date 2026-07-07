@@ -72,7 +72,9 @@ func _test_cross_edge_edit_identity() -> void:
 	_ok(int(g["i"]) >= 0 and int(g["i"]) < n and int(g["j"]) >= 0 and int(g["j"]) < n,
 		"the folded cell is in-range on the neighbour face (i=%d, j=%d)" % [int(g["i"]), int(g["j"])])
 
-	var packed := CellCodec.pack(BlockCatalog.STONE, 0, 5)
+	# Grass + the snow_capped STATE bit: a VALID state that survives the merged CellCodec.canonical write
+	# choke point, so this proves the full value (material + state axis) crosses the face seam intact.
+	var packed := CellCodec.canonical(CellCodec.pack(BlockCatalog.id_of(&"grass"), 0, CellCodec.STATE_SNOW_CAPPED))
 	w._write_cell(wc_a, packed)
 	var key := chart_a.to_global_key(wc_a)
 	_ok(key == CS.edit_key(int(g["face"]), int(g["i"]), int(g["j"]), 6),
@@ -85,7 +87,7 @@ func _test_cross_edge_edit_identity() -> void:
 	var wc_b := Vector3i(0, 6, 0)                       # window (0,·,0) → global (B, gi, gj) exactly
 	_ok(chart_b.to_global_key(wc_b) == key, "a window homed on the OTHER side folds to the SAME global key")
 	_ok(w.cell_value_at(wc_b) == packed, "the cross-edge edit is FOUND AGAIN from the other-side window (full value intact)")
-	_ok(CellCodec.state(w.cell_value_at(wc_b)) == 5, "the state axis survived the cross-edge read")
+	_ok(CellCodec.state(w.cell_value_at(wc_b)) == CellCodec.STATE_SNOW_CAPPED, "the state axis survived the cross-edge read")
 	w.free()
 
 # ---------------------------------------------------------------------------------------
@@ -183,7 +185,9 @@ func _test_home_face_flip() -> void:
 
 	# An edit on the home face near the seam (in-range on face 4).
 	var wc_edit := Vector3i(2, 6, 10)                   # global i = n-8, j = 3010
-	var packed := CellCodec.pack(BlockCatalog.DIRT, 0, 3)
+	# Grass + snow_capped: a VALID state that survives CellCodec.canonical, so the full value (material +
+	# state axis) is proven to survive the home-face flip via its unchanged global key.
+	var packed := CellCodec.canonical(CellCodec.pack(BlockCatalog.id_of(&"grass"), 0, CellCodec.STATE_SNOW_CAPPED))
 	w._write_cell(wc_edit, packed)
 	var key := chart.to_global_key(wc_edit)
 

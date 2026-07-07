@@ -52,7 +52,9 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 			hmap[lz * stride + lx] = world.effective_height(wx, wz) if world != null \
 				else TerrainConfig.height_at(wx, wz)
 
-	# Top block id per interior column (for the greedy top merge key).
+	# Top LOOK KEY per interior column (greedy top merge key): the material id, or
+	# `mat | _LOOK_SNOW_FLAG` for a snow-capped cell (M1 §5.4), so capped/bare tops never
+	# merge and the commit binds the snow-variant material.
 	var topids := PackedInt32Array()
 	topids.resize(n * n)
 	# Surface cell MODIFIER per interior column (0 = FULL). P5b-2 worldgen smoothing
@@ -61,19 +63,36 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 	# greedy top merge and its side wall is capped at the cell floor so the slope shows.
 	var topmods := PackedInt32Array()
 	topmods.resize(n * n)
+	# Columns whose h+1 cell is a solid SHAPED cell (e.g. a snow half-slab): its bottom face is
+	# coincident with the flat surface top quad, so the top quad is skipped to kill z-fight (§6.4).
+	var capshaped := PackedByteArray()
+	capshaped.resize(n * n)
 	for lz in n:
 		for lx in n:
 			var h := hmap[(lz + 1) * stride + (lx + 1)]
-			topids[lz * n + lx] = _cell_id(world, x0 + lx, h, z0 + lz)
-			topmods[lz * n + lx] = CellCodec.modifier(world.cell_value_at(Vector3i(x0 + lx, h, z0 + lz))) \
-				if world != null else 0
+			if world == null:
+				topids[lz * n + lx] = BlockCatalog.GRASS
+				topmods[lz * n + lx] = 0
+				continue
+			var vtop := world.cell_value_at(Vector3i(x0 + lx, h, z0 + lz))
+			topids[lz * n + lx] = _look_of(vtop)
+			topmods[lz * n + lx] = CellCodec.modifier(vtop)
+			var vcap := world.cell_value_at(Vector3i(x0 + lx, h + 1, z0 + lz))
+			# Only a cap whose BOTTOM face FULLY covers the footprint (a bottom-anchored slab, all
+			# corners >= 1 — the snow half-slab, or a full-cover lip) may suppress the surface top
+			# quad: its solid underside is coincident with that quad, so drawing both z-fights. A
+			# PARTIAL/wedge lip (any 0 corner) or a top-anchored cap does NOT cover the whole floor,
+			# so the surface top quad must stay or the exposed remainder becomes a hole (M1 §6.4).
+			if BlockCatalog.solidity_of(CellCodec.mat(vcap)) >= 0.5 and ShapeCodec.bottom_face_covers(CellCodec.modifier(vcap)):
+				capshaped[lz * n + lx] = 1
 
-	# One SurfaceTool per block id present (lazily begun on first face).
-	var tools: Dictionary = {}   # int block_id -> SurfaceTool
-	_emit_tops(tools, hmap, topids, topmods, stride, n, x0, z0)
+	# One SurfaceTool per LOOK KEY present (lazily begun on first face).
+	var tools: Dictionary = {}   # int look key -> SurfaceTool
+	_emit_tops(tools, hmap, topids, topmods, capshaped, stride, n, x0, z0)
 	_emit_sides(tools, world, hmap, topmods, stride, n, x0, z0)
 	if world != null:
 		_emit_terrain_shapes(tools, world, hmap, stride, n, x0, z0)
+		_emit_snow(tools, world, hmap, stride, n, x0, z0)
 		_emit_trees(tools, world, n, x0, z0)
 		_emit_placed(tools, world, n, x0, z0)
 		_emit_water(tools, world, hmap, stride, n, x0, z0)
@@ -84,21 +103,25 @@ static func build(cx: int, cz: int, world: WorldManager = null) -> ArrayMesh:
 	for id: int in tools.keys():
 		var st: SurfaceTool = tools[id]
 		st.commit(mesh)
-		mesh.surface_set_material(mesh.get_surface_count() - 1, BlockMaterials.get_for(id))
+		# A look key with the snow flag binds the snow-cap variant material (M1 §5.4).
+		var surf_mat: Material = BlockMaterials.snow_capped_for(id & 0xFFFF) if (id & _LOOK_SNOW_FLAG) != 0 else BlockMaterials.get_for(id)
+		mesh.surface_set_material(mesh.get_surface_count() - 1, surf_mat)
 	if mesh.get_surface_count() == 0:
 		return null
 	return mesh
 
 # --- top faces: greedy 2D merge over equal (height, top id) ---------------------
 static func _emit_tops(tools: Dictionary, hmap: PackedInt32Array, topids: PackedInt32Array,
-		topmods: PackedInt32Array, stride: int, n: int, x0: int, z0: int) -> void:
+		topmods: PackedInt32Array, capshaped: PackedByteArray, stride: int, n: int, x0: int, z0: int) -> void:
 	var used := PackedByteArray()
 	used.resize(n * n)
 	# A smoothing-shaped surface cell renders via _emit_terrain_shapes (ShapeMesh), not a
 	# flat quad — mark it used so the greedy merge skips it and never floats a flat top
 	# over a ramp (nor lets it break a flat run).
+	# A shaped surface cell renders via _emit_terrain_shapes; a column with a solid shaped h+1
+	# cell (snow slab) skips its top quad too (its coincident bottom face would z-fight, §6.4).
 	for i in n * n:
-		if topmods[i] != 0:
+		if topmods[i] != 0 or capshaped[i]:
 			used[i] = 1
 	for lz in n:
 		for lx in n:
@@ -168,10 +191,10 @@ static func _emit_sides(tools: Dictionary, world: WorldManager, hmap: PackedInt3
 				# Wall covers cells y in [nh+1 .. h] on this (taller) column's face.
 				# Split into contiguous same-id vertical segments so the wall bands.
 				var seg_start := nh + 1
-				var seg_id := _cell_id(world, wx, seg_start, wz)
+				var seg_id := _look_id(world, wx, seg_start, wz)
 				var y := nh + 2
 				while y <= h:
-					var cid := _cell_id(world, wx, y, wz)
+					var cid := _look_id(world, wx, y, wz)
 					if cid != seg_id:
 						if seg_id != BlockCatalog.AIR and seg_start < wall_top:
 							_wall(_tool_for(tools, seg_id), dir.nrm, lx, lz, x0, z0, seg_start, mini(y, wall_top))
@@ -194,17 +217,81 @@ static func _emit_terrain_shapes(tools: Dictionary, world: WorldManager,
 			var h := hmap[(lz + 1) * stride + (lx + 1)]
 			var wx := x0 + lx
 			var wz := z0 + lz
-			# Surface cell (y = h): a smoothing-shaped top emits ShapeMesh geometry.
-			var vs: int = world.cell_value_at(Vector3i(wx, h, wz))
+			# SHARP-SLOPE §4.3: a steep SLOPE column emits its whole vertical RUN [lo, hi−1] of shaped
+			# cells (carve below h, caps above h+1), not just h/h+1. Rare buried full cells between the
+			# heightmap top and the run start are emitted as cubes so the fallback stays hole-free.
+			var run := TerrainConfig.slope_run_of(wx, wz)
+			if TerrainConfig.slope_run_fires(run):
+				var rng := TerrainConfig.slope_run_range(run, h)
+				for yy in range(h + 1, rng.x):
+					var vf: int = world.cell_value_at(Vector3i(wx, yy, wz))
+					if CellCodec.modifier(vf) == 0 and BlockCatalog.solidity_of(CellCodec.mat(vf)) >= 0.5:
+						_emit_shaped(tools, Vector3i(wx, yy, wz), _look_of(vf), 0)   # full cube
+				for yy in range(rng.x, rng.y):
+					var vv: int = world.cell_value_at(Vector3i(wx, yy, wz))
+					var mm: int = CellCodec.modifier(vv)
+					if mm != 0 and BlockCatalog.solidity_of(CellCodec.mat(vv)) >= 0.5:
+						_emit_shaped(tools, Vector3i(wx, yy, wz), _look_of(vv), mm)
+				continue
+			# Surface cell (y = h): a smoothing-shaped top emits ShapeMesh geometry, and — SNOW-ACCUMULATION
+			# §2.8 — a snow-FILLED ramp DUAL-EMITs the snow LAYER fill on top (the module's composite, sans
+			# baking). Same (mat, state, modifier) projection on both paths. (A slope column has already
+			# emitted its run and CONTINUEd, so snow-fill/cap never double up with the run.)
+			var cs := Vector3i(wx, h, wz)
+			var vs: int = world.cell_value_at(cs)
 			var ms: int = CellCodec.modifier(vs)
 			if ms != 0 and BlockCatalog.solidity_of(CellCodec.mat(vs)) >= 0.5:
-				_emit_shaped(tools, Vector3i(wx, h, wz), CellCodec.mat(vs), ms)
+				_emit_shaped(tools, cs, _look_of(vs), ms)
+				_emit_snow_fill(tools, cs, CellCodec.snow_fill(vs))
 			# Cap cell (y = h+1): a partial grass lip above the surface on a rising
 			# neighbour (generated, not placed — placed cells are handled by _emit_placed).
-			var vc: int = world.cell_value_at(Vector3i(wx, h + 1, wz))
+			var cc := Vector3i(wx, h + 1, wz)
+			var vc: int = world.cell_value_at(cc)
 			var mc: int = CellCodec.modifier(vc)
 			if mc != 0 and BlockCatalog.solidity_of(CellCodec.mat(vc)) >= 0.5:
-				_emit_shaped(tools, Vector3i(wx, h + 1, wz), CellCodec.mat(vc), mc)
+				_emit_shaped(tools, cc, _look_of(vc), mc)
+				_emit_snow_fill(tools, cc, CellCodec.snow_fill(vc))
+
+# --- stacked snow: cubes + a top LAYER for the accumulated snow above the surface ---
+# SNOW-ACCUMULATION §2.8. Like the sea/ice cells, the accumulated snow cells (SNOW-ACCUMULATION
+# Decision 3) sit ABOVE the solid heightmap top, so they are invisible to _emit_tops/_emit_sides
+# (which skin effective_height). This pass draws them: for each column it scans the bounded band
+# above the surface top (h+1 .. h + SNOW_FILL_MAX_CELLS) and, for every generated snow_block cell,
+# emits a culled CUBE (a full snow cell, modifier 0) or the shared ShapeMesh (a top LAYER / the level-5
+# slab). It reads only the composed cell query (cell_value_at), so it derives from the same resolve_cell
+# output as the module path (the §5.1 parity statement). The surface top quad's z-fight is already
+# suppressed by the capshaped marking (bottom_face_covers(LAYER/cube) == true) in build().
+static func _emit_snow(tools: Dictionary, world: WorldManager, hmap: PackedInt32Array,
+		stride: int, n: int, x0: int, z0: int) -> void:
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+	var max_up := TerrainConfig.SNOW_FILL_MAX_CELLS + 1
+	for lz in n:
+		for lx in n:
+			var h := hmap[(lz + 1) * stride + (lx + 1)]
+			var wx := x0 + lx
+			var wz := z0 + lz
+			for dy in range(1, max_up + 1):
+				var cell := Vector3i(wx, h + dy, wz)
+				var v := world.cell_value_at(cell)
+				if CellCodec.mat(v) != snow_id:
+					continue                              # cap cell / air / handled elsewhere
+				var modifier := CellCodec.modifier(v)
+				if modifier == 0:
+					_emit_cube(tools, world, cell, snow_id)   # a full snow cell (culled faces)
+				else:
+					_emit_shaped(tools, cell, _look_of(v), modifier)   # a top LAYER / slab
+
+# --- snow FILL: the snow LAYER a filled ramp carries (SNOW-ACCUMULATION §2.8) ------
+# A cold ramp surface/lip cell buries its remainder with a flat snow plane at `fill/10`. The fallback
+# dual-emits it as a second ShapeMesh (snow_block LAYER) at the fill level — the fill plane rounds UP to
+# the same curated {3,5,8,10} the module bakes, so BOTH paths show the snow at one height (parity). The
+# snow's portion inside the opaque ramp is hidden interior overdraw (gameplay never reads geometry).
+static func _emit_snow_fill(tools: Dictionary, cell: Vector3i, fill_level: int) -> void:
+	if fill_level <= 0:
+		return
+	var rl := 3 if fill_level <= 3 else (5 if fill_level <= 5 else (8 if fill_level <= 8 else 10))
+	# make_layer(10) == 0 → a full snow cube (the buried case); 5 → the half-slab; 3/8 → thin FAM slabs.
+	_emit_shaped(tools, cell, BlockCatalog.id_of(&"snow_block"), CellCodec.make_layer(rl))
 
 # --- trees: cubes for genuine tree cells overlapping the chunk ------------------
 static func _emit_trees(tools: Dictionary, world: WorldManager,
@@ -368,6 +455,26 @@ const _CUBE_FACES := [
 ]
 
 # --- helpers -------------------------------------------------------------------
+
+## Render LOOK-KEY flag (M1 ADR §5.4): bit 16 of a look key marks a SNOW-CAPPED variant. Distinct
+## from the MATERIAL projection so capped/bare tops never greedy-merge and the commit binds the
+## snow-variant material; AIR/solidity/physics keep reading the material — this key is render-local.
+const _LOOK_SNOW_FLAG := 0x10000
+
+## Render look key for a packed cell value: the material id, or `mat | _LOOK_SNOW_FLAG` when the
+## cell carries the snow_capped state on a cappable material (state_mask_of != 0).
+static func _look_of(v: int) -> int:
+	var m := CellCodec.mat(v)
+	if m != BlockCatalog.AIR and CellCodec.has_state(v, CellCodec.STATE_SNOW_CAPPED) \
+			and BlockCatalog.state_mask_of(m) != 0:
+		return m | _LOOK_SNOW_FLAG
+	return m
+
+## Composed LOOK KEY at (x, y, z); grass fallback when there is no world.
+static func _look_id(world: WorldManager, x: int, y: int, z: int) -> int:
+	if world == null:
+		return BlockCatalog.GRASS
+	return _look_of(world.cell_value_at(Vector3i(x, y, z)))
 
 ## Composed block id at (x, y, z); grass fallback when there is no world.
 static func _cell_id(world: WorldManager, x: int, y: int, z: int) -> int:

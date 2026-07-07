@@ -19,14 +19,23 @@ const _EPS := 1e-6
 ## {verts: PackedVector3Array, normals: PackedVector3Array, uvs: PackedVector2Array,
 ## indices: PackedInt32Array}. FULL (modifier 0) → a unit cube.
 static func build(modifier: int) -> Dictionary:
+	# FAM LAYER (SNOW-ACCUMULATION §1.4): a thin flat slab, BOTTOM-anchored, with all four
+	# corner heights = level/10 — the uniform-height reuse of the corner builder (§3c "a thin-slab
+	# builder — trivial next to the ramp builder"). is_layer FIRST so its FAM modifier never decodes
+	# as corner heights.
+	if CellCodec.is_layer(modifier):
+		var lh := float(CellCodec.layer_level(modifier)) / 10.0
+		return _build_heights(lh, lh, lh, lh, ShapeCodec.ANCHOR_BOTTOM)
+	if CellCodec.is_slope(modifier):
+		return _build_slope(modifier)
 	var c := ShapeCodec.corners(modifier)
 	var anc := ShapeCodec.anchor(modifier)
-	# Corner surface heights in blocks.
-	var h00 := float(c.x) * 0.5
-	var h10 := float(c.y) * 0.5
-	var h11 := float(c.z) * 0.5
-	var h01 := float(c.w) * 0.5
-	var main := (c.x + c.z) >= (c.y + c.w)
+	return _build_heights(float(c.x) * 0.5, float(c.y) * 0.5, float(c.z) * 0.5, float(c.w) * 0.5, anc)
+
+## Build the unit-cell mesh from four BLOCK-height corner surfaces (h00,h10,h11,h01) + anchor —
+## the shared geometry body for both the corner-height family and the uniform FAM LAYER.
+static func _build_heights(h00: float, h10: float, h11: float, h01: float, anc: int) -> Dictionary:
+	var main := (h00 + h11) >= (h10 + h01)
 
 	var arr := {
 		"verts": PackedVector3Array(),
@@ -67,6 +76,64 @@ static func build(modifier: int) -> Dictionary:
 	if anc == ShapeCodec.ANCHOR_TOP:
 		_flip_top(arr)
 	return arr
+
+## Build the unit-cell mesh for a SLOPE modifier (SHARP-SLOPE §2.3): the top surface is exactly
+## ShapeCodec.surface_tris (plateau at y=1 + band on the clipped plane); the bottom face is the
+## {D > 0} clipped polygon at y = 0 (the empty region has no underside); side faces per lateral
+## edge follow the clamped edge profile. Same {verts, normals, uvs, indices} dict.
+static func _build_slope(modifier: int) -> Dictionary:
+	var arr := {
+		"verts": PackedVector3Array(),
+		"normals": PackedVector3Array(),
+		"uvs": PackedVector2Array(),
+		"indices": PackedInt32Array(),
+	}
+	# 1) Top surface (plateau + band), top → (x, z) UVs, from the shared ShapeCodec query.
+	for tri: Dictionary in ShapeCodec.surface_tris(modifier):
+		var a: Vector3 = tri["v0"]
+		var b: Vector3 = tri["v1"]
+		var cc: Vector3 = tri["v2"]
+		_tri(arr, a, b, cc, tri["normal"], _uvxz(a), _uvxz(b), _uvxz(cc))
+	# 2) Bottom face — the {D > 0} clipped polygon at y = 0, normal down.
+	for tri: Dictionary in ShapeCodec.slope_bottom_tris(modifier):
+		var a: Vector3 = tri["v0"]
+		var b: Vector3 = tri["v1"]
+		var cc: Vector3 = tri["v2"]
+		_tri(arr, a, b, cc, Vector3.DOWN, _uvxz(a), _uvxz(b), _uvxz(cc))
+	# 3) Side faces — clamped edge profiles (SHARP-SLOPE §2.3). Heights in blocks, clamped to [0,1].
+	var d := CellCodec.slope_deltas(modifier)
+	var b00 := Vector3(0, 0, 0)
+	var b10 := Vector3(1, 0, 0)
+	var b11 := Vector3(1, 0, 1)
+	var b01 := Vector3(0, 0, 1)
+	_slope_side(arr, b00, b10, float(d.x), float(d.y), Vector3(0, 0, -1))   # −Z: d00,d10
+	_slope_side(arr, b10, b11, float(d.y), float(d.z), Vector3(1, 0, 0))    # +X: d10,d11
+	_slope_side(arr, b11, b01, float(d.z), float(d.w), Vector3(0, 0, 1))    # +Z: d11,d01
+	_slope_side(arr, b01, b00, float(d.w), float(d.x), Vector3(-1, 0, 0))   # −X: d01,d00
+	return arr
+
+## Emit one SLOPE side face: the region under the clamped profile clamp(lerp(ha,hb,t),0,1) along the
+## edge base_a→base_b (y=0). Fans the ≤ 5-vertex polygon (base corners + profile 0/1 knots).
+static func _slope_side(arr: Dictionary, base_a: Vector3, base_b: Vector3, ha: float, hb: float, nrm: Vector3) -> void:
+	var ts: Array = [0.0, 1.0]
+	if absf(hb - ha) > _EPS:
+		for target: float in [0.0, 1.0]:
+			var t := (target - ha) / (hb - ha)
+			if t > _EPS and t < 1.0 - _EPS:
+				ts.append(t)
+	ts.sort()
+	# Ordered boundary loop as [pos, uv=(tangent, y)]: bottom edge a→b, then top profile b→a.
+	var pts: Array = [[base_a, Vector2(0.0, 0.0)], [base_b, Vector2(1.0, 0.0)]]
+	for i in range(ts.size() - 1, -1, -1):
+		var t: float = ts[i]
+		var py := clampf(lerpf(ha, hb, t), 0.0, 1.0)
+		if py <= _EPS:
+			continue
+		pts.append([base_a.lerp(base_b, t) + Vector3(0, 1, 0) * py, Vector2(t, py)])
+	if pts.size() < 3:
+		return
+	for i in range(1, pts.size() - 1):
+		_tri(arr, pts[0][0], pts[i][0], pts[i + 1][0], nrm, pts[0][1], pts[i][1], pts[i + 1][1])
 
 ## Emit one side quad (base_a, base_b at y=0; surf_b, surf_a at the corner heights),
 ## skipping it when the face collapses to a line (both heights ~0).

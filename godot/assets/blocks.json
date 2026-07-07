@@ -50,7 +50,28 @@
       "attachment": 1.0,
       "solidity": 1.0,
       "permeability": 0.2,
-      "translucence": 0.0
+      "translucence": 0.0,
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
+      "transitions": [
+        {
+          "to": "snow_capped",
+          "field": "temperature",
+          "cmp": "<",
+          "threshold": 0.0
+        },
+        {
+          "to": "grass",
+          "field": "temperature",
+          "cmp": ">=",
+          "threshold": 0.0
+        }
+      ]
     },
     {
       "name": "dirt",
@@ -106,7 +127,28 @@
       "attachment": 1.0,
       "solidity": 1.0,
       "permeability": 0.0,
-      "translucence": 0.0
+      "translucence": 0.0,
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
+      "transitions": [
+        {
+          "to": "snow_capped",
+          "field": "temperature",
+          "cmp": "<",
+          "threshold": 0.0
+        },
+        {
+          "to": "stone",
+          "field": "temperature",
+          "cmp": ">=",
+          "threshold": 0.0
+        }
+      ]
     },
     {
       "name": "wood",
@@ -1143,7 +1185,28 @@
         "mode": "opaque",
         "cull_group": 0,
         "emissive": 0.0
-      }
+      },
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
+      "transitions": [
+        {
+          "to": "snow_capped",
+          "field": "temperature",
+          "cmp": "<",
+          "threshold": 0.0
+        },
+        {
+          "to": "podzol",
+          "field": "temperature",
+          "cmp": ">=",
+          "threshold": 0.0
+        }
+      ]
     },
     {
       "name": "mycelium",
@@ -1268,7 +1331,28 @@
         "cull_group": 0,
         "emissive": 0.0
       },
-      "attachment": 0.0
+      "attachment": 0.0,
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
+      "transitions": [
+        {
+          "to": "snow_capped",
+          "field": "temperature",
+          "cmp": "<",
+          "threshold": 0.0
+        },
+        {
+          "to": "sand",
+          "field": "temperature",
+          "cmp": ">=",
+          "threshold": 0.0
+        }
+      ]
     },
     {
       "name": "red_sand",
@@ -1362,6 +1446,13 @@
       "solidity": 1.0,
       "permeability": 0.5,
       "translucence": 0.1,
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
       "render": {
         "mode": "opaque",
         "cull_group": 0,
@@ -1402,6 +1493,7 @@
       "name": "water",
       "id": 44,
       "tier": "world",
+      "liquid_kind": "water",
       "mass": 560.0,
       "swatch": [
         0.247,
@@ -1433,6 +1525,7 @@
       "name": "lava",
       "id": 45,
       "tier": "world",
+      "liquid_kind": "lava",
       "mass": 1540.0,
       "swatch": [
         0.831,

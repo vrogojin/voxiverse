@@ -180,6 +180,10 @@ func _physics_process(delta: float) -> void:
 	var reanchor_shift := world.maybe_reanchor(global_position)
 	if reanchor_shift != Vector3.ZERO:
 		global_position -= reanchor_shift
+	# COSMOS M3 (§4.5): once we cross far enough past a face edge, flip the home face onto the
+	# neighbour and hard-restream. The flip keeps our window position unchanged (no teleport) and
+	# edits are global-keyed, so nothing moves or is lost. Vector3.ZERO/no-op in FLAT_WORLD.
+	world.maybe_flip_home_face(global_position)
 	_push_bodies(delta)
 	_update_aim()
 

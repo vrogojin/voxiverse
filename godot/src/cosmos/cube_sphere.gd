@@ -309,6 +309,50 @@ static func fold_cell(face: int, i: int, j: int, n: int) -> Dictionary:
 		"j": m[2] * i + m[3] * j + t[1],
 	}
 
+## Inverse of the edge unfold: given the HOME face and a TRUE global column `(gface, gi, gj)`
+## on a NEIGHBOUR face, recover the out-of-range home-face window column `(i, j)` that folds to
+## it — the reverse of `fold_cell` for the single-edge strips (§4.3). Returns {found, i, j}. Used
+## to place a neighbour-face edit back into the extended window (render/collider) and by the
+## home-face flip. Only the 4 direct edges of `home_face` are checked (single-axis strips); a
+## corner quadrant (double cover, §5.3 M5) returns found=false. The D4 map has det ±1, so its
+## integer inverse is exact.
+static func unfold_to_window(home_face: int, gface: int, gi: int, gj: int, n: int) -> Dictionary:
+	if gface == home_face:
+		return {"found": true, "i": gi, "j": gj}
+	for side in range(4):
+		var e := edge_remap(home_face, side, n)
+		if int(e["b"]) != gface:
+			continue
+		var m: Array = e["m"]
+		var t: Array = e["t"]
+		var inv := invert_affine(m, t)
+		var im: Array = inv["m"]
+		var it: Array = inv["t"]
+		var wi: int = im[0] * gi + im[1] * gj + it[0]
+		var wj: int = im[2] * gi + im[3] * gj + it[1]
+		# Only accept if the recovered window cell is genuinely in THIS side's out-of-range strip
+		# (so an ambiguous corner cell reachable from two sides is not mis-claimed).
+		var ok := false
+		match side:
+			SIDE_EAST:  ok = wi >= n and wj >= 0 and wj < n
+			SIDE_WEST:  ok = wi < 0 and wj >= 0 and wj < n
+			SIDE_NORTH: ok = wj >= n and wi >= 0 and wi < n
+			_:          ok = wj < 0 and wi >= 0 and wi < n
+		if ok:
+			return {"found": true, "i": wi, "j": wj}
+	return {"found": false, "i": 0, "j": 0}
+
+## Inverse of a 2D integer affine map {m:[a,b,c,d], t:[t0,t1]} with det(m) = ±1 (a D4 element):
+## if (gi,gj) = M·(i,j)+t then (i,j) = M⁻¹·((gi,gj)−t). Exact integers (M⁻¹ = det·adj(M)).
+static func invert_affine(m: Array, t: Array) -> Dictionary:
+	var a: int = m[0]; var b: int = m[1]; var c: int = m[2]; var d: int = m[3]
+	var t0: int = t[0]; var t1: int = t[1]
+	var det: int = a * d - b * c                 # ±1 for a D4 element
+	# For det = ±1, 1/det == det, so M⁻¹ = det · [[d, −b], [−c, a]] is exact-integer.
+	var im: Array = [det * d, -det * b, -det * c, det * a]
+	var it: Array = [-(im[0] * t0 + im[1] * t1), -(im[2] * t0 + im[3] * t1)]
+	return {"m": im, "t": it}
+
 static func _ensure_edge_table(n: int) -> void:
 	if _edge_cache.has(n):
 		return

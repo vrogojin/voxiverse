@@ -273,7 +273,7 @@ func _build_core(center: Vector2i) -> void:
 	var k := 0
 	for dz in range(-CORE_R, CORE_R + 1):
 		for dx in range(-CORE_R, CORE_R + 1):
-			var h := int(TerrainConfig.column_profile(center.x + dx, center.y + dz, _build_pc).x)
+			var h := int(world.col_profile(center.x + dx, center.y + dz, _build_pc).x)
 			hs[k] = h
 			if h < core_min:
 				core_min = h
@@ -335,7 +335,7 @@ func _advance_build(sync: bool) -> void:
 			if _build_i < total:
 				var i := _build_i / span
 				var j := _build_i % span
-				var h := int(TerrainConfig.column_profile(x0 + i, z0 + j, _build_pc).x)
+				var h := int(world.col_profile(x0 + i, z0 + j, _build_pc).x)
 				_build_heights[_build_i] = h
 				if h < _build_min_h:
 					_build_min_h = h
@@ -410,16 +410,17 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 	var run_start := 0x7fffffff
 	# Sub-surface: the heightmap fills every cell up to h; it is air only where dug out (overlay
 	# 0). At the top (y == h) the LIGHT surface_modifier picks up a smoothed ramp/slab WITHOUT the
-	# heavy generated_cell pipeline. Sub-surface generated cells are always full cubes.
+	# heavy generated_cell pipeline. Sub-surface generated cells are always full cubes. COSMOS M3:
+	# overlay + column queries resolve the GLOBAL cell via the world wrappers (curved-render fold).
 	while y <= h:
 		var ov := -1
 		if edited:
-			ov = world.placed_cells().get(Vector3i(x, y, z), -1)
+			ov = world.overlay_at(Vector3i(x, y, z))
 		var modifier := 0
 		if ov > 0:
 			modifier = CellCodec.modifier(ov)
 		elif ov < 0 and y == h:
-			modifier = TerrainConfig.surface_modifier(x, z, _build_pc)
+			modifier = world.col_surface_modifier(x, z, _build_pc)
 		if ov == 0:                                 # dug to air → no box here
 			if run_start != 0x7fffffff:
 				_add_box(bidx, x, z, run_start, y)
@@ -438,7 +439,7 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 	while y <= y_top:
 		var ov := -1
 		if edited:
-			ov = world.placed_cells().get(Vector3i(x, y, z), -1)
+			ov = world.overlay_at(Vector3i(x, y, z))
 		var solid := false
 		var modifier := 0
 		if ov > 0:                                  # placed block (full cube or shaped)
@@ -448,12 +449,12 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 			pass
 		else:                                       # generated cell above the heightmap top
 			if y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
-				modifier = TerrainConfig.surface_cap_modifier(x, z, _build_pc)
+				modifier = world.col_surface_cap_modifier(x, z, _build_pc)
 			if modifier != 0:
 				solid = true                        # smoothed grass cap → prism
 			elif y <= TerrainConfig.SEA_LEVEL:
 				solid = true                        # sea fill (water/ice) → full-cube box
-			elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+			elif world.tree_block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
 				solid = true                        # tree wood/leaf → full-cube box
 		if solid and modifier != 0:
 			if run_start != 0x7fffffff:

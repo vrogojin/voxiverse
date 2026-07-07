@@ -79,6 +79,8 @@ func _ready() -> void:
 	# walks. FLAT_WORLD (the default) leaves `_chart` null → Vector3i keying → byte-identical.
 	if not CubeSphere.FLAT_WORLD:
 		_chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+		TerrainConfig.set_active_face(_chart.face)
+		environment.set_chart(_chart)
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -214,6 +216,26 @@ func placed_top(x: int, z: int) -> int:
 func placed_cells() -> Dictionary:
 	return _edits
 
+## WINDOW-keyed view of the edit overlay (Vector3i window cell → PACKED value) for the fallback
+## mesher (COSMOS M3 §4.3). In FLAT_WORLD / no chart the overlay IS Vector3i-keyed, so this returns
+## it directly (byte-identical, zero copy). In curved mode `_edits` is GLOBAL-int-keyed, so this
+## unfolds each edit's global cell back into the CURRENT window: a home-face cell is (i−i_org, r,
+## j−j_org); a neighbour-face edit in an edge strip is unfolded via CubeSphere.unfold_to_window so a
+## block built just across a seam still renders in the extended window. Edits whose global cell is
+## not reachable in this window (far off-face / corner quadrant) are omitted — they render once the
+## home face flips to their face (hard restream). Built on demand; the mesher already iterates the
+## whole overlay, so this adds no asymptotic cost.
+func placed_cells_window() -> Dictionary:
+	if _chart == null:
+		return _edits
+	var out := {}
+	for k: int in _edits.keys():
+		var g := CubeSphere.unpack_key(k)
+		var w := _chart.window_of_global(int(g["face"]), int(g["i"]), int(g["j"]))
+		if bool(w["found"]):
+			out[Vector3i(int(w["x"]), int(g["r"]), int(w["z"]))] = _edits[k]
+	return out
+
 ## True if column (x, z) has ANY overlay edit (dug or placed) — the collider's fast-path gate
 ## (PERF): an unedited column's overlay is empty, so the collider skips its per-cell scan there.
 func is_edited_column(x: int, z: int) -> bool:
@@ -329,10 +351,58 @@ func _body_home_column(vb: VoxelBody) -> Vector2i:
 ## the way down, this always finds a block — the ground is never hollow. (Ignores
 ## placed blocks ABOVE the heightmap; those are handled by placed_cells/placed_top.)
 func effective_height(x: int, z: int) -> int:
-	var h := TerrainConfig.height_at(x, z)
+	var h := col_height(x, z)
 	while is_removed(Vector3i(x, h, z)):
 		h -= 1
 	return h
+
+# --- COSMOS M3: curved-render integration — window→GLOBAL column projection (§4.3 / M2 follow-up) --
+# The analytic curved-render consumers (the fallback mesher, GroundCollider, PerVoxelEnvironment)
+# read TerrainConfig column functions on WINDOW coordinates. In curved mode a window column is NOT
+# its global column (the floating origin offsets it, and near a seam it folds to a NEIGHBOUR face),
+# so these MUST resolve the GLOBAL cell first or they build/read the wrong column at a non-zero
+# origin. These wrappers fold window (x, z) → global (i_org+x, j_org+z) — the edge fold happens
+# inside TerrainConfig via LatticeNav when the column spills past an edge. FLAT_WORLD / no chart →
+# the direct TerrainConfig call (byte-identical to the pre-M3 flat world).
+
+## Surface height at WINDOW column (x, z), resolved on the GLOBAL cell (folds the origin, and an
+## edge if the column spilled past one). Byte-identical to TerrainConfig.height_at in flat mode.
+func col_height(x: int, z: int) -> int:
+	if _chart == null:
+		return TerrainConfig.height_at(x, z)
+	return TerrainConfig.height_at(_chart.i_org + x, _chart.j_org + z)
+
+## Column profile Vector4(g, biome, c, t) at WINDOW column (x, z), resolved on the GLOBAL cell.
+func col_profile(x: int, z: int, pcache = null) -> Vector4:
+	if _chart == null:
+		return TerrainConfig.column_profile(x, z, pcache)
+	return TerrainConfig.column_profile(_chart.i_org + x, _chart.j_org + z, pcache)
+
+## Smoothing SURFACE modifier at WINDOW column (x, z), resolved on the GLOBAL cell (GroundCollider).
+func col_surface_modifier(x: int, z: int, pcache = null) -> int:
+	if _chart == null:
+		return TerrainConfig.surface_modifier(x, z, pcache)
+	return TerrainConfig.surface_modifier(_chart.i_org + x, _chart.j_org + z, pcache)
+
+## Smoothing CAP modifier at WINDOW column (x, z), resolved on the GLOBAL cell (GroundCollider).
+func col_surface_cap_modifier(x: int, z: int, pcache = null) -> int:
+	if _chart == null:
+		return TerrainConfig.surface_cap_modifier(x, z, pcache)
+	return TerrainConfig.surface_cap_modifier(_chart.i_org + x, _chart.j_org + z, pcache)
+
+## The tree-overlay block at WINDOW cell (x, y, z), resolved on the GLOBAL column. FLAT_WORLD →
+## direct. Curved: keyed on the global (i, j) so the same tree is seen from any window/origin (the
+## across-a-real-3D-seam identity of a tree straddling a face edge is fallback-grade, §4.6).
+func tree_block_at(x: int, y: int, z: int, pcache = null) -> int:
+	if _chart == null:
+		return TreeGen.block_at(x, y, z, pcache)
+	return TreeGen.block_at(_chart.i_org + x, y, _chart.j_org + z, pcache)
+
+## The raw overlay value at WINDOW cell (folds to the global edit key), or −1 if unedited. THE
+## point accessor the collider uses instead of `placed_cells().get(Vector3i, −1)` — that dict is
+## GLOBAL-keyed in curved mode, so a window-Vector3i lookup would always miss (§1.3).
+func overlay_at(cell: Vector3i) -> int:
+	return _edits.get(_edit_key(cell), -1)
 
 ## Break the block at `cell` (terrain, layers, tree cells, placed blocks alike).
 ## Returns the BROKEN BLOCK ID (>0) on success, 0 if the cell was already air.
@@ -523,9 +593,15 @@ func _paint_cell(cell: Vector3i, packed: int) -> void:
 # by the live path). Curved mode installs a chart in _ready; the M2 verify injects one directly.
 
 ## Install (or replace) the floating-origin chart, switching the overlay to GLOBAL-key mode. Public
-## so the M2 verify can exercise the curved store without flipping the FLAT_WORLD const.
+## so the verify suites can exercise the curved store without flipping the FLAT_WORLD const. Keeps
+## TerrainConfig's active face and the per-voxel environment's chart in sync (§4.5 / §6.1) so the
+## analytic curved-render queries fold window→global on the same face the choke points do.
 func install_chart(chart: CosmosChart) -> void:
 	_chart = chart
+	if chart != null:
+		TerrainConfig.set_active_face(chart.face)
+		if environment != null:
+			environment.set_chart(chart)
 
 ## The active chart, or null in FLAT_WORLD. Read-only accessor.
 func chart() -> CosmosChart:
@@ -553,6 +629,44 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 	if _ground != null:
 		_ground.position -= shift
 	return shift
+
+## COSMOS M3 (§4.5): the home-face flip. When the player has crossed FLIP_HYST cells PAST a face
+## edge, re-base the window onto the neighbour face (chart.flip) and HARD-RESTREAM the local region.
+## Returns true iff a flip happened (FLAT_WORLD / no chart / not past an edge → false, a no-op).
+##
+## Teleport-free + edit-preserving BY CONSTRUCTION: chart.flip keeps the player's window position
+## unchanged (its world point is the same global cell), and every edit is GLOBAL-keyed so it is
+## found again by its unchanged key from the new home face. Worldgen determinism holds because a
+## global cell resolves through _curved_profile identically regardless of which window/home face
+## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
+## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
+func maybe_flip_home_face(player_pos: Vector3) -> bool:
+	if _chart == null or not _chart.flip_needed(player_pos):
+		return false
+	var res := _chart.flip(player_pos)
+	if not bool(res["ok"]):
+		return false                                  # corner quadrant — deferred to M5
+	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
+	TerrainConfig.set_active_face(_chart.face)
+	# The window-space collider indices are re-based onto the new face's index map; the simplest
+	# sound thing on a hard restream is to drop them (they refill as the collider rebuilds).
+	_edit_columns = {}
+	_placed_top = {}
+	# HARD RESTREAM: the render nodes carried the old face's content, which no longer matches the
+	# window. Drop + rebuild around the player (fallback fully; module keeps the far-field cover).
+	_restream()
+	print("[WorldManager] home-face flip %d → %d (hard restream)" % [int(res["from_face"]), int(res["to_face"])])
+	return true
+
+## Drop and rebuild the near render + collider after a home-face flip (§4.5 hard restream). Guarded
+## so it is a safe no-op in the headless verify (no streamer / module / collider nodes exist there).
+func _restream() -> void:
+	if _streamer != null and _streamer.has_method("restream"):
+		_streamer.restream()
+	if _module_world != null and _module_world.has_method("restream"):
+		_module_world.call("restream")
+	if _ground != null:
+		_ground.rebuild_now()
 
 ## Re-key the WINDOW-space bookkeeping (which the global-keyed `_edits`/`_meta` are NOT part of) by
 ## −Δ so it stays consistent after an origin shift: a window column (x, z) becomes (x − Δi, z − Δj).

@@ -318,7 +318,7 @@ static func height_at(x: int, z: int) -> int:
 	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
 	# branch entirely, so the flat world is byte-identical.
 	if not CubeSphere.FLAT_WORLD:
-		return int(_curved_profile(CubeSphere.HOME_FACE, x, z).x)
+		return int(_curved_profile(_active_face, x, z).x)
 	var fx := float(x)
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
@@ -369,8 +369,10 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 	_ensure_noise()
 	var prof: Vector4
 	if not CubeSphere.FLAT_WORLD:
-		# COSMOS M1 (§3.5): the face-4 window column (i, j) = (x, z), sampled from 3D noise along d̂.
-		prof = _curved_profile(CubeSphere.HOME_FACE, x, z)
+		# COSMOS M1 (§3.5)/M3 (§4.5): the current home-face window column (i, j) = (x, z), sampled from
+		# 3D noise along d̂. `_active_face` tracks the home face across a flip (§4.5), so the analytic +
+		# main-thread generated queries follow the player onto the neighbour face after a crossing.
+		prof = _curved_profile(_active_face, x, z)
 	else:
 		var fx := float(x)
 		var fz := float(z)
@@ -395,12 +397,38 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 # lattice coords (i, r, j). DETERMINISTIC: a pure function of (SEED, face, i, j) only (no window,
 # no randi/Time). face_cell_to_dir is f64; FastNoiseLite quantizes to f32 internally (§8.2).
 
+# COSMOS M3 (§4.5) — the ACTIVE home face for the 2-arg (x, z) curved queries. The choke point
+# passes the true (folded) face explicitly to _curved_profile/generated_cell_global, but the
+# analytic + main-thread-generated smoothing stencils reach worldgen through the 2-arg height_at/
+# column_profile, which must follow the player when the home face flips (§4.5). WorldManager keeps
+# this in sync with the chart's face (install/flip). FLAT_WORLD never reads it (default HOME_FACE).
+static var _active_face := CubeSphere.HOME_FACE
+
+## The active home face (read-only accessor).
+static func active_face() -> int:
+	return _active_face
+
+## Set the active home face (called by WorldManager on chart install / home-face flip, §4.5). A
+## real change CLEARS the per-column shape memo — its entries are keyed by column (i, j) for ONE
+## face, so a stale face-A entry must not answer a face-B query after the flip (byte-identical
+## behaviour: recomputing against the new face). No-op when the face is unchanged (zero cost).
+static func set_active_face(f: int) -> void:
+	if f == _active_face:
+		return
+	_active_face = f
+	_shape_memo.clear()
+
 ## The per-column profile Vector4(g, biome, c, t) for lattice column (face, i, j) via 3D noise.
+## COSMOS M3 (§4.3/§4.4): the direction is taken through LatticeNav, which FOLDS a column that has
+## spilled past a face edge onto its true neighbour face before sampling d̂ — so a stencil that
+## steps across an edge reads the real across-seam column and worldgen is seam-continuous (no
+## cliff/gap at an edge). In-range (i, j) fold to the identity, so this is byte-identical to the
+## M2 single-face profile there (verify-pinned).
 static func _curved_profile(face: int, i: int, j: int) -> Vector4:
 	_ensure_noise()
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
-	var d: CubeSphere.DVec3 = CubeSphere.face_cell_to_dir(face, float(i), float(j), n)
+	var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)
 	var px := d.x * rr
 	var py := d.y * rr
 	var pz := d.z * rr

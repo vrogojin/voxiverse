@@ -252,11 +252,13 @@ static func _emit_one_tree(tools: Dictionary, world: WorldManager,
 # --- placed blocks: cubes for player-placed edit cells inside the chunk ---------
 static func _emit_placed(tools: Dictionary, world: WorldManager,
 		n: int, x0: int, z0: int) -> void:
-	for cell: Vector3i in world.placed_cells().keys():
-		# placed_cells() values are PACKED cell values. A full cube (modifier 0) emits
-		# the culled cube faces as before; a shaped placed cell (ramp/slab, SVS §4.2)
-		# emits its partial geometry from the shared ShapeMesh instead.
-		var packed: int = world.placed_cells()[cell]
+	# WINDOW-keyed overlay view (COSMOS M3 §4.3): in curved mode `placed_cells()` is GLOBAL-int-
+	# keyed, so iterate the window projection instead (identical to `placed_cells()` in flat mode).
+	var placed := world.placed_cells_window()
+	for cell: Vector3i in placed.keys():
+		# values are PACKED cell values. A full cube (modifier 0) emits the culled cube faces as
+		# before; a shaped placed cell (ramp/slab, SVS §4.2) emits its partial geometry instead.
+		var packed: int = placed[cell]
 		var id: int = CellCodec.mat(packed)
 		if id <= BlockCatalog.AIR:
 			continue

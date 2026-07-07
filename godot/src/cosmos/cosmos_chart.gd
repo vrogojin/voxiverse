@@ -44,29 +44,60 @@ func _init(p_body: String = CubeSphere.HOME_BODY, p_face: int = CubeSphere.HOME_
 	radius = CubeSphere.radius_for(body)
 
 # ---------------------------------------------------------------------------------------
-# The window↔global bijection (§3.1). Identity fold within the home face (M2); M3 adds the
-# edge unfold for cells that spill past a face edge.
+# The window↔global bijection (§3.1/§4.3). Identity fold within the home face; the EDGE UNFOLD
+# (M3, §4.2/§4.3) folds a window cell that spilled past a face edge onto the true neighbour face
+# via CubeSphere.fold_cell, so an edit made just across an edge is found again by its global
+# (neighbour-face) key from a window homed on either side. Corner quadrants (out of range in BOTH
+# axes) are the M5 stub (§5.3): fold_cell returns face −1 there and we fall back to the raw home-
+# face coordinates (deterministic; the corner zone is deep-ocean-masked + edit-locked in M5, so
+# no walk/build ever lands in it) — flagged, not solved here.
 # ---------------------------------------------------------------------------------------
 
-## Window cell → global cell {face, i, j, r}. i = i_org + x, j = j_org + z, r = y.
-func to_global(cell: Vector3i) -> Dictionary:
-	return {"face": face, "i": i_org + cell.x, "j": j_org + cell.z, "r": cell.y}
+## Window column (x, z) → the TRUE global column {face, i, j}, folded across an edge if it spilled
+## past one (§4.3). THE column projection the analytic curved-render callers use to resolve a
+## window position to its global cell. In-range is the identity (home face).
+func to_global_column(x: int, z: int) -> Dictionary:
+	var g := CubeSphere.fold_cell(face, i_org + x, j_org + z, n)
+	if int(g["face"]) < 0:
+		return {"face": face, "i": i_org + x, "j": j_org + z}   # corner quadrant (M5 stub)
+	return g
 
-## Window cell → the 43-bit global edit key (§1.3). O(1); THE key the `_edits` overlay stores in
-## curved mode so an edit is found again by its global identity across any re-anchor / home face.
+## Window cell → global cell {face, i, j, r}. Folds the (i, j) across a face edge (§4.3); r = y is
+## the radial layer (unfolded — the third axis is radial, §3.3).
+func to_global(cell: Vector3i) -> Dictionary:
+	var c := to_global_column(cell.x, cell.z)
+	return {"face": int(c["face"]), "i": int(c["i"]), "j": int(c["j"]), "r": cell.y}
+
+## Window cell → the 43-bit global edit key (§1.3). O(1) on the home face, one table lookup in an
+## edge strip. THE key the `_edits` overlay stores in curved mode so an edit is found again by its
+## global identity across any re-anchor, edge crossing, or home-face flip.
 func to_global_key(cell: Vector3i) -> int:
-	return CubeSphere.edit_key(face, i_org + cell.x, j_org + cell.z, cell.y)
+	var c := to_global_column(cell.x, cell.z)
+	return CubeSphere.edit_key(int(c["face"]), int(c["i"]), int(c["j"]), cell.y)
 
 ## Window cell → the per-(face, region_i, region_j, region_r) region key (§1.3): every cell in one
-## 32³ ZoneChunk region shares it. Extends `region_origin_of` / the ZoneChunk store to the sphere.
+## 32³ ZoneChunk region shares it. Folds across an edge so a region key names the TRUE face.
 func to_region_key(cell: Vector3i) -> int:
-	return CubeSphere.region_key(face, i_org + cell.x, j_org + cell.z, cell.y)
+	var c := to_global_column(cell.x, cell.z)
+	return CubeSphere.region_key(int(c["face"]), int(c["i"]), int(c["j"]), cell.y)
 
-## The exact body-frame world point (f64 DVec3) of a window cell — P = (R + r)·d̂ (§1.2). Used by
-## verify to prove the re-anchor is teleport-free (the world point is invariant across a shift).
+## The exact body-frame world point (f64 DVec3) of a window cell — P = (R + r)·d̂ (§1.2), folded to
+## the true global cell across an edge. Used by verify to prove the re-anchor / home-face flip is
+## teleport-free (the same physical cell has one world point from any window that reaches it).
 func world_point_of(cell: Vector3i) -> CubeSphere.DVec3:
-	return CubeSphere.world_point(face, float(i_org + cell.x), float(j_org + cell.z),
+	var c := to_global_column(cell.x, cell.z)
+	return CubeSphere.world_point(int(c["face"]), float(int(c["i"])), float(int(c["j"])),
 		float(cell.y), float(radius), n)
+
+## Inverse of `to_global_column` for the current window: a TRUE global column {face, i, j} → the
+## window cell (x, z) that reaches it, folding a neighbour-face column back into the extended
+## window (§4.3). Returns {found, x, z}. Used to place a neighbour-face edit into the window-space
+## render/collider views. found=false for a column outside the extended window / a corner quadrant.
+func window_of_global(gface: int, gi: int, gj: int) -> Dictionary:
+	var w := CubeSphere.unfold_to_window(face, gface, gi, gj, n)
+	if not bool(w["found"]):
+		return {"found": false, "x": 0, "z": 0}
+	return {"found": true, "x": int(w["i"]) - i_org, "z": int(w["j"]) - j_org}
 
 # ---------------------------------------------------------------------------------------
 # Re-anchoring — the integer origin shift (§3.2).
@@ -92,3 +123,43 @@ func reanchor(local: Vector3) -> Vector2i:
 	i_org += di
 	j_org += dj
 	return Vector2i(di, dj)
+
+# ---------------------------------------------------------------------------------------
+# The home-face flip (§4.5) — re-basing the window onto the neighbour face after the player
+# crosses an edge. Hysteretic: the flip fires only once the player is FLIP_HYST cells PAST the
+# edge (so oscillating along a seam never flips); flipping back is symmetric because the new home
+# face contains the whole region in range, so the return crossing must again reach FLIP_HYST past.
+# ---------------------------------------------------------------------------------------
+
+## Cells past a face edge the player must travel before the home face flips (§4.5 hysteresis band).
+const FLIP_HYST := 64
+
+## True if the player at window `local` is ≥ FLIP_HYST cells PAST a face edge — i.e. the global
+## column on the current home face has run out of [0, N) by more than the hysteresis (§4.5). The
+## flip is deferred this far so play continues on the extended window across the seam with no event.
+func flip_needed(local: Vector3) -> bool:
+	var gi := i_org + int(floor(local.x))
+	var gj := j_org + int(floor(local.z))
+	return gi >= n + FLIP_HYST or gi < -FLIP_HYST or gj >= n + FLIP_HYST or gj < -FLIP_HYST
+
+## Perform the home-face flip: fold the player's out-of-range global column to the true neighbour
+## face and re-base the window onto it, KEEPING the player's window position unchanged so the world
+## position is continuous (no teleport). Returns {ok, from_face, to_face}. The caller HARD-RESTREAMS
+## the local region (the render nodes carried the old face's content) — edits are global-keyed so
+## they re-materialise unchanged, and a subsequent maybe_reanchor brings the (now large) local band
+## back to origin. A corner quadrant (fold face −1) is refused (M5) → {ok:false}.
+func flip(local: Vector3) -> Dictionary:
+	var wx := int(floor(local.x))
+	var wz := int(floor(local.z))
+	var g := CubeSphere.fold_cell(face, i_org + wx, j_org + wz, n)
+	var b := int(g["face"])
+	if b < 0:
+		return {"ok": false, "from_face": face, "to_face": face}   # corner quadrant — M5
+	var from_face := face
+	# Re-base: window (wx, wz) must map to the same true global cell (b, gi, gj) on the new face, so
+	# the player does not move. On the new home face b the fold is the identity in range, so choosing
+	# i_org' = gi − wx, j_org' = gj − wz makes window (wx, wz) → (b, gi, gj) exactly.
+	face = b
+	i_org = int(g["i"]) - wx
+	j_org = int(g["j"]) - wz
+	return {"ok": true, "from_face": from_face, "to_face": b}

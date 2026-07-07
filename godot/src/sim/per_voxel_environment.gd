@@ -93,13 +93,37 @@ const PRESSURE_KPA := 101.325                       # standard atmosphere
 const EARTH_MAGNETIC := Vector3(0.0, 0.0, 5.0e-5)   # ~50 microtesla
 const GRAVITY := Vector3(0.0, -9.81, 0.0)           # m/s^2, world down
 
+# COSMOS M3 (§4.5 / M2 curved-render follow-up): the floating-origin chart. NULL in FLAT_WORLD →
+# every query below reads TerrainConfig on the WINDOW column directly (byte-identical). Non-null in
+# curved mode (WorldManager injects it on install/flip): `pos` is a WINDOW position, so the surface/
+# climate reads MUST fold the window column → GLOBAL cell (add the origin, fold across an edge) or
+# temperature/light would read the wrong column at a non-zero origin. THE curved-render fix for the
+# per-voxel environment the task calls out.
+var _chart: CosmosChart = null
+
+## Inject (or clear) the floating-origin chart. Called by WorldManager on chart install / flip.
+func set_chart(chart: CosmosChart) -> void:
+	_chart = chart
+
 static func _cell(pos: Vector3) -> Vector3i:
 	return Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))
 
+## Surface height at WINDOW column (x, z), folded to the GLOBAL cell in curved mode (§4.3).
+func _surface_h(x: int, z: int) -> int:
+	if _chart == null:
+		return TerrainConfig.height_at(x, z)
+	return TerrainConfig.height_at(_chart.i_org + x, _chart.j_org + z)
+
+## Climate temperature term (column_profile.w) at WINDOW column (x, z), folded to the GLOBAL cell.
+func _climate_w(x: int, z: int) -> float:
+	if _chart == null:
+		return TerrainConfig.column_profile(x, z).w
+	return TerrainConfig.column_profile(_chart.i_org + x, _chart.j_org + z).w
+
 ## Depth below the surface for a solid cell (0 at top block); -1 if the cell is
-## air (at or above the surface).
-static func _depth(c: Vector3i) -> int:
-	var surface := TerrainConfig.height_at(c.x, c.z)
+## air (at or above the surface). Folds the window column → global cell in curved mode.
+func _depth(c: Vector3i) -> int:
+	var surface := _surface_h(c.x, c.z)
 	if c.y > surface:
 		return -1
 	return surface - c.y
@@ -107,12 +131,12 @@ static func _depth(c: Vector3i) -> int:
 ## Temperature in degrees Celsius at the voxel containing `pos`.
 func temperature(pos: Vector3) -> float:
 	var c := _cell(pos)
-	var surface := TerrainConfig.height_at(c.x, c.z)
+	var surface := _surface_h(c.x, c.z)
 	if c.y > surface:                          # air voxel (incl. water/sea ice above the floor)
 		# Frozen-sea seam: a frozen OCEAN column's sea-level air/ice stays sub-zero so
 		# the brittle-ice structural curve reads the sheet as sound (see const block).
 		if surface < TerrainConfig.SEA_LEVEL and c.y <= TerrainConfig.SEA_LEVEL \
-				and TerrainConfig.column_profile(c.x, c.z).w < CLIMATE_FROZEN:
+				and _climate_w(c.x, c.z) < CLIMATE_FROZEN:
 			return T_FROZEN_SEA
 		return _air_at(float(c.y), float(surface))
 	# Ground: cool 1 C per block down (floored at 3 C), overridden by the geothermal

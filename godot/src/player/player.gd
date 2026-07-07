@@ -57,6 +57,17 @@ var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
 
 func _ready() -> void:
+	# COSMOS M1 (§6.2): per-body gravity feel. `gravity`/`jump_velocity` are Earth-tuned feel
+	# constants (NOT 9.81); on another body they scale by g_body/9.81 so jump height and fall cadence
+	# track real surface gravity while preserving today's Earth feel. The analytic floor/wall/ceiling
+	# queries need NO change — "down" is always −Y in window space (the §3.3 theorem), so the chart is
+	# curved only in the render (§3.4), never in the query space. FLAT_WORLD skips this (byte-identical
+	# flat play); on Earth the factor is exactly 1.0, so a curved Earth keeps today's numbers too.
+	if not CubeSphere.FLAT_WORLD:
+		var s := CubeSphere.SURFACE_GRAVITY / CubeSphere.SURFACE_GRAVITY   # g_body/9.81; Earth = 1.0
+		gravity *= s
+		jump_velocity *= sqrt(s)
+
 	# Build the camera rig in code to keep scenes minimal and robust.
 	_camera = Camera3D.new()
 	_camera.name = "Camera3D"

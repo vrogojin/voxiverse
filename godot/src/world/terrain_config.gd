@@ -314,6 +314,11 @@ static func _height_c(c: float, fx: float, fz: float) -> int:
 ## (PerVoxelEnvironment depth model, effective_height, floor scans, TreeGen).
 static func height_at(x: int, z: int) -> int:
 	_ensure_noise()
+	# COSMOS M1 (§3.5): when the planet is on, (x, z) is the face-4 window column (i, j) and the
+	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
+	# branch entirely, so the flat world is byte-identical.
+	if not CubeSphere.FLAT_WORLD:
+		return int(_curved_profile(CubeSphere.HOME_FACE, x, z).x)
 	var fx := float(x)
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
@@ -362,16 +367,73 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 		if pcache.has(ck):
 			return pcache[ck]
 	_ensure_noise()
-	var fx := float(x)
-	var fz := float(z)
-	var c := _continent.get_noise_2d(fx, fz)
-	var t := _temperature.get_noise_2d(fx, fz)
-	var hh := _humidity.get_noise_2d(fx, fz)
-	var g := _height_c(c, fx, fz)
-	var prof := Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+	var prof: Vector4
+	if not CubeSphere.FLAT_WORLD:
+		# COSMOS M1 (§3.5): the face-4 window column (i, j) = (x, z), sampled from 3D noise along d̂.
+		prof = _curved_profile(CubeSphere.HOME_FACE, x, z)
+	else:
+		var fx := float(x)
+		var fz := float(z)
+		var c := _continent.get_noise_2d(fx, fz)
+		var t := _temperature.get_noise_2d(fx, fz)
+		var hh := _humidity.get_noise_2d(fx, fz)
+		var g := _height_c(c, fx, fz)
+		prof = Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
 	if pcache != null:
 		pcache[Vector2i(x, z)] = prof
 	return prof
+
+# ------------------------------------------------------------------------------
+# COSMOS M1 — the curved face-window worldgen (docs/COSMOS-PLANET-TOPOLOGY.md §3.5). Only ever
+# reached when CubeSphere.FLAT_WORLD is false; the flat path above is untouched (byte-identical).
+#
+# The domain adapter: a lattice column (face, i, j) maps to the unit direction d̂ =
+# face_cell_to_dir(face, i, j) (§1.2), and every get_noise_2d(x, z) becomes get_noise_3d(d̂ · R) —
+# seam-free 3D noise on the sphere (§3.5), sampled at the datum-surface block point R·d̂ so feature
+# sizes match the flat world's per-block frequencies. The result feeds the SAME climate/biome/
+# height pipeline (y ↦ r), so resolve_cell — bedrock, strata, ores, smoothing — is verbatim on the
+# lattice coords (i, r, j). DETERMINISTIC: a pure function of (SEED, face, i, j) only (no window,
+# no randi/Time). face_cell_to_dir is f64; FastNoiseLite quantizes to f32 internally (§8.2).
+
+## The per-column profile Vector4(g, biome, c, t) for lattice column (face, i, j) via 3D noise.
+static func _curved_profile(face: int, i: int, j: int) -> Vector4:
+	_ensure_noise()
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
+	var d: CubeSphere.DVec3 = CubeSphere.face_cell_to_dir(face, float(i), float(j), n)
+	var px := d.x * rr
+	var py := d.y * rr
+	var pz := d.z * rr
+	var c := _continent.get_noise_3d(px, py, pz)
+	var t := _temperature.get_noise_3d(px, py, pz)
+	var hh := _humidity.get_noise_3d(px, py, pz)
+	var g := _height_c3(c, px, py, pz)
+	return Vector4(float(g), float(_biome(c, t, hh, g)), c, t)
+
+## The 3D-noise twin of _height_c (§3.5): identical spline + shelf shaping, sampling hills/detail
+## from get_noise_3d at the sphere point (px, py, pz) instead of get_noise_2d(fx, fz).
+static func _height_c3(c: float, px: float, py: float, pz: float) -> int:
+	var base := BASE_HEIGHT + _continent_offset(c)
+	var hills := _hills.get_noise_3d(px, py, pz) * HILLS_AMPLITUDE
+	var h := base + hills + _detail.get_noise_3d(px, py, pz) * DETAIL_AMPLITUDE
+	var depth := float(SEA_LEVEL) - h
+	var w := clampf(smoothstep(-SHELF_TOP, 0.5, depth) - smoothstep(SHELF_DEPTH - 1.5, SHELF_DEPTH, depth), 0.0, 1.0)
+	if w > 0.0:
+		h = lerp(h, base + hills * SHELF_HILLS_KEEP, w)
+	return int(floor(h))
+
+## THE terrain-function adapter (§3.5): the PACKED generated cell for global lattice cell
+## (face, i, j, r). In FLAT_WORLD mode `to_global` is the identity — window space (x, y, z) =
+## (i, r, j) (§3.1) — so this is byte-identical to generated_cell(i, r, j). In curved mode it
+## resolves the 3D-noise column profile for the given face and runs the verbatim per-cell pipeline
+## on the lattice coords (i, r, j). This is the single choke point COSMOS §3.5 names.
+static func generated_cell_global(face: int, i: int, j: int, r: int) -> int:
+	if CubeSphere.FLAT_WORLD:
+		return generated_cell(i, r, j)
+	if not _ids_ready:
+		_ensure_ids()
+	var p := _curved_profile(face, i, j)
+	return resolve_cell(i, r, j, int(p.x), int(p.y), p.z, p.w)
 
 # ------------------------------------------------------------------------------
 # The composed cell function (WGC §6.2). generated_cell derives the column

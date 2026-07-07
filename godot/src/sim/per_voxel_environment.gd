@@ -141,9 +141,20 @@ func electric_current(_pos: Vector3) -> float:
 func magnetic_field(_pos: Vector3) -> Vector3:
 	return EARTH_MAGNETIC
 
-## Gravity acceleration vector in m/s^2 (stub: uniform world gravity).
-func gravity(_pos: Vector3) -> Vector3:
-	return GRAVITY
+## Gravity acceleration vector in m/s^2 (COSMOS M1 §6.1 — the toward-centre field).
+## FLAT_WORLD (default): the fixed-down stub, byte-identical to today. Curved: the real radial
+## field. In window space its DIRECTION is exactly −Y for every column (the §3.3 y↦r theorem — no
+## per-position tilt on the surface), and its MAGNITUDE is GM/(R+r)² with r = pos.y (y ↦ r), so it
+## is exactly SURFACE_GRAVITY (9.81) at the datum r=0 and falls off with altitude. Implemented as
+## the real field (not a hardcoded −9.81) so it generalises to other bodies/altitudes unchanged.
+func gravity(pos: Vector3) -> Vector3:
+	if CubeSphere.FLAT_WORLD:
+		return GRAVITY
+	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
+	var r := rr + pos.y
+	if r <= 0.0:
+		return GRAVITY
+	return Vector3(0.0, -CubeSphere.gm_for(CubeSphere.HOME_BODY) / (r * r), 0.0)
 
 ## All fields at once, as the dictionary VoxelMaterialDef.resolve_state expects.
 func sample(pos: Vector3) -> Dictionary:

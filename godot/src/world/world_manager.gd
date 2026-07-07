@@ -165,7 +165,14 @@ func cell_solid(cell: Vector3i) -> bool:
 func _occ_span(v: int, fx: float, fz: float) -> Vector2:
 	if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5:   # 1) MATERIAL GATE
 		return Vector2.ZERO
-	return ShapeCodec.span(CellCodec.modifier(v), fx, fz)  # 2) SHAPE (modifier 0 -> (0,1))
+	var sp := ShapeCodec.span(CellCodec.modifier(v), fx, fz)   # 2) SHAPE (modifier 0 -> (0,1))
+	# 3) SNOW FILL (SNOW-ACCUMULATION §2.4): a filled ramp holds snow in its remainder up to the plane
+	# `fill/10`, so the walkable surface is max(terrain shape, snow plane) — the player stands on the
+	# combined surface everywhere by construction (floor_under/blocked/ceiling all compose against this).
+	var fill := CellCodec.snow_fill(v)
+	if fill != 0:
+		return Vector2(0.0, maxf(sp.y, float(fill) / 10.0))
+	return sp
 
 ## True if the cell was dug out (edit overlay says air). Used by fast column loops
 ## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
@@ -315,6 +322,19 @@ func effective_height(x: int, z: int) -> int:
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
 		return 0
+	# Snow first (SNOW-ACCUMULATION §2.5): a snow-FILLED ramp yields its snow BEFORE the terrain
+	# beneath. The first break clears the fill nibble AND the snow_capped skin (the snow is gone) and
+	# returns snow_block; the terrain ramp is re-exposed (still supported → no structural update), and
+	# the NEXT break takes the terrain. Digging thus removes worldgen snow without partial digging (§1.6).
+	var v0: int = cell_value_at(cell)
+	if CellCodec.snow_fill(v0) != 0:
+		var bare := CellCodec.with_snow_fill(v0, 0)
+		bare = CellCodec.with_state(bare, CellCodec.state(bare) & ~CellCodec.STATE_SNOW_CAPPED)
+		_write_cell(cell, bare)
+		wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)
+		if _ground != null:
+			_ground.rebuild_now()
+		return BlockCatalog.id_of(&"snow_block")
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
 	_structural_update(cell, from_pos)  # only from the player break — never a spawn
@@ -744,11 +764,14 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 					cstack.append(nc)
 		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
-			# Strip the liquid overlay (WATER-SHORE §6): a detaching shore ramp must not
-			# take the ocean with it. The liquid axis is worldgen-only; mass/mesh key off
-			# mat/modifier and would ignore the bits, but the contract is "liquid never
-			# leaves worldgen", so we drop it at the VoxelBody capture boundary.
-			comp_ids[c] = CellCodec.strip_liquid(cell_value_at(c))
+			# Strip the liquid overlay (WATER-SHORE §6) AND the snow fill/skin (SNOW-ACCUMULATION §2.5):
+			# a detaching shore/snowy ramp must not take the ocean or a worldgen snow plane with it. Both
+			# the liquid axis and the snow fill are worldgen/sim-owned; mass/mesh key off mat/modifier and
+			# would ignore them, but the contract is "they never leave worldgen", so a detaching filled ramp
+			# falls BARE (the M1 §5.5 accepted class) — dropped at the VoxelBody capture boundary.
+			var cv := CellCodec.strip_liquid(cell_value_at(c))
+			cv = CellCodec.with_snow_fill(cv, 0)
+			comp_ids[c] = CellCodec.with_state(cv, CellCodec.state(cv) & ~CellCodec.STATE_SNOW_CAPPED)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)

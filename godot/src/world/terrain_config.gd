@@ -491,9 +491,10 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 			var cap := _surface_cap(x, z, g, biome, t, pcache)
 			if cap != BlockCatalog.AIR:
 				# _surface_cap emits a smoothing lip (which gains the snow-cap STATE on a cold column).
-				# The lip keeps PRIORITY over snow at g+1 (SNOW-ACCUMULATION §3.3: Phase A2 keeps the dry
-				# lip; the in-ramp fill nibble is Phase B), so snow stacks from g+2 on a capped column.
-				return _with_snow_state(_with_shore_liquid(cap, y, t), g, t)
+				# The lip keeps PRIORITY over snow at g+1 (SNOW-ACCUMULATION §3.3), and Phase B fills the
+				# lip's own remainder with the in-cell snow plane so a capped snowy slope reads continuous
+				# (snow then stacks from g+2). Composed BESIDE _with_snow_state (one regime authority).
+				return _with_lip_snow_fill(_with_snow_state(_with_shore_liquid(cap, y, t), g, t), x, z, g, t, pcache)
 		# Snow accumulation (SNOW-ACCUMULATION Decision 3): on a COLD column the AIR cells above g fill
 		# with snow up to the climate baseline — full snow_block cubes below, one fractional LAYER at the
 		# top. Composed AFTER the cap check (the lip owns g+1) and BEFORE the sea/tree returns.
@@ -524,8 +525,12 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		# Snow-cap STATE (M1 ADR §2.3): composed OUTSIDE _with_shore_liquid on the surface cell.
 		# A cold-enough cappable surface (surface_temperature < 0) gains the snow_capped bit; wet
 		# shore composites and underwater columns are excluded (disjointness), so this is a no-op
-		# for every temperate/wet column (byte-identical state axis).
-		return _with_snow_state(_with_shore_liquid(_smoothed_surface(x, z, g, id, pcache), y, t), g, t)
+		# for every temperate/wet column (byte-identical state axis). Phase B then buries the ramp's
+		# remainder with the snow fill nibble (SNOW-ACCUMULATION §3.1) — closing the A2 lip↔snow gap so
+		# SLOPED cold terrain reads as one continuous snow plane instead of a dry ramp under floating snow.
+		return _with_surface_snow_fill(
+			_with_snow_state(_with_shore_liquid(_smoothed_surface(x, z, g, id, pcache), y, t), g, t),
+			x, z, g, t, pcache)
 	return id
 
 ## Compose the generated-liquid rule (WATER-SHORE §3, MULTI-LIQUID §2.4) onto a SURFACE cell value:
@@ -569,6 +574,33 @@ static func _with_snow_state(v: int, g: int, t: float) -> int:
 	if ClimateModel.surface_temperature(g, t) >= 0.0:
 		return v
 	return CellCodec.with_state(v, CellCodec.STATE_SNOW_CAPPED)
+
+## The SURFACE-cell snow fill (SNOW-ACCUMULATION Decision 2 / §3.1). On a cold column the ramp surface
+## cell is BURIED: the snow plane sits at/above g+1 (the A2 snow surface = g+1 + D/10 ≥ g+1), so the
+## ramp's whole remainder fills with snow (fill 10). This makes the walkable/rendered surface flush with
+## the snow STACK that begins at g+1 — closing the A2 lip↔snow gap — while the snow-capped skin (already
+## composed) shows on the ramp's exposed faces. No-op on a full-cube surface (modifier 0, no remainder;
+## canonical would strip anyway) and on any warm/sea/tree-gated column (D == 0), so the non-snow world
+## stays BYTE-IDENTICAL. canonical() keeps generated == canonical (a fill below the terrain min strips).
+static func _with_surface_snow_fill(v: int, x: int, z: int, g: int, t: float, pcache) -> int:
+	if CellCodec.modifier(v) == 0:
+		return v
+	if _snow_depth(x, z, g, t, pcache) <= 0:
+		return v
+	return CellCodec.canonical(CellCodec.with_snow_fill(v, 10))
+
+## The smoothing-LIP snow fill (SNOW-ACCUMULATION §3.3): a cold lip (the g+1 corner-height cap) fills to
+## the snow plane WITHIN its own cell — min(D, 10) tenths (D = the column snow depth in tenths above g+1)
+## — so a capped snowy slope reads as one continuous plane and the snow stack above the lip starts from
+## g+2. Partial when the snow is thin (the fringe), full (buried) when the plane clears the lip. No-op on
+## a full-cube cap / warm column, and canonical() strips a fill ≤ the lip's own terrain minimum.
+static func _with_lip_snow_fill(v: int, x: int, z: int, g: int, t: float, pcache) -> int:
+	if CellCodec.modifier(v) == 0:
+		return v
+	var d := _snow_depth(x, z, g, t, pcache)
+	if d <= 0:
+		return v
+	return CellCodec.canonical(CellCodec.with_snow_fill(v, mini(d, 10)))
 
 # ------------------------------------------------------------------------------
 # Snow accumulation baseline (SNOW-ACCUMULATION Decision 3). PURE SEED functions: the static snow
@@ -1343,6 +1375,70 @@ static func find_mountains(count: int) -> Array:
 	if out.is_empty():
 		out.append(find_spawn())
 	return out
+
+## The nearest COLD LAND column — the first B_SNOWY surface above the sea, scanned outward from origin
+## with the find_spawn pattern (SNOW-ACCUMULATION §2.7). Its region seeds emitted_cold_pairs() with the
+## snow-fill composite pairs so the module path bakes them (else a filled ramp degrades to the M1 cap
+## skin — never a hole). Setup/verify only (calls column_profile widely); never the voxel worker. Falls
+## back to find_mountains(1)'s peak (always cold above the freeze line) then spawn if no snowy biome.
+static func find_cold() -> Vector2i:
+	_ensure_noise()
+	for radius in range(0, 2048, 4):
+		for a in range(0, 360, 15):
+			var rad := deg_to_rad(float(a))
+			var x := int(round(cos(rad) * float(radius)))
+			var z := int(round(sin(rad) * float(radius)))
+			var p := column_profile(x, z)
+			if int(p.y) == B_SNOWY and int(p.x) >= SEA_LEVEL:
+				return Vector2i(x, z)
+	return find_mountain()
+
+## The sampled set of (surface/cap material, modifier) pairs a SNOW-FILL composite emits over the cold
+## region (SNOW-ACCUMULATION §2.7), each encoded `mat * _SHORE_STRIDE + modifier` (the emitted_shore_pairs
+## slot). Two families over the find_cold() + find_mountains() centres, at every column whose SURFACE is
+## cold (surface_temperature < 0) and above the sea: (1) the buried SURFACE ramp `_biome_top * 256 + sm`
+## (fill 10), (2) the smoothing LIP `_cap_material * 256 + cm` (a corner cap, NOT a LAYER). A deliberate
+## superset/sample — a rare unsampled pair degrades to the M1 snow-cap skin then the dry ramp on the
+## worker (never a hole). Cached statically; main-thread setup/verify only, never the voxel worker.
+static var _cold_pairs_ready := false
+static var _cold_pairs := PackedInt32Array()
+static func emitted_cold_pairs() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()
+	if _cold_pairs_ready:
+		return _cold_pairs
+	_ensure_noise()
+	_ensure_ids()
+	var seen := {}
+	_sample_cold(find_cold(), _EMIT_SAMPLE_R, seen)
+	for mc: Vector2i in find_mountains(6):
+		_sample_cold(mc, _EMIT_SAMPLE_R, seen)
+	var out := PackedInt32Array()
+	for s: int in seen.keys():
+		out.append(s)
+	out.sort()
+	_cold_pairs = out
+	_cold_pairs_ready = true
+	return _cold_pairs
+
+## Accumulate into `seen` every snow-fill composite pair over the (2r+1)² region centred on `center`.
+static func _sample_cold(center: Vector2i, r: int, seen: Dictionary) -> void:
+	for dx in range(-r, r + 1):
+		var x := center.x + dx
+		for dz in range(-r, r + 1):
+			var z := center.y + dz
+			var p := column_profile(x, z)
+			var g := int(p.x)
+			if g < SEA_LEVEL:
+				continue                                  # no snow fill on underwater floors
+			if ClimateModel.surface_temperature(g, p.w) >= 0.0:
+				continue                                  # only cold columns carry the fill
+			var sm := surface_modifier(x, z, {})          # fresh pcache avoids memo pollution
+			if sm != 0:
+				seen[_biome_top(int(p.y), x, z) * _SHORE_STRIDE + sm] = true
+			var cm := surface_cap_modifier(x, z, {})
+			if cm != 0 and not CellCodec.is_layer(cm):     # a corner lip (a LAYER cap is baked in _layer_arid)
+				seen[_cap_material(int(p.y), x, z, p.w, g) * _SHORE_STRIDE + cm] = true
 
 ## Sentinel returned by find_coast_of when no coast of the requested kind is found in range.
 const _COAST_NONE := Vector2i(0x7fffffff, 0x7fffffff)

@@ -103,9 +103,29 @@ const LIQ_KIND_BY_NAME := {&"water": LIQ_WATER, &"lava": LIQ_LAVA}
 ## produces both on one cell); the codec does not forbid the combination.
 const STATE_SNOW_CAPPED := 1                     # bit 0 of STATE (bits 32..47)
 
+## Snow-fill nibble (SNOW-ACCUMULATION Decision 2.2): STATE bits 1..4 = the SNOW_FILL level in tenths
+## (0 = none, 1..10 = the plane height inside a terrain remainder). It rides the STATE axis because the
+## composite's identity IS a state variant (MULTI-MATERIAL §3a). The four bit NAMES on the declaring
+## materials are `snow_fill_b0..b3` (binary weights), with `snow_capped` staying pinned at index 0.
+const STATE_SNOW_FILL_SHIFT := 1                 # bits 1..4 of STATE
+const STATE_SNOW_FILL_MASK := 0xF << STATE_SNOW_FILL_SHIFT
+
 ## STATE-bit name → value map (mirrors LIQ_KIND_BY_NAME). The reverse global shorthand for
 ## worldgen/render; per-material bit MEANING still comes from each material's declared state_layout.
 const STATE_BIT_BY_NAME := {&"snow_capped": STATE_SNOW_CAPPED}
+
+## The snow-fill level (tenths, 0..10) carried by `v` — the plane height inside the cell's terrain
+## remainder (SNOW-ACCUMULATION §2.2). 0 = no fill. Only meaningful on a solid partial (ramp) cell of a
+## declaring material; canonical() strips it everywhere else.
+static func snow_fill(v: int) -> int:
+	return (state(v) >> STATE_SNOW_FILL_SHIFT) & 0xF
+
+## Set the snow-fill level (tenths) of `v`, leaving snow_capped + any other state bits, plus
+## material/modifier/liquid, intact. Route real writes through canonical() (WorldManager._write_cell).
+static func with_snow_fill(v: int, level: int) -> int:
+	var st := state(v) & ~STATE_SNOW_FILL_MASK
+	st |= (clampi(level, 0, 15) & 0xF) << STATE_SNOW_FILL_SHIFT
+	return with_state(v, st)
 
 ## The 16-bit STATE field (bits 32..47) of a packed cell.
 const STATE_MASK := 0xFFFF
@@ -192,7 +212,8 @@ static func canonical(v: int) -> int:
 		return 0                              # empty FAM LAYER (level 0) → AIR
 	if cm != 0 and (cm & MOD_FAM_BIT) == 0 and (cm & MOD_CORNERS_MASK) == 0:
 		return 0
-	return pack(m, cm, _validate_state(m, state(v)), _canonical_liquid(m, cm, liquid_field(v)))
+	return pack(m, cm, _canonical_snow_fill(m, cm, _validate_state(m, state(v))),
+		_canonical_liquid(m, cm, liquid_field(v)))
 
 ## Corner-height canonicalization (VOXEL-DATA-STRUCTURE §3.2 / SUB-VOXEL §3.1), the
 ## packing half of the split `ShapeCodec` (VDS §13.1.2). Guarantees each geometric
@@ -249,6 +270,35 @@ static func _validate_state(material: int, state_bits: int) -> int:
 	if state_bits == 0:
 		return 0
 	return state_bits & BlockCatalog.state_mask_of(material)
+
+## Snow-fill canonicalization (SNOW-ACCUMULATION §2.3), mirroring `_canonical_liquid` rule-for-rule.
+## Takes the cell's material, its ALREADY-canonicalized modifier, and the ALREADY-validated STATE
+## bits; returns the canonical STATE (the fill nibble adjusted, other state bits untouched). A stripped
+## fill is simply "absent" (0 in the nibble); a genuine violation logs. The fill can ONLY sit on a
+## SOLID PARTIAL (corner-height ramp) cell — never on air (canonical() zeroed it), non-solid, a full
+## cube (no remainder), or a LAYER (snow-on-snow is just a higher level, Decision 4 owns it).
+static func _canonical_snow_fill(material: int, canonical_mod: int, state_bits: int) -> int:
+	var fill := (state_bits >> STATE_SNOW_FILL_SHIFT) & 0xF
+	if fill == 0:
+		return state_bits                         # rule 1: absent
+	var stripped := state_bits & ~STATE_SNOW_FILL_MASK
+	if BlockCatalog.solidity_of(material) < 0.5:
+		return stripped                           # rule 3: no snow-filled water
+	if canonical_mod == 0:
+		return stripped                           # rule 4: a full cube has no remainder to fill
+	if (canonical_mod & MOD_FAM_BIT) != 0:
+		return stripped                           # rule 5: fill on a LAYER — snow-on-snow, not a fill
+	# rule 6: a plane at/below the terrain minimum everywhere adds nothing (corner half-units → 5 tenths).
+	if fill <= 5 * _min_corner(canonical_mod):
+		return stripped
+	if fill > 10:
+		return (state_bits & ~STATE_SNOW_FILL_MASK) | (10 << STATE_SNOW_FILL_SHIFT)   # rule 2: clamp
+	return state_bits
+
+## The smallest of a corner-height modifier's four 2-bit corners (half-block units 0..2) — the terrain
+## minimum used by `_canonical_snow_fill` rule 6. `canonical_mod` is a non-zero, non-FAM modifier.
+static func _min_corner(m: int) -> int:
+	return mini(mini(m & 3, (m >> 2) & 3), mini((m >> 4) & 3, (m >> 6) & 3))
 
 ## Liquid-axis canonicalization (WATER-SHORE §2.3). Takes the cell's material, its
 ## ALREADY-canonicalized modifier, and the raw 6-bit liquid field; returns the canonical

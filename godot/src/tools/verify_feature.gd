@@ -3217,11 +3217,12 @@ func _test_metadata() -> void:
 	_ok(not BlockCatalog.has_block_entity(BE), "has_block_entity is false for shipped materials (default)")
 	st.has_block_entity = true
 	_ok(BlockCatalog.has_block_entity(BE), "has_block_entity true after the flag is set")
-	# M1 retarget (ADR §1.5): stone is now a cappable material with a 1-bit state_layout, but this
-	# test exercises the STATE AXIS generically with value 5 (0b101). Widen stone's mask to ≥3 bits
-	# FOR THIS TEST so 5 stays legal through _validate_state (retarget the sweep, don't weaken it).
+	# SNOW-ACCUMULATION retarget: stone now declares snow_capped(bit0)+snow_fill(bits1..4), so a generic
+	# STATE value must avoid the fill nibble (canonical strips a fill on a full cube). Use 0x21 (bit 0 +
+	# bit 5) and widen stone's mask to permit it, so the value stays legal through _validate_state AND
+	# survives _canonical_snow_fill (fill nibble == 0) — retarget the sweep, don't weaken it.
 	var prev_mask := BlockCatalog.state_mask_of(BE)
-	BlockCatalog._state_mask[BE] = 0x7
+	BlockCatalog._state_mask[BE] = 0x21
 
 	# (d) metadata on a NON-block-entity material is rejected, writes nothing.
 	_ok(world.place_block(cell, GRASS), "place a grass cell (non block-entity)")
@@ -3256,8 +3257,8 @@ func _test_metadata() -> void:
 	# (f) set_state round-trips through the state projection + canonical, and PRESERVES
 	# metadata (the one write that does) with no orphan.
 	orphans.clear()
-	_ok(world.set_state(cell, 5), "set_state succeeds on the block-entity cell")
-	_ok(CellCodec.state(world.cell_value_at(cell)) == 5, "state axis reads back 5 (projection + canonical)")
+	_ok(world.set_state(cell, 0x21), "set_state succeeds on the block-entity cell")
+	_ok(CellCodec.state(world.cell_value_at(cell)) == 0x21, "state axis reads back 0x21 (projection + canonical)")
 	_ok(world.block_id_at(cell) == BE, "set_state left the material projection unchanged")
 	_ok(world.get_metadata(cell) == doc, "set_state KEPT the metadata (preserving write)")
 	_ok(orphans.is_empty(), "set_state fired NO orphan signal")
@@ -3431,10 +3432,10 @@ func _test_zonechunk() -> void:
 	var be_state: VoxelState = BlockCatalog.state_of(BE)
 	var prev_be := be_state.has_block_entity
 	be_state.has_block_entity = true
-	# M1 retarget (ADR §1.5): widen stone's 1-bit state mask so this state-axis test's value 5 stays
-	# legal through _validate_state; restored below with prev_be.
+	# SNOW-ACCUMULATION retarget: use a state value (0x21) outside the snow_fill nibble so it survives
+	# canonical on a full cube; widen stone's mask to permit it. Restored below with prev_be.
 	var prev_be_mask := BlockCatalog.state_mask_of(BE)
-	BlockCatalog._state_mask[BE] = 0x7
+	BlockCatalog._state_mask[BE] = 0x21
 
 	var w1 := _struct_world("P6bSave")
 	var c_cube := Vector3i(px, pg + 1, pz)               # rests on the grass surface
@@ -3442,7 +3443,7 @@ func _test_zonechunk() -> void:
 	var c_be := Vector3i(px, pg + 3, pz)                 # block-entity cell on top
 	_ok(w1.place_block(c_cube, CellCodec.pack(STONE)), "live save: place a full cube (supported)")
 	_ok(w1.place_block(c_ramp, CellCodec.pack(GRASS, RAMP)), "live save: place a shaped ramp on top")
-	_ok(w1.set_state(c_cube, 5), "live save: set a state on the cube cell")
+	_ok(w1.set_state(c_cube, 0x21), "live save: set a state on the cube cell")
 	_ok(w1.place_block(c_be, CellCodec.pack(BE)), "live save: place the block-entity cell")
 	var live_doc := {"label": "furnace", "lit": true, "progress": 0.75}
 	_ok(w1.set_metadata(c_be, live_doc), "live save: attach metadata to the block-entity cell")
@@ -3466,8 +3467,8 @@ func _test_zonechunk() -> void:
 		if w2.cell_value_at(c) != w1.cell_value_at(c):
 			fidelity_ok = false
 	_ok(fidelity_ok, "live save/load: every edited cell's packed value (mat|modifier|state) restored exactly")
-	_ok(CellCodec.mat(w2.cell_value_at(c_cube)) == STONE and CellCodec.state(w2.cell_value_at(c_cube)) == 5,
-		"live save/load: the state axis survived the round-trip (stone, state 5)")
+	_ok(CellCodec.mat(w2.cell_value_at(c_cube)) == STONE and CellCodec.state(w2.cell_value_at(c_cube)) == 0x21,
+		"live save/load: the state axis survived the round-trip (stone, state 0x21)")
 	_ok(CellCodec.modifier(w2.cell_value_at(c_ramp)) == RAMP,
 		"live save/load: the shaped ramp modifier survived the round-trip")
 	_ok(w2.has_metadata(c_be) and w2.get_metadata(c_be) == _json_norm(live_doc),
@@ -4143,11 +4144,15 @@ func _test_snowy_world() -> void:
 	_ok(not ShapeCodec.bottom_face_covers(ShapeCodec.make_modifier(1, 1, 1, 1, ShapeCodec.ANCHOR_TOP)),
 		"bottom_face_covers: top-anchored cap does NOT cover the floor")
 	var gdef := BlockCatalog.def_of(GRASS)
-	_ok(gdef != null and gdef.state_layout.size() == 1 and gdef.state_layout[0] == &"snow_capped",
-		"grass.state_layout[0] == &\"snow_capped\"")
-	_ok(BlockCatalog.state_mask_of(GRASS) == 1 and BlockCatalog.state_mask_of(PODZOL) == 1
-		and BlockCatalog.state_mask_of(SAND) == 1 and BlockCatalog.state_mask_of(STONE) == 1,
-		"grass/podzol/sand/stone each declare the 1-bit snow_capped mask")
+	# SNOW-ACCUMULATION §2.2: the fill-capable set now declares 5 STATE bits — snow_capped (still pinned
+	# at index 0, the M1 global shorthand) + snow_fill_b0..b3 (the composite fill nibble, bits 1..4).
+	_ok(gdef != null and gdef.state_layout.size() == 5 and gdef.state_layout[0] == &"snow_capped"
+		and gdef.state_layout[1] == &"snow_fill_b0" and gdef.state_layout[4] == &"snow_fill_b3",
+		"grass.state_layout == [snow_capped, snow_fill_b0..b3] (snow_capped stays index 0)")
+	_ok(BlockCatalog.state_mask_of(GRASS) == 0x1F and BlockCatalog.state_mask_of(PODZOL) == 0x1F
+		and BlockCatalog.state_mask_of(SAND) == 0x1F and BlockCatalog.state_mask_of(STONE) == 0x1F
+		and BlockCatalog.state_mask_of(BlockCatalog.id_of(&"snow_block")) == 0x1F,
+		"grass/podzol/sand/stone/snow_block each declare the 5-bit snow_capped+snow_fill mask (0x1F)")
 	_ok(BlockCatalog.state_mask_of(DIRT) == 0 and BlockCatalog.state_mask_of(WATER) == 0
 		and BlockCatalog.state_mask_of(BlockCatalog.AIR) == 0,
 		"dirt/water/air declare no state (mask 0)")
@@ -4177,8 +4182,9 @@ func _test_snowy_world() -> void:
 	# placeholder permissiveness (ADR §8 item 2): an UNRESOLVED placeholder keeps its bits.
 	var ph := BlockCatalog.register_placeholder(&"sha256:snowyworldphantom", &"phantom")
 	_ok(BlockCatalog.state_mask_of(ph) == 0xFFFF, "UNRESOLVED placeholder mask is permissive (0xFFFF)")
-	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(ph, 0, 5))) == 5,
-		"placeholder keeps its state bits through canonical (RMS §8 lossless)")
+	# 0x21 (bit 0 + bit 5) avoids the snow_fill nibble (bits 1..4), which canonical strips on a full cube.
+	_ok(CellCodec.state(CellCodec.canonical(CellCodec.pack(ph, 0, 0x21))) == 0x21,
+		"placeholder keeps its (non-fill) state bits through canonical (RMS §8 lossless)")
 	# ClimateModel constants.
 	_ok(absf(ClimateModel.surface_temperature(0, 0.0) - 21.5) < 1e-4, "surface_temperature(0, 0.0) == 21.5")
 	_ok(absf(ClimateModel.surface_temperature(96, 0.0)) < 1e-3, "surface_temperature(96, 0.0) == 0 (±ε)")

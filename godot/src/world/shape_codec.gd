@@ -128,6 +128,26 @@ static func volume(m: int) -> float:
 	var sb := c.y + c.w          # c10 + c01
 	return float(2 * maxi(sa, sb) + mini(sa, sb)) / 12.0
 
+## Snow-fill volume (SNOW-ACCUMULATION §2.5): the fraction of the cell filled by a flat snow plane at
+## height `level/10` sitting ABOVE the terrain shape `m` — i.e. ∫∫ max(0, s − H(fx,fz)) over the unit
+## footprint, the positive part of the plane-minus-ramp integral. `break_terrain` yields `280·this`
+## kg of snow. Deterministic numeric quadrature (a fixed grid); precision is cosmetic, but the sign and
+## monotonicity in `level` are exact (verify pins it against a Monte-Carlo sample). FULL cube / LAYER →
+## 0 (no terrain remainder to fill; snow-on-snow is Decision 4's business).
+static func fill_volume(m: int, level: int) -> float:
+	var s := float(clampi(level, 0, 10)) / 10.0
+	if m == 0 or CellCodec.is_layer(m):
+		return 0.0
+	const N := 16
+	var cell := 1.0 / float(N)
+	var vol := 0.0
+	for i in N:
+		var fx := (float(i) + 0.5) * cell
+		for j in N:
+			var fz := (float(j) + 0.5) * cell
+			vol += maxf(0.0, s - height_at(m, fx, fz))
+	return vol * cell * cell
+
 ## Fill fraction for a FIXED diagonal (main = the (0,0)-(1,1) split), NOT the max-sum
 ## rule — `V_main = (2·sA + sB)/12`. Exists so verify can fence the §6 complement
 ## invariant `V_D(c) + V_D(2−c) = 1` (which holds only per fixed diagonal).

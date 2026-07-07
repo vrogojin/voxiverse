@@ -4553,6 +4553,36 @@ func _test_sharp_slope_worldgen() -> void:
 				no_hole = false
 	_ok(no_hole, "slope-gen: slope columns are gap-free (solid below the run, material through it)")
 
+	# (memo-safety + broad no-hole) WIDE scan: EVERY firing column across a large mountain patch must
+	# keep Tw−g ∈ [−3,+4] (the memo's 4-bit codes are exact — no spike/pit corruption) AND be solid
+	# from below the run up through it (no carved-away hole). Guards the lone-spike failure class.
+	var memo_range_ok := true
+	var wide_no_hole := true
+	var wide_fires := 0
+	for dz in range(-60, 60):
+		for dx in range(-60, 60):
+			var x := mtn.x + dx
+			var z := mtn.y + dz
+			var run := TerrainConfig.slope_run_of(x, z)
+			if not TerrainConfig.slope_run_fires(run):
+				continue
+			wide_fires += 1
+			var g: int = TerrainConfig.height_at(x, z)
+			var rng := TerrainConfig.slope_run_range(run, g)
+			if rng.x < g - 3 or rng.y > g + 4 or rng.y <= rng.x:
+				memo_range_ok = false
+			# memo (analytic) run must equal worker-direct run (no divergence anywhere in the patch)
+			if TerrainConfig.slope_run_of(x, z, {}) != run:
+				memo_range_ok = false
+			if CellCodec.mat(TerrainConfig.generated_cell(x, rng.x - 1, z)) == BlockCatalog.AIR:
+				wide_no_hole = false
+			for y in range(rng.x, rng.y):
+				if CellCodec.mat(TerrainConfig.generated_cell(x, y, z)) == BlockCatalog.AIR:
+					wide_no_hole = false
+	_ok(wide_fires > 0, "slope-gen: wide mountain scan found %d firing columns" % wide_fires)
+	_ok(memo_range_ok, "slope-gen: every firing column keeps Tw−g ∈ [−3,+4] AND memo == worker run (no spike corruption)")
+	_ok(wide_no_hole, "slope-gen: no carved-away holes across the wide mountain scan")
+
 	# (4) THE generalized collider contract: generated_modifier_at == modifier(generated_cell) for
 	# y ∈ [g−4, g+4], memo (analytic) == worker-direct ({}) — over the mountain sweep.
 	var gma_ok := true

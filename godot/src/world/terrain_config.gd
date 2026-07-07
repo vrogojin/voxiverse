@@ -707,7 +707,14 @@ static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 	var tw1 := roundi(raw.y)
 	var tw2 := roundi(raw.z)
 	var tw3 := roundi(raw.w)
-	return maxi(maxi(tw0, tw1), maxi(tw2, tw3)) - mini(mini(tw0, tw1), mini(tw2, tw3)) <= SLOPE_MAX_SPREAD
+	var lo := mini(mini(tw0, tw1), mini(tw2, tw3))
+	var hi := maxi(maxi(tw0, tw1), maxi(tw2, tw3))
+	if hi - lo < 1 or hi - lo > SLOPE_MAX_SPREAD:
+		return false                                  # a flat plane (nothing to grade) OR too steep (cliff)
+	# The run [lo, hi−1] must stay within [g−3, g+4] so (a) the memo's 4-bit (Tw−g) codes are EXACT
+	# and (b) a lone spike/pit whose smoothed plane is far from its own surface falls back to legacy
+	# saturation (a full cube) — never carved down into a hole. Steeper relief stays a blocky cliff.
+	return lo >= g - SLOPE_MAX_SPREAD and hi <= g + SLOPE_MAX_SPREAD + 1
 
 ## The four WHOLE-block corner targets Tw of a firing SLOPE column (call only when _slope_fires_only).
 static func _slope_whole_targets(x: int, z: int, pcache) -> Vector4i:

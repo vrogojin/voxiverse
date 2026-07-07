@@ -48,10 +48,16 @@ server {
         expires -1;
     }
 
-    # Immutable-ish engine assets: cache hard. Godot exports use stable names,
-    # so we key cache-busting on redeploys via the short HTML TTL above.
+    # Engine assets: Godot exports use STABLE names (index.pck / index.wasm), so a 30-day cache
+    # made browsers serve a STALE build after every redeploy (the URL never changes, only the bytes)
+    # — fatal for the review workflow. Use no-cache = "cache but REVALIDATE": the browser sends a
+    # conditional request keyed on the etag/last-modified, so an unchanged 44 MB wasm returns a tiny
+    # 304 (fast, reused from cache) while a redeployed asset returns 200 with the fresh bytes.
+    # NOTE: use ONLY `expires` here (it sets Cache-Control: no-cache directly). Do NOT add an
+    # `add_header` in this location — a location-level add_header CLEARS the inherited server-scope
+    # COOP/COEP headers, which would kill SharedArrayBuffer/crossOriginIsolated and blank the page.
     location ~* \.(wasm|pck|js|mjs|worker\.js|audio\.worklet\.js|png|jpg|jpeg|svg|webp|ico|ttf|woff2?)$ {
-        expires 30d;
+        expires -1;
         try_files $uri =404;
     }
 

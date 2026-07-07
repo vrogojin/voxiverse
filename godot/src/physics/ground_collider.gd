@@ -416,9 +416,13 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 	var s_depth := ((snow >> 4) & 0xF) * 10 + (snow & 0xF)   # D in tenths (0 = no snow)
 	var s_capped := (snow >> 8) & 1                          # a smoothing lip owns g+1 (snow from g+2)
 	var run_start := 0x7fffffff
+	# SHARP-SLOPE §3.6: fetch the column's packed SLOPE run ONCE (0 = no run) so per-cell modifiers
+	# derive by arithmetic (slope_run_modifier_at) — no per-cell generated_cell OR light-query storm.
+	var srun := TerrainConfig.slope_run_of(x, z, _build_pc)
 	# Sub-surface: the heightmap fills every cell up to h; it is air only where dug out (overlay
 	# 0). At the top (y == h) the LIGHT surface_modifier picks up a smoothed ramp/slab WITHOUT the
-	# heavy generated_cell pipeline. Sub-surface generated cells are always full cubes.
+	# heavy generated_cell pipeline. A slope column instead carves a run of shaped cells here (which
+	# can start BELOW h). Sub-surface generated cells outside the run are always full cubes.
 	while y <= h:
 		var ov := -1
 		if edited:
@@ -426,6 +430,8 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		var modifier := 0
 		if ov > 0:
 			modifier = CellCodec.modifier(ov)
+		elif ov < 0 and srun != 0:
+			modifier = TerrainConfig.slope_run_modifier_at(srun, h, y)   # run cell (0 = full below run)
 		elif ov < 0 and y == h:
 			modifier = TerrainConfig.surface_modifier(x, z, _build_pc)
 			if modifier != 0 and s_depth > 0:
@@ -460,38 +466,51 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		elif ov == 0:                               # dug to air
 			pass
 		else:                                       # generated cell above the heightmap top
-			# Snow accumulation cell? The lip (if any) owns g+1, so exclude it from the snow plane there.
-			var remaining := -1
-			if s_depth > 0 and h >= TerrainConfig.SEA_LEVEL and not (s_capped == 1 and y == h + 1):
-				remaining = s_depth - (y - (h + 1)) * 10
-			if remaining >= 10:
-				solid = true                        # a full snow cube → box run
-			elif remaining >= 1:
-				solid = true
-				modifier = CellCodec.make_layer(remaining)   # the fractional top LAYER → prism
-			elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
-				var lip := TerrainConfig.surface_cap_modifier(x, z, _build_pc)
-				if lip != 0:
-					solid = true                    # smoothed grass cap lip
-					if s_depth > 0:
-						# The lip fills to its snow plane min(D,10) (SNOW-ACCUMULATION §3.3): BURIED (fill 10)
-						# → a FULL cell; partial → the lip ramp prisms PLUS the snow LAYER prisms.
-						var lf := mini(s_depth, 10)
-						if lf >= 10:
-							modifier = 0             # buried lip → FULL cell (box run)
+			if srun != 0:
+				# SHARP-SLOPE: a steep column's slope RUN [lo, hi−1] plus the full-solid interior BELOW it
+				# (y < lo). Every cell up to hi−1 is solid (a slope prism where shaped, else a full cube);
+				# above the run (y ≥ hi) falls to sea fill / the tree overlay — matching resolve_cell.
+				var rr := TerrainConfig.slope_run_range(srun, h)
+				if y < rr.y:
+					solid = true
+					modifier = TerrainConfig.slope_run_modifier_at(srun, h, y)   # slope cap cell (0 = full cube below/within)
+				elif y <= TerrainConfig.SEA_LEVEL:
+					solid = true                        # sea fill above the run
+				elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+					solid = true                        # tree above the run
+			else:
+				# Snow accumulation cell? The lip (if any) owns g+1, so exclude it from the snow plane there.
+				var remaining := -1
+				if s_depth > 0 and h >= TerrainConfig.SEA_LEVEL and not (s_capped == 1 and y == h + 1):
+					remaining = s_depth - (y - (h + 1)) * 10
+				if remaining >= 10:
+					solid = true                        # a full snow cube → box run
+				elif remaining >= 1:
+					solid = true
+					modifier = CellCodec.make_layer(remaining)   # the fractional top LAYER → prism
+				elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
+					var lip := TerrainConfig.surface_cap_modifier(x, z, _build_pc)
+					if lip != 0:
+						solid = true                    # smoothed grass cap lip
+						if s_depth > 0:
+							# The lip fills to its snow plane min(D,10) (SNOW-ACCUMULATION §3.3): BURIED (fill 10)
+							# → a FULL cell; partial → the lip ramp prisms PLUS the snow LAYER prisms.
+							var lf := mini(s_depth, 10)
+							if lf >= 10:
+								modifier = 0             # buried lip → FULL cell (box run)
+							else:
+								modifier = lip
+								snow_fill_mod = CellCodec.make_layer(lf)
 						else:
 							modifier = lip
-							snow_fill_mod = CellCodec.make_layer(lf)
-					else:
-						modifier = lip
+					elif y <= TerrainConfig.SEA_LEVEL:
+						solid = true                    # sea fill (water/ice) → full-cube box
+					elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+						solid = true                    # tree wood/leaf → full-cube box
 				elif y <= TerrainConfig.SEA_LEVEL:
-					solid = true                    # sea fill (water/ice) → full-cube box
+					solid = true                        # sea fill (water/ice) → full-cube box
 				elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
-					solid = true                    # tree wood/leaf → full-cube box
-			elif y <= TerrainConfig.SEA_LEVEL:
-				solid = true                        # sea fill (water/ice) → full-cube box
-			elif TreeGen.block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
-				solid = true                        # tree wood/leaf → full-cube box
+					solid = true                        # tree wood/leaf → full-cube box
 		if solid and modifier != 0:
 			if run_start != 0x7fffffff:
 				_add_box(bidx, x, z, run_start, y)

@@ -83,6 +83,15 @@ var _comp_arid_l5: PackedInt32Array
 var _comp_arid_l8: PackedInt32Array
 var _comp_arid_l10: PackedInt32Array
 const _COMP_MESH_FLAG := 1 << 22         # _shape_mesh_cache key bit for snow-fill composite meshes
+# --- SHARP-SLOPE dedicated frozen tables (SHARP-SLOPE §4.1) ----------------------
+# FAM SLOPE modifiers are >= 0x8000 so they can NEVER slot the 256-stride _gen_arid table; a dense
+# per-family stride (the 12-bit payload) is cheap (~count()×4096×4B ≈ 1.2 MB each). Baked + FROZEN at
+# setup over emitted_slope_pairs(); -1 (unbaked) → plain cube fallback on the worker (never a hole).
+# The snow twin reuses the SAME per-payload ArrayMesh (BlockMaterials.snow_capped_for override, zero
+# extra GPU readbacks), the _snow_arid discipline.
+const _SLOPE_STRIDE := 4096
+var _slope_arid: PackedInt32Array        # (mat*_SLOPE_STRIDE + payload) -> ARID; -1 = not baked; frozen at setup
+var _snow_slope_arid: PackedInt32Array   # (mat*_SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
@@ -354,6 +363,19 @@ func arid_for_cell(packed: int) -> int:
 			var ca := _comp_arid_of(CellCodec.mat(packed), CellCodec.modifier(packed), ffill)
 			if ca >= 0:
 				return ca
+	# SHARP-SLOPE (§4.2): a generated SLOPE cell (FAM bit 15, land-only so lf==0) resolves through the
+	# dedicated frozen slope tables — the snow-capped twin when capped, else the dry slope model; an
+	# unbaked payload falls through to arid_for → plain cube (wrong silhouette, right substance).
+	if lf == 0 and CellCodec.is_slope(CellCodec.modifier(packed)):
+		var pmat := CellCodec.mat(packed)
+		var payload := CellCodec.modifier(packed) & 0xFFF
+		var pslot := pmat * _SLOPE_STRIDE + payload
+		if CellCodec.has_state(packed, CellCodec.STATE_SNOW_CAPPED) \
+				and pslot < _snow_slope_arid.size() and _snow_slope_arid[pslot] >= 0:
+			return _snow_slope_arid[pslot]
+		if pslot < _slope_arid.size() and _slope_arid[pslot] >= 0:
+			return _slope_arid[pslot]
+		# else fall through to arid_for (lazy placement path / cube fallback)
 	# Snow-cap state variant (M1 ADR §5.2): a capped cell (state bit set, no liquid — liquid wins if
 	# both ever coexist) resolves to its frozen snow-variant ARID; an unbaked (mat, modifier) snow
 	# slot falls through to the plain look (a bare cap, wrong skin but correct substance, never a hole).
@@ -515,16 +537,21 @@ func _build_gen_manifest(library: Object) -> void:
 	# terrain ramp buried/filled by the snow plane, at levels {3,5,8,10} — the largest bake line item.
 	var comps := _build_comp_manifest(library, total)
 	appended += comps
+	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
+	var slope := _build_slope_manifest(library, total)
+	appended += slope
 
 	if appended > 0 and library.has_method("bake"):
-		library.call("bake")                             # one batched bake: dry shapes + water + snow models
+		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
-		% [appended - wet - snow - layers, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
+		% [appended - wet - snow - layers - comps - slope, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
 	print("[module_world] baked snow manifest: %d snow-cap variant models for %d cappable materials"
 		% [snow, TerrainConfig.snow_cappable_materials().size()])
 	print("[module_world] baked snow LAYER manifest: %d snow_block depth-level models (SNOW-ACCUMULATION §1.5)" % layers)
 	print("[module_world] baked snow-FILL composites: %d models over %d cold (mat,modifier) pairs x levels {3,5,8,10} (SNOW-ACCUMULATION §2.7)"
 		% [comps, TerrainConfig.emitted_cold_pairs().size()])
+	print("[module_world] baked slope manifest: %d SHARP-SLOPE models (%d emitted (mat,payload) pairs, incl. snow twins)"
+		% [slope, TerrainConfig.emitted_slope_pairs().size()])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -702,6 +729,54 @@ func _snow_id_of() -> int:
 	if _snow_id < 0:
 		_snow_id = BlockCatalog.id_of(&"snow_block")
 	return _snow_id
+
+## Bake the SHARP-SLOPE models into `_slope_arid` (and snow twins into `_snow_slope_arid`), keyed
+## `mat * _SLOPE_STRIDE + payload` over TerrainConfig.emitted_slope_pairs() (§4.1). ONE ArrayMesh per
+## payload is shared across materials AND the snow twin via `_shape_mesh_cache[raw FAM modifier]`
+## (bit 15 keeps slope keys disjoint from all corner/LAYER/wet keys). Same anti-drift discipline
+## (add_model() == expected ARID); a drift aborts, leaving the rest -1 (cube fallback, never a hole).
+func _build_slope_manifest(library: Object, total: int) -> int:
+	_slope_arid = PackedInt32Array()
+	_slope_arid.resize(total * _SLOPE_STRIDE)
+	_slope_arid.fill(-1)
+	_snow_slope_arid = PackedInt32Array()
+	_snow_slope_arid.resize(total * _SLOPE_STRIDE)
+	_snow_slope_arid.fill(-1)
+	var capset := {}
+	for cm: int in TerrainConfig.snow_cappable_materials():
+		capset[cm] = true
+	var appended := 0
+	for pair: int in TerrainConfig.emitted_slope_pairs():
+		var mat := pair / _SLOPE_STRIDE
+		var payload := pair % _SLOPE_STRIDE
+		if mat <= BlockCatalog.AIR or mat >= total:
+			continue
+		var modifier := CellCodec.MOD_FAM_BIT | (CellCodec.FAM_SLOPE << CellCodec.MOD_FAM_KIND_SHIFT) | payload
+		var model: Object = _make_shape_model(modifier, BlockMaterials.get_for(mat))
+		if model == null:
+			continue                                     # no mesh-model class → cube fallback
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] slope manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended
+		_next_arid += 1
+		_slope_arid[mat * _SLOPE_STRIDE + payload] = got
+		appended += 1
+		# Snow-capped twin (reuses the SAME per-payload ArrayMesh; only the material override differs).
+		if capset.has(mat):
+			var vmodel: Object = _make_shape_model(modifier, BlockMaterials.snow_capped_for(mat))
+			if vmodel == null:
+				continue
+			var exp2 := _next_arid
+			var got2: int = _add_model(library, vmodel)
+			if got2 != exp2:
+				push_warning("[module_world] slope-snow manifest ARID drift: add_model %d != expected %d" % [got2, exp2])
+				return appended
+			_next_arid += 1
+			_snow_slope_arid[mat * _SLOPE_STRIDE + payload] = got2
+			appended += 1
+	return appended
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into
 ## `_gen_twin_arid[kind]`. Returns the fresh PackedInt32Array so the caller can fill it in place.
@@ -890,6 +965,15 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 			var gca := _comp_arid_of(mat, modifier, gfill)
 			if gca >= 0:
 				return gca
+	# SHARP-SLOPE (§4.2) mirror: a generated SLOPE cell (FAM bit 15, land-only) → the dedicated slope
+	# tables (snow twin when capped), exactly as arid_for_cell / the worker do.
+	if liquid_level == 0 and CellCodec.is_slope(modifier):
+		var pslot := mat * _SLOPE_STRIDE + (modifier & 0xFFF)
+		if (state & CellCodec.STATE_SNOW_CAPPED) != 0 and pslot < _snow_slope_arid.size() and _snow_slope_arid[pslot] >= 0:
+			return _snow_slope_arid[pslot]
+		if pslot < _slope_arid.size() and _slope_arid[pslot] >= 0:
+			return _slope_arid[pslot]
+		return _cube_arid_of(mat)                        # unbaked payload → cube fallback (never a hole)
 	# Snow-cap state variant mirror (M1 ADR §5.2): a capped cell (state bit set, no liquid) resolves
 	# to its frozen snow-variant ARID, exactly as arid_for_cell / the worker do. `state` defaults 0 so
 	# pre-M1 callers are unchanged; verify passes STATE_SNOW_CAPPED to mirror a capped cell.
@@ -922,6 +1006,9 @@ func is_manifest_baked(mat: int, modifier: int) -> bool:
 	if CellCodec.is_layer(modifier):
 		var lvl := CellCodec.layer_level(modifier)
 		return mat == _snow_id_of() and lvl >= 0 and lvl < _layer_arid.size() and _layer_arid[lvl] >= 0
+	if CellCodec.is_slope(modifier):                      # SHARP-SLOPE: dedicated slope table (kind 1 only)
+		var pslot := mat * _SLOPE_STRIDE + (modifier & 0xFFF)
+		return pslot < _slope_arid.size() and _slope_arid[pslot] >= 0
 	var slot := mat * _GEN_STRIDE + modifier
 	return modifier < _GEN_STRIDE and slot < _gen_arid.size() and _gen_arid[slot] >= 0
 
@@ -1288,8 +1375,16 @@ var comp_l5: PackedInt32Array
 var comp_l8: PackedInt32Array
 var comp_l10: PackedInt32Array
 var snow_id := -1                        # snow_block LRID (the curated LAYER material)
+var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
+var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 const GEN_STRIDE := 256
+const SLOPE_STRIDE := 4096
+const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape
+const FAM_KIND_SHIFT := 12               # bits 14..12 select the FAM family kind
+const FAM_KIND_MASK := 0x7
+const FAM_SLOPE := 1                     # kind 1 = SLOPE; only kind 1 routes to the slope table (a future
+                                        # kind-0 LAYER modifier must NOT be mis-indexed here)
 
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
@@ -1311,6 +1406,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var ngen = gen_arid.size()
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
+	var nslope = slope_arid.size()
+	var nsnowslope = snow_slope_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
 	# `gen_twin_arid` Array per cell — zero allocation. null = that kind has no registered fluid.
@@ -1425,7 +1522,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				elif ((v >> 33) & 0xF) != 0:
 					# Snow-FILL composite (SNOW-ACCUMULATION 2.6): a terrain ramp buried/filled by the snow
 					# plane. The fill nibble (STATE bits 1..4 = value bits 33..36) rounds UP to a curated
-					# level {3,5,8,10}; checked BEFORE snow_capped (a filled cell is always also capped).
+					# level {3,5,8,10}; checked BEFORE snow_capped/slope (a filled cell is always also capped).
 					# Ladder: composite -> snow-cap skin -> dry ramp -> cube (never a hole -- 2.7).
 					var flvl = (v >> 33) & 0xF
 					var ctab = comp_l3
@@ -1439,6 +1536,18 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						arid = snow_arid[cslot]            # ladder: the M1 snow-cap skin
 					elif modifier < GEN_STRIDE and cslot < ngen and gen_arid[cslot] >= 0:
 						arid = gen_arid[cslot]             # ladder: the dry ramp
+					else:
+						arid = cube_arid[id] if id < ncube else id
+				elif (modifier & FAM_BIT) != 0 and ((modifier >> FAM_KIND_SHIFT) & FAM_KIND_MASK) == FAM_SLOPE:
+					# SHARP-SLOPE (4.2): a generated SLOPE cell (FAM bit 15 + kind 1, land-only) -> the dedicated
+					# slope tables (snow-capped twin when capped, else dry slope); an unbaked payload cube-
+					# falls-back (never a hole). BEFORE the generic snow-cap arm AND the FAM LAYER arm (a SLOPE
+					# modifier also has bit 15) so a capped slope routes to the slope table, never the layer table.
+					var pslot = id * SLOPE_STRIDE + (modifier & 0xFFF)
+					if ((v >> 32) & 1) != 0 and pslot < nsnowslope and snow_slope_arid[pslot] >= 0:
+						arid = snow_slope_arid[pslot]
+					elif pslot < nslope and slope_arid[pslot] >= 0:
+						arid = slope_arid[pslot]
 					else:
 						arid = cube_arid[id] if id < ncube else id
 				elif ((v >> 32) & 1) != 0:
@@ -1495,6 +1604,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("comp_l8", _comp_arid_l8)
 	gen.set("comp_l10", _comp_arid_l10)
 	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
+	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
+	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	return gen
 

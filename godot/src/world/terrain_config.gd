@@ -68,6 +68,11 @@ const SNOW_REF_LATTICE := 8          # smoothed-terrain reference lattice pitch 
 ## the snow stack emits it on snow_block) and the emitted-modifier union keeps it in the manifest.
 const SNOW_SLAB_MODIFIER := 85
 
+## SHARP-SLOPE §3.2: max corner-target relief (whole blocks) across one cell that the SLOPE family
+## can express as one clean planar diagonal. Steeper terrain saturates the corner-height family
+## (legacy) and stays a blocky cliff (the §8 non-goal preserved). A run spans ≤ this many cells.
+const SLOPE_MAX_SPREAD := 3
+
 ## The render height of the water surface: the top cell of every open-water column and every
 ## smoothed shore composite renders its water at SEA_LEVEL + WATER_SURFACE_HEIGHT, a slightly sunk
 ## surface rather than a full cube. Set to 0.9375 = godot_voxel's native fluid TOP_HEIGHT
@@ -480,6 +485,31 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		return BlockCatalog.AIR
 	if _bedrock_at(x, y, z):
 		return _ID_BEDROCK
+	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
+	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
+	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
+	if _slope_fires_only(x, z, g, pcache):
+		var tw := _slope_whole_targets(x, z, pcache)
+		var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
+		var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
+		if y >= lo and y <= hi - 1:
+			var smod := CellCodec.make_slope(tw.x - y, tw.y - y, tw.z - y, tw.w - y)
+			var smat: int
+			if y >= g:
+				smat = _cap_material(biome, x, z, t, g)         # surface/cap skin (biome top on land)
+			else:
+				smat = _surface_rule(x, y, z, g, biome, c, t)   # carve: generated banding, NO ore/deepslate
+			return _with_snow_state(_with_shore_liquid(CellCodec.pack(smat, smod), y, t), g, t)
+		if y >= hi:
+			if y <= SEA_LEVEL:
+				return _sea_block(t, y)
+			return TreeGen.block_at(x, y, z, pcache)
+		# y < lo: full solid interior below the run — the stackup, NO smoothing (the run owns the top)
+		var idlo := _surface_rule(x, y, z, g, biome, c, t)
+		if idlo == BlockCatalog.STONE and y < g:
+			idlo = _deep_family(x, y, z)
+			idlo = _ore_at(x, y, z, idlo, biome, c)
+		return idlo
 	if y > g:
 		# Smoothing CAP cell (SUB-VOXEL-SMOOTHING §8.1): a column whose neighbours rise grows a
 		# partial lip one cell above its surface, bridging a 1-block step up into a continuous slope.
@@ -686,6 +716,21 @@ static func _cap_snow_modifier(byte: int) -> int:
 	var top := byte & 0xF
 	return CellCodec.make_layer(top) if top > 0 else 0
 
+## The MODIFIER of the snow accumulation cell at height `y` (y >= g+1, no smoothing lip owning that y)
+## over a column with snow byte `byte` and solid top `g` (SNOW-ACCUMULATION §3.4). The generalized form
+## of _cap_snow_modifier for ANY stack height: the absolute snow plane is [g+1, g+1+D/10], so the cell's
+## remaining depth is `D − (y − (g+1))·10` tenths — a full snow cube (≥ 10) → 0, the fractional top LAYER
+## (1..9) → make_layer, none (≤ 0) → 0. Equals CellCodec.modifier(generated_cell(x,y,z)) on a snowy
+## column (matches resolve_cell._snow_stack). y == g+1 reproduces _cap_snow_modifier(byte) exactly.
+static func _snow_cell_modifier(byte: int, g: int, y: int) -> int:
+	var d := ((byte >> 4) & 0xF) * 10 + (byte & 0xF)
+	if d <= 0:
+		return 0
+	var remaining := d - (y - (g + 1)) * 10
+	if remaining <= 0 or remaining >= 10:
+		return 0                                       # no snow at this height, or a full snow cube
+	return CellCodec.make_layer(remaining)             # the fractional top LAYER
+
 ## The collider's LIGHT snow query (§3.4): the column's snow stack packed as (capped << 8) | (whole << 4)
 ## | top — capped = a smoothing lip owns g+1 (snow then stacks from g+2), whole/top the full-cube count +
 ## fractional top LAYER level. 0 = no snow. NO generated_cell calls (the light-query family contract).
@@ -774,20 +819,192 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 	return ShapeCodec.make_modifier(c00, c10, c11, c01, ShapeCodec.ANCHOR_BOTTOM)
 
 # ------------------------------------------------------------------------------
+# SHARP-SLOPE worldgen (docs/SHARP-SLOPE.md §3): where the smoothed corner-target plane escapes the
+# legacy 2-cell [g, g+2] window, a steep column becomes a SLOPE COLUMN — its corner targets quantize
+# to WHOLE blocks (shared with neighbours → crack-free) and a vertical RUN of cells each carries a
+# FAM SLOPE modifier (four signed whole-block corner deltas). ONE shared predicate _slope_entry_data
+# feeds resolve_cell, the light queries and the memo, so memo == worker-direct by construction.
+
+## The SLOPE emission predicate (SHARP-SLOPE §3.2) — pure/deterministic (height_at + TreeGen only),
+## NON-ALLOCATING (bool, so the neighbour-fires stencil in _quantized_targets stays cheap on the hot
+## worker/collider path). fires ⇒ the plane ESCAPES the legacy [g,g+2] window AND is encodable
+## (spread ≤ SLOPE_MAX_SPREAD); below that the world stays byte-identical on today's smoothing path.
+static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
+	if not SMOOTHING_ENABLED or g < SEA_LEVEL:
+		return false                                  # v1: land only; rides the smoothing path
+	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
+		return false                                  # a tree rests here → keep the top FULL
+	var raw := _corner_targets(x, z, pcache)
+	# Which legacy smoothing window the corner-target plane ESCAPES decides firing (SHARP-SLOPE §3.2,
+	# DEFECT 2 — "don't touch hills"). Compare raw targets in integer quarter-units (float-robust):
+	#   * plane escapes the TWO-cell window [g, g+2] (a >2 block/cell face the legacy cap can't grade)
+	#     → fire in ANY biome (the original predicate — steep relief, e.g. badlands mesa walls); else
+	#   * plane escapes only the ONE-cell window [g, g+1] (the 1–2 block/cell, ~45° band) → fire ONLY
+	#     in the Mountains biome. The half-block corner grid clamps a g+1.5 target down to g+1.0, so a
+	#     >45° face develops a 0.5-block riser per cell — the mountain "ladder"/stacked-pyramid look
+	#     the widening kills. Confining the widening to B_MOUNTAINS leaves every hill/temperate 45°
+	#     step BYTE-IDENTICAL to the pre-widening build (whole-block quantization never reaches them).
+	# The biome probe (column_profile.y) is reached ONLY for the narrow 1–2 block/cell band, so the hot
+	# path stays cheap; it is pure + pcache-memoized, preserving the single-predicate collider contract.
+	var r0 := roundi(raw.x * 4.0)
+	var r1 := roundi(raw.y * 4.0)
+	var r2 := roundi(raw.z * 4.0)
+	var r3 := roundi(raw.w * 4.0)
+	var lo_r := mini(mini(r0, r1), mini(r2, r3))
+	var hi_r := maxi(maxi(r0, r1), maxi(r2, r3))
+	if lo_r >= g * 4 and hi_r <= (g + 2) * 4:
+		# within the two-cell window → NOT a >2 block/cell face.
+		if lo_r >= g * 4 and hi_r <= (g + 1) * 4:
+			return false                              # within [g, g+1] → today's smoothing (all biomes)
+		if int(column_profile(x, z, pcache).y) != B_MOUNTAINS:
+			return false                              # 1–2 block/cell band off the mountains → leave hills alone
+	var tw0 := roundi(raw.x)
+	var tw1 := roundi(raw.y)
+	var tw2 := roundi(raw.z)
+	var tw3 := roundi(raw.w)
+	var lo := mini(mini(tw0, tw1), mini(tw2, tw3))
+	var hi := maxi(maxi(tw0, tw1), maxi(tw2, tw3))
+	if hi - lo < 1 or hi - lo > SLOPE_MAX_SPREAD:
+		return false                                  # a flat plane (nothing to grade) OR too steep (cliff)
+	# The run [lo, hi−1] must stay within [g−3, g+4] so (a) the memo's 4-bit (Tw−g) codes are EXACT
+	# and (b) a lone spike/pit whose smoothed plane is far from its own surface falls back to legacy
+	# saturation (a full cube) — never carved down into a hole. Steeper relief stays a blocky cliff.
+	return lo >= g - SLOPE_MAX_SPREAD and hi <= g + SLOPE_MAX_SPREAD + 1
+
+## The four WHOLE-block corner targets Tw of a firing SLOPE column (call only when _slope_fires_only).
+static func _slope_whole_targets(x: int, z: int, pcache) -> Vector4i:
+	var raw := _corner_targets(x, z, pcache)
+	return Vector4i(roundi(raw.x), roundi(raw.y), roundi(raw.z), roundi(raw.w))
+
+## True iff column (X, Z) is slope-EMITTING (its own predicate fires).
+static func _col_fires(X: int, Z: int, pcache) -> bool:
+	return _slope_fires_only(X, Z, _col_h(X, Z, pcache), pcache)
+
+## The corner targets of cell (x, z) quantized on ONE shared grid (SHARP-SLOPE §3.1): whole-block at
+## a corner touching a slope-emitting column, else half-block. Half-block quantization is a NO-OP
+## through _modifier_from_targets (roundi((T−by)·2) already rounds to the half grid), so a cell with
+## no slope-emitting neighbour is BYTE-IDENTICAL to today. The crack-killer for slope↔legacy seams.
+## The 3×3 fires stencil (columns x−1..x+1 × z−1..z+1) is evaluated ONCE — each of the 4 corners is
+## whole iff any of its 4 touching columns fires — so a rim cell pays 9 predicate evals, not 16.
+static func _quantized_targets(x: int, z: int, pcache) -> Vector4:
+	var raw := _corner_targets(x, z, pcache)
+	var f := [
+		_col_fires(x - 1, z - 1, pcache), _col_fires(x - 1, z, pcache), _col_fires(x - 1, z + 1, pcache),
+		_col_fires(x,     z - 1, pcache), _col_fires(x,     z, pcache), _col_fires(x,     z + 1, pcache),
+		_col_fires(x + 1, z - 1, pcache), _col_fires(x + 1, z, pcache), _col_fires(x + 1, z + 1, pcache)]
+	# f[i*3 + j] is column (x−1+i, z−1+j). A corner is whole iff any of its 4 columns fires.
+	var w00: bool = f[0] or f[3] or f[1] or f[4]      # corner (x,   z):   cols (x−1,z−1),(x,z−1),(x−1,z),(x,z)
+	var w10: bool = f[3] or f[6] or f[4] or f[7]      # corner (x+1, z):   cols (x,z−1),(x+1,z−1),(x,z),(x+1,z)
+	var w11: bool = f[4] or f[7] or f[5] or f[8]      # corner (x+1, z+1): cols (x,z),(x+1,z),(x,z+1),(x+1,z+1)
+	var w01: bool = f[1] or f[4] or f[2] or f[5]      # corner (x,   z+1): cols (x−1,z),(x,z),(x−1,z+1),(x,z+1)
+	return Vector4(_q(raw.x, w00), _q(raw.y, w10), _q(raw.z, w11), _q(raw.w, w01))
+
+static func _q(raw_t: float, whole: bool) -> float:
+	if whole:
+		return float(roundi(raw_t))                   # whole block (shared, exact on the half grid)
+	return roundf(raw_t * 2.0) / 2.0                  # half block (byte-identical to legacy)
+
+## Pack a slope run for column consumers (collider/fallback/memo, SHARP-SLOPE §3.5): fires flag in
+## bit 16, four 4-bit biased corner codes (Tw_i − g + 4) in bits 0..15 — enough to derive lo/hi and
+## every run cell's modifier by arithmetic, no per-cell query storm. 0 when the column does not fire.
+static func _slope_run_pack(fires: bool, tw: Vector4i, g: int) -> int:
+	if not fires:
+		return 0
+	var c0 := clampi(tw.x - g + 4, 0, 15)
+	var c1 := clampi(tw.y - g + 4, 0, 15)
+	var c2 := clampi(tw.z - g + 4, 0, 15)
+	var c3 := clampi(tw.w - g + 4, 0, 15)
+	return (1 << 16) | (c3 << 12) | (c2 << 8) | (c1 << 4) | c0
+
+## Decode the whole corner targets Tw from a packed slope run + the column's surface g.
+static func _slope_run_targets(r: int, g: int) -> Vector4i:
+	return Vector4i((r & 15) - 4 + g, ((r >> 4) & 15) - 4 + g, ((r >> 8) & 15) - 4 + g, ((r >> 12) & 15) - 4 + g)
+
+## True iff a packed slope run is a firing column.
+static func slope_run_fires(r: int) -> bool:
+	return (r >> 16) & 1 != 0
+
+## The [lo, hi) run cell range of a packed slope run given g (cells [lo, hi−1] carry slope material).
+static func slope_run_range(r: int, g: int) -> Vector2i:
+	var tw := _slope_run_targets(r, g)
+	return Vector2i(mini(mini(tw.x, tw.y), mini(tw.z, tw.w)), maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w)))
+
+## The generated SLOPE modifier of run `r` at world-y `y` (0 = full cube below the run / air above).
+static func slope_run_modifier_at(r: int, g: int, y: int) -> int:
+	var tw := _slope_run_targets(r, g)
+	var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
+	var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
+	if y >= lo and y <= hi - 1:
+		return CellCodec.make_slope(tw.x - y, tw.y - y, tw.z - y, tw.w - y)
+	return 0
+
+## The packed slope run for column (x, z): the memo's slope bits on the analytic main thread, the
+## shared predicate worker-direct (SHARP-SLOPE §3.5). ONE authority → memo == worker-direct.
+static func slope_run_of(x: int, z: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return 0
+	if pcache == null and _on_main_thread():
+		return (_shape_entry(x, z) >> 40) & 0x1FFFF
+	var g := _col_h(x, z, pcache)
+	if not _slope_fires_only(x, z, g, pcache):
+		return 0
+	return _slope_run_pack(true, _slope_whole_targets(x, z, pcache), g)
+
+## THE generalized light query (SHARP-SLOPE §3.5): the generated cell's MODIFIER at ANY (x,y,z) —
+## from the memo on the analytic main thread, from the shared predicate worker-direct — with ZERO
+## generated_cell calls. Machine-checked == CellCodec.modifier(generated_cell(x,y,z)) (verify).
+## surface_modifier / surface_cap_modifier are thin y=g / y=g+1 projections of this.
+static func generated_modifier_at(x: int, y: int, z: int, pcache = null) -> int:
+	if not SMOOTHING_ENABLED:
+		return 0
+	if pcache == null and _on_main_thread():
+		var e := _shape_entry(x, z)
+		var g := (e & 0xFFFF) - _MEMO_G_BIAS
+		var r := (e >> 40) & 0x1FFFF
+		if (r >> 16) & 1 != 0:
+			return slope_run_modifier_at(r, g, y)     # slope run cell (0 outside [lo, hi−1])
+		if y == g:
+			return (e >> 16) & 0xFF                    # surface smoothing modifier
+		if y >= g + 1:
+			var cmm: int = (e >> 24) & 0xFF
+			if y == g + 1 and cmm != 0:
+				return cmm                             # the smoothing grass CAP lip owns g+1
+			return _snow_cell_modifier((e >> 32) & 0xFF, g, y)   # snow accumulation cell (SNOW-ACCUMULATION §3.4)
+		return 0
+	# worker / other thread: direct compute (byte-identical to the memo — pure functions of SEED)
+	var gg := _col_h(x, z, pcache)
+	if _slope_fires_only(x, z, gg, pcache):
+		return slope_run_modifier_at(_slope_run_pack(true, _slope_whole_targets(x, z, pcache), gg), gg, y)
+	if TreeGen.block_at(x, gg + 1, z, pcache) != BlockCatalog.AIR:
+		return 0
+	if y == gg:
+		return _modifier_from_targets(_quantized_targets(x, z, pcache), gg)
+	if y >= gg + 1:
+		if y == gg + 1:
+			var cmw := _modifier_from_targets(_quantized_targets(x, z, pcache), gg + 1)
+			if cmw != 0:
+				return cmw                             # the smoothing grass CAP lip owns g+1
+		return _snow_cell_modifier(_snow_stack_byte(x, z, gg, column_profile(x, z, pcache).w, pcache), gg, y)
+	return 0
+
+# ------------------------------------------------------------------------------
 # Per-column SHAPE MEMO (analytic-path PERF, the smoothing-jerkiness fix). The analytic queries
 # (WorldManager.floor_under/blocked → cell_value_at → generated_cell, pcache == null) hit a surface
 # (y==g) or cap (y==g+1) cell on nearly every probe; each recomputes the 3×3 corner-target stencil
 # = 9 height_at = 27 fresh noise samples (a surface cell measured 2.9 → 13.2 µs, 4.2×). While the
 # player MOVES it fires ~6 such probes per tick → ms-scale on wasm → the "smoothing stutter". This
-# memo caches, per column, the (g, surface_modifier, cap_modifier, snow_slab) quad — PURE functions
-# of SEED (immutable at runtime; player edits live in the overlay, never in generated modifiers), so
-# it is byte-identical to recomputing. Packed int: (g + _MEMO_G_BIAS) | surface_mod<<16 | cap_mod<<24
-# | snow_slab<<32 (both mods are BOTTOM corner-height codes < 256; g biased so its low 16 bits stay
-# positive; the snow-slab flag rides bit 32 of the 64-bit int, so the raw cap byte stays a pure
-# smoothing modifier and a legit 85-lip is never confused with the slab). M1 ADR §6.3: the cap byte
-# / slab flag now depend on climate+altitude, but those are STILL pure deterministic functions of
-# SEED (no randi/Time), so the memo remains byte-identical to recompute — the memo's old "shape is
-# biome-independent" note is amended, but the thread-safety reasoning is unchanged.
+# memo caches, per column, the (g, surface_modifier, cap_modifier, snow_byte, slope_run) tuple — PURE
+# functions of SEED (immutable at runtime; player edits live in the overlay, never in generated
+# modifiers), so it is byte-identical to recomputing. Packed int: (g + _MEMO_G_BIAS) | surface_mod<<16
+# | cap_mod<<24 | snow_byte<<32 | slope_run<<40. The two mods are BOTTOM corner-height codes < 256; g
+# is biased so its low 16 bits stay positive. MERGE (SNOW-ACCUMULATION §3.4 + SHARP-SLOPE §3.5): bits
+# 32..39 hold the snow accumulation byte ((whole<<4)|top) and bits 40..56 the packed SLOPE run (bit 56
+# fires, 40..55 four biased corner codes) — DISJOINT axes (a firing slope column carries a run and no
+# snow byte; a snow column carries a snow byte and no run), so no bit is ever read for both. The
+# obsolete fixed snow-slab flag is GONE — graded snow accumulation supersedes it. M1 ADR §6.3: the cap
+# byte / snow byte / run now depend on climate+altitude, but those are STILL pure deterministic
+# functions of SEED (no randi/Time), so the memo remains byte-identical to recompute — the memo's old
+# "shape is biome-independent" note is amended, but the thread-safety reasoning is unchanged.
 #
 # THREAD SAFETY — READ THIS: GDScript Dictionaries are NOT thread-safe. This memo is MAIN-THREAD-
 # ONLY by construction. The module voxel WORKER always calls resolve_cell/_smoothed_surface/… with
@@ -822,19 +1039,28 @@ static func _shape_entry(x: int, z: int) -> int:
 	# TreeGen probe returns AIR over ocean columns (trees are biome-gated off ocean/beach), so the
 	# uniform check keeps one code path.
 	var snow_byte := 0
+	var run := 0
 	if SMOOTHING_ENABLED and TreeGen.block_at(x, g + 1, z) == BlockCatalog.AIR:
-		var t := _corner_targets(x, z)      # the 9-height_at stencil — computed ONCE, then cached
-		sm = _modifier_from_targets(t, g)
-		cm = _modifier_from_targets(t, g + 1)
+		# SHARP-SLOPE §3.5: a STEEP column emits a SLOPE run — cache its packed run in bits 40..56
+		# (bit 56 = fires, bits 40..55 = four 4-bit biased corner codes); sm/cm stay 0 (the run owns
+		# the shape). Else today's smoothing surface/cap on the shared whole/half-quantized target grid.
+		if _slope_fires_only(x, z, g, null):
+			run = _slope_run_pack(true, _slope_whole_targets(x, z, null), g)
+		else:
+			var t := _quantized_targets(x, z, null)   # the shared-grid stencil — computed ONCE, cached
+			sm = _modifier_from_targets(t, g)
+			cm = _modifier_from_targets(t, g + 1)
 	# Snow accumulation byte (SNOW-ACCUMULATION §3.4): bits 32..39 = (whole << 4) | top — the column's
-	# full-cube count + fractional top LAYER level above g, REPLACING the removed fixed-slab bit. Derived
-	# from the ONE shared _snow_stack_byte predicate (its sea/warm/tree gates make it 0 on the non-snow
-	# world, so a temperate/underwater memo entry is byte-identical), pure SEED functions → byte-identical
-	# to recompute. cm (bits 24..31) stays the raw smoothing lip; a lip owns g+1, so snow stacks from g+2.
-	snow_byte = _snow_stack_byte(x, z, g, column_profile(x, z).w, null)
+	# full-cube count + fractional top LAYER level above g (the fixed-slab bit is GONE; graded snow
+	# accumulation supersedes it). Slope columns carry the run instead (they cap their own top), so snow
+	# is computed only OFF the slope path (run == 0) — matching resolve_cell, which never stacks snow on a
+	# slope column. Derived from the ONE shared _snow_stack_byte predicate (its sea/warm/tree gates make
+	# it 0 on the non-snow world), pure SEED functions → byte-identical to a worker-direct recompute.
+	if run == 0:
+		snow_byte = _snow_stack_byte(x, z, g, column_profile(x, z).w, null)
 	if _shape_memo.size() >= _MEMO_MAX:
 		_shape_memo.clear()                 # bound memory over a marathon session
-	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24) | (snow_byte << 32)
+	e = (g + _MEMO_G_BIAS) | (sm << 16) | (cm << 24) | (snow_byte << 32) | (run << 40)
 	_shape_memo[k] = e
 	return e
 
@@ -852,7 +1078,7 @@ static func _smoothed_surface(x: int, z: int, g: int, mat: int, pcache = null) -
 		return mat if sm == 0 else CellCodec.pack(mat, sm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return mat                                    # a tree cell rests here → keep FULL
-	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g)
+	var m := _modifier_from_targets(_quantized_targets(x, z, pcache), g)
 	if m == 0:
 		return mat
 	return CellCodec.pack(mat, m)
@@ -873,9 +1099,11 @@ static func _surface_cap(x: int, z: int, g: int, biome: int, t: float, pcache = 
 		return BlockCatalog.AIR if cm == 0 else CellCodec.pack(_cap_material(biome, x, z, t, g), cm)
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return BlockCatalog.AIR                       # tree overlay owns this cell
-	var m := _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
+	var m := _modifier_from_targets(_quantized_targets(x, z, pcache), g + 1)
 	# No smoothing lip → AIR (resolve_cell then stacks the snow accumulation at g+1); a nonzero lip owns
-	# the cell (snow stacks from g+2 on a capped column — SNOW-ACCUMULATION §3.3).
+	# the cell (snow stacks from g+2 on a capped column — SNOW-ACCUMULATION §3.3). The interim fixed snow
+	# half-slab is GONE — graded snow accumulation (resolve_cell._snow_stack) supersedes it. _quantized_targets
+	# (not raw _corner_targets) so a cap ADJACENT to a slope run snaps its shared corners whole → crack-free.
 	return BlockCatalog.AIR if m == 0 else CellCodec.pack(_cap_material(biome, x, z, t, g), m)
 
 ## The cap cell's MATERIAL. A LAND cap (g >= SEA_LEVEL, so the cap cell y=g+1 sits above the water
@@ -905,12 +1133,9 @@ static func _cap_material(biome: int, x: int, z: int, t: float, g: int) -> int:
 static func surface_modifier(x: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0                                      # diagnostic: cube-only surface
-	if pcache == null and _on_main_thread():
-		return (_shape_entry(x, z) >> 16) & 0xFF
-	var g := _col_h(x, z, pcache)
-	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
-		return 0                                      # a tree cell rests on the top → kept FULL
-	return _modifier_from_targets(_corner_targets(x, z, pcache), g)
+	# SHARP-SLOPE §3.5: a thin y=g projection of generated_modifier_at (the ONE light query). On a
+	# slope column this returns the run's surface-cell modifier; else today's smoothing modifier.
+	return generated_modifier_at(x, _col_h(x, z, pcache), z, pcache)
 
 ## The smoothing MODIFIER of the CAP cell at (x, height_at(x,z)+1, z), or 0 when no cap
 ## grows here (flat/steep or tree-owned). Equals
@@ -922,24 +1147,13 @@ static func surface_modifier(x: int, z: int, pcache = null) -> int:
 ## abrupt half-block ledge. The query is material-independent, so the same value holds on land and
 ## underwater; both the memo and the direct branch agree over water.
 static func surface_cap_modifier(x: int, z: int, pcache = null) -> int:
-	if pcache == null and _on_main_thread():
-		var e := _shape_entry(x, z)
-		var cm0: int = (e >> 24) & 0xFF
-		if cm0 != 0:
-			return cm0                                # a smoothing lip owns g+1 (Phase A2: the dry lip)
-		# No lip → the g+1 cell is the snow accumulation cell (SNOW-ACCUMULATION §3.4): a full snow
-		# cube (0), a fractional LAYER (make_layer), or nothing (0). Matches modifier(generated_cell(g+1)).
-		return _cap_snow_modifier((e >> 32) & 0xFF)
-	var g := _col_h(x, z, pcache)
-	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
-		return 0                                      # a tree cell owns g+1 (generated modifier 0)
-	var cm := 0
-	if SMOOTHING_ENABLED:
-		cm = _modifier_from_targets(_corner_targets(x, z, pcache), g + 1)
-	if cm != 0:
-		return cm
-	# No smoothing lip — the g+1 cell is the snow accumulation cell (SNOW-ACCUMULATION §3.4).
-	return _cap_snow_modifier(_snow_stack_byte(x, z, g, column_profile(x, z, pcache).w, pcache))
+	if not SMOOTHING_ENABLED:
+		return 0                                      # diagnostic: no cap cells
+	# A thin y=g+1 projection of the ONE light query generated_modifier_at (SHARP-SLOPE §3.5), now snow
+	# aware (SNOW-ACCUMULATION §3.4): on a slope column it is the run's g+1 cell; on a smoothing column the
+	# grass cap lip; else the snow accumulation cell (a full snow cube 0, a fractional LAYER, or nothing).
+	# One authority so memo == worker-direct by construction; matches modifier(generated_cell(g+1)).
+	return generated_modifier_at(x, _col_h(x, z, pcache) + 1, z, pcache)
 
 ## The appearance manifest (RUNTIME-MATERIAL-STREAMING §6.5 / VOXEL-DATA-STRUCTURE
 ## §8.1/§8.3): the exact set of (surface material, modifier) pairs this smoothing
@@ -1036,6 +1250,13 @@ static func emitted_modifiers() -> PackedInt32Array:
 	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
 	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
 	seen[SNOW_SLAB_MODIFIER] = true
+	# The widened slope threshold (a slope >1 block/cell now emits SLOPE) leaves the ADJACENT legacy
+	# cells with whole-block-quantized corner modifiers whose exact orientations a spatial sample can
+	# miss — a missed one cube-falls-back (a stray pyramid). Union the FULL corner-height tuple set so
+	# NO smoothed cell can ever fall back. +~18 unique meshes over the sample → a small one-time
+	# main-thread bake cost, never the voxel worker.
+	for m: int in appearance_modifiers():
+		seen[m] = true
 	var out := PackedInt32Array()
 	for m: int in seen.keys():
 		out.append(m)
@@ -1355,7 +1576,15 @@ static func find_mountain() -> Vector2i:
 ## centres land on DIFFERENT massifs with different slope orientations — together their emitted-modifier
 ## sample reaches the complete reachable set (no invisible caps). Falls back to spawn if none found (not
 ## the case for this seed). Setup/verify only (calls column_profile widely); never the voxel worker.
+static var _mountains_cache: Dictionary = {}          # count -> Array (pure deterministic; setup/verify only)
 static func find_mountains(count: int) -> Array:
+	if _mountains_cache.has(count):
+		return _mountains_cache[count]
+	var out := _find_mountains_scan(count)
+	_mountains_cache[count] = out
+	return out
+
+static func _find_mountains_scan(count: int) -> Array:
 	var out: Array = []
 	for radius in range(0, 3072, 8):
 		for a in range(0, 360, 6):
@@ -1574,3 +1803,78 @@ static func emitted_submerged_pairs(_kind := CellCodec.LIQ_WATER) -> PackedInt32
 		for m: int in mods:
 			out.append(mat * _SHORE_STRIDE + m)
 	return out
+
+## Every canonical SLOPE payload worldgen can emit (SHARP-SLOPE §4.1 completeness, DEFECT 1 fix) —
+## enumerated ANALYTICALLY, not spatially sampled, so NO emitted slope can cube-fall-back on the
+## module (web) path (the pre-DEFECT sample of find_mountains(6)∪find_spawn() at r=32 baked ~83 of
+## these and left ~25% of worldgen's real payloads unbaked → pyramids reappeared on far mountains).
+## A run cell carries make_slope(Tw − y); across a run [lo, hi−1] its deltas span
+## [−(SLOPE_MAX_SPREAD−1), SLOPE_MAX_SPREAD] with corner spread ≤ SLOPE_MAX_SPREAD (subtracting the
+## per-cell y is spread-invariant). So enumerate EVERY delta tuple in that closed box with spread ≤
+## SLOPE_MAX_SPREAD, canonicalize (rules 1/2/3 drop the full/empty/legacy-collapsible tuples — those
+## are NOT slope cells), and keep the 12-bit payloads that stay SLOPE. Deterministic, biome/seed-
+## independent, complete: 430 payloads for SLOPE_MAX_SPREAD = 3. Cached; main-thread setup/verify only.
+const _SLOPE_STRIDE := 4096
+static var _slope_payloads_ready := false
+static var _slope_payloads := PackedInt32Array()
+static func all_slope_payloads() -> PackedInt32Array:
+	if _slope_payloads_ready:
+		return _slope_payloads
+	var seen := {}
+	for d00 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+		for d10 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+			for d11 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+				for d01 in range(-SLOPE_MAX_SPREAD, SLOPE_MAX_SPREAD + 1):
+					var mn := mini(mini(d00, d10), mini(d11, d01))
+					var mx := maxi(maxi(d00, d10), maxi(d11, d01))
+					if mx - mn > SLOPE_MAX_SPREAD:
+						continue                          # steeper than a run cell can carry
+					var m := CellCodec.make_slope(d00, d10, d11, d01)
+					if CellCodec.is_slope(m):             # canonical: not full/empty/legacy-collapsed
+						seen[m & 0xFFF] = true
+	var out := PackedInt32Array()
+	for p: int in seen.keys():
+		out.append(p)
+	out.sort()
+	_slope_payloads = out
+	_slope_payloads_ready = true
+	return _slope_payloads
+
+## Every SURFACE material worldgen can skin a SLOPE cell with (SHARP-SLOPE §4.1). A slope cell's
+## material is the biome top skin (y ≥ g, via _cap_material → _biome_top, LAND biomes only since
+## slopes are land-only, g ≥ SEA_LEVEL) or the carve banding (y < g, via _surface_rule → _biome_filler,
+## depth ≤ 3). Land tops give GRASS / SAND / RED_SAND / MUD / SNOW / PODZOL / STONE (GRAVEL is
+## underwater-only, so never a land slope skin); the carve adds DIRT (the default forest/taiga/snowy
+## filler) and STONE (bare Mountains rock). The rare badlands terracotta / sandstone carve bands (a
+## >2-block/cell badlands-wall edge, Risk 2) are left to the cube fallback to keep the bake bounded —
+## the physics stays EXACT there (render-larger-than-physics, the benign direction).
+static func all_slope_materials() -> PackedInt32Array:
+	_ensure_ids()
+	return PackedInt32Array([
+		BlockCatalog.GRASS, BlockCatalog.DIRT, BlockCatalog.STONE,
+		_ID_SAND, _ID_RED_SAND, _ID_MUD, _ID_SNOW, _ID_PODZOL,
+	])
+
+## The (surface material, SLOPE payload) pairs the module path pre-bakes + FREEZES into
+## `_slope_arid`/`_snow_slope_arid` — the COMPLETE cross product `all_slope_materials() ×
+## all_slope_payloads()` (SHARP-SLOPE §4.1, DEFECT 1). Encoded `mat * _SLOPE_STRIDE + payload`.
+## Complete for every worldgen-reachable payload on every dense slope skin, so no generated slope
+## cell (mountains especially) silhouette-mismatches the collider by cube-falling-back. Cached;
+## main-thread setup/verify only.
+static var _slope_pairs_ready := false
+static var _slope_pairs := PackedInt32Array()
+static func emitted_slope_pairs() -> PackedInt32Array:
+	if not SMOOTHING_ENABLED:
+		return PackedInt32Array()                     # diagnostic: no slope meshes to bake
+	if _slope_pairs_ready:
+		return _slope_pairs
+	_ensure_ids()
+	var payloads := all_slope_payloads()
+	var out := PackedInt32Array()
+	for mat: int in all_slope_materials():
+		for p: int in payloads:
+			out.append(mat * _SLOPE_STRIDE + p)
+	out.sort()
+	_slope_pairs = out
+	_slope_pairs_ready = true
+	return _slope_pairs

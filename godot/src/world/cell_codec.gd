@@ -28,14 +28,21 @@ const MOD_CORNERS_MASK := 0xFF
 const MOD_ANC_BIT := 1 << 8
 const MOD_FAM_BIT := 1 << 15
 
-## FAM shape families (SNOW-ACCUMULATION §1.2). When MOD_FAM_BIT is set the corner-height
-## semantics do NOT apply; bits 14..12 select the family KIND and the low bits carry
-## family-specific data. FAM_LAYER (kind 0) is a UNIFORM thin layer — a flat top at height
-## `level/10` block, BOTTOM-anchored — with the level (tenths, 1..9) in bits 3..0 and bits 11..4
-## reserved 0. It is the variable-height snow depth (0→1) that replaces the fixed half-slab.
+## FAM shape-family dispatch (SNOW-ACCUMULATION §1.2 / SHARP-SLOPE §1.1). When MOD_FAM_BIT is set
+## the corner-height semantics do NOT apply; the 3-bit KIND field (bits 14..12) selects the family
+## and the low bits carry family-specific data. kind 0 = LAYER (snow accumulation), kind 1 = SLOPE
+## (sharp mountain faces). Any other kind (or a malformed payload) strips to full cube + warns in
+## _canonical_modifier. The bare marker MOD_FAM_BIT (no kind, no payload) is the shared "empty FAM
+## shape" → collapsed to AIR by canonical().
 const MOD_FAM_KIND_SHIFT := 12
 const MOD_FAM_KIND_MASK := 0x7                  # bits 14..12
 const FAM_LAYER := 0
+const FAM_SLOPE := 1
+
+## --- FAM_LAYER (kind 0), SNOW-ACCUMULATION §1.2 -------------------------------------------------
+## A UNIFORM thin layer — a flat top at height `level/10` block, BOTTOM-anchored — with the level
+## (tenths, 1..9) in bits 3..0 and bits 11..4 reserved 0. The variable-height snow depth (0→1) that
+## replaces the fixed half-slab.
 const MOD_LAYER_LEVEL_MASK := 0xF               # bits 3..0 — layer level in tenths
 ## Canonical form of LAYER level 5 (== a 0.5 uniform layer): the all-corners-1 BOTTOM slab
 ## (ShapeCodec.make_modifier(1,1,1,1,BOTTOM) == 85), so level 5 reuses the already-baked,
@@ -76,6 +83,57 @@ static func snow_tenths(m: int) -> int:
 	if m == 0:
 		return 10
 	return 0
+
+## --- FAM_SLOPE (kind 1), SHARP-SLOPE §1.2 ------------------------------------------------------
+## Four 3-bit signed WHOLE-block corner deltas, bias +3, packed low-bits-first in ShapeCodec corner
+## order (c00 @ bits 0..2, c10 @ 3..5, c11 @ 6..8, c01 @ 9..11). `k_i = d_i + 3`, `d_i ∈ {−3..+4}` =
+## the height of corner i's terrain plane above THIS cell's floor, in blocks. Always BOTTOM-anchored
+## (no anchor bit under FAM). The encoding is total — all 4096 payloads decode to a valid tuple.
+const MOD_SLOPE_BIAS := 3
+
+## True iff `m` is a canonical SLOPE modifier (FAM bit set AND kind field == FAM_SLOPE).
+static func is_slope(m: int) -> bool:
+	return (m & MOD_FAM_BIT) != 0 and ((m >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK) == FAM_SLOPE
+
+## Biased-decode a SLOPE modifier to its four signed WHOLE-block corner deltas (d00, d10, d11, d01),
+## in ShapeCodec corner order. Assumes is_slope(m); on any other value the result is meaningless.
+static func slope_deltas(m: int) -> Vector4i:
+	return Vector4i(
+		(m & 7) - MOD_SLOPE_BIAS,
+		((m >> 3) & 7) - MOD_SLOPE_BIAS,
+		((m >> 6) & 7) - MOD_SLOPE_BIAS,
+		((m >> 9) & 7) - MOD_SLOPE_BIAS)
+
+## Build the CANONICAL modifier for a SLOPE cell whose four corner terrain-plane heights above the
+## cell FLOOR are (d00, d10, d11, d01) whole blocks (SHARP-SLOPE §1.2/§1.3). Applies the same
+## canonical collapse rules _canonical_modifier's SLOPE branch does, so a hand-built slope is
+## already in canonical form: full cube (all d ≥ 1 → 0), empty (all d ≤ 0 → MOD_FAM_BIT, which
+## canonical() collapses to AIR), legacy-expressible (all d ∈ {0,1} → the corner modifier), else
+## the raw SLOPE encoding.
+static func make_slope(d00: int, d10: int, d11: int, d01: int) -> int:
+	return _canonical_slope(d00, d10, d11, d01)
+
+## The raw (non-canonical) SLOPE bit encoding for a delta tuple — clamps each delta to {−3..+4}.
+static func _slope_raw(d00: int, d10: int, d11: int, d01: int) -> int:
+	var k00 := clampi(d00 + MOD_SLOPE_BIAS, 0, 7)
+	var k10 := clampi(d10 + MOD_SLOPE_BIAS, 0, 7)
+	var k11 := clampi(d11 + MOD_SLOPE_BIAS, 0, 7)
+	var k01 := clampi(d01 + MOD_SLOPE_BIAS, 0, 7)
+	return MOD_FAM_BIT | (FAM_SLOPE << MOD_FAM_KIND_SHIFT) | (k01 << 9) | (k11 << 6) | (k10 << 3) | k00
+
+## Canonicalize a SLOPE delta tuple (SHARP-SLOPE §1.3): rules 1 (full) / 2 (empty) / 3 (legacy
+## collapse) / 4 (keep). ONE authority shared by make_slope and _canonical_modifier so a shape maps
+## to a unique modifier int (mesher keying + equality).
+static func _canonical_slope(d00: int, d10: int, d11: int, d01: int) -> int:
+	if d00 >= 1 and d10 >= 1 and d11 >= 1 and d01 >= 1:
+		return 0                              # rule 1: full cube (plane at/above the ceiling everywhere)
+	if d00 <= 0 and d10 <= 0 and d11 <= 0 and d01 <= 0:
+		return MOD_FAM_BIT                    # rule 2: empty (shared FAM marker → AIR via canonical())
+	if d00 >= 0 and d00 <= 1 and d10 >= 0 and d10 <= 1 and d11 >= 0 and d11 <= 1 and d01 >= 0 and d01 <= 1:
+		# rule 3: every delta in [0,1] → the clip is inert, so the clipped plane IS the legacy linear
+		# ramp; use the legacy corner encoding (reuses the collider-proven baked models).
+		return ShapeCodec.make_modifier(2 * d00, 2 * d10, 2 * d11, 2 * d01, ShapeCodec.ANCHOR_BOTTOM)
+	return _slope_raw(d00, d10, d11, d01)     # rule 4: keep the tuple
 
 ## Liquid axis (WATER-SHORE §2): bits 48..53. Kind in 48..49, level (tenths) in 50..53.
 ## A pure render+sim overlay orthogonal to material/modifier/state — no physics function
@@ -204,12 +262,13 @@ static func canonical(v: int) -> int:
 	if m == BlockCatalog.AIR:
 		return 0                              # air never carries modifier/state/liquid
 	var cm := _canonical_modifier(m, modifier(v))
-	# A canonicalized shape with NO occupied volume is an EMPTY shape — the cell is AIR (VDS §3.2 /
-	# SUB-VOXEL §3.1). Two forms: a corner-height shape with all four corners 0 but a nonzero
-	# encoding (e.g. a TOP anchor bit); or a FAM LAYER of level 0 (the bare MOD_FAM_BIT marker).
-	# Modifier 0 (the FULL-cube encoding) is deliberately excluded.
+	# A canonicalized shape with NO occupied volume is an EMPTY shape → the cell is AIR (VDS §3.2 /
+	# SUB-VOXEL §3.1). The shared empty-FAM marker (MOD_FAM_BIT bare, no kind/payload) covers BOTH a
+	# FAM LAYER of level 0 (snow) and an empty SLOPE (SHARP-SLOPE §1.3 rule 2).
 	if cm == MOD_FAM_BIT:
-		return 0                              # empty FAM LAYER (level 0) → AIR
+		return 0                              # empty FAM shape (LAYER level 0 / empty SLOPE) → AIR
+	# A canonicalized corner-height shape with all four corners 0 but a nonzero encoding (e.g. a TOP
+	# anchor bit) is also EMPTY. Modifier 0 (the FULL-cube encoding) is deliberately excluded.
 	if cm != 0 and (cm & MOD_FAM_BIT) == 0 and (cm & MOD_CORNERS_MASK) == 0:
 		return 0
 	return pack(m, cm, _canonical_snow_fill(m, cm, _validate_state(m, state(v))),
@@ -235,19 +294,28 @@ static func _canonical_modifier(material: int, modifier_bits: int) -> int:
 		return 0
 	if modifier_bits == 0:
 		return 0                              # FULL cube (fast path)
-	# FAM shape families (SNOW-ACCUMULATION §1.3). Only FAM_LAYER (kind 0) exists today; an
-	# unknown family kind or a nonzero reserved band is malformed → strip to full cube (warn),
-	# the "ramp of water" discipline. A LAYER canonicalizes via make_layer: level 10 → 0 (full
-	# cube), 5 → the corner slab (85), 0 → MOD_FAM_BIT (the empty marker canonical() collapses to
-	# AIR), 1..4/6..9 → the FAM value. This keeps ONE modifier int per geometric shape.
+	# FAM shape families (bit 15): dispatch on the KIND field (SNOW-ACCUMULATION §1.3 / SHARP-SLOPE
+	# §1.3). The bare empty marker passes through (canonical() collapses it to AIR); kind 0 = LAYER
+	# canonicalizes via make_layer (snow), kind 1 = SLOPE via the shared _canonical_slope; a LAYER
+	# with a nonzero reserved band, or any other kind, is malformed → strip to full cube + warn (the
+	# "ramp of water" discipline). This keeps ONE modifier int per geometric shape across BOTH families.
 	if modifier_bits & MOD_FAM_BIT:
+		if modifier_bits == MOD_FAM_BIT:
+			return MOD_FAM_BIT                # bare empty-FAM marker → AIR (via canonical())
 		var kind := (modifier_bits >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK
-		var reserved := (modifier_bits >> 4) & 0xFF
-		if kind != FAM_LAYER or reserved != 0:
-			push_warning("CellCodec: unknown FAM shape family (kind %d, reserved %d) — stripped to full cube (0)"
-				% [kind, reserved])
-			return 0
-		return make_layer(modifier_bits & MOD_LAYER_LEVEL_MASK)
+		if kind == FAM_LAYER:
+			var reserved := (modifier_bits >> 4) & 0xFF
+			if reserved != 0:
+				push_warning("CellCodec: malformed FAM LAYER (reserved %d) — stripped to full cube (0)"
+					% reserved)
+				return 0
+			return make_layer(modifier_bits & MOD_LAYER_LEVEL_MASK)
+		if kind == FAM_SLOPE:
+			var d := slope_deltas(modifier_bits)
+			return _canonical_slope(d.x, d.y, d.z, d.w)
+		push_warning("CellCodec: unknown FAM kind %d in modifier %d — stripped to full cube (0)"
+			% [kind, modifier_bits])
+		return 0
 	# Corner-height family: clamp each 2-bit corner (value 3 → 2, VDS §3.2).
 	var c0 := mini(modifier_bits & 3, 2)
 	var c1 := mini((modifier_bits >> 2) & 3, 2)

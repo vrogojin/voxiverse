@@ -27,14 +27,7 @@ func _ready() -> void:
 	# for a temperate land column above the sea (WGC §8), then _find_flat picks the
 	# flattest spot near it. The physics/breaking sandbox is the deterministic
 	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
-	# TEMPORARY snow-accumulation demo spawn — drops the player on a deep-snow B_SNOWY flat (surface
-	# ≈ -8.4 °C near (-187, 289)) so the new variable-height snow accumulation (SNOW-ACCUMULATION
-	# Phase A2: graded snow_block cubes + a top LAYER filling the terrain into a white plane) is visible
-	# immediately, without the trek from origin. _find_snow_demo scans outward from the known good spot
-	# for the nearest deep-snow land column with a solid all-land 5×5 neighbourhood; _find_flat then picks
-	# the flattest patch there. REVERT before the PR — restore `var spawn := TerrainConfig.find_spawn()`.
-	const SNOW_DEMO_CENTER := Vector2i(-187, 289)
-	var spawn := _find_snow_demo(SNOW_DEMO_CENTER.x, SNOW_DEMO_CENTER.y)
+	var spawn := TerrainConfig.find_spawn()
 	var col := _find_flat(spawn.x, spawn.y)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
@@ -50,14 +43,6 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
-
-	# Diagnostic performance overlay (top-right): FPS, main-thread proc/phys ms, draw
-	# calls + primitives (GPU load), and godot_voxel pending-task counts (worker
-	# saturation). Lets us see the real frame-drop bottleneck in the browser. Remove
-	# once perf is settled.
-	var perf := PerfHUD.new()
-	perf.name = "PerfHUD"
-	add_child(perf)
 
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
@@ -105,33 +90,6 @@ func _setup_environment() -> void:
 
 ## Find the FLATTEST column near (cx, cz): the one whose 3x3 neighbourhood varies
 ## least in height, so the player starts on even ground.
-## TEMPORARY (snow-demo): the nearest deep-snow land column to (cx, cz) with a solid all-land 5×5
-## neighbourhood — a spot where the snow accumulation stack (SNOW-ACCUMULATION Phase A2) is graded and
-## visible. Scans outward in a growing box; requires the column to carry at least one full snow cube
-## (snow_stack_at whole >= 1) and every cell of its 5×5 footprint to be land at/above sea level (so the
-## player does not spawn on a snowy shore edge). Falls back to the centre if none is found in range.
-func _find_snow_demo(cx: int, cz: int) -> Vector2i:
-	for r in range(0, 160, 2):
-		for dz in range(-r, r + 1, 2):
-			for dx in range(-r, r + 1, 2):
-				if maxi(absi(dx), absi(dz)) != r:
-					continue                              # only the growing box RING (nearest-first)
-				var x := cx + dx
-				var z := cz + dz
-				var g := TerrainConfig.height_at(x, z)
-				if g < TerrainConfig.SEA_LEVEL + 1:
-					continue
-				if (((TerrainConfig.snow_stack_at(x, z, {}) >> 4) & 0xF) < 1):
-					continue                              # need a full snow cube (deep snow), not just a dusting
-				var all_land := true
-				for oz in range(-2, 3):
-					for ox in range(-2, 3):
-						if TerrainConfig.height_at(x + ox, z + oz) < TerrainConfig.SEA_LEVEL + 1:
-							all_land = false
-				if all_land:
-					return Vector2i(x, z)
-	return Vector2i(cx, cz)
-
 func _find_flat(cx: int, cz: int) -> Vector2i:
 	var best := Vector2i(cx, cz)
 	var best_spread := 0x7fffffff

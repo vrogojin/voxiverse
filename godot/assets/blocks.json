@@ -52,7 +52,11 @@
       "permeability": 0.2,
       "translucence": 0.0,
       "state_layout": [
-        "snow_capped"
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
       ],
       "transitions": [
         {
@@ -125,7 +129,11 @@
       "permeability": 0.0,
       "translucence": 0.0,
       "state_layout": [
-        "snow_capped"
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
       ],
       "transitions": [
         {
@@ -1179,7 +1187,11 @@
         "emissive": 0.0
       },
       "state_layout": [
-        "snow_capped"
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
       ],
       "transitions": [
         {
@@ -1321,7 +1333,11 @@
       },
       "attachment": 0.0,
       "state_layout": [
-        "snow_capped"
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
       ],
       "transitions": [
         {
@@ -1430,6 +1446,13 @@
       "solidity": 1.0,
       "permeability": 0.5,
       "translucence": 0.1,
+      "state_layout": [
+        "snow_capped",
+        "snow_fill_b0",
+        "snow_fill_b1",
+        "snow_fill_b2",
+        "snow_fill_b3"
+      ],
       "render": {
         "mode": "opaque",
         "cull_group": 0,

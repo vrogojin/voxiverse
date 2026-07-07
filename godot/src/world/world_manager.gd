@@ -27,6 +27,15 @@ var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 
+# The dormant-by-default snowfall SIMULATION (SNOW-ACCUMULATION Decision 4). Owned here and stepped from
+# `_process` on the MAIN thread; it grows/melts the variable-height snow around the player by writing
+# through the ONE choke point (`_write_cell` → `_edits`), so its output is persisted exactly like a
+# break/place edit. It is INERT until the player's position has been reported at least once (so it never
+# runs during the frozen prewarm, or in a headless world that has no player).
+var _snowfall: SnowfallSystem
+var _last_player_pos: Vector3 = Vector3.ZERO
+var _have_player_pos: bool = false
+
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
 # dictionary replaces the old `_removed` set: 0 = dug to air, >0 = solid cell.
@@ -77,9 +86,21 @@ func _ready() -> void:
 	add_child(_ground)
 	_ground.setup(self)
 
+	# The snowfall sim reads/writes the SAME overlay + generation both render paths derive from, so it is
+	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
+	_snowfall = SnowfallSystem.new()
+	_snowfall.setup(self)
+
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
+
+## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
+## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
+## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
+func _process(delta: float) -> void:
+	if _snowfall != null and _have_player_pos:
+		_snowfall.process(delta, _last_player_pos)
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -114,6 +135,10 @@ func update_streaming(player_pos: Vector3) -> void:
 		_streamer.update_center(player_pos)
 	if _ground != null:
 		_ground.update(player_pos)
+	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
+	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
+	_last_player_pos = player_pos
+	_have_player_pos = true
 
 ## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
 ## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the
@@ -165,7 +190,14 @@ func cell_solid(cell: Vector3i) -> bool:
 func _occ_span(v: int, fx: float, fz: float) -> Vector2:
 	if BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5:   # 1) MATERIAL GATE
 		return Vector2.ZERO
-	return ShapeCodec.span(CellCodec.modifier(v), fx, fz)  # 2) SHAPE (modifier 0 -> (0,1))
+	var sp := ShapeCodec.span(CellCodec.modifier(v), fx, fz)   # 2) SHAPE (modifier 0 -> (0,1))
+	# 3) SNOW FILL (SNOW-ACCUMULATION §2.4): a filled ramp holds snow in its remainder up to the plane
+	# `fill/10`, so the walkable surface is max(terrain shape, snow plane) — the player stands on the
+	# combined surface everywhere by construction (floor_under/blocked/ceiling all compose against this).
+	var fill := CellCodec.snow_fill(v)
+	if fill != 0:
+		return Vector2(0.0, maxf(sp.y, float(fill) / 10.0))
+	return sp
 
 ## True if the cell was dug out (edit overlay says air). Used by fast column loops
 ## (fallback mesher tops, ground collider) that only care about air-vs-solid at/
@@ -315,6 +347,19 @@ func effective_height(x: int, z: int) -> int:
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 	if _edits.get(cell, -1) == 0 or not cell_solid(cell):
 		return 0
+	# Snow first (SNOW-ACCUMULATION §2.5): a snow-FILLED ramp yields its snow BEFORE the terrain
+	# beneath. The first break clears the fill nibble AND the snow_capped skin (the snow is gone) and
+	# returns snow_block; the terrain ramp is re-exposed (still supported → no structural update), and
+	# the NEXT break takes the terrain. Digging thus removes worldgen snow without partial digging (§1.6).
+	var v0: int = cell_value_at(cell)
+	if CellCodec.snow_fill(v0) != 0:
+		var bare := CellCodec.with_snow_fill(v0, 0)
+		bare = CellCodec.with_state(bare, CellCodec.state(bare) & ~CellCodec.STATE_SNOW_CAPPED)
+		_write_cell(cell, bare)
+		wake_bodies_near(Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), _WAKE_RADIUS)
+		if _ground != null:
+			_ground.rebuild_now()
+		return BlockCatalog.id_of(&"snow_block")
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
 	_structural_update(cell, from_pos)  # only from the player break — never a spawn
@@ -389,6 +434,32 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	_edits[cell] = packed
 	if paint:
 		_paint_cell(cell, packed)
+
+# --- snowfall-sim support (SNOW-ACCUMULATION Decision 4) ------------------------
+# Three tiny primitives the SnowfallSystem composes over the ONE write choke point. It never bypasses
+# `_write_cell`; these only add the read + the baseline-revert + the debounced rebuild it needs.
+
+## True iff `cell` currently carries an overlay edit (dug air OR a placed/sim value). The sim uses this to
+## tell an in-place snow bump (already an edit) from ADDING a new snow cell (budget accounting), and to
+## refuse burying a NON-snow edit.
+func has_edit(cell: Vector3i) -> bool:
+	return _edits.has(cell)
+
+## Drop `cell`'s overlay edit so it reverts to its pure GENERATED value, and repaint that value into the
+## active render path. The sim calls this when a melting snow cell reaches its bare baseline: storing a
+## baseline-equal edit would be wasted (§4.4 "never write a cell whose new value equals its generated
+## value"), so the edit is removed instead. Safe for snow (no metadata); `_edit_columns` intentionally
+## keeps its entry (it only ever grows — a stale empty-overlay column just costs the collider one skip).
+func sim_revert_cell(cell: Vector3i) -> void:
+	if _edits.erase(cell):
+		_paint_cell(cell, TerrainConfig.generated_cell(cell.x, cell.y, cell.z))
+
+## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
+## The collider's own debounce coalesces further, and its loose-body gate means it does zero work unless a
+## body is actually nearby — a settled pile near the player costs nothing.
+func sim_ground_rebuild() -> void:
+	if _ground != null:
+		_ground.rebuild_now()
 
 # --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
 
@@ -744,11 +815,14 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 					cstack.append(nc)
 		var comp_ids: Dictionary = {}   # Vector3i -> int packed cell value
 		for c: Vector3i in comp:
-			# Strip the liquid overlay (WATER-SHORE §6): a detaching shore ramp must not
-			# take the ocean with it. The liquid axis is worldgen-only; mass/mesh key off
-			# mat/modifier and would ignore the bits, but the contract is "liquid never
-			# leaves worldgen", so we drop it at the VoxelBody capture boundary.
-			comp_ids[c] = CellCodec.strip_liquid(cell_value_at(c))
+			# Strip the liquid overlay (WATER-SHORE §6) AND the snow fill/skin (SNOW-ACCUMULATION §2.5):
+			# a detaching shore/snowy ramp must not take the ocean or a worldgen snow plane with it. Both
+			# the liquid axis and the snow fill are worldgen/sim-owned; mass/mesh key off mat/modifier and
+			# would ignore them, but the contract is "they never leave worldgen", so a detaching filled ramp
+			# falls BARE (the M1 §5.5 accepted class) — dropped at the VoxelBody capture boundary.
+			var cv := CellCodec.strip_liquid(cell_value_at(c))
+			cv = CellCodec.with_snow_fill(cv, 0)
+			comp_ids[c] = CellCodec.with_state(cv, CellCodec.state(cv) & ~CellCodec.STATE_SNOW_CAPPED)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
 		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)

@@ -19,14 +19,21 @@ const _EPS := 1e-6
 ## {verts: PackedVector3Array, normals: PackedVector3Array, uvs: PackedVector2Array,
 ## indices: PackedInt32Array}. FULL (modifier 0) → a unit cube.
 static func build(modifier: int) -> Dictionary:
+	# FAM LAYER (SNOW-ACCUMULATION §1.4): a thin flat slab, BOTTOM-anchored, with all four
+	# corner heights = level/10 — the uniform-height reuse of the corner builder (§3c "a thin-slab
+	# builder — trivial next to the ramp builder"). is_layer FIRST so its FAM modifier never decodes
+	# as corner heights.
+	if CellCodec.is_layer(modifier):
+		var lh := float(CellCodec.layer_level(modifier)) / 10.0
+		return _build_heights(lh, lh, lh, lh, ShapeCodec.ANCHOR_BOTTOM)
 	var c := ShapeCodec.corners(modifier)
 	var anc := ShapeCodec.anchor(modifier)
-	# Corner surface heights in blocks.
-	var h00 := float(c.x) * 0.5
-	var h10 := float(c.y) * 0.5
-	var h11 := float(c.z) * 0.5
-	var h01 := float(c.w) * 0.5
-	var main := (c.x + c.z) >= (c.y + c.w)
+	return _build_heights(float(c.x) * 0.5, float(c.y) * 0.5, float(c.z) * 0.5, float(c.w) * 0.5, anc)
+
+## Build the unit-cell mesh from four BLOCK-height corner surfaces (h00,h10,h11,h01) + anchor —
+## the shared geometry body for both the corner-height family and the uniform FAM LAYER.
+static func _build_heights(h00: float, h10: float, h11: float, h01: float, anc: int) -> Dictionary:
+	var main := (h00 + h11) >= (h10 + h01)
 
 	var arr := {
 		"verts": PackedVector3Array(),

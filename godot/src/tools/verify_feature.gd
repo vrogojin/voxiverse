@@ -4442,6 +4442,19 @@ func _test_sharp_slope() -> void:
 	_ok(plateau_ok, "slope-parity: surface_tris includes the plateau {D≥1} polygon (full-height prisms exist)")
 	_ok(parity_ok, "slope-parity: collider prism surface (surface_tris) == rendered/analytic H at every solid footprint")
 
+	# contact_area smoke: the structural-joint query must stay finite in [0,1] for slope↔slope,
+	# slope↔legacy and slope↔full pairs across all three axes (the LUT-bypass / triangle-clip paths).
+	var ca_ok := true
+	var ca_partners := [0, ShapeCodec.make_modifier(2, 2, 0, 0), CellCodec.make_slope(2, 1, -1, 0), CellCodec.make_slope(3, 2, 1, 0)]
+	for m: int in parity_modifiers:
+		for p: int in ca_partners:
+			for ax in 3:
+				var caab := ShapeCodec.contact_area(m, p, ax)
+				var caba := ShapeCodec.contact_area(p, m, ax)
+				if is_nan(caab) or caab < -1e-6 or caab > 1.0 + 1e-6 or is_nan(caba) or caba < -1e-6 or caba > 1.0 + 1e-6:
+					ca_ok = false
+	_ok(ca_ok, "slope-parity: contact_area finite in [0,1] for slope×{slope,legacy,full} on all axes")
+
 	# --- placement + physics pins ----------------------------------------------------
 	_test_sharp_slope_live()
 	# --- S2 worldgen: emission, byte-identity, collider contract, both-path mirror ----

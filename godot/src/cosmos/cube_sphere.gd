@@ -70,6 +70,34 @@ const BODY_R := {
 	"moon": 1737,
 }
 
+# ---------------------------------------------------------------------------------------
+# COSMOS M1 — the single, easily-flippable planet toggle (docs/COSMOS-PLANET-TOPOLOGY.md §9 M1,
+# §3.5, §3.4, §6.1). THIS is the whole safety net: when FLAT_WORLD is true (the default) the
+# engine is BYTE-IDENTICAL to the pre-M1 flat world — the terrain adapter is the identity, the
+# §3.4 render bend is off, and gravity is the fixed-down stub. Flip it to false to enable the
+# curved face-4 window: 3D-noise worldgen sampled along d̂, the camera-centred exact-sphere
+# vertex bend (sea horizon at ~147 blocks), and the real toward-centre gravity field.
+#
+# TO BUILD A CURVED DEMO: change the one line below to `const FLAT_WORLD := false`.
+const FLAT_WORLD := true
+
+## The cube face the M1 window is homed on (§3.5: "flat world reinterpreted as a face-4 window").
+## Face 4 is +Z polar (a pole on the face centre, §5.2) so the window is defect-free lattice.
+const HOME_FACE := 4
+
+## The body the M1 window lives on (§1.1 table). Earth: N=10016, R=6371.
+const HOME_BODY := "earth"
+
+## Datum surface gravity in m/s² (§6.1). The standard-gravity anchor used to derive GM = g0·R²
+## so the field is exactly g0 at the datum (r = 0) and falls off as 1/r² above it.
+const SURFACE_GRAVITY := 9.81
+
+## GM (gravitational parameter, in block·m²/s² bookkeeping units) for a body: g0·R² so that
+## |gravity| = GM/(R+r)² equals SURFACE_GRAVITY exactly at the datum r = 0 (§6.1).
+static func gm_for(body: String) -> float:
+	var rr := float(radius_for(body))
+	return SURFACE_GRAVITY * rr * rr
+
 # Edge-remap table cache, keyed by N (the affine offsets scale with N). Built on first use.
 static var _edge_cache: Dictionary = {}
 

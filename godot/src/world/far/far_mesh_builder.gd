@@ -135,14 +135,17 @@ static func assemble(job: Dictionary) -> Dictionary:
 			normals[vi] = Vector3(dhx, 2.0 * cell, dhz).normalized()
 			vcolors[vi] = colors[vi]
 
-	# Top-surface triangles (LOD-DESIGN winding == the engine's +Y cube face).
+	# Top-surface triangles wound so the front face points UP (+Y). The original order faced DOWN, so
+	# the surface was back-face-culled and only the vertical skirts rendered ("grid of vertical bars");
+	# with culling off it showed its underside ("terrain rendered from underground"). Reversed here so
+	# it is viewed correctly from above, with CULL_BACK restored on the material.
 	for i in range(0, grid):
 		for j in range(0, grid):
 			var v00 := i * side + j
 			var v01 := i * side + (j + 1)
 			var v11 := (i + 1) * side + (j + 1)
 			var v10 := (i + 1) * side + j
-			indices.append_array([v00, v01, v11, v00, v11, v10])
+			indices.append_array([v00, v11, v01, v00, v10, v11])
 
 	# Skirts: extrude every tile edge straight down (LOD-DESIGN §1.4). Skirt vertices copy
 	# their top vertex's normal + colour (no dark walls). Per-edge (non-deduplicated) so the

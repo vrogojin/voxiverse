@@ -724,7 +724,7 @@ static func generated_cell(x: int, y: int, z: int) -> int:
 ## The per-cell pipeline given a column's precomputed profile scalars (g, biome,
 ## c, t). Returns the PACKED cell value (== bare material id today; sub-voxel adds
 ## modifiers later). This is the single hot function both render paths share.
-static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null) -> int:
+static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null, slope_run: int = -1) -> int:
 	if not _ids_ready:
 		_ensure_ids()
 	if y < WORLD_BOTTOM_Y:
@@ -734,8 +734,24 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
 	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
 	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
-	if _slope_fires_only(x, z, g, pcache):
-		var tw := _slope_whole_targets(x, z, pcache)
+	# PERF (S1 throughput): the slope run is COLUMN-invariant (no y dependence), yet resolve_cell runs
+	# once per y down a ~100-tall column — so the module worker HOISTS it, computing the packed run once
+	# per column and passing it in via `slope_run` (>= 0). This kills a per-y _corner_targets noise
+	# stencil + TreeGen.block_at tree-gate on every sub-surface cell. slope_run < 0 (the analytic path /
+	# default) recomputes exactly as before → BYTE-IDENTICAL. A passed run decodes fires/targets from the
+	# SAME pack the analytic memo + generated_modifier_at already round-trip through (verify-pinned;
+	# SLOPE_MAX_SPREAD=3 ⇒ Tw−g ∈ [−3,4] ⊂ the pack's lossless [−4,11] → no clamp loss).
+	var _slope_fires: bool
+	var tw: Vector4i
+	if slope_run >= 0:
+		_slope_fires = slope_run_fires(slope_run)
+		if _slope_fires:
+			tw = _slope_run_targets(slope_run, g)
+	else:
+		_slope_fires = _slope_fires_only(x, z, g, pcache)
+		if _slope_fires:
+			tw = _slope_whole_targets(x, z, pcache)
+	if _slope_fires:
 		var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
 		var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
 		if y >= lo and y <= hi - 1:

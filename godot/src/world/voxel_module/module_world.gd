@@ -1604,8 +1604,13 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				wx = rxs[idx2]
 				wz = rzs[idx2]
 				pcache.face = rfs[idx2]
+			# S1 throughput hoist: the SLOPE run is column-invariant, so compute it ONCE here (worker-
+			# direct pack, byte-identical to the analytic memo) and pass it into every resolve_cell of
+			# this column — else resolve_cell re-runs the _corner_targets noise stencil + TreeGen.block_at
+			# tree-gate on all ~100 sub-surface y's of a tall land column (the steady-state gen cost).
+			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
 			for y in range(size.y):
-				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache)
+				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache, srun)
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue

@@ -58,6 +58,7 @@ func _initialize() -> void:
 	_test_zone_bundle()
 	_test_snowy_world()
 	_test_mountains()
+	_test_sharp_slope()
 	_test_shader_prewarm()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -4232,6 +4233,209 @@ func _test_mountains() -> void:
 	else:
 		print("    (godot_voxel module absent — module-path peak render check runs on module builds only)")
 
+
+# SHARP-SLOPE (docs/SHARP-SLOPE.md): the FAM kind-1 SLOPE family. S1 verify items 1–2 (the
+# all-4096-payload codec/shape sweep, canonical rules, tiling proofs) + placement/physics pins.
+# The unclamped SLOPE corner plane D(fx,fz) — the same max-sum rule ShapeCodec._plane_at uses,
+# replicated so the test is independent of the private helper.
+func _slope_plane(d: Vector4i, fx: float, fz: float) -> float:
+	var c00 := float(d.x)
+	var c10 := float(d.y)
+	var c11 := float(d.z)
+	var c01 := float(d.w)
+	if (d.x + d.z) >= (d.y + d.w):
+		if fz <= fx:
+			return c00 + (c10 - c00) * fx + (c11 - c10) * fz
+		return c00 + (c11 - c01) * fx + (c01 - c00) * fz
+	if fx + fz <= 1.0:
+		return c00 + (c10 - c00) * fx + (c01 - c00) * fz
+	return (c10 + c01 - c11) + (c11 - c01) * fx + (c11 - c10) * fz
+
+func _test_sharp_slope() -> void:
+	print("[S1] sharp-slope: FAM kind-1 SLOPE family (codec/shape sweep + canonicalization + tiling)")
+	var FAM := CellCodec.MOD_FAM_BIT
+	var KIND := CellCodec.FAM_SLOPE << CellCodec.MOD_FAM_KIND_SHIFT
+
+	# --- Item 1: sweep ALL 4096 payloads through every query -------------------------
+	var no_nan := true
+	var span_ok := true
+	var vol_ok := true
+	var occ_ok := true
+	var tris_ok := true
+	var mc_ok := true
+	var mc_max_err := 0.0
+	var samples := [Vector2(0.15, 0.2), Vector2(0.5, 0.5), Vector2(0.8, 0.35), Vector2(0.3, 0.85), Vector2(0.95, 0.95)]
+	for payload in range(4096):
+		var m := FAM | KIND | payload
+		if not CellCodec.is_slope(m):
+			no_nan = false
+			continue
+		var d := CellCodec.slope_deltas(m)
+		# round-trip: the biased encode/decode is exact for in-range deltas
+		if CellCodec._slope_raw(d.x, d.y, d.z, d.w) != m:
+			no_nan = false
+		var v := ShapeCodec.volume(m)
+		if is_nan(v) or v < -1e-6 or v > 1.0 + 1e-6:
+			vol_ok = false
+		# Monte-Carlo volume: mean of clamp(D,0,1) over the unit square (== ∫ height_at).
+		var acc := 0.0
+		var grid := 12
+		for iu in grid:
+			for iv in grid:
+				var fx := (float(iu) + 0.5) / float(grid)
+				var fz := (float(iv) + 0.5) / float(grid)
+				acc += ShapeCodec.height_at(m, fx, fz)
+		var mc := acc / float(grid * grid)
+		mc_max_err = maxf(mc_max_err, absf(mc - v))
+		if absf(mc - v) > 0.02:
+			mc_ok = false
+		for s: Vector2 in samples:
+			var h := ShapeCodec.height_at(m, s.x, s.y)
+			if is_nan(h) or h < -1e-6 or h > 1.0 + 1e-6:
+				no_nan = false
+			var sp := ShapeCodec.span(m, s.x, s.y)
+			if is_nan(sp.x) or is_nan(sp.y) or sp.y < -1e-6 or sp.y > 1.0 + 1e-6 or sp.x < -1e-6:
+				span_ok = false
+			# occupied consistent with span: a point at mid-span is in, well above H is out.
+			if sp.y > 0.05:
+				if not ShapeCodec.occupied(m, s.x, sp.y * 0.5, s.y):
+					occ_ok = false
+				if ShapeCodec.occupied(m, s.x, sp.y + 0.2, s.y):
+					occ_ok = false
+		# surface_tris: non-degenerate, and the surface is single-valued (each tri's normal has
+		# a positive y so it is a genuine top facet, never a vertical sliver).
+		for tri: Dictionary in ShapeCodec.surface_tris(m):
+			var n: Vector3 = tri["normal"]
+			if is_nan(n.x) or n.length() < 0.5 or n.y < -1e-4:
+				tris_ok = false
+	_ok(no_nan, "slope-sweep: 4096 payloads decode + height_at is finite in [0,1] (round-trip exact)")
+	_ok(vol_ok, "slope-sweep: volume finite in [0,1] for every payload")
+	_ok(span_ok, "slope-sweep: span finite, span.y in [0,1] for every payload")
+	_ok(occ_ok, "slope-sweep: occupied consistent with span (in at mid-span, out above H)")
+	_ok(tris_ok, "slope-sweep: surface_tris non-degenerate, upward-facing (single-valued top)")
+	_ok(mc_ok, "slope-sweep: volume == Monte-Carlo ∫clamp(D,0,1) within 0.02 (max err %.4f)" % mc_max_err)
+
+	# --- Canonical rules 1.3.1–1.3.4 -------------------------------------------------
+	_ok(CellCodec.make_slope(2, 2, 2, 2) == 0, "slope-canon: rule 1 all d≥1 → full cube (0)")
+	_ok(CellCodec.make_slope(1, 1, 1, 1) == 0, "slope-canon: rule 1 all d==1 → full cube (0)")
+	# rule 2: all d≤0 → the empty-FAM marker, which canonical() collapses to AIR.
+	_ok(CellCodec.make_slope(-2, 0, -1, 0) == FAM, "slope-canon: rule 2 all d≤0 → empty-FAM marker")
+	_ok(CellCodec.canonical(CellCodec.pack(STONE, CellCodec.make_slope(-2, 0, -1, 0))) == 0,
+		"slope-canon: rule 2 empty-FAM marker collapses the cell to AIR")
+	# rule 3: all d∈{0,1} (mixed) → the legacy corner modifier, NOT a slope.
+	var leg := CellCodec.make_slope(0, 1, 1, 0)
+	_ok(leg == ShapeCodec.make_modifier(0, 2, 2, 0, ShapeCodec.ANCHOR_BOTTOM) and not CellCodec.is_slope(leg),
+		"slope-canon: rule 3 all d∈{0,1} → legacy corner modifier (reuses baked shape)")
+	# rule 4: an out-of-band tuple is kept as a slope and round-trips exactly.
+	var kept := CellCodec.make_slope(3, -1, 0, 2)
+	_ok(CellCodec.is_slope(kept) and CellCodec.slope_deltas(kept) == Vector4i(3, -1, 0, 2),
+		"slope-canon: rule 4 mixed tuple kept as SLOPE, round-trips")
+	# uniqueness / idempotence: a kept slope canonicalizes to itself.
+	var pk := CellCodec.pack(STONE, kept)
+	_ok(CellCodec.canonical(pk) == pk, "slope-canon: canonical(pack(stone, slope)) == itself (idempotent)")
+	# junk FAM kind (kind 2) strips to full cube + warns.
+	var junk := FAM | (2 << CellCodec.MOD_FAM_KIND_SHIFT) | 0x1FF
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, junk))) == 0,
+		"slope-canon: unknown FAM kind strips to full cube (0)")
+	# non-solid gate: a slope on water strips to full cube (no ramp of water).
+	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(BlockCatalog.id_of(&"water"), kept))) == 0,
+		"slope-canon: slope on a non-solid material strips (no ramp of water)")
+	# mass composes volume.
+	var mv := CellCodec.pack(STONE, CellCodec.make_slope(3, 3, 0, 0))
+	_ok(is_equal_approx(BlockCatalog.mass_of_value(mv), BlockCatalog.mass_of(STONE) * ShapeCodec.volume(CellCodec.modifier(mv))),
+		"slope-canon: mass_of_value == density × volume(slope)")
+
+	# --- Item 2: tiling proofs -------------------------------------------------------
+	# A vertical RUN: cell y carries make_slope(Tw − y). Stacking (d, d−1, d−2, …) the union of
+	# spans is one contiguous interval topped at clamp(D). Proof: Σ_k clamp(D−k, 0, 1) == clamp(D, 0, N).
+	# Run-base tuples with all deltas in [0,3] and spread ≤ SLOPE_MAX_SPREAD (=3): exactly the shape a
+	# run at y=lo carries, so every run cell's deltas stay in the encodable [−3,+4] over k=0..3.
+	var tile_ok := true
+	var contig_ok := true
+	var tuples := [Vector4i(3, 1, 0, 2), Vector4i(2, 3, 1, 0), Vector4i(0, 2, 3, 1), Vector4i(3, 2, 1, 0)]
+	var ncells := 4
+	for base: Vector4i in tuples:
+		for s: Vector2 in samples:
+			var dsum := 0.0
+			var prev_h := 1.0
+			for k in ncells:
+				var mk := CellCodec.make_slope(base.x - k, base.y - k, base.z - k, base.w - k)
+				# span handles every canonical form: full cube (0 → (0,1)), legacy corner collapse,
+				# kept SLOPE, and the empty-FAM marker (→ ZERO).
+				var hk := ShapeCodec.span(mk, s.x, s.y).y
+				# a run cell is full whenever the cell above it holds material (no gap/sliver)
+				if hk > 1e-4 and prev_h < 1.0 - 1e-4:
+					contig_ok = false
+				prev_h = hk
+				dsum += hk
+			var expect := clampf(_slope_plane(base, s.x, s.y), 0.0, float(ncells))
+			if absf(dsum - expect) > 1e-3:
+				tile_ok = false
+	_ok(tile_ok, "slope-tiling: Σ run-cell heights == clamp(D, 0, N) (gap-free vertical tiling)")
+	_ok(contig_ok, "slope-tiling: a run cell is full wherever the cell above holds material (no sliver)")
+	# horizontal edge continuity: two cells sharing an edge with equal corner deltas have equal H
+	# along that edge (crack-free). Cell A +X edge (d10,d11) meets cell B −X edge (d00,d01).
+	var edge_ok := true
+	var ca := CellCodec.make_slope(3, 2, -1, 0)      # A: +X edge corners d10=2, d11=-1
+	var cb := CellCodec.make_slope(2, 3, 1, -1)      # B: −X edge corners d00=2, d01=-1 (== A's +X edge)
+	for tt in 9:
+		var fz := float(tt) / 8.0
+		var ha := ShapeCodec.height_at(ca, 1.0, fz)   # A's +X face (fx=1)
+		var hb := ShapeCodec.height_at(cb, 0.0, fz)   # B's −X face (fx=0)
+		if absf(ha - hb) > 1e-4:
+			edge_ok = false
+	_ok(edge_ok, "slope-tiling: shared-edge H equal for adjacent slope cells (crack-free)")
+
+	# --- placement + physics pins ----------------------------------------------------
+	_test_sharp_slope_live()
+
+# S1 placement/physics: place a SLOPE cell, drive floor_under / break / VoxelBody, render both paths.
+func _test_sharp_slope_live() -> void:
+	var SLOPE := CellCodec.make_slope(2, 2, -1, -1)   # descending along +z, plane D = 2 − 3·fz
+	_ok(CellCodec.is_slope(SLOPE), "slope-live: test modifier is a kept SLOPE")
+	var world: WorldManager = _struct_world("S1Slope")
+	var col := _grass_column()
+	var cx := col.x
+	var cz := col.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	var rc := Vector3i(cx, g + 1, cz)
+	_ok(world.place_block(rc, CellCodec.pack(STONE, SLOPE)), "slope-live: place a stone SLOPE cell")
+	_ok(world.cell_solid(rc), "slope-live: placed slope cell is solid")
+	_ok(CellCodec.modifier(world.cell_value_at(rc)) == SLOPE, "slope-live: placed cell carries the slope modifier")
+	# floor_under == cell.y + clamp(D) at footprints where the slope cell is OCCUPIED (H > 0), so the
+	# floor reads the placed slope, not the (possibly smoothed) ground below it. SLOPE plane D=2−3fz
+	# on fz ≤ fx=0.5, so fz ∈ {0.1,0.3,0.5} all give H > 0.
+	var floor_ok := true
+	for s: Vector2 in [Vector2(0.5, 0.1), Vector2(0.5, 0.3), Vector2(0.5, 0.5)]:
+		var expect := float(g + 1) + clampf(_slope_plane(CellCodec.slope_deltas(SLOPE), s.x, s.y), 0.0, 1.0)
+		var got := world.floor_under(float(cx) + s.x, float(cz) + s.y, float(g) + 4.0)
+		if not is_equal_approx(got, expect):
+			floor_ok = false
+	_ok(floor_ok, "slope-live: floor_under == cell.y + clamp(D) across the slope face (parity)")
+	# fallback mesher builds real geometry for the slope chunk.
+	var n := TerrainConfig.CHUNK_SIZE
+	var fb := ChunkMesher.build(floori(float(cx) / float(n)), floori(float(cz) / float(n)), world)
+	_ok(fb != null and fb.get_surface_count() > 0, "slope-live: fallback mesher builds the slope chunk")
+	# break returns the material.
+	_ok(world.break_terrain(rc, Vector3.INF) == STONE, "slope-live: break_terrain returns the slope material (STONE)")
+	world.queue_free()
+	# a loose VoxelBody keeps the FAM modifier + weighs density × volume.
+	var mworld: WorldManager = _struct_world("S1SlopeMass")
+	var vb := VoxelBody.spawn_loose(mworld, {Vector3i.ZERO: CellCodec.pack(STONE, SLOPE)}, mworld)
+	_ok(vb != null, "slope-live: spawn a loose stone-SLOPE VoxelBody")
+	if vb != null:
+		_ok(is_equal_approx(vb.mass, BlockCatalog.mass_of(STONE) * ShapeCodec.volume(SLOPE)),
+			"slope-live: VoxelBody mass == density × volume(slope) = %.1f (got %.1f)" % [BlockCatalog.mass_of(STONE) * ShapeCodec.volume(SLOPE), vb.mass])
+	mworld.queue_free()
+	# module path: a placed slope value resolves to a shaped ARID (lazy append, never a hole).
+	if ClassDB.class_exists("VoxelTerrain"):
+		var mw: Node = load("res://src/world/voxel_module/module_world.gd").new()
+		get_root().add_child(mw)
+		if bool(mw.call("setup")):
+			var arid: int = mw.call("arid_for", STONE, SLOPE)
+			_ok(arid > 0, "slope-live: module arid_for(stone, slope) yields a shaped ARID (%d)" % arid)
+			_ok(int(mw.call("arid_for", STONE, SLOPE)) == arid, "slope-live: slope ARID stable on re-lookup")
+		mw.queue_free()
 
 # Shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). Headless has NO GPU so we
 # cannot assert pipelines actually compiled; instead we fence the ENUMERATION and

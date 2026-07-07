@@ -4251,6 +4251,26 @@ func _slope_plane(d: Vector4i, fx: float, fz: float) -> float:
 		return c00 + (c10 - c00) * fx + (c01 - c00) * fz
 	return (c10 + c01 - c11) + (c11 - c01) * fx + (c11 - c10) * fz
 
+# The surface y of the covering triangle at footprint (fx,fz), or null if no tri covers it — the
+# collider's prism top there. XZ point-in-triangle + barycentric interpolation of the vertex y's.
+func _slope_tri_y_at(tris: Array, fx: float, fz: float):
+	var best = null
+	for tri: Dictionary in tris:
+		var a: Vector3 = tri["v0"]
+		var b: Vector3 = tri["v1"]
+		var c: Vector3 = tri["v2"]
+		var d := (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z)
+		if absf(d) < 1e-9:
+			continue
+		var w0 := ((b.z - c.z) * (fx - c.x) + (c.x - b.x) * (fz - c.z)) / d
+		var w1 := ((c.z - a.z) * (fx - c.x) + (a.x - c.x) * (fz - c.z)) / d
+		var w2 := 1.0 - w0 - w1
+		if w0 >= -1e-4 and w1 >= -1e-4 and w2 >= -1e-4:
+			var y := w0 * a.y + w1 * b.y + w2 * c.y
+			if best == null or y > float(best):
+				best = y                                  # topmost covering tri = the walkable/collider surface
+	return best
+
 func _test_sharp_slope() -> void:
 	print("[S1] sharp-slope: FAM kind-1 SLOPE family (codec/shape sweep + canonicalization + tiling)")
 	var FAM := CellCodec.MOD_FAM_BIT
@@ -4385,6 +4405,42 @@ func _test_sharp_slope() -> void:
 		if absf(ha - hb) > 1e-4:
 			edge_ok = false
 	_ok(edge_ok, "slope-tiling: shared-edge H equal for adjacent slope cells (crack-free)")
+
+	# --- render/physics PARITY (the whole point): the collider prisms come from surface_tris, so
+	# for every footprint where the shape is solid (H>0) there is a surface triangle whose height
+	# equals the rendered/analytic surface H — collider covers EXACTLY what renders. The plateau
+	# {D≥1} polygon is load-bearing: without it the full-height uphill part would have no collision.
+	var parity_ok := true
+	var plateau_ok := true
+	var parity_modifiers := [
+		CellCodec.make_slope(2, 2, -1, -1), CellCodec.make_slope(3, 1, 0, 2),
+		CellCodec.make_slope(2, 3, 0, 1), CellCodec.make_slope(1, 3, 2, 0),
+		CellCodec.make_slope(3, 0, -1, 1), CellCodec.make_slope(2, -1, -1, 2)]
+	for m: int in parity_modifiers:
+		if not CellCodec.is_slope(m):
+			continue
+		var tris: Array = ShapeCodec.surface_tris(m)
+		var has_plateau := false
+		for tri: Dictionary in tris:
+			var n: Vector3 = tri["normal"]
+			if n.y > 0.999 and absf((tri["v0"] as Vector3).y - 1.0) < 1e-4:
+				has_plateau = true                        # a flat tri at y=1 == the plateau
+		# does the modifier HAVE a plateau region ({D≥1} somewhere)? (max delta ≥ 1 for a kept slope)
+		var d := CellCodec.slope_deltas(m)
+		if maxi(maxi(d.x, d.y), maxi(d.z, d.w)) >= 1 and not has_plateau:
+			plateau_ok = false
+		for iu in 7:
+			for iv in 7:
+				var fx := (float(iu) + 0.5) / 7.0
+				var fz := (float(iv) + 0.5) / 7.0
+				var h := ShapeCodec.height_at(m, fx, fz)          # render/analytic surface
+				if h <= 1e-3:
+					continue                                      # empty footprint — no prism needed
+				var covered = _slope_tri_y_at(tris, fx, fz)
+				if covered == null or absf(float(covered) - h) > 2e-3:
+					parity_ok = false
+	_ok(plateau_ok, "slope-parity: surface_tris includes the plateau {D≥1} polygon (full-height prisms exist)")
+	_ok(parity_ok, "slope-parity: collider prism surface (surface_tris) == rendered/analytic H at every solid footprint")
 
 	# --- placement + physics pins ----------------------------------------------------
 	_test_sharp_slope_live()

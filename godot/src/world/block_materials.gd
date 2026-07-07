@@ -18,12 +18,24 @@ static var _cache: Dictionary = {}    # int block_id -> StandardMaterial3D
 ## ice, cull_group > 0) get an alpha-blended material (WGC §5.1); emissive blocks
 ## (lava) get a glow. The look is driven by BlockCatalog.render_def_of — a data change,
 ## not a code change.
-static func get_for(block_id: int) -> StandardMaterial3D:
+## Returns a Material (StandardMaterial3D in the default FLAT_WORLD; a bend ShaderMaterial when
+## the COSMOS planet is on — see _bend_material). Both share the same per-id cache.
+static func get_for(block_id: int) -> Material:
 	if block_id == BlockCatalog.AIR:
 		return null
-	var cached: StandardMaterial3D = _cache.get(block_id, null)
+	var cached: Material = _cache.get(block_id, null)
 	if cached != null:
 		return cached
+	# COSMOS M1 (§3.4): when the planet is on, every material carries the shared camera-centred bend
+	# shader so ALL geometry (terrain, water, trees, placed blocks, VoxelBody debris — everything
+	# flows through here) curves onto the sphere with one code path, keeping each block's own albedo/
+	# texture/emission. FLAT_WORLD (default) returns today's StandardMaterial3D — byte-identical.
+	var mat: Material = _standard(block_id) if CubeSphere.FLAT_WORLD else _bend_material(block_id)
+	_cache[block_id] = mat
+	return mat
+
+## Today's per-id StandardMaterial3D look (unchanged from pre-M1) — the FLAT_WORLD material.
+static func _standard(block_id: int) -> StandardMaterial3D:
 	var tex := BlockTextures.texture_for(block_id)
 	var rd := BlockCatalog.render_def_of(block_id)
 	var color := BlockCatalog.color_of(block_id)
@@ -38,8 +50,33 @@ static func get_for(block_id: int) -> StandardMaterial3D:
 		mat.emission_enabled = true
 		mat.emission = Color(color.r, color.g, color.b)
 		mat.emission_energy_multiplier = float(rd.get("emissive_glow", 1.0))
-	_cache[block_id] = mat
 	return mat
+
+## The COSMOS M1 bend material (§3.4): a ShaderMaterial mirroring _standard's look (unshaded,
+## textured / flat-swatch / translucent, optional emission) with the shared camera-centred sphere
+## vertex bend. Only built when CubeSphere.FLAT_WORLD is false.
+static func _bend_material(block_id: int) -> ShaderMaterial:
+	CosmosBend.ensure_globals()
+	var tex := BlockTextures.texture_for(block_id)
+	var rd := BlockCatalog.render_def_of(block_id)
+	var color := BlockCatalog.color_of(block_id)
+	var translucent: bool = rd.get("translucent", false)
+	var m := ShaderMaterial.new()
+	m.shader = CosmosBend.translucent_shader() if translucent else CosmosBend.opaque_shader()
+	if tex != null:
+		m.set_shader_parameter("albedo_tex", tex)
+		m.set_shader_parameter("use_texture", true)
+	else:
+		m.set_shader_parameter("use_texture", false)
+	if translucent:
+		m.set_shader_parameter("albedo_color", color)          # tint + alpha; no per-voxel vertex color
+	else:
+		m.set_shader_parameter("albedo_color", Color(1, 1, 1, 1) if tex != null else color)
+		m.set_shader_parameter("use_vertex_color", true)
+		if rd.get("emissive", false):
+			m.set_shader_parameter("emission_color", Color(color.r, color.g, color.b))
+			m.set_shader_parameter("emission_energy", float(rd.get("emissive_glow", 1.0)))
+	return m
 
 ## Drop the entire per-id render-material cache (RUNTIME-MATERIAL-STREAMING §2.6 session
 ## boundary): a fresh session (world-load / peer session) may bind a given dense LRID to a
@@ -56,9 +93,12 @@ static func reset_cache() -> void:
 ## VoxelBody surface) — so the look updates everywhere with no rebake/remesh. A no-op if
 ## nothing has cached this id yet (the next `get_for` builds it fresh from the real look).
 static func refresh(block_id: int) -> void:
-	var mat: StandardMaterial3D = _cache.get(block_id, null)
-	if mat == null:
+	var cached: Material = _cache.get(block_id, null)
+	# Bend ShaderMaterials (COSMOS curved mode) have no albedo_color/emission properties; in-place
+	# streaming refresh is a StandardMaterial3D-only path (unchanged in the default flat world).
+	if cached == null or not (cached is StandardMaterial3D):
 		return
+	var mat := cached as StandardMaterial3D
 	var color := BlockCatalog.color_of(block_id)
 	# Flat-swatch materials (no tile, the placeholder + streamed-material case) carry the
 	# colour in albedo_color; textured materials tint white and keep the texture.

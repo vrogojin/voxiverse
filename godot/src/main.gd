@@ -7,6 +7,8 @@ extends Node3D
 # boundary at 256 blocks dissolves into the horizon (DESIGN §1).
 const SKY_COLOR := Color(0.62, 0.74, 0.86)
 
+var _player: Player
+
 func _ready() -> void:
 	_setup_environment()
 
@@ -15,6 +17,7 @@ func _ready() -> void:
 	add_child(world)
 
 	var player := Player.new()
+	_player = player
 	player.name = "Player"
 	player.world = world
 	# Minecraft-style hotbar inventory: one model, injected into Player (break/place)
@@ -56,6 +59,18 @@ func _ready() -> void:
 	prewarm.name = "ShaderPrewarm"
 	add_child(prewarm)
 	prewarm.begin(player, func() -> void: player.frozen = false)
+
+	# COSMOS M1 (§3.4): the render bend is camera-centred, so register + seed the global bend
+	# uniforms now. FLAT_WORLD (default) leaves them untouched — no bend materials are ever built.
+	if not CubeSphere.FLAT_WORLD:
+		CosmosBend.set_camera(player.camera_global_transform().origin)
+
+## Feed the camera position into the bend-origin global uniform each frame (curved mode only).
+## The bend is continuous around the camera (§3.4), so walking simply rolls the world under you.
+func _process(_delta: float) -> void:
+	if CubeSphere.FLAT_WORLD or _player == null:
+		return
+	CosmosBend.set_camera(_player.camera_global_transform().origin)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

@@ -292,8 +292,10 @@ func _camera_xform(player: Node3D) -> Transform3D:
 ## skipped if the catalog ships none). One material × every emitted modifier is enough
 ## to warm the shaped opaque pipeline; the extra two cover the shaped translucent /
 ## emissive looks.
-func _shaped_materials() -> Array[StandardMaterial3D]:
-	var mats: Array[StandardMaterial3D] = []
+func _shaped_materials() -> Array[Material]:
+	# Array[Material] (not StandardMaterial3D): BlockMaterials.get_for returns a bend ShaderMaterial
+	# when the COSMOS planet is on (CubeSphere.FLAT_WORLD false); both are Materials to warm.
+	var mats: Array[Material] = []
 	var opaque := BlockMaterials.get_for(BlockCatalog.GRASS)
 	if opaque != null:
 		mats.append(opaque)

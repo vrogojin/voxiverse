@@ -419,7 +419,10 @@ static func height_at(x: int, z: int) -> int:
 	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
 	# branch entirely, so the flat world is byte-identical.
 	if not CubeSphere.FLAT_WORLD:
-		return int(_curved_profile(_active_face, x, z).x)
+		# Route through the shared analytic memo (PERF): far terrain, snowfall, per-voxel-env and the
+		# structural solver all call height_at every frame; without the memo each recomputed the full
+		# _curved_profile. Same value as the direct _curved_profile(_active_face, x, z).x, just cached.
+		return int(analytic_column_profile(x, z).x)
 	var fx := float(x)
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
@@ -631,16 +634,44 @@ static func generated_cell_global(face: int, i: int, j: int, r: int) -> int:
 ## A GenCtx for a single face-explicit query. On the main thread it reuses ONE cleared scratch context
 ## (no per-call allocation on the hot analytic cell path); off the main thread (e.g. a verify worker)
 ## it allocates a fresh one so the scratch is never shared across threads.
+# Bound on the persistent analytic column memo (columns are Vector4, ~65k entries ≈ a few MB). When the
+# player explores past this many distinct columns the memo is dropped and rebuilt; spatial locality means
+# the working set (the near neighbourhood the player/collider/far-mesh sample each frame) is tiny, so the
+# hit rate stays ~1.0 well under the cap.
+const _ANALYTIC_MEMO_CAP := 1 << 16
 static var _analytic_ctx: GenCtx = null
 static func _acquire_ctx(face: int) -> GenCtx:
 	if _on_main_thread():
 		if _analytic_ctx == null:
 			_analytic_ctx = GenCtx.new(face)
 		else:
+			# PERF (curved analytic hot path): PERSIST the per-column memo across calls. Worldgen is a pure
+			# function of (face, i, j) and the memo key ENCODES the face (Vector3i(face, i, j)), so entries
+			# are never stale and entries for different faces never collide. Clearing it every call (as
+			# before) forced every generated_cell_global to recompute the full _curved_profile (~8× noise3d +
+			# f64 direction math), so a single vertical column scan (surface_y, floor_under, collider, far
+			# mesh) paid it once PER CELL instead of once per column. We do NOT clear on a face change —
+			# seam-adjacent queries legitimately alternate between the home face and a neighbour face
+			# (cell_value_at folds to g.face near an edge), and face-distinct keys let both coexist; clearing
+			# there would thrash exactly at seams. Clear ONLY past the cap (bound memory). Output is
+			# byte-identical — this removes redundant recomputation, nothing else. `face` is still assigned
+			# every call so column_profile computes a MISSING entry against the correct face.
+			if _analytic_ctx.memo.size() > _ANALYTIC_MEMO_CAP:
+				_analytic_ctx.memo.clear()
 			_analytic_ctx.face = face
-			_analytic_ctx.memo.clear()
 		return _analytic_ctx
 	return GenCtx.new(face)
+
+## THE main-thread analytic column profile (PERF). Every main-thread curved query that needs a column
+## profile — the 2-arg height_at, the far LOD mesh builder, the sim fields — must route through this so
+## they SHARE the persistent per-column memo and never recompute _curved_profile for a column already
+## resolved this frame (or a recent frame). FLAT_WORLD keeps the exact pre-COSMOS path (plain
+## column_profile, no shared ctx) so the shipped flat game stays byte-identical in behaviour. Curved
+## threads the shared _analytic_ctx (memoised, face-scoped key). Output is identical either way.
+static func analytic_column_profile(x: int, z: int) -> Vector4:
+	if CubeSphere.FLAT_WORLD:
+		return column_profile(x, z)
+	return column_profile(x, z, _acquire_ctx(_active_face))
 
 ## THE curved worker generator entry (COSMOS-AUDIT §3.2 items 2–3, F1/F2). The voxel worker calls this
 ## per column with its FROZEN home face `gen_face` (an immutable per-generator snapshot — NEVER the

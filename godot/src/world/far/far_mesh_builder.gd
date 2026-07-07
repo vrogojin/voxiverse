@@ -19,7 +19,10 @@ extends RefCounted
 ## returned as {r, g, biome, t, clamped}. `clamped` == the vertex was pulled up to the
 ## sea surface (an open-water vertex → the sea palette).
 static func sample_point(wx: int, wz: int) -> Dictionary:
-	var p := TerrainConfig.column_profile(wx, wz)
+	# Route through the shared main-thread analytic memo (PERF): the far mesh samples many columns per
+	# frame; in curved mode an uncached column_profile recomputes the full _curved_profile each one. In
+	# flat mode analytic_column_profile is the plain column_profile (byte-identical to before).
+	var p := TerrainConfig.analytic_column_profile(wx, wz)
 	var g := int(p.x)
 	var biome := int(p.y)
 	var t := p.w

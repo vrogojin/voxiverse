@@ -56,11 +56,14 @@ common/max_physics_steps_per_frame=2
 ;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
 ;         = clamp(floor(0.0 * ...), 2, ...) = 2
 ; Fill-speed vs smoothness balance: worldgen is deterministic + per-chunk independent,
-; so worker threads parallelise it safely. 3 threads generate fast but FLOOD the single
-; main-thread mesh-apply (GPU upload must be main-thread) and oversubscribe low-core
-; laptops -> stutter. 2 keeps ~2x throughput without overrunning the consumer. The
-; pre-baked pthread pool proven to hold >=3 (3 loaded without deadlock).
-threads/count/minimum=2
+; so worker threads parallelise it safely. The pre-baked pthread pool holds >=3 (3 loaded
+; without deadlock), so raising this needs NO template rebuild — only a re-export.
+; COSMOS throughput experiment: the curved GDScript resolve_cell loop is the steady-state
+; gen bottleneck (Fable), so a 3rd generation worker is ~+50% raw gen rate. Trade-off to
+; watch: it feeds the SINGLE main-thread mesh-apply (threads/main/time_budget_ms below)
+; faster, so if the fill still lags the new choke is mesh-apply, not generation — raise the
+; main budget next, not the worker count. (2 was the smoothness-first default.)
+threads/count/minimum=3
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +

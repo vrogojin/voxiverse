@@ -1,0 +1,24 @@
+diff --git a/meshers/blocky/voxel_blocky_library.cpp b/meshers/blocky/voxel_blocky_library.cpp
+index b8449ed..b4c8974 100644
+--- a/meshers/blocky/voxel_blocky_library.cpp
++++ b/meshers/blocky/voxel_blocky_library.cpp
+@@ -55,6 +55,19 @@ void VoxelBlockyLibrary::load_default() {
+ void VoxelBlockyLibrary::bake() {
+ 	ZN_PROFILE_SCOPE();
+ 
++	// Skip the (expensive) full re-bake when nothing changed since the last bake.
++	// Every mutation (add_model / set_models / set_bake_tangents / _make_default…) sets
++	// _needs_baking = true, so a redundant bake no-ops here instead of re-running
++	// surface_get_arrays() + generate_side_culling_matrix() over the WHOLE library — a
++	// ~13 s main-thread GL-sync stall on the web build, and it fires TWICE per VoxelTerrain
++	// setup (start_updater() runs on both set_mesher and set_generator), so each home-face
++	// restream froze for ~27 s. _needs_baking defaults to true, so the first bake and every
++	// post-mutation bake still run; only the no-op re-bakes are skipped. Reading the bool
++	// outside the write lock is a benign race (worst case: one extra bake).
++	if (!_needs_baking) {
++		return;
++	}
++
+ 	RWLockWrite lock(_baked_data_rw_lock);
+ 
+ 	const uint64_t time_before = Time::get_singleton()->get_ticks_usec();

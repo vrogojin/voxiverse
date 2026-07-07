@@ -78,11 +78,20 @@ var _active_job: Dictionary = {}
 var _active_done := false
 
 # COSMOS M3: after a home-face flip re-bases the chart onto a neighbour face, this node's global-index
-# frame (its `position` offset) jumps by a large delta. The still-world-correct tiles from the old
-# frame are reparented here as a WORLD-FIXED cover so the horizon never blanks while the new frame
-# streams in; it is freed the moment the new frame has produced coverage. Null except mid-handoff.
-# FLAT_WORLD / no chart never flips, so this stays null and the node stays at position ZERO.
+# frame (its `position` offset) jumps by a large delta. The OLD-HOME-FACE tiles from the old frame are
+# reparented here as a WORLD-FIXED cover so the horizon never blanks while the new frame streams in; it
+# is freed the moment the new frame has produced coverage (or after COVER_MAX_SECONDS, whichever first).
+# Only OLD-HOME-FACE tiles are kept: a tile straddling a face edge (neighbouring side face) or the corner
+# quadrant was placed by the OLD home face's unfold convention, which differs from the new one, so it
+# would render VISIBLY DISPLACED against the (correctly restreamed) near field — Fable's bug-B root
+# cause. Those tiles are dropped here, not stashed, and heal from fresh nearest-first tiles behind the
+# cover. FLAT_WORLD / no chart never flips, so this stays null and the node stays at position ZERO.
 var _cover: Node3D = null
+## Cover lifetime backstop (s). The queue-drained retirement below can be starved indefinitely by a
+## moving player (every 64 m re-enqueues the whole far set under a 3 ms/frame budget), so force-retire
+## after this long regardless. With the freeze fixed the fresh frame rebuilds in a couple of seconds.
+const COVER_MAX_SECONDS := 12.0
+var _cover_age := 0.0
 
 func _ready() -> void:
 	if not ENABLED:
@@ -148,11 +157,13 @@ func update_center(pos: Vector3) -> void:
 func invalidate_tiles(_region: Rect2i) -> void:
 	pass
 
-## COSMOS M3 home-face flip handoff (Fable Stage 1). The chart re-based onto a neighbour face, so this
-## node's global-index frame jumped to `new_pos` = −(i_org, 0, j_org) on the new face. The current
-## live tiles are still WORLD-correct (the flip is teleport-free), so stash them under a world-fixed
-## cover — the horizon stays up while the new frame streams in behind it — then adopt the new frame and
-## force a full recompute. Main-thread only, touches no voxel worker. No-op with no live tiles.
+## COSMOS M3 home-face flip handoff (Fable Stage 1 + bug-B fix). The chart re-based onto a neighbour
+## face, so this node's global-index frame jumped to `new_pos` = −(i_org, 0, j_org) on the new face.
+## Only OLD-HOME-FACE tiles stay WORLD-correct across the flip; edge-straddling and corner-quadrant
+## tiles were placed by the old unfold convention and would render displaced against the restreamed
+## near field, so we KEEP only fully-in-old-face tiles as a world-fixed cover (horizon stays up behind
+## the new frame) and FREE the rest. Then adopt the new frame and force a full recompute. Main-thread
+## only, touches no voxel worker. No-op with no live tiles.
 func rebase_to(new_pos: Vector3) -> void:
 	if not ENABLED:
 		return
@@ -161,7 +172,9 @@ func rebase_to(new_pos: Vector3) -> void:
 	if _cover != null and is_instance_valid(_cover):
 		_cover.queue_free()
 	_cover = null
+	_cover_age = 0.0
 	if not _live.is_empty():
+		var n := CubeSphere.n_for(CubeSphere.HOME_BODY)   # face-edge cells; old-frame global range is [0, n)
 		var cover := Node3D.new()
 		cover.name = "FarStaleCover"
 		add_child(cover)
@@ -170,12 +183,21 @@ func rebase_to(new_pos: Vector3) -> void:
 		# each tile's local (old-frame global) coords are left untouched: world = new_pos + (old_pos −
 		# new_pos) + global_old = old_pos + global_old, its original world spot.
 		cover.position = old_pos - new_pos
+		var kept := 0
 		for key in _live.keys():
 			var mi = _live[key]
-			if is_instance_valid(mi):
-				remove_child(mi)
-				cover.add_child(mi)
-		_cover = cover
+			if not is_instance_valid(mi):
+				continue
+			remove_child(mi)
+			if _tile_fully_in_face(key, n):
+				cover.add_child(mi)                          # trustworthy old-home-face tile → cover
+				kept += 1
+			else:
+				mi.queue_free()                              # edge/corner tile → displaced under new frame; drop
+		if kept > 0:
+			_cover = cover
+		else:
+			cover.queue_free()                               # nothing trustworthy to bridge with
 	_live.clear()
 	_live_tris.clear()
 	_desired.clear()
@@ -198,7 +220,13 @@ func _recompute(e: Vector2) -> void:
 			continue
 		to_build.append(key)
 	var desired := _desired
+	# Normally coarse ring first (full horizon silhouette appears first — LOD-DESIGN §2.6). But while a
+	# post-flip cover is bridging, sort NEAREST-first instead: ring 0 abuts the near field where the
+	# handoff mismatch is most visible, so healing it first lets the cover retire sooner (Fable bug-B).
+	var cover_active := _cover != null
 	to_build.sort_custom(func(a, b):
+		if cover_active:
+			return float(desired[a]["min_dist"]) < float(desired[b]["min_dist"])
 		var ra: int = desired[a]["ring"]
 		var rb: int = desired[b]["ring"]
 		if ra != rb:
@@ -276,6 +304,17 @@ static func _box_max_dist(e: Vector2, lo: Vector2, hi: Vector2) -> float:
 	var dz := maxf(absf(e.y - lo.y), absf(e.y - hi.y))
 	return sqrt(dx * dx + dz * dz)
 
+## True iff tile `key`'s global-index footprint lies ENTIRELY within the current home face's cell range
+## [0, n) on both axes — i.e. it is pure old-home-face content that survives a flip world-unchanged. A
+## tile that straddles a face edge (folds onto a neighbouring side face) or the corner quadrant is
+## placed by the home face's unfold CONVENTION, which differs after the flip, so it must not be stashed
+## as cover (Fable bug-B). Footprint units are blocks = tile_m (1 m per cell), same as n.
+static func _tile_fully_in_face(key: Vector3i, n: int) -> bool:
+	var tile := float(RING_TABLE[key.x]["tile_m"])
+	var lo_x := float(key.y) * tile
+	var lo_z := float(key.z) * tile
+	return lo_x >= 0.0 and lo_x + tile <= float(n) and lo_z >= 0.0 and lo_z + tile <= float(n)
+
 # --- no-hole eviction (LOD-DESIGN §4.2) ---------------------------------------
 
 func _try_evictions() -> void:
@@ -313,16 +352,21 @@ func _free_tile(key) -> void:
 
 # --- build queue + per-frame budget (LOD-DESIGN §2.6) -------------------------
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if not ENABLED:
 		return
 	_drain(FAR_BUILD_BUDGET_MS)
 	# Retire the post-flip stale cover once the new frame has produced real coverage (queue drained AND
-	# at least one new tile is live), so the handoff shows no blank and leaves nothing lingering.
-	if _cover != null and _live.size() > 0 and not has_pending_build():
-		if is_instance_valid(_cover):
-			_cover.queue_free()
-		_cover = null
+	# at least one new tile is live), OR after COVER_MAX_SECONDS as a starvation backstop (a moving
+	# player re-enqueues the far set faster than the 3 ms/frame budget drains it, so "queue drained"
+	# can never arrive) — so the handoff shows no blank yet nothing lingers/misaligns indefinitely.
+	if _cover != null:
+		_cover_age += delta
+		var covered := _live.size() > 0 and not has_pending_build()
+		if covered or _cover_age >= COVER_MAX_SECONDS:
+			if is_instance_valid(_cover):
+				_cover.queue_free()
+			_cover = null
 
 func _drain(budget_ms: float) -> void:
 	var t0 := Time.get_ticks_usec()

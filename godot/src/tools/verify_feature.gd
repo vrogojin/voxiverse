@@ -212,7 +212,9 @@ func _test_manifest_trim() -> void:
 	for m: int in emitted:
 		eset[m] = true
 	_ok(emitted.size() > 0, "emitted modifier set is non-empty (%d)" % emitted.size())
-	_ok(emitted.size() < full.size(), "emitted set is TRIMMED vs the full %d corner tuples (%d)" % [full.size(), emitted.size()])
+	# Widened SLOPE threshold (SHARP-SLOPE): the emitted set now UNIONS the full corner-tuple set so no
+	# slope-adjacent whole-block-quantized shape can cube-fall-back. It is therefore ≥ the full set.
+	_ok(emitted.size() >= full.size(), "emitted set covers the full %d corner tuples for guaranteed coverage (%d)" % [full.size(), emitted.size()])
 	# M1 (ADR §6.4 / §8 item 9): the snow half-slab modifier (85) is unioned into the emitted set so
 	# the module path ALWAYS bakes (snow_block, 85) even though the temperate sample won't contain it.
 	_ok(eset.has(TerrainConfig.SNOW_SLAB_MODIFIER), "emitted set contains the snow half-slab modifier (%d)" % TerrainConfig.SNOW_SLAB_MODIFIER)

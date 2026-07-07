@@ -696,13 +696,18 @@ static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return false                                  # a tree rests here → keep the top FULL
 	var raw := _corner_targets(x, z, pcache)
-	# escape the legacy 2-cell window? compare raw targets in integer quarter-units (float-robust).
+	# escape the legacy ONE-cell window [g, g+1]? compare raw targets in integer quarter-units
+	# (float-robust). The half-block corner grid clamps a target of g+1.5 down to g+1.0, so a slope
+	# steeper than ~45° (1 block/cell) develops a 0.5-block riser at every cell boundary — the
+	# "ladder"/stacked-pyramid look. Firing SLOPE for anything reaching above g+1 replaces those
+	# laddered corner ramps with clean whole-block diagonals; slopes that stay within [g, g+1] are a
+	# single clean corner ramp and remain BYTE-IDENTICAL on today's smoothing path.
 	var r0 := roundi(raw.x * 4.0)
 	var r1 := roundi(raw.y * 4.0)
 	var r2 := roundi(raw.z * 4.0)
 	var r3 := roundi(raw.w * 4.0)
-	if mini(mini(r0, r1), mini(r2, r3)) >= g * 4 and maxi(maxi(r0, r1), maxi(r2, r3)) <= (g + 2) * 4:
-		return false                                  # stays inside the window → today's smoothing
+	if mini(mini(r0, r1), mini(r2, r3)) >= g * 4 and maxi(maxi(r0, r1), maxi(r2, r3)) <= (g + 1) * 4:
+		return false                                  # stays inside the one-cell window → today's smoothing
 	var tw0 := roundi(raw.x)
 	var tw1 := roundi(raw.y)
 	var tw2 := roundi(raw.z)
@@ -1092,6 +1097,13 @@ static func emitted_modifiers() -> PackedInt32Array:
 	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
 	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
 	seen[SNOW_SLAB_MODIFIER] = true
+	# The widened slope threshold (a slope >1 block/cell now emits SLOPE) leaves the ADJACENT legacy
+	# cells with whole-block-quantized corner modifiers whose exact orientations a spatial sample can
+	# miss — a missed one cube-falls-back (a stray pyramid). Union the FULL corner-height tuple set so
+	# NO smoothed cell can ever fall back. +~18 unique meshes over the sample → a small one-time
+	# main-thread bake cost, never the voxel worker.
+	for m: int in appearance_modifiers():
+		seen[m] = true
 	var out := PackedInt32Array()
 	for m: int in seen.keys():
 		out.append(m)

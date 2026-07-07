@@ -696,18 +696,29 @@ static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return false                                  # a tree rests here → keep the top FULL
 	var raw := _corner_targets(x, z, pcache)
-	# escape the legacy ONE-cell window [g, g+1]? compare raw targets in integer quarter-units
-	# (float-robust). The half-block corner grid clamps a target of g+1.5 down to g+1.0, so a slope
-	# steeper than ~45° (1 block/cell) develops a 0.5-block riser at every cell boundary — the
-	# "ladder"/stacked-pyramid look. Firing SLOPE for anything reaching above g+1 replaces those
-	# laddered corner ramps with clean whole-block diagonals; slopes that stay within [g, g+1] are a
-	# single clean corner ramp and remain BYTE-IDENTICAL on today's smoothing path.
+	# Which legacy smoothing window the corner-target plane ESCAPES decides firing (SHARP-SLOPE §3.2,
+	# DEFECT 2 — "don't touch hills"). Compare raw targets in integer quarter-units (float-robust):
+	#   * plane escapes the TWO-cell window [g, g+2] (a >2 block/cell face the legacy cap can't grade)
+	#     → fire in ANY biome (the original predicate — steep relief, e.g. badlands mesa walls); else
+	#   * plane escapes only the ONE-cell window [g, g+1] (the 1–2 block/cell, ~45° band) → fire ONLY
+	#     in the Mountains biome. The half-block corner grid clamps a g+1.5 target down to g+1.0, so a
+	#     >45° face develops a 0.5-block riser per cell — the mountain "ladder"/stacked-pyramid look
+	#     the widening kills. Confining the widening to B_MOUNTAINS leaves every hill/temperate 45°
+	#     step BYTE-IDENTICAL to the pre-widening build (whole-block quantization never reaches them).
+	# The biome probe (column_profile.y) is reached ONLY for the narrow 1–2 block/cell band, so the hot
+	# path stays cheap; it is pure + pcache-memoized, preserving the single-predicate collider contract.
 	var r0 := roundi(raw.x * 4.0)
 	var r1 := roundi(raw.y * 4.0)
 	var r2 := roundi(raw.z * 4.0)
 	var r3 := roundi(raw.w * 4.0)
-	if mini(mini(r0, r1), mini(r2, r3)) >= g * 4 and maxi(maxi(r0, r1), maxi(r2, r3)) <= (g + 1) * 4:
-		return false                                  # stays inside the one-cell window → today's smoothing
+	var lo_r := mini(mini(r0, r1), mini(r2, r3))
+	var hi_r := maxi(maxi(r0, r1), maxi(r2, r3))
+	if lo_r >= g * 4 and hi_r <= (g + 2) * 4:
+		# within the two-cell window → NOT a >2 block/cell face.
+		if lo_r >= g * 4 and hi_r <= (g + 1) * 4:
+			return false                              # within [g, g+1] → today's smoothing (all biomes)
+		if int(column_profile(x, z, pcache).y) != B_MOUNTAINS:
+			return false                              # 1–2 block/cell band off the mountains → leave hills alone
 	var tw0 := roundi(raw.x)
 	var tw1 := roundi(raw.y)
 	var tw2 := roundi(raw.z)

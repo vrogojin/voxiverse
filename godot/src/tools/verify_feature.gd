@@ -66,6 +66,8 @@ func _initialize() -> void:
 	_test_shader_prewarm()
 	_test_lod_far_field()
 	_test_portal_items()
+	_test_portal_frames()
+	_test_portal_buildability()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6380,3 +6382,205 @@ func _test_portal_items() -> void:
 	_ok(world.break_terrain(top) == STONE, "break the placed stone")
 	_ok(counter["n"] == 1 and counter["last"] == top, "break_terrain emits cell_edited once at the cell")
 	world.queue_free()
+
+# PORTALS §3.7 — frame detection (Stage 1). Fixtures are authored directly through the
+# write choke point (`_write_cell`) high above terrain: detection is a PURE function of
+# `block_id_at`, so how the obsidian got there is irrelevant, and this keeps the
+# detection asserts isolated from the structural solver (buildability is its own test
+# below). Frames are placed 64 cells apart in all-air space (y=200 > MAX_SURFACE_Y 116).
+func _test_portal_frames() -> void:
+	print("[portals] frame detection")
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalFrames"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	_ok(OBS > 0, "obsidian id resolves (%d)" % OBS)
+
+	# --- ACCEPT: a 1x2-interior AXIS_X frame, detected from EVERY ring block ---
+	var b0 := Vector3i(0, 200, 0)
+	var f_ax := PortalFrame.new(PortalFrame.AXIS_X, b0, 1, 2)
+	_author_frame(world, f_ax, OBS)
+	_ok(f_ax.interior_cells().size() == 1 * 2, "AXIS_X 1x2 interior_cells count = w*h")
+	_ok(f_ax.ring_cells().size() == 2 * (1 + 2) + 4, "AXIS_X 1x2 ring_cells count = 2(w+h)+4")
+	var all_ax := true
+	for seed: Vector3i in f_ax.ring_cells():
+		var d := PortalFrameDetector.detect(world, seed)
+		if d == null or d.key() != f_ax.key() or d.width != 1 or d.height != 2 or d.axis != PortalFrame.AXIS_X:
+			all_ax = false
+	_ok(all_ax, "AXIS_X 1x2 detected identically from every ring seed")
+
+	# --- ACCEPT: a 4x5-interior AXIS_Z frame, detected from every ring block + corners ---
+	var b1 := Vector3i(64, 200, 0)
+	var f_az := PortalFrame.new(PortalFrame.AXIS_Z, b1, 4, 5)
+	_author_frame(world, f_az, OBS)
+	_ok(f_az.interior_cells().size() == 4 * 5, "AXIS_Z 4x5 interior_cells count = w*h")
+	_ok(f_az.ring_cells().size() == 2 * (4 + 5) + 4, "AXIS_Z 4x5 ring_cells count = 2(w+h)+4")
+	var all_az := true
+	for seed: Vector3i in f_az.ring_cells():
+		var d := PortalFrameDetector.detect(world, seed)
+		if d == null or d.key() != f_az.key() or d.width != 4 or d.height != 5:
+			all_az = false
+	_ok(all_az, "AXIS_Z 4x5 detected identically from every ring seed (incl. corners)")
+	# The four explicit corners resolve the same frame.
+	var t := f_az.tangent_dir()
+	var corners := [
+		f_az.interior_min - t + Vector3i(0, -1, 0),                          # bottom-left
+		f_az.interior_min + t * 4 + Vector3i(0, -1, 0),                      # bottom-right
+		f_az.interior_min - t + Vector3i(0, 5, 0),                          # top-left
+		f_az.interior_min + t * 4 + Vector3i(0, 5, 0),                      # top-right
+	]
+	var corners_ok := true
+	for c: Vector3i in corners:
+		_ok(world.block_id_at(c) == OBS, "corner cell %s is obsidian" % c)
+		var d := PortalFrameDetector.detect(world, c)
+		if d == null or d.key() != f_az.key():
+			corners_ok = false
+	_ok(corners_ok, "AXIS_Z 4x5 resolves the same frame from each of the 4 corner seeds")
+
+	# --- REJECT cases ---
+	# (a) ring with one block missing.
+	var b2 := Vector3i(128, 200, 0)
+	var f_miss := PortalFrame.new(PortalFrame.AXIS_Z, b2, 3, 3)
+	_author_frame(world, f_miss, OBS)
+	var a_ring: Vector3i = f_miss.ring_cells()[0]
+	world._write_cell(a_ring, 0)                                            # knock a hole
+	_ok(not PortalFrameDetector.still_valid(world, f_miss), "still_valid false after a ring block is removed")
+	_ok(PortalFrameDetector.detect(world, f_miss.ring_cells()[5]) == null, "detect null for a ring with a missing block")
+
+	# (b) ring closed but one interior cell filled (place dirt inside).
+	var b3 := Vector3i(192, 200, 0)
+	var f_fill := PortalFrame.new(PortalFrame.AXIS_Z, b3, 3, 3)
+	_author_frame(world, f_fill, OBS)
+	world._write_cell(f_fill.interior_cells()[4], DIRT)                     # a block inside the opening
+	_ok(not PortalFrameDetector.still_valid(world, f_fill), "still_valid false after an interior cell is filled")
+	_ok(PortalFrameDetector.detect(world, f_fill.ring_cells()[0]) == null, "detect null when an interior cell is non-air")
+
+	# (c) interior too small (1x1) — below MIN_H.
+	var b4 := Vector3i(256, 200, 0)
+	var f_small := PortalFrame.new(PortalFrame.AXIS_Z, b4, 1, 1)
+	_author_frame(world, f_small, OBS)
+	_ok(PortalFrameDetector.detect(world, f_small.ring_cells()[0]) == null, "detect null for a 1x1 interior (too small)")
+
+	# (d) interior too wide (9x2) — above MAX_W.
+	var b5 := Vector3i(320, 200, 0)
+	var f_wide := PortalFrame.new(PortalFrame.AXIS_Z, b5, 9, 2)
+	_author_frame(world, f_wide, OBS)
+	_ok(PortalFrameDetector.detect(world, f_wide.ring_cells()[0]) == null, "detect null for a 9x2 interior (too wide)")
+
+	# (e) an L-shaped obsidian blob (no closed rectangle).
+	var b6 := Vector3i(384, 200, 0)
+	for i in range(5):
+		world._write_cell(b6 + Vector3i(i, 0, 0), OBS)                      # horizontal arm
+		world._write_cell(b6 + Vector3i(0, i, 0), OBS)                      # vertical arm
+	_ok(PortalFrameDetector.detect(world, b6 + Vector3i(2, 0, 0)) == null, "detect null for an L-shaped blob")
+
+	# (f) a HORIZONTAL ring (flat on the ground) — no vertical plane.
+	var b7 := Vector3i(448, 200, 0)
+	for i in range(-1, 4):
+		for k in range(-1, 4):
+			if i == -1 or i == 3 or k == -1 or k == 3:
+				world._write_cell(b7 + Vector3i(i, 0, k), OBS)             # ring in the X-Z plane at fixed Y
+	_ok(PortalFrameDetector.detect(world, b7 + Vector3i(-1, 0, 0)) == null, "detect null for a horizontal ring")
+
+	# --- CANONICAL TRANSFORM (pure PortalFrame; hand-computed) ---
+	var az := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(10, 20, 30), 2, 3)
+	var tz := az.global_transform()
+	_ok(tz.origin.is_equal_approx(Vector3(11.0, 21.5, 30.5)), "AXIS_Z center = (11, 21.5, 30.5)")
+	_ok(tz.basis.y.is_equal_approx(Vector3.UP), "AXIS_Z basis.y == UP")
+	_ok(is_equal_approx(tz.basis.determinant(), 1.0), "AXIS_Z basis determinant == 1")
+	_ok(tz.basis.is_equal_approx(Basis.IDENTITY), "AXIS_Z basis == identity")
+	var ax := PortalFrame.new(PortalFrame.AXIS_X, Vector3i(10, 20, 30), 2, 3)
+	var tx := ax.global_transform()
+	_ok(tx.origin.is_equal_approx(Vector3(10.5, 21.5, 31.0)), "AXIS_X center = (10.5, 21.5, 31)")
+	_ok(tx.basis.y.is_equal_approx(Vector3.UP), "AXIS_X basis.y == UP")
+	_ok(is_equal_approx(tx.basis.determinant(), 1.0), "AXIS_X basis determinant == 1 (handed fix)")
+	_ok(tx.basis.z.is_equal_approx(Vector3(1, 0, 0)), "AXIS_X basis.z (normal) == +X")
+	_ok(tx.basis.x.is_equal_approx(Vector3(0, 0, -1)), "AXIS_X basis.x (right) == -Z")
+
+	# --- EDIT INTERPLAY (still_valid under edits) ---
+	var b8 := Vector3i(512, 200, 0)
+	var f_edit := PortalFrame.new(PortalFrame.AXIS_Z, b8, 2, 3)
+	_author_frame(world, f_edit, OBS)
+	_ok(PortalFrameDetector.still_valid(world, f_edit), "still_valid true for a freshly authored frame")
+	world._write_cell(b8 + Vector3i(20, 0, 0), STONE)                       # an unrelated edit far away
+	_ok(PortalFrameDetector.still_valid(world, f_edit), "still_valid true after an unrelated neighbouring edit")
+	world._write_cell(f_edit.ring_cells()[0], 0)                            # break a ring block
+	_ok(not PortalFrameDetector.still_valid(world, f_edit), "still_valid false after breaking a ring block")
+	_author_frame(world, f_edit, OBS)                                       # restore
+	world._write_cell(f_edit.interior_cells()[0], STONE)                    # fill an interior cell
+	_ok(not PortalFrameDetector.still_valid(world, f_edit), "still_valid false after filling an interior cell")
+
+	world.queue_free()
+
+# Author a frame's cells directly through the write choke point: ring → obsidian,
+# interior → air. Used only to build detection fixtures (see _test_portal_frames).
+func _author_frame(world: WorldManager, frame: PortalFrame, obs: int) -> void:
+	for c: Vector3i in frame.ring_cells():
+		world._write_cell(c, obs)
+	for c: Vector3i in frame.interior_cells():
+		world._write_cell(c, 0)
+
+# PORTALS §3.7 — BUILDABILITY / structural guard (Stage 1). A completed MAX 8x8-interior
+# obsidian frame must be a STABLE structure (the StructuralSolver must not eat its
+# lintel). Built the collapse-proof way: a solid 10x10 obsidian wall course-by-course
+# (every block rests on the one below — pure compression, never a transient cantilever),
+# then the 8x8 interior is dug top-down (the lintel stays column-supported throughout).
+# If a body ever spawns, obsidian's `anchors` in blocks.json need tuning (documented
+# escape hatch) — obsidian is a world-tier id, so it is NOT drift-gated.
+func _test_portal_buildability() -> void:
+	print("[portals] frame buildability (max 8x8 stands, no collapse)")
+	var run := _flat_run_x(10)
+	if run.x == 0x7fffffff:
+		_ok(false, "found a flat 10-wide run for the max frame")
+		return
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalBuild"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	var x0 := run.x
+	var g := run.y
+	var z0 := run.z
+	# Solid 10x10 wall, course by course (each course fully supported from below).
+	var built := true
+	for yy in range(g + 1, g + 11):
+		for xx in range(x0, x0 + 10):
+			if not world.place_block(Vector3i(xx, yy, z0), OBS):
+				built = false
+		if world.active_body_count() != 0:
+			built = false
+	_ok(built and world.active_body_count() == 0, "solid 10x10 obsidian wall builds course-by-course, no collapse")
+	# Dig the 8x8 interior top-down; assert no loose body ever spawns.
+	var frame := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(x0 + 1, g + 2, z0), 8, 8)
+	var carved_ok := true
+	for j in range(7, -1, -1):
+		for i in range(8):
+			world.break_terrain(Vector3i(x0 + 1 + i, g + 2 + j, z0))
+			if world.active_body_count() != 0:
+				carved_ok = false
+	_ok(carved_ok and world.active_body_count() == 0, "digging the 8x8 interior spawns no loose body (max lintel is stable)")
+	_ok(PortalFrameDetector.still_valid(world, frame), "the completed max 8x8 frame is valid/standing")
+	_ok(PortalFrameDetector.detect(world, frame.ring_cells()[0]) != null, "the built max frame is detected")
+	world.queue_free()
+
+# First (lowest z, then x) flat run of `n` columns along +X at a fixed z, above sea and
+# clear of generated blocks for 11 cells overhead — the buildability test bed.
+func _flat_run_x(n: int) -> Vector3i:
+	for z in range(-200, 200):
+		for x in range(-200, 200):
+			var g: int = TerrainConfig.height_at(x, z)
+			if g <= TerrainConfig.SEA_LEVEL:
+				continue
+			var ok := true
+			for i in range(n):
+				if TerrainConfig.height_at(x + i, z) != g:
+					ok = false
+					break
+				for yy in range(g + 1, g + 12):
+					if TerrainConfig.generated_block(x + i, yy, z) != 0:
+						ok = false
+						break
+				if not ok:
+					break
+			if ok:
+				return Vector3i(x, g, z)
+	return Vector3i(0x7fffffff, 0, 0)

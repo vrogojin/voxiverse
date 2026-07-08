@@ -45,6 +45,24 @@ var _ramp_active := false
 var _ramp_view := 0.0
 var _ramp_target := 0.0
 
+# COSMOS M4 Stage 2 (§3.1/§4): the OPT-IN freeze-in-place near cover. At a home-face flip, instead of
+# freeing the old VoxelTerrain immediately (the shipped default), pin it at its old WORLD position and
+# freeze it (PROCESS_MODE_DISABLED) so its meshes bridge the seam crossing at full near-field fidelity
+# while the fresh terrain ramps in behind it. DEFAULT OFF (§0 never-OOM): the const is the ONE-LINE
+# production flip; `cover_enabled` mirrors it per-instance so verify can assert BOTH states headless while
+# prod stays a const flip. Only enabled in production through the §9.3 A/B gate. The far bridge runs at
+# every flip regardless, as the safety net behind the cover (§2.2).
+const NEAR_COVER_ENABLED := false          # DEFAULT OFF — the single production flip (§3.1)
+var cover_enabled := NEAR_COVER_ENABLED    # instance mirror: verify overrides it; prod never writes it
+const NEAR_COVER_MAX_SECONDS := 10.0       # hard transient bound (≤ far COVER_MAX_SECONDS = 12)
+## Retirement is_area_meshed half-extent: 96 blocks, NOT the full 128 disk — one laggard outer mesh block
+## must not pin the cover to its timeout, and the 96→128 annulus sits behind the far layer's curved inner
+## hole (INNER_HOLE_CURVED = 112) plus fog, so retiring there is invisible (§4).
+const NEAR_COVER_MESHED_HALF := Vector3(96.0, 32.0, 96.0)
+var _cover_terrain: Node3D = null          # the frozen old VoxelTerrain (flag ON only); null in the default
+var _cover_age := 0.0                       # seconds the current cover has lived
+var _cover_released := false                # WorldManager's handshake fired (re-mirror done) — safe to retire on meshed
+
 # --- appearance table (ARIDs, VOXEL-DATA-STRUCTURE §8.1) ------------------------
 # The TYPE channel carries an Appearance Render ID (ARID) — a session-local, append-
 # only dense id per (LRID, modifier) combination in use, equal by construction to its
@@ -260,16 +278,24 @@ func setup() -> bool:
 ## after a home-face flip instead of freezing on a single full-disk request pass. Self-disables when the
 ## target is reached; dormant (processing off) at every other time.
 func _process(delta: float) -> void:
-	if not _ramp_active:
-		set_process(false)
-		return
-	var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
-	_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
-	if _terrain != null:
-		_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
-	if _ramp_view >= _ramp_target:
-		_ramp_active = false
-		set_process(false)
+	# Ramp step (unchanged): grow the fresh terrain's view distance from RAMP_START_BLOCKS to the target.
+	if _ramp_active:
+		var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
+		_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
+		if _terrain != null:
+			_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
+		if _ramp_view >= _ramp_target:
+			_ramp_active = false
+	# COSMOS M4 Stage 2 (§5.1): age + retire the frozen near cover. Retire on "meshed" once WorldManager has
+	# released it (edits re-mirrored) AND the fresh field has meshed under the player; else at the hard cap.
+	if _cover_terrain != null:
+		_cover_age += delta
+		if _cover_released and not _ramp_active and _new_field_meshed():
+			_free_cover("meshed")
+		elif _cover_age >= NEAR_COVER_MAX_SECONDS:
+			_free_cover("timeout")
+	# Stay processing only while there is still ramp or cover work to do; otherwise go dormant.
+	set_process(_ramp_active or _cover_terrain != null)
 
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
@@ -1067,9 +1093,13 @@ func get_generator() -> Object:
 ## block is dropped by the restream. This is exactly the shape M4's dual-window handoff needs (two
 ## generators, two frozen faces, concurrently). WorldManager also repositions this node so the new
 ## voxel coordinate frame maps to the new face's global indices.
-func set_home_face(face: int) -> void:
+## COSMOS M4 Stage 2 (§3.2): `old_wrapper_pos` is this wrapper's position in the OLD frame, captured by
+## WorldManager BEFORE it repositions the node to the new frame. It is forwarded to restream so the flag-on
+## path can pin the old terrain at its old world spot. The default Vector3.INF means "no old frame supplied"
+## (the free-immediately path) — keeping the 1-arg call in verify_cosmos_race.gd valid.
+func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	_gen_face = face
-	restream()
+	restream(old_wrapper_pos)
 
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
@@ -1077,12 +1107,15 @@ func set_home_face(face: int) -> void:
 ## Recreating the VoxelTerrain node guarantees old-epoch blocks are gone and the new generator is used.
 ## The player's global VoxelViewer keeps streaming the new terrain (viewers are engine-global). A no-op
 ## if the module is unavailable.
-func restream() -> void:
+func restream(old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	if not ClassDB.class_exists("VoxelTerrain") or _mesher == null:
 		return
 	var generator: Object = _make_generator()
 	if generator == null:
 		return
+	# COSMOS M4 Stage 2 (§5.2): free any prior frozen cover FIRST so a flip storm never stacks covers — the
+	# single-cover invariant (≤ 1 frozen + 1 live volume ever). No-op in the default state (no cover exists).
+	_free_cover("superseded")
 	var old_terrain := _terrain
 	var new_terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
 	if new_terrain == null:
@@ -1094,9 +1127,23 @@ func restream() -> void:
 	_set_if(new_terrain, "mesh_block_size", 32)
 	_set_if(new_terrain, "generate_collisions", false)
 	if old_terrain != null:
-		new_terrain.position = old_terrain.position   # preserve the module's coordinate offset
-		remove_child(old_terrain)
-		old_terrain.queue_free()
+		# Capture the old terrain's LOCAL offset BEFORE any cover compensation, so the FRESH terrain inherits
+		# the module's coordinate offset — not the pinned cover's compensated position (§3.2).
+		var base_pos: Vector3 = old_terrain.position
+		new_terrain.position = base_pos
+		# COSMOS M4 Stage 2 (§3.2/§3.3): flag ON and a real old frame supplied → keep the old terrain in place
+		# as a frozen cover: pin its world transform at the OLD spot, THEN disable processing (order matters —
+		# the transform notification applies immediately, independent of process mode). Else free it right away
+		# (the shipped default — byte-for-byte today's teardown). ONLY this flag test picks cover-vs-free.
+		if cover_enabled and old_wrapper_pos.is_finite() and old_wrapper_pos != position:
+			_cover_terrain = old_terrain
+			_cover_age = 0.0
+			_cover_released = false
+			old_terrain.position += old_wrapper_pos - position   # pin at the old WORLD spot (§3.2) …
+			old_terrain.process_mode = Node.PROCESS_MODE_DISABLED  # … THEN freeze (§3.3)
+		else:
+			remove_child(old_terrain)
+			old_terrain.queue_free()
 	add_child(new_terrain)
 	_terrain = new_terrain
 	_generator = generator
@@ -1107,7 +1154,8 @@ func restream() -> void:
 	_ramp_target = float(TerrainConfig.near_render_radius())
 	_ramp_view = RAMP_START_BLOCKS
 	_ramp_active = _ramp_target > RAMP_START_BLOCKS
-	set_process(_ramp_active)
+	# Keep processing while the ramp runs OR a frozen cover is aging toward retirement (§5.1).
+	set_process(_ramp_active or _cover_terrain != null)
 
 ## Whether the OOB fence has clamped a stale/unbaked ARID this session (COSMOS-AUDIT F8 telemetry — a
 ## real out-of-range must never pass silently). Verify asserts this stays false over a clean run.
@@ -1117,6 +1165,13 @@ func oob_seen() -> bool:
 ## The generator's frozen home face (COSMOS-AUDIT §3.2 item 3) — for verify / the dual-window handoff.
 func gen_home_face() -> int:
 	return _gen_face
+
+## COSMOS M4 (§8 step 3): has the post-restream view-distance ramp finished? WorldManager polls this to
+## learn when the fresh near field's data blocks are loaded, so it can re-mirror player edits into the
+## render (§5.4) and end the far handoff turbo. Read-only; _ramp_active is false in steady state, so this
+## returns true whenever no restream ramp is in flight.
+func ramp_done() -> bool:
+	return not _ramp_active
 
 ## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
 ## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
@@ -1369,6 +1424,41 @@ func area_meshed(center: Vector3, half: Vector3) -> bool:
 	if _terrain == null or not _terrain.has_method("is_area_meshed"):
 		return false
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS M4 Stage 2 (§5.1): has the FRESH near field meshed under the player? Unlike area_meshed() (whose
+## raw-world centre is a FLAT-only convention where the wrapper sits at the origin), the curved wrapper sits
+## at a non-zero position, so convert the viewer's WORLD point into the new terrain's local voxel frame
+## (viewer.global − wrapper.global) before the is_area_meshed box. Returns false (never retire on "meshed",
+## fall through to the timeout cap) when there is no viewer/terrain or the module lacks is_area_meshed.
+func _new_field_meshed() -> bool:
+	var v := _viewer as Node3D
+	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
+		return false
+	var center: Vector3 = v.global_position - global_position
+	var half := NEAR_COVER_MESHED_HALF
+	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS M4 Stage 2: free the frozen near cover (null-safe) and print one retirement telemetry line (§9.3
+## watches these). The cover is a child of the wrapper, so queue_free drops its ~+50 MB static transient.
+func _free_cover(reason: String) -> void:
+	if _cover_terrain == null:
+		return
+	if is_instance_valid(_cover_terrain):
+		remove_child(_cover_terrain)
+		_cover_terrain.queue_free()
+	print("[module_world] near cover retired (%s) after %.1fs" % [reason, _cover_age])
+	_cover_terrain = null
+	_cover_age = 0.0
+	_cover_released = false
+
+## COSMOS M4 Stage 2: true while a frozen near cover is bridging a flip (verify / diagnostics).
+func cover_active() -> bool:
+	return _cover_terrain != null
+
+## COSMOS M4 Stage 2 (§5.1): WorldManager's handshake — the fresh terrain has ramped and player edits are
+## re-mirrored, so the cover may retire as soon as the new field meshes under the player. No-op with no cover.
+func release_cover() -> void:
+	_cover_released = true
 
 ## Build the library: air=0, then a cube model for EVERY BlockCatalog id in dense
 ## order (WGC §5.1). The model index MUST equal the BlockCatalog id (the generator +

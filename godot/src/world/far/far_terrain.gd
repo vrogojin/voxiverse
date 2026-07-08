@@ -46,6 +46,17 @@ const SKIRT_CELLS := 4                     # skirt depth = 4 × ring cell
 const FAR_RECENTER_STEP := 64.0            # m of XZ movement before re-evaluating the set
 const FAR_BUILD_BUDGET_MS := 3.0           # main-thread sampling budget per frame
 const MAX_COMMITS_PER_FRAME := 1
+# COSMOS M4 (§4/§8): the seam-cross HANDOFF TURBO. At a home-face flip WorldManager opens a bounded
+# time window during which _drain runs at a raised main-thread budget + commit rate and the build stays
+# NEAREST-first, so the new frame's ring-0 tiles under the player appear in ~0.2–0.5 s while the near
+# field restreams behind them. It changes only WHEN tiles build, never WHAT — the desired set, caps, and
+# per-tile geometry are unchanged, so it costs bounded main-thread ms and ZERO memory (the §0 never-OOM
+# invariant). Flip HANDOFF_ENABLED to false to restore today's post-bug-B behaviour byte-for-byte (§7
+# rung 2, the SMOOTHING_ENABLED discipline); the §5.4 edit re-mirror in WorldManager is independent of it.
+const HANDOFF_ENABLED := true
+const HANDOFF_BUDGET_MS := 8.0             # _drain sampling budget while the handoff window is open (vs 3.0)
+const HANDOFF_COMMITS := 2                 # ArrayMesh uploads per frame while open (vs 1)
+const HANDOFF_MAX_SECONDS := 10.0          # hard close of the window (starvation backstop / headless / fallback path)
 const SAMPLE_STEP_COLUMNS := 1024          # profiling slice size (LOD-DESIGN §2.6)
 const FAR_MAX_TILES := 120                 # hard caps — trim outermost-first, warn
 ## Raised from 450k: double-sided skirts (LOD-DESIGN §1.4) lift per-tile tris, so the pure
@@ -92,6 +103,12 @@ var _cover: Node3D = null
 ## after this long regardless. With the freeze fixed the fresh frame rebuilds in a couple of seconds.
 const COVER_MAX_SECONDS := 12.0
 var _cover_age := 0.0
+
+# COSMOS M4 (§5.1): seconds left in the open handoff turbo window (0 = closed). Set by begin_handoff at a
+# flip, cleared by end_handoff at the near-ramp handshake, and self-decremented in _process so a missed
+# handshake (headless, or the fallback path that never calls end_handoff) still closes it at
+# HANDOFF_MAX_SECONDS. Never set in FLAT_WORLD play — begin_handoff is only reached through a flip.
+var _handoff_left := 0.0
 
 func _ready() -> void:
 	if not ENABLED:
@@ -208,6 +225,23 @@ func rebase_to(new_pos: Vector3) -> void:
 	position = new_pos
 	_has_eval = false                          # next update_center recomputes in the new frame
 
+# COSMOS M4 (§5.1): the handoff turbo window. begin_handoff is called by WorldManager right after
+# rebase_to at a flip; end_handoff at the near-ramp handshake (module ramp_done()). handoff_active gates
+# BOTH the raised _drain budget/commit rate (§2.2 throughput) and the nearest-first sort (§2.2 priority).
+# Opening a window on an already-open one simply resets its clock — nothing stacks (§5.2 re-entrancy). It
+# spends only main-thread ms; the desired set, caps and per-tile geometry are untouched, so ZERO memory.
+func begin_handoff() -> void:
+	if ENABLED and HANDOFF_ENABLED:
+		_handoff_left = HANDOFF_MAX_SECONDS
+
+func end_handoff() -> void:
+	if _handoff_left > 0.0:
+		print("[far] handoff window closed (handshake) after %.1fs" % (HANDOFF_MAX_SECONDS - _handoff_left))
+	_handoff_left = 0.0
+
+func handoff_active() -> bool:
+	return _handoff_left > 0.0
+
 # --- desired-set computation + reconciliation ---------------------------------
 
 func _recompute(e: Vector2) -> void:
@@ -221,9 +255,10 @@ func _recompute(e: Vector2) -> void:
 		to_build.append(key)
 	var desired := _desired
 	# Normally coarse ring first (full horizon silhouette appears first — LOD-DESIGN §2.6). But while a
-	# post-flip cover is bridging, sort NEAREST-first instead: ring 0 abuts the near field where the
-	# handoff mismatch is most visible, so healing it first lets the cover retire sooner (Fable bug-B).
-	var cover_active := _cover != null
+	# post-flip cover is bridging OR the M4 handoff window is open, sort NEAREST-first instead: ring 0
+	# abuts the near field where the handoff mismatch is most visible, so healing it first puts real
+	# terrain under the player fastest and lets the cover retire sooner (Fable bug-B / COSMOS M4 §2.2).
+	var cover_active := _cover != null or handoff_active()
 	to_build.sort_custom(func(a, b):
 		if cover_active:
 			return float(desired[a]["min_dist"]) < float(desired[b]["min_dist"])
@@ -355,7 +390,16 @@ func _free_tile(key) -> void:
 func _process(delta: float) -> void:
 	if not ENABLED:
 		return
-	_drain(FAR_BUILD_BUDGET_MS)
+	# COSMOS M4 (§5.1): tick the handoff window down first, then drain at the turbo budget while it is
+	# open. It self-closes at HANDOFF_MAX_SECONDS so a missed WorldManager handshake (headless, or the
+	# fallback path which never calls end_handoff) never leaves it stuck open — a timeout closure is the
+	# telemetry anomaly signal (§9.2 step 4). The default 3.0 ms / 1-commit constants are untouched, so
+	# flat play (which never opens a window) is byte-identical.
+	if _handoff_left > 0.0:
+		_handoff_left = maxf(_handoff_left - delta, 0.0)
+		if _handoff_left == 0.0:
+			print("[far] handoff window closed (timeout) after %.1fs" % HANDOFF_MAX_SECONDS)
+	_drain(HANDOFF_BUDGET_MS if handoff_active() else FAR_BUILD_BUDGET_MS)
 	# Retire the post-flip stale cover once the new frame has produced real coverage (queue drained AND
 	# at least one new tile is live), OR after COVER_MAX_SECONDS as a starvation backstop (a moving
 	# player re-enqueues the far set faster than the 3 ms/frame budget drains it, so "queue drained"
@@ -371,7 +415,10 @@ func _process(delta: float) -> void:
 func _drain(budget_ms: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	var commits := 0
-	while commits < MAX_COMMITS_PER_FRAME:
+	# COSMOS M4 (§2.2): raise the per-frame commit ceiling while the handoff window is open so the
+	# nearest-first ring-0 tiles reach the GPU sooner; back to 1/frame in steady state.
+	var commit_limit := HANDOFF_COMMITS if handoff_active() else MAX_COMMITS_PER_FRAME
+	while commits < commit_limit:
 		if _active_key == null and not _start_next():
 			break
 		while not _active_done:

@@ -125,15 +125,57 @@ func _process(_delta: float) -> bool:
 			_mw.call("set_home_face", _flip_face)
 			_gen = _mw.call("get_generator")
 			_ok(_mw.call("gen_home_face") == _flip_face, "epoch swap installed the new gen_face (%d)" % _flip_face)
+			# COSMOS M4 (§0.1, verify v4): the epoch swap frees the old VoxelTerrain before adding the new
+			# one, so the near field's memory class has EXACTLY ONE instance across the flip — the never-OOM
+			# invariant, machine-checked where the real module pool runs (not a second retained near volume).
+			_ok(_count_voxel_terrains(_mw) == 1, "exactly one VoxelTerrain child after the epoch swap (single near volume)")
 			_pivot.position = Vector3(float(_spawn.x), 64.0, float(_spawn.y))
 		4:
 			_ok(_blocks_generated() > 0, "post-flip epoch streams blocks (restream worked, blocks=%d)" % _blocks_generated())
 			_ok(not bool(_mw.call("oob_seen")), "no OOB clamp after the home-face flip")
+			# COSMOS M4 Stage 2 (§9.1 v4 / §3.3): a flag-ON cover flip on the REAL pool. Keep the wrapper at the
+			# origin (so the fresh terrain still streams at the viewer) but supply a DIFFERENT old frame, so the
+			# current live terrain — already streamed with real meshes — becomes a frozen cover. Assert the pin
+			# math, the freeze, the single-cover bound, and the harvest-infeasibility probe (built meshes are
+			# RS-level DirectMeshInstance, never scene-tree MeshInstance3D children).
+			_mw.set("cover_enabled", true)
+			var p_old: Vector3 = _mw.position + Vector3(128.0, 0.0, 0.0)   # a fake old frame != current position
+			_mw.call("set_home_face", _flip_face, p_old)
+			_ok(bool(_mw.call("cover_active")), "flag-on flip installs a frozen near cover")
+			var cover: Node3D = _mw.get("_cover_terrain")
+			_ok(cover != null and _mw.position + cover.position == p_old, "cover pinned bit-exact (wrapper + cover == P_old, §3.2)")
+			_ok(cover != null and cover.process_mode == Node.PROCESS_MODE_DISABLED, "cover frozen (PROCESS_MODE_DISABLED, §3.3)")
+			_ok(_count_voxel_terrains(_mw) == 2, "<= 2 VoxelTerrain nodes with the cover alive (1 live + 1 frozen)")
+			_ok(cover != null and _count_mesh_instances(cover) == 0, "the frozen cover has zero MeshInstance3D children (harvest infeasible, §3.3)")
+			_pivot.position = Vector3(float(_spawn.x), 64.0, float(_spawn.y))
+		5:
+			_ok(_blocks_generated() > 0, "the fresh field streams blocks with the frozen cover alive (blocks=%d)" % _blocks_generated())
+			_ok(not bool(_mw.call("oob_seen")), "no OOB clamp with the frozen cover alive")
 			_finish()
 			return true
 	_phase += 1
 	_phase_frames = 0
 	return false
+
+## COSMOS M4 (§0.1): count the module wrapper's VoxelTerrain children. restream() removes+frees the old
+## terrain before adding the new one, so this is 1 in steady state and across a flip — never 2 (a second
+## retained near volume is the OOM risk class §0 bans outright).
+func _count_voxel_terrains(node: Node) -> int:
+	var n := 0
+	for c in node.get_children():
+		if c.get_class() == "VoxelTerrain":
+			n += 1
+	return n
+
+## COSMOS M4 Stage 2 (§3.3): count a node's direct MeshInstance3D children. A VoxelTerrain's built meshes
+## live in RS-level DirectMeshInstance wrappers, never scene-tree MeshInstance3D nodes, so a streamed cover
+## reports ZERO here — documenting harvest-infeasibility against the running engine, not just the docs.
+func _count_mesh_instances(node: Node) -> int:
+	var n := 0
+	for c in node.get_children():
+		if c is MeshInstance3D:
+			n += 1
+	return n
 
 func _blocks_generated() -> int:
 	if _mw == null or not _mw.has_method("get_generator"):

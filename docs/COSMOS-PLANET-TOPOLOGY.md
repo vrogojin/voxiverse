@@ -488,6 +488,10 @@ a tree whose trunk stands on face A grows the same canopy cells into face B from
 
 ### 4.5 The home-face flip (where R2 now lives)
 
+> **M4 landed (see `docs/COSMOS-M4-HANDOFF.md`).** The seam-cross handoff ships as a far-first bridge
+> (always on) plus an opt-in freeze-in-place near cover (default OFF, §9.3 A/B-gated); §4.5.1's
+> dual-window prestream is superseded (COSMOS-M4-HANDOFF §10.2 — a second *live* near volume).
+
 While the player is within the extension's validity, play continues on A's extended window —
 crossing the seam *on foot involves no event at all*. The **home-face flip** (re-basing the
 window on B) is deferred and hysteretic:

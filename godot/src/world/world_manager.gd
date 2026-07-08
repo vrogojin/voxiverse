@@ -36,6 +36,12 @@ var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 
+# COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
+# maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
+# player edits are re-mirrored into the fresh terrain (§5.4) and the far handoff turbo is ended. Never set
+# in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
+var _flip_settling := false
+
 # The dormant-by-default snowfall SIMULATION (SNOW-ACCUMULATION Decision 4). Owned here and stepped from
 # `_process` on the MAIN thread; it grows/melts the variable-height snow around the player by writing
 # through the ONE choke point (`_write_cell` → `_edits`), so its output is persisted exactly like a
@@ -172,6 +178,20 @@ func update_streaming(player_pos: Vector3) -> void:
 	_have_player_pos = true
 	if _far != null:
 		_far.update_center(player_pos)
+	# COSMOS M4 (§5.1/§5.4): while a flip's near field restreams, poll the module's view-distance ramp;
+	# once it finishes the near data blocks are loaded, so re-mirror player edits into the fresh render
+	# (they were dropped by the pure-worldgen restream) and end the far handoff turbo. One-shot per flip.
+	if _flip_settling:
+		if _module_world == null or not _module_world.has_method("ramp_done") \
+				or bool(_module_world.call("ramp_done")):
+			_remirror_module_edits(player_pos)     # §5.4 — BEFORE release_cover so edits are up before the cover vanishes
+			if _far != null:
+				_far.end_handoff()
+			# COSMOS M4 Stage 2 (§5.1): release the frozen near cover — it retires once the fresh field meshes
+			# under the player. Module-guarded no-op on the fallback path / with the cover flag off.
+			if _module_world != null and _module_world.has_method("release_cover"):
+				_module_world.call("release_cover")
+			_flip_settling = false
 
 ## Has the near terrain view around `center` finished MESHING (so it renders — and its GL pipeline
 ## compiles — behind the load overlay)? ShaderPrewarm PHASE 2 polls this to decide when to lift the
@@ -825,17 +845,33 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# and hard-restream so stale face-A meshes are dropped. The old generator is never mutated — any
 	# in-flight worker task finishes on the old face and its block is discarded by the restream.
 	if _module_world != null:
+		# COSMOS M4 Stage 2 (§3.2): capture the wrapper's OLD-frame position BEFORE repositioning to the new
+		# frame, and pass it to set_home_face so the flag-on cover can pin the old terrain at its old world
+		# spot. Default-off ignores it (freed immediately); the 1-arg race-verify call still works.
+		var old_mod_pos: Vector3 = _module_world.position
 		_module_world.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
 		if _module_world.has_method("set_home_face"):
-			_module_world.call("set_home_face", _chart.face)
+			_module_world.call("set_home_face", _chart.face, old_mod_pos)
+	# COSMOS M4 (§5.1): latch the flip-settling window (both render paths). update_streaming settles it once
+	# the module reports ramp_done() — re-mirroring player edits into the fresh terrain (§5.4), ending the far
+	# turbo, and releasing the cover. The fallback path (no module) settles immediately (re-mirror/release are
+	# module-guarded no-ops there — ChunkStreamer re-reads the overlay when it remeshes).
+	_flip_settling = true
 	# Re-base the far layer onto the new face's global frame (Fable Stage 1). It stashes its still-
 	# world-correct tiles as a cover so the horizon holds while the near field restreams behind it —
 	# the intended visual bridge that keeps the seam crossing from blanking the mid-to-far distance.
+	# COSMOS M4 (§2.2): then open the handoff turbo so the new frame's nearest ring-0 tiles build FIRST
+	# and appear under the player in ~0.2–0.5 s (both render paths benefit from the nearest-first turbo).
 	if _far != null:
 		_far.rebase_to(Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org)))
+		_far.begin_handoff()
 	# HARD RESTREAM the fallback streamer + collider (the module was restreamed by set_home_face above).
 	_restream()
-	print("[WorldManager] home-face flip %d → %d (hard restream)" % [int(res["from_face"]), int(res["to_face"])])
+	# COSMOS M4 Stage 2 telemetry: report whether the frozen near cover was actually installed (flag-gated).
+	var cover_on := _module_world != null and _module_world.has_method("cover_active") \
+		and bool(_module_world.call("cover_active"))
+	print("[WorldManager] home-face flip %d → %d (hard restream, handoff=%s, cover=%s)"
+		% [int(res["from_face"]), int(res["to_face"]), "on" if _far != null else "off", "yes" if cover_on else "no"])
 	return true
 
 ## Rebuild the window-keyed PERF indices (`_edit_columns`, `_placed_top`) from the global-keyed
@@ -858,6 +894,37 @@ func _rebuild_window_indices() -> void:
 			var prev: int = _placed_top.get(col, -0x40000000)
 			if r > prev:
 				_placed_top[col] = r
+
+## COSMOS M4 (§5.4): re-mirror player edits into the freshly-restreamed MODULE render. A home-face flip
+## rebuilds the VoxelTerrain from PURE worldgen (set_home_face → restream), so player-placed/dug cells —
+## still authoritative in the global-keyed `_edits` overlay (rule 1) — vanish from the RENDER until their
+## region is next edited. This re-injects them once the near ramp has loaded the data blocks: unfold every
+## edit's global cell back into the CURRENT window (the _rebuild_window_indices pattern), keep only those
+## within the near render radius of the player horizontally (a set-voxel on an unloaded far block would
+## only error-spam), and hand the window-cell → packed dict — dug-to-air cells (packed 0) INCLUDED so holes
+## re-carve — to bulk_inject in ONE call. Gameplay/collision were always correct via the overlay; this
+## closes a RENDER-only gap latent since M3. No-op in FLAT_WORLD / on the fallback path (no chart / module).
+## Edits beyond the near radius re-mirror the way they always have — when their region is next edited/loaded.
+func _remirror_module_edits(player_pos: Vector3) -> void:
+	if _chart == null or _module_world == null or not _module_world.has_method("bulk_inject"):
+		return
+	var radius := float(TerrainConfig.near_render_radius())
+	var collected := {}
+	for k: int in _edits.keys():
+		var g := CubeSphere.unpack_key(k)
+		var win := _chart.window_of_global(int(g["face"]), int(g["i"]), int(g["j"]))
+		if not bool(win["found"]):
+			continue                                     # off the current extended window → re-mirrors when its region reloads
+		var wx := int(win["x"])
+		var wz := int(win["z"])
+		# The near field renders window cells at world = window coordinate (the module node.position offset
+		# maps window→global for the FROZEN generator, not for the player), so compare the window cell to the
+		# player's world XZ directly — exactly the |window_xz − player_xz| test §5.4 specifies.
+		if absf(float(wx) - player_pos.x) > radius or absf(float(wz) - player_pos.z) > radius:
+			continue                                     # beyond the near field → its block is unloaded; skip (unchanged M3 behaviour)
+		collected[Vector3i(wx, int(g["r"]), wz)] = int(_edits[k])   # window cell → packed (0 included); same frame _paint_cell uses
+	if not collected.is_empty():
+		_module_world.call("bulk_inject", collected)
 
 ## Drop and rebuild the near render + collider after a home-face flip (§4.5 hard restream). Guarded
 ## so it is a safe no-op in the headless verify (no streamer / module / collider nodes exist there).

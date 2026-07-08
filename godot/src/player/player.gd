@@ -41,7 +41,7 @@ const CEILING_EPS := 0.001               # keep the head a hair below the ceilin
 
 var world: WorldManager                   # injected by Main before _ready
 var inventory: Inventory                   # injected by Main before add_child; may be null (standalone)
-var portals: Node = null                   # PortalManager, injected by Main; may be null (standalone/verify) — RMB tool routing
+var portals: PortalManager = null          # injected by Main; may be null (standalone/verify) — RMB tool routing
 var flying := false
 ## Input gate. While true the player cannot move, look, break or place — Main holds
 ## this during the load-time shader pre-warm (RENDER-STREAMING-SPIKES) so the hidden

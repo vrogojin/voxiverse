@@ -70,6 +70,17 @@ func ring_cells() -> Array[Vector3i]:
 				out.append(interior_min + t * i + Vector3i(0, j, 0))
 	return out
 
+## True iff `cell` is one of this frame's INTERIOR (air) cells. O(1) — projects the cell
+## onto the frame's local (tangent, up, normal) indices rather than scanning the cell list.
+## Used by the manager's edit-teardown handler (a block placed inside disrupts the portal).
+func is_interior(cell: Vector3i) -> bool:
+	var delta := cell - interior_min
+	var normal_off := delta.x if axis == PortalFrame.AXIS_X else delta.z
+	if normal_off != 0:
+		return false
+	var ti := delta.z if axis == PortalFrame.AXIS_X else delta.x
+	return ti >= 0 and ti < width and delta.y >= 0 and delta.y < height
+
 ## The interior centre in WORLD space: the geometric centre of the w×h interior region,
 ## with the plane coordinate on the MID-PLANE of the single interior cell layer
 ## (normal-axis coordinate = interior_min.<normal> + 0.5). Origin of `global_transform`.

@@ -21,6 +21,12 @@ func _ready() -> void:
 	# and the HotbarHUD. Starts EMPTY — the loop is break-first-then-place.
 	var inv := Inventory.new()
 	player.inventory = inv
+	# Portal starter kit (PORTALS §3.1): obsidian has no worldgen source yet, so the demo
+	# grants two ~4×5 frames' worth plus the linking tool at spawn. Gated by consts so the
+	# deliberate bend of the "start empty" rule is documented and isolated.
+	if PortalManager.ENABLED and PortalManager.GRANT_STARTER_KIT:
+		inv.add(BlockCatalog.id_of(&"obsidian"), 40)
+		inv.add(ItemCatalog.PORTAL_LINKER, 1)
 	add_child(player)
 	# Spawn on flat, open ground looking out over the gentle hills. The world is
 	# now biome/continent-shaped, so origin can be ocean — find_spawn() scans out
@@ -43,6 +49,19 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
+
+	# See-through linked portals (PORTALS): registry + linker tool + render surfaces, its
+	# own node graph outside both render paths (FarTerrain pattern), gated on ENABLED. The
+	# ToastHUD is created here and injected so the tool can post feedback.
+	if PortalManager.ENABLED:
+		var toast := ToastHUD.new()
+		toast.name = "ToastHUD"
+		add_child(toast)
+		var portals := PortalManager.new()
+		portals.name = "PortalManager"
+		add_child(portals)
+		portals.setup(world, player, toast)
+		player.portals = portals
 
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main

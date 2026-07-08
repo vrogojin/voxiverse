@@ -68,6 +68,7 @@ func _initialize() -> void:
 	_test_portal_items()
 	_test_portal_frames()
 	_test_portal_buildability()
+	_test_portal_linking()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6584,3 +6585,121 @@ func _flat_run_x(n: int) -> Vector3i:
 			if ok:
 				return Vector3i(x, g, z)
 	return Vector3i(0x7fffffff, 0, 0)
+
+# PORTALS §3.7 — manager registry + linker tool + edit teardown (Stage 2). Frames are
+# authored floating (via _write_cell) and the manager runs render_enabled=false, so the
+# whole registry/teardown is exercised with no GPU. The sentinel for "no key" is
+# Vector4i(0,0,0,-1) (matches the manager's query defaults).
+const _NOKEY := Vector4i(0, 0, 0, -1)
+
+func _test_portal_linking() -> void:
+	print("[portals] manager registry + linker tool")
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalLink"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	var fa := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 200, 0), 3, 3)
+	var fb := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(64, 200, 0), 3, 3)
+	var fc := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(128, 200, 0), 3, 3)
+	_author_frame(world, fa, OBS)
+	_author_frame(world, fb, OBS)
+	_author_frame(world, fc, OBS)
+
+	# --- arm → link via use_linker ---
+	var pm := _portal_manager(world)
+	pm.use_linker({"kind": "terrain", "cell": fa.ring_cells()[0]})
+	_ok(pm.armed_key() == fa.key() and pm.link_count() == 0, "use_linker arms the first frame")
+	pm.use_linker({"kind": "terrain", "cell": fb.ring_cells()[0]})
+	_ok(pm.link_count() == 1, "use_linker on a second frame links the pair")
+	_ok(pm.linked_key_of(fa.key()) == fb.key() and pm.linked_key_of(fb.key()) == fa.key(), "link entries are symmetric")
+	_ok(pm.armed_key() == _NOKEY, "armed cleared after linking")
+	var want := fa.ring_cells().size() + fa.interior_cells().size() + fb.ring_cells().size() + fb.interior_cells().size()
+	_ok(pm.cell_index_size() == want, "cell index covers both frames' ring+interior (%d)" % want)
+	# aim at a non-obsidian / non-terrain target: no-op.
+	pm.use_linker({"kind": "none"})
+	pm.use_linker({"kind": "terrain", "cell": Vector3i(0, 100, 0)})     # air, not obsidian
+	_ok(pm.link_count() == 1, "use_linker on non-obsidian is a no-op")
+	pm.queue_free()
+
+	# --- arm twice = disarm; self-link rejected ---
+	var pm2 := _portal_manager(world)
+	pm2.use_linker({"kind": "terrain", "cell": fa.ring_cells()[0]})
+	pm2.use_linker({"kind": "terrain", "cell": fa.ring_cells()[0]})
+	_ok(pm2.armed_key() == _NOKEY and pm2.link_count() == 0, "arming the same frame twice disarms (no link)")
+	_ok(pm2.link(fa, fa) == false, "linking a frame to itself is rejected")
+	pm2.queue_free()
+
+	# --- re-link steal: A↔B then C→A ---
+	var pm3 := _portal_manager(world)
+	_ok(pm3.link(fa, fb), "link A↔B")
+	_ok(pm3.link(fc, fa), "link C→A (steals A from B)")
+	_ok(pm3.linked_key_of(fa.key()) == fc.key() and pm3.linked_key_of(fc.key()) == fa.key(), "A↔C live after steal")
+	_ok(not pm3.is_linked(fb.key()), "B unlinked by the steal")
+	_ok(pm3.owning_key(fb.ring_cells()[0]) == _NOKEY, "B's indexed cells purged")
+	_ok(pm3.link_count() == 1, "still exactly one link after the steal")
+	pm3.queue_free()
+
+	# --- unlink by tool ---
+	var pm4 := _portal_manager(world)
+	pm4.link(fa, fb)
+	pm4.use_linker({"kind": "terrain", "cell": fa.ring_cells()[2]})
+	_ok(not pm4.is_linked(fa.key()) and not pm4.is_linked(fb.key()), "the linker on a linked frame unlinks both directions")
+	_ok(pm4.cell_index_size() == 0, "cell index emptied after tool unlink")
+	pm4.queue_free()
+
+	# --- MAX_LINKS enforced ---
+	var pm5 := _portal_manager(world)
+	var many: Array[PortalFrame] = []
+	for i in range(PortalManager.MAX_LINKS * 2 + 2):
+		var f := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(400 + i * 20, 200, 0), 2, 2)
+		_author_frame(world, f, OBS)
+		many.append(f)
+	var made := 0
+	for i in range(PortalManager.MAX_LINKS):
+		if pm5.link(many[2 * i], many[2 * i + 1]):
+			made += 1
+	_ok(made == PortalManager.MAX_LINKS and pm5.link_count() == PortalManager.MAX_LINKS, "MAX_LINKS (%d) pairs link" % PortalManager.MAX_LINKS)
+	_ok(not pm5.link(many[2 * PortalManager.MAX_LINKS], many[2 * PortalManager.MAX_LINKS + 1]), "the (MAX_LINKS+1)th link is refused")
+	_ok(pm5.link_count() == PortalManager.MAX_LINKS, "registry unchanged after the refusal")
+	pm5.queue_free()
+	world.queue_free()
+
+	_test_portal_teardown()
+
+# PORTALS §3.4.3 — edit teardown. A fresh world (isolates the collapse noise of breaking
+# floating obsidian) so break/place on a linked frame tears the link down.
+func _test_portal_teardown() -> void:
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalTeardown"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	var fa := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 200, 0), 3, 3)
+	var fb := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(64, 200, 0), 3, 3)
+	_author_frame(world, fa, OBS)
+	_author_frame(world, fb, OBS)
+	var pm := _portal_manager(world)
+	pm.link(fa, fb)
+	_ok(pm.link_count() == 1, "teardown: linked A↔B")
+	# An unrelated edit two cells away changes nothing.
+	world.place_block(Vector3i(300, 200, 0), STONE)
+	_ok(pm.link_count() == 1, "unrelated far edit leaves the link intact")
+	# Breaking a ring block tears down BOTH directions.
+	world.break_terrain(fa.ring_cells()[0])
+	_ok(not pm.is_linked(fa.key()) and not pm.is_linked(fb.key()), "breaking a ring block destroys the link (both directions)")
+	_ok(pm.cell_index_size() == 0, "cell index cleared after ring-break teardown")
+	# Re-link, then FILL an interior cell → teardown.
+	_author_frame(world, fa, OBS)
+	pm.link(fa, fb)
+	_ok(pm.link_count() == 1, "re-linked after restore")
+	world.place_block(fa.interior_cells()[4], DIRT)
+	_ok(not pm.is_linked(fa.key()) and not pm.is_linked(fb.key()), "placing a block inside the interior destroys the link")
+	pm.queue_free()
+	world.queue_free()
+
+# A render-disabled PortalManager wired to `world` (headless registry testing).
+func _portal_manager(world: WorldManager) -> PortalManager:
+	var pm := PortalManager.new()
+	pm.render_enabled = false
+	get_root().add_child(pm)
+	pm.setup(world, null, null)
+	return pm

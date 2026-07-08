@@ -941,14 +941,31 @@ Deviations from the locked design, and why:
    for w,h ∈ [1,8] at `PX_PER_BLOCK = 96` (min 96, max 768), so the pixel aspect equals
    `W/H` exactly and the live projection matches the verified one.
 
-2. **The shader carries a second `flip_v` uniform (default `true`)** on top of the
-   spec's `flip_u`, for the SubViewport render-target vertical orientation. Both flips
-   are **eyeball-pinned** (not headless-verifiable): `flip_u` is set per-side from
-   `PortalMath` (the derived `σ < 0` rule); `flip_v` is one global constant. If the live
-   view is mirrored horizontally, flip the `flip_u` derivation sign in `PortalMath` and
-   re-pin the `T.basis·S.right == −D.right` assert; if it is upside-down, set
-   `flip_v = false`. Both are uniforms (not `#define`s) so correcting them needs no new
-   pipeline.
+2. **The shader carries a second `flip_v` uniform** on top of the spec's `flip_u`, for
+   the SubViewport render-target vertical orientation. Both flips are **eyeball-pinned**
+   (not headless-verifiable): `flip_u` is set per-side from `PortalMath` (the derived
+   `σ < 0` rule); `flip_v` is one global constant. If the live view is mirrored
+   horizontally, flip the `flip_u` derivation sign in `PortalMath` and re-pin the
+   `T.basis·S.right == −D.right` assert; if it is upside-down, toggle `flip_v`. Both are
+   uniforms (not `#define`s) so correcting them needs no new pipeline.
+
+   **Live correction (post-deploy): `flip_v` default `true` → `false`.** The first live
+   `/portals/` build showed the through-view **upside-down**, and — because the window
+   frustum is off-axis when the eye is not level with the opening — the inverted ground
+   plane also read as an **incline toward the far side's ground** (reported as two bugs,
+   one root cause). The window-frustum camera is provably Y-upright (camera up is always
+   `+Y`; the extended NDC verify shows a frame's *bottom* corners map to NDC bottom, not
+   inverted, for **both** front-side and back-side eyes), and the GL-Compatibility/WebGL2
+   viewport texture sampled by `UV` is not vertically inverted here, so no extra V-flip is
+   warranted — `flip_v = true` was the over-correction. This *also* resolved the
+   "see-through visible from only one side" report: the quad has been double-sided
+   (`cull_disabled`) and the window math correct on both sides since Stage 3 (verified),
+   so both faces always rendered a live image; on the **back** face `flip_u = true` (which
+   correctly undoes back-face UV mirroring) combined with the erroneous `flip_v = true` was
+   a full 180° rotation, so the back view looked broken rather than see-through. With
+   `flip_v = false` the front face is upright and the back face is a clean, upright,
+   `flip_u`-corrected view — usable from both sides. No `PortalMath`, camera-basis,
+   `cull_mask`, or visual-layer change was needed (or made).
 
 3. **Frame buildability is verified via "build a solid 10×10 wall, then dig the 8×8
    interior"** (collapse-proof: every wall block is supported from below during

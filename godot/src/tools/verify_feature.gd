@@ -6747,7 +6747,13 @@ func _test_portal_math() -> void:
 	# rectangle corners (±1, ±1) under the computed (near, offset, size, aspect, camera).
 	var S := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 64, 0), 2, 3)
 	var D := PortalFrame.new(PortalFrame.AXIS_X, Vector3i(40, 64, 20), 2, 3)
-	for eye: Vector3 in [Vector3(0.0, 65.5, 6.0), Vector3(-2.0, 66.0, 3.0), Vector3(1.5, 64.8, 8.0)]:
+	# FRONT-side eyes (σ>0) AND BACK-side eyes (σ<0), incl. eyes above/below the opening
+	# centre (asymmetric frustums) so the both-sides window math is pinned, not just the
+	# front: the near/offset/size/camera must reproject D's corners to the NDC rectangle
+	# from either side (BUG-1 "visible only from one side" is NOT a math fault — this asserts it).
+	for eye: Vector3 in [
+			Vector3(0.0, 65.5, 6.0), Vector3(-2.0, 66.0, 3.0), Vector3(1.5, 64.8, 8.0),
+			Vector3(1.0, 65.5, -5.0), Vector3(0.5, 63.0, -4.0), Vector3(2.0, 68.0, -6.0)]:
 		var cam := PortalMath.window_camera(eye, S, D, far)
 		var view := (cam["transform"] as Transform3D).affine_inverse()
 		var proj := Projection.create_frustum_aspect(cam["size"], cam["aspect"], cam["offset"], cam["near"], far, false)
@@ -6772,6 +6778,9 @@ func _test_portal_math() -> void:
 		# s == -sigma: virtual-eye side of D is the opposite of the real-eye side of S.
 		var sigma := (eye - S.global_transform().origin).dot(S.global_transform().basis.z)
 		_ok(sign(cam["side"]) == -sign(sigma), "window side s == -sigma (eye %s)" % eye)
+		# flip_u flips exactly on the sigma sign (§3.5.3): true iff the eye is on S's back
+		# face — the U-flip that undoes back-face UV mirroring so both sides read upright.
+		_ok(bool(cam["flip_u"]) == (sigma < 0.0), "flip_u == (sigma < 0) (eye %s)" % eye)
 
 	# Degeneracy: eye ON the source plane → near clamps to NEAR_MIN, no NaNs.
 	var deg := PortalMath.window_camera(S.center(), S, D, far)

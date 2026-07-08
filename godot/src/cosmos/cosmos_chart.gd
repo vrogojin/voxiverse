@@ -155,15 +155,37 @@ func flip_needed(local: Vector3) -> bool:
 func flip(local: Vector3) -> Dictionary:
 	var wx := int(floor(local.x))
 	var wz := int(floor(local.z))
-	var g := CubeSphere.fold_cell(face, i_org + wx, j_org + wz, n)
+	var gi := i_org + wx
+	var gj := j_org + wz
+	var g := CubeSphere.fold_cell(face, gi, gj, n)
 	var b := int(g["face"])
 	if b < 0:
-		return {"ok": false, "from_face": face, "to_face": face}   # corner quadrant — M5
+		return {"ok": false, "from_face": face, "to_face": face, "yaw": 0.0}   # corner quadrant — M5
 	var from_face := face
+	# #71: the crossed edge's D4 remap carries a ROTATION (the new home face's lattice is a 0/90/180/270°
+	# rotation of the old at the shared edge). The player's window position stays continuous (below), but its
+	# HEADING is expressed in the window (i,j)=(x,z) axes, which just rotated — so return that rotation as a
+	# yaw so the caller counter-rotates the player and keeps look + motion continuous across the crossing (no
+	# view snap). yaw = atan2(m2, m0) where M=[[m0,m1],[m2,m3]] is the exact edge_remap D4 acting on (x,z);
+	# pure rotation (det +1) on every edge, so a plain yaw compensates it with no handedness flip.
+	var side := CubeSphere.SIDE_EAST
+	if gi >= n:
+		side = CubeSphere.SIDE_EAST
+	elif gi < 0:
+		side = CubeSphere.SIDE_WEST
+	elif gj >= n:
+		side = CubeSphere.SIDE_NORTH
+	else:
+		side = CubeSphere.SIDE_SOUTH
+	var m: Array = CubeSphere.edge_remap(face, side, n)["m"]
+	# NEGATED: M rotates the (i,j) index vectors; the player's heading is a Godot yaw about +Y over the
+	# (x,z)=(i,j) window plane, whose handedness is opposite the index rotation — so the compensating yaw is
+	# −atan2(m2, m0). Verified by verify_cosmos_turn (the ±90° EAST/WEST edges are the sign-sensitive ones).
+	var yaw := -atan2(float(m[2]), float(m[0]))
 	# Re-base: window (wx, wz) must map to the same true global cell (b, gi, gj) on the new face, so
 	# the player does not move. On the new home face b the fold is the identity in range, so choosing
 	# i_org' = gi − wx, j_org' = gj − wz makes window (wx, wz) → (b, gi, gj) exactly.
 	face = b
 	i_org = int(g["i"]) - wx
 	j_org = int(g["j"]) - wz
-	return {"ok": true, "from_face": from_face, "to_face": b}
+	return {"ok": true, "from_face": from_face, "to_face": b, "yaw": yaw}

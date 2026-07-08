@@ -42,6 +42,11 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 # in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
 var _flip_settling := false
 
+# #71: yaw (radians) of the MOST RECENT home-face flip = the crossed edge's D4 rotation. The player reads
+# it via last_flip_yaw() when maybe_flip_home_face returns true and counter-rotates its heading + velocity,
+# so a seam crossing does not snap the view by 90/180/270°. 0.0 when no flip / a 0°-edge flip.
+var _last_flip_yaw := 0.0
+
 # COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
 # this const + the guard in _write_cell) to drop it. When true, a write to a corner-quadrant window cell
 # (double-out on the active chart) is REFUSED — the wedge is a per-window sampling of the canonical
@@ -804,6 +809,12 @@ func install_chart(chart: CosmosChart) -> void:
 func chart() -> CosmosChart:
 	return _chart
 
+## #71: the yaw (radians) the caller must add to the player's heading after the MOST RECENT flip (the
+## crossed edge's D4 rotation), so look + motion stay continuous. Read once, right after maybe_flip_home_face
+## returns true. 0.0 in FLAT_WORLD / when no flip happened.
+func last_flip_yaw() -> float:
+	return _last_flip_yaw
+
 ## DEV (task #66): the 4 CUBE-FACE BORDER lines of the current home face, in WINDOW space, for the border
 ## overlay. The home face spans global i,j ∈ [0, n); the chart maps global (gi,gj) → window (gi−i_org,
 ## gj−j_org), so the 4 edges (i=0, i=n, j=0, j=n) are the window lines x=−i_org, x=n−i_org, z=−j_org,
@@ -867,6 +878,10 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	var res := _chart.flip(player_pos)
 	if not bool(res["ok"]):
 		return false                                  # corner quadrant — deferred to M5
+	# #71: stash the crossed edge's D4 rotation so the player counter-rotates its heading + velocity
+	# (read via last_flip_yaw()); the window frame's (i,j) axes just rotated, so an uncompensated player
+	# would snap 90/180/270°. FLAT_WORLD never reaches here (no chart), so the flat path is unaffected.
+	_last_flip_yaw = float(res["yaw"])
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
 	TerrainConfig.set_active_face(_chart.face)
 	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed

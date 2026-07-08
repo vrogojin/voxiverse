@@ -106,6 +106,7 @@ func _ready() -> void:
 		_chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
 		TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win
 		environment.set_chart(_chart)
+		_m5_sync_frame()   # COSMOS M5a: push the chart table to the true-position shader (no-op when M5_RENDER off)
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
@@ -848,6 +849,22 @@ func install_chart(chart: CosmosChart) -> void:
 		TerrainConfig.set_active_frame(chart.face, CubeSphere.d4_of(chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1)
 		if environment != null:
 			environment.set_chart(chart)
+		_m5_sync_frame()   # COSMOS M5a: chart table (org/M_win/face axes) → true-position shader
+
+## COSMOS M5a: push the per-FRAME camera frame (d̂_cam / y_cam / M_tangent + camera origin) into the
+## true-position shader globals. Called by main.gd each frame in M5_RENDER mode. No-op without a chart.
+func m5_push_camera(cam: Vector3) -> void:
+	if _chart == null or not CubeSphere.M5_RENDER:
+		return
+	CosmosTruePlace.push_camera(_chart, cam)
+
+## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
+## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).
+## Guarded on M5_RENDER so the default (and the CosmosBend curved mode) never touch these globals.
+func _m5_sync_frame() -> void:
+	if _chart == null or not CubeSphere.M5_RENDER:
+		return
+	CosmosTruePlace.push_chart_table(_chart)
 
 ## The active chart, or null in FLAT_WORLD. Read-only accessor.
 func chart() -> CosmosChart:
@@ -930,6 +947,7 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 	# surface (Fable Stage 1). Any live post-flip cover is a child, so it rides along automatically.
 	if _far != null:
 		_far.position -= shift
+	_m5_sync_frame()   # COSMOS M5a: the reanchor moved _chart.org → refresh the true-position chart table
 	return shift
 
 ## COSMOS M3 (§4.5): the home-face flip. When the player has crossed FLIP_HYST cells PAST a face
@@ -953,6 +971,7 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# reverted). FLAT_WORLD never reaches here (no chart), so the flat path is unaffected.
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
 	TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win, before restream
+	_m5_sync_frame()   # COSMOS M5a: flip changed face + M_win → refresh the true-position chart table before restream
 	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed
 	# `_edits`/`_meta` are untouched (edits are preserved), but `_edit_columns`/`_placed_top` are
 	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the

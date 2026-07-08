@@ -133,9 +133,15 @@ func _ready() -> void:
 ## function, the bend pipeline is warmed at load, not on the first far tile drawn in gameplay.
 static func make_material() -> Material:
 	if not CubeSphere.FLAT_WORLD:
-		CosmosBend.ensure_globals()
 		var sm := ShaderMaterial.new()
-		sm.shader = CosmosBend.far_shader()
+		# COSMOS M5a: the PURE true-position far shader (no bubble — far tiles are all beyond the bubble's
+		# r1) when M5_RENDER is on; else the camera-centred bend far shader. Default M5_RENDER=false.
+		if CubeSphere.M5_RENDER:
+			CosmosTruePlace.ensure_globals_m5()
+			sm.shader = CosmosTruePlace.far_shader_m5()
+		else:
+			CosmosBend.ensure_globals()
+			sm.shader = CosmosBend.far_shader()
 		return sm
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true

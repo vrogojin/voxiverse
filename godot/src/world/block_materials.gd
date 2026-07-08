@@ -63,7 +63,14 @@ static func _bend_material(block_id: int) -> ShaderMaterial:
 	var color := BlockCatalog.color_of(block_id)
 	var translucent: bool = rd.get("translucent", false)
 	var m := ShaderMaterial.new()
-	m.shader = CosmosBend.translucent_shader() if translucent else CosmosBend.opaque_shader()
+	# COSMOS M5a (§2): when M5_RENDER is on, carry the TRUE-POSITION placement shader (per-vertex sphere
+	# position + interaction bubble) instead of the camera-centred bend — same uniform surface, so the
+	# param-setting below is unchanged. Default M5_RENDER=false → the CosmosBend shader (byte-identical).
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.ensure_globals_m5()
+		m.shader = CosmosTruePlace.translucent_shader_m5() if translucent else CosmosTruePlace.opaque_shader_m5()
+	else:
+		m.shader = CosmosBend.translucent_shader() if translucent else CosmosBend.opaque_shader()
 	if tex != null:
 		m.set_shader_parameter("albedo_tex", tex)
 		m.set_shader_parameter("use_texture", true)

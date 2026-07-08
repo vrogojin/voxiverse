@@ -112,6 +112,13 @@ const BODY_R := {
 # TO BUILD A CURVED DEMO: change the one line below to `const FLAT_WORLD := false`.
 const FLAT_WORLD := true
 
+## COSMOS M5a (docs/COSMOS-M5-ADR.md §2): the TRUE-POSITION render toggle. DEFAULT false → the shipped
+## camera-centred CosmosBend sagitta is used (byte-identical to M4). Flip to true to place every vertex at
+## its exact sphere position P = (R+y)·d̂ via CosmosTruePlace (kills the §4.6 metric-lie shear everywhere —
+## home + strips + corner, via the corner-closure theorem, from the SAME single near volume). A/B-able
+## live; requires FLAT_WORLD = false (curved). FLAT_WORLD untouched by M5.
+const M5_RENDER := false
+
 ## The cube face the M1 window is homed on (§3.5: "flat world reinterpreted as a face-4 window").
 ## Face 4 is +Z polar (a pole on the face centre, §5.2) so the window is defect-free lattice.
 const HOME_FACE := 4

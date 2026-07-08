@@ -71,7 +71,10 @@ func _ready() -> void:
 	# COSMOS M1 (§3.4): the render bend is camera-centred, so register + seed the global bend
 	# uniforms now. FLAT_WORLD (default) leaves them untouched — no bend materials are ever built.
 	if not CubeSphere.FLAT_WORLD:
-		CosmosBend.set_camera(player.camera_global_transform().origin)
+		if CubeSphere.M5_RENDER:
+			world.m5_push_camera(player.camera_global_transform().origin)   # true-position frame + chart table
+		else:
+			CosmosBend.set_camera(player.camera_global_transform().origin)
 
 	# COSMOS DEV (task #66): the cube-face BORDER overlay — bright magenta pillars along the home face's
 	# seam edges, so they can be walked up to for M4 crossing tests. Curved-only AND flag-gated; FLAT_WORLD
@@ -87,7 +90,10 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
-	CosmosBend.set_camera(_player.camera_global_transform().origin)
+	if CubeSphere.M5_RENDER:
+		_player.world.m5_push_camera(_player.camera_global_transform().origin)
+	else:
+		CosmosBend.set_camera(_player.camera_global_transform().origin)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

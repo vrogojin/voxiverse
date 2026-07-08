@@ -25,6 +25,10 @@ services:
       # The Godot web export, served live. Point VOXIVERSE_WEB_ROOT at your
       # checkout's build/web (absolute path required by Docker bind mounts).
       - ${VOXIVERSE_WEB_ROOT:-/home/vrogojin/voxiverse/build/web}:/srv/web:ro
+      # The see-through PORTALS demo — a SEPARATE Godot export served at the
+      # /portals/ subpath. Its own build dir so it never clobbers the COSMOS
+      # root build; served read-only via the nginx `^~ /portals/` alias block.
+      - ${VOXIVERSE_PORTALS_ROOT:-/home/vrogojin/voxiverse/build/portals-web}:/srv/portals:ro
       # Persist Let's Encrypt material across rebuilds/restarts so we don't
       # re-issue (and risk rate limits) on every deploy.
       - voxiverse-letsencrypt:/etc/letsencrypt

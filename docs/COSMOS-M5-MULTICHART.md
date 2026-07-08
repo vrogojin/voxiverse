@@ -1,6 +1,15 @@
 # COSMOS-M5-MULTICHART — scoping the true-position render milestone
 
-Status: SCOPING (Fable, 2026-07-08). No implementation. Companion to
+Status: SCOPING (Fable, 2026-07-08) — **superseded in part by docs/COSMOS-M5-ADR.md**
+(task #76, the locked design + M5a implementation plan). The ADR's corner-closure
+theorem collapses this note's M5b/M5c sizing: no per-face render volumes and no
+geodesic integrator are needed at the current R_FAR — the single window's strips,
+true-placed, close the corner exactly, and walkable corners reduce to eager corner
+flips + the §5.3 keystone. The §4 corner-decision framing below is also resolved:
+the user chose **walkable LAND corners** (general dry-planet technique; the sea-corner
+option is off). This note remains the background analysis; implement from the ADR.
+
+No implementation. Companion to
 COSMOS-PLANET-TOPOLOGY (§3.4 bend, §4.6 metric lie, §5.3 corner zone, §7.2 B2),
 COSMOS-FRAME-ORIENTATION (#74 `M_win`, the corner wedge §5.4/§10).
 Context: the user chose M5 over the bounded wedge-fill blend (FRAME-ORIENTATION §10 —

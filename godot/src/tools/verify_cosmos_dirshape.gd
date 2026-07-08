@@ -47,9 +47,9 @@ func _angle(a: Vector3, b: Vector3) -> float:
 func _init() -> void:
 	print("=== verify_cosmos_dirshape (G-D — directional-shape world direction, bug #1) FLAT_WORLD=", CubeSphere.FLAT_WORLD, " ===")
 	if CubeSphere.FLAT_WORLD:
-		print("  (FLAT_WORLD — G-D is curved-only; skipping)")
-		print("==== VERIFY: 0 passed, 0 failed (skipped flat) ====")
-		quit(0)
+		print("  SKIPPED — G-D needs FLAT_WORLD=false to exercise the curved fold/render. NOT A PASS.")
+		print("==== VERIFY: SKIPPED (curved-only gate) ====")
+		quit(2)                                     # sentinel: distinct from a real pass (0) or fail (1)
 		return
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var home := 4

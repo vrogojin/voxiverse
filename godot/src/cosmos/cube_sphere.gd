@@ -362,7 +362,10 @@ static func strip_d4_to(from_face: int, to_face: int, n: int) -> int:
 		var e := edge_remap(from_face, side, n)
 		if int(e["b"]) == to_face:
 			return d4_of(e["m"])
-	return 0                                          # not edge-adjacent (should not happen within the extended window)
+	# Not edge-adjacent — must never happen within the extended window (the resolved face is always a
+	# direct neighbour of the home face). Warn loudly instead of silently returning 0 (a wrong orientation).
+	push_warning("CubeSphere.strip_d4_to: face %d is not edge-adjacent to home %d — returning identity (unexpected)" % [to_face, from_face])
+	return 0
 
 ## Fold a window cell that has spilled across exactly ONE face edge back to its true global
 ## (face, i, j). Returns {face, i, j}. In-range cells are the identity. A cell out of range in

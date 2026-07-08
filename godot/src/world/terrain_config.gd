@@ -573,15 +573,12 @@ class GenCtx extends RefCounted:
 static func active_face() -> int:
 	return _active_face
 
-## Set the active home face (called by WorldManager on chart install / home-face flip, §4.5). A
-## real change CLEARS the per-column shape memo — its entries are keyed by column (i, j) for ONE
-## face, so a stale face-A entry must not answer a face-B query after the flip (byte-identical
-## behaviour: recomputing against the new face). No-op when the face is unchanged (zero cost).
+## Set only the active home face, KEEPING the current M_win. Routed through set_active_frame (which clears
+## the memo on a face change) so it can NEVER desync _active_mwin_d4 (COSMOS-FRAME-ORIENTATION Q2d). No
+## production caller today — WorldManager uses set_active_frame directly; retained for the verify gates
+## that change the face without a frame-orientation change.
 static func set_active_face(f: int) -> void:
-	if f == _active_face:
-		return
-	_active_face = f
-	_shape_memo.clear()
+	set_active_frame(f, _active_mwin_d4)
 
 ## The active window orientation quarter-turn d4(M_win) (read-only accessor, §6).
 static func active_mwin_d4() -> int:

@@ -220,7 +220,10 @@ static func _emit_terrain_shapes(tools: Dictionary, world: WorldManager,
 			# SHARP-SLOPE §4.3: a steep SLOPE column emits its whole vertical RUN [lo, hi−1] of shaped
 			# cells (carve below h, caps above h+1), not just h/h+1. Rare buried full cells between the
 			# heightmap top and the run start are emitted as cubes so the fallback stays hole-free.
-			var run := TerrainConfig.slope_run_of(wx, wz)
+			# COSMOS-FRAME-ORIENTATION §6: route the run-gate through world.col_slope_run_of so it folds the
+			# origin + rotates into the window frame (the fires flag + lo/hi range are rotation-invariant, but
+			# this reads the CORRECT global column, not the raw window one). FLAT/no chart → the plain run.
+			var run := world.col_slope_run_of(wx, wz) if world != null else TerrainConfig.slope_run_of(wx, wz)
 			if TerrainConfig.slope_run_fires(run):
 				var rng := TerrainConfig.slope_run_range(run, h)
 				for yy in range(h + 1, rng.x):

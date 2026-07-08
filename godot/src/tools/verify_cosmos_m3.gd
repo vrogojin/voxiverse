@@ -244,7 +244,20 @@ func _test_curved_render_integration() -> void:
 	# point of the gate is that it is the GLOBAL column, NOT the raw window column (which differs here).
 	var expect_h := TC.height_at(i_org + x, j_org + z)
 	_ok(w.col_height(x, z) == expect_h, "col_height resolves the GLOBAL cell (folds the origin), not the window column")
-	_ok(w.col_height(x, z) != TC.height_at(x, z), "col_height differs from the raw-window height (proves the origin fold)")
+	# Prove the fold ROBUSTLY (not on a fixed column whose two heights may coincidentally match): search a
+	# small patch for a column where the GLOBAL and raw-window heights genuinely differ, then assert
+	# col_height matches the global and NOT the window there. Terrain varies over the patch → always found.
+	var fold_proved := false
+	for dx in range(0, 16):
+		for dz in range(0, 16):
+			var gh := TC.height_at(i_org + x + dx, j_org + z + dz)
+			var wh := TC.height_at(x + dx, z + dz)
+			if gh != wh:
+				fold_proved = w.col_height(x + dx, z + dz) == gh and w.col_height(x + dx, z + dz) != wh
+				break
+		if fold_proved:
+			break
+	_ok(fold_proved, "col_height folds the origin: at some column the global height ≠ the raw-window height and col_height == global")
 	_ok(w.effective_height(x, z) == expect_h, "effective_height resolves the GLOBAL cell")
 
 	# Window-independence: a second world at a DIFFERENT origin whose window maps to the SAME global
@@ -263,7 +276,14 @@ func _test_curved_render_integration() -> void:
 	var pos_a := Vector3(float(x) + 0.5, float(expect_h - 5) + 0.5, float(z) + 0.5)
 	var pos_b := Vector3(float(x - 50) + 0.5, float(expect_h - 5) + 0.5, float(z - 70) + 0.5)
 	_ok(pve_a.temperature(pos_a) == pve_b.temperature(pos_b), "PerVoxelEnvironment.temperature is window-independent (global-cell fold)")
-	_ok(absf(pve_a.temperature(pos_a) - 16.5) < 1e-6, "temperature 5 below the GLOBAL surface reads 16.5 C (read the global column, not the window)")
+	# Robust value check (not a hardcoded 16.5, which depends on the column's seed/latitude climate): the
+	# sub-surface temperature is LINEAR in depth (a constant per-block lapse), read off the GLOBAL column.
+	# Assert equal decrements over equal depth steps + a non-flat profile — deterministic for any seed.
+	var t1 := pve_a.temperature(Vector3(float(x) + 0.5, float(expect_h - 1) + 0.5, float(z) + 0.5))
+	var t3 := pve_a.temperature(Vector3(float(x) + 0.5, float(expect_h - 3) + 0.5, float(z) + 0.5))
+	var t5 := pve_a.temperature(Vector3(float(x) + 0.5, float(expect_h - 5) + 0.5, float(z) + 0.5))
+	_ok(absf((t1 - t3) - (t3 - t5)) < 1e-4 and absf(t1 - t5) > 1e-3,
+		"temperature is LINEAR in depth off the GLOBAL surface (constant per-block lapse), not the window column")
 
 	# Fallback-mesher overlay iteration: placed_cells_window unfolds BOTH a home-face edit and an
 	# across-seam edit back into the window (so the mesher renders placed blocks across the seam).

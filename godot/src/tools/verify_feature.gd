@@ -6386,7 +6386,7 @@ func _test_portal_items() -> void:
 	counter["n"] = 0
 	_ok(world.break_terrain(top) == STONE, "break the placed stone")
 	_ok(counter["n"] == 1 and counter["last"] == top, "break_terrain emits cell_edited once at the cell")
-	world.queue_free()
+	world.free()
 
 # PORTALS §3.7 — frame detection (Stage 1). Fixtures are authored directly through the
 # write choke point (`_write_cell`) high above terrain: detection is a PURE function of
@@ -6515,7 +6515,7 @@ func _test_portal_frames() -> void:
 	world._write_cell(f_edit.interior_cells()[0], STONE)                    # fill an interior cell
 	_ok(not PortalFrameDetector.still_valid(world, f_edit), "still_valid false after filling an interior cell")
 
-	world.queue_free()
+	world.free()
 
 # Author a frame's cells directly through the write choke point: ring → obsidian,
 # interior → air. Used only to build detection fixtures (see _test_portal_frames).
@@ -6565,7 +6565,7 @@ func _test_portal_buildability() -> void:
 	_ok(carved_ok and world.active_body_count() == 0, "digging the 8x8 interior spawns no loose body (max lintel is stable)")
 	_ok(PortalFrameDetector.still_valid(world, frame), "the completed max 8x8 frame is valid/standing")
 	_ok(PortalFrameDetector.detect(world, frame.ring_cells()[0]) != null, "the built max frame is detected")
-	world.queue_free()
+	world.free()
 
 # First (lowest z, then x) flat run of `n` columns along +X at a fixed z, above sea and
 # clear of generated blocks for 11 cells overhead — the buildability test bed.
@@ -6623,7 +6623,7 @@ func _test_portal_linking() -> void:
 	pm.use_linker({"kind": "none"})
 	pm.use_linker({"kind": "terrain", "cell": Vector3i(0, 100, 0)})     # air, not obsidian
 	_ok(pm.link_count() == 1, "use_linker on non-obsidian is a no-op")
-	pm.queue_free()
+	pm.free()
 
 	# --- arm twice = disarm; self-link rejected ---
 	var pm2 := _portal_manager(world)
@@ -6631,7 +6631,7 @@ func _test_portal_linking() -> void:
 	pm2.use_linker({"kind": "terrain", "cell": fa.ring_cells()[0]})
 	_ok(pm2.armed_key() == _NOKEY and pm2.link_count() == 0, "arming the same frame twice disarms (no link)")
 	_ok(pm2.link(fa, fa) == false, "linking a frame to itself is rejected")
-	pm2.queue_free()
+	pm2.free()
 
 	# --- re-link steal: A↔B then C→A ---
 	var pm3 := _portal_manager(world)
@@ -6641,7 +6641,7 @@ func _test_portal_linking() -> void:
 	_ok(not pm3.is_linked(fb.key()), "B unlinked by the steal")
 	_ok(pm3.owning_key(fb.ring_cells()[0]) == _NOKEY, "B's indexed cells purged")
 	_ok(pm3.link_count() == 1, "still exactly one link after the steal")
-	pm3.queue_free()
+	pm3.free()
 
 	# --- unlink by tool ---
 	var pm4 := _portal_manager(world)
@@ -6649,7 +6649,7 @@ func _test_portal_linking() -> void:
 	pm4.use_linker({"kind": "terrain", "cell": fa.ring_cells()[2]})
 	_ok(not pm4.is_linked(fa.key()) and not pm4.is_linked(fb.key()), "the linker on a linked frame unlinks both directions")
 	_ok(pm4.cell_index_size() == 0, "cell index emptied after tool unlink")
-	pm4.queue_free()
+	pm4.free()
 
 	# --- MAX_LINKS enforced ---
 	var pm5 := _portal_manager(world)
@@ -6665,8 +6665,8 @@ func _test_portal_linking() -> void:
 	_ok(made == PortalManager.MAX_LINKS and pm5.link_count() == PortalManager.MAX_LINKS, "MAX_LINKS (%d) pairs link" % PortalManager.MAX_LINKS)
 	_ok(not pm5.link(many[2 * PortalManager.MAX_LINKS], many[2 * PortalManager.MAX_LINKS + 1]), "the (MAX_LINKS+1)th link is refused")
 	_ok(pm5.link_count() == PortalManager.MAX_LINKS, "registry unchanged after the refusal")
-	pm5.queue_free()
-	world.queue_free()
+	pm5.free()
+	world.free()
 
 	_test_portal_teardown()
 
@@ -6697,8 +6697,8 @@ func _test_portal_teardown() -> void:
 	_ok(pm.link_count() == 1, "re-linked after restore")
 	world.place_block(fa.interior_cells()[4], DIRT)
 	_ok(not pm.is_linked(fa.key()) and not pm.is_linked(fb.key()), "placing a block inside the interior destroys the link")
-	pm.queue_free()
-	world.queue_free()
+	pm.free()
+	world.free()
 
 # A render-disabled PortalManager wired to `world` (headless registry testing).
 func _portal_manager(world: WorldManager) -> PortalManager:
@@ -6832,8 +6832,8 @@ func _test_portal_activation() -> void:
 	var both_eye := ca + Vector3(0, 0, 6)           # near both fa and fc
 	var capped := pm.compute_active_set(both_eye, {})
 	_ok(capped.size() == PortalManager.MAX_ACTIVE, "the active set never exceeds MAX_ACTIVE (%d)" % PortalManager.MAX_ACTIVE)
-	pm.queue_free()
-	world.queue_free()
+	pm.free()
+	world.free()
 
 # Drive a PortalSurface directly (module present headless): activate parks a SubViewport +
 # destination VoxelViewer, the deactivation linger frees BOTH (no leak). Idle/free calls are
@@ -6869,7 +6869,7 @@ func _test_portal_surface_lifecycle() -> void:
 	surf.tick_idle(PortalSurface.LINGER_SEC + 1.0)
 	# queue_free is deferred; the surface's own bookkeeping reports the release immediately.
 	_ok(not surf.has_dest_viewer(), "the destination viewer is freed after the deactivation linger")
-	surf.queue_free()
+	surf.free()
 
 # Count direct children of `node` whose class name matches `type_name`.
 func _count_type_children(node: Node, type_name: String) -> int:
@@ -6980,6 +6980,6 @@ func _test_portal_teleport() -> void:
 		pm2._physics_process(0.016)
 	_ok(not pm2.teleport_locked(), "the lockout clears after its window")
 
-	pm2.queue_free()
-	pm.queue_free()
-	world.queue_free()
+	pm2.free()
+	pm.free()
+	world.free()

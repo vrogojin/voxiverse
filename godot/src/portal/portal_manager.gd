@@ -345,6 +345,12 @@ func _teardown_entry(key: Vector4i) -> void:
 	var frame: PortalFrame = entry["frame"]
 	var surface: Node = entry.get("surface", null)
 	if surface != null and is_instance_valid(surface):
+		# Stop the SubViewport pass THIS frame (queue_free only deletes at frame end, so an
+		# UPDATE_ALWAYS surface would otherwise render one more frame of a destroyed
+		# destination). deactivate() sets UPDATE_DISABLED; queue_free then frees the viewport
+		# + destination viewer with the node — no leak.
+		if surface.has_method("deactivate"):
+			surface.deactivate()
 		surface.queue_free()
 	# Purge this frame's indexed cells (only those still pointing at this key — a shared
 	# cell between overlapping frames would keep the other's entry, though frames never

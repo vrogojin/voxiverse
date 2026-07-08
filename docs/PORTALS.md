@@ -919,3 +919,87 @@ is untouched — the two variants are a `PortalMath`/shader-local swap by design
   [multiplayer doc](https://voxel-tools.readthedocs.io/en/latest/multiplayer/)
 - Off-axis ("window") projection math: Kooima, *Generalized Perspective
   Projection* (2008) — the head-tracked-window formulation §3.5.2 instantiates.
+
+---
+
+## 7. Implementation notes & DEVIATIONS (as-built, `feat/voxiverse-portals`)
+
+Implemented Stages 0–5 + docs. Headless verify: **`VERIFY: 6163 passed, 0 failed`**
+(`_test_portal_items / _frames / _buildability / _linking / _math / _activation /
+_surface_lifecycle / _teleport`). The GPU render is eyeballed after deploy — the
+headless suite validates logic/math/detection/registry/lifecycle, not the live draw.
+
+Deviations from the locked design, and why:
+
+1. **Off-axis frustum math confirmed correct as specified — no sign flips.** The
+   NDC-corner assert (`_test_portal_math`) builds the projection with Godot's OWN
+   `Projection.create_frustum_aspect(size = D.height, aspect = W/H, offset, near, far,
+   flip_fov = false)` and reprojects D's four interior corners; all land on the NDC
+   rectangle (±1, ±1). So `near`/`frustum_offset`/`size` per §3.5.2 are right and the
+   `PROJECTION_FRUSTUM` fallback (§5.3) was not needed. `size` is the near-plane HEIGHT
+   with `KEEP_HEIGHT`; the portal-sized targets never trip the 64/`MAX_TARGET_PX` clamp
+   for w,h ∈ [1,8] at `PX_PER_BLOCK = 96` (min 96, max 768), so the pixel aspect equals
+   `W/H` exactly and the live projection matches the verified one.
+
+2. **The shader carries a second `flip_v` uniform (default `true`)** on top of the
+   spec's `flip_u`, for the SubViewport render-target vertical orientation. Both flips
+   are **eyeball-pinned** (not headless-verifiable): `flip_u` is set per-side from
+   `PortalMath` (the derived `σ < 0` rule); `flip_v` is one global constant. If the live
+   view is mirrored horizontally, flip the `flip_u` derivation sign in `PortalMath` and
+   re-pin the `T.basis·S.right == −D.right` assert; if it is upside-down, set
+   `flip_v = false`. Both are uniforms (not `#define`s) so correcting them needs no new
+   pipeline.
+
+3. **Frame buildability is verified via "build a solid 10×10 wall, then dig the 8×8
+   interior"** (collapse-proof: every wall block is supported from below during
+   construction, the finished lintel is a closed beam), NOT block-by-block ring
+   construction. The completed max frame is structurally stable with obsidian's
+   **existing** `anchors` — **no `blocks.json` tune was required** (the §3.7 escape hatch
+   was not triggered). A player building a big lintel free-hand in mid-air can still shed
+   transient cantilevers (the engine has structural integrity); build on the ground or
+   with support, exactly like a real portal frame.
+
+4. **Detection seeds from all 8 in-plane neighbours** of the tool-clicked obsidian cell
+   (orthogonal + diagonal), not the 4 orthogonal the prose names — a **corner** ring
+   block reaches its interior only diagonally, and §3.7 requires corner seeds to resolve.
+   Behaviour is otherwise exactly the drop/slide/measure/validate of §3.3.
+
+5. **`compute_active_set` is a pure function** (distance range + hysteresis + edge-on +
+   `MAX_ACTIVE`, nearest-first); the live `_process` ANDs the camera `is_position_in_frustum`
+   test (which needs a real camera) on top. This let the activation policy be verified
+   headless with synthetic eye positions.
+
+6. **`ToastHUD` + `PortalManager` + the starter kit are wired into `main.gd` together**
+   (Stages 2–3), not `ToastHUD` alone at Stage 0 — they are inert without the manager, so
+   consolidating keeps `main.gd` coherent. `GRANT_STARTER_KIT` lives on `PortalManager`
+   as designed.
+
+7. **`PortalManager.player` is duck-typed** (untyped field/param) rather than `: Node`, so
+   the headless teleport test can drive `_physics_process` with a tree-free `RefCounted`
+   mock (a Node3D read out-of-tree returns an identity transform). The live injection is
+   the real `Player` unchanged.
+
+8. **Verify float tolerances**: the isometry round-trip is asserted as `basis ≈ I` +
+   `origin.length() < 0.01` (not `Transform3D.is_equal_approx`) because Godot's `real_t`
+   is 32-bit — round-off at coordinates ~200 is ~2e-5, above the 1e-5 default epsilon,
+   while a real bug is O(distance). The NDC and math asserts use a 1e-3 tolerance.
+
+### Web perf budget (§5.2) — deferred measurement
+
+The budget **levers are all wired** (`MAX_ACTIVE = 1` on web, portal-sized low-res
+targets, `PX_PER_BLOCK`, `HALF_RATE_SECOND` for a 2nd portal, `UPDATE_DISABLED` when
+inactive + 10 s linger free, the destination `VoxelViewer` at `view_distance = 64`, and
+the `RENDER_PORTALS` kill switch to the energy surface). The actual reference-laptop fps
+table is to be filled in at deploy time (`export-web.sh` + `deploy.sh` + eyeball on
+`/portals/`); apply the §5.2 ladder in order if 1 active portal drops below 30 fps and
+record which rung shipped. The see-through effect is **kept** at every rung down to
+low-resolution; only the last-ditch kill switch falls back to the flat energy surface.
+
+### Destination streaming (owner's required visual)
+
+On the module (`godot_voxel`) path an active portal parks a `VoxelViewer` at the
+destination (`view_distance = 64`, `requires_collisions = false`, `ClassDB`-instantiated
+so the file still loads when the module is absent), so the real far-side blocks stream in
+and render behind the opening; it is freed 10 s after deactivation (verified: no leak).
+On the GDScript fallback path a distant destination shows fog (accepted degrade); the
+common near-destination sandbox case works on both paths.

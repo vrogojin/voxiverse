@@ -74,6 +74,18 @@ Model a small, *correctly-abstracted* slice now so it extends to the full engine
 - The **live demo must load and be playable in a desktop browser**; that gate outranks feature depth.
 - Document every real decision in `docs/`.
 
+## 7a. Shipped feature layers (built on the decoupled sim/render split)
+
+Each extends the engine without touching the others (see the named doc for the contract):
+multi-material voxels + waterlogging (`MULTI-MATERIAL.md`, `WATERLOGGING.md`,
+`MULTI-LIQUID.md`), sub-voxel smoothing + sharp slopes (`SUB-VOXEL-SMOOTHING.md`,
+`SHARP-SLOPE.md`), snow accumulation + climate (`SNOW-ACCUMULATION.md`,
+`M1-SNOWY-WORLD.md`), the far-field LOD (`LOD-DESIGN.md`), and — **see-through linked
+portals**: obsidian frames linked by a portal-linking tool, each interior a live
+window-frustum SubViewport view of the other frame with the far side's blocks streamed
+in behind it, plus optional walk-through teleport (`PORTALS.md`; entirely outside both
+render paths, `PortalManager.ENABLED` gate).
+
 ## 8. Long-term vision (context, not this milestone)
 
 Full engine: physical pickable items (mass/durability, convertible into voxel material), voxel meshes with varied geometry (grid/sphere/ragdoll), multi-material voxels (ground+puddle+ice+snow+grass), material state machines driven by temperature/light/current, and per-voxel fields (temperature/light/pressure/current/magnetic/gravity). Build the test env so these extend cleanly.

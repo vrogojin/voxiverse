@@ -92,6 +92,20 @@ func _rebuild_chunk(key: Vector2i) -> void:
 		return
 	inst.mesh = ChunkMesher.build(key.x, key.y, _world)
 
+## COSMOS M3 (§4.5): hard restream after a home-face flip — drop every built chunk and force a
+## fresh active-set rebuild around the player. The chunk meshes carried the OLD home face's
+## window-space geometry, which no longer matches the re-based window, so they must all rebuild
+## (at the normal per-frame budget). Cheap: frees the instances and resets the centre sentinel so
+## the next update_center re-enqueues the ring nearest-first.
+func restream() -> void:
+	for key: Vector2i in _chunks.keys():
+		var inst: Node = _chunks[key]
+		if is_instance_valid(inst):
+			inst.queue_free()
+	_chunks.clear()
+	_queue.clear()
+	_center = Vector2i(2147483647, 0)      # force the next update_center to rebuild the ring
+
 ## True once the initial ring around the player has finished building.
 func is_ready_around_player() -> bool:
 	return _queue.is_empty() and not _chunks.is_empty()

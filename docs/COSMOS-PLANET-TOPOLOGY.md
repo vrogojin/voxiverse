@@ -488,6 +488,10 @@ a tree whose trunk stands on face A grows the same canopy cells into face B from
 
 ### 4.5 The home-face flip (where R2 now lives)
 
+> **M4 landed (see `docs/COSMOS-M4-HANDOFF.md`).** The seam-cross handoff ships as a far-first bridge
+> (always on) plus an opt-in freeze-in-place near cover (default OFF, §9.3 A/B-gated); §4.5.1's
+> dual-window prestream is superseded (COSMOS-M4-HANDOFF §10.2 — a second *live* near volume).
+
 While the player is within the extension's validity, play continues on A's extended window —
 crossing the seam *on foot involves no event at all*. The **home-face flip** (re-basing the
 window on B) is deferred and hysteretic:
@@ -757,6 +761,52 @@ stays within the R3 ladder.
   different windows/home faces is byte-identical*; an edit written via window A reads back via
   window B; a seam-spanning collapse detaches the same component from both windows; corner
   flood termination; `N mod 32 = 0` and region/face alignment.
+
+### 8.3 Threading — the frozen-epoch pure-generator contract (concurrency model)
+
+The curved worldgen runs on godot_voxel's worker pool (**2 web workers**, `project.godot:63`,
+not 1) concurrently with the main thread's analytic physics/collider/HUD queries. §8.2 pins
+*value* determinism but not *implementation* purity; the concurrency model (adversarially
+derived in `docs/COSMOS-AUDIT.md`) closes that gap:
+
+> **Every generation-visible table is built and frozen on the main thread *before* any voxel
+> worker exists** (a one-time init lock in `warm_up()` is fine). The per-cell generator is a
+> pure function `f(global_cell, ctx, SEED)` where `ctx` (`TerrainConfig.GenCtx`) is an
+> **immutable per-generator snapshot** — the home face + a per-task memo — passed as a
+> parameter. The worker path performs **zero writes** to any `static var` / shared container
+> and reads **no mutable global**. State that must change at runtime (home face on a flip)
+> changes only by **creating a new epoch** (a new generator snapshot + `restream()`), never
+> by mutating the one workers hold.
+
+Enforced structurally:
+
+- **No mutable global on the worker path.** The home face travels in `ctx.face`
+  (`GenCtx`), never the main-thread-mutable `TerrainConfig._active_face`. The module worker
+  folds each column with its generator's **frozen** `gen_face` (`worker_fold_column`), so a
+  home-face flip cannot race generation — it installs a new generator epoch + restreams
+  (`module_world.set_home_face`); the old generator is discarded, in-flight tasks finish on
+  the old face and their blocks are dropped by the restream. This is also the shape M4's
+  dual-window handoff needs (two generators, two frozen faces, concurrently).
+- **Frozen, container-free hot path.** The edge-remap table is frozen once into a flat
+  `PackedInt32Array` (`CubeSphere.warm_edge_tables`); the per-face axes are read through
+  **value-returning** `_axis_n/_axis_u/_axis_v` (not the nested `const FACE_*` Arrays).
+  *Rationale (COSMOS-AUDIT F4, proven by the race gate):* indexing a nested `const` Array
+  (`FACE_N[face]` → an inner Array) refcounts (`_ref`) that inner Array, and concurrent
+  `_ref` from the pool + main thread corrupts it (`array.cpp:61`) → worker OOB /
+  `vox_blocks=0`. The flat path never hit it because its const-array reads return **ints**.
+- **Low allocation churn.** `dir_of` has an in-range fast path (no `fold_cell` Dictionary for
+  the >99.9 % of columns that don't fold) and `face_cell_to_dir` normalizes in place — under
+  extreme contention, RefCounted/Dictionary churn was the last residual non-determinism.
+- **Memos are main-thread-only.** `_shape_memo` is consulted solely on the `pcache == null &&
+  _on_main_thread()` path and asserts main-thread in `_shape_entry`; the worker always threads
+  a non-null `GenCtx`, so it structurally never reaches the memo.
+- **Verify gate:** `verify_cosmos_race.gd` (curved-const build) reproduces the `array.cpp:61`
+  race, proves it gone over 16+ cold runs on the **real** VoxelTerrain worker pool
+  (spawn / mountain / seam-straddle / post-flip, blocks > 0, OOB fence never clamps), asserts
+  pure-worldgen per-column hashes are thread-invariant, and pins F2 (worker fold == analytic
+  `generated_cell_global` across a seam). *Residual (documented):* a synthetic harness that
+  instantiates `VoxelBuffer`s across GDScript threads shows an extremely rare module-object
+  flake **in flat too** — orthogonal to worldgen; the gate hashes the pure worldgen instead.
 
 ---
 

@@ -57,6 +57,17 @@ var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
 
 func _ready() -> void:
+	# COSMOS M1 (§6.2): per-body gravity feel. `gravity`/`jump_velocity` are Earth-tuned feel
+	# constants (NOT 9.81); on another body they scale by g_body/9.81 so jump height and fall cadence
+	# track real surface gravity while preserving today's Earth feel. The analytic floor/wall/ceiling
+	# queries need NO change — "down" is always −Y in window space (the §3.3 theorem), so the chart is
+	# curved only in the render (§3.4), never in the query space. FLAT_WORLD skips this (byte-identical
+	# flat play); on Earth the factor is exactly 1.0, so a curved Earth keeps today's numbers too.
+	if not CubeSphere.FLAT_WORLD:
+		var s := CubeSphere.SURFACE_GRAVITY / CubeSphere.SURFACE_GRAVITY   # g_body/9.81; Earth = 1.0
+		gravity *= s
+		jump_velocity *= sqrt(s)
+
 	# Build the camera rig in code to keep scenes minimal and robust.
 	_camera = Camera3D.new()
 	_camera.name = "Camera3D"
@@ -164,6 +175,20 @@ func _physics_process(delta: float) -> void:
 		return
 	_move(delta)
 	world.update_streaming(global_position)
+	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
+	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
+	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
+	# this is a byte-identical no-op today.
+	var reanchor_shift := world.maybe_reanchor(global_position)
+	if reanchor_shift != Vector3.ZERO:
+		global_position -= reanchor_shift
+	# COSMOS M3 (§4.5): once we cross far enough past a face edge, flip the home face onto the
+	# neighbour and hard-restream. The flip keeps our window position unchanged (no teleport) and
+	# edits are global-keyed, so nothing moves or is lost. Vector3.ZERO/no-op in FLAT_WORLD.
+	# COSMOS-FRAME-ORIENTATION §5.1: under the pinned window orientation (M_win) the scene frame does
+	# NOT rotate across a flip — the window axes are continuous — so there is nothing to counter-rotate
+	# (Fix A #71 reverted: its D4 extraction now lives in chart.flip's M_win accumulation).
+	world.maybe_flip_home_face(global_position)
 	_push_bodies(delta)
 	_update_aim()
 

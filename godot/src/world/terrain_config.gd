@@ -118,6 +118,21 @@ const SHELF_HILLS_KEEP := 0.35  # fraction of the low-frequency hills kept in th
 ## chunk radius and the fog reference distance.
 const RENDER_RADIUS_BLOCKS := 256
 
+## Curved (COSMOS) near-field render radius. The flat world's per-column worldgen is one cheap 2D
+## noise stack; the CURVED world's is a ~8× get_noise_3d + f64 cube-sphere fold per column (§3.5), so
+## streaming the full 256-block near sphere on the web's 2 voxel worker threads takes minutes ("chunks
+## generate veeery slowly"). The far LOD field (FarTerrain) already draws everything past the near hole
+## from a cheap coarse height mesh, so the near voxel field only needs to cover the walk-around
+## neighbourhood. 128 blocks of full-detail voxels ≈ (128/256)³ ≈ 1/8 the data blocks of 256 → ~8×
+## faster curved streaming, with the far LOD (its inner hole moved to match — see FarTerrain) filling
+## the rest seamlessly. FLAT_WORLD is unaffected (near_render_radius() returns the full 256).
+const CURVED_RENDER_RADIUS_BLOCKS := 128
+
+## THE near-field render radius the module viewer/terrain actually use: the full 256 in the flat world,
+## the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet. Flat callers get the byte-identical 256.
+static func near_render_radius() -> int:
+	return RENDER_RADIUS_BLOCKS if CubeSphere.FLAT_WORLD else CURVED_RENDER_RADIUS_BLOCKS
+
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
 ## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the
 ## world was only ~94 blocks tall (bedrock y=-64 .. treetops ~y=30) and 0.2 (±51-block slab) sufficed.
@@ -324,6 +339,14 @@ static func warm_up() -> void:
 	_ensure_noise()
 	_ensure_ids()
 	TreeGen.warm_up()
+	# COSMOS crash-fix (WGC §7.4): in curved mode the worldgen fold (LatticeNav → CubeSphere.fold_cell)
+	# reads a lazily-built static edge-remap table. If the voxel WORKER first-touches that build while a
+	# main-thread fold (FarTerrain / collider / HUD / player query) runs concurrently, the shared static
+	# Dictionary/Array corrupts → the worker dies with "index out of bounds" (the browser hang). Build it
+	# NOW on the main thread (warm_up runs in module setup before the worker attaches) so every later fold
+	# is a pure concurrent READ of a frozen table. FLAT_WORLD never folds, so this is skipped there.
+	if not CubeSphere.FLAT_WORLD:
+		CubeSphere.warm_edge_tables(CubeSphere.n_for(CubeSphere.HOME_BODY))
 
 ## Deterministic hash in [0,1) for an integer lattice + salt (3D form of the
 ## TreeGen._hash01 integer-mix family; no floats until the final divide).
@@ -371,6 +394,16 @@ static func _mountain_factor(c: float, fx: float, fz: float) -> float:
 		return 0.0                                   # not a mountain here -> uplift 0 (byte-identical world)
 	return m * smoothstep(MOUNTAIN_C_LO, MOUNTAIN_C_HI, c)
 
+## COSMOS 3D twin of _mountain_factor (§3.5): the same mask + inland gate, sampling the mountain mask
+## from get_noise_3d at the sphere point (px, py, pz) instead of get_noise_2d. Feeds the Mountains
+## biome + uplift into the CURVED worldgen so the sphere carries real mountains. Only reached when
+## FLAT_WORLD is false; the flat path uses the 2D _mountain_factor above and stays byte-identical.
+static func _mountain_factor3(c: float, px: float, py: float, pz: float) -> float:
+	var m := smoothstep(MOUNTAIN_MASK_LO, MOUNTAIN_MASK_HI, _mountain.get_noise_3d(px, py, pz))
+	if m <= 0.0:
+		return 0.0
+	return m * smoothstep(MOUNTAIN_C_LO, MOUNTAIN_C_HI, c)
+
 static func _height_c(c: float, fx: float, fz: float) -> int:
 	var base := BASE_HEIGHT + _continent_offset(c)
 	var hills := _hills.get_noise_2d(fx, fz) * HILLS_AMPLITUDE
@@ -397,6 +430,14 @@ static func _height_c(c: float, fx: float, fz: float) -> int:
 ## (PerVoxelEnvironment depth model, effective_height, floor scans, TreeGen).
 static func height_at(x: int, z: int) -> int:
 	_ensure_noise()
+	# COSMOS M1 (§3.5): when the planet is on, (x, z) is the face-4 window column (i, j) and the
+	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
+	# branch entirely, so the flat world is byte-identical.
+	if not CubeSphere.FLAT_WORLD:
+		# Route through the shared analytic memo (PERF): far terrain, snowfall, per-voxel-env and the
+		# structural solver all call height_at every frame; without the memo each recomputed the full
+		# _curved_profile. Same value as the direct _curved_profile(_active_face, x, z).x, just cached.
+		return int(analytic_column_profile(x, z).x)
 	var fx := float(x)
 	var fz := float(z)
 	return _height_c(_continent.get_noise_2d(fx, fz), fx, fz)
@@ -447,22 +488,291 @@ static func biome_at(x: int, z: int, pcache = null) -> int:
 ## exactly the uncached column_profile, so worldgen output stays byte-identical and
 ## deterministic. Non-null -> memoize; null -> compute directly (the analytic path).
 static func column_profile(x: int, z: int, pcache = null) -> Vector4:
-	if pcache != null:
-		var ck := Vector2i(x, z)
-		if pcache.has(ck):
-			return pcache[ck]
+	# COSMOS frozen-epoch (F1): a GenCtx (the worker path) carries the immutable face + a memo keyed by
+	# (face, x, z); a plain Dictionary (legacy / analytic worker) or null memoizes by (x, z) and reads
+	# `_active_face` (main-thread only). In FLAT_WORLD a GenCtx is never used, so the flat path below is
+	# reached only through the Dictionary/null branch and stays byte-identical.
+	var memo: Variant = pcache
+	var face := _active_face
+	var ck: Variant
+	if pcache is GenCtx:
+		memo = pcache.memo
+		face = pcache.face
+		ck = Vector3i(face, x, z)
+	else:
+		ck = Vector2i(x, z)
+	if memo != null:
+		if memo.has(ck):
+			return memo[ck]
 	_ensure_noise()
-	var fx := float(x)
-	var fz := float(z)
-	var c := _continent.get_noise_2d(fx, fz)
-	var t := _temperature.get_noise_2d(fx, fz)
-	var hh := _humidity.get_noise_2d(fx, fz)
-	var g := _height_c(c, fx, fz)
-	var mtn := _mountain_factor(c, fx, fz)
-	var prof := Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
-	if pcache != null:
-		pcache[Vector2i(x, z)] = prof
+	var prof: Vector4
+	if not CubeSphere.FLAT_WORLD:
+		# COSMOS M1 (§3.5)/M3 (§4.5): the home-face lattice column (i, j) = (x, z), sampled from 3D noise
+		# along d̂. `face` is `ctx.face` on the worker (an immutable snapshot) or `_active_face` on the
+		# main thread — never a mutable global read from a worker. The curved profile threads the SAME
+		# feature pipeline (mountains/climate/biome) and folds across an edge — see _curved_profile.
+		prof = _curved_profile(face, x, z)
+	else:
+		var fx := float(x)
+		var fz := float(z)
+		var c := _continent.get_noise_2d(fx, fz)
+		var t := _temperature.get_noise_2d(fx, fz)
+		var hh := _humidity.get_noise_2d(fx, fz)
+		var g := _height_c(c, fx, fz)
+		var mtn := _mountain_factor(c, fx, fz)
+		prof = Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
+	if memo != null:
+		memo[ck] = prof
 	return prof
+
+# ------------------------------------------------------------------------------
+# COSMOS M1 — the curved face-window worldgen (docs/COSMOS-PLANET-TOPOLOGY.md §3.5). Only ever
+# reached when CubeSphere.FLAT_WORLD is false; the flat path above is untouched (byte-identical).
+#
+# The domain adapter: a lattice column (face, i, j) maps to the unit direction d̂ =
+# face_cell_to_dir(face, i, j) (§1.2), and every get_noise_2d(x, z) becomes get_noise_3d(d̂ · R) —
+# seam-free 3D noise on the sphere (§3.5), sampled at the datum-surface block point R·d̂ so feature
+# sizes match the flat world's per-block frequencies. The result feeds the SAME climate/biome/
+# height pipeline (y ↦ r), so resolve_cell — bedrock, strata, ores, smoothing — is verbatim on the
+# lattice coords (i, r, j). DETERMINISTIC: a pure function of (SEED, face, i, j) only (no window,
+# no randi/Time). face_cell_to_dir is f64; FastNoiseLite quantizes to f32 internally (§8.2).
+
+# COSMOS M3 (§4.5) — the ACTIVE home face for the 2-arg (x, z) curved queries. The choke point
+# passes the true (folded) face explicitly to _curved_profile/generated_cell_global, but the
+# analytic + main-thread-generated smoothing stencils reach worldgen through the 2-arg height_at/
+# column_profile, which must follow the player when the home face flips (§4.5). WorldManager keeps
+# this in sync with the chart's face (install/flip). FLAT_WORLD never reads it (default HOME_FACE).
+static var _active_face := CubeSphere.HOME_FACE
+# COSMOS-FRAME-ORIENTATION §6: the ANALYTIC path's window orientation, as a quarter-turn index d4(M_win)
+# (0..3). Symmetric with _active_face — WorldManager sets it on chart install / home-face flip. The
+# analytic modifier de-rotation (WM col_* wrappers, generated_cell_global, overlay read/write) reads THIS
+# instead of a mutable matrix. Default 0 (identity) → the flat world + M_win=I curved spawn are unchanged.
+static var _active_mwin_d4 := 0
+
+## COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 2, F1): the immutable per-generation
+## snapshot the curved worldgen reads INSTEAD of the mutable global `_active_face`. It carries the cube
+## face the query is homed on plus a per-pass column memo. A voxel worker builds ONE of these per
+## `_generate_block` frame (LOCAL to that stack frame, never shared across threads) and threads it as
+## the `pcache` argument through every column query; the curved branches then read `ctx.face` — a
+## VALUE captured on the worker — so no worker ever reads the main-thread-mutated `_active_face`. The
+## analytic main-thread path keeps passing a plain Dictionary / null and reads `_active_face` (which
+## only the main thread ever mutates, on a home-face flip). This is the whole race fix: the face stops
+## being a hidden mutable global on the worker hot path and becomes an immutable parameter.
+class GenCtx extends RefCounted:
+	var face: int = CubeSphere.HOME_FACE
+	var memo: Dictionary = {}
+	# COSMOS-FRAME-ORIENTATION §6: the J⁻¹ quarter-turn (0..3) to rotate this column's directional
+	# modifier from its canonical TRUE-face frame into the current WINDOW render frame. J = M_strip·M_win;
+	# jinv_d4 = −d4(J) mod 4. 0 for a native column at M_win=I → byte-identical. Set per-column by
+	# worker_fold_column (worker) / generated_cell_global (analytic).
+	var jinv_d4: int = 0
+	func _init(p_face: int = CubeSphere.HOME_FACE) -> void:
+		face = p_face
+
+## The active home face (read-only accessor).
+static func active_face() -> int:
+	return _active_face
+
+## Set only the active home face, KEEPING the current M_win. Routed through set_active_frame (which clears
+## the memo on a face change) so it can NEVER desync _active_mwin_d4 (COSMOS-FRAME-ORIENTATION Q2d). No
+## production caller today — WorldManager uses set_active_frame directly; retained for the verify gates
+## that change the face without a frame-orientation change.
+static func set_active_face(f: int) -> void:
+	set_active_frame(f, _active_mwin_d4)
+
+## The active window orientation quarter-turn d4(M_win) (read-only accessor, §6).
+static func active_mwin_d4() -> int:
+	return _active_mwin_d4
+
+## Set the analytic window orientation d4(M_win) (WorldManager, on chart install / home-face flip). Pure
+## value, no memo dependency (the shape memo keys on face/i/j which are frame-independent; the rotation is
+## applied AFTER a memo read). 0 = identity.
+static func set_active_mwin_d4(d4: int) -> void:
+	_active_mwin_d4 = ((d4 % 4) + 4) % 4
+
+## COSMOS-FRAME-ORIENTATION §6 (Q2d1/d2): the SINGLE atomic setter for the analytic frame (face + M_win),
+## called by WorldManager at chart install AND home-face flip BEFORE any restream/rebuild consumes it — so
+## a rebuild never sees the face updated but the orientation stale. No-op guard on the (face, mwin) PAIR;
+## the shape memo clears ONLY on a face change (it stores CANONICAL, frame-independent values, so a pure
+## M_win change needs no clear — the rotation is applied after the memo read at the window exit).
+static func set_active_frame(face: int, mwin_d4: int) -> void:
+	var mw := ((mwin_d4 % 4) + 4) % 4
+	if face == _active_face and mw == _active_mwin_d4:
+		return
+	if face != _active_face:
+		_active_face = face
+		_shape_memo.clear()
+	_active_mwin_d4 = mw
+
+## The J⁻¹ quarter-turn (0..3) for a raw home-face column `p` under the analytic home face + M_win: the
+## fold from window→true-face is J = M_strip·M_win, and the render modifier is rotate_modifier(canonical,
+## J⁻¹). M_strip's D4 comes from the face fold_cell_canonical resolves `p` to (§6.6 — single edge OR the
+## corner wedge's resolved face). Returns 0 for a native in-range column at M_win=I (byte-identical).
+## COSMOS-FRAME-ORIENTATION §6: the RAW→WINDOW quarter-turn for the COLLIDER light queries. surface_modifier
+## / slope_run_of compute the shape in the RAW home-face index frame (corners assigned in raw i,j order,
+## with the neighbour HEIGHTS already folded to the true face) — NOT canonical. Window↔raw is purely M_win
+## (window w → raw = org + M_win·w), so the raw-frame shape rotates to the window render frame by M_win⁻¹ =
+## (4 − d4(M_win)) mod 4, INDEPENDENT of the strip fold (the strip lives in the height sampling, not the
+## corner assignment). Composed with the raw frame's implicit strip rotation, this equals the canonical
+## render's J⁻¹ exactly (verify_cosmos_arbiter pins render == collider). 0 at M_win=I → byte-identical.
+static func analytic_window_d4() -> int:
+	return (4 - _active_mwin_d4) % 4
+
+static func analytic_jinv_d4(pi: int, pj: int) -> int:
+	if _active_mwin_d4 == 0 and pi >= 0 and pi < _cached_n() and pj >= 0 and pj < _cached_n():
+		return 0                                     # fast path: native column, identity orientation
+	var g := CubeSphere.fold_cell_canonical(_active_face, pi, pj, _cached_n())
+	var strip := CubeSphere.strip_d4_to(_active_face, int(g["face"]), _cached_n())
+	return (4 - ((strip + _active_mwin_d4) % 4)) % 4
+
+static var _n_cache := -1
+static func _cached_n() -> int:
+	if _n_cache < 0:
+		_n_cache = CubeSphere.n_for(CubeSphere.HOME_BODY)
+	return _n_cache
+
+## The per-column profile Vector4(g, biome, c, t) for lattice column (face, i, j) via 3D noise.
+## COSMOS M3 (§4.3/§4.4): the direction is taken through LatticeNav, which FOLDS a column that has
+## spilled past a face edge onto its true neighbour face before sampling d̂ — so a stencil that
+## steps across an edge reads the real across-seam column and worldgen is seam-continuous (no
+## cliff/gap at an edge). In-range (i, j) fold to the identity, so this is byte-identical to the
+## M2 single-face profile there (verify-pinned).
+static func _curved_profile(face: int, i: int, j: int) -> Vector4:
+	_ensure_noise()
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
+	var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)
+	var px := d.x * rr
+	var py := d.y * rr
+	var pz := d.z * rr
+	var c := _continent.get_noise_3d(px, py, pz)
+	var t := _latitude_temperature(d.z, _temperature.get_noise_3d(px, py, pz))
+	var hh := _humidity.get_noise_3d(px, py, pz)
+	var mtn := _mountain_factor3(c, px, py, pz)
+	var g := _height_c3(c, px, py, pz, mtn)
+	# Feature worldgen on the sphere: the mountain factor feeds BOTH the biome (B_MOUNTAINS) and the
+	# uplift baked into _height_c3, so a mountain-latitude column reaches mountain heights and reads as
+	# rock; snow accumulation + sharp-slope then flow through resolve_cell exactly as in the flat world.
+	return Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
+
+## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
+## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
+## temperature `t` (the Vector4.w that drives biome selection AND PerVoxelEnvironment) is anchored
+## to latitude — warm (+1) at the equator, cold (−1) at the poles (face-4/5 centres, §5.2) — and
+## only gently perturbed by the low-frequency temperature noise so biomes still vary within a band.
+## PURE + DETERMINISTIC: a function of (d.z, SEED noise) only, replacing the flat world's pure-noise
+## `t`. LATITUDE_GAIN dominates so the profile is monotonic-ish in latitude (verify-pinned, §9 M2);
+## NOISE_GAIN keeps enough spread that a pole reads frozen (t < −0.55) and the equator temperate.
+const _LAT_GAIN := 0.80          # weight of the latitude term (dominant → monotonic-ish climate)
+const _LAT_NOISE_GAIN := 0.30    # weight of the temperature noise (local variety within the band)
+static func _latitude_temperature(dz: float, noise_t: float) -> float:
+	var lat_term := 1.0 - 2.0 * absf(dz)        # +1 at the equator (|z|=0) … −1 at a pole (|z|=1)
+	return clampf(_LAT_GAIN * lat_term + _LAT_NOISE_GAIN * noise_t, -1.0, 1.0)
+
+## The 3D-noise twin of _height_c (§3.5): identical spline + shelf shaping, sampling hills/detail
+## from get_noise_3d at the sphere point (px, py, pz) instead of get_noise_2d(fx, fz). `mtn` is the
+## precomputed 3D mountain factor (0 outside mountain regions) so the CURVED world gains the SAME tall
+## mountain uplift as the flat world (mirrors _height_c's `h += factor * MOUNTAIN_AMPLITUDE` line).
+static func _height_c3(c: float, px: float, py: float, pz: float, mtn: float) -> int:
+	var base := BASE_HEIGHT + _continent_offset(c)
+	var hills := _hills.get_noise_3d(px, py, pz) * HILLS_AMPLITUDE
+	var h := base + hills + _detail.get_noise_3d(px, py, pz) * DETAIL_AMPLITUDE
+	var depth := float(SEA_LEVEL) - h
+	var w := clampf(smoothstep(-SHELF_TOP, 0.5, depth) - smoothstep(SHELF_DEPTH - 1.5, SHELF_DEPTH, depth), 0.0, 1.0)
+	if w > 0.0:
+		h = lerp(h, base + hills * SHELF_HILLS_KEEP, w)
+	# Mountains: tall inland uplift added AFTER the beach shelf (mountains gate on C_LO, so their shelf
+	# `w` is 0 anyway). Exactly 0 outside mountain regions → those columns match the pre-mountain curve.
+	h += mtn * MOUNTAIN_AMPLITUDE
+	return int(floor(h))
+
+## THE terrain-function adapter (§3.5): the PACKED generated cell for global lattice cell
+## (face, i, j, r). In FLAT_WORLD mode `to_global` is the identity — window space (x, y, z) =
+## (i, r, j) (§3.1) — so this is byte-identical to generated_cell(i, r, j). In curved mode it
+## resolves the 3D-noise column profile for the given face and runs the verbatim per-cell pipeline
+## on the lattice coords (i, r, j). This is the single choke point COSMOS §3.5 names.
+static func generated_cell_global(face: int, i: int, j: int, r: int) -> int:
+	if CubeSphere.FLAT_WORLD:
+		return generated_cell(i, r, j)
+	if not _ids_ready:
+		_ensure_ids()
+	# COSMOS frozen-epoch (F1/F2): thread the TRUE face through a GenCtx so every nested stencil / snow /
+	# tree read inside resolve_cell folds neighbours on THIS cell's face (not the mutable `_active_face`).
+	# The worker path (`_generate_block`) does the identical thing with its own frozen ctx, so a
+	# module-generated cell is byte-identical to this analytic cell — render == physics across seams.
+	# COSMOS-FRAME-ORIENTATION §6: generated_cell_global returns the CANONICAL (true-face) value — the
+	# render rotation into the window frame happens at the WM boundary (cell_value_at), not here.
+	var ctx := _acquire_ctx(face)
+	var p := column_profile(i, j, ctx)
+	return resolve_cell(i, r, j, int(p.x), int(p.y), p.z, p.w, ctx)
+
+## A GenCtx for a single face-explicit query. On the main thread it reuses ONE cleared scratch context
+## (no per-call allocation on the hot analytic cell path); off the main thread (e.g. a verify worker)
+## it allocates a fresh one so the scratch is never shared across threads.
+# Bound on the persistent analytic column memo (columns are Vector4, ~65k entries ≈ a few MB). When the
+# player explores past this many distinct columns the memo is dropped and rebuilt; spatial locality means
+# the working set (the near neighbourhood the player/collider/far-mesh sample each frame) is tiny, so the
+# hit rate stays ~1.0 well under the cap.
+const _ANALYTIC_MEMO_CAP := 1 << 16
+static var _analytic_ctx: GenCtx = null
+static func _acquire_ctx(face: int) -> GenCtx:
+	if _on_main_thread():
+		if _analytic_ctx == null:
+			_analytic_ctx = GenCtx.new(face)
+		else:
+			# PERF (curved analytic hot path): PERSIST the per-column memo across calls. Worldgen is a pure
+			# function of (face, i, j) and the memo key ENCODES the face (Vector3i(face, i, j)), so entries
+			# are never stale and entries for different faces never collide. Clearing it every call (as
+			# before) forced every generated_cell_global to recompute the full _curved_profile (~8× noise3d +
+			# f64 direction math), so a single vertical column scan (surface_y, floor_under, collider, far
+			# mesh) paid it once PER CELL instead of once per column. We do NOT clear on a face change —
+			# seam-adjacent queries legitimately alternate between the home face and a neighbour face
+			# (cell_value_at folds to g.face near an edge), and face-distinct keys let both coexist; clearing
+			# there would thrash exactly at seams. Clear ONLY past the cap (bound memory). Output is
+			# byte-identical — this removes redundant recomputation, nothing else. `face` is still assigned
+			# every call so column_profile computes a MISSING entry against the correct face.
+			if _analytic_ctx.memo.size() > _ANALYTIC_MEMO_CAP:
+				_analytic_ctx.memo.clear()
+			_analytic_ctx.face = face
+		return _analytic_ctx
+	return GenCtx.new(face)
+
+## THE main-thread analytic column profile (PERF). Every main-thread curved query that needs a column
+## profile — the 2-arg height_at, the far LOD mesh builder, the sim fields — must route through this so
+## they SHARE the persistent per-column memo and never recompute _curved_profile for a column already
+## resolved this frame (or a recent frame). FLAT_WORLD keeps the exact pre-COSMOS path (plain
+## column_profile, no shared ctx) so the shipped flat game stays byte-identical in behaviour. Curved
+## threads the shared _analytic_ctx (memoised, face-scoped key). Output is identical either way.
+static func analytic_column_profile(x: int, z: int) -> Vector4:
+	if CubeSphere.FLAT_WORLD:
+		return column_profile(x, z)
+	return column_profile(x, z, _acquire_ctx(_active_face))
+
+## THE curved worker generator entry (COSMOS-AUDIT §3.2 items 2–3, F1/F2). The voxel worker calls this
+## per column with its FROZEN home face `gen_face` (an immutable per-generator snapshot — NEVER the
+## mutable `_active_face`) and the raw voxel column (vx, vz), which is the global home-face index
+## column (the floating origin is folded into the terrain-node transform, §3.2). It FOLDS the column to
+## its true global (face, i, j) ONCE via `ctx`, resolves it, and returns BOTH the profile (for the
+## block's air/height early-outs) and the packed cell — hashing every position feature (bedrock, ore,
+## strata, tree, smoothing) on the TRUE global column so it is window-independent and identical to the
+## analytic generated_cell_global. `ctx.face` is set to the folded true face here; the caller reuses
+## the same ctx (its memo is shared across the block, keyed by (face, i, j)).
+static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx, mwin_d4: int = 0) -> Vector3i:
+	# COSMOS-CORNER-CANONICAL (#69): fold (gen_face, vx, vz) → the CANONICAL true global column, EXACTLY as
+	# CosmosChart.to_global_column does for the analytic path (render == physics, rule 1). Single-edge
+	# strips use the exact D4 fold; the corner quadrant resolves to the nearest REAL cell of its physical
+	# direction (position-only, home-face-INDEPENDENT) instead of the old raw home-face overshoot — so the
+	# wedge generates real neighbour terrain identically from any gen_face epoch (§8.2 restored). ctx.face
+	# is always a real face now (never < 0), so every nested stencil/tree/snow read folds on the true face.
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var g := CubeSphere.fold_cell_canonical(gen_face, vx, vz, n)
+	ctx.face = int(g["face"])
+	# COSMOS-FRAME-ORIENTATION §6: record this column's J⁻¹ so resolve_cell rotates its directional
+	# modifier into the window render frame. J = M_strip·M_win; M_strip = the fold to the RESOLVED face
+	# (§6.6 wedge rule — single edge OR the corner wedge's canonically-resolved face). jinv = −d4(J).
+	var strip := CubeSphere.strip_d4_to(gen_face, int(g["face"]), n)
+	ctx.jinv_d4 = (4 - ((strip + mwin_d4) % 4)) % 4
+	return Vector3i(int(g["face"]), int(g["i"]), int(g["j"]))
 
 # ------------------------------------------------------------------------------
 # The composed cell function (WGC §6.2). generated_cell derives the column
@@ -475,10 +785,13 @@ static func generated_cell(x: int, y: int, z: int) -> int:
 	var p := column_profile(x, z)
 	return resolve_cell(x, y, z, int(p.x), int(p.y), p.z, p.w)
 
-## The per-cell pipeline given a column's precomputed profile scalars (g, biome,
-## c, t). Returns the PACKED cell value (== bare material id today; sub-voxel adds
-## modifiers later). This is the single hot function both render paths share.
-static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null) -> int:
+## The per-cell pipeline given a column's precomputed profile scalars (g, biome, c, t). Returns the PACKED
+## cell value. THE single hot function both render paths share. COSMOS-FRAME-ORIENTATION §6: resolve_cell
+## speaks CANONICAL (true-face frame) — it does NOT rotate. The window render rotation (J⁻¹) is applied at
+## the WINDOW EXITS only: the module worker's buffer write (module_world, via the frozen per-column J⁻¹) and
+## the WM analytic boundary (cell_value_at + the col_* collider wrappers). This keeps TerrainConfig
+## frame-independent, so the shape memo caches canonical values and no stale J is ever embedded (§6.3/Q2d3).
+static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null, slope_run: int = -1) -> int:
 	if not _ids_ready:
 		_ensure_ids()
 	if y < WORLD_BOTTOM_Y:
@@ -488,8 +801,24 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
 	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
 	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
-	if _slope_fires_only(x, z, g, pcache):
-		var tw := _slope_whole_targets(x, z, pcache)
+	# PERF (S1 throughput): the slope run is COLUMN-invariant (no y dependence), yet resolve_cell runs
+	# once per y down a ~100-tall column — so the module worker HOISTS it, computing the packed run once
+	# per column and passing it in via `slope_run` (>= 0). This kills a per-y _corner_targets noise
+	# stencil + TreeGen.block_at tree-gate on every sub-surface cell. slope_run < 0 (the analytic path /
+	# default) recomputes exactly as before → BYTE-IDENTICAL. A passed run decodes fires/targets from the
+	# SAME pack the analytic memo + generated_modifier_at already round-trip through (verify-pinned;
+	# SLOPE_MAX_SPREAD=3 ⇒ Tw−g ∈ [−3,4] ⊂ the pack's lossless [−4,11] → no clamp loss).
+	var _slope_fires: bool
+	var tw: Vector4i
+	if slope_run >= 0:
+		_slope_fires = slope_run_fires(slope_run)
+		if _slope_fires:
+			tw = _slope_run_targets(slope_run, g)
+	else:
+		_slope_fires = _slope_fires_only(x, z, g, pcache)
+		if _slope_fires:
+			tw = _slope_whole_targets(x, z, pcache)
+	if _slope_fires:
 		var lo := mini(mini(tw.x, tw.y), mini(tw.z, tw.w))
 		var hi := maxi(maxi(tw.x, tw.y), maxi(tw.z, tw.w))
 		if y >= lo and y <= hi - 1:
@@ -924,6 +1253,17 @@ static func _slope_run_targets(r: int, g: int) -> Vector4i:
 static func slope_run_fires(r: int) -> bool:
 	return (r >> 16) & 1 != 0
 
+## COSMOS-FRAME-ORIENTATION §6: rotate a packed SLOPE run's four corner codes by `d4` quarter-turns, so a
+## collider-path run (col_slope_run_of) decodes to the SAME rotated slope resolve_cell renders — render ==
+## collision preserved. lo/hi (min/max of the codes) are permutation-invariant, so the run's vertical extent
+## is unchanged. Non-firing run / d4 == 0 → unchanged (identity → byte-identical).
+static func rotate_slope_run(r: int, d4: int) -> int:
+	if d4 % 4 == 0 or not slope_run_fires(r):
+		return r
+	var c := Vector4i(r & 15, (r >> 4) & 15, (r >> 8) & 15, (r >> 12) & 15)
+	var rc := ShapeCodec.rotate_corners(c, d4)
+	return (1 << 16) | (rc.w << 12) | (rc.z << 8) | (rc.y << 4) | rc.x
+
 ## The [lo, hi) run cell range of a packed slope run given g (cells [lo, hi−1] carry slope material).
 static func slope_run_range(r: int, g: int) -> Vector2i:
 	var tw := _slope_run_targets(r, g)
@@ -1025,6 +1365,11 @@ static func _on_main_thread() -> bool:
 ## this column — BOTH surface_mod AND cap_mod cover underwater floors (WATER-SHORE §3.3/§3.6:
 ## underwater caps are ON), WITH the tree-rest suppression — so any consulting query is exact.
 static func _shape_entry(x: int, z: int) -> int:
+	# MAIN-THREAD ONLY (the memo is a plain Dictionary — not thread-safe). Every caller already gates on
+	# `pcache == null and _on_main_thread()`; this assert makes a violated invariant fail LOUDLY in a
+	# debug/verify build instead of silently racing the Dictionary (COSMOS-AUDIT §3.2 items 4–5). The
+	# voxel worker always threads a non-null GenCtx, so it never reaches this function.
+	assert(_on_main_thread(), "TerrainConfig._shape_entry reached off the main thread — memo race")
 	var k := Vector2i(x, z)
 	var e: int = _shape_memo.get(k, -1)
 	if e != -1:
@@ -1235,8 +1580,17 @@ static func emitted_modifiers() -> PackedInt32Array:
 		return _emitted_mods
 	_ensure_noise()
 	var seen := {}
-	_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
-	_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
+	# COSMOS perf (curved-demo load stall): the spatial sample below runs find_spawn/find_coast/
+	# find_mountains + several 160-radius height scans, each ~3× costlier in curved mode (every
+	# height_at is a 3D-noise fold, and find_coast_of scans to radius 512/1024). It exists only to
+	# catch stray corner modifiers, but the unconditional union of the FULL corner-tuple family +
+	# the snow slab (below) is already a SUPERSET of everything it can find (every _modifier_from_
+	# targets output is a member of appearance_modifiers()). So in curved mode we SKIP the sample
+	# entirely — the emitted set is identical (union-dominated) and the ~6 s scan is gone. FLAT_WORLD
+	# keeps the exact sample path → byte-identical.
+	if CubeSphere.FLAT_WORLD:
+		_sample_emitted(find_spawn(), _EMIT_SAMPLE_R, seen)      # inland land shapes
+		_sample_emitted(find_coast(), _EMIT_SAMPLE_R, seen)      # coastline + underwater floor shapes (§3.5)
 	# Mountains biome: its gently-sloped stone flanks emit corner-height modifiers NOT present in the
 	# temperate spawn/coast samples — mountains alone reach ~60 of the 61 globally-emitted modifiers
 	# (every gentle-slope orientation occurs). A snow-capped stone peak cell whose modifier is unbaked
@@ -1244,8 +1598,8 @@ static func emitted_modifiers() -> PackedInt32Array:
 	# angularly-spread mountain massifs — enough that emitted_modifiers() reaches the complete reachable
 	# set (verify asserts a wide mountain scan emits NO modifier missing from this set). One-time setup
 	# cost (main thread); never the voxel worker.
-	for mc: Vector2i in find_mountains(6):
-		_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
+		for mc: Vector2i in find_mountains(6):
+			_sample_emitted(mc, _EMIT_SAMPLE_R, seen)
 	# The snow half-slab modifier (M1 ADR §6.4): worldgen emits (snow_block, 85) on deep-frozen
 	# flats, but this spatial sample is temperate and won't contain 85 — union it in so the module
 	# path always bakes (snow_block, 85) and (grass/sand/… , 85). A superset is always safe here.
@@ -1728,6 +2082,16 @@ static func emitted_shore_pairs(kind := CellCodec.LIQ_WATER) -> PackedInt32Array
 	_ensure_noise()
 	_ensure_ids()
 	var out := PackedInt32Array()
+	# COSMOS perf (curved-demo load stall): this spatial sample calls find_coast_of (a radius-512/1024
+	# scan) + a 160-radius region scan, each ~3× costlier per column in curved mode, purely to catch
+	# SHORE (level-9) composite pairs. The waterlog manifest ALSO unions emitted_submerged_pairs, which
+	# is analytically material-complete (every fill material × the full corner family), so every real
+	# co-filled cell still gets a baked twin without this sample; an unsampled shore pair degrades to
+	# the dry border (a notch, never a hole). Skip it in curved mode (the pole home face has no nearby
+	# unfrozen coast anyway → the scan finds none and wastes the full radius). FLAT keeps it exact.
+	if not CubeSphere.FLAT_WORLD:
+		_shore_pairs_by_kind[kind] = out
+		return out
 	var c := find_coast_of(kind)
 	if c == _COAST_NONE:
 		# No coast of this kind in range (e.g. a lava sea outside the scan radius for this seed):

@@ -196,6 +196,12 @@ static func has_state(v: int, bit: int) -> bool:
 static func with_state(v: int, bits: int) -> int:
 	return (v & ~(STATE_MASK << 32)) | ((bits & STATE_MASK) << 32)
 
+## Replace the MODIFIER field (bits 16..31) of `v`, leaving material/state/liquid intact. Used by the
+## COSMOS-FRAME-ORIENTATION §6 render-frame rotation (ShapeCodec.rotate_modifier is orientation-only, so
+## the level-based snow-fill/liquid overlays — invariant under a D4 rotation of the shape — stay valid).
+static func with_modifier(v: int, m: int) -> int:
+	return (v & ~(0xFFFF << 16)) | ((m & 0xFFFF) << 16)
+
 ## The 6-bit liquid field (kind + level) — 0 means "no liquid".
 static func liquid_field(v: int) -> int:
 	return (v >> LIQ_SHIFT) & LIQ_FIELD_MASK

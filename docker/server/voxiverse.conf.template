@@ -62,6 +62,22 @@ server {
         try_files $uri $uri/ =404;
     }
 
+    # --- /portals/ : the see-through-portals demo (SEPARATE export, subpath) ---
+    # `^~` gives this prefix priority over the `\.(wasm|pck|js…)$` regex location
+    # above — otherwise /portals/index.wasm would match that regex and be looked
+    # up under /srv/web (the COSMOS root), 404-ing. This block declares NO
+    # add_header of its own, so it INHERITS the server-scope COOP/COEP (mandatory
+    # for the threaded WASM export — missing either header blanks the page). The
+    # Godot export uses RELATIVE asset URLs, so a page loaded at /portals/ fetches
+    # index.js/.wasm/.pck as /portals/…; the bare /portals 301s to add the slash.
+    location = /portals { return 301 /portals/; }
+    location ^~ /portals/ {
+        alias /srv/portals/;
+        index index.html;
+        expires -1;
+        try_files $uri $uri/ =404;
+    }
+
     # Lightweight health endpoint for local/haproxy checks.
     location = /healthz {
         default_type text/plain;

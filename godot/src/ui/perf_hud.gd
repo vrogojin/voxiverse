@@ -78,12 +78,13 @@ func _process(delta: float) -> void:
 	# most often explains it (worker backlog + how many blocks are live right now).
 	if dms > LOG_MS:
 		var mesh_pending := "?"
-		var blocks_now := "?"
+		var gen_pending := "?"
 		if _voxel_engine != null and _voxel_engine.has_method("get_stats"):
 			var st: Dictionary = _voxel_engine.call("get_stats")
-			mesh_pending = str((st.get("tasks", {}) as Dictionary).get("meshing", 0))
-			blocks_now = str((st.get("memory_pools", {}) as Dictionary).get("block_count", 0))
-		print("[PERF-HITCH] %.0f ms frame  vox_mesh_pending=%s  vox_blocks=%s" % [dms, mesh_pending, blocks_now])
+			var tasks := (st.get("tasks", {}) as Dictionary)
+			mesh_pending = str(tasks.get("meshing", 0))
+			gen_pending = str(tasks.get("generation", 0))
+		print("[PERF-HITCH] %.0f ms frame  vox_gen_backlog=%s  vox_mesh_backlog=%s" % [dms, gen_pending, mesh_pending])
 
 	if _acc < WINDOW:
 		return
@@ -101,35 +102,39 @@ func _process(delta: float) -> void:
 	var prims := int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))
 	var vmem := Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
 
-	# godot_voxel worker/pool state + blocks streamed since the last window.
+	# godot_voxel worker/pool state. NOTE: memory_pools.block_count is a FREE-buffer counter (reads 0
+	# even while thousands of blocks generate — it is NOT a live-block count), so the real streaming
+	# signal is the TASK BACKLOG: generation + meshing tasks still queued. Backlog draining to 0 == the
+	# near field has finished loading. That is the number to watch while chunks stream in.
+	var gen_pending := 0
 	var mesh_pending := 0
 	var main_pending := 0
 	var gpu_pending := 0
-	var blocks := 0
 	if _voxel_engine != null and _voxel_engine.has_method("get_stats"):
 		var st: Dictionary = _voxel_engine.call("get_stats")
 		var tasks: Dictionary = st.get("tasks", {})
-		var mem: Dictionary = st.get("memory_pools", {})
+		gen_pending = int(tasks.get("generation", 0))
 		mesh_pending = int(tasks.get("meshing", 0))
 		main_pending = int(tasks.get("main_thread", 0))
 		gpu_pending = int(tasks.get("gpu", 0))
-		blocks = int(mem.get("block_count", 0))
-	var streamed := 0
+	var backlog := gen_pending + mesh_pending
+	# Blocks the backlog drained since the last window → an effective streaming rate (blocks/s).
+	var drained := 0
 	if _last_blocks >= 0:
-		streamed = maxi(0, blocks - _last_blocks)
-	_last_blocks = blocks
-	var stream_per_s := int(round(float(streamed) / WINDOW))
+		drained = maxi(0, _last_blocks - backlog)
+	_last_blocks = backlog
+	var stream_per_s := int(round(float(drained) / WINDOW))
 
-	var s := ("FPS %5.1f  min %5.1f\nworst %5.1f ms   hitches %d\nstream %d /s\n" +
+	var s := ("FPS %5.1f  min %5.1f\nworst %5.1f ms   hitches %d\ndrained %d /s\n" +
 		"proc %5.2f ms   phys %5.2f ms\ndraws %d   prims %s\nvmem %.0f MB\n" +
-		"vox pending: mesh %d  main %d  gpu %d\nvox blocks %d") % [
+		"vox backlog: gen %d  mesh %d\nvox pending: main %d  gpu %d") % [
 		fps, min_fps, worst_ms, _hitches, stream_per_s,
 		proc_ms, phys_ms, draws, _fmt(prims), vmem,
-		mesh_pending, main_pending, gpu_pending, blocks]
+		gen_pending, mesh_pending, main_pending, gpu_pending]
 	_label.text = s
 
-	print("[PERF] fps=%.0f min=%.0f worst=%.0fms hitches=%d stream=%d/s proc=%.1f phys=%.1f draws=%d prims=%d vox_mesh=%d vox_blocks=%d" % [
-		fps, min_fps, worst_ms, _hitches, stream_per_s, proc_ms, phys_ms, draws, prims, mesh_pending, blocks])
+	print("[PERF] fps=%.0f min=%.0f worst=%.0fms hitches=%d drained=%d/s proc=%.1f phys=%.1f draws=%d prims=%d vox_gen=%d vox_mesh=%d" % [
+		fps, min_fps, worst_ms, _hitches, stream_per_s, proc_ms, phys_ms, draws, prims, gen_pending, mesh_pending])
 
 func _fmt(n: int) -> String:
 	if n >= 1000000:

@@ -17,12 +17,55 @@ extends Node3D
 ##
 ## WEB THREADING: on Emscripten the pthread pool is fixed-size. godot_voxel's
 ## VoxelEngine sizes its task pool from CPU count and would exhaust the pool
-## (deadlock -> no meshes -> blank world). We cap it to 1 thread via the
-## `voxel/threads/count/*` project settings (see project.godot); that pool is
-## created at engine start from those settings.
+## (deadlock -> no meshes -> blank world). We pin it to a FIXED 2 worker threads
+## via the `voxel/threads/count/*` project settings (project.godot:63,
+## minimum=2, ratio_over_max=0.0 → device-independent); that pool is created at
+## engine start from those settings. Worldgen is per-block independent and (in
+## curved mode) a pure function of the frozen gen_face, so >=2 workers parallelise
+## it race-free (COSMOS-AUDIT §3.2).
 
 var _terrain: Node3D
 var _viewer: Node
+var _mesher: Object                     # the VoxelMesherBlocky (kept so restream can rebuild the terrain)
+# COSMOS frozen-epoch (docs/COSMOS-AUDIT.md §3.2 items 3–4): the cube face this generator epoch is
+# homed on. Frozen onto each generator instance as `gen_face` at creation; a home-face flip creates a
+# NEW generator (new face) and restreams, rather than mutating the face workers are reading.
+var _gen_face := CubeSphere.HOME_FACE
+# COSMOS-FRAME-ORIENTATION §5.1: the epoch's FROZEN window orientation M_win (row-major [a,b,c,d]). The
+# worker recovers the raw home-face index p = gen_mwin·v from the terrain-local voxel index v (= M_win⁻¹·p)
+# before folding, so the near render lands in the master-face orientation. Identity at spawn → byte-identical.
+var _gen_mwin: Array = [1, 0, 0, 1]
+
+# COSMOS Stage 4 — post-flip view-distance ramp (kills the seam-cross freeze without moving spawn).
+# A home-face flip recreates the VoxelTerrain; jamming its max_view_distance to the full near radius in
+# one step re-queues the ENTIRE near disk (~2.6k blocks) in a single process pass → the 2 web workers +
+# the main-thread mesh-apply flood → the multi-second input-dead freeze. Instead the fresh terrain starts
+# at RAMP_START_BLOCKS and grows to the target over RAMP_SECONDS, so the nearest ring meshes first and
+# worker load ramps in instead of spiking (the far LOD, now frame-correct, covers the gap). The FINAL
+# view is identical — this is pure load-shaping. Active only in the ~1-2s after a flip restream.
+const RAMP_START_BLOCKS := 48.0
+const RAMP_SECONDS := 1.5
+var _ramp_active := false
+var _ramp_view := 0.0
+var _ramp_target := 0.0
+
+# COSMOS M4 Stage 2 (§3.1/§4): the OPT-IN freeze-in-place near cover. At a home-face flip, instead of
+# freeing the old VoxelTerrain immediately (the shipped default), pin it at its old WORLD position and
+# freeze it (PROCESS_MODE_DISABLED) so its meshes bridge the seam crossing at full near-field fidelity
+# while the fresh terrain ramps in behind it. DEFAULT OFF (§0 never-OOM): the const is the ONE-LINE
+# production flip; `cover_enabled` mirrors it per-instance so verify can assert BOTH states headless while
+# prod stays a const flip. Only enabled in production through the §9.3 A/B gate. The far bridge runs at
+# every flip regardless, as the safety net behind the cover (§2.2).
+const NEAR_COVER_ENABLED := false          # DEFAULT OFF — the single production flip (§3.1)
+var cover_enabled := NEAR_COVER_ENABLED    # instance mirror: verify overrides it; prod never writes it
+const NEAR_COVER_MAX_SECONDS := 10.0       # hard transient bound (≤ far COVER_MAX_SECONDS = 12)
+## Retirement is_area_meshed half-extent: 96 blocks, NOT the full 128 disk — one laggard outer mesh block
+## must not pin the cover to its timeout, and the 96→128 annulus sits behind the far layer's curved inner
+## hole (INNER_HOLE_CURVED = 112) plus fog, so retiring there is invisible (§4).
+const NEAR_COVER_MESHED_HALF := Vector3(96.0, 32.0, 96.0)
+var _cover_terrain: Node3D = null          # the frozen old VoxelTerrain (flag ON only); null in the default
+var _cover_age := 0.0                       # seconds the current cover has lived
+var _cover_released := false                # WorldManager's handshake fired (re-mirror done) — safe to retire on meshed
 
 # --- appearance table (ARIDs, VOXEL-DATA-STRUCTURE §8.1) ------------------------
 # The TYPE channel carries an Appearance Render ID (ARID) — a session-local, append-
@@ -201,13 +244,17 @@ func setup() -> bool:
 		mesher.call("set_library", library)
 	else:
 		_set_if(mesher, "library", library)
+	_mesher = mesher
 
 	_terrain = ClassDB.instantiate("VoxelTerrain") as Node3D
 	if _terrain == null:
 		return false
 	_set_if(_terrain, "mesher", mesher)
 	_set_if(_terrain, "generator", generator)
-	_set_if(_terrain, "max_view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
+	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
+	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
+	_set_if(_terrain, "max_view_distance", TerrainConfig.near_render_radius())
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -225,7 +272,34 @@ func setup() -> bool:
 	# Each block model (ids 1..count()-1) carries its own material; no terrain-wide
 	# material_override needed.
 	add_child(_terrain)
+	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
+	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
+	set_process(false)
 	return true
+
+## COSMOS Stage 4 — drive the post-flip view-distance ramp. Grows the fresh terrain's max_view_distance
+## from RAMP_START_BLOCKS to the near radius over RAMP_SECONDS so the near field streams in smoothly
+## after a home-face flip instead of freezing on a single full-disk request pass. Self-disables when the
+## target is reached; dormant (processing off) at every other time.
+func _process(delta: float) -> void:
+	# Ramp step (unchanged): grow the fresh terrain's view distance from RAMP_START_BLOCKS to the target.
+	if _ramp_active:
+		var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
+		_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
+		if _terrain != null:
+			_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
+		if _ramp_view >= _ramp_target:
+			_ramp_active = false
+	# COSMOS M4 Stage 2 (§5.1): age + retire the frozen near cover. Retire on "meshed" once WorldManager has
+	# released it (edits re-mirrored) AND the fresh field has meshed under the player; else at the hard cap.
+	if _cover_terrain != null:
+		_cover_age += delta
+		if _cover_released and not _ramp_active and _new_field_meshed():
+			_free_cover("meshed")
+		elif _cover_age >= NEAR_COVER_MAX_SECONDS:
+			_free_cover("timeout")
+	# Stay processing only while there is still ramp or cover work to do; otherwise go dormant.
+	set_process(_ramp_active or _cover_terrain != null)
 
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
@@ -1017,6 +1091,93 @@ func is_manifest_baked(mat: int, modifier: int) -> bool:
 func get_generator() -> Object:
 	return _generator
 
+## COSMOS frozen-epoch home-face flip (COSMOS-AUDIT §3.2 item 4, F3). Install a NEW generator epoch
+## homed on `face` and hard-restream. NEVER mutates the live generator's gen_face (workers read it):
+## the old generator is discarded, any in-flight worker task holding it finishes harmlessly and its
+## block is dropped by the restream. This is exactly the shape M4's dual-window handoff needs (two
+## generators, two frozen faces, concurrently). WorldManager also repositions this node so the new
+## voxel coordinate frame maps to the new face's global indices.
+## COSMOS M4 Stage 2 (§3.2): `old_wrapper_pos` is this wrapper's position in the OLD frame, captured by
+## WorldManager BEFORE it repositions the node to the new frame. It is forwarded to restream so the flag-on
+## path can pin the old terrain at its old world spot. The default Vector3.INF means "no old frame supplied"
+## (the free-immediately path) — keeping the 1-arg call in verify_cosmos_race.gd valid.
+func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Array = [1, 0, 0, 1]) -> void:
+	_gen_face = face
+	_gen_mwin = mwin                                  # COSMOS-FRAME-ORIENTATION §5.1: freeze the new epoch's M_win
+	restream(old_wrapper_pos)
+
+## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
+## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
+## GDScript fallback had one, so a module flip left stale face-A meshes standing (COSMOS-AUDIT F3).
+## Recreating the VoxelTerrain node guarantees old-epoch blocks are gone and the new generator is used.
+## The player's global VoxelViewer keeps streaming the new terrain (viewers are engine-global). A no-op
+## if the module is unavailable.
+func restream(old_wrapper_pos: Vector3 = Vector3.INF) -> void:
+	if not ClassDB.class_exists("VoxelTerrain") or _mesher == null:
+		return
+	var generator: Object = _make_generator()
+	if generator == null:
+		return
+	# COSMOS M4 Stage 2 (§5.2): free any prior frozen cover FIRST so a flip storm never stacks covers — the
+	# single-cover invariant (≤ 1 frozen + 1 live volume ever). No-op in the default state (no cover exists).
+	_free_cover("superseded")
+	var old_terrain := _terrain
+	var new_terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if new_terrain == null:
+		return
+	_set_if(new_terrain, "mesher", _mesher)
+	_set_if(new_terrain, "generator", generator)
+	# Stage 4: start small and ramp up in _process (below) instead of flooding the full disk at once.
+	_set_if(new_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
+	_set_if(new_terrain, "mesh_block_size", 32)
+	_set_if(new_terrain, "generate_collisions", false)
+	if old_terrain != null:
+		# Capture the old terrain's LOCAL offset BEFORE any cover compensation, so the FRESH terrain inherits
+		# the module's coordinate offset — not the pinned cover's compensated position (§3.2).
+		var base_pos: Vector3 = old_terrain.position
+		new_terrain.position = base_pos
+		# COSMOS M4 Stage 2 (§3.2/§3.3): flag ON and a real old frame supplied → keep the old terrain in place
+		# as a frozen cover: pin its world transform at the OLD spot, THEN disable processing (order matters —
+		# the transform notification applies immediately, independent of process mode). Else free it right away
+		# (the shipped default — byte-for-byte today's teardown). ONLY this flag test picks cover-vs-free.
+		if cover_enabled and old_wrapper_pos.is_finite() and old_wrapper_pos != position:
+			_cover_terrain = old_terrain
+			_cover_age = 0.0
+			_cover_released = false
+			old_terrain.position += old_wrapper_pos - position   # pin at the old WORLD spot (§3.2) …
+			old_terrain.process_mode = Node.PROCESS_MODE_DISABLED  # … THEN freeze (§3.3)
+		else:
+			remove_child(old_terrain)
+			old_terrain.queue_free()
+	add_child(new_terrain)
+	_terrain = new_terrain
+	_generator = generator
+	# Kick off the view-distance ramp so the near field fills in over ~RAMP_SECONDS rather than in one
+	# freezing pass. If the target is already within the start radius (never, at radius 128/256) it is a
+	# no-op. FLAT_WORLD only reaches restream() via a flip, which never fires without a chart — so flat
+	# play never ramps and stays byte-identical.
+	_ramp_target = float(TerrainConfig.near_render_radius())
+	_ramp_view = RAMP_START_BLOCKS
+	_ramp_active = _ramp_target > RAMP_START_BLOCKS
+	# Keep processing while the ramp runs OR a frozen cover is aging toward retirement (§5.1).
+	set_process(_ramp_active or _cover_terrain != null)
+
+## Whether the OOB fence has clamped a stale/unbaked ARID this session (COSMOS-AUDIT F8 telemetry — a
+## real out-of-range must never pass silently). Verify asserts this stays false over a clean run.
+func oob_seen() -> bool:
+	return _generator != null and bool(_generator.get("oob_seen"))
+
+## The generator's frozen home face (COSMOS-AUDIT §3.2 item 3) — for verify / the dual-window handoff.
+func gen_home_face() -> int:
+	return _gen_face
+
+## COSMOS M4 (§8 step 3): has the post-restream view-distance ramp finished? WorldManager polls this to
+## learn when the fresh near field's data blocks are loaded, so it can re-mirror player edits into the
+## render (§5.4) and end the far handoff turbo. Read-only; _ramp_active is false in steady state, so this
+## returns true whenever no restream ramp is in flight.
+func ramp_done() -> bool:
+	return not _ramp_active
+
 ## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
 ## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
 func _make_shape_model(modifier: int, material: Material) -> Object:
@@ -1252,7 +1413,7 @@ func attach_viewer(player: Node3D) -> void:
 	_viewer = ClassDB.instantiate("VoxelViewer") as Node
 	if _viewer == null:
 		return
-	_set_if(_viewer, "view_distance", TerrainConfig.RENDER_RADIUS_BLOCKS)
+	_set_if(_viewer, "view_distance", TerrainConfig.near_render_radius())
 	# Vertical stream ratio (1.0 now that terrain is shallow; kept configurable in
 	# TerrainConfig should tall terrain return).
 	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
@@ -1268,6 +1429,41 @@ func area_meshed(center: Vector3, half: Vector3) -> bool:
 	if _terrain == null or not _terrain.has_method("is_area_meshed"):
 		return false
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS M4 Stage 2 (§5.1): has the FRESH near field meshed under the player? Unlike area_meshed() (whose
+## raw-world centre is a FLAT-only convention where the wrapper sits at the origin), the curved wrapper sits
+## at a non-zero position, so convert the viewer's WORLD point into the new terrain's local voxel frame
+## (viewer.global − wrapper.global) before the is_area_meshed box. Returns false (never retire on "meshed",
+## fall through to the timeout cap) when there is no viewer/terrain or the module lacks is_area_meshed.
+func _new_field_meshed() -> bool:
+	var v := _viewer as Node3D
+	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
+		return false
+	var center: Vector3 = v.global_position - global_position
+	var half := NEAR_COVER_MESHED_HALF
+	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS M4 Stage 2: free the frozen near cover (null-safe) and print one retirement telemetry line (§9.3
+## watches these). The cover is a child of the wrapper, so queue_free drops its ~+50 MB static transient.
+func _free_cover(reason: String) -> void:
+	if _cover_terrain == null:
+		return
+	if is_instance_valid(_cover_terrain):
+		remove_child(_cover_terrain)
+		_cover_terrain.queue_free()
+	print("[module_world] near cover retired (%s) after %.1fs" % [reason, _cover_age])
+	_cover_terrain = null
+	_cover_age = 0.0
+	_cover_released = false
+
+## COSMOS M4 Stage 2: true while a frozen near cover is bridging a flip (verify / diagnostics).
+func cover_active() -> bool:
+	return _cover_terrain != null
+
+## COSMOS M4 Stage 2 (§5.1): WorldManager's handshake — the fresh terrain has ramped and player edits are
+## re-mirrored, so the cover may retire as soon as the new field meshes under the player. No-op with no cover.
+func release_cover() -> void:
+	_cover_released = true
 
 ## Build the library: air=0, then a cube model for EVERY BlockCatalog id in dense
 ## order (WGC §5.1). The model index MUST equal the BlockCatalog id (the generator +
@@ -1378,6 +1574,24 @@ var snow_id := -1                        # snow_block LRID (the curated LAYER ma
 var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
+var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
+# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): the IMMUTABLE home face + face-edge cell count this
+# generator epoch is homed on, set once by the loader before this generator runs. The worker folds each
+# column with `gen_face` (NEVER the mutable TerrainConfig._active_face), so home-face flips can never
+# race generation — a flip installs a NEW generator with a new gen_face and restreams (module_world).
+var gen_face := 0
+var gen_n := 0
+# COSMOS-FRAME-ORIENTATION §5.1: this epoch's FROZEN window orientation M_win (row-major ints). The worker
+# recovers the raw index p = M_win·v from the terrain-local voxel index v before folding. Identity at spawn.
+var gen_mwin_a := 1
+var gen_mwin_b := 0
+var gen_mwin_c := 0
+var gen_mwin_d := 1
+var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
+# OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
+# is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
+# write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
+var oob_seen := false
 const GEN_STRIDE := 256
 const SLOPE_STRIDE := 4096
 const FAM_BIT := 1 << 15                 # a modifier with bit 15 set is a FAM shape
@@ -1403,6 +1617,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# today, but taking the max keeps the all-air early-out sound if either bound ever changes.
 	var max_above = max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS)
 	var ncube = cube_arid.size()
+	var mcount = model_count                 # actual baked library model count — the OOB fence (see write site)
 	var ngen = gen_arid.size()
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
@@ -1430,19 +1645,49 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var profs = []
 	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
-	# Per-block column-profile memo (Vector2i -> Vector4) for the smoothing corner-target
-	# stencil AND the tree overlay (PERF): each surface/cap cell samples a 3x3 column-top
-	# stencil that overlaps its neighbours', and TreeGen re-derives its base-column biome per
-	# cell — so without a memo columns are re-noised many times per block. Seeded here from the
-	# profile pass and reused by resolve_cell -> smoothing + TreeGen.block_at; it only pads +1
-	# at block edges. LOCAL to this _generate_block frame -> each voxel worker owns its own dict;
-	# never shared across threads. Values are the exact column_profile -> output byte-identical.
-	var pcache = {}
-	for z in range(size.z):
-		for x in range(size.x):
-			var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
-			profs[z * size.x + x] = p
-			if int(p.x) > max_h: max_h = int(p.x)
+	# Per-block generation context (LOCAL to this _generate_block frame → each voxel worker owns its
+	# own; NEVER shared across threads). FLAT: a plain Dictionary column memo (Vector2i → Vector4),
+	# byte-identical to before. CURVED (COSMOS-AUDIT §3.2 items 2–3, F1/F2): a GenCtx carrying the
+	# FROZEN gen_face — the worker folds every column to its TRUE global (face, i, j) with THIS
+	# immutable face (never TerrainConfig._active_face) and hashes bedrock/ore/strata/tree/smoothing on
+	# the true column, so a module-generated cell is byte-identical to the analytic generated_cell_global
+	# (render == physics across a seam) and no home-face flip can race generation.
+	var pcache
+	var rxs   # per-column resolve i (true global column i) — curved only
+	var rzs   # per-column resolve j
+	var rfs   # per-column true face
+	var rjinv # per-column render-frame J⁻¹ quarter-turn (COSMOS-FRAME-ORIENTATION §6)
+	if flat_world:
+		pcache = {}
+		for z in range(size.z):
+			for x in range(size.x):
+				var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
+				profs[z * size.x + x] = p
+				if int(p.x) > max_h: max_h = int(p.x)
+	else:
+		pcache = TerrainConfig.GenCtx.new(gen_face)
+		# COSMOS-FRAME-ORIENTATION §6: this epoch's M_win quarter-turn, once per block — worker_fold_column
+		# folds each column and records J⁻¹ = −(strip_d4 + gen_mwin_d4) so resolve_cell rotates the shape.
+		var gen_mwin_d4 = CubeSphere.d4_of([gen_mwin_a, gen_mwin_b, gen_mwin_c, gen_mwin_d])
+		rxs = PackedInt32Array(); rxs.resize(size.x * size.z)
+		rzs = PackedInt32Array(); rzs.resize(size.x * size.z)
+		rfs = PackedInt32Array(); rfs.resize(size.x * size.z)
+		rjinv = PackedInt32Array(); rjinv.resize(size.x * size.z)   # §6: per-column J⁻¹ (worker_fold_column sets it)
+		for z in range(size.z):
+			for x in range(size.x):
+				var idx = z * size.x + x
+				# COSMOS-FRAME-ORIENTATION §5.1: recover the raw home-face index p = gen_mwin·v from the
+				# terrain-local voxel index v = (ox+x, oz+z). Identity M_win → (ox+x, oz+z), byte-identical.
+				var vx = ox + x
+				var vz = oz + z
+				var pi = gen_mwin_a * vx + gen_mwin_b * vz
+				var pj = gen_mwin_c * vx + gen_mwin_d * vz
+				# Fold (gen_face, raw column) → true global column ONCE; sets pcache.face + jinv_d4.
+				var tc = TerrainConfig.worker_fold_column(gen_face, pi, pj, pcache, gen_mwin_d4)
+				rfs[idx] = tc.x; rxs[idx] = tc.y; rzs[idx] = tc.z; rjinv[idx] = pcache.jinv_d4
+				var p = TerrainConfig.column_profile(tc.y, tc.z, pcache)
+				profs[idx] = p
+				if int(p.x) > max_h: max_h = int(p.x)
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
@@ -1454,15 +1699,37 @@ func _generate_block(buffer, origin_in_voxels, lod):
 
 	for z in range(size.z):
 		for x in range(size.x):
-			var p = profs[z * size.x + x]
+			var idx2 = z * size.x + x
+			var p = profs[idx2]
 			var g = int(p.x)
 			var biome = int(p.y)
 			var cc = p.z
 			var tt = p.w
-			var wx = ox + x
-			var wz = oz + z
+			var wx
+			var wz
+			if flat_world:
+				wx = ox + x
+				wz = oz + z
+			else:
+				# The TRUE global column this voxel column folds to; restore its face for the nested
+				# smoothing/snow/tree stencil folds inside resolve_cell (COSMOS-AUDIT §3.2 items 2–3).
+				wx = rxs[idx2]
+				wz = rzs[idx2]
+				pcache.face = rfs[idx2]
+			# S1 throughput hoist: the SLOPE run is column-invariant, so compute it ONCE here (worker-
+			# direct pack, byte-identical to the analytic memo) and pass it into every resolve_cell of
+			# this column — else resolve_cell re-runs the _corner_targets noise stencil + TreeGen.block_at
+			# tree-gate on all ~100 sub-surface y's of a tall land column (the steady-state gen cost).
+			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
+			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
-				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache)
+				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache, srun)
+				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
+				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
+				if col_jinv != 0:
+					var vmod = CellCodec.modifier(v)
+					if vmod != 0:
+						v = CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(vmod, col_jinv))
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue
@@ -1583,6 +1850,18 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						arid = gen_arid[slot]
 					else:
 						arid = cube_arid[id] if id < ncube else id
+				# OOB FENCE (VDS 8.1 exhaustion policy) — runs for EVERY cell after the arid resolve: a
+				# stray/unbaked payload degrades to a valid cube, NEVER an out-of-range model index. The
+				# blocky mesher (C++/wasm) indexes its baked-model array by this value, so any arid outside
+				# [0, model_count) is an out-of-bounds worker crash. Every branch above already cube-falls-
+				# back; this only fires if a table held a stale index or a web bake truncated the library
+				# below _next_arid, clamping to the material cube, else air (model 0 is always empty).
+				if arid < 0 or arid >= mcount:
+					var cf = cube_arid[id] if id < ncube else 0
+					arid = cf if (cf >= 0 and cf < mcount) else 0
+					if not oob_seen:
+						oob_seen = true       # write-once telemetry (idempotent → race-safe); surfaced by verify
+						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
 """
 	var gen_script := GDScript.new()
@@ -1607,7 +1886,32 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
+	# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): freeze this epoch's home face + n + flat flag
+	# onto the generator instance. The worker reads these IMMUTABLE snapshots (never _active_face), so a
+	# home-face flip creates a fresh generator (new gen_face) + restream rather than mutating under workers.
+	gen.set("flat_world", CubeSphere.FLAT_WORLD)
+	gen.set("gen_face", _gen_face)
+	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
+	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
+	gen.set("gen_mwin_a", int(_gen_mwin[0]))
+	gen.set("gen_mwin_b", int(_gen_mwin[1]))
+	gen.set("gen_mwin_c", int(_gen_mwin[2]))
+	gen.set("gen_mwin_d", int(_gen_mwin[3]))
+	# The OOB fence upper bound (VDS §8.1): the ACTUAL baked model count, read back from the library
+	# (not _next_arid) so that if a web bake ever truncated the models array below what we appended, the
+	# generator still never writes an index past what the mesher can address. Falls back to _next_arid
+	# when the library doesn't expose its models array.
+	gen.set("model_count", _library_model_count())
 	return gen
+
+## The actual number of models in the baked library (the arid upper bound for the worker's OOB fence).
+## Reads the live `models` array size when exposed; else the append count `_next_arid`.
+func _library_model_count() -> int:
+	if _library != null:
+		var models: Variant = _library.get("models")
+		if models is Array:
+			return (models as Array).size()
+	return _next_arid
 
 # --- helpers -------------------------------------------------------------------
 # Set a property only if the object actually exposes it (avoids error spam if a

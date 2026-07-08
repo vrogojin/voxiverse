@@ -15,14 +15,25 @@ static var _shader: Shader = null
 ## The ONE shared energy material (fills, inactive quads, the §5 kill-switch surface).
 static var _energy: StandardMaterial3D = null
 
+## Destination streaming (PORTALS §3.5.6): a small-radius VoxelViewer parked at the
+## destination so the far-side blocks actually stream in and render behind the opening
+## (the owner's required "show the real other-side blocks" visual). Module path only —
+## instantiated via ClassDB so this file still loads when godot_voxel is absent.
+const DEST_VIEW_DISTANCE := 64
+## Seconds a deactivated surface keeps its SubViewport + destination viewer before freeing
+## them, so peeking repeatedly doesn't thrash the stream / reallocate the FBO.
+const LINGER_SEC := 10.0
+
 var _src: PortalFrame
 var _dst: PortalFrame
 var _quad: MeshInstance3D                     # layer 2 — live view (player camera only)
 var _fill: MeshInstance3D                     # layer 3 — energy fill (portal cameras only)
 var _subviewport: SubViewport = null           # created lazily on first activation
 var _camera: Camera3D = null
+var _dest_viewer: Node = null                  # VoxelViewer parked at the destination (module path)
 var _portal_mat: ShaderMaterial
 var _active := false
+var _linger_left := 0.0                        # deactivation grace countdown
 
 ## Build the quad + fill (both at the source frame's transform) and the per-portal
 ## material. Starts INACTIVE (energy look). The SubViewport is created lazily on first
@@ -60,7 +71,9 @@ func activate(size_px: Vector2i) -> void:
 	if _active:
 		return
 	_active = true
+	_linger_left = 0.0                         # re-activation cancels a pending free
 	_ensure_subviewport(size_px)
+	_ensure_dest_viewer()
 	_quad.material_override = _portal_mat
 	if _subviewport != null:
 		_subviewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
@@ -74,6 +87,18 @@ func deactivate() -> void:
 	_quad.material_override = energy_material()
 	if _subviewport != null:
 		_subviewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	_linger_left = LINGER_SEC                   # start the grace countdown (viewport + viewer freed after)
+
+## Advance the deactivation linger; free the SubViewport + destination viewer when it
+## expires. Driven by the manager for INACTIVE surfaces (no per-surface loop). No-op while
+## active or already freed.
+func tick_idle(delta: float) -> void:
+	if _active or _linger_left <= 0.0:
+		return
+	_linger_left -= delta
+	if _linger_left <= 0.0:
+		free_viewport()
+		_free_dest_viewer()
 
 ## Release the SubViewport FBO + camera entirely (called after the deactivation linger to
 ## reclaim the web frame budget). Safe to call repeatedly.
@@ -82,6 +107,45 @@ func free_viewport() -> void:
 		_subviewport.queue_free()
 		_subviewport = null
 		_camera = null
+
+## Continuous rendering (UPDATE_ALWAYS) — the default for the primary active portal.
+func set_continuous() -> void:
+	if _active and _subviewport != null:
+		_subviewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+
+## Manual rendering (UPDATE_DISABLED between explicit `pulse()`s) — the half-rate path for
+## a 2nd active portal on the web budget.
+func set_manual() -> void:
+	if _active and _subviewport != null and _subviewport.render_target_update_mode == SubViewport.UPDATE_ALWAYS:
+		_subviewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
+
+## True iff a destination VoxelViewer is currently parked (module path, active).
+func has_dest_viewer() -> bool:
+	return _dest_viewer != null
+
+func _ensure_dest_viewer() -> void:
+	if _dest_viewer != null:
+		return
+	# Module path only. Instantiated by string via ClassDB (like module_world.attach_viewer)
+	# so this file loads cleanly when godot_voxel is absent — the fallback path shows fog.
+	if not ClassDB.class_exists("VoxelViewer"):
+		return
+	var v: Node = ClassDB.instantiate("VoxelViewer")
+	if v == null:
+		return
+	_dest_viewer = v
+	if v.has_method("set_view_distance"):
+		v.call("set_view_distance", DEST_VIEW_DISTANCE)
+	else:
+		v.set("view_distance", DEST_VIEW_DISTANCE)
+	v.set("requires_collisions", false)
+	add_child(v)
+	(v as Node3D).global_position = _dst.center()
+
+func _free_dest_viewer() -> void:
+	if _dest_viewer != null:
+		_dest_viewer.queue_free()
+		_dest_viewer = null
 
 ## Force one render of the current view (SubViewport UPDATE_ONCE) — the half-rate pulse
 ## path (Stage 4). No-op when inactive / no viewport.

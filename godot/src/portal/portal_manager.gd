@@ -66,11 +66,16 @@ func setup(p_world: WorldManager, p_player: Node = null, p_toast: ToastHUD = nul
 
 # --- per-frame activation + view update (PORTALS §3.5.6) -----------------------
 
-## Rank the live surfaces by distance to their source frame, ACTIVATE the nearest
-## MAX_ACTIVE that are in front of the player (within ACTIVATE_DIST + hysteresis, inside
-## the camera frustum, not edge-on), deactivate the rest, and refresh each active
-## surface's window-frustum camera. Off entirely when render is disabled or nothing links.
-func _process(_delta: float) -> void:
+## A second active portal renders every OTHER frame (§5.2 rung 2) — dead while MAX_ACTIVE
+## is 1, but the lever is wired for a desktop/2-portal budget.
+const HALF_RATE_SECOND := true
+
+var _frame := 0                                # render frame counter (half-rate phase)
+
+## Drive all surfaces: the nearest MAX_ACTIVE that pass distance/edge-on/cap (compute_active_set)
+## AND lie in the camera frustum ACTIVATE + render; the rest deactivate and linger toward a
+## SubViewport/viewer free. The 2nd active surface half-rates. Off when render disabled / no links.
+func _process(delta: float) -> void:
 	if not render_enabled or not RENDER_PORTALS or player == null or _links.is_empty():
 		return
 	var cam: Camera3D = player.camera_node()
@@ -78,35 +83,69 @@ func _process(_delta: float) -> void:
 		return
 	var eye: Vector3 = cam.global_transform.origin
 	var far: float = cam.far
-	var ranked: Array = []
+	_frame += 1
+	var active_now := {}
 	for key: Vector4i in _links.keys():
-		var entry: Dictionary = _links[key]
-		var surf = entry["surface"]
+		var s = _links[key]["surface"]
+		if s != null and s.is_active():
+			active_now[key] = true
+	var want := {}
+	for key: Vector4i in compute_active_set(eye, active_now):
+		want[key] = true
+	var rendered := 0
+	for key: Vector4i in _links.keys():
+		var surf = _links[key]["surface"]
 		if surf == null:
 			continue
-		var src: PortalFrame = entry["frame"]
-		ranked.append({"d": eye.distance_to(src.center()), "surf": surf, "src": src})
-	ranked.sort_custom(func(a, b): return a["d"] < b["d"])
-	var active_count := 0
-	for r: Dictionary in ranked:
-		var surf = r["surf"]
-		var src: PortalFrame = r["src"]
-		var keep := false
-		if active_count < MAX_ACTIVE:
-			var limit := ACTIVATE_DIST + (DEACTIVATE_HYSTERESIS if surf.is_active() else 0.0)
-			if float(r["d"]) <= limit:
-				var c := src.center()
-				var n_s := src.global_transform().basis.z
-				var edge_on := absf((eye - c).dot(n_s)) <= EDGE_ON_EPS
-				if not edge_on and cam.is_position_in_frustum(c):
-					keep = true
+		var src: PortalFrame = _links[key]["frame"]
+		# The distance/cap/edge-on decision (compute_active_set) is ANDed with the live
+		# camera frustum test here (frustum needs a real camera → not in the pure helper).
+		var keep: bool = want.has(key) and cam.is_position_in_frustum(src.center())
 		if keep:
 			if not surf.is_active():
 				surf.activate(_target_px_for(src))
 			surf.update_view(eye, far)
-			active_count += 1
-		elif surf.is_active():
-			surf.deactivate()
+			# Half-rate the 2nd+ active surface; the primary renders continuously.
+			if rendered >= 1 and HALF_RATE_SECOND:
+				if _frame % 2 == 0:
+					surf.pulse()
+				else:
+					surf.set_manual()
+			else:
+				surf.set_continuous()
+			rendered += 1
+		else:
+			if surf.is_active():
+				surf.deactivate()
+			surf.tick_idle(delta)
+
+## PURE activation selection (PORTALS §3.5.6, headless-testable): the link keys that pass
+## the distance range (ACTIVATE_DIST, + DEACTIVATE_HYSTERESIS for a currently-active one),
+## the edge-on reject, and the MAX_ACTIVE cap, in nearest-first order. `active_now` = keys
+## currently active (for hysteresis). The live `_process` additionally ANDs the camera
+## frustum test; this function is the deterministic core the verify drives with synthetic
+## eyes. Surfaces need not exist (reads only frames), so it runs with render_enabled=false.
+func compute_active_set(eye: Vector3, active_now: Dictionary = {}) -> Array:
+	var ranked: Array = []
+	for key: Vector4i in _links.keys():
+		var src: PortalFrame = _links[key]["frame"]
+		ranked.append({"d": eye.distance_to(src.center()), "key": key, "src": src})
+	ranked.sort_custom(func(a, b): return float(a["d"]) < float(b["d"]))
+	var out: Array = []
+	for r: Dictionary in ranked:
+		if out.size() >= MAX_ACTIVE:
+			break
+		var key: Vector4i = r["key"]
+		var src: PortalFrame = r["src"]
+		var limit := ACTIVATE_DIST + (DEACTIVATE_HYSTERESIS if active_now.has(key) else 0.0)
+		if float(r["d"]) > limit:
+			continue
+		var c := src.center()
+		var n_s := src.global_transform().basis.z
+		if absf((eye - c).dot(n_s)) <= EDGE_ON_EPS:
+			continue                              # edge-on → degenerate view, skip
+		out.append(key)
+	return out
 
 ## The SubViewport target size for a frame: portal-sized, clamped to [64, MAX_TARGET_PX].
 func _target_px_for(frame: PortalFrame) -> Vector2i:

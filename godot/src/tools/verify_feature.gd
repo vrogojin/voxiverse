@@ -70,6 +70,8 @@ func _initialize() -> void:
 	_test_portal_buildability()
 	_test_portal_linking()
 	_test_portal_math()
+	_test_portal_activation()
+	_test_portal_surface_lifecycle()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6790,3 +6792,88 @@ func _axis_aligned(v: Vector3) -> bool:
 		elif _approx(c, 0.0):
 			zeros += 1
 	return ones == 1 and zeros == 2
+
+# PORTALS §3.7/§4 — activation policy (pure) + surface/viewer lifecycle (Stage 4).
+func _test_portal_activation() -> void:
+	print("[portals] activation policy + destination-viewer lifecycle")
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalActivate"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	# Two AXIS_Z frames: fa near the origin, fb 100 m away, plus fc near fa (for the cap).
+	var fa := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 64, 0), 2, 3)
+	var fb := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(100, 64, 0), 2, 3)
+	var fc := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(10, 64, 0), 2, 3)
+	_author_frame(world, fa, OBS)
+	_author_frame(world, fb, OBS)
+	_author_frame(world, fc, OBS)
+	var pm := _portal_manager(world)
+	pm.link(fa, fb)                                 # fa ↔ fb linked
+	var ca := fa.center()                            # (1, 65.5, 0.5), normal +Z
+
+	# Near fa, facing through it → fa active, fb far → not.
+	var near_eye := ca + Vector3(0, 0, 10)
+	var set1 := pm.compute_active_set(near_eye, {})
+	_ok(set1.size() == 1 and set1[0] == fa.key(), "nearest in-range frame is active; the far one is not")
+	# Far from both → empty active set.
+	var far_eye := ca + Vector3(0, 0, 60)
+	_ok(pm.compute_active_set(far_eye, {}).is_empty(), "no portal beyond ACTIVATE_DIST activates")
+	# Edge-on (eye in fa's plane) → excluded even when near.
+	var edge_eye := ca + Vector3(5, 0, 0)            # (eye-centre)·normal == 0
+	_ok(pm.compute_active_set(edge_eye, {}).is_empty(), "an edge-on portal is not activated")
+	# Hysteresis: at dist 26 (between ACTIVATE_DIST 24 and +4) it stays active only if already active.
+	var hyst_eye := ca + Vector3(0, 0, 26)
+	_ok(pm.compute_active_set(hyst_eye, {}).is_empty(), "26 m away: an inactive portal does not activate")
+	_ok(pm.compute_active_set(hyst_eye, {fa.key(): true}) == [fa.key()], "26 m away: an ACTIVE portal stays (hysteresis)")
+	# MAX_ACTIVE cap: link fc↔fa (steals fa from fb) so fa AND fc are both live and near the
+	# eye; the active set must still cap at MAX_ACTIVE.
+	pm.link(fc, fa)
+	var both_eye := ca + Vector3(0, 0, 6)           # near both fa and fc
+	var capped := pm.compute_active_set(both_eye, {})
+	_ok(capped.size() == PortalManager.MAX_ACTIVE, "the active set never exceeds MAX_ACTIVE (%d)" % PortalManager.MAX_ACTIVE)
+	pm.queue_free()
+	world.queue_free()
+
+# Drive a PortalSurface directly (module present headless): activate parks a SubViewport +
+# destination VoxelViewer, the deactivation linger frees BOTH (no leak). Idle/free calls are
+# safe before activation. This exercises the state machine that must never pin the frame budget.
+func _test_portal_surface_lifecycle() -> void:
+	print("[portals] surface + SubViewport/viewer lifecycle")
+	var src := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 64, 0), 2, 3)
+	var dst := PortalFrame.new(PortalFrame.AXIS_X, Vector3i(40, 64, 20), 2, 3)
+	var surf := PortalSurface.new()
+	surf.name = "SurfLifecycle"
+	get_root().add_child(surf)
+	surf.configure(src, dst)
+	_ok(not surf.is_active(), "surface starts inactive")
+	_ok(_count_type_children(surf, "MeshInstance3D") == 2, "surface has the Quad + Fill mesh instances")
+	# Safe before activation.
+	surf.deactivate()
+	surf.tick_idle(20.0)
+	surf.free_viewport()
+	_ok(not surf.is_active(), "idle/free calls before activation are safe no-ops")
+	# Activate → a SubViewport appears; on the module path a destination VoxelViewer is parked.
+	surf.activate(Vector2i(192, 288))
+	_ok(surf.is_active(), "surface activates")
+	_ok(_count_type_children(surf, "SubViewport") == 1, "activation creates exactly one SubViewport")
+	var module_here := ClassDB.class_exists("VoxelViewer")
+	_ok(surf.has_dest_viewer() == module_here, "destination VoxelViewer parked iff the module is present (module_here=%s)" % module_here)
+	surf.update_view(Vector3(0, 65.5, 6.0), 100.0)  # must not crash
+	surf.set_continuous()
+	surf.set_manual()
+	surf.pulse()
+	# Deactivate + linger → both SubViewport and viewer freed.
+	surf.deactivate()
+	_ok(not surf.is_active(), "surface deactivates")
+	surf.tick_idle(PortalSurface.LINGER_SEC + 1.0)
+	# queue_free is deferred; the surface's own bookkeeping reports the release immediately.
+	_ok(not surf.has_dest_viewer(), "the destination viewer is freed after the deactivation linger")
+	surf.queue_free()
+
+# Count direct children of `node` whose class name matches `type_name`.
+func _count_type_children(node: Node, type_name: String) -> int:
+	var n := 0
+	for c in node.get_children():
+		if c.is_class(type_name):
+			n += 1
+	return n

@@ -58,6 +58,36 @@ static func window_camera(eye: Vector3, s: PortalFrame, d: PortalFrame, far: flo
 		"aspect": aspect, "flip_u": sigma < 0.0, "side": side,
 	}
 
+## The yaw (rotation about +Y) encoded by a pure-yaw basis `b` — the isometry basis is
+## always such a yaw (frames are axis-aligned). Applied to the player's rotation.y on
+## teleport (PORTALS §3.6).
+static func yaw_of(b: Basis) -> float:
+	return atan2(b.z.x, b.z.z)
+
+## Does the segment p0→p1 cross frame `f`'s plane WITHIN its interior opening, inflated by
+## `inflate` on both axes (PORTALS §3.6 walk-through detection)? Returns {hit: bool,
+## point: Vector3} — hit true iff the plane-crossing point lies inside the inflated rect.
+## Analytic and exact at any frame rate (mirrors ceiling_scan's anti-tunnel discipline).
+static func segment_crosses_frame(p0: Vector3, p1: Vector3, f: PortalFrame, inflate: float) -> Dictionary:
+	var tx := f.global_transform()
+	var n := tx.basis.z
+	var o := tx.origin
+	var d0 := (p0 - o).dot(n)
+	var d1 := (p1 - o).dot(n)
+	var denom := d0 - d1
+	if absf(denom) < 1e-9:
+		return {"hit": false, "point": Vector3.ZERO}   # parallel to the plane (no normal motion)
+	var t := d0 / denom
+	if t < 0.0 or t > 1.0:
+		return {"hit": false, "point": Vector3.ZERO}   # segment does not reach the plane
+	var hit := p0.lerp(p1, t)
+	var local := hit - o
+	var u := local.dot(tx.basis.x)
+	var v := local.dot(tx.basis.y)
+	var hw := float(f.width) * 0.5 + inflate
+	var hh := float(f.height) * 0.5 + inflate
+	return {"hit": absf(u) <= hw and absf(v) <= hh, "point": hit}
+
 ## The four WORLD-space corners of a frame's interior opening (centre ± half-width along
 ## right, ± half-height along up). Used by the verify NDC-corner reprojection assert and
 ## (later) any window-bounds work.

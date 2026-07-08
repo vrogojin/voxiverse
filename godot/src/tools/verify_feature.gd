@@ -72,6 +72,7 @@ func _initialize() -> void:
 	_test_portal_math()
 	_test_portal_activation()
 	_test_portal_surface_lifecycle()
+	_test_portal_teleport()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6877,3 +6878,108 @@ func _count_type_children(node: Node, type_name: String) -> int:
 		if c.is_class(type_name):
 			n += 1
 	return n
+
+# A minimal stand-in for the Player used by the teleport _physics_process test — exposes
+# just the duck-typed surface the PortalManager touches. RefCounted (not a Node) so it
+# needs no tree: global_position/rotation/velocity are plain fields the manager reads/writes.
+class _MockPlayer extends RefCounted:
+	var global_position := Vector3.ZERO
+	var rotation := Vector3.ZERO
+	var velocity := Vector3.ZERO
+	func head_position() -> Vector3:
+		return global_position + Vector3(0, 1.7, 0)
+
+# PORTALS §3.7 — walk-through teleport (Stage 5). Pure crossing/transform + a mock-driven
+# debounce + arrival refusal. All at y=200 (all air) so standing room is the default.
+func _test_portal_teleport() -> void:
+	print("[portals] walk-through teleport")
+	var world: WorldManager = WorldManager.new()
+	world.name = "WMPortalTeleport"
+	get_root().add_child(world)
+	var OBS := BlockCatalog.id_of(&"obsidian")
+	var fa := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 200, 0), 2, 3)
+	var fb := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(100, 200, 0), 2, 3)
+	var fc := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(50, 200, 0), 2, 3)   # NOT linked
+	_author_frame(world, fa, OBS)
+	_author_frame(world, fb, OBS)
+	_author_frame(world, fc, OBS)
+	var pm := _portal_manager(world)
+	pm.link(fa, fb)
+
+	# --- crossing detector (pure) ---
+	var ca := fa.center()                            # (1, 201.5, 0.5), plane z=0.5
+	var p_before := ca + Vector3(0, 0, 1.0)
+	var p_after := ca + Vector3(0, 0, -1.0)
+	var hit := PortalMath.segment_crosses_frame(p_before, p_after, fa, PortalManager.PLAYER_RADIUS)
+	_ok(hit["hit"], "a straight walk through the centre crosses the opening")
+	# 0.2 m outside the inflated rect (v beyond half-height + radius) → miss.
+	var out_pt := ca + Vector3(0, float(fa.height) * 0.5 + PortalManager.PLAYER_RADIUS + 0.2, 0.0)
+	var miss := PortalMath.segment_crosses_frame(out_pt + Vector3(0, 0, 1), out_pt + Vector3(0, 0, -1), fa, PortalManager.PLAYER_RADIUS)
+	_ok(not miss["hit"], "a pass 0.2 m outside the inflated opening misses")
+	# Motion parallel to the plane (no normal component) → miss.
+	var par := PortalMath.segment_crosses_frame(ca + Vector3(1, 0, 1), ca + Vector3(-1, 0, 1), fa, PortalManager.PLAYER_RADIUS)
+	_ok(not par["hit"], "motion parallel to the plane never crosses")
+	# crossed_link: a LINKED frame crossing resolves (s,d); an UNLINKED frame does not.
+	var cl := pm.crossed_link(p_before, p_after)
+	_ok(cl["found"] and cl["s"].key() == fa.key() and cl["d"].key() == fb.key(), "crossed_link resolves the linked pair (fa→fb)")
+	var cc := fc.center()
+	var cl_un := pm.crossed_link(cc + Vector3(0, 0, 1), cc + Vector3(0, 0, -1))
+	_ok(not cl_un["found"], "crossing an UNLINKED frame does not teleport")
+
+	# --- transform round-trip (pure, open world) ---
+	var feet := Vector3(1.0, 200.0, 5.0)
+	var vel := Vector3(2.0, 0.0, 3.0)
+	var r1 := pm.compute_teleport(fa, fb, feet, 0.0, vel)
+	_ok(r1["ok"], "teleport into open terrain succeeds")
+	var r2 := pm.compute_teleport(fb, fa, r1["position"], r1["yaw"], r1["velocity"])
+	_ok(r2["ok"] and (r2["position"] as Vector3).distance_to(feet) < 0.05, "position round-trips T then T_back")
+	_ok(_approx(wrapf(float(r2["yaw"]), -PI, PI), 0.0, 1e-2), "yaw round-trips (mod 2π)")
+	_ok((r2["velocity"] as Vector3).is_equal_approx(vel), "velocity round-trips through T then T_back")
+
+	# --- blocked-arrival refusal ---
+	var arr: Vector3 = r1["position"]
+	var exit := fb.global_transform().basis.z
+	for step in range(0, PortalManager.MAX_STEP_UP + 1):
+		var base := arr + exit * float(step)
+		var fcell := Vector3i(int(floor(base.x)), int(floor(base.y)), int(floor(base.z)))
+		world._write_cell(fcell, STONE)
+		world._write_cell(fcell + Vector3i(0, 1, 0), STONE)
+	var blocked := pm.compute_teleport(fa, fb, feet, 0.0, vel)
+	_ok(not blocked["ok"], "a walled destination exit refuses the teleport")
+	_ok((blocked["position"] as Vector3).is_equal_approx(feet), "a refused teleport leaves position unchanged")
+
+	# --- debounce (mock-driven _physics_process) ---
+	var mock := _MockPlayer.new()
+	var pm2 := PortalManager.new()
+	pm2.render_enabled = false
+	get_root().add_child(pm2)
+	pm2.setup(world, mock, null)
+	# fresh frames well away from the walled region above.
+	var ga := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(-200, 200, 0), 2, 3)
+	var gb := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(-100, 200, 0), 2, 3)
+	_author_frame(world, ga, OBS)
+	_author_frame(world, gb, OBS)
+	pm2.link(ga, gb)
+	var gca := ga.center()                           # (-199, 201.5, 0.5)
+	mock.global_position = Vector3(gca.x, 200.0, gca.z + 1.0)   # eye at y 201.7 in the opening, z=+1
+	pm2._physics_process(0.016)                      # establish prev eye
+	mock.global_position = Vector3(gca.x, 200.0, gca.z - 1.0)   # cross the plane
+	pm2._physics_process(0.016)                      # → teleport
+	_ok(pm2.teleport_locked(), "a teleport arms the debounce lockout")
+	var pos_after := mock.global_position
+	_ok(pos_after.distance_to(Vector3(gca.x, 200.0, gca.z - 1.0)) > 10.0, "the mock player actually teleported (moved far)")
+	# Immediate re-cross within the lockout does NOT teleport.
+	mock.global_position = Vector3(gca.x, 200.0, gca.z + 1.0)
+	pm2._physics_process(0.016)
+	mock.global_position = Vector3(gca.x, 200.0, gca.z - 1.0)
+	var pos_locked := mock.global_position
+	pm2._physics_process(0.016)
+	_ok(mock.global_position.is_equal_approx(pos_locked), "a re-cross within the lockout does not teleport")
+	# Let the lockout expire.
+	for _i in range(30):
+		pm2._physics_process(0.016)
+	_ok(not pm2.teleport_locked(), "the lockout clears after its window")
+
+	pm2.queue_free()
+	pm.queue_free()
+	world.queue_free()

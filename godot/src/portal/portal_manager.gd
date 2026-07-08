@@ -45,7 +45,7 @@ const EDGE_ON_EPS := 0.05
 var render_enabled := true
 
 var world: WorldManager                       # injected by setup(); THE cell query + edit signal source
-var player: Node = null                        # injected; may be null (verify) — camera/eye source (Stage 3+)
+var player = null                              # injected Player (or null / a test mock) — duck-typed camera/eye source
 var toast: ToastHUD = null                     # injected; may be null (verify) — tool feedback
 
 var _armed: PortalFrame = null                 # the arm→link two-step's first frame (transient UI state)
@@ -54,7 +54,7 @@ var _cell_index: Dictionary = {}               # Vector3i -> Vector4i owning lin
 
 ## Inject dependencies and subscribe to the world's per-cell edit signal (the teardown
 ## hook). `player` and `toast` may be null (headless verify).
-func setup(p_world: WorldManager, p_player: Node = null, p_toast: ToastHUD = null) -> void:
+func setup(p_world: WorldManager, p_player = null, p_toast: ToastHUD = null) -> void:
 	world = p_world
 	player = p_player
 	toast = p_toast
@@ -146,6 +146,112 @@ func compute_active_set(eye: Vector3, active_now: Dictionary = {}) -> Array:
 			continue                              # edge-on → degenerate view, skip
 		out.append(key)
 	return out
+
+# --- walk-through teleport (PORTALS §3.6) --------------------------------------
+## Optional walk-through: apply the pair isometry to the player when their eye crosses a
+## linked frame's opening. Everything above ships without it (portals as windows).
+const TELEPORT_ENABLED := true
+const CROSS_RANGE := 4.0                        # only test frames within this many metres
+const TELEPORT_LOCKOUT := 0.25                  # seconds crossing tests are disabled after a teleport
+const REARM_DIST := 0.5                         # must be this far from the destination plane to re-arm
+const PLAYER_RADIUS := 0.4                      # matches Player.PLAYER_RADIUS (opening inflation)
+const MAX_STEP_UP := 2                          # cells to probe along the exit dir for standing room
+
+var _prev_eye := Vector3.ZERO
+var _have_prev_eye := false
+var _lockout_left := 0.0
+var _rearm_frame: PortalFrame = null            # the destination frame just exited (rearm-distance guard)
+
+## Cache the player eye each physics frame and teleport when it crosses a linked frame's
+## opening. Analytic (no Area3D) — exact at any frame rate. Inert when teleport is off, no
+## player (headless verify), during the lockout, or while still within REARM_DIST of the
+## last exit plane (the ping-pong guard).
+func _physics_process(delta: float) -> void:
+	if not TELEPORT_ENABLED or player == null:
+		return
+	if _lockout_left > 0.0:
+		_lockout_left -= delta
+	var eye: Vector3 = player.head_position()
+	if not _have_prev_eye:
+		_prev_eye = eye
+		_have_prev_eye = true
+		return
+	var p0 := _prev_eye
+	_prev_eye = eye
+	# Rearm-distance guard: don't re-teleport until clear of the destination plane.
+	if _rearm_frame != null:
+		var rn := _rearm_frame.global_transform()
+		if absf((eye - rn.origin).dot(rn.basis.z)) >= REARM_DIST:
+			_rearm_frame = null
+	if _lockout_left > 0.0 or _rearm_frame != null or _links.is_empty():
+		return
+	var cx := crossed_link(p0, eye)
+	if cx["found"]:
+		_teleport_through(cx["s"], cx["d"])
+
+## The first LINKED frame the segment p0→p1 crosses (through its opening), with its
+## partner. Pure (iterates only `_links`, so an UNLINKED frame is never a teleport source).
+## Returns {found: bool, s: PortalFrame, d: PortalFrame}.
+func crossed_link(p0: Vector3, p1: Vector3) -> Dictionary:
+	for key: Vector4i in _links.keys():
+		var s: PortalFrame = _links[key]["frame"]
+		if p0.distance_to(s.center()) > CROSS_RANGE and p1.distance_to(s.center()) > CROSS_RANGE:
+			continue
+		if PortalMath.segment_crosses_frame(p0, p1, s, PLAYER_RADIUS)["hit"]:
+			var other: Vector4i = _links[key]["other"]
+			return {"found": true, "s": s, "d": _links[other]["frame"]}
+	return {"found": false, "s": null, "d": null}
+
+## Compute the post-teleport player state for crossing S→D (PURE, testable): apply the
+## isometry to the feet position / yaw / velocity, then nudge along D's exit direction up to
+## MAX_STEP_UP cells to find standing room. Returns {ok, position, yaw, velocity}; ok=false
+## (refuse — the player just walks through the quad) when no standing room exists.
+func compute_teleport(s: PortalFrame, d: PortalFrame, feet: Vector3, yaw: float, vel: Vector3) -> Dictionary:
+	var t := PortalMath.isometry(s, d)
+	var new_pos: Vector3 = t * feet
+	var exit_dir := d.global_transform().basis.z    # +front of D (horizontal unit)
+	var chosen := Vector3.INF
+	for step in range(0, MAX_STEP_UP + 1):
+		var cand := new_pos + exit_dir * float(step)
+		if _standing_room(cand):
+			chosen = cand
+			break
+	if chosen == Vector3.INF:
+		return {"ok": false, "position": feet, "yaw": yaw, "velocity": vel}
+	return {
+		"ok": true,
+		"position": chosen,
+		"yaw": wrapf(yaw + PortalMath.yaw_of(t.basis), -PI, PI),
+		"velocity": t.basis * vel,
+	}
+
+## Apply a teleport S→D to the live player (arrival nudge/refusal via compute_teleport).
+## Returns true iff the player moved. Sets the lockout + rearm guard and resets the eye
+## segment so the jump itself is not re-detected as a crossing.
+func _teleport_through(s: PortalFrame, d: PortalFrame) -> bool:
+	var res := compute_teleport(s, d, player.global_position, player.rotation.y, player.velocity)
+	if not res["ok"]:
+		return false
+	player.global_position = res["position"]
+	player.rotation.y = res["yaw"]
+	player.velocity = res["velocity"]
+	_lockout_left = TELEPORT_LOCKOUT
+	_rearm_frame = d
+	_have_prev_eye = false                           # re-establish the segment next frame (no self-cross)
+	return true
+
+## True iff the player can stand at `pos` (feet + head cell both non-solid). Because
+## floor/walls are pure functions of TerrainConfig + edits, this is safe even into
+## not-yet-meshed terrain — the ground holds before the meshes appear (PORTALS §1.3).
+func _standing_room(pos: Vector3) -> bool:
+	if world == null:
+		return true
+	var feet := Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))
+	return not world.cell_solid(feet) and not world.cell_solid(feet + Vector3i(0, 1, 0))
+
+## True iff crossing tests are currently suppressed by the post-teleport lockout.
+func teleport_locked() -> bool:
+	return _lockout_left > 0.0
 
 ## The SubViewport target size for a frame: portal-sized, clamped to [64, MAX_TARGET_PX].
 func _target_px_for(frame: PortalFrame) -> Vector2i:

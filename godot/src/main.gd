@@ -73,6 +73,15 @@ func _ready() -> void:
 	if not CubeSphere.FLAT_WORLD:
 		CosmosBend.set_camera(player.camera_global_transform().origin)
 
+	# COSMOS DEV (task #66): the cube-face BORDER overlay — bright magenta pillars along the home face's
+	# seam edges, so they can be walked up to for M4 crossing tests. Curved-only AND flag-gated; FLAT_WORLD
+	# never reaches here (no chart, no borders) so the default path is byte-identical.
+	if not CubeSphere.FLAT_WORLD and CosmosBorderOverlay.DEV_BORDERS:
+		var borders := CosmosBorderOverlay.new()
+		borders.name = "CosmosBorderOverlay"
+		add_child(borders)
+		borders.setup(world, player)
+
 ## Feed the camera position into the bend-origin global uniform each frame (curved mode only).
 ## The bend is continuous around the camera (§3.4), so walking simply rolls the world under you.
 func _process(_delta: float) -> void:

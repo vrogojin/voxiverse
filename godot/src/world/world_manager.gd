@@ -788,6 +788,25 @@ func install_chart(chart: CosmosChart) -> void:
 func chart() -> CosmosChart:
 	return _chart
 
+## DEV (task #66): the 4 CUBE-FACE BORDER lines of the current home face, in WINDOW space, for the border
+## overlay. The home face spans global i,j ∈ [0, n); the chart maps global (gi,gj) → window (gi−i_org,
+## gj−j_org), so the 4 edges (i=0, i=n, j=0, j=n) are the window lines x=−i_org, x=n−i_org, z=−j_org,
+## z=n−j_org. Recomputed from the LIVE chart (i_org/j_org shift on re-anchor + flip), so callers poll each
+## frame. Returns [] in FLAT_WORLD / with no chart (the overlay is then never built — byte-identical). Each
+## entry: {axis:"x"|"z", pos, lo, hi} — pos is the constant window coord, [lo, hi] the perpendicular extent.
+func cosmos_border_lines() -> Array:
+	if _chart == null:
+		return []
+	var n := float(_chart.n)
+	var x0 := -float(_chart.i_org)
+	var z0 := -float(_chart.j_org)
+	return [
+		{"axis": "x", "pos": x0,     "lo": z0, "hi": z0 + n},   # global i = 0 (WEST edge)
+		{"axis": "x", "pos": x0 + n, "lo": z0, "hi": z0 + n},   # global i = n (EAST edge)
+		{"axis": "z", "pos": z0,     "lo": x0, "hi": x0 + n},   # global j = 0 (SOUTH edge)
+		{"axis": "z", "pos": z0 + n, "lo": x0, "hi": x0 + n},   # global j = n (NORTH edge)
+	]
+
 ## COSMOS M2 (§3.2): re-anchor the floating origin if the player has walked past the trigger.
 ## Returns the WORLD-space shift the caller (the player) must SUBTRACT from its position so the
 ## world stays continuous — Vector3.ZERO when there is no chart or no shift is due (FLAT_WORLD →

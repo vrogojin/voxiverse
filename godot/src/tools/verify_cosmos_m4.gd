@@ -20,6 +20,9 @@ extends SceneTree
 ##   (v7) EDIT RE-MIRROR (both modes) — a pre-flip in-near-radius edit (and a dug-to-air cell) arrive in
 ##        one bulk_inject after ramp_done(), keyed by the correct window cells; an out-of-radius edit does
 ##        not; and the bulk_inject is recorded BEFORE release_cover (§5.1 cover-mode sequencing).
+##   (v8) BORDER OVERLAY LINES (dev task #66) — WorldManager.cosmos_border_lines() equals the chart's four
+##        window-space cube-face edges (x=−i_org, n−i_org; z=−j_org, n−j_org); [] with no chart; and it
+##        recomputes to the NEW face's edges after a home-face flip.
 
 const CS := preload("res://src/cosmos/cube_sphere.gd")
 const CHART := preload("res://src/cosmos/cosmos_chart.gd")
@@ -63,6 +66,7 @@ func _initialize() -> void:
 	_test_default_flag_byte_identity() # (v5)
 	_test_flat_byte_identity()         # (v6)
 	_test_edit_remirror()              # (v7)
+	_test_border_lines()               # (v8)
 	TC.set_active_face(CS.HOME_FACE)
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -294,3 +298,75 @@ func _test_edit_remirror() -> void:
 	_ok(i_inject >= 0 and i_release >= 0 and i_inject < i_release, "bulk_inject is sequenced before release_cover (§5.1)")
 	stub.free()
 	w.free()
+
+# ---------------------------------------------------------------------------------------
+# (v8) Border overlay lines — cosmos_border_lines() equals the chart's cube-face edges (dev task #66).
+# ---------------------------------------------------------------------------------------
+func _test_border_lines() -> void:
+	print("[v8] BORDER OVERLAY LINES — cosmos_border_lines() equals the chart's window-space face edges; [] flat; tracks a flip")
+	# No chart → empty (the overlay is never built; FLAT byte-identical).
+	var w0 := _bare_world()
+	_ok(w0.cosmos_border_lines().is_empty(), "no chart → cosmos_border_lines() is empty (overlay never built)")
+	w0.free()
+
+	var n := CS.n_for(CS.HOME_BODY)
+	var i_org := 4000
+	var j_org := 6000
+	var w := _bare_world()
+	w.install_chart(CHART.new(CS.HOME_BODY, 4, i_org, j_org))
+	var lines := w.cosmos_border_lines()
+	_ok(lines.size() == 4, "four border lines (one per cube-face edge)")
+	var xs := {}
+	var zs := {}
+	for L: Dictionary in lines:
+		if String(L["axis"]) == "x":
+			xs[int(round(float(L["pos"])))] = L
+		else:
+			zs[int(round(float(L["pos"])))] = L
+	_ok(xs.has(-i_org) and xs.has(n - i_org), "the two x-edges are at window x = −i_org and n−i_org")
+	_ok(zs.has(-j_org) and zs.has(n - j_org), "the two z-edges are at window z = −j_org and n−j_org")
+	# The −i_org line must fold to global i = 0 (proves the window-pos convention matches the chart).
+	var edge: Dictionary = xs[-i_org]
+	var g := w.chart().to_global(Vector3i(int(round(float(edge["pos"]))), 5, 0))
+	_ok(int(g["i"]) == 0, "a window cell on the −i_org line folds to global i = 0 (the WEST cube-face edge)")
+	w.free()
+
+	# Track a home-face flip: the borders must recompute to the NEW face's window edges (helps SEE the flip).
+	var w2 := _bare_world()
+	w2.install_chart(CHART.new(CS.HOME_BODY, 4, n - 10, 3000))
+	var west_before := -float((n - 10))                 # WEST edge window x with the pre-flip origin
+	var has_before := false
+	for L: Dictionary in w2.cosmos_border_lines():
+		if String(L["axis"]) == "x" and absf(float(L["pos"]) - west_before) < 0.5:
+			has_before = true
+	_ok(has_before, "pre-flip the WEST edge sits at x = −i_org")
+	var flipped := w2.maybe_flip_home_face(Vector3(80.0, 6.0, 20.0))   # ≥ FLIP_HYST past the EAST edge
+	_ok(flipped, "a home-face flip executes (the border overlay jumps to the new face)")
+	var ch := w2.chart()
+	var lines2 := w2.cosmos_border_lines()
+	var tracks := false
+	for L: Dictionary in lines2:
+		if String(L["axis"]) == "x" and absf(float(L["pos"]) - (-float(ch.i_org))) < 0.5:
+			tracks = true
+	_ok(lines2.size() == 4 and tracks, "after the flip the borders recompute to the NEW face's edges (x = −new i_org)")
+	w2.free()
+
+	# Exercise the overlay NODE itself headless: MultiMesh + bend material build + surface-rooted placement.
+	var w3 := _bare_world()
+	w3.install_chart(CHART.new(CS.HOME_BODY, 4, 200, 200))
+	var dummy := Node3D.new()
+	get_root().add_child(dummy)                          # in-tree so global_position resolves (left at origin)
+	# The overlay node stays OUT of the tree — the smoke test drives _process manually and inspects its
+	# MultiMesh directly, so it needs no rendering server instance (and avoids headless teardown noise).
+	var ov := CosmosBorderOverlay.new()
+	ov.setup(w3, dummy)
+	ov._process(0.016)
+	var mmi: MultiMesh = ov.multimesh
+	_ok(mmi != null and mmi.instance_count > 0, "the overlay builds a MultiMesh with a bounded instance pool (%d)" % (mmi.instance_count if mmi != null else -1))
+	var placed := 0
+	if mmi != null:
+		for k in range(mmi.instance_count):
+			if mmi.get_instance_transform(k).basis.determinant() != 0.0:   # hidden pillars carry a zero basis
+				placed += 1
+	_ok(placed > 0, "the overlay places at least one real pillar near the player (%d of %d)" % [placed, mmi.instance_count if mmi != null else 0])
+	ov.free(); w3.free()                                 # dummy is left for the SceneTree's quit-time cleanup

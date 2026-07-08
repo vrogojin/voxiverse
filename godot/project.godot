@@ -54,22 +54,28 @@ common/max_physics_steps_per_frame=2
 ; (ratio 0.0 -> deterministic + device-independent, never scaling with CPU), sized
 ; to fit the pre-baked pool with headroom for the main + other engine threads:
 ;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
-;         = clamp(floor(0.0 * ...), 2, ...) = 2
+;         = clamp(floor(0.0 * ...), 4, ...) = 4
 ; Fill-speed vs smoothness balance: worldgen is deterministic + per-chunk independent,
-; so worker threads parallelise it safely. The pre-baked pthread pool holds >=3 (3 loaded
-; without deadlock), so raising this needs NO template rebuild — only a re-export.
-; COSMOS throughput experiment: the curved GDScript resolve_cell loop is the steady-state
-; gen bottleneck (Fable), so a 3rd generation worker is ~+50% raw gen rate. Trade-off to
-; watch: it feeds the SINGLE main-thread mesh-apply (threads/main/time_budget_ms below)
-; faster, so if the fill still lags the new choke is mesh-apply, not generation — raise the
-; main budget next, not the worker count. (2 was the smoothness-first default.)
-threads/count/minimum=3
+; so worker threads parallelise it safely. The web template bakes pthreadPoolSize=8
+; (confirmed in the served index.js; the pool is NOT growable — an over-request errors
+; "thread pool is exhausted"), so 4 voxel workers + the main proxy + engine/WorkerThreadPool
+; threads fit comfortably within 8. Raising this needs NO template rebuild — only a re-export.
+; COSMOS throughput: the curved GDScript resolve_cell loop is the steady-state gen bottleneck
+; (Fable). 2→3 was ~+50% raw gen; 3→4 adds another generation worker so the near field after a
+; seam-cross flip fills faster (shrinking the window where a re-cross can still reset). Because
+; the workers feed the SINGLE main-thread mesh-apply, the 4th worker only helps if that apply
+; keeps up — so threads/main/time_budget_ms below is raised in the same step (2 was the
+; original smoothness-first default; 3 was the first throughput bump).
+threads/count/minimum=4
 threads/count/ratio_over_max=0.0
 threads/count/margin_below_max=0
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
 ; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input
-; while streaming, so movement stutters. 4 ms (~24% of a frame) keeps the user loop
-; responsive; finished meshes just apply over a few more frames (fill LOOKS marginally
-; slower, FPS stays smooth — the explicit priority). Not lower: 3 ms noticeably slows
-; the visible fill for little extra smoothness headroom; 4 is the balance point.
-threads/main/time_budget_ms=4
+; while streaming, so movement stutters. This is the DOWNSTREAM choke once >=3 workers
+; generate faster than one frame can apply. Raised 4→6 ms (~36% of a 60fps frame) to let
+; the extra worker's output actually reach the screen faster — the near field fills quicker
+; after a seam-cross flip, at a small, bounded smoothness cost the user explicitly opted into
+; (faster fill > marginal extra smoothness here). Still well under the ~12 ms stutter regime;
+; finished meshes beyond the budget just apply over the next frame. Drop back to 4 if 6 ever
+; reads as choppy.
+threads/main/time_budget_ms=6

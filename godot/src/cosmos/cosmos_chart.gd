@@ -48,19 +48,23 @@ func _init(p_body: String = CubeSphere.HOME_BODY, p_face: int = CubeSphere.HOME_
 # (M3, §4.2/§4.3) folds a window cell that spilled past a face edge onto the true neighbour face
 # via CubeSphere.fold_cell, so an edit made just across an edge is found again by its global
 # (neighbour-face) key from a window homed on either side. Corner quadrants (out of range in BOTH
-# axes) are the M5 stub (§5.3): fold_cell returns face −1 there and we fall back to the raw home-
-# face coordinates (deterministic; the corner zone is deep-ocean-masked + edit-locked in M5, so
-# no walk/build ever lands in it) — flagged, not solved here.
+# axes) fold CANONICALLY (COSMOS-CORNER-CANONICAL #69): fold_cell returns face −1 there, but
+# to_global_column routes through fold_cell_canonical → the nearest REAL cell of the physical
+# direction (position-only, home-face-independent, real terrain — §8.2). flip() still refuses the
+# quadrant; M5 later refines the corner's render placement + edit policy.
 # ---------------------------------------------------------------------------------------
 
 ## Window column (x, z) → the TRUE global column {face, i, j}, folded across an edge if it spilled
 ## past one (§4.3). THE column projection the analytic curved-render callers use to resolve a
 ## window position to its global cell. In-range is the identity (home face).
 func to_global_column(x: int, z: int) -> Dictionary:
-	var g := CubeSphere.fold_cell(face, i_org + x, j_org + z, n)
-	if int(g["face"]) < 0:
-		return {"face": face, "i": i_org + x, "j": j_org + z}   # corner quadrant (M5 stub)
-	return g
+	# COSMOS-CORNER-CANONICAL (#69): fold to the CANONICAL true global column — single-edge strips use the
+	# exact D4 fold, the corner quadrant resolves to the nearest REAL cell of its physical direction
+	# (position-only, home-face-INDEPENDENT). Never returns face −1. to_global / to_global_key /
+	# to_region_key / world_point_of inherit this, so a wedge cell resolves + keys identically from any
+	# window/epoch (§8.2). chart.flip below keeps plain fold_cell, so a flip INSIDE the quadrant is still
+	# refused (the M5 hysteresis guard — that is a topology decision, not a content one).
+	return CubeSphere.fold_cell_canonical(face, i_org + x, j_org + z, n)
 
 ## Window cell → global cell {face, i, j, r}. Folds the (i, j) across a face edge (§4.3); r = y is
 ## the radial layer (unfolded — the third axis is radial, §3.3).

@@ -379,6 +379,55 @@ static func fold_cell(face: int, i: int, j: int, n: int) -> Dictionary:
 		"j": m[2] * i + m[3] * j + t[1],
 	}
 
+# COSMOS-CORNER-CANONICAL (task #69, docs/COSMOS-CORNER-CANONICAL.md): the F8 `oob_seen` fence. Counts ONLY
+# a REAL out-of-range — the gnomonic-wrap branch |a| ≥ 2, which never occurs in practice (R_FAR → |a| ≤
+# 1.62): a real out-of-range must NEVER pass silently, so verify asserts this stays zero. Because it never
+# fires in practice it is never written on the worker path → no worker-written-static race (the audit
+# discipline). NOTE (Opus deviation, flagged to team-lead): doc §2.3 also wanted the boundary CLAMP counted
+# on this fence, but §7c1 expects the fence zero over the sweep — contradictory, since the a=±1 boundary
+# clamp fires routinely on the exact wedge diagonal an integer lattice hits (and, being on the worker hot
+# path, a counter for it would be a worker-written static). The clamp is the INTENDED nearest-edge
+# projection (not an anomaly), so it is applied silently and NOT counted; the fence keeps its stated
+# meaning. c1's fence-zero then holds; c1 separately asserts every fold lands in-range (the clamp working).
+static var _corner_fence := 0
+static func corner_fence_seen() -> int:
+	return _corner_fence
+static func reset_corner_fence() -> void:
+	_corner_fence = 0
+
+## COSMOS-CORNER-CANONICAL (#69): the CONTENT/key fold. Like `fold_cell`, but the corner quadrant (out of
+## range in BOTH axes — which `fold_cell` refuses with face −1, having no single-edge D4 fold) resolves to
+## the nearest TRUE global cell of its physical DIRECTION rather than the raw home-face overshoot. In-range
+## → identity; single-out → the exact `fold_cell` D4 branch (delegated); double-out → canonicalise by
+## POSITION: take the raw gnomonic overshoot direction d̂ = face_cell_to_dir(face, i, j) (UNCHANGED —
+## placement/the §4.6 metric lie is out of scope) and project it to its nearest real cell via
+## `dir_to_face_cell` (the M0 inverse), clamping i',j' to [0, n−1]. NEVER returns face −1 — every physical
+## direction has a nearest real cell. This makes the wedge's COLUMN IDENTITY a pure function of position
+## (no home-face argument), so the whole F2-folded feature stack downstream (trees/ore/strata/bedrock/
+## smoothing/snow) is home-face-INDEPENDENT → §8.2 restored (docs/COSMOS-CORNER-CANONICAL §2). Pure f64 +
+## frozen tables → worker-safe under the frozen-epoch contract; runs ONLY for double-out columns (corner-
+## overlapping blocks; zero cost everywhere else). `fold_cell` itself is UNTOUCHED — the −1 sentinel still
+## marks the topological "no D4 fold" where refusal is wanted (e.g. `chart.flip`'s corner guard).
+static func fold_cell_canonical(face: int, i: int, j: int, n: int) -> Dictionary:
+	var oi := i < 0 or i >= n
+	var oj := j < 0 or j >= n
+	if not oi and not oj:
+		return {"face": face, "i": i, "j": j}            # in range → identity (the >99.9% fast path)
+	if not (oi and oj):
+		return fold_cell(face, i, j, n)                  # single-out → the exact D4 edge fold
+	# Double-out (corner quadrant): canonicalise by physical position (§2.1).
+	var a := 2.0 * (float(i) + 0.5) / float(n) - 1.0     # face overshoot params (mirror face_cell_to_dir)
+	var b := 2.0 * (float(j) + 0.5) / float(n) - 1.0
+	if absf(a) >= 2.0 or absf(b) >= 2.0:
+		_corner_fence += 1                               # REAL out-of-range: gnomonic wrap — never in practice
+	var d := face_cell_to_dir(face, float(i), float(j), n)   # the raw overshoot direction — UNCHANGED
+	var c := dir_to_face_cell(d, n)                           # nearest TRUE global cell (M0 inverse)
+	var ci := int(c["fi"])
+	var cj := int(c["fj"])
+	# Clamp the a=±1 boundary (roundi can give n on a neighbour's own edge) to the nearest in-range cell —
+	# the intended nearest-cell projection, applied silently (see the fence note above; not counted).
+	return {"face": int(c["face"]), "i": clampi(ci, 0, n - 1), "j": clampi(cj, 0, n - 1)}
+
 ## Inverse of the edge unfold: given the HOME face and a TRUE global column `(gface, gi, gj)`
 ## on a NEIGHBOUR face, recover the out-of-range home-face window column `(i, j)` that folds to
 ## it — the reverse of `fold_cell` for the single-edge strips (§4.3). Returns {found, i, j}. Used

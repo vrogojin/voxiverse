@@ -42,6 +42,15 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 # in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
 var _flip_settling := false
 
+# COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
+# this const + the guard in _write_cell) to drop it. When true, a write to a corner-quadrant window cell
+# (double-out on the active chart) is REFUSED — the wedge is a per-window sampling of the canonical
+# terrain (COSMOS-CORNER-CANONICAL §4.2/§4.3), so an edit there has no stable window identity to
+# re-mirror (unfold_to_window returns not-found for the quadrant). Curved-only (guarded on `_chart`), so
+# FLAT_WORLD stays byte-identical. Entangled with corner gate (c4): c4 checks store+read when this is
+# false and refusal when true.
+const CORNER_EDIT_LOCK := true
+
 # The dormant-by-default snowfall SIMULATION (SNOW-ACCUMULATION Decision 4). Owned here and stepped from
 # `_process` on the MAIN thread; it grows/melts the variable-height snow around the player by writing
 # through the ONE choke point (`_write_cell` → `_edits`), so its output is persisted exactly like a
@@ -571,6 +580,13 @@ func place_block(cell: Vector3i, value: int) -> bool:
 ## bulk `try_set_block_data` pass (RMS §3.4) after the overlay is fully written — the overlay
 ## update itself (the gameplay truth) is unconditional.
 func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool = true) -> void:
+	# COSMOS-CORNER-CANONICAL (#69) companion edit-lock (SEPARABLE — see CORNER_EDIT_LOCK). Refuse a write
+	# to a corner-quadrant window cell: the double-out wedge is a per-window sampling of canonical terrain
+	# with no stable window identity to re-mirror. FLAT_WORLD (no chart) never reaches this → byte-identical.
+	if CORNER_EDIT_LOCK and _chart != null \
+			and int(CubeSphere.fold_cell(_chart.face, _chart.i_org + cell.x, _chart.j_org + cell.z,
+				CubeSphere.n_for(CubeSphere.HOME_BODY))["face"]) < 0:
+		return
 	packed = CellCodec.canonical(packed)
 	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
 	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider

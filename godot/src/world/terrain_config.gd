@@ -698,17 +698,16 @@ static func analytic_column_profile(x: int, z: int) -> Vector4:
 ## analytic generated_cell_global. `ctx.face` is set to the folded true face here; the caller reuses
 ## the same ctx (its memo is shared across the block, keyed by (face, i, j)).
 static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx) -> Vector3i:
-	# Fold (gen_face, vx, vz) → the true global column, EXACTLY as CosmosChart.to_global_column does for
-	# the analytic path. A corner quadrant (fold face < 0) falls back to the raw home-face coords — the
-	# same deterministic fallback the chart uses (§5.3 M5 stub; that zone is deep-ocean-masked).
+	# COSMOS-CORNER-CANONICAL (#69): fold (gen_face, vx, vz) → the CANONICAL true global column, EXACTLY as
+	# CosmosChart.to_global_column does for the analytic path (render == physics, rule 1). Single-edge
+	# strips use the exact D4 fold; the corner quadrant resolves to the nearest REAL cell of its physical
+	# direction (position-only, home-face-INDEPENDENT) instead of the old raw home-face overshoot — so the
+	# wedge generates real neighbour terrain identically from any gen_face epoch (§8.2 restored). ctx.face
+	# is always a real face now (never < 0), so every nested stencil/tree/snow read folds on the true face.
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
-	var g := CubeSphere.fold_cell(gen_face, vx, vz, n)
-	var tf := int(g["face"])
-	if tf < 0:
-		ctx.face = gen_face
-		return Vector3i(gen_face, vx, vz)
-	ctx.face = tf
-	return Vector3i(tf, int(g["i"]), int(g["j"]))
+	var g := CubeSphere.fold_cell_canonical(gen_face, vx, vz, n)
+	ctx.face = int(g["face"])
+	return Vector3i(int(g["face"]), int(g["i"]), int(g["j"]))
 
 # ------------------------------------------------------------------------------
 # The composed cell function (WGC §6.2). generated_cell derives the column

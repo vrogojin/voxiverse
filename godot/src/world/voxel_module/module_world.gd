@@ -31,6 +31,10 @@ var _mesher: Object                     # the VoxelMesherBlocky (kept so restrea
 # homed on. Frozen onto each generator instance as `gen_face` at creation; a home-face flip creates a
 # NEW generator (new face) and restreams, rather than mutating the face workers are reading.
 var _gen_face := CubeSphere.HOME_FACE
+# COSMOS-FRAME-ORIENTATION §5.1: the epoch's FROZEN window orientation M_win (row-major [a,b,c,d]). The
+# worker recovers the raw home-face index p = gen_mwin·v from the terrain-local voxel index v (= M_win⁻¹·p)
+# before folding, so the near render lands in the master-face orientation. Identity at spawn → byte-identical.
+var _gen_mwin: Array = [1, 0, 0, 1]
 
 # COSMOS Stage 4 — post-flip view-distance ramp (kills the seam-cross freeze without moving spawn).
 # A home-face flip recreates the VoxelTerrain; jamming its max_view_distance to the full near radius in
@@ -1097,8 +1101,9 @@ func get_generator() -> Object:
 ## WorldManager BEFORE it repositions the node to the new frame. It is forwarded to restream so the flag-on
 ## path can pin the old terrain at its old world spot. The default Vector3.INF means "no old frame supplied"
 ## (the free-immediately path) — keeping the 1-arg call in verify_cosmos_race.gd valid.
-func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
+func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Array = [1, 0, 0, 1]) -> void:
 	_gen_face = face
+	_gen_mwin = mwin                                  # COSMOS-FRAME-ORIENTATION §5.1: freeze the new epoch's M_win
 	restream(old_wrapper_pos)
 
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
@@ -1576,6 +1581,12 @@ var model_count := 0                     # actual baked library model count — 
 # race generation — a flip installs a NEW generator with a new gen_face and restreams (module_world).
 var gen_face := 0
 var gen_n := 0
+# COSMOS-FRAME-ORIENTATION §5.1: this epoch's FROZEN window orientation M_win (row-major ints). The worker
+# recovers the raw index p = M_win·v from the terrain-local voxel index v before folding. Identity at spawn.
+var gen_mwin_a := 1
+var gen_mwin_b := 0
+var gen_mwin_c := 0
+var gen_mwin_d := 1
 var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
@@ -1645,6 +1656,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var rxs   # per-column resolve i (true global column i) — curved only
 	var rzs   # per-column resolve j
 	var rfs   # per-column true face
+	var rjinv # per-column render-frame J⁻¹ quarter-turn (COSMOS-FRAME-ORIENTATION §6)
 	if flat_world:
 		pcache = {}
 		for z in range(size.z):
@@ -1654,15 +1666,25 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				if int(p.x) > max_h: max_h = int(p.x)
 	else:
 		pcache = TerrainConfig.GenCtx.new(gen_face)
+		# COSMOS-FRAME-ORIENTATION §6: this epoch's M_win quarter-turn, once per block — worker_fold_column
+		# folds each column and records J⁻¹ = −(strip_d4 + gen_mwin_d4) so resolve_cell rotates the shape.
+		var gen_mwin_d4 = CubeSphere.d4_of([gen_mwin_a, gen_mwin_b, gen_mwin_c, gen_mwin_d])
 		rxs = PackedInt32Array(); rxs.resize(size.x * size.z)
 		rzs = PackedInt32Array(); rzs.resize(size.x * size.z)
 		rfs = PackedInt32Array(); rfs.resize(size.x * size.z)
+		rjinv = PackedInt32Array(); rjinv.resize(size.x * size.z)   # §6: per-column J⁻¹ (worker_fold_column sets it)
 		for z in range(size.z):
 			for x in range(size.x):
 				var idx = z * size.x + x
-				# Fold (gen_face, voxel column) → true global column ONCE; sets pcache.face to the true face.
-				var tc = TerrainConfig.worker_fold_column(gen_face, ox + x, oz + z, pcache)
-				rfs[idx] = tc.x; rxs[idx] = tc.y; rzs[idx] = tc.z
+				# COSMOS-FRAME-ORIENTATION §5.1: recover the raw home-face index p = gen_mwin·v from the
+				# terrain-local voxel index v = (ox+x, oz+z). Identity M_win → (ox+x, oz+z), byte-identical.
+				var vx = ox + x
+				var vz = oz + z
+				var pi = gen_mwin_a * vx + gen_mwin_b * vz
+				var pj = gen_mwin_c * vx + gen_mwin_d * vz
+				# Fold (gen_face, raw column) → true global column ONCE; sets pcache.face + jinv_d4.
+				var tc = TerrainConfig.worker_fold_column(gen_face, pi, pj, pcache, gen_mwin_d4)
+				rfs[idx] = tc.x; rxs[idx] = tc.y; rzs[idx] = tc.z; rjinv[idx] = pcache.jinv_d4
 				var p = TerrainConfig.column_profile(tc.y, tc.z, pcache)
 				profs[idx] = p
 				if int(p.x) > max_h: max_h = int(p.x)
@@ -1699,8 +1721,15 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			# this column — else resolve_cell re-runs the _corner_targets noise stencil + TreeGen.block_at
 			# tree-gate on all ~100 sub-surface y's of a tall land column (the steady-state gen cost).
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
+			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
 				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache, srun)
+				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
+				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
+				if col_jinv != 0:
+					var vmod = CellCodec.modifier(v)
+					if vmod != 0:
+						v = CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(vmod, col_jinv))
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue
@@ -1863,6 +1892,11 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("flat_world", CubeSphere.FLAT_WORLD)
 	gen.set("gen_face", _gen_face)
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
+	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
+	gen.set("gen_mwin_a", int(_gen_mwin[0]))
+	gen.set("gen_mwin_b", int(_gen_mwin[1]))
+	gen.set("gen_mwin_c", int(_gen_mwin[2]))
+	gen.set("gen_mwin_d", int(_gen_mwin[3]))
 	# The OOB fence upper bound (VDS §8.1): the ACTUAL baked model count, read back from the library
 	# (not _next_arid) so that if a web bake ever truncated the models array below what we appended, the
 	# generator still never writes an index past what the mesher can address. Falls back to _next_arid

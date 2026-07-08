@@ -123,6 +123,52 @@ static func bottom_face_covers(m: int) -> bool:
 static func make_modifier(c00: int, c10: int, c11: int, c01: int, anc: int = 0) -> int:
 	return (c00 & 3) | ((c10 & 3) << 2) | ((c11 & 3) << 4) | ((c01 & 3) << 6) | ((anc & 1) << 8)
 
+# --- D4 orientation rotation (COSMOS-FRAME-ORIENTATION §6) -----------------------
+## Cyclically permute a corner tuple (c00, c10, c11, c01 at cell-local footprint corners
+## (0,0),(1,0),(1,1),(0,1)) by `d4` quarter-turns (0..3). d4 == 1 is a +90° rotation of the
+## index axes (the matrix [[0,-1],[1,0]], atan2(m2,m0) = +90°): the footprint corner at position q
+## moves to R·q, so the NEW corner value at index k is the OLD value at R⁻¹(k). Worked out for the
+## corner ring 0→1→2→3 (c00→c10→c11→c01, counter-clockwise in (x,z)): d4=1 → (c01,c00,c10,c11).
+## The SAME permutation serves BOTH the corner-height family and the FAM SLOPE deltas (identical
+## corner order). rotate⁴ = identity and rot(a)∘rot(b) = rot(a+b) hold by construction (a cyclic
+## shift group), pinned by verify_shape_rot.
+## Public D4 permutation of a corner/delta tuple (c00,c10,c11,c01) by `d4` quarter-turns — the SLOPE-run
+## corner-target rotation the collider path uses (TerrainConfig.rotate_slope_run) so a rotated slope run
+## decodes to the same rotated shape resolve_cell renders. Same permutation as rotate_modifier.
+static func rotate_corners(c: Vector4i, d4: int) -> Vector4i:
+	return _rot_corners(c, d4)
+
+static func _rot_corners(c: Vector4i, d4: int) -> Vector4i:
+	match ((d4 % 4) + 4) % 4:
+		1:
+			return Vector4i(c.w, c.x, c.y, c.z)   # +90°  (c01,c00,c10,c11)
+		2:
+			return Vector4i(c.z, c.w, c.x, c.y)   # 180°  (c11,c01,c00,c10)
+		3:
+			return Vector4i(c.y, c.z, c.w, c.x)   # 270°  (c10,c11,c01,c00)
+	return c                                       # 0° — identity
+
+## Rotate a direction-carrying MODIFIER (16-bit shape field only, NOT the liquid/state axes) by a
+## D4 quarter-turn `d4` (0..3, +90° convention as `_rot_corners`) in the cell's XZ plane. Isotropic
+## shapes are fixed points: modifier 0 (full cube), FAM LAYER (uniform snow). Directional shapes —
+## FAM SLOPE (four signed deltas) and the corner-height family (ramps/wedges/caps) — permute their
+## four corners. Waterlogged composites rotate via their dry shape (this modifier); the liquid FIELD
+## rides the packed value's separate axis and is orientation-free. Pure, table-driven, deterministic
+## (COSMOS-FRAME-ORIENTATION §6.2): rotate(mod, 0) == mod, rotate⁴ == id, rotate(a)∘rotate(b) ==
+## rotate(a+b). Used at the ONE TerrainConfig resolve boundary (§6.3) with d4 = the fold Jacobian J⁻¹.
+static func rotate_modifier(modifier: int, d4: int) -> int:
+	var q := ((d4 % 4) + 4) % 4
+	if q == 0 or modifier == 0:
+		return modifier                            # identity turn, or the isotropic full cube
+	if CellCodec.is_layer(modifier):
+		return modifier                            # uniform LAYER — rotation-invariant
+	if CellCodec.is_slope(modifier):
+		var d := _rot_corners(CellCodec.slope_deltas(modifier), q)
+		return CellCodec.make_slope(d.x, d.y, d.z, d.w)   # canonical (rot of a canonical slope is canonical)
+	# Corner-height family (BOTTOM/TOP anchor is a vertical axis → rotation-invariant).
+	var c := _rot_corners(corners(modifier), q)
+	return make_modifier(c.x, c.y, c.z, c.w, anchor(modifier))
+
 # --- mass / fill fraction (§6) --------------------------------------------------
 
 ## Fill fraction ∈ (0, 1] — the §6 closed form `(2·max(sA,sB) + min(sA,sB)) / 12`,

@@ -341,6 +341,29 @@ static func edge_remap(face: int, side: int, n: int) -> Dictionary:
 	_ensure_edge_table(n)
 	return _edge_cache[n][face * 4 + side]
 
+# --- D4 orientation indices (COSMOS-FRAME-ORIENTATION §5.1/§6) -------------------------------------
+## The quarter-turn index (0..3) of a C4 rotation matrix `m` = [a,b,c,d] (row-major, det +1): the
+## angle atan2(m[2], m[0]) measured in +90° units. Used to express M_win / M_strip / the fold Jacobian
+## J as small ints (C4 is abelian, so composing rotations is d4 addition mod 4). d4=1 is +90° — the
+## same convention ShapeCodec.rotate_modifier uses.
+static func d4_of(m: Array) -> int:
+	var q := int(round(atan2(float(m[2]), float(m[0])) / (PI / 2.0)))
+	return ((q % 4) + 4) % 4
+
+## The strip fold's D4 quarter-turn taking `from_face`'s lattice → `to_face`'s across their shared edge
+## (COSMOS-FRAME-ORIENTATION §6.6 / §5.4). 0 when to_face == from_face (native cell, or a corner wedge
+## the canonical fold clamped back onto the home face). Otherwise it is the D4 of the (unique) edge of
+## `from_face` whose remap lands on `to_face` — so a single-edge fold and a corner-wedge cell both get
+## their strip D4 from the face the fold ACTUALLY RESOLVED to. Total + deterministic on the 24-edge graph.
+static func strip_d4_to(from_face: int, to_face: int, n: int) -> int:
+	if to_face == from_face or from_face < 0 or to_face < 0:
+		return 0
+	for side in 4:
+		var e := edge_remap(from_face, side, n)
+		if int(e["b"]) == to_face:
+			return d4_of(e["m"])
+	return 0                                          # not edge-adjacent (should not happen within the extended window)
+
 ## Fold a window cell that has spilled across exactly ONE face edge back to its true global
 ## (face, i, j). Returns {face, i, j}. In-range cells are the identity. A cell out of range in
 ## BOTH i and j is a corner quadrant (§5.3) — undefined here (handled at M5); this returns

@@ -82,6 +82,9 @@ var _queue: Array = []                     # keys pending build (coarse-first, n
 var _eval_point := Vector2.ZERO
 var _has_eval := false
 var _warned_caps := false
+# COSMOS-FRAME-ORIENTATION §5.3: this epoch's FROZEN window orientation M_win (row-major [a,b,c,d]). Far
+# tiles are BUILT in the node-local (v = M_win⁻¹·p) frame but SAMPLED at p = M_win·v. Identity at spawn.
+var _epoch_mwin: Array = [1, 0, 0, 1]
 
 # active (in-progress) sampling job — the one tile being sampled across frames.
 var _active_key                            # Variant: Vector3i or null
@@ -181,7 +184,7 @@ func invalidate_tiles(_region: Rect2i) -> void:
 ## near field, so we KEEP only fully-in-old-face tiles as a world-fixed cover (horizon stays up behind
 ## the new frame) and FREE the rest. Then adopt the new frame and force a full recompute. Main-thread
 ## only, touches no voxel worker. No-op with no live tiles.
-func rebase_to(new_pos: Vector3) -> void:
+func rebase_to(new_pos: Vector3, mwin: Array = [1, 0, 0, 1]) -> void:
 	if not ENABLED:
 		return
 	var old_pos := position
@@ -195,10 +198,12 @@ func rebase_to(new_pos: Vector3) -> void:
 		var cover := Node3D.new()
 		cover.name = "FarStaleCover"
 		add_child(cover)
-		# Keep every reparented tile at its exact current WORLD position. After self.position = new_pos
-		# below, the cover's world origin must remain old_pos, so cover.position = old_pos − new_pos and
-		# each tile's local (old-frame global) coords are left untouched: world = new_pos + (old_pos −
-		# new_pos) + global_old = old_pos + global_old, its original world spot.
+		# Keep every reparented tile at its exact current WORLD position: cover.position = old_pos − new_pos,
+		# tile local coords untouched. COSMOS-FRAME-ORIENTATION §5.1: under the pinned window orientation
+		# (M_win) a flip is a pure TRANSLATION of the whole frame (org re-based, M_win accumulates the fold so
+		# the window axes do NOT rotate), so this translation-only pinning keeps every cover tile at its
+		# correct world spot BY CONSTRUCTION — the pre-fix bug #2 (the retained cover snap-rotating by the edge
+		# D4) is gone. Frame continuity is pinned by verify_cosmos_frame G-B.
 		cover.position = old_pos - new_pos
 		var kept := 0
 		for key in _live.keys():
@@ -206,7 +211,7 @@ func rebase_to(new_pos: Vector3) -> void:
 			if not is_instance_valid(mi):
 				continue
 			remove_child(mi)
-			if _tile_fully_in_face(key, n):
+			if _tile_fully_in_face(key, n, _epoch_mwin):     # test the OLD epoch's RAW footprint (§5.3)
 				cover.add_child(mi)                          # trustworthy old-home-face tile → cover
 				kept += 1
 			else:
@@ -223,6 +228,7 @@ func rebase_to(new_pos: Vector3) -> void:
 	_active_job = {}
 	_active_done = false
 	position = new_pos
+	_epoch_mwin = mwin                          # COSMOS-FRAME-ORIENTATION §5.3: fresh tiles sample in the new epoch's frame
 	_has_eval = false                          # next update_center recomputes in the new frame
 
 # COSMOS M4 (§5.1): the handoff turbo window. begin_handoff is called by WorldManager right after
@@ -344,11 +350,21 @@ static func _box_max_dist(e: Vector2, lo: Vector2, hi: Vector2) -> float:
 ## tile that straddles a face edge (folds onto a neighbouring side face) or the corner quadrant is
 ## placed by the home face's unfold CONVENTION, which differs after the flip, so it must not be stashed
 ## as cover (Fable bug-B). Footprint units are blocks = tile_m (1 m per cell), same as n.
-static func _tile_fully_in_face(key: Vector3i, n: int) -> bool:
+static func _tile_fully_in_face(key: Vector3i, n: int, mwin: Array = [1, 0, 0, 1]) -> bool:
 	var tile := float(RING_TABLE[key.x]["tile_m"])
 	var lo_x := float(key.y) * tile
 	var lo_z := float(key.z) * tile
-	return lo_x >= 0.0 and lo_x + tile <= float(n) and lo_z >= 0.0 and lo_z + tile <= float(n)
+	# COSMOS-FRAME-ORIENTATION §5.3: the tile footprint is in the node-local (v) frame; test the RAW
+	# footprint p = M_win·v against [0, n]. A C4 M_win maps the axis-aligned box to an axis-aligned box,
+	# so min/max over the 4 corners is exact. Identity M_win → the plain v-frame test (byte-identical).
+	var a := int(mwin[0]); var b := int(mwin[1]); var c := int(mwin[2]); var d := int(mwin[3])
+	var hi_x := lo_x + tile
+	var hi_z := lo_z + tile
+	var xs := [a * lo_x + b * lo_z, a * hi_x + b * lo_z, a * lo_x + b * hi_z, a * hi_x + b * hi_z]
+	var zs := [c * lo_x + d * lo_z, c * hi_x + d * lo_z, c * lo_x + d * hi_z, c * hi_x + d * hi_z]
+	var pminx: float = xs.min(); var pmaxx: float = xs.max()
+	var pminz: float = zs.min(); var pmaxz: float = zs.max()
+	return pminx >= 0.0 and pmaxx <= float(n) and pminz >= 0.0 and pmaxz <= float(n)
 
 # --- no-hole eviction (LOD-DESIGN §4.2) ---------------------------------------
 
@@ -440,7 +456,7 @@ func _start_next() -> bool:
 		if _live.has(key) or not _desired.has(key):
 			continue
 		_active_key = key
-		_active_job = FarMeshBuilder.begin_tile(key.x, Vector2i(key.y, key.z))
+		_active_job = FarMeshBuilder.begin_tile(key.x, Vector2i(key.y, key.z), _epoch_mwin)   # §5.3: sample in the epoch frame
 		_active_done = false
 		return true
 	return false

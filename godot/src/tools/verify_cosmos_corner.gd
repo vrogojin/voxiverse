@@ -34,6 +34,7 @@ func _wedge_col(face: int, sign: Vector2i, depth: int, n: int) -> Vector2i:
 func _gen_col(gen_face: int, vx: int, vz: int) -> Dictionary:
 	var ctx := TC.GenCtx.new(gen_face)
 	var tc: Vector3i = TC.worker_fold_column(gen_face, vx, vz, ctx)
+	ctx.jinv_d4 = 0   # COSMOS-FRAME-ORIENTATION §8 G-E: compare CANONICAL content (§8.2), not the per-home render rotation (G-D covers that)
 	var p: Vector4 = TC.column_profile(tc.y, tc.z, ctx)
 	var srun := TC.slope_run_of(tc.y, tc.z, ctx)
 	var g := int(p.x)

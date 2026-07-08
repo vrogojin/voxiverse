@@ -45,7 +45,7 @@ static func _sea_y() -> float:
 
 ## Start sampling tile `tc` of `ring`: allocate the padded height lattice + interior
 ## colour lattice and a column cursor. Does NO profiling yet — `sample_step` does the work.
-static func begin_tile(ring: int, tc: Vector2i) -> Dictionary:
+static func begin_tile(ring: int, tc: Vector2i, mwin: Array = [1, 0, 0, 1]) -> Dictionary:
 	var rd: Dictionary = FarTerrain.RING_TABLE[ring]
 	var grid := int(rd["grid"])
 	var cell := float(rd["cell_m"])
@@ -63,6 +63,10 @@ static func begin_tile(ring: int, tc: Vector2i) -> Dictionary:
 		"heights": heights, "colors": colors,
 		"cursor": 0, "total": ext * ext,
 		"all_sea": true, "sea_y": _sea_y(),
+		# COSMOS-FRAME-ORIENTATION §5.3: the far node lives in the NODE-LOCAL (v = M_win⁻¹·p) frame, so a
+		# vertex is PLACED at its node-local lattice point but the terrain is SAMPLED at the raw index
+		# p = M_win·v. This is the epoch's FROZEN M_win (row-major [a,b,c,d]); identity → byte-identical.
+		"mwa": int(mwin[0]), "mwb": int(mwin[1]), "mwc": int(mwin[2]), "mwd": int(mwin[3]),
 	}
 
 ## Sample up to `max_cols` padded-lattice columns of `job`. Returns true once the whole
@@ -81,15 +85,19 @@ static func sample_step(job: Dictionary, max_cols: int) -> bool:
 	var heights: PackedFloat32Array = job["heights"]
 	var colors: PackedColorArray = job["colors"]
 	var all_sea := bool(job["all_sea"])
+	var mwa := int(job["mwa"]); var mwb := int(job["mwb"]); var mwc := int(job["mwc"]); var mwd := int(job["mwd"])
 	var end := mini(cursor + max_cols, total)
 	for k in range(cursor, end):
 		var ei := k / ext                       # 0..ext-1  → lattice i = ei-1 (−1..grid+1)
 		var ej := k % ext
 		var i := ei - 1
 		var j := ej - 1
-		var wx := int(origin.x) + i * int(cell)
+		var wx := int(origin.x) + i * int(cell)   # node-local (v-frame) — used for vertex placement
 		var wz := int(origin.y) + j * int(cell)
-		var s := sample_point(wx, wz)
+		# COSMOS-FRAME-ORIENTATION §5.3: sample the terrain at the RAW index p = M_win·v (identity → wx,wz).
+		var px := mwa * wx + mwb * wz
+		var pz := mwc * wx + mwd * wz
+		var s := sample_point(px, pz)
 		heights[k] = float(s["r"])
 		if i >= 0 and i <= grid and j >= 0 and j <= grid:
 			colors[i * side + j] = FarPalette.color_for(
@@ -176,8 +184,8 @@ static func assemble(job: Dictionary) -> Dictionary:
 	}
 
 ## Full build (sample everything + assemble) — used by verify and any non-budgeted caller.
-static func build_arrays(ring: int, tc: Vector2i) -> Dictionary:
-	var job := begin_tile(ring, tc)
+static func build_arrays(ring: int, tc: Vector2i, mwin: Array = [1, 0, 0, 1]) -> Dictionary:
+	var job := begin_tile(ring, tc, mwin)
 	while not sample_step(job, 1 << 20):
 		pass
 	return assemble(job)

@@ -90,13 +90,15 @@ static func _cell(pos: Vector3) -> Vector3i:
 func _surface_h(x: int, z: int) -> int:
 	if _chart == null:
 		return TerrainConfig.height_at(x, z)
-	return TerrainConfig.height_at(_chart.i_org + x, _chart.j_org + z)
+	var p := _chart.raw_of(x, z)                 # COSMOS-FRAME-ORIENTATION §5.3: window→raw via M_win
+	return TerrainConfig.height_at(p.x, p.y)
 
 ## Climate temperature term (column_profile.w) at WINDOW column (x, z), folded to the GLOBAL cell.
 func _climate_w(x: int, z: int) -> float:
 	if _chart == null:
 		return TerrainConfig.column_profile(x, z).w
-	return TerrainConfig.column_profile(_chart.i_org + x, _chart.j_org + z).w
+	var p := _chart.raw_of(x, z)                 # COSMOS-FRAME-ORIENTATION §5.3: window→raw via M_win
+	return TerrainConfig.column_profile(p.x, p.y).w
 
 ## Depth below the surface for a solid cell (0 at top block); -1 if the cell is
 ## air (at or above the surface). Folds the window column → global cell in curved mode.

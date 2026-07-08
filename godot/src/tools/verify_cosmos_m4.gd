@@ -344,11 +344,25 @@ func _test_border_lines() -> void:
 	_ok(flipped, "a home-face flip executes (the border overlay jumps to the new face)")
 	var ch := w2.chart()
 	var lines2 := w2.cosmos_border_lines()
-	var tracks := false
+	_ok(lines2.size() == 4, "four border lines after the flip")
+	# COSMOS-FRAME-ORIENTATION §5.3: under the pinned orientation M_win the window axes can rotate, so the
+	# WEST edge is no longer simply x = −i_org. The invariant that survives: every border line sits exactly
+	# on a RAW cube-face edge — a window cell on the line folds (raw_of) to a coord that is 0 or n.
+	var nn := ch.n
+	var all_on_edge := true
+	var edge_coords := {}
 	for L: Dictionary in lines2:
-		if String(L["axis"]) == "x" and absf(float(L["pos"]) - (-float(ch.i_org))) < 0.5:
-			tracks = true
-	_ok(lines2.size() == 4 and tracks, "after the flip the borders recompute to the NEW face's edges (x = −new i_org)")
+		var mid := int(round((float(L["lo"]) + float(L["hi"])) * 0.5))
+		var wc := Vector2i(int(round(float(L["pos"]))), mid) if String(L["axis"]) == "x" else Vector2i(mid, int(round(float(L["pos"]))))
+		var raw := ch.raw_of(wc.x, wc.y)
+		var on := (raw.x == 0 or raw.x == nn or raw.y == 0 or raw.y == nn)
+		all_on_edge = all_on_edge and on
+		if raw.x == 0: edge_coords["i0"] = true
+		elif raw.x == nn: edge_coords["in"] = true
+		elif raw.y == 0: edge_coords["j0"] = true
+		elif raw.y == nn: edge_coords["jn"] = true
+	_ok(all_on_edge, "after the flip every border line sits on a RAW cube-face edge (M_win-aware, not x = −i_org)")
+	_ok(edge_coords.size() == 4, "the four lines cover all four cube-face edges (i=0, i=n, j=0, j=n)")
 	w2.free()
 
 	# Exercise the overlay NODE itself headless: MultiMesh + bend material build + surface-rooted placement.

@@ -543,6 +543,11 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 # column_profile, which must follow the player when the home face flips (§4.5). WorldManager keeps
 # this in sync with the chart's face (install/flip). FLAT_WORLD never reads it (default HOME_FACE).
 static var _active_face := CubeSphere.HOME_FACE
+# COSMOS-FRAME-ORIENTATION §6: the ANALYTIC path's window orientation, as a quarter-turn index d4(M_win)
+# (0..3). Symmetric with _active_face — WorldManager sets it on chart install / home-face flip. The
+# analytic modifier de-rotation (WM col_* wrappers, generated_cell_global, overlay read/write) reads THIS
+# instead of a mutable matrix. Default 0 (identity) → the flat world + M_win=I curved spawn are unchanged.
+static var _active_mwin_d4 := 0
 
 ## COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 2, F1): the immutable per-generation
 ## snapshot the curved worldgen reads INSTEAD of the mutable global `_active_face`. It carries the cube
@@ -556,6 +561,11 @@ static var _active_face := CubeSphere.HOME_FACE
 class GenCtx extends RefCounted:
 	var face: int = CubeSphere.HOME_FACE
 	var memo: Dictionary = {}
+	# COSMOS-FRAME-ORIENTATION §6: the J⁻¹ quarter-turn (0..3) to rotate this column's directional
+	# modifier from its canonical TRUE-face frame into the current WINDOW render frame. J = M_strip·M_win;
+	# jinv_d4 = −d4(J) mod 4. 0 for a native column at M_win=I → byte-identical. Set per-column by
+	# worker_fold_column (worker) / generated_cell_global (analytic).
+	var jinv_d4: int = 0
 	func _init(p_face: int = CubeSphere.HOME_FACE) -> void:
 		face = p_face
 
@@ -572,6 +582,57 @@ static func set_active_face(f: int) -> void:
 		return
 	_active_face = f
 	_shape_memo.clear()
+
+## The active window orientation quarter-turn d4(M_win) (read-only accessor, §6).
+static func active_mwin_d4() -> int:
+	return _active_mwin_d4
+
+## Set the analytic window orientation d4(M_win) (WorldManager, on chart install / home-face flip). Pure
+## value, no memo dependency (the shape memo keys on face/i/j which are frame-independent; the rotation is
+## applied AFTER a memo read). 0 = identity.
+static func set_active_mwin_d4(d4: int) -> void:
+	_active_mwin_d4 = ((d4 % 4) + 4) % 4
+
+## COSMOS-FRAME-ORIENTATION §6 (Q2d1/d2): the SINGLE atomic setter for the analytic frame (face + M_win),
+## called by WorldManager at chart install AND home-face flip BEFORE any restream/rebuild consumes it — so
+## a rebuild never sees the face updated but the orientation stale. No-op guard on the (face, mwin) PAIR;
+## the shape memo clears ONLY on a face change (it stores CANONICAL, frame-independent values, so a pure
+## M_win change needs no clear — the rotation is applied after the memo read at the window exit).
+static func set_active_frame(face: int, mwin_d4: int) -> void:
+	var mw := ((mwin_d4 % 4) + 4) % 4
+	if face == _active_face and mw == _active_mwin_d4:
+		return
+	if face != _active_face:
+		_active_face = face
+		_shape_memo.clear()
+	_active_mwin_d4 = mw
+
+## The J⁻¹ quarter-turn (0..3) for a raw home-face column `p` under the analytic home face + M_win: the
+## fold from window→true-face is J = M_strip·M_win, and the render modifier is rotate_modifier(canonical,
+## J⁻¹). M_strip's D4 comes from the face fold_cell_canonical resolves `p` to (§6.6 — single edge OR the
+## corner wedge's resolved face). Returns 0 for a native in-range column at M_win=I (byte-identical).
+## COSMOS-FRAME-ORIENTATION §6: the RAW→WINDOW quarter-turn for the COLLIDER light queries. surface_modifier
+## / slope_run_of compute the shape in the RAW home-face index frame (corners assigned in raw i,j order,
+## with the neighbour HEIGHTS already folded to the true face) — NOT canonical. Window↔raw is purely M_win
+## (window w → raw = org + M_win·w), so the raw-frame shape rotates to the window render frame by M_win⁻¹ =
+## (4 − d4(M_win)) mod 4, INDEPENDENT of the strip fold (the strip lives in the height sampling, not the
+## corner assignment). Composed with the raw frame's implicit strip rotation, this equals the canonical
+## render's J⁻¹ exactly (verify_cosmos_arbiter pins render == collider). 0 at M_win=I → byte-identical.
+static func analytic_window_d4() -> int:
+	return (4 - _active_mwin_d4) % 4
+
+static func analytic_jinv_d4(pi: int, pj: int) -> int:
+	if _active_mwin_d4 == 0 and pi >= 0 and pi < _cached_n() and pj >= 0 and pj < _cached_n():
+		return 0                                     # fast path: native column, identity orientation
+	var g := CubeSphere.fold_cell_canonical(_active_face, pi, pj, _cached_n())
+	var strip := CubeSphere.strip_d4_to(_active_face, int(g["face"]), _cached_n())
+	return (4 - ((strip + _active_mwin_d4) % 4)) % 4
+
+static var _n_cache := -1
+static func _cached_n() -> int:
+	if _n_cache < 0:
+		_n_cache = CubeSphere.n_for(CubeSphere.HOME_BODY)
+	return _n_cache
 
 ## The per-column profile Vector4(g, biome, c, t) for lattice column (face, i, j) via 3D noise.
 ## COSMOS M3 (§4.3/§4.4): the direction is taken through LatticeNav, which FOLDS a column that has
@@ -642,6 +703,8 @@ static func generated_cell_global(face: int, i: int, j: int, r: int) -> int:
 	# tree read inside resolve_cell folds neighbours on THIS cell's face (not the mutable `_active_face`).
 	# The worker path (`_generate_block`) does the identical thing with its own frozen ctx, so a
 	# module-generated cell is byte-identical to this analytic cell — render == physics across seams.
+	# COSMOS-FRAME-ORIENTATION §6: generated_cell_global returns the CANONICAL (true-face) value — the
+	# render rotation into the window frame happens at the WM boundary (cell_value_at), not here.
 	var ctx := _acquire_ctx(face)
 	var p := column_profile(i, j, ctx)
 	return resolve_cell(i, r, j, int(p.x), int(p.y), p.z, p.w, ctx)
@@ -697,7 +760,7 @@ static func analytic_column_profile(x: int, z: int) -> Vector4:
 ## strata, tree, smoothing) on the TRUE global column so it is window-independent and identical to the
 ## analytic generated_cell_global. `ctx.face` is set to the folded true face here; the caller reuses
 ## the same ctx (its memo is shared across the block, keyed by (face, i, j)).
-static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx) -> Vector3i:
+static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx, mwin_d4: int = 0) -> Vector3i:
 	# COSMOS-CORNER-CANONICAL (#69): fold (gen_face, vx, vz) → the CANONICAL true global column, EXACTLY as
 	# CosmosChart.to_global_column does for the analytic path (render == physics, rule 1). Single-edge
 	# strips use the exact D4 fold; the corner quadrant resolves to the nearest REAL cell of its physical
@@ -707,6 +770,11 @@ static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx) -> 
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var g := CubeSphere.fold_cell_canonical(gen_face, vx, vz, n)
 	ctx.face = int(g["face"])
+	# COSMOS-FRAME-ORIENTATION §6: record this column's J⁻¹ so resolve_cell rotates its directional
+	# modifier into the window render frame. J = M_strip·M_win; M_strip = the fold to the RESOLVED face
+	# (§6.6 wedge rule — single edge OR the corner wedge's canonically-resolved face). jinv = −d4(J).
+	var strip := CubeSphere.strip_d4_to(gen_face, int(g["face"]), n)
+	ctx.jinv_d4 = (4 - ((strip + mwin_d4) % 4)) % 4
 	return Vector3i(int(g["face"]), int(g["i"]), int(g["j"]))
 
 # ------------------------------------------------------------------------------
@@ -720,9 +788,12 @@ static func generated_cell(x: int, y: int, z: int) -> int:
 	var p := column_profile(x, z)
 	return resolve_cell(x, y, z, int(p.x), int(p.y), p.z, p.w)
 
-## The per-cell pipeline given a column's precomputed profile scalars (g, biome,
-## c, t). Returns the PACKED cell value (== bare material id today; sub-voxel adds
-## modifiers later). This is the single hot function both render paths share.
+## The per-cell pipeline given a column's precomputed profile scalars (g, biome, c, t). Returns the PACKED
+## cell value. THE single hot function both render paths share. COSMOS-FRAME-ORIENTATION §6: resolve_cell
+## speaks CANONICAL (true-face frame) — it does NOT rotate. The window render rotation (J⁻¹) is applied at
+## the WINDOW EXITS only: the module worker's buffer write (module_world, via the frozen per-column J⁻¹) and
+## the WM analytic boundary (cell_value_at + the col_* collider wrappers). This keeps TerrainConfig
+## frame-independent, so the shape memo caches canonical values and no stale J is ever embedded (§6.3/Q2d3).
 static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t: float, pcache = null, slope_run: int = -1) -> int:
 	if not _ids_ready:
 		_ensure_ids()
@@ -1184,6 +1255,17 @@ static func _slope_run_targets(r: int, g: int) -> Vector4i:
 ## True iff a packed slope run is a firing column.
 static func slope_run_fires(r: int) -> bool:
 	return (r >> 16) & 1 != 0
+
+## COSMOS-FRAME-ORIENTATION §6: rotate a packed SLOPE run's four corner codes by `d4` quarter-turns, so a
+## collider-path run (col_slope_run_of) decodes to the SAME rotated slope resolve_cell renders — render ==
+## collision preserved. lo/hi (min/max of the codes) are permutation-invariant, so the run's vertical extent
+## is unchanged. Non-firing run / d4 == 0 → unchanged (identity → byte-identical).
+static func rotate_slope_run(r: int, d4: int) -> int:
+	if d4 % 4 == 0 or not slope_run_fires(r):
+		return r
+	var c := Vector4i(r & 15, (r >> 4) & 15, (r >> 8) & 15, (r >> 12) & 15)
+	var rc := ShapeCodec.rotate_corners(c, d4)
+	return (1 << 16) | (rc.w << 12) | (rc.z << 8) | (rc.y << 4) | rc.x
 
 ## The [lo, hi) run cell range of a packed slope run given g (cells [lo, hi−1] carry slope material).
 static func slope_run_range(r: int, g: int) -> Vector2i:

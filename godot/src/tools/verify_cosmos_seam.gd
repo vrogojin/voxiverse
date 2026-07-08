@@ -105,6 +105,7 @@ func _initialize() -> void:
 func _gen_full_column(gen_face: int, vx: int, vz: int) -> Dictionary:
 	var ctx := TC.GenCtx.new(gen_face)
 	var tc: Vector3i = TC.worker_fold_column(gen_face, vx, vz, ctx)   # corner wedge → raw (gen_face, vx, vz)
+	ctx.jinv_d4 = 0   # COSMOS-FRAME-ORIENTATION §8 G-E: compare CANONICAL content (§8.2), not the per-home render rotation
 	var p: Vector4 = TC.column_profile(tc.y, tc.z, ctx)
 	var srun := TC.slope_run_of(tc.y, tc.z, ctx)
 	var g := int(p.x)

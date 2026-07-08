@@ -34,6 +34,19 @@ var j_org: int          # floating-origin cell j
 var n: int              # cells per face edge for `body` (cached)
 var radius: int         # datum radius R in blocks for `body` (cached)
 
+## COSMOS-FRAME-ORIENTATION §5.1 — the PERSISTENT WINDOW ORIENTATION `M_win ∈ C4` (a 2×2 integer
+## D4 rotation, det +1), row-major [[a,b],[c,d]]. It redefines the window↔raw-index bijection
+## `p = org + M_win·w` so the SCENE renders in the master face's orientation for the whole session:
+## a flip accumulates the crossed edge's fold matrix (`M_win ← M_f·M_win`) instead of letting the
+## window silently re-base onto a rotated neighbour lattice. Result: flips AND reanchors are BOTH
+## pure translations of every node → retained covers/debris/player stay aligned by construction
+## (bug #2 fix). `M_win = I` at spawn on the master face 4, and every formula reduces to today's
+## identity mapping when `M_win = I` → the flat world and the pre-fix curved spawn are byte-identical.
+var mw_a: int = 1       # M_win = [[mw_a, mw_b], [mw_c, mw_d]]; identity at spawn
+var mw_b: int = 0
+var mw_c: int = 0
+var mw_d: int = 1
+
 func _init(p_body: String = CubeSphere.HOME_BODY, p_face: int = CubeSphere.HOME_FACE,
 		p_i_org: int = 0, p_j_org: int = 0) -> void:
 	body = p_body
@@ -42,6 +55,35 @@ func _init(p_body: String = CubeSphere.HOME_BODY, p_face: int = CubeSphere.HOME_
 	j_org = p_j_org
 	n = CubeSphere.n_for(body)
 	radius = CubeSphere.radius_for(body)
+
+# ---------------------------------------------------------------------------------------
+# M_win — the window orientation bijection (COSMOS-FRAME-ORIENTATION §5.1). p = org + M_win·w.
+# M_win ∈ C4 is orthogonal with det +1, so M_win⁻¹ = M_winᵀ = [[a,c],[b,d]] (exact integers).
+# ---------------------------------------------------------------------------------------
+
+## The window cell (x, z) → its RAW home-face index (i, j) = org + M_win·w. THE single conversion
+## every window→face-index consumer routes through (§5.3), so the orientation lives in ONE place.
+## M_win = I → (i_org + x, j_org + z), byte-identical to the pre-fix convention.
+func raw_of(x: int, z: int) -> Vector2i:
+	return Vector2i(i_org + mw_a * x + mw_b * z, j_org + mw_c * x + mw_d * z)
+
+## Inverse: a RAW home-face index (i, j) → the window cell (x, z) = M_win⁻¹·(p − org). Uses the
+## transpose (M_win is an orthogonal det+1 integer matrix). M_win = I → (i − i_org, j − j_org).
+func window_of(gi: int, gj: int) -> Vector2i:
+	var pi := gi - i_org
+	var pj := gj - j_org
+	return Vector2i(mw_a * pi + mw_c * pj, mw_b * pi + mw_d * pj)
+
+## The render node's world-space origin: a node whose local coords are the ROTATED raw index
+## `v = M_win⁻¹·p` must sit at position `−M_win⁻¹·org` so that scene(window) x,z == world x,z
+## (scene == window preserved). M_win = I → (−i_org, 0, −j_org), today's node position exactly.
+func node_origin() -> Vector3:
+	return Vector3(-(mw_a * i_org + mw_c * j_org), 0.0, -(mw_b * i_org + mw_d * j_org))
+
+## The 4 ints of M_win (row-major [a,b,c,d]) — for the generator epoch freeze (`gen_mwin`, §5.1)
+## and the M-algebra gates. det is always +1.
+func m_win() -> Array:
+	return [mw_a, mw_b, mw_c, mw_d]
 
 # ---------------------------------------------------------------------------------------
 # The window↔global bijection (§3.1/§4.3). Identity fold within the home face; the EDGE UNFOLD
@@ -64,7 +106,9 @@ func to_global_column(x: int, z: int) -> Dictionary:
 	# to_region_key / world_point_of inherit this, so a wedge cell resolves + keys identically from any
 	# window/epoch (§8.2). chart.flip below keeps plain fold_cell, so a flip INSIDE the quadrant is still
 	# refused (the M5 hysteresis guard — that is a topology decision, not a content one).
-	return CubeSphere.fold_cell_canonical(face, i_org + x, j_org + z, n)
+	# COSMOS-FRAME-ORIENTATION §5.3: window→raw index routes through M_win (raw_of); identity when M_win=I.
+	var p := raw_of(x, z)
+	return CubeSphere.fold_cell_canonical(face, p.x, p.y, n)
 
 ## Window cell → global cell {face, i, j, r}. Folds the (i, j) across a face edge (§4.3); r = y is
 ## the radial layer (unfolded — the third axis is radial, §3.3).
@@ -101,7 +145,9 @@ func window_of_global(gface: int, gi: int, gj: int) -> Dictionary:
 	var w := CubeSphere.unfold_to_window(face, gface, gi, gj, n)
 	if not bool(w["found"]):
 		return {"found": false, "x": 0, "z": 0}
-	return {"found": true, "x": int(w["i"]) - i_org, "z": int(w["j"]) - j_org}
+	# COSMOS-FRAME-ORIENTATION §5.3: raw index → window via M_win⁻¹ (window_of); identity when M_win=I.
+	var win := window_of(int(w["i"]), int(w["j"]))
+	return {"found": true, "x": win.x, "z": win.y}
 
 # ---------------------------------------------------------------------------------------
 # Re-anchoring — the integer origin shift (§3.2).
@@ -124,8 +170,11 @@ func needs_reanchor(local: Vector3) -> bool:
 func reanchor(local: Vector3) -> Vector2i:
 	var di := int(floor(local.x))
 	var dj := int(floor(local.z))
-	i_org += di
-	j_org += dj
+	# COSMOS-FRAME-ORIENTATION §5.1: the origin moves by M_win·Δ (raw-index space) while the caller
+	# still subtracts the WINDOW Δ from window positions — so every node stays a pure −Δ translation
+	# (node_origin shifts by exactly −Δ) and M_win is untouched. M_win = I → i_org+=di, j_org+=dj.
+	i_org += mw_a * di + mw_b * dj
+	j_org += mw_c * di + mw_d * dj
 	return Vector2i(di, dj)
 
 # ---------------------------------------------------------------------------------------
@@ -142,9 +191,10 @@ const FLIP_HYST := 64
 ## column on the current home face has run out of [0, N) by more than the hysteresis (§4.5). The
 ## flip is deferred this far so play continues on the extended window across the seam with no event.
 func flip_needed(local: Vector3) -> bool:
-	var gi := i_org + int(floor(local.x))
-	var gj := j_org + int(floor(local.z))
-	return gi >= n + FLIP_HYST or gi < -FLIP_HYST or gj >= n + FLIP_HYST or gj < -FLIP_HYST
+	# COSMOS-FRAME-ORIENTATION §5.3: the out-of-range test is on the RAW index (org + M_win·w), so
+	# route through raw_of. M_win = I → (i_org + floor x, j_org + floor z), today's test exactly.
+	var p := raw_of(int(floor(local.x)), int(floor(local.z)))
+	return p.x >= n + FLIP_HYST or p.x < -FLIP_HYST or p.y >= n + FLIP_HYST or p.y < -FLIP_HYST
 
 ## Perform the home-face flip: fold the player's out-of-range global column to the true neighbour
 ## face and re-base the window onto it, KEEPING the player's window position unchanged so the world
@@ -155,19 +205,21 @@ func flip_needed(local: Vector3) -> bool:
 func flip(local: Vector3) -> Dictionary:
 	var wx := int(floor(local.x))
 	var wz := int(floor(local.z))
-	var gi := i_org + wx
-	var gj := j_org + wz
+	# The player's RAW home-face index p_p = org + M_win·w_p (raw_of), then folded to the neighbour.
+	var p := raw_of(wx, wz)
+	var gi := p.x
+	var gj := p.y
 	var g := CubeSphere.fold_cell(face, gi, gj, n)
 	var b := int(g["face"])
 	if b < 0:
-		return {"ok": false, "from_face": face, "to_face": face, "yaw": 0.0}   # corner quadrant — M5
+		return {"ok": false, "from_face": face, "to_face": face}   # corner quadrant — M5
 	var from_face := face
-	# #71: the crossed edge's D4 remap carries a ROTATION (the new home face's lattice is a 0/90/180/270°
-	# rotation of the old at the shared edge). The player's window position stays continuous (below), but its
-	# HEADING is expressed in the window (i,j)=(x,z) axes, which just rotated — so return that rotation as a
-	# yaw so the caller counter-rotates the player and keeps look + motion continuous across the crossing (no
-	# view snap). yaw = atan2(m2, m0) where M=[[m0,m1],[m2,m3]] is the exact edge_remap D4 acting on (x,z);
-	# pure rotation (det +1) on every edge, so a plain yaw compensates it with no handedness flip.
+	# COSMOS-FRAME-ORIENTATION §5.1: ACCUMULATE the crossed edge's D4 fold matrix M_f into M_win
+	# (M_win ← M_f·M_win) instead of letting the window silently re-base onto the rotated neighbour
+	# lattice. The (★)-algebra (§2) then makes the window coordinate of EVERY physical cell continuous
+	# across the flip — the scene frame does not rotate — so covers/debris/player need no compensation
+	# (Fix A #71 deletes; its D4 extraction survives HERE as the accumulation step). M_f = edge_remap's
+	# affine linear part [[m0,m1],[m2,m3]] (the exact matrix fold_cell applies), det +1 on every edge.
 	var side := CubeSphere.SIDE_EAST
 	if gi >= n:
 		side = CubeSphere.SIDE_EAST
@@ -178,14 +230,16 @@ func flip(local: Vector3) -> Dictionary:
 	else:
 		side = CubeSphere.SIDE_SOUTH
 	var m: Array = CubeSphere.edge_remap(face, side, n)["m"]
-	# NEGATED: M rotates the (i,j) index vectors; the player's heading is a Godot yaw about +Y over the
-	# (x,z)=(i,j) window plane, whose handedness is opposite the index rotation — so the compensating yaw is
-	# −atan2(m2, m0). Verified by verify_cosmos_turn (the ±90° EAST/WEST edges are the sign-sensitive ones).
-	var yaw := -atan2(float(m[2]), float(m[0]))
-	# Re-base: window (wx, wz) must map to the same true global cell (b, gi, gj) on the new face, so
-	# the player does not move. On the new home face b the fold is the identity in range, so choosing
-	# i_org' = gi − wx, j_org' = gj − wz makes window (wx, wz) → (b, gi, gj) exactly.
+	# M_win_new = M_f · M_win_old (row-major 2×2 integer product).
+	var na := int(m[0]) * mw_a + int(m[1]) * mw_c
+	var nb := int(m[0]) * mw_b + int(m[1]) * mw_d
+	var nc := int(m[2]) * mw_a + int(m[3]) * mw_c
+	var nd := int(m[2]) * mw_b + int(m[3]) * mw_d
+	mw_a = na; mw_b = nb; mw_c = nc; mw_d = nd
+	# Re-base the origin so the player's window cell (wx, wz) still maps to the SAME true global cell
+	# (b, g.i, g.j): org ← g_p − M_win_new·w_p. Then raw_of(wx,wz) = g_p on face b → identity fold →
+	# the player does not move, and by (★)-algebra every other window cell is continuous too.
 	face = b
-	i_org = int(g["i"]) - wx
-	j_org = int(g["j"]) - wz
-	return {"ok": true, "from_face": from_face, "to_face": b, "yaw": yaw}
+	i_org = int(g["i"]) - (mw_a * wx + mw_b * wz)
+	j_org = int(g["j"]) - (mw_c * wx + mw_d * wz)
+	return {"ok": true, "from_face": from_face, "to_face": b}

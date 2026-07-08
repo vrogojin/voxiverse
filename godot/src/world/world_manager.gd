@@ -42,11 +42,6 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 # in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
 var _flip_settling := false
 
-# #71: yaw (radians) of the MOST RECENT home-face flip = the crossed edge's D4 rotation. The player reads
-# it via last_flip_yaw() when maybe_flip_home_face returns true and counter-rotates its heading + velocity,
-# so a seam crossing does not snap the view by 90/180/270°. 0.0 when no flip / a 0°-edge flip.
-var _last_flip_yaw := 0.0
-
 # COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
 # this const + the guard in _write_cell) to drop it. When true, a write to a corner-quadrant window cell
 # (double-out on the active chart) is REFUSED — the wedge is a per-window sampling of the canonical
@@ -109,7 +104,7 @@ func _ready() -> void:
 	# walks. FLAT_WORLD (the default) leaves `_chart` null → Vector3i keying → byte-identical.
 	if not CubeSphere.FLAT_WORLD:
 		_chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
-		TerrainConfig.set_active_face(_chart.face)
+		TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win
 		environment.set_chart(_chart)
 
 	if ClassDB.class_exists("VoxelTerrain"):
@@ -140,7 +135,7 @@ func _ready() -> void:
 		# Stage 1). At spawn the chart is at (0,0) → ZERO; kept in lockstep on re-anchor/flip below.
 		# FLAT_WORLD (no chart) leaves it at ZERO → byte-identical to the pre-COSMOS far layer.
 		if _chart != null:
-			_far.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
+			_far.position = _chart.node_origin()      # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org (=−org at spawn)
 
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
@@ -226,14 +221,46 @@ func initial_view_meshed(center: Vector3) -> bool:
 func cell_value_at(cell: Vector3i) -> int:
 	var e: int = _edits.get(_edit_key(cell), -1)
 	if e >= 0:
-		return e                                    # overlay (already canonical)
+		return _overlay_window_modifier(cell, e)    # overlay: de-canon the directional modifier into the window frame (§6.4)
 	if _chart == null:
 		return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
 	# COSMOS M2 (§3.1/§8.2): fold the window cell to its GLOBAL cell FIRST, then generate. Worldgen
 	# is thereby a pure function of the global cell — window-INDEPENDENT — so it is byte-identical
 	# no matter where the chart is anchored (the determinism the far-from-spawn streaming needs).
 	var g := _chart.to_global(cell)
-	return TerrainConfig.generated_cell_global(int(g["face"]), int(g["i"]), int(g["j"]), int(g["r"]))
+	var v := TerrainConfig.generated_cell_global(int(g["face"]), int(g["i"]), int(g["j"]), int(g["r"]))
+	# COSMOS-FRAME-ORIENTATION §6: generated_cell_global is CANONICAL (true-face); rotate its directional
+	# modifier into the window render frame HERE (the WM analytic boundary — the window cell is in hand so J
+	# is derivable via the chart; the folded-true-cell inside TerrainConfig cannot derive it). No-op for a
+	# full cube / identity orientation → byte-identical. Pairs with the overlay de-canon above.
+	var m := CellCodec.modifier(v)
+	if m == 0:
+		return v
+	var p := _chart.raw_of(cell.x, cell.z)
+	return CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(m, TerrainConfig.analytic_jinv_d4(p.x, p.y)))
+
+## COSMOS-FRAME-ORIENTATION §6.4: the overlay stores a placed DIRECTIONAL modifier in its CANONICAL
+## (true-face) frame so it keeps its physical direction across a future home-face flip. These two helpers
+## convert between the stored canonical frame and the CURRENT window render frame (jinv on read, J = −jinv
+## on write). BOTH are a no-op for a full cube (modifier 0 — everything the hotbar places today), no chart,
+## or identity orientation, so current gameplay + verify_feature's break/place loop stay byte-identical.
+func _overlay_window_modifier(cell: Vector3i, v: int) -> int:
+	if _chart == null or v <= 0 or CellCodec.modifier(v) == 0:
+		return v
+	var p := _chart.raw_of(cell.x, cell.z)
+	var jinv := TerrainConfig.analytic_jinv_d4(p.x, p.y)
+	if jinv == 0:
+		return v
+	return CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(CellCodec.modifier(v), jinv))
+
+func _overlay_canon_modifier(cell: Vector3i, v: int) -> int:
+	if _chart == null or v <= 0 or CellCodec.modifier(v) == 0:
+		return v
+	var p := _chart.raw_of(cell.x, cell.z)
+	var jinv := TerrainConfig.analytic_jinv_d4(p.x, p.y)
+	if jinv == 0:
+		return v
+	return CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(CellCodec.modifier(v), (4 - jinv) % 4))
 
 ## COSMOS M2 (§1.3): THE overlay key for a window cell. FLAT_WORLD / no chart → the Vector3i window
 ## cell itself (byte-identical to the pre-M2 store). Curved → the 43-bit GLOBAL edit key, so an edit
@@ -444,7 +471,7 @@ func effective_height(x: int, z: int) -> int:
 # read TerrainConfig column functions on WINDOW coordinates. In curved mode a window column is NOT
 # its global column (the floating origin offsets it, and near a seam it folds to a NEIGHBOUR face),
 # so these MUST resolve the GLOBAL cell first or they build/read the wrong column at a non-zero
-# origin. These wrappers fold window (x, z) → global (i_org+x, j_org+z) — the edge fold happens
+# origin. These wrappers convert window (x, z) → raw index via chart.raw_of (M_win, §5.3) — the edge fold happens
 # inside TerrainConfig via LatticeNav when the column spills past an edge. FLAT_WORLD / no chart →
 # the direct TerrainConfig call (byte-identical to the pre-M3 flat world).
 
@@ -453,39 +480,49 @@ func effective_height(x: int, z: int) -> int:
 func col_height(x: int, z: int) -> int:
 	if _chart == null:
 		return TerrainConfig.height_at(x, z)
-	return TerrainConfig.height_at(_chart.i_org + x, _chart.j_org + z)
+	var p := _chart.raw_of(x, z)                 # COSMOS-FRAME-ORIENTATION §5.3: window→raw via M_win
+	return TerrainConfig.height_at(p.x, p.y)
 
 ## Column profile Vector4(g, biome, c, t) at WINDOW column (x, z), resolved on the GLOBAL cell.
 func col_profile(x: int, z: int, pcache = null) -> Vector4:
 	if _chart == null:
 		return TerrainConfig.column_profile(x, z, pcache)
-	return TerrainConfig.column_profile(_chart.i_org + x, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	return TerrainConfig.column_profile(p.x, p.y, pcache)
 
 ## Smoothing SURFACE modifier at WINDOW column (x, z), resolved on the GLOBAL cell (GroundCollider).
 func col_surface_modifier(x: int, z: int, pcache = null) -> int:
 	if _chart == null:
 		return TerrainConfig.surface_modifier(x, z, pcache)
-	return TerrainConfig.surface_modifier(_chart.i_org + x, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	# COSMOS-FRAME-ORIENTATION §6: rotate the directional modifier into the window render frame so the
+	# collider matches the mesh (resolve_cell rotates identically). Identity jinv → byte-identical.
+	return ShapeCodec.rotate_modifier(TerrainConfig.surface_modifier(p.x, p.y, pcache), TerrainConfig.analytic_window_d4())
 
 ## Smoothing CAP modifier at WINDOW column (x, z), resolved on the GLOBAL cell (GroundCollider).
 func col_surface_cap_modifier(x: int, z: int, pcache = null) -> int:
 	if _chart == null:
 		return TerrainConfig.surface_cap_modifier(x, z, pcache)
-	return TerrainConfig.surface_cap_modifier(_chart.i_org + x, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	return ShapeCodec.rotate_modifier(TerrainConfig.surface_cap_modifier(p.x, p.y, pcache), TerrainConfig.analytic_window_d4())
 
 ## Packed snow stack (SNOW-ACCUMULATION §3.4) at WINDOW column (x, z), resolved on the GLOBAL cell so
 ## the collider's snow fill matches the surface/cap it folds. Byte-identical to TerrainConfig in flat mode.
 func col_snow_stack_at(x: int, z: int, pcache = null) -> int:
 	if _chart == null:
 		return TerrainConfig.snow_stack_at(x, z, pcache)
-	return TerrainConfig.snow_stack_at(_chart.i_org + x, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	return TerrainConfig.snow_stack_at(p.x, p.y, pcache)
 
 ## Packed SLOPE run (SHARP-SLOPE §3.6) at WINDOW column (x, z), resolved on the GLOBAL cell (the run
 ## decode via slope_run_range/_modifier_at is pure arithmetic, so only this column fetch needs folding).
 func col_slope_run_of(x: int, z: int, pcache = null) -> int:
 	if _chart == null:
 		return TerrainConfig.slope_run_of(x, z, pcache)
-	return TerrainConfig.slope_run_of(_chart.i_org + x, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	# COSMOS-FRAME-ORIENTATION §6: rotate the run's corner codes so the collider decodes the same rotated
+	# slope the mesh renders (render == collision). lo/hi unchanged. Identity jinv → byte-identical.
+	return TerrainConfig.rotate_slope_run(TerrainConfig.slope_run_of(p.x, p.y, pcache), TerrainConfig.analytic_window_d4())
 
 ## The tree-overlay block at WINDOW cell (x, y, z), resolved on the GLOBAL column. FLAT_WORLD →
 ## direct. Curved: keyed on the global (i, j) so the same tree is seen from any window/origin (the
@@ -493,13 +530,17 @@ func col_slope_run_of(x: int, z: int, pcache = null) -> int:
 func tree_block_at(x: int, y: int, z: int, pcache = null) -> int:
 	if _chart == null:
 		return TreeGen.block_at(x, y, z, pcache)
-	return TreeGen.block_at(_chart.i_org + x, y, _chart.j_org + z, pcache)
+	var p := _chart.raw_of(x, z)
+	return TreeGen.block_at(p.x, y, p.y, pcache)
 
 ## The raw overlay value at WINDOW cell (folds to the global edit key), or −1 if unedited. THE
 ## point accessor the collider uses instead of `placed_cells().get(Vector3i, −1)` — that dict is
 ## GLOBAL-keyed in curved mode, so a window-Vector3i lookup would always miss (§1.3).
 func overlay_at(cell: Vector3i) -> int:
-	return _edits.get(_edit_key(cell), -1)
+	var e: int = _edits.get(_edit_key(cell), -1)
+	if e < 0:
+		return e
+	return _overlay_window_modifier(cell, e)         # §6.4: de-canon into the window frame for the collider
 
 ## Break the block at `cell` (terrain, layers, tree cells, placed blocks alike).
 ## Returns the BROKEN BLOCK ID (>0) on success, 0 if the cell was already air.
@@ -588,10 +629,11 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	# COSMOS-CORNER-CANONICAL (#69) companion edit-lock (SEPARABLE — see CORNER_EDIT_LOCK). Refuse a write
 	# to a corner-quadrant window cell: the double-out wedge is a per-window sampling of canonical terrain
 	# with no stable window identity to re-mirror. FLAT_WORLD (no chart) never reaches this → byte-identical.
-	if CORNER_EDIT_LOCK and _chart != null \
-			and int(CubeSphere.fold_cell(_chart.face, _chart.i_org + cell.x, _chart.j_org + cell.z,
+	if CORNER_EDIT_LOCK and _chart != null:
+		var _cp := _chart.raw_of(cell.x, cell.z)     # COSMOS-FRAME-ORIENTATION §5.3: window→raw via M_win
+		if int(CubeSphere.fold_cell(_chart.face, _cp.x, _cp.y,
 				CubeSphere.n_for(CubeSphere.HOME_BODY))["face"]) < 0:
-		return
+			return
 	packed = CellCodec.canonical(packed)
 	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
 	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider
@@ -606,7 +648,9 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 			block_entity_orphaned.emit(cell, old_meta)
 	if not _edits.has(ek):
 		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
-	_edits[ek] = packed
+	# COSMOS-FRAME-ORIENTATION §6.4: store the directional modifier in its CANONICAL (true-face) frame so
+	# it survives a flip; PAINT the window-frame value (the current render). No-op for a full cube.
+	_edits[ek] = _overlay_canon_modifier(cell, packed)
 	if paint:
 		_paint_cell(cell, packed)
 
@@ -801,7 +845,7 @@ func _paint_cell(cell: Vector3i, packed: int) -> void:
 func install_chart(chart: CosmosChart) -> void:
 	_chart = chart
 	if chart != null:
-		TerrainConfig.set_active_face(chart.face)
+		TerrainConfig.set_active_frame(chart.face, CubeSphere.d4_of(chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1)
 		if environment != null:
 			environment.set_chart(chart)
 
@@ -809,30 +853,56 @@ func install_chart(chart: CosmosChart) -> void:
 func chart() -> CosmosChart:
 	return _chart
 
-## #71: the yaw (radians) the caller must add to the player's heading after the MOST RECENT flip (the
-## crossed edge's D4 rotation), so look + motion stay continuous. Read once, right after maybe_flip_home_face
-## returns true. 0.0 in FLAT_WORLD / when no flip happened.
-func last_flip_yaw() -> float:
-	return _last_flip_yaw
-
 ## DEV (task #66): the 4 CUBE-FACE BORDER lines of the current home face, in WINDOW space, for the border
-## overlay. The home face spans global i,j ∈ [0, n); the chart maps global (gi,gj) → window (gi−i_org,
-## gj−j_org), so the 4 edges (i=0, i=n, j=0, j=n) are the window lines x=−i_org, x=n−i_org, z=−j_org,
-## z=n−j_org. Recomputed from the LIVE chart (i_org/j_org shift on re-anchor + flip), so callers poll each
-## frame. Returns [] in FLAT_WORLD / with no chart (the overlay is then never built — byte-identical). Each
-## entry: {axis:"x"|"z", pos, lo, hi} — pos is the constant window coord, [lo, hi] the perpendicular extent.
+## overlay. The home face spans raw i,j ∈ [0, n]; each edge's two endpoints map to window space through the
+## chart (COSMOS-FRAME-ORIENTATION §5.3: window = M_win⁻¹·(raw − org), the `window_of` helper). A C4 M_win
+## keeps every edge axis-aligned but may SWAP which window axis it is constant along, so derive axis/pos/lo/hi
+## from the mapped endpoints rather than assuming i↔x. M_win = I reproduces the old x=−i_org … lines exactly.
+## Recomputed from the LIVE chart (org + M_win shift on re-anchor + flip), so callers poll each frame. Returns
+## [] in FLAT_WORLD / with no chart. Each entry: {axis:"x"|"z", pos, lo, hi} — pos the constant window coord.
 func cosmos_border_lines() -> Array:
 	if _chart == null:
 		return []
-	var n := float(_chart.n)
-	var x0 := -float(_chart.i_org)
-	var z0 := -float(_chart.j_org)
-	return [
-		{"axis": "x", "pos": x0,     "lo": z0, "hi": z0 + n},   # global i = 0 (WEST edge)
-		{"axis": "x", "pos": x0 + n, "lo": z0, "hi": z0 + n},   # global i = n (EAST edge)
-		{"axis": "z", "pos": z0,     "lo": x0, "hi": x0 + n},   # global j = 0 (SOUTH edge)
-		{"axis": "z", "pos": z0 + n, "lo": x0, "hi": x0 + n},   # global j = n (NORTH edge)
-	]
+	var n := _chart.n
+	var edges := [[Vector2i(0, 0), Vector2i(0, n)],   # raw i = 0 (WEST)
+		[Vector2i(n, 0), Vector2i(n, n)],             # raw i = n (EAST)
+		[Vector2i(0, 0), Vector2i(n, 0)],             # raw j = 0 (SOUTH)
+		[Vector2i(0, n), Vector2i(n, n)]]             # raw j = n (NORTH)
+	var out: Array = []
+	for e: Array in edges:
+		var w1: Vector2i = _chart.window_of(e[0].x, e[0].y)
+		var w2: Vector2i = _chart.window_of(e[1].x, e[1].y)
+		if w1.x == w2.x:                              # constant window x → a vertical "x" line over z
+			out.append({"axis": "x", "pos": float(w1.x), "lo": float(mini(w1.y, w2.y)), "hi": float(maxi(w1.y, w2.y))})
+		else:                                         # constant window z → a horizontal "z" line over x
+			out.append({"axis": "z", "pos": float(w1.y), "lo": float(mini(w1.x, w2.x)), "hi": float(maxi(w1.x, w2.x))})
+	return out
+
+## DEV (task #75): window cells of the DOUBLE-OUT CORNER WEDGE near `center`, on a grid of `spacing`,
+## within `span` half-extent — so the dev overlay can mark the known-weird corner quadrant DISTINCTLY (RED)
+## and the user can tell the §4.6/§5.4 corner echo from a real bug while walking around. A wedge cell is one
+## whose RAW index (raw_of, M_win) is out of range in BOTH axes → fold_cell returns face −1 (the same
+## predicate the M4 edit-lock uses). Recomputed each frame from the LIVE chart so it tracks flips/re-anchors
+## like the border pillars. Returns [] in FLAT_WORLD / no chart (the overlay is then never built — byte-identical).
+func cosmos_wedge_cells(center: Vector3, span: float, spacing: float) -> Array:
+	if _chart == null:
+		return []
+	var out: Array = []
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var cx := int(floor(center.x))
+	var cz := int(floor(center.z))
+	var step := maxi(int(spacing), 1)
+	var half := int(span)
+	var x := cx - half
+	while x <= cx + half:
+		var z := cz - half
+		while z <= cz + half:
+			var p := _chart.raw_of(x, z)
+			if int(CubeSphere.fold_cell(_chart.face, p.x, p.y, n)["face"]) < 0:
+				out.append(Vector2i(x, z))
+			z += step
+		x += step
+	return out
 
 ## COSMOS M2 (§3.2): re-anchor the floating origin if the player has walked past the trigger.
 ## Returns the WORLD-space shift the caller (the player) must SUBTRACT from its position so the
@@ -878,12 +948,11 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	var res := _chart.flip(player_pos)
 	if not bool(res["ok"]):
 		return false                                  # corner quadrant — deferred to M5
-	# #71: stash the crossed edge's D4 rotation so the player counter-rotates its heading + velocity
-	# (read via last_flip_yaw()); the window frame's (i,j) axes just rotated, so an uncompensated player
-	# would snap 90/180/270°. FLAT_WORLD never reaches here (no chart), so the flat path is unaffected.
-	_last_flip_yaw = float(res["yaw"])
+	# COSMOS-FRAME-ORIENTATION §5.1: chart.flip accumulated the crossed edge's D4 into M_win, so the
+	# window frame is CONTINUOUS across the flip — no player/heading compensation is needed (Fix A #71
+	# reverted). FLAT_WORLD never reaches here (no chart), so the flat path is unaffected.
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
-	TerrainConfig.set_active_face(_chart.face)
+	TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win, before restream
 	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed
 	# `_edits`/`_meta` are untouched (edits are preserved), but `_edit_columns`/`_placed_top` are
 	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the
@@ -899,9 +968,9 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 		# frame, and pass it to set_home_face so the flag-on cover can pin the old terrain at its old world
 		# spot. Default-off ignores it (freed immediately); the 1-arg race-verify call still works.
 		var old_mod_pos: Vector3 = _module_world.position
-		_module_world.position = Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org))
+		_module_world.position = _chart.node_origin()   # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org
 		if _module_world.has_method("set_home_face"):
-			_module_world.call("set_home_face", _chart.face, old_mod_pos)
+			_module_world.call("set_home_face", _chart.face, old_mod_pos, _chart.m_win())
 	# COSMOS M4 (§5.1): latch the flip-settling window (both render paths). update_streaming settles it once
 	# the module reports ramp_done() — re-mirroring player edits into the fresh terrain (§5.4), ending the far
 	# turbo, and releasing the cover. The fallback path (no module) settles immediately (re-mirror/release are
@@ -913,7 +982,7 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# COSMOS M4 (§2.2): then open the handoff turbo so the new frame's nearest ring-0 tiles build FIRST
 	# and appear under the player in ~0.2–0.5 s (both render paths benefit from the nearest-first turbo).
 	if _far != null:
-		_far.rebase_to(Vector3(-float(_chart.i_org), 0.0, -float(_chart.j_org)))
+		_far.rebase_to(_chart.node_origin(), _chart.m_win())   # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org + frozen epoch M_win
 		_far.begin_handoff()
 	# HARD RESTREAM the fallback streamer + collider (the module was restreamed by set_home_face above).
 	_restream()
@@ -972,7 +1041,8 @@ func _remirror_module_edits(player_pos: Vector3) -> void:
 		# player's world XZ directly — exactly the |window_xz − player_xz| test §5.4 specifies.
 		if absf(float(wx) - player_pos.x) > radius or absf(float(wz) - player_pos.z) > radius:
 			continue                                     # beyond the near field → its block is unloaded; skip (unchanged M3 behaviour)
-		collected[Vector3i(wx, int(g["r"]), wz)] = int(_edits[k])   # window cell → packed (0 included); same frame _paint_cell uses
+		var wcell := Vector3i(wx, int(g["r"]), wz)
+		collected[wcell] = _overlay_window_modifier(wcell, int(_edits[k]))   # §6.4: de-canon to the window render frame (0 included)
 	if not collected.is_empty():
 		_module_world.call("bulk_inject", collected)
 
@@ -1054,9 +1124,12 @@ func load_region(region_key: int, chunk: ZoneChunk, resolver: Callable = Callabl
 		var gi := ri + local.x
 		var gr := rr + local.y
 		var gj := rj + local.z
-		var win := Vector3i(gi - _chart.i_org, gr, gj - _chart.j_org)
 		if rface != _chart.face:
 			continue                                # a region off the home face (M3 territory) is skipped
+		# global (raw home-face) cell → window cell via M_win⁻¹ (COSMOS-FRAME-ORIENTATION §5.3); _write_cell
+		# re-derives the same global key. Guarded above to the home face, so (gi,gj) are raw home-face indices.
+		var wxy := _chart.window_of(gi, gj)
+		var win := Vector3i(wxy.x, gr, wxy.y)
 		_write_cell(win, packed, chunk.meta_at(idx))
 
 # --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------

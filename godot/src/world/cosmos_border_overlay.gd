@@ -27,8 +27,17 @@ const PILLAR_WIDTH := 0.7
 const PILLAR_SINK := 6.0                   # start this far BELOW the surface so the pillar visibly pierces up
 const DEV_COLOR := Color(1.0, 0.0, 1.0)    # vivid magenta — rare in the world, pops against green/white/blue
 
+# DEV (task #75): the DOUBLE-OUT corner WEDGE marker — RED pillars over the known-weird corner quadrant
+# (fold_cell → face −1), so the user can tell the §4.6/§5.4 corner echo from a real bug while walking the
+# corner to test #74. A separate child MultiMesh (its own red material); same DEV_BORDERS gate + bend + FLAT
+# no-op as the magenta borders. Sparse grid (a fill), recomputed each frame so it tracks flips/re-anchors.
+const WEDGE_COLOR := Color(1.0, 0.0, 0.0)  # RED — the corner wedge to IGNORE (distinct from the magenta face borders)
+const WEDGE_SPAN := 128.0                  # window half-extent scanned around the player for wedge cells
+const WEDGE_SPACING := 16.0                # grid step between wedge markers
+
 var _world: WorldManager
 var _player: Node3D
+var _wedge: MultiMeshInstance3D            # child: RED double-out-quadrant markers (task #75)
 
 ## Wire the overlay to the world (chart source) + player (window position). Builds the shared box + bend
 ## material and a fixed-size MultiMesh; per-frame we only reposition instances (no allocation churn).
@@ -60,7 +69,32 @@ func setup(world: WorldManager, player: Node3D) -> void:
 	# never wrongly frustum-culled. It is ~200 instances (far ones bend below the horizon / past camera far
 	# and simply don't rasterize), so "always submitted" costs nothing measurable.
 	custom_aabb = AABB(Vector3(-12000.0, -512.0, -12000.0), Vector3(24000.0, 1024.0, 24000.0))
+
+	# DEV (task #75): a sibling MultiMesh of RED pillars marking the double-out corner WEDGE. Same box + bend
+	# material recipe, different colour; populated each frame from WorldManager.cosmos_wedge_cells.
+	_wedge = MultiMeshInstance3D.new()
+	_wedge.name = "CosmosWedgeMarker"
+	var wmat := ShaderMaterial.new()
+	wmat.shader = CosmosBend.opaque_shader()
+	wmat.set_shader_parameter("use_texture", false)
+	wmat.set_shader_parameter("use_vertex_color", false)
+	wmat.set_shader_parameter("albedo_color", WEDGE_COLOR)
+	wmat.set_shader_parameter("emission_color", Vector3(WEDGE_COLOR.r, WEDGE_COLOR.g, WEDGE_COLOR.b))
+	wmat.set_shader_parameter("emission_energy", 1.0)
+	_wedge.material_override = wmat
+	var wmm := MultiMesh.new()
+	wmm.transform_format = MultiMesh.TRANSFORM_3D
+	wmm.mesh = box
+	wmm.instance_count = _max_wedge_instances()
+	_wedge.multimesh = wmm
+	_wedge.custom_aabb = custom_aabb
+	add_child(_wedge)
+
 	set_process(true)
+
+func _max_wedge_instances() -> int:
+	var per_side := int(2.0 * WEDGE_SPAN / WEDGE_SPACING) + 2
+	return per_side * per_side
 
 func _max_instances() -> int:
 	var per_edge := int(ceil(2.0 * PILLAR_SPAN / PILLAR_SPACING)) + 2
@@ -82,6 +116,26 @@ func _process(_delta: float) -> void:
 	while idx < mm.instance_count:
 		mm.set_instance_transform(idx, hidden)
 		idx += 1
+	_emit_wedge(pp)                                 # DEV task #75: RED double-out-quadrant markers
+
+## DEV (task #75): mark the double-out corner WEDGE cells near the player with RED pillars. Empty in FLAT /
+## no chart (cosmos_wedge_cells returns []) → all instances hidden. Same surface-rooted, bend-curved pillars.
+func _emit_wedge(pp: Vector3) -> void:
+	if _wedge == null or _wedge.multimesh == null:
+		return
+	var wmm := _wedge.multimesh
+	var cells: Array = _world.cosmos_wedge_cells(pp, WEDGE_SPAN, WEDGE_SPACING)
+	var i := 0
+	for c: Vector2i in cells:
+		if i >= wmm.instance_count:
+			break
+		var base := _world.surface_y(float(c.x), float(c.y)) - PILLAR_SINK
+		wmm.set_instance_transform(i, Transform3D(Basis.IDENTITY, Vector3(float(c.x), base + PILLAR_HEIGHT * 0.5, float(c.y))))
+		i += 1
+	var hidden := Transform3D(Basis().scaled(Vector3.ZERO), Vector3.ZERO)
+	while i < wmm.instance_count:
+		wmm.set_instance_transform(i, hidden)
+		i += 1
 
 ## Lay pillars along one edge, spaced PILLAR_SPACING apart over a ±PILLAR_SPAN run centred on the player's
 ## projection onto the edge and clamped to the edge's real extent [lo, hi]. Each pillar is rooted to the

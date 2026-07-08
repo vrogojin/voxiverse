@@ -185,17 +185,10 @@ func _physics_process(delta: float) -> void:
 	# COSMOS M3 (§4.5): once we cross far enough past a face edge, flip the home face onto the
 	# neighbour and hard-restream. The flip keeps our window position unchanged (no teleport) and
 	# edits are global-keyed, so nothing moves or is lost. Vector3.ZERO/no-op in FLAT_WORLD.
-	if world.maybe_flip_home_face(global_position):
-		# #71: the flip re-based the window onto the neighbour face whose lattice is a D4 ROTATION of the
-		# old at the shared edge; our position is continuous but our HEADING is in the (now rotated) window
-		# axes. Counter-rotate our yaw + horizontal velocity about the player's OWN up (pivot at us → no
-		# positional teleport) by the crossed edge's D4 angle, so look + motion stay continuous (no view
-		# snap). 0.0 for a 0°-edge crossing → a no-op. FLAT_WORLD never flips, so this is never reached there.
-		var flip_yaw := world.last_flip_yaw()
-		if flip_yaw != 0.0:
-			rotation.y += flip_yaw
-			_horiz_vel = _horiz_vel.rotated(Vector3.UP, flip_yaw)
-			velocity = velocity.rotated(Vector3.UP, flip_yaw)
+	# COSMOS-FRAME-ORIENTATION §5.1: under the pinned window orientation (M_win) the scene frame does
+	# NOT rotate across a flip — the window axes are continuous — so there is nothing to counter-rotate
+	# (Fix A #71 reverted: its D4 extraction now lives in chart.flip's M_win accumulation).
+	world.maybe_flip_home_face(global_position)
 	_push_bodies(delta)
 	_update_aim()
 

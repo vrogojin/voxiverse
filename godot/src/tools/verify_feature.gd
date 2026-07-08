@@ -69,6 +69,7 @@ func _initialize() -> void:
 	_test_portal_frames()
 	_test_portal_buildability()
 	_test_portal_linking()
+	_test_portal_math()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -6703,3 +6704,89 @@ func _portal_manager(world: WorldManager) -> PortalManager:
 	get_root().add_child(pm)
 	pm.setup(world, null, null)
 	return pm
+
+# PORTALS §3.7 — the off-axis window-frustum math (Stage 3). Pure PortalMath; the
+# NDC-corner reprojection assert is THE gate that retires the main technical risk (the
+# projection is built with Godot's OWN Projection.create_frustum_aspect, so a wrong
+# convention fails here, not on-screen).
+func _test_portal_math() -> void:
+	print("[portals] window-frustum math")
+	var far := 100.0
+	# Isometry round-trip + structure across orientation pairs and offsets.
+	var pairs := [
+		[PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 64, 0), 2, 3), PortalFrame.new(PortalFrame.AXIS_X, Vector3i(40, 64, 20), 2, 3)],
+		[PortalFrame.new(PortalFrame.AXIS_X, Vector3i(-10, 70, 5), 3, 4), PortalFrame.new(PortalFrame.AXIS_X, Vector3i(80, 60, -30), 3, 4)],
+		[PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(3, 64, 7), 1, 2), PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(200, 64, 9), 1, 2)],
+	]
+	for pr: Array in pairs:
+		var s: PortalFrame = pr[0]
+		var d: PortalFrame = pr[1]
+		var t_sd := PortalMath.isometry(s, d)
+		var t_ds := PortalMath.isometry(d, s)
+		var round := t_sd * t_ds
+		# basis O(1) (float32-exact) + origin ~0 (a real bug gives O(distance) error, cleanly
+		# separated from float32 round-off ~1e-5·coord at these coordinates).
+		_ok(round.basis.is_equal_approx(Basis.IDENTITY) and round.origin.length() < 0.01,
+			"T_SD · T_DS == identity (basis I, origin ~0)")
+		_ok(t_sd.basis.y.is_equal_approx(Vector3.UP), "T.basis.y == UP (up preserved)")
+		_ok(is_equal_approx(t_sd.basis.determinant(), 1.0), "T.basis determinant == 1")
+		_ok(_axis_aligned(t_sd.basis.x) and _axis_aligned(t_sd.basis.y) and _axis_aligned(t_sd.basis.z),
+			"T.basis is a pure 90°-multiple yaw (axis-aligned columns)")
+		# front-of-S maps to back-of-D.
+		var stx := s.global_transform()
+		var dtx := d.global_transform()
+		_ok((t_sd * (stx.origin + stx.basis.z)).is_equal_approx(dtx.origin - dtx.basis.z),
+			"front of S maps to back of D")
+		# the U-flip identity: T.basis · S.right == -D.right.
+		_ok((t_sd.basis * stx.basis.x).is_equal_approx(-dtx.basis.x), "T.basis · S.right == -D.right (U-flip identity)")
+
+	# NDC-corner reprojection: the 4 destination interior corners project to the NDC
+	# rectangle corners (±1, ±1) under the computed (near, offset, size, aspect, camera).
+	var S := PortalFrame.new(PortalFrame.AXIS_Z, Vector3i(0, 64, 0), 2, 3)
+	var D := PortalFrame.new(PortalFrame.AXIS_X, Vector3i(40, 64, 20), 2, 3)
+	for eye: Vector3 in [Vector3(0.0, 65.5, 6.0), Vector3(-2.0, 66.0, 3.0), Vector3(1.5, 64.8, 8.0)]:
+		var cam := PortalMath.window_camera(eye, S, D, far)
+		var view := (cam["transform"] as Transform3D).affine_inverse()
+		var proj := Projection.create_frustum_aspect(cam["size"], cam["aspect"], cam["offset"], cam["near"], far, false)
+		var edge_ok := true
+		var hx := {"p": false, "n": false}
+		var hy := {"p": false, "n": false}
+		for corner: Vector3 in PortalMath.opening_corners(D):
+			var pv: Vector3 = view * corner
+			var clip: Vector4 = proj * Vector4(pv.x, pv.y, pv.z, 1.0)
+			if absf(clip.w) < 1e-6:
+				edge_ok = false
+				continue
+			var ndc := Vector3(clip.x, clip.y, clip.z) / clip.w
+			if not (_approx(absf(ndc.x), 1.0) and _approx(absf(ndc.y), 1.0)):
+				edge_ok = false
+			if ndc.x >= 0.0: hx["p"] = true
+			else: hx["n"] = true
+			if ndc.y >= 0.0: hy["p"] = true
+			else: hy["n"] = true
+		_ok(edge_ok, "each destination corner projects to an NDC edge (±1) from eye %s" % eye)
+		_ok(hx["p"] and hx["n"] and hy["p"] and hy["n"], "the 4 corners cover all 4 NDC corners from eye %s" % eye)
+		# s == -sigma: virtual-eye side of D is the opposite of the real-eye side of S.
+		var sigma := (eye - S.global_transform().origin).dot(S.global_transform().basis.z)
+		_ok(sign(cam["side"]) == -sign(sigma), "window side s == -sigma (eye %s)" % eye)
+
+	# Degeneracy: eye ON the source plane → near clamps to NEAR_MIN, no NaNs.
+	var deg := PortalMath.window_camera(S.center(), S, D, far)
+	_ok(_approx(float(deg["near"]), PortalMath.NEAR_MIN), "eye on the source plane clamps near to NEAR_MIN")
+	var dorg: Vector3 = (deg["transform"] as Transform3D).origin
+	_ok(is_finite(dorg.x) and is_finite(dorg.y) and is_finite(dorg.z), "degenerate window camera has a finite pose (no NaN)")
+
+func _approx(a: float, b: float, eps: float = 1e-3) -> bool:
+	return absf(a - b) <= eps
+
+# True iff `v` is (within tolerance) an axis-aligned unit vector — exactly one component ±1.
+func _axis_aligned(v: Vector3) -> bool:
+	var comps := [v.x, v.y, v.z]
+	var ones := 0
+	var zeros := 0
+	for c: float in comps:
+		if _approx(absf(c), 1.0):
+			ones += 1
+		elif _approx(c, 0.0):
+			zeros += 1
+	return ones == 1 and zeros == 2

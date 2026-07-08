@@ -68,6 +68,11 @@ func _ready() -> void:
 	# disabled → today's near-only value.
 	_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
+	# Visual-layer contract for see-through portals (PORTALS §3.0): the player camera sees
+	# world geometry (layer 1) + live portal quads (layer 2), but NEVER the energy fills
+	# (layer 3, portal-camera-only). Everything today is on layer 1, so this is a no-op for
+	# existing rendering and simply admits the portal quads.
+	_camera.cull_mask = (1 << 0) | (1 << 1)
 	add_child(_camera)
 
 	# RayCast3D is present per DESIGN; the authoritative hit test is the analytic
@@ -118,6 +123,11 @@ func _capture_mouse() -> void:
 ## front of it. Falls back to the player transform before the camera rig is built.
 func camera_global_transform() -> Transform3D:
 	return _camera.global_transform if _camera != null else global_transform
+
+## The player's Camera3D (PortalManager reads its origin/frustum/far to drive the
+## per-portal window cameras). Null before the rig is built (_ready).
+func camera_node() -> Camera3D:
+	return _camera
 
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:

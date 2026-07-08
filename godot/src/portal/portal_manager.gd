@@ -22,6 +22,24 @@ const GRANT_STARTER_KIT := true
 ## Sanity cap on simultaneously-linked PAIRS.
 const MAX_LINKS := 16
 
+# --- render budget (PORTALS §3.5.6 / §5.2) -------------------------------------
+## Master render kill switch (§5.2 rung 5): false → surfaces keep the energy material
+## permanently (Spigot-style portals); linking, teardown and teleport still work. The
+## feature never blocks the ship.
+const RENDER_PORTALS := true
+## Simultaneously-RENDERED portals. Web default 1 (each active SubViewport is a full extra
+## scene pass); 2 is a desktop luxury.
+const MAX_ACTIVE := 1
+## Metres from the player eye to a source frame centre within which a portal may activate.
+const ACTIVATE_DIST := 24.0
+## Extra metres a currently-active portal stays active before deactivating (anti-flicker).
+const DEACTIVATE_HYSTERESIS := 4.0
+## SubViewport pixels per interior metre; per-axis target = clamp(size_m·this, 64, MAX_TARGET_PX).
+const PX_PER_BLOCK := 96
+const MAX_TARGET_PX := 768
+## |(eye − centre)·normal| below this ⇒ the player is edge-on; don't activate (degenerate).
+const EDGE_ON_EPS := 0.05
+
 ## Per-instance render gate. Verify sets this false: no SubViewport/quad nodes are ever
 ## created, yet every registry/teardown/link invariant still runs headless (PORTALS §3.0).
 var render_enabled := true
@@ -42,6 +60,59 @@ func setup(p_world: WorldManager, p_player: Node = null, p_toast: ToastHUD = nul
 	toast = p_toast
 	if world != null and not world.cell_edited.is_connected(_on_cell_edited):
 		world.cell_edited.connect(_on_cell_edited)
+	# Only drive the per-frame activation loop when actually rendering (verify sets
+	# render_enabled = false → the registry/teardown run headless with no _process).
+	set_process(render_enabled and RENDER_PORTALS)
+
+# --- per-frame activation + view update (PORTALS §3.5.6) -----------------------
+
+## Rank the live surfaces by distance to their source frame, ACTIVATE the nearest
+## MAX_ACTIVE that are in front of the player (within ACTIVATE_DIST + hysteresis, inside
+## the camera frustum, not edge-on), deactivate the rest, and refresh each active
+## surface's window-frustum camera. Off entirely when render is disabled or nothing links.
+func _process(_delta: float) -> void:
+	if not render_enabled or not RENDER_PORTALS or player == null or _links.is_empty():
+		return
+	var cam: Camera3D = player.camera_node()
+	if cam == null:
+		return
+	var eye: Vector3 = cam.global_transform.origin
+	var far: float = cam.far
+	var ranked: Array = []
+	for key: Vector4i in _links.keys():
+		var entry: Dictionary = _links[key]
+		var surf = entry["surface"]
+		if surf == null:
+			continue
+		var src: PortalFrame = entry["frame"]
+		ranked.append({"d": eye.distance_to(src.center()), "surf": surf, "src": src})
+	ranked.sort_custom(func(a, b): return a["d"] < b["d"])
+	var active_count := 0
+	for r: Dictionary in ranked:
+		var surf = r["surf"]
+		var src: PortalFrame = r["src"]
+		var keep := false
+		if active_count < MAX_ACTIVE:
+			var limit := ACTIVATE_DIST + (DEACTIVATE_HYSTERESIS if surf.is_active() else 0.0)
+			if float(r["d"]) <= limit:
+				var c := src.center()
+				var n_s := src.global_transform().basis.z
+				var edge_on := absf((eye - c).dot(n_s)) <= EDGE_ON_EPS
+				if not edge_on and cam.is_position_in_frustum(c):
+					keep = true
+		if keep:
+			if not surf.is_active():
+				surf.activate(_target_px_for(src))
+			surf.update_view(eye, far)
+			active_count += 1
+		elif surf.is_active():
+			surf.deactivate()
+
+## The SubViewport target size for a frame: portal-sized, clamped to [64, MAX_TARGET_PX].
+func _target_px_for(frame: PortalFrame) -> Vector2i:
+	return Vector2i(
+		clampi(frame.width * PX_PER_BLOCK, 64, MAX_TARGET_PX),
+		clampi(frame.height * PX_PER_BLOCK, 64, MAX_TARGET_PX))
 
 # --- tool interaction (PORTALS §3.4.2) -----------------------------------------
 
@@ -170,11 +241,16 @@ func _on_cell_edited(cell: Vector3i, packed: int) -> void:
 # --- render surface hook (fleshed in Stage 3) ----------------------------------
 
 ## Create a PortalSurface for the (src → dst) frame, or null when rendering is disabled
-## (headless verify) or the feature ships without it. Stage 2 stubs this to null so the
-## registry/teardown is exercised with no GPU dependency; Stage 3 builds the real
-## SubViewport/quad node here.
-func _make_surface(_src: PortalFrame, _dst: PortalFrame) -> Node:
-	return null
+## (headless verify). The surface starts INACTIVE (energy look, no SubViewport) — the
+## _process loop activates it when the player is near and looking at it.
+func _make_surface(src: PortalFrame, dst: PortalFrame) -> Node:
+	if not render_enabled:
+		return null
+	var surf := PortalSurface.new()
+	surf.name = "PortalSurface"
+	add_child(surf)
+	surf.configure(src, dst)
+	return surf
 
 # --- registry queries (verify + Stage 3 driving) -------------------------------
 

@@ -176,6 +176,18 @@ func spawn_warmups(place_xform: Transform3D) -> int:
 		var far_mat := FarTerrain.make_material()
 		jobs.append([_build_far_warm_mesh(far_mat), far_mat])
 
+	# 4) The PORTAL surfaces (PORTALS §3.5.7): the portal shader and the shared energy
+	#    material each compile an ~800 ms ANGLE pipeline on first link; warm both behind
+	#    the boot overlay on a QuadMesh (the real portal quad format). A dummy texture is
+	#    enough — pipelines key on shader + vertex format, not texture contents. Gated on
+	#    the feature so a portal-less build warms nothing extra.
+	if PortalManager.ENABLED:
+		var pmat := PortalSurface.make_portal_material()
+		pmat.set_shader_parameter("view_tex", _dummy_view_texture())
+		jobs.append([_build_portal_warm_mesh(pmat), pmat])
+		var emat := PortalSurface.energy_material()
+		jobs.append([_build_portal_warm_mesh(emat), emat])
+
 	_place_grid(jobs, place_xform)
 	return _instances.size()
 
@@ -381,6 +393,21 @@ func _build_far_warm_mesh(mat: Material) -> ArrayMesh:
 	if mesh.get_surface_count() > 0:
 		mesh.surface_set_material(0, mat)
 	return mesh
+
+## A unit QuadMesh (the REAL portal quad vertex format) carrying `mat` on its single
+## surface, so the portal shader / energy pipeline compiles here rather than on first link.
+func _build_portal_warm_mesh(mat: Material) -> QuadMesh:
+	var q := QuadMesh.new()
+	q.size = Vector2(CUBE_SIZE, CUBE_SIZE)
+	q.material = mat
+	return q
+
+## A tiny opaque placeholder texture for the portal shader's view_tex during warm-up (the
+## pipeline keys on shader + vertex format, not on the texture contents).
+func _dummy_view_texture() -> Texture2D:
+	var img := Image.create(4, 4, false, Image.FORMAT_RGB8)
+	img.fill(Color(0.1, 0.1, 0.1))
+	return ImageTexture.create_from_image(img)
 
 ## A shaped-cell ArrayMesh built from ShapeMesh.build — the SAME ARRAY layout the module
 ## library (module_world._make_shape_model) and VoxelBody consume, so the shaped vertex

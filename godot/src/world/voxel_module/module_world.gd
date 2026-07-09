@@ -321,6 +321,14 @@ func set_render_hidden(hidden: bool) -> void:
 		_set_if(_terrain, "max_view_distance",
 			DEV_HIDDEN_VIEW_BLOCKS if hidden else TerrainConfig.near_render_radius())
 
+## COSMOS R2.2: install/clear the frozen-per-epoch near-field true-geometry bake on the mesher (the C++
+## VoxelMesherBlocky.set_cosmos_bake). `flat_params` is CosmosTruePlace.pack_bake_params_flat, or an empty
+## Dictionary / {enabled:false} to restore the plain flat mesher. No-op if the module lacks the method (an
+## engine built without patch 0003) — so the game still runs (near renders flat-window) on an old binary.
+func set_cosmos_bake(flat_params: Dictionary) -> void:
+	if _mesher != null and _mesher.has_method("set_cosmos_bake"):
+		_mesher.call("set_cosmos_bake", flat_params)
+
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
 ## (main) thread if unseen (VDS §8.2) — and writes THAT into the TYPE channel, which

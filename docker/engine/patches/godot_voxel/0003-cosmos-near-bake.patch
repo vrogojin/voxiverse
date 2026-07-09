@@ -1,9 +1,9 @@
 diff --git a/meshers/blocky/cosmos_bake.h b/meshers/blocky/cosmos_bake.h
 new file mode 100644
-index 0000000..ad6ed2c
+index 0000000..004409b
 --- /dev/null
 +++ b/meshers/blocky/cosmos_bake.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,136 @@
 +// COSMOS R2.1 — near-field real-geometry bake (docs/COSMOS-REAL-GEOMETRY-STUDY §2).
 +//
 +// A DIRECT transcription of CosmosTruePlace.bake_place_packed / bake_radial_packed (GDScript), which is
@@ -25,6 +25,11 @@ index 0000000..ad6ed2c
 +namespace zylann::voxel {
 +
 +constexpr double COSMOS_PI = 3.14159265358979323846;
++
++// Set by VoxelMesherBlocky::set_cosmos_bake (main thread) = cosmos.enabled; read by
++// VoxelMeshBlock::set_parent_transform (main thread) to place baked blocks at IDENTITY-local — their mesh
++// verts are already absolute epoch-frame coords, so the block instance must NOT re-add its window origin.
++extern bool g_cosmos_identity_local;
 +
 +// The frozen-per-epoch bake blob (mirror of CosmosTruePlace.pack_bake_params). Row-major mt.
 +struct CosmosBakeParams {
@@ -136,7 +141,7 @@ index 0000000..ad6ed2c
 +
 +#endif // COSMOS_BAKE_H
 diff --git a/meshers/blocky/voxel_mesher_blocky.cpp b/meshers/blocky/voxel_mesher_blocky.cpp
-index 5f047ce..59151a6 100644
+index 5f047ce..87ac854 100644
 --- a/meshers/blocky/voxel_mesher_blocky.cpp
 +++ b/meshers/blocky/voxel_mesher_blocky.cpp
 @@ -3,6 +3,7 @@
@@ -147,7 +152,7 @@ index 5f047ce..59151a6 100644
  #include "../../util/godot/core/packed_arrays.h"
  #include "../../util/macros.h"
  #include "../../util/math/conv.h"
-@@ -608,6 +609,86 @@ uint8_t VoxelMesherBlocky::get_shadow_occluder_mask() const {
+@@ -608,6 +609,90 @@ uint8_t VoxelMesherBlocky::get_shadow_occluder_mask() const {
  	return _parameters.shadow_occluders_mask;
  }
  
@@ -155,6 +160,9 @@ index 5f047ce..59151a6 100644
 +// flattened to plain packed arrays (no chart topology crosses here — see cosmos_bake.h). enabled=false (or
 +// an empty dict) restores the plain flat mesher exactly. Written under the parameters write-lock so the mesh
 +// workers pick up the whole frozen blob atomically via their build() snapshot.
++// Definition of the cosmos identity-local flag declared in cosmos_bake.h (main-thread only; see there).
++bool g_cosmos_identity_local = false;
++
 +void VoxelMesherBlocky::set_cosmos_bake(Dictionary d) {
 +	CosmosBakeParams cb;
 +	cb.enabled = bool(d.get("enabled", false));
@@ -214,6 +222,7 @@ index 5f047ce..59151a6 100644
 +			}
 +		}
 +	}
++	g_cosmos_identity_local = cb.enabled; // drives VoxelMeshBlock block-instance placement (main thread)
 +	RWLockWrite wlock(_parameters_lock);
 +	_parameters.cosmos = cb;
 +}
@@ -234,7 +243,7 @@ index 5f047ce..59151a6 100644
  void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
  	const VoxelBuffer::ChannelId channel = VoxelBuffer::CHANNEL_TYPE;
  	Parameters params;
-@@ -747,6 +828,70 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
+@@ -747,6 +832,70 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
  		}
  	}
  
@@ -305,7 +314,7 @@ index 5f047ce..59151a6 100644
  	// TODO Optimization: we could return a single byte array and use Mesh::add_surface down the line?
  	// That API does not seem to exist yet though.
  
-@@ -912,6 +1057,10 @@ void VoxelMesherBlocky::_bind_methods() {
+@@ -912,6 +1061,10 @@ void VoxelMesherBlocky::_bind_methods() {
  	ClassDB::bind_method(D_METHOD("set_library", "voxel_library"), &VoxelMesherBlocky::set_library);
  	ClassDB::bind_method(D_METHOD("get_library"), &VoxelMesherBlocky::get_library);
  
@@ -355,3 +364,31 @@ index 842ffac..261138e 100644
  	};
  
  	struct Cache {
+diff --git a/terrain/voxel_mesh_block.cpp b/terrain/voxel_mesh_block.cpp
+index 113201a..ebb9d11 100644
+--- a/terrain/voxel_mesh_block.cpp
++++ b/terrain/voxel_mesh_block.cpp
+@@ -1,5 +1,6 @@
+ #include "voxel_mesh_block.h"
+ #include "../constants/voxel_string_names.h"
++#include "../meshers/blocky/cosmos_bake.h" // COSMOS R2.2: g_cosmos_identity_local
+ #include "../util/godot/classes/collision_shape_3d.h"
+ #include "../util/godot/classes/concave_polygon_shape_3d.h"
+ #include "../util/godot/classes/node_3d.h"
+@@ -135,7 +136,15 @@ void VoxelMeshBlock::set_parent_transform(const Transform3D &parent_transform) {
+ 		const Transform3D world_transform = parent_transform * local_transform;
+ 
+ 		if (_mesh_instance.is_valid()) {
+-			_mesh_instance.set_transform(world_transform);
++			// COSMOS R2.2: when the near field is baked to true epoch-frame geometry, the mesh verts are
++			// absolute epoch coords, so the block instance must NOT re-add its window origin — place it at
++			// parent_transform (identity-local). Collision bodies (window-space physics) keep the normal
++			// placement; in curved mode generate_collisions is off, so no static body exists here anyway.
++			if (g_cosmos_identity_local) {
++				_mesh_instance.set_transform(parent_transform);
++			} else {
++				_mesh_instance.set_transform(world_transform);
++			}
+ 		}
+ 
+ 		if (_static_body.is_valid()) {

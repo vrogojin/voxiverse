@@ -202,6 +202,126 @@ static func alignment_transform(chart: CosmosChart, bake_frame: Dictionary, w_pl
 	return Transform3D(basis, w_player - basis * pe)
 
 # ============================================================================================
+#  R2 NEAR-FIELD C++ MESHER BAKE — packed-table mirror (docs/COSMOS-REAL-GEOMETRY-STUDY §2, R2.1)
+# ============================================================================================
+# The near voxel field bakes inside the godot_voxel C++ mesher (worker threads). To keep ALL cube
+# topology out of the C++ (the exact fold-table sign/index class that scrambled the shader twice), we
+# pre-pack the fold table + face axes + epoch frame HERE — via the gate-proven CubeSphere/place_true
+# functions — into flat numbers the C++ consumes with pure arithmetic. `pack_bake_params` builds the
+# frozen-per-epoch blob; `bake_place_packed` / `bake_radial_packed` are the EXACT arithmetic the C++
+# runs (no chart access). verify_cosmos_bake_mirror asserts bake_place_packed(pack(),v) == place_true
+# (node_origin+v) across faces/edges/corner — so the C++ is a mechanical transcription of a proven
+# mirror, validated headlessly BEFORE any engine rebuild. Identity used: for M_win ∈ C4 (orthonormal),
+# raw(node_origin+v) = M_win·v exactly, so the mesher needs only gen_mwin·v — no org/reanchor term.
+
+## Pack the frozen-per-epoch bake blob from a chart + its epoch bake frame. Side order matches _fold_f:
+## 0=EAST (px≥n), 1=WEST (px<0), 2=NORTH (pz≥n), 3=SOUTH (pz<0). Face axes for all 6 faces so the folded
+## face indexes directly. `mt` kept as a Basis for the GDScript mirror; the C++ push flattens it to 9 floats.
+static func pack_bake_params(chart: CosmosChart, frame: Dictionary) -> Dictionary:
+	var n := chart.n
+	var edges: Array = []
+	for side in 4:
+		var e := CubeSphere.edge_remap(chart.face, side, n)
+		edges.append({"b": int(e["b"]), "m": e["m"], "t": e["t"]})
+	var axes: Array = []
+	for f in 6:
+		var nn := CubeSphere._axis_n(f)
+		var uu := CubeSphere._axis_u(f)
+		var vv := CubeSphere._axis_v(f)
+		axes.append({
+			"nx": float(nn.x), "ny": float(nn.y), "nz": float(nn.z),
+			"ux": float(uu.x), "uy": float(uu.y), "uz": float(uu.z),
+			"vx": float(vv.x), "vy": float(vv.y), "vz": float(vv.z),
+		})
+	return {
+		"n": n, "R": float(chart.radius), "home": chart.face,
+		"mw": [chart.mw_a, chart.mw_b, chart.mw_c, chart.mw_d],
+		"edges": edges, "axes": axes,
+		"dcam": frame["d_cam"], "ycam": float(frame["y_cam"]), "mt": frame["mt"],
+		"node_origin": chart.node_origin(),
+	}
+
+## The EXACT arithmetic the C++ mesher runs, per vertex (v = terrain-local voxel index x,y,z). Returns the
+## true epoch-frame position, or _WEDGE for a double-out corner vertex (the mesher culls its triangles).
+## No chart access — pure numbers from `p` — so transcribing to C++ is mechanical.
+static func bake_place_packed(p: Dictionary, vx: float, vy: float, vz: float) -> Vector3:
+	var n: int = p["n"]
+	var mw: Array = p["mw"]
+	var px := float(mw[0]) * vx + float(mw[1]) * vz
+	var pz := float(mw[2]) * vx + float(mw[3]) * vz
+	var oi := px < 0.0 or px >= float(n)
+	var oj := pz < 0.0 or pz >= float(n)
+	if oi and oj:
+		return _WEDGE
+	var face: int
+	var fx: float
+	var fz: float
+	if not oi and not oj:
+		face = int(p["home"]); fx = px; fz = pz
+	else:
+		var side := 0
+		if px >= float(n): side = 0
+		elif px < 0.0: side = 1
+		elif pz >= float(n): side = 2
+		else: side = 3
+		var e: Dictionary = p["edges"][side]
+		var m: Array = e["m"]; var t: Array = e["t"]
+		face = int(e["b"])
+		fx = float(m[0]) * px + float(m[1]) * pz + float(t[0])
+		fz = float(m[2]) * px + float(m[3]) * pz + float(t[1])
+	var a := 2.0 * fx / float(n) - 1.0
+	var b := 2.0 * fz / float(n) - 1.0
+	var u := tan(a * (PI / 4.0))
+	var w := tan(b * (PI / 4.0))
+	var ax: Dictionary = p["axes"][face]
+	var d := Vector3(
+		float(ax["nx"]) + u * float(ax["ux"]) + w * float(ax["vx"]),
+		float(ax["ny"]) + u * float(ax["uy"]) + w * float(ax["vy"]),
+		float(ax["nz"]) + u * float(ax["uz"]) + w * float(ax["vz"])).normalized()
+	var dcam: Vector3 = p["dcam"]
+	var rr := float(p["R"])
+	var rel := d * rr - dcam * rr + d * vy - dcam * float(p["ycam"])
+	return (p["mt"] as Basis) * rel
+
+## The outward radial normal (mt·d̂ normalized) for vertex v — the C++ mesher's normal transform. _WEDGE
+## position vertices are culled, so callers only read this for kept vertices.
+static func bake_radial_packed(p: Dictionary, vx: float, vy: float, vz: float) -> Vector3:
+	var n: int = p["n"]
+	var mw: Array = p["mw"]
+	var px := float(mw[0]) * vx + float(mw[1]) * vz
+	var pz := float(mw[2]) * vx + float(mw[3]) * vz
+	var oi := px < 0.0 or px >= float(n)
+	var oj := pz < 0.0 or pz >= float(n)
+	if oi and oj:
+		return Vector3.ZERO
+	var face: int
+	var fx: float
+	var fz: float
+	if not oi and not oj:
+		face = int(p["home"]); fx = px; fz = pz
+	else:
+		var side := 0
+		if px >= float(n): side = 0
+		elif px < 0.0: side = 1
+		elif pz >= float(n): side = 2
+		else: side = 3
+		var e: Dictionary = p["edges"][side]
+		var m: Array = e["m"]; var t: Array = e["t"]
+		face = int(e["b"])
+		fx = float(m[0]) * px + float(m[1]) * pz + float(t[0])
+		fz = float(m[2]) * px + float(m[3]) * pz + float(t[1])
+	var a := 2.0 * fx / float(n) - 1.0
+	var b := 2.0 * fz / float(n) - 1.0
+	var u := tan(a * (PI / 4.0))
+	var w := tan(b * (PI / 4.0))
+	var ax: Dictionary = p["axes"][face]
+	var d := Vector3(
+		float(ax["nx"]) + u * float(ax["ux"]) + w * float(ax["vx"]),
+		float(ax["ny"]) + u * float(ax["uy"]) + w * float(ax["vy"]),
+		float(ax["nz"]) + u * float(ax["uz"]) + w * float(ax["vz"])).normalized()
+	return ((p["mt"] as Basis) * d).normalized()
+
+# ============================================================================================
 #  THE SHADER (GPU mirror of place_point / place_true) + the chart table
 # ============================================================================================
 # The shader lives here so the ONE placement formula (§2.1 + the bubble) is authored once and shared with

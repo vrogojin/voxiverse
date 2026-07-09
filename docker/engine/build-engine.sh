@@ -52,6 +52,11 @@ clone_pinned() {
     git -C "${dir}" fetch --depth 1 origin "${ref}" || true
     git -C "${dir}" checkout -f "${ref}" 2>/dev/null || \
       git -C "${dir}" checkout -f FETCH_HEAD
+    # checkout -f resets TRACKED files but leaves untracked ones. A patch that ADDS a file (e.g. 0003's
+    # cosmos_bake.h) creates it untracked via `git apply`, so a warm rebuild would find it "already exists"
+    # and the apply would FATAL. Clean untracked files so every warm build starts truly pristine like a
+    # fresh clone. Excludes are unnecessary — the module tree carries no build outputs (those live elsewhere).
+    git -C "${dir}" clean -fdq
   fi
 }
 

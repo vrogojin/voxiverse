@@ -31,7 +31,7 @@ func _ready() -> void:
 	# flattest spot near it. The physics/breaking sandbox is the deterministic
 	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
 	var spawn := TerrainConfig.find_spawn()
-	var col := _find_flat(spawn.x, spawn.y)
+	var col := _find_flat(spawn.x, spawn.y, world)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
 	world.on_player_ready(player)
@@ -146,14 +146,20 @@ func _setup_environment() -> void:
 	add_child(we)
 
 ## Find the FLATTEST column near (cx, cz): the one whose 3x3 neighbourhood varies
-## least in height, so the player starts on even ground.
-func _find_flat(cx: int, cz: int) -> Vector2i:
+## least in height, so the player starts on even ground. In curved mode the search
+## SKIPS double-out corner WEDGE columns (world.is_wedge_column) — an impossible cell
+## reads as perfectly flat void, so the un-filtered search parks the spawn there and
+## the M5_REAL camera starts at the 1e18 wedge sentinel (blank screen).
+func _find_flat(cx: int, cz: int, world: WorldManager = null) -> Vector2i:
 	var best := Vector2i(cx, cz)
 	var best_spread := 0x7fffffff
+	var best_is_wedge := (world != null and world.is_wedge_column(cx, cz))
 	for dz in range(-16, 17, 2):
 		for dx in range(-16, 17, 2):
 			var x := cx + dx
 			var z := cz + dz
+			if world != null and world.is_wedge_column(x, z):
+				continue
 			var lo := 0x7fffffff
 			var hi := -0x7fffffff
 			for oz in range(-1, 2):
@@ -162,9 +168,11 @@ func _find_flat(cx: int, cz: int) -> Vector2i:
 					lo = mini(lo, h)
 					hi = maxi(hi, h)
 			var spread := hi - lo
-			if spread < best_spread:
+			# Always prefer a non-wedge column over the wedge seed, then flattest.
+			if best_is_wedge or spread < best_spread:
 				best_spread = spread
 				best = Vector2i(x, z)
-			if spread == 0:
+				best_is_wedge = false
+			if spread == 0 and not best_is_wedge:
 				return best
 	return best

@@ -928,13 +928,29 @@ func m5_real_update_far(player_pos: Vector3) -> void:
 func m5_epoch_camera(player_pos: Vector3, window_cam: Transform3D) -> Transform3D:
 	if _chart == null or _epoch_frame.is_empty() or not CubeSphere.M5_REAL:
 		return window_cam
+	# Safety net #1 — the DOUBLE-OUT corner WEDGE: if the player stands in the impossible (both-out) quadrant,
+	# place_true() returns the _WEDGE sentinel (1e18). alignment_transform folds that into F.origin, so F⁻¹
+	# would fling the DISPLAYED camera to ~1e18 and the whole planet (near + far, both baked in the epoch
+	# frame) leaves the frustum → a blank HUD-only screen. Fall back to the window camera this frame instead.
+	# (The spawn is kept out of the wedge in main.gd; this guards a player who walks up to the 3-face vertex
+	# before the M5c corner seal lands.)
+	var pe := CosmosTruePlace.place_true(_chart, player_pos, _epoch_frame)
+	if pe == CosmosTruePlace._WEDGE:
+		return window_cam
 	var f := CosmosTruePlace.alignment_transform(_chart, _epoch_frame, player_pos)
-	# Safety net: camera_frame now synthesises a valid radial in the corner wedge, so F should be non-singular
-	# everywhere — but if it ever degenerates, fall back to the window camera this frame rather than spam
-	# Basis.invert det==0. (The player only touches the wedge at the 3-face vertex, sealed fully by M5c.)
+	# Safety net #2 — a degenerate basis (should not happen now camera_frame synthesises a valid corner
+	# radial) → fall back rather than spam Basis.invert det==0.
 	if absf(f.basis.determinant()) < 1.0e-6:
 		return window_cam
 	return f.affine_inverse() * window_cam
+
+## COSMOS: true iff the window column (x, z) folds to the double-out corner WEDGE — an impossible cell with
+## no sphere position (place_true → _WEDGE). Used by main.gd to keep the spawn off the wedge so the M5_REAL
+## camera never starts at the 1e18 sentinel (blank screen). Always false in FLAT_WORLD / when no chart.
+func is_wedge_column(x: int, z: int) -> bool:
+	if _chart == null:
+		return false
+	return CosmosTruePlace.is_wedge(_chart, float(x), float(z))
 
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).

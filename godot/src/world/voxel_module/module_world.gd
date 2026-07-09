@@ -27,6 +27,14 @@ extends Node3D
 var _terrain: Node3D
 var _viewer: Node
 var _mesher: Object                     # the VoxelMesherBlocky (kept so restream can rebuild the terrain)
+# COSMOS R1 DEV (DEV_HIDE_NEAR): when true, hide the near render by collapsing the module's own streaming
+# radius to DEV_HIDDEN_VIEW_BLOCKS. Godot node visibility does NOT propagate to godot_voxel's RID mesh-block
+# instances, so `.visible=false` on the wrapper leaves chunks drawn — but max_view_distance is the module's
+# own lever, so shrinking it unloads the near field reliably (a tiny platform remains under the player). The
+# ramp (_process) respects this flag so the handoff never re-grows it while hidden. Render-only; analytic
+# physics/GroundCollider are untouched. Never set in normal play (only the dev toggle turns it on).
+var _render_hidden := false
+const DEV_HIDDEN_VIEW_BLOCKS := 8
 # COSMOS frozen-epoch (docs/COSMOS-AUDIT.md §3.2 items 3–4): the cube face this generator epoch is
 # homed on. Frozen onto each generator instance as `gen_face` at creation; a home-face flip creates a
 # NEW generator (new face) and restreams, rather than mutating the face workers are reading.
@@ -254,7 +262,8 @@ func setup() -> bool:
 	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
 	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
 	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
-	_set_if(_terrain, "max_view_distance", TerrainConfig.near_render_radius())
+	_set_if(_terrain, "max_view_distance",
+		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else TerrainConfig.near_render_radius())
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -283,10 +292,11 @@ func setup() -> bool:
 ## target is reached; dormant (processing off) at every other time.
 func _process(delta: float) -> void:
 	# Ramp step (unchanged): grow the fresh terrain's view distance from RAMP_START_BLOCKS to the target.
+	# DEV_HIDE_NEAR: while the near render is hidden, never re-grow the view distance (keep it collapsed).
 	if _ramp_active:
 		var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
 		_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
-		if _terrain != null:
+		if _terrain != null and not _render_hidden:
 			_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
 		if _ramp_view >= _ramp_target:
 			_ramp_active = false
@@ -300,6 +310,16 @@ func _process(delta: float) -> void:
 			_free_cover("timeout")
 	# Stay processing only while there is still ramp or cover work to do; otherwise go dormant.
 	set_process(_ramp_active or _cover_terrain != null)
+
+## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
+## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
+## module unloads the near field, leaving only a tiny platform under the player so the baked far layer can
+## be assessed without the near overlap. Render-only; analytic physics is untouched.
+func set_render_hidden(hidden: bool) -> void:
+	_render_hidden = hidden
+	if _terrain != null:
+		_set_if(_terrain, "max_view_distance",
+			DEV_HIDDEN_VIEW_BLOCKS if hidden else TerrainConfig.near_render_radius())
 
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this

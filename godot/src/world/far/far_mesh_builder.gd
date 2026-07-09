@@ -272,12 +272,20 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 ## Wrap raw arrays into an ArrayMesh with the shared far material on surface 0.
 static func build_mesh(arrays: Dictionary, material: Material) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
+	# COSMOS R1: a corner tile whose triangles ALL touch the double-out wedge bakes to a non-empty vertex
+	# array but an EMPTY index array (bake_arrays culls every triangle). add_surface_from_arrays then errors
+	# `index_array_len==NO_INDEX_ARRAY` (an indexed format with zero indices) and drops the surface anyway —
+	# so skip it: return an empty mesh (the key stays "live" with 0 tris, no hole, no per-frame error spam).
+	var idx: PackedInt32Array = arrays["indices"]
+	var verts: PackedVector3Array = arrays["verts"]
+	if idx.is_empty() or verts.is_empty():
+		return mesh
 	var surf := []
 	surf.resize(Mesh.ARRAY_MAX)
-	surf[Mesh.ARRAY_VERTEX] = arrays["verts"]
+	surf[Mesh.ARRAY_VERTEX] = verts
 	surf[Mesh.ARRAY_NORMAL] = arrays["normals"]
 	surf[Mesh.ARRAY_COLOR] = arrays["colors"]
-	surf[Mesh.ARRAY_INDEX] = arrays["indices"]
+	surf[Mesh.ARRAY_INDEX] = idx
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
 	if material != null and mesh.get_surface_count() > 0:
 		mesh.surface_set_material(0, material)

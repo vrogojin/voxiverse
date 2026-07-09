@@ -467,7 +467,13 @@ func _free_tile(key) -> void:
 	_live.erase(key)
 	_live_tris.erase(key)
 	if is_instance_valid(mi):
-		remove_child(mi)
+		# COSMOS R1: under M5_REAL the tile is parented to `_align_root`, not to this node, so removing it
+		# from `self` throws `p_child->data.parent != this`. Detach from its ACTUAL parent (align root in
+		# M5_REAL, self otherwise). queue_free alone would also work, but the explicit detach keeps the tree
+		# consistent within the frame (a same-key rebuild must not briefly see two nodes under one parent).
+		var p: Node = mi.get_parent()
+		if p != null:
+			p.remove_child(mi)
 		mi.queue_free()
 
 # --- build queue + per-frame budget (LOD-DESIGN §2.6) -------------------------

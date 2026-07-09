@@ -146,8 +146,11 @@ func _ready() -> void:
 	# COSMOS R1 DEV: hide the NEAR chunk render so the baked far layer can be inspected alone (render-only —
 	# analytic physics + GroundCollider are untouched, so movement/collision are unchanged). Curved + dev only.
 	if not CubeSphere.FLAT_WORLD and CubeSphere.DEV_HIDE_NEAR:
-		if _module_world != null:
-			_module_world.visible = false
+		# Module path: node visibility does NOT reach godot_voxel's RID mesh blocks, so collapse the module's
+		# own streaming radius (max_view_distance) — the reliable lever — leaving only a tiny platform under
+		# the player. Fallback path uses MeshInstance3D children, so plain node visibility works there.
+		if _module_world != null and _module_world.has_method("set_render_hidden"):
+			_module_world.call("set_render_hidden", true)
 		if _streamer != null:
 			_streamer.visible = false
 		print("[WorldManager] DEV_HIDE_NEAR: near chunk render hidden (far layer isolated)")

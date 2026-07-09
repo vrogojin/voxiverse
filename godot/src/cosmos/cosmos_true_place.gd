@@ -241,6 +241,47 @@ static func pack_bake_params(chart: CosmosChart, frame: Dictionary) -> Dictionar
 		"node_origin": chart.node_origin(),
 	}
 
+## Flatten pack_bake_params into the plain packed-array Dictionary VoxelMesherBlocky.set_cosmos_bake parses
+## (cosmos_bake.h). No chart/topology objects cross the C++ boundary — only numbers. Side order + row-major
+## mt match the C++ struct exactly. Empty/disabled → the C++ restores the plain flat mesher.
+static func pack_bake_params_flat(chart: CosmosChart, frame: Dictionary) -> Dictionary:
+	var n := chart.n
+	var edge_b := PackedInt32Array()
+	var edge_m := PackedFloat32Array()
+	var edge_t := PackedFloat32Array()
+	for side in 4:
+		var e := CubeSphere.edge_remap(chart.face, side, n)
+		edge_b.append(int(e["b"]))
+		var m: Array = e["m"]; var t: Array = e["t"]
+		for k in 4: edge_m.append(float(m[k]))
+		for k in 2: edge_t.append(float(t[k]))
+	var axis_n := PackedFloat32Array()
+	var axis_u := PackedFloat32Array()
+	var axis_v := PackedFloat32Array()
+	for f in 6:
+		var nn := CubeSphere._axis_n(f)
+		var uu := CubeSphere._axis_u(f)
+		var vv := CubeSphere._axis_v(f)
+		axis_n.append_array([float(nn.x), float(nn.y), float(nn.z)])
+		axis_u.append_array([float(uu.x), float(uu.y), float(uu.z)])
+		axis_v.append_array([float(vv.x), float(vv.y), float(vv.z)])
+	var dc: Vector3 = frame["d_cam"]
+	var mt: Basis = frame["mt"]
+	# mt rows (mt·rel = row_i · rel): row_i = (mt.x[i], mt.y[i], mt.z[i]) since Basis(x,y,z) sets columns.
+	var mt_flat := PackedFloat32Array([
+		mt.x.x, mt.y.x, mt.z.x,
+		mt.x.y, mt.y.y, mt.z.y,
+		mt.x.z, mt.y.z, mt.z.z,
+	])
+	return {
+		"enabled": true,
+		"n": n, "R": float(chart.radius), "home": chart.face,
+		"mw": PackedInt32Array([chart.mw_a, chart.mw_b, chart.mw_c, chart.mw_d]),
+		"edge_b": edge_b, "edge_m": edge_m, "edge_t": edge_t,
+		"axis_n": axis_n, "axis_u": axis_u, "axis_v": axis_v,
+		"dcam": PackedFloat32Array([dc.x, dc.y, dc.z]), "ycam": float(frame["y_cam"]), "mt": mt_flat,
+	}
+
 ## The EXACT arithmetic the C++ mesher runs, per vertex (v = terrain-local voxel index x,y,z). Returns the
 ## true epoch-frame position, or _WEDGE for a double-out corner vertex (the mesher culls its triangles).
 ## No chart access — pure numbers from `p` — so transcribing to C++ is mechanical.

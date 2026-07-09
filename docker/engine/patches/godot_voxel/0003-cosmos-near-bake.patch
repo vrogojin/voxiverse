@@ -1,0 +1,357 @@
+diff --git a/meshers/blocky/cosmos_bake.h b/meshers/blocky/cosmos_bake.h
+new file mode 100644
+index 0000000..ad6ed2c
+--- /dev/null
++++ b/meshers/blocky/cosmos_bake.h
+@@ -0,0 +1,131 @@
++// COSMOS R2.1 — near-field real-geometry bake (docs/COSMOS-REAL-GEOMETRY-STUDY §2).
++//
++// A DIRECT transcription of CosmosTruePlace.bake_place_packed / bake_radial_packed (GDScript), which is
++// proven == place_true across home cells, all four edge folds, and the corner-wedge by the headless gate
++// verify_cosmos_bake_mirror (4/0). ALL cube topology (fold table + face axes) is precomputed GDScript-side
++// and pushed here as flat numbers, so this file does PURE ARITHMETIC — no topology logic, no branches that
++// can get a sign/index wrong (the exact class that scrambled the M5a shader twice). Frozen per epoch and
++// snapshotted under the mesher's Parameters lock, so worker threads read an immutable copy.
++//
++// Coordinate identity (why no origin term): for M_win in C4 (orthonormal), raw(node_origin + v) = M_win*v
++// exactly, so a terrain-local voxel index v maps to the raw home-face index p = mw*v directly.
++
++#ifndef COSMOS_BAKE_H
++#define COSMOS_BAKE_H
++
++#include <core/math/vector3.h>
++#include <cmath>
++
++namespace zylann::voxel {
++
++constexpr double COSMOS_PI = 3.14159265358979323846;
++
++// The frozen-per-epoch bake blob (mirror of CosmosTruePlace.pack_bake_params). Row-major mt.
++struct CosmosBakeParams {
++	bool enabled = false;
++	int n = 1;
++	float R = 1.0f;
++	int home = 0;
++	int mw[4] = { 1, 0, 0, 1 }; // M_win row-major [a,b,c,d]
++
++	// The home face's 4 edge remaps, side order 0=EAST(px>=n),1=WEST(px<0),2=NORTH(pz>=n),3=SOUTH(pz<0).
++	struct Edge {
++		int b = 0; // neighbour face
++		float m[4] = { 1, 0, 0, 1 };
++		float t[2] = { 0, 0 };
++	} edges[4];
++
++	// Per-face axes N,U,V for all 6 faces (so the folded face indexes directly). Layout per face: n,u,v.
++	float axis_n[6][3] = {};
++	float axis_u[6][3] = {};
++	float axis_v[6][3] = {};
++
++	// Epoch frame (frozen at the last flip): d_cam, y_cam, and mt as 3 ROWS (mt*rel = row_i . rel).
++	float dcam[3] = { 0, 1, 0 };
++	float ycam = 0.0f;
++	float mt_row[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
++};
++
++// Fold + gnomonic direction of a terrain-local voxel index (vx,vz). Returns false for a double-out corner
++// (wedge). On success, `dir` is the UNIT sphere direction. Mirrors _fold_f + _dir_of exactly.
++inline bool cosmos_bake_dir(const CosmosBakeParams &p, double vx, double vz, Vector3 &dir) {
++	const double nf = double(p.n);
++	const double px = double(p.mw[0]) * vx + double(p.mw[1]) * vz;
++	const double pz = double(p.mw[2]) * vx + double(p.mw[3]) * vz;
++	const bool oi = px < 0.0 || px >= nf;
++	const bool oj = pz < 0.0 || pz >= nf;
++	if (oi && oj) {
++		return false; // corner wedge
++	}
++	int face;
++	double fx, fz;
++	if (!oi && !oj) {
++		face = p.home;
++		fx = px;
++		fz = pz;
++	} else {
++		int side;
++		if (px >= nf) {
++			side = 0;
++		} else if (px < 0.0) {
++			side = 1;
++		} else if (pz >= nf) {
++			side = 2;
++		} else {
++			side = 3;
++		}
++		const CosmosBakeParams::Edge &e = p.edges[side];
++		face = e.b;
++		fx = double(e.m[0]) * px + double(e.m[1]) * pz + double(e.t[0]);
++		fz = double(e.m[2]) * px + double(e.m[3]) * pz + double(e.t[1]);
++	}
++	const double a = 2.0 * fx / nf - 1.0;
++	const double b = 2.0 * fz / nf - 1.0;
++	const double u = std::tan(a * (COSMOS_PI / 4.0));
++	const double w = std::tan(b * (COSMOS_PI / 4.0));
++	const float *N = p.axis_n[face];
++	const float *U = p.axis_u[face];
++	const float *V = p.axis_v[face];
++	Vector3 d(
++			double(N[0]) + u * double(U[0]) + w * double(V[0]),
++			double(N[1]) + u * double(U[1]) + w * double(V[1]),
++			double(N[2]) + u * double(U[2]) + w * double(V[2]));
++	dir = d.normalized();
++	return true;
++}
++
++inline Vector3 cosmos_mt_xform(const CosmosBakeParams &p, const Vector3 &rel) {
++	return Vector3(
++			p.mt_row[0][0] * rel.x + p.mt_row[0][1] * rel.y + p.mt_row[0][2] * rel.z,
++			p.mt_row[1][0] * rel.x + p.mt_row[1][1] * rel.y + p.mt_row[1][2] * rel.z,
++			p.mt_row[2][0] * rel.x + p.mt_row[2][1] * rel.y + p.mt_row[2][2] * rel.z);
++}
++
++// True epoch-frame position of terrain-local voxel index (vx,vy,vz). Returns false for a wedge vertex
++// (caller culls its triangles). Mirrors bake_place_packed.
++inline bool cosmos_bake_place(const CosmosBakeParams &p, double vx, double vy, double vz, Vector3 &out_pos) {
++	Vector3 d;
++	if (!cosmos_bake_dir(p, vx, vz, d)) {
++		return false;
++	}
++	const double rr = double(p.R);
++	const Vector3 dc(p.dcam[0], p.dcam[1], p.dcam[2]);
++	const Vector3 rel = d * rr - dc * rr + d * vy - dc * double(p.ycam);
++	out_pos = cosmos_mt_xform(p, rel);
++	return true;
++}
++
++// Outward radial normal (mt*d̂ normalized) — the v1 near normal (matches the far layer; ambient-lit scene
++// so slope-exact normals are cosmetically negligible). Mirrors bake_radial_packed.
++inline bool cosmos_bake_radial(const CosmosBakeParams &p, double vx, double vz, Vector3 &out_n) {
++	Vector3 d;
++	if (!cosmos_bake_dir(p, vx, vz, d)) {
++		return false;
++	}
++	out_n = cosmos_mt_xform(p, d).normalized();
++	return true;
++}
++
++} // namespace zylann::voxel
++
++#endif // COSMOS_BAKE_H
+diff --git a/meshers/blocky/voxel_mesher_blocky.cpp b/meshers/blocky/voxel_mesher_blocky.cpp
+index 5f047ce..59151a6 100644
+--- a/meshers/blocky/voxel_mesher_blocky.cpp
++++ b/meshers/blocky/voxel_mesher_blocky.cpp
+@@ -3,6 +3,7 @@
+ #include "../../storage/voxel_buffer.h"
+ #include "../../util/containers/span.h"
+ #include "../../util/godot/core/array.h"
++#include "../../util/godot/core/dictionary.h"
+ #include "../../util/godot/core/packed_arrays.h"
+ #include "../../util/macros.h"
+ #include "../../util/math/conv.h"
+@@ -608,6 +609,86 @@ uint8_t VoxelMesherBlocky::get_shadow_occluder_mask() const {
+ 	return _parameters.shadow_occluders_mask;
+ }
+ 
++// COSMOS R2.1: install/clear the frozen-per-epoch near-field bake. `d` is CosmosTruePlace.pack_bake_params
++// flattened to plain packed arrays (no chart topology crosses here — see cosmos_bake.h). enabled=false (or
++// an empty dict) restores the plain flat mesher exactly. Written under the parameters write-lock so the mesh
++// workers pick up the whole frozen blob atomically via their build() snapshot.
++void VoxelMesherBlocky::set_cosmos_bake(Dictionary d) {
++	CosmosBakeParams cb;
++	cb.enabled = bool(d.get("enabled", false));
++	if (cb.enabled) {
++		cb.n = int(d.get("n", 1));
++		cb.R = float(d.get("R", 1.0));
++		cb.home = int(d.get("home", 0));
++		const PackedInt32Array mw = d.get("mw", PackedInt32Array());
++		for (int i = 0; i < 4 && i < mw.size(); ++i) {
++			cb.mw[i] = mw[i];
++		}
++		const PackedInt32Array eb = d.get("edge_b", PackedInt32Array());
++		const PackedFloat32Array em = d.get("edge_m", PackedFloat32Array());
++		const PackedFloat32Array et = d.get("edge_t", PackedFloat32Array());
++		for (int s = 0; s < 4; ++s) {
++			if (s < eb.size()) {
++				cb.edges[s].b = eb[s];
++			}
++			for (int k = 0; k < 4; ++k) {
++				if (s * 4 + k < em.size()) {
++					cb.edges[s].m[k] = em[s * 4 + k];
++				}
++			}
++			for (int k = 0; k < 2; ++k) {
++				if (s * 2 + k < et.size()) {
++					cb.edges[s].t[k] = et[s * 2 + k];
++				}
++			}
++		}
++		const PackedFloat32Array an = d.get("axis_n", PackedFloat32Array());
++		const PackedFloat32Array au = d.get("axis_u", PackedFloat32Array());
++		const PackedFloat32Array av = d.get("axis_v", PackedFloat32Array());
++		for (int f = 0; f < 6; ++f) {
++			for (int k = 0; k < 3; ++k) {
++				if (f * 3 + k < an.size()) {
++					cb.axis_n[f][k] = an[f * 3 + k];
++				}
++				if (f * 3 + k < au.size()) {
++					cb.axis_u[f][k] = au[f * 3 + k];
++				}
++				if (f * 3 + k < av.size()) {
++					cb.axis_v[f][k] = av[f * 3 + k];
++				}
++			}
++		}
++		const PackedFloat32Array dc = d.get("dcam", PackedFloat32Array());
++		for (int k = 0; k < 3 && k < dc.size(); ++k) {
++			cb.dcam[k] = dc[k];
++		}
++		cb.ycam = float(d.get("ycam", 0.0));
++		const PackedFloat32Array mt = d.get("mt", PackedFloat32Array());
++		for (int r = 0; r < 3; ++r) {
++			for (int c = 0; c < 3; ++c) {
++				if (r * 3 + c < mt.size()) {
++					cb.mt_row[r][c] = mt[r * 3 + c];
++				}
++			}
++		}
++	}
++	RWLockWrite wlock(_parameters_lock);
++	_parameters.cosmos = cb;
++}
++
++Vector3 VoxelMesherBlocky::cosmos_debug_place(double vx, double vy, double vz) const {
++	CosmosBakeParams cb;
++	{
++		RWLockRead rlock(_parameters_lock);
++		cb = _parameters.cosmos;
++	}
++	Vector3 out;
++	if (cosmos_bake_place(cb, vx, vy, vz, out)) {
++		return out;
++	}
++	return Vector3(1.0e18, 1.0e18, 1.0e18); // wedge sentinel (matches CosmosTruePlace._WEDGE)
++}
++
+ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
+ 	const VoxelBuffer::ChannelId channel = VoxelBuffer::CHANNEL_TYPE;
+ 	Parameters params;
+@@ -747,6 +828,70 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
+ 		}
+ 	}
+ 
++	// COSMOS R2.1: near-field real-geometry bake (docs/COSMOS-REAL-GEOMETRY-STUDY §2). Transform every
++	// vertex from window space to its true epoch-frame sphere position — a CPU transcription of place_true,
++	// validated headlessly by verify_cosmos_bake_mirror (mirror == place_true, 4/0) — and DROP triangles
++	// touching a double-out corner wedge (the corner-closure theorem guarantees the strips still close, so
++	// no hole). The window→true map is orientation-REVERSING (negative-determinant reflection: the sphere
++	// radial is the middle axis), which flips triangle winding under CULL_BACK → faces render inward; so we
++	// swap b↔c on every kept triangle, exactly as the far bake does. Normal = the outward radial (mt·d̂),
++	// the far layer's proven-acceptable v1 normal in this ambient-lit scene. Runs on the mesh worker with a
++	// per-mesher frozen params snapshot (thread-safe). Disabled → the flat mesher is byte-identical.
++	if (params.cosmos.enabled) {
++		const CosmosBakeParams &cb = params.cosmos;
++		const Vector3i wo = input.origin_in_voxels; // block's window voxel origin
++		for (Arrays &arrays : arrays_per_material) {
++			const unsigned int vcount = (unsigned int)arrays.positions.size();
++			if (vcount == 0) {
++				continue;
++			}
++			const bool has_normals = (arrays.normals.size() == vcount);
++			StdVector<uint8_t> is_wedge;
++			is_wedge.resize(vcount);
++			for (unsigned int i = 0; i < vcount; ++i) {
++				const Vector3f lp = arrays.positions[i]; // window-local (captured by value before overwrite)
++				const double vx = double(wo.x) + double(lp.x);
++				const double vy = double(wo.y) + double(lp.y);
++				const double vz = double(wo.z) + double(lp.z);
++				Vector3 tp;
++				if (cosmos_bake_place(cb, vx, vy, vz, tp)) {
++					arrays.positions[i] = Vector3f((float)tp.x, (float)tp.y, (float)tp.z);
++					if (has_normals) {
++						Vector3 tn;
++						if (cosmos_bake_radial(cb, vx, vz, tn)) {
++							arrays.normals[i] = Vector3f((float)tn.x, (float)tn.y, (float)tn.z);
++						}
++					}
++					is_wedge[i] = 0;
++				} else {
++					arrays.positions[i] = Vector3f(0.f, 0.f, 0.f); // unreferenced once its triangles are culled
++					is_wedge[i] = 1;
++				}
++			}
++			// Rebuild indices: drop wedge-touching triangles, reverse winding (b↔c) on the rest.
++			StdVector<int> &idx = arrays.indices;
++			unsigned int w = 0;
++			for (unsigned int t = 0; t + 3 <= (unsigned int)idx.size(); t += 3) {
++				const int ia = idx[t];
++				const int ib = idx[t + 1];
++				const int ic = idx[t + 2];
++				if (is_wedge[ia] || is_wedge[ib] || is_wedge[ic]) {
++					continue;
++				}
++				idx[w++] = ia;
++				idx[w++] = ic;
++				idx[w++] = ib;
++			}
++			idx.resize(w);
++			// Every triangle culled (a fully-wedge corner block): clear the arrays so the surface loop below
++			// skips it (its `positions.size() != 0` guard) — an indexed surface with 0 indices errors on
++			// upload with NO_INDEX_ARRAY (the same class fixed in the far bake).
++			if (w == 0) {
++				arrays.clear();
++			}
++		}
++	}
++
+ 	// TODO Optimization: we could return a single byte array and use Mesh::add_surface down the line?
+ 	// That API does not seem to exist yet though.
+ 
+@@ -912,6 +1057,10 @@ void VoxelMesherBlocky::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_library", "voxel_library"), &VoxelMesherBlocky::set_library);
+ 	ClassDB::bind_method(D_METHOD("get_library"), &VoxelMesherBlocky::get_library);
+ 
++	ClassDB::bind_method(D_METHOD("set_cosmos_bake", "params"), &VoxelMesherBlocky::set_cosmos_bake);
++	ClassDB::bind_method(
++			D_METHOD("cosmos_debug_place", "vx", "vy", "vz"), &VoxelMesherBlocky::cosmos_debug_place);
++
+ 	ClassDB::bind_method(D_METHOD("set_occlusion_enabled", "enable"), &VoxelMesherBlocky::set_occlusion_enabled);
+ 	ClassDB::bind_method(D_METHOD("get_occlusion_enabled"), &VoxelMesherBlocky::get_occlusion_enabled);
+ 
+diff --git a/meshers/blocky/voxel_mesher_blocky.h b/meshers/blocky/voxel_mesher_blocky.h
+index 842ffac..261138e 100644
+--- a/meshers/blocky/voxel_mesher_blocky.h
++++ b/meshers/blocky/voxel_mesher_blocky.h
+@@ -2,8 +2,10 @@
+ #define VOXEL_MESHER_BLOCKY_H
+ 
+ #include "../../util/godot/classes/mesh.h"
++#include "../../util/godot/core/dictionary.h"
+ #include "../../util/thread/rw_lock.h"
+ #include "../voxel_mesher.h"
++#include "cosmos_bake.h"
+ #include "voxel_blocky_library_base.h"
+ 
+ #include <vector>
+@@ -46,6 +48,15 @@ public:
+ 
+ 	void build(VoxelMesher::Output &output, const VoxelMesher::Input &input) override;
+ 
++	// COSMOS R2.1: install/clear the frozen-per-epoch near-field bake (docs/COSMOS-REAL-GEOMETRY-STUDY §2).
++	// `params_dict` is CosmosTruePlace.pack_bake_params flattened (empty/enabled=false → plain flat mesher).
++	void set_cosmos_bake(Dictionary params_dict);
++
++	// COSMOS R2.1 gate hook: run the COMPILED bake on one terrain-local voxel index and return its true
++	// epoch-frame position (or (1e18,1e18,1e18) for a wedge). Lets verify_cosmos_bake_cpp assert the compiled
++	// C++ == place_true, catching transcription typos without reading RID block meshes. Cheap, test-only.
++	Vector3 cosmos_debug_place(double vx, double vy, double vz) const;
++
+ 	// TODO GDX: Resource::duplicate() cannot be overriden (while it can in modules).
+ 	// This will lead to performance degradation and maybe unexpected behavior
+ #if defined(ZN_GODOT)
+@@ -100,6 +111,7 @@ private:
+ 		bool bake_occlusion = true;
+ 		uint8_t shadow_occluders_mask = 0;
+ 		Ref<VoxelBlockyLibraryBase> library;
++		CosmosBakeParams cosmos; // COSMOS R2.1: near-field true-position bake (disabled by default)
+ 	};
+ 
+ 	struct Cache {

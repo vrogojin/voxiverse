@@ -142,6 +142,53 @@ static func place_true(chart: CosmosChart, w: Vector3, frame: Dictionary) -> Vec
 	return (frame["mt"] as Basis) * rel
 
 # ============================================================================================
+#  R1 REAL-GEOMETRY BAKE (docs/COSMOS-REAL-GEOMETRY-STUDY §1) — CPU, no shader
+# ============================================================================================
+# The bake reuses the SAME place_true math (gate-proven 11/0), run at mesh-build time, so curved geometry
+# is REAL vertices a headless gate can byte-check — nothing chart-shaped crosses the GPU boundary. The bake
+# frame is anchored at the EPOCH anchor (the chart origin at the last flip, fixed per epoch — NOT per-frame;
+# the rigid alignment root absorbs the walk). A per-TILE local origin keeps baked offsets ≤ tile scale so
+# f32 is exact (ULP 7.6e-6 at ≤64 blocks). is_wedge() tells a builder to CULL a double-out vertex/tile.
+
+## The epoch bake frame: the camera_frame anchored at the epoch anchor `anchor_w` (window coord). Holds
+## d̂_cam / y_cam / M_tangent / w_cam at the anchor — the frozen orientation the whole epoch bakes into.
+static func bake_frame(chart: CosmosChart, anchor_w: Vector3) -> Dictionary:
+	return camera_frame(chart, anchor_w)
+
+## True (bake) position of window point `w`=(x,y,z) in the epoch anchor frame — identical to place_true, but
+## named for the bake path. Wedge → _WEDGE sentinel (the caller culls). f64 (Vector3 f32 in practice).
+static func bake_true(chart: CosmosChart, w: Vector3, frame: Dictionary) -> Vector3:
+	return place_true(chart, w, frame)
+
+## Bake `w` to a per-TILE-LOCAL vertex: the true position minus the tile's own true origin, so the emitted
+## vertex stays small (f32-exact) and the tile NODE is placed at `local_origin_true`. Returns _WEDGE for a
+## wedge vertex so the builder drops the triangle (the corner-closure theorem guarantees no hole).
+static func bake_local(chart: CosmosChart, w: Vector3, frame: Dictionary, local_origin_true: Vector3) -> Vector3:
+	var t := place_true(chart, w, frame)
+	if t == _WEDGE:
+		return _WEDGE
+	return t - local_origin_true
+
+## True iff window point `w` folds to the double-out corner WEDGE (no true face) — the builder culls it.
+static func is_wedge(chart: CosmosChart, x: float, z: float) -> bool:
+	return dir_of_window(chart, x, z) == Vector3.ZERO
+
+## The RIGID ALIGNMENT ROOT transform (study §1.2) for the render root that holds epoch-frame baked geometry
+## (baked vertex + tile local_origin are in the epoch anchor frame). As the player walks from the anchor,
+## the far world must (a) put the player's TRUE position back at their scene/window position (ground under
+## them, near field joins) and (b) map the player's LOCAL TANGENT FRAME to the world window frame — so the
+## radial levels to +Y AND window-east/north render along world-east/north (no azimuthal drift; a yaw-only
+## level would leave the far horizon rotated vs the window, opening a distance-growing seam). Full-basis
+## form: F.basis = mt_player · mt_anchorᵀ maps epoch → world so the player's tangent axes land on the world
+## axes; origin places player-true → player-scene. Pure Transform3D, no shader. F·place_true(player)==player.
+static func alignment_transform(chart: CosmosChart, bake_frame: Dictionary, w_player: Vector3) -> Transform3D:
+	var pe := place_true(chart, w_player, bake_frame)               # player true position in the epoch frame
+	var mt_anchor: Basis = bake_frame["mt"]
+	var mt_player: Basis = camera_frame(chart, w_player)["mt"]       # the player's own tangent frame
+	var basis := mt_player * mt_anchor.transposed()                # epoch-frame direction → world (leveled + yawed)
+	return Transform3D(basis, w_player - basis * pe)
+
+# ============================================================================================
 #  THE SHADER (GPU mirror of place_point / place_true) + the chart table
 # ============================================================================================
 # The shader lives here so the ONE placement formula (§2.1 + the bubble) is authored once and shared with

@@ -137,6 +137,7 @@ func _ready() -> void:
 		# FLAT_WORLD (no chart) leaves it at ZERO → byte-identical to the pre-COSMOS far layer.
 		if _chart != null:
 			_far.position = _chart.node_origin()      # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org (=−org at spawn)
+			_far.set_chart(_chart)                     # COSMOS R1 (M5_REAL): the far bakes/aligns against the chart
 
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
@@ -849,6 +850,8 @@ func install_chart(chart: CosmosChart) -> void:
 		TerrainConfig.set_active_frame(chart.face, CubeSphere.d4_of(chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1)
 		if environment != null:
 			environment.set_chart(chart)
+		if _far != null:
+			_far.set_chart(chart)   # COSMOS R1 (M5_REAL): keep the far's bake/align chart current
 		_m5_sync_frame()   # COSMOS M5a: chart table (org/M_win/face axes) → true-position shader
 
 ## COSMOS M5a: push the per-FRAME camera frame (d̂_cam / y_cam / M_tangent + camera origin) into the
@@ -857,6 +860,13 @@ func m5_push_camera(cam: Vector3) -> void:
 	if _chart == null or not CubeSphere.M5_RENDER:
 		return
 	CosmosTruePlace.push_camera(_chart, cam)
+
+## COSMOS R1 (M5_REAL): drive the far layer's per-frame rigid alignment root from the player position.
+## Called each frame by main.gd in curved mode. No-op without the far / a chart.
+func m5_real_update_far(player_pos: Vector3) -> void:
+	if _far == null or _chart == null or not CubeSphere.M5_REAL:
+		return
+	_far.update_alignment(player_pos)
 
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).

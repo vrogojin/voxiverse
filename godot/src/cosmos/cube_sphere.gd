@@ -119,6 +119,15 @@ const FLAT_WORLD := true
 ## live; requires FLAT_WORLD = false (curved). FLAT_WORLD untouched by M5.
 const M5_RENDER := false
 
+## COSMOS R1 (docs/COSMOS-REAL-GEOMETRY-STUDY §8): the REAL-BAKED-GEOMETRY toggle — "the inflated rubber
+## cube". DEFAULT false → the shipped CosmosBend shader path (byte-identical to M4). Flip to true to bake
+## the FAR layer (+ later water/debris) at TRUE sphere positions on the CPU via CosmosTruePlace.place_true
+## (per-tile local origin), cull the far wedge tiles, and level the render with a rigid alignment-root
+## transform — NO custom shader crosses the GPU boundary (the class that broke M5a twice). Supersedes the
+## M5a placement shader (M5_RENDER); the two are mutually exclusive (M5_REAL wins). Requires FLAT_WORLD =
+## false (curved). Bake-parity is a headless gate (baked vertex == place_true == world_point).
+const M5_REAL := false
+
 ## The cube face the M1 window is homed on (§3.5: "flat world reinterpreted as a face-4 window").
 ## Face 4 is +Z polar (a pole on the face centre, §5.2) so the window is defect-free lattice.
 const HOME_FACE := 4

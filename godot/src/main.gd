@@ -90,10 +90,15 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
+	var cam := _player.camera_global_transform().origin
 	if CubeSphere.M5_RENDER:
-		_player.world.m5_push_camera(_player.camera_global_transform().origin)
+		_player.world.m5_push_camera(cam)
 	else:
-		CosmosBend.set_camera(_player.camera_global_transform().origin)
+		CosmosBend.set_camera(cam)                     # near field: still the camera-centred bend (R1)
+		if CubeSphere.M5_REAL:
+			# R1 real geometry: level the baked far layer under the camera each frame (pure Transform3D,
+			# no shader). Camera origin matches the bend centre → the near/far join is exact at the camera.
+			_player.world.m5_real_update_far(cam)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

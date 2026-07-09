@@ -142,27 +142,38 @@ static func place_true(chart: CosmosChart, w: Vector3, frame: Dictionary) -> Vec
 	return (frame["mt"] as Basis) * rel
 
 # ============================================================================================
-#  THE SHADER (GPU mirror of place_point / place_true) + the global-uniform chart table
+#  THE SHADER (GPU mirror of place_point / place_true) + the chart table
 # ============================================================================================
-# The shader lives here so the ONE placement formula (§2.1 + the bubble) is authored once and shared
-# with the CPU mirror above. Every uniform below is a runtime-registered GLOBAL shader parameter, so a
-# single push updates ALL M5 materials (terrain, water, VoxelBody, far tiles) with no per-material state —
-# exactly the CosmosBend pattern, extended with the per-frame camera frame + the flip-time chart table.
-# Godot global params carry no arrays, so the 4-strip fold table is flattened to per-side scalars (s0=EAST,
-# s1=WEST, s2=NORTH, s3=SOUTH — the _fold_f classify order). Registered/pushed only when M5_RENDER is on;
-# under FLAT_WORLD / default M5_RENDER=false no M5 material is ever built (CosmosBend stays byte-identical).
+# The shader lives here so the ONE placement formula (§2.1 + the bubble) is authored once and shared with
+# the CPU mirror above. AFTER the first WebGL2 deploy scrambled the strips while the CPU mirror passed 11/0,
+# Fable diagnosed a uniform-TRANSPORT bug (COSMOS-PROJECTION-STUDY §3): the 5-chart fold table had been
+# minted as ~30 scalar GLOBAL params (Godot globals cannot be arrays), and one wrong index/sign there
+# scrambles a whole strip — invisible to the math-only mirror. The fix (this file):
+#   * the chart table is now PER-MATERIAL uniform ARRAYS (indexed 0=home, 1=EAST, 2=WEST, 3=NORTH,
+#     4=SOUTH; a wedge vertex is idx 5, handled before any array read). Home carries an IDENTITY fold
+#     affine so home + strips share ONE code path (no special-case branch to get wrong).
+#   * ONE writer — set_chart_table() — packs the table once and applies it to EVERY registered M5 material
+#     (near opaque/translucent + far) in the SAME call, so near and far can never drift apart (the
+#     LOD/chunk-divergence class). A snapshot is kept so a lazily-built material gets the current table on
+#     register(). The per-FRAME camera frame stays scalar GLOBALS (allowed, already proven by the bend).
+#   * verify_cosmos_m5_parity transcribes this GLSL against the SAME packed arrays and diffs vs place_point
+#     — the headless catch for exactly the packing class that slipped past 11/0.
+# Registered/built only when M5_RENDER is on; default false → no M5 material exists (CosmosBend byte-identical).
 
 const U_CAM := "cosmos_bend_origin"          # reuse the bend camera-origin global (camera WINDOW world pos = w_cam)
 const U_RADIUS := "cosmos_radius"            # reuse the bend datum-radius global (R)
+const U_DEBUG := "m5_debug_chart"           # global bool: paint each vertex by its classified chart (debug)
 
 static var _opaque_m5: Shader = null
 static var _translucent_m5: Shader = null
 static var _far_m5: Shader = null
 static var _globals_m5_ready := false
+static var _materials: Array = []            # every live M5 ShaderMaterial (near ids + far) — the writer's fan-out
+static var _snapshot: Dictionary = {}        # last packed chart table (uniform name → value); applied to late registrants
 
-## Register every M5 global shader parameter exactly once (latched — see CosmosBend.ensure_globals for
-## why we never probe first: the get/list calls are editor-only and tank the GLES3 export). MUST run
-## before any M5 material is built (a `global uniform` a shader references must already exist).
+## Register the M5 SCALAR global shader params exactly once (latched — see CosmosBend.ensure_globals for why
+## we never probe first). The chart TABLE is no longer global (it is per-material arrays); only the per-frame
+## camera frame + the debug toggle live here. MUST run before any M5 material is built.
 static func ensure_globals_m5() -> void:
 	if _globals_m5_ready:
 		return
@@ -172,18 +183,22 @@ static func ensure_globals_m5() -> void:
 	RS.global_shader_parameter_add("m5_dcam", RS.GLOBAL_VAR_TYPE_VEC3, Vector3(0, 1, 0))
 	RS.global_shader_parameter_add("m5_ycam", RS.GLOBAL_VAR_TYPE_FLOAT, 0.0)
 	RS.global_shader_parameter_add("m5_mt", RS.GLOBAL_VAR_TYPE_MAT3, Basis.IDENTITY)
-	RS.global_shader_parameter_add("m5_org", RS.GLOBAL_VAR_TYPE_VEC2, Vector2.ZERO)
-	RS.global_shader_parameter_add("m5_mwin", RS.GLOBAL_VAR_TYPE_VEC4, Vector4(1, 0, 0, 1))
-	RS.global_shader_parameter_add("m5_n", RS.GLOBAL_VAR_TYPE_FLOAT, 1.0)
-	for nm: String in ["m5_hn", "m5_hu", "m5_hv"]:
-		RS.global_shader_parameter_add(nm, RS.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
-	for k: int in range(4):
-		RS.global_shader_parameter_add("m5_s%dm" % k, RS.GLOBAL_VAR_TYPE_VEC4, Vector4(1, 0, 0, 1))
-		RS.global_shader_parameter_add("m5_s%dt" % k, RS.GLOBAL_VAR_TYPE_VEC2, Vector2.ZERO)
-		RS.global_shader_parameter_add("m5_s%dn" % k, RS.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
-		RS.global_shader_parameter_add("m5_s%du" % k, RS.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
-		RS.global_shader_parameter_add("m5_s%dv" % k, RS.GLOBAL_VAR_TYPE_VEC3, Vector3.ZERO)
+	RS.global_shader_parameter_add(U_DEBUG, RS.GLOBAL_VAR_TYPE_BOOL, false)
 	_globals_m5_ready = true
+
+## Register an M5 material with the single-writer fan-out. Called at material build (BlockMaterials /
+## FarTerrain). Idempotent; a material built after a chart change gets the current table immediately.
+static func register_material(m: ShaderMaterial) -> void:
+	if m == null or _materials.has(m):
+		return
+	_materials.append(m)
+	if not _snapshot.is_empty():
+		_apply_snapshot(m)
+
+## Drop the material registry (BlockMaterials.reset_cache session boundary — the cached materials are
+## rebuilt fresh, so the old instances must not linger in the fan-out list).
+static func reset_materials() -> void:
+	_materials.clear()
 
 ## Per-FRAME push (main.gd → WorldManager): the camera frame globals for `cam` (camera WINDOW position).
 ## Mirrors camera_frame(): d̂_cam / y_cam / M_tangent + the camera origin (bubble centre) + R.
@@ -197,81 +212,131 @@ static func push_camera(chart: CosmosChart, cam: Vector3) -> void:
 	RS.global_shader_parameter_set("m5_ycam", float(fr["y_cam"]))
 	RS.global_shader_parameter_set("m5_mt", fr["mt"])
 
-## Frame-CHANGE push (WorldManager, at every set_active_frame / reanchor site): the chart-orientation +
-## 5-chart fold table. org + M_win change on reanchor/flip; the axes on a face flip. Cheap enough to push
-## the whole table at each (a handful of RenderingServer sets, only on those discrete events).
-static func push_chart_table(chart: CosmosChart) -> void:
-	ensure_globals_m5()
-	var RS := RenderingServer
+## Frame-CHANGE writer (WorldManager, at every set_active_frame / reanchor site): pack the chart-orientation
+## + 5-chart fold table ONCE and apply it to EVERY registered M5 material in this single call (the single-
+## writer rule — near + far can never drift). Also snapshots it for materials built later. Index convention:
+## 0 = home (IDENTITY fold affine), 1 = EAST, 2 = WEST, 3 = NORTH, 4 = SOUTH; wedge (idx 5) reads no array.
+static func set_chart_table(chart: CosmosChart) -> void:
+	_snapshot = pack_chart_table(chart)
+	for m in _materials:
+		_apply_snapshot(m)
+
+## Pack the chart table into the per-material uniform dictionary (also the input the parity harness diffs).
+## Kept pure (no RenderingServer / material side effects) so verify can call it directly.
+static func pack_chart_table(chart: CosmosChart) -> Dictionary:
 	var n := chart.n
-	RS.global_shader_parameter_set("m5_org", Vector2(float(chart.i_org), float(chart.j_org)))
-	RS.global_shader_parameter_set("m5_mwin", Vector4(float(chart.mw_a), float(chart.mw_b), float(chart.mw_c), float(chart.mw_d)))
-	RS.global_shader_parameter_set("m5_n", float(n))
-	RS.global_shader_parameter_set("m5_hn", _axisf(CubeSphere._axis_n(chart.face)))
-	RS.global_shader_parameter_set("m5_hu", _axisf(CubeSphere._axis_u(chart.face)))
-	RS.global_shader_parameter_set("m5_hv", _axisf(CubeSphere._axis_v(chart.face)))
+	var cm: Array = []          # vec4[5]  edge affine (m0,m1,m2,m3) per chart
+	var ct: Array = []          # vec2[5]  edge translation (t0,t1)
+	var an: Array = []          # vec3[5]  true face n̂
+	var au: Array = []          # vec3[5]  true face û
+	var av: Array = []          # vec3[5]  true face v̂
+	cm.resize(5); ct.resize(5); an.resize(5); au.resize(5); av.resize(5)
+	# idx 0 = home: identity fold (fc = p) + home face axes
+	cm[0] = Vector4(1, 0, 0, 1); ct[0] = Vector2(0, 0)
+	an[0] = _axisf(CubeSphere._axis_n(chart.face))
+	au[0] = _axisf(CubeSphere._axis_u(chart.face))
+	av[0] = _axisf(CubeSphere._axis_v(chart.face))
+	# idx 1..4 = EAST/WEST/NORTH/SOUTH strips (the _fold_f classify order): edge affine + neighbour axes
 	var sides := [CubeSphere.SIDE_EAST, CubeSphere.SIDE_WEST, CubeSphere.SIDE_NORTH, CubeSphere.SIDE_SOUTH]
 	for k: int in range(4):
 		var e := CubeSphere.edge_remap(chart.face, int(sides[k]), n)
 		var m: Array = e["m"]
 		var t: Array = e["t"]
 		var fb := int(e["b"])
-		RS.global_shader_parameter_set("m5_s%dm" % k, Vector4(float(m[0]), float(m[1]), float(m[2]), float(m[3])))
-		RS.global_shader_parameter_set("m5_s%dt" % k, Vector2(float(t[0]), float(t[1])))
-		RS.global_shader_parameter_set("m5_s%dn" % k, _axisf(CubeSphere._axis_n(fb)))
-		RS.global_shader_parameter_set("m5_s%du" % k, _axisf(CubeSphere._axis_u(fb)))
-		RS.global_shader_parameter_set("m5_s%dv" % k, _axisf(CubeSphere._axis_v(fb)))
+		cm[k + 1] = Vector4(float(m[0]), float(m[1]), float(m[2]), float(m[3]))
+		ct[k + 1] = Vector2(float(t[0]), float(t[1]))
+		an[k + 1] = _axisf(CubeSphere._axis_n(fb))
+		au[k + 1] = _axisf(CubeSphere._axis_u(fb))
+		av[k + 1] = _axisf(CubeSphere._axis_v(fb))
+	return {
+		"chart_org": Vector2(float(chart.i_org), float(chart.j_org)),
+		"chart_mwin": Vector4(float(chart.mw_a), float(chart.mw_b), float(chart.mw_c), float(chart.mw_d)),
+		"chart_ncells": float(n),
+		"chart_m": cm, "chart_t": ct, "chart_axn": an, "chart_axu": au, "chart_axv": av,
+	}
+
+## The last packed chart table (uniform name → value) — read by the parity harness.
+static func chart_snapshot() -> Dictionary:
+	return _snapshot
+
+static func _apply_snapshot(m: ShaderMaterial) -> void:
+	for key: String in _snapshot:
+		m.set_shader_parameter(key, _snapshot[key])
 
 static func _axisf(a: Vector3i) -> Vector3:
 	return Vector3(float(a.x), float(a.y), float(a.z))
 
-## The M5 global-uniform declaration block, prepended to each shader variant (one authored list).
+## Toggle the chart-ID debug albedo (Fable §3.2): paint each vertex by its classified chart so one live
+## screenshot shows exactly which vertices misclassify. Global bool → flips all M5 materials at once.
+static func set_debug_chart(on: bool) -> void:
+	ensure_globals_m5()
+	RenderingServer.global_shader_parameter_set(U_DEBUG, on)
+
+## The per-material chart-table uniform declarations, prepended to each shader. ARRAYS (per-material — the
+## fix): Godot's shader language allows uniform arrays on materials (only GLOBAL params can't be arrays).
 const _M5_UNIFORMS := """global uniform vec3 cosmos_bend_origin;
 global uniform float cosmos_radius;
 global uniform vec3 m5_dcam;
 global uniform float m5_ycam;
 global uniform mat3 m5_mt;
-global uniform vec2 m5_org;
-global uniform vec4 m5_mwin;
-global uniform float m5_n;
-global uniform vec3 m5_hn; global uniform vec3 m5_hu; global uniform vec3 m5_hv;
-global uniform vec4 m5_s0m; global uniform vec2 m5_s0t; global uniform vec3 m5_s0n; global uniform vec3 m5_s0u; global uniform vec3 m5_s0v;
-global uniform vec4 m5_s1m; global uniform vec2 m5_s1t; global uniform vec3 m5_s1n; global uniform vec3 m5_s1u; global uniform vec3 m5_s1v;
-global uniform vec4 m5_s2m; global uniform vec2 m5_s2t; global uniform vec3 m5_s2n; global uniform vec3 m5_s2u; global uniform vec3 m5_s2v;
-global uniform vec4 m5_s3m; global uniform vec2 m5_s3t; global uniform vec3 m5_s3n; global uniform vec3 m5_s3u; global uniform vec3 m5_s3v;
+global uniform bool m5_debug_chart;
+uniform vec2 chart_org;
+uniform vec4 chart_mwin;
+uniform float chart_ncells;
+uniform vec4 chart_m[5];
+uniform vec2 chart_t[5];
+uniform vec3 chart_axn[5];
+uniform vec3 chart_axu[5];
+uniform vec3 chart_axv[5];
+varying flat float v_chart;
 """
 
-## Shared GLSL prefix: classify the window vertex through the chart (raw p → 5-chart fold → n̂/û/v̂ + face
-## coord), emitting _wedge / _nn / _uu / _vv / _fc / _ident / _s. Mirrors _raw_of_f + _fold_f + dir setup.
+## The chart-ID debug palette (home grey / EAST red / WEST blue / NORTH green / SOUTH yellow / wedge magenta).
+const _M5_DEBUG_FN := """
+vec3 _m5_chart_color(float c) {
+	if (c < 0.5) return vec3(0.60, 0.60, 0.60);
+	if (c < 1.5) return vec3(0.90, 0.20, 0.20);
+	if (c < 2.5) return vec3(0.20, 0.50, 0.90);
+	if (c < 3.5) return vec3(0.20, 0.80, 0.20);
+	if (c < 4.5) return vec3(0.90, 0.80, 0.20);
+	return vec3(1.00, 0.00, 1.00);
+}
+"""
+
+## Shared GLSL classify prefix: window vertex → raw p → 5-chart index (0 home / 1-4 strips / 5 wedge) →
+## fold coord _fc + true face axes _nn/_uu/_vv, plus _ident and the bubble weight _s. Mirrors _raw_of_f +
+## _fold_f. Home (idx 0) carries an identity affine so it shares the strip fold expression. v_chart set for
+## the debug view. WebGL2 (GLSL ES 3.00) permits dynamic indexing of uniform arrays.
 const _M5_CLASSIFY := """
 	vec3 _wv = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	vec2 _w = _wv.xz;
 	vec3 _ident = _wv - cosmos_bend_origin;
 	float _s = smoothstep(16.0, 104.0, length(_wv.xz - cosmos_bend_origin.xz));
-	vec2 _p = m5_org + vec2(m5_mwin.x * _w.x + m5_mwin.y * _w.y, m5_mwin.z * _w.x + m5_mwin.w * _w.y);
-	bool _oi = (_p.x < 0.0) || (_p.x >= m5_n);
-	bool _oj = (_p.y < 0.0) || (_p.y >= m5_n);
-	vec3 _nn = m5_hn; vec3 _uu = m5_hu; vec3 _vv = m5_hv; vec2 _fc = _p; bool _wedge = false;
-	if (_oi && _oj) { _wedge = true; }
-	else if (_oi || _oj) {
-		vec4 _m; vec2 _t;
-		if (_p.x >= m5_n) { _m = m5_s0m; _t = m5_s0t; _nn = m5_s0n; _uu = m5_s0u; _vv = m5_s0v; }
-		else if (_p.x < 0.0) { _m = m5_s1m; _t = m5_s1t; _nn = m5_s1n; _uu = m5_s1u; _vv = m5_s1v; }
-		else if (_p.y >= m5_n) { _m = m5_s2m; _t = m5_s2t; _nn = m5_s2n; _uu = m5_s2u; _vv = m5_s2v; }
-		else { _m = m5_s3m; _t = m5_s3t; _nn = m5_s3n; _uu = m5_s3u; _vv = m5_s3v; }
-		_fc = vec2(_m.x * _p.x + _m.y * _p.y + _t.x, _m.z * _p.x + _m.w * _p.y + _t.y);
-	}
+	vec2 _p = chart_org + vec2(chart_mwin.x * _w.x + chart_mwin.y * _w.y, chart_mwin.z * _w.x + chart_mwin.w * _w.y);
+	bool _oi = (_p.x < 0.0) || (_p.x >= chart_ncells);
+	bool _oj = (_p.y < 0.0) || (_p.y >= chart_ncells);
+	int _idx;
+	if (_oi && _oj) { _idx = 5; }
+	else if (!_oi && !_oj) { _idx = 0; }
+	else if (_p.x >= chart_ncells) { _idx = 1; }
+	else if (_p.x < 0.0) { _idx = 2; }
+	else if (_p.y >= chart_ncells) { _idx = 3; }
+	else { _idx = 4; }
+	v_chart = float(_idx);
+	int _ai = (_idx == 5) ? 0 : _idx;
+	vec4 _m = chart_m[_ai]; vec2 _t = chart_t[_ai];
+	vec2 _fc = vec2(_m.x * _p.x + _m.y * _p.y + _t.x, _m.z * _p.x + _m.w * _p.y + _t.y);
+	vec3 _nn = chart_axn[_ai]; vec3 _uu = chart_axu[_ai]; vec3 _vv = chart_axv[_ai];
 """
 
-## NEAR vertex body (opaque/translucent): the classify prefix + the INTERACTION BUBBLE
-## (render = mix(ident, true, s); wedge = fading echo ident·(1−s)). Mirrors place_point.
+## NEAR vertex body: classify + the INTERACTION BUBBLE (render = mix(ident, true, s); wedge = fading echo).
 const _M5_VERTEX_NEAR := _M5_CLASSIFY + """
 	vec3 _out;
-	if (_wedge) {
+	if (_idx == 5) {
 		_out = _ident * (1.0 - _s);
 	} else {
-		float _a = 2.0 * _fc.x / m5_n - 1.0;
-		float _b = 2.0 * _fc.y / m5_n - 1.0;
+		float _a = 2.0 * _fc.x / chart_ncells - 1.0;
+		float _b = 2.0 * _fc.y / chart_ncells - 1.0;
 		vec3 _d = normalize(_nn + tan(_a * 0.7853981633974483) * _uu + tan(_b * 0.7853981633974483) * _vv);
 		vec3 _rel = _d * cosmos_radius - m5_dcam * cosmos_radius + _d * _wv.y - m5_dcam * m5_ycam;
 		_out = mix(_ident, m5_mt * _rel, _s);
@@ -279,15 +344,14 @@ const _M5_VERTEX_NEAR := _M5_CLASSIFY + """
 	VERTEX = (inverse(MODEL_MATRIX) * vec4(cosmos_bend_origin + _out, 1.0)).xyz;
 """
 
-## FAR vertex body: the classify prefix + PURE true placement (no bubble — Fable: far = truth); wedge far
-## tiles collapse to the camera (degenerate). Mirrors place_true.
+## FAR vertex body: classify + PURE true placement (no bubble — Fable: far = truth); wedge collapses to cam.
 const _M5_VERTEX_FAR := _M5_CLASSIFY + """
 	vec3 _world;
-	if (_wedge) {
+	if (_idx == 5) {
 		_world = cosmos_bend_origin;
 	} else {
-		float _a = 2.0 * _fc.x / m5_n - 1.0;
-		float _b = 2.0 * _fc.y / m5_n - 1.0;
+		float _a = 2.0 * _fc.x / chart_ncells - 1.0;
+		float _b = 2.0 * _fc.y / chart_ncells - 1.0;
 		vec3 _d = normalize(_nn + tan(_a * 0.7853981633974483) * _uu + tan(_b * 0.7853981633974483) * _vv);
 		vec3 _rel = _d * cosmos_radius - m5_dcam * cosmos_radius + _d * _wv.y - m5_dcam * m5_ycam;
 		_world = cosmos_bend_origin + m5_mt * _rel;
@@ -295,8 +359,7 @@ const _M5_VERTEX_FAR := _M5_CLASSIFY + """
 	VERTEX = (inverse(MODEL_MATRIX) * vec4(_world, 1.0)).xyz;
 """
 
-## Opaque M5 shader — same fragment/uniform surface as CosmosBend.opaque_shader (so BlockMaterials sets
-## the identical shader params); the vertex body is the true-position placement + bubble.
+## Opaque M5 shader — same fragment/param surface as CosmosBend.opaque_shader; vertex = true placement + bubble.
 static func opaque_shader_m5() -> Shader:
 	if _opaque_m5 != null:
 		return _opaque_m5
@@ -308,14 +371,18 @@ uniform bool use_texture = false;
 uniform bool use_vertex_color = true;
 uniform vec3 emission_color = vec3(0.0);
 uniform float emission_energy = 0.0;
+""" + _M5_DEBUG_FN + """
 void vertex() {
 """ + _M5_VERTEX_NEAR + """}
 void fragment() {
-	vec4 col = albedo_color;
-	if (use_texture) { col *= texture(albedo_tex, UV); }
-	if (use_vertex_color) { col.rgb *= COLOR.rgb; }
-	ALBEDO = col.rgb;
-	EMISSION = emission_color * emission_energy;
+	if (m5_debug_chart) { ALBEDO = _m5_chart_color(v_chart); EMISSION = vec3(0.0); }
+	else {
+		vec4 col = albedo_color;
+		if (use_texture) { col *= texture(albedo_tex, UV); }
+		if (use_vertex_color) { col.rgb *= COLOR.rgb; }
+		ALBEDO = col.rgb;
+		EMISSION = emission_color * emission_energy;
+	}
 }
 """
 	_opaque_m5 = s
@@ -330,13 +397,17 @@ static func translucent_shader_m5() -> Shader:
 uniform sampler2D albedo_tex : source_color, filter_nearest_mipmap, repeat_enable;
 uniform vec4 albedo_color : source_color = vec4(1.0);
 uniform bool use_texture = false;
+""" + _M5_DEBUG_FN + """
 void vertex() {
 """ + _M5_VERTEX_NEAR + """}
 void fragment() {
-	vec4 col = albedo_color;
-	if (use_texture) { col *= texture(albedo_tex, UV); }
-	ALBEDO = col.rgb;
-	ALPHA = col.a;
+	if (m5_debug_chart) { ALBEDO = _m5_chart_color(v_chart); ALPHA = 1.0; }
+	else {
+		vec4 col = albedo_color;
+		if (use_texture) { col *= texture(albedo_tex, UV); }
+		ALBEDO = col.rgb;
+		ALPHA = col.a;
+	}
 }
 """
 	_translucent_m5 = s
@@ -347,11 +418,11 @@ static func far_shader_m5() -> Shader:
 	if _far_m5 != null:
 		return _far_m5
 	var s := Shader.new()
-	s.code = "shader_type spatial;\nrender_mode unshaded, cull_back;\n" + _M5_UNIFORMS + """
+	s.code = "shader_type spatial;\nrender_mode unshaded, cull_back;\n" + _M5_UNIFORMS + _M5_DEBUG_FN + """
 void vertex() {
 """ + _M5_VERTEX_FAR + """}
 void fragment() {
-	ALBEDO = COLOR.rgb;
+	ALBEDO = m5_debug_chart ? _m5_chart_color(v_chart) : COLOR.rgb;
 }
 """
 	_far_m5 = s

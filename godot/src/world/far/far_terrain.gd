@@ -139,6 +139,7 @@ static func make_material() -> Material:
 		if CubeSphere.M5_RENDER:
 			CosmosTruePlace.ensure_globals_m5()
 			sm.shader = CosmosTruePlace.far_shader_m5()
+			CosmosTruePlace.register_material(sm)   # single-writer: far gets the chart table with near, same pass
 		else:
 			CosmosBend.ensure_globals()
 			sm.shader = CosmosBend.far_shader()

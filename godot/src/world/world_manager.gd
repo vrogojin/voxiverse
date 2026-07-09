@@ -864,7 +864,7 @@ func m5_push_camera(cam: Vector3) -> void:
 func _m5_sync_frame() -> void:
 	if _chart == null or not CubeSphere.M5_RENDER:
 		return
-	CosmosTruePlace.push_chart_table(_chart)
+	CosmosTruePlace.set_chart_table(_chart)   # single-writer: packs the table + applies to every M5 material this pass
 
 ## The active chart, or null in FLAT_WORLD. Read-only accessor.
 func chart() -> CosmosChart:

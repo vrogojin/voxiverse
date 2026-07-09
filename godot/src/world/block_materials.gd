@@ -84,6 +84,10 @@ static func _bend_material(block_id: int) -> ShaderMaterial:
 		if rd.get("emissive", false):
 			m.set_shader_parameter("emission_color", Color(color.r, color.g, color.b))
 			m.set_shader_parameter("emission_energy", float(rd.get("emissive_glow", 1.0)))
+	# COSMOS M5a: register with the single-writer so the current chart table is applied now (snapshot) and
+	# on every future flip/reanchor in the SAME pass as the far material (kills near/far table divergence).
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.register_material(m)
 	return m
 
 ## The SNOW-CAPPED variant render material for `base_id` (M1 ADR §5.3): the snow_block texture
@@ -117,6 +121,8 @@ static func snow_capped_for(base_id: int) -> StandardMaterial3D:
 static func reset_cache() -> void:
 	_cache.clear()
 	_snow_cache.clear()             # snow-cap variants (M1) rebind per session too
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.reset_materials()   # the M5 single-writer fan-out holds the cached materials — clear it too
 
 ## Update the EXISTING cached Material for `block_id` in place from the catalog look
 ## (RUNTIME-MATERIAL-STREAMING §5.3): when an UNRESOLVED placeholder LRID late-resolves

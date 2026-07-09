@@ -31,7 +31,14 @@ static func get_for(block_id: int) -> Material:
 	# shader so ALL geometry (terrain, water, trees, placed blocks, VoxelBody debris — everything
 	# flows through here) curves onto the sphere with one code path, keeping each block's own albedo/
 	# texture/emission. FLAT_WORLD (default) returns today's StandardMaterial3D — byte-identical.
-	var mat: Material = _standard(block_id) if CubeSphere.FLAT_WORLD else _bend_material(block_id)
+	# COSMOS R2.2 (M5_REAL): the near field is now REAL baked geometry (the C++ mesher places every vertex
+	# at its true sphere position), so it must carry NO bend shader — bending baked verts again would
+	# double-transform them. Return the plain StandardMaterial3D, same as flat (docs/…-REAL-GEOMETRY §1).
+	var mat: Material
+	if CubeSphere.FLAT_WORLD or CubeSphere.M5_REAL:
+		mat = _standard(block_id)
+	else:
+		mat = _bend_material(block_id)
 	_cache[block_id] = mat
 	return mat
 

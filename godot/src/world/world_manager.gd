@@ -42,6 +42,13 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 # in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
 var _flip_settling := false
 
+# COSMOS R2.2 (docs/…-REAL-GEOMETRY §1): the frozen-per-epoch bake frame shared by the near C++ mesher and
+# the far layer, plus its anchor. Empty until m5_real_install_epoch runs (curved + M5_REAL). The near/far
+# geometry is baked STATIC in this frame; the per-frame rigid F (alignment_transform) rotates it to render
+# around the window-space camera. Re-installed at each home-face flip.
+var _epoch_frame: Dictionary = {}
+var _epoch_anchor: Vector3 = Vector3.ZERO
+
 # COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
 # this const + the guard in _write_cell) to drop it. When true, a write to a corner-quadrant window cell
 # (double-out on the active chart) is REFUSED — the wedge is a per-window sampling of the canonical
@@ -185,8 +192,26 @@ func _setup_fallback_path() -> void:
 
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
+	# COSMOS R2.2: install the frozen epoch bake frame + push it to the C++ near mesher BEFORE the viewer
+	# attaches (so the very first streamed block bakes to true geometry, not flat-window). Anchor at the
+	# player's spawn — place_true(anchor)=0, so epoch coords stay smallest around the player.
+	m5_real_install_epoch(player.global_position)
 	if using_module and _module_world != null:
 		_module_world.call("attach_viewer", player)
+
+## COSMOS R2.2: freeze this epoch's shared bake frame (anchored at `anchor`), push its flat params to the
+## C++ near mesher (VoxelMesherBlocky.set_cosmos_bake) so blocky meshes bake to true sphere geometry, and
+## lock the far layer onto the SAME frame so near + far coincide. Re-run at each home-face flip (new epoch).
+## No-op unless curved + M5_REAL + a chart exists → FLAT / R1-only paths are byte-identical.
+func m5_real_install_epoch(anchor: Vector3) -> void:
+	if CubeSphere.FLAT_WORLD or not CubeSphere.M5_REAL or _chart == null:
+		return
+	_epoch_anchor = anchor
+	_epoch_frame = CosmosTruePlace.bake_frame(_chart, anchor)
+	if _module_world != null and _module_world.has_method("set_cosmos_bake"):
+		_module_world.call("set_cosmos_bake", CosmosTruePlace.pack_bake_params_flat(_chart, _epoch_frame))
+	if _far != null and _far.has_method("lock_epoch_frame"):
+		_far.lock_epoch_frame(_epoch_frame)
 
 ## Called every frame with the player's world position (fallback streaming +
 ## keeping the local ground collider centred on the player).
@@ -873,12 +898,43 @@ func m5_push_camera(cam: Vector3) -> void:
 		return
 	CosmosTruePlace.push_camera(_chart, cam)
 
-## COSMOS R1 (M5_REAL): drive the far layer's per-frame rigid alignment root from the player position.
-## Called each frame by main.gd in curved mode. No-op without the far / a chart.
-func m5_real_update_far(player_pos: Vector3) -> void:
-	if _far == null or _chart == null or not CubeSphere.M5_REAL:
+## COSMOS R1/R2.2 (M5_REAL): drive the per-frame render alignment from the player WINDOW position. R1 (no
+## epoch locked, far-only builds) levels the far under the camera. R2.2 (epoch locked, Design Z): the near +
+## far are baked STATIC in the shared epoch frame and the CAMERA moves through them (m5_epoch_camera). We do
+## NOT rotate the VoxelTerrain — godot_voxel inverts a singular basis when its transform is rotated (det==0
+## spam), so the near blocks render at their baked epoch coords via identity placement and the far renders
+## static: apply_alignment(IDENTITY) nets the far node's window offset back out (align_root = (I,−position)),
+## so far tiles sit at epoch coords and still track re-anchors. No-op without the far / a chart.
+func m5_real_update(player_pos: Vector3) -> void:
+	if _chart == null or not CubeSphere.M5_REAL:
 		return
-	_far.update_alignment(player_pos)
+	if not _epoch_frame.is_empty():
+		if _far != null and _far.has_method("apply_alignment"):
+			_far.apply_alignment(Transform3D.IDENTITY)
+		return
+	# R1 far-only fallback (no epoch locked): the far self-refreshes its frame and levels under the camera.
+	if _far != null:
+		_far.update_alignment(player_pos)
+
+## Deprecated R1 name kept for call sites; forwards to the unified updater.
+func m5_real_update_far(player_pos: Vector3) -> void:
+	m5_real_update(player_pos)
+
+## COSMOS R2.2 (Design Z): map the player's WINDOW-space camera transform into the static epoch render frame
+## — camera_epoch = F⁻¹ · window_cam, where F = alignment_transform (epoch→window). The camera flies through
+## the static baked planet at the player's true position/orientation. Physics, streaming and the viewer stay
+## in window space (untouched); only the DISPLAYED camera moves. Returns window_cam unchanged until the epoch
+## is installed. Interaction/aim stays window-space and gains the exact J⁻¹ map in R2.3.
+func m5_epoch_camera(player_pos: Vector3, window_cam: Transform3D) -> Transform3D:
+	if _chart == null or _epoch_frame.is_empty() or not CubeSphere.M5_REAL:
+		return window_cam
+	var f := CosmosTruePlace.alignment_transform(_chart, _epoch_frame, player_pos)
+	# Safety net: camera_frame now synthesises a valid radial in the corner wedge, so F should be non-singular
+	# everywhere — but if it ever degenerates, fall back to the window camera this frame rather than spam
+	# Basis.invert det==0. (The player only touches the wedge at the 3-face vertex, sealed fully by M5c.)
+	if absf(f.basis.determinant()) < 1.0e-6:
+		return window_cam
+	return f.affine_inverse() * window_cam
 
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).

@@ -95,11 +95,35 @@ static func camera_frame(chart: CosmosChart, cam: Vector3) -> Dictionary:
 	var dxn := dir_of_window(chart, cam.x - eps, cam.z)
 	var dzp := dir_of_window(chart, cam.x, cam.z + eps)
 	var dzn := dir_of_window(chart, cam.x, cam.z - eps)
+	# ROBUSTNESS (COSMOS R2.2): the camera can sit IN the double-out corner wedge (both raw axes out of
+	# range), where dir_of_window has no true direction → d_cam = ZERO → a singular mt (Basis.invert det==0).
+	# The wedge is a measure-zero corner the player only brushes at the 3-face vertex (M5c seals it fully); to
+	# keep the render frame well-formed there, synthesise d_cam from the valid neighbour samples (the ± steps
+	# usually land on real edge folds). A well-conditioned mid-face camera has a valid d_cam → this never fires.
+	if d_cam.length() < 1.0e-6:
+		var acc := Vector3.ZERO
+		for s in [dxp, dxn, dzp, dzn]:
+			if s.length() > 1.0e-6:
+				acc += s
+		d_cam = acc.normalized() if acc.length() > 1.0e-6 else Vector3(0, 1, 0)
 	var tx := (dxp - dxn)                                       # ∝ ∂d̂/∂x  (direction of ∂P/∂x)
 	var tz := (dzp - dzn)                                       # ∝ ∂d̂/∂z
 	# Gram-Schmidt with d̂_cam pinned as the radial/up column (ex ⟂ d_cam since ∂d̂/∂x ⟂ d̂ for a unit d̂).
-	var ex := (tx - d_cam * tx.dot(d_cam)).normalized()
-	var ez := (tz - d_cam * tz.dot(d_cam) - ex * tz.dot(ex)).normalized()
+	# ROBUSTNESS (COSMOS R2.2): at a face edge/corner a finite-difference sample can fold to a neighbour face
+	# (a jump) or a wedge, so tx/tz can collapse (≈0) and normalize() would return ZERO → a SINGULAR mt →
+	# Basis.invert det==0 spam the moment anything inverts it (m5_epoch_camera's F⁻¹). Fall back to a stable
+	# orthonormal tangent built from d_cam when a Gram-Schmidt vector degenerates. For a well-conditioned
+	# anchor (mid-face, every gate) both tangents are healthy → the fallback never fires → byte-identical.
+	var ex := (tx - d_cam * tx.dot(d_cam))
+	if ex.length() < 1e-6:
+		ex = d_cam.cross(Vector3(1, 0, 0))
+		if ex.length() < 1e-6:
+			ex = d_cam.cross(Vector3(0, 0, 1))
+	ex = ex.normalized()
+	var ez := (tz - d_cam * tz.dot(d_cam) - ex * tz.dot(ex))
+	if ez.length() < 1e-6:
+		ez = d_cam.cross(ex)
+	ez = ez.normalized()
 	# Right-handed check: window (x, z) with +y radial should keep the mesh winding; if ez flipped, re-cross.
 	if ex.cross(d_cam).dot(ez) < 0.0:
 		ez = -ez

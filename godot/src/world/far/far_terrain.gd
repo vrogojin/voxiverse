@@ -96,6 +96,7 @@ var _align_root: Node3D = null
 var _bake_frame: Dictionary = {}
 var _blend: Dictionary = {}
 var _bake_anchor := Vector3.ZERO               # window pos the epoch frame is anchored at (the recenter point)
+var _epoch_locked := false                     # COSMOS R2.2: WM owns a shared fixed epoch frame → stop self-refresh + blend
 
 # active (in-progress) sampling job — the one tile being sampled across frames.
 var _active_key                            # Variant: Vector3i or null
@@ -217,6 +218,12 @@ func set_chart(chart) -> void:
 func _refresh_bake(anchor_w: Vector3) -> void:
 	if _chart == null:
 		return
+	# COSMOS R2.2: once WorldManager locks a shared epoch frame (so near + far bake into the SAME frame and
+	# coincide), the far must NOT re-anchor its frame every 64 m — the rigid alignment absorbs the walk. The
+	# ring-0 window-blend is also retired (the near is real baked geometry now, not the bend, so the join is
+	# exact without blending). Both stay live in the R1-only (far-only) path where no epoch is locked.
+	if _epoch_locked:
+		return
 	_bake_anchor = anchor_w
 	_bake_frame = CosmosTruePlace.bake_frame(_chart, anchor_w)
 	_blend = {
@@ -232,6 +239,22 @@ func update_alignment(player_pos: Vector3) -> void:
 		return
 	var f := CosmosTruePlace.alignment_transform(_chart, _bake_frame, player_pos)
 	_align_root.transform = Transform3D(f.basis, f.origin - position)
+
+## COSMOS R2.2: apply a WorldManager-computed alignment F directly (the shared epoch frame is owned there so
+## near + far use ONE frame). Absorbs this node's own `position` like update_alignment. Used instead of
+## update_alignment once lock_epoch_frame is set, so near-terrain, far and (window-space) camera agree.
+func apply_alignment(f: Transform3D) -> void:
+	if _align_root == null:
+		return
+	_align_root.transform = Transform3D(f.basis, f.origin - position)
+
+## COSMOS R2.2: adopt WorldManager's shared epoch bake frame (fixed per epoch). Retires the per-64 m
+## self-refresh + the ring-0 blend (see _refresh_bake). The far now bakes tiles into the SAME frame the
+## near C++ mesher uses, so the near/far join is exact by construction.
+func lock_epoch_frame(frame: Dictionary) -> void:
+	_bake_frame = frame
+	_blend = {}
+	_epoch_locked = true
 
 ## COSMOS M3 home-face flip handoff (Fable Stage 1 + bug-B fix). The chart re-based onto a neighbour
 ## face, so this node's global-index frame jumped to `new_pos` = −(i_org, 0, j_org) on the new face.

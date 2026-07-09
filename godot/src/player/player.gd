@@ -79,6 +79,12 @@ func _ready() -> void:
 	_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
 	add_child(_camera)
+	# COSMOS R2.2 (Design Z): the near + far render STATIC in the epoch frame and the camera moves THROUGH
+	# them (main writes _camera.global each frame via set_render_camera). So the camera lives in world/epoch
+	# space, NOT parented to the window-space body — make it top_level so its transform is world-relative and
+	# setting it never inverts the (window-space) parent. FLAT / bend paths keep the child camera (byte-identical).
+	if not CubeSphere.FLAT_WORLD and CubeSphere.M5_REAL:
+		_camera.top_level = true
 
 	# RayCast3D is present per DESIGN; the authoritative hit test is the analytic
 	# voxel DDA in WorldManager (the fallback world has no physics colliders).
@@ -128,6 +134,19 @@ func _capture_mouse() -> void:
 ## front of it. Falls back to the player transform before the camera rig is built.
 func camera_global_transform() -> Transform3D:
 	return _camera.global_transform if _camera != null else global_transform
+
+## COSMOS R2.2 (Design Z): the WINDOW-space camera transform (what the camera is in pre-COSMOS window space)
+## — body yaw+position × the pitch+eye camera-local. Main maps this into the static epoch render frame via
+## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state
+## (yaw via global_transform, _pitch) NOT from _camera.global (which we override), so there is no feedback loop.
+func window_camera_transform() -> Transform3D:
+	var cam_local := Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
+	return global_transform * cam_local
+
+## COSMOS R2.2: place the DISPLAYED camera at the given (epoch-frame) transform. Physics/aim stay window.
+func set_render_camera(t: Transform3D) -> void:
+	if _camera != null:
+		_camera.global_transform = t
 
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:

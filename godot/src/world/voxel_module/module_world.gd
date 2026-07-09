@@ -329,6 +329,12 @@ func set_cosmos_bake(flat_params: Dictionary) -> void:
 	if _mesher != null and _mesher.has_method("set_cosmos_bake"):
 		_mesher.call("set_cosmos_bake", flat_params)
 
+# COSMOS R2.2 NOTE: an earlier design rotated the VoxelTerrain by the per-frame F to render the static baked
+# near field around the window-space camera. That is NOT viable — godot_voxel inverts a singular basis when
+# its transform is rotated (Basis.invert det==0 spam every streaming query). The shipped design (Design Z)
+# instead leaves the terrain unrotated (blocks render at their baked epoch coords via identity placement)
+# and moves the CAMERA into the epoch frame (see WorldManager.m5_epoch_camera + Player.set_render_camera).
+
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
 ## (main) thread if unseen (VDS §8.2) — and writes THAT into the TYPE channel, which

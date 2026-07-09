@@ -93,12 +93,17 @@ func _process(_delta: float) -> void:
 	var cam := _player.camera_global_transform().origin
 	if CubeSphere.M5_RENDER:
 		_player.world.m5_push_camera(cam)
+	elif CubeSphere.M5_REAL:
+		# R2.2 real geometry (Design Z): the near + far are REAL baked geometry (no bend shader), static in
+		# the epoch frame. Keep the far static (apply_alignment IDENTITY) and move the DISPLAYED camera into
+		# that frame — camera_epoch = F⁻¹ · window_cam — so it flies through the static baked planet at the
+		# player's true position/orientation. Physics, streaming and interaction stay in window space (exact
+		# aim arrives with the J⁻¹ input map in R2.3). We do NOT rotate the VoxelTerrain (godot_voxel det==0).
+		_player.world.m5_real_update(_player.global_position)
+		_player.set_render_camera(
+			_player.world.m5_epoch_camera(_player.global_position, _player.window_camera_transform()))
 	else:
-		CosmosBend.set_camera(cam)                     # near field: still the camera-centred bend (R1)
-		if CubeSphere.M5_REAL:
-			# R1 real geometry: level the baked far layer under the camera each frame (pure Transform3D,
-			# no shader). Camera origin matches the bend centre → the near/far join is exact at the camera.
-			_player.world.m5_real_update_far(cam)
+		CosmosBend.set_camera(cam)                     # near field: the camera-centred bend (R1, bend path)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

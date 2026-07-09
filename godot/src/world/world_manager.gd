@@ -143,6 +143,15 @@ func _ready() -> void:
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
 
+	# COSMOS R1 DEV: hide the NEAR chunk render so the baked far layer can be inspected alone (render-only —
+	# analytic physics + GroundCollider are untouched, so movement/collision are unchanged). Curved + dev only.
+	if not CubeSphere.FLAT_WORLD and CubeSphere.DEV_HIDE_NEAR:
+		if _module_world != null:
+			_module_world.visible = false
+		if _streamer != null:
+			_streamer.visible = false
+		print("[WorldManager] DEV_HIDE_NEAR: near chunk render hidden (far layer isolated)")
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).

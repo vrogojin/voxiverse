@@ -160,6 +160,19 @@ static func bake_frame(chart: CosmosChart, anchor_w: Vector3) -> Dictionary:
 static func bake_true(chart: CosmosChart, w: Vector3, frame: Dictionary) -> Vector3:
 	return place_true(chart, w, frame)
 
+## Combined bake primitive: ONE dir_of_window fold, returning both the true position AND the outward radial
+## (mt·d̂) — so a mesh bake pays a single fold per vertex instead of three (is_wedge + place_true + a normal
+## fold). {pos: _WEDGE, radial: ZERO} for a double-out vertex (the caller culls). The R1 far-bake hot path.
+static func place_and_radial(chart: CosmosChart, w: Vector3, frame: Dictionary) -> Dictionary:
+	var d := dir_of_window(chart, w.x, w.z)
+	if d == Vector3.ZERO:
+		return {"pos": _WEDGE, "radial": Vector3.ZERO}
+	var rr := float(chart.radius)
+	var dc: Vector3 = frame["d_cam"]
+	var mt: Basis = frame["mt"]
+	var rel := d * rr - dc * rr + d * w.y - dc * float(frame["y_cam"])
+	return {"pos": mt * rel, "radial": (mt * d).normalized()}
+
 ## Bake `w` to a per-TILE-LOCAL vertex: the true position minus the tile's own true origin, so the emitted
 ## vertex stays small (f32-exact) and the tile NODE is placed at `local_origin_true`. Returns _WEDGE for a
 ## wedge vertex so the builder drops the triangle (the corner-closure theorem guarantees no hole).

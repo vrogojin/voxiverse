@@ -231,12 +231,14 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 	for k in range(n):
 		var v := verts[k]
 		var w := Vector3(node_origin.x + v.x, v.y, node_origin.z + v.z)
-		if CosmosTruePlace.is_wedge(chart, w.x, w.z):
+		# ONE fold per vertex: place + outward radial together, and the _WEDGE sentinel IS the wedge test.
+		var pr := CosmosTruePlace.place_and_radial(chart, w, frame)
+		var true_local: Vector3 = pr["pos"]
+		if true_local == CosmosTruePlace._WEDGE:
 			is_wedge[k] = 1
 			out_verts[k] = Vector3.ZERO  # unreferenced (all its triangles are culled) — keep it at the tile
 			out_norms[k] = normals[k]    # local origin so it can't inflate the mesh AABB (window coords would)
 			continue
-		var true_local: Vector3 = CosmosTruePlace.place_true(chart, w, frame)
 		if do_blend:
 			var s := smoothstep(b_r0, b_r0 + b_band, Vector2(w.x - b_cam.x, w.z - b_cam.z).length())
 			if s < 0.9999:
@@ -244,10 +246,9 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 				var near_local := b_finv * CosmosBend.bend_point(w, b_cam, b_radius)
 				true_local = near_local.lerp(true_local, s)
 		out_verts[k] = true_local - local_origin
-		# rotate the flat normal into the vertex's true tangent frame (mt maps world→local; its transpose
-		# maps the window-aligned flat normal → the true surface orientation).
-		var lf := CosmosTruePlace.camera_frame(chart, w)
-		out_norms[k] = ((lf["mt"] as Basis).transposed() * normals[k]).normalized()
+		# Outward surface normal = the true radial (mt·d̂), already computed above (no extra fold). Unshaded
+		# far, so the slope term is cosmetically irrelevant; the radial is the load-bearing outward direction.
+		out_norms[k] = pr["radial"]
 	# Cull triangles touching a wedge vertex; keep the rest.
 	var out_idx := PackedInt32Array()
 	var culled := 0
@@ -256,7 +257,12 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 		if is_wedge[a] == 1 or is_wedge[b] == 1 or is_wedge[c] == 1:
 			culled += 1
 			continue
-		out_idx.append_array([a, b, c])
+		# REVERSE the winding: the window→true map (place_true) is orientation-REVERSING (negative
+		# determinant — window +Y/up is the middle axis while the sphere's outward normal is the face's
+		# third axis, so the map carries a reflection). A reflection flips triangle winding, which under
+		# Godot CULL_BACK renders the far terrain front-INWARD (the R1 live "visible from underground /
+		# wireframe" bug). Swapping b↔c restores front-OUTWARD to match the working window/bend mesh.
+		out_idx.append_array([a, c, b])
 	return {
 		"verts": out_verts, "normals": out_norms, "colors": arrays["colors"], "indices": out_idx,
 		"tri_count": out_idx.size() / 3, "grid": grid, "cell": cell, "origin": origin,

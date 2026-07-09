@@ -128,6 +128,12 @@ const M5_RENDER := false
 ## false (curved). Bake-parity is a headless gate (baked vertex == place_true == world_point).
 const M5_REAL := false
 
+## COSMOS R1 DEV (task #76 follow-up): hide the NEAR chunk render (module VoxelTerrain / fallback streamer)
+## so the baked FAR layer can be assessed in isolation. RENDER-ONLY (physics — analytic + GroundCollider —
+## is untouched, so you still walk on the invisible near ground). Curved + dev only; default false, no
+## gameplay change. Flip to true with a curved (FLAT_WORLD=false) build to inspect the far layer alone.
+const DEV_HIDE_NEAR := false
+
 ## The cube face the M1 window is homed on (§3.5: "flat world reinterpreted as a face-4 window").
 ## Face 4 is +Z polar (a pole on the face centre, §5.2) so the window is defect-free lattice.
 const HOME_FACE := 4

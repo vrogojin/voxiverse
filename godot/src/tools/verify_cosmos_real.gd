@@ -143,5 +143,41 @@ func _init() -> void:
 	_ok(inner_n > 20 and inner_gap < 0.02, "T7 blend inner edge: far COINCIDES with the near field inside r0 (worst %.5f blk, %d)" % [inner_gap, inner_n])
 	_ok(outer_n > 20 and outer_gap < 1e-4, "T7 blend outer: pure true beyond the band (worst %.6f blk, %d)" % [outer_gap, outer_n])
 
+	# ---- T8 FACING (the gate the position gates missed — R1 live bug). Godot CULL_BACK shows the face on
+	# the side OPPOSITE its right-hand geometric normal (front = −RH). The WORKING window/bend far mesh is
+	# the reference: its winding renders front-UP under CULL_BACK, so RH·(+Y) < 0 there. The baked mesh must
+	# reproduce the SAME rule against its own outward radial: RH·outward < 0 (front-OUTWARD). Reversed
+	# winding + outward radial normals is the fix; an inward-facing tri is what looked "underground/wireframe".
+	var mtb: Basis = frame["mt"]
+	var side8 := int(home["grid"]) + 1
+	var hidx: PackedInt32Array = home["indices"]              # UNBAKED window winding — the working reference
+	var bidx: PackedInt32Array = baked["indices"]            # baked (reversed) winding
+	var bnorm: PackedVector3Array = baked["normals"]
+	# Reference: confirm the window mesh is front-up under Godot's convention (validates the sign rule).
+	var ref_wrong := 0; var refn := 0
+	for ti in range(0, hidx.size(), 3):
+		var a := hidx[ti]; var b := hidx[ti + 1]; var c := hidx[ti + 2]
+		if a >= side8 * side8 or b >= side8 * side8 or c >= side8 * side8: continue
+		refn += 1
+		if (hv[b] - hv[a]).cross(hv[c] - hv[a]).dot(Vector3(0, 1, 0)) >= 0.0:
+			ref_wrong += 1
+	_ok(refn > 100 and ref_wrong == 0, "T8 ref: the working window far mesh is front-UP (RH·+Y<0) — validates the facing rule (wrong %d/%d)" % [ref_wrong, refn])
+	# Baked: same rule vs the outward radial + outward vertex normals.
+	var wrong := 0; var topn := 0; var nrm_bad := 0
+	for ti in range(0, bidx.size(), 3):
+		var a := bidx[ti]; var b := bidx[ti + 1]; var c := bidx[ti + 2]
+		if a >= side8 * side8 or b >= side8 * side8 or c >= side8 * side8:
+			continue                                          # skip skirt tris (double-sided walls)
+		topn += 1
+		var wc := Vector3(node_origin.x + (hv[a].x + hv[b].x + hv[c].x) / 3.0, 0.0, node_origin.z + (hv[a].z + hv[b].z + hv[c].z) / 3.0)
+		var outward := (mtb * TP.dir_of_window(chart, wc.x, wc.z)).normalized()
+		if (bv[b] - bv[a]).cross(bv[c] - bv[a]).dot(outward) >= 0.0:   # RH points outward → Godot-front INWARD → wrong
+			wrong += 1
+		if bnorm[a].dot(outward) <= 0.0:
+			nrm_bad += 1
+	print("  [facing] top tris %d | front-inward (wrong) %d | vertex-normals-inward %d" % [topn, wrong, nrm_bad])
+	_ok(topn > 100 and wrong == 0, "T8 facing: every baked terrain face renders front-OUTWARD (wrong %d / %d)" % [wrong, topn])
+	_ok(nrm_bad == 0, "T8 normals: stored vertex normals point outward (bad %d)" % nrm_bad)
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(0 if _fail == 0 else 1)

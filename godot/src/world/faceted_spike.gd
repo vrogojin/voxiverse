@@ -44,7 +44,6 @@ func _build_planet() -> MeshInstance3D:
 	return mi
 
 func _emit_facet(st: SurfaceTool, face: int, a: int, b: int) -> void:
-	var normal := CosmosFacet.facet_normal(face, a, b, K_DEMO)
 	var stride := CELLS + 1
 	var pos: Array = []
 	var col: Array = []
@@ -55,7 +54,11 @@ func _emit_facet(st: SurfaceTool, face: int, a: int, b: int) -> void:
 			var d := CosmosFacet.facet_dir_at(face, a, b, K_DEMO, s, t)
 			var ter := _terrain(d)
 			var relief := maxf(0.0, float(int(ter["g"]) - TerrainConfig.SEA_LEVEL)) * RELIEF
-			pos.append(CosmosFacet.facet_pos_at(face, a, b, K_DEMO, s, t, R_DEMO) + normal * relief)
+			# Relief along the RADIAL, NOT the facet normal: a shared-seam vertex has the SAME flat-quad base
+			# position and the SAME terrain sample in both adjacent facets, so it displaces to the same point —
+			# peaks stay glued across ridges. (Facet-normal relief split a peak by the dihedral angle → cracks.)
+			var base := CosmosFacet.facet_pos_at(face, a, b, K_DEMO, s, t, R_DEMO)
+			pos.append(base + base.normalized() * relief)
 			col.append(ter["color"])
 	for gj in range(CELLS):
 		for gi in range(CELLS):

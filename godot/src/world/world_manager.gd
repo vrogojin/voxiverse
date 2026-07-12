@@ -1233,6 +1233,13 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
 	TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win, before restream
 	_m5_sync_frame()   # COSMOS M5a: flip changed face + M_win → refresh the true-position chart table before restream
+	# COSMOS R2.2 (M5_REAL): a home-face flip is a NEW EPOCH. Re-install the bake frame for the NEW chart NOW,
+	# BEFORE the near restream + far rebase below, so the fresh face bakes into the CORRECT epoch frame. Without
+	# this the near C++ mesher keeps the SPAWN frame (set_cosmos_bake was pushed only at spawn), so every
+	# post-flip block bakes into a stale frame → the near terrain renders BROKEN across faces — worst near a
+	# corner, where M5c's eager flips fire constantly. Anchors the new epoch at the player (the flip keeps the
+	# window position unchanged). No-op unless curved + M5_REAL (m5_real_install_epoch self-guards).
+	m5_real_install_epoch(player_pos)
 	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed
 	# `_edits`/`_meta` are untouched (edits are preserved), but `_edit_columns`/`_placed_top` are
 	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the

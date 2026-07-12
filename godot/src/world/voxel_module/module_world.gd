@@ -1615,6 +1615,11 @@ var model_count := 0                     # actual baked library model count — 
 # race generation — a flip installs a NEW generator with a new gen_face and restreams (module_world).
 var gen_face := 0
 var gen_n := 0
+# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): the IMMUTABLE facet this generator epoch is homed on
+# (−1 = non-faceted / cube-lattice). Frozen by the loader from TerrainConfig.active_facet(), symmetric with
+# gen_face — the worker threads it through GenCtx.facet so column_profile samples the sphere terrain at this
+# facet's directions (NEVER the mutable TerrainConfig._active_facet). A facet change installs a new generator.
+var gen_facet := -1
 # COSMOS-FRAME-ORIENTATION §5.1: this epoch's FROZEN window orientation M_win (row-major ints). The worker
 # recovers the raw index p = M_win·v from the terrain-local voxel index v before folding. Identity at spawn.
 var gen_mwin_a := 1
@@ -1692,7 +1697,11 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var rfs   # per-column true face
 	var rjinv # per-column render-frame J⁻¹ quarter-turn (COSMOS-FRAME-ORIENTATION §6)
 	if flat_world:
-		pcache = {}
+		# FACETED (§3.3): a GenCtx carrying the FROZEN gen_facet so column_profile takes the faceted branch
+		# and samples the sphere terrain at THIS facet's true cell directions — worker-safe (never reads the
+		# mutable _active_facet). jinv stays 0 (no window rotation in flat/faceted), so it's the flat pipeline
+		# with a facet-sourced profile. Non-faceted flat: the plain Dictionary memo, byte-identical to before.
+		pcache = TerrainConfig.GenCtx.new(0, gen_facet) if gen_facet >= 0 else {}
 		for z in range(size.z):
 			for x in range(size.x):
 				var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
@@ -1926,6 +1935,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("flat_world", CubeSphere.FLAT_WORLD)
 	gen.set("gen_face", _gen_face)
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
+	gen.set("gen_facet", TerrainConfig.active_facet() if CubeSphere.FACETED else -1)   # FACETED §3.3: frozen facet epoch
 	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
 	gen.set("gen_mwin_a", int(_gen_mwin[0]))
 	gen.set("gen_mwin_b", int(_gen_mwin[1]))

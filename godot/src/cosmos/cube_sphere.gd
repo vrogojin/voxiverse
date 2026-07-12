@@ -39,6 +39,14 @@ const CORNER_LOCK_R := 8
 ## builds a static demo faceted planet (flat square facets meeting at dihedral ridges, real terrain colours,
 ## free-fly camera) INSTEAD of the normal world, so the faceted look can be judged live. Default OFF.
 const FACETED_SPIKE := false
+## COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §1.1) — the PLAYABLE faceted engine master toggle. When true the
+## world is ONE flat voxel facet (FacetAtlas) carrying the sphere terrain, played with the flat engine wholesale
+## (gravity −Y local, break/place/collapse). REQUIRES FLAT_WORLD=true (a facet IS a flat world). All faceted
+## worldgen is gated behind this, so default OFF → the shipped build is byte-identical (FLAT gate 6027/0). FP1
+## renders the single home facet; FP2+ add the neighbour ring + walkable junction blocks.
+const FACETED := false
+## COSMOS FACETED (§5) — the 8 grid-twist singularities (cube-vertex facets where the lattice cannot align). FP5.
+const FACET_TWIST := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

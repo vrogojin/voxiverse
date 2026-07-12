@@ -18,6 +18,17 @@ func _ready() -> void:
 
 	_setup_environment()
 
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §4): build the facet atlas and install the spawn facet as the
+	# active facet BEFORE the WorldManager (its module generator freezes TerrainConfig.active_facet() at
+	# creation). warm_up is idempotent + reads worldgen to pick a temperate-land spawn facet, so TerrainConfig
+	# is warmed first. Default OFF (FACETED=false) → this whole block is skipped and the flat game is unchanged.
+	if CubeSphere.FACETED:
+		TerrainConfig.warm_up()
+		FacetAtlas.warm_up()
+		TerrainConfig.set_active_facet(FacetAtlas.spawn_facet())
+		print("[FP1] faceted engine: %d facets (k=%d), spawn facet=%d, spawn col=%s" % [
+			FacetAtlas.facet_count(), FacetAtlas.K, FacetAtlas.spawn_facet(), FacetAtlas.spawn_column()])
+
 	var world := WorldManager.new()
 	world.name = "WorldManager"
 	add_child(world)

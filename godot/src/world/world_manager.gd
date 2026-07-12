@@ -109,6 +109,16 @@ func _ready() -> void:
 	SurfaceModel.ensure_ready()
 	BlockCatalog.ensure_ready()
 
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §4): ensure the facet atlas is built and the spawn facet is
+	# the active facet BEFORE the render path's generator is created (it freezes active_facet). main.gd does
+	# this too, but a headless WorldManager (verify) is constructed directly — warm_up + set_active_facet are
+	# idempotent, so this is a safe backstop. Default OFF → skipped, flat game unchanged.
+	if CubeSphere.FACETED:
+		TerrainConfig.warm_up()
+		FacetAtlas.warm_up()
+		if TerrainConfig.active_facet() < 0:
+			TerrainConfig.set_active_facet(FacetAtlas.spawn_facet())
+
 	# COSMOS M2 (§3.1/§3.2): in curved mode install the floating-origin chart on the home face at
 	# the identity origin, so the overlay keys globally and the origin can re-anchor as the player
 	# walks. FLAT_WORLD (the default) leaves `_chart` null → Vector3i keying → byte-identical.
@@ -137,7 +147,9 @@ func _ready() -> void:
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
 	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
-	if FarTerrain.ENABLED:
+	# COSMOS FACETED (§4.5): the far layer renders the flat/curved global-index heightmap — meaningless (and a
+	# giant misplaced sheet) under a single facet. FP2 replaces it with the neighbour+far facet ring. OFF here.
+	if FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
 		add_child(_far)

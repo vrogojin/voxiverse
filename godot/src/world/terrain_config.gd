@@ -435,7 +435,9 @@ static func height_at(x: int, z: int) -> int:
 	# COSMOS M1 (§3.5): when the planet is on, (x, z) is the face-4 window column (i, j) and the
 	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
 	# branch entirely, so the flat world is byte-identical.
-	if not CubeSphere.FLAT_WORLD:
+	# COSMOS FACETED (§3.3): faceted routes through the same shared analytic memo as curved — the surface
+	# height is the sphere terrain at this facet cell's true direction (facet_profile), NOT the flat 2D noise.
+	if CubeSphere.FACETED or not CubeSphere.FLAT_WORLD:
 		# Route through the shared analytic memo (PERF): far terrain, snowfall, per-voxel-env and the
 		# structural solver all call height_at every frame; without the memo each recomputed the full
 		# _curved_profile. Same value as the direct _curved_profile(_active_face, x, z).x, just cached.
@@ -496,19 +498,29 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 	# reached only through the Dictionary/null branch and stays byte-identical.
 	var memo: Variant = pcache
 	var face := _active_face
+	var facet := _active_facet
 	var ck: Variant
 	if pcache is GenCtx:
 		memo = pcache.memo
 		face = pcache.face
+		if pcache.facet >= 0:
+			facet = pcache.facet
 		ck = Vector3i(face, x, z)
 	else:
 		ck = Vector2i(x, z)
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): key the memo on the facet, not the face — a worker
+	# ctx (or the analytic epoch) is scoped to ONE facet, and the profile is the sphere terrain at this cell's
+	# true direction. FACETED implies FLAT_WORLD=true, so all the col_* flat wrappers stay byte-identical.
+	if CubeSphere.FACETED:
+		ck = Vector3i(facet, x, z)
 	if memo != null:
 		if memo.has(ck):
 			return memo[ck]
 	_ensure_noise()
 	var prof: Vector4
-	if not CubeSphere.FLAT_WORLD:
+	if CubeSphere.FACETED:
+		prof = facet_profile(facet, x, z)
+	elif not CubeSphere.FLAT_WORLD:
 		# COSMOS M1 (§3.5)/M3 (§4.5): the home-face lattice column (i, j) = (x, z), sampled from 3D noise
 		# along d̂. `face` is `ctx.face` on the worker (an immutable snapshot) or `_active_face` on the
 		# main thread — never a mutable global read from a worker. The curved profile threads the SAME
@@ -550,6 +562,26 @@ static var _active_face := CubeSphere.HOME_FACE
 # analytic modifier de-rotation (WM col_* wrappers, generated_cell_global, overlay read/write) reads THIS
 # instead of a mutable matrix. Default 0 (identity) → the flat world + M_win=I curved spawn are unchanged.
 static var _active_mwin_d4 := 0
+# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): the ACTIVE facet for the analytic 2-arg (x,z) faceted
+# queries — the facet the player stands on, symmetric with _active_face. WorldManager sets it on facet install
+# (FP1) / crossing (FP3). The worker path threads the facet through GenCtx.facet instead (never reads this
+# mutable global). Default −1 (unset / non-faceted). FACETED implies FLAT_WORLD=true.
+static var _active_facet := -1
+
+## The active facet (read-only accessor).
+static func active_facet() -> int:
+	return _active_facet
+
+## Set the active facet (WorldManager, on facet install / crossing). Clears the shape memo + the analytic
+## column ctx — a facet change re-homes every 2-arg (x,z) query to a different sphere direction, exactly like
+## a home-face flip clears the shape memo in set_active_frame. No-op guard on an unchanged facet.
+static func set_active_facet(fid: int) -> void:
+	if fid == _active_facet:
+		return
+	_active_facet = fid
+	_shape_memo.clear()
+	if _analytic_ctx != null:
+		_analytic_ctx.memo.clear()
 
 ## COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 2, F1): the immutable per-generation
 ## snapshot the curved worldgen reads INSTEAD of the mutable global `_active_face`. It carries the cube
@@ -562,14 +594,16 @@ static var _active_mwin_d4 := 0
 ## being a hidden mutable global on the worker hot path and becomes an immutable parameter.
 class GenCtx extends RefCounted:
 	var face: int = CubeSphere.HOME_FACE
+	var facet: int = -1   # COSMOS FACETED (§3.3): the facet id this query is homed on (−1 = cube-lattice / flat)
 	var memo: Dictionary = {}
 	# COSMOS-FRAME-ORIENTATION §6: the J⁻¹ quarter-turn (0..3) to rotate this column's directional
 	# modifier from its canonical TRUE-face frame into the current WINDOW render frame. J = M_strip·M_win;
 	# jinv_d4 = −d4(J) mod 4. 0 for a native column at M_win=I → byte-identical. Set per-column by
 	# worker_fold_column (worker) / generated_cell_global (analytic).
 	var jinv_d4: int = 0
-	func _init(p_face: int = CubeSphere.HOME_FACE) -> void:
+	func _init(p_face: int = CubeSphere.HOME_FACE, p_facet: int = -1) -> void:
 		face = p_face
+		facet = p_facet
 
 ## The active home face (read-only accessor).
 static func active_face() -> int:
@@ -684,22 +718,36 @@ static func _pillar_top(k: int) -> int:
 ## The pre-pillar curved column profile (the verbatim COSMOS M1 worldgen). _curved_profile wraps this with
 ## the M5c override; every other caller (and the pillar-top read) uses the base directly.
 static func _curved_profile_base(face: int, i: int, j: int) -> Vector4:
-	_ensure_noise()
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
 	var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)
-	var px := d.x * rr
-	var py := d.y * rr
-	var pz := d.z * rr
+	return profile_at_dir(d.x, d.y, d.z, rr)
+
+## COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.1) — THE direction-parameterised sphere-terrain profile.
+## The verbatim curved worldgen body (extracted from _curved_profile_base), sampled at a raw UNIT direction
+## (dx,dy,dz) and radius rr instead of a (face,i,j) cube-lattice column. BOTH render paths sample this ONE
+## function: the cube-lattice curved path (_curved_profile_base, via LatticeNav.dir_of) and the faceted path
+## (facet_profile, via FacetAtlas.cell_dir) — so a facet shows the SAME planet, byte-for-byte, as the curved
+## lattice would at that direction. Feature worldgen on the sphere: the mountain factor feeds BOTH the biome
+## (B_MOUNTAINS) and the uplift baked into _height_c3, so snow + sharp-slope flow through resolve_cell exactly
+## as in the flat world. Caller passes a UNIT d̂. Pure/deterministic: a function of (SEED, dx,dy,dz, rr) only.
+static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector4:
+	_ensure_noise()
+	var px := dx * rr
+	var py := dy * rr
+	var pz := dz * rr
 	var c := _continent.get_noise_3d(px, py, pz)
-	var t := _latitude_temperature(d.z, _temperature.get_noise_3d(px, py, pz))
+	var t := _latitude_temperature(dz, _temperature.get_noise_3d(px, py, pz))
 	var hh := _humidity.get_noise_3d(px, py, pz)
 	var mtn := _mountain_factor3(c, px, py, pz)
 	var g := _height_c3(c, px, py, pz, mtn)
-	# Feature worldgen on the sphere: the mountain factor feeds BOTH the biome (B_MOUNTAINS) and the
-	# uplift baked into _height_c3, so a mountain-latitude column reaches mountain heights and reads as
-	# rock; snow accumulation + sharp-slope then flow through resolve_cell exactly as in the flat world.
 	return Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
+
+## COSMOS FACETED (§3.1): the sphere-terrain profile for a facet's local lattice column (fid, x, z). The facet
+## cell's TRUE direction (FacetAtlas.cell_dir — all f64) sampled at R_BLOCKS. Deterministic: (SEED, fid, x, z).
+static func facet_profile(fid: int, x: int, z: int) -> Vector4:
+	var d := FacetAtlas.cell_dir(fid, x, z)
+	return profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
 
 ## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
 ## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
@@ -790,9 +838,28 @@ static func _acquire_ctx(face: int) -> GenCtx:
 ## column_profile, no shared ctx) so the shipped flat game stays byte-identical in behaviour. Curved
 ## threads the shared _analytic_ctx (memoised, face-scoped key). Output is identical either way.
 static func analytic_column_profile(x: int, z: int) -> Vector4:
+	# COSMOS FACETED (§3.3): thread a facet-carrying ctx sharing the persistent memo (facet-scoped key). The
+	# facet only changes via set_active_facet, which clears the memo — so entries never go stale or collide.
+	if CubeSphere.FACETED:
+		return column_profile(x, z, _acquire_facet_ctx())
 	if CubeSphere.FLAT_WORLD:
 		return column_profile(x, z)
 	return column_profile(x, z, _acquire_ctx(_active_face))
+
+## A facet-homed GenCtx for the main-thread analytic faceted queries — the twin of _acquire_ctx, but it pins
+## the ctx's facet (not face) and shares the SAME persistent _analytic_ctx memo. The memo is cleared on a facet
+## change (set_active_facet) and past the cap, so entries are always fresh and single-facet. Off the main
+## thread it allocates a fresh ctx (never shares scratch across threads).
+static func _acquire_facet_ctx() -> GenCtx:
+	if _on_main_thread():
+		if _analytic_ctx == null:
+			_analytic_ctx = GenCtx.new(0, _active_facet)
+		else:
+			if _analytic_ctx.memo.size() > _ANALYTIC_MEMO_CAP:
+				_analytic_ctx.memo.clear()
+			_analytic_ctx.facet = _active_facet
+		return _analytic_ctx
+	return GenCtx.new(0, _active_facet)
 
 ## THE curved worker generator entry (COSMOS-AUDIT §3.2 items 2–3, F1/F2). The voxel worker calls this
 ## per column with its FROZEN home face `gen_face` (an immutable per-generator snapshot — NEVER the
@@ -1968,6 +2035,23 @@ static func is_solid_pos(p: Vector3) -> bool:
 # Spawn selection (WGC §8): origin is seed-dependent and may be ocean, so scan
 # outward from (0,0) for the first temperate land column above the sea.
 static func find_spawn() -> Vector2i:
+	# COSMOS FACETED (§3.3): scan around the facet CENTRE (the facet's lattice window is offset by O, so
+	# origin (0,0) is nowhere near it), staying ≥ SPAWN_EDGE_MIN cells inside the polygon so the player and
+	# the camera never start on the seam strip. The spawn facet was picked to have temperate land at centre.
+	if CubeSphere.FACETED:
+		var fid := _active_facet
+		var c := FacetAtlas.spawn_column()
+		for radius in range(0, 256, 2):
+			for a in range(0, 360, 15):
+				var rad := deg_to_rad(float(a))
+				var x := c.x + int(round(cos(rad) * float(radius)))
+				var z := c.y + int(round(sin(rad) * float(radius)))
+				if not FacetAtlas.in_polygon(fid, x, z, -float(FacetAtlas.SPAWN_EDGE_MIN)):
+					continue
+				var pf := column_profile(x, z)
+				if int(pf.x) > SEA_LEVEL + 1 and (int(pf.y) == B_PLAINS or int(pf.y) == B_FOREST):
+					return Vector2i(x, z)
+		return c
 	for radius in range(0, 512, 4):
 		for a in range(0, 360, 15):
 			var rad := deg_to_rad(float(a))

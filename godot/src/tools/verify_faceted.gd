@@ -82,6 +82,30 @@ func _gate_live_loop() -> void:
 	w.place_block(Vector3i(cx + 4, top + 6, cz + 4), BlockCatalog.STONE)   # isolated floater
 	w.break_terrain(Vector3i(cx + 4, top + 6, cz + 4))                      # break it → structural pass runs
 	_ok(_loose_bodies(w) >= body_count_before, "facet live: collapse pass runs without error on the facet")
+	# FP2 B3a — junction physics through the WM: a cell wholly beyond a ridge MASKS to AIR, and a straddling
+	# cell is a solid kind-2 junction (so _occ_span composes a partial interval, and the fallback mesher clips).
+	var fidx := FA.spawn_facet()
+	var lo2: Vector2i = FA.dom_min(fidx)
+	var hi2: Vector2i = FA.dom_max(fidx)
+	var masked_ok := false
+	var junction_ok := false
+	var zz := lo2.y
+	while zz <= hi2.y and not (masked_ok and junction_ok):
+		var xx := lo2.x
+		while xx <= hi2.x:
+			var gg := TC.height_at(xx, zz)
+			var stj := FA.cell_seam_state(fidx, xx, gg - 1, zz)
+			if stj["air"]:
+				if w.block_id_at(Vector3i(xx, gg - 1, zz)) == 0:
+					masked_ok = true
+			elif not (stj["straddle"] as PackedInt32Array).is_empty():
+				var vj := w.cell_value_at(Vector3i(xx, gg - 1, zz))
+				if CellCodec.is_junction(CellCodec.modifier(vj)) and BlockCatalog.solidity_of(CellCodec.mat(vj)) >= 0.5:
+					junction_ok = true
+			xx += 1
+		zz += 1
+	_ok(masked_ok, "junction physics: a beyond-ridge cell masks to AIR (block_id_at == 0)")
+	_ok(junction_ok, "junction physics: a straddling cell is a solid kind-2 junction via WM.cell_value_at")
 	w.queue_free()
 
 # FP2 Stage A — seam table + junction clip (§2.5, §3.5.1-3). Weld closure (reciprocity + matching ring +

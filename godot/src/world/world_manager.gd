@@ -279,7 +279,14 @@ func cell_value_at(cell: Vector3i) -> int:
 	if e >= 0:
 		return _overlay_window_modifier(cell, e)    # overlay: de-canon the directional modifier into the window frame (§6.4)
 	if _chart == null:
-		return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+		var vf := TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+		# COSMOS FACETED §3.5.4/§5.3: the junction authority is the analytic window exit — it MASKS cells
+		# wholly beyond the active facet's ridges to AIR (the domain mask) and turns straddling cells into
+		# kind-2 junction partials. _occ_span composes through ShapeCodec.span (junction-aware), so player
+		# physics + the fallback mesher follow automatically. Interior cells + non-faceted mode: unchanged.
+		if CubeSphere.FACETED:
+			return FacetAtlas.junction_modify(TerrainConfig.active_facet(), cell, vf)
+		return vf
 	# COSMOS M2 (§3.1/§8.2): fold the window cell to its GLOBAL cell FIRST, then generate. Worldgen
 	# is thereby a pure function of the global cell — window-INDEPENDENT — so it is byte-identical
 	# no matter where the chart is anchored (the determinism the far-from-spawn streaming needs).

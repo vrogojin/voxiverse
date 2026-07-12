@@ -129,6 +129,15 @@ func set_initial_look(yaw: float, pitch: float) -> void:
 	if _camera != null:
 		_camera.rotation.x = _pitch
 
+## COSMOS FACETED §6.1 — re-frame the player across a seam onto the neighbour facet. `new_pos` is the f64-exact
+## reframed position (WM computes it via FacetAtlas.reframe_position64); `yaw_delta` is the horizontal twist of
+## the dihedral. The player stays UPRIGHT (+Y up in both flat facet frames) — physics snaps the yaw; the visual
+## dihedral crest is eased by the camera (FP3b). Velocity + heading rotate about UP only, so gravity stays −Y.
+func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
+	global_position = new_pos
+	rotation.y = wrapf(rotation.y + yaw_delta, -PI, PI)
+	velocity = velocity.rotated(Vector3.UP, yaw_delta)
+
 func _capture_mouse() -> void:
 	# Web quirk (Godot #102209): after Esc the pointer won't re-lock unless we
 	# cycle through VISIBLE first. Harmless on desktop.
@@ -213,6 +222,13 @@ func _physics_process(delta: float) -> void:
 	# NOT rotate across a flip — the window axes are continuous — so there is nothing to counter-rotate
 	# (Fix A #71 reverted: its D4 extraction now lives in chart.flip's M_win accumulation).
 	world.maybe_flip_home_face(global_position)
+	# COSMOS FACETED §6.1: walking past an active-facet ridge re-frames the player onto the neighbour facet.
+	# Dormant until FP3b removes the FP2 ridge wall (which stops the player before the crossing threshold); the
+	# reframe is position-exact + upright (physics snaps yaw, camera eases the dihedral). FLAT/non-faceted: skip.
+	if CubeSphere.FACETED:
+		var cross := world.maybe_cross_facet(global_position)
+		if not cross.is_empty():
+			apply_reframe(cross["new_pos"], cross["yaw_delta"])
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
 	# cylinder about a cube vertex (or, defensively, a double-out column), relocate/eject them via the bisector
 	# teleport / seam glue — position, velocity and heading-relative yaw. Flag- and chart-gated no-op otherwise;

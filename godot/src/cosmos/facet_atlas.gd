@@ -241,6 +241,26 @@ static func facet_planar_corner(fid: int, ci: int) -> Array:
 		_frame[f + 1] + qx * _frame[f + 4] + qz * _frame[f + 10],
 		_frame[f + 2] + qx * _frame[f + 5] + qz * _frame[f + 11]]
 
+# ------- FP3 crossing reframe (§6.1) -------
+
+## f64 EXACT reframe of a lattice point from facet `from_fid`'s frame into facet `to_fid`'s frame — the same
+## physical planet point, re-expressed. = world_to_lattice64(to, lattice_to_world64(from, p)). Position-critical
+## (the player's new coords), so it stays in f64; Δ_AB·Δ_BA = identity to f64. The velocity/look basis uses
+## crossing_basis (rotation only, f32-safe).
+static func reframe_position64(from_fid: int, to_fid: int, x: float, y: float, z: float) -> Array:
+	var w := lattice_to_world64(from_fid, x, y, z)
+	return world_to_lattice64(to_fid, w[0], w[1], w[2])
+
+## The rotation taking a DIRECTION from facet `from_fid`'s lattice frame into `to_fid`'s (orthonormal → the
+## dihedral turn). Used for the player velocity/look and debris angular velocity re-frame at a crossing.
+static func crossing_basis(from_fid: int, to_fid: int) -> Basis:
+	return frame_basis(to_fid).transposed() * frame_basis(from_fid)
+
+## The full rigid crossing transform Δ = T_to⁻¹·T_from (from-lattice → to-lattice), as a Transform3D. Used to
+## re-place static nodes (debris) at a crossing; the far ring instead re-sets its node to T_active⁻¹ (§5.2).
+static func crossing_transform(from_fid: int, to_fid: int) -> Transform3D:
+	return facet_transform(to_fid).affine_inverse() * facet_transform(from_fid)
+
 ## Facet `fid`'s outward normal n̂ in world coords (f64 [x,y,z]) — for back-face culling the far ring.
 static func facet_normal64(fid: int) -> Array:
 	var f := fid * 12

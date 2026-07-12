@@ -40,6 +40,7 @@ func _initialize() -> void:
 	_gate_spawn_margin()
 	_gate_seam_continuity()
 	_gate_seams(nf)
+	_gate_crossing_math(nf)
 	_gate_junction_encode()
 	_gate_junction_mesh()
 	_gate_far_ring()
@@ -136,7 +137,45 @@ func _gate_live_loop() -> void:
 			break
 	_ok(wall_in, "facet wall: an interior column is walkable (not blanket-walled)")
 	_ok(scanned and wall_out, "facet wall: blocked() stops the player at the ridge plane")
+	# FP3 crossing smoke test: a synthetic position past a ridge fires maybe_cross_facet + switches the active facet.
+	TC.set_active_facet(fidx)
+	var cross_found := false
+	var cross_res := {}
+	for d in range(1, 400):
+		var px := float(cx + d) + 0.5
+		var pf := w.surface_y(px, float(cz) + 0.5)
+		var mn := 1.0e18
+		for slot in range(4):
+			mn = minf(mn, FA.own_dist(fidx, slot, px, pf, float(cz) + 0.5))
+		if mn < -1.0:
+			cross_res = w.maybe_cross_facet(Vector3(px, pf, float(cz) + 0.5))
+			cross_found = true
+			break
+	_ok(cross_found and cross_res.get("crossed", false), "crossing: maybe_cross_facet fires past a ridge")
+	var to_fid := int(cross_res.get("to", -1))
+	_ok(to_fid >= 0 and TC.active_facet() == to_fid, "crossing: active facet switched to the neighbour (%d→%d)" % [fidx, to_fid])
+	TC.set_active_facet(fidx)                          # restore the spawn facet
 	w.queue_free()
+
+# FP3 — the crossing reframe math (§6.1). The f64 A→B→A position reframe round-trips exactly (Δ_AB·Δ_BA = I),
+# and crossing_basis is a true inverse pair — so a cross-and-return is byte-identical and the player can never
+# drift across repeated seam crossings.
+func _gate_crossing_math(nf: int) -> void:
+	var worst_rt := 0.0
+	var basis_worst := 0.0
+	var step := maxi(1, nf / 150)
+	for a in range(0, nf, step):
+		for slot in range(4):
+			var b: int = FA.seam_neighbour(a, slot)
+			var cc := FA.centre_cell(a)
+			var p := Vector3(float(cc.x) + 0.5, 12.0, float(cc.y) + 0.5)
+			var pb := FA.reframe_position64(a, b, p.x, p.y, p.z)
+			var pa := FA.reframe_position64(b, a, pb[0], pb[1], pb[2])
+			worst_rt = maxf(worst_rt, Vector3(float(pa[0]) - p.x, float(pa[1]) - p.y, float(pa[2]) - p.z).length())
+			var m := FA.crossing_basis(b, a) * FA.crossing_basis(a, b)
+			basis_worst = maxf(basis_worst, (m.x - Vector3(1, 0, 0)).length() + (m.y - Vector3(0, 1, 0)).length() + (m.z - Vector3(0, 0, 1)).length())
+	_ok(worst_rt < 1e-3, "crossing: A→B→A position round-trips exactly (worst %s < 1e-3, f64)" % worst_rt)
+	_ok(basis_worst < 1e-5, "crossing: crossing_basis(B,A)·crossing_basis(A,B) = identity (worst %s)" % basis_worst)
 
 # FP2 Stage A — seam table + junction clip (§2.5, §3.5.1-3). Weld closure (reciprocity + matching ring +
 # opposite m̂ = watertight by construction), G-J1 exact complementarity (own_A(p) = −own_B(p) on the shared

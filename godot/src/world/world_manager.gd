@@ -37,6 +37,7 @@ var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 const FACET_WALL_EPS := 0.5           # COSMOS FACETED §5.3: the ridge wall sits this far INSIDE each seam plane
+const FACET_CROSS_HYST := 0.75        # COSMOS FACETED §6.1: cross onto the neighbour once this far PAST a ridge
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -1233,6 +1234,30 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 ## found again by its unchanged key from the new home face. Worldgen determinism holds because a
 ## global cell resolves through _curved_profile identically regardless of which window/home face
 ## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
+## COSMOS FACETED §6.1 — the crossing handoff. When the player walks past an active-facet ridge (signed own_dist
+## < −HYST, one-sided so jitter can't double-fire), re-frame them onto the neighbour facet: switch the active
+## facet and return the f64-EXACT reframed position + the dihedral yaw twist for Player.apply_reframe. FP3a: the
+## reframe + active-facet switch (the correctness core, gated by cross-and-return byte-identity). FP3b adds the
+## module restream (M4 cover), the far-ring re-placement (rigid, no regen), and debris re-frame. {} = no crossing.
+func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
+	if not CubeSphere.FACETED:
+		return {}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return {}
+	for slot in 4:
+		var s := FacetAtlas.own_dist(fid, slot, player_pos.x, player_pos.y, player_pos.z)
+		if s < -FACET_CROSS_HYST:
+			var to: int = FacetAtlas.seam_neighbour(fid, slot)
+			var np := FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
+			var yaw_delta := atan2(ex.z, ex.x)
+			TerrainConfig.set_active_facet(to)
+			# FP3b: _cross_restream(fid, to, player_pos); _facet_ring.set_active(to); _reframe_debris(fid, to)
+			return {"crossed": true, "from": fid, "to": to,
+				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+	return {}
+
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	if _chart == null:

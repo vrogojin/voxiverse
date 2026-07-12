@@ -203,11 +203,14 @@ const FLIP_HYST := 64
 ## True if the player at window `local` is ≥ FLIP_HYST cells PAST a face edge — i.e. the global
 ## column on the current home face has run out of [0, N) by more than the hysteresis (§4.5). The
 ## flip is deferred this far so play continues on the extended window across the seam with no event.
-func flip_needed(local: Vector3) -> bool:
+## `hyst` defaults to FLIP_HYST; COSMOS M5c (§4) passes FLIP_HYST_CORNER inside the corner zone so the
+## player re-homes almost immediately after an edge crossing near a vertex (flipping early is an exact
+## isometry, never wrong). Body otherwise unchanged.
+func flip_needed(local: Vector3, hyst: int = FLIP_HYST) -> bool:
 	# COSMOS-FRAME-ORIENTATION §5.3: the out-of-range test is on the RAW index (org + M_win·w), so
 	# route through raw_of. M_win = I → (i_org + floor x, j_org + floor z), today's test exactly.
 	var p := raw_of(int(floor(local.x)), int(floor(local.z)))
-	return p.x >= n + FLIP_HYST or p.x < -FLIP_HYST or p.y >= n + FLIP_HYST or p.y < -FLIP_HYST
+	return p.x >= n + hyst or p.x < -hyst or p.y >= n + hyst or p.y < -hyst
 
 ## Perform the home-face flip: fold the player's out-of-range global column to the true neighbour
 ## face and re-base the window onto it, KEEPING the player's window position unchanged so the world

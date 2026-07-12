@@ -158,8 +158,16 @@ func _find_flat(cx: int, cz: int, world: WorldManager = null) -> Vector2i:
 		for dx in range(-16, 17, 2):
 			var x := cx + dx
 			var z := cz + dz
-			if world != null and world.is_wedge_column(x, z):
-				continue
+			if world != null:
+				# COSMOS M5c (§4): under the corner seal, spawn must be HOME-NATIVE (both raw indices in [0,n),
+				# no edge fold) or the eager hysteresis fires a flip + hard restream on the first physics frame.
+				# The (+,+) home quadrant of the scan box always has candidates. Native ⊂ non-wedge, so this
+				# subsumes the wedge skip. Flag off → the shipped wedge skip only.
+				if CubeSphere.M5C_CORNER:
+					if not world.is_home_native_column(x, z):
+						continue
+				elif world.is_wedge_column(x, z):
+					continue
 			var lo := 0x7fffffff
 			var hi := -0x7fffffff
 			for oz in range(-1, 2):

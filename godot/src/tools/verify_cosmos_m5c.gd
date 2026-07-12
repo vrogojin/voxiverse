@@ -25,6 +25,7 @@ func _init() -> void:
 	_c1_phi_map()
 	_c2_involution()
 	_c8_glue()
+	_c6_flip()
 	if CubeSphere.M5C_CORNER:
 		_c4_pillar()
 		_c5_edit_lock()
@@ -36,6 +37,35 @@ func _init() -> void:
 
 const TC := preload("res://src/world/terrain_config.gd")
 const CS2 := preload("res://src/cosmos/cube_sphere.gd")
+
+# C6-partial (§4/§11) — the eager flip cadence + single-edge property (flag-independent chart math; the FULL
+# circling walker with no-double-out + 90° holonomy lands in S4's C6 where teleport makes every radius safe).
+func _c6_flip() -> void:
+	var mk := func() -> CosmosChart: return CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	# hysteresis selection: past the SOUTH edge by overshoot 6 (window==raw at spawn, M_win=I, org=0):
+	var ch: CosmosChart = mk.call()
+	_ok(ch.flip_needed(Vector3(20, 60, -6), CubeSphere.FLIP_HYST_CORNER), "C6 eager flip fires at overshoot 6")
+	_ok(not ch.flip_needed(Vector3(20, 60, -4), CubeSphere.FLIP_HYST_CORNER), "C6 eager no-flip at overshoot 4 (< 5)")
+	_ok(not ch.flip_needed(Vector3(20, 60, -6), CosmosChart.FLIP_HYST), "C6 normal hysteresis no-flip at overshoot 6")
+	# single-EDGE flip: a single-out column (i in range, j out) folds ok:true (not the double-out refusal):
+	var ch2: CosmosChart = mk.call()
+	var res: Dictionary = ch2.flip(Vector3(20, 60, -6))
+	_ok(bool(res["ok"]), "C6 single-out column flips ok (single-edge)")
+	# a real edge cross (face changed). The SOUTH edge of the polar face 4 carries a 0° D4, so M_win may be
+	# unchanged — that is correct single-edge behaviour; only the FULL lap's composition is the 90° holonomy.
+	_ok(int(res["from_face"]) != int(res["to_face"]), "C6 flip crossed to a neighbour face")
+	# DOUBLE-out (both axes out → corner quadrant): flip refused (the shipped {ok:false} deferral):
+	var ch3: CosmosChart = mk.call()
+	var res3: Dictionary = ch3.flip(Vector3(-6, 60, -6))
+	_ok(not bool(res3["ok"]), "C6 double-out (wedge) flip refused (ok:false)")
+	# home-native classification (spawn preference §4): corner cell native, single-out column not native:
+	var ch4: CosmosChart = mk.call()
+	_ok(_native(ch4, 5, 5), "C6 (5,5) home-native")
+	_ok(not _native(ch4, 20, -6), "C6 (20,-6) single-out NOT native")
+
+func _native(ch: CosmosChart, x: int, z: int) -> bool:
+	var p := ch.raw_of(x, z)
+	return p.x >= 0 and p.x < ch.n and p.y >= 0 and p.y < ch.n
 
 # C4 (§11) — the bedrock pillar, requires M5C_CORNER on. Scans the 4 corners of HOME_FACE, verifies the
 # pillar footprint, one flat top, full bedrock cubes / zero modifier / no tree, and cross-face byte-equality.

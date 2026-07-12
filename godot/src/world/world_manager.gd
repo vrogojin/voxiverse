@@ -47,6 +47,9 @@ var _flip_settling := false
 # geometry is baked STATIC in this frame; the per-frame rigid F (alignment_transform) rotates it to render
 # around the window-space camera. Re-installed at each home-face flip.
 var _epoch_frame: Dictionary = {}
+# COSMOS M5c (§4/§5): the player's raw distance to the nearest cube vertex, stashed by maybe_flip_home_face
+# each frame so the §5 anomaly check reuses it. 1e30 = "not near a corner / flag off".
+var _corner_dist := 1.0e30
 var _epoch_anchor: Vector3 = Vector3.ZERO
 
 # COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
@@ -970,6 +973,14 @@ func is_corner_locked_column(x: int, z: int) -> bool:
 	var c := CosmosCorner.nearest_corner(p.x, p.y, _chart.n)
 	return CosmosCorner.corner_dist(p.x, p.y, c) <= float(CubeSphere.CORNER_LOCK_R)
 
+## COSMOS M5c (§4): true iff window column (x,z) is HOME-NATIVE — both raw indices in [0, n), i.e. no edge
+## fold. main._find_flat prefers these under M5C_CORNER so the spawn does not fire the eager flip on frame 1.
+func is_home_native_column(x: int, z: int) -> bool:
+	if _chart == null:
+		return false
+	var p := _chart.raw_of(x, z)
+	return p.x >= 0 and p.x < _chart.n and p.y >= 0 and p.y < _chart.n
+
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).
 ## Guarded on M5_RENDER so the default (and the CosmosBend curved mode) never touch these globals.
@@ -1073,7 +1084,20 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 ## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:
-	if _chart == null or not _chart.flip_needed(player_pos):
+	if _chart == null:
+		return false
+	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §4): inside CORNER_ZONE_R of a vertex, drop the flip hysteresis
+	# from 64 to FLIP_HYST_CORNER=5 so the player re-homes almost immediately after any edge crossing near
+	# the corner (the §7 wedge-unreachability lemma needs this). The corner distance is stashed for §5's
+	# anomaly check. Flag OFF → h stays FLIP_HYST → byte-identical to today.
+	var h := CosmosChart.FLIP_HYST
+	if CubeSphere.M5C_CORNER:
+		var p := _chart.raw_of_f(player_pos.x, player_pos.z)
+		var c := CosmosCorner.nearest_corner(p.x, p.y, _chart.n)
+		_corner_dist = CosmosCorner.corner_dist(p.x, p.y, c)
+		if _corner_dist <= float(CubeSphere.CORNER_ZONE_R):
+			h = CubeSphere.FLIP_HYST_CORNER
+	if not _chart.flip_needed(player_pos, h):
 		return false
 	var res := _chart.flip(player_pos)
 	if not bool(res["ok"]):

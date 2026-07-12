@@ -56,13 +56,20 @@ The user's question decomposes cleanly, and the honest answers differ per part:
    and only locally: anisotropy 1.73 → 1.27 and wedge slack 90° → 30° within ~t cells of
    each corner; invisible beyond that. (c) SIMPLER — bluntly, NO: strictly more
    machinery than the shipped cube + M5c** (more vertices, more seam types, two lattice
-   families, non-separable warp).
+   families, non-separable warp). The user's driving hypothesis — *"square-only wrapping
+   is too difficult, so allowing triangles should SIMPLIFY the design"* — is examined
+   head-on in §7: the geometric half is right, the implementation inference is inverted
+   (milder vertices ≠ less code — the difficulty moves into a lattice *interface*), and
+   the situational fact decides it: the hard square-only parts are **already paid and
+   shipped** (M_win, canonical fold, M5c, R2) — switching now is a restart, not a
+   simplification. Even the best-case reading (delete M5c because corners got mild)
+   fails: §7(d) shows M5c would not be deleted but tripled.
 5. **The 80/20 exists and is cheap** (§6): a **cosmetic triangular corner monument** on
    the existing M5c pillar — a static, three-fold-symmetric cap mesh (true-space under
    R2) whose base trim uses exactly the user's 90-45-45 half-cell triangles to meet the
    three face grids on their diagonals. Zero topology change, zero regeneration, days of
    work. It does not change the metric — it changes what the eye reads at the pinch
-   point: a deliberate landmark instead of a squished lattice. §7 ranks it first among
+   point: a deliberate landmark instead of a squished lattice. §8 ranks it first among
    the actionable options.
 
 ---
@@ -265,9 +272,9 @@ The pieces, against the shipped architecture:
    vertical diagonal half-block is plausibly one more entry, with the same fold-rotation
    discipline.)
 5. **M5c re-derivation.** 24 vertices instead of 8; cone angle 330° instead of 270°
-   (bisector 165° instead of 135°); the §7 unreachability lemma, constants, and all
-   C-gates re-proven for the new adjacency; corner enumeration tables (`CORNER_SIGNS`,
-   `corner_cells`) replaced by 24-vertex tables.
+   (bisector 165° instead of 135°); the M5C-CORNER §7 unreachability lemma, constants,
+   and all C-gates re-proven for the new adjacency; corner enumeration tables
+   (`CORNER_SIGNS`, `corner_cells`) replaced by 24-vertex tables.
 6. **Web/worker safety:** nothing *inherently* unsafe — generation stays a pure
    function of d̂, caps are static meshes, no new threading or per-frame allocation.
    The risk is not thread-safety; it is that this rewrites the exact subsystem
@@ -288,9 +295,9 @@ correctness problem (M5c seals it; R2 renders it honestly):
 
 **Option B — the corner monument cap.** Keep topology, projection, generation, physics,
 and M5c exactly as shipped. Add a designed, three-fold-symmetric static monument mesh at
-each vertex (true-space placement under R2 — same pattern as the §8 barrier cylinder
-visual, but permanent and authored), sized to the pillar + anomaly footprint (~8-cell
-radius):
+each vertex (true-space placement under R2 — same pattern as the M5C-CORNER §8 barrier
+cylinder visual, but permanent and authored), sized to the pillar + anomaly footprint
+(~8-cell radius):
 
 - Its base trim uses **exactly the user's 90-45-45 half-cell triangles**, aligned to
   each of the three incident faces' grid diagonals — the truncated-cube *look* at the
@@ -308,7 +315,91 @@ worst-looking 16 cells of the planet with a deliberate landmark, which is how th
 reads as *designed* rather than *broken* — the same psychology that made M5c's anomaly
 "a consistent place, not a glitch" (M5C-CORNER §12.1).
 
-## 7. Verdict and ranked recommendation
+## 7. The simplification hypothesis, head-on — "square-only is too difficult; the triangle compromise should simplify the design"
+
+This is the user's explicit driving hypothesis, and it deserves a direct, honest
+treatment rather than being folded into the verdict.
+
+### 7.1 (a) The geometric half of the intuition is REAL
+
+Granted in full: allowing triangles is the one legal move that breaks the §2 quantization,
+and it genuinely mildens the geometry — the 720° redistributes from 8 harsh points into
+24 gentle ones (90° → 30° per vertex, anisotropy 1.732 → 1.267, §4.2). If "difficulty"
+meant *geometric severity per vertex*, the hypothesis would be correct.
+
+### 7.2 (b) But "milder geometry" ≠ "simpler code" — the difficulty is conserved, and it moves into an interface
+
+The 720° is a conserved quantity; a topology only chooses **where the difficulty lives**.
+The pure-square cube concentrates it into 8 harsh points — and in exchange buys the
+property the entire engine is built on: **one lattice everywhere**. One block geometry,
+one seam algebra (every seam is square↔square, hence the exact-integer D4 remaps; the
+fold/`M_win`/edit-key machinery is *provable* — flip theorem (★), byte-identity gates —
+precisely because every frame change is a 2×2 integer matrix), one mesher, one analytic
+collision model. The triangle compromise mildens the vertices but pays a **lattice
+interface**: at every cap boundary, two incompatible tilings meet, and no integer remap
+exists across that seam. The implementation delta, counted per axis:
+
+| Axis | cube (shipped) | truncated hybrid |
+|---|---|---|
+| block geometries | 1 | 2 — cube + 90-45-45 prism, in the module mesher AND GDScript fallback AND far LOD AND DDA AND collision AND collapse flood-fill |
+| seam algebra | 1 type × 12 edges, exact integer D4 | 2 types × 36 edges; the 24 square↔triangle seams admit **no integer remap** — the exactness that makes the frame machinery provable dies at those seams |
+| charts | 6 | 14 |
+| defect vertices needing corner handling | 8 | 24 |
+| projection | separable tan warp | non-separable 2-D warp + exact inverse |
+
+Every row is a strict superset — there is no axis on which the hybrid is less code. The
+hypothesis conflates the severity of the *geometry* with the size of the *codebase*;
+they trade against each other here.
+
+### 7.3 (c) The situational fact that decides it: "square is too hard" is a cost already PAID
+
+The hypothesis prices square-only wrapping as a future difficulty. Empirically it is a
+**sunk, shipped** difficulty: `M_win` (#74), the canonical corner fold (#69), the R2
+true-baked render, and the M5c corner seal (#77) are implemented, gate-green, and live.
+The marginal cost of *keeping* square-only is zero; the cost of *switching* is the §5
+4–6-milestone rewrite — which does not skip the hard parts, it **re-pays them in a
+strictly larger topology** (3× the vertices, 3× the seam count, plus the interface).
+
+The greenfield calculus is genuinely different, and honesty requires saying so: starting
+from nothing, with no square-building requirement, an all-triangle icosphere (12 × 60°,
+again ONE lattice everywhere) would be a defensible and arguably cleaner substrate than
+the cube. But (i) square building voxels are a locked constraint, and (ii) we are not
+greenfield. And note the hybrid is dominated from **both** directions: pure-square beats
+it on machinery count, pure-triangle beats it on vertex gentleness — a mixed lattice
+inherits both families' costs plus the interface between them. In this design family,
+hybrids sit at the complexity *maximum*, not the minimum.
+
+### 7.4 (d) The one reading under which the hybrid could be net-simpler: does it let us DELETE M5c?
+
+If 30° corners were so mild that the pillar/anomaly/glue/eager-flip machinery became
+unnecessary, the deleted milestone could offset the new topology cost. Evaluated piece
+by piece — it does not:
+
+- **The wedge survives.** Each of the 24 sub-vertices still has a window excess
+  (360° − 330° = 30°); entities can still go double-out into it. The §6 seam glue
+  survives as a 30° deck transformation — at 3× the vertex count.
+- **Eager flips survive.** The M5C-CORNER §7 unreachability lemma is about hysteresis
+  geometry vs seam rays, not defect size; it must be re-proven (and re-constant-ed) at
+  24 vertices, not deleted.
+- **The cap needs handling either way.** Walkable caps = a non-square-lattice
+  movement/collision/DDA region — a NEW subsystem larger than M5c (the analytic physics
+  is lattice-based; a triangle-lattice walkable region is a second physics dialect).
+  Barred caps = an M5c-style barrier/anomaly with new constants — i.e. M5c survives by
+  construction. Non-buildable caps (the user's own spec) = the edit lock survives.
+- **Actually deletable:** the bedrock pillar mesh and the 135° bisector constant
+  (→ 165°). Cosmetics and one number.
+
+Net: M5c is not deleted — it is renamed, tripled in vertex count, and gains a lattice
+interface. The deletion dividend the hypothesis needs does not exist.
+
+### 7.5 The honest net verdict on the hypothesis
+
+**The intuition about geometry is correct; the inference about implementation is
+inverted.** Triangular border blocks make the planet's corners *milder* and the engine
+*bigger*. For this project, today — with cube + `M_win` + M5c already built, shipped,
+and sealed — the compromise is a restart wearing the costume of a simplification.
+
+## 8. Verdict and ranked recommendation
 
 **(a) Feasible?** Yes — the truncated-cube family is geometrically sound, and a
 plugs-not-charts cap design keeps it worker/web-safe. Feasible ≠ contained: it is a new
@@ -320,10 +411,15 @@ change** (§4.3). New costs: 24 square↔triangle seams, 8 unbuildable cap plaza
 64–128 to cover the visible zone), two lattice families in every downstream system.
 So: better *locally and modestly*, at a scope that only pays if t is large.
 
-**(c) Simpler?** **No.** Strictly more machinery than shipped cube + M5c on every axis:
+**(c) Simpler?** **No** — and this is the direct answer to the user's driving
+hypothesis (§7 in full). Strictly more machinery than shipped cube + M5c on every axis:
 14 charts vs 6, 36 edges vs 12 (24 of them lattice-incompatible), 24 defect vertices vs
-8, non-separable warp vs separable, mixed cell shapes vs one. The user's proposal is
-*geometrically right* that triangles buy gentler corners; it is not a simplification.
+8, non-separable warp vs separable, mixed cell shapes vs one (§7.2 table). The hard
+square-only costs are already paid and shipped, so switching is a restart, not a relief
+(§7.3); and the best-case offset — deleting M5c because corners got mild — does not
+materialize: the wedge, glue, eager flips, and cap handling all survive at 3× the
+vertex count (§7.4). The user's proposal is *geometrically right* that triangles buy
+gentler corners; it is not a simplification.
 
 **Ranked recommendation:**
 

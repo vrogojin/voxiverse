@@ -228,9 +228,11 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 	var out_verts := PackedVector3Array(); out_verts.resize(n)
 	var out_norms := PackedVector3Array(); out_norms.resize(n)
 	var is_wedge := PackedByteArray(); is_wedge.resize(n)
+	var win_xz := PackedVector2Array(); win_xz.resize(n)   # window (x,z) per vertex — for the bridging-cull below
 	for k in range(n):
 		var v := verts[k]
 		var w := Vector3(node_origin.x + v.x, v.y, node_origin.z + v.z)
+		win_xz[k] = Vector2(w.x, w.z)
 		# ONE fold per vertex: place + outward radial together, and the _WEDGE sentinel IS the wedge test.
 		var pr := CosmosTruePlace.place_and_radial(chart, w, frame)
 		var true_local: Vector3 = pr["pos"]
@@ -257,6 +259,19 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 		if is_wedge[a] == 1 or is_wedge[b] == 1 or is_wedge[c] == 1:
 			culled += 1
 			continue
+		# BRIDGING cull: the per-vertex test only drops a triangle whose VERTEX folds to the double-out wedge.
+		# At the COARSE far rings (cell 8–32) a single triangle straddling a cube corner can have all three
+		# vertices on the valid home + strips while its BODY spans the discarded 90° wedge sector — under true
+		# placement that renders a stretched sheet across the corner at distance (the "far wedge still visible"
+		# report). Drop it if its window centroid or any edge midpoint folds to the wedge, so the impossible
+		# sector shows sky instead. The real neighbour-face terrain is rendered by its own (non-bridging) tiles.
+		var wa := win_xz[a]; var wb := win_xz[b]; var wc := win_xz[c]
+		if _win_wedge(chart, (wa + wb + wc) / 3.0) \
+				or _win_wedge(chart, (wa + wb) * 0.5) \
+				or _win_wedge(chart, (wb + wc) * 0.5) \
+				or _win_wedge(chart, (wc + wa) * 0.5):
+			culled += 1
+			continue
 		# REVERSE the winding: the window→true map (place_true) is orientation-REVERSING (negative
 		# determinant — window +Y/up is the middle axis while the sphere's outward normal is the face's
 		# third axis, so the map carries a reflection). A reflection flips triangle winding, which under
@@ -270,6 +285,11 @@ static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origi
 	}
 
 ## Wrap raw arrays into an ArrayMesh with the shared far material on surface 0.
+## True iff the window point p=(x,z) folds to the double-out corner WEDGE. Used by the bake bridging-cull to
+## drop coarse far triangles whose interior spans the discarded sector even though no vertex is itself wedge.
+static func _win_wedge(chart, p: Vector2) -> bool:
+	return CosmosTruePlace.is_wedge(chart, p.x, p.y)
+
 static func build_mesh(arrays: Dictionary, material: Material) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	# COSMOS R1: a corner tile whose triangles ALL touch the double-out wedge bakes to a non-empty vertex

@@ -42,6 +42,7 @@ func _initialize() -> void:
 	_gate_seams(nf)
 	_gate_junction_encode()
 	_gate_junction_mesh()
+	_gate_far_ring()
 	_gate_live_loop()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -106,6 +107,35 @@ func _gate_live_loop() -> void:
 		zz += 1
 	_ok(masked_ok, "junction physics: a beyond-ridge cell masks to AIR (block_id_at == 0)")
 	_ok(junction_ok, "junction physics: a straddling cell is a solid kind-2 junction via WM.cell_value_at")
+	# FP2 Stage D — the ridge wall: blocked() lets the player stand in the interior but stops them at a ridge.
+	# "Interior not walled": SOME interior, non-ridge, tree-free column is walkable (trees/edits make any single
+	# column flaky). "Walled at the ridge": from that column, scanning out to a ridge, blocked() fires.
+	var base_iz := cz + 5
+	var wall_in := false
+	var wall_out := false
+	var scanned := false
+	for dd in range(0, 60, 2):
+		var jx := cx + dd
+		var jfeet := w.surface_y(float(jx) + 0.5, float(base_iz) + 0.5)   # the standable height the player uses
+		var odmin := 1.0e18
+		for slot in range(4):
+			odmin = minf(odmin, FA.own_dist(fidx, slot, float(jx) + 0.5, jfeet, float(base_iz) + 0.5))
+		if odmin < 3.0:
+			continue
+		if not w.blocked(float(jx) + 0.5, float(base_iz) + 0.5, jfeet):
+			wall_in = true
+			for d in range(1, 400):
+				var px := float(jx + d) + 0.5
+				var od := 1.0e18
+				for slot in range(4):
+					od = minf(od, FA.own_dist(fidx, slot, px, jfeet, float(base_iz) + 0.5))
+				if od < 0.4:
+					wall_out = w.blocked(px, float(base_iz) + 0.5, jfeet)
+					scanned = true
+					break
+			break
+	_ok(wall_in, "facet wall: an interior column is walkable (not blanket-walled)")
+	_ok(scanned and wall_out, "facet wall: blocked() stops the player at the ridge plane")
 	w.queue_free()
 
 # FP2 Stage A — seam table + junction clip (§2.5, §3.5.1-3). Weld closure (reciprocity + matching ring +
@@ -261,6 +291,21 @@ func _gate_junction_encode() -> void:
 	_ok(jcount > 0 and air_count > 0 and interior_count > 0, "junction: all three classes present (air=%d interior=%d junction=%d)" % [air_count, interior_count, jcount])
 	_ok(outward_ok, "junction: cut offset q rounds OUTWARD (model plane ≥ exact, no inward crack)")
 	_ok(overlap_worst <= 1.0 / 16.0 + 1e-6, "junction: outward overlap ≤ 1/16 block (worst %s)" % overlap_worst)
+
+# FP2 Stage C — the far ring (§5.2). Builds the planet mesh around the active facet headlessly and checks it
+# produced a substantial-but-bounded triangle count (the active facet is excluded; back-hemisphere facets culled).
+func _gate_far_ring() -> void:
+	var fid := FA.spawn_facet()
+	TC.set_active_facet(fid)
+	var ring := FacetFarRing.new()
+	get_root().add_child(ring)
+	ring.setup(fid)
+	var tris := ring.triangle_count()
+	var k := FA.K
+	var maxtris := 6 * k * k * FacetFarRing.CELLS * FacetFarRing.CELLS * 2
+	_ok(tris > 0, "far ring: built %d triangles around the active facet" % tris)
+	_ok(tris < maxtris, "far ring: triangle count bounded by the all-facet cap (%d < %d, back-hemisphere culled)" % [tris, maxtris])
+	ring.queue_free()
 
 # FP2 Stage B2 — the junction mesh builder (§3.5.4). G-J2: ShapeMesh._build_junction's clipped vertices match
 # the shared clip enumerator (junction_model_verts) to ≤1e-4 — render geometry == the atlas clip by shared

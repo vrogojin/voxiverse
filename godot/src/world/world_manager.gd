@@ -35,6 +35,8 @@ var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
+var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+const FACET_WALL_EPS := 0.5           # COSMOS FACETED §5.3: the ridge wall sits this far INSIDE each seam plane
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -147,9 +149,14 @@ func _ready() -> void:
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
 	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
-	# COSMOS FACETED (§4.5): the far layer renders the flat/curved global-index heightmap — meaningless (and a
-	# giant misplaced sheet) under a single facet. FP2 replaces it with the neighbour+far facet ring. OFF here.
-	if FarTerrain.ENABLED and not CubeSphere.FACETED:
+	# COSMOS FACETED (§5.2): replace FarTerrain (the flat/curved global-index heightmap — a giant misplaced
+	# sheet under a single facet) with the facet far ring: the whole planet rendered around the active facet.
+	if CubeSphere.FACETED and FacetFarRing.ENABLED:
+		_facet_ring = FacetFarRing.new()
+		_facet_ring.name = "FacetFarRing"
+		add_child(_facet_ring)
+		_facet_ring.setup(TerrainConfig.active_facet())
+	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
 		add_child(_far)
@@ -1734,6 +1741,15 @@ const _EPS := 1e-6
 ## → wall), a body span overlapping the ground finds its surface far above the buried
 ## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
+	# COSMOS FACETED §5.3: the ridge wall. Until the FP3 handoff lets the player cross onto the neighbour, an
+	# invisible wall sits just inside each active-facet ridge plane, so the player can stand on the own-side of
+	# every junction cell but not walk past P into the masked void. One own_dist test per ≤4 seams.
+	if CubeSphere.FACETED:
+		var fid := TerrainConfig.active_facet()
+		if fid >= 0:
+			for slot in 4:
+				if FacetAtlas.own_dist(fid, slot, x, feet_y, z) < FACET_WALL_EPS:
+					return true
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)

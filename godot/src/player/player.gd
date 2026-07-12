@@ -76,7 +76,12 @@ func _ready() -> void:
 	# fog hides the boundary well before the edge. With the far field enabled the plane
 	# must reach past R_FAR (LOD-DESIGN §3.5) so the distant rings are not frustum-clipped;
 	# disabled → today's near-only value.
-	_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
+	# COSMOS FACETED §5.2: the far ring wraps the whole planet (~2R) around the active facet, so the camera far
+	# must reach it; otherwise the shipped FarTerrain / near-only value.
+	if CubeSphere.FACETED:
+		_camera.far = FacetFarRing.CAMERA_FAR
+	else:
+		_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
 	add_child(_camera)
 	# COSMOS R2.2 (Design Z): the near + far render STATIC in the epoch frame and the camera moves THROUGH

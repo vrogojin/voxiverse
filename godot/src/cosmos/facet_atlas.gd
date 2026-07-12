@@ -231,6 +231,21 @@ static func world_to_lattice64(fid: int, wx: float, wy: float, wz: float) -> Arr
 		dx * _frame[f + 6] + dy * _frame[f + 7] + dz * _frame[f + 8],
 		dx * _frame[f + 9] + dy * _frame[f + 10] + dz * _frame[f + 11] + float(_off[fid * 2 + 1])]
 
+## The world position of facet `fid`'s planarized corner `ci` (0..3, CCW) — c0' + q_ci·(ê_u, ê_w). f64 [x,y,z].
+## The SAME planar frames the near voxel world uses, so the far ring meets the near facet cleanly at ridges.
+static func facet_planar_corner(fid: int, ci: int) -> Array:
+	var f := fid * 12
+	var p := fid * 8
+	var qx := _poly[p + ci * 2]; var qz := _poly[p + ci * 2 + 1]
+	return [_frame[f + 0] + qx * _frame[f + 3] + qz * _frame[f + 9],
+		_frame[f + 1] + qx * _frame[f + 4] + qz * _frame[f + 10],
+		_frame[f + 2] + qx * _frame[f + 5] + qz * _frame[f + 11]]
+
+## Facet `fid`'s outward normal n̂ in world coords (f64 [x,y,z]) — for back-face culling the far ring.
+static func facet_normal64(fid: int) -> Array:
+	var f := fid * 12
+	return [_frame[f + 6], _frame[f + 7], _frame[f + 8]]
+
 ## The rigid placement Transform3D (FP2+ node placement; FP1 renders in the local frame and never needs it).
 static func facet_transform(fid: int) -> Transform3D:
 	var f := fid * 12

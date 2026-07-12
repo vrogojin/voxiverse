@@ -908,55 +908,40 @@ func _build_junction_manifest(library: Object, total: int) -> int:
 		return 0
 	_junction_arid.resize(total * 128)
 	_junction_arid.fill(-1)
-	var full_cube := CellCodec.pack(BlockCatalog.STONE, 0)   # placeholder v; junction_modify keeps the real mat
-	var keys := {}                                           # mat·128 + slot·32 + q -> mat (the bake list)
-	var lo: Vector2i = FacetAtlas.dom_min(fid)
-	var hi: Vector2i = FacetAtlas.dom_max(fid)
-	var floor_y := TerrainConfig.BEDROCK_FLOOR
-	var z := lo.y
-	while z <= hi.y:
-		var x := lo.x
-		while x <= hi.x:
-			# cheap pre-filter: only columns within a few cells of a ridge can hold junction cells
-			var near := false
-			for slot in range(4):
-				var od := FacetAtlas.own_dist(fid, slot, float(x) + 0.5, 0.0, float(z) + 0.5)
-				if od > -4.0 and od < 4.0:
-					near = true
-					break
-			if near:
-				var g := TerrainConfig.height_at(x, z)
-				var y := g
-				while y >= floor_y:
-					var v := TerrainConfig.generated_cell(x, y, z)
-					if CellCodec.mat(v) > BlockCatalog.AIR:
-						var jm := CellCodec.modifier(FacetAtlas.junction_modify(fid, Vector3i(x, y, z), v))
-						if CellCodec.is_junction(jm):
-							var mat := CellCodec.mat(v)
-							if mat < total:
-								keys[mat * 128 + CellCodec.junction_slot(jm) * 32 + CellCodec.junction_q(jm)] = mat
-					y -= 1
-			x += 1
-		z += 1
+	# The junction CLIP geometry is material-INDEPENDENT (one convex prism per slot+q, in the active facet's
+	# frame), so there is NO need to walk the terrain to discover which cells occur — that deep generated_cell
+	# scan was ~85s on web. Instead bake the small cartesian product (solid materials × 4 slots × 32 offsets)
+	# directly; the ArrayMesh is shared per (slot,q) across materials via _shape_mesh_cache, so only 128 clips
+	# run, and each model is a cheap material override. An unbaked (mat,slot,q) lip-falls-back (never a hole).
+	# Only the TERRAIN materials can appear at a facet seam — the surface set plus the shaped (slope) set (which
+	# carries the sub-surface stone/dirt). Ores, wood, crafted blocks never touch a ridge, so baking all solid
+	# materials (4096, capped) was ~10× waste. This set is ~10-15 materials → ~1-2k models, a couple seconds.
+	var matset := {}
+	for m: int in TerrainConfig.appearance_surface_materials():
+		matset[m] = true
+	for pair: int in TerrainConfig.emitted_slope_pairs():
+		matset[pair / _SLOPE_STRIDE] = true
+	matset[BlockCatalog.STONE] = true
 	var appended := 0
-	for key in keys.keys():
-		if appended >= 4096:
-			push_warning("[module_world] junction manifest hit the 4096-model cap — remaining cells lip-fall-back")
-			break
-		var mat: int = keys[key]
-		var slot: int = (int(key) % 128) / 32
-		var q: int = int(key) % 32
-		var model: Object = _make_shape_model(CellCodec.make_junction(slot, q), BlockMaterials.get_for(mat))
-		if model == null:
+	for mat: int in matset.keys():
+		if mat <= BlockCatalog.AIR or mat >= total or BlockCatalog.solidity_of(mat) < 0.5:
 			continue
-		var expected := _next_arid
-		var got: int = _add_model(library, model)
-		if got != expected:
-			push_warning("[module_world] junction manifest ARID drift: add_model %d != expected %d" % [got, expected])
-			return appended
-		_next_arid += 1
-		_junction_arid[int(key)] = got
-		appended += 1
+		if appended >= 4096:
+			break
+		var material: Material = BlockMaterials.get_for(mat)
+		for slot in range(4):
+			for q in range(32):
+				var model: Object = _make_shape_model(CellCodec.make_junction(slot, q), material)
+				if model == null:
+					return appended                      # no mesh-model class → all lip-fall-back
+				var expected := _next_arid
+				var got: int = _add_model(library, model)
+				if got != expected:
+					push_warning("[module_world] junction manifest ARID drift: add_model %d != expected %d" % [got, expected])
+					return appended
+				_next_arid += 1
+				_junction_arid[mat * 128 + slot * 32 + q] = got
+				appended += 1
 	return appended
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into

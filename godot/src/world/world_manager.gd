@@ -1003,11 +1003,13 @@ func m5c_corner_check(pos: Vector3, vel: Vector3) -> Dictionary:
 		var g := CosmosCorner.glue_raw(pf.x, pf.y, n)
 		var wg := _chart.window_of_f(g["px"], g["py"])
 		return _glue_reloc(pf, Vector2(g["px"], g["py"]), wg, pos, vel, n)
-	# case 2 — anomaly teleport (or barrier mode: no teleport; S5 stops entry so this stays outside R_b).
+	# case 2 — inside the R_b anomaly cylinder.
 	var pr := _chart.raw_of_f(pos.x, pos.z)
 	var c := CosmosCorner.nearest_corner(pr.x, pr.y, n)
-	if CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B or not CubeSphere.M5C_TELEPORT:
+	if CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B:
 		return {}
+	if not CubeSphere.M5C_TELEPORT:
+		return _barrier_reloc(pr, c, pos, vel)     # §8 solid barrier: clamp to the cylinder, kill inward velocity
 	var t := CosmosCorner.teleport_raw(pr.x, pr.y, n)
 	var w_out := _chart.window_of_f(t["px"], t["py"])
 	var beta: float = t["beta"]
@@ -1034,6 +1036,24 @@ func m5c_corner_check(pos: Vector3, vel: Vector3) -> Dictionary:
 		"vel": Vector3(r_out.x * speed, vel.y, r_out.y * speed),
 		"yaw_delta": yaw_delta,
 	}
+
+## COSMOS M5c (§8): the solid ENERGY BARRIER fallback (M5C_TELEPORT=false). Clamp the player to the R_b
+## cylinder surface along their radial from the vertex and remove the inward velocity component — a "you
+## cannot enter" wall over the same full-height cylinder. All §7 invariants keep (the player never gets
+## inside R_b, so never double-out). No teleport, no yaw change.
+func _barrier_reloc(pr: Vector2, c: Vector4, pos: Vector3, vel: Vector3) -> Dictionary:
+	var u := Vector2(pr.x - c.x, pr.y - c.y)
+	u = u.normalized() if u.length() > 1.0e-6 else Vector2(1, 0)
+	var p_out := Vector2(c.x + u.x * (CosmosCorner.R_B + 0.02), c.y + u.y * (CosmosCorner.R_B + 0.02))
+	var w_out := _chart.window_of_f(p_out.x, p_out.y)
+	var w_v := _chart.window_of_f(c.x, c.y)
+	var r_hat := (w_out - w_v)
+	r_hat = r_hat.normalized() if r_hat.length() > 1.0e-6 else Vector2(1, 0)
+	var v_h := Vector2(vel.x, vel.z)
+	var v_in := v_h.dot(r_hat)
+	if v_in < 0.0:
+		v_h -= r_hat * v_in                       # strip the inward component; keep tangential + vertical
+	return {"pos": Vector3(w_out.x, pos.y, w_out.y), "vel": Vector3(v_h.x, vel.y, v_h.y), "yaw_delta": 0.0}
 
 ## COSMOS M5c (§6): the UNIVERSAL seam glue for non-flipping entities. Each physics frame, any AWAKE VoxelBody
 ## whose column is double-out (wedge — a fast projectile/debris can cross a seam ray far outside R_b) is mapped

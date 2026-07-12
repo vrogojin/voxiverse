@@ -29,8 +29,11 @@ func _init() -> void:
 	if CubeSphere.M5C_CORNER:
 		_c4_pillar()
 		_c5_edit_lock()
-		_c7_conservation()
-		_c6_full()
+		if CubeSphere.M5C_TELEPORT:
+			_c7_conservation()
+			_c6_full()
+		else:
+			_c11_barrier()
 	else:
 		_c9_byte_identity()
 
@@ -210,6 +213,29 @@ func _c6_full() -> void:
 	_ok(eject >= 13, "C6 radial-approach: all directions eject outside R_b + wedge (%d/13)" % eject)
 	wm.free()
 	# (holonomy — the honest 90° curvature per lap — is pinned by verify_cosmos_m0's corner tests; not re-asserted here)
+
+# C11 (§8/§11) — barrier mode (M5C_TELEPORT=false): an inward approach is clamped to the R_b cylinder
+# surface (never gets inside) and its inward velocity component is removed. All other invariants keep.
+func _c11_barrier() -> void:
+	var wm := WorldManager.new()
+	wm._chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	var n := wm._chart.n
+	for phi in range(5, 266, 30):
+		var b := deg_to_rad(float(phi) - 90.0)
+		var pos := Vector3(4.0 * cos(b), 40.0, 4.0 * sin(b))       # 4 < R_b=8 → inside the barrier
+		var reloc: Dictionary = wm.m5c_corner_check(pos, Vector3(-cos(b), 0, -sin(b)) * 3.0)
+		_ok(not reloc.is_empty(), "C11 barrier fired @φ%d" % phi)
+		if reloc.is_empty():
+			continue
+		var np: Vector3 = reloc["pos"]
+		var pr := wm._chart.raw_of_f(np.x, np.z)
+		var cc := CosmosCorner.nearest_corner(pr.x, pr.y, n)
+		_ok(CosmosCorner.corner_dist(pr.x, pr.y, cc) >= CosmosCorner.R_B - 1.0e-3, "C11 clamped to ≥ R_b @φ%d" % phi)
+		var nv: Vector3 = reloc["vel"]
+		var w_v := wm._chart.window_of_f(cc.x, cc.y)
+		var inward := (w_v - Vector2(np.x, np.z)).normalized()
+		_ok(Vector2(nv.x, nv.z).dot(inward) <= 1.0e-3, "C11 inward velocity removed @φ%d" % phi)
+	wm.free()
 
 # C9 (§11) — byte-identity with M5C_CORNER OFF: _curved_profile == _curved_profile_base, no B_PILLAR anywhere.
 func _c9_byte_identity() -> void:

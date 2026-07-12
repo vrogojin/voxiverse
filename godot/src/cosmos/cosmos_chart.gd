@@ -74,6 +74,19 @@ func window_of(gi: int, gj: int) -> Vector2i:
 	var pj := gj - j_org
 	return Vector2i(mw_a * pi + mw_c * pj, mw_b * pi + mw_d * pj)
 
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §1) — CONTINUOUS float twins of raw_of / window_of. The corner
+## math works in the continuous raw home-face frame (p = org + M_win·w), never on window (x,z) directly
+## (M_win rotates the window). M_win is orthonormal integer so both are exact under f64.
+func raw_of_f(x: float, z: float) -> Vector2:
+	return Vector2(float(i_org) + float(mw_a) * x + float(mw_b) * z,
+		float(j_org) + float(mw_c) * x + float(mw_d) * z)
+
+## Inverse float twin: continuous raw (px, pz) → window (x, z) = M_win⁻¹·(p − org) (transpose form).
+func window_of_f(px: float, pz: float) -> Vector2:
+	var pi := px - float(i_org)
+	var pj := pz - float(j_org)
+	return Vector2(float(mw_a) * pi + float(mw_c) * pj, float(mw_b) * pi + float(mw_d) * pj)
+
 ## The render node's world-space origin: a node whose local coords are the ROTATED raw index
 ## `v = M_win⁻¹·p` must sit at position `−M_win⁻¹·org` so that scene(window) x,z == world x,z
 ## (scene == window preserved). M_win = I → (−i_org, 0, −j_org), today's node position exactly.

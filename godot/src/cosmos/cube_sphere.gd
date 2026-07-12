@@ -30,6 +30,18 @@ const REGION_SIZE := 32
 const CORNER_SEA_R := 48
 const CORNER_LOCK_R := 8
 
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §9) — the walkable-land-corner seal: bedrock pillar + anomaly
+## teleport. All gated behind M5C_CORNER (default OFF → shipped build byte-identical). M5C_TELEPORT=false
+## degrades §5's bisector teleport to §8's solid energy barrier over the same cylinder. CORNER_ZONE_R /
+## FLIP_HYST_CORNER are the eager-flip zone/hysteresis (corrected from the ADR's 32/8 — see the doc §7/§13);
+## PILLAR_R_CELLS / PILLAR_TOP_UP size the bedrock monument.
+const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
+const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
+const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]
+const FLIP_HYST_CORNER := 5      # eager flip hysteresis inside the zone               [§4, §7]
+const PILLAR_R_CELLS := 3        # pillar angular radius in cells                      [§2.1]
+const PILLAR_TOP_UP := 6         # pillar top above the max corner-cell base height    [§2.2]
+
 ## 1/sqrt(3): the |z| of every cube corner direction; asin(1/sqrt3) = 35.264 deg is the
 ## latitude the 8 corners are parked at with the poles-on-face-centres orientation (§5.2).
 const INV_SQRT3 := 0.5773502691896258

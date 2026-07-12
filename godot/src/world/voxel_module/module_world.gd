@@ -142,6 +142,7 @@ const _COMP_MESH_FLAG := 1 << 22         # _shape_mesh_cache key bit for snow-fi
 # extra GPU readbacks), the _snow_arid discipline.
 const _SLOPE_STRIDE := 4096
 var _slope_arid: PackedInt32Array        # (mat*_SLOPE_STRIDE + payload) -> ARID; -1 = not baked; frozen at setup
+var _junction_arid: PackedInt32Array     # COSMOS FACETED §3.5.4: (mat*128 + slot*32 + q) -> junction bevel ARID; empty until B3b-full
 var _snow_slope_arid: PackedInt32Array   # (mat*_SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
@@ -1606,6 +1607,7 @@ var comp_l8: PackedInt32Array
 var comp_l10: PackedInt32Array
 var snow_id := -1                        # snow_block LRID (the curated LAYER material)
 var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
+var junction_arid: PackedInt32Array     # COSMOS FACETED §3.5.4: (mat*128 + slot*32 + q) -> junction bevel ARID; empty until baked
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
@@ -1661,6 +1663,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
 	var nslope = slope_arid.size()
+	var njunction = junction_arid.size()
 	var nsnowslope = snow_slope_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
@@ -1773,6 +1776,11 @@ func _generate_block(buffer, origin_in_voxels, lod):
 					var vmod = CellCodec.modifier(v)
 					if vmod != 0:
 						v = CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(vmod, col_jinv))
+				# COSMOS FACETED §3.5.4/§5.3: the junction/mask authority at the module worker buffer-write exit
+				# (mirrors WM.cell_value_at). Masks beyond-ridge cells to AIR (id==0 → skipped) and turns
+				# straddling cells into kind-2 partials. Frozen gen_facet (never _active_facet) → worker-safe.
+				if gen_facet >= 0:
+					v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, oy + y, wz), v)
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue
@@ -1875,6 +1883,16 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[gslot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif CellCodec.is_junction(modifier):
+					# COSMOS FACETED §3.5.4: a seam junction partial → its baked bevel ARID (keyed
+					# id·128 + slot·32 + q); unbaked (no manifest yet) → the full-cube lip. The mask already
+					# turned beyond-ridge cells to AIR upstream, so this is never a hole. BEFORE the FAM LAYER
+					# arm (a junction modifier also has bit 15 set).
+					var jslot = id * 128 + CellCodec.junction_slot(modifier) * 32 + CellCodec.junction_q(modifier)
+					if njunction > 0 and jslot < njunction and junction_arid[jslot] >= 0:
+						arid = junction_arid[jslot]
+					else:
+						arid = cube_arid[id] if id < ncube else id
 				elif (modifier & 0x8000) != 0:
 					# FAM LAYER (SNOW-ACCUMULATION 1.5): snow depth level (tenths) resolves through the
 					# dedicated LEVEL table (a FAM modifier is >= 0x8000 and can't slot the 256-stride).
@@ -1927,6 +1945,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("comp_l10", _comp_arid_l10)
 	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
+	gen.set("junction_arid", _junction_arid)             # COSMOS FACETED §3.5.4: junction bevel ARIDs (empty until B3b-full)
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): freeze this epoch's home face + n + flat flag

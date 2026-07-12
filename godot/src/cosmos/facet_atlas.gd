@@ -429,18 +429,26 @@ static func junction_q_of(fid: int, slot: int, x: int, y: int, z: int) -> int:
 ## centre; corner cells (2 ridges) render single-plane (exact collision still uses junction_prism_verts) and
 ## are polished by FP5. Pure: a function of frozen atlas data only → worker-safe.
 static func junction_modify(fid: int, cell: Vector3i, v: int) -> int:
-	var st := cell_seam_state(fid, cell.x, cell.y, cell.z)
-	if st["air"]:
-		return 0
-	var slots: PackedInt32Array = st["straddle"]
-	if slots.is_empty():
-		return v
-	var best_slot := slots[0]
+	# Inlined + allocation-free (this runs on the voxel worker hot path — no Dictionary/Array per cell, so no
+	# COW-refcount race and no GC churn). Reads only frozen atlas data → worker-safe.
+	var fx := float(cell.x); var fy := float(cell.y); var fz := float(cell.z)
+	var best_slot := -1
 	var best_abs := 1.0e18
-	for s in slots:
-		var dc := absf(own_dist(fid, s, float(cell.x) + 0.5, float(cell.y) + 0.5, float(cell.z) + 0.5)) / seam_grad_len(fid, s)
-		if dc < best_abs:
-			best_abs = dc; best_slot = s
+	for slot in range(4):
+		var b := fid * 16 + slot * 4
+		var A := _seam_plane[b]; var B := _seam_plane[b + 1]; var C := _seam_plane[b + 2]
+		var base := A * fx + B * fy + C * fz + _seam_plane[b + 3]
+		var hi := base + maxf(0.0, A) + maxf(0.0, B) + maxf(0.0, C)
+		if hi <= SEAM_EPS:
+			return 0                                 # wholly beyond this ridge → AIR (the domain mask)
+		var lo := base + minf(0.0, A) + minf(0.0, B) + minf(0.0, C)
+		if lo < -SEAM_EPS:                            # straddles this ridge → a junction cell
+			var grad := sqrt(A * A + B * B + C * C)
+			var dc := absf(A * (fx + 0.5) + B * (fy + 0.5) + C * (fz + 0.5) + _seam_plane[b + 3]) / grad
+			if dc < best_abs:
+				best_abs = dc; best_slot = slot
+	if best_slot < 0:
+		return v                                      # interior full cell — unchanged
 	var q := junction_q_of(fid, best_slot, cell.x, cell.y, cell.z)
 	return CellCodec.pack(CellCodec.mat(v), CellCodec.make_junction(best_slot, q), CellCodec.state(v), CellCodec.liquid_field(v))
 

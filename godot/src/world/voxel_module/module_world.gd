@@ -649,6 +649,9 @@ func _build_gen_manifest(library: Object) -> void:
 	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
 	var slope := _build_slope_manifest(library, total)
 	appended += slope
+	# COSMOS FACETED §3.5.4: the seam junction BEVEL models (empty/no-op when not faceted).
+	var junctions := _build_junction_manifest(library, total)
+	appended += junctions
 
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
@@ -661,6 +664,8 @@ func _build_gen_manifest(library: Object) -> void:
 		% [comps, TerrainConfig.emitted_cold_pairs().size()])
 	print("[module_world] baked slope manifest: %d SHARP-SLOPE models (%d emitted (mat,payload) pairs, incl. snow twins)"
 		% [slope, TerrainConfig.emitted_slope_pairs().size()])
+	if CubeSphere.FACETED:
+		print("[module_world] baked junction manifest: %d seam-bevel models (facet %d)" % [junctions, TerrainConfig.active_facet()])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -885,6 +890,73 @@ func _build_slope_manifest(library: Object, total: int) -> int:
 			_next_arid += 1
 			_snow_slope_arid[mat * _SLOPE_STRIDE + payload] = got2
 			appended += 1
+	return appended
+
+## COSMOS FACETED §3.5.4 — bake the junction BEVEL models into `_junction_arid` (keyed mat·128 + slot·32 + q).
+## Enumerates the (material, slot, q) triples that ACTUALLY occur along the active facet's ridges (walking the
+## boundary columns through the pure generator + junction_modify), then bakes each via ShapeMesh's junction clip
+## in the active facet's frame (the ArrayMesh is shared per (slot,q) across materials by _shape_mesh_cache). An
+## unbaked triple cube-falls-back on the worker (the full-cube lip — never a hole). One-time, main thread,
+## bounded by the facet perimeter × depth; capped at 4096 models (never-OOM). Reads active_facet — set by
+## WM._ready / main.gd BEFORE the generator is built.
+func _build_junction_manifest(library: Object, total: int) -> int:
+	_junction_arid = PackedInt32Array()
+	if not CubeSphere.FACETED:
+		return 0
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return 0
+	_junction_arid.resize(total * 128)
+	_junction_arid.fill(-1)
+	var full_cube := CellCodec.pack(BlockCatalog.STONE, 0)   # placeholder v; junction_modify keeps the real mat
+	var keys := {}                                           # mat·128 + slot·32 + q -> mat (the bake list)
+	var lo: Vector2i = FacetAtlas.dom_min(fid)
+	var hi: Vector2i = FacetAtlas.dom_max(fid)
+	var floor_y := TerrainConfig.BEDROCK_FLOOR
+	var z := lo.y
+	while z <= hi.y:
+		var x := lo.x
+		while x <= hi.x:
+			# cheap pre-filter: only columns within a few cells of a ridge can hold junction cells
+			var near := false
+			for slot in range(4):
+				var od := FacetAtlas.own_dist(fid, slot, float(x) + 0.5, 0.0, float(z) + 0.5)
+				if od > -4.0 and od < 4.0:
+					near = true
+					break
+			if near:
+				var g := TerrainConfig.height_at(x, z)
+				var y := g
+				while y >= floor_y:
+					var v := TerrainConfig.generated_cell(x, y, z)
+					if CellCodec.mat(v) > BlockCatalog.AIR:
+						var jm := CellCodec.modifier(FacetAtlas.junction_modify(fid, Vector3i(x, y, z), v))
+						if CellCodec.is_junction(jm):
+							var mat := CellCodec.mat(v)
+							if mat < total:
+								keys[mat * 128 + CellCodec.junction_slot(jm) * 32 + CellCodec.junction_q(jm)] = mat
+					y -= 1
+			x += 1
+		z += 1
+	var appended := 0
+	for key in keys.keys():
+		if appended >= 4096:
+			push_warning("[module_world] junction manifest hit the 4096-model cap — remaining cells lip-fall-back")
+			break
+		var mat: int = keys[key]
+		var slot: int = (int(key) % 128) / 32
+		var q: int = int(key) % 32
+		var model: Object = _make_shape_model(CellCodec.make_junction(slot, q), BlockMaterials.get_for(mat))
+		if model == null:
+			continue
+		var expected := _next_arid
+		var got: int = _add_model(library, model)
+		if got != expected:
+			push_warning("[module_world] junction manifest ARID drift: add_model %d != expected %d" % [got, expected])
+			return appended
+		_next_arid += 1
+		_junction_arid[int(key)] = got
+		appended += 1
 	return appended
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into

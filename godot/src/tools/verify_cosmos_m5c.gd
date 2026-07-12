@@ -25,9 +25,86 @@ func _init() -> void:
 	_c1_phi_map()
 	_c2_involution()
 	_c8_glue()
+	if CubeSphere.M5C_CORNER:
+		_c4_pillar()
+	else:
+		_c9_byte_identity()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+const TC := preload("res://src/world/terrain_config.gd")
+const CS2 := preload("res://src/cosmos/cube_sphere.gd")
+
+# C4 (§11) — the bedrock pillar, requires M5C_CORNER on. Scans the 4 corners of HOME_FACE, verifies the
+# pillar footprint, one flat top, full bedrock cubes / zero modifier / no tree, and cross-face byte-equality.
+func _c4_pillar() -> void:
+	var bedrock := BlockCatalog.id_of(&"bedrock")
+	var f := CubeSphere.HOME_FACE
+	var found_total := 0
+	for corner_v in [Vector2i(0, 0), Vector2i(0, _n - 1), Vector2i(_n - 1, 0), Vector2i(_n - 1, _n - 1)]:
+		var corner: Vector2i = corner_v
+		var si := 1 if corner.x == 0 else -1
+		var sj := 1 if corner.y == 0 else -1
+		var pillars: Array = []          # [i,j] cells that are B_PILLAR
+		var max_r := 0.0
+		for di in range(0, 12):
+			for dj in range(0, 12):
+				var i := corner.x + si * di
+				var j := corner.y + sj * dj
+				if int(TC._curved_profile(f, i, j).y) == TC.B_PILLAR:
+					pillars.append(Vector2i(i, j))
+					max_r = maxf(max_r, sqrt(float(di * di + dj * dj)))
+		_ok(pillars.size() > 0, "C4 pillar exists @face %d corner (%d,%d) — %d cells" % [f, corner.x, corner.y, pillars.size()])
+		_ok(max_r <= 6.0, "C4 pillar footprint radius %.2f <= 6 (≤5.2 + cell)" % max_r)
+		# the corner cell itself must be a pillar (contains radius < 3):
+		_ok(int(TC._curved_profile(f, corner.x, corner.y).y) == TC.B_PILLAR, "C4 corner cell is a pillar")
+		# pick one pillar column and verify the stack + top + modifier + no-tree:
+		if pillars.size() > 0:
+			var pc: Vector2i = pillars[0]
+			var d: CubeSphere.DVec3 = LatticeNav.dir_of(f, pc.x, pc.y, _n)
+			var k := TC._pillar_corner_of(d, _n)
+			var top := TC._pillar_top(k)
+			# bedrock full cubes floor→top, air above:
+			var floor_ok := CellCodec.mat(TC.generated_cell_global(f, pc.x, pc.y, TC.WORLD_BOTTOM_Y + 2)) == bedrock
+			var mid_ok := CellCodec.mat(TC.generated_cell_global(f, pc.x, pc.y, top)) == bedrock
+			var above_air := TC.generated_cell_global(f, pc.x, pc.y, top + 1) == BlockCatalog.AIR
+			var mod0 := CellCodec.modifier(TC.generated_cell_global(f, pc.x, pc.y, top)) == 0
+			_ok(floor_ok and mid_ok, "C4 pillar is bedrock floor→top(%d)" % top)
+			_ok(above_air, "C4 pillar air above top")
+			_ok(mod0, "C4 pillar zero modifier (full cube)")
+			found_total += pillars.size()
+	# (a) cross-face byte-equality: a vertex's 3 incident corner cells are all pillar bedrock, from ANY face.
+	for k in range(8):
+		var cells := CubeSphere.corner_cells(k, _n)
+		var all_bedrock := true
+		for cc in cells:
+			if CellCodec.mat(TC.generated_cell_global(int(cc["face"]), int(cc["i"]), int(cc["j"]), 0)) != bedrock:
+				all_bedrock = false
+		_ok(all_bedrock, "C4 vertex %d: all 3 incident face-corner cells bedrock (cross-face purity)" % k)
+	print("  (C4: %d pillar cells across the 4 home-face corners)" % found_total)
+
+# C9 (§11) — byte-identity with M5C_CORNER OFF: _curved_profile == _curved_profile_base, no B_PILLAR anywhere.
+func _c9_byte_identity() -> void:
+	var f := CubeSphere.HOME_FACE
+	var mism := 0
+	var any_pillar := false
+	for corner_v in [Vector2i(0, 0), Vector2i(_n - 1, _n - 1)]:
+		var corner: Vector2i = corner_v
+		var si := 1 if corner.x == 0 else -1
+		var sj := 1 if corner.y == 0 else -1
+		for di in range(0, 10):
+			for dj in range(0, 10):
+				var i := corner.x + si * di
+				var j := corner.y + sj * dj
+				var p := TC._curved_profile(f, i, j)
+				var b := TC._curved_profile_base(f, i, j)
+				if not p.is_equal_approx(b):
+					mism += 1
+				if int(p.y) == TC.B_PILLAR:
+					any_pillar = true
+	_ok(mism == 0, "C9 flag-off: _curved_profile == base over corner region (%d mismatches)" % mism)
+	_ok(not any_pillar, "C9 flag-off: no B_PILLAR column anywhere")
 
 # The four raw corners with their σ parity — exercise both reflection cases.
 func _corners() -> Array:

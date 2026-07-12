@@ -179,6 +179,8 @@ const B_TAIGA := 6
 const B_FOREST := 7
 const B_PLAINS := 8
 const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
+const B_PILLAR := 10     # COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the unbreakable bedrock corner monument
+                         # — full bedrock cubes floor→flat-top, no strata/ore/tree/snow/slope. M5C_CORNER-gated.
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds), 104
@@ -637,7 +639,51 @@ static func _cached_n() -> int:
 ## steps across an edge reads the real across-seam column and worldgen is seam-continuous (no
 ## cliff/gap at an edge). In-range (i, j) fold to the identity, so this is byte-identical to the
 ## M2 single-face profile there (verify-pinned).
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the curved column profile with the flag-gated PILLAR override.
+## A column whose folded direction d̂ is within THETA_P of a cube vertex becomes an unbreakable bedrock
+## monument — surface = one flat top per vertex (max of the 3 corner-cell BASE heights + 6), biome B_PILLAR
+## (resolve_cell then emits full bedrock cubes floor→top, zero modifiers). The real climate (c, t) is kept so
+## far colour / temperature stay sane. Flag OFF → straight through to _curved_profile_base (byte-identical).
 static func _curved_profile(face: int, i: int, j: int) -> Vector4:
+	if CubeSphere.M5C_CORNER:
+		var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+		var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)   # canonically-folded direction (§2.1)
+		var k := _pillar_corner_of(d, n)
+		if k >= 0:
+			var base := _curved_profile_base(face, i, j)
+			return Vector4(float(_pillar_top(k)), float(B_PILLAR), base.z, base.w)
+	return _curved_profile_base(face, i, j)
+
+## Which cube vertex k (0..7 in CORNER_SIGNS order) this folded direction is a PILLAR of, or −1 (§2.1). The
+## 3-compare prefilter rejects ~everything mid-face with no acos; the exact dot test fires only near a corner.
+static func _pillar_corner_of(d: CubeSphere.DVec3, n: int) -> int:
+	var theta_p := float(CubeSphere.PILLAR_R_CELLS) * (2.0 / sqrt(3.0)) * PI / (2.0 * float(n))
+	var t2 := 2.0 * theta_p
+	if absf(absf(d.x) - CubeSphere.INV_SQRT3) > t2: return -1
+	if absf(absf(d.y) - CubeSphere.INV_SQRT3) > t2: return -1
+	if absf(absf(d.z) - CubeSphere.INV_SQRT3) > t2: return -1
+	# every component is bounded away from 0 here → the sign vector (== corner_dir(k)) is well-defined:
+	var cx := (1.0 if d.x >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	var cy := (1.0 if d.y >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	var cz := (1.0 if d.z >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	if d.x * cx + d.y * cy + d.z * cz < cos(theta_p):
+		return -1
+	# k index in CORNER_SIGNS: (x<0?4)+(y<0?2)+(z<0?1) — see cube_sphere.gd:656.
+	return (4 if d.x < 0.0 else 0) + (2 if d.y < 0.0 else 0) + (1 if d.z < 0.0 else 0)
+
+## The one flat top per vertex k — pure function of (SEED, k, n): max of the 3 incident face-corner cells'
+## BASE (pre-pillar) surface heights + PILLAR_TOP_UP, floored to poke out of a sea corner, clamped to the
+## generator's proven height bound. Reads BASE so it never recurses through the pillar override (§2.2).
+static func _pillar_top(k: int) -> int:
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var hmax := -0x7fffffff
+	for cc in CubeSphere.corner_cells(k, n):
+		hmax = maxi(hmax, int(_curved_profile_base(int(cc["face"]), int(cc["i"]), int(cc["j"])).x))
+	return clampi(hmax + CubeSphere.PILLAR_TOP_UP, SEA_LEVEL + CubeSphere.PILLAR_TOP_UP, MAX_SURFACE_Y)
+
+## The pre-pillar curved column profile (the verbatim COSMOS M1 worldgen). _curved_profile wraps this with
+## the M5c override; every other caller (and the pillar-top read) uses the base directly.
+static func _curved_profile_base(face: int, i: int, j: int) -> Vector4:
 	_ensure_noise()
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
@@ -798,6 +844,13 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		return BlockCatalog.AIR
 	if _bedrock_at(x, y, z):
 		return _ID_BEDROCK
+	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): the bedrock PILLAR column — full bedrock cubes from the
+	# world floor to the one flat top `g`, air above. Bypasses strata, ore, trees, snow, sea fill, and all
+	# smoothing/slope shaping BEFORE any of it runs, so the monument is sheer full cubes and render==collision
+	# is automatic. B_PILLAR is set only under M5C_CORNER (_curved_profile), so this branch is never taken
+	# in FLAT / flag-off builds → byte-identical.
+	if biome == B_PILLAR:
+		return _ID_BEDROCK if y <= g else BlockCatalog.AIR
 	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
 	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
 	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
@@ -1158,9 +1211,18 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 ## NON-ALLOCATING (bool, so the neighbour-fires stencil in _quantized_targets stays cheap on the hot
 ## worker/collider path). fires ⇒ the plane ESCAPES the legacy [g,g+2] window AND is encodable
 ## (spread ≤ SLOPE_MAX_SPREAD); below that the world stays byte-identical on today's smoothing path.
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): true iff this window column folds to a bedrock PILLAR column.
+## Flag-gated so the shipped default-off build short-circuits at zero cost (no column_profile call); when on,
+## column_profile is pcache-memoised. Worker-safe (reads ctx.face via pcache). Used to suppress every
+## directional modifier on the monument so it renders/collides as sheer full cubes.
+static func _is_pillar_column(x: int, z: int, pcache) -> bool:
+	return CubeSphere.M5C_CORNER and int(column_profile(x, z, pcache).y) == B_PILLAR
+
 static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 	if not SMOOTHING_ENABLED or g < SEA_LEVEL:
 		return false                                  # v1: land only; rides the smoothing path
+	if _is_pillar_column(x, z, pcache):
+		return false                                  # M5c pillar: no slopes on the bedrock monument
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return false                                  # a tree rests here → keep the top FULL
 	var raw := _corner_targets(x, z, pcache)
@@ -1297,6 +1359,8 @@ static func slope_run_of(x: int, z: int, pcache = null) -> int:
 static func generated_modifier_at(x: int, y: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0
+	if _is_pillar_column(x, z, pcache):
+		return 0                                       # M5c pillar: zero modifier → render==collision full cubes
 	if pcache == null and _on_main_thread():
 		var e := _shape_entry(x, z)
 		var g := (e & 0xFFFF) - _MEMO_G_BIAS

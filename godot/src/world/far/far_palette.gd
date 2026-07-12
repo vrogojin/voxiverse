@@ -89,6 +89,8 @@ static func biome_base(biome: int, t: float) -> Color:
 			return _forest
 		TerrainConfig.B_MOUNTAINS:
 			return _stone
+		TerrainConfig.B_PILLAR:
+			return Color(0.20, 0.20, 0.23)           # COSMOS M5c: bedrock-grey corner monument in the LOD horizon
 		_:
 			return _grass                            # B_PLAINS (and any unmapped)
 

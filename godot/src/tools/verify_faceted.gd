@@ -39,6 +39,7 @@ func _initialize() -> void:
 	_gate_purity()
 	_gate_spawn_margin()
 	_gate_seam_continuity()
+	_gate_seams(nf)
 	_gate_live_loop()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -80,6 +81,116 @@ func _gate_live_loop() -> void:
 	w.break_terrain(Vector3i(cx + 4, top + 6, cz + 4))                      # break it → structural pass runs
 	_ok(_loose_bodies(w) >= body_count_before, "facet live: collapse pass runs without error on the facet")
 	w.queue_free()
+
+# FP2 Stage A — seam table + junction clip (§2.5, §3.5.1-3). Weld closure (reciprocity + matching ring +
+# opposite m̂ = watertight by construction), G-J1 exact complementarity (own_A(p) = −own_B(p) on the shared
+# plane ⇒ every wedge point claimed by exactly one side, no gap/overlap), and clip sanity (junction cells
+# produce a partial convex prism inside all straddling half-spaces).
+func _gate_seams(nf: int) -> void:
+	# weld closure: every slot's neighbour reciprocates, with a matching welded ring and an opposite m̂
+	var recip_ok := true
+	var ring_worst := 0.0
+	var mhat_worst := -1.0                    # want dot ≈ −1 (opposite); track the LEAST-opposite (largest dot)
+	for fid in range(nf):
+		for slot in range(4):
+			var fidB: int = FA.seam_neighbour(fid, slot)
+			# find B's reciprocal slot pointing back to fid
+			var rs := -1
+			for s2 in range(4):
+				if FA.seam_neighbour(fidB, s2) == fid:
+					rs = s2
+					break
+			if rs < 0:
+				recip_ok = false
+				continue
+			var ra: Array = FA.seam_ring(fid, slot)
+			var rb: Array = FA.seam_ring(fidB, rs)
+			# ring endpoints match up to order (the average is symmetric); take the best pairing
+			var d_same: float = (ra[0] as Vector3).distance_to(rb[0]) + (ra[1] as Vector3).distance_to(rb[1])
+			var d_swap: float = (ra[0] as Vector3).distance_to(rb[1]) + (ra[1] as Vector3).distance_to(rb[0])
+			ring_worst = maxf(ring_worst, minf(d_same, d_swap))
+			var md: float = FA.seam_mhat(fid, slot).dot(FA.seam_mhat(fidB, rs))
+			mhat_worst = maxf(mhat_worst, md)   # track the LEAST-opposite (largest dot)
+	_ok(recip_ok, "seams: every slot's neighbour reciprocates (watertight adjacency)")
+	_ok(ring_worst < 1e-3, "seams: welded ring matches from both sides (worst Δ = %s blocks)" % ring_worst)
+	_ok(mhat_worst < -0.999, "seams: shared ridge normal is exactly opposite from both sides (worst dot = %s)" % mhat_worst)
+
+	# G-J1 exact complementarity: for f64 world points near each sampled ridge, own_A(p) = −own_B(p) — so the
+	# same world plane splits the wedge, and every point is claimed by exactly one facet (no gap, no overlap).
+	var comp_worst := 0.0
+	var exclusive := true
+	var step := maxi(1, nf / 200)
+	for fid in range(0, nf, step):
+		for slot in range(4):
+			var fidB: int = FA.seam_neighbour(fid, slot)
+			var rs := -1
+			for s2 in range(4):
+				if FA.seam_neighbour(fidB, s2) == fid:
+					rs = s2; break
+			if rs < 0:
+				continue
+			var ring: Array = FA.seam_ring(fid, slot)
+			var r0: Vector3 = ring[0]; var r1: Vector3 = ring[1]
+			var mh: Vector3 = FA.seam_mhat(fid, slot)
+			for tstep in range(1, 5):
+				var tt := float(tstep) / 5.0
+				var mid := r0.lerp(r1, tt)
+				for off in [-3.0, -0.5, 0.5, 3.0]:
+					var p := mid + mh * float(off)        # world point off the ridge, on A's side if off>0
+					var la := FA.world_to_lattice64(fid, p.x, p.y, p.z)
+					var lb := FA.world_to_lattice64(fidB, p.x, p.y, p.z)
+					var oa := FA.own_dist(fid, slot, la[0], la[1], la[2])
+					var ob := FA.own_dist(fidB, rs, lb[0], lb[1], lb[2])
+					comp_worst = maxf(comp_worst, absf(oa + ob))      # complementary ⇒ oa ≈ −ob
+					if (oa > 1e-4) == (ob > 1e-4):                     # both own or neither → gap/overlap
+						exclusive = false
+	_ok(comp_worst < 1e-3, "G-J1: own_A(p) = −own_B(p) on the shared plane (worst |sum| = %s)" % comp_worst)
+	_ok(exclusive, "G-J1: every wedge point claimed by exactly one facet (no gap, no double-coverage)")
+
+	# clip sanity: find a straddling junction cell on the spawn facet and check its prism is a proper partial
+	var fid0 := FA.spawn_facet()
+	TC.set_active_facet(fid0)
+	var lo: Vector2i = FA.dom_min(fid0)
+	var hi: Vector2i = FA.dom_max(fid0)
+	var found := false
+	var verts_inside := true
+	var partial := false
+	var masked_seen := false
+	var interior_seen := false
+	var z := lo.y
+	while z <= hi.y and not (found and masked_seen and interior_seen):
+		var x := lo.x
+		while x <= hi.x:
+			var g := TC.height_at(x, z)
+			var st := FA.cell_seam_state(fid0, x, g, z)
+			if st["air"]:
+				masked_seen = true
+			elif (st["straddle"] as PackedInt32Array).is_empty():
+				interior_seen = true
+			elif not found:
+				var vp := FA.junction_prism_verts(fid0, x, g, z)
+				found = vp.size() >= 4
+				partial = vp.size() < 8 or _prism_volume(vp) < 0.999
+				for u in vp:
+					for slot in (st["straddle"] as PackedInt32Array):
+						# check the plane in f64 (own_dist) — seam_plane() is a Vector4 (f32) and loses ~2e-4
+						# at |lattice|~3e4, which would falsely flag exact edge∩plane vertices as outside.
+						if FA.own_dist(fid0, slot, float(x) + u.x, float(g) + u.y, float(z) + u.z) < -1e-4:
+							verts_inside = false
+			x += 1
+		z += 1
+	_ok(found, "clip: a straddling junction cell yields a non-empty prism")
+	_ok(verts_inside, "clip: every prism vertex is inside all straddling half-spaces (own ≥ 0)")
+	_ok(partial, "clip: the junction prism is a proper PARTIAL fill (< full cube)")
+	_ok(masked_seen and interior_seen, "mask: the facet has both masked (air, beyond ridge) and interior cells")
+
+# rough hull volume via the AABB of the point cloud (a cheap "is it smaller than the unit cube" proxy)
+func _prism_volume(pts: PackedVector3Array) -> float:
+	var lo := Vector3(1e9, 1e9, 1e9); var hi := Vector3(-1e9, -1e9, -1e9)
+	for p in pts:
+		lo = lo.min(p); hi = hi.max(p)
+	var d := hi - lo
+	return d.x * d.y * d.z
 
 func _loose_bodies(w: WorldManager) -> int:
 	var n := 0

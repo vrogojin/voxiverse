@@ -41,6 +41,7 @@ func _initialize() -> void:
 	_gate_seam_continuity()
 	_gate_seams(nf)
 	_gate_junction_encode()
+	_gate_junction_mesh()
 	_gate_live_loop()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -236,6 +237,65 @@ func _gate_junction_encode() -> void:
 	_ok(jcount > 0 and air_count > 0 and interior_count > 0, "junction: all three classes present (air=%d interior=%d junction=%d)" % [air_count, interior_count, jcount])
 	_ok(outward_ok, "junction: cut offset q rounds OUTWARD (model plane ≥ exact, no inward crack)")
 	_ok(overlap_worst <= 1.0 / 16.0 + 1e-6, "junction: outward overlap ≤ 1/16 block (worst %s)" % overlap_worst)
+
+# FP2 Stage B2 — the junction mesh builder (§3.5.4). G-J2: ShapeMesh._build_junction's clipped vertices match
+# the shared clip enumerator (junction_model_verts) to ≤1e-4 — render geometry == the atlas clip by shared
+# construction — and every junction mesh is a proper partial (has an interior cut vertex, not a full cube).
+func _gate_junction_mesh() -> void:
+	var fid := FA.spawn_facet()
+	TC.set_active_facet(fid)
+	var full := CellCodec.pack(BlockCatalog.STONE, 0)
+	var seen := {}
+	var lo: Vector2i = FA.dom_min(fid)
+	var hi: Vector2i = FA.dom_max(fid)
+	var z := lo.y
+	while z <= hi.y and seen.size() < 24:
+		var x := lo.x
+		while x <= hi.x and seen.size() < 24:
+			var g := TC.height_at(x, z)
+			for y in [g - 1, g, g - 3]:
+				var st := FA.cell_seam_state(fid, x, y, z)
+				if st["air"] or (st["straddle"] as PackedInt32Array).is_empty():
+					continue
+				var mod := CellCodec.modifier(FA.junction_modify(fid, Vector3i(x, y, z), full))
+				if CellCodec.is_junction(mod):
+					seen[mod] = true
+			x += 1
+		z += 1
+	var match_ok := true; var complete_ok := true; var bounds_ok := true
+	var worst := 0.0; var n := 0; var n_partial := 0
+	for mod in seen.keys():
+		var slot := CellCodec.junction_slot(mod); var q := CellCodec.junction_q(mod)
+		var mesh := ShapeMesh.build(mod)
+		var mv: PackedVector3Array = mesh["verts"]
+		var model := FA.junction_model_verts(fid, slot, q)
+		if mv.is_empty() or model.is_empty():
+			continue
+		n += 1
+		for v in mv:
+			var best := 1e9
+			for u in model:
+				best = minf(best, v.distance_to(u))
+			worst = maxf(worst, best)
+			if best > 1e-4:
+				match_ok = false
+			if v.x < -1e-4 or v.x > 1.0 + 1e-4 or v.y < -1e-4 or v.y > 1.0 + 1e-4 or v.z < -1e-4 or v.z > 1.0 + 1e-4:
+				bounds_ok = false
+		for u in model:
+			var best2 := 1e9
+			for v in mv:
+				best2 = minf(best2, u.distance_to(v))
+			if best2 > 1e-4:
+				complete_ok = false
+		for v in mv:
+			if (v.x > 1e-4 and v.x < 1.0 - 1e-4) or (v.y > 1e-4 and v.y < 1.0 - 1e-4) or (v.z > 1e-4 and v.z < 1.0 - 1e-4):
+				n_partial += 1
+				break
+	_ok(n > 0, "junction mesh: built %d distinct junction models" % n)
+	_ok(match_ok, "G-J2: every mesh vertex matches the shared clip enumerator (worst %s ≤ 1e-4)" % worst)
+	_ok(complete_ok, "G-J2: the mesh covers every clip vertex (no missing geometry)")
+	_ok(bounds_ok, "G-J2: no mesh vertex escapes the unit cube")
+	_ok(n_partial > 0, "G-J2: some junction meshes are proper partials (%d/%d; full-cube models are legit outward rounding)" % [n_partial, n])
 
 # rough hull volume via the AABB of the point cloud (a cheap "is it smaller than the unit cube" proxy)
 func _prism_volume(pts: PackedVector3Array) -> float:

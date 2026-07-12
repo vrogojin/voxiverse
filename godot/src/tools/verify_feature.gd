@@ -5088,8 +5088,8 @@ func _test_sharp_slope() -> void:
 	# uniqueness / idempotence: a kept slope canonicalizes to itself.
 	var pk := CellCodec.pack(STONE, kept)
 	_ok(CellCodec.canonical(pk) == pk, "slope-canon: canonical(pack(stone, slope)) == itself (idempotent)")
-	# junk FAM kind (kind 2) strips to full cube + warns.
-	var junk := FAM | (2 << CellCodec.MOD_FAM_KIND_SHIFT) | 0x1FF
+	# junk FAM kind (kind 3 — still reserved; kind 2 is now FAM_JUNCTION) strips to full cube + warns.
+	var junk := FAM | (3 << CellCodec.MOD_FAM_KIND_SHIFT) | 0x1FF
 	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, junk))) == 0,
 		"slope-canon: unknown FAM kind strips to full cube (0)")
 	# non-solid gate: a slope on water strips to full cube (no ramp of water).

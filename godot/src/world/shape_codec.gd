@@ -162,6 +162,8 @@ static func rotate_modifier(modifier: int, d4: int) -> int:
 		return modifier                            # identity turn, or the isotropic full cube
 	if CellCodec.is_layer(modifier):
 		return modifier                            # uniform LAYER — rotation-invariant
+	if CellCodec.is_junction(modifier):
+		return modifier                            # COSMOS FACETED: facet-frame-local, no D4 in faceted mode
 	if CellCodec.is_slope(modifier):
 		var d := _rot_corners(CellCodec.slope_deltas(modifier), q)
 		return CellCodec.make_slope(d.x, d.y, d.z, d.w)   # canonical (rot of a canonical slope is canonical)
@@ -178,6 +180,8 @@ static func volume(m: int) -> float:
 		return 1.0
 	if CellCodec.is_layer(m):
 		return _layer_h(m)                       # a uniform layer of height h fills fraction h
+	if CellCodec.is_junction(m):
+		return 0.5                               # COSMOS FACETED: partial fill (generation-only; mass unused)
 	if CellCodec.is_slope(m):
 		return _slope_volume(CellCodec.slope_deltas(m))
 	var c := corners(m)
@@ -252,6 +256,8 @@ static func height_at(m: int, fx: float, fz: float) -> float:
 		return 1.0
 	if CellCodec.is_layer(m):
 		return _layer_h(m)                       # flat top at h everywhere (span/occupied/local_top follow)
+	if CellCodec.is_junction(m):
+		return _junction_span(m, fx, fz).y       # COSMOS FACETED: use the seam-clip top (callers should use span)
 	if CellCodec.is_slope(m):
 		return clampf(_plane_at(CellCodec.slope_deltas(m), fx, fz), 0.0, 1.0)
 	return _height_half(corners(m), fx, fz) * 0.5
@@ -330,6 +336,8 @@ static func _int_pos_tri(a: float, b: float, c: float) -> float:
 static func local_top(m: int, fx: float, fz: float) -> float:
 	if m == 0:
 		return 1.0
+	if CellCodec.is_junction(m):
+		return _junction_span(m, fx, fz).y
 	var h := height_at(m, fx, fz)
 	if anchor(m) == ANCHOR_TOP:
 		return 1.0 if h > 0.0 else 0.0
@@ -341,12 +349,36 @@ static func local_top(m: int, fx: float, fz: float) -> float:
 static func span(m: int, fx: float, fz: float) -> Vector2:
 	if m == 0:
 		return Vector2(0.0, 1.0)
+	if CellCodec.is_junction(m):
+		return _junction_span(m, fx, fz)
 	var h := height_at(m, fx, fz)
 	if h <= 0.0:
 		return Vector2.ZERO
 	if anchor(m) == ANCHOR_TOP:
 		return Vector2(1.0 - h, 1.0)
 	return Vector2(0.0, h)
+
+## COSMOS FACETED §3.5.6 — the vertical solid interval of a JUNCTION cell at footprint (fx, fz): the cube
+## column intersected with the seam half-space own_local(fx,fy,fz) = A·fx + B·fy + C·fz + base ≥ 0, using the
+## active facet's q-model plane (matching the baked render mesh; exact per-cell physics is done in
+## WorldManager._occ_span). own_local = B·fy + k, so the cut is at fy = −k/B (or a full/empty column if B≈0).
+static func _junction_span(m: int, fx: float, fz: float) -> Vector2:
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return Vector2(0.0, 1.0)
+	var pl: Array = FacetAtlas.junction_model_plane(fid, CellCodec.junction_slot(m), CellCodec.junction_q(m))
+	var A: float = pl[0]; var B: float = pl[1]; var C: float = pl[2]; var base: float = pl[3]
+	var k := A * fx + C * fz + base
+	if absf(B) < 1e-9:
+		return Vector2(0.0, 1.0) if k >= 0.0 else Vector2.ZERO   # vertical cut: full or empty column
+	var thr := -k / B
+	if B > 0.0:                                                  # solid where fy ≥ thr
+		if thr >= 1.0:
+			return Vector2.ZERO
+		return Vector2(maxf(0.0, thr), 1.0)
+	if thr <= 0.0:                                               # B < 0: solid where fy ≤ thr
+		return Vector2.ZERO
+	return Vector2(0.0, minf(1.0, thr))
 
 ## True if the sub-cell point (fx, fy, fz) lies inside the shape's solid volume
 ## (point-in-interval, biased to "hit" on the filled boundary by _EPS per §11's DDA
@@ -387,6 +419,8 @@ static func side_profile(m: int, face: int) -> Vector3i:
 static func side_profile_full(m: int, face: int) -> bool:
 	if m == 0:
 		return true
+	if CellCodec.is_junction(m):
+		return false                             # COSMOS FACETED: never occlude a neighbour (the cut faces air)
 	if CellCodec.is_layer(m):
 		return face == FACE_NY                   # a 0<h<1 uniform bottom layer covers ONLY the floor face
 	if CellCodec.is_slope(m):

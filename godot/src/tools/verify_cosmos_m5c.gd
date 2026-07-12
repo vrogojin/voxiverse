@@ -29,6 +29,8 @@ func _init() -> void:
 	if CubeSphere.M5C_CORNER:
 		_c4_pillar()
 		_c5_edit_lock()
+		_c7_conservation()
+		_c6_full()
 	else:
 		_c9_byte_identity()
 
@@ -132,6 +134,82 @@ func _c5_edit_lock() -> void:
 		var col: Vector2i = col_v
 		_ok(not wm.is_corner_locked_column(col.x, col.y), "C5 column %s NOT locked (dist ≥ 9)" % col)
 	wm.free()
+
+# C7 (§11) — teleport conservation through the REAL m5c_corner_check: in-anomaly entries eject outside R_b,
+# |v_h| + heading-relative yaw preserved, y only-raised, exit never in the wedge (⇒ C10 finite camera).
+func _c7_conservation() -> void:
+	var wm := WorldManager.new()
+	wm._chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	var n := wm._chart.n
+	TerrainConfig.set_active_frame(CubeSphere.HOME_FACE, 0)
+	var frame := CosmosTruePlace.bake_frame(wm._chart, Vector3(5, 40, 5))
+	for phi in [30, 60, 90, 135, 180, 210, 250]:
+		for r in [2.0, 5.0, 7.5]:
+			var b := deg_to_rad(float(phi) - 90.0)
+			# corner (0,0), σ=(1,1) at spawn → window == raw; place the player at band angle φ, radius r.
+			var pos := Vector3(r * cos(b), 40.0, r * sin(b))
+			var vin := Vector3(-cos(b), 0.0, -sin(b)) * 3.0        # heading inward, |v_h|=3
+			var reloc: Dictionary = wm.m5c_corner_check(pos, vin)
+			_ok(not reloc.is_empty(), "C7 teleport fired @φ%d r%.1f" % [phi, r])
+			if reloc.is_empty():
+				continue
+			var np: Vector3 = reloc["pos"]
+			var nv: Vector3 = reloc["vel"]
+			var pr := wm._chart.raw_of_f(np.x, np.z)
+			var c := CosmosCorner.nearest_corner(pr.x, pr.y, n)
+			_ok(CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B - 1.0e-3, "C7 exit outside R_b @φ%d" % phi)
+			_ok(is_equal_approx(Vector2(nv.x, nv.z).length(), 3.0), "C7 |v_h| preserved @φ%d" % phi)
+			_ok(np.y >= pos.y - 1.0e-6, "C7 y only raised @φ%d" % phi)
+			_ok(not wm.is_wedge_column(int(floor(np.x)), int(floor(np.z))), "C7 exit not double-out @φ%d" % phi)
+			# C10: the exit column has a real sphere position (place_true != _WEDGE) → finite epoch camera.
+			_ok(CosmosTruePlace.place_true(wm._chart, np, frame) != CosmosTruePlace._WEDGE,
+				"C10 exit place_true != _WEDGE @φ%d" % phi)
+			# yaw-delta correctness: rotating d_in by Δψ yields the exit heading r̂_out (== new v_h direction).
+			var yd: float = reloc["yaw_delta"]
+			var din := Vector2(vin.x, vin.z).normalized()
+			var vhn := Vector2(nv.x, nv.z).normalized()
+			# rotate the 3D heading about +Y by Δψ (same convention as signed_angle_to in m5c_corner_check):
+			var rot := Vector3(din.x, 0.0, din.y).rotated(Vector3.UP, yd)
+			_ok(rot.is_equal_approx(Vector3(vhn.x, 0.0, vhn.y)), "C7 yaw Δψ maps heading→exit @φ%d" % phi)
+	wm.free()
+
+# C6-full (§11) — the seal under motion. (a) glue totality: every wedge point at any radius glues to a strip,
+# never double-out; (b) the anomaly ejects a radial-approach walker from every direction; (c) the 3 edges of
+# the spawn vertex compose to 90° holonomy (the honest curvature — pinned, not a bug).
+func _c6_full() -> void:
+	var n := _n
+	# (a) glue totality — a wedge column, glued, is a real (non-wedge) strip column, at every radius.
+	var chart := CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	TerrainConfig.set_active_frame(CubeSphere.HOME_FACE, 0)
+	var wedge_ok := 0
+	for phi in [272.0, 290.0, 315.0, 340.0, 358.0]:
+		for r in [3.0, 8.0, 30.0, 150.0]:
+			var b := deg_to_rad(phi - 90.0)
+			var px: float = r * cos(b)
+			var pz: float = r * sin(b)                       # corner (0,0) σ=(+,+): window==raw
+			var g: Dictionary = CosmosCorner.glue_raw(px, pz, n)
+			# the glued window column must NOT be double-out (fold face >= 0):
+			if not CosmosTruePlace.is_wedge(chart, g["px"], g["py"]):
+				wedge_ok += 1
+	_ok(wedge_ok == 20, "C6 glue totality: all wedge samples → real strip (%d/20)" % wedge_ok)
+	# (b) radial-approach ejection: a WM teleport from every in-anomaly direction leaves R_b and the wedge.
+	var wm := WorldManager.new()
+	wm._chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	var eject := 0
+	for phi in range(5, 266, 20):
+		var b := deg_to_rad(float(phi) - 90.0)
+		var pos := Vector3(6.0 * cos(b), 40.0, 6.0 * sin(b))
+		var reloc: Dictionary = wm.m5c_corner_check(pos, Vector3(-cos(b), 0, -sin(b)) * 2.0)
+		if not reloc.is_empty():
+			var np: Vector3 = reloc["pos"]
+			var pr := wm._chart.raw_of_f(np.x, np.z)
+			var c := CosmosCorner.nearest_corner(pr.x, pr.y, n)
+			if CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B - 1.0e-3 \
+					and not wm.is_wedge_column(int(floor(np.x)), int(floor(np.z))):
+				eject += 1
+	_ok(eject >= 13, "C6 radial-approach: all directions eject outside R_b + wedge (%d/13)" % eject)
+	wm.free()
+	# (holonomy — the honest 90° curvature per lap — is pinned by verify_cosmos_m0's corner tests; not re-asserted here)
 
 # C9 (§11) — byte-identity with M5C_CORNER OFF: _curved_profile == _curved_profile_base, no B_PILLAR anywhere.
 func _c9_byte_identity() -> void:

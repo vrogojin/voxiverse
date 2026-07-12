@@ -208,6 +208,16 @@ func _physics_process(delta: float) -> void:
 	# NOT rotate across a flip — the window axes are continuous — so there is nothing to counter-rotate
 	# (Fix A #71 reverted: its D4 extraction now lives in chart.flip's M_win accumulation).
 	world.maybe_flip_home_face(global_position)
+	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
+	# cylinder about a cube vertex (or, defensively, a double-out column), relocate/eject them via the bisector
+	# teleport / seam glue — position, velocity and heading-relative yaw. Flag- and chart-gated no-op otherwise;
+	# runs in window space (the M5_REAL displayed camera follows next frame).
+	if not CubeSphere.FLAT_WORLD and CubeSphere.M5C_CORNER:
+		var reloc := world.m5c_corner_check(global_position, velocity)
+		if not reloc.is_empty():
+			global_position = reloc["pos"]
+			velocity = reloc["vel"]
+			rotation.y += float(reloc["yaw_delta"])
 	_push_bodies(delta)
 	_update_aim()
 

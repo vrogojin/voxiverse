@@ -227,6 +227,8 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	if CubeSphere.M5C_CORNER:
+		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
 	if _far != null:
 		_far.update_center(player_pos)
 	# COSMOS M4 (§5.1/§5.4): while a flip's near field restreams, poll the module's view-distance ramp;
@@ -980,6 +982,109 @@ func is_home_native_column(x: int, z: int) -> bool:
 		return false
 	var p := _chart.raw_of(x, z)
 	return p.x >= 0 and p.x < _chart.n and p.y >= 0 and p.y < _chart.n
+
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5) — THE runtime corner seal, called each physics frame after the
+## flip. Given the player's window position + velocity, returns a relocation Dictionary the player applies, or
+## {} for "no action". Three cases (all in the continuous RAW frame; window↔raw via the chart):
+##   1. DOUBLE-OUT column (wedge — §7 makes this near-unreachable): apply the §6 seam GLUE to the real strip.
+##   2. inside the R_b anomaly cylinder: the §5.2 bisector TELEPORT (or nothing in barrier mode — S5 blocks entry).
+##   3. else: {}.
+## Flag/chart-gated → FLAT / flag-off is a pure no-op. Physics stays window-space; under M5_REAL the displayed
+## camera follows next frame (set_render_camera), and the exit is never in the wedge so m5_epoch_camera is finite.
+func m5c_corner_check(pos: Vector3, vel: Vector3) -> Dictionary:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return {}
+	var n := _chart.n
+	var fx0 := int(floor(pos.x))
+	var fz0 := int(floor(pos.z))
+	# case 1 — defensive seam glue for a double-out (wedge) column: total at any radius, radius/height preserving.
+	if is_wedge_column(fx0, fz0):
+		var pf := _chart.raw_of_f(pos.x, pos.z)
+		var g := CosmosCorner.glue_raw(pf.x, pf.y, n)
+		var wg := _chart.window_of_f(g["px"], g["py"])
+		return _glue_reloc(pf, Vector2(g["px"], g["py"]), wg, pos, vel, n)
+	# case 2 — anomaly teleport (or barrier mode: no teleport; S5 stops entry so this stays outside R_b).
+	var pr := _chart.raw_of_f(pos.x, pos.z)
+	var c := CosmosCorner.nearest_corner(pr.x, pr.y, n)
+	if CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B or not CubeSphere.M5C_TELEPORT:
+		return {}
+	var t := CosmosCorner.teleport_raw(pr.x, pr.y, n)
+	var w_out := _chart.window_of_f(t["px"], t["py"])
+	var beta: float = t["beta"]
+	var si: float = t["si"]
+	var sj: float = t["sj"]
+	var w_out2 := _chart.window_of_f(t["px"] + si * cos(beta), t["py"] + sj * sin(beta))
+	var r_out := (w_out2 - w_out)
+	r_out = r_out.normalized() if r_out.length() > 1.0e-9 else Vector2(1, 0)
+	# heading in: the horizontal velocity, or (stationary) inward toward the vertex.
+	var v_h := Vector2(vel.x, vel.z)
+	var d_in: Vector2
+	if v_h.length() > 0.01:
+		d_in = v_h.normalized()
+	else:
+		var w_v2 := _chart.window_of_f(c.x, c.y)
+		var inward := w_v2 - Vector2(pos.x, pos.z)
+		d_in = inward.normalized() if inward.length() > 1.0e-6 else r_out
+	var yaw_delta := Vector3(d_in.x, 0.0, d_in.y).signed_angle_to(Vector3(r_out.x, 0.0, r_out.y), Vector3.UP)
+	# de-embed: never below the exit column's surface; keep vertical velocity; re-aim horizontal speed outward.
+	var y_out := maxf(pos.y, float(effective_height(int(floor(w_out.x)), int(floor(w_out.y))) + 1) + 0.01)
+	var speed := v_h.length()
+	return {
+		"pos": Vector3(w_out.x, y_out, w_out.y),
+		"vel": Vector3(r_out.x * speed, vel.y, r_out.y * speed),
+		"yaw_delta": yaw_delta,
+	}
+
+## COSMOS M5c (§6): the UNIVERSAL seam glue for non-flipping entities. Each physics frame, any AWAKE VoxelBody
+## whose column is double-out (wedge — a fast projectile/debris can cross a seam ray far outside R_b) is mapped
+## back through the ±90° B–C seam identification: position + linear velocity, radius/height/speed preserving.
+## The wedge is thus unreachable by anything, at any radius. Zero cost when nothing is awake / flag off.
+func m5c_glue_bodies() -> void:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return
+	var n := _chart.n
+	for ch in get_children():
+		if not (ch is VoxelBody):
+			continue
+		var vb := ch as VoxelBody
+		if not vb.is_awake():
+			continue
+		var gp := vb.global_position
+		if not is_wedge_column(int(floor(gp.x)), int(floor(gp.z))):
+			continue
+		var pf := _chart.raw_of_f(gp.x, gp.z)
+		var g := CosmosCorner.glue_raw(pf.x, pf.y, n)
+		var wg := _chart.window_of_f(g["px"], g["py"])
+		var c := CosmosCorner.nearest_corner(pf.x, pf.y, n)
+		var w_v := _chart.window_of_f(c.x, c.y)
+		var r_old := Vector2(gp.x, gp.z) - w_v
+		var r_new := wg - w_v
+		var lv := vb.linear_velocity
+		if r_old.length() > 1.0e-6 and r_new.length() > 1.0e-6:
+			var ang := Vector3(r_old.normalized().x, 0.0, r_old.normalized().y) \
+				.signed_angle_to(Vector3(r_new.normalized().x, 0.0, r_new.normalized().y), Vector3.UP)
+			var vh := Vector2(lv.x, lv.z).rotated(ang)
+			lv = Vector3(vh.x, lv.y, vh.y)
+		vb.global_position = Vector3(wg.x, gp.y, wg.y)
+		vb.linear_velocity = lv
+
+## §6 glue relocation for the (rare) double-out player: move to the glued strip window position, rotate the
+## horizontal velocity + yaw by the old→new window-radial angle. Height/vertical velocity preserved. The next
+## frame's m5c_corner_check handles the anomaly if the glued position is still inside R_b.
+func _glue_reloc(pf: Vector2, pnew: Vector2, wnew: Vector2, pos: Vector3, vel: Vector3, n: int) -> Dictionary:
+	var c := CosmosCorner.nearest_corner(pf.x, pf.y, n)
+	var w_v := _chart.window_of_f(c.x, c.y)
+	var r_old := (Vector2(pos.x, pos.z) - w_v)
+	var r_new := (wnew - w_v)
+	var yaw_delta := 0.0
+	var vel_out := vel
+	if r_old.length() > 1.0e-6 and r_new.length() > 1.0e-6:
+		var ro := r_old.normalized()
+		var rn := r_new.normalized()
+		yaw_delta = Vector3(ro.x, 0.0, ro.y).signed_angle_to(Vector3(rn.x, 0.0, rn.y), Vector3.UP)
+		var v_h := Vector2(vel.x, vel.z).rotated(yaw_delta)
+		vel_out = Vector3(v_h.x, vel.y, v_h.y)
+	return {"pos": Vector3(wnew.x, pos.y, wnew.y), "vel": vel_out, "yaw_delta": yaw_delta}
 
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).

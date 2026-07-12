@@ -589,6 +589,8 @@ func overlay_at(cell: Vector3i) -> int:
 ## a local support analysis so undercut terrain drops as loose rigid bodies, then
 ## refreshes ground collision.
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
+	if is_corner_locked_column(cell.x, cell.z):
+		return 0                                       # M5c: the corner monument + its lock disc are unbreakable
 	if _edits.get(_edit_key(cell), -1) == 0 or not cell_solid(cell):
 		return 0
 	# Snow first (SNOW-ACCUMULATION §2.5): a snow-FILLED ramp yields its snow BEFORE the terrain
@@ -624,6 +626,8 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 ## apply, e.g. a corner-3 clamp), updates _placed_top, mirrors into the active render
 ## path and rebuilds the ground collider. Player-overlap is the CALLER's check.
 func place_block(cell: Vector3i, value: int) -> bool:
+	if is_corner_locked_column(cell.x, cell.z):
+		return false                                   # M5c: no placing inside the corner lock disc
 	var block_id := CellCodec.mat(value)
 	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.count():
 		return false
@@ -673,6 +677,9 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 		if int(CubeSphere.fold_cell(_chart.face, _cp.x, _cp.y,
 				CubeSphere.n_for(CubeSphere.HOME_BODY))["face"]) < 0:
 			return
+	# COSMOS M5c (§3): the corner-lock disc covers collapse / snowfall / sim writes at the choke point too.
+	if is_corner_locked_column(cell.x, cell.z):
+		return
 	packed = CellCodec.canonical(packed)
 	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
 	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider
@@ -951,6 +958,17 @@ func is_wedge_column(x: int, z: int) -> bool:
 	if _chart == null:
 		return false
 	return CosmosTruePlace.is_wedge(_chart, float(x), float(z))
+
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §3): true iff window column (x,z) is within CORNER_LOCK_R=8 raw
+## cells of a cube vertex — ALL heights refused (bedrock monument + its ground annulus). Cell-CENTRE raw
+## distance across the fold (each strip is a rigid isometry, so Euclidean raw distance is the chart metric).
+## Flag- and chart-gated → FLAT / flag-off short-circuit before any raw math (byte-identical).
+func is_corner_locked_column(x: int, z: int) -> bool:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return false
+	var p := _chart.raw_of_f(float(x) + 0.5, float(z) + 0.5)
+	var c := CosmosCorner.nearest_corner(p.x, p.y, _chart.n)
+	return CosmosCorner.corner_dist(p.x, p.y, c) <= float(CubeSphere.CORNER_LOCK_R)
 
 ## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
 ## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).

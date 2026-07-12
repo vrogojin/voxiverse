@@ -27,6 +27,7 @@ func _init() -> void:
 	_c8_glue()
 	if CubeSphere.M5C_CORNER:
 		_c4_pillar()
+		_c5_edit_lock()
 	else:
 		_c9_byte_identity()
 
@@ -83,6 +84,24 @@ func _c4_pillar() -> void:
 				all_bedrock = false
 		_ok(all_bedrock, "C4 vertex %d: all 3 incident face-corner cells bedrock (cross-face purity)" % k)
 	print("  (C4: %d pillar cells across the 4 home-face corners)" % found_total)
+
+# C5 (§11) — the CORNER_LOCK_R edit refusal, requires M5C_CORNER on. A bare WorldManager with an injected
+# chart (M_win=I at spawn → window == raw): locked columns (raw dist ≤ 8) refuse break/place; distance 9 is
+# allowed. break/place early-return on the lock before any generation, so no full world setup is needed.
+func _c5_edit_lock() -> void:
+	var wm := WorldManager.new()
+	wm._chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
+	var stone := BlockCatalog.id_of(&"stone")
+	for col_v in [Vector2i(0, 0), Vector2i(7, 0), Vector2i(0, 7), Vector2i(5, 5)]:
+		var col: Vector2i = col_v
+		_ok(wm.is_corner_locked_column(col.x, col.y), "C5 column %s is locked (dist ≤ 8)" % col)
+		_ok(wm.break_terrain(Vector3i(col.x, 20, col.y)) == 0, "C5 break refused @%s (all heights)" % col)
+		_ok(wm.break_terrain(Vector3i(col.x, -30, col.y)) == 0, "C5 break refused deep @%s" % col)
+		_ok(not wm.place_block(Vector3i(col.x, 20, col.y), stone), "C5 place refused @%s" % col)
+	for col_v in [Vector2i(9, 0), Vector2i(0, 9), Vector2i(20, 20)]:
+		var col: Vector2i = col_v
+		_ok(not wm.is_corner_locked_column(col.x, col.y), "C5 column %s NOT locked (dist ≥ 9)" % col)
+	wm.free()
 
 # C9 (§11) — byte-identity with M5C_CORNER OFF: _curved_profile == _curved_profile_base, no B_PILLAR anywhere.
 func _c9_byte_identity() -> void:

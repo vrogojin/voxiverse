@@ -11,9 +11,13 @@ study says *what*, this says *how, precisely*.
 Render model context: `docs/COSMOS-REAL-GEOMETRY-STUDY.md` (R2: static rigid
 geometry + camera; reused here **rooted at the facet**, §5.2 below).
 
+Revision 2 (same date): the **seam junction-block model** (§3.5) is locked by
+user directive — matching triangular partial-fill cubes at the seams, replacing
+revision 1's generic "strip prism mesh"; FP2/FP4 updated accordingly.
+
 ---
 
-## 0. The two load-bearing invariants
+## 0. The three load-bearing invariants
 
 **I1 — FLAT_WORLD byte-identity.** Every faceted hook is behind the new
 `CubeSphere.FACETED` toggle (default `false`). With it off, no new branch is ever
@@ -24,8 +28,9 @@ M5, M5c) stays dormant because every one of its hooks keys on
 systems: FACETED never creates a `CosmosChart`, so `WorldManager._chart == null`
 and every `col_*` wrapper takes its flat branch.
 
-**I2 — a facet IS the flat world.** The single substitution faceted mode makes is
-the **profile source**: `TerrainConfig.column_profile(x, z, pcache)`
+**I2 — a facet IS the flat world.** The single substitution faceted mode makes
+*inside* the generation pipeline is the **profile source**:
+`TerrainConfig.column_profile(x, z, pcache)`
 (`terrain_config.gd:492`) is the one choke point through which the module worker,
 the analytic physics (`height_at` → `analytic_column_profile`), the GroundCollider
 light-queries (`surface_modifier`/`slope_run_of`/`snow_stack_at` — all profile
@@ -44,6 +49,18 @@ Consequences worth stating because they delete work: `WorldManager.cell_value_at
 `generated_cell` itself is untouched. The fallback mesher, GroundCollider,
 PerVoxelEnvironment, SnowfallSystem, StructuralSolver: untouched. The module
 worker needs ~5 lines (a frozen `gen_facet`, §4.4).
+
+**I3 — voxels are never distorted; curvature is absorbed at the seam by matching
+partial-fill cubes** (user directive, the seam model of record — §3.5). Every
+voxel is a perfect unit cube in its own facet's local frame, always. At a seam,
+the two facets' boundary voxel meshes meet in real 3D space and each side's
+boundary voxels are **clipped by the shared seam plane into complementary
+triangular-prism partial fills** — the two families of partials compose into
+smooth junction blocks that tile the seam wedge with no gap and no
+double-coverage, rendered and collided by the *same* sub-voxel shape machinery
+that already does terrain smoothing (`CellCodec` FAM modifiers → `shape_mesh`
+models → `ShapeCodec` spans → GroundCollider prisms). No cell is ever sheared,
+scaled, or bent — the seam is geometry composition, not distortion.
 
 ---
 
@@ -206,7 +223,33 @@ own_A(p) := m̂ · (p − r0) ≥ 0               # one plane test; B is the str
 
 Per-seam atlas record: `(fid_A, fid_B, r0, r1, m̂, Δ_AB)` where
 `Δ_AB = T_B⁻¹ · T_A` (composed in f64, stored as Transform3D) — the FP3 crossing
-transform. Dihedral θ = acos(n̂_A·n̂_B).
+transform. Dihedral turn θ = acos(n̂_A·n̂_B).
+
+Three properties of this plane that the junction model (§3.5) relies on — state
+them because each hides a wrong implementation:
+
+1. **P is the dihedral *bisector* plane through the welded ring** (it contains t̂
+   and ĥ). In facet A's local frame it therefore leans exactly **θ/2 from
+   A-vertical** about the ridge direction, and symmetrically θ/2 in B's frame.
+   This is what makes the two sides' partial fills mirror-graded: at the
+   degenerate k=1 (cube, θ=90°) the cut is 45° in both frames — the user's
+   right-isosceles prism.
+2. **P is anchored at the ring, NOT at the raw plane–plane intersection.** The
+   two facet *planes* also intersect in a line, but the seam datum step δ
+   displaces that line laterally by ≈ δ / (2·sin(θ/2)) — ~29 blocks at earth
+   k=16 median steps, >100 near old corners — deep inside one facet. Never use
+   the plane intersection as the hinge; the hinge is the ring, and the datum
+   residue is graded by FP4's strip ramp (§7.1), not by the clip.
+3. **In-frame parameters** (per facet side of each seam, precomputed f64 in the
+   atlas): the plane expressed in A's local lattice frame as `(m̂_A, d_A)` with
+   `m̂_A = Basis_A⁻¹·m̂`, plus the derived scalars the shape system needs:
+   `α_A` = the ridge line's direction angle in the (x,z) lattice plane,
+   `φ_A = θ/2` = the cut face's tilt from local vertical, and the per-column
+   signed in-plane distance function `seam_dist_A(x, z)` (an affine expression —
+   two multiplies). Because the ring's datum varies along the seam, the ridge
+   line is additionally *sloped* in A's frame by a small angle (≤ step/len);
+   `(m̂_A, d_A)` carries this exactly — α and φ are the dominant terms, not the
+   whole truth.
 
 ### 2.6 Storage, warm-up, purity
 
@@ -323,6 +366,195 @@ trees, snow, slopes, smoothing: untouched (I2).
 
 ---
 
+## 3.5 The seam junction-block model — matching partial-fill cubes (LOCKED, user directive)
+
+This is THE seam model (rendered in FP2, walkable in FP4). It supersedes
+revision 1's generic strip prism, and it supersedes the FP0 radial-relief
+seam-glue (commit `8e0de71`) — that was the crude heightmap version of exactly
+this idea. The user's directive, made precise:
+
+> Do NOT distort the voxels. On the borders, let the voxel meshes of
+> neighbouring facets intersect in real 3D space, and fill the intersecting
+> boundary voxels with partially-filling triangular shapes that MATCH each
+> other, creating smooth JUNCTION BLOCKS composed of the two matching partials —
+> same principle as the existing terrain smoothing.
+
+### 3.5.1 The clip rule (the whole model in four sentences)
+
+Every voxel is a perfect unit cube in its own facet frame (I3). A **junction
+cell** is a cell whose cube intersects the seam plane P (§2.5 — the dihedral
+bisector through the welded ring). Its solid geometry is `unit cube ∩ its own
+facet's half-space of P` — a convex prism partial fill; the neighbour facet's
+junction cells are clipped by the *same world plane* from the other side. Cells
+wholly beyond P are AIR (this IS the FP2 domain mask — the facet polygon's edges
+lie in the ridge planes, so the mask and the clip are one test); cells wholly
+inside are untouched full-engine cells.
+
+### 3.5.2 Exact prism geometry
+
+Canonical mid-face case in A's local frame (seam along ẑ at the cell's +x side;
+cell `[0,1]³`; footprint cut offset `x_c ∈ [0,1)` where P crosses at y=0; tilt
+`φ = θ/2` leaning *away* over the neighbour — the planet is convex):
+
+```
+solid = { (x,y,z) ∈ [0,1]³ : x ≤ min(1, x_c + y·tan φ) }
+```
+
+Vertices (plane crossing all y): the quadrilateral cross-section
+`(0,0) (x_c,0) (x_c + tanφ, 1) (0,1)` in (x,y), extruded along z — 8 vertices,
+6 faces (the cut face is the tilted quad lying exactly in P). Degenerate limits:
+`x_c = 0, φ = 45°` → the **90-45-45 right-isosceles triangular prism** (the
+user's picture — exactly the k=1 cube-edge case); at earth k=16, φ = 2.6° and
+the cut face is a near-vertical plane whose top edge overhangs the bottom by
+tan 2.6° ≈ 0.045 blocks (0.09 at demo k=8, ~0.2 on a chunky k≈5 moon). The
+general case (rhombic facets near old corners) adds the in-plane direction
+angle α ≠ 0: the cut line crosses the footprint obliquely and the cross-section
+is a clipped pentagon/quad — same construction, computed by clipping the cube
+against `(m̂_A, d_A)` (one Sutherland–Hodgman pass; the result is always convex).
+A junction cell that is also a **crest** (surface) cell composes this footprint
+clip with its existing corner-height top shape — clip the slope-shape mesh by
+the same plane (the snow-composite model precedent, `_make_composite_model`,
+`module_world.gd:798`).
+
+### 3.5.3 Complementarity — plane-mediated, not cell-paired (THE subtlety)
+
+The two facets' lattices are **incommensurate** across a seam: phase-offset
+(facet dimensions are irrational in blocks), generally angle-offset (α_A ≠ α_B,
+up to ~30° at rhombic facets pre-FP5-twist), and vertically offset (the datum
+step). Therefore A's junction cells and B's junction cells do NOT pair up
+one-to-one, and no cell-to-cell face matching exists or is needed. The matching
+is **against the plane P**: A's partials tile A's half-space up to P exactly; B's
+tile B's half-space up to P exactly; hence together they tile the seam wedge
+with **no gap and no double-coverage** — the "junction block" of the user's
+mental model is the union of one A-partial with whichever 1–2 B-partials abut it
+across P. Observable consequences, disclosed: the seam trace shows both grids'
+cell edges meeting at the fold (a subtle herringbone along the ridge — honest
+voxel aesthetics, this is the look the user is asking for); and where the two
+sides' *terrain heights* at P differ (≤ ½ block after FP4 grading, §3.5.6), the
+taller side's cut face shows as a sliver of side-texture — identical to any
+1-step today.
+
+### 3.5.4 ShapeCodec/CellCodec encoding — FAM kind 2 (JUNCTION)
+
+Same principle, same machinery as terrain smoothing: junction cells are FAM
+shape-family modifiers, so the SAME mesher (baked `VoxelBlockyModelMesh` per
+(material, modifier) ARID) and the SAME collider contract draw them.
+
+- `cell_codec.gd`: `const FAM_JUNCTION := 2` (the kind slot the FAM dispatch
+  already reserves — bits 14..12; `module_world`'s generator comment explicitly
+  anticipates a future kind that "must NOT be mis-indexed" into the slope
+  table). Payload (12 bits):
+  - bits 11..10 — **seam slot s** (0..3): which of the active facet's seams.
+    Resolves the *exact* `(m̂_A, d_A, α, φ)` from the atlas at model-build and
+    collision time — the continuous per-seam parameters live in the atlas, not
+    the payload, so the modifier vocabulary stays finite while the geometry
+    stays exact.
+  - bits 9..5 — **offset q** (0..31): the cut's signed perpendicular distance
+    from the cell centre (in-plane, normal to the ridge line) quantized to
+    **1/16 block** over [−1, +1), **always rounded toward the neighbour**
+    (outward). See §3.5.5 for why outward.
+  - bits 4..0 — reserved 0.
+- `shape_mesh.gd`: `_build_junction(slot_params, q)` — clip the unit cube (or,
+  for a crest cell, the `_build_heights`/`_build_slope` product) by the plane
+  reconstructed from `(α, φ, q)`; emit the convex result (reuses `_tri`/`_quad`
+  emission). `build(modifier)` dispatches on the FAM kind.
+- `shape_codec.gd`: kind-2 handling in `span`/`occupied`/`local_top`/
+  `side_profile` — the footprint side test decides full-span vs empty at a
+  given (fx, fz) (§3.5.6 does it exactly, not via q). `canonical_modifier`/
+  `rotate_modifier` treat kind 2 as pass-through — junction modifiers are
+  facet-frame-local and no D4 ever applies in faceted mode (no M_win exists).
+- `module_world.gd`: a frozen per-epoch `_junction_arid` table
+  (`mat·128 + s·32 + q` → ARID), baked on the main thread in `setup()`/
+  `set_facet()` alongside `_build_slope_manifest` (line 846). The *crest*
+  composites (junction ∧ slope-top) are enumerated at bake time by walking the
+  facet's seam columns and collecting the actually-occurring
+  `(material, top-modifier, s, q)` set (the `emitted_modifiers` sampling
+  precedent) — a few hundred models per facet epoch, bounded; stragglers use
+  the existing lazy main-thread ARID append (`arid_for`, line 504).
+- **Emission — one authority, at the window exits.** `resolve_cell` stays
+  untouched. New pure function `FacetAtlas.junction_modify(fid, cell, v) -> int`
+  returns `v` unchanged (interior), `AIR` (wholly beyond P — the mask), or `v`
+  with the kind-2 modifier composed (cube intersects P). Called from exactly
+  the two places the J⁻¹ rotation exit already established: the module worker's
+  buffer-write loop in `_generate_block`, and `WorldManager.cell_value_at`'s
+  faceted path. All inputs are frozen atlas data — worker-pure.
+- Corner junction cells (cut by TWO seam planes — a handful per facet corner):
+  per-cell exact models via the lazy ARID path; the FP5 vertex clusters polish
+  the 8 planet corners.
+
+### 3.5.5 Quantization, and why it can never open a crack
+
+Baked models cannot carry a continuous per-cell cut offset, so q quantizes it
+(1/16 block). If each side rounded arbitrarily, A's rendered cut face and B's
+would straddle P independently → hairline **gaps** (visible cracks). Rule:
+**round outward** — each side's rendered partial always extends *at least* to P
+(≤ 1/16 proud). Result: rendered overlap ∈ [0, 1/16+1/16], never a gap;
+the overlapping slivers are buried inside the other side's solid (no z-fight —
+the two cut faces are parallel-offset, not coplanar; the buried face is
+overdraw only). The seam-side cut faces are never culled wrongly: a junction
+cell's outward neighbour cell is AIR (the mask), so godot_voxel's side-culling
+keeps them — no custom culling work. Note α and φ are NOT quantized (exact per
+seam slot in the baked model); only the in-cell offset is.
+
+### 3.5.6 Collision — exact, and physics ⊆ render
+
+Physics does not use q. `WorldManager._occ_span` (line 343) for a kind-2 cell:
+test the footprint point against the **exact** plane `(m̂_A, d_A)` (at the
+cell's y for the tilt term) — own side → the underlying shape's span (full
+cube, or the crest slope's span); other side → `Vector2.ZERO`. `blocked`/
+`floor_under`/`ceiling_scan`/DDA all compose through `_occ_span` — no other
+change. GroundCollider (`ground_collider.gd:_emit_column`): junction cells emit
+a `ConvexPolygonShape3D` (the pool at `_cpool` already exists for slope prisms)
+from a shared vertex enumerator `FacetAtlas.junction_prism_verts(fid, cell)` —
+the same clip code the mesh builder uses, so render == collision by shared
+construction. Because render rounds outward and physics is exact:
+**physics ⊆ render** — the player can never stand on invisible ground; at worst
+a ≤ 1/16-block visible sliver is intangible (disclosed; same order as existing
+half-block quantization residues).
+
+### 3.5.7 Who renders the OTHER side (single-active-facet reality)
+
+Only one facet is a live voxel lattice at a time. The neighbour's matching
+partials are rendered by the **neighbour-band builder** in `facet_far_ring.gd`:
+its first `STRIP_CELLS + 2` cell rows along the shared seam are emitted at
+**full cell resolution as exact clipped cubes** — built by the same
+`junction_prism_verts`/clip code, sampled through the same generator
+(`generated_cell` + `junction_modify` on the neighbour's fid), with real cell
+materials — then the mesh coarsens to the mid-LOD pitch beyond. So the player
+standing at a ridge sees two true voxel-cube families meeting at the fold, both
+sides block-accurate; when they cross (FP3), the B side becomes live and is
+geometry-identical by construction (same pure generator, same clip).
+
+### 3.5.8 Walkability across the junction (FP4)
+
+The crossing surface is: A's crest bevel (existing corner-height family — at
+earth k=16 the 5.2° fold is a 0.09-block rise per cell, *under* the half-block
+quantum mid-face; chunkier k gets real bevels from the same family) → the seam
+plane → B's crest bevel. FP4's datum grade (§7.1) ramps BOTH sides' strip
+terrain to the **same integer ring datum**, so the two surfaces at P differ by
+at most the half-block shape quantum (≤ 0.5 < STEP_MAX = 0.55) — a walker
+crosses without a jump, a hitch, or a fall. The FP3 handoff hysteresis (0.75
+blocks) means the walker is re-framed just past P while standing on junction
+cells whose floor heights agree to ≤ 0.5 — the frame swap is height-continuous.
+
+### 3.5.9 Junction gates
+
+- **G-J1 seam tiling (headless, per sampled seam):** for a dense sample of
+  points in the seam wedge, *exactly one* of (A-solid, B-solid, air) claims each
+  point under the exact clip (no gap, no double-coverage — half-space
+  complementarity asserted numerically); for the *rendered* (quantized) models,
+  signed clearance along P ∈ [−1/8, 0] (overlap-only, never a gap).
+- **G-J2 render == collision:** for every junction modifier baked in the epoch,
+  the mesh's clipped vertices and `junction_prism_verts` agree ≤ 1e-4;
+  `_occ_span` matches point-in-prism tests on a sample grid.
+- **G-J3 walker crossing:** a headless walker driven over 20 sampled ridge
+  crossings (mid-face + rhombic + near-corner) records floor height each tick:
+  max single-tick rise ≤ STEP_MAX, no fall > 1 block, no oscillating handoff.
+- **G-J4 emission determinism:** `junction_modify` byte-stable across repeats
+  and worker/analytic (folds into G-F1a).
+
+---
+
 ## 4. FP1 — one playable facet (~1 milestone)
 
 **Definition:** the game boots with `FACETED = true` into a single facet's local
@@ -436,13 +668,18 @@ kernel API takes/returns scalars + DVec3 only; G-F1a is the tripwire.
 
 ---
 
-## 5. FP2 — neighbour ring + far ring + the visual barrier (~1 milestone)
+## 5. FP2 — neighbour ring + far ring + rendered junction blocks (~1 milestone)
 
 **Definition:** the facet is placed in its planet context: the 8 edge/corner
-neighbour facets render as static mid-LOD meshes, the rest of the planet as a
-far ring, seams as welded-ring strip meshes ("ridge rock" barrier). Generation
-masks to the facet domain; an invisible wall clamps the player at ridge planes.
-Still one playable facet.
+neighbour facets render as static meshes (full-resolution clipped-cube junction
+band at the shared seams, mid-LOD beyond), the rest of the planet as a far
+ring, and the seams as **junction blocks** (§3.5): the active facet's boundary
+voxels generate as FAM-kind-2 partial fills terminating exactly on the seam
+planes, meeting the neighbour band's complementary partials. Junction collision
+(exact `_occ_span` + GroundCollider prisms, §3.5.6) lands here too — the player
+can stand on the own-side part of a junction cell, so render==collision cannot
+wait for FP4. An invisible wall still clamps the player at the ridge planes
+(removed by FP3's handoff). Still one playable facet.
 
 ### 5.1 Atlas: seams (§2.5)
 
@@ -460,52 +697,76 @@ cannot be rotated (det==0, `module_world.gd:332`) and physics already lives here
 Everything else is static geometry under rigid transforms (the R2 principle —
 nothing chart-shaped near the GPU, zero custom shaders):
 
-- New `godot/src/world/facet_far_ring.gd` (~400 lines; the far analogue —
+- New `godot/src/world/facet_far_ring.gd` (~450 lines; the far analogue —
   `FarPalette` colours, `FAR_MAX_*`-style caps, `make_material()` reuse):
-  - **Neighbour meshes** (8): heightmap grids at `NEIGH_PITCH := 4` blocks over
-    each neighbour's polygon, heights/colours from `facet_profile` (the same
-    adapter — near/neighbour agree by construction), verts **terminating on the
-    welded rings**, placed at `T_active⁻¹ · T_neigh` (f64-composed, f32-stored;
-    origins ≤ ~2 facet sizes → exact).
+  - **Neighbour meshes** (8): each neighbour renders in two bands (§3.5.7). The
+    **junction band** — its first `STRIP_CELLS + 2` cell rows along shared seams
+    — is emitted at full cell resolution as exact clipped cubes: sampled through
+    the same pure generator (`generated_cell` on the neighbour's fid +
+    `FacetAtlas.junction_modify`), meshed via the shared clip enumerator
+    (`junction_prism_verts` + `shape_mesh.build`), with real cell materials.
+    Beyond the band, a heightmap grid at `NEIGH_PITCH := 4` blocks from
+    `facet_profile`. Placed at `T_active⁻¹ · T_neigh` (f64-composed, f32-stored;
+    origins ≤ ~2 facet sizes → exact). The band's partials are the visible
+    "other half" of every junction block — the two families meet on the seam
+    plane per §3.5.3.
   - **Far ring**: the remaining planet as one FP0-style mesh (all facets,
     `CELLS≈6` per facet, ~28k tris at K=8), placed at `T_active⁻¹` (origin
     magnitude ≈ R — f32-safe at 6371), minus the active facet + neighbours'
     footprint. Rebuilt only on crossing (FP3), never per-frame.
-  - **Strip meshes**: per visible seam, a prism strip on the welded ring
-    (width ≈ 2·STRIP_CELLS, ridge-rock material) covering the near-field mask
-    edge and the neighbour-mesh joins.
+  - **Ring-line cap**: a thin cap mesh along each welded ring covering the
+    ≤ 1/8-block quantized-overlap zone and the datum-step slivers (§3.5.5) —
+    cosmetic only; the generic revision-1 "strip prism barrier" is GONE,
+    replaced by the real junction geometry.
+- **The junction pipeline lands here** (all per §3.5.4–3.5.6):
+  `cell_codec.gd` FAM_JUNCTION + payload helpers; `shape_mesh.gd`
+  `_build_junction`; `shape_codec.gd` kind-2 span/side dispatch;
+  `module_world.gd` `_junction_arid` manifest bake + the generator's
+  `junction_modify` call at the buffer-write exit; `world_manager.gd`
+  `cell_value_at` faceted exit calls `junction_modify` (this subsumes the
+  domain mask — one function, both exits) and `_occ_span` gets the exact
+  kind-2 plane test; `ground_collider.gd` `_emit_column` emits junction
+  `ConvexPolygonShape3D`s via `junction_prism_verts`.
 - `WorldManager._ready`: FACETED branch instantiates `FacetFarRing` instead of
   `FarTerrain`; `update_streaming` forwards `update_center`.
-- Memory/draw ceilings (never-OOM): neighbour meshes ≤ 8 × ~5k tris, far ring ≤
-  `FAR_MAX_TRIS`, strips ≤ 4·K visible — all capped at build, trim
-  outermost-first like `far_terrain.gd:61`.
+- Memory/draw ceilings (never-OOM): junction band ≤ (STRIP_CELLS+2)·edge_len·2
+  cells per seam ≈ 2k cells → ~8k tris per neighbour at demo scale; neighbour
+  meshes ≤ 8 × ~10k tris, far ring ≤ `FAR_MAX_TRIS`, junction manifest ≤ ~512
+  models/epoch — all capped at build, trim outermost-first like
+  `far_terrain.gd:61`.
 
 ### 5.3 The generation mask + the wall
 
-- `TerrainConfig` faceted cell entry: in the faceted branch of `column_profile`
-  do NOT mask (profiles are legitimately queried outside for neighbour meshes);
-  mask at the **cell** level: `WorldManager.cell_value_at`'s `_chart == null`
-  path becomes, under FACETED, `if not FacetAtlas.in_domain(active, x, z):
-  return AIR` before `generated_cell` (also mirrored in the generator worker's
-  column loop: out-of-domain column → skip writes, leave 0). Masking at cell
-  level (not profile) avoids the sea-fill-over-void artifact.
+- The mask IS the junction clip (§3.5.1): `FacetAtlas.junction_modify` returns
+  AIR for cells wholly beyond the active facet's seam planes, the kind-2
+  partial for straddling cells, and `v` unchanged inside. Called at the two
+  window exits only (`cell_value_at` faceted path; the worker's buffer-write
+  loop) — `column_profile` does NOT mask (profiles are legitimately queried
+  outside the domain for the neighbour band and spawn scans). Masking at the
+  cell level avoids the sea-fill-over-void artifact.
 - The wall: `WorldManager.blocked()` (line 1717) FACETED prelude — for each seam
   of the active facet, `m̂·(p − r0) < WALL_EPS` (crossing outward) → blocked.
-  One-plane tests against ≤ 4 seams; `ceiling_scan`/`floor_under` untouched
-  (domain interior). Player never reaches the mask void.
+  One-plane tests against ≤ 4 seams; `ceiling_scan`/`floor_under` untouched.
+  The wall sits ON the seam plane, so the player can walk onto the own-side
+  part of every junction cell (real partial-fill collision, §3.5.6) but not
+  past P until FP3.
 
 ### 5.4 FP2 gates
 
-Weld closure (§5.1); near/neighbour join: for sample columns at the mask edge,
-near-field surface height == neighbour-mesh height at the same d̂ ± 1 block;
-FPS parity on the live web build (PerfHUD; draw calls ≤ flat + 12); never-OOM
-budget delta < 5 MB; G-F1a/b/c re-run green.
+Weld closure (§5.1); **G-J1/G-J2/G-J4** (§3.5.9 — seam tiling, render ==
+collision on junction cells, emission determinism); near/neighbour join: for
+sample columns at the seam, near-field junction geometry and the neighbour
+band's partials meet on P within [−1/8, 0] (overlap-only); FPS parity on the
+live web build (PerfHUD; draw calls ≤ flat + 12); never-OOM budget delta
+< 5 MB; G-F1a/b/c re-run green.
 
-**#1 FP2 risk — the mask edge reads as a cliff of exposed voxel side-faces**
-under the strip mesh (the near field just *stops* at the domain edge). The strip
-prism must be tall/wide enough to cover the tallest exposed profile near old
-corners; budget a fit-and-finish pass, and accept FP2 as "visual barrier"
-quality, not seam-final (that is FP4).
+**#1 FP2 risk — junction-model quantization opening visible cracks** if any
+implementation rounds the cut offset to-nearest instead of outward (§3.5.5), or
+bakes α/φ quantized instead of exact-per-seam-slot. G-J1's rendered-clearance
+assertion ([−1/8, 0], overlap-only) is the tripwire; it must run against the
+*baked models'* vertices, not the exact math. Secondary: junction-manifest
+bloat near rhombic facets (oblique α → more distinct crest composites) — the
+per-epoch enumeration cap (≤ ~512) with lazy-append overflow is the guard.
 
 ---
 
@@ -590,14 +851,17 @@ nodes, assert each is either facet-local or re-frame-registered.
 
 ---
 
-## 7. FP4 — seam gameplay (~1 milestone)
+## 7. FP4 — walkable junctions + seam gameplay (~1 milestone)
 
-**Definition:** the strip becomes real, walkable, generated terrain: banks graded
-with the shipped slope/smoothing families, no-build enforcement, collapse and
-collider clamps, terrain/sea reconciliation. The invisible wall is gone; crossing
-a ridge is walking over a gentle bank.
+**Definition:** the seam becomes a place you walk over and play against: both
+sides' strip terrain grades to the shared ring datum so the junction blocks'
+surfaces meet within the half-block quantum (§3.5.8), crest bevels come from
+the shipped slope/smoothing families, no-build/no-break rules land, collapse
+and DDA clamp at the seam planes, sea reconciles. The invisible wall is gone;
+crossing a ridge is walking over the fold of two matching partial-fill cube
+families.
 
-### 7.1 Strip terrain (profile-level, pure)
+### 7.1 Strip terrain grading (profile-level, pure)
 
 In `facet_profile` (§3.2), for columns with `ring_dist(fid, x, z) ≤ STRIP_CELLS`
 (distance in the facet plane to the nearest owned ridge line):
@@ -609,49 +873,59 @@ w           = 1 − ring_dist / STRIP_CELLS         # 0 at strip edge → 1 at t
 g_strip     = int(round(lerp(float(g_terrain), y_ring(s_proj) + RIDGE_CREST, w)))
 ```
 
-with `RIDGE_CREST := 1` (the strip crowns one block above the shared datum —
-sheds water, reads as ridge rock). Both facets ramp to the **same** ring, so the
-two sides meet within ±1 quantization block; the dihedral kink at 5–11° over a
-4-cell strip is a ≤ 1-block rise — the shipped corner-height smoothing +
-sharp-slope pipeline grades it with **no new shapes** (study §4.3). Strip columns
-also override the surface material to ridge rock (a `B_*`-independent cap in
-`_cap_material` gated on strip membership via the profile's biome slot or a
-dedicated strip flag — implementer's choice; keep it in the profile stage so
-resolve_cell stays untouched). Sea: strip columns clamp the sea fill to
+with `RIDGE_CREST := 1` (the crest crowns one block above the shared datum —
+sheds water, reads as ridge rock). **Both facets round to the same integer
+ring datum** — this is what §3.5.8's walkability needs: the two junction-cell
+surfaces at P then differ only by the half-block shape quantum (≤ 0.5 <
+STEP_MAX), and the dihedral kink at 5–11° over the strip is graded by the
+shipped corner-height smoothing + sharp-slope pipeline with **no new top
+shapes** (study §4.3) — the only seam-specific shape remains the §3.5 footprint
+clip. Strip columns also override the surface material to ridge rock (in the
+profile stage — a dedicated strip flag or the biome slot — so `resolve_cell`
+stays untouched). Sea: strip columns clamp the sea fill to
 `min(SEA_LEVEL, y_ring − 1)` so ocean seams terminate in banks/falls inside the
 strip (the disclosed toy-physics artifact, study §6.5).
 
 Purity is preserved: `ring_dist`/`y_ring` are atlas data — still a pure function
-of `(fid, x, z)`.
+of `(fid, x, z)`. Note this changes strip-column terrain vs FP2/FP3 (a
+generation change — fine pre-persistence; re-run G-F1a after).
 
 ### 7.2 Gameplay clamps
 
-- **No-build:** `WorldManager.place_block` (line 633) rejects cells whose column
-  is in-strip (`FacetAtlas.in_strip(fid, x, z)`); `break_terrain` rejects strip
-  terrain cells (ridge rock unbreakable — cheap and sidesteps
-  collapse-at-boundary edge cases).
+- **No-build / no-break:** `WorldManager.place_block` (line 633) rejects cells
+  whose column is in-strip (`FacetAtlas.in_strip(fid, x, z)` :=
+  `ring_dist ≤ STRIP_CELLS`, which includes every junction cell);
+  `break_terrain` rejects strip terrain cells (ridge rock unbreakable — cheap,
+  sidesteps collapse-at-boundary edge cases, and a junction *partial* is not a
+  well-defined inventory item anyway). Building *adjacent* to the strip stays
+  allowed.
 - **Collapse:** `_collapse_unsupported`'s flood-fill treats in-strip columns as
   *supported boundary* (they terminate the search like region edges do) — a
   cluster can never span a seam.
-- **Wall removal:** delete the FP2 `blocked()` prelude; the FP3 handoff +
-  walkable banks take over. GroundCollider: zero changes (it reads generation).
-- FP2's strip prism mesh shrinks to a thin ring-line cap (the generated strip
-  terrain now does the visual work); neighbour meshes terminate against it.
+- **Wall removal:** delete the FP2 `blocked()` prelude; the FP3 handoff + the
+  graded junction surfaces take over. GroundCollider: zero further changes
+  (junction prisms landed in FP2; it reads generation).
+- Cross-seam DDA within reach (the FP3 §6.3 scope cut): optionally resolved
+  here by continuing `aimed_voxel` rays past P as a query against the
+  neighbour's lattice (transform the ray by Δ_AB, re-run the DDA there,
+  interaction still blocked in-strip) — nice-to-have, not gate-bearing.
 
 ### 7.3 FP4 gates
 
-Seam-walk invariant (headless): along 50 sampled ridge crossings, consecutive
-column height deltas ≤ 1 block through the strip on both sides (walkable without
-jumping, `STEP_MAX = 0.55` respected via the slope shapes); no-build/no-break
-enforced in-strip; collapse never crosses (place a bridge over a seam → break it
-→ assert cluster confined); sea-seam columns hold `≤ min-datum` water; live
-crossing now wall-less end-to-end. Full verify + G-series re-run.
+**G-J3** (§3.5.9 — the walker crossing: 20 sampled ridges, max single-tick rise
+≤ STEP_MAX, no falls, no handoff oscillation); seam-surface agreement: at 50
+sampled seam stations the two sides' junction-cell floor heights at P differ
+≤ 0.5; no-build/no-break enforced in-strip; collapse never crosses (place a
+bridge over a seam → break it → assert cluster confined); sea-seam columns hold
+`≤ min-datum` water; live crossing wall-less end-to-end on the web build. Full
+verify + G-series re-run.
 
 **#1 FP4 risk — bank quality near the 8 old corners** (datum steps up to
-~12 blocks at earth k=16 land exactly where facets are rhombic): the ramp formula
-holds (it just gets steeper — the sharp-slope family covers up to its designed
-pitch), but the *look* needs the FP5 fit-and-finish pass; scope FP4's gate to
-walkability + invariants, not aesthetics.
+~12 blocks at earth k=16 land exactly where facets are rhombic and α is most
+oblique): the grade formula holds (it just gets steeper — the sharp-slope
+family covers up to its designed pitch) and the clip is angle-agnostic, but the
+*look* needs the FP5 fit-and-finish pass; scope FP4's gate to walkability +
+invariants, not aesthetics.
 
 ---
 
@@ -690,16 +964,16 @@ world-generation parameter, not a runtime toggle.
 | Stage | New | Touched | Gate (exit) | ~size |
 |---|---|---|---|---|
 | FP1 | `facet_atlas.gd`, `verify_faceted.gd` | terrain_config, module_world, world_manager, cube_sphere, main | G-F1a..f (§4.7) | ~670 lines |
-| FP2 | `facet_far_ring.gd`; atlas seams | world_manager (mask+wall), main (fog gate) | weld closure; join ≤1; web FPS parity | ~700 |
+| FP2 | `facet_far_ring.gd`; atlas seams; junction pipeline (§3.5) | cell_codec + shape_codec + shape_mesh (FAM kind 2), module_world (junction manifest + emission), world_manager (`junction_modify` exit, `_occ_span` kind-2, wall), ground_collider (junction prisms), main (fog gate) | weld closure; G-J1/J2/J4; web FPS parity | ~1100 |
 | FP3 | — | world_manager (cross, keys), module_world (`set_facet`), player (`apply_reframe`) | cross-and-return byte-identity; no-hitch live | ~460 |
-| FP4 | — | terrain_config (strip profile), world_manager (clamps), facet_far_ring (strip cap) | seam-walk/build/break invariants | ~300 |
+| FP4 | — | terrain_config (strip grade), world_manager (clamps) | G-J3 + seam walk/build/break invariants | ~300 |
 | FP5 | twist bake, monuments | facet_atlas, facet_far_ring | twist bounds; live A/B user pass | ~350 |
 
 Web/never-OOM ledger (all stages): zero custom shaders, zero per-voxel data,
 atlas < 1 MB, neighbour+far meshes capped at build, workers read only
 frozen-after-warm-up data, threading model unchanged, COOP/COEP unaffected.
 
-## 10. The three things most likely to be implemented wrong
+## 10. The four things most likely to be implemented wrong
 
 1. **f32 leaking into the d̂/frame path** (§2, §3.2): any `Vector3` between the
    corner directions and the normalized d̂ (or reusing FP0's f32
@@ -721,3 +995,12 @@ frozen-after-warm-up data, threading model unchanged, COOP/COEP unaffected.
    reappears as Δ applied wrongly: **position takes the full transform;
    velocity/look take the basis only; physics snaps, only the render camera
    eases** (the #71 bug family).
+4. **The junction clip's matching discipline** (§3.5): the two sides must clip
+   against the *same world plane P* — never against each other's facet planes,
+   never against per-side re-derived planes; the baked models carry α and φ
+   **exact** per seam slot and quantize only the in-cell offset, **rounded
+   outward** (to-nearest rounding reopens hairline cracks); and physics uses
+   the exact plane, never the quantized q (physics ⊆ render). Expecting
+   cell-to-cell pairing across the seam is the conceptual trap — the lattices
+   are incommensurate; matching is plane-mediated (§3.5.3). G-J1 run against
+   baked vertices is the tripwire.

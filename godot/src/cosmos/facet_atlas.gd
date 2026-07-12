@@ -394,6 +394,56 @@ static func _face_plane_plane_points(p: Array, q: Array, planes: Array, pts: Pac
 			if _inside_all(planes, u, eps * 100.0):
 				pts.append(u)
 
+# ------- junction encoding authority (§3.5.4) -------
+
+## Length of the ridge-plane gradient (A,B,C) for a seam — converts own_dist to a true perpendicular distance.
+static func seam_grad_len(fid: int, slot: int) -> float:
+	var b := fid * 16 + slot * 4
+	return sqrt(_seam_plane[b] * _seam_plane[b] + _seam_plane[b + 1] * _seam_plane[b + 1] + _seam_plane[b + 2] * _seam_plane[b + 2])
+
+## The QUANTIZED model plane [A,B,C,base] for a baked junction shape (slot, q). Reconstructs the cut plane
+## from the exact per-seam orientation (A,B,C) + the offset q (cell-centre perpendicular distance = q/16 − 1).
+## base is chosen so the plane sits ≥ the exact plane (outward) — the render model reaches at least to P.
+static func junction_model_plane(fid: int, slot: int, q: int) -> Array:
+	var b := fid * 16 + slot * 4
+	var A := _seam_plane[b]; var B := _seam_plane[b + 1]; var C := _seam_plane[b + 2]
+	var grad := sqrt(A * A + B * B + C * C)
+	var dq := float(q) / 16.0 - 1.0
+	var base := dq * grad - (A + B + C) / 2.0
+	return [A, B, C, base]
+
+## The quantized model's clipped unit-cube vertex cloud (LOCAL u∈[0,1]³) — the render geometry for (slot,q).
+static func junction_model_verts(fid: int, slot: int, q: int) -> PackedVector3Array:
+	return _clip_cube_points([junction_model_plane(fid, slot, q)])
+
+## The outward-rounded cut offset q (0..31) for a junction cell — the cell-centre perpendicular distance to
+## the ridge quantized to 1/16 block over [−1,+1), rounded UP so the rendered partial reaches at least to P.
+static func junction_q_of(fid: int, slot: int, x: int, y: int, z: int) -> int:
+	var dc := own_dist(fid, slot, float(x) + 0.5, float(y) + 0.5, float(z) + 0.5) / seam_grad_len(fid, slot)
+	return clampi(int(ceil((dc + 1.0) * 16.0)), 0, 31)
+
+## THE emission authority (§3.5.4) — the ONLY producer of junction cells, called at the two window exits
+## (module worker buffer-write, WM.cell_value_at faceted path). Returns AIR for a cube wholly beyond a ridge
+## (the FP2 domain mask), `v` unchanged for an interior cell, or `v`'s material carrying the kind-2 junction
+## modifier for a straddling cell. The straddling seam encoded is the one whose cut is closest to the cell
+## centre; corner cells (2 ridges) render single-plane (exact collision still uses junction_prism_verts) and
+## are polished by FP5. Pure: a function of frozen atlas data only → worker-safe.
+static func junction_modify(fid: int, cell: Vector3i, v: int) -> int:
+	var st := cell_seam_state(fid, cell.x, cell.y, cell.z)
+	if st["air"]:
+		return 0
+	var slots: PackedInt32Array = st["straddle"]
+	if slots.is_empty():
+		return v
+	var best_slot := slots[0]
+	var best_abs := 1.0e18
+	for s in slots:
+		var dc := absf(own_dist(fid, s, float(cell.x) + 0.5, float(cell.y) + 0.5, float(cell.z) + 0.5)) / seam_grad_len(fid, s)
+		if dc < best_abs:
+			best_abs = dc; best_slot = s
+	var q := junction_q_of(fid, best_slot, cell.x, cell.y, cell.z)
+	return CellCodec.pack(CellCodec.mat(v), CellCodec.make_junction(best_slot, q), CellCodec.state(v), CellCodec.liquid_field(v))
+
 # domain accessors (gates / FP2 streaming bounds)
 static func dom_min(fid: int) -> Vector2i:
 	return Vector2i(_dom[fid * 4 + 0], _dom[fid * 4 + 1])

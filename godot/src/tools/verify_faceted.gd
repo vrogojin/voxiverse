@@ -40,6 +40,7 @@ func _initialize() -> void:
 	_gate_spawn_margin()
 	_gate_seam_continuity()
 	_gate_seams(nf)
+	_gate_junction_encode()
 	_gate_live_loop()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -183,6 +184,58 @@ func _gate_seams(nf: int) -> void:
 	_ok(verts_inside, "clip: every prism vertex is inside all straddling half-spaces (own ≥ 0)")
 	_ok(partial, "clip: the junction prism is a proper PARTIAL fill (< full cube)")
 	_ok(masked_seen and interior_seen, "mask: the facet has both masked (air, beyond ridge) and interior cells")
+
+# FP2 Stage B1 — the junction encoding authority (§3.5.4). junction_modify is deterministic (G-J4), maps the
+# three cell classes correctly (air→AIR mask, interior→unchanged, straddle→kind-2 modifier), and the cut offset
+# q ALWAYS rounds OUTWARD (the model plane sits ≥ the exact plane, overlap ≤ 1/16 block — never an inward crack).
+func _gate_junction_encode() -> void:
+	var fid := FA.spawn_facet()
+	TC.set_active_facet(fid)
+	var lo: Vector2i = FA.dom_min(fid)
+	var hi: Vector2i = FA.dom_max(fid)
+	var FULL := CellCodec.pack(BlockCatalog.STONE, 0)
+	var det_ok := true; var class_ok := true; var outward_ok := true
+	var overlap_worst := 0.0
+	var jcount := 0; var air_count := 0; var interior_count := 0
+	var z := lo.y
+	while z <= hi.y:
+		var x := lo.x
+		while x <= hi.x:
+			var g := TC.height_at(x, z)
+			for y in [g - 2, g, g + 1]:
+				var cell := Vector3i(x, y, z)
+				var st := FA.cell_seam_state(fid, x, y, z)
+				var m0 := FA.junction_modify(fid, cell, FULL)
+				if FA.junction_modify(fid, cell, FULL) != m0:
+					det_ok = false
+				if st["air"]:
+					air_count += 1
+					if m0 != 0:
+						class_ok = false
+				elif (st["straddle"] as PackedInt32Array).is_empty():
+					interior_count += 1
+					if m0 != FULL:
+						class_ok = false
+				else:
+					jcount += 1
+					var mod := CellCodec.modifier(m0)
+					if not CellCodec.is_junction(mod):
+						class_ok = false
+					else:
+						var slot := CellCodec.junction_slot(mod)
+						var q := CellCodec.junction_q(mod)
+						var dc := FA.own_dist(fid, slot, float(x) + 0.5, float(y) + 0.5, float(z) + 0.5) / FA.seam_grad_len(fid, slot)
+						var dq := float(q) / 16.0 - 1.0
+						if dq < dc - 1e-6:
+							outward_ok = false
+						overlap_worst = maxf(overlap_worst, dq - dc)
+			x += 1
+		z += 1
+	_ok(det_ok, "junction: junction_modify is deterministic (G-J4)")
+	_ok(class_ok, "junction: air→AIR mask, interior→unchanged, straddle→kind-2 modifier")
+	_ok(jcount > 0 and air_count > 0 and interior_count > 0, "junction: all three classes present (air=%d interior=%d junction=%d)" % [air_count, interior_count, jcount])
+	_ok(outward_ok, "junction: cut offset q rounds OUTWARD (model plane ≥ exact, no inward crack)")
+	_ok(overlap_worst <= 1.0 / 16.0 + 1e-6, "junction: outward overlap ≤ 1/16 block (worst %s)" % overlap_worst)
 
 # rough hull volume via the AABB of the point cloud (a cheap "is it smaller than the unit cube" proxy)
 func _prism_volume(pts: PackedVector3Array) -> float:

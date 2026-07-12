@@ -10,6 +10,12 @@ const SKY_COLOR := Color(0.62, 0.74, 0.86)
 var _player: Player
 
 func _ready() -> void:
+	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
+	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
+	if CubeSphere.FACETED_SPIKE:
+		add_child(FacetedSpike.new())
+		return
+
 	_setup_environment()
 
 	var world := WorldManager.new()

@@ -35,6 +35,11 @@ const CORNER_LOCK_R := 8
 ## degrades §5's bisector teleport to §8's solid energy barrier over the same cylinder. CORNER_ZONE_R /
 ## FLIP_HYST_CORNER are the eager-flip zone/hysteresis (corrected from the ADR's 32/8 — see the doc §7/§13);
 ## PILLAR_R_CELLS / PILLAR_TOP_UP size the bedrock monument.
+## COSMOS FP0 (docs/COSMOS-FACETED-PLANET-STUDY.md §11) — the faceted-planet VISUAL SPIKE. When true, main.gd
+## builds a static demo faceted planet (flat square facets meeting at dihedral ridges, real terrain colours,
+## free-fly camera) INSTEAD of the normal world, so the faceted look can be judged live. Default OFF.
+const FACETED_SPIKE := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

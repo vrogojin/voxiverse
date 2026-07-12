@@ -109,11 +109,13 @@ func _gate_live_loop() -> void:
 	_ok(masked_ok, "junction physics: a beyond-ridge cell masks to AIR (block_id_at == 0)")
 	_ok(junction_ok, "junction physics: a straddling cell is a solid kind-2 junction via WM.cell_value_at")
 	# FP2 Stage D — the ridge wall: blocked() lets the player stand in the interior but stops them at a ridge.
-	# "Interior not walled": SOME interior, non-ridge, tree-free column is walkable (trees/edits make any single
-	# column flaky). "Walled at the ridge": from that column, scanning out to a ridge, blocked() fires.
+	# FP3: the FP2 ridge wall is gone — the crossing handoff replaces it. blocked() must let the player walk all
+	# the way TO the ridge (and slightly past, where the crossing fires); only a DEEP backstop (>3 blocks past P,
+	# a failed-crossing catch) still blocks. "Interior walkable": some interior, non-ridge column is not walled.
 	var base_iz := cz + 5
 	var wall_in := false
-	var wall_out := false
+	var ridge_open := false          # the player is NOT walled right at / just past the ridge (crossing handles it)
+	var backstop := false            # the deep backstop DOES block far past the ridge
 	var scanned := false
 	for dd in range(0, 60, 2):
 		var jx := cx + dd
@@ -130,13 +132,16 @@ func _gate_live_loop() -> void:
 				var od := 1.0e18
 				for slot in range(4):
 					od = minf(od, FA.own_dist(fidx, slot, px, jfeet, float(base_iz) + 0.5))
-				if od < 0.4:
-					wall_out = w.blocked(px, float(base_iz) + 0.5, jfeet)
+				if od < 0.1 and not scanned:
+					ridge_open = not w.blocked(px, float(base_iz) + 0.5, jfeet)   # NOT walled at the ridge
 					scanned = true
+				if od < -3.5:
+					backstop = w.blocked(px, float(base_iz) + 0.5, jfeet)         # deep backstop DOES block
 					break
 			break
 	_ok(wall_in, "facet wall: an interior column is walkable (not blanket-walled)")
-	_ok(scanned and wall_out, "facet wall: blocked() stops the player at the ridge plane")
+	_ok(scanned and ridge_open, "facet crossing: the player is NOT walled at the ridge (handoff replaces the wall)")
+	_ok(backstop, "facet crossing: a deep backstop still blocks far past the ridge (failed-crossing catch)")
 	# FP3 crossing smoke test: a synthetic position past a ridge fires maybe_cross_facet + switches the active facet.
 	TC.set_active_facet(fidx)
 	var cross_found := false
@@ -344,6 +349,12 @@ func _gate_far_ring() -> void:
 	var maxtris := 6 * k * k * FacetFarRing.CELLS * FacetFarRing.CELLS * 2
 	_ok(tris > 0, "far ring: built %d triangles around the active facet" % tris)
 	_ok(tris < maxtris, "far ring: triangle count bounded by the all-facet cap (%d < %d, back-hemisphere culled)" % [tris, maxtris])
+	# FP3: set_active (crossing) re-places + re-emits from the vertex cache (no terrain re-sampling), producing
+	# a valid mesh for the neighbour frame — the cheap crossing re-placement the user asked for.
+	var nb: int = FA.seam_neighbour(fid, 0)
+	ring.set_active(nb)
+	_ok(ring.triangle_count() > 0, "far ring: set_active(neighbour %d) re-emits a valid mesh from cache" % nb)
+	ring.set_active(fid)
 	ring.queue_free()
 
 # FP2 Stage B2 — the junction mesh builder (§3.5.4). G-J2: ShapeMesh._build_junction's clipped vertices match

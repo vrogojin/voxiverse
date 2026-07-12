@@ -36,8 +36,11 @@ var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
-const FACET_WALL_EPS := 0.5           # COSMOS FACETED §5.3: the ridge wall sits this far INSIDE each seam plane
-const FACET_CROSS_HYST := 0.75        # COSMOS FACETED §6.1: cross onto the neighbour once this far PAST a ridge
+const FACET_WALL_EPS := -3.0          # COSMOS FACETED §6.1: FP3 removes the FP2 ridge wall — the crossing handoff
+                                      # replaces it. A deep backstop (3 blocks PAST the ridge) only catches a
+                                      # failed crossing so the player can never wander far onto masked air.
+const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the neighbour just past a ridge (fires in
+                                      # update_streaming the same frame the feet pass P, so any speed is caught)
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -1253,7 +1256,18 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
 			var yaw_delta := atan2(ex.z, ex.x)
 			TerrainConfig.set_active_facet(to)
-			# FP3b: _cross_restream(fid, to, player_pos); _facet_ring.set_active(to); _reframe_debris(fid, to)
+			# FP3b: the EDITABLE facet swaps to B — restream its (axis-aligned) voxel field via the M4 cover (a
+			# live VoxelTerrain can't be rotated, so only one facet is the editable/streamed field at a time), and
+			# rigidly RE-PLACE the far ring around the new frame (no regen — cached). Debris re-frame + edit-key
+			# migration are FP3b-3. The M4 handoff (_flip_settling) re-mirrors edits + releases the cover on ramp.
+			if _module_world != null and _module_world.has_method("set_facet"):
+				var old_mod_pos: Vector3 = _module_world.position
+				_module_world.call("set_facet", to, old_mod_pos)
+			if _facet_ring != null:
+				_facet_ring.set_active(to)
+			_flip_settling = true
+			_restream()
+			print("[WorldManager] facet cross %d → %d (slot %d, restream + far re-place)" % [fid, to, slot])
 			return {"crossed": true, "from": fid, "to": to,
 				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
 	return {}

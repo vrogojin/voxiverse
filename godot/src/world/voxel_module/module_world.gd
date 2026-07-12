@@ -1213,6 +1213,16 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 	_gen_mwin = mwin                                  # COSMOS-FRAME-ORIENTATION §5.1: freeze the new epoch's M_win
 	restream(old_wrapper_pos)
 
+## COSMOS FACETED §6.1 — the crossing restream. Install a fresh generator epoch homed on facet `fid` (its
+## gen_facet reads TerrainConfig.active_facet(), which WorldManager sets to `fid` BEFORE this call) and
+## hard-restream (the M4 cover + view-distance ramp hides the swap). The junction BEVEL manifest is baked per
+## active-facet seam ORIENTATION, so it is CLEARED here — the new facet's junction cells lip-fall-back
+## (geometrically safe: never a wrong-tilt bevel, never a library leak). Per-facet bevel-on-crossing is a
+## deferred polish (would need library model overwrite to stay leak-free). Sibling of set_home_face.
+func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
+	_junction_arid = PackedInt32Array()               # clear → new facet's junctions render the safe lip
+	restream(old_wrapper_pos)
+
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
 ## GDScript fallback had one, so a module flip left stale face-A meshes standing (COSMOS-AUDIT F3).

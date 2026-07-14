@@ -435,6 +435,14 @@ func _gate_cap_real_spend(mod: Node3D, active: int) -> void:
 	var keep: int = picked[0]
 	m._want.clear()
 	m._want[keep] = 3
+	# steelman re-review (67d6bc0 gap): a PROMOTING facet's held cover must be SPARED by LRU eviction even under cap
+	# pressure (else a crossing opens a see-through hole over un-meshed live terrain). Mark picked[1] promoting AND make
+	# it the OLDEST last_want_ms so it is the natural LRU victim — the _evict_one_non_wanted guard must protect it.
+	# Set the promoting flag DIRECTLY (whitebox, like the ledger injection below): on_promote() would call
+	# notify_pool_changed() and re-derive _want, wiping the keep we just set.
+	var promo: int = picked[1]
+	m._promoting[promo] = true
+	m._cache[promo]["last_want_ms"] = 0
 	var cap_bytes := FLM.LOD_MAX_BYTES_MB * 1024 * 1024
 	m._ledger_bytes = cap_bytes + 1
 	m._ledger_tris = FLM.LOD_MAX_TRIS + 1
@@ -446,6 +454,7 @@ func _gate_cap_real_spend(mod: Node3D, active: int) -> void:
 			int(st["bytes"]), cap_bytes, int(st["tris"]), FLM.LOD_MAX_TRIS])
 	_ok(m.is_covered(keep), "G-M2-CAPS(C1): the WANTED facet was retained (a NON-wanted LRU facet was evicted first)")
 	_ok(int(st["facets"]) < covered_before, "G-M2-CAPS(C1): a non-wanted facet was evicted to fund the over-spend (%d → %d)" % [covered_before, int(st["facets"])])
+	_ok(m.is_covered(promo), "G-M2-CAPS(C1): the PROMOTING facet's held cover was SPARED by LRU eviction under cap pressure (no crossing hole) though it was the oldest non-wanted facet")
 	m.shutdown(); m.free()
 
 # ---------- G-M2-SEAM: erosion zero-protrusion + the ridge apron (§7.5) ----------

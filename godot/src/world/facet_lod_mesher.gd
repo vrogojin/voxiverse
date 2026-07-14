@@ -646,7 +646,7 @@ func _evict_one_non_wanted(keep: int) -> bool:
 	var victim := -1
 	var oldest := 0x7fffffffffffffff
 	for fid in _cache.keys():
-		if fid == keep or _want.has(fid):
+		if fid == keep or _want.has(fid) or _promoting.has(fid):   # M2d: never evict a promoting facet's held cover (no crossing hole, §9.1)
 			continue
 		var w := int(_cache[fid]["last_want_ms"])
 		if w < oldest:
@@ -654,7 +654,7 @@ func _evict_one_non_wanted(keep: int) -> bool:
 	if victim < 0:
 		# no evictable applied facet — also consider dropping a non-wanted in-flight build
 		for fid in _building.keys():
-			if fid != keep and not _want.has(fid):
+			if fid != keep and not _want.has(fid) and not _promoting.has(fid):   # M2d: spare a promoting facet's in-flight cover build too
 				_cancel_build(fid)
 				return true
 		return false

@@ -1,0 +1,622 @@
+diff --git a/meshers/blocky/facet_carve.h b/meshers/blocky/facet_carve.h
+new file mode 100644
+index 0000000..44dde70
+--- /dev/null
++++ b/meshers/blocky/facet_carve.h
+@@ -0,0 +1,321 @@
++// COSMOS FP-CARVE — mesher-side per-facet junction bevels (docs/COSMOS-FACETED-CARVE.md, patch 0004).
++//
++// A DIRECT 1:1 transcription of the GDScript reference proven by verify_facet_clip_ref (C0, 18/0):
++//   * facet_cell_state   mirrors FacetAtlas.cell_seam_state  (facet_atlas.gd:334-346), incl. SEAM_EPS = 1e-6
++//                        and the min/max-over-corners trick; builds the LOCAL cell planes [A,B,C,base].
++//   * facet_clip_cube    mirrors ShapeMesh.build_carve_faces = _unit_cube_faces + fold of _clip_solid
++//                        (shape_mesh.gd:162-239): fold the unit cube through each straddling half-space,
++//                        adding the tilted cut cap; _clip_solid re-clips prior caps so corner (>=2 plane)
++//                        cells close correctly.
++//   * facet_face_uv      mirrors ShapeMesh._face_uv (shape_mesh.gd:247-254).
++//
++// Precision discipline (COSMOS-FACETED-CARVE.md §4 hazard): the per-cell base A*x+B*y+C*z+D is the ONLY place
++// the |lattice| ~ 3e4 magnitude (from the decorrelation offset O in D) enters, so it MUST be f64 — the plane
++// blob is double[4][4] fed from a PackedFloat64Array. The cell-local clip (|values| <= ~2) then runs in
++// double too (free), casting to Vector3f only at the FacetCarveFace boundary. Fixed-capacity arrays only —
++// zero heap per cell. Pure arithmetic, no godot_voxel state; snapshotted under the mesher's Parameters lock.
++
++#ifndef FACET_CARVE_H
++#define FACET_CARVE_H
++
++#include "../../util/math/vector2f.h"
++#include "../../util/math/vector3f.h"
++#include <algorithm>
++#include <cmath>
++
++namespace zylann::voxel {
++
++// Frozen-per-crossing carve blob (mirror of module_world.gd _push_facet_carve). Row-major planes.
++struct FacetCarveParams {
++	bool enabled = false;
++	int32_t arid_base = 0; // first carve-sentinel ARID (contiguous range)
++	int32_t arid_count = 0;
++	// 4 slots x (A,B,C,D), LATTICE coords: own(x,y,z) = A*x + B*y + C*z + D >= 0 is the interior half-space.
++	// f64 MANDATORY (D absorbs the ~3e4 decorrelation offset).
++	double plane[4][4] = {};
++};
++
++enum FacetCellClass { FACET_CELL_AIR = 0, FACET_CELL_INTERIOR = 1, FACET_CELL_STRADDLE = 2 };
++
++// One clipped face: up to 16 verts (a unit-cube face clipped by <=4 half-spaces has <= 8), a flat outward
++// normal, and its Cube::Side (0..5) for axis faces or -1 for the tilted cut cap.
++struct FacetCarveFace {
++	Vector3f pts[16];
++	int count = 0;
++	Vector3f normal;
++	int cube_side = -1;
++};
++
++namespace facet_carve_detail {
++
++// Internal double vec for the clip fold (matches the f64 discipline above; GDScript uses f32 Vector3 storage
++// but promotes the plane dot to f64 through Variant floats — double here is strictly closer and within the
++// 1e-4 parity gate).
++struct V3d {
++	double x = 0, y = 0, z = 0;
++	V3d() {}
++	V3d(double px, double py, double pz) : x(px), y(py), z(pz) {}
++};
++
++inline V3d v_sub(const V3d &a, const V3d &b) { return V3d(a.x - b.x, a.y - b.y, a.z - b.z); }
++inline double v_dot(const V3d &a, const V3d &b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++inline V3d v_cross(const V3d &a, const V3d &b) {
++	return V3d(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
++}
++inline double v_len(const V3d &a) { return std::sqrt(v_dot(a, a)); }
++inline V3d v_lerp(const V3d &a, const V3d &b, double t) {
++	return V3d(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
++}
++inline V3d v_normalized(const V3d &a) {
++	const double l = v_len(a);
++	if (l == 0.0) {
++		return V3d(0, 0, 0);
++	}
++	return V3d(a.x / l, a.y / l, a.z / l);
++}
++
++// Convex polygon face during the clip fold (mirror of ShapeMesh's {poly, normal}).
++struct CFace {
++	V3d poly[16];
++	int count = 0;
++	V3d normal;
++	int cube_side = -1;
++};
++
++constexpr double FC_EPS = 1.0e-6; // ShapeMesh._EPS
++
++// The 6 unit-cube faces (mirror _unit_cube_faces), tagged with Cube::Side (LEFT0 RIGHT1 BOTTOM2 TOP3 BACK4
++// FRONT5 — g_side_normals: LEFT=+X, RIGHT=-X, BACK=-Z, FRONT=+Z; COSMOS-FACETED-CARVE.md B9).
++inline int build_unit_cube_faces(CFace out[6]) {
++	const V3d v0(0, 0, 0), v1(1, 0, 0), v2(1, 0, 1), v3(0, 0, 1);
++	const V3d v4(0, 1, 0), v5(1, 1, 0), v6(1, 1, 1), v7(0, 1, 1);
++	// y=0 (DOWN) -> BOTTOM(2)
++	out[0].poly[0] = v0; out[0].poly[1] = v3; out[0].poly[2] = v2; out[0].poly[3] = v1;
++	out[0].count = 4; out[0].normal = V3d(0, -1, 0); out[0].cube_side = 2;
++	// y=1 (UP) -> TOP(3)
++	out[1].poly[0] = v4; out[1].poly[1] = v5; out[1].poly[2] = v6; out[1].poly[3] = v7;
++	out[1].count = 4; out[1].normal = V3d(0, 1, 0); out[1].cube_side = 3;
++	// z=0 -> BACK(4)
++	out[2].poly[0] = v0; out[2].poly[1] = v1; out[2].poly[2] = v5; out[2].poly[3] = v4;
++	out[2].count = 4; out[2].normal = V3d(0, 0, -1); out[2].cube_side = 4;
++	// z=1 -> FRONT(5)
++	out[3].poly[0] = v3; out[3].poly[1] = v7; out[3].poly[2] = v6; out[3].poly[3] = v2;
++	out[3].count = 4; out[3].normal = V3d(0, 0, 1); out[3].cube_side = 5;
++	// x=0 -> RIGHT(1)
++	out[4].poly[0] = v0; out[4].poly[1] = v4; out[4].poly[2] = v7; out[4].poly[3] = v3;
++	out[4].count = 4; out[4].normal = V3d(-1, 0, 0); out[4].cube_side = 1;
++	// x=1 -> LEFT(0)
++	out[5].poly[0] = v1; out[5].poly[1] = v2; out[5].poly[2] = v6; out[5].poly[3] = v5;
++	out[5].count = 4; out[5].normal = V3d(1, 0, 0); out[5].cube_side = 0;
++	return 6;
++}
++
++inline double plane_val(const double pl[4], const V3d &p) {
++	return pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3];
++}
++
++// Sutherland-Hodgman: keep the own_local >= 0 side of `in`; append the <=2 crossing points to `cut`.
++// Mirrors ShapeMesh._clip_poly exactly (ic = fc >= -EPS).
++inline void clip_poly(const CFace &in, const double pl[4], CFace &out, V3d cut[64], int &ncut) {
++	out.count = 0;
++	out.normal = in.normal;
++	out.cube_side = in.cube_side;
++	const int n = in.count;
++	for (int i = 0; i < n; ++i) {
++		const V3d &cur = in.poly[i];
++		const V3d &nxt = in.poly[(i + 1) % n];
++		const double fc = plane_val(pl, cur);
++		const double fn = plane_val(pl, nxt);
++		const bool ic = fc >= -FC_EPS;
++		const bool inx = fn >= -FC_EPS;
++		if (ic) {
++			if (out.count < 16) {
++				out.poly[out.count++] = cur;
++			}
++		}
++		if (ic != inx) {
++			const double t = fc / (fc - fn);
++			const V3d ip = v_lerp(cur, nxt, t);
++			if (out.count < 16) {
++				out.poly[out.count++] = ip;
++			}
++			if (ncut < 64) {
++				cut[ncut++] = ip;
++			}
++		}
++	}
++}
++
++// Order coplanar cut points into a convex ring (dedup 1e-5, centroid, angular sort). Mirrors _order_ring.
++inline int order_ring(const V3d in[64], int nin, const V3d &normal, V3d out[16]) {
++	V3d uniq[16];
++	int nu = 0;
++	for (int i = 0; i < nin; ++i) {
++		bool dup = false;
++		for (int j = 0; j < nu; ++j) {
++			if (v_len(v_sub(in[i], uniq[j])) < 1.0e-5) {
++				dup = true;
++				break;
++			}
++		}
++		if (!dup && nu < 16) {
++			uniq[nu++] = in[i];
++		}
++	}
++	if (nu < 3) {
++		return 0;
++	}
++	V3d c(0, 0, 0);
++	for (int i = 0; i < nu; ++i) {
++		c.x += uniq[i].x; c.y += uniq[i].y; c.z += uniq[i].z;
++	}
++	c.x /= double(nu); c.y /= double(nu); c.z /= double(nu);
++	V3d t = v_cross(normal, V3d(0, 1, 0)); // normal x UP
++	if (v_len(t) < 1.0e-4) {
++		t = v_cross(normal, V3d(1, 0, 0)); // normal x RIGHT
++	}
++	t = v_normalized(t);
++	const V3d bt = v_normalized(v_cross(normal, t));
++	// angle key per point, then insertion sort ascending (nu <= 16)
++	double ang[16];
++	for (int i = 0; i < nu; ++i) {
++		const V3d d = v_sub(uniq[i], c);
++		ang[i] = std::atan2(v_dot(d, bt), v_dot(d, t));
++	}
++	for (int i = 1; i < nu; ++i) {
++		const V3d kp = uniq[i];
++		const double ka = ang[i];
++		int j = i - 1;
++		while (j >= 0 && ang[j] > ka) {
++			uniq[j + 1] = uniq[j];
++			ang[j + 1] = ang[j];
++			--j;
++		}
++		uniq[j + 1] = kp;
++		ang[j + 1] = ka;
++	}
++	for (int i = 0; i < nu; ++i) {
++		out[i] = uniq[i];
++	}
++	return nu;
++}
++
++} // namespace facet_carve_detail
++
++// Classify the unit CELL at lattice coords (cx,cy,cz) against the 4 ridge planes (mirror cell_seam_state).
++// On STRADDLE, fills out_local[0..out_count-1] with the LOCAL planes [A,B,C,base] (base = own_dist at the
++// (0,0,0) cell corner) — exactly junction_prism_verts' construction. AIR/INTERIOR set out_count = 0.
++inline FacetCellClass facet_cell_state(
++		const FacetCarveParams &p, double cx, double cy, double cz, double out_local[4][4], int &out_count
++) {
++	const double SEAM_EPS = 1.0e-6;
++	out_count = 0;
++	bool any_straddle = false;
++	for (int slot = 0; slot < 4; ++slot) {
++		const double A = p.plane[slot][0];
++		const double B = p.plane[slot][1];
++		const double C = p.plane[slot][2];
++		const double D = p.plane[slot][3];
++		const double base = A * cx + B * cy + C * cz + D;
++		const double lo = base + std::min(0.0, A) + std::min(0.0, B) + std::min(0.0, C);
++		const double hi = base + std::max(0.0, A) + std::max(0.0, B) + std::max(0.0, C);
++		if (hi <= SEAM_EPS) {
++			out_count = 0;
++			return FACET_CELL_AIR; // wholly beyond this ridge -> masked
++		}
++		if (lo < -SEAM_EPS) {
++			out_local[out_count][0] = A;
++			out_local[out_count][1] = B;
++			out_local[out_count][2] = C;
++			out_local[out_count][3] = base;
++			++out_count;
++			any_straddle = true;
++		}
++	}
++	return any_straddle ? FACET_CELL_STRADDLE : FACET_CELL_INTERIOR;
++}
++
++// Fold the unit cube through the `count` local half-spaces, returning the surviving faces (LOCAL u in [0,1]^3).
++// Returns the face count (<= 10); 0 => caller must fall back to the plain cube (never a hole). Mirror of
++// ShapeMesh.build_carve_faces.
++inline int facet_clip_cube(const double local[4][4], int count, FacetCarveFace out[10]) {
++	using namespace facet_carve_detail;
++	CFace cur[16];
++	int ncur = build_unit_cube_faces(cur); // writes 6
++	for (int pi = 0; pi < count; ++pi) {
++		CFace nxt[16];
++		int nnxt = 0;
++		V3d cut[64];
++		int ncut = 0;
++		for (int fi = 0; fi < ncur; ++fi) {
++			CFace clipped;
++			clip_poly(cur[fi], local[pi], clipped, cut, ncut);
++			if (clipped.count >= 3) {
++				if (nnxt >= 16) {
++					return 0; // overflow -> plain cube
++				}
++				nxt[nnxt++] = clipped;
++			}
++		}
++		if (ncut >= 3) {
++			// cut cap points OUT of the solid: -grad normalized
++			V3d cn = v_normalized(V3d(-local[pi][0], -local[pi][1], -local[pi][2]));
++			V3d ring[16];
++			const int nr = order_ring(cut, ncut, cn, ring);
++			if (nr >= 3) {
++				if (nnxt >= 16) {
++					return 0;
++				}
++				CFace cap;
++				for (int k = 0; k < nr; ++k) {
++					cap.poly[k] = ring[k];
++				}
++				cap.count = nr;
++				cap.normal = cn;
++				cap.cube_side = -1;
++				nxt[nnxt++] = cap;
++			}
++		}
++		for (int i = 0; i < nnxt; ++i) {
++			cur[i] = nxt[i];
++		}
++		ncur = nnxt;
++	}
++	int nout = 0;
++	for (int i = 0; i < ncur; ++i) {
++		if (nout >= 10) {
++			return 0; // overflow -> plain cube
++		}
++		FacetCarveFace &f = out[nout++];
++		f.count = cur[i].count;
++		f.normal = Vector3f((float)cur[i].normal.x, (float)cur[i].normal.y, (float)cur[i].normal.z);
++		f.cube_side = cur[i].cube_side;
++		for (int k = 0; k < cur[i].count && k < 16; ++k) {
++			f.pts[k] = Vector3f((float)cur[i].poly[k].x, (float)cur[i].poly[k].y, (float)cur[i].poly[k].z);
++		}
++	}
++	return nout;
++}
++
++// Planar UV for a carve vertex (mirror ShapeMesh._face_uv): near-horizontal face -> (x,z); else (tangent.v, y)
++// with tangent = normalize(normal x UP) (fallback (1,0,0)).
++inline Vector2f facet_face_uv(const Vector3f &v, const Vector3f &n) {
++	if (std::abs(n.y) > 0.5f) {
++		return Vector2f(v.x, v.z);
++	}
++	float tx = -n.z; // (n x (0,1,0)) = (-n.z, 0, n.x)
++	float tz = n.x;
++	const float tl = std::sqrt(tx * tx + tz * tz);
++	if (tl < 1.0e-4f) {
++		tx = 1.0f;
++		tz = 0.0f;
++	} else {
++		tx /= tl;
++		tz /= tl;
++	}
++	return Vector2f(v.x * tx + v.z * tz, v.y);
++}
++
++} // namespace zylann::voxel
++
++#endif // FACET_CARVE_H
+diff --git a/meshers/blocky/voxel_mesher_blocky.cpp b/meshers/blocky/voxel_mesher_blocky.cpp
+index 87ac854..d738785 100644
+--- a/meshers/blocky/voxel_mesher_blocky.cpp
++++ b/meshers/blocky/voxel_mesher_blocky.cpp
+@@ -43,7 +43,9 @@ void generate_mesh(
+ 		const Vector3i block_size,
+ 		const BakedLibrary &library,
+ 		const bool bake_occlusion,
+-		const float baked_occlusion_darkness
++		const float baked_occlusion_darkness,
++		const FacetCarveParams &carve,
++		const Vector3i origin_in_voxels
+ ) {
+ 	// TODO Optimization: not sure if this mandates a template function. There is so much more happening in this
+ 	// function other than reading voxels, although reading is on the hottest path. It needs to be profiled. If
+@@ -181,6 +183,109 @@ void generate_mesh(
+ 					solid_visible_sides_mask |= (1 << side);
+ 				}
+ 
++				// COSMOS FP-CARVE (patch 0004): a straddling carve-sentinel cell is meshed as the unit cube
++				// clipped by its ridge planes (the mesher-side bevel), replacing the whole per-cell pass. It
++				// falls through to the plain-cube pass for interior/air/degenerate/non-sentinel cells, so
++				// carve.enabled=false costs exactly one branch on the hot path (flat byte-identity).
++				if (carve.enabled && voxel_id >= (uint32_t)carve.arid_base &&
++						voxel_id < (uint32_t)(carve.arid_base + carve.arid_count) && model.surface_count > 0) {
++					const double cx = double(origin_in_voxels.x) + double((int)x - VoxelMesherBlocky::PADDING);
++					const double cy = double(origin_in_voxels.y) + double((int)y - VoxelMesherBlocky::PADDING);
++					const double cz = double(origin_in_voxels.z) + double((int)z - VoxelMesherBlocky::PADDING);
++					double clocal[4][4];
++					int pc = 0;
++					const FacetCellClass fcls = facet_cell_state(carve, cx, cy, cz, clocal, pc);
++					if (fcls == FACET_CELL_STRADDLE) {
++						FacetCarveFace cfaces[10];
++						const int fcount = facet_clip_cube(clocal, pc, cfaces);
++						if (fcount > 0) {
++							const BakedModel::Surface &csurf = model.surfaces[0];
++							const uint32_t cmat = csurf.material_id;
++							VoxelMesherBlocky::Arrays &carrays = out_arrays_per_material[cmat];
++							int &cindex_offset = index_offsets[cmat];
++							const Vector3f cpos((float)((int)x - 1), (float)((int)y - 1), (float)((int)z - 1));
++							const Color ccolor = voxel.color;
++							const bool cmirror = (collision_surface != nullptr) && csurf.collision_enabled;
++							for (int fi = 0; fi < fcount; ++fi) {
++								const FacetCarveFace &face = cfaces[fi];
++								if (face.count < 3) {
++									continue;
++								}
++								// Axis faces cull with the plain cube's own visible-sides mask (B9 side map);
++								// the tilted cut cap (cube_side < 0) is always emitted (its outer neighbour is
++								// masked air, so godot_voxel never culls it).
++								if (face.cube_side >= 0 &&
++										((solid_visible_sides_mask >> face.cube_side) & 1u) == 0) {
++									continue;
++								}
++								const unsigned int nverts = (unsigned int)face.count;
++								// One tangent per face from the fan's first triangle (generate_tangents_from_uvs
++								// math) replicated per vertex, so tangents.size() == 4 * positions.size() (B1).
++								float tgt[4] = { 1.f, 0.f, 0.f, 1.f };
++								{
++									const Vector2f uv0 = facet_face_uv(face.pts[0], face.normal);
++									const Vector2f uv1 = facet_face_uv(face.pts[1], face.normal);
++									const Vector2f uv2 = facet_face_uv(face.pts[2], face.normal);
++									const float duv1x = uv1.x - uv0.x, duv1y = uv1.y - uv0.y;
++									const float duv2x = uv2.x - uv0.x, duv2y = uv2.y - uv0.y;
++									const Vector3f dp1 = face.pts[1] - face.pts[0];
++									const Vector3f dp2 = face.pts[2] - face.pts[0];
++									const float det = duv1x * duv2y - duv1y * duv2x;
++									if (std::abs(det) > 1.0e-12f) {
++										const float r = 1.0f / det;
++										const Vector3f t((dp1.x * duv2y - dp2.x * duv1y) * r,
++												(dp1.y * duv2y - dp2.y * duv1y) * r,
++												(dp1.z * duv2y - dp2.z * duv1y) * r);
++										const Vector3f bt((dp2.x * duv1x - dp1.x * duv2x) * r,
++												(dp2.y * duv1x - dp1.y * duv2x) * r,
++												(dp2.z * duv1x - dp1.z * duv2x) * r);
++										const Vector3f nc(face.normal.y * t.z - face.normal.z * t.y,
++												face.normal.z * t.x - face.normal.x * t.z,
++												face.normal.x * t.y - face.normal.y * t.x);
++										const float w =
++												(bt.x * nc.x + bt.y * nc.y + bt.z * nc.z) < 0.f ? -1.f : 1.f;
++										tgt[0] = t.x;
++										tgt[1] = t.y;
++										tgt[2] = t.z;
++										tgt[3] = w;
++									}
++								}
++								for (unsigned int i = 0; i < nverts; ++i) {
++									carrays.positions.push_back(face.pts[i] + cpos);
++									carrays.normals.push_back(face.normal);
++									carrays.uvs.push_back(facet_face_uv(face.pts[i], face.normal));
++									carrays.colors.push_back(ccolor);
++									carrays.tangents.push_back(tgt[0]);
++									carrays.tangents.push_back(tgt[1]);
++									carrays.tangents.push_back(tgt[2]);
++									carrays.tangents.push_back(tgt[3]);
++								}
++								for (unsigned int i = 1; i + 1 < nverts; ++i) {
++									carrays.indices.push_back(cindex_offset + 0);
++									carrays.indices.push_back(cindex_offset + (int)i);
++									carrays.indices.push_back(cindex_offset + (int)i + 1);
++								}
++								if (cmirror) {
++									for (unsigned int i = 0; i < nverts; ++i) {
++										collision_surface->positions.push_back(face.pts[i] + cpos);
++									}
++									for (unsigned int i = 1; i + 1 < nverts; ++i) {
++										collision_surface->indices.push_back(collision_surface_index_offset + 0);
++										collision_surface->indices.push_back(collision_surface_index_offset + (int)i);
++										collision_surface->indices.push_back(
++												collision_surface_index_offset + (int)i + 1);
++									}
++									collision_surface_index_offset += (int)nverts;
++								}
++								cindex_offset += (int)nverts;
++							}
++							continue; // cell fully handled by the carve
++						}
++					}
++					// AIR (defensive), INTERIOR, or a degenerate clip -> fall through to the plain-cube pass
++					// (the sentinel IS a plain cube model). Never a hole.
++				}
++
+ 				// Waterlogged voxels render BOTH their solid (pass 0) and a fluid (pass 1).
+ 				// Regular models and pure fluids run a single pass. The long emission block
+ 				// below is unchanged; it is merely wrapped in this pass loop, reading the
+@@ -693,6 +798,97 @@ Vector3 VoxelMesherBlocky::cosmos_debug_place(double vx, double vy, double vz) c
+ 	return Vector3(1.0e18, 1.0e18, 1.0e18); // wedge sentinel (matches CosmosTruePlace._WEDGE)
+ }
+ 
++// COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md, patch 0004): install/clear the frozen-per-crossing facet
++// carve blob. `d` = {enabled, planes:PackedFloat64Array(16), arid_base, arid_count}. Written under the write
++// lock so mesh workers pick up the whole blob atomically via their build() snapshot; the push happens INSIDE
++// module_world set_facet BEFORE restream() (B7), so no in-flight block ever meshes with a stale facet.
++void VoxelMesherBlocky::set_facet_carve(Dictionary d) {
++	FacetCarveParams fc;
++	fc.enabled = bool(d.get("enabled", false));
++	if (fc.enabled) {
++		fc.arid_base = int(d.get("arid_base", 0));
++		fc.arid_count = int(d.get("arid_count", 0));
++		const PackedFloat64Array planes = d.get("planes", PackedFloat64Array());
++		for (int s = 0; s < 4; ++s) {
++			for (int k = 0; k < 4; ++k) {
++				if (s * 4 + k < planes.size()) {
++					fc.plane[s][k] = planes[s * 4 + k];
++				}
++			}
++		}
++	}
++	RWLockWrite wlock(_parameters_lock);
++	_parameters.facet_carve = fc;
++}
++
++Dictionary VoxelMesherBlocky::get_facet_carve() const {
++	FacetCarveParams fc;
++	{
++		RWLockRead rlock(_parameters_lock);
++		fc = _parameters.facet_carve;
++	}
++	Dictionary d;
++	d["enabled"] = fc.enabled;
++	d["arid_base"] = fc.arid_base;
++	d["arid_count"] = fc.arid_count;
++	PackedFloat64Array planes;
++	planes.resize(16);
++	{
++		double *w = planes.ptrw();
++		for (int s = 0; s < 4; ++s) {
++			for (int k = 0; k < 4; ++k) {
++				w[s * 4 + k] = fc.plane[s][k];
++			}
++		}
++	}
++	d["planes"] = planes;
++	return d;
++}
++
++Dictionary VoxelMesherBlocky::facet_carve_debug_cell(int x, int y, int z) const {
++	FacetCarveParams fc;
++	{
++		RWLockRead rlock(_parameters_lock);
++		fc = _parameters.facet_carve;
++	}
++	Dictionary d;
++	PackedVector3Array verts;
++	PackedVector3Array normals;
++	PackedVector2Array uvs;
++	PackedInt32Array indices;
++	double clocal[4][4];
++	int pc = 0;
++	const FacetCellClass fcls = facet_cell_state(fc, double(x), double(y), double(z), clocal, pc);
++	d["class"] = int(fcls);
++	if (fcls == FACET_CELL_STRADDLE) {
++		FacetCarveFace cfaces[10];
++		const int fcount = facet_clip_cube(clocal, pc, cfaces);
++		for (int fi = 0; fi < fcount; ++fi) {
++			const FacetCarveFace &face = cfaces[fi];
++			if (face.count < 3) {
++				continue;
++			}
++			const int base = verts.size();
++			for (int i = 0; i < face.count; ++i) {
++				verts.push_back(Vector3(face.pts[i].x, face.pts[i].y, face.pts[i].z));
++				normals.push_back(Vector3(face.normal.x, face.normal.y, face.normal.z));
++				const Vector2f uv = facet_face_uv(face.pts[i], face.normal);
++				uvs.push_back(Vector2(uv.x, uv.y));
++			}
++			for (int i = 1; i + 1 < face.count; ++i) {
++				indices.push_back(base + 0);
++				indices.push_back(base + i);
++				indices.push_back(base + i + 1);
++			}
++		}
++	}
++	d["verts"] = verts;
++	d["normals"] = normals;
++	d["uvs"] = uvs;
++	d["indices"] = indices;
++	return d;
++}
++
+ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
+ 	const VoxelBuffer::ChannelId channel = VoxelBuffer::CHANNEL_TYPE;
+ 	Parameters params;
+@@ -788,7 +984,9 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
+ 						block_size,
+ 						library_baked_data,
+ 						params.bake_occlusion,
+-						baked_occlusion_darkness
++						baked_occlusion_darkness,
++						params.facet_carve,
++						input.origin_in_voxels
+ 				);
+ 				if (input.lod_index > 0) {
+ 					blocky::append_skirts(raw_channel, block_size, arrays_per_material, library_baked_data);
+@@ -804,7 +1002,9 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
+ 						block_size,
+ 						library_baked_data,
+ 						params.bake_occlusion,
+-						baked_occlusion_darkness
++						baked_occlusion_darkness,
++						params.facet_carve,
++						input.origin_in_voxels
+ 				);
+ 				if (input.lod_index > 0) {
+ 					blocky::append_skirts(model_ids, block_size, arrays_per_material, library_baked_data);
+@@ -1065,6 +1265,11 @@ void VoxelMesherBlocky::_bind_methods() {
+ 	ClassDB::bind_method(
+ 			D_METHOD("cosmos_debug_place", "vx", "vy", "vz"), &VoxelMesherBlocky::cosmos_debug_place);
+ 
++	ClassDB::bind_method(D_METHOD("set_facet_carve", "params"), &VoxelMesherBlocky::set_facet_carve);
++	ClassDB::bind_method(D_METHOD("get_facet_carve"), &VoxelMesherBlocky::get_facet_carve);
++	ClassDB::bind_method(
++			D_METHOD("facet_carve_debug_cell", "x", "y", "z"), &VoxelMesherBlocky::facet_carve_debug_cell);
++
+ 	ClassDB::bind_method(D_METHOD("set_occlusion_enabled", "enable"), &VoxelMesherBlocky::set_occlusion_enabled);
+ 	ClassDB::bind_method(D_METHOD("get_occlusion_enabled"), &VoxelMesherBlocky::get_occlusion_enabled);
+ 
+diff --git a/meshers/blocky/voxel_mesher_blocky.h b/meshers/blocky/voxel_mesher_blocky.h
+index 261138e..41b04ac 100644
+--- a/meshers/blocky/voxel_mesher_blocky.h
++++ b/meshers/blocky/voxel_mesher_blocky.h
+@@ -6,6 +6,7 @@
+ #include "../../util/thread/rw_lock.h"
+ #include "../voxel_mesher.h"
+ #include "cosmos_bake.h"
++#include "facet_carve.h"
+ #include "voxel_blocky_library_base.h"
+ 
+ #include <vector>
+@@ -57,6 +58,17 @@ public:
+ 	// C++ == place_true, catching transcription typos without reading RID block meshes. Cheap, test-only.
+ 	Vector3 cosmos_debug_place(double vx, double vy, double vz) const;
+ 
++	// COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md, patch 0004): install/clear the frozen-per-crossing facet
++	// carve blob. `params_dict` = {enabled:bool, planes:PackedFloat64Array(16), arid_base:int, arid_count:int}
++	// (empty/enabled=false => plain flat mesher, byte-identical). has_method-guarded on the game side (B12).
++	void set_facet_carve(Dictionary params_dict);
++	Dictionary get_facet_carve() const;
++
++	// COSMOS FP-CARVE gate hook (mirror of cosmos_debug_place): classify one cell (lattice x,y,z) with the
++	// snapshotted carve params, clip it, and return {class:int, verts, normals, uvs, indices} in ShapeMesh
++	// dict layout — lets verify_facet_carve_cpp assert the compiled clip == ShapeMesh.build_carve_faces.
++	Dictionary facet_carve_debug_cell(int x, int y, int z) const;
++
+ 	// TODO GDX: Resource::duplicate() cannot be overriden (while it can in modules).
+ 	// This will lead to performance degradation and maybe unexpected behavior
+ #if defined(ZN_GODOT)
+@@ -112,6 +124,7 @@ private:
+ 		uint8_t shadow_occluders_mask = 0;
+ 		Ref<VoxelBlockyLibraryBase> library;
+ 		CosmosBakeParams cosmos; // COSMOS R2.1: near-field true-position bake (disabled by default)
++		FacetCarveParams facet_carve; // COSMOS FP-CARVE: per-facet junction bevels (disabled by default)
+ 	};
+ 
+ 	struct Cache {

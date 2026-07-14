@@ -72,6 +72,20 @@ func _ready() -> void:
 	perf.name = "PerfHUD"
 	add_child(perf)
 
+	# REMOTE-PLAY BRIDGE (Phase 1, observe-only). Created ONLY when dial mode is detected —
+	# `?remote=<token>` in the page URL on web, or the VOXIVERSE_REMOTE_TOKEN env var natively.
+	# With no token, dial_config() returns {} and NO bridge node exists: no WebSocket, no frame
+	# capture, no per-frame cost — the public site is byte-identical and streams nothing. See
+	# net/remote_bridge.gd for the security model.
+	var dial := RemoteBridge.dial_config()
+	if not dial.is_empty():
+		var bridge := RemoteBridge.new()
+		bridge.name = "RemoteBridge"
+		bridge.configure(dial)
+		bridge.world = world
+		bridge.player = player
+		add_child(bridge)
+
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look

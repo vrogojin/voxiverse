@@ -1,0 +1,6 @@
+# Remote-play bridge relay — NEVER commit the secret, deps, or received data.
+.token
+node_modules/
+package-lock.json
+results/
+*.log

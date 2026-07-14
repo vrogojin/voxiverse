@@ -19,17 +19,25 @@ at every sub-stage.
 
 ## 0. Executive verdict (decisions up front)
 
-1. **Live-terrain population: Z1-hybrid** (§3). Steady state = **1 active full-res terrain
-   + 1 live full-res neighbour** (the imminent-crossing facet by `own_dist`, spawned inside
-   `POOL_D_WARM` = 96 as today), plus **a second live neighbour ONLY when a second ridge is
-   within `POOL_D_WARM2 := 48`** (the corner approach). Every other facet is a FacetLodMesher
-   mesh (or the quad). Worst-case concurrent generation volume drops from FP-M1c's
-   ≈ 2.1× single-terrain to ≈ 1.56× (corner) / 1.28× (steady walking) — the throughput fix —
-   while the shipped invariant "the ridge you are about to cross is full-res on both sides,
-   `redesignate` always hits the pool on the walking path" is preserved. Strict Z0
-   (zero live neighbours, promote-at-cross) is rejected: it saves only the last 0.28× and
-   pays a promote-latency window + LOD-rendered ground under the player's feet at the exact
-   place users test (§3.3).
+1. **Live-terrain population: Z1-hybrid as the steady-state CEILING of a ladder** (§3).
+   Every facet sits on a representation ladder — quad → ℓ3 → ℓ2 → ℓ1 → live full-res
+   terrain — and **climbs it only as fast as measured main-thread headroom allows**
+   (the §6.5 load-adaptive controller; the user's directive: "constantly measuring main
+   thread load … never overload the main thread"). The SSE selector + pool policy set each
+   facet's *target rung*; the controller sets the *pace*. The targets converge, with ample
+   headroom, to: **1 active full-res terrain + 1 live full-res neighbour** (the
+   imminent-crossing facet by `own_dist`, target-live inside `POOL_D_WARM` = 96 as today),
+   plus **a second live neighbour ONLY when a second ridge is within
+   `POOL_D_WARM2 := 48`** (the corner approach). Every other facet's ladder tops out at a
+   FacetLodMesher tier (or the quad). Worst-case concurrent generation volume drops from
+   FP-M1c's ≈ 2.1× single-terrain to ≈ 1.56× (corner) / 1.28× (steady walking) — the
+   throughput fix — while the shipped invariant "the ridge you are about to cross is
+   full-res on both sides, `redesignate` always hits the pool on the walking path" is
+   preserved. Strict Z0 (zero live neighbours, promote-at-cross) is rejected as a
+   *ceiling*: it saves only the last 0.28× and pays a promote-latency window +
+   LOD-rendered ground under the player's feet at the exact place users test (§3.3) —
+   though under sustained overload the controller's pace naturally *behaves* Z0-ward
+   (holds a neighbour at a coarse rung longer) without ever stalling a frame.
 2. **Build pipeline: one persistent background GDScript `Thread`** (§4) running the
    *productized* FP-R0 probe recipe — per-facet frozen generator
    (`_make_generator(fid, lod_probe=true)`, `module_world.gd:2171`) →
@@ -55,12 +63,21 @@ at every sub-stage.
    progressive refinement (first cover ≤ ~2 s at ℓ3, refined toward the granted tier when
    the build queue is idle). The selector can *request* anything; only the budgeter
    *allocates* (REVIEW risk #4).
-6. **Crossing = promote/demote choreography over the existing `redesignate`** (§9): the ONE
+6. **The budgeter is a CLOSED-LOOP controller on measured main-thread load** (§6.5), not a
+   fixed schedule. Measured signal: EMA + worst-in-window of the main-thread frame cost
+   (the PerfHUD's `proc`/`worst` monitors) with the live `vox_gen`/`vox_mesh` backlogs as
+   feed-forward. Setpoint: worst frame ≤ `CTRL_FRAME_BUDGET_MS := 18` ms with margin.
+   Control action: a per-tick admission credit ∈ [0, 1] that scales how much NEW work is
+   admitted — LOD apply-ms, build-job grants, the pool terrains' view-ramp rate, and
+   live-terrain promote admission — down to zero under load, recovering when headroom
+   returns. Promotions, once granted, are paced but never yanked (anti-oscillation, §6.5.4).
+   NEVER-OOM memory caps stay hard and controller-independent.
+7. **Crossing = promote/demote choreography over the existing `redesignate`** (§9): the ONE
    `PlanetRoot.transform` write moves every LOD mesh rigidly (they are facet-anchored
    children); zero LOD rebuilds at a crossing (gate-asserted by a build counter). Promote
    keeps the facet's LOD mesh until the live terrain's seam band is meshed; demote builds
    the LOD mesh *before* retiring the terrain. Both directions are hole-free.
-7. Everything behind **`CubeSphere.FP_M2_LOD := false`** (requires FACETED + FP_M1_POOL);
+8. Everything behind **`CubeSphere.FP_M2_LOD := false`** (requires FACETED + FP_M1_POOL);
    committed OFF, flipped by sed at export (the established deploy pattern). Module render
    path only; the GDScript fallback keeps ChunkStreamer/ChunkMesher + quads, untouched.
    FLAT and curved non-faceted paths byte-identical at every stage. emsdk stays 3.1.64.
@@ -235,6 +252,34 @@ half-bands, not full facets: worst pool volume ≈ 1.56 V vs ≈ 2.1 V shipped �
 **zero** (they are LOD meshes on the builder thread). The `vox_gen` backlog target in the
 FP-M2e gate is **≤ 300 sustained** during a border approach (vs 1500–2800 measured).
 
+### 3.5 The ladder reframe: Z-modes are ceilings, the controller is the pace
+
+Z0/Z1/hybrid are not mode switches — they are **steady-state ceilings on a per-facet
+representation ladder**:
+
+```
+quad (ℓ=∞) → ℓ3 → ℓ2 → ℓ1 → live terrain @48 → @96 (imminent) → @128 (active)
+```
+
+Two orthogonal authorities govern movement on the ladder:
+
+- **Target rung** (WHAT the facet should be): the SSE selector (§6.1) for the LOD rungs;
+  the Z1-hybrid pool policy (§3.2) for the live rungs. Targets are pure geometry/camera
+  functions — deterministic, load-independent.
+- **Climb pace** (WHEN it gets there): the §6.5 load-adaptive controller. Every upward
+  move — a finer-ℓ build grant, a live spawn, a view-ramp growth step — is *admitted* only
+  against measured main-thread headroom. Under sustained load a neighbour holds at ℓ2/ℓ1
+  (or a live terrain holds its current view radius) instead of stalling the frame; when
+  headroom returns, the climb resumes. Downward moves (demote, retire, view shrink) are
+  cheap unloads and are never load-throttled.
+
+The throughput arithmetic of §3.1–3.4 is unchanged — it describes the converged state
+with ample headroom. What the reframe adds is the guarantee *during* convergence: the
+system is never committed to a schedule the main thread cannot afford this second, on
+this machine. A full-res promotion is granted only when BOTH the pool policy demands it
+(imminent/corner-second) AND the controller reports sustained headroom
+(`CTRL_PROMOTE_SUSTAIN_S`, §6.5); once granted it is paced, not cancelled (§6.5.4).
+
 ---
 
 ## 4. The off-terrain build pipeline
@@ -353,7 +398,9 @@ var _build_count := 0         # diagnostics: total tile builds (G-M2-XPD asserts
 # ---- API (all main-thread unless noted) ----
 func setup(module_world) -> bool          # library + generator factory hookup; starts thread
 func set_camera(cam: Camera3D) -> void    # selector input (fov, viewport_h, position)
-func tick() -> void                       # selector + budgeter + apply, per frame
+func set_load_controller(c) -> void       # StreamLoadController (§6.5): credit scales
+                                          # apply-ms + grants; promote gate consults it
+func tick() -> void                       # selector + budgeter(×credit) + apply, per frame
 func want(fid: int, lod: int) -> void     # selector-internal request (never allocates)
 func covered_fids() -> Array              # for the far-ring exclusion merge (§5.5)
 func on_promote(fid: int) -> void         # §9.1: keep mesh until terrain seam band meshed
@@ -401,7 +448,7 @@ in both the ring's emitted set and the covered set after a `force_rebuild()`.
 
 ---
 
-## 6. Selector (screen-space error) + budgeter (request-grant)
+## 6. Selector (screen-space error) + budgeter (request-grant) + the load-adaptive controller
 
 ### 6.1 The one rule
 
@@ -464,6 +511,86 @@ Per `tick()`:
 
 The ms/col estimate is self-calibrating: seeded from the FP-R0 numbers, updated by an EWMA
 of actual job times (so WASM/native and fast/slow machines converge without config).
+
+### 6.5 The load-adaptive admission controller (closed loop, first-class)
+
+The budgeter's per-tick grant volume is not a fixed const — it is the control action of a
+**closed-loop controller on measured main-thread load** (the user's directive: replace
+low-res neighbour terrain with high-res *gradually*, "constantly measuring main thread
+load and ensuring we're not saturating"). One small shared class,
+`godot/src/world/stream_load_controller.gd` (`class_name StreamLoadController`), owned by
+WorldManager, read by FacetLodMesher (grants + applies) and module_world (ramp pace).
+
+**6.5.1 Measured signal** (all already surfaced by the PerfHUD / module stats — no new
+instrumentation class):
+
+- `frame_ema` — EMA (half-life ≈ 0.5 s) of the main-thread frame cost:
+  `Performance.TIME_PROCESS` + `TIME_PHYSICS_PROCESS` (the PerfHUD's `proc`/`phys`).
+- `frame_worst` — worst actual frame delta over a sliding `CTRL_WINDOW_FRAMES := 30`
+  window (the PerfHUD's `worst`). The binding signal: jerk is a worst-frame phenomenon.
+- Feed-forward: the voxel engine task backlogs (`vox_gen`, `vox_mesh`) and the engine's
+  main-thread apply spend, from the same `VoxelEngine`/terrain statistics the HUD logs.
+  Backlog is not main-thread cost *yet* — it is the queue that will become long
+  mesh-apply trains and starved active-facet streaming — so it gates *generation-producing*
+  admissions specifically (below).
+
+**6.5.2 Setpoint.** `CTRL_FRAME_BUDGET_MS := 18.0` on `frame_worst` (hold ≥ ~55 fps with
+margin), evaluated every `CTRL_TICK_S := 0.25` s. Headroom
+`H = CTRL_FRAME_BUDGET_MS − frame_worst_ema` (EMA'd so a single spike is noise, §6.5.4).
+
+**6.5.3 Control action — one scalar credit, four admission surfaces.** The controller
+maintains `credit ∈ [0, 1]` by AIMD: multiplicative decrease on overload
+(`frame_worst_ema > setpoint` → `credit ×= 0.5`, floor 0), additive increase under
+headroom (`credit += 0.1` per tick, cap 1) — bounded, anti-windup by construction
+(the clamp; paused ticks accumulate no debt). Credit scales, downward only from the hard
+consts:
+
+1. **LOD apply budget**: `LOD_APPLY_BUDGET_MS × credit` ms/frame (0 → applies pause,
+   finished meshes wait in the done-queue — bounded, they are already built).
+2. **Build-job grants**: grants admitted per tick = `ceil(2 × credit)`; at credit 0 the
+   budgeter stops enqueueing (the builder finishes in-flight tiles and idles).
+3. **Pool view-ramp pace**: module_world gains `set_stream_pace(f: float)`; the FP-M1c
+   per-slot ramp (`_ramp_pool_step`, `module_world.gd:373-402`) multiplies its per-frame
+   step by `f` — `RAMP_SECONDS` becomes the *minimum* ramp duration, stretched under load,
+   ramp fully held at 0. Shrinks (unloads) are never throttled.
+4. **Promote admission**: a live-terrain spawn (or a finer-ℓ grant for an already-covered
+   facet) additionally requires `credit ≥ 0.5` sustained for `CTRL_PROMOTE_SUSTAIN_S :=
+   1.5` s — promotions start only into real headroom.
+
+Plus the feed-forward gate: while `vox_gen backlog > CTRL_BACKLOG_MAX := 300` (the same
+number as the M2e definition of done), surfaces 3 and 4 are held at zero regardless of
+frame time — new full-res volume is never admitted onto a pool that has not drained,
+which is verbatim the user's "keep the pace of streaming of the neighbour chunks such
+that we never overload". Surfaces 1–2 (builder-thread work) stay frame-time-governed
+only; they do not touch the pool.
+
+**6.5.4 Stability (no promote/demote oscillation).**
+
+- All decisions read EMA'd signals on the 0.25 s tick — one bad frame moves nothing.
+- **A granted promotion is never yanked.** A spawning terrain or in-flight build finishes
+  at reduced pace (down to held-at-zero), it is not cancelled/retired by load. The only
+  load-driven *demotion* trigger is sustained overload ≥ `CTRL_OVERLOAD_SUSTAIN_S := 3.0`
+  s at credit 0, and even then the response is ordered pause-first: hold all climbs →
+  (if still saturated) demote the least-wanted LOD facet one tier — live terrains are
+  never retired by the controller (pool retirement stays purely geometric, §3.2/§9.2).
+- SSE-driven re-tiers keep their own hysteresis (§6.3); the two loops act on different
+  inputs (camera vs load) and only ever *lower* each other's admissions, so they cannot
+  chase each other upward.
+
+**6.5.5 Interaction with `voxel/threads/main/time_budget_ms = 6`.** The engine's apply
+budget bounds how much the engine spends *draining its own queues* per frame; it stays 6
+and is not touched. The controller sits ABOVE it: it governs how much NEW work is
+admitted (grants, ramp growth, LOD applies) so the engine's queues never grow to where
+the 6 ms drain is saturated for long stretches. No double-counting: the controller's
+measured signal is the TOTAL main-thread frame cost, which already *includes* the ≤ 6 ms
+apply spend — when applies eat the frame, credit falls and admissions stop, which is the
+correct composed behaviour, not a conflict.
+
+**6.5.6 Scope.** The controller governs CPU/main-thread saturation ONLY. The NEVER-OOM
+ledgers (§11) are hard, independent, and checked *after* the controller: full credit can
+never admit past a memory cap, and zero credit never exempts eviction. Flag-gated with
+FP_M2_LOD; with the flag off, `set_stream_pace` is never called and the shipped fixed
+ramp is byte-identical.
 
 ---
 
@@ -561,8 +688,11 @@ says it is needed.
 
 ### 9.1 Promote (LOD → live terrain)
 
-Trigger: the pool policy elects fid (imminent / corner-2nd, §3.2) → `pool_spawn(fid)`
-(`module_world.gd:1444-1463`, unchanged: view 48→96 ramp). NEW choreography:
+Trigger: the pool policy elects fid (imminent / corner-2nd, §3.2) AND the load controller
+admits it (credit ≥ 0.5 sustained + backlog gate, §6.5.3.4) → `pool_spawn(fid)`
+(`module_world.gd:1444-1463`, unchanged: view 48→96 ramp, now paced by
+`set_stream_pace`). The D_WARM lead (≥ 10 s walking) is what gives the controller room to
+defer a spawn through a load spike without missing the crossing. NEW choreography:
 
 - The facet's LOD mesh **stays visible** while the terrain streams (they overlap; megablock
   tops may poke ≤ s−1 through fresh full-res — a transient, milder than the hole today's
@@ -601,6 +731,18 @@ mesh, or quad — plus at most one *overlapping transient* during a promote/demo
 bounded by the 20 s timeouts. G-M2-XPD asserts the state machine: no facet ever quad-only
 while pooled, never LOD+quad simultaneously emitted, object counts return to baseline
 after a promote/demote cycle (the anti-leak pattern from G-M1-POOL).
+
+### 9.4 Controller synergy: the crossing is a small delta, not a burst
+
+Because the imminent neighbour has been climbing the ladder under the controller since it
+entered D_WARM (LOD mesh → live @48 → ramping toward 96, each step admitted against real
+headroom), by the time the player reaches the ridge the facet is already at or near its
+view-96 rung. The crossing's `redesignate` then adds only the 96→128 delta annulus —
+itself paced by the same `set_stream_pace` surface — so the promote step at the crossing
+is the *smallest* increment on the ladder rather than the largest. This is the closed-loop
+generalization of the FP-M1c ramp insight: FP-M1c spread the burst over fixed time; the
+controller spreads it over measured headroom, which on a fast idle machine converges
+faster than 1.5 s-per-leg and on a saturated 4-core web tab stretches instead of jerking.
 
 ---
 
@@ -673,6 +815,16 @@ FP_M1_POOL + FP_M2_LOD, exit 0/1) + extensions to `verify_faceted.gd`. Inventory
   approach == 2 (both < 48); diagonal never live; switch margin honoured (no incumbent
   thrash in a diagonal-walk sweep); with `FP_M2_LOD` off, policy byte-matches FP-M1c
   (the shipped G-M1-POOL gate re-run unchanged).
+- **G-M2-CTRL (the closed loop)**: headless, with a synthetic main-thread load injector
+  (busy-wait raising frame cost above/below the setpoint on a square wave) and a
+  synthetic backlog feed: (a) credit falls to 0 within ≤ 4 ticks of sustained overload
+  and admissions (applies, grants, ramp pace, promotes) measurably stop; (b) credit
+  recovers and admissions resume after load removal; (c) under square-wave load the
+  grant/pace trace shows NO promote→demote→promote cycle — a granted promotion completes
+  (paced) across the load pulses; (d) the backlog gate holds surfaces 3–4 at zero while
+  `vox_gen > CTRL_BACKLOG_MAX` even at full frame headroom; (e) at credit == 1 the NEVER-OOM
+  ledgers still bind (a request storm cannot exceed caps regardless of controller state);
+  (f) flag-off: `set_stream_pace` never called, ramp timing byte-matches FP-M1c.
 - **Ledger asserts**: `LOD_FLOOR_Y` large-sample min-height bound (beside the
   MAX_SURFACE_Y assert); all §5 consts present and within the §11 ledger.
 - **Unconditional**: FLAT `verify_feature` **6027/0** every sub-stage; `verify_faceted`
@@ -696,22 +848,29 @@ slope, no console storms, no blank) + the stage-specific soak named below.
   (ring-1 → ℓ1, ring-2 → ℓ2, else ℓ3) — no SSE yet. Replaces quads for covered facets.
   **Gate:** G-M2-CAPS, G-M2-FRAME, G-M2-SEAM headless; live deploy (flag flipped at
   export): megablock detail visible on ≥ 3 facets at a ridge, heap-flat soak.
-- **FP-M2c — SSE selector + budgeter.** §6 in full: camera input, hysteresis,
-  request-grant, progressive refinement, idle demote, `facet_of_dir` stub + off-surface
-  spawn freeze. **Gate:** G-M2-SEL, G-M2-DIR, G-M2-CAPS re-run under the selector (the
+- **FP-M2c — SSE selector + budgeter + the load controller core.** §6 in full: camera
+  input, hysteresis, request-grant, progressive refinement, idle demote, `facet_of_dir`
+  stub + off-surface spawn freeze; `StreamLoadController` (§6.5) with surfaces 1–2 wired
+  (apply-ms + grants — the LOD-side loop closes here). **Gate:** G-M2-SEL, G-M2-DIR,
+  G-M2-CTRL(a–c, e–f for surfaces 1–2), G-M2-CAPS re-run under the selector (the
   telescope burst now organic); live fly-hack altitude soak holds frame rate with tiers
   visibly re-selecting.
-- **FP-M2d — pool integration (the Z1-hybrid) + promote/demote.** §3 policy in
-  WorldManager (`_pool_policy` rework: imminent-winner + D_WARM2 + switch margin),
-  §9 choreography wired into `pool_spawn`/`pool_retire`/`redesignate` call sites.
-  **Gate:** G-M2-POLICY, G-M2-XPD, G-M2-SEAM live seam soak; scripted sprint crossing on
-  live web — PerfHUD max frame ≤ 50 ms, `is_area_meshed` B-core at commit, no `facet
-  cross` storms, pool-miss count 0.
+- **FP-M2d — pool integration (the Z1-hybrid) + promote/demote + controller surfaces 3–4.**
+  §3 policy in WorldManager (`_pool_policy` rework: imminent-winner + D_WARM2 + switch
+  margin), §9 choreography wired into `pool_spawn`/`pool_retire`/`redesignate` call
+  sites, `module_world.set_stream_pace` + the promote admission gate + the backlog
+  feed-forward (§6.5.3.3–4). **Gate:** G-M2-POLICY, G-M2-XPD, G-M2-CTRL in full
+  (incl. (d) and the ramp-pace surface), G-M2-SEAM live seam soak; scripted sprint
+  crossing on live web — PerfHUD max frame ≤ 50 ms, `is_area_meshed` B-core at commit,
+  no `facet cross` storms, pool-miss count 0.
 - **FP-M2e — memory A/B + walk-the-planet + default-ON.** The §11 browser-heap A/B
   (FP-M1c baseline vs FP-M2), a ≥ 30-min walk crossing ≥ 6 seams incl. a cube-edge seam
   and a corner, telemetry: **`vox_gen` backlog ≤ 300 sustained during border approach**
   (the milestone's definition of done — vs 1500–2800 measured), `proc` bursts ≤ 100 ms,
-  LOD stats within caps throughout. Then the sed-at-export flip ships FP_M2_LOD ON
+  **worst-frame histogram ≤ `CTRL_FRAME_BUDGET_MS` for ≥ 99% of frames** (the controller's
+  live proof, sampled by the PerfHUD alongside the credit trace), LOD stats within caps
+  throughout. Run once on a ≤ 4-core machine — the controller must degrade pace there,
+  not frame rate. Then the sed-at-export flip ships FP_M2_LOD ON
   (FACETED + FP_M1_POOL + FP_M2_LOD), repo consts stay OFF.
 
 Every stage exits through the §12 unconditional gates. Revert at any stage = the flag
@@ -761,6 +920,20 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
 9. **Edits invisible at LOD** (a demoted facet "heals" its craters from a distance). By
    design (§5.3, the FarTerrain ADR precedent) — but it must be SAID to the user before
    default-ON, not discovered. Listed in the M2e A/B sign-off notes.
+10. **Controller pathologies.** (a) *Starvation by chronic overload*: on a machine that
+    never has headroom, credit pins at 0 and the imminent neighbour never goes live — the
+    crossing then rides the pool-miss ladder (spawn-at-cross behind an existing LOD mesh,
+    §9.1) — degraded but hole-free and honest: that machine could not have afforded the
+    live neighbour anyway. Gated on the ≤ 4-core M2e run. (b) *Measurement pollution*:
+    the controller's own apply work raises the very signal it reads — bounded because the
+    apply surface is credit-scaled (a shrinking fraction of a shrinking budget converges,
+    it cannot self-oscillate past the AIMD floor); G-M2-CTRL(c)'s square-wave trace is
+    the regression net. (c) *Signal aliasing with GC/browser jank*: an unrelated 200 ms
+    browser pause reads as overload and pauses climbs for a few ticks — the correct
+    conservative response; only *sustained* misreads would matter, and those ARE load.
+    (d) *Fighting the FP-M1c one-slot-per-frame ramp serializer*: it composes — the
+    serializer bounds WHICH slot grows per frame, the pace scalar bounds HOW MUCH; both
+    only reduce work; asserted byte-identical at flag-off (G-M2-CTRL(f)).
 
 ---
 
@@ -774,3 +947,4 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
 | 4 | Junction sentinels at every ridge cell | **Scoped** — ℓ0/live only; ℓ>0 uses uniform conservative erosion (`cell_interior_scaled`), no sentinels |
 | 5 | ℓ0 as a LOD-mesh tier (REVIEW §6.3 sketch) | **Rejected** — full-res is exclusively the live-terrain representation; the LOD floor is ℓ1 |
 | 6 | FP-M2 tier reach | ℓ∈{1..3} + quad; ℓ∈{4,5} + zoom input + distant-planet math are FP-M3 (machinery ready) |
+| 7 | Fixed-schedule streaming pace (FP-M1c `RAMP_SECONDS` legs, fixed const budgets) | **Superseded** — closed-loop admission on measured main-thread load (§6.5); `RAMP_SECONDS` becomes the *minimum* leg duration, stretched (never compressed below it) by the controller; fixed consts remain as the hard upper bounds the credit scales within |

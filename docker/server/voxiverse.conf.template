@@ -78,6 +78,24 @@ server {
         try_files $uri $uri/ =404;
     }
 
+    # --- Remote-play bridge (Phase 1, observe-only): WS proxy to the PRIVATE relay ----------------
+    # `/remote` upgrades to a WebSocket proxied to the voxiverse-relay sibling container on haproxy-net.
+    # The relay is NEVER host-published (no -p) — reachable ONLY through this route. This block declares
+    # NO add_header, so the game pages' server-scope COOP/COEP are untouched (a WS proxy serves no game
+    # content, and the engine boot is unaffected). Per-IP DoS + token auth live in the relay itself
+    # (authed/pending pool split + per-IP pre-auth rate limit + timing-safe token compare).
+    location = /remote {
+        proxy_pass http://voxiverse-relay:8090;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_set_header X-Real-IP  $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
     # Lightweight health endpoint for local/haproxy checks.
     location = /healthz {
         default_type text/plain;

@@ -55,6 +55,10 @@ var _gen_mwin: Array = [1, 0, 0, 1]
 var _planet_root: Node3D = null              # holds the FacetSlots; transform = T_active⁻¹ (rigid re-place on cross)
 var _pool: Dictionary = {}                   # fid -> FacetSlot dict {terrain, slot, mesher, generator, spawn_ms, view, editable}
 var _pool_active := -1                        # the currently-active (editable, composite-identity) facet id
+# COSMOS FP-M2b (docs/COSMOS-FP-M2-DESIGN.md §5): the LOD-mesh layer, a child of PlanetRoot @ identity that draws
+# the near rings of non-active facets as blocky LOD meshes (+ ridge aprons) instead of far-ring quads. Owns ONE
+# FacetLodBuilder (the M2a off-thread build primitive). null unless FP_M2_LOD (dead code → FP-M1c byte-identical).
+var _lod_mesher = null
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -320,6 +324,8 @@ func setup() -> bool:
 	# its own facet slab. Flag OFF ⇒ the shipped single-terrain scene graph (add_child at ZERO), untouched.
 	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
 		_pool_init_active()
+		# FP-M2b (§5): stand up the LOD-mesh layer under PlanetRoot. Dead unless FP_M2_LOD (setup returns false).
+		_lod_setup()
 	else:
 		add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
@@ -355,8 +361,11 @@ func _process(delta: float) -> void:
 	var pool_ramping := false
 	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and not _render_hidden and not _pool.is_empty():
 		pool_ramping = _ramp_pool_step(delta)
-	# Stay processing only while there is still ramp / cover / pool-ramp work to do; otherwise go dormant.
-	set_process(_ramp_active or _cover_terrain != null or pool_ramping)
+	# FP-M2b: drain + apply finished LOD meshes/aprons under the mesher's own per-frame budget (off the voxel pool).
+	if _lod_mesher != null:
+		_lod_mesher.tick()
+	# Stay processing only while there is still ramp / cover / pool-ramp / LOD work to do; otherwise go dormant.
+	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null)
 
 ## FP-M1c: (re)enable per-frame processing so the per-slot pool view ramp advances. Safe to call repeatedly; a no-op
 ## when the pool flag is off or the near render is dev-hidden (the ramp must never re-grow a deliberately hidden field).
@@ -1414,6 +1423,40 @@ func _apply_bounds(terrain: Object, fid: int) -> void:
 	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
 	_set_if(terrain, "bounds", AABB(pos, size))
 
+## FP-M2b (§5): create the FacetLodMesher under PlanetRoot and prime its static tiers on the active facet. Safe
+## no-op unless FP_M2_LOD (mesher.setup returns false → _lod_mesher stays null and the LOD path is fully dead).
+func _lod_setup() -> void:
+	if not CubeSphere.FP_M2_LOD or _planet_root == null:
+		return
+	var scr: Script = load("res://src/world/facet_lod_mesher.gd")
+	if scr == null:
+		return
+	var m = scr.new()
+	m.name = "FacetLodMesher"
+	_planet_root.add_child(m)
+	if not bool(m.call("setup", self)):
+		_planet_root.remove_child(m)
+		m.free()
+		return
+	_lod_mesher = m
+	_lod_mesher.call("set_active_facet", _pool_active)
+	set_process(true)
+
+## FP-M2b: join the builder Thread before the node tree tears down (a bare free would leak the running Thread).
+func _exit_tree() -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("shutdown")
+		_lod_mesher = null
+
+## FP-M2b far-ring merge (§5.5): the facets whose LOD mesh is APPLIED (excluded from the quad ring). [] with the
+## flag off / no mesher — the WorldManager merge then reduces to the shipped pool-neighbour exclusion.
+func lod_covered_fids() -> Array:
+	return _lod_mesher.call("covered_fids") if _lod_mesher != null else []
+
+## FP-M2b gate accessor: the live FacetLodMesher (verify_fp_m2 drives caps/frame/seam through it). null with the flag off.
+func lod_mesher():
+	return _lod_mesher
+
 ## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
 ## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view
 ## (near_render_radius = 128) + already-pushed carve; it just moves under PlanetRoot. Called once from setup().
@@ -1460,6 +1503,8 @@ func pool_spawn(fid: int) -> bool:
 	s["ramp_from"] = float(start)
 	_pool[fid] = s
 	_pool_ramp_kick()
+	if _lod_mesher != null:                          # FP-M2b: `fid` is now live → drop it from LOD coverage
+		_lod_mesher.call("notify_pool_changed")
 	return true
 
 ## Retire (free) a neighbour terrain. Never frees the active facet. queue_free's the whole slot (terrain → its
@@ -1474,6 +1519,8 @@ func pool_retire(fid: int) -> bool:
 		if slot.get_parent() != null:
 			slot.get_parent().remove_child(slot)
 		slot.queue_free()                           # frees the terrain + its mesher/generator
+	if _lod_mesher != null:                          # FP-M2b: `fid` went dormant → it may re-enter LOD coverage
+		_lod_mesher.call("notify_pool_changed")
 	return true
 
 ## Re-designation crossing (§5.1): make `to` the active (editable, composite-identity) facet and the old active a
@@ -1511,6 +1558,10 @@ func redesignate(to: int) -> bool:
 	_terrain = _pool[to]["terrain"]
 	_mesher = _pool[to]["mesher"]
 	_generator = _pool[to]["generator"]
+	# FP-M2b: the LOD layer moved rigidly with the ONE PlanetRoot write (no rebuild). Re-tier for the new active
+	# facet — `to` is now live (dropped from LOD coverage), the old active becomes the nearest LOD ring next tick.
+	if _lod_mesher != null:
+		_lod_mesher.call("set_active_facet", to)
 	return true
 
 ## FP-M1c pathological POOL-MISS fallback (§5.1.a): the destination `to` could not be re-designated NOR spawned
@@ -1521,6 +1572,11 @@ func redesignate(to: int) -> bool:
 func pool_reset(to: int) -> bool:
 	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL):
 		return false
+	# FP-M2b: the mesher is a child of the PlanetRoot we are about to free — join its builder Thread FIRST (a bare
+	# free would leak the running Thread), then it frees with the old PlanetRoot; a fresh one stands up below.
+	if _lod_mesher != null:
+		_lod_mesher.call("shutdown")
+		_lod_mesher = null
 	if _planet_root != null and is_instance_valid(_planet_root):
 		remove_child(_planet_root)
 		_planet_root.queue_free()
@@ -1539,6 +1595,7 @@ func pool_reset(to: int) -> bool:
 	_mesher = s["mesher"]
 	_generator = s["generator"]
 	_push_facet_carve()                              # re-point the (module-level) active mesher carve at `to`
+	_lod_setup()                                     # FP-M2b: rebuild the LOD layer under the fresh PlanetRoot
 	return true
 
 # --- pool introspection (WorldManager policy + the FP-M1c gates) ---

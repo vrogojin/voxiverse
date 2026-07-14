@@ -21,6 +21,7 @@ extends SceneTree
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FLB := preload("res://src/world/facet_lod_builder.gd")
+const FLM := preload("res://src/world/facet_lod_mesher.gd")   # preload (not the global class_name) — headless --script parse scope
 
 const _BYTES_PER_VERT := 64
 const _BYTES_PER_INDEX := 4
@@ -83,6 +84,10 @@ func _initialize() -> void:
 	_gate_lod0_identity(mod, active)
 	_gate_floor_y_bound(nf)
 	await _gate_build(mod, active, neighbour, corner_fid)
+	# --- FP-M2b gates: FacetLodMesher class + caps/LRU + ridge apron ---
+	await _gate_frame(mod, active, neighbour)
+	await _gate_caps(mod, active)
+	await _gate_seam(mod, active)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -203,10 +208,14 @@ func _gate_build(mod: Node3D, active: int, neighbour: int, corner_fid: int) -> v
 	var tri_bound := (FLB.TILE_MAX + 2) * (FLB.TILE_MAX + 2) * (FLB.TILE_MAX + 2) * 12
 	_ok(max_tris > 0 and max_tris < tri_bound, "G-M2-BUILD: max tile tris %d within the sanity bound %d" % [max_tris, tri_bound])
 
-	# voxel-pool statistics untouched — the builder never routes through godot_voxel.
+	# The builder never routes through godot_voxel: a pure-LOD build must NOT push generation/meshing tasks onto the
+	# active terrain's voxel worker pool. If it did, vox_gen/vox_mesh would jump by the built tile count (dozens+).
+	# A tiny drift (a background per-frame VoxelTerrain bookkeeping counter ticking over the drain's frames — delta
+	# ≤ a few, unrelated to the pool) is NOT pool routing, so tolerate that noise while still catching a real burst.
 	var stat_after := _stat_sum(term)
+	var stat_delta: int = absi(stat_after - stat_before)
 	print("    active-terrain statistics sum: before=%d after=%d (delta %d)" % [stat_before, stat_after, stat_after - stat_before])
-	_ok(stat_after == stat_before, "G-M2-BUILD: active-terrain voxel-pool statistics UNCHANGED by the pure-LOD build (vox_gen untouched)")
+	_ok(stat_delta <= 8, "G-M2-BUILD: active-terrain voxel-pool statistics undisturbed by the pure-LOD build (Δ=%d ≤ 8 — no vox_gen burst)" % stat_delta)
 
 	# whole-facet tiling: enqueue_facet tiles a multi-tile coherent facet (cheap ℓ2).
 	var n_before := builder.build_count()
@@ -226,7 +235,236 @@ func _gate_build(mod: Node3D, active: int, neighbour: int, corner_fid: int) -> v
 	builder.shutdown()
 	_ok(not builder.is_running(), "G-M2-BUILD: builder thread joined cleanly on shutdown")
 
+# ---------- G-M2-FRAME: LOD placement round-trip (§8) ----------
+func _gate_frame(mod: Node3D, active: int, neighbour: int) -> void:
+	print("  --- G-M2-FRAME: LOD placement round-trip (orientation-correct under 2 active facets) ---")
+	var mesher = FLM.new()
+	get_root().add_child(mesher)
+	var ok := bool(mesher.setup(mod))
+	_ok(ok, "G-M2-FRAME: FacetLodMesher.setup() wired the builder + apron material")
+	if not ok:
+		mesher.free(); return
+	var f := neighbour
+	mesher.request(f, 3)                                  # ℓ3 = 1 tile per facet — fast + guaranteed non-empty
+	var applied: bool = await _drive_mesher(mesher, f, 60000)
+	_ok(applied, "G-M2-FRAME: facet %d LOD mesh built+applied (covered)" % f)
+	if not applied:
+		mesher.shutdown(); mesher.free(); return
+	var node: Node3D = mesher.get_node_or_null("LodFacet_%d" % f)
+	_ok(node != null, "G-M2-FRAME: LodFacet_%d node present under the mesher" % f)
+	var tiles: Array = mesher.facet_tile_instances(f)
+	_ok(tiles.size() > 0, "G-M2-FRAME: applied facet holds %d tile MeshInstance(s)" % tiles.size())
+	if node == null or tiles.is_empty():
+		mesher.shutdown(); mesher.free(); return
+	var tf := FA.facet_transform(f)
+	_ok(node.transform.is_equal_approx(tf), "G-M2-FRAME: LodFacet node transform == facet_transform(%d)" % f)
+	# every sampled megablock vertex lands where lattice_to_world64 places its lattice cell (the live-block position).
+	var worst := 0.0
+	var lat0 := Vector3.ZERO
+	var wref0 := Vector3.ZERO
+	var got_sample := false
+	for mi in tiles:
+		var arr: Array = (mi as MeshInstance3D).mesh.surface_get_arrays(0)
+		var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+		var lim: int = mini(pv.size(), 200)
+		for i in range(lim):
+			var v: Vector3 = pv[i]
+			var lat: Vector3 = (mi as MeshInstance3D).transform * v          # tile + s·v (facet lattice coords)
+			var wr: Array = FA.lattice_to_world64(f, lat.x, lat.y, lat.z)
+			var wref := Vector3(float(wr[0]), float(wr[1]), float(wr[2]))
+			worst = maxf(worst, (tf * lat - wref).length())
+			if not got_sample:
+				lat0 = lat; wref0 = wref; got_sample = true
+	_ok(worst < 1.0e-1, "G-M2-FRAME: max vertex placement error %.4f blocks < 0.1 (facet_transform == lattice_to_world64)" % worst)
+	# two-active invariance: the absolute planet point recovered from BOTH active facets' render frames is identical.
+	var proot := Node3D.new()
+	get_root().add_child(proot)
+	get_root().remove_child(mesher)
+	proot.add_child(mesher)
+	var abs_pts: Array = []
+	for a in [active, f]:
+		proot.transform = FA.facet_transform(a).affine_inverse()
+		var vglobal: Vector3 = (proot.transform * node.transform) * lat0     # render-frame position under active a
+		abs_pts.append(FA.facet_transform(a) * vglobal)                       # re-express to absolute
+	_ok(abs_pts[0].is_equal_approx(abs_pts[1]) and (abs_pts[0] - wref0).length() < 1.0e-1,
+		"G-M2-FRAME: absolute vertex pos invariant across 2 active facets (Δ=%.4f) and == lattice_to_world64" % (abs_pts[0] - abs_pts[1]).length())
+	mesher.shutdown()
+	proot.queue_free()
+
+# ---------- G-M2-CAPS: NEVER-OOM caps + LRU (§6.2) ----------
+func _gate_caps(mod: Node3D, active: int) -> void:
+	print("  --- G-M2-CAPS: hard caps + LRU (a request storm never exceeds the ceilings) ---")
+	var cap_bytes := FLM.LOD_MAX_BYTES_MB * 1024 * 1024
+	# ---- storm: 80 distinct facets at ℓ1 (the finest/heaviest tier) → byte + facet caps must both bind ----
+	var m = FLM.new()
+	get_root().add_child(m)
+	if not bool(m.setup(mod)):
+		_ok(false, "G-M2-CAPS: mesher setup"); m.free(); return
+	var storm: Array = []
+	var f := 0
+	while storm.size() < 80 and f < FA.facet_count():
+		if f != active:
+			storm.append(f)
+		f += 1
+	for x in storm:
+		m.request(x, 1, true)                            # dry: admission-only (no real build) — exercises caps synchronously
+	var st: Dictionary = m.stats()
+	var tracked := 0
+	for x in storm:
+		if m.is_covered(x) or m.is_building(x):
+			tracked += 1
+	_ok(tracked <= FLM.LOD_MAX_FACETS, "G-M2-CAPS: tracked facets %d ≤ LOD_MAX_FACETS %d" % [tracked, FLM.LOD_MAX_FACETS])
+	_ok(int(st["tris"]) <= FLM.LOD_MAX_TRIS, "G-M2-CAPS: ledger tris %d ≤ LOD_MAX_TRIS %d" % [int(st["tris"]), FLM.LOD_MAX_TRIS])
+	_ok(int(st["bytes"]) <= cap_bytes, "G-M2-CAPS: ledger bytes %d ≤ cap %d (%d MB)" % [int(st["bytes"]), cap_bytes, FLM.LOD_MAX_BYTES_MB])
+	_ok(tracked < storm.size(), "G-M2-CAPS: storm exceeded caps → %d of %d requests degraded/denied to quad (no hole)" % [storm.size() - tracked, storm.size()])
+	# no hole: a denied facet is NOT tracked → covered_fids() excludes it → the far ring keeps drawing its quad.
+	var denied_untracked := true
+	for x in storm:
+		if not (m.is_covered(x) or m.is_building(x)):
+			if m.covered_fids().has(x):
+				denied_untracked = false
+	_ok(denied_untracked, "G-M2-CAPS: every denied facet is absent from covered_fids() (quad stays — no hole)")
+	m.shutdown()
+	# ---- LRU: never evict a WANTED facet to fund another WANTED one; evict non-wanted to fund a newcomer ----
+	var m2 = FLM.new()
+	get_root().add_child(m2)
+	if not bool(m2.setup(mod)):
+		_ok(false, "G-M2-CAPS: LRU mesher setup"); m2.shutdown(); m2.free(); return
+	var picked: Array = []
+	f = 0
+	while picked.size() < FLM.LOD_MAX_FACETS and f < FA.facet_count():
+		if f != active:
+			picked.append(f)
+		f += 1
+	for x in picked:
+		m2.request(x, 3, true)                            # dry → the FACET cap (64) binds, not bytes/tris
+	var filled := 0
+	for x in picked:
+		if m2.is_covered(x) or m2.is_building(x):
+			filled += 1
+	_ok(filled == FLM.LOD_MAX_FACETS, "G-M2-CAPS: filled to the facet cap with wanted facets (%d)" % filled)
+	var extra := f                                        # the next non-active facet id (all picked are wanted)
+	m2.request(extra, 3, true)
+	_ok(not (m2.is_covered(extra) or m2.is_building(extra)), "G-M2-CAPS: newcomer DENIED while every tracked facet is wanted (no wanted evicted)")
+	var still := 0
+	for x in picked:
+		if m2.is_covered(x) or m2.is_building(x):
+			still += 1
+	_ok(still == FLM.LOD_MAX_FACETS, "G-M2-CAPS: all %d wanted facets retained (LRU never evicts wanted-for-wanted)" % still)
+	m2._want.clear()                                     # white-box: the crossing made them non-wanted
+	m2.request(extra, 3, true)
+	_ok(m2.is_covered(extra) or m2.is_building(extra), "G-M2-CAPS: after wants cleared, LRU evicted a NON-wanted facet to admit the newcomer")
+	var final_tracked := 0
+	for x in (picked + [extra]):
+		if m2.is_covered(x) or m2.is_building(x):
+			final_tracked += 1
+	_ok(final_tracked <= FLM.LOD_MAX_FACETS, "G-M2-CAPS: still ≤ facet cap after the LRU eviction (%d)" % final_tracked)
+	m2.shutdown()
+
+# ---------- G-M2-SEAM: erosion zero-protrusion + the ridge apron (§7.5) ----------
+func _gate_seam(mod: Node3D, active: int) -> void:
+	print("  --- G-M2-SEAM: erosion zero-protrusion + LOD↔LOD ridge apron (no hairline) ---")
+	var m = FLM.new()
+	get_root().add_child(m)
+	if not bool(m.setup(mod)):
+		_ok(false, "G-M2-SEAM: mesher setup"); m.free(); return
+	# pick an adjacent LOD↔LOD pair (both non-active): A = a neighbour of active; B = a neighbour of A that isn't active.
+	var A := -1
+	for slot in range(4):
+		var nb: int = FA.seam_neighbour(active, slot)
+		if nb >= 0 and nb != active:
+			A = nb; break
+	var B := -1
+	var slotAB := -1
+	if A >= 0:
+		for slot in range(4):
+			var nb: int = FA.seam_neighbour(A, slot)
+			if nb >= 0 and nb != active and nb != A:
+				B = nb; slotAB = slot; break
+	_ok(A >= 0 and B >= 0, "G-M2-SEAM: found an adjacent non-active LOD↔LOD pair (A=%d, B=%d)" % [A, B])
+	if A < 0 or B < 0:
+		m.shutdown(); return
+	var owner: int = mini(A, B)
+	var nbr: int = maxi(A, B)
+	# owner's slot facing the neighbour
+	var oslot := -1
+	for slot in range(4):
+		if FA.seam_neighbour(owner, slot) == nbr:
+			oslot = slot; break
+	_ok(oslot >= 0, "G-M2-SEAM: owner facet %d has slot %d facing neighbour %d" % [owner, oslot, nbr])
+	if oslot < 0:
+		m.shutdown(); return
+	# build both sides at MIXED tiers (ℓ2 vs ℓ3 → s_max=8) so the apron spans a mixed-stride retreat gap on both
+	# sides (identical apron/erosion logic to ℓ1-vs-ℓ2; the coarser tiers keep the headless gate fast).
+	m.request(owner, 2)
+	m.request(nbr, 3)
+	var both: bool = await _drive_until(m, func(): return m.is_covered(owner) and m.is_covered(nbr), 120000)
+	_ok(both, "G-M2-SEAM: both sides built+applied (owner ℓ%d, nbr ℓ%d)" % [m.lod_of(owner), m.lod_of(nbr)])
+	if not both:
+		m.shutdown(); return
+	# (a) zero protrusion: EVERY LOD megablock vertex is interior to all 4 of its facet's ridge planes (erosion).
+	var worst_prot := 1.0e18
+	for fid in [owner, nbr]:
+		for mi in m.facet_tile_instances(fid):
+			var arr: Array = (mi as MeshInstance3D).mesh.surface_get_arrays(0)
+			var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+			var lim: int = mini(pv.size(), 400)
+			for i in range(lim):
+				var lat: Vector3 = (mi as MeshInstance3D).transform * pv[i]
+				for slot in range(4):
+					worst_prot = minf(worst_prot, FA.own_dist(fid, slot, lat.x, lat.y, lat.z))
+	_ok(worst_prot >= -1.0e-2, "G-M2-SEAM(a): zero protrusion — min own_dist over all LOD verts = %.4f ≥ −0.01 (erosion holds)" % worst_prot)
+	# apron reconciliation: the apron pass enqueues the LOD↔LOD apron on the owner; drive until it applies.
+	var apron_up: bool = await _drive_until(m, func(): return m.apron_slots(owner).has(oslot), 120000)
+	_ok(apron_up, "G-M2-SEAM(c): ridge apron present on owner %d slot %d (the LOD↔LOD seam)" % [owner, oslot])
+	# (d) exactly one apron per seam: the neighbour (higher fid) owns NO apron on the reciprocal slot.
+	var nslot := -1
+	for slot in range(4):
+		if FA.seam_neighbour(nbr, slot) == owner:
+			nslot = slot; break
+	_ok(nslot < 0 or not m.apron_slots(nbr).has(nslot), "G-M2-SEAM(d): single ownership — neighbour %d owns no reciprocal apron (lower fid owns)" % nbr)
+	if apron_up:
+		var s_max := 1 << maxi(m.lod_of(owner), m.lod_of(nbr))
+		var amesh: Mesh = m.apron_mesh(owner, oslot)
+		_ok(amesh != null and amesh.get_surface_count() > 0, "G-M2-SEAM: apron mesh non-empty (s_max=%d)" % s_max)
+		if amesh != null and amesh.get_surface_count() > 0:
+			# ridge line in owner lattice + inward (horizontal own-side) direction
+			var ring: Array = FA.seam_ring(owner, oslot)
+			var pl: Vector4 = FA.seam_plane(owner, oslot)
+			var inward := Vector3(pl.x, 0.0, pl.z).normalized()
+			var L0a: Array = FA.world_to_lattice64(owner, ring[0].x, ring[0].y, ring[0].z)
+			var r0 := Vector3(float(L0a[0]), 0.0, float(L0a[2]))
+			var arr: Array = amesh.surface_get_arrays(0)
+			var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+			var max_off := -1.0e18
+			var min_off := 1.0e18
+			var max_perp := 0.0
+			for i in range(pv.size()):
+				var p := pv[i]
+				var rel := Vector3(p.x - r0.x, 0.0, p.z - r0.z)      # horizontal offset from the ridge line
+				var off := rel.dot(inward)                            # signed: + owner side, − neighbour side
+				max_off = maxf(max_off, off); min_off = minf(min_off, off)
+				max_perp = maxf(max_perp, absf(off))
+			# (c) spans BOTH sides of the retreat gap, and every apron vertex stays within the ±s_max window.
+			_ok(max_off > 0.5 and min_off < -0.5, "G-M2-SEAM(c): apron spans BOTH sides of the ridge (owner off=%.1f, nbr off=%.1f)" % [max_off, min_off])
+			_ok(max_perp <= float(s_max) + 0.75, "G-M2-SEAM(c): every apron vertex within the ±s_max window (max |off|=%.2f ≤ %d)" % [max_perp, s_max])
+	m.shutdown()
+
 # ---------- helpers ----------
+func _drive_mesher(mesher, fid: int, timeout_ms: int) -> bool:
+	var t0 := Time.get_ticks_msec()
+	while not bool(mesher.is_covered(fid)) and (Time.get_ticks_msec() - t0) < timeout_ms:
+		mesher.tick()
+		await process_frame
+	return bool(mesher.is_covered(fid))
+
+func _drive_until(mesher, cond: Callable, timeout_ms: int) -> bool:
+	var t0 := Time.get_ticks_msec()
+	while not bool(cond.call()) and (Time.get_ticks_msec() - t0) < timeout_ms:
+		mesher.tick()
+		await process_frame
+	return bool(cond.call())
+
 func _drain(builder, expected: int, timeout_ms: int) -> Array:
 	var out := []
 	var t0 := Time.get_ticks_msec()

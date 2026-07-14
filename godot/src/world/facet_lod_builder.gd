@@ -129,6 +129,22 @@ func enqueue_tile(fid: int, lod: int, cx: int, cy: int, cz: int, n: int) -> bool
 	_enqueue_one(fid, lod, 1 << lod, gen, cx, cy, cz, e, e, e)
 	return true
 
+## COSMOS FP-M2b (§7.4) — enqueue a RIDGE-APRON job for the LOD↔LOD seam `slot` of owner facet `owner_fid`
+## (ownership = the LOWER fid of the pair; the caller enforces it). The apron is a terrain-coloured strip built
+## from the welded ring line at pitch `s_max` (the coarser side's stride), authored in the owner facet's lattice
+## coords so it rides PlanetRoot rigidly with every other LOD mesh. Built on THIS builder thread as a job
+## appendix — pure frozen-atlas data + profile_at_dir + FarPalette (all warmed before the thread runs), the same
+## thread-safety class as generate_block. Returns false if the flag/thread is unavailable. MAIN thread only.
+func enqueue_apron(owner_fid: int, slot: int, s_max: int) -> bool:
+	if not is_running() or slot < 0 or slot > 3 or s_max < 2:
+		return false
+	var job := {"kind": "apron", "fid": owner_fid, "slot": slot, "s_max": s_max}
+	_queue_mutex.lock()
+	_queue.append(job)
+	_queue_mutex.unlock()
+	_sem.post()
+	return true
+
 func _enqueue_one(fid: int, lod: int, s: int, gen: Object, tx: int, ty: int, tz: int, nx: int, ny: int, nz: int) -> void:
 	var job := {
 		"fid": fid, "lod": lod, "s": s, "gen": gen,
@@ -155,7 +171,7 @@ func _thread_loop() -> void:
 		_queue_mutex.unlock()
 		if job == null:
 			continue
-		var res := _build_job(job)
+		var res: Dictionary = _build_apron(job) if job.get("kind", "tile") == "apron" else _build_job(job)
 		_done_mutex.lock()
 		_done.append(res)
 		_build_count += 1
@@ -185,6 +201,81 @@ func _build_job(job: Dictionary) -> Dictionary:
 		"verts": verts, "tris": tris, "bytes": verts * _BYTES_PER_VERT + (tris * 3) * _BYTES_PER_INDEX,
 		"thread_id": OS.get_thread_caller_id(),
 	}
+
+## Build ONE ridge apron → a vertex-coloured ArrayMesh in the owner facet's LATTICE coords (§7.4), entirely on the
+## builder thread (pure reader: frozen seam data + profile_at_dir + FarPalette, all warmed before the thread ran).
+## Two quad strips (one per side, ridge line inward s_max) with the top snapped UP to the s_max megablock grid
+## (ceil — overlap-not-gap) plus a short outer skirt tucking under the megablock walls, so a LOD↔LOD ridge shows
+## NO hairline. Winding-agnostic (the applied material is CULL_DISABLED, like the far ring — the dihedral turn can
+## flip a strip). Colours track FarPalette so the apron reads as the same terrain the neighbouring quads/LOD do.
+func _build_apron(job: Dictionary) -> Dictionary:
+	var owner: int = job["fid"]
+	var slot: int = job["slot"]
+	var s_max: int = job["s_max"]
+	var fs := float(s_max)
+	var ring: Array = FacetAtlas.seam_ring(owner, slot)
+	var r0: Vector3 = ring[0]
+	var r1: Vector3 = ring[1]
+	var pl: Vector4 = FacetAtlas.seam_plane(owner, slot)                 # own(x,y,z)=A·x+B·y+C·z+D ≥ 0 interior
+	var inward := Vector3(pl.x, 0.0, pl.z)                               # +own_dist horizontal (into owner) in lattice xz
+	if inward.length() < 1.0e-9:
+		inward = Vector3(1.0, 0.0, 0.0)
+	inward = inward.normalized()
+	var L0: Array = FacetAtlas.world_to_lattice64(owner, r0.x, r0.y, r0.z)
+	var L1: Array = FacetAtlas.world_to_lattice64(owner, r1.x, r1.y, r1.z)
+	var p0 := Vector3(float(L0[0]), float(L0[1]), float(L0[2]))
+	var p1 := Vector3(float(L1[0]), float(L1[1]), float(L1[2]))
+	var seglen := (p1 - p0).length()
+	var nseg: int = maxi(1, int(ceil(seglen / fs)))
+	var sea := TerrainConfig.SEA_LEVEL
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var down := Vector3(0.0, fs, 0.0)
+	for i in range(nseg):
+		var t0 := float(i) / float(nseg)
+		var t1 := float(i + 1) / float(nseg)
+		var a0 := p0.lerp(p1, t0)
+		var a1 := p0.lerp(p1, t1)
+		var w0 := r0.lerp(r1, t0); var d0 := w0.normalized()
+		var w1 := r0.lerp(r1, t1); var d1 := w1.normalized()
+		var prof0: Vector4 = TerrainConfig.profile_at_dir(d0.x, d0.y, d0.z, FacetAtlas.R_BLOCKS)
+		var prof1: Vector4 = TerrainConfig.profile_at_dir(d1.x, d1.y, d1.z, FacetAtlas.R_BLOCKS)
+		var g0 := int(prof0.x); var g1 := int(prof1.x)
+		var top0 := float(int(ceil(float(g0) / fs)) * s_max)            # snap UP to the s_max megablock top grid
+		var top1 := float(int(ceil(float(g1) / fs)) * s_max)
+		var c0 := FarPalette.color_for(g0, int(prof0.y), prof0.w, g0 <= sea)
+		var c1 := FarPalette.color_for(g1, int(prof1.y), prof1.w, g1 <= sea)
+		var rA0 := Vector3(a0.x, top0, a0.z)                            # ridge, raised to the local surface top
+		var rA1 := Vector3(a1.x, top1, a1.z)
+		var oO0 := rA0 + inward * fs; var oO1 := rA1 + inward * fs      # owner-side outer (+own_dist s_max)
+		var nO0 := rA0 - inward * fs; var nO1 := rA1 - inward * fs      # neighbour-side outer (−own_dist s_max)
+		_apron_quad(st, rA0, oO0, oO1, rA1, c0, c0, c1, c1)            # owner top strip
+		_apron_quad(st, nO0, rA0, rA1, nO1, c0, c0, c1, c1)            # neighbour top strip
+		_apron_quad(st, oO0, oO0 - down, oO1 - down, oO1, c0, c0, c1, c1)  # owner outer skirt
+		_apron_quad(st, nO0, nO0 - down, nO1 - down, nO1, c0, c0, c1, c1)  # neighbour outer skirt
+	var mesh: ArrayMesh = st.commit()
+	var verts := 0
+	var tris := 0
+	if mesh != null and mesh.get_surface_count() > 0:
+		var arr: Array = mesh.surface_get_arrays(0)
+		var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+		verts = pv.size()
+		tris = int(verts / 3)     # SurfaceTool triangle soup (no index() call) → ARRAY_INDEX is null; verts = 3·tris
+	return {
+		"fid": owner, "kind": "apron", "slot": slot, "s_max": s_max, "lod": 0, "tile": Vector3i.ZERO,
+		"mesh": mesh, "verts": verts, "tris": tris,
+		"bytes": verts * _BYTES_PER_VERT + (tris * 3) * _BYTES_PER_INDEX,
+		"thread_id": OS.get_thread_caller_id(),
+	}
+
+## Two colour-interpolated triangles (a,b,c)+(a,c,d) for an apron quad — sample-0 verts take (ca,cb), sample-1 (cc,cd).
+func _apron_quad(st: SurfaceTool, a: Vector3, b: Vector3, c: Vector3, d: Vector3, ca: Color, cb: Color, cc: Color, cd: Color) -> void:
+	st.set_color(ca); st.add_vertex(a)
+	st.set_color(cb); st.add_vertex(b)
+	st.set_color(cc); st.add_vertex(c)
+	st.set_color(ca); st.add_vertex(a)
+	st.set_color(cc); st.add_vertex(c)
+	st.set_color(cd); st.add_vertex(d)
 
 ## Pop all finished tiles (MAIN thread). M2b applies these under a per-frame budget; the M2a gate collects them.
 func drain_done() -> Array:

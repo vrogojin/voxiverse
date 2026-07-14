@@ -36,6 +36,7 @@ var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 const FACET_WALL_EPS := -3.0          # COSMOS FACETED §6.1: FP3 removes the FP2 ridge wall — the crossing handoff
                                       # replaces it. A deep backstop (3 blocks PAST the ridge) only catches a
                                       # failed crossing so the player can never wander far onto masked air.
@@ -209,6 +210,14 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if _snowfall != null and _have_player_pos:
 		_snowfall.process(delta, _last_player_pos)
+	# FP-M2b: the LOD covered set grows/shrinks as builds apply + facets evict (not only on a pool spawn/retire), so
+	# resync the far-ring exclusion on a slow throttle. set_pool_excluded no-ops when the set is unchanged (cheap).
+	# Gated on FP_M2_LOD → zero extra work with the flag off (byte-identical to FP-M1c).
+	if CubeSphere.FP_M2_LOD and _facet_ring != null:
+		_lod_excl_accum += delta
+		if _lod_excl_accum >= 0.5:
+			_lod_excl_accum = 0.0
+			_facet_ring_sync_exclusion()
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -1471,8 +1480,17 @@ func _manage_facet_pool(player_pos: Vector3) -> void:
 func _facet_ring_sync_exclusion() -> void:
 	if _facet_ring == null or _module_world == null or not _module_world.has_method("pool_neighbour_fids"):
 		return
-	if _facet_ring.has_method("set_pool_excluded"):
-		_facet_ring.set_pool_excluded(_module_world.call("pool_neighbour_fids"))
+	if not _facet_ring.has_method("set_pool_excluded"):
+		return
+	# FP-M2b (§5.5): the ring's excluded set = live pool neighbours ∪ the facets whose LOD mesh is APPLIED, merged
+	# into ONE deferred/budgeted set_pool_excluded (no synchronous ring regen). With FP_M2_LOD off lod_covered_fids
+	# is [] → this reduces to the shipped FP-M1c pool-neighbour exclusion, byte-identical.
+	var excluded: Array = (_module_world.call("pool_neighbour_fids") as Array).duplicate()
+	if CubeSphere.FP_M2_LOD and _module_world.has_method("lod_covered_fids"):
+		for f in (_module_world.call("lod_covered_fids") as Array):
+			if not excluded.has(f):
+				excluded.append(f)
+	_facet_ring.set_pool_excluded(excluded)
 
 ## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
 func pool_miss_count() -> int:

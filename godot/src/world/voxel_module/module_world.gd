@@ -1200,10 +1200,13 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 
 ## COSMOS FACETED §6.1 — the crossing restream. Install a fresh generator epoch homed on facet `fid` (its
 ## gen_facet reads TerrainConfig.active_facet(), which WorldManager sets to `fid` BEFORE this call) and
-## hard-restream (the M4 cover + view-distance ramp hides the swap). The junction BEVEL manifest is baked per
-## active-facet seam ORIENTATION, so it is CLEARED here — the new facet's junction cells lip-fall-back
-## (geometrically safe: never a wrong-tilt bevel, never a library leak). Per-facet bevel-on-crossing is a
-## deferred polish (would need library model overwrite to stay leak-free). Sibling of set_home_face.
+## hard-restream (the M4 cover + view-distance ramp hides the swap). The junction BEVEL manifest is CLEARED — it
+## is baked for the spawn facet's exact seam ORIENTATIONS, and those vary up to ~53° across facets (the cube-
+## sphere warp shears facets differently; verify_faceted proved a single-manifest reuse would crack/mis-tilt on
+## most facets). godot_voxel's library bake is all-or-nothing (~13s web stall, patch 0002), so a per-facet
+## re-bake is infeasible on a crossing. So the new facet's junction cells lip-fall-back (geometrically SAFE:
+## never a wrong-tilt bevel, never a hole, never a library leak). Correct per-facet bevels-on-crossing would
+## need a mesher that can carve voxel cells outside the baked library — a larger change (documented, deferred).
 func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	_junction_arid = PackedInt32Array()               # clear → new facet's junctions render the safe lip
 	restream(old_wrapper_pos)

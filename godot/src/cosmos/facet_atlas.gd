@@ -436,9 +436,13 @@ static func seam_grad_len(fid: int, slot: int) -> float:
 	var b := fid * 16 + slot * 4
 	return sqrt(_seam_plane[b] * _seam_plane[b] + _seam_plane[b + 1] * _seam_plane[b + 1] + _seam_plane[b + 2] * _seam_plane[b + 2])
 
-## The QUANTIZED model plane [A,B,C,base] for a baked junction shape (slot, q). Reconstructs the cut plane
-## from the exact per-seam orientation (A,B,C) + the offset q (cell-centre perpendicular distance = q/16 − 1).
-## base is chosen so the plane sits ≥ the exact plane (outward) — the render model reaches at least to P.
+## The QUANTIZED model plane [A,B,C,base] for a baked junction shape (fid, slot, q). Reconstructs the cut plane
+## from the facet's EXACT per-seam orientation (A,B,C) + the offset q (cell-centre perpendicular distance =
+## q/16 − 1). base is chosen so the plane sits ≥ the exact plane (outward) — the render reaches at least to P.
+## NOTE: the geometry is genuinely per-facet — seam orientations vary up to ~53° across facets (the cube-sphere
+## warp shears facets differently), so a single reference manifest does NOT work; per-facet bevels-on-crossing
+## would need a per-facet re-bake, which godot_voxel makes all-or-nothing (~13s). Hence set_facet clears the
+## manifest on a crossing (safe lip) rather than reuse it.
 static func junction_model_plane(fid: int, slot: int, q: int) -> Array:
 	var b := fid * 16 + slot * 4
 	var A := _seam_plane[b]; var B := _seam_plane[b + 1]; var C := _seam_plane[b + 2]

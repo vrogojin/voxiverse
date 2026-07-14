@@ -41,6 +41,7 @@ func _initialize() -> void:
 	_gate_seam_continuity()
 	_gate_seams(nf)
 	_gate_crossing_math(nf)
+	_gate_bevel_reuse(nf)
 	_gate_junction_encode()
 	_gate_junction_mesh()
 	_gate_far_ring()
@@ -161,6 +162,29 @@ func _gate_live_loop() -> void:
 	_ok(to_fid >= 0 and TC.active_facet() == to_fid, "crossing: active facet switched to the neighbour (%d→%d)" % [fidx, to_fid])
 	TC.set_active_facet(fidx)                          # restore the spawn facet
 	w.queue_free()
+
+# FP3 — the junction bevel geometry is GENUINELY PER-FACET: seam orientations vary widely across facets (the
+# cube-sphere warp shears facets differently), so a single-manifest reuse across a crossing would crack/mis-tilt
+# most seams. This gate PINS that finding — it is why set_facet clears the manifest (safe lip) on a crossing
+# rather than reuse it, and why correct bevels-on-crossing need a per-facet re-bake (infeasible: godot_voxel's
+# library bake is all-or-nothing, ~13s web stall). Do NOT reintroduce a reference-facet reuse without solving
+# the mesher-carve problem first.
+func _slot_normal(fid: int, slot: int) -> Vector3:
+	var p := FA.seam_plane(fid, slot)
+	return Vector3(p.x, p.y, p.z).normalized()
+
+func _ang(a: Vector3, b: Vector3) -> float:
+	return acos(clampf(a.dot(b), -1.0, 1.0))
+
+func _gate_bevel_reuse(nf: int) -> void:
+	var ref := FA.spawn_facet()
+	var all_worst := 0.0
+	var step := maxi(1, nf / 400)
+	for slot in range(4):
+		var rn := _slot_normal(ref, slot)
+		for fid in range(0, nf, step):
+			all_worst = maxf(all_worst, _ang(rn, _slot_normal(fid, slot)))
+	_ok(all_worst > deg_to_rad(20.0), "bevel geometry is genuinely per-facet: seam orientations span %.1f° across facets (a single-manifest reuse WOULD crack → clear-on-cross is required)" % rad_to_deg(all_worst))
 
 # FP3 — the crossing reframe math (§6.1). The f64 A→B→A position reframe round-trips exactly (Δ_AB·Δ_BA = I),
 # and crossing_basis is a true inverse pair — so a cross-and-return is byte-identical and the player can never

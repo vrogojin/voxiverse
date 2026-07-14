@@ -49,14 +49,17 @@ at every sub-stage.
 3. **Shipped LOD tiers ℓ ∈ {1, 2, 3}** (`LOD_MAX_TIER := 3`); the FacetFarRing quad stays as
    the ℓ=∞ coarsest tier and the universal fallback. FP-M3 raises the tier cap to 5 for
    orbit/telescope — the selector/budgeter machinery built here already handles it (§6).
-4. **Seam treatment at ℓ>0: uniform conservative EROSION** (§7). A megablock survives only
-   if its whole s-cube footprint is interior to the facet's 4 ridge planes; no junction
-   sentinels are emitted at ℓ>0. The active facet's carve bevel reaches the plane exactly;
-   the LOD side retreats ≤ s blocks and renders vertical megablock wall faces at its
-   boundary. No interpenetration into live facets (gate-asserted), no z-fight, an accepted
-   ≤ 2s-block hairline at LOD↔LOD ridges (≈ ≤ 3 px at selection equilibrium; soak-gated,
-   named fallback: the ridge apron strip, §7.4). ℓ0 LOD meshes are **not shipped** — full
-   resolution is exclusively the live-terrain representation.
+4. **Seam treatment at ℓ>0: uniform conservative EROSION + the RIDGE APRON** (§7). A
+   megablock survives only if its whole s-cube footprint is interior to the facet's 4
+   ridge planes; no junction sentinels are emitted at ℓ>0. At a **live↔LOD** ridge the
+   live facet's carve bevel reaches the welded plane exactly and the seam reads clean —
+   erosion alone suffices there. At a **LOD↔LOD** ridge, both sides retreat ≤ s and the
+   resulting hairline is **NOT accepted** (user decision): it is covered by a **ridge
+   apron** — a terrain-coloured strip built from the welded ring line spanning both
+   sides' retreat — as PRIMARY M2b scope (§7.4). No interpenetration into live facets
+   (gate-asserted), no z-fight, **no visible LOD↔LOD hairline at any tier**
+   (gate-asserted). ℓ0 LOD meshes are **not shipped** — full resolution is exclusively
+   the live-terrain representation.
 5. **Selector = screen-space error, budgeter = request-grant** (§6). One rule
    `p = (2^ℓ·viewport_h)/(2·d·tan(fov/2)) ≤ τ` (τ := 3 px) covers walk / low flight /
    near orbit / telescope; the budgeter grants under hard caps with coarse-to-fine
@@ -235,10 +238,11 @@ point of view.
   three neighbours stop generating: one producer's half-band at distance-priority is
   exactly the load FP-S1's gate already proved drains in ≤ ~10 s.
 - **Strict Z1 (cap 1)** starves the corner approach: the second ridge's facet would be LOD
-  ℓ1 at ≤ 60 blocks (selector *wants* ℓ0 there; §6.2) — 2-block megablocks plus the §7
-  erosion hairline in the player's face, and a guaranteed pool-miss (spawn-at-cross ladder,
-  `world_manager.gd:1392-1401`) when the player crosses the second ridge. The hybrid's
-  second slot costs 20 MB + 0.28 V *only near corners* and removes both artifacts.
+  ℓ1 at ≤ 60 blocks (selector *wants* ℓ0 there; §6.2) — 2-block megablocks and an
+  apron-covered coarse seam in the player's face, and a guaranteed pool-miss
+  (spawn-at-cross ladder, `world_manager.gd:1392-1401`) when the player crosses the second
+  ridge. The hybrid's second slot costs 20 MB + 0.28 V *only near corners* and removes
+  both artifacts.
 - Degrade/upgrade dial (pre-agreed, NEVER-OOM ladder §11): if the live A/B still shows gen
   backlog > target, `POOL_D_WARM2` 48 → 0 turns the hybrid into strict Z1 (one const); if
   throughput headroom is abundant post-M1b on big machines, nothing changes — the cap is
@@ -634,30 +638,68 @@ verbatim** — LOD0 byte-identity is preserved by construction (G-M2-ID pins it)
   ≤ ~3 px of wall. **No interpenetration into the live facet is possible** (erosion keeps
   every solid strictly inside its own half-space; the planes are exact complements,
   `own_A = −own_B`, G-J1) → no double-render, no z-fight.
-- **LOD ↔ LOD**: both sides erode → a ≤ 2s-block "canyon" whose walls render and whose
-  floor is open; the ridge planes are near-vertical (facet normals tilt 1.9° each side of
-  the bisector) so the slit is a thin dark seam line, ≤ ~6 px at equilibrium, shrinking
-  with distance. **Accepted**, soak-gated (§7.4).
+- **LOD ↔ LOD**: both sides erode → without treatment, a ≤ 2s-block open slit along the
+  ridge. **The user has REJECTED this hairline** — it is designed out, not accepted: every
+  LOD↔LOD ridge is covered by a **ridge apron** (§7.4), primary M2b scope. The erosion
+  contract itself is unchanged (it is what guarantees zero interpenetration); the apron
+  covers the retreat gap on top of it.
 - **Twist / singular vertices (risk #5)**: erosion needs no cross-facet junction geometry
   at all, so the 8 singular cube-corner vertices need nothing special at LOD — each
   facet's own 4 planes are well-defined everywhere (`facet_atlas.gd:199-240`). The FP-M1
   skips stand: no live neighbour across a twist seam (never the imminent facet there —
   `FACET_TWIST` false, no diagonal at 3-facet corners, `SINGULAR_EXCLUDE` complementarity
-  exclusions carried over). Asserted by skipping, exactly as FP-M1 §8.
+  exclusions carried over). Asserted by skipping, exactly as FP-M1 §8. Aprons at twist
+  seams use the same per-seam ring/m̂ data and need no lattice alignment — covered, not
+  special-cased.
 
-### 7.4 The seam-soak gate + the named fallback
+### 7.4 The ridge apron (PRIMARY for LOD↔LOD ridges — M2b scope)
+
+One apron per **seam** whose BOTH adjoining facets are LOD-mesh-covered (a live side needs
+none — its bevel reaches the plane; a quad side needs none — the quad is built from the
+planarized corners and reaches the ridge exactly). Ownership: the **lower fid** of the
+pair builds it (no double-draw), keyed by (owner_fid, slot) in the FacetLodMesher cache.
+
+- **Geometry.** Let `s_max = max(s_A, s_B)` (the coarser of the two sides' strides). Walk
+  the welded ring segment `[r0, r1]` (`seam_ring`, `facet_atlas.gd:355-358`) at pitch
+  `s_max`; at each sample take the surface height from `TerrainConfig.profile_at_dir` at
+  the sample's radial direction (the FacetFarRing recipe, `facet_far_ring.gd:154-179`)
+  and the FarPalette colour. Emit **two quad strips**, one per side: from the ridge line
+  inward `s_max` along each facet's plane (direction = that facet's `seam_mhat`,
+  `facet_atlas.gd:360-362`), with the strip top snapped UP to the side's megablock-top
+  grid (`ceil` to its own s — the outward-rounding discipline of `junction_q_of`:
+  overlap-not-gap, the strip meets or tucks just under the megablock tops). The strips'
+  outer edges drop a short vertical skirt (~s_max blocks) to tuck under the megablock
+  wall faces, killing any residual sliver from height mismatch. Vertices are expressed in
+  the OWNER facet's lattice coords (`world_to_lattice64`) under its `LodFacet` node —
+  the apron therefore moves rigidly with PlanetRoot at a crossing like every other LOD
+  mesh, zero rebuild.
+- **Build/pace.** Built on the BUILDER thread as a job appendix of the owner facet
+  (pure frozen-atlas data + `profile_at_dir` — the same thread-safety class as
+  `generate_block`; ~⌈201/s_max⌉ profile samples ≈ tens-to-200 ms, far too heavy for a
+  main-thread frame). Applied in the facet's atomic swap. Rebuilt (cheap, one strip job)
+  when either adjoining facet re-tiers or gains/loses LOD coverage; paced by the load
+  controller like any other LOD work (§6.5) — an apron job is just a small build job.
+- **Cost (ledgered).** Per seam ≈ 2 strips × ⌈201/s_max⌉ segments × 2 tris + skirts ≈
+  ≤ 500 tris at ℓ1, ~130 at ℓ2, ~70 at ℓ3; ≤ 2 aprons owned per LOD facet (4 ridges,
+  half owned) → at `LOD_MAX_FACETS` = 64 worst ≈ 128 aprons ≈ ≤ 65 k tris, ≤ ~2 MB —
+  inside the existing `LOD_MAX_TRIS`/`LOD_MAX_BYTES_MB` caps (counted in the same
+  ledgers; NEVER-OOM unchanged, §11).
+
+### 7.5 The seam gates
 
 **G-M2-SEAM (headless)**: for ≥ 3 ridges (one cube-edge seam, one flanking a singular
-vertex): build both sides at ℓ ∈ {1, 2}; assert every mesh vertex satisfies
-`own_dist ≥ −1e-3` in its own lattice for all 4 planes (zero protrusion), wall faces
-present at the eroded boundary (no open edge loops facing the ridge), and the measured gap
-≤ 2s + 1. **Live seam soak**: stand at a live↔LOD ridge and fly along a LOD↔LOD ridge —
-no flicker (nothing is coplanar by construction), no console errors, hairline judged
-acceptable. **Named fallback if the user rejects the hairline**: the *ridge apron* — per
-facet, 4 thin FarPalette-coloured strips from the welded ring line (`seam_ring`,
-`facet_atlas.gd:355-358`) to the eroded mesh boundary, built by FacetLodMesher on the main
-thread (few hundred tris/facet, inside the tri ledger). Specced, not built, until the soak
-says it is needed.
+vertex): build both sides at mixed tiers (ℓ1 vs ℓ2); assert (a) every LOD mesh vertex
+satisfies `own_dist ≥ −1e-3` in its own lattice for all 4 planes (zero protrusion — the
+erosion contract); (b) wall faces present at the eroded boundary (no open edge loops
+facing the ridge); (c) **NO LOD↔LOD hairline**: the apron exists for every LOD↔LOD seam,
+spans the full retreat gap on BOTH sides (every ridge-line sample within the domain has
+covering geometry within ε — ray/coverage test against apron + megablock tops), and its
+vertices stay within the ±s_max coverage window; (d) exactly one apron per seam (lower-fid
+ownership — no double-draw); (e) on the live meshers, carve sentinels resolved
+(non-negative slots) and `oob_seen == 0` (the patch-0004 diagnostics — unchanged from
+G-M1-SEAM-2). **Live seam soak**: stand at a live↔LOD ridge and fly along a LOD↔LOD
+ridge — no flicker (nothing coplanar by construction), no console errors, no visible slit
+at any tier.
 
 ---
 
@@ -770,6 +812,7 @@ faster than 1.5 s-per-leg and on a saturated 4-core web tab stretches instead of
 | Pool worst (1 active @128 + 2 neighbours @96, Z1-hybrid) | 80 MB | FP-M1 ledger (40 + 2×20); DOWN from 120 |
 | LOD mesh cache (CPU arrays) | ≤ `LOD_MAX_BYTES_MB` = 96 MB | §1.3 estimates: steady ≈ 50 MB (8×ℓ1 + 16×ℓ2 + ~40×ℓ3); cap = 2× headroom; GPU ≈ ×1 measured by the live A/B |
 | LOD triangles | ≤ 3 M | FP-R0 B2 web ceiling analysis (`verify_fp_r0.gd:320-323`) |
+| Ridge aprons (§7.4) | ≤ ~65 k tris / ≤ ~2 MB worst (128 aprons @ ℓ1) | counted INSIDE the LOD tri/byte caps above, not additional; per-seam cost table §7.4 |
 | Build queue | ≤ 16 jobs / ≤ 30 est-s | grant admission (§6.4) |
 | Builder thread stack | 2 MB | one persistent pthread (§4.3) |
 | Far ring, atlas, probe generators | < 3 MB | FP2 ledger + ~1 KB/frozen generator × cached facets |
@@ -797,9 +840,11 @@ FP_M1_POOL + FP_M2_LOD, exit 0/1) + extensions to `verify_faceted.gd`. Inventory
   §1.3 table re-measured); built entirely on the builder Thread (main-thread id assert);
   voxel-pool stats untouched (`vox_gen` task delta == 0 during a pure-LOD build).
 - **G-M2-FRAME**: §8 placement round-trip under two active facets.
-- **G-M2-SEAM**: §7.4 headless asserts (zero protrusion, walls present, gap ≤ 2s+1;
+- **G-M2-SEAM**: §7.5 headless asserts (zero protrusion; walls present; **no LOD↔LOD
+  hairline** — apron present per seam, spans the retreat gap both sides, one owner,
+  within the ±s_max window; carve sentinels resolved + `oob_seen == 0` on live meshers;
   singular-vertex facets excluded from the complementarity form, included in the
-  no-protrusion form).
+  no-protrusion + apron-coverage forms).
 - **G-M2-SEL**: selector table-driven unit gate — (d, fov, h) → expected tier incl. the
   four regime archetypes; monotone in d; hysteresis two-threshold sweep; telescope fov
   shrink raises requested tiers for in-frustum facets only.
@@ -843,11 +888,15 @@ slope, no console storms, no blank) + the stage-specific soak named below.
   shape settled (materials question, §4.1.4), NO scene consumer (verify-only).
   **Gate:** G-M2-ID, G-M2-BUILD, the thread-pool boot assert (§4.3); FLAT 6027/0.
   Ships as dead code behind `FP_M2_LOD` (byte-identical deploy).
-- **FP-M2b — FacetLodMesher node + cache/caps + static tiers.** The class (§5), apply/swap,
-  ledgers, LRU, far-ring exclusion merge; tier selection is a fixed per-ring table
-  (ring-1 → ℓ1, ring-2 → ℓ2, else ℓ3) — no SSE yet. Replaces quads for covered facets.
-  **Gate:** G-M2-CAPS, G-M2-FRAME, G-M2-SEAM headless; live deploy (flag flipped at
-  export): megablock detail visible on ≥ 3 facets at a ridge, heap-flat soak.
+- **FP-M2b — FacetLodMesher node + cache/caps + static tiers + the RIDGE APRON.** The
+  class (§5), apply/swap, ledgers, LRU, far-ring exclusion merge; tier selection is a
+  fixed per-ring table (ring-1 → ℓ1, ring-2 → ℓ2, else ℓ3) — no SSE yet. Replaces quads
+  for covered facets. The §7.4 apron ships HERE (primary scope, user decision): built as
+  a builder-thread job appendix, one per LOD↔LOD seam, counted in the LOD ledgers —
+  no LOD↔LOD hairline from the first deployed LOD build onward.
+  **Gate:** G-M2-CAPS, G-M2-FRAME, G-M2-SEAM headless (incl. the no-hairline/apron
+  asserts); live deploy (flag flipped at export): megablock detail visible on ≥ 3 facets
+  at a ridge, no visible ridge slit, heap-flat soak.
 - **FP-M2c — SSE selector + budgeter + the load controller core.** §6 in full: camera
   input, hysteresis, request-grant, progressive refinement, idle demote, `facet_of_dir`
   stub + off-surface spawn freeze; `StreamLoadController` (§6.5) with surfaces 1–2 wired
@@ -905,9 +954,16 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
    walking, FP-M1 §4.3) and the 20 s timeout; judged in the M2d live soak. If rejected:
    hide the LOD mesh's *near-band tiles only* at spawn (tile granularity exists) — specced
    fallback, not built.
-6. **Seam hairline rejection.** The ≤ 2s LOD↔LOD slit (§7.3) is the design's one honest
-   visual compromise. The ridge apron (§7.4) is the named, ledgered fallback; it does NOT
-   change the erosion contract, only covers it.
+6. **Apron weld defects.** The apron replaces the (rejected) LOD↔LOD hairline, so its own
+   failure modes inherit the seam's visibility: (a) a height-mismatch sliver where the
+   strip top misses a megablock top — countered by the ceil-to-s snap + the outer skirt
+   (§7.4), asserted by G-M2-SEAM(c)'s coverage test at MIXED tiers (ℓ1 vs ℓ2, the worst
+   case); (b) a stale apron after one side re-tiers (s_max changed) — the rebuild trigger
+   is keyed on both neighbours' cache entries, and a stale window is bounded by one
+   builder job; (c) double-draw if ownership breaks at a fold-adjacent seam —
+   G-M2-SEAM(d) asserts exactly one apron per seam. The erosion contract itself is
+   untouched — the apron only covers it, never substitutes for the zero-protrusion
+   guarantee.
 7. **`build_mesh` API drift / materials.** The exact script-call shape is proven only by
    FP-R0 headless (dummy renderer). If live surfaces come back unshaded, the
    surface_set_material fallback lands in FP-M2a (its live smoke covers it) — before any
@@ -948,3 +1004,4 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
 | 5 | ℓ0 as a LOD-mesh tier (REVIEW §6.3 sketch) | **Rejected** — full-res is exclusively the live-terrain representation; the LOD floor is ℓ1 |
 | 6 | FP-M2 tier reach | ℓ∈{1..3} + quad; ℓ∈{4,5} + zoom input + distant-planet math are FP-M3 (machinery ready) |
 | 7 | Fixed-schedule streaming pace (FP-M1c `RAMP_SECONDS` legs, fixed const budgets) | **Superseded** — closed-loop admission on measured main-thread load (§6.5); `RAMP_SECONDS` becomes the *minimum* leg duration, stretched (never compressed below it) by the controller; fixed consts remain as the hard upper bounds the credit scales within |
+| 8 | LOD↔LOD erosion hairline as an accepted artifact (this doc's first revision) | **Rejected by the user** — designed out: the ridge apron (§7.4) is PRIMARY M2b scope; the remaining accepted-artifact set is (b) transient promote/demote megablock overlap and (c) player edits invisible/healed at LOD distance |

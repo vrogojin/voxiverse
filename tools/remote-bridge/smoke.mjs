@@ -47,20 +47,30 @@ async function main() {
   await sleep(700); // give it time to listen
 
   try {
-    // ── 1. GOOD client ──────────────────────────────────────────────────────────────────────
+    // ── 1. GOOD client — real handshake: hello, WAIT for auth_ok, THEN stream ─────────────────
+    let gotAuthOk = false;
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(URL);
       const timer = setTimeout(() => reject(new Error('good client timeout')), 4000);
       ws.on('open', () => {
         ws.send(JSON.stringify({ type: 'hello', token: TOKEN, ua: 'smoke', ver: 'test' }));
-        ws.send(JSON.stringify({ type: 'telemetry', fps: 59.5, worst_ms: 21.3, _smoke: 'marker-A' }));
-        const frame = Buffer.concat([Buffer.from([FRAME_TAG]), JPEG_1x1]);
-        ws.send(frame, { binary: true });
-        setTimeout(() => { clearTimeout(timer); ws.close(1000, 'done'); resolve(); }, 600);
+      });
+      ws.on('message', (data, isBinary) => {
+        if (isBinary) return;
+        let m; try { m = JSON.parse(data.toString('utf8')); } catch { return; }
+        if (m.type === 'auth_ok') {
+          gotAuthOk = true;
+          // Only NOW does the real client stream — mirrors the auth-ack gate.
+          ws.send(JSON.stringify({ type: 'telemetry', fps: 59.5, worst_ms: 21.3, _smoke: 'marker-A' }));
+          ws.send(Buffer.concat([Buffer.from([FRAME_TAG]), JPEG_1x1]), { binary: true });
+          setTimeout(() => { clearTimeout(timer); ws.close(1000, 'done'); resolve(); }, 600);
+        }
       });
       ws.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
     await sleep(300);
+
+    ok(gotAuthOk, 'relay sent app-level auth_ok after a valid hello');
 
     ok(existsSync(TELEMETRY_FILE), 'telemetry.jsonl was written');
     let telem = '';
@@ -81,15 +91,20 @@ async function main() {
     const badResult = await new Promise((resolve) => {
       const ws = new WebSocket(URL);
       let closedCode = null;
-      const timer = setTimeout(() => resolve({ closedCode, timedOut: true }), 4000);
+      let sawAuthOk = false;
+      const timer = setTimeout(() => resolve({ closedCode, sawAuthOk, timedOut: true }), 4000);
       ws.on('open', () => {
         ws.send(JSON.stringify({ type: 'hello', token: 'WRONG-' + TOKEN, ua: 'smoke-bad', ver: 'test' }));
         ws.send(JSON.stringify({ type: 'telemetry', _smoke: 'marker-B-should-not-appear' }));
       });
-      ws.on('close', (code) => { closedCode = code; clearTimeout(timer); resolve({ closedCode, timedOut: false }); });
+      ws.on('message', (data, isBinary) => {
+        if (!isBinary && data.toString('utf8').includes('auth_ok')) sawAuthOk = true;
+      });
+      ws.on('close', (code) => { closedCode = code; clearTimeout(timer); resolve({ closedCode, sawAuthOk, timedOut: false }); });
       ws.on('error', () => { /* close follows */ });
     });
     ok(badResult.closedCode === 4001, `bad-token connection CLOSED by relay (code ${badResult.closedCode})`);
+    ok(!badResult.sawAuthOk, 'bad-token connection received NO auth_ok (never authed)');
 
     await sleep(300);
     const telemAfter = existsSync(TELEMETRY_FILE) ? readFileSync(TELEMETRY_FILE, 'utf8') : '';

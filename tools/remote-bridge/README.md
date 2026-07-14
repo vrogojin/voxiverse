@@ -30,8 +30,13 @@ this host reads; it never serves the received data publicly.
    never lands in nginx access logs.
 3. **Viewport-only capture.** Frames are `get_viewport().get_texture().get_image()` — the game
    canvas only, never the user's screen or other tabs.
-4. **No inbound control.** Anything the relay might send is drained and discarded by the game; it
-   never influences play.
+4. **Auth-ack gate.** After the hello the client streams **nothing** and captures **nothing** until
+   the relay returns an app-level `{"type":"auth_ok"}` (sent only after a valid token). An
+   unauthenticated visitor (bad/absent token → closed `4001`, never acked) never reads back or
+   streams a single frame — the brief pre-rejection window is closed. `auth_ok` is also the handshake
+   Phase-2 controls will ride.
+5. **No inbound control.** The only inbound message the client acts on is that one `auth_ok`
+   handshake; everything else is drained and discarded — it never influences play.
 5. **Relay hardening.** Binds `127.0.0.1` only (reachable solely through the nginx `/remote` route),
    caps concurrent connections, rate-limits per connection, bounds frame size, rolls/caps the
    telemetry log and prunes the frame ring, and logs every connect/disconnect/auth-fail.

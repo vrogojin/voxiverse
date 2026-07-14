@@ -14,9 +14,13 @@ extends Node
 ##     relay in the `hello`; the relay rejects+closes any connection whose hello token is
 ##     missing/mismatched. The token travels inside the wss (encrypted) hello frame — NOT in the WS
 ##     URL — so it never lands in nginx access logs.
-##   * SEND-ONLY. Phase 1 has NO control surface: the bridge only SENDS (telemetry + frames). Any
-##     inbound packet is DRAINED and DISCARDED — it never influences the game. (Controls are Phase 2,
-##     gated separately.)
+##   * AUTH-ACK GATE. After the hello, the client sends NOTHING and captures NOTHING until the relay
+##     returns an app-level {"type":"auth_ok"}. So an unauthenticated visitor (bad/absent token → the
+##     relay closes 4001, never acks) never reads back or streams a single frame — the brief
+##     pre-rejection capture window is closed. auth_ok is also the handshake Phase-2 controls ride.
+##   * SEND-ONLY. Phase 1 has NO control surface: the bridge only SENDS (telemetry + frames). The only
+##     inbound packet it acts on is that one auth_ok handshake; everything else is DRAINED and
+##     DISCARDED — it never influences the game. (Controls are Phase 2, gated separately.)
 ##   * VIEWPORT-ONLY CAPTURE. Frames are get_viewport().get_texture().get_image() — the game canvas
 ##     ONLY, never the user's screen or other tabs.
 ##
@@ -60,6 +64,7 @@ var _url := DEFAULT_URL
 var _ws: WebSocketPeer = null
 var _was_open := false
 var _hello_sent := false
+var _authed := false                # relay returned auth_ok → cleared to stream telemetry + frames
 var _reconnect_at := 0.0            # msec (Time.get_ticks_msec) at which to attempt reconnect; 0 = connect now
 var _backoff := RECONNECT_BACKOFF_MIN
 
@@ -156,6 +161,7 @@ func _ready() -> void:
 func _open_socket() -> void:
 	_was_open = false
 	_hello_sent = false
+	_authed = false
 	var err := _ws.connect_to_url(_url)
 	if err != OK:
 		# Connect failed to even start — schedule a backed-off retry.
@@ -200,12 +206,26 @@ func _process(delta: float) -> void:
 	if not _was_open:
 		_was_open = true
 		_backoff = RECONNECT_BACKOFF_MIN     # a clean open resets the backoff ladder
-		_send_hello()
-		_set_link(true)                      # socket open → badge shows "REMOTE ACTIVE — observing"
+		_send_hello()                        # socket open, but NOT yet live — wait for auth_ok
 
-	# Phase 1 is SEND-ONLY: drain and discard anything the relay sends. No control surface.
+	# Drain inbound. The ONLY message the client acts on is the one auth_ok handshake (Phase 1 has no
+	# control surface); everything else is discarded. auth_ok flips the gate that lets telemetry +
+	# frames flow and turns the badge live.
 	while _ws.get_available_packet_count() > 0:
-		_ws.get_packet()
+		var pkt := _ws.get_packet()
+		if not _authed and not _ws.was_string_packet():
+			continue                         # pre-auth binary is never expected — ignore
+		if not _authed:
+			var txt := pkt.get_string_from_utf8()
+			if txt.find("auth_ok") != -1:
+				var j = JSON.parse_string(txt)
+				if j is Dictionary and str((j as Dictionary).get("type", "")) == "auth_ok":
+					_authed = true
+					_set_link(true)          # authenticated + open → badge "REMOTE ACTIVE — observing"
+
+	# Nothing streams until the relay has acked our token.
+	if not _authed:
+		return
 
 	# ── Telemetry tick ────────────────────────────────────────────────────────────────────────
 	if _win_acc >= TELEMETRY_INTERVAL:
@@ -313,8 +333,8 @@ func _merge_rich_state(msg: Dictionary) -> void:
 ## Capture the game canvas and send it as a binary JPEG frame, unless a capture is already inflight
 ## or the socket is backpressured (skip, don't queue — a stale frame helps no one).
 func _maybe_capture_frame() -> void:
-	if _capturing:
-		return
+	if _capturing or not _authed:
+		return                            # never read back a frame before the relay's auth_ok
 	if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		return
 	if _ws.get_current_outbound_buffered_amount() > OUTBOUND_BACKPRESSURE_BYTES:

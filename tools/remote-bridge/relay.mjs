@@ -184,6 +184,10 @@ wss.on('connection', (ws, req) => {
       }
       authed = true;
       clearTimeout(authTimer);
+      // App-level AUTH-ACK: the client withholds ALL telemetry + frame capture until it receives this,
+      // so an unauthenticated visitor never reads back or streams a single frame (closes the brief
+      // pre-rejection capture window). It is also the handshake Phase-2 controls will ride.
+      try { ws.send(JSON.stringify({ type: 'auth_ok' })); } catch { /* ignore */ }
       log('AUTH-OK:', peer, 'ver=', String(hello.ver || '?'), 'ua=', String(hello.ua || '?').slice(0, 80));
       return;
     }

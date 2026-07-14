@@ -22,9 +22,19 @@ extends SceneTree
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FLB := preload("res://src/world/facet_lod_builder.gd")
 const FLM := preload("res://src/world/facet_lod_mesher.gd")   # preload (not the global class_name) — headless --script parse scope
+const SLC := preload("res://src/world/stream_load_controller.gd")
 
 const _BYTES_PER_VERT := 64
 const _BYTES_PER_INDEX := 4
+
+## Deterministic synthetic load source for G-M2-CTRL (§6.5.7): the injected input the controller reads instead of the
+## live Performance/VoxelEngine adapter. `frame_ms`/`backlog` are set by the gate to script a square wave — no wall
+## clock, no machine-speed dependence, so the whole credit trace is bit-reproducible.
+class _SquareWaveSource extends RefCounted:
+	var frame_ms := 6.0
+	var backlog := 0
+	func poll() -> Dictionary:
+		return {"frame_ms": frame_ms, "backlog": backlog}
 
 var _pass := 0
 var _fail := 0
@@ -99,6 +109,10 @@ func _initialize() -> void:
 	await _gate_frame(mod, active, neighbour)
 	await _gate_caps(mod, active)
 	await _gate_seam(mod, active)
+	# --- FP-M2c gates: SSE selector + facet_of_dir + the load controller ---
+	_gate_selector()
+	_gate_dir(nf)
+	_gate_ctrl(mod, active)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	# Deterministic process teardown so headless EXITS (not just prints the tally). Under FP_M1_POOL the module
@@ -471,6 +485,178 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 			_ok(max_off > 0.5 and min_off < -0.5, "G-M2-SEAM(c): apron spans BOTH sides of the ridge (owner off=%.1f, nbr off=%.1f)" % [max_off, min_off])
 			_ok(max_perp <= float(s_max) + 0.75, "G-M2-SEAM(c): every apron vertex within the ±s_max window (max |off|=%.2f ≤ %d)" % [max_perp, s_max])
 	m.shutdown(); m.free()
+
+# ---------- G-M2-SEL: SSE selector (monotone + floor/cap + hysteresis + telescope) ----------
+func _gate_selector() -> void:
+	print("  --- G-M2-SEL: SSE selector (monotone in d, floor-1/cap-3, hysteresis, telescope) ---")
+	var m = FLM.new()                                    # no setup() — the selector math needs no builder/module/tree
+	var h := 1080.0
+	var fov := deg_to_rad(70.0)
+	# (1) MONOTONE in d + floor-1/cap-3 over a wide sweep (near walk → far orbit).
+	var mono := true
+	var prev := 0
+	var floor_ok := true
+	var cap_ok := true
+	var d := 50.0
+	while d <= 8000.0:
+		var t := int(m.desired_tier(d, fov, h))
+		if t < prev:
+			mono = false
+		if t < 1:
+			floor_ok = false
+		if t > FLM.LOD_MAX_TIER:
+			cap_ok = false
+		prev = t
+		d *= 1.15
+	_ok(mono, "G-M2-SEL: desired tier is MONOTONE non-decreasing in distance")
+	_ok(floor_ok, "G-M2-SEL: desired tier never below the LOD floor 1 (ℓ0 is live-terrain only)")
+	_ok(cap_ok, "G-M2-SEL: desired tier never above the cap LOD_MAX_TIER=%d (quad is ℓ=∞)" % FLM.LOD_MAX_TIER)
+	_ok(int(m.desired_tier(50.0, fov, h)) == 1, "G-M2-SEL: near walk (d=50) desires ℓ1 (finest LOD)")
+	_ok(int(m.desired_tier(8000.0, fov, h)) == FLM.LOD_MAX_TIER, "G-M2-SEL: far limb (d=8000) desires the cap ℓ%d" % FLM.LOD_MAX_TIER)
+	# (2) the four regime archetypes (§6.2 worked thresholds, h=1080, fov 70°: ℓ1<514, ℓ2 from 1028, ℓ3 from 2056).
+	_ok(int(m.desired_tier(700.0, fov, h)) == 1, "G-M2-SEL: walk regime d=700 → ℓ1 (t=%d)" % int(m.desired_tier(700.0, fov, h)))
+	_ok(int(m.desired_tier(1500.0, fov, h)) == 2, "G-M2-SEL: low-flight d=1500 → ℓ2 (t=%d)" % int(m.desired_tier(1500.0, fov, h)))
+	_ok(int(m.desired_tier(3000.0, fov, h)) == 3, "G-M2-SEL: near-orbit d=3000 → ℓ3 (t=%d)" % int(m.desired_tier(3000.0, fov, h)))
+	# telescope: shrinking fov (zoom) RAISES the requested tier (finer ℓ, smaller number) for the SAME far facet.
+	var wide := int(m.desired_tier(3000.0, deg_to_rad(70.0), h))
+	var zoom := int(m.desired_tier(3000.0, deg_to_rad(20.0), h))
+	_ok(zoom < wide, "G-M2-SEL: telescope (fov 70°→20° at d=3000) refines the tier ℓ%d → ℓ%d (finer)" % [wide, zoom])
+	# (3) HYSTERESIS — two-threshold, ≤1 transition per direction across ONE boundary (the ℓ1/ℓ2 band).
+	var up_lc := -1.0
+	var up_transitions := 0
+	var cur := 1
+	var lc := 1.0
+	while lc <= 2.9:
+		var nt := int(m.hyst_tier(lc, cur))
+		if nt != cur:
+			up_transitions += 1
+			if up_lc < 0.0:
+				up_lc = lc
+			cur = nt
+		lc += 0.01
+	var down_lc := -1.0
+	var down_transitions := 0
+	cur = 2
+	lc = 2.9
+	while lc >= 1.1:
+		var nt := int(m.hyst_tier(lc, cur))
+		if nt != cur:
+			down_transitions += 1
+			if down_lc < 0.0:
+				down_lc = lc
+			cur = nt
+		lc -= 0.01
+	_ok(up_transitions <= 1 and down_transitions <= 1,
+		"G-M2-SEL: hysteresis yields ≤1 transition per direction (up=%d, down=%d — no thrash)" % [up_transitions, down_transitions])
+	_ok(up_transitions == 1 and down_transitions == 1,
+		"G-M2-SEL: exactly one transition each way across the ℓ1/ℓ2 boundary")
+	_ok(up_lc > down_lc + 0.2,
+		"G-M2-SEL: two DIFFERENT thresholds (promote-to-finer at ℓ_c=%.2f ≠ demote at ℓ_c=%.2f — the hysteresis gap)" % [down_lc, up_lc])
+	m.free()
+
+# ---------- G-M2-DIR: facet_of_dir round-trip (§10) ----------
+func _gate_dir(nf: int) -> void:
+	print("  --- G-M2-DIR: facet_of_dir round-trip over all %d facets + orbit-path sanity ---" % nf)
+	var mismatches := 0
+	var first_bad := -1
+	for fid in range(nf):
+		var cc: Vector2i = FA.centre_cell(fid)
+		var d: CubeSphere.DVec3 = FA.cell_dir(fid, cc.x, cc.y)
+		if int(FA.facet_of_dir(d)) != fid:
+			mismatches += 1
+			if first_bad < 0:
+				first_bad = fid
+	_ok(mismatches == 0, "G-M2-DIR: facet_of_dir(cell_dir(centre)) == fid for ALL %d facets (%d mismatches%s)" % [
+		nf, mismatches, "" if first_bad < 0 else ", first fid=%d" % first_bad])
+	# orbit-path sanity: the selector stays finite + monotone along a scripted ascent-to-orbit (no NaN/thrash off-surface).
+	var m = FLM.new()
+	var finite := true
+	var mono := true
+	var prev := -1
+	var alt := 100.0
+	while alt <= 12000.0:
+		var t := int(m.desired_tier(alt, deg_to_rad(70.0), 1080.0))
+		if t < 1 or t > FLM.LOD_MAX_TIER:
+			finite = false
+		if t < prev:
+			mono = false
+		prev = t
+		alt *= 1.3
+	_ok(finite and mono, "G-M2-DIR: selector finite + monotone along an ascent-to-orbit path (no NaN, no off-surface thrash)")
+	m.free()
+
+# ---------- G-M2-CTRL: the closed-loop load controller (synthetic square wave) ----------
+func _gate_ctrl(mod: Node3D, active: int) -> void:
+	print("  --- G-M2-CTRL: closed-loop load controller (deterministic synthetic square wave) ---")
+	var ctrl = SLC.new()
+	var src = _SquareWaveSource.new()
+	ctrl.set_input_source(src)
+	var DT := 1.0 / 60.0                                  # synthetic 60 fps clock — machine speed cannot perturb it
+	var t := 0.0
+	# (f) flag-off / inert byte-identity: a fresh/idle controller passes the shipped fixed values through unchanged.
+	_ok(is_equal_approx(ctrl.credit(), 1.0) and is_equal_approx(ctrl.apply_budget_ms(2.0), 2.0)
+			and int(ctrl.grant_count(2)) == 2 and is_equal_approx(ctrl.stream_pace(), 1.0),
+		"G-M2-CTRL(f): inert controller = shipped defaults (credit 1, apply 2ms, grants 2, pace 1) — flag-off byte-identity")
+	# settle LOW (headroom) → credit pins at 1.
+	src.frame_ms = 6.0; src.backlog = 0
+	for i in range(120):
+		t += DT; ctrl.tick(t)
+	_ok(is_equal_approx(ctrl.credit(), 1.0), "G-M2-CTRL: credit settles to 1 under sustained headroom")
+	# (a) sustained OVERLOAD → credit falls to 0 within ≤4 control ticks; admissions measurably stop.
+	src.frame_ms = 40.0                                  # well above CTRL_FRAME_BUDGET_MS=18
+	var start_ticks := int(ctrl.stats()["ticks"])
+	var ticks_to_zero := -1
+	for i in range(120):
+		t += DT; ctrl.tick(t)
+		if ctrl.credit() == 0.0 and ticks_to_zero < 0:
+			ticks_to_zero = int(ctrl.stats()["ticks"]) - start_ticks
+			break
+	_ok(ticks_to_zero >= 1 and ticks_to_zero <= 4, "G-M2-CTRL(a): credit → 0 within ≤4 ticks of sustained overload (%d ticks)" % ticks_to_zero)
+	_ok(int(ctrl.grant_count(2)) == 0 and is_equal_approx(ctrl.apply_budget_ms(2.0), 0.0) and is_equal_approx(ctrl.stream_pace(), 0.0),
+		"G-M2-CTRL(a): at credit 0 all admissions stop (grants 0, apply 0ms, pace 0)")
+	# (c) no promote↔demote cycling: only ≥ CTRL_OVERLOAD_SUSTAIN_S (3s) of credit-0 overload trips a demote; a short
+	# high pulse must not. We've been overloaded < 3s, so demote_pressure stays false (pause-first, never yanked).
+	_ok(not ctrl.demote_pressure(), "G-M2-CTRL(c): short overload does NOT trip demote pressure (no promote↔demote cycle)")
+	# (b) load removed → credit RECOVERS and admissions resume.
+	src.frame_ms = 6.0
+	for i in range(900):
+		t += DT; ctrl.tick(t)
+	_ok(ctrl.credit() >= 0.9, "G-M2-CTRL(b): credit recovers under restored headroom (%.2f ≥ 0.9)" % ctrl.credit())
+	_ok(int(ctrl.grant_count(2)) > 0 and ctrl.apply_budget_ms(2.0) > 0.0, "G-M2-CTRL(b): admissions resume after recovery")
+	# (d) the vox_gen > CTRL_BACKLOG_MAX feed-forward gate holds surfaces 3-4 at zero even at FULL frame headroom.
+	src.frame_ms = 6.0; src.backlog = CubeSphere.CTRL_BACKLOG_MAX + 100
+	for i in range(120):
+		t += DT; ctrl.tick(t)
+	_ok(ctrl.backlog_gated(), "G-M2-CTRL(d): backlog %d > %d closes the feed-forward gate" % [int(src.backlog), CubeSphere.CTRL_BACKLOG_MAX])
+	_ok(is_equal_approx(ctrl.credit(), 1.0), "G-M2-CTRL(d): credit stays 1 (backlog gates surfaces 3-4, NOT the AIMD credit)")
+	_ok(is_equal_approx(ctrl.stream_pace(), 0.0) and not ctrl.promote_admitted(),
+		"G-M2-CTRL(d): surfaces 3-4 HELD at zero (pace 0, promote denied) despite full frame headroom")
+	src.backlog = 0
+	for i in range(30):
+		t += DT; ctrl.tick(t)
+	_ok(is_equal_approx(ctrl.stream_pace(), 1.0), "G-M2-CTRL(d): pace reopens to credit once the backlog drains")
+	# (e) NEVER-OOM caps still BIND at full credit — a request storm cannot exceed the ledgers regardless of the controller.
+	var m = FLM.new()
+	get_root().add_child(m)
+	if bool(m.setup(mod)):
+		m.call("set_load_controller", ctrl)              # credit is 1 here (full) → grants are NOT throttled
+		var storm := 0
+		var f := 0
+		while storm < 80 and f < FA.facet_count():
+			if f != active:
+				m.request(f, 1, true)                    # dry admission storm at the heaviest tier
+				storm += 1
+			f += 1
+		var st: Dictionary = m.stats()
+		var cap_bytes := FLM.LOD_MAX_BYTES_MB * 1024 * 1024
+		_ok(int(st["tris"]) <= FLM.LOD_MAX_TRIS and int(st["bytes"]) <= cap_bytes,
+			"G-M2-CTRL(e): at credit 1 the NEVER-OOM caps still bind (tris %d ≤ %d, bytes %d ≤ %d)" % [
+				int(st["tris"]), FLM.LOD_MAX_TRIS, int(st["bytes"]), cap_bytes])
+		m.shutdown()
+	else:
+		_ok(false, "G-M2-CTRL(e): mesher setup for the full-credit caps check")
+	if is_instance_valid(m):
+		m.free()
 
 # ---------- helpers ----------
 func _drive_mesher(mesher, fid: int, timeout_ms: int) -> bool:

@@ -33,7 +33,7 @@ const LOD_MAX_TRIS := 3_000_000    # HARD cap: total LOD triangles (meshes + apr
 const LOD_MAX_BYTES_MB := 96       # HARD cap: CPU-side mesh bytes (§11 ledger; ×1024×1024 below)
 const LOD_QUEUE_MAX_JOBS := 16     # tiles queued but not yet building (feed-forward bound; M2c budgeter refines)
 const LOD_IDLE_DEMOTE_S := 30.0    # (M2c uses proactively; present here for the const ledger)
-const LOD_COVER_RINGS := 3         # STATIC (M2b): cover facet-rings 1..3 with ℓ1/ℓ2/ℓ3; beyond → quad
+const LOD_COVER_RINGS := 3         # LEGACY (M2b static rule) — SUPERSEDED by the M2c SSE selector; kept for the const ledger
 const APRON_SKIRT := 1             # outer-skirt depth in s_max units (tuck under megablock walls)
 const LOD_REQUESTS_PER_TICK := 2   # new facet builds admitted per tick — PACES probe-generator creation + enqueues
                                    # across frames (never a set-time/crossing-time flood of ~48 generators, §6.4)
@@ -109,15 +109,21 @@ func shutdown() -> void:
 	_cache.clear(); _building.clear(); _apron_building.clear(); _want.clear(); _pending.clear()
 	_ledger_tris = 0; _ledger_bytes = 0
 
-# ============================ tier policy (STATIC per-ring, M2b) ============================
+# ============================ tier policy (SSE SELECTOR + request-grant BUDGETER, M2c §6) ============================
 
-## Recompute the static per-ring target tiers for `active`, drop stale facets. Called from module_world on init +
-## every crossing (redesignate / pool_reset). The wanted facets are BUILT by tick()'s paced request pass — NOT
-## enqueued here, so a crossing never floods ~48 probe-generator creations onto the crossing frame (§6.4 pacing).
+# §1.3 per-tier build-time estimates (native seconds) — the FIXED, load-independent est-seconds admission bound
+# (§6.5.7: deterministic, machine-speed cannot perturb a gate; the EWMA self-calibration of §6.4 is live-only polish,
+# deliberately NOT wired so the headless gates stay bit-reproducible). The budgeter denies a grant that would push
+# the in-flight sum past CubeSphere.LOD_QUEUE_MAX_EST_S.
+const _EST_BUILD_S := {1: 15.0, 2: 4.0, 3: 1.0}
+
+## A crossing / pool change happened. Under the SSE selector the target rung is pure camera math (recomputed every
+## tick from the moving camera), so this just re-points the active facet + refreshes the want set and drops any facet
+## the new geometry no longer wants (cheap unload; the far-ring quad covers it). No build is enqueued here — tick()'s
+## budgeter paces every grant, so a crossing never floods ~48 probe-generator creations onto the crossing frame.
 func set_active_facet(active: int) -> void:
 	_active_fid = active
 	_recompute_wants()
-	# Evict facets that are no longer wanted (a crossing shifted the covered rings). Cheap unloads, never throttled.
 	for fid in _cache.keys():
 		if not _want.has(fid):
 			evict(fid)
@@ -132,63 +138,152 @@ func notify_pool_changed() -> void:
 		if not _want.has(fid):
 			evict(fid)
 
-## STATIC ring rule (§13): every front-hemisphere facet within LOD_COVER_RINGS of the active facet gets a tier
-## (ring-1 → ℓ1 … ring-3 → ℓ3); the active facet and any LIVE pool facet are excluded (live terrain covers them);
-## beyond the covered rings stays quad. Ring = round(angle / facet-angular-step) — robust across face seams.
+# ---- the SSE selector (§6.1/§6.2/§6.3): pure camera math, testable stand-alone (G-M2-SEL drives these directly) ----
+
+## The continuous SSE tier ℓ_c for a facet at distance `d` under a vertical fov (radians) + viewport height (px):
+## the largest ℓ with the projected megablock size p(ℓ)=(2^ℓ·h)/(2·d·tan(fov/2)) ≤ τ solves to
+## ℓ_c = log2(τ · 2 · d · tan(fov/2) / h). Monotone increasing in d (a farther facet tolerates a coarser tier).
+func sse_lc(d: float, fov_v_rad: float, viewport_h: float) -> float:
+	var dd := maxf(d, 1.0)
+	var coeff := 2.0 * dd * tan(fov_v_rad * 0.5) / maxf(viewport_h, 1.0)
+	return log(CubeSphere.LOD_TAU_PX * coeff) / log(2.0)
+
+## The stateless desired LOD tier = clamp(floor(ℓ_c), 1, LOD_MAX_TIER). A true desired 0 is representable ONLY by a
+## live terrain (§6.1), so the LOD grant FLOOR is 1; the coarsest tier is capped at LOD_MAX_TIER (the quad is ℓ=∞).
+func desired_tier(d: float, fov_v_rad: float, viewport_h: float) -> int:
+	return clampi(int(floor(sse_lc(d, fov_v_rad, viewport_h))), 1, LOD_MAX_TIER)
+
+## Hysteresis (§6.3): hold the current tier `cur` while ℓ_c stays inside its widened band [cur−HYST, cur+1+HYST];
+## only when ℓ_c LEAVES the band does the tier snap to the stateless desired. A camera oscillating on a boundary
+## flips at two different thresholds (promote-to-finer at cur−HYST, demote at cur+1+HYST) → no thrash. cur<1 (no
+## mesh) → the desired directly. G-M2-SEL sweeps ℓ_c both ways and asserts ≤1 transition per direction.
+func hyst_tier(lc: float, cur: int) -> int:
+	var des := clampi(int(floor(lc)), 1, LOD_MAX_TIER)
+	if cur < 1:
+		return des
+	var lo := float(cur) - CubeSphere.LOD_HYST_BAND
+	var hi := float(cur) + 1.0 + CubeSphere.LOD_HYST_BAND
+	if lc >= lo and lc <= hi:
+		return cur                                              # inside the hysteresis band → hold
+	return des
+
+## The live camera driving the selector: the injected one (gates / M2d), else the viewport's active Camera3D so the
+## selector is self-wiring on the live path. null in headless with no camera → the SSE recompute is a no-op (the
+## caps/frame/seam gates drive request() directly and their wants are left untouched).
+func _selector_camera() -> Camera3D:
+	if _cam != null and is_instance_valid(_cam):
+		return _cam
+	var vp := get_viewport()
+	return vp.get_camera_3d() if vp != null else null
+
+## The RENDER-space centre of facet `fid`: facet_transform(fid)·(centre lattice) is the planet-absolute centre; the
+## mesher's own global_transform (it sits @ identity under PlanetRoot @ T_active⁻¹) maps it into render/world space,
+## the SAME space the camera lives in — so distance is frame-consistent for every viewer and rides a crossing rigidly.
+func _facet_render_centre(fid: int) -> Vector3:
+	var cc: Vector2i = FacetAtlas.centre_cell(fid)
+	var local: Vector3 = FacetAtlas.facet_transform(fid) * Vector3(float(cc.x), 0.0, float(cc.y))
+	return global_transform * local
+
+## SSE want recompute (§6.4.1): every front-hemisphere, camera-facing, in-frustum facet not live in the pool gets
+## its hysteresis target tier stamped in _want. Live-only (needs a camera); a no-op without one so direct-request
+## gates keep their wants. The budgeter — never this — allocates; this only sets targets (pure geometry/camera).
 func _recompute_wants() -> void:
+	var cam := _selector_camera()
+	if cam == null or not FacetAtlas.is_ready() or _active_fid < 0:
+		return                                                 # SSE is live-only; leave existing wants untouched
 	_want.clear()
-	if _active_fid < 0 or not FacetAtlas.is_ready():
-		return
 	var live := {}
 	if _mod != null and _mod.has_method("pool_fids"):
 		for f in _mod.call("pool_fids"):
 			live[int(f)] = true
-	var nrm: Array = FacetAtlas.facet_normal64(_active_fid)
-	var ac := _centre_dir(_active_fid)
-	var step := (PI * 0.5) / float(FacetAtlas.K)                # one grid step of angular facet size
+	var cam_pos := cam.global_position
+	var fov_v := deg_to_rad(cam.fov)
+	var vp := get_viewport()
+	var vh := float(vp.get_visible_rect().size.y) if vp != null else 1080.0
+	if vh < 1.0:
+		vh = 1080.0
 	var nf := FacetAtlas.facet_count()
 	for fid in range(nf):
 		if fid == _active_fid or live.has(fid):
 			continue
-		var cd := _centre_dir(fid)
-		if cd[0] * nrm[0] + cd[1] * nrm[1] + cd[2] * nrm[2] < 0.0:
-			continue                                            # back hemisphere — below the horizon, quad suffices
-		var dot: float = clampf(cd[0] * ac[0] + cd[1] * ac[1] + cd[2] * ac[2], -1.0, 1.0)
-		var ring := int(round(acos(dot) / step))
-		if ring >= 1 and ring <= LOD_COVER_RINGS:
-			_want[fid] = mini(ring, LOD_MAX_TIER)
+		var ctr := _facet_render_centre(fid)
+		var to_cam := cam_pos - ctr
+		var nrm: Array = FacetAtlas.facet_normal64(fid)         # planet-absolute outward normal
+		var nrm_w: Vector3 = (global_transform.basis * Vector3(nrm[0], nrm[1], nrm[2]))
+		if to_cam.dot(nrm_w) <= 0.0:
+			continue                                            # camera is behind the facet's plane — quad suffices
+		if not cam.is_position_in_frustum(ctr):
+			continue                                            # off-screen — the far-ring quad covers it
+		var d := maxf(to_cam.length(), 1.0)
+		var lc := sse_lc(d, fov_v, vh)
+		var cur := int(_cache[fid]["lod"]) if _cache.has(fid) else -1
+		_want[fid] = hyst_tier(lc, cur)
 
-func _centre_dir(fid: int) -> Array:
-	var cc: Vector2i = FacetAtlas.centre_cell(fid)
-	var d: CubeSphere.DVec3 = FacetAtlas.cell_dir(fid, cc.x, cc.y)
-	return [d.x, d.y, d.z]
+# ---- the request-grant BUDGETER (§6.4): the selector REQUESTS, only this ALLOCATES ----
 
-## Paced request pass (called from tick): admit at most LOD_REQUESTS_PER_TICK new wanted facets per frame, finest
-## tier first, and only while the builder queue is shallow — so probe-generator creation + enqueues spread across
-## frames instead of stalling one (setup / crossing) frame with ~48 of them. Admission (§6.2 caps) still bounds it.
-func _pace_requests() -> void:
+## Total estimated in-flight build seconds (the FIXED feed-forward est-seconds bound, §6.5.7).
+func _inflight_est_s() -> float:
+	var s := 0.0
+	for fid in _building.keys():
+		s += float(_EST_BUILD_S.get(int(_building[fid]["lod"]), 1.0))
+	return s
+
+## Per tick (§6.4): drive each wanted facet from its current representation toward its target tier, WORST-LOOKING
+## first, admitting at most `grant_count` (credit-scaled, surface 2) grants under the queue + est-seconds bounds.
+## Progressive refinement (§6.4.4): a facet with no mesh is covered at max(target,3) FIRST (≈2 s instant cover), then
+## refined one tier finer per pass — but a FINE grant (< ℓ3) is an idle-time luxury, taken only while the queue is
+## shallow, so under sustained pressure everything converges to ℓ3 + quads, never to OOM. Admission (§6.2 caps / LRU)
+## still bounds every grant. A facet already building is left to land (one build in flight per facet — no thrash).
+func _run_budgeter() -> void:
 	if _builder == null or int(_builder.queued()) > LOD_QUEUE_MAX_JOBS:
 		return
-	# FP-M2c surface 2 (§6.5.3.2): the per-tick admit count is scaled by the controller credit — ceil(2·credit),
-	# 0 → the budgeter stops enqueueing (the builder finishes in-flight tiles and idles). Default = LOD_REQUESTS_PER_TICK.
 	var grants := LOD_REQUESTS_PER_TICK
 	if _controller != null:
 		grants = int(_controller.call("grant_count", LOD_REQUESTS_PER_TICK))
 	if grants <= 0:
 		return
-	var order := _want.keys()
-	order.sort_custom(func(a, b): return int(_want[a]) < int(_want[b]))
+	var queue_idle := int(_builder.queued()) < int(0.25 * float(LOD_QUEUE_MAX_JOBS))
+	var cands: Array = []
+	for fid in _want.keys():
+		var target := int(_want[fid])
+		if _building.has(fid):
+			continue                                            # one build in flight per facet — let it land
+		var cur := int(_cache[fid]["lod"]) if _cache.has(fid) else -1
+		if cur == target:
+			continue                                            # already at target
+		var grant_lod := target
+		if cur < 1:
+			grant_lod = maxi(target, 3)                         # instant coarse cover first (progressive refinement)
+		else:
+			grant_lod = maxi(cur - 1, target)                   # refine one tier finer toward the target
+			if grant_lod < 3 and not queue_idle:
+				continue                                        # fine tiers are an idle-only luxury (§6.4.4)
+		if _inflight_est_s() + float(_EST_BUILD_S.get(grant_lod, 1.0)) > CubeSphere.LOD_QUEUE_MAX_EST_S:
+			continue                                            # est-seconds bound (§6.4.3)
+		# error excess p_current/τ — worst first (a facet with no mesh scores highest so uncovered facets win).
+		var excess := 1.0e12 if cur < 1 else pow(2.0, float(cur))
+		cands.append({"fid": fid, "lod": grant_lod, "excess": excess})
+	cands.sort_custom(func(a, b): return float(a["excess"]) > float(b["excess"]))
 	var made := 0
-	for fid in order:
-		if made >= grants:
+	for c in cands:
+		if made >= grants or int(_builder.queued()) > LOD_QUEUE_MAX_JOBS:
 			break
-		var lod := int(_want[fid])
-		if _cache.has(fid) and int(_cache[fid]["lod"]) == lod:
-			continue
-		if _building.has(fid) and int(_building[fid]["lod"]) == lod:
-			continue
-		request(fid, lod)
+		request(int(c["fid"]), int(c["lod"]))
 		made += 1
+
+## Idle demote / eviction (§5.1 / LOD_IDLE_DEMOTE_S): a covered facet the selector stopped wanting (off-screen /
+## behind the horizon) is freed once it has been unwanted for LOD_IDLE_DEMOTE_S — memory returns WITHOUT pressure,
+## and the far-ring quad covers it (never a hole). Wanted facets keep their last_want_ms fresh so they never idle out.
+func _idle_sweep() -> void:
+	var now := Time.get_ticks_msec()
+	var stale: Array = []
+	for fid in _cache.keys():
+		if _want.has(fid):
+			_cache[fid]["last_want_ms"] = now
+		elif now - int(_cache[fid]["last_want_ms"]) > int(LOD_IDLE_DEMOTE_S * 1000.0):
+			stale.append(fid)
+	for fid in stale:
+		evict(fid)
 
 # ============================ request / admission (NEVER-OOM) ============================
 
@@ -293,7 +388,9 @@ func tick() -> void:
 			_apply_one(_pending.pop_front())
 			if Time.get_ticks_usec() - t0 > budget_us:
 				break
-	_pace_requests()                                          # admit a few new wanted facets (paced, §6.4)
+	_recompute_wants()                                        # SSE selector: refresh target rungs (live-only, §6.1/§6.3)
+	_run_budgeter()                                           # request-grant: allocate a few grants, credit-scaled (§6.4)
+	_idle_sweep()                                             # free facets the selector stopped wanting (§5.1)
 	_apron_pass()
 
 func _apply_one(item: Dictionary) -> void:

@@ -142,8 +142,17 @@ const _COMP_MESH_FLAG := 1 << 22         # _shape_mesh_cache key bit for snow-fi
 # extra GPU readbacks), the _snow_arid discipline.
 const _SLOPE_STRIDE := 4096
 var _slope_arid: PackedInt32Array        # (mat*_SLOPE_STRIDE + payload) -> ARID; -1 = not baked; frozen at setup
-var _junction_arid: PackedInt32Array     # COSMOS FACETED §3.5.4: (mat*128 + slot*32 + q) -> junction bevel ARID; empty until B3b-full
 var _snow_slope_arid: PackedInt32Array   # (mat*_SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
+# COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md, patch 0004): the seam junction bevel is now a MESHER-side
+# per-facet clip (VoxelMesherBlocky.set_facet_carve), not a per-facet baked manifest. The worker/mirrors
+# write a plain carve-SENTINEL cube per material; the compiled mesher clips it by the active facet's ridge
+# planes. Two per-material tables (dry + snow-capped) into a CONTIGUOUS ARID range [_carve_base, +_carve_count)
+# so the C++ mesher identifies sentinels by a cheap range test. A -1 slot / unpatched binary cube-falls-back
+# (the full-cube lip — never a hole). Facet-INDEPENDENT (plain cubes), so a crossing only re-pushes the planes.
+var _carve_arid: PackedInt32Array        # mat -> dry carve-sentinel cube ARID; -1 = not baked
+var _carve_snow_arid: PackedInt32Array   # mat -> snow-capped carve-sentinel cube ARID; -1 = not baked
+var _carve_base := 0                      # first carve-sentinel ARID (contiguous range start)
+var _carve_count := 0                     # number of carve-sentinel ARIDs baked
 
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
@@ -281,6 +290,9 @@ func setup() -> bool:
 	_set_if(_terrain, "generate_collisions", false)
 	# Each block model (ids 1..count()-1) carries its own material; no terrain-wide
 	# material_override needed.
+	# COSMOS FP-CARVE (patch 0004): push the active facet's ridge planes into the mesher's carve blob BEFORE
+	# the terrain starts streaming, so the first meshed block already clips its seam junction sentinels.
+	_push_facet_carve()
 	add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
 	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
@@ -463,6 +475,17 @@ func arid_for_cell(packed: int) -> int:
 					var wslot := mat * _GEN_STRIDE + modifier
 					if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 						return twin[wslot]
+	# COSMOS FP-CARVE (patch 0004): a seam junction cell (produced by junction_modify) → its carve-SENTINEL
+	# cube (the mesher clips it); the snow-capped variant when capped. FIRST lf==0 arm — junction_modify
+	# discards the original modifier, so snow-fill/slope/snow-cap never apply. Unbaked → cube (via arid_for).
+	# Keeps this main-thread mirror in lockstep with the worker + gen_arid_for (the equality discipline, B5).
+	if lf == 0 and CellCodec.is_junction(CellCodec.modifier(packed)):
+		var jmat := CellCodec.mat(packed)
+		if CellCodec.has_state(packed, CellCodec.STATE_SNOW_CAPPED) and jmat < _carve_snow_arid.size() and _carve_snow_arid[jmat] >= 0:
+			return _carve_snow_arid[jmat]
+		if jmat < _carve_arid.size() and _carve_arid[jmat] >= 0:
+			return _carve_arid[jmat]
+		# else fall through to arid_for → cube lip (never a hole)
 	# Snow-FILL composite (SNOW-ACCUMULATION §2.6): a terrain ramp buried/filled by the snow plane wins
 	# over the plain snow-cap skin (a filled cell is always cold ⇒ also capped). The true level rounds UP
 	# to a baked {3,5,8,10}; an unbaked composite falls through to the snow-cap skin below (the ladder).
@@ -649,8 +672,8 @@ func _build_gen_manifest(library: Object) -> void:
 	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
 	var slope := _build_slope_manifest(library, total)
 	appended += slope
-	# COSMOS FACETED §3.5.4: the seam junction BEVEL models (empty/no-op when not faceted).
-	var junctions := _build_junction_manifest(library, total)
+	# COSMOS FP-CARVE (patch 0004): the seam junction carve-SENTINEL cubes (empty/no-op when not faceted).
+	var junctions := _build_carve_manifest(library, total)
 	appended += junctions
 
 	if appended > 0 and library.has_method("bake"):
@@ -665,7 +688,8 @@ func _build_gen_manifest(library: Object) -> void:
 	print("[module_world] baked slope manifest: %d SHARP-SLOPE models (%d emitted (mat,payload) pairs, incl. snow twins)"
 		% [slope, TerrainConfig.emitted_slope_pairs().size()])
 	if CubeSphere.FACETED:
-		print("[module_world] baked junction manifest: %d seam-bevel models (facet %d)" % [junctions, TerrainConfig.active_facet()])
+		print("[module_world] baked carve manifest: %d seam-junction sentinel cubes (facet %d, ARID range [%d,%d))"
+			% [junctions, TerrainConfig.active_facet(), _carve_base, _carve_base + _carve_count])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -892,56 +916,62 @@ func _build_slope_manifest(library: Object, total: int) -> int:
 			appended += 1
 	return appended
 
-## COSMOS FACETED §3.5.4 — bake the junction BEVEL models into `_junction_arid` (keyed mat·128 + slot·32 + q).
-## Enumerates the (material, slot, q) triples that ACTUALLY occur along the active facet's ridges (walking the
-## boundary columns through the pure generator + junction_modify), then bakes each via ShapeMesh's junction clip
-## in the active facet's frame (the ArrayMesh is shared per (slot,q) across materials by _shape_mesh_cache). An
-## unbaked triple cube-falls-back on the worker (the full-cube lip — never a hole). One-time, main thread,
-## bounded by the facet perimeter × depth; capped at 4096 models (never-OOM). Reads active_facet — set by
-## WM._ready / main.gd BEFORE the generator is built.
-func _build_junction_manifest(library: Object, total: int) -> int:
-	_junction_arid = PackedInt32Array()
+## COSMOS FP-CARVE (patch 0004) — bake the seam junction carve-SENTINEL cubes into a CONTIGUOUS ARID range.
+## The per-facet bevel geometry now lives in the COMPILED mesher (VoxelMesherBlocky.set_facet_carve), which
+## clips a plain cube by the active facet's ridge planes at mesh time — so the manifest shrinks to ONE plain
+## cube per candidate material (dry) plus its snow-capped variant (~20-30 models vs the old 1152 per-facet
+## bevels). Facet-INDEPENDENT (plain cubes), so a crossing re-pushes only the planes (_push_facet_carve), no
+## re-bake. Records _carve_arid / _carve_snow_arid (per material) + _carve_base/_carve_count (the range the
+## mesher range-tests). Empty/no-op when not faceted. Same anti-drift discipline; a drift aborts (leaving the
+## rest -1 → the full-cube lip on the worker, never a hole). Reads active_facet (set before the generator).
+func _build_carve_manifest(library: Object, total: int) -> int:
+	_carve_arid = PackedInt32Array()
+	_carve_snow_arid = PackedInt32Array()
+	_carve_base = 0
+	_carve_count = 0
 	if not CubeSphere.FACETED:
 		return 0
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		return 0
-	_junction_arid.resize(total * 128)
-	_junction_arid.fill(-1)
-	# The junction CLIP geometry is material-INDEPENDENT (one convex prism per slot+q, in the active facet's
-	# frame), so there is NO need to walk the terrain to discover which cells occur — that deep generated_cell
-	# scan was ~85s on web. Instead bake the small cartesian product (solid materials × 4 slots × 32 offsets)
-	# directly; the ArrayMesh is shared per (slot,q) across materials via _shape_mesh_cache, so only 128 clips
-	# run, and each model is a cheap material override. An unbaked (mat,slot,q) lip-falls-back (never a hole).
-	# Only the TERRAIN materials can appear at a facet seam — the surface set plus the shaped (slope) set (which
-	# carries the sub-surface stone/dirt). Ores, wood, crafted blocks never touch a ridge, so baking all solid
-	# materials (4096, capped) was ~10× waste. This set is ~10-15 materials → ~1-2k models, a couple seconds.
+	_carve_arid.resize(total)
+	_carve_arid.fill(-1)
+	_carve_snow_arid.resize(total)
+	_carve_snow_arid.fill(-1)
+	# Only the TERRAIN materials touch a facet seam — the surface set, the shaped (slope) set (sub-surface
+	# stone/dirt), plus STONE (mountain peaks). Ores, wood, crafted blocks never reach a ridge.
 	var matset := {}
 	for m: int in TerrainConfig.appearance_surface_materials():
 		matset[m] = true
 	for pair: int in TerrainConfig.emitted_slope_pairs():
 		matset[pair / _SLOPE_STRIDE] = true
 	matset[BlockCatalog.STONE] = true
+	_carve_base = _next_arid                              # contiguous range start (set now → valid on early return)
 	var appended := 0
 	for mat: int in matset.keys():
 		if mat <= BlockCatalog.AIR or mat >= total or BlockCatalog.solidity_of(mat) < 0.5:
 			continue
-		if appended >= 4096:
-			break
-		var material: Material = BlockMaterials.get_for(mat)
-		for slot in range(4):
-			for q in range(32):
-				var model: Object = _make_shape_model(CellCodec.make_junction(slot, q), material)
-				if model == null:
-					return appended                      # no mesh-model class → all lip-fall-back
-				var expected := _next_arid
-				var got: int = _add_model(library, model)
-				if got != expected:
-					push_warning("[module_world] junction manifest ARID drift: add_model %d != expected %d" % [got, expected])
-					return appended
-				_next_arid += 1
-				_junction_arid[mat * 128 + slot * 32 + q] = got
-				appended += 1
+		# dry carve-sentinel cube
+		var expected := _next_arid
+		var got: int = _add_cube(library, BlockMaterials.get_for(mat), BlockCatalog.cull_group_of(mat))
+		if got != expected:
+			push_warning("[module_world] carve manifest ARID drift: add_cube %d != expected %d" % [got, expected])
+			_carve_count = appended
+			return appended
+		_next_arid += 1
+		_carve_arid[mat] = got
+		appended += 1
+		# snow-capped carve-sentinel cube (upgrades a capped straddle from cube-lip to carved, B5)
+		var expected2 := _next_arid
+		var got2: int = _add_cube(library, BlockMaterials.snow_capped_for(mat), BlockCatalog.cull_group_of(mat))
+		if got2 != expected2:
+			push_warning("[module_world] carve snow manifest ARID drift: add_cube %d != expected %d" % [got2, expected2])
+			_carve_count = appended
+			return appended
+		_next_arid += 1
+		_carve_snow_arid[mat] = got2
+		appended += 1
+	_carve_count = appended
 	return appended
 
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into
@@ -1122,6 +1152,15 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 			if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 				return twin[wslot]
 		# unbaked submerged twin → dry shape (fall through)
+	# COSMOS FP-CARVE (patch 0004) mirror: a seam junction cell → its carve-SENTINEL cube (the mesher clips
+	# it), the snow-capped variant when capped. FIRST liquid_level==0 arm, exactly as the worker / arid_for_cell
+	# (equality discipline, B5). `state` carries the snow_capped bit. Unbaked → cube (never a hole).
+	if liquid_level == 0 and CellCodec.is_junction(modifier):
+		if (state & CellCodec.STATE_SNOW_CAPPED) != 0 and mat < _carve_snow_arid.size() and _carve_snow_arid[mat] >= 0:
+			return _carve_snow_arid[mat]
+		if mat < _carve_arid.size() and _carve_arid[mat] >= 0:
+			return _carve_arid[mat]
+		return _cube_arid_of(mat)                        # unbaked → cube lip (never a hole)
 	# Snow-FILL composite mirror (SNOW-ACCUMULATION §2.6): a filled ramp resolves to its curated composite
 	# ARID (rounding the level UP), exactly as arid_for_cell / the worker do — checked BEFORE the snow-cap
 	# skin (a filled cell is always also capped). `state` carries the fill nibble (bits 1..4).
@@ -1198,18 +1237,33 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 	_gen_mwin = mwin                                  # COSMOS-FRAME-ORIENTATION §5.1: freeze the new epoch's M_win
 	restream(old_wrapper_pos)
 
-## COSMOS FACETED §6.1 — the crossing restream. Install a fresh generator epoch homed on facet `fid` (its
-## gen_facet reads TerrainConfig.active_facet(), which WorldManager sets to `fid` BEFORE this call) and
-## hard-restream (the M4 cover + view-distance ramp hides the swap). The junction BEVEL manifest is CLEARED — it
-## is baked for the spawn facet's exact seam ORIENTATIONS, and those vary up to ~53° across facets (the cube-
-## sphere warp shears facets differently; verify_faceted proved a single-manifest reuse would crack/mis-tilt on
-## most facets). godot_voxel's library bake is all-or-nothing (~13s web stall, patch 0002), so a per-facet
-## re-bake is infeasible on a crossing. So the new facet's junction cells lip-fall-back (geometrically SAFE:
-## never a wrong-tilt bevel, never a hole, never a library leak). Correct per-facet bevels-on-crossing would
-## need a mesher that can carve voxel cells outside the baked library — a larger change (documented, deferred).
+## COSMOS FACETED §6.1 / FP-CARVE (patch 0004) — the crossing restream. Install a fresh generator epoch homed
+## on facet `fid` (its gen_facet reads TerrainConfig.active_facet(), which WorldManager sets to `fid` BEFORE
+## this call) and hard-restream (the M4 cover + view-distance ramp hides the swap). FP-CARVE makes the seam
+## bevel a MESHER-side per-facet clip, so a crossing just RE-PUSHES the new facet's ridge planes — the carve
+## sentinel cubes are facet-independent, so no library re-bake (which is all-or-nothing, ~13s web stall). The
+## push happens BEFORE restream() (B7) so no in-flight block can mesh a junction cell with stale planes.
 func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
-	_junction_arid = PackedInt32Array()               # clear → new facet's junctions render the safe lip
+	_push_facet_carve()                               # push the NEW facet's ridge planes (B7: before restream)
 	restream(old_wrapper_pos)
+
+## COSMOS FP-CARVE (patch 0004) — push the active facet's own-side ridge planes into the compiled mesher's
+## carve blob (VoxelMesherBlocky.set_facet_carve). has_method-guarded (B12): an unpatched binary ignores it and
+## the sentinels bake as plain cubes (the full-cube lip — never a hole). No-op (disables the carve) when not
+## faceted, no active facet, or nothing baked. Called at setup (after the manifest) and at each crossing.
+func _push_facet_carve() -> void:
+	if _mesher == null or not _mesher.has_method("set_facet_carve"):
+		return
+	var fid := TerrainConfig.active_facet()
+	if not CubeSphere.FACETED or _carve_count <= 0 or fid < 0:
+		_mesher.call("set_facet_carve", {"enabled": false})
+		return
+	_mesher.call("set_facet_carve", {
+		"enabled": true,
+		"planes": FacetAtlas.seam_planes_f64(fid),
+		"arid_base": _carve_base,
+		"arid_count": _carve_count,
+	})
 
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
@@ -1677,7 +1731,8 @@ var comp_l8: PackedInt32Array
 var comp_l10: PackedInt32Array
 var snow_id := -1                        # snow_block LRID (the curated LAYER material)
 var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
-var junction_arid: PackedInt32Array     # COSMOS FACETED §3.5.4: (mat*128 + slot*32 + q) -> junction bevel ARID; empty until baked
+var carve_arid: PackedInt32Array        # COSMOS FP-CARVE: mat -> carve-sentinel cube ARID; -1 = not baked
+var carve_snow_arid: PackedInt32Array   # COSMOS FP-CARVE: mat -> snow-capped carve-sentinel cube ARID; -1 = not baked
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
@@ -1733,7 +1788,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
 	var nslope = slope_arid.size()
-	var njunction = junction_arid.size()
+	var ncarve = carve_arid.size()
+	var ncarvesnow = carve_snow_arid.size()
 	var nsnowslope = snow_slope_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
@@ -1907,6 +1963,19 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[slot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif CellCodec.is_junction(modifier):
+					# COSMOS FP-CARVE (patch 0004): a seam junction cell (produced by junction_modify) -> its
+					# plain carve-SENTINEL cube; the compiled mesher clips it by the active facet's ridge planes.
+					# The snow-capped variant when capped (bit 32). HOISTED to the FIRST lf==0 arm -- junction_modify
+					# discards the original modifier, so snow-fill/slope/snow-cap never apply to a junction cell.
+					# Unbaked / unpatched binary -> the full-cube lip (the mask already carved beyond-ridge cells to
+					# AIR upstream, so this is never a hole).
+					if ((v >> 32) & 1) != 0 and id < ncarvesnow and carve_snow_arid[id] >= 0:
+						arid = carve_snow_arid[id]
+					elif id < ncarve and carve_arid[id] >= 0:
+						arid = carve_arid[id]
+					else:
+						arid = cube_arid[id] if id < ncube else id
 				elif ((v >> 33) & 0xF) != 0:
 					# Snow-FILL composite (SNOW-ACCUMULATION 2.6): a terrain ramp buried/filled by the snow
 					# plane. The fill nibble (STATE bits 1..4 = value bits 33..36) rounds UP to a curated
@@ -1953,16 +2022,6 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[gslot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
-				elif CellCodec.is_junction(modifier):
-					# COSMOS FACETED §3.5.4: a seam junction partial → its baked bevel ARID (keyed
-					# id·128 + slot·32 + q); unbaked (no manifest yet) → the full-cube lip. The mask already
-					# turned beyond-ridge cells to AIR upstream, so this is never a hole. BEFORE the FAM LAYER
-					# arm (a junction modifier also has bit 15 set).
-					var jslot = id * 128 + CellCodec.junction_slot(modifier) * 32 + CellCodec.junction_q(modifier)
-					if njunction > 0 and jslot < njunction and junction_arid[jslot] >= 0:
-						arid = junction_arid[jslot]
-					else:
-						arid = cube_arid[id] if id < ncube else id
 				elif (modifier & 0x8000) != 0:
 					# FAM LAYER (SNOW-ACCUMULATION 1.5): snow depth level (tenths) resolves through the
 					# dedicated LEVEL table (a FAM modifier is >= 0x8000 and can't slot the 256-stride).
@@ -2015,7 +2074,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("comp_l10", _comp_arid_l10)
 	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
-	gen.set("junction_arid", _junction_arid)             # COSMOS FACETED §3.5.4: junction bevel ARIDs (empty until B3b-full)
+	gen.set("carve_arid", _carve_arid)                   # COSMOS FP-CARVE (patch 0004): carve-sentinel cube ARIDs
+	gen.set("carve_snow_arid", _carve_snow_arid)         # COSMOS FP-CARVE: snow-capped carve-sentinel cube ARIDs
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): freeze this epoch's home face + n + flat flag

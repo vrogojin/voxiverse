@@ -1324,6 +1324,24 @@ func spike_rotated_neighbour(neighbour_fid: int, view_blocks: int = 96) -> Dicti
 		"generator": generator, "carve_enabled": carve_enabled,
 	}
 
+## FP-R0 SPIKE (live-scene wiring): plant a STATIC VoxelViewer at a fixed WORLD point so a spiked neighbour
+## streams+meshes its OWN surface band regardless of where the player stands (the player's single global viewer
+## localises ~edge/2 beyond a neighbour's ridge, out of a 96-block reach — the gate placed a dedicated viewer for
+## exactly this reason). module_world sits at zero in faceted mode, so `world_pos` is also this node's local pos.
+## Returns the viewer node (or null). No-op unless FP_R0 — the shipped build never plants extra viewers.
+func spike_static_viewer(world_pos: Vector3, view_blocks: int = 96) -> Node:
+	if not CubeSphere.FP_R0 or not ClassDB.class_exists("VoxelViewer"):
+		return null
+	var v: Node = ClassDB.instantiate("VoxelViewer")
+	if v == null:
+		return null
+	_set_if(v, "view_distance", view_blocks)
+	_set_if(v, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
+	_set_if(v, "requires_collisions", false)
+	add_child(v)
+	(v as Node3D).position = world_pos
+	return v
+
 ## The shared baked VoxelBlockyLibrary (FP-R0: for a standalone build_mesh probe and neighbour meshers).
 func spike_library() -> Object:
 	return _library if CubeSphere.FP_R0 else null

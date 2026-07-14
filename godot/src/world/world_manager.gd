@@ -224,6 +224,44 @@ func on_player_ready(player: Node3D) -> void:
 	m5_real_install_epoch(player.global_position)
 	if using_module and _module_world != null:
 		_module_world.call("attach_viewer", player)
+	# COSMOS FP-R0 SPIKE (flag-gated): render the spawn facet's edge neighbours as REAL rotated voxel terrains
+	# across the seams, where today the player sees only the flat FacetFarRing quad. DEAD unless FACETED && FP_R0
+	# (both const false on the shipped tree) → this call is skipped and the faceted build is byte-identical.
+	if CubeSphere.FACETED and CubeSphere.FP_R0:
+		_fp_r0_spike_neighbours()
+
+## COSMOS FP-R0 SPIKE (throwaway VISUAL wiring — see docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §8). For each
+## edge neighbour of the spawn (active) facet, instantiate module_world's rotated-neighbour VoxelTerrain (its own
+## frozen-neighbour generator + own carve mesher, the ONE shared baked library, parented under that facet's real
+## det=+1 placement) and plant a dedicated static viewer at the neighbour centre-surface so it streams+meshes its
+## own band. The spiked neighbours are then excluded from the far ring so their flat quads don't z-fight the real
+## voxels. No-op guarded by the caller on CubeSphere.FP_R0; only reachable in faceted mode with the module present.
+func _fp_r0_spike_neighbours() -> void:
+	if _module_world == null or not _module_world.has_method("spike_rotated_neighbour"):
+		return
+	var active := TerrainConfig.active_facet()
+	if active < 0:
+		return
+	var excluded: Array = []
+	for slot in range(4):
+		var nb: int = FacetAtlas.seam_neighbour(active, slot)
+		if nb < 0 or nb == active or excluded.has(nb):
+			continue
+		var built: Dictionary = _module_world.call("spike_rotated_neighbour", nb, 96)
+		if built.is_empty():
+			continue
+		# Plant a static viewer at the neighbour's centre-surface WORLD point so it streams its own surface band
+		# (the player's global viewer localises out of a 96-block reach of a neighbour ridge — see spike helper).
+		var cc: Vector2i = FacetAtlas.centre_cell(nb)
+		var g := int(TerrainConfig.facet_profile(nb, cc.x, cc.y).x)
+		var w: Array = FacetAtlas.lattice_to_world64(nb, float(cc.x), float(g + 2), float(cc.y))
+		_module_world.call("spike_static_viewer", Vector3(w[0], w[1], w[2]), 96)
+		excluded.append(nb)
+		print("[FP-R0] spiked rotated neighbour facet %d (slot %d) as REAL voxels across the seam" % [nb, slot])
+	# Suppress the flat far-ring quads for the facets we now draw as real rotated voxels (no double-draw).
+	if not excluded.is_empty() and _facet_ring != null:
+		_facet_ring.set_excluded(excluded)
+	print("[FP-R0] spike wired %d rotated neighbour terrain(s) around active facet %d" % [excluded.size(), active])
 
 ## COSMOS R2.2: freeze this epoch's shared bake frame (anchored at `anchor`), push its flat params to the
 ## C++ near mesher (VoxelMesherBlocky.set_cosmos_bake) so blocky meshes bake to true sphere geometry, and

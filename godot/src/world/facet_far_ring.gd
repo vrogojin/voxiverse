@@ -20,6 +20,10 @@ var _active_fid := -1
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+# COSMOS FP-R0 SPIKE: facets rendered as REAL rotated voxel terrains (WorldManager fills this behind
+# CubeSphere.FP_R0). Their flat quad is suppressed here so the real voxels don't z-fight the ring. Empty
+# on the shipped build (FP_R0 off) → the ring draws every non-active facet exactly as before, byte-identical.
+var _excluded: Dictionary = {}       # fid -> true (skipped in _rebuild, same as the active facet is skipped)
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -35,6 +39,14 @@ func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
 	_rebuild()
 
+## COSMOS FP-R0 SPIKE: hide these facets' flat quads (they are drawn as real rotated voxel terrains instead).
+## Called only behind CubeSphere.FP_R0; on the shipped build nothing calls this so `_excluded` stays empty.
+func set_excluded(fids: Array) -> void:
+	_excluded.clear()
+	for f in fids:
+		_excluded[int(f)] = true
+	_rebuild()
+
 func _rebuild() -> void:
 	transform = FacetAtlas.facet_transform(_active_fid).affine_inverse()   # absolute → active-lattice render frame
 	var st := SurfaceTool.new()
@@ -48,6 +60,8 @@ func _rebuild() -> void:
 				var fid := (face * k + a) * k + b
 				if fid == _active_fid:
 					continue                          # the near voxel world already covers the active facet
+				if _excluded.has(fid):
+					continue                          # FP-R0 SPIKE: this facet is a real rotated voxel terrain
 				var cd := _facet_centre_dir(fid)
 				if cd[0] * nrm[0] + cd[1] * nrm[1] + cd[2] * nrm[2] < BACK_CULL:
 					continue                          # back hemisphere → not visible from the active facet

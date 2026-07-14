@@ -1,4 +1,4 @@
-# web-soak-gpu — Tier B cloud-GPU web-soak harness (SPIKE)
+# web-soak-gpu — Tier B cloud-GPU web-soak harness
 
 Measures the **real threaded WASM/WebGL2 web build** of VOXIVERSE the way a player's
 desktop browser runs it: worst-frame time, hitches, streaming backlog, heap growth,
@@ -10,8 +10,89 @@ runs the **actual web export on a real GPU** and is the only tier that reproduce
 WASM-heap / worker-timing / GPU numbers that only exist on live web.
 
 > **Standalone.** Everything here is new files under `tools/web-soak-gpu/`. It reads
-> `build/web/` (the export) and mirrors the deploy COOP/COEP headers; it does **not**
-> touch game source, the export, or the deploy. It provisions no cloud resource.
+> the **already-public live site** (`https://voxiverse.game-host.org`, which already
+> serves COOP/COEP + SharedArrayBuffer) — so the cloud box downloads **no game source
+> or export**; it only runs a browser against a public URL. It can also serve a local
+> `build/web/` for offline smoke.
+
+---
+
+## TL;DR — turnkey Vast.ai GPU run (ONE command)
+
+Once your Vast.ai API key is in place, a full real-GPU soak against the live site is:
+
+```bash
+cd tools/web-soak-gpu
+./run-remote.sh                     # ~900 s soak on the cheapest verified T4, then auto-destroy
+```
+
+That single command:
+
+1. **provisions** the cheapest **verified** T4 offer at or under `--max-price` (default
+   **$0.30/hr**) — it prints the $/hr **before** creating and never exceeds the cap;
+2. **waits** until the box is `running` and SSH is up;
+3. **rsyncs** this harness to the box (never the game — the game is the public URL);
+4. **sets up** the box (`setup-box.sh`: Xvfb + Vulkan + Node + Playwright chromium) and
+   **validates a real GPU** (`nvidia-smi` + `vulkaninfo`; llvmpipe is a hard fail);
+5. **runs the soak** against `--url https://voxiverse.game-host.org` under `xvfb-run`
+   with the real-GPU Chrome flags, asserting `UNMASKED_RENDERER_WEBGL` is a real GPU
+   (SwiftShader/llvmpipe ⇒ the soak exits 1);
+6. **pulls results back** to `results/gpu-<timestamp>/` (JSON `[PERF]` series + heap +
+   screenshots);
+7. **ALWAYS destroys the instance** in an `EXIT`/`INT`/`TERM` trap — even on failure,
+   Ctrl-C, or a mid-run error — then prints a one-line spend estimate.
+
+**Teardown guarantee.** The instance id + $/hr are written to a state file
+(`results/vast-instance.env`) the instant the instance is created, and the trap reads
+it back if the shell variable was never set — so the box is torn down even if the run
+is interrupted between provisioning and any later step. Pass `--keep` to intentionally
+leave the box up (you then destroy it yourself).
+
+### Prerequisites
+
+- **Vast.ai CLI + API key.** `pip install --upgrade vastai`, then put your key in
+  **`~/.config/vastai/vast_api_key`** (the CLI reads it automatically), or
+  `export VAST_API_KEY=…` before running (the harness persists it to that file, chmod
+  600). No key ⇒ the harness refuses to do anything. Get a key at
+  <https://cloud.vast.ai/account/>.
+- **An SSH key registered with Vast.ai** (the account key used by `--ssh`); the default
+  local key must be able to reach the box.
+- Local: `bash`, `node` (≥20), `rsync`, `ssh`, `curl`. No GPU needed locally.
+
+### Cost
+
+A verified T4 on Vast.ai is typically **$0.10–0.25/hr**. A 900 s (15 min) soak plus
+~3–5 min of provisioning/setup ⇒ **well under $0.10 per run**. The `[spend]` line at the
+end estimates it as `dph × minutes`.
+
+### Fidelity caveat (read once)
+
+A pinned T4 is a **regression / floor signal on fixed hardware**, not a per-user FPS
+promise. Real players run everything from integrated laptop GPUs to RTX 4090s; the T4
+number tells you *"did this change make the web build slower / leakier than the last
+green run on the same box"*, which is exactly what a CI gate needs. Do not read the T4
+worst-frame as "the FPS a player gets".
+
+### Flags (`run-remote.sh`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--url <u>` | `https://voxiverse.game-host.org` | origin the soak drives |
+| `--duration <s>` | `900` | soak-walk length |
+| `--max-price <f>` | `0.30` | hard $/hr cap — never exceeded |
+| `--gpu <name>` | `Tesla_T4` | Vast.ai `gpu_name` (`L4` also works) |
+| `--disk <gb>` | `32` | instance disk |
+| `--image <img>` | `nvidia/cuda:12.4.1-runtime-ubuntu22.04` | base image |
+| `--keep` | off | do NOT auto-destroy (debug; destroy it yourself) |
+| `--state-file <p>` | `results/vast-instance.env` | teardown state file |
+
+### The Vulkan gotcha the scripts handle for you
+
+`nvidia/cuda` images expose only `compute,utility` driver capabilities by default,
+which **does not include the Vulkan ICD / GL libs**. `provision-vast.sh` therefore
+creates the instance with `NVIDIA_DRIVER_CAPABILITIES=all`, and `setup-box.sh` fails
+closed if `vulkaninfo` still resolves to `llvmpipe` — because a software Vulkan would
+make the whole run a plausible-looking lie.
 
 ---
 
@@ -188,6 +269,10 @@ one-line documented recommendation for whoever wires the in-game `?websoak=1` dr
 
 ## Cloud T4 run recipes
 
+**Prefer the turnkey `./run-remote.sh`** (top of this README) — it does all of the
+below automatically and guarantees teardown. The manual recipes here are for a box you
+provision by hand (other providers, or debugging with `--keep`).
+
 Both give an NVIDIA T4. Verify a real GPU **before** trusting any run (checklist below).
 
 ### AWS spot `g4dn.xlarge` (T4) via RunsOn / plain EC2
@@ -276,12 +361,17 @@ Exit codes: **0** all gates pass · **1** a gate/threshold failed · **2** setup
 ## Files
 
 ```
-server.mjs            COOP/COEP static server for build/web/
-soak.mjs              the Playwright driver (gates, boot, walk, scrape, assert)
+run-remote.sh         TURNKEY one-command flow: provision → setup → soak → pull → destroy
+provision-vast.sh     rent the cheapest verified Vast.ai T4 (price-capped); writes state
+setup-box.sh          runs ON the box: deps + Playwright chromium + real-GPU validation
+server.mjs            COOP/COEP static server for build/web/ (offline smoke)
+soak.mjs              the Playwright driver (gates, boot, walk, scrape, assert); --url mode
 smoke.sh              local CPU-fallback proof (all four checks)
+lib/vast-common.sh    shared Vast.ai helpers (key preflight, state, ssh/wait, spend)
+lib/vastjson.mjs      jq-free JSON reducer for `vastai … --raw` (pick-offer/field/state)
 lib/coop-headers.mjs  COOP/COEP header source of truth (mirrors nginx template)
 lib/chrome-flags.mjs  GPU vs CPU-fallback flag recipes + software-renderer detector
 lib/perf-parse.mjs    [PERF] / [PERF-HITCH] console-line parser + summary
 baseline/             promote a green GPU run's latest.json here to arm regression diff
-results/              run artefacts (gitignored)
+results/              run artefacts + vast-instance.env state (gitignored)
 ```

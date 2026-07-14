@@ -8,3 +8,13 @@ out/
 screenshots/
 # The stored regression baseline IS committed (baseline/baseline.json) so it is
 # NOT ignored here — a fresh baseline is written to results/ and promoted by hand.
+
+# ── Vast.ai turnkey flow: never commit secrets or run state ──────────────────────
+# The instance state file (id + $/hr for teardown) is written under results/ (already
+# ignored) but pin it explicitly in case results/ is overridden with --state-file.
+vast-instance.env
+*.env
+# Vast.ai API keys — the CLI reads ~/.config/vastai/vast_api_key; never keep one here.
+vast_api_key
+*.api_key
+.vast_api_key

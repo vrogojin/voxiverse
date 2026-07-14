@@ -66,6 +66,11 @@ const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
 # at RAMP_START_BLOCKS and grows to the target over RAMP_SECONDS, so the nearest ring meshes first and
 # worker load ramps in instead of spiking (the far LOD, now frame-correct, covers the gap). The FINAL
 # view is identical — this is pure load-shaping. Active only in the ~1-2s after a flip restream.
+# FP-M1c (§5) GENERALIZES this same load-shaping to the neighbour POOL: each FacetSlot carries its own view ramp
+# (view_f/view_target/ramp_from) so a spawned neighbour fills 48→96 over RAMP_SECONDS and a crossing's `to` fills
+# 96→128 over RAMP_SECONDS — both spread across frames instead of a one-pass burst at the facet border. The pool
+# ramp (_ramp_pool_step) advances at most ONE slot per frame; this single-terrain _ramp_* state stays for the
+# flag-OFF (FP-S1) restream path only, which the pool never takes (redesignate replaces restream).
 const RAMP_START_BLOCKS := 48.0
 const RAMP_SECONDS := 1.5
 var _ramp_active := false
@@ -344,8 +349,57 @@ func _process(delta: float) -> void:
 			_free_cover("meshed")
 		elif _cover_age >= NEAR_COVER_MAX_SECONDS:
 			_free_cover("timeout")
-	# Stay processing only while there is still ramp or cover work to do; otherwise go dormant.
-	set_process(_ramp_active or _cover_terrain != null)
+	# FP-M1c per-slot pool view ramp (§5). Independent of the single-terrain _ramp_active (which the pool crossing
+	# never uses — redesignate replaces restream). Bounded to ONE growing slot per frame (see _ramp_pool_step), so
+	# several slots ramping at once can never collectively burst the workers + main-thread mesh-apply.
+	var pool_ramping := false
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and not _render_hidden and not _pool.is_empty():
+		pool_ramping = _ramp_pool_step(delta)
+	# Stay processing only while there is still ramp / cover / pool-ramp work to do; otherwise go dormant.
+	set_process(_ramp_active or _cover_terrain != null or pool_ramping)
+
+## FP-M1c: (re)enable per-frame processing so the per-slot pool view ramp advances. Safe to call repeatedly; a no-op
+## when the pool flag is off or the near render is dev-hidden (the ramp must never re-grow a deliberately hidden field).
+func _pool_ramp_kick() -> void:
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and not _render_hidden:
+		set_process(true)
+
+## FP-M1c per-slot view-distance ramp step (§5 — the border-hitch fix). Grows AT MOST ONE slot's max_view_distance
+## per frame — the ACTIVE facet first (so a crossing's `to` reaches full stream ASAP), else the OLDEST neighbour (so
+## it finishes and frees the single grow channel before the next starts). Serializing the grows bounds the total
+## newly-requested view volume per frame to a single slot's RAMP_SECONDS-paced step, so N slots ramping concurrently
+## can never collectively flood the 2 web workers + the main-thread mesh-apply. Shrinks (view_f > target) only UNLOAD,
+## so every shrinking slot snaps immediately the same frame. Returns true while any slot still has growing to do.
+func _ramp_pool_step(delta: float) -> bool:
+	var up_fid := -1
+	var up_spawn := 0
+	var up_active := false
+	for fid in _pool:
+		var s: Dictionary = _pool[fid]
+		var cur: float = s["view_f"]
+		var tgt: float = s["view_target"]
+		if cur > tgt + 0.5:
+			# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
+			s["view_f"] = tgt
+			s["view"] = int(round(tgt))
+			_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+		elif cur < tgt - 0.5:
+			# Grow candidate — pick ONE: active wins; else the oldest (smallest spawn_ms).
+			var is_active := (int(fid) == _pool_active)
+			if up_fid < 0 or (is_active and not up_active) \
+					or (is_active == up_active and int(s["spawn_ms"]) < up_spawn):
+				up_fid = int(fid)
+				up_spawn = int(s["spawn_ms"])
+				up_active = is_active
+	if up_fid < 0:
+		return false
+	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
+	var sc: Dictionary = _pool[up_fid]
+	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
+	sc["view_f"] = minf(float(sc["view_f"]) + span * delta / RAMP_SECONDS, float(sc["view_target"]))
+	sc["view"] = int(round(float(sc["view_f"])))
+	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
+	return true
 
 ## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
 ## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
@@ -1339,6 +1393,11 @@ func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
 	return {
 		"terrain": terrain, "slot": slot, "mesher": mesher, "generator": generator,
 		"spawn_ms": Time.get_ticks_msec(), "view": view_blocks, "editable": editable, "fid": fid,
+		# FP-M1c per-slot view-distance ramp (§5 load-shaping). view_f is the live FLOAT radius the ramp advances;
+		# view_target its goal; ramp_from the radius the current leg started at (a leg takes RAMP_SECONDS from
+		# ramp_from → view_target regardless of target size). Defaults = NO ramp (target == current == view_blocks):
+		# only pool_spawn / redesignate opt a slot into a ramp, so the active-init and pool_reset paths stay full-view.
+		"view_f": float(view_blocks), "view_target": float(view_blocks), "ramp_from": float(view_blocks),
 	}
 
 ## Clamp a terrain's streaming to its facet's domain slab (§3.2). The engine clips every view box against `bounds`
@@ -1370,10 +1429,13 @@ func _pool_init_active() -> void:
 	slot.transform = FacetAtlas.facet_transform(_pool_active)
 	_planet_root.add_child(slot)
 	slot.add_child(_terrain)
+	var arv := TerrainConfig.near_render_radius()
 	_pool[_pool_active] = {
 		"terrain": _terrain, "slot": slot, "mesher": _mesher, "generator": _generator,
-		"spawn_ms": Time.get_ticks_msec(), "view": TerrainConfig.near_render_radius(),
+		"spawn_ms": Time.get_ticks_msec(), "view": arv,
 		"editable": true, "fid": _pool_active,
+		# Active at init keeps its already-set full near view — NO ramp (target == current). (§5)
+		"view_f": float(arv), "view_target": float(arv), "ramp_from": float(arv),
 	}
 
 ## Spawn a render-only neighbour terrain for facet `fid` (view 96). Enforces the caps: FP_M1_POOL on, faceted, a
@@ -1386,10 +1448,18 @@ func pool_spawn(fid: int) -> bool:
 		return false
 	if pool_neighbour_count() >= CubeSphere.POOL_MAX_NEIGHBOURS:
 		return false
-	var s := _pool_build_slot(fid, 96, false)
+	# Build the neighbour at a SMALL start view and RAMP it up to 96 over RAMP_SECONDS (§5 load-shaping): a fresh
+	# terrain jammed straight to view 96 requests its WHOLE view sphere in one process pass → a generation burst →
+	# the main-thread mesh-apply (voxel/threads/main/time_budget_ms) spikes → the border hitch. The ramp spreads that
+	# fill across frames, exactly like the active-facet restream ramp; the far-ring quad covers the rim until it meshes.
+	var start := int(minf(RAMP_START_BLOCKS, 96.0))
+	var s := _pool_build_slot(fid, start, false)
 	if s.is_empty():
 		return false
+	s["view_target"] = 96.0
+	s["ramp_from"] = float(start)
 	_pool[fid] = s
+	_pool_ramp_kick()
 	return true
 
 ## Retire (free) a neighbour terrain. Never frees the active facet. queue_free's the whole slot (terrain → its
@@ -1420,15 +1490,22 @@ func redesignate(to: int) -> bool:
 	# sub-frame, no meshing. `to`'s composite becomes T_to⁻¹·T_to = identity (axis-aligned, editable); `from`'s
 	# becomes T_to⁻¹·T_from (the dihedral turn — the rotated neighbour, same weld as the far ring).
 	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
-	# View-distance rebalance (delta annulus only — the engine diffs prev/new boxes; no teardown). `to` grows to
-	# the active radius, `from` shrinks to the neighbour radius. bounds/carve/generator are facet-static → untouched.
-	_set_if(_pool[to]["terrain"], "max_view_distance", TerrainConfig.near_render_radius())
-	_pool[to]["view"] = TerrainConfig.near_render_radius()
+	# View-distance rebalance (§5). `to` RAMPS up 96 → near radius: jamming that 96→128 delta annulus in ONE pass is
+	# the SECOND crossing burst — spread it over RAMP_SECONDS like every other grow (the ramp step drives it from the
+	# next frame; the far ring covers the delta rim meanwhile). `from` shrinks to the neighbour radius, and a shrink
+	# only UNLOADS blocks → cheap → snapped immediately. bounds/carve/generator are facet-static → untouched.
+	var to_target := float(TerrainConfig.near_render_radius())
+	_pool[to]["view_target"] = to_target
+	_pool[to]["ramp_from"] = float(_pool[to]["view_f"])   # ramp from wherever `to` sits now (96 warm, or mid-ramp)
 	_pool[to]["editable"] = true
 	if _pool.has(from):
 		_set_if(_pool[from]["terrain"], "max_view_distance", 96)
 		_pool[from]["view"] = 96
+		_pool[from]["view_f"] = 96.0
+		_pool[from]["view_target"] = 96.0
+		_pool[from]["ramp_from"] = 96.0
 		_pool[from]["editable"] = false
+	_pool_ramp_kick()
 	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
 	_pool_active = to
 	_terrain = _pool[to]["terrain"]
@@ -1497,6 +1574,20 @@ func pool_bounds(fid: int) -> AABB:
 ## A pool terrain node (the gate's is_area_meshed / statistics probes). null if absent.
 func pool_terrain(fid: int) -> Node3D:
 	return _pool[fid]["terrain"] if _pool.has(fid) else null
+## FP-M1c view-ramp introspection (§5). pool_view: the LIVE engine-applied max_view_distance (read off the terrain,
+## not the bookkeeping int — the honest value the ramp gate asserts). pool_view_target: the ramp goal. -1 if absent.
+func pool_view(fid: int) -> int:
+	if not _pool.has(fid):
+		return -1
+	var t: Object = _pool[fid]["terrain"]
+	return int(t.get("max_view_distance")) if (t != null and _has_prop(t, "max_view_distance")) else -1
+func pool_view_target(fid: int) -> int:
+	return int(round(float(_pool[fid]["view_target"]))) if _pool.has(fid) else -1
+## FP-M1c gate hook: advance the per-slot pool view ramp by `delta` seconds deterministically (headless frames carry
+## no stable dt, and _process may be dormant). Returns true while any slot is still growing. Test-only; production
+## drives the ramp from _process. No-op-safe: just calls the same step _process uses.
+func pool_ramp_tick(delta: float) -> bool:
+	return _ramp_pool_step(delta)
 ## The shared baked library / a fid-frozen generator / a fid-carve mesher / the carve range — the SEAM gates build
 ## meshes with these directly (the spike_* accessors' pool-flag twins; available whenever FP_M1_POOL is on).
 func pool_library() -> Object:

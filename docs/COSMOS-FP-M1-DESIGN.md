@@ -277,6 +277,18 @@ pool-miss fallback and the flag-OFF path.
 - **Hard caps:** `POOL_MAX_NEIGHBOURS := 4` (const, asserted). Geometry guarantees ≤ 3
   wanted concurrently (edge ≈ 201 > 2·D_WARM, so at most 2 ridges + 1 diagonal are within
   96 blocks — §8), so 4 is slack, and an LRU eviction backs the cap anyway.
+- **Why `D_WARM` stays 96 (lead-time analysis, FP-M1c(v2)).** With the per-slot spawn ramp
+  (§5.1c) a neighbour now needs only `RAMP_SECONDS` (1.5 s) of lead to finish its view ramp,
+  and streaming rides distance-priority behind the far-ring cover. At D_WARM = 96 the lead
+  from the shell to the ridge is 96 / speed = **17.5 s walking** (5.5 b/s), **10.1 s running**
+  (9.5 b/s), **6.0 s flying** (16 b/s) — all ≫ 1.5 s, so the ramp always completes before the
+  crossing and the border cross finds `to` already at full 96-stream (only the small ramped
+  96→128 grow remains). Raising D_WARM is *counter-productive*: the facet HALF-edge is ≈ 100
+  blocks (edge ≈ 201), so D_WARM ≳ 100 would put ALL FOUR ridge-neighbours inside the warm
+  shell whenever the player is near the facet centre → 4 live neighbours constantly → the full
+  `1×40 + 4×20 = 120 MB` worst case pinned at all times, hard against the `POOL_MEM_BUDGET_MB
+  := 128` ceiling (§10) with no headroom, and thrash pressure at the shell. 96 is the sweet
+  spot the geometry already dictates; **the ramp, not the lead time, is the freeze fix.**
 - **Diagonal facets** (share only a corner): FP-M1c ships edge neighbours only (the
   corner hole is covered by the far-ring quad + both edge terrains); FP-M1d adds the
   diagonal (fid = neighbour-of-neighbour across the two flanking slots) when BOTH flanking
@@ -316,9 +328,18 @@ reframe, and the return contract are **unchanged** (`world_manager.gd:1290-1324,
       (axis-aligned, editable), A's becomes the rotated render-only neighbour. The engine
       re-applies the parent transform to all mesh blocks (`voxel_terrain.cpp:867-882`) —
       sub-frame, no meshing.
-   c. Rebalance: `_pool[to].terrain.max_view_distance = 128`,
-      `_pool[from].terrain.max_view_distance = 96`. The engine diffs prev/new boxes
-      (`process_viewers`) — only the delta annulus streams/unloads. No teardown.
+   c. Rebalance (**FP-M1c(v2) per-slot ramp — the border-hitch fix**): `to`'s view
+      TARGET becomes 128 and RAMPS up from its current 96 over `RAMP_SECONDS` (1.5 s),
+      driven one-slot-per-frame in `module_world._ramp_pool_step`
+      (`module_world.gd`, `_process`) — NOT jammed in one write. Jamming the 96→128 delta
+      annulus in a single process pass re-queues its whole rim at once → a generation burst
+      → the main-thread mesh-apply (`voxel/threads/main/time_budget_ms`) spikes → the freeze
+      the user saw *when crossing a facet border*. `from` shrinks to 96 immediately (a shrink
+      only UNLOADS blocks — cheap). The engine diffs prev/new boxes (`process_viewers`) — only
+      the delta annulus streams/unloads. No teardown. Likewise a NEIGHBOUR SPAWN builds at
+      `RAMP_START_BLOCKS` (48) and ramps 48→96 (same step), so *approaching* a border no longer
+      bursts either. The ramp is the exact load-shaping the active-facet restream already used
+      (`:54-73`), generalized per-slot.
    d. Designate edits: `_terrain` accessor now returns `_pool[to]`; pending VoxelTool
       writes route there. Edit keys are `(fid, cell)`-global (§6) — nothing migrates.
 3. `_facet_ring.set_active(to)` — unchanged deferred re-emit (`facet_far_ring.gd:54-58`),

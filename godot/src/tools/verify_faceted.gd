@@ -57,6 +57,7 @@ func _initialize() -> void:
 	if CubeSphere.FP_M1_POOL and ClassDB.class_exists("VoxelTerrain"):
 		await _gate_pool_assembly()      # G-M1-POOL + G-M1-MEM
 		await _gate_redesignation()      # G-M1-XDES
+		await _gate_pool_ramp()          # G-M1-RAMP (per-slot view ramp — the border-hitch fix)
 		_gate_two_facet_seam()           # G-M1-SEAM-1 / SEAM-2
 		await _gate_pool_walk_soak()     # end-to-end: WorldManager crossing is a POOL HIT (pool-miss 0)
 	elif CubeSphere.FP_M1_POOL:
@@ -1059,6 +1060,70 @@ func _gate_redesignation() -> void:
 		var id_err2 := _xform_identity_err(a_terrain.global_transform)
 		_ok(id_err2 < 1e-6, "G-M1-XDES: A back at composite identity after A->B->A (err %.2e < 1e-6)" % id_err2)
 	_ok(_count_voxel_terrains(mod) == terrains_before, "G-M1-XDES: A->B->A froze/freed NO terrain (count stable at %d)" % terrains_before)
+	mod.queue_free()
+	holder.queue_free()
+	await process_frame
+
+# ---- G-M1-RAMP (per-slot view-distance ramp — the facet-border hitch fix) ----
+# Asserts the anti-burst load-shaping the live soak proves: a freshly spawned neighbour STARTS below its view target
+# and RAMPS (never steps) to it over ~RAMP_SECONDS; a re-designation sets `to`'s target to the near radius (128) and
+# ramps up rather than jamming it in one write; the old active SNAPS its shrink to the neighbour radius immediately.
+func _gate_pool_ramp() -> void:
+	var active := FA.spawn_facet()
+	var mod := await _pool_ready_module(active)
+	if mod == null:
+		_ok(false, "G-M1-RAMP: module built for the view-ramp gate")
+		return
+	var holder := Node3D.new()
+	get_root().add_child(holder)
+	mod.call("attach_viewer", holder)
+	var nbs := _edge_neighbours(active)
+	if nbs.is_empty():
+		_ok(false, "G-M1-RAMP: found an edge neighbour to ramp")
+		mod.queue_free(); holder.queue_free(); return
+	var B: int = nbs[0]
+	_ok(bool(mod.call("pool_spawn", B)), "G-M1-RAMP: spawned neighbour facet %d" % B)
+
+	# 1) A fresh neighbour STARTS below its target (built at RAMP_START, not jammed to the full 96).
+	var v0 := int(mod.call("pool_view", B))
+	var tgt := int(mod.call("pool_view_target", B))
+	print("  [G-M1-RAMP] neighbour spawn view=%d target=%d (start must be < target)" % [v0, tgt])
+	_ok(tgt == 96, "G-M1-RAMP: neighbour view target == 96 (the neighbour render radius)")
+	_ok(v0 < tgt, "G-M1-RAMP: freshly spawned neighbour view (%d) STARTS below its target (%d) — no one-pass full request" % [v0, tgt])
+
+	# 2) ONE small tick does NOT reach the target (it RAMPS, it does not STEP).
+	mod.call("pool_ramp_tick", 0.05)
+	var v1 := int(mod.call("pool_view", B))
+	_ok(v1 >= v0 and v1 < tgt, "G-M1-RAMP: after one 50ms tick view grew (%d->%d) but is still below target — ramp, not step" % [v0, v1])
+
+	# 3) After ~RAMP_SECONDS of ticks the ramp REACHES the target and settles (tick reports no more growing).
+	var settled := false
+	for _i in range(240):                       # up to 12s sim @ 50ms — RAMP_SECONDS is 1.5s
+		if not bool(mod.call("pool_ramp_tick", 0.05)):
+			settled = true
+			break
+	var v2 := int(mod.call("pool_view", B))
+	print("  [G-M1-RAMP] after ramp: view=%d target=%d settled=%s" % [v2, tgt, settled])
+	_ok(settled and v2 == tgt, "G-M1-RAMP: neighbour ramp REACHED its target (%d) and settled after ~RAMP_SECONDS of ticks" % tgt)
+
+	# 4) Re-designation: `to`(B) target becomes the near radius (128) and RAMPS up (not stepped); old active A SNAPS
+	#    its shrink to 96 immediately (a shrink only unloads).
+	var near := TC.near_render_radius()
+	_ok(bool(mod.call("redesignate", B)), "G-M1-RAMP: redesignate(%d) POOL HIT" % B)
+	var b_tgt := int(mod.call("pool_view_target", B))
+	var b_view_now := int(mod.call("pool_view", B))
+	_ok(b_tgt == near, "G-M1-RAMP: redesignate set `to` view target to the near radius (%d)" % near)
+	_ok(b_view_now < near, "G-M1-RAMP: right after redesignate `to` view (%d) is STILL below the near radius (%d) — it ramps, not steps" % [b_view_now, near])
+	var a_view := int(mod.call("pool_view", active))
+	_ok(a_view == 96, "G-M1-RAMP: the old active facet SNAPPED its shrink to the neighbour radius (96) immediately (view=%d)" % a_view)
+	# Drive the `to` ramp home.
+	for _j in range(240):
+		if not bool(mod.call("pool_ramp_tick", 0.05)):
+			break
+	var b_final := int(mod.call("pool_view", B))
+	print("  [G-M1-RAMP] post-crossing `to` ramp: view=%d target=%d" % [b_final, near])
+	_ok(b_final == near, "G-M1-RAMP: post-crossing `to` ramp REACHED the near radius (%d)" % near)
+
 	mod.queue_free()
 	holder.queue_free()
 	await process_frame

@@ -1,0 +1,20 @@
+{
+  "name": "voxiverse-web-soak-gpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tier-B cloud-GPU web-soak harness for VOXIVERSE — headful-under-xvfb Chromium + Playwright measuring the REAL threaded WASM web build's worst-frame / heap / GPU renderer / visuals.",
+  "scripts": {
+    "serve": "node server.mjs",
+    "soak": "node soak.mjs",
+    "soak:gpu": "node soak.mjs --gpu",
+    "soak:cpu-smoke": "node soak.mjs --cpu-fallback --allow-software --duration 30",
+    "gate-selftest": "node soak.mjs --cpu-fallback --duration 20"
+  },
+  "dependencies": {
+    "playwright": "^1.61.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

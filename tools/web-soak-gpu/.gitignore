@@ -1,0 +1,10 @@
+# Tier-B web-soak-gpu — never commit deps, browsers, or run outputs.
+node_modules/
+package-lock.json
+results/
+*.log
+# Screenshots + JSON series are run artefacts, not source.
+out/
+screenshots/
+# The stored regression baseline IS committed (baseline/baseline.json) so it is
+# NOT ignored here — a fresh baseline is written to results/ and promoted by hand.

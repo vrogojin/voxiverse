@@ -50,11 +50,16 @@ leave the box up (you then destroy it yourself).
 
 ### Prerequisites
 
-- **Vast.ai CLI + API key.** `pip install --upgrade vastai`, then put your key in
-  **`~/.config/vastai/vast_api_key`** (the CLI reads it automatically), or
-  `export VAST_API_KEY=…` before running (the harness persists it to that file, chmod
+- **Vast.ai CLI + API key.** `pip install --upgrade vastai` if you have pip. **Pip-free
+  host?** No problem — if `vastai` is not on `PATH`, the harness auto-fetches the
+  official standalone `vast.py` into `lib/` and drives it with `python3` (needs only
+  `python3` + the `requests` package, both common). Either way, put your key in
+  **`~/.config/vastai/vast_api_key`** (both the CLI and vast.py read it automatically),
+  or `export VAST_API_KEY=…` before running (the harness persists it to that file, chmod
   600). No key ⇒ the harness refuses to do anything. Get a key at
-  <https://cloud.vast.ai/account/>.
+  <https://cloud.vast.ai/account/>. `vast.py` prints a harmless "deprecated, pip install
+  vastai" WARNING to stderr; it never contaminates the `--raw` JSON (captured from
+  stdout).
 - **An SSH key registered with Vast.ai** (the account key used by `--ssh`); the default
   local key must be able to reach the box.
 - Local: `bash`, `node` (≥20), `rsync`, `ssh`, `curl`. No GPU needed locally.

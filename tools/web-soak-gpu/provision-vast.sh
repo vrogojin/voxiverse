@@ -48,10 +48,11 @@ vast_preflight
 # ── search ──────────────────────────────────────────────────────────────────────
 # verified=true  -> vetted datacenter machines (stable, real GPUs)
 # rentable=true  -> currently available
-# order dph_total (ascending) -> cheapest first; pick-offer re-sorts + caps as a guard.
+# -o 'dph' (the documented cost field, $/hr) sorts cheapest-first; pick-offer re-sorts
+# and enforces the price cap on the JSON, so a wrong sort can never overspend.
 QUERY="gpu_name=${GPU_NAME} verified=true rentable=true disk_space>=${DISK} cuda_max_good>=12"
 log "searching verified offers: [$QUERY]  cap=\$$MAX_PRICE/hr"
-OFFERS_JSON="$(vast search offers "$QUERY" -o 'dph_total' --raw)" \
+OFFERS_JSON="$(vast search offers "$QUERY" -o 'dph' --raw)" \
   || die "vastai search offers failed"
 
 PICK="$(printf '%s' "$OFFERS_JSON" | node "$HERE/lib/vastjson.mjs" \

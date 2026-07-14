@@ -54,9 +54,11 @@ if (mode === 'pick-offer') {
     process.stderr.write('[vastjson] pick-offer expects a JSON array of offers\n');
     process.exit(2);
   }
+  // Price field: prefer dph_total (total incl. internet); fall back to dph.
+  const priceOf = (o) => Number(o.dph_total ?? o.dph);
   const ok = data.filter((o) => {
     if (o == null || typeof o !== 'object') return false;
-    const dph = Number(o.dph_total);
+    const dph = priceOf(o);
     const disk = Number(o.disk_space);
     if (!Number.isFinite(dph) || dph <= 0) return false;
     if (dph > maxPrice) return false;
@@ -65,11 +67,11 @@ if (mode === 'pick-offer') {
     if (o.rentable === false || o.rentable === 0) return false;
     return true;
   });
-  ok.sort((a, b) => Number(a.dph_total) - Number(b.dph_total));
+  ok.sort((a, b) => priceOf(a) - priceOf(b));
   if (ok.length === 0) process.exit(3);
   const o = ok[0];
   process.stdout.write(
-    `${o.id} ${o.dph_total} ${String(o.gpu_name || '?').replace(/\s+/g, '_')} ${o.disk_space ?? '?'}\n`,
+    `${o.id} ${priceOf(o)} ${String(o.gpu_name || '?').replace(/\s+/g, '_')} ${o.disk_space ?? '?'}\n`,
   );
   process.exit(0);
 }

@@ -19,15 +19,47 @@ warn() { printf '[%s] WARN: %s\n' "${VAST_TAG:-vast}" "$*" >&2; }
 die()  { printf '[%s] ERROR: %s\n' "${VAST_TAG:-vast}" "$*" >&2; exit 1; }
 
 VAST_KEY_FILE="${VAST_API_KEY_FILE:-$HOME/.config/vastai/vast_api_key}"
+VAST_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VAST_PY_URL="https://raw.githubusercontent.com/vast-ai/vast-python/master/vast.py"
 
-# vastai wrapper (the CLI reads the key file itself; see vast_preflight).
-vast() { vastai "$@"; }
+# The resolved Vast.ai CLI, as a command array. Filled by vast_resolve():
+#   (vastai)                 if the pip-installed CLI is on PATH, OR
+#   (python3 <lib>/vast.py)  the official standalone script — needs only python3 +
+#                            requests (no pip). We fetch vast.py on first use if the
+#                            host has no vastai. This makes the harness work on a
+#                            pip-less orchestration host.
+VASTAI=()
 
-# Ensure the vastai CLI + an API key are present. Refuse to do anything without a key.
-vast_preflight() {
-  if ! command -v vastai >/dev/null 2>&1; then
-    die "vastai CLI not found. Install it first:  pip install --upgrade vastai"
+# Resolve $VASTAI once. Idempotent.
+vast_resolve() {
+  [ "${#VASTAI[@]}" -gt 0 ] && return 0
+  if command -v vastai >/dev/null 2>&1; then
+    VASTAI=(vastai)
+    return 0
   fi
+  command -v python3 >/dev/null 2>&1 \
+    || die "neither the 'vastai' CLI nor python3 is available — install one (pip install vastai, or python3)."
+  local py="$VAST_LIB/vast.py"
+  if [ ! -s "$py" ]; then
+    log "vastai CLI not found; fetching standalone vast.py -> $py"
+    curl -fsSL "$VAST_PY_URL" -o "$py" || die "failed to download vast.py from $VAST_PY_URL"
+    [ -s "$py" ] || { rm -f "$py"; die "downloaded vast.py is empty"; }
+  fi
+  # Liveness check (--help is confirmed-working; the script prints a harmless
+  # 'deprecated, pip install vastai' WARNING to stderr, which we discard here).
+  python3 "$py" --help >/dev/null 2>&1 \
+    || die "standalone vast.py present but 'python3 vast.py --help' failed — needs python3 + the 'requests' package."
+  VASTAI=(python3 "$py")
+}
+
+# vastai wrapper. --raw JSON is captured from STDOUT by callers; vast.py's deprecation
+# WARNING goes to STDERR, so it never contaminates a `$(vast … --raw)` capture.
+vast() { vast_resolve; "${VASTAI[@]}" "$@"; }
+
+# Ensure the vastai CLI (or standalone vast.py) + an API key are present.
+vast_preflight() {
+  vast_resolve
+  log "using vast CLI: ${VASTAI[*]}"
   if [ -n "${VAST_API_KEY:-}" ] && [ ! -s "$VAST_KEY_FILE" ]; then
     mkdir -p "$(dirname "$VAST_KEY_FILE")"
     printf '%s' "$VAST_API_KEY" > "$VAST_KEY_FILE"

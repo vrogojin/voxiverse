@@ -18,3 +18,5 @@ vast-instance.env
 vast_api_key
 *.api_key
 .vast_api_key
+# Standalone vast.py is fetched on demand when the host has no pip-installed vastai.
+lib/vast.py

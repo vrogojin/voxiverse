@@ -245,8 +245,10 @@ point of view.
   both artifacts.
 - Degrade/upgrade dial (pre-agreed, NEVER-OOM ladder §11): if the live A/B still shows gen
   backlog > target, `POOL_D_WARM2` 48 → 0 turns the hybrid into strict Z1 (one const); if
-  throughput headroom is abundant post-M1b on big machines, nothing changes — the cap is
-  not adaptive (determinism over cleverness).
+  throughput headroom is abundant post-M1b on big machines, nothing changes. The *targets*
+  (the cap, D_WARM/D_WARM2) are fixed feed-forward bounds — deterministic, headless-
+  verifiable; the *pace* toward them is adaptive via the outer measured-load governor
+  (§6.5), which is live-only adaptive and headless-deterministic (§6.5.7).
 
 ### 3.4 What this buys (the fix, quantified)
 
@@ -595,6 +597,19 @@ ledgers (§11) are hard, independent, and checked *after* the controller: full c
 never admit past a memory cap, and zero credit never exempts eviction. Flag-gated with
 FP_M2_LOD; with the flag off, `set_stream_pace` is never called and the shipped fixed
 ramp is byte-identical.
+
+**6.5.7 Determinism reconciled: live-only adaptive, headless-deterministic.** The inner
+feed-forward bounds (queue caps, est-seconds admission, tier targets, memory ledgers) are
+fixed and load-independent — every G-M2 gate that exercises them is bit-reproducible. The
+outer governor is the ONLY load-adaptive element, and in headless verify it never reads
+the wall clock: `StreamLoadController` takes its frame-time/backlog inputs through an
+injectable source, and the gates run it either **forced fully-open** (credit pinned 1 —
+the default for all non-controller gates, so selector/budgeter/caps/seam/policy asserts
+are unaffected by machine speed) or on a **fixed synthetic signal script** (G-M2-CTRL's
+load injector — a deterministic square wave, so the credit trace itself is
+bit-reproducible). Live web uses the real measurement. Both requirements hold: the user's
+"measure the real load" governs production pacing; the project's headless determinism
+governs the gates.
 
 ---
 

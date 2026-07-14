@@ -174,7 +174,10 @@ func _ensure_cached(fid: int) -> void:
 			var g := int(prof.x)
 			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
 			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))   # ABSOLUTE (node placed by transform)
-			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g <= TerrainConfig.SEA_LEVEL))
+			# far water iff g < SEA_LEVEL — STRICT, matching near's sea fill (g < y <= SEA_LEVEL, so g==SEA_LEVEL is DRY
+			# beach/shelf sand, not water). `<=` painted the flattened beach shelf (a wide band quantized to g==SEA_LEVEL)
+			# as water over near's sand. Matches the already-correct far_mesh_builder.gd classifier.
+			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
 	_pos_cache[fid] = pos
 	_col_cache[fid] = col
 

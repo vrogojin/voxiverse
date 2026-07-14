@@ -243,8 +243,9 @@ func _build_apron(job: Dictionary) -> Dictionary:
 		var g0 := int(prof0.x); var g1 := int(prof1.x)
 		var top0 := float(int(ceil(float(g0) / fs)) * s_max)            # snap UP to the s_max megablock top grid
 		var top1 := float(int(ceil(float(g1) / fs)) * s_max)
-		var c0 := FarPalette.color_for(g0, int(prof0.y), prof0.w, g0 <= sea)
-		var c1 := FarPalette.color_for(g1, int(prof1.y), prof1.w, g1 <= sea)
+		# far water iff g < SEA_LEVEL — STRICT (g==SEA_LEVEL is dry beach/shelf sand in near); `<=` regressed the boundary.
+		var c0 := FarPalette.color_for(g0, int(prof0.y), prof0.w, g0 < sea)
+		var c1 := FarPalette.color_for(g1, int(prof1.y), prof1.w, g1 < sea)
 		var rA0 := Vector3(a0.x, top0, a0.z)                            # ridge, raised to the local surface top
 		var rA1 := Vector3(a1.x, top1, a1.z)
 		var oO0 := rA0 + inward * fs; var oO1 := rA1 + inward * fs      # owner-side outer (+own_dist s_max)

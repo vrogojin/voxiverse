@@ -22,6 +22,9 @@ set -Eeuo pipefail
 GODOT_REF="${GODOT_REF:-4.4.1-stable}"
 VOXEL_REF="${VOXEL_REF:-v1.4.1}"
 JOBS="${JOBS:-$(nproc)}"
+# Web pthread pool size baked into the export template. Default 8 = upstream-identical
+# (engine patch 0001 defaults the scons option to 8); versions.env pins 16 for FP-M1b.
+WEB_PTHREAD_POOL="${WEB_PTHREAD_POOL:-8}"
 
 WORK=/work
 SRC="${WORK}/godot"
@@ -87,6 +90,30 @@ fi
 [ -z "${PATCHES_APPLIED}" ] && PATCHES_APPLIED=" (none)"
 log "godot_voxel patches:${PATCHES_APPLIED}"
 
+# ---------------------------------------------------------------------------
+# 1c. Apply in-repo patches to the Godot ENGINE tree (SRC), mirroring 1b.
+#     clone_pinned() reset SRC to pristine above (checkout -f + clean -fdq), so an
+#     edit to e.g. platform/web/detect.py would be wiped every build — hence a
+#     versioned patch series (COSMOS-FP-M1-DESIGN §9.3), same FATAL-on-fail + sha256
+#     discipline as the module loop. Applied AFTER checkout/reset, BEFORE the build.
+# ---------------------------------------------------------------------------
+ENGINE_PATCH_DIR=/patches/godot
+ENGINE_PATCHES_APPLIED=""
+if [ -d "${ENGINE_PATCH_DIR}" ]; then
+  shopt -s nullglob
+  for p in "${ENGINE_PATCH_DIR}"/*.patch; do
+    log "Applying godot engine patch: $(basename "${p}")"
+    if ! git -C "${SRC}" apply --whitespace=nowarn "${p}"; then
+      warn "FAILED to apply ${p} — refusing to build a silently-unpatched engine."
+      exit 1
+    fi
+    ENGINE_PATCHES_APPLIED="${ENGINE_PATCHES_APPLIED} $(basename "${p}"):$(sha256sum "${p}" | cut -d' ' -f1)"
+  done
+  shopt -u nullglob
+fi
+[ -z "${ENGINE_PATCHES_APPLIED}" ] && ENGINE_PATCHES_APPLIED=" (none)"
+log "godot engine patches:${ENGINE_PATCHES_APPLIED}"
+
 log "Toolchain versions"
 echo "  Godot ref     : ${GODOT_REF}   ($(git -C "${SRC}" rev-parse --short HEAD))"
 echo "  godot_voxel   : ${VOXEL_REF}   ($(git -C "${VOXEL_DIR}" rev-parse --short HEAD))"
@@ -125,10 +152,12 @@ MODULE_IN_WEB="unknown"
 
 build_web_templates() {
   # $1 = "release", $2 = scons target
-  log "Web template: scons platform=web target=$2 (production for release) ..."
+  log "Web template: scons platform=web target=$2 (production for release, pthread_pool_size=${WEB_PTHREAD_POOL}) ..."
   local extra=()
   [ "$1" = "release" ] && extra+=(production=yes)
-  scons platform=web target="$2" "${extra[@]}" -j"${JOBS}"
+  # pthread_pool_size is the scons option added by engine patch 0001; wires the web
+  # PTHREAD_POOL_SIZE from versions.env WEB_PTHREAD_POOL (COSMOS-FP-M1-DESIGN §9.3).
+  scons platform=web target="$2" pthread_pool_size="${WEB_PTHREAD_POOL}" "${extra[@]}" -j"${JOBS}"
 }
 
 web_build_all() {
@@ -186,6 +215,8 @@ fi
   echo "godot_ref       : ${GODOT_REF} ($(git -C "${SRC}" rev-parse HEAD))"
   echo "godot_voxel_ref : ${VOXEL_REF} ($(git -C "${VOXEL_DIR}" rev-parse HEAD 2>/dev/null || echo n/a))"
   echo "voxel_patches   :${PATCHES_APPLIED}"
+  echo "engine_patches  :${ENGINE_PATCHES_APPLIED}"
+  echo "web_pthread_pool: ${WEB_PTHREAD_POOL}"
   echo "emcc            : $(emcc --version | head -n1)"
   echo "module_in_web   : ${MODULE_IN_WEB}"
   echo "templates       : $(ls -1 "${OUT}/templates"/*.zip 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"

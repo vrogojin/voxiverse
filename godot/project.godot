@@ -47,28 +47,30 @@ common/max_physics_steps_per_frame=2
 
 [voxel]
 
-; godot_voxel (Zylann) VoxelEngine task-pool sizing. On the web/Emscripten build
-; the pthread pool is FIXED and pre-allocated; VoxelEngine's default sizing
-; (~ratio_over_max * CPU_count) spawns more threads than the pool has, exhausting
-; it -> meshing tasks deadlock -> blank world. So the count is a FIXED minimum
-; (ratio 0.0 -> deterministic + device-independent, never scaling with CPU), sized
-; to fit the pre-baked pool with headroom for the main + other engine threads:
-;   count = clamp(floor(ratio_over_max * (cpu - margin_below_max)), minimum, ...)
-;         = clamp(floor(0.0 * ...), 4, ...) = 4
-; Fill-speed vs smoothness balance: worldgen is deterministic + per-chunk independent,
-; so worker threads parallelise it safely. The web template bakes pthreadPoolSize=8
-; (confirmed in the served index.js; the pool is NOT growable — an over-request errors
-; "thread pool is exhausted"), so 4 voxel workers + the main proxy + engine/WorkerThreadPool
-; threads fit comfortably within 8. Raising this needs NO template rebuild — only a re-export.
-; COSMOS throughput: the curved GDScript resolve_cell loop is the steady-state gen bottleneck
-; (Fable). 2→3 was ~+50% raw gen; 3→4 adds another generation worker so the near field after a
-; seam-cross flip fills faster (shrinking the window where a re-cross can still reset). Because
-; the workers feed the SINGLE main-thread mesh-apply, the 4th worker only helps if that apply
-; keeps up — so threads/main/time_budget_ms below is raised in the same step (2 was the
-; original smoothness-first default; 3 was the first throughput bump).
-threads/count/minimum=4
-threads/count/ratio_over_max=0.0
-threads/count/margin_below_max=0
+; godot_voxel (Zylann) VoxelEngine task-pool sizing.
+; count = clamp(round(ratio_over_max * hw), minimum, max(hw - margin_below_max, minimum))
+;   (voxel_engine.cpp:49-52; hw = Thread::get_hardware_concurrency()).
+;
+; COSMOS FP-M1b (COSMOS-FP-M1-DESIGN §9.1) makes the voxel worker count scale with the
+; visitor's core count instead of the old fixed 4-pin (ratio 0.0 -> 4 on every device).
+; The old pin was only ever a WEB constraint: the web pthread pool is FIXED and
+; pre-allocated, and over-requesting it errors "thread pool is exhausted" -> meshing
+; deadlock -> blank world. FP-M1b removes that ceiling two ways so scaling is safe:
+;   1. The web template now bakes PTHREAD_POOL_SIZE=16 (was 8) — engine patch
+;      docker/engine/patches/godot/0001 + versions.env WEB_PTHREAD_POOL=16.
+;   2. godot_voxel patch 0005 clamps the web-reported hardware_concurrency to 14
+;      (the formula has no absolute-max knob), so N_voxel maxes at 10.
+; Resulting web N_voxel by cores: hw=2->3, hw=4->3, hw=8->6, hw=12->8, hw>=14->10.
+; Worst-case pool occupancy: voxel(<=10) + WorkerThreadPool(2) + audio/IO/spare(<=3)
+; = 15 < 16 pool slots. This file is SHARED native+web: native has no pool ceiling, so
+; ratio-scaling simply gives native visitors more workers on bigger machines — safe.
+; NOTE: minimum=3, not 4 — on a 1-2 core device the min clamp wins and a slight
+; oversubscription (3 workers) is accepted; the 16-slot pool has ample room. The
+; count/* keys need only a re-export (baked into the exported project); the
+; PTHREAD_POOL_SIZE change needs the ~24-min engine rebuild.
+threads/count/minimum=3
+threads/count/ratio_over_max=0.7
+threads/count/margin_below_max=1
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
 ; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input
 ; while streaming, so movement stutters. This is the DOWNSTREAM choke once >=3 workers

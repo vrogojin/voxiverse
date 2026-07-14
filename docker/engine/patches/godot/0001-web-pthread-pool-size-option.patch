@@ -1,0 +1,32 @@
+Make the Web PTHREAD_POOL_SIZE a SCons build option (default 8, upstream-identical)
+
+Godot 4.4.1 hard-codes the Emscripten pthread pool size to 8 at
+platform/web/detect.py:232. VOXIVERSE's web build is threaded (godot_voxel is
+multithreaded) and, under COSMOS FP-M1 (COSMOS-FP-M1-DESIGN §9), needs a larger
+preallocated Web-Worker pool so voxel workers can scale with the visitor's core
+count without exhausting the pool. Rather than sed the literal (which rots
+silently against upstream), expose it as a SCons option `pthread_pool_size`
+whose default stays 8 (byte-identical to stock when unset). build-engine.sh
+passes pthread_pool_size=${WEB_PTHREAD_POOL} (16) from versions.env.
+
+diff --git a/platform/web/detect.py b/platform/web/detect.py
+index 1111111..2222222 100644
+--- a/platform/web/detect.py
++++ b/platform/web/detect.py
+@@ -41,6 +41,7 @@ def get_opts():
+         # Matches default values from before Emscripten 3.1.27. New defaults are too low for Godot.
+         ("stack_size", "WASM stack size (in KiB)", 5120),
+         ("default_pthread_stack_size", "WASM pthread default stack size (in KiB)", 2048),
++        ("pthread_pool_size", "WASM pthread pool size (preallocated Web Workers)", 8),
+         BoolVariable("use_assertions", "Use Emscripten runtime assertions", False),
+         BoolVariable("use_ubsan", "Use Emscripten undefined behavior sanitizer (UBSAN)", False),
+         BoolVariable("use_asan", "Use Emscripten address sanitizer (ASAN)", False),
+@@ -229,7 +229,7 @@ def configure(env: "SConsEnvironment"):
+         env.Append(CCFLAGS=["-sUSE_PTHREADS=1"])
+         env.Append(LINKFLAGS=["-sUSE_PTHREADS=1"])
+         env.Append(LINKFLAGS=["-sDEFAULT_PTHREAD_STACK_SIZE=%sKB" % env["default_pthread_stack_size"]])
+-        env.Append(LINKFLAGS=["-sPTHREAD_POOL_SIZE=8"])
++        env.Append(LINKFLAGS=["-sPTHREAD_POOL_SIZE=%s" % env["pthread_pool_size"]])
+         env.Append(LINKFLAGS=["-sWASM_MEM_MAX=2048MB"])
+         if not env["dlink_enabled"]:
+             # Workaround https://github.com/emscripten-core/emscripten/issues/21844#issuecomment-2116936414.

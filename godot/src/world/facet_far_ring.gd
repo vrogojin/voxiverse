@@ -5,9 +5,15 @@ extends Node3D
 ## coords with radial relief (FP0's seam-glue). This node's transform = T_active⁻¹ (facet_transform(active)
 ## inverse), so the whole planet is re-placed into the active facet's flat render frame by ONE rigid transform —
 ## the player on the flat facet sees the faceted planet curve away, faces JOINING at the seams (no wedge).
-## CROSSING (FP3) is therefore cheap: set_active(B) just updates the node transform + re-emits the visible set
-## from the vertex CACHE (no terrain re-sampling — the user's insight; §6.4 "rigid re-parent, deferred re-emit").
-## Render-only, collision-free, voxel-worker-free (like FarTerrain).
+##
+## FP-S1(d) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 4 / §8): a crossing's set_active USED to do a
+## synchronous full 3456-facet rescan + re-emit + generate_normals + commit (plus first-time 25-noise-profile
+## caching for every newly-front-hemisphere facet) in ONE main-thread frame — the same frame as the restream
+## kickoff. That is a large part of the crossing stall. Now set_active is O(1): it updates ONLY the node transform
+## (the mesh is in ABSOLUTE coords, so a rigid re-place keeps every cached facet correctly positioned) and marks a
+## deferred rebuild. _process completes it OFF the crossing frame: it cache-warms newly-front-hemisphere facets
+## under a per-frame ms budget (mirroring FarTerrain's discipline), then re-emits once. The headless gate drives it
+## synchronously via force_rebuild(). Render-only, collision-free, voxel-worker-free (like FarTerrain).
 
 const ENABLED := true
 const CELLS := 4                     # heightmap cells per facet edge (far LOD) — k=24 facets are small
@@ -15,11 +21,17 @@ const RELIEF := 1.0                  # blocks of radial relief per (g − SEA_LE
 const BACK_CULL := 0.0               # front hemisphere only — back-side facets sit below the surface horizon
 const CAMERA_FAR := 9000.0           # the planet spans ~2R; the player camera far must reach it in faceted mode
 const FOG_BEGIN := 2200.0            # fog only far out, so the whole planet reads
+const WARM_BUDGET_MS := 3.0          # FP-S1(d): per-frame cache-warm budget for newly-front-hemisphere facets
 
 var _active_fid := -1
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
+# FP-S1(d) deferred-rebuild state
+var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
+var _emitted: Dictionary = {}        # fid -> true: the facets in the CURRENTLY committed mesh (visible-set gate check)
+var _reemit_count := 0               # diagnostics: full re-emits done (gate: set_active does NOT re-emit synchronously)
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -27,35 +39,89 @@ func setup(active_fid: int) -> void:
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
 	add_child(_mi)
-	_rebuild()
+	_rebuild_full()                  # initial build — synchronous (spawn is masked by the ShaderPrewarm hold)
+	set_process(true)
 
-## FP3 §6.1 crossing: re-place the planet into facet `new_fid`'s render frame (rigid) + re-emit the visible set
-## from the cache (no terrain work — only the exclusion/hemisphere set changes). Cheap enough for a live crossing.
+## FP3 §6.1 / FP-S1(d) crossing: re-place the planet into facet `new_fid`'s render frame (rigid, O(1)) and DEFER the
+## exclusion/terminator re-emit + any new-facet noise caching to _process (off the crossing frame, under a budget).
+## The existing merged mesh is in ABSOLUTE coords, so the transform update alone keeps every cached facet correctly
+## placed; only B's quad (now the active facet → should be excluded) and the just-left A's quad (now visible) plus a
+## thin terminator band are transiently stale for the ≤1-2 frames until the deferred re-emit lands.
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
-	_rebuild()
+	transform = FacetAtlas.facet_transform(_active_fid).affine_inverse()   # rigid re-place (cheap)
+	_pending = true
 
-func _rebuild() -> void:
+## FP-S1(d): drive the deferred rebuild off the crossing frame. Cache-warm the newly-front-hemisphere facets under a
+## per-frame ms budget; once they are all cached, do the single re-emit. Only active while a crossing is pending.
+func _process(_dt: float) -> void:
+	if not _pending:
+		return
+	var nrm := FacetAtlas.facet_normal64(_active_fid)
+	if _warm_front(nrm):             # all front-hemisphere facets cached → safe to re-emit this frame
+		_rebuild_full()
+
+## Warm (noise-cache) every uncached front-hemisphere facet under WARM_BUDGET_MS. Returns true once none remain
+## uncached (rebuild may proceed), false when the frame budget is spent (resume next frame). The scan itself is a
+## cheap cached-dot classification; only _ensure_cached (25 sphere-profile samples) is budgeted.
+func _warm_front(nrm: Array) -> bool:
+	var k := FacetAtlas.K
+	var t0 := Time.get_ticks_usec()
+	var budget_us := int(WARM_BUDGET_MS * 1000.0)
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				if not _front_visible(fid, nrm):
+					continue
+				if _pos_cache.has(fid):
+					continue
+				_ensure_cached(fid)
+				if Time.get_ticks_usec() - t0 > budget_us:
+					return false     # budget spent — finish warming next frame
+	return true
+
+func _front_visible(fid: int, nrm: Array) -> bool:
+	if fid == _active_fid:
+		return false                 # the near voxel world already covers the active facet
+	var cd := _centre_dir(fid)
+	return cd[0] * nrm[0] + cd[1] * nrm[1] + cd[2] * nrm[2] >= BACK_CULL
+
+## The full scan + re-emit + commit (the OLD _rebuild). Runs at setup, from _process once warming completes, and
+## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
+func _rebuild_full() -> void:
 	transform = FacetAtlas.facet_transform(_active_fid).affine_inverse()   # absolute → active-lattice render frame
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var k := FacetAtlas.K
 	var nrm := FacetAtlas.facet_normal64(_active_fid)
 	var tris := 0
+	_emitted.clear()
 	for face in range(6):
 		for a in range(k):
 			for b in range(k):
 				var fid := (face * k + a) * k + b
-				if fid == _active_fid:
-					continue                          # the near voxel world already covers the active facet
-				var cd := _facet_centre_dir(fid)
-				if cd[0] * nrm[0] + cd[1] * nrm[1] + cd[2] * nrm[2] < BACK_CULL:
-					continue                          # back hemisphere → not visible from the active facet
+				if not _front_visible(fid, nrm):
+					continue
 				_ensure_cached(fid)
 				tris += _emit_cached(st, fid)
+				_emitted[fid] = true
 	st.generate_normals()
 	_mi.mesh = st.commit()
+	_reemit_count += 1
+	_pending = false
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+
+## FP-S1(d) gate helper: synchronously complete a pending deferred rebuild (what _process does over budgeted frames)
+## so headless gates — which do not step frames — can assert the post-crossing visible set.
+func force_rebuild() -> void:
+	_rebuild_full()
+
+# --- gate diagnostics ---
+func is_rebuild_pending() -> bool: return _pending
+func reemit_count() -> int: return _reemit_count
+func is_emitted(fid: int) -> bool: return _emitted.has(fid)
+func emitted_count() -> int: return _emitted.size()
 
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
@@ -104,6 +170,13 @@ func _emit_cached(st: SurfaceTool, fid: int) -> int:
 			st.set_color(col[i3]); st.add_vertex(pos[i3])
 			n += 2
 	return n
+
+func _centre_dir(fid: int) -> Array:
+	if _centre_cache.has(fid):
+		return _centre_cache[fid]
+	var cd := _facet_centre_dir(fid)
+	_centre_cache[fid] = cd
+	return cd
 
 func _facet_centre_dir(fid: int) -> Array:
 	var s := [0.0, 0.0, 0.0]

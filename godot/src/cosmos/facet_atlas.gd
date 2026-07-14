@@ -503,6 +503,35 @@ static func dom_min(fid: int) -> Vector2i:
 	return Vector2i(_dom[fid * 4 + 0], _dom[fid * 4 + 1])
 static func dom_max(fid: int) -> Vector2i:
 	return Vector2i(_dom[fid * 4 + 2], _dom[fid * 4 + 3])
+
+## FP-S1(b) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §5(a)/§8) — BLOCK-level facet-domain early-out. Each facet's
+## near box overlaps FOREIGN territory that junction_modify() masks to AIR one cell at a time; that still pays the
+## full per-column profile pass first. This answers, in ~16 flops, "does the ENTIRE lattice block lie wholly beyond
+## one of `fid`'s four ridge planes → would junction_modify mask EVERY cell in it to AIR?" — letting the generator
+## skip the column work and leave the buffer default (air).
+##
+## The block spans cell-ORIGINS ox,ox+st,… (up to ox+(sx-1)*st) in x, likewise y/z; each cell footprint is the unit
+## cube [wx,wx+1] — EXACTLY junction_modify's per-cell model. For a ridge (A,B,C,D), junction_modify masks a cell to
+## AIR iff its `hi = A·wx+B·wy+C·wz+D + max(0,A)+max(0,B)+max(0,C) ≤ SEAM_EPS`. `hi` is affine and separable, so its
+## MAXIMUM over every cell in the block is at the block corner that maximizes each term. If even that maximum ≤ EPS
+## for ANY single ridge, every cell is beyond that ridge → the whole block is AIR. This is the exact per-cell test's
+## supremum, so it NEVER reports true for a block holding any interior/straddle cell (conservative — err to generate;
+## a block masked only by two ridges JOINTLY is not skipped, just not optimised). Pure/frozen atlas data → worker-safe.
+static func block_all_air(fid: int, ox: int, oy: int, oz: int, sx: int, sy: int, sz: int, st: int) -> bool:
+	if sx <= 0 or sy <= 0 or sz <= 0:
+		return false
+	var x0 := float(ox); var x1 := float(ox + (sx - 1) * st)
+	var y0 := float(oy); var y1 := float(oy + (sy - 1) * st)
+	var z0 := float(oz); var z1 := float(oz + (sz - 1) * st)
+	for slot in range(4):
+		var b := fid * 16 + slot * 4
+		var A := _seam_plane[b]; var B := _seam_plane[b + 1]; var C := _seam_plane[b + 2]; var D := _seam_plane[b + 3]
+		# max over cell-origins of A·wx + B·wy + C·wz (affine → at the block corner picking the larger coord per +coef)
+		var base_max := (A * x1 if A > 0.0 else A * x0) + (B * y1 if B > 0.0 else B * y0) + (C * z1 if C > 0.0 else C * z0) + D
+		var hi_max := base_max + maxf(0.0, A) + maxf(0.0, B) + maxf(0.0, C)   # + the unit-cube extent (matches junction_modify's `hi`)
+		if hi_max <= SEAM_EPS:
+			return true
+	return false
 static func frame_basis(fid: int) -> Basis:
 	var f := fid * 12
 	return Basis(Vector3(_frame[f + 3], _frame[f + 4], _frame[f + 5]),

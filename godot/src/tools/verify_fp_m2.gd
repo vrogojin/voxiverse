@@ -23,6 +23,7 @@ const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FLB := preload("res://src/world/facet_lod_builder.gd")
 const FLM := preload("res://src/world/facet_lod_mesher.gd")   # preload (not the global class_name) — headless --script parse scope
 const SLC := preload("res://src/world/stream_load_controller.gd")
+const WM := preload("res://src/world/world_manager.gd")       # M2d: the Z1-hybrid policy statics (z1_live_targets/promote_admit)
 
 const _BYTES_PER_VERT := 64
 const _BYTES_PER_INDEX := 4
@@ -113,6 +114,9 @@ func _initialize() -> void:
 	_gate_selector()
 	_gate_dir(nf)
 	_gate_ctrl(mod, active)
+	# --- FP-M2d gates: Z1-hybrid pool policy + promote/demote choreography ---
+	_gate_policy()
+	await _gate_xpd(mod, active, neighbour)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	# Deterministic process teardown so headless EXITS (not just prints the tally). Under FP_M1_POOL the module
@@ -657,6 +661,100 @@ func _gate_ctrl(mod: Node3D, active: int) -> void:
 		_ok(false, "G-M2-CTRL(e): mesher setup for the full-credit caps check")
 	if is_instance_valid(m):
 		m.free()
+
+# ---------- G-M2-POLICY: Z1-hybrid live-terrain targets + promote admission (§3.2 / §6.5.3.4) ----------
+func _gate_policy() -> void:
+	print("  --- G-M2-POLICY: Z1-hybrid live-neighbour targets + promote admission ---")
+	# arbitrary distinct facet ids for the PURE selector (z1_live_targets is over CubeSphere consts only).
+	var A := 10; var B := 11; var C := 12; var D := 13
+	# mid-edge walk: one ridge under D_WARM, the rest far → EXACTLY 1 live neighbour (the imminent).
+	var mid: Array = WM.z1_live_targets({A: 40.0, B: 200.0, C: 210.0, D: 220.0}, false, [])
+	_ok(mid.size() == 1 and int(mid[0]) == A, "G-M2-POLICY mid-edge: exactly 1 live neighbour (imminent)")
+	# corner approach: TWO ridges within D_WARM2 (48) → 2 live neighbours.
+	var corner: Array = WM.z1_live_targets({A: 20.0, B: 30.0, C: 210.0, D: 220.0}, false, [])
+	_ok(corner.size() == 2 and corner.has(A) and corner.has(B), "G-M2-POLICY corner: 2 live neighbours (both < D_WARM2=48)")
+	# a 2nd ridge inside D_WARM but OUTSIDE D_WARM2 does NOT add a 2nd live (walking mid-edge stays 1).
+	var one2: Array = WM.z1_live_targets({A: 40.0, B: 80.0, C: 210.0, D: 220.0}, false, [])
+	_ok(one2.size() == 1, "G-M2-POLICY: a 2nd ridge in [D_WARM2, D_WARM) stays 1 live (no spurious corner-second)")
+	# diagonal never live: z1 only ever returns fids present in `want` (edge neighbours) — a diagonal is never in `want`.
+	_ok(not corner.has(99), "G-M2-POLICY: a fid absent from `want` (a diagonal) is never a live target")
+	# off-surface freeze (risk #6): 0 live neighbours even with two near ridges (a high-flyer must not thrash the pool).
+	_ok(WM.z1_live_targets({A: 20.0, B: 30.0}, true, []).is_empty(), "G-M2-POLICY off-surface: 0 live neighbours (spawn freeze)")
+	# switch margin (anti-thrash): a live incumbent B@75 is KEPT when challenger A@70 beats it by only 5 (< 16).
+	var keep: Array = WM.z1_live_targets({A: 70.0, B: 75.0}, false, [B])
+	_ok(keep.size() == 1 and int(keep[0]) == B, "G-M2-POLICY switch-margin: incumbent kept (challenger within 16 — no thrash)")
+	# switch margin: incumbent B@75 is DISPLACED when challenger A@50 beats it by 25 (> 16).
+	var sw: Array = WM.z1_live_targets({A: 50.0, B: 75.0}, false, [B])
+	_ok(sw.size() == 1 and int(sw[0]) == A, "G-M2-POLICY switch-margin: incumbent displaced when beaten by > 16")
+	# promote admission (surface 4): a backlog-gated controller DENIES a live spawn; a healthy one admits; null → admit.
+	var cg = SLC.new()
+	var sg = _SquareWaveSource.new()
+	cg.set_input_source(sg)
+	var DT := 1.0 / 60.0
+	var t := 0.0
+	sg.frame_ms = 6.0; sg.backlog = CubeSphere.CTRL_BACKLOG_MAX + 100
+	for i in range(120):
+		t += DT; cg.tick(t)
+	_ok(not WM.promote_admit(cg), "G-M2-POLICY: backlog-gated controller → NO live spawn admitted (promote_admit false)")
+	sg.backlog = 0; sg.frame_ms = 6.0
+	for i in range(300):
+		t += DT; cg.tick(t)
+	_ok(WM.promote_admit(cg), "G-M2-POLICY: drained + sustained headroom → live spawn admitted (promote_admit true)")
+	_ok(WM.promote_admit(null), "G-M2-POLICY: null controller (flag-off) → admit (shipped FP-M1c behaviour)")
+
+# ---------- G-M2-XPD: promote-hold / evict + redesignate (no rebuild, no teardown, pool-miss 0) (§9) ----------
+func _gate_xpd(mod: Node3D, active: int, neighbour: int) -> void:
+	print("  --- G-M2-XPD: promote-hold → evict + redesignate crossing (rigid, no rebuild, pool-miss 0) ---")
+	# ---- Part A: the promote HOLD + evict state machine on a standalone mesher (no builder flood → hang-safe) ----
+	var m = FLM.new()
+	get_root().add_child(m)
+	if not bool(m.setup(mod)):
+		_ok(false, "G-M2-XPD: mesher setup"); m.free(); return
+	var f := neighbour
+	m.request(f, 3)                                          # ℓ3 = 1 tile — fast, guaranteed non-empty
+	var applied: bool = await _drive_mesher(m, f, 60000)
+	_ok(applied, "G-M2-XPD: facet %d covered (LOD mesh applied)" % f)
+	if not applied:
+		m.shutdown(); m.free(); return
+	var build0 := int(m.stats()["builder_built"])
+	m.on_promote(f)                                          # PROMOTE: hold the LOD cover while the live terrain streams
+	_ok(m.is_promoting(f) and m.is_covered(f), "G-M2-XPD: on_promote HOLDS facet %d's LOD cover (covered + promoting)" % f)
+	m.notify_pool_changed()                                  # a pool change must NOT evict the held cover (no gap)
+	_ok(m.is_covered(f), "G-M2-XPD: held cover survives notify_pool_changed (no gap while streaming)")
+	m.set_active_facet(active)                               # the crossing re-tier call: held cover moves rigidly, NO rebuild
+	_ok(m.is_covered(f), "G-M2-XPD: held cover survives set_active_facet(other) (rigid — not evicted)")
+	_ok(int(m.stats()["builder_built"]) == build0,
+		"G-M2-XPD: the crossing re-tier (set_active_facet) enqueued NO rebuild (build_count %d unchanged)" % build0)
+	m.evict(f)                                               # seam band meshed → complete the promote
+	_ok(not m.is_covered(f) and not m.is_promoting(f), "G-M2-XPD: evict() completes the promote (cover dropped, hold lifted)")
+	# the ACTIVE facet must NEVER carry a held cover: re-cover f, promote it, then make it active → force-evicted.
+	m.request(f, 3)
+	var re: bool = await _drive_mesher(m, f, 60000)
+	if re:
+		m.on_promote(f)
+		m.set_active_facet(f)                               # f becomes active
+		_ok(not m.is_covered(f) and not m.is_promoting(f),
+			"G-M2-XPD: a promoting facet that goes ACTIVE is force-evicted (active never carries LOD)")
+	else:
+		_ok(false, "G-M2-XPD: re-cover facet %d for the active-force-evict check" % f)
+	m.shutdown(); m.free()
+	# ---- Part B: redesignate on the real module pool is a HIT (pool-miss 0), ONE transform write, no teardown ----
+	_ok(int(mod.call("pool_active")) == active, "G-M2-XPD: module pool active == %d before the crossing" % active)
+	var spawned := bool(mod.call("pool_spawn", neighbour))
+	_ok(spawned and bool(mod.call("pool_has", neighbour)),
+		"G-M2-XPD: pre-spawned the crossing target %d (controlled, non-outrunning sequence)" % neighbour)
+	if spawned:
+		var t_to_before = mod.call("pool_terrain", neighbour)
+		var t_from = mod.call("pool_terrain", active)
+		var hit := bool(mod.call("redesignate", neighbour))
+		_ok(hit, "G-M2-XPD: redesignate(%d) is a POOL HIT (controlled crossing — strict pool-miss == 0)" % neighbour)
+		_ok(int(mod.call("pool_active")) == neighbour, "G-M2-XPD: pool active flipped to %d after redesignate" % neighbour)
+		var proot: Node3D = mod.get_node_or_null("PlanetRoot")
+		_ok(proot != null and proot.transform.is_equal_approx(FA.facet_transform(neighbour).affine_inverse()),
+			"G-M2-XPD: ONE PlanetRoot transform write == facet_transform(to)⁻¹ (the rigid crossing)")
+		var t_to_after = mod.call("pool_terrain", neighbour)
+		_ok(t_to_after == t_to_before and is_instance_valid(t_from) and bool(mod.call("pool_has", active)),
+			"G-M2-XPD: NO teardown — `to`+`from` terrains persist ((fid,cell) edit keys continuous across the crossing)")
 
 # ---------- helpers ----------
 func _drive_mesher(mesher, fid: int, timeout_ms: int) -> bool:

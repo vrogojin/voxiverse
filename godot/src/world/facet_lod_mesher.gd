@@ -50,6 +50,9 @@ var _cache: Dictionary = {}                 # fid -> {lod,node,tris,bytes,last_w
 var _building: Dictionary = {}              # fid -> {lod,expected,got,staging:Node3D,tris,bytes,est_tris,est_bytes}
 var _apron_building: Dictionary = {}        # "owner:slot" -> s_max (in-flight apron jobs, dedup)
 var _want: Dictionary = {}                  # fid -> desired tier (the target rung; recomputed on active/pool change)
+var _promoting: Dictionary = {}             # M2d (§9.1): fids whose LOD mesh is HELD while their live terrain streams —
+                                            # NOT evicted/idled/rebuilt until WorldManager calls evict() on seam-band-meshed
+                                            # (or the promote timeout). Cleared when the fid leaves the pool or goes active.
 var _pending: Array = []                    # drained-but-not-yet-applied items (carried across apply budgets)
 var _ledger_tris := 0                       # running sum: applied + in-flight (estimated) triangles
 var _ledger_bytes := 0                      # running sum: applied + in-flight (estimated) bytes
@@ -106,7 +109,7 @@ func shutdown() -> void:
 		var s: Node3D = _building[fid]["staging"]
 		if s != null and is_instance_valid(s):
 			s.free()                                        # never entered the tree → free() not queue_free()
-	_cache.clear(); _building.clear(); _apron_building.clear(); _want.clear(); _pending.clear()
+	_cache.clear(); _building.clear(); _apron_building.clear(); _want.clear(); _promoting.clear(); _pending.clear()
 	_ledger_tris = 0; _ledger_bytes = 0
 
 # ============================ tier policy (SSE SELECTOR + request-grant BUDGETER, M2c §6) ============================
@@ -123,20 +126,61 @@ const _EST_BUILD_S := {1: 15.0, 2: 4.0, 3: 1.0}
 ## budgeter paces every grant, so a crossing never floods ~48 probe-generator creations onto the crossing frame.
 func set_active_facet(active: int) -> void:
 	_active_fid = active
+	# M2d (§9.1): the new active facet must NEVER carry a held LOD mesh (it is now the live editable terrain). Force-drop
+	# any promote-hold + cached mesh for it, so a crossing to a still-promoting `to` cannot leave double geometry on the
+	# active facet. (Normally the promote-hold is already evicted during the D_WARM approach — this is the backstop.)
+	_promoting.erase(active)
+	if _cache.has(active):
+		evict(active)
 	_recompute_wants()
 	for fid in _cache.keys():
-		if not _want.has(fid):
+		if not _want.has(fid) and not _promoting.has(fid):     # M2d: never evict a promoting facet's held cover
 			evict(fid)
 	for fid in _building.keys():
-		if not _want.has(fid):
+		if not _want.has(fid) and not _promoting.has(fid):
 			_cancel_build(fid)
 
 ## The live pool (spawn/retire/redesignate) changed — a facet may have gone live (exclude it) or freed (re-cover).
 func notify_pool_changed() -> void:
 	_recompute_wants()
 	for fid in _cache.keys():
-		if not _want.has(fid):
+		if not _want.has(fid) and not _promoting.has(fid):     # M2d: hold a promoting facet's LOD cover (no gap, §9.1)
 			evict(fid)
+
+## M2d (§9.1) — PROMOTE: facet `fid` just went LIVE (pool_spawn). HOLD its LOD mesh (do not evict/idle/rebuild it) so
+## there is no gap while its full-res terrain streams; WorldManager calls evict(fid) once the terrain's seam band has
+## meshed (or the PROMOTE_EVICT_MAX_S timeout). Everything else (excluding the now-live fid from `_want`, re-covering
+## any freed facet) is exactly notify_pool_changed — this is that, made hold-aware for `fid`.
+func on_promote(fid: int) -> void:
+	if fid >= 0:
+		_promoting[fid] = true
+	notify_pool_changed()                                     # exclude the now-live fid from _want; hold protects its mesh
+
+## M2d — lift the promote HOLD without evicting the mesh: the facet retired before its live promote completed (it is a
+## normal LOD neighbour again). WorldManager calls this when a pending promote's facet has left the pool. The mesh stays;
+## only the no-evict protection lifts, so normal want-management (idle demote / LRU) resumes. evict() lifts the hold too.
+func end_promote(fid: int) -> void:
+	_promoting.erase(fid)
+
+## M2d (§6.5.4) — sustained-overload relief (pause-first): coarsen ONE least-recently-wanted covered LOD facet by one
+## tier (frees memory + future apply cost as it swaps). Live terrains are NEVER retired by the controller (pool
+## retirement stays purely geometric). A no-op when every covered facet is already at the coarsest tier. Called by
+## WorldManager only while StreamLoadController.demote_pressure() holds (≥ CTRL_OVERLOAD_SUSTAIN_S of credit-0 overload).
+func demote_pressure_relief() -> void:
+	var victim := -1
+	var oldest := 0x7fffffffffffffff
+	var vlod := 0
+	for fid in _cache.keys():
+		if _promoting.has(fid):
+			continue                                           # never coarsen a facet whose live promote is in flight
+		var lod := int(_cache[fid]["lod"])
+		if lod >= LOD_MAX_TIER:
+			continue                                           # already the coarsest LOD tier — nothing to give
+		var w := int(_cache[fid]["last_want_ms"])
+		if w < oldest:
+			oldest = w; victim = fid; vlod = lod
+	if victim >= 0:
+		request(victim, vlod + 1)                              # rebuild one tier coarser
 
 # ---- the SSE selector (§6.1/§6.2/§6.3): pure camera math, testable stand-alone (G-M2-SEL drives these directly) ----
 
@@ -278,7 +322,7 @@ func _idle_sweep() -> void:
 	var now := Time.get_ticks_msec()
 	var stale: Array = []
 	for fid in _cache.keys():
-		if _want.has(fid):
+		if _want.has(fid) or _promoting.has(fid):              # M2d: a held (promoting) facet never idles out
 			_cache[fid]["last_want_ms"] = now
 		elif now - int(_cache[fid]["last_want_ms"]) > int(LOD_IDLE_DEMOTE_S * 1000.0):
 			stale.append(fid)
@@ -504,6 +548,7 @@ func _free_apron(owner: int, slot: int) -> void:
 ## Free facet `fid`'s LOD node + aprons and subtract its ledger. Used by LRU funding, crossing shifts, promote
 ## completion (M2d). An evicted facet drops out of covered_fids() → the far-ring quad covers it (never a hole).
 func evict(fid: int) -> void:
+	_promoting.erase(fid)                                      # M2d: completing/aborting a promote lifts the hold
 	_cancel_build(fid)
 	if not _cache.has(fid):
 		return
@@ -567,6 +612,10 @@ func covered_fids() -> Array:
 
 func is_covered(fid: int) -> bool:
 	return _cache.has(fid)
+
+## M2d gate (G-M2-XPD): is `fid`'s LOD mesh currently HELD through a live-terrain promote (§9.1)?
+func is_promoting(fid: int) -> bool:
+	return _promoting.has(fid)
 
 func active_facet() -> int:
 	return _active_fid

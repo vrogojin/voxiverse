@@ -61,6 +61,10 @@ var _cross_cooldown := 0              # remaining suppressed calls (decremented 
 var _last_pool_spawn_ms := -100000
 var _last_pool_retire_ms := -100000
 var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# FP-M2d (§9.1): fids whose live promote is in flight (fid -> spawn ms). Each frame their seam-side band is polled
+# (pool_seam_meshed); when meshed — or after CubeSphere.PROMOTE_EVICT_MAX_S — the held LOD cover is evicted (lod_evict),
+# so the LOD mesh overlaps the streaming terrain with NO gap and is dropped only once the full-res seam is up. FP_M2_LOD-only.
+var _promote_pending: Dictionary = {}
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -219,6 +223,14 @@ func _process(delta: float) -> void:
 	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
 	if _load_ctrl != null:
 		_load_ctrl.tick(Time.get_ticks_msec() / 1000.0)
+	# FP-M2d (§6.5.3 surfaces 3-4): drive the pool view-ramp PACE from the controller every frame (stream_pace() folds
+	# in the vox_gen backlog gate — 0 holds neighbour growth while the pool has not drained), and, only under SUSTAINED
+	# overload, apply the pause-first LOD demote relief. With FP_M2_LOD off neither is called (pace stays 1.0 — byte-identical).
+	if CubeSphere.FP_M2_LOD and _load_ctrl != null and _module_world != null:
+		if _module_world.has_method("set_stream_pace"):
+			_module_world.call("set_stream_pace", float(_load_ctrl.stream_pace()))
+		if bool(_load_ctrl.demote_pressure()) and _module_world.has_method("lod_demote_pressure"):
+			_module_world.call("lod_demote_pressure")
 	# FP-M2b: the LOD covered set grows/shrinks as builds apply + facets evict (not only on a pool spawn/retire), so
 	# resync the far-ring exclusion on a slow throttle. set_pool_excluded no-ops when the set is unchanged (cheap).
 	# Gated on FP_M2_LOD → zero extra work with the flag off (byte-identical to FP-M1c).
@@ -1477,6 +1489,8 @@ func _manage_facet_pool(player_pos: Vector3) -> void:
 	var active := TerrainConfig.active_facet()
 	if active < 0:
 		return
+	# Own-side ridge distance per EDGE neighbour (nearest slot wins). The diagonal is never a seam_neighbour, so it
+	# never enters `want` → never live (Z1-hybrid §3.2 "the diagonal facet is never live"). Shared with both policies.
 	var want := {}
 	for slot in 4:
 		var nb: int = FacetAtlas.seam_neighbour(active, slot)
@@ -1485,6 +1499,18 @@ func _manage_facet_pool(player_pos: Vector3) -> void:
 		var d := FacetAtlas.own_dist(active, slot, player_pos.x, player_pos.y, player_pos.z)
 		if not want.has(nb) or d < float(want[nb]):
 			want[nb] = d
+	var changed := false
+	if CubeSphere.FP_M2_LOD:
+		changed = _manage_pool_z1hybrid(active, player_pos, want)
+		_lod_promote_pass(player_pos)                # evict held LOD covers whose live seam band has meshed (§9.1)
+	else:
+		changed = _manage_pool_fp1c(want)            # shipped FP-M1c policy, byte-identical with the flag off
+	if changed:
+		_facet_ring_sync_exclusion()
+
+## FP-M1c pool policy (shipped, unchanged) — 1 nearest neighbour under D_WARM, up to POOL_MAX_NEIGHBOURS, retire past
+## D_RETIRE (+ MIN_LIVE_S), ≤1 spawn + ≤1 retire per SPAWN_INTERVAL_S. Reached only with FP_M2_LOD OFF. Returns `changed`.
+func _manage_pool_fp1c(want: Dictionary) -> bool:
 	var now := Time.get_ticks_msec()
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
 	var changed := false
@@ -1507,8 +1533,124 @@ func _manage_facet_pool(player_pos: Vector3) -> void:
 					_last_pool_retire_ms = now
 					changed = true
 					break
-	if changed:
-		_facet_ring_sync_exclusion()
+	return changed
+
+## FP-M2d (§3.2) — the Z1-hybrid pool policy. Steady state = 1 active + 1 LIVE imminent neighbour (+ 1 corner-second when
+## a 2nd ridge is within POOL_D_WARM2); every OTHER non-active facet is a FacetLodMesher LOD mesh, not a live terrain —
+## the throughput win. Live PROMOTES are gated on the load controller (promote_admitted() + not backlog_gated(), §6.5.3.4)
+## and on the off-surface freeze (high flyer, risk #6). Non-target live neighbours retire (demote → LOD via the far-ring
+## quad, then rebuilt). ≤1 spawn + ≤1 retire per SPAWN_INTERVAL_S. Returns `changed` (whether the far ring needs a resync).
+func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -> bool:
+	var live_now: Array = (_module_world.call("pool_neighbour_fids") as Array)
+	var off_surface := _pool_off_surface(active, player_pos)
+	var targets := z1_live_targets(want, off_surface, live_now)
+	var now := Time.get_ticks_msec()
+	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
+	var changed := false
+	# SPAWN (promote LOD → live): the highest-priority target not yet live, iff the controller admits it AND we are below
+	# the Z1 live cap. One spawn per SPAWN_INTERVAL_S (amortized). backlog-gated / no-headroom → freeze (no live spawn).
+	if promote_admit(_load_ctrl) and (now - _last_pool_spawn_ms >= interval_ms):
+		for t in targets:
+			if bool(_module_world.call("pool_has", t)):
+				continue
+			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
+				break
+			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
+				_last_pool_spawn_ms = now
+				_promote_pending[t] = now                        # track → evict the held cover on seam-band-meshed
+				changed = true
+				break
+	# RETIRE (demote live → LOD): a live neighbour that is no longer a target and has walked past D_RETIRE (hysteresis),
+	# once it has lived ≥ MIN_LIVE_S. pool_retire() re-covers it as an LOD mesh (notify_pool_changed); the far-ring quad
+	# bridges the brief rebuild window (hole-free). One retire per SPAWN_INTERVAL_S.
+	if now - _last_pool_retire_ms >= interval_ms:
+		for nb in live_now:
+			if targets.has(nb):
+				continue
+			var d: float = want.get(nb, 1.0e30)
+			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
+				if bool(_module_world.call("pool_retire", nb)):
+					_last_pool_retire_ms = now
+					_promote_pending.erase(nb)
+					changed = true
+					break
+	return changed
+
+## FP-M2d (§3.2) — the PURE Z1-hybrid target selector (static so G-M2-POLICY drives it directly). Given each edge
+## neighbour's own-side ridge distance `want[fid]`, the off-surface freeze flag, and the currently-live neighbour set,
+## returns the fids that SHOULD be live terrains (0, 1, or 2). Rules: off-surface → [] (freeze). Else the imminent =
+## the nearest ridge under D_WARM, BUT an already-live incumbent is kept unless a challenger beats it by POOL_SWITCH_MARGIN
+## (anti-thrash). Plus a corner-second = the nearest OTHER ridge under POOL_D_WARM2, capped at FP2_LIVE_CAP. Every
+## returned fid is present in `want` (edge-only), so a diagonal — never in `want` — can never be a live target.
+static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array) -> Array:
+	var out: Array = []
+	if off_surface:
+		return out
+	var arr: Array = []
+	for nb in want.keys():
+		if float(want[nb]) < CubeSphere.POOL_D_WARM:
+			arr.append([float(want[nb]), int(nb)])
+	if arr.is_empty():
+		return out
+	arr.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
+	# imminent (with incumbent hysteresis): the nearest, unless a live incumbent is within POOL_SWITCH_MARGIN of it.
+	var imm := int(arr[0][1])
+	var imm_d := float(arr[0][0])
+	var inc := -1
+	var inc_d := 1.0e30
+	for c in arr:
+		if live_now.has(int(c[1])) and float(c[0]) < inc_d:
+			inc = int(c[1]); inc_d = float(c[0])
+	if inc >= 0 and imm != inc and imm_d > inc_d - CubeSphere.POOL_SWITCH_MARGIN:
+		imm = inc; imm_d = inc_d                              # challenger did not beat the incumbent by the margin — hold
+	out.append(imm)
+	# corner-second: the nearest OTHER ridge inside the tighter D_WARM2 shell, up to the live cap.
+	for c in arr:
+		if out.size() >= CubeSphere.FP2_LIVE_CAP:
+			break
+		if int(c[1]) != imm and float(c[0]) < CubeSphere.POOL_D_WARM2:
+			out.append(int(c[1]))
+			break
+	return out
+
+## FP-M2d (§6.5.3.4) — is a live-terrain promote admitted right now? Requires credit ≥ CTRL_PROMOTE_CREDIT sustained
+## AND the vox_gen backlog gate open (promotions start only into real, drained headroom). null controller (flag-off /
+## no source) → always admit (the shipped FP-M1c behaviour). Static so G-M2-POLICY asserts the backlog-gated denial.
+static func promote_admit(ctrl) -> bool:
+	if ctrl == null:
+		return true
+	return bool(ctrl.promote_admitted()) and not bool(ctrl.backlog_gated())
+
+## FP-M2d (risk #6, §10) — off-surface spawn freeze: a HIGH FLYER (altitude above the active facet plane > OFFSURFACE_Y)
+## whose radial direction has drifted over a DIFFERENT facet should not thrash the pool by skimming ridges. Returns true
+## only when both hold. The player's active-facet-lattice position → planet-absolute direction → facet_of_dir classifier.
+func _pool_off_surface(active: int, player_pos: Vector3) -> bool:
+	if player_pos.y <= CubeSphere.OFFSURFACE_Y:
+		return false
+	var w := FacetAtlas.lattice_to_world64(active, player_pos.x, player_pos.y, player_pos.z)
+	var rad_fid := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	return rad_fid != active
+
+## FP-M2d (§9.1) — the promote-completion pass: for every in-flight live promote, drop the held LOD cover once the live
+## terrain's seam-side band (nearest the player) has meshed — or after PROMOTE_EVICT_MAX_S (never pin double geometry).
+## Dropping a facet that retired before its promote completed is handled first (it is no longer live).
+func _lod_promote_pass(player_pos: Vector3) -> void:
+	if _promote_pending.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	var done: Array = []
+	for fid in _promote_pending.keys():
+		if not bool(_module_world.call("pool_has", fid)):
+			_module_world.call("lod_end_promote", fid)        # retired before completing — lift the hold, keep the LOD mesh
+			done.append(fid)
+			continue
+		var meshed := bool(_module_world.call("pool_seam_meshed", fid, player_pos))
+		var timed_out := now - int(_promote_pending[fid]) > int(CubeSphere.PROMOTE_EVICT_MAX_S * 1000.0)
+		if meshed or timed_out:
+			_module_world.call("lod_evict", fid)             # live full-res now covers the seam → drop the LOD overlap
+			done.append(fid)
+	for fid in done:
+		_promote_pending.erase(fid)
 
 ## FP-M1c: refresh the FacetFarRing exclusion to the live pool's NEIGHBOUR fids (the active facet is excluded by
 ## the ring itself). Deferred rebuild (budgeted _process) so a spawn/retire/crossing never pays a synchronous regen.
@@ -1530,6 +1672,14 @@ func _facet_ring_sync_exclusion() -> void:
 ## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
 func pool_miss_count() -> int:
 	return _pool_miss_count
+
+## FP-M2d M2e-WIRE hook (verify_fp_m2_soak §M2e-WIRE): the FacetLodMesher ledger snapshot (facets/tris/bytes/aprons/
+## in-flight, forwarded from module_world.lod_stats() → mesher.stats()). {} without a pool-capable module / flag off, so
+## the soak asserts the LOD caps hold throughout the walk (§11) alongside stream_load_credit() and the neighbour count.
+func lod_stats() -> Dictionary:
+	if _module_world != null and _module_world.has_method("lod_stats"):
+		return _module_world.call("lod_stats")
+	return {}
 
 ## FP-M1c gate accessor: is facet `fid` currently in this WorldManager's live pool? (module passthrough; false
 ## without a pool-capable module). Used by the end-to-end walk-soak gate to confirm the pool warmed before a crossing.

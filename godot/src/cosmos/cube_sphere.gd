@@ -76,6 +76,20 @@ const POOL_SPAWN_INTERVAL_S := 1.0
 const POOL_MEM_BUDGET_MB := 128
 const POOL_SINGULAR_EXCLUDE := 4
 
+## COSMOS FP-M2d (docs/COSMOS-FP-M2-DESIGN.md §3.2 / §9) — the Z1-hybrid pool-policy consts (beside the POOL_* family,
+## §3.2). CONSULTED ONLY under FP_M2_LOD; with the flag off the pool reverts to the shipped FP-M1c policy verbatim
+## (POOL_MAX_NEIGHBOURS = 4 stays the hard backstop, asserted by G-M1-POOL). D_WARM2: a SECOND live neighbour spawns
+## only when a 2nd ridge is within this (the corner approach; mid-edge it never fires). FP2_LIVE_CAP: the effective
+## live-neighbour cap (1 imminent + 1 corner-second) — the throughput win (worst pool volume 2.1V → 1.56V). SWITCH_MARGIN:
+## an incumbent imminent neighbour is displaced only when a challenger's ridge distance beats it by this (anti-thrash on
+## a diagonal-walk sweep). PROMOTE_EVICT_MAX_S / DEMOTE_RETIRE_MAX_S: hard lifetime caps on the promote/demote overlap
+## windows (§9.1/§9.2) — never let a laggard mesh/terrain pin double geometry (NEVER-OOM outranks the pop).
+const POOL_D_WARM2 := 48.0
+const FP2_LIVE_CAP := 2
+const POOL_SWITCH_MARGIN := 16.0
+const PROMOTE_EVICT_MAX_S := 20.0
+const DEMOTE_RETIRE_MAX_S := 20.0
+
 ## COSMOS FP-M2 (docs/COSMOS-FP-M2-DESIGN.md §0.8) — the LOD-mesh-neighbours master toggle. When true (AND
 ## FACETED AND FP_M1_POOL AND the module binary present) non-imminent facets stop being live full-res
 ## VoxelTerrains and become screen-space-error-selected blocky meshes built entirely OFF the voxel worker pool

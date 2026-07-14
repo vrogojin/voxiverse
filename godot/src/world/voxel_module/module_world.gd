@@ -1467,6 +1467,45 @@ func lod_covered_fids() -> Array:
 func lod_mesher():
 	return _lod_mesher
 
+## FP-M2d (§9.1): drop the held LOD cover for promoting facet `fid` — WorldManager calls this once `fid`'s live terrain
+## seam band has meshed (pool_seam_meshed) or the promote timeout expires. No-op without a mesher (flag off).
+func lod_evict(fid: int) -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("evict", fid)
+
+## FP-M2d (§9.1): lift the promote HOLD without evicting — the facet retired before its promote completed, so its LOD
+## mesh stays but normal want-management resumes. WorldManager calls this from _lod_promote_pass. No-op without a mesher.
+func lod_end_promote(fid: int) -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("end_promote", fid)
+
+## FP-M2d (§6.5.4): sustained-overload relief — coarsen one least-wanted LOD facet a tier (pause-first; live terrains
+## untouched). WorldManager calls this only while StreamLoadController.demote_pressure() holds. No-op without a mesher.
+func lod_demote_pressure() -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("demote_pressure_relief")
+
+## FP-M2d M2e-WIRE hook: the FacetLodMesher stats snapshot (facet/tri/byte ledgers, in-flight, aprons) — forwarded up
+## through WorldManager.lod_stats() for the soak/heap-A/B harness. {} without a mesher (flag off).
+func lod_stats() -> Dictionary:
+	return _lod_mesher.call("stats") if _lod_mesher != null else {}
+
+## FP-M2d (§9.1): has PROMOTING neighbour `fid`'s seam-side band (the strip of `fid` nearest the player) finished
+## MESHING? The player's ACTIVE-facet-lattice position is reframed into `fid`'s lattice (= `fid`'s terrain LOCAL space,
+## since the slot applies facet_transform(fid) over fid-lattice geometry) and probed with is_area_meshed. Returns true
+## when `fid` is not live / the terrain lacks is_area_meshed (never block a promote's completion on a missing probe).
+func pool_seam_meshed(fid: int, player_active_pos: Vector3) -> bool:
+	if not _pool.has(fid):
+		return true
+	var t: Object = _pool[fid]["terrain"]
+	if t == null or not t.has_method("is_area_meshed"):
+		return true
+	var lp := FacetAtlas.reframe_position64(_pool_active, fid,
+		player_active_pos.x, player_active_pos.y, player_active_pos.z)
+	var c := Vector3(float(lp[0]), float(lp[1]), float(lp[2]))
+	var half := Vector3(32.0, 40.0, 32.0)
+	return bool(t.call("is_area_meshed", AABB(c - half, half * 2.0)))
+
 ## FP-M2c (§6.5.3 surface 3): set the pool view-ramp pace ∈ [0,1] from the StreamLoadController. The GROW leg of every
 ## view ramp is stretched by `f` (RAMP_SECONDS the min duration; f=0 holds it). Clamped; default 1.0 → the shipped
 ## fixed ramp. M2d calls this each frame with the controller's stream_pace(); M2c leaves it at 1.0 (byte-identical).
@@ -1526,8 +1565,8 @@ func pool_spawn(fid: int) -> bool:
 	s["ramp_from"] = float(start)
 	_pool[fid] = s
 	_pool_ramp_kick()
-	if _lod_mesher != null:                          # FP-M2b: `fid` is now live → drop it from LOD coverage
-		_lod_mesher.call("notify_pool_changed")
+	if _lod_mesher != null:                          # FP-M2d (§9.1): `fid` is now live — HOLD its LOD cover (no gap)
+		_lod_mesher.call("on_promote", fid)          #   until WorldManager evicts it on seam-band-meshed (lod_evict).
 	return true
 
 ## Retire (free) a neighbour terrain. Never frees the active facet. queue_free's the whole slot (terrain → its

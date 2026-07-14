@@ -26,6 +26,7 @@
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
 import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync } from 'node:fs';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -44,8 +45,12 @@ const FRAMES_DIR = join(RESULTS_DIR, 'frames');
 const TELEMETRY_FILE = join(RESULTS_DIR, 'telemetry.jsonl');
 const FRAME_LATEST = join(RESULTS_DIR, 'frame-latest.jpg');
 
-const AUTH_TIMEOUT_MS = 5000;        // a socket must send a valid hello within this window
-const MAX_CONNS = 4;                 // live connection cap
+const AUTH_TIMEOUT_MS = 1500;        // a socket must send a valid hello within this SHORT window (anti-DoS)
+const MAX_CONNS = parseInt(process.env.REMOTE_BRIDGE_MAX_CONNS || '4', 10);   // AUTHED cap — never evicted
+const MAX_PENDING = parseInt(process.env.REMOTE_BRIDGE_MAX_PENDING || '8', 10); // unauthed pool; OLDEST evicted when full
+const PREAUTH_CONNECTS_PER_IP = parseInt(process.env.REMOTE_BRIDGE_PREAUTH_PER_IP || '10', 10); // new conns/IP/window
+const PREAUTH_WINDOW_MS = 10000;
+const ALLOWED_ORIGIN = (process.env.REMOTE_BRIDGE_ORIGIN || '').trim();  // optional Origin allow-list (defense-in-depth)
 const MAX_MSG_PER_SEC = 60;          // per-connection message-rate cap (telemetry ~4/s + frames ~2/s + slack)
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;   // reject a JPEG frame larger than 2 MB
 const TELEMETRY_CAP_BYTES = 32 * 1024 * 1024;  // roll telemetry.jsonl when it exceeds this
@@ -69,14 +74,12 @@ if (!TOKEN) {
   process.exit(2);
 }
 
-// Constant-time-ish token compare (avoid trivial length/short-circuit leaks).
+// Timing-safe token compare. Both sides are first SHA-256 digested to a fixed 32 bytes, so the raw
+// token LENGTH never leaks (a bare `a.length !== b.length` check would, and timingSafeEqual throws on
+// unequal lengths) and the comparison itself is constant-time.
 function tokenOk(candidate) {
-  const a = Buffer.from(String(candidate));
-  const b = Buffer.from(TOKEN);
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
+  const h = (s) => createHash('sha256').update(String(s)).digest();
+  return timingSafeEqual(h(candidate), h(TOKEN));
 }
 
 // ── Result sinks ───────────────────────────────────────────────────────────────────────────────
@@ -130,16 +133,54 @@ const httpServer = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_FRAME_BYTES });
 
-let liveConns = 0;
+// TWO separate pools so anonymous sockets can never lock out a real session:
+//   * authed  — validated sessions, capped at MAX_CONNS, NEVER evicted by newcomers.
+//   * pending — unauthed sockets awaiting a hello; capped at MAX_PENDING, OLDEST evicted when full.
+let authedConns = 0;
+const pending = new Map();          // ws -> connect-time ms
+const ipConnects = new Map();       // ip -> recent connect timestamps (pre-auth rate limit)
+
+// Per-IP pre-auth connection rate limit: at most PREAUTH_CONNECTS_PER_IP new sockets per window.
+function ipRateOk(ip) {
+  const now = Date.now();
+  const arr = (ipConnects.get(ip) || []).filter((t) => now - t < PREAUTH_WINDOW_MS);
+  arr.push(now);
+  ipConnects.set(ip, arr);
+  return arr.length <= PREAUTH_CONNECTS_PER_IP;
+}
 
 wss.on('connection', (ws, req) => {
-  const peer = req.socket.remoteAddress + ':' + req.socket.remotePort;
-  if (liveConns >= MAX_CONNS) {
-    log('REFUSE (cap):', peer);
-    try { ws.close(4009, 'busy'); } catch { /* ignore */ }
+  const ip = req.socket.remoteAddress;
+  const peer = ip + ':' + req.socket.remotePort;
+
+  // Optional Origin allow-list. WebSockets are NOT subject to CORS, so this is defense-in-depth only
+  // (a native/dev client sends no Origin, so an unset ALLOWED_ORIGIN — the default — never blocks).
+  if (ALLOWED_ORIGIN && req.headers.origin && req.headers.origin !== ALLOWED_ORIGIN) {
+    log('REFUSE (origin):', peer, req.headers.origin);
+    try { ws.close(4003, 'origin'); } catch { /* ignore */ }
     return;
   }
-  liveConns++;
+
+  // Per-IP pre-auth connection rate limit.
+  if (!ipRateOk(ip)) {
+    log('REFUSE (ip-rate):', peer);
+    try { ws.close(4029, 'rate'); } catch { /* ignore */ }
+    return;
+  }
+
+  // Register as pending. If the pending pool is full, evict the OLDEST pending (unauthed) socket —
+  // strangers displace strangers; the SEPARATE authed pool is untouched, so a real session can never
+  // be locked out by anonymous sockets holding the auth window.
+  if (pending.size >= MAX_PENDING) {
+    let oldestWs = null, oldestT = Infinity;
+    for (const [w, t] of pending) { if (t < oldestT) { oldestT = t; oldestWs = w; } }
+    if (oldestWs) {
+      log('EVICT (pending full):', peer);
+      try { oldestWs.close(4009, 'evicted'); } catch { /* ignore */ }
+      pending.delete(oldestWs);
+    }
+  }
+  pending.set(ws, Date.now());
 
   let authed = false;
   let msgWindowStart = Date.now();
@@ -152,7 +193,7 @@ wss.on('connection', (ws, req) => {
     }
   }, AUTH_TIMEOUT_MS);
 
-  log('CONNECT:', peer, `(live=${liveConns})`);
+  log('CONNECT:', peer, `(pending=${pending.size} authed=${authedConns})`);
 
   ws.on('message', (data, isBinary) => {
     // Per-connection rate limit.
@@ -182,7 +223,16 @@ wss.on('connection', (ws, req) => {
         try { ws.close(4001, 'auth'); } catch { /* ignore */ }
         return;
       }
+      // Valid token. Move from pending → authed, enforcing the authed cap. A real session is never
+      // displaced (we refuse the newcomer if the authed pool is full, rather than evicting a session).
+      pending.delete(ws);
+      if (authedConns >= MAX_CONNS) {
+        log('REFUSE (authed cap):', peer);
+        try { ws.close(4009, 'busy'); } catch { /* ignore */ }
+        return;
+      }
       authed = true;
+      authedConns++;
       clearTimeout(authTimer);
       // App-level AUTH-ACK: the client withholds ALL telemetry + frame capture until it receives this,
       // so an unauthenticated visitor never reads back or streams a single frame (closes the brief
@@ -212,8 +262,9 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', (code) => {
     clearTimeout(authTimer);
-    liveConns = Math.max(0, liveConns - 1);
-    log('DISCONNECT:', peer, 'code=', code, `(live=${liveConns})`);
+    if (authed) authedConns = Math.max(0, authedConns - 1);
+    else pending.delete(ws);
+    log('DISCONNECT:', peer, 'code=', code, `(pending=${pending.size} authed=${authedConns})`);
   });
 
   ws.on('error', (e) => {

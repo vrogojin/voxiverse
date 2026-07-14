@@ -39,9 +39,13 @@ function ok(cond, msg) {
 }
 
 async function main() {
-  // Boot the relay.
+  // Boot the relay. Small pending pool (2) + generous per-IP rate so test 3 can exercise pending
+  // eviction deterministically from loopback without the IP rate limit confounding it.
   const relay = spawn(process.execPath, [join(HERE, 'relay.mjs'), '--port', String(PORT), '--results', RESULTS], {
-    env: { ...process.env, REMOTE_BRIDGE_TOKEN: TOKEN },
+    env: {
+      ...process.env, REMOTE_BRIDGE_TOKEN: TOKEN,
+      REMOTE_BRIDGE_MAX_PENDING: '2', REMOTE_BRIDGE_PREAUTH_PER_IP: '100', REMOTE_BRIDGE_MAX_CONNS: '4',
+    },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   await sleep(700); // give it time to listen
@@ -111,6 +115,38 @@ async function main() {
     ok(!telemAfter.includes('marker-B-should-not-appear'), 'bad-token telemetry was NOT written');
     ok((existsSync(TELEMETRY_FILE) ? statSync(TELEMETRY_FILE).size : 0) === telemBytesBefore,
       'telemetry file did not grow after the bad-token attempt');
+
+    // ── 3. AUTHED-NEVER-EVICTED — a stranger flood can't displace a real session ───────────────
+    // Open + authenticate two real sessions, keep them open, then flood unauthed (pending) sockets
+    // past the small pending pool. The authed sessions must stay OPEN and still stream.
+    const authedWs = [];
+    for (let i = 0; i < 2; i++) {
+      await new Promise((resolve, reject) => {
+        const ws = new WebSocket(URL);
+        const timer = setTimeout(() => reject(new Error('authed setup timeout')), 4000);
+        ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', token: TOKEN, ua: 'authed-' + i, ver: 'test' })));
+        ws.on('message', (data, isBinary) => {
+          if (!isBinary && data.toString('utf8').includes('auth_ok')) { clearTimeout(timer); authedWs.push(ws); resolve(); }
+        });
+        ws.on('error', (e) => { clearTimeout(timer); reject(e); });
+      });
+    }
+    // Flood pending (unauthed — never send a hello) sockets past MAX_PENDING(2) to force eviction.
+    const floodWs = [];
+    for (let i = 0; i < 6; i++) { const w = new WebSocket(URL); floodWs.push(w); w.on('error', () => {}); }
+    await sleep(600);
+    const authedStillOpen = authedWs.filter((w) => w.readyState === WebSocket.OPEN).length;
+    ok(authedStillOpen === 2, `both authed sessions stayed OPEN through a pending flood (${authedStillOpen}/2)`);
+
+    // An authed session can still stream after the flood.
+    const beforeStream = existsSync(TELEMETRY_FILE) ? statSync(TELEMETRY_FILE).size : 0;
+    authedWs[0].send(JSON.stringify({ type: 'telemetry', _smoke: 'marker-C-post-flood' }));
+    await sleep(300);
+    const telemC = existsSync(TELEMETRY_FILE) ? readFileSync(TELEMETRY_FILE, 'utf8') : '';
+    ok(telemC.includes('marker-C-post-flood'), 'authed session still streamed after the pending flood');
+    ok((existsSync(TELEMETRY_FILE) ? statSync(TELEMETRY_FILE).size : 0) > beforeStream, 'telemetry grew from the authed post-flood write');
+    for (const w of authedWs) try { w.close(); } catch { /* ignore */ }
+    for (const w of floodWs) try { w.close(); } catch { /* ignore */ }
   } finally {
     relay.kill('SIGTERM');
   }

@@ -37,6 +37,16 @@ this host reads; it never serves the received data publicly.
    Phase-2 controls will ride.
 5. **No inbound control.** The only inbound message the client acts on is that one `auth_ok`
    handshake; everything else is drained and discarded — it never influences play.
+6. **Anti-DoS + timing-safe auth.** The token compare is `crypto.timingSafeEqual` over SHA-256
+   digests (constant-time, leaks no length). Connections are split into an **authed** pool (cap
+   `MAX_CONNS`, never evicted) and a **pending** pool (unauthed; the oldest is evicted when full), so
+   anonymous sockets can never lock a real session out of the channel. Short 1.5 s auth timeout, a
+   per-IP pre-auth connection rate limit, a per-connection message-rate cap, bounded frame size,
+   rolled/capped telemetry log, pruned frame ring, and an optional `REMOTE_BRIDGE_ORIGIN` allow-list
+   (defense-in-depth — WS isn't subject to CORS). Every connect/disconnect/auth-fail is logged.
+
+Tunables (env): `REMOTE_BRIDGE_MAX_CONNS` (4), `REMOTE_BRIDGE_MAX_PENDING` (8),
+`REMOTE_BRIDGE_PREAUTH_PER_IP` (10/10s), `REMOTE_BRIDGE_ORIGIN` (unset).
 5. **Relay hardening.** Binds `127.0.0.1` only (reachable solely through the nginx `/remote` route),
    caps concurrent connections, rate-limits per connection, bounds frame size, rolls/caps the
    telemetry log and prunes the frame ring, and logs every connect/disconnect/auth-fail.

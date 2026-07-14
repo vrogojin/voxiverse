@@ -5,10 +5,12 @@ extends Node
 ## GAME CANVAS to a relay on our host, so a remote agent can OBSERVE a real-GPU play session.
 ##
 ## SECURITY MODEL (this is a PUBLIC live site — these are load-bearing):
-##   * DEAD IN NORMAL PLAY. This node is instantiated by main.gd ONLY when dial mode is detected
-##     (dial_config() non-empty). With no `?remote=<token>` in the page URL, main.gd never creates
-##     it — no WebSocket, no frame capture, no per-frame cost, zero behavioural change. The headless
-##     verify gate never runs main.gd, so it never sees this node (6027/0 stays structural).
+##   * DEAD IN NORMAL PLAY. This streaming node is created ONLY on activation — the `?remote=<token>`
+##     URL param at boot, or the Ctrl+Shift+F9 hotkey + a token (RemoteBridgeActivator). Until then
+##     there is no WebSocket, no frame capture, no per-frame cost, zero behavioural change. (The
+##     RemoteBridgeActivator itself IS always present in main.gd, but it is an input-only key listener
+##     with no `_process` and no network — it just decides when to spawn/despawn THIS node.) The
+##     headless verify gate never runs main.gd, so it sees neither (6027/0 stays structural).
 ##   * TOKEN AUTH. The token comes from the URL query on web (`location.search`) or the
 ##     VOXIVERSE_REMOTE_TOKEN env var on native/headless (local testing only). It is sent to the
 ##     relay in the `hello`; the relay rejects+closes any connection whose hello token is
@@ -205,8 +207,10 @@ func _process(delta: float) -> void:
 
 	if not _was_open:
 		_was_open = true
-		_backoff = RECONNECT_BACKOFF_MIN     # a clean open resets the backoff ladder
 		_send_hello()                        # socket open, but NOT yet live — wait for auth_ok
+		# NB: the backoff ladder is reset only on auth_ok (below), NOT here. A bad/stale token OPENS the
+		# socket but never gets auth_ok, so resetting on open would hot-loop reconnects at ~1/s forever;
+		# leaving it to grow lets a rejected link back off to the 30s cap instead of hammering the relay.
 
 	# Drain inbound. The ONLY message the client acts on is the one auth_ok handshake (Phase 1 has no
 	# control surface); everything else is discarded. auth_ok flips the gate that lets telemetry +
@@ -221,6 +225,7 @@ func _process(delta: float) -> void:
 				var j = JSON.parse_string(txt)
 				if j is Dictionary and str((j as Dictionary).get("type", "")) == "auth_ok":
 					_authed = true
+					_backoff = RECONNECT_BACKOFF_MIN   # only a REAL auth resets the backoff ladder
 					_set_link(true)          # authenticated + open → badge "REMOTE ACTIVE — observing"
 
 	# Nothing streams until the relay has acked our token.

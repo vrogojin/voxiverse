@@ -65,6 +65,9 @@ var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate
 # (pool_seam_meshed); when meshed — or after CubeSphere.PROMOTE_EVICT_MAX_S — the held LOD cover is evicted (lod_evict),
 # so the LOD mesh overlaps the streaming terrain with NO gap and is dropped only once the full-res seam is up. FP_M2_LOD-only.
 var _promote_pending: Dictionary = {}
+var _last_demote_relief_ms := -100000  # W3: throttle sustained-overload LOD demote relief to ≤1 per CTRL_TICK_S (else
+                                       # _process fires it every frame while demote_pressure() holds → coarsens the whole
+                                       # LOD field to max tier in ~1s and pulses coarse↔fine)
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -229,8 +232,13 @@ func _process(delta: float) -> void:
 	if CubeSphere.FP_M2_LOD and _load_ctrl != null and _module_world != null:
 		if _module_world.has_method("set_stream_pace"):
 			_module_world.call("set_stream_pace", float(_load_ctrl.stream_pace()))
+		# W3: relief coarsens ONE least-wanted LOD facet per call; fire it at most once per CTRL_TICK_S (demote_pressure()
+		# stays continuously true once tripped, so an unthrottled per-frame call would strip the whole field in ~1s).
 		if bool(_load_ctrl.demote_pressure()) and _module_world.has_method("lod_demote_pressure"):
-			_module_world.call("lod_demote_pressure")
+			var now_relief := Time.get_ticks_msec()
+			if now_relief - _last_demote_relief_ms >= int(CubeSphere.CTRL_TICK_S * 1000.0):
+				_last_demote_relief_ms = now_relief
+				_module_world.call("lod_demote_pressure")
 	# FP-M2b: the LOD covered set grows/shrinks as builds apply + facets evict (not only on a pool spawn/retire), so
 	# resync the far-ring exclusion on a slow throttle. set_pool_excluded no-ops when the set is unchanged (cheap).
 	# Gated on FP_M2_LOD → zero extra work with the flag off (byte-identical to FP-M1c).
@@ -1548,13 +1556,21 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
 	var changed := false
 	# SPAWN (promote LOD → live): the highest-priority target not yet live, iff the controller admits it AND we are below
-	# the Z1 live cap. One spawn per SPAWN_INTERVAL_S (amortized). backlog-gated / no-headroom → freeze (no live spawn).
-	if promote_admit(_load_ctrl) and (now - _last_pool_spawn_ms >= interval_ms):
-		for t in targets:
+	# the Z1 live cap. One spawn per SPAWN_INTERVAL_S (amortized). W1 — targets[0] is the IMMINENT ridge (the one we are
+	# committed to crossing); it is EXEMPT from the raw vox_gen backlog gate (while walking vox_gen naturally sits
+	# 1500-2800, which would otherwise suppress the crossing promote → a silent fall-back to spawn-at-cross + a pool-miss).
+	# It still needs sustained frame HEADROOM (promote_admit_imminent). The 2nd/corner target keeps the FULL backlog gate
+	# — the feed-forward throttle applies to that EXTRA generation volume, and its view-ramp pace is throttled regardless.
+	if now - _last_pool_spawn_ms >= interval_ms:
+		for idx in range(targets.size()):
+			var t: int = int(targets[idx])
 			if bool(_module_world.call("pool_has", t)):
 				continue
 			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
 				break
+			var admitted: bool = promote_admit_imminent(_load_ctrl) if idx == 0 else promote_admit(_load_ctrl)
+			if not admitted:
+				continue
 			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
 				_last_pool_spawn_ms = now
 				_promote_pending[t] = now                        # track → evict the held cover on seam-band-meshed
@@ -1562,7 +1578,14 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 				break
 	# RETIRE (demote live → LOD): a live neighbour that is no longer a target and has walked past D_RETIRE (hysteresis),
 	# once it has lived ≥ MIN_LIVE_S. pool_retire() re-covers it as an LOD mesh (notify_pool_changed); the far-ring quad
-	# bridges the brief rebuild window (hole-free). One retire per SPAWN_INTERVAL_S.
+	# bridges the brief rebuild window. One retire per SPAWN_INTERVAL_S.
+	#
+	# ACCEPTED v1 RESIDUAL (§9.2 build-first-demote, decisions ledger #9): the geometric retire frees the live terrain
+	# BEFORE its LOD cover is built — the far-ring quad covers the gap, but its exclusion re-emit is deferred/budgeted,
+	# so under SUSTAINED backlog-gating there is a brief coarse-flash / possible seam gap for a few frames. A true
+	# build-first-demote requires the mesher to build an LOD cover for a still-LIVE facet, which the mesher deliberately
+	# forbids (request()/_recompute_wants exclude pool facets) — a non-trivial new demote-build path + gate, deferred to
+	# a follow-up. The W1/W10 controller fixes shrink the trigger (retire happens later / the promote holds longer).
 	if now - _last_pool_retire_ms >= interval_ms:
 		for nb in live_now:
 			if targets.has(nb):
@@ -1571,7 +1594,9 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
 				if bool(_module_world.call("pool_retire", nb)):
 					_last_pool_retire_ms = now
-					_promote_pending.erase(nb)
+					# C4: do NOT erase _promote_pending here — retire alone would leave the mesher's promote-HOLD set
+					# (on_promote) forever, PINNING the held LOD mesh in the cache (no idle/LRU path frees it). Instead let
+					# THIS tick's _lod_promote_pass see `not pool_has(nb)` → lod_end_promote(nb) → lift the hold → erase.
 					changed = true
 					break
 	return changed
@@ -1621,6 +1646,15 @@ static func promote_admit(ctrl) -> bool:
 		return true
 	return bool(ctrl.promote_admitted()) and not bool(ctrl.backlog_gated())
 
+## FP-M2d (W1) — is the SINGLE imminent live-terrain promote admitted? The ridge the player is committed to crossing is
+## EXEMPT from the raw vox_gen backlog gate (which naturally holds while walking, and would otherwise suppress the
+## crossing promote → spawn-at-cross + a pool-miss); it needs only sustained frame HEADROOM (promote_imminent_admitted).
+## null controller (flag-off / no source) → always admit (shipped FP-M1c). Static so G-M2-POLICY asserts the exemption.
+static func promote_admit_imminent(ctrl) -> bool:
+	if ctrl == null:
+		return true
+	return bool(ctrl.promote_imminent_admitted())
+
 ## FP-M2d (risk #6, §10) — off-surface spawn freeze: a HIGH FLYER (altitude above the active facet plane > OFFSURFACE_Y)
 ## whose radial direction has drifted over a DIFFERENT facet should not thrash the pool by skimming ridges. Returns true
 ## only when both hold. The player's active-facet-lattice position → planet-absolute direction → facet_of_dir classifier.
@@ -1645,7 +1679,14 @@ func _lod_promote_pass(player_pos: Vector3) -> void:
 			done.append(fid)
 			continue
 		var meshed := bool(_module_world.call("pool_seam_meshed", fid, player_pos))
-		var timed_out := now - int(_promote_pending[fid]) > int(CubeSphere.PROMOTE_EVICT_MAX_S * 1000.0)
+		# W10: dropping the held LOD cover over UN-meshed live terrain is a real see-through hole. Under backlog
+		# starvation the seam may not mesh within PROMOTE_EVICT_MAX_S — EXTEND the timeout (×PROMOTE_EVICT_STARVE_MULT)
+		# while the controller is starving the stream, so the cover holds until the live seam is really up. The hard-cap
+		# escape stays (never pin double geometry forever) — it just becomes much longer under starvation.
+		var cap_s := CubeSphere.PROMOTE_EVICT_MAX_S
+		if _load_ctrl != null and bool(_load_ctrl.backlog_gated()):
+			cap_s *= CubeSphere.PROMOTE_EVICT_STARVE_MULT
+		var timed_out := now - int(_promote_pending[fid]) > int(cap_s * 1000.0)
 		if meshed or timed_out:
 			_module_world.call("lod_evict", fid)             # live full-res now covers the seam → drop the LOD overlap
 			done.append(fid)

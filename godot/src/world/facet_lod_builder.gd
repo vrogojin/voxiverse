@@ -83,7 +83,7 @@ func _generator_for(fid: int) -> Object:
 ## ≤TILE_MAX³ LOD-stride blocks and enqueue them on the builder thread. MAIN thread only (touches _gen_cache).
 ## Each tile buffer is (nx+2, ny+2, nz+2) with origin = tile_corner − s so the 1-cell pad samples the
 ## neighbouring megablocks (correct face occlusion at same-ℓ tile seams). Returns the number of tiles enqueued.
-func enqueue_facet(fid: int, lod: int) -> int:
+func enqueue_facet(fid: int, lod: int, epoch: int = 0) -> int:
 	if not is_running():
 		return 0
 	if lod < 1 or lod > LOD_MAX_TIER:
@@ -109,7 +109,7 @@ func enqueue_facet(fid: int, lod: int) -> int:
 			while ty < y_hi:
 				var ny: int = mini(TILE_MAX, int(ceil(float(y_hi - ty) / float(s))))
 				if nx > 0 and ny > 0 and nz > 0:
-					_enqueue_one(fid, lod, s, gen, tx, ty, tz, nx, ny, nz)
+					_enqueue_one(fid, lod, s, gen, tx, ty, tz, nx, ny, nz, epoch)
 					jobs += 1
 				ty += tile_span
 			tx += tile_span
@@ -119,14 +119,14 @@ func enqueue_facet(fid: int, lod: int) -> int:
 ## Enqueue a SINGLE tile: interior edge `n` (≤ TILE_MAX) at LOD0 lattice corner (cx,cy,cz), tier `lod`. The raw
 ## build primitive that enqueue_facet is the whole-slab convenience over; the gate uses it for centred
 ## surface-straddling tiles. MAIN thread (touches _gen_cache). Returns false if the flag/module refuse.
-func enqueue_tile(fid: int, lod: int, cx: int, cy: int, cz: int, n: int) -> bool:
+func enqueue_tile(fid: int, lod: int, cx: int, cy: int, cz: int, n: int, epoch: int = 0) -> bool:
 	if not is_running() or lod < 1 or lod > LOD_MAX_TIER or n <= 0:
 		return false
 	var gen: Object = _generator_for(fid)
 	if gen == null:
 		return false
 	var e: int = mini(n, TILE_MAX)
-	_enqueue_one(fid, lod, 1 << lod, gen, cx, cy, cz, e, e, e)
+	_enqueue_one(fid, lod, 1 << lod, gen, cx, cy, cz, e, e, e, epoch)
 	return true
 
 ## COSMOS FP-M2b (§7.4) — enqueue a RIDGE-APRON job for the LOD↔LOD seam `slot` of owner facet `owner_fid`
@@ -145,9 +145,9 @@ func enqueue_apron(owner_fid: int, slot: int, s_max: int) -> bool:
 	_sem.post()
 	return true
 
-func _enqueue_one(fid: int, lod: int, s: int, gen: Object, tx: int, ty: int, tz: int, nx: int, ny: int, nz: int) -> void:
+func _enqueue_one(fid: int, lod: int, s: int, gen: Object, tx: int, ty: int, tz: int, nx: int, ny: int, nz: int, epoch: int = 0) -> void:
 	var job := {
-		"fid": fid, "lod": lod, "s": s, "gen": gen,
+		"fid": fid, "lod": lod, "s": s, "gen": gen, "epoch": epoch,
 		"tile": Vector3i(tx, ty, tz),          # LOD0 lattice corner (interior cell 0 origin)
 		"ox": tx - s, "oy": ty - s, "oz": tz - s,   # buffer origin: 1-cell pad below the corner
 		"nx": nx, "ny": ny, "nz": nz,
@@ -197,7 +197,7 @@ func _build_job(job: Dictionary) -> Dictionary:
 			var idx: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
 			tris += int(idx.size() / 3)
 	return {
-		"fid": job["fid"], "lod": job["lod"], "tile": job["tile"], "mesh": mesh,
+		"fid": job["fid"], "lod": job["lod"], "epoch": job.get("epoch", 0), "tile": job["tile"], "mesh": mesh,
 		"verts": verts, "tris": tris, "bytes": verts * _BYTES_PER_VERT + (tris * 3) * _BYTES_PER_INDEX,
 		"thread_id": OS.get_thread_caller_id(),
 	}

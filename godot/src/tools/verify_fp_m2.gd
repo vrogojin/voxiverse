@@ -109,11 +109,13 @@ func _initialize() -> void:
 	# --- FP-M2b gates: FacetLodMesher class + caps/LRU + ridge apron ---
 	await _gate_frame(mod, active, neighbour)
 	await _gate_caps(mod, active)
+	_gate_cap_real_spend(mod, active)               # steelman C1: the hard cap binds on REAL bytes at spend
 	await _gate_seam(mod, active)
 	# --- FP-M2c gates: SSE selector + facet_of_dir + the load controller ---
 	_gate_selector()
 	_gate_dir(nf)
 	_gate_ctrl(mod, active)
+	_gate_ctrl_rawdt()                              # steelman W2: raw-dt sustain clamp
 	# --- FP-M2d gates: Z1-hybrid pool policy + promote/demote choreography ---
 	_gate_policy()
 	await _gate_xpd(mod, active, neighbour)
@@ -401,6 +403,51 @@ func _gate_caps(mod: Node3D, active: int) -> void:
 	_ok(final_tracked <= FLM.LOD_MAX_FACETS, "G-M2-CAPS: still ≤ facet cap after the LRU eviction (%d)" % final_tracked)
 	m2.shutdown(); m2.free()
 
+# ---------- G-M2-CAPS(C1): the HARD cap binds on REAL bytes at SPEND (steelman C1) ----------
+# Admission uses an UPPER-FENCE estimate; a rugged facet / an apron can still overshoot the remaining headroom when the
+# real mesh lands. _enforce_caps_after_spend (called at every swap + apron apply) must then evict NON-wanted LRU until
+# the ACTUAL ledger is back under the caps — the cap can never be exceeded on materialized memory. White-box (the
+# estimate cannot be forced below the real mesh through the pipeline, so we drive the reconcile with an injected
+# over-spend and assert the invariant the swap-site relies on).
+func _gate_cap_real_spend(mod: Node3D, active: int) -> void:
+	print("  --- G-M2-CAPS(C1): the hard cap binds on REAL bytes at spend (over-spend evicts, never exceeds) ---")
+	var m = FLM.new()
+	get_root().add_child(m)
+	if not bool(m.setup(mod)):
+		_ok(false, "G-M2-CAPS(C1): mesher setup"); m.free(); return
+	# populate a handful of REAL applied facets (their real bytes/tris land in the ledger + _cache).
+	var picked: Array = []
+	var f := 0
+	while picked.size() < 4 and f < FA.facet_count():
+		if f != active:
+			picked.append(f)
+		f += 1
+	var all_up := true
+	for x in picked:
+		m.request(x, 3)
+		if not await _drive_mesher(m, x, 60000):
+			all_up = false
+	_ok(all_up, "G-M2-CAPS(C1): %d real facets applied (ledger holds their measured bytes)" % picked.size())
+	if not all_up:
+		m.shutdown(); m.free(); return
+	# keep ONE wanted; the rest become non-wanted (evictable). Then inject an over-spend (as if an applied mesh / apron
+	# overshot its fence) that pushes BOTH ledgers just past the caps.
+	var keep: int = picked[0]
+	m._want.clear()
+	m._want[keep] = 3
+	var cap_bytes := FLM.LOD_MAX_BYTES_MB * 1024 * 1024
+	m._ledger_bytes = cap_bytes + 1
+	m._ledger_tris = FLM.LOD_MAX_TRIS + 1
+	var covered_before := int(m.stats()["facets"])
+	m._enforce_caps_after_spend(keep)               # the exact call the swap / apron-apply sites make (C1)
+	var st: Dictionary = m.stats()
+	_ok(int(st["bytes"]) <= cap_bytes and int(st["tris"]) <= FLM.LOD_MAX_TRIS,
+		"G-M2-CAPS(C1): after an over-spend the reconcile drives the ledger BACK under the caps (bytes %d ≤ %d, tris %d ≤ %d)" % [
+			int(st["bytes"]), cap_bytes, int(st["tris"]), FLM.LOD_MAX_TRIS])
+	_ok(m.is_covered(keep), "G-M2-CAPS(C1): the WANTED facet was retained (a NON-wanted LRU facet was evicted first)")
+	_ok(int(st["facets"]) < covered_before, "G-M2-CAPS(C1): a non-wanted facet was evicted to fund the over-spend (%d → %d)" % [covered_before, int(st["facets"])])
+	m.shutdown(); m.free()
+
 # ---------- G-M2-SEAM: erosion zero-protrusion + the ridge apron (§7.5) ----------
 func _gate_seam(mod: Node3D, active: int) -> void:
 	print("  --- G-M2-SEAM: erosion zero-protrusion + LOD↔LOD ridge apron (no hairline) ---")
@@ -488,6 +535,13 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 			# (c) spans BOTH sides of the retreat gap, and every apron vertex stays within the ±s_max window.
 			_ok(max_off > 0.5 and min_off < -0.5, "G-M2-SEAM(c): apron spans BOTH sides of the ridge (owner off=%.1f, nbr off=%.1f)" % [max_off, min_off])
 			_ok(max_perp <= float(s_max) + 0.75, "G-M2-SEAM(c): every apron vertex within the ±s_max window (max |off|=%.2f ≤ %d)" % [max_perp, s_max])
+	# W6: put the NEIGHBOUR into a promote-hold (its live terrain now streams under a held cover) — the owner's apron on
+	# the ridge facing it MUST be dropped (an apron there extends into the live facet and z-fights its carve bevel).
+	if apron_up:
+		m.on_promote(nbr)
+		var gone: bool = await _drive_until(m, func(): return not m.apron_slots(owner).has(oslot), 30000)
+		_ok(gone, "G-M2-SEAM(W6): no apron on a live<->LOD ridge — the owner apron facing the promoting neighbour is dropped")
+		m.end_promote(nbr)
 	m.shutdown(); m.free()
 
 # ---------- G-M2-SEL: SSE selector (monotone + floor/cap + hysteresis + telescope) ----------
@@ -662,6 +716,36 @@ func _gate_ctrl(mod: Node3D, active: int) -> void:
 	if is_instance_valid(m):
 		m.free()
 
+# ---------- G-M2-CTRL(W2): raw-dt sustain clamp (a background gap must not spuriously trip a sustained condition) ----------
+func _gate_ctrl_rawdt() -> void:
+	print("  --- G-M2-CTRL(W2): raw-dt sustain clamp (giant background tick never satisfies a sustain) ---")
+	var DT := 1.0 / 60.0
+	# headroom arm: partial imminent headroom-hold (< CTRL_PROMOTE_SUSTAIN_S), then ONE giant dt tick.
+	var cw = SLC.new()
+	var sw = _SquareWaveSource.new()
+	cw.set_input_source(sw)
+	var tt := 0.0
+	sw.frame_ms = 6.0; sw.backlog = 0                    # headroom → the imminent headroom-hold accrues
+	for i in range(80):
+		tt += DT; cw.tick(tt)
+	var head_before := float(cw.stats()["headroom_hold_s"])
+	_ok(head_before > 0.0 and not cw.promote_imminent_admitted(),
+		"G-M2-CTRL(W2) setup: partial headroom hold accrued (%.2fs), not yet sustained" % head_before)
+	tt += 100.0; cw.tick(tt)                             # ONE giant tick (100 s of wall clock in one frame)
+	_ok(float(cw.stats()["headroom_hold_s"]) <= CubeSphere.CTRL_TICK_S + 1e-6 and not cw.promote_imminent_admitted(),
+		"G-M2-CTRL(W2): a giant dt tick does NOT jump the headroom hold past threshold (discontinuity reset)")
+	# overload arm: partial overload hold (< CTRL_OVERLOAD_SUSTAIN_S), then a giant tick must NOT trip sustained demote.
+	var cw2 = SLC.new()
+	var sw2 = _SquareWaveSource.new()
+	cw2.set_input_source(sw2)
+	var t2 := 0.0
+	sw2.frame_ms = 40.0; sw2.backlog = 0                 # overload → credit → 0, overload-hold begins
+	for i in range(120):
+		t2 += DT; cw2.tick(t2)
+	_ok(not cw2.demote_pressure(), "G-M2-CTRL(W2) setup: overloaded < CTRL_OVERLOAD_SUSTAIN_S — demote pressure not yet tripped")
+	t2 += 100.0; cw2.tick(t2)                            # ONE giant tick
+	_ok(not cw2.demote_pressure(), "G-M2-CTRL(W2): a giant dt tick does NOT instantly trip sustained demote pressure (no spurious demote on refocus)")
+
 # ---------- G-M2-POLICY: Z1-hybrid live-terrain targets + promote admission (§3.2 / §6.5.3.4) ----------
 func _gate_policy() -> void:
 	print("  --- G-M2-POLICY: Z1-hybrid live-neighbour targets + promote admission ---")
@@ -701,6 +785,21 @@ func _gate_policy() -> void:
 		t += DT; cg.tick(t)
 	_ok(WM.promote_admit(cg), "G-M2-POLICY: drained + sustained headroom → live spawn admitted (promote_admit true)")
 	_ok(WM.promote_admit(null), "G-M2-POLICY: null controller (flag-off) → admit (shipped FP-M1c behaviour)")
+	# W1 — the IMMINENT target is EXEMPT from the raw vox_gen backlog gate (the ridge we are crossing must go full-res on
+	# frame headroom alone), but the 2nd/corner target is NOT. Build a controller that is backlog-GATED yet has sustained
+	# frame headroom: promote_admit_imminent → true (imminent spawns), promote_admit → false (2nd/corner is throttled).
+	var ci = SLC.new()
+	var si = _SquareWaveSource.new()
+	ci.set_input_source(si)
+	var ti := 0.0
+	si.frame_ms = 6.0                                   # full frame headroom (credit floats to 1, headroom-hold accrues)
+	si.backlog = CubeSphere.CTRL_BACKLOG_MAX + 100      # vox_gen gate CLOSED throughout
+	for i in range(300):
+		ti += DT; ci.tick(ti)
+	_ok(ci.backlog_gated(), "G-M2-POLICY(W1): backlog gate closed (vox_gen %d > %d)" % [int(si.backlog), CubeSphere.CTRL_BACKLOG_MAX])
+	_ok(WM.promote_admit_imminent(ci), "G-M2-POLICY(W1): the IMMINENT target IS admitted despite the backlog gate (frame-headroom exempt)")
+	_ok(not WM.promote_admit(ci), "G-M2-POLICY(W1): the 2nd/corner target is NOT admitted while backlog-gated (feed-forward throttle holds)")
+	_ok(WM.promote_admit_imminent(null), "G-M2-POLICY(W1): null controller (flag-off) → imminent admit (shipped FP-M1c)")
 
 # ---------- G-M2-XPD: promote-hold / evict + redesignate (no rebuild, no teardown, pool-miss 0) (§9) ----------
 func _gate_xpd(mod: Node3D, active: int, neighbour: int) -> void:
@@ -737,6 +836,22 @@ func _gate_xpd(mod: Node3D, active: int, neighbour: int) -> void:
 			"G-M2-XPD: a promoting facet that goes ACTIVE is force-evicted (active never carries LOD)")
 	else:
 		_ok(false, "G-M2-XPD: re-cover facet %d for the active-force-evict check" % f)
+	# ---- C4: promote then RETIRE-before-complete. end_promote() lifts the HOLD without evicting (the facet is a normal
+	# LOD neighbour again); the once-held cover must then be normally manageable (idle/LRU can free it) — NOT pinned
+	# forever (the world_manager premature `_promote_pending.erase` bug left `_promoting[fid]` set → an orphan mesh). ----
+	m.set_active_facet(active)                               # reset: f is a neighbour again
+	m.request(f, 3)
+	var reC: bool = await _drive_mesher(m, f, 60000)
+	if reC:
+		m.on_promote(f)
+		_ok(m.is_promoting(f) and m.is_covered(f), "G-M2-XPD(C4): facet %d promote-held (covered + promoting)" % f)
+		m.end_promote(f)                                    # == module_world.lod_end_promote on a retire-before-complete
+		_ok(not m.is_promoting(f) and m.is_covered(f), "G-M2-XPD(C4): end_promote lifts the hold, mesh KEPT (not evicted, not pinned-promoting)")
+		m._want.clear()                                     # white-box: the facet is no longer wanted (retired + walked on)
+		m.set_active_facet(active)                          # a re-tier now frees the un-held, unwanted cover
+		_ok(not m.is_covered(f), "G-M2-XPD(C4): the un-held cover is freeable — no orphan LOD mesh pinned after promote-retire")
+	else:
+		_ok(false, "G-M2-XPD(C4): re-cover facet %d for the promote-retire check" % f)
 	m.shutdown(); m.free()
 	# ---- Part B: redesignate on the real module pool is a HIT (pool-miss 0), ONE transform write, no teardown ----
 	_ok(int(mod.call("pool_active")) == active, "G-M2-XPD: module pool active == %d before the crossing" % active)

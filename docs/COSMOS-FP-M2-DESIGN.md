@@ -777,6 +777,17 @@ Trigger: pool policy retires fid (ridge > D_RETIRE, or displaced incumbent §3.2
   set re-merges. Hard timeout `DEMOTE_RETIRE_MAX_S := 20` → retire anyway and let the quad
   cover until the normal grant lands (never let a stuck build pin a 20 MB terrain —
   NEVER-OOM outranks the pop).
+  > **v1 SHIPPED DIVERGENCE (steelman-accepted residual, decisions ledger #10).** The
+  > shipped `_manage_pool_z1hybrid` retire branch does a **geometric retire** (`pool_retire`
+  > immediately, the far-ring quad bridges the rebuild window) rather than this full
+  > build-first choreography. True build-first requires the mesher to build an LOD cover for
+  > a **still-live** facet, which `request()`/`_recompute_wants` deliberately forbid
+  > (`pool_has` → excluded) — a non-trivial new demote-build path + gate, deferred to a
+  > follow-up. Residual: under **sustained backlog-gating** the deferred far-ring quad
+  > re-emit can lag a few frames, so a demote can show a brief coarse-flash / a possible
+  > seam gap. The W1 (imminent-exempt promote) and W10 (starvation-extended promote hold)
+  > fixes shrink the trigger. Accepted for v1 alongside the promote-overlap and
+  > edits-invisible-at-LOD residuals (§15 #8).
 - The old active after a crossing is simply the new imminent neighbour (distance ≈ 0) —
   it stays live and demotes later through this same path when the player walks on. No
   crossing-frame work.

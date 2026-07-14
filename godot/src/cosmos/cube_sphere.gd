@@ -89,6 +89,11 @@ const FP2_LIVE_CAP := 2
 const POOL_SWITCH_MARGIN := 16.0
 const PROMOTE_EVICT_MAX_S := 20.0
 const DEMOTE_RETIRE_MAX_S := 20.0
+## W10 — while the load controller is STARVING the stream (vox_gen backlog-gated), the promoting terrain's seam band
+## may not mesh within PROMOTE_EVICT_MAX_S; dropping the held LOD cover then would open a real see-through hole over
+## un-meshed live terrain. So the promote-evict timeout is EXTENDED by this factor while backlog-gated (the hard-cap
+## escape stays — it just becomes much longer under starvation, never infinite).
+const PROMOTE_EVICT_STARVE_MULT := 6.0
 
 ## COSMOS FP-M2 (docs/COSMOS-FP-M2-DESIGN.md §0.8) — the LOD-mesh-neighbours master toggle. When true (AND
 ## FACETED AND FP_M1_POOL AND the module binary present) non-imminent facets stop being live full-res

@@ -28,6 +28,10 @@ var _frame_worst_ema := 0.0                    # EMA of the window's worst frame
 var _backlog := 0                              # last polled vox_gen backlog (feed-forward)
 var _last_tick_s := -1.0                       # injected-clock time of the last control update (−1 = not started)
 var _promote_hold_s := 0.0                     # seconds credit has sat ≥ CTRL_PROMOTE_CREDIT with the backlog gate open
+var _headroom_hold_s := 0.0                    # seconds credit has sat ≥ CTRL_PROMOTE_CREDIT IGNORING the backlog gate —
+                                               # the IMMINENT-promote sustain (W1): the ridge you are crossing must promote
+                                               # on frame HEADROOM alone (vox_gen naturally sits 1500-2800 while walking, so
+                                               # the raw backlog gate would otherwise suppress it → silent spawn-at-cross).
 var _overload_hold_s := 0.0                    # seconds of sustained credit-0 overload (drives demote_pressure)
 var _ticks := 0                                # control ticks since start (diagnostics)
 var _overload := false                         # last control tick's overload verdict (diagnostics)
@@ -65,6 +69,13 @@ func tick(now_s: float) -> void:
 		return
 	_last_tick_s = now_s
 	_ticks += 1
+	# W2 — the sustain accumulators must accrue in REAL-TICK units, never a background-gap of raw wall-clock. A tab
+	# backgrounded / a GC pause on web produces ONE giant tick (dt tens of seconds); advancing a hold by the full raw
+	# dt would instantly "satisfy" a sustained-for-N-seconds condition → a spurious spawn/demote on refocus. Two guards:
+	#  (1) clamp the per-tick increment to CTRL_TICK_S, so a hold reflects the NUMBER of real control ticks it survived;
+	#  (2) a giant tick is a DISCONTINUITY, not evidence — RESET every hold (a gap is not sustained load).
+	var adt := minf(dt, CubeSphere.CTRL_TICK_S)
+	var gap := dt > CubeSphere.CTRL_TICK_S * 4.0
 	# frame_worst = the slowest frame in the window; EMA'd so a single spike is noise (§6.5.2/§6.5.4).
 	var worst := 0.0
 	for i in range(_win_fill):
@@ -78,14 +89,26 @@ func tick(now_s: float) -> void:
 			_credit = 0.0
 	else:
 		_credit = minf(1.0, _credit + CubeSphere.CTRL_CREDIT_AI)
-	# promote sustain: credit must sit ≥ PROMOTE_CREDIT with the backlog gate OPEN for CTRL_PROMOTE_SUSTAIN_S (§6.5.3.4)
+	if gap:
+		# discontinuity: the sustain evidence prior to the gap does not carry across it — restart every hold fresh.
+		_promote_hold_s = 0.0
+		_headroom_hold_s = 0.0
+		_overload_hold_s = 0.0
+		return
+	# imminent-promote sustain (W1): credit ≥ PROMOTE_CREDIT, IGNORING the backlog gate (the ridge we are crossing is
+	# exempt from the raw vox_gen gate — it must go full-res on frame headroom alone, §3.2/§6.5.3.4).
+	if _credit >= CubeSphere.CTRL_PROMOTE_CREDIT:
+		_headroom_hold_s += adt
+	else:
+		_headroom_hold_s = 0.0
+	# corner/2nd-promote sustain: credit ≥ PROMOTE_CREDIT WITH the backlog gate OPEN for CTRL_PROMOTE_SUSTAIN_S (§6.5.3.4)
 	if _credit >= CubeSphere.CTRL_PROMOTE_CREDIT and not backlog_gated():
-		_promote_hold_s += dt
+		_promote_hold_s += adt
 	else:
 		_promote_hold_s = 0.0
 	# demote pressure: only SUSTAINED credit-0 overload (≥ CTRL_OVERLOAD_SUSTAIN_S) — pause-first, never a spike (§6.5.4)
 	if _overload and _credit <= 0.0:
-		_overload_hold_s += dt
+		_overload_hold_s += adt
 	else:
 		_overload_hold_s = 0.0
 
@@ -114,6 +137,14 @@ func stream_pace() -> float:
 func promote_admitted() -> bool:
 	return (not backlog_gated()) and _promote_hold_s >= CubeSphere.CTRL_PROMOTE_SUSTAIN_S and _credit >= CubeSphere.CTRL_PROMOTE_CREDIT
 
+## Surface 4 (imminent, W1) — is the SINGLE highest-priority imminent live-terrain promote admitted? The ridge the
+## player is committed to crossing is EXEMPT from the raw vox_gen backlog gate (while walking vox_gen naturally sits
+## 1500-2800, which would otherwise suppress the crossing promote → silent fall-back to spawn-at-cross + a pool-miss);
+## it requires only sustained frame HEADROOM (credit ≥ PROMOTE_CREDIT for CTRL_PROMOTE_SUSTAIN_S). The 2nd/corner
+## promote keeps the full promote_admitted() gate — the feed-forward throttle applies to that EXTRA generation volume.
+func promote_imminent_admitted() -> bool:
+	return _headroom_hold_s >= CubeSphere.CTRL_PROMOTE_SUSTAIN_S and _credit >= CubeSphere.CTRL_PROMOTE_CREDIT
+
 # ---- feed-forward + stability introspection ----
 
 ## The vox_gen feed-forward gate: true while the backlog exceeds CTRL_BACKLOG_MAX (holds surfaces 3-4 at zero).
@@ -131,7 +162,7 @@ func stats() -> Dictionary:
 	return {
 		"credit": _credit, "frame_worst_ema": _frame_worst_ema, "backlog": _backlog,
 		"backlog_gated": backlog_gated(), "overload": _overload, "ticks": _ticks,
-		"promote_hold_s": _promote_hold_s, "overload_hold_s": _overload_hold_s,
+		"promote_hold_s": _promote_hold_s, "headroom_hold_s": _headroom_hold_s, "overload_hold_s": _overload_hold_s,
 	}
 
 # ============================ live input source (§6.5.1) ============================

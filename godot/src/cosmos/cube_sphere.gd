@@ -53,6 +53,29 @@ const FACET_TWIST := false
 ## lod>0 stride stays disabled). Requires FACETED = true. Never ship this on.
 const FP_R0 := false
 
+## COSMOS FP-M1c (docs/COSMOS-FP-M1-DESIGN.md §3–§5) — the Planet Assembly master toggle. When true the faceted
+## world runs the POOLED rotated-neighbour terrains under a PlanetRoot (≥2 facets rendering real voxels at a
+## ridge) and crossings become sub-frame RE-DESIGNATION (root-transform swap + view rebalance, NO teardown/
+## restream). Exactly ONE global player VoxelViewer serves every facet terrain (the spike's per-neighbour static
+## viewers are BANNED, §2); every pool terrain is `bounds`-clamped to its own facet slab (§3.2). Requires
+## FACETED = true. Default OFF → faceted behaves as FP-S1 (single active terrain + far-ring quads + set_facet
+## teardown crossing); with FACETED also off, FLAT is byte-identical (6027/0). Flipped ON at export after the A/B.
+const FP_M1_POOL := false
+## FP-M1c pool policy (§4.3) + memory ledger (§10). Consts so the gate can assert the caps (never-OOM: the pool
+## has a geometric ceiling independent of viewer behaviour). D_WARM: spawn a neighbour when the player's own-side
+## ridge distance drops below this. D_RETIRE: free it once past this (32-block hysteresis ≫ jitter). MIN_LIVE_S:
+## minimum lifetime before a retire (anti-thrash at the D_WARM shell). MAX_NEIGHBOURS: hard cap (geometry wants
+## ≤3 concurrently; 4 is slack + LRU backstop). SPAWN_INTERVAL_S: ≤1 spawn AND ≤1 retire per second (amortized).
+## MEM_BUDGET_MB: pool worst-case ceiling (1×40 + 4×20 = 120 ⇒ 128). SINGULAR_EXCLUDE: cells near a cube-vertex
+## singularity kept single-plane (excluded from the two-live-facet complementarity assert, §8).
+const POOL_D_WARM := 96.0
+const POOL_D_RETIRE := 128.0
+const POOL_MIN_LIVE_S := 10.0
+const POOL_MAX_NEIGHBOURS := 4
+const POOL_SPAWN_INTERVAL_S := 1.0
+const POOL_MEM_BUDGET_MB := 128
+const POOL_SINGULAR_EXCLUDE := 4
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

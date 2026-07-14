@@ -49,6 +49,14 @@ const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the nei
 const FACET_CROSS_COOLDOWN := 6       # maybe_cross_facet calls (≈physics ticks) suppressed after a committed crossing
 var _cross_cooldown := 0              # remaining suppressed calls (decremented per call; 0 = ready)
 
+# FP-M1c Planet Assembly pool policy (docs/COSMOS-FP-M1-DESIGN.md §4.3). Amortization throttle (≤1 spawn AND ≤1
+# retire per POOL_SPAWN_INTERVAL_S) + the pool-miss counter (a re-designation crossing whose destination was not
+# yet pooled falls back to the FP-S1 teardown — must be ~0 in a normal walk; the gate asserts it). All dormant
+# unless CubeSphere.FP_M1_POOL. Wall-clock (Time.get_ticks_msec) so it works both live and in headless soaks.
+var _last_pool_spawn_ms := -100000
+var _last_pool_retire_ms := -100000
+var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
 # player edits are re-mirrored into the fresh terrain (§5.4) and the far handoff turbo is ended. Never set
@@ -295,6 +303,10 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
+	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
+		_manage_facet_pool(player_pos)
 	if CubeSphere.M5C_CORNER:
 		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
 	if _far != null:
@@ -1371,22 +1383,107 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
 			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
 			_rebuild_window_indices()
-			# FP3b: the EDITABLE facet swaps to B — restream its (axis-aligned) voxel field via the M4 cover (a
-			# live VoxelTerrain can't be rotated, so only one facet is the editable/streamed field at a time), and
-			# rigidly RE-PLACE the far ring around the new frame (no regen — cached). Debris re-frame is FP-M1d.
-			# The M4 handoff (_flip_settling) releases the cover on ramp (render re-mirror is FP-M1c).
-			if _module_world != null and _module_world.has_method("set_facet"):
-				var old_mod_pos: Vector3 = _module_world.position
-				_module_world.call("set_facet", to, old_mod_pos)
-			if _facet_ring != null:
-				_facet_ring.set_active(to)
-			_flip_settling = true
-			_restream()
+			# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
+			# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
+			# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
+			var redesignated := false
+			if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
+				redesignated = bool(_module_world.call("redesignate", to))
+				if not redesignated:
+					# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
+					# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
+					_pool_miss_count += 1
+					if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
+						redesignated = bool(_module_world.call("redesignate", to))
+					if not redesignated and _module_world.has_method("pool_reset"):
+						# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
+						# blank. NOT the FP-S1 set_facet path.
+						redesignated = bool(_module_world.call("pool_reset", to))
+			if redesignated:
+				# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
+				# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
+				# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
+				if _facet_ring != null:
+					_facet_ring.set_active(to)
+					_facet_ring_sync_exclusion()
+			else:
+				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
+				# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
+				if _module_world != null and _module_world.has_method("set_facet"):
+					var old_mod_pos: Vector3 = _module_world.position
+					_module_world.call("set_facet", to, old_mod_pos)
+				if _facet_ring != null:
+					_facet_ring.set_active(to)
+				_flip_settling = true
+				_restream()
 			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
-			print("[WorldManager] facet cross %d → %d (slot %d, restream + far re-place)" % [fid, to, slot])
+			print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
+				"RE-DESIGNATION" if redesignated else "restream + far re-place"])
 			return {"crossed": true, "from": fid, "to": to,
 				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
 	return {}
+
+## FP-M1c (§4.3): the neighbour-pool manager, run every physics tick from update_streaming (pool flag only).
+## Spawn a facet whose own-side ridge distance is below D_WARM (nearest first), retire a pooled neighbour past
+## D_RETIRE once it has lived >= MIN_LIVE_S, <=1 spawn AND <=1 retire per SPAWN_INTERVAL_S, hard cap 1 active +
+## MAX_NEIGHBOURS. EDGE neighbours only (§8 -- the diagonal is FP-M1d). On any change it refreshes the far ring.
+func _manage_facet_pool(player_pos: Vector3) -> void:
+	if not _module_world.has_method("pool_spawn"):
+		return
+	var active := TerrainConfig.active_facet()
+	if active < 0:
+		return
+	var want := {}
+	for slot in 4:
+		var nb: int = FacetAtlas.seam_neighbour(active, slot)
+		if nb < 0 or nb == active:
+			continue
+		var d := FacetAtlas.own_dist(active, slot, player_pos.x, player_pos.y, player_pos.z)
+		if not want.has(nb) or d < float(want[nb]):
+			want[nb] = d
+	var now := Time.get_ticks_msec()
+	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
+	var changed := false
+	if now - _last_pool_spawn_ms >= interval_ms:
+		var best := -1
+		var best_d := CubeSphere.POOL_D_WARM
+		for nb in want.keys():
+			var d: float = want[nb]
+			if d < best_d and not bool(_module_world.call("pool_has", nb)):
+				best = nb; best_d = d
+		if best >= 0 and int(_module_world.call("pool_neighbour_count")) < CubeSphere.POOL_MAX_NEIGHBOURS:
+			if bool(_module_world.call("pool_spawn", best)):
+				_last_pool_spawn_ms = now
+				changed = true
+	if now - _last_pool_retire_ms >= interval_ms:
+		for nb in (_module_world.call("pool_neighbour_fids") as Array):
+			var d: float = want.get(nb, 1.0e30)
+			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
+				if bool(_module_world.call("pool_retire", nb)):
+					_last_pool_retire_ms = now
+					changed = true
+					break
+	if changed:
+		_facet_ring_sync_exclusion()
+
+## FP-M1c: refresh the FacetFarRing exclusion to the live pool's NEIGHBOUR fids (the active facet is excluded by
+## the ring itself). Deferred rebuild (budgeted _process) so a spawn/retire/crossing never pays a synchronous regen.
+func _facet_ring_sync_exclusion() -> void:
+	if _facet_ring == null or _module_world == null or not _module_world.has_method("pool_neighbour_fids"):
+		return
+	if _facet_ring.has_method("set_pool_excluded"):
+		_facet_ring.set_pool_excluded(_module_world.call("pool_neighbour_fids"))
+
+## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
+func pool_miss_count() -> int:
+	return _pool_miss_count
+
+## FP-M1c gate accessor: is facet `fid` currently in this WorldManager's live pool? (module passthrough; false
+## without a pool-capable module). Used by the end-to-end walk-soak gate to confirm the pool warmed before a crossing.
+func facet_pool_has(fid: int) -> bool:
+	return _module_world != null and _module_world.has_method("pool_has") and bool(_module_world.call("pool_has", fid))
+func facet_pool_neighbour_count() -> int:
+	return int(_module_world.call("pool_neighbour_count")) if (_module_world != null and _module_world.has_method("pool_neighbour_count")) else 0
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:

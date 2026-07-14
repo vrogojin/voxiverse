@@ -44,6 +44,21 @@ var _gen_face := CubeSphere.HOME_FACE
 # before folding, so the near render lands in the master-face orientation. Identity at spawn → byte-identical.
 var _gen_mwin: Array = [1, 0, 0, 1]
 
+# ============================ FP-M1c Planet Assembly (flag: CubeSphere.FP_M1_POOL) ============================
+# docs/COSMOS-FP-M1-DESIGN.md §4. A PlanetRoot node holds one FacetSlot per live facet terrain: the ACTIVE facet
+# (composite transform = T_active⁻¹·T_active = identity → axis-aligned + editable → physics/DDA/collider untouched)
+# and ≤ POOL_MAX_NEIGHBOURS render-only rotated neighbours (composite = T_active⁻¹·T_nb = the dihedral turn — the
+# SAME T_active⁻¹ convention the FacetFarRing uses, so the two live fields WELD at the shared ridge). Every slot
+# terrain streams from the ONE global player VoxelViewer (attach_viewer) and is `bounds`-clamped to its own facet
+# domain slab (§3.2 — no foreign block ever exists). A crossing = redesignate(): ONE PlanetRoot.transform write +
+# a view-distance rebalance; NO teardown, NO restream, NO new generator. All of it dormant unless FP_M1_POOL.
+var _planet_root: Node3D = null              # holds the FacetSlots; transform = T_active⁻¹ (rigid re-place on cross)
+var _pool: Dictionary = {}                   # fid -> FacetSlot dict {terrain, slot, mesher, generator, spawn_ms, view, editable}
+var _pool_active := -1                        # the currently-active (editable, composite-identity) facet id
+# §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
+const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
+const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
+
 # COSMOS Stage 4 — post-flip view-distance ramp (kills the seam-cross freeze without moving spawn).
 # A home-face flip recreates the VoxelTerrain; jamming its max_view_distance to the full near radius in
 # one step re-queues the ENTIRE near disk (~2.6k blocks) in a single process pass → the 2 web workers +
@@ -295,7 +310,13 @@ func setup() -> bool:
 	# COSMOS FP-CARVE (patch 0004): push the active facet's ridge planes into the mesher's carve blob BEFORE
 	# the terrain starts streaming, so the first meshed block already clips its seam junction sentinels.
 	_push_facet_carve()
-	add_child(_terrain)
+	# FP-M1c (§4.1): under the pool flag the active terrain lives in a FacetSlot under PlanetRoot (composite
+	# identity — byte-identical world placement to the direct-child path, just reparented), bounds-clamped to
+	# its own facet slab. Flag OFF ⇒ the shipped single-terrain scene graph (add_child at ZERO), untouched.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
+		_pool_init_active()
+	else:
+		add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
 	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
 	set_process(false)
@@ -1266,6 +1287,247 @@ func _push_facet_carve() -> void:
 		"arid_base": _carve_base,
 		"arid_count": _carve_count,
 	})
+
+# ============================ FP-M1c Planet Assembly pool (flag: CubeSphere.FP_M1_POOL) ============================
+# The pooled rotated-neighbour terrains + re-designation crossing (docs/COSMOS-FP-M1-DESIGN.md §4, §5). Reuses THIS
+# module's ONE baked VoxelBlockyLibrary + generator factory + carve tables; each pool terrain gets its OWN mesher
+# (own carve blob) + OWN generator frozen on its fid (the frozen-epoch discipline — each worker reads its own
+# immutable gen_facet). Exactly ONE VoxelViewer (attach_viewer) serves all of them; NO static/extra viewers ever.
+
+## Build a bounds-clamped VoxelTerrain frozen on `fid` with its own mesher+carve+generator, parented under a
+## FacetSlot @ facet_transform(fid) below PlanetRoot. Returns the FacetSlot dict, or {} on failure. Shared by the
+## active-facet init and every neighbour spawn (the ONE construction path — §4.1). Adds NO viewer.
+func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
+	if _library == null or not ClassDB.class_exists("VoxelTerrain"):
+		return {}
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return {}
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	# The facet's OWN-side ridge planes into ITS OWN carve blob (patch 0004, per-mesher, facet-static). Guarded:
+	# an unpatched binary lacks set_facet_carve → the sentinels bake as plain cubes (full-cube lip, never a hole).
+	if mesher.has_method("set_facet_carve"):
+		if _carve_count > 0 and fid >= 0:
+			mesher.call("set_facet_carve", {
+				"enabled": true,
+				"planes": FacetAtlas.seam_planes_f64(fid),
+				"arid_base": _carve_base,
+				"arid_count": _carve_count,
+			})
+		else:
+			mesher.call("set_facet_carve", {"enabled": false})
+	var generator: Object = _make_generator(fid)   # OWN generator frozen on this fid's gen_facet (worker-safe)
+	if generator == null:
+		return {}
+	var terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if terrain == null:
+		return {}
+	_set_if(terrain, "mesher", mesher)
+	_set_if(terrain, "generator", generator)
+	_set_if(terrain, "max_view_distance", view_blocks)
+	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "generate_collisions", false)
+	_apply_bounds(terrain, fid)                     # §3.2: clamp to this facet's domain slab — no foreign block exists
+	var slot := Node3D.new()
+	slot.name = "FacetSlot_%d" % fid
+	slot.transform = FacetAtlas.facet_transform(fid)
+	_planet_root.add_child(slot)
+	slot.add_child(terrain)
+	return {
+		"terrain": terrain, "slot": slot, "mesher": mesher, "generator": generator,
+		"spawn_ms": Time.get_ticks_msec(), "view": view_blocks, "editable": editable, "fid": fid,
+	}
+
+## Clamp a terrain's streaming to its facet's domain slab (§3.2). The engine clips every view box against `bounds`
+## (voxel_terrain.cpp:1296,1314), so no data/mesh block outside the slab is ever requested, allocated, or meshed —
+## a GEOMETRIC per-terrain memory ceiling independent of viewer behaviour (the spike's missing clamp, §2 defect 2).
+func _apply_bounds(terrain: Object, fid: int) -> void:
+	if terrain == null or not (terrain.has_method("set_bounds") or _has_prop(terrain, "bounds")):
+		return
+	var dmin: Vector2i = FacetAtlas.dom_min(fid)    # facet-lattice (x,z); domain already includes MARGIN_CELLS
+	var dmax: Vector2i = FacetAtlas.dom_max(fid)
+	var y_min := float(TerrainConfig.BEDROCK_FLOOR)
+	var y_max := float(TerrainConfig.MAX_SURFACE_Y + max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS))
+	var pos := Vector3(float(dmin.x) - 2.0, y_min, float(dmin.y) - 2.0)   # +2 seam strip (§3.2)
+	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
+	_set_if(terrain, "bounds", AABB(pos, size))
+
+## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
+## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view
+## (near_render_radius = 128) + already-pushed carve; it just moves under PlanetRoot. Called once from setup().
+func _pool_init_active() -> void:
+	_pool_active = TerrainConfig.active_facet()
+	_planet_root = Node3D.new()
+	_planet_root.name = "PlanetRoot"
+	_planet_root.transform = FacetAtlas.facet_transform(_pool_active).affine_inverse()
+	add_child(_planet_root)
+	_apply_bounds(_terrain, _pool_active)
+	var slot := Node3D.new()
+	slot.name = "FacetSlot_%d" % _pool_active
+	slot.transform = FacetAtlas.facet_transform(_pool_active)
+	_planet_root.add_child(slot)
+	slot.add_child(_terrain)
+	_pool[_pool_active] = {
+		"terrain": _terrain, "slot": slot, "mesher": _mesher, "generator": _generator,
+		"spawn_ms": Time.get_ticks_msec(), "view": TerrainConfig.near_render_radius(),
+		"editable": true, "fid": _pool_active,
+	}
+
+## Spawn a render-only neighbour terrain for facet `fid` (view 96). Enforces the caps: FP_M1_POOL on, faceted, a
+## live PlanetRoot, `fid` not already pooled, and the neighbour count below POOL_MAX_NEIGHBOURS. Returns true on a
+## successful spawn. Adds NO viewer. Amortization (≤1/s) + the D_WARM trigger are the caller's (WorldManager §4.3).
+func pool_spawn(fid: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL) or _planet_root == null:
+		return false
+	if fid < 0 or _pool.has(fid):
+		return false
+	if pool_neighbour_count() >= CubeSphere.POOL_MAX_NEIGHBOURS:
+		return false
+	var s := _pool_build_slot(fid, 96, false)
+	if s.is_empty():
+		return false
+	_pool[fid] = s
+	return true
+
+## Retire (free) a neighbour terrain. Never frees the active facet. queue_free's the whole slot (terrain → its
+## mesher + generator drop with it) and erases every GDScript ref so nothing pins the freed maps (§10 leak class #1).
+func pool_retire(fid: int) -> bool:
+	if not _pool.has(fid) or fid == _pool_active:
+		return false
+	var s: Dictionary = _pool[fid]
+	var slot: Node3D = s.get("slot")
+	_pool.erase(fid)                                # drop OUR refs first
+	if slot != null and is_instance_valid(slot):
+		if slot.get_parent() != null:
+			slot.get_parent().remove_child(slot)
+		slot.queue_free()                           # frees the terrain + its mesher/generator
+	return true
+
+## Re-designation crossing (§5.1): make `to` the active (editable, composite-identity) facet and the old active a
+## rotated render-only neighbour, in ONE PlanetRoot transform write + a view rebalance. NO teardown, NO restream,
+## NO new generator, NO terrain freed. Returns true on a POOL HIT; false on a POOL MISS (`to` not pooled — the
+## caller falls back to the FP-S1 set_facet teardown). Requires `to` to already be a spawned neighbour.
+func redesignate(to: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL) or _planet_root == null:
+		return false
+	if not _pool.has(to) or to == _pool_active:
+		return false
+	var from := _pool_active
+	# ONE assignment — the engine re-places every child slot's mesh blocks rigidly (voxel_terrain.cpp:867-882),
+	# sub-frame, no meshing. `to`'s composite becomes T_to⁻¹·T_to = identity (axis-aligned, editable); `from`'s
+	# becomes T_to⁻¹·T_from (the dihedral turn — the rotated neighbour, same weld as the far ring).
+	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	# View-distance rebalance (delta annulus only — the engine diffs prev/new boxes; no teardown). `to` grows to
+	# the active radius, `from` shrinks to the neighbour radius. bounds/carve/generator are facet-static → untouched.
+	_set_if(_pool[to]["terrain"], "max_view_distance", TerrainConfig.near_render_radius())
+	_pool[to]["view"] = TerrainConfig.near_render_radius()
+	_pool[to]["editable"] = true
+	if _pool.has(from):
+		_set_if(_pool[from]["terrain"], "max_view_distance", 96)
+		_pool[from]["view"] = 96
+		_pool[from]["editable"] = false
+	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
+	_pool_active = to
+	_terrain = _pool[to]["terrain"]
+	_mesher = _pool[to]["mesher"]
+	_generator = _pool[to]["generator"]
+	return true
+
+## FP-M1c pathological POOL-MISS fallback (§5.1.a): the destination `to` could not be re-designated NOR spawned
+## (e.g. a teleport past the neighbour cap). Rather than the FP-S1 set_facet teardown (which would rebuild OUTSIDE
+## PlanetRoot and desync the pool), REBUILD the pool fresh on `to`: free the whole PlanetRoot (all live terrains)
+## and construct a new active `to` slot. Degraded (neighbours re-spawn as the player walks) but NEVER corrupt/blank.
+## Keeps the world-frame invariant (composite identity for `to`). No-op unless FP_M1_POOL.
+func pool_reset(to: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL):
+		return false
+	if _planet_root != null and is_instance_valid(_planet_root):
+		remove_child(_planet_root)
+		_planet_root.queue_free()
+	_planet_root = null
+	_pool.clear()
+	_planet_root = Node3D.new()
+	_planet_root.name = "PlanetRoot"
+	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	add_child(_planet_root)
+	var s := _pool_build_slot(to, TerrainConfig.near_render_radius(), true)
+	if s.is_empty():
+		return false
+	_pool[to] = s
+	_pool_active = to
+	_terrain = s["terrain"]
+	_mesher = s["mesher"]
+	_generator = s["generator"]
+	_push_facet_carve()                              # re-point the (module-level) active mesher carve at `to`
+	return true
+
+# --- pool introspection (WorldManager policy + the FP-M1c gates) ---
+func pool_has(fid: int) -> bool:
+	return _pool.has(fid)
+func pool_active() -> int:
+	return _pool_active
+func pool_neighbour_count() -> int:
+	return maxi(0, _pool.size() - (1 if _pool.has(_pool_active) else 0))
+## Every LIVE facet id in the pool (active + neighbours) — the far-ring excluded set + the gate's ≤1+4 cap check.
+func pool_fids() -> Array:
+	return _pool.keys()
+## The render-only NEIGHBOUR fids (active excluded) — the FacetFarRing exclusion set (no flat-quad double-draw).
+func pool_neighbour_fids() -> Array:
+	var out: Array = []
+	for fid in _pool.keys():
+		if fid != _pool_active:
+			out.append(fid)
+	return out
+## Seconds `fid` has been live (WorldManager's MIN_LIVE_S anti-thrash gate). -1 if not pooled.
+func pool_age_s(fid: int) -> float:
+	if not _pool.has(fid):
+		return -1.0
+	return float(Time.get_ticks_msec() - int(_pool[fid]["spawn_ms"])) / 1000.0
+## A pool terrain's live `bounds` AABB (the gate asserts bounds ⊆ facet slab). AABB() if absent.
+func pool_bounds(fid: int) -> AABB:
+	if not _pool.has(fid):
+		return AABB()
+	var t: Object = _pool[fid]["terrain"]
+	if t == null or not _has_prop(t, "bounds"):
+		return AABB()
+	return t.get("bounds")
+## A pool terrain node (the gate's is_area_meshed / statistics probes). null if absent.
+func pool_terrain(fid: int) -> Node3D:
+	return _pool[fid]["terrain"] if _pool.has(fid) else null
+## The shared baked library / a fid-frozen generator / a fid-carve mesher / the carve range — the SEAM gates build
+## meshes with these directly (the spike_* accessors' pool-flag twins; available whenever FP_M1_POOL is on).
+func pool_library() -> Object:
+	return _library if (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) else null
+func pool_generator(fid: int) -> Object:
+	return _make_generator(fid) if (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) else null
+func pool_carve_mesher(fid: int) -> Object:
+	if not (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) or _library == null:
+		return null
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return null
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	if mesher.has_method("set_facet_carve") and _carve_count > 0 and fid >= 0:
+		mesher.call("set_facet_carve", {
+			"enabled": true, "planes": FacetAtlas.seam_planes_f64(fid),
+			"arid_base": _carve_base, "arid_count": _carve_count,
+		})
+	return mesher
+func pool_carve_range() -> Vector2i:
+	return Vector2i(_carve_base, _carve_count)
+
+## True iff `obj` exposes a settable property named `name` (bounds feature-detect without has_method churn).
+func _has_prop(obj: Object, name: String) -> bool:
+	for p in obj.get_property_list():
+		if String(p.get("name", "")) == name:
+			return true
+	return false
 
 # ============================ FP-R0 SPIKE (flag-gated: CubeSphere.FP_R0) ============================
 # The multi-facet rotation kill-shot (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §3, §8 FP-R0). All methods

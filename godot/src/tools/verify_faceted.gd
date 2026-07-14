@@ -51,6 +51,17 @@ func _initialize() -> void:
 	_gate_crossing_containment()     # FP-S1(c)
 	_gate_edit_key_global()          # FP-M1a G-M1-KEY
 
+	# FP-M1c Planet Assembly gates (docs/COSMOS-FP-M1-DESIGN.md §11). Run ONLY when the pool flag is on AND the
+	# module binary is present (they build a live VoxelTerrain pool). With just FACETED=true they are skipped, so
+	# the standard faceted run stays at its baseline pass count; sed FP_M1_POOL=true to exercise them (payload gate).
+	if CubeSphere.FP_M1_POOL and ClassDB.class_exists("VoxelTerrain"):
+		await _gate_pool_assembly()      # G-M1-POOL + G-M1-MEM
+		await _gate_redesignation()      # G-M1-XDES
+		_gate_two_facet_seam()           # G-M1-SEAM-1 / SEAM-2
+		await _gate_pool_walk_soak()     # end-to-end: WorldManager crossing is a POOL HIT (pool-miss 0)
+	elif CubeSphere.FP_M1_POOL:
+		print("  NOTE: FP_M1_POOL on but no VoxelTerrain (module absent) — FP-M1c live gates skipped (need the module binary).")
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -878,3 +889,406 @@ func _nearest_cell(fid: int, rd: CubeSphere.DVec3) -> Vector2i:
 			x += 1
 		z += 1
 	return best
+
+# ============================ FP-M1c Planet Assembly gates (docs/COSMOS-FP-M1-DESIGN.md §11) ============================
+# All three build a module_world directly (the verify_fp_r0 pattern) so the pool is isolated from the WorldManagers
+# the earlier gates spawn. They run ONLY under FP_M1_POOL + the module binary (see _initialize). Each asserts a §11
+# invariant with a REAL live VoxelTerrain pool — the anti-spike gates the payload stage must pass before deploy.
+
+## Build the active-facet module, add to the tree, run setup(). Returns the module Node3D or null.
+func _build_pool_module(active: int) -> Node3D:
+	TC.set_active_facet(active)
+	var mod: Node3D = (load("res://src/world/voxel_module/module_world.gd").new()) as Node3D
+	get_root().add_child(mod)
+	if not bool(mod.call("setup")):
+		return null
+	return mod
+
+## Count LIVE VoxelTerrain nodes anywhere under `root` (recursive) — the anti-leak instrument (§10/§12.1a).
+func _count_voxel_terrains(root: Node) -> int:
+	var n := 0
+	if root.get_class() == "VoxelTerrain":
+		n += 1
+	for c in root.get_children():
+		n += _count_voxel_terrains(c)
+	return n
+
+## Count VoxelViewer nodes anywhere in the scene tree (G-M1-POOL: must be exactly 1).
+func _count_voxel_viewers() -> int:
+	return _count_by_class(get_root(), "VoxelViewer")
+func _count_by_class(root: Node, cls: String) -> int:
+	var n := (1 if root.get_class() == cls else 0)
+	for c in root.get_children():
+		n += _count_by_class(c, cls)
+	return n
+
+## Two distinct edge-neighbours of `active` (for spawning ≥2 live facets). [] if fewer exist.
+func _edge_neighbours(active: int) -> Array:
+	var out: Array = []
+	for slot in range(4):
+		var nb: int = FA.seam_neighbour(active, slot)
+		if nb >= 0 and nb != active and not out.has(nb):
+			out.append(nb)
+	return out
+
+# ---- G-M1-POOL + G-M1-MEM ----
+func _gate_pool_assembly() -> void:
+	var active := FA.spawn_facet()
+	var mem_base := OS.get_static_memory_usage()
+	var mod := await _pool_ready_module(active)
+	if mod == null:
+		_ok(false, "G-M1-POOL: module_world.setup() built the active-facet pool")
+		return
+	_ok(true, "G-M1-POOL: module_world.setup() built the active-facet pool (PlanetRoot + active slot)")
+	# The active terrain sits at composite IDENTITY (PlanetRoot T_active⁻¹ · slot T_active), so world == active
+	# lattice — physics/DDA/collider unchanged. Assert it to 1e-9 (the reparent must not perturb the frame).
+	var at: Node3D = mod.call("pool_terrain", active)
+	_ok(at != null, "G-M1-POOL: the active facet is pooled")
+	if at != null:
+		var comp := at.global_transform
+		var id_err := _xform_identity_err(comp)
+		_ok(id_err < 1e-6, "G-M1-POOL: active terrain composite == identity (frame err %.2e < 1e-6 — physics frame unchanged)" % id_err)
+
+	# Attach the ONE global player viewer (a holder Node3D stands in for the player). No other viewer ever exists.
+	var holder := Node3D.new()
+	get_root().add_child(holder)
+	mod.call("attach_viewer", holder)
+	print("  [G-M1-POOL] VoxelViewer count in tree = %d (must be 1)" % _count_voxel_viewers())
+	_ok(_count_voxel_viewers() == 1, "G-M1-POOL: exactly ONE VoxelViewer in the tree (spike's per-neighbour viewers BANNED) — count=%d" % _count_voxel_viewers())
+
+	var base_terrains := _count_voxel_terrains(mod)
+	_ok(base_terrains == 1, "G-M1-POOL: baseline live VoxelTerrain count under the module == 1 (active only)")
+
+	# Spawn ≥2 edge neighbours → ≥2 facets rendering real voxels at once (the first user complaint).
+	var nbs := _edge_neighbours(active)
+	_ok(nbs.size() >= 2, "G-M1-POOL: the active facet has >=2 edge neighbours to pool (found %d)" % nbs.size())
+	var spawn_deltas: Array = []
+	var spawned: Array = []
+	for i in range(min(2, nbs.size())):
+		var m0 := OS.get_static_memory_usage()
+		var ok_sp: bool = bool(mod.call("pool_spawn", nbs[i]))
+		var m1 := OS.get_static_memory_usage()
+		spawn_deltas.append(m1 - m0)
+		if ok_sp:
+			spawned.append(nbs[i])
+		_ok(ok_sp and bool(mod.call("pool_has", nbs[i])), "G-M1-POOL: pool_spawn(facet %d) built a live neighbour terrain" % nbs[i])
+	_ok(int(mod.call("pool_neighbour_count")) == spawned.size(), "G-M1-POOL: neighbour count == %d after spawns" % spawned.size())
+	_ok(_count_voxel_terrains(mod) == 1 + spawned.size(), "G-M1-POOL: live VoxelTerrain count == 1 active + %d neighbours" % spawned.size())
+	_ok(int(mod.call("pool_neighbour_count")) <= CubeSphere.POOL_MAX_NEIGHBOURS, "G-M1-POOL: neighbour count <= POOL_MAX_NEIGHBOURS(%d)" % CubeSphere.POOL_MAX_NEIGHBOURS)
+
+	# bounds ⊆ facet slab (§3.2): every pool terrain's bounds matches its own facet's domain-slab AABB.
+	var bounds_ok := true
+	for fid in (mod.call("pool_fids") as Array):
+		if not _bounds_is_slab(mod.call("pool_bounds", fid), int(fid)):
+			bounds_ok = false
+	_ok(bounds_ok, "G-M1-POOL: every pool terrain's bounds is clamped to its own facet domain slab (no foreign block)")
+
+	# MIN_LIVE anti-thrash: a just-spawned neighbour is younger than MIN_LIVE_S, so the policy would NOT retire it.
+	if spawned.size() > 0:
+		_ok(float(mod.call("pool_age_s", spawned[0])) < CubeSphere.POOL_MIN_LIVE_S,
+			"G-M1-POOL: a just-spawned neighbour age < MIN_LIVE_S(%.0fs) — retire is suppressed (anti-thrash)" % CubeSphere.POOL_MIN_LIVE_S)
+
+	# G-M1-MEM: per-spawn heap delta <= the §10 neighbour budget (ceiling — headless streams little without the
+	# viewer near the neighbour, so this is a CEILING assertion; the live A/B is the authority on GPU memory).
+	var neigh_budget: int = int(mod.get("POOL_NEIGHBOUR_MEM_BUDGET_MB")) * 1048576
+	var mem_ok := true
+	for d in spawn_deltas:
+		if int(d) > neigh_budget:
+			mem_ok = false
+	var deltas_mb: Array = []
+	for d in spawn_deltas:
+		deltas_mb.append("%.2f" % (int(d) / 1048576.0))
+	print("  [G-M1-MEM] per-spawn static-heap deltas = %s MB (budget %d MB/neighbour; headless CPU-only, GPU is the live A/B)" % [str(deltas_mb), mod.get("POOL_NEIGHBOUR_MEM_BUDGET_MB")])
+	_ok(mem_ok, "G-M1-MEM: per-spawn heap delta <= %d MB budget (deltas=%s bytes)" % [mod.get("POOL_NEIGHBOUR_MEM_BUDGET_MB"), str(spawn_deltas)])
+	var pool_total := OS.get_static_memory_usage() - mem_base
+	print("  [G-M1-MEM] pool total static-heap delta = %.2f MB (ceiling POOL_MEM_BUDGET_MB = %d MB)" % [pool_total / 1048576.0, CubeSphere.POOL_MEM_BUDGET_MB])
+	_ok(pool_total <= CubeSphere.POOL_MEM_BUDGET_MB * 1048576,
+		"G-M1-MEM: pool total heap delta %.1f MB <= POOL_MEM_BUDGET_MB(%d)" % [pool_total / 1048576.0, CubeSphere.POOL_MEM_BUDGET_MB])
+
+	# THE anti-leak assertion (the spike would FAIL here): retire every neighbour, pump frames, assert the live
+	# VoxelTerrain count returns to baseline (freed — no stray GDScript ref pins the maps, §12.1a).
+	for fid in spawned:
+		_ok(bool(mod.call("pool_retire", fid)), "G-M1-POOL: pool_retire(facet %d) succeeded" % fid)
+	for _i in range(6):
+		await process_frame
+	_ok(_count_voxel_terrains(mod) == base_terrains,
+		"G-M1-POOL: retired terrains FREED — live VoxelTerrain count back to baseline %d (anti-leak; the spike would leak here)" % base_terrains)
+	_ok(int(mod.call("pool_neighbour_count")) == 0, "G-M1-POOL: neighbour count == 0 after retiring all")
+	mod.queue_free()
+	holder.queue_free()
+	await process_frame
+
+# ---- G-M1-XDES (re-designation: no teardown) ----
+func _gate_redesignation() -> void:
+	var active := FA.spawn_facet()
+	var mod := await _pool_ready_module(active)
+	if mod == null:
+		_ok(false, "G-M1-XDES: module built for the re-designation gate")
+		return
+	var holder := Node3D.new()
+	get_root().add_child(holder)
+	mod.call("attach_viewer", holder)
+	var nbs := _edge_neighbours(active)
+	if nbs.is_empty():
+		_ok(false, "G-M1-XDES: found an edge neighbour to designate")
+		return
+	var B: int = nbs[0]
+	_ok(bool(mod.call("pool_spawn", B)), "G-M1-XDES: spawned neighbour facet %d for the re-designation" % B)
+	# Capture identities BEFORE the crossing: the active terrain (must survive), B's generator (must NOT be rebuilt).
+	var a_terrain: Node3D = mod.call("pool_terrain", active)
+	var a_terrain_id := a_terrain.get_instance_id() if a_terrain != null else 0
+	var b_gen: Object = null
+	# read B's generator object via a designate + read-back trick: redesignate then compare module _generator to a fresh
+	var terrains_before := _count_voxel_terrains(mod)
+	var ok_rd: bool = bool(mod.call("redesignate", B))
+	_ok(ok_rd, "G-M1-XDES: redesignate(%d) returned true (POOL HIT — no teardown fallback)" % B)
+	_ok(int(mod.call("pool_active")) == B, "G-M1-XDES: active facet switched to B(%d) by re-designation" % B)
+	# No teardown: the old active terrain is STILL LIVE (rotated neighbour now), and NO terrain was created/freed.
+	_ok(a_terrain != null and is_instance_valid(a_terrain), "G-M1-XDES: old active terrain NOT freed (persists as the rotated neighbour — no removed frame)")
+	_ok(a_terrain != null and a_terrain.get_instance_id() == a_terrain_id, "G-M1-XDES: old active terrain is the SAME node object (no rebuild)")
+	_ok(_count_voxel_terrains(mod) == terrains_before, "G-M1-XDES: live terrain count unchanged across the crossing (no new generator/terrain, none freed)")
+	# The newly-active B terrain now sits at composite IDENTITY (editable, axis-aligned).
+	var bt: Node3D = mod.call("pool_terrain", B)
+	if bt != null:
+		var id_err := _xform_identity_err(bt.global_transform)
+		_ok(id_err < 1e-6, "G-M1-XDES: post-crossing active(B) composite == identity (err %.2e < 1e-6 — physics frame re-based cleanly)" % id_err)
+	# Cross-and-return: designate back to A; A must again be identity, B persists as neighbour.
+	_ok(bool(mod.call("redesignate", active)), "G-M1-XDES: re-designate back to A (A->B->A) succeeds")
+	_ok(int(mod.call("pool_active")) == active, "G-M1-XDES: active facet back to A after the round trip")
+	if a_terrain != null:
+		var id_err2 := _xform_identity_err(a_terrain.global_transform)
+		_ok(id_err2 < 1e-6, "G-M1-XDES: A back at composite identity after A->B->A (err %.2e < 1e-6)" % id_err2)
+	_ok(_count_voxel_terrains(mod) == terrains_before, "G-M1-XDES: A->B->A froze/freed NO terrain (count stable at %d)" % terrains_before)
+	mod.queue_free()
+	holder.queue_free()
+	await process_frame
+
+# ---- G-M1-SEAM-1 / SEAM-2 (two live voxel facets at a shared ridge) ----
+func _gate_two_facet_seam() -> void:
+	var active := FA.spawn_facet()
+	TC.set_active_facet(active)
+	var mod: Node3D = (load("res://src/world/voxel_module/module_world.gd").new()) as Node3D
+	get_root().add_child(mod)
+	if not bool(mod.call("setup")):
+		_ok(false, "G-M1-SEAM: module built for the two-facet seam gate")
+		mod.queue_free(); return
+	# Pick a shared ridge (slot) between the active facet A and a neighbour B (mid-edge, away from corners).
+	var slotAB := -1
+	var B := -1
+	for slot in range(4):
+		var nb: int = FA.seam_neighbour(active, slot)
+		if nb >= 0 and nb != active:
+			slotAB = slot; B = nb; break
+	if B < 0:
+		_ok(false, "G-M1-SEAM: found a shared ridge A|B")
+		mod.queue_free(); return
+	var slotBA := -1
+	for slot in range(4):
+		if FA.seam_neighbour(B, slot) == active:
+			slotBA = slot; break
+	_ok(slotBA >= 0, "G-M1-SEAM: located the reciprocal ridge B|A (slot %d)" % slotBA)
+
+	var lib: Object = mod.call("pool_library")
+	var gen_a: Object = mod.call("pool_generator", active)
+	var gen_b: Object = mod.call("pool_generator", B)
+	var mesh_a: Object = mod.call("pool_carve_mesher", active)
+	var mesh_b: Object = mod.call("pool_carve_mesher", B)
+	var carve_rng: Vector2i = mod.call("pool_carve_range")
+	_ok(lib != null and gen_a != null and gen_b != null and mesh_a != null and mesh_b != null, "G-M1-SEAM: built shared library + per-facet generators + carve meshers")
+	if gen_a == null or mesh_a == null:
+		mod.queue_free(); return
+
+	# Sample a straddling region centred on the ridge midpoint (in each facet's OWN lattice), build both meshes.
+	# The ridge welds two cells; own_dist(fid, slot, .) == 0 on the plane, > 0 interior. We centre a 32³ mesh block
+	# on a mid-ridge cell of A and the reciprocal cell of B, generate + build_mesh, and inspect the seam faces.
+	var ccA: Vector2i = FA.centre_cell(active)
+	var gA := int(TC.facet_profile(active, ccA.x, ccA.y).x)
+	# Walk from the centre toward ridge `slotAB` until own_dist ~ small positive (near the seam), staying mid-edge.
+	var seam_cell := _seam_probe_cell(active, slotAB, ccA, gA)
+	var res_a := _gen_and_mesh(gen_a, mesh_a, Vector3i(seam_cell.x - 16, gA - 16, seam_cell.y - 16), 32)
+	_ok(int(res_a["verts"]) > 0, "G-M1-SEAM-1: A-side straddling region meshes non-empty (%d verts) at the ridge" % int(res_a["verts"]))
+	_ok(not bool(gen_a.get("oob_seen")), "G-M1-SEAM-2: A generator OOB fence never fired (oob_seen == false)")
+	# B-side: reframe the SAME world ridge point into B's lattice.
+	var wsA: Array = FA.lattice_to_world64(active, float(seam_cell.x), float(gA), float(seam_cell.y))
+	var lbB: Array = FA.world_to_lattice64(B, wsA[0], wsA[1], wsA[2])
+	var bcell := Vector2i(int(round(lbB[0])), int(round(lbB[2])))
+	var gB := int(round(lbB[1]))
+	var res_b := _gen_and_mesh(gen_b, mesh_b, Vector3i(bcell.x - 16, gB - 16, bcell.y - 16), 32)
+	_ok(int(res_b["verts"]) > 0, "G-M1-SEAM-1: B-side straddling region meshes non-empty (%d verts) at the same ridge" % int(res_b["verts"]))
+	_ok(not bool(gen_b.get("oob_seen")), "G-M1-SEAM-2: B generator OOB fence never fired (oob_seen == false)")
+
+	# No RUNAWAY double-geometry: no mesh vertex escapes past its OWN ridge plane by more than the geometric
+	# supremum. junction_modify keeps a cell solid iff own_dist(origin) + Σmax(0,coef) > EPS, so a solid cell's
+	# origin sits at own_dist > -Σmax(0,coef) and its cube vertices reach down to own_dist(origin) + Σmin(0,coef),
+	# i.e. penetration < Σ|coef| — the exact per-plane bound (the same coefficients junction_modify uses). +1 cell
+	# absorbs the build_mesh vertex/buffer-origin offset. A vertex beyond THIS is real double-solid (a seam bug);
+	# within it, the two coplanar cut faces cull back-to-back (the §7 anti-z-fight property, straddle band carved).
+	var bnd_a := _seam_penetration_bound(active, slotAB)
+	var bnd_b := _seam_penetration_bound(B, slotBA)
+	var pen_a := _max_penetration(res_a["verts_arr"], Vector3i(seam_cell.x - 16, gA - 16, seam_cell.y - 16), active, slotAB)
+	var pen_b := _max_penetration(res_b["verts_arr"], Vector3i(bcell.x - 16, gB - 16, bcell.y - 16), B, slotBA)
+	_ok(pen_a <= bnd_a, "G-M1-SEAM-1: A-side geometry stays within its own ridge (pen %.3f <= supremum %.3f — no runaway double-solid)" % [pen_a, bnd_a])
+	_ok(pen_b <= bnd_b, "G-M1-SEAM-1: B-side geometry stays within its own ridge (pen %.3f <= supremum %.3f)" % [pen_b, bnd_b])
+	# SEAM-2: carve blob enabled (patch 0004 present) — else SKIP with the cube-lip note rather than fail.
+	if carve_rng.y > 0:
+		_ok(true, "G-M1-SEAM-2: per-mesher carve blob enabled on both facets (ARID range count=%d, planes pushed)" % carve_rng.y)
+	else:
+		print("  SKIP G-M1-SEAM-2: carve range empty (unpatched binary) — sentinels cube-fall-back (full-cube lip, never a hole)")
+	mod.queue_free()
+	await process_frame
+
+# ---- FP-M1c gate helpers ----
+
+## setup the module and pump a few frames so any deferred init settles. Returns the module or null.
+func _pool_ready_module(active: int) -> Node3D:
+	var mod := _build_pool_module(active)
+	if mod == null:
+		return null
+	await process_frame
+	return mod
+
+## Frobenius-style deviation of a Transform3D from the identity (basis off-identity + origin length).
+func _xform_identity_err(t: Transform3D) -> float:
+	var b := t.basis
+	var e := 0.0
+	var cols := [b.x - Vector3(1,0,0), b.y - Vector3(0,1,0), b.z - Vector3(0,0,1)]
+	for c in cols:
+		e += (c as Vector3).length()
+	e += t.origin.length()
+	return e
+
+## True iff `bounds` is facet `fid`'s domain slab (dom_min-2 .. dom_max+2 in x/z, worldgen y band) block-quantized:
+## the engine snaps a VoxelTerrain.bounds OUTWARD to 16-voxel data-block boundaries (pos floored, far edge ceiled),
+## so the check is exact against that quantization. Also asserts the slab is far below the default (clamped) and the
+## y-band <= 256 (§3.2). Block-quantized outward containment guarantees the slab still covers the whole facet domain.
+func _bounds_is_slab(bounds: AABB, fid: int) -> bool:
+	var dmin: Vector2i = FA.dom_min(fid)
+	var dmax: Vector2i = FA.dom_max(fid)
+	var y_min := float(TC.BEDROCK_FLOOR)
+	var y_max := float(TC.MAX_SURFACE_Y + max(TreeGen.MAX_ABOVE_SURFACE, TC.SNOW_FILL_MAX_CELLS))
+	if (y_max - y_min) > 256.0:
+		return false
+	var blk := 16.0
+	var qp := Vector3(floor((float(dmin.x) - 2.0) / blk) * blk, floor(y_min / blk) * blk, floor((float(dmin.y) - 2.0) / blk) * blk)
+	var qe := Vector3(ceil((float(dmax.x) + 2.0) / blk) * blk, ceil(y_max / blk) * blk, ceil((float(dmax.y) + 2.0) / blk) * blk)
+	# Far below the huge default box (clamped at all), and equal to the block-quantized slab (covers the domain).
+	if bounds.size.x > 1.0e6 or bounds.size.z > 1.0e6:
+		return false
+	return bounds.position.is_equal_approx(qp) and (bounds.position + bounds.size).is_equal_approx(qe) \
+		and bounds.position.x <= float(dmin.x) and (bounds.position.x + bounds.size.x) >= float(dmax.x) \
+		and bounds.position.z <= float(dmin.y) and (bounds.position.z + bounds.size.z) >= float(dmax.y)
+
+## generate_block(lod0) + build_mesh; returns {verts, tris, verts_arr(PackedVector3Array)}.
+func _gen_and_mesh(gen: Object, mesher: Object, corner: Vector3i, n: int) -> Dictionary:
+	var buf: Object = ClassDB.instantiate("VoxelBuffer")
+	buf.call("create", n + 2, n + 2, n + 2)
+	buf.call("set_channel_depth", 0, 1)
+	gen.call("generate_block", buf, Vector3(corner.x - 1, corner.y - 1, corner.z - 1), 0)
+	var mesh: Mesh = mesher.call("build_mesh", buf, [], {}) as Mesh
+	var verts := 0
+	var tris := 0
+	var vout := PackedVector3Array()
+	if mesh != null:
+		for si in range(mesh.get_surface_count()):
+			var arr: Array = mesh.surface_get_arrays(si)
+			var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+			verts += pv.size()
+			for v in pv:
+				vout.append(v)
+			var idx: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
+			tris += idx.size() / 3
+	return {"verts": verts, "tris": tris, "verts_arr": vout}
+
+## The geometric supremum (in cells) of how far a solid cell's cube vertex can sit past facet `fid`'s ridge `slot`
+## plane: Σ|coef| of the (unit-ish) plane normal — the same coefficients junction_modify masks with — plus 1 cell
+## to absorb the standalone build_mesh vertex/buffer-origin offset. A penetration beyond this is real double-solid.
+func _seam_penetration_bound(fid: int, slot: int) -> float:
+	var p: Vector4 = FA.seam_plane(fid, slot)
+	return absf(p.x) + absf(p.y) + absf(p.z) + 1.0
+
+## Max penetration (in cells) of any mesh vertex BEYOND facet `fid`'s ridge `slot` plane (own_dist < 0 = past it).
+## Mesh vertices are in the padded-buffer frame; the buffer origin is (corner - 1), so world lattice = corner-1+vert.
+func _max_penetration(verts: PackedVector3Array, corner: Vector3i, fid: int, slot: int) -> float:
+	var worst := 0.0
+	var base := Vector3(corner.x - 1, corner.y - 1, corner.z - 1)
+	for v in verts:
+		var lx := base.x + v.x
+		var ly := base.y + v.y
+		var lz := base.z + v.z
+		var d := FA.own_dist(fid, slot, lx, ly, lz)   # >=0 interior; < 0 means past the own ridge (penetration)
+		if -d > worst:
+			worst = -d
+	return worst
+
+## Walk from the facet centre toward ridge `slot` until near the seam (own_dist small positive), returning a
+## mid-edge lattice cell straddling the ridge (away from the polygon corners so it is not a singular junction).
+func _seam_probe_cell(fid: int, slot: int, centre: Vector2i, g: int) -> Vector2i:
+	var cur := Vector2i(centre)
+	# March the cell outward along the gradient of the own-side ridge distance until own_dist ~ 1.
+	for _i in range(512):
+		var d := FA.own_dist(fid, slot, float(cur.x), float(g), float(cur.y))
+		if d <= 1.5:
+			break
+		# step 1 cell in the direction that decreases own_dist (the ridge normal in lattice x/z).
+		var dx := FA.own_dist(fid, slot, float(cur.x + 1), float(g), float(cur.y)) - d
+		var dz := FA.own_dist(fid, slot, float(cur.x), float(g), float(cur.y + 1)) - d
+		cur += Vector2i(-1 if dx > 0.0 else 1, 0) if absf(dx) >= absf(dz) else Vector2i(0, -1 if dz > 0.0 else 1)
+	return cur
+
+# ---- End-to-end pool walk-soak: a WorldManager crossing is a POOL HIT (re-designation), pool-miss 0 ----
+# Drives WorldManager.update_streaming (which runs the pool manager) as the player approaches a ridge inside D_WARM
+# — pre-warming the neighbour — then fires maybe_cross_facet just past the ridge and asserts the crossing was a
+# RE-DESIGNATION (POOL HIT), not a teardown fallback. This is the headless proxy for the live "pool-miss count 0".
+func _gate_pool_walk_soak() -> void:
+	var active := FA.spawn_facet()
+	TC.set_active_facet(active)
+	var w := WorldManager.new()
+	w.name = "PoolWalkSoak"
+	get_root().add_child(w)
+	# Attach the ONE viewer via a stand-in player so the module streams (on_player_ready wires it).
+	var player := Node3D.new()
+	get_root().add_child(player)
+	if w.has_method("on_player_ready"):
+		w.on_player_ready(player)
+	# Pick a mid-edge ridge + its neighbour, and build interior/past positions along the ridge normal.
+	var slot := -1
+	var B := -1
+	for s in range(4):
+		var nb: int = FA.seam_neighbour(active, s)
+		if nb >= 0 and nb != active:
+			slot = s; B = nb; break
+	if B < 0:
+		_ok(false, "G-M1-POOL walk: found a ridge to cross")
+		return
+	var cc: Vector2i = FA.centre_cell(active)
+	var gA := int(TC.facet_profile(active, cc.x, cc.y).x)
+	var seam_cell := _seam_probe_cell(active, slot, cc, gA)
+	var pl: Vector4 = FA.seam_plane(active, slot)
+	var n := Vector3(pl.x, pl.y, pl.z)
+	var nlen := maxf(n.length(), 1e-9)
+	var nhat := n / nlen
+	var seam_pt := Vector3(float(seam_cell.x), float(gA), float(seam_cell.y))
+	var d_s := FA.own_dist(active, slot, seam_pt.x, seam_pt.y, seam_pt.z)
+	var approach := seam_pt + nhat * ((40.0 - d_s) / nlen)     # own_dist ~ +40 (inside D_WARM=96)
+	var past := seam_pt + nhat * ((-0.5 - d_s) / nlen)         # own_dist ~ -0.5 (just past the ridge)
+	# Warm the pool: update_streaming runs _manage_facet_pool (first call spawns B — the throttle starts ready).
+	var warmed := false
+	var t0 := Time.get_ticks_msec()
+	while Time.get_ticks_msec() - t0 < 3000:
+		w.update_streaming(approach)
+		await process_frame
+		if w.facet_pool_has(B):
+			warmed = true
+			break
+	print("  [G-M1-POOL walk] approaching ridge (own_dist~40): B pooled = %s, neighbour count = %d" % [warmed, w.facet_pool_neighbour_count()])
+	_ok(warmed, "G-M1-POOL walk: neighbour B(%d) spawned while approaching the ridge (own_dist < D_WARM)" % B)
+	var miss_before := w.pool_miss_count()
+	# Cross just past the ridge — with B pooled this must be a RE-DESIGNATION (pool hit), no teardown fallback.
+	var res := w.maybe_cross_facet(past)
+	_ok(bool(res.get("crossed", false)), "G-M1-POOL walk: maybe_cross_facet fires past the ridge")
+	_ok(TC.active_facet() == B, "G-M1-POOL walk: active facet re-designated to B(%d)" % B)
+	print("  [G-M1-POOL walk] pool-miss count: before=%d after=%d (0 delta == the crossing was a POOL HIT)" % [miss_before, w.pool_miss_count()])
+	_ok(w.pool_miss_count() == miss_before, "G-M1-POOL walk: the crossing was a POOL HIT — pool-miss count unchanged (re-designation, no teardown)")
+	w.queue_free()
+	player.queue_free()
+	await process_frame

@@ -65,6 +65,18 @@ func set_excluded(fids: Array) -> void:
 		_excluded[int(f)] = true
 	force_rebuild()
 
+## FP-M1c (docs/COSMOS-FP-M1-DESIGN.md §4.1): set the excluded flat-quad facets to the live neighbour pool and
+## rebuild DEFERRED (budgeted _process) rather than synchronously — a pool spawn/retire/crossing must never pay a
+## full ring regen on its own frame (§12.1c). No-op re-sets that leave the set unchanged skip the pending flag.
+func set_pool_excluded(fids: Array) -> void:
+	var next := {}
+	for f in fids:
+		next[int(f)] = true
+	if next == _excluded:
+		return
+	_excluded = next
+	_pending = true   # deferred rebuild (the crossing's set_active already re-placed the mesh rigidly)
+
 ## FP-S1(d): drive the deferred rebuild off the crossing frame. Cache-warm the newly-front-hemisphere facets under a
 ## per-frame ms budget; once they are all cached, do the single re-emit. Only active while a crossing is pending.
 func _process(_dt: float) -> void:

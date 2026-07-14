@@ -41,6 +41,13 @@ const FACET_WALL_EPS := -3.0          # COSMOS FACETED §6.1: FP3 removes the FP
                                       # failed crossing so the player can never wander far onto masked air.
 const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the neighbour just past a ridge (fires in
                                       # update_streaming the same frame the feet pass P, so any speed is caught)
+# FP-S1(c) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R3 / §8): a crossing that lands the reframed player PAST
+# one of the destination facet's OTHER ridges (the near-corner case) would re-fire a full teardown+restream every
+# physics tick (B→C→B…) — the "all chunks blank" storm. Two guards: a containment check (only commit a crossing
+# whose landing is interior to ALL FOUR of B's ridges, i.e. would not itself immediately re-fire) and a short
+# cooldown (a crossing cannot re-fire for the next N maybe_cross_facet calls — belt-and-suspenders vs ridge jitter).
+const FACET_CROSS_COOLDOWN := 6       # maybe_cross_facet calls (≈physics ticks) suppressed after a committed crossing
+var _cross_cooldown := 0              # remaining suppressed calls (decremented per call; 0 = ready)
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
@@ -1248,11 +1255,32 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		return {}
+	# FP-S1(c): cooldown — after a committed crossing, suppress the next FACET_CROSS_COOLDOWN calls so a crossing
+	# can never re-fire immediately (ridge-jitter / residual oscillation). A genuine sequential crossing traverses
+	# the whole facet (many ticks ≫ cooldown), so this never blocks a legitimate crossing.
+	if _cross_cooldown > 0:
+		_cross_cooldown -= 1
+		return {}
 	for slot in 4:
 		var s := FacetAtlas.own_dist(fid, slot, player_pos.x, player_pos.y, player_pos.z)
 		if s < -FACET_CROSS_HYST:
 			var to: int = FacetAtlas.seam_neighbour(fid, slot)
 			var np := FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+			# FP-S1(c) containment: only commit if the reframed landing is INTERIOR to ALL FOUR of B's ridges —
+			# concretely own_dist(B, bslot, np) >= -HYST for every bslot, i.e. the landing would NOT itself
+			# immediately re-fire a crossing. A genuine mid-edge crossing lands deep inside B (the welded ridge at
+			# ~+HYST by seam complementarity, the other three far positive), so it ALWAYS passes. Near a corner the
+			# player is past TWO of A's ridges, so the landing sits past one of B's other ridges (< -HYST) → this
+			# slot would ping-pong B→C→B every tick (the R3 storm). Skip it; a later tick (once the player walks
+			# clearly into one facet) or a better slot resolves it. Deferring a corner is strictly safer than a
+			# storm — the far ring still draws the planet and the analytic floor still carries the player.
+			var contained := true
+			for bslot in 4:
+				if FacetAtlas.own_dist(to, bslot, np[0], np[1], np[2]) < -FACET_CROSS_HYST:
+					contained = false
+					break
+			if not contained:
+				continue
 			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
 			var yaw_delta := atan2(ex.z, ex.x)
 			TerrainConfig.set_active_facet(to)
@@ -1267,6 +1295,7 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 				_facet_ring.set_active(to)
 			_flip_settling = true
 			_restream()
+			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
 			print("[WorldManager] facet cross %d → %d (slot %d, restream + far re-place)" % [fid, to, slot])
 			return {"crossed": true, "from": fid, "to": to,
 				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}

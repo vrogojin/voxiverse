@@ -59,6 +59,12 @@ var _pool_active := -1                        # the currently-active (editable, 
 # the near rings of non-active facets as blocky LOD meshes (+ ridge aprons) instead of far-ring quads. Owns ONE
 # FacetLodBuilder (the M2a off-thread build primitive). null unless FP_M2_LOD (dead code → FP-M1c byte-identical).
 var _lod_mesher = null
+# COSMOS FP-M2c (§6.5.3 surface 3): the load-adaptive view-ramp pace ∈ [0,1] pushed by the StreamLoadController via
+# set_stream_pace. Multiplies the per-frame GROW leg of every view ramp (single-terrain + pool), so RAMP_SECONDS is
+# the MINIMUM leg duration, stretched (never compressed) under load; pace 0 fully HOLDS a grow. Shrinks (unloads) are
+# never throttled. Default 1.0 → byte-identical to the shipped fixed ramp (M2c never calls it with <1; M2d does).
+var _stream_pace := 1.0
+var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -342,7 +348,7 @@ func _process(delta: float) -> void:
 	# DEV_HIDE_NEAR: while the near render is hidden, never re-grow the view distance (keep it collapsed).
 	if _ramp_active:
 		var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
-		_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
+		_ramp_view = minf(_ramp_view + span * delta * _stream_pace / RAMP_SECONDS, _ramp_target)
 		if _terrain != null and not _render_hidden:
 			_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
 		if _ramp_view >= _ramp_target:
@@ -405,7 +411,9 @@ func _ramp_pool_step(delta: float) -> bool:
 	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
 	var sc: Dictionary = _pool[up_fid]
 	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
-	sc["view_f"] = minf(float(sc["view_f"]) + span * delta / RAMP_SECONDS, float(sc["view_target"]))
+	# FP-M2c surface 3: the GROW leg is paced by the load controller (RAMP_SECONDS = the min duration, stretched under
+	# load; pace 0 holds the grow). Default pace 1.0 → the shipped ramp math verbatim. Shrinks above snapped separately.
+	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * _stream_pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
 	return true
@@ -1440,6 +1448,8 @@ func _lod_setup() -> void:
 		return
 	_lod_mesher = m
 	_lod_mesher.call("set_active_facet", _pool_active)
+	if _load_ctrl != null:                            # FP-M2c: a pool_reset rebuild re-forwards the controller (§6.5)
+		_lod_mesher.call("set_load_controller", _load_ctrl)
 	set_process(true)
 
 ## FP-M2b: join the builder Thread before the node tree tears down (a bare free would leak the running Thread).
@@ -1456,6 +1466,19 @@ func lod_covered_fids() -> Array:
 ## FP-M2b gate accessor: the live FacetLodMesher (verify_fp_m2 drives caps/frame/seam through it). null with the flag off.
 func lod_mesher():
 	return _lod_mesher
+
+## FP-M2c (§6.5.3 surface 3): set the pool view-ramp pace ∈ [0,1] from the StreamLoadController. The GROW leg of every
+## view ramp is stretched by `f` (RAMP_SECONDS the min duration; f=0 holds it). Clamped; default 1.0 → the shipped
+## fixed ramp. M2d calls this each frame with the controller's stream_pace(); M2c leaves it at 1.0 (byte-identical).
+func set_stream_pace(f: float) -> void:
+	_stream_pace = clampf(f, 0.0, 1.0)
+
+## FP-M2c (§6.5): store the StreamLoadController (owned by WorldManager) and forward it to the FacetLodMesher, which
+## scales its LOD apply-ms + build grants by the credit (surfaces 1-2). No-op if the mesher is absent (flag off).
+func set_load_controller(c) -> void:
+	_load_ctrl = c
+	if _lod_mesher != null:
+		_lod_mesher.call("set_load_controller", c)
 
 ## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
 ## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view

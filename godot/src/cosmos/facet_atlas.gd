@@ -629,6 +629,20 @@ static func centre_cell(fid: int) -> Vector2i:
 static func spawn_column() -> Vector2i:
 	return _facet_centre_cell(_spawn_fid)
 
+## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §10, risk #6) — the off-surface active-facet-by-DIRECTION classifier:
+## which facet does the radial direction `d` (planet centre → a point) land in? Pure f64 (CubeSphere.dir_to_face_cell
+## at n=K) over the frozen cube-sphere tables, so the SSE selector stays pure viewer camera math and never assumes the
+## viewer stands on the active facet. Round-trips EXACTLY with every facet's centre direction — G-M2-DIR asserts
+## facet_of_dir(cell_dir(fid, centre_cell(fid))) == fid over all 6·K² facets. The fid layout mirrors warm_up's build
+## order fid = (face·K + a)·K + b. The M2d pool policy uses this only defensively (freeze spawns for a high flyer
+## above OFFSURFACE_Y — no ridge-skim thrash); full off-facet gravity/locomotion is FP-M3.
+static func facet_of_dir(d: CubeSphere.DVec3) -> int:
+	var fc := CubeSphere.dir_to_face_cell(d, K)
+	var face: int = int(fc["face"])
+	var fi: int = clampi(int(fc["fi"]), 0, K - 1)
+	var fj: int = clampi(int(fc["fj"]), 0, K - 1)
+	return (face * K + fi) * K + fj
+
 # ------- frame self-test (G-F1e, all f64 — never routes the frame through f32 Vector3) -------
 
 ## f64 frame-math metrics for facet `fid` (the FP1 gate G-F1e asserts thresholds on these). Recomputes the

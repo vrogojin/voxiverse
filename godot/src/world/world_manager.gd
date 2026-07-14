@@ -37,6 +37,10 @@ var _ground: GroundCollider           # local blocky physics collider
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
+# FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
+# to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
+# and ticked every frame with real time. null unless FP_M2_LOD + the module path (dead code with the flag off).
+var _load_ctrl = null
 const FACET_WALL_EPS := -3.0          # COSMOS FACETED §6.1: FP3 removes the FP2 ridge wall — the crossing handoff
                                       # replaces it. A deep backstop (3 blocks PAST the ridge) only catches a
                                       # failed crossing so the player can never wander far onto masked air.
@@ -210,6 +214,11 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if _snowfall != null and _have_player_pos:
 		_snowfall.process(delta, _last_player_pos)
+	# FP-M2c (§6.5): tick the load controller every frame with REAL time so it adapts to live main-thread load. The
+	# FacetLodMesher reads its credit for LOD apply-ms + build grants (surfaces 1-2). The pool ramp pace (surface 3)
+	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
+	if _load_ctrl != null:
+		_load_ctrl.tick(Time.get_ticks_msec() / 1000.0)
 	# FP-M2b: the LOD covered set grows/shrinks as builds apply + facets evict (not only on a pool spawn/retire), so
 	# resync the far-ring exclusion on a slow throttle. set_pool_excluded no-ops when the set is unchanged (cheap).
 	# Gated on FP_M2_LOD → zero extra work with the flag off (byte-identical to FP-M1c).
@@ -231,8 +240,34 @@ func _setup_module_path() -> void:
 	if world.call("setup"):
 		_module_world = world
 		using_module = true
+		_lod_ctrl_setup()
 	else:
 		world.queue_free()
+
+## FP-M2c (§6.5): create the StreamLoadController, wire the LIVE measured-load source, and forward it to
+## module_world (which passes it to the FacetLodMesher for surfaces 1-2 and holds it for the surface-3 ramp pace).
+## No-op unless FP_M2_LOD → the controller is never created with the flag off (byte-identical to FP-M1c).
+func _lod_ctrl_setup() -> void:
+	if not CubeSphere.FP_M2_LOD or _module_world == null:
+		return
+	# preload (not the global class_name) so a core always-parsed script never depends on the stale editor class cache
+	# (the codebase convention — verify_fp_m2 preloads FLM/FLB likewise). The inner LiveSource resolves off the script.
+	var slc: Script = load("res://src/world/stream_load_controller.gd")
+	_load_ctrl = slc.new()
+	_load_ctrl.set_input_source(slc.LiveSource.new())
+	if _module_world.has_method("set_load_controller"):
+		_module_world.call("set_load_controller", _load_ctrl)
+
+## FP-M2c external injection hook (the harness M2e-WIRE point): override the owned controller (e.g. a soak driver
+## injecting a scripted source). Forwards to module_world so the mesher + ramp read the same instance.
+func set_load_controller(c) -> void:
+	_load_ctrl = c
+	if _module_world != null and _module_world.has_method("set_load_controller"):
+		_module_world.call("set_load_controller", c)
+
+## FP-M2c: the current admission credit ∈ [0,1] (1.0 when no controller — the flag-off / fallback default).
+func stream_load_credit() -> float:
+	return float(_load_ctrl.credit()) if _load_ctrl != null else 1.0
 
 func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()

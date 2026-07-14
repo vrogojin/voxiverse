@@ -169,11 +169,18 @@ func _centre_dir(fid: int) -> Array:
 func _pace_requests() -> void:
 	if _builder == null or int(_builder.queued()) > LOD_QUEUE_MAX_JOBS:
 		return
+	# FP-M2c surface 2 (§6.5.3.2): the per-tick admit count is scaled by the controller credit — ceil(2·credit),
+	# 0 → the budgeter stops enqueueing (the builder finishes in-flight tiles and idles). Default = LOD_REQUESTS_PER_TICK.
+	var grants := LOD_REQUESTS_PER_TICK
+	if _controller != null:
+		grants = int(_controller.call("grant_count", LOD_REQUESTS_PER_TICK))
+	if grants <= 0:
+		return
 	var order := _want.keys()
 	order.sort_custom(func(a, b): return int(_want[a]) < int(_want[b]))
 	var made := 0
 	for fid in order:
-		if made >= LOD_REQUESTS_PER_TICK:
+		if made >= grants:
 			break
 		var lod := int(_want[fid])
 		if _cache.has(fid) and int(_cache[fid]["lod"]) == lod:
@@ -273,12 +280,19 @@ func tick() -> void:
 		return
 	for item in _builder.drain_done():
 		_pending.append(item)
-	var t0 := Time.get_ticks_usec()
-	var budget_us := int(LOD_APPLY_BUDGET_MS * 1000.0)
-	while not _pending.is_empty():
-		_apply_one(_pending.pop_front())
-		if Time.get_ticks_usec() - t0 > budget_us:
-			break
+	# FP-M2c surface 1 (§6.5.3.1): the apply budget is scaled by the controller credit — 0 → applies PAUSE (the
+	# finished meshes wait in _pending, bounded because they are already built). Default (no controller) = the M2b
+	# fixed LOD_APPLY_BUDGET_MS. Credit-scaled ms/frame governs how fast built meshes swap into the scene.
+	var apply_ms := LOD_APPLY_BUDGET_MS
+	if _controller != null:
+		apply_ms = float(_controller.call("apply_budget_ms", LOD_APPLY_BUDGET_MS))
+	if apply_ms > 0.0:
+		var t0 := Time.get_ticks_usec()
+		var budget_us := int(apply_ms * 1000.0)
+		while not _pending.is_empty():
+			_apply_one(_pending.pop_front())
+			if Time.get_ticks_usec() - t0 > budget_us:
+				break
 	_pace_requests()                                          # admit a few new wanted facets (paced, §6.4)
 	_apron_pass()
 

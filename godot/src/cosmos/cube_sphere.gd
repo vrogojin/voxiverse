@@ -85,6 +85,32 @@ const POOL_SINGULAR_EXCLUDE := 4
 ## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
 const FP_M2_LOD := false
 
+## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
+## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
+## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with
+## p ≤ τ). LOD_HYST_BAND — a re-tier only fires when the continuous ℓ_c crosses the current tier's band by this
+## much (no boundary thrash). LOD_QUEUE_MAX_EST_S — the FIXED (load-independent, §6.5.7) est-build-seconds admission
+## bound the budgeter grants under. CONTROLLER (§6.5): the closed loop on measured main-thread load. FRAME_BUDGET_MS
+## — the worst-frame setpoint. TICK_S — control cadence. WINDOW_FRAMES — the worst-frame sliding window. BACKLOG_MAX
+## — the vox_gen feed-forward gate (holds full-res admission at 0 until the pool drains; == the M2e definition of
+## done). PROMOTE_SUSTAIN_S — credit must sit ≥ PROMOTE_CREDIT this long before a live spawn is admitted (M2d).
+## OVERLOAD_SUSTAIN_S — only sustained credit-0 overload this long triggers a (pause-first) demote (§6.5.4). AIMD:
+## CREDIT_MDF (×0.5 on overload) / CREDIT_AI (+0.1 under headroom). OFFSURFACE_Y — the flight altitude above which
+## the pool freezes spawns (risk #6 defensive stub; M2d consumes it).
+const LOD_TAU_PX := 3.0
+const LOD_HYST_BAND := 0.25
+const LOD_QUEUE_MAX_EST_S := 30.0
+const CTRL_FRAME_BUDGET_MS := 18.0
+const CTRL_TICK_S := 0.25
+const CTRL_WINDOW_FRAMES := 30
+const CTRL_BACKLOG_MAX := 300
+const CTRL_PROMOTE_SUSTAIN_S := 1.5
+const CTRL_OVERLOAD_SUSTAIN_S := 3.0
+const CTRL_CREDIT_MDF := 0.5
+const CTRL_CREDIT_AI := 0.1
+const CTRL_PROMOTE_CREDIT := 0.5
+const OFFSURFACE_Y := 256.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

@@ -76,6 +76,15 @@ const POOL_SPAWN_INTERVAL_S := 1.0
 const POOL_MEM_BUDGET_MB := 128
 const POOL_SINGULAR_EXCLUDE := 4
 
+## COSMOS FP-M2 (docs/COSMOS-FP-M2-DESIGN.md §0.8) — the LOD-mesh-neighbours master toggle. When true (AND
+## FACETED AND FP_M1_POOL AND the module binary present) non-imminent facets stop being live full-res
+## VoxelTerrains and become screen-space-error-selected blocky meshes built entirely OFF the voxel worker pool
+## (FacetLodMesher), cutting the generation-throughput ceiling. FP-M2a (this stage) ships ONLY the off-terrain
+## build primitive + the LOD0 byte-identity gate as DEAD CODE behind this flag — no scene consumer yet. Default
+## OFF → the faceted world is byte-identical to FP-M1c; FLAT stays 6027/0. Flipped ON at export after the
+## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
+const FP_M2_LOD := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

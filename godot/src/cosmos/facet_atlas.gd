@@ -571,6 +571,27 @@ static func block_all_air(fid: int, ox: int, oy: int, oz: int, sx: int, sy: int,
 		if hi_max <= SEAM_EPS:
 			return true
 	return false
+
+## COSMOS FP-M2 §7.2 — conservative megablock erosion for LOD ℓ>0. A coarse buffer cell samples the LOD0 lattice
+## corner (wx,wy,wz) but RENDERS an s³ megablock spanning the footprint [wx,wx+s]³. It survives ONLY if that whole
+## footprint is interior to all 4 ridge planes; anything straddling or beyond a ridge becomes AIR. For a plane
+## own(x,y,z)=A·x+B·y+C·z+D the MINIMUM over [wx,wx+s]³ is at the corner minimizing each term, i.e.
+##   lo = A·wx + B·wy + C·wz + D + s·(min(0,A)+min(0,B)+min(0,C))
+## and the megablock is interior iff lo ≥ −SEAM_EPS for EVERY ridge. This REPLACES the per-cell junction_modify at
+## ℓ>0 (no junction sentinels are emitted for megablocks — a single sampled LOD0 cell cannot cut an s³ block, §7.1);
+## at ℓ==0 (s==1) the shipped junction_modify path runs verbatim, so LOD0 is byte-identical (G-M2-ID). The retreat
+## is ≤ s blocks — covered on LOD↔LOD ridges by the ridge apron (M2b), never interpenetrating a live facet. Pure
+## frozen-atlas arithmetic (the block_all_air family) → worker/builder-safe, facet-static.
+static func cell_interior_scaled(fid: int, wx: int, wy: int, wz: int, s: int) -> bool:
+	var fx := float(wx); var fy := float(wy); var fz := float(wz); var fs := float(s)
+	for slot in range(4):
+		var b := fid * 16 + slot * 4
+		var A := _seam_plane[b]; var B := _seam_plane[b + 1]; var C := _seam_plane[b + 2]; var D := _seam_plane[b + 3]
+		var lo := A * fx + B * fy + C * fz + D + fs * (minf(0.0, A) + minf(0.0, B) + minf(0.0, C))
+		if lo < -SEAM_EPS:
+			return false
+	return true
+
 static func frame_basis(fid: int) -> Basis:
 	var f := fid * 12
 	return Basis(Vector3(_frame[f + 3], _frame[f + 4], _frame[f + 5]),

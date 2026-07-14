@@ -1716,6 +1716,33 @@ func spike_carve_range() -> Vector2i:
 
 # ========================== end FP-R0 SPIKE ==========================
 
+# ========================== FP-M2 LOD build hookup (docs/COSMOS-FP-M2-DESIGN.md §4.1, §13) ==========================
+# Productized access to the probe recipe FP-R0 proved, for FacetLodBuilder / FacetLodMesher. Gated on FP_M2_LOD
+# (NOT FP_R0) so with the flag off these return null and the whole LOD path is dead code. The builder thread
+# reads the returned frozen generator ONLY (never a mutable global) — the frozen-epoch discipline, §4.3.
+
+## The shared baked VoxelBlockyLibrary — the builder's own VoxelMesherBlocky shares it for build_mesh.
+func lod_library() -> Object:
+	return _library if CubeSphere.FP_M2_LOD else null
+
+## A per-facet frozen probe generator (lod>0 stride enabled) homed on `fid`. Built on the MAIN thread (compiles
+## the generator source + freezes the appearance tables); handed to the builder thread which only calls
+## generate_block(buffer, origin, ℓ) on it. At ℓ0 stride==1 → byte-identical to the shipped generator (G-M2-ID).
+func lod_probe_generator(fid: int) -> Object:
+	return _make_generator(fid, true) if CubeSphere.FP_M2_LOD else null
+
+## The SHIPPED active-facet generator (lod>0 early-out, no stride) — the byte-identity reference for G-M2-ID
+## (probe-stride generator at ℓ0 must equal this voxel-for-voxel). null with the flag off.
+func lod_shipped_generator() -> Object:
+	return _generator if CubeSphere.FP_M2_LOD else null
+
+## The active-facet VoxelTerrain — the gate samples its statistics to prove a pure-LOD build leaves the voxel
+## worker pool's task counts untouched (G-M2-BUILD; the builder never touches any terrain). null with the flag off.
+func lod_active_terrain() -> Node3D:
+	return _terrain if CubeSphere.FP_M2_LOD else null
+
+# ========================== end FP-M2 LOD build hookup ==========================
+
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
 ## GDScript fallback had one, so a module flip left stale face-A meshes standing (COSMOS-AUDIT F3).
@@ -2378,8 +2405,15 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				# COSMOS FACETED §3.5.4/§5.3: the junction/mask authority at the module worker buffer-write exit
 				# (mirrors WM.cell_value_at). Masks beyond-ridge cells to AIR (id==0 → skipped) and turns
 				# straddling cells into kind-2 partials. Frozen gen_facet (never _active_facet) → worker-safe.
+				# COSMOS FP-M2 §7.2: at ℓ>0 (s>1, the LOD probe path) a single sampled LOD0 cell cannot cut an s³
+				# megablock, so junction sentinels are NOT emitted — instead the megablock is kept only if its whole
+				# s-cube footprint is interior to all 4 ridges (conservative erosion), else AIR. At ℓ0 (s==1) the
+				# shipped junction_modify runs verbatim → LOD0 byte-identical (G-M2-ID pins it).
 				if gen_facet >= 0:
-					v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, wy, wz), v)
+					if s == 1:
+						v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, wy, wz), v)
+					elif not FacetAtlas.cell_interior_scaled(gen_facet, wx, wy, wz, s):
+						v = 0
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue

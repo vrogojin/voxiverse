@@ -48,7 +48,18 @@ printf '%s' "$(openssl rand -hex 24)" > .token      # .token is gitignored
 export REMOTE_BRIDGE_TOKEN="$(cat .token)"
 ```
 
-The **same** value goes into the game URL: `https://voxiverse.game-host.org/?remote=<token>`.
+The **same** value activates the game two ways:
+
+- **URL param** — `https://voxiverse.game-host.org/?remote=<token>` auto-dials on load.
+- **Hotkey (`Ctrl+Shift+F9`)** — toggles dial mode at runtime. If the URL param is absent, an
+  on-canvas prompt asks for the token; the game dials only once a token is entered. The prompt takes
+  a **token only** — the relay URL is fixed to our host and is never user-specifiable, so a visitor
+  can't be redirected to a rogue relay. Pressing the chord again (or closing the tab) disconnects.
+
+Whenever the channel is live, a prominent **"● REMOTE ACTIVE — observing"** badge is shown on the
+game canvas (amber "◌ REMOTE — dialing…" while connecting), so the user can always tell when the
+agent can observe the session. In Phase 2 (control) the same toggle/badge upgrade to
+"observing + CONTROLLING".
 
 > Never commit `.token`. It is listed in `.gitignore` alongside `node_modules/` and `results/`.
 

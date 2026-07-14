@@ -22,9 +22,21 @@ extends Node
 ##
 ## Reconnect with capped backoff on drop; clean teardown on _exit_tree. Robust to readback cost:
 ## a frame is SKIPPED (not queued) when the socket is backpressured or a capture is already inflight.
+##
+## The RemoteBridgeActivator (net/remote_bridge_activator.gd) owns runtime toggling (the Ctrl+Shift+F9
+## chord + the on-canvas token prompt) and the always-visible LIVE badge; it listens to `link_state`
+## below to keep that badge honest. This node stays a pure dumb pipe — activation policy lives there.
+
+## Emitted when the WS link opens (true) or drops/closes (false). The activator drives the on-screen
+## "REMOTE ACTIVE" badge from this, so the user can ALWAYS tell when the channel is live.
+signal link_state(open: bool)
 
 # ── Configuration ──────────────────────────────────────────────────────────────────────────────
 const DEFAULT_URL := "wss://voxiverse.game-host.org/remote"
+
+## Phase-1 badge status verb. Phase 2 (control) upgrades this surface to "observing + CONTROLLING"
+## through the SAME toggle + badge — the activator reads PHASE_STATUS, so the upgrade is one const.
+const PHASE_STATUS := "observing"
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
 const FRAME_INTERVAL_MS := 500      # ms — ~2 fps frame stream
@@ -61,6 +73,14 @@ var _hitches := 0                   # cumulative frames slower than HITCH_MS sin
 
 var _frame_acc_ms := 0.0
 var _capturing := false             # a frame readback+send is inflight (skip overlapping captures)
+var _link_open := false             # last emitted link_state (so we emit only on transitions)
+
+
+## Emit link_state only when the live/down status actually flips (drives the badge).
+func _set_link(open: bool) -> void:
+	if open != _link_open:
+		_link_open = open
+		link_state.emit(open)
 
 
 ## Detect dial mode. Returns {} when NOT active — the normal path, in which main.gd creates NO
@@ -83,10 +103,22 @@ static func dial_config() -> Dictionary:
 	token = token.strip_edges()
 	if token == "":
 		return {}
+	return {"token": token, "url": resolve_url()}
+
+
+## The relay URL is FIXED to our host — resolved from VOXIVERSE_REMOTE_URL (native/dev only) else the
+## hard-coded default. It is NEVER derived from user input: the on-canvas token prompt collects ONLY a
+## token, never a URL, so a visitor can't be tricked into streaming to an attacker's relay. On the web
+## the env var is unset, so this is always DEFAULT_URL (same-origin wss).
+static func resolve_url() -> String:
 	var url := OS.get_environment("VOXIVERSE_REMOTE_URL").strip_edges()
-	if url == "":
-		url = DEFAULT_URL
-	return {"token": token, "url": url}
+	return url if url != "" else DEFAULT_URL
+
+
+## The URL-param / env token if dial mode is pre-armed, else "" (the hotkey path then prompts for one).
+static func preset_token() -> String:
+	var cfg := dial_config()
+	return str(cfg.get("token", ""))
 
 
 ## Extract the `remote` value from a raw `?a=b&remote=TOK&c=d` query string (leading `?` optional).
@@ -151,6 +183,7 @@ func _process(delta: float) -> void:
 	# ── Socket state machine ──────────────────────────────────────────────────────────────────
 	var state := _ws.get_ready_state()
 	if state == WebSocketPeer.STATE_CLOSED:
+		_set_link(false)                     # link is down → badge reverts to "dialing…"
 		# Reconnect on the backoff schedule.
 		if _reconnect_at == 0.0:
 			_schedule_reconnect()
@@ -168,6 +201,7 @@ func _process(delta: float) -> void:
 		_was_open = true
 		_backoff = RECONNECT_BACKOFF_MIN     # a clean open resets the backoff ladder
 		_send_hello()
+		_set_link(true)                      # socket open → badge shows "REMOTE ACTIVE — observing"
 
 	# Phase 1 is SEND-ONLY: drain and discard anything the relay sends. No control surface.
 	while _ws.get_available_packet_count() > 0:
@@ -326,6 +360,7 @@ func _capture_frame_async() -> void:
 
 func _exit_tree() -> void:
 	# Clean teardown — close the socket so the relay sees a prompt disconnect.
+	_set_link(false)
 	if _ws != null:
 		if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN or _ws.get_ready_state() == WebSocketPeer.STATE_CONNECTING:
 			_ws.close(1000, "bye")

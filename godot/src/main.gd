@@ -72,19 +72,16 @@ func _ready() -> void:
 	perf.name = "PerfHUD"
 	add_child(perf)
 
-	# REMOTE-PLAY BRIDGE (Phase 1, observe-only). Created ONLY when dial mode is detected —
-	# `?remote=<token>` in the page URL on web, or the VOXIVERSE_REMOTE_TOKEN env var natively.
-	# With no token, dial_config() returns {} and NO bridge node exists: no WebSocket, no frame
-	# capture, no per-frame cost — the public site is byte-identical and streams nothing. See
-	# net/remote_bridge.gd for the security model.
-	var dial := RemoteBridge.dial_config()
-	if not dial.is_empty():
-		var bridge := RemoteBridge.new()
-		bridge.name = "RemoteBridge"
-		bridge.configure(dial)
-		bridge.world = world
-		bridge.player = player
-		add_child(bridge)
+	# REMOTE-PLAY BRIDGE activation (Phase 1, observe-only). An INPUT-ONLY activator is always present:
+	# it wires the Ctrl+Shift+F9 toggle, the on-canvas token prompt, and the live "REMOTE ACTIVE" badge,
+	# but holds NOTHING live (no WebSocket, no frame capture, no per-frame cost) until the chord fires
+	# with a valid token — or the `?remote=<token>` URL param pre-arms it (RemoteBridge.preset_token()).
+	# The relay URL is fixed to our host; the prompt takes a token only. verify_feature never runs
+	# main.gd, so the FLAT gate is unaffected. See net/remote_bridge_activator.gd for the trust model.
+	var activator := RemoteBridgeActivator.new()
+	activator.name = "RemoteBridgeActivator"
+	activator.configure(world, player, RemoteBridge.preset_token())
+	add_child(activator)
 
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main

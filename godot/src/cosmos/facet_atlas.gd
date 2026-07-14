@@ -41,6 +41,45 @@ static var _seam_mhat := PackedFloat64Array()    # 12/fid: 4 slots × m̂.xyz (w
 static func facet_count() -> int:
 	return 6 * K * K
 
+# ---------------------------------------------------------------------------------------
+# The FACETED global edit key (COSMOS-FP-M1-DESIGN §6.2 / FACETED-IMPL §6.2). Under FACETED an
+# edit is bound to its FACET + LATTICE CELL forever, independent of which facet is active: when the
+# active facet changes at a crossing the same world cell maps to a DIFFERENT active-lattice Vector3i,
+# so a Vector3i key would silently re-interpret in the new lattice (corruption). The (fid, cell) int
+# is that permanent identity — pure/static, so it is worker-safe and mirrors CubeSphere.edit_key's
+# role for curved mode.
+#
+#   key = ((fid·2^18 + (x + 131072))·2^18 + (z + 131072))·2^11 + (y + 512)
+#   12 bits fid | 18 bits (x+2^17) | 18 bits (z+2^17) | 11 bits (y+512)  -> 59 bits, a plain int64.
+#
+# Ranges (every term is non-negative, so the packed key is always positive → GDScript /,% are exact):
+#   fid  < 4096   (6·24² = 3456 facets, K=24)
+#   x,z  ∈ [−131072, 131071]  — the decorrelation offset O ∈ [−32768, 32767] (_build_facet:107-108)
+#                               pushes |lattice| to ~3·10⁴; 2^17 centring gives ~4× headroom.
+#   y    ∈ [−512, 1535]       — the worldgen vertical envelope (bedrock −64 … tallest surface+tree).
+# ---------------------------------------------------------------------------------------
+const _EK_XZ_OFF := 131072            # 2^17 lateral centring offset
+const _EK_XZ_SPAN := 262144           # 2^18 lateral field width
+const _EK_Y_OFF := 512                # y centring offset
+const _EK_Y_SPAN := 2048              # 2^11 y field width
+
+static func edit_key(fid: int, cell: Vector3i) -> int:
+	return ((fid * _EK_XZ_SPAN + (cell.x + _EK_XZ_OFF)) * _EK_XZ_SPAN + (cell.z + _EK_XZ_OFF)) * _EK_Y_SPAN + (cell.y + _EK_Y_OFF)
+
+## Inverse of edit_key: returns [fid: int, cell: Vector3i]. Total bijection over the documented ranges.
+static func edit_key_unpack(key: int) -> Array:
+	var y := (key % _EK_Y_SPAN) - _EK_Y_OFF
+	var rest := key / _EK_Y_SPAN
+	var z := (rest % _EK_XZ_SPAN) - _EK_XZ_OFF
+	rest /= _EK_XZ_SPAN
+	var x := (rest % _EK_XZ_SPAN) - _EK_XZ_OFF
+	var fid := rest / _EK_XZ_SPAN
+	return [fid, Vector3i(x, y, z)]
+
+## The facet-id half of a key WITHOUT allocating the Vector3i (hot-path filter for index rebuilds).
+static func edit_key_fid(key: int) -> int:
+	return key / (_EK_Y_SPAN * _EK_XZ_SPAN * _EK_XZ_SPAN)
+
 ## Build the whole atlas once (main thread). Call AFTER TerrainConfig.warm_up (spawn pick reads worldgen).
 static func warm_up() -> void:
 	if _ready:

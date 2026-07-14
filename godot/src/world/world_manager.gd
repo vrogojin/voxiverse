@@ -381,14 +381,50 @@ func _overlay_canon_modifier(cell: Vector3i, v: int) -> int:
 		return v
 	return CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(CellCodec.modifier(v), (4 - jinv) % 4))
 
-## COSMOS M2 (§1.3): THE overlay key for a window cell. FLAT_WORLD / no chart → the Vector3i window
-## cell itself (byte-identical to the pre-M2 store). Curved → the 43-bit GLOBAL edit key, so an edit
-## survives origin re-anchors and home-face flips (its key is its global identity, not its window
-## position). Returned as a Variant because Dictionary keys are the Vector3i or the int transparently.
+## COSMOS M2 (§1.3) / FP-M1a (§6.2): THE overlay key for a window cell. Three regimes:
+##   • curved (chart installed) → the 43-bit GLOBAL edit key (CubeSphere), so an edit survives origin
+##     re-anchors and home-face flips (its key is its global identity, not its window position);
+##   • FACETED → the 59-bit (fid, cell) GLOBAL key (FacetAtlas), so an edit is bound to its facet+cell
+##     forever and cannot be re-interpreted in the neighbour lattice after a crossing/re-designation;
+##   • FLAT_WORLD / no chart → the Vector3i window cell itself (byte-identical to the pre-M2 store).
+## Returned as a Variant because Dictionary keys are the Vector3i or the int transparently.
 func _edit_key(cell: Vector3i) -> Variant:
-	if _chart == null:
-		return cell
-	return _chart.to_global_key(cell)
+	if _chart != null:
+		return _chart.to_global_key(cell)
+	if CubeSphere.FACETED:
+		return FacetAtlas.edit_key(TerrainConfig.active_facet(), cell)
+	return cell
+
+## FP-M1a (§6.2): the active-facet edit overlay projected back to Vector3i lattice cells — the view the
+## Vector3i-keyed consumers (fallback mesher, structural collapse solver, region save) expect. Under
+## FACETED the stored keys are (fid, cell) globals, so filter to the CURRENT active facet and unpack;
+## since the active facet lattice IS the world/window lattice (no chart), the unpacked cell is the
+## window cell directly. FLAT / no chart returns the live `_edits` by reference (byte-identical, zero
+## copy). Curved uses the dedicated window/region unfolds (placed_cells_window / save_region) instead.
+func _overlay_v3i() -> Dictionary:
+	if CubeSphere.FACETED and _chart == null:
+		return _translate_active(_edits)
+	return _edits
+
+## FP-M1a: the active-facet METADATA overlay as Vector3i cell → document (the region-save companion of
+## `_overlay_v3i`). FLAT returns the live `_meta` by reference (byte-identical).
+func _meta_v3i() -> Dictionary:
+	if CubeSphere.FACETED and _chart == null:
+		return _translate_active(_meta)
+	return _meta
+
+## The (fid, cell)→Vector3i projection of a key-global dict (`_edits` or `_meta`) filtered to the active
+## facet. Only ever called under FACETED (the caller gates), where `_chart` is null and the unpacked
+## cell equals the window cell.
+func _translate_active(src: Dictionary) -> Dictionary:
+	var out := {}
+	var active := TerrainConfig.active_facet()
+	for k in src.keys():
+		if FacetAtlas.edit_key_fid(k) != active:
+			continue
+		var u := FacetAtlas.edit_key_unpack(k)
+		out[u[1]] = src[k]
+	return out
 
 ## Material id at `cell` — the material projection of the composed query. UNCHANGED
 ## contract: every existing call site (floor, blocked, DDA, collider, collapse,
@@ -439,11 +475,13 @@ func placed_top(x: int, z: int) -> int:
 	return _placed_top.get(Vector2i(x, z), -0x40000000)
 
 ## Read-only view of the edit overlay (Vector3i -> int PACKED cell value; 0 = dug
-## air, >0 = solid). The fallback mesher reads placed (value > 0) cells from it and
-## MUST project the material via CellCodec.mat (a bare id is a plain packed value,
-## so it is identical today) rather than treating the raw value as a block id.
+## air, >0 = solid). The fallback mesher / structural collapse solver read placed (value > 0) cells
+## from it and MUST project the material via CellCodec.mat (a bare id is a plain packed value, so it
+## is identical today) rather than treating the raw value as a block id. FP-M1a: under FACETED the
+## live overlay is (fid, cell)-keyed, so this projects the ACTIVE facet's edits back to Vector3i cells
+## (the consumers' expectation); FLAT returns the live `_edits` by reference (byte-identical).
 func placed_cells() -> Dictionary:
-	return _edits
+	return _overlay_v3i()
 
 ## WINDOW-keyed view of the edit overlay (Vector3i window cell → PACKED value) for the fallback
 ## mesher (COSMOS M3 §4.3). In FLAT_WORLD / no chart the overlay IS Vector3i-keyed, so this returns
@@ -456,7 +494,7 @@ func placed_cells() -> Dictionary:
 ## whole overlay, so this adds no asymptotic cost.
 func placed_cells_window() -> Dictionary:
 	if _chart == null:
-		return _edits
+		return _overlay_v3i()   # FLAT: live `_edits`; FACETED: active-facet edits projected to Vector3i cells
 	var out := {}
 	for k: int in _edits.keys():
 		var g := CubeSphere.unpack_key(k)
@@ -761,10 +799,16 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	if is_corner_locked_column(cell.x, cell.z):
 		return
 	packed = CellCodec.canonical(packed)
-	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
-	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider
-	# fast-path index) and is re-keyed by −Δ on a re-anchor (_shift_window_bookkeeping).
+	# COSMOS M2 / FP-M1a: the overlay + metadata key by the global edit key in curved mode, by the
+	# (fid, cell) global int under FACETED, by the Vector3i window cell in plain FLAT_WORLD (byte-
+	# identical). `_edit_columns` stays WINDOW-keyed (a collider fast-path index) and is re-keyed by −Δ
+	# on a re-anchor (_shift_window_bookkeeping) / re-derived per facet on a crossing.
 	var ek: Variant = _edit_key(cell)
+	# FP-M1a §6.2 write-guard: under FACETED an edit key is ALWAYS the (fid, cell) packed int — a stray
+	# Vector3i key would corrupt across a crossing. Debug-only (asserts strip in release); the headless
+	# gate re-checks the whole overlay. FLAT/curved never trip this (FACETED is false there).
+	assert(not CubeSphere.FACETED or typeof(ek) == TYPE_INT,
+		"WorldManager._write_cell: a non-int edit key entered `_edits` under FACETED (FP-M1a §6.2)")
 	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
 		_meta[ek] = meta                         # the one write that (re)sets metadata
 	elif not _meta.is_empty():
@@ -1322,10 +1366,15 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
 			var yaw_delta := atan2(ex.z, ex.x)
 			TerrainConfig.set_active_facet(to)
+			# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
+			# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
+			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
+			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
+			_rebuild_window_indices()
 			# FP3b: the EDITABLE facet swaps to B — restream its (axis-aligned) voxel field via the M4 cover (a
 			# live VoxelTerrain can't be rotated, so only one facet is the editable/streamed field at a time), and
-			# rigidly RE-PLACE the far ring around the new frame (no regen — cached). Debris re-frame + edit-key
-			# migration are FP3b-3. The M4 handoff (_flip_settling) re-mirrors edits + releases the cover on ramp.
+			# rigidly RE-PLACE the far ring around the new frame (no regen — cached). Debris re-frame is FP-M1d.
+			# The M4 handoff (_flip_settling) releases the cover on ramp (render re-mirror is FP-M1c).
 			if _module_world != null and _module_world.has_method("set_facet"):
 				var old_mod_pos: Vector3 = _module_world.position
 				_module_world.call("set_facet", to, old_mod_pos)
@@ -1413,13 +1462,29 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	return true
 
 ## Rebuild the window-keyed PERF indices (`_edit_columns`, `_placed_top`) from the global-keyed
-## overlay after a home-face flip re-bases the window (§4.5). Every edit's global cell is unfolded
-## back into the current window; edits whose cell is not reachable in this window (far off-face)
-## simply do not index a column here — they re-index when the home face flips to their face. Keeps
-## the collider's fast-path gate + above-surface scan exact after the flip.
+## overlay after a home-face flip (curved) or a facet crossing (FACETED) re-bases the window (§4.5 /
+## FP-M1a §6.2). Every edit's global cell is unfolded back into the current window; edits whose cell
+## is not reachable in this window (far off-face / another facet) simply do not index a column here —
+## they re-index when the window returns to them. Keeps the collider's fast-path gate + above-surface
+## scan exact after the reframe.
 func _rebuild_window_indices() -> void:
 	_edit_columns = {}
 	_placed_top = {}
+	# FP-M1a: FACETED (no chart) — the active facet lattice IS the window, so keep this facet's edits and
+	# index them directly by their unpacked cell (x, z) / y high-water mark.
+	if CubeSphere.FACETED and _chart == null:
+		var active := TerrainConfig.active_facet()
+		for k in _edits.keys():
+			if FacetAtlas.edit_key_fid(k) != active:
+				continue
+			var cell: Vector3i = FacetAtlas.edit_key_unpack(k)[1]
+			var col := Vector2i(cell.x, cell.z)
+			_edit_columns[col] = true
+			if int(_edits[k]) > 0:
+				var prev: int = _placed_top.get(col, -0x40000000)
+				if cell.y > prev:
+					_placed_top[col] = cell.y
+		return
 	for k: int in _edits.keys():
 		var g := CubeSphere.unpack_key(k)
 		var win := _chart.window_of_global(int(g["face"]), int(g["i"]), int(g["j"]))
@@ -1580,19 +1645,25 @@ static func _floor_div(a: int, b: int) -> int:
 func save_edits(region_origin: Vector3i) -> ZoneChunk:
 	var zc := ZoneChunk.new()
 	var s := ZoneChunk.SIZE
+	# FP-M1a: iterate the overlay projected to Vector3i cells (FLAT: the live dicts by reference; FACETED:
+	# the ACTIVE facet's edits unpacked to their lattice cell — the region grid is in active-facet lattice).
+	var edits_v := _overlay_v3i()
+	var meta_v := _meta_v3i()
 	# Union of edited cells and metadata-bearing cells in the region (a metadata cell is
 	# always an edited block-entity cell today, but unioning is leak-proof regardless).
 	var cells := {}
-	for cell: Vector3i in _edits.keys():
+	for cell: Vector3i in edits_v.keys():
 		if _in_region(cell, region_origin, s):
 			cells[cell] = true
-	for cell: Vector3i in _meta.keys():
+	for cell: Vector3i in meta_v.keys():
 		if _in_region(cell, region_origin, s):
 			cells[cell] = true
 	for cell: Vector3i in cells.keys():
 		var local := cell - region_origin
 		var idx := ZoneChunk.local_index(local.x, local.y, local.z)
-		zc.set_cell(idx, cell_value_at(cell), _meta.get(cell, null))
+		zc.set_cell(idx, cell_value_at(cell), meta_v.get(cell, null))
+	if CubeSphere.FACETED and _chart == null:
+		zc.set_key_format(ZoneChunk.FIDCELL_V1)   # §6.3 fence: this region is keyed in active-facet lattice
 	return zc
 
 ## Apply a ZoneChunk's present cells back into the overlay at `region_origin`, routing every
@@ -1603,6 +1674,8 @@ func save_edits(region_origin: Vector3i) -> ZoneChunk:
 ## saving session did (VDS §10.1). An unknown name resolves to a logged placeholder material
 ## (never a crash, never data loss of the shape/state bits — §16).
 func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = Callable()) -> void:
+	if not _key_format_compatible(chunk.key_format()):
+		return
 	for idx: int in chunk.present_indices():
 		var name := chunk.material_name_at(idx)
 		var id := -1
@@ -1623,6 +1696,19 @@ static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 		and cell.y >= origin.y and cell.y < origin.y + s \
 		and cell.z >= origin.z and cell.z < origin.z + s
 
+## FP-M1a (§6.3): the save-format fence. A FACETED session loads only FIDCELL_V1 chunks/bundles; a
+## FLAT/curved session loads only legacy (unfenced) ones. A mismatch means the region indices are in a
+## different lattice frame than the loader expects (per-facet vs window/global), so refusing is the only
+## safe choice — it is a fence against a cross-mode misload, not a migration (none exist in the wild).
+func _key_format_compatible(fmt: String) -> bool:
+	var want := ZoneChunk.FIDCELL_V1 if (CubeSphere.FACETED and _chart == null) else ""
+	if fmt == want:
+		return true
+	push_error("WorldManager: refusing a '%s' key-format payload in a '%s' session (FP-M1a §6.3 fence)"
+		% ["fidcell-v1" if fmt == ZoneChunk.FIDCELL_V1 else "legacy",
+			"fidcell-v1" if want == ZoneChunk.FIDCELL_V1 else "legacy"])
+	return false
+
 # --- zone bundles: streamed material payloads (RMS §2.6/§3.4/§5) ----------------
 # The final piece of runtime material streaming: a ZoneBundle packages one or more regions'
 # edit overlay TOGETHER WITH the material documents the receiver needs (manifest), keyed by
@@ -1641,12 +1727,16 @@ static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 func save_bundle(regions: Array) -> ZoneBundle:
 	var bundle := ZoneBundle.new()
 	var s := ZoneChunk.SIZE
+	# FP-M1a: same Vector3i projection as save_edits (FLAT: live dicts; FACETED: active-facet edits).
+	var edits_v := _overlay_v3i()
+	var meta_v := _meta_v3i()
+	var faceted := CubeSphere.FACETED and _chart == null
 	for region_origin: Vector3i in regions:
 		var cells := {}
-		for cell: Vector3i in _edits.keys():
+		for cell: Vector3i in edits_v.keys():
 			if _in_region(cell, region_origin, s):
 				cells[cell] = true
-		for cell: Vector3i in _meta.keys():
+		for cell: Vector3i in meta_v.keys():
 			if _in_region(cell, region_origin, s):
 				cells[cell] = true
 		if cells.is_empty():
@@ -1659,7 +1749,9 @@ func save_bundle(regions: Array) -> ZoneBundle:
 			var local := cell - region_origin
 			zc.set_cell_keyed(ZoneChunk.local_index(local.x, local.y, local.z),
 				String(BlockCatalog.key_of(mat)), CellCodec.modifier(v), CellCodec.state(v),
-				_meta.get(cell, null))
+				meta_v.get(cell, null))
+		if faceted:
+			zc.set_key_format(ZoneChunk.FIDCELL_V1)   # §6.3 fence on every chunk of the bundle
 		bundle.add_chunk(region_origin, zc)
 	return bundle
 
@@ -1683,6 +1775,8 @@ func load_bundle(bundle: ZoneBundle) -> void:
 	for entry: Dictionary in bundle.chunks():
 		var region_origin: Vector3i = entry["origin"]
 		var chunk: ZoneChunk = entry["chunk"]
+		if not _key_format_compatible(chunk.key_format()):
+			continue                                 # FP-M1a §6.3 fence: skip a cross-mode chunk
 		for idx: int in chunk.present_indices():
 			var key := chunk.material_name_at(idx)
 			var lrid := int(key_to_lrid.get(key, -1))

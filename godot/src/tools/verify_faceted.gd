@@ -49,6 +49,7 @@ func _initialize() -> void:
 	_gate_near_radius()              # FP-S1(a)
 	_gate_block_early_out()          # FP-S1(b)
 	_gate_crossing_containment()     # FP-S1(c)
+	_gate_edit_key_global()          # FP-M1a G-M1-KEY
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -287,6 +288,166 @@ func _gate_crossing_containment() -> void:
 	_ok(midcross == 1, "FP-S1(c): a normal mid-edge crossing still succeeds (containment does not trap the player)")
 	w2.queue_free()
 	TC.set_active_facet(fid)
+
+# ---------------------------------------------------------------------------------------
+# G-M1-KEY (COSMOS-FP-M1-DESIGN §11 FP-M1a / §6.2) — the (fid, cell) GLOBAL edit key. Under FACETED the
+# edit overlay MUST key by (facet, lattice cell), never the active-lattice Vector3i: a Vector3i key
+# silently re-interprets after a crossing, so a block placed on facet A corrupts once B is active. This
+# gate places edits on BOTH sides of a seam, drives a REAL cross-and-return (A→B→A) through the existing
+# maybe_cross_facet path, and proves: (a) edits are stored under (fid,cell) int keys — NO Vector3i key
+# ever enters the overlay; (b) A-edits survive the round-trip byte-identical (same block id / packed
+# value); (c) A and B edits coexist without collision; (d) the window-keyed PERF indices re-derive ==
+# the incrementally-maintained ones; (e) the fidcell-v1 save fence tags faceted saves and refuses a
+# cross-mode (legacy) chunk.
+func _gate_edit_key_global() -> void:
+	var A := FA.spawn_facet()
+	var B: int = FA.seam_neighbour(A, 0)            # an edge neighbour — a mid-edge crossing lands contained
+	TC.set_active_facet(A)
+	var w := WorldManager.new(); w.name = "FEditKey"; get_root().add_child(w)
+
+	# --- A-side edits (active = A): dig the top cell, place STONE just above it ---
+	var s: Vector2i = TC.find_spawn()
+	var cxA := s.x; var czA := s.y
+	var topA := _top_solid(w, cxA, czA)
+	var dig_A := Vector3i(cxA, topA, czA)
+	var place_A := Vector3i(cxA + 2, topA + 1, czA)
+	var broke_A := w.break_terrain(dig_A) > 0
+	var placed_A := w.place_block(place_A, BlockCatalog.STONE)
+	var exp_dig_A := w.block_id_at(dig_A)           # 0 (air)
+	var exp_place_A := w.block_id_at(place_A)        # STONE material id
+	var pak_place_A: int = w._edits.get(FA.edit_key(A, place_A), -999)
+	var key_dig_A := FA.edit_key(A, dig_A)
+	var key_place_A := FA.edit_key(A, place_A)
+	_ok(broke_A and placed_A, "G-M1-KEY: A-side break+place succeed (active facet A=%d)" % A)
+	_ok(w._edits.has(key_dig_A) and w._edits.has(key_place_A),
+		"G-M1-KEY: A edits stored under (fid,cell) global keys")
+
+	# --- index parity on A: the incremental _edit_columns/_placed_top == a full re-derive ---
+	var inc_cols: Dictionary = w._edit_columns.duplicate()
+	var inc_top: Dictionary = w._placed_top.duplicate()
+	w._rebuild_window_indices()
+	_ok(_dict_eq(inc_cols, w._edit_columns) and _dict_eq(inc_top, w._placed_top),
+		"G-M1-KEY: incremental _edit_columns/_placed_top == full _rebuild_window_indices (A)")
+
+	# --- REAL crossing A→B through maybe_cross_facet ---
+	var rAB := _drive_cross_to(w, B)
+	_ok(bool(rAB.get("crossed", false)) and TC.active_facet() == B,
+		"G-M1-KEY: real crossing A→B via maybe_cross_facet (active=%d, want %d)" % [TC.active_facet(), B])
+	# A edits are UNTOUCHED and NOT re-interpreted in B's lattice: the (A,cell) key + value survive.
+	_ok(w._edits.has(key_place_A) and int(w._edits[key_place_A]) == pak_place_A,
+		"G-M1-KEY: the A edit's (A,cell) key + packed value are unchanged after the crossing")
+
+	# --- B-side edits (active = B): a placement in B's own lattice, on the OTHER side of the seam ---
+	var ccB := FA.centre_cell(B)
+	var cxB := ccB.x; var czB := ccB.y
+	var topB := _top_solid(w, cxB, czB)
+	var place_B := Vector3i(cxB, topB + 1, czB)
+	var placed_B := w.place_block(place_B, BlockCatalog.STONE)
+	var exp_place_B := w.block_id_at(place_B)
+	var key_place_B := FA.edit_key(B, place_B)
+	_ok(placed_B and w._edits.has(key_place_B), "G-M1-KEY: B-side edit stored under (B,cell) key")
+
+	# both A and B keys coexist; assert NO Vector3i key and every key decodes to A or B.
+	var all_int := true
+	var all_decode := true
+	var saw_a := false
+	var saw_b := false
+	for k in w._edits.keys():
+		if typeof(k) != TYPE_INT:
+			all_int = false
+			continue
+		var fid: int = FA.edit_key_fid(k)
+		if fid == A: saw_a = true
+		elif fid == B: saw_b = true
+		else: all_decode = false
+	_ok(all_int, "G-M1-KEY: NO Vector3i-keyed edit under FACETED (every overlay key is a packed int)")
+	_ok(all_decode and saw_a and saw_b,
+		"G-M1-KEY: A and B edits coexist under distinct (fid,cell) keys (no collision)")
+
+	# --- REAL return crossing B→A ---
+	var rBA := _drive_cross_to(w, A)
+	_ok(bool(rBA.get("crossed", false)) and TC.active_facet() == A,
+		"G-M1-KEY: real return crossing B→A via maybe_cross_facet (active=%d)" % TC.active_facet())
+	# THE round-trip assertion: every A edit resolves to the SAME block/value after A→B→A (byte-identical).
+	_ok(w.block_id_at(dig_A) == exp_dig_A and w.block_id_at(place_A) == exp_place_A
+			and int(w._edits.get(key_place_A, -999)) == pak_place_A,
+		"G-M1-KEY: A edits byte-identical after A→B→A round-trip (block ids + packed value unchanged)")
+
+	# --- cross A→B once more: the B edit survives the round-trip too ---
+	var rAB2 := _drive_cross_to(w, B)
+	_ok(bool(rAB2.get("crossed", false)) and w.block_id_at(place_B) == exp_place_B,
+		"G-M1-KEY: B edit byte-identical after the round-trip (seen again when B is active)")
+	TC.set_active_facet(A)
+	w.queue_free()
+
+	# --- §6.3 save fence: a faceted save tags fidcell-v1 (survives serialization); a legacy chunk is refused ---
+	var w2 := WorldManager.new(); w2.name = "FEditKeyFence"; get_root().add_child(w2)
+	var ro := WorldManager.region_origin_of(place_A)
+	w2.place_block(place_A, BlockCatalog.STONE)
+	var zc := w2.save_edits(ro)
+	_ok(zc.key_format() == ZoneChunk.FIDCELL_V1, "G-M1-KEY: faceted save_edits tags key_format = fidcell-v1")
+	var zc2 := ZoneChunk.from_bytes(zc.to_bytes())
+	_ok(zc2.key_format() == ZoneChunk.FIDCELL_V1, "G-M1-KEY: the fidcell-v1 fence survives to_bytes/from_bytes")
+	var w3 := WorldManager.new(); w3.name = "FEditKeyLoad"; get_root().add_child(w3)
+	w3.load_edits(ro, zc2)
+	_ok(w3.block_id_at(place_A) == exp_place_A, "G-M1-KEY: a fidcell-v1 chunk loads into a faceted session (cell restored)")
+	# a legacy (untagged) chunk is REFUSED by the faceted loader — the cell stays at its generated value.
+	var lp := place_A - ro
+	var legacy := ZoneChunk.new()
+	legacy.set_cell(ZoneChunk.local_index(lp.x, lp.y, lp.z), CellCodec.pack(BlockCatalog.STONE), null)
+	var w4 := WorldManager.new(); w4.name = "FEditKeyLegacy"; get_root().add_child(w4)
+	var before := w4.block_id_at(place_A)
+	w4.load_edits(ro, legacy)
+	_ok(w4.block_id_at(place_A) == before, "G-M1-KEY: the faceted loader REFUSES a legacy (unfenced) chunk (fence holds)")
+	w2.queue_free(); w3.queue_free(); w4.queue_free()
+	TC.set_active_facet(A)
+
+## G-M1-KEY helper: the topmost solid cell of column (cx, cz) in the ACTIVE facet (surface_y is the top
+## FACE, so scan down from a little above to the first solid cell — robust to snow/tree caps).
+func _top_solid(w: WorldManager, cx: int, cz: int) -> int:
+	var sy := int(round(w.surface_y(float(cx) + 0.5, float(cz) + 0.5)))
+	var top := sy + 4
+	while top > sy - 8 and w.block_id_at(Vector3i(cx, top, cz)) == 0:
+		top -= 1
+	return top
+
+## G-M1-KEY helper: drive maybe_cross_facet to cross from the CURRENT active facet onto `target`. Marches
+## straight down the gradient of `target`'s ridge own_dist from the facet centre (the plane is affine, so
+## the xz-gradient is a constant heading toward the ridge midpoint → a contained mid-edge crossing). Burns
+## the post-crossing cooldown naturally (each call decrements it while still interior). {} if no crossing.
+func _drive_cross_to(w: WorldManager, target: int) -> Dictionary:
+	var from_fid := TC.active_facet()
+	var slot := -1
+	for sl in range(4):
+		if FA.seam_neighbour(from_fid, sl) == target:
+			slot = sl
+			break
+	if slot < 0:
+		return {}
+	var cc := FA.centre_cell(from_fid)
+	var px := float(cc.x) + 0.5
+	var pz := float(cc.y) + 0.5
+	var py := w.surface_y(px, pz)
+	var d0 := FA.own_dist(from_fid, slot, px, py, pz)
+	var g := Vector2(FA.own_dist(from_fid, slot, px + 1.0, py, pz) - d0,
+		FA.own_dist(from_fid, slot, px, py, pz + 1.0) - d0)
+	g = g.normalized() if g.length() > 1e-9 else Vector2(1, 0)
+	for _step in range(4000):
+		px -= g.x * 0.5                            # −gradient: march toward (then past) the ridge
+		pz -= g.y * 0.5
+		py = w.surface_y(px, pz)
+		var r := w.maybe_cross_facet(Vector3(px, py, pz))
+		if bool(r.get("crossed", false)):
+			return r
+	return {}
+
+func _dict_eq(a: Dictionary, b: Dictionary) -> bool:
+	if a.size() != b.size():
+		return false
+	for k in a.keys():
+		if not b.has(k) or b[k] != a[k]:
+			return false
+	return true
 
 # FP3 — the junction bevel geometry is GENUINELY PER-FACET: seam orientations vary widely across facets (the
 # cube-sphere warp shears facets differently), so a single-manifest reuse across a crossing would crack/mis-tilt

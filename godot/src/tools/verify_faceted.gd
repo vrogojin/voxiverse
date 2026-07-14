@@ -46,6 +46,9 @@ func _initialize() -> void:
 	_gate_junction_mesh()
 	_gate_far_ring()
 	_gate_live_loop()
+	_gate_near_radius()              # FP-S1(a)
+	_gate_block_early_out()          # FP-S1(b)
+	_gate_crossing_containment()     # FP-S1(c)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -162,6 +165,128 @@ func _gate_live_loop() -> void:
 	_ok(to_fid >= 0 and TC.active_facet() == to_fid, "crossing: active facet switched to the neighbour (%d→%d)" % [fidx, to_fid])
 	TC.set_active_facet(fidx)                          # restore the spawn facet
 	w.queue_free()
+
+# FP-S1(a) — a facet must stream the CHEAP curved near radius (128), NOT the flat 256. FACETED requires FLAT_WORLD=true,
+# so the old `FLAT_WORLD ? 256 : 128` branch wrongly gave a facet the full 256 (≈4× the box, ~8× the per-column cost
+# per crossing restream). The fix routes FACETED to CURVED_RENDER_RADIUS_BLOCKS. (FLAT non-faceted byte-identity — the
+# 256 branch — is covered by the separate verify_feature.gd run with FACETED=false.)
+func _gate_near_radius() -> void:
+	var r := TC.near_render_radius()
+	_ok(r == TC.CURVED_RENDER_RADIUS_BLOCKS, "FP-S1(a): near_render_radius()=%d == CURVED_RENDER_RADIUS_BLOCKS(%d) under FACETED" % [r, TC.CURVED_RENDER_RADIUS_BLOCKS])
+	_ok(r == 128, "FP-S1(a): the faceted near radius is 128 blocks")
+	_ok(r != TC.RENDER_RADIUS_BLOCKS, "FP-S1(a): FACETED does NOT take the flat %d branch" % TC.RENDER_RADIUS_BLOCKS)
+
+# FP-S1(b) — the BLOCK-level facet-domain early-out (FacetAtlas.block_all_air) must be CONSERVATIVE: whenever it
+# returns true for a block, EVERY cell in that block masks to AIR under junction_modify (the per-cell mask the module
+# generator applies at its buffer-write exit). So skipping such a block emits byte-identical voxels (all air), just
+# faster. This gate sweeps block origins from deep interior out into foreign territory and asserts: (i) SOUNDNESS —
+# no block_all_air block contains any cell junction_modify would KEEP (deep-scanned, capped); (ii) the optimisation
+# actually FIRES (some wholly-foreign block is caught) and does NOT over-fire (an interior surface block is kept).
+func _gate_block_early_out() -> void:
+	var fid := FA.spawn_facet()
+	var lo: Vector2i = FA.dom_min(fid)
+	var hi: Vector2i = FA.dom_max(fid)
+	var full := CellCodec.pack(BlockCatalog.STONE, 0)      # a solid probe: junction_modify returns 0 ONLY via ridge masking
+	var BS := 8
+	var span_x := hi.x - lo.x
+	var span_z := hi.y - lo.y
+	var unsound := 0
+	var caught := 0
+	var deep := 0                                          # deep soundness scans done (capped for runtime)
+	var interior_kept := false
+	var ox := lo.x - span_x
+	while ox <= hi.x + span_x:
+		var oz := lo.y - span_z
+		while oz <= hi.y + span_z:
+			var cix := clampi(ox + BS / 2, lo.x, hi.x)
+			var ciz := clampi(oz + BS / 2, lo.y, hi.y)
+			var oy := int(TC.height_at(cix, ciz)) - BS / 2   # straddle the surface where content lives
+			if FA.block_all_air(fid, ox, oy, oz, BS, BS, BS, 1):
+				caught += 1
+				if deep < 40:                                # SOUNDNESS: no cell in a "wholly air" block may survive the mask
+					deep += 1
+					for x in range(BS):
+						for z in range(BS):
+							for y in range(BS):
+								if FA.junction_modify(fid, Vector3i(ox + x, oy + y, oz + z), full) != 0:
+									unsound += 1
+			elif ox >= lo.x and ox <= hi.x and oz >= lo.y and oz <= hi.y:
+				interior_kept = true                          # a domain-interior surface block is NOT skipped
+			oz += BS
+		ox += BS
+	_ok(unsound == 0, "FP-S1(b): block_all_air is SOUND — every skipped block's cells all mask to AIR (%d deep-scanned, 0 survivors)" % deep)
+	_ok(caught > 0, "FP-S1(b): the block-level early-out FIRES on foreign territory (%d blocks skipped)" % caught)
+	_ok(interior_kept, "FP-S1(b): an interior surface block is NOT wrongly skipped (early-out is conservative)")
+
+# FP-S1(c) — the crossing containment check + cooldown kill the near-corner ping-pong storm (§4-R3) WITHOUT trapping
+# the player. Three properties:
+#   (1) INVARIANT: any COMMITTED crossing lands CONTAINED — the reframed position is interior (own_dist >= −HYST) to
+#       ALL FOUR of the destination's ridges, so it can never itself immediately re-fire.
+#   (2) NO STORM: a STATIONARY player parked in a corner region (past ≥2 of the active facet's ridges) — the exact
+#       ping-pong trigger — crosses ≤1 time over many ticks (the fix defers the corner rather than B→C→B storming).
+#   (3) NO TRAP: a normal mid-edge crossing (a straight march past ONE ridge near an edge midpoint) still succeeds.
+func _gate_crossing_containment() -> void:
+	var fid := FA.spawn_facet()
+	var HYST := WorldManager.FACET_CROSS_HYST
+	var cc := FA.centre_cell(fid)
+	var w := WorldManager.new(); w.name = "FCrossContain"; get_root().add_child(w)
+	TC.set_active_facet(fid)
+	var y0 := w.surface_y(float(cc.x) + 0.5, float(cc.y) + 0.5)   # a representative feet height for the ridge planes
+	# (2) build a corner-region position: push a domain corner OUTWARD past the ridges until it is beyond ≥2 of them.
+	var lo: Vector2i = FA.dom_min(fid)
+	var hi: Vector2i = FA.dom_max(fid)
+	var corners := [Vector2(hi.x, hi.y), Vector2(hi.x, lo.y), Vector2(lo.x, hi.y), Vector2(lo.x, lo.y)]
+	var cpx := 0.0; var cpz := 0.0; var found := false
+	for corner in corners:
+		var dirx := signf(corner.x - float(cc.x))
+		var dirz := signf(corner.y - float(cc.y))
+		for push in [1.0, 3.0, 5.0, 8.0, 12.0]:
+			var qx: float = corner.x + dirx * push + 0.5
+			var qz: float = corner.y + dirz * push + 0.5
+			var past := 0
+			for slot in range(4):
+				if FA.own_dist(fid, slot, qx, y0, qz) < -HYST:
+					past += 1
+			if past >= 2:
+				cpx = qx; cpz = qz; found = true
+				break
+		if found:
+			break
+	_ok(found, "FP-S1(c): constructed a corner-region position (past ≥2 of the active facet's ridges)")
+	# stationary storm test: reframe after each cross (as the player does) but never MOVE. Count crossings + check
+	# every landing is contained.
+	var crossings := 0
+	var contain_violations := 0
+	var apx := cpx; var apz := cpz
+	for _call in range(40):
+		var apy := w.surface_y(apx, apz)
+		var res := w.maybe_cross_facet(Vector3(apx, apy, apz))
+		if res.get("crossed", false):
+			crossings += 1
+			var to := int(res["to"])
+			var np: Vector3 = res["new_pos"]
+			for bslot in range(4):
+				if FA.own_dist(to, bslot, np.x, np.y, np.z) < -HYST - 1e-4:
+					contain_violations += 1
+			apx = np.x; apz = np.z              # reframe into the new facet, but stay put (stationary)
+	_ok(crossings <= 1, "FP-S1(c): a STATIONARY corner player does not cross-storm (%d crossings over 40 ticks ≤ 1)" % crossings)
+	_ok(contain_violations == 0, "FP-S1(c): every committed crossing lands interior to ALL of B's ridges (no immediate re-fire)")
+	w.queue_free()
+	# (3) NO-TRAP: a normal mid-edge crossing still fires (straight +X march from centre → crosses the +X ridge once).
+	var w2 := WorldManager.new(); w2.name = "FCrossMid"; get_root().add_child(w2)
+	TC.set_active_facet(fid)
+	var mx := float(cc.x) + 0.5; var mz := float(cc.y) + 0.5
+	var midcross := 0
+	for _step in range(600):
+		mx += 1.0
+		var my := w2.surface_y(mx, mz)
+		var r := w2.maybe_cross_facet(Vector3(mx, my, mz))
+		if r.get("crossed", false):
+			midcross += 1
+			break
+	_ok(midcross == 1, "FP-S1(c): a normal mid-edge crossing still succeeds (containment does not trap the player)")
+	w2.queue_free()
+	TC.set_active_facet(fid)
 
 # FP3 — the junction bevel geometry is GENUINELY PER-FACET: seam orientations vary widely across facets (the
 # cube-sphere warp shears facets differently), so a single-manifest reuse across a crossing would crack/mis-tilt
@@ -373,12 +498,21 @@ func _gate_far_ring() -> void:
 	var maxtris := 6 * k * k * FacetFarRing.CELLS * FacetFarRing.CELLS * 2
 	_ok(tris > 0, "far ring: built %d triangles around the active facet" % tris)
 	_ok(tris < maxtris, "far ring: triangle count bounded by the all-facet cap (%d < %d, back-hemisphere culled)" % [tris, maxtris])
-	# FP3: set_active (crossing) re-places + re-emits from the vertex cache (no terrain re-sampling), producing
-	# a valid mesh for the neighbour frame — the cheap crossing re-placement the user asked for.
+	# FP3/FP-S1(d): set_active (crossing) rigidly re-places the planet (transform only) and DEFERS the re-emit off
+	# the crossing frame. It must NOT synchronously re-emit — the old mesh stays valid/placed until the deferred
+	# rebuild lands. force_rebuild() stands in for _process (headless frames aren't stepped).
 	var nb: int = FA.seam_neighbour(fid, 0)
+	var re0 := ring.reemit_count()
 	ring.set_active(nb)
-	_ok(ring.triangle_count() > 0, "far ring: set_active(neighbour %d) re-emits a valid mesh from cache" % nb)
+	_ok(ring.triangle_count() > 0, "far ring: set_active(neighbour %d) keeps a valid mesh (rigid re-place)" % nb)
+	_ok(ring.is_rebuild_pending(), "FP-S1(d): set_active marks a deferred rebuild (no synchronous full re-emit)")
+	_ok(ring.reemit_count() == re0, "FP-S1(d): set_active did NOT re-emit synchronously (reemit_count still %d)" % re0)
+	ring.force_rebuild()
+	_ok(ring.reemit_count() == re0 + 1 and not ring.is_rebuild_pending(), "FP-S1(d): the deferred rebuild completes exactly once")
+	_ok(not ring.is_emitted(nb), "FP-S1(d): the active facet %d is EXCLUDED from the re-emitted visible set" % nb)
+	_ok(ring.emitted_count() > 0 and ring.emitted_count() < 6 * k * k, "FP-S1(d): visible set non-empty and back-hemisphere culled (%d < %d)" % [ring.emitted_count(), 6 * k * k])
 	ring.set_active(fid)
+	ring.force_rebuild()
 	ring.queue_free()
 
 # FP2 Stage B2 — the junction mesh builder (§3.5.4). G-J2: ShapeMesh._build_junction's clipped vertices match

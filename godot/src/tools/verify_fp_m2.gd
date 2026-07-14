@@ -70,6 +70,17 @@ func _initialize() -> void:
 	_ok(ok_setup, "setup: module_world built the active-facet terrain + baked library")
 	if not ok_setup:
 		print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail]); quit(1); return
+	# This gate tests STANDALONE FacetLodMesher instances; the module's OWN mesher (created by setup under
+	# FP_M1_POOL) is not the subject. If left ticking through the gate's frame-stepping it floods its builder
+	# Thread with ℓ1 ring builds, and the end-of-gate teardown then blocks joining that Thread on an in-flight
+	# tile (hang under the gate's own worker-thread load). Shut it down UP FRONT — its builder is still idle
+	# here (no frame has ticked it yet), so this is instant — leaving it inert for the run. (module_world's
+	# shipped _exit_tree teardown is unchanged and separately correct.)
+	if mod.has_method("lod_mesher"):
+		var _mm = mod.call("lod_mesher")
+		if _mm != null:
+			_mm.call("shutdown")
+			print("  [setup] module-owned FacetLodMesher shut down (inert) — gate uses standalone instances")
 
 	# pick an edge-neighbour (shared ridge) and a cube-corner facet (singular-vertex-flanking).
 	var neighbour := -1
@@ -90,6 +101,17 @@ func _initialize() -> void:
 	await _gate_seam(mod, active)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
+	# Deterministic process teardown so headless EXITS (not just prints the tally). Under FP_M1_POOL the module
+	# world's OWN FacetLodMesher owns a builder Thread; if `mod` is never freed, quit() does not run its
+	# _exit_tree → that Thread stays parked in Semaphore.wait() forever, and a live GDScript Thread keeps the
+	# process alive (hang-at-quit). Freeing `mod` runs module_world._exit_tree → _lod_mesher.shutdown() →
+	# builder.shutdown() → the Thread wakes on _running=false and joins. (The sub-gate meshers already join their
+	# own threads via shutdown() on every path.)
+	if is_instance_valid(mod):
+		if mod.get_parent() != null:
+			mod.get_parent().remove_child(mod)
+		mod.free()
+	print("[verify_fp_m2] teardown complete — exiting %d" % (1 if _fail > 0 else 0))
 	quit(1 if _fail > 0 else 0)
 
 # ---------- G-M2-ID: LOD0 byte-identity ----------
@@ -324,7 +346,7 @@ func _gate_caps(mod: Node3D, active: int) -> void:
 			if m.covered_fids().has(x):
 				denied_untracked = false
 	_ok(denied_untracked, "G-M2-CAPS: every denied facet is absent from covered_fids() (quad stays — no hole)")
-	m.shutdown()
+	m.shutdown(); m.free()
 	# ---- LRU: never evict a WANTED facet to fund another WANTED one; evict non-wanted to fund a newcomer ----
 	var m2 = FLM.new()
 	get_root().add_child(m2)
@@ -359,7 +381,7 @@ func _gate_caps(mod: Node3D, active: int) -> void:
 		if m2.is_covered(x) or m2.is_building(x):
 			final_tracked += 1
 	_ok(final_tracked <= FLM.LOD_MAX_FACETS, "G-M2-CAPS: still ≤ facet cap after the LRU eviction (%d)" % final_tracked)
-	m2.shutdown()
+	m2.shutdown(); m2.free()
 
 # ---------- G-M2-SEAM: erosion zero-protrusion + the ridge apron (§7.5) ----------
 func _gate_seam(mod: Node3D, active: int) -> void:
@@ -383,7 +405,7 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 				B = nb; slotAB = slot; break
 	_ok(A >= 0 and B >= 0, "G-M2-SEAM: found an adjacent non-active LOD↔LOD pair (A=%d, B=%d)" % [A, B])
 	if A < 0 or B < 0:
-		m.shutdown(); return
+		m.shutdown(); m.free(); return
 	var owner: int = mini(A, B)
 	var nbr: int = maxi(A, B)
 	# owner's slot facing the neighbour
@@ -393,7 +415,7 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 			oslot = slot; break
 	_ok(oslot >= 0, "G-M2-SEAM: owner facet %d has slot %d facing neighbour %d" % [owner, oslot, nbr])
 	if oslot < 0:
-		m.shutdown(); return
+		m.shutdown(); m.free(); return
 	# build both sides at MIXED tiers (ℓ2 vs ℓ3 → s_max=8) so the apron spans a mixed-stride retreat gap on both
 	# sides (identical apron/erosion logic to ℓ1-vs-ℓ2; the coarser tiers keep the headless gate fast).
 	m.request(owner, 2)
@@ -401,7 +423,7 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 	var both: bool = await _drive_until(m, func(): return m.is_covered(owner) and m.is_covered(nbr), 120000)
 	_ok(both, "G-M2-SEAM: both sides built+applied (owner ℓ%d, nbr ℓ%d)" % [m.lod_of(owner), m.lod_of(nbr)])
 	if not both:
-		m.shutdown(); return
+		m.shutdown(); m.free(); return
 	# (a) zero protrusion: EVERY LOD megablock vertex is interior to all 4 of its facet's ridge planes (erosion).
 	var worst_prot := 1.0e18
 	for fid in [owner, nbr]:
@@ -448,7 +470,7 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 			# (c) spans BOTH sides of the retreat gap, and every apron vertex stays within the ±s_max window.
 			_ok(max_off > 0.5 and min_off < -0.5, "G-M2-SEAM(c): apron spans BOTH sides of the ridge (owner off=%.1f, nbr off=%.1f)" % [max_off, min_off])
 			_ok(max_perp <= float(s_max) + 0.75, "G-M2-SEAM(c): every apron vertex within the ±s_max window (max |off|=%.2f ≤ %d)" % [max_perp, s_max])
-	m.shutdown()
+	m.shutdown(); m.free()
 
 # ---------- helpers ----------
 func _drive_mesher(mesher, fid: int, timeout_ms: int) -> bool:

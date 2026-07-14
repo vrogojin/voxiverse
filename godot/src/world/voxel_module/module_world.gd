@@ -1265,6 +1265,84 @@ func _push_facet_carve() -> void:
 		"arid_count": _carve_count,
 	})
 
+# ============================ FP-R0 SPIKE (flag-gated: CubeSphere.FP_R0) ============================
+# The multi-facet rotation kill-shot (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §3, §8 FP-R0). All methods
+# below no-op unless CubeSphere.FP_R0 is on (sed-toggled by verify_fp_r0), so the shipped build is untouched.
+# They reuse THIS module's ONE baked VoxelBlockyLibrary and generator factory to build extra terrains, keeping
+# the frozen-epoch discipline (each terrain's worker reads its own frozen gen_facet, never a mutable global).
+
+## Build a SECOND VoxelTerrain homed on `neighbour_fid`, parented under a Node3D carrying that facet's REAL
+## orthonormal placement transform (det=+1), with its OWN VoxelMesherBlocky + OWN carve blob (the neighbour's
+## ridge planes) but the SAME shared baked library. Served by the same single global VoxelViewer (attach_viewer).
+## Returns {terrain, parent, mesher, generator, carve_enabled} or {} if unavailable. This proves godot_voxel
+## streams+meshes under a rigid rotation (the falsified "cannot be rotated" constraint).
+func spike_rotated_neighbour(neighbour_fid: int, view_blocks: int = 96) -> Dictionary:
+	if not CubeSphere.FP_R0 or _library == null or not ClassDB.class_exists("VoxelTerrain"):
+		return {}
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return {}
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	# The neighbour's OWN-side ridge planes into ITS OWN mesher carve blob (patch 0004, per-mesher). Guarded:
+	# an unpatched binary lacks set_facet_carve → the sentinels bake as plain cubes (full-cube lip, never a hole).
+	var carve_enabled := false
+	if mesher.has_method("set_facet_carve"):
+		if _carve_count > 0 and neighbour_fid >= 0:
+			mesher.call("set_facet_carve", {
+				"enabled": true,
+				"planes": FacetAtlas.seam_planes_f64(neighbour_fid),
+				"arid_base": _carve_base,
+				"arid_count": _carve_count,
+			})
+			carve_enabled = true
+		else:
+			mesher.call("set_facet_carve", {"enabled": false})
+	# OWN generator frozen on the NEIGHBOUR facet (the worker reads this immutable gen_facet, never _active_facet).
+	var generator: Object = _make_generator(neighbour_fid)
+	if generator == null:
+		return {}
+	var terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if terrain == null:
+		return {}
+	_set_if(terrain, "mesher", mesher)
+	_set_if(terrain, "generator", generator)
+	_set_if(terrain, "max_view_distance", view_blocks)
+	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "generate_collisions", false)
+	# The rotated parent: FacetAtlas.facet_transform(neighbour) is orthonormal det=+1 (verify_frame asserts it).
+	# The terrain streams an axis-aligned box in ITS OWN lattice; the parent rigidly rotates the rendered mesh
+	# blocks (§3.1). module_world sits at ZERO in faceted mode, so parent.global == facet_transform(neighbour).
+	var parent := Node3D.new()
+	parent.transform = FacetAtlas.facet_transform(neighbour_fid)
+	parent.add_child(terrain)
+	add_child(parent)
+	return {
+		"terrain": terrain, "parent": parent, "mesher": mesher,
+		"generator": generator, "carve_enabled": carve_enabled,
+	}
+
+## The shared baked VoxelBlockyLibrary (FP-R0: for a standalone build_mesh probe and neighbour meshers).
+func spike_library() -> Object:
+	return _library if CubeSphere.FP_R0 else null
+
+## A LOD-probe generator frozen on `facet_fid` with lod>0 stride sampling enabled (FP-R0 §B). NOT wired to any
+## terrain — the caller drives it directly via generate_block(buffer, origin, lod) + a mesher's build_mesh.
+func spike_lod_generator(facet_fid: int) -> Object:
+	return _make_generator(facet_fid, true) if CubeSphere.FP_R0 else null
+
+## The active-facet generator (FP-R0: to prove the neighbour field differs from the active field).
+func spike_active_generator() -> Object:
+	return _generator if CubeSphere.FP_R0 else null
+
+## The contiguous carve-sentinel ARID range [base, base+count) (FP-R0 diagnostics).
+func spike_carve_range() -> Vector2i:
+	return Vector2i(_carve_base, _carve_count) if CubeSphere.FP_R0 else Vector2i.ZERO
+
+# ========================== end FP-R0 SPIKE ==========================
+
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
 ## GDScript fallback had one, so a module flip left stale face-A meshes standing (COSMOS-AUDIT F3).
@@ -1712,7 +1790,12 @@ func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
 ## (a value-type Vector4, no allocation) per column and calls
 ## TerrainConfig.resolve_cell per cell, the exact functions the analytic queries
 ## use, so the module path and TerrainConfig.generated_block agree by construction.
-func _make_generator() -> Object:
+## `facet_override` (>= -1) freezes the epoch on a SPECIFIC facet instead of TerrainConfig.active_facet() —
+## the FP-R0 spike uses it to home a neighbour terrain's generator on a neighbour facet without mutating the
+## global active facet (the frozen-epoch discipline: the worker reads the frozen gen_facet, never a mutable
+## global). `lod_probe` publishes gen_lod_probe=true so lod>0 strides instead of early-returning (FP-R0 §B);
+## default false keeps the shipped generator's lod!=0 early-out — and at lod0 the stride is 1, byte-identical.
+func _make_generator(facet_override := -999, lod_probe := false) -> Object:
 	var src := """
 extends VoxelGeneratorScript
 
@@ -1754,6 +1837,7 @@ var gen_mwin_b := 0
 var gen_mwin_c := 0
 var gen_mwin_d := 1
 var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
+var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples at stride 2^lod (else early-out). Default false → shipped path unchanged; at lod0 stride==1 so byte-identical.
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -1770,8 +1854,14 @@ func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
 
 func _generate_block(buffer, origin_in_voxels, lod):
+	# FP-R0 §B stride: shipped path early-outs on lod!=0 (gen_lod_probe=false). The probe generator strides the
+	# LOD0 sampling by s=2^lod so a coarse buffer cell (x,y,z) reads LOD0 voxel (ox+x*s, oy+y*s, oz+z*s). At
+	# lod0 s==1 so every `*s` below is a no-op → byte-identical to the shipped generator (gated by verify_fp_r0).
+	var s = 1
 	if lod != 0:
-		return
+		if not gen_lod_probe:
+			return
+		s = 1 << lod
 	var size = buffer.get_size()
 	var ox = origin_in_voxels.x
 	var oy = origin_in_voxels.y
@@ -1805,7 +1895,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
 	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
 		return
-	if oy + size.y <= TerrainConfig.BEDROCK_FLOOR:
+	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
 		return
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
@@ -1833,7 +1923,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 		pcache = TerrainConfig.GenCtx.new(0, gen_facet) if gen_facet >= 0 else {}
 		for z in range(size.z):
 			for x in range(size.x):
-				var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
+				var p = TerrainConfig.column_profile(ox + x * s, oz + z * s, pcache)
 				profs[z * size.x + x] = p
 				if int(p.x) > max_h: max_h = int(p.x)
 	else:
@@ -1880,8 +1970,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			var wx
 			var wz
 			if flat_world:
-				wx = ox + x
-				wz = oz + z
+				wx = ox + x * s
+				wz = oz + z * s
 			else:
 				# The TRUE global column this voxel column folds to; restore its face for the nested
 				# smoothing/snow/tree stencil folds inside resolve_cell (COSMOS-AUDIT §3.2 items 2–3).
@@ -1895,7 +1985,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
-				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache, srun)
+				var wy = oy + y * s
+				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
 				if col_jinv != 0:
@@ -1906,7 +1997,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				# (mirrors WM.cell_value_at). Masks beyond-ridge cells to AIR (id==0 → skipped) and turns
 				# straddling cells into kind-2 partials. Frozen gen_facet (never _active_facet) → worker-safe.
 				if gen_facet >= 0:
-					v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, oy + y, wz), v)
+					v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, wy, wz), v)
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue
@@ -2084,7 +2175,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("flat_world", CubeSphere.FLAT_WORLD)
 	gen.set("gen_face", _gen_face)
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
-	gen.set("gen_facet", TerrainConfig.active_facet() if CubeSphere.FACETED else -1)   # FACETED §3.3: frozen facet epoch
+	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
+	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
 	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
 	gen.set("gen_mwin_a", int(_gen_mwin[0]))
 	gen.set("gen_mwin_b", int(_gen_mwin[1]))

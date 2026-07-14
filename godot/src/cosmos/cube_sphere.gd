@@ -47,6 +47,11 @@ const FACETED_SPIKE := false
 const FACETED := false
 ## COSMOS FACETED (§5) — the 8 grid-twist singularities (cube-vertex facets where the lattice cannot align). FP5.
 const FACET_TWIST := false
+## COSMOS FP-R0 (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §8) — the multi-facet rotation kill-shot SPIKE. When
+## true it unlocks module_world's spike_* methods (a rotated neighbour VoxelTerrain + a LOD-stride probe) used
+## ONLY by verify_fp_r0. Default OFF → shipped build byte-identical (the spike methods no-op, the generator's
+## lod>0 stride stays disabled). Requires FACETED = true. Never ship this on.
+const FP_R0 := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

@@ -128,10 +128,17 @@ const RENDER_RADIUS_BLOCKS := 256
 ## the rest seamlessly. FLAT_WORLD is unaffected (near_render_radius() returns the full 256).
 const CURVED_RENDER_RADIUS_BLOCKS := 128
 
-## THE near-field render radius the module viewer/terrain actually use: the full 256 in the flat world,
-## the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet. Flat callers get the byte-identical 256.
+## THE near-field render radius the module viewer/terrain actually use: the full 256 in the FLAT non-faceted
+## world, the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet AND on a facet. Flat callers get the byte-identical 256.
+## FP-S1(a) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 2 / §8): FACETED *requires* FLAT_WORLD=true, so
+## the old `FLAT_WORLD ? 256 : 128` branch wrongly streamed the full flat 256 on a facet — paying the ~8× curved
+## per-column cost across a ~4× larger box, i.e. the single biggest facet-crossing restream cost. A facet's near
+## field only needs the walk-around 128 (the far ring draws the rest), exactly like curved mode. FACETED=false
+## (the shipped default) still takes the 256 branch → byte-identical.
 static func near_render_radius() -> int:
-	return RENDER_RADIUS_BLOCKS if CubeSphere.FLAT_WORLD else CURVED_RENDER_RADIUS_BLOCKS
+	if CubeSphere.FLAT_WORLD and not CubeSphere.FACETED:
+		return RENDER_RADIUS_BLOCKS
+	return CURVED_RENDER_RADIUS_BLOCKS
 
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
 ## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the

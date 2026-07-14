@@ -101,6 +101,8 @@ var _next_arid := 0                     # next free library model index / ARID t
 const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
+var _gen_script_cache: GDScript = null   # FP-S1(e): the generator SOURCE compiled once (the src literal is constant —
+                                         # facet/lod/frame are per-instance properties), reused across restreams/crossings
 
 # --- snow-cap state variant table (M1 snowy-world ADR §5) -----------------------
 # A PARALLEL per-state frozen table (the liquid-twin discipline), NOT a re-keyed _gen_arid: for
@@ -1915,6 +1917,15 @@ func _generate_block(buffer, origin_in_voxels, lod):
 		return
 	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
 		return
+	# FP-S1(b) COSMOS FACETED (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §5(a)/§8) — BLOCK-level facet-domain
+	# early-out, BEFORE the per-column profile pass. junction_modify() (the buffer-write exit below) masks every
+	# beyond-ridge cell to AIR one at a time — but only AFTER this block pays the full column-profile + resolve_cell
+	# work. On a facet the near box overlaps foreign territory, so whole blocks generate nothing but masked air.
+	# block_all_air() is the exact per-cell mask's supremum over the block: true ONLY when a single ridge alone
+	# masks every cell (never skips a block with any interior/straddle cell → identical voxels emitted, just faster).
+	# Gated by gen_facet >= 0 (faceted only) → flat / non-faceted byte-identical. Frozen gen_facet → worker-safe.
+	if gen_facet >= 0 and FacetAtlas.block_all_air(gen_facet, ox, oy, oz, size.x, size.y, size.z, s):
+		return
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
 	# noise sampling and no allocation.
@@ -2163,13 +2174,20 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
 """
-	var gen_script := GDScript.new()
-	gen_script.source_code = src
-	var err := gen_script.reload()
-	if err != OK:
-		push_warning("[module_world] generator compile failed: %d" % err)
-		return null
-	var gen: Object = gen_script.new()
+	# FP-S1(e) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 4 note / §8): `src` is a CONSTANT literal —
+	# the facet epoch, lod-probe flag, frame M_win and all frozen tables are set as INSTANCE properties below, never
+	# baked into the source. So compiling it (the ~expensive GDScript.reload() parse) on EVERY restream/crossing was
+	# pure waste. Compile ONCE, cache the compiled class, and instantiate a fresh generator per epoch. The compiled
+	# class carries no per-epoch state (all state is instance vars set on `gen`), so reuse is byte-identical.
+	if _gen_script_cache == null:
+		var gen_script := GDScript.new()
+		gen_script.source_code = src
+		var err := gen_script.reload()
+		if err != OK:
+			push_warning("[module_world] generator compile failed: %d" % err)
+			return null
+		_gen_script_cache = gen_script
+	var gen: Object = _gen_script_cache.new()
 	# Publish the frozen tables to the worker-side generator (read-only from here on).
 	gen.set("cube_arid", _cube_arid)
 	gen.set("gen_arid", _gen_arid)

@@ -158,6 +158,19 @@ static func _build_junction(modifier: int) -> Dictionary:
 		_emit_polygon(arr, f["poly"], f["normal"])
 	return arr
 
+## COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md) — the multi-plane cube-clip REFERENCE the C++ mesher
+## transcribes 1:1 (patch 0004). Given the LOCAL cell planes (each [A, B, C, base]; own_local(u) =
+## A·ux + B·uy + C·uz + base ≥ 0 is the interior half-space — the exact form junction_prism_verts builds),
+## fold the unit cube through _clip_solid once per plane. A single plane reproduces _build_junction's
+## single-plane clip exactly (identical body); ≥ 2 planes clip CORNER cells correctly because _clip_solid
+## re-clips every face it is handed, INCLUDING previously-added caps (cap-of-cap). Returns the surviving
+## face list [{poly: [Vector3…] CCW, normal: Vector3}]; degenerate faces are dropped by _clip_solid.
+static func build_carve_faces(local_planes: Array) -> Array:
+	var faces := _unit_cube_faces()
+	for pl: Array in local_planes:
+		faces = _clip_solid(faces, pl)
+	return faces
+
 # The 6 faces of the unit cube as {poly: [Vector3 ×4 CCW], normal: Vector3 outward}.
 static func _unit_cube_faces() -> Array:
 	var v := [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1),

@@ -327,6 +327,13 @@ static func own_dist(fid: int, slot: int, x: float, y: float, z: float) -> float
 	var b := fid * 16 + slot * 4
 	return _seam_plane[b] * x + _seam_plane[b + 1] * y + _seam_plane[b + 2] * z + _seam_plane[b + 3]
 
+## COSMOS FP-CARVE — the 4 own-side ridge planes of `fid` as a raw f64 16-slice: slot 0..3 × (A,B,C,D),
+## LATTICE coords (own(x,y,z) = A·x + B·y + C·z + D ≥ 0 interior). The f64 accessor the carve mesher blob
+## needs — seam_plane() returns a Vector4 (f32) that loses ~2e-4 at |lattice| ~ 3e4 (the decorrelation
+## offset O ∈ [−32768, 32768] pushes |D| ~ 3e4). Pure/frozen atlas data → worker-safe.
+static func seam_planes_f64(fid: int) -> PackedFloat64Array:
+	return _seam_plane.slice(fid * 16, fid * 16 + 16)
+
 ## Classify the unit CELL (integer x,y,z) against this facet's 4 ridge planes (§3.5.1). Returns
 ## {"air": bool, "straddle": PackedInt32Array of slots}. air ⇒ the cube lies wholly beyond some ridge (the FP2
 ## domain mask); empty straddle & not air ⇒ interior full cell; non-empty straddle ⇒ a junction cell clipped by

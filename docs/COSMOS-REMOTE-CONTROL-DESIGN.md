@@ -65,7 +65,9 @@ Phase 2 is **gated on not letting control ride the observe token**: the shared P
 grants OBSERVE only. Control requires a **separate, per-session, short-TTL grant** with **explicit
 in-game re-consent** when the badge upgrades to CONTROLLING (task #113). §6 designs that grant as
 an in-game human consent handshake (the human at the keyboard *is* the second factor), plus TTL,
-caps, and instant override.
+caps, and instant override. **§9 (2026-07-15) completes #113**: the grant additionally proves
+knowledge of a separate host-side CONTROL secret (nonce-bound HMAC), so control cryptographically
+cannot ride the observe token.
 
 ---
 
@@ -413,13 +415,13 @@ forged downlink results. Three relay-side rules close this:
    to); a forged event from any other socket is dropped and audited (`result_forged`) — it never
    touches `control/results/<seq>/`.
 
-**Residual (documented, out of F1 scope):** the relay cannot itself verify a *human* clicked Allow —
-it trusts that `control_state:granted` came from a consented game (the human at the keyboard is the
-game-side second factor, §6.1). So a token-holding attacker who wins the *first* grant race (before
-any legit human consents) can receive the agent's commands; the human consent gate lives game-side,
-and the shared-token limitation is what task #113 ultimately removes by not letting control ride the
-observe token (a future per-session control credential). F1 bounds the damage: no result poisoning,
-no stealing a standing grant, no grant without a real relay offer.
+**Residual (documented, out of F1 scope — CLOSED by §9/#113):** the relay cannot itself verify a
+*human* clicked Allow — it trusts that `control_state:granted` came from a consented game (the human
+at the keyboard is the game-side second factor, §6.1). So a token-holding attacker who wins the
+*first* grant race (before any legit human consents) can receive the agent's commands; the human
+consent gate lives game-side. F1 bounds the damage: no result poisoning, no stealing a standing
+grant, no grant without a real relay offer. **§9 removes the residual itself**: a grant additionally
+requires an HMAC proof of a separate CONTROL secret the observe-token holder does not have.
 
 ### 5.3 Game socket stays outbound-dial; auth model unchanged for observe
 
@@ -469,10 +471,12 @@ The Phase-1 token only ever grants OBSERVE. The control grant is **created in-ga
    frees the executor, badge drops back to *observing*, relay stops forwarding. Renewal = a fresh
    offer + a fresh human click. No silent renewals, ever.
 
-The human at the keyboard is the second factor; there is deliberately **no second typed token**
-(nothing to phish, nothing to leak in logs) — possession of the machine + explicit click is
-strictly stronger, and it satisfies #113's "server-issued per-session short-TTL grant" via the
-relay's `granted(expiry, grant_id)` state.
+~~The human at the keyboard is the second factor; there is deliberately **no second typed token**~~
+**SUPERSEDED by §9 (#113, 2026-07-15):** the click alone is only a *game-side* factor — the relay
+cannot verify it, which left the first-grant-race residual (§5.2). §9 adds a second, typed-once
+CONTROL secret whose HMAC proof accompanies the grant; the human click AND the proof are now both
+required. The "nothing to leak in logs" property is preserved: the secret itself never crosses the
+wire — only a nonce-bound HMAC does.
 
 ### 6.2 Persistent indicator
 
@@ -691,3 +695,217 @@ explicit sign-off.
 Combined posture: a persistent, full-agency grant that the human can hard-revoke at any keystroke,
 with re-authorization required to resume. Control still only goes LIVE at P4 (§7) after a security
 review + /steelman + explicit user sign-off.
+
+---
+
+## 9. #113 — Per-session control credential (control NEVER rides the observe token)
+
+**Status: DESIGN 2026-07-15 — closes the §5.2 F1 residual; supersedes §6.1's "no second typed
+token" claim.** This is the last gate before go-live named by the adversarial audit.
+
+### 9.0 The residual, restated precisely
+
+The observe token is a **shared, multi-use secret carried in the page URL** (`?remote=<TOKEN>`,
+`remote_bridge.gd dial_config`). Anyone holding it can auth a socket. The F1 nonce gate
+(`relay.mjs onControlState` / `nonceOk` / `offerControlToAll`) proves a `granted` came from a
+socket that *received a real offer* — but every authed socket receives an offer
+(`offerControlToAll` loops **all** authed, ungranted sockets), each with its own nonce. So a
+malicious client holding only the observe token can, when the agent drops an outbox command,
+**auto-echo its own nonce with no human present** and win the *first* grant race — receiving the
+agent's command stream (a hijack of the agent's control session; the game-side consent double-gate
+still prevents driving a non-consenting human). The relay cannot verify a human clicked Allow.
+
+**The fix:** a grant must additionally prove knowledge of a **CONTROL secret** that an
+observe-token holder does not have. Nonce (F1) **AND** proof (#113) both required.
+
+### 9.1 The credential: a second host secret, distinct from the observe token
+
+| Property | Value |
+|---|---|
+| Source | `REMOTE_BRIDGE_CONTROL_TOKEN` env, else `tools/remote-bridge/.control-token` (gitignored, sibling of `.token`) — exact `loadToken()` idiom |
+| Generation | owner runs e.g. `openssl rand -hex 24 > tools/remote-bridge/.control-token` (≥ 24 random bytes) |
+| Distribution | **never in any URL, never in localStorage by default, never on the wire in any form.** The owner (who runs the agent on this host) reads the file and **types it into the consent modal** (web), or sets `VOXIVERSE_REMOTE_CONTROL_TOKEN` for native/dev prefill |
+| Fail-CLOSED | control secret unset ⇒ the relay **disables control entirely**: `offerControlToAll` no-ops, every `granted` is refused (`no_control_secret`), held/new outbox files are rejected `control_disabled`. Observe is untouched. Logged once loudly at boot |
+| Distinctness enforced | if the control secret **equals** the observe token, control is disabled exactly as if unset (loud log) — an owner cannot accidentally collapse the two factors into one |
+
+The relay never stores the secret anywhere but process memory; the game keeps it **RAM-only** in
+the `RemoteBridge` node for the bridge's lifetime (cleared on deactivate/`_exit_tree`), so D2
+re-consent after an override is one click, not a retype. The **only** persistent copies are the
+host file and — solely under explicit unattended opt-in — the §9.4 localStorage entry.
+
+### 9.2 The grant proof — nonce-bound HMAC, never the secret itself
+
+The game proves knowledge without transmitting the secret and without producing anything replayable
+on another socket:
+
+```
+proof = hex( HMAC-SHA256( key = control_secret,
+                          msg = "vxv-ctl-grant.v1\n" + grant_nonce ) )
+```
+
+- `grant_nonce` is the existing F1 relay-minted, per-socket, CSPRNG nonce from `control_offer`.
+  The version prefix domain-separates the MAC (nothing else in the protocol may HMAC this key).
+- Game side: `Crypto.hmac_digest(HashingContext.HASH_SHA256, key, msg)` (Godot ≥ 3.2; no JS).
+- Wire: `control_state:granted` carries **both** `grant_nonce` (F1 echo, unchanged) and
+  `grant_proof` (new). Relay validates `nonceOk(...)` **then** `proofOk(...)` — `proofOk`
+  recomputes the HMAC from its own copy of the secret + the nonce **it minted for that socket**
+  and compares with the same double-SHA256 `timingSafeEqual` idiom as `tokenOk`/`nonceOk`.
+- **Replay/leak resistance:** the proof is bound to one socket's nonce. A different socket has a
+  different nonce (its offer travels only on its own wss link), so a captured/forged proof never
+  validates elsewhere; after a re-mint the old proof is dead on the same socket too. The secret
+  itself never appears on the wire, in URLs, in nginx logs, or in `audit.log` (the relay logs
+  `bad_proof`, never the received proof value).
+- **Attacker closure:** an observe-token-only socket receives offer + nonce but must produce
+  `HMAC(control_secret, nonce)` — a 256-bit forgery without the key. The first-grant race is over.
+
+`grant_id` stays exactly what it is today: a game-generated opaque **correlator** (echoed on
+`cmd_ack`), never a credential. It is deliberately NOT folded into the MAC — wss provides channel
+integrity; keeping the MAC input minimal keeps the proof independently testable.
+
+### 9.3 Grant acknowledgement — `control_result` (keeps the badge honest)
+
+Today the game sets `_control_state = "granted"` **optimistically** when it sends
+`control_state:granted` (`grant_control()`), and the relay never answers. With #113, refusal
+becomes a *legitimate runtime path* (typo'd key, rotated `.control-token`, stale stored secret), so
+silence would leave a lying "CONTROL ACTIVE" badge on a grant the relay refused. New relay→game
+message, added to the §3.1 dispatch whitelist:
+
+```jsonc
+{ "type": "control_result", "accepted": true }                     // grant armed relay-side
+{ "type": "control_result", "accepted": false, "reason": "bad_proof|no_control_secret|already_held" }
+```
+
+Game handling: on `accepted:false` → clear the local grant (`_control_state = "none"`, free the
+executor), and if this was an unattended re-arm, **fall back to the attended modal** (the stored
+secret is stale — the human re-types the rotated key, which then refreshes storage). The badge only
+shows CONTROL once `accepted:true` arrives. (Belt-and-braces: the relay's forward gate never
+depended on the game's belief, so even without this message the refusal was safe — this is honesty,
+not enforcement.)
+
+### 9.4 Consent UX + the UNATTENDED interaction (the subtle part)
+
+**Attended (typed once per session).** The §6.1 consent modal gains one field: a `secret=true`
+`LineEdit` labelled "Control key (from the host operator)". Allow is disabled while empty. On
+Allow, the activator hands the key to the bridge (`grant_control(gid, unattended, key)`); the
+bridge keeps it RAM-only (§9.1) so subsequent D2 re-consents within the session are click-only.
+Native/dev: prefilled from `VOXIVERSE_REMOTE_CONTROL_TOKEN`. Typed-per-session is the right
+default: the marginal friction is one paste per play session, and it keeps zero persistent
+browser-side secret in the normal (attended) case.
+
+**Unattended re-arm needs the secret to survive a reload.** §6.6 re-arms after `reload` with no
+human — but a fresh proof for the *new* socket's *new* nonce requires the control secret, and a
+reload destroys the game process's RAM. Three options were weighed:
+
+- **(a) Store the raw control secret in localStorage on unattended opt-in** — keyed alongside the
+  existing `unattended_id` under the `sha256(observe token)`-derived key (§6.6/F3). **CHOSEN.**
+- **(b) Relay-issued long-lived unattended credential** after the first human+proof-verified
+  grant. Rejected: the issued credential must *itself* live in localStorage to survive the reload,
+  so the browser-side exposure is **identical** to (a) — while adding exactly the stateful
+  relay-side registry the audit already rejected (a relay restart silently breaks every re-arm;
+  persisting the registry to disk repairs restarts but adds a second credential store plus
+  issuance/expiry/rotation machinery, buying only finer-grained server-side revocation that (a)
+  already gets via `.control-token` rotation).
+- **(c) Unattended only within an already-attended session.** Rejected: a reload IS a new page —
+  RAM is gone, so (c) cannot produce a proof after reload at all; it forbids the deploy→reload→
+  re-test loop that is unattended mode's entire purpose.
+
+**(a), precisely:** on "Enable UNATTENDED" the activator stores
+`JSON {"uid": <unattended_id>, "ck": <control_secret>}` at the existing
+`vxv_unattended_<sha256(token)[:16]>` key (same-origin localStorage; the storage key still never
+contains the secret token). Boot re-arm (`_load_unattended`) recovers both, arms the bridge, and
+the next `control_offer`'s fresh nonce gets a fresh proof — **no relay state, so relay restarts
+are harmless** (the audit's registry objection is answered structurally: the trust anchors remain
+token-auth + minted nonce + proof, all stateless per-offer). Esc / the revoke chord / `_deactivate`
+clear the entry exactly as today (`_clear_unattended`).
+
+**Residual of (a), stated honestly:** same-origin XSS or local disk/profile access on the OWNER's
+machine can exfiltrate the stored control secret. Bounded because: (i) unattended is an explicit,
+loudest-modal, owner-machine opt-in for a DEV/TEST loop — the modal text must say the key will be
+stored in this browser until revoked; (ii) the game page serves only our own Godot export (no
+third-party script surface), and a same-origin XSS could already puppet the session directly —
+the *new* capability a stolen secret adds is hijacking the agent's command stream from another
+socket, which (iii) `.control-token` rotation kills instantly and fail-closed (the stored copy just
+stops proving; the game falls back to the attended modal via §9.3). Attended sessions store
+nothing, ever.
+
+### 9.5 Threat closure + non-regression matrix
+
+| Property | Status under #113 |
+|---|---|
+| First-grant race by observe-token-only socket | **CLOSED** — offer+nonce received, but `grant_proof` unforgeable without the control secret; relay refuses `bad_proof`, audits, sends `control_result:refused` |
+| Grant race by observe-token + *stolen control secret* | Out of scope by definition (possession of both credentials IS authorization); mitigated by rotation + attended-mode-stores-nothing |
+| Command ingress | UNCHANGED — host filesystem `control/outbox/` only (§5.1); the proof gates grants, not ingress |
+| Game-side human double-gate | UNCHANGED — modal still required for attended; unattended still its own louder opt-in (§6.6) |
+| F1 protections (nonce, no-supersede, result tagging) | UNCHANGED and still required — proof is an additional AND-gate inside the same `granted` handler |
+| `CONTROL_ENABLED := false` byte-identity | UNCHANGED — every new field/handler sits behind the existing gate; the modal (and its new field) never exists with the flag off |
+| Control secret unset relay-side | **FAIL-CLOSED** — no offers, all grants refused, outbox rejected `control_disabled`; observe unaffected |
+| Secret hygiene | never on the wire (HMAC only), never in URLs/nginx logs/audit.log, RAM-only game-side except explicit unattended opt-in |
+| Relay restart during unattended loop | Harmless — no relay-side grant/credential state; next offer re-mints, stored secret re-proves |
+
+### 9.6 Implementation plan (for the implementer)
+
+**`tools/remote-bridge/relay.mjs`**
+1. `loadControlToken()` beside `loadToken()` (env `REMOTE_BRIDGE_CONTROL_TOKEN` → `.control-token`
+   file → `''`). `const CONTROL_TOKEN`; `const CONTROL_AVAILABLE = !!CONTROL_TOKEN &&
+   CONTROL_TOKEN !== TOKEN` — log the disabled reason once at boot (unset vs equal-to-observe).
+2. `proofOk(candidate, nonce)`: `createHmac('sha256', CONTROL_TOKEN).update('vxv-ctl-grant.v1\n'
+   + nonce).digest('hex')`, then the existing double-SHA256 `timingSafeEqual` idiom vs `candidate`.
+3. `onControlState` `granted` case: after the F1 `nonceOk` check and before no-supersede, add
+   `if (!CONTROL_AVAILABLE) → refuse 'no_control_secret'`; `if (!proofOk(msg.grant_proof,
+   conn.grantNonce)) → refuse 'bad_proof'`. On every refusal AND on acceptance send the §9.3
+   `control_result`. Never log the received proof.
+4. `offerControlToAll`: `if (!CONTROL_AVAILABLE) return;`. `dispatchOrHold`/`pollOutbox` path:
+   reject (not hold) files with `control_disabled` when `!CONTROL_AVAILABLE`.
+
+**`godot/src/net/remote_bridge.gd`** (all inside `CONTROL_ENABLED` paths)
+5. `var _control_secret := ""` RAM-only; param on `grant_control(grant_id, unattended,
+   control_secret)`; cleared in `_exit_tree`/`revoke_control`/`deny_control` teardown paths
+   (kept across override/suspend so unattended auto-resume can re-prove).
+6. `_send_control_state("granted", …)`: attach `grant_proof` computed via
+   `Crypto.hmac_digest(HashingContext.HASH_SHA256, _control_secret.to_utf8_buffer(),
+   ("vxv-ctl-grant.v1\n" + _grant_nonce).to_utf8_buffer()).hex_encode()`.
+7. Dispatch whitelist += `control_result`; handler per §9.3 (on refused: drop local grant, free
+   executor, and emit a new `control_denied_relay` signal/phase so the activator can re-open the
+   attended modal when the refusal killed an unattended re-arm).
+8. Unattended auto-resume (`_control_tick`) and `arm_unattended_rearm` carry the secret alongside
+   the uid.
+
+**`godot/src/net/remote_bridge_activator.gd`**
+9. Consent modal (§6.1/§6.6 builders): add the `secret=true` "Control key" `LineEdit`; disable
+   Allow/Enable while empty; prefill from `VOXIVERSE_REMOTE_CONTROL_TOKEN` on native and from the
+   bridge's RAM copy on re-consent. Unattended modal text gains: "The control key will be STORED
+   in this browser until you revoke."
+10. `_store_unattended`/`_load_unattended`/`_clear_unattended`: value becomes the §9.4 JSON
+    (`uid` + `ck`); same key derivation, same clear paths.
+
+**`tools/remote-bridge/smoke.mjs`** (relay spawned with `REMOTE_BRIDGE_CONTROL_TOKEN` set)
+11. `makeFakeGame` gains `grantWithProof(controlToken)` computing the real HMAC; existing
+    positive-path tests switch to it.
+12. **The #113 assertion (the whole point):** a fake game that auths with ONLY the observe token,
+    receives `control_offer`, and echoes the correct `grant_nonce` with (i) no `grant_proof` and
+    (ii) a wrong `grant_proof` → assert the grant is refused (`control_result accepted:false
+    reason=bad_proof` received; command NEVER forwarded — `gotSeq` false; file still held then
+    staleness-rejected; `audit.log` contains `grant_rejected … bad_proof`).
+13. Fail-closed test: relay spawned WITHOUT the control token → assert no `control_offer` is ever
+    sent and the outbox file lands in `rejected/` with `control_disabled`; observe telemetry still
+    flows. Plus: relay spawned with control token == observe token behaves identically.
+14. Rotation/fallback test: valid grant, then simulate a stale key by granting again on a new
+    socket with a proof from a different key → refused; original semantics intact.
+
+**Docs:** this section; `README.md` security model gains the two-secret table (§9.1).
+
+**Flag-gating:** everything game-side stays behind `CONTROL_ENABLED := false` until P4. Relay-side
+#113 code ships inert-by-default too: with no `.control-token` the relay is fail-closed (§9.1), so
+deploying the relay first is safe against live Phase-1 clients.
+
+**Phase placement:** relay half (items 1–4, 11–14) is a P1 amendment; game half (5–10) lands with
+P2. P4's steelman explicitly re-attacks the grant gate with the §9.5 matrix.
+
+### 9.7 Open decisions for the user
+
+- **D6 — unattended storage consent wording:** §9.4(a) stores the raw control key in localStorage
+  on unattended opt-in. Accept the stated residual, or require typed-key-per-reload (which kills
+  fully-unattended reload loops)? Design recommends accepting with the rotation story.
+- **D7 — control-key rotation cadence:** `.control-token` is until-revoked by default. Rotate per
+  dev campaign, or add an optional relay-side max-age warning? (No enforcement proposed — rotation
+  is one shell command.)

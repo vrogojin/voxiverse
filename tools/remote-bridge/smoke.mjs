@@ -17,12 +17,20 @@
 import { spawn } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { mkdtempSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, readdirSync } from 'node:fs';
+import { createHmac } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TOKEN = 'smoke-secret-' + Math.random().toString(36).slice(2);
+// #113: the CONTROL credential — a SECOND secret, DISTINCT from the observe TOKEN. A valid grant must
+// prove knowledge of it (nonce-bound HMAC). The main relay below is spawned with it set.
+const CONTROL_TOKEN = 'smoke-control-' + Math.random().toString(36).slice(2);
+// The grant proof the real game computes: hex(HMAC-SHA256(control_secret, "vxv-ctl-grant.v1\n" + nonce)).
+function grantProof(controlToken, nonce) {
+  return createHmac('sha256', controlToken).update('vxv-ctl-grant.v1\n' + nonce).digest('hex');
+}
 const PORT = 8100 + Math.floor(Math.random() * 800);
 const RESULTS = mkdtempSync(join(tmpdir(), 'vox-relay-smoke-'));
 const CONTROL = join(RESULTS, 'control');
@@ -76,17 +84,26 @@ async function waitFor(fn, timeoutMs = 4000, stepMs = 100) {
 // A fake game client that emulates the rover for control tests.
 //   opts.autoRun: on receiving a cmd_seq, echo ack + per-step events + shot + seq_done (default true).
 //   It records every received cmd_seq in `received` and control_offers in `offers`.
-function makeFakeGame(tag) {
+function makeFakeGame(tag, opts = {}) {
+  const url = opts.url || URL;
+  const token = opts.token || TOKEN;
+  const controlToken = opts.controlToken || CONTROL_TOKEN;   // #113: the secret this game proves knowledge of
   const g = {
-    ws: null, authed: false, received: [], offers: [], pings: 0, revokes: [],
+    ws: null, authed: false, received: [], offers: [], pings: 0, revokes: [], results: [],
     autoRun: true, holdSeq: null,   // holdSeq: a seq to ACK but NOT finish (simulate a long run)
     lastNonce: '',                  // F1: the relay-minted grant_nonce from the most recent control_offer
     answerPings: true,              // F2: set false to stop ponging → trip the relay's ping-timeout revoke
+    controlToken,                   // exposed so tests can flip to a WRONG key (rotation/fallback, §9.4)
     sendRaw(obj) { g.ws.send(JSON.stringify(obj)); },
-    // A proper grant ECHOES the minted nonce (F1) — the real game does this from control_offer.
-    grant(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce })); },
+    // A proper grant ECHOES the minted nonce (F1) AND carries a valid grant_proof (#113) — exactly what
+    // the real game does from control_offer + its RAM control secret.
+    grant(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce, grant_proof: grantProof(g.controlToken, g.lastNonce) })); },
     grantRaw(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag) })); },           // NO nonce → must be refused
     grantWithNonce(nonce, grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: nonce })); },
+    // #113 negatives: correct minted nonce but NO proof / a WRONG proof → must be refused `bad_proof`.
+    grantNoProof(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce })); },
+    grantWrongProof(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce, grant_proof: '00'.repeat(32) })); },
+    grantWithKey(wrongKey, grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce, grant_proof: grantProof(wrongKey, g.lastNonce) })); },
     deny() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'denied' })); },
     override() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'override' })); },
     revoke() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'revoked' })); },
@@ -115,10 +132,10 @@ function makeFakeGame(tag) {
     })();
   }
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(URL);
+    const ws = new WebSocket(url);
     g.ws = ws;
     const timer = setTimeout(() => reject(new Error('fake-game auth timeout: ' + tag)), 4000);
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', token: TOKEN, ua: 'fake-game-' + tag, ver: 'test' })));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', token, ua: 'fake-game-' + tag, ver: 'test' })));
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
       let m; try { m = JSON.parse(data.toString('utf8')); } catch { return; }
@@ -127,6 +144,7 @@ function makeFakeGame(tag) {
         case 'control_offer': g.offers.push(m.seq); g.lastNonce = m.grant_nonce || ''; break;   // F1: capture the minted nonce
         case 'control_ping': g.pings++; if (g.answerPings) ws.send(JSON.stringify({ type: 'control_pong', t: Date.now() / 1000 })); break;
         case 'control_revoke': g.revokes.push(m.reason); break;
+        case 'control_result': g.results.push(m); break;   // #113: the relay's accept/refuse verdict on our grant
         case 'cmd_seq': g.received.push(m); if (g.autoRun) runSeq(m); break;
         default: break;
       }
@@ -141,11 +159,62 @@ function reasonFileFor(seq) {
 }
 function gotSeq(game, seq) { return game.received.some((c) => c.seq === seq); }
 
+// #113 fail-closed harness: spawn a SEPARATE relay whose control credential is unusable (unset, or equal
+// to the observe token) and assert control is disabled end-to-end while OBSERVE is unaffected. NOTE: the
+// "unset" case relies on no real tools/remote-bridge/.control-token existing (it is gitignored and only
+// provisioned at go-live) — the go-live secret is never read here because the temp control dir is fresh.
+function spawnRelay(port, resultsDir, controlDir, envExtra) {
+  return spawn(process.execPath,
+    [join(HERE, 'relay.mjs'), '--port', String(port), '--results', resultsDir, '--control', controlDir], {
+      env: {
+        ...process.env, REMOTE_BRIDGE_TOKEN: TOKEN,
+        REMOTE_BRIDGE_MAX_PENDING: '2', REMOTE_BRIDGE_PREAUTH_PER_IP: '100', REMOTE_BRIDGE_MAX_CONNS: '4',
+        REMOTE_BRIDGE_POLL_MS: '150', REMOTE_BRIDGE_PING_MS: '1000', ...envExtra,
+      },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+}
+
+async function assertControlDisabled(label, envExtra, gameOpts = {}) {
+  const port = 8100 + Math.floor(Math.random() * 800);
+  const results = mkdtempSync(join(tmpdir(), 'vox-relay-smoke-off-'));
+  const control = join(results, 'control');
+  const outbox = join(control, 'outbox');
+  const rejected = join(control, 'rejected');
+  const telemetryFile = join(results, 'telemetry.jsonl');
+  const relay = spawnRelay(port, results, control, envExtra);
+  await sleep(700);
+  try {
+    const game = await makeFakeGame(label, { url: `ws://127.0.0.1:${port}`, ...gameOpts });
+    await sleep(200);
+    // OBSERVE must be untouched: telemetry still lands on disk.
+    game.sendRaw({ type: 'telemetry', _smoke: 'marker-' + label });
+    await sleep(300);
+    ok(existsSync(telemetryFile) && readFileSync(telemetryFile, 'utf8').includes('marker-' + label),
+      `${label}: OBSERVE telemetry still flows while control is disabled`);
+    // A dropped command must be REJECTED control_disabled (not held, not forwarded) and never offered.
+    const name = 'off-cmd.json';
+    const tmp = join(outbox, `.${name}.tmp`);
+    writeFileSync(tmp, JSON.stringify({ type: 'cmd_seq', seq: 'off-cmd', issued: Date.now() / 1000, steps: [{ id: 1, op: 'stop' }] }));
+    renameSync(tmp, join(outbox, name));
+    await sleep(1000);
+    ok(game.offers.length === 0, `${label}: NO control_offer was ever sent (fail-closed)`);
+    ok(!gotSeq(game, 'off-cmd'), `${label}: command was NEVER forwarded`);
+    ok(existsSync(join(rejected, 'off-cmd.json')), `${label}: outbox command moved to rejected/`);
+    const reasonTxt = existsSync(join(rejected, 'off-cmd.reject.txt')) ? readFileSync(join(rejected, 'off-cmd.reject.txt'), 'utf8') : '';
+    ok(reasonTxt.includes('control_disabled'), `${label}: reject reason is control_disabled (${reasonTxt.trim() || 'none'})`);
+    game.close();
+    await sleep(200);
+  } finally {
+    relay.kill('SIGTERM');
+  }
+}
+
 async function main() {
   const relay = spawn(process.execPath,
     [join(HERE, 'relay.mjs'), '--port', String(PORT), '--results', RESULTS, '--control', CONTROL], {
       env: {
-        ...process.env, REMOTE_BRIDGE_TOKEN: TOKEN,
+        ...process.env, REMOTE_BRIDGE_TOKEN: TOKEN, REMOTE_BRIDGE_CONTROL_TOKEN: CONTROL_TOKEN,
         REMOTE_BRIDGE_MAX_PENDING: '2', REMOTE_BRIDGE_PREAUTH_PER_IP: '100', REMOTE_BRIDGE_MAX_CONNS: '4',
         REMOTE_BRIDGE_POLL_MS: '150', REMOTE_BRIDGE_PING_MS: '1000',
       },
@@ -484,6 +553,65 @@ async function main() {
       await sleep(300);
     }
 
+    // ── B(j) #113 KEYSTONE: an observe-token-only socket cannot forge the grant proof ───────────
+    console.log('\n── PART B(j): #113 — control cannot ride the observe token (KEYSTONE) ──');
+    {
+      // This game knows the observe token (it authed) but NOT the control secret — exactly the residual
+      // attacker of §9.0. It echoes the correct minted nonce, but any proof it produces is a forgery.
+      const game = await makeFakeGame('secproof', { controlToken: 'attacker-does-not-know-the-control-key' });
+      await sleep(200);
+      dropOutbox(mkCmd('sec-proof', [{ id: 1, op: 'wait', seconds: 0.1 }, { id: 2, op: 'stop' }]));
+      await waitFor(() => game.offers.includes('sec-proof'), 4000);   // relay offers + mints a per-socket nonce
+      ok(game.offers.includes('sec-proof'), 'B(j) relay offered control (minted a nonce) to the observe-token socket');
+      // (i) correct minted nonce, NO proof → refused bad_proof, command NEVER forwarded.
+      game.grantNoProof();
+      await waitFor(() => game.results.length >= 1, 4000);
+      ok(!gotSeq(game, 'sec-proof'), 'B(j) grant with the correct nonce but NO proof did NOT forward the command');
+      const r1 = game.results[game.results.length - 1];
+      ok(r1 && r1.accepted === false && r1.reason === 'bad_proof', `B(j) relay answered control_result bad_proof (${r1 && r1.reason})`);
+      // (ii) a WRONG proof (an HMAC under a guessed key) → also refused.
+      game.grantWrongProof();
+      await sleep(400);
+      ok(!gotSeq(game, 'sec-proof'), 'B(j) grant with a WRONG proof still did NOT forward the command');
+      const r2 = game.results[game.results.length - 1];
+      ok(r2 && r2.accepted === false && r2.reason === 'bad_proof', 'B(j) WRONG proof also refused bad_proof');
+      ok(!existsSync(join(SENT, 'sec-proof.json')), 'B(j) command NEVER moved to sent/ (never forwarded)');
+      ok(existsSync(join(OUTBOX, 'sec-proof.json')), 'B(j) command still HELD (would age out to no_consent), never driven');
+      game.close();
+      await sleep(300);
+    }
+
+    // ── B(m) #113 rotation/fallback: a stale/rotated control key stops proving ───────────────────
+    console.log('\n── PART B(m): #113 — a stale/rotated key stops proving (rotation fallback) ──');
+    {
+      // Simulate a stored key that no longer matches the relay's rotated .control-token.
+      const game = await makeFakeGame('rotate', { controlToken: CONTROL_TOKEN + '-rotated-away' });
+      await sleep(200);
+      dropOutbox(mkCmd('rot-cmd', [{ id: 1, op: 'stop' }]));
+      await waitFor(() => game.offers.includes('rot-cmd'), 4000);
+      game.grant();                                                    // proves with the STALE key → bad_proof
+      await waitFor(() => game.results.length >= 1, 4000);
+      const r = game.results[game.results.length - 1];
+      ok(r && r.accepted === false && r.reason === 'bad_proof', `B(m) grant under a rotated key refused bad_proof (${r && r.reason})`);
+      ok(!gotSeq(game, 'rot-cmd'), 'B(m) command under a stale key NEVER forwarded');
+      // The fallback (game re-types the correct rotated key): the SAME nonce is still valid, so proving
+      // with the CORRECT key now grants and flushes the held command — original semantics intact.
+      game.controlToken = CONTROL_TOKEN;
+      game.grant();
+      await waitFor(() => gotSeq(game, 'rot-cmd'), 4000);
+      ok(gotSeq(game, 'rot-cmd'), 'B(m) after supplying the CORRECT key the held command forwards (fallback works)');
+      const rOk = game.results[game.results.length - 1];
+      ok(rOk && rOk.accepted === true, 'B(m) correct-key grant answered control_result accepted:true');
+      game.close();
+      await sleep(300);
+    }
+
+    // ── B(k)/B(l) #113 FAIL-CLOSED: control secret unset, or equal to the observe token ──────────
+    console.log('\n── PART B(k): #113 — control secret UNSET ⇒ fail-closed ──');
+    await assertControlDisabled('B(k)-unset', { REMOTE_BRIDGE_CONTROL_TOKEN: '' });
+    console.log('\n── PART B(l): #113 — control secret == observe token ⇒ fail-closed ──');
+    await assertControlDisabled('B(l)-equal', { REMOTE_BRIDGE_CONTROL_TOKEN: TOKEN });
+
     // ── B(f) audit log recorded the control lifecycle ─────────────────────────────────────────
     console.log('\n── PART B: audit trail ──');
     {
@@ -493,6 +621,7 @@ async function main() {
       ok(auditTxt.includes('reject'), 'audit.log recorded a reject');
       ok(auditTxt.includes('override'), 'audit.log recorded an override');
       ok(auditTxt.includes('grant_rejected'), 'audit.log recorded a grant_rejected (F1 nonce/no-supersede gate)');
+      ok(auditTxt.includes('reason="bad_proof"'), 'audit.log recorded a grant_rejected bad_proof (#113 proof gate)');
       ok(auditTxt.includes('result_forged'), 'audit.log recorded a result_forged drop (F1 per-socket result tagging)');
     }
 

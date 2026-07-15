@@ -45,8 +45,28 @@ this host reads; it never serves the received data publicly.
    rolled/capped telemetry log, pruned frame ring, and an optional `REMOTE_BRIDGE_ORIGIN` allow-list
    (defense-in-depth — WS isn't subject to CORS). Every connect/disconnect/auth-fail is logged.
 
+7. **Two secrets: OBSERVE ≠ CONTROL (#113).** The `.token` above only ever grants **observe** (it
+   rides the page URL, so anyone with the link holds it). A live **control** grant additionally
+   requires proof of a **second, distinct** host secret — `REMOTE_BRIDGE_CONTROL_TOKEN` env, else a
+   gitignored `.control-token` file. The game proves knowledge of it without ever sending it: a
+   grant carries `grant_proof = HMAC-SHA256(control_secret, "vxv-ctl-grant.v1\n" + grant_nonce)`,
+   bound to the relay-minted per-socket nonce; the relay recomputes and constant-time compares it.
+   So control **cannot ride the observe token** — an observe-token-only socket receives the offer
+   and nonce but cannot forge the proof. The secret never appears on the wire, in URLs, in nginx
+   logs, or in `audit.log`. **Fail-closed:** if `.control-token` is unset (or equals the observe
+   token) the relay disables control entirely — no offers, every grant refused, outbox files
+   rejected `control_disabled`; **observe is untouched**, so a relay deployed with no control
+   secret behaves exactly like the Phase-1 observe bridge. Set it like the observe token:
+   `printf '%s' "$(openssl rand -hex 24)" > .control-token` (gitignored; must differ from `.token`).
+
+   | Secret | Grants | Where it lives | On the wire |
+   |---|---|---|---|
+   | `.token` / `REMOTE_BRIDGE_TOKEN` | **observe** (telemetry + frames) | host file/env; page URL `?remote=` | in the `wss` hello frame |
+   | `.control-token` / `REMOTE_BRIDGE_CONTROL_TOKEN` | **control** (drive/break/place/reload) | host file/env; typed into the game's consent modal | **never** — only a nonce-bound HMAC proof |
+
 Tunables (env): `REMOTE_BRIDGE_MAX_CONNS` (4), `REMOTE_BRIDGE_MAX_PENDING` (8),
-`REMOTE_BRIDGE_PREAUTH_PER_IP` (10/10s), `REMOTE_BRIDGE_ORIGIN` (unset).
+`REMOTE_BRIDGE_PREAUTH_PER_IP` (10/10s), `REMOTE_BRIDGE_ORIGIN` (unset),
+`REMOTE_BRIDGE_CONTROL_TOKEN` (unset ⇒ control fail-closed).
 5. **Relay hardening.** Binds `127.0.0.1` only (reachable solely through the nginx `/remote` route),
    caps concurrent connections, rate-limits per connection, bounds frame size, rolls/caps the
    telemetry log and prunes the frame ring, and logs every connect/disconnect/auth-fail.

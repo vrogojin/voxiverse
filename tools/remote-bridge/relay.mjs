@@ -41,7 +41,7 @@
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
 import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync, existsSync } from 'node:fs';
-import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -124,6 +124,38 @@ function nonceOk(candidate, minted) {
   if (!minted || typeof candidate !== 'string') return false;
   const h = (s) => createHash('sha256').update(String(s)).digest();
   return timingSafeEqual(h(candidate), h(minted));
+}
+
+// ── Control credential (#113) — a SECOND host secret, distinct from the observe token ────────────
+// The observe token above only ever grants OBSERVE. A control GRANT must ADDITIONALLY prove knowledge
+// of this secret (nonce-bound HMAC, §9.2), so control cryptographically cannot ride the shared,
+// URL-carried observe token. Source mirrors loadToken(): env → sibling .control-token file → ''.
+function loadControlToken() {
+  const env = (process.env.REMOTE_BRIDGE_CONTROL_TOKEN || '').trim();
+  if (env) return env;
+  try {
+    const t = readFileSync(join(HERE, '.control-token'), 'utf8').trim();
+    if (t) return t;
+  } catch { /* no file */ }
+  return '';
+}
+const CONTROL_TOKEN = loadControlToken();
+// FAIL-CLOSED (§9.1): control is enabled ONLY when a control secret is present AND it is DISTINCT from
+// the observe token (never collapse the two factors into one). Otherwise every grant is refused, no
+// offers are sent, and outbox files are rejected `control_disabled` — the observe path is untouched, so
+// a relay deployed with no .control-token is byte-for-byte the Phase-1 observe bridge for live clients.
+const CONTROL_AVAILABLE = !!CONTROL_TOKEN && CONTROL_TOKEN !== TOKEN;
+
+// The grant proof (#113, §9.2): proof = hex(HMAC-SHA256(control_secret, "vxv-ctl-grant.v1\n" + nonce)).
+// Recompute from OUR copy of the secret + the nonce WE minted for this socket, then constant-time compare
+// against the candidate with the same double-SHA256 idiom as tokenOk/nonceOk (so the raw proof length
+// never leaks and timingSafeEqual never throws). The secret itself never appears on the wire or in logs.
+const CTRL_GRANT_MAC_PREFIX = 'vxv-ctl-grant.v1\n';
+function proofOk(candidate, mintedNonce) {
+  if (!CONTROL_AVAILABLE || !mintedNonce || typeof candidate !== 'string') return false;
+  const expected = createHmac('sha256', CONTROL_TOKEN).update(CTRL_GRANT_MAC_PREFIX + mintedNonce).digest('hex');
+  const h = (s) => createHash('sha256').update(String(s)).digest();
+  return timingSafeEqual(h(candidate), h(expected));
 }
 
 // ── Result sinks ───────────────────────────────────────────────────────────────────────────────
@@ -336,6 +368,7 @@ function rejectFile(file, seq, reason, detail) {
 // that socket's wss offer) and stays valid until the next offer re-mints it, so an unattended re-arm
 // (§6.6, no fresh offer) can legitimately re-echo it while a cross-socket forge still fails.
 function offerControlToAll(seq) {
+  if (!CONTROL_AVAILABLE) return;   // #113 fail-closed: no control secret ⇒ no offers, so no grant can arm.
   for (const c of authedSockets) {
     if (c.controlState === 'none' && !c.offerSent) {
       c.offerSent = true;
@@ -367,6 +400,13 @@ function forward(entry, conn, preempted) {
 // The single forward gate. DEFAULT-DENY: with no active grant a valid command WAITS (never forwards).
 function dispatchOrHold(entry) {
   const wi = waiting.indexOf(entry); if (wi >= 0) waiting.splice(wi, 1);
+  // #113 fail-closed (§9.1): with no usable control secret, control is disabled entirely — a command can
+  // never be consented to, so REJECT (do not hold) rather than let a file wait forever for an offer that
+  // will never come. This is the outbox counterpart of the disabled offer/grant paths.
+  if (!CONTROL_AVAILABLE) {
+    rejectFile(entry.file, entry.seq, 'control_disabled', 'relay has no control secret (control disabled)');
+    return;
+  }
   const granted = activeGranted();
   if (!granted) {
     waiting.push(entry);
@@ -499,6 +539,13 @@ function revokeGrant(conn, reason) {
   log('CONTROL revoked:', conn.peer, `[${reason}]`);
 }
 
+// #113 (§9.3): tell the game whether a `granted` was accepted or refused so its CONTROL badge never
+// lies on a refusal (typo'd/rotated/stale key). Sent on EVERY granted attempt — the reason is never a
+// secret, and the received proof is NEVER echoed back or logged.
+function sendControlResult(conn, accepted, reason) {
+  try { conn.ws.send(JSON.stringify({ type: 'control_result', accepted, reason: reason || null })); } catch { /* ignore */ }
+}
+
 function onControlState(conn, msg) {
   const state = msg.state;
   switch (state) {
@@ -512,6 +559,24 @@ function onControlState(conn, msg) {
       if (!nonceOk(msg.grant_nonce, conn.grantNonce)) {
         audit('grant_rejected', { peer: conn.peer, reason: 'bad_nonce' });
         log('CONTROL grant REJECTED (bad/absent minted nonce):', conn.peer);
+        sendControlResult(conn, false, 'bad_nonce');
+        return;
+      }
+      // #113 — CONTROL-SECRET GATE. Two AND-ed requirements ON TOP of the F1 nonce:
+      //   (1) control must be enabled relay-side at all (fail-closed if no/degenerate secret), and
+      //   (2) the grant must carry a valid `grant_proof` = HMAC(control_secret, minted nonce). An
+      // observe-token-only socket receives the offer + nonce but CANNOT forge this proof, so the
+      // first-grant race (§9.0 residual) is closed — control cannot ride the observe token.
+      if (!CONTROL_AVAILABLE) {
+        audit('grant_rejected', { peer: conn.peer, reason: 'no_control_secret' });
+        log('CONTROL grant REFUSED (control disabled — no control secret):', conn.peer);
+        sendControlResult(conn, false, 'no_control_secret');
+        return;
+      }
+      if (!proofOk(msg.grant_proof, conn.grantNonce)) {
+        audit('grant_rejected', { peer: conn.peer, reason: 'bad_proof' });   // NB: never log the received proof
+        log('CONTROL grant REFUSED (bad/absent grant_proof):', conn.peer);
+        sendControlResult(conn, false, 'bad_proof');
         return;
       }
       // F1b — NO-SUPERSEDE: a second authed socket can NEVER wrest a standing valid grant away (was:
@@ -521,12 +586,14 @@ function onControlState(conn, msg) {
       if (holder && holder !== conn) {
         audit('grant_rejected', { peer: conn.peer, reason: 'already_held', holder: holder.peer });
         log('CONTROL grant REJECTED (another socket already holds control):', conn.peer);
+        sendControlResult(conn, false, 'already_held');
         return;
       }
       conn.controlState = 'granted'; conn.grantId = gid; conn.offerSent = false;
       startHeartbeat(conn);
       audit('grant', { peer: conn.peer, grant_id: gid });
       log('CONTROL granted:', conn.peer, 'grant_id=', gid);
+      sendControlResult(conn, true, null);
       flushWaiting();
       break;
     }
@@ -804,6 +871,14 @@ wss.on('connection', (ws, req) => {
 httpServer.listen(PORT, HOST, () => {
   log(`listening ws://${HOST}:${PORT}  results=${RESULTS_DIR}  control=${CONTROL_DIR}  cap=${MAX_CONNS}`);
   log('token loaded (' + TOKEN.length + ' chars). Waiting for the game to dial in.');
+  // #113 control-credential status, logged ONCE, loudly (§9.1). Fail-closed is the safe default.
+  if (CONTROL_AVAILABLE) {
+    log('CONTROL credential loaded (' + CONTROL_TOKEN.length + ' chars) — grants require a valid grant_proof.');
+  } else if (!CONTROL_TOKEN) {
+    log('CONTROL DISABLED (no control secret: set REMOTE_BRIDGE_CONTROL_TOKEN or create .control-token) — all grants refused, outbox files rejected control_disabled; OBSERVE unaffected.');
+  } else {
+    log('CONTROL DISABLED (control secret EQUALS the observe token — refusing to collapse the two factors) — all grants refused, outbox files rejected control_disabled; OBSERVE unaffected.');
+  }
 });
 
 // Outbox poller — the ONLY command ingress (design §5.1). Polling (not fs.watch) because fs.watch is

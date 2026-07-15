@@ -46,8 +46,9 @@ var _ctl_unattended := false        # the active grant is the persistent §6.6 m
 var _driving_text := ""             # live "step N/M …" readout for the DRIVING badge
 var _flashing := false              # a "— YOU HAVE CONTROL" override flash is up (§6.4 step 4)
 var _consent: CanvasLayer = null    # the red consent / unattended modal (null = none up)
+var _consent_key_field: LineEdit = null  # #113: the secret "Control key" field inside the consent modal
 var _pending_offer_seq := ""        # the seq that triggered the offer (informational)
-var _native_unattended := ""        # native/dev fallback for localStorage (web uses JavaScriptBridge)
+var _native_unattended := ""        # native/dev fallback for localStorage (web uses JavaScriptBridge); JSON {uid,ck}
 
 
 func configure(world_ref: Node, player_ref: Node3D, preset_token: String) -> void:
@@ -122,9 +123,12 @@ func _activate(token: String) -> void:
 	if RemoteBridge.CONTROL_ENABLED:
 		_bridge.control_offer_in.connect(_on_control_offer_ui)
 		_bridge.control_phase.connect(_on_control_phase)
-		var uid := _load_unattended(token)      # persistent §6.6 grant restored across a reload?
+		_bridge.control_denied_relay.connect(_on_control_denied_relay)   # #113: relay refused a grant
+		var stored := _load_unattended(token)   # persistent §6.6 grant restored across a reload?
+		var uid := str(stored.get("uid", ""))
 		if uid != "":
-			_bridge.arm_unattended_rearm(uid)   # auto re-arm on the next relay offer (no human click)
+			# #113 (§9.4): the stored control key (ck) re-proves the fresh nonce after a reload wiped RAM.
+			_bridge.arm_unattended_rearm(uid, str(stored.get("ck", "")))
 	add_child(_bridge)
 	_show_badge(false)                # "dialing…" until the socket actually opens
 	print("[REMOTE] activation requested (token-gated, fixed relay)")
@@ -255,8 +259,36 @@ func _on_control_offer_ui(seq: String) -> void:
 	_open_consent_modal(false)
 
 
+## #113 (§9.3): the relay REFUSED our grant (typo'd/rotated/stale control key). Revert the badge to
+## observing and re-open the attended modal so the human can (re)type the correct control key. If the
+## refusal killed an UNATTENDED re-arm, clear the now-stale stored key first so it can't loop.
+func _on_control_denied_relay(_reason: String, was_unattended: bool) -> void:
+	_ctl_phase = "observing"
+	_ctl_unattended = false
+	if is_instance_valid(_badge):
+		_refresh_badge()
+	if was_unattended:
+		_clear_unattended()
+	# Re-open the attended modal for a retry (only while the bridge is still live and no modal is up).
+	if is_instance_valid(_bridge) and _consent == null:
+		_open_consent_modal(false)
+
+
+## #113 (§9.4): the control-key prefill for the consent field. D2 re-consent within a session is
+## click-only — the bridge still holds the key in RAM. Native/dev prefills from the env var. Attended
+## first-consent on web returns "" (the human types it once per session).
+func _control_key_prefill() -> String:
+	if is_instance_valid(_bridge):
+		var ram := _bridge.peek_control_secret()
+		if ram != "":
+			return ram
+	if not OS.has_feature("web"):
+		return OS.get_environment("VOXIVERSE_REMOTE_CONTROL_TOKEN").strip_edges()
+	return ""
+
+
 # ── Consent modals (session + louder unattended). Red-bordered, capability-enumerating (D5). ────────
-func _open_consent_modal(unattended: bool) -> void:
+func _open_consent_modal(unattended: bool, prefill_key := "") -> void:
 	_close_consent()
 	# Release the mouse + freeze the player so the buttons are clickable without driving the camera —
 	# the exact pattern the token prompt uses.
@@ -307,8 +339,9 @@ func _open_consent_modal(unattended: bool) -> void:
 			+ "  • PLACE blocks\n" \
 			+ "  • manage your INVENTORY\n" \
 			+ "  • RELOAD the browser tab to pick up new builds\n\n" \
+			+ "The control key will be STORED in this browser until you revoke (so it survives reloads). " \
 			+ "It can NOT read anything outside the game. Press Esc anytime to revoke and CLEAR this " \
-			+ "permission. This is a standing grant — enable it only if you are walking away."
+			+ "permission (and the stored key). This is a standing grant — enable it only if you are walking away."
 	else:
 		title.text = "●  MISSION CONTROL requests DRIVE access"
 		body.text = "The remote agent will be able to, UNTIL YOU REVOKE:\n" \
@@ -318,6 +351,22 @@ func _open_consent_modal(unattended: bool) -> void:
 			+ "  • manage your INVENTORY\n\n" \
 			+ "It can NOT read anything outside the game, and it LOSES control the instant you press " \
 			+ "any key or move the mouse. Press Esc anytime to revoke."
+	# #113 (§9.4): the secret Control-key field. The affirmative button(s) stay DISABLED until it is
+	# non-empty, so a grant can never be attempted without a key. Prefilled on a D2 re-consent (bridge
+	# RAM) or native/dev (env); empty on an attended first-consent (the human types the host's key once).
+	var key_label := Label.new()
+	key_label.text = "Control key (from the host operator)"
+	key_label.add_theme_font_size_override("font_size", 13)
+	key_label.modulate = Color(0.85, 0.87, 0.92)
+	vb.add_child(key_label)
+
+	_consent_key_field = LineEdit.new()
+	_consent_key_field.secret = true
+	_consent_key_field.placeholder_text = "control key"
+	_consent_key_field.custom_minimum_size = Vector2(520, 0)
+	_consent_key_field.text = prefill_key if prefill_key != "" else _control_key_prefill()
+	vb.add_child(_consent_key_field)
+
 	vb.add_child(HSeparator.new())
 
 	var row := HBoxContainer.new()
@@ -330,36 +379,56 @@ func _open_consent_modal(unattended: bool) -> void:
 	deny.pressed.connect(_deny_consent)
 	row.add_child(deny)
 
+	# The affirmative buttons gated on a non-empty key. Collected so text_changed can toggle `disabled`.
+	var gated: Array[Button] = []
 	if unattended:
 		var enable := Button.new()
 		enable.text = "Enable UNATTENDED"
 		enable.pressed.connect(_allow_unattended)
 		row.add_child(enable)                              # deliberately NOT the default focus (§6.6)
+		gated.append(enable)
 		deny.grab_focus()
 	else:
 		var allow_un := Button.new()
 		allow_un.text = "Allow UNATTENDED…"
-		allow_un.pressed.connect(func() -> void: _open_consent_modal(true))
+		# Carry the currently-typed key into the louder unattended modal so it stays prefilled.
+		allow_un.pressed.connect(func() -> void: _open_consent_modal(true, _consent_key_field.text))
 		row.add_child(allow_un)
+		gated.append(allow_un)
 		var allow := Button.new()
 		allow.text = "Allow — until I revoke"
 		allow.pressed.connect(_allow_session)
 		row.add_child(allow)
+		gated.append(allow)
+
+	# Enforce "no key ⇒ no affirmative action": set initial disabled state and keep it live as they type.
+	var refresh_gate := func() -> void:
+		var empty := _consent_key_field.text.strip_edges() == ""
+		for b in gated:
+			b.disabled = empty
+	refresh_gate.call()
+	_consent_key_field.text_changed.connect(func(_t: String) -> void: refresh_gate.call())
 
 
 func _allow_session() -> void:
 	var gid := _gen_id()
+	var key := _consent_key_field.text.strip_edges() if _consent_key_field != null else ""
+	if key == "":
+		return                                              # gated button; defensive — never grant keyless
 	_close_consent()
 	if is_instance_valid(_bridge):
-		_bridge.grant_control(gid, false)
+		_bridge.grant_control(gid, false, key)              # #113: the typed control key proves the grant
 
 
 func _allow_unattended() -> void:
 	var uid := _gen_id()
-	_store_unattended(uid)                                  # opaque id in localStorage, keyed to the token (§6.6)
+	var key := _consent_key_field.text.strip_edges() if _consent_key_field != null else ""
+	if key == "":
+		return                                              # gated button; defensive — never grant keyless
+	_store_unattended(uid, key)                             # §9.4: {uid, ck} in localStorage, keyed to the token
 	_close_consent()
 	if is_instance_valid(_bridge):
-		_bridge.grant_control(uid, true)
+		_bridge.grant_control(uid, true, key)
 
 
 func _deny_consent() -> void:
@@ -372,6 +441,7 @@ func _close_consent() -> void:
 	if _consent != null:
 		_consent.queue_free()
 		_consent = null
+	_consent_key_field = null                              # freed with the modal; drop the dangling ref
 	# Restore play (mirror the token prompt): recapture the mouse + unfreeze.
 	if is_instance_valid(player):
 		player.set("frozen", false)
@@ -389,18 +459,34 @@ func _js_str(s: String) -> String:
 	return JSON.stringify(s)                                # safe JS string literal (no injection)
 
 
-func _store_unattended(uid: String) -> void:
+## §9.4 (D6): the persisted value is JSON {"uid": <opaque id>, "ck": <control secret>}. The uid stays an
+## opaque correlator (never the observe secret); ck is the raw control key, stored ONLY on an explicit
+## unattended opt-in so a fresh proof can be produced after a reload wipes RAM. The storage KEY is still a
+## non-reversible hash of the observe token, so the observe secret is never written. Attended → never here.
+func _store_unattended(uid: String, control_secret: String) -> void:
+	var payload := JSON.stringify({"uid": uid, "ck": control_secret})
 	if not OS.has_feature("web"):
-		_native_unattended = uid
+		_native_unattended = payload
 		return
-	JavaScriptBridge.eval("localStorage.setItem(%s,%s)" % [_js_str(_ls_key(_active_token)), _js_str(uid)], true)
+	JavaScriptBridge.eval("localStorage.setItem(%s,%s)" % [_js_str(_ls_key(_active_token)), _js_str(payload)], true)
 
 
-func _load_unattended(token: String) -> String:
+## Returns {"uid": String, "ck": String} (empty {} when none/invalid). Tolerates a legacy bare-id value
+## (pre-#113) by treating it as a uid with no stored key — that re-arm will then be refused and fall back
+## to the attended modal, which is the correct migration behaviour.
+func _load_unattended(token: String) -> Dictionary:
+	var raw := ""
 	if not OS.has_feature("web"):
-		return _native_unattended
-	var v = JavaScriptBridge.eval("localStorage.getItem(%s)" % _js_str(_ls_key(token)), true)
-	return "" if v == null else str(v)
+		raw = _native_unattended
+	else:
+		var v = JavaScriptBridge.eval("localStorage.getItem(%s)" % _js_str(_ls_key(token)), true)
+		raw = "" if v == null else str(v)
+	if raw == "":
+		return {}
+	var parsed = JSON.parse_string(raw)
+	if parsed is Dictionary:
+		return {"uid": str((parsed as Dictionary).get("uid", "")), "ck": str((parsed as Dictionary).get("ck", ""))}
+	return {"uid": raw, "ck": ""}                          # legacy bare id → no key (re-arm falls back to modal)
 
 
 func _clear_unattended() -> void:

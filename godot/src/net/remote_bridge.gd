@@ -42,6 +42,10 @@ signal link_state(open: bool)
 ## stays exactly the Phase-1 "observing" surface (byte-identical).
 signal control_offer_in(seq: String)                  # relay offered control → activator shows the consent modal
 signal control_phase(phase: String, info: Dictionary) # badge driver: observing|granted|driving|suspended|override|revoked
+## #113 (§9.3): the RELAY REFUSED our `granted` (bad/absent grant_proof, control disabled, or already
+## held). The activator drops the badge to observing and, on a killed UNATTENDED re-arm, clears the
+## stale stored key and re-opens the attended modal so the human can type the rotated control key.
+signal control_denied_relay(reason: String, was_unattended: bool)
 
 # ── Configuration ──────────────────────────────────────────────────────────────────────────────
 const DEFAULT_URL := "wss://voxiverse.game-host.org/remote"
@@ -135,6 +139,12 @@ var _link_open := false             # last emitted link_state (so we emit only o
 var _control_state := "none"        # none | granted
 var _grant_id := ""                 # game-generated random id echoed on cmd_ack (binds results to this consent)
 var _grant_nonce := ""              # F1: the relay-MINTED nonce from control_offer, echoed back on control_state:granted
+## #113 (§9.1): the CONTROL SECRET, held RAM-ONLY for the bridge's lifetime. Never stored for an attended
+## grant; under an explicit UNATTENDED opt-in the activator ALSO keeps a copy in localStorage (§9.4) and
+## re-supplies it here on a boot re-arm. Cleared only on revoke/deny/_exit_tree (kept across override/
+## suspend/link-loss so a session re-consent or an unattended auto-resume re-proves without a retype).
+var _control_secret := ""
+var _rearm_control_secret := ""     # boot re-arm (§9.4): the stored control secret handed in with the uid
 var _unattended := false            # this grant is the persistent §6.6 mode (survives override via auto-resume)
 var _exec: RemoteControl = null     # the step executor — created ON GRANT, freed on revoke/override/link-loss
 var _last_ping_ms := 0              # Time.get_ticks_msec of the last control_ping (0 = none yet)
@@ -558,6 +568,7 @@ func _dispatch_control(txt: String) -> void:
 		"cmd_seq":        _on_cmd_seq(m)
 		"control_ping":   _on_control_ping()
 		"control_revoke": _on_control_revoke(m)
+		"control_result": _on_control_result(m)
 		# auth_ok (duplicate) and anything else: drained-and-discarded.
 
 
@@ -575,17 +586,24 @@ func _on_control_offer(m: Dictionary) -> void:
 		return                               # already driving — the relay just (re)advertised
 	if _rearm_unattended_id != "":
 		var uid := _rearm_unattended_id
+		var ck := _rearm_control_secret       # §9.4: the stored control secret proves the fresh nonce
 		_rearm_unattended_id = ""
-		grant_control(uid, true)             # persistent mode: auto re-arm, no modal
+		_rearm_control_secret = ""
+		grant_control(uid, true, ck)          # persistent mode: auto re-arm, no modal
 		return
 	control_offer_in.emit(seq)               # → activator consent modal
 
 
 ## Called by the activator when the human ALLOWS (session) or ENABLES UNATTENDED. grant_id is a
-## game-generated opaque token bound to this consent (echoed on every cmd_ack).
-func grant_control(grant_id: String, unattended: bool) -> void:
+## game-generated opaque token bound to this consent (echoed on every cmd_ack). control_secret (#113) is
+## the host control key the human typed / the stored key on an unattended re-arm; a non-empty value is
+## latched into RAM (_control_secret) so a later D2 re-consent within the session is click-only ("" keeps
+## the existing RAM copy). The proof is computed inside _send_control_state.
+func grant_control(grant_id: String, unattended: bool, control_secret: String = "") -> void:
 	if not CONTROL_ENABLED:
 		return
+	if control_secret != "":
+		_control_secret = control_secret     # latch the typed/stored key; kept RAM-only for the session
 	_control_state = "granted"
 	_grant_id = grant_id
 	_unattended = unattended
@@ -603,6 +621,7 @@ func deny_control() -> void:
 	_send_control_state("denied", "")
 	_control_state = "none"
 	_grant_id = ""
+	_control_secret = ""                     # #113: drop the RAM secret on an explicit deny
 	control_phase.emit("observing", {})
 
 
@@ -617,6 +636,7 @@ func revoke_control() -> void:
 	_free_executor()
 	_control_state = "none"
 	_grant_id = ""
+	_control_secret = ""                     # #113: hard stop clears the RAM secret (re-consent must retype)
 	_unattended = false
 	_suspend_resume_at = 0
 	control_phase.emit("revoked", {})
@@ -631,9 +651,18 @@ func control_is_unattended() -> bool:
 
 
 ## Activator → bridge at boot: a valid localStorage unattended grant exists for this token; auto-arm
-## on the next relay offer (no human click). Opaque id only — never the observe secret (§6.6).
-func arm_unattended_rearm(unattended_id: String) -> void:
+## on the next relay offer (no human click). The opaque id is never the observe secret (§6.6); the
+## control_secret (#113/§9.4) is the stored key that lets the re-arm PROVE the fresh nonce after a reload
+## destroyed the RAM copy. Attended sessions never reach here (they store nothing).
+func arm_unattended_rearm(unattended_id: String, control_secret: String = "") -> void:
 	_rearm_unattended_id = unattended_id
+	_rearm_control_secret = control_secret
+
+
+## Same-process getter so the activator can PREFILL the control-key field on a D2 re-consent (§9.4),
+## making it click-only. Returns "" when no key is held. Never crosses the process/trust boundary.
+func peek_control_secret() -> String:
+	return _control_secret
 
 
 # ── Command sequence intake ────────────────────────────────────────────────────────────────────────
@@ -915,7 +944,89 @@ func _send_control_state(state: String, grant_id: String) -> void:
 		msg["grant_id"] = grant_id
 	if state == "granted" and _grant_nonce != "":
 		msg["grant_nonce"] = _grant_nonce   # F1: echo the relay-minted offer nonce so the grant is honoured
+		# #113 (§9.2): PROVE knowledge of the control secret without ever transmitting it — a nonce-bound
+		# HMAC. The relay recomputes it from its own secret + the nonce it minted for this socket and
+		# accepts only on a match. An empty proof (no secret in RAM) will be refused (control_result).
+		msg["grant_proof"] = _compute_grant_proof(_grant_nonce)
 	_send_text_guarded(msg)
+
+
+## #113 (§9.2): proof = hex(HMAC-SHA256(control_secret, "vxv-ctl-grant.v1\n" + nonce)). "" when no secret
+## is held (an unprovable grant the relay refuses). The secret never leaves this function's inputs.
+func _compute_grant_proof(nonce: String) -> String:
+	if _control_secret == "":
+		return ""
+	var key := _control_secret.to_utf8_buffer()
+	var message := ("vxv-ctl-grant.v1\n" + nonce).to_utf8_buffer()
+	return _hmac_sha256_hex(key, message)
+
+
+## HMAC-SHA256 → lowercase hex. Primary path is Godot's Crypto.hmac_digest (mbedTLS). Its availability on
+## the THREADED WEB export is not verified on this host, so we fall back to a pure HashingContext HMAC
+## (RFC 2104) — HashingContext/SHA-256 is used elsewhere in the engine and is known-present on web — so
+## the proof is computed identically on every platform regardless of whether Crypto is compiled into the
+## web template. Both produce the same bytes for the same key+message.
+func _hmac_sha256_hex(key: PackedByteArray, message: PackedByteArray) -> String:
+	var crypto := Crypto.new()
+	if crypto.has_method("hmac_digest"):
+		var digest: PackedByteArray = crypto.hmac_digest(HashingContext.HASH_SHA256, key, message)
+		if digest.size() == 32:
+			return digest.hex_encode()
+	return _hmac_sha256_fallback(key, message).hex_encode()
+
+
+## RFC 2104 HMAC-SHA256 built from HashingContext (guaranteed on the web export). Block size 64 B: keys
+## longer than the block are hashed first; then inner = H((K⊕ipad)‖msg), out = H((K⊕opad)‖inner).
+func _hmac_sha256_fallback(key: PackedByteArray, message: PackedByteArray) -> PackedByteArray:
+	const BLOCK := 64
+	var k := key
+	if k.size() > BLOCK:
+		k = _sha256_bytes(k)
+	while k.size() < BLOCK:
+		k.append(0)
+	var ipad := PackedByteArray()
+	var opad := PackedByteArray()
+	ipad.resize(BLOCK)
+	opad.resize(BLOCK)
+	for i in range(BLOCK):
+		ipad[i] = k[i] ^ 0x36
+		opad[i] = k[i] ^ 0x5c
+	var inner := ipad.duplicate()
+	inner.append_array(message)
+	var inner_hash := _sha256_bytes(inner)
+	var outer := opad.duplicate()
+	outer.append_array(inner_hash)
+	return _sha256_bytes(outer)
+
+
+func _sha256_bytes(data: PackedByteArray) -> PackedByteArray:
+	var ctx := HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA256)
+	ctx.update(data)
+	return ctx.finish()
+
+
+## #113 (§9.3): the relay's answer to our `granted`. accepted:true arms forwarding (badge already shows
+## CONTROL from the optimistic grant, so nothing to do). accepted:false is a legitimate runtime refusal
+## (typo'd key, rotated/stale control secret): drop the local grant so the badge never lies, clear the
+## RAM secret, and signal the activator to re-open the attended modal (and, if this killed an UNATTENDED
+## re-arm, clear the stale stored key first). The relay's forward gate never trusted our belief, so this
+## is honesty, not enforcement.
+func _on_control_result(m: Dictionary) -> void:
+	if bool(m.get("accepted", false)):
+		return
+	var reason := str(m.get("reason", ""))
+	var was_unattended := _unattended
+	if is_instance_valid(_exec):
+		_exec.abort("aborted")
+	_free_executor()
+	_control_state = "none"
+	_grant_id = ""
+	_control_secret = ""                     # the offered key was rejected — force a fresh retype
+	_unattended = false
+	_suspend_resume_at = 0
+	control_phase.emit("observing", {})
+	control_denied_relay.emit(reason, was_unattended)
 
 
 func _send_cmd_ack(seq: String, steps: int) -> void:
@@ -942,6 +1053,8 @@ func _send_text_guarded(msg: Dictionary) -> void:
 func _exit_tree() -> void:
 	# Clean teardown — free any executor, then close the socket so the relay sees a prompt disconnect.
 	_free_executor()
+	_control_secret = ""                     # #113: never leave the control secret in a freed node's RAM
+	_rearm_control_secret = ""
 	_set_link(false)
 	if _ws != null:
 		if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN or _ws.get_ready_state() == WebSocketPeer.STATE_CONNECTING:

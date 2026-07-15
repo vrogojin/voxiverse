@@ -226,7 +226,7 @@ table entries (R, GM):
 | Earth–Moon distance | 384,400 km | **384,400 blocks** |
 | Earth–Sun distance | 149.6M km | **149,600,000 blocks** |
 | Moon SOI | 66,100 km | 66,100 blocks (falls out of GM ratios) |
-| Geostationary radius | 42,164 km | ~42,150 blocks (falls out of §3.4 day) |
+| Geostationary radius | 42,164 km | ~42,150 blocks (falls out of the §3.3 day + GM) |
 | Sun/Moon angular diameter | 0.53° / 0.52° | **0.53° / 0.52°** (÷1000 is angle-preserving) |
 | Atmosphere thickness | ~100 km | **384 blocks** (near-field, NOT ÷1000 — locked by user) |
 | Terrain relief | Everest 8.8 km | O(100) blocks (near-field, ~11× the ÷1000 value) |
@@ -550,6 +550,7 @@ thrust caps produce (Earth system, §3.3 parameters):
 | Around the planet | gear-1 fly 32 m/s | ~21 min | 1 |
 | Ground → low orbit | gear 2 | ~1 min burn + coast | — |
 | **LEO → Moon, Hohmann** (Δv 220 m/s) | gear 2 + coast | **≈ 3.3 h** | 10 |
+| LEO → Moon, brachistochrone a_C = 0.2 m/s² | gear 3 | ≈ 46 min (peak 277 m/s) | 2.3 |
 | LEO → Moon, brachistochrone a_C = 0.5 m/s² | gear 3 | ≈ 29 min (peak 438 m/s) | 1.5 |
 | LEO → Moon, brachistochrone a_C = 2 m/s² | gear 3 | ≈ 15 min (peak 877 m/s) | 0.75 |
 | Earth → Sun distance, at 100 km/s (illustrative) | interstellar tier | 17.3 days | 1250 |
@@ -701,7 +702,7 @@ export only after a measured heap A/B; ceilings are asserted by gates, not hoped
 | D2b | Near-field vs datum gravity seam | walk g stays feel-22 with a blend-band magnitude ramp to GM/r² (§3.3.1) / raise walk g to the 50.9 datum / shrink GM to a 22 datum (breaks the locked day) | **feel-22 + blend ramp** — the priority rule (day wins) forces GM; playability keeps the walk feel |
 | D3 | Orbit fidelity | patched conics + symplectic active set / full n-body / all-on-rails | **patched conics + symplectic** (KSP model) — deterministic, dormancy-friendly |
 | D4 | Ground-frame spin forces | ignore (≤0.8% of feel g, disclosed) / simulate Coriolis | **ignore** — but honor ω×r = 33 m/s at the mode handoff (eastward launch bonus is real, ~4% of orbital v) |
-| D5 | Gear-3 thrust cap a_C (sets first-reach travel time; distances are LOCKED-vast, never the tunable) | 0.2 / 0.5 / 2 m/s² → Moon ≈ 3.3 h (Hohmann default) / 29 min / 15 min (§6.3 table) | **0.2–0.5 m/s², Hohmann coast as default** — Moon first-reach = a 1–3.3 h expedition (3–10 game days); repeats amortized by portals (§7.4). Fully Newtonian, no supercruise; interstellar tier deferred |
+| D5 | Gear-3 thrust cap a_C (sets first-reach travel time; distances are LOCKED-vast, never the tunable) | powered brachistochrone at a_C = 0.2 / 0.5 / 2 m/s² → Moon in 46 / 29 / 15 min; low-Δv Hohmann coast = 3.3 h (§6.3 table) | **a_C 0.2–0.5 m/s² with the 3.3-h Hohmann as the cheap default** — Moon first-reach = a ~0.5–3.3 h expedition (1.5–10 game days) depending on Δv spent; repeats amortized by portals (§7.4). Fully Newtonian, no supercruise; interstellar tier deferred |
 | D6 | Grid attitude | inertially fixed v1 / simulated spin | **fixed** — spin stations are a future rotating-zone feature |
 | D7 | Interior gravity in grids | microgravity-only v1 / gravity generators now | **microgravity v1**; per-grid Area3D generalization later |
 | D8 | The Sun as a place | unreachable environmental object (cruise clamps at ~0.1 AU÷1000) / approachable | **unreachable v1** |

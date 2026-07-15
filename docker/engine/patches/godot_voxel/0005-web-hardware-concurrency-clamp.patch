@@ -1,0 +1,41 @@
+Clamp web hardware_concurrency to 14 (bounds worst-case voxel worker occupancy)
+
+VoxelEngine sizes its worker pool from Thread::get_hardware_concurrency()
+(voxel_engine.cpp formula clamp(round(ratio*hw), minimum, max(hw-margin,minimum)))
+which has no absolute-max knob. On the web build that value is
+navigator.hardwareConcurrency, otherwise UNCAPPED here -- so a 32-logical-core
+visitor requests far more workers than the preallocated pthread pool holds and
+exhausts it (meshing tasks deadlock -> blank world). With PTHREAD_POOL_SIZE=16
+(docker/engine/patches/godot/0001 + versions.env WEB_PTHREAD_POOL) we cap the
+reported web concurrency at 14 so the worst-case voxel worker count stays <= 10,
+keeping voxel(<=10) + WorkerThreadPool(2) + audio/IO/spare(<=3) <= 15 < 16 pool
+slots. Native builds are unchanged. See COSMOS-FP-M1-DESIGN section 9.1.
+
+diff --git a/util/thread/thread.cpp b/util/thread/thread.cpp
+index 1111111..2222222 100644
+--- a/util/thread/thread.cpp
++++ b/util/thread/thread.cpp
+@@ -94,8 +94,20 @@ void Thread::sleep_usec(uint32_t microseconds) {
+ 	OS::get_singleton()->delay_usec(microseconds);
+ }
+ 
+-unsigned int Thread::get_hardware_concurrency() {
+-	return std::thread::hardware_concurrency();
+-}
++unsigned int Thread::get_hardware_concurrency() {
++#ifdef __EMSCRIPTEN__
++	// On the web build the pthread pool is preallocated to a fixed PTHREAD_POOL_SIZE
++	// (VOXIVERSE ships 16; docker/engine/patches/godot/0001 + versions.env WEB_PTHREAD_POOL).
++	// VoxelEngine sizes its worker pool from hardware_concurrency (navigator.hardwareConcurrency,
++	// otherwise uncapped here) and its formula has no absolute-max knob, so a many-core visitor
++	// would request more workers than the pool holds and exhaust it (meshing deadlock -> blank
++	// world). Clamp to 14 so worst-case voxel workers <= 10 and voxel + WorkerThreadPool(2) +
++	// audio/IO/spare(<=3) <= 15 < 16 pool slots. COSMOS-FP-M1-DESIGN section 9.1.
++	const unsigned int hw = std::thread::hardware_concurrency();
++	return hw > 14u ? 14u : hw;
++#else
++	return std::thread::hardware_concurrency();
++#endif
++}
+ 
+ namespace {

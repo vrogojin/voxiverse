@@ -86,6 +86,18 @@ var _warned_caps := false
 # tiles are BUILT in the node-local (v = M_win⁻¹·p) frame but SAMPLED at p = M_win·v. Identity at spawn.
 var _epoch_mwin: Array = [1, 0, 0, 1]
 
+# COSMOS R1 (M5_REAL): real-baked-geometry state. `_align_root` is a child that holds every baked tile and
+# carries the per-frame rigid alignment transform (study §1.2) — set so tile world = F·(local_origin+baked)
+# regardless of this node's own `position` (the align root absorbs node_origin, so the WM position/reanchor/
+# flip machinery stays untouched). `_bake_frame` is the epoch anchor frame (refreshed at each 64 m recenter,
+# where the far already rebuilds); `_blend` is the ring-0 window-blend context for the near/far join.
+var _chart = null                              # CosmosChart (set by WorldManager) — needed to bake/align
+var _align_root: Node3D = null
+var _bake_frame: Dictionary = {}
+var _blend: Dictionary = {}
+var _bake_anchor := Vector3.ZERO               # window pos the epoch frame is anchored at (the recenter point)
+var _epoch_locked := false                     # COSMOS R2.2: WM owns a shared fixed epoch frame → stop self-refresh + blend
+
 # active (in-progress) sampling job — the one tile being sampled across frames.
 var _active_key                            # Variant: Vector3i or null
 var _active_job: Dictionary = {}
@@ -122,6 +134,10 @@ func _ready() -> void:
 	TerrainConfig.warm_up()
 	FarPalette.ensure_ready()
 	_material = make_material()
+	if not CubeSphere.FLAT_WORLD and CubeSphere.M5_REAL:
+		_align_root = Node3D.new()
+		_align_root.name = "FarAlignRoot"
+		add_child(_align_root)
 	set_process(true)
 
 ## The one shared far material (LOD-DESIGN §2.4). Static so ShaderPrewarm warms the
@@ -132,10 +148,19 @@ func _ready() -> void:
 ## keeps the StandardMaterial3D below byte-identical — and because ShaderPrewarm builds through THIS
 ## function, the bend pipeline is warmed at load, not on the first far tile drawn in gameplay.
 static func make_material() -> Material:
-	if not CubeSphere.FLAT_WORLD:
-		CosmosBend.ensure_globals()
+	# COSMOS R1 (M5_REAL): real baked geometry carries NO shader — fall through to the plain unshaded
+	# StandardMaterial3D below (the whole point: nothing chart-shaped crosses the GPU boundary).
+	if not CubeSphere.FLAT_WORLD and not CubeSphere.M5_REAL:
 		var sm := ShaderMaterial.new()
-		sm.shader = CosmosBend.far_shader()
+		# COSMOS M5a: the PURE true-position far shader (no bubble — far tiles are all beyond the bubble's
+		# r1) when M5_RENDER is on; else the camera-centred bend far shader. Default M5_RENDER=false.
+		if CubeSphere.M5_RENDER:
+			CosmosTruePlace.ensure_globals_m5()
+			sm.shader = CosmosTruePlace.far_shader_m5()
+			CosmosTruePlace.register_material(sm)   # single-writer: far gets the chart table with near, same pass
+		else:
+			CosmosBend.ensure_globals()
+			sm.shader = CosmosBend.far_shader()
 		return sm
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true
@@ -170,12 +195,66 @@ func update_center(pos: Vector3) -> void:
 		return
 	_eval_point = e
 	_has_eval = true
+	# COSMOS R1: re-anchor the epoch bake frame + ring-0 blend at the player on the SAME 64 m cadence the far
+	# rebuilds — offsets stay f32-small, the fold keeps baked positions reanchor-invariant.
+	if CubeSphere.M5_REAL and _chart != null:
+		_refresh_bake(Vector3(pos.x, pos.y, pos.z))
 	_recompute(e)
 
 ## LOD-DESIGN §1.6 extension point for future distant-edit visibility. Specified but
 ## deliberately NOT implemented in v1 (a dug pit subtends < 0.3° at 192 m).
 func invalidate_tiles(_region: Rect2i) -> void:
 	pass
+
+# --- COSMOS R1 (M5_REAL): real-baked-geometry hooks -------------------------------
+
+## WorldManager sets the active chart (needed to bake + align). Called at chart init / install / flip.
+func set_chart(chart) -> void:
+	_chart = chart
+
+## Refresh the epoch bake frame + ring-0 blend context at the given window anchor (the recenter point).
+## Called from _recompute so the far re-anchors on the SAME 64 m cadence it already rebuilds on — offsets
+## stay f32-small and no floating-origin bookkeeping is needed (the frame is per-recenter for the far).
+func _refresh_bake(anchor_w: Vector3) -> void:
+	if _chart == null:
+		return
+	# COSMOS R2.2: once WorldManager locks a shared epoch frame (so near + far bake into the SAME frame and
+	# coincide), the far must NOT re-anchor its frame every 64 m — the rigid alignment absorbs the walk. The
+	# ring-0 window-blend is also retired (the near is real baked geometry now, not the bend, so the join is
+	# exact without blending). Both stay live in the R1-only (far-only) path where no epoch is locked.
+	if _epoch_locked:
+		return
+	_bake_anchor = anchor_w
+	_bake_frame = CosmosTruePlace.bake_frame(_chart, anchor_w)
+	_blend = {
+		"cam": anchor_w, "r0": float(INNER_HOLE_CURVED) - 8.0, "band": 24.0,
+		"radius": float(_chart.radius), "align": CosmosTruePlace.alignment_transform(_chart, _bake_frame, anchor_w),
+	}
+
+## The per-FRAME rigid alignment (study §1.2): re-level the baked epoch geometry under the player each
+## frame via a pure Transform3D on the align root. The align root absorbs this node's own `position`
+## (F.origin − position), so the baked tiles land at F·(local_origin+baked) regardless of reanchor/flip.
+func update_alignment(player_pos: Vector3) -> void:
+	if not CubeSphere.M5_REAL or _align_root == null or _chart == null or _bake_frame.is_empty():
+		return
+	var f := CosmosTruePlace.alignment_transform(_chart, _bake_frame, player_pos)
+	_align_root.transform = Transform3D(f.basis, f.origin - position)
+
+## COSMOS R2.2: apply a WorldManager-computed alignment F directly (the shared epoch frame is owned there so
+## near + far use ONE frame). Absorbs this node's own `position` like update_alignment. Used instead of
+## update_alignment once lock_epoch_frame is set, so near-terrain, far and (window-space) camera agree.
+func apply_alignment(f: Transform3D) -> void:
+	if _align_root == null:
+		return
+	_align_root.transform = Transform3D(f.basis, f.origin - position)
+
+## COSMOS R2.2: adopt WorldManager's shared epoch bake frame (fixed per epoch). Retires the per-64 m
+## self-refresh + the ring-0 blend (see _refresh_bake). The far now bakes tiles into the SAME frame the
+## near C++ mesher uses, so the near/far join is exact by construction.
+func lock_epoch_frame(frame: Dictionary) -> void:
+	_bake_frame = frame
+	_blend = {}
+	_epoch_locked = true
 
 ## COSMOS M3 home-face flip handoff (Fable Stage 1 + bug-B fix). The chart re-based onto a neighbour
 ## face, so this node's global-index frame jumped to `new_pos` = −(i_org, 0, j_org) on the new face.
@@ -186,6 +265,19 @@ func invalidate_tiles(_region: Rect2i) -> void:
 ## only, touches no voxel worker. No-op with no live tiles.
 func rebase_to(new_pos: Vector3, mwin: Array = [1, 0, 0, 1]) -> void:
 	if not ENABLED:
+		return
+	# COSMOS R1: baked tiles live under the align root in the OLD epoch frame — they can't bridge into the
+	# new epoch (the bake frame changes), so free them and rebuild fresh (the align root re-anchors at the
+	# next recenter; the horizon rebuilds in a couple of seconds, no stale-cover displacement risk).
+	if CubeSphere.M5_REAL and _align_root != null:
+		for c in _align_root.get_children():
+			c.queue_free()
+		_live.clear(); _live_tris.clear(); _desired.clear(); _queue.clear()
+		_active_key = null; _active_job = {}; _active_done = false
+		position = new_pos
+		_epoch_mwin = mwin
+		_bake_frame = {}                            # invalidate — next update_center re-anchors + rebuilds
+		_has_eval = false
 		return
 	var old_pos := position
 	# Drop any prior cover first (its terrain is now two flips stale — no longer trustworthy).
@@ -398,7 +490,13 @@ func _free_tile(key) -> void:
 	_live.erase(key)
 	_live_tris.erase(key)
 	if is_instance_valid(mi):
-		remove_child(mi)
+		# COSMOS R1: under M5_REAL the tile is parented to `_align_root`, not to this node, so removing it
+		# from `self` throws `p_child->data.parent != this`. Detach from its ACTUAL parent (align root in
+		# M5_REAL, self otherwise). queue_free alone would also work, but the explicit detach keeps the tree
+		# consistent within the frame (a same-key rebuild must not briefly see two nodes under one parent).
+		var p: Node = mi.get_parent()
+		if p != null:
+			p.remove_child(mi)
 		mi.queue_free()
 
 # --- build queue + per-frame budget (LOD-DESIGN §2.6) -------------------------
@@ -463,12 +561,22 @@ func _start_next() -> bool:
 
 func _commit(key, job: Dictionary) -> void:
 	var arrays := FarMeshBuilder.assemble(job)
-	var mesh := FarMeshBuilder.build_mesh(arrays, _material)
 	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	add_child(mi)
+	# COSMOS R1: bake the tile to TRUE positions (per-tile local origin) + cull the wedge + ring-0 blend,
+	# then parent under the align root (which carries the per-frame rigid alignment). node_origin = this
+	# node's `position` (= chart.node_origin()); place_true folds to the reanchor-invariant raw, so baked
+	# positions are stable regardless of when the tile is built. Falls back to the shader path otherwise.
+	if CubeSphere.M5_REAL and _align_root != null and _chart != null and not _bake_frame.is_empty():
+		var baked := FarMeshBuilder.bake_arrays(arrays, _chart, _bake_frame, position, _blend)
+		mi.mesh = FarMeshBuilder.build_mesh(baked, _material)
+		mi.position = baked["local_origin"]
+		_align_root.add_child(mi)
+		_live_tris[key] = int(baked["tri_count"])
+	else:
+		mi.mesh = FarMeshBuilder.build_mesh(arrays, _material)
+		add_child(mi)
+		_live_tris[key] = int(arrays["tri_count"])
 	_live[key] = mi
-	_live_tris[key] = int(arrays["tri_count"])
 
 # --- test / diagnostic hooks (verify_feature) ---------------------------------
 

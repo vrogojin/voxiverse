@@ -27,6 +27,14 @@ extends Node3D
 var _terrain: Node3D
 var _viewer: Node
 var _mesher: Object                     # the VoxelMesherBlocky (kept so restream can rebuild the terrain)
+# COSMOS R1 DEV (DEV_HIDE_NEAR): when true, hide the near render by collapsing the module's own streaming
+# radius to DEV_HIDDEN_VIEW_BLOCKS. Godot node visibility does NOT propagate to godot_voxel's RID mesh-block
+# instances, so `.visible=false` on the wrapper leaves chunks drawn — but max_view_distance is the module's
+# own lever, so shrinking it unloads the near field reliably (a tiny platform remains under the player). The
+# ramp (_process) respects this flag so the handoff never re-grows it while hidden. Render-only; analytic
+# physics/GroundCollider are untouched. Never set in normal play (only the dev toggle turns it on).
+var _render_hidden := false
+const DEV_HIDDEN_VIEW_BLOCKS := 8
 # COSMOS frozen-epoch (docs/COSMOS-AUDIT.md §3.2 items 3–4): the cube face this generator epoch is
 # homed on. Frozen onto each generator instance as `gen_face` at creation; a home-face flip creates a
 # NEW generator (new face) and restreams, rather than mutating the face workers are reading.
@@ -36,6 +44,43 @@ var _gen_face := CubeSphere.HOME_FACE
 # before folding, so the near render lands in the master-face orientation. Identity at spawn → byte-identical.
 var _gen_mwin: Array = [1, 0, 0, 1]
 
+# ============================ FP-M1c Planet Assembly (flag: CubeSphere.FP_M1_POOL) ============================
+# docs/COSMOS-FP-M1-DESIGN.md §4. A PlanetRoot node holds one FacetSlot per live facet terrain: the ACTIVE facet
+# (composite transform = T_active⁻¹·T_active = identity → axis-aligned + editable → physics/DDA/collider untouched)
+# and ≤ POOL_MAX_NEIGHBOURS render-only rotated neighbours (composite = T_active⁻¹·T_nb = the dihedral turn — the
+# SAME T_active⁻¹ convention the FacetFarRing uses, so the two live fields WELD at the shared ridge). Every slot
+# terrain streams from the ONE global player VoxelViewer (attach_viewer) and is `bounds`-clamped to its own facet
+# domain slab (§3.2 — no foreign block ever exists). A crossing = redesignate(): ONE PlanetRoot.transform write +
+# a view-distance rebalance; NO teardown, NO restream, NO new generator. All of it dormant unless FP_M1_POOL.
+var _planet_root: Node3D = null              # holds the FacetSlots; transform = T_active⁻¹ (rigid re-place on cross)
+# COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3): the accumulated floating-origin integer shift.
+# Under the fixed frame PlanetRoot pins @ (identity − _anchor_offset); a re-anchor (WorldManager) pushes shift_anchor()
+# to slide every FacetSlot/LOD tile back toward the render origin. ZERO (byte-identical) with the flag off.
+var _anchor_offset: Vector3 = Vector3.ZERO
+var _pool: Dictionary = {}                   # fid -> FacetSlot dict {terrain, slot, mesher, generator, spawn_ms, view, editable}
+var _pool_active := -1                        # the currently-active (editable, composite-identity) facet id
+# A1 CROSSING INSTRUMENTATION (#114): the last redesignate()'s attribution metrics, populated ONLY inside
+# redesignate() and drained by WorldManager.maybe_cross_facet (take_last_redesignate). Empty until a crossing
+# occurs; redesignate runs on the crossing path only (FACETED+FP_M1_POOL), so this adds ZERO per-frame cost and
+# is unreachable when the faceted flags are off (FLAT byte-identity preserved).
+var _last_redesignate: Dictionary = {}
+# COSMOS FP-M2b (docs/COSMOS-FP-M2-DESIGN.md §5): the LOD-mesh layer, a child of PlanetRoot @ identity that draws
+# the near rings of non-active facets as blocky LOD meshes (+ ridge aprons) instead of far-ring quads. Owns ONE
+# FacetLodBuilder (the M2a off-thread build primitive). null unless FP_M2_LOD (dead code → FP-M1c byte-identical).
+var _lod_mesher = null
+# COSMOS FP-M2c (§6.5.3 surface 3): the load-adaptive view-ramp pace ∈ [0,1] pushed by the StreamLoadController via
+# set_stream_pace. Multiplies the per-frame GROW leg of every view ramp (single-terrain + pool), so RAMP_SECONDS is
+# the MINIMUM leg duration, stretched (never compressed) under load; pace 0 fully HOLDS a grow. Shrinks (unloads) are
+# never throttled. Default 1.0 → byte-identical to the shipped fixed ramp (M2c never calls it with <1; M2d does).
+var _stream_pace := 1.0
+var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
+var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
+                                              # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
+                                              # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
+# §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
+const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
+const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
+
 # COSMOS Stage 4 — post-flip view-distance ramp (kills the seam-cross freeze without moving spawn).
 # A home-face flip recreates the VoxelTerrain; jamming its max_view_distance to the full near radius in
 # one step re-queues the ENTIRE near disk (~2.6k blocks) in a single process pass → the 2 web workers +
@@ -43,6 +88,11 @@ var _gen_mwin: Array = [1, 0, 0, 1]
 # at RAMP_START_BLOCKS and grows to the target over RAMP_SECONDS, so the nearest ring meshes first and
 # worker load ramps in instead of spiking (the far LOD, now frame-correct, covers the gap). The FINAL
 # view is identical — this is pure load-shaping. Active only in the ~1-2s after a flip restream.
+# FP-M1c (§5) GENERALIZES this same load-shaping to the neighbour POOL: each FacetSlot carries its own view ramp
+# (view_f/view_target/ramp_from) so a spawned neighbour fills 48→96 over RAMP_SECONDS and a crossing's `to` fills
+# 96→128 over RAMP_SECONDS — both spread across frames instead of a one-pass burst at the facet border. The pool
+# ramp (_ramp_pool_step) advances at most ONE slot per frame; this single-terrain _ramp_* state stays for the
+# flag-OFF (FP-S1) restream path only, which the pool never takes (redesignate replaces restream).
 const RAMP_START_BLOCKS := 48.0
 const RAMP_SECONDS := 1.5
 var _ramp_active := false
@@ -93,6 +143,8 @@ var _next_arid := 0                     # next free library model index / ARID t
 const _GEN_STRIDE := 256                 # max BOTTOM corner-height modifier (0xAA) + margin
 var _gen_arid: PackedInt32Array          # (mat*_GEN_STRIDE + modifier) -> ARID; frozen at setup
 var _generator: Object                   # the runtime-compiled generator (kept for verify)
+var _gen_script_cache: GDScript = null   # FP-S1(e): the generator SOURCE compiled once (the src literal is constant —
+                                         # facet/lod/frame are per-instance properties), reused across restreams/crossings
 
 # --- snow-cap state variant table (M1 snowy-world ADR §5) -----------------------
 # A PARALLEL per-state frozen table (the liquid-twin discipline), NOT a re-keyed _gen_arid: for
@@ -135,6 +187,16 @@ const _COMP_MESH_FLAG := 1 << 22         # _shape_mesh_cache key bit for snow-fi
 const _SLOPE_STRIDE := 4096
 var _slope_arid: PackedInt32Array        # (mat*_SLOPE_STRIDE + payload) -> ARID; -1 = not baked; frozen at setup
 var _snow_slope_arid: PackedInt32Array   # (mat*_SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
+# COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md, patch 0004): the seam junction bevel is now a MESHER-side
+# per-facet clip (VoxelMesherBlocky.set_facet_carve), not a per-facet baked manifest. The worker/mirrors
+# write a plain carve-SENTINEL cube per material; the compiled mesher clips it by the active facet's ridge
+# planes. Two per-material tables (dry + snow-capped) into a CONTIGUOUS ARID range [_carve_base, +_carve_count)
+# so the C++ mesher identifies sentinels by a cheap range test. A -1 slot / unpatched binary cube-falls-back
+# (the full-cube lip — never a hole). Facet-INDEPENDENT (plain cubes), so a crossing only re-pushes the planes.
+var _carve_arid: PackedInt32Array        # mat -> dry carve-sentinel cube ARID; -1 = not baked
+var _carve_snow_arid: PackedInt32Array   # mat -> snow-capped carve-sentinel cube ARID; -1 = not baked
+var _carve_base := 0                      # first carve-sentinel ARID (contiguous range start)
+var _carve_count := 0                     # number of carve-sentinel ARIDs baked
 
 # --- liquid appearance, PER KIND (WATER-SHORE §4.2 / WATERLOGGING §4 / MULTI-LIQUID §2.2) -----
 # Generalized from the water-only wiring to one set of tables PER liquid kind (CellCodec
@@ -254,7 +316,8 @@ func setup() -> bool:
 	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
 	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
 	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
-	_set_if(_terrain, "max_view_distance", TerrainConfig.near_render_radius())
+	_set_if(_terrain, "max_view_distance",
+		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else TerrainConfig.near_render_radius())
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -271,7 +334,18 @@ func setup() -> bool:
 	_set_if(_terrain, "generate_collisions", false)
 	# Each block model (ids 1..count()-1) carries its own material; no terrain-wide
 	# material_override needed.
-	add_child(_terrain)
+	# COSMOS FP-CARVE (patch 0004): push the active facet's ridge planes into the mesher's carve blob BEFORE
+	# the terrain starts streaming, so the first meshed block already clips its seam junction sentinels.
+	_push_facet_carve()
+	# FP-M1c (§4.1): under the pool flag the active terrain lives in a FacetSlot under PlanetRoot (composite
+	# identity — byte-identical world placement to the direct-child path, just reparented), bounds-clamped to
+	# its own facet slab. Flag OFF ⇒ the shipped single-terrain scene graph (add_child at ZERO), untouched.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
+		_pool_init_active()
+		# FP-M2b (§5): stand up the LOD-mesh layer under PlanetRoot. Dead unless FP_M2_LOD (setup returns false).
+		_lod_setup()
+	else:
+		add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
 	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
 	set_process(false)
@@ -283,10 +357,11 @@ func setup() -> bool:
 ## target is reached; dormant (processing off) at every other time.
 func _process(delta: float) -> void:
 	# Ramp step (unchanged): grow the fresh terrain's view distance from RAMP_START_BLOCKS to the target.
+	# DEV_HIDE_NEAR: while the near render is hidden, never re-grow the view distance (keep it collapsed).
 	if _ramp_active:
 		var span := maxf(_ramp_target - RAMP_START_BLOCKS, 1.0)
-		_ramp_view = minf(_ramp_view + span * delta / RAMP_SECONDS, _ramp_target)
-		if _terrain != null:
+		_ramp_view = minf(_ramp_view + span * delta * _stream_pace / RAMP_SECONDS, _ramp_target)
+		if _terrain != null and not _render_hidden:
 			_set_if(_terrain, "max_view_distance", int(round(_ramp_view)))
 		if _ramp_view >= _ramp_target:
 			_ramp_active = false
@@ -298,8 +373,92 @@ func _process(delta: float) -> void:
 			_free_cover("meshed")
 		elif _cover_age >= NEAR_COVER_MAX_SECONDS:
 			_free_cover("timeout")
-	# Stay processing only while there is still ramp or cover work to do; otherwise go dormant.
-	set_process(_ramp_active or _cover_terrain != null)
+	# FP-M1c per-slot pool view ramp (§5). Independent of the single-terrain _ramp_active (which the pool crossing
+	# never uses — redesignate replaces restream). Bounded to ONE growing slot per frame (see _ramp_pool_step), so
+	# several slots ramping at once can never collectively burst the workers + main-thread mesh-apply.
+	var pool_ramping := false
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and not _render_hidden and not _pool.is_empty():
+		pool_ramping = _ramp_pool_step(delta)
+	# FP-M2b: drain + apply finished LOD meshes/aprons under the mesher's own per-frame budget (off the voxel pool).
+	if _lod_mesher != null:
+		_lod_mesher.tick()
+	# Stay processing only while there is still ramp / cover / pool-ramp / LOD work to do; otherwise go dormant.
+	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null)
+
+## FP-M1c: (re)enable per-frame processing so the per-slot pool view ramp advances. Safe to call repeatedly; a no-op
+## when the pool flag is off or the near render is dev-hidden (the ramp must never re-grow a deliberately hidden field).
+func _pool_ramp_kick() -> void:
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and not _render_hidden:
+		set_process(true)
+
+## FP-M1c per-slot view-distance ramp step (§5 — the border-hitch fix). Grows AT MOST ONE slot's max_view_distance
+## per frame — the ACTIVE facet first (so a crossing's `to` reaches full stream ASAP), else the OLDEST neighbour (so
+## it finishes and frees the single grow channel before the next starts). Serializing the grows bounds the total
+## newly-requested view volume per frame to a single slot's RAMP_SECONDS-paced step, so N slots ramping concurrently
+## can never collectively flood the 2 web workers + the main-thread mesh-apply. Shrinks (view_f > target) only UNLOAD,
+## so every shrinking slot snaps immediately the same frame. Returns true while any slot still has growing to do.
+func _ramp_pool_step(delta: float) -> bool:
+	var up_fid := -1
+	var up_spawn := 0
+	var up_active := false
+	for fid in _pool:
+		var s: Dictionary = _pool[fid]
+		var cur: float = s["view_f"]
+		var tgt: float = s["view_target"]
+		if cur > tgt + 0.5:
+			# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
+			s["view_f"] = tgt
+			s["view"] = int(round(tgt))
+			_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+		elif cur < tgt - 0.5:
+			# Grow candidate — pick ONE: active wins; else the oldest (smallest spawn_ms).
+			var is_active := (int(fid) == _pool_active)
+			if up_fid < 0 or (is_active and not up_active) \
+					or (is_active == up_active and int(s["spawn_ms"]) < up_spawn):
+				up_fid = int(fid)
+				up_spawn = int(s["spawn_ms"])
+				up_active = is_active
+	if up_fid < 0:
+		return false
+	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
+	var sc: Dictionary = _pool[up_fid]
+	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
+	# FP-M2c surface 3: the GROW leg is paced by the load controller (RAMP_SECONDS = the min duration, stretched under
+	# load; pace 0 holds the grow). Default pace 1.0 → the shipped ramp math verbatim. Shrinks above snapped separately.
+	# CONTROLLER-FIX §P3c: the committed imminent slot must keep streaming even when surface-3 pace is held at 0 (else a
+	# geometric-commit spawn sits at RAMP_START_BLOCKS forever) — floor ONLY that slot at RELIEF_FLOOR (worst-case ramp
+	# RAMP_SECONDS/0.25 = 6 s, inside the commit lead time); every other slot keeps the fully-gated pace for optional volume.
+	var pace := _stream_pace
+	if up_fid == _imminent_fid:
+		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
+	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
+	sc["view"] = int(round(float(sc["view_f"])))
+	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
+	return true
+
+## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
+## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
+## module unloads the near field, leaving only a tiny platform under the player so the baked far layer can
+## be assessed without the near overlap. Render-only; analytic physics is untouched.
+func set_render_hidden(hidden: bool) -> void:
+	_render_hidden = hidden
+	if _terrain != null:
+		_set_if(_terrain, "max_view_distance",
+			DEV_HIDDEN_VIEW_BLOCKS if hidden else TerrainConfig.near_render_radius())
+
+## COSMOS R2.2: install/clear the frozen-per-epoch near-field true-geometry bake on the mesher (the C++
+## VoxelMesherBlocky.set_cosmos_bake). `flat_params` is CosmosTruePlace.pack_bake_params_flat, or an empty
+## Dictionary / {enabled:false} to restore the plain flat mesher. No-op if the module lacks the method (an
+## engine built without patch 0003) — so the game still runs (near renders flat-window) on an old binary.
+func set_cosmos_bake(flat_params: Dictionary) -> void:
+	if _mesher != null and _mesher.has_method("set_cosmos_bake"):
+		_mesher.call("set_cosmos_bake", flat_params)
+
+# COSMOS R2.2 NOTE: an earlier design rotated the VoxelTerrain by the per-frame F to render the static baked
+# near field around the window-space camera. That is NOT viable — godot_voxel inverts a singular basis when
+# its transform is rotated (Basis.invert det==0 spam every streaming query). The shipped design (Design Z)
+# instead leaves the terrain unrotated (blocks render at their baked epoch coords via identity placement)
+# and moves the CAMERA into the epoch frame (see WorldManager.m5_epoch_camera + Player.set_render_camera).
 
 ## Set one voxel from a PACKED cell value (0 = air/break; >0 = place). Resolves the
 ## value's (material, modifier) to its ARID — allocating a shaped ARID lazily on this
@@ -428,6 +587,17 @@ func arid_for_cell(packed: int) -> int:
 					var wslot := mat * _GEN_STRIDE + modifier
 					if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 						return twin[wslot]
+	# COSMOS FP-CARVE (patch 0004): a seam junction cell (produced by junction_modify) → its carve-SENTINEL
+	# cube (the mesher clips it); the snow-capped variant when capped. FIRST lf==0 arm — junction_modify
+	# discards the original modifier, so snow-fill/slope/snow-cap never apply. Unbaked → cube (via arid_for).
+	# Keeps this main-thread mirror in lockstep with the worker + gen_arid_for (the equality discipline, B5).
+	if lf == 0 and CellCodec.is_junction(CellCodec.modifier(packed)):
+		var jmat := CellCodec.mat(packed)
+		if CellCodec.has_state(packed, CellCodec.STATE_SNOW_CAPPED) and jmat < _carve_snow_arid.size() and _carve_snow_arid[jmat] >= 0:
+			return _carve_snow_arid[jmat]
+		if jmat < _carve_arid.size() and _carve_arid[jmat] >= 0:
+			return _carve_arid[jmat]
+		# else fall through to arid_for → cube lip (never a hole)
 	# Snow-FILL composite (SNOW-ACCUMULATION §2.6): a terrain ramp buried/filled by the snow plane wins
 	# over the plain snow-cap skin (a filled cell is always cold ⇒ also capped). The true level rounds UP
 	# to a baked {3,5,8,10}; an unbaked composite falls through to the snow-cap skin below (the ladder).
@@ -614,6 +784,9 @@ func _build_gen_manifest(library: Object) -> void:
 	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
 	var slope := _build_slope_manifest(library, total)
 	appended += slope
+	# COSMOS FP-CARVE (patch 0004): the seam junction carve-SENTINEL cubes (empty/no-op when not faceted).
+	var junctions := _build_carve_manifest(library, total)
+	appended += junctions
 
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
@@ -626,6 +799,9 @@ func _build_gen_manifest(library: Object) -> void:
 		% [comps, TerrainConfig.emitted_cold_pairs().size()])
 	print("[module_world] baked slope manifest: %d SHARP-SLOPE models (%d emitted (mat,payload) pairs, incl. snow twins)"
 		% [slope, TerrainConfig.emitted_slope_pairs().size()])
+	if CubeSphere.FACETED:
+		print("[module_world] baked carve manifest: %d seam-junction sentinel cubes (facet %d, ARID range [%d,%d))"
+			% [junctions, TerrainConfig.active_facet(), _carve_base, _carve_base + _carve_count])
 	if _waterlog_enabled:
 		print("[module_world] baked waterlog manifest: %d waterlogged composite twins total; surface ARIDs water=%d lava=%d"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER], _surface_arid[CellCodec.LIQ_LAVA]])
@@ -852,6 +1028,64 @@ func _build_slope_manifest(library: Object, total: int) -> int:
 			appended += 1
 	return appended
 
+## COSMOS FP-CARVE (patch 0004) — bake the seam junction carve-SENTINEL cubes into a CONTIGUOUS ARID range.
+## The per-facet bevel geometry now lives in the COMPILED mesher (VoxelMesherBlocky.set_facet_carve), which
+## clips a plain cube by the active facet's ridge planes at mesh time — so the manifest shrinks to ONE plain
+## cube per candidate material (dry) plus its snow-capped variant (~20-30 models vs the old 1152 per-facet
+## bevels). Facet-INDEPENDENT (plain cubes), so a crossing re-pushes only the planes (_push_facet_carve), no
+## re-bake. Records _carve_arid / _carve_snow_arid (per material) + _carve_base/_carve_count (the range the
+## mesher range-tests). Empty/no-op when not faceted. Same anti-drift discipline; a drift aborts (leaving the
+## rest -1 → the full-cube lip on the worker, never a hole). Reads active_facet (set before the generator).
+func _build_carve_manifest(library: Object, total: int) -> int:
+	_carve_arid = PackedInt32Array()
+	_carve_snow_arid = PackedInt32Array()
+	_carve_base = 0
+	_carve_count = 0
+	if not CubeSphere.FACETED:
+		return 0
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return 0
+	_carve_arid.resize(total)
+	_carve_arid.fill(-1)
+	_carve_snow_arid.resize(total)
+	_carve_snow_arid.fill(-1)
+	# Only the TERRAIN materials touch a facet seam — the surface set, the shaped (slope) set (sub-surface
+	# stone/dirt), plus STONE (mountain peaks). Ores, wood, crafted blocks never reach a ridge.
+	var matset := {}
+	for m: int in TerrainConfig.appearance_surface_materials():
+		matset[m] = true
+	for pair: int in TerrainConfig.emitted_slope_pairs():
+		matset[pair / _SLOPE_STRIDE] = true
+	matset[BlockCatalog.STONE] = true
+	_carve_base = _next_arid                              # contiguous range start (set now → valid on early return)
+	var appended := 0
+	for mat: int in matset.keys():
+		if mat <= BlockCatalog.AIR or mat >= total or BlockCatalog.solidity_of(mat) < 0.5:
+			continue
+		# dry carve-sentinel cube
+		var expected := _next_arid
+		var got: int = _add_cube(library, BlockMaterials.get_for(mat), BlockCatalog.cull_group_of(mat))
+		if got != expected:
+			push_warning("[module_world] carve manifest ARID drift: add_cube %d != expected %d" % [got, expected])
+			_carve_count = appended
+			return appended
+		_next_arid += 1
+		_carve_arid[mat] = got
+		appended += 1
+		# snow-capped carve-sentinel cube (upgrades a capped straddle from cube-lip to carved, B5)
+		var expected2 := _next_arid
+		var got2: int = _add_cube(library, BlockMaterials.snow_capped_for(mat), BlockCatalog.cull_group_of(mat))
+		if got2 != expected2:
+			push_warning("[module_world] carve snow manifest ARID drift: add_cube %d != expected %d" % [got2, expected2])
+			_carve_count = appended
+			return appended
+		_next_arid += 1
+		_carve_snow_arid[mat] = got2
+		appended += 1
+	_carve_count = appended
+	return appended
+
 ## Allocate + zero-init (`-1`) a kind's twin table (`total * _GEN_STRIDE`) and publish it into
 ## `_gen_twin_arid[kind]`. Returns the fresh PackedInt32Array so the caller can fill it in place.
 func _ensure_twin_table(kind: int, total: int) -> PackedInt32Array:
@@ -1030,6 +1264,15 @@ func gen_arid_for(mat: int, modifier: int, liquid_level := 0, liquid_kind := Cel
 			if modifier < _GEN_STRIDE and wslot < twin.size() and twin[wslot] >= 0:
 				return twin[wslot]
 		# unbaked submerged twin → dry shape (fall through)
+	# COSMOS FP-CARVE (patch 0004) mirror: a seam junction cell → its carve-SENTINEL cube (the mesher clips
+	# it), the snow-capped variant when capped. FIRST liquid_level==0 arm, exactly as the worker / arid_for_cell
+	# (equality discipline, B5). `state` carries the snow_capped bit. Unbaked → cube (never a hole).
+	if liquid_level == 0 and CellCodec.is_junction(modifier):
+		if (state & CellCodec.STATE_SNOW_CAPPED) != 0 and mat < _carve_snow_arid.size() and _carve_snow_arid[mat] >= 0:
+			return _carve_snow_arid[mat]
+		if mat < _carve_arid.size() and _carve_arid[mat] >= 0:
+			return _carve_arid[mat]
+		return _cube_arid_of(mat)                        # unbaked → cube lip (never a hole)
 	# Snow-FILL composite mirror (SNOW-ACCUMULATION §2.6): a filled ramp resolves to its curated composite
 	# ARID (rounding the level UP), exactly as arid_for_cell / the worker do — checked BEFORE the snow-cap
 	# skin (a filled cell is always also capped). `state` carries the fill nibble (bits 1..4).
@@ -1105,6 +1348,657 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 	_gen_face = face
 	_gen_mwin = mwin                                  # COSMOS-FRAME-ORIENTATION §5.1: freeze the new epoch's M_win
 	restream(old_wrapper_pos)
+
+## COSMOS FACETED §6.1 / FP-CARVE (patch 0004) — the crossing restream. Install a fresh generator epoch homed
+## on facet `fid` (its gen_facet reads TerrainConfig.active_facet(), which WorldManager sets to `fid` BEFORE
+## this call) and hard-restream (the M4 cover + view-distance ramp hides the swap). FP-CARVE makes the seam
+## bevel a MESHER-side per-facet clip, so a crossing just RE-PUSHES the new facet's ridge planes — the carve
+## sentinel cubes are facet-independent, so no library re-bake (which is all-or-nothing, ~13s web stall). The
+## push happens BEFORE restream() (B7) so no in-flight block can mesh a junction cell with stale planes.
+func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
+	_push_facet_carve()                               # push the NEW facet's ridge planes (B7: before restream)
+	restream(old_wrapper_pos)
+
+## COSMOS FP-CARVE (patch 0004) — push the active facet's own-side ridge planes into the compiled mesher's
+## carve blob (VoxelMesherBlocky.set_facet_carve). has_method-guarded (B12): an unpatched binary ignores it and
+## the sentinels bake as plain cubes (the full-cube lip — never a hole). No-op (disables the carve) when not
+## faceted, no active facet, or nothing baked. Called at setup (after the manifest) and at each crossing.
+func _push_facet_carve() -> void:
+	if _mesher == null or not _mesher.has_method("set_facet_carve"):
+		return
+	var fid := TerrainConfig.active_facet()
+	if not CubeSphere.FACETED or _carve_count <= 0 or fid < 0:
+		_mesher.call("set_facet_carve", {"enabled": false})
+		return
+	_mesher.call("set_facet_carve", {
+		"enabled": true,
+		"planes": FacetAtlas.seam_planes_f64(fid),
+		"arid_base": _carve_base,
+		"arid_count": _carve_count,
+	})
+
+# ============================ FP-M1c Planet Assembly pool (flag: CubeSphere.FP_M1_POOL) ============================
+# The pooled rotated-neighbour terrains + re-designation crossing (docs/COSMOS-FP-M1-DESIGN.md §4, §5). Reuses THIS
+# module's ONE baked VoxelBlockyLibrary + generator factory + carve tables; each pool terrain gets its OWN mesher
+# (own carve blob) + OWN generator frozen on its fid (the frozen-epoch discipline — each worker reads its own
+# immutable gen_facet). Exactly ONE VoxelViewer (attach_viewer) serves all of them; NO static/extra viewers ever.
+
+## Build a bounds-clamped VoxelTerrain frozen on `fid` with its own mesher+carve+generator, parented under a
+## FacetSlot @ facet_transform(fid) below PlanetRoot. Returns the FacetSlot dict, or {} on failure. Shared by the
+## active-facet init and every neighbour spawn (the ONE construction path — §4.1). Adds NO viewer.
+func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
+	if _library == null or not ClassDB.class_exists("VoxelTerrain"):
+		return {}
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return {}
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	# The facet's OWN-side ridge planes into ITS OWN carve blob (patch 0004, per-mesher, facet-static). Guarded:
+	# an unpatched binary lacks set_facet_carve → the sentinels bake as plain cubes (full-cube lip, never a hole).
+	if mesher.has_method("set_facet_carve"):
+		if _carve_count > 0 and fid >= 0:
+			mesher.call("set_facet_carve", {
+				"enabled": true,
+				"planes": FacetAtlas.seam_planes_f64(fid),
+				"arid_base": _carve_base,
+				"arid_count": _carve_count,
+			})
+		else:
+			mesher.call("set_facet_carve", {"enabled": false})
+	var generator: Object = _make_generator(fid)   # OWN generator frozen on this fid's gen_facet (worker-safe)
+	if generator == null:
+		return {}
+	var terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if terrain == null:
+		return {}
+	_set_if(terrain, "mesher", mesher)
+	_set_if(terrain, "generator", generator)
+	_set_if(terrain, "max_view_distance", view_blocks)
+	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "generate_collisions", false)
+	_apply_bounds(terrain, fid)                     # §3.2: clamp to this facet's domain slab — no foreign block exists
+	var slot := Node3D.new()
+	slot.name = "FacetSlot_%d" % fid
+	slot.transform = FacetAtlas.facet_transform(fid)
+	_planet_root.add_child(slot)
+	slot.add_child(terrain)
+	return {
+		"terrain": terrain, "slot": slot, "mesher": mesher, "generator": generator,
+		"spawn_ms": Time.get_ticks_msec(), "view": view_blocks, "editable": editable, "fid": fid,
+		# FP-M1c per-slot view-distance ramp (§5 load-shaping). view_f is the live FLOAT radius the ramp advances;
+		# view_target its goal; ramp_from the radius the current leg started at (a leg takes RAMP_SECONDS from
+		# ramp_from → view_target regardless of target size). Defaults = NO ramp (target == current == view_blocks):
+		# only pool_spawn / redesignate opt a slot into a ramp, so the active-init and pool_reset paths stay full-view.
+		"view_f": float(view_blocks), "view_target": float(view_blocks), "ramp_from": float(view_blocks),
+	}
+
+## Clamp a terrain's streaming to its facet's domain slab (§3.2). The engine clips every view box against `bounds`
+## (voxel_terrain.cpp:1296,1314), so no data/mesh block outside the slab is ever requested, allocated, or meshed —
+## a GEOMETRIC per-terrain memory ceiling independent of viewer behaviour (the spike's missing clamp, §2 defect 2).
+func _apply_bounds(terrain: Object, fid: int) -> void:
+	if terrain == null or not (terrain.has_method("set_bounds") or _has_prop(terrain, "bounds")):
+		return
+	var dmin: Vector2i = FacetAtlas.dom_min(fid)    # facet-lattice (x,z); domain already includes MARGIN_CELLS
+	var dmax: Vector2i = FacetAtlas.dom_max(fid)
+	var y_min := float(TerrainConfig.BEDROCK_FLOOR)
+	var y_max := float(TerrainConfig.MAX_SURFACE_Y + max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS))
+	var pos := Vector3(float(dmin.x) - 2.0, y_min, float(dmin.y) - 2.0)   # +2 seam strip (§3.2)
+	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
+	_set_if(terrain, "bounds", AABB(pos, size))
+
+## FP-M2b (§5): create the FacetLodMesher under PlanetRoot and prime its static tiers on the active facet. Safe
+## no-op unless FP_M2_LOD (mesher.setup returns false → _lod_mesher stays null and the LOD path is fully dead).
+func _lod_setup() -> void:
+	if not CubeSphere.FP_M2_LOD or _planet_root == null:
+		return
+	var scr: Script = load("res://src/world/facet_lod_mesher.gd")
+	if scr == null:
+		return
+	var m = scr.new()
+	m.name = "FacetLodMesher"
+	_planet_root.add_child(m)
+	if not bool(m.call("setup", self)):
+		_planet_root.remove_child(m)
+		m.free()
+		return
+	_lod_mesher = m
+	_lod_mesher.call("set_active_facet", _pool_active)
+	if _load_ctrl != null:                            # FP-M2c: a pool_reset rebuild re-forwards the controller (§6.5)
+		_lod_mesher.call("set_load_controller", _load_ctrl)
+	set_process(true)
+
+## FP-M2b: join the builder Thread before the node tree tears down (a bare free would leak the running Thread).
+func _exit_tree() -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("shutdown")
+		_lod_mesher = null
+
+## FP-M2b far-ring merge (§5.5): the facets whose LOD mesh is APPLIED (excluded from the quad ring). [] with the
+## flag off / no mesher — the WorldManager merge then reduces to the shipped pool-neighbour exclusion.
+func lod_covered_fids() -> Array:
+	return _lod_mesher.call("covered_fids") if _lod_mesher != null else []
+
+## FP-M2b gate accessor: the live FacetLodMesher (verify_fp_m2 drives caps/frame/seam through it). null with the flag off.
+func lod_mesher():
+	return _lod_mesher
+
+## FP-M2d (§9.1): drop the held LOD cover for promoting facet `fid` — WorldManager calls this once `fid`'s live terrain
+## seam band has meshed (pool_seam_meshed) or the promote timeout expires. No-op without a mesher (flag off).
+func lod_evict(fid: int) -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("evict", fid)
+
+## FP-M2d (§9.1): lift the promote HOLD without evicting — the facet retired before its promote completed, so its LOD
+## mesh stays but normal want-management resumes. WorldManager calls this from _lod_promote_pass. No-op without a mesher.
+func lod_end_promote(fid: int) -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("end_promote", fid)
+
+## FP-M2d (§6.5.4): sustained-overload relief — coarsen one least-wanted LOD facet a tier (pause-first; live terrains
+## untouched). WorldManager calls this only while StreamLoadController.demote_pressure() holds. No-op without a mesher.
+func lod_demote_pressure() -> void:
+	if _lod_mesher != null:
+		_lod_mesher.call("demote_pressure_relief")
+
+## FP-M2d M2e-WIRE hook: the FacetLodMesher stats snapshot (facet/tri/byte ledgers, in-flight, aprons) — forwarded up
+## through WorldManager.lod_stats() for the soak/heap-A/B harness. {} without a mesher (flag off).
+func lod_stats() -> Dictionary:
+	return _lod_mesher.call("stats") if _lod_mesher != null else {}
+
+## FP-M2d (§9.1): has PROMOTING neighbour `fid`'s seam-side band (the strip of `fid` nearest the player) finished
+## MESHING? The player's ACTIVE-facet-lattice position is reframed into `fid`'s lattice (= `fid`'s terrain LOCAL space,
+## since the slot applies facet_transform(fid) over fid-lattice geometry) and probed with is_area_meshed. Returns true
+## when `fid` is not live / the terrain lacks is_area_meshed (never block a promote's completion on a missing probe).
+func pool_seam_meshed(fid: int, player_active_pos: Vector3) -> bool:
+	if not _pool.has(fid):
+		return true
+	var t: Object = _pool[fid]["terrain"]
+	if t == null or not t.has_method("is_area_meshed"):
+		return true
+	var lp := FacetAtlas.reframe_position64(_pool_active, fid,
+		player_active_pos.x, player_active_pos.y, player_active_pos.z)
+	var c := Vector3(float(lp[0]), float(lp[1]), float(lp[2]))
+	var half := Vector3(32.0, 40.0, 32.0)
+	return bool(t.call("is_area_meshed", AABB(c - half, half * 2.0)))
+
+## FP-M2c (§6.5.3 surface 3): set the pool view-ramp pace ∈ [0,1] from the StreamLoadController. The GROW leg of every
+## view ramp is stretched by `f` (RAMP_SECONDS the min duration; f=0 holds it). Clamped; default 1.0 → the shipped
+## fixed ramp. M2d calls this each frame with the controller's stream_pace(); M2c leaves it at 1.0 (byte-identical).
+func set_stream_pace(f: float) -> void:
+	_stream_pace = clampf(f, 0.0, 1.0)
+
+## FP-M2c (§6.5): store the StreamLoadController (owned by WorldManager) and forward it to the FacetLodMesher, which
+## scales its LOD apply-ms + build grants by the credit (surfaces 1-2). No-op if the mesher is absent (flag off).
+func set_load_controller(c) -> void:
+	_load_ctrl = c
+	if _lod_mesher != null:
+		_lod_mesher.call("set_load_controller", c)
+
+## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
+## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).
+func set_imminent_fid(fid: int) -> void:
+	var prev := _imminent_fid
+	_imminent_fid = fid
+	if _lod_mesher != null:
+		_lod_mesher.call("set_imminent_fid", fid)
+	# COSMOS-FP-CROSSING-PREGEN (#114): pre-grow the COMMITTED imminent slot to the ACTIVE near radius during the approach
+	# so redesignate's 96→128 fill is already done at the seam (zero new generation on the crossing frame). The relief-
+	# floored imminent leg of _ramp_pool_step paces the extra annulus across the ~6 s approach. A slot that STOPS being the
+	# imminent (reverse / corner-switch) and is not the active drops back to 96 (a shrink → snapped unload) so the enlarged
+	# live volume is held ONLY for the facet we are crossing to (NEVER-OOM: at most one 128-view neighbour). Gated on the
+	# fixed frame — a fuller imminent is free there (O(1) crossing, §9) but would enlarge the redesignate transform write
+	# otherwise. Off ⇒ this whole block is skipped and view_target stays 96 (byte-identical to the shipped FP-M2d ramp).
+	if not (CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on()):
+		return
+	if prev == fid:
+		return
+	var target := minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	# Demote the OUTGOING imminent (if it is a live non-active neighbour) back to the neighbour radius.
+	if prev >= 0 and prev != _pool_active and _pool.has(prev):
+		var ps: Dictionary = _pool[prev]
+		if float(ps["view_target"]) > 96.0:
+			ps["view_target"] = 96.0
+			ps["ramp_from"] = float(ps["view_f"])       # shrink leg → snapped by the next _ramp_pool_step (cheap unload)
+			_pool_ramp_kick()
+	# Promote the INCOMING imminent (if already spawned; a fresh spawn is handled in pool_spawn) to the active radius.
+	if fid >= 0 and fid != _pool_active and _pool.has(fid):
+		var s: Dictionary = _pool[fid]
+		if float(s["view_target"]) < target:
+			s["view_target"] = target
+			s["ramp_from"] = float(s["view_f"])          # grow leg from wherever it sits now; paced (relief-floored) grow
+			_pool_ramp_kick()
+
+## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
+## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view
+## (near_render_radius = 128) + already-pushed carve; it just moves under PlanetRoot. Called once from setup().
+## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §10 decision 5) — the fixed frame is active only with
+## its flag AND both prerequisites on. When on, PlanetRoot is PINNED @ identity (the scene frame IS the planet-
+## absolute frame) so each FacetSlot's global == its own T_fid (its true place) and a crossing NEVER re-writes
+## PlanetRoot (no NOTIFICATION_TRANSFORM_CHANGED). Off ⇒ PlanetRoot @ T_active⁻¹ exactly as today (byte-identical).
+func _fixed_frame_on() -> bool:
+	return CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL
+
+## The PlanetRoot transform for `active_fid`: identity (minus the re-anchor offset) under the fixed frame (absolute
+## scene frame), else the shipped T_active⁻¹ that re-centres the active facet at the lattice origin.
+func _planet_root_placement(active_fid: int) -> Transform3D:
+	return Transform3D(Basis.IDENTITY, -_anchor_offset) if _fixed_frame_on() else FacetAtlas.facet_transform(active_fid).affine_inverse()
+
+## COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1) — slide PlanetRoot (hence
+## EVERY child FacetSlot AND the LOD-tile layer) by −A so the rendered planet-absolute coords stay near the origin
+## for large-planet f32 headroom. This is the ONE transform write that fires godot_voxel's NOTIFICATION_TRANSFORM_
+## CHANGED per-mesh-block re-place — ACCEPTED because a re-anchor fires FAR less often than a crossing (only when
+## |player_abs| > REANCHOR_TRIGGER_BLOCKS, i.e. never at R = 3072), so it is one rare re-place, never on the hot
+## crossing path. No-op unless the fixed frame is on and PlanetRoot exists (byte-identical off).
+func shift_anchor(a: Vector3) -> void:
+	if not _fixed_frame_on() or _planet_root == null:
+		return
+	_anchor_offset += a
+	_planet_root.position = -_anchor_offset
+
+func _pool_init_active() -> void:
+	_pool_active = TerrainConfig.active_facet()
+	_planet_root = Node3D.new()
+	_planet_root.name = "PlanetRoot"
+	_planet_root.transform = _planet_root_placement(_pool_active)
+	add_child(_planet_root)
+	_apply_bounds(_terrain, _pool_active)
+	var slot := Node3D.new()
+	slot.name = "FacetSlot_%d" % _pool_active
+	slot.transform = FacetAtlas.facet_transform(_pool_active)
+	_planet_root.add_child(slot)
+	slot.add_child(_terrain)
+	var arv := TerrainConfig.near_render_radius()
+	_pool[_pool_active] = {
+		"terrain": _terrain, "slot": slot, "mesher": _mesher, "generator": _generator,
+		"spawn_ms": Time.get_ticks_msec(), "view": arv,
+		"editable": true, "fid": _pool_active,
+		# Active at init keeps its already-set full near view — NO ramp (target == current). (§5)
+		"view_f": float(arv), "view_target": float(arv), "ramp_from": float(arv),
+	}
+
+## Spawn a render-only neighbour terrain for facet `fid` (view 96). Enforces the caps: FP_M1_POOL on, faceted, a
+## live PlanetRoot, `fid` not already pooled, and the neighbour count below POOL_MAX_NEIGHBOURS. Returns true on a
+## successful spawn. Adds NO viewer. Amortization (≤1/s) + the D_WARM trigger are the caller's (WorldManager §4.3).
+func pool_spawn(fid: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL) or _planet_root == null:
+		return false
+	if fid < 0 or _pool.has(fid):
+		return false
+	if pool_neighbour_count() >= CubeSphere.POOL_MAX_NEIGHBOURS:
+		return false
+	# Build the neighbour at a SMALL start view and RAMP it up to 96 over RAMP_SECONDS (§5 load-shaping): a fresh
+	# terrain jammed straight to view 96 requests its WHOLE view sphere in one process pass → a generation burst →
+	# the main-thread mesh-apply (voxel/threads/main/time_budget_ms) spikes → the border hitch. The ramp spreads that
+	# fill across frames, exactly like the active-facet restream ramp; the far-ring quad covers the rim until it meshes.
+	var start := int(minf(RAMP_START_BLOCKS, 96.0))
+	var s := _pool_build_slot(fid, start, false)
+	if s.is_empty():
+		return false
+	# COSMOS-FP-CROSSING-PREGEN (#114): if THIS spawn is the committed imminent (set by WorldManager just before this
+	# call, same pool pass), ramp straight to the ACTIVE near radius instead of 96 — the crossing-target facet fully
+	# streams during the approach, so redesignate adds no generation at the seam. Relief-floored in _ramp_pool_step, so
+	# the wider 48→128 fill still SPREADS across the approach (never a burst). Gated on the fixed frame; off ⇒ 96 (shipped).
+	var nb_target := 96.0
+	if CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on() and fid == _imminent_fid:
+		nb_target = minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	s["view_target"] = nb_target
+	s["ramp_from"] = float(start)
+	_pool[fid] = s
+	_pool_ramp_kick()
+	if _lod_mesher != null:                          # FP-M2d (§9.1): `fid` is now live — HOLD its LOD cover (no gap)
+		_lod_mesher.call("on_promote", fid)          #   until WorldManager evicts it on seam-band-meshed (lod_evict).
+	return true
+
+## Retire (free) a neighbour terrain. Never frees the active facet. queue_free's the whole slot (terrain → its
+## mesher + generator drop with it) and erases every GDScript ref so nothing pins the freed maps (§10 leak class #1).
+func pool_retire(fid: int) -> bool:
+	if not _pool.has(fid) or fid == _pool_active:
+		return false
+	var s: Dictionary = _pool[fid]
+	var slot: Node3D = s.get("slot")
+	_pool.erase(fid)                                # drop OUR refs first
+	if slot != null and is_instance_valid(slot):
+		if slot.get_parent() != null:
+			slot.get_parent().remove_child(slot)
+		slot.queue_free()                           # frees the terrain + its mesher/generator
+	if _lod_mesher != null:                          # FP-M2b: `fid` went dormant → it may re-enter LOD coverage
+		_lod_mesher.call("notify_pool_changed")
+	return true
+
+## Re-designation crossing (§5.1): make `to` the active (editable, composite-identity) facet and the old active a
+## rotated render-only neighbour, in ONE PlanetRoot transform write + a view rebalance. NO teardown, NO restream,
+## NO new generator, NO terrain freed. Returns true on a POOL HIT; false on a POOL MISS (`to` not pooled — the
+## caller falls back to the FP-S1 set_facet teardown). Requires `to` to already be a spawned neighbour.
+func redesignate(to: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL) or _planet_root == null:
+		return false
+	if not _pool.has(to) or to == _pool_active:
+		return false
+	var from := _pool_active
+	# A1 CROSSING INSTRUMENTATION (#114): time the whole redesignate + bracket the SINGLE transform write, which is
+	# what fires godot_voxel's NOTIFICATION_TRANSFORM_CHANGED → per-mesh-block instance_set_transform across all live
+	# terrains (the 200–772 ms spike). Only executes on a real crossing (this is the crossing path), so zero cost off.
+	var _redesig_t0 := Time.get_ticks_usec()
+	# ONE assignment — the engine re-places every child slot's mesh blocks rigidly (voxel_terrain.cpp:867-882),
+	# sub-frame, no meshing. `to`'s composite becomes T_to⁻¹·T_to = identity (axis-aligned, editable); `from`'s
+	# becomes T_to⁻¹·T_from (the dihedral turn — the rotated neighbour, same weld as the far ring).
+	var _xform_t0 := Time.get_ticks_usec()
+	# FP-FIXED-FRAME (§2.2 step 3, THE keystone): under the fixed frame PlanetRoot is pinned @ identity forever, so we
+	# SKIP this write entirely — no NOTIFICATION_TRANSFORM_CHANGED, no per-mesh-block instance_set_transform re-place,
+	# no 200–772 ms deferred spike. The crossing instead re-frames only the ~10 ActiveFrame children (WorldManager).
+	if not _fixed_frame_on():
+		_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	var _transform_us := Time.get_ticks_usec() - _xform_t0
+	# View-distance rebalance (§5). `to` RAMPS up 96 → near radius: jamming that 96→128 delta annulus in ONE pass is
+	# the SECOND crossing burst — spread it over RAMP_SECONDS like every other grow (the ramp step drives it from the
+	# next frame; the far ring covers the delta rim meanwhile). `from` shrinks to the neighbour radius, and a shrink
+	# only UNLOADS blocks → cheap → snapped immediately. bounds/carve/generator are facet-static → untouched.
+	var to_target := float(TerrainConfig.near_render_radius())
+	_pool[to]["view_target"] = to_target
+	_pool[to]["ramp_from"] = float(_pool[to]["view_f"])   # ramp from wherever `to` sits now (96 warm, or mid-ramp)
+	_pool[to]["editable"] = true
+	if _pool.has(from):
+		_set_if(_pool[from]["terrain"], "max_view_distance", 96)
+		_pool[from]["view"] = 96
+		_pool[from]["view_f"] = 96.0
+		_pool[from]["view_target"] = 96.0
+		_pool[from]["ramp_from"] = 96.0
+		_pool[from]["editable"] = false
+	_pool_ramp_kick()
+	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
+	_pool_active = to
+	_terrain = _pool[to]["terrain"]
+	_mesher = _pool[to]["mesher"]
+	_generator = _pool[to]["generator"]
+	# FP-M2b: the LOD layer moved rigidly with the ONE PlanetRoot write (no rebuild). Re-tier for the new active
+	# facet — `to` is now live (dropped from LOD coverage), the old active becomes the nearest LOD ring next tick.
+	if _lod_mesher != null:
+		_lod_mesher.call("set_active_facet", to)
+	# A1 CROSSING INSTRUMENTATION (#114): stash the attribution metrics for WorldManager to drain. blocks_replaced is
+	# the loaded mesh-block count re-placed by the transform write (summed across every live pool terrain); the two µs
+	# figures split the transform write out of the total redesignate cost. Measured AFTER the write — the block SET is
+	# unchanged by a rigid re-place, only re-positioned. This whole tail is on the crossing path (runs once per cross).
+	_last_redesignate = {
+		"transform_us": _transform_us,
+		"redesignate_us": Time.get_ticks_usec() - _redesig_t0,
+		"blocks_replaced": _pool_block_sum(),
+		"live_neighbours": pool_neighbour_count(),
+		"lod_tiles": _lod_tile_count(),
+	}
+	return true
+
+## A1 CROSSING INSTRUMENTATION (#114): return the last redesignate()'s metrics and CLEAR the latch (so a drain never
+## re-reports a stale crossing). {} when no crossing has occurred since the last drain. Crossing-path only — never
+## called in normal play (WorldManager.maybe_cross_facet is the sole caller, right after a committed redesignate).
+func take_last_redesignate() -> Dictionary:
+	var out := _last_redesignate
+	_last_redesignate = {}
+	return out
+
+## Sum the loaded mesh-block counters across every LIVE pool terrain (active + neighbours) via godot_voxel's
+## get_statistics() — this is the block population the ONE PlanetRoot transform write re-places. get_statistics
+## exposes a flat dict of counters; we sum the int entries whose key mentions "block" (the same shape the cosmos
+## gates read). Called once per crossing only, so the per-terrain stat probe never costs a per-frame anything.
+func _pool_block_sum() -> int:
+	var total := 0
+	for fid in _pool.keys():
+		var t: Object = _pool[fid]["terrain"]
+		if t == null or not t.has_method("get_statistics"):
+			continue
+		var st = t.call("get_statistics")
+		if st is Dictionary:
+			for k in (st as Dictionary).keys():
+				var v = st[k]
+				if v is int and String(k).findn("block") >= 0:
+					total += int(v)
+	return total
+
+## The FP-M2 LOD layer's covered-facet count (each is a re-tiered LOD mesh set moved by the same PlanetRoot write).
+## 0 when the LOD layer is absent (FP_M2_LOD off) — cheap stats() read, crossing-path only.
+func _lod_tile_count() -> int:
+	if _lod_mesher == null or not _lod_mesher.has_method("stats"):
+		return 0
+	var ls = _lod_mesher.call("stats")
+	return int((ls as Dictionary).get("facets", 0)) if ls is Dictionary else 0
+
+## FP-M1c pathological POOL-MISS fallback (§5.1.a): the destination `to` could not be re-designated NOR spawned
+## (e.g. a teleport past the neighbour cap). Rather than the FP-S1 set_facet teardown (which would rebuild OUTSIDE
+## PlanetRoot and desync the pool), REBUILD the pool fresh on `to`: free the whole PlanetRoot (all live terrains)
+## and construct a new active `to` slot. Degraded (neighbours re-spawn as the player walks) but NEVER corrupt/blank.
+## Keeps the world-frame invariant (composite identity for `to`). No-op unless FP_M1_POOL.
+func pool_reset(to: int) -> bool:
+	if not (CubeSphere.FACETED and CubeSphere.FP_M1_POOL):
+		return false
+	# FP-M2b: the mesher is a child of the PlanetRoot we are about to free — join its builder Thread FIRST (a bare
+	# free would leak the running Thread), then it frees with the old PlanetRoot; a fresh one stands up below.
+	if _lod_mesher != null:
+		_lod_mesher.call("shutdown")
+		_lod_mesher = null
+	if _planet_root != null and is_instance_valid(_planet_root):
+		remove_child(_planet_root)
+		_planet_root.queue_free()
+	_planet_root = null
+	_pool.clear()
+	_planet_root = Node3D.new()
+	_planet_root.name = "PlanetRoot"
+	_planet_root.transform = _planet_root_placement(to)   # FP-FIXED-FRAME: identity under the flag (absolute frame)
+	add_child(_planet_root)
+	var s := _pool_build_slot(to, TerrainConfig.near_render_radius(), true)
+	if s.is_empty():
+		return false
+	_pool[to] = s
+	_pool_active = to
+	_terrain = s["terrain"]
+	_mesher = s["mesher"]
+	_generator = s["generator"]
+	_push_facet_carve()                              # re-point the (module-level) active mesher carve at `to`
+	_lod_setup()                                     # FP-M2b: rebuild the LOD layer under the fresh PlanetRoot
+	return true
+
+# --- pool introspection (WorldManager policy + the FP-M1c gates) ---
+func pool_has(fid: int) -> bool:
+	return _pool.has(fid)
+func pool_active() -> int:
+	return _pool_active
+func pool_neighbour_count() -> int:
+	return maxi(0, _pool.size() - (1 if _pool.has(_pool_active) else 0))
+## Every LIVE facet id in the pool (active + neighbours) — the far-ring excluded set + the gate's ≤1+4 cap check.
+func pool_fids() -> Array:
+	return _pool.keys()
+## The render-only NEIGHBOUR fids (active excluded) — the FacetFarRing exclusion set (no flat-quad double-draw).
+func pool_neighbour_fids() -> Array:
+	var out: Array = []
+	for fid in _pool.keys():
+		if fid != _pool_active:
+			out.append(fid)
+	return out
+## Seconds `fid` has been live (WorldManager's MIN_LIVE_S anti-thrash gate). -1 if not pooled.
+func pool_age_s(fid: int) -> float:
+	if not _pool.has(fid):
+		return -1.0
+	return float(Time.get_ticks_msec() - int(_pool[fid]["spawn_ms"])) / 1000.0
+## A pool terrain's live `bounds` AABB (the gate asserts bounds ⊆ facet slab). AABB() if absent.
+func pool_bounds(fid: int) -> AABB:
+	if not _pool.has(fid):
+		return AABB()
+	var t: Object = _pool[fid]["terrain"]
+	if t == null or not _has_prop(t, "bounds"):
+		return AABB()
+	return t.get("bounds")
+## A pool terrain node (the gate's is_area_meshed / statistics probes). null if absent.
+func pool_terrain(fid: int) -> Node3D:
+	return _pool[fid]["terrain"] if _pool.has(fid) else null
+## FP-M1c view-ramp introspection (§5). pool_view: the LIVE engine-applied max_view_distance (read off the terrain,
+## not the bookkeeping int — the honest value the ramp gate asserts). pool_view_target: the ramp goal. -1 if absent.
+func pool_view(fid: int) -> int:
+	if not _pool.has(fid):
+		return -1
+	var t: Object = _pool[fid]["terrain"]
+	return int(t.get("max_view_distance")) if (t != null and _has_prop(t, "max_view_distance")) else -1
+func pool_view_target(fid: int) -> int:
+	return int(round(float(_pool[fid]["view_target"]))) if _pool.has(fid) else -1
+## FP-M1c gate hook: advance the per-slot pool view ramp by `delta` seconds deterministically (headless frames carry
+## no stable dt, and _process may be dormant). Returns true while any slot is still growing. Test-only; production
+## drives the ramp from _process. No-op-safe: just calls the same step _process uses.
+func pool_ramp_tick(delta: float) -> bool:
+	return _ramp_pool_step(delta)
+## The shared baked library / a fid-frozen generator / a fid-carve mesher / the carve range — the SEAM gates build
+## meshes with these directly (the spike_* accessors' pool-flag twins; available whenever FP_M1_POOL is on).
+func pool_library() -> Object:
+	return _library if (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) else null
+func pool_generator(fid: int) -> Object:
+	return _make_generator(fid) if (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) else null
+func pool_carve_mesher(fid: int) -> Object:
+	if not (CubeSphere.FP_M1_POOL or CubeSphere.FP_R0) or _library == null:
+		return null
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return null
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	if mesher.has_method("set_facet_carve") and _carve_count > 0 and fid >= 0:
+		mesher.call("set_facet_carve", {
+			"enabled": true, "planes": FacetAtlas.seam_planes_f64(fid),
+			"arid_base": _carve_base, "arid_count": _carve_count,
+		})
+	return mesher
+func pool_carve_range() -> Vector2i:
+	return Vector2i(_carve_base, _carve_count)
+
+## True iff `obj` exposes a settable property named `name` (bounds feature-detect without has_method churn).
+func _has_prop(obj: Object, name: String) -> bool:
+	for p in obj.get_property_list():
+		if String(p.get("name", "")) == name:
+			return true
+	return false
+
+# ============================ FP-R0 SPIKE (flag-gated: CubeSphere.FP_R0) ============================
+# The multi-facet rotation kill-shot (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §3, §8 FP-R0). All methods
+# below no-op unless CubeSphere.FP_R0 is on (sed-toggled by verify_fp_r0), so the shipped build is untouched.
+# They reuse THIS module's ONE baked VoxelBlockyLibrary and generator factory to build extra terrains, keeping
+# the frozen-epoch discipline (each terrain's worker reads its own frozen gen_facet, never a mutable global).
+
+## Build a SECOND VoxelTerrain homed on `neighbour_fid`, parented under a Node3D carrying that facet's REAL
+## orthonormal placement transform (det=+1), with its OWN VoxelMesherBlocky + OWN carve blob (the neighbour's
+## ridge planes) but the SAME shared baked library. Served by the same single global VoxelViewer (attach_viewer).
+## Returns {terrain, parent, mesher, generator, carve_enabled} or {} if unavailable. This proves godot_voxel
+## streams+meshes under a rigid rotation (the falsified "cannot be rotated" constraint).
+func spike_rotated_neighbour(neighbour_fid: int, view_blocks: int = 96) -> Dictionary:
+	if not CubeSphere.FP_R0 or _library == null or not ClassDB.class_exists("VoxelTerrain"):
+		return {}
+	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
+	if mesher == null:
+		return {}
+	if mesher.has_method("set_library"):
+		mesher.call("set_library", _library)
+	else:
+		_set_if(mesher, "library", _library)
+	# The neighbour's OWN-side ridge planes into ITS OWN mesher carve blob (patch 0004, per-mesher). Guarded:
+	# an unpatched binary lacks set_facet_carve → the sentinels bake as plain cubes (full-cube lip, never a hole).
+	var carve_enabled := false
+	if mesher.has_method("set_facet_carve"):
+		if _carve_count > 0 and neighbour_fid >= 0:
+			mesher.call("set_facet_carve", {
+				"enabled": true,
+				"planes": FacetAtlas.seam_planes_f64(neighbour_fid),
+				"arid_base": _carve_base,
+				"arid_count": _carve_count,
+			})
+			carve_enabled = true
+		else:
+			mesher.call("set_facet_carve", {"enabled": false})
+	# OWN generator frozen on the NEIGHBOUR facet (the worker reads this immutable gen_facet, never _active_facet).
+	var generator: Object = _make_generator(neighbour_fid)
+	if generator == null:
+		return {}
+	var terrain := ClassDB.instantiate("VoxelTerrain") as Node3D
+	if terrain == null:
+		return {}
+	_set_if(terrain, "mesher", mesher)
+	_set_if(terrain, "generator", generator)
+	_set_if(terrain, "max_view_distance", view_blocks)
+	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "generate_collisions", false)
+	# The rotated parent: FacetAtlas.facet_transform(neighbour) is orthonormal det=+1 (verify_frame asserts it).
+	# The terrain streams an axis-aligned box in ITS OWN lattice; the parent rigidly rotates the rendered mesh
+	# blocks (§3.1). module_world sits at ZERO in faceted mode, so parent.global == facet_transform(neighbour).
+	var parent := Node3D.new()
+	parent.transform = FacetAtlas.facet_transform(neighbour_fid)
+	parent.add_child(terrain)
+	add_child(parent)
+	return {
+		"terrain": terrain, "parent": parent, "mesher": mesher,
+		"generator": generator, "carve_enabled": carve_enabled,
+	}
+
+## FP-R0 SPIKE (live-scene wiring): plant a STATIC VoxelViewer at a fixed WORLD point so a spiked neighbour
+## streams+meshes its OWN surface band regardless of where the player stands (the player's single global viewer
+## localises ~edge/2 beyond a neighbour's ridge, out of a 96-block reach — the gate placed a dedicated viewer for
+## exactly this reason). module_world sits at zero in faceted mode, so `world_pos` is also this node's local pos.
+## Returns the viewer node (or null). No-op unless FP_R0 — the shipped build never plants extra viewers.
+func spike_static_viewer(world_pos: Vector3, view_blocks: int = 96) -> Node:
+	if not CubeSphere.FP_R0 or not ClassDB.class_exists("VoxelViewer"):
+		return null
+	var v: Node = ClassDB.instantiate("VoxelViewer")
+	if v == null:
+		return null
+	_set_if(v, "view_distance", view_blocks)
+	_set_if(v, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
+	_set_if(v, "requires_collisions", false)
+	add_child(v)
+	(v as Node3D).position = world_pos
+	return v
+
+## The shared baked VoxelBlockyLibrary (FP-R0: for a standalone build_mesh probe and neighbour meshers).
+func spike_library() -> Object:
+	return _library if CubeSphere.FP_R0 else null
+
+## A LOD-probe generator frozen on `facet_fid` with lod>0 stride sampling enabled (FP-R0 §B). NOT wired to any
+## terrain — the caller drives it directly via generate_block(buffer, origin, lod) + a mesher's build_mesh.
+func spike_lod_generator(facet_fid: int) -> Object:
+	return _make_generator(facet_fid, true) if CubeSphere.FP_R0 else null
+
+## The active-facet generator (FP-R0: to prove the neighbour field differs from the active field).
+func spike_active_generator() -> Object:
+	return _generator if CubeSphere.FP_R0 else null
+
+## The contiguous carve-sentinel ARID range [base, base+count) (FP-R0 diagnostics).
+func spike_carve_range() -> Vector2i:
+	return Vector2i(_carve_base, _carve_count) if CubeSphere.FP_R0 else Vector2i.ZERO
+
+# ========================== end FP-R0 SPIKE ==========================
+
+# ========================== FP-M2 LOD build hookup (docs/COSMOS-FP-M2-DESIGN.md §4.1, §13) ==========================
+# Productized access to the probe recipe FP-R0 proved, for FacetLodBuilder / FacetLodMesher. Gated on FP_M2_LOD
+# (NOT FP_R0) so with the flag off these return null and the whole LOD path is dead code. The builder thread
+# reads the returned frozen generator ONLY (never a mutable global) — the frozen-epoch discipline, §4.3.
+
+## The shared baked VoxelBlockyLibrary — the builder's own VoxelMesherBlocky shares it for build_mesh.
+func lod_library() -> Object:
+	return _library if CubeSphere.FP_M2_LOD else null
+
+## A per-facet frozen probe generator (lod>0 stride enabled) homed on `fid`. Built on the MAIN thread (compiles
+## the generator source + freezes the appearance tables); handed to the builder thread which only calls
+## generate_block(buffer, origin, ℓ) on it. At ℓ0 stride==1 → byte-identical to the shipped generator (G-M2-ID).
+func lod_probe_generator(fid: int) -> Object:
+	return _make_generator(fid, true) if CubeSphere.FP_M2_LOD else null
+
+## The SHIPPED active-facet generator (lod>0 early-out, no stride) — the byte-identity reference for G-M2-ID
+## (probe-stride generator at ℓ0 must equal this voxel-for-voxel). null with the flag off.
+func lod_shipped_generator() -> Object:
+	return _generator if CubeSphere.FP_M2_LOD else null
+
+## The active-facet VoxelTerrain — the gate samples its statistics to prove a pure-LOD build leaves the voxel
+## worker pool's task counts untouched (G-M2-BUILD; the builder never touches any terrain). null with the flag off.
+func lod_active_terrain() -> Node3D:
+	return _terrain if CubeSphere.FP_M2_LOD else null
+
+# ========================== end FP-M2 LOD build hookup ==========================
 
 ## Drop the streamed near region and rebuild it with a FRESH generator snapshot (frozen on the current
 ## _gen_face). This is the module restream the home-face flip (and M4) needs — previously ONLY the
@@ -1414,11 +2308,23 @@ func attach_viewer(player: Node3D) -> void:
 	if _viewer == null:
 		return
 	_set_if(_viewer, "view_distance", TerrainConfig.near_render_radius())
-	# Vertical stream ratio (1.0 now that terrain is shallow; kept configurable in
-	# TerrainConfig should tall terrain return).
-	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
+	# A2 UNDERGROUND DOWNWARD-REACH CLAMP. VoxelViewer has NO asymmetric up/down extent — only a single
+	# view_distance_vertical_ratio, a SYMMETRIC world-Y ellipsoid centred on the viewer node. To keep the
+	# full UPWARD reach (mountains) while trimming the DOWNWARD reach to a modest band, offset the viewer
+	# +Y and shrink the ratio (TerrainConfig helpers): on the composite-identity active facet world +Y =
+	# radial up = the player's local up (the body only yaws), so a (0, O, 0) LOCAL offset is a pure radial
+	# +O in world. FACETED-gated + toggle-gated so the FLAT world keeps its byte-identical symmetric slab.
+	var use_clamp := CubeSphere.FACETED and TerrainConfig.DOWNWARD_REACH_CLAMP_ENABLED
+	if use_clamp:
+		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.clamped_viewer_vertical_ratio())
+	else:
+		# Un-clamped vertical stream ratio (byte-identical to the pre-A2 viewer).
+		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
+	if use_clamp:
+		# LOCAL offset (child of the player) → radial +O on the active facet; unaffected by yaw.
+		(_viewer as Node3D).position = Vector3(0.0, TerrainConfig.clamped_viewer_offset_y(), 0.0)
 
 ## True once every mesh block intersecting the axis-aligned box of half-extents `half` around world
 ## point `center` has been MESHED (its surface applied to the scene, so it renders next frame). Used by
@@ -1439,7 +2345,13 @@ func _new_field_meshed() -> bool:
 	var v := _viewer as Node3D
 	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
 		return false
-	var center: Vector3 = v.global_position - global_position
+	# FP-FIXED-FRAME (§4/§1.6 audit): the `viewer.global − node.global` translation-only shortcut assumes the active
+	# terrain sits composite-identity (no rotation) under module_world. Under the fixed frame the active slot sits at
+	# its true rotated T_active, so map the viewer world point through the terrain's real frame with to_local(). Off ⇒
+	# the shortcut is exact (module_world @ 0, composite identity) → byte-identical. (Pool-path only reaches here in the
+	# never-taken FP-S1 fallback, but the audit keeps it frame-correct regardless.)
+	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
+		else v.global_position - global_position
 	var half := NEAR_COVER_MESHED_HALF
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
 
@@ -1553,7 +2465,12 @@ func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
 ## (a value-type Vector4, no allocation) per column and calls
 ## TerrainConfig.resolve_cell per cell, the exact functions the analytic queries
 ## use, so the module path and TerrainConfig.generated_block agree by construction.
-func _make_generator() -> Object:
+## `facet_override` (>= -1) freezes the epoch on a SPECIFIC facet instead of TerrainConfig.active_facet() —
+## the FP-R0 spike uses it to home a neighbour terrain's generator on a neighbour facet without mutating the
+## global active facet (the frozen-epoch discipline: the worker reads the frozen gen_facet, never a mutable
+## global). `lod_probe` publishes gen_lod_probe=true so lod>0 strides instead of early-returning (FP-R0 §B);
+## default false keeps the shipped generator's lod!=0 early-out — and at lod0 the stride is 1, byte-identical.
+func _make_generator(facet_override := -999, lod_probe := false) -> Object:
 	var src := """
 extends VoxelGeneratorScript
 
@@ -1572,6 +2489,8 @@ var comp_l8: PackedInt32Array
 var comp_l10: PackedInt32Array
 var snow_id := -1                        # snow_block LRID (the curated LAYER material)
 var slope_arid: PackedInt32Array        # (mat*SLOPE_STRIDE + payload) -> SHARP-SLOPE ARID; -1 = not baked
+var carve_arid: PackedInt32Array        # COSMOS FP-CARVE: mat -> carve-sentinel cube ARID; -1 = not baked
+var carve_snow_arid: PackedInt32Array   # COSMOS FP-CARVE: mat -> snow-capped carve-sentinel cube ARID; -1 = not baked
 var snow_slope_arid: PackedInt32Array   # (mat*SLOPE_STRIDE + payload) -> snow-capped slope ARID; -1 = not baked
 var waterlog := false                   # native waterlogging on → submerged composites route to twins
 var model_count := 0                     # actual baked library model count — the OOB fence upper bound (VDS §8.1)
@@ -1581,6 +2500,11 @@ var model_count := 0                     # actual baked library model count — 
 # race generation — a flip installs a NEW generator with a new gen_face and restreams (module_world).
 var gen_face := 0
 var gen_n := 0
+# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): the IMMUTABLE facet this generator epoch is homed on
+# (−1 = non-faceted / cube-lattice). Frozen by the loader from TerrainConfig.active_facet(), symmetric with
+# gen_face — the worker threads it through GenCtx.facet so column_profile samples the sphere terrain at this
+# facet's directions (NEVER the mutable TerrainConfig._active_facet). A facet change installs a new generator.
+var gen_facet := -1
 # COSMOS-FRAME-ORIENTATION §5.1: this epoch's FROZEN window orientation M_win (row-major ints). The worker
 # recovers the raw index p = M_win·v from the terrain-local voxel index v before folding. Identity at spawn.
 var gen_mwin_a := 1
@@ -1588,6 +2512,7 @@ var gen_mwin_b := 0
 var gen_mwin_c := 0
 var gen_mwin_d := 1
 var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
+var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples at stride 2^lod (else early-out). Default false → shipped path unchanged; at lod0 stride==1 so byte-identical.
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -1604,8 +2529,14 @@ func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
 
 func _generate_block(buffer, origin_in_voxels, lod):
+	# FP-R0 §B stride: shipped path early-outs on lod!=0 (gen_lod_probe=false). The probe generator strides the
+	# LOD0 sampling by s=2^lod so a coarse buffer cell (x,y,z) reads LOD0 voxel (ox+x*s, oy+y*s, oz+z*s). At
+	# lod0 s==1 so every `*s` below is a no-op → byte-identical to the shipped generator (gated by verify_fp_r0).
+	var s = 1
 	if lod != 0:
-		return
+		if not gen_lod_probe:
+			return
+		s = 1 << lod
 	var size = buffer.get_size()
 	var ox = origin_in_voxels.x
 	var oy = origin_in_voxels.y
@@ -1622,6 +2553,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var nsnow = snow_arid.size()
 	var nlayer = layer_arid.size()
 	var nslope = slope_arid.size()
+	var ncarve = carve_arid.size()
+	var ncarvesnow = carve_snow_arid.size()
 	var nsnowslope = snow_slope_arid.size()
 	# Hoist the per-kind twin tables into block-frame locals ONCE (MULTI-LIQUID §2.2.5): the worker
 	# then selects among these locals per cell (a branch on the kind), never indexing the untyped
@@ -1637,7 +2570,16 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
 	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
 		return
-	if oy + size.y <= TerrainConfig.BEDROCK_FLOOR:
+	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
+		return
+	# FP-S1(b) COSMOS FACETED (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §5(a)/§8) — BLOCK-level facet-domain
+	# early-out, BEFORE the per-column profile pass. junction_modify() (the buffer-write exit below) masks every
+	# beyond-ridge cell to AIR one at a time — but only AFTER this block pays the full column-profile + resolve_cell
+	# work. On a facet the near box overlaps foreign territory, so whole blocks generate nothing but masked air.
+	# block_all_air() is the exact per-cell mask's supremum over the block: true ONLY when a single ridge alone
+	# masks every cell (never skips a block with any interior/straddle cell → identical voxels emitted, just faster).
+	# Gated by gen_facet >= 0 (faceted only) → flat / non-faceted byte-identical. Frozen gen_facet → worker-safe.
+	if gen_facet >= 0 and FacetAtlas.block_all_air(gen_facet, ox, oy, oz, size.x, size.y, size.z, s):
 		return
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
@@ -1658,10 +2600,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var rfs   # per-column true face
 	var rjinv # per-column render-frame J⁻¹ quarter-turn (COSMOS-FRAME-ORIENTATION §6)
 	if flat_world:
-		pcache = {}
+		# FACETED (§3.3): a GenCtx carrying the FROZEN gen_facet so column_profile takes the faceted branch
+		# and samples the sphere terrain at THIS facet's true cell directions — worker-safe (never reads the
+		# mutable _active_facet). jinv stays 0 (no window rotation in flat/faceted), so it's the flat pipeline
+		# with a facet-sourced profile. Non-faceted flat: the plain Dictionary memo, byte-identical to before.
+		pcache = TerrainConfig.GenCtx.new(0, gen_facet) if gen_facet >= 0 else {}
 		for z in range(size.z):
 			for x in range(size.x):
-				var p = TerrainConfig.column_profile(ox + x, oz + z, pcache)
+				var p = TerrainConfig.column_profile(ox + x * s, oz + z * s, pcache)
 				profs[z * size.x + x] = p
 				if int(p.x) > max_h: max_h = int(p.x)
 	else:
@@ -1708,8 +2654,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			var wx
 			var wz
 			if flat_world:
-				wx = ox + x
-				wz = oz + z
+				wx = ox + x * s
+				wz = oz + z * s
 			else:
 				# The TRUE global column this voxel column folds to; restore its face for the nested
 				# smoothing/snow/tree stencil folds inside resolve_cell (COSMOS-AUDIT §3.2 items 2–3).
@@ -1723,13 +2669,26 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
-				var v = TerrainConfig.resolve_cell(wx, oy + y, wz, g, biome, cc, tt, pcache, srun)
+				var wy = oy + y * s
+				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
 				if col_jinv != 0:
 					var vmod = CellCodec.modifier(v)
 					if vmod != 0:
 						v = CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(vmod, col_jinv))
+				# COSMOS FACETED §3.5.4/§5.3: the junction/mask authority at the module worker buffer-write exit
+				# (mirrors WM.cell_value_at). Masks beyond-ridge cells to AIR (id==0 → skipped) and turns
+				# straddling cells into kind-2 partials. Frozen gen_facet (never _active_facet) → worker-safe.
+				# COSMOS FP-M2 §7.2: at ℓ>0 (s>1, the LOD probe path) a single sampled LOD0 cell cannot cut an s³
+				# megablock, so junction sentinels are NOT emitted — instead the megablock is kept only if its whole
+				# s-cube footprint is interior to all 4 ridges (conservative erosion), else AIR. At ℓ0 (s==1) the
+				# shipped junction_modify runs verbatim → LOD0 byte-identical (G-M2-ID pins it).
+				if gen_facet >= 0:
+					if s == 1:
+						v = FacetAtlas.junction_modify(gen_facet, Vector3i(wx, wy, wz), v)
+					elif not FacetAtlas.cell_interior_scaled(gen_facet, wx, wy, wz, s):
+						v = 0
 				var id = CellCodec.mat(v)
 				if id == 0:
 					continue
@@ -1786,6 +2745,19 @@ func _generate_block(buffer, origin_in_voxels, lod):
 							arid = gen_arid[slot]
 						else:
 							arid = cube_arid[id] if id < ncube else id
+				elif CellCodec.is_junction(modifier):
+					# COSMOS FP-CARVE (patch 0004): a seam junction cell (produced by junction_modify) -> its
+					# plain carve-SENTINEL cube; the compiled mesher clips it by the active facet's ridge planes.
+					# The snow-capped variant when capped (bit 32). HOISTED to the FIRST lf==0 arm -- junction_modify
+					# discards the original modifier, so snow-fill/slope/snow-cap never apply to a junction cell.
+					# Unbaked / unpatched binary -> the full-cube lip (the mask already carved beyond-ridge cells to
+					# AIR upstream, so this is never a hole).
+					if ((v >> 32) & 1) != 0 and id < ncarvesnow and carve_snow_arid[id] >= 0:
+						arid = carve_snow_arid[id]
+					elif id < ncarve and carve_arid[id] >= 0:
+						arid = carve_arid[id]
+					else:
+						arid = cube_arid[id] if id < ncube else id
 				elif ((v >> 33) & 0xF) != 0:
 					# Snow-FILL composite (SNOW-ACCUMULATION 2.6): a terrain ramp buried/filled by the snow
 					# plane. The fill nibble (STATE bits 1..4 = value bits 33..36) rounds UP to a curated
@@ -1864,13 +2836,20 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
 """
-	var gen_script := GDScript.new()
-	gen_script.source_code = src
-	var err := gen_script.reload()
-	if err != OK:
-		push_warning("[module_world] generator compile failed: %d" % err)
-		return null
-	var gen: Object = gen_script.new()
+	# FP-S1(e) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 4 note / §8): `src` is a CONSTANT literal —
+	# the facet epoch, lod-probe flag, frame M_win and all frozen tables are set as INSTANCE properties below, never
+	# baked into the source. So compiling it (the ~expensive GDScript.reload() parse) on EVERY restream/crossing was
+	# pure waste. Compile ONCE, cache the compiled class, and instantiate a fresh generator per epoch. The compiled
+	# class carries no per-epoch state (all state is instance vars set on `gen`), so reuse is byte-identical.
+	if _gen_script_cache == null:
+		var gen_script := GDScript.new()
+		gen_script.source_code = src
+		var err := gen_script.reload()
+		if err != OK:
+			push_warning("[module_world] generator compile failed: %d" % err)
+			return null
+		_gen_script_cache = gen_script
+	var gen: Object = _gen_script_cache.new()
 	# Publish the frozen tables to the worker-side generator (read-only from here on).
 	gen.set("cube_arid", _cube_arid)
 	gen.set("gen_arid", _gen_arid)
@@ -1884,6 +2863,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("comp_l10", _comp_arid_l10)
 	gen.set("snow_id", _snow_id_of())                    # the curated LAYER material (snow_block LRID)
 	gen.set("slope_arid", _slope_arid)                   # SHARP-SLOPE §4.2: (mat*SLOPE_STRIDE+payload) -> ARID
+	gen.set("carve_arid", _carve_arid)                   # COSMOS FP-CARVE (patch 0004): carve-sentinel cube ARIDs
+	gen.set("carve_snow_arid", _carve_snow_arid)         # COSMOS FP-CARVE: snow-capped carve-sentinel cube ARIDs
 	gen.set("snow_slope_arid", _snow_slope_arid)         # SHARP-SLOPE §4.2: snow-capped slope ARID
 	gen.set("waterlog", _waterlog_enabled)               # WATERLOGGING §4.5: route submerged → twins
 	# COSMOS frozen-epoch (COSMOS-AUDIT §3.2 items 2–3): freeze this epoch's home face + n + flat flag
@@ -1892,6 +2873,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("flat_world", CubeSphere.FLAT_WORLD)
 	gen.set("gen_face", _gen_face)
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
+	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
+	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
 	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
 	gen.set("gen_mwin_a", int(_gen_mwin[0]))
 	gen.set("gen_mwin_b", int(_gen_mwin[1]))

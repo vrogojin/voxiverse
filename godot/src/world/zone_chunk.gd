@@ -41,13 +41,19 @@ const CELLS := SIZE * SIZE * SIZE          # 32 768 — fits a u16 cell index ex
 ## Payload format version (bumped only on an incompatible layout change).
 const VERSION := 1
 
-## layer_flags bits (§5). Bits 3..7 are reserved 0 in P6b: MODIFIER_DENSE / STATE_DENSE
-## (the sparse→dense escalation of §6.3) are a future size optimization — P6b writes the
-## sparse form for any count (a u16 count covers all 32 768 cells), so the reader never
-## sees a dense scalar layer and both bits stay clear.
+## layer_flags bits (§5). Bit 3 is the FP-M1a (fid, cell) key-format fence (see FIDCELL_V1); bits 4..7
+## remain reserved 0 (MODIFIER_DENSE / STATE_DENSE — the sparse→dense escalation of §6.3 — were never
+## built; P6b always writes the sparse form, so both stay clear).
 const F_MODIFIER := 1 << 0
 const F_STATE := 1 << 1
 const F_META := 1 << 2
+## FP-M1a (COSMOS-FP-M1-DESIGN §6.3): set on a chunk authored while the overlay was (fid, cell)-GLOBAL
+## keyed (FACETED mode). It is a FENCE, not a migration: a loader refuses a FACETED bundle that lacks
+## it, and a FLAT/curved loader refuses one that carries it (the region grid is per-facet-lattice, so a
+## cross-mode misload would place cells in the wrong frame). FLAT/curved saves never set the bit → the
+## serialized bytes are byte-identical to the pre-M1a format (verify_feature 6027/0 holds).
+const F_FIDCELL := 1 << 3
+const FIDCELL_V1 := "fidcell-v1"
 
 ## The palette entry that marks a cell as NOT present in this chunk (falls back to the
 ## generated function on load). No real material has an empty name, so it can never
@@ -68,6 +74,7 @@ var _mat_name: Dictionary = {}    # local_idx -> String   (material name; presen
 var _modifier: Dictionary = {}    # local_idx -> int      (only non-zero modifiers)
 var _state: Dictionary = {}       # local_idx -> int      (only non-zero states)
 var _meta: Dictionary = {}        # local_idx -> Dictionary (block-entity documents)
+var _key_format: String = ""      # FP-M1a fence: FIDCELL_V1 iff authored under FACETED (fid, cell) keys
 
 var _version: int = VERSION       # set by from_bytes to the payload's version
 
@@ -171,7 +178,9 @@ func state_at(idx: int) -> int:
 func meta_at(idx: int) -> Variant:
 	return _meta.get(idx, null)
 
-## The layer_flags byte this chunk would serialize with (which optional layers are present).
+## The layer_flags byte this chunk would serialize with (which optional layers are present, plus the
+## FP-M1a key-format fence bit). FLAT/curved chunks leave `_key_format` empty → bit 3 clear → the byte
+## is byte-identical to the pre-M1a format.
 func layer_flags() -> int:
 	var f := 0
 	if not _modifier.is_empty():
@@ -180,7 +189,17 @@ func layer_flags() -> int:
 		f |= F_STATE
 	if not _meta.is_empty():
 		f |= F_META
+	if _key_format == FIDCELL_V1:
+		f |= F_FIDCELL
 	return f
+
+## FP-M1a fence accessors. `set_key_format(FIDCELL_V1)` marks a chunk as authored under FACETED keys;
+## `key_format()` returns "" for a legacy/FLAT/curved chunk or FIDCELL_V1 for a faceted one.
+func set_key_format(fmt: String) -> void:
+	_key_format = fmt
+
+func key_format() -> String:
+	return _key_format
 
 # --- serialization (§5 exact byte layout; all integers little-endian) -----------------
 
@@ -272,6 +291,7 @@ static func from_bytes(bytes: PackedByteArray) -> ZoneChunk:
 	spb.seek(0)
 	zc._version = spb.get_u8()
 	var flags := spb.get_u8()
+	zc._key_format = FIDCELL_V1 if (flags & F_FIDCELL) else ""   # FP-M1a fence (bit 3)
 
 	# MATERIAL layer: palette (id-map header) then the bit-packed dense index array.
 	var pcount := spb.get_u16()

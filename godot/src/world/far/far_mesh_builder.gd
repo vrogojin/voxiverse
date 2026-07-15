@@ -190,15 +190,122 @@ static func build_arrays(ring: int, tc: Vector2i, mwin: Array = [1, 0, 0, 1]) ->
 		pass
 	return assemble(job)
 
+## COSMOS R1 (real-geometry): bake the assembled window-space `arrays` to TRUE sphere positions (CPU, no
+## shader — mirrors the C++ mesher hook's post-generation vertex pass). Each vertex's window coord is
+## node_origin + its node-local position; place_true folds→gnomonic→(R+y)d̂ in the epoch anchor `frame`,
+## expressed relative to the tile's own true origin (returned as `local_origin`) so emitted vertices stay
+## f32-small and the tile node is placed at `local_origin`. Normals rotate by the vertex's local tangent
+## frame. WEDGE (double-out) triangles are CULLED — the corner-closure theorem guarantees no hole (the
+## gate asserts a closed ring). Byte-identical inputs → deterministic output (headless bake-parity gate).
+static func bake_arrays(arrays: Dictionary, chart, frame: Dictionary, node_origin: Vector3, blend: Dictionary = {}) -> Dictionary:
+	var verts: PackedVector3Array = arrays["verts"]
+	var normals: PackedVector3Array = arrays["normals"]
+	var src_idx: PackedInt32Array = arrays["indices"]
+	var origin: Vector2 = arrays["origin"]
+	var grid := int(arrays["grid"])
+	var cell := float(arrays["cell"])
+	var half := 0.5 * float(grid) * cell
+	# The tile's own true origin (its centre at y=0) — the per-tile local frame origin (f32-small offsets).
+	var anchor_w := Vector3(node_origin.x + origin.x + half, 0.0, node_origin.z + origin.y + half)
+	var local_origin: Vector3 = CosmosTruePlace.place_true(chart, anchor_w, frame)
+	# A corner tile's CENTRE can fall in the double-out wedge → place_true returns the _WEDGE sentinel. The
+	# per-tile local origin is only an f32 optimisation (place_true is already epoch-anchor-relative, so its
+	# values are ring-scale, f32-safe), so fall back to zero rather than offset every vertex by 1e18.
+	if local_origin == CosmosTruePlace._WEDGE:
+		local_origin = Vector3.ZERO
+	# Ring-0 window-blend (study §8 R1): near the inner boundary, lerp each far vertex from the near
+	# CosmosBend (window-metric) position toward its true-baked position over a band, so the innermost far
+	# edge COINCIDES with the near field (killing the window/true metric seam) and transitions smoothly out.
+	var do_blend := not blend.is_empty()
+	var b_cam: Vector3 = blend.get("cam", Vector3.ZERO)
+	var b_r0: float = blend.get("r0", 0.0)
+	var b_band: float = maxf(blend.get("band", 1.0), 0.001)
+	var b_radius: float = blend.get("radius", 1.0)
+	var b_finv := Transform3D()
+	if do_blend:
+		b_finv = (blend["align"] as Transform3D).affine_inverse()
+	var n := verts.size()
+	var out_verts := PackedVector3Array(); out_verts.resize(n)
+	var out_norms := PackedVector3Array(); out_norms.resize(n)
+	var is_wedge := PackedByteArray(); is_wedge.resize(n)
+	var win_xz := PackedVector2Array(); win_xz.resize(n)   # window (x,z) per vertex — for the bridging-cull below
+	for k in range(n):
+		var v := verts[k]
+		var w := Vector3(node_origin.x + v.x, v.y, node_origin.z + v.z)
+		win_xz[k] = Vector2(w.x, w.z)
+		# ONE fold per vertex: place + outward radial together, and the _WEDGE sentinel IS the wedge test.
+		var pr := CosmosTruePlace.place_and_radial(chart, w, frame)
+		var true_local: Vector3 = pr["pos"]
+		if true_local == CosmosTruePlace._WEDGE:
+			is_wedge[k] = 1
+			out_verts[k] = Vector3.ZERO  # unreferenced (all its triangles are culled) — keep it at the tile
+			out_norms[k] = normals[k]    # local origin so it can't inflate the mesh AABB (window coords would)
+			continue
+		if do_blend:
+			var s := smoothstep(b_r0, b_r0 + b_band, Vector2(w.x - b_cam.x, w.z - b_cam.z).length())
+			if s < 0.9999:
+				# near position (CosmosBend window-metric) expressed in the epoch/far frame via F⁻¹
+				var near_local := b_finv * CosmosBend.bend_point(w, b_cam, b_radius)
+				true_local = near_local.lerp(true_local, s)
+		out_verts[k] = true_local - local_origin
+		# Outward surface normal = the true radial (mt·d̂), already computed above (no extra fold). Unshaded
+		# far, so the slope term is cosmetically irrelevant; the radial is the load-bearing outward direction.
+		out_norms[k] = pr["radial"]
+	# Cull triangles touching a wedge vertex; keep the rest.
+	var out_idx := PackedInt32Array()
+	var culled := 0
+	for ti in range(0, src_idx.size(), 3):
+		var a := src_idx[ti]; var b := src_idx[ti + 1]; var c := src_idx[ti + 2]
+		if is_wedge[a] == 1 or is_wedge[b] == 1 or is_wedge[c] == 1:
+			culled += 1
+			continue
+		# BRIDGING cull: the per-vertex test only drops a triangle whose VERTEX folds to the double-out wedge.
+		# At the COARSE far rings (cell 8–32) a single triangle straddling a cube corner can have all three
+		# vertices on the valid home + strips while its BODY spans the discarded 90° wedge sector — under true
+		# placement that renders a stretched sheet across the corner at distance (the "far wedge still visible"
+		# report). Drop it if its window centroid or any edge midpoint folds to the wedge, so the impossible
+		# sector shows sky instead. The real neighbour-face terrain is rendered by its own (non-bridging) tiles.
+		var wa := win_xz[a]; var wb := win_xz[b]; var wc := win_xz[c]
+		if _win_wedge(chart, (wa + wb + wc) / 3.0) \
+				or _win_wedge(chart, (wa + wb) * 0.5) \
+				or _win_wedge(chart, (wb + wc) * 0.5) \
+				or _win_wedge(chart, (wc + wa) * 0.5):
+			culled += 1
+			continue
+		# REVERSE the winding: the window→true map (place_true) is orientation-REVERSING (negative
+		# determinant — window +Y/up is the middle axis while the sphere's outward normal is the face's
+		# third axis, so the map carries a reflection). A reflection flips triangle winding, which under
+		# Godot CULL_BACK renders the far terrain front-INWARD (the R1 live "visible from underground /
+		# wireframe" bug). Swapping b↔c restores front-OUTWARD to match the working window/bend mesh.
+		out_idx.append_array([a, c, b])
+	return {
+		"verts": out_verts, "normals": out_norms, "colors": arrays["colors"], "indices": out_idx,
+		"tri_count": out_idx.size() / 3, "grid": grid, "cell": cell, "origin": origin,
+		"collapsed": arrays.get("collapsed", false), "local_origin": local_origin, "culled_tris": culled,
+	}
+
 ## Wrap raw arrays into an ArrayMesh with the shared far material on surface 0.
+## True iff the window point p=(x,z) folds to the double-out corner WEDGE. Used by the bake bridging-cull to
+## drop coarse far triangles whose interior spans the discarded sector even though no vertex is itself wedge.
+static func _win_wedge(chart, p: Vector2) -> bool:
+	return CosmosTruePlace.is_wedge(chart, p.x, p.y)
+
 static func build_mesh(arrays: Dictionary, material: Material) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
+	# COSMOS R1: a corner tile whose triangles ALL touch the double-out wedge bakes to a non-empty vertex
+	# array but an EMPTY index array (bake_arrays culls every triangle). add_surface_from_arrays then errors
+	# `index_array_len==NO_INDEX_ARRAY` (an indexed format with zero indices) and drops the surface anyway —
+	# so skip it: return an empty mesh (the key stays "live" with 0 tris, no hole, no per-frame error spam).
+	var idx: PackedInt32Array = arrays["indices"]
+	var verts: PackedVector3Array = arrays["verts"]
+	if idx.is_empty() or verts.is_empty():
+		return mesh
 	var surf := []
 	surf.resize(Mesh.ARRAY_MAX)
-	surf[Mesh.ARRAY_VERTEX] = arrays["verts"]
+	surf[Mesh.ARRAY_VERTEX] = verts
 	surf[Mesh.ARRAY_NORMAL] = arrays["normals"]
 	surf[Mesh.ARRAY_COLOR] = arrays["colors"]
-	surf[Mesh.ARRAY_INDEX] = arrays["indices"]
+	surf[Mesh.ARRAY_INDEX] = idx
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surf)
 	if material != null and mesh.get_surface_count() > 0:
 		mesh.surface_set_material(0, material)

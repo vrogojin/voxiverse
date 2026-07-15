@@ -38,6 +38,7 @@ const MOD_FAM_KIND_SHIFT := 12
 const MOD_FAM_KIND_MASK := 0x7                  # bits 14..12
 const FAM_LAYER := 0
 const FAM_SLOPE := 1
+const FAM_JUNCTION := 2                          # COSMOS FACETED §3.5.4 — faceted seam junction (clipped cube)
 
 ## --- FAM_LAYER (kind 0), SNOW-ACCUMULATION §1.2 -------------------------------------------------
 ## A UNIFORM thin layer — a flat top at height `level/10` block, BOTTOM-anchored — with the level
@@ -134,6 +135,39 @@ static func _canonical_slope(d00: int, d10: int, d11: int, d01: int) -> int:
 		# ramp; use the legacy corner encoding (reuses the collider-proven baked models).
 		return ShapeCodec.make_modifier(2 * d00, 2 * d10, 2 * d11, 2 * d01, ShapeCodec.ANCHOR_BOTTOM)
 	return _slope_raw(d00, d10, d11, d01)     # rule 4: keep the tuple
+
+## --- FAM_JUNCTION (kind 2), COSMOS FACETED §3.5.4 ----------------------------------------------
+## A faceted seam junction cell: the unit cube clipped by ONE facet ridge plane (§3.5.1). The continuous
+## per-seam plane (m̂, tilt φ, angle α) lives EXACT in the FacetAtlas keyed by the seam slot — the payload
+## carries only which seam and the in-cell cut offset, so the modifier vocabulary stays finite while the
+## geometry stays exact. Payload (12 bits): bits 11..10 = seam slot s (0..3, which of the active facet's E/W/
+## N/S ridges); bits 9..5 = cut offset q (0..31, the cell-centre perpendicular distance to the ridge quantized
+## to 1/16 block over [−1,+1), ALWAYS rounded outward so the rendered partial reaches at least to the plane —
+## §3.5.5, never a crack); bits 4..0 reserved 0. Junction modifiers are produced ONLY by
+## FacetAtlas.junction_modify at the two window exits and are facet-frame-local (no D4 ever applies — no M_win
+## in faceted mode), so rotate/canonical treat them as pass-through.
+const MOD_JUNCTION_SLOT_SHIFT := 10
+const MOD_JUNCTION_SLOT_MASK := 0x3
+const MOD_JUNCTION_Q_SHIFT := 5
+const MOD_JUNCTION_Q_MASK := 0x1F
+
+## True iff `m` is a JUNCTION modifier (FAM bit set AND kind field == FAM_JUNCTION).
+static func is_junction(m: int) -> bool:
+	return (m & MOD_FAM_BIT) != 0 and ((m >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK) == FAM_JUNCTION
+
+## Build the JUNCTION modifier for seam slot `s` and cut offset `q`.
+static func make_junction(s: int, q: int) -> int:
+	return MOD_FAM_BIT | (FAM_JUNCTION << MOD_FAM_KIND_SHIFT) \
+		| ((s & MOD_JUNCTION_SLOT_MASK) << MOD_JUNCTION_SLOT_SHIFT) \
+		| ((q & MOD_JUNCTION_Q_MASK) << MOD_JUNCTION_Q_SHIFT)
+
+## The seam slot (0..3) of a JUNCTION modifier. Assumes is_junction(m).
+static func junction_slot(m: int) -> int:
+	return (m >> MOD_JUNCTION_SLOT_SHIFT) & MOD_JUNCTION_SLOT_MASK
+
+## The cut offset q (0..31) of a JUNCTION modifier. Assumes is_junction(m).
+static func junction_q(m: int) -> int:
+	return (m >> MOD_JUNCTION_Q_SHIFT) & MOD_JUNCTION_Q_MASK
 
 ## Liquid axis (WATER-SHORE §2): bits 48..53. Kind in 48..49, level (tenths) in 50..53.
 ## A pure render+sim overlay orthogonal to material/modifier/state — no physics function
@@ -319,6 +353,11 @@ static func _canonical_modifier(material: int, modifier_bits: int) -> int:
 		if kind == FAM_SLOPE:
 			var d := slope_deltas(modifier_bits)
 			return _canonical_slope(d.x, d.y, d.z, d.w)
+		if kind == FAM_JUNCTION:
+			# COSMOS FACETED §3.5.4: (slot, q) are already the canonical exact encoding — the geometry lives
+			# in the atlas per slot, so there is nothing to collapse. Pass through (reserved bits zeroed).
+			return MOD_FAM_BIT | (FAM_JUNCTION << MOD_FAM_KIND_SHIFT) \
+				| (modifier_bits & ((MOD_JUNCTION_SLOT_MASK << MOD_JUNCTION_SLOT_SHIFT) | (MOD_JUNCTION_Q_MASK << MOD_JUNCTION_Q_SHIFT)))
 		push_warning("CellCodec: unknown FAM kind %d in modifier %d — stripped to full cube (0)"
 			% [kind, modifier_bits])
 		return 0

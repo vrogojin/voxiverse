@@ -133,8 +133,16 @@ var _slice_ops := 0                           # PhysicsServer shape ops in the m
 
 func setup(world_ref: WorldManager) -> void:
 	world = world_ref
-	# The node stays at the origin; box transforms carry absolute world positions.
-	global_position = Vector3.ZERO
+	# The node adds NO offset of its own; box shape transforms carry play-frame (lattice cell) positions relative to
+	# the staging body. FP-FIXED-FRAME (§4): when the fixed frame is on this collider is a child of the ActiveFrame (@
+	# T_active), so its LOCAL transform must be IDENTITY — a lattice box at cell L then acquires the correct absolute
+	# global T_active·L through the parent. Forcing global_position=0 (as off) would STRIP the frame translation and
+	# misplace every shape by T_active.origin. Off ⇒ the node is a child of WorldManager @ identity, so global 0 ==
+	# local identity → byte-identical.
+	if world != null and world.frame_adapter() != null and world.frame_adapter().enabled():
+		transform = Transform3D.IDENTITY
+	else:
+		global_position = Vector3.ZERO
 	_build_heights.resize((2 * R + 1) * (2 * R + 1))
 	for i in 2:
 		var b := StaticBody3D.new()
@@ -218,6 +226,16 @@ func rebuild_now() -> void:
 		_edit_age = 0                       # first edit of a burst: start the max-latency clock
 	_dirty = true
 	_edit_idle = 0                          # every new edit resets the debounce window
+
+## COSMOS FP-FIXED-FRAME (§2.2 step 8): a facet crossing flipped the play frame (ActiveFrame T_from→T_to), so
+## every live box shape — placed in the OLD active lattice — now resolves to a STALE absolute pose. Invalidate the
+## live set + any in-progress build so the next non-gated update() does a fresh core-then-fill at the NEW active-
+## lattice column (the same session-first path used on the very first build). Cheap: no PhysicsServer ops here, just
+## a couple of flags. While the collider is gated (no awake debris near) this stays idle and rebuilds only on wake.
+func note_facet_crossing() -> void:
+	_live_center = Vector2i(0x7fffffff, 0)   # "nothing built" → next update() bootstraps a fresh core at the new column
+	_phase = PHASE_IDLE                       # drop any in-progress (old-lattice) build
+	_dirty = false
 
 ## Gate OFF (no loose body near): stop doing rebuild work but RETAIN the live shape set and all
 ## build state (P2 — the anti-stall change). The player is analytic and frozen debris never consults

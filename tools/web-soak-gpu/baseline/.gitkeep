@@ -1,0 +1,2 @@
+# Promote a green GPU-mode run's results/latest.json to baseline.json here (by hand)
+# to arm the regression diff. Until then the harness runs without a baseline.

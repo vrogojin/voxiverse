@@ -31,7 +31,14 @@ static func get_for(block_id: int) -> Material:
 	# shader so ALL geometry (terrain, water, trees, placed blocks, VoxelBody debris — everything
 	# flows through here) curves onto the sphere with one code path, keeping each block's own albedo/
 	# texture/emission. FLAT_WORLD (default) returns today's StandardMaterial3D — byte-identical.
-	var mat: Material = _standard(block_id) if CubeSphere.FLAT_WORLD else _bend_material(block_id)
+	# COSMOS R2.2 (M5_REAL): the near field is now REAL baked geometry (the C++ mesher places every vertex
+	# at its true sphere position), so it must carry NO bend shader — bending baked verts again would
+	# double-transform them. Return the plain StandardMaterial3D, same as flat (docs/…-REAL-GEOMETRY §1).
+	var mat: Material
+	if CubeSphere.FLAT_WORLD or CubeSphere.M5_REAL:
+		mat = _standard(block_id)
+	else:
+		mat = _bend_material(block_id)
 	_cache[block_id] = mat
 	return mat
 
@@ -63,7 +70,14 @@ static func _bend_material(block_id: int) -> ShaderMaterial:
 	var color := BlockCatalog.color_of(block_id)
 	var translucent: bool = rd.get("translucent", false)
 	var m := ShaderMaterial.new()
-	m.shader = CosmosBend.translucent_shader() if translucent else CosmosBend.opaque_shader()
+	# COSMOS M5a (§2): when M5_RENDER is on, carry the TRUE-POSITION placement shader (per-vertex sphere
+	# position + interaction bubble) instead of the camera-centred bend — same uniform surface, so the
+	# param-setting below is unchanged. Default M5_RENDER=false → the CosmosBend shader (byte-identical).
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.ensure_globals_m5()
+		m.shader = CosmosTruePlace.translucent_shader_m5() if translucent else CosmosTruePlace.opaque_shader_m5()
+	else:
+		m.shader = CosmosBend.translucent_shader() if translucent else CosmosBend.opaque_shader()
 	if tex != null:
 		m.set_shader_parameter("albedo_tex", tex)
 		m.set_shader_parameter("use_texture", true)
@@ -77,6 +91,10 @@ static func _bend_material(block_id: int) -> ShaderMaterial:
 		if rd.get("emissive", false):
 			m.set_shader_parameter("emission_color", Color(color.r, color.g, color.b))
 			m.set_shader_parameter("emission_energy", float(rd.get("emissive_glow", 1.0)))
+	# COSMOS M5a: register with the single-writer so the current chart table is applied now (snapshot) and
+	# on every future flip/reanchor in the SAME pass as the far material (kills near/far table divergence).
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.register_material(m)
 	return m
 
 ## The SNOW-CAPPED variant render material for `base_id` (M1 ADR §5.3): the snow_block texture
@@ -110,6 +128,8 @@ static func snow_capped_for(base_id: int) -> StandardMaterial3D:
 static func reset_cache() -> void:
 	_cache.clear()
 	_snow_cache.clear()             # snow-cap variants (M1) rebind per session too
+	if CubeSphere.M5_RENDER:
+		CosmosTruePlace.reset_materials()   # the M5 single-writer fan-out holds the cached materials — clear it too
 
 ## Update the EXISTING cached Material for `block_id` in place from the catalog look
 ## (RUNTIME-MATERIAL-STREAMING §5.3): when an UNRESOLVED placeholder LRID late-resolves

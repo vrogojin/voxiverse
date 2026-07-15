@@ -1,0 +1,18 @@
+{
+  "name": "voxiverse-remote-bridge-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 1 (observe-only) relay for the VOXIVERSE remote-play bridge — token-gated WebSocket that receives telemetry + JPEG frames from a real-GPU play session and writes them to files the agent reads.",
+  "scripts": {
+    "start": "node relay.mjs",
+    "smoke": "node smoke.mjs",
+    "check": "node --check relay.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

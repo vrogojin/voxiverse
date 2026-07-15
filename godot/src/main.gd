@@ -10,7 +10,24 @@ const SKY_COLOR := Color(0.62, 0.74, 0.86)
 var _player: Player
 
 func _ready() -> void:
+	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
+	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
+	if CubeSphere.FACETED_SPIKE:
+		add_child(FacetedSpike.new())
+		return
+
 	_setup_environment()
+
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §4): build the facet atlas and install the spawn facet as the
+	# active facet BEFORE the WorldManager (its module generator freezes TerrainConfig.active_facet() at
+	# creation). warm_up is idempotent + reads worldgen to pick a temperate-land spawn facet, so TerrainConfig
+	# is warmed first. Default OFF (FACETED=false) → this whole block is skipped and the flat game is unchanged.
+	if CubeSphere.FACETED:
+		TerrainConfig.warm_up()
+		FacetAtlas.warm_up()
+		TerrainConfig.set_active_facet(FacetAtlas.spawn_facet())
+		print("[FP1] faceted engine: %d facets (k=%d), spawn facet=%d, spawn col=%s" % [
+			FacetAtlas.facet_count(), FacetAtlas.K, FacetAtlas.spawn_facet(), FacetAtlas.spawn_column()])
 
 	var world := WorldManager.new()
 	world.name = "WorldManager"
@@ -31,7 +48,7 @@ func _ready() -> void:
 	# flattest spot near it. The physics/breaking sandbox is the deterministic
 	# trees from the generator (chop a trunk and the canopy detaches as a loose body).
 	var spawn := TerrainConfig.find_spawn()
-	var col := _find_flat(spawn.x, spawn.y)
+	var col := _find_flat(spawn.x, spawn.y, world)
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
 	world.on_player_ready(player)
@@ -55,6 +72,27 @@ func _ready() -> void:
 	perf.name = "PerfHUD"
 	add_child(perf)
 
+	# REMOTE-PLAY BRIDGE activation (Phase 1, observe-only). An INPUT-ONLY activator is always present:
+	# it wires the Ctrl+Shift+F9 toggle, the on-canvas token prompt, and the live "REMOTE ACTIVE" badge,
+	# but holds NOTHING live (no WebSocket, no frame capture, no per-frame cost) until the chord fires
+	# with a valid token — or the `?remote=<token>` URL param pre-arms it (RemoteBridge.preset_token()).
+	# The relay URL is fixed to our host; the prompt takes a token only. verify_feature never runs
+	# main.gd, so the FLAT gate is unaffected. See net/remote_bridge_activator.gd for the trust model.
+	var activator := RemoteBridgeActivator.new()
+	activator.name = "RemoteBridgeActivator"
+	activator.configure(world, player, RemoteBridge.preset_token())
+	add_child(activator)
+
+	# REMOTE-CONTROL P2 (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4/§7). The RemoteControl executor
+	# (net/remote_control.gd) is deliberately NOT a persistent scene node: RemoteBridge instantiates it
+	# ONLY after the human consents in-game and frees it on revoke/override/link-loss ("dead in normal
+	# play", §4.1). The control graph is therefore owned by the activator+bridge wired just above —
+	# main.gd only records the master gate. Guarded by RemoteBridge.CONTROL_ENABLED (default false → this
+	# block is skipped, byte-identical Phase-1); P4 flips the flag ONLY after the §6 security review +
+	# /steelman + sign-off. A parallel Track-B edit to the scene wiring merges cleanly around this block.
+	if RemoteBridge.CONTROL_ENABLED:
+		print("[REMOTE] P2 control ENABLED — executor is bridge-spawned on human consent (net/remote_control.gd)")
+
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look
@@ -71,7 +109,10 @@ func _ready() -> void:
 	# COSMOS M1 (§3.4): the render bend is camera-centred, so register + seed the global bend
 	# uniforms now. FLAT_WORLD (default) leaves them untouched — no bend materials are ever built.
 	if not CubeSphere.FLAT_WORLD:
-		CosmosBend.set_camera(player.camera_global_transform().origin)
+		if CubeSphere.M5_RENDER:
+			world.m5_push_camera(player.camera_global_transform().origin)   # true-position frame + chart table
+		else:
+			CosmosBend.set_camera(player.camera_global_transform().origin)
 
 	# COSMOS DEV (task #66): the cube-face BORDER overlay — bright magenta pillars along the home face's
 	# seam edges, so they can be walked up to for M4 crossing tests. Curved-only AND flag-gated; FLAT_WORLD
@@ -87,7 +128,20 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
-	CosmosBend.set_camera(_player.camera_global_transform().origin)
+	var cam := _player.camera_global_transform().origin
+	if CubeSphere.M5_RENDER:
+		_player.world.m5_push_camera(cam)
+	elif CubeSphere.M5_REAL:
+		# R2.2 real geometry (Design Z): the near + far are REAL baked geometry (no bend shader), static in
+		# the epoch frame. Keep the far static (apply_alignment IDENTITY) and move the DISPLAYED camera into
+		# that frame — camera_epoch = F⁻¹ · window_cam — so it flies through the static baked planet at the
+		# player's true position/orientation. Physics, streaming and interaction stay in window space (exact
+		# aim arrives with the J⁻¹ input map in R2.3). We do NOT rotate the VoxelTerrain (godot_voxel det==0).
+		_player.world.m5_real_update(_player.global_position)
+		_player.set_render_camera(
+			_player.world.m5_epoch_camera(_player.global_position, _player.window_camera_transform()))
+	else:
+		CosmosBend.set_camera(cam)                     # near field: the camera-centred bend (R1, bend path)
 
 func _setup_environment() -> void:
 	var env := Environment.new()
@@ -109,7 +163,13 @@ func _setup_environment() -> void:
 	env.fog_mode = Environment.FOG_MODE_DEPTH
 	env.fog_light_color = SKY_COLOR
 	env.fog_light_energy = 1.0
-	if FarTerrain.ENABLED:
+	if CubeSphere.FACETED:
+		# COSMOS FACETED §5.2: the faceted planet fills the view out to ~2R; fog only far out so the whole
+		# planet reads, opaque just before the camera far so the space-black rim is hidden.
+		env.fog_depth_begin = FacetFarRing.FOG_BEGIN
+		env.fog_depth_end = FacetFarRing.CAMERA_FAR * 0.98
+		env.fog_depth_curve = 0.5
+	elif FarTerrain.ENABLED:
 		# Far field present (LOD-DESIGN §3.4): retune the 243 m wall into a ~2,750 m haze so
 		# the distant mountains/coastlines read as silhouettes and dissolve into the horizon at
 		# the R_FAR rim. Front-loaded curve keeps the seam band at ~26–49% (washing the residuals)
@@ -130,14 +190,28 @@ func _setup_environment() -> void:
 	add_child(we)
 
 ## Find the FLATTEST column near (cx, cz): the one whose 3x3 neighbourhood varies
-## least in height, so the player starts on even ground.
-func _find_flat(cx: int, cz: int) -> Vector2i:
+## least in height, so the player starts on even ground. In curved mode the search
+## SKIPS double-out corner WEDGE columns (world.is_wedge_column) — an impossible cell
+## reads as perfectly flat void, so the un-filtered search parks the spawn there and
+## the M5_REAL camera starts at the 1e18 wedge sentinel (blank screen).
+func _find_flat(cx: int, cz: int, world: WorldManager = null) -> Vector2i:
 	var best := Vector2i(cx, cz)
 	var best_spread := 0x7fffffff
+	var best_is_wedge := (world != null and world.is_wedge_column(cx, cz))
 	for dz in range(-16, 17, 2):
 		for dx in range(-16, 17, 2):
 			var x := cx + dx
 			var z := cz + dz
+			if world != null:
+				# COSMOS M5c (§4): under the corner seal, spawn must be HOME-NATIVE (both raw indices in [0,n),
+				# no edge fold) or the eager hysteresis fires a flip + hard restream on the first physics frame.
+				# The (+,+) home quadrant of the scan box always has candidates. Native ⊂ non-wedge, so this
+				# subsumes the wedge skip. Flag off → the shipped wedge skip only.
+				if CubeSphere.M5C_CORNER:
+					if not world.is_home_native_column(x, z):
+						continue
+				elif world.is_wedge_column(x, z):
+					continue
 			var lo := 0x7fffffff
 			var hi := -0x7fffffff
 			for oz in range(-1, 2):
@@ -146,9 +220,11 @@ func _find_flat(cx: int, cz: int) -> Vector2i:
 					lo = mini(lo, h)
 					hi = maxi(hi, h)
 			var spread := hi - lo
-			if spread < best_spread:
+			# Always prefer a non-wedge column over the wedge seed, then flattest.
+			if best_is_wedge or spread < best_spread:
 				best_spread = spread
 				best = Vector2i(x, z)
-			if spread == 0:
+				best_is_wedge = false
+			if spread == 0 and not best_is_wedge:
 				return best
 	return best

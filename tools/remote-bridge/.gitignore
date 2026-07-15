@@ -1,0 +1,10 @@
+# Remote-play bridge relay — NEVER commit the secret, deps, or received data.
+.token
+# #113 control credential — a SECOND host secret, distinct from the observe token. Never commit it.
+.control-token
+node_modules/
+package-lock.json
+results/
+*.log
+# P1 control channel — agent-written commands + game-written results are runtime data, not source.
+control/

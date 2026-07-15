@@ -414,7 +414,10 @@ static func _sigma_c_eff(world: Object, c: Vector3i, solid: Dictionary,
 
 ## True for a pristine (unedited) cell with all 6 neighbours solid — confined bulk.
 static func _confined(world: Object, c: Vector3i, _solid: Dictionary) -> bool:
-	if world.placed_cells().has(c):
+	# FP-M1a: point overlay query via the world's edit key (byte-identical to placed_cells().has(c) in
+	# FLAT — `_edit_key(c) == c` there — and correct under FACETED's (fid, cell) keys without rebuilding
+	# the whole Vector3i projection per cell).
+	if world.has_edit(c):
 		return false                        # edited (placed) cells are never confined
 	for d in NB6:
 		if not world.cell_solid(c + d):

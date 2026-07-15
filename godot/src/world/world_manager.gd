@@ -1,5 +1,9 @@
 class_name WorldManager
 extends Node3D
+
+# FP-FIXED-FRAME: preload the FrameAdapter (not the global class_name) so this always-parsed core script never
+# depends on the stale editor class-cache (the same convention as FLM/FLB in verify_fp_m2). Used as a type below.
+const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
 ## Owns "the world": picks the rendering path, drives streaming, and exposes the
 ## analytic queries (solidity, surface height, voxel raycast) that the player and
 ## HUD use regardless of path. Also holds the decoupled sim layer (material
@@ -34,13 +38,86 @@ var _chart: CosmosChart = null
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
+# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.1) — the play-frame bridge. `_active_frame` is the
+# new ActiveFrame Node3D (@ identity in Phase 1) that hosts the player, GroundCollider and loose VoxelBody debris;
+# `_frame` is the FrameAdapter every physics-boundary conversion routes through. When FP_FIXED_FRAME is off both are
+# inert: `_active_frame` stays null, `_frame` is a transparent identity adapter, and `_frame_host()` returns self —
+# so the scene tree and every numeric result are byte-identical to today. Created in _ready().
+var _active_frame: Node3D = null
+var _frame: _FrameAdapterCls = null
+# COSMOS FP-FIXED-FRAME §2.3/§2.2 step 6 + §10 decision 2 (Phase 3) — PER-BODY PER-FACET-ACCURATE debris gravity.
+# With the fixed frame ON the scene IS the planet-ABSOLUTE frame, so a VoxelBody's "down" is ITS OWN facet's up in
+# absolute space (−T_fid.basis.y). Phase 2 used ONE global Area3D rotated to the active facet's up (≤3.7° error on a
+# body resting on a neighbour facet); Phase 3 replaces it with ONE Area3D PER LIVE FACET (`_gravity_areas`: fid →
+# Area3D), each a REPLACE-override box oriented to T_fid + placed over that facet's patch, so a body over facet F
+# falls exactly along F's up. The set is BOUNDED to the live pool (active + ≤ POOL_MAX_NEIGHBOURS neighbours) — the
+# NEVER-OOM cap — resynced on every crossing/pool change. `_gravity_vec` mirrors the ACTIVE facet's down for the
+# headless gate. Empty/(-Y) when the fixed frame is off → default −Y gravity, byte-identical.
+var _gravity_areas: Dictionary = {}   # fid -> Area3D (fixed-frame only; bounded to the live pool)
+var _gravity_vec: Vector3 = Vector3.DOWN
+# COSMOS FP-FIXED-FRAME re-anchor (§3 / §10 decision 1): the accumulated integer floating-origin shift applied to
+# every ABSOLUTE node (PlanetRoot, far ring, per-facet gravity) AND folded into the ActiveFrame placement so the
+# player/debris/collider/viewer ride it. `_player_abs_max` is the Phase-0 telemetry guard — the running max of the
+# player's rendered-absolute magnitude (surfaced live via player_abs_max() → remote bridge). ZERO/0 when off.
+var _anchor_offset: Vector3 = Vector3.ZERO
+var _player_abs_max: float = 0.0
+var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resync (fixed-frame only, §10 decision 2)
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
+var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
+# FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
+# to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
+# and ticked every frame with real time. null unless FP_M2_LOD + the module path (dead code with the flag off).
+var _load_ctrl = null
+const FACET_WALL_EPS := -3.0          # COSMOS FACETED §6.1: FP3 removes the FP2 ridge wall — the crossing handoff
+                                      # replaces it. A deep backstop (3 blocks PAST the ridge) only catches a
+                                      # failed crossing so the player can never wander far onto masked air.
+const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the neighbour just past a ridge (fires in
+                                      # update_streaming the same frame the feet pass P, so any speed is caught)
+# FP-S1(c) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R3 / §8): a crossing that lands the reframed player PAST
+# one of the destination facet's OTHER ridges (the near-corner case) would re-fire a full teardown+restream every
+# physics tick (B→C→B…) — the "all chunks blank" storm. Two guards: a containment check (only commit a crossing
+# whose landing is interior to ALL FOUR of B's ridges, i.e. would not itself immediately re-fire) and a short
+# cooldown (a crossing cannot re-fire for the next N maybe_cross_facet calls — belt-and-suspenders vs ridge jitter).
+const FACET_CROSS_COOLDOWN := 6       # maybe_cross_facet calls (≈physics ticks) suppressed after a committed crossing
+var _cross_cooldown := 0              # remaining suppressed calls (decremented per call; 0 = ready)
+
+# FP-M1c Planet Assembly pool policy (docs/COSMOS-FP-M1-DESIGN.md §4.3). Amortization throttle (≤1 spawn AND ≤1
+# retire per POOL_SPAWN_INTERVAL_S) + the pool-miss counter (a re-designation crossing whose destination was not
+# yet pooled falls back to the FP-S1 teardown — must be ~0 in a normal walk; the gate asserts it). All dormant
+# unless CubeSphere.FP_M1_POOL. Wall-clock (Time.get_ticks_msec) so it works both live and in headless soaks.
+var _last_pool_spawn_ms := -100000
+var _last_pool_retire_ms := -100000
+var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
+# and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
+# committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
+# session can never grow it without limit (NEVER-OOM). Untouched when FACETED is off → FLAT byte-identity holds.
+var _crossing_events: Array = []
+const CROSSING_EVENTS_MAX := 32       # hard cap; oldest dropped past this (a bridge drains ~60/s — never reached live)
+# FP-M2d (§9.1): fids whose live promote is in flight (fid -> spawn ms). Each frame their seam-side band is polled
+# (pool_seam_meshed); when meshed — or after CubeSphere.PROMOTE_EVICT_MAX_S — the held LOD cover is evicted (lod_evict),
+# so the LOD mesh overlaps the streaming terrain with NO gap and is dropped only once the full-res seam is up. FP_M2_LOD-only.
+var _promote_pending: Dictionary = {}
+var _last_demote_relief_ms := -100000  # W3: throttle sustained-overload LOD demote relief to ≤1 per CTRL_TICK_S (else
+                                       # _process fires it every frame while demote_pressure() holds → coarsens the whole
+                                       # LOD field to max tier in ~1s and pulses coarse↔fine)
 
 # COSMOS M4 (§5.1): true while a home-face flip's near field is restreaming (MODULE path only). Set in
 # maybe_flip_home_face, cleared in update_streaming once the module reports ramp_done() — at which point
 # player edits are re-mirrored into the fresh terrain (§5.4) and the far handoff turbo is ended. Never set
 # in FLAT_WORLD (no chart → no flip) or on the fallback path (it re-reads the overlay when it remeshes).
 var _flip_settling := false
+
+# COSMOS R2.2 (docs/…-REAL-GEOMETRY §1): the frozen-per-epoch bake frame shared by the near C++ mesher and
+# the far layer, plus its anchor. Empty until m5_real_install_epoch runs (curved + M5_REAL). The near/far
+# geometry is baked STATIC in this frame; the per-frame rigid F (alignment_transform) rotates it to render
+# around the window-space camera. Re-installed at each home-face flip.
+var _epoch_frame: Dictionary = {}
+# COSMOS M5c (§4/§5): the player's raw distance to the nearest cube vertex, stashed by maybe_flip_home_face
+# each frame so the §5 anomaly check reuses it. 1e30 = "not near a corner / flag off".
+var _corner_dist := 1.0e30
+var _epoch_anchor: Vector3 = Vector3.ZERO
 
 # COSMOS-CORNER-CANONICAL (#69) companion — the TOPOLOGY §5.3 edit-lock. SEPARABLE: set false (or delete
 # this const + the guard in _write_cell) to drop it. When true, a write to a corner-quadrant window cell
@@ -99,6 +176,16 @@ func _ready() -> void:
 	SurfaceModel.ensure_ready()
 	BlockCatalog.ensure_ready()
 
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §4): ensure the facet atlas is built and the spawn facet is
+	# the active facet BEFORE the render path's generator is created (it freezes active_facet). main.gd does
+	# this too, but a headless WorldManager (verify) is constructed directly — warm_up + set_active_facet are
+	# idempotent, so this is a safe backstop. Default OFF → skipped, flat game unchanged.
+	if CubeSphere.FACETED:
+		TerrainConfig.warm_up()
+		FacetAtlas.warm_up()
+		if TerrainConfig.active_facet() < 0:
+			TerrainConfig.set_active_facet(FacetAtlas.spawn_facet())
+
 	# COSMOS M2 (§3.1/§3.2): in curved mode install the floating-origin chart on the home face at
 	# the identity origin, so the overlay keys globally and the origin can re-anchor as the player
 	# walks. FLAT_WORLD (the default) leaves `_chart` null → Vector3i keying → byte-identical.
@@ -106,16 +193,39 @@ func _ready() -> void:
 		_chart = CosmosChart.new(CubeSphere.HOME_BODY, CubeSphere.HOME_FACE, 0, 0)
 		TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win
 		environment.set_chart(_chart)
+		_m5_sync_frame()   # COSMOS M5a: push the chart table to the true-position shader (no-op when M5_RENDER off)
 
 	if ClassDB.class_exists("VoxelTerrain"):
 		_setup_module_path()
 	if not using_module:
 		_setup_fallback_path()
 
-	# Local terrain physics collider (both render paths are collider-less).
+	# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7 P1): install the play-frame bridge. When the
+	# flag is on, ActiveFrame is a Node3D @ IDENTITY (Phase 1) that hosts the player, GroundCollider and loose
+	# VoxelBody debris; the FrameAdapter routes every physics-boundary conversion (a no-op at identity). When off,
+	# `_active_frame` stays null and `_frame` is a transparent identity adapter → the tree + numerics are unchanged.
+	_frame = _FrameAdapterCls.new()
+	if _fixed_frame_on():
+		_active_frame = Node3D.new()
+		_active_frame.name = "ActiveFrame"
+		# Phase 2 (§2.1): the ActiveFrame sits at the active facet's TRUE absolute transform T_active, so the player /
+		# collider / debris hosted under it render + physic in planet-absolute space while their LOCAL transforms stay
+		# facet-lattice. PlanetRoot is pinned @ identity forever (module_world), so a crossing only re-writes THIS node
+		# (O(1) — ~10 non-terrain children), never the mesh blocks. (At Phase-1 sed toggles this reduces to identity when
+		# the spawn facet's transform is identity; the P2 gates assert the tilted-frame behaviour instead.)
+		_active_frame.transform = _anchored(FacetAtlas.facet_transform(TerrainConfig.active_facet()))
+		add_child(_active_frame)
+		# Per-facet directional-gravity Area3D volumes (§10 decision 2) so debris fall along THEIR OWN facet's absolute
+		# up, not one global −T_active.basis.y. Built for the live pool now (active facet); resynced on crossings + the
+		# throttled _process pass as neighbours spawn/retire — the set stays bounded to the pool (NEVER-OOM).
+		_sync_gravity_areas()
+	_frame.setup(_active_frame)
+
+	# Local terrain physics collider (both render paths are collider-less). Hosted under ActiveFrame when the fixed
+	# frame is on (its lattice-coord box shapes then acquire correct absolute globals through the parent, §4).
 	_ground = GroundCollider.new()
 	_ground.name = "GroundCollider"
-	add_child(_ground)
+	_frame_host().add_child(_ground)
 	_ground.setup(self)
 
 	# The snowfall sim reads/writes the SAME overlay + generation both render paths derive from, so it is
@@ -126,7 +236,14 @@ func _ready() -> void:
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
 	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
-	if FarTerrain.ENABLED:
+	# COSMOS FACETED (§5.2): replace FarTerrain (the flat/curved global-index heightmap — a giant misplaced
+	# sheet under a single facet) with the facet far ring: the whole planet rendered around the active facet.
+	if CubeSphere.FACETED and FacetFarRing.ENABLED:
+		_facet_ring = FacetFarRing.new()
+		_facet_ring.name = "FacetFarRing"
+		add_child(_facet_ring)
+		_facet_ring.setup(TerrainConfig.active_facet())
+	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
 		add_child(_far)
@@ -136,10 +253,23 @@ func _ready() -> void:
 		# FLAT_WORLD (no chart) leaves it at ZERO → byte-identical to the pre-COSMOS far layer.
 		if _chart != null:
 			_far.position = _chart.node_origin()      # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org (=−org at spawn)
+			_far.set_chart(_chart)                     # COSMOS R1 (M5_REAL): the far bakes/aligns against the chart
 
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
+
+	# COSMOS R1 DEV: hide the NEAR chunk render so the baked far layer can be inspected alone (render-only —
+	# analytic physics + GroundCollider are untouched, so movement/collision are unchanged). Curved + dev only.
+	if not CubeSphere.FLAT_WORLD and CubeSphere.DEV_HIDE_NEAR:
+		# Module path: node visibility does NOT reach godot_voxel's RID mesh blocks, so collapse the module's
+		# own streaming radius (max_view_distance) — the reliable lever — leaving only a tiny platform under
+		# the player. Fallback path uses MeshInstance3D children, so plain node visibility works there.
+		if _module_world != null and _module_world.has_method("set_render_hidden"):
+			_module_world.call("set_render_hidden", true)
+		if _streamer != null:
+			_streamer.visible = false
+		print("[WorldManager] DEV_HIDE_NEAR: near chunk render hidden (far layer isolated)")
 
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
@@ -147,6 +277,41 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if _snowfall != null and _have_player_pos:
 		_snowfall.process(delta, _last_player_pos)
+	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
+	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
+	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
+	# unchanged. Gated on the fixed frame → zero extra work with the flag off (byte-identical).
+	if _fixed_frame_on():
+		_grav_sync_accum += delta
+		if _grav_sync_accum >= 0.5:
+			_grav_sync_accum = 0.0
+			_sync_gravity_areas()
+	# FP-M2c (§6.5): tick the load controller every frame with REAL time so it adapts to live main-thread load. The
+	# FacetLodMesher reads its credit for LOD apply-ms + build grants (surfaces 1-2). The pool ramp pace (surface 3)
+	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
+	if _load_ctrl != null:
+		_load_ctrl.tick(Time.get_ticks_msec() / 1000.0)
+	# FP-M2d (§6.5.3 surfaces 3-4): drive the pool view-ramp PACE from the controller every frame (stream_pace() folds
+	# in the vox_gen backlog gate — 0 holds neighbour growth while the pool has not drained), and, only under SUSTAINED
+	# overload, apply the pause-first LOD demote relief. With FP_M2_LOD off neither is called (pace stays 1.0 — byte-identical).
+	if CubeSphere.FP_M2_LOD and _load_ctrl != null and _module_world != null:
+		if _module_world.has_method("set_stream_pace"):
+			_module_world.call("set_stream_pace", float(_load_ctrl.stream_pace()))
+		# W3: relief coarsens ONE least-wanted LOD facet per call; fire it at most once per CTRL_TICK_S (demote_pressure()
+		# stays continuously true once tripped, so an unthrottled per-frame call would strip the whole field in ~1s).
+		if bool(_load_ctrl.demote_pressure()) and _module_world.has_method("lod_demote_pressure"):
+			var now_relief := Time.get_ticks_msec()
+			if now_relief - _last_demote_relief_ms >= int(CubeSphere.CTRL_TICK_S * 1000.0):
+				_last_demote_relief_ms = now_relief
+				_module_world.call("lod_demote_pressure")
+	# FP-M2b: the LOD covered set grows/shrinks as builds apply + facets evict (not only on a pool spawn/retire), so
+	# resync the far-ring exclusion on a slow throttle. set_pool_excluded no-ops when the set is unchanged (cheap).
+	# Gated on FP_M2_LOD → zero extra work with the flag off (byte-identical to FP-M1c).
+	if CubeSphere.FP_M2_LOD and _facet_ring != null:
+		_lod_excl_accum += delta
+		if _lod_excl_accum >= 0.5:
+			_lod_excl_accum = 0.0
+			_facet_ring_sync_exclusion()
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -160,8 +325,34 @@ func _setup_module_path() -> void:
 	if world.call("setup"):
 		_module_world = world
 		using_module = true
+		_lod_ctrl_setup()
 	else:
 		world.queue_free()
+
+## FP-M2c (§6.5): create the StreamLoadController, wire the LIVE measured-load source, and forward it to
+## module_world (which passes it to the FacetLodMesher for surfaces 1-2 and holds it for the surface-3 ramp pace).
+## No-op unless FP_M2_LOD → the controller is never created with the flag off (byte-identical to FP-M1c).
+func _lod_ctrl_setup() -> void:
+	if not CubeSphere.FP_M2_LOD or _module_world == null:
+		return
+	# preload (not the global class_name) so a core always-parsed script never depends on the stale editor class cache
+	# (the codebase convention — verify_fp_m2 preloads FLM/FLB likewise). The inner LiveSource resolves off the script.
+	var slc: Script = load("res://src/world/stream_load_controller.gd")
+	_load_ctrl = slc.new()
+	_load_ctrl.set_input_source(slc.LiveSource.new())
+	if _module_world.has_method("set_load_controller"):
+		_module_world.call("set_load_controller", _load_ctrl)
+
+## FP-M2c external injection hook (the harness M2e-WIRE point): override the owned controller (e.g. a soak driver
+## injecting a scripted source). Forwards to module_world so the mesher + ramp read the same instance.
+func set_load_controller(c) -> void:
+	_load_ctrl = c
+	if _module_world != null and _module_world.has_method("set_load_controller"):
+		_module_world.call("set_load_controller", c)
+
+## FP-M2c: the current admission credit ∈ [0,1] (1.0 when no controller — the flag-off / fallback default).
+func stream_load_credit() -> float:
+	return float(_load_ctrl.credit()) if _load_ctrl != null else 1.0
 
 func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
@@ -169,10 +360,199 @@ func _setup_fallback_path() -> void:
 	add_child(_streamer)
 	_streamer.setup(self)
 
+## COSMOS FP-FIXED-FRAME (§10 decision 5): the fixed frame is active only when its flag AND both prerequisites
+## are on (FACETED for a facet play frame, FP_M1_POOL for the redesignation crossing it replaces). Off ⇒ every
+## fixed-frame branch below is inert and the build is byte-identical.
+func _fixed_frame_on() -> bool:
+	return CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL
+
+## The FrameAdapter every physics-boundary conversion routes through (player.gd fetches it). Never null after
+## _ready — a transparent identity adapter when the fixed frame is off.
+func frame_adapter() -> _FrameAdapterCls:
+	return _frame
+
+## The parent node for the player, GroundCollider and loose VoxelBody debris: the ActiveFrame when the fixed frame
+## is on, else this WorldManager (@ identity) exactly as today. THE single seam that makes every debris scan +
+## spawn frame-correct without touching their bodies.
+func _frame_host() -> Node3D:
+	return _active_frame if _active_frame != null else self
+
+## COSMOS FP-FIXED-FRAME §2.2 step 6 — the world gravity vector debris fall along, in the ABSOLUTE (scene) frame.
+## −T_active.basis.y (the active facet's up) when the fixed frame is on; Vector3.DOWN (the default) otherwise. Read
+## by the headless gate (must equal −FacetAtlas.facet_transform(active).basis.y after a crossing).
+func gravity_vector() -> Vector3:
+	return _gravity_vec
+
+## COSMOS FP-FIXED-FRAME re-anchor helper (§3): fold the current floating-origin shift into an ABSOLUTE placement
+## transform — same rotation, origin slid by −_anchor_offset. ZERO offset ⇒ returns `t` unchanged (byte-identical).
+func _anchored(t: Transform3D) -> Transform3D:
+	return Transform3D(t.basis, t.origin - _anchor_offset)
+
+## The accumulated floating-origin shift (blocks) — the amount every absolute node has been slid toward the render
+## origin. `true_abs = node.global + active_anchor_offset()` is the invariant a re-anchor preserves (gate reads it).
+func active_anchor_offset() -> Vector3:
+	return _anchor_offset
+
+## Phase-0 telemetry guard (§3): the running max of the player's rendered-absolute magnitude. Surfaced live by the
+## remote bridge so the |player_abs| headroom (and any re-anchor need at larger R) is evidence-based, not assumed.
+func player_abs_max() -> float:
+	return _player_abs_max
+
+# COSMOS FP-FIXED-FRAME §10 decision 2 — per-facet gravity box dims (blocks). Tangential half-extent (160) exceeds a
+# facet's ~100-block half-width so a body anywhere over facet F is inside F's box, yet is < the ~200-block inter-facet
+# centre spacing so a body at a NEIGHBOUR facet's centre is OUTSIDE this facet's box → exact per-facet up (no seam
+# double-cover at facet centres; only a thin ridge band overlaps, resolved by the active facet's higher priority).
+const GRAV_BOX_TANGENTIAL := 320.0
+const GRAV_BOX_VERTICAL := 2048.0     # ± ~1 k blocks about the facet mean-plane — spans bedrock → tallest surface + debris arc
+
+## COSMOS FP-FIXED-FRAME §10 decision 2 (Phase 3) — resync the per-facet directional-gravity volume set to the LIVE
+## pool: one REPLACE-override Area3D per live facet (active + ≤ POOL_MAX_NEIGHBOURS neighbours → the NEVER-OOM cap),
+## each oriented to T_fid so a VoxelBody over facet F falls along F's OWN absolute up (−T_F.basis.y), not a single
+## global approximation. Builds newly-live facets, frees ones that left the pool, and re-stamps the active facet's box
+## with the higher priority (it wins the thin ridge overlap where the player edits/breaks). No-op when off.
+func _sync_gravity_areas() -> void:
+	if not _fixed_frame_on():
+		return
+	var want: Dictionary = {}
+	if _module_world != null and _module_world.has_method("pool_fids"):
+		for fid in _module_world.call("pool_fids"):
+			want[int(fid)] = true
+	else:
+		want[TerrainConfig.active_facet()] = true
+	# Free gravity boxes whose facet is no longer live (bounds the set — NEVER-OOM).
+	for fid in _gravity_areas.keys():
+		if not want.has(fid):
+			var dead: Area3D = _gravity_areas[fid]
+			_gravity_areas.erase(fid)
+			if is_instance_valid(dead):
+				dead.queue_free()
+	# Build gravity boxes for newly-live facets.
+	for fid in want.keys():
+		if fid >= 0 and not _gravity_areas.has(fid):
+			_gravity_areas[fid] = _build_facet_gravity_area(fid)
+	_stamp_active_gravity()
+
+## Build one directional-gravity Area3D for facet `fid`: a REPLACE-override box, oriented + placed at the facet's
+## absolute (re-anchored) transform with a child box shifted over the facet's own patch (centre cell), gravity along
+## −T_fid.basis.y. Masks the BODY layer only, so the analytic player (CharacterBody3D ignores area gravity) is untouched.
+func _build_facet_gravity_area(fid: int) -> Area3D:
+	var area := Area3D.new()
+	area.name = "FacetGravity_%d" % fid
+	area.collision_layer = 0
+	area.collision_mask = VoxelBody.LAYER_BODY
+	area.gravity_space_override = Area3D.SPACE_OVERRIDE_REPLACE
+	area.gravity_point = false
+	area.gravity_direction = -FacetAtlas.facet_transform(fid).basis.y.normalized()
+	area.gravity = 9.8
+	area.priority = 1
+	area.transform = _anchored(FacetAtlas.facet_transform(fid))
+	var cs := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(GRAV_BOX_TANGENTIAL, GRAV_BOX_VERTICAL, GRAV_BOX_TANGENTIAL)
+	cs.shape = box
+	# Offset the box over the facet's PATCH: the facet-centre lattice cell (T_fid's origin is the lattice ORIGIN, far
+	# from the patch via the decorrelation offset O). In the Area's local (lattice) frame +Y is the facet up.
+	var centre := FacetAtlas.centre_cell(fid)
+	cs.position = Vector3(float(centre.x), 0.0, float(centre.y))
+	area.add_child(cs)
+	add_child(area)
+	return area
+
+## Stamp `_gravity_vec` = the ACTIVE facet's down (for the headless gate + any single-vector consumer) and bias the
+## active facet's box priority above its neighbours' so it wins the thin ridge overlap (the "clean crossing between
+## volumes" — a body at the active/neighbour seam falls to the active floor the player is standing on).
+func _stamp_active_gravity() -> void:
+	var fid := TerrainConfig.active_facet()
+	if fid >= 0:
+		_gravity_vec = -FacetAtlas.facet_transform(fid).basis.y.normalized()
+	for f in _gravity_areas.keys():
+		var a: Area3D = _gravity_areas[f]
+		if is_instance_valid(a):
+			a.priority = (2 if f == fid else 1)
+
+## The gravity DIRECTION a live per-facet volume applies for facet `fid` (−T_fid.basis.y), or Vector3.ZERO if `fid`
+## has no live volume. The exact per-facet-up model the gate asserts against FacetAtlas.facet_of_dir(body position).
+func gravity_direction_for_facet(fid: int) -> Vector3:
+	var a: Area3D = _gravity_areas.get(fid)
+	return a.gravity_direction if (a != null and is_instance_valid(a)) else Vector3.ZERO
+
+## The bounded set of facets with a live gravity volume (== the live pool). Gate reads it to assert the NEVER-OOM cap.
+func live_gravity_facets() -> Array:
+	return _gravity_areas.keys()
+
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
+	# COSMOS FP-FIXED-FRAME (§2.1/§7 P1): re-home the player under the ActiveFrame so its LOCAL transform is the
+	# facet-lattice pose while its GLOBAL transform (what physics + the renderer consume) comes out planet-absolute.
+	# reparent() preserves the global transform, and in Phase 1 ActiveFrame is @ identity so local == global (the
+	# spawn pose main.gd just set is unchanged to the bit). No-op when the fixed frame is off (player stays put).
+	if _active_frame != null and player.get_parent() != _active_frame:
+		# main.gd set the spawn as a LATTICE pose — its GLOBAL under the identity `main` parent (a plain Node → the
+		# player's local == global there). Capture it, reparent (reparent preserves the GLOBAL pose), then RE-ASSERT it
+		# as the LOCAL pose so the player rides the ActiveFrame: its global becomes T_active·lattice (Phase 2 tilted) /
+		# == lattice when T_active is identity (byte-identical). Without this, reparent under the tilted frame would
+		# reinterpret the lattice spawn as an absolute pose and mislocate the player by T_active.
+		var lattice_pose := player.transform
+		player.reparent(_active_frame)
+		player.transform = lattice_pose
+	# COSMOS R2.2: install the frozen epoch bake frame + push it to the C++ near mesher BEFORE the viewer
+	# attaches (so the very first streamed block bakes to true geometry, not flat-window). Anchor at the
+	# player's spawn — place_true(anchor)=0, so epoch coords stay smallest around the player.
+	m5_real_install_epoch(player.global_position)
 	if using_module and _module_world != null:
 		_module_world.call("attach_viewer", player)
+	# COSMOS FP-R0 SPIKE (flag-gated): render the spawn facet's edge neighbours as REAL rotated voxel terrains
+	# across the seams, where today the player sees only the flat FacetFarRing quad. DEAD unless FACETED && FP_R0
+	# (both const false on the shipped tree) → this call is skipped and the faceted build is byte-identical.
+	if CubeSphere.FACETED and CubeSphere.FP_R0:
+		_fp_r0_spike_neighbours()
+
+## COSMOS FP-R0 SPIKE (throwaway VISUAL wiring — see docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §8). For each
+## edge neighbour of the spawn (active) facet, instantiate module_world's rotated-neighbour VoxelTerrain (its own
+## frozen-neighbour generator + own carve mesher, the ONE shared baked library, parented under that facet's real
+## det=+1 placement) and plant a dedicated static viewer at the neighbour centre-surface so it streams+meshes its
+## own band. The spiked neighbours are then excluded from the far ring so their flat quads don't z-fight the real
+## voxels. No-op guarded by the caller on CubeSphere.FP_R0; only reachable in faceted mode with the module present.
+func _fp_r0_spike_neighbours() -> void:
+	if _module_world == null or not _module_world.has_method("spike_rotated_neighbour"):
+		return
+	var active := TerrainConfig.active_facet()
+	if active < 0:
+		return
+	var excluded: Array = []
+	for slot in range(4):
+		var nb: int = FacetAtlas.seam_neighbour(active, slot)
+		if nb < 0 or nb == active or excluded.has(nb):
+			continue
+		var built: Dictionary = _module_world.call("spike_rotated_neighbour", nb, 96)
+		if built.is_empty():
+			continue
+		# Plant a static viewer at the neighbour's centre-surface WORLD point so it streams its own surface band
+		# (the player's global viewer localises out of a 96-block reach of a neighbour ridge — see spike helper).
+		var cc: Vector2i = FacetAtlas.centre_cell(nb)
+		var g := int(TerrainConfig.facet_profile(nb, cc.x, cc.y).x)
+		var w: Array = FacetAtlas.lattice_to_world64(nb, float(cc.x), float(g + 2), float(cc.y))
+		_module_world.call("spike_static_viewer", Vector3(w[0], w[1], w[2]), 96)
+		excluded.append(nb)
+		print("[FP-R0] spiked rotated neighbour facet %d (slot %d) as REAL voxels across the seam" % [nb, slot])
+	# Suppress the flat far-ring quads for the facets we now draw as real rotated voxels (no double-draw).
+	if not excluded.is_empty() and _facet_ring != null:
+		_facet_ring.set_excluded(excluded)
+	print("[FP-R0] spike wired %d rotated neighbour terrain(s) around active facet %d" % [excluded.size(), active])
+
+## COSMOS R2.2: freeze this epoch's shared bake frame (anchored at `anchor`), push its flat params to the
+## C++ near mesher (VoxelMesherBlocky.set_cosmos_bake) so blocky meshes bake to true sphere geometry, and
+## lock the far layer onto the SAME frame so near + far coincide. Re-run at each home-face flip (new epoch).
+## No-op unless curved + M5_REAL + a chart exists → FLAT / R1-only paths are byte-identical.
+func m5_real_install_epoch(anchor: Vector3) -> void:
+	if CubeSphere.FLAT_WORLD or not CubeSphere.M5_REAL or _chart == null:
+		return
+	_epoch_anchor = anchor
+	_epoch_frame = CosmosTruePlace.bake_frame(_chart, anchor)
+	if _module_world != null and _module_world.has_method("set_cosmos_bake"):
+		_module_world.call("set_cosmos_bake", CosmosTruePlace.pack_bake_params_flat(_chart, _epoch_frame))
+	if _far != null and _far.has_method("lock_epoch_frame"):
+		_far.lock_epoch_frame(_epoch_frame)
 
 ## Called every frame with the player's world position (fallback streaming +
 ## keeping the local ground collider centred on the player).
@@ -185,6 +565,12 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
+	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
+		_manage_facet_pool(player_pos)
+	if CubeSphere.M5C_CORNER:
+		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
 	if _far != null:
 		_far.update_center(player_pos)
 	# COSMOS M4 (§5.1/§5.4): while a flip's near field restreams, poll the module's view-distance ramp;
@@ -223,7 +609,14 @@ func cell_value_at(cell: Vector3i) -> int:
 	if e >= 0:
 		return _overlay_window_modifier(cell, e)    # overlay: de-canon the directional modifier into the window frame (§6.4)
 	if _chart == null:
-		return TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+		var vf := TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
+		# COSMOS FACETED §3.5.4/§5.3: the junction authority is the analytic window exit — it MASKS cells
+		# wholly beyond the active facet's ridges to AIR (the domain mask) and turns straddling cells into
+		# kind-2 junction partials. _occ_span composes through ShapeCodec.span (junction-aware), so player
+		# physics + the fallback mesher follow automatically. Interior cells + non-faceted mode: unchanged.
+		if CubeSphere.FACETED:
+			return FacetAtlas.junction_modify(TerrainConfig.active_facet(), cell, vf)
+		return vf
 	# COSMOS M2 (§3.1/§8.2): fold the window cell to its GLOBAL cell FIRST, then generate. Worldgen
 	# is thereby a pure function of the global cell — window-INDEPENDENT — so it is byte-identical
 	# no matter where the chart is anchored (the determinism the far-from-spawn streaming needs).
@@ -262,14 +655,50 @@ func _overlay_canon_modifier(cell: Vector3i, v: int) -> int:
 		return v
 	return CellCodec.with_modifier(v, ShapeCodec.rotate_modifier(CellCodec.modifier(v), (4 - jinv) % 4))
 
-## COSMOS M2 (§1.3): THE overlay key for a window cell. FLAT_WORLD / no chart → the Vector3i window
-## cell itself (byte-identical to the pre-M2 store). Curved → the 43-bit GLOBAL edit key, so an edit
-## survives origin re-anchors and home-face flips (its key is its global identity, not its window
-## position). Returned as a Variant because Dictionary keys are the Vector3i or the int transparently.
+## COSMOS M2 (§1.3) / FP-M1a (§6.2): THE overlay key for a window cell. Three regimes:
+##   • curved (chart installed) → the 43-bit GLOBAL edit key (CubeSphere), so an edit survives origin
+##     re-anchors and home-face flips (its key is its global identity, not its window position);
+##   • FACETED → the 59-bit (fid, cell) GLOBAL key (FacetAtlas), so an edit is bound to its facet+cell
+##     forever and cannot be re-interpreted in the neighbour lattice after a crossing/re-designation;
+##   • FLAT_WORLD / no chart → the Vector3i window cell itself (byte-identical to the pre-M2 store).
+## Returned as a Variant because Dictionary keys are the Vector3i or the int transparently.
 func _edit_key(cell: Vector3i) -> Variant:
-	if _chart == null:
-		return cell
-	return _chart.to_global_key(cell)
+	if _chart != null:
+		return _chart.to_global_key(cell)
+	if CubeSphere.FACETED:
+		return FacetAtlas.edit_key(TerrainConfig.active_facet(), cell)
+	return cell
+
+## FP-M1a (§6.2): the active-facet edit overlay projected back to Vector3i lattice cells — the view the
+## Vector3i-keyed consumers (fallback mesher, structural collapse solver, region save) expect. Under
+## FACETED the stored keys are (fid, cell) globals, so filter to the CURRENT active facet and unpack;
+## since the active facet lattice IS the world/window lattice (no chart), the unpacked cell is the
+## window cell directly. FLAT / no chart returns the live `_edits` by reference (byte-identical, zero
+## copy). Curved uses the dedicated window/region unfolds (placed_cells_window / save_region) instead.
+func _overlay_v3i() -> Dictionary:
+	if CubeSphere.FACETED and _chart == null:
+		return _translate_active(_edits)
+	return _edits
+
+## FP-M1a: the active-facet METADATA overlay as Vector3i cell → document (the region-save companion of
+## `_overlay_v3i`). FLAT returns the live `_meta` by reference (byte-identical).
+func _meta_v3i() -> Dictionary:
+	if CubeSphere.FACETED and _chart == null:
+		return _translate_active(_meta)
+	return _meta
+
+## The (fid, cell)→Vector3i projection of a key-global dict (`_edits` or `_meta`) filtered to the active
+## facet. Only ever called under FACETED (the caller gates), where `_chart` is null and the unpacked
+## cell equals the window cell.
+func _translate_active(src: Dictionary) -> Dictionary:
+	var out := {}
+	var active := TerrainConfig.active_facet()
+	for k in src.keys():
+		if FacetAtlas.edit_key_fid(k) != active:
+			continue
+		var u := FacetAtlas.edit_key_unpack(k)
+		out[u[1]] = src[k]
+	return out
 
 ## Material id at `cell` — the material projection of the composed query. UNCHANGED
 ## contract: every existing call site (floor, blocked, DDA, collider, collapse,
@@ -320,11 +749,13 @@ func placed_top(x: int, z: int) -> int:
 	return _placed_top.get(Vector2i(x, z), -0x40000000)
 
 ## Read-only view of the edit overlay (Vector3i -> int PACKED cell value; 0 = dug
-## air, >0 = solid). The fallback mesher reads placed (value > 0) cells from it and
-## MUST project the material via CellCodec.mat (a bare id is a plain packed value,
-## so it is identical today) rather than treating the raw value as a block id.
+## air, >0 = solid). The fallback mesher / structural collapse solver read placed (value > 0) cells
+## from it and MUST project the material via CellCodec.mat (a bare id is a plain packed value, so it
+## is identical today) rather than treating the raw value as a block id. FP-M1a: under FACETED the
+## live overlay is (fid, cell)-keyed, so this projects the ACTIVE facet's edits back to Vector3i cells
+## (the consumers' expectation); FLAT returns the live `_edits` by reference (byte-identical).
 func placed_cells() -> Dictionary:
-	return _edits
+	return _overlay_v3i()
 
 ## WINDOW-keyed view of the edit overlay (Vector3i window cell → PACKED value) for the fallback
 ## mesher (COSMOS M3 §4.3). In FLAT_WORLD / no chart the overlay IS Vector3i-keyed, so this returns
@@ -337,7 +768,7 @@ func placed_cells() -> Dictionary:
 ## whole overlay, so this adds no asymptotic cost.
 func placed_cells_window() -> Dictionary:
 	if _chart == null:
-		return _edits
+		return _overlay_v3i()   # FLAT: live `_edits`; FACETED: active-facet edits projected to Vector3i cells
 	var out := {}
 	for k: int in _edits.keys():
 		var g := CubeSphere.unpack_key(k)
@@ -368,14 +799,14 @@ const _WAKE_RADIUS := 6.0
 ## Number of active loose VoxelBodies (debris) in the world.
 func active_body_count() -> int:
 	var n := 0
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody:
 			n += 1
 	return n
 
 ## True iff any loose VoxelBody exists at all (dormant or awake).
 func has_active_bodies() -> bool:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody:
 			return true
 	return false
@@ -383,7 +814,7 @@ func has_active_bodies() -> bool:
 ## Number of AWAKE (simulating) loose bodies — dormant (frozen / sleeping) debris is excluded.
 func awake_body_count() -> int:
 	var n := 0
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody and (c as VoxelBody).is_awake():
 			n += 1
 	return n
@@ -395,14 +826,16 @@ func awake_body_count() -> int:
 ## falling body keeps the collider active. A body's world column is its spawn cell offset by its
 ## rigid-body displacement (global_position), so a dropping/shoved body is tracked cheaply.
 func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or not vb.is_awake():
 			continue                        # emptied (mid-free) or DORMANT → does not hold the collider on
 		var home := _body_home_column(vb)
-		var gp := vb.global_position
+		# FP-FIXED-FRAME (§2.3): the collider gate is a LATTICE-column test; a debris body's lattice pose is its
+		# LOCAL transform under ActiveFrame (== global_position when off / at identity → byte-identical).
+		var gp := vb.position
 		var wx := home.x + int(floor(gp.x))
 		var wz := home.y + int(floor(gp.z))
 		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
@@ -415,14 +848,15 @@ func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
 ## rather than on the player, so a small core reliably covers the body that needs ground. Mirrors the
 ## body-tracking of has_active_bodies_near exactly (same awake/home-column logic).
 func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or not vb.is_awake():
 			continue
 		var home := _body_home_column(vb)
-		var gp := vb.global_position
+		# FP-FIXED-FRAME (§2.3): lattice column of the body = its LOCAL pose under ActiveFrame (see above).
+		var gp := vb.position
 		var wx := home.x + int(floor(gp.x))
 		var wz := home.y + int(floor(gp.z))
 		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
@@ -435,13 +869,16 @@ func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
 ## terrain/body edit; comprehensive so a body can never be left floating with its support removed.
 func wake_bodies_near(p: Vector3, radius: float) -> void:
 	var r2 := radius * radius
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or vb.is_awake():
 			continue                        # already awake → nothing to do
-		var xf := vb.global_transform
+		# FP-FIXED-FRAME (§2.3): compare the disturbance point `p` (a LATTICE point — WM callers pass a lattice
+		# cell centre; VoxelBody.break_cell now passes `transform * cell`) against the body's cells in its LATTICE
+		# frame, i.e. its LOCAL transform under ActiveFrame (== global_transform when off / at identity).
+		var xf := vb.transform
 		for k: Vector3i in vb.cells:
 			var wp: Vector3 = xf * Vector3(k.x + 0.5, k.y + 0.5, k.z + 0.5)
 			if wp.distance_squared_to(p) <= r2:
@@ -550,6 +987,8 @@ func overlay_at(cell: Vector3i) -> int:
 ## a local support analysis so undercut terrain drops as loose rigid bodies, then
 ## refreshes ground collision.
 func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
+	if is_corner_locked_column(cell.x, cell.z):
+		return 0                                       # M5c: the corner monument + its lock disc are unbreakable
 	if _edits.get(_edit_key(cell), -1) == 0 or not cell_solid(cell):
 		return 0
 	# Snow first (SNOW-ACCUMULATION §2.5): a snow-FILLED ramp yields its snow BEFORE the terrain
@@ -585,6 +1024,8 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 ## apply, e.g. a corner-3 clamp), updates _placed_top, mirrors into the active render
 ## path and rebuilds the ground collider. Player-overlap is the CALLER's check.
 func place_block(cell: Vector3i, value: int) -> bool:
+	if is_corner_locked_column(cell.x, cell.z):
+		return false                                   # M5c: no placing inside the corner lock disc
 	var block_id := CellCodec.mat(value)
 	if block_id <= BlockCatalog.AIR or block_id >= BlockCatalog.count():
 		return false
@@ -634,11 +1075,20 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 		if int(CubeSphere.fold_cell(_chart.face, _cp.x, _cp.y,
 				CubeSphere.n_for(CubeSphere.HOME_BODY))["face"]) < 0:
 			return
+	# COSMOS M5c (§3): the corner-lock disc covers collapse / snowfall / sim writes at the choke point too.
+	if is_corner_locked_column(cell.x, cell.z):
+		return
 	packed = CellCodec.canonical(packed)
-	# COSMOS M2: the overlay + metadata key by the global edit key in curved mode, by the Vector3i
-	# window cell in FLAT_WORLD (byte-identical). `_edit_columns` stays WINDOW-keyed (a collider
-	# fast-path index) and is re-keyed by −Δ on a re-anchor (_shift_window_bookkeeping).
+	# COSMOS M2 / FP-M1a: the overlay + metadata key by the global edit key in curved mode, by the
+	# (fid, cell) global int under FACETED, by the Vector3i window cell in plain FLAT_WORLD (byte-
+	# identical). `_edit_columns` stays WINDOW-keyed (a collider fast-path index) and is re-keyed by −Δ
+	# on a re-anchor (_shift_window_bookkeeping) / re-derived per facet on a crossing.
 	var ek: Variant = _edit_key(cell)
+	# FP-M1a §6.2 write-guard: under FACETED an edit key is ALWAYS the (fid, cell) packed int — a stray
+	# Vector3i key would corrupt across a crossing. Debug-only (asserts strip in release); the headless
+	# gate re-checks the whole overlay. FLAT/curved never trip this (FACETED is false there).
+	assert(not CubeSphere.FACETED or typeof(ek) == TYPE_INT,
+		"WorldManager._write_cell: a non-int edit key entered `_edits` under FACETED (FP-M1a §6.2)")
 	if meta != null and BlockCatalog.has_block_entity(CellCodec.mat(packed)):
 		_meta[ek] = meta                         # the one write that (re)sets metadata
 	elif not _meta.is_empty():
@@ -848,6 +1298,223 @@ func install_chart(chart: CosmosChart) -> void:
 		TerrainConfig.set_active_frame(chart.face, CubeSphere.d4_of(chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1)
 		if environment != null:
 			environment.set_chart(chart)
+		if _far != null:
+			_far.set_chart(chart)   # COSMOS R1 (M5_REAL): keep the far's bake/align chart current
+		_m5_sync_frame()   # COSMOS M5a: chart table (org/M_win/face axes) → true-position shader
+
+## COSMOS M5a: push the per-FRAME camera frame (d̂_cam / y_cam / M_tangent + camera origin) into the
+## true-position shader globals. Called by main.gd each frame in M5_RENDER mode. No-op without a chart.
+func m5_push_camera(cam: Vector3) -> void:
+	if _chart == null or not CubeSphere.M5_RENDER:
+		return
+	CosmosTruePlace.push_camera(_chart, cam)
+
+## COSMOS R1/R2.2 (M5_REAL): drive the per-frame render alignment from the player WINDOW position. R1 (no
+## epoch locked, far-only builds) levels the far under the camera. R2.2 (epoch locked, Design Z): the near +
+## far are baked STATIC in the shared epoch frame and the CAMERA moves through them (m5_epoch_camera). We do
+## NOT rotate the VoxelTerrain — godot_voxel inverts a singular basis when its transform is rotated (det==0
+## spam), so the near blocks render at their baked epoch coords via identity placement and the far renders
+## static: apply_alignment(IDENTITY) nets the far node's window offset back out (align_root = (I,−position)),
+## so far tiles sit at epoch coords and still track re-anchors. No-op without the far / a chart.
+func m5_real_update(player_pos: Vector3) -> void:
+	if _chart == null or not CubeSphere.M5_REAL:
+		return
+	if not _epoch_frame.is_empty():
+		if _far != null and _far.has_method("apply_alignment"):
+			_far.apply_alignment(Transform3D.IDENTITY)
+		return
+	# R1 far-only fallback (no epoch locked): the far self-refreshes its frame and levels under the camera.
+	if _far != null:
+		_far.update_alignment(player_pos)
+
+## Deprecated R1 name kept for call sites; forwards to the unified updater.
+func m5_real_update_far(player_pos: Vector3) -> void:
+	m5_real_update(player_pos)
+
+## COSMOS R2.2 (Design Z): map the player's WINDOW-space camera transform into the static epoch render frame
+## — camera_epoch = F⁻¹ · window_cam, where F = alignment_transform (epoch→window). The camera flies through
+## the static baked planet at the player's true position/orientation. Physics, streaming and the viewer stay
+## in window space (untouched); only the DISPLAYED camera moves. Returns window_cam unchanged until the epoch
+## is installed. Interaction/aim stays window-space and gains the exact J⁻¹ map in R2.3.
+func m5_epoch_camera(player_pos: Vector3, window_cam: Transform3D) -> Transform3D:
+	if _chart == null or _epoch_frame.is_empty() or not CubeSphere.M5_REAL:
+		return window_cam
+	# Safety net #1 — the DOUBLE-OUT corner WEDGE: if the player stands in the impossible (both-out) quadrant,
+	# place_true() returns the _WEDGE sentinel (1e18). alignment_transform folds that into F.origin, so F⁻¹
+	# would fling the DISPLAYED camera to ~1e18 and the whole planet (near + far, both baked in the epoch
+	# frame) leaves the frustum → a blank HUD-only screen. Fall back to the window camera this frame instead.
+	# (The spawn is kept out of the wedge in main.gd; this guards a player who walks up to the 3-face vertex
+	# before the M5c corner seal lands.)
+	var pe := CosmosTruePlace.place_true(_chart, player_pos, _epoch_frame)
+	if pe == CosmosTruePlace._WEDGE:
+		return window_cam
+	var f := CosmosTruePlace.alignment_transform(_chart, _epoch_frame, player_pos)
+	# Safety net #2 — a degenerate basis (should not happen now camera_frame synthesises a valid corner
+	# radial) → fall back rather than spam Basis.invert det==0.
+	if absf(f.basis.determinant()) < 1.0e-6:
+		return window_cam
+	return f.affine_inverse() * window_cam
+
+## COSMOS: true iff the window column (x, z) folds to the double-out corner WEDGE — an impossible cell with
+## no sphere position (place_true → _WEDGE). Used by main.gd to keep the spawn off the wedge so the M5_REAL
+## camera never starts at the 1e18 sentinel (blank screen). Always false in FLAT_WORLD / when no chart.
+func is_wedge_column(x: int, z: int) -> bool:
+	if _chart == null:
+		return false
+	return CosmosTruePlace.is_wedge(_chart, float(x), float(z))
+
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §3): true iff window column (x,z) is within CORNER_LOCK_R=8 raw
+## cells of a cube vertex — ALL heights refused (bedrock monument + its ground annulus). Cell-CENTRE raw
+## distance across the fold (each strip is a rigid isometry, so Euclidean raw distance is the chart metric).
+## Flag- and chart-gated → FLAT / flag-off short-circuit before any raw math (byte-identical).
+func is_corner_locked_column(x: int, z: int) -> bool:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return false
+	var p := _chart.raw_of_f(float(x) + 0.5, float(z) + 0.5)
+	var c := CosmosCorner.nearest_corner(p.x, p.y, _chart.n)
+	return CosmosCorner.corner_dist(p.x, p.y, c) <= float(CubeSphere.CORNER_LOCK_R)
+
+## COSMOS M5c (§4): true iff window column (x,z) is HOME-NATIVE — both raw indices in [0, n), i.e. no edge
+## fold. main._find_flat prefers these under M5C_CORNER so the spawn does not fire the eager flip on frame 1.
+func is_home_native_column(x: int, z: int) -> bool:
+	if _chart == null:
+		return false
+	var p := _chart.raw_of(x, z)
+	return p.x >= 0 and p.x < _chart.n and p.y >= 0 and p.y < _chart.n
+
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5) — THE runtime corner seal, called each physics frame after the
+## flip. Given the player's window position + velocity, returns a relocation Dictionary the player applies, or
+## {} for "no action". Three cases (all in the continuous RAW frame; window↔raw via the chart):
+##   1. DOUBLE-OUT column (wedge — §7 makes this near-unreachable): apply the §6 seam GLUE to the real strip.
+##   2. inside the R_b anomaly cylinder: the §5.2 bisector TELEPORT (or nothing in barrier mode — S5 blocks entry).
+##   3. else: {}.
+## Flag/chart-gated → FLAT / flag-off is a pure no-op. Physics stays window-space; under M5_REAL the displayed
+## camera follows next frame (set_render_camera), and the exit is never in the wedge so m5_epoch_camera is finite.
+func m5c_corner_check(pos: Vector3, vel: Vector3) -> Dictionary:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return {}
+	var n := _chart.n
+	var fx0 := int(floor(pos.x))
+	var fz0 := int(floor(pos.z))
+	# case 1 — defensive seam glue for a double-out (wedge) column: total at any radius, radius/height preserving.
+	if is_wedge_column(fx0, fz0):
+		var pf := _chart.raw_of_f(pos.x, pos.z)
+		var g := CosmosCorner.glue_raw(pf.x, pf.y, n)
+		var wg := _chart.window_of_f(g["px"], g["py"])
+		return _glue_reloc(pf, Vector2(g["px"], g["py"]), wg, pos, vel, n)
+	# case 2 — inside the R_b anomaly cylinder.
+	var pr := _chart.raw_of_f(pos.x, pos.z)
+	var c := CosmosCorner.nearest_corner(pr.x, pr.y, n)
+	if CosmosCorner.corner_dist(pr.x, pr.y, c) >= CosmosCorner.R_B:
+		return {}
+	if not CubeSphere.M5C_TELEPORT:
+		return _barrier_reloc(pr, c, pos, vel)     # §8 solid barrier: clamp to the cylinder, kill inward velocity
+	var t := CosmosCorner.teleport_raw(pr.x, pr.y, n)
+	var w_out := _chart.window_of_f(t["px"], t["py"])
+	var beta: float = t["beta"]
+	var si: float = t["si"]
+	var sj: float = t["sj"]
+	var w_out2 := _chart.window_of_f(t["px"] + si * cos(beta), t["py"] + sj * sin(beta))
+	var r_out := (w_out2 - w_out)
+	r_out = r_out.normalized() if r_out.length() > 1.0e-9 else Vector2(1, 0)
+	# heading in: the horizontal velocity, or (stationary) inward toward the vertex.
+	var v_h := Vector2(vel.x, vel.z)
+	var d_in: Vector2
+	if v_h.length() > 0.01:
+		d_in = v_h.normalized()
+	else:
+		var w_v2 := _chart.window_of_f(c.x, c.y)
+		var inward := w_v2 - Vector2(pos.x, pos.z)
+		d_in = inward.normalized() if inward.length() > 1.0e-6 else r_out
+	var yaw_delta := Vector3(d_in.x, 0.0, d_in.y).signed_angle_to(Vector3(r_out.x, 0.0, r_out.y), Vector3.UP)
+	# de-embed: never below the exit column's surface; keep vertical velocity; re-aim horizontal speed outward.
+	var y_out := maxf(pos.y, float(effective_height(int(floor(w_out.x)), int(floor(w_out.y))) + 1) + 0.01)
+	var speed := v_h.length()
+	return {
+		"pos": Vector3(w_out.x, y_out, w_out.y),
+		"vel": Vector3(r_out.x * speed, vel.y, r_out.y * speed),
+		"yaw_delta": yaw_delta,
+	}
+
+## COSMOS M5c (§8): the solid ENERGY BARRIER fallback (M5C_TELEPORT=false). Clamp the player to the R_b
+## cylinder surface along their radial from the vertex and remove the inward velocity component — a "you
+## cannot enter" wall over the same full-height cylinder. All §7 invariants keep (the player never gets
+## inside R_b, so never double-out). No teleport, no yaw change.
+func _barrier_reloc(pr: Vector2, c: Vector4, pos: Vector3, vel: Vector3) -> Dictionary:
+	var u := Vector2(pr.x - c.x, pr.y - c.y)
+	u = u.normalized() if u.length() > 1.0e-6 else Vector2(1, 0)
+	var p_out := Vector2(c.x + u.x * (CosmosCorner.R_B + 0.02), c.y + u.y * (CosmosCorner.R_B + 0.02))
+	var w_out := _chart.window_of_f(p_out.x, p_out.y)
+	var w_v := _chart.window_of_f(c.x, c.y)
+	var r_hat := (w_out - w_v)
+	r_hat = r_hat.normalized() if r_hat.length() > 1.0e-6 else Vector2(1, 0)
+	var v_h := Vector2(vel.x, vel.z)
+	var v_in := v_h.dot(r_hat)
+	if v_in < 0.0:
+		v_h -= r_hat * v_in                       # strip the inward component; keep tangential + vertical
+	return {"pos": Vector3(w_out.x, pos.y, w_out.y), "vel": Vector3(v_h.x, vel.y, v_h.y), "yaw_delta": 0.0}
+
+## COSMOS M5c (§6): the UNIVERSAL seam glue for non-flipping entities. Each physics frame, any AWAKE VoxelBody
+## whose column is double-out (wedge — a fast projectile/debris can cross a seam ray far outside R_b) is mapped
+## back through the ±90° B–C seam identification: position + linear velocity, radius/height/speed preserving.
+## The wedge is thus unreachable by anything, at any radius. Zero cost when nothing is awake / flag off.
+func m5c_glue_bodies() -> void:
+	if _chart == null or not CubeSphere.M5C_CORNER:
+		return
+	var n := _chart.n
+	# FP-FIXED-FRAME: scan under the debris host for consistency. This path is chart-gated (M5c, curved-only) and
+	# the fixed frame requires FACETED (⇒ chart null), so it never runs with the frame on — but routing through the
+	# host keeps a single debris-parent seam. Debris stay under WM@identity here, so global_position is unchanged.
+	for ch in _frame_host().get_children():
+		if not (ch is VoxelBody):
+			continue
+		var vb := ch as VoxelBody
+		if not vb.is_awake():
+			continue
+		var gp := vb.global_position
+		if not is_wedge_column(int(floor(gp.x)), int(floor(gp.z))):
+			continue
+		var pf := _chart.raw_of_f(gp.x, gp.z)
+		var g := CosmosCorner.glue_raw(pf.x, pf.y, n)
+		var wg := _chart.window_of_f(g["px"], g["py"])
+		var c := CosmosCorner.nearest_corner(pf.x, pf.y, n)
+		var w_v := _chart.window_of_f(c.x, c.y)
+		var r_old := Vector2(gp.x, gp.z) - w_v
+		var r_new := wg - w_v
+		var lv := vb.linear_velocity
+		if r_old.length() > 1.0e-6 and r_new.length() > 1.0e-6:
+			var ang := Vector3(r_old.normalized().x, 0.0, r_old.normalized().y) \
+				.signed_angle_to(Vector3(r_new.normalized().x, 0.0, r_new.normalized().y), Vector3.UP)
+			var vh := Vector2(lv.x, lv.z).rotated(ang)
+			lv = Vector3(vh.x, lv.y, vh.y)
+		vb.global_position = Vector3(wg.x, gp.y, wg.y)
+		vb.linear_velocity = lv
+
+## §6 glue relocation for the (rare) double-out player: move to the glued strip window position, rotate the
+## horizontal velocity + yaw by the old→new window-radial angle. Height/vertical velocity preserved. The next
+## frame's m5c_corner_check handles the anomaly if the glued position is still inside R_b.
+func _glue_reloc(pf: Vector2, pnew: Vector2, wnew: Vector2, pos: Vector3, vel: Vector3, n: int) -> Dictionary:
+	var c := CosmosCorner.nearest_corner(pf.x, pf.y, n)
+	var w_v := _chart.window_of_f(c.x, c.y)
+	var r_old := (Vector2(pos.x, pos.z) - w_v)
+	var r_new := (wnew - w_v)
+	var yaw_delta := 0.0
+	var vel_out := vel
+	if r_old.length() > 1.0e-6 and r_new.length() > 1.0e-6:
+		var ro := r_old.normalized()
+		var rn := r_new.normalized()
+		yaw_delta = Vector3(ro.x, 0.0, ro.y).signed_angle_to(Vector3(rn.x, 0.0, rn.y), Vector3.UP)
+		var v_h := Vector2(vel.x, vel.z).rotated(yaw_delta)
+		vel_out = Vector3(v_h.x, vel.y, v_h.y)
+	return {"pos": Vector3(wnew.x, pos.y, wnew.y), "vel": vel_out, "yaw_delta": yaw_delta}
+
+## COSMOS M5a: push the chart-orientation + 5-chart fold TABLE (org / M_win / face axes) into the true-
+## position shader globals. Called after every frame change (init / install_chart / flip / reanchor).
+## Guarded on M5_RENDER so the default (and the CosmosBend curved mode) never touch these globals.
+func _m5_sync_frame() -> void:
+	if _chart == null or not CubeSphere.M5_RENDER:
+		return
+	CosmosTruePlace.set_chart_table(_chart)   # single-writer: packs the table + applies to every M5 material this pass
 
 ## The active chart, or null in FLAT_WORLD. Read-only accessor.
 func chart() -> CosmosChart:
@@ -912,6 +1579,14 @@ func cosmos_wedge_cells(center: Vector3, span: float, spacing: float) -> Array:
 ## no content re-streams (pop = 0). Render nodes carry window-space geometry, so they are translated
 ## by −Δ to keep their already-built meshes at the same world position while the origin moves.
 func maybe_reanchor(player_pos: Vector3) -> Vector3:
+	# COSMOS FP-FIXED-FRAME re-anchor (§3 / §10 decision 1): the curved `_chart` path below is a byte-identical no-op
+	# under FACETED (no chart is built — §1.2), so the fixed frame gets its OWN faceted floating-origin re-anchor.
+	# `player_pos` is the player's RENDERED-ABSOLUTE position (player.global_position); the faceted path slides every
+	# absolute node toward the origin and carries the player via the ActiveFrame, so it returns ZERO (the caller
+	# subtracts nothing — unlike the chart path where the caller compensates its own global_position).
+	if _fixed_frame_on():
+		_maybe_reanchor_faceted(player_pos)
+		return Vector3.ZERO
 	if _chart == null or not _chart.needs_reanchor(player_pos):
 		return Vector3.ZERO
 	var d := _chart.reanchor(player_pos)
@@ -930,7 +1605,51 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 	# surface (Fable Stage 1). Any live post-flip cover is a child, so it rides along automatically.
 	if _far != null:
 		_far.position -= shift
+	_m5_sync_frame()   # COSMOS M5a: the reanchor moved _chart.org → refresh the true-position chart table
 	return shift
+
+## COSMOS FP-FIXED-FRAME faceted floating-origin re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1).
+## Tracks the Phase-0 |player_abs| telemetry guard, and — ONLY when the rendered-absolute magnitude exceeds the
+## trigger (never at R = 3072; large-planet headroom) — slides every absolute node back toward the origin by an
+## INTEGER shift so f32 render/physics precision stays bounded. Fires far less often than a crossing; one PlanetRoot
+## re-place per shift is acceptable (§3). The shift is exact-integer so no lattice/edit identity changes.
+func _maybe_reanchor_faceted(player_global: Vector3) -> void:
+	var mag := player_global.length()
+	if mag > _player_abs_max:
+		_player_abs_max = mag                       # Phase-0 telemetry: track the max |player render-abs| seen live
+	if mag < CubeSphere.REANCHOR_TRIGGER_BLOCKS:
+		return
+	# Shift by the player's rendered-absolute position ROUNDED to whole blocks → the player lands near the origin,
+	# and every absolute quantity is an exact integer translation (edits are (fid,cell)-keyed → wholly untouched).
+	var a := Vector3(roundf(player_global.x), roundf(player_global.y), roundf(player_global.z))
+	if a == Vector3.ZERO:
+		return
+	_apply_anchor_shift(a)
+
+## Apply an integer floating-origin shift `a`: slide PlanetRoot (+ its FacetSlots + LOD tiles — ONE mesh-block
+## re-place), the far ring, the per-facet gravity volumes, and the ActiveFrame (hence the player, GroundCollider,
+## debris and the player-parented VoxelViewer, whose LOCAL/lattice poses are all UNTOUCHED) each by −a. Every node's
+## `global + active_anchor_offset()` is therefore invariant — the physical world does not move; only the render
+## origin does. Exposed (non-underscore-free) so the headless gate can force a shift directly (the trigger never
+## fires at R = 3072). No-op unless the fixed frame is on.
+func _apply_anchor_shift(a: Vector3) -> void:
+	if not _fixed_frame_on():
+		return
+	_anchor_offset += a
+	# 1. PlanetRoot (every FacetSlot + the LOD-tile layer ride it) — the ONE godot_voxel re-place, rare by construction.
+	if _module_world != null and _module_world.has_method("shift_anchor"):
+		_module_world.call("shift_anchor", a)
+	# 2. Far ring (its mesh is ABSOLUTE) rides the same shift; the offset survives crossings (set_active folds it in).
+	if _facet_ring != null and _facet_ring.has_method("shift_anchor"):
+		_facet_ring.shift_anchor(a)
+	# 3. ActiveFrame origin drops by a (basis unchanged); player/GroundCollider/debris/viewer keep their lattice locals.
+	if _active_frame != null:
+		_active_frame.position -= a
+	# 4. Per-facet gravity volumes are placed in absolute space → slide each by −a (direction is translation-invariant).
+	for f in _gravity_areas.keys():
+		var ga: Area3D = _gravity_areas[f]
+		if is_instance_valid(ga):
+			ga.position -= a
 
 ## COSMOS M3 (§4.5): the home-face flip. When the player has crossed FLIP_HYST cells PAST a face
 ## edge, re-base the window onto the neighbour face (chart.flip) and HARD-RESTREAM the local region.
@@ -941,9 +1660,438 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 ## found again by its unchanged key from the new home face. Worldgen determinism holds because a
 ## global cell resolves through _curved_profile identically regardless of which window/home face
 ## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
+## COSMOS FACETED §6.1 — the crossing handoff. When the player walks past an active-facet ridge (signed own_dist
+## < −HYST, one-sided so jitter can't double-fire), re-frame them onto the neighbour facet: switch the active
+## facet and return the f64-EXACT reframed position + the dihedral yaw twist for Player.apply_reframe. FP3a: the
+## reframe + active-facet switch (the correctness core, gated by cross-and-return byte-identity). FP3b adds the
+## module restream (M4 cover), the far-ring re-placement (rigid, no regen), and debris re-frame. {} = no crossing.
+func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
+	if not CubeSphere.FACETED:
+		return {}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return {}
+	# FP-S1(c): cooldown — after a committed crossing, suppress the next FACET_CROSS_COOLDOWN calls so a crossing
+	# can never re-fire immediately (ridge-jitter / residual oscillation). A genuine sequential crossing traverses
+	# the whole facet (many ticks ≫ cooldown), so this never blocks a legitimate crossing.
+	if _cross_cooldown > 0:
+		_cross_cooldown -= 1
+		return {}
+	for slot in 4:
+		var s := FacetAtlas.own_dist(fid, slot, player_pos.x, player_pos.y, player_pos.z)
+		if s < -FACET_CROSS_HYST:
+			var to: int = FacetAtlas.seam_neighbour(fid, slot)
+			var np := FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+			# FP-S1(c) containment: only commit if the reframed landing is INTERIOR to ALL FOUR of B's ridges —
+			# concretely own_dist(B, bslot, np) >= -HYST for every bslot, i.e. the landing would NOT itself
+			# immediately re-fire a crossing. A genuine mid-edge crossing lands deep inside B (the welded ridge at
+			# ~+HYST by seam complementarity, the other three far positive), so it ALWAYS passes. Near a corner the
+			# player is past TWO of A's ridges, so the landing sits past one of B's other ridges (< -HYST) → this
+			# slot would ping-pong B→C→B every tick (the R3 storm). Skip it; a later tick (once the player walks
+			# clearly into one facet) or a better slot resolves it. Deferring a corner is strictly safer than a
+			# storm — the far ring still draws the planet and the analytic floor still carries the player.
+			var contained := true
+			for bslot in 4:
+				if FacetAtlas.own_dist(to, bslot, np[0], np[1], np[2]) < -FACET_CROSS_HYST:
+					contained = false
+					break
+			if not contained:
+				continue
+			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
+			var yaw_delta := atan2(ex.z, ex.x)
+			# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
+			# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
+			# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
+			var _cross_t0 := Time.get_ticks_usec()
+			var _rebuild_us := 0
+			var _redesig_us := 0
+			var _far_us := 0
+			TerrainConfig.set_active_facet(to)
+			# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
+			# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
+			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
+			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
+			var _rebuild_t0 := Time.get_ticks_usec()
+			_rebuild_window_indices()
+			_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
+			# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
+			# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
+			# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
+			var redesignated := false
+			var _redesig_t0 := Time.get_ticks_usec()
+			if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
+				redesignated = bool(_module_world.call("redesignate", to))
+				if not redesignated:
+					# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
+					# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
+					_pool_miss_count += 1
+					if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
+						redesignated = bool(_module_world.call("redesignate", to))
+					if not redesignated and _module_world.has_method("pool_reset"):
+						# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
+						# blank. NOT the FP-S1 set_facet path.
+						redesignated = bool(_module_world.call("pool_reset", to))
+			_redesig_us = Time.get_ticks_usec() - _redesig_t0
+			if redesignated:
+				# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
+				# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
+				# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
+				var _far_t0 := Time.get_ticks_usec()
+				if _facet_ring != null:
+					_facet_ring.set_active(to)
+					_facet_ring_sync_exclusion()
+				_far_us = Time.get_ticks_usec() - _far_t0
+			else:
+				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
+				# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
+				if _module_world != null and _module_world.has_method("set_facet"):
+					var old_mod_pos: Vector3 = _module_world.position
+					_module_world.call("set_facet", to, old_mod_pos)
+				if _facet_ring != null:
+					_facet_ring.set_active(to)
+				_flip_settling = true
+				_restream()
+			# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
+			# redesignate() SKIPPED the PlanetRoot transform write (module_world, flag-gated), so NO
+			# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
+			# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
+			if _fixed_frame_on():
+				# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
+				#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
+				#    planet-absolute space. O(1) — never terrain.
+				_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
+				# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
+				#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
+				#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
+				#    sleepers keep their global pose → stay asleep. (The player is NOT compensated here — apply_reframe
+				#    assigns its lattice-B local next; the collider is rebuilt below.)
+				var cross_delta := FacetAtlas.crossing_transform(fid, to)
+				for c in _frame_host().get_children():
+					if c is VoxelBody:
+						var vb := c as VoxelBody
+						var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
+						vb.transform = cross_delta * vb.transform
+						vb.sleeping = was_sleeping
+				# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
+				#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
+				#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
+				_sync_gravity_areas()
+				# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
+				#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
+				#    entirely when no awake debris are near, exactly as today).
+				if _ground != null:
+					_ground.note_facet_crossing()
+			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
+			print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
+				"RE-DESIGNATION" if redesignated else "restream + far re-place"])
+			# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
+			# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
+			# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
+			# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
+			var _cross_us := Time.get_ticks_usec() - _cross_t0
+			var _rd: Dictionary = {}
+			if _module_world != null and _module_world.has_method("take_last_redesignate"):
+				_rd = _module_world.call("take_last_redesignate")
+			var _rec := {
+				"ev": "crossing",
+				"from_fid": fid, "to_fid": to,
+				"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
+				"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
+				"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
+				"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
+				"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
+				"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
+				"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
+				"live_neighbours": int(_rd.get("live_neighbours", 0)),
+				"lod_tiles": int(_rd.get("lod_tiles", 0)),
+				"redesignated": redesignated,
+			}
+			_crossing_events.append(_rec)
+			while _crossing_events.size() > CROSSING_EVENTS_MAX:
+				_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
+			return {"crossed": true, "from": fid, "to": to,
+				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+	return {}
+
+## FP-M1c (§4.3): the neighbour-pool manager, run every physics tick from update_streaming (pool flag only).
+## Spawn a facet whose own-side ridge distance is below D_WARM (nearest first), retire a pooled neighbour past
+## D_RETIRE once it has lived >= MIN_LIVE_S, <=1 spawn AND <=1 retire per SPAWN_INTERVAL_S, hard cap 1 active +
+## MAX_NEIGHBOURS. EDGE neighbours only (§8 -- the diagonal is FP-M1d). On any change it refreshes the far ring.
+func _manage_facet_pool(player_pos: Vector3) -> void:
+	if not _module_world.has_method("pool_spawn"):
+		return
+	var active := TerrainConfig.active_facet()
+	if active < 0:
+		return
+	# Own-side ridge distance per EDGE neighbour (nearest slot wins). The diagonal is never a seam_neighbour, so it
+	# never enters `want` → never live (Z1-hybrid §3.2 "the diagonal facet is never live"). Shared with both policies.
+	var want := {}
+	for slot in 4:
+		var nb: int = FacetAtlas.seam_neighbour(active, slot)
+		if nb < 0 or nb == active:
+			continue
+		var d := FacetAtlas.own_dist(active, slot, player_pos.x, player_pos.y, player_pos.z)
+		if not want.has(nb) or d < float(want[nb]):
+			want[nb] = d
+	var changed := false
+	if CubeSphere.FP_M2_LOD:
+		changed = _manage_pool_z1hybrid(active, player_pos, want)
+		_lod_promote_pass(player_pos)                # evict held LOD covers whose live seam band has meshed (§9.1)
+	else:
+		changed = _manage_pool_fp1c(want)            # shipped FP-M1c policy, byte-identical with the flag off
+	if changed:
+		_facet_ring_sync_exclusion()
+
+## FP-M1c pool policy (shipped, unchanged) — 1 nearest neighbour under D_WARM, up to POOL_MAX_NEIGHBOURS, retire past
+## D_RETIRE (+ MIN_LIVE_S), ≤1 spawn + ≤1 retire per SPAWN_INTERVAL_S. Reached only with FP_M2_LOD OFF. Returns `changed`.
+func _manage_pool_fp1c(want: Dictionary) -> bool:
+	var now := Time.get_ticks_msec()
+	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
+	var changed := false
+	if now - _last_pool_spawn_ms >= interval_ms:
+		var best := -1
+		var best_d := CubeSphere.POOL_D_WARM
+		for nb in want.keys():
+			var d: float = want[nb]
+			if d < best_d and not bool(_module_world.call("pool_has", nb)):
+				best = nb; best_d = d
+		if best >= 0 and int(_module_world.call("pool_neighbour_count")) < CubeSphere.POOL_MAX_NEIGHBOURS:
+			if bool(_module_world.call("pool_spawn", best)):
+				_last_pool_spawn_ms = now
+				changed = true
+	if now - _last_pool_retire_ms >= interval_ms:
+		for nb in (_module_world.call("pool_neighbour_fids") as Array):
+			var d: float = want.get(nb, 1.0e30)
+			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
+				if bool(_module_world.call("pool_retire", nb)):
+					_last_pool_retire_ms = now
+					changed = true
+					break
+	return changed
+
+## FP-M2d (§3.2) — the Z1-hybrid pool policy. Steady state = 1 active + 1 LIVE imminent neighbour (+ 1 corner-second when
+## a 2nd ridge is within POOL_D_WARM2); every OTHER non-active facet is a FacetLodMesher LOD mesh, not a live terrain —
+## the throughput win. Live PROMOTES are gated on the load controller (promote_admitted() + not backlog_gated(), §6.5.3.4)
+## and on the off-surface freeze (high flyer, risk #6). Non-target live neighbours retire (demote → LOD via the far-ring
+## quad, then rebuilt). ≤1 spawn + ≤1 retire per SPAWN_INTERVAL_S. Returns `changed` (whether the far ring needs a resync).
+func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -> bool:
+	var live_now: Array = (_module_world.call("pool_neighbour_fids") as Array)
+	var off_surface := _pool_off_surface(active, player_pos)
+	var targets := z1_live_targets(want, off_surface, live_now)
+	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
+	# so its pool-ramp slot is pace-floored, its LOD stays budgeted through relief mode, and demote never coarsens it.
+	if _module_world != null and _module_world.has_method("set_imminent_fid"):
+		_module_world.call("set_imminent_fid", int(targets[0]) if targets.size() > 0 else -1)
+	var now := Time.get_ticks_msec()
+	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
+	var changed := false
+	# SPAWN (promote LOD → live): the highest-priority target not yet live, iff the controller admits it AND we are below
+	# the Z1 live cap. One spawn per SPAWN_INTERVAL_S (amortized). W1 — targets[0] is the IMMINENT ridge (the one we are
+	# committed to crossing); it is EXEMPT from the raw vox_gen backlog gate (while walking vox_gen naturally sits
+	# 1500-2800, which would otherwise suppress the crossing promote → a silent fall-back to spawn-at-cross + a pool-miss).
+	# It still needs sustained frame HEADROOM (promote_admit_imminent). The 2nd/corner target keeps the FULL backlog gate
+	# — the feed-forward throttle applies to that EXTRA generation volume, and its view-ramp pace is throttled regardless.
+	if now - _last_pool_spawn_ms >= interval_ms:
+		for idx in range(targets.size()):
+			var t: int = int(targets[idx])
+			if bool(_module_world.call("pool_has", t)):
+				continue
+			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
+				break
+			var admitted: bool = promote_admit_imminent(_load_ctrl, float(want.get(t, 1.0e30))) if idx == 0 else promote_admit(_load_ctrl)
+			if not admitted:
+				continue
+			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
+				_last_pool_spawn_ms = now
+				_promote_pending[t] = now                        # track → evict the held cover on seam-band-meshed
+				changed = true
+				break
+	# RETIRE (demote live → LOD): a live neighbour that is no longer a target and has walked past D_RETIRE (hysteresis),
+	# once it has lived ≥ MIN_LIVE_S. pool_retire() re-covers it as an LOD mesh (notify_pool_changed); the far-ring quad
+	# bridges the brief rebuild window. One retire per SPAWN_INTERVAL_S.
+	#
+	# ACCEPTED v1 RESIDUAL (§9.2 build-first-demote, decisions ledger #9): the geometric retire frees the live terrain
+	# BEFORE its LOD cover is built — the far-ring quad covers the gap, but its exclusion re-emit is deferred/budgeted,
+	# so under SUSTAINED backlog-gating there is a brief coarse-flash / possible seam gap for a few frames. A true
+	# build-first-demote requires the mesher to build an LOD cover for a still-LIVE facet, which the mesher deliberately
+	# forbids (request()/_recompute_wants exclude pool facets) — a non-trivial new demote-build path + gate, deferred to
+	# a follow-up. The W1/W10 controller fixes shrink the trigger (retire happens later / the promote holds longer).
+	if now - _last_pool_retire_ms >= interval_ms:
+		for nb in live_now:
+			if targets.has(nb):
+				continue
+			var d: float = want.get(nb, 1.0e30)
+			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
+				if bool(_module_world.call("pool_retire", nb)):
+					_last_pool_retire_ms = now
+					# C4: do NOT erase _promote_pending here — retire alone would leave the mesher's promote-HOLD set
+					# (on_promote) forever, PINNING the held LOD mesh in the cache (no idle/LRU path frees it). Instead let
+					# THIS tick's _lod_promote_pass see `not pool_has(nb)` → lod_end_promote(nb) → lift the hold → erase.
+					changed = true
+					break
+	return changed
+
+## FP-M2d (§3.2) — the PURE Z1-hybrid target selector (static so G-M2-POLICY drives it directly). Given each edge
+## neighbour's own-side ridge distance `want[fid]`, the off-surface freeze flag, and the currently-live neighbour set,
+## returns the fids that SHOULD be live terrains (0, 1, or 2). Rules: off-surface → [] (freeze). Else the imminent =
+## the nearest ridge under D_WARM, BUT an already-live incumbent is kept unless a challenger beats it by POOL_SWITCH_MARGIN
+## (anti-thrash). Plus a corner-second = the nearest OTHER ridge under POOL_D_WARM2, capped at FP2_LIVE_CAP. Every
+## returned fid is present in `want` (edge-only), so a diagonal — never in `want` — can never be a live target.
+static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array) -> Array:
+	var out: Array = []
+	if off_surface:
+		return out
+	var arr: Array = []
+	for nb in want.keys():
+		if float(want[nb]) < CubeSphere.POOL_D_WARM:
+			arr.append([float(want[nb]), int(nb)])
+	if arr.is_empty():
+		return out
+	arr.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
+	# imminent (with incumbent hysteresis): the nearest, unless a live incumbent is within POOL_SWITCH_MARGIN of it.
+	var imm := int(arr[0][1])
+	var imm_d := float(arr[0][0])
+	var inc := -1
+	var inc_d := 1.0e30
+	for c in arr:
+		if live_now.has(int(c[1])) and float(c[0]) < inc_d:
+			inc = int(c[1]); inc_d = float(c[0])
+	if inc >= 0 and imm != inc and imm_d > inc_d - CubeSphere.POOL_SWITCH_MARGIN:
+		imm = inc; imm_d = inc_d                              # challenger did not beat the incumbent by the margin — hold
+	out.append(imm)
+	# corner-second: the nearest OTHER ridge inside the tighter D_WARM2 shell, up to the live cap.
+	for c in arr:
+		if out.size() >= CubeSphere.FP2_LIVE_CAP:
+			break
+		if int(c[1]) != imm and float(c[0]) < CubeSphere.POOL_D_WARM2:
+			out.append(int(c[1]))
+			break
+	return out
+
+## FP-M2d (§6.5.3.4) — is a live-terrain promote admitted right now? Requires credit ≥ CTRL_PROMOTE_CREDIT sustained
+## AND the vox_gen backlog gate open (promotions start only into real, drained headroom). null controller (flag-off /
+## no source) → always admit (the shipped FP-M1c behaviour). Static so G-M2-POLICY asserts the backlog-gated denial.
+static func promote_admit(ctrl) -> bool:
+	if ctrl == null:
+		return true
+	return bool(ctrl.promote_admitted()) and not bool(ctrl.backlog_gated())
+
+## FP-M2d (W1) + CONTROLLER-FIX §P3b — is the SINGLE imminent live-terrain promote admitted? The ridge the player is
+## committed to crossing is EXEMPT from the raw vox_gen backlog gate (which naturally holds while walking, and would
+## otherwise suppress the crossing promote → spawn-at-cross + a pool-miss). Two admit paths:
+##  • polite (headroom): sustained frame headroom (promote_imminent_admitted) — used in the [D_COMMIT, D_WARM] band,
+##    where the controller may defer the spawn to a headroom tick (frequently available under P1/P2 when the player pauses);
+##  • committed (geometric): ridge_dist < POOL_D_COMMIT — the crossing is committed, the generation cost is no longer
+##    optional, and pre-paying it now (≈6.7 s of lead even at run speed) strictly dominates paying it at the seam.
+## A pinned-0 credit (the live starvation, §1) can no longer VETO the imminent live invariant (§3.2) — only pace WHEN it
+## starts within the politeness window. null controller (flag-off / no source) → always admit (shipped FP-M1c). Static so
+## G-M2-POLICY / G-M2-STARVE assert both the headroom path (out-of-commit distance) and the geometric commit at credit 0.
+static func promote_admit_imminent(ctrl, ridge_dist: float) -> bool:
+	if ctrl == null:
+		return true
+	return bool(ctrl.promote_imminent_admitted()) or ridge_dist < CubeSphere.POOL_D_COMMIT
+
+## FP-M2d (risk #6, §10) — off-surface spawn freeze: a HIGH FLYER (altitude above the active facet plane > OFFSURFACE_Y)
+## whose radial direction has drifted over a DIFFERENT facet should not thrash the pool by skimming ridges. Returns true
+## only when both hold. The player's active-facet-lattice position → planet-absolute direction → facet_of_dir classifier.
+func _pool_off_surface(active: int, player_pos: Vector3) -> bool:
+	if player_pos.y <= CubeSphere.OFFSURFACE_Y:
+		return false
+	var w := FacetAtlas.lattice_to_world64(active, player_pos.x, player_pos.y, player_pos.z)
+	var rad_fid := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	return rad_fid != active
+
+## FP-M2d (§9.1) — the promote-completion pass: for every in-flight live promote, drop the held LOD cover once the live
+## terrain's seam-side band (nearest the player) has meshed — or after PROMOTE_EVICT_MAX_S (never pin double geometry).
+## Dropping a facet that retired before its promote completed is handled first (it is no longer live).
+func _lod_promote_pass(player_pos: Vector3) -> void:
+	if _promote_pending.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	var done: Array = []
+	for fid in _promote_pending.keys():
+		if not bool(_module_world.call("pool_has", fid)):
+			_module_world.call("lod_end_promote", fid)        # retired before completing — lift the hold, keep the LOD mesh
+			done.append(fid)
+			continue
+		var meshed := bool(_module_world.call("pool_seam_meshed", fid, player_pos))
+		# W10: dropping the held LOD cover over UN-meshed live terrain is a real see-through hole. Under backlog
+		# starvation the seam may not mesh within PROMOTE_EVICT_MAX_S — EXTEND the timeout (×PROMOTE_EVICT_STARVE_MULT)
+		# while the controller is starving the stream, so the cover holds until the live seam is really up. The hard-cap
+		# escape stays (never pin double geometry forever) — it just becomes much longer under starvation.
+		var cap_s := CubeSphere.PROMOTE_EVICT_MAX_S
+		if _load_ctrl != null and bool(_load_ctrl.backlog_gated()):
+			cap_s *= CubeSphere.PROMOTE_EVICT_STARVE_MULT
+		var timed_out := now - int(_promote_pending[fid]) > int(cap_s * 1000.0)
+		if meshed or timed_out:
+			_module_world.call("lod_evict", fid)             # live full-res now covers the seam → drop the LOD overlap
+			done.append(fid)
+	for fid in done:
+		_promote_pending.erase(fid)
+
+## FP-M1c: refresh the FacetFarRing exclusion to the live pool's NEIGHBOUR fids (the active facet is excluded by
+## the ring itself). Deferred rebuild (budgeted _process) so a spawn/retire/crossing never pays a synchronous regen.
+func _facet_ring_sync_exclusion() -> void:
+	if _facet_ring == null or _module_world == null or not _module_world.has_method("pool_neighbour_fids"):
+		return
+	if not _facet_ring.has_method("set_pool_excluded"):
+		return
+	# FP-M2b (§5.5): the ring's excluded set = live pool neighbours ∪ the facets whose LOD mesh is APPLIED, merged
+	# into ONE deferred/budgeted set_pool_excluded (no synchronous ring regen). With FP_M2_LOD off lod_covered_fids
+	# is [] → this reduces to the shipped FP-M1c pool-neighbour exclusion, byte-identical.
+	var excluded: Array = (_module_world.call("pool_neighbour_fids") as Array).duplicate()
+	if CubeSphere.FP_M2_LOD and _module_world.has_method("lod_covered_fids"):
+		for f in (_module_world.call("lod_covered_fids") as Array):
+			if not excluded.has(f):
+				excluded.append(f)
+	_facet_ring.set_pool_excluded(excluded)
+
+## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
+func pool_miss_count() -> int:
+	return _pool_miss_count
+
+## FP-M2d M2e-WIRE hook (verify_fp_m2_soak §M2e-WIRE): the FacetLodMesher ledger snapshot (facets/tris/bytes/aprons/
+## in-flight, forwarded from module_world.lod_stats() → mesher.stats()). {} without a pool-capable module / flag off, so
+## the soak asserts the LOD caps hold throughout the walk (§11) alongside stream_load_credit() and the neighbour count.
+func lod_stats() -> Dictionary:
+	if _module_world != null and _module_world.has_method("lod_stats"):
+		return _module_world.call("lod_stats")
+	return {}
+
+## FP-M1c gate accessor: is facet `fid` currently in this WorldManager's live pool? (module passthrough; false
+## without a pool-capable module). Used by the end-to-end walk-soak gate to confirm the pool warmed before a crossing.
+func facet_pool_has(fid: int) -> bool:
+	return _module_world != null and _module_world.has_method("pool_has") and bool(_module_world.call("pool_has", fid))
+func facet_pool_neighbour_count() -> int:
+	return int(_module_world.call("pool_neighbour_count")) if (_module_world != null and _module_world.has_method("pool_neighbour_count")) else 0
+
+## A1 CROSSING INSTRUMENTATION (#114): drain + return all per-crossing attribution records queued since the last call
+## (FIFO, oldest first), clearing the queue. RemoteBridge polls this each frame and publishes each record as a
+## distinct {"type":"crossing",…} JSON on the authed telemetry socket. Empty in normal play (a crossing is seconds
+## apart); the queue only ever fills on committed faceted crossings, so this is a no-op when FACETED is off.
+func take_crossing_events() -> Array:
+	if _crossing_events.is_empty():
+		return []
+	var out := _crossing_events
+	_crossing_events = []
+	return out
+
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:
-	if _chart == null or not _chart.flip_needed(player_pos):
+	if _chart == null:
+		return false
+	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §4): inside CORNER_ZONE_R of a vertex, drop the flip hysteresis
+	# from 64 to FLIP_HYST_CORNER=5 so the player re-homes almost immediately after any edge crossing near
+	# the corner (the §7 wedge-unreachability lemma needs this). The corner distance is stashed for §5's
+	# anomaly check. Flag OFF → h stays FLIP_HYST → byte-identical to today.
+	var h := CosmosChart.FLIP_HYST
+	if CubeSphere.M5C_CORNER:
+		var p := _chart.raw_of_f(player_pos.x, player_pos.z)
+		var c := CosmosCorner.nearest_corner(p.x, p.y, _chart.n)
+		_corner_dist = CosmosCorner.corner_dist(p.x, p.y, c)
+		if _corner_dist <= float(CubeSphere.CORNER_ZONE_R):
+			h = CubeSphere.FLIP_HYST_CORNER
+	if not _chart.flip_needed(player_pos, h):
 		return false
 	var res := _chart.flip(player_pos)
 	if not bool(res["ok"]):
@@ -953,6 +2101,14 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	# reverted). FLAT_WORLD never reaches here (no chart), so the flat path is unaffected.
 	# Follow the new home face in the analytic/main-thread-generated worldgen queries (§4.5).
 	TerrainConfig.set_active_frame(_chart.face, CubeSphere.d4_of(_chart.m_win()))   # COSMOS-FRAME-ORIENTATION §6 (Q2d1): atomic face+M_win, before restream
+	_m5_sync_frame()   # COSMOS M5a: flip changed face + M_win → refresh the true-position chart table before restream
+	# COSMOS R2.2 (M5_REAL): a home-face flip is a NEW EPOCH. Re-install the bake frame for the NEW chart NOW,
+	# BEFORE the near restream + far rebase below, so the fresh face bakes into the CORRECT epoch frame. Without
+	# this the near C++ mesher keeps the SPAWN frame (set_cosmos_bake was pushed only at spawn), so every
+	# post-flip block bakes into a stale frame → the near terrain renders BROKEN across faces — worst near a
+	# corner, where M5c's eager flips fire constantly. Anchors the new epoch at the player (the flip keeps the
+	# window position unchanged). No-op unless curved + M5_REAL (m5_real_install_epoch self-guards).
+	m5_real_install_epoch(player_pos)
 	# Re-base the WINDOW-space collider indices onto the new face's index map: the global-keyed
 	# `_edits`/`_meta` are untouched (edits are preserved), but `_edit_columns`/`_placed_top` are
 	# window-keyed PERF indices, so rebuild them by unfolding every edit's global cell back into the
@@ -994,13 +2150,29 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	return true
 
 ## Rebuild the window-keyed PERF indices (`_edit_columns`, `_placed_top`) from the global-keyed
-## overlay after a home-face flip re-bases the window (§4.5). Every edit's global cell is unfolded
-## back into the current window; edits whose cell is not reachable in this window (far off-face)
-## simply do not index a column here — they re-index when the home face flips to their face. Keeps
-## the collider's fast-path gate + above-surface scan exact after the flip.
+## overlay after a home-face flip (curved) or a facet crossing (FACETED) re-bases the window (§4.5 /
+## FP-M1a §6.2). Every edit's global cell is unfolded back into the current window; edits whose cell
+## is not reachable in this window (far off-face / another facet) simply do not index a column here —
+## they re-index when the window returns to them. Keeps the collider's fast-path gate + above-surface
+## scan exact after the reframe.
 func _rebuild_window_indices() -> void:
 	_edit_columns = {}
 	_placed_top = {}
+	# FP-M1a: FACETED (no chart) — the active facet lattice IS the window, so keep this facet's edits and
+	# index them directly by their unpacked cell (x, z) / y high-water mark.
+	if CubeSphere.FACETED and _chart == null:
+		var active := TerrainConfig.active_facet()
+		for k in _edits.keys():
+			if FacetAtlas.edit_key_fid(k) != active:
+				continue
+			var cell: Vector3i = FacetAtlas.edit_key_unpack(k)[1]
+			var col := Vector2i(cell.x, cell.z)
+			_edit_columns[col] = true
+			if int(_edits[k]) > 0:
+				var prev: int = _placed_top.get(col, -0x40000000)
+				if cell.y > prev:
+					_placed_top[col] = cell.y
+		return
 	for k: int in _edits.keys():
 		var g := CubeSphere.unpack_key(k)
 		var win := _chart.window_of_global(int(g["face"]), int(g["i"]), int(g["j"]))
@@ -1161,19 +2333,25 @@ static func _floor_div(a: int, b: int) -> int:
 func save_edits(region_origin: Vector3i) -> ZoneChunk:
 	var zc := ZoneChunk.new()
 	var s := ZoneChunk.SIZE
+	# FP-M1a: iterate the overlay projected to Vector3i cells (FLAT: the live dicts by reference; FACETED:
+	# the ACTIVE facet's edits unpacked to their lattice cell — the region grid is in active-facet lattice).
+	var edits_v := _overlay_v3i()
+	var meta_v := _meta_v3i()
 	# Union of edited cells and metadata-bearing cells in the region (a metadata cell is
 	# always an edited block-entity cell today, but unioning is leak-proof regardless).
 	var cells := {}
-	for cell: Vector3i in _edits.keys():
+	for cell: Vector3i in edits_v.keys():
 		if _in_region(cell, region_origin, s):
 			cells[cell] = true
-	for cell: Vector3i in _meta.keys():
+	for cell: Vector3i in meta_v.keys():
 		if _in_region(cell, region_origin, s):
 			cells[cell] = true
 	for cell: Vector3i in cells.keys():
 		var local := cell - region_origin
 		var idx := ZoneChunk.local_index(local.x, local.y, local.z)
-		zc.set_cell(idx, cell_value_at(cell), _meta.get(cell, null))
+		zc.set_cell(idx, cell_value_at(cell), meta_v.get(cell, null))
+	if CubeSphere.FACETED and _chart == null:
+		zc.set_key_format(ZoneChunk.FIDCELL_V1)   # §6.3 fence: this region is keyed in active-facet lattice
 	return zc
 
 ## Apply a ZoneChunk's present cells back into the overlay at `region_origin`, routing every
@@ -1184,6 +2362,8 @@ func save_edits(region_origin: Vector3i) -> ZoneChunk:
 ## saving session did (VDS §10.1). An unknown name resolves to a logged placeholder material
 ## (never a crash, never data loss of the shape/state bits — §16).
 func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = Callable()) -> void:
+	if not _key_format_compatible(chunk.key_format()):
+		return
 	for idx: int in chunk.present_indices():
 		var name := chunk.material_name_at(idx)
 		var id := -1
@@ -1204,6 +2384,19 @@ static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 		and cell.y >= origin.y and cell.y < origin.y + s \
 		and cell.z >= origin.z and cell.z < origin.z + s
 
+## FP-M1a (§6.3): the save-format fence. A FACETED session loads only FIDCELL_V1 chunks/bundles; a
+## FLAT/curved session loads only legacy (unfenced) ones. A mismatch means the region indices are in a
+## different lattice frame than the loader expects (per-facet vs window/global), so refusing is the only
+## safe choice — it is a fence against a cross-mode misload, not a migration (none exist in the wild).
+func _key_format_compatible(fmt: String) -> bool:
+	var want := ZoneChunk.FIDCELL_V1 if (CubeSphere.FACETED and _chart == null) else ""
+	if fmt == want:
+		return true
+	push_error("WorldManager: refusing a '%s' key-format payload in a '%s' session (FP-M1a §6.3 fence)"
+		% ["fidcell-v1" if fmt == ZoneChunk.FIDCELL_V1 else "legacy",
+			"fidcell-v1" if want == ZoneChunk.FIDCELL_V1 else "legacy"])
+	return false
+
 # --- zone bundles: streamed material payloads (RMS §2.6/§3.4/§5) ----------------
 # The final piece of runtime material streaming: a ZoneBundle packages one or more regions'
 # edit overlay TOGETHER WITH the material documents the receiver needs (manifest), keyed by
@@ -1222,12 +2415,16 @@ static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 func save_bundle(regions: Array) -> ZoneBundle:
 	var bundle := ZoneBundle.new()
 	var s := ZoneChunk.SIZE
+	# FP-M1a: same Vector3i projection as save_edits (FLAT: live dicts; FACETED: active-facet edits).
+	var edits_v := _overlay_v3i()
+	var meta_v := _meta_v3i()
+	var faceted := CubeSphere.FACETED and _chart == null
 	for region_origin: Vector3i in regions:
 		var cells := {}
-		for cell: Vector3i in _edits.keys():
+		for cell: Vector3i in edits_v.keys():
 			if _in_region(cell, region_origin, s):
 				cells[cell] = true
-		for cell: Vector3i in _meta.keys():
+		for cell: Vector3i in meta_v.keys():
 			if _in_region(cell, region_origin, s):
 				cells[cell] = true
 		if cells.is_empty():
@@ -1240,7 +2437,9 @@ func save_bundle(regions: Array) -> ZoneBundle:
 			var local := cell - region_origin
 			zc.set_cell_keyed(ZoneChunk.local_index(local.x, local.y, local.z),
 				String(BlockCatalog.key_of(mat)), CellCodec.modifier(v), CellCodec.state(v),
-				_meta.get(cell, null))
+				meta_v.get(cell, null))
+		if faceted:
+			zc.set_key_format(ZoneChunk.FIDCELL_V1)   # §6.3 fence on every chunk of the bundle
 		bundle.add_chunk(region_origin, zc)
 	return bundle
 
@@ -1264,6 +2463,8 @@ func load_bundle(bundle: ZoneBundle) -> void:
 	for entry: Dictionary in bundle.chunks():
 		var region_origin: Vector3i = entry["origin"]
 		var chunk: ZoneChunk = entry["chunk"]
+		if not _key_format_compatible(chunk.key_format()):
+			continue                                 # FP-M1a §6.3 fence: skip a cross-mode chunk
 		for idx: int in chunk.present_indices():
 			var key := chunk.material_name_at(idx)
 			var lrid := int(key_to_lrid.get(key, -1))
@@ -1345,7 +2546,11 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 			comp_ids[c] = CellCodec.with_state(cv, CellCodec.state(cv) & ~CellCodec.STATE_SNOW_CAPPED)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
-		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
+		# FP-FIXED-FRAME (§5): parent collapse debris under the ActiveFrame host (else self, @ identity) so it rides
+		# the play frame; the world_ref stays this WorldManager. Phase 2: spawn_loose sets the body's LOCAL transform
+		# to identity (cells stay lattice), so its GLOBAL comes out T_active·cell — the block's true absolute pose,
+		# where it physically sat. Frame off ⇒ global identity == local identity (parent @ identity) → byte-identical.
+		VoxelBody.spawn_loose(_frame_host(), comp_ids, self, from_pos)
 
 # --- per-joint reinforcement (STRUCTURAL-INTEGRITY §4.2/§7) ---------------------
 
@@ -1428,6 +2633,15 @@ const _EPS := 1e-6
 ## → wall), a body span overlapping the ground finds its surface far above the buried
 ## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
+	# COSMOS FACETED §5.3: the ridge wall. Until the FP3 handoff lets the player cross onto the neighbour, an
+	# invisible wall sits just inside each active-facet ridge plane, so the player can stand on the own-side of
+	# every junction cell but not walk past P into the masked void. One own_dist test per ≤4 seams.
+	if CubeSphere.FACETED:
+		var fid := TerrainConfig.active_facet()
+		if fid >= 0:
+			for slot in 4:
+				if FacetAtlas.own_dist(fid, slot, x, feet_y, z) < FACET_WALL_EPS:
+					return true
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)

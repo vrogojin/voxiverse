@@ -23,6 +23,8 @@ static func build(modifier: int) -> Dictionary:
 	# corner heights = level/10 — the uniform-height reuse of the corner builder (§3c "a thin-slab
 	# builder — trivial next to the ramp builder"). is_layer FIRST so its FAM modifier never decodes
 	# as corner heights.
+	if CellCodec.is_junction(modifier):
+		return _build_junction(modifier)
 	if CellCodec.is_layer(modifier):
 		var lh := float(CellCodec.layer_level(modifier)) / 10.0
 		return _build_heights(lh, lh, lh, lh, ShapeCodec.ANCHOR_BOTTOM)
@@ -134,6 +136,139 @@ static func _slope_side(arr: Dictionary, base_a: Vector3, base_b: Vector3, ha: f
 		return
 	for i in range(1, pts.size() - 1):
 		_tri(arr, pts[0][0], pts[i][0], pts[i + 1][0], nrm, pts[0][1], pts[i][1], pts[i + 1][1])
+
+## COSMOS FACETED §3.5.4 — build the unit-cell mesh for a JUNCTION modifier: the unit cube clipped by the
+## seam ridge plane (the QUANTIZED q-model plane from the atlas, matching the render). Clips the 6 cube faces
+## against the plane (keep own_local ≥ 0) and adds the tilted cut face; the cut face's outward neighbour is AIR
+## (the mask), so godot_voxel never culls it. The active facet supplies the exact per-seam orientation (A,B,C).
+static func _build_junction(modifier: int) -> Dictionary:
+	var arr := {
+		"verts": PackedVector3Array(),
+		"normals": PackedVector3Array(),
+		"uvs": PackedVector2Array(),
+		"indices": PackedInt32Array(),
+	}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		_emit_cube(arr)                              # defensive: no active facet → full cube
+		return arr
+	var pl: Array = FacetAtlas.junction_model_plane(fid, CellCodec.junction_slot(modifier), CellCodec.junction_q(modifier))
+	var faces := _clip_solid(_unit_cube_faces(), pl)
+	for f: Dictionary in faces:
+		_emit_polygon(arr, f["poly"], f["normal"])
+	return arr
+
+## COSMOS FP-CARVE (docs/COSMOS-FACETED-CARVE.md) — the multi-plane cube-clip REFERENCE the C++ mesher
+## transcribes 1:1 (patch 0004). Given the LOCAL cell planes (each [A, B, C, base]; own_local(u) =
+## A·ux + B·uy + C·uz + base ≥ 0 is the interior half-space — the exact form junction_prism_verts builds),
+## fold the unit cube through _clip_solid once per plane. A single plane reproduces _build_junction's
+## single-plane clip exactly (identical body); ≥ 2 planes clip CORNER cells correctly because _clip_solid
+## re-clips every face it is handed, INCLUDING previously-added caps (cap-of-cap). Returns the surviving
+## face list [{poly: [Vector3…] CCW, normal: Vector3}]; degenerate faces are dropped by _clip_solid.
+static func build_carve_faces(local_planes: Array) -> Array:
+	var faces := _unit_cube_faces()
+	for pl: Array in local_planes:
+		faces = _clip_solid(faces, pl)
+	return faces
+
+# The 6 faces of the unit cube as {poly: [Vector3 ×4 CCW], normal: Vector3 outward}.
+static func _unit_cube_faces() -> Array:
+	var v := [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1),
+		Vector3(0, 1, 0), Vector3(1, 1, 0), Vector3(1, 1, 1), Vector3(0, 1, 1)]
+	return [
+		{"poly": [v[0], v[3], v[2], v[1]], "normal": Vector3.DOWN},   # y=0
+		{"poly": [v[4], v[5], v[6], v[7]], "normal": Vector3.UP},     # y=1
+		{"poly": [v[0], v[1], v[5], v[4]], "normal": Vector3(0, 0, -1)},  # z=0
+		{"poly": [v[3], v[7], v[6], v[2]], "normal": Vector3(0, 0, 1)},   # z=1
+		{"poly": [v[0], v[4], v[7], v[3]], "normal": Vector3(-1, 0, 0)},  # x=0
+		{"poly": [v[1], v[2], v[6], v[5]], "normal": Vector3(1, 0, 0)},   # x=1
+	]
+
+static func _plane_val(pl: Array, p: Vector3) -> float:
+	return pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3]
+
+# Clip a convex solid (list of {poly, normal}) by one half-space (keep own_local ≥ 0), adding the cut cap.
+static func _clip_solid(faces: Array, pl: Array) -> Array:
+	var out: Array = []
+	var cut_pts: Array = []
+	for f: Dictionary in faces:
+		var r := _clip_poly(f["poly"], pl)
+		var poly: Array = r["poly"]
+		if poly.size() >= 3:
+			out.append({"poly": poly, "normal": f["normal"]})
+		for cp: Vector3 in r["cut"]:
+			cut_pts.append(cp)
+	if cut_pts.size() >= 3:
+		var cn := Vector3(-pl[0], -pl[1], -pl[2]).normalized()   # cut face points OUT of the solid (−grad)
+		var ring := _order_ring(cut_pts, cn)
+		if ring.size() >= 3:
+			out.append({"poly": ring, "normal": cn})
+	return out
+
+# Sutherland–Hodgman: keep the own_local ≥ 0 side of `poly`; report the ≤2 crossing points for the cap.
+static func _clip_poly(poly: Array, pl: Array) -> Dictionary:
+	var out: Array = []
+	var cut: Array = []
+	var n := poly.size()
+	for i in range(n):
+		var cur: Vector3 = poly[i]
+		var nxt: Vector3 = poly[(i + 1) % n]
+		var fc := _plane_val(pl, cur)
+		var fn := _plane_val(pl, nxt)
+		var ic := fc >= -_EPS
+		var inx := fn >= -_EPS
+		if ic:
+			out.append(cur)
+		if ic != inx:
+			var t := fc / (fc - fn)
+			var ip := cur.lerp(nxt, t)
+			out.append(ip)
+			cut.append(ip)
+	return {"poly": out, "cut": cut}
+
+# Order a set of coplanar points into a convex ring (dedup + angular sort about the centroid).
+static func _order_ring(pts: Array, normal: Vector3) -> Array:
+	var uniq: Array = []
+	for p: Vector3 in pts:
+		var dup := false
+		for u: Vector3 in uniq:
+			if p.distance_to(u) < 1e-5:
+				dup = true; break
+		if not dup:
+			uniq.append(p)
+	if uniq.size() < 3:
+		return []
+	var c := Vector3.ZERO
+	for u: Vector3 in uniq:
+		c += u
+	c /= float(uniq.size())
+	var t := normal.cross(Vector3.UP)
+	if t.length() < 1e-4:
+		t = normal.cross(Vector3.RIGHT)
+	t = t.normalized()
+	var bt := normal.cross(t).normalized()
+	uniq.sort_custom(func(a: Vector3, b: Vector3) -> bool:
+		return atan2((a - c).dot(bt), (a - c).dot(t)) < atan2((b - c).dot(bt), (b - c).dot(t)))
+	return uniq
+
+# Emit a convex polygon (fan) with a flat normal + planar UV (top/bottom → x,z; laterals/cut → tangent,y).
+static func _emit_polygon(arr: Dictionary, poly: Array, normal: Vector3) -> void:
+	for i in range(1, poly.size() - 1):
+		_tri(arr, poly[0], poly[i], poly[i + 1], normal,
+			_face_uv(poly[0], normal), _face_uv(poly[i], normal), _face_uv(poly[i + 1], normal))
+
+static func _face_uv(v: Vector3, normal: Vector3) -> Vector2:
+	if absf(normal.y) > 0.5:
+		return Vector2(v.x, v.z)
+	var tang := normal.cross(Vector3.UP)
+	if tang.length() < 1e-4:
+		tang = Vector3(1, 0, 0)
+	tang = tang.normalized()
+	return Vector2(v.dot(tang), v.y)
+
+static func _emit_cube(arr: Dictionary) -> void:
+	for f: Dictionary in _unit_cube_faces():
+		_emit_polygon(arr, f["poly"], f["normal"])
 
 ## Emit one side quad (base_a, base_b at y=0; surf_b, surf_a at the corner heights),
 ## skipping it when the face collapses to a line (both heights ~0).

@@ -30,6 +30,168 @@ const REGION_SIZE := 32
 const CORNER_SEA_R := 48
 const CORNER_LOCK_R := 8
 
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §9) — the walkable-land-corner seal: bedrock pillar + anomaly
+## teleport. All gated behind M5C_CORNER (default OFF → shipped build byte-identical). M5C_TELEPORT=false
+## degrades §5's bisector teleport to §8's solid energy barrier over the same cylinder. CORNER_ZONE_R /
+## FLIP_HYST_CORNER are the eager-flip zone/hysteresis (corrected from the ADR's 32/8 — see the doc §7/§13);
+## PILLAR_R_CELLS / PILLAR_TOP_UP size the bedrock monument.
+## COSMOS FP0 (docs/COSMOS-FACETED-PLANET-STUDY.md §11) — the faceted-planet VISUAL SPIKE. When true, main.gd
+## builds a static demo faceted planet (flat square facets meeting at dihedral ridges, real terrain colours,
+## free-fly camera) INSTEAD of the normal world, so the faceted look can be judged live. Default OFF.
+const FACETED_SPIKE := false
+## COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §1.1) — the PLAYABLE faceted engine master toggle. When true the
+## world is ONE flat voxel facet (FacetAtlas) carrying the sphere terrain, played with the flat engine wholesale
+## (gravity −Y local, break/place/collapse). REQUIRES FLAT_WORLD=true (a facet IS a flat world). All faceted
+## worldgen is gated behind this, so default OFF → the shipped build is byte-identical (FLAT gate 6027/0). FP1
+## renders the single home facet; FP2+ add the neighbour ring + walkable junction blocks.
+const FACETED := false
+## COSMOS FACETED (§5) — the 8 grid-twist singularities (cube-vertex facets where the lattice cannot align). FP5.
+const FACET_TWIST := false
+## COSMOS FP-R0 (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §8) — the multi-facet rotation kill-shot SPIKE. When
+## true it unlocks module_world's spike_* methods (a rotated neighbour VoxelTerrain + a LOD-stride probe) used
+## ONLY by verify_fp_r0. Default OFF → shipped build byte-identical (the spike methods no-op, the generator's
+## lod>0 stride stays disabled). Requires FACETED = true. Never ship this on.
+const FP_R0 := false
+
+## COSMOS FP-M1c (docs/COSMOS-FP-M1-DESIGN.md §3–§5) — the Planet Assembly master toggle. When true the faceted
+## world runs the POOLED rotated-neighbour terrains under a PlanetRoot (≥2 facets rendering real voxels at a
+## ridge) and crossings become sub-frame RE-DESIGNATION (root-transform swap + view rebalance, NO teardown/
+## restream). Exactly ONE global player VoxelViewer serves every facet terrain (the spike's per-neighbour static
+## viewers are BANNED, §2); every pool terrain is `bounds`-clamped to its own facet slab (§3.2). Requires
+## FACETED = true. Default OFF → faceted behaves as FP-S1 (single active terrain + far-ring quads + set_facet
+## teardown crossing); with FACETED also off, FLAT is byte-identical (6027/0). Flipped ON at export after the A/B.
+const FP_M1_POOL := false
+## FP-M1c pool policy (§4.3) + memory ledger (§10). Consts so the gate can assert the caps (never-OOM: the pool
+## has a geometric ceiling independent of viewer behaviour). D_WARM: spawn a neighbour when the player's own-side
+## ridge distance drops below this. D_RETIRE: free it once past this (32-block hysteresis ≫ jitter). MIN_LIVE_S:
+## minimum lifetime before a retire (anti-thrash at the D_WARM shell). MAX_NEIGHBOURS: hard cap (geometry wants
+## ≤3 concurrently; 4 is slack + LRU backstop). SPAWN_INTERVAL_S: ≤1 spawn AND ≤1 retire per second (amortized).
+## MEM_BUDGET_MB: pool worst-case ceiling (1×40 + 4×20 = 120 ⇒ 128). SINGULAR_EXCLUDE: cells near a cube-vertex
+## singularity kept single-plane (excluded from the two-live-facet complementarity assert, §8).
+const POOL_D_WARM := 96.0
+const POOL_D_RETIRE := 128.0
+const POOL_MIN_LIVE_S := 10.0
+const POOL_MAX_NEIGHBOURS := 4
+const POOL_SPAWN_INTERVAL_S := 1.0
+const POOL_MEM_BUDGET_MB := 128
+const POOL_SINGULAR_EXCLUDE := 4
+
+## COSMOS FP-M2d (docs/COSMOS-FP-M2-DESIGN.md §3.2 / §9) — the Z1-hybrid pool-policy consts (beside the POOL_* family,
+## §3.2). CONSULTED ONLY under FP_M2_LOD; with the flag off the pool reverts to the shipped FP-M1c policy verbatim
+## (POOL_MAX_NEIGHBOURS = 4 stays the hard backstop, asserted by G-M1-POOL). D_WARM2: a SECOND live neighbour spawns
+## only when a 2nd ridge is within this (the corner approach; mid-edge it never fires). FP2_LIVE_CAP: the effective
+## live-neighbour cap (1 imminent + 1 corner-second) — the throughput win (worst pool volume 2.1V → 1.56V). SWITCH_MARGIN:
+## an incumbent imminent neighbour is displaced only when a challenger's ridge distance beats it by this (anti-thrash on
+## a diagonal-walk sweep). PROMOTE_EVICT_MAX_S / DEMOTE_RETIRE_MAX_S: hard lifetime caps on the promote/demote overlap
+## windows (§9.1/§9.2) — never let a laggard mesh/terrain pin double geometry (NEVER-OOM outranks the pop).
+const POOL_D_WARM2 := 48.0
+const FP2_LIVE_CAP := 2
+const POOL_SWITCH_MARGIN := 16.0
+const PROMOTE_EVICT_MAX_S := 20.0
+const DEMOTE_RETIRE_MAX_S := 20.0
+## W10 — while the load controller is STARVING the stream (vox_gen backlog-gated), the promoting terrain's seam band
+## may not mesh within PROMOTE_EVICT_MAX_S; dropping the held LOD cover then would open a real see-through hole over
+## un-meshed live terrain. So the promote-evict timeout is EXTENDED by this factor while backlog-gated (the hard-cap
+## escape stays — it just becomes much longer under starvation, never infinite).
+const PROMOTE_EVICT_STARVE_MULT := 6.0
+
+## COSMOS FP-M2 (docs/COSMOS-FP-M2-DESIGN.md §0.8) — the LOD-mesh-neighbours master toggle. When true (AND
+## FACETED AND FP_M1_POOL AND the module binary present) non-imminent facets stop being live full-res
+## VoxelTerrains and become screen-space-error-selected blocky meshes built entirely OFF the voxel worker pool
+## (FacetLodMesher), cutting the generation-throughput ceiling. FP-M2a (this stage) ships ONLY the off-terrain
+## build primitive + the LOD0 byte-identity gate as DEAD CODE behind this flag — no scene consumer yet. Default
+## OFF → the faceted world is byte-identical to FP-M1c; FLAT stays 6027/0. Flipped ON at export after the
+## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
+const FP_M2_LOD := false
+
+## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
+## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
+## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with
+## p ≤ τ). LOD_HYST_BAND — a re-tier only fires when the continuous ℓ_c crosses the current tier's band by this
+## much (no boundary thrash). LOD_QUEUE_MAX_EST_S — the FIXED (load-independent, §6.5.7) est-build-seconds admission
+## bound the budgeter grants under. CONTROLLER (§6.5): the closed loop on measured main-thread load. FRAME_BUDGET_MS
+## — the worst-frame setpoint. TICK_S — control cadence. WINDOW_FRAMES — the worst-frame sliding window. BACKLOG_MAX
+## — the vox_gen feed-forward gate (holds full-res admission at 0 until the pool drains; == the M2e definition of
+## done). PROMOTE_SUSTAIN_S — credit must sit ≥ PROMOTE_CREDIT this long before a live spawn is admitted (M2d).
+## OVERLOAD_SUSTAIN_S — only sustained credit-0 overload this long triggers a (pause-first) demote (§6.5.4). AIMD:
+## CREDIT_MDF (×0.5 on overload) / CREDIT_AI (+0.1 under headroom). OFFSURFACE_Y — the flight altitude above which
+## the pool freezes spawns (risk #6 defensive stub; M2d consumes it).
+const LOD_TAU_PX := 3.0
+const LOD_HYST_BAND := 0.25
+const LOD_QUEUE_MAX_EST_S := 30.0
+const CTRL_FRAME_BUDGET_MS := 18.0
+const CTRL_TICK_S := 0.25
+const CTRL_WINDOW_FRAMES := 30
+const CTRL_BACKLOG_MAX := 300
+const CTRL_PROMOTE_SUSTAIN_S := 1.5
+const CTRL_OVERLOAD_SUSTAIN_S := 3.0
+const CTRL_CREDIT_MDF := 0.5
+const CTRL_CREDIT_AI := 0.1
+const CTRL_PROMOTE_CREDIT := 0.5
+const OFFSURFACE_Y := 256.0
+
+## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
+## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
+## are floored to, so COVERAGE relief flows even at credit 0 (§P3a/§P3c); a relief-only candidate restriction keeps it
+## terminal. FRAME_SAMPLE_CLAMP_MS — the per-sample clamp on the P1 measured inter-poll frame delta (a backgrounded tab
+## cannot poison the window with a multi-second sample; §P1). WINDOW_PCTL — the P2 order statistic over the frame window
+## (was: max; a max makes one browser-normal dropped frame per half-second read as sustained overload forever, §1.2).
+## POOL_D_COMMIT — inside this ridge distance the imminent live promote is admitted GEOMETRICALLY (the crossing is
+## committed; the cost is unavoidable and pre-paying it strictly dominates paying it at the seam, §P3b). D_WARM→D_COMMIT
+## is the politeness window (defer to a headroom tick); D_COMMIT→0 is the commit band.
+const CTRL_RELIEF_FLOOR := 0.25
+const CTRL_FRAME_SAMPLE_CLAMP_MS := 250.0
+const CTRL_WINDOW_PCTL := 0.9
+const POOL_D_COMMIT := 64.0
+
+## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
+## master toggle (the crossing-hitch fix). When true, the player + GroundCollider + loose VoxelBody debris live
+## under a new ActiveFrame Node3D whose transform is the active facet's true placement, so gameplay math stays in
+## the facet-local play frame while the physics server + renderer consume planet-absolute globals — and a crossing
+## becomes an O(1) node-transform swap instead of re-placing every loaded mesh block (the 200–772 ms stall).
+## PHASE 1 (this stage) is the FRAME-NEUTRAL refactor ONLY: ActiveFrame pins at IDENTITY and every global↔local
+## conversion routes through FrameAdapter, which is then a numeric no-op → byte-identical to today (flag on OR off).
+## Phase 2 flips ActiveFrame to T_active and skips the PlanetRoot write. Requires FACETED = true AND FP_M1_POOL =
+## true (decision 5; the FP-S1 teardown crossing stays the untouched fallback). Default OFF → byte-identical
+## (the ActiveFrame is never created, FrameAdapter is transparent); FLAT stays 6027/0. Flipped ON at export A/B.
+const FP_FIXED_FRAME := false
+
+## COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1) — the |player render-abs|
+## magnitude (blocks) at which the faceted floating-origin re-anchor fires: an INTEGER world shift of PlanetRoot +
+## every absolute FacetSlot/LOD tile + the far ring + the ActiveFrame (hence player/debris/collider/viewer) toward
+## the origin, bounding f32 precision for LARGE planets (R ≫ 3072). At the shipped R = 3072 the rendered absolute
+## coords are ≤ ~3.3 k (§3), so with this at 8192 the trigger NEVER fires and the committed build is byte-identical;
+## it exists purely as large-planet headroom and is validated by the headless gate (which forces a shift directly).
+const REANCHOR_TRIGGER_BLOCKS := 8192.0
+
+## COSMOS-FP-CROSSING-PREGEN (#114) — kill the post-crossing vox_gen BURST by pre-generating the crossing-target facet
+## to the ACTIVE near-render radius DURING the approach, so redesignate's 96→128 fill (the "SECOND crossing burst",
+## module_world.gd:1661) is ALREADY done at the seam → the crossing frame requests ZERO new generation. Mechanism: the
+## committed imminent slot's view_target is raised from the neighbour radius (96) to POOL_IMMINENT_PREFILL_BLOCKS the
+## moment it becomes the imminent (WorldManager.set_imminent_fid / pool_spawn); the relief-floored imminent leg of
+## _ramp_pool_step (module_world.gd:432) then paces the extra 96→128 annulus across the ~6 s approach — SPREAD, never a
+## seam burst. When a slot STOPS being the imminent (reverse / corner-switch) it drops back to 96 (a shrink → snapped
+## unload) so the enlarged live volume is held only for the facet we are actually crossing to.
+##
+## GATED ON FP_FIXED_FRAME (via _fixed_frame_on()): only cheap under the fixed frame — crossing cost is O(1) in
+## live-terrain count (docs/COSMOS-FIXED-FRAME-DESIGN.md §9), so a fuller imminent adds NO transform-write cost; WITHOUT
+## the fixed frame a 128-view imminent would ENLARGE the redesignate PlanetRoot re-place (the 200–772 ms spike). Off ⇒
+## view_target stays 96, byte-identical to the shipped FP-M2d ramp. NEVER-OOM: only the SINGLE imminent slot is enlarged
+## (Z1-hybrid caps live at 1 active + 1 imminent + 1 corner-second, FP2_LIVE_CAP=2); worst pool bytes = active(40 @128)
+## + imminent(40 @128) + corner-second(20 @96) = 100 MB < POOL_MEM_BUDGET_MB (128). The corner-second stays at 96.
+const POOL_CROSSING_PREGEN := true
+## The view radius (blocks) the committed imminent slot is pre-grown to. Clamped at runtime to near_render_radius() (128
+## faceted). Tunable DOWN to trade the post-crossing spread for lower peak pool memory (e.g. 112 ⇒ imminent ≈ 30 MB); at
+## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
+const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
+
+const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
+const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
+const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]
+const FLIP_HYST_CORNER := 5      # eager flip hysteresis inside the zone               [§4, §7]
+const PILLAR_R_CELLS := 3        # pillar angular radius in cells                      [§2.1]
+const PILLAR_TOP_UP := 6         # pillar top above the max corner-cell base height    [§2.2]
+
 ## 1/sqrt(3): the |z| of every cube corner direction; asin(1/sqrt3) = 35.264 deg is the
 ## latitude the 8 corners are parked at with the poles-on-face-centres orientation (§5.2).
 const INV_SQRT3 := 0.5773502691896258
@@ -111,6 +273,28 @@ const BODY_R := {
 #
 # TO BUILD A CURVED DEMO: change the one line below to `const FLAT_WORLD := false`.
 const FLAT_WORLD := true
+
+## COSMOS M5a (docs/COSMOS-M5-ADR.md §2): the TRUE-POSITION render toggle. DEFAULT false → the shipped
+## camera-centred CosmosBend sagitta is used (byte-identical to M4). Flip to true to place every vertex at
+## its exact sphere position P = (R+y)·d̂ via CosmosTruePlace (kills the §4.6 metric-lie shear everywhere —
+## home + strips + corner, via the corner-closure theorem, from the SAME single near volume). A/B-able
+## live; requires FLAT_WORLD = false (curved). FLAT_WORLD untouched by M5.
+const M5_RENDER := false
+
+## COSMOS R1 (docs/COSMOS-REAL-GEOMETRY-STUDY §8): the REAL-BAKED-GEOMETRY toggle — "the inflated rubber
+## cube". DEFAULT false → the shipped CosmosBend shader path (byte-identical to M4). Flip to true to bake
+## the FAR layer (+ later water/debris) at TRUE sphere positions on the CPU via CosmosTruePlace.place_true
+## (per-tile local origin), cull the far wedge tiles, and level the render with a rigid alignment-root
+## transform — NO custom shader crosses the GPU boundary (the class that broke M5a twice). Supersedes the
+## M5a placement shader (M5_RENDER); the two are mutually exclusive (M5_REAL wins). Requires FLAT_WORLD =
+## false (curved). Bake-parity is a headless gate (baked vertex == place_true == world_point).
+const M5_REAL := false
+
+## COSMOS R1 DEV (task #76 follow-up): hide the NEAR chunk render (module VoxelTerrain / fallback streamer)
+## so the baked FAR layer can be assessed in isolation. RENDER-ONLY (physics — analytic + GroundCollider —
+## is untouched, so you still walk on the invisible near ground). Curved + dev only; default false, no
+## gameplay change. Flip to true with a curved (FLAT_WORLD=false) build to inspect the far layer alone.
+const DEV_HIDE_NEAR := false
 
 ## The cube face the M1 window is homed on (§3.5: "flat world reinterpreted as a face-4 window").
 ## Face 4 is +Z polar (a pole on the face centre, §5.2) so the window is defect-free lattice.

@@ -65,6 +65,7 @@ func _initialize() -> void:
 	_test_sharp_slope()
 	_test_shader_prewarm()
 	_test_lod_far_field()
+	_test_downward_reach_clamp()
 	print("\n==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -982,6 +983,51 @@ func _test_ceiling_scan() -> void:
 	# (b) CLEAR range fully in open air above the surface returns INF (no false positive).
 	var clear := world.ceiling_scan(fx, fz, float(g) + 2.0, float(g) + 4.0)
 	_ok(clear == INF, "ceiling-scan: a clear open-air head range returns INF (got %.2f)" % clear)
+	world.queue_free()
+
+## A2 UNDERGROUND DOWNWARD-REACH CLAMP — the SAFETY invariant. The clamp stops the module VoxelViewer from
+## STREAMING/meshing the deep underground below a surface player. That is only safe because the analytic
+## truth (WorldManager.block_id_at → cell_value_at → TerrainConfig.resolve_cell / generated_cell) is
+## INDEPENDENT of the voxel render buffer: a cell whose render block is never streamed is still solid and
+## breakable. This headless run attaches NO VoxelViewer and streams NO module blocks, so EVERY deep cell
+## here has NO resident render block — exactly the "below the clamped reach" condition — and a solid +
+## breakable deep cell IS the proof. Also checks the clamp geometry keeps the full UPWARD reach.
+func _test_downward_reach_clamp() -> void:
+	print("[A2] underground downward-reach clamp (analytic truth below streamed reach)")
+	var band: int = TerrainConfig.VIEWER_DOWNWARD_REACH_BLOCKS
+	var u := TerrainConfig.viewer_vertical_reach()
+	# (a) the band is the modest design range and genuinely SHORTER than the upward reach (removes work).
+	_ok(band >= 32 and band <= 48, "downward band is the modest design range (32..48): %d" % band)
+	_ok(float(band) < u, "downward band (%d) < upward reach (%.0f) — the clamp REMOVES streaming work" % [band, u])
+	# (b) the offset+ratio geometry: the symmetric ellipsoid still reaches U up but only `band` down.
+	var vd := float(TerrainConfig.near_render_radius())
+	var off := TerrainConfig.clamped_viewer_offset_y()
+	var half := TerrainConfig.clamped_viewer_vertical_ratio() * vd
+	_ok(absf((off + half) - u) < 1e-3, "clamped ellipsoid still reaches the FULL upward reach %.0f (top=%.2f)" % [u, off + half])
+	_ok(absf((off - half) + float(band)) < 1e-3, "clamped ellipsoid reaches only %d down (bottom=%.2f)" % [band, off - half])
+	# (c) analytic SOLID + BREAKABLE below the clamped reach, with NO resident render block (headless).
+	var world: WorldManager = _struct_world("A2Clamp")
+	var spawn := TerrainConfig.find_spawn()
+	var cx := spawn.x
+	var cz := spawn.y
+	var g: int = TerrainConfig.height_at(cx, cz)
+	# A cell 8 blocks BELOW the clamped downward band from the surface player (y≈g), yet ABOVE the bedrock
+	# floor so it is genuinely solid terrain (not void). deep_y = g − band − 8.
+	var deep_y: int = g - band - 8
+	if deep_y <= TerrainConfig.WORLD_BOTTOM_Y:
+		_ok(true, "A2 clamp: spawn column too shallow for a sub-band deep cell (g=%d) — skipped" % g)
+		world.queue_free()
+		return
+	var deep := Vector3i(cx, deep_y, cz)
+	_ok(deep_y < g - band, "deep test cell y=%d sits BELOW the streamed band (player g=%d, band=%d)" % [deep_y, g, band])
+	var below_id := world.block_id_at(deep)
+	_ok(world.cell_solid(deep) and below_id > 0,
+		"deep cell below streamed reach is SOLID via block_id_at (analytic, NO resident render block): id %d" % below_id)
+	# BREAKABLE: the dig resolves through the overlay + analytic path, independent of any streamed mesh.
+	var dug := world.break_terrain(deep, Vector3.INF)
+	_ok(dug > 0, "deep cell below streamed reach is BREAKABLE via break_terrain (dug id %d)" % dug)
+	_ok(not world.cell_solid(deep) and world.block_id_at(deep) == 0,
+		"after break, deep cell reads AIR via block_id_at (overlay-else-analytic, streaming-independent)")
 	world.queue_free()
 
 func _test_smoothing_walkable() -> void:
@@ -5088,8 +5134,8 @@ func _test_sharp_slope() -> void:
 	# uniqueness / idempotence: a kept slope canonicalizes to itself.
 	var pk := CellCodec.pack(STONE, kept)
 	_ok(CellCodec.canonical(pk) == pk, "slope-canon: canonical(pack(stone, slope)) == itself (idempotent)")
-	# junk FAM kind (kind 2) strips to full cube + warns.
-	var junk := FAM | (2 << CellCodec.MOD_FAM_KIND_SHIFT) | 0x1FF
+	# junk FAM kind (kind 3 — still reserved; kind 2 is now FAM_JUNCTION) strips to full cube + warns.
+	var junk := FAM | (3 << CellCodec.MOD_FAM_KIND_SHIFT) | 0x1FF
 	_ok(CellCodec.modifier(CellCodec.canonical(CellCodec.pack(STONE, junk))) == 0,
 		"slope-canon: unknown FAM kind strips to full cube (0)")
 	# non-solid gate: a slope on water strips to full cube (no ramp of water).

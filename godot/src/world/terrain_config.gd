@@ -128,10 +128,17 @@ const RENDER_RADIUS_BLOCKS := 256
 ## the rest seamlessly. FLAT_WORLD is unaffected (near_render_radius() returns the full 256).
 const CURVED_RENDER_RADIUS_BLOCKS := 128
 
-## THE near-field render radius the module viewer/terrain actually use: the full 256 in the flat world,
-## the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet. Flat callers get the byte-identical 256.
+## THE near-field render radius the module viewer/terrain actually use: the full 256 in the FLAT non-faceted
+## world, the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet AND on a facet. Flat callers get the byte-identical 256.
+## FP-S1(a) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 2 / §8): FACETED *requires* FLAT_WORLD=true, so
+## the old `FLAT_WORLD ? 256 : 128` branch wrongly streamed the full flat 256 on a facet — paying the ~8× curved
+## per-column cost across a ~4× larger box, i.e. the single biggest facet-crossing restream cost. A facet's near
+## field only needs the walk-around 128 (the far ring draws the rest), exactly like curved mode. FACETED=false
+## (the shipped default) still takes the 256 branch → byte-identical.
 static func near_render_radius() -> int:
-	return RENDER_RADIUS_BLOCKS if CubeSphere.FLAT_WORLD else CURVED_RENDER_RADIUS_BLOCKS
+	if CubeSphere.FLAT_WORLD and not CubeSphere.FACETED:
+		return RENDER_RADIUS_BLOCKS
+	return CURVED_RENDER_RADIUS_BLOCKS
 
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
 ## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the
@@ -146,6 +153,52 @@ static func near_render_radius() -> int:
 ## whenever it DOES stream (only WHEN changes), so determinism/output are unaffected; analytic physics +
 ## the collider read TerrainConfig directly (not the mesh), so collision is unchanged.
 const VIEWER_VERTICAL_RATIO := 0.5
+
+## A2 UNDERGROUND DOWNWARD-REACH CLAMP (perf: faster initial near-terrain gen for a SURFACE player).
+## A surface player never needs the deep underground STREAMED/meshed: the analytic truth
+## (WorldManager.block_id_at → cell_value_at → TerrainConfig.resolve_cell) reads THIS file DIRECTLY,
+## not the voxel render buffer, so a never-streamed deep cell is still SOLID and BREAKABLE. The world is
+## heightmap-only bedrock→surface (no 3-D caves, §6.8), so nothing structural is lost by not meshing the
+## underground. godot_voxel's VoxelViewer exposes ONLY a symmetric vertical ellipsoid (a single
+## view_distance_vertical_ratio, no separate up/down reach), so the clamp KEEPS the full UPWARD reach
+## (mountains) and trims only the DOWNWARD reach by OFFSETTING the viewer node +radial-up and shrinking
+## the ratio (the geometry lives in the three helpers below; the wiring is module_world.attach_viewer,
+## FACETED-gated). REVERSIBLE + byte-identical when off: flip the toggle false → the viewer reverts to the
+## un-clamped symmetric slab verbatim. Never EXTENDS the reach (a no-op if the band already ≥ the up reach).
+const DOWNWARD_REACH_CLAMP_ENABLED := true
+
+## Blocks kept streamed BELOW the player — the modest underground band (design range ~32-48). 40 leaves a
+## comfortable dig/step-down margin under the analytic ground while dropping the deepest (U−D) blocks of
+## pure interior stone/deepslate a surface player never sees. NEVER-OOM: this REMOVES streaming work; it
+## adds no queue and defers nothing into a growing buffer.
+const VIEWER_DOWNWARD_REACH_BLOCKS := 40
+
+## The symmetric vertical reach in blocks (U): view_distance · VIEWER_VERTICAL_RATIO. Un-clamped this is
+## the reach BOTH up and down; the clamp keeps it UP and trims the down side to VIEWER_DOWNWARD_REACH_BLOCKS.
+static func viewer_vertical_reach() -> float:
+	return float(near_render_radius()) * VIEWER_VERTICAL_RATIO
+
+## The +Y offset applied to the VoxelViewer node (radial-up on the composite-identity active facet, where
+## world +Y = local up) so a SYMMETRIC ellipsoid still reaches U up but only D=VIEWER_DOWNWARD_REACH_BLOCKS
+## down: with half-height H=(U+D)/2 centred at +O, top = O+H = U and bottom = O−H = −D, so O = (U−D)/2.
+## Returns 0 (no-op) when the band already covers U — the clamp never EXTENDS the reach.
+static func clamped_viewer_offset_y() -> float:
+	var u := viewer_vertical_reach()
+	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	if d >= u:
+		return 0.0
+	return (u - d) * 0.5
+
+## The shrunk view_distance_vertical_ratio pairing with clamped_viewer_offset_y(): half-height H=(U+D)/2
+## over the horizontal view_distance. Falls back to the un-clamped VIEWER_VERTICAL_RATIO (no-op) when the
+## band already covers U (or view_distance is degenerate).
+static func clamped_viewer_vertical_ratio() -> float:
+	var vd := float(near_render_radius())
+	var u := viewer_vertical_reach()
+	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	if d >= u or vd <= 0.0:
+		return VIEWER_VERTICAL_RATIO
+	return ((u + d) * 0.5) / vd
 
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
@@ -179,6 +232,8 @@ const B_TAIGA := 6
 const B_FOREST := 7
 const B_PLAINS := 8
 const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
+const B_PILLAR := 10     # COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the unbreakable bedrock corner monument
+                         # — full bedrock cubes floor→flat-top, no strata/ore/tree/snow/slope. M5C_CORNER-gated.
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds), 104
@@ -433,7 +488,9 @@ static func height_at(x: int, z: int) -> int:
 	# COSMOS M1 (§3.5): when the planet is on, (x, z) is the face-4 window column (i, j) and the
 	# surface height is derived from the 3D noise domain along d̂. FLAT_WORLD (default) skips this
 	# branch entirely, so the flat world is byte-identical.
-	if not CubeSphere.FLAT_WORLD:
+	# COSMOS FACETED (§3.3): faceted routes through the same shared analytic memo as curved — the surface
+	# height is the sphere terrain at this facet cell's true direction (facet_profile), NOT the flat 2D noise.
+	if CubeSphere.FACETED or not CubeSphere.FLAT_WORLD:
 		# Route through the shared analytic memo (PERF): far terrain, snowfall, per-voxel-env and the
 		# structural solver all call height_at every frame; without the memo each recomputed the full
 		# _curved_profile. Same value as the direct _curved_profile(_active_face, x, z).x, just cached.
@@ -494,19 +551,29 @@ static func column_profile(x: int, z: int, pcache = null) -> Vector4:
 	# reached only through the Dictionary/null branch and stays byte-identical.
 	var memo: Variant = pcache
 	var face := _active_face
+	var facet := _active_facet
 	var ck: Variant
 	if pcache is GenCtx:
 		memo = pcache.memo
 		face = pcache.face
+		if pcache.facet >= 0:
+			facet = pcache.facet
 		ck = Vector3i(face, x, z)
 	else:
 		ck = Vector2i(x, z)
+	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): key the memo on the facet, not the face — a worker
+	# ctx (or the analytic epoch) is scoped to ONE facet, and the profile is the sphere terrain at this cell's
+	# true direction. FACETED implies FLAT_WORLD=true, so all the col_* flat wrappers stay byte-identical.
+	if CubeSphere.FACETED:
+		ck = Vector3i(facet, x, z)
 	if memo != null:
 		if memo.has(ck):
 			return memo[ck]
 	_ensure_noise()
 	var prof: Vector4
-	if not CubeSphere.FLAT_WORLD:
+	if CubeSphere.FACETED:
+		prof = facet_profile(facet, x, z)
+	elif not CubeSphere.FLAT_WORLD:
 		# COSMOS M1 (§3.5)/M3 (§4.5): the home-face lattice column (i, j) = (x, z), sampled from 3D noise
 		# along d̂. `face` is `ctx.face` on the worker (an immutable snapshot) or `_active_face` on the
 		# main thread — never a mutable global read from a worker. The curved profile threads the SAME
@@ -548,6 +615,26 @@ static var _active_face := CubeSphere.HOME_FACE
 # analytic modifier de-rotation (WM col_* wrappers, generated_cell_global, overlay read/write) reads THIS
 # instead of a mutable matrix. Default 0 (identity) → the flat world + M_win=I curved spawn are unchanged.
 static var _active_mwin_d4 := 0
+# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.3): the ACTIVE facet for the analytic 2-arg (x,z) faceted
+# queries — the facet the player stands on, symmetric with _active_face. WorldManager sets it on facet install
+# (FP1) / crossing (FP3). The worker path threads the facet through GenCtx.facet instead (never reads this
+# mutable global). Default −1 (unset / non-faceted). FACETED implies FLAT_WORLD=true.
+static var _active_facet := -1
+
+## The active facet (read-only accessor).
+static func active_facet() -> int:
+	return _active_facet
+
+## Set the active facet (WorldManager, on facet install / crossing). Clears the shape memo + the analytic
+## column ctx — a facet change re-homes every 2-arg (x,z) query to a different sphere direction, exactly like
+## a home-face flip clears the shape memo in set_active_frame. No-op guard on an unchanged facet.
+static func set_active_facet(fid: int) -> void:
+	if fid == _active_facet:
+		return
+	_active_facet = fid
+	_shape_memo.clear()
+	if _analytic_ctx != null:
+		_analytic_ctx.memo.clear()
 
 ## COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 2, F1): the immutable per-generation
 ## snapshot the curved worldgen reads INSTEAD of the mutable global `_active_face`. It carries the cube
@@ -560,14 +647,16 @@ static var _active_mwin_d4 := 0
 ## being a hidden mutable global on the worker hot path and becomes an immutable parameter.
 class GenCtx extends RefCounted:
 	var face: int = CubeSphere.HOME_FACE
+	var facet: int = -1   # COSMOS FACETED (§3.3): the facet id this query is homed on (−1 = cube-lattice / flat)
 	var memo: Dictionary = {}
 	# COSMOS-FRAME-ORIENTATION §6: the J⁻¹ quarter-turn (0..3) to rotate this column's directional
 	# modifier from its canonical TRUE-face frame into the current WINDOW render frame. J = M_strip·M_win;
 	# jinv_d4 = −d4(J) mod 4. 0 for a native column at M_win=I → byte-identical. Set per-column by
 	# worker_fold_column (worker) / generated_cell_global (analytic).
 	var jinv_d4: int = 0
-	func _init(p_face: int = CubeSphere.HOME_FACE) -> void:
+	func _init(p_face: int = CubeSphere.HOME_FACE, p_facet: int = -1) -> void:
 		face = p_face
+		facet = p_facet
 
 ## The active home face (read-only accessor).
 static func active_face() -> int:
@@ -637,23 +726,81 @@ static func _cached_n() -> int:
 ## steps across an edge reads the real across-seam column and worldgen is seam-continuous (no
 ## cliff/gap at an edge). In-range (i, j) fold to the identity, so this is byte-identical to the
 ## M2 single-face profile there (verify-pinned).
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the curved column profile with the flag-gated PILLAR override.
+## A column whose folded direction d̂ is within THETA_P of a cube vertex becomes an unbreakable bedrock
+## monument — surface = one flat top per vertex (max of the 3 corner-cell BASE heights + 6), biome B_PILLAR
+## (resolve_cell then emits full bedrock cubes floor→top, zero modifiers). The real climate (c, t) is kept so
+## far colour / temperature stay sane. Flag OFF → straight through to _curved_profile_base (byte-identical).
 static func _curved_profile(face: int, i: int, j: int) -> Vector4:
-	_ensure_noise()
+	if CubeSphere.M5C_CORNER:
+		var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+		var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)   # canonically-folded direction (§2.1)
+		var k := _pillar_corner_of(d, n)
+		if k >= 0:
+			var base := _curved_profile_base(face, i, j)
+			return Vector4(float(_pillar_top(k)), float(B_PILLAR), base.z, base.w)
+	return _curved_profile_base(face, i, j)
+
+## Which cube vertex k (0..7 in CORNER_SIGNS order) this folded direction is a PILLAR of, or −1 (§2.1). The
+## 3-compare prefilter rejects ~everything mid-face with no acos; the exact dot test fires only near a corner.
+static func _pillar_corner_of(d: CubeSphere.DVec3, n: int) -> int:
+	var theta_p := float(CubeSphere.PILLAR_R_CELLS) * (2.0 / sqrt(3.0)) * PI / (2.0 * float(n))
+	var t2 := 2.0 * theta_p
+	if absf(absf(d.x) - CubeSphere.INV_SQRT3) > t2: return -1
+	if absf(absf(d.y) - CubeSphere.INV_SQRT3) > t2: return -1
+	if absf(absf(d.z) - CubeSphere.INV_SQRT3) > t2: return -1
+	# every component is bounded away from 0 here → the sign vector (== corner_dir(k)) is well-defined:
+	var cx := (1.0 if d.x >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	var cy := (1.0 if d.y >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	var cz := (1.0 if d.z >= 0.0 else -1.0) * CubeSphere.INV_SQRT3
+	if d.x * cx + d.y * cy + d.z * cz < cos(theta_p):
+		return -1
+	# k index in CORNER_SIGNS: (x<0?4)+(y<0?2)+(z<0?1) — see cube_sphere.gd:656.
+	return (4 if d.x < 0.0 else 0) + (2 if d.y < 0.0 else 0) + (1 if d.z < 0.0 else 0)
+
+## The one flat top per vertex k — pure function of (SEED, k, n): max of the 3 incident face-corner cells'
+## BASE (pre-pillar) surface heights + PILLAR_TOP_UP, floored to poke out of a sea corner, clamped to the
+## generator's proven height bound. Reads BASE so it never recurses through the pillar override (§2.2).
+static func _pillar_top(k: int) -> int:
+	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
+	var hmax := -0x7fffffff
+	for cc in CubeSphere.corner_cells(k, n):
+		hmax = maxi(hmax, int(_curved_profile_base(int(cc["face"]), int(cc["i"]), int(cc["j"])).x))
+	return clampi(hmax + CubeSphere.PILLAR_TOP_UP, SEA_LEVEL + CubeSphere.PILLAR_TOP_UP, MAX_SURFACE_Y)
+
+## The pre-pillar curved column profile (the verbatim COSMOS M1 worldgen). _curved_profile wraps this with
+## the M5c override; every other caller (and the pillar-top read) uses the base directly.
+static func _curved_profile_base(face: int, i: int, j: int) -> Vector4:
 	var n := CubeSphere.n_for(CubeSphere.HOME_BODY)
 	var rr := float(CubeSphere.radius_for(CubeSphere.HOME_BODY))
 	var d: CubeSphere.DVec3 = LatticeNav.dir_of(face, i, j, n)
-	var px := d.x * rr
-	var py := d.y * rr
-	var pz := d.z * rr
+	return profile_at_dir(d.x, d.y, d.z, rr)
+
+## COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §3.1) — THE direction-parameterised sphere-terrain profile.
+## The verbatim curved worldgen body (extracted from _curved_profile_base), sampled at a raw UNIT direction
+## (dx,dy,dz) and radius rr instead of a (face,i,j) cube-lattice column. BOTH render paths sample this ONE
+## function: the cube-lattice curved path (_curved_profile_base, via LatticeNav.dir_of) and the faceted path
+## (facet_profile, via FacetAtlas.cell_dir) — so a facet shows the SAME planet, byte-for-byte, as the curved
+## lattice would at that direction. Feature worldgen on the sphere: the mountain factor feeds BOTH the biome
+## (B_MOUNTAINS) and the uplift baked into _height_c3, so snow + sharp-slope flow through resolve_cell exactly
+## as in the flat world. Caller passes a UNIT d̂. Pure/deterministic: a function of (SEED, dx,dy,dz, rr) only.
+static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector4:
+	_ensure_noise()
+	var px := dx * rr
+	var py := dy * rr
+	var pz := dz * rr
 	var c := _continent.get_noise_3d(px, py, pz)
-	var t := _latitude_temperature(d.z, _temperature.get_noise_3d(px, py, pz))
+	var t := _latitude_temperature(dz, _temperature.get_noise_3d(px, py, pz))
 	var hh := _humidity.get_noise_3d(px, py, pz)
 	var mtn := _mountain_factor3(c, px, py, pz)
 	var g := _height_c3(c, px, py, pz, mtn)
-	# Feature worldgen on the sphere: the mountain factor feeds BOTH the biome (B_MOUNTAINS) and the
-	# uplift baked into _height_c3, so a mountain-latitude column reaches mountain heights and reads as
-	# rock; snow accumulation + sharp-slope then flow through resolve_cell exactly as in the flat world.
 	return Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
+
+## COSMOS FACETED (§3.1): the sphere-terrain profile for a facet's local lattice column (fid, x, z). The facet
+## cell's TRUE direction (FacetAtlas.cell_dir — all f64) sampled at R_BLOCKS. Deterministic: (SEED, fid, x, z).
+static func facet_profile(fid: int, x: int, z: int) -> Vector4:
+	var d := FacetAtlas.cell_dir(fid, x, z)
+	return profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
 
 ## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
 ## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
@@ -744,9 +891,28 @@ static func _acquire_ctx(face: int) -> GenCtx:
 ## column_profile, no shared ctx) so the shipped flat game stays byte-identical in behaviour. Curved
 ## threads the shared _analytic_ctx (memoised, face-scoped key). Output is identical either way.
 static func analytic_column_profile(x: int, z: int) -> Vector4:
+	# COSMOS FACETED (§3.3): thread a facet-carrying ctx sharing the persistent memo (facet-scoped key). The
+	# facet only changes via set_active_facet, which clears the memo — so entries never go stale or collide.
+	if CubeSphere.FACETED:
+		return column_profile(x, z, _acquire_facet_ctx())
 	if CubeSphere.FLAT_WORLD:
 		return column_profile(x, z)
 	return column_profile(x, z, _acquire_ctx(_active_face))
+
+## A facet-homed GenCtx for the main-thread analytic faceted queries — the twin of _acquire_ctx, but it pins
+## the ctx's facet (not face) and shares the SAME persistent _analytic_ctx memo. The memo is cleared on a facet
+## change (set_active_facet) and past the cap, so entries are always fresh and single-facet. Off the main
+## thread it allocates a fresh ctx (never shares scratch across threads).
+static func _acquire_facet_ctx() -> GenCtx:
+	if _on_main_thread():
+		if _analytic_ctx == null:
+			_analytic_ctx = GenCtx.new(0, _active_facet)
+		else:
+			if _analytic_ctx.memo.size() > _ANALYTIC_MEMO_CAP:
+				_analytic_ctx.memo.clear()
+			_analytic_ctx.facet = _active_facet
+		return _analytic_ctx
+	return GenCtx.new(0, _active_facet)
 
 ## THE curved worker generator entry (COSMOS-AUDIT §3.2 items 2–3, F1/F2). The voxel worker calls this
 ## per column with its FROZEN home face `gen_face` (an immutable per-generator snapshot — NEVER the
@@ -798,6 +964,13 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		return BlockCatalog.AIR
 	if _bedrock_at(x, y, z):
 		return _ID_BEDROCK
+	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): the bedrock PILLAR column — full bedrock cubes from the
+	# world floor to the one flat top `g`, air above. Bypasses strata, ore, trees, snow, sea fill, and all
+	# smoothing/slope shaping BEFORE any of it runs, so the monument is sheer full cubes and render==collision
+	# is automatic. B_PILLAR is set only under M5C_CORNER (_curved_profile), so this branch is never taken
+	# in FLAT / flag-off builds → byte-identical.
+	if biome == B_PILLAR:
+		return _ID_BEDROCK if y <= g else BlockCatalog.AIR
 	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
 	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
 	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
@@ -1158,9 +1331,18 @@ static func _modifier_from_targets(targets: Vector4, base_y: int) -> int:
 ## NON-ALLOCATING (bool, so the neighbour-fires stencil in _quantized_targets stays cheap on the hot
 ## worker/collider path). fires ⇒ the plane ESCAPES the legacy [g,g+2] window AND is encodable
 ## (spread ≤ SLOPE_MAX_SPREAD); below that the world stays byte-identical on today's smoothing path.
+## COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): true iff this window column folds to a bedrock PILLAR column.
+## Flag-gated so the shipped default-off build short-circuits at zero cost (no column_profile call); when on,
+## column_profile is pcache-memoised. Worker-safe (reads ctx.face via pcache). Used to suppress every
+## directional modifier on the monument so it renders/collides as sheer full cubes.
+static func _is_pillar_column(x: int, z: int, pcache) -> bool:
+	return CubeSphere.M5C_CORNER and int(column_profile(x, z, pcache).y) == B_PILLAR
+
 static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 	if not SMOOTHING_ENABLED or g < SEA_LEVEL:
 		return false                                  # v1: land only; rides the smoothing path
+	if _is_pillar_column(x, z, pcache):
+		return false                                  # M5c pillar: no slopes on the bedrock monument
 	if TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
 		return false                                  # a tree rests here → keep the top FULL
 	var raw := _corner_targets(x, z, pcache)
@@ -1297,6 +1479,8 @@ static func slope_run_of(x: int, z: int, pcache = null) -> int:
 static func generated_modifier_at(x: int, y: int, z: int, pcache = null) -> int:
 	if not SMOOTHING_ENABLED:
 		return 0
+	if _is_pillar_column(x, z, pcache):
+		return 0                                       # M5c pillar: zero modifier → render==collision full cubes
 	if pcache == null and _on_main_thread():
 		var e := _shape_entry(x, z)
 		var g := (e & 0xFFFF) - _MEMO_G_BIAS
@@ -1904,6 +2088,23 @@ static func is_solid_pos(p: Vector3) -> bool:
 # Spawn selection (WGC §8): origin is seed-dependent and may be ocean, so scan
 # outward from (0,0) for the first temperate land column above the sea.
 static func find_spawn() -> Vector2i:
+	# COSMOS FACETED (§3.3): scan around the facet CENTRE (the facet's lattice window is offset by O, so
+	# origin (0,0) is nowhere near it), staying ≥ SPAWN_EDGE_MIN cells inside the polygon so the player and
+	# the camera never start on the seam strip. The spawn facet was picked to have temperate land at centre.
+	if CubeSphere.FACETED:
+		var fid := _active_facet
+		var c := FacetAtlas.spawn_column()
+		for radius in range(0, 256, 2):
+			for a in range(0, 360, 15):
+				var rad := deg_to_rad(float(a))
+				var x := c.x + int(round(cos(rad) * float(radius)))
+				var z := c.y + int(round(sin(rad) * float(radius)))
+				if not FacetAtlas.in_polygon(fid, x, z, -float(FacetAtlas.SPAWN_EDGE_MIN)):
+					continue
+				var pf := column_profile(x, z)
+				if int(pf.x) > SEA_LEVEL + 1 and (int(pf.y) == B_PLAINS or int(pf.y) == B_FOREST):
+					return Vector2i(x, z)
+		return c
 	for radius in range(0, 512, 4):
 		for a in range(0, 360, 15):
 			var rad := deg_to_rad(float(a))

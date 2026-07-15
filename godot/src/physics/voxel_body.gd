@@ -119,7 +119,14 @@ static func spawn_loose(parent: Node, cell_ids: Dictionary,
 	b.cells = cell_ids.duplicate()    # take our own copy; caller keeps its dict
 	b.activated = true                # born dynamic: _rebuild() unfreezes + applies props
 	parent.add_child(b)
-	b.global_transform = Transform3D.IDENTITY   # local cells == world cells
+	# The caller passes WORLD == active-facet-LATTICE cells. FP-FIXED-FRAME (§5): under the fixed frame the parent is
+	# the ActiveFrame (@ T_active), so the body's LOCAL transform must be identity (cells stay lattice) and its GLOBAL
+	# comes out planet-absolute (T_active·cell). Assigning global_transform=IDENTITY instead would strip T_active and
+	# misplace it. Off ⇒ the parent is @ identity, so local identity == the old global identity → byte-identical.
+	if world_ref != null and world_ref.frame_adapter() != null and world_ref.frame_adapter().enabled():
+		b.transform = Transform3D.IDENTITY
+	else:
+		b.global_transform = Transform3D.IDENTITY   # local cells == world cells
 	b._rebuild()                      # sets freeze = false (activated) + dynamic props
 	b.sleeping = false                # wake so it falls immediately
 	_apply_kick(b, kick_from)         # slight away-from-breaker momentum (no-op if infinite)

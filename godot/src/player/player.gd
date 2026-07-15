@@ -150,7 +150,15 @@ func set_initial_look(yaw: float, pitch: float) -> void:
 ## the dihedral. The player stays UPRIGHT (+Y up in both flat facet frames) — physics snaps the yaw; the visual
 ## dihedral crest is eased by the camera (FP3b). Velocity + heading rotate about UP only, so gravity stays −Y.
 func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
-	global_position = new_pos
+	# FP-FIXED-FRAME §2.2 step 7 (Phase 2): with the fixed frame ON the player rides the ActiveFrame (@ T_to after
+	# the crossing flipped it), so `new_pos` — B's lattice from reframe_position64 — is its LOCAL pose. Assigning
+	# `position` makes its GLOBAL = T_to·new_pos, which equals the pre-crossing T_from·old_pos to f64 (continuous,
+	# no teleport). Frame OFF ⇒ `global_position` exactly as before (byte-identical). The yaw twist + velocity
+	# rotate stay in the LOCAL (lattice) frame about UP — unchanged; the dihedral tilt is carried by ActiveFrame.
+	if _frame.enabled():
+		position = new_pos
+	else:
+		global_position = new_pos
 	rotation.y = wrapf(rotation.y + yaw_delta, -PI, PI)
 	velocity = velocity.rotated(Vector3.UP, yaw_delta)
 

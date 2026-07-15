@@ -53,8 +53,17 @@ func setup(active_fid: int) -> void:
 ## thin terminator band are transiently stale for the ≤1-2 frames until the deferred re-emit lands.
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
-	transform = FacetAtlas.facet_transform(_active_fid).affine_inverse()   # rigid re-place (cheap)
+	transform = _placement_xform()   # rigid re-place (cheap); identity under FP-FIXED-FRAME (no re-place)
 	_pending = true
+
+## FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §1.4/§2.2 step 8): the ring mesh is built in ABSOLUTE planet
+## coords. When the fixed frame pins the scene @ the absolute frame (PlanetRoot @ identity) this node stays @
+## identity — a crossing does NO transform write here (only the deferred exclusion/terminator re-emit remains). Off
+## ⇒ T_active⁻¹, re-placing the absolute mesh into the active facet's render frame exactly as today (byte-identical).
+func _placement_xform() -> Transform3D:
+	if CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
+		return Transform3D.IDENTITY
+	return FacetAtlas.facet_transform(_active_fid).affine_inverse()
 
 ## COSMOS FP-R0 SPIKE: hide these facets' flat quads (they are drawn as real rotated voxel terrains instead).
 ## Called only behind CubeSphere.FP_R0; on the shipped build nothing calls this so `_excluded` stays empty and the
@@ -117,7 +126,7 @@ func _front_visible(fid: int, nrm: Array) -> bool:
 ## The full scan + re-emit + commit (the OLD _rebuild). Runs at setup, from _process once warming completes, and
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
 func _rebuild_full() -> void:
-	transform = FacetAtlas.facet_transform(_active_fid).affine_inverse()   # absolute → active-lattice render frame
+	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var k := FacetAtlas.K

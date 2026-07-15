@@ -1543,11 +1543,23 @@ func set_imminent_fid(fid: int) -> void:
 ## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
 ## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view
 ## (near_render_radius = 128) + already-pushed carve; it just moves under PlanetRoot. Called once from setup().
+## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §10 decision 5) — the fixed frame is active only with
+## its flag AND both prerequisites on. When on, PlanetRoot is PINNED @ identity (the scene frame IS the planet-
+## absolute frame) so each FacetSlot's global == its own T_fid (its true place) and a crossing NEVER re-writes
+## PlanetRoot (no NOTIFICATION_TRANSFORM_CHANGED). Off ⇒ PlanetRoot @ T_active⁻¹ exactly as today (byte-identical).
+func _fixed_frame_on() -> bool:
+	return CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL
+
+## The PlanetRoot transform for `active_fid`: identity under the fixed frame (absolute scene frame), else the
+## shipped T_active⁻¹ that re-centres the active facet at the lattice origin.
+func _planet_root_placement(active_fid: int) -> Transform3D:
+	return Transform3D.IDENTITY if _fixed_frame_on() else FacetAtlas.facet_transform(active_fid).affine_inverse()
+
 func _pool_init_active() -> void:
 	_pool_active = TerrainConfig.active_facet()
 	_planet_root = Node3D.new()
 	_planet_root.name = "PlanetRoot"
-	_planet_root.transform = FacetAtlas.facet_transform(_pool_active).affine_inverse()
+	_planet_root.transform = _planet_root_placement(_pool_active)
 	add_child(_planet_root)
 	_apply_bounds(_terrain, _pool_active)
 	var slot := Node3D.new()
@@ -1624,7 +1636,11 @@ func redesignate(to: int) -> bool:
 	# sub-frame, no meshing. `to`'s composite becomes T_to⁻¹·T_to = identity (axis-aligned, editable); `from`'s
 	# becomes T_to⁻¹·T_from (the dihedral turn — the rotated neighbour, same weld as the far ring).
 	var _xform_t0 := Time.get_ticks_usec()
-	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	# FP-FIXED-FRAME (§2.2 step 3, THE keystone): under the fixed frame PlanetRoot is pinned @ identity forever, so we
+	# SKIP this write entirely — no NOTIFICATION_TRANSFORM_CHANGED, no per-mesh-block instance_set_transform re-place,
+	# no 200–772 ms deferred spike. The crossing instead re-frames only the ~10 ActiveFrame children (WorldManager).
+	if not _fixed_frame_on():
+		_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
 	var _transform_us := Time.get_ticks_usec() - _xform_t0
 	# View-distance rebalance (§5). `to` RAMPS up 96 → near radius: jamming that 96→128 delta annulus in ONE pass is
 	# the SECOND crossing burst — spread it over RAMP_SECONDS like every other grow (the ramp step drives it from the
@@ -1718,7 +1734,7 @@ func pool_reset(to: int) -> bool:
 	_pool.clear()
 	_planet_root = Node3D.new()
 	_planet_root.name = "PlanetRoot"
-	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	_planet_root.transform = _planet_root_placement(to)   # FP-FIXED-FRAME: identity under the flag (absolute frame)
 	add_child(_planet_root)
 	var s := _pool_build_slot(to, TerrainConfig.near_render_radius(), true)
 	if s.is_empty():
@@ -2279,7 +2295,13 @@ func _new_field_meshed() -> bool:
 	var v := _viewer as Node3D
 	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
 		return false
-	var center: Vector3 = v.global_position - global_position
+	# FP-FIXED-FRAME (§4/§1.6 audit): the `viewer.global − node.global` translation-only shortcut assumes the active
+	# terrain sits composite-identity (no rotation) under module_world. Under the fixed frame the active slot sits at
+	# its true rotated T_active, so map the viewer world point through the terrain's real frame with to_local(). Off ⇒
+	# the shortcut is exact (module_world @ 0, composite identity) → byte-identical. (Pool-path only reaches here in the
+	# never-taken FP-S1 fallback, but the audit keeps it frame-correct regardless.)
+	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
+		else v.global_position - global_position
 	var half := NEAR_COVER_MESHED_HALF
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
 

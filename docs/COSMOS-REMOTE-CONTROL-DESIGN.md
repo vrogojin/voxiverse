@@ -108,12 +108,20 @@ host (§5), forwarded verbatim by the relay to the consented game socket as a si
 | `jump` | — | One grounded jump: latch a jump request consumed the first tick the floor check allows it (`player.gd:357-361`); completes on lift-off. No-op + `ok` with note `"flying"` while in fly mode. |
 | `screenshot` | `label` (≤ 40 chars, `[a-z0-9-]`) | On-demand full-quality canvas capture, uplinked as a **tagged, correlated** binary frame (§3.3) distinct from the ambient ~2/s stream. |
 | `set_fly` | `on` (bool) | Enter/leave fly mode — exactly the KEY_F path (`player.gd:197-204`), including capsule disable. |
+| `break` | `target` ∈ `aim\|{dx,dy,dz}` | Break/mine the aimed (or player-relative offset) block via the SAME `WorldManager` break + `_collapse_unsupported` pipeline a human uses (reach + gameplay rules enforced). **Added per resolved D5 (full agency).** |
+| `place` | `block` (id/name), `target` ∈ `aim\|{dx,dy,dz}` | Place the selected block via the human place pipeline (reach + rules enforced). **Added per D5.** |
+| `select_slot` | `n` (hotbar index) | Select the active hotbar slot (the human `1`–`9` path). **Added per D5.** |
+| `reload` | — | Reload the browser tab via `JavaScriptBridge.eval("location.reload()")` → re-fetch the freshly deployed build (deploy sends `cache-control: no-cache`, so the reload gets the new `wasm`/`pck`). The `?remote=<token>` URL param re-arms the observe bridge automatically; CONTROL re-arms **without** a human click ONLY when persistent unattended mode is active (§6.5). **Added 2026-07-15 for unattended deploy→reload→re-test loops.** |
 | `stop` | — | Explicit sequence end / no-op step (useful as a labelled fence). |
 
-**Deliberately NOT in v1:** break/place blocks, inventory ops, any world mutation, any raw
-key/mouse synthesis, anything that can reach outside game actions. The executor dispatches through
-a **closed op table** — an unknown `op` fails the step (and, with `on_fail:"abort"`, the sequence)
-with status `bad_op`; it is never interpreted loosely.
+**Scope (resolved D5 — FULL AGENCY):** v1 includes world mutation — `break`, `place`,
+`select_slot` — in addition to locomotion + observation. Every mutation routes through the SAME
+`WorldManager` break/place/collapse pipeline a human uses (reach, gameplay rules, edit-overlay,
+NEVER-OOM all enforced) — no new mutation path, no call-by-name. Still EXCLUDED: raw key/mouse
+synthesis and anything reaching outside game actions. The executor dispatches through a **closed op
+table** — an unknown `op` fails the step (with `on_fail:"abort"`, the sequence) with status
+`bad_op`; it is never interpreted loosely. The consent modal MUST enumerate this full power set in
+plain language (§6).
 
 ### 1.2 Units and frame (normative)
 
@@ -486,6 +494,41 @@ Sequence/step caps (§1.3); one sequence in flight; consent TTL (§6.1); grant b
 + `grant_id`; staleness cap on outbox files; relay `audit.log` of every forward/nack/grant/
 override; all Phase-1 anti-DoS unchanged. Nothing in this design increases per-frame cost or
 memory when off (NEVER-OOM: the executor's queue is ≤ 64 tiny dictionaries, freed with the node).
+
+### 6.6 Persistent UNATTENDED mode (resolved 2026-07-15 — enables the `reload` op + walk-away loops)
+
+To leave dev/test running headless, control must survive a `reload` (§1.1) — but a reload drops the
+socket, which per D2 ends the grant, so normal per-session consent would demand a fresh human click
+each cycle. Unattended mode resolves this with an EXPLICIT, LOUDER, one-time opt-in — never a silent
+weakening of the human-second-factor model:
+
+- **Distinct, louder consent.** A second modal beyond the per-session control grant: "Allow MISSION
+  CONTROL to DRIVE **and RELOAD** this game **UNATTENDED**, persisting across reloads, until you
+  revoke — it can move, build, MINE/BREAK, PLACE, and manage INVENTORY with no further prompts."
+  Red-bordered, capability-enumerating (matches the resolved D5 full-agency scope), requires a
+  deliberate click (not the default button).
+- **Persistence.** On opt-in the game stores an unattended token in `localStorage` keyed to the
+  observe token (NOT the secret itself — an opaque per-grant `unattended_id` the relay also holds).
+  After a `reload`, boot reads it and re-arms CONTROL automatically (no human click) IFF: the
+  `?remote=<token>` matches, the stored `unattended_id` validates against the relay, and the mode
+  has not been revoked. Otherwise it falls back to normal per-session consent.
+- **Override semantics preserved, escalated.** Any local key/mouse still aborts the running queue in
+  the same frame (§6.4). In unattended mode a plain override SUSPENDS (auto-resumes after idle, so a
+  curious human glance doesn't tear down an overnight run) — but **Esc / the revoke chord CLEARS the
+  `localStorage` grant entirely** (hard, permanent until re-opted-in). The persistent indicator
+  reads "● UNATTENDED REMOTE CONTROL — press Esc to revoke".
+- **Fail-safe + bounds.** Link loss still stops the rover (§3); on reconnect it re-arms only via the
+  stored grant. The relay still enforces token-auth + `unattended_id` match before forwarding; an
+  optional wall-clock lifetime cap on the unattended grant (default none = until-revoked per D1) is
+  available. This is an explicit trust escalation the human performs ONCE and can kill instantly.
+- **Deploy→reload loop (agent side).** Orchestrator: build+export+deploy (host-side, unchanged) →
+  uplink a `reload` step → the browser re-fetches the new build + re-arms via the stored grant →
+  orchestrator reads the new build's telemetry and resumes driving. `reload` is only honoured while
+  a grant (session or unattended) is active.
+
+Ships in P2 (consent modal + `localStorage` + `reload` receiver) hardened in P4; the relay's op
+whitelist (P1) simply includes `reload`. Goes live only at P4 with the same security review + your
+explicit sign-off.
 
 ---
 

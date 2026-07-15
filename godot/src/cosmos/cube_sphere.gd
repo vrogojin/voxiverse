@@ -164,6 +164,27 @@ const FP_FIXED_FRAME := false
 ## it exists purely as large-planet headroom and is validated by the headless gate (which forces a shift directly).
 const REANCHOR_TRIGGER_BLOCKS := 8192.0
 
+## COSMOS-FP-CROSSING-PREGEN (#114) — kill the post-crossing vox_gen BURST by pre-generating the crossing-target facet
+## to the ACTIVE near-render radius DURING the approach, so redesignate's 96→128 fill (the "SECOND crossing burst",
+## module_world.gd:1661) is ALREADY done at the seam → the crossing frame requests ZERO new generation. Mechanism: the
+## committed imminent slot's view_target is raised from the neighbour radius (96) to POOL_IMMINENT_PREFILL_BLOCKS the
+## moment it becomes the imminent (WorldManager.set_imminent_fid / pool_spawn); the relief-floored imminent leg of
+## _ramp_pool_step (module_world.gd:432) then paces the extra 96→128 annulus across the ~6 s approach — SPREAD, never a
+## seam burst. When a slot STOPS being the imminent (reverse / corner-switch) it drops back to 96 (a shrink → snapped
+## unload) so the enlarged live volume is held only for the facet we are actually crossing to.
+##
+## GATED ON FP_FIXED_FRAME (via _fixed_frame_on()): only cheap under the fixed frame — crossing cost is O(1) in
+## live-terrain count (docs/COSMOS-FIXED-FRAME-DESIGN.md §9), so a fuller imminent adds NO transform-write cost; WITHOUT
+## the fixed frame a 128-view imminent would ENLARGE the redesignate PlanetRoot re-place (the 200–772 ms spike). Off ⇒
+## view_target stays 96, byte-identical to the shipped FP-M2d ramp. NEVER-OOM: only the SINGLE imminent slot is enlarged
+## (Z1-hybrid caps live at 1 active + 1 imminent + 1 corner-second, FP2_LIVE_CAP=2); worst pool bytes = active(40 @128)
+## + imminent(40 @128) + corner-second(20 @96) = 100 MB < POOL_MEM_BUDGET_MB (128). The corner-second stays at 96.
+const POOL_CROSSING_PREGEN := true
+## The view radius (blocks) the committed imminent slot is pre-grown to. Clamped at runtime to near_render_radius() (128
+## faceted). Tunable DOWN to trade the post-crossing spread for lower peak pool memory (e.g. 112 ⇒ imminent ≈ 30 MB); at
+## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
+const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

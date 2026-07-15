@@ -1540,9 +1540,36 @@ func set_load_controller(c) -> void:
 ## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
 ## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).
 func set_imminent_fid(fid: int) -> void:
+	var prev := _imminent_fid
 	_imminent_fid = fid
 	if _lod_mesher != null:
 		_lod_mesher.call("set_imminent_fid", fid)
+	# COSMOS-FP-CROSSING-PREGEN (#114): pre-grow the COMMITTED imminent slot to the ACTIVE near radius during the approach
+	# so redesignate's 96→128 fill is already done at the seam (zero new generation on the crossing frame). The relief-
+	# floored imminent leg of _ramp_pool_step paces the extra annulus across the ~6 s approach. A slot that STOPS being the
+	# imminent (reverse / corner-switch) and is not the active drops back to 96 (a shrink → snapped unload) so the enlarged
+	# live volume is held ONLY for the facet we are crossing to (NEVER-OOM: at most one 128-view neighbour). Gated on the
+	# fixed frame — a fuller imminent is free there (O(1) crossing, §9) but would enlarge the redesignate transform write
+	# otherwise. Off ⇒ this whole block is skipped and view_target stays 96 (byte-identical to the shipped FP-M2d ramp).
+	if not (CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on()):
+		return
+	if prev == fid:
+		return
+	var target := minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	# Demote the OUTGOING imminent (if it is a live non-active neighbour) back to the neighbour radius.
+	if prev >= 0 and prev != _pool_active and _pool.has(prev):
+		var ps: Dictionary = _pool[prev]
+		if float(ps["view_target"]) > 96.0:
+			ps["view_target"] = 96.0
+			ps["ramp_from"] = float(ps["view_f"])       # shrink leg → snapped by the next _ramp_pool_step (cheap unload)
+			_pool_ramp_kick()
+	# Promote the INCOMING imminent (if already spawned; a fresh spawn is handled in pool_spawn) to the active radius.
+	if fid >= 0 and fid != _pool_active and _pool.has(fid):
+		var s: Dictionary = _pool[fid]
+		if float(s["view_target"]) < target:
+			s["view_target"] = target
+			s["ramp_from"] = float(s["view_f"])          # grow leg from wherever it sits now; paced (relief-floored) grow
+			_pool_ramp_kick()
 
 ## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
 ## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view
@@ -1610,7 +1637,14 @@ func pool_spawn(fid: int) -> bool:
 	var s := _pool_build_slot(fid, start, false)
 	if s.is_empty():
 		return false
-	s["view_target"] = 96.0
+	# COSMOS-FP-CROSSING-PREGEN (#114): if THIS spawn is the committed imminent (set by WorldManager just before this
+	# call, same pool pass), ramp straight to the ACTIVE near radius instead of 96 — the crossing-target facet fully
+	# streams during the approach, so redesignate adds no generation at the seam. Relief-floored in _ramp_pool_step, so
+	# the wider 48→128 fill still SPREADS across the approach (never a burst). Gated on the fixed frame; off ⇒ 96 (shipped).
+	var nb_target := 96.0
+	if CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on() and fid == _imminent_fid:
+		nb_target = minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	s["view_target"] = nb_target
 	s["ramp_from"] = float(start)
 	_pool[fid] = s
 	_pool_ramp_kick()

@@ -67,6 +67,20 @@ var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
 
+# ── REMOTE-DRIVE INTENT SEAM (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4.2) ─────────────────────────
+# The ONLY hook the RemoteControl executor drives the rover through: it injects INTENT at the exact
+# level a human does (the WASD/Shift/Space polls in _move), so commanded motion flows through the
+# IDENTICAL analytic wall/floor/ceiling/collision pipeline — real locomotion, never a teleport. All
+# fields are zero/false in normal play and the executor never exists while RemoteBridge.CONTROL_ENABLED
+# is false, so this is a byte-identical no-op today.
+var remote_drive := false                 # true only while a move step runs → _move uses remote_input/run
+var remote_input := Vector3.ZERO          # body-local wish, SAME shape as the WASD `input` vector
+var remote_run := false                   # substitutes the KEY_SHIFT poll
+var remote_jump := false                  # one-shot latch, consumed by the grounded/fly jump branch (§4.6)
+var remote_yaw_rate := 0.0                # rad/s the executor is applying this tick (seam indicator; the
+                                          # executor owns the exact rotate_y for seam-immune remaining-degrees)
+var remote_exec: Node = null              # the RemoteControl executor; ticked from _physics_process (§4.3)
+
 func _ready() -> void:
 	# COSMOS FP-FIXED-FRAME: fetch the coordinate-frame adapter from the world (a transparent identity adapter when
 	# the fixed frame is off, so all conversions below are numeric no-ops). Fall back to a fresh identity adapter
@@ -230,7 +244,13 @@ func _unhandled_input(event: InputEvent) -> void:
 func _physics_process(delta: float) -> void:
 	if frozen or world == null:
 		return
+	# REMOTE-DRIVE (§4.3): snapshot the pre-locomotion LATTICE position so the executor measures pure
+	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
+	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
+	var _pre_move_pos := position
 	_move(delta)
+	var _tick_move_delta := position - _pre_move_pos
+	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
 	# when the frame is off / at identity). update_streaming feeds the collider/pool/streamer, all lattice consumers.
 	world.update_streaming(position)
@@ -251,11 +271,15 @@ func _physics_process(delta: float) -> void:
 	# COSMOS FACETED §6.1: walking past an active-facet ridge re-frames the player onto the neighbour facet.
 	# Dormant until FP3b removes the FP2 ridge wall (which stops the player before the crossing threshold); the
 	# reframe is position-exact + upright (physics snaps yaw, camera eases the dihedral). FLAT/non-faceted: skip.
+	var _reframe_yaw := 0.0
 	if CubeSphere.FACETED:
 		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
 		var cross := world.maybe_cross_facet(position)
 		if not cross.is_empty():
 			apply_reframe(cross["new_pos"], cross["yaw_delta"])
+			# REMOTE-DRIVE (§4.4): forward the seam's yaw twist so the executor rotates its along-heading
+			# accumulator vector identically — distance walked stays continuous across the crossing.
+			_reframe_yaw = float(cross["yaw_delta"])
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
 	# cylinder about a cube vertex (or, defensively, a double-out column), relocate/eject them via the bisector
 	# teleport / seam glue — position, velocity and heading-relative yaw. Flag- and chart-gated no-op otherwise;
@@ -268,25 +292,38 @@ func _physics_process(delta: float) -> void:
 			rotation.y += float(reloc["yaw_delta"])
 	_push_bodies(delta)
 	_update_aim()
+	# REMOTE-DRIVE (§4.3): tick the executor AFTER the origin/frame corrections (so the crossing yaw_delta
+	# is known) but with the PRE-correction locomotion delta captured at the top. No-op in normal play
+	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
+	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
+		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.
+	# REMOTE-DRIVE SEAM (§4.2): while a move step runs the executor's commanded body-local wish
+	# REPLACES the WASD polls for this tick — the SAME `input` vector, so everything below is identical.
 	var input := Vector3.ZERO
-	if Input.is_key_pressed(KEY_W): input.z -= 1.0
-	if Input.is_key_pressed(KEY_S): input.z += 1.0
-	if Input.is_key_pressed(KEY_A): input.x -= 1.0
-	if Input.is_key_pressed(KEY_D): input.x += 1.0
+	if remote_drive:
+		input = remote_input
+	else:
+		if Input.is_key_pressed(KEY_W): input.z -= 1.0
+		if Input.is_key_pressed(KEY_S): input.z += 1.0
+		if Input.is_key_pressed(KEY_A): input.x -= 1.0
+		if Input.is_key_pressed(KEY_D): input.x += 1.0
 	var wish := (transform.basis * Vector3(input.x, 0, input.z))
 	wish.y = 0.0
 	if wish.length() > 0.0:
 		wish = wish.normalized()
 
-	var running := Input.is_key_pressed(KEY_SHIFT)
+	var running := remote_run if remote_drive else Input.is_key_pressed(KEY_SHIFT)
 	if flying:
 		var speed := fly_speed * (2.0 if running else 1.0)
 		var vy := 0.0
-		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
-		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+		if remote_drive:
+			vy = input.y                        # a remote `move` in fly mode is horizontal (input.y == 0)
+		else:
+			if Input.is_key_pressed(KEY_SPACE): vy += 1.0
+			if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
 		# FP-FIXED-FRAME: `wish` is a LATTICE direction (local basis · input), so fly in the LATTICE (local) frame.
 		position += (wish + Vector3(0, vy, 0)) * speed * delta
 		_horiz_vel = wish * speed
@@ -394,8 +431,11 @@ func _move(delta: float) -> void:
 	if position.y <= floor_y:
 		position.y = floor_y
 		velocity.y = 0.0
-		if Input.is_key_pressed(KEY_SPACE):
+		# REMOTE-DRIVE SEAM (§4.6): the one-shot remote_jump latch is consumed exactly as KEY_SPACE the
+		# first grounded tick — real lift-off through the same jump_velocity, cleared so it fires once.
+		if Input.is_key_pressed(KEY_SPACE) or remote_jump:
 			velocity.y = jump_velocity
+			remote_jump = false
 
 	# While actually resting on the piece (not jumping off it), press the player's
 	# weight DOWN into the body at the CONTACT OFFSET (not its centre): a light piece
@@ -669,3 +709,122 @@ func head_position() -> Vector3:
 ## LATTICE position just below the feet — the grass voxel the player stands on (per-voxel-environment query).
 func ground_probe_position() -> Vector3:
 	return position - Vector3(0, 0.5, 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# REMOTE-DRIVE ACTUATORS (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4.6 + resolved D5). The executor calls
+# these; each ROUTES THROUGH THE SAME WorldManager/inventory pipeline a human uses (reach + gameplay
+# rules enforced) — NO new mutation path, NO call-by-name. Dead code unless a live control grant exists.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## set_fly (§4.6): replicate the KEY_F branch exactly — toggle fly, zero velocity, disable/enable the
+## capsule so no loose body can wedge the player while airborne.
+func remote_set_fly(on: bool) -> void:
+	flying = on
+	velocity = Vector3.ZERO
+	if _body_shape != null:
+		_body_shape.disabled = flying
+
+## look.pitch_deg (§4.5): absolute camera pitch in radians (horizon = 0, up = +), clamped to the same
+## ±1.5 rad the mouse-look path uses.
+func remote_set_pitch(rad: float) -> void:
+	_pitch = clampf(rad, -1.5, 1.5)
+	if _camera != null:
+		_camera.rotation.x = _pitch
+
+## Current camera pitch (radians) — the executor eases toward the look target from here.
+func remote_pitch() -> float:
+	return _pitch
+
+## select_slot{n}: the human 1–9 hotbar path. Returns false if there is no inventory.
+func remote_select_slot(n: int) -> bool:
+	if inventory == null:
+		return false
+	inventory.select_slot(n)
+	return true
+
+## The LATTICE cell at a player-relative integer offset (feet cell + offset) — the `{dx,dy,dz}` target mode.
+func _remote_offset_cell(o: Vector3i) -> Vector3i:
+	return Vector3i(floori(position.x), floori(position.y), floori(position.z)) + o
+
+func _remote_in_break_reach(cell: Vector3i) -> bool:
+	return head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5)) <= break_reach
+
+func _remote_in_reach(cell: Vector3i) -> bool:
+	return head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5)) <= reach
+
+## break{target}: `target` is Vector3i (player-relative offset cell) or "aim". Routes through the SAME
+## break pipeline `_try_break` uses (WorldManager.break_terrain / VoxelBody.break_cell + collapse +
+## inventory). Returns the broken block id (>0) on success, 0 if nothing broke (air / out of reach / rules).
+func remote_break(target) -> int:
+	if target is Vector3i:
+		var cell: Vector3i = _remote_offset_cell(target)
+		if not _remote_in_break_reach(cell):
+			return 0
+		var oid := world.break_terrain(cell, global_position)
+		if oid > 0 and inventory != null:
+			inventory.add(oid, 1)
+		return oid
+	# "aim": the SAME nearest-of(wood,terrain) contest + break path as _try_break, returning the id.
+	var tgt := _current_target()
+	match String(tgt["kind"]):
+		"wood":
+			var body := tgt["body"] as VoxelBody
+			var cell: Vector3i = tgt["cell"]
+			var bid := body.cell_block_id(cell)
+			body.break_cell(cell, global_position)
+			if bid > 0 and inventory != null:
+				inventory.add(bid, 1)
+			return bid
+		"terrain":
+			var cell: Vector3i = tgt["cell"]
+			var tid := world.break_terrain(cell, global_position)
+			if tid > 0 and inventory != null:
+				inventory.add(tid, 1)
+			return tid
+	return 0
+
+## place{block,target}: `block` is a resolved block id (0 → use the selected hotbar slot); `target` is a
+## Vector3i offset cell or "aim". Routes through the SAME place pipeline `_try_place` uses
+## (player-overlap guard + WorldManager.place_block / VoxelBody.add_cell). Consumes the selected slot when
+## the placed id matches it (inventory bookkeeping). Returns true on a successful placement.
+func remote_place(block_id: int, target) -> bool:
+	if inventory == null:
+		return false
+	var id := block_id if block_id > 0 else inventory.selected_block_id()
+	if id <= 0:
+		return false
+	if target is Vector3i:
+		var cell: Vector3i = _remote_offset_cell(target)
+		if not _remote_in_reach(cell):
+			return false
+		if _cell_intersects_player(cell):
+			return false
+		if world.place_block(cell, id):
+			if inventory.selected_block_id() == id:
+				inventory.consume_selected(1)
+			return true
+		return false
+	# "aim": place against the aimed face, exactly as _try_place.
+	var tgt := _current_target()
+	match String(tgt["kind"]):
+		"terrain":
+			var base_cell: Vector3i = tgt["cell"]
+			var nrm: Vector3i = tgt["normal"]
+			var place_cell := base_cell + nrm
+			if _cell_intersects_player(place_cell):
+				return false
+			if world.place_block(place_cell, id):
+				if inventory.selected_block_id() == id:
+					inventory.consume_selected(1)
+				return true
+			return false
+		"wood":
+			var body := tgt["body"] as VoxelBody
+			var local_cell: Vector3i = tgt["cell"] + tgt["normal"]
+			if body.add_cell(local_cell, id):
+				if inventory.selected_block_id() == id:
+					inventory.consume_selected(1)
+				return true
+			return false
+	return false

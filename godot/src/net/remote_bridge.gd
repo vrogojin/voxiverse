@@ -830,9 +830,15 @@ func _ensure_executor() -> void:
 	_exec.progress.connect(_on_exec_progress)
 	_exec.override_triggered.connect(_on_exec_override)
 	add_child(_exec)
+	# P3 intent seam: hand the player a reference so Player._physics_process ticks the executor (§4.3).
+	if is_instance_valid(player):
+		player.set("remote_exec", _exec)
 
 
 func _free_executor() -> void:
+	# Clear the player's seam reference FIRST so a lingering physics_tick can't touch a freed executor.
+	if is_instance_valid(player):
+		player.set("remote_exec", null)
 	if is_instance_valid(_exec):
 		_exec.queue_free()
 	_exec = null

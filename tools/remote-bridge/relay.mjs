@@ -92,7 +92,7 @@ const MAX_TOTAL_DURATION_S = 180;    // Σ expected step time (watchdog outer bo
 const MAX_CMD_BYTES = 16 * 1024;     // sequence JSON size
 const STALE_S = 120;                 // `issued` older than this => rejected (a delayed/re-sent file must not fire late)
 // Closed op whitelist (design §1.1 + resolved D5 full-agency set). Validation only routes in P1.
-const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot']);
+const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload']);
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
 function loadToken() {
@@ -246,6 +246,7 @@ function validateStep(st) {
       return okEst(0.2);
     }
     case 'stop': return okEst(0.1);
+    case 'reload': return okEst(2.0);                   // §6.6: reload the browser to pick up a fresh deploy (grant-gated, game-side)
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');
       return okEst(0.5);

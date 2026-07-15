@@ -49,7 +49,16 @@ const FRAME_INTERVAL_MS := 500      # ms — ~2 fps frame stream
 const FRAME_MAX_WIDTH := 960        # px — downscale cap for the JPEG (keeps bytes + readback modest)
 const FRAME_JPG_QUALITY := 0.6
 const FRAME_TAG := 0x01             # 1-byte type tag prefixing a binary JPEG frame (distinguish from JSON text)
-const OUTBOUND_BACKPRESSURE_BYTES := 262144   # skip a frame if > 256 KB is still queued in the socket
+## The WebSocketPeer's Godot-side outbound ring buffer. MUST be set (before connect) well above a single
+## frame (~45 KB) — the DEFAULT is only ~64 KB, so one JPEG + a telemetry JSON overflowed it and every
+## subsequent send errored `ERR_OUT_OF_MEMORY (emws_peer.cpp:_send)`, corrupting the stream and the very
+## measurement we are here to take. 1 MiB gives ~20 frames of drain headroom; it is a hard bound (frames
+## are SHED below it, never queued past it), so it does not threaten NEVER-OOM.
+const OUTBOUND_BUFFER_BYTES := 1 << 20        # 1 MiB Godot-side outbound buffer (was default ~64 KB)
+## Shed a frame when this many bytes are still queued. MUST stay comfortably BELOW OUTBOUND_BUFFER_BYTES
+## so that the in-flight frame + a telemetry JSON still fit after the check passes — otherwise the guard
+## is dead (the old 256 KB threshold sat ABOVE the real ~64 KB buffer, so it never tripped).
+const OUTBOUND_BACKPRESSURE_BYTES := 393216   # skip a frame if > 384 KB is still queued (< 1 MiB buffer)
 
 const HITCH_MS := 33.0              # perf_hud.gd parity: a frame slower than ~30 fps counts as a hitch
 
@@ -164,6 +173,10 @@ func _open_socket() -> void:
 	_was_open = false
 	_hello_sent = false
 	_authed = false
+	# Enlarge the outbound ring buffer BEFORE connecting — the default (~64 KB) is smaller than one
+	# JPEG frame, so sends overflowed with ERR_OUT_OF_MEMORY. Set each open (a fresh connect can reset
+	# peer buffers). Frames are still shed at OUTBOUND_BACKPRESSURE_BYTES, so this is a bounded ceiling.
+	_ws.outbound_buffer_size = OUTBOUND_BUFFER_BYTES
 	var err := _ws.connect_to_url(_url)
 	if err != OK:
 		# Connect failed to even start — schedule a backed-off retry.
@@ -312,7 +325,11 @@ func _send_telemetry() -> void:
 	}
 	_merge_rich_state(msg)
 
-	if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
+	# Telemetry is small (~1 KB) and the signal we most want to keep, so it is NOT shed at the frame
+	# threshold — but under a total network stall the buffer could still creep up, so only send while
+	# there is clear headroom below the ring cap. This keeps ERR_OUT_OF_MEMORY out of the console.
+	if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN \
+			and _ws.get_current_outbound_buffered_amount() < OUTBOUND_BUFFER_BYTES - 65536:
 		_ws.send_text(JSON.stringify(msg))
 
 

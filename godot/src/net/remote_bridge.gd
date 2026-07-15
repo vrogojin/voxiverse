@@ -82,10 +82,15 @@ var _backoff := RECONNECT_BACKOFF_MIN
 var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hud.gd parity)
 
 # Frame-timing window (accumulated in _process, flushed with each telemetry send).
+# NOTE: we measure the frame period from Time.get_ticks_usec() deltas, NOT the _process(delta)
+# param — Godot CLAMPS that param (~50 ms / 1/20 s spiral-of-death guard), which censored worst_ms
+# at exactly 50 in the border-walk telemetry (proc_ms via TIME_PROCESS read 282 ms the same frame).
+# The usec delta is the true wall frame time, so crossing spikes above 50 ms become measurable.
 var _win_acc := 0.0
 var _win_frames := 0
-var _win_worst := 0.0               # slowest frame (s) in the current window
+var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
+var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
 var _frame_acc_ms := 0.0
 var _capturing := false             # a frame readback+send is inflight (skip overlapping captures)
@@ -193,12 +198,17 @@ func _process(delta: float) -> void:
 	if _ws == null:
 		return
 
-	# ── Frame-timing accumulation (perf_hud.gd parity) — cheap, runs whether or not connected. ──
-	_win_acc += delta
+	# ── Frame-timing accumulation — use the TRUE wall delta (usec), not the engine-clamped `delta` param. ──
+	var now_usec := Time.get_ticks_usec()
+	var real_delta := delta                                   # first frame: fall back to the engine param
+	if _last_frame_usec >= 0:
+		real_delta = float(now_usec - _last_frame_usec) / 1_000_000.0
+	_last_frame_usec = now_usec
+	_win_acc += real_delta
 	_win_frames += 1
-	if delta > _win_worst:
-		_win_worst = delta
-	if delta * 1000.0 > HITCH_MS:
+	if real_delta > _win_worst:
+		_win_worst = real_delta
+	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
 
 	# ── Socket state machine ──────────────────────────────────────────────────────────────────

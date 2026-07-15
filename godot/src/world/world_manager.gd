@@ -45,14 +45,23 @@ var _ground: GroundCollider           # local blocky physics collider
 # so the scene tree and every numeric result are byte-identical to today. Created in _ready().
 var _active_frame: Node3D = null
 var _frame: _FrameAdapterCls = null
-# COSMOS FP-FIXED-FRAME §2.3/§2.2 step 6 (Phase 2) — rigid-body (debris) gravity in the tilted frame. With the
-# fixed frame ON the scene IS the planet-ABSOLUTE frame, so a VoxelBody's "down" is the active facet's up in
-# absolute space (−T_active.basis.y), NOT global −Y. `_gravity_area` is one global directional-gravity Area3D
-# (REPLACE override, LAYER_BODY mask) covering the whole planet; a crossing rotates its direction. `_gravity_vec`
-# mirrors it for the headless gate. Both stay null/(-Y) when the fixed frame is off → default −Y gravity, byte-
-# identical. Per-body per-facet-accurate Area3D gravity (RESOLVED decision 2) is deferred to Phase 3.
-var _gravity_area: Area3D = null
+# COSMOS FP-FIXED-FRAME §2.3/§2.2 step 6 + §10 decision 2 (Phase 3) — PER-BODY PER-FACET-ACCURATE debris gravity.
+# With the fixed frame ON the scene IS the planet-ABSOLUTE frame, so a VoxelBody's "down" is ITS OWN facet's up in
+# absolute space (−T_fid.basis.y). Phase 2 used ONE global Area3D rotated to the active facet's up (≤3.7° error on a
+# body resting on a neighbour facet); Phase 3 replaces it with ONE Area3D PER LIVE FACET (`_gravity_areas`: fid →
+# Area3D), each a REPLACE-override box oriented to T_fid + placed over that facet's patch, so a body over facet F
+# falls exactly along F's up. The set is BOUNDED to the live pool (active + ≤ POOL_MAX_NEIGHBOURS neighbours) — the
+# NEVER-OOM cap — resynced on every crossing/pool change. `_gravity_vec` mirrors the ACTIVE facet's down for the
+# headless gate. Empty/(-Y) when the fixed frame is off → default −Y gravity, byte-identical.
+var _gravity_areas: Dictionary = {}   # fid -> Area3D (fixed-frame only; bounded to the live pool)
 var _gravity_vec: Vector3 = Vector3.DOWN
+# COSMOS FP-FIXED-FRAME re-anchor (§3 / §10 decision 1): the accumulated integer floating-origin shift applied to
+# every ABSOLUTE node (PlanetRoot, far ring, per-facet gravity) AND folded into the ActiveFrame placement so the
+# player/debris/collider/viewer ride it. `_player_abs_max` is the Phase-0 telemetry guard — the running max of the
+# player's rendered-absolute magnitude (surfaced live via player_abs_max() → remote bridge). ZERO/0 when off.
+var _anchor_offset: Vector3 = Vector3.ZERO
+var _player_abs_max: float = 0.0
+var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resync (fixed-frame only, §10 decision 2)
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
@@ -204,10 +213,12 @@ func _ready() -> void:
 		# facet-lattice. PlanetRoot is pinned @ identity forever (module_world), so a crossing only re-writes THIS node
 		# (O(1) — ~10 non-terrain children), never the mesh blocks. (At Phase-1 sed toggles this reduces to identity when
 		# the spawn facet's transform is identity; the P2 gates assert the tilted-frame behaviour instead.)
-		_active_frame.transform = FacetAtlas.facet_transform(TerrainConfig.active_facet())
+		_active_frame.transform = _anchored(FacetAtlas.facet_transform(TerrainConfig.active_facet()))
 		add_child(_active_frame)
-		# One global directional-gravity Area3D so debris fall along the active facet's ABSOLUTE up, not global −Y (§2.3).
-		_install_gravity_area(TerrainConfig.active_facet())
+		# Per-facet directional-gravity Area3D volumes (§10 decision 2) so debris fall along THEIR OWN facet's absolute
+		# up, not one global −T_active.basis.y. Built for the live pool now (active facet); resynced on crossings + the
+		# throttled _process pass as neighbours spawn/retire — the set stays bounded to the pool (NEVER-OOM).
+		_sync_gravity_areas()
 	_frame.setup(_active_frame)
 
 	# Local terrain physics collider (both render paths are collider-less). Hosted under ActiveFrame when the fixed
@@ -266,6 +277,15 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if _snowfall != null and _have_player_pos:
 		_snowfall.process(delta, _last_player_pos)
+	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
+	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
+	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
+	# unchanged. Gated on the fixed frame → zero extra work with the flag off (byte-identical).
+	if _fixed_frame_on():
+		_grav_sync_accum += delta
+		if _grav_sync_accum >= 0.5:
+			_grav_sync_accum = 0.0
+			_sync_gravity_areas()
 	# FP-M2c (§6.5): tick the load controller every frame with REAL time so it adapts to live main-thread load. The
 	# FacetLodMesher reads its credit for LOD apply-ms + build grants (surfaces 1-2). The pool ramp pace (surface 3)
 	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
@@ -363,35 +383,102 @@ func _frame_host() -> Node3D:
 func gravity_vector() -> Vector3:
 	return _gravity_vec
 
-## Build the single global directional-gravity Area3D (fixed-frame only). One big box (covers the whole planet:
-## |absolute| ≤ R+height ≈ 3.3 k ⋘ 8000) with a REPLACE gravity override pointing along −T_active.basis.y, masking
-## the BODY layer so ONLY VoxelBody debris are re-gravitated (the analytic player is untouched — CharacterBody3D
-## ignores area gravity). A crossing rotates its direction via _set_gravity_for_facet. Never built when off.
-func _install_gravity_area(active_fid: int) -> void:
-	_gravity_area = Area3D.new()
-	_gravity_area.name = "FacetGravity"
-	_gravity_area.collision_layer = 0
-	_gravity_area.collision_mask = VoxelBody.LAYER_BODY
-	_gravity_area.gravity_space_override = Area3D.SPACE_OVERRIDE_REPLACE
-	_gravity_area.gravity_point = false
-	_gravity_area.priority = 1
+## COSMOS FP-FIXED-FRAME re-anchor helper (§3): fold the current floating-origin shift into an ABSOLUTE placement
+## transform — same rotation, origin slid by −_anchor_offset. ZERO offset ⇒ returns `t` unchanged (byte-identical).
+func _anchored(t: Transform3D) -> Transform3D:
+	return Transform3D(t.basis, t.origin - _anchor_offset)
+
+## The accumulated floating-origin shift (blocks) — the amount every absolute node has been slid toward the render
+## origin. `true_abs = node.global + active_anchor_offset()` is the invariant a re-anchor preserves (gate reads it).
+func active_anchor_offset() -> Vector3:
+	return _anchor_offset
+
+## Phase-0 telemetry guard (§3): the running max of the player's rendered-absolute magnitude. Surfaced live by the
+## remote bridge so the |player_abs| headroom (and any re-anchor need at larger R) is evidence-based, not assumed.
+func player_abs_max() -> float:
+	return _player_abs_max
+
+# COSMOS FP-FIXED-FRAME §10 decision 2 — per-facet gravity box dims (blocks). Tangential half-extent (160) exceeds a
+# facet's ~100-block half-width so a body anywhere over facet F is inside F's box, yet is < the ~200-block inter-facet
+# centre spacing so a body at a NEIGHBOUR facet's centre is OUTSIDE this facet's box → exact per-facet up (no seam
+# double-cover at facet centres; only a thin ridge band overlaps, resolved by the active facet's higher priority).
+const GRAV_BOX_TANGENTIAL := 320.0
+const GRAV_BOX_VERTICAL := 2048.0     # ± ~1 k blocks about the facet mean-plane — spans bedrock → tallest surface + debris arc
+
+## COSMOS FP-FIXED-FRAME §10 decision 2 (Phase 3) — resync the per-facet directional-gravity volume set to the LIVE
+## pool: one REPLACE-override Area3D per live facet (active + ≤ POOL_MAX_NEIGHBOURS neighbours → the NEVER-OOM cap),
+## each oriented to T_fid so a VoxelBody over facet F falls along F's OWN absolute up (−T_F.basis.y), not a single
+## global approximation. Builds newly-live facets, frees ones that left the pool, and re-stamps the active facet's box
+## with the higher priority (it wins the thin ridge overlap where the player edits/breaks). No-op when off.
+func _sync_gravity_areas() -> void:
+	if not _fixed_frame_on():
+		return
+	var want: Dictionary = {}
+	if _module_world != null and _module_world.has_method("pool_fids"):
+		for fid in _module_world.call("pool_fids"):
+			want[int(fid)] = true
+	else:
+		want[TerrainConfig.active_facet()] = true
+	# Free gravity boxes whose facet is no longer live (bounds the set — NEVER-OOM).
+	for fid in _gravity_areas.keys():
+		if not want.has(fid):
+			var dead: Area3D = _gravity_areas[fid]
+			_gravity_areas.erase(fid)
+			if is_instance_valid(dead):
+				dead.queue_free()
+	# Build gravity boxes for newly-live facets.
+	for fid in want.keys():
+		if fid >= 0 and not _gravity_areas.has(fid):
+			_gravity_areas[fid] = _build_facet_gravity_area(fid)
+	_stamp_active_gravity()
+
+## Build one directional-gravity Area3D for facet `fid`: a REPLACE-override box, oriented + placed at the facet's
+## absolute (re-anchored) transform with a child box shifted over the facet's own patch (centre cell), gravity along
+## −T_fid.basis.y. Masks the BODY layer only, so the analytic player (CharacterBody3D ignores area gravity) is untouched.
+func _build_facet_gravity_area(fid: int) -> Area3D:
+	var area := Area3D.new()
+	area.name = "FacetGravity_%d" % fid
+	area.collision_layer = 0
+	area.collision_mask = VoxelBody.LAYER_BODY
+	area.gravity_space_override = Area3D.SPACE_OVERRIDE_REPLACE
+	area.gravity_point = false
+	area.gravity_direction = -FacetAtlas.facet_transform(fid).basis.y.normalized()
+	area.gravity = 9.8
+	area.priority = 1
+	area.transform = _anchored(FacetAtlas.facet_transform(fid))
 	var cs := CollisionShape3D.new()
 	var box := BoxShape3D.new()
-	box.size = Vector3(16000.0, 16000.0, 16000.0)
+	box.size = Vector3(GRAV_BOX_TANGENTIAL, GRAV_BOX_VERTICAL, GRAV_BOX_TANGENTIAL)
 	cs.shape = box
-	_gravity_area.add_child(cs)
-	add_child(_gravity_area)   # a child of WorldManager @ identity → absolute frame, so the box spans the planet
-	_set_gravity_for_facet(active_fid)
+	# Offset the box over the facet's PATCH: the facet-centre lattice cell (T_fid's origin is the lattice ORIGIN, far
+	# from the patch via the decorrelation offset O). In the Area's local (lattice) frame +Y is the facet up.
+	var centre := FacetAtlas.centre_cell(fid)
+	cs.position = Vector3(float(centre.x), 0.0, float(centre.y))
+	area.add_child(cs)
+	add_child(area)
+	return area
 
-## Point the world gravity along the active facet's ABSOLUTE up (−T_fid.basis.y) at 9.8 m/s² (the Godot default
-## magnitude). Also stamps `_gravity_vec` for the gate. No-op container when the fixed frame is off (_gravity_area
-## null → default −Y gravity stays authoritative).
-func _set_gravity_for_facet(fid: int) -> void:
-	var up: Vector3 = FacetAtlas.facet_transform(fid).basis.y.normalized()
-	_gravity_vec = -up
-	if _gravity_area != null:
-		_gravity_area.gravity_direction = _gravity_vec
-		_gravity_area.gravity = 9.8
+## Stamp `_gravity_vec` = the ACTIVE facet's down (for the headless gate + any single-vector consumer) and bias the
+## active facet's box priority above its neighbours' so it wins the thin ridge overlap (the "clean crossing between
+## volumes" — a body at the active/neighbour seam falls to the active floor the player is standing on).
+func _stamp_active_gravity() -> void:
+	var fid := TerrainConfig.active_facet()
+	if fid >= 0:
+		_gravity_vec = -FacetAtlas.facet_transform(fid).basis.y.normalized()
+	for f in _gravity_areas.keys():
+		var a: Area3D = _gravity_areas[f]
+		if is_instance_valid(a):
+			a.priority = (2 if f == fid else 1)
+
+## The gravity DIRECTION a live per-facet volume applies for facet `fid` (−T_fid.basis.y), or Vector3.ZERO if `fid`
+## has no live volume. The exact per-facet-up model the gate asserts against FacetAtlas.facet_of_dir(body position).
+func gravity_direction_for_facet(fid: int) -> Vector3:
+	var a: Area3D = _gravity_areas.get(fid)
+	return a.gravity_direction if (a != null and is_instance_valid(a)) else Vector3.ZERO
+
+## The bounded set of facets with a live gravity volume (== the live pool). Gate reads it to assert the NEVER-OOM cap.
+func live_gravity_facets() -> Array:
+	return _gravity_areas.keys()
 
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
@@ -1492,6 +1579,14 @@ func cosmos_wedge_cells(center: Vector3, span: float, spacing: float) -> Array:
 ## no content re-streams (pop = 0). Render nodes carry window-space geometry, so they are translated
 ## by −Δ to keep their already-built meshes at the same world position while the origin moves.
 func maybe_reanchor(player_pos: Vector3) -> Vector3:
+	# COSMOS FP-FIXED-FRAME re-anchor (§3 / §10 decision 1): the curved `_chart` path below is a byte-identical no-op
+	# under FACETED (no chart is built — §1.2), so the fixed frame gets its OWN faceted floating-origin re-anchor.
+	# `player_pos` is the player's RENDERED-ABSOLUTE position (player.global_position); the faceted path slides every
+	# absolute node toward the origin and carries the player via the ActiveFrame, so it returns ZERO (the caller
+	# subtracts nothing — unlike the chart path where the caller compensates its own global_position).
+	if _fixed_frame_on():
+		_maybe_reanchor_faceted(player_pos)
+		return Vector3.ZERO
 	if _chart == null or not _chart.needs_reanchor(player_pos):
 		return Vector3.ZERO
 	var d := _chart.reanchor(player_pos)
@@ -1512,6 +1607,49 @@ func maybe_reanchor(player_pos: Vector3) -> Vector3:
 		_far.position -= shift
 	_m5_sync_frame()   # COSMOS M5a: the reanchor moved _chart.org → refresh the true-position chart table
 	return shift
+
+## COSMOS FP-FIXED-FRAME faceted floating-origin re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1).
+## Tracks the Phase-0 |player_abs| telemetry guard, and — ONLY when the rendered-absolute magnitude exceeds the
+## trigger (never at R = 3072; large-planet headroom) — slides every absolute node back toward the origin by an
+## INTEGER shift so f32 render/physics precision stays bounded. Fires far less often than a crossing; one PlanetRoot
+## re-place per shift is acceptable (§3). The shift is exact-integer so no lattice/edit identity changes.
+func _maybe_reanchor_faceted(player_global: Vector3) -> void:
+	var mag := player_global.length()
+	if mag > _player_abs_max:
+		_player_abs_max = mag                       # Phase-0 telemetry: track the max |player render-abs| seen live
+	if mag < CubeSphere.REANCHOR_TRIGGER_BLOCKS:
+		return
+	# Shift by the player's rendered-absolute position ROUNDED to whole blocks → the player lands near the origin,
+	# and every absolute quantity is an exact integer translation (edits are (fid,cell)-keyed → wholly untouched).
+	var a := Vector3(roundf(player_global.x), roundf(player_global.y), roundf(player_global.z))
+	if a == Vector3.ZERO:
+		return
+	_apply_anchor_shift(a)
+
+## Apply an integer floating-origin shift `a`: slide PlanetRoot (+ its FacetSlots + LOD tiles — ONE mesh-block
+## re-place), the far ring, the per-facet gravity volumes, and the ActiveFrame (hence the player, GroundCollider,
+## debris and the player-parented VoxelViewer, whose LOCAL/lattice poses are all UNTOUCHED) each by −a. Every node's
+## `global + active_anchor_offset()` is therefore invariant — the physical world does not move; only the render
+## origin does. Exposed (non-underscore-free) so the headless gate can force a shift directly (the trigger never
+## fires at R = 3072). No-op unless the fixed frame is on.
+func _apply_anchor_shift(a: Vector3) -> void:
+	if not _fixed_frame_on():
+		return
+	_anchor_offset += a
+	# 1. PlanetRoot (every FacetSlot + the LOD-tile layer ride it) — the ONE godot_voxel re-place, rare by construction.
+	if _module_world != null and _module_world.has_method("shift_anchor"):
+		_module_world.call("shift_anchor", a)
+	# 2. Far ring (its mesh is ABSOLUTE) rides the same shift; the offset survives crossings (set_active folds it in).
+	if _facet_ring != null and _facet_ring.has_method("shift_anchor"):
+		_facet_ring.shift_anchor(a)
+	# 3. ActiveFrame origin drops by a (basis unchanged); player/GroundCollider/debris/viewer keep their lattice locals.
+	if _active_frame != null:
+		_active_frame.position -= a
+	# 4. Per-facet gravity volumes are placed in absolute space → slide each by −a (direction is translation-invariant).
+	for f in _gravity_areas.keys():
+		var ga: Area3D = _gravity_areas[f]
+		if is_instance_valid(ga):
+			ga.position -= a
 
 ## COSMOS M3 (§4.5): the home-face flip. When the player has crossed FLIP_HYST cells PAST a face
 ## edge, re-base the window onto the neighbour face (chart.flip) and HARD-RESTREAM the local region.
@@ -1618,9 +1756,10 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
 			# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
 			if _fixed_frame_on():
-				# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform). Its children (player, collider,
-				#    debris) keep their LATTICE locals; their globals follow to planet-absolute space. O(1) — never terrain.
-				_active_frame.transform = FacetAtlas.facet_transform(to)
+				# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
+				#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
+				#    planet-absolute space. O(1) — never terrain.
+				_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
 				# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
 				#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
 				#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
@@ -1633,8 +1772,10 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 						var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
 						vb.transform = cross_delta * vb.transform
 						vb.sleeping = was_sleeping
-				# 6. Rotate world gravity to the new facet's absolute up (−T_to.basis.y) so debris fall toward B's floor.
-				_set_gravity_for_facet(to)
+				# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
+				#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
+				#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
+				_sync_gravity_areas()
 				# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
 				#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
 				#    entirely when no awake debris are near, exactly as today).

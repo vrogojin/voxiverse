@@ -24,6 +24,9 @@ const FOG_BEGIN := 2200.0            # fog only far out, so the whole planet rea
 const WARM_BUDGET_MS := 3.0          # FP-S1(d): per-frame cache-warm budget for newly-front-hemisphere facets
 
 var _active_fid := -1
+# COSMOS FP-FIXED-FRAME re-anchor (§3): the accumulated floating-origin shift. Under the fixed frame the ring pins @
+# (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
+var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
@@ -62,8 +65,17 @@ func set_active(new_fid: int) -> void:
 ## ⇒ T_active⁻¹, re-placing the absolute mesh into the active facet's render frame exactly as today (byte-identical).
 func _placement_xform() -> Transform3D:
 	if CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
-		return Transform3D.IDENTITY
+		return Transform3D(Basis.IDENTITY, -_anchor_offset)
 	return FacetAtlas.facet_transform(_active_fid).affine_inverse()
+
+## COSMOS FP-FIXED-FRAME re-anchor (§3): slide the absolute ring mesh by −A in lockstep with PlanetRoot + the
+## ActiveFrame so the whole rendered planet stays continuous through a floating-origin shift. The offset survives a
+## crossing (set_active re-applies _placement_xform, which now folds it in). No-op unless the fixed frame is on.
+func shift_anchor(a: Vector3) -> void:
+	if not (CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL):
+		return
+	_anchor_offset += a
+	transform = _placement_xform()
 
 ## COSMOS FP-R0 SPIKE: hide these facets' flat quads (they are drawn as real rotated voxel terrains instead).
 ## Called only behind CubeSphere.FP_R0; on the shipped build nothing calls this so `_excluded` stays empty and the

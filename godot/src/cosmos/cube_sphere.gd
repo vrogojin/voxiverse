@@ -156,6 +156,14 @@ const POOL_D_COMMIT := 64.0
 ## (the ActiveFrame is never created, FrameAdapter is transparent); FLAT stays 6027/0. Flipped ON at export A/B.
 const FP_FIXED_FRAME := false
 
+## COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1) — the |player render-abs|
+## magnitude (blocks) at which the faceted floating-origin re-anchor fires: an INTEGER world shift of PlanetRoot +
+## every absolute FacetSlot/LOD tile + the far ring + the ActiveFrame (hence player/debris/collider/viewer) toward
+## the origin, bounding f32 precision for LARGE planets (R ≫ 3072). At the shipped R = 3072 the rendered absolute
+## coords are ≤ ~3.3 k (§3), so with this at 8192 the trigger NEVER fires and the committed build is byte-identical;
+## it exists purely as large-planet headroom and is validated by the headless gate (which forces a shift directly).
+const REANCHOR_TRIGGER_BLOCKS := 8192.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

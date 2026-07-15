@@ -166,15 +166,20 @@ func _initialize() -> void:
 	# so they hold in the committed (flag-off) build too. -----------------------------------------------------------
 	_p2_numeric_lemmas()
 
-	# --- G-WM-WIRING + G-P2-LIVE: real WorldManager + a scripted crossing (only when the flag chain is on) ---------
+	# --- G-P3-* NUMERIC lemmas (flag-INDEPENDENT): the re-anchor pose-preservation algebra + the per-facet gravity
+	# model, proven against FacetAtlas so they hold in the committed (flag-off) build too. ---------------------------
+	_p3_numeric_lemmas()
+
+	# --- G-WM-WIRING + G-P2-LIVE + G-P3-LIVE: real WorldManager + a scripted crossing (only when the flag chain is on)
 	if CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
 		if ClassDB.class_exists("VoxelTerrain"):
 			await _wm_wiring_check()      # awaits a process frame so WorldManager._ready fires
 			await _p2_live_crossing_check()   # drives a real crossing + asserts the keystone invariants
+			await _p3_live_check()        # P3: forced re-anchor pose/overlay preservation + per-facet gravity
 		else:
-			print("  NOTE: G-WM-WIRING/G-P2-LIVE skipped — godot_voxel module absent (numeric core still validated).")
+			print("  NOTE: G-WM-WIRING/G-P2-LIVE/G-P3-LIVE skipped — godot_voxel module absent (numeric core still validated).")
 	else:
-		print("  NOTE: G-WM-WIRING/G-P2-LIVE skipped — FP_FIXED_FRAME/FACETED/FP_M1_POOL not all on (numeric core validated).")
+		print("  NOTE: G-WM-WIRING/G-P2-LIVE/G-P3-LIVE skipped — FP_FIXED_FRAME/FACETED/FP_M1_POOL not all on (numeric core validated).")
 
 	active.free()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -373,4 +378,154 @@ func _p2_live_crossing_check() -> void:
 		# PlanetRoot never moved through the whole round trip.
 		if pr != null:
 			_ok(_tapprox(pr.transform, Transform3D.IDENTITY, 1e-5), "G-P2-LIVE-RETURN PlanetRoot still @ identity after round-trip")
+	w.free()
+
+## COSMOS FP-FIXED-FRAME P3 NUMERIC lemmas (§3 re-anchor + §10 decision 2 per-facet gravity) — proven against the
+## FacetAtlas frames so they hold in the committed (flag-off) build too:
+##   G-P3-ANCHOR-POINT   an integer shift A of an absolute placement preserves the world point: (T'·p)+A == T·p with
+##                       T' = Transform3D(T.basis, T.origin−A) — the exact ActiveFrame / slot / far-ring re-anchor.
+##   G-P3-ANCHOR-REL     a player point and a terrain point BOTH slid by −A keep their relative offset (no teleport).
+##   G-P3-GRAV-UP        the per-facet gravity −T_fid.basis.y is a UNIT vector, and a neighbour's up DIFFERS from the
+##                       active's by the (non-zero) dihedral — the accuracy the single Phase-2 global vector lacked.
+##   G-P3-GRAV-CLASSIFY  facet_of_dir(centre direction of fid) == fid — the body→facet map the gravity model rests on.
+func _p3_numeric_lemmas() -> void:
+	TerrainConfig.warm_up()
+	FacetAtlas.warm_up()
+	var fid := FacetAtlas.spawn_facet()
+	var ta := FacetAtlas.facet_transform(fid)
+	var A := Vector3(1234.0, 56.0, -7890.0)
+	var tprime := Transform3D(ta.basis, ta.origin - A)
+	for p: Vector3 in _sample_points():
+		# G-P3-ANCHOR-POINT: the re-anchored placement + the offset recovers the original world point (f32 at ~33 k).
+		_ok(_vapprox(tprime * p + A, ta * p, 0.1), "G-P3-ANCHOR-POINT (T'·p)+A == T·p %s" % p)
+	# G-P3-ANCHOR-REL: player point q and terrain point v BOTH shifted by −A keep their relative displacement.
+	var q := Vector3(120.5, 40.0, 88.0)         # a play-frame (lattice) point mapped through T (ActiveFrame slid by −A)
+	var v := Vector3(10.0, 0.0, -5.0)           # a terrain voxel absolute point (PlanetRoot slid by −A)
+	var rel_before := (ta * q) - v
+	var rel_after := (tprime * q) - (v - A)
+	_ok(_vapprox(rel_before, rel_after, 0.1), "G-P3-ANCHOR-REL relative player↔terrain offset invariant under shift")
+	# Per-facet gravity model over the spawn facet's seam neighbours.
+	var active_up := ta.basis.y.normalized()
+	for slot in 4:
+		var nb: int = FacetAtlas.seam_neighbour(fid, slot)
+		if nb < 0:
+			continue
+		var tb := FacetAtlas.facet_transform(nb)
+		var nb_up := tb.basis.y.normalized()
+		_ok(absf(nb_up.length() - 1.0) < 1e-4, "G-P3-GRAV-UP facet %d up is unit" % nb)
+		# neighbour up differs from active up by the dihedral (~3.7° ⇒ dot < 1): the per-facet volumes are genuinely distinct.
+		_ok(active_up.dot(nb_up) < 0.9999, "G-P3-GRAV-UP neighbour %d up ≠ active up (per-facet accuracy)" % nb)
+		var cc := FacetAtlas.centre_cell(nb)
+		_ok(FacetAtlas.facet_of_dir(FacetAtlas.cell_dir(nb, cc.x, cc.y)) == nb,
+			"G-P3-GRAV-CLASSIFY facet_of_dir(centre_dir(%d)) == %d" % [nb, nb])
+
+## COSMOS FP-FIXED-FRAME P3 LIVE (§3 re-anchor + §10 decision 2) — a real WorldManager (flags on, module present):
+## drive a crossing to populate the pool, assert the per-facet gravity volumes, then FORCE a re-anchor shift and
+## assert every absolute pose + the edit overlay are preserved:
+##   G-P3-LIVE-GRAV-SET    the gravity-volume set == the live pool, bounded ≤ 1+POOL_MAX_NEIGHBOURS (NEVER-OOM).
+##   G-P3-LIVE-GRAV-UP     each live facet's volume applies −T_fid.up; active ≠ a neighbour (per-facet accurate).
+##   G-P3-LIVE-ANCHOR-*    a forced integer shift preserves player/debris ABSOLUTE poses (global+offset invariant),
+##                         leaves their LATTICE locals + the edit overlay untouched, and slides PlanetRoot/ActiveFrame.
+func _p3_live_check() -> void:
+	TerrainConfig.warm_up()
+	FacetAtlas.warm_up()
+	var fid := FacetAtlas.spawn_facet()
+	TerrainConfig.set_active_facet(fid)
+	var w := WorldManager.new()
+	w.name = "P3Live"
+	get_root().add_child(w)
+	await process_frame
+	await process_frame
+	var af: Node3D = w.get_node_or_null("ActiveFrame")
+	var pr: Node3D = w.find_child("PlanetRoot", true, false)
+	if af == null:
+		_ok(false, "G-P3-LIVE ActiveFrame present"); w.free(); return
+
+	# Drive one crossing so the pool holds ≥2 live facets (active `to` + the just-left `from`) → ≥2 gravity volumes.
+	var cc := FacetAtlas.centre_cell(fid)
+	var cx := cc.x; var cz := cc.y
+	var cross_pos := Vector3.INF
+	for d in range(1, 400):
+		var px := float(cx + d) + 0.5
+		var pf := w.surface_y(px, float(cz) + 0.5)
+		var mn := 1.0e18
+		for slot in range(4):
+			mn = minf(mn, FacetAtlas.own_dist(fid, slot, px, pf, float(cz) + 0.5))
+		if mn < -1.0:
+			cross_pos = Vector3(px, pf, float(cz) + 0.5)
+			break
+	if cross_pos.is_finite():
+		var res := w.maybe_cross_facet(cross_pos)
+		if res.get("crossed", false):
+			pass   # active facet advanced; pool now holds ≥2 live facets
+
+	# G-P3-LIVE-GRAV-SET: the gravity set matches the live pool and is bounded (NEVER-OOM).
+	var live: Array = w.live_gravity_facets()
+	_ok(live.size() >= 1 and live.size() <= 1 + CubeSphere.POOL_MAX_NEIGHBOURS,
+		"G-P3-LIVE-GRAV-SET |gravity set|=%d ∈ [1, 1+cap] (NEVER-OOM)" % live.size())
+	var pool: Array = []
+	if w._module_world != null and w._module_world.has_method("pool_fids"):
+		pool = w._module_world.call("pool_fids")
+	if pool.size() > 0:
+		var same := (live.size() == pool.size())
+		for f in pool:
+			if not (int(f) in live):
+				same = false
+		_ok(same, "G-P3-LIVE-GRAV-SET gravity volumes == live pool %s" % [pool])
+	# G-P3-LIVE-GRAV-UP: each live volume applies its own facet's −up; the active differs from a neighbour.
+	var active_fid := TerrainConfig.active_facet()
+	for f in live:
+		_ok(_vapprox(w.gravity_direction_for_facet(int(f)), -FacetAtlas.facet_transform(int(f)).basis.y.normalized(), 1e-3),
+			"G-P3-LIVE-GRAV-UP facet %d volume == −T_fid.up" % int(f))
+	if live.size() >= 2:
+		var neigh := -1
+		for f in live:
+			if int(f) != active_fid:
+				neigh = int(f); break
+		if neigh >= 0:
+			_ok(not _vapprox(w.gravity_direction_for_facet(active_fid), w.gravity_direction_for_facet(neigh), 1e-3),
+				"G-P3-LIVE-GRAV-UP active up ≠ neighbour %d up (per-facet accurate, not one global vector)" % neigh)
+
+	# --- G-P3-LIVE-ANCHOR: a player-proxy + debris under ActiveFrame, an edit, then a FORCED integer shift. ----------
+	var acx := FacetAtlas.centre_cell(active_fid).x
+	var acz := FacetAtlas.centre_cell(active_fid).y
+	var lat := Vector3(float(acx) + 0.5, w.surface_y(float(acx) + 0.5, float(acz) + 0.5) + 2.0, float(acz) + 0.5)
+	var proxy := Node3D.new(); proxy.name = "P3Proxy"; af.add_child(proxy)
+	proxy.position = lat
+	var proxy_abs_before := proxy.global_transform.origin + w.active_anchor_offset()
+	var STONE := BlockCatalog.STONE
+	var debris: VoxelBody = VoxelBody.spawn_loose(af, {Vector3i(int(acx), int(w.surface_y(float(acx) + 0.5, float(acz) + 0.5)) + 30, int(acz)): STONE}, w)
+	debris.freeze = true
+	var debris_abs_before := debris.global_transform.origin + w.active_anchor_offset()
+	var debris_local_before := debris.transform
+	# A real edit — DIG a below-surface solid cell to air on the active facet (a mid-air PLACE would be detached by the
+	# structural-collapse pass). Its (fid,cell)-global overlay key must survive the shift untouched.
+	var edit_cell := Vector3i(int(acx), int(w.surface_y(float(acx) + 0.5, float(acz) + 0.5)) - 2, int(acz))
+	var broke := w.break_terrain(edit_cell)
+	var block_before := w.block_id_at(edit_cell)
+	var proot_before := pr.position if pr != null else Vector3.ZERO
+	var af_basis_before := af.transform.basis
+
+	# FORCE a shift (the trigger never fires at R = 3072 — that is the point; we validate the mechanism directly).
+	var A := Vector3(1000.0, 40.0, -2500.0)
+	w._apply_anchor_shift(A)
+
+	_ok(_vapprox(w.active_anchor_offset(), A, 1e-4), "G-P3-LIVE-ANCHOR offset accumulates the shift")
+	_ok(_veq(proxy.position, lat), "G-P3-LIVE-ANCHOR player-proxy LATTICE local untouched by shift")
+	_ok(_teq(debris.transform, debris_local_before), "G-P3-LIVE-ANCHOR debris LATTICE local untouched by shift")
+	_ok(_vapprox(proxy.global_transform.origin + w.active_anchor_offset(), proxy_abs_before, 1e-2),
+		"G-P3-LIVE-ANCHOR player-proxy ABSOLUTE pose (global+offset) invariant")
+	_ok(_vapprox(debris.global_transform.origin + w.active_anchor_offset(), debris_abs_before, 1e-2),
+		"G-P3-LIVE-ANCHOR debris ABSOLUTE pose (global+offset) invariant")
+	_ok(_vapprox(af.transform.origin, FacetAtlas.facet_transform(active_fid).origin - A, 1e-2),
+		"G-P3-LIVE-ANCHOR ActiveFrame origin slid by −A")
+	_ok(_veq(af.transform.basis.x, af_basis_before.x) and _veq(af.transform.basis.y, af_basis_before.y) and _veq(af.transform.basis.z, af_basis_before.z),
+		"G-P3-LIVE-ANCHOR ActiveFrame basis unchanged (pure translation)")
+	if pr != null:
+		_ok(_vapprox(pr.position, proot_before - A, 1e-2), "G-P3-LIVE-ANCHOR PlanetRoot slid by −A")
+	_ok(broke > 0 and block_before == BlockCatalog.AIR and w.block_id_at(edit_cell) == block_before,
+		"G-P3-LIVE-ANCHOR edit overlay intact across the shift (dug cell stays air, key unchanged)")
+	# The per-facet gravity volumes rode the shift (directions still correct after re-anchor).
+	_ok(_vapprox(w.gravity_direction_for_facet(active_fid), -FacetAtlas.facet_transform(active_fid).basis.y.normalized(), 1e-3),
+		"G-P3-LIVE-ANCHOR active gravity volume direction preserved across shift")
 	w.free()

@@ -53,6 +53,10 @@ var _gen_mwin: Array = [1, 0, 0, 1]
 # domain slab (§3.2 — no foreign block ever exists). A crossing = redesignate(): ONE PlanetRoot.transform write +
 # a view-distance rebalance; NO teardown, NO restream, NO new generator. All of it dormant unless FP_M1_POOL.
 var _planet_root: Node3D = null              # holds the FacetSlots; transform = T_active⁻¹ (rigid re-place on cross)
+# COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3): the accumulated floating-origin integer shift.
+# Under the fixed frame PlanetRoot pins @ (identity − _anchor_offset); a re-anchor (WorldManager) pushes shift_anchor()
+# to slide every FacetSlot/LOD tile back toward the render origin. ZERO (byte-identical) with the flag off.
+var _anchor_offset: Vector3 = Vector3.ZERO
 var _pool: Dictionary = {}                   # fid -> FacetSlot dict {terrain, slot, mesher, generator, spawn_ms, view, editable}
 var _pool_active := -1                        # the currently-active (editable, composite-identity) facet id
 # A1 CROSSING INSTRUMENTATION (#114): the last redesignate()'s attribution metrics, populated ONLY inside
@@ -1550,10 +1554,22 @@ func set_imminent_fid(fid: int) -> void:
 func _fixed_frame_on() -> bool:
 	return CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL
 
-## The PlanetRoot transform for `active_fid`: identity under the fixed frame (absolute scene frame), else the
-## shipped T_active⁻¹ that re-centres the active facet at the lattice origin.
+## The PlanetRoot transform for `active_fid`: identity (minus the re-anchor offset) under the fixed frame (absolute
+## scene frame), else the shipped T_active⁻¹ that re-centres the active facet at the lattice origin.
 func _planet_root_placement(active_fid: int) -> Transform3D:
-	return Transform3D.IDENTITY if _fixed_frame_on() else FacetAtlas.facet_transform(active_fid).affine_inverse()
+	return Transform3D(Basis.IDENTITY, -_anchor_offset) if _fixed_frame_on() else FacetAtlas.facet_transform(active_fid).affine_inverse()
+
+## COSMOS FP-FIXED-FRAME re-anchor (docs/COSMOS-FIXED-FRAME-DESIGN.md §3 / §10 decision 1) — slide PlanetRoot (hence
+## EVERY child FacetSlot AND the LOD-tile layer) by −A so the rendered planet-absolute coords stay near the origin
+## for large-planet f32 headroom. This is the ONE transform write that fires godot_voxel's NOTIFICATION_TRANSFORM_
+## CHANGED per-mesh-block re-place — ACCEPTED because a re-anchor fires FAR less often than a crossing (only when
+## |player_abs| > REANCHOR_TRIGGER_BLOCKS, i.e. never at R = 3072), so it is one rare re-place, never on the hot
+## crossing path. No-op unless the fixed frame is on and PlanetRoot exists (byte-identical off).
+func shift_anchor(a: Vector3) -> void:
+	if not _fixed_frame_on() or _planet_root == null:
+		return
+	_anchor_offset += a
+	_planet_root.position = -_anchor_offset
 
 func _pool_init_active() -> void:
 	_pool_active = TerrainConfig.active_facet()

@@ -471,6 +471,10 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			msg["facet_neighbours"] = int(world.call("facet_pool_neighbour_count"))
 		if world.has_method("stream_load_credit"):
 			msg["stream_credit"] = snappedf(float(world.call("stream_load_credit")), 0.001)
+		# COSMOS FP-FIXED-FRAME Phase-0 guard (§3): the max |player render-abs| seen — the f32-precision headroom
+		# signal that tells us whether a re-anchor is ever needed at the current R (0 unless the fixed frame is on).
+		if world.has_method("player_abs_max"):
+			msg["player_abs_max"] = snappedf(float(world.call("player_abs_max")), 0.1)
 		if world.has_method("lod_stats"):
 			var ls = world.call("lod_stats")
 			if ls is Dictionary and not (ls as Dictionary).is_empty():

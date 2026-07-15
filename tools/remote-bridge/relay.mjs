@@ -1,9 +1,20 @@
-// VOXIVERSE remote-play bridge — RELAY (Phase 1, OBSERVE-ONLY).
+// VOXIVERSE remote-play bridge — RELAY (Phase 1 observe + P1 control CORE).
 // ----------------------------------------------------------------------------------------------
 // A token-gated WebSocket server the GAME dials OUT to. It receives TELEMETRY (JSON text frames)
 // and FRAMES (binary: 1-byte type tag + JPEG) from a real-GPU play session and writes them to
-// files under results/remote/ that only the agent on this host reads. It NEVER serves the received
-// data publicly and NEVER sends anything back that the game acts on (Phase 1 is observe-only).
+// files under results/remote/ that only the agent on this host reads.
+//
+// P1 CONTROL CORE (this file) adds the agent→game command path WITHOUT enabling live control
+// (that is gated in the GAME client, P2/P4 — see docs/COSMOS-REMOTE-CONTROL-DESIGN.md §7). The
+// Phase-1 policy "the relay NEVER sends anything back that the game acts on" is REPLACED, not
+// weakened, by a strict rule (design §3.2):
+//
+//   The relay forwards to a game socket ONLY bytes that originate from a local file the host
+//   agent wrote into control/outbox/, and ONLY to a socket that is (a) token-authed AND (b) has an
+//   active control GRANT that the human in the game armed. Nothing a WS client sends is ever
+//   forwarded to another socket or reflected back — game-originated messages remain record-only.
+//   The relay itself never authors commands. Default is DENY: no outbox file + no grant => the
+//   game behaves EXACTLY as Phase-1 observe-only (byte-identical for a client that never grants).
 //
 // SECURITY MODEL (this sits behind nginx on a PUBLIC domain — see README.md §Security):
 //   * TOKEN AUTH. The shared secret comes from REMOTE_BRIDGE_TOKEN env or tools/remote-bridge/.token
@@ -16,16 +27,20 @@
 //     relay never terminates TLS and is never directly exposed.
 //   * The token is read from the hello frame (inside wss), never from the URL, so it stays out of
 //     nginx access logs.
+//   * COMMAND INGRESS IS THE HOST FILESYSTEM ONLY. The single trust anchor for control is write
+//     access to control/outbox/ on this host — no WS client, HTTP path, or game message can inject
+//     a command. Files are ingested atomically (act only on a fully-renamed *.json).
 //
 // Run:   REMOTE_BRIDGE_TOKEN=... node relay.mjs           (or drop the secret in ./.token)
-//        node relay.mjs --port 8090 --results ./results/remote
+//        node relay.mjs --port 8090 --results ./results/remote --control ./control
 //
 // Read (agent): results/remote/telemetry.jsonl  (append-only, capped)  and
 //               results/remote/frame-latest.jpg (most recent frame) + results/remote/frames/ (ring).
+//               control/results/<seq>/{ack.json,events.jsonl,done.json,shot-<id>-<label>.jpg}.
 
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
-import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync } from 'node:fs';
+import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync, existsSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -45,6 +60,14 @@ const FRAMES_DIR = join(RESULTS_DIR, 'frames');
 const TELEMETRY_FILE = join(RESULTS_DIR, 'telemetry.jsonl');
 const FRAME_LATEST = join(RESULTS_DIR, 'frame-latest.jpg');
 
+// Control (P1) sinks — see design §2.2. All gitignored (received/agent-written runtime data).
+const CONTROL_DIR = argOf('control', process.env.REMOTE_BRIDGE_CONTROL || join(HERE, 'control'));
+const OUTBOX_DIR = join(CONTROL_DIR, 'outbox');        // agent WRITES <seq>.json here (only command source)
+const SENT_DIR = join(CONTROL_DIR, 'sent');            // relay moves a forwarded file here (audit trail)
+const REJECTED_DIR = join(CONTROL_DIR, 'rejected');    // relay moves an invalid file here + <seq>.reject.txt
+const CONTROL_RESULTS_DIR = join(CONTROL_DIR, 'results'); // results/<seq>/{ack,events,done,shot}
+const AUDIT_LOG = join(CONTROL_DIR, 'audit.log');      // append-only: grants/forwards/rejects/revokes
+
 const AUTH_TIMEOUT_MS = 1500;        // a socket must send a valid hello within this SHORT window (anti-DoS)
 const MAX_CONNS = parseInt(process.env.REMOTE_BRIDGE_MAX_CONNS || '4', 10);   // AUTHED cap — never evicted
 const MAX_PENDING = parseInt(process.env.REMOTE_BRIDGE_MAX_PENDING || '8', 10); // unauthed pool; OLDEST evicted when full
@@ -56,7 +79,20 @@ const MAX_FRAME_BYTES = 2 * 1024 * 1024;   // reject a JPEG frame larger than 2 
 const TELEMETRY_CAP_BYTES = 32 * 1024 * 1024;  // roll telemetry.jsonl when it exceeds this
 const FRAME_RING = 60;               // keep the newest N frames in frames/ (older ones pruned)
 
-const FRAME_TAG = 0x01;              // must match RemoteBridge.FRAME_TAG on the game side
+const FRAME_TAG = 0x01;              // ambient frame  [0x01][jpeg]           — must match RemoteBridge.FRAME_TAG
+const SHOT_TAG = 0x02;               // commanded shot [0x02][u16 hlen][hdr][jpeg] — design §3.3
+
+// ── Control caps (design §1.3; validated here AND re-validated on the rover) ──────────────────
+const POLL_MS = parseInt(process.env.REMOTE_BRIDGE_POLL_MS || '500', 10);     // outbox poll cadence (fs.watch is unreliable on bind mounts)
+const CTRL_PING_MS = parseInt(process.env.REMOTE_BRIDGE_PING_MS || '5000', 10); // control heartbeat while granted
+const CTRL_MAX_MISSED_PINGS = 3;     // missed pongs while granted => drop consent (fail-safe to stop, §5.4)
+const MAX_STEPS = 64;                // steps per sequence
+const MAX_MOVE_BLOCKS = 128;         // move.blocks per step
+const MAX_TOTAL_DURATION_S = 180;    // Σ expected step time (watchdog outer bound)
+const MAX_CMD_BYTES = 16 * 1024;     // sequence JSON size
+const STALE_S = 120;                 // `issued` older than this => rejected (a delayed/re-sent file must not fire late)
+// Closed op whitelist (design §1.1 + resolved D5 full-agency set). Validation only routes in P1.
+const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot']);
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
 function loadToken() {
@@ -84,6 +120,7 @@ function tokenOk(candidate) {
 
 // ── Result sinks ───────────────────────────────────────────────────────────────────────────────
 mkdirSync(FRAMES_DIR, { recursive: true });
+for (const d of [OUTBOX_DIR, SENT_DIR, REJECTED_DIR, CONTROL_RESULTS_DIR]) mkdirSync(d, { recursive: true });
 
 function ts() { return new Date().toISOString(); }
 function log(...a) { console.log(`[relay ${ts()}]`, ...a); }
@@ -124,6 +161,391 @@ function pruneFrameRing() {
   } catch { /* dir vanished — fine */ }
 }
 
+// ── Control: audit + path safety ───────────────────────────────────────────────────────────────
+function audit(event, fields = {}) {
+  const parts = Object.entries(fields).map(([k, v]) => `${k}=${JSON.stringify(v)}`);
+  try { appendFileSync(AUDIT_LOG, `${ts()} ${event} ${parts.join(' ')}\n`); } catch (e) { log('audit write error:', e.message); }
+}
+
+// A seq/id used to build a filesystem path MUST be a strict, traversal-proof token — a rogue game
+// message can never escape control/results/. Anything else is refused (orphan-audited, never written).
+const SAFE_ID = /^[A-Za-z0-9._-]{1,120}$/;
+function safeId(s) { return typeof s === 'string' && SAFE_ID.test(s) && s !== '.' && s !== '..'; }
+
+// A results dir is only valid for a seq we FORWARDED (its dir exists) — this binds every downlink
+// result to a real, host-authored, consent-gated command and blocks arbitrary dir creation by the game.
+function resultsDirFor(seq) {
+  if (!safeId(seq)) return null;
+  const d = join(CONTROL_RESULTS_DIR, seq);
+  return existsSync(d) ? d : null;
+}
+
+function writeResult(seq, name, obj) {
+  const d = resultsDirFor(seq);
+  if (!d) { audit('result_orphan', { seq: String(seq).slice(0, 60), name }); return; }
+  const stamped = { ...obj, _rx: obj._rx || ts() };
+  const tmp = join(d, name + '.tmp');
+  try { writeFileSync(tmp, JSON.stringify(stamped)); renameSync(tmp, join(d, name)); }
+  catch (e) { log('result write error:', e.message); }
+}
+
+function appendEvent(seq, obj) {
+  const d = resultsDirFor(seq);
+  if (!d) { audit('event_orphan', { seq: String(seq).slice(0, 60), type: obj && obj.type }); return; }
+  try { appendFileSync(join(d, 'events.jsonl'), JSON.stringify({ ...obj, _rx: obj._rx || ts() }) + '\n'); }
+  catch (e) { log('event write error:', e.message); }
+}
+
+// ── Control: command validation (design §1) ──────────────────────────────────────────────────
+function rej(reason, detail) { return { ok: false, reason, detail, est: 0 }; }
+function okEst(est) { return { ok: true, est }; }
+
+// A break/place `target` is intentionally loosely specified in the design (D5). Accept the safe
+// shapes only: a [x,y,z] cell, the raycast sentinel "aim"/"look", or a small object — never a string
+// that could be interpreted elsewhere (the relay only routes; the rover re-validates against reach).
+function validTarget(t) {
+  if (typeof t === 'string') return t === 'aim' || t === 'look';
+  if (Array.isArray(t)) return t.length === 3 && t.every((n) => typeof n === 'number' && isFinite(n));
+  return typeof t === 'object' && t !== null;
+}
+
+function validateStep(st) {
+  switch (st.op) {
+    case 'move': {
+      if (typeof st.blocks !== 'number' || !(st.blocks > 0)) return rej('caps', 'move.blocks must be > 0');
+      if (st.blocks > MAX_MOVE_BLOCKS) return rej('caps', `move.blocks ${st.blocks} > ${MAX_MOVE_BLOCKS}`);
+      const heading = st.heading ?? 'forward';
+      if (!['forward', 'back', 'left', 'right'].includes(heading)) return rej('caps', `bad heading '${heading}'`);
+      const gait = st.gait ?? 'walk';
+      if (!['walk', 'run'].includes(gait)) return rej('caps', `bad gait '${gait}'`);
+      return okEst(st.blocks / (gait === 'run' ? 9.5 : 5.5));
+    }
+    case 'turn': {
+      if (typeof st.degrees !== 'number' || !(st.degrees > 0)) return rej('caps', 'turn.degrees must be > 0');
+      if (!['left', 'right'].includes(st.dir)) return rej('caps', `bad turn dir '${st.dir}'`);
+      return okEst(st.degrees / 120);
+    }
+    case 'look': {
+      if (st.pitch_deg !== undefined && (typeof st.pitch_deg !== 'number' || st.pitch_deg < -85 || st.pitch_deg > 85))
+        return rej('caps', 'look.pitch_deg out of [-85,85]');
+      if (st.yaw_deg !== undefined && typeof st.yaw_deg !== 'number') return rej('caps', 'look.yaw_deg not a number');
+      return okEst(Math.max(0.2, st.yaw_deg ? Math.abs(st.yaw_deg) / 120 : 0));
+    }
+    case 'wait': {
+      if (typeof st.seconds !== 'number' || !(st.seconds > 0) || st.seconds > 60) return rej('caps', 'wait.seconds must be in (0,60]');
+      return okEst(st.seconds);
+    }
+    case 'jump': return okEst(1.0);
+    case 'screenshot': {
+      if (st.label !== undefined && (typeof st.label !== 'string' || !/^[a-z0-9-]{0,40}$/.test(st.label)))
+        return rej('caps', 'screenshot.label must be [a-z0-9-]{0,40}');
+      return okEst(0.5);
+    }
+    case 'set_fly': {
+      if (typeof st.on !== 'boolean') return rej('caps', 'set_fly.on must be a bool');
+      return okEst(0.2);
+    }
+    case 'stop': return okEst(0.1);
+    case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
+      if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');
+      return okEst(0.5);
+    }
+    case 'place': {
+      if (st.block === undefined || (typeof st.block !== 'number' && typeof st.block !== 'string')) return rej('caps', 'place.block required');
+      if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'place.target invalid');
+      return okEst(0.5);
+    }
+    case 'select_slot': {
+      if (typeof st.n !== 'number' || !Number.isInteger(st.n) || st.n < 0 || st.n > 15) return rej('caps', 'select_slot.n out of range');
+      return okEst(0.1);
+    }
+    default: return rej('caps', `unhandled op '${st.op}'`); // unreachable — whitelist checked in validateCmd
+  }
+}
+
+function validateCmd(cmd) {
+  if (typeof cmd !== 'object' || cmd === null) return rej('bad_json', 'not an object');
+  if (cmd.type !== 'cmd_seq') return rej('bad_json', `type != cmd_seq ('${cmd.type}')`);
+  if (!safeId(cmd.seq)) return rej('bad_json', 'missing/invalid seq id');
+  if (typeof cmd.issued !== 'number' || !isFinite(cmd.issued)) return rej('bad_json', 'issued not a finite number');
+  const onFail = cmd.on_fail ?? 'abort';
+  if (onFail !== 'abort' && onFail !== 'continue') return rej('caps', `on_fail invalid '${onFail}'`);
+  if (cmd.preempt !== undefined && typeof cmd.preempt !== 'boolean') return rej('bad_json', 'preempt not a bool');
+  if (!Array.isArray(cmd.steps)) return rej('bad_json', 'steps not an array');
+  if (cmd.steps.length < 1) return rej('caps', 'no steps');
+  if (cmd.steps.length > MAX_STEPS) return rej('caps', `steps ${cmd.steps.length} > ${MAX_STEPS}`);
+  let est = 0;
+  for (let i = 0; i < cmd.steps.length; i++) {
+    const st = cmd.steps[i];
+    if (typeof st !== 'object' || st === null) return rej('bad_json', `step ${i} not an object`);
+    if (!OP_WHITELIST.has(st.op)) return rej('caps', `step ${i} op '${st.op}' not in whitelist`);
+    const e = validateStep(st);
+    if (!e.ok) return { ...e, detail: `step ${i}: ${e.detail}` };
+    est += e.est;
+  }
+  if (est > MAX_TOTAL_DURATION_S) return rej('caps', `est duration ${est.toFixed(1)}s > ${MAX_TOTAL_DURATION_S}`);
+  return { ok: true };
+}
+
+// ── Control: consent state machine + forward gate ─────────────────────────────────────────────
+const authedSockets = new Set();     // conn records for token-authed sockets
+const ingestedFiles = new Set();     // outbox filenames already processed (waiting or resolved) — avoids re-ingest
+const seenSeqs = new Set();          // seq ids seen this run (duplicate detection)
+const waiting = [];                  // validated commands awaiting a grant: {seq,text,file,issued,preempt}
+let inFlightSeq = null;              // the ONE sequence currently forwarded+running (exactly 1 in flight)
+let inFlightOwner = null;            // conn running inFlightSeq
+
+function activeGranted() {
+  for (const c of authedSockets) if (c.controlState === 'granted') return c;
+  return null;
+}
+
+function rejectFile(file, seq, reason, detail) {
+  const src = join(OUTBOX_DIR, file);
+  const base = safeId(seq) ? seq : String(file).replace(/\.json$/, '');
+  const dst = join(REJECTED_DIR, file);
+  try { renameSync(src, dst); } catch { try { unlinkSync(src); } catch { /* raced/gone */ } }
+  try { writeFileSync(join(REJECTED_DIR, `${base}.reject.txt`), `${ts()} reason=${reason} detail=${detail || ''}\n`); }
+  catch (e) { log('reject-reason write error:', e.message); }
+  ingestedFiles.delete(file);
+  audit('reject', { seq: seq || null, file, reason, detail: detail || '' });
+  log('REJECT outbox:', file, `[${reason}]`, detail || '');
+}
+
+// Offer control to any authed, ungranted socket so the human can arm a grant (design §6.1 step 1).
+function offerControlToAll(seq) {
+  for (const c of authedSockets) {
+    if (c.controlState === 'none' && !c.offerSent) {
+      c.offerSent = true;
+      try { c.ws.send(JSON.stringify({ type: 'control_offer', seq, t: Date.now() / 1000 })); } catch { /* ignore */ }
+      audit('offer', { peer: c.peer, seq });
+    }
+  }
+}
+
+function forward(entry, conn, preempted) {
+  const src = join(OUTBOX_DIR, entry.file);
+  const dst = join(SENT_DIR, entry.file);
+  try { renameSync(src, dst); } catch { /* may already be gone; forward is still authoritative */ }
+  ingestedFiles.delete(entry.file);
+  try { mkdirSync(join(CONTROL_RESULTS_DIR, entry.seq), { recursive: true }); } catch { /* ignore */ }
+  if (preempted && inFlightSeq && inFlightSeq !== entry.seq) {
+    // D3: the running sequence is aborted-and-replaced. Synthesize its terminal record for the agent.
+    writeResult(inFlightSeq, 'done.json', { type: 'seq_done', seq: inFlightSeq, status: 'aborted', reason: 'preempted', _rx: ts() });
+    audit('preempt', { new_seq: entry.seq, aborted_seq: inFlightSeq });
+  }
+  inFlightSeq = entry.seq;
+  inFlightOwner = conn;
+  try { conn.ws.send(entry.text); } catch (e) { log('forward send error:', e.message); }  // verbatim host bytes
+  audit('forward', { seq: entry.seq, peer: conn.peer, grant_id: conn.grantId, preempt: !!preempted });
+  log('FORWARD:', entry.seq, '->', conn.peer, preempted ? '(preempt)' : '');
+}
+
+// The single forward gate. DEFAULT-DENY: with no active grant a valid command WAITS (never forwards).
+function dispatchOrHold(entry) {
+  const wi = waiting.indexOf(entry); if (wi >= 0) waiting.splice(wi, 1);
+  const granted = activeGranted();
+  if (!granted) {
+    waiting.push(entry);
+    offerControlToAll(entry.seq);
+    audit('hold', { seq: entry.seq, reason: 'no_consent' });
+    log('HOLD (no consent):', entry.seq);
+    return;
+  }
+  if (inFlightSeq !== null) {
+    if (entry.preempt) forward(entry, granted, true);
+    else rejectFile(entry.file, entry.seq, 'busy', `seq '${inFlightSeq}' already in flight`);
+    return;
+  }
+  forward(entry, granted, false);
+}
+
+// Try to move held commands once a grant exists (FIFO). The first forwards; any further while one is
+// in flight resolve via the same gate (busy unless preempt).
+function flushWaiting() {
+  if (!activeGranted()) return;
+  for (const entry of waiting.slice()) {
+    if (waiting.indexOf(entry) < 0) continue;   // already resolved this pass
+    dispatchOrHold(entry);
+    if (!activeGranted()) break;
+  }
+}
+
+function failWaiting(reason, detail) {
+  for (const entry of waiting.slice()) {
+    const wi = waiting.indexOf(entry); if (wi >= 0) waiting.splice(wi, 1);
+    rejectFile(entry.file, entry.seq, reason, detail);
+  }
+}
+
+function sweepWaiting() {
+  const nowS = Date.now() / 1000;
+  for (const entry of waiting.slice()) {
+    if (nowS - entry.issued > STALE_S) {
+      const wi = waiting.indexOf(entry); if (wi >= 0) waiting.splice(wi, 1);
+      rejectFile(entry.file, entry.seq, 'no_consent', `waited past ${STALE_S}s staleness with no grant`);
+    }
+  }
+}
+
+function ingestFile(file) {
+  ingestedFiles.add(file);
+  const src = join(OUTBOX_DIR, file);
+  let raw;
+  try { raw = readFileSync(src); } catch { ingestedFiles.delete(file); return; }  // vanished/raced — retry next poll
+  if (raw.length > MAX_CMD_BYTES) { rejectFile(file, null, 'caps', `oversize ${raw.length}B > ${MAX_CMD_BYTES}`); return; }
+  let cmd;
+  try { cmd = JSON.parse(raw.toString('utf8')); } catch { rejectFile(file, null, 'bad_json', 'JSON parse error'); return; }
+  const v = validateCmd(cmd);
+  if (!v.ok) { rejectFile(file, cmd && cmd.seq, v.reason, v.detail); return; }
+  const seq = cmd.seq;
+  if (seenSeqs.has(seq)) { rejectFile(file, seq, 'duplicate', 'seq already seen this run'); return; }
+  if (Date.now() / 1000 - cmd.issued > STALE_S) { rejectFile(file, seq, 'stale', `issued ${(Date.now() / 1000 - cmd.issued).toFixed(0)}s ago > ${STALE_S}`); return; }
+  seenSeqs.add(seq);
+  dispatchOrHold({ seq, text: raw.toString('utf8'), file, issued: cmd.issued, preempt: cmd.preempt === true });
+}
+
+function pollOutbox() {
+  let files;
+  try { files = readdirSync(OUTBOX_DIR); } catch { return; }
+  for (const f of files) {
+    if (!f.endsWith('.json') || f.startsWith('.') || f.endsWith('.tmp') || ingestedFiles.has(f)) continue;
+    try { ingestFile(f); }
+    catch (e) { log('ingest error:', f, e.message); try { rejectFile(f, null, 'bad_json', 'ingest exception'); } catch { /* ignore */ } }
+  }
+  sweepWaiting();
+}
+
+// ── Control: heartbeat + grant lifecycle ─────────────────────────────────────────────────────
+function startHeartbeat(conn) {
+  stopHeartbeat(conn);
+  conn.missedPings = 0;
+  conn.heartbeat = setInterval(() => {
+    if (conn.ws.readyState !== conn.ws.OPEN) { stopHeartbeat(conn); return; }
+    if (conn.missedPings >= CTRL_MAX_MISSED_PINGS) {
+      audit('ping_timeout', { peer: conn.peer });
+      log('CONTROL ping timeout — dropping grant:', conn.peer);
+      revokeGrant(conn, 'link_lost');
+      return;
+    }
+    conn.missedPings++;                       // reset to 0 on each control_pong
+    try { conn.ws.send(JSON.stringify({ type: 'control_ping', t: Date.now() / 1000 })); } catch { /* ignore */ }
+  }, CTRL_PING_MS);
+}
+
+function stopHeartbeat(conn) {
+  if (conn.heartbeat) { clearInterval(conn.heartbeat); conn.heartbeat = null; }
+}
+
+// If a granted socket ends its grant while a sequence it owns is running, synthesize that sequence's
+// terminal record so the agent's loop always terminates (fail-safe-to-stop, §5.4).
+function abortInFlight(conn, status) {
+  if (inFlightOwner === conn && inFlightSeq) {
+    writeResult(inFlightSeq, 'done.json', { type: 'seq_done', seq: inFlightSeq, status, _rx: ts(), _synthesized: true });
+    audit('seq_end', { seq: inFlightSeq, status, synthesized: true });
+    inFlightSeq = null; inFlightOwner = null;
+  }
+}
+
+function revokeGrant(conn, reason) {
+  if (conn.controlState === 'none') { stopHeartbeat(conn); return; }
+  abortInFlight(conn, reason === 'link_lost' ? 'link_lost' : 'aborted');
+  conn.controlState = 'none'; conn.grantId = null; conn.offerSent = false;
+  stopHeartbeat(conn);
+  try { conn.ws.send(JSON.stringify({ type: 'control_revoke', reason })); } catch { /* ignore */ }
+  audit('revoke', { peer: conn.peer, reason });
+  log('CONTROL revoked:', conn.peer, `[${reason}]`);
+}
+
+function onControlState(conn, msg) {
+  const state = msg.state;
+  switch (state) {
+    case 'granted': {
+      const gid = typeof msg.grant_id === 'string' ? msg.grant_id : null;
+      // §5.2: most-recently-granted wins; supersede any other standing grant.
+      for (const c of authedSockets) if (c !== conn && c.controlState === 'granted') revokeGrant(c, 'superseded');
+      conn.controlState = 'granted'; conn.grantId = gid; conn.offerSent = false;
+      startHeartbeat(conn);
+      audit('grant', { peer: conn.peer, grant_id: gid });
+      log('CONTROL granted:', conn.peer, 'grant_id=', gid);
+      flushWaiting();
+      break;
+    }
+    case 'denied':
+      conn.controlState = 'none'; conn.grantId = null; conn.offerSent = false; stopHeartbeat(conn);
+      audit('deny', { peer: conn.peer });
+      log('CONTROL denied:', conn.peer);
+      failWaiting('no_consent', 'control denied by human');
+      break;
+    case 'revoked':
+      revokeGrant(conn, 'revoked');
+      break;
+    case 'override':
+      // D2: any local human input ENDS the grant. Forwarding suspends and NEVER silently resumes —
+      // a fresh `granted` is required. Held commands stay held (they wait for the re-grant).
+      audit('override', { peer: conn.peer, grant_id: conn.grantId });
+      log('CONTROL override — grant ended, re-consent required:', conn.peer);
+      abortInFlight(conn, 'user_override');
+      conn.controlState = 'none'; conn.grantId = null; conn.offerSent = false;
+      stopHeartbeat(conn);
+      break;
+    default:
+      audit('control_state_unknown', { peer: conn.peer, state: String(state).slice(0, 40) });
+  }
+}
+
+// Route a downlink text frame. Returns true if it was a recognized control event. Game-originated
+// messages are RECORD-ONLY — never forwarded to another socket or reflected back.
+function routeControlEvent(conn, obj) {
+  switch (obj.type) {
+    case 'control_state': onControlState(conn, obj); return true;
+    case 'control_pong': conn.missedPings = 0; return true;
+    case 'cmd_ack':
+      writeResult(obj.seq, 'ack.json', obj);
+      if (conn.grantId && obj.grant_id && obj.grant_id !== conn.grantId)
+        audit('grant_id_mismatch', { seq: obj.seq, got: String(obj.grant_id).slice(0, 40), want: conn.grantId });
+      audit('ack', { seq: obj.seq, steps: obj.steps });
+      return true;
+    case 'cmd_nack':
+      writeResult(obj.seq, 'ack.json', obj);
+      writeResult(obj.seq, 'done.json', { type: 'seq_done', seq: obj.seq, status: 'nack', reason: obj.reason, _rx: ts() });
+      if (inFlightSeq === obj.seq) { inFlightSeq = null; inFlightOwner = null; }
+      audit('nack', { seq: obj.seq, reason: obj.reason });
+      return true;
+    case 'step_start':
+    case 'step_done':
+      appendEvent(obj.seq, obj);
+      return true;
+    case 'seq_done':
+      appendEvent(obj.seq, obj);
+      writeResult(obj.seq, 'done.json', obj);
+      if (inFlightSeq === obj.seq) { inFlightSeq = null; inFlightOwner = null; }
+      audit('seq_done', { seq: obj.seq, status: obj.status });
+      return true;
+    default:
+      return false;   // telemetry etc. — already recorded to telemetry.jsonl by the caller
+  }
+}
+
+// A commanded screenshot: [0x02][u16 BE header_len][header JSON: {seq,id,label,t}][jpeg]. Written to
+// the correlated results dir AND refreshed as frame-latest.jpg (it is, after all, the latest frame).
+function handleShotFrame(data) {
+  if (data.length < 3) return;
+  const hlen = data.readUInt16BE(1);
+  if (data.length < 3 + hlen) return;
+  let hdr;
+  try { hdr = JSON.parse(data.subarray(3, 3 + hlen).toString('utf8')); } catch { return; }
+  const jpg = data.subarray(3 + hlen);
+  if (jpg.length < 2 || jpg[0] !== 0xff || jpg[1] !== 0xd8) return;         // JPEG magic
+  const d = resultsDirFor(hdr.seq);
+  if (!d) { audit('shot_orphan', { seq: String(hdr.seq).slice(0, 60) }); return; }
+  const idPart = safeId(String(hdr.id)) ? String(hdr.id) : 'x';
+  const labelPart = (typeof hdr.label === 'string' && /^[a-z0-9-]{1,40}$/.test(hdr.label)) ? hdr.label : 'shot';
+  try { writeFileSync(join(d, `shot-${idPart}-${labelPart}.jpg`), jpg); } catch (e) { log('shot write error:', e.message); }
+  try { writeFrame(jpg); } catch { /* frame-latest refresh is best-effort */ }
+  audit('shot', { seq: hdr.seq, id: idPart, label: labelPart, bytes: jpg.length });
+}
+
 // ── WS server (behind an http server so nginx can proxy_pass to it) ──────────────────────────────
 const httpServer = createServer((req, res) => {
   // Anything that is NOT a WS upgrade gets a bare 426 — the relay serves no content.
@@ -152,6 +574,8 @@ function ipRateOk(ip) {
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   const peer = ip + ':' + req.socket.remotePort;
+  // Per-connection control record. Inert until this socket both authenticates AND is granted control.
+  const conn = { ws, peer, ip, controlState: 'none', grantId: null, heartbeat: null, missedPings: 0, offerSent: false };
 
   // Optional Origin allow-list. WebSockets are NOT subject to CORS, so this is defense-in-depth only
   // (a native/dev client sends no Origin, so an unset ALLOWED_ORIGIN — the default — never blocks).
@@ -233,10 +657,11 @@ wss.on('connection', (ws, req) => {
       }
       authed = true;
       authedConns++;
+      authedSockets.add(conn);
       clearTimeout(authTimer);
       // App-level AUTH-ACK: the client withholds ALL telemetry + frame capture until it receives this,
       // so an unauthenticated visitor never reads back or streams a single frame (closes the brief
-      // pre-rejection capture window). It is also the handshake Phase-2 controls will ride.
+      // pre-rejection capture window). It is also the handshake the P1 controls ride.
       try { ws.send(JSON.stringify({ type: 'auth_ok' })); } catch { /* ignore */ }
       log('AUTH-OK:', peer, 'ver=', String(hello.ver || '?'), 'ua=', String(hello.ua || '?').slice(0, 80));
       return;
@@ -244,26 +669,46 @@ wss.on('connection', (ws, req) => {
 
     // ── Authenticated data ──────────────────────────────────────────────────────────────────
     if (isBinary) {
-      // Binary = a frame: [FRAME_TAG][jpeg...].
-      if (data.length < 2 || data[0] !== FRAME_TAG) return;  // unknown binary type — ignore
-      const jpg = data.subarray(1);
-      // Sanity: JPEG magic FF D8.
-      if (jpg.length < 2 || jpg[0] !== 0xff || jpg[1] !== 0xd8) return;
-      try { writeFrame(jpg); } catch (e) { log('frame write error:', e.message); }
-    } else {
-      // Text = telemetry JSON. Stamp with server receive time + peer, then append.
-      let obj;
-      try { obj = JSON.parse(data.toString('utf8')); } catch { return; }
-      obj._rx = ts();
-      obj._peer = peer;
-      try { writeTelemetry(obj); } catch (e) { log('telemetry write error:', e.message); }
+      if (data.length < 2) return;
+      if (data[0] === FRAME_TAG) {
+        // Ambient frame: [FRAME_TAG][jpeg...].
+        const jpg = data.subarray(1);
+        if (jpg.length < 2 || jpg[0] !== 0xff || jpg[1] !== 0xd8) return;  // JPEG magic FF D8
+        try { writeFrame(jpg); } catch (e) { log('frame write error:', e.message); }
+      } else if (data[0] === SHOT_TAG) {
+        // Commanded screenshot: [SHOT_TAG][u16 hlen][header][jpeg...].
+        try { handleShotFrame(data); } catch (e) { log('shot frame error:', e.message); }
+      }
+      // unknown binary tag — ignore
+      return;
     }
+
+    // Text = telemetry JSON. Stamp with server receive time + peer, append (Phase-1, UNCHANGED),
+    // then additionally route any recognized control event (record-only — never forwarded onward).
+    let obj;
+    try { obj = JSON.parse(data.toString('utf8')); } catch { return; }
+    obj._rx = ts();
+    obj._peer = peer;
+    try { writeTelemetry(obj); } catch (e) { log('telemetry write error:', e.message); }
+    try { routeControlEvent(conn, obj); } catch (e) { log('control route error:', e.message); }
   });
 
   ws.on('close', (code) => {
     clearTimeout(authTimer);
-    if (authed) authedConns = Math.max(0, authedConns - 1);
-    else pending.delete(ws);
+    if (authed) {
+      authedConns = Math.max(0, authedConns - 1);
+      authedSockets.delete(conn);
+      // Link loss fail-safe (§5.4): end any grant this socket held and terminate its in-flight seq.
+      if (conn.controlState !== 'none') {
+        abortInFlight(conn, 'link_lost');
+        audit('link_lost', { peer });
+        conn.controlState = 'none'; conn.grantId = null;
+      }
+      stopHeartbeat(conn);
+      // With no authed socket left, no one can consent — fail held commands rather than let them
+      // leak into a later, different session's grant (§5.4: fail queued files on socket loss).
+      if (authedSockets.size === 0) failWaiting('no_consent', 'authed socket closed; no consenter remains');
+    } else pending.delete(ws);
     log('DISCONNECT:', peer, 'code=', code, `(pending=${pending.size} authed=${authedConns})`);
   });
 
@@ -273,11 +718,22 @@ wss.on('connection', (ws, req) => {
 });
 
 httpServer.listen(PORT, HOST, () => {
-  log(`listening ws://${HOST}:${PORT}  results=${RESULTS_DIR}  cap=${MAX_CONNS}`);
+  log(`listening ws://${HOST}:${PORT}  results=${RESULTS_DIR}  control=${CONTROL_DIR}  cap=${MAX_CONNS}`);
   log('token loaded (' + TOKEN.length + ' chars). Waiting for the game to dial in.');
 });
 
+// Outbox poller — the ONLY command ingress (design §5.1). Polling (not fs.watch) because fs.watch is
+// unreliable on bind mounts, and 500 ms is ample for a half-duplex, latency-tolerant control loop.
+const outboxPoller = setInterval(pollOutbox, POLL_MS);
+
 // Clean shutdown.
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { log('shutting down on', sig); wss.close(); httpServer.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1000); });
+  process.on(sig, () => {
+    log('shutting down on', sig);
+    clearInterval(outboxPoller);
+    for (const c of authedSockets) stopHeartbeat(c);
+    wss.close();
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000);
+  });
 }

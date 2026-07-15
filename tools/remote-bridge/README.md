@@ -97,8 +97,14 @@ listening **before** you open the game with `?remote=<token>`.
 ### Loopback smoke test (no game/browser needed)
 
 ```bash
-npm run smoke      # boots the relay on a scratch port, drives a fake game client, asserts
-                   # telemetry.jsonl + frame-latest.jpg are written AND a bad token is rejected
+npm run smoke      # boots the relay on a scratch port and asserts, headless (no browser):
+                   #   PART A (observe): telemetry.jsonl + frame-latest.jpg written; bad token
+                   #     rejected (4001); authed sessions survive a pending flood.
+                   #   PART B (P1 control): a FAKE GAME client auths/grants/overrides/preempts and
+                   #     echoes ack/step/shot/seq_done — asserts a command is forwarded ONLY after a
+                   #     grant, NEVER without consent, results routed to control/results/<seq>/,
+                   #     override ends the grant, preempt aborts a run, and caps/oversize/garbage/
+                   #     stale/duplicate are rejected with a reason. Exits non-zero on any failure.
 node --check relay.mjs   # syntax only
 ```
 
@@ -117,6 +123,79 @@ Everything lands under `results/remote/` (gitignored):
 Telemetry field reference (all optional except `type`/`t`): `fps`, `min_fps`, `worst_ms`, `hitches`,
 `proc_ms`, `phys_ms`, `draws`, `prims`, `vmem_mb`, `objects`, `vox_gen`, `vox_mesh`, `vox_main`,
 `vox_gpu`, `pos` `[x,y,z]`, `facet`, `facet_neighbours`, `stream_credit`, `lod` `{…}`.
+
+---
+
+## P1 control channel (relay core — NOT yet live)
+
+The relay now also carries the **agent → game command path** (design
+`docs/COSMOS-REMOTE-CONTROL-DESIGN.md` §7 "P1"). This is the relay-side **core only**: it validates,
+consent-gates, forwards, and result-routes commands. **Live control is NOT enabled** — the game
+client does not yet receive, consent to, or execute commands (that is P2–P4, and the game's
+`CONTROL_ENABLED` flag is off). Against today's live observe-only rover, every new relay→game message
+is simply drained-and-discarded, so **deploying this relay is byte-identical for a client that never
+grants control**.
+
+### The one rule (Phase-1 policy inversion, design §3.2)
+
+> The relay forwards to a game socket **only** bytes that originate from a **local file the host
+> agent wrote into `control/outbox/`**, and **only** to a socket that is token-authed **and** has an
+> active human-armed control **grant**. Nothing a WS client sends is ever forwarded onward or
+> reflected back — game messages stay record-only. The relay never authors commands. **Default is
+> DENY:** no outbox file + no grant ⇒ the observe path behaves exactly as Phase 1.
+
+Command ingress is the **host filesystem only** — the single trust anchor. No WS client, HTTP path,
+or game message can inject a command.
+
+### File layout (all under `control/`, gitignored)
+
+```
+control/
+  outbox/          ← agent WRITES <seq>.json here (atomic temp+rename); the ONLY command source
+  sent/            ← relay moves a forwarded file here (audit trail)
+  rejected/        ← relay moves an invalid file here + <seq>.reject.txt (reason)
+  results/<seq>/   ← ack.json, events.jsonl, done.json, shot-<id>-<label>.jpg
+  audit.log        ← append-only: grant / forward / reject / revoke / override / seq_done …
+```
+
+### Uplink = one `cmd_seq` JSON file
+
+```jsonc
+{ "type": "cmd_seq", "seq": "walkabout-007", "issued": 1784500000.0,
+  "on_fail": "abort",            // "abort" (default) | "continue"
+  "preempt": false,              // true = abort-and-replace the running sequence (D3)
+  "steps": [ { "id": 1, "op": "move", "blocks": 10.5, "heading": "forward", "gait": "walk" },
+             { "id": 2, "op": "screenshot", "label": "ridge" }, { "id": 3, "op": "stop" } ] }
+```
+
+**Caps (rejected whole-sequence, design §1.3):** ≤ 64 steps, `move.blocks` ≤ 128, Σ expected step
+time ≤ 180 s, JSON ≤ 16 KiB, `issued` not older than 120 s. Ops are a **closed whitelist**:
+`move turn look wait jump screenshot set_fly stop break place select_slot` (D5 full-agency set) — any
+other op fails validation. Reject reasons written to `rejected/<seq>.reject.txt`: `bad_json`, `caps`,
+`stale`, `duplicate`, `busy`, `no_consent`.
+
+### Consent state machine (relay side)
+
+- The game arms control by sending `{"type":"control_state","state":"granted","grant_id":"…"}`;
+  the relay then forwards held/incoming commands to that socket. Exactly **one** sequence is in
+  flight; a second non-`preempt` command while one runs is rejected `busy`.
+- **`override`** (any local human input, D2) or **`revoked`**/**socket-close**/**3 missed
+  `control_ping`s** ends the grant. Forwarding **suspends and never silently resumes** — a fresh
+  `granted` is required. A command dropped while ungranted **waits** (it is offered via
+  `control_offer`) and is failed `no_consent` only if it goes stale or the last authed socket leaves.
+- Grant persists **until revoked** (D1 — no TTL). Most-recently-granted socket wins (§5.2).
+
+### Downlink results
+
+Game→relay events (`cmd_ack`/`cmd_nack`, `step_start`/`step_done`, `seq_done`) route to
+`control/results/<seq>/{ack.json, events.jsonl, done.json}`; a commanded screenshot arrives as a
+`0x02`-tagged binary frame (`[0x02][u16 hlen][{seq,id,label,t}][jpeg]`) written to
+`shot-<id>-<label>.jpg`. `seq`/`id`/`label` are strictly sanitized — a rogue game message cannot
+escape `control/results/`, and results are only written for a seq the relay actually forwarded.
+
+> **Not a deploy step.** This is code + headless test only. Live enablement (P4) requires the game
+> client (P2/P3), a `/steelman` pass, and a security review of the §5/§6 boundary — do not flip the
+> game's `CONTROL_ENABLED` before then.
 
 ---
 

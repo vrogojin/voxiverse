@@ -4,3 +4,5 @@ node_modules/
 package-lock.json
 results/
 *.log
+# P1 control channel — agent-written commands + game-written results are runtime data, not source.
+control/

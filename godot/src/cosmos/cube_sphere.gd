@@ -144,6 +144,18 @@ const CTRL_FRAME_SAMPLE_CLAMP_MS := 250.0
 const CTRL_WINDOW_PCTL := 0.9
 const POOL_D_COMMIT := 64.0
 
+## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
+## master toggle (the crossing-hitch fix). When true, the player + GroundCollider + loose VoxelBody debris live
+## under a new ActiveFrame Node3D whose transform is the active facet's true placement, so gameplay math stays in
+## the facet-local play frame while the physics server + renderer consume planet-absolute globals — and a crossing
+## becomes an O(1) node-transform swap instead of re-placing every loaded mesh block (the 200–772 ms stall).
+## PHASE 1 (this stage) is the FRAME-NEUTRAL refactor ONLY: ActiveFrame pins at IDENTITY and every global↔local
+## conversion routes through FrameAdapter, which is then a numeric no-op → byte-identical to today (flag on OR off).
+## Phase 2 flips ActiveFrame to T_active and skips the PlanetRoot write. Requires FACETED = true AND FP_M1_POOL =
+## true (decision 5; the FP-S1 teardown crossing stays the untouched fallback). Default OFF → byte-identical
+## (the ActiveFrame is never created, FrameAdapter is transparent); FLAT stays 6027/0. Flipped ON at export A/B.
+const FP_FIXED_FRAME := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

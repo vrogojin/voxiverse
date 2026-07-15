@@ -135,8 +135,10 @@ func break_cell(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> void:
 		return
 	var was_frozen := freeze          # captured so a settled/pristine body kicks on unfreeze
 	# Disturbance: wake dormant debris resting on/near this body's broken cell (dormant-by-default).
+	# FP-FIXED-FRAME (§2.3): wake_bodies_near is a LATTICE proximity test, so feed the broken cell's LATTICE point
+	# — this body's LOCAL transform under ActiveFrame (== global_transform when the frame is off / at identity).
 	if world != null:
-		world.wake_bodies_near(global_transform * Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), 6.0)
+		world.wake_bodies_near(transform * Vector3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), 6.0)
 	cells.erase(cell)
 	if cells.is_empty():
 		queue_free()
@@ -426,8 +428,10 @@ func _grounded(comp: Dictionary) -> bool:
 	if world == null:
 		return true
 	# 1) Fast analytic check: any cell at/below the terrain heightmap surface.
+	# FP-FIXED-FRAME (§2.3): surface_y is a LATTICE terrain query, so map cells through this body's LOCAL transform
+	# (its lattice pose under ActiveFrame; == global_transform when the frame is off / at identity → byte-identical).
 	for c: Vector3i in comp.keys():
-		var wp := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
+		var wp := transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
 		if wp.y <= world.surface_y(wp.x, wp.z) + 0.2:
 			return true
 	# 2) Analytic cell-below check (P0): for each exposed-underside cell, ask THE cell
@@ -439,7 +443,9 @@ func _grounded(comp: Dictionary) -> bool:
 	for c: Vector3i in comp.keys():
 		if comp.has(Vector3i(c.x, c.y - 1, c.z)):
 			continue                              # not an exposed underside cell
-		var base := global_transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
+		# FP-FIXED-FRAME (§2.3): cell_solid is a LATTICE terrain query → map through the body's LOCAL (lattice)
+		# transform, not global_transform (equal when the frame is off / at identity → byte-identical).
+		var base := transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
 		var below := Vector3i(floori(base.x), floori(base.y - 0.05), floori(base.z))
 		if world.cell_solid(below):
 			return true

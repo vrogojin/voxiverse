@@ -14,6 +14,10 @@ extends CharacterBody3D
 
 signal aimed_voxel_changed(info: Dictionary)
 
+# FP-FIXED-FRAME: preload the FrameAdapter (not the global class_name) so this core script parses without depending
+# on the editor class-cache (the FLM/FLB convention). Used as the type of `_frame` below.
+const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
+
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
 @export var fly_speed := 16.0
@@ -48,6 +52,13 @@ var flying := false
 ## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
 var frozen := false
 
+# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.3): the coordinate-frame adapter that bridges the
+# player's canonical LATTICE frame (its LOCAL transform under WorldManager's ActiveFrame) and the GLOBAL/absolute
+# frame the physics server + renderer consume. Every physics-boundary conversion below routes through it. Fetched
+# from `world` in _ready; never null (a transparent identity adapter when the fixed frame is off / in Phase 1), so
+# all the maps are numeric no-ops → byte-identical to today. Phase 2 rotates the frame with zero call-site change.
+var _frame: _FrameAdapterCls
+
 var _camera: Camera3D
 var _ray: RayCast3D
 var _capsule: CapsuleShape3D
@@ -57,6 +68,11 @@ var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
 
 func _ready() -> void:
+	# COSMOS FP-FIXED-FRAME: fetch the coordinate-frame adapter from the world (a transparent identity adapter when
+	# the fixed frame is off, so all conversions below are numeric no-ops). Fall back to a fresh identity adapter
+	# for a standalone player (no world) so the physics-boundary maps never dereference null.
+	_frame = world.frame_adapter() if world != null else _FrameAdapterCls.new()
+
 	# COSMOS M1 (§6.2): per-body gravity feel. `gravity`/`jump_velocity` are Earth-tuned feel
 	# constants (NOT 9.81); on another body they scale by g_body/9.81 so jump height and fall cadence
 	# track real surface gravity while preserving today's Earth feel. The analytic floor/wall/ceiling
@@ -207,7 +223,9 @@ func _physics_process(delta: float) -> void:
 	if frozen or world == null:
 		return
 	_move(delta)
-	world.update_streaming(global_position)
+	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
+	# when the frame is off / at identity). update_streaming feeds the collider/pool/streamer, all lattice consumers.
+	world.update_streaming(position)
 	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
 	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
 	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
@@ -226,7 +244,8 @@ func _physics_process(delta: float) -> void:
 	# Dormant until FP3b removes the FP2 ridge wall (which stops the player before the crossing threshold); the
 	# reframe is position-exact + upright (physics snaps yaw, camera eases the dihedral). FLAT/non-faceted: skip.
 	if CubeSphere.FACETED:
-		var cross := world.maybe_cross_facet(global_position)
+		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
+		var cross := world.maybe_cross_facet(position)
 		if not cross.is_empty():
 			apply_reframe(cross["new_pos"], cross["yaw_delta"])
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
@@ -260,7 +279,8 @@ func _move(delta: float) -> void:
 		var vy := 0.0
 		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
 		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
-		global_position += (wish + Vector3(0, vy, 0)) * speed * delta
+		# FP-FIXED-FRAME: `wish` is a LATTICE direction (local basis · input), so fly in the LATTICE (local) frame.
+		position += (wish + Vector3(0, vy, 0)) * speed * delta
 		_horiz_vel = wish * speed
 		velocity = Vector3.ZERO
 		return
@@ -274,22 +294,24 @@ func _move(delta: float) -> void:
 	# the player's vertical span there. Descending/flat ground has air ahead at feet
 	# level (not blocked), so movement stays free; only upward steps block, so going
 	# up requires a JUMP (intended — no auto-step).
-	var feet_y := global_position.y
+	# FP-FIXED-FRAME (§2.3): the analytic walls are axis-aligned LATTICE probes → run them on the LOCAL (lattice)
+	# position. `delta_move` is a lattice displacement (`wish` is a lattice direction). Byte-identical off / at identity.
+	var feet_y := position.y
 	var delta_move := wish * speed * delta
 	# Test each axis at the leading edge, AND at both perpendicular corners of the
 	# capsule (± radius), so a wall touching only one corner (or reached by a
 	# diagonal move) still stops us instead of letting the capsule clip through it.
 	if delta_move.x != 0.0:
-		var lead_x := global_position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x
-		if world.blocked(lead_x, global_position.z, feet_y) \
-				or world.blocked(lead_x, global_position.z - PLAYER_RADIUS, feet_y) \
-				or world.blocked(lead_x, global_position.z + PLAYER_RADIUS, feet_y):
+		var lead_x := position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x
+		if world.blocked(lead_x, position.z, feet_y) \
+				or world.blocked(lead_x, position.z - PLAYER_RADIUS, feet_y) \
+				or world.blocked(lead_x, position.z + PLAYER_RADIUS, feet_y):
 			delta_move.x = 0.0
 	if delta_move.z != 0.0:
-		var lead_z := global_position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z
-		if world.blocked(global_position.x, lead_z, feet_y) \
-				or world.blocked(global_position.x - PLAYER_RADIUS, lead_z, feet_y) \
-				or world.blocked(global_position.x + PLAYER_RADIUS, lead_z, feet_y):
+		var lead_z := position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z
+		if world.blocked(position.x, lead_z, feet_y) \
+				or world.blocked(position.x - PLAYER_RADIUS, lead_z, feet_y) \
+				or world.blocked(position.x + PLAYER_RADIUS, lead_z, feet_y):
 			delta_move.z = 0.0
 	# The surviving delta goes THROUGH the physics engine so we still collide with the
 	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces also
@@ -308,9 +330,11 @@ func _move(delta: float) -> void:
 	# Analytic gravity + floor. floor_under() scans down from the feet, so we can
 	# descend into pits/shafts and enter tunnels we've dug instead of being snapped
 	# back to the original surface.
+	# FP-FIXED-FRAME (§2.3): `velocity` stays our own LATTICE bookkeeping (never fed to move_and_slide), so gravity
+	# integration and the vertical floor/ceiling scans all run on the LOCAL (lattice) y — byte-identical at identity.
 	velocity.y -= gravity * delta
-	var prev_head_y := global_position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
-	global_position.y += velocity.y * delta
+	var prev_head_y := position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
+	position.y += velocity.y * delta
 
 	# Analytic CEILING (SWEPT + shape-aware): while rising, the head must not pass into
 	# a solid cell overhead (jump under a low ceiling and you bonk it, like a wall stops
@@ -324,13 +348,13 @@ func _move(delta: float) -> void:
 	# upward velocity. Descending/flat motion (velocity.y <= 0) is skipped, so standing
 	# and open-sky jumps behave exactly as before.
 	if velocity.y > 0.0:
-		var new_head_y := global_position.y + PLAYER_HEIGHT
+		var new_head_y := position.y + PLAYER_HEIGHT
 		var ceiling_y := _ceiling_under(prev_head_y, new_head_y)
 		if new_head_y > ceiling_y:
-			global_position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
+			position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
 			velocity.y = 0.0
 
-	var terrain_floor := world.floor_under(global_position.x, global_position.z, global_position.y)
+	var terrain_floor := world.floor_under(position.x, position.z, position.y)
 	var floor_y := terrain_floor
 
 	# Stand ON a detached voxel body directly under the feet instead of falling
@@ -339,14 +363,19 @@ func _move(delta: float) -> void:
 	var piece: VoxelBody = null
 	var piece_point := Vector3.ZERO
 	var space := get_world_3d().direct_space_state
+	# FP-FIXED-FRAME (§2.3): the stand-on ray runs in GLOBAL/physics space, so map the LATTICE feet endpoints out
+	# through the frame (T·(p±ŷ)); byte-identical at identity.
 	var rq := PhysicsRayQueryParameters3D.create(
-		global_position + Vector3(0, 0.05, 0), global_position + Vector3(0, -0.6, 0))
+		_frame.l2g_point(position + Vector3(0, 0.05, 0)),
+		_frame.l2g_point(position + Vector3(0, -0.6, 0)))
 	rq.collision_mask = WOOD_LAYER_MASK
 	rq.collide_with_bodies = true
 	rq.exclude = [get_rid()]
 	var rhit := space.intersect_ray(rq)
 	if not rhit.is_empty() and rhit.get("collider") is VoxelBody:
-		var piece_top: float = (rhit["position"] as Vector3).y
+		# Convert the GLOBAL hit back to LATTICE (T⁻¹·hit) to compare its height against the lattice terrain floor;
+		# piece_point stays GLOBAL for the apply_force contact offset below (physics space).
+		var piece_top: float = _frame.g2l_point(rhit["position"]).y
 		# Only stand on it when its top is at/above the terrain floor; otherwise the
 		# terrain wins and we ignore a piece that is really below the ground.
 		if piece_top >= terrain_floor:
@@ -354,8 +383,8 @@ func _move(delta: float) -> void:
 			piece_point = rhit["position"]
 			floor_y = maxf(terrain_floor, piece_top)
 
-	if global_position.y <= floor_y:
-		global_position.y = floor_y
+	if position.y <= floor_y:
+		position.y = floor_y
 		velocity.y = 0.0
 		if Input.is_key_pressed(KEY_SPACE):
 			velocity.y = jump_velocity
@@ -363,8 +392,10 @@ func _move(delta: float) -> void:
 	# While actually resting on the piece (not jumping off it), press the player's
 	# weight DOWN into the body at the CONTACT OFFSET (not its centre): a light piece
 	# can tip and a heavy one resists, so it holds us up instead of being launched.
-	if piece != null and global_position.y <= floor_y + 0.05 and velocity.y <= 0.0:
-		piece.apply_force(Vector3(0, -PLAYER_WEIGHT, 0),
+	# FP-FIXED-FRAME (§2.3): apply_force is GLOBAL/physics space — the weight direction is the facet-local down
+	# (−T.basis.y = l2g_dir of local −ŷ), and the contact offset is a global delta; byte-identical at identity.
+	if piece != null and position.y <= floor_y + 0.05 and velocity.y <= 0.0:
+		piece.apply_force(_frame.l2g_dir(Vector3(0, -PLAYER_WEIGHT, 0)),
 			piece_point - piece.global_transform.origin)
 
 ## Move horizontally against the wooden blocks with a single slide, so pillars are
@@ -382,18 +413,24 @@ func _move(delta: float) -> void:
 ## the movement intent `wish`. If the resolved displacement points against `wish`, we
 ## revert to where this tick began — the worst case is a clean stop, never a shove.
 func _move_horizontal(motion: Vector3, wish: Vector3) -> void:
+	# FP-FIXED-FRAME (§2.3): move_and_collide + the slide operate in GLOBAL/physics space, so map the LATTICE
+	# motion and wish out through the frame (T.basis·motion / T.basis·wish). The rubber-band dot-check then
+	# compares the GLOBAL displacement against the GLOBAL wish, and the revert restores the GLOBAL start x/z.
+	# All maps are the identity when the frame is off / at identity → byte-identical.
+	var motion_g := _frame.l2g_dir(motion)
+	var wish_g := _frame.l2g_dir(wish)
 	var start := global_position
-	var coll := move_and_collide(motion)
+	var coll := move_and_collide(motion_g)
 	if coll != null:
 		var slide := coll.get_remainder().slide(coll.get_normal())
 		move_and_collide(slide)
-	if wish.length_squared() > 0.0:
+	if wish_g.length_squared() > 0.0:
 		var moved := global_position - start
 		moved.y = 0.0
 		# A pure sideways slide has a ~0 along-wish component (kept); only a clearly
 		# backward net displacement is a rubber-band eject, which we undo. The epsilon
 		# tolerates float noise and legitimate corner slides.
-		if moved.dot(wish) < -0.001:
+		if moved.dot(wish_g) < -0.001:
 			global_position.x = start.x
 			global_position.z = start.z
 
@@ -406,8 +443,10 @@ func _move_horizontal(motion: Vector3, wish: Vector3) -> void:
 ## every cell in the head's vertical range (no tunneling) and reads the true occupied
 ## span (top-anchored slabs stop at their underside). No trimesh collision.
 func _ceiling_under(from_head_y: float, to_head_y: float) -> float:
-	var px := global_position.x
-	var pz := global_position.z
+	# FP-FIXED-FRAME (§2.3): ceiling_scan is a LATTICE query, and the y-bounds come from the lattice position — so
+	# probe on the LOCAL (lattice) x/z too (== global at identity → byte-identical).
+	var px := position.x
+	var pz := position.z
 	var r := PLAYER_RADIUS
 	var lo := world.ceiling_scan(px, pz, from_head_y, to_head_y)
 	lo = minf(lo, world.ceiling_scan(px - r, pz - r, from_head_y, to_head_y))
@@ -435,8 +474,14 @@ func _ceiling_under(from_head_y: float, to_head_y: float) -> float:
 ##   * wood    — the body's global_transform composed with that translation, so a
 ##               tumbling/rotating body carries the cube with it.
 func _current_target() -> Dictionary:
+	# FP-FIXED-FRAME (§2.3): the camera origin/dir are GLOBAL/absolute — used directly for the wood physics ray.
+	# The terrain DDA is a LATTICE query, so convert origin/dir into the lattice frame for world.aimed_voxel. The
+	# two hit distances are rigid-invariant (a rigid T preserves lengths), so the wood-vs-terrain contest compares
+	# them directly. All maps are the identity when the frame is off / at identity → byte-identical.
 	var origin := _camera.global_position
 	var dir := -_camera.global_transform.basis.z
+	var origin_lat := _frame.g2l_point(origin)
+	var dir_lat := _frame.g2l_dir(dir)
 
 	# Wooden block (physics ray vs the voxel-body colliders).
 	var wood_dist := INF
@@ -459,22 +504,24 @@ func _current_target() -> Dictionary:
 		var nl := (wood_body.global_transform.basis.inverse() * hit_n).normalized()
 		wood_normal = _dominant_axis(nl)
 
-	# Terrain (analytic voxel DDA in world space; DDA already reports the face).
+	# Terrain (analytic voxel DDA in LATTICE space; DDA already reports the face).
 	var terr_dist := INF
 	var terr_cell := Vector3i.ZERO
 	var terr_normal := Vector3i.ZERO
-	var info := world.aimed_voxel(origin, dir, break_reach)
+	var info := world.aimed_voxel(origin_lat, dir_lat, break_reach)
 	if info.get("hit", false):
-		terr_dist = origin.distance_to(info["position"])
+		terr_dist = origin_lat.distance_to(info["position"])   # lattice-space distance; rigid-invariant vs wood_dist
 		terr_cell = info["voxel"]
 		terr_normal = info["normal"]
 
 	# Nearest wins; ties go to wood (it is physically in front of the terrain).
 	if wood_body != null and wood_dist <= terr_dist:
+		# wood_body.global_transform is already GLOBAL → the cube xform is global.
 		var xf := wood_body.global_transform * Transform3D(Basis(), Vector3(wood_cell))
 		return {"kind": "wood", "body": wood_body, "cell": wood_cell, "normal": wood_normal, "xform": xf}
 	if terr_dist < INF:
-		var xf := Transform3D(Basis(), Vector3(terr_cell))
+		# The terrain cube xform is LATTICE → map it to GLOBAL so a (top_level) highlight consumes an absolute pose.
+		var xf := _frame.l2g_xform(Transform3D(Basis(), Vector3(terr_cell)))
 		return {"kind": "terrain", "body": null, "cell": terr_cell, "normal": terr_normal, "xform": xf}
 	return {"kind": "none", "body": null, "cell": Vector3i.ZERO, "normal": Vector3i.ZERO, "xform": Transform3D()}
 
@@ -549,10 +596,12 @@ func _try_place() -> void:
 ## column is still allowed.
 func _cell_intersects_player(cell: Vector3i) -> bool:
 	const EPS := 0.001
+	# FP-FIXED-FRAME (§2.3): `cell` is a LATTICE cell (from the terrain DDA), so test the player's AABB in the
+	# LOCAL (lattice) frame — byte-identical at identity.
 	var lo := Vector3(cell)
 	var hi := lo + Vector3.ONE
-	var pmin := global_position + Vector3(-PLAYER_RADIUS, 0.0, -PLAYER_RADIUS)
-	var pmax := global_position + Vector3(PLAYER_RADIUS, 1.8, PLAYER_RADIUS)
+	var pmin := position + Vector3(-PLAYER_RADIUS, 0.0, -PLAYER_RADIUS)
+	var pmax := position + Vector3(PLAYER_RADIUS, 1.8, PLAYER_RADIUS)
 	return pmin.x < hi.x - EPS and pmax.x > lo.x + EPS \
 		and pmin.y < hi.y - EPS and pmax.y > lo.y + EPS \
 		and pmin.z < hi.z - EPS and pmax.z > lo.z + EPS
@@ -577,11 +626,13 @@ func _push_bodies(delta: float) -> void:
 	var space := get_world_3d().direct_space_state
 	var q := PhysicsShapeQueryParameters3D.new()
 	q.shape = _capsule
-	q.transform = Transform3D(Basis(), global_position + Vector3(0, 0.9, 0))
+	# FP-FIXED-FRAME (§2.3): the shape query + push impulse are GLOBAL/physics space — map the LATTICE capsule pose
+	# (T·(p + 0.9ŷ)) and the push direction (T.basis·dir) out through the frame; `speed` is frame-invariant. Identity → no-op.
+	q.transform = _frame.l2g_xform(Transform3D(Basis(), position + Vector3(0, 0.9, 0)))
 	q.collision_mask = WOOD_LAYER_MASK
 	q.collide_with_bodies = true
 	q.exclude = [get_rid()]
-	var dir := _horiz_vel.normalized()
+	var dir := _frame.l2g_dir(_horiz_vel.normalized())
 	var speed := _horiz_vel.length()
 	for h in space.intersect_shape(q, 8):
 		var col: Object = h.get("collider")
@@ -591,8 +642,9 @@ func _push_bodies(delta: float) -> void:
 				body.apply_central_impulse(dir * push_force * delta)
 
 func _update_aim() -> void:
-	var origin := _camera.global_position
-	var dir := -_camera.global_transform.basis.z
+	# FP-FIXED-FRAME (§2.3): convert the GLOBAL camera origin/dir into the LATTICE frame for the terrain DDA.
+	var origin := _frame.g2l_point(_camera.global_position)
+	var dir := _frame.g2l_dir(-_camera.global_transform.basis.z)
 	var info := world.aimed_voxel(origin, dir, reach)
 	if info != _aimed:
 		_aimed = info
@@ -601,10 +653,11 @@ func _update_aim() -> void:
 func get_aimed() -> Dictionary:
 	return _aimed
 
-## World position of the air voxel at the player's head (for the air thermometer).
+## LATTICE position of the air voxel at the player's head (for the air thermometer — a per-voxel-environment
+## query, which is lattice). FP-FIXED-FRAME (§2.3): local == lattice under ActiveFrame; == global at identity.
 func head_position() -> Vector3:
-	return global_position + Vector3(0, eye_height, 0)
+	return position + Vector3(0, eye_height, 0)
 
-## World position just below the feet — the grass voxel the player stands on.
+## LATTICE position just below the feet — the grass voxel the player stands on (per-voxel-environment query).
 func ground_probe_position() -> Vector3:
-	return global_position - Vector3(0, 0.5, 0)
+	return position - Vector3(0, 0.5, 0)

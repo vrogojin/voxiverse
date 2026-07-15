@@ -1,5 +1,9 @@
 class_name WorldManager
 extends Node3D
+
+# FP-FIXED-FRAME: preload the FrameAdapter (not the global class_name) so this always-parsed core script never
+# depends on the stale editor class-cache (the same convention as FLM/FLB in verify_fp_m2). Used as a type below.
+const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
 ## Owns "the world": picks the rendering path, drives streaming, and exposes the
 ## analytic queries (solidity, surface height, voxel raycast) that the player and
 ## HUD use regardless of path. Also holds the decoupled sim layer (material
@@ -34,6 +38,13 @@ var _chart: CosmosChart = null
 var _streamer: ChunkStreamer          # fallback path
 var _module_world: Node3D             # godot_voxel path
 var _ground: GroundCollider           # local blocky physics collider
+# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.1) — the play-frame bridge. `_active_frame` is the
+# new ActiveFrame Node3D (@ identity in Phase 1) that hosts the player, GroundCollider and loose VoxelBody debris;
+# `_frame` is the FrameAdapter every physics-boundary conversion routes through. When FP_FIXED_FRAME is off both are
+# inert: `_active_frame` stays null, `_frame` is a transparent identity adapter, and `_frame_host()` returns self —
+# so the scene tree and every numeric result are byte-identical to today. Created in _ready().
+var _active_frame: Node3D = null
+var _frame: _FrameAdapterCls = null
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
@@ -172,10 +183,23 @@ func _ready() -> void:
 	if not using_module:
 		_setup_fallback_path()
 
-	# Local terrain physics collider (both render paths are collider-less).
+	# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7 P1): install the play-frame bridge. When the
+	# flag is on, ActiveFrame is a Node3D @ IDENTITY (Phase 1) that hosts the player, GroundCollider and loose
+	# VoxelBody debris; the FrameAdapter routes every physics-boundary conversion (a no-op at identity). When off,
+	# `_active_frame` stays null and `_frame` is a transparent identity adapter → the tree + numerics are unchanged.
+	_frame = _FrameAdapterCls.new()
+	if _fixed_frame_on():
+		_active_frame = Node3D.new()
+		_active_frame.name = "ActiveFrame"
+		# Phase 1: PINNED at identity (Phase 2 assigns FacetAtlas.facet_transform(active) here on setup + crossing).
+		add_child(_active_frame)
+	_frame.setup(_active_frame)
+
+	# Local terrain physics collider (both render paths are collider-less). Hosted under ActiveFrame when the fixed
+	# frame is on (its lattice-coord box shapes then acquire correct absolute globals through the parent, §4).
 	_ground = GroundCollider.new()
 	_ground.name = "GroundCollider"
-	add_child(_ground)
+	_frame_host().add_child(_ground)
 	_ground.setup(self)
 
 	# The snowfall sim reads/writes the SAME overlay + generation both render paths derive from, so it is
@@ -301,8 +325,31 @@ func _setup_fallback_path() -> void:
 	add_child(_streamer)
 	_streamer.setup(self)
 
+## COSMOS FP-FIXED-FRAME (§10 decision 5): the fixed frame is active only when its flag AND both prerequisites
+## are on (FACETED for a facet play frame, FP_M1_POOL for the redesignation crossing it replaces). Off ⇒ every
+## fixed-frame branch below is inert and the build is byte-identical.
+func _fixed_frame_on() -> bool:
+	return CubeSphere.FP_FIXED_FRAME and CubeSphere.FACETED and CubeSphere.FP_M1_POOL
+
+## The FrameAdapter every physics-boundary conversion routes through (player.gd fetches it). Never null after
+## _ready — a transparent identity adapter when the fixed frame is off.
+func frame_adapter() -> _FrameAdapterCls:
+	return _frame
+
+## The parent node for the player, GroundCollider and loose VoxelBody debris: the ActiveFrame when the fixed frame
+## is on, else this WorldManager (@ identity) exactly as today. THE single seam that makes every debris scan +
+## spawn frame-correct without touching their bodies.
+func _frame_host() -> Node3D:
+	return _active_frame if _active_frame != null else self
+
 ## Called once the player exists (module path attaches its VoxelViewer here).
 func on_player_ready(player: Node3D) -> void:
+	# COSMOS FP-FIXED-FRAME (§2.1/§7 P1): re-home the player under the ActiveFrame so its LOCAL transform is the
+	# facet-lattice pose while its GLOBAL transform (what physics + the renderer consume) comes out planet-absolute.
+	# reparent() preserves the global transform, and in Phase 1 ActiveFrame is @ identity so local == global (the
+	# spawn pose main.gd just set is unchanged to the bit). No-op when the fixed frame is off (player stays put).
+	if _active_frame != null and player.get_parent() != _active_frame:
+		player.reparent(_active_frame)
 	# COSMOS R2.2: install the frozen epoch bake frame + push it to the C++ near mesher BEFORE the viewer
 	# attaches (so the very first streamed block bakes to true geometry, not flat-window). Anchor at the
 	# player's spawn — place_true(anchor)=0, so epoch coords stay smallest around the player.
@@ -607,14 +654,14 @@ const _WAKE_RADIUS := 6.0
 ## Number of active loose VoxelBodies (debris) in the world.
 func active_body_count() -> int:
 	var n := 0
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody:
 			n += 1
 	return n
 
 ## True iff any loose VoxelBody exists at all (dormant or awake).
 func has_active_bodies() -> bool:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody:
 			return true
 	return false
@@ -622,7 +669,7 @@ func has_active_bodies() -> bool:
 ## Number of AWAKE (simulating) loose bodies — dormant (frozen / sleeping) debris is excluded.
 func awake_body_count() -> int:
 	var n := 0
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if c is VoxelBody and (c as VoxelBody).is_awake():
 			n += 1
 	return n
@@ -634,14 +681,16 @@ func awake_body_count() -> int:
 ## falling body keeps the collider active. A body's world column is its spawn cell offset by its
 ## rigid-body displacement (global_position), so a dropping/shoved body is tracked cheaply.
 func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or not vb.is_awake():
 			continue                        # emptied (mid-free) or DORMANT → does not hold the collider on
 		var home := _body_home_column(vb)
-		var gp := vb.global_position
+		# FP-FIXED-FRAME (§2.3): the collider gate is a LATTICE-column test; a debris body's lattice pose is its
+		# LOCAL transform under ActiveFrame (== global_position when off / at identity → byte-identical).
+		var gp := vb.position
 		var wx := home.x + int(floor(gp.x))
 		var wz := home.y + int(floor(gp.z))
 		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
@@ -654,14 +703,15 @@ func has_active_bodies_near(center: Vector2i, radius: int) -> bool:
 ## rather than on the player, so a small core reliably covers the body that needs ground. Mirrors the
 ## body-tracking of has_active_bodies_near exactly (same awake/home-column logic).
 func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or not vb.is_awake():
 			continue
 		var home := _body_home_column(vb)
-		var gp := vb.global_position
+		# FP-FIXED-FRAME (§2.3): lattice column of the body = its LOCAL pose under ActiveFrame (see above).
+		var gp := vb.position
 		var wx := home.x + int(floor(gp.x))
 		var wz := home.y + int(floor(gp.z))
 		if maxi(absi(wx - center.x), absi(wz - center.y)) <= radius:
@@ -674,13 +724,16 @@ func active_body_column_near(center: Vector2i, radius: int) -> Vector2i:
 ## terrain/body edit; comprehensive so a body can never be left floating with its support removed.
 func wake_bodies_near(p: Vector3, radius: float) -> void:
 	var r2 := radius * radius
-	for c in get_children():
+	for c in _frame_host().get_children():   # FP-FIXED-FRAME: debris live under ActiveFrame when on, else self
 		if not (c is VoxelBody):
 			continue
 		var vb := c as VoxelBody
 		if vb.cells.is_empty() or vb.is_awake():
 			continue                        # already awake → nothing to do
-		var xf := vb.global_transform
+		# FP-FIXED-FRAME (§2.3): compare the disturbance point `p` (a LATTICE point — WM callers pass a lattice
+		# cell centre; VoxelBody.break_cell now passes `transform * cell`) against the body's cells in its LATTICE
+		# frame, i.e. its LOCAL transform under ActiveFrame (== global_transform when off / at identity).
+		var xf := vb.transform
 		for k: Vector3i in vb.cells:
 			var wp: Vector3 = xf * Vector3(k.x + 0.5, k.y + 0.5, k.z + 0.5)
 			if wp.distance_squared_to(p) <= r2:
@@ -1264,7 +1317,10 @@ func m5c_glue_bodies() -> void:
 	if _chart == null or not CubeSphere.M5C_CORNER:
 		return
 	var n := _chart.n
-	for ch in get_children():
+	# FP-FIXED-FRAME: scan under the debris host for consistency. This path is chart-gated (M5c, curved-only) and
+	# the fixed frame requires FACETED (⇒ chart null), so it never runs with the frame on — but routing through the
+	# host keeps a single debris-parent seam. Debris stay under WM@identity here, so global_position is unchanged.
+	for ch in _frame_host().get_children():
 		if not (ch is VoxelBody):
 			continue
 		var vb := ch as VoxelBody
@@ -2264,7 +2320,10 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 			comp_ids[c] = CellCodec.with_state(cv, CellCodec.state(cv) & ~CellCodec.STATE_SNOW_CAPPED)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
-		VoxelBody.spawn_loose(self, comp_ids, self, from_pos)
+		# FP-FIXED-FRAME (§5): parent collapse debris under the ActiveFrame host (else self, @ identity) so it rides
+		# the play frame; the world_ref stays this WorldManager. At identity (Phase 1) the body's global pose is
+		# unchanged (spawn_loose sets global_transform = IDENTITY, and ActiveFrame is identity) → byte-identical.
+		VoxelBody.spawn_loose(_frame_host(), comp_ids, self, from_pos)
 
 # --- per-joint reinforcement (STRUCTURAL-INTEGRITY §4.2/§7) ---------------------
 

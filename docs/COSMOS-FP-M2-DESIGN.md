@@ -520,6 +520,14 @@ of actual job times (so WASM/native and fast/slow machines converge without conf
 
 ### 6.5 The load-adaptive admission controller (closed loop, first-class)
 
+> **AMENDED 2026-07-15** by `docs/COSMOS-FP-M2-CONTROLLER-FIX.md`: live telemetry proved
+> the credit pinned at 0 for an entire session (the §6.5.1 `TIME_PROCESS` signal is
+> invalid on the threaded web export, and the max-of-window statistic is unrecoverable in
+> a browser), starving all four surfaces — zero LOD facets, zero promotes. The fix:
+> measured frame-delta sensor + window-p90 statistic + a `CTRL_RELIEF_FLOOR` on surfaces
+> 1–2 + a geometric `POOL_D_COMMIT` for the imminent promote. Read that doc before
+> changing anything in this section.
+
 The budgeter's per-tick grant volume is not a fixed const — it is the control action of a
 **closed-loop controller on measured main-thread load** (the user's directive: replace
 low-res neighbour terrain with high-res *gradually*, "constantly measuring main thread
@@ -1016,6 +1024,11 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
     (d) *Fighting the FP-M1c one-slot-per-frame ramp serializer*: it composes — the
     serializer bounds WHICH slot grows per frame, the pace scalar bounds HOW MUCH; both
     only reduce work; asserted byte-identical at flag-off (G-M2-CTRL(f)).
+    **(a) CAME TRUE and its acceptance is OVERTURNED** — the 2026-07-15 live session hit
+    exactly this starvation (from boot, on every web machine, via the broken sensor +
+    the unattainable max-statistic setpoint), and the "could not have afforded it anyway"
+    reasoning is wrong: the imminent neighbour's cost is unavoidable and deferral just
+    moves it to the seam. See `docs/COSMOS-FP-M2-CONTROLLER-FIX.md` §1.5.
 
 ---
 
@@ -1031,3 +1044,4 @@ Every stage exits through the §12 unconditional gates. Revert at any stage = th
 | 6 | FP-M2 tier reach | ℓ∈{1..3} + quad; ℓ∈{4,5} + zoom input + distant-planet math are FP-M3 (machinery ready) |
 | 7 | Fixed-schedule streaming pace (FP-M1c `RAMP_SECONDS` legs, fixed const budgets) | **Superseded** — closed-loop admission on measured main-thread load (§6.5); `RAMP_SECONDS` becomes the *minimum* leg duration, stretched (never compressed below it) by the controller; fixed consts remain as the hard upper bounds the credit scales within |
 | 8 | LOD↔LOD erosion hairline as an accepted artifact (this doc's first revision) | **Rejected by the user** — designed out: the ridge apron (§7.4) is PRIMARY M2b scope; the remaining accepted-artifact set is (b) transient promote/demote megablock overlap and (c) player edits invisible/healed at LOD distance |
+| 9 | One AIMD credit gates all four §6.5.3 surfaces; §14.10(a) starvation accepted as honest degradation | **Overturned 2026-07-15** — live telemetry: credit pinned 0 all session (sensor invalid on web + max-statistic unrecoverable), M2 fully inert. Relief surfaces floored + imminent promote made geometric inside `POOL_D_COMMIT`; see `docs/COSMOS-FP-M2-CONTROLLER-FIX.md` |

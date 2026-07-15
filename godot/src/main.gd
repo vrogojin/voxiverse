@@ -83,6 +83,16 @@ func _ready() -> void:
 	activator.configure(world, player, RemoteBridge.preset_token())
 	add_child(activator)
 
+	# REMOTE-CONTROL P2 (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4/§7). The RemoteControl executor
+	# (net/remote_control.gd) is deliberately NOT a persistent scene node: RemoteBridge instantiates it
+	# ONLY after the human consents in-game and frees it on revoke/override/link-loss ("dead in normal
+	# play", §4.1). The control graph is therefore owned by the activator+bridge wired just above —
+	# main.gd only records the master gate. Guarded by RemoteBridge.CONTROL_ENABLED (default false → this
+	# block is skipped, byte-identical Phase-1); P4 flips the flag ONLY after the §6 security review +
+	# /steelman + sign-off. A parallel Track-B edit to the scene wiring merges cleanly around this block.
+	if RemoteBridge.CONTROL_ENABLED:
+		print("[REMOTE] P2 control ENABLED — executor is bridge-spawned on human consent (net/remote_control.gd)")
+
 	# Load-time shader/material PIPELINE pre-warm (RENDER-STREAMING-SPIKES). The GL
 	# Compatibility renderer compiles each material pipeline synchronously on the main
 	# thread the first time it is DRAWN, so on a real device every distinct look

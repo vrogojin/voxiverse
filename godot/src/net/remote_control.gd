@@ -508,6 +508,10 @@ func _trigger_override() -> void:
 	override_triggered.emit()                      # bridge sends control_state:override + ends/suspends the grant
 	if _running:
 		abort("user_override")                     # zero intent + emit step_done/seq_done user_override
+	# F5: never hand the controls back mid-air. If the agent had toggled fly on, drop it so the human's
+	# takeover starts from normal grounded locomotion rather than a lingering remote-set fly state.
+	if is_instance_valid(player) and bool(_player_get("flying", false)) and player.has_method("remote_set_fly"):
+		player.call("remote_set_fly", false)
 
 
 ## Arming gate: ANY input (incl. Esc) keeps us un-armed, so we only arm once the console is idle.

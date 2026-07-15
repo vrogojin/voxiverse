@@ -382,7 +382,7 @@ func _close_consent() -> void:
 # observe secret; the storage KEY is a non-reversible hash of the token so the secret isn't there
 # either. On web this is real localStorage via JavaScriptBridge; native/dev uses an in-memory field. ──
 func _ls_key(token: String) -> String:
-	return "vxv_unattended_%d" % hash(token)
+	return "vxv_unattended_" + token.sha256_text().substr(0, 16)   # non-reversible key namespace (F3), never the secret
 
 
 func _js_str(s: String) -> String:
@@ -410,11 +410,26 @@ func _clear_unattended() -> void:
 	JavaScriptBridge.eval("localStorage.removeItem(%s)" % _js_str(_ls_key(_active_token)), true)
 
 
+## F3: an opaque per-grant id (grant_id / unattended_id). CSPRNG-seeded — never the non-crypto `randi()`
+## — and bound to a HASH of the observe token (never the raw secret), so it is unique per session and not
+## derivable from the token alone. It is an opaque correlator echoed on cmd_ack, NOT a relay-held secret
+## (the relay gates grants via the minted nonce + human consent — see §6.6 same-origin model).
 func _gen_id() -> String:
-	var s := ""
-	for i in 8:
-		s += "%02x" % (randi() & 0xFF)
-	return s
+	var rnd := _csprng_hex(16)
+	var tok_hash := _active_token.sha256_text()
+	return (rnd + tok_hash).sha256_text().substr(0, 32)
+
+
+## CSPRNG hex string of `n` random bytes. Web: the browser crypto.getRandomValues; native/dev: Godot's
+## Crypto (mbedTLS). Falls back to Crypto if the JS eval is unavailable for any reason.
+func _csprng_hex(n: int) -> String:
+	if OS.has_feature("web"):
+		var js := "(function(){var a=new Uint8Array(%d);crypto.getRandomValues(a);" % n \
+			+ "return Array.prototype.map.call(a,function(b){return ('0'+b.toString(16)).slice(-2)}).join('')})()"
+		var v = JavaScriptBridge.eval(js, true)
+		if v != null and str(v).length() >= n * 2:
+			return str(v)
+	return Crypto.new().generate_random_bytes(n).hex_encode()
 
 
 # ── On-canvas token prompt (token ONLY — never a URL) ─────────────────────────────────────────────

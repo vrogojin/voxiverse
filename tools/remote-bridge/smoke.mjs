@@ -80,7 +80,13 @@ function makeFakeGame(tag) {
   const g = {
     ws: null, authed: false, received: [], offers: [], pings: 0, revokes: [],
     autoRun: true, holdSeq: null,   // holdSeq: a seq to ACK but NOT finish (simulate a long run)
-    grant(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag) })); },
+    lastNonce: '',                  // F1: the relay-minted grant_nonce from the most recent control_offer
+    answerPings: true,              // F2: set false to stop ponging → trip the relay's ping-timeout revoke
+    sendRaw(obj) { g.ws.send(JSON.stringify(obj)); },
+    // A proper grant ECHOES the minted nonce (F1) — the real game does this from control_offer.
+    grant(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: g.lastNonce })); },
+    grantRaw(grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag) })); },           // NO nonce → must be refused
+    grantWithNonce(nonce, grantId) { g.ws.send(JSON.stringify({ type: 'control_state', state: 'granted', grant_id: grantId || ('gid-' + tag), grant_nonce: nonce })); },
     deny() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'denied' })); },
     override() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'override' })); },
     revoke() { g.ws.send(JSON.stringify({ type: 'control_state', state: 'revoked' })); },
@@ -118,8 +124,8 @@ function makeFakeGame(tag) {
       let m; try { m = JSON.parse(data.toString('utf8')); } catch { return; }
       switch (m.type) {
         case 'auth_ok': if (!g.authed) { g.authed = true; clearTimeout(timer); resolve(g); } break;
-        case 'control_offer': g.offers.push(m.seq); break;
-        case 'control_ping': g.pings++; ws.send(JSON.stringify({ type: 'control_pong', t: Date.now() / 1000 })); break;
+        case 'control_offer': g.offers.push(m.seq); g.lastNonce = m.grant_nonce || ''; break;   // F1: capture the minted nonce
+        case 'control_ping': g.pings++; if (g.answerPings) ws.send(JSON.stringify({ type: 'control_pong', t: Date.now() / 1000 })); break;
         case 'control_revoke': g.revokes.push(m.reason); break;
         case 'cmd_seq': g.received.push(m); if (g.autoRun) runSeq(m); break;
         default: break;
@@ -297,9 +303,9 @@ async function main() {
     {
       const game = await makeFakeGame('override');
       await sleep(200);
-      game.grant();
-      await sleep(200);
       dropOutbox(mkCmd('ovr-first', [{ id: 1, op: 'wait', seconds: 0.1 }, { id: 2, op: 'stop' }]));
+      await waitFor(() => game.offers.includes('ovr-first'), 4000);   // relay offers control (mints the nonce)
+      game.grant();                                                    // echo the minted nonce (F1)
       await waitFor(() => existsSync(join(CTRL_RESULTS, 'ovr-first', 'done.json')), 4000);
       ok(gotSeq(game, 'ovr-first'), 'B(c) first command forwarded under the grant');
       // Human touches a key: override ends the grant.
@@ -309,7 +315,8 @@ async function main() {
       await sleep(1000);
       ok(!gotSeq(game, 'ovr-second'), 'B(c) after override: second command NOT forwarded (grant ended)');
       ok(!existsSync(join(SENT, 'ovr-second.json')), 'B(c) second command not in sent/ (held, awaiting re-consent)');
-      // Fresh consent: the held command now flushes.
+      // Fresh consent: the relay re-offered (fresh nonce); the held command now flushes.
+      await waitFor(() => game.offers.includes('ovr-second'), 4000);
       game.grant();
       await waitFor(() => gotSeq(game, 'ovr-second'), 4000);
       ok(gotSeq(game, 'ovr-second'), 'B(c) after RE-grant: held command forwarded');
@@ -325,9 +332,9 @@ async function main() {
       game.autoRun = true;
       game.holdSeq = 'run-long';        // ack but never finish run-long => it stays in flight
       await sleep(200);
-      game.grant();
-      await sleep(200);
       dropOutbox(mkCmd('run-long', [{ id: 1, op: 'wait', seconds: 30 }]));
+      await waitFor(() => game.offers.includes('run-long'), 4000);   // relay offers control (mints the nonce)
+      game.grant();                                                  // echo the minted nonce (F1)
       await waitFor(() => gotSeq(game, 'run-long'), 4000);
       ok(gotSeq(game, 'run-long'), 'B(d) long-running seq forwarded and in flight');
       // A non-preempt seq while one is in flight => busy reject, never forwarded.
@@ -351,9 +358,14 @@ async function main() {
     {
       const game = await makeFakeGame('reject');
       await sleep(200);
-      game.grant();      // even WITH a grant, invalid commands must be rejected (never forwarded)
-      await sleep(200);
+      // Establish a grant the F1 way: a valid priming command triggers an offer (+ minted nonce), then grant.
+      dropOutbox(mkCmd('rej-prime', [{ id: 1, op: 'stop' }]));
+      await waitFor(() => game.offers.includes('rej-prime'), 4000);
+      game.grant();
+      await waitFor(() => existsSync(join(CTRL_RESULTS, 'rej-prime', 'done.json')), 4000);
+      ok(gotSeq(game, 'rej-prime'), 'B(e) priming command established the grant');
 
+      // Even WITH a grant, invalid commands must be rejected (never forwarded).
       dropRawOutbox('rej-garbage', Buffer.from('this is not json at all {{{'));
       dropOutbox({ type: 'cmd_seq', seq: 'rej-badop', issued: Date.now() / 1000, steps: [{ id: 1, op: 'launch_missiles' }] });
       dropOutbox(mkCmd('rej-toomany', Array.from({ length: 65 }, (_, i) => ({ id: i, op: 'stop' }))));
@@ -387,6 +399,91 @@ async function main() {
       await sleep(300);
     }
 
+    // ── B(g) F1: a grant must echo the relay-MINTED nonce (no nonce / wrong nonce ⇒ refused) ───
+    console.log('\n── PART B(g): F1 — a grant requires the relay-minted nonce ──');
+    {
+      const game = await makeFakeGame('nononce');
+      await sleep(200);
+      // Claim control BEFORE any offer exists → the relay minted no nonce for this socket → refused.
+      game.grantRaw();
+      await sleep(300);
+      dropOutbox(mkCmd('f1-nononce', [{ id: 1, op: 'wait', seconds: 0.1 }, { id: 2, op: 'stop' }]));
+      await sleep(900);
+      ok(!gotSeq(game, 'f1-nononce'), 'B(g) grant with NO minted nonce refused → command NOT forwarded');
+      ok(!existsSync(join(SENT, 'f1-nononce.json')), 'B(g) command not moved to sent/ (never forwarded)');
+      ok(existsSync(join(OUTBOX, 'f1-nononce.json')), 'B(g) command HELD, still awaiting a valid grant');
+      ok(game.offers.includes('f1-nononce'), 'B(g) relay offered control (minted a fresh nonce) for the held command');
+      // A wrong/guessed nonce is likewise refused.
+      game.grantWithNonce('deadbeefdeadbeefdeadbeefdeadbeef');
+      await sleep(500);
+      ok(!gotSeq(game, 'f1-nononce'), 'B(g) grant with a WRONG nonce refused → still not forwarded');
+      // Echoing the REAL minted nonce now grants and flushes the held command.
+      game.grant();
+      await waitFor(() => gotSeq(game, 'f1-nononce'), 4000);
+      ok(gotSeq(game, 'f1-nononce'), 'B(g) grant echoing the CORRECT minted nonce forwarded the held command');
+      ok(existsSync(join(SENT, 'f1-nononce.json')), 'B(g) valid-nonce grant moved the file to sent/');
+      game.close();
+      await sleep(300);
+    }
+
+    // ── B(h) F1: a 2nd authed socket cannot steal a standing grant nor forge results ────────────
+    console.log('\n── PART B(h): F1 — a 2nd socket cannot steal control or poison results ──');
+    {
+      const legit = await makeFakeGame('legit');
+      const attacker = await makeFakeGame('attacker');
+      attacker.autoRun = false;                 // attacker forges by hand (never auto-runs a forwarded seq)
+      legit.holdSeq = 'f1-run';                  // legit acks but never finishes → seq stays in flight
+      await sleep(200);
+      dropOutbox(mkCmd('f1-run', [{ id: 1, op: 'wait', seconds: 30 }]));
+      // Both authed sockets receive an offer (each with its OWN nonce). Legit grants first.
+      await waitFor(() => legit.offers.includes('f1-run') && attacker.offers.includes('f1-run'), 4000);
+      legit.grant();
+      await waitFor(() => gotSeq(legit, 'f1-run'), 4000);
+      ok(gotSeq(legit, 'f1-run'), 'B(h) legit socket holds the grant + the in-flight seq');
+      ok(!gotSeq(attacker, 'f1-run'), 'B(h) attacker never received the forwarded seq');
+      // Attacker tries to STEAL control by granting with its OWN valid minted nonce → no-supersede refuses it.
+      attacker.grant();
+      await sleep(500);
+      // Attacker forges downlink RESULTS for legit's in-flight seq → dropped by per-socket ownership.
+      attacker.sendRaw({ type: 'step_done', seq: 'f1-run', id: 99, op: 'wait', status: 'ok', t: Date.now() / 1000 });
+      attacker.sendRaw({ type: 'seq_done', seq: 'f1-run', status: 'ok', completed: 1, t: Date.now() / 1000 });
+      await sleep(500);
+      ok(!existsSync(join(CTRL_RESULTS, 'f1-run', 'done.json')), 'B(h) forged seq_done from a NON-OWNER dropped (results not poisoned)');
+      const evForged = existsSync(join(CTRL_RESULTS, 'f1-run', 'events.jsonl'))
+        ? readFileSync(join(CTRL_RESULTS, 'f1-run', 'events.jsonl'), 'utf8') : '';
+      ok(!evForged.includes('"id":99'), 'B(h) forged step_done from a NON-OWNER did not land in events.jsonl');
+      // The real owner can still finalize its own sequence — control was never stolen.
+      legit.holdSeq = null;
+      legit.sendRaw({ type: 'step_done', seq: 'f1-run', id: 1, op: 'wait', status: 'ok', t: Date.now() / 1000 });
+      legit.sendRaw({ type: 'seq_done', seq: 'f1-run', status: 'ok', completed: 1, t: Date.now() / 1000 });
+      await waitFor(() => existsSync(join(CTRL_RESULTS, 'f1-run', 'done.json')), 4000);
+      const doneReal = existsSync(join(CTRL_RESULTS, 'f1-run', 'done.json'))
+        ? JSON.parse(readFileSync(join(CTRL_RESULTS, 'f1-run', 'done.json'), 'utf8')) : null;
+      ok(doneReal && doneReal.status === 'ok', 'B(h) the OWNER socket still finalized its own seq (grant intact)');
+      legit.close(); attacker.close();
+      await sleep(300);
+    }
+
+    // ── B(i) F2: the relay DELIVERS control_revoke on a ping timeout (client no longer lies) ────
+    console.log('\n── PART B(i): F2 — relay delivers control_revoke on a ping timeout ──');
+    {
+      const game = await makeFakeGame('pingrevoke');
+      game.holdSeq = 'f2-cmd';                  // keep the seq in flight so the grant + heartbeat stay live
+      await sleep(200);
+      dropOutbox(mkCmd('f2-cmd', [{ id: 1, op: 'wait', seconds: 30 }]));
+      await waitFor(() => game.offers.includes('f2-cmd'), 4000);
+      game.grant();
+      await waitFor(() => gotSeq(game, 'f2-cmd'), 4000);
+      ok(gotSeq(game, 'f2-cmd'), 'B(i) command forwarded under the grant (relay heartbeat now running)');
+      // Stop answering control_ping → after CTRL_MAX_MISSED_PINGS the relay revokes AND sends control_revoke.
+      game.answerPings = false;
+      const gotRevoke = await waitFor(() => game.revokes.length > 0, 8000);
+      ok(gotRevoke, 'B(i) relay delivered a control_revoke frame to the client (F2 — was previously silent)');
+      ok(game.revokes.includes('link_lost'), `B(i) control_revoke reason was link_lost (${game.revokes.join(',') || 'none'})`);
+      game.close();
+      await sleep(300);
+    }
+
     // ── B(f) audit log recorded the control lifecycle ─────────────────────────────────────────
     console.log('\n── PART B: audit trail ──');
     {
@@ -395,6 +492,8 @@ async function main() {
       ok(auditTxt.includes('forward'), 'audit.log recorded a forward');
       ok(auditTxt.includes('reject'), 'audit.log recorded a reject');
       ok(auditTxt.includes('override'), 'audit.log recorded an override');
+      ok(auditTxt.includes('grant_rejected'), 'audit.log recorded a grant_rejected (F1 nonce/no-supersede gate)');
+      ok(auditTxt.includes('result_forged'), 'audit.log recorded a result_forged drop (F1 per-socket result tagging)');
     }
 
     // ── (f) Part-A telemetry still intact after all control traffic ───────────────────────────

@@ -41,7 +41,7 @@
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
 import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync, existsSync } from 'node:fs';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -116,6 +116,14 @@ if (!TOKEN) {
 function tokenOk(candidate) {
   const h = (s) => createHash('sha256').update(String(s)).digest();
   return timingSafeEqual(h(candidate), h(TOKEN));
+}
+
+// Constant-time equality for the relay-minted grant nonce (F1). Both sides are SHA-256 digested to a
+// fixed 32 bytes first, so a length mismatch never throws and the compare leaks no timing.
+function nonceOk(candidate, minted) {
+  if (!minted || typeof candidate !== 'string') return false;
+  const h = (s) => createHash('sha256').update(String(s)).digest();
+  return timingSafeEqual(h(candidate), h(minted));
 }
 
 // ── Result sinks ───────────────────────────────────────────────────────────────────────────────
@@ -291,7 +299,7 @@ function validateCmd(cmd) {
 // ── Control: consent state machine + forward gate ─────────────────────────────────────────────
 const authedSockets = new Set();     // conn records for token-authed sockets
 const ingestedFiles = new Set();     // outbox filenames already processed (waiting or resolved) — avoids re-ingest
-const seenSeqs = new Set();          // seq ids seen this run (duplicate detection)
+const seenSeqs = new Map();          // seq id -> first-seen ms (duplicate detection; pruned past staleness, F5)
 const waiting = [];                  // validated commands awaiting a grant: {seq,text,file,issued,preempt}
 let inFlightSeq = null;              // the ONE sequence currently forwarded+running (exactly 1 in flight)
 let inFlightOwner = null;            // conn running inFlightSeq
@@ -299,6 +307,14 @@ let inFlightOwner = null;            // conn running inFlightSeq
 function activeGranted() {
   for (const c of authedSockets) if (c.controlState === 'granted') return c;
   return null;
+}
+
+// F1: a downlink RESULT (cmd_ack/nack, step_*, seq_done, shot) is honoured ONLY from the granted socket
+// that actually owns the in-flight sequence — the one the relay forwarded it to. Any other socket's
+// event for that seq is a forgery and dropped, so a 2nd token-holding socket cannot poison results.
+function ownsDownlink(conn, seq) {
+  return conn === inFlightOwner && conn.controlState === 'granted'
+    && inFlightSeq !== null && String(seq) === String(inFlightSeq);
 }
 
 function rejectFile(file, seq, reason, detail) {
@@ -314,11 +330,17 @@ function rejectFile(file, seq, reason, detail) {
 }
 
 // Offer control to any authed, ungranted socket so the human can arm a grant (design §6.1 step 1).
+// F1: mint a fresh, cryptographically-random per-socket `grant_nonce` and include it in the offer. The
+// game must echo THIS exact nonce back in its `control_state:granted` — a socket that never received (or
+// cannot guess) the nonce it was minted cannot forge a grant. The nonce is per-socket (delivered only on
+// that socket's wss offer) and stays valid until the next offer re-mints it, so an unattended re-arm
+// (§6.6, no fresh offer) can legitimately re-echo it while a cross-socket forge still fails.
 function offerControlToAll(seq) {
   for (const c of authedSockets) {
     if (c.controlState === 'none' && !c.offerSent) {
       c.offerSent = true;
-      try { c.ws.send(JSON.stringify({ type: 'control_offer', seq, t: Date.now() / 1000 })); } catch { /* ignore */ }
+      c.grantNonce = randomBytes(24).toString('hex');
+      try { c.ws.send(JSON.stringify({ type: 'control_offer', seq, grant_nonce: c.grantNonce, t: Date.now() / 1000 })); } catch { /* ignore */ }
       audit('offer', { peer: c.peer, seq });
     }
   }
@@ -402,7 +424,7 @@ function ingestFile(file) {
   const seq = cmd.seq;
   if (seenSeqs.has(seq)) { rejectFile(file, seq, 'duplicate', 'seq already seen this run'); return; }
   if (Date.now() / 1000 - cmd.issued > STALE_S) { rejectFile(file, seq, 'stale', `issued ${(Date.now() / 1000 - cmd.issued).toFixed(0)}s ago > ${STALE_S}`); return; }
-  seenSeqs.add(seq);
+  seenSeqs.set(seq, Date.now());
   dispatchOrHold({ seq, text: raw.toString('utf8'), file, issued: cmd.issued, preempt: cmd.preempt === true });
 }
 
@@ -414,7 +436,26 @@ function pollOutbox() {
     try { ingestFile(f); }
     catch (e) { log('ingest error:', f, e.message); try { rejectFile(f, null, 'bad_json', 'ingest exception'); } catch { /* ignore */ } }
   }
+  // NEVER-OOM (F5): forget ingest markers whose outbox file is gone (forwarded→sent/ or moved to
+  // rejected/). Files still waiting for a grant remain present in the listing, so they are kept; the
+  // set therefore tracks only live files and cannot grow without bound over a long-lived relay.
+  const present = new Set(files);
+  for (const f of ingestedFiles) if (!present.has(f)) ingestedFiles.delete(f);
   sweepWaiting();
+}
+
+// NEVER-OOM (F5): prune the run-lifetime maps so a long-lived relay's memory stays bounded.
+//   * seenSeqs — drop entries older than the staleness window (+ margin); a replay past that window is
+//     rejected `stale` by ingest anyway (§1.3), so forgetting it changes nothing security-relevant.
+//   * ipConnects — drop IPs whose recent-connect list has fully aged out of the pre-auth window.
+function pruneMaps() {
+  const now = Date.now();
+  const seqTtl = (STALE_S + 60) * 1000;
+  for (const [seq, t] of seenSeqs) if (now - t > seqTtl) seenSeqs.delete(seq);
+  for (const [ip, arr] of ipConnects) {
+    const keep = arr.filter((t) => now - t < PREAUTH_WINDOW_MS);
+    if (keep.length) ipConnects.set(ip, keep); else ipConnects.delete(ip);
+  }
 }
 
 // ── Control: heartbeat + grant lifecycle ─────────────────────────────────────────────────────
@@ -462,9 +503,26 @@ function onControlState(conn, msg) {
   const state = msg.state;
   switch (state) {
     case 'granted': {
+      if (conn.controlState === 'granted') return;   // already driving — ignore a duplicate granted
       const gid = typeof msg.grant_id === 'string' ? msg.grant_id : null;
-      // §5.2: most-recently-granted wins; supersede any other standing grant.
-      for (const c of authedSockets) if (c !== conn && c.controlState === 'granted') revokeGrant(c, 'superseded');
+      // F1a — MINTED-NONCE GATE: accept `granted` ONLY when it echoes the exact relay-minted nonce this
+      // socket received in ITS `control_offer`. A socket that auths and immediately claims control (no
+      // offer ⇒ no nonce), or echoes a wrong/guessed nonce, is refused. The human consent still gates it
+      // game-side; this binds the wire grant to a real relay offer delivered to THIS socket.
+      if (!nonceOk(msg.grant_nonce, conn.grantNonce)) {
+        audit('grant_rejected', { peer: conn.peer, reason: 'bad_nonce' });
+        log('CONTROL grant REJECTED (bad/absent minted nonce):', conn.peer);
+        return;
+      }
+      // F1b — NO-SUPERSEDE: a second authed socket can NEVER wrest a standing valid grant away (was:
+      // "most-recently-granted wins"). While one socket holds control, another's grant is refused —
+      // this is what stops a 2nd token-holder from stealing/oscillating the grant.
+      const holder = activeGranted();
+      if (holder && holder !== conn) {
+        audit('grant_rejected', { peer: conn.peer, reason: 'already_held', holder: holder.peer });
+        log('CONTROL grant REJECTED (another socket already holds control):', conn.peer);
+        return;
+      }
       conn.controlState = 'granted'; conn.grantId = gid; conn.offerSent = false;
       startHeartbeat(conn);
       audit('grant', { peer: conn.peer, grant_id: gid });
@@ -495,12 +553,22 @@ function onControlState(conn, msg) {
   }
 }
 
+// Set of downlink RESULT types that must be tagged to the owning granted socket (F1).
+const RESULT_TYPES = new Set(['cmd_ack', 'cmd_nack', 'step_start', 'step_done', 'seq_done']);
+
 // Route a downlink text frame. Returns true if it was a recognized control event. Game-originated
 // messages are RECORD-ONLY — never forwarded to another socket or reflected back.
 function routeControlEvent(conn, obj) {
+  if (obj.type === 'control_state') { onControlState(conn, obj); return true; }
+  if (obj.type === 'control_pong') { conn.missedPings = 0; return true; }
+  if (!RESULT_TYPES.has(obj.type)) return false;   // telemetry etc. — already recorded by the caller
+  // F1c — PER-SOCKET RESULT TAGGING: only the socket that owns the in-flight seq may write its results.
+  // A forged event from a non-owning (e.g. 2nd token-holding) socket is dropped, never touching disk.
+  if (!ownsDownlink(conn, obj.seq)) {
+    audit('result_forged', { peer: conn.peer, type: obj.type, seq: String(obj && obj.seq).slice(0, 60) });
+    return true;
+  }
   switch (obj.type) {
-    case 'control_state': onControlState(conn, obj); return true;
-    case 'control_pong': conn.missedPings = 0; return true;
     case 'cmd_ack':
       writeResult(obj.seq, 'ack.json', obj);
       if (conn.grantId && obj.grant_id && obj.grant_id !== conn.grantId)
@@ -523,14 +591,13 @@ function routeControlEvent(conn, obj) {
       if (inFlightSeq === obj.seq) { inFlightSeq = null; inFlightOwner = null; }
       audit('seq_done', { seq: obj.seq, status: obj.status });
       return true;
-    default:
-      return false;   // telemetry etc. — already recorded to telemetry.jsonl by the caller
   }
+  return true;
 }
 
 // A commanded screenshot: [0x02][u16 BE header_len][header JSON: {seq,id,label,t}][jpeg]. Written to
 // the correlated results dir AND refreshed as frame-latest.jpg (it is, after all, the latest frame).
-function handleShotFrame(data) {
+function handleShotFrame(conn, data) {
   if (data.length < 3) return;
   const hlen = data.readUInt16BE(1);
   if (data.length < 3 + hlen) return;
@@ -540,6 +607,8 @@ function handleShotFrame(data) {
   if (jpg.length < 2 || jpg[0] !== 0xff || jpg[1] !== 0xd8) return;         // JPEG magic
   const d = resultsDirFor(hdr.seq);
   if (!d) { audit('shot_orphan', { seq: String(hdr.seq).slice(0, 60) }); return; }
+  // F1c: a commanded shot is a downlink result — accept it only from the owning granted socket.
+  if (!ownsDownlink(conn, hdr.seq)) { audit('shot_forged', { peer: conn.peer, seq: String(hdr.seq).slice(0, 60) }); return; }
   const idPart = safeId(String(hdr.id)) ? String(hdr.id) : 'x';
   const labelPart = (typeof hdr.label === 'string' && /^[a-z0-9-]{1,40}$/.test(hdr.label)) ? hdr.label : 'shot';
   try { writeFileSync(join(d, `shot-${idPart}-${labelPart}.jpg`), jpg); } catch (e) { log('shot write error:', e.message); }
@@ -572,11 +641,25 @@ function ipRateOk(ip) {
   return arr.length <= PREAUTH_CONNECTS_PER_IP;
 }
 
+// F5: the real browser IP for the per-IP rate limit. The relay only ever sees traffic via our own nginx
+// (never host-published), so `req.socket.remoteAddress` is ALWAYS the nginx container IP — keying the
+// limit on it would make a global limit any one attacker could trip to lock out every browser. nginx
+// sets `X-Real-IP: $remote_addr` (voxiverse.conf.template) with the true client IP; use it, validated to
+// a single IP literal (only hex/digit/dot/colon, ≤ 45 chars) so a malformed value falls back safely.
+function clientIp(req) {
+  const xri = req.headers['x-real-ip'];
+  if (typeof xri === 'string') {
+    const v = xri.trim();
+    if (v && v.length <= 45 && /^[0-9a-fA-F.:]+$/.test(v)) return v;
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
 wss.on('connection', (ws, req) => {
-  const ip = req.socket.remoteAddress;
+  const ip = clientIp(req);
   const peer = ip + ':' + req.socket.remotePort;
   // Per-connection control record. Inert until this socket both authenticates AND is granted control.
-  const conn = { ws, peer, ip, controlState: 'none', grantId: null, heartbeat: null, missedPings: 0, offerSent: false };
+  const conn = { ws, peer, ip, controlState: 'none', grantId: null, grantNonce: '', heartbeat: null, missedPings: 0, offerSent: false };
 
   // Optional Origin allow-list. WebSockets are NOT subject to CORS, so this is defense-in-depth only
   // (a native/dev client sends no Origin, so an unset ALLOWED_ORIGIN — the default — never blocks).
@@ -678,7 +761,7 @@ wss.on('connection', (ws, req) => {
         try { writeFrame(jpg); } catch (e) { log('frame write error:', e.message); }
       } else if (data[0] === SHOT_TAG) {
         // Commanded screenshot: [SHOT_TAG][u16 hlen][header][jpeg...].
-        try { handleShotFrame(data); } catch (e) { log('shot frame error:', e.message); }
+        try { handleShotFrame(conn, data); } catch (e) { log('shot frame error:', e.message); }
       }
       // unknown binary tag — ignore
       return;
@@ -727,11 +810,16 @@ httpServer.listen(PORT, HOST, () => {
 // unreliable on bind mounts, and 500 ms is ample for a half-duplex, latency-tolerant control loop.
 const outboxPoller = setInterval(pollOutbox, POLL_MS);
 
+// F5: periodic NEVER-OOM housekeeping for the run-lifetime maps (seenSeqs / ipConnects).
+const MAINT_MS = 30000;
+const maintPoller = setInterval(pruneMaps, MAINT_MS);
+
 // Clean shutdown.
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     log('shutting down on', sig);
     clearInterval(outboxPoller);
+    clearInterval(maintPoller);
     for (const c of authedSockets) stopHeartbeat(c);
     wss.close();
     httpServer.close(() => process.exit(0));

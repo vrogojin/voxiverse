@@ -134,6 +134,7 @@ var _link_open := false             # last emitted link_state (so we emit only o
 # ── P2 control state (all inert while CONTROL_ENABLED is false — never touched on the Phase-1 path) ──
 var _control_state := "none"        # none | granted
 var _grant_id := ""                 # game-generated random id echoed on cmd_ack (binds results to this consent)
+var _grant_nonce := ""              # F1: the relay-MINTED nonce from control_offer, echoed back on control_state:granted
 var _unattended := false            # this grant is the persistent §6.6 mode (survives override via auto-resume)
 var _exec: RemoteControl = null     # the step executor — created ON GRANT, freed on revoke/override/link-loss
 var _last_ping_ms := 0              # Time.get_ticks_msec of the last control_ping (0 = none yet)
@@ -553,9 +554,10 @@ func _dispatch_control(txt: String) -> void:
 		return
 	var m: Dictionary = j
 	match str(m.get("type", "")):
-		"control_offer": _on_control_offer(m)
-		"cmd_seq":       _on_cmd_seq(m)
-		"control_ping":  _on_control_ping()
+		"control_offer":  _on_control_offer(m)
+		"cmd_seq":        _on_cmd_seq(m)
+		"control_ping":   _on_control_ping()
+		"control_revoke": _on_control_revoke(m)
 		# auth_ok (duplicate) and anything else: drained-and-discarded.
 
 
@@ -566,6 +568,9 @@ func _dispatch_control(txt: String) -> void:
 ## activator shows the capability-enumerating consent modal (§6.1 / resolved D5).
 func _on_control_offer(m: Dictionary) -> void:
 	var seq := str(m.get("seq", ""))
+	# F1: remember the relay-minted nonce so grant_control can echo it back (proving this exact socket
+	# received the offer). Refreshed on every offer, so a session re-consent uses the freshly-minted one.
+	_grant_nonce = str(m.get("grant_nonce", ""))
 	if _control_state == "granted":
 		return                               # already driving — the relay just (re)advertised
 	if _rearm_unattended_id != "":
@@ -851,6 +856,26 @@ func _on_control_ping() -> void:
 	_send_text_guarded({"type": "control_pong", "t": Time.get_unix_time_from_system()})
 
 
+## F2: the RELAY revoked our grant (ping timeout, or it echoed our own revoke). Previously this frame was
+## outside the inbound whitelist, so the grant + badge stayed live until the ~16 s local ping timeout — a
+## lying badge. Now we drop the grant the instant the relay says so: halt + free the executor and revert
+## the badge to observing. Mirrors the link-loss fail-safe (§5.4): in unattended mode we keep the grant id
+## so the next relay offer re-arms without a human click; otherwise re-consent is required.
+func _on_control_revoke(_m: Dictionary) -> void:
+	if _control_state != "granted" and _suspend_resume_at == 0:
+		return
+	if is_instance_valid(_exec):
+		_exec.abort("aborted")
+	_free_executor()
+	_control_state = "none"
+	_suspend_resume_at = 0
+	if _unattended and _grant_id != "":
+		_rearm_unattended_id = _grant_id
+	else:
+		_grant_id = ""
+	control_phase.emit("observing", {})
+
+
 func _control_tick() -> void:
 	if _control_state == "granted":
 		if _last_ping_ms > 0 and Time.get_ticks_msec() - _last_ping_ms > CTRL_PING_TIMEOUT_MS:
@@ -888,6 +913,8 @@ func _send_control_state(state: String, grant_id: String) -> void:
 	var msg := {"type": "control_state", "state": state}
 	if grant_id != "":
 		msg["grant_id"] = grant_id
+	if state == "granted" and _grant_nonce != "":
+		msg["grant_nonce"] = _grant_nonce   # F1: echo the relay-minted offer nonce so the grant is honoured
 	_send_text_guarded(msg)
 
 

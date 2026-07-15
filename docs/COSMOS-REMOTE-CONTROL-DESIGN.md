@@ -225,13 +225,15 @@ agent actually consumes.
 
 | Direction | Types |
 |---|---|
-| relay → game | `auth_ok` (existing), `control_offer` (§6.2), `cmd_seq`, `control_ping` (5 s heartbeat while control is granted) |
-| game → relay | telemetry (existing), `control_state` (consent granted/denied/revoked/expired — drives relay gating + audit), `cmd_ack`/`cmd_nack`, `step_start`/`step_done`, `seq_done`, `control_pong` |
+| relay → game | `auth_ok` (existing), `control_offer` (§6.2, carries the relay-minted `grant_nonce` — F1), `cmd_seq`, `control_ping` (5 s heartbeat while control is granted), `control_revoke` (relay ended the grant — ping timeout / echoed revoke) |
+| game → relay | telemetry (existing), `control_state` (consent granted/denied/revoked/expired — `granted` echoes the offer's `grant_nonce`, F1 — drives relay gating + audit), `cmd_ack`/`cmd_nack`, `step_start`/`step_done`, `seq_done`, `control_pong` |
 
 The game's inbound drain (`remote_bridge.gd:238-252`) grows from "only `auth_ok`" to a **strict
-type-whitelist dispatch** (`auth_ok`, `control_offer`, `cmd_seq`, `control_ping`); anything else
-stays drained-and-discarded. When the control flag is OFF (compile-time const, §7 P2), the
-dispatch table simply doesn't contain the new types — byte-identical Phase-1 behaviour.
+type-whitelist dispatch** (`auth_ok`, `control_offer`, `cmd_seq`, `control_ping`, `control_revoke`);
+anything else stays drained-and-discarded. `control_revoke` (F2) makes the client drop its grant +
+free the executor + revert the badge the instant the relay revokes, instead of lying until the
+~16 s local ping timeout. When the control flag is OFF (compile-time const, §7 P2), the dispatch
+table simply doesn't contain the new types — byte-identical Phase-1 behaviour.
 
 ### 3.2 Relay policy inversion, stated precisely
 
@@ -389,9 +391,35 @@ file). Every action appends to `control/audit.log`.
 
 `MAX_CONNS = 4` (`relay.mjs:49`) allows several authed sockets. Commands go **only** to the
 socket whose control state is `granted` and unexpired. If none: the outbox file waits (up to its
-`issued` staleness cap) and is then rejected `no_consent`. If more than one granted socket ever
-exists, the **most recently granted** wins and older grants are revoked (relay emits
-`control_offer` withdrawal; simplest correct policy — a fleet is out of scope).
+`issued` staleness cap) and is then rejected `no_consent`.
+
+**Grant authenticity (F1 — hardened 2026-07-15).** The observe token is a *shared* URL secret, so
+without further binding a 2nd token-holding socket could forge/steal/oscillate the grant and inject
+forged downlink results. Three relay-side rules close this:
+
+1. **Relay-minted `grant_nonce`.** When the relay offers control it mints a cryptographically-random
+   per-socket nonce (`node:crypto` `randomBytes`) and sends it in that socket's `control_offer`. A
+   `control_state:granted` is honoured **only** if it echoes the exact nonce the relay minted for
+   *that* socket (constant-time compare). A socket that auths and immediately claims control (no
+   offer ⇒ no nonce) or echoes a wrong/guessed nonce is refused. The nonce is per-socket (delivered
+   only on that socket's wss offer) and stays valid until the next offer re-mints it — so an
+   unattended re-arm (§6.6, no fresh offer) can legitimately re-echo it, while a *cross-socket* forge
+   still fails (each socket has a distinct nonce it cannot observe on another's link).
+2. **No-supersede.** While one socket holds a valid grant, a second socket's `granted` is **rejected**
+   (previously "most-recently-granted wins"). A standing grant can never be wrested away; it ends only
+   by the owner's revoke/override, link loss, or ping timeout.
+3. **Per-socket result tagging.** `cmd_ack`/`cmd_nack`/`step_*`/`seq_done` and `0x02` shot frames are
+   accepted **only** from the socket that owns the in-flight sequence (the one the relay forwarded it
+   to); a forged event from any other socket is dropped and audited (`result_forged`) — it never
+   touches `control/results/<seq>/`.
+
+**Residual (documented, out of F1 scope):** the relay cannot itself verify a *human* clicked Allow —
+it trusts that `control_state:granted` came from a consented game (the human at the keyboard is the
+game-side second factor, §6.1). So a token-holding attacker who wins the *first* grant race (before
+any legit human consents) can receive the agent's commands; the human consent gate lives game-side,
+and the shared-token limitation is what task #113 ultimately removes by not letting control ride the
+observe token (a future per-session control credential). F1 bounds the damage: no result poisoning,
+no stealing a standing grant, no grant without a real relay offer.
 
 ### 5.3 Game socket stays outbound-dial; auth model unchanged for observe
 
@@ -507,20 +535,29 @@ weakening of the human-second-factor model:
   revoke — it can move, build, MINE/BREAK, PLACE, and manage INVENTORY with no further prompts."
   Red-bordered, capability-enumerating (matches the resolved D5 full-agency scope), requires a
   deliberate click (not the default button).
-- **Persistence.** On opt-in the game stores an unattended token in `localStorage` keyed to the
-  observe token (NOT the secret itself — an opaque per-grant `unattended_id` the relay also holds).
-  After a `reload`, boot reads it and re-arms CONTROL automatically (no human click) IFF: the
-  `?remote=<token>` matches, the stored `unattended_id` validates against the relay, and the mode
-  has not been revoked. Otherwise it falls back to normal per-session consent.
+- **Persistence (same-origin model — corrected F3 2026-07-15).** On opt-in the game stores an opaque
+  per-grant `unattended_id` in `localStorage` under a non-reversible key (`sha256(observe token)` —
+  NOT the secret). The id is CSPRNG-generated (browser `crypto.getRandomValues`, native `Crypto`) and
+  bound to a hash of the observe token. After a `reload`, boot reads it and re-arms CONTROL
+  automatically (no human click) IFF: the `?remote=<token>` matches (so the socket re-auths), the
+  stored id is present **same-origin** (localStorage is origin-scoped — another site cannot read or
+  plant it), and the mode has not been revoked. **The trust anchors are token-auth + the F1
+  relay-minted grant_nonce + same-origin localStorage — NOT a relay-held unattended registry.** An
+  earlier draft claimed the id "validates against the relay"; there is deliberately no such registry:
+  it would add stateful relay memory that a relay restart wipes (silently breaking every unattended
+  re-arm), and it buys nothing over the nonce gate the re-arm already passes. The `unattended_id`
+  remains a pure client-side opaque correlator (echoed on `cmd_ack`), never a relay credential.
+  Otherwise (no stored id / token mismatch / revoked) it falls back to normal per-session consent.
 - **Override semantics preserved, escalated.** Any local key/mouse still aborts the running queue in
   the same frame (§6.4). In unattended mode a plain override SUSPENDS (auto-resumes after idle, so a
   curious human glance doesn't tear down an overnight run) — but **Esc / the revoke chord CLEARS the
   `localStorage` grant entirely** (hard, permanent until re-opted-in). The persistent indicator
   reads "● UNATTENDED REMOTE CONTROL — press Esc to revoke".
 - **Fail-safe + bounds.** Link loss still stops the rover (§3); on reconnect it re-arms only via the
-  stored grant. The relay still enforces token-auth + `unattended_id` match before forwarding; an
-  optional wall-clock lifetime cap on the unattended grant (default none = until-revoked per D1) is
-  available. This is an explicit trust escalation the human performs ONCE and can kill instantly.
+  stored grant. Before forwarding the relay still enforces token-auth **and the F1 minted-nonce grant
+  gate** (the re-arm echoes the nonce from the fresh offer on the reconnected socket); an optional
+  wall-clock lifetime cap on the unattended grant (default none = until-revoked per D1) is available.
+  This is an explicit trust escalation the human performs ONCE and can kill instantly.
 - **Deploy→reload loop (agent side).** Orchestrator: build+export+deploy (host-side, unchanged) →
   uplink a `reload` step → the browser re-fetches the new build + re-arms via the stored grant →
   orchestrator reads the new build's telemetry and resumes driving. `reload` is only honoured while

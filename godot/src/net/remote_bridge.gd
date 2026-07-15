@@ -118,6 +118,15 @@ var _win_worst := 0.0               # slowest frame (s) in the current window (t
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
 var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
+# A1-REFINE (#114): the crossing's transform-WRITE is ~0.02 ms, but Godot flushes the
+# NOTIFICATION_TRANSFORM_CHANGED re-place AFTER _physics_process returns — the real ~290-816 ms
+# spike lands in the FOLLOWING frame(s), not in the write bracket. So for each crossing we track the
+# WORST frame over the next ~1.2 s and emit a {"ev":"crossing_after"} record — the clean deferred-cost
+# KPI (before/after the fixed-frame keystone). Only fills on real crossings (faceted); empty otherwise.
+var _post_cross: Array = []         # open windows: [{from,to,end_usec,worst_ms,frames}]
+const POST_CROSS_WINDOW_MS := 1200  # attribute the worst frame for this long after a crossing
+const POST_CROSS_MAX := 8           # NEVER-OOM: hard cap on concurrent windows
+
 var _frame_acc_ms := 0.0
 var _capturing := false             # a frame readback+send is inflight (skip overlapping captures)
 var _link_open := false             # last emitted link_state (so we emit only on transitions)
@@ -245,6 +254,9 @@ func _process(delta: float) -> void:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
+	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
+	if not _post_cross.is_empty():
+		_update_post_cross(now_usec, real_delta)
 
 	# ── Socket state machine ──────────────────────────────────────────────────────────────────
 	var state := _ws.get_ready_state()
@@ -416,6 +428,34 @@ func _drain_crossing_events() -> void:
 		msg["t"] = Time.get_unix_time_from_system()
 		msg["up_ms"] = Time.get_ticks_msec()
 		_ws.send_text(JSON.stringify(msg))
+		# A1-REFINE (#114): open a post-crossing attribution window (the deferred re-place lands in the next ~1.2 s).
+		if _post_cross.size() < POST_CROSS_MAX:
+			_post_cross.append({"from": int((ev as Dictionary).get("from_fid", -1)), "to": int((ev as Dictionary).get("to_fid", -1)),
+				"end_usec": Time.get_ticks_usec() + POST_CROSS_WINDOW_MS * 1000, "worst_ms": 0.0, "frames": 0})
+
+
+## A1-REFINE (#114): track the worst frame in each open post-crossing window; when a window closes, emit a
+## {"ev":"crossing_after"} record attributing that DEFERRED spike to its crossing — the real cost the
+## synchronous transform_ms bracket misses. Bounded (POST_CROSS_MAX), no-op when no window is open.
+func _update_post_cross(now_usec: int, real_delta: float) -> void:
+	var still: Array = []
+	for w in _post_cross:
+		w["frames"] = int(w["frames"]) + 1
+		var ms := real_delta * 1000.0
+		if ms > float(w["worst_ms"]):
+			w["worst_ms"] = ms
+		if now_usec >= int(w["end_usec"]):
+			if _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN \
+					and _ws.get_current_outbound_buffered_amount() < OUTBOUND_BUFFER_BYTES - 65536:
+				_ws.send_text(JSON.stringify({
+					"type": "crossing_after", "ev": "crossing_after",
+					"from_fid": int(w["from"]), "to_fid": int(w["to"]),
+					"post_worst_ms": snappedf(float(w["worst_ms"]), 0.1), "frames": int(w["frames"]),
+					"window_ms": POST_CROSS_WINDOW_MS,
+					"t": Time.get_unix_time_from_system(), "up_ms": Time.get_ticks_msec()}))
+		else:
+			still.append(w)
+	_post_cross = still
 
 
 ## Rich engine/world state — every field guarded for absence so a render-path/flag combination that

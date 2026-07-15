@@ -130,6 +130,20 @@ const CTRL_CREDIT_AI := 0.1
 const CTRL_PROMOTE_CREDIT := 0.5
 const OFFSURFACE_Y := 256.0
 
+## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
+## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
+## are floored to, so COVERAGE relief flows even at credit 0 (§P3a/§P3c); a relief-only candidate restriction keeps it
+## terminal. FRAME_SAMPLE_CLAMP_MS — the per-sample clamp on the P1 measured inter-poll frame delta (a backgrounded tab
+## cannot poison the window with a multi-second sample; §P1). WINDOW_PCTL — the P2 order statistic over the frame window
+## (was: max; a max makes one browser-normal dropped frame per half-second read as sustained overload forever, §1.2).
+## POOL_D_COMMIT — inside this ridge distance the imminent live promote is admitted GEOMETRICALLY (the crossing is
+## committed; the cost is unavoidable and pre-paying it strictly dominates paying it at the seam, §P3b). D_WARM→D_COMMIT
+## is the politeness window (defer to a headroom tick); D_COMMIT→0 is the commit band.
+const CTRL_RELIEF_FLOOR := 0.25
+const CTRL_FRAME_SAMPLE_CLAMP_MS := 250.0
+const CTRL_WINDOW_PCTL := 0.9
+const POOL_D_COMMIT := 64.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

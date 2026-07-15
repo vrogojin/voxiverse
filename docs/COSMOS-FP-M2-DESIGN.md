@@ -559,24 +559,44 @@ headroom (`credit += 0.1` per tick, cap 1) — bounded, anti-windup by construct
 (the clamp; paused ticks accumulate no debt). Credit scales, downward only from the hard
 consts:
 
-1. **LOD apply budget**: `LOD_APPLY_BUDGET_MS × credit` ms/frame (0 → applies pause,
-   finished meshes wait in the done-queue — bounded, they are already built).
-2. **Build-job grants**: grants admitted per tick = `ceil(2 × credit)`; at credit 0 the
-   budgeter stops enqueueing (the builder finishes in-flight tiles and idles).
+1. **LOD apply budget**: `LOD_APPLY_BUDGET_MS × max(credit, CTRL_RELIEF_FLOOR)` ms/frame.
+   *(AMENDED — see below: floored at `CTRL_RELIEF_FLOOR := 0.25` so applies never fully
+   pause; at credit 0 this is 0.5 ms/frame, enough to swap in coverage.)*
+2. **Build-job grants**: grants admitted per tick = `ceil(2 × max(credit, CTRL_RELIEF_FLOOR))`.
+   *(AMENDED: floored to ≥ 1 grant/tick; while `relief_only()` (credit < the floor) the
+   budgeter restricts its candidate set to meshless facets + the imminent-ridge fid — it
+   buys coverage, not refinement of already-covered scenery.)*
 3. **Pool view-ramp pace**: module_world gains `set_stream_pace(f: float)`; the FP-M1c
    per-slot ramp (`_ramp_pool_step`, `module_world.gd:373-402`) multiplies its per-frame
    step by `f` — `RAMP_SECONDS` becomes the *minimum* ramp duration, stretched under load,
-   ramp fully held at 0. Shrinks (unloads) are never throttled.
+   ramp fully held at 0. Shrinks (unloads) are never throttled. *(AMENDED: the single
+   imminent slot is floored at `CTRL_RELIEF_FLOOR` so a committed crossing still streams
+   in — every other slot keeps the fully feedback-gated pace.)*
 4. **Promote admission**: a live-terrain spawn (or a finer-ℓ grant for an already-covered
    facet) additionally requires `credit ≥ 0.5` sustained for `CTRL_PROMOTE_SUSTAIN_S :=
-   1.5` s — promotions start only into real headroom.
+   1.5` s — promotions start only into real headroom. *(AMENDED: the SINGLE imminent
+   promote now also admits geometrically once `ridge_dist < POOL_D_COMMIT := 64` —
+   `promote_admit_imminent(ctrl, ridge_dist)`; the controller may pace WHEN the imminent
+   live invariant (§3.2) starts within the `[D_COMMIT, D_WARM]` politeness window but can
+   no longer veto it. The corner/2nd promote stays fully credit-gated.)*
+
+> **AMENDED 2026-07-15** by `docs/COSMOS-FP-M2-CONTROLLER-FIX.md` (implemented): live
+> telemetry proved the single AIMD credit pinned at 0 all session (invalid web sensor +
+> unrecoverable max-statistic), closing all four surfaces and rendering M2 inert. The fix
+> (P1 measured-frame-delta sensor, P2 window-p90 statistic, P3 relief floor + geometric
+> commit) re-classifies the surfaces above: **relief** surfaces (1, 2, and the imminent
+> parts of 3–4) flow even at credit 0, bounded; the **feedback** surfaces (generic pace,
+> corner/2nd promote) stay credit-gated. Validated headless by G-M2-STARVE(a–f). The
+> NEVER-OOM ledgers (§6.5.6) are untouched and still checked after every admission.
 
 Plus the feed-forward gate: while `vox_gen backlog > CTRL_BACKLOG_MAX := 300` (the same
-number as the M2e definition of done), surfaces 3 and 4 are held at zero regardless of
-frame time — new full-res volume is never admitted onto a pool that has not drained,
-which is verbatim the user's "keep the pace of streaming of the neighbour chunks such
-that we never overload". Surfaces 1–2 (builder-thread work) stay frame-time-governed
-only; they do not touch the pool.
+number as the M2e definition of done), the *feedback* portions of surfaces 3 and 4 are
+held at zero regardless of frame time — new *optional* full-res volume is never admitted
+onto a pool that has not drained, which is verbatim the user's "keep the pace of streaming
+of the neighbour chunks such that we never overload". Surfaces 1–2 (builder-thread work)
+stay frame-time-governed only; they do not touch the pool. (Per the amendment above, the
+committed imminent crossing is exempt from this veto — its cost is unavoidable and paced,
+never optional.)
 
 **6.5.4 Stability (no promote/demote oscillation).**
 

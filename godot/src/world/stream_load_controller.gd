@@ -21,10 +21,10 @@ const _CREDIT_ZERO_SNAP := 0.1    # below this the multiplicative decrease snaps
 # ---- state ----
 var _src: Object = null                        # injectable input source (duck-typed: poll() -> {frame_ms, backlog})
 var _credit := 1.0                             # the AIMD admission credit ∈ [0,1]
-var _win := PackedFloat64Array()               # sliding worst-frame window (CTRL_WINDOW_FRAMES frame-cost samples)
+var _win := PackedFloat64Array()               # sliding frame-cost window (CTRL_WINDOW_FRAMES measured frame-delta samples)
 var _win_i := 0
 var _win_fill := 0
-var _frame_worst_ema := 0.0                    # EMA of the window's worst frame — the setpoint-comparison signal
+var _frame_worst_ema := 0.0                    # EMA of the window p90 (§P2, was max) — the setpoint-comparison signal
 var _backlog := 0                              # last polled vox_gen backlog (feed-forward)
 var _last_tick_s := -1.0                       # injected-clock time of the last control update (−1 = not started)
 var _promote_hold_s := 0.0                     # seconds credit has sat ≥ CTRL_PROMOTE_CREDIT with the backlog gate open
@@ -56,7 +56,7 @@ func tick(now_s: float) -> void:
 		fm = float(d.get("frame_ms", 0.0))
 		bk = int(d.get("backlog", 0))
 	_backlog = bk
-	# push this frame's cost into the sliding window (worst = max over the window)
+	# push this frame's measured cost into the sliding window (the binding statistic is the p90 over the window, §P2)
 	_win[_win_i] = fm
 	_win_i = (_win_i + 1) % CubeSphere.CTRL_WINDOW_FRAMES
 	_win_fill = mini(_win_fill + 1, CubeSphere.CTRL_WINDOW_FRAMES)
@@ -76,10 +76,20 @@ func tick(now_s: float) -> void:
 	#  (2) a giant tick is a DISCONTINUITY, not evidence — RESET every hold (a gap is not sustained load).
 	var adt := minf(dt, CubeSphere.CTRL_TICK_S)
 	var gap := dt > CubeSphere.CTRL_TICK_S * 4.0
-	# frame_worst = the slowest frame in the window; EMA'd so a single spike is noise (§6.5.2/§6.5.4).
+	# frame_worst = the window p90 (COSMOS-FP-M2-CONTROLLER-FIX §P2 — was max), EMA'd so a single spike is noise
+	# (§6.5.2/§6.5.4). Deterministic order statistic: sort the filled window, index ceil(PCTL·fill)−1. A *max* holds
+	# overload forever off one browser-normal dropped frame per half-second (§1.2); p90 tolerates ≤3 stutter frames per
+	# window while still reading a sustained 30 fps (all deltas 33 ms → p90 = 33 > 18) as overload. Under a CONSTANT
+	# signal p90 ≡ max, so every G-M2-CTRL square-wave credit trace is bit-identical to the pre-change max statistic.
 	var worst := 0.0
-	for i in range(_win_fill):
-		worst = maxf(worst, _win[i])
+	if _win_fill > 0:
+		var samp := PackedFloat64Array()
+		samp.resize(_win_fill)
+		for i in range(_win_fill):
+			samp[i] = _win[i]
+		samp.sort()
+		var idx := int(ceil(CubeSphere.CTRL_WINDOW_PCTL * float(_win_fill))) - 1
+		worst = samp[clampi(idx, 0, _win_fill - 1)]
 	_frame_worst_ema = _frame_worst_ema + _EMA_ALPHA * (worst - _frame_worst_ema)
 	# AIMD (§6.5.3): multiplicative decrease on overload, additive increase under headroom. Anti-windup by the clamp.
 	_overload = _frame_worst_ema > CubeSphere.CTRL_FRAME_BUDGET_MS
@@ -118,13 +128,22 @@ func tick(now_s: float) -> void:
 func credit() -> float:
 	return _credit
 
-## Surface 1 — the LOD main-thread apply budget: base × credit (0 → applies pause; built meshes wait, bounded).
+## Surface 1 — the LOD main-thread apply budget: base × max(credit, RELIEF_FLOOR). Floored at the relief credit (§P3a)
+## so built meshes still swap in at credit 0 (base 2 ms → 0.5 ms/frame); the mesher's relief-only candidate restriction
+## keeps this bounded to COVERAGE, not refinement luxury. NEVER-OOM caps are still checked after admission (§4).
 func apply_budget_ms(base_ms: float) -> float:
-	return base_ms * _credit
+	return base_ms * maxf(_credit, CubeSphere.CTRL_RELIEF_FLOOR)
 
-## Surface 2 — build-job grants admitted this tick: ceil(base × credit) (credit 0 → the budgeter stops enqueueing).
+## Surface 2 — build-job grants admitted this tick: ceil(base × max(credit, RELIEF_FLOOR)). Floored at the relief credit
+## (§P3a) so the budgeter still enqueues ≥1 coverage grant/tick at credit 0 (base 2 → 1 grant); the relief-only
+## restriction bounds it to meshless facets + the imminent ridge. Denials still funnel through the ledger/LRU path (§4).
 func grant_count(base: int = 2) -> int:
-	return int(ceil(float(base) * _credit))
+	return int(ceil(float(base) * maxf(_credit, CubeSphere.CTRL_RELIEF_FLOOR)))
+
+## §P3a — relief mode: credit below the relief floor. The mesher restricts its budgeter to COVERAGE (meshless facets +
+## the imminent ridge) while this holds — the floor buys first-cover, never SSE refinement of already-covered scenery.
+func relief_only() -> bool:
+	return _credit < CubeSphere.CTRL_RELIEF_FLOOR
 
 ## Surface 3 — the pool view-ramp pace fed to module_world.set_stream_pace: the credit, HELD AT ZERO while the
 ## vox_gen backlog gate is closed (new full-res volume is never admitted onto a pool that has not drained, §6.5.3.4).
@@ -161,26 +180,36 @@ func demote_pressure() -> bool:
 func stats() -> Dictionary:
 	return {
 		"credit": _credit, "frame_worst_ema": _frame_worst_ema, "backlog": _backlog,
-		"backlog_gated": backlog_gated(), "overload": _overload, "ticks": _ticks,
+		"backlog_gated": backlog_gated(), "overload": _overload, "ticks": _ticks, "relief_only": relief_only(),
 		"promote_hold_s": _promote_hold_s, "headroom_hold_s": _headroom_hold_s, "overload_hold_s": _overload_hold_s,
 	}
 
 # ============================ live input source (§6.5.1) ============================
 
-## The LIVE measured-load source: the main-thread frame cost (Performance TIME_PROCESS + TIME_PHYSICS_PROCESS, the
-## PerfHUD's proc/phys) + the vox_gen backlog (VoxelEngine.get_stats().tasks.generation). Read every frame by tick()
-## on the main thread — the SAME reading logic the PerfHUD uses (perf_hud.gd is not modified; this replicates it).
-## The headless gates DO NOT use this — they inject a deterministic synthetic source instead.
+## The LIVE measured-load source: the main-thread frame cost as the MEASURED wall delta between successive polls
+## (COSMOS-FP-M2-CONTROLLER-FIX §P1) + the vox_gen backlog (VoxelEngine.get_stats().tasks.generation). poll() is called
+## exactly once per frame from WorldManager._process, so the inter-poll delta IS the frame period. This REPLACES the
+## former Performance.TIME_PROCESS + TIME_PHYSICS_PROCESS read, which on the threaded web export is invalid as a frame
+## cost — it folds in the browser present/rAF wait under the emscripten threaded loop and never read below ~18 ms even
+## at a demonstrably idle 60 fps (77 ms median in the live telemetry), asserting overload from boot and pinning credit
+## at 0 for the whole session (§1.1). Each sample is clamped to CTRL_FRAME_SAMPLE_CLAMP_MS so a backgrounded tab (a
+## multi-second inter-poll gap) cannot poison the window; the first poll returns 0.0 (neutral). Wall-clock use stays
+## CONFINED to this class, which the headless gates never construct — they inject a deterministic synthetic source, so
+## determinism (§6.5.7) is intact.
 class LiveSource extends RefCounted:
 	var _ve: Object = null
+	var _last_usec := -1
 	func _init() -> void:
 		if Engine.has_singleton("VoxelEngine"):
 			_ve = Engine.get_singleton("VoxelEngine")
 	func poll() -> Dictionary:
-		var proc_ms := Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0
-		var phys_ms := Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0
+		var now := Time.get_ticks_usec()
+		var frame_ms := 0.0
+		if _last_usec >= 0:
+			frame_ms = minf(float(now - _last_usec) / 1000.0, CubeSphere.CTRL_FRAME_SAMPLE_CLAMP_MS)
+		_last_usec = now
 		var backlog := 0
 		if _ve != null and _ve.has_method("get_stats"):
 			var st: Dictionary = _ve.call("get_stats")
 			backlog = int((st.get("tasks", {}) as Dictionary).get("generation", 0))
-		return {"frame_ms": proc_ms + phys_ms, "backlog": backlog}
+		return {"frame_ms": frame_ms, "backlog": backlog}

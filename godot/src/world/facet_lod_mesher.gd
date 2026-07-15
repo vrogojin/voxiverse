@@ -46,6 +46,8 @@ var _builder = null                        # the ONE FacetLodBuilder this mesher
 var _active_fid := -1
 var _cam: Camera3D = null                   # M2c selector input (stored, unused in M2b)
 var _controller = null                      # M2c/d StreamLoadController (stored, unused in M2b)
+var _imminent_fid := -1                      # CONTROLLER-FIX §P3: the committed imminent-ridge fid — floored through
+                                             # relief mode (budgeter §P3a) and spared by demote (§P3d); −1 = none
 var _apron_mat: StandardMaterial3D = null
 
 var _cache: Dictionary = {}                 # fid -> {lod,node,tris,bytes,last_want_ms, apron:{slot->{mi,s_max,tris,bytes}}}
@@ -115,6 +117,11 @@ func set_camera(cam: Camera3D) -> void:
 ## M2c/d admission controller. Stored now; the credit that scales apply-ms + grants is M2c.
 func set_load_controller(c) -> void:
 	_controller = c
+
+## CONTROLLER-FIX §P3: the committed imminent-ridge fid (WorldManager forwards it each pool pass via module_world).
+## In relief mode the budgeter keeps granting toward this fid at any tier; demote_pressure_relief never coarsens it.
+func set_imminent_fid(fid: int) -> void:
+	_imminent_fid = fid
 
 ## Join the builder thread and free every LOD node. MUST run before this node (or its PlanetRoot parent) is freed —
 ## a bare queue_free would leak the running builder Thread. module_world calls this on pool_reset + _exit_tree.
@@ -201,6 +208,8 @@ func demote_pressure_relief() -> void:
 	for fid in _cache.keys():
 		if _promoting.has(fid):
 			continue                                           # never coarsen a facet whose live promote is in flight
+		if fid == _imminent_fid:
+			continue                                           # CONTROLLER-FIX §P3d: never coarsen the committed imminent ridge
 		var lod := int(_cache[fid]["lod"])
 		if lod >= LOD_MAX_TIER:
 			continue                                           # already the coarsest LOD tier — nothing to give
@@ -326,6 +335,11 @@ func _run_budgeter() -> void:
 		grants = int(_controller.call("grant_count", LOD_REQUESTS_PER_TICK))
 	if grants <= 0:
 		return
+	# CONTROLLER-FIX §P3a: under relief (credit < RELIEF_FLOOR) the floored grants buy COVERAGE only — restrict the
+	# candidate set to (i) meslesh facets (cur < 1, the ≥ℓ3 instant first cover; the far-ring-quad→LOD upgrade that
+	# never happened live) and (ii) the imminent-ridge facet. SSE refinement of already-covered facets stays credit-gated,
+	# which is what makes the floor provably TERMINAL (a meshless facet leaves the set once covered — §3, no build↔demote hunt).
+	var relief := _controller != null and bool(_controller.call("relief_only"))
 	var queue_idle := int(_builder.queued()) < int(0.25 * float(LOD_QUEUE_MAX_JOBS))
 	var cands: Array = []
 	for fid in _want.keys():
@@ -335,6 +349,8 @@ func _run_budgeter() -> void:
 		var cur := int(_cache[fid]["lod"]) if _cache.has(fid) else -1
 		if cur == target:
 			continue                                            # already at target
+		if relief and cur >= 1 and fid != _imminent_fid:
+			continue                                            # §P3a: relief buys coverage, not refinement of covered scenery
 		var grant_lod := target
 		if cur < 1:
 			grant_lod = maxi(target, 3)                         # instant coarse cover first (progressive refinement)

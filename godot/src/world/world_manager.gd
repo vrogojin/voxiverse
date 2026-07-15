@@ -1552,6 +1552,10 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	var live_now: Array = (_module_world.call("pool_neighbour_fids") as Array)
 	var off_surface := _pool_off_surface(active, player_pos)
 	var targets := z1_live_targets(want, off_surface, live_now)
+	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
+	# so its pool-ramp slot is pace-floored, its LOD stays budgeted through relief mode, and demote never coarsens it.
+	if _module_world != null and _module_world.has_method("set_imminent_fid"):
+		_module_world.call("set_imminent_fid", int(targets[0]) if targets.size() > 0 else -1)
 	var now := Time.get_ticks_msec()
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
 	var changed := false
@@ -1568,7 +1572,7 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 				continue
 			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
 				break
-			var admitted: bool = promote_admit_imminent(_load_ctrl) if idx == 0 else promote_admit(_load_ctrl)
+			var admitted: bool = promote_admit_imminent(_load_ctrl, float(want.get(t, 1.0e30))) if idx == 0 else promote_admit(_load_ctrl)
 			if not admitted:
 				continue
 			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
@@ -1646,14 +1650,20 @@ static func promote_admit(ctrl) -> bool:
 		return true
 	return bool(ctrl.promote_admitted()) and not bool(ctrl.backlog_gated())
 
-## FP-M2d (W1) — is the SINGLE imminent live-terrain promote admitted? The ridge the player is committed to crossing is
-## EXEMPT from the raw vox_gen backlog gate (which naturally holds while walking, and would otherwise suppress the
-## crossing promote → spawn-at-cross + a pool-miss); it needs only sustained frame HEADROOM (promote_imminent_admitted).
-## null controller (flag-off / no source) → always admit (shipped FP-M1c). Static so G-M2-POLICY asserts the exemption.
-static func promote_admit_imminent(ctrl) -> bool:
+## FP-M2d (W1) + CONTROLLER-FIX §P3b — is the SINGLE imminent live-terrain promote admitted? The ridge the player is
+## committed to crossing is EXEMPT from the raw vox_gen backlog gate (which naturally holds while walking, and would
+## otherwise suppress the crossing promote → spawn-at-cross + a pool-miss). Two admit paths:
+##  • polite (headroom): sustained frame headroom (promote_imminent_admitted) — used in the [D_COMMIT, D_WARM] band,
+##    where the controller may defer the spawn to a headroom tick (frequently available under P1/P2 when the player pauses);
+##  • committed (geometric): ridge_dist < POOL_D_COMMIT — the crossing is committed, the generation cost is no longer
+##    optional, and pre-paying it now (≈6.7 s of lead even at run speed) strictly dominates paying it at the seam.
+## A pinned-0 credit (the live starvation, §1) can no longer VETO the imminent live invariant (§3.2) — only pace WHEN it
+## starts within the politeness window. null controller (flag-off / no source) → always admit (shipped FP-M1c). Static so
+## G-M2-POLICY / G-M2-STARVE assert both the headroom path (out-of-commit distance) and the geometric commit at credit 0.
+static func promote_admit_imminent(ctrl, ridge_dist: float) -> bool:
 	if ctrl == null:
 		return true
-	return bool(ctrl.promote_imminent_admitted())
+	return bool(ctrl.promote_imminent_admitted()) or ridge_dist < CubeSphere.POOL_D_COMMIT
 
 ## FP-M2d (risk #6, §10) — off-surface spawn freeze: a HIGH FLYER (altitude above the active facet plane > OFFSURFACE_Y)
 ## whose radial direction has drifted over a DIFFERENT facet should not thrash the pool by skimming ridges. Returns true

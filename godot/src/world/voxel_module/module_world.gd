@@ -65,6 +65,9 @@ var _lod_mesher = null
 # never throttled. Default 1.0 → byte-identical to the shipped fixed ramp (M2c never calls it with <1; M2d does).
 var _stream_pace := 1.0
 var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
+var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
+                                              # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
+                                              # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -413,7 +416,13 @@ func _ramp_pool_step(delta: float) -> bool:
 	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
 	# FP-M2c surface 3: the GROW leg is paced by the load controller (RAMP_SECONDS = the min duration, stretched under
 	# load; pace 0 holds the grow). Default pace 1.0 → the shipped ramp math verbatim. Shrinks above snapped separately.
-	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * _stream_pace / RAMP_SECONDS, float(sc["view_target"]))
+	# CONTROLLER-FIX §P3c: the committed imminent slot must keep streaming even when surface-3 pace is held at 0 (else a
+	# geometric-commit spawn sits at RAMP_START_BLOCKS forever) — floor ONLY that slot at RELIEF_FLOOR (worst-case ramp
+	# RAMP_SECONDS/0.25 = 6 s, inside the commit lead time); every other slot keeps the fully-gated pace for optional volume.
+	var pace := _stream_pace
+	if up_fid == _imminent_fid:
+		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
+	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
 	return true
@@ -1518,6 +1527,13 @@ func set_load_controller(c) -> void:
 	_load_ctrl = c
 	if _lod_mesher != null:
 		_lod_mesher.call("set_load_controller", c)
+
+## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
+## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).
+func set_imminent_fid(fid: int) -> void:
+	_imminent_fid = fid
+	if _lod_mesher != null:
+		_lod_mesher.call("set_imminent_fid", fid)
 
 ## FP-M1c (§4.1) init: create PlanetRoot @ T_active⁻¹ and reparent the setup()-built active terrain into a
 ## composite-identity FacetSlot, bounds-clamped to its slab. The active terrain keeps its already-set view

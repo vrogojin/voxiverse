@@ -118,6 +118,8 @@ func _initialize() -> void:
 	_gate_ctrl_rawdt()                              # steelman W2: raw-dt sustain clamp
 	# --- FP-M2d gates: Z1-hybrid pool policy + promote/demote choreography ---
 	_gate_policy()
+	# --- CONTROLLER-FIX gate: the relief floor + geometric commit un-starve the controller (credit was pinned 0) ---
+	await _gate_starve(mod, active, neighbour, corner_fid)
 	await _gate_xpd(mod, active, neighbour)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -679,8 +681,11 @@ func _gate_ctrl(mod: Node3D, active: int) -> void:
 			ticks_to_zero = int(ctrl.stats()["ticks"]) - start_ticks
 			break
 	_ok(ticks_to_zero >= 1 and ticks_to_zero <= 4, "G-M2-CTRL(a): credit → 0 within ≤4 ticks of sustained overload (%d ticks)" % ticks_to_zero)
-	_ok(int(ctrl.grant_count(2)) == 0 and is_equal_approx(ctrl.apply_budget_ms(2.0), 0.0) and is_equal_approx(ctrl.stream_pace(), 0.0),
-		"G-M2-CTRL(a): at credit 0 all admissions stop (grants 0, apply 0ms, pace 0)")
+	# CONTROLLER-FIX §P3a: at credit 0 the RELIEF surfaces 1-2 FLOOR (they buy coverage even under sustained overload) —
+	# grant_count → 1, apply_budget_ms(2.0) → 0.5, relief_only() true — while the feedback surface 3 (pace) still closes.
+	_ok(int(ctrl.grant_count(2)) == 1 and is_equal_approx(ctrl.apply_budget_ms(2.0), 0.5)
+			and is_equal_approx(ctrl.stream_pace(), 0.0) and bool(ctrl.relief_only()),
+		"G-M2-CTRL(a): at credit 0 surfaces 1-2 FLOOR (grants 1, apply 0.5ms, relief_only), surface 3 closes (pace 0)")
 	# (c) no promote↔demote cycling: only ≥ CTRL_OVERLOAD_SUSTAIN_S (3s) of credit-0 overload trips a demote; a short
 	# high pulse must not. We've been overloaded < 3s, so demote_pressure stays false (pause-first, never yanked).
 	_ok(not ctrl.demote_pressure(), "G-M2-CTRL(c): short overload does NOT trip demote pressure (no promote↔demote cycle)")
@@ -806,9 +811,122 @@ func _gate_policy() -> void:
 	for i in range(300):
 		ti += DT; ci.tick(ti)
 	_ok(ci.backlog_gated(), "G-M2-POLICY(W1): backlog gate closed (vox_gen %d > %d)" % [int(si.backlog), CubeSphere.CTRL_BACKLOG_MAX])
-	_ok(WM.promote_admit_imminent(ci), "G-M2-POLICY(W1): the IMMINENT target IS admitted despite the backlog gate (frame-headroom exempt)")
+	# CONTROLLER-FIX §P3b: assert the HEADROOM path specifically — an out-of-commit distance so the geometric commit does
+	# not mask it (the commit path is asserted at credit 0 in G-M2-STARVE(c)).
+	_ok(WM.promote_admit_imminent(ci, CubeSphere.POOL_D_COMMIT + 32.0), "G-M2-POLICY(W1): the IMMINENT target IS admitted despite the backlog gate (frame-headroom exempt, out of commit range)")
 	_ok(not WM.promote_admit(ci), "G-M2-POLICY(W1): the 2nd/corner target is NOT admitted while backlog-gated (feed-forward throttle holds)")
-	_ok(WM.promote_admit_imminent(null), "G-M2-POLICY(W1): null controller (flag-off) → imminent admit (shipped FP-M1c)")
+	_ok(WM.promote_admit_imminent(null, CubeSphere.POOL_D_COMMIT + 32.0), "G-M2-POLICY(W1): null controller (flag-off) → imminent admit (shipped FP-M1c)")
+
+# ---------- G-M2-STARVE: the relief floor + geometric commit un-starve the controller (§6.3 regression gate) ----------
+# COSMOS-FP-M2-CONTROLLER-FIX §6.3 — the gate that would have caught the live starvation (credit pinned 0 for 437 s:
+# zero LOD facets ever built, every crossing a pool-miss). Fixed-step injected clock + synthetic _SquareWaveSource
+# throughout; NO wall clock in any decision. (a) pins the shipped deadlock as the precondition; (b) is the minimal
+# catcher (the single assert that fails on shipped code); (c) the geometric commit; (d) end-to-end residency under
+# starvation; (e) disjointness / no build↔demote hunt; (f) p90 ≡ max trace identity under a constant signal.
+func _gate_starve(mod: Node3D, active: int, neighbour: int, corner_fid: int) -> void:
+	print("  --- G-M2-STARVE: relief floor + geometric commit (credit-0 no longer inert) ---")
+	var DT := 1.0 / 60.0
+	# (a) reproduce the shipped STARVED state: sustained overload + heavy backlog → credit 0, both promote gates shut.
+	var ctrl = SLC.new()
+	var src = _SquareWaveSource.new()
+	ctrl.set_input_source(src)
+	src.frame_ms = 45.0; src.backlog = 900               # >> CTRL_FRAME_BUDGET_MS(18) and >> CTRL_BACKLOG_MAX(300)
+	var t := 0.0
+	for i in range(300):                                 # ≥12 control ticks (a control tick fires every ~15 frames)
+		t += DT; ctrl.tick(t)
+	_ok(ctrl.credit() == 0.0 and ctrl.backlog_gated()
+			and not ctrl.promote_admitted() and not ctrl.promote_imminent_admitted(),
+		"G-M2-STARVE(a): sustained overload+backlog pins credit 0, both promote gates shut (the shipped deadlock precondition)")
+	# (b) THE MINIMAL CATCHER: under (a), surfaces 1-2 are still open at the RELIEF FLOOR (this single assert fails on shipped code).
+	_ok(int(ctrl.grant_count(2)) == 1 and is_equal_approx(ctrl.apply_budget_ms(2.0), 0.5) and bool(ctrl.relief_only()),
+		"G-M2-STARVE(b): under sustained overload the build/apply surfaces stay OPEN at the floor (grants 1, apply 0.5ms) — the fix")
+	# (c) the imminent ridge still PROMOTES at credit 0 via the geometric commit; the politeness window + the corner/2nd throttle hold.
+	_ok(WM.promote_admit_imminent(ctrl, CubeSphere.POOL_D_COMMIT - 1.0),
+		"G-M2-STARVE(c): imminent promote ADMITTED at credit 0 inside POOL_D_COMMIT (geometric commit — no seam-burst)")
+	_ok(not WM.promote_admit_imminent(ctrl, CubeSphere.POOL_D_COMMIT + 32.0),
+		"G-M2-STARVE(c): imminent promote DEFERRED outside POOL_D_COMMIT at credit 0 (politeness window intact)")
+	_ok(not WM.promote_admit(ctrl), "G-M2-STARVE(c): the corner/2nd promote stays throttled at credit 0 (feed-forward on optional volume)")
+	# (f) p90 ≡ max under a CONSTANT signal → the AIMD credit trace equals the pre-change (window-max) constants.
+	var cf = SLC.new()
+	var sf = _SquareWaveSource.new()
+	cf.set_input_source(sf)
+	var tf := 0.0
+	sf.frame_ms = 6.0; sf.backlog = 0
+	for i in range(120):                                 # warm to credit 1 under sustained headroom
+		tf += DT; cf.tick(tf)
+	sf.frame_ms = 40.0                                   # constant overload → capture the multiplicative-decrease trace tick-by-tick
+	var trace: Array = []
+	var last_ticks := int(cf.stats()["ticks"])
+	while trace.size() < 4 and tf < 120.0:
+		tf += DT; cf.tick(tf)
+		var nt := int(cf.stats()["ticks"])
+		if nt > last_ticks:
+			last_ticks = nt
+			trace.append(cf.credit())
+	var expect := [0.5, 0.25, 0.125, 0.0]                # 1.0 ×0.5/tick; 0.0625 ≤ _CREDIT_ZERO_SNAP(0.1) → snaps to 0
+	var ident := trace.size() == expect.size()
+	for i in range(expect.size()):
+		if i >= trace.size() or not is_equal_approx(float(trace[i]), expect[i]):
+			ident = false
+	_ok(ident, "G-M2-STARVE(f): constant-signal credit trace == pre-change AIMD (p90 ≡ max) %s" % str(trace))
+	# (d) end-to-end residency UNDER STARVATION: wire the starved controller into a REAL mesher, seed a want for an
+	# uncovered facet, drive → the ℓ3 first cover MATERIALIZES. Live telemetry showed residency pinned at 0 for 437 s.
+	var md = FLM.new()
+	get_root().add_child(md)
+	if bool(md.setup(mod)):
+		md.call("set_load_controller", ctrl)             # ctrl is starved (credit 0, relief_only) from (a)
+		md.call("set_imminent_fid", -1)
+		md._want[neighbour] = 1                           # want a FINE tier; relief still covers a MESHLESS facet at ℓ3 first
+		var covered: bool = await _drive_mesher(md, neighbour, 60000)
+		_ok(covered and int(md.stats()["facets"]) >= 1,
+			"G-M2-STARVE(d): a meshless facet is covered under sustained credit-0 starvation (residency %d ≥ 1)" % int(md.stats()["facets"]))
+		md.shutdown()
+	else:
+		_ok(false, "G-M2-STARVE(d): mesher setup for the residency-under-starvation check")
+	if is_instance_valid(md):
+		md.free()
+	# (e) disjointness / no build↔demote hunt: cover a non-imminent A and the imminent I at ℓ2 (direct, controller-free);
+	# then wire the STARVED controller (relief_only) and assert (e1) a covered non-imminent facet wanting FINER is NOT
+	# re-granted; (e2) demote coarsens A (not I) and A keeps its mesh; (e3) the imminent I is never the demote victim.
+	var me = FLM.new()
+	get_root().add_child(me)
+	if bool(me.setup(mod)):
+		var A := neighbour
+		var Ic := corner_fid
+		me.request(A, 2)
+		var cA: bool = await _drive_mesher(me, A, 60000)
+		me.request(Ic, 2)
+		var cI: bool = await _drive_mesher(me, Ic, 60000)
+		if cA and cI and me.lod_of(A) == 2 and me.lod_of(Ic) == 2:
+			me.call("set_load_controller", ctrl)         # relief_only holds (credit 0 from (a))
+			me.call("set_imminent_fid", Ic)
+			# (e1) covered non-imminent A wants finer → the relief budgeter must NOT grant it (refinement stays credit-gated).
+			me._want.clear(); me._want[A] = 1; me._want[Ic] = 2   # keep both wanted (no idle-out); Ic@cur → no self-regrant
+			for i in range(40):
+				me.tick(); await process_frame
+			_ok(me.lod_of(A) == 2 and not me.is_building(A),
+				"G-M2-STARVE(e1): a covered non-imminent facet is NOT refined in relief mode (held at ℓ%d)" % me.lod_of(A))
+			# (e2/e3) demote: victim is A (Ic is imminent → §P3d spared); A keeps its mesh through the coarser rebuild; Ic stays ℓ2.
+			me._want.clear()
+			var covered_before := int(me.stats()["facets"])
+			me.demote_pressure_relief()
+			_ok(me.is_covered(A), "G-M2-STARVE(e2): the demote victim keeps a mesh during the coarser rebuild (no hole)")
+			var coarsened: bool = await _drive_until(me, func(): return int(me.lod_of(A)) == 3, 60000)
+			_ok(coarsened, "G-M2-STARVE(e2): demote_pressure_relief coarsened the NON-imminent victim A one tier (ℓ2 → ℓ3)")
+			_ok(me.lod_of(Ic) == 2 and int(me.stats()["facets"]) == covered_before,
+				"G-M2-STARVE(e3): the imminent ridge is SPARED by demote (held at ℓ2, residency %d unchanged)" % covered_before)
+			# no re-grant while relief holds: A@ℓ3 wanting finer → stays ℓ3 (the only path back to finer needs credit ≥ FLOOR).
+			me._want.clear(); me._want[A] = 1; me._want[Ic] = 2
+			for i in range(40):
+				me.tick(); await process_frame
+			_ok(me.lod_of(A) == 3, "G-M2-STARVE(e): the coarsened victim is NOT re-refined while relief_only holds (ℓ%d — no hunting)" % me.lod_of(A))
+		else:
+			_ok(false, "G-M2-STARVE(e): setup — cover non-imminent A@ℓ2 (cA=%s ℓ%d) + imminent I@ℓ2 (cI=%s ℓ%d)" % [str(cA), me.lod_of(A), str(cI), me.lod_of(Ic)])
+		me.shutdown()
+	else:
+		_ok(false, "G-M2-STARVE(e): mesher setup for the disjointness check")
+	if is_instance_valid(me):
+		me.free()
 
 # ---------- G-M2-XPD: promote-hold / evict + redesignate (no rebuild, no teardown, pool-miss 0) (§9) ----------
 func _gate_xpd(mod: Node3D, active: int, neighbour: int) -> void:

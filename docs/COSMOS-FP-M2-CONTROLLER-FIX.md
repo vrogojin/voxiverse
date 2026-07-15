@@ -1,6 +1,12 @@
 # COSMOS-FP-M2-CONTROLLER-FIX — un-starving the StreamLoadController (credit pinned at 0, M2 inert in production)
 
-Status: **design locked, implementation pending** (task #115, branch `fix/voxiverse-crossing-hitches`).
+Status: **implemented + headless-gate-validated** (2026-07-15, task #115, branch
+`fix/voxiverse-crossing-hitches`). All three prongs (P1 sensor, P2 p90 statistic, P3
+relief floor + geometric commit) shipped across the 6 files in §6.2/§6.3; the new
+regression gate **G-M2-STARVE(a–f)** plus the amended G-M2-CTRL(a) / G-M2-POLICY(W1)
+pass with FACETED+FP_M1_POOL+FP_M2_LOD on (127/0), and the flag-off FLAT `verify_feature`
+byte-identity holds (6027/0). Live/web acceptance (§6.4) remains manual and pending —
+headless cannot reproduce the web `TIME_PROCESS` pathology.
 This document EXTENDS `docs/COSMOS-FP-M2-DESIGN.md`: it amends §6.5 (the admission
 controller), overturns §14.10(a) (starvation as accepted risk), and supersedes ledger
 row 7's implicit assumption that one AIMD credit may gate all four admission surfaces.

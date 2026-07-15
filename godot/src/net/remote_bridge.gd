@@ -255,6 +255,12 @@ func _process(delta: float) -> void:
 	if not _authed:
 		return
 
+	# ── Crossing events (A1 instrumentation, #114) ──────────────────────────────────────────────
+	# EVENT-driven: drained every frame (not folded into the 0.25 s telemetry window) so a facet-crossing
+	# spike is reported as its own record the moment it happens. Cheap: a guarded has_method + an is_empty
+	# array check when there is nothing to send (the normal case), which is byte-free vs the ambient stream.
+	_drain_crossing_events()
+
 	# ── Telemetry tick ────────────────────────────────────────────────────────────────────────
 	if _win_acc >= TELEMETRY_INTERVAL:
 		_send_telemetry()
@@ -340,6 +346,33 @@ func _send_telemetry() -> void:
 	# there is clear headroom below the ring cap. This keeps ERR_OUT_OF_MEMORY out of the console.
 	if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN \
 			and _ws.get_current_outbound_buffered_amount() < OUTBOUND_BUFFER_BYTES - 65536:
+		_ws.send_text(JSON.stringify(msg))
+
+
+## A1 CROSSING INSTRUMENTATION (#114): drain WorldManager's per-crossing attribution queue and send each record as a
+## DISTINCT {"type":"crossing", …} text message on the SAME authed socket as the ambient telemetry (the relay appends
+## any unknown JSON line to telemetry.jsonl — no relay change needed). Each record carries the transform-write ms (the
+## NOTIFICATION_TRANSFORM_CHANGED spike), the crossing total + phase split, and the re-placed block/neighbour/LOD
+## counts, so a real-GPU walkthrough can ATTRIBUTE the hitch. Guarded for absence (non-faceted / GDScript path) and
+## backpressure so it never crashes the bridge nor piles onto a stalled socket. The ambient telemetry stream is intact.
+func _drain_crossing_events() -> void:
+	if not is_instance_valid(world) or not world.has_method("take_crossing_events"):
+		return
+	var events: Array = world.call("take_crossing_events")
+	if events.is_empty():
+		return
+	for ev in events:
+		if not (ev is Dictionary):
+			continue
+		# Only send while there is clear ring-buffer headroom (parity with _send_telemetry) — a crossing record is
+		# small (~250 B) and the signal we most want, but under a total stall we still refuse to grow the buffer.
+		if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN \
+				or _ws.get_current_outbound_buffered_amount() >= OUTBOUND_BUFFER_BYTES - 65536:
+			break
+		var msg: Dictionary = (ev as Dictionary).duplicate()
+		msg["type"] = "crossing"          # relay/reader message discriminator (the record keeps its own "ev":"crossing")
+		msg["t"] = Time.get_unix_time_from_system()
+		msg["up_ms"] = Time.get_ticks_msec()
 		_ws.send_text(JSON.stringify(msg))
 
 

@@ -61,6 +61,12 @@ var _cross_cooldown := 0              # remaining suppressed calls (decremented 
 var _last_pool_spawn_ms := -100000
 var _last_pool_retire_ms := -100000
 var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
+# and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
+# committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
+# session can never grow it without limit (NEVER-OOM). Untouched when FACETED is off → FLAT byte-identity holds.
+var _crossing_events: Array = []
+const CROSSING_EVENTS_MAX := 32       # hard cap; oldest dropped past this (a bridge drains ~60/s — never reached live)
 # FP-M2d (§9.1): fids whose live promote is in flight (fid -> spawn ms). Each frame their seam-side band is polled
 # (pool_seam_meshed); when meshed — or after CubeSphere.PROMOTE_EVICT_MAX_S — the held LOD cover is evicted (lod_evict),
 # so the LOD mesh overlaps the streaming terrain with NO gap and is dropped only once the full-res seam is up. FP_M2_LOD-only.
@@ -1441,16 +1447,26 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 				continue
 			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
 			var yaw_delta := atan2(ex.z, ex.x)
+			# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
+			# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
+			# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
+			var _cross_t0 := Time.get_ticks_usec()
+			var _rebuild_us := 0
+			var _redesig_us := 0
+			var _far_us := 0
 			TerrainConfig.set_active_facet(to)
 			# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
 			# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
 			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
 			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
+			var _rebuild_t0 := Time.get_ticks_usec()
 			_rebuild_window_indices()
+			_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
 			# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
 			# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
 			# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
 			var redesignated := false
+			var _redesig_t0 := Time.get_ticks_usec()
 			if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
 				redesignated = bool(_module_world.call("redesignate", to))
 				if not redesignated:
@@ -1463,13 +1479,16 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 						# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
 						# blank. NOT the FP-S1 set_facet path.
 						redesignated = bool(_module_world.call("pool_reset", to))
+			_redesig_us = Time.get_ticks_usec() - _redesig_t0
 			if redesignated:
 				# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
 				# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
 				# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
+				var _far_t0 := Time.get_ticks_usec()
 				if _facet_ring != null:
 					_facet_ring.set_active(to)
 					_facet_ring_sync_exclusion()
+				_far_us = Time.get_ticks_usec() - _far_t0
 			else:
 				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
 				# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
@@ -1483,6 +1502,31 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
 			print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
 				"RE-DESIGNATION" if redesignated else "restream + far re-place"])
+			# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
+			# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
+			# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
+			# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
+			var _cross_us := Time.get_ticks_usec() - _cross_t0
+			var _rd: Dictionary = {}
+			if _module_world != null and _module_world.has_method("take_last_redesignate"):
+				_rd = _module_world.call("take_last_redesignate")
+			var _rec := {
+				"ev": "crossing",
+				"from_fid": fid, "to_fid": to,
+				"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
+				"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
+				"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
+				"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
+				"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
+				"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
+				"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
+				"live_neighbours": int(_rd.get("live_neighbours", 0)),
+				"lod_tiles": int(_rd.get("lod_tiles", 0)),
+				"redesignated": redesignated,
+			}
+			_crossing_events.append(_rec)
+			while _crossing_events.size() > CROSSING_EVENTS_MAX:
+				_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
 			return {"crossed": true, "from": fid, "to": to,
 				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
 	return {}
@@ -1738,6 +1782,17 @@ func facet_pool_has(fid: int) -> bool:
 	return _module_world != null and _module_world.has_method("pool_has") and bool(_module_world.call("pool_has", fid))
 func facet_pool_neighbour_count() -> int:
 	return int(_module_world.call("pool_neighbour_count")) if (_module_world != null and _module_world.has_method("pool_neighbour_count")) else 0
+
+## A1 CROSSING INSTRUMENTATION (#114): drain + return all per-crossing attribution records queued since the last call
+## (FIFO, oldest first), clearing the queue. RemoteBridge polls this each frame and publishes each record as a
+## distinct {"type":"crossing",…} JSON on the authed telemetry socket. Empty in normal play (a crossing is seconds
+## apart); the queue only ever fills on committed faceted crossings, so this is a no-op when FACETED is off.
+func take_crossing_events() -> Array:
+	if _crossing_events.is_empty():
+		return []
+	var out := _crossing_events
+	_crossing_events = []
+	return out
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:

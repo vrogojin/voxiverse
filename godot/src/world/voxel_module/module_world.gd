@@ -55,6 +55,11 @@ var _gen_mwin: Array = [1, 0, 0, 1]
 var _planet_root: Node3D = null              # holds the FacetSlots; transform = T_active⁻¹ (rigid re-place on cross)
 var _pool: Dictionary = {}                   # fid -> FacetSlot dict {terrain, slot, mesher, generator, spawn_ms, view, editable}
 var _pool_active := -1                        # the currently-active (editable, composite-identity) facet id
+# A1 CROSSING INSTRUMENTATION (#114): the last redesignate()'s attribution metrics, populated ONLY inside
+# redesignate() and drained by WorldManager.maybe_cross_facet (take_last_redesignate). Empty until a crossing
+# occurs; redesignate runs on the crossing path only (FACETED+FP_M1_POOL), so this adds ZERO per-frame cost and
+# is unreachable when the faceted flags are off (FLAT byte-identity preserved).
+var _last_redesignate: Dictionary = {}
 # COSMOS FP-M2b (docs/COSMOS-FP-M2-DESIGN.md §5): the LOD-mesh layer, a child of PlanetRoot @ identity that draws
 # the near rings of non-active facets as blocky LOD meshes (+ ridge aprons) instead of far-ring quads. Owns ONE
 # FacetLodBuilder (the M2a off-thread build primitive). null unless FP_M2_LOD (dead code → FP-M1c byte-identical).
@@ -1611,10 +1616,16 @@ func redesignate(to: int) -> bool:
 	if not _pool.has(to) or to == _pool_active:
 		return false
 	var from := _pool_active
+	# A1 CROSSING INSTRUMENTATION (#114): time the whole redesignate + bracket the SINGLE transform write, which is
+	# what fires godot_voxel's NOTIFICATION_TRANSFORM_CHANGED → per-mesh-block instance_set_transform across all live
+	# terrains (the 200–772 ms spike). Only executes on a real crossing (this is the crossing path), so zero cost off.
+	var _redesig_t0 := Time.get_ticks_usec()
 	# ONE assignment — the engine re-places every child slot's mesh blocks rigidly (voxel_terrain.cpp:867-882),
 	# sub-frame, no meshing. `to`'s composite becomes T_to⁻¹·T_to = identity (axis-aligned, editable); `from`'s
 	# becomes T_to⁻¹·T_from (the dihedral turn — the rotated neighbour, same weld as the far ring).
+	var _xform_t0 := Time.get_ticks_usec()
 	_planet_root.transform = FacetAtlas.facet_transform(to).affine_inverse()
+	var _transform_us := Time.get_ticks_usec() - _xform_t0
 	# View-distance rebalance (§5). `to` RAMPS up 96 → near radius: jamming that 96→128 delta annulus in ONE pass is
 	# the SECOND crossing burst — spread it over RAMP_SECONDS like every other grow (the ramp step drives it from the
 	# next frame; the far ring covers the delta rim meanwhile). `from` shrinks to the neighbour radius, and a shrink
@@ -1640,7 +1651,52 @@ func redesignate(to: int) -> bool:
 	# facet — `to` is now live (dropped from LOD coverage), the old active becomes the nearest LOD ring next tick.
 	if _lod_mesher != null:
 		_lod_mesher.call("set_active_facet", to)
+	# A1 CROSSING INSTRUMENTATION (#114): stash the attribution metrics for WorldManager to drain. blocks_replaced is
+	# the loaded mesh-block count re-placed by the transform write (summed across every live pool terrain); the two µs
+	# figures split the transform write out of the total redesignate cost. Measured AFTER the write — the block SET is
+	# unchanged by a rigid re-place, only re-positioned. This whole tail is on the crossing path (runs once per cross).
+	_last_redesignate = {
+		"transform_us": _transform_us,
+		"redesignate_us": Time.get_ticks_usec() - _redesig_t0,
+		"blocks_replaced": _pool_block_sum(),
+		"live_neighbours": pool_neighbour_count(),
+		"lod_tiles": _lod_tile_count(),
+	}
 	return true
+
+## A1 CROSSING INSTRUMENTATION (#114): return the last redesignate()'s metrics and CLEAR the latch (so a drain never
+## re-reports a stale crossing). {} when no crossing has occurred since the last drain. Crossing-path only — never
+## called in normal play (WorldManager.maybe_cross_facet is the sole caller, right after a committed redesignate).
+func take_last_redesignate() -> Dictionary:
+	var out := _last_redesignate
+	_last_redesignate = {}
+	return out
+
+## Sum the loaded mesh-block counters across every LIVE pool terrain (active + neighbours) via godot_voxel's
+## get_statistics() — this is the block population the ONE PlanetRoot transform write re-places. get_statistics
+## exposes a flat dict of counters; we sum the int entries whose key mentions "block" (the same shape the cosmos
+## gates read). Called once per crossing only, so the per-terrain stat probe never costs a per-frame anything.
+func _pool_block_sum() -> int:
+	var total := 0
+	for fid in _pool.keys():
+		var t: Object = _pool[fid]["terrain"]
+		if t == null or not t.has_method("get_statistics"):
+			continue
+		var st = t.call("get_statistics")
+		if st is Dictionary:
+			for k in (st as Dictionary).keys():
+				var v = st[k]
+				if v is int and String(k).findn("block") >= 0:
+					total += int(v)
+	return total
+
+## The FP-M2 LOD layer's covered-facet count (each is a re-tiered LOD mesh set moved by the same PlanetRoot write).
+## 0 when the LOD layer is absent (FP_M2_LOD off) — cheap stats() read, crossing-path only.
+func _lod_tile_count() -> int:
+	if _lod_mesher == null or not _lod_mesher.has_method("stats"):
+		return 0
+	var ls = _lod_mesher.call("stats")
+	return int((ls as Dictionary).get("facets", 0)) if ls is Dictionary else 0
 
 ## FP-M1c pathological POOL-MISS fallback (§5.1.a): the destination `to` could not be re-designated NOR spawned
 ## (e.g. a teleport past the neighbour cap). Rather than the FP-S1 set_facet teardown (which would rebuild OUTSIDE

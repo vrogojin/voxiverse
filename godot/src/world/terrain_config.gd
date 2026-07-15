@@ -154,6 +154,52 @@ static func near_render_radius() -> int:
 ## the collider read TerrainConfig directly (not the mesh), so collision is unchanged.
 const VIEWER_VERTICAL_RATIO := 0.5
 
+## A2 UNDERGROUND DOWNWARD-REACH CLAMP (perf: faster initial near-terrain gen for a SURFACE player).
+## A surface player never needs the deep underground STREAMED/meshed: the analytic truth
+## (WorldManager.block_id_at → cell_value_at → TerrainConfig.resolve_cell) reads THIS file DIRECTLY,
+## not the voxel render buffer, so a never-streamed deep cell is still SOLID and BREAKABLE. The world is
+## heightmap-only bedrock→surface (no 3-D caves, §6.8), so nothing structural is lost by not meshing the
+## underground. godot_voxel's VoxelViewer exposes ONLY a symmetric vertical ellipsoid (a single
+## view_distance_vertical_ratio, no separate up/down reach), so the clamp KEEPS the full UPWARD reach
+## (mountains) and trims only the DOWNWARD reach by OFFSETTING the viewer node +radial-up and shrinking
+## the ratio (the geometry lives in the three helpers below; the wiring is module_world.attach_viewer,
+## FACETED-gated). REVERSIBLE + byte-identical when off: flip the toggle false → the viewer reverts to the
+## un-clamped symmetric slab verbatim. Never EXTENDS the reach (a no-op if the band already ≥ the up reach).
+const DOWNWARD_REACH_CLAMP_ENABLED := true
+
+## Blocks kept streamed BELOW the player — the modest underground band (design range ~32-48). 40 leaves a
+## comfortable dig/step-down margin under the analytic ground while dropping the deepest (U−D) blocks of
+## pure interior stone/deepslate a surface player never sees. NEVER-OOM: this REMOVES streaming work; it
+## adds no queue and defers nothing into a growing buffer.
+const VIEWER_DOWNWARD_REACH_BLOCKS := 40
+
+## The symmetric vertical reach in blocks (U): view_distance · VIEWER_VERTICAL_RATIO. Un-clamped this is
+## the reach BOTH up and down; the clamp keeps it UP and trims the down side to VIEWER_DOWNWARD_REACH_BLOCKS.
+static func viewer_vertical_reach() -> float:
+	return float(near_render_radius()) * VIEWER_VERTICAL_RATIO
+
+## The +Y offset applied to the VoxelViewer node (radial-up on the composite-identity active facet, where
+## world +Y = local up) so a SYMMETRIC ellipsoid still reaches U up but only D=VIEWER_DOWNWARD_REACH_BLOCKS
+## down: with half-height H=(U+D)/2 centred at +O, top = O+H = U and bottom = O−H = −D, so O = (U−D)/2.
+## Returns 0 (no-op) when the band already covers U — the clamp never EXTENDS the reach.
+static func clamped_viewer_offset_y() -> float:
+	var u := viewer_vertical_reach()
+	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	if d >= u:
+		return 0.0
+	return (u - d) * 0.5
+
+## The shrunk view_distance_vertical_ratio pairing with clamped_viewer_offset_y(): half-height H=(U+D)/2
+## over the horizontal view_distance. Falls back to the un-clamped VIEWER_VERTICAL_RATIO (no-op) when the
+## band already covers U (or view_distance is degenerate).
+static func clamped_viewer_vertical_ratio() -> float:
+	var vd := float(near_render_radius())
+	var u := viewer_vertical_reach()
+	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	if d >= u or vd <= 0.0:
+		return VIEWER_VERTICAL_RATIO
+	return ((u + d) * 0.5) / vd
+
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
 ## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +

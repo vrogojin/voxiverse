@@ -2242,11 +2242,23 @@ func attach_viewer(player: Node3D) -> void:
 	if _viewer == null:
 		return
 	_set_if(_viewer, "view_distance", TerrainConfig.near_render_radius())
-	# Vertical stream ratio (1.0 now that terrain is shallow; kept configurable in
-	# TerrainConfig should tall terrain return).
-	_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
+	# A2 UNDERGROUND DOWNWARD-REACH CLAMP. VoxelViewer has NO asymmetric up/down extent — only a single
+	# view_distance_vertical_ratio, a SYMMETRIC world-Y ellipsoid centred on the viewer node. To keep the
+	# full UPWARD reach (mountains) while trimming the DOWNWARD reach to a modest band, offset the viewer
+	# +Y and shrink the ratio (TerrainConfig helpers): on the composite-identity active facet world +Y =
+	# radial up = the player's local up (the body only yaws), so a (0, O, 0) LOCAL offset is a pure radial
+	# +O in world. FACETED-gated + toggle-gated so the FLAT world keeps its byte-identical symmetric slab.
+	var use_clamp := CubeSphere.FACETED and TerrainConfig.DOWNWARD_REACH_CLAMP_ENABLED
+	if use_clamp:
+		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.clamped_viewer_vertical_ratio())
+	else:
+		# Un-clamped vertical stream ratio (byte-identical to the pre-A2 viewer).
+		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
 	_set_if(_viewer, "requires_collisions", false)
 	player.add_child(_viewer)
+	if use_clamp:
+		# LOCAL offset (child of the player) → radial +O on the active facet; unaffected by yaw.
+		(_viewer as Node3D).position = Vector3(0.0, TerrainConfig.clamped_viewer_offset_y(), 0.0)
 
 ## True once every mesh block intersecting the axis-aligned box of half-extents `half` around world
 ## point `center` has been MESHED (its surface applied to the scene, so it renders next frame). Used by

@@ -135,10 +135,14 @@ func enqueue_tile(fid: int, lod: int, cx: int, cy: int, cz: int, n: int, epoch: 
 ## coords so it rides PlanetRoot rigidly with every other LOD mesh. Built on THIS builder thread as a job
 ## appendix — pure frozen-atlas data + profile_at_dir + FarPalette (all warmed before the thread runs), the same
 ## thread-safety class as generate_block. Returns false if the flag/thread is unavailable. MAIN thread only.
-func enqueue_apron(owner_fid: int, slot: int, s_max: int) -> bool:
+## `clamp_live` (FP-NEIGHBOUR-SEAM-POLISH §7.6 / A1): build the OWNER-SIDE HALF ONLY — the owner top strip + owner
+## outer skirt, and NONE of the neighbour-side strip/skirt. Used on a live↔LOD seam so the apron fills the LOD-side
+## eroded shelf but every vertex stays on the owner side of the welded ridge plane (off ∈ [0, s_max]); it therefore
+## cannot protrude into / z-fight the live facet. A strict subset of the LOD↔LOD apron's already-shipped owner half.
+func enqueue_apron(owner_fid: int, slot: int, s_max: int, clamp_live: bool = false) -> bool:
 	if not is_running() or slot < 0 or slot > 3 or s_max < 2:
 		return false
-	var job := {"kind": "apron", "fid": owner_fid, "slot": slot, "s_max": s_max}
+	var job := {"kind": "apron", "fid": owner_fid, "slot": slot, "s_max": s_max, "clamp": clamp_live}
 	_queue_mutex.lock()
 	_queue.append(job)
 	_queue_mutex.unlock()
@@ -212,6 +216,7 @@ func _build_apron(job: Dictionary) -> Dictionary:
 	var owner: int = job["fid"]
 	var slot: int = job["slot"]
 	var s_max: int = job["s_max"]
+	var clamp_live: bool = bool(job.get("clamp", false))       # A1: owner-side half only (no neighbour-side geometry)
 	var fs := float(s_max)
 	var ring: Array = FacetAtlas.seam_ring(owner, slot)
 	var r0: Vector3 = ring[0]
@@ -231,6 +236,7 @@ func _build_apron(job: Dictionary) -> Dictionary:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var down := Vector3(0.0, fs, 0.0)
+	var quads := 0
 	for i in range(nseg):
 		var t0 := float(i) / float(nseg)
 		var t1 := float(i + 1) / float(nseg)
@@ -251,19 +257,25 @@ func _build_apron(job: Dictionary) -> Dictionary:
 		var oO0 := rA0 + inward * fs; var oO1 := rA1 + inward * fs      # owner-side outer (+own_dist s_max)
 		var nO0 := rA0 - inward * fs; var nO1 := rA1 - inward * fs      # neighbour-side outer (−own_dist s_max)
 		_apron_quad(st, rA0, oO0, oO1, rA1, c0, c0, c1, c1)            # owner top strip
-		_apron_quad(st, nO0, rA0, rA1, nO1, c0, c0, c1, c1)            # neighbour top strip
 		_apron_quad(st, oO0, oO0 - down, oO1 - down, oO1, c0, c0, c1, c1)  # owner outer skirt
-		_apron_quad(st, nO0, nO0 - down, nO1 - down, nO1, c0, c0, c1, c1)  # neighbour outer skirt
+		quads += 2
+		if not clamp_live:
+			# A1: on a live↔LOD seam these neighbour-side quads would reach ACROSS the welded ridge into the live
+			# facet (off < 0) and z-fight its carve bevel — so the plane-clamp omits them entirely. rA0/rA1 already
+			# sit ON the ridge line (off = 0), so the owner half above stops exactly at the welded plane.
+			_apron_quad(st, nO0, rA0, rA1, nO1, c0, c0, c1, c1)            # neighbour top strip
+			_apron_quad(st, nO0, nO0 - down, nO1 - down, nO1, c0, c0, c1, c1)  # neighbour outer skirt
+			quads += 2
 	var mesh: ArrayMesh = st.commit()
-	var verts := 0
-	var tris := 0
-	if mesh != null and mesh.get_surface_count() > 0:
-		var arr: Array = mesh.surface_get_arrays(0)
-		var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
-		verts = pv.size()
-		tris = int(verts / 3)     # SurfaceTool triangle soup (no index() call) → ARRAY_INDEX is null; verts = 3·tris
+	# COUNT verts/tris FROM THE QUAD TALLY — never mesh.surface_get_arrays() here. That readback is a
+	# render-server round-trip on the BUILDER thread; if the main thread is joining this thread (shutdown /
+	# wait_to_finish) while a build is in flight, it stops pumping frames and the readback deadlocks. A1 builds
+	# aprons continuously (toward the live active facet), so a build is almost always in flight at shutdown — this
+	# tally makes the apron build render-server-free. Triangle soup (no index()): 2 tris/quad, verts = 3·tris.
+	var tris := (0 if mesh == null else quads * 2)
+	var verts := tris * 3
 	return {
-		"fid": owner, "kind": "apron", "slot": slot, "s_max": s_max, "lod": 0, "tile": Vector3i.ZERO,
+		"fid": owner, "kind": "apron", "slot": slot, "s_max": s_max, "clamp": clamp_live, "lod": 0, "tile": Vector3i.ZERO,
 		"mesh": mesh, "verts": verts, "tris": tris,
 		"bytes": verts * _BYTES_PER_VERT + (tris * 3) * _BYTES_PER_INDEX,
 		"thread_id": OS.get_thread_caller_id(),

@@ -546,14 +546,47 @@ func _gate_seam(mod: Node3D, active: int) -> void:
 			# (c) spans BOTH sides of the retreat gap, and every apron vertex stays within the ±s_max window.
 			_ok(max_off > 0.5 and min_off < -0.5, "G-M2-SEAM(c): apron spans BOTH sides of the ridge (owner off=%.1f, nbr off=%.1f)" % [max_off, min_off])
 			_ok(max_perp <= float(s_max) + 0.75, "G-M2-SEAM(c): every apron vertex within the ±s_max window (max |off|=%.2f ≤ %d)" % [max_perp, s_max])
-	# W6: put the NEIGHBOUR into a promote-hold (its live terrain now streams under a held cover) — the owner's apron on
-	# the ridge facing it MUST be dropped (an apron there extends into the live facet and z-fights its carve bevel).
+	# W6: put the NEIGHBOUR into a promote-hold (its live terrain now streams under a held cover). WITHOUT the seam-polish
+	# the owner's apron on the ridge facing it MUST be dropped (a both-sided apron there extends INTO the live facet and
+	# z-fights its carve bevel). WITH FP_NEIGHBOUR_SEAM_POLISH (A1) it is instead REPLACED by a PLANE-CLAMPED apron: the
+	# owner-side half only, so it fills the LOD-side shelf but every vertex stays on the owner side of the welded ridge
+	# (own-side offset ≥ 0) and therefore still cannot protrude into / z-fight the live facet — the erosion invariant holds.
 	if apron_up:
 		m.on_promote(nbr)
-		var gone: bool = await _drive_until(m, func(): return not m.apron_slots(owner).has(oslot), 30000)
-		_ok(gone, "G-M2-SEAM(W6): no apron on a live<->LOD ridge — the owner apron facing the promoting neighbour is dropped")
+		if CubeSphere.FP_NEIGHBOUR_SEAM_POLISH:
+			var clamped: bool = await _drive_until(m, func(): return _apron_owner_side_only(m, owner, oslot), 30000)
+			_ok(clamped, "G-M2-SEAM(W6): live<->LOD ridge apron is PLANE-CLAMPED to the owner side (no vertex crosses the ridge into the live facet)")
+		else:
+			var gone: bool = await _drive_until(m, func(): return not m.apron_slots(owner).has(oslot), 30000)
+			_ok(gone, "G-M2-SEAM(W6): no apron on a live<->LOD ridge — the owner apron facing the promoting neighbour is dropped")
 		m.end_promote(nbr)
 	m.shutdown(); m.free()
+
+## G-M2-SEAM(W6) / A1 helper: true iff owner's apron on `oslot` EXISTS and every vertex is on the OWNER side of the
+## welded ridge plane — the plane-clamp invariant. Threshold −0.75 matches the LOD↔LOD gate's own sub-block ridge-drift
+## tolerance (the seam plane has a small vertical component Bc, so a ridge vertex can sit ≤0.75 block off the plane);
+## a both-sided (LOD↔LOD) apron has its neighbour outer strip at off ≈ −s_max ≤ −2 → false, while the clamped live↔LOD
+## apron fills off ∈ [≈0, s_max] only (min_off ≈ the sub-block drift) → true. So it cleanly separates clamped from both-sided.
+func _apron_owner_side_only(m, owner: int, oslot: int) -> bool:
+	if not m.apron_slots(owner).has(oslot):
+		return false
+	var amesh: Mesh = m.apron_mesh(owner, oslot)
+	if amesh == null or amesh.get_surface_count() == 0:
+		return false
+	var ring: Array = FA.seam_ring(owner, oslot)
+	var pl: Vector4 = FA.seam_plane(owner, oslot)
+	var inward := Vector3(pl.x, 0.0, pl.z).normalized()
+	var L0a: Array = FA.world_to_lattice64(owner, ring[0].x, ring[0].y, ring[0].z)
+	var r0 := Vector3(float(L0a[0]), 0.0, float(L0a[2]))
+	var arr: Array = amesh.surface_get_arrays(0)
+	var pv: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+	if pv.is_empty():
+		return false
+	for i in range(pv.size()):
+		var rel := Vector3(pv[i].x - r0.x, 0.0, pv[i].z - r0.z)
+		if rel.dot(inward) < -0.75:
+			return false                                        # a vertex reached the neighbour side (a full −s_max strip)
+	return true
 
 # ---------- G-M2-SEL: SSE selector (monotone + floor/cap + hysteresis + telescope) ----------
 func _gate_selector() -> void:

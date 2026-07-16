@@ -80,4 +80,12 @@ threads/count/margin_below_max=1
 ; (faster fill > marginal extra smoothness here). Still well under the ~12 ms stutter regime;
 ; finished meshes beyond the budget just apply over the next frame. Drop back to 4 if 6 ever
 ; reads as choppy.
+; MESH-PACING A/B (docs/COSMOS-MESH-PACING-DESIGN.md): this is the ONLY mesh-apply pacing knob and
+; it is export-baked (VoxelEngine's runtime setter is NOT bound to GDScript, so no per-crossing
+; throttle). Live telemetry shows the apply queue is empty (mean depth 0.01, gpu queue never backs
+; up), so lowering this only spreads the sub-second post-crossing batch transient (the 157-381 ms
+; post_worst_ms windows) at a slower-fill / more-pop-in cost — it does NOT touch the dominant ~79%
+; render/rAF draw-call ceiling at 204 draws (that needs a structural draw-call cut, not pacing).
+; A/B down to 4/3 via a deploy-time sed on this line; judge on post_worst_ms, not raw worst_ms.
+; Default stays 6 (the user's explicit fill>smoothness choice) until a real-GPU A/B beats it.
 threads/main/time_budget_ms=6

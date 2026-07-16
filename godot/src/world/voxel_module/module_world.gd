@@ -77,6 +77,8 @@ var _load_ctrl = null                         # the StreamLoadController (stored
 var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
                                               # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
                                               # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
+var _imminent_committed := false              # CROSSING-JERKINESS FIX: true once the imminent ridge_dist < POOL_D_COMMIT
+                                              # (published by WorldManager) → its ramp uses CTRL_IMMINENT_COMMIT_PACE (full)
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -127,6 +129,14 @@ var _cover_released := false                # WorldManager's handshake fired (re
 # riding the batched bake(). The generator (voxel worker) only ever emits modifier 0,
 # so it writes the cube ARID directly and never touches the lazy table.
 var _library: Object                    # the VoxelBlockyLibrary (kept for lazy appends + re-bake)
+# COSMOS-ATLAS Stage 1 (docs/COSMOS-ATLAS-DESIGN.md, flag CubeSphere.FP_ATLAS_MATERIAL): the shared OPAQUE atlas.
+# Built ONCE at setup() (main thread) before _configure_library when the flag is on; null otherwise (and null =>
+# every code path takes the shipped per-id-material branch, byte-identical). Holds the ONE shared opaque material +
+# the per-(opaque block-id) → atlas-cell map that _add_cube routes onto instead of a per-id set_material_override.
+# Loaded via load().new() (like the other path-activated components here) so a freshly-added file needs no global
+# class-cache rescan to parse; block_atlas.gd still carries `class_name BlockAtlas` for the exported build.
+var _atlas = null                       # BlockAtlas instance (untyped: avoids a class-cache parse dependency)
+const _ATLAS_SCRIPT := "res://src/world/voxel_module/block_atlas.gd"
 var _cube_arid: PackedInt32Array        # LRID -> cube ARID (preallocated; == LRID for bootstrap)
 var _arid_by_key: Dictionary = {}       # (lrid | modifier<<16) -> ARID (MAIN THREAD ONLY)
 var _next_arid := 0                     # next free library model index / ARID to allocate
@@ -242,6 +252,18 @@ var _fluids: Array = [null, null, null, null]            # kind -> VoxelBlockyFl
 # count (<=79) instead of materials×shapes (474) — the material differs only via the
 # per-model override, so mesh allocation/upload is not multiplied by the palette.
 var _shape_mesh_cache: Dictionary = {}   # int modifier -> ArrayMesh
+# COSMOS-ATLAS Stage 2 (docs/COSMOS-ATLAS-DESIGN.md §2.4): when FP_ATLAS_MATERIAL routes a shaped OPAQUE family onto
+# the shared atlas material, the per-surface UVs are affine-remapped into the material's atlas CELL, which makes them
+# material-dependent — so the cross-material `_shape_mesh_cache[modifier]` sharing (geometry-only) can no longer serve
+# them. These atlas-remapped meshes cache in a SEPARATE dict keyed by (cell, modifier[, surface-variant]) so the
+# shipped `_shape_mesh_cache` (flag-off path + the water twins that reuse the dry ramp) keeps its exact semantics. The
+# geometry is rebuilt+UV-offset per distinct cell (design §2.4 option A: ~+1–2 MB of tiny meshes, flag-ON only).
+var _atlas_shape_mesh_cache: Dictionary = {}   # String key -> ArrayMesh (atlas-remapped; only populated under the flag)
+# G-ATLAS-UV/-MAT gate capture (verify_atlas.gd). Off in production (zero overhead): the gate sets this true BEFORE
+# setup() so the manifest bake records, per atlas-routed shaped ARID, the expected atlas cell(s) it was baked into —
+# the authoritative source the gate replays (material_override(i) == atlas.material AND every surface-i UV ∈ cell i).
+var capture_atlas_probes := false
+var _atlas_probes: Array = []            # [{arid:int, cells:Array[Vector2i]}] — one per atlas-routed shaped model
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
@@ -281,6 +303,16 @@ func setup() -> bool:
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
 	if library == null or mesher == null:
 		return false
+
+	# COSMOS-ATLAS Stage 1: build the shared OPAQUE atlas (image + one material + per-id cell map) BEFORE the library
+	# so _configure_library can route opaque cubes onto it. Flag OFF (or a build that placed nothing) ⇒ _atlas stays
+	# null and every cube takes the shipped per-id-material path (byte-identical). Main-thread, once — never per frame.
+	if CubeSphere.FP_ATLAS_MATERIAL:
+		var atlas = load(_ATLAS_SCRIPT).new()
+		if atlas.build():
+			_atlas = atlas
+		else:
+			print("[module_world] FP_ATLAS_MATERIAL on but atlas placed no opaque cells — staying on per-id materials")
 
 	# Per-phase timing (printed to the JS console on web) — pinpoints any load stall.
 	var _t_warm := Time.get_ticks_msec()
@@ -430,7 +462,10 @@ func _ramp_pool_step(delta: float) -> bool:
 	# RAMP_SECONDS/0.25 = 6 s, inside the commit lead time); every other slot keeps the fully-gated pace for optional volume.
 	var pace := _stream_pace
 	if up_fid == _imminent_fid:
-		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
+		# CROSSING-JERKINESS FIX: the COMMITTED imminent (ridge < POOL_D_COMMIT) ramps at the full commit pace so the
+		# crossing target finishes filling DURING the approach instead of bursting at the seam; an uncommitted imminent
+		# keeps the shipped RELIEF_FLOOR trickle. Memory-neutral (same view_target); only the fill RATE changes.
+		pace = maxf(pace, CubeSphere.CTRL_IMMINENT_COMMIT_PACE if _imminent_committed else CubeSphere.CTRL_RELIEF_FLOOR)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
@@ -660,7 +695,9 @@ func arid_for(mat: int, modifier: int) -> int:
 		return int(_arid_by_key[key])
 	if _library == null:
 		return _cube_arid_of(mat)
-	var model: Object = _make_shape_model(modifier, BlockMaterials.get_for(mat))
+	# Stage 2: a runtime-placed opaque shape rides the shared atlas cell too (else it would emit its own
+	# residual surface). _shape_cell → (-1,-1) for the atlas-off path or a non-opaque material → per-id fallback.
+	var model: Object = _make_shape_model(modifier, BlockMaterials.get_for(mat), _shape_cell(mat))
 	if model == null:
 		return _cube_arid_of(mat)
 	var expected := _next_arid
@@ -721,6 +758,96 @@ func can_render(arid: int) -> bool:
 func appearance_count() -> int:
 	return _next_arid
 
+## COSMOS-ATLAS gate accessors (verify_atlas.gd). `atlas()` is the built BlockAtlas (null when FP_ATLAS_MATERIAL is
+## off / the atlas placed nothing). `library_model(arid)` returns the baked VoxelBlockyModel at a library index, so
+## the gate can read back a cube's `get_material_override(0)` / `get_tile(side)` / `get_atlas_size_in_tiles()` and
+## assert the opaque cubes actually share the one atlas material + point at the right cell. `cube_arid_of(id)` maps a
+## bootstrap block id to its library model index (== id for the bootstrap set).
+func atlas():
+	return _atlas
+
+func library_model(arid: int) -> Object:
+	if _library == null:
+		return null
+	var models: Variant = _library.get("models")
+	if models is Array and arid >= 0 and arid < (models as Array).size():
+		return (models as Array)[arid]
+	return null
+
+func cube_arid_of(id: int) -> int:
+	if id >= 0 and id < _cube_arid.size():
+		return _cube_arid[id]
+	return -1
+
+## COSMOS-ATLAS Stage 2 — null-safe atlas-cell lookups the shaped-family builders use. `_shape_cell` is the OPAQUE cube
+## cell for surface material `mat` (dry shapes, snow LAYER, slopes ride their material's cube cell); `_snowcap_cell` is
+## the snow-CAP variant cell (snow variants, composites, slope twins). Both return Vector2i(-1,-1) when the atlas is off
+## / the id has no cell, so the caller falls back to the shipped per-material path (byte-identical). Static-safe: never
+## dereference a null `_atlas`.
+func _shape_cell(mat: int) -> Vector2i:
+	return _atlas.cell_of(mat) if _atlas != null else Vector2i(-1, -1)
+
+func _snowcap_cell(mat: int) -> Vector2i:
+	return _atlas.snow_cap_cell_of(mat) if _atlas != null else Vector2i(-1, -1)
+
+## An ArrayMesh with ONE surface = ShapeMesh.build(modifier) UV-remapped into atlas `cell` (design §2.4). Cached per
+## (cell, modifier) so a re-emitted (mat,modifier) at the same cell reuses it. Only called under the flag with a valid
+## cell.
+func _atlas_shape_mesh(modifier: int, cell: Vector2i) -> ArrayMesh:
+	var key := "s:%d:%d:%d" % [modifier, cell.x, cell.y]
+	var amesh: ArrayMesh = _atlas_shape_mesh_cache.get(key, null)
+	if amesh == null:
+		amesh = ArrayMesh.new()
+		_add_surface(amesh, _atlas_remap_geom(ShapeMesh.build(modifier), cell))
+		_atlas_shape_mesh_cache[key] = amesh
+	return amesh
+
+## Return a COPY of a {verts,normals,uvs,indices} geometry dict with its unit-cell UVs affine-folded into atlas `cell`:
+## uv_atlas = cell_origin + clamp(uv_unit, 0, 1) × cell_size (design §2.4). ShapeMesh's planar UVs are all in [0,1]²
+## (corner heights are half-block ∈{0,0.5,1}, slope/layer heights clamp to [0,1], junction/carve verts are in the unit
+## cube), so the clamp is a defensive no-op that GUARANTEES no cell overrun / neighbour bleed under the CLAMP-sampled
+## atlas material. verts/normals/indices are shared by reference (read-only in the ArrayMesh); only the UVs are new.
+func _atlas_remap_geom(geom: Dictionary, cell: Vector2i) -> Dictionary:
+	var g: Vector2i = _atlas.grid
+	var sx := 1.0 / float(g.x)
+	var sy := 1.0 / float(g.y)
+	var ox := float(cell.x) * sx
+	var oy := float(cell.y) * sy
+	var src: PackedVector2Array = geom["uvs"]
+	var out := PackedVector2Array()
+	out.resize(src.size())
+	for i in src.size():
+		var u: Vector2 = src[i]
+		out[i] = Vector2(ox + clampf(u.x, 0.0, 1.0) * sx, oy + clampf(u.y, 0.0, 1.0) * sy)
+	return {"verts": geom["verts"], "normals": geom["normals"], "uvs": out, "indices": geom["indices"]}
+
+## Record (gate-only) that library model `arid` is an atlas-routed shaped model whose surface i was baked into
+## `cells[i]`. No-op unless the gate armed `capture_atlas_probes` and the atlas is live. See verify_atlas.gd.
+func _atlas_probe(arid: int, cells: Array) -> void:
+	if not (capture_atlas_probes and _atlas != null):
+		return
+	# Only a model whose EVERY surface got a real cell was actually routed onto the atlas; an invalid cell means the
+	# builder fell back to the per-id material (a residual surface, correct look), which the gate must NOT flag.
+	for c: Vector2i in cells:
+		if c.x < 0 or c.y < 0:
+			return
+	_atlas_probes.append({"arid": arid, "cells": cells})
+
+## The recorded atlas probes (verify_atlas.gd G-ATLAS-UV/-MAT over the shaped families).
+func atlas_shaped_probes() -> Array:
+	return _atlas_probes
+
+## The mesh a library model carries (VoxelBlockyModelMesh) — for the gate's shaped-UV read-back. Null when the model
+## has no mesh (cube / fluid) or the index is out of range.
+func library_model_mesh(arid: int) -> Mesh:
+	var model := library_model(arid)
+	if model == null:
+		return null
+	if model.has_method("get_mesh"):
+		return model.call("get_mesh") as Mesh
+	var m: Variant = model.get("mesh")
+	return m as Mesh if m is Mesh else null
+
 ## Pre-allocate + bake the generator's appearance manifest and FREEZE it into
 ## `_gen_arid` (VDS §8.1/§8.3, RMS §6.5). Each (surface material, modifier) pair the
 ## smoothing worldgen can emit becomes a once-baked VoxelBlockyModelMesh whose library
@@ -744,10 +871,11 @@ func _build_gen_manifest(library: Object) -> void:
 		if mat <= BlockCatalog.AIR or mat >= total:
 			continue
 		var material: Material = BlockMaterials.get_for(mat)
+		var cell := _shape_cell(mat)                     # atlas cube cell for this surface material (Stage 2)
 		for modifier: int in mods:
 			if modifier <= 0 or modifier >= _GEN_STRIDE:
 				continue
-			var model: Object = _make_shape_model(modifier, material)
+			var model: Object = _make_shape_model(modifier, material, cell)
 			if model == null:
 				continue                                 # no mesh-model class → cube fallback
 			var expected := _next_arid
@@ -757,6 +885,7 @@ func _build_gen_manifest(library: Object) -> void:
 				return                                   # leave the rest -1 (cube fallback)
 			_next_arid += 1
 			_gen_arid[mat * _GEN_STRIDE + modifier] = got
+			_atlas_probe(got, [cell])
 			appended += 1
 
 	# Water models: NATIVE waterlogged twins (WATERLOGGING §4) or LEGACY wet composites + slab
@@ -790,6 +919,13 @@ func _build_gen_manifest(library: Object) -> void:
 
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
+	# COSMOS-ATLAS Stage 2 NEVER-OOM ledger. Atlas-remapped UVs are per (cell, modifier), which drops the shipped
+	# cross-material geometry sharing, so the shape-mesh COUNT rises. Report BOTH caches so the DELTA is explicit: the
+	# shipped `_shape_mesh_cache` (shared; also holds the still-per-material water twins under the flag) and the
+	# `_atlas_shape_mesh_cache` (flag-ON, per-cell). The atlas IMAGE is a separate ~5.3 MB (see block_atlas).
+	print("[module_world] ATLAS ledger: shared shape meshes %d ≈ %.2f MB; atlas shape meshes %d ≈ %.2f MB (dry/snow/layer + composites; slopes stay shared per-material)"
+		% [_shape_mesh_cache.size(), _mesh_cache_mb(_shape_mesh_cache),
+			_atlas_shape_mesh_cache.size(), _mesh_cache_mb(_atlas_shape_mesh_cache)])
 	print("[module_world] baked appearance manifest: %d (material,modifier) generated shapes (%d materials x %d emitted modifiers; full set would be %d)"
 		% [appended - wet - snow - layers - comps - slope, mats.size(), mods.size(), mats.size() * TerrainConfig.appearance_modifiers().size()])
 	print("[module_world] baked snow manifest: %d snow-cap variant models for %d cappable materials"
@@ -828,20 +964,22 @@ func _build_snow_manifest(library: Object, total: int) -> int:
 		if mat <= BlockCatalog.AIR or mat >= total:
 			continue
 		var variant: Material = BlockMaterials.snow_capped_for(mat)
+		var scell := _snowcap_cell(mat)                  # atlas snow-CAP cell for this cappable base (Stage 2)
 		# The snow-variant CUBE (a full capped cell) at modifier 0.
 		var expected := _next_arid
-		var got: int = _add_cube(library, variant, BlockCatalog.cull_group_of(mat))
+		var got: int = _add_cube(library, variant, BlockCatalog.cull_group_of(mat), scell)
 		if got != expected:
 			push_warning("[module_world] snow manifest cube ARID drift: add_model %d != expected %d" % [got, expected])
 			return appended                              # abort snow manifest; dry + water manifests stand
 		_next_arid += 1
 		_snow_arid[mat * _GEN_STRIDE + 0] = got
+		_atlas_probe(got, [scell])
 		appended += 1
 		# The snow-variant SHAPES (reuse the shared dry ArrayMesh; only the material override differs).
 		for modifier: int in mods:
 			if modifier <= 0 or modifier >= _GEN_STRIDE:
 				continue
-			var model: Object = _make_shape_model(modifier, variant)
+			var model: Object = _make_shape_model(modifier, variant, scell)
 			if model == null:
 				continue                                 # no mesh-model class → cube/plain fallback
 			var exp2 := _next_arid
@@ -851,6 +989,7 @@ func _build_snow_manifest(library: Object, total: int) -> int:
 				return appended
 			_next_arid += 1
 			_snow_arid[mat * _GEN_STRIDE + modifier] = got2
+			_atlas_probe(got2, [scell])
 			appended += 1
 	return appended
 
@@ -870,10 +1009,11 @@ func _build_layer_manifest(library: Object) -> int:
 	if snow_id <= BlockCatalog.AIR:
 		return 0
 	var variant: Material = BlockMaterials.get_for(snow_id)
+	var scell := _shape_cell(snow_id)                    # atlas cube cell for snow_block (the LAYER material, Stage 2)
 	var appended := 0
 	for level in [1, 2, 3, 4, 6, 7, 8, 9]:
 		var modifier := CellCodec.make_layer(level)      # the raw FAM modifier for this level
-		var model: Object = _make_shape_model(modifier, variant)
+		var model: Object = _make_shape_model(modifier, variant, scell)
 		if model == null:
 			continue                                     # no mesh-model class → snow-cube fallback
 		var expected := _next_arid
@@ -883,6 +1023,7 @@ func _build_layer_manifest(library: Object) -> int:
 			return appended                              # abort layer manifest; dry/water/snow stand
 		_next_arid += 1
 		_layer_arid[level] = got
+		_atlas_probe(got, [scell])
 		appended += 1
 	return appended
 
@@ -902,6 +1043,7 @@ func _build_comp_manifest(library: Object, total: int) -> int:
 	_comp_arid_l8 = PackedInt32Array(); _comp_arid_l8.resize(total * _GEN_STRIDE); _comp_arid_l8.fill(-1)
 	_comp_arid_l10 = PackedInt32Array(); _comp_arid_l10.resize(total * _GEN_STRIDE); _comp_arid_l10.fill(-1)
 	var snow_mat: Material = BlockMaterials.get_for(_snow_id_of())
+	var snow_cell := _shape_cell(_snow_id_of())          # surface-1 snow-fill atlas cell (plain snow, Stage 2)
 	var appended := 0
 	for slot: int in TerrainConfig.emitted_cold_pairs():
 		var mat := slot / _GEN_STRIDE
@@ -911,8 +1053,9 @@ func _build_comp_manifest(library: Object, total: int) -> int:
 		if CellCodec.is_layer(modifier):
 			continue                                     # a LAYER cap is baked in _layer_arid, not here
 		var skin: Material = BlockMaterials.snow_capped_for(mat)   # surface-0 = the capped ramp (cold ⇒ white)
+		var skin_cell := _snowcap_cell(mat)              # surface-0 snow-CAP atlas cell (Stage 2)
 		for level in [3, 5, 8, 10]:
-			var model: Object = _make_composite_model(modifier, level, skin, snow_mat)
+			var model: Object = _make_composite_model(modifier, level, skin, snow_mat, skin_cell, snow_cell)
 			if model == null:
 				continue                                 # no mesh-model class → cap-skin/dry fallback
 			var expected := _next_arid
@@ -926,6 +1069,7 @@ func _build_comp_manifest(library: Object, total: int) -> int:
 				5: _comp_arid_l5[slot] = got
 				8: _comp_arid_l8[slot] = got
 				10: _comp_arid_l10[slot] = got
+			_atlas_probe(got, [skin_cell, snow_cell])
 			appended += 1
 	return appended
 
@@ -937,26 +1081,42 @@ func _build_comp_manifest(library: Object, total: int) -> int:
 ## can never cull it. The combined ArrayMesh is shared across materials per (modifier, level) via
 ## `_shape_mesh_cache` (the _COMP_MESH_FLAG keyspace, disjoint from corner/FAM/wet keys). Null when the
 ## module lacks the mesh-model class.
-func _make_composite_model(modifier: int, level: int, terrain_material: Material, snow_material: Material) -> Object:
+## COSMOS-ATLAS Stage 2: with valid `skin_cell` (surface-0 snow-capped ramp) + `snow_cell` (surface-1 snow fill) both
+## surfaces ride the ONE shared atlas material with UVs remapped into their respective cells, so the composite MERGES
+## into the block's single opaque surface (both surfaces same material). Without cells it is the shipped 2-material
+## per-surface path (shared `_shape_mesh_cache`).
+func _make_composite_model(modifier: int, level: int, terrain_material: Material, snow_material: Material,
+		skin_cell := Vector2i(-1, -1), snow_cell := Vector2i(-1, -1)) -> Object:
 	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
 		return null
 	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
 	if model == null:
 		return null
-	var key := modifier | (level << 8) | _COMP_MESH_FLAG
-	var amesh: ArrayMesh = _shape_mesh_cache.get(key, null)
-	if amesh == null:
-		amesh = ArrayMesh.new()
-		_add_surface(amesh, ShapeMesh.build(modifier))          # surface 0: the (capped) terrain ramp
-		_add_surface(amesh, _snow_fill_geom(level))             # surface 1: the snow LAYER fill (eps-lifted)
-		_shape_mesh_cache[key] = amesh
+	var use_atlas := skin_cell.x >= 0 and snow_cell.x >= 0 and _atlas != null
+	var amesh: ArrayMesh
+	if use_atlas:
+		var akey := "c:%d:%d:%d:%d:%d:%d" % [modifier, level, skin_cell.x, skin_cell.y, snow_cell.x, snow_cell.y]
+		amesh = _atlas_shape_mesh_cache.get(akey, null)
+		if amesh == null:
+			amesh = ArrayMesh.new()
+			_add_surface(amesh, _atlas_remap_geom(ShapeMesh.build(modifier), skin_cell))   # surface 0: capped ramp
+			_add_surface(amesh, _atlas_remap_geom(_snow_fill_geom(level), snow_cell))       # surface 1: snow fill
+			_atlas_shape_mesh_cache[akey] = amesh
+	else:
+		var key := modifier | (level << 8) | _COMP_MESH_FLAG
+		amesh = _shape_mesh_cache.get(key, null)
+		if amesh == null:
+			amesh = ArrayMesh.new()
+			_add_surface(amesh, ShapeMesh.build(modifier))          # surface 0: the (capped) terrain ramp
+			_add_surface(amesh, _snow_fill_geom(level))             # surface 1: the snow LAYER fill (eps-lifted)
+			_shape_mesh_cache[key] = amesh
 	if model.has_method("set_mesh"):
 		model.call("set_mesh", amesh)
 	else:
 		_set_if(model, "mesh", amesh)
 	if model.has_method("set_material_override"):
-		model.call("set_material_override", 0, terrain_material)
-		model.call("set_material_override", 1, snow_material)
+		model.call("set_material_override", 0, _atlas.material if use_atlas else terrain_material)
+		model.call("set_material_override", 1, _atlas.material if use_atlas else snow_material)
 	if model.has_method("set_transparency_index"):
 		model.call("set_transparency_index", 0)                 # opaque: the ramp is the occlusion role
 	return model
@@ -1002,6 +1162,12 @@ func _build_slope_manifest(library: Object, total: int) -> int:
 		if mat <= BlockCatalog.AIR or mat >= total:
 			continue
 		var modifier := CellCodec.MOD_FAM_BIT | (CellCodec.FAM_SLOPE << CellCodec.MOD_FAM_KIND_SHIFT) | payload
+		# COSMOS-ATLAS Stage 2 — the SLOPE family stays PER-MATERIAL (NOT atlassed): atlas-remapped UVs are per (cell,
+		# payload), and the emitted (mat,payload) product here is huge (~3440 pairs × dry+snow-twin ⇒ ~5160 distinct
+		# meshes ≈ 5.9 MB), which blows the NEVER-OOM ≤-few-MB budget for a MINORITY (steep-terrain) surface. So a
+		# slope-bearing block keeps a residual slope-material surface (an extra draw only where sharp slopes appear); the
+		# dominant smoothed-terrain (dry corner shapes + snow caps + layers + snow-fill composites) IS atlassed. Passing
+		# no cell → the shipped shared-`_shape_mesh_cache` per-material path (byte-identical to pre-atlas).
 		var model: Object = _make_shape_model(modifier, BlockMaterials.get_for(mat))
 		if model == null:
 			continue                                     # no mesh-model class → cube fallback
@@ -1449,10 +1615,19 @@ func _apply_bounds(terrain: Object, fid: int) -> void:
 	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
 	_set_if(terrain, "bounds", AABB(pos, size))
 
+## RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1) — the single near-LOD predicate (mirrors WorldManager's).
+## FP_NO_NEAR_LOD is the inverse of FP_M2_LOD: with it off this equals FP_M2_LOD exactly (byte-identical), with it on the
+## LOD mesher is never created here. The passive lod_* generator/terrain accessors below stay on raw FP_M2_LOD.
+func _near_lod_on() -> bool:
+	return CubeSphere.FP_M2_LOD and not CubeSphere.FP_NO_NEAR_LOD
+
 ## FP-M2b (§5): create the FacetLodMesher under PlanetRoot and prime its static tiers on the active facet. Safe
 ## no-op unless FP_M2_LOD (mesher.setup returns false → _lod_mesher stays null and the LOD path is fully dead).
 func _lod_setup() -> void:
-	if not CubeSphere.FP_M2_LOD or _planet_root == null:
+	# RENDER-SIMPLIFY §2.1: FP_NO_NEAR_LOD bypasses the whole LOD stack at its creation site — return early so
+	# _lod_mesher stays null (the builder Thread never starts, the 96 MB ledger never allocates). _near_lod_on() ==
+	# FP_M2_LOD with the flag off → byte-identical.
+	if not _near_lod_on() or _planet_root == null:
 		return
 	var scr: Script = load("res://src/world/facet_lod_mesher.gd")
 	if scr == null:
@@ -1539,9 +1714,10 @@ func set_load_controller(c) -> void:
 
 ## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
 ## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).
-func set_imminent_fid(fid: int) -> void:
+func set_imminent_fid(fid: int, committed: bool = false) -> void:
 	var prev := _imminent_fid
 	_imminent_fid = fid
+	_imminent_committed = committed
 	if _lod_mesher != null:
 		_lod_mesher.call("set_imminent_fid", fid)
 	# COSMOS-FP-CROSSING-PREGEN (#114): pre-grow the COMMITTED imminent slot to the ACTIVE near radius during the approach
@@ -2074,24 +2250,34 @@ func ramp_done() -> bool:
 
 ## Build a VoxelBlockyModelMesh for `modifier` from the shared ShapeMesh geometry (the
 ## one render seam — SVS §4). Returns null when the module lacks the mesh-model class.
-func _make_shape_model(modifier: int, material: Material) -> Object:
+##
+## COSMOS-ATLAS Stage 2 (§2.4): with a valid `atlas_cell` (and the atlas live) the model rides the ONE shared atlas
+## material and its ArrayMesh carries UVs remapped into that cell (per-(cell,modifier) cache), so the mesher MERGES it
+## into the block's single opaque surface. Without a cell (flag off / a non-atlassed material) it takes the shipped
+## path verbatim: the cross-material shared `_shape_mesh_cache[modifier]` geometry + the caller's per-id material.
+func _make_shape_model(modifier: int, material: Material, atlas_cell := Vector2i(-1, -1)) -> Object:
 	if not ClassDB.class_exists("VoxelBlockyModelMesh"):
 		return null
 	var model: Object = ClassDB.instantiate("VoxelBlockyModelMesh")
 	if model == null:
 		return null
-	# Share one ArrayMesh per shape across all materials (see _shape_mesh_cache).
-	var amesh: ArrayMesh = _shape_mesh_cache.get(modifier, null)
-	if amesh == null:
-		amesh = ArrayMesh.new()
-		_add_surface(amesh, ShapeMesh.build(modifier))
-		_shape_mesh_cache[modifier] = amesh
+	var use_atlas := atlas_cell.x >= 0 and _atlas != null
+	var amesh: ArrayMesh
+	if use_atlas:
+		amesh = _atlas_shape_mesh(modifier, atlas_cell)
+	else:
+		# Share one ArrayMesh per shape across all materials (see _shape_mesh_cache).
+		amesh = _shape_mesh_cache.get(modifier, null)
+		if amesh == null:
+			amesh = ArrayMesh.new()
+			_add_surface(amesh, ShapeMesh.build(modifier))
+			_shape_mesh_cache[modifier] = amesh
 	if model.has_method("set_mesh"):
 		model.call("set_mesh", amesh)
 	else:
 		_set_if(model, "mesh", amesh)
 	if model.has_method("set_material_override"):
-		model.call("set_material_override", 0, material)
+		model.call("set_material_override", 0, _atlas.material if use_atlas else material)
 	return model
 
 ## True when the running godot_voxel exposes NATIVE waterlogging (WATERLOGGING.md §4): the
@@ -2272,6 +2458,17 @@ func _make_slab_model(water_material: Material) -> Object:
 		model.call("set_transparency_index", cull_group)
 	return model
 
+## Approx resident CPU vertex+index MB of a {key -> ArrayMesh} cache (NEVER-OOM ledger, verify/telemetry only).
+func _mesh_cache_mb(cache: Dictionary) -> float:
+	var bytes := 0
+	for k: Variant in cache.keys():
+		var am: ArrayMesh = cache[k]
+		for s in am.get_surface_count():
+			var a := am.surface_get_arrays(s)
+			bytes += (a[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() * (12 + 12 + 8)   # pos+normal+uv
+			bytes += (a[Mesh.ARRAY_INDEX] as PackedInt32Array).size() * 4
+	return float(bytes) / 1048576.0
+
 ## Append one {verts, normals, uvs, indices} geometry dict as a triangle surface on `amesh`.
 ## Shared by the shape/wet/slab builders so the ShapeMesh/WaterMesh dict format is unpacked
 ## in exactly one place.
@@ -2404,15 +2601,21 @@ func _configure_library(library: Object) -> bool:
 		var cull_group: int = BlockCatalog.cull_group_of(block_id)
 		var got: int
 		var lk := BlockCatalog.liquid_kind_of(block_id)
+		# COSMOS-ATLAS Stage 1: an OPAQUE cube with an atlas cell renders on the SHARED atlas material + a per-face
+		# tile pointing at its cell, so the mesher merges all opaque cubes in a block into one surface. Non-opaque
+		# (translucent/emissive/fluid) ids have no cell (has_cell false) ⇒ per-id material path, unchanged (Stage 2+).
+		var use_atlas: bool = _atlas != null and bool(_atlas.has_cell(block_id))
+		var cube_mat: Material = _atlas.material if use_atlas else BlockMaterials.get_for(block_id)
+		var atlas_cell: Vector2i = _atlas.cell_of(block_id) if use_atlas else Vector2i(-1, -1)
 		if _waterlog_enabled and lk != CellCodec.LIQ_NONE and _fluids[lk] != null:
 			# A liquid LRID renders as a PURE FLUID model (WATERLOGGING §4.2 / MULTI-LIQUID §2.2.2),
 			# not a cube — so deep liquid culls internally and every cell of that kind shares its one
 			# fluid_index. Falls back to a cube if the fluid model can't be built, preserving the
-			# index==LRID invariant either way.
+			# index==LRID invariant either way. (Liquids are never opaque, so use_atlas is false here.)
 			var fluid_model: Object = _make_fluid_model(block_id, lk)
-			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, cube_mat, cull_group, atlas_cell)
 		else:
-			got = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+			got = _add_cube(library, cube_mat, cull_group, atlas_cell)
 		if got != block_id:
 			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
@@ -2433,21 +2636,26 @@ func _configure_library(library: Object) -> bool:
 ## culls a face against a neighbour whose index is <= this model's, so glass-behind-
 ## glass culls but stone-behind-glass draws. The alpha blend itself lives on the
 ## material; the index only governs face culling.
-func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
+func _add_cube(library: Object, material: Material, cull_group: int = 0, atlas_cell := Vector2i(-1, -1)) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
-	# CRITICAL for a visible texture: 1x1 tile atlas with every face at tile
-	# (0,0). The default atlas_size_in_tiles is (0,0) → DEGENERATE UVs (every
-	# face samples one texel → flat solid colour). A 1x1 atlas gives 0..1 UVs so
-	# the whole 64x64 texture shows per face.
+	# COSMOS-ATLAS Stage 1: with a valid atlas cell (col,row >= 0) the model uses the LIBRARY-WIDE atlas grid and
+	# points every face at THIS id's cell — so the shared atlas `material` samples the id's tile and the mesher
+	# merges all opaque cubes into one surface. Without a cell (the shipped path / non-opaque ids) it keeps the 1×1
+	# per-model atlas: the default atlas_size_in_tiles is (0,0) → DEGENERATE UVs (every face samples one texel → a
+	# flat solid colour); a 1×1 atlas gives 0..1 UVs so the whole per-model texture shows per face.
+	var use_atlas := atlas_cell.x >= 0 and _atlas != null
 	if cube.has_method("set_atlas_size_in_tiles"):
-		cube.call("set_atlas_size_in_tiles", Vector2i(1, 1))
+		cube.call("set_atlas_size_in_tiles", _atlas.grid if use_atlas else Vector2i(1, 1))
 	if cube.has_method("set_tile"):
 		for side in 6:  # VoxelBlockyModel.SIDE_* : 0..5 (all cube faces)
-			cube.call("set_tile", side, Vector2i(0, 0))
+			cube.call("set_tile", side, atlas_cell if use_atlas else Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
-		cube.call("set_material_override", 0, material)
+		# A valid atlas cell ALWAYS means the shared atlas material (the tile samples the atlas). Stage-1 callers
+		# already pass _atlas.material; Stage-2 snow-cap-cube callers pass the per-id snow material — force it here so
+		# the tile+material agree (else the face would sample the atlas cell through the wrong per-id texture / not merge).
+		cube.call("set_material_override", 0, _atlas.material if use_atlas else material)
 	# Transparency index for face culling (WGC §5.1). Opaque (0) is the godot_voxel
 	# default, so only translucent models need it; guarded so the call is harmless if
 	# the module drops the setter between versions.
@@ -2513,6 +2721,14 @@ var gen_mwin_c := 0
 var gen_mwin_d := 1
 var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
 var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples at stride 2^lod (else early-out). Default false → shipped path unchanged; at lod0 stride==1 so byte-identical.
+# GEN-EFFICIENCY Fix A (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1): FP_BULK_UNDERGROUND snapshot + the two fill
+# ARIDs a plain deep STONE / DEEPSLATE cube writes (frozen by the loader from the baked cube_arid table). When
+# fp_bulk and a block is provably interior stone/deepslate, the worker VoxelBuffer.fill()s it with one of these
+# instead of the per-cell pass — the SAME cube ARID a non-ore/non-strata deep cell would emit (byte-matching an
+# exposed non-ore wall). -1 = not baked → the block falls back to per-cell (never fills a stale index).
+var fp_bulk := false
+var bulk_stone_arid := -1
+var bulk_deepslate_arid := -1
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -2524,6 +2740,15 @@ const FAM_KIND_SHIFT := 12               # bits 14..12 select the FAM family kin
 const FAM_KIND_MASK := 0x7
 const FAM_SLOPE := 1                     # kind 1 = SLOPE; only kind 1 routes to the slope table (a future
                                         # kind-0 LAYER modifier must NOT be mis-indexed here)
+# GEN-EFFICIENCY Fix A: the qualification constants, mirrored from TerrainConfig so the worker never reaches
+# outside its frozen instance. BULK_MAX_FILLER = max _filler_depth over all biomes (badlands, 12): a block whose
+# top cell sits deeper than this under EVERY column is interior stone (no dirt/biome-top skipped). The DEEPSLATE
+# band bounds (TerrainConfig.DEEPSLATE_TOP_Y / _FULL_Y): above -16 is pure stone, below -24 is pure deepslate,
+# -24..-16 is a dithered mix (fall back). BULK_BEDROCK_TOP_Y (TerrainConfig.BEDROCK_TOP_Y): no bedrock at y >= -59.
+const BULK_MAX_FILLER := 12
+const BULK_DEEPSLATE_TOP_Y := -16
+const BULK_DEEPSLATE_FULL_Y := -24
+const BULK_BEDROCK_TOP_Y := -59
 
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
@@ -2587,6 +2812,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var profs = []
 	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
+	var min_h = 0x7fffffff                   # GEN-EFFICIENCY Fix A: the shallowest surface over the block's columns
+	                                         # (flat branch only) — bounds the Fix A "block fully below filler" gate.
 	# Per-block generation context (LOCAL to this _generate_block frame → each voxel worker owns its
 	# own; NEVER shared across threads). FLAT: a plain Dictionary column memo (Vector2i → Vector4),
 	# byte-identical to before. CURVED (COSMOS-AUDIT §3.2 items 2–3, F1/F2): a GenCtx carrying the
@@ -2610,6 +2837,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				var p = TerrainConfig.column_profile(ox + x * s, oz + z * s, pcache)
 				profs[z * size.x + x] = p
 				if int(p.x) > max_h: max_h = int(p.x)
+				if int(p.x) < min_h: min_h = int(p.x)
 	else:
 		pcache = TerrainConfig.GenCtx.new(gen_face)
 		# COSMOS-FRAME-ORIENTATION §6: this epoch's M_win quarter-turn, once per block — worker_fold_column
@@ -2634,6 +2862,40 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				var p = TerrainConfig.column_profile(tc.y, tc.z, pcache)
 				profs[idx] = p
 				if int(p.x) > max_h: max_h = int(p.x)
+
+	# GEN-EFFICIENCY Fix A (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1) — bulk-fill a provably-interior underground
+	# block with ONE material via VoxelBuffer.fill() instead of the per-cell resolve_cell pass (~27× on that
+	# block; the 4096 resolve_cell calls + the slope_run pass are skipped). Qualifies (LOD0 flat branch only) when:
+	#   • the block's TOP cell is deeper than the max biome filler under EVERY column
+	#     (oy+size.y <= min_h - BULK_MAX_FILLER) → _surface_rule returns STONE for all cells, no dirt/biome-top or
+	#     surface cell is ever inside the block (this is ALSO the no-fall-through guarantee: the walkable surface is
+	#     never bulk-filled), and
+	#   • exactly ONE fill material is well-defined: the whole block is strictly ABOVE the -24..-16 deepslate dither
+	#     band (oy > -16 → pure STONE) OR strictly BELOW it and clear of bedrock (oy+size.y <= -24 and oy >= -59 →
+	#     pure DEEPSLATE). Blocks straddling the dither band, the dirt layer, or bedrock fall back to per-cell.
+	# resolve_cell for such a cell is a full STONE/DEEPSLATE cube (modifier 0, lf 0) → the fill writes the SAME cube
+	# ARID a per-cell non-ore/non-strata cell would (an exposed non-ore wall matches byte-for-byte); the block's
+	# ore/strata VARIANTS are the accepted appearance loss (physics + the broken/dropped block read block_id_at →
+	# resolve_cell directly, never this buffer). FACETED: gated on the WHOLE block box being interior to all four
+	# ridges (cell_interior_scaled over [ox..ox+size]) so no beyond-ridge cell that junction_modify masks to AIR is
+	# wrongly filled — a straddling/edge block falls back to per-cell. Flag OFF → this is skipped entirely → the
+	# generator is byte-identical per-cell (FLAT 6035/0; G-M2-ID compares two module generators that share the
+	# const flag, so both bulk-fill identically → still equal).
+	if fp_bulk and s == 1 and flat_world and size.x == size.y and size.y == size.z:
+		var by_top = oy + size.y                      # one past the top cell (cells are oy .. by_top-1)
+		if by_top <= min_h - BULK_MAX_FILLER:
+			var fill_arid := -1
+			if oy > BULK_DEEPSLATE_TOP_Y:                                  # whole block above the dither band → STONE
+				fill_arid = bulk_stone_arid
+			elif by_top <= BULK_DEEPSLATE_FULL_Y and oy >= BULK_BEDROCK_TOP_Y:  # below -24, above bedrock → DEEPSLATE
+				fill_arid = bulk_deepslate_arid
+			if fill_arid >= 0 and fill_arid < mcount:
+				var interior := true
+				if gen_facet >= 0:
+					interior = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
+				if interior:
+					buffer.fill(fill_arid, ch)
+					return
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
@@ -2875,6 +3137,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
 	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
 	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
+	# GEN-EFFICIENCY Fix A: freeze the bulk-underground flag + the two fill ARIDs (the cube ARID a plain deep STONE /
+	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
+	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
+	gen.set("fp_bulk", CubeSphere.FP_BULK_UNDERGROUND)
+	var _bstone := BlockCatalog.STONE
+	gen.set("bulk_stone_arid", _cube_arid[_bstone] if _bstone >= 0 and _bstone < _cube_arid.size() else -1)
+	var _bdeep := BlockCatalog.id_of(&"deepslate")
+	gen.set("bulk_deepslate_arid", _cube_arid[_bdeep] if _bdeep >= 0 and _bdeep < _cube_arid.size() else -1)
 	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
 	gen.set("gen_mwin_a", int(_gen_mwin[0]))
 	gen.set("gen_mwin_b", int(_gen_mwin[1]))

@@ -104,6 +104,20 @@ const PROMOTE_EVICT_STARVE_MULT := 6.0
 ## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
 const FP_M2_LOD := false
 
+## COSMOS GEN-EFFICIENCY (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1 Fix A) — bulk-fill invisible underground blocks.
+## Underground `resolve_cell` is ~76% of a land column's generation cost (~84 unseen cells × 2.9 µs); a fully-
+## underground 16³ data block runs 4096 resolve_cell calls (~13.7 ms), and a crossing restreams ~500 of them →
+## the multi-second freeze + fall-through. When true, a data block whose ENTIRE y-range is provably interior
+## stone/deepslate (below every column's dirt/biome filler, above bedrock, clear of the -24..-16 deepslate dither
+## band, and — on a facet — fully interior to all four ridges) is filled with ONE material via VoxelBuffer.fill
+## instead of the per-cell pass (~27× on that block). NOT byte-identical: the block's ore/strata VARIANTS become
+## uniform stone/deepslate — the ACCEPTED, near-invisible loss (unseen until dug; WM.block_id_at → resolve_cell
+## reads TerrainConfig directly, never this buffer, so physics + the broken/dropped block stay ground-truth).
+## Ships A-accept (uniform-stone walls on exposure; the appearance-only loss), with A-lazy exposure regen a
+## documented follow-up. Default OFF → the generator is per-cell, byte-identical (FLAT verify pin 6035/0 stays,
+## G-M2-ID stays module==module). LOD0 only. Independent of FACETED; the ridge guard self-disables when flat.
+const FP_BULK_UNDERGROUND := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB
@@ -114,6 +128,75 @@ const FP_M2_LOD := false
 ## unless FP_M2_LOD (the mesher never exists otherwise) → byte-identical with the faceted flags off. Default true:
 ## it is pure LOD-side polish already bounded by the NEVER-OOM caps, so it rides on whenever the LOD path is live.
 const FP_NEIGHBOUR_SEAM_POLISH := true
+
+## COSMOS RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1/§2) — REMOVE the intermediate near-neighbour LOD.
+## When true (AND FACETED AND FP_M1_POOL), the whole FacetLodMesher stack is bypassed: the mesher is never created
+## (_lod_setup returns early → _lod_mesher stays null → its builder Thread never starts and the 96 MB LOD ledger never
+## allocates), the promote-hold / _lod_promote_pass / demote-relief / apron paths self-disable, and the FacetFarRing
+## exclusion set shrinks to live-pool-neighbours-only so every ex-LOD facet shows its far-ring quad instead (§2.5 — the
+## far ring already renders behind everything, so removing the LOD opens NO horizon gap). This is the logical INVERSE of
+## FP_M2_LOD (they are mutually exclusive): every FP_M2_LOD *creation/policy* read routes through _near_lod_on() =
+## FP_M2_LOD and not FP_NO_NEAR_LOD, so with this flag off _near_lod_on() == FP_M2_LOD exactly (byte-identical; the
+## passive lod_* generator/terrain accessors stay on raw FP_M2_LOD — only consumed by a mesher that no longer exists).
+## Memory-SAFE on its own (only FREES the 96 MB LOD ledger). Default OFF → byte-identical; FLAT stays 6035/0. Flipped ON
+## at export after the browser-heap A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true.
+const FP_NO_NEAR_LOD := false
+
+## COSMOS RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1/§3) — widen the near render radius 128 → 256 and
+## ridge-band + rescale the neighbour pool into the envelope the LOD removal frees. This is the memory-RISKY half (it
+## SPENDS the 96 MB FP_NO_NEAR_LOD reclaims) and is gated + A/B'd INDEPENDENTLY of the removal (§1: bundling them would
+## make a memory regression indistinguishable from a seam regression). Consulted only via near_render_radius() (the single
+## widening lever) + the pool rescale/ceiling; requires FP_NO_NEAR_LOD. THIS PASS wires only the flag + the flag-aware
+## near_render_radius() scaffold — the ridge-band, pool-ceiling raise (224 MB) and real-bytes ceiling are a later pass
+## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
+const FP_FULLRES_256 := false
+
+## COSMOS-ATLAS (docs/COSMOS-ATLAS-DESIGN.md, Perf L3) — collapse the OPAQUE terrain onto ONE shared atlas material.
+## Every block id today carries its OWN StandardMaterial3D (block_materials.gd), and VoxelMesherBlocky emits ONE
+## surface (= one draw call) per distinct material per 32³ mesh block, so materials MULTIPLY the draw count
+## (~90 surface blocks × ~2.1 materials/block ≈ 190 of the ~204 measured draws → the GL-compatibility per-draw
+## ceiling that caps walking at ~30 fps). When true (STAGE 1), the 67 OPAQUE VoxelBlockyModelCube models
+## (_configure_library → _add_cube) are packed into ONE 8×8×128px = 1024² atlas behind ONE shared opaque
+## StandardMaterial3D (BlockAtlas): per-face set_tile() picks the id's atlas cell instead of a per-id
+## set_material_override, so the mesher MERGES all opaque cubes in a block into one surface (draws 204 → ~130-150;
+## shaped/snow/slope/carve models + the translucent glass/ice + emissive lava stay per-material — STAGE 2+). The
+## cube ARID == LRID invariant is UNTOUCHED (only material + UVs change, never the model index / TYPE channel), so
+## G-M2-ID stays green. Default OFF → the shipped per-id-material path, byte-identical (FLAT verify pin 6035/0
+## stays; the atlas is never built). Flipped ON at export after the browser-heap + visual A/B (the established
+## sed-at-export deploy pattern). Independent of FACETED (the module library build is the same both ways).
+const FP_ATLAS_MATERIAL := false
+
+## COSMOS-PERF STEP 1 / L1 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — the far-ring FAST packed-array rebuild.
+## FacetFarRing._rebuild_full() re-emits ~1728 front-hemisphere facets every crossing AND every neighbour-pool change
+## via ~332k per-vertex SurfaceTool add_vertex/set_color GDScript→C++ round-trips + generate_normals() over ~55k tris —
+## ~300–700 ms on ONE main-thread frame (the dominant post-crossing spike). When true, _rebuild_full assembles the
+## mesh from PRE-TRIANGULATED per-facet pos/col caches (built once per facet) via append_array (C++ memcpy) into two big
+## PackedArrays + ONE add_surface_from_arrays, then computes normals with SurfaceTool.create_from + generate_normals —
+## both C++, so NONE of the per-vertex GDScript emission remains. VISUALLY EQUIVALENT: the fast path expands each cell
+## into the SAME triangle order/winding + per-vertex colors as the SurfaceTool path, and its normals are BIT-IDENTICAL
+## because create_from replays the identical vertex list into the identical generate_normals — the GLOBAL smoothing
+## (which merges vertices across facet SEAMS) is preserved exactly (G-L1-FARRING proves normal/pos/col deviation 0.0).
+## Default OFF → the SurfaceTool path, byte-identical mesh. +~5 MB bounded by the front-hemisphere
+## facet cache (NEVER-OOM OK; the tri caches are built lazily, only when the fast path or the gate runs). Flipped ON at
+## export after the A/B (the established sed-at-export pattern).
+const FP_FARRING_FAST_REBUILD := false
+
+## COSMOS-PERF STEP 2 / L1-async (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — move the far-ring rebuild OFF the
+## main thread. Even the fast packed-array assembler still runs synchronously on ONE frame: a headless breakdown of the
+## full front-hemisphere rebuild (~1727 facets / ~55k tris) shows the main-thread cost is SPREAD, not one hotspot —
+## SurfaceTool assembly + generate_normals + commit dominate, and on the threaded web export (~5-8× the native host)
+## that is the residual ~180-227 ms crossing/pool spike. When true, FacetFarRing hands ALL the mesh-DATA work (per-vertex
+## assembly + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) to a WorkerThreadPool task on the
+## warmed (read-only) per-facet caches, then swaps the finished ArrayMesh onto the MeshInstance3D on the main thread
+## (only the single add_surface_from_arrays / mesh RID create touches RenderingServer — kept on main, ~5 ms native).
+## Double-buffered: the previous far ring stays visible until the new mesh is ready, so a crossing/pool change costs the
+## main thread only the ~5 ms swap instead of the whole rebuild. VISUALLY IDENTICAL: commit_to_arrays yields the EXACT
+## arrays the synchronous path commits (pos/col/normal deviation 0.0 — G-L1-FARRING-ASYNC proves it), so smooth seam
+## normals are preserved. Single-flight; a crossing while a build is in flight is honoured after it lands; _exit_tree
+## joins any in-flight task. Independent of FP_FARRING_FAST_REBUILD (the worker emits from the grid caches, so the swapped
+## mesh is byte-identical to BOTH sync assemblers); needs a multi-core build, else it falls back to the synchronous
+## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
+const FP_FARRING_ASYNC_REBUILD := false
 
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
@@ -155,6 +238,28 @@ const CTRL_FRAME_SAMPLE_CLAMP_MS := 250.0
 const CTRL_WINDOW_PCTL := 0.9
 const POOL_D_COMMIT := 64.0
 
+## COSMOS-PERF STEP 1 / L5 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §1.2/§4 L5) — the ADAPTIVE overload setpoint.
+## The shipped overload test is `EMA(window p90) > CTRL_FRAME_BUDGET_MS` (18 ms). But the HEALTHY full-radius steady
+## frame is 33 ms (2 vsyncs) on a 30-fps-floor client → p90 = 33 > 18 → PERMANENT overload → stream_credit pinned 0 all
+## session, optional streaming stuck at the relief floor forever (live telemetry: credit 0 on every row). When true, the
+## setpoint becomes RELATIVE to this client's OWN achievable floor: setpoint = clamp(floor_p10 × CTRL_ADAPTIVE_MARGIN,
+## CTRL_FRAME_BUDGET_MS, CTRL_ADAPTIVE_MAX_MS), where floor_p10 is the p10 of a long rolling frame window (the "best
+## recent minute", robust to short hitch trains). Overload then means "worse than this client's floor," not an absolute
+## 60-fps-derived number: a 30-fps-floor client at a steady 33 ms is NOT flagged (setpoint ≈ 43), but a genuine
+## transient spike ABOVE its floor still IS. The clamp floor (CTRL_FRAME_BUDGET_MS) means the adaptive setpoint is
+## NEVER stricter than shipped — it only ever RELAXES upward for slow clients, so a fast client is never made MORE
+## overload-prone than today. DETERMINISM (§6.5.7): floor_p10 is a pure order statistic over the injected-source samples
+## + injected clock — no wall clock; the G-M2-CTRL-ADAPTIVE gate asserts it as a machine-speed-independent square wave.
+## Default OFF → the absolute CTRL_FRAME_BUDGET_MS path, byte-identical (the per-frame floor-window push is inert — it
+## never touches credit with the flag off). The controller is created only under FP_M2_LOD, so FLAT stays byte-identical
+## regardless. Instance-overridable via StreamLoadController.set_adaptive() so the gates pin either mode explicitly.
+## Flipped ON at export after the browser A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true live.
+const FP_CTRL_ADAPTIVE := false
+const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
+const CTRL_FLOOR_PCTL := 0.1             # p10 — the client's achievable floor (robust to short hitch trains)
+const CTRL_ADAPTIVE_MARGIN := 1.3        # setpoint = floor_p10 × this (overload ⇔ ~30% worse than the client's floor)
+const CTRL_ADAPTIVE_MAX_MS := 45.0       # setpoint upper clamp (never tolerate worse than ~22 fps as "not overload")
+
 ## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
 ## master toggle (the crossing-hitch fix). When true, the player + GroundCollider + loose VoxelBody debris live
 ## under a new ActiveFrame Node3D whose transform is the active facet's true placement, so gameplay math stays in
@@ -195,6 +300,15 @@ const POOL_CROSSING_PREGEN := true
 ## faceted). Tunable DOWN to trade the post-crossing spread for lower peak pool memory (e.g. 112 ⇒ imminent ≈ 30 MB); at
 ## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
 const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
+
+## CROSSING-JERKINESS FIX (3-agent root-cause 2026-07-16) — the committed imminent slot's view-ramp pace FLOOR. The
+## shipped build floored it at CTRL_RELIEF_FLOOR (0.25 → ~6 s to fill 96→128, LONGER than a facet traversal → the
+## residual fill BURSTS at the seam = the post-crossing mesh-upload spike the player feels as a jerk). Once the crossing
+## is GEOMETRICALLY COMMITTED (imminent ridge_dist < POOL_D_COMMIT — the SAME gate promote_admit_imminent already uses),
+## the fill cost is unavoidable and pre-paying it at FULL pace during the commit band strictly dominates paying it at the
+## seam, so the committed imminent ramps at this pace instead. Memory-NEUTRAL (same view_target; only the fill RATE
+## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
+const CTRL_IMMINENT_COMMIT_PACE := 1.0
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

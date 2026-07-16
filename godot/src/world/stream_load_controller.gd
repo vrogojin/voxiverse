@@ -35,15 +35,32 @@ var _headroom_hold_s := 0.0                    # seconds credit has sat ≥ CTRL
 var _overload_hold_s := 0.0                    # seconds of sustained credit-0 overload (drives demote_pressure)
 var _ticks := 0                                # control ticks since start (diagnostics)
 var _overload := false                         # last control tick's overload verdict (diagnostics)
+# L5 (COSMOS-PERF §1.2): the ADAPTIVE floor-relative overload setpoint. `_adaptive` defaults to the const so the LIVE
+# controller (created only under FP_M2_LOD) picks it up with no wiring; the gates override it per-controller via
+# set_adaptive() so each gate pins the exact mode it asserts. `_floor` is a long rolling frame-sample window whose p10
+# is this client's achievable floor; `_setpoint_ms` is the last effective overload threshold (const 18 in absolute mode,
+# clamp(floor_p10 × margin, 18, 45) in adaptive mode) — exposed via stats() for the gate + PerfHUD.
+var _adaptive: bool = CubeSphere.FP_CTRL_ADAPTIVE
+var _floor := PackedFloat64Array()             # rolling frame-cost window for the best-floor p10 (CTRL_FLOOR_WINDOW_FRAMES)
+var _floor_i := 0
+var _floor_fill := 0
+var _setpoint_ms := CubeSphere.CTRL_FRAME_BUDGET_MS
 
 func _init() -> void:
 	_win.resize(CubeSphere.CTRL_WINDOW_FRAMES)
+	_floor.resize(CubeSphere.CTRL_FLOOR_WINDOW_FRAMES)
 
 ## Inject the load source (§6.5.7). `src` is duck-typed: `poll() -> Dictionary {"frame_ms": float, "backlog": int}`.
 ## Live: `StreamLoadController.LiveSource.new()` (reads Performance + VoxelEngine). Headless: a synthetic source.
 ## null → the controller reads a neutral zero-load signal and credit floats to 1 (the flag-off / no-source default).
 func set_input_source(src: Object) -> void:
 	_src = src
+
+## L5 (COSMOS-PERF §1.2): pin the overload setpoint mode for THIS controller, overriding the FP_CTRL_ADAPTIVE default.
+## true → floor-relative adaptive setpoint (overload ⇔ worse than this client's own floor); false → the absolute
+## CTRL_FRAME_BUDGET_MS. The gates call this to assert each mode deterministically regardless of the shipped const.
+func set_adaptive(on: bool) -> void:
+	_adaptive = on
 
 ## Advance one FRAME. `now_s` is the INJECTED clock (live: Time in seconds; gates: a synthetic fixed step) so the
 ## run is machine-speed-independent. Samples the source every call (feeding the worst-frame window) but only
@@ -60,6 +77,11 @@ func tick(now_s: float) -> void:
 	_win[_win_i] = fm
 	_win_i = (_win_i + 1) % CubeSphere.CTRL_WINDOW_FRAMES
 	_win_fill = mini(_win_fill + 1, CubeSphere.CTRL_WINDOW_FRAMES)
+	# L5: push the same sample into the long best-floor window (its p10 is the adaptive setpoint's floor). Inert with the
+	# flag off — it never touches credit — so this is byte-identical to shipped when _adaptive is false.
+	_floor[_floor_i] = fm
+	_floor_i = (_floor_i + 1) % CubeSphere.CTRL_FLOOR_WINDOW_FRAMES
+	_floor_fill = mini(_floor_fill + 1, CubeSphere.CTRL_FLOOR_WINDOW_FRAMES)
 	if _last_tick_s < 0.0:
 		_last_tick_s = now_s
 		_frame_worst_ema = fm
@@ -91,8 +113,16 @@ func tick(now_s: float) -> void:
 		var idx := int(ceil(CubeSphere.CTRL_WINDOW_PCTL * float(_win_fill))) - 1
 		worst = samp[clampi(idx, 0, _win_fill - 1)]
 	_frame_worst_ema = _frame_worst_ema + _EMA_ALPHA * (worst - _frame_worst_ema)
+	# L5 (COSMOS-PERF §1.2): the overload setpoint. Absolute (shipped) = CTRL_FRAME_BUDGET_MS. Adaptive = relative to
+	# THIS client's own achievable floor (floor_p10 × margin, clamped [BUDGET, ADAPTIVE_MAX]) so a 30-fps-floor client at
+	# a steady 33 ms is NOT flagged overloaded (setpoint ≈ 43) — un-pinning credit — while a genuine spike above its floor
+	# still is. The clamp floor == CTRL_FRAME_BUDGET_MS ⇒ adaptive is never STRICTER than shipped (only relaxes upward).
+	_setpoint_ms = CubeSphere.CTRL_FRAME_BUDGET_MS
+	if _adaptive:
+		_setpoint_ms = clampf(_floor_p_low() * CubeSphere.CTRL_ADAPTIVE_MARGIN,
+			CubeSphere.CTRL_FRAME_BUDGET_MS, CubeSphere.CTRL_ADAPTIVE_MAX_MS)
 	# AIMD (§6.5.3): multiplicative decrease on overload, additive increase under headroom. Anti-windup by the clamp.
-	_overload = _frame_worst_ema > CubeSphere.CTRL_FRAME_BUDGET_MS
+	_overload = _frame_worst_ema > _setpoint_ms
 	if _overload:
 		_credit *= CubeSphere.CTRL_CREDIT_MDF
 		if _credit <= _CREDIT_ZERO_SNAP:
@@ -121,6 +151,21 @@ func tick(now_s: float) -> void:
 		_overload_hold_s += adt
 	else:
 		_overload_hold_s = 0.0
+
+## L5: this client's achievable floor — the p10 of the long rolling frame window. Deterministic order statistic (same
+## sort-then-index form as the window p90, §P2): under a CONSTANT signal p10 ≡ the constant, so a gate square wave is
+## bit-reproducible. Empty window → CTRL_FRAME_BUDGET_MS (the setpoint then clamps to the absolute budget — conservative
+## until enough samples accrue). A single early 0.0 sample cannot lower p10 once the window holds ≥10 real samples.
+func _floor_p_low() -> float:
+	if _floor_fill <= 0:
+		return CubeSphere.CTRL_FRAME_BUDGET_MS
+	var samp := PackedFloat64Array()
+	samp.resize(_floor_fill)
+	for i in range(_floor_fill):
+		samp[i] = _floor[i]
+	samp.sort()
+	var idx := int(ceil(CubeSphere.CTRL_FLOOR_PCTL * float(_floor_fill))) - 1
+	return samp[clampi(idx, 0, _floor_fill - 1)]
 
 # ---- the ONE credit + the four admission surfaces (§6.5.3) ----
 
@@ -182,6 +227,7 @@ func stats() -> Dictionary:
 		"credit": _credit, "frame_worst_ema": _frame_worst_ema, "backlog": _backlog,
 		"backlog_gated": backlog_gated(), "overload": _overload, "ticks": _ticks, "relief_only": relief_only(),
 		"promote_hold_s": _promote_hold_s, "headroom_hold_s": _headroom_hold_s, "overload_hold_s": _overload_hold_s,
+		"adaptive": _adaptive, "setpoint_ms": _setpoint_ms, "floor_p10_ms": _floor_p_low(),
 	}
 
 # ============================ live input source (§6.5.1) ============================

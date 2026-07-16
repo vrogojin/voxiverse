@@ -30,6 +30,15 @@ var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+# COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
+# caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
+# the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
+# straight append_array memcpy per facet (~1728 C++ memcpys) instead of ~332k per-vertex GDScript→C++ round-trips.
+# NORMALS are NOT cached: the mesh's GLOBAL smoothing (generate_normals merges vertices across facet SEAMS — proven by
+# G-L1-FARRING) depends on the whole visible set, so the fast path assembles pos/col, then runs create_from +
+# generate_normals (both C++, no GDScript per-vertex calls) → the normal array is BIT-IDENTICAL to the SurfaceTool path.
+var _tri_pos_cache: Dictionary = {}  # fid -> PackedVector3Array (96 verts: the facet's tri soup, ABSOLUTE coords)
+var _tri_col_cache: Dictionary = {}  # fid -> PackedColorArray   (96 colors, per _emit_cached order)
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -39,6 +48,15 @@ var _reemit_count := 0               # diagnostics: full re-emits done (gate: se
 # CubeSphere.FP_R0). Their flat quad is suppressed here so the real voxels don't z-fight the ring. Empty
 # on the shipped build (FP_R0 off) → the ring draws every non-active facet exactly as before, byte-identical.
 var _excluded: Dictionary = {}       # fid -> true (skipped in the visible set, same as the active facet is skipped)
+# COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
+# (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
+# per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
+# (_async_building), double-buffered (the old _mi.mesh stays visible until the swap), happens-before via the worker
+# pool's is_task_completed (main writes _async_fids before add_task; worker writes _async_arrays before returning).
+var _async_task_id := -1
+var _async_building := false
+var _async_fids := PackedInt32Array()   # the visible set the in-flight worker is building (main → worker; read-only during)
+var _async_arrays: Array = []           # worker → main: the committed surface arrays (built off-thread, swapped on main)
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -100,12 +118,78 @@ func set_pool_excluded(fids: Array) -> void:
 
 ## FP-S1(d): drive the deferred rebuild off the crossing frame. Cache-warm the newly-front-hemisphere facets under a
 ## per-frame ms budget; once they are all cached, do the single re-emit. Only active while a crossing is pending.
+## COSMOS-PERF STEP 2: first drain any finished off-thread build (swap it in on the main thread). A new crossing that
+## arrives while a build is in flight keeps _pending set but does NOT re-dispatch (_async_building gate) — it is served
+## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
 func _process(_dt: float) -> void:
-	if not _pending:
+	_poll_async_rebuild()
+	if not _pending or _async_building:
 		return
 	var nrm := FacetAtlas.facet_normal64(_active_fid)
 	if _warm_front(nrm):             # all front-hemisphere facets cached → safe to re-emit this frame
+		_begin_rebuild()
+
+## COSMOS-PERF STEP 2: whether the off-main-thread rebuild path is live (flag on AND real background workers exist —
+## a single-core build has no worker to flip is_task_completed, so it must fall back to the synchronous rebuild).
+func _async_enabled() -> bool:
+	return CubeSphere.FP_FARRING_ASYNC_REBUILD and OS.get_processor_count() > 1
+
+## Complete a warmed pending rebuild: dispatch it to a worker (async path) or build it inline (synchronous fallback).
+func _begin_rebuild() -> void:
+	if _async_enabled():
+		_dispatch_async_rebuild()
+	else:
 		_rebuild_full()
+
+## MAIN THREAD: snapshot the (already-warmed) visible set and hand the whole mesh-DATA build to a worker. The caches the
+## worker reads are frozen for its lifetime — _process will not warm/dispatch again while _async_building (the gate in
+## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
+func _dispatch_async_rebuild() -> void:
+	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
+	_async_fids = visible_fids()     # every fid here is warmed already (_warm_front gated the dispatch)
+	_async_arrays = []
+	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
+	_async_building = true
+	_async_task_id = WorkerThreadPool.add_task(Callable(self, "_async_build_worker"), false, "far-ring mesh rebuild")
+
+## WORKER THREAD: pure CPU. Emits the visible facets' cached pos/col into a SurfaceTool, computes the GLOBAL smooth
+## normals, and extracts the raw surface arrays via commit_to_arrays — which, unlike commit(), creates NO mesh RID and
+## touches NO RenderingServer. The arrays are BIT-IDENTICAL to what the synchronous commit() would store (proven by
+## G-L1-FARRING-ASYNC). NOTHING here reads the scene tree or a rendering server.
+func _async_build_worker() -> void:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for fid in _async_fids:
+		_emit_cached(st, fid)
+	st.generate_normals()
+	_async_arrays = st.commit_to_arrays()
+
+## MAIN THREAD: swap a finished off-thread build onto the MeshInstance3D. The double-buffer is implicit — the previous
+## _mi.mesh stayed assigned (and visible) for the whole worker run; here we replace it with the freshly built one. This
+## is the ONLY RenderingServer touch of the async path (the add_surface_from_arrays / mesh RID create + assignment).
+func _poll_async_rebuild() -> void:
+	if not _async_building:
+		return
+	if not WorkerThreadPool.is_task_completed(_async_task_id):
+		return
+	WorkerThreadPool.wait_for_task_completion(_async_task_id)   # already done — reclaims the handle (never blocks here)
+	_swap_in_arrays(_async_arrays, _async_fids)
+	_async_task_id = -1
+	_async_arrays = []
+	_async_building = false
+
+## MAIN THREAD: build the ArrayMesh from the worker's surface arrays and assign it, then update the committed-set gate
+## state exactly as _rebuild_full does (so emitted_count/reemit_count/_emitted are identical to the synchronous path).
+## An empty visible set (fully back-facing) yields an empty ArrayMesh — matching _build_fast's empty-mesh contract.
+func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
+	var mesh := ArrayMesh.new()
+	if arrays.size() == Mesh.ARRAY_MAX and (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() > 0:
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	_mi.mesh = mesh
+	_emitted.clear()
+	for fid in fids:
+		_emitted[fid] = true
+	_reemit_count += 1
 
 ## Warm (noise-cache) every uncached front-hemisphere facet under WARM_BUDGET_MS. Returns true once none remain
 ## uncached (rebuild may proceed), false when the frame budget is spent (resume next frame). The scan itself is a
@@ -139,31 +223,90 @@ func _front_visible(fid: int, nrm: Array) -> bool:
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
 func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var fids := visible_fids()
+	_emitted.clear()
+	for fid in fids:
+		_ensure_cached(fid)
+		_emitted[fid] = true
+	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
+	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
+	_mi.mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	_reemit_count += 1
+	_pending = false
+	var tris := fids.size() * CELLS * CELLS * 2   # 32 tris/facet — exact for both assemblers
+	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+
+## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
+## mesh assemblers + the equivalence gate consume this so their vertex/color/normal arrays are index-aligned.
+func visible_fids() -> PackedInt32Array:
+	var out := PackedInt32Array()
 	var k := FacetAtlas.K
 	var nrm := FacetAtlas.facet_normal64(_active_fid)
-	var tris := 0
-	_emitted.clear()
 	for face in range(6):
 		for a in range(k):
 			for b in range(k):
 				var fid := (face * k + a) * k + b
-				if not _front_visible(fid, nrm):
-					continue
-				_ensure_cached(fid)
-				tris += _emit_cached(st, fid)
-				_emitted[fid] = true
+				if _front_visible(fid, nrm):
+					out.append(fid)
+	return out
+
+## SHIPPED assembler: per-vertex SurfaceTool emission + generate_normals (the ~332k GDScript→C++ round-trip path).
+func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for fid in fids:
+		_ensure_cached(fid)
+		_emit_cached(st, fid)
 	st.generate_normals()
-	_mi.mesh = st.commit()
-	_reemit_count += 1
-	_pending = false
-	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+	return st.commit()
+
+## FAST assembler (L1): concat the pre-triangulated per-facet pos/col caches into two big packed arrays (C++ memcpy),
+## build a normal-less mesh, then let SurfaceTool COMPUTE the normals via create_from + generate_normals — both C++,
+## so NONE of the ~332k per-vertex GDScript→C++ round-trips of the shipped path remain, yet the normals are the SAME
+## GLOBALLY-smoothed array (create_from replays the identical vertex list into the identical generate_normals, seams
+## and all). A few ms of memcpy + one C++ normal pass, vs 300–700 ms of GDScript emission.
+func _build_fast(fids: PackedInt32Array) -> Mesh:
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for fid in fids:
+		_ensure_tri_cached(fid)
+		pos.append_array(_tri_pos_cache[fid])
+		col.append_array(_tri_col_cache[fid])
+	if pos.size() == 0:
+		return ArrayMesh.new()
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	var flat := ArrayMesh.new()
+	flat.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)   # normal-less; positions + colors only
+	var st := SurfaceTool.new()
+	st.create_from(flat, 0)                                       # C++ read-back of the vertex list (no GDScript per-vert)
+	st.generate_normals()                                        # C++ GLOBAL smoothing — bit-identical to the shipped path
+	return st.commit()
 
 ## FP-S1(d) gate helper: synchronously complete a pending deferred rebuild (what _process does over budgeted frames)
-## so headless gates — which do not step frames — can assert the post-crossing visible set.
+## so headless gates — which do not step frames — can assert the post-crossing visible set. COSMOS-PERF STEP 2: joins
+## any in-flight off-thread build first (so the caches are quiescent), then rebuilds synchronously — force_rebuild is
+## always immediate + main-thread, regardless of the async flag.
 func force_rebuild() -> void:
+	_join_async_rebuild()
 	_rebuild_full()
+
+## COSMOS-PERF STEP 2: block until any in-flight worker finishes and discard its result (a synchronous rebuild is about
+## to overwrite it). Called before force_rebuild/set_excluded (which rebuild inline) and on _exit_tree (the worker reads
+## this node's caches — it must not outlive the node). No-op when nothing is in flight.
+func _join_async_rebuild() -> void:
+	if not _async_building:
+		return
+	WorkerThreadPool.wait_for_task_completion(_async_task_id)
+	_async_task_id = -1
+	_async_arrays = []
+	_async_building = false
+
+## COSMOS-PERF STEP 2: never free while a worker is still reading our caches.
+func _exit_tree() -> void:
+	_join_async_rebuild()
 
 # --- gate diagnostics ---
 func is_rebuild_pending() -> bool: return _pending
@@ -221,6 +364,32 @@ func _emit_cached(st: SurfaceTool, fid: int) -> int:
 			st.set_color(col[i3]); st.add_vertex(pos[i3])
 			n += 2
 	return n
+
+## COSMOS-PERF L1: derive facet `fid`'s pre-triangulated pos/col soup from its grid caches, ONCE (cached forever). Expands
+## the (CELLS+1)² vertex grid into the SAME 32-tri soup _emit_cached emits (same two tris per cell, same winding, same
+## per-vertex colors) so a fast rebuild is a straight append_array of these arrays. Normals are computed later, globally,
+## by _build_fast's create_from + generate_normals (they depend on the whole visible set via cross-facet seam smoothing).
+func _ensure_tri_cached(fid: int) -> void:
+	if _tri_pos_cache.has(fid):
+		return
+	_ensure_cached(fid)
+	var pos: PackedVector3Array = _pos_cache[fid]
+	var col: PackedColorArray = _col_cache[fid]
+	var stride := CELLS + 1
+	var tp := PackedVector3Array()
+	var tc := PackedColorArray()
+	for gj in range(CELLS):
+		for gi in range(CELLS):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			tp.push_back(pos[i0]); tp.push_back(pos[i2]); tp.push_back(pos[i1])
+			tp.push_back(pos[i1]); tp.push_back(pos[i2]); tp.push_back(pos[i3])
+			tc.push_back(col[i0]); tc.push_back(col[i2]); tc.push_back(col[i1])
+			tc.push_back(col[i1]); tc.push_back(col[i2]); tc.push_back(col[i3])
+	_tri_pos_cache[fid] = tp
+	_tri_col_cache[fid] = tc
 
 func _centre_dir(fid: int) -> Array:
 	if _centre_cache.has(fid):

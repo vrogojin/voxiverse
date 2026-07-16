@@ -24,6 +24,7 @@ const FLB := preload("res://src/world/facet_lod_builder.gd")
 const FLM := preload("res://src/world/facet_lod_mesher.gd")   # preload (not the global class_name) — headless --script parse scope
 const SLC := preload("res://src/world/stream_load_controller.gd")
 const WM := preload("res://src/world/world_manager.gd")       # M2d: the Z1-hybrid policy statics (z1_live_targets/promote_admit)
+const FFR := preload("res://src/world/facet_far_ring.gd")    # L1: the far-ring node (G-L1-FARRING mesh-equivalence gate)
 
 const _BYTES_PER_VERT := 64
 const _BYTES_PER_INDEX := 4
@@ -116,6 +117,8 @@ func _initialize() -> void:
 	_gate_dir(nf)
 	_gate_ctrl(mod, active)
 	_gate_ctrl_rawdt()                              # steelman W2: raw-dt sustain clamp
+	_gate_ctrl_adaptive()                           # COSMOS-PERF L5: the adaptive floor-relative overload setpoint
+	_gate_farring_equiv(active)                     # COSMOS-PERF L1: far-ring fast-rebuild mesh equivalence
 	# --- FP-M2d gates: Z1-hybrid pool policy + promote/demote choreography ---
 	_gate_policy()
 	# --- CONTROLLER-FIX gate: the relief floor + geometric commit un-starve the controller (credit was pinned 0) ---
@@ -693,6 +696,7 @@ func _gate_ctrl(mod: Node3D, active: int) -> void:
 	var ctrl = SLC.new()
 	var src = _SquareWaveSource.new()
 	ctrl.set_input_source(src)
+	ctrl.set_adaptive(false)                              # L5: this gate asserts the ABSOLUTE-setpoint AIMD (adaptive is _gate_ctrl_adaptive)
 	var DT := 1.0 / 60.0                                  # synthetic 60 fps clock — machine speed cannot perturb it
 	var t := 0.0
 	# (f) flag-off / inert byte-identity: a fresh/idle controller passes the shipped fixed values through unchanged.
@@ -771,6 +775,7 @@ func _gate_ctrl_rawdt() -> void:
 	var cw = SLC.new()
 	var sw = _SquareWaveSource.new()
 	cw.set_input_source(sw)
+	cw.set_adaptive(false)                               # L5: W2 asserts absolute-path sustain clamps
 	var tt := 0.0
 	sw.frame_ms = 6.0; sw.backlog = 0                    # headroom → the imminent headroom-hold accrues
 	for i in range(80):
@@ -785,6 +790,7 @@ func _gate_ctrl_rawdt() -> void:
 	var cw2 = SLC.new()
 	var sw2 = _SquareWaveSource.new()
 	cw2.set_input_source(sw2)
+	cw2.set_adaptive(false)                              # L5: W2 asserts absolute-path sustain clamps
 	var t2 := 0.0
 	sw2.frame_ms = 40.0; sw2.backlog = 0                 # overload → credit → 0, overload-hold begins
 	for i in range(120):
@@ -792,6 +798,159 @@ func _gate_ctrl_rawdt() -> void:
 	_ok(not cw2.demote_pressure(), "G-M2-CTRL(W2) setup: overloaded < CTRL_OVERLOAD_SUSTAIN_S — demote pressure not yet tripped")
 	t2 += 100.0; cw2.tick(t2)                            # ONE giant tick
 	_ok(not cw2.demote_pressure(), "G-M2-CTRL(W2): a giant dt tick does NOT instantly trip sustained demote pressure (no spurious demote on refocus)")
+
+# ---------- G-M2-CTRL-ADAPTIVE (COSMOS-PERF L5): the floor-relative overload setpoint ----------
+# The shipped absolute setpoint (18 ms) reads a 30-fps-floor client's HEALTHY 33 ms steady frame as permanent overload,
+# pinning stream_credit at 0 all session (live telemetry). L5 makes the setpoint relative to the client's OWN floor.
+# Deterministic: synthetic square-wave source + fixed-step injected clock; each controller pins its mode via set_adaptive.
+func _gate_ctrl_adaptive() -> void:
+	print("  --- G-M2-CTRL-ADAPTIVE (L5): floor-relative overload setpoint (deterministic square wave) ---")
+	var DT := 1.0 / 60.0
+	# (a) a 30-fps-FLOOR client at a STEADY 33 ms is NOT flagged overloaded (the un-starve fix).
+	var c = SLC.new()
+	var s = _SquareWaveSource.new()
+	c.set_input_source(s)
+	c.set_adaptive(true)
+	var t := 0.0
+	s.frame_ms = 33.0; s.backlog = 0                     # the healthy full-radius 2-vsync frame on a 30-fps client
+	for i in range(200):
+		t += DT; c.tick(t)
+	var sp := float(c.stats()["setpoint_ms"])
+	_ok(sp > 33.0 and sp <= CubeSphere.CTRL_ADAPTIVE_MAX_MS,
+		"G-M2-CTRL-ADAPTIVE(a): setpoint tracks the client floor ABOVE a steady 33 ms (%.1f ms, floor_p10 %.1f)" % [sp, float(c.stats()["floor_p10_ms"])])
+	_ok(not bool(c.stats()["overload"]) and is_equal_approx(c.credit(), 1.0),
+		"G-M2-CTRL-ADAPTIVE(a): a steady 33 ms is NOT overload on a 33-ms-floor client (credit stays 1 — un-starved)")
+	# (a') the SHIPPED absolute setpoint DOES pin credit 0 at the same steady 33 ms — the exact regression adaptive fixes.
+	var cabs = SLC.new()
+	var sabs = _SquareWaveSource.new()
+	cabs.set_input_source(sabs)
+	cabs.set_adaptive(false)
+	var ta := 0.0
+	sabs.frame_ms = 33.0; sabs.backlog = 0
+	for i in range(200):
+		ta += DT; cabs.tick(ta)
+	_ok(cabs.credit() == 0.0 and bool(cabs.stats()["overload"]),
+		"G-M2-CTRL-ADAPTIVE(a'): the absolute setpoint pins credit 0 at a steady 33 ms (the bug adaptive removes)")
+	# (b) a genuine transient SPIKE above the floor still registers overload → credit dips (adaptive is not blind to hitches).
+	s.frame_ms = 80.0                                    # a real hitch, well above the ~43 ms adaptive setpoint
+	for i in range(120):
+		t += DT; c.tick(t)
+	_ok(c.credit() < 1.0 and bool(c.stats()["overload"]),
+		"G-M2-CTRL-ADAPTIVE(b): a transient spike ABOVE the floor still trips overload (credit %.2f < 1)" % c.credit())
+	_ok(float(c.stats()["floor_p10_ms"]) <= 34.0,
+		"G-M2-CTRL-ADAPTIVE(b): the short spike does NOT pollute the best-floor (floor_p10 %.1f ≈ 33)" % float(c.stats()["floor_p10_ms"]))
+	# (c) at the FAST end the adaptive setpoint clamps DOWN to the absolute budget → identical verdict to shipped (never stricter).
+	var cf2 = SLC.new()
+	var sf2 = _SquareWaveSource.new()
+	cf2.set_input_source(sf2)
+	cf2.set_adaptive(true)
+	var tf := 0.0
+	sf2.frame_ms = 6.0; sf2.backlog = 0                  # a 60-fps client: floor 6 → setpoint clamps UP to the 18 ms budget
+	for i in range(200):
+		tf += DT; cf2.tick(tf)
+	_ok(is_equal_approx(float(cf2.stats()["setpoint_ms"]), CubeSphere.CTRL_FRAME_BUDGET_MS),
+		"G-M2-CTRL-ADAPTIVE(c): a fast client's setpoint clamps to the absolute budget (%.1f ms) — never STRICTER than shipped" % CubeSphere.CTRL_FRAME_BUDGET_MS)
+	sf2.frame_ms = 40.0                                  # 40 > 18 → overload on BOTH paths (adaptive ≡ absolute at the clamp)
+	var zeroed := false
+	for i in range(120):
+		tf += DT; cf2.tick(tf)
+		if cf2.credit() == 0.0:
+			zeroed = true; break
+	_ok(zeroed, "G-M2-CTRL-ADAPTIVE(c): at the clamped setpoint a 40 ms load still drives credit → 0 (adaptive ≡ absolute here)")
+
+# ---------- G-L1-FARRING (COSMOS-PERF L1): far-ring fast-rebuild mesh equivalence ----------
+# The FP_FARRING_FAST_REBUILD packed-array assembler must produce a VISUALLY EQUIVALENT mesh to the shipped SurfaceTool
+# path: identical vertex count, identical per-vertex positions + colors (same winding), and per-face FLAT normals that
+# match generate_normals(flip=false). Builds BOTH meshes for the same visible fid set (independent of the const) + a
+# pool-exclusion variant, and compares the decompressed surface arrays.
+func _gate_farring_equiv(active: int) -> void:
+	print("  --- G-L1-FARRING (L1): far-ring fast-rebuild mesh equivalence (SurfaceTool vs packed arrays) ---")
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active)
+	_farring_compare(ring, "front-hemisphere")
+	# pool-change path: exclude one visible facet (a neighbour spawn/retire) and re-compare.
+	var vis: PackedInt32Array = ring.call("visible_fids")
+	if vis.size() > 0:
+		ring.call("set_pool_excluded", [int(vis[0])])
+		_farring_compare(ring, "one facet excluded (pool change)")
+	ring.free()
+
+func _farring_compare(ring: Node3D, label: String) -> void:
+	var fids: PackedInt32Array = ring.call("visible_fids")
+	var slow: ArrayMesh = ring.call("_build_surfacetool", fids)
+	var fast: ArrayMesh = ring.call("_build_fast", fids)
+	var sc_a := slow.get_surface_count()
+	var sc_b := fast.get_surface_count()
+	if sc_a == 0 or sc_b == 0:
+		_ok(sc_a == sc_b, "G-L1-FARRING [%s]: both empty ⇔ both empty (surfaces %d/%d)" % [label, sc_a, sc_b])
+		return
+	var aa := slow.surface_get_arrays(0)
+	var ab := fast.surface_get_arrays(0)
+	var va: PackedVector3Array = aa[Mesh.ARRAY_VERTEX]
+	var vb: PackedVector3Array = ab[Mesh.ARRAY_VERTEX]
+	var ca: PackedColorArray = aa[Mesh.ARRAY_COLOR]
+	var cb: PackedColorArray = ab[Mesh.ARRAY_COLOR]
+	var na: PackedVector3Array = aa[Mesh.ARRAY_NORMAL]
+	var nb: PackedVector3Array = ab[Mesh.ARRAY_NORMAL]
+	# vertex count (== tri count × 3): 32 tris/facet × 3 = 96 verts/facet on both.
+	var verts_per_facet := FFR.CELLS * FFR.CELLS * 2 * 3
+	_ok(va.size() == vb.size() and va.size() % 3 == 0 and va.size() == fids.size() * verts_per_facet,
+		"G-L1-FARRING [%s]: identical vertex count (%d == %d = %d facets × %d)" % [label, va.size(), vb.size(), fids.size(), verts_per_facet])
+	# positions: index-aligned (same fids, same order, same winding).
+	var vert_ok := va.size() == vb.size()
+	for i in range(mini(va.size(), vb.size())):
+		if not va[i].is_equal_approx(vb[i]):
+			vert_ok = false; break
+	_ok(vert_ok, "G-L1-FARRING [%s]: per-vertex positions identical (same triangles + winding)" % label)
+	# colors: the seam palette must be preserved exactly.
+	var col_ok := ca.size() == cb.size()
+	for i in range(mini(ca.size(), cb.size())):
+		if not ca[i].is_equal_approx(cb[i]):
+			col_ok = false; break
+	_ok(col_ok, "G-L1-FARRING [%s]: per-vertex colors identical (seam palette preserved)" % label)
+	# normals: BIT-IDENTICAL. The fast path computes normals with create_from + generate_normals over the SAME assembled
+	# vertex list, so its GLOBAL smoothing (which merges vertices across facet SEAMS) equals the SurfaceTool path exactly.
+	# A per-facet or flat shortcut would deviate ~0.1–0.4 at the seams; a FLIP ~2.0 — both far above this 1e-6 tolerance.
+	var nrm_ok := na.size() == nb.size()
+	var maxdev := 0.0
+	for i in range(mini(na.size(), nb.size())):
+		var d := (na[i] - nb[i]).length()
+		if d > maxdev:
+			maxdev = d
+		if d > 1.0e-6:
+			nrm_ok = false
+	_ok(nrm_ok, "G-L1-FARRING [%s]: normals bit-identical to generate_normals (max dev %.8f — global smoothing preserved)" % [label, maxdev])
+	# COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): the OFF-THREAD worker body must produce a mesh byte-identical to the
+	# synchronous path. It emits the same visible fids + generate_normals, then extracts the arrays via commit_to_arrays
+	# (no mesh RID / RenderingServer) — the arrays the async main-thread swap builds an ArrayMesh from. Run the worker
+	# body inline (pure CPU) and compare its swapped mesh to the synchronous `slow` mesh (pos/col/normal deviation 0.0).
+	ring.set("_async_fids", fids)
+	ring.call("_async_build_worker")
+	var async_arrays: Array = ring.get("_async_arrays")
+	var async_mesh := ArrayMesh.new()
+	var vac := 0
+	if async_arrays.size() == Mesh.ARRAY_MAX and (async_arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() > 0:
+		async_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, async_arrays)
+		vac = async_mesh.get_surface_count()
+	if vac == 0:
+		_ok(va.size() == 0, "G-L1-FARRING-ASYNC [%s]: empty visible set ⇔ empty async mesh" % label)
+		return
+	var da := async_mesh.surface_get_arrays(0)
+	var vd: PackedVector3Array = da[Mesh.ARRAY_VERTEX]
+	var cd: PackedColorArray = da[Mesh.ARRAY_COLOR]
+	var nd: PackedVector3Array = da[Mesh.ARRAY_NORMAL]
+	var async_ok := vd.size() == va.size() and cd.size() == ca.size() and nd.size() == na.size()
+	var amax := 0.0
+	for i in range(mini(vd.size(), va.size())):
+		if not vd[i].is_equal_approx(va[i]) or not cd[i].is_equal_approx(ca[i]):
+			async_ok = false
+		var ad := (nd[i] - na[i]).length()
+		if ad > amax:
+			amax = ad
+		if ad > 1.0e-6:
+			async_ok = false
+	_ok(async_ok, "G-L1-FARRING-ASYNC [%s]: off-thread worker mesh bit-identical to synchronous (nrm dev %.8f)" % [label, amax])
 
 # ---------- G-M2-POLICY: Z1-hybrid live-terrain targets + promote admission (§3.2 / §6.5.3.4) ----------
 func _gate_policy() -> void:
@@ -821,6 +980,7 @@ func _gate_policy() -> void:
 	var cg = SLC.new()
 	var sg = _SquareWaveSource.new()
 	cg.set_input_source(sg)
+	cg.set_adaptive(false)                              # L5: promote-admission is asserted on the absolute path
 	var DT := 1.0 / 60.0
 	var t := 0.0
 	sg.frame_ms = 6.0; sg.backlog = CubeSphere.CTRL_BACKLOG_MAX + 100
@@ -838,6 +998,7 @@ func _gate_policy() -> void:
 	var ci = SLC.new()
 	var si = _SquareWaveSource.new()
 	ci.set_input_source(si)
+	ci.set_adaptive(false)                              # L5: W1 imminent-exempt gate asserted on the absolute path
 	var ti := 0.0
 	si.frame_ms = 6.0                                   # full frame headroom (credit floats to 1, headroom-hold accrues)
 	si.backlog = CubeSphere.CTRL_BACKLOG_MAX + 100      # vox_gen gate CLOSED throughout
@@ -863,6 +1024,7 @@ func _gate_starve(mod: Node3D, active: int, neighbour: int, corner_fid: int) -> 
 	var ctrl = SLC.new()
 	var src = _SquareWaveSource.new()
 	ctrl.set_input_source(src)
+	ctrl.set_adaptive(false)                             # L5: STARVE asserts the ORTHOGONAL relief-floor fix at credit 0 (absolute path)
 	src.frame_ms = 45.0; src.backlog = 900               # >> CTRL_FRAME_BUDGET_MS(18) and >> CTRL_BACKLOG_MAX(300)
 	var t := 0.0
 	for i in range(300):                                 # ≥12 control ticks (a control tick fires every ~15 frames)
@@ -883,6 +1045,7 @@ func _gate_starve(mod: Node3D, active: int, neighbour: int, corner_fid: int) -> 
 	var cf = SLC.new()
 	var sf = _SquareWaveSource.new()
 	cf.set_input_source(sf)
+	cf.set_adaptive(false)                               # L5: the p90≡max constant-signal trace is the absolute-path AIMD
 	var tf := 0.0
 	sf.frame_ms = 6.0; sf.backlog = 0
 	for i in range(120):                                 # warm to credit 1 under sustained headroom

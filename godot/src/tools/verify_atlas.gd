@@ -1,14 +1,18 @@
 extends SceneTree
-## COSMOS-ATLAS Stage 1 gate (docs/COSMOS-ATLAS-DESIGN.md §4.2) — the OPAQUE-cube atlas: coverage, UVs, and the ONE
-## shared material. Runs headless with FP_ATLAS_MATERIAL sed-toggled true (like verify_fp_m2's FACETED/FP_M2_LOD).
-## Proves, on the ACTUAL built library (not by eye):
-##   G-ATLAS-COVER  every opaque cube id maps to a baked atlas cell, and that cell holds the id's REAL tile/swatch
-##                  (sample the atlas image at the cell centre vs the source tile centre / the swatch colour) — no id
-##                  points at an unbaked / empty / wrong cell.
-##   G-ATLAS-UV     every opaque cube model is configured with the library-wide atlas grid + every face's set_tile is
-##                  the id's cell (the exact UV rect bake() emits), and that rect is inside [0,1]².
-##   G-ATLAS-MAT    every opaque cube model's material_override(0) is the ONE shared atlas material INSTANCE (is_same),
-##                  so the mesher merges them into one surface; a translucent id (glass) is NOT on it (kept per-id).
+## COSMOS-ATLAS Stage 1+2 gate (docs/COSMOS-ATLAS-DESIGN.md §4.2/§2.4) — the OPAQUE atlas: coverage, UVs, and the ONE
+## shared material, over BOTH the cubes (Stage 1) AND the shaped/composite families (Stage 2). Runs headless with
+## FP_ATLAS_MATERIAL sed-toggled true (like verify_fp_m2's FACETED/FP_M2_LOD). Proves, on the ACTUAL built library
+## (not by eye):
+##   G-ATLAS-COVER          every opaque cube id maps to a baked atlas cell holding its REAL tile/swatch, and every
+##                          cappable base has a snow-CAP cell holding the snow tile × its base tint (§2.6) — no look
+##                          points at an unbaked / empty / wrong cell.
+##   G-ATLAS-UV             every opaque cube model uses the atlas grid + points its 6 faces at its cell (rect in
+##                          [0,1]²); and every atlas-routed SHAPED surface's baked vertex UVs lie inside its cell rect.
+##   G-ATLAS-MAT            every opaque cube AND every atlas-routed shaped surface's material_override(i) is the ONE
+##                          shared atlas material INSTANCE (is_same) so the mesher merges them; a translucent id (glass)
+##                          is NOT on it (kept per-id).
+## The shaped gates replay the manifest's own probe record (module capture_atlas_probes → atlas_shaped_probes()), so
+## they cover exactly the (mat,modifier) shapes the bake routed onto the atlas.
 ##
 ## RUN:
 ##   sed -i 's/const FP_ATLAS_MATERIAL := false/const FP_ATLAS_MATERIAL := true/' godot/src/cosmos/cube_sphere.gd
@@ -39,9 +43,10 @@ func _initialize() -> void:
 	BlockCatalog.ensure_ready()
 	TerrainConfig.warm_up()
 
-	# Build the module world (which builds the atlas + routes the opaque cubes under the flag).
+	# Build the module world (which builds the atlas + routes the opaque cubes AND shaped families under the flag).
 	var mod: Node3D = (load("res://src/world/voxel_module/module_world.gd").new()) as Node3D
 	get_root().add_child(mod)
+	mod.set("capture_atlas_probes", true)   # Stage 2: arm the shaped-model probe record BEFORE setup bakes the manifest
 	var ok_setup: bool = bool(mod.call("setup"))
 	_ok(ok_setup, "setup: module_world built the terrain + baked library (atlas routed)")
 	if not ok_setup:
@@ -69,6 +74,9 @@ func _initialize() -> void:
 	_gate_cover(atlas, opaque)
 	_gate_uv(mod, atlas, opaque)
 	_gate_mat(mod, atlas, opaque, translucent)
+	# Stage 2 — the shaped OPAQUE families (dry corner shapes, snow caps, layers, composites, slopes).
+	_gate_snowcap_cover(atlas)
+	_gate_shaped(mod, atlas)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	_teardown(mod)
@@ -192,6 +200,129 @@ func _gate_mat(mod: Node3D, atlas, opaque: PackedInt32Array, translucent: Packed
 			control_off_atlas = false
 	_ok(checked_ctrl > 0 and control_off_atlas,
 		"G-ATLAS-MAT: translucent ids (%d checked) are NOT on the atlas material (kept per-id for Stage 3)" % checked_ctrl)
+
+# ---------- G-ATLAS-COVER (Stage 2): every snow-CAP variant cell holds the tinted snow tile ----------
+func _gate_snowcap_cover(atlas) -> void:
+	print("  --- G-ATLAS-COVER(snow-cap): every cappable/fill base has a snow-cap cell holding the tinted snow tile ---")
+	# The union the atlas registers (module snow variants + slope twins over snow_cappable; composite skins over
+	# snow_fill — which adds snow_block itself). Every one must have a cell holding snow×tint, or a composite skin holes.
+	var capset := {}
+	for m in TerrainConfig.snow_cappable_materials():
+		capset[m] = true
+	for m in TerrainConfig.snow_fill_materials():
+		capset[m] = true
+	var caps := PackedInt32Array()
+	for m: int in capset.keys():
+		caps.append(m)
+	var missing := 0
+	var wrong := 0
+	var first_missing := -1
+	var first_wrong := -1
+	# The snow_block source tile, resized to the atlas cell, sampled at centre — the un-tinted reference.
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+	var snow_stem: String = BlockTextures.TILES.get(StringName(BlockCatalog.name_of(snow_id)), "")
+	var snow_center := Color(1, 1, 1, 1)
+	if snow_stem != "":
+		var src: Image = (load("%s/%s.png" % [BlockTextures.DIR, snow_stem]) as Texture2D).get_image()
+		if src.is_compressed(): src.decompress()
+		if src.get_format() != Image.FORMAT_RGBA8: src.convert(Image.FORMAT_RGBA8)
+		if src.get_width() != BA.CELL_PX or src.get_height() != BA.CELL_PX:
+			src.resize(BA.CELL_PX, BA.CELL_PX, Image.INTERPOLATE_NEAREST)
+		snow_center = src.get_pixel(BA.CELL_PX / 2, BA.CELL_PX / 2)
+	for base in caps:
+		if not atlas.has_snow_cap_cell(base):
+			missing += 1
+			if first_missing < 0: first_missing = base
+			continue
+		var cell: Vector2i = atlas.snow_cap_cell_of(base)
+		if cell.x < 0 or cell.y < 0 or cell.x >= BA.GRID or cell.y >= BA.GRID:
+			wrong += 1
+			if first_wrong < 0: first_wrong = base
+			continue
+		var tint: Color = lerp(Color.WHITE, BlockCatalog.color_of(base), BA.SNOW_CAP_TINT)
+		var want := Color(snow_center.r * tint.r, snow_center.g * tint.g, snow_center.b * tint.b, snow_center.a)
+		var cx: int = cell.x * BA.CELL_PX + BA.CELL_PX / 2
+		var cy: int = cell.y * BA.CELL_PX + BA.CELL_PX / 2
+		var got: Color = atlas.image.get_pixel(cx, cy)
+		if not _color_close(got, want):
+			wrong += 1
+			if first_wrong < 0: first_wrong = base
+			print("    snow-cap base %d (%s) cell (%d,%d): atlas=%s want=%s" % [base, BlockCatalog.name_of(base), cell.x, cell.y, str(got), str(want)])
+	_ok(caps.size() > 0, "G-ATLAS-COVER(snow-cap): there are cappable materials to check (%d)" % caps.size())
+	_ok(missing == 0, "G-ATLAS-COVER(snow-cap): every cappable base has a snow-cap cell (%d missing%s)" % [
+		missing, "" if first_missing < 0 else ", first base=%d" % first_missing])
+	_ok(wrong == 0, "G-ATLAS-COVER(snow-cap): every snow-cap cell holds snow×tint (%d wrong%s)" % [
+		wrong, "" if first_wrong < 0 else ", first base=%d" % first_wrong])
+
+# ---------- G-ATLAS-MAT/-UV (Stage 2): shaped models share the atlas material + their UVs land in the right cell ----
+func _gate_shaped(mod: Node3D, atlas) -> void:
+	print("  --- G-ATLAS-MAT/-UV(shaped): every atlas-routed shaped model surface is on the ONE material, UVs in-cell ---")
+	var probes: Array = mod.call("atlas_shaped_probes")
+	_ok(probes.size() > 0, "G-ATLAS(shaped): the manifest recorded atlas-routed shaped models (%d probes)" % probes.size())
+	if probes.is_empty():
+		return
+	var shared: Object = atlas.material
+	var bad_mat := 0
+	var bad_uv := 0
+	var checked_surf := 0
+	var first_bad_mat := -1
+	var first_bad_uv := -1
+	var tol := 1.0 / float(BA.GRID) * 0.001 + 1e-5   # a sub-texel slack on the cell rect containment
+	for probe: Dictionary in probes:
+		var arid: int = probe["arid"]
+		var cells: Array = probe["cells"]
+		var model: Object = mod.call("library_model", arid)
+		if model == null:
+			bad_mat += 1
+			if first_bad_mat < 0: first_bad_mat = arid
+			continue
+		var mesh: Mesh = mod.call("library_model_mesh", arid)
+		# A CUBE probe (the snow-cap variant cube at modifier 0) has no mesh — its faces sample the atlas via set_tile,
+		# so verify it the Stage-1 way: material_override(0) shared + every face's tile == the cell (UVs bake() emits).
+		if mesh == null:
+			checked_surf += 1
+			if not (model.has_method("get_material_override") and is_same(model.call("get_material_override", 0), shared)):
+				bad_mat += 1
+				if first_bad_mat < 0: first_bad_mat = arid
+			var ccell: Vector2i = cells[0]
+			var tile_bad := not model.has_method("get_tile")
+			if not tile_bad:
+				for side in 6:
+					if model.call("get_tile", side) != ccell:
+						tile_bad = true
+						break
+			if tile_bad:
+				bad_uv += 1
+				if first_bad_uv < 0: first_bad_uv = arid
+			continue
+		for si in cells.size():
+			checked_surf += 1
+			# G-ATLAS-MAT: this surface is on the ONE shared atlas material instance (so the mesher merges it).
+			if not (model.has_method("get_material_override") and is_same(model.call("get_material_override", si), shared)):
+				bad_mat += 1
+				if first_bad_mat < 0: first_bad_mat = arid
+			# G-ATLAS-UV: every vertex UV of the surface lies inside the surface's expected atlas cell rect.
+			var cell: Vector2i = cells[si]
+			var rect: Rect2 = atlas.rect_of_cell(cell)
+			if si >= mesh.get_surface_count():
+				bad_uv += 1
+				if first_bad_uv < 0: first_bad_uv = arid
+				continue
+			var arrays: Array = mesh.surface_get_arrays(si)
+			var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV]
+			var surf_bad := false
+			for uv: Vector2 in uvs:
+				if uv.x < rect.position.x - tol or uv.y < rect.position.y - tol \
+						or uv.x > rect.end.x + tol or uv.y > rect.end.y + tol:
+					surf_bad = true
+					break
+			if surf_bad:
+				bad_uv += 1
+				if first_bad_uv < 0: first_bad_uv = arid
+	_ok(bad_mat == 0, "G-ATLAS-MAT(shaped): every shaped surface is on the shared atlas material (%d off%s)" % [
+		bad_mat, "" if first_bad_mat < 0 else ", first arid=%d" % first_bad_mat])
+	_ok(bad_uv == 0, "G-ATLAS-UV(shaped): every shaped surface's UVs lie in its atlas cell over %d surfaces (%d out%s)" % [
+		checked_surf, bad_uv, "" if first_bad_uv < 0 else ", first arid=%d" % first_bad_uv])
 
 func _color_close(a: Color, b: Color) -> bool:
 	var tol := 3.0 / 255.0

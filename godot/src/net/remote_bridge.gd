@@ -86,6 +86,12 @@ const FRAME_INTERVAL_MS := 2000     # ms — ~0.5 fps ambient frame stream (was 
 const CAPTURE_SKIP_WORST_MS := 45.0 # ms — skip a scheduled auto-capture if the last window's worst frame exceeded this
 const FRAME_MAX_WIDTH := 960        # px — downscale cap for the JPEG (keeps bytes + readback modest)
 const FRAME_JPG_QUALITY := 0.6
+# COSMOS-PERF L2 (threaded encode): the get_image() readback (WebGL2 glReadPixels) MUST stay on the engine thread —
+# gl_compatibility has no async GPU→CPU path from GDScript — but the resize + JPEG encode that follow it are pure CPU.
+# When true, those are handed to a WorkerThreadPool task on an OWNED image copy, so only the (unavoidable) readback
+# stall remains on the engine thread; the finished bytes are queued back and sent from the main thread on a later frame
+# (WebSocketPeer is NOT thread-safe). Default true (dev tooling; strictly cheaper). false → the synchronous path.
+const CAPTURE_THREADED_ENCODE := true
 const FRAME_TAG := 0x01             # 1-byte type tag prefixing a binary JPEG frame (distinguish from JSON text)
 ## The WebSocketPeer's Godot-side outbound ring buffer. MUST be set (before connect) well above a single
 ## frame (~45 KB) — the DEFAULT is only ~64 KB, so one JPEG + a telemetry JSON overflowed it and every
@@ -141,6 +147,13 @@ const POST_CROSS_MAX := 8           # NEVER-OOM: hard cap on concurrent windows
 
 var _frame_acc_ms := 0.0
 var _capturing := false             # a frame readback+send is inflight (skip overlapping captures)
+# COSMOS-PERF L2 threaded encode: a single-flight worker task carrying the resize+JPEG off the engine thread. Only one
+# capture is ever in flight (guarded by _capturing), so these three are never touched by two threads at once: the worker
+# reads/mutates _cap_img and writes _cap_jpg; the main thread reads _cap_jpg ONLY after WorkerThreadPool reports the task
+# complete (a happens-before), then sends it. -1 = no task pending.
+var _cap_task_id := -1
+var _cap_img: Image = null
+var _cap_jpg: PackedByteArray = PackedByteArray()
 var _link_open := false             # last emitted link_state (so we emit only on transitions)
 # COSMOS-PERF L2: ambient auto-capture controls. `_auto_frames_enabled` is the re-baseline kill switch — set false by
 # `?frames=0` / `?capture=0` (web) or VOXIVERSE_REMOTE_FRAMES=0 (native), and toggleable at runtime via set_auto_frames()
@@ -310,6 +323,10 @@ func _process(delta: float) -> void:
 	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
 	if not _post_cross.is_empty():
 		_update_post_cross(now_usec, real_delta)
+
+	# L2 threaded encode: drain a finished worker EVERY frame (before the state machine's early returns) so a pending
+	# capture never gets stuck across a disconnect — _send_frame_jpg guards the send on the socket being open.
+	_poll_capture_encode()
 
 	# ── Socket state machine ──────────────────────────────────────────────────────────────────
 	var state := _ws.get_ready_state()
@@ -571,20 +588,69 @@ func _capture_frame_async() -> void:
 		_capturing = false
 		return
 
-	# Downscale to the width cap (preserve aspect), then JPEG-encode.
+	# L2 threaded encode: the readback is DONE (unavoidably on this thread). Hand the resize + JPEG to a worker on an
+	# OWNED image so the engine thread pays nothing more; the finished bytes are sent from _poll_capture_encode (main).
+	if CAPTURE_THREADED_ENCODE and _thread_encode_available():
+		_cap_img = img                    # get_image() returned a fresh instance owned only by us — the worker is its sole toucher
+		_cap_jpg = PackedByteArray()
+		_cap_task_id = WorkerThreadPool.add_task(Callable(self, "_encode_worker"), false, "remote-bridge frame JPEG")
+		return                            # stays _capturing until the worker finishes and the main thread sends (§ poll)
+
+	# Synchronous fallback (flag off / no thread pool): downscale + encode + send inline, as before.
+	_resize_to_cap(img)
+	var jpg := img.save_jpg_to_buffer(FRAME_JPG_QUALITY)
+	_send_frame_jpg(jpg)
+	_capturing = false
+
+
+## Whether the WorkerThreadPool has real background threads for the off-thread encode. On >1 core it sizes a worker pool
+## (so is_task_completed flips without an explicit wait); on a single-core build there are no background workers → fall
+## back to the synchronous path rather than risk a task that only runs when waited on. Our threaded web export is multi-core.
+func _thread_encode_available() -> bool:
+	return OS.get_processor_count() > 1
+
+
+## WORKER THREAD (L2): pure CPU, NO scene tree / WS / RenderingServer access. Resizes the owned capture image to the
+## width cap, then JPEG-encodes into _cap_jpg. The main thread reads _cap_jpg only after is_task_completed (happens-before).
+func _encode_worker() -> void:
+	if _cap_img == null:
+		return
+	_resize_to_cap(_cap_img)
+	_cap_jpg = _cap_img.save_jpg_to_buffer(FRAME_JPG_QUALITY)
+
+
+## MAIN THREAD (L2): drain a finished threaded encode — send the bytes over the (non-thread-safe) WebSocket, then release
+## the task + owned image and clear the single-flight guard. Called every frame from _process while a task is pending.
+func _poll_capture_encode() -> void:
+	if _cap_task_id == -1:
+		return
+	if not WorkerThreadPool.is_task_completed(_cap_task_id):
+		return
+	WorkerThreadPool.wait_for_task_completion(_cap_task_id)   # already done — reclaims the task handle (never blocks here)
+	var jpg := _cap_jpg
+	_cap_task_id = -1
+	_cap_img = null
+	_cap_jpg = PackedByteArray()
+	_send_frame_jpg(jpg)
+	_capturing = false
+
+
+## Downscale an image to FRAME_MAX_WIDTH (preserve aspect). Safe to call on a worker thread (pure CPU, no server).
+func _resize_to_cap(img: Image) -> void:
 	var w := img.get_width()
 	if w > FRAME_MAX_WIDTH and w > 0:
 		var scale := float(FRAME_MAX_WIDTH) / float(w)
 		img.resize(FRAME_MAX_WIDTH, maxi(1, int(round(float(img.get_height()) * scale))),
 			Image.INTERPOLATE_BILINEAR)
-	var jpg := img.save_jpg_to_buffer(FRAME_JPG_QUALITY)
+
+
+## MAIN THREAD ONLY: send an encoded JPEG as a tagged BINARY frame, honoring the same open/backpressure guards as before.
+func _send_frame_jpg(jpg: PackedByteArray) -> void:
 	if jpg.size() > 0 and _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN \
 			and _ws.get_current_outbound_buffered_amount() <= OUTBOUND_BACKPRESSURE_BYTES:
-		# 1-byte type tag + JPEG bytes, sent as a BINARY frame.
 		var packet := PackedByteArray([FRAME_TAG])
 		packet.append_array(jpg)
 		_ws.send(packet)
-	_capturing = false
 
 
 ## Phase-1 auth handshake (extracted so the inbound loop reads cleanly). Only a real {"type":"auth_ok"}
@@ -1098,6 +1164,12 @@ func _send_text_guarded(msg: Dictionary) -> void:
 
 
 func _exit_tree() -> void:
+	# L2: a threaded encode may still be running — BLOCK until it finishes so the worker never touches this freed node's
+	# members after teardown (the task is a bound Callable on self). It is at most one resize+JPEG, so the wait is short.
+	if _cap_task_id != -1:
+		WorkerThreadPool.wait_for_task_completion(_cap_task_id)
+		_cap_task_id = -1
+		_cap_img = null
 	# Clean teardown — free any executor, then close the socket so the relay sees a prompt disconnect.
 	_free_executor()
 	_control_secret = ""                     # #113: never leave the control secret in a freed node's RAM

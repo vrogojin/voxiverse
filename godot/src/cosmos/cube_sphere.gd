@@ -166,6 +166,23 @@ const FP_FULLRES_256 := false
 ## export after the A/B (the established sed-at-export pattern).
 const FP_FARRING_FAST_REBUILD := false
 
+## COSMOS-PERF STEP 2 / L1-async (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — move the far-ring rebuild OFF the
+## main thread. Even the fast packed-array assembler still runs synchronously on ONE frame: a headless breakdown of the
+## full front-hemisphere rebuild (~1727 facets / ~55k tris) shows the main-thread cost is SPREAD, not one hotspot —
+## SurfaceTool assembly + generate_normals + commit dominate, and on the threaded web export (~5-8× the native host)
+## that is the residual ~180-227 ms crossing/pool spike. When true, FacetFarRing hands ALL the mesh-DATA work (per-vertex
+## assembly + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) to a WorkerThreadPool task on the
+## warmed (read-only) per-facet caches, then swaps the finished ArrayMesh onto the MeshInstance3D on the main thread
+## (only the single add_surface_from_arrays / mesh RID create touches RenderingServer — kept on main, ~5 ms native).
+## Double-buffered: the previous far ring stays visible until the new mesh is ready, so a crossing/pool change costs the
+## main thread only the ~5 ms swap instead of the whole rebuild. VISUALLY IDENTICAL: commit_to_arrays yields the EXACT
+## arrays the synchronous path commits (pos/col/normal deviation 0.0 — G-L1-FARRING-ASYNC proves it), so smooth seam
+## normals are preserved. Single-flight; a crossing while a build is in flight is honoured after it lands; _exit_tree
+## joins any in-flight task. Independent of FP_FARRING_FAST_REBUILD (the worker emits from the grid caches, so the swapped
+## mesh is byte-identical to BOTH sync assemblers); needs a multi-core build, else it falls back to the synchronous
+## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
+const FP_FARRING_ASYNC_REBUILD := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

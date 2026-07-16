@@ -921,6 +921,36 @@ func _farring_compare(ring: Node3D, label: String) -> void:
 		if d > 1.0e-6:
 			nrm_ok = false
 	_ok(nrm_ok, "G-L1-FARRING [%s]: normals bit-identical to generate_normals (max dev %.8f — global smoothing preserved)" % [label, maxdev])
+	# COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): the OFF-THREAD worker body must produce a mesh byte-identical to the
+	# synchronous path. It emits the same visible fids + generate_normals, then extracts the arrays via commit_to_arrays
+	# (no mesh RID / RenderingServer) — the arrays the async main-thread swap builds an ArrayMesh from. Run the worker
+	# body inline (pure CPU) and compare its swapped mesh to the synchronous `slow` mesh (pos/col/normal deviation 0.0).
+	ring.set("_async_fids", fids)
+	ring.call("_async_build_worker")
+	var async_arrays: Array = ring.get("_async_arrays")
+	var async_mesh := ArrayMesh.new()
+	var vac := 0
+	if async_arrays.size() == Mesh.ARRAY_MAX and (async_arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() > 0:
+		async_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, async_arrays)
+		vac = async_mesh.get_surface_count()
+	if vac == 0:
+		_ok(va.size() == 0, "G-L1-FARRING-ASYNC [%s]: empty visible set ⇔ empty async mesh" % label)
+		return
+	var da := async_mesh.surface_get_arrays(0)
+	var vd: PackedVector3Array = da[Mesh.ARRAY_VERTEX]
+	var cd: PackedColorArray = da[Mesh.ARRAY_COLOR]
+	var nd: PackedVector3Array = da[Mesh.ARRAY_NORMAL]
+	var async_ok := vd.size() == va.size() and cd.size() == ca.size() and nd.size() == na.size()
+	var amax := 0.0
+	for i in range(mini(vd.size(), va.size())):
+		if not vd[i].is_equal_approx(va[i]) or not cd[i].is_equal_approx(ca[i]):
+			async_ok = false
+		var ad := (nd[i] - na[i]).length()
+		if ad > amax:
+			amax = ad
+		if ad > 1.0e-6:
+			async_ok = false
+	_ok(async_ok, "G-L1-FARRING-ASYNC [%s]: off-thread worker mesh bit-identical to synchronous (nrm dev %.8f)" % [label, amax])
 
 # ---------- G-M2-POLICY: Z1-hybrid live-terrain targets + promote admission (§3.2 / §6.5.3.4) ----------
 func _gate_policy() -> void:

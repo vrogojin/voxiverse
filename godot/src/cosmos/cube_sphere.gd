@@ -366,6 +366,16 @@ static func vel_lead(speed: float) -> float:
 ## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
 const CTRL_IMMINENT_COMMIT_PACE := 1.0
 
+## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
+## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
+## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a
+## living sky (spin/orbit expressed by MOVING THE SKY, never the pinned voxel planet — §4.1). O0 is
+## pure sky: NO gameplay/physics change, O(few) reused nodes, no per-frame allocation (NEVER-OOM).
+## Default OFF → main._setup_environment's shipped flat-ambient look is byte-identical and NO sky node
+## is added; the FLAT gate stays green. The CosmosEphemeris/DVecF64 kernels are pure statics — DEAD
+## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
+const ORBITAL_SKY := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

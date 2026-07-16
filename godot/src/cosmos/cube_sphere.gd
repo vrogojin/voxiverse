@@ -104,6 +104,20 @@ const PROMOTE_EVICT_STARVE_MULT := 6.0
 ## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
 const FP_M2_LOD := false
 
+## COSMOS GEN-EFFICIENCY (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1 Fix A) — bulk-fill invisible underground blocks.
+## Underground `resolve_cell` is ~76% of a land column's generation cost (~84 unseen cells × 2.9 µs); a fully-
+## underground 16³ data block runs 4096 resolve_cell calls (~13.7 ms), and a crossing restreams ~500 of them →
+## the multi-second freeze + fall-through. When true, a data block whose ENTIRE y-range is provably interior
+## stone/deepslate (below every column's dirt/biome filler, above bedrock, clear of the -24..-16 deepslate dither
+## band, and — on a facet — fully interior to all four ridges) is filled with ONE material via VoxelBuffer.fill
+## instead of the per-cell pass (~27× on that block). NOT byte-identical: the block's ore/strata VARIANTS become
+## uniform stone/deepslate — the ACCEPTED, near-invisible loss (unseen until dug; WM.block_id_at → resolve_cell
+## reads TerrainConfig directly, never this buffer, so physics + the broken/dropped block stay ground-truth).
+## Ships A-accept (uniform-stone walls on exposure; the appearance-only loss), with A-lazy exposure regen a
+## documented follow-up. Default OFF → the generator is per-cell, byte-identical (FLAT verify pin 6035/0 stays,
+## G-M2-ID stays module==module). LOD0 only. Independent of FACETED; the ridge guard self-disables when flat.
+const FP_BULK_UNDERGROUND := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB

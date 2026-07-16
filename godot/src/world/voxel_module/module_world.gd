@@ -2528,6 +2528,14 @@ var gen_mwin_c := 0
 var gen_mwin_d := 1
 var flat_world := true                   # CubeSphere.FLAT_WORLD snapshot: flat → no fold (byte-identical)
 var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples at stride 2^lod (else early-out). Default false → shipped path unchanged; at lod0 stride==1 so byte-identical.
+# GEN-EFFICIENCY Fix A (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1): FP_BULK_UNDERGROUND snapshot + the two fill
+# ARIDs a plain deep STONE / DEEPSLATE cube writes (frozen by the loader from the baked cube_arid table). When
+# fp_bulk and a block is provably interior stone/deepslate, the worker VoxelBuffer.fill()s it with one of these
+# instead of the per-cell pass — the SAME cube ARID a non-ore/non-strata deep cell would emit (byte-matching an
+# exposed non-ore wall). -1 = not baked → the block falls back to per-cell (never fills a stale index).
+var fp_bulk := false
+var bulk_stone_arid := -1
+var bulk_deepslate_arid := -1
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -2539,6 +2547,15 @@ const FAM_KIND_SHIFT := 12               # bits 14..12 select the FAM family kin
 const FAM_KIND_MASK := 0x7
 const FAM_SLOPE := 1                     # kind 1 = SLOPE; only kind 1 routes to the slope table (a future
                                         # kind-0 LAYER modifier must NOT be mis-indexed here)
+# GEN-EFFICIENCY Fix A: the qualification constants, mirrored from TerrainConfig so the worker never reaches
+# outside its frozen instance. BULK_MAX_FILLER = max _filler_depth over all biomes (badlands, 12): a block whose
+# top cell sits deeper than this under EVERY column is interior stone (no dirt/biome-top skipped). The DEEPSLATE
+# band bounds (TerrainConfig.DEEPSLATE_TOP_Y / _FULL_Y): above -16 is pure stone, below -24 is pure deepslate,
+# -24..-16 is a dithered mix (fall back). BULK_BEDROCK_TOP_Y (TerrainConfig.BEDROCK_TOP_Y): no bedrock at y >= -59.
+const BULK_MAX_FILLER := 12
+const BULK_DEEPSLATE_TOP_Y := -16
+const BULK_DEEPSLATE_FULL_Y := -24
+const BULK_BEDROCK_TOP_Y := -59
 
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
@@ -2602,6 +2619,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var profs = []
 	profs.resize(size.x * size.z)
 	var max_h = -0x7fffffff
+	var min_h = 0x7fffffff                   # GEN-EFFICIENCY Fix A: the shallowest surface over the block's columns
+	                                         # (flat branch only) — bounds the Fix A "block fully below filler" gate.
 	# Per-block generation context (LOCAL to this _generate_block frame → each voxel worker owns its
 	# own; NEVER shared across threads). FLAT: a plain Dictionary column memo (Vector2i → Vector4),
 	# byte-identical to before. CURVED (COSMOS-AUDIT §3.2 items 2–3, F1/F2): a GenCtx carrying the
@@ -2625,6 +2644,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				var p = TerrainConfig.column_profile(ox + x * s, oz + z * s, pcache)
 				profs[z * size.x + x] = p
 				if int(p.x) > max_h: max_h = int(p.x)
+				if int(p.x) < min_h: min_h = int(p.x)
 	else:
 		pcache = TerrainConfig.GenCtx.new(gen_face)
 		# COSMOS-FRAME-ORIENTATION §6: this epoch's M_win quarter-turn, once per block — worker_fold_column
@@ -2649,6 +2669,40 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				var p = TerrainConfig.column_profile(tc.y, tc.z, pcache)
 				profs[idx] = p
 				if int(p.x) > max_h: max_h = int(p.x)
+
+	# GEN-EFFICIENCY Fix A (docs/COSMOS-GEN-EFFICIENCY-DESIGN.md §1) — bulk-fill a provably-interior underground
+	# block with ONE material via VoxelBuffer.fill() instead of the per-cell resolve_cell pass (~27× on that
+	# block; the 4096 resolve_cell calls + the slope_run pass are skipped). Qualifies (LOD0 flat branch only) when:
+	#   • the block's TOP cell is deeper than the max biome filler under EVERY column
+	#     (oy+size.y <= min_h - BULK_MAX_FILLER) → _surface_rule returns STONE for all cells, no dirt/biome-top or
+	#     surface cell is ever inside the block (this is ALSO the no-fall-through guarantee: the walkable surface is
+	#     never bulk-filled), and
+	#   • exactly ONE fill material is well-defined: the whole block is strictly ABOVE the -24..-16 deepslate dither
+	#     band (oy > -16 → pure STONE) OR strictly BELOW it and clear of bedrock (oy+size.y <= -24 and oy >= -59 →
+	#     pure DEEPSLATE). Blocks straddling the dither band, the dirt layer, or bedrock fall back to per-cell.
+	# resolve_cell for such a cell is a full STONE/DEEPSLATE cube (modifier 0, lf 0) → the fill writes the SAME cube
+	# ARID a per-cell non-ore/non-strata cell would (an exposed non-ore wall matches byte-for-byte); the block's
+	# ore/strata VARIANTS are the accepted appearance loss (physics + the broken/dropped block read block_id_at →
+	# resolve_cell directly, never this buffer). FACETED: gated on the WHOLE block box being interior to all four
+	# ridges (cell_interior_scaled over [ox..ox+size]) so no beyond-ridge cell that junction_modify masks to AIR is
+	# wrongly filled — a straddling/edge block falls back to per-cell. Flag OFF → this is skipped entirely → the
+	# generator is byte-identical per-cell (FLAT 6035/0; G-M2-ID compares two module generators that share the
+	# const flag, so both bulk-fill identically → still equal).
+	if fp_bulk and s == 1 and flat_world and size.x == size.y and size.y == size.z:
+		var by_top = oy + size.y                      # one past the top cell (cells are oy .. by_top-1)
+		if by_top <= min_h - BULK_MAX_FILLER:
+			var fill_arid := -1
+			if oy > BULK_DEEPSLATE_TOP_Y:                                  # whole block above the dither band → STONE
+				fill_arid = bulk_stone_arid
+			elif by_top <= BULK_DEEPSLATE_FULL_Y and oy >= BULK_BEDROCK_TOP_Y:  # below -24, above bedrock → DEEPSLATE
+				fill_arid = bulk_deepslate_arid
+			if fill_arid >= 0 and fill_arid < mcount:
+				var interior := true
+				if gen_facet >= 0:
+					interior = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
+				if interior:
+					buffer.fill(fill_arid, ch)
+					return
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
@@ -2890,6 +2944,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
 	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
 	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
+	# GEN-EFFICIENCY Fix A: freeze the bulk-underground flag + the two fill ARIDs (the cube ARID a plain deep STONE /
+	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
+	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
+	gen.set("fp_bulk", CubeSphere.FP_BULK_UNDERGROUND)
+	var _bstone := BlockCatalog.STONE
+	gen.set("bulk_stone_arid", _cube_arid[_bstone] if _bstone >= 0 and _bstone < _cube_arid.size() else -1)
+	var _bdeep := BlockCatalog.id_of(&"deepslate")
+	gen.set("bulk_deepslate_arid", _cube_arid[_bdeep] if _bdeep >= 0 and _bdeep < _cube_arid.size() else -1)
 	# COSMOS-FRAME-ORIENTATION §5.1: freeze this epoch's window orientation M_win (row-major [a,b,c,d]).
 	gen.set("gen_mwin_a", int(_gen_mwin[0]))
 	gen.set("gen_mwin_b", int(_gen_mwin[1]))

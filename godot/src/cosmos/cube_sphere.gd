@@ -275,7 +275,12 @@ const POOL_D_COMMIT := 64.0
 const FP_CTRL_ADAPTIVE := false
 const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
 const CTRL_FLOOR_PCTL := 0.1             # p10 — the client's achievable floor (robust to short hitch trains)
-const CTRL_ADAPTIVE_MARGIN := 1.3        # setpoint = floor_p10 × this (overload ⇔ ~30% worse than the client's floor)
+# CROSSING-FASTGEN obs-2 fix (1) — UN-PIN THE CONTROLLER. The margin was 1.3 → setpoint ≈ floor_p10×1.3 ≈ 22.8 ms, which
+# the client's own frame exceeds in 52% of windows → credit stays pinned 0 → the imminent promotes only via the geometric
+# D_COMMIT fallback (~3.4 s less gen lead). Raising it to 2.0 floats the setpoint above the client's steady frame so credit
+# recovers and the imminent promotes at D_WARM. Only consumed when the setpoint is adaptive (`_adaptive`, defaulting to
+# FP_CTRL_ADAPTIVE, default OFF) — so the flag-OFF absolute-setpoint path is byte-identical; this is the FLAGGED value.
+const CTRL_ADAPTIVE_MARGIN := 2.0        # setpoint = floor_p10 × this (overload ⇔ ~2× worse than the client's floor)
 const CTRL_ADAPTIVE_MAX_MS := 45.0       # setpoint upper clamp (never tolerate worse than ~22 fps as "not overload")
 
 ## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
@@ -318,6 +323,39 @@ const POOL_CROSSING_PREGEN := true
 ## faceted). Tunable DOWN to trade the post-crossing spread for lower peak pool memory (e.g. 112 ⇒ imminent ≈ 30 MB); at
 ## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
 const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
+
+## CROSSING-FASTGEN obs-2 fix (2) — LOWER PREFILL. When on, the committed imminent slot is pre-grown to 112 instead of
+## 128 blocks: a STRICT byte reduction (imminent live volume ~40 → ~30 MB) that also shrinks the approach vox_gen backlog,
+## for the cost of a thin 112→128 annulus that stays hidden behind fog / the curved far-ring (and is filled at the seam
+## by the ordinary neighbour ramp). Default OFF → 128 == today (`imminent_prefill_blocks()` returns the base const). NEVER-
+## OOM: strictly reduces resident bytes. Flipped ON at export A/B (the sed-at-export pattern) alongside FP_CTRL_ADAPTIVE.
+const FP_PREFILL_112 := false
+const POOL_IMMINENT_PREFILL_BLOCKS_LOW := 112.0
+
+## CROSSING-FASTGEN obs-2 fix (3) — VELOCITY-AWARE PREDICTIVE STREAMING. When on, the imminent promote/commit distances
+## (POOL_D_WARM select + POOL_D_COMMIT geometric commit) gain a speed-proportional lead `+ min(K·|v|, MAX_ADD)` so a fast
+## player promotes/commits the crossing-target facet EARLIER in TIME (more gen lead before the seam). Memory behaviour is
+## unchanged — the live cap (FP2_LIVE_CAP=2: imminent + corner-second) is untouched, only the TIMING of the transitions
+## shifts; and the lead is clamped so the effective D_WARM never exceeds the near render radius (128). Default OFF →
+## vel_lead() ≡ 0 → the effective distances are the base consts, byte-identical. The `speed` param on the policy statics
+## defaults to 0, so the headless gates (which pass no speed) are unaffected even with the flag on. Flipped ON at export.
+const FP_VEL_PREDICT := false
+const VEL_PREDICT_K := 2.0               # blocks of extra promote/commit lead per (block/s) of player speed
+const VEL_PREDICT_MAX_ADD := 32.0        # ceiling on the additive lead — bounds effective D_WARM ≤ 96+32 = 128 (near radius)
+const VEL_PREDICT_SPEED_CLAMP := 40.0    # reject a per-update speed above this as a crossing/flip discontinuity, not motion
+
+## CROSSING-FASTGEN obs-2 fix (2): the pre-grow radius for the committed imminent slot — 112 under FP_PREFILL_112, else the
+## shipped 128. Static so both module_world consumers (set_imminent_fid, pool_spawn) share one gate; OFF == the base const.
+static func imminent_prefill_blocks() -> float:
+	return POOL_IMMINENT_PREFILL_BLOCKS_LOW if FP_PREFILL_112 else POOL_IMMINENT_PREFILL_BLOCKS
+
+## CROSSING-FASTGEN obs-2 fix (3): the speed-proportional promote/commit lead (blocks). Zero when FP_VEL_PREDICT is off →
+## every effective distance collapses to its base const (byte-identical). Clamped to VEL_PREDICT_MAX_ADD so the effective
+## D_WARM/D_COMMIT stay inside the near render radius (NEVER-OOM: the live-facet count/cap is unchanged — only timing).
+static func vel_lead(speed: float) -> float:
+	if not FP_VEL_PREDICT:
+		return 0.0
+	return minf(VEL_PREDICT_K * maxf(speed, 0.0), VEL_PREDICT_MAX_ADD)
 
 ## CROSSING-JERKINESS FIX (3-agent root-cause 2026-07-16) — the committed imminent slot's view-ramp pace FLOOR. The
 ## shipped build floored it at CTRL_RELIEF_FLOOR (0.25 → ~6 s to fill 96→128, LONGER than a facet traversal → the

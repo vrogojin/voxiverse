@@ -120,6 +120,7 @@ var _ws: WebSocketPeer = null
 var _was_open := false
 var _hello_sent := false
 var _authed := false                # relay returned auth_ok → cleared to stream telemetry + frames
+var _flags_emitted := false         # CROSSING-FASTGEN obs-2 fix (4): the exported FP_* flag set is stamped ONCE (first telemetry)
 var _reconnect_at := 0.0            # msec (Time.get_ticks_msec) at which to attempt reconnect; 0 = connect now
 var _backoff := RECONNECT_BACKOFF_MIN
 
@@ -466,6 +467,19 @@ func _send_telemetry() -> void:
 	}
 	_merge_rich_state(msg)
 
+	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these
+	# via sed before export, so reading the compiled consts gives exactly-what-shipped provenance — BUILD-INFO.txt is
+	# written during the earlier engine build, before the sed, so it cannot). Emitted once (small, static); read live.
+	if not _flags_emitted:
+		_flags_emitted = true
+		msg["flags"] = {
+			"FACETED": CubeSphere.FACETED, "FP_M1_POOL": CubeSphere.FP_M1_POOL, "FP_M2_LOD": CubeSphere.FP_M2_LOD,
+			"FP_CTRL_ADAPTIVE": CubeSphere.FP_CTRL_ADAPTIVE, "FP_PREFILL_112": CubeSphere.FP_PREFILL_112,
+			"FP_VEL_PREDICT": CubeSphere.FP_VEL_PREDICT, "FP_FIXED_FRAME": CubeSphere.FP_FIXED_FRAME,
+			"FP_FARRING_FULL_COVER": CubeSphere.FP_FARRING_FULL_COVER, "FP_NO_NEAR_LOD": CubeSphere.FP_NO_NEAR_LOD,
+			"FP_ATLAS_MATERIAL": CubeSphere.FP_ATLAS_MATERIAL, "POOL_CROSSING_PREGEN": CubeSphere.POOL_CROSSING_PREGEN,
+		}
+
 	# Telemetry is small (~1 KB) and the signal we most want to keep, so it is NOT shed at the frame
 	# threshold — but under a total network stall the buffer could still creep up, so only send while
 	# there is clear headroom below the ring cap. This keeps ERR_OUT_OF_MEMORY out of the console.
@@ -542,6 +556,16 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			msg["facet_neighbours"] = int(world.call("facet_pool_neighbour_count"))
 		if world.has_method("stream_load_credit"):
 			msg["stream_credit"] = snappedf(float(world.call("stream_load_credit")), 0.001)
+		# CROSSING-FASTGEN obs-2 fix (4): the controller setpoint/floor/overload trace, so "adaptive off" vs "on but
+		# genuinely over setpoint" is directly readable alongside the credit. Guarded + empty-dict-guarded so a
+		# flag/render-path combination without a live controller simply omits these (never crashes the bridge).
+		if world.has_method("stream_load_stats"):
+			var cs = world.call("stream_load_stats")
+			if cs is Dictionary and not (cs as Dictionary).is_empty():
+				msg["setpoint_ms"] = snappedf(float((cs as Dictionary).get("setpoint_ms", 0.0)), 0.1)
+				msg["frame_worst_ema"] = snappedf(float((cs as Dictionary).get("frame_worst_ema", 0.0)), 0.1)
+				msg["floor_p10"] = snappedf(float((cs as Dictionary).get("floor_p10_ms", 0.0)), 0.1)
+				msg["backlog_gated"] = bool((cs as Dictionary).get("backlog_gated", false))
 		# COSMOS FP-FIXED-FRAME Phase-0 guard (§3): the max |player render-abs| seen — the f32-precision headroom
 		# signal that tells us whether a re-anchor is ever needed at the current R (0 unless the fixed frame is on).
 		if world.has_method("player_abs_max"):

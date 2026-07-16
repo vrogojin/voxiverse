@@ -1731,7 +1731,7 @@ func set_imminent_fid(fid: int, committed: bool = false) -> void:
 		return
 	if prev == fid:
 		return
-	var target := minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	var target := minf(CubeSphere.imminent_prefill_blocks(), float(TerrainConfig.near_render_radius()))
 	# Demote the OUTGOING imminent (if it is a live non-active neighbour) back to the neighbour radius.
 	if prev >= 0 and prev != _pool_active and _pool.has(prev):
 		var ps: Dictionary = _pool[prev]
@@ -1819,7 +1819,7 @@ func pool_spawn(fid: int) -> bool:
 	# the wider 48→128 fill still SPREADS across the approach (never a burst). Gated on the fixed frame; off ⇒ 96 (shipped).
 	var nb_target := 96.0
 	if CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on() and fid == _imminent_fid:
-		nb_target = minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+		nb_target = minf(CubeSphere.imminent_prefill_blocks(), float(TerrainConfig.near_render_radius()))
 	s["view_target"] = nb_target
 	s["ramp_from"] = float(start)
 	_pool[fid] = s

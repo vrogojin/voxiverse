@@ -141,6 +141,25 @@ const CTRL_CREDIT_AI := 0.1
 const CTRL_PROMOTE_CREDIT := 0.5
 const OFFSURFACE_Y := 256.0
 
+## COSMOS ORBITAL O1 (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §2.1) — the orbit-mechanics constant block, placed beside
+## OFFSURFACE_Y because they are the same altitude-regime knobs. FP_M3_ORBIT is the master flag: default false ⇒
+## byte-identical (the O1 kernels — CosmosGravity / OrbitalState / the frame algebra — are PURE STATIC and are
+## never consulted, so no new node or behaviour is created; verify_feature stays 6035/0). Altitude is RADIAL:
+## h = |p_fixed| − R_body (f64). H_BLEND_LO/HI bound the three-regime gravity blend (§2.2); ATMO_TOP is the drag
+## ceiling (§2.6); H_FARSWAP is the pool/far-ring retire + home-impostor altitude (§2.8); ORBIT_THRUST_G2 is the
+## gear-2 authority; ORBIT_ACTIVE_MAX caps actively-integrated orbital entities (O1 uses 1); DRAG_TERMINAL is the
+## sea-level terminal-speed target (§2.6); ORBIT_PREWARM_H is the descent altitude that designates + pre-warms the
+## landing facet (§2.7). These are DATA ONLY — they change no code path until the live-wiring stage flips the flag.
+const FP_M3_ORBIT := false        # master flag; OFF ⇒ byte-identical (nothing below is created)
+const H_BLEND_LO := 128.0         # radial altitude: below = pure lattice feel gravity (shipped)
+const H_BLEND_HI := 512.0         # above = pure GM/r² inertial regime (> ATMO_TOP, > OFFSURFACE_Y)
+const ATMO_TOP := 384.0           # atmosphere ceiling (D10; near-field scale, user-locked)
+const H_FARSWAP := 20000.0        # above: pool+far-ring retire, home body renders as impostor (§2.8)
+const ORBIT_THRUST_G2 := 25.0     # gear-2 thrust authority, m/s² (0→LEO 548 m/s in ~22 s)
+const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital entities
+const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with controller gate)
+const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates + pre-warms the landing facet
+
 ## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
 ## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
 ## are floored to, so COVERAGE relief flows even at credit 0 (§P3a/§P3c); a relief-only candidate restriction keeps it

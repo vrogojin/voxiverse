@@ -53,23 +53,24 @@ const TIME_WARP := 1.0
 #   spin_period  : body-fixed spin period in game seconds (0 ⇒ use the tidal rule or no spin).
 #   spin_phase0  : spin angle at t=0 (rad).
 #   tidal        : true ⇒ spin_angle = orbit_angle + PI (same face parent-ward always — the Moon).
+#   has_atmo     : true ⇒ the body has an atmosphere (O1 drag §2.6 applies below ATMO_TOP; Earth yes, Moon no).
 #   ecc, incl, axial_tilt : v1 = 0 (slots reserved for O5 eccentric orbits / seasons).
 # Canonical GM_game / period cross-checks are in the doc §3.3 table and asserted by the gate.
 # ---------------------------------------------------------------------------------------
 const BODIES := {
 	"sun": {
 		"gm_real": 1.327e20, "r": 696000.0, "parent": "", "a": 0.0, "m0": 0.0,
-		"spin_period": 0.0, "spin_phase0": 0.0, "tidal": false,
+		"spin_period": 0.0, "spin_phase0": 0.0, "tidal": false, "has_atmo": false,
 		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
 	},
 	"earth": {
 		"gm_real": 3.986e14, "r": 6371.0, "parent": "sun", "a": 149.6e6, "m0": 0.0,
-		"spin_period": 1200.0, "spin_phase0": 0.0, "tidal": false,
+		"spin_period": 1200.0, "spin_phase0": 0.0, "tidal": false, "has_atmo": true,
 		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
 	},
 	"moon": {
 		"gm_real": 4.905e12, "r": 1737.0, "parent": "earth", "a": 384400.0, "m0": 0.0,
-		"spin_period": 0.0, "spin_phase0": 0.0, "tidal": true,
+		"spin_period": 0.0, "spin_phase0": 0.0, "tidal": true, "has_atmo": false,
 		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
 	},
 }
@@ -114,6 +115,11 @@ static func radius_of(body: String) -> float:
 
 static func parent_of(body: String) -> String:
 	return String(BODIES[body]["parent"])
+
+## True iff `body` has an atmosphere (O1 drag §2.6 — Earth yes, Moon/Sun no). Defaults false for any
+## body whose spec predates the field, so an airless body never accrues drag by omission.
+static func has_atmo(body: String) -> bool:
+	return bool(BODIES[body].get("has_atmo", false))
 
 static func orbit_a(body: String) -> float:
 	return float(BODIES[body]["a"])

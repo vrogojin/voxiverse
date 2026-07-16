@@ -77,6 +77,8 @@ var _load_ctrl = null                         # the StreamLoadController (stored
 var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
                                               # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
                                               # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
+var _imminent_committed := false              # CROSSING-JERKINESS FIX: true once the imminent ridge_dist < POOL_D_COMMIT
+                                              # (published by WorldManager) → its ramp uses CTRL_IMMINENT_COMMIT_PACE (full)
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -430,7 +432,10 @@ func _ramp_pool_step(delta: float) -> bool:
 	# RAMP_SECONDS/0.25 = 6 s, inside the commit lead time); every other slot keeps the fully-gated pace for optional volume.
 	var pace := _stream_pace
 	if up_fid == _imminent_fid:
-		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
+		# CROSSING-JERKINESS FIX: the COMMITTED imminent (ridge < POOL_D_COMMIT) ramps at the full commit pace so the
+		# crossing target finishes filling DURING the approach instead of bursting at the seam; an uncommitted imminent
+		# keeps the shipped RELIEF_FLOOR trickle. Memory-neutral (same view_target); only the fill RATE changes.
+		pace = maxf(pace, CubeSphere.CTRL_IMMINENT_COMMIT_PACE if _imminent_committed else CubeSphere.CTRL_RELIEF_FLOOR)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
@@ -1539,9 +1544,10 @@ func set_load_controller(c) -> void:
 
 ## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
 ## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).
-func set_imminent_fid(fid: int) -> void:
+func set_imminent_fid(fid: int, committed: bool = false) -> void:
 	var prev := _imminent_fid
 	_imminent_fid = fid
+	_imminent_committed = committed
 	if _lod_mesher != null:
 		_lod_mesher.call("set_imminent_fid", fid)
 	# COSMOS-FP-CROSSING-PREGEN (#114): pre-grow the COMMITTED imminent slot to the ACTIVE near radius during the approach

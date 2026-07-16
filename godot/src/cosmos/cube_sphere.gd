@@ -196,6 +196,15 @@ const POOL_CROSSING_PREGEN := true
 ## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
 const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
 
+## CROSSING-JERKINESS FIX (3-agent root-cause 2026-07-16) — the committed imminent slot's view-ramp pace FLOOR. The
+## shipped build floored it at CTRL_RELIEF_FLOOR (0.25 → ~6 s to fill 96→128, LONGER than a facet traversal → the
+## residual fill BURSTS at the seam = the post-crossing mesh-upload spike the player feels as a jerk). Once the crossing
+## is GEOMETRICALLY COMMITTED (imminent ridge_dist < POOL_D_COMMIT — the SAME gate promote_admit_imminent already uses),
+## the fill cost is unavoidable and pre-paying it at FULL pace during the commit band strictly dominates paying it at the
+## seam, so the committed imminent ramps at this pace instead. Memory-NEUTRAL (same view_target; only the fill RATE
+## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
+const CTRL_IMMINENT_COMMIT_PACE := 1.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

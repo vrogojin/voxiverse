@@ -1881,7 +1881,12 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
 	# so its pool-ramp slot is pace-floored, its LOD stays budgeted through relief mode, and demote never coarsens it.
 	if _module_world != null and _module_world.has_method("set_imminent_fid"):
-		_module_world.call("set_imminent_fid", int(targets[0]) if targets.size() > 0 else -1)
+		var imm_fid: int = int(targets[0]) if targets.size() > 0 else -1
+		# CROSSING-JERKINESS FIX: mark the imminent COMMITTED once its ridge is within POOL_D_COMMIT (the same geometric
+		# gate promote_admit_imminent uses) so the module ramps it to full res at FULL pace before the seam, converting
+		# the post-crossing 96→128 fill burst into an approach-spread trickle.
+		var imm_committed: bool = imm_fid >= 0 and float(want.get(imm_fid, 1.0e30)) < CubeSphere.POOL_D_COMMIT
+		_module_world.call("set_imminent_fid", imm_fid, imm_committed)
 	var now := Time.get_ticks_msec()
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
 	var changed := false

@@ -104,6 +104,17 @@ const PROMOTE_EVICT_STARVE_MULT := 6.0
 ## FP-M2e browser-heap A/B (the established sed-at-export deploy pattern). Requires FP_M1_POOL = true.
 const FP_M2_LOD := false
 
+## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
+## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
+## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB
+## = 96, NOT the 128 MB vox pool): (A1) a PLANE-CLAMPED ridge apron on the live↔LOD seam — the owner-side HALF of
+## the normal LOD↔LOD apron, so it fills the LOD-side eroded shelf but STOPS at the welded ridge plane and can never
+## protrude into / z-fight the live facet; (A2) the active facet's ≤4 near edge-neighbours are pinned to ℓ1 (2-block
+## megablocks) + spared from pressure-demotion, so the ridges the player looks across are never coarse ℓ2-3. DEAD
+## unless FP_M2_LOD (the mesher never exists otherwise) → byte-identical with the faceted flags off. Default true:
+## it is pure LOD-side polish already bounded by the NEVER-OOM caps, so it rides on whenever the LOD path is live.
+const FP_NEIGHBOUR_SEAM_POLISH := true
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

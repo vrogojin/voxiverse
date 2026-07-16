@@ -205,11 +205,14 @@ func demote_pressure_relief() -> void:
 	var victim := -1
 	var oldest := 0x7fffffffffffffff
 	var vlod := 0
+	var pinned := _active_seam_neighbours()                     # A2: the ℓ1-pinned near ridges are never demote victims
 	for fid in _cache.keys():
 		if _promoting.has(fid):
 			continue                                           # never coarsen a facet whose live promote is in flight
 		if fid == _imminent_fid:
 			continue                                           # CONTROLLER-FIX §P3d: never coarsen the committed imminent ridge
+		if pinned.has(fid):
+			continue                                           # A2 (§7.6): never coarsen a near edge-neighbour pinned to ℓ1
 		var lod := int(_cache[fid]["lod"])
 		if lod >= LOD_MAX_TIER:
 			continue                                           # already the coarsest LOD tier — nothing to give
@@ -311,6 +314,12 @@ func _recompute_wants() -> void:
 		var lc := sse_lc(d, fov_v, vh)
 		var cur := int(_cache[fid]["lod"]) if _cache.has(fid) else -1
 		_want[fid] = hyst_tier(lc, cur)
+	# A2 (FP-NEIGHBOUR-SEAM-POLISH §7.6): pin the active facet's near edge-neighbours to ℓ1 (the finest tier) so the
+	# ridges the player looks across are 2-block megablocks. Stamped UNCONDITIONALLY (bypassing the hemisphere/frustum
+	# cull above) so a quick turn never lands on a coarse/absent near ridge; ℓ1 ≈ 4.6 MB each (≈18 MB for 4) sits well
+	# inside the 96 MB LOD ledger, and the NEVER-OOM caps still bound the total regardless (a genuine over-cap degrades).
+	for nb in _active_seam_neighbours():
+		_want[nb] = 1
 
 # ---- the request-grant BUDGETER (§6.4): the selector REQUESTS, only this ALLOCATES ----
 
@@ -579,13 +588,23 @@ func _apron_pass() -> void:
 		var aprons: Dictionary = _cache[owner]["apron"]
 		for slot in range(4):
 			var nb: int = FacetAtlas.seam_neighbour(owner, slot)
-			# W6: the neighbour must be a genuine LOD facet — NOT live and NOT promote-held. A live/promoting neighbour's
-			# carve bevel already reaches the welded plane; an apron there extends INTO the live facet and z-fights it.
-			var desired: bool = nb >= 0 and nb != owner and owner < nb and _cache.has(nb) and not _is_live_or_promoting(nb)
 			var key := "%d:%d" % [owner, slot]
+			# The classic LOD↔LOD apron: a genuine LOD neighbour (not live, not promote-held), owned by the LOWER fid,
+			# spanning BOTH sides of the retreat gap. (W6: without the polish an apron toward a live/promoting neighbour
+			# was SUPPRESSED, because its neighbour half extends INTO the live facet and z-fights its carve bevel.)
+			var nb_live: bool = nb >= 0 and nb != owner and _is_live_or_promoting(nb)
+			var desired_lod: bool = nb >= 0 and nb != owner and owner < nb and _cache.has(nb) and not _is_live_or_promoting(nb)
+			# A1 (FP-NEIGHBOUR-SEAM-POLISH §7.6): the live↔LOD seam gets a PLANE-CLAMPED apron instead — the owner (the
+			# ONLY LOD side; the live/active neighbour never owns aprons) emits the owner-side HALF, which fills the
+			# LOD-side eroded shelf but stops at the welded ridge plane, so it cannot protrude into / z-fight the live facet.
+			var clamp_live: bool = CubeSphere.FP_NEIGHBOUR_SEAM_POLISH and nb_live
+			var desired: bool = desired_lod or clamp_live
 			if desired:
-				var s_max: int = 1 << maxi(lodO, int(_cache[nb]["lod"]))
-				var have_ok: bool = aprons.has(slot) and int(aprons[slot]["s_max"]) == s_max
+				# the live neighbour is full-res (stride 1) and owns no LOD mesh → the coarser side is the owner itself.
+				var nb_lod: int = int(_cache[nb]["lod"]) if _cache.has(nb) else lodO
+				var s_max: int = 1 << maxi(lodO, nb_lod)
+				var have_ok: bool = aprons.has(slot) and int(aprons[slot]["s_max"]) == s_max \
+						and bool(aprons[slot].get("clamp", false)) == clamp_live
 				if not have_ok and not _apron_building.has(key):
 					# W4: RESERVE the apron's cost in the ledger before enqueue (an apron is a real build job that lands
 					# in the SAME tri/byte caps). DEFER (retry a later pass once headroom frees) rather than overrun a
@@ -593,7 +612,7 @@ func _apron_pass() -> void:
 					var est_t := _APRON_EST_TRIS
 					var est_b := _APRON_EST_TRIS * _BYTES_PER_TRI
 					if _ledger_tris + est_t <= LOD_MAX_TRIS and _ledger_bytes + est_b <= cap_bytes:
-						if _builder.enqueue_apron(owner, slot, s_max):
+						if _builder.enqueue_apron(owner, slot, s_max, clamp_live):
 							_ledger_tris += est_t; _ledger_bytes += est_b
 							_apron_building[key] = {"s_max": s_max, "tris": est_t, "bytes": est_b}
 			else:
@@ -618,7 +637,8 @@ func _apply_apron(item: Dictionary) -> void:
 	mi.mesh = mesh
 	mi.material_override = _apron_mat
 	(_cache[owner]["node"] as Node3D).add_child(mi)
-	aprons[slot] = {"mi": mi, "s_max": int(item["s_max"]), "tris": int(item["tris"]), "bytes": int(item["bytes"])}
+	aprons[slot] = {"mi": mi, "s_max": int(item["s_max"]), "clamp": bool(item.get("clamp", false)),
+		"tris": int(item["tris"]), "bytes": int(item["bytes"])}
 	_ledger_tris += int(item["tris"]); _ledger_bytes += int(item["bytes"])
 	_enforce_caps_after_spend(owner)                         # C1: the cap binds on the real apron bytes too
 
@@ -723,6 +743,21 @@ func _facet_render_corners(fid: int, gt: Transform3D) -> Array:
 	var out: Array = []
 	for c in [Vector2i(dmn.x, dmn.y), Vector2i(dmx.x, dmn.y), Vector2i(dmx.x, dmx.y), Vector2i(dmn.x, dmx.y)]:
 		out.append(gt * (tf * Vector3(float(c.x), 0.0, float(c.y))))
+	return out
+
+## A2 (FP-NEIGHBOUR-SEAM-POLISH §7.6): the ≤4 genuine-LOD facets sharing an edge with the ACTIVE facet — the near
+## ridges the player looks across. These are pinned to ℓ1 (their want is floored at the finest tier) and spared from
+## pressure-demotion, so the seam right at the player stays 2-block megablocks instead of coarse ℓ2/ℓ3 (SSE by
+## CENTRE distance can wrongly coarsen an edge-on near-neighbour whose centre is far while its shared ridge is close).
+## Excludes the active facet itself and any live-pool / promote-held facet (those are full-res, never LOD-covered).
+func _active_seam_neighbours() -> Dictionary:
+	var out := {}
+	if not CubeSphere.FP_NEIGHBOUR_SEAM_POLISH or _active_fid < 0 or not FacetAtlas.is_ready():
+		return out
+	for slot in range(4):
+		var nb: int = FacetAtlas.seam_neighbour(_active_fid, slot)
+		if nb >= 0 and nb != _active_fid and not _is_live_or_promoting(nb):
+			out[nb] = true
 	return out
 
 ## W6: is `fid` a live pool terrain OR a promote-held facet (its live terrain is streaming under a held LOD cover)?

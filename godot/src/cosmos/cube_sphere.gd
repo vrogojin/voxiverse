@@ -198,6 +198,24 @@ const FP_FARRING_FAST_REBUILD := false
 ## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
 const FP_FARRING_ASYNC_REBUILD := false
 
+## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
+## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
+## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe
+## (the annular hole). When true (requires FACETED), the ring draws ALL front-hemisphere facets INCLUDING the active +
+## `_excluded` set; those "backstop" facets are emitted sunk radially inward by BACKSTOP_SINK blocks at the denser
+## BACKSTOP_CELLS resolution, so the opaque near voxels overdraw them with no z-fight and no poke-through (§2–§3). The
+## back-hemisphere cull (BACK_CULL) is UNCHANGED. Default OFF → `_front_visible` excludes active+`_excluded` exactly as
+## today, no backstop cache is ever populated, FLAT stays byte-identical (6035/0). Flipped ON at export after the live A/B.
+const FP_FARRING_FULL_COVER := false
+## Backstop tuning (§3). BACKSTOP_SINK: blocks the backstop facets are pushed radially inward, so they sit strictly
+## behind the near blocky surface (clears facet chord sagitta + relief quantization + the residual flank dip). BACKSTOP_CELLS:
+## the backstop-facet heightmap resolution (vs the shipped CELLS=4 for non-backstop facets) — denser cells shrink the
+## between-sample chord error so a coarse triangle cannot stab up through fine mountain terrain. G-FRC-NOPOKE is the tuning
+## oracle: if a mountain-foothill spawn pokes, raise BACKSTOP_CELLS to 32 (cell ≈ 6 blocks) before raising the sink, so the
+## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
+const BACKSTOP_SINK := 6.0
+const BACKSTOP_CELLS := 16
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

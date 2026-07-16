@@ -359,8 +359,8 @@ func setup() -> bool:
 	# a larger block, but that runs on the voxel worker and the main-thread mesh APPLY is
 	# already capped (voxel/threads/main/time_budget_ms=4), so it is not a frame stall.
 	# Data blocks stay 16³ (bulk_inject groups by data block), so edit injection is
-	# unaffected. Valid values are 16 or 32 only.
-	_set_if(_terrain, "mesh_block_size", 32)
+	# unaffected. Valid values are 16 or 32 (or 64 with godot_voxel patch 0006 / FP_MESH_BLOCK_64).
+	_set_if(_terrain, "mesh_block_size", _mesh_block_size())
 	# We move/raycast analytically, so terrain colliders aren't needed — and
 	# skipping them keeps the (web-capped) single voxel thread free for meshing.
 	_set_if(_terrain, "generate_collisions", false)
@@ -1583,7 +1583,7 @@ func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
 	_set_if(terrain, "mesher", mesher)
 	_set_if(terrain, "generator", generator)
 	_set_if(terrain, "max_view_distance", view_blocks)
-	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "mesh_block_size", _mesh_block_size())
 	_set_if(terrain, "generate_collisions", false)
 	_apply_bounds(terrain, fid)                     # §3.2: clamp to this facet's domain slab — no foreign block exists
 	var slot := Node3D.new()
@@ -2098,7 +2098,7 @@ func spike_rotated_neighbour(neighbour_fid: int, view_blocks: int = 96) -> Dicti
 	_set_if(terrain, "mesher", mesher)
 	_set_if(terrain, "generator", generator)
 	_set_if(terrain, "max_view_distance", view_blocks)
-	_set_if(terrain, "mesh_block_size", 32)
+	_set_if(terrain, "mesh_block_size", _mesh_block_size())
 	_set_if(terrain, "generate_collisions", false)
 	# The rotated parent: FacetAtlas.facet_transform(neighbour) is orthonormal det=+1 (verify_frame asserts it).
 	# The terrain streams an axis-aligned box in ITS OWN lattice; the parent rigidly rotates the rendered mesh
@@ -2199,7 +2199,7 @@ func restream(old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	_set_if(new_terrain, "generator", generator)
 	# Stage 4: start small and ramp up in _process (below) instead of flooding the full disk at once.
 	_set_if(new_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
-	_set_if(new_terrain, "mesh_block_size", 32)
+	_set_if(new_terrain, "mesh_block_size", _mesh_block_size())
 	_set_if(new_terrain, "generate_collisions", false)
 	if old_terrain != null:
 		# Capture the old terrain's LOCAL offset BEFORE any cover compensation, so the FRESH terrain inherits
@@ -3174,3 +3174,9 @@ func _set_if(obj: Object, prop: String, value: Variant) -> void:
 		if p.get("name", "") == prop:
 			obj.set(prop, value)
 			return
+
+## COSMOS-64MESH (Perf L4). The VoxelTerrain mesh_block_size for EVERY terrain we build (active,
+## frozen cover, neighbour, restream). 64 needs godot_voxel patch 0006 (the unpatched module clamps
+## >32 back to 16); default OFF → 32, byte-identical. See CubeSphere.FP_MESH_BLOCK_64 / docs/COSMOS-64MESH-DESIGN.md.
+func _mesh_block_size() -> int:
+	return 64 if CubeSphere.FP_MESH_BLOCK_64 else 32

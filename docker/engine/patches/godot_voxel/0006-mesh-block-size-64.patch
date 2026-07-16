@@ -1,0 +1,34 @@
+diff --git a/constants/voxel_constants.h b/constants/voxel_constants.h
+index 7a4d9a3..8459273 100644
+--- a/constants/voxel_constants.h
++++ b/constants/voxel_constants.h
+@@ -11,7 +11,13 @@ static const float MINIMUM_LOD_DISTANCE = 16.f;
+ static const float MAXIMUM_LOD_DISTANCE = 128.f;
+ 
+ static const unsigned int MIN_BLOCK_SIZE = 16;
+-static const unsigned int MAX_BLOCK_SIZE = 32;
++// VOXIVERSE COSMOS L4: mesh-block ceiling raised 32 -> 64 so VoxelTerrain (fixed-LOD) can use 64^3
++// mesh blocks (8x the ground per block -> ~2x fewer draw calls on gl_compatibility). This is a
++// resource-usage guardrail, NOT a correctness bound: the blocky mesher emits int32 indices
++// (PackedInt32Array) and WebGL2 supports 32-bit element indices, so >65535-vertex surfaces are
++// fine. Data blocks stay 16^3 (no set_data_block_size on VoxelTerrain), so edits are unaffected.
++// See docs/COSMOS-64MESH-DESIGN.md.
++static const unsigned int MAX_BLOCK_SIZE = 64;
+ 
+ static const unsigned int MAX_BLOCK_COUNT_PER_REQUEST = 4 * 4 * 4;
+ 
+diff --git a/terrain/fixed_lod/voxel_terrain.cpp b/terrain/fixed_lod/voxel_terrain.cpp
+index 7aa7cf6..fa273cd 100644
+--- a/terrain/fixed_lod/voxel_terrain.cpp
++++ b/terrain/fixed_lod/voxel_terrain.cpp
+@@ -217,6 +217,10 @@ void VoxelTerrain::set_mesh_block_size(unsigned int mesh_block_size) {
+ 		case 32:
+ 			po2 = 5;
+ 			break;
++		case 64:
++			// VOXIVERSE COSMOS L4 — 64^3 mesh blocks. render_to_data_factor = 64/16 = 4.
++			po2 = 6;
++			break;
+ 		default:
+ 			mesh_block_size = 16;
+ 			po2 = 4;

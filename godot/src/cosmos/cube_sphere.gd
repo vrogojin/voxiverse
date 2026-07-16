@@ -166,6 +166,22 @@ const FP_FULLRES_256 := false
 ## sed-at-export deploy pattern). Independent of FACETED (the module library build is the same both ways).
 const FP_ATLAS_MATERIAL := false
 
+## COSMOS-64MESH (docs/COSMOS-64MESH-DESIGN.md, Perf L4) — 64³ VoxelTerrain mesh blocks instead of 32³.
+## VoxelMesherBlocky emits one surface (= one draw) per material per MESH block; a 64³ block covers 8× the
+## volume (4× the near-2D ground footprint) of a 32³ block, so near-field surface blocks — the bulk of the
+## ~74-87 post-atlas draws — drop ~4× (→ ~40 draws, the robust-60fps rung on gl_compatibility; stacks with L3).
+## Requires godot_voxel patch 0006 (MAX_BLOCK_SIZE 32→64 + the case-64 po2=6 branch in VoxelTerrain's
+## set_mesh_block_size switch); WITHOUT the rebuilt engine the module clamps any value >32 back to 16, so this
+## flag is inert until the patched templates ship. The blocky mesher is int32-indexed (PackedInt32Array) and
+## WebGL2 has 32-bit element indices, so a >65535-vertex surface is fine — the 32 cap was only a resource
+## guardrail, never an index limit. Data blocks stay 16³ (edit injection unchanged). Trade-off: each mesh
+## APPLY is an indivisible RenderingServer upload ~4-8× bigger, so a single apply can overrun the main-thread
+## time_budget_ms=4 in one atomic chunk — measure the crossing/streaming worst-frame A/B (on vs off) before
+## shipping; mitigation is 64³ for the steady-state active facet only (see the design doc §7). Default OFF →
+## mesh_block_size=32 exactly as today, byte-identical (FLAT verify pin 6035/0 stays). Flipped ON at export
+## after the rebuild + worst-frame A/B (the established sed-at-export deploy pattern).
+const FP_MESH_BLOCK_64 := false
+
 ## COSMOS-PERF STEP 1 / L1 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — the far-ring FAST packed-array rebuild.
 ## FacetFarRing._rebuild_full() re-emits ~1728 front-hemisphere facets every crossing AND every neighbour-pool change
 ## via ~332k per-vertex SurfaceTool add_vertex/set_color GDScript→C++ round-trips + generate_normals() over ~55k tris —

@@ -75,7 +75,15 @@ const STALE_S := 120.0
 const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload"]
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
-const FRAME_INTERVAL_MS := 500      # ms — ~2 fps frame stream
+# COSMOS-PERF L2 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §1.1/§4 L2) — capture hygiene. The synchronous
+# get_texture().get_image() (WebGL2 glReadPixels = full GPU pipeline stall) + resize + JPEG on the engine thread cost
+# ~35 ms and, at the old 500 ms cadence, landed a hitch 2×/second in EVERY remote session — self-inflicted jank that
+# also polluted every worst-frame statistic used to judge feel. The interval is raised to 2000 ms (~0.5 fps) AND the
+# scheduled capture is SKIPPED when the last telemetry window already hitched (worst > CAPTURE_SKIP_WORST_MS) so a
+# readback never piles onto a frame that is already slow. The COMMANDED screenshot (§3.3, _commanded_shot_async) is a
+# SEPARATE path — unaffected by both throttles — so an explicit agent screenshot request always captures.
+const FRAME_INTERVAL_MS := 2000     # ms — ~0.5 fps ambient frame stream (was 500; L2 capture hygiene)
+const CAPTURE_SKIP_WORST_MS := 45.0 # ms — skip a scheduled auto-capture if the last window's worst frame exceeded this
 const FRAME_MAX_WIDTH := 960        # px — downscale cap for the JPEG (keeps bytes + readback modest)
 const FRAME_JPG_QUALITY := 0.6
 const FRAME_TAG := 0x01             # 1-byte type tag prefixing a binary JPEG frame (distinguish from JSON text)
@@ -134,6 +142,12 @@ const POST_CROSS_MAX := 8           # NEVER-OOM: hard cap on concurrent windows
 var _frame_acc_ms := 0.0
 var _capturing := false             # a frame readback+send is inflight (skip overlapping captures)
 var _link_open := false             # last emitted link_state (so we emit only on transitions)
+# COSMOS-PERF L2: ambient auto-capture controls. `_auto_frames_enabled` is the re-baseline kill switch — set false by
+# `?frames=0` / `?capture=0` (web) or VOXIVERSE_REMOTE_FRAMES=0 (native), and toggleable at runtime via set_auto_frames()
+# so the agent/relay can request frames-off for a clean measurement. `_last_window_worst_ms` is the just-closed
+# telemetry window's worst frame — the threshold gate reads it so a readback never lands on an already-hitching frame.
+var _auto_frames_enabled := true
+var _last_window_worst_ms := 0.0
 
 # ── P2 control state (all inert while CONTROL_ENABLED is false — never touched on the Phase-1 path) ──
 var _control_state := "none"        # none | granted
@@ -166,6 +180,7 @@ func _set_link(open: bool) -> void:
 ## VOXIVERSE_REMOTE_URL in both cases.
 static func dial_config() -> Dictionary:
 	var token := ""
+	var frames := true                       # L2: ambient frame stream on unless explicitly disabled (re-baseline knob)
 	if OS.has_feature("web"):
 		# location.search is inherent to the page; a single boot-time eval decides whether to dial.
 		# No param → empty token → {} → dead. This is the whole activation gate on the public site.
@@ -174,12 +189,15 @@ static func dial_config() -> Dictionary:
 		if raw != null:
 			qs = str(raw)
 		token = _parse_query_token(qs)
+		frames = _parse_frames_flag(qs)
 	else:
 		token = OS.get_environment("VOXIVERSE_REMOTE_TOKEN")
+		var fenv := OS.get_environment("VOXIVERSE_REMOTE_FRAMES").strip_edges()
+		frames = not (fenv == "0" or fenv.to_lower() == "false" or fenv.to_lower() == "off")
 	token = token.strip_edges()
 	if token == "":
 		return {}
-	return {"token": token, "url": resolve_url()}
+	return {"token": token, "url": resolve_url(), "frames": frames}
 
 
 ## The relay URL is FIXED to our host — resolved from VOXIVERSE_REMOTE_URL (native/dev only) else the
@@ -211,10 +229,34 @@ static func _parse_query_token(query: String) -> String:
 	return ""
 
 
+## L2: the ambient-frame gate from the query string. Returns false iff `frames`/`capture` is explicitly disabled
+## (`=0`/`false`/`off`) — the re-baseline knob (`?remote=TOK&frames=0`). Absent → true (frames on, unchanged default).
+static func _parse_frames_flag(query: String) -> bool:
+	var q := query
+	if q.begins_with("?"):
+		q = q.substr(1)
+	for pair in q.split("&", false):
+		var eq := pair.find("=")
+		if eq < 0:
+			continue
+		var key := pair.substr(0, eq)
+		if key == "frames" or key == "capture":
+			var v := pair.substr(eq + 1).uri_decode().strip_edges().to_lower()
+			return not (v == "0" or v == "false" or v == "off" or v == "no")
+	return true
+
+
 ## Called by main.gd BEFORE add_child, with the dial_config() dictionary.
 func configure(cfg: Dictionary) -> void:
 	_token = str(cfg.get("token", ""))
 	_url = str(cfg.get("url", DEFAULT_URL))
+	_auto_frames_enabled = bool(cfg.get("frames", true))   # L2: honor ?frames=0 / VOXIVERSE_REMOTE_FRAMES=0
+
+
+## L2 runtime kill switch for the AMBIENT auto-capture (the commanded screenshot path is never affected). Lets the
+## agent/relay turn periodic frames off for a clean re-baseline measurement without a page reload.
+func set_auto_frames(on: bool) -> void:
+	_auto_frames_enabled = on
 
 
 func _ready() -> void:
@@ -368,6 +410,7 @@ func _send_telemetry() -> void:
 	var fps := (float(_win_frames) / _win_acc) if _win_acc > 0.0 else 0.0
 	var worst_ms := _win_worst * 1000.0
 	var min_fps := 1000.0 / maxf(worst_ms, 0.001)
+	_last_window_worst_ms = worst_ms          # L2: the threshold gate reads this before scheduling the next auto-capture
 	_win_acc = 0.0
 	_win_frames = 0
 	_win_worst = 0.0
@@ -497,6 +540,10 @@ func _merge_rich_state(msg: Dictionary) -> void:
 func _maybe_capture_frame() -> void:
 	if _capturing or not _authed:
 		return                            # never read back a frame before the relay's auth_ok
+	if not _auto_frames_enabled:
+		return                            # L2: ambient frames disabled (?frames=0 / set_auto_frames(false)) — clean measure
+	if _last_window_worst_ms > CAPTURE_SKIP_WORST_MS:
+		return                            # L2: last window already hitched — do not pile a ~35 ms readback onto a slow run
 	if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		return
 	if _ws.get_current_outbound_buffered_amount() > OUTBOUND_BACKPRESSURE_BYTES:

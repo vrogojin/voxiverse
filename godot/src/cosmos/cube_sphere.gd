@@ -151,6 +151,21 @@ const FP_NO_NEAR_LOD := false
 ## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
 const FP_FULLRES_256 := false
 
+## COSMOS-PERF STEP 1 / L1 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — the far-ring FAST packed-array rebuild.
+## FacetFarRing._rebuild_full() re-emits ~1728 front-hemisphere facets every crossing AND every neighbour-pool change
+## via ~332k per-vertex SurfaceTool add_vertex/set_color GDScript→C++ round-trips + generate_normals() over ~55k tris —
+## ~300–700 ms on ONE main-thread frame (the dominant post-crossing spike). When true, _rebuild_full assembles the
+## mesh from PRE-TRIANGULATED per-facet pos/col caches (built once per facet) via append_array (C++ memcpy) into two big
+## PackedArrays + ONE add_surface_from_arrays, then computes normals with SurfaceTool.create_from + generate_normals —
+## both C++, so NONE of the per-vertex GDScript emission remains. VISUALLY EQUIVALENT: the fast path expands each cell
+## into the SAME triangle order/winding + per-vertex colors as the SurfaceTool path, and its normals are BIT-IDENTICAL
+## because create_from replays the identical vertex list into the identical generate_normals — the GLOBAL smoothing
+## (which merges vertices across facet SEAMS) is preserved exactly (G-L1-FARRING proves normal/pos/col deviation 0.0).
+## Default OFF → the SurfaceTool path, byte-identical mesh. +~5 MB bounded by the front-hemisphere
+## facet cache (NEVER-OOM OK; the tri caches are built lazily, only when the fast path or the gate runs). Flipped ON at
+## export after the A/B (the established sed-at-export pattern).
+const FP_FARRING_FAST_REBUILD := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with
@@ -190,6 +205,28 @@ const CTRL_RELIEF_FLOOR := 0.25
 const CTRL_FRAME_SAMPLE_CLAMP_MS := 250.0
 const CTRL_WINDOW_PCTL := 0.9
 const POOL_D_COMMIT := 64.0
+
+## COSMOS-PERF STEP 1 / L5 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §1.2/§4 L5) — the ADAPTIVE overload setpoint.
+## The shipped overload test is `EMA(window p90) > CTRL_FRAME_BUDGET_MS` (18 ms). But the HEALTHY full-radius steady
+## frame is 33 ms (2 vsyncs) on a 30-fps-floor client → p90 = 33 > 18 → PERMANENT overload → stream_credit pinned 0 all
+## session, optional streaming stuck at the relief floor forever (live telemetry: credit 0 on every row). When true, the
+## setpoint becomes RELATIVE to this client's OWN achievable floor: setpoint = clamp(floor_p10 × CTRL_ADAPTIVE_MARGIN,
+## CTRL_FRAME_BUDGET_MS, CTRL_ADAPTIVE_MAX_MS), where floor_p10 is the p10 of a long rolling frame window (the "best
+## recent minute", robust to short hitch trains). Overload then means "worse than this client's floor," not an absolute
+## 60-fps-derived number: a 30-fps-floor client at a steady 33 ms is NOT flagged (setpoint ≈ 43), but a genuine
+## transient spike ABOVE its floor still IS. The clamp floor (CTRL_FRAME_BUDGET_MS) means the adaptive setpoint is
+## NEVER stricter than shipped — it only ever RELAXES upward for slow clients, so a fast client is never made MORE
+## overload-prone than today. DETERMINISM (§6.5.7): floor_p10 is a pure order statistic over the injected-source samples
+## + injected clock — no wall clock; the G-M2-CTRL-ADAPTIVE gate asserts it as a machine-speed-independent square wave.
+## Default OFF → the absolute CTRL_FRAME_BUDGET_MS path, byte-identical (the per-frame floor-window push is inert — it
+## never touches credit with the flag off). The controller is created only under FP_M2_LOD, so FLAT stays byte-identical
+## regardless. Instance-overridable via StreamLoadController.set_adaptive() so the gates pin either mode explicitly.
+## Flipped ON at export after the browser A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true live.
+const FP_CTRL_ADAPTIVE := false
+const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
+const CTRL_FLOOR_PCTL := 0.1             # p10 — the client's achievable floor (robust to short hitch trains)
+const CTRL_ADAPTIVE_MARGIN := 1.3        # setpoint = floor_p10 × this (overload ⇔ ~30% worse than the client's floor)
+const CTRL_ADAPTIVE_MAX_MS := 45.0       # setpoint upper clamp (never tolerate worse than ~22 fps as "not overload")
 
 ## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
 ## master toggle (the crossing-hitch fix). When true, the player + GroundCollider + loose VoxelBody debris live

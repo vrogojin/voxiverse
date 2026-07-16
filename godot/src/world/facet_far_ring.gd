@@ -30,6 +30,15 @@ var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+# COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
+# caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
+# the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
+# straight append_array memcpy per facet (~1728 C++ memcpys) instead of ~332k per-vertex GDScript→C++ round-trips.
+# NORMALS are NOT cached: the mesh's GLOBAL smoothing (generate_normals merges vertices across facet SEAMS — proven by
+# G-L1-FARRING) depends on the whole visible set, so the fast path assembles pos/col, then runs create_from +
+# generate_normals (both C++, no GDScript per-vertex calls) → the normal array is BIT-IDENTICAL to the SurfaceTool path.
+var _tri_pos_cache: Dictionary = {}  # fid -> PackedVector3Array (96 verts: the facet's tri soup, ABSOLUTE coords)
+var _tri_col_cache: Dictionary = {}  # fid -> PackedColorArray   (96 colors, per _emit_cached order)
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -139,26 +148,67 @@ func _front_visible(fid: int, nrm: Array) -> bool:
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
 func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var fids := visible_fids()
+	_emitted.clear()
+	for fid in fids:
+		_ensure_cached(fid)
+		_emitted[fid] = true
+	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
+	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
+	_mi.mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	_reemit_count += 1
+	_pending = false
+	var tris := fids.size() * CELLS * CELLS * 2   # 32 tris/facet — exact for both assemblers
+	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+
+## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
+## mesh assemblers + the equivalence gate consume this so their vertex/color/normal arrays are index-aligned.
+func visible_fids() -> PackedInt32Array:
+	var out := PackedInt32Array()
 	var k := FacetAtlas.K
 	var nrm := FacetAtlas.facet_normal64(_active_fid)
-	var tris := 0
-	_emitted.clear()
 	for face in range(6):
 		for a in range(k):
 			for b in range(k):
 				var fid := (face * k + a) * k + b
-				if not _front_visible(fid, nrm):
-					continue
-				_ensure_cached(fid)
-				tris += _emit_cached(st, fid)
-				_emitted[fid] = true
+				if _front_visible(fid, nrm):
+					out.append(fid)
+	return out
+
+## SHIPPED assembler: per-vertex SurfaceTool emission + generate_normals (the ~332k GDScript→C++ round-trip path).
+func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for fid in fids:
+		_ensure_cached(fid)
+		_emit_cached(st, fid)
 	st.generate_normals()
-	_mi.mesh = st.commit()
-	_reemit_count += 1
-	_pending = false
-	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+	return st.commit()
+
+## FAST assembler (L1): concat the pre-triangulated per-facet pos/col caches into two big packed arrays (C++ memcpy),
+## build a normal-less mesh, then let SurfaceTool COMPUTE the normals via create_from + generate_normals — both C++,
+## so NONE of the ~332k per-vertex GDScript→C++ round-trips of the shipped path remain, yet the normals are the SAME
+## GLOBALLY-smoothed array (create_from replays the identical vertex list into the identical generate_normals, seams
+## and all). A few ms of memcpy + one C++ normal pass, vs 300–700 ms of GDScript emission.
+func _build_fast(fids: PackedInt32Array) -> Mesh:
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for fid in fids:
+		_ensure_tri_cached(fid)
+		pos.append_array(_tri_pos_cache[fid])
+		col.append_array(_tri_col_cache[fid])
+	if pos.size() == 0:
+		return ArrayMesh.new()
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	var flat := ArrayMesh.new()
+	flat.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)   # normal-less; positions + colors only
+	var st := SurfaceTool.new()
+	st.create_from(flat, 0)                                       # C++ read-back of the vertex list (no GDScript per-vert)
+	st.generate_normals()                                        # C++ GLOBAL smoothing — bit-identical to the shipped path
+	return st.commit()
 
 ## FP-S1(d) gate helper: synchronously complete a pending deferred rebuild (what _process does over budgeted frames)
 ## so headless gates — which do not step frames — can assert the post-crossing visible set.
@@ -221,6 +271,32 @@ func _emit_cached(st: SurfaceTool, fid: int) -> int:
 			st.set_color(col[i3]); st.add_vertex(pos[i3])
 			n += 2
 	return n
+
+## COSMOS-PERF L1: derive facet `fid`'s pre-triangulated pos/col soup from its grid caches, ONCE (cached forever). Expands
+## the (CELLS+1)² vertex grid into the SAME 32-tri soup _emit_cached emits (same two tris per cell, same winding, same
+## per-vertex colors) so a fast rebuild is a straight append_array of these arrays. Normals are computed later, globally,
+## by _build_fast's create_from + generate_normals (they depend on the whole visible set via cross-facet seam smoothing).
+func _ensure_tri_cached(fid: int) -> void:
+	if _tri_pos_cache.has(fid):
+		return
+	_ensure_cached(fid)
+	var pos: PackedVector3Array = _pos_cache[fid]
+	var col: PackedColorArray = _col_cache[fid]
+	var stride := CELLS + 1
+	var tp := PackedVector3Array()
+	var tc := PackedColorArray()
+	for gj in range(CELLS):
+		for gi in range(CELLS):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			tp.push_back(pos[i0]); tp.push_back(pos[i2]); tp.push_back(pos[i1])
+			tp.push_back(pos[i1]); tp.push_back(pos[i2]); tp.push_back(pos[i3])
+			tc.push_back(col[i0]); tc.push_back(col[i2]); tc.push_back(col[i1])
+			tc.push_back(col[i1]); tc.push_back(col[i2]); tc.push_back(col[i3])
+	_tri_pos_cache[fid] = tp
+	_tri_col_cache[fid] = tc
 
 func _centre_dir(fid: int) -> Array:
 	if _centre_cache.has(fid):

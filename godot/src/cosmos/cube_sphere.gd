@@ -151,6 +151,21 @@ const FP_NO_NEAR_LOD := false
 ## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
 const FP_FULLRES_256 := false
 
+## COSMOS-ATLAS (docs/COSMOS-ATLAS-DESIGN.md, Perf L3) — collapse the OPAQUE terrain onto ONE shared atlas material.
+## Every block id today carries its OWN StandardMaterial3D (block_materials.gd), and VoxelMesherBlocky emits ONE
+## surface (= one draw call) per distinct material per 32³ mesh block, so materials MULTIPLY the draw count
+## (~90 surface blocks × ~2.1 materials/block ≈ 190 of the ~204 measured draws → the GL-compatibility per-draw
+## ceiling that caps walking at ~30 fps). When true (STAGE 1), the 67 OPAQUE VoxelBlockyModelCube models
+## (_configure_library → _add_cube) are packed into ONE 8×8×128px = 1024² atlas behind ONE shared opaque
+## StandardMaterial3D (BlockAtlas): per-face set_tile() picks the id's atlas cell instead of a per-id
+## set_material_override, so the mesher MERGES all opaque cubes in a block into one surface (draws 204 → ~130-150;
+## shaped/snow/slope/carve models + the translucent glass/ice + emissive lava stay per-material — STAGE 2+). The
+## cube ARID == LRID invariant is UNTOUCHED (only material + UVs change, never the model index / TYPE channel), so
+## G-M2-ID stays green. Default OFF → the shipped per-id-material path, byte-identical (FLAT verify pin 6035/0
+## stays; the atlas is never built). Flipped ON at export after the browser-heap + visual A/B (the established
+## sed-at-export deploy pattern). Independent of FACETED (the module library build is the same both ways).
+const FP_ATLAS_MATERIAL := false
+
 ## COSMOS-PERF STEP 1 / L1 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §3.1) — the far-ring FAST packed-array rebuild.
 ## FacetFarRing._rebuild_full() re-emits ~1728 front-hemisphere facets every crossing AND every neighbour-pool change
 ## via ~332k per-vertex SurfaceTool add_vertex/set_color GDScript→C++ round-trips + generate_normals() over ~55k tris —

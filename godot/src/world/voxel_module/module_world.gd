@@ -129,6 +129,14 @@ var _cover_released := false                # WorldManager's handshake fired (re
 # riding the batched bake(). The generator (voxel worker) only ever emits modifier 0,
 # so it writes the cube ARID directly and never touches the lazy table.
 var _library: Object                    # the VoxelBlockyLibrary (kept for lazy appends + re-bake)
+# COSMOS-ATLAS Stage 1 (docs/COSMOS-ATLAS-DESIGN.md, flag CubeSphere.FP_ATLAS_MATERIAL): the shared OPAQUE atlas.
+# Built ONCE at setup() (main thread) before _configure_library when the flag is on; null otherwise (and null =>
+# every code path takes the shipped per-id-material branch, byte-identical). Holds the ONE shared opaque material +
+# the per-(opaque block-id) → atlas-cell map that _add_cube routes onto instead of a per-id set_material_override.
+# Loaded via load().new() (like the other path-activated components here) so a freshly-added file needs no global
+# class-cache rescan to parse; block_atlas.gd still carries `class_name BlockAtlas` for the exported build.
+var _atlas = null                       # BlockAtlas instance (untyped: avoids a class-cache parse dependency)
+const _ATLAS_SCRIPT := "res://src/world/voxel_module/block_atlas.gd"
 var _cube_arid: PackedInt32Array        # LRID -> cube ARID (preallocated; == LRID for bootstrap)
 var _arid_by_key: Dictionary = {}       # (lrid | modifier<<16) -> ARID (MAIN THREAD ONLY)
 var _next_arid := 0                     # next free library model index / ARID to allocate
@@ -283,6 +291,16 @@ func setup() -> bool:
 	var mesher: Object = ClassDB.instantiate("VoxelMesherBlocky")
 	if library == null or mesher == null:
 		return false
+
+	# COSMOS-ATLAS Stage 1: build the shared OPAQUE atlas (image + one material + per-id cell map) BEFORE the library
+	# so _configure_library can route opaque cubes onto it. Flag OFF (or a build that placed nothing) ⇒ _atlas stays
+	# null and every cube takes the shipped per-id-material path (byte-identical). Main-thread, once — never per frame.
+	if CubeSphere.FP_ATLAS_MATERIAL:
+		var atlas = load(_ATLAS_SCRIPT).new()
+		if atlas.build():
+			_atlas = atlas
+		else:
+			print("[module_world] FP_ATLAS_MATERIAL on but atlas placed no opaque cells — staying on per-id materials")
 
 	# Per-phase timing (printed to the JS console on web) — pinpoints any load stall.
 	var _t_warm := Time.get_ticks_msec()
@@ -725,6 +743,27 @@ func can_render(arid: int) -> bool:
 ## == the library model count. Used by verify to fence the lazy append (VDS §8.1).
 func appearance_count() -> int:
 	return _next_arid
+
+## COSMOS-ATLAS gate accessors (verify_atlas.gd). `atlas()` is the built BlockAtlas (null when FP_ATLAS_MATERIAL is
+## off / the atlas placed nothing). `library_model(arid)` returns the baked VoxelBlockyModel at a library index, so
+## the gate can read back a cube's `get_material_override(0)` / `get_tile(side)` / `get_atlas_size_in_tiles()` and
+## assert the opaque cubes actually share the one atlas material + point at the right cell. `cube_arid_of(id)` maps a
+## bootstrap block id to its library model index (== id for the bootstrap set).
+func atlas():
+	return _atlas
+
+func library_model(arid: int) -> Object:
+	if _library == null:
+		return null
+	var models: Variant = _library.get("models")
+	if models is Array and arid >= 0 and arid < (models as Array).size():
+		return (models as Array)[arid]
+	return null
+
+func cube_arid_of(id: int) -> int:
+	if id >= 0 and id < _cube_arid.size():
+		return _cube_arid[id]
+	return -1
 
 ## Pre-allocate + bake the generator's appearance manifest and FREEZE it into
 ## `_gen_arid` (VDS §8.1/§8.3, RMS §6.5). Each (surface material, modifier) pair the
@@ -2419,15 +2458,21 @@ func _configure_library(library: Object) -> bool:
 		var cull_group: int = BlockCatalog.cull_group_of(block_id)
 		var got: int
 		var lk := BlockCatalog.liquid_kind_of(block_id)
+		# COSMOS-ATLAS Stage 1: an OPAQUE cube with an atlas cell renders on the SHARED atlas material + a per-face
+		# tile pointing at its cell, so the mesher merges all opaque cubes in a block into one surface. Non-opaque
+		# (translucent/emissive/fluid) ids have no cell (has_cell false) ⇒ per-id material path, unchanged (Stage 2+).
+		var use_atlas: bool = _atlas != null and bool(_atlas.has_cell(block_id))
+		var cube_mat: Material = _atlas.material if use_atlas else BlockMaterials.get_for(block_id)
+		var atlas_cell: Vector2i = _atlas.cell_of(block_id) if use_atlas else Vector2i(-1, -1)
 		if _waterlog_enabled and lk != CellCodec.LIQ_NONE and _fluids[lk] != null:
 			# A liquid LRID renders as a PURE FLUID model (WATERLOGGING §4.2 / MULTI-LIQUID §2.2.2),
 			# not a cube — so deep liquid culls internally and every cell of that kind shares its one
 			# fluid_index. Falls back to a cube if the fluid model can't be built, preserving the
-			# index==LRID invariant either way.
+			# index==LRID invariant either way. (Liquids are never opaque, so use_atlas is false here.)
 			var fluid_model: Object = _make_fluid_model(block_id, lk)
-			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, cube_mat, cull_group, atlas_cell)
 		else:
-			got = _add_cube(library, BlockMaterials.get_for(block_id), cull_group)
+			got = _add_cube(library, cube_mat, cull_group, atlas_cell)
 		if got != block_id:
 			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
@@ -2448,19 +2493,21 @@ func _configure_library(library: Object) -> bool:
 ## culls a face against a neighbour whose index is <= this model's, so glass-behind-
 ## glass culls but stone-behind-glass draws. The alpha blend itself lives on the
 ## material; the index only governs face culling.
-func _add_cube(library: Object, material: Material, cull_group: int = 0) -> int:
+func _add_cube(library: Object, material: Material, cull_group: int = 0, atlas_cell := Vector2i(-1, -1)) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
-	# CRITICAL for a visible texture: 1x1 tile atlas with every face at tile
-	# (0,0). The default atlas_size_in_tiles is (0,0) → DEGENERATE UVs (every
-	# face samples one texel → flat solid colour). A 1x1 atlas gives 0..1 UVs so
-	# the whole 64x64 texture shows per face.
+	# COSMOS-ATLAS Stage 1: with a valid atlas cell (col,row >= 0) the model uses the LIBRARY-WIDE atlas grid and
+	# points every face at THIS id's cell — so the shared atlas `material` samples the id's tile and the mesher
+	# merges all opaque cubes into one surface. Without a cell (the shipped path / non-opaque ids) it keeps the 1×1
+	# per-model atlas: the default atlas_size_in_tiles is (0,0) → DEGENERATE UVs (every face samples one texel → a
+	# flat solid colour); a 1×1 atlas gives 0..1 UVs so the whole per-model texture shows per face.
+	var use_atlas := atlas_cell.x >= 0 and _atlas != null
 	if cube.has_method("set_atlas_size_in_tiles"):
-		cube.call("set_atlas_size_in_tiles", Vector2i(1, 1))
+		cube.call("set_atlas_size_in_tiles", _atlas.grid if use_atlas else Vector2i(1, 1))
 	if cube.has_method("set_tile"):
 		for side in 6:  # VoxelBlockyModel.SIDE_* : 0..5 (all cube faces)
-			cube.call("set_tile", side, Vector2i(0, 0))
+			cube.call("set_tile", side, atlas_cell if use_atlas else Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
 		cube.call("set_material_override", 0, material)
 	# Transparency index for face culling (WGC §5.1). Opaque (0) is the godot_voxel

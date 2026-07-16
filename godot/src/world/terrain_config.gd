@@ -128,6 +128,12 @@ const RENDER_RADIUS_BLOCKS := 256
 ## the rest seamlessly. FLAT_WORLD is unaffected (near_render_radius() returns the full 256).
 const CURVED_RENDER_RADIUS_BLOCKS := 128
 
+## COSMOS RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §3.1) — the widened faceted near radius under
+## FP_FULLRES_256 (full-res voxels 0..256, the far ring keeps the horizon). DORMANT this pass: FP_FULLRES_256 defaults
+## OFF, so near_render_radius() returns the shipped CURVED_RENDER_RADIUS_BLOCKS (128) → byte-identical. The 256 spend
+## (ridge-banded pool + raised ceiling) is a later pass; this const only makes the widening a one-flag flip.
+const FULLRES_256_RADIUS_BLOCKS := 256
+
 ## THE near-field render radius the module viewer/terrain actually use: the full 256 in the FLAT non-faceted
 ## world, the cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet AND on a facet. Flat callers get the byte-identical 256.
 ## FP-S1(a) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 2 / §8): FACETED *requires* FLAT_WORLD=true, so
@@ -135,10 +141,15 @@ const CURVED_RENDER_RADIUS_BLOCKS := 128
 ## per-column cost across a ~4× larger box, i.e. the single biggest facet-crossing restream cost. A facet's near
 ## field only needs the walk-around 128 (the far ring draws the rest), exactly like curved mode. FACETED=false
 ## (the shipped default) still takes the 256 branch → byte-identical.
+## RENDER-SIMPLIFY §3.1: the single near-widening lever. FP_FULLRES_256 (default OFF) widens the faceted near field to
+## FULLRES_256_RADIUS_BLOCKS (256); with it off the faceted radius is the shipped 128 → byte-identical. The flat
+## non-faceted world is unaffected (the byte-identical 256).
 static func near_render_radius() -> int:
 	if CubeSphere.FLAT_WORLD and not CubeSphere.FACETED:
-		return RENDER_RADIUS_BLOCKS
-	return CURVED_RENDER_RADIUS_BLOCKS
+		return RENDER_RADIUS_BLOCKS                       # 256, byte-identical flat
+	if CubeSphere.FP_FULLRES_256:
+		return FULLRES_256_RADIUS_BLOCKS                  # 256 under the widening flag (later pass)
+	return CURVED_RENDER_RADIUS_BLOCKS                    # 128, shipped faceted
 
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is
 ## VIEWER_VERTICAL_RATIO * view_distance (RENDER_RADIUS_BLOCKS = 256). Before the Mountains biome the

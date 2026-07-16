@@ -1817,6 +1817,14 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 ## Spawn a facet whose own-side ridge distance is below D_WARM (nearest first), retire a pooled neighbour past
 ## D_RETIRE once it has lived >= MIN_LIVE_S, <=1 spawn AND <=1 retire per SPAWN_INTERVAL_S, hard cap 1 active +
 ## MAX_NEIGHBOURS. EDGE neighbours only (§8 -- the diagonal is FP-M1d). On any change it refreshes the far ring.
+## RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1) — the single near-LOD predicate. FP_NO_NEAR_LOD is the
+## logical inverse of FP_M2_LOD, so every LOD *creation/policy* read routes through this helper: with FP_NO_NEAR_LOD off
+## it equals FP_M2_LOD exactly (byte-identical); with it on the whole FacetLodMesher stack is bypassed (mesher never
+## created, promote-hold + _lod_promote_pass + far-ring LOD-merge self-disable). The passive lod_* generator/terrain
+## accessors deliberately stay on raw FP_M2_LOD — a null mesher never calls them, and verify_fp_m2 reads them directly.
+func _near_lod_on() -> bool:
+	return CubeSphere.FP_M2_LOD and not CubeSphere.FP_NO_NEAR_LOD
+
 func _manage_facet_pool(player_pos: Vector3) -> void:
 	if not _module_world.has_method("pool_spawn"):
 		return
@@ -1835,8 +1843,11 @@ func _manage_facet_pool(player_pos: Vector3) -> void:
 			want[nb] = d
 	var changed := false
 	if CubeSphere.FP_M2_LOD:
+		# RENDER-SIMPLIFY §2.2: keep the Z1-hybrid pool policy (its imminent-commit machinery drives the seamless
+		# crossing, capped at FP2_LIVE_CAP) even under FP_NO_NEAR_LOD — _near_lod_on() gates only the mesher SIDE-EFFECTS.
 		changed = _manage_pool_z1hybrid(active, player_pos, want)
-		_lod_promote_pass(player_pos)                # evict held LOD covers whose live seam band has meshed (§9.1)
+		if _near_lod_on():
+			_lod_promote_pass(player_pos)            # evict held LOD covers whose live seam band has meshed (§9.1); no held covers under FP_NO_NEAR_LOD (far-ring quad is the cover)
 	else:
 		changed = _manage_pool_fp1c(want)            # shipped FP-M1c policy, byte-identical with the flag off
 	if changed:
@@ -1908,7 +1919,11 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 				continue
 			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
 				_last_pool_spawn_ms = now
-				_promote_pending[t] = now                        # track → evict the held cover on seam-band-meshed
+				# RENDER-SIMPLIFY §2.2: the promote-HOLD handshake self-disables when the mesher is null (pool_spawn
+				# null-guards on_promote), so this bookkeeping is vestigial under FP_NO_NEAR_LOD — keep the map empty so
+				# _lod_promote_pass's `_promote_pending.is_empty()` early-out stays free.
+				if _near_lod_on():
+					_promote_pending[t] = now                    # track → evict the held cover on seam-band-meshed
 				changed = true
 				break
 	# RETIRE (demote live → LOD): a live neighbour that is no longer a target and has walked past D_RETIRE (hysteresis),
@@ -2045,7 +2060,9 @@ func _facet_ring_sync_exclusion() -> void:
 	# into ONE deferred/budgeted set_pool_excluded (no synchronous ring regen). With FP_M2_LOD off lod_covered_fids
 	# is [] → this reduces to the shipped FP-M1c pool-neighbour exclusion, byte-identical.
 	var excluded: Array = (_module_world.call("pool_neighbour_fids") as Array).duplicate()
-	if CubeSphere.FP_M2_LOD and _module_world.has_method("lod_covered_fids"):
+	# RENDER-SIMPLIFY §2.4: under FP_NO_NEAR_LOD there is no LOD cover, so the excluded set collapses to live pool
+	# neighbours only — every ex-LOD facet then shows its far-ring quad. _near_lod_on() short-circuits the merge.
+	if _near_lod_on() and _module_world.has_method("lod_covered_fids"):
 		for f in (_module_world.call("lod_covered_fids") as Array):
 			if not excluded.has(f):
 				excluded.append(f)

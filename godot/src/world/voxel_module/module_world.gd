@@ -1454,10 +1454,19 @@ func _apply_bounds(terrain: Object, fid: int) -> void:
 	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
 	_set_if(terrain, "bounds", AABB(pos, size))
 
+## RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1) — the single near-LOD predicate (mirrors WorldManager's).
+## FP_NO_NEAR_LOD is the inverse of FP_M2_LOD: with it off this equals FP_M2_LOD exactly (byte-identical), with it on the
+## LOD mesher is never created here. The passive lod_* generator/terrain accessors below stay on raw FP_M2_LOD.
+func _near_lod_on() -> bool:
+	return CubeSphere.FP_M2_LOD and not CubeSphere.FP_NO_NEAR_LOD
+
 ## FP-M2b (§5): create the FacetLodMesher under PlanetRoot and prime its static tiers on the active facet. Safe
 ## no-op unless FP_M2_LOD (mesher.setup returns false → _lod_mesher stays null and the LOD path is fully dead).
 func _lod_setup() -> void:
-	if not CubeSphere.FP_M2_LOD or _planet_root == null:
+	# RENDER-SIMPLIFY §2.1: FP_NO_NEAR_LOD bypasses the whole LOD stack at its creation site — return early so
+	# _lod_mesher stays null (the builder Thread never starts, the 96 MB ledger never allocates). _near_lod_on() ==
+	# FP_M2_LOD with the flag off → byte-identical.
+	if not _near_lod_on() or _planet_root == null:
 		return
 	var scr: Script = load("res://src/world/facet_lod_mesher.gd")
 	if scr == null:

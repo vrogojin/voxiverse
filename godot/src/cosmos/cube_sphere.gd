@@ -115,6 +115,28 @@ const FP_M2_LOD := false
 ## it is pure LOD-side polish already bounded by the NEVER-OOM caps, so it rides on whenever the LOD path is live.
 const FP_NEIGHBOUR_SEAM_POLISH := true
 
+## COSMOS RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1/§2) — REMOVE the intermediate near-neighbour LOD.
+## When true (AND FACETED AND FP_M1_POOL), the whole FacetLodMesher stack is bypassed: the mesher is never created
+## (_lod_setup returns early → _lod_mesher stays null → its builder Thread never starts and the 96 MB LOD ledger never
+## allocates), the promote-hold / _lod_promote_pass / demote-relief / apron paths self-disable, and the FacetFarRing
+## exclusion set shrinks to live-pool-neighbours-only so every ex-LOD facet shows its far-ring quad instead (§2.5 — the
+## far ring already renders behind everything, so removing the LOD opens NO horizon gap). This is the logical INVERSE of
+## FP_M2_LOD (they are mutually exclusive): every FP_M2_LOD *creation/policy* read routes through _near_lod_on() =
+## FP_M2_LOD and not FP_NO_NEAR_LOD, so with this flag off _near_lod_on() == FP_M2_LOD exactly (byte-identical; the
+## passive lod_* generator/terrain accessors stay on raw FP_M2_LOD — only consumed by a mesher that no longer exists).
+## Memory-SAFE on its own (only FREES the 96 MB LOD ledger). Default OFF → byte-identical; FLAT stays 6035/0. Flipped ON
+## at export after the browser-heap A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true.
+const FP_NO_NEAR_LOD := false
+
+## COSMOS RENDER-SIMPLIFY (docs/COSMOS-RENDER-SIMPLIFY-DESIGN.md §1/§3) — widen the near render radius 128 → 256 and
+## ridge-band + rescale the neighbour pool into the envelope the LOD removal frees. This is the memory-RISKY half (it
+## SPENDS the 96 MB FP_NO_NEAR_LOD reclaims) and is gated + A/B'd INDEPENDENTLY of the removal (§1: bundling them would
+## make a memory regression indistinguishable from a seam regression). Consulted only via near_render_radius() (the single
+## widening lever) + the pool rescale/ceiling; requires FP_NO_NEAR_LOD. THIS PASS wires only the flag + the flag-aware
+## near_render_radius() scaffold — the ridge-band, pool-ceiling raise (224 MB) and real-bytes ceiling are a later pass
+## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
+const FP_FULLRES_256 := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

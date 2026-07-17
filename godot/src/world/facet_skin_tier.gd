@@ -20,12 +20,34 @@ extends Node3D
 ## GDScript oracle (TerrainConfig.column_profile + FarPalette, byte-equal to the C++ path by G-CG-COLUMNS).
 ## There is NO independent height function here; a second one would crack at a facet ridge.
 ##
-## NEVER-OOM (§10 C3 ledger). A HARD `MAX_BYTES` ceiling (8 MB). Tiles are added nearest-first and the
-## farthest are evicted when the budget would be exceeded — memory safety outranks coverage, so if the
-## full 256 annulus does not fit at pitch 1 the skin covers LESS (the far ring backstop still covers the
-## rest coarsely); it never grows past the ceiling. CDLOD morph, pitch-2/4/8 extension rings and tree
-## impostors are LATER stages (§4.2/§4.3) and are deliberately NOT built here — but each tile vertex is
-## laid out so a parent-pitch height can be added later without reshaping the mesh.
+## DRAW-CALL DISCIPLINE (§10 C3 ledger "≤50 draws / merge-per-facet fallback"). Tiles do NOT each get a
+## MeshInstance3D — that was ~114 draws at the shipped tile count (measured live: standing fps 60→30,
+## draws 90→204, the exact vsync-ladder ceiling the atlas rescued us from). Instead a facet's tiles are
+## MERGED into ONE ArrayMesh surface on ONE MeshInstance3D per LIVE FACET (§ "Part A"): draws drop to
+## ≈ the live-facet count (active + a few neighbours, ≤~6). The merge is INCREMENTAL — only a facet whose
+## tile set changed this update() is re-merged (a pure PackedArray concat + one upload, main-thread-cheap;
+## the per-tile _sampler.call count is UNCHANGED, so no new apply-bound cost). Per-tile geometry is kept
+## CPU-side (the merge source of truth) so a re-merge never re-samples — it is memcpy-cheap.
+##
+## OWNERSHIP DEDUP (§ "Part B"). Facet DOMAIN BOXES overlap at K=24 seams (MARGIN_CELLS apron + the quad's
+## AABB corners), so the un-deduped skin covered every seam region from TWO facets (~2× tiles for a given
+## reach). Each tile is now owned by exactly ONE facet: the one whose EXACT polygon contains the tile
+## centre (`FacetAtlas.in_polygon(fid, cx, cz, 0)`). Adjacent facet polygons TILE the sphere (partition,
+## share edges), so a tile centre lies in exactly one — deterministic, and the SAME partition the near
+## voxel field already uses (junction_modify masks foreign cells to AIR). Because a TILE (32 blocks) is far
+## wider than the ownership granularity, tiles straddling a polygon edge extend ~half a tile past it, so the
+## two owners' tiles meet with a natural sub-tile overlap band across the ridge — no crack, exactly as the
+## overlap contract requires (and the far-ring backstop still underlies any residual sliver). WITHIN a facet
+## adjacent tiles share their boundary column bit-for-bit (G-SKIN-EDGE) — dedup does not touch that.
+##
+## NEVER-OOM (§10 C3 ledger). A HARD `MAX_BYTES` ceiling (8 MB) on the TRUE footprint. The merge keeps the
+## per-tile vertex data CPU-side (the merge source) AND the RenderingServer keeps the uploaded copy, so the
+## true peak is ~2× the vertex bytes — `total_bytes()` reports that 2× footprint and the ceiling binds on
+## IT (source is therefore capped at ~4 MB). Tiles are added nearest-first and the farthest evicted when the
+## budget would be exceeded — memory safety outranks coverage. Dedup removes the ~2× seam redundancy, which
+## recovers the reach the 2× footprint accounting costs: the skin stays memory-neutral vs the shipped
+## per-tile version at the SAME reach while cutting draws ~20×. CDLOD morph, pitch-2/4/8 extension rings and
+## tree impostors are LATER stages (§4.2/§4.3), deliberately NOT built here.
 ##
 ## Flag OFF (default) == byte-identical: WorldManager never creates this node, so nothing changes. FACETED
 ## only (like FacetFarRing) — the flat world has no facets/atlas; under FLAT the node is never created.
@@ -43,7 +65,10 @@ const R_INNER := 64.0                # skip tiles wholly inside this radius: the
                                      # reaches much further out. A one-tile overlap is kept so the skin still
                                      # underlies the near disc's edge (no ring gap while meshes stream in).
 const R_OUTER := 256.0               # target coverage radius (blocks). Actual reach is capped by MAX_BYTES.
-const MAX_BYTES := 8 * 1024 * 1024   # §10 C3 hard ceiling. Bound tile count × tile bytes; evict farthest.
+const MAX_BYTES := 8 * 1024 * 1024   # §10 C3 hard ceiling on the TRUE footprint (source + render copy).
+const RENDER_COPY_FACTOR := 2        # true peak = CPU merge-source arrays + the RenderingServer upload of the
+                                     # merged mesh ≈ 2× the vertex bytes. The ceiling binds on this footprint,
+                                     # so `_src_bytes` (the counted vertex data) is effectively capped at 4 MB.
 
 var _sampler: Callable               # (fid:int, packed:PackedInt64Array) -> {heights,biomes,water,colors}
 var _sampler_obj: Object = null      # STRONG ref to the sampler's object (the compiled generator is a
@@ -52,8 +77,12 @@ var _sampler_obj: Object = null      # STRONG ref to the sampler's object (the c
 var _active_fid := -1
 var _anchor_offset: Vector3 = Vector3.ZERO   # fixed-frame floating-origin shift, mirrored from the far ring
 var _mat: StandardMaterial3D
-var _tiles: Dictionary = {}          # key "fid:tx:tz" -> {mi:MeshInstance3D, bytes:int, dist:float}
-var _bytes := 0
+# Per-tile geometry (the merge source of truth). key "fid:tx:tz" ->
+#   {fid:int, bytes:int, dist:float, pos:PackedVector3Array, nrm:PackedVector3Array, col:PackedColorArray, idx:PackedInt32Array}
+var _tiles: Dictionary = {}
+# Per LIVE FACET: the ONE merged draw call. fid -> {mi:MeshInstance3D, keys:Dictionary(tileKey->true)}.
+var _facets: Dictionary = {}
+var _src_bytes := 0                  # sum of the per-tile vertex bytes (the CPU merge source). Footprint = 2×.
 var _last_center := Vector3(1e18, 1e18, 1e18)   # last player world pos an update scheduled from
 
 # --- lifecycle -----------------------------------------------------------------------------------
@@ -91,6 +120,7 @@ func _fixed_frame_on() -> bool:
 
 ## Same placement law as FacetFarRing: identity (minus the re-anchor offset) under the fixed frame, so the
 ## ABSOLUTE-coord mesh renders in the scene frame; else T_active⁻¹ (re-place absolute into active-lattice).
+## One node transform covers EVERY facet's merged mesh — they are all absolute-coord children of this node.
 func _placement_xform() -> Transform3D:
 	if _fixed_frame_on():
 		return Transform3D(Basis.IDENTITY, -_anchor_offset)
@@ -102,6 +132,9 @@ func _placement_xform() -> Transform3D:
 ## R_OUTER of the player, nearest-first, under the byte ceiling; evict tiles that fell out of range or
 ## past the budget. `player_lattice` is the player's (x,y,z) in the ACTIVE facet lattice (the frame
 ## WorldManager already works in); `fids` are the candidate facets to skin (active + front neighbours).
+##
+## Only facets whose tile set CHANGED this call are re-merged at the end (the incremental merge, main-thread
+## cheap — no re-sample). The TILE·0.5 hysteresis keeps this (and the re-merge) from firing every frame.
 func update(active_fid: int, player_lattice: Vector3, fids: PackedInt32Array) -> void:
 	_active_fid = active_fid
 	var pw := _lattice_world(active_fid, player_lattice.x, player_lattice.y, player_lattice.z)
@@ -110,32 +143,41 @@ func update(active_fid: int, player_lattice: Vector3, fids: PackedInt32Array) ->
 		return
 	_last_center = pw
 
-	# Rank every in-range tile by distance, build nearest-first until the budget binds.
-	var wanted := _rank_tiles(pw, fids)          # Array of [dist, fid, tx, tz], sorted ascending
+	var dirty := {}                                # fids whose tile set changed → re-merge at the end
+	# Rank every in-range, OWNED tile by distance, build nearest-first until the budget binds.
+	var wanted := _rank_tiles(pw, fids)            # Array of [dist, fid, tx, tz], sorted ascending
 	var keep := {}
 	for entry in wanted:
-		var key: String = _key(int(entry[1]), int(entry[2]), int(entry[3]))
+		var fid := int(entry[1])
+		var key: String = _key(fid, int(entry[2]), int(entry[3]))
 		keep[key] = true
 		if _tiles.has(key):
 			continue
-		var m := _build_tile(int(entry[1]), int(entry[2]), int(entry[3]))
+		var m := _build_tile(fid, int(entry[2]), int(entry[3]))
 		if m.is_empty():
 			continue
 		var b: int = m["bytes"]
-		if _bytes + b > MAX_BYTES:
+		if (_src_bytes + b) * RENDER_COPY_FACTOR > MAX_BYTES:
 			# Budget bound: stop adding (the rest of the annulus is the far ring's job). NEVER-OOM.
-			(m["mi"] as MeshInstance3D).queue_free()
 			break
-		add_child(m["mi"])
 		m["dist"] = float(entry[0])
 		_tiles[key] = m
-		_bytes += b
+		_src_bytes += b
+		_register_key(fid, key)
+		dirty[fid] = true
 	# Evict tiles no longer wanted (out of range / past budget).
 	for key in _tiles.keys():
 		if not keep.has(key):
+			dirty[int(_tiles[key]["fid"])] = true
 			_evict(key)
+	# Incremental merge: rebuild ONLY the facets whose tile set changed (§ Part A).
+	for fid in dirty.keys():
+		_remerge_facet(int(fid))
 
-## The candidate tiles within R_OUTER of the player, as [dist, fid, tx, tz], sorted nearest-first.
+## The candidate tiles within R_OUTER of the player AND owned by their facet, as [dist, fid, tx, tz],
+## sorted nearest-first. Ownership (Part B): a tile belongs to `fid` iff its CENTRE column is inside fid's
+## exact polygon — `in_polygon(grow=0)`. Adjacent facet polygons partition the sphere, so each world region
+## is skinned once (no seam-box double coverage), the same partition the near voxel field uses.
 func _rank_tiles(pw: Vector3, fids: PackedInt32Array) -> Array:
 	var out: Array = []
 	for fid in fids:
@@ -149,6 +191,8 @@ func _rank_tiles(pw: Vector3, fids: PackedInt32Array) -> Array:
 			for tz in range(tz0, tz1 + 1):
 				var cx := tx * TILE + TILE / 2
 				var cz := tz * TILE + TILE / 2
+				if not FacetAtlas.in_polygon(fid, cx, cz, 0.0):
+					continue                          # owned by a neighbour facet (Part B dedup)
 				var w := _lattice_world(fid, float(cx), 0.0, float(cz))
 				var d := pw.distance_to(w)
 				if d >= R_INNER - float(TILE) and d <= R_OUTER + float(TILE):
@@ -156,17 +200,96 @@ func _rank_tiles(pw: Vector3, fids: PackedInt32Array) -> Array:
 	out.sort_custom(func(a, b): return a[0] < b[0])
 	return out
 
+## Drop a tile from the source dict + its facet's key set + the byte counter. Marks nothing dirty itself
+## (the caller batches the re-merge); a facet left with zero tiles is torn down by _remerge_facet.
 func _evict(key: String) -> void:
 	var t: Dictionary = _tiles[key]
-	_bytes -= int(t["bytes"])
-	(t["mi"] as MeshInstance3D).queue_free()
+	var fid := int(t["fid"])
+	_src_bytes -= int(t["bytes"])
+	if _facets.has(fid):
+		(_facets[fid]["keys"] as Dictionary).erase(key)
 	_tiles.erase(key)
 
-# --- tile construction (the ONE place geometry is made; used by update AND the gate) --------------
+func _register_key(fid: int, key: String) -> void:
+	if not _facets.has(fid):
+		_facets[fid] = {"mi": null, "keys": {}}
+	(_facets[fid]["keys"] as Dictionary)[key] = true
+
+# --- per-facet merge (§ Part A — the ONE draw call per live facet) --------------------------------
+
+## Rebuild facet `fid`'s single merged surface from its current tiles' CPU-side geometry and (re)assign it
+## to the facet's one MeshInstance3D. Pure PackedArray concat + one upload — no _sampler call, so it is
+## main-thread cheap and adds NO apply-bound cost (the sampling already happened in _build_tile). A facet
+## with no tiles is torn down (its draw call removed). Called once per dirty facet per update().
+func _remerge_facet(fid: int) -> void:
+	if not _facets.has(fid):
+		return
+	var rec: Dictionary = _facets[fid]
+	var keys: Dictionary = rec["keys"]
+	if keys.is_empty():
+		# No tiles left → remove the draw call entirely.
+		var mi_gone: MeshInstance3D = rec["mi"]
+		if mi_gone != null:
+			mi_gone.queue_free()
+		_facets.erase(fid)
+		return
+
+	var pos := PackedVector3Array()
+	var nrm := PackedVector3Array()
+	var col := PackedColorArray()
+	var idx := PackedInt32Array()
+	# Pre-size so the concat is a memcpy fill, not a growth cascade (all tiles share stride² verts).
+	var stride := TILE + 1
+	var vper := stride * stride
+	var iper := TILE * TILE * 6
+	var ntiles := keys.size()
+	pos.resize(vper * ntiles)
+	nrm.resize(vper * ntiles)
+	col.resize(vper * ntiles)
+	idx.resize(iper * ntiles)
+	var voff := 0
+	var ioff := 0
+	for key in keys.keys():
+		var t: Dictionary = _tiles[key]
+		var tp: PackedVector3Array = t["pos"]
+		var tn: PackedVector3Array = t["nrm"]
+		var tc: PackedColorArray = t["col"]
+		var ti: PackedInt32Array = t["idx"]
+		var nv := tp.size()
+		for i in range(nv):
+			pos[voff + i] = tp[i]
+			nrm[voff + i] = tn[i]
+			col[voff + i] = tc[i]
+		var ni := ti.size()
+		for j in range(ni):
+			idx[ioff + j] = ti[j] + voff        # re-base this tile's indices into the merged vertex buffer
+		voff += nv
+		ioff += ni
+
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_NORMAL] = nrm
+	arr[Mesh.ARRAY_COLOR] = col
+	arr[Mesh.ARRAY_INDEX] = idx
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+
+	var mi: MeshInstance3D = rec["mi"]
+	if mi == null:
+		mi = MeshInstance3D.new()
+		mi.material_override = _mat
+		mi.name = "skin_facet_%d" % fid
+		rec["mi"] = mi
+		add_child(mi)
+	mi.mesh = mesh
+
+# --- tile construction (the ONE place tile geometry is made; used by update AND the gate) ----------
 
 ## Build facet `fid`'s tile (tx,tz): sample its (TILE+1)² columns in ONE _sampler call, place each column
-## vertex at its ABSOLUTE world height SUNK by SINK, colour it from the palette. Returns
-## {mi:MeshInstance3D, bytes:int} or null. NOT added to the tree (the caller decides, for budget control).
+## vertex at its ABSOLUTE world height SUNK by SINK, colour it from the palette. Returns the CPU-side
+## geometry {fid,bytes,pos,nrm,col,idx} (the merge source of truth) or {} on a bad sample. NOT added to any
+## mesh here — the facet's tiles are merged together by _remerge_facet.
 func _build_tile(fid: int, tx: int, tz: int) -> Dictionary:
 	var ox := tx * TILE
 	var oz := tz * TILE
@@ -212,21 +335,8 @@ func _build_tile(fid: int, tx: int, tz: int) -> Dictionary:
 		var n := nrm[i]
 		nrm[i] = n.normalized() if n.length_squared() > 0.0 else Vector3.UP
 
-	var arr := []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = pos
-	arr[Mesh.ARRAY_NORMAL] = nrm
-	arr[Mesh.ARRAY_COLOR] = col
-	arr[Mesh.ARRAY_INDEX] = idx
-	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.material_override = _mat
-	mi.name = _key(fid, tx, tz)
-
 	var bytes := pos.size() * 12 + nrm.size() * 12 + col.size() * 16 + idx.size() * 4
-	return {"mi": mi, "bytes": bytes, "dist": 0.0}
+	return {"fid": fid, "bytes": bytes, "dist": 0.0, "pos": pos, "nrm": nrm, "col": col, "idx": idx}
 
 ## THE per-vertex placement (the ONE geometry rule, shared by _build_tile and the shared-edge gate):
 ## each column's ABSOLUTE world surface point at its sampled height, SUNK SINK blocks radially inward.
@@ -381,8 +491,8 @@ func true_vertex(fid: int, x: int, z: int) -> Vector3:
 	var g := int((res["heights"] as PackedFloat32Array)[0])
 	return _lattice_world(fid, float(x), float(g), float(z))
 
-## Build a tile and register it exactly as update() would (used by the memory gate's scripted pan). No
-## budget enforcement here — the gate asserts the ceiling holds under update()'s enforcement separately.
+## Build a tile and register + merge it exactly as update() would (used by the memory gate's scripted pan).
+## No budget enforcement here — the gate asserts the ceiling holds under update()'s enforcement separately.
 func gate_add_tile(fid: int, tx: int, tz: int) -> bool:
 	var key := _key(fid, tx, tz)
 	if _tiles.has(key):
@@ -390,14 +500,37 @@ func gate_add_tile(fid: int, tx: int, tz: int) -> bool:
 	var m := _build_tile(fid, tx, tz)
 	if m.is_empty():
 		return false
-	add_child(m["mi"])
 	_tiles[key] = m
-	_bytes += int(m["bytes"])
+	_src_bytes += int(m["bytes"])
+	_register_key(fid, key)
+	_remerge_facet(fid)
 	return true
 
-func total_bytes() -> int: return _bytes
+## TRUE footprint (§ NEVER-OOM): the CPU merge-source arrays PLUS the RenderingServer's merged upload
+## ≈ 2× the vertex bytes. The 8 MB ceiling binds on this, not on the raw vertex bytes.
+func total_bytes() -> int: return _src_bytes * RENDER_COPY_FACTOR
 func tile_count() -> int: return _tiles.size()
 func has_tile(fid: int, tx: int, tz: int) -> bool: return _tiles.has(_key(fid, tx, tz))
+
+## Draw-count gate surface (G-SKIN-DRAW): the number of live MeshInstance3Ds the skin renders — ONE per
+## live facet after the merge, NOT one per tile. This is the whole point of Part A; the gate asserts it is
+## ≤ the live-facet count and « tile_count().
+func mesh_instance_count() -> int:
+	# Count what ACTUALLY renders — MeshInstance3D children of this node — not the _facets bookkeeping, so
+	# the gate measures true draw calls and would catch any regression that re-introduced per-tile nodes.
+	var n := 0
+	for c in get_children():
+		if c is MeshInstance3D:
+			n += 1
+	return n
+
+## The number of distinct facets that currently own at least one tile — the theoretical minimum draw count
+## (mesh_instance_count must equal this after every merge).
+func distinct_facet_count() -> int:
+	var seen := {}
+	for key in _tiles.keys():
+		seen[int(_tiles[key]["fid"])] = true
+	return seen.size()
 
 ## Gate/telemetry: the farthest built tile centre from world point `pw`, over ALL facets the skin covers
 ## (not just the active one) — the honest reach of the current skin under the byte ceiling.

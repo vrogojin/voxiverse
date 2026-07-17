@@ -154,6 +154,25 @@ func _initialize() -> void:
 	_ok(dt_ms <= 1500.0, "G-SKIN-M3 — cover pass built in %.1f ms (design target <= 1500 ms)" % dt_ms)
 	_ok(skin2.total_bytes() <= SKIN.MAX_BYTES, "G-SKIN-M3 — cover pass respected the 8 MB ceiling")
 
+	# --- G-SKIN-DRAW — merged draw calls: ONE per LIVE FACET, not one per tile (§ Part A) ------------
+	# The whole point of the merge: the skin must render ~(live facets) MeshInstance3Ds, not ~(tiles). At
+	# the shipped tile count that was ~114 extra draws (fps 60→30); merged it is ≤ the candidate-facet set.
+	var mic := skin2.mesh_instance_count()
+	var dfc := skin2.distinct_facet_count()
+	var tc := skin2.tile_count()
+	print("  ... DRAW: %d MeshInstance3Ds for %d distinct live facets over %d tiles (candidate fids %d)"
+		% [mic, dfc, tc, fids.size()])
+	_ok(mic == dfc and mic > 0,
+		"G-SKIN-DRAW — %d merged draws == %d distinct live facets (exactly one merged draw per facet)" % [mic, dfc])
+	_ok(mic <= fids.size(),
+		"G-SKIN-DRAW — %d merged draws <= %d candidate facets (the ≤N_live_facets bound holds)" % [mic, fids.size()])
+	_ok(mic < tc,
+		"G-SKIN-DRAW — %d merged draws « %d tiles (merge cut skin draws ~%dx)" % [mic, tc, tc / maxi(mic, 1)])
+	# FALSIFY: a per-tile skin would issue tile_count draws — which EXCEEDS the ≤facets bound. Proving
+	# tc > dfc shows the merged assertion is non-trivial: without the merge it would fail.
+	_ok(tc > dfc,
+		"G-SKIN-DRAW-FALS — a per-tile skin (%d draws) would BREACH the %d-facet bound (the merge bound bites)" % [tc, dfc])
+
 	_done(0 if _fail == 0 else 1)
 
 ## The front-hemisphere neighbour facets of `fid` (a handful) — the candidate set the live skin covers.

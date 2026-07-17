@@ -68,7 +68,21 @@ common/max_physics_steps_per_frame=2
 ; oversubscription (3 workers) is accepted; the 16-slot pool has ample room. The
 ; count/* keys need only a re-export (baked into the exported project); the
 ; PTHREAD_POOL_SIZE change needs the ~24-min engine rebuild.
-; WALK-PERF L4b (docs/COSMOS-WALK-PERF-DESIGN.md) — MEASURED 2026-07-17 on the user's real laptop.
+; WALK-PERF L4b — REVERTED 2026-07-17 (ratio kept at 0.7). READ THIS BEFORE LOWERING IT AGAIN.
+; Capping workers 6->3 was SHIPPED and then REGRESSED IN THE FIELD: the user reported "longer and
+; more frequent freezes" and it was reverted. The metrics that justified it were MEASURED WRONG —
+; they were conditioned on `vox_gen>200`, i.e. "frame quality WHILE streaming". Fewer workers do
+; improve that (worst p50 80.5->38.9, fps p10 15.4->34.4) but cut throughput 33%, so streaming
+; LASTS LONGER — and while WALKING the backlog never clears at all (supply 23-35 blocks/s vs
+; ~90-100 demanded). Total experienced jank = (jank per frame) x (time spent janky): the cap
+; improved term 1 and made term 2 worse, and the player feels the product. Cross-session numbers
+; were also invalid (activity mix differed: 6.4% vs 26.6% vs 29.8% of windows streaming).
+; The real ceiling is ~130 ms/block (vs 13.7 ms native, ~10x WASM/GDScript penalty) — a worker-count
+; knob cannot fix a supply<demand problem; only cutting/reordering DEMAND can
+; (docs/COSMOS-STREAM-SCHED-DESIGN.md). Judge any future change on INTEGRATED metrics over a fixed
+; walk (% windows worst_ms>100, unconditional fps p10, time-to-cover-256-blocks, backlog growth),
+; never on stats conditioned on the streaming state.
+; The original A/B, kept for the record (it is real, just not the metric that matters):
 ; ratio 0.7 was tuned for big machines and OVERSUBSCRIBES a small client: the browser reports
 ; hardwareConcurrency≈8 (≈4 physical cores + SMT), so 0.7 handed 6 of 8 logical cores to voxel
 ; workers, starving the main thread, the renderer and the browser compositor. That — not the
@@ -85,7 +99,7 @@ common/max_physics_steps_per_frame=2
 ; client while still scaling (hw 14 -> N=6), unlike a flat 0.15 which would starve big machines.
 ; Revert knob: set back to 0.7. Memory-neutral, no rebuild (export-baked project setting).
 threads/count/minimum=3
-threads/count/ratio_over_max=0.4
+threads/count/ratio_over_max=0.7
 threads/count/margin_below_max=1
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
 ; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input

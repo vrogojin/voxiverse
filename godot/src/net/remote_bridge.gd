@@ -479,15 +479,29 @@ func _poll_voxel_main_thread_stats() -> void:
 func _wasm_heap_mb() -> float:
 	if not OS.has_feature("web"):
 		return -1.0
-	var v = JavaScriptBridge.eval(
+	# v1 tried `wasmMemory` / `HEAP8` from page scope and always read -1: Godot's web export keeps the
+	# Module (and its heap views) inside a closure, so they are NOT page-scope globals. Don't chase that.
+	# `performance.measureUserAgentSpecificMemory()` is the supported route and requires exactly the
+	# crossOriginIsolated state our COOP/COEP deploy ALWAYS guarantees (it is why threads work at all).
+	# It is ASYNC, so: kick a measurement off, stash the result on window, and read the PREVIOUS tick's
+	# value. A one-tick (250 ms) lag is irrelevant for a peak/steady-state gate. `_measuring` prevents
+	# stacking overlapping measurements (the call is not free).
+	JavaScriptBridge.eval(
 		"(function(){try{" +
-		"if(typeof wasmMemory!=='undefined'&&wasmMemory.buffer)return wasmMemory.buffer.byteLength;" +
-		"if(typeof HEAP8!=='undefined'&&HEAP8.buffer)return HEAP8.buffer.byteLength;" +
-		"return -1;}catch(e){return -1;}})()", true)
+		"if(!self.crossOriginIsolated||!performance.measureUserAgentSpecificMemory){window.__voxHeapBytes=-2;return;}" +
+		"if(window.__voxHeapBusy)return;" +
+		"window.__voxHeapBusy=1;" +
+		"performance.measureUserAgentSpecificMemory().then(function(m){window.__voxHeapBytes=m.bytes;window.__voxHeapBusy=0;})" +
+		".catch(function(){window.__voxHeapBytes=-3;window.__voxHeapBusy=0;});" +
+		"}catch(e){window.__voxHeapBytes=-4;}})()", true)
+	var v = JavaScriptBridge.eval("(typeof window.__voxHeapBytes==='number')?window.__voxHeapBytes:-1", true)
 	if v == null:
 		return -1.0
 	var b := float(v)
-	return -1.0 if b <= 0.0 else b / 1048576.0
+	# Negative sentinels are diagnostics, not sizes: -2 not crossOriginIsolated / API absent, -3 the
+	# promise rejected, -4 threw, -1 not yet resolved. Passed through so the trace says WHY it is absent
+	# rather than silently reading as a measured value.
+	return b if b < 0.0 else b / 1048576.0
 
 
 func _send_telemetry() -> void:

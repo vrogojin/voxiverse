@@ -68,8 +68,24 @@ common/max_physics_steps_per_frame=2
 ; oversubscription (3 workers) is accepted; the 16-slot pool has ample room. The
 ; count/* keys need only a re-export (baked into the exported project); the
 ; PTHREAD_POOL_SIZE change needs the ~24-min engine rebuild.
+; WALK-PERF L4b (docs/COSMOS-WALK-PERF-DESIGN.md) — MEASURED 2026-07-17 on the user's real laptop.
+; ratio 0.7 was tuned for big machines and OVERSUBSCRIBES a small client: the browser reports
+; hardwareConcurrency≈8 (≈4 physical cores + SMT), so 0.7 handed 6 of 8 logical cores to voxel
+; workers, starving the main thread, the renderer and the browser compositor. That — not the
+; allocator — is what made streaming jank: main-thread IPC collapses with zero locks involved,
+; which is why a mimalloc rebuild (measured, engine patch 0002) barely moved anything.
+;
+; A/B at gen>200, same build, ONLY this ratio changed (N=6 vs N=3):
+;   worst_ms p50  61.7 -> 37.6   | worst_ms p90 153.2 -> 112.4
+;   phys_ms  p90  32.88 -> 9.28  (-72%: the contention signature collapsing, for UNCHANGED code)
+;   fps p50  33.9 -> 47.8        | fps p10 21.7 -> 34.4  (+123% at the worst moments)
+;   cost: stationary drain 34.6 -> 23.1 blocks/s (-33%)
+; Worker count on small devices must be tuned for main-thread SMOOTHNESS, not drain: a slower fill
+; is barely perceptible, an 80 ms worst frame IS the experience. 0.4 keeps N=3 on this 8-thread
+; client while still scaling (hw 14 -> N=6), unlike a flat 0.15 which would starve big machines.
+; Revert knob: set back to 0.7. Memory-neutral, no rebuild (export-baked project setting).
 threads/count/minimum=3
-threads/count/ratio_over_max=0.7
+threads/count/ratio_over_max=0.4
 threads/count/margin_below_max=1
 ; Main-thread budget godot_voxel spends per frame APPLYING finished meshes (upload +
 ; scene-tree insert). At 12 ms that is ~72% of a 60fps frame → it starves render/input

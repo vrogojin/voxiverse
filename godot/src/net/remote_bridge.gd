@@ -151,6 +151,11 @@ var _win_vt_dropped_loads := 0      # max seen (counters are cumulative-ish per 
 var _win_vt_dropped_meshs := 0
 var _win_vt_updated := 0            # max updated_blocks in one frame (apply burst size)
 var _win_vt_seen := false           # any sample at all this window (module path present)
+# STREAM-SCHED T1: last window's cumulative per-class generator counters, so telemetry can report the WINDOW
+# delta (blocks + total ms per class) instead of an ever-growing total. See _send_telemetry for the epoch-reset
+# and racy-counter caveats.
+var _gen_prev_ct := [0, 0, 0, 0]
+var _gen_prev_us := [0, 0, 0, 0]
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
 var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
@@ -609,6 +614,34 @@ func _send_telemetry() -> void:
 	# MAIN-THREAD BREAKDOWN: fold in this window's VoxelTerrain::_process maxima (omitted entirely on the
 	# fallback path / before setup, so a missing key means "no module terrain", never "measured zero").
 	msg.merge(vt)
+	# STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the generator's per-class block
+	# histogram: 0 = air/cheap early-out, 1 = whole-block bulk fill, 2 = underground per-cell (the min_h-gate-
+	# FAILED class R1 targets), 3 = surface-crossing. §2.3's supply model ASSUMES a 30/25/25/20 mix and names
+	# that its own soft spot; these fields MEASURE it, so R1 is judged on the real histogram. Reported as this
+	# window's DELTA — gen_ms_N / gen_ct_N reads directly as mean ms/block for class N.
+	# Two caveats that must travel with the numbers:
+	#  • the counters are cumulative per generator EPOCH and restart at 0 when a crossing installs a new
+	#    generator, so a negative delta means "epoch changed", not negative work — floored at 0 (that one
+	#    window under-reports rather than emitting nonsense).
+	#  • TELEMETRY-GRADE: the voxel workers share one generator instance and race the `+=`, so both ct and ms
+	#    UNDERCOUNT under load. The per-class SHARES and the ms/block ratios are the signal; the absolute
+	#    block count is not (compare it against vox_gen/dropped, don't treat it as a census).
+	# `dropped_block_loads` — T1's other half, the R4 go/no-go stale share — already ships as vt_dropped_loads.
+	var gcs: Dictionary = {}
+	if is_instance_valid(world) and world.has_method("gen_class_stats"):
+		var g = world.call("gen_class_stats")
+		if g is Dictionary:
+			gcs = g as Dictionary
+	if not gcs.is_empty():
+		var cct: Array = gcs.get("ct", [])
+		var cus: Array = gcs.get("us", [])
+		for i in range(4):
+			var c := int(cct[i]) if i < cct.size() else 0
+			var u := int(cus[i]) if i < cus.size() else 0
+			msg["gen_ct_%d" % i] = maxi(0, c - int(_gen_prev_ct[i]))
+			msg["gen_ms_%d" % i] = snappedf(float(maxi(0, u - int(_gen_prev_us[i]))) / 1000.0, 0.01)
+			_gen_prev_ct[i] = c
+			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
 
 	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these

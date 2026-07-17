@@ -1993,6 +1993,46 @@ func terrain_main_thread_stats() -> Dictionary:
 	var d = _terrain.call("get_statistics")
 	return (d as Dictionary) if d is Dictionary else {}
 
+## STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §9.1) — the per-class generation histogram, summed over
+## EVERY live generator (the active slot + each pool slot owns its own instance, frozen on its own facet epoch;
+## _generator is the active slot's, so dedupe by instance id or a crossing double-counts it). Returns
+## {ct: [4 ints], us: [4 ints]} — class 0 air/cheap, 1 whole-block bulk, 2 underground per-cell (the
+## gate-failed class R1 targets), 3 surface-crossing. Counters are CUMULATIVE per epoch and telemetry-grade
+## (racy across the workers sharing one generator — see the generator's gen_ct_* comment); an epoch install
+## resets them to 0, so a consumer differencing windows must floor negative deltas at 0. Empty on the fallback
+## path / before setup.
+func gen_class_stats() -> Dictionary:
+	var ct := [0, 0, 0, 0]
+	var us := [0, 0, 0, 0]
+	var seen := {}
+	var gens: Array = []
+	if _generator != null:
+		gens.append(_generator)
+	for fid in _pool.keys():
+		var g = _pool[fid].get("generator")
+		if g != null:
+			gens.append(g)
+	var any := false
+	for g in gens:
+		var gid := (g as Object).get_instance_id()
+		if seen.has(gid):
+			continue
+		seen[gid] = true
+		if not (g as Object).has_method("gen_stats"):
+			continue
+		var d = (g as Object).call("gen_stats")
+		if not (d is Dictionary):
+			continue
+		any = true
+		var dct: Array = (d as Dictionary).get("ct", [])
+		var dus: Array = (d as Dictionary).get("us", [])
+		for i in range(4):
+			if i < dct.size():
+				ct[i] += int(dct[i])
+			if i < dus.size():
+				us[i] += int(dus[i])
+	return {"ct": ct, "us": us} if any else {}
+
 func pool_neighbour_count() -> int:
 	return maxi(0, _pool.size() - (1 if _pool.has(_pool_active) else 0))
 ## Every LIVE facet id in the pool (active + neighbours) — the far-ring excluded set + the gate's ≤1+4 cap check.
@@ -2743,6 +2783,29 @@ var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples a
 var fp_bulk := false
 var bulk_stone_arid := -1
 var bulk_deepslate_arid := -1
+# STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the per-class generation timer. §2.3's
+# supply model rests on an ASSUMED block-class mix (30% air/cheap, 25% bulk-qualified, 25% gate-failed, 20%
+# surface); the doc itself names that its soft spot. These count blocks + accumulate usec per class so the mix is
+# MEASURED before R1 is judged. Classes: 0 = air / cheap early-out, 1 = whole-block bulk fill
+# (FP_BULK_UNDERGROUND), 2 = underground per-cell (the min_h-gate-FAILED class R1 targets), 3 = surface-crossing
+# per-cell.
+#
+# THREADING (read this before "fixing" it): several voxel workers share ONE generator instance, so these `+= `
+# are racing read-modify-writes and WILL lose updates under contention. That is deliberate and bounded:
+#   • they are plain ints (never Packed*Array) — a Variant int store is a word write with no refcount, so the
+#     race costs LOST UPDATES only, never corruption. A Packed*Array member would be far worse here: a
+#     main-thread read bumps its refcount and the next worker write silently CoW-detaches the buffer.
+#   • no lock, ever: this is the hot path R1 exists to shrink; a mutex here would measure the mutex.
+# ⇒ these are TELEMETRY-GRADE (undercounts under load, monotonic, ratios stable — mix shares are what T1 is for),
+# NOT an accounting ledger. Same tolerated-race class as `oob_seen` below. Read via gen_stats().
+var gen_ct_0 := 0
+var gen_ct_1 := 0
+var gen_ct_2 := 0
+var gen_ct_3 := 0
+var gen_us_0 := 0
+var gen_us_1 := 0
+var gen_us_2 := 0
+var gen_us_3 := 0
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -2767,6 +2830,32 @@ const BULK_BEDROCK_TOP_Y := -59
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
 
+## STREAM-SCHED T1: this generator epoch's per-class block counts + usec. Cumulative since the epoch was
+## installed (a facet/face flip builds a FRESH generator → the counters restart at 0; the reader must treat a
+## decrease as an epoch change, not as negative work). Telemetry-grade — see the gen_ct_* declaration.
+func gen_stats() -> Dictionary:
+	return {
+		"ct": [gen_ct_0, gen_ct_1, gen_ct_2, gen_ct_3],
+		"us": [gen_us_0, gen_us_1, gen_us_2, gen_us_3],
+	}
+
+## Add one block's elapsed usec into class `cls`. Racy by design (see gen_ct_* above).
+func _gen_acc(cls: int, t0: int) -> void:
+	var d = Time.get_ticks_usec() - t0
+	match cls:
+		0:
+			gen_ct_0 += 1
+			gen_us_0 += d
+		1:
+			gen_ct_1 += 1
+			gen_us_1 += d
+		2:
+			gen_ct_2 += 1
+			gen_us_2 += d
+		_:
+			gen_ct_3 += 1
+			gen_us_3 += d
+
 func _generate_block(buffer, origin_in_voxels, lod):
 	# FP-R0 §B stride: shipped path early-outs on lod!=0 (gen_lod_probe=false). The probe generator strides the
 	# LOD0 sampling by s=2^lod so a coarse buffer cell (x,y,z) reads LOD0 voxel (ox+x*s, oy+y*s, oz+z*s). At
@@ -2776,6 +2865,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 		if not gen_lod_probe:
 			return
 		s = 1 << lod
+	# STREAM-SCHED T1 (§9.1): start the per-class timer AFTER the lod early-out (that return is not a block
+	# generation at all, it is the shipped "this generator only serves lod0" contract — counting it would
+	# dilute the mix with zero-cost no-ops). Every return below routes through _gen_acc exactly once.
+	var _t0 = Time.get_ticks_usec()
 	var size = buffer.get_size()
 	var ox = origin_in_voxels.x
 	var oy = origin_in_voxels.y
@@ -2808,8 +2901,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# pass at all. Uses only CONSTANTS (no noise). MAX_SURFACE_Y is a proven upper bound on
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
 	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
+		_gen_acc(0, _t0)                                  # T1 class 0: constant air early-out
 		return
 	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
+		_gen_acc(0, _t0)
 		return
 	# FP-S1(b) COSMOS FACETED (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §5(a)/§8) — BLOCK-level facet-domain
 	# early-out, BEFORE the per-column profile pass. junction_modify() (the buffer-write exit below) masks every
@@ -2819,6 +2914,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# masks every cell (never skips a block with any interior/straddle cell → identical voxels emitted, just faster).
 	# Gated by gen_facet >= 0 (faceted only) → flat / non-faceted byte-identical. Frozen gen_facet → worker-safe.
 	if gen_facet >= 0 and FacetAtlas.block_all_air(gen_facet, ox, oy, oz, size.x, size.y, size.z, s):
+		_gen_acc(0, _t0)                                  # T1 class 0: beyond-ridge all-air early-out
 		return
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
@@ -2909,6 +3005,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 					interior = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
 				if interior:
 					buffer.fill(fill_arid, ch)
+					_gen_acc(1, _t0)                      # T1 class 1: whole-block bulk fill
 					return
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
@@ -2917,6 +3014,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var top = max_h + max_above
 	if sea > top: top = sea
 	if oy > top:
+		_gen_acc(0, _t0)                                  # T1 class 0: profiled all-air block
 		return
 
 	for z in range(size.z):
@@ -3111,6 +3209,12 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						oob_seen = true       # write-once telemetry (idempotent → race-safe); surfaced by verify
 						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
+	# STREAM-SCHED T1 (§9.1): the per-cell emit loop finished. Class 2 = the block sits wholly BELOW every
+	# column's surface, i.e. the UNDERGROUND block that failed the whole-block bulk gate — exactly the class
+	# R1 targets, and the share §2.3 models at 25%. Class 3 = it crosses a surface. min_h is only computed on
+	# the flat branch (curved leaves it at its +inf init), so curved blocks report as surface-crossing rather
+	# than silently landing in class 2.
+	_gen_acc(2 if (flat_world and oy + size.y * s <= min_h) else 3, _t0)
 """
 	# FP-S1(e) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 4 note / §8): `src` is a CONSTANT literal —
 	# the facet epoch, lod-probe flag, frame M_win and all frozen tables are set as INSTANCE properties below, never

@@ -543,6 +543,14 @@ const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates 
 ## node-transform scale). REPLACES the rejected O1O4 §2.8 H_FARSWAP impostor-swap (SPACE-NAV R1). Flipped ON at
 ## export after the AM remote-bridge screendiff proves the climb is pop-free (§10 SN3 live-only).
 const FP_SCALED_BODY := false
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
+## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
+## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the
+## RemoteBridge telemetry. Default FALSE ⇒ BYTE-IDENTICAL: the NavState is never created, CosmosNav is a
+## pure DEAD static, the HUD/telemetry are unchanged (nav_telemetry() returns {} ⇒ the guarded merge adds
+## nothing). The five modes are RE-EXPRESSIONS of the ONE SN1 f64 BCI state (§0.1) — a mode flip touches
+## NOTHING physical, so this flag adds zero per-frame allocation and cannot perturb the scene or state.
+const SN_NAV_MODES := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

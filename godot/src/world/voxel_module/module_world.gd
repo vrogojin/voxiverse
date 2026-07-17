@@ -2787,6 +2787,11 @@ var bulk_deepslate_arid := -1
 # column-granular twin of fp_bulk. Reuses the SAME two frozen fill ARIDs (a column's deep run writes exactly
 # the cube a whole-block fill would), so it needs no extra table. Frozen by the loader, read-only on workers.
 var fp_colbulk := false
+# STREAM-SCHED R7 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.5 / §9.6): CubeSphere.FP_STAMP's snapshot — the
+# scatter pass that puts the strata/ore variants back into fp_colbulk's deep fill runs, making the column
+# bulk fill BYTE-IDENTICAL to the per-cell path instead of an accepted appearance loss. Meaningless without
+# fp_colbulk (it stamps exactly the cells fp_colbulk's fill_area runs wrote) → the emit gate ANDs the two.
+var fp_stamp := false
 # STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the per-class generation timer. §2.3's
 # supply model rests on an ASSUMED block-class mix (30% air/cheap, 25% bulk-qualified, 25% gate-failed, 20%
 # surface); the doc itself names that its soft spot. These count blocks + accumulate usec per class so the mix is
@@ -3045,6 +3050,19 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# massifs, so this costs ≤3 cells of fill per column — but the bound no longer RESTS on that measurement.
 	# The ring reads through the same per-block pcache memo, so the 256 in-block columns are memo hits and only
 	# the ~68 ring columns sample noise. Built only when cb_on; worker-local (never shared).
+	# STREAM-SCHED R7 (§2.5/§9.6) — FP_STAMP: record each column's deep-region top so the scatter pass below
+	# knows EXACTLY which cells the fill runs wrote (dtop is PER-COLUMN: it depends on that column's 3×3 gmin).
+	# The stamp must never touch a cell the per-cell path resolved — that cell is already exact, and a stamp
+	# would overwrite it with a deep-only guess. Init to oy = "this column filled nothing"; the emit loop
+	# overwrites it wherever cb_on computes a real dtop. NEVER-OOM ledger: ONE worker-local PackedInt32Array
+	# of size.x*size.z (1 KiB for a 16³ block), allocated only when stamping is on, freed with the frame.
+	# No cache, no cross-block retention, no growth with view distance.
+	var stamp_on = cb_on and fp_stamp
+	var cdtop: PackedInt32Array
+	if stamp_on:
+		cdtop = PackedInt32Array()
+		cdtop.resize(size.x * size.z)
+		cdtop.fill(oy)
 	var gring: PackedInt32Array
 	var grw = size.x + 2
 	if cb_on:
@@ -3096,6 +3114,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						if gn < gmin: gmin = gn
 				deep_top = gmin - BULK_MAX_FILLER
 				var dtop = mini(cb_top, deep_top)     # exclusive top of this column's deep region in the block
+				if stamp_on:
+					cdtop[idx2] = dtop                # R7: the scatter's per-column deep bound (see below)
 				if dtop > oy:
 					# Two runs at most; both are half-open [lo, hi) in WORLD y, written in BUFFER-local
 					# coords. Stone: wy > −16. Deepslate: wy < −24 AND wy >= −59 (below −59 bedrock can
@@ -3313,6 +3333,133 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						oob_seen = true       # write-once telemetry (idempotent → race-safe); surfaced by verify
 						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
+
+	# ---- STREAM-SCHED R7 (§2.5/§9.6) — FP_STAMP: the gather→scatter inversion --------------------------
+	# The emit loop above fill_area'd every column's deep run with PLAIN stone/deepslate, which is the whole
+	# of R1's appearance loss: the strata blobs and ore pockets that the per-cell path would have written
+	# there are gone. Rather than ask each of 4096 cells "is a blob here?" (the gather, and the single
+	# biggest term in the 11.9 ms per-cell pass), enumerate the blobs that can REACH this block and stamp
+	# them. That is exact and LOCAL because a blob is confined to its own lattice cell:
+	# TerrainConfig.strata_blob/ore_blob clamp the centre jitter so centre−r >= cell_lo and
+	# centre+r <= cell_lo+L. Note the PLUS face touches cell_lo+L, which is the next lattice cell's first
+	# cell — the sphere bleeds by exactly ONE cell in +x/+y/+z, and the gather truncates that bleed
+	# implicitly (a query there derives the NEXT lattice cell and never consults this blob). So the scatter
+	# clips every stamp to the blob's OWN lattice cell; that clip is not an optimisation, it is what makes
+	# the scatter equal the gather. Byte-identity is otherwise structural: every blob parameter comes from
+	# the same TerrainConfig statics both paths call, so the two cannot drift.
+	#
+	# The stamp writes ONLY cells the fill runs actually wrote (the `wy < cdtop and (above −16 or below −24
+	# and >= −59)` test mirrors the emit loop's `continue` verbatim). Cells the per-cell path resolved are
+	# already exact and are never touched; the −24..−16 dither rows and the sub-−59 bedrock rows were never
+	# filled and are never stamped. Every stamped cell is a deep interior full cube (modifier 0, no liquid,
+	# no state), so its ARID is cube_arid[id] — the same table the per-cell write site resolves it through,
+	# behind the same OOB fence. flat_world + s == 1 + cubic block are cb_on preconditions, so there is no
+	# folding, no J⁻¹ rotation (modifier 0) and no junction_modify (cb_on already proved the whole block
+	# interior to all four ridges) to reproduce here.
+	if stamp_on:
+		var bx1 = ox + size.x - 1
+		var by1 = oy + size.y - 1
+		var bz1 = oz + size.z - 1
+		# --- strata: 16³ lattice → 1-8 cells over a 16³ block ---
+		var sl = TerrainConfig.strata_lattice()
+		for lx in range(floori(ox / float(sl)), floori(bx1 / float(sl)) + 1):
+			for ly in range(floori(oy / float(sl)), floori(by1 / float(sl)) + 1):
+				for lz in range(floori(oz / float(sl)), floori(bz1 / float(sl)) + 1):
+					var sb = TerrainConfig.strata_blob(lx, ly, lz)
+					if sb.w == 0:
+						continue
+					var sr = sb.w
+					# sphere bbox ∩ the blob's OWN lattice cell ∩ this block
+					var sx0 = maxi(maxi(sb.x - sr, lx * sl), ox)
+					var sx1 = mini(mini(sb.x + sr, lx * sl + sl - 1), bx1)
+					var sy0 = maxi(maxi(sb.y - sr, ly * sl), oy)
+					var sy1 = mini(mini(sb.y + sr, ly * sl + sl - 1), by1)
+					var sz0 = maxi(maxi(sb.z - sr, lz * sl), oz)
+					var sz1 = mini(mini(sb.z + sr, lz * sl + sl - 1), bz1)
+					if sx0 > sx1 or sy0 > sy1 or sz0 > sz1:
+						continue
+					var svar = TerrainConfig.strata_variant_of(lx, ly, lz, sb.y)
+					# The deepslate-region rule (TerrainConfig._deep_family): a variant replaces STONE, but in
+					# the deepslate region deepslate stays dominant and only the sulfur/cinnabar pockets punch
+					# through. Inside a fill run the base is decided by y ALONE (the dither band is excluded
+					# from the runs), so a non-pocket variant simply cannot write below −24 — skip those rows
+					# instead of testing every cell.
+					var punches = TerrainConfig.deep_pocket_variant(svar)
+					var sa = cube_arid[svar] if svar < ncube else svar
+					if sa < 0 or sa >= mcount:
+						continue                      # unbaked → leave the plain fill (never a stale index)
+					for wy in range(sy0, sy1 + 1):
+						if wy < BULK_DEEPSLATE_FULL_Y and not punches:
+							continue                  # deepslate region, ordinary strata → deepslate wins
+						var dy = wy - sb.y
+						for wz in range(sz0, sz1 + 1):
+							var dz = wz - sb.z
+							var dyz = dy * dy + dz * dz
+							if dyz > sr * sr:
+								continue
+							for wx in range(sx0, sx1 + 1):
+								var dx = wx - sb.x
+								if dx * dx + dyz > sr * sr:
+									continue
+								var ci = (wz - oz) * size.x + (wx - ox)
+								if wy >= cdtop[ci]:
+									continue          # per-cell territory — already exact
+								if wy > BULK_DEEPSLATE_TOP_Y or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y):
+									buffer.set_voxel(sa, wx - ox, wy - oy, wz - oz, ch)
+		# --- ore: 6³ lattice → up to 4³ cells over a 16³ block, ~45 % populated ---
+		var ol = TerrainConfig.ore_lattice()
+		for lx in range(floori(ox / float(ol)), floori(bx1 / float(ol)) + 1):
+			for ly in range(floori(oy / float(ol)), floori(by1 / float(ol)) + 1):
+				for lz in range(floori(oz / float(ol)), floori(bz1 / float(ol)) + 1):
+					var ob = TerrainConfig.ore_blob(lx, ly, lz)
+					if ob.w == 0:
+						continue
+					var orr = ob.w
+					var ox0 = maxi(maxi(ob.x - orr, lx * ol), ox)
+					var ox1 = mini(mini(ob.x + orr, lx * ol + ol - 1), bx1)
+					var oy0 = maxi(maxi(ob.y - orr, ly * ol), oy)
+					var oy1 = mini(mini(ob.y + orr, ly * ol + ol - 1), by1)
+					var oz0 = maxi(maxi(ob.z - orr, lz * ol), oz)
+					var oz1 = mini(mini(ob.z + orr, lz * ol + ol - 1), bz1)
+					if ox0 > ox1 or oy0 > oy1 or oz0 > oz1:
+						continue
+					# Ore TYPE is per (blob, QUERY COLUMN): the weights read the column's biome/c (emerald
+					# needs c > 0.4, badlands quadruples gold), so it is hoisted per column — never per blob
+					# (a different world) and never per cell (the cost R7 exists to remove).
+					for wz in range(oz0, oz1 + 1):
+						var dz = wz - ob.z
+						for wx in range(ox0, ox1 + 1):
+							var dx = wx - ob.x
+							var dxz = dx * dx + dz * dz
+							if dxz > orr * orr:
+								continue
+							var ci = (wz - oz) * size.x + (wx - ox)
+							var pc = profs[ci]
+							var ore = TerrainConfig.ore_pick_for(lx, ly, lz, ob.y, int(pc.y), pc.z)
+							if ore < 0:
+								continue
+							var ctop = cdtop[ci]
+							for wy in range(oy0, oy1 + 1):
+								if wy >= ctop:
+									continue          # per-cell territory — already exact
+								if not (wy > BULK_DEEPSLATE_TOP_Y or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
+									continue          # dither / bedrock rows: never filled, never stamped
+								var dy = wy - ob.y
+								if dxz + dy * dy > orr * orr:
+									continue
+								# The HOST (base gradient + any strata blob just stamped) decides both whether
+								# ore may replace it at all and which variant it takes — read from the SAME
+								# _deep_family the gather uses rather than re-deriving it here.
+								var host = TerrainConfig.deep_family_at(wx, wy, wz)
+								if not TerrainConfig.ore_hosts(host):
+									continue
+								var oid = TerrainConfig.ore_apply(ore, wy, host)
+								if oid == host:
+									continue          # outside the ore's own y-band → host stands
+								var oa = cube_arid[oid] if oid < ncube else oid
+								if oa < 0 or oa >= mcount:
+									continue          # unbaked → leave the host (never a stale index)
+								buffer.set_voxel(oa, wx - ox, wy - oy, wz - oz, ch)
 	# STREAM-SCHED T1 (§9.1): the per-cell emit loop finished. Class 2 = the block sits wholly BELOW every
 	# column's surface, i.e. the UNDERGROUND block that failed the whole-block bulk gate — exactly the class
 	# R1 targets, and the share §2.3 models at 25%. Class 3 = it crosses a surface. min_h is only computed on
@@ -3364,6 +3511,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
 	gen.set("fp_bulk", CubeSphere.FP_BULK_UNDERGROUND)
 	gen.set("fp_colbulk", CubeSphere.FP_COLBULK)         # STREAM-SCHED R1 (§9.2): column-granular bulk fill
+	gen.set("fp_stamp", CubeSphere.FP_STAMP)             # STREAM-SCHED R7 (§9.6): lossless blob scatter over R1's fills
 	var _bstone := BlockCatalog.STONE
 	gen.set("bulk_stone_arid", _cube_arid[_bstone] if _bstone >= 0 and _bstone < _cube_arid.size() else -1)
 	var _bdeep := BlockCatalog.id_of(&"deepslate")

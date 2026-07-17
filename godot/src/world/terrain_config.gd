@@ -1972,6 +1972,37 @@ static func _band_color(x: int, y: int, z: int) -> int:
 	return _BAND_SEQ[posmod(y + shift, _BAND_SEQ.size())]
 
 # --- stage: deepslate gradient + strata blobs (WGC §6.5) ----------------------
+
+## STREAM-SCHED R7 (§9.6): _deep_family under its public name — the ore scatter needs a cell's HOST
+## (base gradient + any strata blob) to decide the stone/deepslate ore variant, and must read it from
+## the SAME function the gather does. Not a reimplementation: a one-line forward.
+static func deep_family_at(x: int, y: int, z: int) -> int:
+	return _deep_family(x, y, z)
+
+## Can ore replace `host`? _ore_at's first guard (:2024-2025), exposed so the R7 scatter applies the
+## identical rule instead of restating "stone or deepslate" in a second place. §9.6 shared static.
+static func ore_hosts(host: int) -> bool:
+	if not _ids_ready:
+		_ensure_ids()
+	return host == BlockCatalog.STONE or host == _ID_DEEPSLATE
+
+## Is strata variant `v` one of the deep pockets that punch THROUGH deepslate? _deep_family's dominance
+## rule (:1985-1990 pre-R7) as a predicate: in the deepslate region an ordinary granite/diorite/... blob
+## loses to deepslate and only sulfur/cinnabar wins. The R7 scatter uses it to skip whole rows rather than
+## re-testing the rule per cell (and, more importantly, to state the rule in ONE place). §9.6 shared static.
+static func deep_pocket_variant(v: int) -> bool:
+	if not _ids_ready:
+		_ensure_ids()
+	return v == _ID_SULFUR or v == _ID_CINNABAR
+
+## The strata/ore lattice pitches, for the R7 scatter's block→lattice-cell enumeration (§2.5). Read once
+## per block, so a static accessor rather than a second public copy of the constant that could drift.
+static func strata_lattice() -> int:
+	return _STRATA_L
+
+static func ore_lattice() -> int:
+	return _ORE_L
+
 static func _deep_family(x: int, y: int, z: int) -> int:
 	var base := BlockCatalog.STONE
 	if y < DEEPSLATE_FULL_Y:
@@ -1990,25 +2021,34 @@ static func _deep_family(x: int, y: int, z: int) -> int:
 			return variant
 	return base
 
-## Strata blob at (x,y,z) or -1. One 16^3 lattice; the blob centre is jitter-
-## clamped so centre +/- radius stays inside its lattice cell (the TreeGen
-## containment trick), so a query consults exactly ONE lattice cell.
-static func _strata_at(x: int, y: int, z: int) -> int:
-	var lx := floori(x / float(_STRATA_L))
-	var ly := floori(y / float(_STRATA_L))
-	var lz := floori(z / float(_STRATA_L))
+## STREAM-SCHED R7 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.5/§9.6) — THE one derivation of a strata
+## blob's parameters, keyed by its LATTICE CELL. Returns (cx, cy, cz, r); r == 0 means "this cell holds
+## no blob" (an existing blob always has r in 3..7, so 0 is an unambiguous sentinel). Both the per-cell
+## GATHER (_strata_at) and the FP_STAMP SCATTER call this, so the two paths cannot drift — byte-identity
+## is structural, not a parallel reimplementation that happens to agree today.
+##
+## CONTAINMENT (the fact the scatter rides on): cx = lo + r + j with j in [0, _STRATA_L - 2r], so
+## cx - r >= lo and cx + r <= lo + _STRATA_L. The MINUS face is inside the cell; the PLUS face reaches
+## lo + _STRATA_L, which is the FIRST cell of the next lattice cell — the sphere bleeds by exactly one
+## cell in +x/+y/+z. The gather truncates that bleed implicitly (a query at lo + _STRATA_L derives the
+## NEXT lattice cell and never consults this blob), so the scatter MUST clip its stamp to the blob's own
+## lattice cell [lo, lo + _STRATA_L - 1] to reproduce it. Returns a Vector4i (a value type) and not a
+## PackedInt32Array: _strata_at is the hot per-cell path and must not heap-allocate per call.
+static func strata_blob(lx: int, ly: int, lz: int) -> Vector4i:
 	if _hash01_3d(lx, ly, lz, _SALT_STRATA_EXIST) >= 0.25:
-		return -1
+		return Vector4i.ZERO
 	var r := 3 + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_R) * 5.0)    # 3..7
 	var span := maxi(_STRATA_L - 2 * r, 0)
-	var cx := lx * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JX) * float(span + 1))
-	var cy := ly * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JY) * float(span + 1))
-	var cz := lz * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JZ) * float(span + 1))
-	var dx := x - cx
-	var dy := y - cy
-	var dz := z - cz
-	if dx * dx + dy * dy + dz * dz > r * r:
-		return -1
+	return Vector4i(
+		lx * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JX) * float(span + 1)),
+		ly * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JY) * float(span + 1)),
+		lz * _STRATA_L + r + int(_hash01_3d(lx, ly, lz, _SALT_STRATA_JZ) * float(span + 1)),
+		r)
+
+## The strata VARIANT id of the blob in lattice cell (lx,ly,lz), whose centre y is `cy`. Constant over
+## the whole blob (it is decided from the LATTICE hashes, never the query cell) — which is what lets the
+## scatter evaluate it once per blob instead of once per cell. §9.6 shared static; see strata_blob.
+static func strata_variant_of(lx: int, ly: int, lz: int, cy: int) -> int:
 	# Deep pockets (below -32): rare sulfur/cinnabar; otherwise a common stone strata.
 	if cy < -32:
 		var d := _hash01_3d(lx, ly, lz, _SALT_STRATA_VAR + 1)
@@ -2019,31 +2059,73 @@ static func _strata_at(x: int, y: int, z: int) -> int:
 	var h := _hash01_3d(lx, ly, lz, _SALT_STRATA_VAR)
 	return _STRATA_SEQ[int(h * float(_STRATA_SEQ.size())) % _STRATA_SEQ.size()]
 
+## Strata blob at (x,y,z) or -1. One 16^3 lattice; a query consults exactly ONE lattice cell (its own),
+## which both bounds the cost and truncates the blob's one-cell +face bleed (see strata_blob).
+static func _strata_at(x: int, y: int, z: int) -> int:
+	var lx := floori(x / float(_STRATA_L))
+	var ly := floori(y / float(_STRATA_L))
+	var lz := floori(z / float(_STRATA_L))
+	var b := strata_blob(lx, ly, lz)
+	if b.w == 0:
+		return -1
+	var dx := x - b.x
+	var dy := y - b.y
+	var dz := z - b.z
+	if dx * dx + dy * dy + dz * dz > b.w * b.w:
+		return -1
+	return strata_variant_of(lx, ly, lz, b.y)
+
 # --- stage: ores (WGC §6.6) — deterministic lattice, triangle distributions ---
+
+## STREAM-SCHED R7 (§2.5/§9.6) — THE one derivation of an ore blob's parameters, keyed by its LATTICE
+## CELL. Returns (cx, cy, cz, r); r == 0 means no blob (an existing blob has r in 1..2). The gather
+## (_ore_at) and the FP_STAMP scatter both call it. Containment is the same shape as strata_blob's:
+## cx - r >= lo, cx + r <= lo + _ORE_L — inside on the minus face, one cell PAST the cell on the plus
+## face, which the gather truncates and the scatter must therefore clip to [lo, lo + _ORE_L - 1].
+static func ore_blob(lx: int, ly: int, lz: int) -> Vector4i:
+	if _hash01_3d(lx, ly, lz, _SALT_ORE_EXIST) >= 0.55:
+		return Vector4i.ZERO
+	var r := 1 + int(_hash01_3d(lx, ly, lz, _SALT_ORE_R) * 2.0)   # 1..2
+	var span := maxi(_ORE_L - 2 * r, 0)
+	return Vector4i(
+		lx * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JX) * float(span + 1)),
+		ly * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JY) * float(span + 1)),
+		lz * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JZ) * float(span + 1)),
+		r)
+
+## The ore TYPE of the blob in lattice cell (lx,ly,lz) with centre y `cy`, AS SEEN FROM a query column of
+## climate (biome, c), or -1. NOT blob-constant: the weights read the QUERY column's biome/c (emerald
+## needs c > 0.4, badlands quadruples gold), so one blob can be emerald in a highland column and iron one
+## column over. That is why the scatter must evaluate this per COLUMN of the blob's bbox and can only
+## hoist it out of the y loop — hoisting it per blob would be a different world (§2.5). §9.6 shared static.
+static func ore_pick_for(lx: int, ly: int, lz: int, cy: int, biome: int, c: float) -> int:
+	return _pick_ore(cy, biome, c, lx, ly, lz)
+
+## Project ore type `ore` onto host material `host` at world y — the y-band clip + host variant choice,
+## i.e. _ore_at's tail (:2044-2046 pre-R7). Returns `host` unchanged when the cell is outside the ore's
+## own y-band, so e.g. diamond never appears above -40 even inside a diamond blob. §9.6 shared static.
+static func ore_apply(ore: int, y: int, host: int) -> int:
+	if ore < 0 or _ore_density(ore, y) <= 0.0:
+		return host
+	return _ORE_DEEP[ore] if host == _ID_DEEPSLATE else _ORE_STONE[ore]
+
 static func _ore_at(x: int, y: int, z: int, host: int, biome: int, c: float) -> int:
 	if host != BlockCatalog.STONE and host != _ID_DEEPSLATE:
 		return host                              # ore only replaces stone/deepslate
 	var lx := floori(x / float(_ORE_L))
 	var ly := floori(y / float(_ORE_L))
 	var lz := floori(z / float(_ORE_L))
-	if _hash01_3d(lx, ly, lz, _SALT_ORE_EXIST) >= 0.55:
+	var b := ore_blob(lx, ly, lz)
+	if b.w == 0:
 		return host
-	var r := 1 + int(_hash01_3d(lx, ly, lz, _SALT_ORE_R) * 2.0)   # 1..2
-	var span := maxi(_ORE_L - 2 * r, 0)
-	var cx := lx * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JX) * float(span + 1))
-	var cy := ly * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JY) * float(span + 1))
-	var cz := lz * _ORE_L + r + int(_hash01_3d(lx, ly, lz, _SALT_ORE_JZ) * float(span + 1))
-	var dx := x - cx
-	var dy := y - cy
-	var dz := z - cz
-	if dx * dx + dy * dy + dz * dz > r * r:
+	var dx := x - b.x
+	var dy := y - b.y
+	var dz := z - b.z
+	if dx * dx + dy * dy + dz * dz > b.w * b.w:
 		return host
 	# Ore TYPE is decided once per blob (at its centre y); the individual voxel is
 	# clipped to that ore's own y-band, so e.g. diamond never appears above -40.
-	var ore := _pick_ore(cy, biome, c, lx, ly, lz)
-	if ore < 0 or _ore_density(ore, y) <= 0.0:
-		return host
-	return _ORE_DEEP[ore] if host == _ID_DEEPSLATE else _ORE_STONE[ore]
+	return ore_apply(ore_pick_for(lx, ly, lz, b.y, biome, c), y, host)
 
 ## Triangle (or edge) distribution density for ore `i` at world y, in [0,1].
 static func _ore_density(i: int, y: int) -> float:

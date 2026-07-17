@@ -138,6 +138,27 @@ const FP_BULK_UNDERGROUND := false
 ## below a column's biome filler. Any FUTURE deep carver (caves, dungeons) must update BOTH gates together.
 const FP_COLBULK := false
 
+## COSMOS STREAM-SCHED R7 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.5 / §9.6) — the gather→scatter inversion
+## that makes FP_COLBULK's bulk fill LOSSLESS. FP_COLBULK's deep fill_area writes plain stone/deepslate,
+## flattening the interior strata/ore VARIANTS — an accepted loss, but one that costs it the FLAT gate
+## (verify_feature's coast/TYPE tests are strict truth-mirrors of TerrainConfig.generated_cell over EVERY
+## non-air cell, so any bulk fill fails them by construction). R7 puts the variants back: instead of asking
+## all 4096 cells "is a blob here?" (the GATHER), it enumerates the handful of blobs that can reach the
+## block and stamps them (the SCATTER). Exact and local because a blob is confined to its lattice cell
+## (see TerrainConfig.strata_blob), so the only blobs that can touch a block live in the lattice cells
+## overlapping it — 1-8 strata cells (16³ pitch) and ~27-64 ore cells (6³ pitch, ~45% populated).
+## The output is byte-identical to the per-cell path BY SHARED CONSTRUCTION: both paths derive every blob
+## parameter from the same TerrainConfig statics (strata_blob / strata_variant_of / ore_blob /
+## ore_pick_for / ore_apply / deep_family_at), so they cannot drift. With FP_COLBULK + FP_STAMP the
+## generator is EXACT — no appearance loss and no gate carve-out (FLAT reads 6035/0).
+## Requires FP_COLBULK (it stamps that flag's deep runs, and only the cells those runs actually wrote —
+## the −24..−16 dither rows and the sub-−59 bedrock rows are per-cell already and are never stamped).
+## Does NOT cover FP_BULK_UNDERGROUND's whole-block fill, which returns before the stamp pass and keeps
+## its own accepted loss. Default OFF → not a byte of the generator changes (FLAT pin 6035/0 stays).
+## Truth gate: src/tools/verify_stamp.gd — a HARD cell-for-cell equality assert (fill+stamp == per-cell)
+## over blocks spanning surface/deep/coast/mountain/deepslate-band/bedrock, not a lossy-appearance oracle.
+const FP_STAMP := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB

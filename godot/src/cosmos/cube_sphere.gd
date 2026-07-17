@@ -515,6 +515,24 @@ const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, lin
 ## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
 const ORBITAL_SKY := false
 
+## COSMOS ORBITAL O1 / SPACE-NAV SN1 (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §2.1, docs/COSMOS-SPACE-NAV-DESIGN.md
+## §10 SN1) — the ORBITAL substrate master flag + its constants. FP_M3_ORBIT defaults FALSE ⇒ the engine is
+## BYTE-IDENTICAL: nothing below is created, the CosmosGravity/OrbitalState kernels are pure statics DEAD with the
+## flag off, and SURFACE/FLY locomotion is untouched. The blend band is radial altitude h = |p_fixed| − R_body:
+## below H_BLEND_LO = pure shipped lattice feel gravity (walking game intact); above H_BLEND_HI = pure GM_dyn/r²
+## inertial regime; in between a slerp/lerp blend (CosmosGravity.gravity_fixed). NOTE (SPACE-NAV R1): the parent
+## O1O4 §2.8 H_FARSWAP impostor-swap is REJECTED (SEAMLESS-SCALES) and the const is deliberately NOT created here —
+## far-ring persistence + the SN3 scaled clamp replace it. All local dynamics read GM_dyn (SPACE-NAV §3), not the
+## sky's GM_game. NEVER-OOM: OrbitalState ~100 B/entity, hard-capped at ORBIT_ACTIVE_MAX (player = 1 in O1).
+const FP_M3_ORBIT := false        # master flag; OFF ⇒ byte-identical (nothing below is created)
+const H_BLEND_LO := 128.0         # radial altitude (blocks): below = pure lattice feel gravity (shipped)
+const H_BLEND_HI := 512.0         # above = pure GM_dyn/r² inertial regime (> ATMO_TOP, > OFFSURFACE_Y)
+const ATMO_TOP := 384.0           # atmosphere ceiling (D10; near-field scale, user-locked)
+const ORBIT_THRUST_G2 := 25.0     # gear-2 thrust authority, m/s²
+const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital entities (NEVER-OOM)
+const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with the controller commit band)
+const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates + pre-warms the landing facet
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

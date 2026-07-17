@@ -173,6 +173,28 @@ static func body_pos_helio(body: String, t: float) -> PackedFloat64Array:
 		return DV.v(0.0, 0.0, 0.0)                     # the Sun is the origin
 	return DV.add(body_pos_helio(par, t), body_pos_parent(body, t))
 
+## Velocity of `body` RELATIVE TO ITS PARENT (DVec3 blocks/s), parent inertial frame — the exact
+## closed-form time-derivative of body_pos_parent for a circular orbit (SPACE-NAV §5.1): with
+## angle θ = M0 + n·t, d/dt (a cos θ, a sin θ, 0) = a·n·(−sin θ, cos θ, 0). Pure f64; the twin of
+## body_pos_parent that the HIGH_ORBIT↔DEEP_SPACE handoff and the SOI-swap re-expression consume.
+static func body_vel_parent(body: String, t: float) -> PackedFloat64Array:
+	var a := orbit_a(body)
+	if parent_of(body) == "" or a <= 0.0:
+		return DV.v(0.0, 0.0, 0.0)
+	var n := omega_orbit(body)
+	var th := orbit_angle(body, t)
+	return DV.v(-a * n * sin(th), a * n * cos(th), 0.0)
+
+## Heliocentric (system-centre) velocity of `body` (DVec3 blocks/s): the chain of parent-relative
+## velocities up to the Sun (at rest at the origin). Pure recursion over the acyclic parent graph —
+## the exact analogue of body_pos_helio, so p_helio and v_helio are a consistent (position, velocity)
+## pair at every t. This is the ONE new ephemeris accessor SN1 adds (SPACE-NAV §5.1).
+static func body_vel_helio(body: String, t: float) -> PackedFloat64Array:
+	var par := parent_of(body)
+	if par == "":
+		return DV.v(0.0, 0.0, 0.0)                     # the Sun is at rest at the origin
+	return DV.add(body_vel_helio(par, t), body_vel_parent(body, t))
+
 ## Body-fixed spin angle (rad) of `body` at t. Tidal lock is the one-line rule (§4.2):
 ## spin_angle(moon) = orbit_angle(moon) + PI ⇒ the same face stays parent-ward forever.
 static func spin_angle(body: String, t: float) -> float:

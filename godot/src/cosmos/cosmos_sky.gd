@@ -38,6 +38,52 @@ var _sun_light: DirectionalLight3D = null
 var _moon: MeshInstance3D = null
 var _stars: MeshInstance3D = null
 var _moon_mat: StandardMaterial3D = null
+var _star_mat: ShaderMaterial = null
+
+## BLACK-SKY FIX: the additive procedural starfield for the dome (see _build_nodes). `blend_add` +
+## `depth_draw_never` are what stop it occluding the ramped Environment background (the original
+## opaque dome's bug); `cull_front` shows its inside; `unshaded` keeps it light-independent. Stars are
+## a hashed cell field on the view direction — asset-free, deterministic, and cheap (one hash + a
+## smoothstep per fragment). `star_fade` collapses the whole thing to black (⇒ adds nothing) by day.
+const STAR_DOME_SHADER := """
+shader_type spatial;
+render_mode unshaded, cull_front, blend_add, depth_draw_never, shadows_disabled, fog_disabled;
+
+uniform float star_fade : hint_range(0.0, 1.0) = 1.0;
+
+varying vec3 v_dir;
+
+void vertex() {
+	v_dir = normalize(VERTEX);
+}
+
+float hash13(vec3 p) {
+	p = fract(p * 0.1031);
+	p += dot(p, p.yzx + 33.33);
+	return fract((p.x + p.y) * p.z);
+}
+
+void fragment() {
+	vec3 d = normalize(v_dir);
+	vec3 g = d * 140.0;
+	vec3 cell = floor(g);
+	float h = hash13(cell);
+	float star = 0.0;
+	// Only the sparse top slice of cells host a star; brightness varies across the surviving range.
+	if (h > 0.982) {
+		vec3 fp = fract(g) - 0.5;
+		float bright = (h - 0.982) / 0.018;
+		star = smoothstep(0.42, 0.0, length(fp)) * (0.35 + 0.65 * bright);
+	}
+	// A faint milky band so the dome is not a pure void between stars (still ~black additively).
+	float band = smoothstep(0.30, 0.0, abs(d.z)) * 0.020;
+	// NOTE: write the starlight to ALBEDO, NOT EMISSION. Under `unshaded` Godot skips the light pass and
+	// ALBEDO *is* the fragment output — EMISSION would be silently dropped and the dome would render
+	// black, which is the very bug being fixed here. With blend_add this ALBEDO is added to the sky
+	// behind it, so black = adds nothing (the by-day case) and stars = additive points at night.
+	ALBEDO = (vec3(star) * 2.2 + vec3(0.7, 0.75, 1.0) * band) * star_fade;
+}
+"""
 
 # Shipped flat-ambient values (main._setup_environment) — reused verbatim as the NIGHT floor so a
 # night sky matches today's look exactly, and DAY brightens above them.
@@ -70,6 +116,12 @@ func _build_nodes() -> void:
 	sun_mat.emission = Color(1.0, 0.96, 0.85)
 	sun_mat.emission_energy_multiplier = 8.0
 	sun_mat.albedo_color = Color(1.0, 0.96, 0.85)
+	# BLACK-SKY FIX: the faceted Environment drives DEPTH FOG fully opaque at CAMERA_FAR·0.98 = 8820
+	# ("so the space-black rim is hidden", main._setup_environment) — but the impostors sit at D_SKY =
+	# 8000, i.e. ~93% into that ramp, so the Sun was being almost entirely repainted in fog colour (and
+	# fog colour is ramped to the NIGHT sky colour after dusk ⇒ the Sun vanished outright). Celestial
+	# bodies are BEYOND the atmosphere by definition and must never be fogged.
+	sun_mat.disable_fog = true
 	_sun.material_override = sun_mat
 	_sun.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_sun)
@@ -92,12 +144,23 @@ func _build_nodes() -> void:
 	_moon_mat.albedo_color = Color(0.72, 0.72, 0.70)
 	_moon_mat.roughness = 1.0
 	_moon_mat.metallic = 0.0
+	_moon_mat.disable_fog = true                          # BLACK-SKY FIX — see the Sun note above (fog opaque at 8820 > D_SKY)
 	_moon.material_override = _moon_mat
 	_moon.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_moon)
 
-	# --- Star dome: one big inverted sphere, unshaded dark emissive, rotated by −Earth spin. A
-	# placeholder starfield (no texture assets in O0); the live screenshot pass refines the look.
+	# --- Star dome: one big inverted sphere, rotated by −Earth spin.
+	# BLACK-SKY FIX (live screenshot pass, 2026-07-17): the O0 placeholder was an OPAQUE near-black
+	# StandardMaterial dome. Being opaque, it OCCLUDED the Environment background entirely — so the
+	# day-sky blue that _ramp_environment writes to background_color was never visible, and the sky
+	# rendered black at ALL times of day (confirmed live: black in 4/4 quadrants). It also carried no
+	# actual stars (a flat dark tint), so night was an empty void too. Fix = an ADDITIVE shader dome:
+	#   • blend_add + depth_draw_never ⇒ it NEVER occludes; the ramped background shows through and the
+	#     dome only ADDS light. Depth TEST stays on, so the opaque Sun/Moon impostors (at D_SKY, nearer
+	#     than the dome at 1.05·D_SKY) still correctly occlude the stars behind them.
+	#   • procedural hashed starfield (no texture assets — stays asset-free per O0) so night is starry.
+	#   • star_fade uniform, driven from the same sun-elevation ramp ⇒ stars vanish by day (additive
+	#     black adds nothing) and bloom in at dusk. NEVER-OOM: one mesh, one material, zero per-frame alloc.
 	_stars = MeshInstance3D.new()
 	_stars.name = "StarDome"
 	var star_mesh := SphereMesh.new()
@@ -106,15 +169,16 @@ func _build_nodes() -> void:
 	star_mesh.radial_segments = 24
 	star_mesh.rings = 12
 	_stars.mesh = star_mesh
-	var star_mat := StandardMaterial3D.new()
-	star_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	star_mat.cull_mode = BaseMaterial3D.CULL_FRONT        # see the inside of the dome
-	star_mat.emission_enabled = true
-	star_mat.emission = Color(0.03, 0.03, 0.06)
-	star_mat.emission_energy_multiplier = 1.0
-	star_mat.albedo_color = Color(0.01, 0.01, 0.02)
-	_stars.material_override = star_mat
+	var star_shader := Shader.new()
+	star_shader.code = STAR_DOME_SHADER
+	_star_mat = ShaderMaterial.new()
+	_star_mat.shader = star_shader
+	_star_mat.set_shader_parameter("star_fade", 1.0)
+	_stars.material_override = _star_mat
 	_stars.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Draw the dome BEFORE geometry it must never hide; additive + no depth-write already guarantee it
+	# cannot occlude, this just keeps it out of the transparent sort against the impostors.
+	_stars.sorting_offset = -1.0
 	add_child(_stars)
 
 func _process(_delta: float) -> void:
@@ -162,12 +226,18 @@ func _update_sky(t: float) -> void:
 ## up is the radial direction at the camera (planet centre = origin under the fixed frame). Night (sun
 ## below the horizon) sits at the shipped ambient floor; day brightens/blues toward noon (§8.2).
 func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
-	if _env == null:
-		return
 	var up := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
 	var elev := clampf(sun_dir.dot(up), -1.0, 1.0)          # −1 (midnight) .. +1 (noon)
 	var day := clampf(elev, 0.0, 1.0)                        # 0 below horizon, ramps to 1 at zenith
 	var twilight := clampf((elev + 0.15) / 0.30, 0.0, 1.0)   # soft dawn/dusk band around the horizon
+	# BLACK-SKY FIX: fade the additive starfield out as twilight brightens, so stars own the night sky
+	# and add nothing at noon (the ramped blue background then reads through the dome untouched). Driven
+	# from the SAME elevation as the background ramp, so stars and sky can never disagree. Kept OUTSIDE
+	# the `_env == null` early-out below — the starfield must still ramp when there is no Environment.
+	if _star_mat != null:
+		_star_mat.set_shader_parameter("star_fade", 1.0 - twilight)
+	if _env == null:
+		return
 	_env.background_color = _SKY_NIGHT.lerp(_SKY_DAY, twilight)
 	_env.fog_light_color = _env.background_color
 	_env.ambient_light_energy = lerpf(_NIGHT_AMBIENT_ENERGY, 1.0, day)

@@ -171,11 +171,18 @@ const FP_STAMP := false
 ## and byte-identical yet moved M4 only −13% (the profile pass and loop mechanics still carry the full VM
 ## tax). No script-side transformation removes a multiplier; only compilation does.
 ##
-## THE FENCE: terrain physics is ANALYTIC (block_id_at/floor_under read TerrainConfig GDScript directly; there
-## are no collision meshes), so this generator produces RENDER buffers only and GDScript stays the source of
-## truth for queries. Byte-equality is therefore the WHOLE consistency argument between render and physics —
-## not an optimisation detail. Default OFF → the C++ class is never instantiated → the GDScript generator is
-## untouched and FLAT stays 6035/0.
+## THE ONE-SAMPLER LAW (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §7.1) — the architectural constraint, and NOT
+## the "C++ renders, GDScript answers queries" split it is tempting to assume. That split would institutionalise
+## a BIFURCATION: C++ for voxel workers while analytic physics (block_id_at → resolve_cell), the skin tier, the
+## far ring (facet_far_ring.gd:390,434) and the LOD builder keep calling GDScript. Two implementations of
+## resolve_cell/column_profile maintained in parallel WILL drift, and a drift between the physics oracle and the
+## rendered mesh is WORSE than a seam — it is the float-through/fall-through class this project already fought.
+## So VoxelGeneratorCosmos is THE worldgen implementation and must be able to serve the query path too (§7.2
+## exposes sample_columns + scalar column_profile/resolve_cell for exactly that); the GDScript twin is retained
+## permanently as the byte-equality ORACLE, never as a live second path. Today the law holds because everything
+## funnels through TerrainConfig.profile_at_dir/facet_profile/resolve_cell — the port must INHERIT that choke
+## point, not break it. Byte-equality is therefore the whole argument that every tier and the physics oracle
+## agree. Default OFF → the C++ class is never instantiated → the GDScript generator is untouched, FLAT 6035/0.
 ## Truth gate: src/tools/verify_cppgen.gd — an N-block cell-for-cell equality assert (C++ buffer == GDScript
 ## buffer) over blocks spanning biomes, depth bands, ridges/seams, coasts/liquid and tree stencils. The gate is
 ## the oracle: it is proven able to FAIL (a deliberately perturbed C++ path must be caught) and is never

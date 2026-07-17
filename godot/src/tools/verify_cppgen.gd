@@ -182,6 +182,33 @@ func _initialize() -> void:
 	_ok(_bit_equal(truth, truth),
 		"G-CG-FALSIFY — comparator ACCEPTS the identical value (it is not vacuously red)")
 
+	# --- G-CG-CONTRACT — the one-sampler law's interface, pinned from S1 ---------------------------
+	# SEAMLESS-SCALES §7.2 requires the C++ core to serve ALL FOUR of: the worker path, batch column
+	# sampling, scalar parity queries, and a purity contract. Pinning the shape now (while the bodies
+	# are still staged) is the point: it stops S2/S3 quietly dropping an entry point and rebuilding a
+	# GDScript-side sampler for the skin or the far ring — which is the bifurcation §7.1 forbids, and
+	# whose seam would land on a facet ridge.
+	for m in ["generate_block", "sample_columns", "column_profile", "resolve_cell"]:
+		_ok(gen.has_method(m), "G-CG-CONTRACT — §7.2 entry point exposed: %s" % m)
+
+	# --- G-CG-STAGED — the staged entry points fail LOUD, not plausibly --------------------------
+	# While S2/S3 are unimplemented these return sentinels. The gate asserts they are UNMISTAKABLE
+	# rather than plausible: a zeroed profile (height 0, biome 0) or an AIR cell would be silently
+	# consumable by a caller — and a physics caller believing "air here" is the float-through bug this
+	# port must never introduce. NaN and -1 cannot be mistaken for real answers.
+	var staged_prof: Vector4 = gen.call("column_profile", -1, 0, 0)
+	_ok(is_nan(staged_prof.x) and is_nan(staged_prof.y),
+		"G-CG-STAGED — column_profile returns NaN while staged (loud, not a plausible column)")
+	var staged_cell: int = gen.call("resolve_cell", -1, 0, 0, 0)
+	_ok(staged_cell == -1,
+		"G-CG-STAGED — resolve_cell returns -1 while staged (never a packable cell value; 0 would mean AIR)")
+	var staged_cols: Dictionary = gen.call("sample_columns", -1, PackedInt64Array([0]))
+	_ok(staged_cols.has("heights") and staged_cols.has("biomes") \
+			and staged_cols.has("water") and staged_cols.has("colors"),
+		"G-CG-STAGED — sample_columns returns the §7.2 key set {heights,biomes,water,colors}")
+	_ok(bool(staged_cols.get("staged", false)),
+		"G-CG-STAGED — sample_columns is marked staged (this assert MUST be inverted when S2/S3 lands)")
+
 	_done(0 if _fail == 0 else 1)
 
 ## Exact equality. NOT approximate: C++ and GDScript call the same const method on the same Noise

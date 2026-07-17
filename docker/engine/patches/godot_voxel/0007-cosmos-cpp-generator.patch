@@ -12,14 +12,16 @@ index ccac0f7..a96e2ae 100644
          "modifiers/*.cpp",
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
 new file mode 100644
-index 0000000..4d9317d
+index 0000000..629ee51
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,207 @@
 +#include "voxel_generator_cosmos.h"
 +#include "../../util/godot/classes/noise.h"
 +
 +#include <core/variant/dictionary.h>
++
++#include <cmath>
 +
 +namespace zylann::voxel {
 +
@@ -156,50 +158,136 @@ index 0000000..4d9317d
 +	return d;
 +}
 +
++// ================================================================================================
++// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). All are STAGED INERT in S1.
++//
++// A note on how they fail while staged, because it is a deliberate choice and not laziness: each
++// returns a value that is OBVIOUSLY broken rather than plausibly correct. Missing terrain and a -1
++// cell id are loud; a plausible-but-subtly-wrong height or an AIR cell would be quiet, and quiet
++// wrongness in worldgen is exactly what the byte-equality gate exists to prevent from ever
++// shipping. None of these is reachable in the shipped build anyway: the class is only instantiated
++// under FP_CPPGEN, which is default-false.
++// ================================================================================================
++
 +VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input) {
-+	// S1: SKELETON ONLY. The port lands in S2 (pure column math) and S3 (resolve_cell + emit loop).
-+	// Emitting nothing here is the correct inert behaviour and not a placeholder to be forgotten: the
-+	// class is only ever instantiated under FP_CPPGEN, which is default-false, so with the flag off
-+	// this code is unreachable and the GDScript generator remains byte-identical to shipped. If this
-+	// is somehow reached before S3, an empty buffer is a LOUD failure (visibly missing terrain), not a
-+	// quiet one -- which is the way round we want it.
++	// ENTRY POINT 1 — S1: skeleton. Lands in S3 (resolve_cell + the emit loop), as a thin loop over
++	// resolve_cell_core. An empty buffer here reads as visibly missing terrain: loud, as intended.
 +	return Result();
++}
++
++Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
++	// ENTRY POINT 2 — S1: shape only; lands in S2/S3 as a thin loop over column_profile_core, plus
++	// the junction/ridge treatment so adjacent facets' tiles agree bit-exactly at shared seam columns.
++	//
++	// The empty dictionary is the staged inert value. Do NOT be tempted to "temporarily" fill this
++	// from a quick heightfield approximation to unblock a caller: a second sampler is precisely what
++	// the one-sampler law forbids, and its seam would land on a facet ridge.
++	Dictionary d;
++	d["heights"] = PackedFloat32Array();
++	d["biomes"] = PackedInt32Array();
++	d["water"] = PackedByteArray();
++	d["colors"] = PackedColorArray();
++	d["staged"] = true; // S1 marker: absent once S2/S3 implement this. Gates assert on it.
++	return d;
++}
++
++Vector4 VoxelGeneratorCosmos::column_profile(int fid, int x, int z) const {
++	// ENTRY POINT 3a — S1: shape only; lands in S2 as a single column_profile_core call.
++	// NaN, not zero: a zeroed profile is a plausible column (height 0, ocean biome) that a caller
++	// could consume without noticing, whereas NaN poisons any arithmetic it touches and surfaces
++	// immediately. While staged, being unmissable beats being tidy.
++	const float nan = NAN;
++	return Vector4(nan, nan, nan, nan);
++}
++
++int64_t VoxelGeneratorCosmos::resolve_cell(int fid, int x, int y, int z) const {
++	// ENTRY POINT 3b — S1: shape only; lands in S3 as a single resolve_cell_core call.
++	// -1 is not a representable packed cell value (CellCodec packs a material in the low bits, and 0
++	// is AIR). Returning 0 would claim "air here", which a physics caller would happily believe and
++	// fall through -- the exact failure this port must never introduce. -1 cannot be mistaken for a
++	// real answer.
++	return -1;
 +}
 +
 +void VoxelGeneratorCosmos::_bind_methods() {
 +	ClassDB::bind_method(D_METHOD("setup", "config"), &VoxelGeneratorCosmos::setup);
 +	ClassDB::bind_method(D_METHOD("is_ready"), &VoxelGeneratorCosmos::is_ready);
 +	ClassDB::bind_method(D_METHOD("get_setup_digest"), &VoxelGeneratorCosmos::get_setup_digest);
++
++	// SEAMLESS-SCALES §7.2 items 2 and 3: the batch sampler and the scalar parity queries. Bound in
++	// S1 -- while they are staged inert -- so the boundary shape is pinned by the gate from the start
++	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
++	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);
++	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
++	ClassDB::bind_method(D_METHOD("resolve_cell", "fid", "x", "y", "z"), &VoxelGeneratorCosmos::resolve_cell);
 +}
 +
 +} // namespace zylann::voxel
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
 new file mode 100644
-index 0000000..18bdcf8
+index 0000000..faccae9
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,230 @@
 +#ifndef VOXEL_GENERATOR_COSMOS_H
 +#define VOXEL_GENERATOR_COSMOS_H
 +
-+// VOXIVERSE COSMOS — L5(a): the C++ worldgen port (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6).
++// VOXIVERSE COSMOS — L5(a): the C++ worldgen port.
++// Design: docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6 (why) + docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §7
++// (the one-sampler law + the interface contract this class MUST satisfy).
 +//
 +// WHY THIS EXISTS. Measured on the live web build (2026-07-17): 97 % of all block-generation time
 +// is spent in two per-cell classes that are *interpreter-bound*, not algorithm-bound —
 +// underground gate-failed at 337.7 ms/block and surface-crossing at 559.8 ms/block, against a
 +// 13.7 ms native twin (a ~x25 WASM/GDScript multiplier). Supply is 23-35 blocks/s against a
-+// walking demand of ~90-100 blocks/s: supply < demand ALWAYS, and that gap IS the freezes. No
-+// script-side transformation removes a multiplier — only compilation does. This class is that
-+// compilation: the whole `_generate_block` inner path of `module_world.gd`'s runtime-compiled
-+// GDScript generator, as C++ inside our module patch set.
++// walking demand of ~90-100 blocks/s: supply < demand ALWAYS, and that gap IS the freezes. Every
++// script-side lever was built and measured out — R1 column-bulk and R7 blob-stamp are correct and
++// byte-identical yet moved M4 only -13 %, because the profile pass and loop mechanics still carry
++// the full VM tax. No script-side transformation removes a multiplier; only compilation does.
 +//
-+// THE CORRECTNESS FENCE (read before touching anything here).
-+// Terrain physics is ANALYTIC: `WorldManager.block_id_at` / `floor_under` read TerrainConfig
-+// (GDScript) directly and there are no collision meshes. This class only produces RENDER buffers.
-+// So GDScript stays the source of truth for queries, and the ONLY thing keeping render and physics
-+// consistent is that this generator is byte-identical to the GDScript one. Byte-equality is not a
-+// nice-to-have here — it is the entire safety argument. `verify_cppgen.gd` is the oracle; never
-+// weaken it to make a change pass.
++// ===========================================================================================
++// THE ONE-SAMPLER LAW (SEAMLESS-SCALES §7.1) — THE ARCHITECTURAL CONSTRAINT ON THIS FILE
++// ===========================================================================================
++//
++//   "Every tier — voxel, skin, far ring, scaled body — must sample the SAME worldgen
++//    implementation, parameterized by stride/LOD; a second implementation of any terrain
++//    quantity is a guaranteed seam."
++//
++// Today the law holds because everything funnels through TerrainConfig.profile_at_dir /
++// facet_profile / resolve_cell — ONE choke point, which is exactly why the tiers agree. THIS CLASS
++// IS THE FIRST REAL RISK OF BIFURCATION, and it must inherit the choke-point property rather than
++// break it. The failure mode to understand before editing: if C++ served the voxel workers while
++// analytic physics (WorldManager.block_id_at -> resolve_cell), the skin tier, the far ring
++// (facet_far_ring.gd:390,434) and the LOD builder kept calling GDScript, we would be maintaining
++// two implementations of resolve_cell/column_profile in parallel. They WILL drift — and a drift
++// between the physics oracle and the rendered mesh is worse than a seam: it is the float-through /
++// fall-through class of bug this project has already fought once.
++//
++// So this class is NOT "the render-buffer generator". It is THE worldgen implementation. The
++// GDScript twin is retained permanently as the byte-equality ORACLE, never as a live second path.
++//
++// STRUCTURAL CONSEQUENCE — ONE CORE, THREE ENTRY POINTS. The private `*_core` functions below are
++// the single implementation of every terrain quantity. Every public entry point is a thin loop
++// over them:
++//
++//     generate_block()   ---\
++//     sample_columns()   ----+--->   column_profile_core
++//     column_profile()   ---/        slope_run_core          (the ONE implementation)
++//     resolve_cell()     ---/        resolve_cell_core
++//
++// DO NOT add a per-caller fast path. A "just for the skin tier" column routine, or a "cheap"
++// approximation for the far ring, IS the second implementation the law forbids — and its seam
++// would surface at a facet ridge, the exact artifact the user has ruled out. If a tier needs
++// coarser data, it passes a bigger stride to the same core; it does not get its own sampler.
++//
++// ===========================================================================================
++// THE CORRECTNESS FENCE
++// ===========================================================================================
++//
++// Byte-equality against the GDScript twin is not a quality metric — it is the entire argument that
++// every tier, and the physics oracle, agree. `verify_cppgen.gd` is the oracle; it is proven able
++// to fail (a 1e-6 perturbation of the C++ noise read was caught), and it is never weakened to make
++// a change pass. If it goes red, this file is wrong.
 +//
 +// HOW BYTE-EQUALITY IS ACHIEVED (the two decisions that make it tractable):
 +//
@@ -208,8 +296,9 @@ index 0000000..18bdcf8
 +//     SAME `get_noise_2d/3d` virtual the GDScript path calls, on the SAME instance. Bit-matching is
 +//     therefore by construction rather than by careful reimplementation — the class of bug that
 +//     would otherwise sink this port (a subtly different fBm accumulation order) cannot occur.
-+//     Godot's `Noise::get_noise_*` is `const` and non-mutating, and the GDScript generator already
-+//     calls it from voxel worker threads today, so concurrent reads are established practice.
++//     PROVEN, not assumed: verify_cppgen's G-CG-NOISE compares all six noises across the boundary
++//     at 17 significant digits and they agree exactly. Do not "simplify" this into passing noise
++//     PARAMETERS and rebuilding the noise C++-side; that reintroduces precisely the drift it avoids.
 +//
 +//  2. FLOAT WIDTH IS MIRRORED, NOT CHOSEN. GDScript `float` is f64, so every intermediate here is
 +//     `double` — never `float`. The narrowing points are mirrored exactly where GDScript narrows:
@@ -217,23 +306,17 @@ index 0000000..18bdcf8
 +//     (real_t components) when a column profile is stored. Using `float` for an intermediate, or
 +//     skipping a narrowing GDScript performs, is a byte-equality failure — and a legitimate one.
 +//
-+// THE FROZEN-EPOCH CONTRACT IS SACRED. Every table crosses the boundary ONCE, in `setup()`, on the
-+// main thread, before any worker touches this generator. After that the worker reads immutable
-+// C++-side data only. Nothing here may lazily first-touch on a worker: that is this project's worst
-+// data-race class (WGC §7.4). A facet/face flip installs a NEW generator, it never mutates a live
-+// one -- exactly as the GDScript generator's `gen_face`/`gen_facet` epoch already works.
++//     RELATED TRAP, for whoever ports the hashes (S3): GDScript ints are **int64**, and
++//     TerrainConfig._hash01_3d's constant 2246822519 EXCEEDS int32. The hash mixers must use
++//     `int64_t`, not `int`, or bedrock/strata/ore silently diverge. This is the single easiest way
++//     to break byte-equality in this port.
 +//
-+// LOD / STRIDE / PROFILE-ONLY SAMPLING (forward-looking, NOT implemented in S1).
-+// The user's constraint is that walking, in-atmosphere flight and near-planet orbit must be one
-+// continuous experience with no stitches or jumps at facet seams or the atmosphere-space border,
-+// possibly rendering surface blocks from space. That means this generator will eventually serve all
-+// scales: near voxels, a heightfield skin tier, the far ring, and maybe space-visible surface
-+// detail. The hard requirement that follows is that a coarse/strided/profile-only sample must be
-+// THE SAME FUNCTION as the full one -- a second implementation would drift, and drift at a seam is
-+// exactly the stitch the user is ruling out. Hence the interface shape below: `column_profile_at()`
-+// is public and independent of the emit loop, and `generate_block` already carries a `stride` from
-+// its `lod` (mirroring the GDScript generator's `gen_lod_probe` / `s = 1 << lod`). A future skin or
-+// far-ring tier calls `column_profile_at()` directly rather than growing a parallel path.
++// THE FROZEN-EPOCH CONTRACT IS SACRED — and §7.2's purity contract makes it structural. Every table
++// crosses the boundary ONCE, in `setup()`, on the main thread, before any worker touches this
++// generator; the worker then reads immutable C++-side data only. Nothing here may lazily
++// first-touch on a worker: that is this project's worst data-race class (WGC §7.4). No callbacks
++// into script, no engine singletons, const after setup. A facet/face flip installs a NEW generator,
++// it never mutates a live one — exactly as the GDScript generator's gen_face/gen_facet epoch works.
 +
 +#include "../../util/godot/classes/noise.h"
 +#include "../../util/thread/rw_lock.h"
@@ -250,6 +333,8 @@ index 0000000..18bdcf8
 +	VoxelGeneratorCosmos();
 +	~VoxelGeneratorCosmos();
 +
++	// --- setup / epoch --------------------------------------------------------------------------
++
 +	// Freeze this epoch's immutable inputs. MAIN THREAD ONLY, exactly once, before any worker runs.
 +	// `config` mirrors the frozen members of the GDScript generator one-for-one (noise stack, block
 +	// id table, appearance/ARID tables, facet/face epoch, flags). Returns false and stays disabled if
@@ -258,21 +343,77 @@ index 0000000..18bdcf8
 +	// harder to diagnose in the field.
 +	bool setup(Dictionary config);
 +
-+	// True once `setup()` has succeeded. `generate_block` is inert until then.
++	// True once `setup()` has succeeded. Every entry point is inert until then.
 +	bool is_ready() const;
 +
 +	// S1 gate surface: echoes back what `setup()` actually received (table sizes, seed, epoch), so
 +	// `verify_cppgen.gd` can prove the frozen tables crossed the boundary intact rather than assume
-+	// it. Cheap, main-thread, diagnostic only -- nothing in the emit path reads this.
++	// it. Also round-trips one sample per noise, which is what proves decision (1) end-to-end.
++	// Cheap, main-thread, diagnostic only -- nothing in any emit path reads this.
 +	Dictionary get_setup_digest() const;
 +
++	// --- ENTRY POINT 1: the voxel worker path (SEAMLESS-SCALES §7.2 item 1) ---------------------
++	// The whole inner path of module_world.gd's generated `_generate_block`: frozen tables in once at
++	// setup, no per-cell script calls. `input.lod` carries the stride (s = 1 << lod), mirroring the
++	// GDScript generator's gen_lod_probe; at lod0 s == 1 and this is byte-identical to shipped.
 +	Result generate_block(VoxelQueryData input) override;
++
++	// --- ENTRY POINT 2: batch heightfield sampling (SEAMLESS-SCALES §7.2 item 2) ----------------
++	//
++	// The load-bearing addition of the seamless-scales design: what lets the skin tier, the extension
++	// rings, the backstop refresh and future Moon tiles cost milliseconds *and* agree with the voxel
++	// surface exactly -- the mechanical embodiment of "no stitches". ONE call per skin tile /
++	// backstop grid (33^2-65^2 columns). Target: a 64x64 pitch-2 tile <= ~1 ms.
++	//
++	// BATCH IS THE POINT, not a micro-optimisation. §2.6 forbids per-cell GDScript->C++ round trips
++	// because their call overhead eats the entire win; a scalar-per-column API would simply recreate
++	// that cost at skin-tile scale. Callers hand over a whole tile's columns at once.
++	//
++	// `cells` packs (x, z) per column into an int64. Returns
++	// {heights: PackedFloat32Array, biomes: PackedInt32Array, water: PackedByteArray,
++	//  colors: PackedColorArray}.
++	//
++	// MUST apply the ridge/junction treatment (junction_modify) so adjacent facets' tiles agree
++	// BIT-EXACTLY at shared seam columns -- otherwise every facet ridge becomes a visible crack in
++	// the skin tier, which is the stitch this whole design exists to remove.
++	//
++	// S2/S3: implement as a thin loop over column_profile_core. NOT as its own sampler.
++	Dictionary sample_columns(int fid, PackedInt64Array cells) const;
++
++	// --- ENTRY POINT 3: scalar parity queries (SEAMLESS-SCALES §7.2 item 3) ---------------------
++	//
++	// So block_id_at / height_at -- the PHYSICS TRUTH -- can route to the SAME core under the port
++	// flag instead of keeping a live second implementation in GDScript. This is the item that keeps
++	// the law satisfied: without it the port bifurcates physics from render, which buys the
++	// float-through class of bug rather than a merely visible seam.
++	//
++	// Scalar, hence boundary-cost-bound: these are for the QUERY path, which already makes one call
++	// per query today. Never use them for bulk sampling -- bulk goes through sample_columns.
++	Vector4 column_profile(int fid, int x, int z) const;
++	int64_t resolve_cell(int fid, int x, int y, int z) const;
 +
 +private:
 +	static void _bind_methods();
 +
++	struct Parameters;
++
++	// --- THE ONE CORE (see the one-sampler law above) -------------------------------------------
++	// The single implementation of every terrain quantity, shared by all entry points. Pure: reads
++	// only `p` (the frozen epoch) and its arguments. No script callbacks, no singletons, thread-safe
++	// const after setup -- §7.2's purity contract, expressed as a signature rather than a promise.
++	//
++	// The profile type is `Vector4` deliberately: it matches GDScript's column_profile return type
++	// EXACTLY, including that its components are real_t (f32). That narrowing is part of the
++	// SEMANTICS, not a storage detail -- GDScript's downstream resolve_cell reads c/t back out of a
++	// Vector4, so the f32 round-trip already happened there and must happen here too. Compute in
++	// double, land in Vector4, read back.
++	static Vector4 column_profile_core(const Parameters &p, int fid, int x, int z);
++	static int slope_run_core(const Parameters &p, int fid, int x, int z, int g);
++	static int64_t resolve_cell_core(
++			const Parameters &p, int fid, int x, int y, int z, const Vector4 &prof, int slope_run);
++
 +	// The immutable per-epoch snapshot. Written once by `setup()` under `_params_lock`, read by every
-+	// worker thread thereafter. Mirrors VoxelGeneratorNoise2D's Parameters/RWLock idiom, which is the
++	// worker thereafter. Mirrors VoxelGeneratorNoise2D's Parameters/RWLock idiom, which is the
 +	// module's established pattern for exactly this.
 +	struct Parameters {
 +		bool ready = false;

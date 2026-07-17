@@ -98,6 +98,11 @@ static func frozen_atlas() -> Dictionary:
 		"facet_off": _off,
 		"facet_r_blocks": R_BLOCKS,
 		"facet_count": _nf,
+		# COSMOS L5(a) S3b — the 4 own-side ridge planes per facet (16 f64/fid: slot × A,B,C,D, lattice
+		# coords). The C++ emit loop's junction_modify / block_all_air / cell_interior_scaled are pure
+		# arithmetic over these, exactly as the GDScript ones are — no seam topology re-derived in C++.
+		"seam_plane": _seam_plane,
+		"seam_eps": SEAM_EPS,
 	}
 
 ## Build the whole atlas once (main thread). Call AFTER TerrainConfig.warm_up (spawn pick reads worldgen).

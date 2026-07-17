@@ -3526,7 +3526,76 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# generator still never writes an index past what the mesher can address. Falls back to _next_arid
 	# when the library doesn't expose its models array.
 	gen.set("model_count", _library_model_count())
+
+	# COSMOS L5(a) S4 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6) — under FP_CPPGEN, the voxel workers run
+	# the COMPILED VoxelGeneratorCosmos instead of this GDScript generator. Same frozen tables, same epoch,
+	# byte-identical output (verify_cppgen's buffer gate), but ~x25 faster on web (compiled wasm vs the
+	# interpreter). We build it here — AFTER `gen` is fully configured — so it reuses every already-baked
+	# table rather than re-deriving one. On ANY failure (class absent, setup refused) we fall back to the
+	# GDScript `gen`, so a missing/older binary degrades to the shipped path instead of breaking. Default
+	# OFF ⇒ this whole block is skipped ⇒ byte-identical to shipped.
+	if CubeSphere.FP_CPPGEN and ClassDB.class_exists("VoxelGeneratorCosmos"):
+		var cgen: Object = _make_cpp_generator(gen)
+		if cgen != null:
+			return cgen
 	return gen
+
+## S4: construct the compiled VoxelGeneratorCosmos for this epoch, frozen from the SAME tables the
+## GDScript generator `src_gen` just received (so the two are byte-identical by shared inputs, not a
+## parallel bake). Returns null on any failure so the caller falls back to the GDScript generator.
+func _make_cpp_generator(src_gen: Object) -> Object:
+	var cgen: Object = ClassDB.instantiate("VoxelGeneratorCosmos")
+	if cgen == null:
+		return null
+	var twin: Array = _gen_twin_arid
+	var empty := PackedInt32Array()
+	var cfg := TerrainConfig.noise_stack()
+	for k in TerrainConfig.material_tables():
+		cfg[k] = TerrainConfig.material_tables()[k]
+	# Epoch + flags (mirrors the gen.set(...) calls above; read the frozen epoch off src_gen so the two
+	# generators are on the SAME facet/face/window — never re-read a mutable global here).
+	cfg["gen_face"] = src_gen.get("gen_face")
+	cfg["gen_n"] = src_gen.get("gen_n")
+	cfg["gen_facet"] = src_gen.get("gen_facet")
+	cfg["flat_world"] = src_gen.get("flat_world")
+	cfg["faceted"] = CubeSphere.FACETED
+	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
+	cfg["model_count"] = src_gen.get("model_count")
+	cfg["waterlog"] = src_gen.get("waterlog")
+	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set
+	# them here explicitly; omitting them defaults p.id_wood to 0 (air) and every oak tree emits air.
+	cfg["id_wood"] = BlockCatalog.WOOD
+	cfg["id_leaf"] = BlockCatalog.LEAF
+	cfg["id_spruce_log"] = BlockCatalog.id_of(&"spruce_log")
+	cfg["id_spruce_leaf"] = BlockCatalog.id_of(&"spruce_leaves")
+	cfg["id_birch_log"] = BlockCatalog.id_of(&"birch_log")
+	cfg["id_birch_leaf"] = BlockCatalog.id_of(&"birch_leaves")
+	# The frozen appearance/ARID tables (reuse the exact instances set on src_gen).
+	cfg["block_ids"] = TerrainConfig.appearance_surface_materials()   # setup sanity field (unused by emit)
+	cfg["cube_arid"] = src_gen.get("cube_arid")
+	cfg["gen_arid"] = src_gen.get("gen_arid")
+	cfg["snow_arid"] = src_gen.get("snow_arid")
+	cfg["layer_arid"] = src_gen.get("layer_arid")
+	cfg["slope_arid"] = src_gen.get("slope_arid")
+	cfg["snow_slope_arid"] = src_gen.get("snow_slope_arid")
+	cfg["carve_arid"] = src_gen.get("carve_arid")
+	cfg["carve_snow_arid"] = src_gen.get("carve_snow_arid")
+	cfg["surface_arid"] = src_gen.get("surface_arid")
+	cfg["twin_w"] = twin[1] if twin.size() > 1 and twin[1] != null else empty
+	cfg["twin_l"] = twin[2] if twin.size() > 2 and twin[2] != null else empty
+	cfg["twin_3"] = twin[3] if twin.size() > 3 and twin[3] != null else empty
+	cfg["comp_l3"] = src_gen.get("comp_l3")
+	cfg["comp_l5"] = src_gen.get("comp_l5")
+	cfg["comp_l8"] = src_gen.get("comp_l8")
+	cfg["comp_l10"] = src_gen.get("comp_l10")
+	cfg["snow_lrid"] = _snow_id_of()
+	if CubeSphere.FACETED:
+		for k in FacetAtlas.frozen_atlas():
+			cfg[k] = FacetAtlas.frozen_atlas()[k]
+	if not cgen.call("setup", cfg):
+		push_warning("[module_world] VoxelGeneratorCosmos.setup refused — falling back to GDScript generator")
+		return null
+	return cgen
 
 ## The actual number of models in the baked library (the arid upper bound for the worker's OOB fence).
 ## Reads the live `models` array size when exposed; else the append count `_next_arid`.

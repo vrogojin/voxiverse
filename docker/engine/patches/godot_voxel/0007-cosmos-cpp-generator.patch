@@ -347,15 +347,19 @@ index 0000000..45393ff
 +#endif // COSMOS_TERRAIN_H
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
 new file mode 100644
-index 0000000..2ff9a7a
+index 0000000..0d461a9
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -0,0 +1,1436 @@
+@@ -0,0 +1,1773 @@
 +#include "voxel_generator_cosmos.h"
 +#include "../../util/godot/classes/noise.h"
 +#include "cosmos_terrain.h"
++#include "../../storage/voxel_buffer.h"
++#include "../../storage/voxel_buffer_gd.h"
 +
 +#include <core/variant/dictionary.h>
++
++#include <vector>
 +
 +#include <cmath>
 +
@@ -419,6 +423,14 @@ index 0000000..2ff9a7a
 +	p.carve_arid = get_i32_param(config, "carve_arid");
 +	p.carve_snow_arid = get_i32_param(config, "carve_snow_arid");
 +	p.surface_arid = get_i32_param(config, "surface_arid");
++	p.twin_w = get_i32_param(config, "twin_w");
++	p.twin_l = get_i32_param(config, "twin_l");
++	p.twin_3 = get_i32_param(config, "twin_3");
++	p.comp_l3 = get_i32_param(config, "comp_l3");
++	p.comp_l5 = get_i32_param(config, "comp_l5");
++	p.comp_l8 = get_i32_param(config, "comp_l8");
++	p.comp_l10 = get_i32_param(config, "comp_l10");
++	p.snow_lrid = int(config.get("snow_lrid", -1));
 +	p.block_ids = get_i32_param(config, "block_ids");
 +
 +	p.model_count = int(config.get("model_count", 0));
@@ -430,6 +442,8 @@ index 0000000..2ff9a7a
 +	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
 +	p.facet_off = get_i32_param(config, "facet_off");
 +	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
++	p.seam_plane = PackedFloat64Array(config.get("seam_plane", PackedFloat64Array()));
++	p.seam_eps = double(config.get("seam_eps", 1.0e-6));
 +
 +	p.id_wood = int(config.get("id_wood", 0));
 +	p.id_leaf = int(config.get("id_leaf", 0));
@@ -1697,8 +1711,234 @@ index 0000000..2ff9a7a
 +	return id;
 +}
 +
++// --- S3b: FacetAtlas junction authority, ported (pure over the frozen seam planes) -------------
++
++int VoxelGeneratorCosmos::junction_q_of(const Parameters &p, int fid, int slot, int x, int y, int z) {
++	const int b = fid * 16 + slot * 4;
++	const double A = p.seam_plane[b], B = p.seam_plane[b + 1], C = p.seam_plane[b + 2], D = p.seam_plane[b + 3];
++	const double dc = (A * (double(x) + 0.5) + B * (double(y) + 0.5) + C * (double(z) + 0.5) + D) /
++			Math::sqrt(A * A + B * B + C * C);
++	return cosmos::clampi(int(Math::ceil((dc + 1.0) * 16.0)), 0, 31);
++}
++
++int64_t VoxelGeneratorCosmos::junction_modify(const Parameters &p, int fid, int cx, int cy, int cz, int64_t v) {
++	const double fx = double(cx), fy = double(cy), fz = double(cz);
++	int best_slot = -1;
++	double best_abs = 1.0e18;
++	for (int slot = 0; slot < 4; ++slot) {
++		const int b = fid * 16 + slot * 4;
++		const double A = p.seam_plane[b], B = p.seam_plane[b + 1], C = p.seam_plane[b + 2];
++		const double base = A * fx + B * fy + C * fz + p.seam_plane[b + 3];
++		const double hi = base + MAX(0.0, A) + MAX(0.0, B) + MAX(0.0, C);
++		if (hi <= p.seam_eps) {
++			return 0; // wholly beyond this ridge -> AIR
++		}
++		const double lo = base + MIN(0.0, A) + MIN(0.0, B) + MIN(0.0, C);
++		if (lo < -p.seam_eps) {
++			const double grad = Math::sqrt(A * A + B * B + C * C);
++			const double dc = Math::abs(A * (fx + 0.5) + B * (fy + 0.5) + C * (fz + 0.5) + p.seam_plane[b + 3]) / grad;
++			if (dc < best_abs) {
++				best_abs = dc;
++				best_slot = slot;
++			}
++		}
++	}
++	if (best_slot < 0) {
++		return v;
++	}
++	const int q = junction_q_of(p, fid, best_slot, cx, cy, cz);
++	const int mj = MOD_FAM_BIT | (FAM_JUNCTION << MOD_FAM_KIND_SHIFT) |
++			((best_slot & 0x3) << 10) | ((q & 0x1F) << 5);
++	return cc_pack(cc_mat(v), mj, cc_state(v), cc_liquid_field(v));
++}
++
++bool VoxelGeneratorCosmos::block_all_air(
++		const Parameters &p, int fid, int ox, int oy, int oz, int sx, int sy, int sz, int st) {
++	if (sx <= 0 || sy <= 0 || sz <= 0) {
++		return false;
++	}
++	const double x0 = double(ox), x1 = double(ox + (sx - 1) * st);
++	const double y0 = double(oy), y1 = double(oy + (sy - 1) * st);
++	const double z0 = double(oz), z1 = double(oz + (sz - 1) * st);
++	for (int slot = 0; slot < 4; ++slot) {
++		const int b = fid * 16 + slot * 4;
++		const double A = p.seam_plane[b], B = p.seam_plane[b + 1], C = p.seam_plane[b + 2], D = p.seam_plane[b + 3];
++		const double base_max = (A > 0.0 ? A * x1 : A * x0) + (B > 0.0 ? B * y1 : B * y0) +
++				(C > 0.0 ? C * z1 : C * z0) + D;
++		const double hi_max = base_max + MAX(0.0, A) + MAX(0.0, B) + MAX(0.0, C);
++		if (hi_max <= p.seam_eps) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool VoxelGeneratorCosmos::cell_interior_scaled(const Parameters &p, int fid, int wx, int wy, int wz, int s) {
++	const double fx = double(wx), fy = double(wy), fz = double(wz), fs = double(s);
++	for (int slot = 0; slot < 4; ++slot) {
++		const int b = fid * 16 + slot * 4;
++		const double A = p.seam_plane[b], B = p.seam_plane[b + 1], C = p.seam_plane[b + 2], D = p.seam_plane[b + 3];
++		const double lo = A * fx + B * fy + C * fz + D + fs * (MIN(0.0, A) + MIN(0.0, B) + MIN(0.0, C));
++		if (lo < -p.seam_eps) {
++			return false;
++		}
++	}
++	return true;
++}
++
++// --- S3b: the packed-cell -> ARID map (module_world.gd:3193-3335), ported verbatim -------------
++// The frozen tables' indexing constants, mirroring the generated source string.
++namespace {
++constexpr int GEN_STRIDE = 256;
++constexpr int SLOPE_STRIDE = 4096;
++constexpr int FAM_BIT_LOCAL = 1 << 15;
++constexpr int FAM_KIND_SHIFT_LOCAL = 12;
++constexpr int FAM_KIND_MASK_LOCAL = 0x7;
++constexpr int FAM_SLOPE_LOCAL = 1;
++inline int arr_get(const PackedInt32Array &a, int i) { return (i >= 0 && i < a.size()) ? a[i] : -1; }
++inline bool cc_is_junction(int m) {
++	return (m & FAM_BIT_LOCAL) != 0 && ((m >> FAM_KIND_SHIFT_LOCAL) & FAM_KIND_MASK_LOCAL) == 2;
++}
++} // namespace
++
++int VoxelGeneratorCosmos::cell_to_arid(const Parameters &p, int64_t v) {
++	const int id = cc_mat(v);
++	if (id == 0) {
++		return -1; // air: emit nothing (the caller skips)
++	}
++	const int ncube = p.cube_arid.size();
++	const int ngen = p.gen_arid.size();
++	const int nsnow = p.snow_arid.size();
++	const int nlayer = p.layer_arid.size();
++	const int nslope = p.slope_arid.size();
++	const int ncarve = p.carve_arid.size();
++	const int ncarvesnow = p.carve_snow_arid.size();
++	const int nsnowslope = p.snow_slope_arid.size();
++	const int modifier = cc_modifier(v);
++	int arid = 0;
++	const int lf = cc_liquid_field(v);
++	if (lf != 0) {
++		const int lk = lf & 3;
++		const int lvl = lf >> 2;
++		const PackedInt32Array *twins = &p.twin_w;
++		if (lk == 2) {
++			twins = &p.twin_l;
++		} else if (lk == 3) {
++			twins = &p.twin_3;
++		}
++		if (lvl == 9) {
++			if (modifier == 0) {
++				const int sa = lk < p.surface_arid.size() ? p.surface_arid[lk] : -1;
++				arid = sa >= 0 ? sa : (id < ncube ? p.cube_arid[id] : id);
++			} else {
++				const int wslot = id * GEN_STRIDE + modifier;
++				if (twins->size() > 0 && modifier < GEN_STRIDE && wslot < twins->size() && (*twins)[wslot] >= 0) {
++					arid = (*twins)[wslot];
++				} else if (modifier < GEN_STRIDE && wslot < ngen && p.gen_arid[wslot] >= 0) {
++					arid = p.gen_arid[wslot];
++				} else {
++					arid = id < ncube ? p.cube_arid[id] : id;
++				}
++			}
++		} else if (p.waterlog && lvl == 10 && modifier != 0) {
++			const int wslot = id * GEN_STRIDE + modifier;
++			if (twins->size() > 0 && modifier < GEN_STRIDE && wslot < twins->size() && (*twins)[wslot] >= 0) {
++				arid = (*twins)[wslot];
++			} else if (modifier < GEN_STRIDE && wslot < ngen && p.gen_arid[wslot] >= 0) {
++				arid = p.gen_arid[wslot];
++			} else {
++				arid = id < ncube ? p.cube_arid[id] : id;
++			}
++		} else if (modifier == 0) {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		} else {
++			const int slot = id * GEN_STRIDE + modifier;
++			if (modifier < GEN_STRIDE && slot < ngen && p.gen_arid[slot] >= 0) {
++				arid = p.gen_arid[slot];
++			} else {
++				arid = id < ncube ? p.cube_arid[id] : id;
++			}
++		}
++	} else if (cc_is_junction(modifier)) {
++		if (((v >> 32) & 1) != 0 && id < ncarvesnow && p.carve_snow_arid[id] >= 0) {
++			arid = p.carve_snow_arid[id];
++		} else if (id < ncarve && p.carve_arid[id] >= 0) {
++			arid = p.carve_arid[id];
++		} else {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		}
++	} else if (((v >> 33) & 0xF) != 0) {
++		const int flvl = int((v >> 33) & 0xF);
++		const PackedInt32Array *ctab = &p.comp_l3;
++		if (flvl > 8) {
++			ctab = &p.comp_l10;
++		} else if (flvl > 5) {
++			ctab = &p.comp_l8;
++		} else if (flvl > 3) {
++			ctab = &p.comp_l5;
++		}
++		const int cslot = id * GEN_STRIDE + modifier;
++		if (modifier < GEN_STRIDE && cslot < ctab->size() && (*ctab)[cslot] >= 0) {
++			arid = (*ctab)[cslot];
++		} else if (modifier < GEN_STRIDE && cslot < nsnow && p.snow_arid[cslot] >= 0) {
++			arid = p.snow_arid[cslot];
++		} else if (modifier < GEN_STRIDE && cslot < ngen && p.gen_arid[cslot] >= 0) {
++			arid = p.gen_arid[cslot];
++		} else {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		}
++	} else if ((modifier & FAM_BIT_LOCAL) != 0 &&
++			((modifier >> FAM_KIND_SHIFT_LOCAL) & FAM_KIND_MASK_LOCAL) == FAM_SLOPE_LOCAL) {
++		const int pslot = id * SLOPE_STRIDE + (modifier & 0xFFF);
++		if (((v >> 32) & 1) != 0 && pslot < nsnowslope && p.snow_slope_arid[pslot] >= 0) {
++			arid = p.snow_slope_arid[pslot];
++		} else if (pslot < nslope && p.slope_arid[pslot] >= 0) {
++			arid = p.slope_arid[pslot];
++		} else {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		}
++	} else if (((v >> 32) & 1) != 0) {
++		const int sslot = id * GEN_STRIDE + modifier;
++		if (modifier < GEN_STRIDE && sslot < nsnow && p.snow_arid[sslot] >= 0) {
++			arid = p.snow_arid[sslot];
++		} else if (modifier == 0) {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		} else {
++			const int gslot = id * GEN_STRIDE + modifier;
++			if (modifier < GEN_STRIDE && gslot < ngen && p.gen_arid[gslot] >= 0) {
++				arid = p.gen_arid[gslot];
++			} else {
++				arid = id < ncube ? p.cube_arid[id] : id;
++			}
++		}
++	} else if ((modifier & 0x8000) != 0) {
++		const int lvl = modifier & 0xF;
++		if (id == p.snow_lrid && lvl < nlayer && p.layer_arid[lvl] >= 0) {
++			arid = p.layer_arid[lvl];
++		} else {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		}
++	} else if (modifier == 0) {
++		arid = id < ncube ? p.cube_arid[id] : id;
++	} else {
++		const int slot = id * GEN_STRIDE + modifier;
++		if (modifier < GEN_STRIDE && slot < ngen && p.gen_arid[slot] >= 0) {
++			arid = p.gen_arid[slot];
++		} else {
++			arid = id < ncube ? p.cube_arid[id] : id;
++		}
++	}
++	// OOB fence (VDS 8.1): a stray/unbaked index degrades to a valid cube, never OOB.
++	const int mcount = p.model_count;
++	if (arid < 0 || arid >= mcount) {
++		const int cf = id < ncube ? p.cube_arid[id] : 0;
++		arid = (cf >= 0 && cf < mcount) ? cf : 0;
++	}
++	return arid;
++}
++
 +// ================================================================================================
-+// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). generate_block is STAGED INERT until S3.
++// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). generate_block is LIVE (S3b).
 +//
 +// A note on how they fail while staged, because it is a deliberate choice and not laziness: each
 +// returns a value that is OBVIOUSLY broken rather than plausibly correct. Missing terrain and a -1
@@ -1709,9 +1949,99 @@ index 0000000..2ff9a7a
 +// ================================================================================================
 +
 +VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input) {
-+	// ENTRY POINT 1 — S1: skeleton. Lands in S3 (resolve_cell + the emit loop), as a thin loop over
-+	// resolve_cell_core. An empty buffer here reads as visibly missing terrain: loud, as intended.
-+	return Result();
++	// ENTRY POINT 1 (S3b — LIVE). The whole inner path of module_world.gd's generated `_generate_block`,
++	// for the SHIPPED flag configuration (fp_bulk / fp_colbulk / fp_stamp all OFF, gen_lod_probe OFF).
++	// Those flags are default-false and rejected here anyway (see below), so the R1/R7/bulk fill_area
++	// paths are deliberately NOT ported: with FP_CPPGEN, worldgen runs C++, and column-bulk is a
++	// GDScript-side scheduling trick that this port makes moot. What IS ported is the exact per-cell
++	// path the GDScript generator takes when those flags are off, which is what byte-equality compares.
++	Result result;
++	VoxelBuffer &buffer = input.voxel_buffer;
++	const int lod = int(input.lod);
++
++	RWLockRead rlock(_params_lock);
++	if (!_params.ready) {
++		return result; // inert until setup(); loud (missing terrain) rather than quiet-wrong
++	}
++	const Parameters &p = _params;
++
++	// lod>0: the shipped generator early-outs unless gen_lod_probe (FP-R0). This port does not do the
++	// stride probe (it is a GDScript-side LOD tier, not worldgen), so lod>0 emits nothing — exactly the
++	// shipped generator with gen_lod_probe=false.
++	if (lod != 0) {
++		return result;
++	}
++
++	const Vector3i size = buffer.get_size();
++	const int ox = input.origin_in_voxels.x;
++	const int oy = input.origin_in_voxels.y;
++	const int oz = input.origin_in_voxels.z;
++	const unsigned int ch = VoxelBuffer::CHANNEL_TYPE;
++	const int sea = SEA_LEVEL;
++	const int max_above = MAX(10, SNOW_FILL_MAX_CELLS); // TreeGen.MAX_ABOVE_SURFACE=10
++	const int fid = p.gen_facet;
++
++	// Cheap constant all-air early-outs (no noise).
++	if (oy > MAX_SURFACE_Y + max_above && oy > sea) {
++		return result;
++	}
++	if (oy + size.y <= WORLD_BOTTOM_Y) {
++		return result;
++	}
++	// Faceted block-level all-air early-out (junction_modify would mask every cell to AIR).
++	if (fid >= 0 && block_all_air(p, fid, ox, oy, oz, size.x, size.y, size.z, 1)) {
++		return result;
++	}
++
++	// Per-column profile pass. profs[z*size.x + x] = Vector4(g, biome, c, t); track max_h.
++	std::vector<Vector4> profs;
++	profs.resize(size.x * size.z);
++	int max_h = -0x7fffffff;
++	for (int z = 0; z < size.z; ++z) {
++		for (int x = 0; x < size.x; ++x) {
++			const Vector4 pr = column_profile_core(p, fid, ox + x, oz + z);
++			profs[z * size.x + x] = pr;
++			if (int(pr.x) > max_h) {
++				max_h = int(pr.x);
++			}
++		}
++	}
++
++	// Whole-block all-air (profiled).
++	int top = max_h + max_above;
++	if (sea > top) {
++		top = sea;
++	}
++	if (oy > top) {
++		return result;
++	}
++
++	// Per-column emit. jinv rotation is skipped: flat_world (and faceted, which is flat) => col_jinv 0.
++	for (int z = 0; z < size.z; ++z) {
++		for (int x = 0; x < size.x; ++x) {
++			const Vector4 pr = profs[z * size.x + x];
++			const int wx = ox + x;
++			const int wz = oz + z;
++			const int g = int(pr.x);
++			const int srun = slope_run_core(p, fid, wx, wz, g);
++			for (int y = 0; y < size.y; ++y) {
++				const int wy = oy + y;
++				int64_t v = resolve_cell_core(p, fid, wx, wy, wz, pr, srun);
++				if (fid >= 0) {
++					v = junction_modify(p, fid, wx, wy, wz, v);
++				}
++				const int id = cc_mat(v);
++				if (id == 0) {
++					continue; // air: leave the buffer default, exactly as the GDScript loop skips
++				}
++				// cell_to_arid returns a valid model index (>= 0; the OOB fence guarantees in-range).
++				// A non-air cell that the fence clamps to model 0 still writes 0, matching the GDScript
++				// set_voxel(0) on that cell.
++				buffer.set_voxel(uint64_t(cell_to_arid(p, v)), x, y, z, ch);
++			}
++		}
++	}
++	return result;
 +}
 +
 +Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
@@ -1772,6 +2102,12 @@ index 0000000..2ff9a7a
 +	return resolve_cell_core(_params, fid, x, y, z, prof, slope_run);
 +}
 +
++void VoxelGeneratorCosmos::gd_generate_block(Ref<godot::VoxelBuffer> out_buffer, Vector3i origin, int lod) {
++	ERR_FAIL_COND(out_buffer.is_null());
++	VoxelQueryData q{ out_buffer->get_buffer(), origin, uint32_t(lod) };
++	generate_block(q);
++}
++
 +void VoxelGeneratorCosmos::_bind_methods() {
 +	ClassDB::bind_method(D_METHOD("setup", "config"), &VoxelGeneratorCosmos::setup);
 +	ClassDB::bind_method(D_METHOD("is_ready"), &VoxelGeneratorCosmos::is_ready);
@@ -1781,6 +2117,7 @@ index 0000000..2ff9a7a
 +	// S1 -- while they are staged inert -- so the boundary shape is pinned by the gate from the start
 +	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
 +	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);
++	ClassDB::bind_method(D_METHOD("_generate_block", "out_buffer", "origin_in_voxels", "lod"), &VoxelGeneratorCosmos::gd_generate_block);
 +	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
 +	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
 +	ClassDB::bind_method(D_METHOD("resolve_cell", "fid", "x", "y", "z"), &VoxelGeneratorCosmos::resolve_cell);
@@ -1789,10 +2126,10 @@ index 0000000..2ff9a7a
 +} // namespace zylann::voxel
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
 new file mode 100644
-index 0000000..e4a6a3e
+index 0000000..d4a1d0e
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,395 @@
 +#ifndef VOXEL_GENERATOR_COSMOS_H
 +#define VOXEL_GENERATOR_COSMOS_H
 +
@@ -1885,6 +2222,7 @@ index 0000000..e4a6a3e
 +#include "../../util/godot/classes/noise.h"
 +#include "../../util/thread/rw_lock.h"
 +#include "../voxel_generator.h"
++#include "../../storage/voxel_buffer_gd.h"
 +
 +#include <core/math/vector4i.h>
 +#include <core/variant/typed_array.h>
@@ -1944,6 +2282,12 @@ index 0000000..e4a6a3e
 +	//
 +	// S2/S3: implement as a thin loop over column_profile_core. NOT as its own sampler.
 +	Dictionary sample_columns(int fid, PackedInt64Array cells) const;
++
++	// Harness alias: some GDScript gates drive the generator by the VoxelGeneratorScript override name
++	// `_generate_block(buffer, origin, lod)` rather than the base virtual. Bind it so those gates run
++	// against the C++ generator identically -- the LIVE game path (VoxelTerrain -> generate_block) is
++	// unaffected; this only lets a test call the same work by the other name.
++	void gd_generate_block(Ref<godot::VoxelBuffer> out_buffer, Vector3i origin, int lod);
 +
 +	// --- ENTRY POINT 3: scalar parity queries (SEAMLESS-SCALES §7.2 item 3) ---------------------
 +	//
@@ -2063,6 +2407,14 @@ index 0000000..e4a6a3e
 +	static int64_t with_surface_snow_fill(const Parameters &p, int fid, int64_t v, int x, int z, int g, double t);
 +	static int64_t with_lip_snow_fill(const Parameters &p, int fid, int64_t v, int x, int z, int g, double t);
 +
++	// S3b — the emit loop's faceted junction authority (FacetAtlas), pure over the frozen seam planes.
++	static int64_t junction_modify(const Parameters &p, int fid, int cx, int cy, int cz, int64_t v);
++	static bool block_all_air(const Parameters &p, int fid, int ox, int oy, int oz, int sx, int sy, int sz, int st);
++	static bool cell_interior_scaled(const Parameters &p, int fid, int wx, int wy, int wz, int s);
++	static int junction_q_of(const Parameters &p, int fid, int slot, int x, int y, int z);
++	// S3b — the packed-cell -> ARID map (the emit loop's dispatch), pure over the frozen appearance tables.
++	static int cell_to_arid(const Parameters &p, int64_t v);
++
 +	// S2 gate surface: the ported slope run for a column, so verify_cppgen can compare it against
 +	// GDScript's slope_run_of. Exposed via ClassDB alongside the §7.2 entry points.
 +public:
@@ -2110,6 +2462,9 @@ index 0000000..e4a6a3e
 +		// takes an `fid` precisely so a skin tile can cover facets other than the one the voxel workers
 +		// are homed on. gen_facet is this epoch's HOME facet, not a limit on what may be sampled.
 +		int facet_count = 0;
++		// S3b: the 4 own-side ridge planes per facet (junction_modify / block_all_air / cell_interior).
++		PackedFloat64Array seam_plane;
++		double seam_eps = 1.0e-6;
 +
 +		// TreeGen material ids (BlockCatalog). Frozen: BlockCatalog.id_of() is a main-thread lookup and
 +		// must never be reached from a worker.
@@ -2130,6 +2485,15 @@ index 0000000..e4a6a3e
 +		PackedInt32Array carve_arid;
 +		PackedInt32Array carve_snow_arid;
 +		PackedInt32Array surface_arid;
++		// S3b: the per-kind liquid twin tables (gen_twin_arid[1..3]) + snow-fill composites + snow LRID.
++		PackedInt32Array twin_w;   // LIQ_WATER
++		PackedInt32Array twin_l;   // LIQ_LAVA
++		PackedInt32Array twin_3;   // reserved third liquid
++		PackedInt32Array comp_l3;
++		PackedInt32Array comp_l5;
++		PackedInt32Array comp_l8;
++		PackedInt32Array comp_l10;
++		int snow_lrid = -1;
 +
 +		// Frozen material ids resolved from BlockCatalog (TerrainConfig._ensure_ids' outputs).
 +		PackedInt32Array block_ids;

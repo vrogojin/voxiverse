@@ -388,7 +388,8 @@ const _EDGE_STRIDE := 7                   # ints per (face, side) entry in one b
 const _EDGE_BLOCK := 24 * _EDGE_STRIDE    # ints per warmed n (6 faces × 4 sides × stride)
 static var _edge_flat: PackedInt32Array = PackedInt32Array()   # slot-major concat of _EDGE_BLOCK blocks
 static var _edge_ns: PackedInt32Array = PackedInt32Array()     # the n of each block, in slot order
-static var _edge_frozen := false         # true once warm_edge_tables() has published a block
+# (the old single-n `_edge_frozen` flag is gone: with a multi-n table "is it built?" is only ever a
+# question ABOUT AN N, which `edge_tables_warm(n)` answers exactly. A global bool would now be a lie.)
 
 ## Base index of the frozen block for `n` in `_edge_flat`, or −1 if `n` is not warmed. Pure Packed
 ## reads of never-mutated arrays (worker-safe); the scan is ≤ the registered body count.
@@ -807,7 +808,6 @@ static func warm_edge_tables(n: int) -> void:
 	ns.append(n)
 	_edge_flat = flat        # data first: the new block is unreachable until its n is named below
 	_edge_ns = ns            # ...then name it — this is what makes the slot readable
-	_edge_frozen = true
 
 ## Generate one {b, m, t} unfold entry for (face, side) at resolution n.
 static func _gen_edge(face: int, side: int, n: int) -> Dictionary:

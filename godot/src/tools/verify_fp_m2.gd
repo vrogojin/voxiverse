@@ -664,7 +664,7 @@ func _gate_dir(nf: int) -> void:
 	for fid in range(nf):
 		var cc: Vector2i = FA.centre_cell(fid)
 		var d: CubeSphere.DVec3 = FA.cell_dir(fid, cc.x, cc.y)
-		if int(FA.facet_of_dir(d)) != fid:
+		if int(FA.facet_of_dir("earth", d)) != fid:
 			mismatches += 1
 			if first_bad < 0:
 				first_bad = fid

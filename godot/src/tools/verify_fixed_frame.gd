@@ -416,7 +416,7 @@ func _p3_numeric_lemmas() -> void:
 		# neighbour up differs from active up by the dihedral (~3.7° ⇒ dot < 1): the per-facet volumes are genuinely distinct.
 		_ok(active_up.dot(nb_up) < 0.9999, "G-P3-GRAV-UP neighbour %d up ≠ active up (per-facet accuracy)" % nb)
 		var cc := FacetAtlas.centre_cell(nb)
-		_ok(FacetAtlas.facet_of_dir(FacetAtlas.cell_dir(nb, cc.x, cc.y)) == nb,
+		_ok(FacetAtlas.facet_of_dir("earth", FacetAtlas.cell_dir(nb, cc.x, cc.y)) == nb,
 			"G-P3-GRAV-CLASSIFY facet_of_dir(centre_dir(%d)) == %d" % [nb, nb])
 
 ## COSMOS FP-FIXED-FRAME P3 LIVE (§3 re-anchor + §10 decision 2) — a real WorldManager (flags on, module present):

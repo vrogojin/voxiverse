@@ -16,6 +16,21 @@ const MARGIN_CELLS := 8          # lattice cells kept beyond the facet polygon (
 const STRIP_CELLS := 2           # per-side seam strip width (FP2+)
 const SPAWN_EDGE_MIN := 48       # spawn scan stays ≥ this many cells from the facet boundary
 
+# ---------------------------------------------------------------------------------------
+# COSMOS ORBITAL O4a (docs/COSMOS-ORBITAL-O1O4-DESIGN.md Part B §3.1) — the GLOBAL FID NAMESPACE.
+# Facet ids are a single namespace across ALL bodies: each registered body owns a contiguous fid
+# block [fid_base(body) .. fid_base(body) + 6·k_body² − 1]. BODY_TABLE is APPEND-ONLY, never
+# re-ordered, and a body's k/r NEVER change after content exists on it (fids encode into persisted
+# edits + future portal anchors — §3.1 fact 5). In O4a the table holds ONLY Earth at fid_base 0 with
+# k == K (24) / r == R_BLOCKS (3072) → every per-fid accessor is bit-for-bit what the shipped
+# single-body atlas returned (k_of ≡ 24, r_of ≡ 3072, body_of_fid ≡ 0, facet_count ≡ 3456), proven by
+# the G-O4-EQ gate (verify_multibody.gd). The Moon (k=14/r=1737) is APPENDED in O4b behind
+# CubeSphere.MULTI_BODY — nothing here changes until then. Earth's `k`/`r` MUST equal K/R_BLOCKS or
+# the (still const-based) build math in _build_facet/_build_seam would disagree with the accessors.
+const BODY_TABLE := [
+	{"name": "earth", "k": 24, "r": 3072.0},   # fid_base 0
+]
+
 static var _ready := false
 static var _nf := 0
 static var _frame := PackedFloat64Array()   # 12/fid: c0'(3) ê_u(3) n̂(3) ê_w(3)
@@ -38,8 +53,65 @@ static var _seam_neigh := PackedInt32Array()     # 4/fid: neighbour fid per slot
 static var _seam_ring := PackedFloat64Array()    # 24/fid: 4 slots × (r0.xyz, r1.xyz) welded ring (world)
 static var _seam_mhat := PackedFloat64Array()    # 12/fid: 4 slots × m̂.xyz (world ridge normal, toward this facet)
 
+# ------- O4a body registry (pure functions of BODY_TABLE + CubeSphere.MULTI_BODY; pre-warm safe) -------
+# Every accessor derives from the const BODY_TABLE, so it is valid before AND after warm_up (mirroring
+# facet_count()'s shipped pre-warm property). In O4a there is exactly one built body (Earth) regardless of
+# MULTI_BODY, so all of these collapse to the shipped constants.
+
+## Number of bodies actually BUILT into the atlas: Earth always, any body beyond it iff MULTI_BODY.
+## O4a: BODY_TABLE has one entry, so this is 1 either way.
+static func body_count() -> int:
+	if CubeSphere.MULTI_BODY:
+		return BODY_TABLE.size()
+	return 1
+
+## First fid of built-body slot `slot` (= Σ 6·k² over earlier slots). Slot 0 (Earth) == 0 always.
+static func fid_base_slot(slot: int) -> int:
+	var base := 0
+	for s in range(slot):
+		var k := int(BODY_TABLE[s]["k"])
+		base += 6 * k * k
+	return base
+
+## Registry slot index of a body name (-1 if absent). Earth == 0.
+static func body_slot(body: String) -> int:
+	for s in range(BODY_TABLE.size()):
+		if String(BODY_TABLE[s]["name"]) == body:
+			return s
+	return -1
+
+## First fid owned by `body`. fid_base("earth") == 0.
+static func fid_base(body: String) -> int:
+	return fid_base_slot(body_slot(body))
+
+## Facet count of a single body = 6·k². body_facet_count("earth") == 3456.
+static func body_facet_count(body: String) -> int:
+	var k := int(BODY_TABLE[body_slot(body)]["k"])
+	return 6 * k * k
+
+## Which built body owns `fid` (slot index). O4a: 0 for every valid fid. 2-body: one range compare.
+static func body_of_fid(fid: int) -> int:
+	var slot := body_count() - 1
+	while slot > 0 and fid < fid_base_slot(slot):
+		slot -= 1
+	return slot
+
+## Faceting resolution K for the body owning `fid`. O4a ≡ 24.
+static func k_of(fid: int) -> int:
+	return int(BODY_TABLE[body_of_fid(fid)]["k"])
+
+## Planet radius (blocks) for the body owning `fid`. O4a ≡ 3072.0.
+static func r_of(fid: int) -> float:
+	return float(BODY_TABLE[body_of_fid(fid)]["r"])
+
+## TOTAL facets across all BUILT bodies (the global fid range [0, facet_count())). O4a ≡ 6·K² ≡ 3456
+## (byte-identical to the shipped `6 * K * K`). Pure over BODY_TABLE → valid before warm_up.
 static func facet_count() -> int:
-	return 6 * K * K
+	var total := 0
+	for s in range(body_count()):
+		var k := int(BODY_TABLE[s]["k"])
+		total += 6 * k * k
+	return total
 
 # ---------------------------------------------------------------------------------------
 # The FACETED global edit key (COSMOS-FP-M1-DESIGN §6.2 / FACETED-IMPL §6.2). Under FACETED an
@@ -53,7 +125,11 @@ static func facet_count() -> int:
 #   12 bits fid | 18 bits (x+2^17) | 18 bits (z+2^17) | 11 bits (y+512)  -> 59 bits, a plain int64.
 #
 # Ranges (every term is non-negative, so the packed key is always positive → GDScript /,% are exact):
-#   fid  < 4096   (6·24² = 3456 facets, K=24)
+#   fid  — the GLOBAL multi-body fid (O4a §3.1 fact 4). The multiplicative pack is key ≈ fid·2^47, so a
+#          plain int64 (< 2^63) holds fid to ~65,000 — FAR beyond any registered body count (Earth 3456
+#          today; Earth+Moon at the O3 K=50 resize is 15,000 + 1,176 = 16,176). The old "fid < 4096" was
+#          the single-body K=24 facet count, NOT a packing limit; the gate asserts pack/unpack round-trip
+#          over the full registered fid range.
 #   x,z  ∈ [−131072, 131071]  — the decorrelation offset O ∈ [−32768, 32767] (_build_facet:107-108)
 #                               pushes |lattice| to ~3·10⁴; 2^17 centring gives ~4× headroom.
 #   y    ∈ [−512, 1535]       — the worldgen vertical envelope (bedrock −64 … tallest surface+tree).
@@ -84,26 +160,37 @@ static func edit_key_fid(key: int) -> int:
 static func warm_up() -> void:
 	if _ready:
 		return
-	_nf = 6 * K * K
+	# O4a: multi-body-shaped, but Earth is the only built body. The loop appends each built body's
+	# facets contiguously at its fid_base; for Earth (slot 0, base 0, k == K) `base + (face·k+a)·k+b`
+	# is TEXTUALLY the shipped `(face·K+a)·K+b`, and _build_facet/_build_seam still use the const
+	# K/R_BLOCKS internally — so Earth builds byte-identically (G-O4-EQ pins it). O4b appends the Moon
+	# here (a second slot) and parameterises the build math on k_of/r_of; nothing else moves.
+	_nf = facet_count()
 	_frame.resize(_nf * 12)
 	_off.resize(_nf * 2)
 	_poly.resize(_nf * 8)
 	_dom.resize(_nf * 4)
-	for face in range(6):
-		for a in range(K):
-			for b in range(K):
-				_build_facet((face * K + a) * K + b, face, a, b)
+	for slot in range(body_count()):
+		var base := fid_base_slot(slot)
+		var k := int(BODY_TABLE[slot]["k"])
+		for face in range(6):
+			for a in range(k):
+				for b in range(k):
+					_build_facet(base + (face * k + a) * k + b, face, a, b)
 	# seams need every facet's frame built first (each seam reads BOTH facets' planes)
 	_seam_plane.resize(_nf * 16)
 	_seam_neigh.resize(_nf * 4)
 	_seam_ring.resize(_nf * 24)
 	_seam_mhat.resize(_nf * 12)
-	for face in range(6):
-		for a in range(K):
-			for b in range(K):
-				var fid := (face * K + a) * K + b
-				for slot in range(4):
-					_build_seam(fid, face, a, b, slot)
+	for slot in range(body_count()):
+		var base := fid_base_slot(slot)
+		var k := int(BODY_TABLE[slot]["k"])
+		for face in range(6):
+			for a in range(k):
+				for b in range(k):
+					var fid := base + (face * k + a) * k + b
+					for seam_slot in range(4):
+						_build_seam(fid, face, a, b, seam_slot)
 	_spawn_fid = _pick_spawn_facet()
 	_ready = true
 
@@ -607,7 +694,10 @@ static func _facet_centre_cell(fid: int) -> Vector2i:
 	return Vector2i(_off[fid * 2] + int(round(qx)), _off[fid * 2 + 1] + int(round(qy)))
 
 static func _pick_spawn_facet() -> int:
-	for fid in range(_nf):
+	# O4a: spawn is Earth-only — restrict the scan to Earth's fid block (§3.1/§3.3). In O4a Earth is
+	# base 0 with 3456 facets, so range(0, 3456) == the shipped range(_nf); the Moon is never scanned.
+	var e_base := fid_base("earth")
+	for fid in range(e_base, e_base + body_facet_count("earth")):
 		var cc := _facet_centre_cell(fid)
 		var d := cell_dir(fid, cc.x, cc.y)
 		if absf(d.z) >= 0.5:                       # temperate latitude only (|sin φ| < 0.5)
@@ -636,12 +726,16 @@ static func spawn_column() -> Vector2i:
 ## facet_of_dir(cell_dir(fid, centre_cell(fid))) == fid over all 6·K² facets. The fid layout mirrors warm_up's build
 ## order fid = (face·K + a)·K + b. The M2d pool policy uses this only defensively (freeze spawns for a high flyer
 ## above OFFSURFACE_Y — no ridge-skim thrash); full off-facet gravity/locomotion is FP-M3.
-static func facet_of_dir(d: CubeSphere.DVec3) -> int:
-	var fc := CubeSphere.dir_to_face_cell(d, K)
+## O4a: `body` names which body's facet grid to classify into (the fid namespace is global). For Earth
+## (k == K == 24, fid_base 0) this returns `(face·K+fi)·K+fj` — byte-identical to the shipped classifier.
+static func facet_of_dir(body: String, d: CubeSphere.DVec3) -> int:
+	var k := int(BODY_TABLE[body_slot(body)]["k"])
+	var base := fid_base(body)
+	var fc := CubeSphere.dir_to_face_cell(d, k)
 	var face: int = int(fc["face"])
-	var fi: int = clampi(int(fc["fi"]), 0, K - 1)
-	var fj: int = clampi(int(fc["fj"]), 0, K - 1)
-	return (face * K + fi) * K + fj
+	var fi: int = clampi(int(fc["fi"]), 0, k - 1)
+	var fj: int = clampi(int(fc["fj"]), 0, k - 1)
+	return base + (face * k + fi) * k + fj
 
 # ------- frame self-test (G-F1e, all f64 — never routes the frame through f32 Vector3) -------
 

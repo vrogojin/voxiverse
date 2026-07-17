@@ -798,9 +798,17 @@ static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector
 
 ## COSMOS FACETED (§3.1): the sphere-terrain profile for a facet's local lattice column (fid, x, z). The facet
 ## cell's TRUE direction (FacetAtlas.cell_dir — all f64) sampled at R_BLOCKS. Deterministic: (SEED, fid, x, z).
+## COSMOS ORBITAL O4a (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2) — the per-body worldgen DISPATCH point.
+## fid is the GLOBAL multi-body facet id; body_of_fid(fid) selects the body's profile. In O4a only Earth
+## (body 0) is registered and r_of(fid) ≡ FacetAtlas.R_BLOCKS (3072), so this is byte-identical to the
+## shipped `profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)` (G-O4-EQ pins it). O4b slots the Moon in as
+## a `1:` branch calling moon_profile_at_dir — the match is structured so nothing else moves.
 static func facet_profile(fid: int, x: int, z: int) -> Vector4:
 	var d := FacetAtlas.cell_dir(fid, x, z)
-	return profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+	match FacetAtlas.body_of_fid(fid):
+		# 1: return moon_profile_at_dir(d.x, d.y, d.z, FacetAtlas.r_of(fid))   # O4b — the Moon
+		_:
+			return profile_at_dir(d.x, d.y, d.z, FacetAtlas.r_of(fid))         # Earth (body 0) — verbatim
 
 ## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
 ## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate

@@ -225,6 +225,14 @@ const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
 ## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
 const ORBITAL_SKY := false
 
+## COSMOS ORBITAL O4 (docs/COSMOS-ORBITAL-O1O4-DESIGN.md Part B §3.1, §3.7) — the multi-body master toggle.
+## When true, FacetAtlas.warm_up APPENDS every body beyond Earth in BODY_TABLE (the Moon in O4b) into the
+## same static packed arrays, and CubeSphere.warm_edge_tables warms each body's K grid. Default FALSE ⇒ ONLY
+## Earth is built: BODY_TABLE has a single entry in O4a so this flag changes NOTHING yet (body_count() == 1,
+## every per-fid accessor collapses to the shipped constants) — it exists so the O4b Moon append is a
+## registry-row edit gated here, not a structural change. Byte-identity for Earth is proven by G-O4-EQ.
+const MULTI_BODY := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

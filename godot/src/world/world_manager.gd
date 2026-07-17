@@ -1998,7 +1998,7 @@ func _pool_off_surface(active: int, player_pos: Vector3) -> bool:
 	if player_pos.y <= CubeSphere.OFFSURFACE_Y:
 		return false
 	var w := FacetAtlas.lattice_to_world64(active, player_pos.x, player_pos.y, player_pos.z)
-	var rad_fid := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	var rad_fid := FacetAtlas.facet_of_dir("earth", CubeSphere.DVec3.new(w[0], w[1], w[2]))
 	return rad_fid != active
 
 ## FP-M2d (§9.1) — the promote-completion pass: for every in-flight live promote, drop the held LOD cover once the live

@@ -61,6 +61,12 @@ func _initialize() -> void:
 # G-TIER-ENVELOPE (P2, RC-A) — the skew-aware min-envelope poke oracle.
 # =====================================================================================================
 func _gate_envelope(active: int) -> void:
+	# Phase-guarded (§ isolation): the envelope assertions only hold under FP_TIER_ENVELOPE. With the flag off this phase
+	# is SKIPPED (0 pass / 0 fail) so a STICKY-only or DEPTH-BIAS-only run is a clean green. Falsify the envelope by
+	# sabotaging its IMPLEMENTATION (not the flag): break _ensure_backstop_cached_env → the ε-sink lower bound pokes → RED.
+	if not TierPlace.envelope_on():
+		print("  --- G-TIER-ENVELOPE: SKIPPED (FP_TIER_ENVELOPE off) ---")
+		return
 	print("  --- G-TIER-ENVELOPE: at a small ε sink the min-envelope is a provable lower bound; a plain profile sample is NOT ---")
 	var ring: Node3D = FFR.new()
 	get_root().add_child(ring)
@@ -167,6 +173,12 @@ func _const_sink_positions(fid: int, cells: int, sink: float) -> PackedVector3Ar
 # G-TIER-STICKY (P1, RC-B) — make-before-break: a ring-1 facet is an emitted backstop through the deferred window.
 # =====================================================================================================
 func _gate_sticky(active: int) -> void:
+	# Phase-guarded: the make-before-break assertions only hold under FP_TIER_STICKY_BACKSTOP. Off ⇒ SKIPPED (green).
+	# Falsify by sabotaging the implementation: make TierPlace.ring1 return only [active] (drop the neighbours) → B is no
+	# longer sticky → is_emitted_backstop(B) false → RED.
+	if not TierPlace.sticky_on():
+		print("  --- G-TIER-STICKY: SKIPPED (FP_TIER_STICKY_BACKSTOP off) ---")
+		return
 	print("  --- G-TIER-STICKY: ring-1 facet drawn SUNK before it enters the pool (no unsunk quad under live near meshes) ---")
 	var ring: Node3D = FFR.new()
 	get_root().add_child(ring)
@@ -192,17 +204,58 @@ func _gate_sticky(active: int) -> void:
 	ring.call("set_pool_excluded", PackedInt32Array([B]))
 	_ok(bool(ring.call("is_emitted_backstop", B)),
 		"G-TIER-STICKY: B=%d remains an emitted backstop across the deferred-rebuild window (RC-B flash prevented)" % B)
+	# WHY ring-1 must include the DIAGONALS (the ≤12 set, not just active+4 seam=≤5): after the player crosses A→B, B
+	# becomes active and B's OWN seam neighbours enter the pool. They must ALREADY be sunk in the pre-crossing committed
+	# mesh (built while A was active) or the crossing itself flashes. A diagonal D (a seam neighbour of B, front-visible,
+	# not active, not a direct neighbour of active) is exactly such a facet — it is drawn sunk at spawn ONLY because
+	# ring1(active) reaches the diagonals. Sabotaging ring1 to active+4-seam would drop D → the crossing would flash.
+	var D := -1
+	for slot in range(4):
+		var d := FA.seam_neighbour(B, slot)
+		if d >= 0 and d != active and _centre_dir(d).dot(nv) >= 1.0e-4 and FA.seam_neighbour(active, 0) != d \
+				and FA.seam_neighbour(active, 1) != d and FA.seam_neighbour(active, 2) != d and FA.seam_neighbour(active, 3) != d:
+			D = d; break
+	if D >= 0:
+		_ok(bool(ring.call("is_emitted_backstop", D)),
+			"G-TIER-STICKY: diagonal D=%d (B's neighbour) is pre-sunk at spawn → the A→B crossing itself never flashes" % D)
+	else:
+		print("    (no clean front-visible diagonal off B=%d — geometry; two-step check skipped)" % B)
 	# NEVER-OOM bound: the sticky set never exceeds the stated dense-cache ceiling.
 	_ok(int(ring.call("sticky_count")) <= CubeSphere.STICKY_RING1_MAX,
 		"G-TIER-STICKY-BOUND: sticky set %d ≤ cap %d (dense cache ≤ 1+ring-1 ≈ +96 kB)" % [int(ring.call("sticky_count")), CubeSphere.STICKY_RING1_MAX])
 	_ok(int(ring.call("backstop_cache_size")) <= 1 + CubeSphere.STICKY_RING1_MAX,
 		"G-TIER-STICKY-BOUND: dense backstop cache %d facets ≤ 1+STICKY_RING1_MAX" % int(ring.call("backstop_cache_size")))
+
+	# --- G-TIER-STICKY-PERF (structural anti-hitch) — sticky's ONLY runtime cost is a larger backstop set in the ring
+	# rebuild. Three structural properties keep that from becoming a main-thread hitch, each asserted here (headless can't
+	# read live fps; probe_sticky_perf.gd measured the delta directly: async main-thread swap +0.23ms native, 6% bigger
+	# mesh upload; the +~4ms build is off-thread):
+	#   (1) the set is BOUNDED (≤ STICKY_RING1_MAX) ⇒ the per-crossing rebuild-size delta is bounded (asserted above);
+	#   (2) the enlarged dense-cache warming is TIME-SLICED (WARM_BUDGET_MS>0), never one unbounded synchronous build;
+	#   (3) the ring HAS an off-main-thread rebuild path so the enlarged (backstop-heavy) build runs off the frame.
+	_ok(FFR.WARM_BUDGET_MS > 0.0,
+		"G-TIER-STICKY-PERF: dense-cache warming is time-sliced (WARM_BUDGET_MS=%.1f ms/frame) — sticky's extra warms spread" % FFR.WARM_BUDGET_MS)
+	_ok(ring.has_method("_dispatch_async_rebuild") and ring.has_method("_async_enabled"),
+		"G-TIER-STICKY-PERF: an off-main-thread rebuild path exists — the enlarged backstop build runs off the crossing frame")
+	# With depth-bias OFF the far material MUST stay the shipped StandardMaterial3D (no shader swap → normal appearance).
+	# This pins the "drop the shader swap" requirement of the isolated sticky build. (Skipped when P3 is also on, where
+	# the material is intentionally the biased ShaderMaterial — covered by G-TIER-DEPTH-BIAS.)
+	if not TierPlace.depth_bias_on():
+		var fmat: Material = ring.get("_mi").material_override
+		_ok(fmat is StandardMaterial3D and not (fmat is ShaderMaterial),
+			"G-TIER-STICKY-PERF: far material is StandardMaterial3D (P3 shader swap NOT applied with sticky alone)")
 	ring.free()
 
 # =====================================================================================================
 # G-TIER-DEPTH-BIAS (P3, RC-C) — the far/skin biased ShaderMaterial + the near-plane policy.
 # =====================================================================================================
 func _gate_depth_bias(active: int) -> void:
+	# Phase-guarded: the biased-ShaderMaterial + near-plane assertions only hold under FP_TIER_DEPTH_BIAS. Off ⇒ SKIPPED
+	# (green) — a STICKY-only run keeps the shipped StandardMaterial3D (normal appearance), which is the point of dropping
+	# the shader swap from this build. Falsify by sabotaging make_biased_material (drop the uniform) → shader check RED.
+	if not TierPlace.depth_bias_on():
+		print("  --- G-TIER-DEPTH-BIAS: SKIPPED (FP_TIER_DEPTH_BIAS off) ---")
+		return
 	print("  --- G-TIER-DEPTH-BIAS: far/skin biased ShaderMaterial (window-space k-quantum) + raised near plane ---")
 	# Policy constants (the depth-domain contract §5.2: near 0 < skin 4 < far 8 quanta; near plane raised 5×).
 	_ok(is_equal_approx(TierPlace.far_bias(), 2.0 * 8.0 * TierPlace.DEPTH_QUANTUM), "far bias = 2·8·2⁻²⁴")

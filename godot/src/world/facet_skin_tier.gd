@@ -34,8 +34,9 @@ const TILE := 32                     # columns per tile edge (pitch 1). Adjacent
                                      # column (tile tx spans [tx·TILE .. tx·TILE+TILE] inclusive), so a
                                      # shared vertex is sampled from the SAME integer (fid,x,z) on both —
                                      # bit-identical by construction (the shared-edge rule, §7 / G-SKIN-EDGE).
-const SINK := 1.5                    # blocks pushed radially inward, so the near voxels overdraw the skin
-                                     # (SEAMLESS-SCALES §5.1; the far ring's BACKSTOP_SINK is the same idea).
+const SINK := 1.5                    # the v1 depth-composition knob (blocks). See _compose_position — this is
+                                     # HOW the skin defers to the exact voxels, kept separate from WHAT the tile
+                                     # is (the geometry below never reads SINK except through _compose_position).
 const R_INNER := 64.0                # skip tiles wholly inside this radius: the near voxel disc (0..~128)
                                      # already covers there, so spending the budget on the 96..256 annulus
                                      # (where the arriving-mesh frontier leaves the coarse backstop showing)
@@ -241,8 +242,30 @@ func _positions_from(fid: int, ox: int, oz: int, heights: PackedFloat32Array) ->
 		var gj := i / stride
 		var g := int(heights[i])
 		var w := _lattice_world(fid, float(ox + gi), float(g), float(oz + gj))
-		pos[i] = w - w.normalized() * SINK        # SEAMLESS-SCALES §5.1: strictly below the true surface
+		pos[i] = _compose_position(w)             # geometry hands the TRUE surface point to the ONE
+		                                          # composition site; it never applies depth resolution itself
 	return pos
+
+## THE composition-mechanism site (the ONLY one). Maps a TRUE world surface point to the position the skin
+## renders at so the exact voxels strictly OVERDRAW it and it OVERDRAWS the far-ring backstop — the
+## "overlap + shared sampling + sink" contract (SEAMLESS-SCALES §0.5/§5.1). This is a resolution trick, kept
+## deliberately SEPARATE from tile geometry (heights/colours/water/shared-edge/ridge exactness are identical
+## no matter how depth is resolved): swapping the mechanism must touch ONLY this function.
+##
+## v1 = a constant radial SINK (push the surface `SINK` blocks toward the planet centre). At the skin's
+## operating range (96-256 blocks) binocular depth acuity is ~14-42 blocks, so a 1.5-block sink is ~10-28×
+## below the stereo/VR threshold — imperceptible; it stays as v1. It is a pure function of the surface point,
+## so two adjacent tiles' shared column (same `w`) still land bit-identically (G-SKIN-EDGE holds).
+##
+## Future alternatives (NOT built — this is the seam that keeps them a drop-in):
+##   (a) distance-scaled polygon offset — return `w` unchanged and bias the DEPTH in the material just enough
+##       to break z-fight, scaled with distance to stay under the per-distance stereo threshold (true depth,
+##       VR-exact); needs the offset wired on the material, geometry unchanged.
+##   (b) true-depth layered composite — return `w` unchanged and render each tier to its own target,
+##       compositing by nested coverage; needs Forward+/WebGPU or a depth-texture engine patch (unschedulable
+##       in gl_compatibility through Godot 4.7).
+func _compose_position(w: Vector3) -> Vector3:
+	return w - w.normalized() * SINK
 
 ## Gate surface (G-SKIN-EDGE): the raw sunk (stride×stride) positions a tile at lattice origin (ox,oz)
 ## would build. Takes the origin directly (not tx/tz) so the gate can FALSIFY by perturbing it.
@@ -350,7 +373,7 @@ func skin_vertex(fid: int, x: int, z: int) -> Vector3:
 	var res: Dictionary = _sampler.call(fid, PackedInt64Array([_pack_xz(x, z)]))
 	var g := int((res["heights"] as PackedFloat32Array)[0])
 	var w := _lattice_world(fid, float(x), float(g), float(z))
-	return w - w.normalized() * SINK
+	return _compose_position(w)
 
 ## The TRUE (unsunk) absolute surface point for column (fid,x,z) — the sink gate's reference.
 func true_vertex(fid: int, x: int, z: int) -> Vector3:

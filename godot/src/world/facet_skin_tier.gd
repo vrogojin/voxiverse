@@ -104,7 +104,7 @@ var _sampler_obj: Object = null      # STRONG ref to the sampler's object (the c
                                      # out from under _sampler mid-session (else every sample returns null).
 var _active_fid := -1
 var _anchor_offset: Vector3 = Vector3.ZERO   # fixed-frame floating-origin shift, mirrored from the far ring
-var _mat: StandardMaterial3D
+var _mat: Material                   # StandardMaterial3D normally; the biased tier ShaderMaterial under FP_TIER_DEPTH_BIAS (P3)
 # Per-tile geometry (the merge source of truth). key "fid:tx:tz" ->
 #   {fid:int, bytes:int, dist:float, pos:PackedVector3Array, nrm:PackedVector3Array, col:PackedColorArray, idx:PackedInt32Array}
 var _tiles: Dictionary = {}
@@ -604,7 +604,12 @@ static func gd_sample(fid: int, packed: PackedInt64Array) -> Dictionary:
 		colors[i] = FarPalette.color_for(g, biome, pr.w, w)
 	return {"heights": heights, "biomes": biomes, "water": water, "colors": colors}
 
-func _make_material() -> StandardMaterial3D:
+func _make_material() -> Material:
+	# TIER-DEPTH P3 (§5.2): the skin is the middle tier → a 4-quantum window-space depth bias so it loses to the near
+	# blocks but beats the far ring at every distance. The biased material is a LIT vertex-colour spatial shader
+	# equivalent to the StandardMaterial3D below. Flag off → the shipped StandardMaterial3D verbatim (byte-identical).
+	if TierPlace.depth_bias_on():
+		return TierPlace.make_biased_material(TierPlace.skin_bias())
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true
 	m.cull_mode = BaseMaterial3D.CULL_DISABLED     # winding-agnostic (facet transforms may flip)

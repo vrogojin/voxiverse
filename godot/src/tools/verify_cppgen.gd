@@ -129,6 +129,10 @@ func _initialize() -> void:
 		"id_birch_log": BlockCatalog.id_of(&"birch_log"),
 		"id_birch_leaf": BlockCatalog.id_of(&"birch_leaves"),
 	}
+	# S3: the material tables resolve_cell projects to (ids, strata/ore/band seqs, solidity + state
+	# masks for canonical(), liquid lrids). Merged in from the ONE main-thread freeze helper.
+	for k in TerrainConfig.material_tables():
+		cfg[k] = TerrainConfig.material_tables()[k]
 	if faceted:
 		cfg["facet_frame"] = atlas["facet_frame"]
 		cfg["facet_off"] = atlas["facet_off"]
@@ -230,9 +234,11 @@ func _initialize() -> void:
 	var live_prof: Vector4 = gen.call("column_profile", fid, 0, 0)
 	_ok(not is_nan(live_prof.x) and not is_nan(live_prof.y),
 		"G-CG-STAGED — column_profile is LIVE (S2): returns a real profile, not the staged NaN")
-	var staged_cell: int = gen.call("resolve_cell", -1, 0, 0, 0)
-	_ok(staged_cell == -1,
-		"G-CG-STAGED — resolve_cell returns -1 while staged (never a packable cell value; 0 would mean AIR)")
+	# resolve_cell went LIVE in S3; its staged-(-1) tripwire is inverted here (it did its job by going
+	# red the moment the body landed). A live query must return a real packed cell, never the sentinel.
+	var live_cell: int = gen.call("resolve_cell", fid, 0, -64, 0)   # y=-64 is always bedrock -> non -1
+	_ok(live_cell != -1,
+		"G-CG-STAGED — resolve_cell is LIVE (S3): returns a real packed cell, not the staged -1")
 	var staged_cols: Dictionary = gen.call("sample_columns", -1, PackedInt64Array([0]))
 	_ok(staged_cols.has("heights") and staged_cols.has("biomes") \
 			and staged_cols.has("water") and staged_cols.has("colors"),
@@ -240,9 +246,155 @@ func _initialize() -> void:
 	_ok(bool(staged_cols.get("staged", false)),
 		"G-CG-STAGED — sample_columns is marked staged (this assert MUST be inverted when S2/S3 lands)")
 
-	_s2_column_gates(gen)
+	_s2_column_gates(gen, faceted, fid)
+	_s3_cell_gates(gen, faceted, fid)
 
 	_done(0 if _fail == 0 else 1)
+
+## ------------------------------------------------------------------------------------------------
+## S3 — the cell gate. C++ resolve_cell(fid,x,y,z) packed == GDScript resolve_cell over a large
+## sweep of CELLS spanning every depth band. This is the load-bearing S3 correctness: the emit loop
+## is a pure ARID-table lookup on top of these packed values, so if the packed cells match, the
+## buffers match.
+##
+##   G-CG-CELL   every sampled cell's packed 64-bit value is EXACTLY equal across the boundary.
+##   G-CG-CELLCOVER  the sweep hits every band that has its own code path: bedrock, the −24..−16
+##                deepslate dither, deep stone+strata+ore, the filler layers, the surface cell
+##                (smoothing), the g+1 cap, snow stacks, sea fill and tree cells. A cell gate that
+##                only saw deep stone would be worthless — a wrong g shifts a whole column, but a
+##                wrong SNOW rule only shows on a cold surface column, etc.
+## ------------------------------------------------------------------------------------------------
+func _s3_cell_gates(gen: Object, faceted: bool, fid: int) -> void:
+	# Column anchors: reuse S2's landmark logic but sample a full y-range per column so every band is
+	# exercised. FLAT anchors at biome landmarks; FACETED at slope-firing + varied facets.
+	var cols: Array = []          # [[fid, x, z], ...]
+	if faceted:
+		# Choose facets that EXERCISE each band, then sample a WINDOW around each so the sweep is wide
+		# (a single column per facet gives too few cells and no neighbour variety). Scan once for both a
+		# slope-firing facet AND a cold (snow-bearing) facet — the two bands a strided pick tends to
+		# miss on the sphere. Then top up with a stride for breadth.
+		var nf: int = int(FacetAtlas.frozen_atlas()["facet_count"])
+		var chosen: Array = []        # [fid, cx, cz]
+		var have_fire := 0
+		var have_cold := 0
+		var f := 0
+		while f < nf and (have_fire < 3 or have_cold < 3):
+			var lo: Vector2i = FacetAtlas.dom_min(f)
+			var hi: Vector2i = FacetAtlas.dom_max(f)
+			var cx := (lo.x + hi.x) / 2
+			var cz := (lo.y + hi.y) / 2
+			TerrainConfig.set_active_facet(f)
+			var prof: Vector4 = TerrainConfig.column_profile(cx, cz)
+			var fires: bool = TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(cx, cz))
+			var cold: bool = ClimateModel.surface_temperature(int(prof.x), prof.w) < 0.0 and int(prof.x) >= TerrainConfig.SEA_LEVEL
+			if fires and have_fire < 3:
+				chosen.append([f, cx, cz]); have_fire += 1
+			elif cold and have_cold < 3:
+				chosen.append([f, cx, cz]); have_cold += 1
+			f += 1
+		TerrainConfig.set_active_facet(fid)
+		var step: int = maxi(1, nf / 12)
+		f = 0
+		while f < nf and chosen.size() < 12:
+			var lo2: Vector2i = FacetAtlas.dom_min(f)
+			var hi2: Vector2i = FacetAtlas.dom_max(f)
+			chosen.append([f, (lo2.x + hi2.x) / 2, (lo2.y + hi2.y) / 2])
+			f += step
+		for ch in chosen:
+			for dx in range(-8, 8):
+				for dz in range(-8, 8):
+					cols.append([int(ch[0]), int(ch[1]) + dx, int(ch[2]) + dz])
+	else:
+		# Find an OCEAN column (g strictly below sea) so the sea-fill path is exercised — find_coast
+		# lands at the water LINE where g ≈ sea, above the g < y <= sea band. Scan outward for a
+		# genuinely submerged column; sea fill is a whole code path and must not go untested.
+		var ocean := Vector2i(0, 0)
+		var found_ocean := false
+		for radius in range(64, 4096, 64):
+			var oc := TerrainConfig.column_profile(radius, 0, {})
+			if int(oc.x) < TerrainConfig.SEA_LEVEL - 2:
+				ocean = Vector2i(radius, 0)
+				found_ocean = true
+				break
+		var anchors := [TerrainConfig.find_spawn(), TerrainConfig.find_mountain(),
+				TerrainConfig.find_cold(), TerrainConfig.find_coast()]
+		if found_ocean:
+			anchors.append(ocean)
+		for a in anchors:
+			for dx in range(-6, 6):
+				for dz in range(-6, 6):
+					cols.append([-1, a.x + dx, a.y + dz])
+
+	# The full vertical span: bedrock (−64) through the tallest snow above a mountain top.
+	var y_lo := TerrainConfig.WORLD_BOTTOM_Y - 1
+	var y_hi := TerrainConfig.MAX_SURFACE_Y + TreeGen.MAX_ABOVE_SURFACE + 2
+
+	var n_cells := 0
+	var bad := 0
+	var first := ""
+	# Coverage tallies (from the GDScript oracle).
+	var saw_bedrock := 0
+	var saw_deepslate := 0
+	var saw_dither := 0
+	var saw_ore := 0
+	var saw_snow := 0
+	var saw_sea := 0
+	var saw_tree := 0
+	var saw_surface_shaped := 0
+	var deepslate_id := BlockCatalog.id_of(&"deepslate")
+	var snow_id := BlockCatalog.id_of(&"snow_block")
+
+	for csw in cols:
+		var sfid: int = csw[0]
+		var pcache = TerrainConfig.GenCtx.new(0, sfid) if faceted else {}
+		var x: int = int(csw[1])
+		var z: int = int(csw[2])
+		var prof: Vector4 = TerrainConfig.column_profile(x, z, pcache)
+		var g := int(prof.x)
+		var srun := TerrainConfig.slope_run_of(x, z, pcache)
+		for y in range(y_lo, y_hi):
+			n_cells += 1
+			var gd: int = TerrainConfig.resolve_cell(x, y, z, g, int(prof.y), prof.z, prof.w, pcache, srun)
+			var cpp: int = gen.call("resolve_cell", sfid, x, y, z)
+			if cpp != gd:
+				bad += 1
+				if first == "":
+					first = "(%d,%d,%d g=%d biome=%d) C++ 0x%x != GD 0x%x" % [x, y, z, g, int(prof.y), cpp, gd]
+			# Coverage from the oracle value.
+			var mat := CellCodec.mat(gd)
+			if y <= TerrainConfig.WORLD_BOTTOM_Y or (mat == BlockCatalog.id_of(&"bedrock")):
+				saw_bedrock += 1
+			if mat == deepslate_id:
+				saw_deepslate += 1
+				if y > -24 and y <= -16:
+					saw_dither += 1
+			if y < g and CellCodec.mat(gd) >= BlockCatalog.id_of(&"coal_ore") \
+					and CellCodec.mat(gd) <= BlockCatalog.id_of(&"deepslate_emerald_ore"):
+				saw_ore += 1
+			if mat == snow_id:
+				saw_snow += 1
+			if y > g and y <= TerrainConfig.SEA_LEVEL and gd != 0 and mat != snow_id:
+				saw_sea += 1
+			if y > g + 1 and (mat == BlockCatalog.WOOD or mat == BlockCatalog.LEAF \
+					or mat == BlockCatalog.id_of(&"birch_log") or mat == BlockCatalog.id_of(&"spruce_log")):
+				saw_tree += 1
+			if y == g and CellCodec.modifier(gd) != 0:
+				saw_surface_shaped += 1
+
+	print("  ... swept %d cells across %d columns (faceted=%s)" % [n_cells, cols.size(), faceted])
+	_ok(n_cells >= 20000, "G-CG-CELLCOVER — swept %d cells (>= 2e4)" % n_cells)
+	_ok(saw_bedrock > 0, "G-CG-CELLCOVER — bedrock band hit (%d)" % saw_bedrock)
+	_ok(saw_deepslate > 0, "G-CG-CELLCOVER — deepslate hit (%d)" % saw_deepslate)
+	_ok(saw_dither > 0, "G-CG-CELLCOVER — the −24..−16 deepslate dither band hit (%d)" % saw_dither)
+	_ok(saw_ore > 0, "G-CG-CELLCOVER — ore cells hit (%d)" % saw_ore)
+	_ok(saw_sea > 0, "G-CG-CELLCOVER — sea fill hit (%d)" % saw_sea)
+	_ok(saw_tree > 0, "G-CG-CELLCOVER — tree cells hit (%d)" % saw_tree)
+	_ok(saw_surface_shaped > 0, "G-CG-CELLCOVER — smoothed surface cells hit (%d)" % saw_surface_shaped)
+	# snow only exists on cold columns; require it in whichever topology surfaces cold terrain.
+	_ok(saw_snow > 0, "G-CG-CELLCOVER — snow stack cells hit (%d)" % saw_snow)
+
+	_ok(bad == 0, "G-CG-CELL — %d/%d cells mismatched%s"
+		% [bad, n_cells, ("" if bad == 0 else ("; first: " + first))])
 
 ## ------------------------------------------------------------------------------------------------
 ## S2 — the column-math gates. C++ column_profile / slope_run_of vs the GDScript twin over >= 1e5
@@ -277,9 +429,7 @@ func _initialize() -> void:
 ##     trap 2 is documented at the top of cosmos_terrain.h, and (b) S3's cell gate, where a single
 ##     wrong g shifts that column's ENTIRE stack and so is caught by any cell of it.
 ## ------------------------------------------------------------------------------------------------
-func _s2_column_gates(gen: Object) -> void:
-	var faceted: bool = CubeSphere.FACETED
-	var fid: int = TerrainConfig.active_facet() if faceted else -1
+func _s2_column_gates(gen: Object, faceted: bool, fid: int) -> void:
 
 	# The sweep's shape differs by world topology, and that is not incidental — it is where the
 	# coverage actually lives:

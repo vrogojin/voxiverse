@@ -12,10 +12,10 @@ index ccac0f7..a96e2ae 100644
          "modifiers/*.cpp",
 diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
 new file mode 100644
-index 0000000..80f86ae
+index 0000000..45393ff
 --- /dev/null
 +++ b/generators/cosmos/cosmos_terrain.h
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,329 @@
 +#ifndef COSMOS_TERRAIN_H
 +#define COSMOS_TERRAIN_H
 +
@@ -124,8 +124,105 @@ index 0000000..80f86ae
 +constexpr int SP_BIRCH = 2;
 +constexpr int SP_SPRUCE = 3;
 +
++constexpr int WORLD_BOTTOM_Y_C = WORLD_BOTTOM_Y;
++
++// Ore distribution tables (terrain_config.gd:273-281). Constants, so mirrored directly.
++constexpr int ORE_YMIN[8] = { -8, -16, -56, -60, -64, -52, -64, -8 };
++constexpr int ORE_YMAX[8] = { 16, 12, 12, -8, -24, -6, -40, 16 };
++constexpr int ORE_PEAK[8] = { 8, 4, -8, -32, -56, -28, -58, 12 };
++constexpr double ORE_WEIGHT[8] = { 30.0, 25.0, 25.0, 10.0, 14.0, 8.0, 6.0, 3.0 };
++constexpr int ORE_EMERALD = 7;
++constexpr int ORE_GOLD = 3;
++constexpr int STRATA_L = 16;
++constexpr int ORE_L = 6;
++
++// Hash salts (terrain_config.gd:254-269).
++constexpr int SALT_BEDROCK = 701;
++constexpr int SALT_DEEP = 702;
++constexpr int SALT_STRATA_EXIST = 711;
++constexpr int SALT_STRATA_JX = 712;
++constexpr int SALT_STRATA_JY = 713;
++constexpr int SALT_STRATA_JZ = 714;
++constexpr int SALT_STRATA_VAR = 715;
++constexpr int SALT_STRATA_R = 716;
++constexpr int SALT_ORE_EXIST = 721;
++constexpr int SALT_ORE_JX = 722;
++constexpr int SALT_ORE_JY = 723;
++constexpr int SALT_ORE_JZ = 724;
++constexpr int SALT_ORE_PICK = 725;
++constexpr int SALT_ORE_R = 726;
++constexpr int SALT_BAND = 731;
++constexpr int SALT_PODZOL = 741;
++
++// Snow accumulation (terrain_config.gd:58-63).
++constexpr double SNOW_T0 = 0.0;
++constexpr double SNOW_BLANKET_PER_C = 0.4;
++constexpr int SNOW_BLANKET_MAX = 3;
++constexpr double SNOW_FILL_PER_C = 1.5;
++constexpr int SNOW_FILL_MAX_CELLS = 4;
++constexpr int SNOW_REF_LATTICE = 8;
++
++constexpr double LAVA_SEA_T = 0.60;
++
++// ClimateModel (climate_model.gd).
++constexpr double T_SEA_LEVEL = 21.5;
++constexpr int ALT_ZERO_Y = 96;
++constexpr double LAPSE_RATE = T_SEA_LEVEL / double(ALT_ZERO_Y);
++constexpr double CLIMATE_TEMPERATE = -0.15;
++constexpr double CLIMATE_FROZEN = -0.55;
++constexpr double T_FROZEN_SEA = -8.0;
++
++// CellCodec bit layout (cell_codec.gd). The packed-cell contract; getting any of these wrong is a
++// byte-equality failure by definition.
++constexpr int64_t MAT_MASK = 0xFFFF;
++constexpr int MOD_ANC_BIT = 1 << 8;
++constexpr int MOD_CORNERS_MASK = 0xFF;
++constexpr int MOD_FAM_BIT = 1 << 15;
++constexpr int MOD_FAM_KIND_SHIFT = 12;
++constexpr int MOD_FAM_KIND_MASK = 0x7;
++constexpr int FAM_LAYER = 0;
++constexpr int FAM_SLOPE = 1;
++constexpr int FAM_JUNCTION = 2;
++constexpr int MOD_LAYER_LEVEL_MASK = 0xF;
++constexpr int LAYER_SLAB_MODIFIER = 85;
++constexpr int MOD_SLOPE_BIAS = 3;
++constexpr int LIQ_SHIFT = 48;
++constexpr int LIQ_FIELD_MASK = 0x3F;
++constexpr int LIQ_KIND_MASK = 0x3;
++constexpr int LIQ_WATER = 1;
++constexpr int LIQ_LAVA = 2;
++constexpr int LIQ_LEVEL_SURFACE = 9;
++constexpr int LIQ_LEVEL_FULL = 10;
++constexpr int STATE_SNOW_CAPPED = 1;
++constexpr int STATE_SNOW_FILL_SHIFT = 1;
++constexpr int STATE_SNOW_FILL_MASK = 0xF << STATE_SNOW_FILL_SHIFT;
++constexpr int64_t STATE_MASK = 0xFFFF;
++
++constexpr int ANCHOR_BOTTOM = 0;
++
 +// BlockCatalog (godot/src/sim/block_catalog.gd).
 +constexpr int ID_AIR = 0;
++
++// GDScript posmod(a, b): result has the sign of b, i.e. ((a % b) + b) % b.
++inline int64_t posmod(int64_t a, int64_t b) {
++	int64_t r = a % b;
++	if ((r != 0) && ((r < 0) != (b < 0))) {
++		r += b;
++	}
++	return r;
++}
++
++inline int clampi(int v, int lo, int hi) {
++	return v < lo ? lo : (v > hi ? hi : v);
++}
++
++inline int mini(int a, int b) {
++	return a < b ? a : b;
++}
++
++inline int maxi(int a, int b) {
++	return a > b ? a : b;
++}
 +
 +// ---------------------------------------------------------------------------------------------
 +// GDScript built-in equivalents. Thin on purpose: each mirrors ONE GDScript global exactly.
@@ -250,10 +347,10 @@ index 0000000..80f86ae
 +#endif // COSMOS_TERRAIN_H
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
 new file mode 100644
-index 0000000..84ab96b
+index 0000000..2ff9a7a
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,1436 @@
 +#include "voxel_generator_cosmos.h"
 +#include "../../util/godot/classes/noise.h"
 +#include "cosmos_terrain.h"
@@ -340,6 +437,34 @@ index 0000000..84ab96b
 +	p.id_spruce_leaf = int(config.get("id_spruce_leaf", 0));
 +	p.id_birch_log = int(config.get("id_birch_log", 0));
 +	p.id_birch_leaf = int(config.get("id_birch_leaf", 0));
++
++	p.id_bedrock = int(config.get("id_bedrock", 0));
++	p.id_deepslate = int(config.get("id_deepslate", 0));
++	p.id_water = int(config.get("id_water", 0));
++	p.id_lava = int(config.get("id_lava", 0));
++	p.id_ice = int(config.get("id_ice", 0));
++	p.id_sand = int(config.get("id_sand", 0));
++	p.id_red_sand = int(config.get("id_red_sand", 0));
++	p.id_gravel = int(config.get("id_gravel", 0));
++	p.id_sandstone = int(config.get("id_sandstone", 0));
++	p.id_red_sandstone = int(config.get("id_red_sandstone", 0));
++	p.id_snow = int(config.get("id_snow", 0));
++	p.id_mud = int(config.get("id_mud", 0));
++	p.id_podzol = int(config.get("id_podzol", 0));
++	p.id_sulfur = int(config.get("id_sulfur", 0));
++	p.id_cinnabar = int(config.get("id_cinnabar", 0));
++	p.id_stone = int(config.get("id_stone", 0));
++	p.id_dirt = int(config.get("id_dirt", 0));
++	p.id_grass = int(config.get("id_grass", 0));
++	p.strata_seq = get_i32_param(config, "strata_seq");
++	p.band_seq = get_i32_param(config, "band_seq");
++	p.ore_stone = get_i32_param(config, "ore_stone");
++	p.ore_deep = get_i32_param(config, "ore_deep");
++	p.solidity = PackedFloat64Array(config.get("solidity", PackedFloat64Array()));
++	p.state_mask = get_i32_param(config, "state_mask");
++	p.liquid_lrid_water = int(config.get("liquid_lrid_water", -1));
++	p.liquid_lrid_lava = int(config.get("liquid_lrid_lava", -1));
++	p.block_count = int(config.get("block_count", 0));
 +
 +	// The cube table and the block-id table are the two the emit loop cannot function without.
 +	if (p.cube_arid.size() == 0 || p.block_ids.size() == 0) {
@@ -787,6 +912,792 @@ index 0000000..84ab96b
 +}
 +
 +// ================================================================================================
++// S3 — resolve_cell + helpers. Line-for-line from TerrainConfig / CellCodec / ShapeCodec /
++// ClimateModel. This is where the measured 337.7 ms/block underground and 559.8 ms/block surface
++// cost lives. Same transcription discipline as S2 (cosmos_terrain.h's four traps).
++// ================================================================================================
++
++using namespace cosmos;
++
++// --- CellCodec / ShapeCodec pack path ----------------------------------------------------------
++int VoxelGeneratorCosmos::shape_make_modifier(int c00, int c10, int c11, int c01, int anc) {
++	return (c00 & 3) | ((c10 & 3) << 2) | ((c11 & 3) << 4) | ((c01 & 3) << 6) | ((anc & 1) << 8);
++}
++
++int VoxelGeneratorCosmos::cc_slope_raw(int d00, int d10, int d11, int d01) {
++	const int k00 = cosmos::clampi(d00 + MOD_SLOPE_BIAS, 0, 7);
++	const int k10 = cosmos::clampi(d10 + MOD_SLOPE_BIAS, 0, 7);
++	const int k11 = cosmos::clampi(d11 + MOD_SLOPE_BIAS, 0, 7);
++	const int k01 = cosmos::clampi(d01 + MOD_SLOPE_BIAS, 0, 7);
++	return MOD_FAM_BIT | (FAM_SLOPE << MOD_FAM_KIND_SHIFT) | (k01 << 9) | (k11 << 6) | (k10 << 3) | k00;
++}
++
++int VoxelGeneratorCosmos::cc_canonical_slope(int d00, int d10, int d11, int d01) {
++	if (d00 >= 1 && d10 >= 1 && d11 >= 1 && d01 >= 1) {
++		return 0; // rule 1: full cube
++	}
++	if (d00 <= 0 && d10 <= 0 && d11 <= 0 && d01 <= 0) {
++		return MOD_FAM_BIT; // rule 2: empty
++	}
++	if (d00 >= 0 && d00 <= 1 && d10 >= 0 && d10 <= 1 && d11 >= 0 && d11 <= 1 && d01 >= 0 && d01 <= 1) {
++		return shape_make_modifier(2 * d00, 2 * d10, 2 * d11, 2 * d01, ANCHOR_BOTTOM); // rule 3
++	}
++	return cc_slope_raw(d00, d10, d11, d01); // rule 4
++}
++
++int VoxelGeneratorCosmos::cc_make_slope(int d00, int d10, int d11, int d01) {
++	return cc_canonical_slope(d00, d10, d11, d01);
++}
++
++int VoxelGeneratorCosmos::cc_make_layer(int level) {
++	const int lv = cosmos::clampi(level, 0, 10);
++	if (lv <= 0) {
++		return MOD_FAM_BIT;
++	}
++	if (lv >= 10) {
++		return 0;
++	}
++	if (lv == 5) {
++		return LAYER_SLAB_MODIFIER;
++	}
++	return MOD_FAM_BIT | lv;
++}
++
++int64_t VoxelGeneratorCosmos::cc_pack(int mat, int modifier, int state, int liquid) {
++	return (int64_t(mat) & MAT_MASK) | ((int64_t(modifier) & 0xFFFF) << 16) |
++			((int64_t(state) & 0xFFFF) << 32) | ((int64_t(liquid) & LIQ_FIELD_MASK) << LIQ_SHIFT);
++}
++
++int VoxelGeneratorCosmos::cc_make_liquid(int kind, int level) {
++	return (kind & LIQ_KIND_MASK) | ((level & 0xF) << 2);
++}
++
++int VoxelGeneratorCosmos::cc_mat(int64_t v) {
++	return int(v & MAT_MASK);
++}
++int VoxelGeneratorCosmos::cc_modifier(int64_t v) {
++	return int((v >> 16) & 0xFFFF);
++}
++int VoxelGeneratorCosmos::cc_state(int64_t v) {
++	return int((v >> 32) & 0xFFFF);
++}
++int VoxelGeneratorCosmos::cc_liquid_field(int64_t v) {
++	return int((v >> LIQ_SHIFT) & LIQ_FIELD_MASK);
++}
++
++int64_t VoxelGeneratorCosmos::cc_with_state(int64_t v, int bits) {
++	return (v & ~(STATE_MASK << 32)) | ((int64_t(bits) & STATE_MASK) << 32);
++}
++
++int64_t VoxelGeneratorCosmos::cc_with_liquid(int64_t v, int kind, int level) {
++	const int64_t stripped = v & ~(int64_t(LIQ_FIELD_MASK) << LIQ_SHIFT);
++	return stripped | (int64_t(cc_make_liquid(kind, level)) << LIQ_SHIFT);
++}
++
++int64_t VoxelGeneratorCosmos::cc_with_snow_fill(int64_t v, int level) {
++	int st = cc_state(v) & ~STATE_SNOW_FILL_MASK;
++	st |= (cosmos::clampi(level, 0, 15) & 0xF) << STATE_SNOW_FILL_SHIFT;
++	return cc_with_state(v, st);
++}
++
++double VoxelGeneratorCosmos::solidity_of(const Parameters &p, int mat) {
++	if (mat < 0 || mat >= p.solidity.size()) {
++		return 0.0;
++	}
++	return p.solidity[mat];
++}
++
++int VoxelGeneratorCosmos::state_mask_of(const Parameters &p, int lrid) {
++	if (lrid <= ID_AIR || lrid >= p.block_count) {
++		return 0;
++	}
++	return p.state_mask[lrid];
++}
++
++int VoxelGeneratorCosmos::cc_canonical_modifier(const Parameters &p, int material, int modifier_bits) {
++	if (modifier_bits != 0 && solidity_of(p, material) < 0.5) {
++		return 0; // "ramp of water" -> full cube
++	}
++	if (modifier_bits == 0) {
++		return 0;
++	}
++	if (modifier_bits & MOD_FAM_BIT) {
++		if (modifier_bits == MOD_FAM_BIT) {
++			return MOD_FAM_BIT;
++		}
++		const int kind = (modifier_bits >> MOD_FAM_KIND_SHIFT) & MOD_FAM_KIND_MASK;
++		if (kind == FAM_LAYER) {
++			const int reserved = (modifier_bits >> 4) & 0xFF;
++			if (reserved != 0) {
++				return 0;
++			}
++			return cc_make_layer(modifier_bits & MOD_LAYER_LEVEL_MASK);
++		}
++		if (kind == FAM_SLOPE) {
++			const int d00 = (modifier_bits & 7) - MOD_SLOPE_BIAS;
++			const int d10 = ((modifier_bits >> 3) & 7) - MOD_SLOPE_BIAS;
++			const int d11 = ((modifier_bits >> 6) & 7) - MOD_SLOPE_BIAS;
++			const int d01 = ((modifier_bits >> 9) & 7) - MOD_SLOPE_BIAS;
++			return cc_canonical_slope(d00, d10, d11, d01);
++		}
++		if (kind == FAM_JUNCTION) {
++			return MOD_FAM_BIT | (FAM_JUNCTION << MOD_FAM_KIND_SHIFT) |
++					(modifier_bits & ((0x3 << 10) | (0x1F << 5)));
++		}
++		return 0;
++	}
++	const int c0 = cosmos::mini(modifier_bits & 3, 2);
++	const int c1 = cosmos::mini((modifier_bits >> 2) & 3, 2);
++	const int c2 = cosmos::mini((modifier_bits >> 4) & 3, 2);
++	const int c3 = cosmos::mini((modifier_bits >> 6) & 3, 2);
++	if (c0 == 2 && c1 == 2 && c2 == 2 && c3 == 2) {
++		return 0;
++	}
++	const int anc = modifier_bits & MOD_ANC_BIT;
++	return c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | anc;
++}
++
++int VoxelGeneratorCosmos::cc_validate_state(const Parameters &p, int material, int state_bits) {
++	if (state_bits == 0) {
++		return 0;
++	}
++	return state_bits & state_mask_of(p, material);
++}
++
++int VoxelGeneratorCosmos::cc_canonical_snow_fill(
++		const Parameters &p, int material, int canonical_mod, int state_bits) {
++	const int fill = (state_bits >> STATE_SNOW_FILL_SHIFT) & 0xF;
++	if (fill == 0) {
++		return state_bits;
++	}
++	const int stripped = state_bits & ~STATE_SNOW_FILL_MASK;
++	if (solidity_of(p, material) < 0.5) {
++		return stripped;
++	}
++	if (canonical_mod == 0) {
++		return stripped;
++	}
++	if ((canonical_mod & MOD_FAM_BIT) != 0) {
++		return stripped;
++	}
++	const int min_corner = cosmos::mini(cosmos::mini(canonical_mod & 3, (canonical_mod >> 2) & 3),
++			cosmos::mini((canonical_mod >> 4) & 3, (canonical_mod >> 6) & 3));
++	if (fill <= 5 * min_corner) {
++		return stripped;
++	}
++	if (fill > 10) {
++		return (state_bits & ~STATE_SNOW_FILL_MASK) | (10 << STATE_SNOW_FILL_SHIFT);
++	}
++	return state_bits;
++}
++
++int VoxelGeneratorCosmos::cc_canonical_liquid(
++		const Parameters &p, int material, int canonical_mod, int liquid) {
++	if (liquid == 0) {
++		return 0;
++	}
++	const int kind = liquid & LIQ_KIND_MASK;
++	int level = (liquid >> 2) & 0xF;
++	if (kind == 0) {
++		return 0;
++	}
++	if (level == 0) {
++		return 0;
++	}
++	if (level > LIQ_LEVEL_FULL) {
++		level = LIQ_LEVEL_FULL;
++	}
++	if (solidity_of(p, material) < 0.5) {
++		// Rule 5: non-solid host. kind must match the material's own liquid identity.
++		int host_kind = 0;
++		if (material == p.liquid_lrid_water) {
++			host_kind = LIQ_WATER;
++		} else if (material == p.liquid_lrid_lava) {
++			host_kind = LIQ_LAVA;
++		}
++		if (kind != host_kind) {
++			return 0;
++		}
++		if (level == LIQ_LEVEL_FULL) {
++			return 0;
++		}
++		return cc_make_liquid(kind, level);
++	}
++	if (canonical_mod == 0) {
++		return 0; // rule 6: no remainder
++	}
++	// is_liquid_kind_known: water/lava registered iff their lrid resolved.
++	const bool known = (kind == LIQ_WATER && p.liquid_lrid_water >= 0) ||
++			(kind == LIQ_LAVA && p.liquid_lrid_lava >= 0);
++	if (!known) {
++		return 0;
++	}
++	return cc_make_liquid(kind, level);
++}
++
++int64_t VoxelGeneratorCosmos::cc_canonical(const Parameters &p, int64_t v) {
++	const int m = cc_mat(v);
++	if (m == ID_AIR) {
++		return 0;
++	}
++	const int cm = cc_canonical_modifier(p, m, cc_modifier(v));
++	if (cm == MOD_FAM_BIT) {
++		return 0;
++	}
++	if (cm != 0 && (cm & MOD_FAM_BIT) == 0 && (cm & MOD_CORNERS_MASK) == 0) {
++		return 0;
++	}
++	const int st = cc_canonical_snow_fill(p, m, cm, cc_validate_state(p, m, cc_state(v)));
++	const int lq = cc_canonical_liquid(p, m, cm, cc_liquid_field(v));
++	return cc_pack(m, cm, st, lq);
++}
++
++// --- resolve_cell helper chain -----------------------------------------------------------------
++
++bool VoxelGeneratorCosmos::bedrock_at(const Parameters &p, int x, int y, int z) {
++	if (y <= WORLD_BOTTOM_Y) {
++		return true;
++	}
++	if (y >= BEDROCK_TOP_Y) {
++		return false;
++	}
++	const double pr = double(BEDROCK_TOP_Y - y) / double(BEDROCK_TOP_Y - WORLD_BOTTOM_Y);
++	return hash01_3d(x, y, z, SALT_BEDROCK) < pr;
++}
++
++int VoxelGeneratorCosmos::sea_liquid_kind(double t) {
++	return t >= LAVA_SEA_T ? LIQ_LAVA : LIQ_WATER;
++}
++
++int64_t VoxelGeneratorCosmos::sea_block(const Parameters &p, double t, int y) {
++	const int kind = sea_liquid_kind(t);
++	const int lrid = (kind == LIQ_LAVA) ? p.liquid_lrid_lava : p.liquid_lrid_water;
++	if (y == SEA_LEVEL) {
++		if (t < -0.55) {
++			return p.id_ice;
++		}
++		return cc_pack(lrid, 0, 0, cc_make_liquid(kind, LIQ_LEVEL_SURFACE));
++	}
++	return lrid;
++}
++
++int VoxelGeneratorCosmos::biome_top(const Parameters &p, int biome, int x, int z) {
++	switch (biome) {
++		case B_BEACH:
++		case B_DESERT:
++			return p.id_sand;
++		case B_BADLANDS:
++			return p.id_red_sand;
++		case B_SWAMP:
++			return p.id_mud;
++		case B_SNOWY:
++			return p.id_snow;
++		case B_TAIGA:
++			return hash01_3d(x, 0, z, SALT_PODZOL) < 0.20 ? p.id_podzol : p.id_grass;
++		case B_MOUNTAINS:
++			return p.id_stone;
++		case B_OCEAN:
++			return p.id_sand;
++		default:
++			return p.id_grass;
++	}
++}
++
++int VoxelGeneratorCosmos::underwater_floor(const Parameters &p, int biome, int x, int z, double t) {
++	switch (biome) {
++		case B_OCEAN:
++			return t > 0.0 ? p.id_sand : p.id_gravel;
++		case B_BEACH:
++		case B_DESERT:
++			return p.id_sand;
++		case B_BADLANDS:
++			return p.id_red_sand;
++		case B_SWAMP:
++			return p.id_mud;
++		default:
++			return p.id_gravel;
++	}
++}
++
++int VoxelGeneratorCosmos::filler_depth(int biome) {
++	switch (biome) {
++		case B_BADLANDS:
++			return 12;
++		case B_DESERT:
++			return 7;
++		case B_BEACH:
++			return 6;
++		case B_SWAMP:
++			return 5;
++		case B_OCEAN:
++			return 3;
++		case B_MOUNTAINS:
++			return 0;
++		default:
++			return 3;
++	}
++}
++
++int VoxelGeneratorCosmos::band_color(const Parameters &p, int x, int y, int z) {
++	const int shift = int(hash01_3d(cosmos::floori(x / 512.0), 0, cosmos::floori(z / 512.0), SALT_BAND) * 7.0);
++	const int n = p.band_seq.size();
++	return p.band_seq[int(cosmos::posmod(int64_t(y) + shift, n))];
++}
++
++int VoxelGeneratorCosmos::biome_filler(
++		const Parameters &p, int biome, int x, int y, int z, int depth, double t) {
++	switch (biome) {
++		case B_BEACH:
++		case B_DESERT:
++			return depth <= 3 ? p.id_sand : p.id_sandstone;
++		case B_BADLANDS:
++			return depth <= 8 ? band_color(p, x, y, z) : p.id_red_sandstone;
++		case B_SWAMP:
++			return depth <= 3 ? p.id_mud : p.id_dirt;
++		case B_OCEAN:
++			return underwater_floor(p, B_OCEAN, x, z, t);
++		default:
++			return p.id_dirt;
++	}
++}
++
++int VoxelGeneratorCosmos::surface_rule(
++		const Parameters &p, int x, int y, int z, int g, int biome, double c, double t) {
++	const bool underwater = g < SEA_LEVEL;
++	if (y == g) {
++		if (underwater) {
++			return underwater_floor(p, biome, x, z, t);
++		}
++		return biome_top(p, biome, x, z);
++	}
++	const int depth = g - y;
++	if (depth <= filler_depth(biome)) {
++		return biome_filler(p, biome, x, y, z, depth, t);
++	}
++	return p.id_stone;
++}
++
++int VoxelGeneratorCosmos::strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy) {
++	if (cy < -32) {
++		const double d = hash01_3d(lx, ly, lz, SALT_STRATA_VAR + 1);
++		if (d < 0.10) {
++			return p.id_sulfur;
++		}
++		if (d < 0.20) {
++			return p.id_cinnabar;
++		}
++	}
++	const double h = hash01_3d(lx, ly, lz, SALT_STRATA_VAR);
++	const int n = p.strata_seq.size();
++	return p.strata_seq[int(h * double(n)) % n];
++}
++
++int VoxelGeneratorCosmos::strata_at(const Parameters &p, int x, int y, int z) {
++	const int lx = int(cosmos::floori(x / double(STRATA_L)));
++	const int ly = int(cosmos::floori(y / double(STRATA_L)));
++	const int lz = int(cosmos::floori(z / double(STRATA_L)));
++	if (hash01_3d(lx, ly, lz, SALT_STRATA_EXIST) >= 0.25) {
++		return -1;
++	}
++	const int r = 3 + int(hash01_3d(lx, ly, lz, SALT_STRATA_R) * 5.0);
++	const int span = cosmos::maxi(STRATA_L - 2 * r, 0);
++	const int bx = lx * STRATA_L + r + int(hash01_3d(lx, ly, lz, SALT_STRATA_JX) * double(span + 1));
++	const int by = ly * STRATA_L + r + int(hash01_3d(lx, ly, lz, SALT_STRATA_JY) * double(span + 1));
++	const int bz = lz * STRATA_L + r + int(hash01_3d(lx, ly, lz, SALT_STRATA_JZ) * double(span + 1));
++	const int dx = x - bx, dy = y - by, dz = z - bz;
++	if (dx * dx + dy * dy + dz * dz > r * r) {
++		return -1;
++	}
++	return strata_variant_of(p, lx, ly, lz, by);
++}
++
++int VoxelGeneratorCosmos::deep_family(const Parameters &p, int x, int y, int z) {
++	int base = p.id_stone;
++	if (y < DEEPSLATE_FULL_Y) {
++		base = p.id_deepslate;
++	} else if (y <= DEEPSLATE_TOP_Y) {
++		const int band = DEEPSLATE_TOP_Y - DEEPSLATE_FULL_Y; // 8
++		if (hash01_3d(x, y, z, SALT_DEEP) < double(DEEPSLATE_TOP_Y - y) / double(band)) {
++			base = p.id_deepslate;
++		}
++	}
++	const int variant = strata_at(p, x, y, z);
++	if (variant >= 0) {
++		if (base == p.id_stone) {
++			return variant;
++		}
++		if (variant == p.id_sulfur || variant == p.id_cinnabar) {
++			return variant;
++		}
++	}
++	return base;
++}
++
++double VoxelGeneratorCosmos::ore_density(int i, int y) {
++	const int ymin = ORE_YMIN[i], ymax = ORE_YMAX[i], peak = ORE_PEAK[i];
++	if (y < ymin || y > ymax) {
++		return 0.0;
++	}
++	if (y <= peak) {
++		return peak == ymin ? 1.0 : double(y - ymin) / double(peak - ymin);
++	}
++	return ymax == peak ? 1.0 : double(ymax - y) / double(ymax - peak);
++}
++
++double VoxelGeneratorCosmos::eff_weight(int i, int y, int biome, double c) {
++	if (i == ORE_EMERALD && c <= 0.4) {
++		return 0.0;
++	}
++	double w = ORE_WEIGHT[i] * ore_density(i, y);
++	if (i == ORE_GOLD && biome == B_BADLANDS) {
++		w *= 4.0;
++	}
++	return w;
++}
++
++int VoxelGeneratorCosmos::pick_ore(const Parameters &p, int y, int biome, double c, int lx, int ly, int lz) {
++	double total = 0.0;
++	for (int i = 0; i < 8; ++i) {
++		total += eff_weight(i, y, biome, c);
++	}
++	if (total <= 0.0) {
++		return -1;
++	}
++	const double r = hash01_3d(lx, ly, lz, SALT_ORE_PICK) * total;
++	double acc = 0.0;
++	for (int i = 0; i < 8; ++i) {
++		acc += eff_weight(i, y, biome, c);
++		if (r < acc) {
++			return i;
++		}
++	}
++	return 7;
++}
++
++int VoxelGeneratorCosmos::ore_apply(const Parameters &p, int ore, int y, int host) {
++	if (ore < 0 || ore_density(ore, y) <= 0.0) {
++		return host;
++	}
++	return host == p.id_deepslate ? p.ore_deep[ore] : p.ore_stone[ore];
++}
++
++int VoxelGeneratorCosmos::ore_at(const Parameters &p, int x, int y, int z, int host, int biome, double c) {
++	if (host != p.id_stone && host != p.id_deepslate) {
++		return host;
++	}
++	const int lx = int(cosmos::floori(x / double(ORE_L)));
++	const int ly = int(cosmos::floori(y / double(ORE_L)));
++	const int lz = int(cosmos::floori(z / double(ORE_L)));
++	if (hash01_3d(lx, ly, lz, SALT_ORE_EXIST) >= 0.55) {
++		return host;
++	}
++	const int r = 1 + int(hash01_3d(lx, ly, lz, SALT_ORE_R) * 2.0);
++	const int span = cosmos::maxi(ORE_L - 2 * r, 0);
++	const int bx = lx * ORE_L + r + int(hash01_3d(lx, ly, lz, SALT_ORE_JX) * double(span + 1));
++	const int by = ly * ORE_L + r + int(hash01_3d(lx, ly, lz, SALT_ORE_JY) * double(span + 1));
++	const int bz = lz * ORE_L + r + int(hash01_3d(lx, ly, lz, SALT_ORE_JZ) * double(span + 1));
++	const int dx = x - bx, dy = y - by, dz = z - bz;
++	if (dx * dx + dy * dy + dz * dz > r * r) {
++		return host;
++	}
++	return ore_apply(p, pick_ore(p, by, biome, c, lx, ly, lz), y, host);
++}
++
++// --- ClimateModel + snow -----------------------------------------------------------------------
++
++double VoxelGeneratorCosmos::climate_base(double t) {
++	if (t >= CLIMATE_TEMPERATE) {
++		return T_SEA_LEVEL;
++	}
++	if (t < CLIMATE_FROZEN) {
++		return T_FROZEN_SEA;
++	}
++	return cosmos::lerp(T_FROZEN_SEA, T_SEA_LEVEL, (t - CLIMATE_FROZEN) / (CLIMATE_TEMPERATE - CLIMATE_FROZEN));
++}
++
++double VoxelGeneratorCosmos::surface_temperature(int surface_y, double t) {
++	return climate_base(t) - LAPSE_RATE * MAX(double(surface_y), 0.0);
++}
++
++double VoxelGeneratorCosmos::h_ref(const Parameters &p, int fid, int x, int z) {
++	const int l = SNOW_REF_LATTICE;
++	const int x0 = int(cosmos::floori(x / double(l))) * l;
++	const int z0 = int(cosmos::floori(z / double(l))) * l;
++	const int x1 = x0 + l;
++	const int z1 = z0 + l;
++	const double h00 = double(col_h(p, fid, x0, z0));
++	const double h10 = double(col_h(p, fid, x1, z0));
++	const double h01 = double(col_h(p, fid, x0, z1));
++	const double h11 = double(col_h(p, fid, x1, z1));
++	const double tx = double(x - x0) / double(l);
++	const double tz = double(z - z0) / double(l);
++	return cosmos::lerp(cosmos::lerp(h00, h10, tx), cosmos::lerp(h01, h11, tx), tz);
++}
++
++int VoxelGeneratorCosmos::snow_depth(const Parameters &p, int fid, int x, int z, int g, double t) {
++	if (g < SEA_LEVEL) {
++		return 0;
++	}
++	const double ts = surface_temperature(g, t);
++	if (ts >= SNOW_T0) {
++		return 0;
++	}
++	if (tree_block_at(p, fid, x, g + 1, z) != ID_AIR) {
++		return 0;
++	}
++	const double neg = -ts;
++	const int d_blanket = cosmos::clampi(int(cosmos::roundi(SNOW_BLANKET_PER_C * neg)), 0, SNOW_BLANKET_MAX);
++	const double pp = h_ref(p, fid, x, z) + 1.0 +
++			MIN(SNOW_FILL_PER_C * neg, 10.0 * double(SNOW_FILL_MAX_CELLS)) / 10.0;
++	const double fill_blocks = cosmos::clampf(pp - double(g + 1), 0.0, double(SNOW_FILL_MAX_CELLS));
++	const int d_fill = int(cosmos::roundi(fill_blocks * 10.0));
++	return cosmos::maxi(d_blanket, d_fill);
++}
++
++int64_t VoxelGeneratorCosmos::snow_stack(const Parameters &p, int fid, int x, int y, int z, int g, double t) {
++	const int d = snow_depth(p, fid, x, z, g, t);
++	if (d <= 0) {
++		return ID_AIR;
++	}
++	const int remaining = d - (y - (g + 1)) * 10;
++	if (remaining <= 0) {
++		return ID_AIR;
++	}
++	if (remaining >= 10) {
++		return cc_pack(p.id_snow, 0, 0, 0);
++	}
++	return cc_pack(p.id_snow, cc_make_layer(remaining), 0, 0);
++}
++
++// --- smoothing / cap ---------------------------------------------------------------------------
++
++int VoxelGeneratorCosmos::modifier_from_targets(const Vector4 &targets, int base_y) {
++	const double by = double(base_y);
++	const int c00 = cosmos::clampi(int(cosmos::roundi((double(targets.x) - by) * 2.0)), 0, 2);
++	const int c10 = cosmos::clampi(int(cosmos::roundi((double(targets.y) - by) * 2.0)), 0, 2);
++	const int c11 = cosmos::clampi(int(cosmos::roundi((double(targets.z) - by) * 2.0)), 0, 2);
++	const int c01 = cosmos::clampi(int(cosmos::roundi((double(targets.w) - by) * 2.0)), 0, 2);
++	if (c00 == 2 && c10 == 2 && c11 == 2 && c01 == 2) {
++		return 0;
++	}
++	if (c00 == 0 && c10 == 0 && c11 == 0 && c01 == 0) {
++		return 0;
++	}
++	return shape_make_modifier(c00, c10, c11, c01, ANCHOR_BOTTOM);
++}
++
++bool VoxelGeneratorCosmos::col_fires(const Parameters &p, int fid, int X, int Z) {
++	return slope_fires_only(p, fid, X, Z, col_h(p, fid, X, Z));
++}
++
++double VoxelGeneratorCosmos::q_target(double raw_t, bool whole) {
++	if (whole) {
++		return double(cosmos::roundi(raw_t));
++	}
++	return cosmos::roundf_gd(raw_t * 2.0) / 2.0;
++}
++
++Vector4 VoxelGeneratorCosmos::quantized_targets(const Parameters &p, int fid, int x, int z) {
++	const Vector4 raw = corner_targets(p, fid, x, z);
++	const bool f[9] = {
++		col_fires(p, fid, x - 1, z - 1), col_fires(p, fid, x - 1, z), col_fires(p, fid, x - 1, z + 1),
++		col_fires(p, fid, x, z - 1), col_fires(p, fid, x, z), col_fires(p, fid, x, z + 1),
++		col_fires(p, fid, x + 1, z - 1), col_fires(p, fid, x + 1, z), col_fires(p, fid, x + 1, z + 1)
++	};
++	const bool w00 = f[0] || f[3] || f[1] || f[4];
++	const bool w10 = f[3] || f[6] || f[4] || f[7];
++	const bool w11 = f[4] || f[7] || f[5] || f[8];
++	const bool w01 = f[1] || f[4] || f[2] || f[5];
++	return Vector4(float(q_target(double(raw.x), w00)), float(q_target(double(raw.y), w10)),
++			float(q_target(double(raw.z), w11)), float(q_target(double(raw.w), w01)));
++}
++
++int VoxelGeneratorCosmos::cap_material(const Parameters &p, int biome, int x, int z, double t, int g) {
++	return g >= SEA_LEVEL ? biome_top(p, biome, x, z) : underwater_floor(p, biome, x, z, t);
++}
++
++int64_t VoxelGeneratorCosmos::surface_cap(
++		const Parameters &p, int fid, int x, int z, int g, int biome, double t) {
++	if (!SMOOTHING_ENABLED) {
++		return ID_AIR;
++	}
++	if (tree_block_at(p, fid, x, g + 1, z) != ID_AIR) {
++		return ID_AIR;
++	}
++	const int m = modifier_from_targets(quantized_targets(p, fid, x, z), g + 1);
++	if (m == 0) {
++		return ID_AIR;
++	}
++	return cc_pack(cap_material(p, biome, x, z, t, g), m, 0, 0);
++}
++
++int64_t VoxelGeneratorCosmos::smoothed_surface(const Parameters &p, int fid, int x, int z, int g, int mat) {
++	if (!SMOOTHING_ENABLED) {
++		return mat;
++	}
++	if (tree_block_at(p, fid, x, g + 1, z) != ID_AIR) {
++		return mat;
++	}
++	const int m = modifier_from_targets(quantized_targets(p, fid, x, z), g);
++	if (m == 0) {
++		return mat;
++	}
++	return cc_pack(mat, m, 0, 0);
++}
++
++// --- state/liquid/snow composition wrappers ----------------------------------------------------
++
++int64_t VoxelGeneratorCosmos::with_shore_liquid(const Parameters &p, int64_t v, int y, double t) {
++	if (y > SEA_LEVEL || cc_modifier(v) == 0) {
++		return v;
++	}
++	if (y == SEA_LEVEL && t < -0.55) {
++		return v;
++	}
++	const int lvl = (y == SEA_LEVEL) ? LIQ_LEVEL_SURFACE : LIQ_LEVEL_FULL;
++	return cc_with_liquid(v, sea_liquid_kind(t), lvl);
++}
++
++int64_t VoxelGeneratorCosmos::with_snow_state(const Parameters &p, int fid, int64_t v, int g, double t) {
++	if (g < SEA_LEVEL) {
++		return v;
++	}
++	if (cc_liquid_field(v) != 0) {
++		return v;
++	}
++	const int mat = cc_mat(v);
++	if ((state_mask_of(p, mat) & STATE_SNOW_CAPPED) == 0) {
++		return v;
++	}
++	if (surface_temperature(g, t) >= 0.0) {
++		return v;
++	}
++	return cc_with_state(v, cc_state(v) | STATE_SNOW_CAPPED);
++}
++
++int64_t VoxelGeneratorCosmos::with_surface_snow_fill(
++		const Parameters &p, int fid, int64_t v, int x, int z, int g, double t) {
++	if (cc_modifier(v) == 0) {
++		return v;
++	}
++	if (snow_depth(p, fid, x, z, g, t) <= 0) {
++		return v;
++	}
++	return cc_canonical(p, cc_with_snow_fill(v, 10));
++}
++
++int64_t VoxelGeneratorCosmos::with_lip_snow_fill(
++		const Parameters &p, int fid, int64_t v, int x, int z, int g, double t) {
++	if (cc_modifier(v) == 0) {
++		return v;
++	}
++	const int d = snow_depth(p, fid, x, z, g, t);
++	if (d <= 0) {
++		return v;
++	}
++	return cc_canonical(p, cc_with_snow_fill(v, cosmos::mini(d, 10)));
++}
++
++Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
++	return Vector4i((r & 15) - 4 + g, ((r >> 4) & 15) - 4 + g, ((r >> 8) & 15) - 4 + g,
++			((r >> 12) & 15) - 4 + g);
++}
++
++// --- THE cell resolver -------------------------------------------------------------------------
++// Port of TerrainConfig.resolve_cell (the worker path: slope_run passed in, pcache non-null).
++int64_t VoxelGeneratorCosmos::resolve_cell_core(
++		const Parameters &p, int fid, int x, int y, int z, const Vector4 &prof, int slope_run) {
++	const int g = int(prof.x);
++	const int biome = int(prof.y);
++	const double c = double(prof.z);
++	const double t = double(prof.w);
++
++	if (y < WORLD_BOTTOM_Y) {
++		return ID_AIR;
++	}
++	if (bedrock_at(p, x, y, z)) {
++		return p.id_bedrock;
++	}
++	if (biome == B_PILLAR) {
++		return y <= g ? p.id_bedrock : ID_AIR;
++	}
++
++	// SHARP-SLOPE. slope_run is always >= 0 here (worker path hoists it); < 0 would mean recompute,
++	// which the emit loop never asks for.
++	bool slope_fires = false;
++	Vector4i tw;
++	if (slope_run >= 0) {
++		slope_fires = ((slope_run >> 16) & 1) != 0;
++		if (slope_fires) {
++			tw = slope_run_targets(slope_run, g);
++		}
++	} else {
++		slope_fires = slope_fires_only(p, fid, x, z, g);
++		if (slope_fires) {
++			const Vector4 raw = corner_targets(p, fid, x, z);
++			tw = Vector4i(int(cosmos::roundi(double(raw.x))), int(cosmos::roundi(double(raw.y))),
++					int(cosmos::roundi(double(raw.z))), int(cosmos::roundi(double(raw.w))));
++		}
++	}
++	if (slope_fires) {
++		const int lo = cosmos::mini(cosmos::mini(tw.x, tw.y), cosmos::mini(tw.z, tw.w));
++		const int hi = cosmos::maxi(cosmos::maxi(tw.x, tw.y), cosmos::maxi(tw.z, tw.w));
++		if (y >= lo && y <= hi - 1) {
++			const int smod = cc_make_slope(tw.x - y, tw.y - y, tw.z - y, tw.w - y);
++			int smat;
++			if (y >= g) {
++				smat = cap_material(p, biome, x, z, t, g);
++			} else {
++				smat = surface_rule(p, x, y, z, g, biome, c, t);
++			}
++			return with_snow_state(p, fid, with_shore_liquid(p, cc_pack(smat, smod, 0, 0), y, t), g, t);
++		}
++		if (y >= hi) {
++			if (y <= SEA_LEVEL) {
++				return sea_block(p, t, y);
++			}
++			return tree_block_at(p, fid, x, y, z);
++		}
++		int idlo = surface_rule(p, x, y, z, g, biome, c, t);
++		if (idlo == p.id_stone && y < g) {
++			idlo = deep_family(p, x, y, z);
++			idlo = ore_at(p, x, y, z, idlo, biome, c);
++		}
++		return idlo;
++	}
++
++	if (y > g) {
++		if (y == g + 1) {
++			const int64_t cap = surface_cap(p, fid, x, z, g, biome, t);
++			if (cap != ID_AIR) {
++				return with_lip_snow_fill(p, fid,
++						with_snow_state(p, fid, with_shore_liquid(p, cap, y, t), g, t), x, z, g, t);
++			}
++		}
++		const int64_t snow = snow_stack(p, fid, x, y, z, g, t);
++		if (snow != ID_AIR) {
++			return snow;
++		}
++		if (y <= SEA_LEVEL) {
++			return sea_block(p, t, y);
++		}
++		return tree_block_at(p, fid, x, y, z);
++	}
++
++	int id = surface_rule(p, x, y, z, g, biome, c, t);
++	if (id == p.id_stone && y < g) {
++		id = deep_family(p, x, y, z);
++		id = ore_at(p, x, y, z, id, biome, c);
++	}
++	if (y == g) {
++		return with_surface_snow_fill(p, fid,
++				with_snow_state(p, fid, with_shore_liquid(p, smoothed_surface(p, fid, x, z, g, id), y, t), g, t),
++				x, z, g, t);
++	}
++	return id;
++}
++
++// ================================================================================================
 +// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). generate_block is STAGED INERT until S3.
 +//
 +// A note on how they fail while staged, because it is a deliberate choice and not laziness: each
@@ -849,12 +1760,16 @@ index 0000000..84ab96b
 +}
 +
 +int64_t VoxelGeneratorCosmos::resolve_cell(int fid, int x, int y, int z) const {
-+	// ENTRY POINT 3b — S1: shape only; lands in S3 as a single resolve_cell_core call.
-+	// -1 is not a representable packed cell value (CellCodec packs a material in the low bits, and 0
-+	// is AIR). Returning 0 would claim "air here", which a physics caller would happily believe and
-+	// fall through -- the exact failure this port must never introduce. -1 cannot be mistaken for a
-+	// real answer.
-+	return -1;
++	// ENTRY POINT 3b (S3 — live). Mirrors TerrainConfig.resolve_cell's WORKER path: the column
++	// profile + the hoisted slope run, then the one core. `fid` ignored on the flat branch.
++	RWLockRead rlock(_params_lock);
++	if (!_params.ready || !fid_ok(_params, fid)) {
++		return -1;
++	}
++	const Vector4 prof = column_profile_core(_params, fid, x, z);
++	const int g = int(prof.x);
++	const int slope_run = slope_run_core(_params, fid, x, z, g);
++	return resolve_cell_core(_params, fid, x, y, z, prof, slope_run);
 +}
 +
 +void VoxelGeneratorCosmos::_bind_methods() {
@@ -874,10 +1789,10 @@ index 0000000..84ab96b
 +} // namespace zylann::voxel
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
 new file mode 100644
-index 0000000..a37291e
+index 0000000..e4a6a3e
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,368 @@
 +#ifndef VOXEL_GENERATOR_COSMOS_H
 +#define VOXEL_GENERATOR_COSMOS_H
 +
@@ -1084,6 +1999,69 @@ index 0000000..a37291e
 +	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
 +	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
 +	static int slope_run_pack(const Vector4i &tw, int g);
++	static Vector4i slope_run_targets(int r, int g);
++
++	// S3 — resolve_cell + its helpers, ported from TerrainConfig. Every one names the GDScript static
++	// it transcribes. All static + pure over the frozen `p`.
++	static bool bedrock_at(const Parameters &p, int x, int y, int z);
++	static int sea_liquid_kind(double t);
++	static int64_t sea_block(const Parameters &p, double t, int y);
++	static int surface_rule(const Parameters &p, int x, int y, int z, int g, int biome, double c, double t);
++	static int biome_top(const Parameters &p, int biome, int x, int z);
++	static int underwater_floor(const Parameters &p, int biome, int x, int z, double t);
++	static int filler_depth(int biome);
++	static int biome_filler(const Parameters &p, int biome, int x, int y, int z, int depth, double t);
++	static int band_color(const Parameters &p, int x, int y, int z);
++	static int deep_family(const Parameters &p, int x, int y, int z);
++	static int strata_at(const Parameters &p, int x, int y, int z);
++	static int strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy);
++	static int ore_at(const Parameters &p, int x, int y, int z, int host, int biome, double c);
++	static double ore_density(int i, int y);
++	static double eff_weight(int i, int y, int biome, double c);
++	static int pick_ore(const Parameters &p, int y, int biome, double c, int lx, int ly, int lz);
++	static int ore_apply(const Parameters &p, int ore, int y, int host);
++
++	static double climate_base(double t);
++	static double surface_temperature(int surface_y, double t);
++	static int snow_depth(const Parameters &p, int fid, int x, int z, int g, double t);
++	static double h_ref(const Parameters &p, int fid, int x, int z);
++	static int64_t snow_stack(const Parameters &p, int fid, int x, int y, int z, int g, double t);
++
++	static Vector4 quantized_targets(const Parameters &p, int fid, int x, int z);
++	static double q_target(double raw_t, bool whole);
++	static bool col_fires(const Parameters &p, int fid, int X, int Z);
++	static int modifier_from_targets(const Vector4 &targets, int base_y);
++	static int cap_material(const Parameters &p, int biome, int x, int z, double t, int g);
++	static int64_t surface_cap(const Parameters &p, int fid, int x, int z, int g, int biome, double t);
++	static int64_t smoothed_surface(const Parameters &p, int fid, int x, int z, int g, int mat);
++
++	// CellCodec / ShapeCodec, ported. Only the pack/compose path resolve_cell exercises.
++	static int shape_make_modifier(int c00, int c10, int c11, int c01, int anc);
++	static int cc_make_slope(int d00, int d10, int d11, int d01);
++	static int cc_canonical_slope(int d00, int d10, int d11, int d01);
++	static int cc_slope_raw(int d00, int d10, int d11, int d01);
++	static int cc_make_layer(int level);
++	static int64_t cc_pack(int mat, int modifier, int state, int liquid);
++	static int cc_make_liquid(int kind, int level);
++	static int64_t cc_with_liquid(int64_t v, int kind, int level);
++	static int64_t cc_with_state(int64_t v, int bits);
++	static int64_t cc_with_snow_fill(int64_t v, int level);
++	static int cc_modifier(int64_t v);
++	static int cc_mat(int64_t v);
++	static int cc_state(int64_t v);
++	static int cc_liquid_field(int64_t v);
++	static int64_t cc_canonical(const Parameters &p, int64_t v);
++	static int cc_canonical_modifier(const Parameters &p, int material, int modifier_bits);
++	static int cc_validate_state(const Parameters &p, int material, int state_bits);
++	static int cc_canonical_snow_fill(const Parameters &p, int material, int canonical_mod, int state_bits);
++	static int cc_canonical_liquid(const Parameters &p, int material, int canonical_mod, int liquid);
++	static double solidity_of(const Parameters &p, int mat);
++	static int state_mask_of(const Parameters &p, int lrid);
++
++	static int64_t with_shore_liquid(const Parameters &p, int64_t v, int y, double t);
++	static int64_t with_snow_state(const Parameters &p, int fid, int64_t v, int g, double t);
++	static int64_t with_surface_snow_fill(const Parameters &p, int fid, int64_t v, int x, int z, int g, double t);
++	static int64_t with_lip_snow_fill(const Parameters &p, int fid, int64_t v, int x, int z, int g, double t);
 +
 +	// S2 gate surface: the ported slope run for a column, so verify_cppgen can compare it against
 +	// GDScript's slope_run_of. Exposed via ClassDB alongside the §7.2 entry points.
@@ -1158,6 +2136,22 @@ index 0000000..a37291e
 +
 +		int model_count = 0;
 +		bool waterlog = false;
++
++		// S3: material ids resolve_cell projects to, frozen from TerrainConfig.material_tables().
++		int id_bedrock = 0, id_deepslate = 0, id_water = 0, id_lava = 0, id_ice = 0;
++		int id_sand = 0, id_red_sand = 0, id_gravel = 0, id_sandstone = 0, id_red_sandstone = 0;
++		int id_snow = 0, id_mud = 0, id_podzol = 0, id_sulfur = 0, id_cinnabar = 0;
++		int id_stone = 0, id_dirt = 0, id_grass = 0;
++		PackedInt32Array strata_seq;  // 6
++		PackedInt32Array band_seq;    // 7
++		PackedInt32Array ore_stone;   // 8
++		PackedInt32Array ore_deep;    // 8
++		// Per-lrid solidity + state mask, indexed by material id (for CellCodec.canonical()).
++		PackedFloat64Array solidity;
++		PackedInt32Array state_mask;
++		int liquid_lrid_water = -1;
++		int liquid_lrid_lava = -1;
++		int block_count = 0;
 +	};
 +
 +	Parameters _params;

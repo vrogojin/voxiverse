@@ -377,6 +377,42 @@ static func noise_stack() -> Dictionary:
 		"seed": SEED,
 	}
 
+## COSMOS L5(a) S3 — the frozen material tables the C++ resolve_cell needs (docs/COSMOS-STREAM-SCHED §2.6).
+##
+## resolve_cell projects a cell to a MATERIAL id, which means the port needs every id _ensure_ids() resolves
+## from the catalog, the strata/band/ore SEQUENCES, and — because resolve_cell's snow/shore wrappers call
+## CellCodec.canonical() — the per-material solidity + state-mask arrays canonical() consults, plus the
+## liquid LRIDs _sea_block emits. Frozen once here on the main thread (BlockCatalog.id_of is a main-thread
+## lookup); the worker reads the immutable copies. Same frozen-epoch discipline as noise_stack().
+static func material_tables() -> Dictionary:
+	_ensure_ids()
+	BlockCatalog.ensure_ready()
+	var n := BlockCatalog.count()
+	var solidity := PackedFloat64Array()
+	solidity.resize(n)
+	var state_mask := PackedInt32Array()
+	state_mask.resize(n)
+	for i in range(n):
+		solidity[i] = BlockCatalog.solidity_of(i)
+		state_mask[i] = BlockCatalog.state_mask_of(i)
+	return {
+		"id_bedrock": _ID_BEDROCK, "id_deepslate": _ID_DEEPSLATE, "id_water": _ID_WATER,
+		"id_lava": _ID_LAVA, "id_ice": _ID_ICE, "id_sand": _ID_SAND, "id_red_sand": _ID_RED_SAND,
+		"id_gravel": _ID_GRAVEL, "id_sandstone": _ID_SANDSTONE, "id_red_sandstone": _ID_RED_SANDSTONE,
+		"id_snow": _ID_SNOW, "id_mud": _ID_MUD, "id_podzol": _ID_PODZOL, "id_sulfur": _ID_SULFUR,
+		"id_cinnabar": _ID_CINNABAR,
+		"id_stone": BlockCatalog.STONE, "id_dirt": BlockCatalog.DIRT, "id_grass": BlockCatalog.GRASS,
+		"strata_seq": PackedInt32Array(_STRATA_SEQ),
+		"band_seq": PackedInt32Array(_BAND_SEQ),
+		"ore_stone": PackedInt32Array(_ORE_STONE),
+		"ore_deep": PackedInt32Array(_ORE_DEEP),
+		"solidity": solidity,
+		"state_mask": state_mask,
+		"liquid_lrid_water": BlockCatalog.liquid_lrid_of(CellCodec.LIQ_WATER),
+		"liquid_lrid_lava": BlockCatalog.liquid_lrid_of(CellCodec.LIQ_LAVA),
+		"block_count": n,
+	}
+
 ## Resolve every material id the generator can emit, once, from the catalog.
 static func _ensure_ids() -> void:
 	if _ids_ready:

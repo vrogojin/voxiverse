@@ -9,8 +9,9 @@ extends SceneTree
 ## build-math threading perturbed Earth: that is a hard FAIL to be FIXED, never re-pinned.
 ##
 ## The remaining gates are O4b: ATLAS2 (Moon frames/classifier/seams), KEY (edit_key bijection over
-## the FULL Earth+Moon namespace), OFF (flag-off identity). Moon gates self-skip when MULTI_BODY is
-## false (the shipped default) — the suite is green in both states.
+## the FULL Earth+Moon namespace), MOONGEN (the lunar worldgen contract), OFF (flag-off identity).
+## Moon gates self-skip when MULTI_BODY is false (the shipped default) — the suite is green in both
+## states, and the MULTI_BODY=true run is what proves the dark Moon before O4c exposes it.
 ##
 ## Requires NO world flags — it warms TerrainConfig + FacetAtlas directly and samples the pure worldgen.
 
@@ -95,6 +96,7 @@ func _initialize() -> void:
 	_gate_off(multi)
 	_gate_atlas2(multi)
 	_gate_key()
+	_gate_moongen(multi)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -287,3 +289,129 @@ func _gate_key() -> void:
 	_ok(ck > 0 and int(cu[0]) == FID_CEILING and Vector3i(cu[1]) == extreme,
 		"the documented fid ceiling %d still packs positive + round-trips (key = %d < 2^63)" % [FID_CEILING, ck])
 	_ok(last < FID_CEILING / 4, "registered fids (max %d) sit under a 4× margin of the %d ceiling — room for O3's K=50 resize + more bodies" % [last, FID_CEILING])
+
+# ---------------------------------------------------------------------------------------
+# G-O4-MOONGEN — the lunar worldgen contract (§3.2): a pure function of (SEED_MOON, d̂), no liquid
+# ever emitted, no trees, height inside the worker's envelope, and the crater/maria fields present.
+# ---------------------------------------------------------------------------------------
+func _gate_moongen(multi: bool) -> void:
+	if not multi:
+		print("[G-O4-MOONGEN] skipped (MULTI_BODY=false — no Moon rows built)")
+		return
+	print("[G-O4-MOONGEN] lunar worldgen")
+	var base: int = FA.fid_base("moon")
+	var nm: int = FA.body_facet_count("moon")
+
+	# --- determinism: a PURE function of (SEED_MOON, d̂) — re-evaluation must never differ. This is
+	# what makes the moon profile legal to call from a voxel worker under the frozen-epoch contract.
+	var det_bad := 0
+	for i in range(500):
+		var fid := base + (i * 13) % nm
+		var cc: Vector2i = FA.centre_cell(fid)
+		var x := cc.x + ((i * 131) % 201) - 100
+		var z := cc.y + ((i * 197) % 201) - 100
+		var a: Vector4 = TC.facet_profile(fid, x, z)
+		var b: Vector4 = TC.facet_profile(fid, x, z)
+		# ...and the direct kernel must agree with the dispatched call (no hidden state in between)
+		var d: CubeSphere.DVec3 = FA.cell_dir(fid, x, z)
+		var c: Vector4 = TC.moon_profile_at_dir(d.x, d.y, d.z, FA.r_of(fid))
+		if a != b or a != c:
+			det_bad += 1
+	_ok(det_bad == 0, "moon profile deterministic + dispatch == kernel (%d unstable)" % det_bad)
+
+	# --- envelope + biome + no-liquid + no-trees over 10⁴ samples ---
+	var n_samp := 10000
+	var hi_bad := 0
+	var lo_bad := 0
+	var biome_bad := 0
+	var liquid := 0
+	var trees := 0
+	var maria := 0
+	var highlands := 0
+	var regolith_seen := 0
+	var bedrock_seen := 0
+	var gmin := 1 << 30
+	var gmax := -(1 << 30)
+	var water: int = BlockCatalog.id_of(&"water")
+	var lava: int = BlockCatalog.id_of(&"lava")
+	var ice: int = BlockCatalog.id_of(&"ice")
+	var snow: int = BlockCatalog.id_of(&"snow_block")
+	var i_reg: int = BlockCatalog.id_of(&"regolith")
+	var i_bas: int = BlockCatalog.id_of(&"basalt")
+	var i_ano: int = BlockCatalog.id_of(&"anorthosite")
+	for i in range(n_samp):
+		var fid := base + (i * 7) % nm
+		var cc: Vector2i = FA.centre_cell(fid)
+		var x := cc.x + ((i * 37) % 321) - 160
+		var z := cc.y + ((i * 53) % 321) - 160
+		var p: Vector4 = TC.facet_profile(fid, x, z)
+		var g := int(p.x)
+		var biome := int(p.y)
+		gmin = mini(gmin, g); gmax = maxi(gmax, g)
+		if g > TC.MAX_SURFACE_Y:
+			hi_bad += 1
+		if g <= TC.SEA_LEVEL:
+			lo_bad += 1
+		if biome == TC.B_MOON_MARIA:
+			maria += 1
+		elif biome == TC.B_MOON_HIGHLANDS:
+			highlands += 1
+		else:
+			biome_bad += 1
+		# walk the column across the surface and the ladder: nothing wet, nothing growing
+		for y in range(g - 8, g + 4):
+			var v: int = TC.resolve_cell(x, y, z, g, biome, p.z, p.w)
+			var mat: int = CellCodec.mat(v)
+			if mat == water or mat == lava or mat == ice or mat == snow:
+				liquid += 1
+			if mat == BlockCatalog.WOOD or mat == BlockCatalog.LEAF:
+				trees += 1
+			if mat == i_reg:
+				regolith_seen += 1
+			if mat == i_bas or mat == i_ano:
+				bedrock_seen += 1
+		# the bedrock floor is SHARED bones — the world still has a floor under the Moon
+		if int(CellCodec.mat(TC.resolve_cell(x, TC.WORLD_BOTTOM_Y, z, g, biome, p.z, p.w))) == BlockCatalog.id_of(&"bedrock"):
+			bedrock_seen += 0   # counted separately below; presence asserted via the dedicated check
+	_ok(hi_bad == 0, "moon height ≤ MAX_SURFACE_Y (%d) over %d samples (%d over — the worker early-out bound)" % [TC.MAX_SURFACE_Y, n_samp, hi_bad])
+	_ok(lo_bad == 0, "moon height stays ABOVE SEA_LEVEL over %d samples (%d under — a sea-fill would be reachable)" % [n_samp, lo_bad])
+	_ok(biome_bad == 0, "every moon column is a MOON biome (maria/highlands); %d leaked an Earth biome" % biome_bad)
+	_ok(liquid == 0, "NO liquid/ice/snow EVER emitted on the Moon (%d cells) — airless body" % liquid)
+	_ok(trees == 0, "NO trees on the Moon (%d wood/leaf cells) — TreeGen density 0" % trees)
+	_ok(regolith_seen > 0 and bedrock_seen > 0, "the lunar ladder is real: regolith (%d cells) over basalt/anorthosite (%d cells)" % [regolith_seen, bedrock_seen])
+	_ok(int(CellCodec.mat(TC.resolve_cell(0, TC.WORLD_BOTTOM_Y, 0, 40, TC.B_MOON_MARIA, 0.0, 0.0))) == BlockCatalog.id_of(&"bedrock"),
+		"the Moon keeps Earth's bedrock floor at WORLD_BOTTOM_Y (shared bones)")
+	print("  moon height range: g ∈ [%d, %d] (envelope: SEA_LEVEL+8 … %d)" % [gmin, gmax, TC.MAX_SURFACE_Y])
+
+	# --- maria vs highlands: a STATISTICAL floor. The exact fraction is a TASTE knob (D-O4-1,
+	# TerrainConfig.MOON_MARIA_T); the gate only defends "both terrains genuinely exist".
+	var frac := float(maria) / float(maxi(1, maria + highlands))
+	print("  maria coverage = %.1f%% (design target ~30%%; knob TerrainConfig.MOON_MARIA_T = %s)" % [frac * 100.0, TC.MOON_MARIA_T])
+	_ok(frac > 0.10 and frac < 0.55, "maria coverage %.1f%% inside the sane 10-55%% band (both provinces exist)" % (frac * 100.0))
+
+	# --- craters present: a statistical FLOOR (the design's "crater fields present"). A crater-free
+	# moon (a broken placement hash, a truncated neighbour sum) would read as near-flat rolling
+	# ground, so require BOTH real relief AND many distinct bowls along long surface traverses.
+	var relief_max := 0
+	var dips := 0
+	for fid in [base, base + nm / 4, base + nm / 2, base + (3 * nm) / 4, base + nm - 1]:
+		var cc: Vector2i = FA.centre_cell(fid)
+		var glo := 1 << 30
+		var ghi := -(1 << 30)
+		var prev := 0
+		var rising := false
+		for step in range(-90, 91):
+			var g2: int = int(TC.facet_profile(fid, cc.x + step, cc.y).x)
+			glo = mini(glo, g2); ghi = maxi(ghi, g2)
+			if step > -90:
+				var dd := g2 - prev
+				if dd > 0 and not rising:
+					rising = true
+					dips += 1              # a local minimum turned upward — a bowl floor
+				elif dd < 0:
+					rising = false
+			prev = g2
+		relief_max = maxi(relief_max, ghi - glo)
+	print("  moon relief over 5 sampled 180-block traverses: max %d blocks, %d local bowls" % [relief_max, dips])
+	_ok(relief_max >= 6, "the Moon has real relief (max %d ≥ 6 blocks over a 180-block traverse) — craters/maria present" % relief_max)
+	_ok(dips >= 10, "the moon surface is bowl-structured (%d local minima ≥ 10) — the crater field is not flat" % dips)

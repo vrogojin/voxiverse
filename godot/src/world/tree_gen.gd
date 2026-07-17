@@ -83,6 +83,13 @@ static func _species_for(biome: int, gx: int, gz: int) -> int:
 			return SP_SPRUCE
 		TerrainConfig.B_SWAMP, TerrainConfig.B_PLAINS:
 			return SP_OAK
+		# COSMOS ORBITAL O4b (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2): "no trees" on the Moon —
+		# TreeGen density 0 for the lunar biomes. The `_` default below already returns SP_NONE, and
+		# resolve_cell's moon branch never reaches TreeGen at all, so this is belt-and-braces AND a
+		# no-op (byte-identical). It is spelled out because "the Moon has no trees" is a stated
+		# contract (gate G-O4-MOONGEN), not an accident of a default that a later biome could disturb.
+		TerrainConfig.B_MOON_MARIA, TerrainConfig.B_MOON_HIGHLANDS, TerrainConfig.B_MOON_POLAR:
+			return SP_NONE
 		_:
 			return SP_NONE
 

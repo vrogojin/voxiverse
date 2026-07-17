@@ -1,7 +1,7 @@
 {
   "$schema_note": "VOXIVERSE data-driven block catalog (WORLDGEN-CATALOG \u00a74). BlockCatalog.ensure_ready() loads this file into the runtime VoxelState array (record order IS the dense id; APPEND-ONLY). The frozen core consts (AIR..LEAF) are ASSERTED against ids 0-5 here; every non-override record's anchors are pinned by the verify drift gate to AnchorConverter.propose_anchors(priors, structural_class). swatch is [r,g,b,a] floats; render.cull_group maps 1:1 onto the blocky transparency_index. Optional has_block_entity (bool, default false) marks a material whose cells may carry per-cell metadata (VOXEL-DATA-STRUCTURE \u00a73.1); no shipped material declares it yet. Tiers: core (0-5, frozen), world (6-76, always loaded); extended streams later (WGC \u00a73.1).",
   "version": 2,
-  "count": 77,
+  "count": 80,
   "blocks": [
     {
       "name": "air",
@@ -2546,6 +2546,104 @@
         "density": 2650.0,
         "C": 80.0,
         "T": 5.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "regolith",
+      "id": 77,
+      "tier": "world",
+      "mass": 950.0,
+      "break_force": 500.0,
+      "swatch": [
+        0.62,
+        0.61,
+        0.6,
+        1.0
+      ],
+      "structural_class": "granular",
+      "anchors": [
+        3,
+        1,
+        0
+      ],
+      "priors": {
+        "analog": "lunar regolith, cohesionless dust/rubble",
+        "cohesion": 2.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      },
+      "attachment": 0.0
+    },
+    {
+      "name": "basalt",
+      "id": 78,
+      "tier": "world",
+      "mass": 1610.0,
+      "break_force": 3390.0,
+      "swatch": [
+        0.22,
+        0.22,
+        0.24,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        90,
+        8,
+        5
+      ],
+      "priors": {
+        "analog": "mare basalt",
+        "density": 2900.0,
+        "C": 150.0,
+        "T": 15.0
+      },
+      "solidity": 1.0,
+      "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "anorthosite",
+      "id": 79,
+      "tier": "world",
+      "mass": 1500.0,
+      "break_force": 2500.0,
+      "swatch": [
+        0.78,
+        0.77,
+        0.74,
+        1.0
+      ],
+      "structural_class": "rock",
+      "anchors": [
+        64,
+        6,
+        4
+      ],
+      "priors": {
+        "analog": "lunar highland anorthosite",
+        "density": 2700.0,
+        "C": 100.0,
+        "T": 10.0
       },
       "solidity": 1.0,
       "permeability": 0.0,

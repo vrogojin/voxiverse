@@ -2047,7 +2047,11 @@ func _test_material_data() -> void:
 func _test_catalog_expansion() -> void:
 	print("[P3a] catalog expansion + translucent rendering")
 	var n := BlockCatalog.count()
-	_ok(n == 77, "catalog holds 77 materials (core+world), got %d" % n)
+	# 77 core+world + the 3 O4b lunar strata (regolith/basalt/anorthosite, ids 77-79 — the append-only
+	# data change of docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2). The pin is a DENSE-ORDER guard: bumping
+	# it is correct ONLY for an APPEND (ids added at the end, existing ids unmoved); a renumber/reorder
+	# must still fail here, and _assert_frozen_core + the per-id checks below enforce that.
+	_ok(n == 80, "catalog holds 80 materials (77 core+world + 3 lunar), got %d" % n)
 
 	# (a) every id 0..count-1 resolves to state + mass + solidity + a render material,
 	# id<->name round-trips, and non-air names are unique.
@@ -3585,7 +3589,7 @@ func _test_dynamic_catalog() -> void:
 	print("[P6c-1] dynamic material catalog (GMID ⇄ LRID + streaming)")
 
 	# (a) STATIC FACADE UNCHANGED: the bootstrap catalog behaves exactly as today.
-	_ok(BlockCatalog.count() == 77, "static facade: count() still 77 (bootstrap = core+world)")
+	_ok(BlockCatalog.count() == 80, "static facade: count() == 80 (bootstrap = core+world+lunar)")
 	_ok(BlockCatalog.key_of(0) == &"air", "static facade: LRID 0 is the reserved 'air' key")
 	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
 		var nm := BlockCatalog.name_of(id)

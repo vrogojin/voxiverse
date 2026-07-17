@@ -234,6 +234,103 @@ const B_PLAINS := 8
 const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
 const B_PILLAR := 10     # COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the unbreakable bedrock corner monument
                          # — full bedrock cubes floor→flat-top, no strata/ore/tree/snow/slope. M5C_CORNER-gated.
+# COSMOS ORBITAL O4b (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2) — the LUNAR biomes. Produced ONLY by
+# moon_profile_at_dir (a Moon fid), never by _biome(), so no Earth column can ever select one and every
+# Earth path stays byte-identical. They route to the moon strata ladder at resolve_cell's choke point.
+const B_MOON_MARIA := 11      # the dark basalt plains: lower, smoother, ~30% coverage
+const B_MOON_HIGHLANDS := 12  # the bright anorthosite uplands: higher, rougher, more heavily cratered
+const B_MOON_POLAR := 13      # CONTENT HOOK ONLY (design §3.2: "a slot for later ice") — never emitted in v1
+
+# ==============================================================================================
+# COSMOS ORBITAL O4b — LUNAR WORLDGEN (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2).
+#
+# EVERY CONST IN THIS BLOCK IS A TASTE KNOB (decision D-O4-1: "Moon terrain character — crater
+# density/scale/maria fraction"). The design fixed the SHAPE of the model (sparse hash-jittered
+# craters: bowl + raised rim + ejecta; a broad maria/highlands mask; a regolith→bedrock ladder) and
+# gave defaults for the two ratios it named — depth/radius ≈ 0.2 and rim ≈ 0.04·R_c, both honoured
+# below. Everything else here is a value THIS STAGE HAD TO CHOOSE because the design left it open;
+# each is flagged INVENTED with its rationale so the user's screenshot pass can retune it. The Moon
+# is dark (MULTI_BODY=false) precisely so this iterates without blocking the mechanics (risk #8).
+#
+# Determinism/worker-safety: identical to Earth's contract — FastNoiseLite singletons built in
+# _ensure_noise() on the main thread via warm_up(), plus pure _hash01_3d integer hashes. Every
+# function here is a pure function of (SEED_MOON, d̂).
+
+## The Moon's noise seed base. Design-specified. Far from Earth's SEED+101..104 salts, so lunar and
+## terrestrial fields are decorrelated.
+const SEED_MOON := SEED + 900001
+
+## Radial elevation datum for the lunar surface, in blocks above y=0. INVENTED: the design never fixed
+## one. Chosen so (a) the deepest crater bowl still lands well above SEA_LEVEL — nothing on the Moon
+## may ever reach the sea-fill branch, belt-and-braces beside the resolve_cell moon branch that never
+## emits liquid — and (b) the tallest rim stays far under MAX_SURFACE_Y (116), the bound the module
+## worker's early-outs depend on. Budget: 40 + maria(−6) + rolling(±4) + rim(+2.6) + ejecta ⇒ ~[26, 50].
+const MOON_BASE_HEIGHT := 40.0
+## Gentle rolling regolith relief, blocks (INVENTED, "hills-class, lower amplitude" per the design).
+const MOON_ROLL_AMPLITUDE := 4.0
+const MOON_ROLL_FREQ := 0.010          # INVENTED: ~Earth's _hills 0.008, slightly tighter (airless, no fluvial smoothing)
+## Fine surface grain, blocks (INVENTED — the regolith "texture" that keeps flat ground from reading dead).
+const MOON_DETAIL_AMPLITUDE := 1.0
+const MOON_DETAIL_FREQ := 0.06
+
+## --- maria vs highlands (design: "broad low-frequency mask, ~30% maria coverage") ---
+const MOON_MARIA_FREQ := 0.0008        # INVENTED: == Earth's _mountain mask freq — broad coherent provinces, not speckle
+## Maria where the mask noise EXCEEDS this. MEASURED, not guessed: the mask's p70 over a 20k-sample
+## sweep of the Moon's surface, which is exactly the design's ~30% maria target (the gate prints the
+## realised coverage every run, so a retune is a one-const edit with immediate feedback).
+const MOON_MARIA_T := 0.18
+const MOON_MARIA_DROP := 6.0           # INVENTED: mare floors sit this far BELOW the datum ("lower elevation")
+const MOON_MARIA_SMOOTH := 0.35        # INVENTED: fraction of rolling relief kept in a mare (basalt flood = flat plains)
+const MOON_MARIA_BLEND := 0.05         # INVENTED: mask half-width of the maria↔highlands ramp (no cliff at the shoreline)
+const MOON_HIGHLAND_ROUGH := 1.8       # INVENTED: highlands relief multiplier ("brighter, rougher, higher")
+
+## --- craters (THE signature; design §3.2) ---
+## The coarse cube-face cell lattice craters are seeded on. INVENTED (the design says "the existing
+## face/cell math at a small n"). n=24 ⇒ cell arc = (π/2·1737)/24 ≈ 114 blocks.
+##
+## THE COMPLETENESS INEQUALITY — the load-bearing constraint tying these knobs together:
+##
+##     cell_arc  ≥  MOON_CRATER_R_MAX × MOON_CRATER_EJECTA_REACH        (a crater's FULL reach)
+##       114     ≥        64          ×          1.5        = 96   ✓ (1.19× margin)
+##
+## This is what makes the bounded ≤3×3 neighbour sum EXACT rather than an approximation: a crater
+## seeded two cells away is ≥ one full cell width from this column, so if its total reach is under a
+## cell width it physically cannot contribute. Note the reach is R_MAX·EJECTA_REACH — the EJECTA
+## tail, NOT the bowl radius; using R_MAX alone silently truncates big craters' ejecta at the window
+## edge (a sub-block seam, but a real one). ANY edit to N / R_MAX / EJECTA_REACH must re-check this
+## inequality — or widen the neighbour window to match.
+const MOON_CRATER_N := 24
+const MOON_CRATER_MAX_PER_CELL := 2    # design: "0..2 craters" per cell
+## P(a coarse cell hosts ≥1 crater). INVENTED — with MAX_PER_CELL this is THE density dial. High:
+## the real Moon's highlands are crater-SATURATED, and at 0.62 a measured median 180-block traverse
+## found only ~3 blocks of relief (a near-flat plain). ~1.5 craters/cell average.
+const MOON_CRATER_CHANCE := 0.95
+const MOON_CRATER_R_MIN := 8.0         # design: "radius 8..64"
+const MOON_CRATER_R_MAX := 64.0        # design: bounded by MOON_CRATER_N's cell arc (see above)
+## Radius draw = R_MIN + (R_MAX−R_MIN)·hash^BIAS. INVENTED exponent, and the single most taste-visible
+## crater knob. >1 biases small (big basins rare — real, but a uniform draw made the field read as
+## wall-to-wall craters); too high and the Moon flattens into faint pockmarks. MEASURED at 2.0: median
+## radius ~22, p90 ~53 (bowl ~10 blocks deep) — the "Minecraft-heroic" read the design asks for. (3.0
+## measured a median traverse relief of only 3 blocks — a near-flat plain. Do not raise blindly.)
+const MOON_CRATER_R_BIAS := 2.0
+const MOON_CRATER_DEPTH_RATIO := 0.2   # DESIGN-SPECIFIED: bowl depth / radius ≈ 0.2
+const MOON_CRATER_RIM_RATIO := 0.04    # DESIGN-SPECIFIED: rim height ≈ 0.04·R_c
+const MOON_CRATER_RIM_WIDTH := 0.18    # INVENTED: rim falloff width as a fraction of R_c (the s≈R_c "near" band)
+## Ejecta noise fades to nothing by this multiple of R_c ("beyond", per the design). INVENTED, and
+## CONSTRAINED: it sets a crater's true reach, so it is bound by the completeness inequality above
+## (R_MAX · this ≤ cell_arc). 1.9 would give reach 121.6 > the 114-block cell — incomplete.
+const MOON_CRATER_EJECTA_REACH := 1.5
+const MOON_CRATER_EJECTA_AMP := 0.06   # INVENTED: ejecta amplitude as a fraction of R_c
+## Old craters are shallower/softer (design: each crater hashes an "age"). INVENTED ramp: age∈[0,1]
+## scales depth/rim between these bounds, so a field reads as overlapping generations, not one stamp.
+const MOON_CRATER_AGE_MIN := 0.35
+## Craters are denser/deeper on the ancient highlands than on the resurfaced maria — the single most
+## recognisable real lunar fact. INVENTED weight (the design implies it but fixes no number).
+const MOON_CRATER_MARIA_SCALE := 0.45
+
+## Lunar strata ladder (design §3.2: regolith top "3-5 cells", then basalt/anorthosite bedrock).
+const MOON_REGOLITH_MIN := 3
+const MOON_REGOLITH_MAX := 5
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds), 104
@@ -256,6 +353,14 @@ const _SALT_ORE_PICK := 725
 const _SALT_ORE_R := 726
 const _SALT_BAND := 731
 const _SALT_PODZOL := 741
+# O4b lunar salts. 751/757 are taken by FacetAtlas's per-facet decorrelation offset, so the Moon
+# claims the 77x block — recorded HERE because this file is the one-place registry (WGC §7.1).
+const _SALT_MOON_CRATER_N := 771     # how many craters this coarse cell hosts (0..2)
+const _SALT_MOON_CRATER_JI := 772    # crater centre jitter along face axis i
+const _SALT_MOON_CRATER_JJ := 773    # crater centre jitter along face axis j
+const _SALT_MOON_CRATER_R := 774     # crater radius
+const _SALT_MOON_CRATER_AGE := 775   # crater age (depth/rim softening)
+const _SALT_MOON_REGOLITH := 776     # per-column regolith depth (3..5)
 
 # --- ore depth table (WGC §6.6; y-range/peak/weight, triangle distributions) ---
 # index: 0 coal, 1 copper, 2 iron, 3 gold, 4 redstone, 5 lapis, 6 diamond, 7 emerald
@@ -276,6 +381,13 @@ static var _continent: FastNoiseLite   # continentalness (ocean <-> inland)
 static var _temperature: FastNoiseLite # climate temperature
 static var _humidity: FastNoiseLite    # climate humidity
 static var _mountain: FastNoiseLite    # Mountains-biome mask (broad, low-frequency ranges)
+# O4b lunar noise stack (SEED_MOON). Built in _ensure_noise on the MAIN thread beside Earth's — ALL
+# bodies' noises warm up front and freeze, so a voxel worker generating a Moon facet never first-
+# touches a lazily-built singleton (the project's worst race class; §3.2 "frozen up front").
+static var _moon_roll: FastNoiseLite   # gentle rolling regolith relief
+static var _moon_detail: FastNoiseLite # fine surface grain
+static var _moon_maria: FastNoiseLite  # broad maria/highlands province mask
+static var _moon_ejecta: FastNoiseLite # crater ejecta blanket texture
 
 # --- cached material ids (resolved once from the data-driven catalog) ---------
 static var _ids_ready := false
@@ -294,6 +406,11 @@ static var _ID_MUD := 0
 static var _ID_PODZOL := 0
 static var _ID_SULFUR := 0
 static var _ID_CINNABAR := 0
+# O4b lunar strata ids (§3.2) — the CLAUDE.md rule-2 data change: BlockCatalog + BlockMaterials + a
+# biome rule. Resolved in _ensure_ids beside every other id, so the moon ladder never id_of()s hot.
+static var _ID_REGOLITH := 0
+static var _ID_BASALT := 0
+static var _ID_ANORTHOSITE := 0
 static var _STRATA_SEQ: Array[int] = []   # granite,diorite,andesite,tuff,calcite,dripstone
 static var _BAND_SEQ: Array[int] = []      # 7 terracotta ids (badlands strata)
 static var _ORE_STONE: Array[int] = []     # ids 18..25
@@ -330,6 +447,26 @@ static func _ensure_noise() -> void:
 	# worker is the project's worst data-race class.
 	_mountain = _make_climate(SEED + 104, 0.0008)
 
+	# COSMOS ORBITAL O4b (§3.2): the lunar stack, warmed HERE on the main thread beside Earth's — the
+	# design's "all bodies' noises warm up front, frozen". Unconditional (not MULTI_BODY-gated): four
+	# FastNoiseLite objects are O(KB) and building them always keeps the frozen-epoch contract free of
+	# a flag-dependent race window, while the terrain they describe stays unreachable until the flag.
+	_moon_roll = FastNoiseLite.new()
+	_moon_roll.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	_moon_roll.seed = SEED_MOON
+	_moon_roll.frequency = MOON_ROLL_FREQ
+	_moon_roll.fractal_type = FastNoiseLite.FRACTAL_FBM
+	_moon_roll.fractal_octaves = 3
+	_moon_roll.fractal_gain = 0.5
+
+	_moon_detail = FastNoiseLite.new()
+	_moon_detail.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	_moon_detail.seed = SEED_MOON + 1
+	_moon_detail.frequency = MOON_DETAIL_FREQ
+
+	_moon_maria = _make_climate(SEED_MOON + 2, MOON_MARIA_FREQ)
+	_moon_ejecta = _make_climate(SEED_MOON + 3, 0.02)
+
 static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
 	var n := FastNoiseLite.new()
 	n.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
@@ -360,6 +497,9 @@ static func _ensure_ids() -> void:
 	_ID_PODZOL = BlockCatalog.id_of(&"podzol")
 	_ID_SULFUR = BlockCatalog.id_of(&"sulfur_block")
 	_ID_CINNABAR = BlockCatalog.id_of(&"cinnabar_block")
+	_ID_REGOLITH = BlockCatalog.id_of(&"regolith")             # O4b lunar ladder (§3.2)
+	_ID_BASALT = BlockCatalog.id_of(&"basalt")
+	_ID_ANORTHOSITE = BlockCatalog.id_of(&"anorthosite")
 	_STRATA_SEQ = [
 		BlockCatalog.id_of(&"granite"), BlockCatalog.id_of(&"diorite"),
 		BlockCatalog.id_of(&"andesite"), BlockCatalog.id_of(&"tuff"),
@@ -402,6 +542,14 @@ static func warm_up() -> void:
 	# is a pure concurrent READ of a frozen table. FLAT_WORLD never folds, so this is skipped there.
 	if not CubeSphere.FLAT_WORLD:
 		CubeSphere.warm_edge_tables(CubeSphere.n_for(CubeSphere.HOME_BODY))
+	# COSMOS ORBITAL O4b (§3.2, risk #3): the lunar CRATER LATTICE folds at MOON_CRATER_N to resolve
+	# its ≤3×3 neighbour cells across cube-face edges (_moon_crater_height → fold_cell_canonical). That
+	# is a THIRD grid resolution beyond Earth's k=24 and the Moon's k=14, and the worker generating a
+	# Moon column is what would first-touch it — so warm it HERE, on the main thread, before any
+	# worker. warm_edge_tables is append-only per n, so this never evicts a body's k table. Guarded on
+	# MULTI_BODY: with the Moon unbuilt, no Moon fid exists and the crater kernel is unreachable.
+	if CubeSphere.MULTI_BODY:
+		CubeSphere.warm_edge_tables(MOON_CRATER_N)
 
 ## Deterministic hash in [0,1) for an integer lattice + salt (3D form of the
 ## TreeGen._hash01 integer-mix family; no floats until the final divide).
@@ -796,19 +944,170 @@ static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector
 	var g := _height_c3(c, px, py, pz, mtn)
 	return Vector4(float(g), float(_biome(c, t, hh, g, mtn)), c, t)
 
+# ==============================================================================================
+# COSMOS ORBITAL O4b — the LUNAR worldgen (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2).
+#
+# Structurally the twin of profile_at_dir: a PURE function of (SEED_MOON, d̂, rr) returning the same
+# Vector4 (g, biome, c, t) contract, so everything downstream — the GenCtx threading, the (facet,x,z)
+# column memo, resolve_cell, the module worker, the analytic queries — flows UNCHANGED. The Moon is
+# just another direction-parameterised profile behind the facet_profile dispatch.
+#
+# What it is NOT: no sea (never emits liquid), no trees, no snow, no atmosphere-driven climate. The
+# Vector4's `c`/`t` slots carry the maria mask and a latitude proxy purely so the tuple keeps its
+# shape for the memo; NOTHING on the moon path consults them for liquid/vegetation decisions.
+# ==============================================================================================
+
+## Crater contribution (blocks, signed) at direction d̂ from every crater seeded within the ≤3×3
+## coarse-cell neighbourhood — the design's bounded, memoized sum.
+##
+## Placement (design §3.2): partition the sphere by coarse cube-face cells at MOON_CRATER_N; hash
+## (SEED_MOON, cell) → 0..2 craters with centre jitter, radius 8..64, age. Height at angular distance
+## s from a centre: bowl −depth·(1 − (s/R_c)²) inside, raised rim +h_rim·falloff near s≈R_c, ejecta
+## noise beyond.
+##
+## COMPLETENESS (why 3×3 is EXACT, not an approximation): a crater's full reach — bowl AND ejecta —
+## is R_c·MOON_CRATER_EJECTA_REACH ≤ 64·1.5 = 96 blocks, while a coarse cell at MOON_CRATER_N=24 is
+## ≈114 blocks across. A crater seeded two cells away is separated from this column by at least one
+## whole intervening cell (≥114 blocks) > 96, so it cannot contribute. The 3×3 window is therefore
+## the crater's EXACT support and the sum is bounded at ≤ 9·2 = 18 craters. See the completeness
+## inequality at MOON_CRATER_N: the bound is the EJECTA reach, not the bowl radius — comparing the
+## window against R_MAX alone would truncate big craters' ejecta tails at the window edge.
+##
+## Cross-face correctness: neighbour cells are resolved with fold_cell_canonical at MOON_CRATER_N, so
+## a crater straddling a cube-face edge or corner is still one crater at one true direction rather
+## than being clipped into a seam. Corner quadrants can fold two window cells onto the SAME true
+## cell, so folded cells are DEDUPED — without that, a corner crater would be summed twice and punch
+## a double-depth bowl at the 8 cube vertices. Pure f64 + frozen tables ⇒ worker-safe.
+static func _moon_crater_height(dx: float, dy: float, dz: float, rr: float, maria_w: float) -> float:
+	var d := CubeSphere.DVec3.new(dx, dy, dz)
+	var home := CubeSphere.dir_to_face_cell(d, MOON_CRATER_N)
+	var hface := int(home["face"])
+	var hi := int(home["fi"])
+	var hj := int(home["fj"])
+	var total := 0.0
+	var seen := PackedInt32Array()             # deduped folded cell keys (≤9; corner quadrants alias)
+	for di in range(-1, 2):
+		for dj in range(-1, 2):
+			var f := CubeSphere.fold_cell_canonical(hface, hi + di, hj + dj, MOON_CRATER_N)
+			var cf := int(f["face"])
+			var ci := int(f["i"])
+			var cj := int(f["j"])
+			var key := (cf * MOON_CRATER_N + ci) * MOON_CRATER_N + cj
+			if seen.has(key):
+				continue                        # same true cell reached twice (corner) — count it ONCE
+			seen.append(key)
+			total += _moon_cell_craters(cf, ci, cj, dx, dy, dz, rr, maria_w)
+	return total
+
+## Every crater seeded in ONE coarse cell, summed at d̂. Split out of _moon_crater_height so the
+## placement hash chain reads in one place.
+static func _moon_cell_craters(cf: int, ci: int, cj: int, dx: float, dy: float, dz: float, rr: float, maria_w: float) -> float:
+	# how many craters this cell hosts: 0..MOON_CRATER_MAX_PER_CELL (design: "0..2")
+	var hn := _hash01_3d(cf, ci, cj, _SALT_MOON_CRATER_N)
+	if hn >= MOON_CRATER_CHANCE:
+		return 0.0
+	var count := 1 + int(hn / MOON_CRATER_CHANCE * float(MOON_CRATER_MAX_PER_CELL))
+	count = mini(count, MOON_CRATER_MAX_PER_CELL)
+	var acc := 0.0
+	for c in range(count):
+		# centre jitter INSIDE the cell (salted per crater index so the 2 craters never coincide)
+		var ji := _hash01_3d(cf * 31 + c, ci, cj, _SALT_MOON_CRATER_JI)
+		var jj := _hash01_3d(cf * 31 + c, ci, cj, _SALT_MOON_CRATER_JJ)
+		var cdir := CubeSphere.face_cell_to_dir(cf, float(ci) - 0.5 + ji, float(cj) - 0.5 + jj, MOON_CRATER_N)
+		# radius 8..64 (design), biased small by MOON_CRATER_R_BIAS so big basins stay rare
+		var hr := _hash01_3d(cf * 31 + c, ci, cj, _SALT_MOON_CRATER_R)
+		var rad: float = MOON_CRATER_R_MIN + (MOON_CRATER_R_MAX - MOON_CRATER_R_MIN) * pow(hr, MOON_CRATER_R_BIAS)
+		# age: old craters are shallower/softer (design: each crater hashes an age)
+		var age: float = MOON_CRATER_AGE_MIN + (1.0 - MOON_CRATER_AGE_MIN) * _hash01_3d(cf * 31 + c, ci, cj, _SALT_MOON_CRATER_AGE)
+		# maria are RESURFACED: same field, muted (INVENTED weight MOON_CRATER_MARIA_SCALE)
+		var wgt: float = age * lerpf(1.0, MOON_CRATER_MARIA_SCALE, maria_w)
+		# angular distance → arc length in blocks (the honest metric on the sphere)
+		var dot: float = clampf(cdir.x * dx + cdir.y * dy + cdir.z * dz, -1.0, 1.0)
+		var s: float = acos(dot) * rr
+		acc += _moon_crater_shape(s, rad, dx, dy, dz, rr) * wgt
+	return acc
+
+## One crater's radial height profile at arc distance `s` from its centre (blocks, signed).
+## Bowl (design): −depth·(1 − (s/R_c)²) inside. Rim: +h_rim·falloff near s≈R_c. Ejecta: noise beyond.
+static func _moon_crater_shape(s: float, rad: float, dx: float, dy: float, dz: float, rr: float) -> float:
+	var reach: float = rad * MOON_CRATER_EJECTA_REACH
+	if s >= reach:
+		return 0.0
+	var depth: float = rad * MOON_CRATER_DEPTH_RATIO
+	var h_rim: float = rad * MOON_CRATER_RIM_RATIO
+	var h := 0.0
+	if s < rad:
+		var u: float = s / rad
+		h += -depth * (1.0 - u * u)                       # the bowl (design formula, verbatim)
+	# raised rim: a smooth bump centred on s == rad, width MOON_CRATER_RIM_WIDTH·rad
+	var w: float = rad * MOON_CRATER_RIM_WIDTH
+	var e: float = (s - rad) / w
+	h += h_rim * exp(-e * e)
+	# ejecta blanket beyond the rim, fading to nothing by `reach`
+	if s > rad:
+		var f: float = 1.0 - (s - rad) / (reach - rad)
+		var n: float = _moon_ejecta.get_noise_3d(dx * rr, dy * rr, dz * rr)
+		h += n * rad * MOON_CRATER_EJECTA_AMP * f * f
+	return h
+
+## THE lunar profile (§3.2) — the Moon's answer to profile_at_dir. Pure in (SEED_MOON, d̂, rr).
+## Returns the same (g, biome, c, t) Vector4 contract Earth's does.
+static func moon_profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector4:
+	_ensure_noise()
+	var px := dx * rr
+	var py := dy * rr
+	var pz := dz * rr
+	# --- maria vs highlands: a broad low-frequency province mask ---
+	var mask := _moon_maria.get_noise_3d(px, py, pz)
+	# maria_w ∈ [0,1]: 1 deep inside a mare, 0 in the highlands, ramped over MOON_MARIA_BLEND so the
+	# shoreline is a slope rather than a cliff.
+	var maria_w := clampf((mask - MOON_MARIA_T) / MOON_MARIA_BLEND + 0.5, 0.0, 1.0)
+	var biome := B_MOON_MARIA if maria_w >= 0.5 else B_MOON_HIGHLANDS
+	# --- base relief: rolling regolith + fine grain, roughened on the highlands, flattened in maria ---
+	var roll := _moon_roll.get_noise_3d(px, py, pz) * MOON_ROLL_AMPLITUDE
+	var grain := _moon_detail.get_noise_3d(px, py, pz) * MOON_DETAIL_AMPLITUDE
+	var rough := lerpf(MOON_HIGHLAND_ROUGH, MOON_MARIA_SMOOTH, maria_w)
+	var h := MOON_BASE_HEIGHT + (roll + grain) * rough - MOON_MARIA_DROP * maria_w
+	# --- craters: the signature, summed over the bounded 3×3 neighbourhood ---
+	h += _moon_crater_height(dx, dy, dz, rr, maria_w)
+	# --- envelope (design §3.2: "clamped so height ≤ MAX_SURFACE_Y") ---
+	# The module worker's all-air early-outs are only sound if NOTHING exceeds MAX_SURFACE_Y, so this
+	# clamp is load-bearing, not cosmetic (G-O4-MOONGEN asserts it over 10⁴ samples). The lower bound
+	# keeps the surface far above the bedrock floor AND above SEA_LEVEL — a second guarantee, beside
+	# resolve_cell's moon branch, that the sea-fill path can never be reached on an airless body.
+	var g := clampi(int(floor(h)), SEA_LEVEL + 8, MAX_SURFACE_Y)
+	# `c` carries the maria mask and `t` a latitude proxy purely to keep the Vector4 contract's shape
+	# (the memo/threading are tuple-shaped). No moon path reads them for liquid/vegetation decisions.
+	return Vector4(float(g), float(biome), mask, _moon_latitude_t(dz))
+
+## A cold latitude proxy for the Moon's Vector4.w. NOT Earth's climate model: airless, so there is no
+## meaningful biome-driving air temperature. Kept latitude-shaped (equator warm → poles cold) so the
+## later B_MOON_POLAR ice hook and PerVoxelEnvironment's wider day/night swing (§3.2 "Sky/environment")
+## have an honest signal to key on. INVENTED (design defers the environment model to a data change).
+static func _moon_latitude_t(dz: float) -> float:
+	return clampf(1.0 - 2.0 * absf(dz), -1.0, 1.0) * 0.5 - 0.5
+
 ## COSMOS FACETED (§3.1): the sphere-terrain profile for a facet's local lattice column (fid, x, z). The facet
 ## cell's TRUE direction (FacetAtlas.cell_dir — all f64) sampled at R_BLOCKS. Deterministic: (SEED, fid, x, z).
-## COSMOS ORBITAL O4a (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2) — the per-body worldgen DISPATCH point.
-## fid is the GLOBAL multi-body facet id; body_of_fid(fid) selects the body's profile. In O4a only Earth
-## (body 0) is registered and r_of(fid) ≡ FacetAtlas.R_BLOCKS (3072), so this is byte-identical to the
-## shipped `profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)` (G-O4-EQ pins it). O4b slots the Moon in as
-## a `1:` branch calling moon_profile_at_dir — the match is structured so nothing else moves.
+## COSMOS ORBITAL O4a/O4b (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2) — the per-body worldgen DISPATCH
+## point, and the ONLY worldgen entry the faceted engine uses. fid is the GLOBAL multi-body facet id;
+## body_of_fid(fid) selects the body's profile. Everything downstream (GenCtx threading, the
+## (facet,x,z) column memo, resolve_cell, the module worker, the analytic queries, LOD/far-ring
+## sampling) flows UNCHANGED — the profile was already the single choke point they all share.
+##
+## The slot is resolved ONCE and both the branch and the radius read from it (r_of(fid) would repeat
+## the body_of_fid lookup — this is worker-hot, called per column). Post-warm those are frozen Packed
+## reads (FacetAtlas._slot_*). For Earth this is `profile_at_dir(d…, 3072.0)` — byte-identical to the
+## shipped call, which G-O4-EQ pins in BOTH MULTI_BODY states.
 static func facet_profile(fid: int, x: int, z: int) -> Vector4:
 	var d := FacetAtlas.cell_dir(fid, x, z)
-	match FacetAtlas.body_of_fid(fid):
-		# 1: return moon_profile_at_dir(d.x, d.y, d.z, FacetAtlas.r_of(fid))   # O4b — the Moon
+	var slot := FacetAtlas.body_of_fid(fid)
+	var rr := FacetAtlas.r_of_slot(slot)
+	match slot:
+		1:
+			return moon_profile_at_dir(d.x, d.y, d.z, rr)                      # the Moon (O4b)
 		_:
-			return profile_at_dir(d.x, d.y, d.z, FacetAtlas.r_of(fid))         # Earth (body 0) — verbatim
+			return profile_at_dir(d.x, d.y, d.z, rr)                           # Earth (body 0) — verbatim
 
 ## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
 ## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
@@ -979,6 +1278,16 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# in FLAT / flag-off builds → byte-identical.
 	if biome == B_PILLAR:
 		return _ID_BEDROCK if y <= g else BlockCatalog.AIR
+	# COSMOS ORBITAL O4b (§3.2): the LUNAR strata ladder. resolve_cell stays THE choke point — the moon
+	# biomes route here, immediately after the SHARED bones (the bedrock floor above, which the Moon
+	# keeps), and BEFORE every Earth-only stage. That ordering is the whole design: sea fill, trees,
+	# snow, slope/smoothing and the ore/strata rewrite are structurally UNREACHABLE on the Moon rather
+	# than being individually suppressed — so "no sea, no trees, no snow" is a property of the control
+	# flow, not a list of guards someone must remember to extend. B_MOON_* is emitted ONLY by
+	# moon_profile_at_dir, so no Earth column can enter here and every Earth path stays byte-identical.
+	# Caves/ores slot in later as data on these same shared bones (deepslate band + bedrock floor).
+	if biome == B_MOON_MARIA or biome == B_MOON_HIGHLANDS:
+		return _moon_cell(x, y, z, g, biome)
 	# SHARP-SLOPE §3.4: a steep SLOPE column carves/caps a vertical RUN [lo, hi−1] of SLOPE cells
 	# (possibly reaching BELOW g and ABOVE g+1), replacing today's saturated hip-roof caps. The run
 	# is gap-free by the clipped-plane construction; the column is solid from bedrock to the plane.
@@ -1969,6 +2278,32 @@ static func _band_color(x: int, y: int, z: int) -> int:
 	return _BAND_SEQ[posmod(y + shift, _BAND_SEQ.size())]
 
 # --- stage: deepslate gradient + strata blobs (WGC §6.5) ----------------------
+## COSMOS ORBITAL O4b (§3.2) — the lunar strata ladder, the Moon's whole material story.
+##
+##   air                         y > g
+##   regolith (3-5 cells)        the silver-grey surface dust/rubble (mass ~gravel, granular)
+##   basalt / anorthosite        mare bedrock / highland bedrock — the biome IS the rock
+##   deepslate band              SHARED bones with Earth (the existing dither), so the deep world
+##   bedrock floor               ...is one concept across bodies (handled by resolve_cell above)
+##
+## NEVER emits liquid (airless body) and never consults TreeGen — both are simply not on this path.
+## Pure: (SEED_MOON hashes, y, biome) only. The regolith depth is a per-column hash, so the boundary
+## between dust and bedrock undulates instead of ringing a dead-flat contour line.
+static func _moon_cell(x: int, y: int, z: int, g: int, biome: int) -> int:
+	if y > g:
+		return BlockCatalog.AIR
+	var depth := MOON_REGOLITH_MIN + int(_hash01_3d(x, 0, z, _SALT_MOON_REGOLITH) * float(MOON_REGOLITH_MAX - MOON_REGOLITH_MIN + 1))
+	depth = mini(depth, MOON_REGOLITH_MAX)
+	if y > g - depth:
+		return _ID_REGOLITH
+	# the deepslate band is SHARED with Earth (same dither predicate, same y bands) — the "shared
+	# bones" the design asks for, so caves/ores slot in later as data on both bodies at once.
+	if y < DEEPSLATE_FULL_Y:
+		return _ID_DEEPSLATE
+	if y <= DEEPSLATE_TOP_Y and _hash01_3d(x, y, z, _SALT_DEEP) < float(DEEPSLATE_TOP_Y - y) / float(DEEPSLATE_TOP_Y - DEEPSLATE_FULL_Y):
+		return _ID_DEEPSLATE
+	return _ID_BASALT if biome == B_MOON_MARIA else _ID_ANORTHOSITE
+
 static func _deep_family(x: int, y: int, z: int) -> int:
 	var base := BlockCatalog.STONE
 	if y < DEEPSLATE_FULL_Y:

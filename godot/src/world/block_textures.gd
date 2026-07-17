@@ -30,6 +30,11 @@ const TILES := {
 	# soils / surface
 	&"coarse_dirt": "dirt", &"mud": "mud", &"sand": "sand", &"gravel": "gravel",
 	&"snow_block": "snow_block", &"powder_snow": "snow_block",
+	# COSMOS ORBITAL O4b — the lunar strata (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.2). No new CC0
+	# tiles are baked: each reuses the nearest existing stem and takes its lunar CAST from the
+	# material swatch (regolith = grey rubble, basalt = the dark mare, anorthosite = bright
+	# highlands). TASTE KNOB (D-O4-1): swap the stems / swatches here + in assets/blocks.json.
+	&"regolith": "gravel", &"basalt": "deepslate", &"anorthosite": "diorite",
 	# cryo
 	&"ice": "ice",
 	# tree species (oak = core wood/leaf; dark_oak/cherry have no CC0 tile -> swatch)

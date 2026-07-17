@@ -26,6 +26,11 @@ var _win_i := 0
 var _win_fill := 0
 var _frame_worst_ema := 0.0                    # EMA of the window p90 (§P2, was max) — the setpoint-comparison signal
 var _backlog := 0                              # last polled vox_gen backlog (feed-forward)
+# FP_INFLIGHT_GATE (P1): the total in-flight signal F = gen + mesh + K·main (post-port, the main-thread apply stage is
+# the choke, not gen) and its hysteresis latch. Both are inert with the flag off — backlog_gated() reads the shipped
+# _backlog path, so the latch never feeds any decision and the whole controller stays byte-identical.
+var _inflight := 0                             # last polled F = gen + mesh + INFLIGHT_MAIN_K·main
+var _inflight_gated := false                   # hysteresis latch: close at INFLIGHT_MAX, re-open at INFLIGHT_MIN
 var _last_tick_s := -1.0                       # injected-clock time of the last control update (−1 = not started)
 var _promote_hold_s := 0.0                     # seconds credit has sat ≥ CTRL_PROMOTE_CREDIT with the backlog gate open
 var _headroom_hold_s := 0.0                    # seconds credit has sat ≥ CTRL_PROMOTE_CREDIT IGNORING the backlog gate —
@@ -68,11 +73,22 @@ func set_adaptive(on: bool) -> void:
 func tick(now_s: float) -> void:
 	var fm := 0.0
 	var bk := 0
+	var inf := 0
 	if _src != null:
 		var d: Dictionary = _src.call("poll")
 		fm = float(d.get("frame_ms", 0.0))
 		bk = int(d.get("backlog", 0))
+		inf = int(d.get("inflight", bk))   # FP_INFLIGHT_GATE: total in-flight F; a source without it (headless square-wave) falls back to backlog
 	_backlog = bk
+	# FP_INFLIGHT_GATE (P1): latch the in-flight admission gate with hysteresis every poll (parity with _backlog above,
+	# updated before the CTRL_TICK_S credit gate so it tracks F instantaneously). Purely stored state — backlog_gated()
+	# only consults it under the flag, so with the flag off this computes an unused latch and behaviour is byte-identical.
+	_inflight = inf
+	if _inflight_gated:
+		if _inflight < CubeSphere.INFLIGHT_MIN:
+			_inflight_gated = false
+	elif _inflight > CubeSphere.INFLIGHT_MAX:
+		_inflight_gated = true
 	# push this frame's measured cost into the sliding window (the binding statistic is the p90 over the window, §P2)
 	_win[_win_i] = fm
 	_win_i = (_win_i + 1) % CubeSphere.CTRL_WINDOW_FRAMES
@@ -211,8 +227,13 @@ func promote_imminent_admitted() -> bool:
 
 # ---- feed-forward + stability introspection ----
 
-## The vox_gen feed-forward gate: true while the backlog exceeds CTRL_BACKLOG_MAX (holds surfaces 3-4 at zero).
+## The feed-forward admission gate holding surfaces 3-4 at zero. Shipped: true while vox_gen > CTRL_BACKLOG_MAX. Under
+## FP_INFLIGHT_GATE (P1) it switches to the TOTAL in-flight signal with hysteresis (the latch maintained in tick()):
+## F = gen + mesh + K·main > INFLIGHT_MAX closes it, F < INFLIGHT_MIN re-opens it — the C++ port made gen fast, so the
+## binding backlog is now the main-thread apply/upload stage, not vox_gen. Flag OFF ⇒ the exact shipped path.
 func backlog_gated() -> bool:
+	if CubeSphere.FP_INFLIGHT_GATE:
+		return _inflight_gated
 	return _backlog > CubeSphere.CTRL_BACKLOG_MAX
 
 ## Sustained-overload demote pressure (§6.5.4): true only after CTRL_OVERLOAD_SUSTAIN_S of continuous credit-0
@@ -228,6 +249,7 @@ func stats() -> Dictionary:
 		"backlog_gated": backlog_gated(), "overload": _overload, "ticks": _ticks, "relief_only": relief_only(),
 		"promote_hold_s": _promote_hold_s, "headroom_hold_s": _headroom_hold_s, "overload_hold_s": _overload_hold_s,
 		"adaptive": _adaptive, "setpoint_ms": _setpoint_ms, "floor_p10_ms": _floor_p_low(),
+		"inflight": _inflight, "inflight_gated": _inflight_gated,   # FP_INFLIGHT_GATE (P1) diagnostics
 	}
 
 # ============================ live input source (§6.5.1) ============================
@@ -255,7 +277,12 @@ class LiveSource extends RefCounted:
 			frame_ms = minf(float(now - _last_usec) / 1000.0, CubeSphere.CTRL_FRAME_SAMPLE_CLAMP_MS)
 		_last_usec = now
 		var backlog := 0
+		var inflight := 0
 		if _ve != null and _ve.has_method("get_stats"):
 			var st: Dictionary = _ve.call("get_stats")
-			backlog = int((st.get("tasks", {}) as Dictionary).get("generation", 0))
-		return {"frame_ms": frame_ms, "backlog": backlog}
+			var tasks: Dictionary = st.get("tasks", {})
+			backlog = int(tasks.get("generation", 0))
+			# FP_INFLIGHT_GATE (P1): F = gen + mesh + K·main — the TOTAL in-flight work the pipeline is carrying, so
+			# admission paces the main-thread apply/upload stage (the post-port choke), not the now-fast gen backlog alone.
+			inflight = backlog + int(tasks.get("meshing", 0)) + CubeSphere.INFLIGHT_MAIN_K * int(tasks.get("main_thread", 0))
+		return {"frame_ms": frame_ms, "backlog": backlog, "inflight": inflight}

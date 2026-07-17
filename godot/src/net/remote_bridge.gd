@@ -134,6 +134,7 @@ var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hu
 var _win_acc := 0.0
 var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
+var _win_had_capture := false       # T2f: this window initiated an ambient frame capture (~35 ms readback) — stamp cap=1 so analysis can exclude it
 
 # MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
 # godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
@@ -409,6 +410,11 @@ func _process(delta: float) -> void:
 	# array check when there is nothing to send (the normal case), which is byte-free vs the ambient stream.
 	_drain_crossing_events()
 
+	# ── Far-ring build/swap timing events (T2e) ──────────────────────────────────────────────────
+	# Same event-drain discipline as the crossing events: drained every frame, published as distinct {"type":"farring"}
+	# records the moment a rebuild swaps in. Normally empty (a rebuild is seconds apart), so this is a guarded no-op.
+	_drain_farring_events()
+
 	# ── Telemetry tick ────────────────────────────────────────────────────────────────────────
 	if _win_acc >= TELEMETRY_INTERVAL:
 		_send_telemetry()
@@ -644,6 +650,18 @@ func _send_telemetry() -> void:
 			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
 
+	# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer attribution + the capture-window marker. snow_ms/ctrl_ms
+	# are this window's WORST single-frame snowfall-step / controller-tick cost (WorldManager accumulates the max, resets on
+	# read); cap=1 marks a window whose frames include the ambient capture readback (~35 ms) so the §6 metrics can exclude
+	# capture-polluted windows honestly. Telemetry-only — no frame behaviour changes.
+	if is_instance_valid(world) and world.has_method("take_perf_attrib"):
+		var pa = world.call("take_perf_attrib")
+		if pa is Dictionary:
+			msg.merge(pa as Dictionary)
+	if _win_had_capture:
+		msg["cap"] = 1
+		_win_had_capture = false
+
 	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these
 	# via sed before export, so reading the compiled consts gives exactly-what-shipped provenance — BUILD-INFO.txt is
 	# written during the earlier engine build, before the sed, so it cannot). Emitted once (small, static); read live.
@@ -655,6 +673,12 @@ func _send_telemetry() -> void:
 			"FP_VEL_PREDICT": CubeSphere.FP_VEL_PREDICT, "FP_FIXED_FRAME": CubeSphere.FP_FIXED_FRAME,
 			"FP_FARRING_FULL_COVER": CubeSphere.FP_FARRING_FULL_COVER, "FP_NO_NEAR_LOD": CubeSphere.FP_NO_NEAR_LOD,
 			"FP_ATLAS_MATERIAL": CubeSphere.FP_ATLAS_MATERIAL, "POOL_CROSSING_PREGEN": CubeSphere.POOL_CROSSING_PREGEN,
+			# T2d (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): the post-port provenance gap — we could not prove what build
+			# produced a telemetry file (the async far-ring / CPPGEN / sky deploy state was unknown from telemetry alone).
+			"FP_CPPGEN": CubeSphere.FP_CPPGEN, "FP_FARRING_FAST_REBUILD": CubeSphere.FP_FARRING_FAST_REBUILD,
+			"FP_FARRING_ASYNC_REBUILD": CubeSphere.FP_FARRING_ASYNC_REBUILD, "ORBITAL_SKY": CubeSphere.ORBITAL_SKY,
+			"FP_COLBULK": CubeSphere.FP_COLBULK, "FP_STAMP": CubeSphere.FP_STAMP,
+			"FP_INFLIGHT_GATE": CubeSphere.FP_INFLIGHT_GATE,
 		}
 
 	# Telemetry is small (~1 KB) and the signal we most want to keep, so it is NOT shed at the frame
@@ -694,6 +718,28 @@ func _drain_crossing_events() -> void:
 		if _post_cross.size() < POST_CROSS_MAX:
 			_post_cross.append({"from": int((ev as Dictionary).get("from_fid", -1)), "to": int((ev as Dictionary).get("to_fid", -1)),
 				"end_usec": Time.get_ticks_usec() + POST_CROSS_WINDOW_MS * 1000, "worst_ms": 0.0, "frames": 0})
+
+
+## T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): drain WorldManager's far-ring build/swap timing queue and publish each
+## record as a distinct {"type":"farring", path, build_ms, swap_ms, verts} JSON on the authed telemetry socket (the relay
+## appends any unknown JSON line to telemetry.jsonl — no relay change). Same guards/backpressure as the crossing drain, so
+## it never crashes the bridge nor piles onto a stalled socket. The record already carries its own "type":"farring".
+func _drain_farring_events() -> void:
+	if not is_instance_valid(world) or not world.has_method("take_farring_events"):
+		return
+	var events: Array = world.call("take_farring_events")
+	if events.is_empty():
+		return
+	for ev in events:
+		if not (ev is Dictionary):
+			continue
+		if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN \
+				or _ws.get_current_outbound_buffered_amount() >= OUTBOUND_BUFFER_BYTES - 65536:
+			break
+		var msg: Dictionary = (ev as Dictionary).duplicate()
+		msg["t"] = Time.get_unix_time_from_system()
+		msg["up_ms"] = Time.get_ticks_msec()
+		_ws.send_text(JSON.stringify(msg))
 
 
 ## A1-REFINE (#114): track the worst frame in each open post-crossing window; when a window closes, emit a
@@ -767,6 +813,7 @@ func _maybe_capture_frame() -> void:
 	if _ws.get_current_outbound_buffered_amount() > OUTBOUND_BACKPRESSURE_BYTES:
 		return   # socket is behind — drop this frame rather than pile on latency
 	_capturing = true
+	_win_had_capture = true           # T2f: the ~35 ms readback lands this frame → mark the window for capture-exclusion in analysis
 	_capture_frame_async()
 
 

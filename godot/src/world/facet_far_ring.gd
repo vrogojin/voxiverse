@@ -70,6 +70,14 @@ var _async_arrays: Array = []           # worker → main: the committed surface
 # would race the dict). The role is snapshotted here on the main thread at dispatch (fid -> true); the worker only reads
 # this frozen dict, preserving the existing "worker reads read-only per-facet state" contract. Empty with the flag off.
 var _async_backstop: Dictionary = {}
+# T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
+# RemoteBridge (take_events) so the §2.2c "zero-queue crossing stall" (far-ring re-emit prime suspect) is convicted or
+# acquitted in one run. Bounded FIFO (NEVER-OOM: a drain-less headless session can never grow it). `_async_build_us` is
+# the off-thread worker build wall time, written by the worker before it returns and read by main after is_task_completed
+# (same happens-before as _async_arrays), so the async event carries a real build_ms alongside its main-thread swap_ms.
+const EVENTS_MAX := 16
+var _events: Array = []
+var _async_build_us := 0
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -177,6 +185,7 @@ func _dispatch_async_rebuild() -> void:
 ## touches NO RenderingServer. The arrays are BIT-IDENTICAL to what the synchronous commit() would store (proven by
 ## G-L1-FARRING-ASYNC). NOTHING here reads the scene tree or a rendering server.
 func _async_build_worker() -> void:
+	var t0 := Time.get_ticks_usec()   # T2e: off-thread build wall time (read on main after is_task_completed)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for fid in _async_fids:
@@ -184,6 +193,7 @@ func _async_build_worker() -> void:
 		_emit_cached(st, fid, CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid))
 	st.generate_normals()
 	_async_arrays = st.commit_to_arrays()
+	_async_build_us = Time.get_ticks_usec() - t0
 
 ## MAIN THREAD: swap a finished off-thread build onto the MeshInstance3D. The double-buffer is implicit — the previous
 ## _mi.mesh stayed assigned (and visible) for the whole worker run; here we replace it with the freshly built one. This
@@ -203,14 +213,18 @@ func _poll_async_rebuild() -> void:
 ## state exactly as _rebuild_full does (so emitted_count/reemit_count/_emitted are identical to the synchronous path).
 ## An empty visible set (fully back-facing) yields an empty ArrayMesh — matching _build_fast's empty-mesh contract.
 func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
+	var t_swap := Time.get_ticks_usec()   # T2e: main-thread swap (add_surface_from_arrays / RID create + instance update)
 	var mesh := ArrayMesh.new()
+	var verts := 0
 	if arrays.size() == Mesh.ARRAY_MAX and (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() > 0:
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		verts = (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
 	_mi.mesh = mesh
 	_emitted.clear()
 	for fid in fids:
 		_emitted[fid] = true
 	_reemit_count += 1
+	_push_event("async", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
 
 ## Warm (noise-cache) every uncached front-hemisphere facet under WARM_BUDGET_MS. Returns true once none remain
 ## uncached (rebuild may proceed), false when the frame budget is spent (resume next frame). The scan itself is a
@@ -268,7 +282,14 @@ func _rebuild_full() -> void:
 		_emitted[fid] = true
 	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
 	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
-	_mi.mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	# T2e: time the mesh BUILD (assembler) and the SWAP (mesh assign / RID create + instance update) separately — two
+	# ticks_usec reads either side of the split assignment, telemetry-only, no behavioural change.
+	var t_build := Time.get_ticks_usec()
+	var new_mesh: Mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	var build_us := Time.get_ticks_usec() - t_build
+	var t_swap := Time.get_ticks_usec()
+	_mi.mesh = new_mesh
+	var swap_us := Time.get_ticks_usec() - t_swap
 	_reemit_count += 1
 	_pending = false
 	# 32 tris/facet at CELLS=4; under FULL_COVER the backstop facets are denser (2·BACKSTOP_CELLS²) — count them exactly.
@@ -278,6 +299,7 @@ func _rebuild_full() -> void:
 		for fid in fids:
 			if _is_backstop(fid):
 				tris += extra
+	_push_event("sync", build_us, swap_us, tris * 3)   # T2e: verts = 3·tris (cheap; no surface read-back on the crossing frame)
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
 
 ## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
@@ -358,6 +380,27 @@ func _join_async_rebuild() -> void:
 ## COSMOS-PERF STEP 2: never free while a worker is still reading our caches.
 func _exit_tree() -> void:
 	_join_async_rebuild()
+
+# --- T2e far-ring build/swap timing events ---
+## Push one rebuild's timing record. `path` = "sync"|"async"; build_ms = mesh assembly (off-thread for async), swap_ms =
+## the main-thread RID create/instance update, verts = the committed vertex count. Main-thread only in both paths.
+func _push_event(path: String, build_us: int, swap_us: int, verts: int) -> void:
+	_events.append({
+		"type": "farring", "path": path,
+		"build_ms": snappedf(float(build_us) / 1000.0, 0.01),
+		"swap_ms": snappedf(float(swap_us) / 1000.0, 0.01),
+		"verts": verts,
+	})
+	while _events.size() > EVENTS_MAX:
+		_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
+
+## Drain the pending far-ring timing records (FIFO), clearing the queue. WorldManager.take_farring_events() delegates here.
+func take_events() -> Array:
+	if _events.is_empty():
+		return []
+	var out := _events
+	_events = []
+	return out
 
 # --- gate diagnostics ---
 func is_rebuild_pending() -> bool: return _pending

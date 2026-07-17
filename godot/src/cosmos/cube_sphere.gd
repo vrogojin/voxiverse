@@ -447,6 +447,25 @@ static func vel_lead(speed: float) -> float:
 ## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
 const CTRL_IMMINENT_COMMIT_PACE := 1.0
 
+## COSMOS-PERF POST-PORT P1 (docs/COSMOS-PERF-POSTPORT-DESIGN.md §4 P1) — FP_INFLIGHT_GATE: admission paced by TOTAL
+## in-flight work, not the gen backlog alone. The C++ worldgen port made generation fast (supply ≥ demand at every
+## speed), so the freeze bottleneck INVERTED to the main-thread mesh apply/upload stage — vox_main (mean 0.002 the
+## entire pre-port history) now spikes 17–87 exactly inside the 300–881 ms worst frames. The shipped admission signal
+## (vox_gen > CTRL_BACKLOG_MAX) paces the stage that is no longer the choke and is blind to the one that is: it admits
+## shell bursts the downstream apply stage cannot absorb, so they land compressed. When true, the StreamLoadController's
+## backlog_gated() switches to the in-flight signal F = tasks.generation + tasks.meshing + INFLIGHT_MAIN_K·tasks.main_thread
+## with hysteresis (close at F > INFLIGHT_MAX, re-open at F < INFLIGHT_MIN), and module_world's per-slot view ramp applies
+## a feed-forward pace cut  pace *= clampf(1 − main_q/APPLY_CHOKE, 0, 1)  (main_q = tasks.main_thread) INCLUDING the
+## committed-imminent floor — the imminent slot keeps priority ORDER but must not outrun the apply stage (its old
+## exemption assumed gen was the choke). Zero memory: it strictly DELAYS admission (NEVER-OOM). Default OFF ⇒
+## backlog_gated() is the exact shipped  vox_gen > CTRL_BACKLOG_MAX(300)  behaviour byte-identical, the ramp pace is
+## untouched, FLAT stays 6035/0. Flipped ON at export after the live SW-1C A/B (the established sed-at-export pattern).
+const FP_INFLIGHT_GATE := false
+const INFLIGHT_MAX := 192        # close the gate above this F (≈0.6 s of pipe at the measured 300+/s drain)
+const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hysteresis band prevents admission thrash
+const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
+const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a

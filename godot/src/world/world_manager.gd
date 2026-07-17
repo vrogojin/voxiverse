@@ -140,6 +140,11 @@ const CORNER_EDIT_LOCK := true
 var _snowfall: SnowfallSystem
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
+# of the snowfall fixed step + the load-controller tick since the last telemetry drain; RemoteBridge samples the max once
+# per window (take_perf_attrib) so the 0.5 s snowfall spike is attributed instead of folded anonymously into worst_ms.
+var _snow_us_max := 0
+var _ctrl_us_max := 0
 # CROSSING-FASTGEN obs-2 fix (3): the EMA'd player speed (blocks/s), measured from the inter-update position delta and
 # consumed ONLY under FP_VEL_PREDICT to lead the imminent promote/commit distances. Computed lazily inside its flag gate
 # in update_streaming, so with the flag off it stays 0 and this is a literal no-op (no behaviour change, no read path).
@@ -296,7 +301,9 @@ func _ready() -> void:
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
 	if _snowfall != null and _have_player_pos:
+		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
+		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
 	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
@@ -310,7 +317,9 @@ func _process(delta: float) -> void:
 	# FacetLodMesher reads its credit for LOD apply-ms + build grants (surfaces 1-2). The pool ramp pace (surface 3)
 	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
 	if _load_ctrl != null:
+		var t_ctrl := Time.get_ticks_usec()   # T2f: attribute the controller tick
 		_load_ctrl.tick(Time.get_ticks_msec() / 1000.0)
+		_ctrl_us_max = maxi(_ctrl_us_max, Time.get_ticks_usec() - t_ctrl)
 	# FP-M2d (§6.5.3 surfaces 3-4): drive the pool view-ramp PACE from the controller every frame (stream_pace() folds
 	# in the vox_gen backlog gate — 0 holds neighbour growth while the pool has not drained), and, only under SUSTAINED
 	# overload, apply the pause-first LOD demote relief. With FP_M2_LOD off neither is called (pace stays 1.0 — byte-identical).
@@ -2191,6 +2200,28 @@ func take_crossing_events() -> Array:
 		return []
 	var out := _crossing_events
 	_crossing_events = []
+	return out
+
+## T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): drain the FacetFarRing's per-rebuild build/swap timing records for the
+## telemetry socket. Guarded for the non-faceted / fallback path (no ring) → always [] there. RemoteBridge publishes each
+## as a distinct {"type":"farring",…} JSON line (same event-drain pattern as take_crossing_events); the record convicts
+## or acquits the §2.2c zero-queue crossing stall (far-ring re-emit is the prime suspect).
+func take_farring_events() -> Array:
+	if _facet_ring == null or not _facet_ring.has_method("take_events"):
+		return []
+	return _facet_ring.take_events()
+
+## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
+## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets
+## the accumulators — RemoteBridge samples it once per telemetry window so a 0.5 s snowfall spike is attributed as its own
+## number rather than folded anonymously into worst_ms. Read-only w.r.t. gameplay; the timers are passive ticks_usec reads.
+func take_perf_attrib() -> Dictionary:
+	var out := {
+		"snow_ms": snappedf(float(_snow_us_max) / 1000.0, 0.01),
+		"ctrl_ms": snappedf(float(_ctrl_us_max) / 1000.0, 0.01),
+	}
+	_snow_us_max = 0
+	_ctrl_us_max = 0
 	return out
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).

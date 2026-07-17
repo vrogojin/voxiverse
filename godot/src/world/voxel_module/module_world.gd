@@ -73,6 +73,7 @@ var _lod_mesher = null
 # the MINIMUM leg duration, stretched (never compressed) under load; pace 0 fully HOLDS a grow. Shrinks (unloads) are
 # never throttled. Default 1.0 → byte-identical to the shipped fixed ramp (M2c never calls it with <1; M2d does).
 var _stream_pace := 1.0
+var _voxel_engine: Object = null              # FP_INFLIGHT_GATE (P1): lazily-cached VoxelEngine singleton for the main-thread apply-queue read
 var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
 var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
                                               # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
@@ -466,10 +467,31 @@ func _ramp_pool_step(delta: float) -> bool:
 		# crossing target finishes filling DURING the approach instead of bursting at the seam; an uncommitted imminent
 		# keeps the shipped RELIEF_FLOOR trickle. Memory-neutral (same view_target); only the fill RATE changes.
 		pace = maxf(pace, CubeSphere.CTRL_IMMINENT_COMMIT_PACE if _imminent_committed else CubeSphere.CTRL_RELIEF_FLOOR)
+	# FP_INFLIGHT_GATE (P1) feed-forward: cut the ramp pace by the main-thread apply-queue depth so admission never
+	# outruns the apply/upload stage (the post-port choke). Applied AFTER the imminent floor so the committed imminent
+	# slot keeps its priority ORDER but is still throttled by the apply queue (its old exemption assumed gen was the
+	# choke). Off ⇒ pace is untouched — the shipped ramp math verbatim, byte-identical.
+	if CubeSphere.FP_INFLIGHT_GATE:
+		pace *= clampf(1.0 - float(_inflight_main_q()) / float(CubeSphere.APPLY_CHOKE), 0.0, 1.0)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
 	return true
+
+## FP_INFLIGHT_GATE (P1): the current main-thread apply/free queue depth (VoxelEngine tasks.main_thread) for the
+## feed-forward ramp pace cut. Lazy cached-singleton lookup; returns 0 when the engine/stat is unavailable (⇒ no
+## throttle). Called only from _ramp_pool_step under the flag, i.e. only while a slot is actively growing — at most
+## once per frame, so the extra get_stats() is negligible and never runs with the flag off.
+func _inflight_main_q() -> int:
+	if _voxel_engine == null:
+		if Engine.has_singleton("VoxelEngine"):
+			_voxel_engine = Engine.get_singleton("VoxelEngine")
+		else:
+			return 0
+	if not _voxel_engine.has_method("get_stats"):
+		return 0
+	var st: Dictionary = _voxel_engine.call("get_stats")
+	return int((st.get("tasks", {}) as Dictionary).get("main_thread", 0))
 
 ## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
 ## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
@@ -1987,11 +2009,33 @@ func pool_active() -> int:
 ## cost lives inside VoxelTerrain::_process (these fields will show it) or it lives OUTSIDE it (they
 ## will all be small, and the hitch is render/upload — a completely different fix). Telemetry-only,
 ## read-only, no behaviour change; guarded so a missing method/terrain simply yields {}.
+## T2b (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): SUM VoxelTerrain::_process timings over ALL live pool slots, not just
+## the active _terrain — the imminent-prefill slot is where a crossing's apply burst lands and its main-thread cost was
+## invisible (the shipped read saw only _terrain). The active slot IS a _pool entry (the module keeps _terrain ==
+## _pool[_pool_active]["terrain"]), so iterating the pool alone avoids double-counting; the single _terrain is the
+## fallback on the non-pool path. Every returned key is a per-frame numeric field, so a plain per-key sum is correct and
+## the RemoteBridge consumer (which reads by key name) sees each field aggregated across the whole live pool.
 func terrain_main_thread_stats() -> Dictionary:
-	if _terrain == null or not _terrain.has_method("get_statistics"):
-		return {}
-	var d = _terrain.call("get_statistics")
-	return (d as Dictionary) if d is Dictionary else {}
+	var terrains: Array = []
+	if not _pool.is_empty():
+		for fid in _pool.keys():
+			var t = _pool[fid].get("terrain")
+			if t != null:
+				terrains.append(t)
+	elif _terrain != null:
+		terrains.append(_terrain)
+	var out: Dictionary = {}
+	for t in terrains:
+		if not (t as Object).has_method("get_statistics"):
+			continue
+		var d = t.call("get_statistics")
+		if not (d is Dictionary):
+			continue
+		for k in (d as Dictionary).keys():
+			var v = (d as Dictionary)[k]
+			if v is int or v is float:
+				out[k] = out.get(k, 0) + v
+	return out
 
 ## STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §9.1) — the per-class generation histogram, summed over
 ## EVERY live generator (the active slot + each pool slot owns its own instance, frozen on its own facet epoch;

@@ -2783,6 +2783,10 @@ var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples a
 var fp_bulk := false
 var bulk_stone_arid := -1
 var bulk_deepslate_arid := -1
+# STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3 / §9.2): CubeSphere.FP_COLBULK's snapshot — the
+# column-granular twin of fp_bulk. Reuses the SAME two frozen fill ARIDs (a column's deep run writes exactly
+# the cube a whole-block fill would), so it needs no extra table. Frozen by the loader, read-only on workers.
+var fp_colbulk := false
 # STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the per-class generation timer. §2.3's
 # supply model rests on an ASSUMED block-class mix (30% air/cheap, 25% bulk-qualified, 25% gate-failed, 20%
 # surface); the doc itself names that its soft spot. These count blocks + accumulate usec per class so the mix is
@@ -3017,6 +3021,20 @@ func _generate_block(buffer, origin_in_voxels, lod):
 		_gen_acc(0, _t0)                                  # T1 class 0: profiled all-air block
 		return
 
+	# STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3 / §9.2) — FP_COLBULK: the block-level hoist.
+	# Everything that is constant over the block is decided ONCE here; the per-column work is in the emit loop.
+	# Preconditions mirror the whole-block fill above (LOD0, flat branch, cubic block) plus the OOB fence: a
+	# fill_area write bypasses the per-cell fence, so BOTH fill ARIDs must be baked and in range or the whole
+	# optimisation stays off (never fill a stale index). FACETED: v1 requires the WHOLE block box to be interior
+	# to all four ridges — exactly the whole-block fill's gate — so no beyond-ridge cell that junction_modify
+	# would mask to AIR is ever filled; ridge straddlers stay fully per-cell.
+	var cb_on = fp_colbulk and s == 1 and flat_world and size.x == size.y and size.y == size.z \
+		and bulk_stone_arid >= 0 and bulk_stone_arid < mcount \
+		and bulk_deepslate_arid >= 0 and bulk_deepslate_arid < mcount
+	if cb_on and gen_facet >= 0:
+		cb_on = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
+	var cb_top = oy + size.y                              # one past the block's top cell (s == 1 whenever cb_on)
+
 	for z in range(size.z):
 		for x in range(size.x):
 			var idx2 = z * size.x + x
@@ -3036,14 +3054,75 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				wx = rxs[idx2]
 				wz = rzs[idx2]
 				pcache.face = rfs[idx2]
+			# STREAM-SCHED R1/R1b (§2.3/§2.4, §9.2) — this column's three y-regions, when FP_COLBULK is on:
+			#   deep run  [oy, min(cb_top, g − 12))  → fill_area stone (above −16) / deepslate (below −24);
+			#                                          the −24..−16 dither rows and any row below −59 (where
+			#                                          bedrock can hash in) are EXCLUDED and stay per-cell.
+			#   exact band [g − 12, col_hi)          → the per-cell body below, verbatim and BYTE-EXACT.
+			#   air        [col_hi, cb_top)          → skipped (R1b).
+			# Why g − 12: _surface_rule returns STONE for depth > _filler_depth(biome), whose max over all
+			# biomes is 12 (badlands). So every cell strictly below g − 12 is stone/deepslate/strata/ore —
+			# the exact material class the whole-block fill already approximates, and the SAME accepted loss
+			# (interior ore/strata variants). Cells at or above g − 12 can be filler/biome-top/cap/slope/snow/
+			# tree/sea and are never guessed. SLOPE runs reach at most 3 BELOW g (SLOPE_MAX_SPREAD), so a deep
+			# cell is always in resolve_cell's `y < lo` full-solid-interior arm — not the slope arm.
+			var col_hi = cb_top                       # one past the last cell this column must resolve
+			var deep_top = -0x40000000                # cells with wy < deep_top are provably deep interior
+			if cb_on:
+				deep_top = g - BULK_MAX_FILLER
+				var dtop = mini(cb_top, deep_top)     # exclusive top of this column's deep region in the block
+				if dtop > oy:
+					# Two runs at most; both are half-open [lo, hi) in WORLD y, written in BUFFER-local
+					# coords. Stone: wy > −16. Deepslate: wy < −24 AND wy >= −59 (below −59 bedrock can
+					# hash in per-cell, so those rows are left out of the run entirely).
+					var s0 = maxi(oy, BULK_DEEPSLATE_TOP_Y + 1)
+					if dtop > s0:
+						buffer.fill_area(bulk_stone_arid, Vector3i(x, s0 - oy, z), Vector3i(x + 1, dtop - oy, z + 1), ch)
+					var d0 = maxi(oy, BULK_BEDROCK_TOP_Y)
+					var d1 = mini(dtop, BULK_DEEPSLATE_FULL_Y)
+					if d1 > d0:
+						buffer.fill_area(bulk_deepslate_arid, Vector3i(x, d0 - oy, z), Vector3i(x + 1, d1 - oy, z + 1), ch)
+				# R1b, the per-column air ceiling. Everything resolve_cell can emit ABOVE a column's own g is
+				# bounded by max_above over the columns that can REACH this one: the smoothing cap (own g+1),
+				# the snow stack (own g + SNOW_FILL_MAX_CELLS), the SLOPE run (corner targets over the 3×3),
+				# and a TREE canopy. The tree term is why this stencil is 5×5 and NOT the 3×3 the design doc
+				# names: TreeGen.block_at consults the tree of (x,z)'s OWN G=10 grid cell, whose base column
+				# is jittered anywhere in [gx·10+2, gx·10+7] — but a canopy has radius ≤ 2, so only a base
+				# within ±2 columns can place a cell here, and that base's g is what the height is measured
+				# from. A 3×3 max would therefore MISS a tall neighbour's overhang and silently clip canopy.
+				# Maxed with SEA_LEVEL because an underwater column emits sea fill up to it regardless of g.
+				# Interior columns only (the 5×5 must be inside profs[]); edge columns keep the full loop.
+				if x >= 2 and x < size.x - 2 and z >= 2 and z < size.z - 2:
+					var gmax = g
+					for dz2 in range(-2, 3):
+						for dx2 in range(-2, 3):
+							var gg = int(profs[(z + dz2) * size.x + (x + dx2)].x)
+							if gg > gmax: gmax = gg
+					col_hi = mini(cb_top, maxi(gmax + max_above, sea) + 1)
 			# S1 throughput hoist: the SLOPE run is column-invariant, so compute it ONCE here (worker-
 			# direct pack, byte-identical to the analytic memo) and pass it into every resolve_cell of
 			# this column — else resolve_cell re-runs the _corner_targets noise stencil + TreeGen.block_at
 			# tree-gate on all ~100 sub-surface y's of a tall land column (the steady-state gen cost).
+			# R1 (§9.2) makes it LAZY: a column whose every in-block cell was fill_area'd or skipped calls
+			# resolve_cell zero times, so the noise stencil it feeds is pure waste. The three terms are the
+			# three per-cell regions left: the exact band, the dither rows, and the bedrock rows.
+			if cb_on:
+				var dtop2 = mini(cb_top, deep_top)
+				var need_cells = mini(cb_top, col_hi) > maxi(oy, deep_top) \
+					or mini(dtop2, BULK_DEEPSLATE_TOP_Y + 1) > maxi(oy, BULK_DEEPSLATE_FULL_Y) \
+					or mini(dtop2, BULK_BEDROCK_TOP_Y) > oy
+				if not need_cells:
+					continue
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
 				var wy = oy + y * s
+				if cb_on:
+					if wy >= col_hi:
+						break                         # R1b: above this column's content ceiling — nothing but air
+					if wy < deep_top and (wy > BULK_DEEPSLATE_TOP_Y \
+							or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
+						continue                      # R1: already emitted by this column's deep fill runs
 				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
@@ -3259,6 +3338,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
 	gen.set("fp_bulk", CubeSphere.FP_BULK_UNDERGROUND)
+	gen.set("fp_colbulk", CubeSphere.FP_COLBULK)         # STREAM-SCHED R1 (§9.2): column-granular bulk fill
 	var _bstone := BlockCatalog.STONE
 	gen.set("bulk_stone_arid", _cube_arid[_bstone] if _bstone >= 0 and _bstone < _cube_arid.size() else -1)
 	var _bdeep := BlockCatalog.id_of(&"deepslate")

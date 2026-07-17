@@ -118,6 +118,26 @@ const FP_M2_LOD := false
 ## G-M2-ID stays module==module). LOD0 only. Independent of FACETED; the ridge guard self-disables when flat.
 const FP_BULK_UNDERGROUND := false
 
+## COSMOS STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3-§2.4 / §9.2) — COLUMN-granular bulk fill.
+## FP_BULK_UNDERGROUND above qualifies on the WHOLE BOX (by_top <= min_h − 12), so every block under ROUGH
+## terrain fails its min_h gate and pays the full 4096-cell per-cell pass (~13.7 ms native, ~10× on web) —
+## §2.3 measures that gate-failed class as the largest recoverable term left in the generator. R1 moves the
+## same gate INSIDE the emit loop, per column: each column's provably-deep run (below its OWN g − 12) is
+## fill_area'd with stone/deepslate, its exact band (g−12 .. surface) stays per-cell and BYTE-EXACT, and the
+## air above its content ceiling is skipped (R1b). slope_run_of is computed only for columns that still need
+## a resolve_cell. Same appearance class as FP_BULK_UNDERGROUND — and no wider: the loss stays the interior
+## ore/strata VARIANTS of cells >12 deep (invisible until dug; block_id_at → resolve_cell reads TerrainConfig,
+## never this buffer, so physics + the dropped block stay ground truth). The −24..−16 deepslate dither rows and
+## any row below −59 (bedrock) stay PER-CELL, so no dithered/bedrock cell is ever guessed.
+## Independent of FP_BULK_UNDERGROUND (both may run; the whole-block fill wins when it qualifies). LOD0 + flat
+## branch only. FACETED: v1 applies column bulk only when the WHOLE block is interior to all four ridges
+## (the same cell_interior_scaled gate the whole-block fill uses) — ridge straddlers stay fully per-cell.
+## Default OFF → the emit loop is textually the shipped per-cell path (FLAT verify pin 6035/0 stays).
+## Truth gate: src/tools/verify_colbulk.gd (run with this flag sed-toggled true).
+## NOTE (shared with FP_BULK_UNDERGROUND): both gates assume nothing but stone/deepslate/strata/ore exists
+## below a column's biome filler. Any FUTURE deep carver (caves, dungeons) must update BOTH gates together.
+const FP_COLBULK := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB

@@ -1,34 +1,29 @@
 extends SceneTree
 ## verify_colbulk — STREAM-SCHED R1/R1b (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3-§2.4 / §9.2) truth gate.
 ##
-## FP_COLBULK moves the FP_BULK_UNDERGROUND gate INSIDE the emit loop, per column. The whole claim it must earn
-## is that this costs NO MORE appearance than the shipped, user-accepted whole-block loss. So this gate does not
-## sample a few cells — it generates N random blocks BOTH ways (colbulk vs per-cell) and compares EVERY cell:
+## FP_COLBULK guesses deep cells (plain stone/deepslate instead of their ore/strata variant). That is only
+## legitimate for cells the player CANNOT SEE. So the oracle here is EXPOSURE, not depth:
 ##
-##   G-CB-EXACT    every cell at/above its column's `g - BULK_MAX_FILLER` (the exact band) and every cell in the
-##                 -24..-16 dither rows or below -59 (bedrock rows) is BYTE-IDENTICAL to the per-cell path.
-##                 This is the whole visible world: you cannot see or dig below your column's filler without
-##                 first removing the exact band, and the dither/bedrock rows are never guessed.
-##   G-CB-LOSS     every DIFFERING cell is a deep-run cell whose per-cell value is an ore/strata VARIANT and
-##                 whose colbulk value is the plain stone/deepslate cube ARID — i.e. exactly the
-##                 FP_BULK_UNDERGROUND loss class, never wider, and never air/hole (counted + printed).
-##   G-CB-AIR      R1b never clips content: every cell colbulk left as AIR is AIR in the per-cell path too
-##                 (subsumed by G-CB-EXACT/G-CB-LOSS, asserted separately so a ceiling bug names itself).
-##   G-CB-TRUTH    physics ground truth is intact: resolve_cell (the block_id_at source) still returns the TRUE
-##                 material for every lost cell. block_id_at reads TerrainConfig, never this buffer, so this
-##                 holds by construction — pinned anyway, because that is the claim physics rests on.
+##   G-CB-EXPOSED  the load-bearing gate. Over a WIDE sweep of blocks (deliberately including shorelines and
+##                 the steepest terrain the generator can make), EVERY cell with any see-through face-neighbour
+##                 is byte-identical to the analytic per-cell truth. "see-through" is strict: a neighbour is
+##                 see-through unless it is a FULL OPAQUE CUBE — air, ANY liquid field (water is transparent,
+##                 so a coastal face renders), or ANY non-zero modifier (a slope/cap/layer neighbour is a
+##                 partial shape and leaves a real gap). Neighbours are read ANALYTICALLY, so this crosses
+##                 block boundaries — the buffer's own edge cells are checked against terrain outside it.
+##                 v1 of this gate asked "is the cell below its column's g-12", which is a DEPTH oracle, not
+##                 an exposure oracle: it passed 8/0 while FLAT failed. That is the hole this closes.
+##   G-CB-BURIED   every remaining (buried) mismatch is the plain stone/deepslate cube ARID — the
+##                 FP_BULK_UNDERGROUND loss class, never air/hole, never a different material.
+##   G-CB-TRUTH    physics ground truth intact: the analytic path (the block_id_at source) still returns the
+##                 TRUE material for every guessed cell. Holds by construction (block_id_at never reads this
+##                 buffer) — pinned anyway, because it is the claim physics rests on.
 ##   G-CB-SURFACE  no-fall-through: the centre column's top solid cell still equals column_profile g.
 ##
 ## Requires FP_COLBULK ON (a const): run with the flag sed-toggled true, e.g.
 ##   sed -i 's/const FP_COLBULK := false/const FP_COLBULK := true/' godot/src/cosmos/cube_sphere.gd
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_colbulk.gd
 ## Runs in FLAT mode (gen_facet < 0 → the ridge guard self-disables), so it needs no faceted atlas.
-
-const N_BLOCKS := 64
-const BULK_MAX_FILLER := 12          # mirrors ModuleWorld.BULK_MAX_FILLER (max _filler_depth over all biomes)
-const DEEPSLATE_TOP_Y := -16
-const DEEPSLATE_FULL_Y := -24
-const BEDROCK_TOP_Y := -59
 
 var _pass := 0
 var _fail := 0
@@ -41,10 +36,18 @@ func _ok(c: bool, m: String) -> void:
 		_fail += 1
 		print("  FAIL: %s" % m)
 
+func _tru(x: int, y: int, z: int) -> int:
+	return TerrainConfig.generated_cell(x, y, z)
+
+## A face against this neighbour is VISIBLE unless the neighbour is a full opaque cube.
+func _see_through(v: int) -> bool:
+	return CellCodec.mat(v) == BlockCatalog.AIR or CellCodec.liquid_field(v) != 0 or CellCodec.modifier(v) != 0
+
 func _gen_into(gen: Object, origin: Vector3i) -> Object:
 	var buf: Object = ClassDB.instantiate("VoxelBuffer")
 	buf.call("create", 16, 16, 16)
 	buf.call("set_channel_depth", 0, 1)          # DEPTH_16_BIT (matches the live TYPE channel)
+	buf.call("fill", 0, 0)
 	gen.call("generate_block", buf, Vector3(origin.x, origin.y, origin.z), 0)
 	return buf
 
@@ -65,105 +68,86 @@ func _initialize() -> void:
 	if not ok_setup:
 		print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail]); quit(1); return
 
-	# the SHIPPED generator (flag on), plus a per-cell reference clone (same epoch, BOTH bulk paths forced off).
 	var gb: Object = mod.call("get_generator")
-	var gc: Object = mod.call("_make_generator")
-	gc.set("fp_colbulk", false)
-	gc.set("fp_bulk", false)
 	var stone_arid := int(gb.get("bulk_stone_arid"))
 	var deep_arid := int(gb.get("bulk_deepslate_arid"))
 	_ok(bool(gb.get("fp_colbulk")), "setup: shipped generator has fp_colbulk ON (flag sed-toggled)")
 	_ok(stone_arid >= 0 and deep_arid >= 0, "setup: fill ARIDs baked (stone=%d, deepslate=%d)" % [stone_arid, deep_arid])
 
-	# N random blocks spanning the depth bands that matter: surface-crossing, the shallow interior, the
-	# -24..-16 dither straddle, the deep deepslate region, and the bedrock straddle at -59. A fixed seed so a
-	# failure is reproducible.
-	var rng := RandomNumberGenerator.new()
-	rng.seed = 20260717
-	var exact_bad := 0
-	var loss_wrong_class := 0
-	var loss_cells := 0
-	var air_clipped := 0
+	# The sweep. Surface blocks + the block under each, over a wide area, so shorelines and the steepest
+	# relief the height field produces are included — those are exactly where a per-column (non-neighbour-
+	# aware) deep bound would expose a guessed cell. Plus the fixed deep origins verify_feature drives, plus
+	# the MOUNTAINS massifs (amplitude 92 — the steepest steps the generator can make).
+	var origins: Array[Vector3i] = []
+	for bx in range(-8, 9, 2):
+		for bz in range(-8, 9, 2):
+			var ox := bx * 16
+			var oz := bz * 16
+			var gy: int = TerrainConfig.height_at(ox + 8, oz + 8)
+			origins.append(Vector3i(ox, floori(gy / 16.0) * 16, oz))
+			origins.append(Vector3i(ox, floori(gy / 16.0) * 16 - 16, oz))
+	for o: Vector3i in [Vector3i(0, -64, 0), Vector3i(0, -16, 0), Vector3i(-80, -32, 16), Vector3i(128, -8, -64)]:
+		origins.append(o)
+	for mc: Vector2i in TerrainConfig.find_mountains(3):
+		var mg: int = TerrainConfig.height_at(mc.x, mc.y)
+		origins.append(Vector3i(floori(mc.x / 16.0) * 16, floori(mg / 16.0) * 16, floori(mc.y / 16.0) * 16))
+		origins.append(Vector3i(floori(mc.x / 16.0) * 16, floori(mg / 16.0) * 16 - 16, floori(mc.y / 16.0) * 16))
+
+	var exposed_bad := 0
+	var buried_wrong_class := 0
+	var buried := 0
 	var truth_bad := 0
-	var bands := {}
-	for i in range(N_BLOCKS):
-		var ox := int(rng.randi_range(-40, 40)) * 16
-		var oz := int(rng.randi_range(-40, 40)) * 16
-		# Bias the y pick across the interesting bands rather than uniformly (uniform would mostly miss the
-		# dither/bedrock straddles, which is exactly where a run-boundary off-by-one would hide).
-		var oy := 0
-		match i % 5:
-			0: oy = int(floor(TerrainConfig.height_at(ox + 8, oz + 8) / 16.0)) * 16   # surface-crossing
-			1: oy = int(floor(TerrainConfig.height_at(ox + 8, oz + 8) / 16.0)) * 16 - 16
-			2: oy = -32                                                              # straddles -24..-16
-			3: oy = -48                                                              # deep deepslate
-			_: oy = -64                                                              # straddles bedrock (-59)
-		var origin := Vector3i(ox, oy, oz)
-		var a: Object = _gen_into(gb, origin)
-		var b: Object = _gen_into(gc, origin)
-		for z in range(16):
-			for x in range(16):
-				var wx := ox + x
-				var wz := oz + z
+	var first := ""
+	for origin: Vector3i in origins:
+		var buf: Object = _gen_into(gb, origin)
+		for lz in range(16):
+			for lx in range(16):
+				var wx := origin.x + lx
+				var wz := origin.z + lz
 				var p := TerrainConfig.column_profile(wx, wz, {})
-				var g := int(p.x)
-				var deep_top := g - BULK_MAX_FILLER
-				for y in range(16):
-					var wy := oy + y
-					var va := int(a.call("get_voxel", x, y, z, 0))
-					var vb := int(b.call("get_voxel", x, y, z, 0))
-					if va == vb:
+				for ly in range(16):
+					var wy := origin.y + ly
+					var got := int(buf.call("get_voxel", lx, ly, lz, 0))
+					var v := _tru(wx, wy, wz)
+					var expected := int(mod.call("gen_arid_for", CellCodec.mat(v), CellCodec.modifier(v),
+						CellCodec.liquid_level(v), CellCodec.liquid_kind(v), CellCodec.state(v)))
+					if got == expected:
 						continue
-					# --- the cell differs: it MUST be a deep-run cell, and the diff MUST be the accepted class ---
-					var in_deep_run := wy < deep_top \
-						and (wy > DEEPSLATE_TOP_Y or (wy < DEEPSLATE_FULL_Y and wy >= BEDROCK_TOP_Y))
-					if not in_deep_run:
-						exact_bad += 1                    # a visible/diggable cell changed → G-CB-EXACT is broken
+					# This cell was guessed. It is only legitimate if NOTHING can see it.
+					var vis := _see_through(_tru(wx + 1, wy, wz)) or _see_through(_tru(wx - 1, wy, wz)) \
+						or _see_through(_tru(wx, wy + 1, wz)) or _see_through(_tru(wx, wy - 1, wz)) \
+						or _see_through(_tru(wx, wy, wz + 1)) or _see_through(_tru(wx, wy, wz - 1))
+					if vis:
+						exposed_bad += 1
+						if first == "":
+							first = "(%d,%d,%d) own_g=%d depth=%d got=%d expected=%d" % [wx, wy, wz, int(p.x), int(p.x) - wy, got, expected]
 						continue
-					loss_cells += 1
-					bands[_band_of(wy)] = int(bands.get(_band_of(wy), 0)) + 1
-					if va == 0:
-						air_clipped += 1                  # colbulk wrote AIR where per-cell had content → a HOLE
-					# colbulk must have written the plain base cube; per-cell must have had a variant.
-					if not (va == stone_arid or va == deep_arid):
-						loss_wrong_class += 1
-					# G-CB-TRUTH: resolve_cell must still report the TRUE variant for this lost cell.
-					var true_id := int(TerrainConfig.resolve_cell(wx, wy, wz, g, int(p.y), p.z, p.w))
-					if true_id == BlockCatalog.AIR:
+					buried += 1
+					if got != stone_arid and got != deep_arid:
+						buried_wrong_class += 1
+					if CellCodec.mat(v) == BlockCatalog.AIR:
 						truth_bad += 1
 
-	_ok(exact_bad == 0,
-		"G-CB-EXACT: every exact-band / dither / bedrock cell (everything visible or diggable) is BYTE-IDENTICAL to the per-cell path (%d mismatches)" % exact_bad)
-	_ok(air_clipped == 0,
-		"G-CB-AIR: FP_COLBULK never wrote AIR where the per-cell path has content — no R1b ceiling clip, no hole (%d)" % air_clipped)
-	_ok(loss_wrong_class == 0,
-		"G-CB-LOSS: every differing cell is the plain stone/deepslate cube ARID — exactly the FP_BULK_UNDERGROUND loss class, never wider (%d wrong)" % loss_wrong_class)
+	_ok(exposed_bad == 0,
+		"G-CB-EXPOSED: over %d blocks (incl. shorelines + mountain massifs), every cell with a see-through face-neighbour is byte-identical to analytic truth (%d violations%s)"
+			% [origins.size(), exposed_bad, ("" if first == "" else "; first " + first)])
+	_ok(buried_wrong_class == 0,
+		"G-CB-BURIED: every buried guess is the plain stone/deepslate cube ARID — the FP_BULK_UNDERGROUND loss class, never wider (%d wrong)" % buried_wrong_class)
 	_ok(truth_bad == 0,
-		"G-CB-TRUTH: resolve_cell (the block_id_at / physics source) returns real material for all %d lost cells" % loss_cells)
-	print("      %d blocks compared cell-by-cell; %d deep-run ore/strata variant cells lost to fill (accepted); bands=%s"
-		% [N_BLOCKS, loss_cells, bands])
+		"G-CB-TRUTH: the analytic path (the block_id_at / physics source) returns real material for all %d guessed cells — never air" % buried)
+	print("      %d blocks swept; %d buried ore/strata variant cells guessed (accepted, invisible); %d exposed violations"
+		% [origins.size(), buried, exposed_bad])
 
 	_gate_surface(gb, 0, 0)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
-func _band_of(wy: int) -> String:
-	if wy > DEEPSLATE_TOP_Y:
-		return "stone(>-16)"
-	if wy >= DEEPSLATE_FULL_Y:
-		return "dither(-24..-16)"
-	if wy >= BEDROCK_TOP_Y:
-		return "deepslate(-59..-25)"
-	return "bedrock(<-59)"
-
-## no-fall-through: the walkable top the player stands on must still be the real surface. This is the invariant
-## the whole-block gate calls G-BULK-SURFACE; column bulk must not weaken it (its deep run stops 12 below g).
+## no-fall-through: the walkable top must still be the real surface (the whole-block gate's G-BULK-SURFACE).
 func _gate_surface(gb: Object, ox: int, oz: int) -> void:
 	var g0 := int(TerrainConfig.column_profile(ox + 8, oz + 8, {}).x)
-	var oy := floori(g0 / 16.0) * 16                # floor to the 16-grid data block containing g0
-	var origin := Vector3i(ox, oy, oz)
-	var buf: Object = _gen_into(gb, origin)
+	var oy := floori(g0 / 16.0) * 16
+	var buf: Object = _gen_into(gb, Vector3i(ox, oy, oz))
 	var top_solid := -0x7fffffff
 	for y in range(16):
 		if int(buf.call("get_voxel", 8, y, 8, 0)) != 0:

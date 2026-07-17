@@ -3034,6 +3034,25 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	if cb_on and gen_facet >= 0:
 		cb_on = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
 	var cb_top = oy + size.y                              # one past the block's top cell (s == 1 whenever cb_on)
+	# R1 NEIGHBOUR-AWARE DEEP BOUND — a 1-wide ring of column heights around the block (18×18 for a 16³).
+	# Being deep is a property of CONTENT, but being INVISIBLE is a property of the NEIGHBOURHOOD: a cell 13
+	# below its OWN g is still on a visible face if an adjacent column's surface drops below it. So the deep
+	# bound is min(g over the 3×3) − BULK_MAX_FILLER, not the doc's per-column `g − 12` (§2.3/§9.2 specifies
+	# the per-column form; it is unsound in the general case and this deviates deliberately). At y < min3x3(g)
+	# − 12 every face-neighbour is >12 below its own surface, hence a FULL opaque cube (a SLOPE run reaches at
+	# most 3 below g, so it can never carve that deep) ⇒ the cell has no visible face, by construction rather
+	# than by luck. MEASURED on this terrain: max adjacent-column |Δg| is 1 near spawn and 3 across mountain
+	# massifs, so this costs ≤3 cells of fill per column — but the bound no longer RESTS on that measurement.
+	# The ring reads through the same per-block pcache memo, so the 256 in-block columns are memo hits and only
+	# the ~68 ring columns sample noise. Built only when cb_on; worker-local (never shared).
+	var gring: PackedInt32Array
+	var grw = size.x + 2
+	if cb_on:
+		gring = PackedInt32Array()
+		gring.resize(grw * (size.z + 2))
+		for j in range(size.z + 2):
+			for i in range(grw):
+				gring[j * grw + i] = int(TerrainConfig.column_profile(ox + i - 1, oz + j - 1, pcache).x)
 
 	for z in range(size.z):
 		for x in range(size.x):
@@ -3060,16 +3079,22 @@ func _generate_block(buffer, origin_in_voxels, lod):
 			#                                          bedrock can hash in) are EXCLUDED and stay per-cell.
 			#   exact band [g − 12, col_hi)          → the per-cell body below, verbatim and BYTE-EXACT.
 			#   air        [col_hi, cb_top)          → skipped (R1b).
-			# Why g − 12: _surface_rule returns STONE for depth > _filler_depth(biome), whose max over all
-			# biomes is 12 (badlands). So every cell strictly below g − 12 is stone/deepslate/strata/ore —
+			# Why min3x3(g) − 12: _surface_rule returns STONE for depth > _filler_depth(biome), whose max over
+			# all biomes is 12 (badlands). So every cell strictly below g − 12 is stone/deepslate/strata/ore —
 			# the exact material class the whole-block fill already approximates, and the SAME accepted loss
-			# (interior ore/strata variants). Cells at or above g − 12 can be filler/biome-top/cap/slope/snow/
-			# tree/sea and are never guessed. SLOPE runs reach at most 3 BELOW g (SLOPE_MAX_SPREAD), so a deep
-			# cell is always in resolve_cell's `y < lo` full-solid-interior arm — not the slope arm.
+			# (interior ore/strata variants). Cells at or above that can be filler/biome-top/cap/slope/snow/
+			# tree/sea and are never guessed. Taking the MIN over the 3×3 additionally makes the cell provably
+			# INVISIBLE (see the gring comment): content-deep is not the same claim as unseen, and only the
+			# second one licenses guessing the cell.
 			var col_hi = cb_top                       # one past the last cell this column must resolve
-			var deep_top = -0x40000000                # cells with wy < deep_top are provably deep interior
+			var deep_top = -0x40000000                # cells with wy < deep_top are provably deep AND unseen
 			if cb_on:
-				deep_top = g - BULK_MAX_FILLER
+				var gmin = g
+				for dz1 in range(-1, 2):
+					for dx1 in range(-1, 2):
+						var gn = gring[(z + 1 + dz1) * grw + (x + 1 + dx1)]
+						if gn < gmin: gmin = gn
+				deep_top = gmin - BULK_MAX_FILLER
 				var dtop = mini(cb_top, deep_top)     # exclusive top of this column's deep region in the block
 				if dtop > oy:
 					# Two runs at most; both are half-open [lo, hi) in WORLD y, written in BUFFER-local

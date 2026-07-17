@@ -159,6 +159,29 @@ const FP_COLBULK := false
 ## over blocks spanning surface/deep/coast/mountain/deepslate-band/bedrock, not a lossy-appearance oracle.
 const FP_STAMP := false
 
+## COSMOS L5(a) — THE C++ WORLDGEN PORT (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6). When true (AND the patched
+## module binary is present — ClassDB.class_exists("VoxelGeneratorCosmos")), module_world installs the compiled
+## VoxelGeneratorCosmos (engine patch 0007) instead of the runtime-compiled GDScript generator.
+##
+## WHY: measured live 2026-07-17, 97% of ALL block-generation time sits in two per-cell classes that are
+## INTERPRETER-bound, not algorithm-bound — underground gate-failed 337.7 ms/block and surface-crossing
+## 559.8 ms/block, against a 13.7 ms native twin (a ~×25 WASM/GDScript multiplier, not the ×10 long assumed).
+## Supply 23-35 blocks/s vs walking demand ~90-100 blocks/s: supply < demand ALWAYS, and that gap IS the
+## freezes. Every script-side lever was built and measured out — R1 column-bulk + R7 blob-stamp are CORRECT
+## and byte-identical yet moved M4 only −13% (the profile pass and loop mechanics still carry the full VM
+## tax). No script-side transformation removes a multiplier; only compilation does.
+##
+## THE FENCE: terrain physics is ANALYTIC (block_id_at/floor_under read TerrainConfig GDScript directly; there
+## are no collision meshes), so this generator produces RENDER buffers only and GDScript stays the source of
+## truth for queries. Byte-equality is therefore the WHOLE consistency argument between render and physics —
+## not an optimisation detail. Default OFF → the C++ class is never instantiated → the GDScript generator is
+## untouched and FLAT stays 6035/0.
+## Truth gate: src/tools/verify_cppgen.gd — an N-block cell-for-cell equality assert (C++ buffer == GDScript
+## buffer) over blocks spanning biomes, depth bands, ridges/seams, coasts/liquid and tree stencils. The gate is
+## the oracle: it is proven able to FAIL (a deliberately perturbed C++ path must be caught) and is never
+## weakened to make the port pass.
+const FP_CPPGEN := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB

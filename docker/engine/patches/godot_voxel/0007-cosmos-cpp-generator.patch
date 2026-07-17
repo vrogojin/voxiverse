@@ -1,0 +1,341 @@
+diff --git a/common.py b/common.py
+index ccac0f7..a96e2ae 100644
+--- a/common.py
++++ b/common.py
+@@ -43,6 +43,7 @@ def get_sources(env, is_editor_build, include_tests):
+         "generators/*.cpp",
+         "generators/graph/*.cpp",
+         "generators/simple/*.cpp",
++        "generators/cosmos/*.cpp",
+         "generators/multipass/*.cpp",
+ 
+         "modifiers/*.cpp",
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+new file mode 100644
+index 0000000..4d9317d
+--- /dev/null
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -0,0 +1,157 @@
++#include "voxel_generator_cosmos.h"
++#include "../../util/godot/classes/noise.h"
++
++#include <core/variant/dictionary.h>
++
++namespace zylann::voxel {
++
++namespace {
++
++// Pull a required Ref<Noise> out of the config. Missing/wrong-typed -> null, which fails setup().
++// Deliberately strict: a generator that silently ran with five of six noises would produce terrain
++// that is *plausible* and wrong, and plausible-and-wrong is the one failure mode the byte-equality
++// gate exists to make impossible.
++Ref<Noise> get_noise_param(const Dictionary &config, const char *key) {
++	if (!config.has(key)) {
++		return Ref<Noise>();
++	}
++	return Ref<Noise>(config[key]);
++}
++
++PackedInt32Array get_i32_param(const Dictionary &config, const char *key) {
++	if (!config.has(key)) {
++		return PackedInt32Array();
++	}
++	return PackedInt32Array(config[key]);
++}
++
++} // namespace
++
++VoxelGeneratorCosmos::VoxelGeneratorCosmos() {}
++
++VoxelGeneratorCosmos::~VoxelGeneratorCosmos() {}
++
++bool VoxelGeneratorCosmos::setup(Dictionary config) {
++	Parameters p;
++
++	p.hills = get_noise_param(config, "hills");
++	p.detail = get_noise_param(config, "detail");
++	p.continent = get_noise_param(config, "continent");
++	p.temperature = get_noise_param(config, "temperature");
++	p.humidity = get_noise_param(config, "humidity");
++	p.mountain = get_noise_param(config, "mountain");
++
++	// All six or nothing. See get_noise_param's comment: a partial noise stack is worse than none.
++	if (p.hills.is_null() || p.detail.is_null() || p.continent.is_null() || p.temperature.is_null() ||
++			p.humidity.is_null() || p.mountain.is_null()) {
++		ERR_PRINT("VoxelGeneratorCosmos.setup: incomplete noise stack; generator stays disabled.");
++		return false;
++	}
++
++	p.seed = int(config.get("seed", 0));
++	p.gen_face = int(config.get("gen_face", 0));
++	p.gen_n = int(config.get("gen_n", 0));
++	p.gen_facet = int(config.get("gen_facet", -1));
++	p.flat_world = bool(config.get("flat_world", true));
++
++	p.cube_arid = get_i32_param(config, "cube_arid");
++	p.gen_arid = get_i32_param(config, "gen_arid");
++	p.snow_arid = get_i32_param(config, "snow_arid");
++	p.layer_arid = get_i32_param(config, "layer_arid");
++	p.slope_arid = get_i32_param(config, "slope_arid");
++	p.snow_slope_arid = get_i32_param(config, "snow_slope_arid");
++	p.carve_arid = get_i32_param(config, "carve_arid");
++	p.carve_snow_arid = get_i32_param(config, "carve_snow_arid");
++	p.surface_arid = get_i32_param(config, "surface_arid");
++	p.block_ids = get_i32_param(config, "block_ids");
++
++	p.model_count = int(config.get("model_count", 0));
++	p.waterlog = bool(config.get("waterlog", false));
++
++	// The cube table and the block-id table are the two the emit loop cannot function without.
++	if (p.cube_arid.size() == 0 || p.block_ids.size() == 0) {
++		ERR_PRINT("VoxelGeneratorCosmos.setup: missing cube_arid/block_ids; generator stays disabled.");
++		return false;
++	}
++
++	p.ready = true;
++
++	{
++		RWLockWrite wlock(_params_lock);
++		_params = p;
++	}
++	return true;
++}
++
++bool VoxelGeneratorCosmos::is_ready() const {
++	RWLockRead rlock(_params_lock);
++	return _params.ready;
++}
++
++Dictionary VoxelGeneratorCosmos::get_setup_digest() const {
++	RWLockRead rlock(_params_lock);
++	Dictionary d;
++	d["ready"] = _params.ready;
++	d["seed"] = _params.seed;
++	d["gen_face"] = _params.gen_face;
++	d["gen_n"] = _params.gen_n;
++	d["gen_facet"] = _params.gen_facet;
++	d["flat_world"] = _params.flat_world;
++	d["model_count"] = _params.model_count;
++	d["waterlog"] = _params.waterlog;
++	d["cube_arid_size"] = _params.cube_arid.size();
++	d["gen_arid_size"] = _params.gen_arid.size();
++	d["snow_arid_size"] = _params.snow_arid.size();
++	d["layer_arid_size"] = _params.layer_arid.size();
++	d["slope_arid_size"] = _params.slope_arid.size();
++	d["snow_slope_arid_size"] = _params.snow_slope_arid.size();
++	d["carve_arid_size"] = _params.carve_arid.size();
++	d["carve_snow_arid_size"] = _params.carve_snow_arid.size();
++	d["surface_arid_size"] = _params.surface_arid.size();
++	d["block_ids_size"] = _params.block_ids.size();
++	d["noise_ok"] = _params.continent.is_valid() && _params.hills.is_valid() && _params.detail.is_valid() &&
++			_params.temperature.is_valid() && _params.humidity.is_valid() && _params.mountain.is_valid();
++
++	// Round-trip one noise sample through the SAME call the port will use. This is the S1 proof that
++	// decision (1) in the header holds end-to-end: verify_cppgen.gd compares this against GDScript's
++	// `_continent.get_noise_2d(0.0, 0.0)` and friends. If these ever differ, the whole port's
++	// byte-equality argument is void and the port must stop -- so it is worth one bound call to know.
++	if (_params.continent.is_valid()) {
++		d["probe_continent_2d"] = double(_params.continent->get_noise_2d(12.0, -7.0));
++		d["probe_continent_3d"] = double(_params.continent->get_noise_3d(12.0, -7.0, 33.0));
++	}
++	if (_params.mountain.is_valid()) {
++		d["probe_mountain_2d"] = double(_params.mountain->get_noise_2d(12.0, -7.0));
++	}
++	if (_params.hills.is_valid()) {
++		d["probe_hills_2d"] = double(_params.hills->get_noise_2d(12.0, -7.0));
++	}
++	if (_params.detail.is_valid()) {
++		d["probe_detail_2d"] = double(_params.detail->get_noise_2d(12.0, -7.0));
++	}
++	if (_params.temperature.is_valid()) {
++		d["probe_temperature_2d"] = double(_params.temperature->get_noise_2d(12.0, -7.0));
++	}
++	if (_params.humidity.is_valid()) {
++		d["probe_humidity_2d"] = double(_params.humidity->get_noise_2d(12.0, -7.0));
++	}
++	return d;
++}
++
++VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input) {
++	// S1: SKELETON ONLY. The port lands in S2 (pure column math) and S3 (resolve_cell + emit loop).
++	// Emitting nothing here is the correct inert behaviour and not a placeholder to be forgotten: the
++	// class is only ever instantiated under FP_CPPGEN, which is default-false, so with the flag off
++	// this code is unreachable and the GDScript generator remains byte-identical to shipped. If this
++	// is somehow reached before S3, an empty buffer is a LOUD failure (visibly missing terrain), not a
++	// quiet one -- which is the way round we want it.
++	return Result();
++}
++
++void VoxelGeneratorCosmos::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("setup", "config"), &VoxelGeneratorCosmos::setup);
++	ClassDB::bind_method(D_METHOD("is_ready"), &VoxelGeneratorCosmos::is_ready);
++	ClassDB::bind_method(D_METHOD("get_setup_digest"), &VoxelGeneratorCosmos::get_setup_digest);
++}
++
++} // namespace zylann::voxel
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+new file mode 100644
+index 0000000..18bdcf8
+--- /dev/null
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -0,0 +1,139 @@
++#ifndef VOXEL_GENERATOR_COSMOS_H
++#define VOXEL_GENERATOR_COSMOS_H
++
++// VOXIVERSE COSMOS — L5(a): the C++ worldgen port (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6).
++//
++// WHY THIS EXISTS. Measured on the live web build (2026-07-17): 97 % of all block-generation time
++// is spent in two per-cell classes that are *interpreter-bound*, not algorithm-bound —
++// underground gate-failed at 337.7 ms/block and surface-crossing at 559.8 ms/block, against a
++// 13.7 ms native twin (a ~x25 WASM/GDScript multiplier). Supply is 23-35 blocks/s against a
++// walking demand of ~90-100 blocks/s: supply < demand ALWAYS, and that gap IS the freezes. No
++// script-side transformation removes a multiplier — only compilation does. This class is that
++// compilation: the whole `_generate_block` inner path of `module_world.gd`'s runtime-compiled
++// GDScript generator, as C++ inside our module patch set.
++//
++// THE CORRECTNESS FENCE (read before touching anything here).
++// Terrain physics is ANALYTIC: `WorldManager.block_id_at` / `floor_under` read TerrainConfig
++// (GDScript) directly and there are no collision meshes. This class only produces RENDER buffers.
++// So GDScript stays the source of truth for queries, and the ONLY thing keeping render and physics
++// consistent is that this generator is byte-identical to the GDScript one. Byte-equality is not a
++// nice-to-have here — it is the entire safety argument. `verify_cppgen.gd` is the oracle; never
++// weaken it to make a change pass.
++//
++// HOW BYTE-EQUALITY IS ACHIEVED (the two decisions that make it tractable):
++//
++//  1. NOISE IS NOT REIMPLEMENTED. `setup()` takes the very `FastNoiseLite` objects
++//     `TerrainConfig._ensure_noise()` built on the main thread, as `Ref<Noise>`. C++ then calls the
++//     SAME `get_noise_2d/3d` virtual the GDScript path calls, on the SAME instance. Bit-matching is
++//     therefore by construction rather than by careful reimplementation — the class of bug that
++//     would otherwise sink this port (a subtly different fBm accumulation order) cannot occur.
++//     Godot's `Noise::get_noise_*` is `const` and non-mutating, and the GDScript generator already
++//     calls it from voxel worker threads today, so concurrent reads are established practice.
++//
++//  2. FLOAT WIDTH IS MIRRORED, NOT CHOSEN. GDScript `float` is f64, so every intermediate here is
++//     `double` — never `float`. The narrowing points are mirrored exactly where GDScript narrows:
++//     `real_t` (f32 in a standard build) at the noise call boundary in and out, and `Vector4`
++//     (real_t components) when a column profile is stored. Using `float` for an intermediate, or
++//     skipping a narrowing GDScript performs, is a byte-equality failure — and a legitimate one.
++//
++// THE FROZEN-EPOCH CONTRACT IS SACRED. Every table crosses the boundary ONCE, in `setup()`, on the
++// main thread, before any worker touches this generator. After that the worker reads immutable
++// C++-side data only. Nothing here may lazily first-touch on a worker: that is this project's worst
++// data-race class (WGC §7.4). A facet/face flip installs a NEW generator, it never mutates a live
++// one -- exactly as the GDScript generator's `gen_face`/`gen_facet` epoch already works.
++//
++// LOD / STRIDE / PROFILE-ONLY SAMPLING (forward-looking, NOT implemented in S1).
++// The user's constraint is that walking, in-atmosphere flight and near-planet orbit must be one
++// continuous experience with no stitches or jumps at facet seams or the atmosphere-space border,
++// possibly rendering surface blocks from space. That means this generator will eventually serve all
++// scales: near voxels, a heightfield skin tier, the far ring, and maybe space-visible surface
++// detail. The hard requirement that follows is that a coarse/strided/profile-only sample must be
++// THE SAME FUNCTION as the full one -- a second implementation would drift, and drift at a seam is
++// exactly the stitch the user is ruling out. Hence the interface shape below: `column_profile_at()`
++// is public and independent of the emit loop, and `generate_block` already carries a `stride` from
++// its `lod` (mirroring the GDScript generator's `gen_lod_probe` / `s = 1 << lod`). A future skin or
++// far-ring tier calls `column_profile_at()` directly rather than growing a parallel path.
++
++#include "../../util/godot/classes/noise.h"
++#include "../../util/thread/rw_lock.h"
++#include "../voxel_generator.h"
++
++#include <core/variant/typed_array.h>
++
++namespace zylann::voxel {
++
++class VoxelGeneratorCosmos : public VoxelGenerator {
++	GDCLASS(VoxelGeneratorCosmos, VoxelGenerator)
++
++public:
++	VoxelGeneratorCosmos();
++	~VoxelGeneratorCosmos();
++
++	// Freeze this epoch's immutable inputs. MAIN THREAD ONLY, exactly once, before any worker runs.
++	// `config` mirrors the frozen members of the GDScript generator one-for-one (noise stack, block
++	// id table, appearance/ARID tables, facet/face epoch, flags). Returns false and stays disabled if
++	// anything required is missing -- a half-configured generator must never emit, because "emits
++	// something slightly wrong" is indistinguishable from a byte-equality failure at the gate but far
++	// harder to diagnose in the field.
++	bool setup(Dictionary config);
++
++	// True once `setup()` has succeeded. `generate_block` is inert until then.
++	bool is_ready() const;
++
++	// S1 gate surface: echoes back what `setup()` actually received (table sizes, seed, epoch), so
++	// `verify_cppgen.gd` can prove the frozen tables crossed the boundary intact rather than assume
++	// it. Cheap, main-thread, diagnostic only -- nothing in the emit path reads this.
++	Dictionary get_setup_digest() const;
++
++	Result generate_block(VoxelQueryData input) override;
++
++private:
++	static void _bind_methods();
++
++	// The immutable per-epoch snapshot. Written once by `setup()` under `_params_lock`, read by every
++	// worker thread thereafter. Mirrors VoxelGeneratorNoise2D's Parameters/RWLock idiom, which is the
++	// module's established pattern for exactly this.
++	struct Parameters {
++		bool ready = false;
++
++		// The SAME instances TerrainConfig._ensure_noise() built (see decision 1 above).
++		Ref<Noise> hills;
++		Ref<Noise> detail;
++		Ref<Noise> continent;
++		Ref<Noise> temperature;
++		Ref<Noise> humidity;
++		Ref<Noise> mountain;
++
++		int seed = 0;
++
++		// Frozen epoch, mirroring the GDScript generator's members of the same names.
++		int gen_face = 0;
++		int gen_n = 0;
++		int gen_facet = -1;
++		bool flat_world = true;
++
++		// Frozen appearance tables (baked main-thread by the loader). Cross once, read-only after.
++		PackedInt32Array cube_arid;
++		PackedInt32Array gen_arid;
++		PackedInt32Array snow_arid;
++		PackedInt32Array layer_arid;
++		PackedInt32Array slope_arid;
++		PackedInt32Array snow_slope_arid;
++		PackedInt32Array carve_arid;
++		PackedInt32Array carve_snow_arid;
++		PackedInt32Array surface_arid;
++
++		// Frozen material ids resolved from BlockCatalog (TerrainConfig._ensure_ids' outputs).
++		PackedInt32Array block_ids;
++
++		int model_count = 0;
++		bool waterlog = false;
++	};
++
++	Parameters _params;
++	mutable RWLock _params_lock;
++};
++
++} // namespace zylann::voxel
++
++#endif // VOXEL_GENERATOR_COSMOS_H
+diff --git a/register_types.cpp b/register_types.cpp
+index bd6db77..03aa4de 100644
+--- a/register_types.cpp
++++ b/register_types.cpp
+@@ -12,6 +12,7 @@
+ #include "engine/voxel_engine_gd.h"
+ #include "generators/graph/node_type_db.h"
+ #include "generators/graph/voxel_generator_graph.h"
++#include "generators/cosmos/voxel_generator_cosmos.h"
+ #include "generators/multipass/voxel_generator_multipass_cb.h"
+ #include "generators/simple/voxel_generator_flat.h"
+ #include "generators/simple/voxel_generator_heightmap.h"
+@@ -279,6 +280,8 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
+ 		ClassDB::register_class<VoxelGeneratorGraph>();
+ 		ClassDB::register_class<VoxelGeneratorScript>();
+ 		ClassDB::register_class<VoxelGeneratorMultipassCB>();
++		// VOXIVERSE COSMOS L5(a): the C++ worldgen port (patch 0007).
++		ClassDB::register_class<VoxelGeneratorCosmos>();
+ 
+ 		// Utilities
+ 		ClassDB::register_class<VoxelBoxMover>();

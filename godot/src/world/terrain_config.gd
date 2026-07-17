@@ -351,6 +351,32 @@ static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
 	n.fractal_gain = 0.5
 	return n
 
+## COSMOS L5(a) (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6) — the frozen noise stack, for the C++ generator.
+##
+## THIS IS THE PORT'S BYTE-EQUALITY KEYSTONE, so it is worth stating plainly why it hands out the objects
+## rather than their parameters. The C++ generator does NOT reimplement FastNoiseLite: it holds these exact
+## six instances and calls the SAME `get_noise_2d/3d` the GDScript path calls, on the same object. Bit-match
+## is therefore by CONSTRUCTION, not by a careful transcription that could drift in fBm accumulation order
+## or a float width. Handing over parameters and rebuilding the noise C++-side would reintroduce exactly the
+## drift this avoids — so don't "simplify" it that way.
+##
+## THREADING: this is the frozen-epoch contract (WGC §7.4). _ensure_noise() runs here on the MAIN thread
+## before any worker exists; the instances are immutable afterwards and Noise.get_noise_* is a const,
+## non-mutating read. The GDScript generator already samples these same objects from voxel workers today,
+## so concurrent reads are established, not hoped for. Callers must invoke this on the main thread as part
+## of generator setup and never lazily from a worker.
+static func noise_stack() -> Dictionary:
+	_ensure_noise()
+	return {
+		"hills": _hills,
+		"detail": _detail,
+		"continent": _continent,
+		"temperature": _temperature,
+		"humidity": _humidity,
+		"mountain": _mountain,
+		"seed": SEED,
+	}
+
 ## Resolve every material id the generator can emit, once, from the catalog.
 static func _ensure_ids() -> void:
 	if _ids_ready:

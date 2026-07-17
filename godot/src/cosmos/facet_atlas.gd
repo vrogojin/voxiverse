@@ -27,8 +27,16 @@ const SPAWN_EDGE_MIN := 48       # spawn scan stays ≥ this many cells from the
 # the G-O4-EQ gate (verify_multibody.gd). The Moon (k=14/r=1737) is APPENDED in O4b behind
 # CubeSphere.MULTI_BODY — nothing here changes until then. Earth's `k`/`r` MUST equal K/R_BLOCKS or
 # the (still const-based) build math in _build_facet/_build_seam would disagree with the accessors.
+## O4b: the Moon is APPENDED (never inserted/re-ordered — fact 5). k=14 ⇒ 6·14² = 1176 facets at
+## fid_base 3456, r=1737 (real lunar radius in blocks; Earth stays the SHIPPED 3072 — the O3 D1
+## resize to 6371 is a LATER stage and is NOT pre-empted here). Facet edge = (π/2·1737)/14 ≈ 195
+## blocks — the same ~200-block playable patch Earth's k=24/R=3072 gives, so the Moon's facets feel
+## like Earth's rather than being a differently-scaled grid. Built ONLY under CubeSphere.MULTI_BODY
+## (default false ⇒ body_count()==1 ⇒ no Moon rows ⇒ byte-identical to O4a, proven by G-O4-EQ/OFF).
+## The Moon ships DARK in O4b: no spawn facet, no SOI, unreachable in-game (O4c wires it up).
 const BODY_TABLE := [
 	{"name": "earth", "k": 24, "r": 3072.0},   # fid_base 0
+	{"name": "moon",  "k": 14, "r": 1737.0},   # fid_base 3456  (MULTI_BODY only)
 ]
 
 static var _ready := false
@@ -55,8 +63,37 @@ static var _seam_mhat := PackedFloat64Array()    # 12/fid: 4 slots × m̂.xyz (w
 
 # ------- O4a body registry (pure functions of BODY_TABLE + CubeSphere.MULTI_BODY; pre-warm safe) -------
 # Every accessor derives from the const BODY_TABLE, so it is valid before AND after warm_up (mirroring
-# facet_count()'s shipped pre-warm property). In O4a there is exactly one built body (Earth) regardless of
-# MULTI_BODY, so all of these collapse to the shipped constants.
+# facet_count()'s shipped pre-warm property).
+#
+# O4b — the FROZEN SLOT TABLES (O4a caveat 4). `body_of_fid`/`k_of`/`r_of` are worker-hot: facet_profile
+# calls them PER COLUMN. Derived straight from BODY_TABLE they are a range search whose every step reads a
+# const Dictionary (fid_base_slot re-summing 6·k² per call, then BODY_TABLE[slot]["r"]) — fine at one body
+# where the loop never runs, wasteful at two. So warm_up FREEZES the ≤N-body registry into three tiny Packed
+# arrays (one row per BODY, not per fid — ~40 B total, so Earth's memory ledger is unmoved and G-O4-OFF's
+# array-size pins still hold). After warm_up every accessor is 1-2 Packed reads over never-mutated arrays
+# (worker-safe by the same frozen-epoch argument as the atlas rows). Before warm_up they fall back to the
+# BODY_TABLE derivation, so the pre-warm property the gates rely on survives.
+static var _slot_base := PackedInt32Array()     # per built body: first fid  (slot 0 == 0 always)
+static var _slot_k := PackedInt32Array()        # per built body: faceting resolution k
+static var _slot_r := PackedFloat64Array()      # per built body: radius in blocks
+
+## Freeze the registry slot tables (main thread, warm_up only; idempotent).
+static func _freeze_registry() -> void:
+	var nb := body_count()
+	var sb := PackedInt32Array(); var sk := PackedInt32Array(); var sr := PackedFloat64Array()
+	sb.resize(nb); sk.resize(nb); sr.resize(nb)
+	var base := 0
+	for s in range(nb):
+		var k := int(BODY_TABLE[s]["k"])
+		sb[s] = base
+		sk[s] = k
+		sr[s] = float(BODY_TABLE[s]["r"])
+		base += 6 * k * k
+	# publish fully-built (same discipline as CubeSphere._edge_flat): data arrays first, then _slot_base
+	# — _slot_base.size() is what switches every accessor onto the frozen path.
+	_slot_k = sk
+	_slot_r = sr
+	_slot_base = sb
 
 ## Number of bodies actually BUILT into the atlas: Earth always, any body beyond it iff MULTI_BODY.
 ## O4a: BODY_TABLE has one entry, so this is 1 either way.
@@ -89,20 +126,40 @@ static func body_facet_count(body: String) -> int:
 	var k := int(BODY_TABLE[body_slot(body)]["k"])
 	return 6 * k * k
 
-## Which built body owns `fid` (slot index). O4a: 0 for every valid fid. 2-body: one range compare.
+## Which built body owns `fid` (slot index). Earth-only ⇒ 0 for every valid fid; 2-body ⇒ one compare.
+## Post-warm this is a Packed scan (worker-safe); pre-warm it derives from BODY_TABLE.
 static func body_of_fid(fid: int) -> int:
-	var slot := body_count() - 1
+	var nb := _slot_base.size()
+	if nb > 0:                                   # frozen path (post-warm_up)
+		var s := nb - 1
+		while s > 0 and fid < _slot_base[s]:
+			s -= 1
+		return s
+	var slot := body_count() - 1                 # pre-warm fallback (main thread only)
 	while slot > 0 and fid < fid_base_slot(slot):
 		slot -= 1
 	return slot
 
-## Faceting resolution K for the body owning `fid`. O4a ≡ 24.
-static func k_of(fid: int) -> int:
-	return int(BODY_TABLE[body_of_fid(fid)]["k"])
+## Faceting resolution k for BUILT-body slot `slot` — the frozen per-slot read the build/dispatch paths
+## use once they have resolved the slot (no repeated body_of_fid).
+static func k_of_slot(slot: int) -> int:
+	if _slot_k.size() > 0:
+		return _slot_k[slot]
+	return int(BODY_TABLE[slot]["k"])
 
-## Planet radius (blocks) for the body owning `fid`. O4a ≡ 3072.0.
+## Planet radius (blocks) for BUILT-body slot `slot`. Earth 3072 (SHIPPED — NOT the O3 6371), Moon 1737.
+static func r_of_slot(slot: int) -> float:
+	if _slot_r.size() > 0:
+		return _slot_r[slot]
+	return float(BODY_TABLE[slot]["r"])
+
+## Faceting resolution K for the body owning `fid`. Earth ≡ 24, Moon ≡ 14.
+static func k_of(fid: int) -> int:
+	return k_of_slot(body_of_fid(fid))
+
+## Planet radius (blocks) for the body owning `fid`. Earth ≡ 3072.0, Moon ≡ 1737.0.
 static func r_of(fid: int) -> float:
-	return float(BODY_TABLE[body_of_fid(fid)]["r"])
+	return r_of_slot(body_of_fid(fid))
 
 ## TOTAL facets across all BUILT bodies (the global fid range [0, facet_count())). O4a ≡ 6·K² ≡ 3456
 ## (byte-identical to the shipped `6 * K * K`). Pure over BODY_TABLE → valid before warm_up.
@@ -160,38 +217,57 @@ static func edit_key_fid(key: int) -> int:
 static func warm_up() -> void:
 	if _ready:
 		return
-	# O4a: multi-body-shaped, but Earth is the only built body. The loop appends each built body's
-	# facets contiguously at its fid_base; for Earth (slot 0, base 0, k == K) `base + (face·k+a)·k+b`
-	# is TEXTUALLY the shipped `(face·K+a)·K+b`, and _build_facet/_build_seam still use the const
-	# K/R_BLOCKS internally — so Earth builds byte-identically (G-O4-EQ pins it). O4b appends the Moon
-	# here (a second slot) and parameterises the build math on k_of/r_of; nothing else moves.
+	# O4b: each built body's facets are appended contiguously at its fid_base, built with ITS OWN k/r
+	# (threaded through _corner/_build_facet/_build_seam — the O4a const-K/R build math would have
+	# produced Earth-shaped geometry at Moon fids). For Earth (slot 0, base 0, k == K, r == R_BLOCKS)
+	# `base + (face·k+a)·k+b` is TEXTUALLY the shipped `(face·K+a)·K+b` and every threaded value equals
+	# the const it replaced, so Earth still builds byte-identically — G-O4-EQ pins exactly that.
+	_freeze_registry()
+	# COSMOS ORBITAL O4b — THE DUAL-K FOLD WARM (§3.1 fact 2 / risk #3, "the project's worst race
+	# class"). _build_seam folds each body's facet grid at that body's k (CubeSphere.fold_cell(…, k)),
+	# and facet_of_dir classifies at k too. An unwarmed k falls through fold_cell's frozen fast path
+	# into the LAZY `_ensure_edge_table` Dictionary build — which, first-touched by a voxel worker
+	# while the main thread folds, is the corruption class the frozen-epoch contract exists to kill.
+	# So warm EVERY built body's k HERE: main thread, before the seam loop below (the first folder),
+	# and long before any worker exists (warm_up runs in module setup, before the generator attaches).
+	# warm_edge_tables is append-only per n, so K=24 and K=14 COEXIST — neither evicts the other.
+	for slot in range(body_count()):
+		CubeSphere.warm_edge_tables(k_of_slot(slot))
 	_nf = facet_count()
 	_frame.resize(_nf * 12)
 	_off.resize(_nf * 2)
 	_poly.resize(_nf * 8)
 	_dom.resize(_nf * 4)
 	for slot in range(body_count()):
-		var base := fid_base_slot(slot)
-		var k := int(BODY_TABLE[slot]["k"])
+		var base := _slot_base[slot]
+		var k := k_of_slot(slot)
+		var r := r_of_slot(slot)
 		for face in range(6):
 			for a in range(k):
 				for b in range(k):
-					_build_facet(base + (face * k + a) * k + b, face, a, b)
+					_build_facet(base + (face * k + a) * k + b, face, a, b, k, r)
 	# seams need every facet's frame built first (each seam reads BOTH facets' planes)
 	_seam_plane.resize(_nf * 16)
 	_seam_neigh.resize(_nf * 4)
 	_seam_ring.resize(_nf * 24)
 	_seam_mhat.resize(_nf * 12)
 	for slot in range(body_count()):
-		var base := fid_base_slot(slot)
-		var k := int(BODY_TABLE[slot]["k"])
+		var base := _slot_base[slot]
+		var k := k_of_slot(slot)
+		var r := r_of_slot(slot)
 		for face in range(6):
 			for a in range(k):
 				for b in range(k):
 					var fid := base + (face * k + a) * k + b
 					for seam_slot in range(4):
-						_build_seam(fid, face, a, b, seam_slot)
+						_build_seam(fid, face, a, b, seam_slot, base, k, r)
 	_spawn_fid = _pick_spawn_facet()
+	# Risk #3, asserted rather than trusted: EVERY built body's fold table is frozen before warm_up
+	# returns (i.e. before setup returns, before any worker). A miss here is a latent worker race, so
+	# it is a hard failure, not a warning.
+	for slot in range(body_count()):
+		assert(CubeSphere.edge_tables_warm(k_of_slot(slot)),
+			"FacetAtlas.warm_up: fold/edge table NOT warmed for body slot %d (k=%d) — worker race (risk #3)" % [slot, k_of_slot(slot)])
 	_ready = true
 
 static func is_ready() -> bool:
@@ -199,9 +275,11 @@ static func is_ready() -> bool:
 
 # ------- construction (f64) -------
 
-static func _corner(face: int, i: int, j: int) -> Array:
-	var d := CosmosFacet.vertex_dir(face, i, j, K)   # f64 DVec3 unit
-	return [d.x * R_BLOCKS, d.y * R_BLOCKS, d.z * R_BLOCKS]
+## O4b: `k`/`r` are the OWNING BODY's faceting resolution / radius (threaded from warm_up's per-body
+## loop), not the Earth consts. Called with (K, R_BLOCKS) for Earth ⇒ byte-identical to the shipped form.
+static func _corner(face: int, i: int, j: int, k: int, r: float) -> Array:
+	var d := CosmosFacet.vertex_dir(face, i, j, k)   # f64 DVec3 unit
+	return [d.x * r, d.y * r, d.z * r]
 
 static func _cross(a: Array, b: Array) -> Array:
 	return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
@@ -212,8 +290,8 @@ static func _norm(a: Array) -> Array:
 		return [0.0, 0.0, 0.0]
 	return [a[0] / l, a[1] / l, a[2] / l]
 
-static func _build_facet(fid: int, face: int, a: int, b: int) -> void:
-	var c: Array = [_corner(face, a, b), _corner(face, a + 1, b), _corner(face, a + 1, b + 1), _corner(face, a, b + 1)]
+static func _build_facet(fid: int, face: int, a: int, b: int, k: int, r: float) -> void:
+	var c: Array = [_corner(face, a, b, k, r), _corner(face, a + 1, b, k, r), _corner(face, a + 1, b + 1, k, r), _corner(face, a, b + 1, k, r)]
 	var mx: float = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4.0
 	var my: float = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4.0
 	var mz: float = (c[0][2] + c[1][2] + c[2][2] + c[3][2]) / 4.0
@@ -283,23 +361,28 @@ static func _facet_world_centroid(fid: int) -> Array:
 		_frame[f + 1] + qcx * _frame[f + 4] + qcy * _frame[f + 10],
 		_frame[f + 2] + qcx * _frame[f + 5] + qcy * _frame[f + 11]]
 
-static func _build_seam(fid: int, face: int, a: int, b: int, slot: int) -> void:
+## O4b: `base`/`k`/`r` are the OWNING BODY's fid_base / faceting resolution / radius. Seams NEVER cross
+## bodies (§3.1 fact 3): the fold runs within this body's own 6·k² face grid and the neighbour fid is
+## re-based to `base`, so each body's facet graph is closed and every neighbour fid stays in-range by
+## construction. Earth passes (0, K, R_BLOCKS) ⇒ textually the shipped math.
+static func _build_seam(fid: int, face: int, a: int, b: int, slot: int, base: int, k: int, r: float) -> void:
 	var fA := fid * 12
 	var c0A: Array = [_frame[fA + 0], _frame[fA + 1], _frame[fA + 2]]
 	var euA: Array = [_frame[fA + 3], _frame[fA + 4], _frame[fA + 5]]
 	var nA: Array = [_frame[fA + 6], _frame[fA + 7], _frame[fA + 8]]
 	var ewA: Array = [_frame[fA + 9], _frame[fA + 10], _frame[fA + 11]]
-	# neighbour facet via fold_cell at grid resolution K (single-edge fold — a facet is never double-out)
+	# neighbour facet via fold_cell at THIS BODY's grid resolution k (single-edge fold — a facet is
+	# never double-out). The table for k is frozen by warm_up's dual-K warm above (risk #3).
 	var nb := _neigh_ab(a, b, slot)
-	var fold: Dictionary = CubeSphere.fold_cell(face, nb.x, nb.y, K)
-	var fidB := (int(fold["face"]) * K + int(fold["i"])) * K + int(fold["j"])
+	var fold: Dictionary = CubeSphere.fold_cell(face, nb.x, nb.y, k)
+	var fidB := base + (int(fold["face"]) * k + int(fold["i"])) * k + int(fold["j"])
 	var fB := fidB * 12
 	var c0B: Array = [_frame[fB + 0], _frame[fB + 1], _frame[fB + 2]]
 	var nB: Array = [_frame[fB + 6], _frame[fB + 7], _frame[fB + 8]]
 	# shared true edge endpoints (·R, un-planarized), projected onto BOTH facet planes and averaged = welded ring
 	var ev := _seam_edge_ij(a, b, slot)
-	var e0 := _corner(face, ev[0], ev[1])
-	var e1 := _corner(face, ev[2], ev[3])
+	var e0 := _corner(face, ev[0], ev[1], k, r)
+	var e1 := _corner(face, ev[2], ev[3], k, r)
 	var pA0 := _proj_plane(e0, c0A, nA); var pB0 := _proj_plane(e0, c0B, nB)
 	var pA1 := _proj_plane(e1, c0A, nA); var pB1 := _proj_plane(e1, c0B, nB)
 	var r0: Array = [(pA0[0] + pB0[0]) / 2.0, (pA0[1] + pB0[1]) / 2.0, (pA0[2] + pB0[2]) / 2.0]
@@ -729,8 +812,9 @@ static func spawn_column() -> Vector2i:
 ## O4a: `body` names which body's facet grid to classify into (the fid namespace is global). For Earth
 ## (k == K == 24, fid_base 0) this returns `(face·K+fi)·K+fj` — byte-identical to the shipped classifier.
 static func facet_of_dir(body: String, d: CubeSphere.DVec3) -> int:
-	var k := int(BODY_TABLE[body_slot(body)]["k"])
-	var base := fid_base(body)
+	var slot := body_slot(body)
+	var k := k_of_slot(slot)
+	var base := fid_base_slot(slot)
 	var fc := CubeSphere.dir_to_face_cell(d, k)
 	var face: int = int(fc["face"])
 	var fi: int = clampi(int(fc["fi"]), 0, k - 1)
@@ -757,11 +841,17 @@ static func verify_frame(fid: int) -> Dictionary:
 	# determinant of [eu | n | ew] = eu · (n × ew); +1 for a right-handed orthonormal basis
 	var nxw: Array = _cross(n, ew)
 	var det: float = eu[0] * nxw[0] + eu[1] * nxw[1] + eu[2] * nxw[2]
-	# recompute the true (unprojected) corners + centroid → n̂ must point along the centre radial
-	var face := int(fid / (K * K))
-	var rem := fid - face * K * K
-	var a := int(rem / K); var b := rem - a * K
-	var tc: Array = [_corner(face, a, b), _corner(face, a + 1, b), _corner(face, a + 1, b + 1), _corner(face, a, b + 1)]
+	# recompute the true (unprojected) corners + centroid → n̂ must point along the centre radial.
+	# O4b: decompose the fid in the OWNING BODY's grid — subtract its fid_base, then divide by ITS k
+	# (the const-K decomposition would mis-read every Moon fid). Earth (base 0, k == K) is verbatim.
+	var slot := body_of_fid(fid)
+	var lf := fid - fid_base_slot(slot)
+	var k := k_of_slot(slot)
+	var r := r_of_slot(slot)
+	var face := int(lf / (k * k))
+	var rem := lf - face * k * k
+	var a := int(rem / k); var b := rem - a * k
+	var tc: Array = [_corner(face, a, b, k, r), _corner(face, a + 1, b, k, r), _corner(face, a + 1, b + 1, k, r), _corner(face, a, b + 1, k, r)]
 	var mx: float = (tc[0][0] + tc[1][0] + tc[2][0] + tc[3][0]) / 4.0
 	var my: float = (tc[0][1] + tc[1][1] + tc[2][1] + tc[3][1]) / 4.0
 	var mz: float = (tc[0][2] + tc[1][2] + tc[2][2] + tc[3][2]) / 4.0

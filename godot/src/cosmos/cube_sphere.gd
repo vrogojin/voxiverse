@@ -366,17 +366,42 @@ static func gm_for(body: String) -> float:
 # the FROZEN flat array below, which is the lock-free, allocation-free source the voxel worker reads.
 static var _edge_cache: Dictionary = {}
 
-# COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 1): the home-body edge-remap table,
-# built ONCE on the main thread in warm_edge_tables() BEFORE any voxel worker spawns and NEVER
-# mutated again. A FLAT PackedInt32Array (24 entries × 7 ints: b, m00, m01, m10, m11, t0, t1) instead
-# of the Dictionary-of-Array-of-Dictionary form, so every concurrent worker fold is a pure read of a
-# frozen Packed array — lock-free and allocation-free by construction (Godot documents reads of a
+# COSMOS frozen-epoch contract (docs/COSMOS-AUDIT.md §3.2 item 1): the edge-remap table, built ONCE
+# on the main thread in warm_edge_tables() BEFORE any voxel worker spawns and NEVER mutated again. A
+# FLAT PackedInt32Array (24 entries × 7 ints: b, m00, m01, m10, m11, t0, t1) instead of the
+# Dictionary-of-Array-of-Dictionary form, so every concurrent worker fold is a pure read of a frozen
+# Packed array — lock-free and allocation-free by construction (Godot documents reads of a
 # never-written Packed array as thread-safe). This subsumes the pass-1 prewarm AND removes the nested
 # container as a memory-corruption candidate (COSMOS-AUDIT §2 #4 / F4). Empty until warm_edge_tables().
-const _EDGE_STRIDE := 7                   # ints per (face, side) entry in the flat table
-static var _edge_flat: PackedInt32Array = PackedInt32Array()
-static var _edge_flat_n := 0             # the n `_edge_flat` was built for (0 = not built)
-static var _edge_frozen := false         # true once warm_edge_tables() has published `_edge_flat`
+#
+# COSMOS ORBITAL O4b (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.1 fact 2, risk #3 — "the project's worst
+# race class"): the table is now MULTI-N. Each body folds its own facet grid at its OWN k (Earth 24,
+# Moon 14), and the Moon's crater lattice folds at a third n — so a SINGLE-n slot would leave every
+# other n falling through to the LAZY `_edge_cache` Dictionary (`_ensure_edge_table`), i.e. exactly
+# the first-touch build the frozen-epoch contract exists to kill. `_edge_flat` therefore holds one
+# 24×_EDGE_STRIDE BLOCK PER WARMED N, concatenated; `_edge_ns` names each block's n in slot order.
+# warm_edge_tables(n) APPENDS a block (idempotent per n) — it never replaces — so warming K=24 does
+# not un-warm K=14. Every warm still happens on the main thread inside warm_up, before a worker
+# exists; the arrays are immutable afterwards. Lookup is a linear scan over `_edge_ns` (≤3 entries),
+# both Packed reads → still lock-free and allocation-free on the worker path.
+const _EDGE_STRIDE := 7                   # ints per (face, side) entry in one block
+const _EDGE_BLOCK := 24 * _EDGE_STRIDE    # ints per warmed n (6 faces × 4 sides × stride)
+static var _edge_flat: PackedInt32Array = PackedInt32Array()   # slot-major concat of _EDGE_BLOCK blocks
+static var _edge_ns: PackedInt32Array = PackedInt32Array()     # the n of each block, in slot order
+static var _edge_frozen := false         # true once warm_edge_tables() has published a block
+
+## Base index of the frozen block for `n` in `_edge_flat`, or −1 if `n` is not warmed. Pure Packed
+## reads of never-mutated arrays (worker-safe); the scan is ≤ the registered body count.
+static func _edge_base(n: int) -> int:
+	for s in range(_edge_ns.size()):
+		if _edge_ns[s] == n:
+			return s * _EDGE_BLOCK
+	return -1
+
+## True iff the frozen fold/edge table for grid resolution `n` is built. The O4b dual-K warm assertion
+## (FacetAtlas.warm_up) reads this to prove EVERY body's k is warmed before setup returns (risk #3).
+static func edge_tables_warm(n: int) -> bool:
+	return _edge_base(n) >= 0
 
 # ---------------------------------------------------------------------------------------
 # DVec3 — a minimal three-f64 vector. Deliberately NOT Vector3 (which is f32); the exact
@@ -560,11 +585,12 @@ static func region_key(face: int, i: int, j: int, r: int) -> int:
 # ---------------------------------------------------------------------------------------
 
 ## Returns the remap entry for crossing `side` of `face` (Dictionary {b, m, t}) for a given N. Reads
-## the FROZEN flat table for the home body (lock-free); a foreign n falls back to the Dictionary cache
-## (main-thread verify only — the voxel worker only ever folds at the home-body n).
+## the FROZEN flat table for ANY warmed n (lock-free, O4b multi-n); an unwarmed n falls back to the
+## Dictionary cache (main-thread verify only — every n a worker can fold at is warmed in warm_up).
 static func edge_remap(face: int, side: int, n: int) -> Dictionary:
-	if n == _edge_flat_n and _edge_flat.size() == 24 * _EDGE_STRIDE:
-		var b := (face * 4 + side) * _EDGE_STRIDE
+	var nb := _edge_base(n)
+	if nb >= 0:
+		var b := nb + (face * 4 + side) * _EDGE_STRIDE
 		return {
 			"b": _edge_flat[b],
 			"m": [_edge_flat[b + 1], _edge_flat[b + 2], _edge_flat[b + 3], _edge_flat[b + 4]],
@@ -621,8 +647,11 @@ static func fold_cell(face: int, i: int, j: int, n: int) -> Dictionary:
 		side = SIDE_SOUTH
 	# Frozen-table fast path (the voxel-worker fold, COSMOS-AUDIT §3.2 item 1): read the affine map
 	# straight out of the flat PackedInt32Array by index — no Dictionary/Array allocation, lock-free.
-	if n == _edge_flat_n and _edge_flat.size() == 24 * _EDGE_STRIDE:
-		var b := (face * 4 + side) * _EDGE_STRIDE
+	# O4b: `_edge_base` picks THIS n's frozen block (Earth k=24 / Moon k=14 / the crater lattice n all
+	# coexist), so no body's fold ever falls through to the lazy `_edge_cache` build.
+	var nb := _edge_base(n)
+	if nb >= 0:
+		var b := nb + (face * 4 + side) * _EDGE_STRIDE
 		return {
 			"face": _edge_flat[b],
 			"i": _edge_flat[b + 1] * i + _edge_flat[b + 2] * j + _edge_flat[b + 5],
@@ -747,25 +776,37 @@ static func _ensure_edge_table(n: int) -> void:
 ## pass-1 crash class AND the F4 corruption candidate are both structurally removed). Called from
 ## TerrainConfig.warm_up() in module setup(), before the generator/viewer attaches. Idempotent (a
 ## no-op once frozen for this n). FLAT_WORLD never folds, so it need not (and does not) call this.
+##
+## O4b (§3.1 fact 2, risk #3): APPEND-only and MULTI-N. Warming a second n (the Moon's k=14 beside
+## Earth's k=24, plus the crater lattice) ADDS a block; it does NOT evict the first — the old
+## replace-in-place would have silently demoted Earth's folds to the lazy `_edge_cache` path the
+## moment the Moon warmed, re-arming the exact worker race this function exists to remove. Publish
+## order is load-bearing: `_edge_flat` (old blocks keep their slot offsets, so a concurrent reader
+## indexing an already-named slot stays correct) BEFORE `_edge_ns` (which is what NAMES a slot as
+## readable). CONTRACT: every call happens on the main thread inside warm_up, before any worker.
 static func warm_edge_tables(n: int) -> void:
-	if _edge_frozen and _edge_flat_n == n:
-		return
-	var flat := PackedInt32Array()
-	flat.resize(24 * _EDGE_STRIDE)
+	if _edge_base(n) >= 0:
+		return                                   # already frozen for this n — idempotent
+	var block := PackedInt32Array()
+	block.resize(_EDGE_BLOCK)
 	for face in range(6):
 		for side in range(4):
 			var e := _gen_edge(face, side, n)
 			var m: Array = e["m"]
 			var t: Array = e["t"]
 			var b := (face * 4 + side) * _EDGE_STRIDE
-			flat[b] = int(e["b"])
-			flat[b + 1] = int(m[0]); flat[b + 2] = int(m[1])
-			flat[b + 3] = int(m[2]); flat[b + 4] = int(m[3])
-			flat[b + 5] = int(t[0]); flat[b + 6] = int(t[1])
-	# Publish the fully-built table, then set the guards LAST so no reader ever sees a half-built
-	# array (a reader checks `_edge_flat_n` / size before indexing). After this the array is const.
-	_edge_flat = flat
-	_edge_flat_n = n
+			block[b] = int(e["b"])
+			block[b + 1] = int(m[0]); block[b + 2] = int(m[1])
+			block[b + 3] = int(m[2]); block[b + 4] = int(m[3])
+			block[b + 5] = int(t[0]); block[b + 6] = int(t[1])
+	# Build the new concat OFF to the side, then publish whole arrays (never mutate in place, so a
+	# concurrent reader never observes a half-grown array). Existing blocks keep their slot index.
+	var flat := _edge_flat.duplicate()
+	flat.append_array(block)
+	var ns := _edge_ns.duplicate()
+	ns.append(n)
+	_edge_flat = flat        # data first: the new block is unreachable until its n is named below
+	_edge_ns = ns            # ...then name it — this is what makes the slot readable
 	_edge_frozen = true
 
 ## Generate one {b, m, t} unfold entry for (face, side) at resolution n.

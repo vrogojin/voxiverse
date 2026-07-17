@@ -80,6 +80,31 @@ static func edit_key_unpack(key: int) -> Array:
 static func edit_key_fid(key: int) -> int:
 	return key / (_EK_Y_SPAN * _EK_XZ_SPAN * _EK_XZ_SPAN)
 
+## COSMOS L5(a) (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6) — the frozen facet atlas, for the C++ generator.
+##
+## Hands the atlas over as FLAT NUMBERS (12 f64 per facet + a 2-int offset + the radius), never as topology.
+## That is deliberate and follows engine patch 0003's precedent, whose header records the reason: cube topology
+## re-derived in C++ is "the exact class that scrambled the M5a shader twice". With the frame frozen,
+## VoxelGeneratorCosmos::cell_dir is pure arithmetic — it has no branch that can get a sign or an axis index
+## wrong, because it makes no topological decision at all. Keep it that way: if C++ ever needs a new facet
+## quantity, derive it HERE on the main thread and freeze it, rather than reconstructing the cube over there.
+##
+## THREADING: the frozen-epoch contract. warm_up() runs main-thread; the arrays are immutable afterwards and
+## the returned copies cross the boundary once at generator setup. Never call this from a worker.
+static func frozen_atlas() -> Dictionary:
+	warm_up()
+	return {
+		"facet_frame": _frame,
+		"facet_off": _off,
+		"facet_r_blocks": R_BLOCKS,
+		"facet_count": _nf,
+		# COSMOS L5(a) S3b — the 4 own-side ridge planes per facet (16 f64/fid: slot × A,B,C,D, lattice
+		# coords). The C++ emit loop's junction_modify / block_all_air / cell_interior_scaled are pure
+		# arithmetic over these, exactly as the GDScript ones are — no seam topology re-derived in C++.
+		"seam_plane": _seam_plane,
+		"seam_eps": SEAM_EPS,
+	}
+
 ## Build the whole atlas once (main thread). Call AFTER TerrainConfig.warm_up (spawn pick reads worldgen).
 static func warm_up() -> void:
 	if _ready:

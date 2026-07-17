@@ -120,6 +120,7 @@ var _ws: WebSocketPeer = null
 var _was_open := false
 var _hello_sent := false
 var _authed := false                # relay returned auth_ok → cleared to stream telemetry + frames
+var _flags_emitted := false         # CROSSING-FASTGEN obs-2 fix (4): the exported FP_* flag set is stamped ONCE (first telemetry)
 var _reconnect_at := 0.0            # msec (Time.get_ticks_msec) at which to attempt reconnect; 0 = connect now
 var _backoff := RECONNECT_BACKOFF_MIN
 
@@ -133,6 +134,28 @@ var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hu
 var _win_acc := 0.0
 var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
+
+# MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
+# godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
+# WHY MAXIMA, POLLED EVERY FRAME: a telemetry window is 250 ms ≈ 15 frames and the hitch is BURSTY —
+# sampling the stats once at send time would almost always miss the one bad frame and read ~0, which is
+# exactly the false-negative that would "prove" the wrong conclusion. We poll every frame and keep the
+# worst, so vt_total_max is directly comparable against worst_ms for the SAME window: if
+# vt_total_max << worst_ms, the streaming hitch is NOT inside VoxelTerrain::_process at all.
+var _win_vt_detect := 0             # usec, max: time_detect_required_blocks
+var _win_vt_req_load := 0           # usec, max: time_request_blocks_to_load
+var _win_vt_load_resp := 0          # usec, max: time_process_load_responses (the APPLY path)
+var _win_vt_req_upd := 0            # usec, max: time_request_blocks_to_update
+var _win_vt_total := 0              # usec, max of the per-frame SUM of the four (time in _process)
+var _win_vt_dropped_loads := 0      # max seen (counters are cumulative-ish per frame in godot_voxel)
+var _win_vt_dropped_meshs := 0
+var _win_vt_updated := 0            # max updated_blocks in one frame (apply burst size)
+var _win_vt_seen := false           # any sample at all this window (module path present)
+# STREAM-SCHED T1: last window's cumulative per-class generator counters, so telemetry can report the WINDOW
+# delta (blocks + total ms per class) instead of an ever-growing total. See _send_telemetry for the epoch-reset
+# and racy-counter caveats.
+var _gen_prev_ct := [0, 0, 0, 0]
+var _gen_prev_us := [0, 0, 0, 0]
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
 var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
@@ -320,6 +343,7 @@ func _process(delta: float) -> void:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
+	_poll_voxel_main_thread_stats()
 	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
 	if not _post_cross.is_empty():
 		_update_post_cross(now_usec, real_delta)
@@ -422,6 +446,69 @@ func _engine_version() -> String:
 	return s
 
 
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation): sample godot_voxel's per-_process timing
+## breakdown ONCE PER FRAME and keep the window maxima. Called from _process before any early return so
+## the sample set covers every frame in the window (including the hitching one — the whole point).
+## Read-only + fully guarded: no world / fallback path / missing method ⇒ silently no-ops.
+func _poll_voxel_main_thread_stats() -> void:
+	if not is_instance_valid(world) or not world.has_method("terrain_main_thread_stats"):
+		return
+	var d = world.call("terrain_main_thread_stats")
+	if not (d is Dictionary) or (d as Dictionary).is_empty():
+		return
+	var s := d as Dictionary
+	_win_vt_seen = true
+	var detect := int(s.get("time_detect_required_blocks", 0))
+	var req_load := int(s.get("time_request_blocks_to_load", 0))
+	var load_resp := int(s.get("time_process_load_responses", 0))
+	var req_upd := int(s.get("time_request_blocks_to_update", 0))
+	var total := detect + req_load + load_resp + req_upd
+	_win_vt_detect = maxi(_win_vt_detect, detect)
+	_win_vt_req_load = maxi(_win_vt_req_load, req_load)
+	_win_vt_load_resp = maxi(_win_vt_load_resp, load_resp)
+	_win_vt_req_upd = maxi(_win_vt_req_upd, req_upd)
+	_win_vt_total = maxi(_win_vt_total, total)
+	_win_vt_dropped_loads = maxi(_win_vt_dropped_loads, int(s.get("dropped_block_loads", 0)))
+	_win_vt_dropped_meshs = maxi(_win_vt_dropped_meshs, int(s.get("dropped_block_meshs", 0)))
+	_win_vt_updated = maxi(_win_vt_updated, int(s.get("updated_blocks", 0)))
+
+
+## NEVER-OOM INSTRUMENT (WALK-PERF L2 heap A/B) — the live WASM heap in MB, or -1 off-web/unavailable.
+## docs/COSMOS-FP-M2-HEAP-AB.md's pass criterion is a heap A/B, but its instrument is MANUAL browser
+## DevTools (performance.memory), and telemetry carried only vmem_mb (VIDEO memory — a different thing
+## entirely). Without this the mimalloc A/B could not be judged against the NEVER-OOM ceiling at all,
+## and "it got faster" would be the only number in the room — exactly the trade the rule forbids.
+## mimalloc reserves per-thread segments, so this is THE number that can veto the frame-time win.
+## `wasmMemory.buffer.byteLength` is the true linear-memory size (what actually OOMs a tab); HEAP8 is
+## the fallback name. Evaluated once per telemetry window (4 Hz) — a trivial eval, not per frame.
+func _wasm_heap_mb() -> float:
+	if not OS.has_feature("web"):
+		return -1.0
+	# v1 tried `wasmMemory` / `HEAP8` from page scope and always read -1: Godot's web export keeps the
+	# Module (and its heap views) inside a closure, so they are NOT page-scope globals. Don't chase that.
+	# `performance.measureUserAgentSpecificMemory()` is the supported route and requires exactly the
+	# crossOriginIsolated state our COOP/COEP deploy ALWAYS guarantees (it is why threads work at all).
+	# It is ASYNC, so: kick a measurement off, stash the result on window, and read the PREVIOUS tick's
+	# value. A one-tick (250 ms) lag is irrelevant for a peak/steady-state gate. `_measuring` prevents
+	# stacking overlapping measurements (the call is not free).
+	JavaScriptBridge.eval(
+		"(function(){try{" +
+		"if(!self.crossOriginIsolated||!performance.measureUserAgentSpecificMemory){window.__voxHeapBytes=-2;return;}" +
+		"if(window.__voxHeapBusy)return;" +
+		"window.__voxHeapBusy=1;" +
+		"performance.measureUserAgentSpecificMemory().then(function(m){window.__voxHeapBytes=m.bytes;window.__voxHeapBusy=0;})" +
+		".catch(function(){window.__voxHeapBytes=-3;window.__voxHeapBusy=0;});" +
+		"}catch(e){window.__voxHeapBytes=-4;}})()", true)
+	var v = JavaScriptBridge.eval("(typeof window.__voxHeapBytes==='number')?window.__voxHeapBytes:-1", true)
+	if v == null:
+		return -1.0
+	var b := float(v)
+	# Negative sentinels are diagnostics, not sizes: -2 not crossOriginIsolated / API absent, -3 the
+	# promise rejected, -4 threw, -1 not yet resolved. Passed through so the trace says WHY it is absent
+	# rather than silently reading as a measured value.
+	return b if b < 0.0 else b / 1048576.0
+
+
 func _send_telemetry() -> void:
 	# Window stats (fps + worst frame over the just-elapsed window), then reset the window.
 	var fps := (float(_win_frames) / _win_acc) if _win_acc > 0.0 else 0.0
@@ -432,14 +519,63 @@ func _send_telemetry() -> void:
 	_win_frames = 0
 	_win_worst = 0.0
 
+	# MAIN-THREAD BREAKDOWN: latch + reset this window's maxima (ms, 0.01 precision). vt_total is the
+	# headline: compare it against worst_ms for the SAME window. vt_total ≈ worst_ms ⇒ the hitch IS
+	# VoxelTerrain::_process (and vt_load_resp says whether it is the apply path); vt_total << worst_ms
+	# ⇒ the hitch is OUTSIDE _process entirely (render / GPU upload / elsewhere) and the streaming-
+	# throughput framing is aimed at the wrong term.
+	var vt: Dictionary = {}
+	if _win_vt_seen:
+		vt = {
+			"vt_total_ms": snappedf(float(_win_vt_total) / 1000.0, 0.01),
+			"vt_load_resp_ms": snappedf(float(_win_vt_load_resp) / 1000.0, 0.01),
+			"vt_detect_ms": snappedf(float(_win_vt_detect) / 1000.0, 0.01),
+			"vt_req_load_ms": snappedf(float(_win_vt_req_load) / 1000.0, 0.01),
+			"vt_req_upd_ms": snappedf(float(_win_vt_req_upd) / 1000.0, 0.01),
+			"vt_updated_max": _win_vt_updated,
+			"vt_dropped_loads": _win_vt_dropped_loads,
+			"vt_dropped_meshs": _win_vt_dropped_meshs,
+		}
+	_win_vt_detect = 0
+	_win_vt_req_load = 0
+	_win_vt_load_resp = 0
+	_win_vt_req_upd = 0
+	_win_vt_total = 0
+	_win_vt_dropped_loads = 0
+	_win_vt_dropped_meshs = 0
+	_win_vt_updated = 0
+	_win_vt_seen = false
+
 	# godot_voxel worker backlog (perf_hud.gd reads the TASK counts — memory_pools.block_count lies).
 	var vox_gen := 0
 	var vox_mesh := 0
 	var vox_main := 0
 	var vox_gpu := 0
+	# WALK-PERF L1 (docs/COSMOS-WALK-PERF-DESIGN.md §4 L1) — the H-A/H-B discriminator. The dlmalloc-convoy
+	# hypothesis (workers and main thread throttling each other through the single global malloc lock) predicts
+	# the pool runs its FULL thread_count but each thread CRAWLS: during a stationary drain active_threads ≈ 10
+	# ⇒ H-A. If instead active_threads ≤ 3, few threads are actually running ⇒ H-B (pool/scheduling), and the
+	# mimalloc rebuild would be wasted. Free: get_stats() is already fetched+built here.
+	# NOTE std_current is #ifdef DEBUG_ENABLED in voxel_engine_gd.cpp:149-158 — a RELEASE web export returns
+	# -1. Emitted anyway so the trace records "unavailable" explicitly rather than looking like a real zero.
+	var pool_threads := -1
+	var pool_active := -1
+	var pool_tasks := ""
+	var vox_std_current := -1
 	if _voxel_engine != null and _voxel_engine.has_method("get_stats"):
 		var st: Dictionary = _voxel_engine.call("get_stats")
 		var tasks: Dictionary = st.get("tasks", {})
+		var gpool: Dictionary = (st.get("thread_pools", {}) as Dictionary).get("general", {})
+		pool_threads = int(gpool.get("thread_count", -1))
+		pool_active = int(gpool.get("active_threads", -1))
+		var tn = gpool.get("task_names", null)
+		if tn is PackedStringArray:
+			var names := PackedStringArray()
+			for n in (tn as PackedStringArray):
+				if String(n) != "":
+					names.append(String(n))
+			pool_tasks = ",".join(names)
+		vox_std_current = int((st.get("memory_pools", {}) as Dictionary).get("std_current", -1))
 		vox_gen = int(tasks.get("generation", 0))
 		vox_mesh = int(tasks.get("meshing", 0))
 		vox_main = int(tasks.get("main_thread", 0))
@@ -458,13 +594,68 @@ func _send_telemetry() -> void:
 		"draws": int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)),
 		"prims": int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)),
 		"vmem_mb": snappedf(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0, 0.1),
+		# NEVER-OOM: the WASM linear-memory size (what actually OOMs a tab) + Godot's own tracked static
+		# allocation. vmem_mb above is VIDEO memory and is NOT the NEVER-OOM signal. heap_mb is the number
+		# that can VETO the mimalloc win (per-thread segments raise the baseline) — see _wasm_heap_mb.
+		"heap_mb": snappedf(_wasm_heap_mb(), 0.1),
+		"mem_static_mb": snappedf(Performance.get_monitor(Performance.MEMORY_STATIC) / 1048576.0, 0.1),
 		"objects": int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT)),
 		"vox_gen": vox_gen,
 		"vox_mesh": vox_mesh,
 		"vox_main": vox_main,
 		"vox_gpu": vox_gpu,
+		# WALK-PERF L1: the dlmalloc-convoy discriminator (see above). pool_active ≈ pool_threads during a
+		# stationary drain ⇒ threads run-but-crawl ⇒ H-A (convoy) ⇒ the mimalloc rebuild is justified.
+		"pool_threads": pool_threads,
+		"pool_active": pool_active,
+		"pool_tasks": pool_tasks,
+		"vox_std_current": vox_std_current,
 	}
+	# MAIN-THREAD BREAKDOWN: fold in this window's VoxelTerrain::_process maxima (omitted entirely on the
+	# fallback path / before setup, so a missing key means "no module terrain", never "measured zero").
+	msg.merge(vt)
+	# STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the generator's per-class block
+	# histogram: 0 = air/cheap early-out, 1 = whole-block bulk fill, 2 = underground per-cell (the min_h-gate-
+	# FAILED class R1 targets), 3 = surface-crossing. §2.3's supply model ASSUMES a 30/25/25/20 mix and names
+	# that its own soft spot; these fields MEASURE it, so R1 is judged on the real histogram. Reported as this
+	# window's DELTA — gen_ms_N / gen_ct_N reads directly as mean ms/block for class N.
+	# Two caveats that must travel with the numbers:
+	#  • the counters are cumulative per generator EPOCH and restart at 0 when a crossing installs a new
+	#    generator, so a negative delta means "epoch changed", not negative work — floored at 0 (that one
+	#    window under-reports rather than emitting nonsense).
+	#  • TELEMETRY-GRADE: the voxel workers share one generator instance and race the `+=`, so both ct and ms
+	#    UNDERCOUNT under load. The per-class SHARES and the ms/block ratios are the signal; the absolute
+	#    block count is not (compare it against vox_gen/dropped, don't treat it as a census).
+	# `dropped_block_loads` — T1's other half, the R4 go/no-go stale share — already ships as vt_dropped_loads.
+	var gcs: Dictionary = {}
+	if is_instance_valid(world) and world.has_method("gen_class_stats"):
+		var g = world.call("gen_class_stats")
+		if g is Dictionary:
+			gcs = g as Dictionary
+	if not gcs.is_empty():
+		var cct: Array = gcs.get("ct", [])
+		var cus: Array = gcs.get("us", [])
+		for i in range(4):
+			var c := int(cct[i]) if i < cct.size() else 0
+			var u := int(cus[i]) if i < cus.size() else 0
+			msg["gen_ct_%d" % i] = maxi(0, c - int(_gen_prev_ct[i]))
+			msg["gen_ms_%d" % i] = snappedf(float(maxi(0, u - int(_gen_prev_us[i]))) / 1000.0, 0.01)
+			_gen_prev_ct[i] = c
+			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
+
+	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these
+	# via sed before export, so reading the compiled consts gives exactly-what-shipped provenance — BUILD-INFO.txt is
+	# written during the earlier engine build, before the sed, so it cannot). Emitted once (small, static); read live.
+	if not _flags_emitted:
+		_flags_emitted = true
+		msg["flags"] = {
+			"FACETED": CubeSphere.FACETED, "FP_M1_POOL": CubeSphere.FP_M1_POOL, "FP_M2_LOD": CubeSphere.FP_M2_LOD,
+			"FP_CTRL_ADAPTIVE": CubeSphere.FP_CTRL_ADAPTIVE, "FP_PREFILL_112": CubeSphere.FP_PREFILL_112,
+			"FP_VEL_PREDICT": CubeSphere.FP_VEL_PREDICT, "FP_FIXED_FRAME": CubeSphere.FP_FIXED_FRAME,
+			"FP_FARRING_FULL_COVER": CubeSphere.FP_FARRING_FULL_COVER, "FP_NO_NEAR_LOD": CubeSphere.FP_NO_NEAR_LOD,
+			"FP_ATLAS_MATERIAL": CubeSphere.FP_ATLAS_MATERIAL, "POOL_CROSSING_PREGEN": CubeSphere.POOL_CROSSING_PREGEN,
+		}
 
 	# Telemetry is small (~1 KB) and the signal we most want to keep, so it is NOT shed at the frame
 	# threshold — but under a total network stall the buffer could still creep up, so only send while
@@ -542,6 +733,16 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			msg["facet_neighbours"] = int(world.call("facet_pool_neighbour_count"))
 		if world.has_method("stream_load_credit"):
 			msg["stream_credit"] = snappedf(float(world.call("stream_load_credit")), 0.001)
+		# CROSSING-FASTGEN obs-2 fix (4): the controller setpoint/floor/overload trace, so "adaptive off" vs "on but
+		# genuinely over setpoint" is directly readable alongside the credit. Guarded + empty-dict-guarded so a
+		# flag/render-path combination without a live controller simply omits these (never crashes the bridge).
+		if world.has_method("stream_load_stats"):
+			var cs = world.call("stream_load_stats")
+			if cs is Dictionary and not (cs as Dictionary).is_empty():
+				msg["setpoint_ms"] = snappedf(float((cs as Dictionary).get("setpoint_ms", 0.0)), 0.1)
+				msg["frame_worst_ema"] = snappedf(float((cs as Dictionary).get("frame_worst_ema", 0.0)), 0.1)
+				msg["floor_p10"] = snappedf(float((cs as Dictionary).get("floor_p10_ms", 0.0)), 0.1)
+				msg["backlog_gated"] = bool((cs as Dictionary).get("backlog_gated", false))
 		# COSMOS FP-FIXED-FRAME Phase-0 guard (§3): the max |player render-abs| seen — the f32-precision headroom
 		# signal that tells us whether a re-anchor is ever needed at the current R (0 unless the fixed frame is on).
 		if world.has_method("player_abs_max"):

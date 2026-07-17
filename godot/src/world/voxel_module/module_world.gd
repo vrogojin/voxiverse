@@ -1731,7 +1731,7 @@ func set_imminent_fid(fid: int, committed: bool = false) -> void:
 		return
 	if prev == fid:
 		return
-	var target := minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+	var target := minf(CubeSphere.imminent_prefill_blocks(), float(TerrainConfig.near_render_radius()))
 	# Demote the OUTGOING imminent (if it is a live non-active neighbour) back to the neighbour radius.
 	if prev >= 0 and prev != _pool_active and _pool.has(prev):
 		var ps: Dictionary = _pool[prev]
@@ -1819,7 +1819,7 @@ func pool_spawn(fid: int) -> bool:
 	# the wider 48→128 fill still SPREADS across the approach (never a burst). Gated on the fixed frame; off ⇒ 96 (shipped).
 	var nb_target := 96.0
 	if CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on() and fid == _imminent_fid:
-		nb_target = minf(CubeSphere.POOL_IMMINENT_PREFILL_BLOCKS, float(TerrainConfig.near_render_radius()))
+		nb_target = minf(CubeSphere.imminent_prefill_blocks(), float(TerrainConfig.near_render_radius()))
 	s["view_target"] = nb_target
 	s["ramp_from"] = float(start)
 	_pool[fid] = s
@@ -1979,6 +1979,60 @@ func pool_has(fid: int) -> bool:
 	return _pool.has(fid)
 func pool_active() -> int:
 	return _pool_active
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17). VoxelTerrain::_b_get_statistics
+## (voxel_terrain.cpp:603) returns godot_voxel's OWN "breakdown of time spent in _process" — the four
+## time_* fields are MAIN-THREAD microseconds per _process call, plus the drop/update counters. This is
+## the only way to localise the streaming hitch: live telemetry shows worst_ms 117-136 ms whenever
+## vox_gen > 0 (even STANDING STILL) while the mesh/apply queues read 0 — so either that main-thread
+## cost lives inside VoxelTerrain::_process (these fields will show it) or it lives OUTSIDE it (they
+## will all be small, and the hitch is render/upload — a completely different fix). Telemetry-only,
+## read-only, no behaviour change; guarded so a missing method/terrain simply yields {}.
+func terrain_main_thread_stats() -> Dictionary:
+	if _terrain == null or not _terrain.has_method("get_statistics"):
+		return {}
+	var d = _terrain.call("get_statistics")
+	return (d as Dictionary) if d is Dictionary else {}
+
+## STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §9.1) — the per-class generation histogram, summed over
+## EVERY live generator (the active slot + each pool slot owns its own instance, frozen on its own facet epoch;
+## _generator is the active slot's, so dedupe by instance id or a crossing double-counts it). Returns
+## {ct: [4 ints], us: [4 ints]} — class 0 air/cheap, 1 whole-block bulk, 2 underground per-cell (the
+## gate-failed class R1 targets), 3 surface-crossing. Counters are CUMULATIVE per epoch and telemetry-grade
+## (racy across the workers sharing one generator — see the generator's gen_ct_* comment); an epoch install
+## resets them to 0, so a consumer differencing windows must floor negative deltas at 0. Empty on the fallback
+## path / before setup.
+func gen_class_stats() -> Dictionary:
+	var ct := [0, 0, 0, 0]
+	var us := [0, 0, 0, 0]
+	var seen := {}
+	var gens: Array = []
+	if _generator != null:
+		gens.append(_generator)
+	for fid in _pool.keys():
+		var g = _pool[fid].get("generator")
+		if g != null:
+			gens.append(g)
+	var any := false
+	for g in gens:
+		var gid := (g as Object).get_instance_id()
+		if seen.has(gid):
+			continue
+		seen[gid] = true
+		if not (g as Object).has_method("gen_stats"):
+			continue
+		var d = (g as Object).call("gen_stats")
+		if not (d is Dictionary):
+			continue
+		any = true
+		var dct: Array = (d as Dictionary).get("ct", [])
+		var dus: Array = (d as Dictionary).get("us", [])
+		for i in range(4):
+			if i < dct.size():
+				ct[i] += int(dct[i])
+			if i < dus.size():
+				us[i] += int(dus[i])
+	return {"ct": ct, "us": us} if any else {}
+
 func pool_neighbour_count() -> int:
 	return maxi(0, _pool.size() - (1 if _pool.has(_pool_active) else 0))
 ## Every LIVE facet id in the pool (active + neighbours) — the far-ring excluded set + the gate's ≤1+4 cap check.
@@ -2729,6 +2783,38 @@ var gen_lod_probe := false               # FP-R0 §B: when true, lod>0 samples a
 var fp_bulk := false
 var bulk_stone_arid := -1
 var bulk_deepslate_arid := -1
+# STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3 / §9.2): CubeSphere.FP_COLBULK's snapshot — the
+# column-granular twin of fp_bulk. Reuses the SAME two frozen fill ARIDs (a column's deep run writes exactly
+# the cube a whole-block fill would), so it needs no extra table. Frozen by the loader, read-only on workers.
+var fp_colbulk := false
+# STREAM-SCHED R7 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.5 / §9.6): CubeSphere.FP_STAMP's snapshot — the
+# scatter pass that puts the strata/ore variants back into fp_colbulk's deep fill runs, making the column
+# bulk fill BYTE-IDENTICAL to the per-cell path instead of an accepted appearance loss. Meaningless without
+# fp_colbulk (it stamps exactly the cells fp_colbulk's fill_area runs wrote) → the emit gate ANDs the two.
+var fp_stamp := false
+# STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1 / §9.1) — the per-class generation timer. §2.3's
+# supply model rests on an ASSUMED block-class mix (30% air/cheap, 25% bulk-qualified, 25% gate-failed, 20%
+# surface); the doc itself names that its soft spot. These count blocks + accumulate usec per class so the mix is
+# MEASURED before R1 is judged. Classes: 0 = air / cheap early-out, 1 = whole-block bulk fill
+# (FP_BULK_UNDERGROUND), 2 = underground per-cell (the min_h-gate-FAILED class R1 targets), 3 = surface-crossing
+# per-cell.
+#
+# THREADING (read this before "fixing" it): several voxel workers share ONE generator instance, so these `+= `
+# are racing read-modify-writes and WILL lose updates under contention. That is deliberate and bounded:
+#   • they are plain ints (never Packed*Array) — a Variant int store is a word write with no refcount, so the
+#     race costs LOST UPDATES only, never corruption. A Packed*Array member would be far worse here: a
+#     main-thread read bumps its refcount and the next worker write silently CoW-detaches the buffer.
+#   • no lock, ever: this is the hot path R1 exists to shrink; a mutex here would measure the mutex.
+# ⇒ these are TELEMETRY-GRADE (undercounts under load, monotonic, ratios stable — mix shares are what T1 is for),
+# NOT an accounting ledger. Same tolerated-race class as `oob_seen` below. Read via gen_stats().
+var gen_ct_0 := 0
+var gen_ct_1 := 0
+var gen_ct_2 := 0
+var gen_ct_3 := 0
+var gen_us_0 := 0
+var gen_us_1 := 0
+var gen_us_2 := 0
+var gen_us_3 := 0
 # OOB-fence telemetry (COSMOS-AUDIT §3.2 item 6, F8): a benign write-once flag so a clamped/stale ARID
 # is never SILENT. Set true the first time the fence fires; surfaced via module_world.oob_seen(). The
 # write is idempotent (only ever false→true) so it is race-safe even though workers share this instance.
@@ -2753,6 +2839,32 @@ const BULK_BEDROCK_TOP_Y := -59
 func _get_used_channels_mask() -> int:
 	return 1 << VoxelBuffer.CHANNEL_TYPE
 
+## STREAM-SCHED T1: this generator epoch's per-class block counts + usec. Cumulative since the epoch was
+## installed (a facet/face flip builds a FRESH generator → the counters restart at 0; the reader must treat a
+## decrease as an epoch change, not as negative work). Telemetry-grade — see the gen_ct_* declaration.
+func gen_stats() -> Dictionary:
+	return {
+		"ct": [gen_ct_0, gen_ct_1, gen_ct_2, gen_ct_3],
+		"us": [gen_us_0, gen_us_1, gen_us_2, gen_us_3],
+	}
+
+## Add one block's elapsed usec into class `cls`. Racy by design (see gen_ct_* above).
+func _gen_acc(cls: int, t0: int) -> void:
+	var d = Time.get_ticks_usec() - t0
+	match cls:
+		0:
+			gen_ct_0 += 1
+			gen_us_0 += d
+		1:
+			gen_ct_1 += 1
+			gen_us_1 += d
+		2:
+			gen_ct_2 += 1
+			gen_us_2 += d
+		_:
+			gen_ct_3 += 1
+			gen_us_3 += d
+
 func _generate_block(buffer, origin_in_voxels, lod):
 	# FP-R0 §B stride: shipped path early-outs on lod!=0 (gen_lod_probe=false). The probe generator strides the
 	# LOD0 sampling by s=2^lod so a coarse buffer cell (x,y,z) reads LOD0 voxel (ox+x*s, oy+y*s, oz+z*s). At
@@ -2762,6 +2874,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 		if not gen_lod_probe:
 			return
 		s = 1 << lod
+	# STREAM-SCHED T1 (§9.1): start the per-class timer AFTER the lod early-out (that return is not a block
+	# generation at all, it is the shipped "this generator only serves lod0" contract — counting it would
+	# dilute the mix with zero-cost no-ops). Every return below routes through _gen_acc exactly once.
+	var _t0 = Time.get_ticks_usec()
 	var size = buffer.get_size()
 	var ox = origin_in_voxels.x
 	var oy = origin_in_voxels.y
@@ -2794,8 +2910,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# pass at all. Uses only CONSTANTS (no noise). MAX_SURFACE_Y is a proven upper bound on
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
 	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
+		_gen_acc(0, _t0)                                  # T1 class 0: constant air early-out
 		return
 	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
+		_gen_acc(0, _t0)
 		return
 	# FP-S1(b) COSMOS FACETED (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §5(a)/§8) — BLOCK-level facet-domain
 	# early-out, BEFORE the per-column profile pass. junction_modify() (the buffer-write exit below) masks every
@@ -2805,6 +2923,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# masks every cell (never skips a block with any interior/straddle cell → identical voxels emitted, just faster).
 	# Gated by gen_facet >= 0 (faceted only) → flat / non-faceted byte-identical. Frozen gen_facet → worker-safe.
 	if gen_facet >= 0 and FacetAtlas.block_all_air(gen_facet, ox, oy, oz, size.x, size.y, size.z, s):
+		_gen_acc(0, _t0)                                  # T1 class 0: beyond-ridge all-air early-out
 		return
 
 	# Per-column profile cache: Vector4(g, biome, c, t). Value type -> no per-cell
@@ -2895,6 +3014,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 					interior = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
 				if interior:
 					buffer.fill(fill_arid, ch)
+					_gen_acc(1, _t0)                      # T1 class 1: whole-block bulk fill
 					return
 
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
@@ -2903,7 +3023,54 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	var top = max_h + max_above
 	if sea > top: top = sea
 	if oy > top:
+		_gen_acc(0, _t0)                                  # T1 class 0: profiled all-air block
 		return
+
+	# STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3 / §9.2) — FP_COLBULK: the block-level hoist.
+	# Everything that is constant over the block is decided ONCE here; the per-column work is in the emit loop.
+	# Preconditions mirror the whole-block fill above (LOD0, flat branch, cubic block) plus the OOB fence: a
+	# fill_area write bypasses the per-cell fence, so BOTH fill ARIDs must be baked and in range or the whole
+	# optimisation stays off (never fill a stale index). FACETED: v1 requires the WHOLE block box to be interior
+	# to all four ridges — exactly the whole-block fill's gate — so no beyond-ridge cell that junction_modify
+	# would mask to AIR is ever filled; ridge straddlers stay fully per-cell.
+	var cb_on = fp_colbulk and s == 1 and flat_world and size.x == size.y and size.y == size.z \
+		and bulk_stone_arid >= 0 and bulk_stone_arid < mcount \
+		and bulk_deepslate_arid >= 0 and bulk_deepslate_arid < mcount
+	if cb_on and gen_facet >= 0:
+		cb_on = FacetAtlas.cell_interior_scaled(gen_facet, ox, oy, oz, size.x)
+	var cb_top = oy + size.y                              # one past the block's top cell (s == 1 whenever cb_on)
+	# R1 NEIGHBOUR-AWARE DEEP BOUND — a 1-wide ring of column heights around the block (18×18 for a 16³).
+	# Being deep is a property of CONTENT, but being INVISIBLE is a property of the NEIGHBOURHOOD: a cell 13
+	# below its OWN g is still on a visible face if an adjacent column's surface drops below it. So the deep
+	# bound is min(g over the 3×3) − BULK_MAX_FILLER, not the doc's per-column `g − 12` (§2.3/§9.2 specifies
+	# the per-column form; it is unsound in the general case and this deviates deliberately). At y < min3x3(g)
+	# − 12 every face-neighbour is >12 below its own surface, hence a FULL opaque cube (a SLOPE run reaches at
+	# most 3 below g, so it can never carve that deep) ⇒ the cell has no visible face, by construction rather
+	# than by luck. MEASURED on this terrain: max adjacent-column |Δg| is 1 near spawn and 3 across mountain
+	# massifs, so this costs ≤3 cells of fill per column — but the bound no longer RESTS on that measurement.
+	# The ring reads through the same per-block pcache memo, so the 256 in-block columns are memo hits and only
+	# the ~68 ring columns sample noise. Built only when cb_on; worker-local (never shared).
+	# STREAM-SCHED R7 (§2.5/§9.6) — FP_STAMP: record each column's deep-region top so the scatter pass below
+	# knows EXACTLY which cells the fill runs wrote (dtop is PER-COLUMN: it depends on that column's 3×3 gmin).
+	# The stamp must never touch a cell the per-cell path resolved — that cell is already exact, and a stamp
+	# would overwrite it with a deep-only guess. Init to oy = "this column filled nothing"; the emit loop
+	# overwrites it wherever cb_on computes a real dtop. NEVER-OOM ledger: ONE worker-local PackedInt32Array
+	# of size.x*size.z (1 KiB for a 16³ block), allocated only when stamping is on, freed with the frame.
+	# No cache, no cross-block retention, no growth with view distance.
+	var stamp_on = cb_on and fp_stamp
+	var cdtop: PackedInt32Array
+	if stamp_on:
+		cdtop = PackedInt32Array()
+		cdtop.resize(size.x * size.z)
+		cdtop.fill(oy)
+	var gring: PackedInt32Array
+	var grw = size.x + 2
+	if cb_on:
+		gring = PackedInt32Array()
+		gring.resize(grw * (size.z + 2))
+		for j in range(size.z + 2):
+			for i in range(grw):
+				gring[j * grw + i] = int(TerrainConfig.column_profile(ox + i - 1, oz + j - 1, pcache).x)
 
 	for z in range(size.z):
 		for x in range(size.x):
@@ -2924,14 +3091,83 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				wx = rxs[idx2]
 				wz = rzs[idx2]
 				pcache.face = rfs[idx2]
+			# STREAM-SCHED R1/R1b (§2.3/§2.4, §9.2) — this column's three y-regions, when FP_COLBULK is on:
+			#   deep run  [oy, min(cb_top, g − 12))  → fill_area stone (above −16) / deepslate (below −24);
+			#                                          the −24..−16 dither rows and any row below −59 (where
+			#                                          bedrock can hash in) are EXCLUDED and stay per-cell.
+			#   exact band [g − 12, col_hi)          → the per-cell body below, verbatim and BYTE-EXACT.
+			#   air        [col_hi, cb_top)          → skipped (R1b).
+			# Why min3x3(g) − 12: _surface_rule returns STONE for depth > _filler_depth(biome), whose max over
+			# all biomes is 12 (badlands). So every cell strictly below g − 12 is stone/deepslate/strata/ore —
+			# the exact material class the whole-block fill already approximates, and the SAME accepted loss
+			# (interior ore/strata variants). Cells at or above that can be filler/biome-top/cap/slope/snow/
+			# tree/sea and are never guessed. Taking the MIN over the 3×3 additionally makes the cell provably
+			# INVISIBLE (see the gring comment): content-deep is not the same claim as unseen, and only the
+			# second one licenses guessing the cell.
+			var col_hi = cb_top                       # one past the last cell this column must resolve
+			var deep_top = -0x40000000                # cells with wy < deep_top are provably deep AND unseen
+			if cb_on:
+				var gmin = g
+				for dz1 in range(-1, 2):
+					for dx1 in range(-1, 2):
+						var gn = gring[(z + 1 + dz1) * grw + (x + 1 + dx1)]
+						if gn < gmin: gmin = gn
+				deep_top = gmin - BULK_MAX_FILLER
+				var dtop = mini(cb_top, deep_top)     # exclusive top of this column's deep region in the block
+				if stamp_on:
+					cdtop[idx2] = dtop                # R7: the scatter's per-column deep bound (see below)
+				if dtop > oy:
+					# Two runs at most; both are half-open [lo, hi) in WORLD y, written in BUFFER-local
+					# coords. Stone: wy > −16. Deepslate: wy < −24 AND wy >= −59 (below −59 bedrock can
+					# hash in per-cell, so those rows are left out of the run entirely).
+					var s0 = maxi(oy, BULK_DEEPSLATE_TOP_Y + 1)
+					if dtop > s0:
+						buffer.fill_area(bulk_stone_arid, Vector3i(x, s0 - oy, z), Vector3i(x + 1, dtop - oy, z + 1), ch)
+					var d0 = maxi(oy, BULK_BEDROCK_TOP_Y)
+					var d1 = mini(dtop, BULK_DEEPSLATE_FULL_Y)
+					if d1 > d0:
+						buffer.fill_area(bulk_deepslate_arid, Vector3i(x, d0 - oy, z), Vector3i(x + 1, d1 - oy, z + 1), ch)
+				# R1b, the per-column air ceiling. Everything resolve_cell can emit ABOVE a column's own g is
+				# bounded by max_above over the columns that can REACH this one: the smoothing cap (own g+1),
+				# the snow stack (own g + SNOW_FILL_MAX_CELLS), the SLOPE run (corner targets over the 3×3),
+				# and a TREE canopy. The tree term is why this stencil is 5×5 and NOT the 3×3 the design doc
+				# names: TreeGen.block_at consults the tree of (x,z)'s OWN G=10 grid cell, whose base column
+				# is jittered anywhere in [gx·10+2, gx·10+7] — but a canopy has radius ≤ 2, so only a base
+				# within ±2 columns can place a cell here, and that base's g is what the height is measured
+				# from. A 3×3 max would therefore MISS a tall neighbour's overhang and silently clip canopy.
+				# Maxed with SEA_LEVEL because an underwater column emits sea fill up to it regardless of g.
+				# Interior columns only (the 5×5 must be inside profs[]); edge columns keep the full loop.
+				if x >= 2 and x < size.x - 2 and z >= 2 and z < size.z - 2:
+					var gmax = g
+					for dz2 in range(-2, 3):
+						for dx2 in range(-2, 3):
+							var gg = int(profs[(z + dz2) * size.x + (x + dx2)].x)
+							if gg > gmax: gmax = gg
+					col_hi = mini(cb_top, maxi(gmax + max_above, sea) + 1)
 			# S1 throughput hoist: the SLOPE run is column-invariant, so compute it ONCE here (worker-
 			# direct pack, byte-identical to the analytic memo) and pass it into every resolve_cell of
 			# this column — else resolve_cell re-runs the _corner_targets noise stencil + TreeGen.block_at
 			# tree-gate on all ~100 sub-surface y's of a tall land column (the steady-state gen cost).
+			# R1 (§9.2) makes it LAZY: a column whose every in-block cell was fill_area'd or skipped calls
+			# resolve_cell zero times, so the noise stencil it feeds is pure waste. The three terms are the
+			# three per-cell regions left: the exact band, the dither rows, and the bedrock rows.
+			if cb_on:
+				var dtop2 = mini(cb_top, deep_top)
+				var need_cells = mini(cb_top, col_hi) > maxi(oy, deep_top) \
+					or mini(dtop2, BULK_DEEPSLATE_TOP_Y + 1) > maxi(oy, BULK_DEEPSLATE_FULL_Y) \
+					or mini(dtop2, BULK_BEDROCK_TOP_Y) > oy
+				if not need_cells:
+					continue
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
 				var wy = oy + y * s
+				if cb_on:
+					if wy >= col_hi:
+						break                         # R1b: above this column's content ceiling — nothing but air
+					if wy < deep_top and (wy > BULK_DEEPSLATE_TOP_Y \
+							or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
+						continue                      # R1: already emitted by this column's deep fill runs
 				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
@@ -3097,6 +3333,139 @@ func _generate_block(buffer, origin_in_voxels, lod):
 						oob_seen = true       # write-once telemetry (idempotent → race-safe); surfaced by verify
 						push_warning("[module_world] OOB fence clamped a stale/unbaked ARID (mat=%d modifier=%d) to a cube" % [id, CellCodec.modifier(v)])
 				buffer.set_voxel(arid, x, y, z, ch)
+
+	# ---- STREAM-SCHED R7 (§2.5/§9.6) — FP_STAMP: the gather→scatter inversion --------------------------
+	# The emit loop above fill_area'd every column's deep run with PLAIN stone/deepslate, which is the whole
+	# of R1's appearance loss: the strata blobs and ore pockets that the per-cell path would have written
+	# there are gone. Rather than ask each of 4096 cells "is a blob here?" (the gather, and the single
+	# biggest term in the 11.9 ms per-cell pass), enumerate the blobs that can REACH this block and stamp
+	# them. That is exact and LOCAL because a blob is confined to its own lattice cell:
+	# TerrainConfig.strata_blob/ore_blob clamp the centre jitter so centre−r >= cell_lo and
+	# centre+r <= cell_lo+L. Note the PLUS face touches cell_lo+L, which is the next lattice cell's first
+	# cell — the sphere bleeds by exactly ONE cell in +x/+y/+z, and the gather truncates that bleed
+	# implicitly (a query there derives the NEXT lattice cell and never consults this blob). So the scatter
+	# clips every stamp to the blob's OWN lattice cell; that clip is not an optimisation, it is what makes
+	# the scatter equal the gather. Byte-identity is otherwise structural: every blob parameter comes from
+	# the same TerrainConfig statics both paths call, so the two cannot drift.
+	#
+	# The stamp writes ONLY cells the fill runs actually wrote (the `wy < cdtop and (above −16 or below −24
+	# and >= −59)` test mirrors the emit loop's `continue` verbatim). Cells the per-cell path resolved are
+	# already exact and are never touched; the −24..−16 dither rows and the sub-−59 bedrock rows were never
+	# filled and are never stamped. Every stamped cell is a deep interior full cube (modifier 0, no liquid,
+	# no state), so its ARID is cube_arid[id] — the same table the per-cell write site resolves it through,
+	# behind the same OOB fence. flat_world + s == 1 + cubic block are cb_on preconditions, so there is no
+	# folding, no J⁻¹ rotation (modifier 0) and no junction_modify (cb_on already proved the whole block
+	# interior to all four ridges) to reproduce here.
+	if stamp_on:
+		var bx1 = ox + size.x - 1
+		var by1 = oy + size.y - 1
+		var bz1 = oz + size.z - 1
+		# --- strata: 16³ lattice → 1-8 cells over a 16³ block ---
+		var sl = TerrainConfig.strata_lattice()
+		for lx in range(floori(ox / float(sl)), floori(bx1 / float(sl)) + 1):
+			for ly in range(floori(oy / float(sl)), floori(by1 / float(sl)) + 1):
+				for lz in range(floori(oz / float(sl)), floori(bz1 / float(sl)) + 1):
+					var sb = TerrainConfig.strata_blob(lx, ly, lz)
+					if sb.w == 0:
+						continue
+					var sr = sb.w
+					# sphere bbox ∩ the blob's OWN lattice cell ∩ this block
+					var sx0 = maxi(maxi(sb.x - sr, lx * sl), ox)
+					var sx1 = mini(mini(sb.x + sr, lx * sl + sl - 1), bx1)
+					var sy0 = maxi(maxi(sb.y - sr, ly * sl), oy)
+					var sy1 = mini(mini(sb.y + sr, ly * sl + sl - 1), by1)
+					var sz0 = maxi(maxi(sb.z - sr, lz * sl), oz)
+					var sz1 = mini(mini(sb.z + sr, lz * sl + sl - 1), bz1)
+					if sx0 > sx1 or sy0 > sy1 or sz0 > sz1:
+						continue
+					var svar = TerrainConfig.strata_variant_of(lx, ly, lz, sb.y)
+					# The deepslate-region rule (TerrainConfig._deep_family): a variant replaces STONE, but in
+					# the deepslate region deepslate stays dominant and only the sulfur/cinnabar pockets punch
+					# through. Inside a fill run the base is decided by y ALONE (the dither band is excluded
+					# from the runs), so a non-pocket variant simply cannot write below −24 — skip those rows
+					# instead of testing every cell.
+					var punches = TerrainConfig.deep_pocket_variant(svar)
+					var sa = cube_arid[svar] if svar < ncube else svar
+					if sa < 0 or sa >= mcount:
+						continue                      # unbaked → leave the plain fill (never a stale index)
+					for wy in range(sy0, sy1 + 1):
+						if wy < BULK_DEEPSLATE_FULL_Y and not punches:
+							continue                  # deepslate region, ordinary strata → deepslate wins
+						var dy = wy - sb.y
+						for wz in range(sz0, sz1 + 1):
+							var dz = wz - sb.z
+							var dyz = dy * dy + dz * dz
+							if dyz > sr * sr:
+								continue
+							for wx in range(sx0, sx1 + 1):
+								var dx = wx - sb.x
+								if dx * dx + dyz > sr * sr:
+									continue
+								var ci = (wz - oz) * size.x + (wx - ox)
+								if wy >= cdtop[ci]:
+									continue          # per-cell territory — already exact
+								if wy > BULK_DEEPSLATE_TOP_Y or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y):
+									buffer.set_voxel(sa, wx - ox, wy - oy, wz - oz, ch)
+		# --- ore: 6³ lattice → up to 4³ cells over a 16³ block, ~45 % populated ---
+		var ol = TerrainConfig.ore_lattice()
+		for lx in range(floori(ox / float(ol)), floori(bx1 / float(ol)) + 1):
+			for ly in range(floori(oy / float(ol)), floori(by1 / float(ol)) + 1):
+				for lz in range(floori(oz / float(ol)), floori(bz1 / float(ol)) + 1):
+					var ob = TerrainConfig.ore_blob(lx, ly, lz)
+					if ob.w == 0:
+						continue
+					var orr = ob.w
+					var ox0 = maxi(maxi(ob.x - orr, lx * ol), ox)
+					var ox1 = mini(mini(ob.x + orr, lx * ol + ol - 1), bx1)
+					var oy0 = maxi(maxi(ob.y - orr, ly * ol), oy)
+					var oy1 = mini(mini(ob.y + orr, ly * ol + ol - 1), by1)
+					var oz0 = maxi(maxi(ob.z - orr, lz * ol), oz)
+					var oz1 = mini(mini(ob.z + orr, lz * ol + ol - 1), bz1)
+					if ox0 > ox1 or oy0 > oy1 or oz0 > oz1:
+						continue
+					# Ore TYPE is per (blob, QUERY COLUMN): the weights read the column's biome/c (emerald
+					# needs c > 0.4, badlands quadruples gold), so it is hoisted per column — never per blob
+					# (a different world) and never per cell (the cost R7 exists to remove).
+					for wz in range(oz0, oz1 + 1):
+						var dz = wz - ob.z
+						for wx in range(ox0, ox1 + 1):
+							var dx = wx - ob.x
+							var dxz = dx * dx + dz * dz
+							if dxz > orr * orr:
+								continue
+							var ci = (wz - oz) * size.x + (wx - ox)
+							var pc = profs[ci]
+							var ore = TerrainConfig.ore_pick_for(lx, ly, lz, ob.y, int(pc.y), pc.z)
+							if ore < 0:
+								continue
+							var ctop = cdtop[ci]
+							for wy in range(oy0, oy1 + 1):
+								if wy >= ctop:
+									continue          # per-cell territory — already exact
+								if not (wy > BULK_DEEPSLATE_TOP_Y or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
+									continue          # dither / bedrock rows: never filled, never stamped
+								var dy = wy - ob.y
+								if dxz + dy * dy > orr * orr:
+									continue
+								# The HOST (base gradient + any strata blob just stamped) decides both whether
+								# ore may replace it at all and which variant it takes — read from the SAME
+								# _deep_family the gather uses rather than re-deriving it here.
+								var host = TerrainConfig.deep_family_at(wx, wy, wz)
+								if not TerrainConfig.ore_hosts(host):
+									continue
+								var oid = TerrainConfig.ore_apply(ore, wy, host)
+								if oid == host:
+									continue          # outside the ore's own y-band → host stands
+								var oa = cube_arid[oid] if oid < ncube else oid
+								if oa < 0 or oa >= mcount:
+									continue          # unbaked → leave the host (never a stale index)
+								buffer.set_voxel(oa, wx - ox, wy - oy, wz - oz, ch)
+	# STREAM-SCHED T1 (§9.1): the per-cell emit loop finished. Class 2 = the block sits wholly BELOW every
+	# column's surface, i.e. the UNDERGROUND block that failed the whole-block bulk gate — exactly the class
+	# R1 targets, and the share §2.3 models at 25%. Class 3 = it crosses a surface. min_h is only computed on
+	# the flat branch (curved leaves it at its +inf init), so curved blocks report as surface-crossing rather
+	# than silently landing in class 2.
+	_gen_acc(2 if (flat_world and oy + size.y * s <= min_h) else 3, _t0)
 """
 	# FP-S1(e) (docs/COSMOS-MULTIFACET-STREAMING-REVIEW.md §4-R2 defect 4 note / §8): `src` is a CONSTANT literal —
 	# the facet epoch, lod-probe flag, frame M_win and all frozen tables are set as INSTANCE properties below, never
@@ -3141,6 +3510,8 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
 	gen.set("fp_bulk", CubeSphere.FP_BULK_UNDERGROUND)
+	gen.set("fp_colbulk", CubeSphere.FP_COLBULK)         # STREAM-SCHED R1 (§9.2): column-granular bulk fill
+	gen.set("fp_stamp", CubeSphere.FP_STAMP)             # STREAM-SCHED R7 (§9.6): lossless blob scatter over R1's fills
 	var _bstone := BlockCatalog.STONE
 	gen.set("bulk_stone_arid", _cube_arid[_bstone] if _bstone >= 0 and _bstone < _cube_arid.size() else -1)
 	var _bdeep := BlockCatalog.id_of(&"deepslate")
@@ -3155,7 +3526,76 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# generator still never writes an index past what the mesher can address. Falls back to _next_arid
 	# when the library doesn't expose its models array.
 	gen.set("model_count", _library_model_count())
+
+	# COSMOS L5(a) S4 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6) — under FP_CPPGEN, the voxel workers run
+	# the COMPILED VoxelGeneratorCosmos instead of this GDScript generator. Same frozen tables, same epoch,
+	# byte-identical output (verify_cppgen's buffer gate), but ~x25 faster on web (compiled wasm vs the
+	# interpreter). We build it here — AFTER `gen` is fully configured — so it reuses every already-baked
+	# table rather than re-deriving one. On ANY failure (class absent, setup refused) we fall back to the
+	# GDScript `gen`, so a missing/older binary degrades to the shipped path instead of breaking. Default
+	# OFF ⇒ this whole block is skipped ⇒ byte-identical to shipped.
+	if CubeSphere.FP_CPPGEN and ClassDB.class_exists("VoxelGeneratorCosmos"):
+		var cgen: Object = _make_cpp_generator(gen)
+		if cgen != null:
+			return cgen
 	return gen
+
+## S4: construct the compiled VoxelGeneratorCosmos for this epoch, frozen from the SAME tables the
+## GDScript generator `src_gen` just received (so the two are byte-identical by shared inputs, not a
+## parallel bake). Returns null on any failure so the caller falls back to the GDScript generator.
+func _make_cpp_generator(src_gen: Object) -> Object:
+	var cgen: Object = ClassDB.instantiate("VoxelGeneratorCosmos")
+	if cgen == null:
+		return null
+	var twin: Array = _gen_twin_arid
+	var empty := PackedInt32Array()
+	var cfg := TerrainConfig.noise_stack()
+	for k in TerrainConfig.material_tables():
+		cfg[k] = TerrainConfig.material_tables()[k]
+	# Epoch + flags (mirrors the gen.set(...) calls above; read the frozen epoch off src_gen so the two
+	# generators are on the SAME facet/face/window — never re-read a mutable global here).
+	cfg["gen_face"] = src_gen.get("gen_face")
+	cfg["gen_n"] = src_gen.get("gen_n")
+	cfg["gen_facet"] = src_gen.get("gen_facet")
+	cfg["flat_world"] = src_gen.get("flat_world")
+	cfg["faceted"] = CubeSphere.FACETED
+	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
+	cfg["model_count"] = src_gen.get("model_count")
+	cfg["waterlog"] = src_gen.get("waterlog")
+	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set
+	# them here explicitly; omitting them defaults p.id_wood to 0 (air) and every oak tree emits air.
+	cfg["id_wood"] = BlockCatalog.WOOD
+	cfg["id_leaf"] = BlockCatalog.LEAF
+	cfg["id_spruce_log"] = BlockCatalog.id_of(&"spruce_log")
+	cfg["id_spruce_leaf"] = BlockCatalog.id_of(&"spruce_leaves")
+	cfg["id_birch_log"] = BlockCatalog.id_of(&"birch_log")
+	cfg["id_birch_leaf"] = BlockCatalog.id_of(&"birch_leaves")
+	# The frozen appearance/ARID tables (reuse the exact instances set on src_gen).
+	cfg["block_ids"] = TerrainConfig.appearance_surface_materials()   # setup sanity field (unused by emit)
+	cfg["cube_arid"] = src_gen.get("cube_arid")
+	cfg["gen_arid"] = src_gen.get("gen_arid")
+	cfg["snow_arid"] = src_gen.get("snow_arid")
+	cfg["layer_arid"] = src_gen.get("layer_arid")
+	cfg["slope_arid"] = src_gen.get("slope_arid")
+	cfg["snow_slope_arid"] = src_gen.get("snow_slope_arid")
+	cfg["carve_arid"] = src_gen.get("carve_arid")
+	cfg["carve_snow_arid"] = src_gen.get("carve_snow_arid")
+	cfg["surface_arid"] = src_gen.get("surface_arid")
+	cfg["twin_w"] = twin[1] if twin.size() > 1 and twin[1] != null else empty
+	cfg["twin_l"] = twin[2] if twin.size() > 2 and twin[2] != null else empty
+	cfg["twin_3"] = twin[3] if twin.size() > 3 and twin[3] != null else empty
+	cfg["comp_l3"] = src_gen.get("comp_l3")
+	cfg["comp_l5"] = src_gen.get("comp_l5")
+	cfg["comp_l8"] = src_gen.get("comp_l8")
+	cfg["comp_l10"] = src_gen.get("comp_l10")
+	cfg["snow_lrid"] = _snow_id_of()
+	if CubeSphere.FACETED:
+		for k in FacetAtlas.frozen_atlas():
+			cfg[k] = FacetAtlas.frozen_atlas()[k]
+	if not cgen.call("setup", cfg):
+		push_warning("[module_world] VoxelGeneratorCosmos.setup refused — falling back to GDScript generator")
+		return null
+	return cgen
 
 ## The actual number of models in the baked library (the arid upper bound for the worker's OOB fence).
 ## Reads the live `models` array size when exposed; else the append count `_next_arid`.

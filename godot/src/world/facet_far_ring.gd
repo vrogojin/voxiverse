@@ -30,6 +30,14 @@ var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+# COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md §3): the SEPARATE dense caches for "backstop"
+# facets (the active facet + the live-pool `_excluded` set) under FP_FARRING_FULL_COVER. Built lazily at BACKSTOP_CELLS
+# (denser than the shipped CELLS=4) by _ensure_backstop_cached; the shipped _pos_cache/_col_cache stay at CELLS for the
+# non-backstop horizon facets. Positions are ABSOLUTE + radial with NO sink baked in — the BACKSTOP_SINK radial push is
+# applied PER EMITTED VERTEX in _emit_cached, so a facet that transitions backstop→distant across a crossing drops the
+# sink automatically on the next rebuild (the cache is role-agnostic). NEVER populated with the flag off (zero cost).
+var _bpos_cache: Dictionary = {}     # fid -> PackedVector3Array (dense, ABSOLUTE, un-sunk)
+var _bcol_cache: Dictionary = {}     # fid -> PackedColorArray
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -57,6 +65,11 @@ var _async_task_id := -1
 var _async_building := false
 var _async_fids := PackedInt32Array()   # the visible set the in-flight worker is building (main → worker; read-only during)
 var _async_arrays: Array = []           # worker → main: the committed surface arrays (built off-thread, swapped on main)
+# COSMOS far-ring full coverage (§4): the FROZEN backstop set for the in-flight worker. `_is_backstop` reads `_excluded`,
+# which set_pool_excluded MUTATES on the main thread mid-crossing — so the worker must NOT evaluate the role live (that
+# would race the dict). The role is snapshotted here on the main thread at dispatch (fid -> true); the worker only reads
+# this frozen dict, preserving the existing "worker reads read-only per-facet state" contract. Empty with the flag off.
+var _async_backstop: Dictionary = {}
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -147,6 +160,13 @@ func _begin_rebuild() -> void:
 func _dispatch_async_rebuild() -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
 	_async_fids = visible_fids()     # every fid here is warmed already (_warm_front gated the dispatch)
+	# COSMOS far-ring full coverage (§4): freeze the backstop role on the MAIN thread so the worker never reads `_excluded`
+	# live (set_pool_excluded may mutate it mid-run). Only populated under FULL_COVER; empty otherwise → worker sinks nothing.
+	_async_backstop = {}
+	if CubeSphere.FP_FARRING_FULL_COVER:
+		for fid in _async_fids:
+			if _is_backstop(fid):
+				_async_backstop[fid] = true
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -160,7 +180,8 @@ func _async_build_worker() -> void:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for fid in _async_fids:
-		_emit_cached(st, fid)
+		# backstop role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
+		_emit_cached(st, fid, CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid))
 	st.generate_normals()
 	_async_arrays = st.commit_to_arrays()
 
@@ -204,20 +225,37 @@ func _warm_front(nrm: Array) -> bool:
 				var fid := (face * k + a) * k + b
 				if not _front_visible(fid, nrm):
 					continue
-				if _pos_cache.has(fid):
-					continue
-				_ensure_cached(fid)
+				# COSMOS far-ring full coverage (§4): backstop facets warm their DENSE cache; every other facet the
+				# shipped grid cache. Warming on the MAIN thread here (before any async dispatch) keeps the worker's
+				# read-only cache contract — the worker only ever reads _bpos_cache/_pos_cache, never builds them.
+				if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+					if not _bpos_cache.has(fid):
+						_ensure_backstop_cached(fid)
+				elif not _pos_cache.has(fid):
+					_ensure_cached(fid)
 				if Time.get_ticks_usec() - t0 > budget_us:
 					return false     # budget spent — finish warming next frame
 	return true
 
 func _front_visible(fid: int, nrm: Array) -> bool:
-	if fid == _active_fid:
-		return false                 # the near voxel world already covers the active facet
-	if _excluded.has(fid):
-		return false                 # FP-R0 SPIKE: drawn as a real rotated voxel terrain, not a flat quad
+	# COSMOS far-ring full coverage (§2): with FP_FARRING_FULL_COVER on, the active facet + `_excluded` set are NO
+	# LONGER skipped — they are drawn as sunk "backstop" facets (see _is_backstop / _emit_cached) so the near-disk
+	# annular hole is filled. Only the back-hemisphere cull remains. With the flag off, the shipped exclusions apply
+	# verbatim (byte-identical: active + `_excluded` absent from the visible set).
+	if not CubeSphere.FP_FARRING_FULL_COVER:
+		if fid == _active_fid:
+			return false                 # the near voxel world already covers the active facet
+		if _excluded.has(fid):
+			return false                 # FP-R0 SPIKE: drawn as a real rotated voxel terrain, not a flat quad
 	var cd := _centre_dir(fid)
 	return cd[0] * nrm[0] + cd[1] * nrm[1] + cd[2] * nrm[2] >= BACK_CULL
+
+## COSMOS far-ring full coverage (§2): a "backstop" facet is one the near voxel world / live pool overlaps (the active
+## facet or a live-pool-`_excluded` facet). Under FP_FARRING_FULL_COVER these are drawn from the dense `_bpos_cache` at
+## BACKSTOP_CELLS and sunk radially by BACKSTOP_SINK at emit; every other front-hemisphere facet keeps its exact shipped
+## CELLS geometry. Role is decided at emit time (keyed by the current active/excluded state), never baked into a cache.
+func _is_backstop(fid: int) -> bool:
+	return fid == _active_fid or _excluded.has(fid)
 
 ## The full scan + re-emit + commit (the OLD _rebuild). Runs at setup, from _process once warming completes, and
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
@@ -226,15 +264,21 @@ func _rebuild_full() -> void:
 	var fids := visible_fids()
 	_emitted.clear()
 	for fid in fids:
-		_ensure_cached(fid)
+		_ensure_emit_cached(fid)
 		_emitted[fid] = true
 	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
 	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
 	_mi.mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
 	_reemit_count += 1
 	_pending = false
-	var tris := fids.size() * CELLS * CELLS * 2   # 32 tris/facet — exact for both assemblers
-	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached)" % [tris, _active_fid, _pos_cache.size()])
+	# 32 tris/facet at CELLS=4; under FULL_COVER the backstop facets are denser (2·BACKSTOP_CELLS²) — count them exactly.
+	var tris := fids.size() * CELLS * CELLS * 2
+	if CubeSphere.FP_FARRING_FULL_COVER:
+		var extra := (CubeSphere.BACKSTOP_CELLS * CubeSphere.BACKSTOP_CELLS - CELLS * CELLS) * 2
+		for fid in fids:
+			if _is_backstop(fid):
+				tris += extra
+	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
 
 ## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
 ## mesh assemblers + the equivalence gate consume this so their vertex/color/normal arrays are index-aligned.
@@ -255,8 +299,8 @@ func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for fid in fids:
-		_ensure_cached(fid)
-		_emit_cached(st, fid)
+		_ensure_emit_cached(fid)
+		_emit_cached(st, fid, CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid))   # main thread — live role is safe
 	st.generate_normals()
 	return st.commit()
 
@@ -269,9 +313,16 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 	var pos := PackedVector3Array()
 	var col := PackedColorArray()
 	for fid in fids:
-		_ensure_tri_cached(fid)
-		pos.append_array(_tri_pos_cache[fid])
-		col.append_array(_tri_col_cache[fid])
+		# COSMOS far-ring full coverage (§4): a sunk backstop facet cannot ride the pre-triangulated memcpy (its
+		# vertices are pushed radially inward per-vertex at BACKSTOP_CELLS). Under FULL_COVER it falls back to the
+		# per-vertex sunk expansion (a handful of facets — §5); non-backstop facets keep the memcpy fast path. The
+		# vertex order/winding matches _emit_cached exactly, so the later global generate_normals is bit-identical.
+		if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+			_append_backstop_tris(pos, col, fid)
+		else:
+			_ensure_tri_cached(fid)
+			pos.append_array(_tri_pos_cache[fid])
+			col.append_array(_tri_col_cache[fid])
 	if pos.size() == 0:
 		return ArrayMesh.new()
 	var arr := []
@@ -313,6 +364,8 @@ func is_rebuild_pending() -> bool: return _pending
 func reemit_count() -> int: return _reemit_count
 func is_emitted(fid: int) -> bool: return _emitted.has(fid)
 func emitted_count() -> int: return _emitted.size()
+func is_backstop(fid: int) -> bool: return _is_backstop(fid)     # COSMOS far-ring full coverage — gate visibility
+func backstop_cache_size() -> int: return _bpos_cache.size()     # G-FRC-BOUND: dense caches ≤ 5-facet bound
 
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
@@ -345,13 +398,100 @@ func _ensure_cached(fid: int) -> void:
 	_pos_cache[fid] = pos
 	_col_cache[fid] = col
 
-func _emit_cached(st: SurfaceTool, fid: int) -> int:
-	var pos: PackedVector3Array = _pos_cache[fid]
-	var col: PackedColorArray = _col_cache[fid]
-	var stride := CELLS + 1
+## COSMOS far-ring full coverage (§4): ensure the emit cache appropriate to facet `fid`'s CURRENT role — the dense
+## backstop cache for a backstop facet under FULL_COVER, else the shipped CELLS grid. Called by every synchronous
+## assembler path before it emits; the async path warms these on the main thread in _warm_front instead.
+func _ensure_emit_cached(fid: int) -> void:
+	if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+		_ensure_backstop_cached(fid)
+	else:
+		_ensure_cached(fid)
+
+## COSMOS far-ring full coverage (§3): compute + cache facet `fid`'s DENSE (BACKSTOP_CELLS) ABSOLUTE-coord terrain quad
+## once. Identical construction to _ensure_cached (planar corners + radial relief + FarPalette colour) but at the denser
+## resolution so the between-sample chord error stays below the near mountain relief. The BACKSTOP_SINK radial push is
+## NOT baked here — it is applied per emitted vertex (so the cache is role-agnostic and survives a crossing unchanged).
+func _ensure_backstop_cached(fid: int) -> void:
+	if _bpos_cache.has(fid):
+		return
+	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
+	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
+	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
+	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var s := float(gi) / float(cells)
+			var t := float(gj) / float(cells)
+			var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
+			var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
+			var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
+			var ln := sqrt(bx * bx + by * by + bz * bz)
+			var dx := bx / ln; var dy := by / ln; var dz := bz / ln
+			var prof := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
+			var g := int(prof.x)
+			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))   # ABSOLUTE, un-sunk
+			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+	_bpos_cache[fid] = pos
+	_bcol_cache[fid] = col
+
+## COSMOS far-ring full coverage (§2): return a copy of grid positions `p` pushed radially inward by BACKSTOP_SINK
+## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
+## emit so a shared grid vertex is not re-normalized per triangle. Pure math — safe on the async worker thread.
+func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
+	var sink := CubeSphere.BACKSTOP_SINK
+	var out := PackedVector3Array()
+	out.resize(p.size())
+	for i in range(p.size()):
+		var v: Vector3 = p[i]
+		out[i] = v - v.normalized() * sink
+	return out
+
+## COSMOS far-ring full coverage (§4): expand backstop facet `fid`'s dense sunk grid into the tri soup (same two tris
+## per cell, same winding, same per-vertex colours as _emit_cached) and append it to the fast path's packed arrays. Used
+## only by _build_fast under FULL_COVER for the handful of backstop facets that cannot ride the pre-triangulated memcpy.
+func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int) -> void:
+	_ensure_backstop_cached(fid)
+	var gp := _sunk_positions(_bpos_cache[fid])
+	var gc: PackedColorArray = _bcol_cache[fid]
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			pos.push_back(gp[i0]); pos.push_back(gp[i2]); pos.push_back(gp[i1])
+			pos.push_back(gp[i1]); pos.push_back(gp[i2]); pos.push_back(gp[i3])
+			col.push_back(gc[i0]); col.push_back(gc[i2]); col.push_back(gc[i1])
+			col.push_back(gc[i1]); col.push_back(gc[i2]); col.push_back(gc[i3])
+
+## COSMOS far-ring full coverage (§2/§4): emit facet `fid`'s tri soup into `st`. A backstop facet (under FULL_COVER)
+## emits its DENSE cache with the BACKSTOP_SINK radial push applied per vertex (pre-computed once here via _sunk_positions
+## so a shared grid vertex is not re-normalized per triangle); every other facet emits the shipped CELLS grid verbatim.
+## Pure CPU + const reads only — safe on the async worker thread (no scene-tree / RenderingServer access). `sunk` is
+## decided by the CALLER (live `_is_backstop` on the main-thread sync path; the frozen `_async_backstop` snapshot on the
+## worker) so this function never reads the mutable `_excluded` off-thread.
+func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
+	var pos: PackedVector3Array
+	var col: PackedColorArray
+	var cells := CELLS
+	if sunk:
+		pos = _sunk_positions(_bpos_cache[fid])
+		col = _bcol_cache[fid]
+		cells = CubeSphere.BACKSTOP_CELLS
+	else:
+		pos = _pos_cache[fid]
+		col = _col_cache[fid]
+	var stride := cells + 1
 	var n := 0
-	for gj in range(CELLS):
-		for gi in range(CELLS):
+	for gj in range(cells):
+		for gi in range(cells):
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride

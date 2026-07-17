@@ -52,6 +52,7 @@ docker run --rm \
   -e GODOT_REF="${GODOT_REF}" \
   -e VOXEL_REF="${VOXEL_REF}" \
   -e WEB_PTHREAD_POOL="${WEB_PTHREAD_POOL}" \
+  -e WEB_MALLOC="${WEB_MALLOC}" \
   -e JOBS="${JOBS}" \
   -e SKIP_LINUX="${SKIP_LINUX:-0}" \
   -e SKIP_WEB="${SKIP_WEB:-0}" \

@@ -136,6 +136,11 @@ const CORNER_EDIT_LOCK := true
 var _snowfall: SnowfallSystem
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+# CROSSING-FASTGEN obs-2 fix (3): the EMA'd player speed (blocks/s), measured from the inter-update position delta and
+# consumed ONLY under FP_VEL_PREDICT to lead the imminent promote/commit distances. Computed lazily inside its flag gate
+# in update_streaming, so with the flag off it stays 0 and this is a literal no-op (no behaviour change, no read path).
+var _player_speed: float = 0.0
+var _last_stream_usec: int = -1
 
 # Terrain edit overlay: the gameplay source of truth (floor + raycast + collider +
 # collapse consult it), mirrored into whichever render path runs. This one
@@ -354,6 +359,32 @@ func set_load_controller(c) -> void:
 func stream_load_credit() -> float:
 	return float(_load_ctrl.credit()) if _load_ctrl != null else 1.0
 
+## CROSSING-FASTGEN obs-2 fix (4) — telemetry-only accessor: the controller's setpoint/floor/overload trace so the
+## remote bridge can emit "adaptive off" vs "on but genuinely over setpoint" directly. Empty when there is no controller
+## (flag-off / fallback). Read-only — no frame behaviour changes. See StreamLoadController.stats().
+func stream_load_stats() -> Dictionary:
+	return (_load_ctrl.stats() as Dictionary) if _load_ctrl != null else {}
+
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation) — godot_voxel's own per-_process timing
+## breakdown, forwarded from the module path (see ModuleWorld.terrain_main_thread_stats). Empty on the
+## GDScript fallback path / before setup. Telemetry-only; read-only; no frame behaviour changes.
+## STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §7 row T1) — the generator's per-class block
+## histogram, forwarded from the module path (see ModuleWorld.gen_class_stats). Empty on the GDScript
+## fallback path / before setup. Telemetry-only; read-only; no frame behaviour changes.
+func gen_class_stats() -> Dictionary:
+	if _module_world != null and _module_world.has_method("gen_class_stats"):
+		var d = _module_world.call("gen_class_stats")
+		if d is Dictionary:
+			return d as Dictionary
+	return {}
+
+func terrain_main_thread_stats() -> Dictionary:
+	if _module_world != null and _module_world.has_method("terrain_main_thread_stats"):
+		var d = _module_world.call("terrain_main_thread_stats")
+		if d is Dictionary:
+			return d as Dictionary
+	return {}
+
 func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
 	_streamer.name = "ChunkStreamer"
@@ -561,6 +592,20 @@ func update_streaming(player_pos: Vector3) -> void:
 		_streamer.update_center(player_pos)
 	if _ground != null:
 		_ground.update(player_pos)
+	# CROSSING-FASTGEN obs-2 fix (3): measure the player speed for velocity-aware predictive streaming, BEFORE the
+	# _last_player_pos latch below overwrites the previous sample. Read-only w.r.t. every existing structure; wholly
+	# inside its flag gate so with FP_VEL_PREDICT off it never runs and _player_speed stays 0 (byte-identical). A
+	# per-update speed above VEL_PREDICT_SPEED_CLAMP is a crossing/flip position discontinuity (a relocation, not
+	# motion) → rejected; otherwise EMA-smoothed so a single frame never swings the promote/commit lead.
+	if CubeSphere.FP_VEL_PREDICT:
+		var now_usec := Time.get_ticks_usec()
+		if _have_player_pos and _last_stream_usec >= 0:
+			var dt := float(now_usec - _last_stream_usec) / 1.0e6
+			if dt > 0.0:
+				var sp := player_pos.distance_to(_last_player_pos) / dt
+				if sp < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
+					_player_speed = lerpf(_player_speed, sp, 0.3)
+		_last_stream_usec = now_usec
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
@@ -1888,15 +1933,19 @@ func _manage_pool_fp1c(want: Dictionary) -> bool:
 func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -> bool:
 	var live_now: Array = (_module_world.call("pool_neighbour_fids") as Array)
 	var off_surface := _pool_off_surface(active, player_pos)
-	var targets := z1_live_targets(want, off_surface, live_now)
+	# CROSSING-FASTGEN obs-2 fix (3): pass the measured player speed so the imminent-select D_WARM shell leads with
+	# velocity (vel_lead ≡ 0 with FP_VEL_PREDICT off → the shell is exactly POOL_D_WARM, byte-identical).
+	var targets := z1_live_targets(want, off_surface, live_now, _player_speed)
 	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
 	# so its pool-ramp slot is pace-floored, its LOD stays budgeted through relief mode, and demote never coarsens it.
 	if _module_world != null and _module_world.has_method("set_imminent_fid"):
 		var imm_fid: int = int(targets[0]) if targets.size() > 0 else -1
 		# CROSSING-JERKINESS FIX: mark the imminent COMMITTED once its ridge is within POOL_D_COMMIT (the same geometric
 		# gate promote_admit_imminent uses) so the module ramps it to full res at FULL pace before the seam, converting
-		# the post-crossing 96→128 fill burst into an approach-spread trickle.
-		var imm_committed: bool = imm_fid >= 0 and float(want.get(imm_fid, 1.0e30)) < CubeSphere.POOL_D_COMMIT
+		# the post-crossing 96→128 fill burst into an approach-spread trickle. CROSSING-FASTGEN obs-2 fix (3): the commit
+		# distance gains a speed-proportional lead (vel_lead ≡ 0 with FP_VEL_PREDICT off → byte-identical) so a fast
+		# player commits — hence ramps to full pace — EARLIER, giving the extra annulus more approach time to spread.
+		var imm_committed: bool = imm_fid >= 0 and float(want.get(imm_fid, 1.0e30)) < CubeSphere.POOL_D_COMMIT + CubeSphere.vel_lead(_player_speed)
 		_module_world.call("set_imminent_fid", imm_fid, imm_committed)
 	var now := Time.get_ticks_msec()
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
@@ -1914,7 +1963,7 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 				continue
 			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
 				break
-			var admitted: bool = promote_admit_imminent(_load_ctrl, float(want.get(t, 1.0e30))) if idx == 0 else promote_admit(_load_ctrl)
+			var admitted: bool = promote_admit_imminent(_load_ctrl, float(want.get(t, 1.0e30)), _player_speed) if idx == 0 else promote_admit(_load_ctrl)
 			if not admitted:
 				continue
 			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
@@ -1957,13 +2006,18 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 ## the nearest ridge under D_WARM, BUT an already-live incumbent is kept unless a challenger beats it by POOL_SWITCH_MARGIN
 ## (anti-thrash). Plus a corner-second = the nearest OTHER ridge under POOL_D_WARM2, capped at FP2_LIVE_CAP. Every
 ## returned fid is present in `want` (edge-only), so a diagonal — never in `want` — can never be a live target.
-static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array) -> Array:
+## CROSSING-FASTGEN obs-2 fix (3): `speed` (blocks/s, default 0) widens the imminent-select shell by vel_lead(speed) so a
+## fast player selects the crossing-target facet earlier. Default 0 + FP_VEL_PREDICT off ⇒ vel_lead ≡ 0 ⇒ shell is exactly
+## POOL_D_WARM, byte-identical, and the headless gates (which pass 3 args) are unaffected. The corner-second D_WARM2 shell
+## is deliberately NOT led — the extra corner volume stays gated on the tighter shipped shell (conservative, NEVER-OOM).
+static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array, speed: float = 0.0) -> Array:
 	var out: Array = []
 	if off_surface:
 		return out
+	var warm := CubeSphere.POOL_D_WARM + CubeSphere.vel_lead(speed)
 	var arr: Array = []
 	for nb in want.keys():
-		if float(want[nb]) < CubeSphere.POOL_D_WARM:
+		if float(want[nb]) < warm:
 			arr.append([float(want[nb]), int(nb)])
 	if arr.is_empty():
 		return out
@@ -2006,10 +2060,13 @@ static func promote_admit(ctrl) -> bool:
 ## A pinned-0 credit (the live starvation, §1) can no longer VETO the imminent live invariant (§3.2) — only pace WHEN it
 ## starts within the politeness window. null controller (flag-off / no source) → always admit (shipped FP-M1c). Static so
 ## G-M2-POLICY / G-M2-STARVE assert both the headroom path (out-of-commit distance) and the geometric commit at credit 0.
-static func promote_admit_imminent(ctrl, ridge_dist: float) -> bool:
+## CROSSING-FASTGEN obs-2 fix (3): `speed` (blocks/s, default 0) leads the geometric commit band by vel_lead(speed) so a
+## fast player commits the crossing earlier. Default 0 + FP_VEL_PREDICT off ⇒ vel_lead ≡ 0 ⇒ the band is exactly
+## POOL_D_COMMIT, byte-identical, and the G-M2 gates (which pass 2 args) are unaffected.
+static func promote_admit_imminent(ctrl, ridge_dist: float, speed: float = 0.0) -> bool:
 	if ctrl == null:
 		return true
-	return bool(ctrl.promote_imminent_admitted()) or ridge_dist < CubeSphere.POOL_D_COMMIT
+	return bool(ctrl.promote_imminent_admitted()) or ridge_dist < CubeSphere.POOL_D_COMMIT + CubeSphere.vel_lead(speed)
 
 ## FP-M2d (risk #6, §10) — off-surface spawn freeze: a HIGH FLYER (altitude above the active facet plane > OFFSURFACE_Y)
 ## whose radial direction has drifted over a DIFFERENT facet should not thrash the pool by skimming ridges. Returns true

@@ -9,6 +9,11 @@ const SKY_COLOR := Color(0.62, 0.74, 0.86)
 
 var _player: Player
 
+# COSMOS ORBITAL O0 (CubeSphere.ORBITAL_SKY): the celestial clock (advanced each frame) and the sky
+# node it drives. Both stay null when the flag is off → no cost, byte-identical to the shipped game.
+var _cosmos_clock: CosmosEphemeris.CosmosClock = null
+var _cosmos_sky: CosmosSky = null
+
 func _ready() -> void:
 	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
 	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
@@ -63,6 +68,20 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
+
+	# COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0): the living sky. Behind
+	# CubeSphere.ORBITAL_SKY (default OFF → this block is skipped and the shipped flat-ambient
+	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp
+	# (day-night), placing the Sun light + Sun/Moon impostors + star dome from the pure ephemeris; the
+	# clock is advanced in _process (below). The player is the parallax-free camera provider.
+	if CubeSphere.ORBITAL_SKY:
+		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
+		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
+		var env: Environment = we.environment if we != null else null
+		_cosmos_sky = CosmosSky.new()
+		_cosmos_sky.name = "CosmosSky"
+		add_child(_cosmos_sky)
+		_cosmos_sky.setup(_cosmos_clock, env, player)
 
 	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
 	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
@@ -126,6 +145,11 @@ func _ready() -> void:
 ## Feed the camera position into the bend-origin global uniform each frame (curved mode only).
 ## The bend is continuous around the camera (§3.4), so walking simply rolls the world under you.
 func _process(_delta: float) -> void:
+	# COSMOS ORBITAL O0: advance the celestial clock every frame (independent of the render path). The
+	# sky moves 72× via the scaled GM; CosmosSky reads this clock in its own _process. Null (flag off)
+	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
+	if _cosmos_clock != null:
+		_cosmos_clock.advance(_delta)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin

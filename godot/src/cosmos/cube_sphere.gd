@@ -118,6 +118,77 @@ const FP_M2_LOD := false
 ## G-M2-ID stays module==module). LOD0 only. Independent of FACETED; the ridge guard self-disables when flat.
 const FP_BULK_UNDERGROUND := false
 
+## COSMOS STREAM-SCHED R1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.3-§2.4 / §9.2) — COLUMN-granular bulk fill.
+## FP_BULK_UNDERGROUND above qualifies on the WHOLE BOX (by_top <= min_h − 12), so every block under ROUGH
+## terrain fails its min_h gate and pays the full 4096-cell per-cell pass (~13.7 ms native, ~10× on web) —
+## §2.3 measures that gate-failed class as the largest recoverable term left in the generator. R1 moves the
+## same gate INSIDE the emit loop, per column: each column's provably-deep run (below its OWN g − 12) is
+## fill_area'd with stone/deepslate, its exact band (g−12 .. surface) stays per-cell and BYTE-EXACT, and the
+## air above its content ceiling is skipped (R1b). slope_run_of is computed only for columns that still need
+## a resolve_cell. Same appearance class as FP_BULK_UNDERGROUND — and no wider: the loss stays the interior
+## ore/strata VARIANTS of cells >12 deep (invisible until dug; block_id_at → resolve_cell reads TerrainConfig,
+## never this buffer, so physics + the dropped block stay ground truth). The −24..−16 deepslate dither rows and
+## any row below −59 (bedrock) stay PER-CELL, so no dithered/bedrock cell is ever guessed.
+## Independent of FP_BULK_UNDERGROUND (both may run; the whole-block fill wins when it qualifies). LOD0 + flat
+## branch only. FACETED: v1 applies column bulk only when the WHOLE block is interior to all four ridges
+## (the same cell_interior_scaled gate the whole-block fill uses) — ridge straddlers stay fully per-cell.
+## Default OFF → the emit loop is textually the shipped per-cell path (FLAT verify pin 6035/0 stays).
+## Truth gate: src/tools/verify_colbulk.gd (run with this flag sed-toggled true).
+## NOTE (shared with FP_BULK_UNDERGROUND): both gates assume nothing but stone/deepslate/strata/ore exists
+## below a column's biome filler. Any FUTURE deep carver (caves, dungeons) must update BOTH gates together.
+const FP_COLBULK := false
+
+## COSMOS STREAM-SCHED R7 (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.5 / §9.6) — the gather→scatter inversion
+## that makes FP_COLBULK's bulk fill LOSSLESS. FP_COLBULK's deep fill_area writes plain stone/deepslate,
+## flattening the interior strata/ore VARIANTS — an accepted loss, but one that costs it the FLAT gate
+## (verify_feature's coast/TYPE tests are strict truth-mirrors of TerrainConfig.generated_cell over EVERY
+## non-air cell, so any bulk fill fails them by construction). R7 puts the variants back: instead of asking
+## all 4096 cells "is a blob here?" (the GATHER), it enumerates the handful of blobs that can reach the
+## block and stamps them (the SCATTER). Exact and local because a blob is confined to its lattice cell
+## (see TerrainConfig.strata_blob), so the only blobs that can touch a block live in the lattice cells
+## overlapping it — 1-8 strata cells (16³ pitch) and ~27-64 ore cells (6³ pitch, ~45% populated).
+## The output is byte-identical to the per-cell path BY SHARED CONSTRUCTION: both paths derive every blob
+## parameter from the same TerrainConfig statics (strata_blob / strata_variant_of / ore_blob /
+## ore_pick_for / ore_apply / deep_family_at), so they cannot drift. With FP_COLBULK + FP_STAMP the
+## generator is EXACT — no appearance loss and no gate carve-out (FLAT reads 6035/0).
+## Requires FP_COLBULK (it stamps that flag's deep runs, and only the cells those runs actually wrote —
+## the −24..−16 dither rows and the sub-−59 bedrock rows are per-cell already and are never stamped).
+## Does NOT cover FP_BULK_UNDERGROUND's whole-block fill, which returns before the stamp pass and keeps
+## its own accepted loss. Default OFF → not a byte of the generator changes (FLAT pin 6035/0 stays).
+## Truth gate: src/tools/verify_stamp.gd — a HARD cell-for-cell equality assert (fill+stamp == per-cell)
+## over blocks spanning surface/deep/coast/mountain/deepslate-band/bedrock, not a lossy-appearance oracle.
+const FP_STAMP := false
+
+## COSMOS L5(a) — THE C++ WORLDGEN PORT (docs/COSMOS-STREAM-SCHED-DESIGN.md §2.6). When true (AND the patched
+## module binary is present — ClassDB.class_exists("VoxelGeneratorCosmos")), module_world installs the compiled
+## VoxelGeneratorCosmos (engine patch 0007) instead of the runtime-compiled GDScript generator.
+##
+## WHY: measured live 2026-07-17, 97% of ALL block-generation time sits in two per-cell classes that are
+## INTERPRETER-bound, not algorithm-bound — underground gate-failed 337.7 ms/block and surface-crossing
+## 559.8 ms/block, against a 13.7 ms native twin (a ~×25 WASM/GDScript multiplier, not the ×10 long assumed).
+## Supply 23-35 blocks/s vs walking demand ~90-100 blocks/s: supply < demand ALWAYS, and that gap IS the
+## freezes. Every script-side lever was built and measured out — R1 column-bulk + R7 blob-stamp are CORRECT
+## and byte-identical yet moved M4 only −13% (the profile pass and loop mechanics still carry the full VM
+## tax). No script-side transformation removes a multiplier; only compilation does.
+##
+## THE ONE-SAMPLER LAW (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §7.1) — the architectural constraint, and NOT
+## the "C++ renders, GDScript answers queries" split it is tempting to assume. That split would institutionalise
+## a BIFURCATION: C++ for voxel workers while analytic physics (block_id_at → resolve_cell), the skin tier, the
+## far ring (facet_far_ring.gd:390,434) and the LOD builder keep calling GDScript. Two implementations of
+## resolve_cell/column_profile maintained in parallel WILL drift, and a drift between the physics oracle and the
+## rendered mesh is WORSE than a seam — it is the float-through/fall-through class this project already fought.
+## So VoxelGeneratorCosmos is THE worldgen implementation and must be able to serve the query path too (§7.2
+## exposes sample_columns + scalar column_profile/resolve_cell for exactly that); the GDScript twin is retained
+## permanently as the byte-equality ORACLE, never as a live second path. Today the law holds because everything
+## funnels through TerrainConfig.profile_at_dir/facet_profile/resolve_cell — the port must INHERIT that choke
+## point, not break it. Byte-equality is therefore the whole argument that every tier and the physics oracle
+## agree. Default OFF → the C++ class is never instantiated → the GDScript generator is untouched, FLAT 6035/0.
+## Truth gate: src/tools/verify_cppgen.gd — an N-block cell-for-cell equality assert (C++ buffer == GDScript
+## buffer) over blocks spanning biomes, depth bands, ridges/seams, coasts/liquid and tree stencils. The gate is
+## the oracle: it is proven able to FAIL (a deliberately perturbed C++ path must be caught) and is never
+## weakened to make the port pass.
+const FP_CPPGEN := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB
@@ -198,6 +269,24 @@ const FP_FARRING_FAST_REBUILD := false
 ## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
 const FP_FARRING_ASYNC_REBUILD := false
 
+## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
+## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
+## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe
+## (the annular hole). When true (requires FACETED), the ring draws ALL front-hemisphere facets INCLUDING the active +
+## `_excluded` set; those "backstop" facets are emitted sunk radially inward by BACKSTOP_SINK blocks at the denser
+## BACKSTOP_CELLS resolution, so the opaque near voxels overdraw them with no z-fight and no poke-through (§2–§3). The
+## back-hemisphere cull (BACK_CULL) is UNCHANGED. Default OFF → `_front_visible` excludes active+`_excluded` exactly as
+## today, no backstop cache is ever populated, FLAT stays byte-identical (6035/0). Flipped ON at export after the live A/B.
+const FP_FARRING_FULL_COVER := false
+## Backstop tuning (§3). BACKSTOP_SINK: blocks the backstop facets are pushed radially inward, so they sit strictly
+## behind the near blocky surface (clears facet chord sagitta + relief quantization + the residual flank dip). BACKSTOP_CELLS:
+## the backstop-facet heightmap resolution (vs the shipped CELLS=4 for non-backstop facets) — denser cells shrink the
+## between-sample chord error so a coarse triangle cannot stab up through fine mountain terrain. G-FRC-NOPOKE is the tuning
+## oracle: if a mountain-foothill spawn pokes, raise BACKSTOP_CELLS to 32 (cell ≈ 6 blocks) before raising the sink, so the
+## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
+const BACKSTOP_SINK := 6.0
+const BACKSTOP_CELLS := 16
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with
@@ -257,7 +346,12 @@ const POOL_D_COMMIT := 64.0
 const FP_CTRL_ADAPTIVE := false
 const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
 const CTRL_FLOOR_PCTL := 0.1             # p10 — the client's achievable floor (robust to short hitch trains)
-const CTRL_ADAPTIVE_MARGIN := 1.3        # setpoint = floor_p10 × this (overload ⇔ ~30% worse than the client's floor)
+# CROSSING-FASTGEN obs-2 fix (1) — UN-PIN THE CONTROLLER. The margin was 1.3 → setpoint ≈ floor_p10×1.3 ≈ 22.8 ms, which
+# the client's own frame exceeds in 52% of windows → credit stays pinned 0 → the imminent promotes only via the geometric
+# D_COMMIT fallback (~3.4 s less gen lead). Raising it to 2.0 floats the setpoint above the client's steady frame so credit
+# recovers and the imminent promotes at D_WARM. Only consumed when the setpoint is adaptive (`_adaptive`, defaulting to
+# FP_CTRL_ADAPTIVE, default OFF) — so the flag-OFF absolute-setpoint path is byte-identical; this is the FLAGGED value.
+const CTRL_ADAPTIVE_MARGIN := 2.0        # setpoint = floor_p10 × this (overload ⇔ ~2× worse than the client's floor)
 const CTRL_ADAPTIVE_MAX_MS := 45.0       # setpoint upper clamp (never tolerate worse than ~22 fps as "not overload")
 
 ## COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7) — the fixed absolute render-frame keystone
@@ -301,6 +395,39 @@ const POOL_CROSSING_PREGEN := true
 ## the default 128 the crossing's 96→128 fill fully disappears. Consulted only under POOL_CROSSING_PREGEN + fixed frame.
 const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
 
+## CROSSING-FASTGEN obs-2 fix (2) — LOWER PREFILL. When on, the committed imminent slot is pre-grown to 112 instead of
+## 128 blocks: a STRICT byte reduction (imminent live volume ~40 → ~30 MB) that also shrinks the approach vox_gen backlog,
+## for the cost of a thin 112→128 annulus that stays hidden behind fog / the curved far-ring (and is filled at the seam
+## by the ordinary neighbour ramp). Default OFF → 128 == today (`imminent_prefill_blocks()` returns the base const). NEVER-
+## OOM: strictly reduces resident bytes. Flipped ON at export A/B (the sed-at-export pattern) alongside FP_CTRL_ADAPTIVE.
+const FP_PREFILL_112 := false
+const POOL_IMMINENT_PREFILL_BLOCKS_LOW := 112.0
+
+## CROSSING-FASTGEN obs-2 fix (3) — VELOCITY-AWARE PREDICTIVE STREAMING. When on, the imminent promote/commit distances
+## (POOL_D_WARM select + POOL_D_COMMIT geometric commit) gain a speed-proportional lead `+ min(K·|v|, MAX_ADD)` so a fast
+## player promotes/commits the crossing-target facet EARLIER in TIME (more gen lead before the seam). Memory behaviour is
+## unchanged — the live cap (FP2_LIVE_CAP=2: imminent + corner-second) is untouched, only the TIMING of the transitions
+## shifts; and the lead is clamped so the effective D_WARM never exceeds the near render radius (128). Default OFF →
+## vel_lead() ≡ 0 → the effective distances are the base consts, byte-identical. The `speed` param on the policy statics
+## defaults to 0, so the headless gates (which pass no speed) are unaffected even with the flag on. Flipped ON at export.
+const FP_VEL_PREDICT := false
+const VEL_PREDICT_K := 2.0               # blocks of extra promote/commit lead per (block/s) of player speed
+const VEL_PREDICT_MAX_ADD := 32.0        # ceiling on the additive lead — bounds effective D_WARM ≤ 96+32 = 128 (near radius)
+const VEL_PREDICT_SPEED_CLAMP := 40.0    # reject a per-update speed above this as a crossing/flip discontinuity, not motion
+
+## CROSSING-FASTGEN obs-2 fix (2): the pre-grow radius for the committed imminent slot — 112 under FP_PREFILL_112, else the
+## shipped 128. Static so both module_world consumers (set_imminent_fid, pool_spawn) share one gate; OFF == the base const.
+static func imminent_prefill_blocks() -> float:
+	return POOL_IMMINENT_PREFILL_BLOCKS_LOW if FP_PREFILL_112 else POOL_IMMINENT_PREFILL_BLOCKS
+
+## CROSSING-FASTGEN obs-2 fix (3): the speed-proportional promote/commit lead (blocks). Zero when FP_VEL_PREDICT is off →
+## every effective distance collapses to its base const (byte-identical). Clamped to VEL_PREDICT_MAX_ADD so the effective
+## D_WARM/D_COMMIT stay inside the near render radius (NEVER-OOM: the live-facet count/cap is unchanged — only timing).
+static func vel_lead(speed: float) -> float:
+	if not FP_VEL_PREDICT:
+		return 0.0
+	return minf(VEL_PREDICT_K * maxf(speed, 0.0), VEL_PREDICT_MAX_ADD)
+
 ## CROSSING-JERKINESS FIX (3-agent root-cause 2026-07-16) — the committed imminent slot's view-ramp pace FLOOR. The
 ## shipped build floored it at CTRL_RELIEF_FLOOR (0.25 → ~6 s to fill 96→128, LONGER than a facet traversal → the
 ## residual fill BURSTS at the seam = the post-crossing mesh-upload spike the player feels as a jerk). Once the crossing
@@ -309,6 +436,16 @@ const POOL_IMMINENT_PREFILL_BLOCKS := 128.0
 ## seam, so the committed imminent ramps at this pace instead. Memory-NEUTRAL (same view_target; only the fill RATE
 ## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
 const CTRL_IMMINENT_COMMIT_PACE := 1.0
+
+## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
+## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
+## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a
+## living sky (spin/orbit expressed by MOVING THE SKY, never the pinned voxel planet — §4.1). O0 is
+## pure sky: NO gameplay/physics change, O(few) reused nodes, no per-frame allocation (NEVER-OOM).
+## Default OFF → main._setup_environment's shipped flat-ambient look is byte-identical and NO sky node
+## is added; the FLAT gate stays green. The CosmosEphemeris/DVecF64 kernels are pure statics — DEAD
+## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
+const ORBITAL_SKY := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

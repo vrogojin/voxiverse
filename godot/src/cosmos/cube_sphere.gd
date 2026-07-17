@@ -287,6 +287,16 @@ const FP_FARRING_FULL_COVER := false
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
 
+## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
+## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
+## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles
+## built from VoxelGeneratorCosmos.sample_columns (§7.2 item 2) — exact 1-block silhouette, SUNK SKIN blocks so
+## the near voxels strictly overdraw it and it overdraws the backstop (overlap + shared sampling + sink, no fade).
+## Requires FACETED (flat has no atlas). Default OFF → WorldManager never creates the node, FLAT stays byte-identical
+## (6035/0). Flipped ON at export after the live A/B. HARD 8 MB ceiling (FacetSkinTier.MAX_BYTES) — evict-farthest,
+## never grow. CDLOD morph / pitch-2..8 extension rings / tree impostors are LATER stages, not built here.
+const FP_SKIN_TIER := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

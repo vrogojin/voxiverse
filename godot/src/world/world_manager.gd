@@ -4,6 +4,9 @@ extends Node3D
 # FP-FIXED-FRAME: preload the FrameAdapter (not the global class_name) so this always-parsed core script never
 # depends on the stale editor class-cache (the same convention as FLM/FLB in verify_fp_m2). Used as a type below.
 const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
+# COSMOS SEAMLESS-SCALES C3: preload the skin tier (not the class_name) for the same reason as _FrameAdapterCls —
+# this always-parsed core must not depend on the editor class-cache. DEAD unless CubeSphere.FP_SKIN_TIER.
+const _SkinTierCls := preload("res://src/world/facet_skin_tier.gd")
 ## Owns "the world": picks the rendering path, drives streaming, and exposes the
 ## analytic queries (solidity, surface height, voxel raycast) that the player and
 ## HUD use regardless of path. Also holds the decoupled sim layer (material
@@ -64,6 +67,7 @@ var _player_abs_max: float = 0.0
 var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resync (fixed-frame only, §10 decision 2)
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -248,6 +252,17 @@ func _ready() -> void:
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near
+		# voxels and the far-ring backstop. Gated on FP_SKIN_TIER (default OFF → node never created →
+		# byte-identical). Peer node placed like the far ring; driven from update_streaming/crossing/reanchor.
+		# LIVE-LOOP NOTE: node + gates are validated headless; the live per-frame scheduling frame-math is
+		# pending the AM real-GPU validation pass (the flag stays OFF until then).
+		if CubeSphere.FP_SKIN_TIER:
+			var afid := TerrainConfig.active_facet()
+			_skin = _SkinTierCls.new()
+			_skin.name = "FacetSkinTier"
+			add_child(_skin)
+			_skin.call("setup", afid)
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -610,6 +625,11 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
+	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
+	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
+	if _skin != null:
+		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
@@ -1687,6 +1707,9 @@ func _apply_anchor_shift(a: Vector3) -> void:
 	# 2. Far ring (its mesh is ABSOLUTE) rides the same shift; the offset survives crossings (set_active folds it in).
 	if _facet_ring != null and _facet_ring.has_method("shift_anchor"):
 		_facet_ring.shift_anchor(a)
+	# 2b. Skin tier (its mesh is ABSOLUTE too) rides the same shift, exactly like the far ring.
+	if _skin != null:
+		_skin.call("shift_anchor", a)
 	# 3. ActiveFrame origin drops by a (basis unchanged); player/GroundCollider/debris/viewer keep their lattice locals.
 	if _active_frame != null:
 		_active_frame.position -= a
@@ -1785,6 +1808,8 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 				if _facet_ring != null:
 					_facet_ring.set_active(to)
 					_facet_ring_sync_exclusion()
+				if _skin != null:
+					_skin.call("set_active", to)
 				_far_us = Time.get_ticks_usec() - _far_t0
 			else:
 				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
@@ -1794,6 +1819,8 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 					_module_world.call("set_facet", to, old_mod_pos)
 				if _facet_ring != null:
 					_facet_ring.set_active(to)
+				if _skin != null:
+					_skin.call("set_active", to)
 				_flip_settling = true
 				_restream()
 			# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
@@ -2124,6 +2151,17 @@ func _facet_ring_sync_exclusion() -> void:
 			if not excluded.has(f):
 				excluded.append(f)
 	_facet_ring.set_pool_excluded(excluded)
+
+## COSMOS SEAMLESS-SCALES C3: the facets the skin should cover — the active facet plus the live-pool
+## neighbours (the front-hemisphere facets the near disc/annulus can reach). Mirrors the far ring's
+## excluded set so the skin and the pool cover the same facets.
+func _skin_candidate_fids() -> PackedInt32Array:
+	var out := PackedInt32Array([TerrainConfig.active_facet()])
+	if _module_world != null and _module_world.has_method("pool_neighbour_fids"):
+		for f in (_module_world.call("pool_neighbour_fids") as Array):
+			if not out.has(int(f)):
+				out.append(int(f))
+	return out
 
 ## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
 func pool_miss_count() -> int:

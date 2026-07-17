@@ -134,6 +134,23 @@ var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hu
 var _win_acc := 0.0
 var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
+
+# MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
+# godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
+# WHY MAXIMA, POLLED EVERY FRAME: a telemetry window is 250 ms ≈ 15 frames and the hitch is BURSTY —
+# sampling the stats once at send time would almost always miss the one bad frame and read ~0, which is
+# exactly the false-negative that would "prove" the wrong conclusion. We poll every frame and keep the
+# worst, so vt_total_max is directly comparable against worst_ms for the SAME window: if
+# vt_total_max << worst_ms, the streaming hitch is NOT inside VoxelTerrain::_process at all.
+var _win_vt_detect := 0             # usec, max: time_detect_required_blocks
+var _win_vt_req_load := 0           # usec, max: time_request_blocks_to_load
+var _win_vt_load_resp := 0          # usec, max: time_process_load_responses (the APPLY path)
+var _win_vt_req_upd := 0            # usec, max: time_request_blocks_to_update
+var _win_vt_total := 0              # usec, max of the per-frame SUM of the four (time in _process)
+var _win_vt_dropped_loads := 0      # max seen (counters are cumulative-ish per frame in godot_voxel)
+var _win_vt_dropped_meshs := 0
+var _win_vt_updated := 0            # max updated_blocks in one frame (apply burst size)
+var _win_vt_seen := false           # any sample at all this window (module path present)
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
 var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
@@ -321,6 +338,7 @@ func _process(delta: float) -> void:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
+	_poll_voxel_main_thread_stats()
 	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
 	if not _post_cross.is_empty():
 		_update_post_cross(now_usec, real_delta)
@@ -423,6 +441,33 @@ func _engine_version() -> String:
 	return s
 
 
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation): sample godot_voxel's per-_process timing
+## breakdown ONCE PER FRAME and keep the window maxima. Called from _process before any early return so
+## the sample set covers every frame in the window (including the hitching one — the whole point).
+## Read-only + fully guarded: no world / fallback path / missing method ⇒ silently no-ops.
+func _poll_voxel_main_thread_stats() -> void:
+	if not is_instance_valid(world) or not world.has_method("terrain_main_thread_stats"):
+		return
+	var d = world.call("terrain_main_thread_stats")
+	if not (d is Dictionary) or (d as Dictionary).is_empty():
+		return
+	var s := d as Dictionary
+	_win_vt_seen = true
+	var detect := int(s.get("time_detect_required_blocks", 0))
+	var req_load := int(s.get("time_request_blocks_to_load", 0))
+	var load_resp := int(s.get("time_process_load_responses", 0))
+	var req_upd := int(s.get("time_request_blocks_to_update", 0))
+	var total := detect + req_load + load_resp + req_upd
+	_win_vt_detect = maxi(_win_vt_detect, detect)
+	_win_vt_req_load = maxi(_win_vt_req_load, req_load)
+	_win_vt_load_resp = maxi(_win_vt_load_resp, load_resp)
+	_win_vt_req_upd = maxi(_win_vt_req_upd, req_upd)
+	_win_vt_total = maxi(_win_vt_total, total)
+	_win_vt_dropped_loads = maxi(_win_vt_dropped_loads, int(s.get("dropped_block_loads", 0)))
+	_win_vt_dropped_meshs = maxi(_win_vt_dropped_meshs, int(s.get("dropped_block_meshs", 0)))
+	_win_vt_updated = maxi(_win_vt_updated, int(s.get("updated_blocks", 0)))
+
+
 func _send_telemetry() -> void:
 	# Window stats (fps + worst frame over the just-elapsed window), then reset the window.
 	var fps := (float(_win_frames) / _win_acc) if _win_acc > 0.0 else 0.0
@@ -432,6 +477,33 @@ func _send_telemetry() -> void:
 	_win_acc = 0.0
 	_win_frames = 0
 	_win_worst = 0.0
+
+	# MAIN-THREAD BREAKDOWN: latch + reset this window's maxima (ms, 0.01 precision). vt_total is the
+	# headline: compare it against worst_ms for the SAME window. vt_total ≈ worst_ms ⇒ the hitch IS
+	# VoxelTerrain::_process (and vt_load_resp says whether it is the apply path); vt_total << worst_ms
+	# ⇒ the hitch is OUTSIDE _process entirely (render / GPU upload / elsewhere) and the streaming-
+	# throughput framing is aimed at the wrong term.
+	var vt: Dictionary = {}
+	if _win_vt_seen:
+		vt = {
+			"vt_total_ms": snappedf(float(_win_vt_total) / 1000.0, 0.01),
+			"vt_load_resp_ms": snappedf(float(_win_vt_load_resp) / 1000.0, 0.01),
+			"vt_detect_ms": snappedf(float(_win_vt_detect) / 1000.0, 0.01),
+			"vt_req_load_ms": snappedf(float(_win_vt_req_load) / 1000.0, 0.01),
+			"vt_req_upd_ms": snappedf(float(_win_vt_req_upd) / 1000.0, 0.01),
+			"vt_updated_max": _win_vt_updated,
+			"vt_dropped_loads": _win_vt_dropped_loads,
+			"vt_dropped_meshs": _win_vt_dropped_meshs,
+		}
+	_win_vt_detect = 0
+	_win_vt_req_load = 0
+	_win_vt_load_resp = 0
+	_win_vt_req_upd = 0
+	_win_vt_total = 0
+	_win_vt_dropped_loads = 0
+	_win_vt_dropped_meshs = 0
+	_win_vt_updated = 0
+	_win_vt_seen = false
 
 	# godot_voxel worker backlog (perf_hud.gd reads the TASK counts — memory_pools.block_count lies).
 	var vox_gen := 0
@@ -465,6 +537,9 @@ func _send_telemetry() -> void:
 		"vox_main": vox_main,
 		"vox_gpu": vox_gpu,
 	}
+	# MAIN-THREAD BREAKDOWN: fold in this window's VoxelTerrain::_process maxima (omitted entirely on the
+	# fallback path / before setup, so a missing key means "no module terrain", never "measured zero").
+	msg.merge(vt)
 	_merge_rich_state(msg)
 
 	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these

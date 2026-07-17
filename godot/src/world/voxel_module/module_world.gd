@@ -1979,6 +1979,20 @@ func pool_has(fid: int) -> bool:
 	return _pool.has(fid)
 func pool_active() -> int:
 	return _pool_active
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17). VoxelTerrain::_b_get_statistics
+## (voxel_terrain.cpp:603) returns godot_voxel's OWN "breakdown of time spent in _process" — the four
+## time_* fields are MAIN-THREAD microseconds per _process call, plus the drop/update counters. This is
+## the only way to localise the streaming hitch: live telemetry shows worst_ms 117-136 ms whenever
+## vox_gen > 0 (even STANDING STILL) while the mesh/apply queues read 0 — so either that main-thread
+## cost lives inside VoxelTerrain::_process (these fields will show it) or it lives OUTSIDE it (they
+## will all be small, and the hitch is render/upload — a completely different fix). Telemetry-only,
+## read-only, no behaviour change; guarded so a missing method/terrain simply yields {}.
+func terrain_main_thread_stats() -> Dictionary:
+	if _terrain == null or not _terrain.has_method("get_statistics"):
+		return {}
+	var d = _terrain.call("get_statistics")
+	return (d as Dictionary) if d is Dictionary else {}
+
 func pool_neighbour_count() -> int:
 	return maxi(0, _pool.size() - (1 if _pool.has(_pool_active) else 0))
 ## Every LIVE facet id in the pool (active + neighbours) — the far-ring excluded set + the gate's ≤1+4 cap check.

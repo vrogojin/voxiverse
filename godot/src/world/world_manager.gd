@@ -365,6 +365,16 @@ func stream_load_credit() -> float:
 func stream_load_stats() -> Dictionary:
 	return (_load_ctrl.stats() as Dictionary) if _load_ctrl != null else {}
 
+## MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation) — godot_voxel's own per-_process timing
+## breakdown, forwarded from the module path (see ModuleWorld.terrain_main_thread_stats). Empty on the
+## GDScript fallback path / before setup. Telemetry-only; read-only; no frame behaviour changes.
+func terrain_main_thread_stats() -> Dictionary:
+	if _module_world != null and _module_world.has_method("terrain_main_thread_stats"):
+		var d = _module_world.call("terrain_main_thread_stats")
+		if d is Dictionary:
+			return d as Dictionary
+	return {}
+
 func _setup_fallback_path() -> void:
 	_streamer = ChunkStreamer.new()
 	_streamer.name = "ChunkStreamer"

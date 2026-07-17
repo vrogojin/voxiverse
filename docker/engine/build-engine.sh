@@ -26,6 +26,13 @@ JOBS="${JOBS:-$(nproc)}"
 # (engine patch 0001 defaults the scons option to 8); versions.env pins 16 for FP-M1b.
 WEB_PTHREAD_POOL="${WEB_PTHREAD_POOL:-8}"
 
+# Web WASM malloc implementation baked into the export template. Default dlmalloc = upstream-identical
+# (stock Godot sets no -sMALLOC; engine patch 0002 defaults the scons option to dlmalloc and only appends
+# the flag when it differs). versions.env pins mimalloc: dlmalloc's single global lock is the measured
+# cause of the streaming hitch — workers + main convoy on it and the main thread busy-waits, burning rAF
+# (docs/COSMOS-WALK-PERF-DESIGN.md). Requires emsdk >= 3.1.50 (we pin 3.1.64). Revert: set dlmalloc.
+WEB_MALLOC="${WEB_MALLOC:-dlmalloc}"
+
 WORK=/work
 SRC="${WORK}/godot"
 VOXEL_DIR="${SRC}/modules/voxel"
@@ -152,12 +159,14 @@ MODULE_IN_WEB="unknown"
 
 build_web_templates() {
   # $1 = "release", $2 = scons target
-  log "Web template: scons platform=web target=$2 (production for release, pthread_pool_size=${WEB_PTHREAD_POOL}) ..."
+  log "Web template: scons platform=web target=$2 (production for release, pthread_pool_size=${WEB_PTHREAD_POOL}, malloc=${WEB_MALLOC}) ..."
   local extra=()
   [ "$1" = "release" ] && extra+=(production=yes)
   # pthread_pool_size is the scons option added by engine patch 0001; wires the web
   # PTHREAD_POOL_SIZE from versions.env WEB_PTHREAD_POOL (COSMOS-FP-M1-DESIGN §9.3).
-  scons platform=web target="$2" pthread_pool_size="${WEB_PTHREAD_POOL}" "${extra[@]}" -j"${JOBS}"
+  # malloc is the scons option added by engine patch 0002; wires -sMALLOC from versions.env
+  # WEB_MALLOC (COSMOS-WALK-PERF-DESIGN §4 L2). dlmalloc == stock (flag omitted entirely).
+  scons platform=web target="$2" pthread_pool_size="${WEB_PTHREAD_POOL}" malloc="${WEB_MALLOC}" "${extra[@]}" -j"${JOBS}"
 }
 
 web_build_all() {
@@ -217,6 +226,7 @@ fi
   echo "voxel_patches   :${PATCHES_APPLIED}"
   echo "engine_patches  :${ENGINE_PATCHES_APPLIED}"
   echo "web_pthread_pool: ${WEB_PTHREAD_POOL}"
+  echo "web_malloc      : ${WEB_MALLOC}"
   echo "emcc            : $(emcc --version | head -n1)"
   echo "module_in_web   : ${MODULE_IN_WEB}"
   echo "templates       : $(ls -1 "${OUT}/templates"/*.zip 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"

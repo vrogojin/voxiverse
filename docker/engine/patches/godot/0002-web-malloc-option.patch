@@ -1,0 +1,60 @@
+Make the Web malloc implementation a SCons build option (default dlmalloc, upstream-identical)
+
+Godot 4.4.1 does not set -sMALLOC for the web build, so Emscripten's default (dlmalloc) is
+used. dlmalloc serialises EVERY allocation through a SINGLE GLOBAL LOCK. That is the measured
+root cause of VOXIVERSE's streaming hitch (docs/COSMOS-WALK-PERF-DESIGN.md): our voxel workers
+perform ~500-2000 heap ops per generated block, so N workers + the main thread convoy on that
+one lock. Because a browser main thread may not block in Atomics.wait, a contended lock
+BUSY-WAITS on the main thread, burning the rAF budget.
+
+Measured live on a real GPU (2026-07-17), which is what makes this a diagnosis and not a guess:
+  * all 6 pool threads read ACTIVE on GenerateBlock for an entire drain, yet only ~40 blocks/s
+    come out -- the pool runs at full width and every thread CRAWLS;
+  * phys_ms inflates 4.3 -> 44.5 ms for IDENTICAL physics/movement code purely because workers
+    are busy (the main thread's own unrelated code slows ~10x);
+  * drain-rate vs worst_ms correlates r = -0.47 (bidirectional coupling = a shared serializer,
+    not a one-way bottleneck);
+  * movement itself is FREE (moving with gen<=5 => worst p50 23.4 == standing 23.2);
+  * godot_voxel's own main-thread work is nil (VoxelTerrain _process breakdown 0.02-0.08 ms,
+    apply queue empty) -- so the cost is not meshing, applying, draws, or movement.
+This one mechanism also explains why raising the voxel worker count (FP-M1b, 2 -> 6/10) bought
+nothing: more workers simply add contenders to the convoy.
+
+mimalloc uses per-thread heaps and removes the convoy. Emscripten has shipped it since 3.1.50
+(-sMALLOC=mimalloc); VOXIVERSE pins EMSDK_VERSION=3.1.64, so it is available. Emscripten's own
+benchmarks show dlmalloc ANTI-SCALING with threads while mimalloc restores scaling.
+
+Rather than hard-code the flag (which rots silently against upstream and cannot be A/B'd), it is
+exposed as a SCons option `malloc` defaulting to "dlmalloc" -- byte-identical to stock when unset,
+so this patch is INERT unless build-engine.sh passes malloc=mimalloc from versions.env WEB_MALLOC.
+Revert knob: set WEB_MALLOC=dlmalloc and rebuild (~24 min).
+
+NEVER-OOM note: mimalloc reserves per-thread segments, so the baseline WASM heap is expected to
+grow. This is a memory-costly upgrade and MUST be shipped as a measured deploy-time A/B (peak heap
+via the COSMOS-FP-M2-HEAP-AB harness), and REJECTED if the baseline grows past the ledgered
+ceiling. Memory safety outranks frame time -- that rule is not negotiable for a frame-time win.
+
+diff --git a/platform/web/detect.py b/platform/web/detect.py
+index 8a28eee..f8bc1cd 100644
+--- a/platform/web/detect.py
++++ b/platform/web/detect.py
+@@ -42,6 +42,7 @@ def get_opts():
+         ("stack_size", "WASM stack size (in KiB)", 5120),
+         ("default_pthread_stack_size", "WASM pthread default stack size (in KiB)", 2048),
+         ("pthread_pool_size", "WASM pthread pool size (preallocated Web Workers)", 8),
++        ("malloc", "WASM malloc implementation (dlmalloc|mimalloc|emmalloc)", "dlmalloc"),
+         BoolVariable("use_assertions", "Use Emscripten runtime assertions", False),
+         BoolVariable("use_ubsan", "Use Emscripten undefined behavior sanitizer (UBSAN)", False),
+         BoolVariable("use_asan", "Use Emscripten address sanitizer (ASAN)", False),
+@@ -231,6 +232,11 @@ def configure(env: "SConsEnvironment"):
+         env.Append(LINKFLAGS=["-sUSE_PTHREADS=1"])
+         env.Append(LINKFLAGS=["-sDEFAULT_PTHREAD_STACK_SIZE=%sKB" % env["default_pthread_stack_size"]])
+         env.Append(LINKFLAGS=["-sPTHREAD_POOL_SIZE=%s" % env["pthread_pool_size"]])
++        # VOXIVERSE: the allocator is the threaded-web scaling bottleneck (dlmalloc serialises every
++        # allocation through ONE global lock; workers + main convoy on it and the main thread busy-waits,
++        # burning rAF). Default "dlmalloc" == stock Emscripten behaviour (flag omitted entirely).
++        if env["malloc"] != "dlmalloc":
++            env.Append(LINKFLAGS=["-sMALLOC=%s" % env["malloc"]])
+         env.Append(LINKFLAGS=["-sWASM_MEM_MAX=2048MB"])
+         if not env["dlink_enabled"]:
+             # Workaround https://github.com/emscripten-core/emscripten/issues/21844#issuecomment-2116936414.

@@ -533,6 +533,17 @@ const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital enti
 const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with the controller commit band)
 const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates + pre-warms the landing facet
 
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SPACE-NAV-DESIGN.md §10 / docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.5) —
+## the BORDER-CONTINUITY master flag: the atmosphere↔space border + the climb to orbit render with NO pop. Off
+## ⇒ BYTE-IDENTICAL: the scaled-body clamp is absent (nothing scales — CosmosScale.on() is false so its whole
+## path is DEAD), the camera keeps its shipped near/far (0.05 / FacetFarRing.CAMERA_FAR = 9000), and the far
+## ring retires exactly as today (never at an altitude cutoff). On ⇒ the far ring persists to any altitude under
+## the continuous distance clamp s = min(1, D_ENGAGE/d) placed camera-relative, and the camera near/far ramp
+## with altitude (CosmosScale). ZERO added bytes (§9: same far-ring mesh/nodes; only camera params + a per-frame
+## node-transform scale). REPLACES the rejected O1O4 §2.8 H_FARSWAP impostor-swap (SPACE-NAV R1). Flipped ON at
+## export after the AM remote-bridge screendiff proves the climb is pop-free (§10 SN3 live-only).
+const FP_SCALED_BODY := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

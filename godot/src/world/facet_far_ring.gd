@@ -121,6 +121,25 @@ func _placement_xform() -> Transform3D:
 		return Transform3D(Basis.IDENTITY, -_anchor_offset)
 	return FacetAtlas.facet_transform(_active_fid).affine_inverse()
 
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2): the planet centre in the CURRENT render
+## frame. The ring mesh is absolute + body-centred (the planet centre is v_abs = 0), so its world position is
+## _placement_xform() applied to the origin — i.e. the shipped placement's translation. Frame-agnostic (folds
+## in T_active⁻¹ or the fixed-frame −anchor). The SN3 driver uses this to derive d = |camera − centre| and the
+## radial altitude h. DEAD unless FP_SCALED_BODY is on (only the SN3 per-frame driver calls it).
+func render_centre() -> Vector3:
+	return _placement_xform().origin
+
+## COSMOS SPACE-NAV SN3 (§5.2): apply the angular-size-preserving distance clamp. Above D_ENGAGE the whole ring
+## is uniformly scaled by s = min(1, D_ENGAGE/d) ABOUT the camera — screen image invariant, geometry pulled into
+## the depth range at d·s = D_ENGAGE. Below D_ENGAGE s == 1 exactly ⇒ transform == _placement_xform() (the
+## shipped placement, byte-identical to the near regime). The ring mesh/nodes are untouched (ZERO bytes) — only
+## this node's transform changes, and only when the SN3 driver calls this (FP_SCALED_BODY on). Called per frame
+## on the main thread (like set_active's rigid re-place); the async worker is unaffected (it reads only caches).
+func apply_scaled_placement(cam: Vector3) -> void:
+	var base := _placement_xform()
+	var s := CosmosScale.scale_for(cam.distance_to(base.origin), FacetAtlas.R_BLOCKS)
+	transform = CosmosScale.scale_about_camera(cam, s) * base   # s == 1 ⇒ identity·base == base (near regime unchanged)
+
 ## COSMOS FP-FIXED-FRAME re-anchor (§3): slide the absolute ring mesh by −A in lockstep with PlanetRoot + the
 ## ActiveFrame so the whole rendered planet stays continuous through a floating-origin shift. The offset survives a
 ## crossing (set_active re-applies _placement_xform, which now folds it in). No-op unless the fixed frame is on.

@@ -115,6 +115,12 @@ func _ready() -> void:
 		# Flag off → near stays Godot's default 0.05 (byte-identical).
 		if CubeSphere.FP_TIER_DEPTH_BIAS:
 			_camera.near = TierPlace.CAMERA_NEAR
+		# SPACE-NAV SN3 (§5.4): the altitude-continuous frustum. At ground (h = 0) these are EXACTLY the shipped
+		# 0.05 / 9000 (byte-identical initial); the SN3 driver (main._process) ramps them per frame with altitude.
+		# Overrides the depth-bias 0.25 with the design's 0.05 near floor. DEAD unless FP_SCALED_BODY is on.
+		if CosmosScale.on():
+			_camera.near = CosmosScale.camera_near(0.0)
+			_camera.far = CosmosScale.camera_far(FacetAtlas.R_BLOCKS, FacetAtlas.R_BLOCKS)
 	else:
 		_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
@@ -204,6 +210,15 @@ func window_camera_transform() -> Transform3D:
 func set_render_camera(t: Transform3D) -> void:
 	if _camera != null:
 		_camera.global_transform = t
+
+## SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.4): ramp the camera near/far with altitude so the
+## climb to orbit stays C0 (no frustum pop) and the far plane always reaches the horizon tangent. h = radial
+## altitude, d = |camera − body_centre| (blocks). At h = 0 / d = R these are the shipped 0.05 / 9000. Called
+## per frame by main._process under FP_SCALED_BODY only; DEAD (never called) with the flag off.
+func apply_scaled_camera_planes(h: float, d: float) -> void:
+	if _camera != null:
+		_camera.near = CosmosScale.camera_near(h)
+		_camera.far = CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
 
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:

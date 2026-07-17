@@ -94,6 +94,17 @@ static func biome_base(biome: int, t: float) -> Color:
 		_:
 			return _grass                            # B_PLAINS (and any unmapped)
 
+## SEAMLESS-SCALES §7.2 item 2: the 14 far-field colours in the FIXED order VoxelGeneratorCosmos'
+## far_color() (the C++ FarColor enum) indexes. The C++ port applies FarPalette.color_for's BRANCH
+## logic over these, so a skin tile comes back render-ready in ONE sample_columns call. This is the
+## SINGLE source of the order — both verify_cppgen's colour gate and module_world's frozen epoch
+## build the config from this, so the C++/GDScript colours cannot drift on ordering.
+static func frozen_colors() -> PackedColorArray:
+	ensure_ready()
+	return PackedColorArray([
+		_water, _ice, _lava, _snow, _sand, _gravel, _red_sand, _mud,
+		_podzol, _grass, _leaf, _stone, _taiga, _forest])
+
 ## THE per-vertex colour (LOD-DESIGN §2.3). A clamped sea vertex takes the sea regime
 ## colour; a dry-land vertex above the freeze line whitens (the altitude snow line — the
 ## exact ClimateModel.surface_temperature < 0 predicate worldgen stamps caps with, gated

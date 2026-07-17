@@ -1,0 +1,199 @@
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index d4a1d0e..7aa3e67 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -92,6 +92,7 @@
+ #include "../voxel_generator.h"
+ #include "../../storage/voxel_buffer_gd.h"
+ 
++#include <core/math/color.h>
+ #include <core/math/vector4i.h>
+ #include <core/variant/typed_array.h>
+ 
+@@ -224,6 +225,11 @@ private:
+ 	static int filler_depth(int biome);
+ 	static int biome_filler(const Parameters &p, int biome, int x, int y, int z, int depth, double t);
+ 	static int band_color(const Parameters &p, int x, int y, int z);
++
++	// SEAMLESS-SCALES §7.2 item 2: the cheap-tier per-column colour. A byte-equal port of
++	// FarPalette.color_for's BRANCH LOGIC over the frozen `far_colors` (the RGB values are the
++	// catalog's, handed over once at setup). Pure over `p`; used only by sample_columns.
++	static Color far_color(const Parameters &p, int g, int biome, double t, bool water);
+ 	static int deep_family(const Parameters &p, int x, int y, int z);
+ 	static int strata_at(const Parameters &p, int x, int y, int z);
+ 	static int strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy);
+@@ -369,6 +375,15 @@ private:
+ 		int model_count = 0;
+ 		bool waterlog = false;
+ 
++		// SEAMLESS-SCALES §7.2 item 2: the cheap-tier (skin / far ring) per-column colours, so
++		// sample_columns can hand a tile back render-ready in ONE call. These are the 14 colours
++		// FarPalette resolves from BlockCatalog, frozen GDScript-side and passed in a FIXED order
++		// (see FarColor below) -- the RGB values come from the catalog, never re-derived here; only
++		// the BRANCH SELECTION (sea regime / snow line / biome base) is ported, and it is gated
++		// byte-equal against FarPalette.color_for (verify_cppgen G-CG-COLUMNS). Empty when the caller
++		// (S1 gate) omitted them; far_color then returns opaque black, which the colour gate ignores.
++		PackedColorArray far_colors;
++
+ 		// S3: material ids resolve_cell projects to, frozen from TerrainConfig.material_tables().
+ 		int id_bedrock = 0, id_deepslate = 0, id_water = 0, id_lava = 0, id_ice = 0;
+ 		int id_sand = 0, id_red_sand = 0, id_gravel = 0, id_sandstone = 0, id_red_sandstone = 0;
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index 0d461a9..aff1f00 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -83,6 +83,11 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 	p.model_count = int(config.get("model_count", 0));
+ 	p.waterlog = bool(config.get("waterlog", false));
+ 
++	// SEAMLESS-SCALES §7.2 item 2: the frozen cheap-tier palette (14 colours in FarColor order),
++	// used only by sample_columns. Optional -- a config that omits it (the pre-skin voxel path) simply
++	// leaves sample_columns' colours black; the S3/skin gates supply it. NOT validated as required.
++	p.far_colors = PackedColorArray(config.get("far_colors", PackedColorArray()));
++
+ 	p.faceted = bool(config.get("faceted", false));
+ 	p.m5c_corner = bool(config.get("m5c_corner", false));
+ 
+@@ -1691,19 +1696,132 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 	return result;
+ }
+ 
++// SEAMLESS-SCALES §7.2 item 2: the frozen cheap-tier palette indices. GDScript's FarPalette.frozen_colors()
++// (verify_cppgen / module_world) hands the 14 colours over in EXACTLY this order; a mismatch would be
++// caught the moment G-CG-COLUMNS compares against FarPalette.color_for.
++namespace {
++enum FarColor {
++	FC_WATER = 0, FC_ICE, FC_LAVA, FC_SNOW, FC_SAND, FC_GRAVEL, FC_RED_SAND, FC_MUD,
++	FC_PODZOL, FC_GRASS, FC_LEAF, FC_STONE, FC_TAIGA, FC_FOREST, FC_COUNT
++};
++} // namespace
++
++// A byte-equal port of FarPalette.color_for's BRANCH LOGIC (far_palette.gd:62-107). The RGB values are
++// the catalog's, frozen in `far_colors`; only the selection is here. B_PILLAR's grey is a literal in
++// FarPalette (not a catalog colour) and is mirrored as a literal here. Returns opaque black if the
++// palette was not supplied (the pre-skin voxel path never calls this) -- never a plausible tint.
++Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, double t, bool water) {
++	if (p.far_colors.size() < FC_COUNT) {
++		return Color(0, 0, 0, 1);
++	}
++	if (water) {
++		// sea_color(t): frozen -> ice, molten -> lava, else water.
++		if (t < cosmos::CLIMATE_FROZEN) {
++			return p.far_colors[FC_ICE];
++		}
++		if (t >= cosmos::LAVA_SEA_T) {
++			return p.far_colors[FC_LAVA];
++		}
++		return p.far_colors[FC_WATER];
++	}
++	// The altitude snow line: the exact ClimateModel.surface_temperature < 0 predicate, gated on
++	// g >= SEA_LEVEL (FarPalette's underwater guard).
++	if (g >= cosmos::SEA_LEVEL && surface_temperature(g, t) < 0.0) {
++		return p.far_colors[FC_SNOW];
++	}
++	// biome_base(biome, t).
++	switch (biome) {
++		case cosmos::B_OCEAN:
++			return t > 0.0 ? p.far_colors[FC_SAND] : p.far_colors[FC_GRAVEL];
++		case cosmos::B_BEACH:
++		case cosmos::B_DESERT:
++			return p.far_colors[FC_SAND];
++		case cosmos::B_BADLANDS:
++			return p.far_colors[FC_RED_SAND];
++		case cosmos::B_SWAMP:
++			return p.far_colors[FC_MUD];
++		case cosmos::B_SNOWY:
++			return p.far_colors[FC_SNOW];
++		case cosmos::B_TAIGA:
++			return p.far_colors[FC_TAIGA];
++		case cosmos::B_FOREST:
++			return p.far_colors[FC_FOREST];
++		case cosmos::B_MOUNTAINS:
++			return p.far_colors[FC_STONE];
++		case cosmos::B_PILLAR:
++			return Color(0.20, 0.20, 0.23); // FarPalette's bedrock-grey corner monument literal
++		default:
++			return p.far_colors[FC_GRASS]; // B_PLAINS and any unmapped
++	}
++}
++
+ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
+-	// ENTRY POINT 2 — S1: shape only; lands in S2/S3 as a thin loop over column_profile_core, plus
+-	// the junction/ridge treatment so adjacent facets' tiles agree bit-exactly at shared seam columns.
++	// ENTRY POINT 2 (S2/S3 — LIVE). A thin loop over the ONE core (column_profile_core), never a second
++	// sampler: heights/biomes are exactly the voxel path's, so a skin tile and the voxels it overdraws
++	// cannot disagree. `water` mirrors the far ring's classifier (g < SEA_LEVEL, STRICT) and `colors`
++	// the far ring's palette, so the skin tier meets the far ring seamlessly at their overlap.
++	//
++	// RIDGE/JUNCTION treatment: junction_modify (the FacetAtlas seam authority) welds sub-block CELL
++	// SHAPE at ridges; it does NOT move a column's integer top `g`. The heightfield the skin builds is
++	// per-column `g`, and adjacent facets' shared ridge columns already agree bit-exactly because they
++	// map through the SAME frozen cell_dir to the SAME direction and column_profile_core is byte-equal
++	// (G-CG-PROFILE). So there is nothing at the column-height layer for junction_modify to correct --
++	// applying it here would be a no-op on g. Cross-facet ridge agreement is asserted directly by
++	// G-CG-COLUMNS (shared-ridge columns compared across the two facets), not assumed.
+ 	//
+-	// The empty dictionary is the staged inert value. Do NOT be tempted to "temporarily" fill this
+-	// from a quick heightfield approximation to unblock a caller: a second sampler is precisely what
+-	// the one-sampler law forbids, and its seam would land on a facet ridge.
++	// Packing: each cell is (x, z) as two int32 -- x in the low 32 bits, z in the high 32 (see
++	// pack_xz in GDScript). Reinterpreted through int32_t so negative lattice coords survive.
++	RWLockRead rlock(_params_lock);
++	const int n = cells.size();
+ 	Dictionary d;
+-	d["heights"] = PackedFloat32Array();
+-	d["biomes"] = PackedInt32Array();
+-	d["water"] = PackedByteArray();
+-	d["colors"] = PackedColorArray();
+-	d["staged"] = true; // S1 marker: absent once S2/S3 implement this. Gates assert on it.
++	PackedFloat32Array heights;
++	PackedInt32Array biomes;
++	PackedByteArray water;
++	PackedColorArray colors;
++	PackedFloat32Array temps;
++	heights.resize(n);
++	biomes.resize(n);
++	water.resize(n);
++	colors.resize(n);
++	temps.resize(n);
++
++	if (!_params.ready || !fid_ok(_params, fid)) {
++		// Inert-but-well-formed: the §7.2 key set with EMPTY arrays. A caller detects the refusal by
++		// size 0 (not by a poison value in a plausible-length array). No `staged` marker -- this entry
++		// point is LIVE; an invalid fid is a caller error, not a staged stub.
++		d["heights"] = PackedFloat32Array();
++		d["biomes"] = PackedInt32Array();
++		d["water"] = PackedByteArray();
++		d["colors"] = PackedColorArray();
++		d["temps"] = PackedFloat32Array();
++		return d;
++	}
++
++	float *hw = heights.ptrw();
++	int32_t *bw = biomes.ptrw();
++	uint8_t *ww = water.ptrw();
++	Color *cw = colors.ptrw();
++	float *tw = temps.ptrw();
++	for (int i = 0; i < n; ++i) {
++		const int64_t packed = cells[i];
++		const int x = int(int32_t(packed & 0xffffffffLL));
++		const int z = int(int32_t((packed >> 32) & 0xffffffffLL));
++		const Vector4 pr = column_profile_core(_params, fid, x, z);
++		const int g = int(pr.x);
++		const int biome = int(pr.y);
++		const double t = double(pr.w);
++		const bool w = g < cosmos::SEA_LEVEL;
++		hw[i] = float(g);
++		bw[i] = biome;
++		ww[i] = w ? 1 : 0;
++		cw[i] = far_color(_params, g, biome, t, w);
++		tw[i] = float(t);
++	}
++	d["heights"] = heights;
++	d["biomes"] = biomes;
++	d["water"] = water;
++	d["colors"] = colors;
++	d["temps"] = temps; // superset of §7.2: lets a caller re-derive colours via FarPalette if it wants
+ 	return d;
+ }
+ 

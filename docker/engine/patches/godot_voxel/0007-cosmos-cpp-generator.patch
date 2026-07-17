@@ -10,14 +10,253 @@ index ccac0f7..a96e2ae 100644
          "generators/multipass/*.cpp",
  
          "modifiers/*.cpp",
+diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
+new file mode 100644
+index 0000000..80f86ae
+--- /dev/null
++++ b/generators/cosmos/cosmos_terrain.h
+@@ -0,0 +1,232 @@
++#ifndef COSMOS_TERRAIN_H
++#define COSMOS_TERRAIN_H
++
++// VOXIVERSE COSMOS L5(a) — the ported worldgen constants and pure column math.
++//
++// THIS FILE IS A TRANSCRIPTION, NOT A DESIGN. Every function here is a line-for-line port of a
++// `TerrainConfig` / `TreeGen` static, and its ONLY correctness criterion is that it returns exactly
++// what the GDScript twin returns, bit for bit. If you find yourself improving an algorithm here,
++// stop: the GDScript is the specification, `verify_cppgen.gd` is the oracle, and a "better" formula
++// is a byte-equality failure. Fix the GDScript first if something is genuinely wrong, then re-port.
++//
++// THE FOUR TRANSCRIPTION TRAPS (all of them have teeth; the first two have already bitten projects
++// like this one):
++//
++//  1. INT WIDTH. GDScript ints are int64, and TerrainConfig._hash01_3d mixes with 2246822519 —
++//     which EXCEEDS int32. Every hash mixer below therefore uses int64_t. Using `int` silently
++//     changes bedrock/strata/ore. This is the single easiest way to break the port.
++//
++//  2. FLOAT WIDTH. GDScript `float` is f64, so intermediates are `double`, never `float`. But the
++//     narrowings GDScript *does* perform are part of the semantics and must be reproduced:
++//       - `Noise::get_noise_*` takes and returns real_t (f32 in a standard build). Passing a double
++//         narrows on the way in and widens on the way out — mirrored here by taking doubles and
++//         letting the same implicit conversions happen.
++//       - `Vector4` has real_t components. GDScript's column_profile and _corner_targets return
++//         Vector4, so their values are ALREADY f32-rounded before anything downstream reads them.
++//         That is why the profile and corner-target types here are Vector4 and not a double quad.
++//
++//  3. DON'T REIMPLEMENT ENGINE MATH. GDScript's `smoothstep`/`lerp` bind straight to
++//     Math::smoothstep / Math::lerp (double overloads). We call the same functions rather than
++//     retyping the formula — smoothstep in particular has an is_equal_approx early-out that a
++//     hand-rolled `s*s*(3-2s)` would miss. Same discipline as not reimplementing FastNoiseLite.
++//
++//  4. NO CUBE TOPOLOGY IN C++. Facet frames arrive as 12 frozen doubles per facet (FacetAtlas._frame)
++//     plus a 2-int offset, so `cell_dir` below is PURE ARITHMETIC. This deliberately follows patch
++//     0003's precedent, whose header records why: topology logic in C++ is "the exact class that
++//     scrambled the M5a shader twice". Sign/index errors are unfixable-by-inspection; frozen numbers
++//     cannot have them.
++
++#include <core/math/math_funcs.h>
++#include <core/math/vector4.h>
++#include <core/math/vector4i.h>
++
++#include <cstdint>
++
++namespace zylann::voxel {
++namespace cosmos {
++
++// ---------------------------------------------------------------------------------------------
++// TerrainConfig constants (godot/src/world/terrain_config.gd). Values only — see there for rationale.
++// ---------------------------------------------------------------------------------------------
++
++constexpr int SEED = 20260702;
++constexpr bool SMOOTHING_ENABLED = true;
++constexpr int WORLD_BOTTOM_Y = -64;
++constexpr int BEDROCK_TOP_Y = -59;
++constexpr int DEEPSLATE_FULL_Y = -24;
++constexpr int DEEPSLATE_TOP_Y = -16;
++constexpr int SEA_LEVEL = 0;
++
++constexpr int SLOPE_MAX_SPREAD = 3;
++
++constexpr double BASE_HEIGHT = 5.0;
++constexpr double HILLS_AMPLITUDE = 3.0;
++constexpr double DETAIL_AMPLITUDE = 1.0;
++
++constexpr double MOUNTAIN_AMPLITUDE = 92.0;
++constexpr double MOUNTAIN_MASK_LO = 0.35;
++constexpr double MOUNTAIN_MASK_HI = 0.68;
++constexpr double MOUNTAIN_C_LO = 0.05;
++constexpr double MOUNTAIN_C_HI = 0.35;
++constexpr double MOUNTAIN_BIOME_T = 0.35;
++
++constexpr double SHELF_TOP = 1.0;
++constexpr double SHELF_DEPTH = 5.0;
++constexpr double SHELF_HILLS_KEEP = 0.35;
++
++constexpr int MAX_SURFACE_Y = 116;
++
++// Biome enum.
++constexpr int B_OCEAN = 0;
++constexpr int B_BEACH = 1;
++constexpr int B_BADLANDS = 2;
++constexpr int B_DESERT = 3;
++constexpr int B_SWAMP = 4;
++constexpr int B_SNOWY = 5;
++constexpr int B_TAIGA = 6;
++constexpr int B_FOREST = 7;
++constexpr int B_PLAINS = 8;
++constexpr int B_MOUNTAINS = 9;
++constexpr int B_PILLAR = 10;
++
++constexpr double LAT_GAIN = 0.80;
++constexpr double LAT_NOISE_GAIN = 0.30;
++
++// TreeGen constants (godot/src/world/tree_gen.gd).
++constexpr int TREE_G = 10;
++constexpr int TREE_P = 5;
++constexpr double PATCH_CHANCE = 0.30;
++constexpr double TREE_CHANCE = 0.45;
++constexpr int TRUNK_MIN = 4;
++constexpr int SPRUCE_TRUNK_MIN = 5;
++constexpr int SPRUCE_TRUNK_MAX = 8;
++
++constexpr int SP_NONE = 0;
++constexpr int SP_OAK = 1;
++constexpr int SP_BIRCH = 2;
++constexpr int SP_SPRUCE = 3;
++
++// BlockCatalog (godot/src/sim/block_catalog.gd).
++constexpr int ID_AIR = 0;
++
++// ---------------------------------------------------------------------------------------------
++// GDScript built-in equivalents. Thin on purpose: each mirrors ONE GDScript global exactly.
++// ---------------------------------------------------------------------------------------------
++
++// GDScript `roundi(x)` == int(round(x)); Godot's round() is half-away-from-zero, which is NOT what
++// nearbyint()/rint() do under the default rounding mode (they are half-to-even). Getting this wrong
++// would flip exactly the .5 corner targets that decide whether a slope fires.
++inline int64_t roundi(double x) {
++	return int64_t(Math::round(x));
++}
++
++inline int64_t floori(double x) {
++	return int64_t(Math::floor(x));
++}
++
++// GDScript `roundf` — same half-away-from-zero rule, kept as a double.
++inline double roundf_gd(double x) {
++	return Math::round(x);
++}
++
++inline double smoothstep(double from, double to, double x) {
++	return Math::smoothstep(from, to, x);
++}
++
++inline double lerp(double from, double to, double w) {
++	return Math::lerp(from, to, w);
++}
++
++inline double clampf(double v, double lo, double hi) {
++	return CLAMP(v, lo, hi);
++}
++
++// ---------------------------------------------------------------------------------------------
++// Hashes. int64_t THROUGHOUT — see trap 1 above.
++// ---------------------------------------------------------------------------------------------
++
++// Port of TerrainConfig._hash01_3d.
++inline double hash01_3d(int64_t ix, int64_t iy, int64_t iz, int64_t salt) {
++	int64_t n = (ix * 374761393 + iy * 668265263 + iz * 2246822519 + salt * 362437) & 0x7FFFFFFF;
++	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF;
++	n = n ^ (n >> 16);
++	return double(n & 0xFFFF) / 65536.0;
++}
++
++// Port of TreeGen._hash01 (the 2D twin; different mix, do not merge with the 3D one).
++inline double tree_hash01(int64_t ix, int64_t iz, int64_t salt) {
++	int64_t n = (ix * 374761393 + iz * 668265263 + salt * 362437) & 0x7FFFFFFF;
++	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF;
++	n = n ^ (n >> 16);
++	return double(n & 0xFFFF) / 65536.0;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Continent spline + biome. Ports of TerrainConfig._knot / _continent_offset / _biome.
++// ---------------------------------------------------------------------------------------------
++
++inline double knot(double c, double c0, double c1, double v0, double v1) {
++	return v0 + (v1 - v0) * (c - c0) / (c1 - c0);
++}
++
++inline double continent_offset(double c) {
++	if (c <= -1.0) {
++		return -14.0;
++	}
++	if (c < -0.45) {
++		return knot(c, -1.0, -0.45, -14.0, -6.0);
++	}
++	if (c < -0.15) {
++		return knot(c, -0.45, -0.15, -6.0, 0.0);
++	}
++	if (c < 0.4) {
++		return knot(c, -0.15, 0.4, 0.0, 2.0);
++	}
++	if (c < 1.0) {
++		return knot(c, 0.4, 1.0, 2.0, 11.0);
++	}
++	return 11.0;
++}
++
++// `h` is HUMIDITY despite the name -- kept as-is to match the GDScript signature it ports.
++inline int biome_of(double c, double t, double h, int g, double mountain) {
++	if (c < -0.32) {
++		return B_OCEAN;
++	}
++	if (c < 0.25 && g >= SEA_LEVEL - 2 && g <= SEA_LEVEL + 2) {
++		return B_BEACH;
++	}
++	if (mountain > MOUNTAIN_BIOME_T) {
++		return B_MOUNTAINS;
++	}
++	if (t > 0.45 && h < -0.45) {
++		return B_BADLANDS;
++	}
++	if (t > 0.45 && h < 0.0) {
++		return B_DESERT;
++	}
++	if (t > 0.15 && h > 0.5) {
++		return B_SWAMP;
++	}
++	if (t < -0.55) {
++		return B_SNOWY;
++	}
++	if (t < -0.15) {
++		return B_TAIGA;
++	}
++	if (h > 0.1) {
++		return B_FOREST;
++	}
++	return B_PLAINS;
++}
++
++// Port of TerrainConfig._latitude_temperature.
++inline double latitude_temperature(double dz, double noise_t) {
++	const double lat_term = 1.0 - 2.0 * Math::abs(dz);
++	return clampf(LAT_GAIN * lat_term + LAT_NOISE_GAIN * noise_t, -1.0, 1.0);
++}
++
++} // namespace cosmos
++} // namespace zylann::voxel
++
++#endif // COSMOS_TERRAIN_H
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
 new file mode 100644
-index 0000000..629ee51
+index 0000000..84ab96b
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,618 @@
 +#include "voxel_generator_cosmos.h"
 +#include "../../util/godot/classes/noise.h"
++#include "cosmos_terrain.h"
 +
 +#include <core/variant/dictionary.h>
 +
@@ -88,10 +327,60 @@ index 0000000..629ee51
 +	p.model_count = int(config.get("model_count", 0));
 +	p.waterlog = bool(config.get("waterlog", false));
 +
++	p.faceted = bool(config.get("faceted", false));
++	p.m5c_corner = bool(config.get("m5c_corner", false));
++
++	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
++	p.facet_off = get_i32_param(config, "facet_off");
++	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
++
++	p.id_wood = int(config.get("id_wood", 0));
++	p.id_leaf = int(config.get("id_leaf", 0));
++	p.id_spruce_log = int(config.get("id_spruce_log", 0));
++	p.id_spruce_leaf = int(config.get("id_spruce_leaf", 0));
++	p.id_birch_log = int(config.get("id_birch_log", 0));
++	p.id_birch_leaf = int(config.get("id_birch_leaf", 0));
++
 +	// The cube table and the block-id table are the two the emit loop cannot function without.
 +	if (p.cube_arid.size() == 0 || p.block_ids.size() == 0) {
 +		ERR_PRINT("VoxelGeneratorCosmos.setup: missing cube_arid/block_ids; generator stays disabled.");
 +		return false;
++	}
++
++	// REFUSE what is not ported, rather than generate a different planet quietly.
++	//
++	// column_profile_core implements two of TerrainConfig.column_profile's three branches: faceted
++	// (facet_profile -> profile_at_dir) and flat 2D. The third -- the non-faceted CURVED branch
++	// (_curved_profile, with LatticeNav edge folding and the M5C pillar override) -- is NOT ported.
++	// It is unreachable in the shipped build (FLAT_WORLD stays true; faceted implies flat), so this
++	// costs nothing today. But an un-ported branch that silently falls through to the flat formula
++	// would produce a coherent, plausible, WRONG world -- the failure mode the byte-equality gate
++	// exists to prevent, and one that would be caught only after shipping. So: hard refusal.
++	if (!p.flat_world) {
++		ERR_PRINT("VoxelGeneratorCosmos.setup: the non-faceted CURVED branch (_curved_profile / "
++				  "LatticeNav folding) is not ported; refusing rather than emitting a different planet.");
++		return false;
++	}
++	if (p.faceted) {
++		// Faceted needs the frozen atlas: 12 doubles + 2 ints per facet. Validate it as a WHOLE (rather
++		// than only far enough to cover gen_facet), because any facet may legitimately be sampled: §7.2's
++		// sample_columns takes an fid so a skin tile can cover facets the workers are not homed on.
++		p.facet_count = int(p.facet_frame.size() / 12);
++		if (p.facet_count <= 0 || p.facet_frame.size() != int64_t(p.facet_count) * 12 ||
++				p.facet_off.size() != int64_t(p.facet_count) * 2) {
++			ERR_PRINT("VoxelGeneratorCosmos.setup: faceted epoch without a well-formed frozen facet atlas "
++					  "(facet_frame/facet_off size mismatch); generator stays disabled.");
++			return false;
++		}
++		if (p.gen_facet < 0 || p.gen_facet >= p.facet_count) {
++			ERR_PRINT("VoxelGeneratorCosmos.setup: faceted epoch's gen_facet is outside the frozen atlas; "
++					  "generator stays disabled.");
++			return false;
++		}
++		if (!(p.facet_r_blocks > 0.0)) {
++			ERR_PRINT("VoxelGeneratorCosmos.setup: faceted epoch needs facet_r_blocks > 0; disabled.");
++			return false;
++		}
 +	}
 +
 +	p.ready = true;
@@ -159,7 +448,346 @@ index 0000000..629ee51
 +}
 +
 +// ================================================================================================
-+// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). All are STAGED INERT in S1.
++// THE ONE CORE (SEAMLESS-SCALES §7.1). Every entry point below is a thin loop over these.
++//
++// S2 scope: the pure column math -- column_profile (flat + faceted/sphere) and slope_run_of, with
++// the TreeGen stencil that slope firing depends on. Transcribed line-for-line from TerrainConfig /
++// TreeGen; see cosmos_terrain.h for the four transcription traps that govern every line here.
++// ================================================================================================
++
++// --- FacetAtlas.cell_dir: PURE ARITHMETIC over the frozen frame (see Parameters::facet_frame) ---
++// Port of facet_atlas.gd:246. `_frame` layout per facet: [0..2] origin, [3..5] du, [6..8] dw(y),
++// [9..11] dv. All f64, and normalized() in f64 -- CubeSphere.DVec3 is a script f64 vector, NOT a
++// Godot Vector3 (which is f32). Routing this through Vector3 would silently f32-quantize the
++// direction and move the terrain.
++void VoxelGeneratorCosmos::cell_dir(
++		const Parameters &p, int fid, int x, int z, double &out_x, double &out_y, double &out_z) {
++	const int f = fid * 12;
++	const double fx = double(x) - double(p.facet_off[fid * 2]) + 0.5;
++	const double fz = double(z) - double(p.facet_off[fid * 2 + 1]) + 0.5;
++	double dx = p.facet_frame[f + 0] + fx * p.facet_frame[f + 3] + fz * p.facet_frame[f + 9];
++	double dy = p.facet_frame[f + 1] + fx * p.facet_frame[f + 4] + fz * p.facet_frame[f + 10];
++	double dz = p.facet_frame[f + 2] + fx * p.facet_frame[f + 5] + fz * p.facet_frame[f + 11];
++	// DVec3.normalized(): length() in f64, and the l == 0.0 guard returns a ZERO vector (not the
++	// input). Mirrored exactly -- an ordinary "if (l > 0)" would differ on the degenerate case.
++	const double l = Math::sqrt(dx * dx + dy * dy + dz * dz);
++	if (l == 0.0) {
++		out_x = 0.0;
++		out_y = 0.0;
++		out_z = 0.0;
++		return;
++	}
++	out_x = dx / l;
++	out_y = dy / l;
++	out_z = dz / l;
++}
++
++// Port of TerrainConfig._mountain_factor (2D, flat world).
++double VoxelGeneratorCosmos::mountain_factor(const Parameters &p, double c, double fx, double fz) {
++	const double m = cosmos::smoothstep(
++			cosmos::MOUNTAIN_MASK_LO, cosmos::MOUNTAIN_MASK_HI, p.mountain->get_noise_2d(fx, fz));
++	if (m <= 0.0) {
++		return 0.0;
++	}
++	return m * cosmos::smoothstep(cosmos::MOUNTAIN_C_LO, cosmos::MOUNTAIN_C_HI, c);
++}
++
++// Port of TerrainConfig._mountain_factor3 (3D, sphere).
++double VoxelGeneratorCosmos::mountain_factor3(
++		const Parameters &p, double c, double px, double py, double pz) {
++	const double m = cosmos::smoothstep(
++			cosmos::MOUNTAIN_MASK_LO, cosmos::MOUNTAIN_MASK_HI, p.mountain->get_noise_3d(px, py, pz));
++	if (m <= 0.0) {
++		return 0.0;
++	}
++	return m * cosmos::smoothstep(cosmos::MOUNTAIN_C_LO, cosmos::MOUNTAIN_C_HI, c);
++}
++
++// Port of TerrainConfig._height_c (flat).
++int VoxelGeneratorCosmos::height_c(const Parameters &p, double c, double fx, double fz) {
++	const double base = cosmos::BASE_HEIGHT + cosmos::continent_offset(c);
++	const double hills = double(p.hills->get_noise_2d(fx, fz)) * cosmos::HILLS_AMPLITUDE;
++	double h = base + hills + double(p.detail->get_noise_2d(fx, fz)) * cosmos::DETAIL_AMPLITUDE;
++	const double depth = double(cosmos::SEA_LEVEL) - h;
++	const double w = cosmos::clampf(
++			cosmos::smoothstep(-cosmos::SHELF_TOP, 0.5, depth) -
++					cosmos::smoothstep(cosmos::SHELF_DEPTH - 1.5, cosmos::SHELF_DEPTH, depth),
++			0.0, 1.0);
++	if (w > 0.0) {
++		h = cosmos::lerp(h, base + hills * cosmos::SHELF_HILLS_KEEP, w);
++	}
++	h += mountain_factor(p, c, fx, fz) * cosmos::MOUNTAIN_AMPLITUDE;
++	return int(Math::floor(h));
++}
++
++// Port of TerrainConfig._height_c3 (sphere). Same spline/shelf shaping, 3D noise, and the mountain
++// factor arrives PRECOMPUTED (the GDScript signature takes `mtn`) rather than being re-sampled.
++int VoxelGeneratorCosmos::height_c3(
++		const Parameters &p, double c, double px, double py, double pz, double mtn) {
++	const double base = cosmos::BASE_HEIGHT + cosmos::continent_offset(c);
++	const double hills = double(p.hills->get_noise_3d(px, py, pz)) * cosmos::HILLS_AMPLITUDE;
++	double h = base + hills + double(p.detail->get_noise_3d(px, py, pz)) * cosmos::DETAIL_AMPLITUDE;
++	const double depth = double(cosmos::SEA_LEVEL) - h;
++	const double w = cosmos::clampf(
++			cosmos::smoothstep(-cosmos::SHELF_TOP, 0.5, depth) -
++					cosmos::smoothstep(cosmos::SHELF_DEPTH - 1.5, cosmos::SHELF_DEPTH, depth),
++			0.0, 1.0);
++	if (w > 0.0) {
++		h = cosmos::lerp(h, base + hills * cosmos::SHELF_HILLS_KEEP, w);
++	}
++	h += mtn * cosmos::MOUNTAIN_AMPLITUDE;
++	return int(Math::floor(h));
++}
++
++// Port of TerrainConfig.profile_at_dir -- THE direction-parameterised sphere-terrain profile that
++// both the curved lattice and the faceted path sample, which is why a facet shows the same planet
++// as the lattice would. Returns Vector4(g, biome, c, t); the real_t narrowing of c/t IS the
++// semantics (see cosmos_terrain.h trap 2).
++Vector4 VoxelGeneratorCosmos::profile_at_dir(
++		const Parameters &p, double dx, double dy, double dz, double rr) {
++	const double px = dx * rr;
++	const double py = dy * rr;
++	const double pz = dz * rr;
++	const double c = double(p.continent->get_noise_3d(px, py, pz));
++	const double t = cosmos::latitude_temperature(dz, double(p.temperature->get_noise_3d(px, py, pz)));
++	const double hh = double(p.humidity->get_noise_3d(px, py, pz));
++	const double mtn = mountain_factor3(p, c, px, py, pz);
++	const int g = height_c3(p, c, px, py, pz, mtn);
++	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn)), float(c), float(t));
++}
++
++// THE column profile. Ports TerrainConfig.column_profile's worker-path branches:
++//   faceted -> facet_profile(facet, x, z) -> profile_at_dir at the facet cell's true direction
++//   flat    -> the 2D noise stack
++// The pcache memo is deliberately absent: it is a pure-function cache, so omitting it cannot change
++// a value -- only cost. (The GDScript memo exists because interpreted noise calls are expensive;
++// that is the whole reason this file exists.)
++//
++// NOT PORTED, and this is a real limit to state plainly: the non-faceted CURVED branch
++// (`elif not FLAT_WORLD: _curved_profile`) with its LatticeNav edge folding and the M5C pillar
++// override. The shipped build is faceted-or-flat (FLAT_WORLD stays true), so that branch is
++// unreachable today; setup() REFUSES a config that would need it rather than silently generating a
++// different planet.
++Vector4 VoxelGeneratorCosmos::column_profile_core(const Parameters &p, int fid, int x, int z) {
++	if (p.faceted) {
++		double dx, dy, dz;
++		cell_dir(p, fid, x, z, dx, dy, dz);
++		return profile_at_dir(p, dx, dy, dz, p.facet_r_blocks);
++	}
++	const double fx = double(x);
++	const double fz = double(z);
++	const double c = double(p.continent->get_noise_2d(fx, fz));
++	const double t = double(p.temperature->get_noise_2d(fx, fz));
++	const double hh = double(p.humidity->get_noise_2d(fx, fz));
++	const int g = height_c(p, c, fx, fz);
++	const double mtn = mountain_factor(p, c, fx, fz);
++	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn)), float(c), float(t));
++}
++
++// TerrainConfig._col_h on the worker path (pcache non-null) == int(column_profile(...).x).
++int VoxelGeneratorCosmos::col_h(const Parameters &p, int fid, int x, int z) {
++	return int(column_profile_core(p, fid, x, z).x);
++}
++
++// --- TreeGen -----------------------------------------------------------------------------------
++// slope firing consults the tree stencil (a tree keeps its column's top FULL), so the slope port
++// drags TreeGen in with it. Ports tree_gen.gd:62-171.
++
++void VoxelGeneratorCosmos::tree_base_pos(int gx, int gz, int &out_bx, int &out_bz) {
++	out_bx = gx * cosmos::TREE_G + 2 + int(cosmos::tree_hash01(gx, gz, 33) * double(cosmos::TREE_G - 4));
++	out_bz = gz * cosmos::TREE_G + 2 + int(cosmos::tree_hash01(gx, gz, 44) * double(cosmos::TREE_G - 4));
++}
++
++int VoxelGeneratorCosmos::tree_species_for(int biome, int gx, int gz) {
++	switch (biome) {
++		case cosmos::B_FOREST:
++			return cosmos::tree_hash01(gx, gz, 88) < 0.70 ? cosmos::SP_OAK : cosmos::SP_BIRCH;
++		case cosmos::B_TAIGA:
++		case cosmos::B_SNOWY:
++			return cosmos::SP_SPRUCE;
++		case cosmos::B_SWAMP:
++		case cosmos::B_PLAINS:
++			return cosmos::SP_OAK;
++		default:
++			return cosmos::SP_NONE;
++	}
++}
++
++bool VoxelGeneratorCosmos::tree_has_tree(const Parameters &p, int fid, int gx, int gz) {
++	// floori(float(gx) / float(P)) -- float division then floor, NOT integer division: they differ
++	// for negative gx (integer division truncates toward zero), i.e. across half the world.
++	const int px = int(cosmos::floori(double(gx) / double(cosmos::TREE_P)));
++	const int pz = int(cosmos::floori(double(gz) / double(cosmos::TREE_P)));
++	if (cosmos::tree_hash01(px, pz, 11) >= cosmos::PATCH_CHANCE) {
++		return false;
++	}
++	if (cosmos::tree_hash01(gx, gz, 22) >= cosmos::TREE_CHANCE) {
++		return false;
++	}
++	int bx, bz;
++	tree_base_pos(gx, gz, bx, bz);
++	const int biome = int(column_profile_core(p, fid, bx, bz).y);
++	return tree_species_for(biome, gx, gz) != cosmos::SP_NONE;
++}
++
++int VoxelGeneratorCosmos::tree_oak_block(
++		int gx, int gz, int dx, int y, int dz, int gy, int log_id, int leaf_id) {
++	const int t = cosmos::TRUNK_MIN + int(cosmos::tree_hash01(gx, gz, 55) * 3.0);
++	if (dx == 0 && dz == 0) {
++		if (y >= gy + 1 && y <= gy + t) {
++			return log_id;
++		}
++		// Falls through: above the trunk the centre column can still be a cap leaf.
++	}
++	if (y == gy + t - 1 || y == gy + t) {
++		if (Math::abs(dx) <= 1 && Math::abs(dz) <= 1 && !(dx == 0 && dz == 0)) {
++			return leaf_id;
++		}
++	}
++	if (y == gy + t + 1 && Math::abs(dx) + Math::abs(dz) <= 1) {
++		return leaf_id;
++	}
++	return cosmos::ID_AIR;
++}
++
++int VoxelGeneratorCosmos::tree_spruce_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy) {
++	const int t = cosmos::SPRUCE_TRUNK_MIN +
++			int(cosmos::tree_hash01(gx, gz, 66) *
++					double(cosmos::SPRUCE_TRUNK_MAX - cosmos::SPRUCE_TRUNK_MIN + 1));
++	const int top = gy + t;
++	if (dx == 0 && dz == 0 && y >= gy + 1 && y <= top) {
++		return p.id_spruce_log;
++	}
++	if (y == top + 1) {
++		return (dx == 0 && dz == 0) ? p.id_spruce_leaf : cosmos::ID_AIR;
++	}
++	if (y == top || y == top - 1) {
++		if (Math::abs(dx) <= 1 && Math::abs(dz) <= 1 && !(dx == 0 && dz == 0)) {
++			return p.id_spruce_leaf;
++		}
++		return cosmos::ID_AIR;
++	}
++	if (y == top - 2 || y == top - 3) {
++		if (Math::abs(dx) + Math::abs(dz) <= 2 && !(dx == 0 && dz == 0)) {
++			return p.id_spruce_leaf;
++		}
++	}
++	return cosmos::ID_AIR;
++}
++
++int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int y, int z) {
++	const int gx = int(cosmos::floori(double(x) / double(cosmos::TREE_G)));
++	const int gz = int(cosmos::floori(double(z) / double(cosmos::TREE_G)));
++	if (!tree_has_tree(p, fid, gx, gz)) {
++		return cosmos::ID_AIR;
++	}
++	int bx, bz;
++	tree_base_pos(gx, gz, bx, bz);
++	const int gy = col_h(p, fid, bx, bz);
++	if (gy <= cosmos::SEA_LEVEL) {
++		return cosmos::ID_AIR; // no submerged half-trees
++	}
++	const int species = tree_species_for(int(column_profile_core(p, fid, bx, bz).y), gx, gz);
++	const int dx = x - bx;
++	const int dz = z - bz;
++	switch (species) {
++		case cosmos::SP_OAK:
++			return tree_oak_block(gx, gz, dx, y, dz, gy, p.id_wood, p.id_leaf);
++		case cosmos::SP_BIRCH:
++			return tree_oak_block(gx, gz, dx, y, dz, gy, p.id_birch_log, p.id_birch_leaf);
++		case cosmos::SP_SPRUCE:
++			return tree_spruce_block(p, gx, gz, dx, y, dz, gy);
++		default:
++			return cosmos::ID_AIR;
++	}
++}
++
++// --- SHARP-SLOPE -------------------------------------------------------------------------------
++// Port of TerrainConfig._corner_targets. Vector4 (real_t) return is the GDScript type and its f32
++// rounding is load-bearing: _slope_fires_only reads these back and rounds them on a quarter grid.
++Vector4 VoxelGeneratorCosmos::corner_targets(const Parameters &p, int fid, int x, int z) {
++	const double t_nn = double(col_h(p, fid, x - 1, z - 1) + 1);
++	const double t_0n = double(col_h(p, fid, x, z - 1) + 1);
++	const double t_pn = double(col_h(p, fid, x + 1, z - 1) + 1);
++	const double t_n0 = double(col_h(p, fid, x - 1, z) + 1);
++	const double t_00 = double(col_h(p, fid, x, z) + 1);
++	const double t_p0 = double(col_h(p, fid, x + 1, z) + 1);
++	const double t_np = double(col_h(p, fid, x - 1, z + 1) + 1);
++	const double t_0p = double(col_h(p, fid, x, z + 1) + 1);
++	const double t_pp = double(col_h(p, fid, x + 1, z + 1) + 1);
++	return Vector4(
++			float((t_nn + t_0n + t_n0 + t_00) * 0.25),
++			float((t_0n + t_pn + t_00 + t_p0) * 0.25),
++			float((t_00 + t_p0 + t_0p + t_pp) * 0.25),
++			float((t_n0 + t_00 + t_np + t_0p) * 0.25));
++}
++
++// Port of TerrainConfig._slope_fires_only.
++bool VoxelGeneratorCosmos::slope_fires_only(const Parameters &p, int fid, int x, int z, int g) {
++	if (!cosmos::SMOOTHING_ENABLED || g < cosmos::SEA_LEVEL) {
++		return false; // v1: land only
++	}
++	// _is_pillar_column: M5C_CORNER-gated, and short-circuits BEFORE the profile read when off.
++	if (p.m5c_corner && int(column_profile_core(p, fid, x, z).y) == cosmos::B_PILLAR) {
++		return false;
++	}
++	if (tree_block_at(p, fid, x, g + 1, z) != cosmos::ID_AIR) {
++		return false; // a tree rests here -> keep the top FULL
++	}
++	const Vector4 raw = corner_targets(p, fid, x, z);
++	// Integer quarter-units (float-robust), exactly as the GDScript does it.
++	const int64_t r0 = cosmos::roundi(double(raw.x) * 4.0);
++	const int64_t r1 = cosmos::roundi(double(raw.y) * 4.0);
++	const int64_t r2 = cosmos::roundi(double(raw.z) * 4.0);
++	const int64_t r3 = cosmos::roundi(double(raw.w) * 4.0);
++	const int64_t lo_r = MIN(MIN(r0, r1), MIN(r2, r3));
++	const int64_t hi_r = MAX(MAX(r0, r1), MAX(r2, r3));
++	if (lo_r >= int64_t(g) * 4 && hi_r <= int64_t(g + 2) * 4) {
++		if (lo_r >= int64_t(g) * 4 && hi_r <= int64_t(g + 1) * 4) {
++			return false; // within [g, g+1] -> today's smoothing, all biomes
++		}
++		if (int(column_profile_core(p, fid, x, z).y) != cosmos::B_MOUNTAINS) {
++			return false; // the 1-2 block/cell band off the mountains -> leave hills alone
++		}
++	}
++	const int64_t tw0 = cosmos::roundi(double(raw.x));
++	const int64_t tw1 = cosmos::roundi(double(raw.y));
++	const int64_t tw2 = cosmos::roundi(double(raw.z));
++	const int64_t tw3 = cosmos::roundi(double(raw.w));
++	const int64_t lo = MIN(MIN(tw0, tw1), MIN(tw2, tw3));
++	const int64_t hi = MAX(MAX(tw0, tw1), MAX(tw2, tw3));
++	if (hi - lo < 1 || hi - lo > cosmos::SLOPE_MAX_SPREAD) {
++		return false; // flat (nothing to grade) OR too steep (cliff)
++	}
++	return lo >= int64_t(g - cosmos::SLOPE_MAX_SPREAD) && hi <= int64_t(g + cosmos::SLOPE_MAX_SPREAD + 1);
++}
++
++// Port of TerrainConfig._slope_whole_targets + _slope_run_pack.
++int VoxelGeneratorCosmos::slope_run_pack(const Vector4i &tw, int g) {
++	const int c0 = CLAMP(tw.x - g + 4, 0, 15);
++	const int c1 = CLAMP(tw.y - g + 4, 0, 15);
++	const int c2 = CLAMP(tw.z - g + 4, 0, 15);
++	const int c3 = CLAMP(tw.w - g + 4, 0, 15);
++	return (1 << 16) | (c3 << 12) | (c2 << 8) | (c1 << 4) | c0;
++}
++
++// Port of TerrainConfig.slope_run_of, WORKER path (pcache non-null). The pcache == null branch reads
++// the main-thread shape memo (_shape_entry), which is not what a worker or this port does.
++int VoxelGeneratorCosmos::slope_run_core(const Parameters &p, int fid, int x, int z, int g) {
++	if (!cosmos::SMOOTHING_ENABLED) {
++		return 0;
++	}
++	if (!slope_fires_only(p, fid, x, z, g)) {
++		return 0;
++	}
++	const Vector4 raw = corner_targets(p, fid, x, z);
++	const Vector4i tw(int(cosmos::roundi(double(raw.x))), int(cosmos::roundi(double(raw.y))),
++			int(cosmos::roundi(double(raw.z))), int(cosmos::roundi(double(raw.w))));
++	return slope_run_pack(tw, g);
++}
++
++// ================================================================================================
++// THE THREE ENTRY POINTS (SEAMLESS-SCALES §7.2). generate_block is STAGED INERT until S3.
 +//
 +// A note on how they fail while staged, because it is a deliberate choice and not laziness: each
 +// returns a value that is OBVIOUSLY broken rather than plausibly correct. Missing terrain and a -1
@@ -191,13 +819,33 @@ index 0000000..629ee51
 +	return d;
 +}
 +
++// A facet id the frozen atlas actually covers. cell_dir indexes facet_frame directly, so an
++// unchecked fid from script would read out of bounds -- checked once at the entry point rather than
++// per core call, keeping the hot path clean while the boundary stays safe.
++bool VoxelGeneratorCosmos::fid_ok(const Parameters &p, int fid) {
++	return !p.faceted || (fid >= 0 && fid < p.facet_count);
++}
++
 +Vector4 VoxelGeneratorCosmos::column_profile(int fid, int x, int z) const {
-+	// ENTRY POINT 3a — S1: shape only; lands in S2 as a single column_profile_core call.
-+	// NaN, not zero: a zeroed profile is a plausible column (height 0, ocean biome) that a caller
-+	// could consume without noticing, whereas NaN poisons any arithmetic it touches and surfaces
-+	// immediately. While staged, being unmissable beats being tidy.
-+	const float nan = NAN;
-+	return Vector4(nan, nan, nan, nan);
++	// ENTRY POINT 3a (S2 — live). A single core call; no separate implementation. `fid` is ignored
++	// on the flat branch, exactly as the GDScript is.
++	RWLockRead rlock(_params_lock);
++	if (!_params.ready || !fid_ok(_params, fid)) {
++		const float nan = NAN;
++		return Vector4(nan, nan, nan, nan);
++	}
++	return column_profile_core(_params, fid, x, z);
++}
++
++int VoxelGeneratorCosmos::slope_run_of(int fid, int x, int z) const {
++	// The S2 gate surface for SHARP-SLOPE. Mirrors TerrainConfig.slope_run_of's WORKER path: derive
++	// g from the column itself, then the shared predicate.
++	RWLockRead rlock(_params_lock);
++	if (!_params.ready || !fid_ok(_params, fid)) {
++		return -1;
++	}
++	const int g = col_h(_params, fid, x, z);
++	return slope_run_core(_params, fid, x, z, g);
 +}
 +
 +int64_t VoxelGeneratorCosmos::resolve_cell(int fid, int x, int y, int z) const {
@@ -219,16 +867,17 @@ index 0000000..629ee51
 +	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
 +	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);
 +	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
++	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
 +	ClassDB::bind_method(D_METHOD("resolve_cell", "fid", "x", "y", "z"), &VoxelGeneratorCosmos::resolve_cell);
 +}
 +
 +} // namespace zylann::voxel
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
 new file mode 100644
-index 0000000..faccae9
+index 0000000..a37291e
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,289 @@
 +#ifndef VOXEL_GENERATOR_COSMOS_H
 +#define VOXEL_GENERATOR_COSMOS_H
 +
@@ -322,6 +971,7 @@ index 0000000..faccae9
 +#include "../../util/thread/rw_lock.h"
 +#include "../voxel_generator.h"
 +
++#include <core/math/vector4i.h>
 +#include <core/variant/typed_array.h>
 +
 +namespace zylann::voxel {
@@ -412,6 +1062,36 @@ index 0000000..faccae9
 +	static int64_t resolve_cell_core(
 +			const Parameters &p, int fid, int x, int y, int z, const Vector4 &prof, int slope_run);
 +
++	// Core internals (S2). All static + pure over `p`; see cosmos_terrain.h for the transcription
++	// traps. Named after the TerrainConfig / TreeGen statics they port, so a reader can diff them
++	// against the GDScript side by side -- which is the only way this stays byte-equal over time.
++	static void cell_dir(const Parameters &p, int fid, int x, int z, double &out_x, double &out_y, double &out_z);
++	static double mountain_factor(const Parameters &p, double c, double fx, double fz);
++	static double mountain_factor3(const Parameters &p, double c, double px, double py, double pz);
++	static int height_c(const Parameters &p, double c, double fx, double fz);
++	static int height_c3(const Parameters &p, double c, double px, double py, double pz, double mtn);
++	static Vector4 profile_at_dir(const Parameters &p, double dx, double dy, double dz, double rr);
++	static int col_h(const Parameters &p, int fid, int x, int z);
++	static bool fid_ok(const Parameters &p, int fid);
++
++	static void tree_base_pos(int gx, int gz, int &out_bx, int &out_bz);
++	static int tree_species_for(int biome, int gx, int gz);
++	static bool tree_has_tree(const Parameters &p, int fid, int gx, int gz);
++	static int tree_oak_block(int gx, int gz, int dx, int y, int dz, int gy, int log_id, int leaf_id);
++	static int tree_spruce_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
++	static int tree_block_at(const Parameters &p, int fid, int x, int y, int z);
++
++	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
++	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
++	static int slope_run_pack(const Vector4i &tw, int g);
++
++	// S2 gate surface: the ported slope run for a column, so verify_cppgen can compare it against
++	// GDScript's slope_run_of. Exposed via ClassDB alongside the §7.2 entry points.
++public:
++	int slope_run_of(int fid, int x, int z) const;
++
++private:
++
 +	// The immutable per-epoch snapshot. Written once by `setup()` under `_params_lock`, read by every
 +	// worker thereafter. Mirrors VoxelGeneratorNoise2D's Parameters/RWLock idiom, which is the
 +	// module's established pattern for exactly this.
@@ -433,6 +1113,34 @@ index 0000000..faccae9
 +		int gen_n = 0;
 +		int gen_facet = -1;
 +		bool flat_world = true;
++
++		// World-shape flags, snapshotted from CubeSphere at setup. Consts in GDScript; frozen ints
++		// here, because a `const` there is a runtime value to us.
++		bool faceted = false;
++		bool m5c_corner = false;
++
++		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
++		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is
++		// FacetAtlas._off (2 ints per facet); together they make cell_dir() pure arithmetic. This
++		// follows patch 0003's precedent deliberately -- its header records that cube topology in C++
++		// is "the exact class that scrambled the M5a shader twice". Frozen numbers cannot get a sign
++		// or an index wrong; re-derived topology can.
++		PackedFloat64Array facet_frame;
++		PackedInt32Array facet_off;
++		double facet_r_blocks = 0.0;
++		// Facets the frozen atlas covers. ONE generator can sample ANY of them: §7.2's sample_columns
++		// takes an `fid` precisely so a skin tile can cover facets other than the one the voxel workers
++		// are homed on. gen_facet is this epoch's HOME facet, not a limit on what may be sampled.
++		int facet_count = 0;
++
++		// TreeGen material ids (BlockCatalog). Frozen: BlockCatalog.id_of() is a main-thread lookup and
++		// must never be reached from a worker.
++		int id_wood = 0;
++		int id_leaf = 0;
++		int id_spruce_log = 0;
++		int id_spruce_leaf = 0;
++		int id_birch_log = 0;
++		int id_birch_leaf = 0;
 +
 +		// Frozen appearance tables (baked main-thread by the loader). Cross once, read-only after.
 +		PackedInt32Array cube_arid;

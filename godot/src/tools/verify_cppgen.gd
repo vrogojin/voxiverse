@@ -89,6 +89,20 @@ func _initialize() -> void:
 	var cube_arid := PackedInt32Array([0, 1, 2, 3, 4, 5, 6, 7])
 	var block_ids := TerrainConfig.appearance_surface_materials()
 
+	# The epoch this gate freezes must MIRROR what module_world's loader will freeze at S4 — otherwise
+	# the gate proves equality for a configuration that never ships. Faceted vs flat is read from the
+	# same const the engine reads, so the FACETED sed-toggle exercises the facet path here too.
+	var faceted: bool = CubeSphere.FACETED
+	var fid: int = -1
+	var atlas := {}
+	if faceted:
+		FacetAtlas.warm_up()
+		atlas = FacetAtlas.frozen_atlas()
+		fid = TerrainConfig.active_facet()
+		if fid < 0:
+			fid = 0
+			TerrainConfig.set_active_facet(fid)
+
 	var cfg := {
 		"hills": ns["hills"],
 		"detail": ns["detail"],
@@ -99,13 +113,26 @@ func _initialize() -> void:
 		"seed": ns["seed"],
 		"gen_face": 0,
 		"gen_n": 0,
-		"gen_facet": -1,
+		"gen_facet": fid,
 		"flat_world": true,
+		"faceted": faceted,
+		"m5c_corner": CubeSphere.M5C_CORNER,
 		"cube_arid": cube_arid,
 		"block_ids": block_ids,
 		"model_count": 8,
 		"waterlog": false,
+		# TreeGen ids: slope firing consults the tree stencil, so the S2 slope gate needs these.
+		"id_wood": BlockCatalog.WOOD,
+		"id_leaf": BlockCatalog.LEAF,
+		"id_spruce_log": BlockCatalog.id_of(&"spruce_log"),
+		"id_spruce_leaf": BlockCatalog.id_of(&"spruce_leaves"),
+		"id_birch_log": BlockCatalog.id_of(&"birch_log"),
+		"id_birch_leaf": BlockCatalog.id_of(&"birch_leaves"),
 	}
+	if faceted:
+		cfg["facet_frame"] = atlas["facet_frame"]
+		cfg["facet_off"] = atlas["facet_off"]
+		cfg["facet_r_blocks"] = atlas["facet_r_blocks"]
 
 	# --- G-CG-SETUP ---------------------------------------------------------------------------------
 	var ok: bool = gen.call("setup", cfg)
@@ -124,8 +151,8 @@ func _initialize() -> void:
 		"G-CG-TABLES — block_ids crossed intact (%d)" % block_ids.size())
 	_ok(int(dg.get("seed", -1)) == TerrainConfig.SEED,
 		"G-CG-TABLES — seed crossed intact (%d)" % TerrainConfig.SEED)
-	_ok(bool(dg.get("flat_world", false)) and int(dg.get("gen_facet", 0)) == -1,
-		"G-CG-TABLES — epoch (flat_world, gen_facet) crossed intact")
+	_ok(bool(dg.get("flat_world", false)) and int(dg.get("gen_facet", -99)) == fid,
+		"G-CG-TABLES — epoch (flat_world=true, gen_facet=%d) crossed intact" % fid)
 	_ok(bool(dg.get("noise_ok", false)), "G-CG-TABLES — all six noise refs held C++-side")
 
 	# --- G-CG-NOISE — the load-bearing gate ---------------------------------------------------------
@@ -196,9 +223,13 @@ func _initialize() -> void:
 	# rather than plausible: a zeroed profile (height 0, biome 0) or an AIR cell would be silently
 	# consumable by a caller — and a physics caller believing "air here" is the float-through bug this
 	# port must never introduce. NaN and -1 cannot be mistaken for real answers.
-	var staged_prof: Vector4 = gen.call("column_profile", -1, 0, 0)
-	_ok(is_nan(staged_prof.x) and is_nan(staged_prof.y),
-		"G-CG-STAGED — column_profile returns NaN while staged (loud, not a plausible column)")
+	# column_profile went LIVE in S2, so its staged-NaN assert is inverted here rather than deleted:
+	# the tripwire did its job (it went red the moment the body landed, forcing this edit), and the
+	# replacement keeps the same guarantee pointing the other way -- a live entry point must never
+	# hand back a poison value.
+	var live_prof: Vector4 = gen.call("column_profile", fid, 0, 0)
+	_ok(not is_nan(live_prof.x) and not is_nan(live_prof.y),
+		"G-CG-STAGED — column_profile is LIVE (S2): returns a real profile, not the staged NaN")
 	var staged_cell: int = gen.call("resolve_cell", -1, 0, 0, 0)
 	_ok(staged_cell == -1,
 		"G-CG-STAGED — resolve_cell returns -1 while staged (never a packable cell value; 0 would mean AIR)")
@@ -209,7 +240,161 @@ func _initialize() -> void:
 	_ok(bool(staged_cols.get("staged", false)),
 		"G-CG-STAGED — sample_columns is marked staged (this assert MUST be inverted when S2/S3 lands)")
 
+	_s2_column_gates(gen)
+
 	_done(0 if _fail == 0 else 1)
+
+## ------------------------------------------------------------------------------------------------
+## S2 — the column-math gates. C++ column_profile / slope_run_of vs the GDScript twin over >= 1e5
+## columns. This is the stage's whole point: the port is only allowed to be fast if it is EQUAL.
+##
+##   G-CG-PROFILE  every sampled column's Vector4(g, biome, c, t) is EXACTLY equal across the
+##                 boundary. Exact, not approximate — both sides run the same noise on the same
+##                 instance through the same narrowings, so any difference is a transcription bug
+##                 (an int32 hash, a float intermediate, a missed f32 round-trip), not a wobble.
+##   G-CG-SLOPE    every sampled column's packed SHARP-SLOPE run matches. This is the deeper test:
+##                 slope firing consults the TreeGen stencil and a 3x3 of column heights, so it
+##                 exercises the tree hashes, the corner-target f32 rounding and the quarter-grid
+##                 integer predicate all at once.
+##   G-CG-COVER    the sweep is not vacuous: it must span most biomes, include coast columns, and
+##                 actually FIRE some slope runs and hit some tree-gated columns. A 1e5-column gate
+##                 that only ever saw flat ocean would be green and worthless.
+##
+## MEASURED SENSITIVITY — what these gates catch, and the ONE thing they mostly don't. Established by
+## deliberate sabotage of the C++ build, not by reasoning:
+##   * drift in c/t (the UNFLOORED Vector4 components): caught totally. A 1e-7 RELATIVE perturbation
+##     of `c` mismatched 102,400/102,400 columns. G-CG-PROFILE is maximally sensitive here.
+##   * an int64 -> int32 hash mixer (cosmos_terrain.h trap 1): caught by G-CG-SLOPE, 3/102,400.
+##     Note how FEW: the tree hashes only matter where a tree actually gates a slope, so the
+##     coverage asserts above are what give this gate its teeth. Without them it would be luck.
+##   * an f32 intermediate inside height_c (trap 2): **NOT caught — 0/640,000 columns.** This is a
+##     real, characterised limit and not an oversight. height_c's output is int(floor(h)), so an f32
+##     perturbation of h (ulp ~5e-6 at these magnitudes) only changes the answer when h lands within
+##     an ulp of an integer: P ~ 1e-6 per column. More N does not fix it (640k was already tried).
+##     Consequences, stated honestly: such a bug would surface as a ~1-in-a-million column being one
+##     block off — which IS a render/physics divergence, just a rare one. The defences that actually
+##     cover it are (a) using `double` uniformly by construction rather than by testing, which is why
+##     trap 2 is documented at the top of cosmos_terrain.h, and (b) S3's cell gate, where a single
+##     wrong g shifts that column's ENTIRE stack and so is caught by any cell of it.
+## ------------------------------------------------------------------------------------------------
+func _s2_column_gates(gen: Object) -> void:
+	var faceted: bool = CubeSphere.FACETED
+	var fid: int = TerrainConfig.active_facet() if faceted else -1
+
+	# The sweep's shape differs by world topology, and that is not incidental — it is where the
+	# coverage actually lives:
+	#   FLAT   — one infinite plane. Biome variety comes from WANDERING, so anchor patches at the
+	#            landmark finders (spawn/mountain/cold/coast) rather than at arbitrary offsets.
+	#   FACETED— a facet is only ~200 blocks across, so four anchors land on near-identical terrain
+	#            (measured: 2 biomes, 0 slope fires — G-CG-COVER caught exactly that and refused to
+	#            call the sweep meaningful). On a sphere the variety is across FACETS: different
+	#            facets sit at different latitudes, hence different climate. So sweep facets. This
+	#            also exercises cell_dir against many different frozen frames, which is precisely
+	#            where a frame indexing/sign error would surface — the class patch 0003 warns about.
+	var sweeps: Array = []                # [[fid, cx, cz], ...]
+	var span := 160
+	if faceted:
+		var nf: int = int(FacetAtlas.frozen_atlas()["facet_count"])
+		# FIND facets that actually EXERCISE the machinery instead of striding blindly. A facet is only
+		# ~200 blocks, and slopes fire only on steep (mountain) terrain, so a naive stride can — and did
+		# — pick 24 flat facets and leave G-CG-SLOPE comparing 0 == 0 on every column (vacuously green).
+		# So probe each facet's centre column for a slope fire, prioritise the ones that fire, then top
+		# up to 24 with a stride for biome breadth. CENTRE each sweep on the facet's OWN domain: a
+		# facet's local coords sit at its atlas offset, not 0, and sweeping around 0 samples columns
+		# outside the facet where cell_dir extrapolates to junk. The probe uses the analytic path (cheap,
+		# and only to CHOOSE facets — the byte-equality comparison below still uses the worker path).
+		var firing: Array = []
+		var f := 0
+		while f < nf:
+			var lo: Vector2i = FacetAtlas.dom_min(f)
+			var hi: Vector2i = FacetAtlas.dom_max(f)
+			var cx := (lo.x + hi.x) / 2
+			var cz := (lo.y + hi.y) / 2
+			TerrainConfig.set_active_facet(f)
+			if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(cx, cz)):
+				firing.append([f, cx, cz])
+				if firing.size() >= 12:
+					break
+			f += 1
+		TerrainConfig.set_active_facet(fid)
+		for e in firing:
+			sweeps.append(e)
+		var step: int = maxi(1, nf / 24)
+		f = 0
+		while f < nf and sweeps.size() < 24:
+			var lo2: Vector2i = FacetAtlas.dom_min(f)
+			var hi2: Vector2i = FacetAtlas.dom_max(f)
+			sweeps.append([f, (lo2.x + hi2.x) / 2, (lo2.y + hi2.y) / 2])
+			f += step
+		span = int(ceil(sqrt(100000.0 / float(sweeps.size()))))  # keep the total >= 1e5
+	else:
+		for a in [TerrainConfig.find_spawn(), TerrainConfig.find_mountain(),
+				TerrainConfig.find_cold(), TerrainConfig.find_coast()]:
+			sweeps.append([-1, a.x, a.y])
+
+	var n_cols := 0
+	var prof_bad := 0
+	var slope_bad := 0
+	var first_prof_msg := ""
+	var first_slope_msg := ""
+
+	var biomes_seen := {}
+	var coast_cols := 0
+	var slope_fired := 0
+	var tree_cols := 0
+
+	for sw in sweeps:
+		var sfid: int = sw[0]
+		# The GDScript reference must be the WORKER path, not the analytic one: slope_run_of's
+		# pcache == null branch reads the main-thread shape memo (_shape_entry) instead of the shared
+		# predicate. module_world uses a GenCtx when faceted and a plain Dictionary memo when flat —
+		# mirrored exactly, with a FRESH ctx per facet (a ctx is scoped to one facet by contract).
+		var pcache = TerrainConfig.GenCtx.new(0, sfid) if faceted else {}
+		for dz in range(span):
+			for dx in range(span):
+				var x: int = int(sw[1]) + dx - span / 2
+				var z: int = int(sw[2]) + dz - span / 2
+				n_cols += 1
+
+				var gd_p: Vector4 = TerrainConfig.column_profile(x, z, pcache)
+				var cpp_p: Vector4 = gen.call("column_profile", sfid, x, z)
+				if not (cpp_p.x == gd_p.x and cpp_p.y == gd_p.y and cpp_p.z == gd_p.z and cpp_p.w == gd_p.w):
+					prof_bad += 1
+					if first_prof_msg == "":
+						first_prof_msg = "(%d,%d) C++ (%s,%s,%s,%s) != GD (%s,%s,%s,%s)" % [x, z,
+							_f(cpp_p.x), _f(cpp_p.y), _f(cpp_p.z), _f(cpp_p.w),
+							_f(gd_p.x), _f(gd_p.y), _f(gd_p.z), _f(gd_p.w)]
+
+				var gd_r: int = TerrainConfig.slope_run_of(x, z, pcache)
+				var cpp_r: int = gen.call("slope_run_of", sfid, x, z)
+				if cpp_r != gd_r:
+					slope_bad += 1
+					if first_slope_msg == "":
+						first_slope_msg = "(%d,%d) C++ run 0x%x != GD run 0x%x" % [x, z, cpp_r, gd_r]
+
+				# Coverage bookkeeping (from the GDScript side — the oracle).
+				var g := int(gd_p.x)
+				biomes_seen[int(gd_p.y)] = true
+				if g >= TerrainConfig.SEA_LEVEL - 2 and g <= TerrainConfig.SEA_LEVEL + 2:
+					coast_cols += 1
+				if TerrainConfig.slope_run_fires(gd_r):
+					slope_fired += 1
+				if g > TerrainConfig.SEA_LEVEL and TreeGen.block_at(x, g + 1, z, pcache) != BlockCatalog.AIR:
+					tree_cols += 1
+
+	print("  ... swept %d columns across %d sweeps (faceted=%s, span=%d)" % [n_cols, sweeps.size(), faceted, span])
+
+	_ok(n_cols >= 100000, "G-CG-COVER — swept %d columns (>= 1e5 required)" % n_cols)
+	_ok(biomes_seen.size() >= 5,
+		"G-CG-COVER — sweep spans %d distinct biomes: %s" % [biomes_seen.size(), str(biomes_seen.keys())])
+	_ok(coast_cols > 0, "G-CG-COVER — sweep includes %d coast/sea-level columns" % coast_cols)
+	_ok(slope_fired > 0, "G-CG-COVER — sweep FIRES %d SHARP-SLOPE runs (the predicate is exercised)" % slope_fired)
+	_ok(tree_cols > 0, "G-CG-COVER — sweep hits %d tree-occupied columns (the stencil is exercised)" % tree_cols)
+
+	_ok(prof_bad == 0, "G-CG-PROFILE — %d/%d columns mismatched%s"
+		% [prof_bad, n_cols, ("" if prof_bad == 0 else ("; first: " + first_prof_msg))])
+	_ok(slope_bad == 0, "G-CG-SLOPE — %d/%d slope runs mismatched%s"
+		% [slope_bad, n_cols, ("" if slope_bad == 0 else ("; first: " + first_slope_msg))])
 
 ## Exact equality. NOT approximate: C++ and GDScript call the same const method on the same Noise
 ## instance, so any difference at all is a broken assumption about the marshalling boundary, not a

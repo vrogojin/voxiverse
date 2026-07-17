@@ -173,6 +173,71 @@ func _initialize() -> void:
 	_ok(tc > dfc,
 		"G-SKIN-DRAW-FALS — a per-tile skin (%d draws) would BREACH the %d-facet bound (the merge bound bites)" % [tc, dfc])
 
+	# --- G-SKIN-COVER — the covered-tile skip: no overdraw over meshed near voxels, gap-fill preserved ----
+	# The measured problem is STANDING STILL: after the player stops, the near field finishes meshing over
+	# ~1 s and the skin tiles in the 64..128 band then render behind the opaque near voxels for nothing (the
+	# ~20 fps fill hit). This gate models exactly that: (1) arrive over a STILL-STREAMING near field (nothing
+	# meshed) — the skin fills the gap; (2) STAND while the near field meshes in — the reap must drop every
+	# tile that becomes CONFIRMED-covered, while a tile over a persistent UNMESHED hole must KEEP rendering
+	# (the skin's real job). It is driven by a scripted coverage Callable (the same (fid, fid-lattice AABB) ->
+	# bool contract module_world.skin_near_meshed implements), so it exercises the EXACT decision path
+	# (update/reap → _tile_covered → _probe_covered → cover_query) without a live VoxelTerrain.
+	var T2: int = T
+	var hole_tx := int(floor(float(cy + 80) / float(T2)))     # a persistent UNMESHED near hole (must render)
+	var hole_tz := int(floor(float(cz) / float(T2)))
+	var cov_tx := int(floor(float(cy - 80) / float(T2)))      # a tile the near field meshes over (must drop)
+	var cov_tz := int(floor(float(cz) / float(T2)))
+	var none_stub := func(_f: int, _b: AABB) -> bool: return false           # near field: nothing meshed yet
+	var mesh_stub := func(_f: int, box: AABB) -> bool:                       # meshed everywhere EXCEPT the hole
+		var qtx := int(round(box.position.x / float(T2)))
+		var qtz := int(round(box.position.z / float(T2)))
+		return not (qtx == hole_tx and qtz == hole_tz)
+
+	# Baseline: arrive at the pose with NO coverage query (invalid Callable) — every in-range owned tile is
+	# emitted, exactly the pre-fix behaviour. This is the "before" tile-emit count (the fill/overdraw proxy).
+	var skin_base := SKIN.new()
+	get_root().add_child(skin_base)
+	skin_base.setup(fid)
+	skin_base.update(fid, Vector3(float(cy), float(g0), float(cz)), fids)    # 3-arg → no skip
+	var base_tiles := skin_base.tile_count()
+	var base_has_cov := skin_base.has_tile(fid, cov_tx, cov_tz)
+	var base_has_hole := skin_base.has_tile(fid, hole_tx, hole_tz)
+
+	# With coverage: arrive over a streaming near field, THEN stand while it meshes in (reap a few throttle
+	# ticks to clear COVER_CONFIRM). The covered tiles must be gone; the hole must remain.
+	var skin_cov := SKIN.new()
+	get_root().add_child(skin_cov)
+	skin_cov.setup(fid)
+	skin_cov.update(fid, Vector3(float(cy), float(g0), float(cz)), fids, none_stub)   # arrive (gap-fill)
+	var stream_tiles := skin_cov.tile_count()
+	var stream_has_cov := skin_cov.has_tile(fid, cov_tx, cov_tz)              # rendered while streaming
+	for _r in range(0, 4):
+		skin_cov.gate_reap(fid, Vector3(float(cy), float(g0), float(cz)), mesh_stub)  # stand: mesh settles
+	var settled_tiles := skin_cov.tile_count()
+	var settled_has_cov := skin_cov.has_tile(fid, cov_tx, cov_tz)
+	var settled_has_hole := skin_cov.has_tile(fid, hole_tx, hole_tz)
+	print("  ... COVER: tiles emitted no-skip=%d ; streaming(gap-fill)=%d ; standing-settled=%d ; covered-tile %s(stream)->%s(settled) ; hole settled=%s"
+		% [base_tiles, stream_tiles, settled_tiles, str(stream_has_cov), str(settled_has_cov), str(settled_has_hole)])
+	_ok(base_has_cov and base_has_hole, "G-SKIN-COVER — baseline (no coverage query) emits both the covered tile and the hole (the overdraw exists to remove)")
+	_ok(stream_has_cov, "G-SKIN-COVER — while the near field is STILL STREAMING the tile IS emitted (immediate gap-fill preserved)")
+	_ok(not settled_has_cov, "G-SKIN-COVER — once the near field meshes in, the covered tile is REAPED while standing (the standing overdraw is removed)")
+	_ok(settled_has_hole, "G-SKIN-COVER — a tile over a persistent UNMESHED hole KEEPS rendering (gap-fill not over-reaped)")
+	_ok(settled_tiles < base_tiles, "G-SKIN-COVER — the standing-settled emit count fell far below baseline (%d -> %d)" % [base_tiles, settled_tiles])
+
+	# FALSIFY: if the near field NEVER meshes (all-exposed query), the covered tile is NEVER reaped — proving
+	# the skip is driven by CONFIRMED coverage, not by anything incidental (position, budget, ownership, time).
+	var skin_fals := SKIN.new()
+	get_root().add_child(skin_fals)
+	skin_fals.setup(fid)
+	skin_fals.update(fid, Vector3(float(cy), float(g0), float(cz)), fids, none_stub)
+	for _r2 in range(0, 4):
+		skin_fals.gate_reap(fid, Vector3(float(cy), float(g0), float(cz)), none_stub)
+	_ok(skin_fals.has_tile(fid, cov_tx, cov_tz),
+		"G-SKIN-COVER-FALS — with nothing ever meshed the tile is NEVER reaped (the skip is coverage-driven, the test bites)")
+
+	# G-SKIN-MEM still holds under the skip (skipping/reaping only ever removes tiles → bytes can only fall).
+	_ok(skin_cov.total_bytes() <= SKIN.MAX_BYTES, "G-SKIN-COVER — the 8 MB ceiling still holds with the skip on")
+
 	_done(0 if _fail == 0 else 1)
 
 ## The front-hemisphere neighbour facets of `fid` (a handful) — the candidate set the live skin covers.

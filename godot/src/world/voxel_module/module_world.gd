@@ -2105,6 +2105,23 @@ func pool_bounds(fid: int) -> AABB:
 ## A pool terrain node (the gate's is_area_meshed / statistics probes). null if absent.
 func pool_terrain(fid: int) -> Node3D:
 	return _pool[fid]["terrain"] if _pool.has(fid) else null
+
+## COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): is facet `fid`'s near voxel field fully meshed over the
+## fid-LATTICE box `aabb`? The skin builds tiles in fid-lattice, and a VoxelTerrain's is_area_meshed operates
+## in its OWN voxel (= fid-lattice) coordinates regardless of the slot's Node3D transform — the SAME reason
+## pool_seam_meshed reframes into fid-lattice before probing — so the tile AABB maps in directly, no reframe.
+## Returns false (→ the skin RENDERS the tile) whenever the fid is not live, its terrain lacks the probe, or
+## the box is not fully meshed (a streaming hole). This is the underlay coverage the skin's covered-tile skip
+## consumes; it is a pure read, so it adds no streaming/apply cost.
+func skin_near_meshed(fid: int, aabb: AABB) -> bool:
+	var t: Object = null
+	if _pool.has(fid):
+		t = _pool[fid]["terrain"]
+	elif fid == _pool_active or fid == TerrainConfig.active_facet():
+		t = _terrain
+	if t == null or not t.has_method("is_area_meshed"):
+		return false
+	return bool(t.call("is_area_meshed", aabb))
 ## FP-M1c view-ramp introspection (§5). pool_view: the LIVE engine-applied max_view_distance (read off the terrain,
 ## not the bookkeeping int — the honest value the ramp gate asserts). pool_view_target: the ramp goal. -1 if absent.
 func pool_view(fid: int) -> int:

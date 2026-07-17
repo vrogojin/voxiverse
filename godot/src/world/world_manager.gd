@@ -638,7 +638,14 @@ func update_streaming(player_pos: Vector3) -> void:
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
 	if _skin != null:
-		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids())
+		# COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): hand the skin a coverage Callable so it can drop
+		# tiles that sit wholly behind the CONFIRMED-meshed near voxels (pure fill overdraw). Routed to
+		# module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the fallback /
+		# no-module path leaves the skin's skip inert (byte-identical, renders every in-range tile).
+		var cover_query := Callable()
+		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
+			cover_query = Callable(_module_world, "skin_near_meshed")
+		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:

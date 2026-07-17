@@ -70,6 +70,34 @@ const RENDER_COPY_FACTOR := 2        # true peak = CPU merge-source arrays + the
                                      # merged mesh ≈ 2× the vertex bytes. The ceiling binds on this footprint,
                                      # so `_src_bytes` (the counted vertex data) is effectively capped at 4 MB.
 
+# --- COVERED-TILE SKIP (the overdraw fix, §10 C3 "underlay contract") -----------------------------
+# The measured cost of the skin was NOT draws (the merge fixed those — 189 both ways) but FILL: a skin
+# tile in the 64..128 band renders BEHIND the opaque near voxels, and on the gl_compatibility web path a
+# shaded opaque fragment is not reliably early-z-rejected (no depth prepass; hardware early-z of a lit
+# fragment is best-effort and weak on a throttled integrated GPU), so those occluded fragments shade for
+# nothing — close to the camera, at high pixel density. A tile whose whole footprint is inside CONFIRMED-
+# MESHED near coverage is therefore pure overdraw: we DON'T emit it (the underlay contract the far ring
+# already uses). Tiles over UNMESHED near regions (streaming holes) or beyond the near radius still render
+# — that is the skin's actual job (immediate gap-fill + the annulus). Coverage is queried via a Callable
+# (fid, fid-lattice AABB) -> bool routed to module_world.skin_near_meshed (godot_voxel is_area_meshed);
+# an INVALID callable (no module / fallback path) means "never covered" → byte-identical to pre-skip.
+const NEAR_COVER_R := 144.0          # only PROBE tiles within this radius for coverage — the near field can
+                                     # only cover ~128; beyond it the annulus always renders (no probe cost).
+const COVER_Y_MARGIN := 40.0         # the coverage AABB's radial half-band around the tile's sampled surface
+                                     # (mirrors pool_seam_meshed's 40): tall enough to span the meshed surface
+                                     # shell, short enough to stay inside the loaded vertical extent (a band
+                                     # past the view distance would read un-meshed air blocks → false → render).
+const REAP_INTERVAL_MS := 100        # while STANDING, re-probe the built tiles' coverage at most this often
+                                     # (10 Hz) — enough to catch the ~1 s post-stop mesh settle, cheap enough
+                                     # that the transient probe cost is nil, and it self-terminates once the
+                                     # covered tiles are evicted (nothing left within NEAR_COVER_R to probe).
+const COVER_CONFIRM := 2             # anti-churn hysteresis: a tile must read covered on COVER_CONFIRM
+                                     # CONSECUTIVE re-evals (each a ≥TILE·0.5 move, since update() early-returns
+                                     # while stationary) before it is dropped from the merge; ANY exposed read
+                                     # resets it and it renders immediately (gap-fill promptness outranks a rare
+                                     # pace-across-boundary churn). So a streaming boundary that flickers each
+                                     # beat never reaches the skip and never thrashes the re-merge.
+
 var _sampler: Callable               # (fid:int, packed:PackedInt64Array) -> {heights,biomes,water,colors}
 var _sampler_obj: Object = null      # STRONG ref to the sampler's object (the compiled generator is a
                                      # RefCounted a Callable does NOT keep alive) — held so it is not freed
@@ -84,6 +112,10 @@ var _tiles: Dictionary = {}
 var _facets: Dictionary = {}
 var _src_bytes := 0                  # sum of the per-tile vertex bytes (the CPU merge source). Footprint = 2×.
 var _last_center := Vector3(1e18, 1e18, 1e18)   # last player world pos an update scheduled from
+# Covered-tile skip hysteresis: tileKey -> count of CONSECUTIVE covered re-evals (see COVER_CONFIRM). Pruned
+# to the current candidate set each update() so it stays bounded by the annulus tile count (a few KB of ints).
+var _cover_hold: Dictionary = {}
+var _last_reap_ms := 0               # throttle clock for the standing-still coverage reap (REAP_INTERVAL_MS)
 
 # --- lifecycle -----------------------------------------------------------------------------------
 
@@ -135,23 +167,50 @@ func _placement_xform() -> Transform3D:
 ##
 ## Only facets whose tile set CHANGED this call are re-merged at the end (the incremental merge, main-thread
 ## cheap — no re-sample). The TILE·0.5 hysteresis keeps this (and the re-merge) from firing every frame.
-func update(active_fid: int, player_lattice: Vector3, fids: PackedInt32Array) -> void:
+func update(active_fid: int, player_lattice: Vector3, fids: PackedInt32Array,
+		cover_query: Callable = Callable()) -> void:
 	_active_fid = active_fid
 	var pw := _lattice_world(active_fid, player_lattice.x, player_lattice.y, player_lattice.z)
-	# Small hysteresis: only reschedule when the player moved enough to matter (avoids per-frame churn).
+	# Small hysteresis: only RESCHEDULE (the expensive rank/build over all candidate facets) when the player
+	# moved enough to matter — never per frame. But the near field finishes MESHING ~1 s AFTER the player
+	# stops (streaming lag), and that is exactly when the covered-tile skip must drop the now-hidden tiles —
+	# the standing-still overdraw the fix targets. So while stationary we still run a CHEAP, self-terminating
+	# coverage REAP of the tiles already built (throttled; no rank, no new builds): it evicts each tile as the
+	# near voxels below it confirm meshed, then goes quiet (nothing left to evict → no re-merge). No-op without
+	# a cover_query (the fallback / no-module path) → byte-identical to the movement-only schedule.
 	if pw.distance_to(_last_center) < float(TILE) * 0.5 and _tiles.size() > 0:
+		if cover_query.is_valid() and _reap_due():
+			_reap_covered(pw, cover_query)
 		return
 	_last_center = pw
 
 	var dirty := {}                                # fids whose tile set changed → re-merge at the end
-	# Rank every in-range, OWNED tile by distance, build nearest-first until the budget binds.
-	var wanted := _rank_tiles(pw, fids)            # Array of [dist, fid, tx, tz], sorted ascending
-	var keep := {}
+	# Rank every in-range, OWNED tile by distance (nearest-first, dist-sorted ascending).
+	var wanted := _rank_tiles(pw, fids)            # Array of [dist, fid, tx, tz]
+
+	# PHASE 1 — decide the KEEP set (rank + covered-tile skip), WITHOUT building. The covered-tile skip
+	# advances the hysteresis streak for EVERY candidate (not just built ones), so a whole band confirms
+	# together and, once confirmed, stays skipped — no per-beat flip. An invalid cover_query (no module /
+	# fallback) never skips → keep == every in-range tile → byte-identical to the pre-skip schedule.
+	var keep := {}                                 # key -> true for tiles that SHOULD render this beat
+	var seen := {}                                 # every candidate key (for _cover_hold pruning)
+	for entry in wanted:
+		var key: String = _key(int(entry[1]), int(entry[2]), int(entry[3]))
+		seen[key] = true
+		if not _tile_covered(int(entry[1]), int(entry[2]), int(entry[3]), float(entry[0]), cover_query):
+			keep[key] = true
+	# PHASE 2 — evict tiles no longer kept (out of range / now covered) FIRST, so the byte budget below
+	# reflects only the surviving set. (Evicting before building is what stops a band flipping covered from
+	# transiently pinning the budget with about-to-die tiles and starving the frontier — the churn trap.)
+	for key in _tiles.keys():
+		if not keep.has(key):
+			dirty[int(_tiles[key]["fid"])] = true
+			_evict(key)
+	# PHASE 3 — build the kept tiles that aren't present yet, nearest-first, under the 8 MB ceiling.
 	for entry in wanted:
 		var fid := int(entry[1])
-		var key: String = _key(fid, int(entry[2]), int(entry[3]))
-		keep[key] = true
-		if _tiles.has(key):
+		var key2: String = _key(fid, int(entry[2]), int(entry[3]))
+		if not keep.has(key2) or _tiles.has(key2):
 			continue
 		var m := _build_tile(fid, int(entry[2]), int(entry[3]))
 		if m.is_empty():
@@ -161,18 +220,95 @@ func update(active_fid: int, player_lattice: Vector3, fids: PackedInt32Array) ->
 			# Budget bound: stop adding (the rest of the annulus is the far ring's job). NEVER-OOM.
 			break
 		m["dist"] = float(entry[0])
-		_tiles[key] = m
+		_tiles[key2] = m
 		_src_bytes += b
-		_register_key(fid, key)
+		_register_key(fid, key2)
 		dirty[fid] = true
-	# Evict tiles no longer wanted (out of range / past budget).
-	for key in _tiles.keys():
-		if not keep.has(key):
-			dirty[int(_tiles[key]["fid"])] = true
-			_evict(key)
+	# Prune the hysteresis map to this beat's candidate set so it stays bounded (a tile that left the
+	# annulus entirely drops its streak; a re-entrant tile re-confirms from scratch).
+	for key in _cover_hold.keys():
+		if not seen.has(key):
+			_cover_hold.erase(key)
 	# Incremental merge: rebuild ONLY the facets whose tile set changed (§ Part A).
 	for fid in dirty.keys():
 		_remerge_facet(int(fid))
+
+## COVERED-TILE SKIP decision (the overdraw fix). Returns true only when tile (fid,tx,tz) is CONFIRMED to
+## sit wholly inside meshed near coverage — so it renders behind the opaque near voxels for nothing. Two
+## guards keep the skin's real job intact: (1) tiles past NEAR_COVER_R (the annulus / beyond the near field)
+## are never skipped — the near voxels cannot cover them; (2) COVER_CONFIRM consecutive covered re-evals are
+## required before a skip, and ANY exposed read resets the streak and renders immediately, so a streaming
+## hole (the gap-fill case) is filled promptly and a flickering boundary never thrashes the merge. An invalid
+## `cover_query` (no module / fallback path) always returns false → the skip is inert (byte-identical).
+func _tile_covered(fid: int, tx: int, tz: int, dist: float, cover_query: Callable) -> bool:
+	var key := _key(fid, tx, tz)
+	if not cover_query.is_valid() or dist > NEAR_COVER_R:
+		_cover_hold.erase(key)                     # out of the near field / no query → render, reset streak
+		return false
+	if not _probe_covered(fid, tx, tz, cover_query):
+		_cover_hold.erase(key)                     # exposed (a hole, or the near field hasn't meshed here yet)
+		return false
+	var streak := int(_cover_hold.get(key, 0)) + 1
+	_cover_hold[key] = streak
+	return streak >= COVER_CONFIRM                 # skip only once confirmed-covered for COVER_CONFIRM beats
+
+## Is tile (fid,tx,tz)'s whole footprint meshed in the near field? Sample the 5 extreme columns (4 corners +
+## centre — cheap vs the 1089-column full build) to bound the tile's surface height, then ask `cover_query`
+## whether the fid-lattice AABB spanning that footprint ± COVER_Y_MARGIN is fully meshed (godot_voxel
+## is_area_meshed, which is true only when EVERY mesh block in the box is applied — exactly "fully behind
+## confirmed near voxels"). A partly-streamed tile reads false → renders (gap-fill preserved).
+func _probe_covered(fid: int, tx: int, tz: int, cover_query: Callable) -> bool:
+	var ox := tx * TILE
+	var oz := tz * TILE
+	var probe := PackedInt64Array([
+		_pack_xz(ox, oz), _pack_xz(ox + TILE, oz), _pack_xz(ox, oz + TILE),
+		_pack_xz(ox + TILE, oz + TILE), _pack_xz(ox + TILE / 2, oz + TILE / 2)])
+	var res: Dictionary = _sampler.call(fid, probe)
+	var h: PackedFloat32Array = res["heights"]
+	if h.size() < 5:
+		return false                               # bad sample → treat as exposed (render, never over-skip)
+	var gmin := h[0]
+	var gmax := h[0]
+	for i in range(1, h.size()):
+		gmin = minf(gmin, h[i])
+		gmax = maxf(gmax, h[i])
+	var aabb := AABB(Vector3(float(ox), gmin - COVER_Y_MARGIN, float(oz)),
+		Vector3(float(TILE), (gmax - gmin) + 2.0 * COVER_Y_MARGIN, float(TILE)))
+	return bool(cover_query.call(fid, aabb))
+
+## Is the standing-still coverage reap due (≥ REAP_INTERVAL_MS since the last one)? Throttles the reap to
+## ~10 Hz so the per-tile probe cost stays negligible during the ~1 s the near field takes to settle.
+func _reap_due() -> bool:
+	return Time.get_ticks_msec() - _last_reap_ms >= REAP_INTERVAL_MS
+
+## Standing-still reap: re-probe ONLY the tiles already built (no rank, no new builds) and evict any that
+## have since become CONFIRMED-covered by the near field meshing in below them. Self-terminating — once the
+## covered tiles are gone the survivors are the annulus (dist > NEAR_COVER_R → the probe short-circuits, no
+## sample) and any genuine holes (still exposed → kept), so subsequent reaps find nothing to evict and issue
+## no re-merge. This is what removes the overdraw the player sees while STANDING (the measured 20 fps hit),
+## which the movement-gated schedule alone cannot, because it never re-evaluates while the player is still.
+func _reap_covered(pw: Vector3, cover_query: Callable) -> void:
+	_last_reap_ms = Time.get_ticks_msec()
+	var dirty := {}
+	for key in _tiles.keys():
+		var t: Dictionary = _tiles[key]
+		var fid := int(t["fid"])
+		var parts: PackedStringArray = key.split(":")
+		var tx := int(parts[1])
+		var tz := int(parts[2])
+		var c := _lattice_world(fid, float(tx * TILE + TILE / 2), 0.0, float(tz * TILE + TILE / 2))
+		if _tile_covered(fid, tx, tz, pw.distance_to(c), cover_query):
+			dirty[fid] = true
+			_evict(key)
+	for fid in dirty.keys():
+		_remerge_facet(int(fid))
+
+## Test seam (verify_skin G-SKIN-COVER standing case): run one reap immediately, bypassing the throttle, so
+## the gate can drive the standing-still eviction deterministically without wall-clock delays.
+func gate_reap(active_fid: int, player_lattice: Vector3, cover_query: Callable) -> void:
+	_active_fid = active_fid
+	var pw := _lattice_world(active_fid, player_lattice.x, player_lattice.y, player_lattice.z)
+	_reap_covered(pw, cover_query)
 
 ## The candidate tiles within R_OUTER of the player AND owned by their facet, as [dist, fid, tx, tz],
 ## sorted nearest-first. Ownership (Part B): a tile belongs to `fid` iff its CENTRE column is inside fid's

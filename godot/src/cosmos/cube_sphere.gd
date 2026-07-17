@@ -287,6 +287,45 @@ const FP_FARRING_FULL_COVER := false
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
 
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
+## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
+## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already
+## applied on it — a 15-25-block poke-through FLASH on every crossing/pool change near mountains. When true (requires
+## FP_FARRING_FULL_COVER), the far ring's backstop role is made STICKY: the set is grown EAGERLY to active ∪ the
+## active facet's ring-1 neighbours ∪ recently-active (so a facet is ALREADY drawn sunk BEFORE it enters the pool and
+## near meshes arrive — "sink early"), and a facet LEAVING the set keeps its backstop role for STICKY_HOLD more
+## role-events ("unsink late") so it never reverts to a coarse unsunk quad while near meshes may still be applied.
+## NEVER-OOM: the dense backstop cache grows from ≤ 1+POOL_MAX_NEIGHBOURS (5) to ≤ 1+STICKY_RING1_MAX (12) facets
+## ≈ +96 kB — a stated, bounded ceiling (G-TIER-STICKY-BOUND). Default OFF → `_sticky` stays empty, `_is_backstop`
+## is the shipped active∪`_excluded`, FLAT stays 6035/0 (byte-identical). Flipped ON at export after the live A/B.
+const FP_TIER_STICKY_BACKSTOP := false
+const STICKY_HOLD := 2            # role-events an ex-backstop facet stays sunk before it may revert (≥ worst rebuild latency)
+const STICKY_RING1_MAX := 12      # hard cap on the sticky backstop set (1 active + ≤8 ring-1 + a few recently-active)
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.1 / §7 P2) — the MIN-ENVELOPE vertex rule.
+## Fixes RC-A (the steady ~4-block poke at a mountain flank near a facet corner): the constant BACKSTOP_SINK is
+## arithmetically insufficient in the tail because the far ring pushes relief along the sphere RADIUS d̂ while the
+## near lattice stacks blocks along the facet NORMAL n̂ — a resolution-independent skew of up to ~5-8 blocks that no
+## sink/cell tuning removes. When true (requires FP_FARRING_FULL_COVER), each dense backstop vertex's height becomes a
+## PROVABLE LOWER ENVELOPE: env(i) = min{ near g over i's dilated 2×2-coarse-cell footprint } − ε, sampled at
+## TierPlace.ENV_FINE_MULT × the coarse resolution (the footprint min bounds the interpolation/aliasing/skew terms by
+## construction, §5.1). The constant sink then collapses to the small ε guard (TierPlace.backstop_sink()). Zero
+## PERSISTENT memory (same 17² grids, different values); +~(ENV_FINE_MULT·CELLS+1)² transient profile samples per facet
+## cache build. Applies to BACKSTOP facets (distant CELLS=4 facets are a follow-up). Default OFF → the vertex height is
+## the shipped profile_at_dir g and the sink is BACKSTOP_SINK (byte-identical, FLAT 6035/0). Truth gate: verify_tier_depth.gd G-TIER-ENVELOPE.
+const FP_TIER_ENVELOPE := false
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.2 / §3.3 / §7 P3) — per-tier WINDOW-SPACE
+## depth bias + a raised camera near plane. Addresses RC-C (24-bit depth precision, latent past ~1 km): a constant
+## window-space offset of k depth quanta (POSITION.z += 2k·2⁻²⁴·w) pushes each coarser tier exactly k quanta behind at
+## EVERY distance, so coincident surfaces resolve in tier order (blocks > skin > far ring) even where an eye-space sink
+## has collapsed into one quantum. When true, the far-ring + skin StandardMaterial3D are replaced by an equivalent LIT
+## vertex-colour ShaderMaterial carrying the bias (k = TierPlace.FAR_BIAS_K = 8 far ring, TierPlace.SKIN_BIAS_K = 4 skin;
+## near blocks stay UNBIASED/authoritative), and player.gd raises the faceted camera near plane 0.05 → 0.25 (5× depth
+## precision for free — precision scales linearly with near). Zero memory (2 small shaders). Default OFF → the shipped
+## StandardMaterial3D + near 0.05, byte-identical (FLAT 6035/0). Truth gate: verify_tier_depth.gd G-TIER-DEPTH-BIAS.
+const FP_TIER_DEPTH_BIAS := false
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles

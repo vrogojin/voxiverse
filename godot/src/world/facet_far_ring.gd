@@ -56,6 +56,18 @@ var _reemit_count := 0               # diagnostics: full re-emits done (gate: se
 # CubeSphere.FP_R0). Their flat quad is suppressed here so the real voxels don't z-fight the ring. Empty
 # on the shipped build (FP_R0 off) → the ring draws every non-active facet exactly as before, byte-identical.
 var _excluded: Dictionary = {}       # fid -> true (skipped in the visible set, same as the active facet is skipped)
+# COSMOS TIER-DEPTH-PRIORITY P1 (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3): the STICKY backstop set under
+# FP_TIER_STICKY_BACKSTOP. Grown EAGERLY to active ∪ ring-1 (make-before-break: a facet is drawn sunk BEFORE it
+# enters the pool) and shrunk LAZILY (a departing facet holds its backstop role STICKY_HOLD role-events so it never
+# reverts to an unsunk coarse quad while near meshes may still be applied). `_is_backstop` unions this. Empty with
+# the flag off → `_is_backstop` is the shipped active∪`_excluded`, byte-identical. `_sticky_hold` is the per-fid
+# remaining-hold countdown driving the lazy shrink; recomputed on every set_active/set_pool_excluded (a role-event).
+var _sticky: Dictionary = {}         # fid -> true (currently a sticky backstop)
+var _sticky_hold: Dictionary = {}    # fid -> int (role-events left before this ex-target may drop out of _sticky)
+# COSMOS TIER-DEPTH-PRIORITY P1 gate visibility: which fids were emitted AS BACKSTOP (sunk) in the CURRENTLY committed
+# mesh — the make-before-break invariant is "every pool facet is an emitted backstop at the moment near meshes apply",
+# and that is a property of the LAST rebuild's roles, not the live `_is_backstop`. Recorded at each rebuild/swap.
+var _emitted_backstop: Dictionary = {}   # fid -> true (drawn sunk in the committed mesh)
 # COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
 # (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
 # per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
@@ -81,6 +93,7 @@ var _async_build_us := 0
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
+	_recompute_sticky()              # TIER-DEPTH P1: seed the sticky backstop set so ring-1 is sunk from the first build (no-op with the flag off)
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
@@ -96,6 +109,7 @@ func setup(active_fid: int) -> void:
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
 	transform = _placement_xform()   # rigid re-place (cheap); identity under FP-FIXED-FRAME (no re-place)
+	_recompute_sticky()              # TIER-DEPTH P1: grow the sticky set to the NEW active's ring-1 (no-op with the flag off)
 	_pending = true
 
 ## FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §1.4/§2.2 step 8): the ring mesh is built in ABSOLUTE planet
@@ -135,6 +149,7 @@ func set_pool_excluded(fids: Array) -> void:
 	if next == _excluded:
 		return
 	_excluded = next
+	_recompute_sticky()   # TIER-DEPTH P1: fold the new pool set into the sticky backstop (no-op with the flag off)
 	_pending = true   # deferred rebuild (the crossing's set_active already re-placed the mesh rigidly)
 
 ## FP-S1(d): drive the deferred rebuild off the crossing frame. Cache-warm the newly-front-hemisphere facets under a
@@ -221,8 +236,11 @@ func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
 		verts = (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
 	_mi.mesh = mesh
 	_emitted.clear()
+	_emitted_backstop.clear()   # TIER-DEPTH P1: the async build drew the FROZEN `_async_backstop` roles as sunk
 	for fid in fids:
 		_emitted[fid] = true
+		if _async_backstop.has(fid):
+			_emitted_backstop[fid] = true
 	_reemit_count += 1
 	_push_event("async", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
 
@@ -269,7 +287,36 @@ func _front_visible(fid: int, nrm: Array) -> bool:
 ## BACKSTOP_CELLS and sunk radially by BACKSTOP_SINK at emit; every other front-hemisphere facet keeps its exact shipped
 ## CELLS geometry. Role is decided at emit time (keyed by the current active/excluded state), never baked into a cache.
 func _is_backstop(fid: int) -> bool:
-	return fid == _active_fid or _excluded.has(fid)
+	return fid == _active_fid or _excluded.has(fid) or _sticky.has(fid)
+
+## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded
+## / setup). Make-before-break: the TARGET = active ∪ ring-1 neighbours (the design's set; a facet the player can cross into
+## is a seam neighbour = ring-1, so it is already drawn sunk BEFORE it enters the pool and near meshes arrive). Unsink-late
+## ("recently-active"): a facet that WAS sticky but is no longer a target keeps its role for STICKY_HOLD more role-events (a
+## hold countdown), so a just-departed facet never reverts to a coarse unsunk quad while its near meshes may still be
+## applied. Pool facets OUTSIDE ring-1 are already backstop via `_excluded.has` (unioned in `_is_backstop`) and revert
+## benignly (a dip) when they leave — so they are deliberately NOT unioned into the TARGET, keeping `_sticky` rigorously
+## bounded by ring-1 (≤ STICKY_RING1_MAX, the +96 kB dense-cache ceiling). No-op (empty `_sticky`) unless the flag is on.
+func _recompute_sticky() -> void:
+	if not TierPlace.sticky_on():
+		return
+	var target := {}
+	for f in TierPlace.ring1(_active_fid):
+		target[int(f)] = true
+	# Grow eagerly: every target is sticky now, hold refreshed to full.
+	for f in target.keys():
+		_sticky[int(f)] = true
+		_sticky_hold[int(f)] = CubeSphere.STICKY_HOLD
+	# Shrink lazily: a sticky facet no longer targeted decrements its hold; only at 0 does it drop.
+	for f in _sticky.keys():
+		if target.has(int(f)):
+			continue
+		var h := int(_sticky_hold.get(int(f), 0)) - 1
+		if h <= 0:
+			_sticky.erase(int(f))
+			_sticky_hold.erase(int(f))
+		else:
+			_sticky_hold[int(f)] = h
 
 ## The full scan + re-emit + commit (the OLD _rebuild). Runs at setup, from _process once warming completes, and
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
@@ -277,9 +324,12 @@ func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
 	var fids := visible_fids()
 	_emitted.clear()
+	_emitted_backstop.clear()   # TIER-DEPTH P1: record which fids this build draws SUNK (the make-before-break gate reads it)
 	for fid in fids:
 		_ensure_emit_cached(fid)
 		_emitted[fid] = true
+		if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+			_emitted_backstop[fid] = true
 	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
 	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
 	# T2e: time the mesh BUILD (assembler) and the SWAP (mesh assign / RID create + instance update) separately — two
@@ -409,6 +459,23 @@ func is_emitted(fid: int) -> bool: return _emitted.has(fid)
 func emitted_count() -> int: return _emitted.size()
 func is_backstop(fid: int) -> bool: return _is_backstop(fid)     # COSMOS far-ring full coverage — gate visibility
 func backstop_cache_size() -> int: return _bpos_cache.size()     # G-FRC-BOUND: dense caches ≤ 5-facet bound
+func is_emitted_backstop(fid: int) -> bool: return _emitted_backstop.has(fid)   # TIER-DEPTH P1: fid drawn SUNK in the committed mesh
+func is_sticky(fid: int) -> bool: return _sticky.has(fid)        # TIER-DEPTH P1 gate visibility
+func sticky_count() -> int: return _sticky.size()               # TIER-DEPTH P1: sticky set ≤ STICKY_RING1_MAX bound
+
+## TIER-DEPTH P2 gate: the SUNK (as-rendered) dense backstop vertex positions for facet `fid` — the cache (envelope or
+## constant-relief) pushed in by the current emit sink (TierPlace.backstop_sink). The gate projects these onto the near
+## height field (world_to_lattice64) to prove the rendered coarse surface never rises above the near block tops.
+func backstop_rendered_positions(fid: int) -> PackedVector3Array:
+	_ensure_backstop_cached(fid)
+	return _sunk_positions(_bpos_cache[fid])
+
+## TIER-DEPTH P2 gate: the RAW (un-sunk) dense backstop cache for facet `fid` — the ENVELOPE heights under FP_TIER_ENVELOPE,
+## the plain profile_at_dir relief otherwise. The gate applies its OWN fixed ε sink to this so it can prove the ENVELOPE
+## property in isolation (a lower bound at a small sink) vs the plain sample (which needs the full 6-block sink to hold).
+func backstop_raw_positions(fid: int) -> PackedVector3Array:
+	_ensure_backstop_cached(fid)
+	return _bpos_cache[fid]
 
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
@@ -457,6 +524,12 @@ func _ensure_emit_cached(fid: int) -> void:
 func _ensure_backstop_cached(fid: int) -> void:
 	if _bpos_cache.has(fid):
 		return
+	# TIER-DEPTH P2 (§5.1): under the min-envelope rule each vertex height becomes a PROVABLE lower bound of the near
+	# surface over its dilated footprint, replacing the constant sink. Separate builder so the flag-off path is textually
+	# the shipped per-vertex profile sample (byte-identical).
+	if TierPlace.envelope_on():
+		_ensure_backstop_cached_env(fid)
+		return
 	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
 	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
 	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
@@ -482,11 +555,81 @@ func _ensure_backstop_cached(fid: int) -> void:
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
 
+## TIER-DEPTH P2 (§5.1): the MIN-ENVELOPE dense backstop cache. Each of the (BACKSTOP_CELLS+1)² coarse vertices keeps its
+## own planar position b and radial direction d̂ (grid unchanged — NOT a re-mesh), but its HEIGHT becomes a provable lower
+## bound of the near surface: the MINIMUM near g over the vertex's 2×2-coarse-cell footprint DILATED by the radial-vs-
+## normal skew reach, sampled on a fine grid at ENV_FINE_MULT × the coarse resolution. A rendered backstop triangle is a
+## convex combination of three such corner minima, so it stays ≤ the near surface everywhere in the overlap BY
+## CONSTRUCTION (no tuned constant — the proof). The small radial ε sink at emit (TierPlace.backstop_sink) covers the
+## sub-fine-sample residual + f32 rounding. Colour is the vertex's OWN direct biome/water sample (cosmetic). Costs
+## ~(ENV_FINE_MULT·cells+1)² transient profile_at_dir samples at cache build; ZERO persistent bytes (same 17² grid). Uses
+## the far ring's own profile_at_dir funnel (byte-equal to sample_columns by the one-sampler law), so no facet-param→
+## lattice remap is introduced. NEVER-OOM: the fine grid is transient and bounded; no cache grows with walk distance.
+func _ensure_backstop_cached_env(fid: int) -> void:
+	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
+	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
+	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
+	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var mult := TierPlace.ENV_FINE_MULT
+	var fine := cells * mult
+	var fstride := fine + 1
+	# Fine near-g grid over the facet (pitch = edge/fine ≈ 3 blocks): one profile_at_dir per fine node.
+	var fg := PackedInt32Array()
+	fg.resize(fstride * fstride)
+	for fj in range(fstride):
+		for fi in range(fstride):
+			var s := float(fi) / float(fine)
+			var t := float(fj) / float(fine)
+			var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
+			var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
+			var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
+			var ln := sqrt(bx * bx + by * by + bz * bz)
+			var prof := TerrainConfig.profile_at_dir(bx / ln, by / ln, bz / ln, FacetAtlas.R_BLOCKS)
+			fg[fj * fstride + fi] = int(prof.x)
+	# Skew dilation, in fine-sample units: the far vertex lands displaced ≤ ENV_DILATE_BLOCKS from its footprint b.
+	var edge_blocks := (PI * 0.5 * FacetAtlas.R_BLOCKS) / float(FacetAtlas.K)
+	var fine_pitch := edge_blocks / float(fine)
+	var dil := int(ceil(TierPlace.ENV_DILATE_BLOCKS / maxf(fine_pitch, 0.001)))
+	var half := mult + dil                       # footprint = ±1 coarse cell (±mult fine) + the skew dilation
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var s := float(gi) / float(cells)
+			var t := float(gj) / float(cells)
+			var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
+			var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
+			var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
+			var ln := sqrt(bx * bx + by * by + bz * bz)
+			var dx := bx / ln; var dy := by / ln; var dz := bz / ln
+			var fic := gi * mult
+			var fjc := gj * mult
+			var gmin := 1 << 30
+			for wj in range(fjc - half, fjc + half + 1):
+				if wj < 0 or wj >= fstride:
+					continue
+				var rowoff := wj * fstride
+				for wi in range(fic - half, fic + half + 1):
+					if wi < 0 or wi >= fstride:
+						continue
+					var gg: int = fg[rowoff + wi]
+					if gg < gmin:
+						gmin = gg
+			var relief := maxf(0.0, float(gmin - TerrainConfig.SEA_LEVEL)) * RELIEF
+			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))   # ABSOLUTE, envelope height, un-sunk
+			var vp := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
+			var vg := int(vp.x)
+			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+	_bpos_cache[fid] = pos
+	_bcol_cache[fid] = col
+
 ## COSMOS far-ring full coverage (§2): return a copy of grid positions `p` pushed radially inward by BACKSTOP_SINK
 ## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
 ## emit so a shared grid vertex is not re-normalized per triangle. Pure math — safe on the async worker thread.
 func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
-	var sink := CubeSphere.BACKSTOP_SINK
+	var sink := TierPlace.backstop_sink()   # TIER-DEPTH P2: ε guard under the envelope, else the shipped BACKSTOP_SINK
 	var out := PackedVector3Array()
 	out.resize(p.size())
 	for i in range(p.size()):
@@ -592,7 +735,13 @@ func _facet_centre_dir(fid: int) -> Array:
 static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t
 
-func _make_material() -> StandardMaterial3D:
+func _make_material() -> Material:
+	# TIER-DEPTH P3 (§5.2): the far ring is the coarsest overlapping tier → an 8-quantum window-space depth bias so it
+	# loses every coincident-depth tie to the skin and near blocks at ANY distance. The biased material is a LIT
+	# vertex-colour spatial shader equivalent to the StandardMaterial3D below (fog/tonemap applied by the environment).
+	# Flag off → the shipped StandardMaterial3D verbatim (byte-identical).
+	if TierPlace.depth_bias_on():
+		return TierPlace.make_biased_material(TierPlace.far_bias())
 	var m := StandardMaterial3D.new()
 	m.vertex_color_use_as_albedo = true
 	m.cull_mode = BaseMaterial3D.CULL_DISABLED     # far ring: winding-agnostic (transforms may flip facets)

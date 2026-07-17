@@ -110,6 +110,11 @@ func _ready() -> void:
 	# must reach it; otherwise the shipped FarTerrain / near-only value.
 	if CubeSphere.FACETED:
 		_camera.far = FacetFarRing.CAMERA_FAR
+		# TIER-DEPTH P3 (§3.3): raise the near plane 0.05 → 0.25 (5× depth precision — precision scales linearly with
+		# near) so the per-tier depth bias holds past ~1 km. 0.25 is far inside the 0.4-radius capsule, so no near-clip.
+		# Flag off → near stays Godot's default 0.05 (byte-identical).
+		if CubeSphere.FP_TIER_DEPTH_BIAS:
+			_camera.near = TierPlace.CAMERA_NEAR
 	else:
 		_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0

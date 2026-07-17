@@ -468,6 +468,28 @@ func _poll_voxel_main_thread_stats() -> void:
 	_win_vt_updated = maxi(_win_vt_updated, int(s.get("updated_blocks", 0)))
 
 
+## NEVER-OOM INSTRUMENT (WALK-PERF L2 heap A/B) — the live WASM heap in MB, or -1 off-web/unavailable.
+## docs/COSMOS-FP-M2-HEAP-AB.md's pass criterion is a heap A/B, but its instrument is MANUAL browser
+## DevTools (performance.memory), and telemetry carried only vmem_mb (VIDEO memory — a different thing
+## entirely). Without this the mimalloc A/B could not be judged against the NEVER-OOM ceiling at all,
+## and "it got faster" would be the only number in the room — exactly the trade the rule forbids.
+## mimalloc reserves per-thread segments, so this is THE number that can veto the frame-time win.
+## `wasmMemory.buffer.byteLength` is the true linear-memory size (what actually OOMs a tab); HEAP8 is
+## the fallback name. Evaluated once per telemetry window (4 Hz) — a trivial eval, not per frame.
+func _wasm_heap_mb() -> float:
+	if not OS.has_feature("web"):
+		return -1.0
+	var v = JavaScriptBridge.eval(
+		"(function(){try{" +
+		"if(typeof wasmMemory!=='undefined'&&wasmMemory.buffer)return wasmMemory.buffer.byteLength;" +
+		"if(typeof HEAP8!=='undefined'&&HEAP8.buffer)return HEAP8.buffer.byteLength;" +
+		"return -1;}catch(e){return -1;}})()", true)
+	if v == null:
+		return -1.0
+	var b := float(v)
+	return -1.0 if b <= 0.0 else b / 1048576.0
+
+
 func _send_telemetry() -> void:
 	# Window stats (fps + worst frame over the just-elapsed window), then reset the window.
 	var fps := (float(_win_frames) / _win_acc) if _win_acc > 0.0 else 0.0
@@ -553,6 +575,11 @@ func _send_telemetry() -> void:
 		"draws": int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)),
 		"prims": int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)),
 		"vmem_mb": snappedf(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0, 0.1),
+		# NEVER-OOM: the WASM linear-memory size (what actually OOMs a tab) + Godot's own tracked static
+		# allocation. vmem_mb above is VIDEO memory and is NOT the NEVER-OOM signal. heap_mb is the number
+		# that can VETO the mimalloc win (per-thread segments raise the baseline) — see _wasm_heap_mb.
+		"heap_mb": snappedf(_wasm_heap_mb(), 0.1),
+		"mem_static_mb": snappedf(Performance.get_monitor(Performance.MEMORY_STATIC) / 1048576.0, 0.1),
 		"objects": int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT)),
 		"vox_gen": vox_gen,
 		"vox_mesh": vox_mesh,

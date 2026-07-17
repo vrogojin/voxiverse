@@ -510,9 +510,31 @@ func _send_telemetry() -> void:
 	var vox_mesh := 0
 	var vox_main := 0
 	var vox_gpu := 0
+	# WALK-PERF L1 (docs/COSMOS-WALK-PERF-DESIGN.md §4 L1) — the H-A/H-B discriminator. The dlmalloc-convoy
+	# hypothesis (workers and main thread throttling each other through the single global malloc lock) predicts
+	# the pool runs its FULL thread_count but each thread CRAWLS: during a stationary drain active_threads ≈ 10
+	# ⇒ H-A. If instead active_threads ≤ 3, few threads are actually running ⇒ H-B (pool/scheduling), and the
+	# mimalloc rebuild would be wasted. Free: get_stats() is already fetched+built here.
+	# NOTE std_current is #ifdef DEBUG_ENABLED in voxel_engine_gd.cpp:149-158 — a RELEASE web export returns
+	# -1. Emitted anyway so the trace records "unavailable" explicitly rather than looking like a real zero.
+	var pool_threads := -1
+	var pool_active := -1
+	var pool_tasks := ""
+	var vox_std_current := -1
 	if _voxel_engine != null and _voxel_engine.has_method("get_stats"):
 		var st: Dictionary = _voxel_engine.call("get_stats")
 		var tasks: Dictionary = st.get("tasks", {})
+		var gpool: Dictionary = (st.get("thread_pools", {}) as Dictionary).get("general", {})
+		pool_threads = int(gpool.get("thread_count", -1))
+		pool_active = int(gpool.get("active_threads", -1))
+		var tn = gpool.get("task_names", null)
+		if tn is PackedStringArray:
+			var names := PackedStringArray()
+			for n in (tn as PackedStringArray):
+				if String(n) != "":
+					names.append(String(n))
+			pool_tasks = ",".join(names)
+		vox_std_current = int((st.get("memory_pools", {}) as Dictionary).get("std_current", -1))
 		vox_gen = int(tasks.get("generation", 0))
 		vox_mesh = int(tasks.get("meshing", 0))
 		vox_main = int(tasks.get("main_thread", 0))
@@ -536,6 +558,12 @@ func _send_telemetry() -> void:
 		"vox_mesh": vox_mesh,
 		"vox_main": vox_main,
 		"vox_gpu": vox_gpu,
+		# WALK-PERF L1: the dlmalloc-convoy discriminator (see above). pool_active ≈ pool_threads during a
+		# stationary drain ⇒ threads run-but-crawl ⇒ H-A (convoy) ⇒ the mimalloc rebuild is justified.
+		"pool_threads": pool_threads,
+		"pool_active": pool_active,
+		"pool_tasks": pool_tasks,
+		"vox_std_current": vox_std_current,
 	}
 	# MAIN-THREAD BREAKDOWN: fold in this window's VoxelTerrain::_process maxima (omitted entirely on the
 	# fallback path / before setup, so a missing key means "no module terrain", never "measured zero").

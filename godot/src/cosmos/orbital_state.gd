@@ -246,9 +246,42 @@ static func helio_to_bci(body: String, t: float, p_hel: PackedFloat64Array, v_he
 	return [DV.sub(p_hel, EPH.body_pos_helio(body, t)), DV.sub(v_hel, EPH.body_vel_helio(body, t))]
 
 # ---------------------------------------------------------------------------------------
+# Off-surface render placement — anchor-follow (§2.8; SPACE-NAV R2, ADOPTED). The shipped integer
+# floating-origin anchor (world_manager `_anchor_offset`, REANCHOR_TRIGGER_BLOCKS = 8192) starts firing
+# in ORBITAL mode: when |p_fixed − anchor| > trigger, step the anchor by INTEGER multiples of `quantum`
+# (4096) toward the player and re-place every absolute node. anchor_snap is the pure step rule; place_rel
+# is the f64-subtract-then-f32-downgrade placement (sub-mm ulp at ≤ 8k magnitude). The anchor is
+# render-only — it never touches the BCI OrbitalState (asserted by G-O1-ANCHOR). NOTE: SPACE-NAV R1
+# REJECTS the O1O4 §2.8 H_FARSWAP impostor swap; only the anchor-follow half of §2.8 is adopted here.
+# ---------------------------------------------------------------------------------------
+
+## The new anchor for a player at body-fixed position `p` (DVec3): unchanged while |p − anchor| ≤ trigger,
+## else snapped onto the global integer `quantum` grid nearest the player (each axis independently). The
+## returned anchor is always an exact integer multiple of `quantum` away from the old one ⇒ every
+## already-placed node shifts by the SAME integer vector, so relative positions are preserved exactly.
+static func anchor_snap(anchor: PackedFloat64Array, p: PackedFloat64Array, trigger: float, quantum: float) -> PackedFloat64Array:
+	var d := DV.sub(p, anchor)
+	if DV.length(d) <= trigger:
+		return PackedFloat64Array([anchor[0], anchor[1], anchor[2]])
+	return DV.v(
+		anchor[0] + round(d[0] / quantum) * quantum,
+		anchor[1] + round(d[1] / quantum) * quantum,
+		anchor[2] + round(d[2] / quantum) * quantum)
+
+## Place an f64 world position `p` relative to the f64 `anchor` as a render-side Vector3 — the subtraction
+## is done in f64 BEFORE the f32 downgrade, so a node ≤ 8k blocks from the anchor is placed to sub-mm ulp.
+static func place_rel(p: PackedFloat64Array, anchor: PackedFloat64Array) -> Vector3:
+	return Vector3(float(p[0] - anchor[0]), float(p[1] - anchor[1]), float(p[2] - anchor[2]))
+
+# ---------------------------------------------------------------------------------------
 # Atmosphere drag (§2.6) — pure static. Air co-rotates with the body: v_air = v_bci − ω⃗×p_bci;
-# a_drag = −k(h)·|v_air|·v_air, k(h) = K0·exp(−h/H_SCALE), K0 = FEEL_G/DRAG_TERMINAL² ⇒ terminal speed
-# == DRAG_TERMINAL at h = 0. Only bodies with an atmosphere (Earth yes, Moon no), only below ATMO_TOP.
+# a_drag = −k(h)·|v_air|·v_air, k(h) = K0·exp(−h/H_SCALE). K0 = datum_gravity/DRAG_TERMINAL² ⇒ terminal
+# speed == DRAG_TERMINAL at h = 0 EXACTLY, balanced against the gravity the ACTIVE integrator actually
+# applies (point-mass GM_dyn/R² = datum_gravity). NOTE: the parent §2.6 wrote K0 = FEEL_G/DRAG_TERMINAL²,
+# which assumed the integrator used the blend field (== feel-g at the surface); this build integrates the
+# pure point-mass gravity for clean energy conservation, so datum_gravity is the self-consistent K0
+# (interim: 24.6 vs the design's 22 — a 12% K0 shift that makes terminal exactly 55 not 58). Only bodies
+# with an atmosphere (Earth yes, Moon no), only below ATMO_TOP.
 # ---------------------------------------------------------------------------------------
 
 static func has_atmo(body: String) -> bool:
@@ -265,7 +298,7 @@ static func atmos_drag_bci(body: String, p_bci: PackedFloat64Array, v_bci: Packe
 	var speed := DV.length(v_air)
 	if speed <= 0.0:
 		return DV.v(0.0, 0.0, 0.0)
-	var k0 := GRAV.feel_g(body) / (CubeSphere.DRAG_TERMINAL * CubeSphere.DRAG_TERMINAL)
+	var k0 := GRAV.datum_gravity(body) / (CubeSphere.DRAG_TERMINAL * CubeSphere.DRAG_TERMINAL)
 	var k := k0 * exp(-h / DRAG_H_SCALE)
 	return DV.scale(v_air, -k * speed)
 

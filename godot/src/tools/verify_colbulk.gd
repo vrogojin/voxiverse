@@ -97,7 +97,10 @@ func _initialize() -> void:
 	var buried_wrong_class := 0
 	var buried := 0
 	var truth_bad := 0
+	var premise_bad := 0
+	var premise_liquid := 0
 	var first := ""
+	var first_premise := ""
 	for origin: Vector3i in origins:
 		var buf: Object = _gen_into(gb, origin)
 		for lz in range(16):
@@ -127,12 +130,31 @@ func _initialize() -> void:
 						buried_wrong_class += 1
 					if CellCodec.mat(v) == BlockCatalog.AIR:
 						truth_bad += 1
+					# G-CB-PREMISE: the ENTIRE design rests on "below the biome filler, _surface_rule returns
+					# STONE, so the only thing a fill can lose is the deepslate/strata/ore rewrite of a plain
+					# rock cell". Assert that premise directly on every cell we actually guessed, rather than
+					# inferring it. This is what catches a seabed/beach emitting sand or gravel at depth, or a
+					# submerged cell carrying a liquid field — i.e. a material-CLASS change (a wider loss than
+					# FP_BULK_UNDERGROUND's), as opposed to the accepted variant loss. Checking only what we
+					# WROTE (buried_wrong_class, above) cannot see that: it never looks at truth.
+					if int(TerrainConfig._surface_rule(wx, wy, wz, int(p.x), int(p.y), p.z, p.w)) != BlockCatalog.STONE:
+						premise_bad += 1
+						if first_premise == "":
+							first_premise = "(%d,%d,%d) g=%d depth=%d surface_rule=%s" % [wx, wy, wz, int(p.x), int(p.x) - wy,
+								BlockCatalog.name_of(int(TerrainConfig._surface_rule(wx, wy, wz, int(p.x), int(p.y), p.z, p.w)))]
+					if CellCodec.liquid_field(v) != 0:
+						premise_liquid += 1
 
 	_ok(exposed_bad == 0,
 		"G-CB-EXPOSED: over %d blocks (incl. shorelines + mountain massifs), every cell with a see-through face-neighbour is byte-identical to analytic truth (%d violations%s)"
 			% [origins.size(), exposed_bad, ("" if first == "" else "; first " + first)])
 	_ok(buried_wrong_class == 0,
 		"G-CB-BURIED: every buried guess is the plain stone/deepslate cube ARID — the FP_BULK_UNDERGROUND loss class, never wider (%d wrong)" % buried_wrong_class)
+	_ok(premise_bad == 0,
+		"G-CB-PREMISE: for every one of the %d guessed cells, _surface_rule returns STONE — so the ONLY thing the fill can lose is the deepslate/strata/ore rewrite of a plain rock cell, never a material class (%d violations%s)"
+			% [buried, premise_bad, ("" if first_premise == "" else "; first " + first_premise)])
+	_ok(premise_liquid == 0,
+		"G-CB-PREMISE(liquid): no guessed cell carries a liquid field in truth — a seabed/submerged cell is never bulk-filled (%d violations)" % premise_liquid)
 	_ok(truth_bad == 0,
 		"G-CB-TRUTH: the analytic path (the block_id_at / physics source) returns real material for all %d guessed cells — never air" % buried)
 	print("      %d blocks swept; %d buried ore/strata variant cells guessed (accepted, invisible); %d exposed violations"

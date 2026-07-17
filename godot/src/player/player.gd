@@ -18,6 +18,14 @@ signal aimed_voxel_changed(info: Dictionary)
 # on the editor class-cache (the FLM/FLB convention). Used as the type of `_frame` below.
 const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
 
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§10): preloaded kernels for the gated nav-frame
+# machine (same FLM/FLB convention — preload, not the global class-name). DEAD unless CubeSphere.SN_NAV_MODES.
+const _CosmosNavCls := preload("res://src/cosmos/cosmos_nav.gd")
+const _OrbitalStateCls := preload("res://src/cosmos/orbital_state.gd")
+const _DVCls := preload("res://src/cosmos/dvec3.gd")
+const _EphCls := preload("res://src/cosmos/cosmos_ephemeris.gd")
+const _FacetAtlasCls := preload("res://src/cosmos/facet_atlas.gd")
+
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
 @export var fly_speed := 16.0
@@ -58,6 +66,19 @@ var frozen := false
 # from `world` in _ready; never null (a transparent identity adapter when the fixed frame is off / in Phase 1), so
 # all the maps are numeric no-ops → byte-identical to today. Phase 2 rotates the frame with zero call-site change.
 var _frame: _FrameAdapterCls
+
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): the nav-frame machine. `_nav` is NULL unless
+# CubeSphere.SN_NAV_MODES ⇒ the whole feed is dead (flag-off byte-identical). The machine READS the player's
+# body-centred BCI state each physics tick (derived from the shipped lattice `position` via the SN1 frame
+# maps) and re-expresses the HUD velocity — it never writes pos/vel (the §5.4 theorem). `_nav_tele` is the
+# additive RemoteBridge telemetry dict (nav_mode/frame_v/|v_bci|), surfaced via nav_telemetry().
+# LIVE-ONLY-VALIDATED (honest, per SN1's precedent): the KERNEL + machine are headless-gated (verify_nav), but
+# this in-game BCI derivation is validated only in a live session — the flag ships false until then.
+var _nav: RefCounted = null
+var _nav_clock := 0.0                         # local nav time (s); reused main's ORBITAL_SKY clock is not required
+var _nav_prev_fix := PackedFloat64Array()     # previous body-fixed world position (finite-difference velocity)
+var _nav_have_prev := false
+var _nav_tele: Dictionary = {}
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -155,6 +176,10 @@ func _ready() -> void:
 	add_child(crosshair)
 
 	_capture_mouse()
+
+	# COSMOS SPACE-NAV SN2: build the nav-frame machine ONLY under the flag (else it stays null ⇒ dead).
+	if CubeSphere.SN_NAV_MODES:
+		_nav = _CosmosNavCls.NavState.new()
 
 ## Set the initial facing (yaw about Y) and camera pitch. Call after the player
 ## is in the tree (the camera is built in _ready).
@@ -302,6 +327,39 @@ func _physics_process(delta: float) -> void:
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
 	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
 		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
+	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
+	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
+	if _nav != null:
+		_nav_tick(delta)
+
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
+## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world
+## coords are body-FIXED — the planet is pinned — so p_bci = R_z(θ)·p_fix; velocity is a finite difference of
+## the body-fixed world position mapped through fixed→bci), classifies with the 2-s dwell, and stores the
+## HUD/telemetry re-expression. Reads only; never writes pos/vel. Earth-only (the Moon is SN6). No-op off the
+## faceted planet (the nav machine's frame is the cosmos planet). LIVE-ONLY-VALIDATED — see the field comment.
+func _nav_tick(delta: float) -> void:
+	if not CubeSphere.FACETED:
+		return
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])                 # body-fixed (planet-pinned) world position, f64
+	_nav_clock += delta * _EphCls.TIME_WARP
+	var v_fix := _DVCls.v(0.0, 0.0, 0.0)
+	if _nav_have_prev and delta > 0.0:
+		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), 1.0 / delta)
+	var bci: Array = _OrbitalStateCls.fixed_to_bci("earth", _nav_clock, p_fix, v_fix)
+	_nav.tick("earth", bci[0], bci[1], _nav_clock, delta)
+	_nav_prev_fix = p_fix
+	_nav_have_prev = true
+	_nav_tele = _CosmosNavCls.telemetry(_nav, "earth", bci[0], bci[1], _nav_clock)
+
+## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
+## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
+func nav_telemetry() -> Dictionary:
+	return _nav_tele
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.

@@ -772,6 +772,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 	if is_instance_valid(player):
 		var p := player.global_position
 		msg["pos"] = [snappedf(p.x, 0.01), snappedf(p.y, 0.01), snappedf(p.z, 0.01)]
+		# COSMOS SPACE-NAV SN2 (§7.5): the nav-frame machine telemetry (nav_mode/frame_v/|v_bci|/nav_frame),
+		# ADDITIVE + GUARDED — an empty dict (flag-off, or the method absent) merges nothing, so a build with
+		# SN_NAV_MODES=false stamps exactly the shipped fields (byte-identical telemetry).
+		if player.has_method("nav_telemetry"):
+			var nt = player.call("nav_telemetry")
+			if nt is Dictionary and not (nt as Dictionary).is_empty():
+				msg.merge(nt as Dictionary)
 	# Active facet is a global (faceted mode); -1 when non-faceted. Static call is always safe.
 	msg["facet"] = TerrainConfig.active_facet()
 	if is_instance_valid(world):

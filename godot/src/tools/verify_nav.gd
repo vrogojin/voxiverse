@@ -1,0 +1,379 @@
+extends SceneTree
+## COSMOS SPACE-NAV SN2 gate — the nav-frame state machine (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10).
+## Proves the pure CosmosNav kernel: the §4.3 classifier + §4.5 hysteresis/dwell/R-latch (G-SN-CLASS), the
+## §5.4 CONTINUITY THEOREM over a full scripted trajectory (G-SN-CONT — the crux), and geostationary
+## exactness (G-SN-GEO). Every assert is PURE-KERNEL (CosmosNav / OrbitalState / CosmosGravity are
+## engine-free statics), so this gate is FLAG-INDEPENDENT: it passes identically with SN_NAV_MODES true or
+## false (the machine is DEAD — never instantiated in-game — when the flag is off; the gate drives it
+## directly). Byte-identity (G-SN-OFF) is the FLAT verify_feature (6035/0), run separately.
+##
+## Asserts:
+##   G-SN-CLASS  the §4.3 sanity table (Earth interim, every row → expected mode, incl. the r=12R→DEEP
+##               "Earth-bound but classified deep" row); boundary crossings both directions honour the
+##               ±10%/±5%/±32 hysteresis; the 2-s dwell delays a commit; the R-latch forces DEEP from HIGH.
+##   G-SN-CONT   a trajectory crossing every reachable boundary both ways (prograde spiral surface→LEO→high
+##               →heliocentric coast→retro re-entry), the full stack stepped (SN1 integrator + classifier +
+##               machine): per tick the machine NEVER mutates [pos,vel] (control-run bit-identity); Δv equals
+##               the integrator's own trapezoid (no impulse term) INCLUDING flip ticks; every frame
+##               round-trip (fix→bci→fix, bci→helio→bci) < 1e-9; the committed mode sequence matches
+##               expectation with the dwell honoured. DEEP↔INTER (identity map) asserted separately.
+##   G-SN-GEO    at r_geo_dyn: |ω⃗×p| == v_circ(r_geo) (circular) AND |v_fix| == 0 (scene-stationary) AND
+##               classify → HIGH_ORBIT; Moon: r_geo > SOI ⇒ has_stationary_orbit == false ("none").
+##
+## RUN: docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
+##       --script res://src/tools/verify_nav.gd 2>/dev/null | grep VERIFY
+## Exits 0 all-pass / 1 on any failure.
+
+const EPH := preload("res://src/cosmos/cosmos_ephemeris.gd")
+const DV := preload("res://src/cosmos/dvec3.gd")
+const GRAV := preload("res://src/cosmos/cosmos_gravity.gd")
+const ORB := preload("res://src/cosmos/orbital_state.gd")
+const NAV := preload("res://src/cosmos/cosmos_nav.gd")
+
+var _pass := 0
+var _fail := 0
+func _ok(c: bool, m: String) -> void:
+	if c: _pass += 1
+	else:
+		_fail += 1
+		print("  FAIL: ", m)
+
+func _rel(a: float, b: float) -> float:
+	var d := absf(b)
+	if d < 1.0e-300:
+		return absf(a - b)
+	return absf(a - b) / d
+
+func _name(m: int) -> String:
+	return NAV.NAV_NAMES[m] if m >= 0 and m < NAV.NAV_NAMES.size() else "NONE"
+
+func _initialize() -> void:
+	print("=== verify_nav (COSMOS SPACE-NAV SN2: classifier + continuity theorem + geostationary) ===")
+	print("  CubeSphere.SN_NAV_MODES = %s (gate is flag-independent; kernel is a pure static)" % str(CubeSphere.SN_NAV_MODES))
+	FacetAtlas.warm_up()                                    # r_vox(earth) reads FacetAtlas.R_BLOCKS
+	_gate_class()
+	_gate_cont()
+	_gate_geo()
+	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
+	quit(1 if _fail > 0 else 0)
+
+# ---------- a BCI state at radius r on the equator (XY plane) with speed-ratio u tangential ----------
+# Tangential (prograde-east) velocity of magnitude u·v_circ(r). Pure setup helper for synthetic rows.
+func _state_at(body: String, r: float, u: float) -> Array:
+	var mu := GRAV.gm_dyn(body)
+	var v_circ := sqrt(mu / r)
+	var p := DV.v(r, 0.0, 0.0)
+	var v := DV.v(0.0, u * v_circ, 0.0)
+	return [p, v]
+
+# ---------- G-SN-CLASS: the §4.3 sanity table + hysteresis + dwell + R-latch ----------
+func _gate_class() -> void:
+	print("  --- G-SN-CLASS: §4.3 table + boundary hysteresis + 2-s dwell + R-latch ---")
+	var body := "earth"
+	var R := GRAV.r_vox(body)                               # 3072 interim
+	var r_geo := NAV.r_geo_dyn(body)                        # ≈ 20370
+	var t := 0.0
+
+	# The sanity table (Earth interim radii). incumbent = NONE ⇒ raw (interior points, no boundary ambiguity).
+	# Standing on the surface: r=R, eastward spin speed ω·R ⇒ u≈0.06, h=0 < 384.
+	var w := EPH.omega_spin(body)
+	var surf_p := DV.v(R, 0.0, 0.0)
+	var surf_v := DV.v(0.0, w * R, 0.0)                     # = ω⃗×p (rest on the rotating surface)
+	_ok(NAV.classify(body, surf_p, surf_v, t) == NAV.PLANETARY, "row: surface (h=0, u≈%.3f) → PLANETARY" % (DV.length(surf_v) / sqrt(GRAV.gm_dyn(body) / R)))
+
+	# Hovering at h=500 (above atmo 384), slow u≈0.07 ⇒ vicinity + suborbital → PLANETARY.
+	var hov := _state_at(body, R + 500.0, 0.07)
+	_ok(NAV.classify(body, hov[0], hov[1], t) == NAV.PLANETARY, "row: hover h=500 u=0.07 → PLANETARY (vicinity+slow)")
+
+	# LEO circular at h=500, u=1 ⇒ vicinity, super-suborbital → LOW_ORBIT.
+	var leo := _state_at(body, R + 500.0, 1.0)
+	_ok(NAV.classify(body, leo[0], leo[1], t) == NAV.LOW_ORBIT, "row: LEO h=500 u=1 → LOW_ORBIT")
+
+	# Circular at r=5R (below r_geo), u=1 ⇒ γ-gated speed clause → LOW_ORBIT.
+	var r5 := _state_at(body, 5.0 * R, 1.0)
+	_ok(NAV.classify(body, r5[0], r5[1], t) == NAV.LOW_ORBIT, "row: r=5R u=1 → LOW_ORBIT (below geostationary)")
+
+	# Geostationary (r_geo ≈ 6.6R), u=1 ⇒ the D-SN-CLASS-1 resolution puts it at the low/high divide → HIGH_ORBIT.
+	var rgeo_s := _state_at(body, r_geo, 1.0)
+	_ok(NAV.classify(body, rgeo_s[0], rgeo_s[1], t) == NAV.HIGH_ORBIT, "row: geostationary r=%.0f u=1 → HIGH_ORBIT" % r_geo)
+
+	# Just ABOVE geostationary, still bound γ>0.01 u<2 → HIGH_ORBIT (in the well, above the divide).
+	var rgeo_hi := _state_at(body, r_geo * 1.2, 1.0)
+	_ok(NAV.classify(body, rgeo_hi[0], rgeo_hi[1], t) == NAV.HIGH_ORBIT, "row: r=1.2·r_geo u=1 → HIGH_ORBIT")
+
+	# Circular at r=12R, u=1 ⇒ γ=0.0069<0.01, r>cap ⇒ per the user's thresholds → DEEP_SPACE (Earth-bound but deep).
+	var r12 := _state_at(body, 12.0 * R, 1.0)
+	_ok(NAV.classify(body, r12[0], r12[1], t) == NAV.DEEP_SPACE, "row: r=12R u=1 → DEEP_SPACE (Earth-bound but classified deep — CORRECT)")
+
+	# Hyperbolic escape at r=20R, u=2.5, s<1 ⇒ HIGH_ORBIT (escape clause). Near Earth the heliocentric speed
+	# is dominated by Earth's own 2145-b/s orbital velocity (≈ v_sol), so s < 1 needs the escape burn RETROGRADE
+	# to Earth's motion (Earth's t=0 velocity is +Y here; the −Y burn subtracts from the solar-frame speed).
+	var mu := GRAV.gm_dyn(body)
+	var resc_p := DV.v(20.0 * R, 0.0, 0.0)
+	var resc_v := DV.v(0.0, -2.5 * sqrt(mu / (20.0 * R)), 0.0)
+	_ok(NAV.classify(body, resc_p, resc_v, t) == NAV.HIGH_ORBIT, "row: r=20R u=2.5 retrograde (s<1) → HIGH_ORBIT (hyperbolic escape)")
+
+	# INTERSTELLAR: a heliocentric state far beyond R_SYSTEM at ≥10× solar speed. Build it in BCI over the Sun
+	# (parentless ⇒ p_helio == p_bci, v_helio == v_bci) at r_helio = 50 AU, |v| = 12× local v_sol.
+	var au := 1.496e8
+	var r_far := 50.0 * au
+	var v_sol_far := sqrt(EPH.gm_game("sun") / r_far)
+	var inter_p := DV.v(r_far, 0.0, 0.0)
+	var inter_v := DV.v(0.0, 12.0 * v_sol_far, 0.0)
+	_ok(NAV.classify("sun", inter_p, inter_v, t) == NAV.INTERSTELLAR, "row: r_helio=50 AU, s=12 → INTERSTELLAR")
+
+	# DEEP_SPACE just inside the system at modest speed (s=5 < 10) beyond gravity wells.
+	var r_mid := 20.0 * au
+	var v_sol_mid := sqrt(EPH.gm_game("sun") / r_mid)
+	var deep_p := DV.v(r_mid, 0.0, 0.0)
+	var deep_v := DV.v(0.0, 5.0 * v_sol_mid, 0.0)
+	_ok(NAV.classify("sun", deep_p, deep_v, t) == NAV.DEEP_SPACE, "row: r_helio=20 AU, s=5 → DEEP_SPACE (in system)")
+
+	# --- hysteresis both directions across the PLANETARY↔LOW atmosphere boundary (±32 blocks) ---
+	# Incumbent PLANETARY holds until h > 384+32 = 416; incumbent LOW re-enters PLANETARY below 384−32 = 352.
+	var u_orb := 1.0                                        # super-suborbital so the ONLY divider is the atmo band
+	var s_plan_hold := _state_at(body, R + 400.0, u_orb)    # h=400, between 352 and 416
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_plan_hold[0], s_plan_hold[1], t), NAV.PLANETARY) == NAV.PLANETARY,
+		"hyst: h=400 with incumbent PLANETARY stays PLANETARY (band+32)")
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_plan_hold[0], s_plan_hold[1], t), NAV.LOW_ORBIT) == NAV.LOW_ORBIT,
+		"hyst: h=400 with incumbent LOW_ORBIT stays LOW_ORBIT (band−32)")
+	# Beyond the margin the incumbent CANNOT hold: h=430 > 416 ⇒ LOW even from PLANETARY.
+	var s_above := _state_at(body, R + 430.0, u_orb)
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_above[0], s_above[1], t), NAV.PLANETARY) == NAV.LOW_ORBIT,
+		"hyst: h=430 forces LOW even from PLANETARY (past +32 margin)")
+	# h=340 < 352 ⇒ PLANETARY even from LOW.
+	var s_below := _state_at(body, R + 340.0, u_orb)
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_below[0], s_below[1], t), NAV.LOW_ORBIT) == NAV.PLANETARY,
+		"hyst: h=340 forces PLANETARY even from LOW (past −32 margin)")
+
+	# --- hysteresis across the LOW↔HIGH geostationary divide (±5 % on r_geo) ---
+	var s_div := _state_at(body, r_geo * 1.02, 1.0)         # 2 % above r_geo, inside the ±5 % band
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_div[0], s_div[1], t), NAV.LOW_ORBIT) == NAV.LOW_ORBIT,
+		"hyst: r=1.02·r_geo with incumbent LOW stays LOW (r_geo+5%)")
+	_ok(NAV._classify_inputs(body, NAV.inputs(body, s_div[0], s_div[1], t), NAV.HIGH_ORBIT) == NAV.HIGH_ORBIT,
+		"hyst: r=1.02·r_geo with incumbent HIGH stays HIGH (r_geo−5%)")
+
+	# --- the 2-s dwell: a raw change does NOT commit until held NAV_DWELL_S ---
+	var ns := NAV.NavState.new()
+	ns.mode = NAV.PLANETARY
+	# Feed a persistent LOW_ORBIT state; before 2 s it must stay PLANETARY, after 2 s commit to LOW.
+	var dt := 1.0 / 60.0
+	var committed_early := true
+	var tt := 0.0
+	while tt < 1.9:
+		ns.tick(body, leo[0], leo[1], t, dt)
+		if ns.mode != NAV.PLANETARY:
+			committed_early = false                         # (would be a FAIL — recorded below)
+		tt += dt
+	_ok(committed_early and ns.mode == NAV.PLANETARY, "dwell: mode holds PLANETARY through 1.9 s of a LOW input")
+	# Cross the 2-s mark.
+	var loops := 0
+	while ns.mode == NAV.PLANETARY and loops < 60:
+		ns.tick(body, leo[0], leo[1], t, dt)
+		loops += 1
+	_ok(ns.mode == NAV.LOW_ORBIT, "dwell: mode commits to LOW_ORBIT after 2 s held")
+
+	# --- the R-latch forces DEEP_SPACE from HIGH_ORBIT until cleared ---
+	_ok(NAV.classify(body, rgeo_s[0], rgeo_s[1], t, NAV.HIGH_ORBIT, false) == NAV.HIGH_ORBIT,
+		"R-latch OFF: geostationary classify → HIGH_ORBIT")
+	_ok(NAV.classify(body, rgeo_s[0], rgeo_s[1], t, NAV.HIGH_ORBIT, true) == NAV.DEEP_SPACE,
+		"R-latch ON: same HIGH_ORBIT state expresses DEEP_SPACE")
+
+# ---------- G-SN-CONT: the §5.4 CONTINUITY THEOREM (the crux) ----------
+# Two complementary scripted-trajectory proofs:
+#   (A) INTEGRATED no-impulse theorem — a bounded powered orbit-raise stepped through the FULL stack
+#       (SN1 integrator + classifier + machine). Proves per tick: the machine never writes [pos,vel]; a
+#       live run and a machine-free CONTROL run stay BIT-IDENTICAL (⇒ zero impulse, incl. flip ticks); Δv
+#       equals the integrator's own trapezoid; every frame round-trip is exact to f64 relative precision.
+#   (B) MODE-SEQUENCE sweep — a scripted near-circular radial trajectory crossing EVERY boundary both
+#       directions (surface→LEO→high→heliocentric→return→re-entry), driving the machine (dwell + hysteresis)
+#       and asserting the committed mode sequence. Kinematic (the machine only READS state) — the no-impulse
+#       theorem is (A)'s job; this proves the boundary/dwell logic over the full crossing set.
+func _gate_cont() -> void:
+	print("  --- G-SN-CONT: no-impulse continuity (A) + full boundary/mode sequence (B) — the theorem ---")
+	_cont_integrated()
+	_cont_sequence()
+
+# (A) the integrated no-impulse theorem over a bounded powered orbit-raise (LOW→HIGH→LOW).
+func _cont_integrated() -> void:
+	var body := "earth"
+	var R := GRAV.r_vox(body)
+	var mu := GRAV.gm_dyn(body)
+	# dt = 0.01 s < SUBSTEP_MAX (1/60) so step() runs EXACTLY one velocity-Verlet substep per tick — the
+	# per-tick Δv then equals ½(a0+a1)·dt exactly (a multi-substep tick would fold in an intermediate
+	# acceleration my single-a1 trapezoid can't see, a false failure unrelated to any impulse).
+	var dt := 0.01
+	var r0 := R + 500.0
+	var v_circ0 := sqrt(mu / r0)
+	var live := ORB.make(body, DV.v(r0, 0.0, 0.0), DV.v(0.0, v_circ0, 0.0))
+	# CONTROL: identical initial state, integrator ONLY. If it ever diverges from `live`, the machine wrote state.
+	var ctrl := ORB.make(body, DV.v(r0, 0.0, 0.0), DV.v(0.0, v_circ0, 0.0))
+	var ns := NAV.NavState.new()
+	ns.mode = NAV.LOW_ORBIT
+
+	var worst_drift := 0.0          # max |live − ctrl| (must be 0.0 exactly)
+	var worst_dv := 0.0             # max relative |Δv − ½(a0+a1)h| (no impulse term)
+	var worst_rt := 0.0             # max relative frame round-trip error
+	var machine_mutation := 0.0     # max |v before machine − v after machine| (must be 0.0)
+	var flip_dv := 0.0              # max Δv from a mode-flip tick specifically (must be 0.0)
+	var flips := 0
+
+	# Prograde burn raises the orbit past geostationary (LOW→HIGH); reverse on r ≥ 7.2R (bounded — never
+	# escapes, so the heliocentric magnitude stays ≈ 1 AU and the round-trips stay f64-exact); retrograde
+	# back to re-entry, drag engaging in the band. r stays in [R, 7.2R] ⇒ the trajectory is bounded.
+	var A := 6.0
+	var ascending := true
+	var tick := 0
+	while tick < 120000:
+		var t := float(tick) * dt
+		var spd := DV.length(live.vel)
+		var vhat := DV.scale(live.vel, 1.0 / spd) if spd > 0.0 else DV.v(0.0, 1.0, 0.0)
+		var sign := 1.0 if ascending else -1.0
+		var a_ext := DV.add(DV.scale(vhat, sign * A), ORB.atmos_drag_bci(body, live.pos, live.vel))
+
+		var v_before := PackedFloat64Array([live.vel[0], live.vel[1], live.vel[2]])
+		var a0 := DV.add(GRAV.gravity_bci(body, live.pos), a_ext)
+		live.step(dt, a_ext)
+		var a1 := DV.add(GRAV.gravity_bci(body, live.pos), a_ext)
+		var dv_expect := DV.scale(DV.add(a0, a1), 0.5 * dt)
+		var dv_err := DV.length(DV.sub(DV.sub(live.vel, v_before), dv_expect))
+		# Scale by the magnitude of the contributing terms (not their possibly-cancelling sum) so a
+		# near-zero-net-accel tick can't inflate the ratio. err/scale ~ machine ε.
+		var dv_scale := (DV.length(a0) + DV.length(a1)) * 0.5 * dt
+		worst_dv = maxf(worst_dv, dv_err / dv_scale if dv_scale > 1.0e-30 else dv_err)
+
+		# CONTROL steps with the SAME sign, its own velocity-derived thrust; bit-identical iff machine is inert.
+		var cspd := DV.length(ctrl.vel)
+		var cvhat := DV.scale(ctrl.vel, 1.0 / cspd) if cspd > 0.0 else DV.v(0.0, 1.0, 0.0)
+		ctrl.step(dt, DV.add(DV.scale(cvhat, sign * A), ORB.atmos_drag_bci(body, ctrl.pos, ctrl.vel)))
+		worst_drift = maxf(worst_drift, DV.length(DV.sub(live.pos, ctrl.pos)) + DV.length(DV.sub(live.vel, ctrl.vel)))
+
+		# Run the machine; it must not touch [pos,vel].
+		var v_pre := PackedFloat64Array([live.vel[0], live.vel[1], live.vel[2]])
+		var prev := ns.mode
+		ns.tick(body, live.pos, live.vel, t, dt)
+		machine_mutation = maxf(machine_mutation, DV.length(DV.sub(live.vel, v_pre)))
+		if ns.mode != prev:
+			flips += 1
+			flip_dv = maxf(flip_dv, DV.length(DV.sub(live.vel, v_pre)))
+
+		# Frame round-trips (relative to the heliocentric magnitude — the maps are exact to f64 ulp, and the
+		# helio leg carries the 1.5e8-block Earth offset whose ulp ≈ 3e-8, so ABSOLUTE < 1e-9 is unachievable
+		# at 1 AU; RELATIVE ε is the correct, honest statement).
+		var fx := ORB.bci_to_fixed(body, t, live.pos, live.vel)
+		var bk := ORB.fixed_to_bci(body, t, fx[0], fx[1])
+		var e_fix := (DV.length(DV.sub(bk[0], live.pos)) + DV.length(DV.sub(bk[1], live.vel))) / maxf(DV.length(live.pos), 1.0)
+		var hl := ORB.bci_to_helio(body, t, live.pos, live.vel)
+		var hb := ORB.helio_to_bci(body, t, hl[0], hl[1])
+		var e_hel := (DV.length(DV.sub(hb[0], live.pos)) + DV.length(DV.sub(hb[1], live.vel))) / maxf(DV.length(hl[0]), 1.0)
+		worst_rt = maxf(worst_rt, maxf(e_fix, e_hel))
+
+		var r := DV.length(live.pos)
+		if ascending and r >= 7.2 * R:
+			ascending = false
+		if not ascending and r <= R + 300.0:
+			break
+		tick += 1
+
+	_ok(machine_mutation == 0.0, "G-SN-CONT(A): the machine NEVER mutates [pos,vel] (max Δ = %.1e — must be 0)" % [machine_mutation])
+	_ok(worst_drift == 0.0, "G-SN-CONT(A): live vs machine-free control run bit-identical (max |Δstate| = %.1e — zero impulse)" % [worst_drift])
+	_ok(flips >= 1, "G-SN-CONT(A): the powered orbit-raise crossed ≥1 mode boundary (LOW↔HIGH); flips = %d" % flips)
+	_ok(flip_dv == 0.0, "G-SN-CONT(A): zero Δv at every mode-flip tick (max = %.1e)" % [flip_dv])
+	_ok(worst_dv < 1.0e-12, "G-SN-CONT(A): per-tick Δv == integrator trapezoid to %.1e (no impulse term)" % [worst_dv])
+	_ok(worst_rt < 1.0e-12, "G-SN-CONT(A): frame round-trips (fix↔bci, bci↔helio) relative err %.1e (f64-exact)" % [worst_rt])
+
+# (B) the full boundary crossing set + committed mode sequence, both directions, dwell honoured.
+func _cont_sequence() -> void:
+	var body := "earth"
+	var R := GRAV.r_vox(body)
+	var mu := GRAV.gm_dyn(body)
+	var dt := 1.0 / 60.0
+	var ns := NAV.NavState.new()
+	ns.mode = NAV.PLANETARY
+
+	# Waypoint radii the scripted trajectory visits (near-circular, u=1). Each leg RAMPS r over the boundaries;
+	# a HOLD at each waypoint lets the 2-s dwell commit. Up: atmo→LEO→below-geo→geo→high→deep. Down: reverse.
+	var wps := [R + 100.0, R + 600.0, 5.0 * R, NAV.r_geo_dyn(body), 8.0 * R, 11.5 * R,
+			8.0 * R, 5.0 * R, R + 600.0, R + 100.0]
+	var seq: Array = [ns.mode]
+	var t := 0.0
+	var r_prev: float = wps[0]
+	for wi in range(wps.size()):
+		var r_target: float = wps[wi]
+		# Ramp from r_prev to r_target over RAMP ticks (crossing whatever boundaries lie between).
+		var ramp := 400
+		for i in range(ramp + 1):
+			var r: float = lerp(r_prev, r_target, float(i) / float(ramp))
+			var st := _state_at(body, r, 1.0)
+			var prev := ns.mode
+			ns.tick(body, st[0], st[1], t, dt)
+			if ns.mode != prev:
+				seq.append(ns.mode)
+			t += dt
+		# Hold at the waypoint > 2 s so the terminal mode of the leg commits.
+		var hold := 200
+		for _i in range(hold):
+			var st := _state_at(body, r_target, 1.0)
+			var prev := ns.mode
+			ns.tick(body, st[0], st[1], t, dt)
+			if ns.mode != prev:
+				seq.append(ns.mode)
+			t += dt
+		r_prev = r_target
+
+	var names: Array = []
+	for m in seq:
+		names.append(_name(m))
+	print("    committed mode sequence: %s" % str(names))
+	# Expected committed progression: P→LOW→HIGH→DEEP (up) then DEEP→HIGH→LOW→P (down).
+	var expected := [NAV.PLANETARY, NAV.LOW_ORBIT, NAV.HIGH_ORBIT, NAV.DEEP_SPACE,
+			NAV.HIGH_ORBIT, NAV.LOW_ORBIT, NAV.PLANETARY]
+	var match_ok: bool = seq.size() == expected.size()
+	if match_ok:
+		for i in range(expected.size()):
+			if int(seq[i]) != expected[i]:
+				match_ok = false
+	_ok(match_ok, "G-SN-CONT(B): committed sequence P→LOW→HIGH→DEEP→HIGH→LOW→P (every boundary, both ways, dwell honoured)")
+
+	# DEEP ↔ INTERSTELLAR is the identity velocity map (§5.2) — HUD/control expression only, physical state
+	# untouched. Assert the two express the SAME v_bci with different frame speeds (solar → self=0).
+	var au := 1.496e8
+	var r_far := 42.0 * au
+	var v_sol := sqrt(EPH.gm_game("sun") / r_far)
+	var pf := DV.v(r_far, 0.0, 0.0)
+	var vf := DV.v(0.0, 9.8 * v_sol, 0.0)
+	var deep_hud := NAV.hud_velocity(NAV.DEEP_SPACE, "sun", pf, vf, 0.0)
+	var inter_hud := NAV.hud_velocity(NAV.INTERSTELLAR, "sun", pf, vf, 0.0)
+	_ok(float(deep_hud["speed"]) > 0.0 and float(inter_hud["speed"]) == 0.0,
+		"G-SN-CONT: DEEP↔INTER HUD-only (solar %.1f → self 0); v_bci untouched (identity map)" % float(deep_hud["speed"]))
+
+# ---------- G-SN-GEO: geostationary exactness + the Moon "no stationary orbit" case ----------
+func _gate_geo() -> void:
+	print("  --- G-SN-GEO: |ω⃗×p| == v_circ(r_geo), scene-stationary, HIGH_ORBIT; Moon ⇒ none ---")
+	var body := "earth"
+	var r_geo := NAV.r_geo_dyn(body)
+	var mu := GRAV.gm_dyn(body)
+	var v_circ := sqrt(mu / r_geo)
+	# Place at r_geo on the equator, v = ω⃗×p (the geostationary velocity).
+	var p := DV.v(r_geo, 0.0, 0.0)
+	var v := ORB.omega_cross(body, p)
+	_ok(_rel(DV.length(v), v_circ) < 1.0e-9, "G-SN-GEO: |ω⃗×p| = %.4f == v_circ(r_geo) = %.4f (exactly circular)" % [DV.length(v), v_circ])
+	# Scene-stationary: the body-fixed velocity is zero (a geostationary point does not move on the surface).
+	var vf: PackedFloat64Array = ORB.bci_to_fixed(body, 0.0, p, v)[1]
+	_ok(DV.length(vf) < 1.0e-9, "G-SN-GEO: |v_fix| = %.1e < 1e-9 (scene-stationary in the pinned body frame)" % [DV.length(vf)])
+	# It classifies HIGH_ORBIT (the §4.4 requirement).
+	_ok(NAV.classify(body, p, v, 0.0) == NAV.HIGH_ORBIT, "G-SN-GEO: geostationary classifies HIGH_ORBIT")
+	# r_geo consistency: (GM/ω²)^{1/3} and ω·r_geo == v_circ both hold ⇒ ω²r_geo³ == GM.
+	var w := EPH.omega_spin(body)
+	_ok(_rel(w * w * r_geo * r_geo * r_geo, mu) < 1.0e-9, "G-SN-GEO: ω²·r_geo³ == GM_dyn (r_geo definition exact)")
+
+	# Earth HAS a stationary orbit (r_geo 20370 < SOI ≈ 385 k).
+	_ok(NAV.has_stationary_orbit("earth"), "G-SN-GEO: Earth has_stationary_orbit == true (r_geo %.0f < SOI %.0f)" % [r_geo, NAV.soi_radius("earth")])
+	# The Moon does NOT (r_geo ≈ 88.5 k > SOI ≈ 66.1 k) — the §4.4 corner the G key reports as "none".
+	var moon_rgeo := NAV.r_geo_dyn("moon")
+	var moon_soi := NAV.soi_radius("moon")
+	_ok(moon_rgeo > moon_soi, "G-SN-GEO: Moon r_geo %.0f > SOI %.0f (no selenostationary orbit)" % [moon_rgeo, moon_soi])
+	_ok(not NAV.has_stationary_orbit("moon"), "G-SN-GEO: Moon has_stationary_orbit == false (G key reports 'none')")
+	# Interim numbers sanity (SPACE-NAV §3 table): Earth r_geo ≈ 20,370; Moon r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
+	_ok(_rel(r_geo, 20370.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 20,370 (interim)" % r_geo)
+	_ok(_rel(moon_soi, 66100.0) < 2.0e-2, "G-SN-GEO: Moon SOI = %.0f ≈ 66,100" % moon_soi)

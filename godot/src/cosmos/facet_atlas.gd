@@ -13,6 +13,19 @@ const K := 24                    # faceting resolution: 6·K² = 3456 facets —
 const R_BLOCKS := 6371.0         # planet radius, blocks = true Earth radius / 1000 (1:1000 model, 1 block = 1 m). Facet
                                  # edge = (π/2·R)/K ≈ 417 blocks — K stays 24 (user-locked), so the facet grows to a ~417-block
                                  # playable patch (coarser far-LOD silhouette accepted). R×K couple facet size only; math scale-invariant.
+
+## COSMOS-ORBITAL-O1O4 §3.1 (Part B, O4) — the GLOBAL fid namespace across bodies. Facet ids are contiguous
+## per body: Earth fids 0..6·K²−1 at fid_base 0 (bit-UNCHANGED — K/R here ARE Earth's, byte-identity by
+## construction), other bodies APPENDED at their fid_base under CubeSphere.MULTI_BODY. THE contract: this table
+## is APPEND-ONLY FOREVER, never re-ordered, and a body's k/r never changes once content exists on it (fids
+## encode into persisted edits). Earth's row MUST mirror the K / R_BLOCKS consts above (asserted in warm_up).
+## Every per-fid accessor (k_of/r_of/body_of_fid) selects a body's row so the ~151 fid·stride table reads work
+## VERBATIM — a Moon fid indexes Moon rows, zero call-site churn. warm_up builds ALL active bodies before any
+## worker exists, immutable forever after (append-never-swap ⇒ worker safety is structural, not disciplinary).
+const BODY_TABLE := [
+	{"name": "earth", "k": 24, "r": 6371.0},   # fid_base 0     (always built; MUST equal K / R_BLOCKS)
+	{"name": "moon",  "k": 14, "r": 1737.0},   # fid_base 3456  (built only under CubeSphere.MULTI_BODY)
+]
 const MARGIN_CELLS := 8          # lattice cells kept beyond the facet polygon (streaming slack)
 const STRIP_CELLS := 2           # per-side seam strip width (FP2+)
 const SPAWN_EDGE_MIN := 48       # spawn scan stays ≥ this many cells from the facet boundary
@@ -24,6 +37,17 @@ static var _off := PackedInt32Array()        # 2/fid: O.x O.z
 static var _poly := PackedFloat64Array()     # 8/fid: local q0..q3 as (x,y)
 static var _dom := PackedInt32Array()        # 4/fid: minx minz maxx maxz
 static var _spawn_fid := -1
+
+# COSMOS-ORBITAL-O1O4 §3.1 — the active-body registry, built by _build_registry() at the head of warm_up
+# (Earth always; the rest only under CubeSphere.MULTI_BODY). Immutable after warm_up. `_nf` (above) is the
+# TOTAL facet count across active bodies (array sizing); facet_count() stays the HOME body's count so the ~10
+# streaming/mesher/spawn call sites are byte-identical (they only ever want Earth's facets in O4a/O4b).
+static var _nbodies := 0
+static var _total_facets := 0
+static var _body_k := PackedInt32Array()     # per active body: faceting resolution k
+static var _body_r := PackedFloat64Array()   # per active body: datum radius (blocks)
+static var _fid_base := PackedInt32Array()   # per active body: first fid (Earth == 0)
+static var _fid_end := PackedInt32Array()    # per active body: one-past-last fid
 
 # COSMOS FACETED FP2 (§2.5) — per-facet seam table. Every facet has EXACTLY 4 grid-edge neighbours (the K×K×6
 # facet grid is closed via CubeSphere.fold_cell at n=K), one per slot E/W/N/S. Each slot stores THIS facet's
@@ -39,8 +63,79 @@ static var _seam_neigh := PackedInt32Array()     # 4/fid: neighbour fid per slot
 static var _seam_ring := PackedFloat64Array()    # 24/fid: 4 slots × (r0.xyz, r1.xyz) welded ring (world)
 static var _seam_mhat := PackedFloat64Array()    # 12/fid: 4 slots × m̂.xyz (world ridge normal, toward this facet)
 
+## The HOME (dominant) body's facet count — the 6·K² Earth facets. UNCHANGED semantics: every streaming /
+## mesher / spawn / far-ring caller wants the dominant body's facets (Earth in O4a/O4b), so this stays
+## byte-identical. Array sizing + all-body loops use `_total_facets` (total_facet_count) instead.
 static func facet_count() -> int:
 	return 6 * K * K
+
+# ------- COSMOS-ORBITAL-O1O4 §3.1: the body registry + per-fid dispatch -------
+
+## Build the active-body registry from BODY_TABLE (Earth always at base 0; the rest only under MULTI_BODY).
+## Append-only, Earth first ⇒ Earth's fid range is bit-identical whether or not the Moon is registered.
+static func _build_registry() -> void:
+	_body_k = PackedInt32Array()
+	_body_r = PackedFloat64Array()
+	_fid_base = PackedInt32Array()
+	_fid_end = PackedInt32Array()
+	var base := 0
+	for bi in range(BODY_TABLE.size()):
+		if bi > 0 and not CubeSphere.MULTI_BODY:
+			break                                     # Earth-only: no other body's rows exist (byte-identity)
+		var row: Dictionary = BODY_TABLE[bi]
+		var k := int(row["k"])
+		var r := float(row["r"])
+		var cnt := 6 * k * k
+		_body_k.append(k); _body_r.append(r)
+		_fid_base.append(base); _fid_end.append(base + cnt)
+		base += cnt
+	_nbodies = _body_k.size()
+	_total_facets = base
+	# Earth's row MUST mirror the K / R_BLOCKS consts, or the fid·stride reads that still use K/R_BLOCKS
+	# (facet_count, external home-body callers) would disagree with k_of/r_of — the byte-identity contract.
+	assert(_body_k[0] == K and _body_r[0] == R_BLOCKS, "BODY_TABLE earth row drifted from K / R_BLOCKS")
+
+## The active-body INDEX owning `fid` (0 = Earth). Linear scan over ≤ 2 active bodies (1 compare each).
+static func body_of_fid(fid: int) -> int:
+	for bi in range(_nbodies):
+		if fid < _fid_end[bi]:
+			return bi
+	return maxi(_nbodies - 1, 0)
+
+## The faceting resolution k of `fid`'s body (Earth ⇒ K).
+static func k_of(fid: int) -> int:
+	return _body_k[body_of_fid(fid)]
+
+## The datum radius (blocks) of `fid`'s body (Earth ⇒ R_BLOCKS). == CosmosEphemeris.radius_of(body).
+static func r_of(fid: int) -> float:
+	return _body_r[body_of_fid(fid)]
+
+## The first fid of `fid`'s body (the fid_base to subtract for local face/a/b decoding).
+static func fid_base_of(fid: int) -> int:
+	return _fid_base[body_of_fid(fid)]
+
+## The first fid of active body index `bi`.
+static func fid_base(bi: int) -> int:
+	return _fid_base[bi]
+
+## The 6·k² facet count of active body index `bi`.
+static func body_facet_count(bi: int) -> int:
+	return 6 * _body_k[bi] * _body_k[bi]
+
+## The active-body index for a name ("earth"/"moon"), or −1 if not registered this session.
+static func body_index(name: String) -> int:
+	for bi in range(_nbodies):
+		if String(BODY_TABLE[bi]["name"]) == name:
+			return bi
+	return -1
+
+## The number of active (registered) bodies (1 Earth-only, 2 under MULTI_BODY).
+static func active_body_count() -> int:
+	return _nbodies
+
+## The TOTAL facet count across every active body (array sizing / all-body iteration). == facet_count() Earth-only.
+static func total_facet_count() -> int:
+	return _total_facets
 
 # ---------------------------------------------------------------------------------------
 # The FACETED global edit key (COSMOS-FP-M1-DESIGN §6.2 / FACETED-IMPL §6.2). Under FACETED an
@@ -51,10 +146,14 @@ static func facet_count() -> int:
 # role for curved mode.
 #
 #   key = ((fid·2^18 + (x + 131072))·2^18 + (z + 131072))·2^11 + (y + 512)
-#   12 bits fid | 18 bits (x+2^17) | 18 bits (z+2^17) | 11 bits (y+512)  -> 59 bits, a plain int64.
+#   fid·2^47 | 18 bits (x+2^17) | 18 bits (z+2^17) | 11 bits (y+512).  The packing is MULTIPLICATIVE (not a
+#   bit mask), so it holds ANY fid whose key stays under 2^63 — the "fid < 4096" below is the Earth-only
+#   count, not a packing limit (COSMOS-ORBITAL-O1O4 §3.1 fact 4). Under MULTI_BODY the global namespace runs
+#   Earth 0..3455 + Moon 3456..4631 (13-bit fids); max key ≈ 4631·2^47 ≈ 6.5·10^17 ≪ 2^63 — still exact. The
+#   contract caps registry growth so this never overflows (G-O4-KEY asserts the round-trip at the max fid).
 #
 # Ranges (every term is non-negative, so the packed key is always positive → GDScript /,% are exact):
-#   fid  < 4096   (6·24² = 3456 facets, K=24)
+#   fid  < 4096   Earth-only (6·24² = 3456 facets, K=24); < 4632 with the Moon appended (MULTI_BODY)
 #   x,z  ∈ [−131072, 131071]  — the decorrelation offset O ∈ [−32768, 32767] (_build_facet:107-108)
 #                               pushes |lattice| to ~3·10⁴; 2^17 centring gives ~4× headroom.
 #   y    ∈ [−512, 1535]       — the worldgen vertical envelope (bedrock −64 … tallest surface+tree).
@@ -110,26 +209,38 @@ static func frozen_atlas() -> Dictionary:
 static func warm_up() -> void:
 	if _ready:
 		return
-	_nf = 6 * K * K
+	# Build the active-body registry FIRST (Earth always; Moon under MULTI_BODY). `_nf` is the TOTAL across
+	# bodies — Earth-only it is exactly 6·K², so the arrays/loops below are byte-identical to the pre-refactor
+	# tree. Earth is built at fid_base 0 with (k=24, r=6371) == the consts, so its rows are bit-unchanged.
+	_build_registry()
+	_nf = _total_facets
 	_frame.resize(_nf * 12)
 	_off.resize(_nf * 2)
 	_poly.resize(_nf * 8)
 	_dom.resize(_nf * 4)
-	for face in range(6):
-		for a in range(K):
-			for b in range(K):
-				_build_facet((face * K + a) * K + b, face, a, b)
+	for bi in range(_nbodies):
+		var k := _body_k[bi]
+		var r := _body_r[bi]
+		var base := _fid_base[bi]
+		for face in range(6):
+			for a in range(k):
+				for b in range(k):
+					_build_facet(base + (face * k + a) * k + b, face, a, b, k, r)
 	# seams need every facet's frame built first (each seam reads BOTH facets' planes)
 	_seam_plane.resize(_nf * 16)
 	_seam_neigh.resize(_nf * 4)
 	_seam_ring.resize(_nf * 24)
 	_seam_mhat.resize(_nf * 12)
-	for face in range(6):
-		for a in range(K):
-			for b in range(K):
-				var fid := (face * K + a) * K + b
-				for slot in range(4):
-					_build_seam(fid, face, a, b, slot)
+	for bi in range(_nbodies):
+		var k := _body_k[bi]
+		var r := _body_r[bi]
+		var base := _fid_base[bi]
+		for face in range(6):
+			for a in range(k):
+				for b in range(k):
+					var fid := base + (face * k + a) * k + b
+					for slot in range(4):
+						_build_seam(fid, face, a, b, slot, k, r, base)
 	_spawn_fid = _pick_spawn_facet()
 	_ready = true
 
@@ -138,9 +249,9 @@ static func is_ready() -> bool:
 
 # ------- construction (f64) -------
 
-static func _corner(face: int, i: int, j: int) -> Array:
-	var d := CosmosFacet.vertex_dir(face, i, j, K)   # f64 DVec3 unit
-	return [d.x * R_BLOCKS, d.y * R_BLOCKS, d.z * R_BLOCKS]
+static func _corner(face: int, i: int, j: int, k: int, r: float) -> Array:
+	var d := CosmosFacet.vertex_dir(face, i, j, k)   # f64 DVec3 unit
+	return [d.x * r, d.y * r, d.z * r]
 
 static func _cross(a: Array, b: Array) -> Array:
 	return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
@@ -151,8 +262,8 @@ static func _norm(a: Array) -> Array:
 		return [0.0, 0.0, 0.0]
 	return [a[0] / l, a[1] / l, a[2] / l]
 
-static func _build_facet(fid: int, face: int, a: int, b: int) -> void:
-	var c: Array = [_corner(face, a, b), _corner(face, a + 1, b), _corner(face, a + 1, b + 1), _corner(face, a, b + 1)]
+static func _build_facet(fid: int, face: int, a: int, b: int, k: int, r: float) -> void:
+	var c: Array = [_corner(face, a, b, k, r), _corner(face, a + 1, b, k, r), _corner(face, a + 1, b + 1, k, r), _corner(face, a, b + 1, k, r)]
 	var mx: float = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4.0
 	var my: float = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4.0
 	var mz: float = (c[0][2] + c[1][2] + c[2][2] + c[3][2]) / 4.0
@@ -222,23 +333,25 @@ static func _facet_world_centroid(fid: int) -> Array:
 		_frame[f + 1] + qcx * _frame[f + 4] + qcy * _frame[f + 10],
 		_frame[f + 2] + qcx * _frame[f + 5] + qcy * _frame[f + 11]]
 
-static func _build_seam(fid: int, face: int, a: int, b: int, slot: int) -> void:
+static func _build_seam(fid: int, face: int, a: int, b: int, slot: int, k: int, r: float, base: int) -> void:
 	var fA := fid * 12
 	var c0A: Array = [_frame[fA + 0], _frame[fA + 1], _frame[fA + 2]]
 	var euA: Array = [_frame[fA + 3], _frame[fA + 4], _frame[fA + 5]]
 	var nA: Array = [_frame[fA + 6], _frame[fA + 7], _frame[fA + 8]]
 	var ewA: Array = [_frame[fA + 9], _frame[fA + 10], _frame[fA + 11]]
-	# neighbour facet via fold_cell at grid resolution K (single-edge fold — a facet is never double-out)
+	# neighbour facet via fold_cell at THIS body's grid resolution k (single-edge fold — a facet is never
+	# double-out); the neighbour fid stays IN this body's range by construction (+ fid_base). Seams never
+	# cross bodies (each body's facet graph is closed), so a Moon seam always resolves to a Moon fid.
 	var nb := _neigh_ab(a, b, slot)
-	var fold: Dictionary = CubeSphere.fold_cell(face, nb.x, nb.y, K)
-	var fidB := (int(fold["face"]) * K + int(fold["i"])) * K + int(fold["j"])
+	var fold: Dictionary = CubeSphere.fold_cell(face, nb.x, nb.y, k)
+	var fidB := base + (int(fold["face"]) * k + int(fold["i"])) * k + int(fold["j"])
 	var fB := fidB * 12
 	var c0B: Array = [_frame[fB + 0], _frame[fB + 1], _frame[fB + 2]]
 	var nB: Array = [_frame[fB + 6], _frame[fB + 7], _frame[fB + 8]]
 	# shared true edge endpoints (·R, un-planarized), projected onto BOTH facet planes and averaged = welded ring
 	var ev := _seam_edge_ij(a, b, slot)
-	var e0 := _corner(face, ev[0], ev[1])
-	var e1 := _corner(face, ev[2], ev[3])
+	var e0 := _corner(face, ev[0], ev[1], k, r)
+	var e1 := _corner(face, ev[2], ev[3], k, r)
 	var pA0 := _proj_plane(e0, c0A, nA); var pB0 := _proj_plane(e0, c0B, nB)
 	var pA1 := _proj_plane(e1, c0A, nA); var pB1 := _proj_plane(e1, c0B, nB)
 	var r0: Array = [(pA0[0] + pB0[0]) / 2.0, (pA0[1] + pB0[1]) / 2.0, (pA0[2] + pB0[2]) / 2.0]
@@ -633,7 +746,9 @@ static func _facet_centre_cell(fid: int) -> Vector2i:
 	return Vector2i(_off[fid * 2] + int(round(qx)), _off[fid * 2 + 1] + int(round(qy)))
 
 static func _pick_spawn_facet() -> int:
-	for fid in range(_nf):
+	# Scan the HOME body (Earth) range only — you spawn on Earth; the Moon needs no spawn facet (you arrive
+	# where you land, O4c). Earth-only this is [0, _nf) so the pick is byte-identical to the pre-refactor scan.
+	for fid in range(body_facet_count(0)):
 		var cc := _facet_centre_cell(fid)
 		var d := cell_dir(fid, cc.x, cc.y)
 		if absf(d.z) >= 0.5:                       # temperate latitude only (|sin φ| < 0.5)
@@ -669,6 +784,18 @@ static func facet_of_dir(d: CubeSphere.DVec3) -> int:
 	var fj: int = clampi(int(fc["fj"]), 0, K - 1)
 	return (face * K + fi) * K + fj
 
+## COSMOS-ORBITAL-O1O4 §3.1 — the body-parameterised facet_of_dir: which facet of active body `bi` does the
+## radial direction `d` land in? Returns a GLOBAL fid (fid_base[bi] + local). facet_of_dir(d) above is exactly
+## facet_of_dir_body(0, d) for Earth (K, base 0) — kept as a distinct literal so the ~9 Earth callers stay
+## byte-identical and require no registry. The Moon gate (G-O4-ATLAS2) round-trips this over the Moon's fids.
+static func facet_of_dir_body(bi: int, d: CubeSphere.DVec3) -> int:
+	var k := _body_k[bi]
+	var fc := CubeSphere.dir_to_face_cell(d, k)
+	var face: int = int(fc["face"])
+	var fi: int = clampi(int(fc["fi"]), 0, k - 1)
+	var fj: int = clampi(int(fc["fj"]), 0, k - 1)
+	return _fid_base[bi] + (face * k + fi) * k + fj
+
 # ------- frame self-test (G-F1e, all f64 — never routes the frame through f32 Vector3) -------
 
 ## f64 frame-math metrics for facet `fid` (the FP1 gate G-F1e asserts thresholds on these). Recomputes the
@@ -689,11 +816,13 @@ static func verify_frame(fid: int) -> Dictionary:
 	# determinant of [eu | n | ew] = eu · (n × ew); +1 for a right-handed orthonormal basis
 	var nxw: Array = _cross(n, ew)
 	var det: float = eu[0] * nxw[0] + eu[1] * nxw[1] + eu[2] * nxw[2]
-	# recompute the true (unprojected) corners + centroid → n̂ must point along the centre radial
-	var face := int(fid / (K * K))
-	var rem := fid - face * K * K
-	var a := int(rem / K); var b := rem - a * K
-	var tc: Array = [_corner(face, a, b), _corner(face, a + 1, b), _corner(face, a + 1, b + 1), _corner(face, a, b + 1)]
+	# recompute the true (unprojected) corners + centroid → n̂ must point along the centre radial. Decode the
+	# LOCAL (face,a,b) within this fid's body (Earth ⇒ base 0, k=K, r=R_BLOCKS → byte-identical to the old K*K decode).
+	var kb := k_of(fid); var rb := r_of(fid); var lf := fid - fid_base_of(fid)
+	var face := int(lf / (kb * kb))
+	var rem := lf - face * kb * kb
+	var a := int(rem / kb); var b := rem - a * kb
+	var tc: Array = [_corner(face, a, b, kb, rb), _corner(face, a + 1, b, kb, rb), _corner(face, a + 1, b + 1, kb, rb), _corner(face, a, b + 1, kb, rb)]
 	var mx: float = (tc[0][0] + tc[1][0] + tc[2][0] + tc[3][0]) / 4.0
 	var my: float = (tc[0][1] + tc[1][1] + tc[2][1] + tc[3][1]) / 4.0
 	var mz: float = (tc[0][2] + tc[1][2] + tc[2][2] + tc[3][2]) / 4.0

@@ -779,6 +779,10 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var nt = player.call("nav_telemetry")
 			if nt is Dictionary and not (nt as Dictionary).is_empty():
 				msg.merge(nt as Dictionary)
+		# COSMOS-ORBITAL-SHELL H-B: the live camera far plane, so "shell emitted but far side clipped" (far-plane) is
+		# directly readable next to sh_d/sh_h (compare far to the limb tangent √(d²−R²)). Guarded; 0 when absent.
+		if player.has_method("camera_far"):
+			msg["cam_far"] = snappedf(float(player.call("camera_far")), 0.1)
 	# Active facet is a global (faceted mode); -1 when non-faceted. Static call is always safe.
 	msg["facet"] = TerrainConfig.active_facet()
 	if is_instance_valid(world):
@@ -804,6 +808,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var ls = world.call("lod_stats")
 			if ls is Dictionary and not (ls as Dictionary).is_empty():
 				msg["lod"] = ls
+			# COSMOS-ORBITAL-SHELL live-path telemetry — the far-ring driver→warm→emit→draw state, so ONE orbit fly
+			# disambiguates the far-side-blank stage (warm/emit stall vs draw/far-plane vs wrong axis). ADDITIVE +
+			# empty-dict-guarded: with the camera-set law off/never-engaged shell_telemetry() is {} → nothing stamped.
+		if world.has_method("shell_telemetry"):
+			var sh = world.call("shell_telemetry")
+			if sh is Dictionary and not (sh as Dictionary).is_empty():
+				msg.merge(sh as Dictionary)
 
 
 ## Capture the game canvas and send it as a binary JPEG frame, unless a capture is already inflight

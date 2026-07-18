@@ -159,6 +159,16 @@ func _process(_delta: float) -> void:
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
 	if _cosmos_clock != null:
 		_cosmos_clock.advance(_delta)
+	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
+	# CAMERA radial direction + arm the one-shot prewarm. The FACETED production game ships FLAT_WORLD=true and RETURNS
+	# below, so — exactly like the sky clock above — this MUST run BEFORE that early-return or the driver is DEAD (the
+	# live far-side-blank bug: the hook used to sit after the return → update_shell_camera_set was never called →
+	# shell_telemetry() came back {} every frame). Gated on the shell flags + FACETED (flag-off ⇒ never called ⇒
+	# byte-identical); _player-null-guarded. At the user's low orbit the shipped faceted far plane (9000) already
+	# reaches the far-ring limb √(d²−R²), so this driver-move alone renders the far side; the SN3 scaled-body ramp
+	# (also stranded below the return) is only needed above h≈6.4k and is a separate FP_SCALED_BODY pass.
+	if _player != null and (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
+		_player.world.update_shell_camera_set(_player.camera_global_transform().origin)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin
@@ -186,13 +196,6 @@ func _process(_delta: float) -> void:
 		var d := cam.distance_to(centre)
 		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
 		_player.world.apply_scaled_body(cam)
-
-	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
-	# CAMERA radial direction (so the whole visible cap renders from orbit, not just the active facet's hemisphere)
-	# and arm the one-shot whole-planet prewarm. Independent of FP_SCALED_BODY (S1 is standalone-correct below the
-	# limb-clip altitude). DEAD (never called) with both shell flags off ⇒ the far ring is byte-identical to shipped.
-	if (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
-		_player.world.update_shell_camera_set(cam)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

@@ -61,7 +61,7 @@ func _gate_hudnav() -> void:
 	var h = NavHUDCls.new()
 	h._ready()                                              # builds the panel + labels (fired by add_child in-app)
 	_ok(h.get_child_count() == 1, "NavHUD builds exactly one panel node on _ready")
-	_ok(h._pos_label != null and h._mode_label != null, "NavHUD position + mode labels instantiated")
+	_ok(h._pos_label != null and h._vel_label != null and h._mode_label != null, "NavHUD position + velocity + mode labels instantiated")
 	# _process with a null player must be a safe no-op (no crash, labels stay default).
 	h.player = null
 	h._process(0.016)
@@ -73,6 +73,9 @@ func _gate_hudnav() -> void:
 		"format_pos rounds x,y,z + altitude")
 	_ok(NavHUDCls.format_mode("low_orbit") == "mode: LOW_ORBIT", "format_mode upper-cases the nav name")
 	_ok(NavHUDCls.format_mode("—") == "mode: —", "format_mode passes the off-state dash through")
+	# SN-FIX #1b: the velocity + circular-orbit-reference readout.
+	_ok(NavHUDCls.format_vel(141.6, 259.7) == "spd 142 b/s\nv_circ 260", "format_vel rounds speed + v_circ")
+	_ok(NavHUDCls.format_vel(0.0, 0.0) == "spd 0 b/s\nv_circ 0", "format_vel handles the at-rest / at-centre case")
 
 # ------------------------------------------------------------------ G-SN-KEEPHEADING
 func _gate_keepheading() -> void:

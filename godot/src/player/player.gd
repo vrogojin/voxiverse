@@ -630,6 +630,25 @@ func radial_altitude() -> float:
 			return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - _FacetAtlasCls.R_BLOCKS
 	return position.y
 
+## SN-FIX #1b (SN_HUD_NAV, 2026-07-18 live-pilot request): the player's current speed in blocks/s for the HUD.
+## Prefers the nav machine's body-centred-inertial |v_bci| (`_nav_tele`, the same value the RemoteBridge streams),
+## and falls back to the CharacterBody3D lattice speed when the nav machine is off (SN_NAV_MODES false ⇒ empty
+## `_nav_tele`). Pure read; no state.
+func nav_speed_bci() -> float:
+	if _nav_tele.has("v_bci"):
+		return float(_nav_tele["v_bci"])
+	return velocity.length()
+
+## SN-FIX #1b (SN_HUD_NAV): the LOCAL circular-orbit speed reference v_circ = √(GM_dyn/r) at the player's current
+## radius r = R_BLOCKS + radial_altitude() — so the pilot can read how close their speed is to a stable orbit
+## (≈260 b/s at the surface). Reads GM_dyn (SPACE-NAV §3, the local-dynamics scale — NOT the sky's GM_game) for the
+## home body. Pure math; 0 at/below the centre. Cheap (one sqrt).
+func orbit_v_circ() -> float:
+	var r := _FacetAtlasCls.R_BLOCKS + radial_altitude()
+	if r <= 0.0:
+		return 0.0
+	return sqrt(CosmosGravity.gm_dyn("earth") / r)
+
 ## SN-BRAKE (per-body generic, architectural): the dominant body whose atmosphere/gravity the local descent
 ## physics reads. Today the only walkable body is Earth (the faceted planet), so this returns "earth"; when the
 ## O4a multi-body atlas lands this is the ONE place that resolves the active dominant body — the drag/gravity

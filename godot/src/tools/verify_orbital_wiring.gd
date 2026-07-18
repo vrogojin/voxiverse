@@ -88,7 +88,9 @@ func _gate_handoff() -> void:
 	var speed := DV.length(bci_eq[1])
 	var expect := EPH.omega_spin(body) * rv
 	_ok(_rel(speed, expect) < 1.0e-9, "G-O1-HANDOFF: standing at equator |v_bci| = %.4f == ω·R" % speed)
-	_ok(_rel(speed, 16.1) < 1.0e-2, "G-O1-HANDOFF: equator spin bonus = %.3f m/s ≈ 16.1 (interim R=3072)" % speed)
+	# ω·R scales linearly with R: interim 16.1 at R=3072 → 33.36 at R=6371 (×6371/3072). ω_spin (day length) is
+	# unchanged, so this is a pure radius rescale.
+	_ok(_rel(speed, 33.36) < 1.0e-2, "G-O1-HANDOFF: equator spin bonus = %.3f m/s ≈ 33.36 (Earth/1000, R=6371)" % speed)
 	# eastward: at (R,0,0) with +Z spin, ω⃗×p = ωR·(+Y); at t=0 (θ=0) v_bci stays +Y.
 	var v_eq: PackedFloat64Array = bci_eq[1]
 	var yhat := v_eq[1] / speed

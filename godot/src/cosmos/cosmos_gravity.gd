@@ -32,9 +32,10 @@ class_name CosmosGravity
 const EPH := preload("res://src/cosmos/cosmos_ephemeris.gd")
 const DV := preload("res://src/cosmos/dvec3.gd")
 
-## Earth walking feel gravity (blocks/s²) — the shipped player.gd tuning constant (player.gd:25). Not
-## 9.81: an Earth-feel value. FEEL_G(body) scales it by the real surface-gravity ratio (below).
-const FEEL_G_EARTH := 22.0
+## Earth walking feel gravity (blocks/s²) — mirrors the player.gd `gravity` walk-feel constant (kept in
+## lockstep so the near-surface blend field and the walking game agree). Rescale set both to realistic
+## 9.8 (Earth/1000 model, 1 block = 1 m). FEEL_G(body) scales it by the real surface-gravity ratio (below).
+const FEEL_G_EARTH := 9.8
 
 # ---------------------------------------------------------------------------------------
 # GM_dyn — the scale bridge (SPACE-NAV §3).

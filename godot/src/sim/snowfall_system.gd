@@ -126,6 +126,12 @@ func _process_column(x: int, z: int, player_col: Vector2i) -> int:
 	var g := TerrainConfig.height_at(x, z)
 	var t := TerrainConfig.column_profile(x, z).w
 	var ts := ClimateModel.surface_temperature(g, t)
+	# CLIMATE W0 (§3.4): the seasonal snow line. The offset shifts this column's freeze test with the
+	# subsolar latitude — snow advances in the winter hemisphere and retreats in summer, entirely inside
+	# the existing SNOW_EDIT_BUDGET / SIM_RADIUS footprint (no global restamp). Flag-off ⇒ never evaluated
+	# ⇒ byte-identical to the shipped snow sim. The signed latitude comes from the env's chart (0 when flat).
+	if CubeSphere.FP_SEASONS and world.environment != null:
+		ts += ClimateModel.season_offset(world.environment.signed_sinlat(x, z), ClimateModel.current_sin_delta)
 
 	# (1) Piggyback the M1 melt/freeze EVALUATOR on the exposed surface cell (§4.3.4): bounded (one call
 	# per processed column), main-thread, and its SET (freeze) edge stays self-gated to the generated

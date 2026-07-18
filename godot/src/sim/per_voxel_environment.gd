@@ -108,21 +108,42 @@ func _depth(c: Vector3i) -> int:
 		return -1
 	return surface - c.y
 
+## CLIMATE W0 (§3): signed sin-latitude at WINDOW column (x, z) — the spin-axis (+Z) component of the
+## column's sphere direction (curved/faceted). FLAT_WORLD (no chart) ⇒ 0 (a flat world has no hemispheres),
+## so the seasonal offset vanishes there. The ONE source of latitude sign (N vs S) for the season term;
+## the climate `t` (column_profile.w) can't provide it — it uses |sinφ| and loses the hemisphere.
+func signed_sinlat(x: int, z: int) -> float:
+	if _chart == null:
+		return 0.0
+	return CosmosTruePlace.dir_of_window(_chart, float(x) + 0.5, float(z) + 0.5).z
+
+## The seasonal temperature offset (°C) at column (x, z) — 0 unless FP_SEASONS is on, so the flag-off path
+## never even evaluates it (byte-identical). Applied to the air/ground branches below (NOT the frozen-sea
+## structural pin, which stays exactly −8 — the ice sheet is annual-mean static, §3.4).
+func _season_term(x: int, z: int) -> float:
+	return ClimateModel.season_offset(signed_sinlat(x, z), ClimateModel.current_sin_delta)
+
 ## Temperature in degrees Celsius at the voxel containing `pos`.
 func temperature(pos: Vector3) -> float:
 	var c := _cell(pos)
 	var surface := _surface_h(c.x, c.z)
 	if c.y > surface:                          # air voxel (incl. water/sea ice above the floor)
 		# Frozen-sea seam (verbatim): a frozen OCEAN column's sea-level air/ice stays exactly
-		# −8 so the brittle-ice structural curve reads the sheet as sound (see const block).
+		# −8 so the brittle-ice structural curve reads the sheet as sound (see const block). The
+		# season offset is deliberately NOT added here — the ice sheet is annual-mean static (§3.4).
 		if surface < TerrainConfig.SEA_LEVEL and c.y <= TerrainConfig.SEA_LEVEL \
 				and _climate_w(c.x, c.z) < CLIMATE_FROZEN:
 			return T_FROZEN_SEA
-		return ClimateModel.air_temperature(float(c.y), _climate_w(c.x, c.z))
+		var air := ClimateModel.air_temperature(float(c.y), _climate_w(c.x, c.z))
+		if CubeSphere.FP_SEASONS:
+			air += _season_term(c.x, c.z)
+		return air
 	# Ground: cool from the surface anchor toward the 3 C plateau at COOL_RATE/block, SIGNED
 	# (a cold column with ts < COOL_FLOOR warms downward toward the plateau — permafrost), plus
 	# the geothermal excess in the 24 blocks above bedrock (3 C at y=-40, climbing to 27 C at y=-64).
 	var ts := ClimateModel.surface_temperature(surface, _climate_w(c.x, c.z))
+	if CubeSphere.FP_SEASONS:
+		ts += _season_term(c.x, c.z)
 	var d := surface - c.y
 	var toward := maxf(ts - COOL_RATE * float(d), COOL_FLOOR) if ts >= COOL_FLOOR \
 		else minf(ts + COOL_RATE * float(d), COOL_FLOOR)

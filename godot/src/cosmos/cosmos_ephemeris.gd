@@ -75,7 +75,11 @@ const BODIES := {
 	"earth": {
 		"gm_real": 3.986e14, "r": 6371.0, "parent": "sun", "a": 149.6e6, "m0": 0.0,
 		"spin_period": DAY_GAME, "spin_phase0": 0.0, "tidal": false,   # one solar day = √1000-scaled ≈ 2732.6 s
-		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
+		# CLIMATE W0 (§3): real obliquity ε = 23.4° = 0.4084 rad. USED only when CubeSphere.FP_SEASONS is on
+		# (effective_tilt gates it → 0 with the flag off, so dir_to_bodyfixed stays byte-identical). incl still
+		# 0 (the orbit plane == the ecliptic); the tilt lives purely in the body-fixed frame, so orbit/period/
+		# tidal math is untouched.
+		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.4084,
 	},
 	"moon": {
 		"gm_real": 4.905e12, "r": 1737.0, "parent": "earth", "a": 384400.0, "m0": 0.0,
@@ -242,21 +246,66 @@ static func angular_diameter(body: String, from_body: String, t: float) -> float
 		return 0.0
 	return 2.0 * atan(radius_of(body) / dist)
 
+## CLIMATE W0 (§3): the axial obliquity (rad) actually APPLIED to `body`'s body-fixed frame. The frozen
+## table value gated by CubeSphere.FP_SEASONS — with the flag OFF this returns 0 for every body, so
+## dir_to_bodyfixed / subsolar_latitude below collapse to the shipped no-tilt kernel (R_tilt = I) and are
+## BYTE-IDENTICAL. ON, Earth reads 0.4084 rad (23.4°) → seasonal sun arcs and the subsolar-latitude wave.
+## Reading a CubeSphere const keeps the kernel pure (CubeSphere is engine-free math, no singleton/clock).
+static func effective_tilt(body: String) -> float:
+	if not CubeSphere.FP_SEASONS:
+		return 0.0
+	return float(BODIES[body]["axial_tilt"])
+
 ## Unit direction (Vector3) from `from_body` to `to_body`, expressed in `from_body`'s BODY-FIXED
 ## frame at t — the inertial direction rotated by −spin_angle(from_body) about the spin axis (+Z,
 ## north per the CubeSphere face frame). This is what the sky layer consumes: as Earth spins the
-## Sun sweeps around the observer (day-night) with zero geometry work (§4.1/§8.2). incl/tilt = 0,
-## so a −Z-axis rotation is exact for v1.
+## Sun sweeps around the observer (day-night) with zero geometry work (§4.1/§8.2).
+##
+## CLIMATE W0: the body-fixed frame is R_spin(θ)·R_tilt(ε) — the obliquity tilts the pole off the orbit
+## normal, fixed in inertial space, so as Earth orbits its north pole leans sun-ward in summer and away in
+## winter (the WHOLE of seasons). We express the inertial direction in that frame: first R_x(−ε) (tilt the
+## pole from +Z toward the equinox line), then R_z(−θ) (spin about the tilted pole). ε=0 (flag off) ⇒ only
+## the spin rotation runs ⇒ byte-identical to the shipped kernel. The Z-component after R_x(−ε) IS the sine
+## of the local declination, so this and subsolar_latitude() agree by construction.
 static func dir_to_bodyfixed(from_body: String, to_body: String, t: float) -> Vector3:
-	var d_inertial := dir_to(from_body, to_body, t)
+	var d := dir_to(from_body, to_body, t)
+	var eps := effective_tilt(from_body)
+	if eps != 0.0:
+		# R_x(−ε): (x, y·cosε + z·sinε, −y·sinε + z·cosε) — tilt the north axis by the obliquity.
+		var ce := cos(eps)
+		var se := sin(eps)
+		d = Vector3(d.x, d.y * ce + d.z * se, -d.y * se + d.z * ce)
 	var ang := -spin_angle(from_body, t)
 	var c := cos(ang)
 	var s := sin(ang)
 	# R_z(ang) · d : rotate about +Z (the spin/north axis); Z component is untouched.
 	return Vector3(
-		c * d_inertial.x - s * d_inertial.y,
-		s * d_inertial.x + c * d_inertial.y,
-		d_inertial.z)
+		c * d.x - s * d.y,
+		s * d.x + c * d.y,
+		d.z)
+
+## CLIMATE W0 (§3): the SUBSOLAR LATITUDE δ(t) (rad) — the latitude where the Sun stands at zenith. It is
+## the sine of the Sun's north-axis component in Earth's tilted (but unspun) frame: with the inertial Sun
+## direction ŝ and R_x(−ε) applied, z' = −ŝ_y·sinε + ŝ_z·cosε, δ = asin(z'). Since the Sun sits in the
+## ecliptic (ŝ_z ≈ 0) this is δ ≈ asin(sinε·sinM) → +23.4° at the June solstice (M=π/2), −23.4° in
+## December, 0 at the equinoxes. This is the SAME z' the tilted dir_to_bodyfixed produces, so the sky sun
+## arc and the season offset can never disagree. Pure; ε gated by FP_SEASONS (0 ⇒ δ≡0, no seasons).
+static func subsolar_latitude(t: float) -> float:
+	return subsolar_latitude_eps(t, effective_tilt("earth"))
+
+## The explicit-obliquity form of subsolar_latitude — a pure function of (t, ε) that does NOT read the
+## flag, so a gate can assert δ = ±23.4° at the solstices regardless of the shipped FP_SEASONS default.
+static func subsolar_latitude_eps(t: float, eps: float) -> float:
+	var s := dir_to_f64("earth", "sun", t)          # inertial f64 unit direction to the Sun
+	var z_pole := -s[1] * sin(eps) + s[2] * cos(eps)
+	return asin(clampf(z_pole, -1.0, 1.0))
+
+## CLIMATE W0: `body`'s spin-axis (north-pole) unit direction in the INERTIAL frame = R_x(ε)·(+Z) =
+## (0, −sinε, cosε). Fixed in inertial space (obliquity is constant) — celestial north for the sky/nav.
+## ε gated by FP_SEASONS ⇒ (0,0,1) with the flag off (byte-identical to the untilted +Z pole).
+static func pole_axis_inertial(body: String) -> Vector3:
+	var eps := effective_tilt(body)
+	return Vector3(0.0, -sin(eps), cos(eps))
 
 ## Sub-`target` longitude (rad) on `body`'s surface — the body-fixed azimuth of the direction from
 ## `body` to `target`. For a tidally-locked moon toward its parent this is CONSTANT (the tidal-lock

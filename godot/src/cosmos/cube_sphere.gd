@@ -632,6 +632,17 @@ const ATMO_VISUAL_RAMP := false
 ## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
 const SN_SUN_OCCLUSION := false
 
+## COSMOS CLIMATE W0 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3 / §7) — REAL AXIAL SEASONS. When true the
+## ephemeris fills Earth's reserved axial_tilt slot (23.4° = 0.4084 rad): dir_to_bodyfixed composes the
+## obliquity (R_spin·R_tilt) so CosmosSky's sun arcs get seasonal (low winter / high summer / polar
+## day-night) for free, and ClimateModel.season_offset(sinlat, sinδ) shifts the sim-layer temperature and
+## the SnowfallSystem snow line with the subsolar latitude δ(t). WORLDGEN IS UNTOUCHED — the offset is added
+## ONLY by sim-layer callers (PerVoxelEnvironment / SnowfallSystem), so generated_cell/profile_at_dir stay
+## pure of the clock (G-SEAS-PURE) and the C++ frozen epoch survives. Default FALSE ⇒ effective_tilt≡0
+## (R_tilt=I) and no offset is ever added ⇒ BYTE-IDENTICAL to the shipped no-tilt kernel; the O1/tidal gates
+## stay green. Gate verify_climate G-SEAS-TILT (δ=±23.4° at solstices) + G-SEAS-PURE.
+const FP_SEASONS := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

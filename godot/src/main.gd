@@ -83,8 +83,11 @@ func _ready() -> void:
 	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp
 	# (day-night), placing the Sun light + Sun/Moon impostors + star dome from the pure ephemeris; the
 	# clock is advanced in _process (below). The player is the parallax-free camera provider.
-	if CubeSphere.ORBITAL_SKY:
+	# CLIMATE W0 (FP_SEASONS) also needs the celestial clock (to derive the subsolar latitude), so build it
+	# whenever EITHER flag is on; the Sun/Moon/sky nodes are still ORBITAL_SKY-only.
+	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS:
 		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
+	if CubeSphere.ORBITAL_SKY:
 		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
 		var env: Environment = we.environment if we != null else null
 		_cosmos_sky = CosmosSky.new()
@@ -159,6 +162,11 @@ func _process(_delta: float) -> void:
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
 	if _cosmos_clock != null:
 		_cosmos_clock.advance(_delta)
+		# CLIMATE W0 (§3): publish the current subsolar sin-latitude once per frame (main thread) so the
+		# sim-layer season offset (PerVoxelEnvironment / SnowfallSystem) tracks the seasons. Flag-off ⇒ never
+		# written ⇒ stays 0 ⇒ zero seasonal offset (byte-identical). Pure ephemeris read, no allocation.
+		if CubeSphere.FP_SEASONS:
+			ClimateModel.current_sin_delta = sin(CosmosEphemeris.subsolar_latitude(_cosmos_clock.now()))
 	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
 	# CAMERA radial direction + arm the one-shot prewarm. The FACETED production game ships FLAT_WORLD=true and RETURNS
 	# below, so — exactly like the sky clock above — this MUST run BEFORE that early-return or the driver is DEAD (the

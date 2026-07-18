@@ -116,6 +116,14 @@ var _dev_orbital_commit := false
 # (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
 var _fall_v_bci := PackedFloat64Array()
 var _fall_have_v := false
+# COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — the O free-coast state. `_orbit_coasting` is set by the O toggle in
+# LOW/HIGH orbit; while true, each physics frame integrates `_coast_v_bci` under GM_dyn/r² gravity (the shared
+# Kepler coast, seeded tangential by O) and re-projects to the lattice `position` — a stable circular seed holds
+# radius (the fix for "orbits then hangs"). The coast mirrors `_coast_v_bci` into `_dev_v_bci` each tick so the
+# nav machine reads the true orbital velocity AND an exit to the dev-flight controller is velocity-continuous
+# (SN-R1). DEAD (never set) with ORBIT_COAST off ⇒ the shipped O velocity-command path is byte-identical.
+var _orbit_coasting := false
+var _coast_v_bci := PackedFloat64Array()
 
 # COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3) — the inertial-attitude state machine. ALL DEAD
 # (mode pinned ATT_SURFACE, camera never emancipated) unless CubeSphere.ORBIT_ATTITUDE AND _nav != null, so the
@@ -634,6 +642,7 @@ func _toggle_dev_nav() -> void:
 	_dev_have_v = false
 	_dev_active = false
 	_dev_orbital_commit = false                              # SN-FIX #3: entering/leaving dev-nav is never mid-orbit
+	_orbit_coasting = false                                  # ORBIT_COAST (§7.4): toggling dev-nav ends any free-coast
 	if _body_shape != null:
 		_body_shape.disabled = flying
 	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
@@ -754,20 +763,58 @@ func _free_fall_move(delta: float) -> void:
 		velocity.y -= gravity * delta
 		position.y += velocity.y * delta
 		return
-	var t := _nav_clock
-	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
-	var p_fix := _DVCls.v(w[0], w[1], w[2])
-	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
 	if not _fall_have_v:
 		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
 		_fall_have_v = true
-	var os = _OrbitalStateCls.make("earth", p_bci, _fall_v_bci)
-	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free-fall (no thrust/drag)
-	_fall_v_bci = os.vel
-	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, os.pos, _fall_v_bci)[0]
+	_fall_v_bci = _coast_step(delta, _fall_v_bci, "earth")   # shared Kepler coast (free-fall literal body stays "earth")
+	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
+## planet-centred point-mass gravity (GM_dyn/r² via OrbitalState velocity-Verlet, substep-capped) in the BCI frame
+## from the seed velocity `v_bci`, re-projecting the new BCI position back to the lattice `position`, and RETURNING
+## the new BCI velocity. Pure free coast (no thrust/drag). PRECONDITION: on an active facet (fid >= 0 — the caller
+## handles the off-facet fallback). This is the ONE code path both the free-fall (seeded straight-down) and the O
+## orbit (seeded tangential) share — gravity alone decides straight fall vs stable orbit vs ellipse/escape.
+func _coast_step(delta: float, v_bci: PackedFloat64Array, body: String) -> PackedFloat64Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
+	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, os.pos, os.vel)[0]
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
 	position = Vector3(lat[0], lat[1], lat[2])
-	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
+	return os.vel
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — one physics tick of the O free-coast: integrate the shared Kepler coast
+## from `_coast_v_bci` (seeded tangential by the O toggle) and write the lattice `position`. A stable circular seed
+## HOLDS radius; an off-circular seed evolves into an ellipse / decay / escape. The coast mirrors its BCI velocity
+## into `_dev_v_bci` (and marks `_dev_active`) so the nav machine classifies on the true orbital velocity and any
+## later exit to the dev-flight controller is velocity-continuous. Off-facet ⇒ hold (never strand). LIVE-ONLY: the
+## feel of orbiting; the orbit math (holds radius / ellipse / escape) is G-OCOAST.
+func _orbit_coast_move(delta: float) -> void:
+	delta = _CosmosNavCls.clamp_nav_dt(delta)               # G-SN-NOSPIRAL: bound the post-hitch dt (no spiral)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		velocity = Vector3.ZERO
+		return
+	_coast_v_bci = _coast_step(delta, _coast_v_bci, _dominant_body())
+	_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+	_dev_have_v = true                                       # SN-R1: the dev-flight seed mirrors the coast velocity
+	_horiz_vel = Vector3.ZERO
+	velocity = Vector3.ZERO
+	_dev_active = true                                       # tells _nav_tick the coast owns the BCI velocity this frame
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — is there a thrust/movement input this tick (the coast-exit trigger)? WASD
+## (input.x/z) or the vertical verb (Space/Ctrl, or the remote `input.y`). Pure read of the already-polled input.
+func _coast_thrust_input(input: Vector3) -> bool:
+	if input.x != 0.0 or input.z != 0.0:
+		return true
+	if remote_drive:
+		return absf(input.y) > 0.0
+	return Input.is_key_pressed(KEY_SPACE) or Input.is_key_pressed(KEY_CTRL)
 
 ## SN-FIX #3 — the free-fall → surface handoff: the LATTICE vertical velocity (velocity.y) equivalent of the
 ## current BCI fall velocity, so the surface-feel gravity continues from the true downward speed (continuous at
@@ -869,15 +916,35 @@ func _dev_toggle_key(keycode: int) -> void:
 		KEY_R:
 			_nav.toggle_r_latch()                           # §7.4 R: latch DEEP_SPACE expression from HIGH_ORBIT
 		KEY_O:
-			# O — circular-orbit release (LOW/HIGH): set the controller velocity to the circular orbital velocity
-			# in the look-tangential direction. (True free-coast handoff to the ORBITAL integrator is live/SN1.)
+			# O — circular-orbit release (LOW/HIGH). Under ORBIT_COAST (§7.4) O engages a REAL Keplerian free-coast
+			# (gravity-integrated each frame — a stable orbit HOLDS, fixing "orbits then hangs"); O again leaves it.
+			# Flag off ⇒ the shipped velocity-command release (which decays to rest with no ongoing input — the bug).
 			if mode == _CosmosNavCls.LOW_ORBIT or mode == _CosmosNavCls.HIGH_ORBIT:
-				var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
-				_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
-				_dev_have_v = true
-				# SN-FIX #3: O is the explicit "commit to orbital flight" verb — latch it so the velocity-command
-				# controller now owns flight (under SN_NO_CEILING_BOUNCE; the latch is inert with the flag off).
-				_dev_orbital_commit = true
+				if CubeSphere.ORBIT_COAST:
+					var body := _dominant_body()
+					if _orbit_coasting:
+						# O again → leave the coast. Seed the dev-flight velocity-command from the CURRENT coast
+						# velocity (SN-R1 — no jump) and commit so the controller owns flight from here.
+						_orbit_coasting = false
+						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+						_dev_have_v = true
+						_dev_orbital_commit = true
+					else:
+						# O → enter the free-coast. Seed v = v_circ·t̂ with t̂ = the YAW-heading tangent (the BODY
+						# basis forward, PITCH IGNORED — pitch never tilts the orbit plane). Gravity does the rest.
+						var look_yaw := _dev_dir_to_bci(fid, t, _DevFlightCls.coast_seed_look_lattice(transform.basis)) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+						_coast_v_bci = _DevFlightCls.release_circular(body, _dev_p_bci, look_yaw, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+						_orbit_coasting = true
+						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+						_dev_have_v = true
+						_dev_orbital_commit = true
+				else:
+					var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+					_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+					_dev_have_v = true
+					# SN-FIX #3: O is the explicit "commit to orbital flight" verb — latch it so the velocity-command
+					# controller now owns flight (under SN_NO_CEILING_BOUNCE; the latch is inert with the flag off).
+					_dev_orbital_commit = true
 		KEY_G:
 			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
 			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
@@ -918,6 +985,19 @@ func _move(delta: float) -> void:
 		_dev_active = false
 		_fall_have_v = false                                # flying ⇒ not falling; next F-off re-seeds the free-fall
 		var use_devnav := _dev_nav and _nav != null
+		# COSMOS SPACE-NAV §7.4 (ORBIT_COAST): the O free-coast. While coasting, gravity integrates the orbit each
+		# frame (a stable circular seed HOLDS radius — the fix for "orbits then hangs"). EXIT: (b) any thrust/movement
+		# input hands off to the dev-flight velocity-command (SN-R1: `_dev_v_bci` already mirrors the coast velocity
+		# ⇒ no jump); (c) dropping into the atmosphere (PLANETARY) hands off to the shipped surface/dev path. On exit
+		# we fall through to the handoff below with `_dev_orbital_commit` set. Flag off ⇒ `_orbit_coasting` is never
+		# true ⇒ this whole block is skipped (byte-identical).
+		if CubeSphere.ORBIT_COAST and use_devnav and _orbit_coasting:
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY or _coast_thrust_input(input):
+				_orbit_coasting = false
+				_dev_orbital_commit = true                  # commit the mirrored coast velocity to the controller
+			else:
+				_orbit_coast_move(delta)
+				return
 		# SN-FIX #3 (SN_NO_CEILING_BOUNCE): `orbital_handoff` gates the O-COMMITTED orbital controller. Flag off ⇒
 		# it is the shipped `mode != PLANETARY` test (byte-identical auto-handoff). Flag on ⇒ it also requires the
 		# explicit O commit (`_dev_orbital_commit`), so the O velocity-command controller (a follow-up) runs ONLY

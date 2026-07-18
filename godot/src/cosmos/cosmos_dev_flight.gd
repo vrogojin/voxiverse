@@ -142,6 +142,13 @@ static func release_circular(body: String, p_bci: PackedFloat64Array, look_bci: 
 	var tl := DV.length(tang)
 	return DV.scale(tang, v_circ / tl) if tl > 0.0 else DV.v(0.0, 0.0, 0.0)
 
+## O — ORBIT_COAST seed look (§7.4): the player's YAW-heading forward with PITCH STRIPPED. The body
+## (CharacterBody3D) basis is yaw-only — pitch lives on the camera — so its forward (−Z) is the horizontal heading
+## independent of look pitch. Feeding THIS lattice direction (mapped to BCI) to release_circular keeps pitch from
+## ever tilting the orbit plane (user-locked: pitch ignored). Pure Basis read; gate G-OCOAST asserts .y == 0.
+static func coast_seed_look_lattice(body_basis: Basis) -> Vector3:
+	return -body_basis.z
+
 ## G — geostationary snap (§7.4, HIGH only): move to the equatorial point at r_geo preserving the current
 ## longitude, with `v_bci = ω⃗×p` (exactly circular there, and scene-stationary since the scene frame is
 ## body-fixed). Returns [p_new, v_new], or an EMPTY array when the body has no stationary orbit (the Moon —

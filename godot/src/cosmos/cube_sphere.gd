@@ -680,6 +680,19 @@ const ORBIT_LAND_RECOVER := false
 ## ORBIT-FRAME tunable (live-tuned): the RECOVER blend duration (s). Consulted only under ORBIT_LAND_RECOVER.
 const ORBIT_T_REC := 0.8
 
+## COSMOS SPACE-NAV §7.4 (docs/COSMOS-SPACE-NAV-DESIGN.md) — the O toggle becomes a REAL Keplerian free-coast.
+## Pressing O seeds v_bci = v_circ·t̂ (t̂ = the player's YAW-heading tangent ⊥ r̂, PITCH IGNORED) and then each
+## physics frame integrates the OrbitalState under GM_dyn/r² gravity — the SAME symplectic coast the SN-FIX #3
+## free-fall uses — so a circular seed HOLDS a stable orbit and an off-circular seed evolves into an ellipse /
+## decay / escape (KSP-style, emergent from the vector). Fixes the live bug where O set a dev-flight velocity-
+## COMMAND that ramped back to rest ("orbits a few seconds then hangs in space") because nothing integrated
+## gravity. Movement/thrust input exits to the dev-flight velocity-command (SN-R1 continuity — the coast mirrors
+## its BCI velocity into the controller each tick, so there is no jump); dropping into the atmosphere (PLANETARY)
+## also exits to the shipped surface/dev path. Per-body generic (reads the dominant body, not a hardcoded Earth).
+## Requires SN_DEVNAV (O is a dev-nav toggle) + FACETED. Default FALSE ⇒ BYTE-IDENTICAL: O keeps its shipped
+## velocity-command behaviour and no coast state is ever set. Gate G-OCOAST (verify_ocoast.gd).
+const ORBIT_COAST := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

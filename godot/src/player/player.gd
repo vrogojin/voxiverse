@@ -100,6 +100,12 @@ var _dev_have_v := false                        # false until seeded on the firs
 var _dev_active := false                         # true on ticks the orbital controller drove position (feeds _nav_tick)
 var _dev_p_bci := PackedFloat64Array()          # last BCI position (stashed for the O/G key handlers)
 var _dev_overlay: Control = null                # the SN5b overlay set (compass + guides); null unless dev-nav on
+# SN-FIX #3 (SN_NO_CEILING_BOUNCE): the explicit orbital-commit latch. Under the flag the auto mode→dev-flight
+# handoff is deferred (kinematic lattice fly is kept through the atmosphere→orbit band so a climb is not
+# decelerated at the ceiling); the orbital velocity-command controller engages only after the pilot EXPLICITLY
+# commits with the O "release-to-orbit" verb. Cleared on dev-nav toggle and whenever the mode is PLANETARY.
+# DEAD (always false) with the flag off ⇒ the shipped auto-handoff is byte-identical.
+var _dev_orbital_commit := false
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -230,8 +236,22 @@ func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
 		position = new_pos
 	else:
 		global_position = new_pos
-	rotation.y = wrapf(rotation.y + yaw_delta, -PI, PI)
-	velocity = velocity.rotated(Vector3.UP, yaw_delta)
+	# SN-FIX #2 (FP_CROSS_KEEP_HEADING): the position reframe above is what keeps position CONTINUOUS across the
+	# seam — it is untouched. The horizontal heading + velocity twist by `yaw_delta` (which re-aligns them to B's
+	# lattice frame) is factored into the pure `reframe_twist` so the gate drives both flag states. Flag off ⇒ the
+	# shipped twist (byte-identical); flag on ⇒ heading + velocity are preserved (the pilot's world heading stays,
+	# the ground's dihedral tilt is carried separately by the ActiveFrame/camera).
+	var tw := reframe_twist(rotation.y, velocity, yaw_delta, CubeSphere.FP_CROSS_KEEP_HEADING)
+	rotation.y = tw[0]
+	velocity = tw[1]
+
+## SN-FIX #2 (FP_CROSS_KEEP_HEADING) — the pure crossing heading/velocity twist decision, factored out for the
+## gate (no node state). `keep_heading` off ⇒ the shipped twist about UP by `yaw_delta`; on ⇒ heading + velocity
+## are returned UNCHANGED (world heading preserved across the crossing). Returns [new_yaw, new_velocity].
+static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, keep_heading: bool) -> Array:
+	if keep_heading:
+		return [cur_yaw, cur_vel]
+	return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]
 
 func _capture_mouse() -> void:
 	# Web quirk (Godot #102209): after Esc the pointer won't re-lock unless we
@@ -356,7 +376,9 @@ func _physics_process(delta: float) -> void:
 			apply_reframe(cross["new_pos"], cross["yaw_delta"])
 			# REMOTE-DRIVE (§4.4): forward the seam's yaw twist so the executor rotates its along-heading
 			# accumulator vector identically — distance walked stays continuous across the crossing.
-			_reframe_yaw = float(cross["yaw_delta"])
+			# SN-FIX #2: under FP_CROSS_KEEP_HEADING the heading is NOT twisted (see apply_reframe), so the
+			# executor's along-heading accumulator must NOT rotate either — forward a zero twist to stay consistent.
+			_reframe_yaw = 0.0 if CubeSphere.FP_CROSS_KEEP_HEADING else float(cross["yaw_delta"])
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
 	# cylinder about a cube vertex (or, defensively, a double-out column), relocate/eject them via the bisector
 	# teleport / seam glue — position, velocity and heading-relative yaw. Flag- and chart-gated no-op otherwise;
@@ -428,6 +450,24 @@ func _nav_tick(delta: float) -> void:
 func nav_telemetry() -> Dictionary:
 	return _nav_tele
 
+## SN-FIX #1 (SN_HUD_NAV): the current nav-mode NAME for the HUD — the SAME string the RemoteBridge nav_mode
+## telemetry uses. "—" when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` is null). Pure read.
+func nav_mode_name() -> String:
+	if _nav == null:
+		return "—"
+	return _CosmosNavCls.NAV_NAMES[int(_nav.mode)]
+
+## SN-FIX #1 (SN_HUD_NAV): the player's radial altitude in blocks for the HUD. On the faceted planet it is
+## |world(lattice)| − R_BLOCKS (the same h the nav machine classifies on); off the faceted planet (FLAT) it is
+## the lattice y (height above the ground plane). Pure read; no state.
+func radial_altitude() -> float:
+	if CubeSphere.FACETED:
+		var fid := TerrainConfig.active_facet()
+		if fid >= 0:
+			var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+			return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - _FacetAtlasCls.R_BLOCKS
+	return position.y
+
 ## COSMOS SPACE-NAV SN5 (§7.1): F toggled dev-nav. Dev-nav rides `flying` (noclip): entering disables the
 ## capsule (the shipped fly escape-hatch semantics), leaving re-enables it. The controller's velocity seed is
 ## dropped so the first orbital tick re-seeds from the live SN2 velocity. Only reachable under SN_DEVNAV.
@@ -437,6 +477,7 @@ func _toggle_dev_nav() -> void:
 	velocity = Vector3.ZERO
 	_dev_have_v = false
 	_dev_active = false
+	_dev_orbital_commit = false                              # SN-FIX #3: entering/leaving dev-nav is never mid-orbit
 	if _body_shape != null:
 		_body_shape.disabled = flying
 	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
@@ -453,6 +494,18 @@ func _toggle_dev_nav() -> void:
 ## True iff dev-nav is engaged (F under SN_DEVNAV). Read by the overlays (SN5b) and the HUD.
 func dev_nav_active() -> bool:
 	return _dev_nav
+
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the ORBITAL dev-flight handoff decision, factored out so the gate drives
+## it directly (pure, no state). Returns true iff the velocity-command controller should own this fly tick.
+## Flag OFF: exactly the shipped test — any orbital mode hands off (byte-identical). Flag ON: an orbital mode
+## hands off ONLY once the pilot has explicitly committed (O verb) — so climbing through the atmosphere ceiling
+## keeps the shipped kinematic lattice fly (climb velocity preserved, no ramp/deceleration = no bounce).
+static func orbital_handoff(mode: int, orbital_commit: bool, no_ceiling_bounce: bool) -> bool:
+	if mode == _CosmosNavCls.PLANETARY:
+		return false
+	if no_ceiling_bounce:
+		return orbital_commit
+	return true
 
 ## COSMOS SPACE-NAV SN5 (§7.2): the ORBITAL-mode dev-flight step. Reads the current lattice `position`, lifts it
 ## to the BCI frame, runs the velocity-command controller (CosmosDevFlight — the SN-R1-seamless kernel proven by
@@ -545,6 +598,9 @@ func _dev_toggle_key(keycode: int) -> void:
 				var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
 				_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
 				_dev_have_v = true
+				# SN-FIX #3: O is the explicit "commit to orbital flight" verb — latch it so the velocity-command
+				# controller now owns flight (under SN_NO_CEILING_BOUNCE; the latch is inert with the flag off).
+				_dev_orbital_commit = true
 		KEY_G:
 			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
 			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
@@ -583,13 +639,21 @@ func _move(delta: float) -> void:
 		# kinematic BCI position back to the lattice. In PLANETARY the shipped lattice fly below is used UNCHANGED
 		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
 		_dev_active = false
-		if _dev_nav and _nav != null and int(_nav.mode) != _CosmosNavCls.PLANETARY:
+		# SN-FIX #3 (SN_NO_CEILING_BOUNCE): the handoff decision is factored so the gate can drive it. Flag off ⇒
+		# `orbital_handoff` is exactly the shipped `mode != PLANETARY` test (byte-identical). Flag on ⇒ it also
+		# requires `_dev_orbital_commit`, so crossing the atmosphere ceiling keeps the kinematic lattice fly (the
+		# climb velocity is preserved — no controller ramp/deceleration) until the pilot explicitly commits (O).
+		if _dev_nav and _nav != null and orbital_handoff(int(_nav.mode), _dev_orbital_commit, CubeSphere.SN_NO_CEILING_BOUNCE):
 			_dev_flight_move(delta, input, running)
 			return
 		# PLANETARY dev-nav (or the flag off) uses the shipped lattice fly below. Drop the controller's velocity
 		# seed so the next ORBITAL entry re-seeds from the fresh SN2-derived velocity (a seamless handoff).
 		if _dev_nav:
 			_dev_have_v = false
+			# SN-FIX #3: back in PLANETARY the pilot is not in orbit — clear the commit latch so the next climb
+			# again keeps the kinematic fly through the band until they re-commit. No-op with the flag off.
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY:
+				_dev_orbital_commit = false
 		var speed := fly_speed * (2.0 if running else 1.0)
 		var vy := 0.0
 		if remote_drive:

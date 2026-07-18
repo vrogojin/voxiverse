@@ -585,6 +585,34 @@ const ATMO_VISUAL_RAMP := false
 ## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
 const SN_SUN_OCCLUSION := false
 
+## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
+## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
+## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;
+## "—" when SN_NAV_MODES is off). Default FALSE ⇒ BYTE-IDENTICAL: no NavHUD node is created, no new per-frame
+## work. Additive, read-only (mirrors the ThermometerHUD pattern). Gate G-SN-HUDNAV (lifecycle + formatting).
+const SN_HUD_NAV := false
+
+## SN-FIX #2 (2026-07-18, live pilot report) — PRESERVE HEADING across facet crossings. The shipped fixed-frame
+## reframe (player.gd apply_reframe) twists rotation.y + velocity by the seam's horizontal `yaw_delta` so a
+## walk stays world-continuous; the pilot reports this SWINGS their horizontal heading at crossings and wants
+## it FIXED (the ground may tilt — carried by the ActiveFrame/camera — but the heading must NOT rotate). When
+## true, apply_reframe does the POSITION reframe exactly as shipped but SKIPS the horizontal yaw twist of
+## heading + velocity (and forwards a zero twist to the remote executor). Default FALSE ⇒ the shipped yaw-twist
+## is BYTE-IDENTICAL. This gates a SHIPPED fixed-frame behaviour. Gate G-SN-KEEPHEADING. Live-only: the feel.
+const FP_CROSS_KEEP_HEADING := false
+
+## SN-FIX #3 (2026-07-18, live pilot report "bounced back at the atmosphere ceiling"). CONFIRMED cause (headless
+## diag, not gravity — all flight is kinematic/gravity-off): at the PLANETARY→LOW_ORBIT commit (crossing
+## ATMO_TOP=384) the shipped dev-nav auto-hands the player to the CosmosDevFlight velocity-command controller,
+## which RAMPS the seeded straight-up climb velocity toward the (camera-relative) command at DEV_ACCEL — so a
+## climb decelerates hard (32→~1 b/s) or reverses unless the command points exactly radial. Below 384 the fly
+## vertical axis is independent + instant; the abrupt change reads as a ceiling that bounces you back. When
+## true, the auto mode→dev-flight handoff is COMMIT-GATED: the player keeps the shipped kinematic lattice fly
+## (velocity preserved, no ramp) through the atmosphere→orbit band until they EXPLICITLY commit to orbital
+## flight (the O "release-to-orbit" verb). Default FALSE ⇒ the shipped auto-handoff is BYTE-IDENTICAL. Requires
+## SN_DEVNAV to have any effect. Gate G-SN-NOBOUNCE. Live-only: the FEEL of the smooth climb into orbit.
+const SN_NO_CEILING_BOUNCE := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

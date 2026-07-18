@@ -69,6 +69,15 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
+	# SN-FIX #1 (docs/COSMOS-SPACE-NAV-DESIGN.md; live pilot request 2026-07-18): the NAV readout — lattice
+	# position + radial altitude + nav-mode name. Behind SN_HUD_NAV (default OFF → no node is created and the
+	# shipped HUD stack is byte-identical). Additive, read-only.
+	if CubeSphere.SN_HUD_NAV:
+		var nav_hud := NavHUD.new()
+		nav_hud.name = "NavHUD"
+		nav_hud.player = player
+		add_child(nav_hud)
+
 	# COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0): the living sky. Behind
 	# CubeSphere.ORBITAL_SKY (default OFF → this block is skipped and the shipped flat-ambient
 	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp

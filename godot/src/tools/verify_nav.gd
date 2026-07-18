@@ -383,10 +383,11 @@ func _gate_geo() -> void:
 	var moon_soi := NAV.soi_radius("moon")
 	_ok(moon_rgeo > moon_soi, "G-SN-GEO: Moon r_geo %.0f > SOI %.0f (no selenostationary orbit)" % [moon_rgeo, moon_soi])
 	_ok(not NAV.has_stationary_orbit("moon"), "G-SN-GEO: Moon has_stationary_orbit == false (G key reports 'none')")
-	# Earth/1000 numbers (R=6371, GM_dyn=GM_game=2.066e9): Earth r_geo = (GM/ω²)^⅓ ≈ 42,241 (ω = 2π/DAY_GAME,
-	# DAY_GAME=1200 s); scales as GM^⅓ from the interim 20,370 (×(2.066e9/2.317e8)^⅓ ≈ ×2.07). Moon unchanged
-	# (R_vox==R_eph identity): r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
-	_ok(_rel(r_geo, 42241.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 42,241 (Earth/1000)" % r_geo)
+	# Earth r_geo = (GM·DAY²/4π²)^⅓ ≈ 42,241. This is MODEL-INVARIANT across the natural 1:1000 retune: GM
+	# shrank ×(1e-6/5.184e-6)=0.193 while DAY² grew ×(√1000/72·1200... )² so GM·DAY² is unchanged — the
+	# geostationary altitude is the real 42,164-km orbit scaled ÷1000, independent of the clock rate. (Natural:
+	# GM_dyn=GM_game=3.986e8, DAY_GAME≈2732 s.) Moon unchanged (R_vox==R_eph): r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
+	_ok(_rel(r_geo, 42241.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 42,241 (geostationary, model-invariant)" % r_geo)
 	_ok(_rel(moon_soi, 66100.0) < 2.0e-2, "G-SN-GEO: Moon SOI = %.0f ≈ 66,100" % moon_soi)
 
 # ---------- G-SN-NOSPIRAL: the per-frame work is BOUNDED regardless of dt (the freeze / spiral-of-death fix) ----------

@@ -8,14 +8,17 @@ extends SceneTree
 ## flag, so it runs either way. RENDER cannot be verified headless — the live sunset is a screenshot.
 ##
 ## Asserts:
-##   SCALE   GM scaling law: GM_SCALE == (1e-3)³·72² (to f64 ulp; direct == is a 1-ulp miss), and
-##           GM_game/GM_real == 5.184e-6 for every body; derived GM_game == the canonical §3.3 table.
-##   CAL     Calendar: DAY_GAME=1200; Earth spin period 1200 s; Moon month ≈ 32796 s (9.11 h, 27.3
-##           game-days); year ≈ 438300 s (121.75 h, 365 game-days) — each derived by Kepler
-##           T=2π√(a³/GM_parent), proving the GM table is self-consistent with the locked periods.
+##   SCALE   GM scaling law (STRICT 1:1000 SPACETIME): GM_SCALE == (1e-3)³·(√1000)² == 1e-6, and
+##           GM_game/GM_real == 1e-6 for every body; derived GM_game == the canonical table (Earth 3.986e8
+##           == SURFACE_GRAVITY·R², so orbit GM == the near-field feel anchor — no split).
+##   CAL     Calendar: DAY_GAME = 86400/√1000 ≈ 2732.2 s (~45.5-min day); Earth spin period == DAY_GAME; Moon
+##           month ≈ 75004 s (27.3 game-days); year ≈ 998026 s (365 game-days) — each derived by Kepler
+##           T=2π√(a³/GM_parent), proving the GM table is self-consistent with the derived periods. The
+##           game-days-per-year/month ratios are dimensionless ⇒ IDENTICAL to the old 72× model (only the clock
+##           rate changed, uniformly).
 ##   TIDAL   sub-Earth longitude of the Moon is constant across a full month (same face Earthward).
 ##   ANG     Sun angular diameter ≈ 0.533°, Moon ≈ 0.518° (the near-equality eclipses need).
-##   SPEED   circular datum ≈ 570, low orbit ≈ 548 m/s & period ≈ 78.7 s, escape ≈ 805 m/s.
+##   SPEED   circular datum ≈ 250, low orbit ≈ 241 m/s & period ≈ 179 s, escape ≈ 354 m/s.
 ##   PURE    determinism (same t → identical), monotone advance, clock advance sums exactly.
 ##   ECLIPSE some t exists where Moon-dir and Sun-dir from Earth fall within the summed angular radii.
 ##   SKY     CosmosSky builds its Sun/SunLight/Moon/StarDome nodes and ticks without error.
@@ -62,41 +65,42 @@ func _initialize() -> void:
 
 # ---------- SCALE: the GM scaling law (the heart of the phase) ----------
 func _gate_scale() -> void:
-	print("  --- SCALE: GM_game = GM_real × 5.184e-6 = (1e-3)³·72² ---")
-	var prod := pow(1.0e-3, 3.0) * pow(72.0, 2.0)
-	# The literal 5.184e-6 and the computed product differ by 1 ulp (rel ~1.6e-16) — so this is a
-	# tolerance check, NOT ==, and the tolerance is far below any physical significance.
-	_ok(prod != EPH.GM_SCALE, "SCALE: (1e-3)³·72² != the 5.184e-6 literal by 1 ulp (direct == would be brittle)")
-	_ok(_rel(prod, EPH.GM_SCALE) < 1.0e-12, "SCALE: GM_SCALE == (1e-3)³·72² to f64 ulp (rel %s < 1e-12)" % _rel(prod, EPH.GM_SCALE))
-	_ok(is_equal_approx(EPH.GM_SCALE, 5.184e-6), "SCALE: GM_SCALE == 5.184e-6")
-	# per-body scaling law + canonical §3.3 table cross-check.
-	var canon := {"sun": 6.880e14, "earth": 2.066e9, "moon": 2.543e7}
+	print("  --- SCALE: GM_game = GM_real × 1e-6 = (1e-3)³·(√1000)² (strict 1:1000 spacetime) ---")
+	# GM_SCALE is DERIVED (LENGTH_SCALE³·TIME_COMPRESSION²) — assert it equals the strict-1:1000 value 1e-6 AND
+	# reproduce the derivation independently. Strict 1:1000 ⇒ s_T² == s_L (acceleration invariant), so
+	# TIME_COMPRESSION² == 1/LENGTH_SCALE == 1000.
+	var prod := pow(EPH.LENGTH_SCALE, 3.0) * pow(EPH.TIME_COMPRESSION, 2.0)
+	_ok(_rel(prod, EPH.GM_SCALE) < 1.0e-12, "SCALE: GM_SCALE == LENGTH_SCALE³·TIME_COMPRESSION² to f64 ulp (rel %s < 1e-12)" % _rel(prod, EPH.GM_SCALE))
+	_ok(_rel(EPH.GM_SCALE, 1.0e-6) < 1.0e-9, "SCALE: GM_SCALE == 1e-6 (= (1e-3)³·(√1000)²)")
+	_ok(_rel(EPH.TIME_COMPRESSION * EPH.TIME_COMPRESSION, 1.0 / EPH.LENGTH_SCALE) < 1.0e-12, "SCALE: TIME_COMPRESSION² == 1/LENGTH_SCALE (s_T²==s_L ⇒ acceleration invariant, gravity 9.8 both regimes)")
+	# per-body scaling law + canonical table cross-check (natural: GM_real × 1e-6).
+	var canon := {"sun": 1.327e14, "earth": 3.986e8, "moon": 4.905e6}
 	for b in ["sun", "earth", "moon"]:
 		var ratio := EPH.gm_game(b) / EPH.gm_real(b)
-		_ok(_rel(ratio, 5.184e-6) < 1.0e-3, "SCALE[%s]: GM_game/GM_real = %s ≈ 5.184e-6 (rel %s)" % [b, ratio, _rel(ratio, 5.184e-6)])
+		_ok(_rel(ratio, 1.0e-6) < 1.0e-3, "SCALE[%s]: GM_game/GM_real = %s ≈ 1e-6 (rel %s)" % [b, ratio, _rel(ratio, 1.0e-6)])
 		_ok(_rel(EPH.gm_game(b), canon[b]) < 1.0e-3, "SCALE[%s]: derived GM_game %s ≈ canonical %s (rel %s)" % [b, EPH.gm_game(b), canon[b], _rel(EPH.gm_game(b), canon[b])])
 
 # ---------- CAL: the calendar (Kepler self-consistency with the locked periods) ----------
 func _gate_calendar() -> void:
-	print("  --- CAL: day 1200 s, month ≈ 32796 s, year ≈ 438300 s (Kepler-derived) ---")
-	_ok(is_equal_approx(EPH.DAY_GAME, 1200.0), "CAL: DAY_GAME == 1200 s (20-min day)")
-	_ok(is_equal_approx(EPH.TIME_COMPRESSION, 72.0), "CAL: TIME_COMPRESSION == 72×")
-	# Earth spin period from the spin rate.
+	print("  --- CAL: day ≈ 2732 s (~45.5 min), month ≈ 75004 s, year ≈ 998026 s (Kepler-derived) ---")
+	# DAY_GAME = 86400/√1000 ≈ 2732.2 s (the natural ~45.5-min day); TIME_COMPRESSION = √1000 ≈ 31.62×.
+	_ok(_rel(EPH.DAY_GAME, 86400.0 / sqrt(1000.0)) < 1.0e-9, "CAL: DAY_GAME = %.2f s == 86400/√1000 (~45.5-min day)" % EPH.DAY_GAME)
+	_ok(_rel(EPH.TIME_COMPRESSION, sqrt(1000.0)) < 1.0e-9, "CAL: TIME_COMPRESSION = %.5f == √1000" % EPH.TIME_COMPRESSION)
+	# Earth spin period from the spin rate == the game day (Earth spins once per DAY_GAME).
 	var earth_spin_T := TAU / EPH.omega_spin("earth")
-	_ok(_rel(earth_spin_T, 1200.0) < 1.0e-6, "CAL: Earth spin period = %.3f s == 1200 (rel %s)" % [earth_spin_T, _rel(earth_spin_T, 1200.0)])
-	# Year — Earth around Sun, Kepler T=2π√(a³/GM_sun). Matches the locked 438300 s to <0.01%.
+	_ok(_rel(earth_spin_T, EPH.DAY_GAME) < 1.0e-6, "CAL: Earth spin period = %.3f s == DAY_GAME (rel %s)" % [earth_spin_T, _rel(earth_spin_T, EPH.DAY_GAME)])
+	# Year — Earth around Sun, Kepler T=2π√(a³/GM_sun) ≈ 998026 s = real 31.56e6 s ÷ √1000. The year/day RATIO is
+	# dimensionless ⇒ still EXACTLY 365.25 (only the clock rate changed, not the geometry).
 	var year := EPH.orbit_period("earth")
-	_ok(_rel(year, 438300.0) < 1.0e-3, "CAL: year (Kepler) = %.1f s ≈ 438300 (%.3f h, rel %s)" % [year, year / 3600.0, _rel(year, 438300.0)])
-	_ok(_rel(year / EPH.DAY_GAME, 365.25) < 5.0e-3, "CAL: year = %.2f game-days ≈ 365" % (year / EPH.DAY_GAME))
-	# Month — Moon around Earth, Kepler T=2π√(a³/GM_earth). The locked table month (32796 s, from
-	# real 27.32 d ÷ 72) and the (a=384400, GM_earth) Kepler period disagree by ~0.45% — an inherent
-	# real-world inconsistency (the Moon's mean-distance/mass/period is NOT a clean one-body Kepler
-	# set: Earth–Moon barycentre + osculating vs mean elements). The ÷1000/÷72 scaling preserves that
-	# real ~0.45% ratio EXACTLY (§3.3), so the tolerance here is physical, not numerical slop.
+	_ok(_rel(year, 998026.0) < 1.0e-3, "CAL: year (Kepler) = %.1f s ≈ 998026 (%.3f h, rel %s)" % [year, year / 3600.0, _rel(year, 998026.0)])
+	_ok(_rel(year / EPH.DAY_GAME, 365.25) < 5.0e-3, "CAL: year = %.2f game-days ≈ 365 (dimensionless, model-invariant)" % (year / EPH.DAY_GAME))
+	# Month — Moon around Earth, Kepler T=2π√(a³/GM_earth) ≈ 75004 s. The Kepler period and the real sidereal
+	# month (27.32 d, scaled) disagree by ~0.45% — an inherent real two-body inconsistency (Earth–Moon
+	# barycentre + osculating vs mean elements) that the uniform 1:1000/√1000 scaling preserves EXACTLY. The
+	# month/day ratio (27.3 game-days) is dimensionless ⇒ IDENTICAL to the old 72× model.
 	var month := EPH.orbit_period("moon")
-	var month_rel := _rel(month, 32796.0)
-	_ok(month_rel < 1.0e-2, "CAL: month (Kepler) = %.1f s ≈ 32796 (%.3f h, rel %.3f — inherent real two-body 0.45%%)" % [month, month / 3600.0, month_rel])
-	_ok(_rel(month / EPH.DAY_GAME, 27.3) < 1.0e-2, "CAL: month = %.2f game-days ≈ 27.3" % (month / EPH.DAY_GAME))
+	_ok(_rel(month, 75004.0) < 1.0e-3, "CAL: month (Kepler) = %.1f s ≈ 75004 (%.3f h)" % [month, month / 3600.0])
+	_ok(_rel(month / EPH.DAY_GAME, 27.3) < 1.0e-2, "CAL: month = %.2f game-days ≈ 27.3 (dimensionless, model-invariant, inherent 0.45%%)" % (month / EPH.DAY_GAME))
 	# Kepler-self-consistency (explicit): the derived period IS 2π√(a³/GM_parent) — recompute independently.
 	for b in ["earth", "moon"]:
 		var a := EPH.orbit_a(b)
@@ -132,18 +136,18 @@ func _gate_angular_sizes() -> void:
 
 # ---------- SPEED: derived orbital speeds (Earth system) ----------
 func _gate_speeds() -> void:
-	print("  --- SPEED: circular 570, low-orbit 548/78.7 s, escape 805 m/s ---")
+	print("  --- SPEED: circular 250, low-orbit 241/179 s, escape 354 m/s (natural 1:1000) ---")
 	var gm := EPH.gm_game("earth")
 	var R := EPH.radius_of("earth")
 	var v_circ := sqrt(gm / R)
-	_ok(_rel(v_circ, 570.0) < 1.0e-2, "SPEED: circular at datum = %.1f m/s ≈ 570" % v_circ)
+	_ok(_rel(v_circ, 250.1) < 1.0e-2, "SPEED: circular at datum = %.1f m/s ≈ 250 (√(GM/R), == the real-Earth walk-g orbit speed)" % v_circ)
 	var r_low := R + 500.0
 	var v_low := sqrt(gm / r_low)
 	var t_low := TAU * sqrt((r_low * r_low * r_low) / gm)
-	_ok(_rel(v_low, 548.0) < 1.0e-2, "SPEED: low orbit (r=%.0f) = %.1f m/s ≈ 548" % [r_low, v_low])
-	_ok(_rel(t_low, 78.7) < 1.0e-2, "SPEED: low orbit period = %.2f s ≈ 78.7" % t_low)
+	_ok(_rel(v_low, 240.9) < 1.0e-2, "SPEED: low orbit (r=%.0f) = %.1f m/s ≈ 241" % [r_low, v_low])
+	_ok(_rel(t_low, 179.2) < 1.0e-2, "SPEED: low orbit period = %.2f s ≈ 179" % t_low)
 	var v_esc := sqrt(2.0 * gm / R)
-	_ok(_rel(v_esc, 805.0) < 1.0e-2, "SPEED: escape at datum = %.1f m/s ≈ 805" % v_esc)
+	_ok(_rel(v_esc, 353.7) < 1.0e-2, "SPEED: escape at datum = %.1f m/s ≈ 354 (√2·v_circ)" % v_esc)
 
 # ---------- PURE: determinism + clock exactness ----------
 func _gate_purity() -> void:

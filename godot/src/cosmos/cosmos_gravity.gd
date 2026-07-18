@@ -5,18 +5,17 @@ class_name CosmosGravity
 ## f64 kernel, matching the CosmosEphemeris / DVecF64 / FacetAtlas discipline: static, engine-free,
 ## deterministic, worker-safe, headless-gate-testable. NO engine singletons, NO wall clock, NO randi().
 ##
-## GM_dyn (SPACE-NAV §3, decision D-SN-2) — THE one new scale decision. The ephemeris carries the REAL
-## Earth (R_eph 6371, GM_game 2.066e9), but the voxel Earth is R_vox = 3072. Using GM_game raw at the
-## voxel radius makes datum gravity 219 m/s² and pushes geostationary outside the 1 %-gravity radius —
-## the user's own nav thresholds then misclassify. Fix: ALL local player dynamics (this field, the
+## GM_dyn (SPACE-NAV §3, decision D-SN-2) — the voxel↔ephemeris scale bridge. It was introduced when the
+## voxel Earth (R_vox) differed from the ephemeris R_eph=6371; ALL local player dynamics (this field, the
 ## orbital integrator, v_circ/γ/SOI/r_geo) read
 ##     GM_dyn(body) = GM_game(body) × (R_vox(body) / R_eph(body))³
-## which is Kepler-shape-exact at the voxel surface, collapses to identity the moment R_vox == R_eph
-## (post-O3 resize, and the Moon TODAY: R_vox = R_eph = 1737), and leaves the SKY untouched
-## (CosmosEphemeris keeps GM_game + real÷1000 distances — the 20-min day / eclipse geometry stay locked).
-## The sky reads GM_game; every local dynamic reads GM_dyn. Disclosed inconsistency: a player at
-## lunar distance under GM_dyn does not station-keep with the on-rails Moon — unobservable until O3,
-## which erases the difference (R7). Gated by G-SN-SCALE.
+## which is Kepler-shape-exact at the voxel surface and collapses to IDENTITY the moment R_vox == R_eph.
+## As of the Earth/1000 rescale (R_BLOCKS = R_eph = 6371) that identity now holds for Earth too, so
+## GM_dyn == GM_game everywhere (Moon always did: R_vox = R_eph = 1737). Under the natural strict-1:1000
+## clock (GM_SCALE = 1e-6) GM_game(earth) = 3.986e8 = SURFACE_GRAVITY·R² (CubeSphere.gm_for), so the orbit
+## GM and the near-field walk-feel anchor COINCIDE — datum orbital gravity == walk gravity == 9.8, and the
+## sky (which also reads GM_game) stays in lockstep: one clock, no split, no station-keeping inconsistency.
+## Gated by G-SN-SCALE.
 ##
 ## THE BLEND FIELD (§2.2). g at a planet-centred body-fixed position p over `body`, blending three
 ## regimes by radial altitude h = |p| − R_vox:

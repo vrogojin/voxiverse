@@ -9,8 +9,8 @@ extends SceneTree
 ## need the full engine (G-O1-HANDOFF/REENTRY/DRAG/ANCHOR/OFF) live in the O1b wiring.
 ##
 ## Asserts:
-##   G-SN-SCALE  GM_dyn(body) = GM_game·(R_vox/R_eph)³; identity when R_vox==R_eph (Moon today); Earth
-##               interim datum gravity 24.6 / circular 274.6; feel_g Earth==22, Moon≈3.63.
+##   G-SN-SCALE  GM_dyn(body) = GM_game·(R_vox/R_eph)³; identity when R_vox==R_eph (Earth/1000 + Moon); natural
+##               1:1000 datum gravity 9.82 == walk g / circular 250; GM_game==SURFACE_GRAVITY·R²; feel_g Earth==9.8.
 ##   G-O1-FIELD  gravity_fixed: == feel-g·(−n̂) below LO, == GM_dyn/r²·(−p̂) above HI, continuous at both
 ##               band edges, magnitude monotone on the ramp; _slerp_unit endpoints/unit/monotone.
 ##   G-O1-ENERGY 10 LEO orbits ACTIVE at dt=1/60: specific energy + |h| bounded, secular slope < 1e-6/orbit,
@@ -59,22 +59,26 @@ func _gate_scale() -> void:
 	var k_earth := FacetAtlas.R_BLOCKS / EPH.radius_of("earth")
 	var expect_earth := EPH.gm_game("earth") * k_earth * k_earth * k_earth
 	_ok(_rel(GRAV.gm_dyn("earth"), expect_earth) < 1.0e-12, "G-SN-SCALE: gm_dyn(earth) = %.6e == GM_game·k³ (k=%.5f)" % [GRAV.gm_dyn("earth"), k_earth])
-	# Earth/1000 (R_BLOCKS = R_eph = 6371): k = 1 ⇒ GM_dyn collapses to the real-Earth GM_game EXACTLY — the
-	# whole point of the resize (the O3 migration the GM_dyn formula was designed to make a no-op). Was 2.317e8
-	# at the interim R=3072; now 2.066e9.
-	_ok(GRAV.gm_dyn("earth") == EPH.gm_game("earth"), "G-SN-SCALE: gm_dyn(earth) = %.4e == GM_game EXACTLY (R_vox==R_eph identity, Earth/1000)" % GRAV.gm_dyn("earth"))
+	# Earth/1000 (R_BLOCKS = R_eph = 6371): k = 1 ⇒ GM_dyn collapses to GM_game EXACTLY. Under the natural
+	# strict-1:1000 clock (GM_SCALE = 1e-6) GM_game(earth) = 3.986e8, which ALSO equals CubeSphere.gm_for =
+	# SURFACE_GRAVITY·R² — so the orbit GM and the walk-feel anchor coincide (the split is gone).
+	_ok(GRAV.gm_dyn("earth") == EPH.gm_game("earth"), "G-SN-SCALE: gm_dyn(earth) = %.4e == GM_game EXACTLY (R_vox==R_eph identity)" % GRAV.gm_dyn("earth"))
+	# The natural-model coincidence stated directly: GM_game == SURFACE_GRAVITY·R² (orbit GM == feel GM).
+	var gm_for_earth := CubeSphere.SURFACE_GRAVITY * EPH.radius_of("earth") * EPH.radius_of("earth")
+	_ok(_rel(EPH.gm_game("earth"), gm_for_earth) < 2.0e-3, "G-SN-SCALE: GM_game(earth) = %.4e ≈ gm_for = SURFACE_GRAVITY·R² (natural 1:1000)" % EPH.gm_game("earth"))
 	# Moon: R_vox == R_eph == 1737 ⇒ identity.
 	_ok(GRAV.gm_dyn("moon") == EPH.gm_game("moon"), "G-SN-SCALE: gm_dyn(moon) == GM_game(moon) EXACTLY (R_vox==R_eph identity)")
 	_ok(GRAV.r_vox("moon") == EPH.radius_of("moon"), "G-SN-SCALE: r_vox(moon) == R_eph(moon) == 1737")
 	# The identity property stated generally: gm_dyn/gm_game == (r_vox/r_eph)³.
 	var ratio := GRAV.gm_dyn("earth") / EPH.gm_game("earth")
 	_ok(_rel(ratio, k_earth * k_earth * k_earth) < 1.0e-12, "G-SN-SCALE: gm_dyn/GM_game == k³ = %.6f" % (k_earth * k_earth * k_earth))
-	# Datum numbers (Earth/1000): datum gravity = GM_dyn/R² = 2.066e9/6371² ≈ 50.9 b/s²; datum circular speed =
-	# √(GM_dyn/R) ≈ 569.5 b/s. These are the REAL-Earth Kepler values under the ephemeris' 72× time compression
-	# (the same compression that gives the 20-min day) — NOT √(9.81·R) = 250, which is CubeSphere.gm_for (the
-	# per-voxel-HUD feel anchor), a SEPARATE field the orbital integrator does not read.
-	_ok(_rel(GRAV.datum_gravity("earth"), 50.9) < 5.0e-3, "G-SN-SCALE: datum gravity(earth) = %.3f ≈ 50.9" % GRAV.datum_gravity("earth"))
-	_ok(_rel(GRAV.datum_circular_speed("earth"), 569.5) < 5.0e-3, "G-SN-SCALE: datum circular(earth) = %.2f ≈ 569.5" % GRAV.datum_circular_speed("earth"))
+	# Datum numbers (natural strict-1:1000): datum gravity = GM_dyn/R² = 3.986e8/6371² ≈ 9.82 b/s² — which
+	# EQUALS the walk feel gravity 9.8 (the whole point: orbit g == walk g, no split). Datum circular speed =
+	# √(GM_dyn/R) ≈ 250.1 b/s (low-orbit period ≈ 160 s, escape ≈ 354). These are the natural √(GM/R) Kepler
+	# values now that GM_game == SURFACE_GRAVITY·R².
+	_ok(_rel(GRAV.datum_gravity("earth"), 9.82) < 5.0e-3, "G-SN-SCALE: datum gravity(earth) = %.3f ≈ 9.82" % GRAV.datum_gravity("earth"))
+	_ok(_rel(GRAV.datum_gravity("earth"), GRAV.feel_g("earth")) < 3.0e-3, "G-SN-SCALE: datum orbital g == walk feel_g (%.3f ≈ 9.8) — orbit gravity IS walk gravity" % GRAV.datum_gravity("earth"))
+	_ok(_rel(GRAV.datum_circular_speed("earth"), 250.1) < 5.0e-3, "G-SN-SCALE: datum circular(earth) = %.2f ≈ 250.1 (√(GM/R))" % GRAV.datum_circular_speed("earth"))
 	# feel_g: Earth == the shipped walk-feel gravity (player.gd `gravity`), rescaled to 9.8; Moon ≈ 1.62 (real ratio).
 	_ok(GRAV.feel_g("earth") == 9.8, "G-SN-SCALE: feel_g(earth) == 9.8 exactly (mirrors player.gd walk gravity)")
 	_ok(_rel(GRAV.feel_g("moon"), 1.618) < 1.0e-2, "G-SN-SCALE: feel_g(moon) = %.3f ≈ 1.62 (9.8 × real g-ratio, hang ×2.5)" % GRAV.feel_g("moon"))

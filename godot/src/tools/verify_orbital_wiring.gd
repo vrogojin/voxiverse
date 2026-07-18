@@ -8,7 +8,7 @@ extends SceneTree
 ##
 ## Asserts:
 ##   G-O1-HANDOFF  fixed↔bci↔fixed and bci↔helio↔bci round-trips < 1e-9; lattice↔fixed round-trip via
-##                 the atlas < 1e-9; standing still at the equator ⇒ |v_bci| == ω·R == 16.1 m/s eastward.
+##                 the atlas < 1e-9; standing still at the equator ⇒ |v_bci| == ω·R ≈ 14.65 m/s eastward (natural 1:1000 day).
 ##   G-O1-DRAG     terminal speed at h=0 == DRAG_TERMINAL ±5%; a periapsis inside the atmosphere decays
 ##                 the orbit (energy drops); NO drag above ATMO_TOP.
 ##   G-O1-REENTRY  facet_of_dir designates the facet under the descending craft; world_to_lattice64 y ≈ h;
@@ -56,7 +56,7 @@ func _initialize() -> void:
 
 # ---------- G-O1-HANDOFF: the frame-algebra re-expressions (§2.4/§5.1) ----------
 func _gate_handoff() -> void:
-	print("  --- G-O1-HANDOFF: frame round-trips + equator spin bonus 16.1 m/s ---")
+	print("  --- G-O1-HANDOFF: frame round-trips + equator spin bonus 14.65 m/s ---")
 	var body := "earth"
 	var t := 337.0                                      # arbitrary non-trivial time (θ = spin_angle ≠ 0)
 	var p_fix := DV.v(2000.0, -900.0, 1500.0)
@@ -88,9 +88,10 @@ func _gate_handoff() -> void:
 	var speed := DV.length(bci_eq[1])
 	var expect := EPH.omega_spin(body) * rv
 	_ok(_rel(speed, expect) < 1.0e-9, "G-O1-HANDOFF: standing at equator |v_bci| = %.4f == ω·R" % speed)
-	# ω·R scales linearly with R: interim 16.1 at R=3072 → 33.36 at R=6371 (×6371/3072). ω_spin (day length) is
-	# unchanged, so this is a pure radius rescale.
-	_ok(_rel(speed, 33.36) < 1.0e-2, "G-O1-HANDOFF: equator spin bonus = %.3f m/s ≈ 33.36 (Earth/1000, R=6371)" % speed)
+	# Equator spin bonus = ω·R. Under natural 1:1000, ω = 2π/DAY_GAME with DAY_GAME = 86400/√1000 ≈ 2732.6 s
+	# (the ~45.5-min day), so ω·R = 2π/2732.6·6371 ≈ 14.65 m/s. (Was 16.1 at interim R=3072/1200 s; the slower
+	# √1000 day drops it below the old 33.36 the 1200-s day gave at R=6371.)
+	_ok(_rel(speed, 14.65) < 1.0e-2, "G-O1-HANDOFF: equator spin bonus = %.3f m/s ≈ 14.65 (natural 1:1000, R=6371)" % speed)
 	# eastward: at (R,0,0) with +Z spin, ω⃗×p = ωR·(+Y); at t=0 (θ=0) v_bci stays +Y.
 	var v_eq: PackedFloat64Array = bci_eq[1]
 	var yhat := v_eq[1] / speed

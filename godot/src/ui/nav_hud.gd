@@ -9,6 +9,7 @@ extends CanvasLayer
 var player: Player           # injected by Main
 
 var _pos_label: Label
+var _vel_label: Label
 var _mode_label: Label
 
 func _ready() -> void:
@@ -44,6 +45,13 @@ func _ready() -> void:
 	_pos_label.add_theme_font_size_override("font_size", 14)
 	vbox.add_child(_pos_label)
 
+	# SN-FIX #1b (live-pilot request): speed |v_bci| + the local circular-orbit reference v_circ, so the pilot can
+	# read how close they are to a stable orbit. Same additive/read-only pattern as the rest of this HUD.
+	_vel_label = Label.new()
+	_vel_label.add_theme_font_size_override("font_size", 14)
+	_vel_label.modulate = Color(0.82, 0.88, 0.95)
+	vbox.add_child(_vel_label)
+
 	_mode_label = Label.new()
 	_mode_label.add_theme_font_size_override("font_size", 16)
 	_mode_label.modulate = Color(0.85, 0.9, 0.8)
@@ -53,11 +61,17 @@ func _process(_delta: float) -> void:
 	if player == null:
 		return
 	_pos_label.text = format_pos(player.position, player.radial_altitude())
+	_vel_label.text = format_vel(player.nav_speed_bci(), player.orbit_v_circ())
 	_mode_label.text = format_mode(player.nav_mode_name())
 
 ## Pure formatters (gate-testable, no node state). Position rounded to whole blocks + radial altitude.
 static func format_pos(pos: Vector3, alt: float) -> String:
 	return "pos %d, %d, %d\nalt %d" % [roundi(pos.x), roundi(pos.y), roundi(pos.z), roundi(alt)]
+
+## SN-FIX #1b: current speed |v_bci| + the local circular-orbit reference v_circ = √(GM_dyn/r), both blocks/s.
+## At/above v_circ the player holds/exceeds a circular orbit; below it they are sub-orbital (will descend).
+static func format_vel(speed: float, v_circ: float) -> String:
+	return "spd %d b/s\nv_circ %d" % [roundi(speed), roundi(v_circ)]
 
 static func format_mode(mode_name: String) -> String:
 	return "mode: %s" % mode_name.to_upper()

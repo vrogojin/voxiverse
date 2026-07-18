@@ -55,6 +55,7 @@ func _initialize() -> void:
 	print("  atlas: k=%d, R=%.0f, active(spawn)=%d, OFFSURFACE_Y=%.0f, CAP_MAX=%.0f°, RELIEF=%.0f°, SLACK=%.0f°, CAMERA_SET=%s, PREWARM=%s" % [
 		FA.K, _R, active, CubeSphere.OFFSURFACE_Y, CubeSphere.SHELL_CAP_MAX_DEG,
 		CubeSphere.SHELL_RELIEF_DEG, CubeSphere.SHELL_SLACK_DEG, str(CubeSphere.FP_SHELL_CAMERA_SET), str(CubeSphere.FP_SHELL_PREWARM)])
+	_gate_driver_reachable()
 	_gate_live(active)
 	_gate_cover(active)
 	_gate_antipode(active)
@@ -128,6 +129,42 @@ func _test_axes(active: int) -> Array:
 	var n := Vector3(nrm[0], nrm[1], nrm[2]).normalized()
 	var pe := _perp(n)
 	return [n, -n, pe[0], -pe[0], pe[1], -pe[1]]
+
+# ---------------- G-SHELL-DRIVER-REACHABLE (production main-loop wiring — the dead-hook regression) ----------------
+## The far-side-blank bug was NOT the shell logic — it was a DEAD main-loop hook: update_shell_camera_set was placed
+## AFTER main._process's `if CubeSphere.FLAT_WORLD ... return`, and the faceted production game ships FLAT_WORLD=true,
+## so the driver never ran live (shell_telemetry() came back {} every frame). The direct-call gates (which drive the
+## ring, not main._process) all missed it. This structural gate asserts the driver call sits BEFORE that early-return
+## inside _process — it FAILS on the hook-after-return code and PASSES after the move. Deterministic, no full scene.
+func _gate_driver_reachable() -> void:
+	print("  --- G-SHELL-DRIVER-REACHABLE: update_shell_camera_set runs BEFORE main._process's FLAT_WORLD early-return ---")
+	var f := FileAccess.open("res://src/main.gd", FileAccess.READ)
+	if f == null:
+		_ok(false, "G-SHELL-DRIVER-REACHABLE: could not open res://src/main.gd")
+		return
+	var lines := f.get_as_text().split("\n")
+	f.close()
+	var in_proc := false
+	var driver_line := -1
+	var return_guard_line := -1
+	for i in range(lines.size()):
+		var ln: String = lines[i]
+		if ln.begins_with("func _process("):
+			in_proc = true
+			continue
+		if in_proc and ln.begins_with("func "):
+			break                                          # end of _process
+		if not in_proc:
+			continue
+		var s := ln.strip_edges()
+		if driver_line < 0 and s.contains("update_shell_camera_set"):
+			driver_line = i
+		if return_guard_line < 0 and s.begins_with("if CubeSphere.FLAT_WORLD"):
+			return_guard_line = i
+	_ok(driver_line >= 0, "G-SHELL-DRIVER-REACHABLE: update_shell_camera_set IS called inside main._process (line %d)" % driver_line)
+	_ok(return_guard_line >= 0, "G-SHELL-DRIVER-REACHABLE: found the FLAT_WORLD early-return guard (line %d)" % return_guard_line)
+	_ok(driver_line >= 0 and return_guard_line >= 0 and driver_line < return_guard_line,
+		"G-SHELL-DRIVER-REACHABLE: shell driver (line %d) runs BEFORE the FLAT_WORLD return (line %d) — reachable in the FLAT_WORLD=true production game" % [driver_line, return_guard_line])
 
 # ---------------- G-SHELL-LIVE (the driver→warm→_process→emit chain the direct-call gates never exercised) ----------------
 ## Reproduces the LIVE far-side-blank stall headless: drive the real per-frame driver (apply_camera_set) to an orbit

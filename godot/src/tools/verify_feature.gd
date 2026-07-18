@@ -2047,7 +2047,7 @@ func _test_material_data() -> void:
 func _test_catalog_expansion() -> void:
 	print("[P3a] catalog expansion + translucent rendering")
 	var n := BlockCatalog.count()
-	_ok(n == 77, "catalog holds 77 materials (core+world), got %d" % n)
+	_ok(n == 78, "catalog holds 78 materials (core+world), got %d" % n)
 
 	# (a) every id 0..count-1 resolves to state + mass + solidity + a render material,
 	# id<->name round-trips, and non-air names are unique.
@@ -3585,7 +3585,7 @@ func _test_dynamic_catalog() -> void:
 	print("[P6c-1] dynamic material catalog (GMID ⇄ LRID + streaming)")
 
 	# (a) STATIC FACADE UNCHANGED: the bootstrap catalog behaves exactly as today.
-	_ok(BlockCatalog.count() == 77, "static facade: count() still 77 (bootstrap = core+world)")
+	_ok(BlockCatalog.count() == 78, "static facade: count() still 78 (bootstrap = core+world)")
 	_ok(BlockCatalog.key_of(0) == &"air", "static facade: LRID 0 is the reserved 'air' key")
 	for id in [GRASS, DIRT, STONE, WOOD, LEAF]:
 		var nm := BlockCatalog.name_of(id)

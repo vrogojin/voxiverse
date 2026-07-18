@@ -245,9 +245,16 @@ const B_PLAINS := 8
 const B_MOUNTAINS := 9   # SEPARATE tall biome: stone peaks that cross the y=96 freeze line (altitude snow caps)
 const B_PILLAR := 10     # COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the unbreakable bedrock corner monument
                          # — full bedrock cubes floor→flat-top, no strata/ore/tree/snow/slope. M5C_CORNER-gated.
+# COSMOS CLIMATE-BIOMES B1 (design §6.1): the two Whittaker warm-band biomes, APPENDED after B_PILLAR so no
+# existing id renumbers (the frozen-id discipline that keeps FP_CLIMATE_BIOMES OFF byte-identical). Only ever
+# produced by the Whittaker classifier under CubeSphere.FP_CLIMATE_BIOMES; both surface to grass/dirt (the
+# _biome_top/_biome_filler defaults) and carry their own tree species (acacia / jungle) + FarPalette rows.
+const B_SAVANNA := 11    # equatorial/subtropical dry grassland (tan grass, sparse flat-topped acacias)
+const B_JUNGLE := 12     # hot + wet tropical rainforest (deep-green grass, dense tall jungle trees)
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
-# TreeGen owns 11/22/33/44/55/66/88. TerrainConfig owns 101-103 (noise seeds), 104
+# TreeGen owns 11/22/33/44/55/66/88 + 121-125 (B1 climate-biome species: jungle/acacia/cactus
+# trunk heights + acacia/cactus density thinning). TerrainConfig owns 101-103 (noise seeds), 104
 # (Mountains mask), and the 7xx hashing salts below. SnowfallSystem owns 105 (the
 # SEED+105 weather-gate noise, SNOW-ACCUMULATION §4.3) — recorded here so the one-place
 # registry stays collision-free even though the noise object lives in the sim class.
@@ -587,6 +594,11 @@ static func _biome(c: float, t: float, h: float, g: int, mountain: float) -> int
 		return B_BEACH
 	if mountain > MOUNTAIN_BIOME_T:
 		return B_MOUNTAINS
+	# COSMOS CLIMATE-BIOMES B1 (design §6.1): under the flag the climate biomes come from the Whittaker
+	# temperature×moisture table (below); OFF the shipped first-match chain runs verbatim (byte-identical).
+	# The ocean/beach/mountain guards above keep their precedence in BOTH paths.
+	if CubeSphere.FP_CLIMATE_BIOMES:
+		return _whittaker_biome(t, h)
 	if t > 0.45 and h < -0.45:
 		return B_BADLANDS
 	if t > 0.45 and h < 0.0:
@@ -600,6 +612,36 @@ static func _biome(c: float, t: float, h: float, g: int, mountain: float) -> int
 	if h > 0.1:
 		return B_FOREST
 	return B_PLAINS
+
+## COSMOS CLIMATE-BIOMES B1 (design §6.1) — the Whittaker temperature×moisture classification: `t` is the
+## latitude-anchored annual-mean temperature (equator +1 … pole −1, §_latitude_temperature — NEVER the season
+## offset, which never reaches worldgen) and `h` is the static humidity noise. Five temperature bands × four
+## moisture columns. Because `t` is latitude-dominant on the sphere these read as bands pole→equator:
+## snowy → taiga → temperate (plains/forest/swamp) → warm (desert/savanna) → hot (badlands/desert/savanna/jungle),
+## with the subtropical desert sitting in the Hadley-descent dry column exactly where §1's weather model dries.
+## Pure/deterministic (a function of t,h only); the ocean/beach/mountain guards are applied by the caller (_biome).
+static func _whittaker_biome(t: float, h: float) -> int:
+	if t > 0.45:                          # hot (equatorial / low latitude)
+		if h < -0.45:
+			return B_BADLANDS
+		if h < 0.0:
+			return B_DESERT
+		if h < 0.4:
+			return B_SAVANNA
+		return B_JUNGLE
+	if t > 0.15:                          # warm (subtropical)
+		if h < -0.45:
+			return B_DESERT
+		if h < 0.0:
+			return B_SAVANNA
+		if h <= 0.5:
+			return B_FOREST
+		return B_SWAMP
+	if t > -0.15:                         # temperate (mid-latitude)
+		return B_FOREST if h >= 0.0 else B_PLAINS
+	if t > -0.55:                         # cold (subpolar)
+		return B_TAIGA
+	return B_SNOWY                        # frozen (polar) — always snowy regardless of moisture
 
 ## Biome enum at column (x, z). Public: TreeGen (species) and PerVoxelEnvironment
 ## (surface temperature) key off it. `pcache` (optional) is the shared per-pass column

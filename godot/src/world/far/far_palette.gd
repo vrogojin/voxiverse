@@ -28,6 +28,8 @@ static var _leaf: Color
 static var _stone: Color
 static var _taiga: Color      # deterministic mean of the 20% podzol hash (LOD-DESIGN §2.3.3)
 static var _forest: Color     # canopy tint — the locked no-distant-trees compensation
+static var _savanna: Color    # B1: tan grassland (grass↔sand lerp)
+static var _jungle: Color     # B1: deep-green rainforest canopy (grass↔jungle_leaves lerp)
 
 ## Resolve every far-field colour from the catalog once. Idempotent; call before any
 ## lookup (FarTerrain warms it, but every accessor guards too).
@@ -52,6 +54,12 @@ static func ensure_ready() -> void:
 	# canopy the far field cannot draw as individual trees.
 	_taiga = _grass.lerp(_podzol, 0.20)
 	_forest = _grass.lerp(_leaf, 0.35)
+	# B1 climate-biome bands (design §6.5): savanna reads as tan dry grassland (grass toward sand),
+	# jungle as a deep saturated green (grass toward jungle_leaves). Both derive from catalog tints so
+	# they follow a recolour, exactly like every other far colour. Shown on the GDScript far path; the
+	# C++ skin path (frozen_colors, 14 entries) maps them to grass via its default until the enum extends.
+	_savanna = _grass.lerp(_sand, 0.40)
+	_jungle = _grass.lerp(BlockCatalog.color_of(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
 	_ready = true
 
 ## The sea-surface colour for a clamped (open-water) vertex of climate temperature `t`
@@ -87,6 +95,10 @@ static func biome_base(biome: int, t: float) -> Color:
 			return _taiga
 		TerrainConfig.B_FOREST:
 			return _forest
+		TerrainConfig.B_SAVANNA:
+			return _savanna
+		TerrainConfig.B_JUNGLE:
+			return _jungle
 		TerrainConfig.B_MOUNTAINS:
 			return _stone
 		TerrainConfig.B_PILLAR:

@@ -25,15 +25,32 @@ const TRUNK_MIN := 4               # oak/birch trunk min
 const TRUNK_MAX := 6               # oak/birch trunk max
 const SPRUCE_TRUNK_MIN := 5
 const SPRUCE_TRUNK_MAX := 8
-## Tallest a tree reaches above its base surface (spruce trunk 8 + 1 canopy cap +
-## 1 headroom). Widens the collapse scan and collider vertical bounds that read it.
-const MAX_ABOVE_SURFACE := 10
+## Tallest a tree reaches above its base surface. Widens the collapse scan and collider
+## vertical bounds that read it. Raised 10→14 for the B1 jungle tree (trunk ≤ 11 + 2 canopy
+## layers + 1 cap): a wider scan bound is safe for every shorter species (worldgen bytes are
+## unaffected — this bounds the collapse/collider scan, not generated_cell), and jungle trees
+## only exist under CubeSphere.FP_CLIMATE_BIOMES anyway.
+const MAX_ABOVE_SURFACE := 14
 
-# Species enum.
+# Species enum. SP_ACACIA/SP_JUNGLE/SP_CACTUS are the B1 climate-biome species (appended;
+# only ever selected under CubeSphere.FP_CLIMATE_BIOMES — see _species_for).
 const SP_NONE := 0
 const SP_OAK := 1
 const SP_BIRCH := 2
 const SP_SPRUCE := 3
+const SP_ACACIA := 4
+const SP_JUNGLE := 5
+const SP_CACTUS := 6
+
+# --- B1 climate-biome tree tuning (design §6.4) -------------------------------
+const JUNGLE_TRUNK_MIN := 8         # dense, tall rainforest tree
+const JUNGLE_TRUNK_MAX := 11
+const ACACIA_TRUNK_MIN := 4         # short, flat-topped savanna tree
+const ACACIA_TRUNK_MAX := 6
+const CACTUS_MIN := 1              # a 1×1 column, height 1..3 (very sparse)
+const CACTUS_MAX := 3
+const ACACIA_DENSITY := 0.5        # fraction of eligible savanna cells that actually host an acacia (sparse)
+const CACTUS_DENSITY := 0.3        # ...and of desert cells that host a cactus (very sparse)
 
 ## Sentinel "no tree" base (y is a deep negative so no world cell ever matches).
 const _NO_TREE := Vector3i(0, -0x40000000, 0)
@@ -44,6 +61,11 @@ static var _SPRUCE_LOG := 0
 static var _SPRUCE_LEAF := 0
 static var _BIRCH_LOG := 0
 static var _BIRCH_LEAF := 0
+static var _JUNGLE_LOG := 0     # B1 climate-biome species ids
+static var _JUNGLE_LEAF := 0
+static var _ACACIA_LOG := 0
+static var _ACACIA_LEAF := 0
+static var _CACTUS := 0
 
 ## Warm the species id cache on the main thread (called from TerrainConfig.warm_up
 ## so the voxel worker thread never races it into existence).
@@ -55,6 +77,11 @@ static func warm_up() -> void:
 	_SPRUCE_LEAF = BlockCatalog.id_of(&"spruce_leaves")
 	_BIRCH_LOG = BlockCatalog.id_of(&"birch_log")
 	_BIRCH_LEAF = BlockCatalog.id_of(&"birch_leaves")
+	_JUNGLE_LOG = BlockCatalog.id_of(&"jungle_log")
+	_JUNGLE_LEAF = BlockCatalog.id_of(&"jungle_leaves")
+	_ACACIA_LOG = BlockCatalog.id_of(&"acacia_log")
+	_ACACIA_LEAF = BlockCatalog.id_of(&"acacia_leaves")
+	_CACTUS = BlockCatalog.id_of(&"cactus")
 	_sp_ready = true
 
 ## Deterministic hash in [0,1) for an integer lattice + salt (same integer-mix
@@ -83,8 +110,19 @@ static func _species_for(biome: int, gx: int, gz: int) -> int:
 			return SP_SPRUCE
 		TerrainConfig.B_SWAMP, TerrainConfig.B_PLAINS:
 			return SP_OAK
-		_:
-			return SP_NONE
+	# COSMOS CLIMATE-BIOMES B1 (design §6.4): the new species are FLAG-GATED. B_DESERT already exists in the
+	# shipped world and must stay TREE-FREE when the flag is off (byte-identity), so the desert→cactus mapping
+	# lives here rather than in the match above; jungle/savanna biomes only exist under the flag at all. Acacia
+	# and cactus thin their patches with an extra hash so savanna/desert stay sparse (dry, open look).
+	if CubeSphere.FP_CLIMATE_BIOMES:
+		match biome:
+			TerrainConfig.B_JUNGLE:
+				return SP_JUNGLE
+			TerrainConfig.B_SAVANNA:
+				return SP_ACACIA if _hash01(gx, gz, 124) < ACACIA_DENSITY else SP_NONE
+			TerrainConfig.B_DESERT:
+				return SP_CACTUS if _hash01(gx, gz, 125) < CACTUS_DENSITY else SP_NONE
+	return SP_NONE
 
 ## True iff grid cell (gx, gz) hosts a tree (patch gate AND per-cell gate AND the
 ## biome gate). The two cheap hash gates run first, so the biome lookup only fires
@@ -145,6 +183,18 @@ static func block_at(x: int, y: int, z: int, pcache = null) -> int:
 			if not _sp_ready:
 				warm_up()
 			return _spruce_block(gx, gz, dx, y, dz, gy)
+		SP_JUNGLE:
+			if not _sp_ready:
+				warm_up()
+			return _jungle_block(gx, gz, dx, y, dz, gy)
+		SP_ACACIA:
+			if not _sp_ready:
+				warm_up()
+			return _acacia_block(gx, gz, dx, y, dz, gy)
+		SP_CACTUS:
+			if not _sp_ready:
+				warm_up()
+			return _cactus_block(gx, gz, dx, y, dz, gy)
 	return BlockCatalog.AIR
 
 ## Oak-shaped tree (also used, with birch ids, for birch): a WOOD trunk column,
@@ -198,4 +248,65 @@ static func _spruce_block(gx: int, gz: int, dx: int, y: int, dz: int, gy: int) -
 		if absi(dx) + absi(dz) <= 2 and not (dx == 0 and dz == 0):
 			return _SPRUCE_LEAF
 
+	return BlockCatalog.AIR
+
+## B1 climate-biome tree trunk heights (pure position hashes; TreeGen-owned salts 121/122).
+static func _jungle_trunk_height(gx: int, gz: int) -> int:
+	return JUNGLE_TRUNK_MIN + int(_hash01(gx, gz, 121) * float(JUNGLE_TRUNK_MAX - JUNGLE_TRUNK_MIN + 1))
+
+static func _acacia_trunk_height(gx: int, gz: int) -> int:
+	return ACACIA_TRUNK_MIN + int(_hash01(gx, gz, 122) * float(ACACIA_TRUNK_MAX - ACACIA_TRUNK_MIN + 1))
+
+## Jungle: a tall (8-11) jungle_log column under a dense two-tier canopy — a wide radius-2 (5×5)
+## block on the top two trunk layers narrowing to a radius-1 plus cap. Radius ≤ 2 keeps the whole
+## tree inside its 10-wide grid cell (the O(1) one-tree-per-cell invariant), like spruce.
+static func _jungle_block(gx: int, gz: int, dx: int, y: int, dz: int, gy: int) -> int:
+	var t := _jungle_trunk_height(gx, gz)
+	var top := gy + t
+
+	# Trunk.
+	if dx == 0 and dz == 0 and y >= gy + 1 and y <= top:
+		return _JUNGLE_LOG
+
+	# Wide canopy: top two trunk layers, a full radius-2 square minus the trunk centre.
+	if y == top or y == top - 1:
+		if absi(dx) <= 2 and absi(dz) <= 2 and not (dx == 0 and dz == 0):
+			return _JUNGLE_LEAF
+		return BlockCatalog.AIR
+
+	# Cap: a plus one layer above the trunk top.
+	if y == top + 1 and absi(dx) + absi(dz) <= 1:
+		return _JUNGLE_LEAF
+
+	return BlockCatalog.AIR
+
+## Acacia: a short (4-6) acacia_log trunk under a FLAT radius-2 canopy disc (the savanna umbrella look)
+## with a small plus cap. Deliberately thin foliage (one flat layer) so savanna reads open, not forested.
+static func _acacia_block(gx: int, gz: int, dx: int, y: int, dz: int, gy: int) -> int:
+	var t := _acacia_trunk_height(gx, gz)
+	var top := gy + t
+
+	# Trunk.
+	if dx == 0 and dz == 0 and y >= gy + 1 and y <= top:
+		return _ACACIA_LOG
+
+	# Flat top: one radius-2 square layer at the trunk top minus the trunk centre.
+	if y == top:
+		if absi(dx) <= 2 and absi(dz) <= 2 and not (dx == 0 and dz == 0):
+			return _ACACIA_LEAF
+		return BlockCatalog.AIR
+
+	# Cap: a plus one layer above (the umbrella's crown).
+	if y == top + 1 and absi(dx) + absi(dz) <= 1:
+		return _ACACIA_LEAF
+
+	return BlockCatalog.AIR
+
+## Cactus: a 1×1 cactus column, height 1..3 (salt 123). No canopy — the cheapest possible "tree".
+static func _cactus_block(gx: int, gz: int, dx: int, y: int, dz: int, gy: int) -> int:
+	if dx != 0 or dz != 0:
+		return BlockCatalog.AIR
+	var h := CACTUS_MIN + int(_hash01(gx, gz, 123) * float(CACTUS_MAX - CACTUS_MIN + 1))
+	if y >= gy + 1 and y <= gy + h:
+		return _CACTUS
 	return BlockCatalog.AIR

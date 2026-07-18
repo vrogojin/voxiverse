@@ -36,6 +36,7 @@ func _initialize() -> void:
 	_gate_w1_cpu()
 	_gate_w1_physics()
 	_gate_w1_itcz()
+	_gate_w2_clouds()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -186,6 +187,43 @@ func _itcz_peak_lat(decl: float) -> float:
 				best = m; best_b = bi
 	var sinlat := (float(best_b) + 0.5) / float(bands) * 2.0 - 1.0
 	return asin(clampf(sinlat, -1.0, 1.0))
+
+# ================= W2 : the 3-layer cloud mesher (bytes + draws only; look is LIVE) =================
+const CLOUDS := preload("res://src/world/cloud_layers.gd")
+
+func _gate_w2_clouds() -> void:
+	print("  --- G-W2-BYTES/DRAWS: ≤ 3 draws, greedy overcast cheap, scratch bounded + identity-stable ---")
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)                               # no env: the gate drives cover directly
+	cl.debug_set_camera(Vector3(1234.0, 0.0, -5678.0))
+	# scratch allocated once at the vertex cap; capture identity by size.
+	var rep := cl.byte_report()
+	var scratch_bytes := int(rep["scratch"])
+	_ok(scratch_bytes <= 2_500_000, "W2: CPU scratch %d B ≤ 2.4 MiB (one reused buffer at the vertex cap)" % scratch_bytes)
+	# synthetic FULL OVERCAST → greedy row-merge makes it the CHEAPEST mesh (a few long runs), never the worst.
+	cl.debug_force_cover(1.0)
+	cl.rebuild_all_now()
+	var worst := 0
+	for l in range(3):
+		worst = maxi(worst, cl.emitted_verts(l))
+	_ok(worst <= CLOUDS.CAP_VERTS, "W2: overcast emit %d verts/layer ≤ cap %d (hard bound holds)" % [worst, CLOUDS.CAP_VERTS])
+	_ok(worst < 5000, "W2: overcast is CHEAP (%d verts — greedy row-merge working, not the worst case)" % worst)
+	_ok(cl.draw_count() == 3, "W2: exactly 3 cloud mesh surfaces (3 draw calls)")
+	# rebuild many times: the scratch must not reallocate (identity-stable byte footprint).
+	for i in range(50):
+		cl.debug_set_camera(Vector3(float(i) * 320.0, 0.0, float(i) * 96.0))
+		cl.rebuild_all_now()
+	var rep2 := cl.byte_report()
+	_ok(int(rep2["scratch"]) == scratch_bytes, "W2: scratch byte footprint invariant across 50 rebuilds (no realloc)")
+	# empty sky → zero emit, zero draws (clouds only cost when present).
+	cl.debug_force_cover(0.0)
+	cl.rebuild_all_now()
+	var empty := 0
+	for l in range(3):
+		empty += cl.emitted_verts(l)
+	_ok(empty == 0 and cl.draw_count() == 0, "W2: clear sky emits nothing (0 verts, 0 draws)")
+	cl.queue_free()
 
 # ---------- G-SEAS-TILT: obliquity geometry (pure, flag-independent via the _eps form) ----------
 func _gate_seasons_tilt() -> void:

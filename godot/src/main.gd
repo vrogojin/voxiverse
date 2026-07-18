@@ -97,6 +97,15 @@ func _ready() -> void:
 		add_child(_cosmos_sky)
 		_cosmos_sky.setup(_cosmos_clock, env, player)
 
+	# CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4): the 3-layer cloud mesher, a read-only view of the
+	# weather grid (rule 2). Built only under BOTH flags (it reads the grid's cloud water); default OFF ⇒ no
+	# node ⇒ byte-identical. The player is the camera provider; PerVoxelEnvironment is the grid read interface.
+	if CubeSphere.FP_CLOUDS and CubeSphere.FP_CLIMATE_GRID:
+		var clouds := CloudLayers.new()
+		clouds.name = "CloudLayers"
+		add_child(clouds)
+		clouds.setup(world.environment, player)
+
 	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
 	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
 	# on-device (esp. the M4 seam-handoff frame/memory budget). DEMO instrumentation — revert

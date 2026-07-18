@@ -654,6 +654,15 @@ const FP_SEASONS := false
 ## CPU / byte-identical. Gate verify_climate G-W1-BYTES/CPU/DET/PHYS/ITCZ/INIT.
 const FP_CLIMATE_GRID := false
 
+## COSMOS CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4 / §7) — the 3-layer semi-cubic CLOUD mesher
+## (CloudLayers). A read-only view of the weather grid: blocky prisms (cumulus/stratus/cirrus at 3
+## altitudes, all < ATMO_TOP 384) in the terrain's own vertex-colour language, from a camera-following
+## world-snapped 64×64 tile lattice + SEED+106 noise, greedy row-merged into ONE reused CPU scratch
+## uploaded to exactly 3 ArrayMesh surfaces (3 draw calls). HARD vertex cap ⇒ overcast is the cheapest
+## mesh, the worst case bounded (≤2.4 MiB, G-W2-BYTES/DRAWS). Requires FP_CLIMATE_GRID (reads its cloud
+## water). Default FALSE ⇒ no CloudLayers node ⇒ zero bytes / byte-identical. Cloud LOOK is LIVE-ONLY.
+const FP_CLOUDS := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

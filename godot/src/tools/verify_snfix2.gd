@@ -22,6 +22,7 @@ const PlayerCls := preload("res://src/player/player.gd")
 const NavHUDCls := preload("res://src/ui/nav_hud.gd")
 const NAV := preload("res://src/cosmos/cosmos_nav.gd")
 const DEVF := preload("res://src/cosmos/cosmos_dev_flight.gd")
+const GRAV := preload("res://src/cosmos/cosmos_gravity.gd")
 const DV := preload("res://src/cosmos/dvec3.gd")
 
 var _pass := 0
@@ -32,6 +33,12 @@ func _ok(c: bool, m: String) -> void:
 		_fail += 1
 		print("  FAIL: ", m)
 
+func _rel(a: float, b: float) -> float:
+	var d := absf(b)
+	if d < 1.0e-300:
+		return absf(a - b)
+	return absf(a - b) / d
+
 func _initialize() -> void:
 	print("=== verify_snfix2 (G-SN-HUDNAV + G-SN-KEEPHEADING + G-SN-NOBOUNCE) ===")
 	print("  flags: SN_HUD_NAV=%s FP_CROSS_KEEP_HEADING=%s SN_NO_CEILING_BOUNCE=%s (gate drives both states)"
@@ -40,6 +47,7 @@ func _initialize() -> void:
 	_gate_hudnav()
 	_gate_keepheading()
 	_gate_nobounce()
+	_gate_fmode()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -126,3 +134,47 @@ func _gate_nobounce() -> void:
 		min_radial = minf(min_radial, radial)
 		p = p_new
 	_ok(min_radial < 16.0, "confirmed cause: dev-flight decelerates a 32 b/s climb to %.1f b/s (< half) on a level command" % min_radial)
+
+# ------------------------------------------------------------------ G-SN-NOBOUNCE (F-mode gravity model)
+func _gate_fmode() -> void:
+	print("  --- G-SN-NOBOUNCE (F-mode): gravity-off flight + where-aware F-off gravity ---")
+	var R := FacetAtlas.R_BLOCKS
+	# (a) F-MODE gravity-off while flying: the free-fall regime is NEVER entered while flying (so no gravity is
+	#     applied while F is on), at any altitude — climbing through the band is purely kinematic.
+	_ok(PlayerCls.free_fall_regime(true, R + 500.0, true) == false, "flag ON: flying above the ceiling ⇒ NO free-fall gravity (F-mode gravity-off)")
+	_ok(PlayerCls.free_fall_regime(true, 10.0, true) == false, "flag ON: flying below the ceiling ⇒ NO free-fall gravity")
+	# (b) F-OFF where-aware regime: above the ceiling ⇒ free-fall; below ⇒ surface walk. Flag off ⇒ never.
+	_ok(PlayerCls.free_fall_regime(false, CubeSphere.ATMO_TOP + 1.0, true) == true, "flag ON, F-off, above 384 ⇒ planet-centred free-fall")
+	_ok(PlayerCls.free_fall_regime(false, CubeSphere.ATMO_TOP - 1.0, true) == false, "flag ON, F-off, below 384 ⇒ surface-feel walk (shipped)")
+	_ok(PlayerCls.free_fall_regime(false, R + 500.0, false) == false, "flag OFF ⇒ never free-falls (byte-identical walk)")
+	# Falsify: the flag must change the F-off regime above the ceiling.
+	_ok(PlayerCls.free_fall_regime(false, R + 500.0, true) != PlayerCls.free_fall_regime(false, R + 500.0, false),
+		"falsify: the flag changes the above-ceiling F-off regime")
+
+	# (c) The free-fall gravity is PLANET-CENTRED: −GM_dyn·p/|p|³ — radial INWARD (toward the planet centre),
+	#     magnitude GM_dyn/r², and PURELY radial (no ω⃗×p surface-rotation term ⇒ p × g == 0).
+	var p := DV.v(0.0, 0.0, R + 500.0)
+	var g: PackedFloat64Array = GRAV.gravity_bci("earth", p)
+	var r := DV.length(p)
+	var expect_mag := GRAV.gm_dyn("earth") / (r * r)
+	_ok(_rel(DV.length(g), expect_mag) < 1.0e-9, "F-off free-fall |g| == GM_dyn/r² = %.4f (planet-centred)" % expect_mag)
+	_ok(DV.dot(g, p) < 0.0, "F-off free-fall gravity points INWARD (toward the planet centre)")
+	# p × g: cross product magnitude ~0 ⇒ g is parallel to p (purely radial, no tangential rotation-drag term).
+	var cross := Vector3(float(p[1]) * float(g[2]) - float(p[2]) * float(g[1]),
+		float(p[2]) * float(g[0]) - float(p[0]) * float(g[2]),
+		float(p[0]) * float(g[1]) - float(p[1]) * float(g[0]))
+	_ok(cross.length() / (r * expect_mag) < 1.0e-9, "F-off free-fall gravity is PURELY radial (no ω⃗×p surface drag)")
+
+	# (d) flight→fall handoff continuity: the fall seeds its BCI velocity from the last flight velocity (no jump);
+	#     an empty seed rests (zero).
+	var seed := PlayerCls.fall_seed(PackedFloat64Array([12.0, -3.0, 7.5]))
+	_ok(seed.size() == 3 and seed[0] == 12.0 and seed[1] == -3.0 and seed[2] == 7.5, "flight→fall seed == last flight velocity (continuous, no jump)")
+	_ok(PlayerCls.fall_seed(PackedFloat64Array()).size() == 3 and DV.length(PlayerCls.fall_seed(PackedFloat64Array())) == 0.0, "empty seed ⇒ rest (zero velocity)")
+
+	# A short free-fall integration accelerates the fall inward (radius decreases, descent speed grows) — the
+	# planet-centred free-fall behaves as gravity (sanity of the OrbitalState path the player uses).
+	var os = preload("res://src/cosmos/orbital_state.gd").make("earth", DV.v(0.0, 0.0, R + 500.0), DV.v(0.0, 0.0, 0.0))
+	var r0 := DV.length(os.pos)
+	for i in 30:
+		os.step(1.0 / 60.0, DV.v(0.0, 0.0, 0.0))
+	_ok(DV.length(os.pos) < r0 and os.vel[2] < 0.0, "F-off free-fall accelerates inward (radius %.1f→%.1f, v_r<0)" % [r0, DV.length(os.pos)])

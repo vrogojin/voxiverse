@@ -106,6 +106,13 @@ var _dev_overlay: Control = null                # the SN5b overlay set (compass 
 # commits with the O "release-to-orbit" verb. Cleared on dev-nav toggle and whenever the mode is PLANETARY.
 # DEAD (always false) with the flag off ⇒ the shipped auto-handoff is byte-identical.
 var _dev_orbital_commit := false
+# SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-OFF free-fall state. When F is off ABOVE the atmosphere ceiling the
+# player free-falls in the planet-centred (inertial) BCI frame under GM_dyn/r² (no surface-rotation drag); the
+# BCI velocity is integrated here and seeded — on the flight→fall handoff — from the last SN2 finite-difference
+# BCI velocity so there is NO velocity jump. Below the ceiling the shipped surface-feel walk gravity takes over
+# (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
+var _fall_v_bci := PackedFloat64Array()
+var _fall_have_v := false
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -507,6 +514,84 @@ static func orbital_handoff(mode: int, orbital_commit: bool, no_ceiling_bounce: 
 		return orbital_commit
 	return true
 
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-MODE kinematic fly: gravity-off, full 6-DOF in the FULL look
+## direction (camera basis incl. pitch), constant speed at ALL altitudes. Forward (input.z=−1) maps to the
+## camera look (−cam.z, pitched); Space/Ctrl add the camera up axis. The camera basis is in the lattice/window
+## orientation, so the resulting direction is a LATTICE direction (position is lattice). No velocity state that
+## gravity could act on ⇒ crossing the atmosphere ceiling never decelerates the climb.
+func _kinematic_look_fly(delta: float, input: Vector3, running: bool) -> void:
+	var speed := fly_speed * (2.0 if running else 1.0)
+	var vy := 0.0
+	if remote_drive:
+		vy = input.y
+	else:
+		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
+		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+	var cam := window_camera_transform().basis
+	var dir := cam * Vector3(input.x, vy, input.z)          # forward incl. pitch (−cam.z), strafe, camera-up
+	if dir.length() > 0.0:
+		dir = dir.normalized()
+	position += dir * speed * delta
+	_horiz_vel = Vector3(dir.x, 0.0, dir.z) * speed
+	velocity = Vector3.ZERO
+
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-OFF gravity regime, factored for the gate. Free-fall (planet-centred
+## GM_dyn/r² frame) applies iff the flag is on, we are NOT flying, and the radial altitude is at/above the
+## atmosphere ceiling. Below the ceiling ⇒ false ⇒ the shipped surface-feel walk gravity/frame. Pure.
+static func free_fall_regime(is_flying: bool, alt: float, no_ceiling_bounce: bool) -> bool:
+	return no_ceiling_bounce and not is_flying and alt >= CubeSphere.ATMO_TOP
+
+## SN-FIX #3 — the flight→fall velocity seed (continuity): the free-fall starts from the last SN2 finite-difference
+## BCI velocity so there is NO jump at F-off. A missing/short vector rests (zero). Pure.
+static func fall_seed(last_v_bci: PackedFloat64Array) -> PackedFloat64Array:
+	if last_v_bci.size() == 3:
+		return PackedFloat64Array([last_v_bci[0], last_v_bci[1], last_v_bci[2]])
+	return PackedFloat64Array([0.0, 0.0, 0.0])
+
+## SN-FIX #3 — one free-fall tick: integrate the planet-centred point-mass gravity (GM_dyn/r², velocity-Verlet
+## via OrbitalState) in the BCI frame and re-project to the lattice `position`. Seeded on entry from the last
+## flight velocity (continuous). NO surface-rotation drag (BCI is inertial). Off-facet ⇒ a straight-down lattice
+## fallback so the player is never stranded. LIVE-ONLY: the feel of the fall; the gravity math is G-SN-FALLGRAV.
+func _free_fall_move(delta: float) -> void:
+	delta = _CosmosNavCls.clamp_nav_dt(delta)               # G-SN-NOSPIRAL: bound the post-hitch dt
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		# Off-facet safety: fall straight down in the lattice (never strand the player above a retired facet). Do
+		# NOT set _fall_have_v here — leaving it false keeps _fall_v_bci unseeded so a later on-facet tick seeds it
+		# cleanly (from _nav_last_v_bci) instead of feeding an empty array to OrbitalState.make.
+		velocity.y -= gravity * delta
+		position.y += velocity.y * delta
+		return
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	if not _fall_have_v:
+		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
+		_fall_have_v = true
+	var os = _OrbitalStateCls.make("earth", p_bci, _fall_v_bci)
+	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free-fall (no thrust/drag)
+	_fall_v_bci = os.vel
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, os.pos, _fall_v_bci)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
+
+## SN-FIX #3 — the free-fall → surface handoff: the LATTICE vertical velocity (velocity.y) equivalent of the
+## current BCI fall velocity, so the surface-feel gravity continues from the true downward speed (continuous at
+## the ceiling). Uses the SN1 frame maps; near the facet centre the lattice normal is the radial, so this is the
+## fall's descent rate. Returns the current velocity.y unchanged if no fall velocity / off-facet.
+func _fall_exit_vy() -> float:
+	var fid := TerrainConfig.active_facet()
+	if fid < 0 or _fall_v_bci.size() != 3:
+		return velocity.y
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	var vf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_bci, _fall_v_bci)[1]
+	var v_lat := _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(vf[0], vf[1], vf[2])
+	return v_lat.y
+
 ## COSMOS SPACE-NAV SN5 (§7.2): the ORBITAL-mode dev-flight step. Reads the current lattice `position`, lifts it
 ## to the BCI frame, runs the velocity-command controller (CosmosDevFlight — the SN-R1-seamless kernel proven by
 ## G-SN-DEVFLIGHT), and re-projects the new kinematic BCI position back to the lattice `position`. The controller
@@ -639,19 +724,28 @@ func _move(delta: float) -> void:
 		# kinematic BCI position back to the lattice. In PLANETARY the shipped lattice fly below is used UNCHANGED
 		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
 		_dev_active = false
-		# SN-FIX #3 (SN_NO_CEILING_BOUNCE): the handoff decision is factored so the gate can drive it. Flag off ⇒
-		# `orbital_handoff` is exactly the shipped `mode != PLANETARY` test (byte-identical). Flag on ⇒ it also
-		# requires `_dev_orbital_commit`, so crossing the atmosphere ceiling keeps the kinematic lattice fly (the
-		# climb velocity is preserved — no controller ramp/deceleration) until the pilot explicitly commits (O).
-		if _dev_nav and _nav != null and orbital_handoff(int(_nav.mode), _dev_orbital_commit, CubeSphere.SN_NO_CEILING_BOUNCE):
+		_fall_have_v = false                                # flying ⇒ not falling; next F-off re-seeds the free-fall
+		var use_devnav := _dev_nav and _nav != null
+		# SN-FIX #3 (SN_NO_CEILING_BOUNCE): `orbital_handoff` gates the O-COMMITTED orbital controller. Flag off ⇒
+		# it is the shipped `mode != PLANETARY` test (byte-identical auto-handoff). Flag on ⇒ it also requires the
+		# explicit O commit (`_dev_orbital_commit`), so the O velocity-command controller (a follow-up) runs ONLY
+		# after the pilot commits — its per-mode caps + SN-R1 continuity are untouched.
+		if use_devnav and orbital_handoff(int(_nav.mode), _dev_orbital_commit, CubeSphere.SN_NO_CEILING_BOUNCE):
 			_dev_flight_move(delta, input, running)
 			return
-		# PLANETARY dev-nav (or the flag off) uses the shipped lattice fly below. Drop the controller's velocity
-		# seed so the next ORBITAL entry re-seeds from the fresh SN2-derived velocity (a seamless handoff).
+		# SN-FIX #3: F-MODE MODEL — under the flag, dev-nav fly is a GRAVITY-OFF kinematic fly in the FULL look
+		# direction (camera forward incl. pitch), at ALL altitudes. No controller ramp, no deceleration crossing
+		# the atmosphere ceiling: the "bounce" is gone and looking up + forward climbs straight into orbit.
+		if use_devnav and CubeSphere.SN_NO_CEILING_BOUNCE:
+			_dev_have_v = false                             # drop the seed so a later O-commit re-seeds cleanly
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY:
+				_dev_orbital_commit = false
+			_kinematic_look_fly(delta, input, running)
+			return
+		# Shipped lattice fly: the bare fly toggle (SN_DEVNAV off), or dev-nav PLANETARY with SN_NO_CEILING_BOUNCE
+		# off. Drop the controller's velocity seed so the next ORBITAL entry re-seeds from the fresh SN2 velocity.
 		if _dev_nav:
 			_dev_have_v = false
-			# SN-FIX #3: back in PLANETARY the pilot is not in orbit — clear the commit latch so the next climb
-			# again keeps the kinematic fly through the band until they re-commit. No-op with the flag off.
 			if int(_nav.mode) == _CosmosNavCls.PLANETARY:
 				_dev_orbital_commit = false
 		var speed := fly_speed * (2.0 if running else 1.0)
@@ -666,6 +760,20 @@ func _move(delta: float) -> void:
 		_horiz_vel = wish * speed
 		velocity = Vector3.ZERO
 		return
+
+	# SN-FIX #3 (SN_NO_CEILING_BOUNCE): F-OFF gravity is WHERE-aware. ABOVE the atmosphere ceiling the player is in
+	# the planet-centred (inertial) frame — free-fall under GM_dyn/r² toward the planet centre, NO surface-rotation
+	# drag (that frame switch is the nav machine's carrier ω⃗×p → 0). BELOW the ceiling the shipped surface-feel
+	# gravity/frame takes over; the fall's radial velocity is handed to velocity.y so the transition is continuous.
+	# Flag off / FLAT ⇒ skipped ⇒ the shipped walk is byte-identical.
+	if CubeSphere.SN_NO_CEILING_BOUNCE and CubeSphere.FACETED and free_fall_regime(flying, radial_altitude(), true):
+		_free_fall_move(delta)
+		return
+	if _fall_have_v:
+		# Leaving free-fall (dropped below the ceiling): seed velocity.y from the BCI fall velocity so the surface
+		# walk's gravity continues from the true downward speed — a continuous flight→fall→surface handoff.
+		velocity.y = _fall_exit_vy()
+		_fall_have_v = false
 
 	var speed := run_speed if running else walk_speed
 	_horiz_vel = wish * speed

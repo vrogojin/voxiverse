@@ -601,16 +601,22 @@ const SN_HUD_NAV := false
 ## is BYTE-IDENTICAL. This gates a SHIPPED fixed-frame behaviour. Gate G-SN-KEEPHEADING. Live-only: the feel.
 const FP_CROSS_KEEP_HEADING := false
 
-## SN-FIX #3 (2026-07-18, live pilot report "bounced back at the atmosphere ceiling"). CONFIRMED cause (headless
-## diag, not gravity — all flight is kinematic/gravity-off): at the PLANETARY→LOW_ORBIT commit (crossing
-## ATMO_TOP=384) the shipped dev-nav auto-hands the player to the CosmosDevFlight velocity-command controller,
-## which RAMPS the seeded straight-up climb velocity toward the (camera-relative) command at DEV_ACCEL — so a
-## climb decelerates hard (32→~1 b/s) or reverses unless the command points exactly radial. Below 384 the fly
-## vertical axis is independent + instant; the abrupt change reads as a ceiling that bounces you back. When
-## true, the auto mode→dev-flight handoff is COMMIT-GATED: the player keeps the shipped kinematic lattice fly
-## (velocity preserved, no ramp) through the atmosphere→orbit band until they EXPLICITLY commit to orbital
-## flight (the O "release-to-orbit" verb). Default FALSE ⇒ the shipped auto-handoff is BYTE-IDENTICAL. Requires
-## SN_DEVNAV to have any effect. Gate G-SN-NOBOUNCE. Live-only: the FEEL of the smooth climb into orbit.
+## SN-FIX #3 (2026-07-18, live pilot report "bounced back at the atmosphere ceiling" + the full F-mode model the
+## pilot then specified). The intended physics, gated as ONE switch:
+##   (1) F-MODE (dev-nav fly) is GRAVITY-OFF ALWAYS — a kinematic fly in the FULL look direction (camera forward
+##       incl. pitch), constant speed at every altitude. Looking up + forward climbs straight through the
+##       atmosphere ceiling (ATMO_TOP=384) into orbit with NO deceleration/bounce. (The bounce was the shipped
+##       dev-nav auto-handoff to the CosmosDevFlight velocity-command controller, which ramped the climb toward
+##       the command at DEV_ACCEL — headless-confirmed 32→~1 b/s. That controller now runs ONLY after the pilot
+##       EXPLICITLY commits with the O "release-to-orbit" verb; O behaviour itself is a follow-up, untouched.)
+##   (2) F-OFF gravity is WHERE-aware: ABOVE 384 the player free-falls in the PLANET-CENTRED (inertial) frame
+##       under GM_dyn/r² toward the planet centre — NO surface-rotation drag (you keep the planet's solar orbit,
+##       don't co-rotate with the surface). Crossing BACK DOWN under 384, the SURFACE frame + surface-feel
+##       gravity resume. The frame/rotation-drag switch at 384 is the existing nav-mode carrier (ω⃗×p → 0); the
+##       flight↔fall and fall↔surface handoffs seed velocity so there is NO jump.
+## Default FALSE ⇒ BYTE-IDENTICAL: dev-nav keeps its shipped auto-handoff fly and F-off is the shipped lattice
+## walk gravity; nothing free-falls. Requires SN_DEVNAV + FACETED to have any effect. Gate G-SN-NOBOUNCE
+## (decision/regime/gravity/continuity, headless). Live-only: the FEEL of the seamless climb + the fall.
 const SN_NO_CEILING_BOUNCE := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged

@@ -29,6 +29,8 @@ const _FacetAtlasCls := preload("res://src/cosmos/facet_atlas.gd")
 # static). DEAD unless CubeSphere.SN_DEVNAV drives it in-game; the trajectory MATH is headless-gated
 # (verify_dev_flight — G-SN-DEVFLIGHT). Same FLM/FLB preload convention.
 const _DevFlightCls := preload("res://src/cosmos/cosmos_dev_flight.gd")
+# COSMOS SPACE-NAV SN5b (§7.3): the dev-nav overlay set (compass + guides). Lazy-built on F, freed on toggle.
+const _DevNavOverlayCls := preload("res://src/player/dev_nav_overlay.gd")
 
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
@@ -96,6 +98,8 @@ var _dev_nav := false
 var _dev_v_bci := PackedFloat64Array()         # the controller's BCI velocity state (kinematic; owned while orbital)
 var _dev_have_v := false                        # false until seeded on the first orbital tick (from _nav_last_v_bci)
 var _dev_active := false                         # true on ticks the orbital controller drove position (feeds _nav_tick)
+var _dev_p_bci := PackedFloat64Array()          # last BCI position (stashed for the O/G key handlers)
+var _dev_overlay: Control = null                # the SN5b overlay set (compass + guides); null unless dev-nav on
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -308,6 +312,11 @@ func _unhandled_input(event: InputEvent) -> void:
 					# wedge) the player. Re-enabled on landing. See _move_horizontal.
 					if _body_shape != null:
 						_body_shape.disabled = flying
+			KEY_O, KEY_G, KEY_R:
+				# COSMOS SPACE-NAV SN5b (§7.4): the dev-nav toggles. Live ONLY while dev-nav is engaged (F);
+				# otherwise inert (they carry no shipped binding). Flag off / not dev-nav ⇒ no-op.
+				if CubeSphere.SN_DEVNAV and _dev_nav and _nav != null:
+					_dev_toggle_key(event.keycode)
 
 func _physics_process(delta: float) -> void:
 	if frozen or world == null:
@@ -398,7 +407,16 @@ func _nav_tick(delta: float) -> void:
 	_nav_prev_fix = p_fix
 	_nav_have_prev = true
 	_nav_last_v_bci = v_bci                                  # seed for the next orbital dev-flight handoff (SN5)
+	_dev_p_bci = p_bci                                       # stash for the O/G key handlers (SN5b)
 	_nav_tele = _CosmosNavCls.telemetry(_nav, "earth", p_bci, v_bci, _nav_clock)
+	# SN5b: refresh the compass strip from the camera forward re-expressed in BCI (spin axis = BCI +Z).
+	if _dev_overlay != null and _dev_overlay.is_built():
+		var rmag := _DVCls.length(p_bci)
+		if rmag > 0.0:
+			var rhat := _DVCls.scale(p_bci, 1.0 / rmag)
+			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
+			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
+			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
 
 ## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
 ## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
@@ -416,6 +434,16 @@ func _toggle_dev_nav() -> void:
 	_dev_active = false
 	if _body_shape != null:
 		_body_shape.disabled = flying
+	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
+	if _dev_nav:
+		if _dev_overlay == null:
+			_dev_overlay = _DevNavOverlayCls.new()
+			add_child(_dev_overlay)
+			_dev_overlay.build(self, _FacetAtlasCls.R_BLOCKS)
+	elif _dev_overlay != null:
+		_dev_overlay.free_overlays()
+		_dev_overlay.queue_free()
+		_dev_overlay = null
 
 ## True iff dev-nav is engaged (F under SN_DEVNAV). Read by the overlays (SN5b) and the HUD.
 func dev_nav_active() -> bool:
@@ -487,6 +515,41 @@ func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
 func _dev_dir_to_bci(fid: int, t: float, d_lat: Vector3) -> PackedFloat64Array:
 	var wd := _FacetAtlasCls.frame_basis(fid) * d_lat
 	return _OrbitalStateCls.fixed_to_bci("earth", t, _DVCls.v(wd.x, wd.y, wd.z), _DVCls.v(0.0, 0.0, 0.0))[0]
+
+## COSMOS SPACE-NAV SN5b (§7.4): the O/G/R dev-nav toggles. Pure re-uses of the gated kernel math
+## (CosmosDevFlight.release_circular / geostationary_snap, CosmosNav.toggle_r_latch). O and G are explicit
+## user commands (allowed dev verbs), applied to the controller's BCI state; R flips the classifier's detach
+## latch. LIVE-ONLY: the resulting FEEL + the G teleport re-projection at altitude (morning). Only reached
+## under SN_DEVNAV while dev-nav is engaged (the key handler guards it).
+func _dev_toggle_key(keycode: int) -> void:
+	if _dev_p_bci.size() != 3:
+		return                                              # no BCI state yet (nav machine hasn't ticked)
+	var mode := int(_nav.mode)
+	var t := _nav_clock
+	var fid := TerrainConfig.active_facet()
+	match keycode:
+		KEY_R:
+			_nav.toggle_r_latch()                           # §7.4 R: latch DEEP_SPACE expression from HIGH_ORBIT
+		KEY_O:
+			# O — circular-orbit release (LOW/HIGH): set the controller velocity to the circular orbital velocity
+			# in the look-tangential direction. (True free-coast handoff to the ORBITAL integrator is live/SN1.)
+			if mode == _CosmosNavCls.LOW_ORBIT or mode == _CosmosNavCls.HIGH_ORBIT:
+				var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+				_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+				_dev_have_v = true
+		KEY_G:
+			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
+			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
+			if mode == _CosmosNavCls.HIGH_ORBIT and fid >= 0:
+				var snap := _DevFlightCls.geostationary_snap("earth", _dev_p_bci)
+				if snap.size() == 2:
+					var p_new: PackedFloat64Array = snap[0]
+					var v_new: PackedFloat64Array = snap[1]
+					var pf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_new, v_new)[0]
+					var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf[0], pf[1], pf[2])
+					position = Vector3(lat[0], lat[1], lat[2])
+					_dev_v_bci = v_new
+					_dev_have_v = true
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.

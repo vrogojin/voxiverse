@@ -115,3 +115,52 @@ static func _move_toward(cur: PackedFloat64Array, target: PackedFloat64Array, st
 	if l <= step or l == 0.0:
 		return PackedFloat64Array([target[0], target[1], target[2]])
 	return DV.add(cur, DV.scale(d, step / l))
+
+# ---------------------------------------------------------------------------------------
+# The dev-nav TOGGLES (§7.4). O and G are explicit user COMMANDS (allowed dev verbs), not seams — each sets a
+# specific BCI state the caller then either keeps flying or hands to the ORBITAL integrator. R (frame detach) is
+# the NavState.toggle_r_latch bit (SN2), not a state edit — no kernel here. All pure, gateable (G-SN-DEVNAV).
+# ---------------------------------------------------------------------------------------
+
+## O — circular-orbit release (§7.4): the BCI velocity of a circular orbit at the current radius, in the
+## tangential direction picked by the look vector: `v_bci = v_circ(r)·t̂`, `t̂ = normalize(look − (look·r̂)r̂)`.
+## A degenerate look (parallel to r̂) keeps the current tangential heading, else falls back to east (ẑ×r̂). The
+## result is exactly circular (|v| == v_circ) and purely tangential (v ⊥ r̂). The caller hands it to the ORBITAL
+## integrator (freeze-to-Kepler) — the initial impulse is a user command, not a seam.
+static func release_circular(body: String, p_bci: PackedFloat64Array, look_bci: PackedFloat64Array,
+		cur_v_bci: PackedFloat64Array) -> PackedFloat64Array:
+	var r := DV.length(p_bci)
+	if r <= 0.0:
+		return DV.v(0.0, 0.0, 0.0)
+	var v_circ := sqrt(GRAV.gm_dyn(body) / r)
+	var rhat := DV.scale(p_bci, 1.0 / r)
+	var tang := _tangent_of(look_bci, rhat)
+	if DV.length(tang) < 1.0e-9:                        # look parallel to r̂: keep the current tangential heading…
+		tang = _tangent_of(cur_v_bci, rhat)
+	if DV.length(tang) < 1.0e-9:                        # …else east.
+		tang = _east(p_bci)
+	var tl := DV.length(tang)
+	return DV.scale(tang, v_circ / tl) if tl > 0.0 else DV.v(0.0, 0.0, 0.0)
+
+## G — geostationary snap (§7.4, HIGH only): move to the equatorial point at r_geo preserving the current
+## longitude, with `v_bci = ω⃗×p` (exactly circular there, and scene-stationary since the scene frame is
+## body-fixed). Returns [p_new, v_new], or an EMPTY array when the body has no stationary orbit (the Moon —
+## r_geo > SOI), which the G key reports as "none". A user-invoked dev teleport (§7.4 D-SN-4: instant).
+static func geostationary_snap(body: String, p_bci: PackedFloat64Array) -> Array:
+	if not NAV.has_stationary_orbit(body):
+		return []
+	var rg := NAV.r_geo_dyn(body)
+	var phi := atan2(p_bci[1], p_bci[0])                # current longitude in the equatorial (XY) plane
+	var p_new := DV.v(rg * cos(phi), rg * sin(phi), 0.0)
+	var v_new := ORB.omega_cross(body, p_new)          # exactly circular + scene-stationary
+	return [p_new, v_new]
+
+## The component of `d` in the tangent plane at r̂ (⊥ r̂): d − (d·r̂)r̂. A pure projection.
+static func _tangent_of(d: PackedFloat64Array, rhat: PackedFloat64Array) -> PackedFloat64Array:
+	return DV.sub(d, DV.scale(rhat, DV.dot(d, rhat)))
+
+## East at p: normalize(ẑ × r̂) (prograde-east on the equatorial sense). Zero at the poles (caller guards).
+static func _east(p: PackedFloat64Array) -> PackedFloat64Array:
+	var c := DV.v(-p[1], p[0], 0.0)                     # ẑ × p = (−p_y, p_x, 0)
+	var l := DV.length(c)
+	return DV.scale(c, 1.0 / l) if l > 0.0 else DV.v(0.0, 1.0, 0.0)

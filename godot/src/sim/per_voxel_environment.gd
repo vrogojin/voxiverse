@@ -83,6 +83,30 @@ var _chart: CosmosChart = null
 func set_chart(chart: CosmosChart) -> void:
 	_chart = chart
 
+# COSMOS CLIMATE W1 (§1.5): the weather grid this interface READS (engine rule 2). Null unless
+# FP_CLIMATE_GRID (WorldManager injects it). Every query below falls back to a static default when it is
+# null or not yet spun up, so a flag-off / pre-init build is byte-identical.
+var _weather: WeatherSystem = null
+
+## Inject the weather grid. Called by WorldManager under FP_CLIMATE_GRID.
+func set_weather(w: WeatherSystem) -> void:
+	_weather = w
+
+## Unit sphere direction of WINDOW column (x, z): via the chart (curved) or the active facet (FACETED);
+## ZERO in a pure flat world (no sphere). The ONE column→direction funnel for the season term and every
+## weather-grid read, so gameplay and the sim agree on which weather cell a column sits in.
+func _dir_of_col(x: int, z: int) -> Vector3:
+	if _chart != null:
+		return CosmosTruePlace.dir_of_window(_chart, float(x) + 0.5, float(z) + 0.5)
+	if CubeSphere.FACETED:
+		var d := FacetAtlas.cell_dir(TerrainConfig.active_facet(), x, z)
+		return Vector3(float(d.x), float(d.y), float(d.z))
+	return Vector3.ZERO
+
+func _dir_of_pos(pos: Vector3) -> Vector3:
+	var c := _cell(pos)
+	return _dir_of_col(c.x, c.z)
+
 static func _cell(pos: Vector3) -> Vector3i:
 	return Vector3i(int(floor(pos.x)), int(floor(pos.y)), int(floor(pos.z)))
 
@@ -109,19 +133,25 @@ func _depth(c: Vector3i) -> int:
 	return surface - c.y
 
 ## CLIMATE W0 (§3): signed sin-latitude at WINDOW column (x, z) — the spin-axis (+Z) component of the
-## column's sphere direction (curved/faceted). FLAT_WORLD (no chart) ⇒ 0 (a flat world has no hemispheres),
-## so the seasonal offset vanishes there. The ONE source of latitude sign (N vs S) for the season term;
-## the climate `t` (column_profile.w) can't provide it — it uses |sinφ| and loses the hemisphere.
+## column's sphere direction (curved/faceted). A pure flat world (no direction) ⇒ 0 (no hemispheres), so
+## the seasonal offset vanishes there. The ONE source of latitude sign (N vs S) for the season term; the
+## climate `t` (column_profile.w) can't provide it — it uses |sinφ| and loses the hemisphere.
 func signed_sinlat(x: int, z: int) -> float:
-	if _chart == null:
-		return 0.0
-	return CosmosTruePlace.dir_of_window(_chart, float(x) + 0.5, float(z) + 0.5).z
+	return _dir_of_col(x, z).z
 
 ## The seasonal temperature offset (°C) at column (x, z) — 0 unless FP_SEASONS is on, so the flag-off path
 ## never even evaluates it (byte-identical). Applied to the air/ground branches below (NOT the frozen-sea
 ## structural pin, which stays exactly −8 — the ice sheet is annual-mean static, §3.4).
 func _season_term(x: int, z: int) -> float:
 	return ClimateModel.season_offset(signed_sinlat(x, z), ClimateModel.current_sin_delta)
+
+## CLIMATE W1 (§1.5): the BOUNDED weather temperature anomaly (°C) at column (x, z) — the grid's local T
+## deviation, hard-clamped to ±8 so weather can never dominate the climate/altitude structure. 0 unless the
+## weather grid exists and is spun up (⇒ pre-init / flag-off is byte-identical).
+func _weather_term(x: int, z: int) -> float:
+	if _weather == null or not _weather.is_ready():
+		return 0.0
+	return clampf(_weather.temp_anomaly_at_dir(_dir_of_col(x, z)), -8.0, 8.0)
 
 ## Temperature in degrees Celsius at the voxel containing `pos`.
 func temperature(pos: Vector3) -> float:
@@ -137,6 +167,8 @@ func temperature(pos: Vector3) -> float:
 		var air := ClimateModel.air_temperature(float(c.y), _climate_w(c.x, c.z))
 		if CubeSphere.FP_SEASONS:
 			air += _season_term(c.x, c.z)
+		if CubeSphere.FP_CLIMATE_GRID:
+			air += _weather_term(c.x, c.z)
 		return air
 	# Ground: cool from the surface anchor toward the 3 C plateau at COOL_RATE/block, SIGNED
 	# (a cold column with ts < COOL_FLOOR warms downward toward the plateau — permafrost), plus
@@ -144,6 +176,8 @@ func temperature(pos: Vector3) -> float:
 	var ts := ClimateModel.surface_temperature(surface, _climate_w(c.x, c.z))
 	if CubeSphere.FP_SEASONS:
 		ts += _season_term(c.x, c.z)
+	if CubeSphere.FP_CLIMATE_GRID:
+		ts += _weather_term(c.x, c.z)
 	var d := surface - c.y
 	var toward := maxf(ts - COOL_RATE * float(d), COOL_FLOOR) if ts >= COOL_FLOOR \
 		else minf(ts + COOL_RATE * float(d), COOL_FLOOR)
@@ -157,9 +191,65 @@ func light(pos: Vector3) -> float:
 		return 1.0
 	return exp(-float(d) / LIGHT_DEPTH)
 
-## Air/hydrostatic pressure in kPa (stub: standard atmosphere everywhere).
-func pressure(_pos: Vector3) -> float:
-	return PRESSURE_KPA
+# CLIMATE W1: pressure scale height (blocks) for the hydrostatic altitude term. Matches the SN4 fog
+# scale so space stays low-pressure; only consulted under FP_CLIMATE_GRID (flag-off returns the constant).
+const P_SCALE_HEIGHT := 900.0
+const P_ANOM_KPA := 0.03            # kPa per unit of grid pressure anomaly (thermal low/high)
+
+## Air/hydrostatic pressure in kPa. Stub (flag off): standard atmosphere everywhere (byte-identical).
+## CLIMATE W1: the hydrostatic altitude term (101.325·exp(−y/H)) plus the weather grid's pressure anomaly.
+func pressure(pos: Vector3) -> float:
+	if not CubeSphere.FP_CLIMATE_GRID:
+		return PRESSURE_KPA
+	var base := PRESSURE_KPA * exp(-maxf(pos.y, 0.0) / P_SCALE_HEIGHT)
+	if _weather != null and _weather.is_ready():
+		base += P_ANOM_KPA * _weather.pressure_anomaly_at_dir(_dir_of_pos(pos))
+	return base
+
+## CLIMATE W1 (§1.5): specific humidity at `pos` — the grid `q` at the column's weather cell (the sub-cell
+## downscale noise is a later refinement). Falls back to a climatological proxy from the local temperature
+## when the grid is absent, so callers always get a sane value.
+func humidity(pos: Vector3) -> float:
+	if _weather != null and _weather.is_ready():
+		return _weather.humidity_at_dir(_dir_of_pos(pos))
+	# proxy: warmer air holds more moisture (Clausius-Clapeyron), at ~half saturation.
+	var t_abs := temperature(pos)
+	return clampf(WeatherSystem.QSAT_REF * exp(WeatherSystem.QSAT_K * (t_abs - WeatherSystem.QSAT_T0)) * 0.5,
+		0.0, WeatherSystem.Q_MAX)
+
+## CLIMATE W1: wind vector (blocks/s) at `pos`. The grid stores geographic (east, north); this maps them
+## to a local world frame with the convention east→+X, north→−Z (the facet's flat lattice orientation) — an
+## approximate local mapping adequate for cloud advection / particle drift (W2/W3). ZERO without the grid.
+func wind(pos: Vector3) -> Vector3:
+	if _weather == null or not _weather.is_ready():
+		return Vector3.ZERO
+	var en := _weather.wind_en_at_dir(_dir_of_pos(pos))
+	return Vector3(en.x, 0.0, -en.y)
+
+## CLIMATE W1 (§1.5): precipitation {rate: blocks-equiv intensity 0..1, kind: "none"|"rain"|"snow"} at the
+## column of `pos`. Rate is a threshold read-out of the grid cloud water; kind is resolved by the ONE
+## zero-crossing authority (surface_temperature + season), so precip agrees with the snow-cap boundary.
+func precipitation(pos: Vector3) -> Dictionary:
+	if _weather == null or not _weather.is_ready():
+		return {"rate": 0.0, "kind": "none"}
+	var c := _cell(pos)
+	var d := _dir_of_col(c.x, c.z)
+	var cw := _weather.cloud_water_at_dir(d)
+	var rate := clampf((cw - WeatherSystem.RAIN_HOLD) / WeatherSystem.CW_MAX, 0.0, 1.0)
+	if rate <= 0.0:
+		return {"rate": 0.0, "kind": "none"}
+	var surface := _surface_h(c.x, c.z)
+	var ts := ClimateModel.surface_temperature(surface, _climate_w(c.x, c.z))
+	if CubeSphere.FP_SEASONS:
+		ts += _season_term(c.x, c.z)
+	return {"rate": rate, "kind": "snow" if ts < 0.0 else "rain"}
+
+## CLIMATE W1/W2 (§1.5): normalised cloud cover [0..1] at the column of `pos` (the grid cloud water,
+## scaled). `layer` selects an altitude band's threshold for W2's multi-layer meshes (0 = any cloud).
+func cloud_cover(pos: Vector3, _layer: int = 0) -> float:
+	if _weather == null or not _weather.is_ready():
+		return 0.0
+	return clampf(_weather.cloud_water_at_dir(_dir_of_pos(pos)) / WeatherSystem.CW_MAX, 0.0, 1.0)
 
 ## Electric current density (stub: none).
 func electric_current(_pos: Vector3) -> float:

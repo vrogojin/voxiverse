@@ -138,6 +138,13 @@ const CORNER_EDIT_LOCK := true
 # break/place edit. It is INERT until the player's position has been reported at least once (so it never
 # runs during the frozen prewarm, or in a headless world that has no player).
 var _snowfall: SnowfallSystem
+# COSMOS CLIMATE W1: the coarse prognostic weather grid (null unless FP_CLIMATE_GRID). Stepped from
+# _process on the main thread; PerVoxelEnvironment reads it. `_cosmos_clock` (injected by main.gd) gives
+# the game-time for insolation/seasons; null ⇒ the grid runs on its own default dt (still a valid diurnal
+# cycle once the clock exists). Both null in the shipped flat game ⇒ zero cost.
+var _weather: WeatherSystem
+var _cosmos_clock: CosmosEphemeris.CosmosClock = null
+var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
 # T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
@@ -246,6 +253,16 @@ func _ready() -> void:
 	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
 	_snowfall = SnowfallSystem.new()
 	_snowfall.setup(self)
+
+	# COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1.5): the ONE coarse prognostic weather grid.
+	# Owned + stepped here exactly like SnowfallSystem (SnowfallSystem-style: constructed ONLY under the flag,
+	# so all flags off ⇒ the class isn't even instantiated ⇒ zero bytes / zero CPU). PerVoxelEnvironment READS
+	# it (engine rule 2). The static basis is built sliced over startup frames (§1.7); the game_time it needs
+	# for insolation is injected via the celestial clock (main.gd → set_cosmos_clock). Default OFF → byte-identical.
+	if CubeSphere.FP_CLIMATE_GRID:
+		_weather = WeatherSystem.new()
+		_weather.setup()
+		environment.set_weather(_weather)
 	# Far-distance terrain layer (LOD-DESIGN): render-only, collision-free, voxel-worker-free —
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
@@ -296,6 +313,11 @@ func _ready() -> void:
 			_streamer.visible = false
 		print("[WorldManager] DEV_HIDE_NEAR: near chunk render hidden (far layer isolated)")
 
+## CLIMATE W1: inject the celestial clock so the weather grid can read game-time (insolation/seasons).
+## main.gd calls this once after building the clock; null-safe (the grid falls back to its default dt).
+func set_cosmos_clock(clock: CosmosEphemeris.CosmosClock) -> void:
+	_cosmos_clock = clock
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
@@ -304,6 +326,14 @@ func _process(delta: float) -> void:
 		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
 		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)
+	# COSMOS CLIMATE W1: advance the weather grid one sweep slice (main thread). The game_time drives
+	# insolation/seasons; with no clock yet (or flag off) it simply doesn't run. Timed separately so the
+	# ≤0.7 ms/frame budget can be attributed (RemoteBridge take_perf_attrib).
+	if _weather != null:
+		var gt := _cosmos_clock.now() if _cosmos_clock != null else 0.0
+		var t_w := Time.get_ticks_usec()
+		_weather.process(delta, gt)
+		_weather_us_max = maxi(_weather_us_max, Time.get_ticks_usec() - t_w)
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
 	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is

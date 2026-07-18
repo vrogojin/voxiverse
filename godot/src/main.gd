@@ -83,10 +83,12 @@ func _ready() -> void:
 	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp
 	# (day-night), placing the Sun light + Sun/Moon impostors + star dome from the pure ephemeris; the
 	# clock is advanced in _process (below). The player is the parallax-free camera provider.
-	# CLIMATE W0 (FP_SEASONS) also needs the celestial clock (to derive the subsolar latitude), so build it
-	# whenever EITHER flag is on; the Sun/Moon/sky nodes are still ORBITAL_SKY-only.
-	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS:
+	# CLIMATE W0/W1 (FP_SEASONS / FP_CLIMATE_GRID) also need the celestial clock (subsolar latitude +
+	# insolation game-time), so build it whenever ANY of them is on; the Sun/Moon/sky nodes stay
+	# ORBITAL_SKY-only. The clock is injected into the WorldManager so the weather grid can read game-time.
+	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS or CubeSphere.FP_CLIMATE_GRID:
 		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
+		world.set_cosmos_clock(_cosmos_clock)
 	if CubeSphere.ORBITAL_SKY:
 		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
 		var env: Environment = we.environment if we != null else null

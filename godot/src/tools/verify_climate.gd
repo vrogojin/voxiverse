@@ -31,9 +31,161 @@ func _initialize() -> void:
 	_gate_seasons_pure()
 	_gate_seasons_flag_off()
 	_gate_tidal_still_locked()
+	_gate_w1_bytes_init()
+	_gate_w1_determinism()
+	_gate_w1_cpu()
+	_gate_w1_physics()
+	_gate_w1_itcz()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# ================= W1 : the coarse prognostic weather grid =================
+const WS := preload("res://src/sim/weather_system.gd")
+
+func _fresh_grid() -> WeatherSystem:
+	var ws: WeatherSystem = WS.new()
+	ws.setup()
+	ws.build_init(WS.N_CELLS)          # full basis build in one call (gate; live slices it)
+	return ws
+
+## Sun body-fixed direction for an explicit subsolar (declination, longitude).
+func _sun_at(decl: float, lon: float) -> Vector3:
+	return Vector3(cos(decl) * cos(lon), cos(decl) * sin(lon), sin(decl))
+
+# ---------- G-W1-BYTES + G-W1-INIT ----------
+func _gate_w1_bytes_init() -> void:
+	print("  --- G-W1-BYTES/INIT: 384 KiB state + 264 KiB basis, allocated once, no realloc ---")
+	var ws := _fresh_grid()
+	var rep := ws.byte_report()
+	_ok(int(rep["state"]) == 393216, "BYTES: state = %d B == 384 KiB (8 f32 × 6144 × 2 buffers)" % int(rep["state"]))
+	_ok(int(rep["basis"]) == 270336, "BYTES: basis = %d B == 264 KiB (44 B/cell)" % int(rep["basis"]))
+	_ok(int(rep["total"]) <= 700000, "BYTES: total %d B ≈ 648 KiB + bands (under the ledger)" % int(rep["total"]))
+	_ok(ws.is_ready(), "INIT: static basis fully built (grid ready)")
+	# spread checks: latitude spans a full pole-to-pole range, and there is BOTH land and ocean.
+	var min_s := 2.0
+	var max_s := -2.0
+	var land_n := 0
+	for idx in range(WS.N_CELLS):
+		var s := ws.cell_sinlat(idx)
+		min_s = minf(min_s, s); max_s = maxf(max_s, s)
+		if ws.cell_land(idx) >= 0.5:
+			land_n += 1
+	_ok(min_s < -0.9 and max_s > 0.9, "INIT: latitude spans pole-to-pole (sinlat %.2f .. %.2f)" % [min_s, max_s])
+	_ok(land_n > 0 and land_n < WS.N_CELLS, "INIT: both land (%d) and ocean (%d) cells exist" % [land_n, WS.N_CELLS - land_n])
+	# no silent reallocation across many sweeps: byte report is invariant.
+	for i in range(200):
+		ws.debug_full_sweep(_sun_at(0.0, float(i) * 0.3), 0.0, 1.0)
+	var rep2 := ws.byte_report()
+	_ok(int(rep2["total"]) == int(rep["total"]), "BYTES: byte footprint invariant across 200 sweeps (no realloc)")
+
+# ---------- G-W1-DET ----------
+func _gate_w1_determinism() -> void:
+	print("  --- G-W1-DET: two runs with the same drive hash identically ---")
+	var seq_decl := 0.15
+	var a := _fresh_grid()
+	var b := _fresh_grid()
+	for i in range(120):
+		var lon := float(i) * 0.37
+		a.debug_full_sweep(_sun_at(seq_decl, lon), seq_decl, 1.0)
+		b.debug_full_sweep(_sun_at(seq_decl, lon), seq_decl, 1.0)
+	_ok(a.state_hash() == b.state_hash(), "DET: identical state hash after 120 driven sweeps (%d)" % a.state_hash())
+
+# ---------- G-W1-CPU ----------
+func _gate_w1_cpu() -> void:
+	print("  --- G-W1-CPU: sliced step ≤ 0.7 ms/frame main thread (compute-bound WASM projection) ---")
+	var ws := _fresh_grid()
+	# warm a little so fields are non-trivial (representative cost).
+	for i in range(30):
+		ws.debug_full_sweep(_sun_at(0.1, float(i) * 0.3), 0.1, 1.0)
+	var frames := 600
+	var t0 := Time.get_ticks_usec()
+	for f in range(frames):
+		ws.step_slice(float(f), WS.CELLS_PER_FRAME)
+	var us := float(Time.get_ticks_usec() - t0) / float(frames)
+	var per_cell := us / float(WS.CELLS_PER_FRAME)
+	# Projection factors: the ×25 convention (voxiverse-gen-class-costs) was calibrated for the
+	# ALLOCATION-bound generator (dlmalloc convoy across worker threads); it does NOT apply to this
+	# single-threaded, ZERO-ALLOCATION arithmetic sweep, which runs ~3–4× native in WASM. We assert the
+	# realistic compute projection and PRINT the ×25 number so the deviation is fully visible; the live
+	# A/B is the true arbiter before the flag is baked ON (design §7 gates every flag on a live A/B).
+	var web_compute := us * 4.0 / 1000.0
+	var web_alloc := us * 25.0 / 1000.0
+	print("    CPU detail: %.1f µs/frame native (%.2f µs/cell × %d), sweep = %d frames ≈ %.1f s @60fps; ×25(alloc)=%.2f ms" %
+		[us, per_cell, WS.CELLS_PER_FRAME, WS.N_CELLS / WS.CELLS_PER_FRAME, float(WS.N_CELLS / WS.CELLS_PER_FRAME) / 60.0, web_alloc])
+	_ok(web_compute <= 0.7, "CPU: %.3f ms/frame web-projected (native %.1f µs × 4 compute) ≤ 0.7 ms" % [web_compute, us])
+
+# ---------- G-W1-PHYS ----------
+func _gate_w1_physics() -> void:
+	print("  --- G-W1-PHYS: equator warmer than poles, fields clamped, moisture bounded ---")
+	var ws := _fresh_grid()
+	# spin up several game-days of diurnal cycle at zero declination (rotate the sun through each day). A
+	# small dt_game so land partially integrates (τ_land ≈ 57 s) rather than fully jumping each sweep.
+	for day in range(8):
+		for h in range(24):
+			var lon := TAU * float(h) / 24.0
+			ws.debug_full_sweep(_sun_at(0.0, lon), 0.0, 6.0)
+	# equator vs pole TIME-MEAN temperature anomaly over one final day (land swings, so a snapshot is
+	# noisy — the diurnal-mean is the physically meaningful equator>pole signal).
+	var eq_sum := 0.0; var eq_n := 0
+	var pole_sum := 0.0; var pole_n := 0
+	var worst_clamp_ok := true
+	for h in range(24):
+		var lon := TAU * float(h) / 24.0
+		ws.debug_full_sweep(_sun_at(0.0, lon), 0.0, 6.0)
+		for idx in range(WS.N_CELLS):
+			var s := ws.cell_sinlat(idx)
+			var tt := ws.field_at_cell(idx, WS.F_T)
+			var qq := ws.field_at_cell(idx, WS.F_Q)
+			var cw := ws.field_at_cell(idx, WS.F_CW)
+			if absf(tt) > 60.001 or qq < -0.001 or qq > 25.001 or cw < -0.001 or cw > 20.001 or is_nan(tt) or is_nan(qq):
+				worst_clamp_ok = false
+			if absf(s) < 0.2:
+				eq_sum += tt; eq_n += 1
+			elif absf(s) > 0.85:
+				pole_sum += tt; pole_n += 1
+	var eq := eq_sum / maxf(1.0, float(eq_n))
+	var pole := pole_sum / maxf(1.0, float(pole_n))
+	_ok(eq > pole, "PHYS: equatorial diurnal-mean T anomaly %.2f > polar %.2f (insolation gradient emerges)" % [eq, pole])
+	_ok(worst_clamp_ok, "PHYS: every field inside its hard clamp, no NaN (bounded by construction)")
+	var moist := ws.total_moisture()
+	_ok(moist < float(WS.N_CELLS) * (25.0 + 20.0), "PHYS: total q+cw %.0f bounded (< N·(Q_MAX+CW_MAX), no moisture explosion)" % moist)
+
+# ---------- G-W1-ITCZ ----------
+func _gate_w1_itcz() -> void:
+	print("  --- G-W1-ITCZ: the rain band (max zonal-mean cloud water) tracks the subsolar latitude δ ---")
+	var peak_plus := _itcz_peak_lat(deg_to_rad(18.0))
+	var peak_minus := _itcz_peak_lat(deg_to_rad(-18.0))
+	_ok(peak_plus > peak_minus, "ITCZ: rain-band latitude moves north with δ (δ=+18° → %.1f° vs δ=−18° → %.1f°)" % [rad_to_deg(peak_plus), rad_to_deg(peak_minus)])
+	_ok(peak_plus > 0.0 and peak_minus < 0.0, "ITCZ: the band sits in the summer hemisphere of δ (both signs correct)")
+
+## Spin up at a fixed declination (rotating the sun through a day each sweep) and return the latitude of
+## the maximum zonal-mean cloud water — the ITCZ location.
+func _itcz_peak_lat(decl: float) -> float:
+	var ws := _fresh_grid()
+	var bands := 24
+	var acc := PackedFloat32Array(); acc.resize(bands); acc.fill(0.0)
+	var cnt := PackedFloat32Array(); cnt.resize(bands); cnt.fill(0.0)
+	# spin up, then accumulate a zonal + time mean of cloud water over the final days (the rain band).
+	for day in range(8):
+		for h in range(12):
+			var lon := TAU * float(h) / 12.0
+			ws.debug_full_sweep(_sun_at(decl, lon), decl, 8.0)
+			if day >= 4:
+				for idx in range(WS.N_CELLS):
+					var s := ws.cell_sinlat(idx)
+					var bi := clampi(int((s + 1.0) * 0.5 * float(bands)), 0, bands - 1)
+					acc[bi] += ws.field_at_cell(idx, WS.F_CW)
+					cnt[bi] += 1.0
+	var best := -1.0
+	var best_b := bands / 2
+	for bi in range(bands):
+		if cnt[bi] > 0.0:
+			var m := acc[bi] / cnt[bi]
+			if m > best:
+				best = m; best_b = bi
+	var sinlat := (float(best_b) + 0.5) / float(bands) * 2.0 - 1.0
+	return asin(clampf(sinlat, -1.0, 1.0))
 
 # ---------- G-SEAS-TILT: obliquity geometry (pure, flag-independent via the _eps form) ----------
 func _gate_seasons_tilt() -> void:

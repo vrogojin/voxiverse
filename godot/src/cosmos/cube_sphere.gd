@@ -643,6 +643,17 @@ const SN_SUN_OCCLUSION := false
 ## stay green. Gate verify_climate G-SEAS-TILT (δ=±23.4° at solstices) + G-SEAS-PURE.
 const FP_SEASONS := false
 
+## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
+## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
+## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem
+## discipline). A sliced sweep (128 cells/frame) integrates insolation → T, a diagnostic thermal-low
+## pressure, an analytic + geostrophic + friction DIAGNOSTIC wind (cannot go unstable), semi-Lagrangian
+## moisture with evap/condense/rain-out + orographic lift, and a CAPE instability proxy. NO rendering (that
+## is W2/W3/W4); PerVoxelEnvironment exposes humidity/wind/pressure/precip/cloud reads. Deterministic (pure
+## of SEED + state + sweep index). Default FALSE ⇒ WeatherSystem is never instantiated ⇒ zero bytes / zero
+## CPU / byte-identical. Gate verify_climate G-W1-BYTES/CPU/DET/PHYS/ITCZ/INIT.
+const FP_CLIMATE_GRID := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

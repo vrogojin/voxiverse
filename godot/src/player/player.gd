@@ -391,12 +391,17 @@ func _nav_tick(delta: float) -> void:
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		return
+	# G-SN-NOSPIRAL: clamp the per-frame dt fed to the nav path so a post-hitch huge frame (a 16-s recovery
+	# frame was seen live) can never feed a runaway dt into the clock advance, the finite difference, or any
+	# integration downstream. 1/30 s ⇒ a normal 60-fps tick (dt = 1/60) is UNCHANGED (byte-neutral common case).
+	delta = _CosmosNavCls.clamp_nav_dt(delta)
 	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
 	var p_fix := _DVCls.v(w[0], w[1], w[2])                 # body-fixed (planet-pinned) world position, f64
 	_nav_clock += delta * _EphCls.TIME_WARP
 	var v_fix := _DVCls.v(0.0, 0.0, 0.0)
 	if _nav_have_prev and delta > 0.0:
-		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), 1.0 / delta)
+		# Bounded reciprocal (fd_inv_dt = 1/max(delta, MIN_FD_DT)) so a near-zero delta cannot blow up v_fix.
+		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), _CosmosNavCls.fd_inv_dt(delta))
 	var bci: Array = _OrbitalStateCls.fixed_to_bci("earth", _nav_clock, p_fix, v_fix)
 	var p_bci: PackedFloat64Array = bci[0]
 	# COSMOS SPACE-NAV SN5: when the dev-flight controller drove position THIS frame it OWNS the velocity —
@@ -456,6 +461,9 @@ func dev_nav_active() -> bool:
 ## lattice fly). LIVE-ONLY-VALIDATED: the BCI↔lattice re-projection is only meaningful while the player is
 ## roughly over the active facet (a morning-session check); the controller math itself is headless-proven.
 func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
+	# G-SN-NOSPIRAL: clamp the dt so a post-hitch huge frame cannot fling the kinematic BCI position by
+	# v·dt with a runaway dt (nor feed one to the controller). Byte-neutral for a normal 60-fps tick.
+	delta = _CosmosNavCls.clamp_nav_dt(delta)
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		# Off-facet safety: fall back to the shipped lattice fly for this tick (never strand the player).

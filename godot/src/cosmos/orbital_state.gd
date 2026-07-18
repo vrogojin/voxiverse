@@ -28,6 +28,15 @@ var vel: PackedFloat64Array = DV.v(0.0, 0.0, 0.0)      # DVec3 BCI, blocks/s
 var elems: PackedFloat64Array = PackedFloat64Array()   # RAILS: [a, e, i, raan, argp, M, epoch] (f64 ×7)
 
 const SUBSTEP_MAX := 0.016666666666666666              # 1/60 s — the integrator substep clamp (§2.3)
+## HARD CAP on the Verlet substep count per step() (G-SN-NOSPIRAL). Without it, `n = ceil(dt/SUBSTEP_MAX)`
+## scales linearly with dt, so a post-hitch huge frame (dt = 16 s ⇒ ~960 substeps) does proportionally more
+## work IN one frame, lengthening the next frame's dt → an unbounded per-frame loop (the live "spiral of
+## death"). Capped at 8, a spike costs at most 8 substeps; a normal 60 fps tick (dt = 1/60) is still exactly
+## 1 substep, so every accuracy gate (all step at dt ≤ 1/60) is byte-unchanged. The caller ALSO clamps the
+## per-frame dt (CosmosNav.MAX_NAV_DT) so under normal wiring step never even approaches the cap — belt +
+## suspenders. NOTE: a capped huge-dt tick trades integration accuracy for bounded work — correct, because
+## the point is to survive the recovery frame, not to integrate 16 s of orbit precisely in it.
+const SUBSTEP_MAX_N := 8
 const DRAG_H_SCALE := 128.0                            # atmosphere scale height (blocks) — shared with SN4a ramp
 const FREEZE_ECC_MAX := 0.999                          # v1 freezes only elliptic bound orbits (e < 1 − ε)
 
@@ -53,12 +62,19 @@ static func make(body_: String, pos_bci: PackedFloat64Array, vel_bci: PackedFloa
 func step(dt: float, a_ext: PackedFloat64Array) -> void:
 	if dt <= 0.0 or mode == RAILS:
 		return                                          # RAILS coasts on rails; caller thaws before stepping
-	var n := int(ceil(dt / SUBSTEP_MAX))
-	if n < 1:
-		n = 1
+	var n := substep_count(dt)
 	var h := dt / float(n)
 	for _i in range(n):
 		_verlet(h, a_ext)
+
+## The number of velocity-Verlet substeps step() runs for `dt`: ceil(dt/SUBSTEP_MAX) clamped to [1, SUBSTEP_MAX_N].
+## Pure + static so G-SN-NOSPIRAL can assert the bound directly (substep_count(16.0) == SUBSTEP_MAX_N, not ~960)
+## without instrumenting the loop. This is THE line that makes the per-frame work bounded regardless of dt.
+static func substep_count(dt: float) -> int:
+	var n := int(ceil(dt / SUBSTEP_MAX))
+	if n < 1:
+		n = 1
+	return mini(n, SUBSTEP_MAX_N)
 
 func _verlet(h: float, a_ext: PackedFloat64Array) -> void:
 	var a0 := DV.add(GRAV.gravity_bci(body, pos), a_ext)

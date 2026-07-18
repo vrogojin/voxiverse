@@ -66,6 +66,29 @@ const RADIUS_MARGIN := 0.05             # ±5 % on every radius threshold (4R, 1
 const ATMO_MARGIN := 32.0               # ±32 blocks absolute on the atmosphere band (the O1O4 band)
 
 # ---------------------------------------------------------------------------------------
+# Space-nav per-frame dt safety (G-SN-NOSPIRAL). A post-hitch frame can hand the space-nav path a huge dt
+# (a 16-s recovery frame was observed live). The nav tick + any integration must NEVER see a runaway dt, or
+# a per-frame loop whose count scales with dt lengthens the next frame → an exponential freeze. Two guards:
+#   MAX_NAV_DT — the per-frame dt clamp fed to the nav tick / dev-flight. 1/30 s: a normal 60-fps frame
+#     (dt = 1/60 < 1/30) is UNTOUCHED, so this is byte-neutral in the common case; a spike is bounded to
+#     ≤ 2 integrator substeps. clamp_nav_dt keeps the clamp in ONE place (player + gate agree).
+#   MIN_FD_DT — the floor on the finite-difference dt (v_fix = (p − prev)/dt in player._nav_tick). Guards a
+#     near-zero delta from exploding the derived velocity. fd_inv_dt(dt) = 1/max(dt, MIN_FD_DT) is bounded.
+# ---------------------------------------------------------------------------------------
+const MAX_NAV_DT := 0.03333333333333333  # 1/30 s — clamp on the dt fed to the space-nav per-frame path
+const MIN_FD_DT := 1.0e-4                 # floor (s) on the finite-difference dt so v_fix cannot blow up
+
+## Clamp a per-frame dt to the space-nav safe range [0, MAX_NAV_DT] (G-SN-NOSPIRAL). Pure; the player and the
+## gate call this ONE function so the bound they enforce/assert are identical. dt ≤ 0 passes through as 0.
+static func clamp_nav_dt(dt: float) -> float:
+	return minf(dt, MAX_NAV_DT) if dt > 0.0 else 0.0
+
+## Bounded reciprocal for the finite-difference velocity (v_fix = Δp · fd_inv_dt): 1/max(dt, MIN_FD_DT).
+## Never larger than 1/MIN_FD_DT, so a near-zero delta cannot produce an unbounded derived velocity.
+static func fd_inv_dt(dt: float) -> float:
+	return 1.0 / maxf(dt, MIN_FD_DT)
+
+# ---------------------------------------------------------------------------------------
 # Per-body derived radii (SPACE-NAV §3/§4). Pure reads of the ephemeris + GM_dyn scale bridge.
 # ---------------------------------------------------------------------------------------
 
@@ -173,8 +196,6 @@ static func _classify_inputs(body: String, inp: Dictionary, incumbent: int) -> i
 	var atmo_eff := atmo
 	if incumbent == PLANETARY: atmo_eff = atmo + ATMO_MARGIN
 	elif incumbent != NONE: atmo_eff = atmo - ATMO_MARGIN
-	# Suborbital speed 0.25 (PLANETARY vicinity clause): leave above 0.275, re-enter below 0.225.
-	var u_sub := _speed_thr(U_SUBORBITAL, incumbent == PLANETARY, incumbent)
 	# Escape speed 2.0 (LOW↔HIGH via u): LOW stays low until u > 2.2; HIGH re-enters below 1.8.
 	var u_esc := _speed_thr(U_ESCAPE, incumbent == LOW_ORBIT, incumbent, incumbent == HIGH_ORBIT)
 	# Solar-speed 1.0 (HIGH escape clause, u≥2 and s<1): HIGH stays until s>1.05; others below 0.95.
@@ -194,12 +215,13 @@ static func _classify_inputs(body: String, inp: Dictionary, incumbent: int) -> i
 	var rsys := R_SYSTEM * _rad_scale(incumbent == DEEP_SPACE, incumbent, incumbent == INTERSTELLAR)
 
 	# --- the §4.3 priority decision list (first match wins) ---
-	# 1. PLANETARY: inside the atmosphere band, or suborbital in the vicinity.
+	# 1. PLANETARY: inside the atmosphere band ONLY. The atmosphere ceiling (h < H_ATMO = 384 blocks, ±32
+	#    hysteresis) IS the planetary↔low-orbit divide — the user's live decision 2026-07-18, which OVERRIDES
+	#    the §4.3 "suborbital in the vicinity stays PLANETARY" clause. Crossing 384 upward is LOW_ORBIT
+	#    regardless of speed: a slow hover just above the atmosphere falls through to rule 2 (vicinity).
 	if h < atmo_eff:
 		return PLANETARY
-	if r <= vic and u < u_sub:
-		return PLANETARY
-	# 2. LOW_ORBIT: in the vicinity (super-suborbital), or bound-ish flight in the well BELOW geostationary
+	# 2. LOW_ORBIT: in the vicinity (above the atmosphere), or bound-ish flight in the well BELOW geostationary
 	#    (the D-SN-CLASS-1 `r < r_geo` gate — see the header ambiguity note).
 	if r <= vic:
 		return LOW_ORBIT

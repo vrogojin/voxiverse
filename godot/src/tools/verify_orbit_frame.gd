@@ -15,7 +15,8 @@ extends SceneTree
 ##                 rotates at exactly −ω (the θ-step rotation) when B_cam is a constant body-fixed basis.
 ##   G-ORBIT-FLY   (Phase B) lat_cam_basis maps forward to the BCI look direction to f32 tol through random
 ##                 facet/θ; Space/Ctrl move along CAMERA ±Y not lattice ±Y.
-## (Phase C EXTENDS this gate with G-ORBIT-REC — the design's "extended per phase" pattern.)
+##   G-ORBIT-REC   (Phase C) recovery converges (roll==0, pitch∈[−1.5,1.5], heading/elevation preserved) from ANY
+##                 start incl. roll π + the forward=±facet-normal degenerate; continuity at α=0/α=1; no spike.
 ##
 ## RUN: docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
 ##       --script res://src/tools/verify_orbit_frame.gd 2>/dev/null | grep VERIFY
@@ -52,6 +53,7 @@ func _initialize() -> void:
 	_gate_att()
 	_gate_sky()
 	_gate_fly()
+	_gate_rec()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -167,3 +169,62 @@ func _gate_fly() -> void:
 			vy_ok = false
 	_ok(worst < 1.0e-4, "G-ORBIT-FLY forward maps to BCI look (dev %s)" % worst)
 	_ok(vy_ok, "G-ORBIT-FLY Space/Ctrl move along CAMERA ±Y (not lattice ±Y)")
+# ---------- G-ORBIT-REC (Phase C): landing recovery convergence + continuity ----------
+func _gate_rec() -> void:
+	var nf := FacetAtlas.facet_count()
+	var conv_ok := true
+	var cont0_worst := 0.0
+	var cont1_worst := 0.0
+	var roll_worst := 0.0
+	var spike_worst := 0.0
+	var heading_ok := true
+	# Include degenerate start attitudes: forward = ±facet normal, and a roll-π (upside-down) view.
+	for i in range(48):
+		var fid := i % nf
+		var b_active := FacetAtlas.frame_basis(fid)
+		# A start scene basis: rotate the facet frame by a random full 3D rotation (covers roll π, look ±normal).
+		var b_start := b_active * _rand_basis(i * 3 + 2)
+		var degenerate := i % 7 == 0
+		if degenerate:
+			# Degenerate: forward exactly along +normal (look straight down the facet normal), rolled.
+			b_start = b_active * (Basis(Vector3(1, 0, 0), -PI * 0.5) * Basis(Vector3(0, 0, 1), fmod(float(i), TAU)))
+		var tp := ATT.recover_target(b_active, b_start)
+		# α=1: the displayed basis equals the surface FPS reconstruction; roll==0 (right-axis horizontal), pitch clamped.
+		var b_lat_start_q := (b_active.transposed() * b_start).orthonormalized().get_rotation_quaternion()
+		var b_end := ATT.recover_blend(b_active, b_lat_start_q, tp.x, tp.y, 1.0)
+		var b_hand := b_active * ATT.surface_lat_basis(tp.x, tp.y)
+		cont1_worst = maxf(cont1_worst, _basis_dev(b_end, b_hand))
+		# roll == 0: the right-axis (X column) of the lattice-frame basis has no facet-normal (+Y) component.
+		var lat_end := b_active.transposed() * b_end
+		roll_worst = maxf(roll_worst, absf(lat_end.x.y))
+		if tp.y < -1.5 - 1.0e-6 or tp.y > 1.5 + 1.0e-6:
+			conv_ok = false
+		# HEADING PRESERVED: the recovered forward keeps the incoming view's horizontal azimuth (you look the SAME
+		# way, just level + roll-free). Non-degenerate only (a straight-down look has no defined azimuth). The
+		# elevation sign is preserved too (looking up recovers to a positive pitch). Catches a wrong target sign.
+		if not degenerate:
+			var f_start := -(b_active.transposed() * b_start).z
+			var f_end := -lat_end.z
+			var hs := Vector2(f_start.x, f_start.z)
+			var he := Vector2(f_end.x, f_end.z)
+			if hs.length() > 1.0e-3 and he.length() > 1.0e-3 and hs.normalized().dot(he.normalized()) < 0.999:
+				heading_ok = false
+			if signf(f_end.y) != signf(clampf(f_start.y, -sin(1.5), sin(1.5))) and absf(f_start.y) > 1.0e-3:
+				heading_ok = false
+		# α=0: the displayed basis equals the frozen scene start (C0 continuity).
+		var b0 := ATT.recover_blend(b_active, b_lat_start_q, tp.x, tp.y, 0.0)
+		cont0_worst = maxf(cont0_worst, _basis_dev(b0, b_start))
+		# No spike: the per-α-step angular delta is bounded (sample the blend; max step small over a fine sweep).
+		var prev := b0
+		for k in range(1, 33):
+			var a := float(k) / 32.0
+			var b := ATT.recover_blend(b_active, b_lat_start_q, tp.x, tp.y, a)
+			spike_worst = maxf(spike_worst, _basis_dev(prev, b))
+			prev = b
+	_ok(cont0_worst < 1.0e-4, "G-ORBIT-REC continuity α=0 == frozen start (dev %s)" % cont0_worst)
+	_ok(cont1_worst < 1.0e-4, "G-ORBIT-REC continuity α=1 == hand-back euler (dev %s)" % cont1_worst)
+	_ok(roll_worst < 1.0e-5, "G-ORBIT-REC roll==0 at α=1 (right-axis normal comp %s)" % roll_worst)
+	_ok(conv_ok, "G-ORBIT-REC pitch converges within ±1.5 rad from any start")
+	_ok(heading_ok, "G-ORBIT-REC recovered heading preserves the incoming view azimuth + elevation sign")
+	# A π tumble over 32 steps ⇒ each step ≤ ~π/32·(smoothstep peak 1.5) ≈ 0.15 rad ⇒ basis dev < ~0.25. Generous bound.
+	_ok(spike_worst < 0.3, "G-ORBIT-REC no angular spike across the blend (max step dev %s)" % spike_worst)

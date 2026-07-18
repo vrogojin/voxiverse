@@ -127,6 +127,10 @@ const ATT_SPACE := 1
 const ATT_RECOVER := 2                          # (Phase C) the smooth landing-recovery blend state
 var _att_mode := ATT_SURFACE
 var _att_q := Quaternion.IDENTITY              # the camera basis in the BCI (inertial) frame (SPACE)
+var _att_recover_b_start := Basis()            # RECOVER (Phase C): the frozen SCENE basis at the leave-SPACE instant
+var _att_recover_yaw := 0.0                     # RECOVER: the target surface yaw (mouse-drivable during the blend)
+var _att_recover_pitch := 0.0                   # RECOVER: the target surface pitch (clamped ±1.5)
+var _att_recover_alpha := 0.0                   # RECOVER: the 0→1 blend parameter (ramps over ORBIT_T_REC)
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -299,11 +303,18 @@ func window_camera_transform() -> Transform3D:
 	var cam_local := Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
 	return global_transform * cam_local
 
-## COSMOS ORBIT-FRAME (§3.2): the current DISPLAYED scene (render) basis while in SPACE — R_z(−θ)·Basis(q_bci).
-## θ is read fresh from the f64 nav clock (no basis accumulation ⇒ no f32 drift). (Phase C adds the RECOVER blend.)
+## COSMOS ORBIT-FRAME (§3.2/§3.5): the current DISPLAYED scene (render) basis. SPACE composes R_z(−θ)·Basis(q_bci);
+## RECOVER (Phase C) is the eased slerp toward the gravity-aligned surface pose in the CURRENT active facet frame —
+## b_active updates across a crossing while the frozen b_start stays scene-constant, so the blend re-references
+## automatically (§6.2). θ is read fresh from the f64 nav clock (no basis accumulation ⇒ no f32 drift).
 func _attitude_scene_basis() -> Basis:
 	var theta := _EphCls.spin_angle("earth", _nav_clock)
-	return _CosmosAttitudeCls.scene_basis(_att_q, theta)
+	if _att_mode == ATT_SPACE:
+		return _CosmosAttitudeCls.scene_basis(_att_q, theta)
+	# RECOVER: express the frozen scene start in the current facet lattice, slerp to the surface target.
+	var b_active := _attitude_active_basis()
+	var b_lat_start_q := (b_active.transposed() * _att_recover_b_start).orthonormalized().get_rotation_quaternion()
+	return _CosmosAttitudeCls.recover_blend(b_active, b_lat_start_q, _att_recover_yaw, _att_recover_pitch, _att_recover_alpha)
 
 ## The active facet's lattice basis in scene coords (b_active), or identity off-facet. Used by the attitude seam.
 func _attitude_active_basis() -> Basis:
@@ -339,14 +350,35 @@ func _attitude_tick(delta: float) -> void:
 				_attitude_leave_space(theta)
 			else:
 				_write_attitude_camera()
+		ATT_RECOVER:
+			# Phase C: re-leaving PLANETARY mid-recovery ⇒ re-seed q_bci from the DISPLAYED (blended) basis so the
+			# jump back to SPACE is continuous. Otherwise ramp α over ORBIT_T_REC and hand back at α ≥ 1.
+			if not committed_planetary:
+				_att_q = _CosmosAttitudeCls.seed_bci(_camera.global_transform.basis, theta)
+				_att_mode = ATT_SPACE
+				_write_attitude_camera()
+			else:
+				_att_recover_alpha += (delta / CubeSphere.ORBIT_T_REC) if CubeSphere.ORBIT_T_REC > 0.0 else 1.0
+				if _att_recover_alpha >= 1.0:
+					_attitude_handback(_att_recover_yaw, _att_recover_pitch)
+				else:
+					_write_attitude_camera()
 
 ## Leave SPACE for the surface: derive the gravity-aligned surface (yaw*, pitch*) from the current displayed
-## basis and hand back INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0, documented). Phase C
-## (ORBIT_LAND_RECOVER) replaces this instant hand-back with a smooth slerp (the ATT_RECOVER state).
+## basis. Under ORBIT_LAND_RECOVER (Phase C) begin a smooth slerp (the ATT_RECOVER state); else hand back
+## INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0, documented).
 func _attitude_leave_space(theta: float) -> void:
 	var b_scene := _CosmosAttitudeCls.scene_basis(_att_q, theta)
 	var tp := _CosmosAttitudeCls.recover_target(_attitude_active_basis(), b_scene)
-	_attitude_handback(tp.x, tp.y)
+	if CubeSphere.ORBIT_LAND_RECOVER:
+		_att_recover_b_start = b_scene
+		_att_recover_yaw = tp.x
+		_att_recover_pitch = tp.y
+		_att_recover_alpha = 0.0
+		_att_mode = ATT_RECOVER
+		_write_attitude_camera()                            # α=0 shows the frozen basis exactly (continuity)
+	else:
+		_attitude_handback(tp.x, tp.y)
 
 ## Hand the surface FPS parametrization back: write rotation.y/_pitch, un-emancipate the camera to its shipped
 ## child pose, return to SURFACE. The child basis b_active·R_y(yaw)·R_x(pitch) equals the displayed basis at
@@ -395,6 +427,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		# ⇒ the shipped clamped-euler handler BYTE-IDENTICALLY (the machine never leaves SURFACE with the flag off).
 		if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
 			_att_q = _CosmosAttitudeCls.apply_look(_att_q, event.relative.x, event.relative.y, mouse_sensitivity)
+		elif CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_RECOVER:
+			# Phase C: during the landing blend the mouse drives the surface recovery TARGET (clamped) so the pilot
+			# never loses look control; the slerp target moves continuously, the displayed basis stays C0.
+			_att_recover_yaw = wrapf(_att_recover_yaw - event.relative.x * mouse_sensitivity, -PI, PI)
+			_att_recover_pitch = clampf(_att_recover_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
 		else:
 			rotate_y(-event.relative.x * mouse_sensitivity)
 			_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)

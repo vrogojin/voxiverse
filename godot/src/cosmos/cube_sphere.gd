@@ -669,6 +669,16 @@ const ORBIT_ROLL_RATE := 1.2
 ## FALSE ⇒ the shipped body-yaw+pitch lattice construction, byte-identical (and _kinematic_look_fly is only
 ## reached under SN_NO_CEILING_BOUNCE dev-nav). Requires ORBIT_ATTITUDE + SN_DEVNAV. Gate G-ORBIT-FLY.
 const ORBIT_6DOF_FLY := false
+## COSMOS ORBIT-FRAME Phase C (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3.5) — the SMOOTH landing recovery. When true
+## (AND ORBIT_ATTITUDE), leaving SPACE enters a RECOVER blend instead of the Phase A instant hand-back: the
+## displayed basis slerps (smoothstep, C1) from the frozen space attitude to the gravity-aligned surface FPS pose
+## over ORBIT_T_REC seconds, mouse-drivable during the blend, converging from ANY attitude (incl. roll pi) along
+## the shortest great-circle arc; ground contact is an extra leave trigger. At alpha=1 the hand-back writes exactly
+## the basis already displayed (no jump). Re-leaving PLANETARY mid-blend re-seeds q_bci from the displayed basis
+## (always continuous). Default FALSE ⇒ the Phase A INSTANT hand-back. Requires ORBIT_ATTITUDE. Gate G-ORBIT-REC.
+const ORBIT_LAND_RECOVER := false
+## ORBIT-FRAME tunable (live-tuned): the RECOVER blend duration (s). Consulted only under ORBIT_LAND_RECOVER.
+const ORBIT_T_REC := 0.8
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

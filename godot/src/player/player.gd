@@ -527,8 +527,13 @@ func _kinematic_look_fly(delta: float, input: Vector3, running: bool) -> void:
 	else:
 		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
 		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
-	var cam := window_camera_transform().basis
-	var dir := cam * Vector3(input.x, vy, input.z)          # forward incl. pitch (−cam.z), strafe, camera-up
+	# FP-FIXED-FRAME: `position` is a LATTICE pose, so the fly direction MUST be a LATTICE direction. The player
+	# body's `transform.basis` is the local (lattice) YAW basis; the camera PITCH (_pitch about local X) adds the
+	# look-up/down component → forward flies where you look. Space/Ctrl (vy) are straight LATTICE up/down.
+	# (The prior code used window_camera_transform() = GLOBAL basis on a lattice position, so the facet's world
+	# tilt scrambled the axes — Space went sideways/underground. transform.basis keeps it all in-frame.)
+	var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(input.x, 0.0, input.z)   # strafe + forward(incl pitch)
+	var dir := transform.basis * look_local + Vector3(0.0, vy, 0.0)
 	if dir.length() > 0.0:
 		dir = dir.normalized()
 	position += dir * speed * delta

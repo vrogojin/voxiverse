@@ -301,6 +301,8 @@ func _ready() -> void:
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
 	var _pp_wm := PerfProbe.t()
+	var _ppv_wm := PerfProbe.vmem()
+	var _pps_wm := PerfProbe.smem()
 	if _snowfall != null and _have_player_pos:
 		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
@@ -343,6 +345,7 @@ func _process(delta: float) -> void:
 			_lod_excl_accum = 0.0
 			_facet_ring_sync_exclusion()
 	PerfProbe.mark("wm_process", _pp_wm)
+	PerfProbe.mark_mem("wm_process", _ppv_wm, _pps_wm)
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -618,8 +621,11 @@ func update_streaming(player_pos: Vector3) -> void:
 		_streamer.update_center(player_pos)
 	if _ground != null:
 		var _pp_ground := PerfProbe.t()
+		var _ppv_ground := PerfProbe.vmem()
+		var _pps_ground := PerfProbe.smem()
 		_ground.update(player_pos)
 		PerfProbe.mark("ground", _pp_ground)
+		PerfProbe.mark_mem("ground", _ppv_ground, _pps_ground)
 	# CROSSING-FASTGEN obs-2 fix (3): measure the player speed for velocity-aware predictive streaming, BEFORE the
 	# _last_player_pos latch below overwrites the previous sample. Read-only w.r.t. every existing structure; wholly
 	# inside its flag gate so with FP_VEL_PREDICT off it never runs and _player_speed stays 0 (byte-identical). A
@@ -650,20 +656,29 @@ func update_streaming(player_pos: Vector3) -> void:
 		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
 			cover_query = Callable(_module_world, "skin_near_meshed")
 		var _pp_skin := PerfProbe.t()
+		var _ppv_skin := PerfProbe.vmem()
+		var _pps_skin := PerfProbe.smem()
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
 		PerfProbe.mark("skin", _pp_skin)
+		PerfProbe.mark_mem("skin", _ppv_skin, _pps_skin)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
 		var _pp_pool := PerfProbe.t()
+		var _ppv_pool := PerfProbe.vmem()
+		var _pps_pool := PerfProbe.smem()
 		_manage_facet_pool(player_pos)
 		PerfProbe.mark("pool", _pp_pool)
+		PerfProbe.mark_mem("pool", _ppv_pool, _pps_pool)
 	if CubeSphere.M5C_CORNER:
 		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
 	if _far != null:
 		var _pp_far := PerfProbe.t()
+		var _ppv_far := PerfProbe.vmem()
+		var _pps_far := PerfProbe.smem()
 		_far.update_center(player_pos)
 		PerfProbe.mark("far", _pp_far)
+		PerfProbe.mark_mem("far", _ppv_far, _pps_far)
 	# COSMOS M4 (§5.1/§5.4): while a flip's near field restreams, poll the module's view-distance ramp;
 	# once it finishes the near data blocks are loaded, so re-mirror player edits into the fresh render
 	# (they were dropped by the pure-worldgen restream) and end the far handoff turbo. One-shot per flip.

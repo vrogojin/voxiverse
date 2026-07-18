@@ -160,6 +160,17 @@ var _gen_prev_us := [0, 0, 0, 0]
 var _hitches := 0                   # cumulative frames slower than HITCH_MS since start
 var _last_frame_usec := -1          # previous _process wall time (usec); -1 = first frame
 
+# SN_PERF_PROBE MEMORY PASS (freeze = a per-frame ~0.8 MB video-mem leak, not compute): the WHOLE-FRAME
+# memory growth, so the pilot can see the per-frame leak directly and check whether the per-subsystem
+# pp_mem_*/pp_smem_* deltas sum to it. Both are the WORST single-frame POSITIVE delta in the window (bytes):
+# _win_vmem_delta from RENDER_VIDEO_MEM_USED (the counter vmem_mb reads — where the leak shows), _win_smem_delta
+# from MEMORY_STATIC (Godot CPU heap — the synchronous cross-check). Emitted as pp_vmem_delta / pp_smem_delta.
+# Wholly inside the SN_PERF_PROBE gate ⇒ byte-identical with the flag off. -1 sentinels = no prior sample yet.
+var _last_vmem := -1
+var _last_smem := -1
+var _win_vmem_delta := 0
+var _win_smem_delta := 0
+
 # A1-REFINE (#114): the crossing's transform-WRITE is ~0.02 ms, but Godot flushes the
 # NOTIFICATION_TRANSFORM_CHANGED re-place AFTER _physics_process returns — the real ~290-816 ms
 # spike lands in the FOLLOWING frame(s), not in the write bracket. So for each crossing we track the
@@ -344,6 +355,15 @@ func _process(delta: float) -> void:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
+	# SN_PERF_PROBE: whole-frame memory growth (the per-frame leak). Gated ⇒ byte-identical with the flag off.
+	if CubeSphere.SN_PERF_PROBE:
+		var vm := int(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED))
+		var sm := int(Performance.get_monitor(Performance.MEMORY_STATIC))
+		if _last_vmem >= 0:
+			_win_vmem_delta = maxi(_win_vmem_delta, vm - _last_vmem)
+			_win_smem_delta = maxi(_win_smem_delta, sm - _last_smem)
+		_last_vmem = vm
+		_last_smem = sm
 	_poll_voxel_main_thread_stats()
 	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
 	if not _post_cross.is_empty():
@@ -658,9 +678,17 @@ func _send_telemetry() -> void:
 		var pa = world.call("take_perf_attrib")
 		if pa is Dictionary:
 			msg.merge(pa as Dictionary)
-	# SN_PERF_PROBE (throwaway freeze-localization): fold in each per-frame subsystem's worst-ms-in-window as
-	# `pp_<name>` fields, then reset the probe window. Empty {} with the flag off ⇒ merges nothing (byte-identical).
+	# SN_PERF_PROBE (throwaway freeze-localization): fold in each per-frame subsystem's worst-ms-in-window
+	# (pp_<name>) plus its worst positive video/static memory delta (pp_mem_<name> / pp_smem_<name>), then reset
+	# the probe window. Empty {} with the flag off ⇒ merges nothing (byte-identical).
 	msg.merge(PerfProbe.take())
+	# Whole-frame memory growth: pp_vmem_delta (the ~0.8 MB/frame leak counter) + pp_smem_delta (CPU cross-check),
+	# each the worst single-frame positive delta this window (KB). Gated ⇒ omitted entirely with the flag off.
+	if CubeSphere.SN_PERF_PROBE:
+		msg["pp_vmem_delta"] = snappedf(float(_win_vmem_delta) / 1024.0, 0.1)
+		msg["pp_smem_delta"] = snappedf(float(_win_smem_delta) / 1024.0, 0.1)
+		_win_vmem_delta = 0
+		_win_smem_delta = 0
 	if _win_had_capture:
 		msg["cap"] = 1
 		_win_had_capture = false

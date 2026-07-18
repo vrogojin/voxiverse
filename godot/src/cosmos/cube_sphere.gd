@@ -515,6 +515,76 @@ const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, lin
 ## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
 const ORBITAL_SKY := false
 
+## COSMOS ORBITAL O1 / SPACE-NAV SN1 (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §2.1, docs/COSMOS-SPACE-NAV-DESIGN.md
+## §10 SN1) — the ORBITAL substrate master flag + its constants. FP_M3_ORBIT defaults FALSE ⇒ the engine is
+## BYTE-IDENTICAL: nothing below is created, the CosmosGravity/OrbitalState kernels are pure statics DEAD with the
+## flag off, and SURFACE/FLY locomotion is untouched. The blend band is radial altitude h = |p_fixed| − R_body:
+## below H_BLEND_LO = pure shipped lattice feel gravity (walking game intact); above H_BLEND_HI = pure GM_dyn/r²
+## inertial regime; in between a slerp/lerp blend (CosmosGravity.gravity_fixed). NOTE (SPACE-NAV R1): the parent
+## O1O4 §2.8 H_FARSWAP impostor-swap is REJECTED (SEAMLESS-SCALES) and the const is deliberately NOT created here —
+## far-ring persistence + the SN3 scaled clamp replace it. All local dynamics read GM_dyn (SPACE-NAV §3), not the
+## sky's GM_game. NEVER-OOM: OrbitalState ~100 B/entity, hard-capped at ORBIT_ACTIVE_MAX (player = 1 in O1).
+const FP_M3_ORBIT := false        # master flag; OFF ⇒ byte-identical (nothing below is created)
+const H_BLEND_LO := 128.0         # radial altitude (blocks): below = pure lattice feel gravity (shipped)
+const H_BLEND_HI := 512.0         # above = pure GM_dyn/r² inertial regime (> ATMO_TOP, > OFFSURFACE_Y)
+const ATMO_TOP := 384.0           # atmosphere ceiling (D10; near-field scale, user-locked)
+const ORBIT_THRUST_G2 := 25.0     # gear-2 thrust authority, m/s²
+const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital entities (NEVER-OOM)
+const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with the controller commit band)
+const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates + pre-warms the landing facet
+
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SPACE-NAV-DESIGN.md §10 / docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.5) —
+## the BORDER-CONTINUITY master flag: the atmosphere↔space border + the climb to orbit render with NO pop. Off
+## ⇒ BYTE-IDENTICAL: the scaled-body clamp is absent (nothing scales — CosmosScale.on() is false so its whole
+## path is DEAD), the camera keeps its shipped near/far (0.05 / FacetFarRing.CAMERA_FAR = 9000), and the far
+## ring retires exactly as today (never at an altitude cutoff). On ⇒ the far ring persists to any altitude under
+## the continuous distance clamp s = min(1, D_ENGAGE/d) placed camera-relative, and the camera near/far ramp
+## with altitude (CosmosScale). ZERO added bytes (§9: same far-ring mesh/nodes; only camera params + a per-frame
+## node-transform scale). REPLACES the rejected O1O4 §2.8 H_FARSWAP impostor-swap (SPACE-NAV R1). Flipped ON at
+## export after the AM remote-bridge screendiff proves the climb is pop-free (§10 SN3 live-only).
+const FP_SCALED_BODY := false
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
+## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
+## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the
+## RemoteBridge telemetry. Default FALSE ⇒ BYTE-IDENTICAL: the NavState is never created, CosmosNav is a
+## pure DEAD static, the HUD/telemetry are unchanged (nav_telemetry() returns {} ⇒ the guarded merge adds
+## nothing). The five modes are RE-EXPRESSIONS of the ONE SN1 f64 BCI state (§0.1) — a mode flip touches
+## NOTHING physical, so this flag adds zero per-frame allocation and cannot perturb the scene or state.
+const SN_NAV_MODES := false
+
+## COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7/§10) — the DEV-NAV master flag. When true, F enters
+## dev-nav (the mode-appropriate velocity-command flight controller + the overlay set) instead of the bare fly
+## toggle; the controller re-expresses the shipped fly input into the current nav frame (planetary hover tracks
+## the spinning surface, orbital hover station-keeps) and is SN-R1-seamless across mode boundaries. Default
+## FALSE ⇒ BYTE-IDENTICAL: F is the shipped bare fly toggle, no dev-flight controller runs, no overlay node is
+## created, CosmosDevFlight is a pure DEAD static. Requires SN_NAV_MODES (the controller reads the NavState).
+## NEVER-OOM: the controller is O(bytes) (no retained state — the caller owns [p,v]); the SN5b overlays are
+## lazy, reused, freed on toggle, hard-capped ≤ 64 KB (§9). The FEEL of flying + the LOOK of the overlays are
+## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
+## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
+const SN_DEVNAV := false
+
+## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
+## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
+## the shipped sun-elevation ramp: fog thins (fog_density = exp(−h/H_SCALE)), the sky lerps to BLACK as
+## space_mix rises (smoothstep 0.5·H_ATMO..2.5·H_ATMO), stars emerge (star_fade = max(night_fade, space_mix)),
+## ambient dims to AMBIENT_SPACE. On an airless body (has_atmo=false) space_mix≡1 ⇒ black starry sky at the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: _ramp_environment writes exactly the shipped day-night values
+## (fog_density stays 1.0, no altitude term is evaluated). Requires ORBITAL_SKY (the ramp lives in CosmosSky).
+## ZERO added bytes (O(1) Environment property writes/frame), NO shaders/materials — Environment props only.
+## Headless-PROVEN: the curve MATH + endpoints (G-SN-RAMP). LIVE-ONLY: the actual LOOK (limb, sunset legibility).
+const ATMO_VISUAL_RAMP := false
+
+## COSMOS SPACE-NAV SN4b (docs/COSMOS-SPACE-NAV-DESIGN.md §6.3) — the ANALYTIC SUN-OCCLUSION DIMMER. Without
+## shadow maps the DirectionalLight lights a player behind the planet; this dims light_energy to 0 when the
+## body occludes the sun (α between ŝ and −p̂ < asin(R_vox/|p|), soft ±0.005 rad penumbra). Pure f64, one
+## scalar/frame, ZERO bytes. Blended by altitude with the shipped elevation ramp (authority = space_mix(h)) so
+## exactly one driver owns any regime — at the surface the elevation ramp owns (light_energy stays 1.0), in
+## space the occlusion dimmer owns (night side dark from orbit). Airless bodies: occlusion owns from the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: light_energy is never written (stays the shipped 1.0). Gate
+## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
+const SN_SUN_OCCLUSION := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

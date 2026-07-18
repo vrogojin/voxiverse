@@ -2218,6 +2218,21 @@ func take_farring_events() -> Array:
 		return []
 	return _facet_ring.take_events()
 
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2): the planet centre in the current render
+## frame (the far-ring placement translation), for the SN3 driver to derive the camera distance/altitude. No
+## faceted ring (fallback / flat) ⇒ the origin. DEAD unless FP_SCALED_BODY is on (only main._process calls it).
+func planet_render_centre() -> Vector3:
+	if _facet_ring == null:
+		return Vector3.ZERO
+	return _facet_ring.render_centre()
+
+## COSMOS SPACE-NAV SN3 (§5.2): apply the scaled-body distance clamp to the far ring for this frame. No-op when
+## there is no faceted ring. Below D_ENGAGE this is byte-identical to the shipped placement (the clamp scale is
+## exactly 1). Called per frame by main._process under FP_SCALED_BODY only.
+func apply_scaled_body(cam: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.apply_scaled_placement(cam)
+
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets
 ## the accumulators — RemoteBridge samples it once per telemetry window so a 0.5 s snowfall spike is attributed as its own

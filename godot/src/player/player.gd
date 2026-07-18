@@ -18,6 +18,20 @@ signal aimed_voxel_changed(info: Dictionary)
 # on the editor class-cache (the FLM/FLB convention). Used as the type of `_frame` below.
 const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
 
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§10): preloaded kernels for the gated nav-frame
+# machine (same FLM/FLB convention — preload, not the global class-name). DEAD unless CubeSphere.SN_NAV_MODES.
+const _CosmosNavCls := preload("res://src/cosmos/cosmos_nav.gd")
+const _OrbitalStateCls := preload("res://src/cosmos/orbital_state.gd")
+const _DVCls := preload("res://src/cosmos/dvec3.gd")
+const _EphCls := preload("res://src/cosmos/cosmos_ephemeris.gd")
+const _FacetAtlasCls := preload("res://src/cosmos/facet_atlas.gd")
+# COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7): the dev-flight velocity-command controller (pure
+# static). DEAD unless CubeSphere.SN_DEVNAV drives it in-game; the trajectory MATH is headless-gated
+# (verify_dev_flight — G-SN-DEVFLIGHT). Same FLM/FLB preload convention.
+const _DevFlightCls := preload("res://src/cosmos/cosmos_dev_flight.gd")
+# COSMOS SPACE-NAV SN5b (§7.3): the dev-nav overlay set (compass + guides). Lazy-built on F, freed on toggle.
+const _DevNavOverlayCls := preload("res://src/player/dev_nav_overlay.gd")
+
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
 @export var fly_speed := 16.0
@@ -58,6 +72,34 @@ var frozen := false
 # from `world` in _ready; never null (a transparent identity adapter when the fixed frame is off / in Phase 1), so
 # all the maps are numeric no-ops → byte-identical to today. Phase 2 rotates the frame with zero call-site change.
 var _frame: _FrameAdapterCls
+
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): the nav-frame machine. `_nav` is NULL unless
+# CubeSphere.SN_NAV_MODES ⇒ the whole feed is dead (flag-off byte-identical). The machine READS the player's
+# body-centred BCI state each physics tick (derived from the shipped lattice `position` via the SN1 frame
+# maps) and re-expresses the HUD velocity — it never writes pos/vel (the §5.4 theorem). `_nav_tele` is the
+# additive RemoteBridge telemetry dict (nav_mode/frame_v/|v_bci|), surfaced via nav_telemetry().
+# LIVE-ONLY-VALIDATED (honest, per SN1's precedent): the KERNEL + machine are headless-gated (verify_nav), but
+# this in-game BCI derivation is validated only in a live session — the flag ships false until then.
+var _nav: RefCounted = null
+var _nav_clock := 0.0                         # local nav time (s); reused main's ORBITAL_SKY clock is not required
+var _nav_prev_fix := PackedFloat64Array()     # previous body-fixed world position (finite-difference velocity)
+var _nav_have_prev := false
+var _nav_tele: Dictionary = {}
+var _nav_last_v_bci := PackedFloat64Array()   # last derived BCI velocity (seeds dev-flight for a seamless handoff)
+
+# COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7): dev-nav state. `_dev_nav` (F under SN_DEVNAV) turns
+# dev-nav ON (rides `flying` — noclip + the mode-appropriate controller). In PLANETARY the shipped lattice fly
+# path is used UNCHANGED (§7.2); in the orbital modes the velocity-command controller (CosmosDevFlight) owns the
+# BCI velocity `_dev_v_bci` and re-projects the kinematic BCI position back to the lattice `position` each tick.
+# All DEAD with SN_DEVNAV off (F stays the shipped bare fly toggle → byte-identical). LIVE-ONLY-VALIDATED: the
+# in-game feel + the BCI↔lattice re-projection at altitude are a morning-session check; the controller MATH is
+# headless-proven by G-SN-DEVFLIGHT.
+var _dev_nav := false
+var _dev_v_bci := PackedFloat64Array()         # the controller's BCI velocity state (kinematic; owned while orbital)
+var _dev_have_v := false                        # false until seeded on the first orbital tick (from _nav_last_v_bci)
+var _dev_active := false                         # true on ticks the orbital controller drove position (feeds _nav_tick)
+var _dev_p_bci := PackedFloat64Array()          # last BCI position (stashed for the O/G key handlers)
+var _dev_overlay: Control = null                # the SN5b overlay set (compass + guides); null unless dev-nav on
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -115,6 +157,12 @@ func _ready() -> void:
 		# Flag off → near stays Godot's default 0.05 (byte-identical).
 		if CubeSphere.FP_TIER_DEPTH_BIAS:
 			_camera.near = TierPlace.CAMERA_NEAR
+		# SPACE-NAV SN3 (§5.4): the altitude-continuous frustum. At ground (h = 0) these are EXACTLY the shipped
+		# 0.05 / 9000 (byte-identical initial); the SN3 driver (main._process) ramps them per frame with altitude.
+		# Overrides the depth-bias 0.25 with the design's 0.05 near floor. DEAD unless FP_SCALED_BODY is on.
+		if CosmosScale.on():
+			_camera.near = CosmosScale.camera_near(0.0)
+			_camera.far = CosmosScale.camera_far(FacetAtlas.R_BLOCKS, FacetAtlas.R_BLOCKS)
 	else:
 		_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
@@ -155,6 +203,10 @@ func _ready() -> void:
 	add_child(crosshair)
 
 	_capture_mouse()
+
+	# COSMOS SPACE-NAV SN2: build the nav-frame machine ONLY under the flag (else it stays null ⇒ dead).
+	if CubeSphere.SN_NAV_MODES:
+		_nav = _CosmosNavCls.NavState.new()
 
 ## Set the initial facing (yaw about Y) and camera pitch. Call after the player
 ## is in the tree (the camera is built in _ready).
@@ -205,6 +257,15 @@ func set_render_camera(t: Transform3D) -> void:
 	if _camera != null:
 		_camera.global_transform = t
 
+## SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.4): ramp the camera near/far with altitude so the
+## climb to orbit stays C0 (no frustum pop) and the far plane always reaches the horizon tangent. h = radial
+## altitude, d = |camera − body_centre| (blocks). At h = 0 / d = R these are the shipped 0.05 / 9000. Called
+## per frame by main._process under FP_SCALED_BODY only; DEAD (never called) with the flag off.
+func apply_scaled_camera_planes(h: float, d: float) -> void:
+	if _camera != null:
+		_camera.near = CosmosScale.camera_near(h)
+		_camera.far = CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
+
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:
 		return
@@ -238,13 +299,24 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_ESCAPE:
 				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 			KEY_F:
-				flying = not flying
-				velocity = Vector3.ZERO
-				# Fly is a GUARANTEED escape hatch: while airborne the capsule is
-				# disabled so no loose body can collide with (and therefore shove or
-				# wedge) the player. Re-enabled on landing. See _move_horizontal.
-				if _body_shape != null:
-					_body_shape.disabled = flying
+				# COSMOS SPACE-NAV SN5 (§7.1): under SN_DEVNAV, F toggles DEV-NAV (the mode-appropriate flight
+				# controller + overlays) instead of the bare fly toggle. Flag OFF ⇒ the ELSE branch is the shipped
+				# fly toggle BYTE-IDENTICALLY (nothing about dev-nav is touched). See _toggle_dev_nav.
+				if CubeSphere.SN_DEVNAV:
+					_toggle_dev_nav()
+				else:
+					flying = not flying
+					velocity = Vector3.ZERO
+					# Fly is a GUARANTEED escape hatch: while airborne the capsule is
+					# disabled so no loose body can collide with (and therefore shove or
+					# wedge) the player. Re-enabled on landing. See _move_horizontal.
+					if _body_shape != null:
+						_body_shape.disabled = flying
+			KEY_O, KEY_G, KEY_R:
+				# COSMOS SPACE-NAV SN5b (§7.4): the dev-nav toggles. Live ONLY while dev-nav is engaged (F);
+				# otherwise inert (they carry no shipped binding). Flag off / not dev-nav ⇒ no-op.
+				if CubeSphere.SN_DEVNAV and _dev_nav and _nav != null:
+					_dev_toggle_key(event.keycode)
 
 func _physics_process(delta: float) -> void:
 	if frozen or world == null:
@@ -302,6 +374,182 @@ func _physics_process(delta: float) -> void:
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
 	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
 		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
+	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
+	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
+	if _nav != null:
+		_nav_tick(delta)
+
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
+## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world
+## coords are body-FIXED — the planet is pinned — so p_bci = R_z(θ)·p_fix; velocity is a finite difference of
+## the body-fixed world position mapped through fixed→bci), classifies with the 2-s dwell, and stores the
+## HUD/telemetry re-expression. Reads only; never writes pos/vel. Earth-only (the Moon is SN6). No-op off the
+## faceted planet (the nav machine's frame is the cosmos planet). LIVE-ONLY-VALIDATED — see the field comment.
+func _nav_tick(delta: float) -> void:
+	if not CubeSphere.FACETED:
+		return
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])                 # body-fixed (planet-pinned) world position, f64
+	_nav_clock += delta * _EphCls.TIME_WARP
+	var v_fix := _DVCls.v(0.0, 0.0, 0.0)
+	if _nav_have_prev and delta > 0.0:
+		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), 1.0 / delta)
+	var bci: Array = _OrbitalStateCls.fixed_to_bci("earth", _nav_clock, p_fix, v_fix)
+	var p_bci: PackedFloat64Array = bci[0]
+	# COSMOS SPACE-NAV SN5: when the dev-flight controller drove position THIS frame it OWNS the velocity —
+	# use its BCI velocity instead of the finite difference (which would just re-derive it, less precisely).
+	# Off dev-flight (SN2-only, or PLANETARY) this is exactly the shipped bci[1] finite-difference path.
+	var v_bci: PackedFloat64Array = _dev_v_bci if (_dev_active and _dev_have_v) else bci[1]
+	_nav.tick("earth", p_bci, v_bci, _nav_clock, delta)
+	_nav_prev_fix = p_fix
+	_nav_have_prev = true
+	_nav_last_v_bci = v_bci                                  # seed for the next orbital dev-flight handoff (SN5)
+	_dev_p_bci = p_bci                                       # stash for the O/G key handlers (SN5b)
+	_nav_tele = _CosmosNavCls.telemetry(_nav, "earth", p_bci, v_bci, _nav_clock)
+	# SN5b: refresh the compass strip from the camera forward re-expressed in BCI (spin axis = BCI +Z).
+	if _dev_overlay != null and _dev_overlay.is_built():
+		var rmag := _DVCls.length(p_bci)
+		if rmag > 0.0:
+			var rhat := _DVCls.scale(p_bci, 1.0 / rmag)
+			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
+			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
+			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
+
+## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
+## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
+func nav_telemetry() -> Dictionary:
+	return _nav_tele
+
+## COSMOS SPACE-NAV SN5 (§7.1): F toggled dev-nav. Dev-nav rides `flying` (noclip): entering disables the
+## capsule (the shipped fly escape-hatch semantics), leaving re-enables it. The controller's velocity seed is
+## dropped so the first orbital tick re-seeds from the live SN2 velocity. Only reachable under SN_DEVNAV.
+func _toggle_dev_nav() -> void:
+	_dev_nav = not _dev_nav
+	flying = _dev_nav
+	velocity = Vector3.ZERO
+	_dev_have_v = false
+	_dev_active = false
+	if _body_shape != null:
+		_body_shape.disabled = flying
+	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
+	if _dev_nav:
+		if _dev_overlay == null:
+			_dev_overlay = _DevNavOverlayCls.new()
+			add_child(_dev_overlay)
+			_dev_overlay.build(self, _FacetAtlasCls.R_BLOCKS)
+	elif _dev_overlay != null:
+		_dev_overlay.free_overlays()
+		_dev_overlay.queue_free()
+		_dev_overlay = null
+
+## True iff dev-nav is engaged (F under SN_DEVNAV). Read by the overlays (SN5b) and the HUD.
+func dev_nav_active() -> bool:
+	return _dev_nav
+
+## COSMOS SPACE-NAV SN5 (§7.2): the ORBITAL-mode dev-flight step. Reads the current lattice `position`, lifts it
+## to the BCI frame, runs the velocity-command controller (CosmosDevFlight — the SN-R1-seamless kernel proven by
+## G-SN-DEVFLIGHT), and re-projects the new kinematic BCI position back to the lattice `position`. The controller
+## OWNS `_dev_v_bci` while orbital (seeded from the last SN2 velocity on entry ⇒ seamless from the PLANETARY
+## lattice fly). LIVE-ONLY-VALIDATED: the BCI↔lattice re-projection is only meaningful while the player is
+## roughly over the active facet (a morning-session check); the controller math itself is headless-proven.
+func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		# Off-facet safety: fall back to the shipped lattice fly for this tick (never strand the player).
+		var vy0 := 0.0
+		if not remote_drive:
+			if Input.is_key_pressed(KEY_SPACE): vy0 += 1.0
+			if Input.is_key_pressed(KEY_CTRL): vy0 -= 1.0
+		var wish0 := (transform.basis * Vector3(input.x, 0, input.z))
+		wish0.y = 0.0
+		if wish0.length() > 0.0:
+			wish0 = wish0.normalized()
+		position += (wish0 + Vector3(0, vy0, 0)) * fly_speed * (2.0 if running else 1.0) * delta
+		velocity = Vector3.ZERO
+		return
+	var t := _nav_clock
+	# lattice → body-fixed world → BCI position (the SN1 frame maps; body coords are planet-pinned).
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	var mode := int(_nav.mode)
+	# Seed the controller's velocity on the first orbital tick from the last SN2-derived BCI velocity (seamless
+	# handoff from the PLANETARY lattice fly); if none is available yet, rest in the current frame (carrier).
+	if not _dev_have_v:
+		if _nav_last_v_bci.size() == 3:
+			_dev_v_bci = PackedFloat64Array([_nav_last_v_bci[0], _nav_last_v_bci[1], _nav_last_v_bci[2]])
+		else:
+			_dev_v_bci = _CosmosNavCls.carrier_velocity(mode, "earth", p_bci, _DVCls.v(0.0, 0.0, 0.0), t)
+		_dev_have_v = true
+	# Camera basis (window/lattice orientation) → BCI axis columns for the fully camera-relative wish.
+	var cb := window_camera_transform().basis
+	var cam_x := _dev_dir_to_bci(fid, t, cb.x)
+	var cam_y := _dev_dir_to_bci(fid, t, cb.y)
+	var cam_z := _dev_dir_to_bci(fid, t, cb.z)
+	# Vertical (Space/Ctrl) — camera-relative up/down, matching the shipped fly verbs.
+	var vy := 0.0
+	if remote_drive:
+		vy = input.y
+	else:
+		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
+		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+	var wish_bci := _DevFlightCls.wish_dir(cam_x, cam_y, cam_z, Vector3(input.x, vy, input.z))
+	var cap := _DevFlightCls.speed_cap(mode, "earth", p_bci, t, running)
+	var out: Array = _DevFlightCls.step(mode, "earth", p_bci, _dev_v_bci, t, delta, wish_bci, cap)
+	var p_new: PackedFloat64Array = out[0]
+	_dev_v_bci = out[1]
+	# BCI → body-fixed → lattice, and write it back as the player's canonical position.
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_new, _dev_v_bci)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	_horiz_vel = Vector3.ZERO
+	velocity = Vector3.ZERO
+	_dev_active = true                                       # tells _nav_tick the controller owns velocity this frame
+
+## COSMOS SPACE-NAV SN5: map a LATTICE direction to a BCI direction — frame_basis(fid) lifts it to the body-fixed
+## world frame, then the SN1 fixed→bci position map (R_z(θ)) rotates it into the inertial frame. Pure rotation
+## (no ω⃗×p term for a direction): the position component of fixed_to_bci is exactly R_z(θ)·d.
+func _dev_dir_to_bci(fid: int, t: float, d_lat: Vector3) -> PackedFloat64Array:
+	var wd := _FacetAtlasCls.frame_basis(fid) * d_lat
+	return _OrbitalStateCls.fixed_to_bci("earth", t, _DVCls.v(wd.x, wd.y, wd.z), _DVCls.v(0.0, 0.0, 0.0))[0]
+
+## COSMOS SPACE-NAV SN5b (§7.4): the O/G/R dev-nav toggles. Pure re-uses of the gated kernel math
+## (CosmosDevFlight.release_circular / geostationary_snap, CosmosNav.toggle_r_latch). O and G are explicit
+## user commands (allowed dev verbs), applied to the controller's BCI state; R flips the classifier's detach
+## latch. LIVE-ONLY: the resulting FEEL + the G teleport re-projection at altitude (morning). Only reached
+## under SN_DEVNAV while dev-nav is engaged (the key handler guards it).
+func _dev_toggle_key(keycode: int) -> void:
+	if _dev_p_bci.size() != 3:
+		return                                              # no BCI state yet (nav machine hasn't ticked)
+	var mode := int(_nav.mode)
+	var t := _nav_clock
+	var fid := TerrainConfig.active_facet()
+	match keycode:
+		KEY_R:
+			_nav.toggle_r_latch()                           # §7.4 R: latch DEEP_SPACE expression from HIGH_ORBIT
+		KEY_O:
+			# O — circular-orbit release (LOW/HIGH): set the controller velocity to the circular orbital velocity
+			# in the look-tangential direction. (True free-coast handoff to the ORBITAL integrator is live/SN1.)
+			if mode == _CosmosNavCls.LOW_ORBIT or mode == _CosmosNavCls.HIGH_ORBIT:
+				var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+				_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+				_dev_have_v = true
+		KEY_G:
+			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
+			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
+			if mode == _CosmosNavCls.HIGH_ORBIT and fid >= 0:
+				var snap := _DevFlightCls.geostationary_snap("earth", _dev_p_bci)
+				if snap.size() == 2:
+					var p_new: PackedFloat64Array = snap[0]
+					var v_new: PackedFloat64Array = snap[1]
+					var pf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_new, v_new)[0]
+					var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf[0], pf[1], pf[2])
+					position = Vector3(lat[0], lat[1], lat[2])
+					_dev_v_bci = v_new
+					_dev_have_v = true
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.
@@ -322,6 +570,18 @@ func _move(delta: float) -> void:
 
 	var running := remote_run if remote_drive else Input.is_key_pressed(KEY_SHIFT)
 	if flying:
+		# COSMOS SPACE-NAV SN5 (§7.2): under dev-nav, once the nav machine reads an ORBITAL frame (LOW/HIGH/
+		# DEEP/INTER) the velocity-command controller takes over — it owns the BCI velocity and re-projects the
+		# kinematic BCI position back to the lattice. In PLANETARY the shipped lattice fly below is used UNCHANGED
+		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
+		_dev_active = false
+		if _dev_nav and _nav != null and int(_nav.mode) != _CosmosNavCls.PLANETARY:
+			_dev_flight_move(delta, input, running)
+			return
+		# PLANETARY dev-nav (or the flag off) uses the shipped lattice fly below. Drop the controller's velocity
+		# seed so the next ORBITAL entry re-seeds from the fresh SN2-derived velocity (a seamless handoff).
+		if _dev_nav:
+			_dev_have_v = false
 		var speed := fly_speed * (2.0 if running else 1.0)
 		var vy := 0.0
 		if remote_drive:

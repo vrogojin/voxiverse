@@ -167,6 +167,17 @@ func _process(_delta: float) -> void:
 	else:
 		CosmosBend.set_camera(cam)                     # near field: the camera-centred bend (R1, bend path)
 
+	# SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.4): border continuity. Ramp the camera near/far
+	# with altitude and place the far ring under the angular-size-preserving distance clamp, so the atmosphere↔
+	# space border and the climb to orbit render with NO pop. Below D_ENGAGE the clamp scale is exactly 1 (near
+	# regime byte-identical). DEAD with FP_SCALED_BODY off. Independent of the camera-write above (near/far are
+	# separate properties from the camera transform), so it composes with the M5_REAL / bend paths untouched.
+	if CosmosScale.on() and CubeSphere.FACETED:
+		var centre := _player.world.planet_render_centre()
+		var d := cam.distance_to(centre)
+		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
+		_player.world.apply_scaled_body(cam)
+
 func _setup_environment() -> void:
 	var env := Environment.new()
 

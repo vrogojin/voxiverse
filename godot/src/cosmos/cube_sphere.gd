@@ -632,6 +632,33 @@ const ATMO_VISUAL_RAMP := false
 ## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
 const SN_SUN_OCCLUSION := false
 
+## COSMOS-LOD-SKY M1 (docs/COSMOS-LOD-SKY-DESIGN.md §2/§5/§9) — the multi-body distance-LOD SELECTION LAW.
+## When true, CosmosSky consults BodyLod each frame to classify every celestial body's presented tier
+## (POINT → IMPOSTOR → RING) from its angular size — relief_px = e_relief/d·K_px vs TAU_POP, ±25% hysteresis —
+## and logs each impostor↔ring handover under the G-SSE-INV sub-pixel no-pop discipline. M1 SELECTS + ACCOUNTS
+## only: the law's output for the real Sun/Moon at their true distances is IMPOSTOR (Sun e_relief=0 ⇒ impostor
+## forever; Moon relief_px≈0.23 px ≪ 1), so NO placement/mesh changes — the visible detail-on-approach needs
+## M2's per-body RING build (FP_MOON_RING, rides O4c). The BodyLod kernel is pure statics (no engine deps, no
+## alloc, caller owns the latched tier) and DEAD with this flag off ⇒ BYTE-IDENTICAL (FLAT 6035/0): the sky's
+## per-frame writes are untouched, no BodyLod call is made. NEVER-OOM: selection + byte bookkeeping only, no new
+## allocation — the 32 MB far-tier ceiling (N_RING_MAX=2 resident rings, dominant-exclusive dense/skin) is
+## ACCOUNTING the gate asserts, not new bytes. Requires ORBITAL_SKY (the consult lives in CosmosSky). Truth
+## gate: src/tools/verify_body_lod.gd (G-BODY-LOD / G-LOD-CEILING / G-LOD-NOPOP).
+const FP_BODY_LOD := false
+
+## COSMOS-LOD-SKY M1 — the D_SKY O3 revisit (docs/COSMOS-LOD-SKY-DESIGN.md §1/§11, cosmos_sky.gd:26). The sky
+## impostor/star-dome placement radius CosmosSky.D_SKY = 8000 was sized for R = 3072 (2.6·R); after the rescale
+## to R = 6371 it sits at only 1.26·R — too close to the planet — and its literal value no longer tracks the
+## far clip. When true, CosmosSky uses CosmosSky.d_sky_derived() = CAMERA_FAR·SKY_FAR_MARGIN/STAR_DOME_MULT
+## (≈ 8143): as far OUTSIDE the planet as the 9000-block camera far clip allows, with the star dome (radius
+## D·1.05) fully inside the clip by a stated margin — derived from CAMERA_FAR so it can never clip and tracks
+## any future far-plane change. Default FALSE ⇒ BYTE-IDENTICAL: CosmosSky keeps the shipped literal 8000
+## everywhere (placement + star mesh). Requires ORBITAL_SKY. Gate: the D_SKY section of verify_body_lod.gd
+## (impostor outside R, star dome inside the far clip). NOTE: at R=6371 with a 9000 far clip the impostor
+## CANNOT be a large multiple of R (the far plane boxes it at ≤ 1.35·R); raising that further is a CAMERA_FAR
+## change, out of M1 scope — the gate asserts the derived value clears R and flags loudly if R ever approaches it.
+const FP_SKY_DSKY_R := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

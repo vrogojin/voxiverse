@@ -26,8 +26,28 @@ const EPH := preload("res://src/cosmos/cosmos_ephemeris.gd")
 ## O3 (R = 6371) revisits this; O0 targets the shipped R = 3072.
 const D_SKY := 8000.0
 
+## COSMOS-LOD-SKY M1 — the D_SKY O3 revisit (§1/§11). The star dome is a sphere of radius D·STAR_DOME_MULT
+## (built in _build_nodes), so the binding constraint is that the DOME stay inside the camera far clip
+## (FacetFarRing.CAMERA_FAR = 9000). SKY_FAR_MARGIN keeps the dome edge a stated fraction inside the clip;
+## the impostor then sits as far OUTSIDE the planet as that allows. Both are used ONLY when FP_SKY_DSKY_R is
+## on (via _dsky); with the flag off the shipped literal 8000 is used everywhere and 8000·1.05 = 8400 is the
+## byte-identical shipped star-dome radius.
+const STAR_DOME_MULT := 1.05      # star dome radius = D_SKY · this (matches the _build_nodes 1.05 / 2.1 literals)
+const SKY_FAR_MARGIN := 0.95      # keep the star dome edge ≤ 95% of the camera far clip (headroom inside the plane)
+
+## The R-rescale-safe sky placement radius (blocks): as far out as the far clip allows with the star dome
+## fully inside it. Derived from FacetFarRing.CAMERA_FAR so it tracks the far plane and can never clip. At
+## CAMERA_FAR=9000 this is 9000·0.95/1.05 ≈ 8143 (dome edge 8550 < 9000; 1.28·R, outside the planet). Pure math.
+static func d_sky_derived() -> float:
+	return FacetFarRing.CAMERA_FAR * SKY_FAR_MARGIN / STAR_DOME_MULT
+
 ## The observer body whose body-fixed frame is the scene frame (the dominant body). O0 = Earth.
 const OBSERVER := "earth"
+
+## COSMOS-LOD-SKY M1 (FP_BODY_LOD) — a placeholder camera vertical fov (deg) for the per-frame BodyLod K_px
+## consult. M1 only SELECTS the tier (always IMPOSTOR for the real Sun/Moon), so the exact fov is immaterial;
+## the real live fov (and its zoom) is M4 (FP_TELESCOPE). Used only inside the FP_BODY_LOD-gated consult.
+const LOD_NOMINAL_FOV_DEG := 70.0
 
 var _clock: EPH.CosmosClock = null
 var _env: Environment = null
@@ -39,6 +59,13 @@ var _moon: MeshInstance3D = null
 var _stars: MeshInstance3D = null
 var _moon_mat: StandardMaterial3D = null
 var _star_mat: ShaderMaterial = null
+
+## The active sky placement radius (blocks), resolved ONCE in _build_nodes: the derived R-safe value under
+## FP_SKY_DSKY_R, else the shipped literal D_SKY (byte-identical). Everything downstream reads this, never D_SKY.
+var _dsky := D_SKY
+## COSMOS-LOD-SKY M1 (FP_BODY_LOD) — the per-body latched LOD tier (caller-owned state; the BodyLod kernel is
+## stateless). Populated only while FP_BODY_LOD is on; empty otherwise (the consult never runs ⇒ byte-identical).
+var _lod_tier := {}
 
 ## BLACK-SKY FIX: the additive procedural starfield for the dome (see _build_nodes). `blend_add` +
 ## `depth_draw_never` are what stop it occluding the ramped Environment background (the original
@@ -172,6 +199,10 @@ func setup(clock: EPH.CosmosClock, env: Environment = null, cam_provider: Node =
 	_update_sky(0.0 if _clock == null else _clock.now())
 
 func _build_nodes() -> void:
+	# Resolve the sky placement radius ONCE (the flag is a compile-time const, so this never changes at runtime).
+	# FP_SKY_DSKY_R off ⇒ the shipped literal 8000 ⇒ every downstream value is byte-identical to shipped.
+	_dsky = d_sky_derived() if CubeSphere.FP_SKY_DSKY_R else D_SKY
+
 	# --- Sun impostor: emissive smooth sphere (explicitly NON-voxel, D8: environmental, never a place).
 	_sun = MeshInstance3D.new()
 	_sun.name = "Sun"
@@ -233,8 +264,8 @@ func _build_nodes() -> void:
 	_stars = MeshInstance3D.new()
 	_stars.name = "StarDome"
 	var star_mesh := SphereMesh.new()
-	star_mesh.radius = D_SKY * 1.05
-	star_mesh.height = D_SKY * 2.1
+	star_mesh.radius = _dsky * STAR_DOME_MULT
+	star_mesh.height = _dsky * STAR_DOME_MULT * 2.0
 	star_mesh.radial_segments = 24
 	star_mesh.rings = 12
 	_stars.mesh = star_mesh
@@ -274,14 +305,14 @@ func _update_sky(t: float) -> void:
 
 	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter.
 	var sun_ang := EPH.angular_diameter("sun", OBSERVER, t)
-	_place_impostor(_sun, cam_origin + sun_dir * D_SKY, D_SKY * tan(sun_ang * 0.5))
+	_place_impostor(_sun, cam_origin + sun_dir * _dsky, _dsky * tan(sun_ang * 0.5))
 
 	# Moon impostor: body-fixed direction from Earth, exact angular size, lit by the shared light.
 	var moon_dir := EPH.dir_to_bodyfixed(OBSERVER, "moon", t)
 	if moon_dir == Vector3.ZERO:
 		moon_dir = Vector3(-1.0, 0.0, 0.0)
 	var moon_ang := EPH.angular_diameter("moon", OBSERVER, t)
-	_place_impostor(_moon, cam_origin + moon_dir * D_SKY, D_SKY * tan(moon_ang * 0.5))
+	_place_impostor(_moon, cam_origin + moon_dir * _dsky, _dsky * tan(moon_ang * 0.5))
 
 	# Star dome: centred on the camera, rotated by −Earth spin (the stars wheel as the planet turns).
 	var spin := EPH.spin_angle(OBSERVER, t)
@@ -290,6 +321,12 @@ func _update_sky(t: float) -> void:
 
 	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up).
 	_ramp_environment(sun_dir, cam_origin)
+
+	# COSMOS-LOD-SKY M1 (FP_BODY_LOD): consult the multi-body LOD selection law + log any impostor↔ring
+	# handover. SELECTION ONLY — no placement/mesh change (the real Sun/Moon stay IMPOSTOR by the law), so the
+	# impostor writes above are unchanged. Fully inside the flag guard ⇒ byte-identical with the flag off.
+	if CubeSphere.FP_BODY_LOD:
+		_update_body_lod(t, cam_origin)
 
 ## Drive the Environment background/ambient from the Sun's elevation. Elevation = sun_dir · up, where
 ## up is the radial direction at the camera (planet centre = origin under the fixed frame). Night (sun
@@ -367,3 +404,30 @@ func _looking_along(fwd: Vector3, origin: Vector3) -> Transform3D:
 func _place_impostor(mi: MeshInstance3D, pos: Vector3, radius: float) -> void:
 	var r := maxf(radius, 0.001)
 	mi.transform = Transform3D(Basis().scaled(Vector3(r, r, r)), pos)
+
+## COSMOS-LOD-SKY M1 (FP_BODY_LOD) — the per-frame LOD SELECTION consult (§2). For each celestial body,
+## classify its presented tier from the angular-size law (relief_px vs TAU_POP, latched ±25% hysteresis) and
+## print the G-SSE-INV handover line on a tier change. SELECTION ONLY: the real Sun (e_relief=0) and Moon
+## (relief_px ≈ 0.23 px at its true distance) both resolve to IMPOSTOR, so nothing above changes — the actual
+## per-body RING build + placement is M2. Called only under the flag (see _update_sky); zero cost off.
+func _update_body_lod(t: float, _cam_origin: Vector3) -> void:
+	var kpx := BodyLod.k_px(_viewport_h_px(), deg_to_rad(LOD_NOMINAL_FOV_DEG))
+	for body in ["sun", "moon"]:
+		var d := EPH.distance_between(OBSERVER, body, t)
+		var r := EPH.radius_of(body)
+		var e := BodyLod.e_relief_of(body)
+		var prev := int(_lod_tier.get(body, BodyLod.POINT))
+		var next := BodyLod.tier_hyst(prev, r, e, d, kpx)
+		if next != prev:
+			print(BodyLod.transition_log(body, prev, next, d, BodyLod.relief_px(e, d, kpx)))
+			_lod_tier[body] = next
+
+## Device-px viewport height for the K_px consult, read defensively (this runs only under FP_BODY_LOD, never
+## in the headless sky gate). Falls back to a 1080p nominal when no viewport is available.
+func _viewport_h_px() -> float:
+	var vp := get_viewport()
+	if vp != null:
+		var h := vp.get_visible_rect().size.y
+		if h > 1.0:
+			return h
+	return 1080.0

@@ -141,7 +141,13 @@ func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
 	transform = _placement_xform()   # rigid re-place (cheap); identity under FP-FIXED-FRAME (no re-place)
 	_recompute_sticky()              # TIER-DEPTH P1: grow the sticky set to the NEW active's ring-1 (no-op with the flag off)
-	_pending = true
+	# COSMOS-ORBITAL-SHELL live fix: in orbit the emitted set is CAMERA-axis-driven (not active-facet-driven), and the
+	# mesh is absolute (the transform re-place above already follows the new active facet), so a facet crossing does
+	# NOT change the emitted set — its _pending would force a redundant full rebuild every ~3 frames as the active
+	# facet churns under the orbit ground-track. Skip it off-surface; the camera driver re-emits on real drift. On the
+	# surface / flag-off _shell_orbit() is false ⇒ the shipped deferred re-emit fires exactly as today (byte-identical).
+	if not _shell_orbit():
+		_pending = true
 
 ## FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §1.4/§2.2 step 8): the ring mesh is built in ABSOLUTE planet
 ## coords. When the fixed frame pins the scene @ the absolute frame (PlanetRoot @ identity) this node stays @
@@ -312,7 +318,7 @@ func _process(_dt: float) -> void:
 	# else the shipped active-facet normal + BACK_CULL (byte-identical). Both _warm_front and the rebuild's
 	# visible_fids() consume THIS pair, so the warmed set and the emitted set can never disagree.
 	var p := _cull_params()
-	if _cam_set and not _emit_floored_last:
+	if _shell_orbit():
 		# COSMOS-ORBITAL-SHELL S1b (§3): TRUE ORBIT — progressive cached-subset emit. Never block the whole rebuild on
 		# the ~1900-facet cap being cached in ONE frame (impossible under web ×25 warm cost → the live far-side stall).
 		# Warm cumulatively under budget, emit the cache-ready subset now, re-emit as coverage grows (throttled by
@@ -352,6 +358,17 @@ func _cull_params() -> Array:
 	if _cam_set:
 		return [_emit_axis, _emit_cos]
 	return [FacetAtlas.facet_normal64(_active_fid), BACK_CULL]
+
+## COSMOS-ORBITAL-SHELL (live fix 2026-07-19): the TRUE-ORBIT regime — the camera-set law engaged AND off-surface
+## (not floored). Off-surface there is NO near voxel field over the ground under the camera (the near disk sits at
+## the player's FLIGHT altitude, hundreds of blocks up, not on the ground), so the "backstop" role (sunk, meant to
+## hide BEHIND near voxels) and the active/`_excluded` EXCLUSION (near voxels own that facet) are both WRONG here:
+## they leave a HOLE at the sub-camera facet that SWEEPS as the active facet churns (~1 facet / 3 frames in orbit) —
+## the live "facets under me disappear" flicker. In this regime the shell OWNS the sub-camera facet, drawn as a
+## regular coarse facet from the prewarm-filled coarse cache (always ready ⇒ no warm hole; un-sunk ⇒ true surface).
+## Byte-identical off (flag off ⇒ `_cam_set` false) and on the surface (floored ⇒ shipped exclusion / backstop).
+func _shell_orbit() -> bool:
+	return _cam_set and not _emit_floored_last
 
 ## COSMOS-PERF STEP 2: whether the off-main-thread rebuild path is live (flag on AND real background workers exist —
 ## a single-core build has no worker to flip is_task_completed, so it must fall back to the synchronous rebuild).
@@ -468,9 +485,13 @@ func _front_visible(fid: int, nrm: Array, thresh: float) -> bool:
 	# LONGER skipped — they are drawn as sunk "backstop" facets (see _is_backstop / _emit_cached) so the near-disk
 	# annular hole is filled. Only the back-hemisphere cull remains. With the flag off, the shipped exclusions apply
 	# verbatim (byte-identical: active + `_excluded` absent from the visible set).
-	if not CubeSphere.FP_FARRING_FULL_COVER:
+	# COSMOS-ORBITAL-SHELL live fix: the active/`_excluded` skip is a SURFACE assumption (near voxels cover those
+	# facets). OFF-SURFACE (_shell_orbit) there are no near voxels over the ground under the camera, so skipping them
+	# leaves a sweeping hole — the shell must draw the sub-camera facet. So the skip applies only on the surface /
+	# flag-off (byte-identical). Under FULL_COVER the skip is already bypassed (they draw as backstops on the surface).
+	if not CubeSphere.FP_FARRING_FULL_COVER and not _shell_orbit():
 		if fid == _active_fid:
-			return false                 # the near voxel world already covers the active facet
+			return false                 # the near voxel world already covers the active facet (surface only)
 		if _excluded.has(fid):
 			return false                 # FP-R0 SPIKE: drawn as a real rotated voxel terrain, not a flat quad
 	var cd := _centre_dir(fid)
@@ -481,6 +502,12 @@ func _front_visible(fid: int, nrm: Array, thresh: float) -> bool:
 ## BACKSTOP_CELLS and sunk radially by BACKSTOP_SINK at emit; every other front-hemisphere facet keeps its exact shipped
 ## CELLS geometry. Role is decided at emit time (keyed by the current active/excluded state), never baked into a cache.
 func _is_backstop(fid: int) -> bool:
+	# COSMOS-ORBITAL-SHELL live fix: OFF-SURFACE (_shell_orbit) there are no near voxels to sink behind, and the dense
+	# backstop cache churns/holes as the active facet sweeps in orbit. Draw the sub-camera facet as a regular coarse
+	# facet instead (coarse cache is prewarm-filled ⇒ never a warm hole; un-sunk ⇒ true surface). On the surface /
+	# flag-off _shell_orbit() is false ⇒ the shipped backstop set (active ∪ `_excluded` ∪ `_sticky`), byte-identical.
+	if _shell_orbit():
+		return false
 	return fid == _active_fid or _excluded.has(fid) or _sticky.has(fid)
 
 ## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded

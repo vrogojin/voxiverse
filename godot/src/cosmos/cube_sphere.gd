@@ -543,6 +543,38 @@ const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates 
 ## node-transform scale). REPLACES the rejected O1O4 §2.8 H_FARSWAP impostor-swap (SPACE-NAV R1). Flipped ON at
 ## export after the AM remote-bridge screendiff proves the climb is pop-free (§10 SN3 live-only).
 const FP_SCALED_BODY := false
+
+## COSMOS ORBITAL-SHELL S1 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3) — drive the far-ring emitted set from the
+## CAMERA radial direction instead of the player's active-facet normal, so the WHOLE visible cap renders from
+## orbit (fixing the "far hemisphere blank from space" bug). The shipped ring emits only the hemisphere around
+## `_active_fid`'s normal and refreshes it only on surface crossings; off-surface the radial direction drifts
+## across facets with NO crossing fired, so the emitted hemisphere stays pinned near the departure region and the
+## far side is simply ABSENT from the mesh (facet_far_ring.gd:291-302 / world_manager.gd:2117-2122). When true,
+## the emit cull axis becomes ĉ = normalize(camera − body_centre) (ABSOLUTE planet space) with an altitude-derived
+## cap θ_emit = min(arccos(R/d) + SHELL_RELIEF_DEG + SHELL_SLACK_DEG, SHELL_CAP_MAX_DEG), re-emitted (via the
+## EXISTING deferred-warm + async-build + single-swap pipeline, verbatim — no new mesh/build path) when ĉ drifts
+## past SHELL_SLACK_DEG − 2° or θ_h shifts > 5°. A SURFACE FLOOR keeps θ_emit ≥ 90° below OFFSURFACE_Y, so the
+## on-foot regime is byte-VISUALLY identical to shipped (the facets that then differ from the active-facet law all
+## sit behind the limb, occluded by the planet body). This is a POLICY change only: no second globe/representation,
+## the same absolute vertex-coloured merged mesh, ONE draw call. Worst emitted mesh at the 96° cap ≈ 61 k tris /
+## 7.3 MB (Δ ≤ +0.7 MB over the shipped hemisphere) — NEVER-OOM: capped by θ_cap, flat vs time/altitude. Default
+## OFF ⇒ the shipped active-facet law runs verbatim, byte-identical (FLAT 6035/0). Requires FACETED. The full
+## altitude range above h ≈ 6.3 k also needs FP_SCALED_BODY (SN3 near/far ramp); S1 is standalone-correct below.
+## Flipped ON at export after the live orbit re-fly. Truth gate: src/tools/verify_shell.gd.
+const FP_SHELL_CAMERA_SET := false
+const SHELL_RELIEF_DEG := 8.0     # relief margin: terrain of height h pokes past the limb by ≈ √(2h/R); 8° covers ≥ 30-block relief
+const SHELL_SLACK_DEG := 15.0     # drift slack: re-emits are scheduled (fired at SLACK − 2° = 13°), not reactive, so the old set still contains the visible cap until the new build lands
+const SHELL_CAP_MAX_DEG := 96.0   # emit cap ceiling (facet-centre test grants ~half-facet slop like BACK_CULL = 0); 105° is the pre-approved limb fallback
+
+## COSMOS ORBITAL-SHELL S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §4/§9) — a ONE-SHOT background whole-planet warm of
+## the far-ring COARSE cache (all 6·K² facets) once sustained off-surface, so passing over a never-visited longitude
+## from orbit is a pure cached emit + async build (no warm lag). Fills ONLY the same fid-keyed _pos_cache/_col_cache
+## the ring already uses (hard cap 6·K² ≈ 2.4 MB — a ceiling already reachable by circumnavigating on foot; the shell
+## reaches it in one orbit), never a parallel store, under the existing WARM_BUDGET_MS per frame, strictly once per
+## session (a cursor). Default OFF ⇒ never armed, byte-identical (FLAT 6035/0). Requires FACETED. Depends on S1 only.
+const FP_SHELL_PREWARM := false
+const SHELL_PREWARM_DWELL_S := 5.0   # seconds sustained above OFFSURFACE_Y before the one-shot warm arms (ignores a brief pop above the ceiling)
+
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
 ## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the

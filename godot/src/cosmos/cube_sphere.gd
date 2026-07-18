@@ -552,6 +552,18 @@ const FP_SCALED_BODY := false
 ## NOTHING physical, so this flag adds zero per-frame allocation and cannot perturb the scene or state.
 const SN_NAV_MODES := false
 
+## COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7/§10) — the DEV-NAV master flag. When true, F enters
+## dev-nav (the mode-appropriate velocity-command flight controller + the overlay set) instead of the bare fly
+## toggle; the controller re-expresses the shipped fly input into the current nav frame (planetary hover tracks
+## the spinning surface, orbital hover station-keeps) and is SN-R1-seamless across mode boundaries. Default
+## FALSE ⇒ BYTE-IDENTICAL: F is the shipped bare fly toggle, no dev-flight controller runs, no overlay node is
+## created, CosmosDevFlight is a pure DEAD static. Requires SN_NAV_MODES (the controller reads the NavState).
+## NEVER-OOM: the controller is O(bytes) (no retained state — the caller owns [p,v]); the SN5b overlays are
+## lazy, reused, freed on toggle, hard-capped ≤ 64 KB (§9). The FEEL of flying + the LOOK of the overlays are
+## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
+## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
+const SN_DEVNAV := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

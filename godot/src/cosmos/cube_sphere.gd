@@ -619,6 +619,30 @@ const FP_CROSS_KEEP_HEADING := false
 ## (decision/regime/gravity/continuity, headless). Live-only: the FEEL of the seamless climb + the fall.
 const SN_NO_CEILING_BOUNCE := false
 
+## SN-BRAKE (2026-07-18, live pilot "fell F-off from orbit at ~141 m/s → generation storm on landing";
+## docs/COSMOS-SPACE-NAV-DESIGN.md §6 / COSMOS-ORBITAL-O1O4-DESIGN.md §2.6). ATMOSPHERIC DESCENT BRAKING: a
+## craft entering the atmosphere fast decelerates toward a low terminal velocity BEFORE it reaches the surface,
+## so the descent never outruns terrain streaming (the fast landing was outrunning the generator). The SN1 drag
+## law a_drag = −k(h)·|v|·v, k(h) = k0·exp(−h/DRAG_H_SCALE) (density ~0 at ATMO_TOP, max at h=0), is applied to
+## the DESCENT vertical velocity on the below-ATMO_TOP surface-frame path (where the F-off fall velocity is
+## handed to velocity.y). k0 = datum_gravity(body)/ATMO_BRAKE_TERMINAL² ⇒ terminal == ATMO_BRAKE_TERMINAL for
+## ANY body (per-body generic — reads the dominant body, NOT a hardcoded Earth). ABOVE ATMO_TOP: NO drag (the
+## planet-centred free-fall owns space, unchanged). Continuous at 384 (density ≈ 0 there ⇒ no jump). SEPARATE
+## from the ORBITAL integrator's own DRAG_TERMINAL (that drag is untouched). Default FALSE ⇒ BYTE-IDENTICAL:
+## no brake term is evaluated, the shipped surface walk is byte-for-byte. Requires FACETED. Gate G-SN-BRAKE
+## (braked-to-terminal / density profile / no-drag-above-384 / per-body, headless). LIVE-ONLY: that streaming
+## actually keeps up (no storm) needs a live re-fly — the gate proves the descent is braked, not that the
+## generator wins. Follow-up if braking alone is insufficient: pre-generate the landing column during the fall.
+const SN_ATMO_BRAKING := false
+## SN-BRAKE descent terminal speed (blocks/s) — the speed a re-entry brakes to below ATMO_TOP. Chosen
+## CONSERVATIVE at 25: the historical stream-supply floor is ~23–35 blocks/s (pre-C++-port generator;
+## voxiverse-streaming-supply-demand). A fast re-entry ASYMPTOTES to this terminal FROM ABOVE (the 384-block
+## band is not deep enough to fully relax 141→25, so the in-game arrival lands ~1 above terminal, ≈26 b/s under
+## the feel-g the surface walk integrates) — 25 keeps that arrival comfortably INSIDE the supply band with
+## margin, and well under half the orbital DRAG_TERMINAL (55). Single named const — dial live (lower if a re-fly
+## still storms; raise toward 55 once a pre-gen landing column removes the streaming constraint).
+const ATMO_BRAKE_TERMINAL := 25.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

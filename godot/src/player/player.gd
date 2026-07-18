@@ -475,6 +475,14 @@ func radial_altitude() -> float:
 			return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - _FacetAtlasCls.R_BLOCKS
 	return position.y
 
+## SN-BRAKE (per-body generic, architectural): the dominant body whose atmosphere/gravity the local descent
+## physics reads. Today the only walkable body is Earth (the faceted planet), so this returns "earth"; when the
+## O4a multi-body atlas lands this is the ONE place that resolves the active dominant body — the drag/gravity
+## kernels already take `body`, so generalizing is a single change here (the shipped free-fall/_fall_exit_vy
+## literals stay "earth" until that lands). Kept a method so the SN-BRAKE caller never hardcodes the body.
+func _dominant_body() -> String:
+	return "earth"
+
 ## COSMOS SPACE-NAV SN5 (§7.1): F toggled dev-nav. Dev-nav rides `flying` (noclip): entering disables the
 ## capsule (the shipped fly escape-hatch semantics), leaving re-enables it. The controller's velocity seed is
 ## dropped so the first orbital tick re-seeds from the live SN2 velocity. Only reachable under SN_DEVNAV.
@@ -850,6 +858,19 @@ func _move(delta: float) -> void:
 	# FP-FIXED-FRAME (§2.3): `velocity` stays our own LATTICE bookkeeping (never fed to move_and_slide), so gravity
 	# integration and the vertical floor/ceiling scans all run on the LOCAL (lattice) y — byte-identical at identity.
 	velocity.y -= gravity * delta
+	# SN-BRAKE (§6): atmospheric DESCENT braking. Below ATMO_TOP a fast re-entry (the F-off free-fall velocity
+	# handed to velocity.y at 384) decelerates toward ATMO_BRAKE_TERMINAL under the density-profiled SN1 drag,
+	# so the descent never outruns terrain streaming (the fix for the ~141 m/s landing generation storm).
+	# DESCENT-ONLY (velocity.y < 0) so a jump's rise is untouched; per-body via _dominant_body() (no hardcoded
+	# Earth); the drag impulse is sign-clamped so drag alone can slow the fall to rest but never flips it upward
+	# (semi-implicit stability under a big post-hitch dt). Density ≈ 0 at 384 ⇒ continuous with the space
+	# free-fall (which owns h ≥ 384 with NO drag). Flag off / FLAT / airless ⇒ no term ⇒ byte-identical.
+	if CubeSphere.SN_ATMO_BRAKING and CubeSphere.FACETED and velocity.y < 0.0:
+		var a_brake := _OrbitalStateCls.atmo_brake_accel(_dominant_body(), radial_altitude(), velocity.y)
+		var dvy := a_brake * delta
+		if dvy > -velocity.y:                                # never decelerate past a standstill from drag alone
+			dvy = -velocity.y
+		velocity.y += dvy
 	var prev_head_y := position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
 	position.y += velocity.y * delta
 

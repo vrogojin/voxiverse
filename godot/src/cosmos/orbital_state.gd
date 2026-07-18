@@ -319,6 +319,35 @@ static func atmos_drag_bci(body: String, p_bci: PackedFloat64Array, v_bci: Packe
 	return DV.scale(v_air, -k * speed)
 
 # ---------------------------------------------------------------------------------------
+# SN-BRAKE (§6 / O1O4 §2.6) — atmospheric DESCENT braking. DISTINCT from the orbital integrator's own
+# atmos_drag_bci above: this brakes the below-ATMO_TOP SURFACE-frame descent (velocity.y) to a low
+# ATMO_BRAKE_TERMINAL so a fast re-entry cannot outrun terrain streaming. Same density law
+# k(h) = k0·exp(−h/DRAG_H_SCALE); k0 keyed to datum_gravity(body) so the descent settles to
+# ATMO_BRAKE_TERMINAL for ANY body (per-body generic — reads `body`, no hardcoded Earth constant).
+# Airless body or h > ATMO_TOP ⇒ k=0 (no drag: the space free-fall owns that band). Pure statics.
+# ---------------------------------------------------------------------------------------
+
+## The atmospheric-brake drag coefficient k(h) (1/blocks) for `body` at radial altitude `h`:
+## k0·exp(−h/DRAG_H_SCALE), k0 = datum_gravity(body)/ATMO_BRAKE_TERMINAL². Zero for an airless body or
+## above ATMO_TOP (space). Density signature: MAX at h=0, ≈0 at h=ATMO_TOP. Reads datum_gravity(body) so
+## the coefficient — hence the terminal balance — is per-body, never a hardcoded Earth value.
+static func atmo_brake_k(body: String, h: float) -> float:
+	if not has_atmo(body):
+		return 0.0
+	if h > CubeSphere.ATMO_TOP:
+		return 0.0
+	var k0 := GRAV.datum_gravity(body) / (CubeSphere.ATMO_BRAKE_TERMINAL * CubeSphere.ATMO_BRAKE_TERMINAL)
+	return k0 * exp(-h / DRAG_H_SCALE)
+
+## The signed vertical brake acceleration (blocks/s²) opposing a vertical speed `vy` at altitude `h`:
+## a = −k(h)·|vy|·vy. Descent (vy<0) ⇒ a>0 (upward, decelerating the fall). At the terminal balance
+## (vy = −ATMO_BRAKE_TERMINAL, h=0) |a| == datum_gravity(body) so it exactly cancels the fall gravity ⇒
+## the descent settles to ATMO_BRAKE_TERMINAL. Pure.
+static func atmo_brake_accel(body: String, h: float, vy: float) -> float:
+	var k := atmo_brake_k(body, h)
+	return -k * abs(vy) * vy
+
+# ---------------------------------------------------------------------------------------
 # Conserved-quantity accessors (for gates / HUD).
 # ---------------------------------------------------------------------------------------
 

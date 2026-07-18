@@ -48,9 +48,9 @@ func _initialize() -> void:
 	FA.warm_up()
 	var active := FA.spawn_facet()
 	TerrainConfig.set_active_facet(active)
-	print("  flags: STICKY=%s ENVELOPE=%s DEPTH_BIAS=%s | active=%d near=%d BACKSTOP_SINK=%.1f CELLS=%d sink_now=%.2f" % [
+	print("  flags: STICKY=%s ENVELOPE=%s DEPTH_BIAS=%s | active=%d near=%d SINK_FRAC=%.2f CELLS=%d sink_now=%.2f" % [
 		str(CubeSphere.FP_TIER_STICKY_BACKSTOP), str(CubeSphere.FP_TIER_ENVELOPE), str(CubeSphere.FP_TIER_DEPTH_BIAS),
-		active, TerrainConfig.near_render_radius(), CubeSphere.BACKSTOP_SINK, CubeSphere.BACKSTOP_CELLS, TierPlace.backstop_sink()])
+		active, TerrainConfig.near_render_radius(), CubeSphere.BACKSTOP_SINK_FRAC, CubeSphere.BACKSTOP_CELLS, TierPlace.backstop_sink()])
 	_gate_envelope(active)
 	_gate_sticky(active)
 	_gate_depth_bias(active)

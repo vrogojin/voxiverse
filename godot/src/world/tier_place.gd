@@ -46,11 +46,16 @@ static func envelope_on() -> bool:
 static func depth_bias_on() -> bool:
 	return CubeSphere.FP_TIER_DEPTH_BIAS
 
-## The radial sink (blocks) applied to backstop vertices at emit. Under the envelope the constant 6-block
-## sink collapses to the small ε guard (the envelope already carries the lower-bound in the vertex height);
-## otherwise it is the shipped BACKSTOP_SINK. This is the ONE site the sink value is decided.
+## The radial sink (blocks) applied to backstop vertices at emit. Under the envelope the sink collapses to the
+## small ε guard (the envelope already carries the lower-bound in the vertex height); otherwise it is DERIVED
+## from facet geometry — BACKSTOP_SINK_FRAC × the facet cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge
+## = (π/2·R)/K) — so it scales with R and never goes stale on a rescale (clears the coarse-grid chord error at
+## any radius; ≈ 6 at R=3072, ≈ 13 at R=6371). This is the ONE site the sink value is decided.
 static func backstop_sink() -> float:
-	return ENV_EPS_G if envelope_on() else CubeSphere.BACKSTOP_SINK
+	if envelope_on():
+		return ENV_EPS_G
+	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	return CubeSphere.BACKSTOP_SINK_FRAC * cell
 
 ## P3: the window-space depth-bias uniform value for tier `k` quanta = 2·k·2⁻²⁴ (POSITION.z += bias·w).
 static func bias_for_k(k: int) -> float:

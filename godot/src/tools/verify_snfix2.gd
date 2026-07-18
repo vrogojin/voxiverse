@@ -24,6 +24,8 @@ const NAV := preload("res://src/cosmos/cosmos_nav.gd")
 const DEVF := preload("res://src/cosmos/cosmos_dev_flight.gd")
 const GRAV := preload("res://src/cosmos/cosmos_gravity.gd")
 const DV := preload("res://src/cosmos/dvec3.gd")
+const EPH := preload("res://src/cosmos/cosmos_ephemeris.gd")
+const ORB := preload("res://src/cosmos/orbital_state.gd")
 
 var _pass := 0
 var _fail := 0
@@ -48,6 +50,7 @@ func _initialize() -> void:
 	_gate_keepheading()
 	_gate_nobounce()
 	_gate_fmode()
+	_gate_hover_drift()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -178,3 +181,81 @@ func _gate_fmode() -> void:
 	for i in 30:
 		os.step(1.0 / 60.0, DV.v(0.0, 0.0, 0.0))
 	_ok(DV.length(os.pos) < r0 and os.vel[2] < 0.0, "F-off free-fall accelerates inward (radius %.1f→%.1f, v_r<0)" % [r0, DV.length(os.pos)])
+
+# ------------------------------------------------------------------ G-SN-HOVERDRIFT (FIX-B: low-orbit spin detach)
+## The pilot report: at low orbit in F a zero-input hover CO-MOVES with the surface (holds a body-fixed lattice
+## point) instead of detaching to a steady inertial point and watching the planet spin beneath. The fix makes the
+## kinematic fly carry the nav-frame carrier drift: 0 in PLANETARY (fly over the ground), −ω⃗×p in LOW_ORBIT+
+## (hold BCI-inertial ⇒ surface rotates beneath). Pure kernel (CosmosNav.hover_drift_fixed) + the lattice mapping
+## and composition at the real integration site (Player.hover_drift_lattice + _kinematic_look_fly).
+func _gate_hover_drift() -> void:
+	print("  --- G-SN-HOVERDRIFT: kinematic hover holds the nav-frame rest (FIX-B low-orbit spin detach) ---")
+	FacetAtlas.warm_up()
+	var R := FacetAtlas.R_BLOCKS
+	# An equatorial-ish body-fixed test point (off the +Z spin axis ⇒ nonzero ω×p) at a low-orbit radius.
+	var p_fix := DV.v(R + 2000.0, 0.0, 0.0)
+	var wxp := ORB.omega_cross("earth", p_fix)          # the surface's inertial motion at p_fix (fixed frame)
+	var wxp_mag := DV.length(wxp)
+	_ok(wxp_mag > 0.0, "sanity: |ω×p| > 0 at the equatorial test point (%.3f b/s)" % wxp_mag)
+
+	# (a) PLANETARY: ZERO drift — a zero-input hover holds the surface point (unchanged shipped behaviour).
+	var d_plan := NAV.hover_drift_fixed(NAV.PLANETARY, "earth", p_fix)
+	_ok(DV.length(d_plan) == 0.0, "PLANETARY hover drift == 0 (holds the surface point — no detach in the atmosphere)")
+
+	# (b) LOW_ORBIT: drift magnitude == |ω×p| (the spin speed at that radius) ...
+	var d_low := NAV.hover_drift_fixed(NAV.LOW_ORBIT, "earth", p_fix)
+	_ok(_rel(DV.length(d_low), wxp_mag) < 1.0e-9, "LOW_ORBIT hover drift magnitude == |ω×p| = %.3f b/s (spin rate at r)" % wxp_mag)
+	# ... and direction OPPOSITE the surface's inertial motion (observer stays inertial): dot(d, ω×p) == −|ω×p|².
+	_ok(_rel(DV.dot(d_low, wxp), -(wxp_mag * wxp_mag)) < 1.0e-9, "LOW_ORBIT hover drift is OPPOSITE ω×p (observer holds inertial, surface spins by)")
+	# HIGH_ORBIT shares the planet-centred inertial rule ⇒ identical drift.
+	var d_high := NAV.hover_drift_fixed(NAV.HIGH_ORBIT, "earth", p_fix)
+	_ok(d_high[0] == d_low[0] and d_high[1] == d_low[1] and d_high[2] == d_low[2], "HIGH_ORBIT hover drift == LOW_ORBIT (both planet-centred inertial)")
+
+	# FALSIFY: dropping the carrier term (drift 0 in orbit) fails (b)-magnitude; the WRONG sign (+ω×p, co-moving
+	# with the surface — the bug being fixed) fails (b)-direction. Assert both discriminators are live.
+	_ok(DV.length(d_low) != 0.0, "falsify: a dropped carrier term would leave drift==0 ⇒ this assert catches it")
+	_ok(DV.dot(d_low, wxp) < 0.0, "falsify: the sign is NEGATIVE — a +ω×p (co-move with surface) drift would flip this")
+
+	# (c) LATTICE mapping + composition at the real site (Player.hover_drift_lattice + _kinematic_look_fly).
+	var fid := FacetAtlas.spawn_facet()
+	TerrainConfig.set_active_facet(fid)
+	var cc := FacetAtlas.centre_cell(fid)
+	var pos := Vector3(float(cc.x), 2000.0, float(cc.y))    # low-orbit altitude above the spawn-facet centre
+	var wl: Array = FacetAtlas.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	var wxp_lat := DV.length(ORB.omega_cross("earth", DV.v(wl[0], wl[1], wl[2])))
+	var drift := PlayerCls.hover_drift_lattice(fid, NAV.LOW_ORBIT, pos)
+	_ok(_rel(drift.length(), wxp_lat) < 1.0e-6, "hover_drift_lattice magnitude == |ω×p_fix| = %.3f b/s at the low-orbit pose" % wxp_lat)
+	_ok(PlayerCls.hover_drift_lattice(fid, NAV.PLANETARY, pos) == Vector3.ZERO, "hover_drift_lattice PLANETARY == 0 (lattice)")
+	_ok(PlayerCls.hover_drift_lattice(-1, NAV.LOW_ORBIT, pos) == Vector3.ZERO, "hover_drift_lattice off-facet (fid<0) ⇒ 0")
+
+	# Composition: drive the actual kinematic fly. Zero input ⇒ moves by the drift only; forward input ⇒ the
+	# look displacement ADDS on top of the same drift.
+	var dt := 1.0 / 60.0
+	var speed := 16.0                                       # default fly_speed, non-running
+	var pl = PlayerCls.new()
+	pl.fly_speed = speed
+	pl._nav = NAV.NavState.new()
+	pl._nav.mode = NAV.LOW_ORBIT
+	pl.position = pos
+	# NOTE: `position` is float32 at LATTICE scale (coords ~10³ blocks), so `position − pos` loses ~10⁻⁴ blocks to
+	# catastrophic cancellation. The EXACT math is proven in f64 above (drift == −ω×p to 1e-9); these two asserts
+	# only prove the drift is APPLIED and the input COMPOSES additively, so a float32-scale tolerance (2e-3 blocks,
+	# < 0.5 % of the ~0.44-block drift step) is the right bar — a dropped/wrong drift misses by the full step.
+	var f32_tol := 2.0e-3
+	pl._kinematic_look_fly(dt, Vector3.ZERO, false)
+	var hover_delta: Vector3 = (pl.position as Vector3) - pos
+	_ok((hover_delta - drift * dt).length() < f32_tol, "zero-input hover step == drift·dt (holds inertial, surface spins beneath)")
+	# Forward input (camera identity, pitch 0 ⇒ look = −Z lattice): total = look displacement + carrier drift.
+	pl.position = pos
+	pl._kinematic_look_fly(dt, Vector3(0.0, 0.0, -1.0), false)
+	var fwd_delta: Vector3 = (pl.position as Vector3) - pos
+	var input_disp := Vector3(0.0, 0.0, -1.0) * speed * dt
+	_ok((fwd_delta - (input_disp + drift * dt)).length() < f32_tol, "forward-input step == look displacement + carrier drift (input composes on top)")
+	_ok((fwd_delta - input_disp).length() > 1.0e-9, "falsify: the forward step includes the drift (differs from input-only)")
+	# PLANETARY composition: no drift ⇒ a zero-input hover does NOT move (the atmosphere fly is byte-unchanged).
+	pl._nav.mode = NAV.PLANETARY
+	pl.position = pos
+	pl._kinematic_look_fly(dt, Vector3.ZERO, false)
+	_ok((pl.position - pos).length() == 0.0, "PLANETARY zero-input hover does not drift (co-moves with surface, unchanged)")
+	pl.free()
+	TerrainConfig.set_active_facet(-1)

@@ -13,9 +13,20 @@ var _mode_label: Label
 
 func _ready() -> void:
 	var panel := PanelContainer.new()
-	# Top-right corner so it does not overlap the top-left thermometer.
-	panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	panel.position = Vector2(-220, 16)
+	# SN-FIX (2026-07-18 live-pilot HUD overlap): BOTTOM-RIGHT corner, grown up-left from that corner. This is
+	# the one free quadrant — the always-on PerfHUD owns TOP-RIGHT (perf_hud.gd: anchor_right=1, offset_top=16),
+	# the thermometer owns TOP-LEFT (16,16), and the hotbar owns the BOTTOM-CENTRE band (bottom-wide, ~68 px tall).
+	# offset_bottom = −84 lifts the panel's bottom edge 84 px off the screen bottom → 16 px clear ABOVE the hotbar
+	# band's top (−68) AND far right of the centred hotbar slots ⇒ no overlap with any HUD rect. Mirrors PerfHUD's
+	# anchored-corner + GROW_DIRECTION_BEGIN idiom (auto-sizes to content, grows toward the interior).
+	panel.anchor_left = 1.0
+	panel.anchor_top = 1.0
+	panel.anchor_right = 1.0
+	panel.anchor_bottom = 1.0
+	panel.offset_right = -16.0
+	panel.offset_bottom = -84.0
+	panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	panel.grow_vertical = Control.GROW_DIRECTION_BEGIN
 	panel.modulate = Color(1, 1, 1, 0.92)
 	add_child(panel)
 

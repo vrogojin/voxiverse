@@ -514,6 +514,21 @@ static func orbital_handoff(mode: int, orbital_commit: bool, no_ceiling_bounce: 
 		return orbital_commit
 	return true
 
+## SN-FIX (2026-07-18 live-pilot FIX-B, SN_NO_CEILING_BOUNCE) — the LATTICE-frame hover drift for the kinematic
+## fly (the "detach from the planet spin" fix). Lifts the lattice pose to the body-fixed world (lattice_to_world64),
+## asks the nav kernel for the body-fixed hover drift (0 in PLANETARY; −ω⃗×p_fix in LOW_ORBIT+ — CosmosNav.
+## hover_drift_fixed), then rotates that world velocity back into the lattice frame (frame_basis is orthonormal ⇒
+## inverse == transpose, the same rotation world_to_lattice64 applies to positions). Result: a LATTICE velocity
+## that, added each tick, makes a zero-input hover hold the nav-frame rest — surface-following in the atmosphere,
+## inertial (surface spins beneath) in orbit. Pure + fid-parameterised so the gate drives it with no live scene.
+## Off-facet (fid < 0) ⇒ zero (no body-fixed reference — the caller is already in its off-facet fallback anyway).
+static func hover_drift_lattice(fid: int, mode: int, pos: Vector3) -> Vector3:
+	if fid < 0:
+		return Vector3.ZERO
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	var drift_fix := _CosmosNavCls.hover_drift_fixed(mode, "earth", _DVCls.v(w[0], w[1], w[2]))
+	return _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(drift_fix[0], drift_fix[1], drift_fix[2])
+
 ## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-MODE kinematic fly: gravity-off, full 6-DOF in the FULL look
 ## direction (camera basis incl. pitch), constant speed at ALL altitudes. Forward (input.z=−1) maps to the
 ## camera look (−cam.z, pitched); Space/Ctrl add the camera up axis. The camera basis is in the lattice/window
@@ -536,7 +551,14 @@ func _kinematic_look_fly(delta: float, input: Vector3, running: bool) -> void:
 	var dir := transform.basis * look_local + Vector3(0.0, vy, 0.0)
 	if dir.length() > 0.0:
 		dir = dir.normalized()
-	position += dir * speed * delta
+	# SN-FIX (2026-07-18 live-pilot FIX-B): the nav-frame carrier drift about the CURRENT hover point, integrated
+	# ON TOP of the look-fly input velocity. In PLANETARY it is zero (the lattice hover already tracks the spinning
+	# surface — fly over the ground, unchanged). In LOW_ORBIT+ it is −ω⃗×p in the lattice, so a zero-input hover
+	# holds a BCI-inertial point and the body-fixed surface rotates beneath at the spin rate — the pilot "observes
+	# from a steady point how the planet is spinning". A velocity (no position jump), so crossing the LOW_ORBIT
+	# boundary (nav hysteresis at 384) is a seamless frame detach, not a teleport. `_nav != null` always holds here.
+	var carrier := hover_drift_lattice(TerrainConfig.active_facet(), int(_nav.mode), position) if _nav != null else Vector3.ZERO
+	position += (dir * speed + carrier) * delta
 	_horiz_vel = Vector3(dir.x, 0.0, dir.z) * speed
 	velocity = Vector3.ZERO
 

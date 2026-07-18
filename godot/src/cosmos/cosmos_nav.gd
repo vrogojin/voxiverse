@@ -304,6 +304,22 @@ static func carrier_velocity(mode: int, body: String, p_bci: PackedFloat64Array,
 		_:
 			return DV.v(0.0, 0.0, 0.0)                       # LOW_ORBIT / HIGH_ORBIT: BCI rest
 
+## SN-FIX (2026-07-18 live-pilot FIX-B, SN_NO_CEILING_BOUNCE) — the BODY-FIXED (scene/lattice) velocity a
+## zero-input kinematic hover must carry so it rests in the NAV FRAME, not in the body-fixed lattice.
+##   PLANETARY: the lattice IS the body-fixed rotating frame ⇒ a lattice-fixed hover already co-rotates with
+##     the surface (the pilot flies OVER the ground). Nav rest == lattice rest ⇒ ZERO drift (unchanged behaviour).
+##   LOW_ORBIT and above: the nav frame is planet-centred INERTIAL (carrier_velocity == 0 in BCI). To hold a
+##     BCI-inertial point while the body-fixed surface rotates beneath it, the point's velocity IN THE BODY-FIXED
+##     FRAME must be −ω⃗×p_fix: from v_fix = R_z(−θ)·(v_bci − ω⃗×p_bci) with v_bci = 0 and ω⃗∥ẑ (so R_z commutes
+##     with the cross product), v_fix = −R_z(−θ)(ω⃗×p_bci) = −ω⃗×p_fix. NO clock needed — it is a closed form in
+##     p_fix alone. Magnitude == |ω×p| (the surface spin speed at that radius); direction OPPOSITE the surface's
+##     inertial motion, so the observer stays inertial and the surface appears to spin by (the pilot's intent).
+## Pure; gate G-SN-HOVERDRIFT. The player applies it as an additive lattice velocity ON TOP of the look-fly input.
+static func hover_drift_fixed(mode: int, body: String, p_fix: PackedFloat64Array) -> PackedFloat64Array:
+	if mode == PLANETARY:
+		return DV.v(0.0, 0.0, 0.0)
+	return DV.scale(ORB.omega_cross(body, p_fix), -1.0)
+
 # ---------------------------------------------------------------------------------------
 # NavState — the machine wrapper (§4.5): the incumbent mode + the 2-s dwell timer + the R-detach latch.
 # The ONLY mutable state in SN2, ~40 bytes. tick() is the per-physics-frame driver; it reads the BCI

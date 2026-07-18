@@ -658,6 +658,9 @@ func _send_telemetry() -> void:
 		var pa = world.call("take_perf_attrib")
 		if pa is Dictionary:
 			msg.merge(pa as Dictionary)
+	# SN_PERF_PROBE (throwaway freeze-localization): fold in each per-frame subsystem's worst-ms-in-window as
+	# `pp_<name>` fields, then reset the probe window. Empty {} with the flag off ⇒ merges nothing (byte-identical).
+	msg.merge(PerfProbe.take())
 	if _win_had_capture:
 		msg["cap"] = 1
 		_win_had_capture = false

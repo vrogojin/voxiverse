@@ -253,7 +253,9 @@ func _build_nodes() -> void:
 func _process(_delta: float) -> void:
 	if _clock == null:
 		return
+	var _pp_sky := PerfProbe.t()
 	_update_sky(_clock.now())
+	PerfProbe.mark("sky_update", _pp_sky)
 
 ## Re-place the sky from the ephemeris at time t. ONLY transforms/uniforms are written (no allocation,
 ## no geometry rebuild) — the per-frame cost is a handful of node writes (§4.1). NOTE: CosmosSky is a

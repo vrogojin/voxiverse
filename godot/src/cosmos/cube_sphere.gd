@@ -643,6 +643,18 @@ const SN_ATMO_BRAKING := false
 ## still storms; raise toward 55 once a pre-gen landing column removes the streaming constraint).
 const ATMO_BRAKE_TERMINAL := 25.0
 
+## SN_PERF_PROBE (2026-07-18, THROWAWAY DIAGNOSTIC — not a shipped feature). Per-subsystem frame-timing
+## instrumentation to localize the unsolved landing FREEZE: on touchdown (player STATIONARY) frame time
+## DOUBLES 200→…→16000 ms and never recovers, yet every EXISTING cost is idle (vox_gen=0, draws flat,
+## vt_total≈0) — so the culprit is an UN-instrumented per-frame GDScript subsystem whose work scales with
+## the frame delta. With this on, PerfProbe (src/tools/perf_probe.gd) times each per-frame block separately
+## (Time.get_ticks_usec) and RemoteBridge emits each block's worst-ms-in-window as a `pp_<name>` field, so a
+## live spiral shows WHICH subsystem's ms is doubling. Default FALSE ⇒ BYTE-IDENTICAL: PerfProbe.mark() early-
+## returns, take() returns {} (merges nothing), the timer call sites read a couple of usec clocks and discard.
+## Deploy flips this true via sed before export (like the other FP_*/SN_* flags). REMOVE once the freeze is
+## localized. Gate: FLAT verify_feature stays 6035/0 with this off.
+const SN_PERF_PROBE := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

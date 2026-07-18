@@ -352,16 +352,21 @@ func _physics_process(delta: float) -> void:
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
 	var _pre_move_pos := position
+	var _pp_move := PerfProbe.t()
 	_move(delta)
+	PerfProbe.mark("move", _pp_move)
 	var _tick_move_delta := position - _pre_move_pos
 	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
 	# when the frame is off / at identity). update_streaming feeds the collider/pool/streamer, all lattice consumers.
+	var _pp_stream := PerfProbe.t()
 	world.update_streaming(position)
+	PerfProbe.mark("stream", _pp_stream)
 	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
 	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
 	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
 	# this is a byte-identical no-op today.
+	var _pp_cross := PerfProbe.t()
 	var reanchor_shift := world.maybe_reanchor(global_position)
 	if reanchor_shift != Vector3.ZERO:
 		global_position -= reanchor_shift
@@ -396,17 +401,26 @@ func _physics_process(delta: float) -> void:
 			global_position = reloc["pos"]
 			velocity = reloc["vel"]
 			rotation.y += float(reloc["yaw_delta"])
+	PerfProbe.mark("crossing", _pp_cross)
+	var _pp_push := PerfProbe.t()
 	_push_bodies(delta)
+	PerfProbe.mark("pushbodies", _pp_push)
+	var _pp_aim := PerfProbe.t()
 	_update_aim()
+	PerfProbe.mark("aim", _pp_aim)
 	# REMOTE-DRIVE (§4.3): tick the executor AFTER the origin/frame corrections (so the crossing yaw_delta
 	# is known) but with the PRE-correction locomotion delta captured at the top. No-op in normal play
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
+	var _pp_rexec := PerfProbe.t()
 	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
 		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
+	PerfProbe.mark("remoteexec", _pp_rexec)
 	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
 	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
+	var _pp_nav := PerfProbe.t()
 	if _nav != null:
 		_nav_tick(delta)
+	PerfProbe.mark("nav", _pp_nav)
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
 ## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world
@@ -821,6 +835,7 @@ func _move(delta: float) -> void:
 	# up requires a JUMP (intended — no auto-step).
 	# FP-FIXED-FRAME (§2.3): the analytic walls are axis-aligned LATTICE probes → run them on the LOCAL (lattice)
 	# position. `delta_move` is a lattice displacement (`wish` is a lattice direction). Byte-identical off / at identity.
+	var _pp_col := PerfProbe.t()
 	var feet_y := position.y
 	var delta_move := wish * speed * delta
 	# Test each axis at the leading edge, AND at both perpendicular corners of the
@@ -894,7 +909,9 @@ func _move(delta: float) -> void:
 
 	var terrain_floor := world.floor_under(position.x, position.z, position.y)
 	var floor_y := terrain_floor
+	PerfProbe.mark("collision", _pp_col)
 
+	var _pp_standon := PerfProbe.t()
 	# Stand ON a detached voxel body directly under the feet instead of falling
 	# through it (and, below, press our weight into it so it does not squirt out).
 	# Short physics ray straight down from just above the feet, wood layer only.
@@ -938,6 +955,7 @@ func _move(delta: float) -> void:
 	if piece != null and position.y <= floor_y + 0.05 and velocity.y <= 0.0:
 		piece.apply_force(_frame.l2g_dir(Vector3(0, -PLAYER_WEIGHT, 0)),
 			piece_point - piece.global_transform.origin)
+	PerfProbe.mark("standon", _pp_standon)
 
 ## Move horizontally against the wooden blocks with a single slide, so pillars are
 ## solid obstacles. Uses move_and_collide (not move_and_slide) to keep the vertical

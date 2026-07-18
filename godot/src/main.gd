@@ -157,10 +157,13 @@ func _process(_delta: float) -> void:
 	# COSMOS ORBITAL O0: advance the celestial clock every frame (independent of the render path). The
 	# sky moves 72× via the scaled GM; CosmosSky reads this clock in its own _process. Null (flag off)
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
+	var _pp_sky := PerfProbe.t()
 	if _cosmos_clock != null:
 		_cosmos_clock.advance(_delta)
+	PerfProbe.mark("sky_clock", _pp_sky)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
+	var _pp_cam := PerfProbe.t()
 	var cam := _player.camera_global_transform().origin
 	if CubeSphere.M5_RENDER:
 		_player.world.m5_push_camera(cam)
@@ -175,6 +178,7 @@ func _process(_delta: float) -> void:
 			_player.world.m5_epoch_camera(_player.global_position, _player.window_camera_transform()))
 	else:
 		CosmosBend.set_camera(cam)                     # near field: the camera-centred bend (R1, bend path)
+	PerfProbe.mark("cam", _pp_cam)
 
 	# SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.4): border continuity. Ramp the camera near/far
 	# with altitude and place the far ring under the angular-size-preserving distance clamp, so the atmosphere↔
@@ -182,10 +186,12 @@ func _process(_delta: float) -> void:
 	# regime byte-identical). DEAD with FP_SCALED_BODY off. Independent of the camera-write above (near/far are
 	# separate properties from the camera transform), so it composes with the M5_REAL / bend paths untouched.
 	if CosmosScale.on() and CubeSphere.FACETED:
+		var _pp_scaled := PerfProbe.t()
 		var centre := _player.world.planet_render_centre()
 		var d := cam.distance_to(centre)
 		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
 		_player.world.apply_scaled_body(cam)
+		PerfProbe.mark("scaledbody", _pp_scaled)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

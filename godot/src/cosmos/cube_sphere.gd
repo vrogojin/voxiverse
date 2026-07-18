@@ -564,6 +564,27 @@ const SN_NAV_MODES := false
 ## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
 const SN_DEVNAV := false
 
+## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
+## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
+## the shipped sun-elevation ramp: fog thins (fog_density = exp(−h/H_SCALE)), the sky lerps to BLACK as
+## space_mix rises (smoothstep 0.5·H_ATMO..2.5·H_ATMO), stars emerge (star_fade = max(night_fade, space_mix)),
+## ambient dims to AMBIENT_SPACE. On an airless body (has_atmo=false) space_mix≡1 ⇒ black starry sky at the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: _ramp_environment writes exactly the shipped day-night values
+## (fog_density stays 1.0, no altitude term is evaluated). Requires ORBITAL_SKY (the ramp lives in CosmosSky).
+## ZERO added bytes (O(1) Environment property writes/frame), NO shaders/materials — Environment props only.
+## Headless-PROVEN: the curve MATH + endpoints (G-SN-RAMP). LIVE-ONLY: the actual LOOK (limb, sunset legibility).
+const ATMO_VISUAL_RAMP := false
+
+## COSMOS SPACE-NAV SN4b (docs/COSMOS-SPACE-NAV-DESIGN.md §6.3) — the ANALYTIC SUN-OCCLUSION DIMMER. Without
+## shadow maps the DirectionalLight lights a player behind the planet; this dims light_energy to 0 when the
+## body occludes the sun (α between ŝ and −p̂ < asin(R_vox/|p|), soft ±0.005 rad penumbra). Pure f64, one
+## scalar/frame, ZERO bytes. Blended by altitude with the shipped elevation ramp (authority = space_mix(h)) so
+## exactly one driver owns any regime — at the surface the elevation ramp owns (light_energy stays 1.0), in
+## space the occlusion dimmer owns (night side dark from orbit). Airless bodies: occlusion owns from the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: light_energy is never written (stays the shipped 1.0). Gate
+## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
+const SN_SUN_OCCLUSION := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

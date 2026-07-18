@@ -92,6 +92,75 @@ const _NIGHT_AMBIENT_ENERGY := 0.35        # dimmed floor at night; ramps to 1.0
 const _SKY_DAY := Color(0.62, 0.74, 0.86)  # main.SKY_COLOR
 const _SKY_NIGHT := Color(0.02, 0.02, 0.05)
 
+# ---------------------------------------------------------------------------------------
+# SN4 — the altitude atmosphere ramp (SN4a) + analytic sun-occlusion dimmer (SN4b). All the curve/geometry
+# math below is PURE STATIC (engine-free): it is composed onto the shipped sun-elevation ramp inside
+# _ramp_environment ONLY when the flags (CubeSphere.ATMO_VISUAL_RAMP / .SN_SUN_OCCLUSION) are on, and is
+# driven DIRECTLY (flag-independent) by the G-SN-RAMP / G-SN-OCCLUDE gates. Every function is C¹ in its
+# radial-altitude argument h (smoothstep is Hermite ⇒ zero-slope, C¹-continuous endpoints; exp is C∞), so
+# the whole ramp is seamless (SEAMLESS-SCALES). ZERO bytes: these are property writes, no geometry/material.
+# ---------------------------------------------------------------------------------------
+
+## Fog scale height (blocks) — shared with the SN1 drag model (OrbitalState.DRAG_H_SCALE = 128).
+const H_SCALE := 128.0
+## Atmosphere ceiling (blocks) == CubeSphere.ATMO_TOP; the space_mix band spans 0.5·H_ATMO..2.5·H_ATMO.
+const H_ATMO := 384.0
+## Sea-level fog density — the shipped main._setup_environment value, so fog_density(h=0) is byte-identical.
+const FOG0 := 1.0
+## Ambient-energy multiplier floor reached in space (the sky no longer scatters skylight).
+const AMBIENT_SPACE := 0.15
+## space_mix smoothstep band (blocks): sky/star/ambient cross from atmosphere to space between these.
+const SPACE_MIX_LO := 0.5 * H_ATMO      # 192
+const SPACE_MIX_HI := 2.5 * H_ATMO      # 960
+## Sun-occlusion soft penumbra half-width (rad), ~ the solar angular radius (SN4b, §6.3).
+const OCC_PENUMBRA := 0.005
+## Ambient floor multiplier applied by SN4b in the orbital umbra (the night side keeps a faint fill).
+const AMBIENT_UMBRA := 0.25
+
+## space_mix(h): 0 in the atmosphere → 1 in space, C¹ (smoothstep). On an airless body (has_atmo=false) the
+## sky is black at the surface, so space_mix ≡ 1 everywhere.
+static func space_mix(h: float, has_atmo: bool) -> float:
+	if not has_atmo:
+		return 1.0
+	return smoothstep(SPACE_MIX_LO, SPACE_MIX_HI, h)
+
+## Depth-fog density at altitude h: FOG0·exp(−h/H_SCALE), C∞. Airless body ⇒ 0 (no atmosphere to fog).
+static func fog_density_at(h: float, has_atmo: bool) -> float:
+	if not has_atmo:
+		return 0.0
+	return FOG0 * exp(-h / H_SCALE)
+
+## Ambient-energy multiplier at space_mix sm: 1.0 (surface) → AMBIENT_SPACE (space).
+static func ambient_scale(sm: float) -> float:
+	return lerpf(1.0, AMBIENT_SPACE, sm)
+
+## Raw occlusion factor in [0,1]: 1 fully sunlit, 0 in the umbra (the body's disc covers the sun), C¹ through
+## the penumbra. sun_dir = unit direction TOWARD the sun; p = player position from the planet centre (blocks);
+## r_vox = the occluding body's voxel radius. α = angle(sun_dir, −p̂); the body occludes when α < asin(R/|p|).
+static func occlusion_factor(sun_dir: Vector3, p: Vector3, r_vox: float) -> float:
+	var dist := p.length()
+	if dist <= 0.0:
+		return 1.0
+	var ang_radius := asin(clampf(r_vox / dist, 0.0, 1.0))   # the body's angular radius from the player
+	var to_center := -p / dist
+	var alpha := acos(clampf(sun_dir.dot(to_center), -1.0, 1.0))
+	# α small ⇒ sun behind the body's disc ⇒ umbra ⇒ 0; α large ⇒ clear of the disc ⇒ sunlit ⇒ 1.
+	return smoothstep(ang_radius - OCC_PENUMBRA, ang_radius + OCC_PENUMBRA, alpha)
+
+## The DirectionalLight energy under SN4b: the occlusion factor blended with the shipped light (1.0) by
+## altitude authority = space_mix(h), so the elevation ramp owns the surface (→ 1.0, byte-identical hand-off)
+## and the occlusion dimmer owns space (→ occlusion_factor). Continuous everywhere (both terms C¹ in h).
+static func occlusion_light(sun_dir: Vector3, p: Vector3, h: float, r_vox: float, has_atmo: bool) -> float:
+	var authority := space_mix(h, has_atmo)
+	return lerpf(1.0, occlusion_factor(sun_dir, p, r_vox), authority)
+
+## The ambient multiplier under SN4b: in the orbital umbra the ambient fill drops to AMBIENT_UMBRA, again
+## blended in by altitude authority so the surface is untouched. Continuous; 1.0 when fully sunlit.
+static func occlusion_ambient(sun_dir: Vector3, p: Vector3, h: float, r_vox: float, has_atmo: bool) -> float:
+	var authority := space_mix(h, has_atmo)
+	var occ := occlusion_factor(sun_dir, p, r_vox)
+	return lerpf(1.0, lerpf(AMBIENT_UMBRA, 1.0, occ), authority)
+
 ## Wire the sky to a clock (read each frame), the scene Environment (ramped; may be null → no ramp),
 ## and a camera provider (the Player; may be null → impostors sit around the origin). Builds the
 ## reused nodes once. Idempotent-safe: call once from main.gd under the flag.
@@ -230,17 +299,48 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var elev := clampf(sun_dir.dot(up), -1.0, 1.0)          # −1 (midnight) .. +1 (noon)
 	var day := clampf(elev, 0.0, 1.0)                        # 0 below horizon, ramps to 1 at zenith
 	var twilight := clampf((elev + 0.15) / 0.30, 0.0, 1.0)   # soft dawn/dusk band around the horizon
+	var night_fade := 1.0 - twilight                         # shipped star-fade: stars own the night sky
+
+	# --- SN4 altitude inputs (only evaluated when a flag is on; flag-off ⇒ byte-identical below) ---
+	var atmo_on := CubeSphere.ATMO_VISUAL_RAMP
+	var occ_on := CubeSphere.SN_SUN_OCCLUSION
+	var h := 0.0
+	var r_vox := 0.0
+	var has_atmo := true
+	if atmo_on or occ_on:
+		r_vox = CosmosGravity.r_vox(OBSERVER)
+		h = cam_origin.length() - r_vox                      # radial altitude above the voxel surface
+		has_atmo = OrbitalState.has_atmo(OBSERVER)
+	var sm := space_mix(h, has_atmo) if atmo_on else 0.0
+
 	# BLACK-SKY FIX: fade the additive starfield out as twilight brightens, so stars own the night sky
 	# and add nothing at noon (the ramped blue background then reads through the dome untouched). Driven
 	# from the SAME elevation as the background ramp, so stars and sky can never disagree. Kept OUTSIDE
 	# the `_env == null` early-out below — the starfield must still ramp when there is no Environment.
+	# SN4a: stars ALSO emerge as the sky blackens with altitude (star_fade = max(night_fade, space_mix)).
 	if _star_mat != null:
-		_star_mat.set_shader_parameter("star_fade", 1.0 - twilight)
+		_star_mat.set_shader_parameter("star_fade", maxf(night_fade, sm) if atmo_on else night_fade)
+
+	# SN4b: the sun-occlusion dimmer drives the DirectionalLight energy. Computed OUTSIDE the `_env == null`
+	# guard — the light must dim even when there is no Environment. Flag-off ⇒ light_energy is never touched
+	# (stays the shipped 1.0 set in _build_nodes).
+	if occ_on:
+		_sun_light.light_energy = occlusion_light(sun_dir, cam_origin, h, r_vox, has_atmo)
+
 	if _env == null:
 		return
-	_env.background_color = _SKY_NIGHT.lerp(_SKY_DAY, twilight)
+	var sky := _SKY_NIGHT.lerp(_SKY_DAY, twilight)
+	var ambient := lerpf(_NIGHT_AMBIENT_ENERGY, 1.0, day)
+	if atmo_on:
+		# SN4a: sky → BLACK, ambient → AMBIENT_SPACE, fog thins with altitude (all composed onto the ramp).
+		sky = sky.lerp(Color.BLACK, sm)
+		ambient *= ambient_scale(sm)
+		_env.fog_density = fog_density_at(h, has_atmo)
+	if occ_on:
+		ambient *= occlusion_ambient(sun_dir, cam_origin, h, r_vox, has_atmo)
+	_env.background_color = sky
 	_env.fog_light_color = _env.background_color
-	_env.ambient_light_energy = lerpf(_NIGHT_AMBIENT_ENERGY, 1.0, day)
+	_env.ambient_light_energy = ambient
 
 ## Camera origin (parallax-free sky centre). Falls back to this node's own origin if no provider yet
 ## (local origin — CosmosSky is at identity, so this is the scene origin / planet centre).

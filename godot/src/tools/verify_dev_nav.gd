@@ -168,7 +168,11 @@ func _gate_continuity_with_devflight() -> void:
 		if ascending and ns.mode == NAV.DEEP_SPACE:
 			reached_deep = true
 			ascending = false                               # turn around and descend
-		if not ascending and DV.length(p) <= R + 200.0:
+		# End the descent when the machine has actually re-committed PLANETARY (crossed every band back down),
+		# not at a fixed altitude. The PLANETARY↔LOW divide is the atmosphere ceiling (h=384±32) with a 2-s
+		# dwell; at the Earth/1000 scale the descent is ~2× faster, so that dwell now commits ~h=72 — below the
+		# old fixed R+200 cutoff, which would end the loop before the final flip registered. R+5 is a safety floor.
+		if not ascending and (ns.mode == NAV.PLANETARY or DV.length(p) <= R + 5.0):
 			break
 		t += dt
 		tick += 1

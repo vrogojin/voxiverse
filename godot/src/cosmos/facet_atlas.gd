@@ -10,8 +10,9 @@ extends RefCounted
 ## is a pure function of (SEED, fid, x, z) — stronger than the curved frozen-epoch contract (no window state).
 
 const K := 24                    # faceting resolution: 6·K² = 3456 facets — LOCKED at 24 (user taste-test, FP0 k=8/16/24)
-const R_BLOCKS := 3072.0         # planet radius, blocks. Facet edge = (π/2·R)/K ≈ 200 blocks — R tracks K so a facet
-                                 # stays a ~200-block playable patch (facet size is the only thing R×K couple; scale-invariant math)
+const R_BLOCKS := 6371.0         # planet radius, blocks = true Earth radius / 1000 (1:1000 model, 1 block = 1 m). Facet
+                                 # edge = (π/2·R)/K ≈ 417 blocks — K stays 24 (user-locked), so the facet grows to a ~417-block
+                                 # playable patch (coarser far-LOD silhouette accepted). R×K couple facet size only; math scale-invariant.
 const MARGIN_CELLS := 8          # lattice cells kept beyond the facet polygon (streaming slack)
 const STRIP_CELLS := 2           # per-side seam strip width (FP2+)
 const SPAWN_EDGE_MIN := 48       # spawn scan stays ≥ this many cells from the facet boundary

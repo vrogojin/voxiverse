@@ -282,7 +282,13 @@ func _cont_integrated() -> void:
 	_ok(worst_drift == 0.0, "G-SN-CONT(A): live vs machine-free control run bit-identical (max |Δstate| = %.1e — zero impulse)" % [worst_drift])
 	_ok(flips >= 1, "G-SN-CONT(A): the powered orbit-raise crossed ≥1 mode boundary (LOW↔HIGH); flips = %d" % flips)
 	_ok(flip_dv == 0.0, "G-SN-CONT(A): zero Δv at every mode-flip tick (max = %.1e)" % [flip_dv])
-	_ok(worst_dv < 1.0e-12, "G-SN-CONT(A): per-tick Δv == integrator trapezoid to %.1e (no impulse term)" % [worst_dv])
+	# Tolerance scales with the coordinate magnitude: the trapezoid residual is the f64 round-off of a
+	# velocity-Verlet update whose absolute ulp grows with √(GM·r). Earth/1000 (R=6371, GM=2.07e9) makes the
+	# BCI coordinates/velocities ~2× larger than the interim R=3072 world, so the relative residual grows from
+	# ~6e-13 to ~1.3e-12. 1e-11 keeps this a meaningful "no impulse" assertion — a real impulse is a RELATIVE
+	# O(1) jump, ~10 orders of magnitude above this floor — while `worst_drift == 0.0` (bit-identical control
+	# run, asserted separately below) is the exact zero-impulse proof this only corroborates.
+	_ok(worst_dv < 1.0e-11, "G-SN-CONT(A): per-tick Δv == integrator trapezoid to %.1e (no impulse term)" % [worst_dv])
 	_ok(worst_rt < 1.0e-12, "G-SN-CONT(A): frame round-trips (fix↔bci, bci↔helio) relative err %.1e (f64-exact)" % [worst_rt])
 
 # (B) the full boundary crossing set + committed mode sequence, both directions, dwell honoured.
@@ -377,8 +383,11 @@ func _gate_geo() -> void:
 	var moon_soi := NAV.soi_radius("moon")
 	_ok(moon_rgeo > moon_soi, "G-SN-GEO: Moon r_geo %.0f > SOI %.0f (no selenostationary orbit)" % [moon_rgeo, moon_soi])
 	_ok(not NAV.has_stationary_orbit("moon"), "G-SN-GEO: Moon has_stationary_orbit == false (G key reports 'none')")
-	# Interim numbers sanity (SPACE-NAV §3 table): Earth r_geo ≈ 20,370; Moon r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
-	_ok(_rel(r_geo, 20370.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 20,370 (interim)" % r_geo)
+	# Earth r_geo = (GM·DAY²/4π²)^⅓ ≈ 42,241. This is MODEL-INVARIANT across the natural 1:1000 retune: GM
+	# shrank ×(1e-6/5.184e-6)=0.193 while DAY² grew ×(√1000/72·1200... )² so GM·DAY² is unchanged — the
+	# geostationary altitude is the real 42,164-km orbit scaled ÷1000, independent of the clock rate. (Natural:
+	# GM_dyn=GM_game=3.986e8, DAY_GAME≈2732 s.) Moon unchanged (R_vox==R_eph): r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
+	_ok(_rel(r_geo, 42241.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 42,241 (geostationary, model-invariant)" % r_geo)
 	_ok(_rel(moon_soi, 66100.0) < 2.0e-2, "G-SN-GEO: Moon SOI = %.0f ≈ 66,100" % moon_soi)
 
 # ---------- G-SN-NOSPIRAL: the per-frame work is BOUNDED regardless of dt (the freeze / spiral-of-death fix) ----------

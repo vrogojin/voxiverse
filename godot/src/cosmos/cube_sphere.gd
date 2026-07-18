@@ -677,14 +677,16 @@ const SN_NO_CEILING_BOUNCE := false
 ## actually keeps up (no storm) needs a live re-fly — the gate proves the descent is braked, not that the
 ## generator wins. Follow-up if braking alone is insufficient: pre-generate the landing column during the fall.
 const SN_ATMO_BRAKING := false
-## SN-BRAKE descent terminal speed (blocks/s) — the speed a re-entry brakes to below ATMO_TOP. Chosen
-## CONSERVATIVE at 25: the historical stream-supply floor is ~23–35 blocks/s (pre-C++-port generator;
-## voxiverse-streaming-supply-demand). A fast re-entry ASYMPTOTES to this terminal FROM ABOVE (the 384-block
-## band is not deep enough to fully relax 141→25, so the in-game arrival lands ~1 above terminal, ≈26 b/s under
-## the feel-g the surface walk integrates) — 25 keeps that arrival comfortably INSIDE the supply band with
-## margin, and well under half the orbital DRAG_TERMINAL (55). Single named const — dial live (lower if a re-fly
-## still storms; raise toward 55 once a pre-gen landing column removes the streaming constraint).
-const ATMO_BRAKE_TERMINAL := 25.0
+## SN-BRAKE descent terminal speed (blocks/s) — the speed a re-entry brakes to below ATMO_TOP. Set to 20 for
+## the natural 1:1000 model: datum gravity is now 9.8 (≈5× weaker than the old 72×-model 50.9), so k0 =
+## datum_gravity/ATMO_BRAKE_TERMINAL² is smaller and the drag relaxes SLOWER over the fixed 384-block band
+## (ATMO_TOP is USER-LOCKED at 384 — retune drag, not the border). 20 is the strongest reasonable terminal that
+## keeps a STEEP re-entry from the natural 250-b/s orbit STREAM-SAFE within 384 blocks: a −250 dive arrives
+## ≈25.3 b/s, a −300 dive ≈26.5, even a −350 (escape-speed) dive ≈27.8 — all under the ~30-b/s stream-supply
+## floor (voxiverse-streaming-supply-demand), while 20 b/s reads as a firm descent, not a hard stop. Terminal ==
+## √(datum_gravity/k0) == ATMO_BRAKE_TERMINAL by construction (per-body generic). Single named const — dial live
+## (raise toward the orbital DRAG_TERMINAL 55 once a pre-gen landing column removes the streaming constraint).
+const ATMO_BRAKE_TERMINAL := 20.0
 
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while

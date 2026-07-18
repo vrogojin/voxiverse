@@ -175,7 +175,7 @@ func _gate_inert() -> void:
 	var clock := EPH.CosmosClock.new()
 	sky.setup(clock, env, null)
 	# Drive the ramp at high noon over the planet (sun straight up at the local zenith of cam_origin).
-	var cam := Vector3(0.0, 0.0, 3072.0)                   # on the +Z surface (up = +Z)
+	var cam := Vector3(0.0, 0.0, float(FacetAtlas.R_BLOCKS))   # on the +Z surface (Earth/1000 R=6371; up = +Z)
 	var sun_up := Vector3(0.0, 0.0, 1.0)                   # noon
 	sky._ramp_environment(sun_up, cam)
 	# With the flags off the shipped formula is: twilight=1 ⇒ background==_SKY_DAY, ambient==1.0, fog untouched.

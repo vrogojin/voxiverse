@@ -6,10 +6,11 @@ extends SceneTree
 ## COMPOSES this term in-game; the FLAT byte-identity face is verify_feature 6035/0, run separately).
 ##
 ## G-SN-BRAKE asserts:
-##   (a) BRAKED-TO-TERMINAL: a fast descent (vy=−141 blocks/s seeded at h=ATMO_TOP) integrated down through the
-##       atmosphere under datum_gravity arrives at the surface at ≈ ATMO_BRAKE_TERMINAL (settles to terminal),
-##       and hugely below the no-drag arrival (falsifies "no braking"). Integrated under the in-game feel-g it
-##       arrives at ≤ ATMO_BRAKE_TERMINAL (the streaming-safety claim).
+##   (a) STREAM-SAFE RE-ENTRY: a STEEP dive seeded at the natural orbital speed (vy=−v_circ≈−250 b/s at
+##       h=ATMO_TOP) integrated down through the atmosphere under datum_gravity arrives at the surface UNDER the
+##       ~30-b/s stream-supply floor (≈25 b/s with ATMO_BRAKE_TERMINAL=20), so terrain streaming keeps up — and
+##       hugely below the no-drag arrival (falsifies "no braking"). The in-game feel-g path (9.8 ≈ datum g)
+##       arrives the same (orbit g == walk g). ATMO_TOP stays user-locked at 384; only the drag terminal is tuned.
 ##   (b) DENSITY PROFILE: k(h) is MAX at h=0 (== k0), monotonically decays with h, ≈0 at ATMO_TOP, continuous;
 ##       the accel SIGN opposes motion (descent vy<0 ⇒ a>0 upward; ascent vy>0 ⇒ a<0). Falsifies a wrong sign.
 ##   (c) NO DRAG ABOVE 384: k==0 and accel==0 for h>ATMO_TOP (the planet-centred free-fall owns space, unchanged);
@@ -102,40 +103,48 @@ func _gate_perbody() -> void:
 	# coefficient is exactly datum_gravity(body)/T² (falsifies a hardcoded literal — e.g. 9.81 or a frozen 24.6).
 	var k0_expected := g_earth / (CubeSphere.ATMO_BRAKE_TERMINAL * CubeSphere.ATMO_BRAKE_TERMINAL)
 	_ok(is_equal_approx(ORB.atmo_brake_k("earth", 0.0), k0_expected), "k0 == datum_gravity(earth)/ATMO_BRAKE_TERMINAL²")
-	_ok(g_earth != 9.81, "datum_gravity(earth) is the GM_dyn datum (≈24.6), NOT the real-world 9.81 (proves it reads the kernel)")
+	# datum_gravity reads the LIVE kernel (GM_dyn/R²), not a frozen literal. Under natural 1:1000 it now ≈ 9.8 —
+	# and that is the POINT (orbit datum g == walk g), so the old "must differ from 9.81" check is retired for the
+	# stronger structural one: it EQUALS the kernel computation exactly.
+	var rv := GRAV.r_vox("earth")
+	_ok(is_equal_approx(g_earth, GRAV.gm_dyn("earth") / (rv * rv)), "datum_gravity(earth) == GM_dyn/R² exactly (reads the kernel, ≈ 9.8 under natural 1:1000)")
 	# Airless body ⇒ no atmosphere ⇒ no brake (has_atmo false).
 	_ok(not ORB.has_atmo("moon"), "moon has_atmo == false (airless)")
 	_ok(ORB.atmo_brake_k("moon", 0.0) == 0.0, "airless body ⇒ k==0 (no atmosphere ⇒ no descent braking)")
 
 # ------------------------------------------------------------------ (a) braked to terminal
 func _gate_braked() -> void:
-	print("  --- (a) a fast descent brakes to terminal within the atmosphere ---")
+	print("  --- (a) a STEEP re-entry from the natural orbit brakes STREAM-SAFE within the atmosphere ---")
 	var top := CubeSphere.ATMO_TOP
 	var term := CubeSphere.ATMO_BRAKE_TERMINAL
 	var g_datum := GRAV.datum_gravity("earth")
-	var v0 := -141.0                                         # the live storm entry speed
-	# No-drag reference: pure gravity fall through the 384-block band from 141 → speed at surface.
+	# Seed the worst realistic case: a near-radial dive at the NATURAL orbital speed (≈ 250 b/s) — a de-orbit
+	# from low orbit whose vertical component is the full circular speed. This is what the atmosphere must brake.
+	var v_orbit := GRAV.datum_circular_speed("earth")       # ≈ 250.1 b/s (√(GM/R))
+	var v0 := -v_orbit
+	# No-drag reference: pure gravity fall through the 384-block band — the entry ACCELERATES (≈ 265, > v_orbit).
 	var v_nodrag := sqrt(v0 * v0 + 2.0 * g_datum * top)
 	# In-game faithful integration under datum gravity (the gravity the brake law balances). dt = the game tick.
 	var res_datum := _descend(v0, top, g_datum, 1.0 / 60.0)
-	# In-game faithful integration under the feel-g the surface walk actually uses (22 on Earth) — the terminal
-	# it settles to is slightly LOWER (safer): term·sqrt(feel_g/datum) ⇒ arrival ≤ ATMO_BRAKE_TERMINAL.
-	var res_feel := _descend(v0, top, 22.0, 1.0 / 60.0)
-	print("      v_entry=%.1f  no-drag surface=%.1f  braked(datum-g)=%.2f  braked(feel-g)=%.2f  terminal=%.1f"
-		% [absf(v0), v_nodrag, res_datum, res_feel, term])
-	# A fast entry ASYMPTOTES to terminal FROM ABOVE (terminal is the drag=gravity attractor, never crossed from
-	# above), and the 384-block band is not deep enough to fully relax 141→terminal, so arrival lands ~1–3 above
-	# terminal — that is the honest "braked to ≈terminal", hugely below the no-drag storm speed.
-	_ok(v_nodrag > 190.0, "no-drag reference: unbraked fall ACCELERATES to ~%.0f (the storm)" % v_nodrag)
-	_ok(res_datum <= term * 1.20, "braked descent (datum-g) arrives ≈ terminal (within 20%% above — asymptotic from above)")
-	_ok(res_datum >= term - 3.0, "braked descent (datum-g) settles NEAR terminal (not overshot to a crawl)")
-	_ok(res_feel <= term * 1.10, "braked descent (feel-g, the in-game gravity) arrives ≈ terminal (within 10%%, streaming-safe band)")
-	_ok(res_feel < 30.0, "braked descent (feel-g) arrives < 30 blocks/s (inside the ~30 b/s stream-supply floor)")
-	_ok(res_datum < absf(v0) * 0.30, "braked arrival << entry (141 → ≈terminal): the brake shed the storm speed")
-	# FALSIFICATION face: kill the drag term ⇒ the same integrator arrives at the no-drag speed (assert fails).
+	# Under natural 1:1000 the WALK feel gravity is 9.8 ≈ datum g (orbit g == walk g), so this path coincides
+	# with the datum-g path (was 22 and noticeably different under the old model).
+	var res_feel := _descend(v0, top, GRAV.feel_g("earth"), 1.0 / 60.0)
+	print("      v_entry(orbit)=%.1f  no-drag surface=%.1f  braked(datum-g)=%.2f  braked(feel-g)=%.2f  terminal=%.1f"
+		% [v_orbit, v_nodrag, res_datum, res_feel, term])
+	# STREAM-SAFE (the §D retune): with ATMO_BRAKE_TERMINAL = 20 under natural datum g 9.8, the density-profiled
+	# drag brakes a 250-b/s steep entry to ≈ 25 b/s within the fixed 384-block band (ATMO_TOP user-locked) —
+	# UNDER the ~30-b/s stream-supply floor, so terrain streaming keeps up and the landing isn't jerky. Even a
+	# −300 dive arrives ≈ 26.5 and a −350 escape-speed dive ≈ 27.8, all < 30. The brake settles toward terminal
+	# FROM ABOVE (the band still can't fully relax to 20, arrival ~1.25× terminal) — that is the honest bound.
+	_ok(res_datum < 30.0, "STREAM-SAFE: 250-orbit steep entry brakes to %.1f b/s < 30 (stream-supply floor) within ATMO_TOP" % res_datum)
+	_ok(res_feel < 30.0, "STREAM-SAFE: feel-g (9.8) descent arrives %.1f b/s < 30 (the in-game path)" % res_feel)
+	_ok(res_datum < 0.15 * v_nodrag, "the brake bites hard: %.1f is << no-drag %.1f (sheds >85%%)" % [res_datum, v_nodrag])
+	_ok(res_datum > term * 0.9 and res_datum < term * 1.4, "braked (datum-g) %.1f settles toward terminal %.1f FROM ABOVE (band-limited)" % [res_datum, term])
+	_ok(absf(res_feel - res_datum) / res_datum < 0.15, "braked (feel-g) %.1f ≈ braked (datum-g) %.1f — orbit g == walk g, the paths coincide" % [res_feel, res_datum])
+	# FALSIFICATION face: kill the drag term ⇒ the same integrator arrives at the no-drag storm (assert fails).
 	var res_nodrag := _descend(v0, top, g_datum, 1.0 / 60.0, false)
-	_ok(res_nodrag > 190.0 and absf(res_nodrag - v_nodrag) < 2.0,
-		"drag OFF ⇒ arrival == no-drag reference (kills the brake ⇒ the (a) asserts would fail)")
+	_ok(res_nodrag > v_orbit and absf(res_nodrag - v_nodrag) < 2.0,
+		"drag OFF ⇒ arrival == no-drag reference %.1f (kills the brake ⇒ the (a) asserts would fail)" % v_nodrag)
 
 ## Integrate a vertical descent from `v0` (<0, falling) at radial altitude `h0` down to the surface (h=0),
 ## mirroring the game surface walk: vy −= g·dt; then (if `brake`) vy += clamp(atmo_brake_accel·dt) descent-only.

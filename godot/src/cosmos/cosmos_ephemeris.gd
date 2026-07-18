@@ -6,18 +6,21 @@ class_name CosmosEphemeris
 ## NO randi(). This makes it worker-safe and headless-gate-testable (verify_orbital_sky.gd), and it
 ## carries the whole scale/time/mass model that O1+ (real orbits, SOI, grids) reads as data.
 ##
-## THE LOCKED SCALE MODEL (§3.3, decision D2, USER-LOCKED):
-##   1 unit = 1 block = 1 m. Celestial lengths are real km ÷ 1000. One Earth rotation = 20 min real,
-##   so time runs 72× (86400 s ÷ 1200 s). 1:1000 lengths + 72× time cannot keep real masses, so
-##   GM is the FREE PARAMETER chosen (via Kepler) to keep Newton exact at those two scales:
-##       GM_game = GM_real × s_L³ / s_T²  = GM_real × (10⁻³)³ × 72²  = GM_real × 5.184×10⁻⁶
-##   Corollaries: every period = real ÷ 72, every orbital speed = real × 0.072, every dimensionless
-##   ratio (angular sizes, eclipse geometry, orbits-per-day) is EXACTLY real. One clock: ephemeris
-##   time = real seconds; the scaled GM alone produces the 72× sky.
+## THE SCALE MODEL — STRICT 1:1000 SPACETIME (§3.3, USER-LOCKED 2026-07-18, natural Earth/1000):
+##   1 unit = 1 block = 1 m. Celestial lengths are real km ÷ 1000 (s_L = 1/1000). Time is scaled by the
+##   SAME rule so acceleration (length/time²) is INVARIANT: s_T² = s_L ⇒ s_T = √s_L = 1/√1000, i.e. game
+##   time runs √1000 = 31.62× faster than reality (NOT the old 72×). Then the GM that keeps Newton exact is
+##       GM_game = GM_real × s_L³ / s_T²  = GM_real × (10⁻³)³ × (√1000)²  = GM_real × 1×10⁻⁶
+##   which for Earth is 3.986e8 = SURFACE_GRAVITY·R² (CubeSphere.gm_for) — so the far-field Kepler GM and the
+##   near-field FEEL anchor COINCIDE. Consequences (all self-consistent, ONE clock): gravity is 9.8 for BOTH
+##   walking AND orbit (no split); surface v_circ = √(GM/R) = 250 b/s, low-orbit period ≈ 160 s, escape ≈ 354;
+##   one Earth day = 86400/√1000 ≈ 2732.6 s ≈ 45.5 min. Because the SKY (sun/moon/day/eclipses) runs on the
+##   same clock it slows to the same √1000 rate — orbit ↔ day ↔ gravity stay in sync, no desync. Every
+##   dimensionless ratio (angular sizes, eclipse geometry, orbits-per-day) is still EXACTLY real.
 ##
-## This table is SEPARATE from CubeSphere.gm_for() — that stays the near-field FEEL anchor (§3.3.1,
-## walk gravity 22); this GM table is the far-field Kepler truth (supersedes gm_for above the blend
-## band, which is O1). O0 uses this kernel for the sky only (Sun/Moon direction + day-night).
+## Since GM_game now EQUALS CubeSphere.gm_for by construction (§3.3.1, walk gravity 9.8), the far-field Kepler
+## truth and the near-field feel anchor agree at the datum — the O1 blend band is continuous with no GM step.
+## O0 uses this kernel for the sky (Sun/Moon direction + day-night); O1+ read the same GM for real orbits.
 ##
 ## PRECISION: positions are DVecF64 (PackedFloat64Array) — Earth–Sun 1.496e8 needs f64; the render
 ## layer downgrades DIRECTIONS to Vector3 (§4.3).
@@ -28,16 +31,23 @@ const DV := preload("res://src/cosmos/dvec3.gd")
 # Scale constants (§3.3) — the three locked numbers everything else derives from.
 # ---------------------------------------------------------------------------------------
 
-## Time compression: game runs this many times faster than reality (86400 s day / 1200 s day).
-const TIME_COMPRESSION := 72.0
-## One Earth solar day in game seconds (= real 86400 s ÷ 72). The Earth spin period.
-const DAY_GAME := 1200.0
 ## Length scale: 1 game block = 1000 real metres for celestial quantities (real km → blocks).
+## s_L = 1/1000. Defined first — the time and GM scales derive from it under the STRICT 1:1000 rule.
 const LENGTH_SCALE := 1.0e-3
-## The GM scaling law (§3.3): GM_game = GM_real × s_L³/s_T² = (10⁻³)³ × 72². Written as the literal
-## 5.184e-6 (== 1e-9 × 5184) so the intent is legible; asserted against the computed product by the
-## gate (they agree to f64 ulp — the direct == is a 1-ulp miss, hence a tolerance there).
-const GM_SCALE := 5.184e-6
+## Time compression: game runs this many times faster than reality. STRICT 1:1000 SPACETIME (§3.3):
+## for acceleration = length/time² to be scale-INVARIANT we need s_T² = s_L ⇒ s_T = √s_L = 1/√1000, i.e.
+## time compression = 1/s_T = √1000 = 31.6227766 (NOT the old 72×). This is the value that keeps gravity
+## the SAME 9.8 for walking AND orbit and keeps the whole clock — orbits, day, sun/moon, eclipses — on ONE
+## coherent scale. Written as the literal √1000 (sqrt is not allowed in a const expr); the gate checks it.
+const TIME_COMPRESSION := 31.622776601683793
+## One Earth solar day in game seconds (= real 86400 s ÷ √1000 ≈ 2732.6 s ≈ 45.5 min). DERIVED from
+## TIME_COMPRESSION so the day tracks the one time scale (was 1200 s / 20 min under the old 72× model).
+const DAY_GAME := 86400.0 / TIME_COMPRESSION
+## The GM scaling law (§3.3): GM_game = GM_real × s_L³/s_T² = (10⁻³)³ × (√1000)² = 1e-9 × 1000 = 1e-6.
+## DERIVED (not a hand literal) so the Newton scaling law holds by construction. Under strict 1:1000 this
+## makes GM_game(earth) = 3.986e14 × 1e-6 = 3.986e8 ≈ SURFACE_GRAVITY·R² (CubeSphere.gm_for) — the far-field
+## Kepler GM and the near-field feel anchor now COINCIDE, so orbit gravity == walk gravity == 9.8 (no split).
+const GM_SCALE := LENGTH_SCALE * LENGTH_SCALE * LENGTH_SCALE * TIME_COMPRESSION * TIME_COMPRESSION
 
 ## Global time-warp multiplier (D2 note / §3.4): v1 = 1 (a warp>1 scales the SKY only unless GM is
 ## co-scaled, so it ships at 1). The clock multiplies real dt by this — the ONE knob for fast-forward.
@@ -64,7 +74,7 @@ const BODIES := {
 	},
 	"earth": {
 		"gm_real": 3.986e14, "r": 6371.0, "parent": "sun", "a": 149.6e6, "m0": 0.0,
-		"spin_period": 1200.0, "spin_phase0": 0.0, "tidal": false,
+		"spin_period": DAY_GAME, "spin_phase0": 0.0, "tidal": false,   # one solar day = √1000-scaled ≈ 2732.6 s
 		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
 	},
 	"moon": {
@@ -86,7 +96,7 @@ class CosmosClock extends RefCounted:
 	func _init(t0: float = 0.0) -> void:
 		t = t0
 
-	## Advance the clock by a REAL frame delta (seconds); the sky moves 72× via the scaled GM, and
+	## Advance the clock by a REAL frame delta (seconds); the sky moves √1000× via the scaled GM, and
 	## TIME_WARP (=1) is the only extra multiplier. Pure accumulation — no wall clock is read here.
 	func advance(real_dt: float) -> void:
 		t += real_dt * CosmosEphemeris.TIME_WARP
@@ -104,8 +114,9 @@ static func has_body(body: String) -> bool:
 static func gm_real(body: String) -> float:
 	return float(BODIES[body]["gm_real"])
 
-## GM_game = GM_real × GM_SCALE — DERIVED so the scaling law is exact (§3.3). Matches the doc's
-## canonical hand-values (2.066e9 / 2.543e7 / 6.880e14) to 4 sig figs (gate asserts).
+## GM_game = GM_real × GM_SCALE — DERIVED so the scaling law is exact (§3.3). Under the natural strict-1:1000
+## clock (GM_SCALE = 1e-6) the canonical values are 3.986e8 (earth) / 4.905e6 (moon) / 1.327e14 (sun) — the
+## earth value equals SURFACE_GRAVITY·R² (gate asserts).
 static func gm_game(body: String) -> float:
 	return float(BODIES[body]["gm_real"]) * GM_SCALE
 

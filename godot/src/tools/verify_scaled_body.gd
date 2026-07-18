@@ -22,7 +22,7 @@ extends SceneTree
 ##       --script res://src/tools/verify_scaled_body.gd 2>/dev/null | grep VERIFY
 ## Exits 0 all-pass / 1 on any failure.
 
-const R := 3072.0                     # FacetAtlas.R_BLOCKS (the home body voxel radius)
+const R := FacetAtlas.R_BLOCKS        # the home body voxel radius (Earth/1000 = 6371); tracks the rescale
 
 var _pass := 0
 var _fail := 0

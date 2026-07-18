@@ -40,9 +40,9 @@ func _initialize() -> void:
 	FA.warm_up()
 	var active := FA.spawn_facet()
 	TerrainConfig.set_active_facet(active)
-	print("  atlas: k=%d, R=%.0f, active(spawn)=%d, near_render_radius=%d, FULL_COVER=%s, BACKSTOP_SINK=%.1f, BACKSTOP_CELLS=%d" % [
+	print("  atlas: k=%d, R=%.0f, active(spawn)=%d, near_render_radius=%d, FULL_COVER=%s, sink(derived)=%.2f, BACKSTOP_CELLS=%d" % [
 		FA.K, FA.R_BLOCKS, active, TerrainConfig.near_render_radius(),
-		str(CubeSphere.FP_FARRING_FULL_COVER), CubeSphere.BACKSTOP_SINK, CubeSphere.BACKSTOP_CELLS])
+		str(CubeSphere.FP_FARRING_FULL_COVER), TierPlace.backstop_sink(), CubeSphere.BACKSTOP_CELLS])
 	if CubeSphere.FP_FARRING_FULL_COVER:
 		_gate_cover_on(active)
 		_gate_nopoke(active)
@@ -160,7 +160,7 @@ func _gate_cover_off(active: int) -> void:
 func _gate_nopoke(active: int) -> void:
 	print("  --- G-FRC-NOPOKE: sunk backstop < near surface (mountain-foothill spawn sweep, per-block) ---")
 	var cells := CubeSphere.BACKSTOP_CELLS
-	var sink := CubeSphere.BACKSTOP_SINK
+	var sink := TierPlace.backstop_sink()               # the DERIVED sink actually applied at emit (frac × cell size)
 	var near := float(TerrainConfig.near_render_radius())
 	var edge_blocks := (PI * 0.5 * FA.R_BLOCKS) / float(FA.K)     # ≈ 201 blocks per facet edge
 	# spawn sweep: the active facet + the three worst-relief (mountainous) facets — the worst chord error lives there.
@@ -194,7 +194,7 @@ func _gate_nopoke(active: int) -> void:
 	_ok(worst < 0.0,
 		"G-FRC-NOPOKE: backstop below near everywhere (worst margin %.2f blocks < 0; chord err %.2f vs sink %.1f, cells=%d, facet %d, near g=%d bs g=%.1f)"
 		% [worst, worst + sink, sink, cells, worst_fid, worst_near, worst_bs])
-	print("    NOPOKE worst chord error = %.2f blocks (need < BACKSTOP_SINK = %.1f); if it exceeds, raise BACKSTOP_CELLS to 32" % [worst + sink, sink])
+	print("    NOPOKE worst chord error = %.2f blocks (need < derived sink = %.2f, margin %.2f); if it exceeds, raise BACKSTOP_CELLS to 32" % [worst + sink, sink, -worst])
 
 # ---------- G-FRC-BOUND (flag ON): NEVER-OOM — bounded tris + bounded backstop cache ----------
 func _gate_bound(active: int) -> void:

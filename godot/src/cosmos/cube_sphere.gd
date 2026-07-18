@@ -286,6 +286,10 @@ const FP_FARRING_FULL_COVER := false
 ## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
+## Rescale-safe backstop sink: TierPlace.backstop_sink() derives the radial sink as BACKSTOP_SINK_FRAC × the facet
+## cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge = (π/2·R)/K), so it scales with R and clears the coarse-grid
+## facet chord sagitta at any radius (≈6 at R=3072, ≈13 at R=6371). 0.5 reproduces the shipped 6-block sink at R=3072.
+const BACKSTOP_SINK_FRAC := 0.5
 
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4

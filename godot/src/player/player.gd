@@ -31,6 +31,9 @@ const _FacetAtlasCls := preload("res://src/cosmos/facet_atlas.gd")
 const _DevFlightCls := preload("res://src/cosmos/cosmos_dev_flight.gd")
 # COSMOS SPACE-NAV SN5b (§7.3): the dev-nav overlay set (compass + guides). Lazy-built on F, freed on toggle.
 const _DevNavOverlayCls := preload("res://src/player/dev_nav_overlay.gd")
+# COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §7): the pure inertial-attitude kernel. DEAD unless
+# CubeSphere.ORBIT_ATTITUDE (same FLM/FLB preload convention — the machine below never leaves SURFACE off-flag).
+const _CosmosAttitudeCls := preload("res://src/cosmos/cosmos_attitude.gd")
 
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
@@ -113,6 +116,17 @@ var _dev_orbital_commit := false
 # (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
 var _fall_v_bci := PackedFloat64Array()
 var _fall_have_v := false
+
+# COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3) — the inertial-attitude state machine. ALL DEAD
+# (mode pinned ATT_SURFACE, camera never emancipated) unless CubeSphere.ORBIT_ATTITUDE AND _nav != null, so the
+# input/camera/window_camera_transform branches all fall through to the shipped surface FPS path (byte-identical).
+# SURFACE = shipped clamped-euler (rotation.y + _pitch). SPACE = the BCI quaternion _att_q (facet-decoupled,
+# 6DOF). RECOVER = the landing slerp back to a gravity-aligned surface pose (Phase C; Phase A hands back instantly).
+const ATT_SURFACE := 0
+const ATT_SPACE := 1
+const ATT_RECOVER := 2                          # (Phase C) the smooth landing-recovery blend state
+var _att_mode := ATT_SURFACE
+var _att_q := Quaternion.IDENTITY              # the camera basis in the BCI (inertial) frame (SPACE)
 
 var _camera: Camera3D
 var _ray: RayCast3D
@@ -276,8 +290,87 @@ func camera_global_transform() -> Transform3D:
 ## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state
 ## (yaw via global_transform, _pitch) NOT from _camera.global (which we override), so there is no feedback loop.
 func window_camera_transform() -> Transform3D:
+	# COSMOS ORBIT-FRAME (§3.3): in SPACE/RECOVER the displayed camera is the inertial 6DOF pose, not the euler
+	# reconstruction — this ONE seam is what makes dev-flight wishes, the SN5b compass, aim and the prewarm all
+	# consume the 6DOF attitude with no further edits (§5). Flag off / SURFACE ⇒ the shipped euler transform,
+	# byte-identical. The origin is the SAME eye-height offset in both branches (only the basis differs).
+	if CubeSphere.ORBIT_ATTITUDE and _att_mode != ATT_SURFACE:
+		return Transform3D(_attitude_scene_basis(), global_transform * Vector3(0, eye_height, 0))
 	var cam_local := Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
 	return global_transform * cam_local
+
+## COSMOS ORBIT-FRAME (§3.2): the current DISPLAYED scene (render) basis while in SPACE — R_z(−θ)·Basis(q_bci).
+## θ is read fresh from the f64 nav clock (no basis accumulation ⇒ no f32 drift). (Phase C adds the RECOVER blend.)
+func _attitude_scene_basis() -> Basis:
+	var theta := _EphCls.spin_angle("earth", _nav_clock)
+	return _CosmosAttitudeCls.scene_basis(_att_q, theta)
+
+## The active facet's lattice basis in scene coords (b_active), or identity off-facet. Used by the attitude seam.
+func _attitude_active_basis() -> Basis:
+	var fid := TerrainConfig.active_facet()
+	return _FacetAtlasCls.frame_basis(fid) if fid >= 0 else Basis()
+
+## COSMOS ORBIT-FRAME (§3.2) — advance the SURFACE/SPACE/RECOVER machine one physics tick. The trigger is the
+## COMMITTED nav mode (PLANETARY ⇔ h < 384±32 with the 2-s dwell — reused so the attitude inherits exactly the
+## nav hysteresis and can never flap faster than the HUD). It writes ONLY the camera node's global transform in
+## SPACE/RECOVER and hands back the surface euler on landing — it NEVER touches position/velocity (the pilot's
+## position mechanics — hover drift, free-fall, dev-flight — compose untouched). Only reached under the flag.
+func _attitude_tick(delta: float) -> void:
+	var committed_planetary := int(_nav.mode) == _CosmosNavCls.PLANETARY
+	var theta := _EphCls.spin_angle("earth", _nav_clock)
+	match _att_mode:
+		ATT_SURFACE:
+			# Leave PLANETARY ⇒ go inertial. Seed q_bci from the CURRENT displayed (child-camera) basis so the
+			# view does not pop (C0), then emancipate the camera and write the space pose.
+			if not committed_planetary:
+				_att_q = _CosmosAttitudeCls.seed_bci(_camera.global_transform.basis, theta)
+				_att_mode = ATT_SPACE
+				_camera.top_level = true
+				_write_attitude_camera()
+		ATT_SPACE:
+			# Q/E roll (held keys — a continuous rate, so polled here not in _unhandled_input).
+			var roll := 0.0
+			if Input.is_key_pressed(KEY_Q): roll += 1.0
+			if Input.is_key_pressed(KEY_E): roll -= 1.0
+			if roll != 0.0:
+				_att_q = _CosmosAttitudeCls.apply_roll(_att_q, roll, delta, CubeSphere.ORBIT_ROLL_RATE)
+			# Return to PLANETARY (or a fast fall reaching the ground inside the dwell) ⇒ recover the surface pose.
+			if committed_planetary or _attitude_ground_contact():
+				_attitude_leave_space(theta)
+			else:
+				_write_attitude_camera()
+
+## Leave SPACE for the surface: derive the gravity-aligned surface (yaw*, pitch*) from the current displayed
+## basis and hand back INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0, documented). Phase C
+## (ORBIT_LAND_RECOVER) replaces this instant hand-back with a smooth slerp (the ATT_RECOVER state).
+func _attitude_leave_space(theta: float) -> void:
+	var b_scene := _CosmosAttitudeCls.scene_basis(_att_q, theta)
+	var tp := _CosmosAttitudeCls.recover_target(_attitude_active_basis(), b_scene)
+	_attitude_handback(tp.x, tp.y)
+
+## Hand the surface FPS parametrization back: write rotation.y/_pitch, un-emancipate the camera to its shipped
+## child pose, return to SURFACE. The child basis b_active·R_y(yaw)·R_x(pitch) equals the displayed basis at
+## α=1, so there is no jump at the hand-back frame (Phase C); Phase A drops any residual roll here.
+func _attitude_handback(yaw: float, pitch: float) -> void:
+	rotation.y = yaw
+	_pitch = clampf(pitch, -1.5, 1.5)
+	_camera.top_level = false
+	_camera.transform = Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
+	_att_mode = ATT_SURFACE
+
+## Write the emancipated camera's global transform to the current SPACE/RECOVER pose (the M5_REAL top_level
+## mechanism). The pose (basis + eye origin) is exactly window_camera_transform() in these modes, so aim + any
+## camera-derived wish stay consistent through the one seam.
+func _write_attitude_camera() -> void:
+	_camera.global_transform = window_camera_transform()
+
+## Ground-contact safety trigger (§3.2): while NOT flying, a fast free-fall can reach the surface inside the 2-s
+## nav dwell — recover before the player stands on terrain with a space attitude. Flying (dev-nav) never counts
+## (you recover when the nav mode commits PLANETARY, not while actively flying).
+func _attitude_ground_contact() -> bool:
+	if flying or world == null:
+		return false
+	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
 
 ## COSMOS R2.2: place the DISPLAYED camera at the given (epoch-frame) transform. Physics/aim stay window.
 func set_render_camera(t: Transform3D) -> void:
@@ -297,9 +390,15 @@ func _unhandled_input(event: InputEvent) -> void:
 	if frozen:
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		rotate_y(-event.relative.x * mouse_sensitivity)
-		_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
-		_camera.rotation.x = _pitch
+		# COSMOS ORBIT-FRAME (§3.4): in SPACE the mouse composes CAMERA-LOCAL quaternion increments (yaw + UNLIMITED
+		# pitch) on the BCI attitude; in RECOVER it drives the surface recovery target (clamped). Flag off / SURFACE
+		# ⇒ the shipped clamped-euler handler BYTE-IDENTICALLY (the machine never leaves SURFACE with the flag off).
+		if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
+			_att_q = _CosmosAttitudeCls.apply_look(_att_q, event.relative.x, event.relative.y, mouse_sensitivity)
+		else:
+			rotate_y(-event.relative.x * mouse_sensitivity)
+			_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
+			_camera.rotation.x = _pitch
 	elif event is InputEventMouseButton and event.pressed:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			_capture_mouse()
@@ -407,6 +506,11 @@ func _physics_process(delta: float) -> void:
 	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
 	if _nav != null:
 		_nav_tick(delta)
+	# COSMOS ORBIT-FRAME (§3.2): advance the inertial-attitude machine AFTER the nav tick, so it reads the
+	# freshest COMMITTED nav mode + the just-advanced clock. DEAD unless the flag AND the nav machine are live —
+	# off-flag the machine never leaves SURFACE, the camera node is never emancipated, so this is byte-identical.
+	if CubeSphere.ORBIT_ATTITUDE and _nav != null:
+		_attitude_tick(delta)
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
 ## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world

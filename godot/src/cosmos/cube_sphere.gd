@@ -643,6 +643,24 @@ const SN_ATMO_BRAKING := false
 ## still storms; raise toward 55 once a pre-gen landing column removes the streaming constraint).
 const ATMO_BRAKE_TERMINAL := 25.0
 
+## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
+## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
+## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,
+## no pop), decouples the camera from the facet frame (top_level global write B_cam = R_z(−θ)·Basis(q)), and
+## routes mouse to camera-local yaw + UNLIMITED pitch and Q/E to roll. Returning to PLANETARY re-derives the
+## surface FPS yaw/pitch and hands back INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0; the
+## smooth slerp is Phase C, ORBIT_LAND_RECOVER). This alone fixes BOTH live-pilot bugs ("sky rotates with the
+## planet" + "roll/pitch tied to the facet"): the star dome is ALREADY inertially fixed (R_z(−θ)), so making the
+## camera inertial freezes the stars and detaches the attitude with ZERO sky-render change. Requires SN_NAV_MODES
+## (reads player._nav) AND FACETED. Default FALSE ⇒ BYTE-IDENTICAL: the machine never leaves SURFACE, the
+## input/camera/window_camera_transform branches all fall through to the shipped surface FPS path, the camera
+## node is never emancipated. Gates G-ORBIT-ATT (seed round-trip / >90° pitch / roll / inertial hold) + G-ORBIT-SKY
+## (the −θ dome counter-rotation regression). LIVE-ONLY: the top_level camera render + the feel of 6DOF + frozen stars.
+const ORBIT_ATTITUDE := false
+## ORBIT-FRAME tunable (live-tuned): the Q/E roll rate (rad/s). Consulted only under ORBIT_ATTITUDE in SPACE;
+## the pure kernel takes it as an argument so the gate drives it directly. (Phases B/C add their own flags.)
+const ORBIT_ROLL_RATE := 1.2
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

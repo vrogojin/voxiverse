@@ -55,6 +55,7 @@ func _initialize() -> void:
 	print("  atlas: k=%d, R=%.0f, active(spawn)=%d, OFFSURFACE_Y=%.0f, CAP_MAX=%.0f°, RELIEF=%.0f°, SLACK=%.0f°, CAMERA_SET=%s, PREWARM=%s" % [
 		FA.K, _R, active, CubeSphere.OFFSURFACE_Y, CubeSphere.SHELL_CAP_MAX_DEG,
 		CubeSphere.SHELL_RELIEF_DEG, CubeSphere.SHELL_SLACK_DEG, str(CubeSphere.FP_SHELL_CAMERA_SET), str(CubeSphere.FP_SHELL_PREWARM)])
+	_gate_live(active)
 	_gate_cover(active)
 	_gate_antipode(active)
 	_gate_bound(active)
@@ -127,6 +128,46 @@ func _test_axes(active: int) -> Array:
 	var n := Vector3(nrm[0], nrm[1], nrm[2]).normalized()
 	var pe := _perp(n)
 	return [n, -n, pe[0], -pe[0], pe[1], -pe[1]]
+
+# ---------------- G-SHELL-LIVE (the driver→warm→_process→emit chain the direct-call gates never exercised) ----------------
+## Reproduces the LIVE far-side-blank stall headless: drive the real per-frame driver (apply_camera_set) to an orbit
+## over the spawn ANTIPODE with a COLD cache, then step _process. The shipped all-or-nothing warm gate would emit NOTHING
+## until the whole ~1900-facet cap caches in one 3 ms frame (impossible on web) — the bug. S1b's progressive emit must
+## instead emit a growing cached subset from the first frame and CONVERGE to the full antipode cap.
+func _gate_live(active: int) -> void:
+	print("  --- G-SHELL-LIVE: real driver→warm→_process→emit converges to full coverage (the live-stall regression) ---")
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active)                # setup emits the SPAWN hemisphere; the antipode cap starts cold + unemitted
+	var nrm := FA.facet_normal64(active)
+	var anti := -Vector3(nrm[0], nrm[1], nrm[2]).normalized()
+	var d: float = _R + 500.0                 # LEO
+	# Drive the REAL frame path: render-frame camera = placement · (dir · d). apply_camera_set maps it back to ĉ_abs.
+	var base := FA.facet_transform(active).affine_inverse()
+	var cam: Vector3 = base * (anti * d)
+	ring.call("apply_camera_set", cam)        # engages the camera-set law (off-surface, not floored) + sets _pending
+	_ok(bool(ring.call("shell_cam_set")), "G-SHELL-LIVE: driver engaged the camera-set law")
+	# the full antipode-cap target under the engaged axis (cache-independent; excludes the active facet with FULL_COVER off).
+	var target := int((ring.call("visible_fids") as PackedInt32Array).size())
+	_ok(target > 100, "G-SHELL-LIVE: antipode visible cap is substantial (%d facets)" % target)
+	# ONE _process frame: the fix emits a NON-EMPTY partial subset without the whole cap being warmed (shipped gate ⇒ 0).
+	ring.call("_process", 0.016)
+	var after1 := int(ring.call("emitted_count"))
+	_ok(after1 > 0, "G-SHELL-LIVE: emit fires on the FIRST frame without full warm (%d facets; the shipped all-or-nothing gate would be 0)" % after1)
+	_ok(after1 < target, "G-SHELL-LIVE: the first frame is a PARTIAL cached subset (%d < %d) — progressive, not all-or-nothing" % [after1, target])
+	# step to convergence: the cached subset grows to the full antipode cap.
+	var frames := 1
+	while int(ring.call("emitted_count")) < target and frames < 2000:
+		ring.call("_process", 0.016)
+		frames += 1
+	var final := int(ring.call("emitted_count"))
+	_ok(final == target, "G-SHELL-LIVE: converged to the FULL antipode cap (%d/%d facets) in %d frames" % [final, target, frames])
+	var tel: Dictionary = ring.call("shell_telemetry")
+	_ok(int(tel.get("sh_begin", 0)) >= 2 and int(tel.get("sh_wfail", 0)) >= 1,
+		"G-SHELL-LIVE: multiple progressive re-emits (begin=%d) and the warm gate genuinely failed early (wfail=%d) — the stall path is exercised" % [int(tel.get("sh_begin", 0)), int(tel.get("sh_wfail", 0))])
+	_ok(int(tel.get("sh_emit", -1)) == target and int(tel.get("sh_visN", -1)) == target and int(tel.get("sh_cachedN", -1)) == target,
+		"G-SHELL-LIVE: telemetry agrees at convergence (emit=%d visN=%d cachedN=%d target=%d)" % [int(tel.get("sh_emit", -1)), int(tel.get("sh_visN", -1)), int(tel.get("sh_cachedN", -1)), target])
+	ring.free()
 
 # ---------------- G-SHELL-COVER ----------------
 func _gate_cover(active: int) -> void:

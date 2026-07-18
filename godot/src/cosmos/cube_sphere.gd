@@ -574,6 +574,17 @@ const SHELL_CAP_MAX_DEG := 96.0   # emit cap ceiling (facet-centre test grants ~
 ## session (a cursor). Default OFF ⇒ never armed, byte-identical (FLAT 6035/0). Requires FACETED. Depends on S1 only.
 const FP_SHELL_PREWARM := false
 const SHELL_PREWARM_DWELL_S := 5.0   # seconds sustained above OFFSURFACE_Y before the one-shot warm arms (ignores a brief pop above the ceiling)
+## COSMOS ORBITAL-SHELL S1b (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3) — PROGRESSIVE emit in the true-orbit regime.
+## The shipped far ring emits only after _warm_front caches EVERY front-hemisphere facet within one WARM_BUDGET_MS
+## frame (all-or-nothing). On the surface that holds — you cross facet-by-facet and the cap stays warm — but entering
+## orbit exposes ~1900 never-visited facets AT ONCE, and on web (×25 profile cost) that cap can never cache in a
+## single 3 ms frame, so _begin_rebuild never fires post-ascent and the far side stays stale (the live bug the
+## direct-call gates never exercised). Under FP_SHELL_CAMERA_SET, off-surface (not floored) the emit proceeds on the
+## CACHED SUBSET each rebuild and grows as _warm_front + FP_SHELL_PREWARM fill the cache — re-emitted every
+## SHELL_REEMIT_GROWTH newly-cached facets — so coverage appears immediately and converges, never stalling. The
+## async worker still only ever reads cached facets (the emitted set is cache-filtered), preserving its read-only
+## contract. The SURFACE (floored) + flag-off paths keep the shipped all-or-nothing warm gate verbatim (byte-identical).
+const SHELL_REEMIT_GROWTH := 64      # re-emit the growing cached cap every N newly-cached facets (progressive-fill cadence)
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),

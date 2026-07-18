@@ -426,6 +426,12 @@ func apply_scaled_camera_planes(h: float, d: float) -> void:
 		_camera.near = CosmosScale.camera_near(h)
 		_camera.far = CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
 
+## COSMOS-ORBITAL-SHELL H-B telemetry: the LIVE camera far plane (blocks). At orbit distance d the far ring's limb
+## sits at √(d²−R²) from the camera; if far < that the limb-ward part of the visible disc is CLIPPED (the far side
+## reads blank even though the shell emitted it). Read-only; the remote bridge streams it alongside the shell state.
+func camera_far() -> float:
+	return _camera.far if _camera != null else 0.0
+
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:
 		return

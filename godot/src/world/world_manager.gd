@@ -2241,6 +2241,13 @@ func update_shell_camera_set(cam: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.apply_camera_set(cam)
 
+## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
+## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).
+func shell_telemetry() -> Dictionary:
+	if _facet_ring == null or not _facet_ring.has_method("shell_telemetry"):
+		return {}
+	return _facet_ring.shell_telemetry()
+
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets
 ## the accumulators — RemoteBridge samples it once per telemetry window so a 0.5 s snowfall spike is attributed as its own

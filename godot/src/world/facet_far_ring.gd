@@ -108,6 +108,19 @@ var _emit_floored_last := false             # the surface-floor state at the las
 var _offsurface := false                    # set by the per-frame driver: camera radial altitude > OFFSURFACE_Y
 var _offsurface_dwell := 0.0                # seconds sustained off-surface (the S2 warm arms after SHELL_PREWARM_DWELL_S)
 var _prewarm_cursor := -1                   # -1 = not started; 0..6·K² = next fid to warm; ≥ total = done (one-shot)
+# COSMOS-ORBITAL-SHELL S1b (§3): progressive cached-subset emit in the true-orbit regime (see SHELL_REEMIT_GROWTH).
+var _emit_cached_only := false              # the current rebuild emits ONLY cache-ready facets (true-orbit progressive path)
+var _last_emit_cache_size := 0             # total cached facets at the last progressive re-emit (re-emit-on-growth throttle)
+var _was_done := false                      # _warm_front returned true last orbit frame (fire ONE final full emit on completion, no prewarm-churn)
+# Live-path telemetry counters/values (remote_bridge streams shell_telemetry() → disambiguate the live driver→warm→emit chain).
+var _begin_rebuild_count := 0               # times _begin_rebuild fired (0 post-engage ⇒ the emit never runs = warm-gate stall)
+var _warm_pass_count := 0                   # _warm_front returned true (cap fully cached in one frame)
+var _warm_fail_count := 0                   # _warm_front returned false (budget spent before the cap was fully cached)
+var _dbg_true_dir: Array = [0.0, 0.0, 0.0]  # the latest ABSOLUTE sub-camera direction (driver input) — compare to _emit_axis for H-C
+var _dbg_d := 0.0                           # latest camera distance from the body centre
+var _dbg_h := 0.0                           # latest radial altitude h = d − R
+var _dbg_theta_emit_deg := 0.0              # latest θ_emit (deg)
+var _dbg_scale := 1.0                       # latest SN3 scaled-body scale s (1.0 = no clamp) — H-B far-plane/placement signal
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -156,6 +169,7 @@ func render_centre() -> Vector3:
 func apply_scaled_placement(cam: Vector3) -> void:
 	var base := _placement_xform()
 	var s := CosmosScale.scale_for(cam.distance_to(base.origin), FacetAtlas.R_BLOCKS)
+	_dbg_scale = s                                  # H-B telemetry: the SN3 clamp scale actually applied to the ring this frame
 	transform = CosmosScale.scale_about_camera(cam, s) * base   # s == 1 ⇒ identity·base == base (near regime unchanged)
 
 ## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): the per-frame camera-set driver. `cam`
@@ -173,12 +187,15 @@ func apply_camera_set(cam: Vector3) -> void:
 	var d := rel.length()
 	var h := d - FacetAtlas.R_BLOCKS
 	_offsurface = h > CubeSphere.OFFSURFACE_Y         # S2 prewarm arming (drives the dwell in _prewarm_step)
+	_dbg_d = d
+	_dbg_h = h
 	if not CubeSphere.FP_SHELL_CAMERA_SET:
 		return                                        # S2-only run: prewarm the cache without changing the emitted-set law
 	var abs_rel := base.basis.inverse() * rel         # rotate the render-frame offset back into ABSOLUTE mesh space
 	if abs_rel.length() < 1.0e-6:
 		return                                        # camera at the body centre (degenerate) — keep the last axis
 	var u := abs_rel.normalized()
+	_dbg_true_dir = [u.x, u.y, u.z]                   # H-C telemetry: the TRUE sub-camera direction the driver fed in
 	shell_set_camera_abs([u.x, u.y, u.z], d, h < CubeSphere.OFFSURFACE_Y)
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the emitted-set law core, driven from the ABSOLUTE sub-camera direction `dir`
@@ -195,6 +212,7 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 			deg_to_rad(CubeSphere.SHELL_CAP_MAX_DEG))
 	if floored:
 		theta_emit = maxf(theta_emit, deg_to_rad(90.0))       # surface floor: keep the shipped hemisphere while near tiers are live
+	_dbg_theta_emit_deg = rad_to_deg(theta_emit)
 	var new_cos := cos(theta_emit)
 	if not _cam_set:
 		_cam_set = true                                       # first engage → snapshot + force a re-emit onto the camera axis
@@ -288,14 +306,42 @@ func set_pool_excluded(fids: Array) -> void:
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
 	_prewarm_step(_dt)               # COSMOS-ORBITAL-SHELL S2: one-shot whole-planet warm (no-op unless FP_SHELL_PREWARM + off-surface)
-	if not _pending or _async_building:
+	if _async_building:
 		return
 	# COSMOS-ORBITAL-SHELL S1: the emit cull axis + threshold — ĉ + cos(θ_emit) when the camera-set law is engaged,
 	# else the shipped active-facet normal + BACK_CULL (byte-identical). Both _warm_front and the rebuild's
 	# visible_fids() consume THIS pair, so the warmed set and the emitted set can never disagree.
 	var p := _cull_params()
-	if _warm_front(p[0], p[1]):      # all front-hemisphere facets cached → safe to re-emit this frame
-		_begin_rebuild()
+	if _cam_set and not _emit_floored_last:
+		# COSMOS-ORBITAL-SHELL S1b (§3): TRUE ORBIT — progressive cached-subset emit. Never block the whole rebuild on
+		# the ~1900-facet cap being cached in ONE frame (impossible under web ×25 warm cost → the live far-side stall).
+		# Warm cumulatively under budget, emit the cache-ready subset now, re-emit as coverage grows (throttled by
+		# SHELL_REEMIT_GROWTH). The async worker still reads only cache-ready facets (visible_fids cache-filters here).
+		var done := _warm_front(p[0], p[1])
+		if done:
+			_warm_pass_count += 1
+		else:
+			_warm_fail_count += 1
+		var sz := _pos_cache.size() + _bpos_cache.size()
+		# Re-emit: on a fresh drift/engage (_pending); every SHELL_REEMIT_GROWTH newly-cached facets WHILE still filling
+		# the front cap (progressive reveal); and ONCE when the front cap just finished caching (done ↑) to capture the
+		# tail. Once done, the growth trigger is gated off so background prewarm back-filling never churns re-emits.
+		var grew := (not done) and (sz - _last_emit_cache_size) >= CubeSphere.SHELL_REEMIT_GROWTH
+		if _pending or grew or (done and not _was_done):
+			_last_emit_cache_size = sz
+			_emit_cached_only = true
+			_begin_rebuild()
+		_was_done = done
+	else:
+		# SURFACE (floored) / shipped: the all-or-nothing warm gate (byte-identical; the worker never sees an uncached facet).
+		if not _pending:
+			return
+		_emit_cached_only = false
+		if _warm_front(p[0], p[1]):   # all front-hemisphere facets cached → safe to re-emit this frame
+			_warm_pass_count += 1
+			_begin_rebuild()
+		else:
+			_warm_fail_count += 1
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
@@ -314,6 +360,7 @@ func _async_enabled() -> bool:
 
 ## Complete a warmed pending rebuild: dispatch it to a worker (async path) or build it inline (synchronous fallback).
 func _begin_rebuild() -> void:
+	_begin_rebuild_count += 1        # S1b telemetry: prove the emit actually runs post-engage (0 ⇒ warm-gate stall)
 	if _async_enabled():
 		_dispatch_async_rebuild()
 	else:
@@ -324,7 +371,9 @@ func _begin_rebuild() -> void:
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
 func _dispatch_async_rebuild() -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
-	_async_fids = visible_fids()     # every fid here is warmed already (_warm_front gated the dispatch)
+	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
+	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
+	_async_fids = visible_fids(_emit_cached_only)
 	# COSMOS far-ring full coverage (§4): freeze the backstop role on the MAIN thread so the worker never reads `_excluded`
 	# live (set_pool_excluded may mutate it mid-run). Only populated under FULL_COVER; empty otherwise → worker sinks nothing.
 	_async_backstop = {}
@@ -467,7 +516,7 @@ func _recompute_sticky() -> void:
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
 func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
-	var fids := visible_fids()
+	var fids := visible_fids(_emit_cached_only)   # S1b: cache-filtered in the true-orbit progressive path, full set otherwise (shipped)
 	_emitted.clear()
 	_emitted_backstop.clear()   # TIER-DEPTH P1: record which fids this build draws SUNK (the make-before-break gate reads it)
 	for fid in fids:
@@ -499,7 +548,7 @@ func _rebuild_full() -> void:
 
 ## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
 ## mesh assemblers + the equivalence gate consume this so their vertex/color/normal arrays are index-aligned.
-func visible_fids() -> PackedInt32Array:
+func visible_fids(cached_only := false) -> PackedInt32Array:
 	var out := PackedInt32Array()
 	var k := FacetAtlas.K
 	# COSMOS-ORBITAL-SHELL S1: the same cull axis + threshold _warm_front consumed, so the warmed and emitted sets agree.
@@ -510,9 +559,22 @@ func visible_fids() -> PackedInt32Array:
 		for a in range(k):
 			for b in range(k):
 				var fid := (face * k + a) * k + b
-				if _front_visible(fid, nrm, thresh):
-					out.append(fid)
+				if not _front_visible(fid, nrm, thresh):
+					continue
+				# S1b: the true-orbit progressive path emits only cache-ready facets (grows as the cache fills); every
+				# other caller passes cached_only=false ⇒ the shipped full front set (byte-identical).
+				if cached_only and not _emit_cache_ready(fid):
+					continue
+				out.append(fid)
 	return out
+
+## COSMOS-ORBITAL-SHELL S1b (§3): is facet `fid`'s emit cache present? Backstop facets (FULL_COVER) render from the
+## dense _bpos_cache; every other facet from the shipped coarse _pos_cache. Used to filter the progressive orbit set
+## so the async worker (and the sync assembler) only ever touch a facet whose cache exists.
+func _emit_cache_ready(fid: int) -> bool:
+	if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+		return _bpos_cache.has(fid)
+	return _pos_cache.has(fid)
 
 ## SHIPPED assembler: per-vertex SurfaceTool emission + generate_normals (the ~332k GDScript→C++ round-trip path).
 func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
@@ -562,6 +624,7 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 ## always immediate + main-thread, regardless of the async flag.
 func force_rebuild() -> void:
 	_join_async_rebuild()
+	_emit_cached_only = false        # S1b: force_rebuild always emits the FULL front set (warms as needed) — gate + set_excluded semantics
 	_rebuild_full()
 
 ## COSMOS-PERF STEP 2: block until any in-flight worker finishes and discard its result (a synchronous rebuild is about
@@ -616,6 +679,59 @@ func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE):
 func shell_emit_cos() -> float: return _emit_cos                # cos(θ_emit): the current emit threshold
 func coarse_cache_size() -> int: return _pos_cache.size()       # S2: how many facets' coarse caches are warmed (prewarm ≤ 6·K²)
 func prewarm_cursor() -> int: return _prewarm_cursor            # S2: prewarm progress (≥ 6·K² ⇒ one-shot complete)
+
+## COSMOS-ORBITAL-SHELL live-path telemetry (remote_bridge streams this) — disambiguates the driver→warm→emit→draw
+## chain the direct-call gates never exercised. Returns {} when the camera-set law is NOT engaged (flag off / never
+## driven) so a shipped/flag-off build stamps NOTHING (byte-identical telemetry). Fields:
+##  sh_cam       camera-set law engaged
+##  sh_emit      emitted facet count (H-A: small/stuck; H-B: ~= visN but the far side is still blank ⇒ a DRAW problem)
+##  sh_visN      front-visible target count under the current axis (what SHOULD be emitted)
+##  sh_cachedN   how many of the target are cache-ready right now (H-A: cachedN << visN ⇒ warm/prewarm is the bottleneck)
+##  sh_cached / sh_bcached / sh_prewarm   coarse+dense cache fill + the one-shot prewarm cursor (→ 6·K² = complete)
+##  sh_off / sh_dwell / sh_pend / sh_build   driver arming + pipeline state
+##  sh_reemit / sh_begin / sh_wpass / sh_wfail   re-emit + begin_rebuild counts + warm pass/fail (H-A: wfail≫0, begin≈0)
+##  sh_axdot     dot(_emit_axis, true sub-camera dir) — ~1 aligned; low/negative ⇒ H-C (wrong emit hemisphere)
+##  sh_theta / sh_d / sh_h / sh_scale   θ_emit(deg), distance, altitude, SN3 clamp scale (H-B far-plane/placement signal)
+func shell_telemetry() -> Dictionary:
+	if not _cam_set:
+		return {}
+	var p := _cull_params()
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var visN := 0
+	var cachedN := 0
+	var k := FacetAtlas.K
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				if _front_visible(fid, nrm, thresh):
+					visN += 1
+					if _emit_cache_ready(fid):
+						cachedN += 1
+	var axdot: float = _emit_axis[0] * _dbg_true_dir[0] + _emit_axis[1] * _dbg_true_dir[1] + _emit_axis[2] * _dbg_true_dir[2]
+	return {
+		"sh_cam": _cam_set,
+		"sh_emit": _emitted.size(),
+		"sh_visN": visN,
+		"sh_cachedN": cachedN,
+		"sh_cached": _pos_cache.size(),
+		"sh_bcached": _bpos_cache.size(),
+		"sh_prewarm": _prewarm_cursor,
+		"sh_off": _offsurface,
+		"sh_dwell": snappedf(_offsurface_dwell, 0.1),
+		"sh_pend": _pending,
+		"sh_build": _async_building,
+		"sh_reemit": _reemit_count,
+		"sh_begin": _begin_rebuild_count,
+		"sh_wpass": _warm_pass_count,
+		"sh_wfail": _warm_fail_count,
+		"sh_axdot": snappedf(axdot, 0.001),
+		"sh_theta": snappedf(_dbg_theta_emit_deg, 0.1),
+		"sh_d": snappedf(_dbg_d, 0.1),
+		"sh_h": snappedf(_dbg_h, 0.1),
+		"sh_scale": snappedf(_dbg_scale, 0.0001),
+	}
 
 ## TIER-DEPTH P2 gate: the SUNK (as-rendered) dense backstop vertex positions for facet `fid` — the cache (envelope or
 ## constant-relief) pushed in by the current emit sink (TierPlace.backstop_sink). The gate projects these onto the near

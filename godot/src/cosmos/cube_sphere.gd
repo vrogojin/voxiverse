@@ -897,6 +897,14 @@ const BODY_R := {
 	"moon": 1737,
 }
 
+## COSMOS-ORBITAL-O1O4 §3.1 (Part B, O4) — the WALKABLE-MOON master toggle. When true, FacetAtlas.warm_up
+## APPENDS the Moon's 6·14² = 1176 facets into the global fid namespace (Earth fids 0..3455 at base 0 stay
+## BIT-UNCHANGED; Moon fids at base 3456) and TerrainConfig.facet_profile dispatches Moon fids to the airless
+## moon worldgen. Default FALSE ⇒ ONLY Earth rows exist — facet_count/memory/terrain-hash are BYTE-IDENTICAL
+## to the pre-refactor tree (the G-O4-OFF / G-O4-EQ keystone). Flipped ON (sed-toggled) only by the multibody
+## gate + the future O4c SOI/landing wiring; the Moon soaks DARK (unreachable in-game) until then.
+const MULTI_BODY := false
+
 # ---------------------------------------------------------------------------------------
 # COSMOS M1 — the single, easily-flippable planet toggle (docs/COSMOS-PLANET-TOPOLOGY.md §9 M1,
 # §3.5, §3.4, §6.1). THIS is the whole safety net: when FLAT_WORLD is true (the default) the

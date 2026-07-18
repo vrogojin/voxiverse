@@ -119,6 +119,32 @@ static func ensure_ready() -> void:
 	_assert_frozen_core()
 	_build_liquid_index()
 
+## COSMOS-ORBITAL-O1O4 §3.2 — the Moon materials, registered ONLY under CubeSphere.MULTI_BODY (TerrainConfig
+## calls this from _ensure_ids when the flag is on). With the flag OFF this is never called, so the catalog
+## stays byte-identical: 77 core+world rows, no Moon memory, no drift-gate/count perturbation (the G-O4-OFF
+## contract). Appended AFTER the bootstrap set (ensure_ready first) so they land at the next dense ids (77..79);
+## idempotent (register_material dedupes by GMID). The records mirror the blocks.json shape (rock cubes; NO
+## liquid_kind, so the liquid index is untouched). Inert data — resolve_cell's moon branch is their only producer.
+const _MOON_MATERIALS := [
+	{"name": "regolith", "mass": 1300.0, "break_force": 900.0, "swatch": [0.62, 0.62, 0.64, 1.0],
+		"structural_class": "rock", "anchors": [30, 4, 3], "solidity": 1.0,
+		"render": {"mode": "opaque", "cull_group": 0, "emissive": 0.0}},
+	{"name": "basalt", "mass": 1650.0, "break_force": 3100.0, "swatch": [0.17, 0.17, 0.19, 1.0],
+		"structural_class": "rock", "anchors": [70, 7, 5], "solidity": 1.0,
+		"render": {"mode": "opaque", "cull_group": 0, "emissive": 0.0}},
+	{"name": "anorthosite", "mass": 1520.0, "break_force": 2700.0, "swatch": [0.80, 0.80, 0.82, 1.0],
+		"structural_class": "rock", "anchors": [60, 6, 4], "solidity": 1.0,
+		"render": {"mode": "opaque", "cull_group": 0, "emissive": 0.0}},
+]
+
+## Register the Moon materials (idempotent). Called by TerrainConfig._ensure_ids ONLY under MULTI_BODY, before
+## it resolves their ids — so the ids exist when the moon worldgen asks for them, and the flag-off catalog is
+## untouched. Uses the same _from_record + _register_bootstrap_state path the bootstrap set uses.
+static func ensure_moon_materials() -> void:
+	ensure_ready()
+	for rec: Variant in _MOON_MATERIALS:
+		_register_bootstrap_state(_from_record(rec), &"")
+
 ## Session-boundary reset (RMS §2.6): drop the entire session table and re-register the
 ## bootstrap set, modelling a DISTINCT process/peer/world-load that allocates dense LRIDs
 ## from scratch — so the same GMIDs registered in a different order land on DIFFERENT dense

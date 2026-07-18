@@ -29,6 +29,30 @@ extends RefCounted
 
 const SEED := 20260702
 
+# COSMOS-ORBITAL-O1O4 §3.2 — the Moon worldgen seed (SEED + 900001, well clear of every Earth salt/seed
+# offset) and its shaping constants. The moon is airless + waterless: heights stay strictly above SEA_LEVEL
+# (no liquid can ever match) and below MAX_SURFACE_Y (the worker air-skip bound holds). Deterministic: a pure
+# function of (SEED_MOON, d̂) only. Craters are hash-placed on a coarse cube-face cell grid (§3.2 crater kernel).
+const SEED_MOON := SEED + 900001
+const MOON_BASE_HEIGHT := 40.0        # mean regolith surface (≫ SEA_LEVEL=0 → no liquid; ≪ MAX_SURFACE_Y)
+const MOON_ROLL_AMP := 6.0            # gentle regolith rolling amplitude (highlands scale it up)
+const MOON_MARIA_DROP := 12.0         # maria basalt plains sit this many blocks lower than highlands
+const MOON_HIGHLAND_ROUGH := 1.7      # highlands roughness multiplier (maria ≈ 0.5, smoother)
+const MOON_DETAIL_AMP := 1.0          # small-scale regolith bumpiness
+const MOON_REGOLITH_DEPTH := 4        # top regolith cells before the host basalt/anorthosite rock
+const MOON_FLOOR_Y := 6               # min surface y — keeps the whole moon well above SEA_LEVEL
+const MOON_CEIL_Y := MAX_SURFACE_Y - 4  # max surface y — keeps crater rims under the air-skip bound
+# Crater field: partition the sphere by a coarse cube-face cell grid; each cell hash-places up to _MAX craters.
+const MOON_CRATER_N := 22             # coarse cube-face cells per edge for crater placement
+const MOON_CRATER_MAX := 2            # up to this many craters per coarse cell
+const MOON_CRATER_RMIN := 8.0         # crater radius range (blocks)
+const MOON_CRATER_RMAX := 60.0
+const MOON_CRATER_DEPTH_RATIO := 0.22 # bowl depth = ratio · R_c
+const MOON_CRATER_RIM_RATIO := 0.05   # raised rim height = ratio · R_c
+const _SALT_MOON_CN := 811            # crater-count hash salt
+const _SALT_MOON_CJ := 812            # crater centre-jitter hash salt
+const _SALT_MOON_CR := 813            # crater radius hash salt
+
 ## DIAGNOSTIC A/B TOGGLE (SUB-VOXEL-SMOOTHING). When false, terrain smoothing is fully OFF:
 ## the surface cell is a plain FULL cube (no ramp/slab reshape), no grass CAP lip grows, and the
 ## appearance manifest bakes ZERO shaped models — the world is cube-only like pre-P5. Flip to false
@@ -252,6 +276,14 @@ const B_PILLAR := 10     # COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2): the unbre
 const B_SAVANNA := 11    # equatorial/subtropical dry grassland (tan grass, sparse flat-topped acacias)
 const B_JUNGLE := 12     # hot + wet tropical rainforest (deep-green grass, dense tall jungle trees)
 
+# COSMOS-ORBITAL-O1O4 §3.2 (Part B, O4) — the airless Moon biomes. A moon facet's biome is one of these,
+# routed by resolve_cell to a dedicated moon strata branch (_moon_cell) that emits regolith/basalt/anorthosite
+# over the shared deepslate+bedrock bones — NO sea, NO snow, NO trees, NO atmosphere. Values start ABOVE every
+# Earth biome so the enum spaces never collide; Earth columns never carry these, moon columns only these.
+const B_MOON_MARIA := 11       # dark basalt plains (broad, lower, smoother)
+const B_MOON_HIGHLANDS := 12   # bright anorthosite highlands (rougher, higher)
+const B_MOON_POLAR := 13       # polar slot (content hook for later ice; v1 routes as highlands strata)
+
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88 + 121-125 (B1 climate-biome species: jungle/acacia/cactus
 # trunk heights + acacia/cactus density thinning). TerrainConfig owns 101-103 (noise seeds), 104
@@ -294,6 +326,12 @@ static var _continent: FastNoiseLite   # continentalness (ocean <-> inland)
 static var _temperature: FastNoiseLite # climate temperature
 static var _humidity: FastNoiseLite    # climate humidity
 static var _mountain: FastNoiseLite    # Mountains-biome mask (broad, low-frequency ranges)
+# COSMOS-ORBITAL-O1O4 §3.2 — the Moon noise stack (SEED_MOON), warmed in _ensure_noise on the main thread
+# beside the Earth noises (all bodies' noises frozen up front → worker-safe). Null until MULTI_BODY worldgen
+# first warms; Earth-only builds never touch them, so the flat/Earth path is byte-identical.
+static var _moon_roll: FastNoiseLite   # gentle regolith rolling
+static var _moon_maria: FastNoiseLite  # broad low-frequency maria mask (dark plains vs highlands)
+static var _moon_detail: FastNoiseLite # small-scale regolith bumpiness
 
 # --- cached material ids (resolved once from the data-driven catalog) ---------
 static var _ids_ready := false
@@ -312,6 +350,9 @@ static var _ID_MUD := 0
 static var _ID_PODZOL := 0
 static var _ID_SULFUR := 0
 static var _ID_CINNABAR := 0
+static var _ID_REGOLITH := 0     # COSMOS-ORBITAL-O1O4 §3.2 — moon surface regolith (silver-grey)
+static var _ID_BASALT := 0       # moon maria host rock (dark basalt)
+static var _ID_ANORTHOSITE := 0  # moon highlands host rock (bright anorthosite)
 static var _STRATA_SEQ: Array[int] = []   # granite,diorite,andesite,tuff,calcite,dripstone
 static var _BAND_SEQ: Array[int] = []      # 7 terracotta ids (badlands strata)
 static var _ORE_STONE: Array[int] = []     # ids 18..25
@@ -347,6 +388,22 @@ static func _ensure_noise() -> void:
 	# MAIN thread (WGC §7.4) before the voxel worker runs — a lazily-built noise first-touched on the
 	# worker is the project's worst data-race class.
 	_mountain = _make_climate(SEED + 104, 0.0008)
+
+	# COSMOS-ORBITAL-O1O4 §3.2 — the Moon noise stack (SEED_MOON), warmed HERE on the main thread beside the
+	# Earth noises (frozen-epoch: all bodies' noises built before any worker exists). Cheap; always built (the
+	# objects are inert unless a moon facet samples them), so this stays MULTI_BODY-independent and Earth-safe.
+	_moon_roll = FastNoiseLite.new()
+	_moon_roll.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	_moon_roll.seed = SEED_MOON
+	_moon_roll.frequency = 0.010
+	_moon_roll.fractal_type = FastNoiseLite.FRACTAL_FBM
+	_moon_roll.fractal_octaves = 3
+	_moon_roll.fractal_gain = 0.5
+	_moon_maria = _make_climate(SEED_MOON + 11, 0.0006)   # broad maria mask (lower-freq than continent)
+	_moon_detail = FastNoiseLite.new()
+	_moon_detail.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	_moon_detail.seed = SEED_MOON + 23
+	_moon_detail.frequency = 0.05
 
 static func _make_climate(sd: int, freq: float) -> FastNoiseLite:
 	var n := FastNoiseLite.new()
@@ -440,6 +497,14 @@ static func _ensure_ids() -> void:
 	_ID_PODZOL = BlockCatalog.id_of(&"podzol")
 	_ID_SULFUR = BlockCatalog.id_of(&"sulfur_block")
 	_ID_CINNABAR = BlockCatalog.id_of(&"cinnabar_block")
+	# COSMOS-ORBITAL-O1O4 §3.2 — moon materials, registered at runtime ONLY under MULTI_BODY (so the flag-off
+	# catalog is byte-identical: 77 rows, no moon memory). Registered HERE before resolving the ids; inert for
+	# Earth worldgen (no Earth biome emits them), and resolve_cell's moon branch is their only producer.
+	if CubeSphere.MULTI_BODY:
+		BlockCatalog.ensure_moon_materials()
+	_ID_REGOLITH = BlockCatalog.id_of(&"regolith")
+	_ID_BASALT = BlockCatalog.id_of(&"basalt")
+	_ID_ANORTHOSITE = BlockCatalog.id_of(&"anorthosite")
 	_STRATA_SEQ = [
 		BlockCatalog.id_of(&"granite"), BlockCatalog.id_of(&"diorite"),
 		BlockCatalog.id_of(&"andesite"), BlockCatalog.id_of(&"tuff"),
@@ -913,9 +978,97 @@ static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector
 
 ## COSMOS FACETED (§3.1): the sphere-terrain profile for a facet's local lattice column (fid, x, z). The facet
 ## cell's TRUE direction (FacetAtlas.cell_dir — all f64) sampled at R_BLOCKS. Deterministic: (SEED, fid, x, z).
+## COSMOS-ORBITAL-O1O4 §3.2 — THE per-body worldgen dispatch point. A facet's true direction (cell_dir) at
+## its body's datum radius (r_of), routed to that body's profile: Earth (body 0) samples the verbatim
+## profile_at_dir at R_BLOCKS (byte-identical — r_of(earth) == R_BLOCKS), the Moon (body 1) samples the airless
+## moon_profile_at_dir. Everything downstream (GenCtx threading, column memo, resolve_cell, LOD/far-ring) flows
+## UNCHANGED — the profile is the single choke point both render paths and all queries share.
 static func facet_profile(fid: int, x: int, z: int) -> Vector4:
 	var d := FacetAtlas.cell_dir(fid, x, z)
-	return profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+	var r := FacetAtlas.r_of(fid)
+	if FacetAtlas.body_of_fid(fid) == 0:
+		return profile_at_dir(d.x, d.y, d.z, r)          # Earth — verbatim
+	return moon_profile_at_dir(d.x, d.y, d.z, r)         # Moon (airless)
+
+## COSMOS-ORBITAL-O1O4 §3.2 — the airless Moon terrain profile at a raw UNIT direction (dx,dy,dz), radius rr.
+## Rolling regolith + a broad maria/highlands mask + a hash-placed crater field. NO ocean (height stays above
+## SEA_LEVEL so the sea fill never matches), NO trees (moon biomes gate TreeGen to none), NO snow. Returns
+## Vector4(g, biome, maria-signal, latitude-t). Pure/deterministic: a function of (SEED_MOON, d̂, rr) only.
+static func moon_profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector4:
+	_ensure_noise()
+	var px := dx * rr; var py := dy * rr; var pz := dz * rr
+	var maria := clampf(smoothstep(-0.12, 0.22, _moon_maria.get_noise_3d(px, py, pz)), 0.0, 1.0)  # 1 = maria
+	var rough := lerpf(MOON_HIGHLAND_ROUGH, 0.5, maria)
+	var roll := _moon_roll.get_noise_3d(px, py, pz) * MOON_ROLL_AMP * rough
+	var detail := _moon_detail.get_noise_3d(px, py, pz) * MOON_DETAIL_AMP
+	var h := MOON_BASE_HEIGHT + roll + detail - maria * MOON_MARIA_DROP
+	h += _moon_crater_height(dx, dy, dz, rr)
+	var g := clampi(int(floor(h)), MOON_FLOOR_Y, MOON_CEIL_Y)
+	var biome := B_MOON_MARIA if maria >= 0.5 else B_MOON_HIGHLANDS
+	var t := clampf(1.0 - 2.0 * absf(dz), -1.0, 1.0)     # latitude hook (harsh airless day/night swing, data)
+	return Vector4(float(g), float(biome), maria * 2.0 - 1.0, t)
+
+## The crater field's height contribution (blocks, ≤0 bowls / ≥0 rims) at direction d̂. Craters are placed on
+## a coarse cube-face cell grid (MOON_CRATER_N); summed over the 3×3 same-face neighbour cells (bounded). Pure
+## hash placement (SEED_MOON) → deterministic. v1 skips cross-face neighbour cells at a face seam (a crater
+## astride a cube edge clips) — an accepted taste limitation flagged for the O4c screenshot pass.
+static func _moon_crater_height(dx: float, dy: float, dz: float, rr: float) -> float:
+	var d := CubeSphere.DVec3.new(dx, dy, dz)
+	var fc := CubeSphere.dir_to_face_cell(d, MOON_CRATER_N)
+	var face := int(fc["face"])
+	var ci := int(fc["fi"]); var cj := int(fc["fj"])
+	var total := 0.0
+	for di: int in [-1, 0, 1]:
+		for dj: int in [-1, 0, 1]:
+			var cci := ci + di; var ccj := cj + dj
+			if cci < 0 or cci >= MOON_CRATER_N or ccj < 0 or ccj >= MOON_CRATER_N:
+				continue                                  # v1: skip cross-face neighbours (seam clip)
+			total += _moon_cell_craters(face, cci, ccj, d, rr)
+	return total
+
+## The height contribution of every crater hash-seeded into coarse cube-face cell (face, ci, cj) at direction d̂.
+static func _moon_cell_craters(face: int, ci: int, cj: int, d: CubeSphere.DVec3, rr: float) -> float:
+	var key := face * 1000000 + ci * 1000 + cj
+	var ncr := int(_hash01_3d(key, 0, 0, _SALT_MOON_CN) * float(MOON_CRATER_MAX + 1))   # 0..MAX
+	var h := 0.0
+	for ic in range(ncr):
+		var jx := _hash01_3d(key, ic, 1, _SALT_MOON_CJ)
+		var jy := _hash01_3d(key, ic, 2, _SALT_MOON_CJ)
+		var rc := lerpf(MOON_CRATER_RMIN, MOON_CRATER_RMAX, _hash01_3d(key, ic, 3, _SALT_MOON_CR))
+		var centre := CubeSphere.face_cell_to_dir(face, float(ci) + jx, float(cj) + jy, MOON_CRATER_N)
+		var s := d.angle_to(centre) * rr                 # great-circle surface distance to the crater centre
+		h += _moon_crater_profile(s, rc)
+	return h
+
+## One crater's radial height profile at surface distance s from its centre (radius R_c): a parabolic bowl
+## inside, a raised rim near the edge, fading ejecta beyond ~1.5·R_c. All f64, pure — no noise, no state.
+static func _moon_crater_profile(s: float, rc: float) -> float:
+	var depth := MOON_CRATER_DEPTH_RATIO * rc
+	var rim := MOON_CRATER_RIM_RATIO * rc
+	if s < rc:
+		var u := s / rc
+		return -depth * (1.0 - u * u)                     # bowl: deepest at centre, 0 at the rim edge
+	if s < rc * 1.5:
+		return rim * (1.0 - (s - rc) / (rc * 0.5))        # raised rim + linear ejecta falloff
+	return 0.0
+
+## COSMOS-ORBITAL-O1O4 §3.2 — the airless Moon cell pipeline (the moon twin of Earth's smoothing/snow/sea
+## machinery, reduced to strata). Bedrock is handled by resolve_cell's _bedrock_at BEFORE this. Above the solid
+## top g is vacuum (AIR). The stack: a regolith blanket, then the biome host rock (basalt maria / anorthosite
+## highlands), then the SHARED deepslate deep bones (dithered transition, exactly like Earth's _deep_family so
+## later caves/ore slot in as data). Full cubes only (no smoothing/ore v1) — pure/deterministic (SEED_MOON hash).
+static func _moon_cell(x: int, y: int, z: int, g: int, biome: int) -> int:
+	if y > g:
+		return BlockCatalog.AIR                          # airless — no sea, snow, tree, atmosphere
+	var host := _ID_BASALT if biome == B_MOON_MARIA else _ID_ANORTHOSITE
+	if g - y < MOON_REGOLITH_DEPTH:
+		return _ID_REGOLITH                              # top regolith blanket
+	if y <= DEEPSLATE_FULL_Y:
+		return _ID_DEEPSLATE                             # always-deepslate deep band (shared bones)
+	if y < DEEPSLATE_TOP_Y:
+		var frac := float(DEEPSLATE_TOP_Y - y) / float(DEEPSLATE_TOP_Y - DEEPSLATE_FULL_Y)
+		return _ID_DEEPSLATE if _hash01_3d(x, y, z, _SALT_DEEP) < frac else host   # dithered transition band
+	return host
 
 ## Latitude climate (COSMOS §3.5: the `asin(d.z)` climate term). The spin axis is +Z, so the
 ## latitude is φ = asin(d.z) and |d.z| = |sin φ| runs 0 at the equator to 1 at a pole. The climate
@@ -1079,6 +1232,12 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		return BlockCatalog.AIR
 	if _bedrock_at(x, y, z):
 		return _ID_BEDROCK
+	# COSMOS-ORBITAL-O1O4 §3.2 — the airless Moon strata branch, taken BEFORE any Earth machinery (slope/snow/
+	# sea/cap/tree). A moon column emits ONLY the moon strata ladder over the shared bedrock (handled above);
+	# it NEVER reaches _sea_block/_snow_stack/TreeGen, so the moon is guaranteed liquid-/snow-/tree-free and
+	# Earth columns (which never carry a B_MOON_* biome) are byte-identical (this branch is never taken for them).
+	if biome == B_MOON_MARIA or biome == B_MOON_HIGHLANDS or biome == B_MOON_POLAR:
+		return _moon_cell(x, y, z, g, biome)
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): the bedrock PILLAR column — full bedrock cubes from the
 	# world floor to the one flat top `g`, air above. Bypasses strata, ore, trees, snow, sea fill, and all
 	# smoothing/slope shaping BEFORE any of it runs, so the monument is sheer full cubes and render==collision

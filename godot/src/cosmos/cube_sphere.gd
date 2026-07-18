@@ -189,6 +189,18 @@ const FP_STAMP := false
 ## weakened to make the port pass.
 const FP_CPPGEN := false
 
+## COSMOS CLIMATE-BIOMES B1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §6/§7) — the Whittaker temperature×moisture
+## biome classifier. When true, TerrainConfig._biome swaps its shipped first-match chain for a
+## temperature-band × humidity-band table that appends B_SAVANNA / B_JUNGLE, TreeGen grows acacia (savanna),
+## jungle (jungle) and cactus (desert) species, and FarPalette shows tan/green savanna/jungle bands from orbit.
+## Biome is a PURE function of position (+ static latitude/humidity proxy) — zero per-voxel storage, no RNG, no
+## climate-sim dependency (it reads only worldgen noise, exactly like today). This is a NEW-WORLD look change:
+## default OFF → _biome runs the shipped chain verbatim, TreeGen never plants the new species, and the world is
+## BYTE-IDENTICAL (FLAT 6035/0 + the terrain hash unchanged — the compatibility proof). Independent of the W*
+## weather flags (biomes never read the sim). Gates: src/tools/verify_climate.gd (band ordering, determinism,
+## byte-identical OFF, new-species determinism, palette bands).
+const FP_CLIMATE_BIOMES := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB

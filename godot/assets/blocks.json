@@ -1,7 +1,7 @@
 {
   "$schema_note": "VOXIVERSE data-driven block catalog (WORLDGEN-CATALOG \u00a74). BlockCatalog.ensure_ready() loads this file into the runtime VoxelState array (record order IS the dense id; APPEND-ONLY). The frozen core consts (AIR..LEAF) are ASSERTED against ids 0-5 here; every non-override record's anchors are pinned by the verify drift gate to AnchorConverter.propose_anchors(priors, structural_class). swatch is [r,g,b,a] floats; render.cull_group maps 1:1 onto the blocky transparency_index. Optional has_block_entity (bool, default false) marks a material whose cells may carry per-cell metadata (VOXEL-DATA-STRUCTURE \u00a73.1); no shipped material declares it yet. Tiers: core (0-5, frozen), world (6-76, always loaded); extended streams later (WGC \u00a73.1).",
   "version": 2,
-  "count": 77,
+  "count": 78,
   "blocks": [
     {
       "name": "air",
@@ -2549,6 +2549,36 @@
       },
       "solidity": 1.0,
       "permeability": 0.0,
+      "translucence": 0.0,
+      "render": {
+        "mode": "opaque",
+        "cull_group": 0,
+        "emissive": 0.0
+      }
+    },
+    {
+      "name": "cactus",
+      "id": 77,
+      "tier": "world",
+      "mass": 260.0,
+      "break_force": 65.0,
+      "swatch": [
+        0.298,
+        0.514,
+        0.216,
+        1.0
+      ],
+      "structural_class": "foliage",
+      "anchors": [
+        4,
+        3,
+        2
+      ],
+      "priors": {
+        "analog": "succulent column"
+      },
+      "solidity": 1.0,
+      "permeability": 0.4,
       "translucence": 0.0,
       "render": {
         "mode": "opaque",

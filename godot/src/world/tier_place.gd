@@ -14,8 +14,12 @@ extends RefCounted
 ## (never referenced on a hot path) unless a tier flag is on.
 
 # --- P2 envelope (§5.1) ------------------------------------------------------------------------------
-const ENV_EPS_G := 1.5            # residual g guard (blocks) once the min-envelope replaces the constant sink:
+const ENV_EPS_G := 1.5            # residual g guard FLOOR (blocks) once the min-envelope replaces the constant sink:
                                   # absorbs the between-fine-sample residual (detail-noise/shelf-knee) + f32 rounding.
+const ENV_EPS_FRAC := 0.2         # the guard SCALES with the facet cell like BACKSTOP_SINK_FRAC: the between-fine-sample
+                                  # chord sag grows with the cell (∝ R), so a fixed 1.5 goes stale on a rescale. guard =
+                                  # max(ENV_EPS_G, ENV_EPS_FRAC × cell): ≈1.5 floor at R=3072, ≈5.2 at R=6371 (clears the
+                                  # R=6371 poke with margin). Single derivation site (backstop_sink), rescale-safe by construction.
 const ENV_FINE_MULT := 4          # fine-sample density = ENV_FINE_MULT × BACKSTOP_CELLS per facet edge — the
                                   # resolution the per-footprint minimum is taken at (pitch ≈ edge/(4·16) ≈ 3.1 blocks).
 const ENV_DILATE_BLOCKS := 6.0    # footprint dilation (blocks) for the radial-vs-normal skew reach (relief·sin α_max
@@ -52,9 +56,9 @@ static func depth_bias_on() -> bool:
 ## = (π/2·R)/K) — so it scales with R and never goes stale on a rescale (clears the coarse-grid chord error at
 ## any radius; ≈ 6 at R=3072, ≈ 13 at R=6371). This is the ONE site the sink value is decided.
 static func backstop_sink() -> float:
-	if envelope_on():
-		return ENV_EPS_G
 	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	if envelope_on():
+		return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)   # ε guard scales with the cell (rescale-safe), floored at 1.5
 	return CubeSphere.BACKSTOP_SINK_FRAC * cell
 
 ## P3: the window-space depth-bias uniform value for tier `k` quanta = 2·k·2⁻²⁴ (POSITION.z += bias·w).

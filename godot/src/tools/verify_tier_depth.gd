@@ -73,7 +73,8 @@ func _gate_envelope(active: int) -> void:
 	ring.call("setup", active)
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var near := float(TerrainConfig.near_render_radius())
-	var eps := TierPlace.ENV_EPS_G   # the fixed probe sink: at THIS small a sink only a true lower envelope can hold.
+	var eps := TierPlace.backstop_sink()   # the DERIVED envelope guard actually applied at emit (max(ENV_EPS_G, frac×cell),
+	                                       # rescale-safe): at this SMALL sink (≪ the constant path's frac×cell) only a true lower envelope holds.
 	# Sweep the worst-relief (mountainous) facets + the active facet, marked backstop, exactly as G-FRC-NOPOKE.
 	var sweep := _worst_relief_facets(3)
 	if not sweep.has(active):

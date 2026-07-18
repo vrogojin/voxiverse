@@ -124,6 +124,17 @@ var _fall_have_v := false
 # (SN-R1). DEAD (never set) with ORBIT_COAST off ⇒ the shipped O velocity-command path is byte-identical.
 var _orbit_coasting := false
 var _coast_v_bci := PackedFloat64Array()
+# SN-ODECAY FIX (G-ODECAY, verify_odecay.gd): the coast's BCI POSITION carried in f64 across ticks, MIRRORING
+# `_coast_v_bci`. The original coast reconstructed p from the body-FIXED f32 `position` each tick and re-projected
+# with the SAME t, rotating p by one tick of planet spin (ω·dt) relative to the un-rotated f64 velocity — this
+# desynchronised the (p,v) pair and PUMPED orbital eccentricity (periapsis drops each orbit until the surface
+# handoff arrests the player on the far side: the live "arcs to the opposite side and stops"). Carrying [p,v] in
+# f64 and writing `position` as a DISPLAY-ONLY projection removes the round-trip. Empty ⇒ unseeded (reconstruct once).
+var _coast_p_bci := PackedFloat64Array()
+# SN-ODECAY station-keeping cooldown (s): the O free-coast periodically adds a small PROGRADE Δv when the orbit
+# nears the atmosphere (CosmosDevFlight.station_keep_dv), so a decaying orbit re-lifts instead of spiralling in.
+# Counts down each coast tick; a correction fires + resets it. DEAD off ORBIT_COAST ⇒ byte-identical.
+var _coast_boost_cd := 0.0
 
 # COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3) — the inertial-attitude state machine. ALL DEAD
 # (mode pinned ATT_SURFACE, camera never emancipated) unless CubeSphere.ORBIT_ATTITUDE AND _nav != null, so the
@@ -643,6 +654,7 @@ func _toggle_dev_nav() -> void:
 	_dev_active = false
 	_dev_orbital_commit = false                              # SN-FIX #3: entering/leaving dev-nav is never mid-orbit
 	_orbit_coasting = false                                  # ORBIT_COAST (§7.4): toggling dev-nav ends any free-coast
+	_coast_p_bci = PackedFloat64Array()                      # SN-ODECAY: drop the carried BCI pos (re-entry re-seeds)
 	if _body_shape != null:
 		_body_shape.disabled = flying
 	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
@@ -800,12 +812,46 @@ func _orbit_coast_move(delta: float) -> void:
 	if fid < 0:
 		velocity = Vector3.ZERO
 		return
-	_coast_v_bci = _coast_step(delta, _coast_v_bci, _dominant_body())
+	# SN-ODECAY FIX: integrate the CARRIED f64 BCI [p,v] (no per-tick f32 position read-back — the eccentricity
+	# pump). Defensive seed: if `_coast_p_bci` is unseeded (the O handler seeds it from `_dev_p_bci`), reconstruct
+	# it ONCE from the current lattice `position` (the pre-fix first-tick value).
+	if _coast_p_bci.size() != 3:
+		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+		_coast_p_bci = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	var out := _coast_step_kepler(delta, _coast_p_bci, _coast_v_bci, _dominant_body())
+	_coast_p_bci = out[0]
+	_coast_v_bci = out[1]
+	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere, periodically add a small prograde
+	# Δv so it re-lifts instead of decaying in. Self-limiting (caps at circular speed) ⇒ never boosts to escape.
+	_coast_boost_cd -= delta
+	if _coast_boost_cd <= 0.0:
+		var dv := _DevFlightCls.station_keep_dv(_dominant_body(), _coast_p_bci, _coast_v_bci)
+		if _DVCls.length(dv) > 0.0:
+			_coast_v_bci = _DVCls.add(_coast_v_bci, dv)
+			_coast_boost_cd = _DevFlightCls.STATION_KEEP_COOLDOWN
 	_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
 	_dev_have_v = true                                       # SN-R1: the dev-flight seed mirrors the coast velocity
 	_horiz_vel = Vector3.ZERO
 	velocity = Vector3.ZERO
 	_dev_active = true                                       # tells _nav_tick the coast owns the BCI velocity this frame
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — SN-ODECAY FIX. The Kepler coast step that carries the BCI [p,v] pair in
+## f64 ACROSS ticks and writes the lattice `position` as a DISPLAY-ONLY projection (never read back). Distinct from
+## the shared `_coast_step` (which reconstructs p from `position` every tick — correct for the short, near-radial
+## free-fall, but for a long tangential orbit the SAME-t fixed↔BCI round-trip rotates p by one tick of planet spin
+## relative to the f64 velocity and pumps eccentricity). Pure central free coast (no thrust/drag). Precondition:
+## on an active facet (fid >= 0 — the caller guards). Returns [p_bci_new, v_bci_new]. Proven by G-ODECAY.
+func _coast_step_kepler(delta: float, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array, body: String) -> Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
+	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
+	# DISPLAY-ONLY: project the new BCI position back to the lattice for rendering/streaming/collision. This value
+	# is NEVER read back into the integrator (that read-back was the pump) — the carried `os.pos` is the truth.
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, os.pos, os.vel)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	return [os.pos, os.vel]
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — is there a thrust/movement input this tick (the coast-exit trigger)? WASD
 ## (input.x/z) or the vertical verb (Space/Ctrl, or the remote `input.y`). Pure read of the already-polled input.
@@ -929,11 +975,15 @@ func _dev_toggle_key(keycode: int) -> void:
 						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
 						_dev_have_v = true
 						_dev_orbital_commit = true
+						_coast_p_bci = PackedFloat64Array()     # SN-ODECAY: drop the carried BCI pos so a re-entry re-seeds
 					else:
 						# O → enter the free-coast. Seed v = v_circ·t̂ with t̂ = the YAW-heading tangent (the BODY
 						# basis forward, PITCH IGNORED — pitch never tilts the orbit plane). Gravity does the rest.
 						var look_yaw := _dev_dir_to_bci(fid, t, _DevFlightCls.coast_seed_look_lattice(transform.basis)) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
 						_coast_v_bci = _DevFlightCls.release_circular(body, _dev_p_bci, look_yaw, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+						# SN-ODECAY FIX: seed the carried f64 BCI position from `_dev_p_bci` — the EXACT point
+						# release_circular made the velocity circular for, so the integrated orbit starts perfectly circular.
+						_coast_p_bci = PackedFloat64Array([_dev_p_bci[0], _dev_p_bci[1], _dev_p_bci[2]])
 						_orbit_coasting = true
 						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
 						_dev_have_v = true

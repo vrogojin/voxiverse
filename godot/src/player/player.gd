@@ -654,6 +654,22 @@ func _kinematic_look_fly(delta: float, input: Vector3, running: bool) -> void:
 	else:
 		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
 		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+	# COSMOS ORBIT-FRAME Phase B (§5(a)): in SPACE (or the RECOVER blend) fly the FULL inertial camera basis
+	# re-expressed in the active facet lattice, with Space/Ctrl on CAMERA-local ±Y (microgravity has no world
+	# vertical). The nav-frame carrier drift composes UNCHANGED (a zero-input hover still holds the BCI rest).
+	# Flag off / SURFACE ⇒ the shipped body-yaw+pitch construction below, byte-identical.
+	if CubeSphere.ORBIT_6DOF_FLY and _att_mode != ATT_SURFACE:
+		var afid := TerrainConfig.active_facet()
+		if afid >= 0:
+			var b_lat_cam := _CosmosAttitudeCls.lat_cam_basis(_FacetAtlasCls.frame_basis(afid), _attitude_scene_basis())
+			var dir6 := b_lat_cam * Vector3(input.x, vy, input.z)   # forward = look, strafe = camera X, vy = camera Y
+			if dir6.length() > 0.0:
+				dir6 = dir6.normalized()
+			var carrier6 := hover_drift_lattice(afid, int(_nav.mode), position) if _nav != null else Vector3.ZERO
+			position += (dir6 * speed + carrier6) * delta
+			_horiz_vel = Vector3(dir6.x, 0.0, dir6.z) * speed
+			velocity = Vector3.ZERO
+			return
 	# FP-FIXED-FRAME: `position` is a LATTICE pose, so the fly direction MUST be a LATTICE direction. The player
 	# body's `transform.basis` is the local (lattice) YAW basis; the camera PITCH (_pitch about local X) adds the
 	# look-up/down component → forward flies where you look. Space/Ctrl (vy) are straight LATTICE up/down.

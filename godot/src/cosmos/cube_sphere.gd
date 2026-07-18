@@ -660,6 +660,15 @@ const ORBIT_ATTITUDE := false
 ## ORBIT-FRAME tunable (live-tuned): the Q/E roll rate (rad/s). Consulted only under ORBIT_ATTITUDE in SPACE;
 ## the pure kernel takes it as an argument so the gate drives it directly. (Phases B/C add their own flags.)
 const ORBIT_ROLL_RATE := 1.2
+## COSMOS ORBIT-FRAME Phase B (docs/COSMOS-ORBIT-FRAME-DESIGN.md §5) — fly the FULL 6DOF look. When true (AND
+## ORBIT_ATTITUDE AND in SPACE), the kinematic look-fly builds its direction from the inertial camera basis
+## re-expressed in the lattice (frame_basis-transpose times B_cam_scene = CosmosAttitude.lat_cam_basis), with
+## Space/Ctrl on CAMERA-local +/-Y (microgravity has no world vertical); the hover carrier drift composes
+## UNCHANGED (a zero-input hover still holds the BCI rest, G-SN-HOVERDRIFT stays valid). The dev-flight velocity
+## controller becomes fully 6DOF for FREE via the window_camera_transform seam (asserted, not edited). Default
+## FALSE ⇒ the shipped body-yaw+pitch lattice construction, byte-identical (and _kinematic_look_fly is only
+## reached under SN_NO_CEILING_BOUNCE dev-nav). Requires ORBIT_ATTITUDE + SN_DEVNAV. Gate G-ORBIT-FLY.
+const ORBIT_6DOF_FLY := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

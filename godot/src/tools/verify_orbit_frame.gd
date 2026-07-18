@@ -13,7 +13,9 @@ extends SceneTree
 ##   G-ORBIT-SKY   the −θ dome counter-rotation regression: R_z(−θ)·R_z(+θ) == I; the view-relative star rotation
 ##                 B_rel = B_cam⁻¹·R_z(−θ) is CONSTANT when B_cam follows the inertial-hold formula (fixed q), and
 ##                 rotates at exactly −ω (the θ-step rotation) when B_cam is a constant body-fixed basis.
-## (Phases B/C EXTEND this gate with G-ORBIT-FLY / G-ORBIT-REC — the design's "extended per phase" pattern.)
+##   G-ORBIT-FLY   (Phase B) lat_cam_basis maps forward to the BCI look direction to f32 tol through random
+##                 facet/θ; Space/Ctrl move along CAMERA ±Y not lattice ±Y.
+## (Phase C EXTENDS this gate with G-ORBIT-REC — the design's "extended per phase" pattern.)
 ##
 ## RUN: docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
 ##       --script res://src/tools/verify_orbit_frame.gd 2>/dev/null | grep VERIFY
@@ -49,6 +51,7 @@ func _initialize() -> void:
 	FacetAtlas.warm_up()
 	_gate_att()
 	_gate_sky()
+	_gate_fly()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -137,3 +140,30 @@ func _gate_sky() -> void:
 		rel_prev = rel
 		t_prev = t
 	_ok(step_worst < 1.0e-4, "G-ORBIT-SKY surface stars wheel at −ω (step dev %s)" % step_worst)
+
+# ---------- G-ORBIT-FLY (Phase B): the lattice look-fly basis ----------
+func _gate_fly() -> void:
+	# lat_cam_basis(frame_basis(fid), B_scene) maps a lattice input to the camera axes; lifting the mapped forward
+	# back to scene via frame_basis must reproduce B_scene·(0,0,−1) (the look direction). Random facet + attitude.
+	var nf := FacetAtlas.facet_count()
+	var worst := 0.0
+	var vy_ok := true
+	for i in range(40):
+		var fid := i % nf
+		var fb := FacetAtlas.frame_basis(fid)
+		var theta := fmod(float(i) * 0.53, TAU)
+		var q := ATT.seed_bci(_rand_basis(i * 5 + 1), theta)
+		var b_scene := ATT.scene_basis(q, theta)
+		var b_lat_cam := ATT.lat_cam_basis(fb, b_scene)
+		# forward: lattice input (0,0,−1) → lattice dir; lift by fb → scene; compare to the true look −B_scene.z.
+		var dir_lat := b_lat_cam * Vector3(0, 0, -1)
+		var dir_scene := fb * dir_lat
+		var look := -b_scene.z
+		worst = maxf(worst, (dir_scene - look).length())
+		# Space (+Y input) must move along the CAMERA up axis (scene b_scene.y), not the lattice up (fb.y).
+		var up_lat := b_lat_cam * Vector3(0, 1, 0)
+		var up_scene := (fb * up_lat).normalized()
+		if (up_scene - b_scene.y.normalized()).length() > 1.0e-4:
+			vy_ok = false
+	_ok(worst < 1.0e-4, "G-ORBIT-FLY forward maps to BCI look (dev %s)" % worst)
+	_ok(vy_ok, "G-ORBIT-FLY Space/Ctrl move along CAMERA ±Y (not lattice ±Y)")

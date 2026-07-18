@@ -57,6 +57,8 @@ func _initialize() -> void:
 		_repro_and_fix(r, 3)
 	_secular_pump(4500.0, 30)
 	_hitchy_dt_case(4500.0)
+	_bar_1000(4500.0, 1.0 / 30.0, 60)
+	_station_keep_gate(1.0 / 30.0)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -373,3 +375,92 @@ func _hitchy_dt_case(r: float) -> void:
 	_ok(is_finite(cC["r_end"]) and not is_nan(cC["r_end"]), "HITCHY: FIX radius finite (no NaN/spiral)")
 	var c_spread: float = (float(cC["r_max"]) - float(cC["r_min"])) / float(cC["r0"])
 	_ok(c_spread < 1.0e-6, "HITCHY: FIX stays exactly circular (spread %.6f%%) even under clamped huge dt" % (c_spread * 100.0))
+
+# ---------------------------------------------------------------------------------------
+# ACCEPTANCE BAR (updated): the bare coast must survive >= 1000 orbits before the PERIAPSIS reaches the atmosphere
+# top (R_BLOCKS + ATMO_TOP). Measure the per-orbit periapsis drop for the shipped composite vs the fix over a
+# window and extrapolate orbits-to-atmosphere. The fix (exactly circular, symplectic) has ~0 secular drop ⇒ >>1000.
+# ---------------------------------------------------------------------------------------
+func _bar_1000(r: float, dt: float, orbits: int) -> void:
+	print("  --- >=1000-ORBIT BAR: orbits-to-atmosphere at r = %.0f, dt = 1/%.0f (%d-orbit window) ---" % [r, 1.0 / dt, orbits])
+	var seed := _seed(r, 300.0)
+	var atmo: float = GRAV.r_vox("earth") + CubeSphere.ATMO_TOP           # periapsis floor = R_BLOCKS + ATMO_TOP
+	var steps := int(ceil(orbits * TAU * r / seed["v_circ"] / dt))
+	var cA := _run_composite_f32(seed, dt, steps)
+	var cC := _run_fix_bci(seed, dt, steps)
+	# per-orbit periapsis drop (r0 − lowest periapsis seen), and the linear orbits-to-atmosphere extrapolation.
+	var dropA: float = float(cA["r0"]) - float(cA["r_min"])
+	var dropC: float = float(cC["r0"]) - float(cC["r_min"])
+	var rateA: float = maxf(dropA / float(orbits), 1.0e-12)
+	var rateC: float = maxf(dropC / float(orbits), 1.0e-12)
+	var o2a_A: float = (float(cA["r0"]) - atmo) / rateA
+	var o2a_C: float = (float(cC["r0"]) - atmo) / rateC
+	print("    shipped composite: periapsis drop %.3f blocks / %d orbits ⇒ ~%.0f orbits to atmosphere (%.0f)" % [dropA, orbits, o2a_A, atmo])
+	print("    FIX (f64 BCI carry): periapsis drop %.5f blocks / %d orbits ⇒ ~%.0f orbits to atmosphere" % [dropC, orbits, o2a_C])
+	_ok(o2a_C >= 1000.0, "BAR: FIX survives >= 1000 orbits before periapsis reaches the atmosphere (extrapolated %.0f)" % o2a_C)
+	_ok(dropC < 0.5, "BAR: FIX per-window periapsis drop is negligible (%.5f blocks over %d orbits — non-secular)" % [dropC, orbits])
+	_ok(o2a_C > 10.0 * o2a_A, "BAR: FIX lasts >= 10x longer than the shipped composite before decaying")
+
+# ---------------------------------------------------------------------------------------
+# STATION-KEEPING (dev assist) — a DELIBERATELY decaying orbit (synthetic linear drag) must be re-lifted by the
+# periodic prograde auto-boost so it sustains far past 1000 orbits without ever entering the atmosphere or
+# escaping. WITHOUT the boost the same orbit spirals into the atmosphere in a few dozen orbits. Exercises the REAL
+# CosmosDevFlight.station_keep_dv the player wires in.
+# ---------------------------------------------------------------------------------------
+func _station_keep_gate(dt: float) -> void:
+	var body := "earth"
+	var mu := GRAV.gm_dyn(body)
+	var rv := GRAV.r_vox(body)
+	var atmo := rv + CubeSphere.ATMO_TOP                                  # 3456: the floor the periapsis must not cross
+	var r0 := rv + CubeSphere.ATMO_TOP + 300.0                            # 3756: seed just above the guard band
+	print("  --- STATION-KEEPING: deliberately-decaying orbit, boost vs no-boost (r0=%.0f, atmo floor=%.0f) ---" % [r0, atmo])
+	var drag_c := 2.0e-5                                                  # synthetic linear drag (energy sink) forcing decay
+	var period := TAU * r0 / sqrt(mu / r0)
+
+	# --- WITHOUT boost: how many orbits until the periapsis crosses into the atmosphere? ---
+	var os0 = _seed_circular_bci(body, r0)
+	var t0 := 0.0
+	var orbits_noboost := -1
+	var cap_orbits := 400
+	for i in range(int(ceil(cap_orbits * period / dt))):
+		var a_drag := DV.scale(os0.vel, -drag_c)
+		os0.step(NAV.clamp_nav_dt(dt), a_drag)
+		t0 += NAV.clamp_nav_dt(dt)
+		if DV.length(os0.pos) < atmo:
+			orbits_noboost = int(t0 / period)
+			break
+	print("    no-boost: entered atmosphere after ~%d orbits (drag_c=%.7f)" % [orbits_noboost, drag_c])
+
+	# --- WITH boost: run a long horizon; the periodic prograde nudge must hold periapsis above the atmosphere. ---
+	var os1 = _seed_circular_bci(body, r0)
+	var cd := 0.0
+	var horizon := 1200                                                  # orbits — well past the 1000 bar
+	var peri_min := r0
+	var apo_max := r0
+	var t1 := 0.0
+	var steps1 := int(ceil(horizon * period / dt))
+	for i in range(steps1):
+		var cdt := NAV.clamp_nav_dt(dt)
+		var a_drag := DV.scale(os1.vel, -drag_c)
+		os1.step(cdt, a_drag)
+		t1 += cdt
+		cd -= cdt
+		if cd <= 0.0:
+			var dv := DEVF.station_keep_dv(body, os1.pos, os1.vel)
+			if DV.length(dv) > 0.0:
+				os1.vel = DV.add(os1.vel, dv)
+				cd = DEVF.STATION_KEEP_COOLDOWN
+		var rr := DV.length(os1.pos)
+		peri_min = minf(peri_min, rr)
+		apo_max = maxf(apo_max, rr)
+	print("    with-boost over %d orbits: periapsis_min=%.1f (floor %.0f), apoapsis_max=%.1f" % [horizon, peri_min, atmo, apo_max])
+	_ok(orbits_noboost > 0 and orbits_noboost < 200, "STATION-KEEP: WITHOUT boost the drag orbit enters the atmosphere (~%d orbits)" % orbits_noboost)
+	_ok(peri_min > atmo, "STATION-KEEP: WITH boost the periapsis NEVER reaches the atmosphere over %d orbits (min %.1f > %.0f)" % [horizon, peri_min, atmo])
+	_ok(apo_max < 2.0 * r0, "STATION-KEEP: WITH boost the orbit stays bounded (apoapsis %.1f < 2·r0) — self-limiting, no escape" % apo_max)
+	_ok(horizon > 1000, "STATION-KEEP: the sustained horizon exceeds the 1000-orbit bar (%d)" % horizon)
+
+# A circular OrbitalState at radius `r` in the equatorial plane (helper for the drag/boost scenarios).
+func _seed_circular_bci(body: String, r: float):
+	var p := DV.v(r, 0.0, 0.0)
+	var v := DV.v(0.0, sqrt(GRAV.gm_dyn(body) / r), 0.0)                  # tangential, exactly circular
+	return ORB.make(body, p, v)

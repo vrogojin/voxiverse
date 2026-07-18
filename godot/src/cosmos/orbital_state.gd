@@ -359,6 +359,21 @@ static func specific_energy(mu: float, p: PackedFloat64Array, v: PackedFloat64Ar
 static func ang_momentum(p: PackedFloat64Array, v: PackedFloat64Array) -> PackedFloat64Array:
 	return _cross(p, v)
 
+## Periapsis radius r_p = a·(1−e) (blocks) of the osculating orbit through (p,v) under `mu`. Returns +INF for an
+## unbound (parabolic/hyperbolic) state — nothing to guard against. Used by the ORBIT_COAST station-keeping assist
+## to predict whether the orbit will dip into the atmosphere before it actually does. Pure static f64.
+static func periapsis_radius(mu: float, p: PackedFloat64Array, v: PackedFloat64Array) -> float:
+	var energy := specific_energy(mu, p, v)
+	if energy >= 0.0:
+		return INF
+	var a := -mu / (2.0 * energy)
+	var e := _eccentricity(mu, p, v)
+	return a * (1.0 - e)
+
+## Public eccentricity accessor (the internal _eccentricity, exposed for the station-keeping assist / gates).
+static func eccentricity(mu: float, p: PackedFloat64Array, v: PackedFloat64Array) -> float:
+	return _eccentricity(mu, p, v)
+
 static func _eccentricity(mu: float, r_vec: PackedFloat64Array, v_vec: PackedFloat64Array) -> float:
 	var r := DV.length(r_vec)
 	var v2 := DV.dot(v_vec, v_vec)

@@ -57,6 +57,7 @@ func _initialize() -> void:
 		CubeSphere.SHELL_RELIEF_DEG, CubeSphere.SHELL_SLACK_DEG, str(CubeSphere.FP_SHELL_CAMERA_SET), str(CubeSphere.FP_SHELL_PREWARM)])
 	_gate_driver_reachable()
 	_gate_live(active)
+	_gate_subcam(active)
 	_gate_cover(active)
 	_gate_antipode(active)
 	_gate_bound(active)
@@ -206,15 +207,49 @@ func _gate_live(active: int) -> void:
 		"G-SHELL-LIVE: telemetry agrees at convergence (emit=%d visN=%d cachedN=%d target=%d)" % [int(tel.get("sh_emit", -1)), int(tel.get("sh_visN", -1)), int(tel.get("sh_cachedN", -1)), target])
 	ring.free()
 
+# ---------------- G-SHELL-SUBCAM (the "facets under me disappear" fix — sub-camera coverage by regime) ----------------
+## In orbit there are no near voxels over the ground under the camera, so the shipped active-facet EXCLUSION / sunk
+## backstop leaves a sweeping HOLE at the sub-camera facet as the active facet churns (~1 facet / 3 frames) — the
+## live "facets under me disappear" flicker. Fix: OFF-SURFACE the shell OWNS the sub-camera facet, emitted as a
+## REGULAR coarse facet (not excluded, not a sunk backstop; the coarse cache is prewarm-filled ⇒ no warm hole). ON
+## the surface the shipped exclusion stays (near voxels own it — byte-identical). This gate asserts both regimes.
+func _gate_subcam(active: int) -> void:
+	print("  --- G-SHELL-SUBCAM: sub-camera facet covered off-surface (no hole), excluded on the surface (shipped) ---")
+	var nrm := FA.facet_normal64(active)
+	var n := Vector3(nrm[0], nrm[1], nrm[2]).normalized()
+	# OFF-SURFACE: camera directly over the active facet at LEO — the sub-camera facet + its neighbours must be emitted, un-sunk.
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active)
+	var emitted := _emit_set(ring, n, _R + 500.0, false)          # floored=false ⇒ true-orbit regime
+	_ok(emitted.has(active) and bool(ring.call("is_emitted", active)),
+		"G-SHELL-SUBCAM: off-surface the sub-camera (active) facet %d IS emitted (no hole under the camera)" % active)
+	_ok(not bool(ring.call("is_backstop", active)),
+		"G-SHELL-SUBCAM: off-surface the sub-camera facet is a REGULAR coarse facet, not a sunk backstop")
+	var missing_ring1 := 0
+	for slot in range(4):
+		var nb := FA.seam_neighbour(active, slot)
+		if nb >= 0 and nb != active and not emitted.has(int(nb)):
+			missing_ring1 += 1
+	_ok(missing_ring1 == 0, "G-SHELL-SUBCAM: off-surface the sub-camera facet's edge neighbours are all emitted (%d missing)" % missing_ring1)
+	ring.free()
+	# ON-SURFACE (floored): the shipped exclusion — the active facet is near-field-owned, NOT emitted by the shell (FULL_COVER off).
+	var ring2: Node3D = FFR.new()
+	get_root().add_child(ring2)
+	ring2.call("setup", active)
+	var surf := _emit_set(ring2, n, _R + 2.0, true)               # floored=true ⇒ surface regime
+	_ok(not surf.has(active) and not bool(ring2.call("is_emitted", active)),
+		"G-SHELL-SUBCAM: on the surface the active facet stays EXCLUDED (near-field-owned — byte-identical to shipped)")
+	ring2.free()
+
 # ---------------- G-SHELL-COVER ----------------
 func _gate_cover(active: int) -> void:
 	print("  --- G-SHELL-COVER: the visible cap is fully emitted at every altitude × longitude (incl. antipode) ---")
 	var ring: Node3D = FFR.new()
 	get_root().add_child(ring)
 	ring.call("setup", active)
-	# With FP_FARRING_FULL_COVER off (this gate), _front_visible legitimately skips the ACTIVE facet — the near voxel
-	# world / the FULL_COVER backstop covers the sub-camera facet, and that is never the far-hemisphere-blank bug. So
-	# the coverage oracle excludes the active facet (it is emitted-as-backstop under FULL_COVER, the deployed config).
+	# COSMOS-ORBITAL-SHELL live fix: OFF-SURFACE the shell OWNS the sub-camera facet (no near voxels to cover it), so
+	# the active facet is emitted too — the coverage oracle now INCLUDES it (no hole under the camera). See G-SHELL-SUBCAM.
 	var alts := [500.0, 2000.0, 8000.0, 30000.0, 200000.0]
 	var axes := _test_axes(active)
 	var total_miss := 0            # oracle (a) sampled-point misses (a facet containing a visible dir not emitted)
@@ -237,8 +272,6 @@ func _gate_cover(active: int) -> void:
 					var phi := TAU * float(ai) / float(naz)
 					var p := _dir_at(c, pe[0], pe[1], ang, phi)
 					var fid := _facet_of(p)
-					if fid == active:
-						continue                  # active facet covered by near voxels / FULL_COVER backstop (not the shell's cap)
 					total_checked += 1
 					if not emitted.has(fid):
 						total_miss += 1
@@ -250,8 +283,6 @@ func _gate_cover(active: int) -> void:
 			# (b) centre oracle: every facet whose CENTRE is inside the visible cap is emitted.
 			var cosb := cos(th)
 			for fid2 in range(_centres.size()):
-				if fid2 == active:
-					continue                      # active facet excluded (see above)
 				var cv: Vector3 = _centres[fid2]
 				if cv.dot(c) >= cosb:
 					total_checked += 1

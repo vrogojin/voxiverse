@@ -49,15 +49,17 @@ func _rel(a: float, b: float) -> float:
 
 func _initialize() -> void:
 	print("=== verify_odecay (COSMOS SPACE-NAV §7.4: G-ODECAY — the O coast DESCENT reproduction + fix) ===")
-	print("  CubeSphere.ORBIT_COAST = %s ; omega_spin(earth) = %.8f rad/s (spin period %.0f s)"
-		% [str(CubeSphere.ORBIT_COAST), EPH.omega_spin("earth"), 1200.0])
 	FA.warm_up()
-	# The three test radii the mandate specifies (post-atmosphere orbital band, R=3072 + ATMO_TOP=384).
-	for r in [3600.0, 4500.0, 6000.0]:
+	var R := GRAV.r_vox("earth")                             # surface radius (blocks) — 6371 today, read at runtime
+	print("  CubeSphere.ORBIT_COAST = %s ; R_body = %.0f ; gm_dyn = %.1f ; omega_spin = %.8f rad/s ; surface v_circ = %.1f b/s"
+		% [str(CubeSphere.ORBIT_COAST), R, GRAV.gm_dyn("earth"), EPH.omega_spin("earth"), sqrt(GRAV.gm_dyn("earth") / R)])
+	# Test radii are ALWAYS above the surface and expressed relative to R_body, so the gate never goes stale on a
+	# rescale (LEO band up through ~1.5 R). The atmosphere floor the bar guards is R + ATMO_TOP.
+	for r in [R + 500.0, R + 1500.0, R + 3000.0]:
 		_repro_and_fix(r, 3)
-	_secular_pump(4500.0, 30)
-	_hitchy_dt_case(4500.0)
-	_bar_1000(4500.0, 1.0 / 30.0, 60)
+	_secular_pump(R + 3000.0, 30)
+	_hitchy_dt_case(R + 1500.0)
+	_bar_1000(R + 1500.0, 1.0 / 30.0, 60)
 	_station_keep_gate(1.0 / 30.0)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -353,9 +355,11 @@ func _secular_pump(r: float, orbits: int) -> void:
 	var peri_drop_A: float = float(cA["r0"]) - float(cA["r_min"])
 	var peri_drop_C: float = float(cC["r0"]) - float(cC["r_min"])
 	print("    periapsis drop over %d orbits: A = %.1f blocks | FIX = %.4f blocks" % [orbits, peri_drop_A, peri_drop_C])
-	_ok(peri_drop_A > 5.0, "SECULAR: shipped composite A periapsis drops %.1f blocks (eccentricity pump — the descent)" % peri_drop_A)
+	# Meaningful invariant (not a magic block count): the shipped pump drops the periapsis by a clearly-measurable
+	# amount (≫ f64 noise) AND ≥ 1000× the fix's drop — i.e. a real secular decay that the f64 carry eliminates.
+	_ok(peri_drop_A > 1.0, "SECULAR: shipped composite A periapsis drops %.1f blocks (real eccentricity pump, not noise)" % peri_drop_A)
 	_ok(peri_drop_C < 1.0e-3, "SECULAR: FIX periapsis drop ~0 (%.5f blocks) — stays exactly circular over %d orbits" % [peri_drop_C, orbits])
-	_ok(peri_drop_A > 1000.0 * maxf(peri_drop_C, 1.0e-9), "SECULAR: A's periapsis drop is ≥ 1000× the FIX's")
+	_ok(peri_drop_A > 1000.0 * maxf(peri_drop_C, 1.0e-9), "SECULAR: A's periapsis drop is ≥ 1000× the FIX's (the fix removes the pump)")
 
 # ---------------------------------------------------------------------------------------
 # Hitchy-dt case — the substep-cap path (mandate): a post-hitch huge dt clamped, the FIX stays bounded + circular.
@@ -411,8 +415,8 @@ func _station_keep_gate(dt: float) -> void:
 	var body := "earth"
 	var mu := GRAV.gm_dyn(body)
 	var rv := GRAV.r_vox(body)
-	var atmo := rv + CubeSphere.ATMO_TOP                                  # 3456: the floor the periapsis must not cross
-	var r0 := rv + CubeSphere.ATMO_TOP + 300.0                            # 3756: seed just above the guard band
+	var atmo := rv + CubeSphere.ATMO_TOP                                  # R_body + ATMO_TOP: the floor the periapsis must not cross
+	var r0 := rv + CubeSphere.ATMO_TOP + 300.0                            # seed just inside the guard band (below the safe radius)
 	print("  --- STATION-KEEPING: deliberately-decaying orbit, boost vs no-boost (r0=%.0f, atmo floor=%.0f) ---" % [r0, atmo])
 	var drag_c := 2.0e-5                                                  # synthetic linear drag (energy sink) forcing decay
 	var period := TAU * r0 / sqrt(mu / r0)

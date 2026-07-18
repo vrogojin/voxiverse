@@ -40,6 +40,16 @@ var _stars: MeshInstance3D = null
 var _moon_mat: StandardMaterial3D = null
 var _star_mat: ShaderMaterial = null
 
+## L1 moonshine per-frame inputs, computed in _update_sky (which holds t + the Moon geometry) and read by
+## _ramp_environment. Defaults ⇒ zero moonshine, so a direct _ramp_environment call (the SN4 gate) is
+## unaffected regardless of the flag. base albedo cached once so the eclipse redden is non-cumulative.
+var _moon_up := 0.0                 # clamp(moon_dir·up, 0, 1) — how high the Moon rides
+var _moon_illum := 0.0              # ephemeris illuminated fraction (0 new … 1 full)
+var _moon_eclipse := 1.0            # lunar-eclipse factor (1 clear … 0 deep umbra)
+var _moon_light: DirectionalLight3D = null   # L1 v1 real second light (SKY_MOONSHINE_LIGHT); null unless built
+var _cur_sun_dir := Vector3(1.0, 0.0, 0.0)   # L3: last body-fixed Sun direction, exposed via current_sun_dir()
+const _MOON_ALBEDO_BASE := Color(0.72, 0.72, 0.70)   # shipped grey (see _build_nodes); umbra reddens toward crimson
+
 ## BLACK-SKY FIX: the additive procedural starfield for the dome (see _build_nodes). `blend_add` +
 ## `depth_draw_never` are what stop it occluding the ramped Environment background (the original
 ## opaque dome's bug); `cull_front` shows its inside; `unshaded` keeps it light-independent. Stars are
@@ -161,6 +171,76 @@ static func occlusion_ambient(sun_dir: Vector3, p: Vector3, h: float, r_vox: flo
 	var occ := occlusion_factor(sun_dir, p, r_vox)
 	return lerpf(1.0, lerpf(AMBIENT_UMBRA, 1.0, occ), authority)
 
+# ---------------------------------------------------------------------------------------
+# COSMOS-LOD-SKY task 2 (docs/COSMOS-LOD-SKY-DESIGN.md §6, §7.3) — celestial lighting statics. ALL pure
+# (engine-free) so the gates (G-SKY-MOONSHINE / G-SKY-SCATTER / G-SHELL-TINT) drive them DIRECTLY and are
+# FLAG-INDEPENDENT; the flags only decide whether _ramp_environment / _make_material COMPOSE them in-game.
+# ZERO bytes: property/uniform writes only, no geometry, no per-frame allocation.
+# ---------------------------------------------------------------------------------------
+
+# --- L2/L3 Rayleigh scattering (§6). ONE model, μ = sin(sun elevation) = cos(zenith), three consumers. ---
+## Sea-level vertical Rayleigh optical depths (real, 680/550/440 nm). Named per channel: R the least extinct.
+const TAU_R := 0.042
+const TAU_G := 0.098
+const TAU_B := 0.245
+
+## Kasten–Young relative air mass at μ = sin(elevation). μ clamped to [0,1] (the direct-sun term is defined
+## down to the horizon; μ<0 is handled by sunset_weight/scatter_band fading the tint into night). m(1)=1
+## (overhead), m(0)≈38 (horizon). C¹ in μ over (0,1]. Real formula: 1/(sin h + 0.50572·(h°+6.07995)^−1.6364).
+static func air_mass(mu: float) -> float:
+	var m := clampf(mu, 0.0, 1.0)
+	var h_deg := rad_to_deg(asin(m))
+	return 1.0 / (m + 0.50572 * pow(h_deg + 6.07995, -1.6364))
+
+## Direct-light transmittance colour T_c(μ) = exp(−τ_c·m(μ)) — the sunrise/sunset/terminator colour, straight
+## from the physics (no scripted gradient): pale-warm near noon → gold → orange → deep crimson at the horizon.
+static func scatter_tint(mu: float) -> Color:
+	var m := air_mass(mu)
+	return Color(exp(-TAU_R * m), exp(-TAU_G * m), exp(-TAU_B * m))
+
+## L2 GROUND weight: how strongly the scatter tint colours the sky. 0 with the Sun high (ordinary blue day),
+## rising as it nears the horizon, back to 0 well below (deep night owns the floor). C¹ (smoothstep product).
+const SUNSET_MU_HI := 0.50        # above this μ (elev ≳ 30°): no sunset tint — plain day
+const SUNSET_MU_LO := -0.10       # below this μ (elev ≲ −6°): deep night — no direct-Sun colour
+static func sunset_weight(mu: float) -> float:
+	var hi := 1.0 - smoothstep(0.25, SUNSET_MU_HI, mu)     # fade out as the Sun climbs past the band
+	var lo := smoothstep(SUNSET_MU_LO, 0.02, mu)           # fade out below the horizon into night
+	return hi * lo
+
+## L3 SHELL band weight: localise the tint to the terminator arc on the globe (μ∈[−0.05,0.25] ≈ 17° of arc,
+## §6). 0 in full day (no tint, ALBEDO unchanged) and in deep night; a smooth bump peaking at the terminator.
+const BAND_MU_LO := -0.05
+const BAND_MU_HI := 0.25
+static func scatter_band(mu: float) -> float:
+	var up := smoothstep(BAND_MU_LO - 0.05, BAND_MU_LO + 0.05, mu)   # night → band
+	var down := 1.0 - smoothstep(BAND_MU_HI - 0.10, BAND_MU_HI, mu)  # band → full day
+	return up * down
+
+## L3 per-vertex shell ALBEDO multiplier at μ = normalize(v)·sun_dir: mix(white, scatter_tint(μ), band(μ)).
+## The GDScript twin of the shell shader's tint (the gate pins the shader to THIS curve; render is live-only).
+static func shell_terminator_tint(mu: float) -> Color:
+	var w := scatter_band(mu)
+	return Color.WHITE.lerp(scatter_tint(mu), w)
+
+# --- L1 moonshine (§7.3). v0 ambient (default), + lunar-eclipse dim/redden; v1 real light shares the energy. ---
+## Ambient-energy gain of a full Moon over the night floor (D-LS1, taste; 0.5 of the floor).
+const MOONSHINE_GAIN := 0.5
+## Cool moonlight tint applied to the ambient light colour on the night side.
+const MOONSHINE_TINT := Color(0.75, 0.80, 1.00)
+
+## Extra night ambient energy from moonshine: gain · illuminated_fraction · moon_up · night_authority. 0 at new
+## moon (f=0), by day (night_authority=0) or when the Moon is down (moon_up=0); monotone & C¹ in every argument.
+static func moonshine_energy(illum_frac: float, moon_up: float, night_authority: float) -> float:
+	return MOONSHINE_GAIN * clampf(illum_frac, 0.0, 1.0) * clampf(moon_up, 0.0, 1.0) * clampf(night_authority, 0.0, 1.0)
+
+## Lunar-eclipse factor ∈ [0,1] at time t: 1 = Moon in full sunlight, 0 = Moon deep in Earth's umbra. Reuses
+## occlusion_factor with the MOON as the occluded point and EARTH as the occluding body (radius r_earth), in
+## Earth's inertial frame. Multiplies the illuminated fraction (dims moonshine) and drives the impostor redden.
+static func moon_eclipse_factor(t: float) -> float:
+	var sun_dir := EPH.dir_to("earth", "sun", t)
+	var moon_p := EPH.body_pos_parent_v3("moon", t)        # Moon relative to Earth's centre (blocks, inertial)
+	return occlusion_factor(sun_dir, moon_p, EPH.radius_of("earth"))
+
 ## Wire the sky to a clock (read each frame), the scene Environment (ramped; may be null → no ramp),
 ## and a camera provider (the Player; may be null → impostors sit around the origin). Builds the
 ## reused nodes once. Idempotent-safe: call once from main.gd under the flag.
@@ -201,6 +281,17 @@ func _build_nodes() -> void:
 	_sun_light.shadow_enabled = false
 	_sun_light.light_energy = 1.0
 	add_child(_sun_light)
+
+	# --- L1 v1 (SKY_MOONSHINE_LIGHT, §7.3): a real second DirectionalLight for moon-shadows-on-terrain. Built
+	# ONLY under the flag (draw-count VISUAL-RISK on gl_compat — an extra additive lit pass), aimed/energised in
+	# _update_sky. Flag off ⇒ never created ⇒ byte-identical (no extra light in the scene). Requires SKY_MOONSHINE.
+	if CubeSphere.SKY_MOONSHINE and CubeSphere.SKY_MOONSHINE_LIGHT:
+		_moon_light = DirectionalLight3D.new()
+		_moon_light.name = "MoonLight"
+		_moon_light.shadow_enabled = false
+		_moon_light.light_color = MOONSHINE_TINT
+		_moon_light.light_energy = 0.0
+		add_child(_moon_light)
 
 	# --- Moon impostor: a SHADED sphere lit by the sun light ⇒ its phase falls out for free (§4.4).
 	_moon = MeshInstance3D.new()
@@ -268,6 +359,8 @@ func _update_sky(t: float) -> void:
 	if sun_dir == Vector3.ZERO:
 		sun_dir = Vector3(1.0, 0.0, 0.0)
 
+	_cur_sun_dir = sun_dir                                   # L3: forwarded to the shell tint uniform (current_sun_dir)
+
 	# The light comes FROM the sun: a DirectionalLight shines along its local −Z, so aim −Z at −sun_dir
 	# (i.e. +Z = sun_dir). look_at points local −Z at the target, so look from cam toward (cam − sun_dir).
 	_sun_light.transform = _looking_along(-sun_dir, cam_origin)
@@ -282,6 +375,22 @@ func _update_sky(t: float) -> void:
 		moon_dir = Vector3(-1.0, 0.0, 0.0)
 	var moon_ang := EPH.angular_diameter("moon", OBSERVER, t)
 	_place_impostor(_moon, cam_origin + moon_dir * D_SKY, D_SKY * tan(moon_ang * 0.5))
+
+	# --- L1 MOONSHINE (SKY_MOONSHINE, §7.3). Compute the Moon geometry _ramp_environment reads, redden the
+	# impostor through a lunar eclipse, and (v1) aim the optional real second light. Flag off ⇒ this whole block
+	# is skipped: the moonshine inputs stay 0 (no ambient add) and the Moon albedo stays the shipped grey.
+	if CubeSphere.SKY_MOONSHINE:
+		var up := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+		_moon_up = clampf(moon_dir.dot(up), 0.0, 1.0)
+		_moon_illum = EPH.illuminated_fraction(OBSERVER, "moon", "sun", t)
+		_moon_eclipse = moon_eclipse_factor(t)
+		# Eclipse redden: blend the shipped grey toward the §6 horizon crimson as the Moon enters the umbra.
+		var umbra := scatter_tint(0.0)                       # deep crimson (m≈38 horizon transmittance)
+		_moon_mat.albedo_color = _MOON_ALBEDO_BASE.lerp(umbra, 1.0 - _moon_eclipse)
+		if _moon_light != null:                              # v1 (SKY_MOONSHINE_LIGHT): a real −moon_dir light
+			_moon_light.transform = _looking_along(-moon_dir, cam_origin)
+			var night_authority := 1.0 - clampf((clampf(sun_dir.dot(up), -1.0, 1.0) + 0.15) / 0.30, 0.0, 1.0)
+			_moon_light.light_energy = CubeSphere.MOON_LIGHT_MAX * _moon_illum * _moon_eclipse * night_authority
 
 	# Star dome: centred on the camera, rotated by −Earth spin (the stars wheel as the planet turns).
 	var spin := EPH.spin_angle(OBSERVER, t)
@@ -338,9 +447,39 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 		_env.fog_density = fog_density_at(h, has_atmo)
 	if occ_on:
 		ambient *= occlusion_ambient(sun_dir, cam_origin, h, r_vox, has_atmo)
+
+	# L2 SKY_SCATTER_RAMP (§6a): recolour the sky/fog toward the Rayleigh direct-light transmittance as the Sun
+	# nears the horizon (deep-blue → gold → crimson), and warm the ambient tint in the gold band. `elev` is
+	# μ = sin(sun elevation), the exact argument scatter_tint wants. sunset_weight is 0 with the Sun high and in
+	# deep night, so away from sunrise/sunset the shipped ramp is untouched. Environment writes only (no shader).
+	# L1 SKY_MOONSHINE (§7.3): add the cool ambient moonlight term on the night side (energy = gain·f·moon_up·night;
+	# f dimmed by the eclipse factor), and cool the ambient tint by its strength. Both terms reset their colour to
+	# white when inactive, so nothing lingers. Flag(s) off ⇒ ambient_light_color is NEVER written (byte-identical).
+	var amb_col := Color.WHITE
+	var amb_col_write := false
+	if CubeSphere.SKY_SCATTER_RAMP:
+		var w := sunset_weight(elev)
+		if w > 0.0:
+			var st := scatter_tint(elev)
+			sky = sky.lerp(Color(sky.r * st.r, sky.g * st.g, sky.b * st.b), w)
+			amb_col = amb_col.lerp(st, w * 0.6)
+		amb_col_write = true
+	if CubeSphere.SKY_MOONSHINE:
+		var add := moonshine_energy(_moon_illum * _moon_eclipse, _moon_up, night_fade)
+		ambient += add
+		amb_col = amb_col.lerp(MOONSHINE_TINT, clampf(add / MOONSHINE_GAIN, 0.0, 1.0))
+		amb_col_write = true
+
 	_env.background_color = sky
 	_env.fog_light_color = _env.background_color
 	_env.ambient_light_energy = ambient
+	if amb_col_write:
+		_env.ambient_light_color = amb_col
+
+## L3 (SHELL_TERMINATOR_TINT): the current body-fixed Sun direction, for main.gd to forward into the far-ring
+## shell tint uniform each frame (so the space-side terminator band tracks the same Sun as the ground ramp).
+func current_sun_dir() -> Vector3:
+	return _cur_sun_dir
 
 ## Camera origin (parallax-free sky centre). Falls back to this node's own origin if no provider yet
 ## (local origin — CosmosSky is at identity, so this is the scene origin / planet centre).

@@ -258,6 +258,58 @@ static func dir_to_bodyfixed(from_body: String, to_body: String, t: float) -> Ve
 		s * d_inertial.x + c * d_inertial.y,
 		d_inertial.z)
 
+## COSMOS-LOD-SKY L0 (docs/COSMOS-LOD-SKY-DESIGN.md §7.2, G-MOON-PHASE) — celestial PHASE geometry, pure f64.
+## The phase angle ψ at `body` is the Source–body–Observer angle: the angle, seen AT `body`, between the
+## direction to the light source and the direction to the observer. For the Moon (observer=earth, source=sun):
+## full moon ⇒ Sun and Earth lie the same way from the Moon ⇒ ψ≈0; new moon ⇒ opposite ⇒ ψ≈π. This is exactly
+## the light-vs-view geometry the shipped CosmosSky Moon impostor is rendered with (a sphere lit along −sun_dir,
+## viewed from earth), so the illuminated fraction below IS the rendered lit fraction — the gate proves it, no
+## new render code. Pure statics: dead unless a gate / the moonshine term calls them (no byte impact).
+static func phase_angle(observer: String, body: String, source: String, t: float) -> float:
+	var pb := body_pos_helio(body, t)
+	var to_source := DV.normalized_v3(DV.sub(body_pos_helio(source, t), pb))
+	var to_observer := DV.normalized_v3(DV.sub(body_pos_helio(observer, t), pb))
+	if to_source == Vector3.ZERO or to_observer == Vector3.ZERO:
+		return 0.0
+	return to_source.angle_to(to_observer)
+
+## Illuminated fraction of `body`'s disc as seen from `observer`, lit by `source`: f = (1+cos ψ)/2 ∈ [0,1].
+## 1 = full (ψ=0), 0.5 = quarter (ψ=π/2), 0 = new (ψ=π). This is the textbook lit fraction of a sphere at
+## phase angle ψ — the value the shipped lit-sphere impostor shows automatically (§7.2). Reused by SKY_MOONSHINE.
+static func illuminated_fraction(observer: String, body: String, source: String, t: float) -> float:
+	return 0.5 * (1.0 + cos(phase_angle(observer, body, source, t)))
+
+## Sky-plane direction, seen from `observer`, of `body`'s bright limb (the illuminated edge points toward the
+## source). = the component of the observer→source direction perpendicular to the observer→body line of sight,
+## normalized. Perpendicular to the line of sight by construction; the terminator on the disc is ⊥ to it. The
+## gate asserts it is a valid unit vector, ⊥ the view direction, and sunward — i.e. the shipped sphere's
+## terminator orientation is the real ephemeris one (§7.2 bright-limb position angle == projected sun direction).
+static func bright_limb_dir(observer: String, body: String, source: String, t: float) -> Vector3:
+	var po := body_pos_helio(observer, t)
+	var m_hat := DV.normalized_v3(DV.sub(body_pos_helio(body, t), po))       # observer → body (line of sight)
+	var s_hat := DV.normalized_v3(DV.sub(body_pos_helio(source, t), po))     # observer → source
+	if m_hat == Vector3.ZERO or s_hat == Vector3.ZERO:
+		return Vector3.ZERO
+	var proj := s_hat - m_hat * s_hat.dot(m_hat)                             # sunward, projected onto the sky plane
+	if proj.length() < 1.0e-12:
+		return Vector3.ZERO
+	return proj.normalized()
+
+## Solar ELONGATION of `body` from `observer`: the on-sky angle between the source and the body (Sun–observer–
+## body angle). Ties phase to geometry — at first/last quarter (f=0.5) the elongation is ≈90° (the gate checks it).
+static func elongation(observer: String, body: String, source: String, t: float) -> float:
+	var po := body_pos_helio(observer, t)
+	var to_body := DV.normalized_v3(DV.sub(body_pos_helio(body, t), po))
+	var to_source := DV.normalized_v3(DV.sub(body_pos_helio(source, t), po))
+	if to_body == Vector3.ZERO or to_source == Vector3.ZERO:
+		return 0.0
+	return to_source.angle_to(to_body)
+
+## Position of `body` relative to its parent as a render-side Vector3 (blocks). Thin wrapper over the f64
+## body_pos_parent for the eclipse geometry in CosmosSky (the Moon's offset from Earth's centre).
+static func body_pos_parent_v3(body: String, t: float) -> Vector3:
+	return DV.to_v3_scaled(body_pos_parent(body, t), 1.0)
+
 ## Sub-`target` longitude (rad) on `body`'s surface — the body-fixed azimuth of the direction from
 ## `body` to `target`. For a tidally-locked moon toward its parent this is CONSTANT (the tidal-lock
 ## invariant the gate samples across a month). Computed in f64 (NOT the f32 Vector3 render path) so

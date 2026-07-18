@@ -1032,7 +1032,38 @@ func _facet_centre_dir(fid: int) -> Array:
 static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t
 
+# COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT, §6b): the space-side terminator band. A lit vertex-colour spatial
+# shader (same render class as the StandardMaterial3D / the P3 bias shader) plus a `sun_dir` uniform: per VERTEX
+# μ = normalize(world_pos)·sun_dir and ALBEDO *= mix(1, scatter_tint(μ), band(μ)). The scatter_tint/band GLSL MIRRORS
+# CosmosSky.scatter_tint/scatter_band EXACTLY (the gate pins the GDScript twin; this shader render is live-only). The
+# ONE VISUAL-RISK stage (P3 shader-failure class on gl_compat) — default-off, screenshot-gated; the StandardMaterial
+# fallback below is retained permanently. planet centre = scene origin (fixed frame) so normalize(world) is the surface dir.
+const _SHELL_TINT_SHADER := "shader_type spatial;
+render_mode cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+varying vec3 v_col;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	float mu = dot(normalize(wp), normalize(sun_dir));
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col = COLOR.rgb * tint;
+}
+void fragment() { ALBEDO = v_col; ROUGHNESS = 1.0; }
+"
+
 func _make_material() -> Material:
+	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
+	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
+	if CubeSphere.SHELL_TERMINATOR_TINT:
+		var sh := Shader.new()
+		sh.code = _SHELL_TINT_SHADER
+		var sm := ShaderMaterial.new()
+		sm.shader = sh
+		sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		return sm
 	# TIER-DEPTH P3 (§5.2): the far ring is the coarsest overlapping tier → an 8-quantum window-space depth bias so it
 	# loses every coincident-depth tie to the skin and near blocks at ANY distance. The biased material is a LIT
 	# vertex-colour spatial shader equivalent to the StandardMaterial3D below (fog/tonemap applied by the environment).
@@ -1044,6 +1075,16 @@ func _make_material() -> Material:
 	m.cull_mode = BaseMaterial3D.CULL_DISABLED     # far ring: winding-agnostic (transforms may flip facets)
 	m.roughness = 1.0
 	return m
+
+## COSMOS-LOD-SKY L3: feed the current Sun direction into the shell tint shader's `sun_dir` uniform (main.gd forwards
+## it from CosmosSky each frame). No-op unless SHELL_TERMINATOR_TINT is on and the material is the tint shader — so
+## flag-off is byte-identical (the setter is never wired) and it can never touch the StandardMaterial/bias paths.
+func set_terminator_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.SHELL_TERMINATOR_TINT or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
 
 ## Triangle count of the built ring mesh (gate).
 func triangle_count() -> int:

@@ -54,6 +54,7 @@ func _initialize() -> void:
 	_gate_class()
 	_gate_cont()
 	_gate_geo()
+	_gate_nospiral()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -81,9 +82,11 @@ func _gate_class() -> void:
 	var surf_v := DV.v(0.0, w * R, 0.0)                     # = ω⃗×p (rest on the rotating surface)
 	_ok(NAV.classify(body, surf_p, surf_v, t) == NAV.PLANETARY, "row: surface (h=0, u≈%.3f) → PLANETARY" % (DV.length(surf_v) / sqrt(GRAV.gm_dyn(body) / R)))
 
-	# Hovering at h=500 (above atmo 384), slow u≈0.07 ⇒ vicinity + suborbital → PLANETARY.
+	# Hovering at h=500 (above atmo 384), slow u≈0.07 ⇒ LOW_ORBIT. The atmosphere ceiling IS the planetary↔
+	# low-orbit divide (user decision 2026-07-18): above 384 blocks the slow-hover "suborbital stays PLANETARY"
+	# clause is gone, so a slow hover just above the atmosphere falls through the vicinity rule → LOW_ORBIT.
 	var hov := _state_at(body, R + 500.0, 0.07)
-	_ok(NAV.classify(body, hov[0], hov[1], t) == NAV.PLANETARY, "row: hover h=500 u=0.07 → PLANETARY (vicinity+slow)")
+	_ok(NAV.classify(body, hov[0], hov[1], t) == NAV.LOW_ORBIT, "row: hover h=500 u=0.07 → LOW_ORBIT (above atmo ⇒ low orbit regardless of speed)")
 
 	# LEO circular at h=500, u=1 ⇒ vicinity, super-suborbital → LOW_ORBIT.
 	var leo := _state_at(body, R + 500.0, 1.0)
@@ -377,3 +380,58 @@ func _gate_geo() -> void:
 	# Interim numbers sanity (SPACE-NAV §3 table): Earth r_geo ≈ 20,370; Moon r_geo ≈ 88.5 k, SOI ≈ 66.1 k.
 	_ok(_rel(r_geo, 20370.0) < 5.0e-3, "G-SN-GEO: Earth r_geo = %.0f ≈ 20,370 (interim)" % r_geo)
 	_ok(_rel(moon_soi, 66100.0) < 2.0e-2, "G-SN-GEO: Moon SOI = %.0f ≈ 66,100" % moon_soi)
+
+# ---------- G-SN-NOSPIRAL: the per-frame work is BOUNDED regardless of dt (the freeze / spiral-of-death fix) ----------
+# The live symptom was an exponential frame-time runaway (worst_ms 433→893→1024→1995→…→15974) with EVERY
+# measured cost flat — the signature of a per-frame loop whose iteration count scales with the frame dt: one
+# streaming hitch seeds a large dt, the loop does proportionally more work, the frame gets slower, dt grows.
+# The unbounded loop is OrbitalState.step's `n = ceil(dt/SUBSTEP_MAX)` (dt = 16 s ⇒ ~960 Verlet substeps in
+# ONE frame). This gate proves the three defensive bounds hold, and is FALSIFIABLE: remove the SUBSTEP_MAX_N
+# cap and substep_count(16) jumps to ~960 (assert fails); remove clamp_nav_dt and the live dt is unbounded.
+func _gate_nospiral() -> void:
+	print("  --- G-SN-NOSPIRAL: substep cap + nav-dt clamp + finite-difference guard (bounded per-frame work) ---")
+	var body := "earth"
+
+	# (1) A normal 60-fps tick is a couple of substeps at most, and the CAP is INERT there — the uncapped count
+	#     for dt ≤ 1/60 is well below SUBSTEP_MAX_N, so every accuracy gate (all step at dt ≤ 1/60) is
+	#     byte-unchanged by the cap (min(uncapped, cap) == uncapped when uncapped < cap). (Note: 1/60 ÷ the
+	#     0.016666… SUBSTEP_MAX literal rounds to a hair over 1.0, so ceil is 2, not 1 — a couple of substeps,
+	#     exactly as before this fix; the cap never touches it.)
+	_ok(ORB.substep_count(1.0 / 60.0) <= 2, "substep_count(1/60) <= 2 (a normal frame is a couple of substeps)")
+	_ok(int(ceil((1.0 / 60.0) / ORB.SUBSTEP_MAX)) < ORB.SUBSTEP_MAX_N, "the cap is INERT for a normal frame (uncapped %d < cap %d ⇒ accuracy gates untouched)" % [int(ceil((1.0 / 60.0) / ORB.SUBSTEP_MAX)), ORB.SUBSTEP_MAX_N])
+	_ok(ORB.substep_count(0.01) == 1, "substep_count(0.01) == 1 (the G-SN-CONT(A) dt is still 1 substep)")
+
+	# (2) A post-hitch HUGE dt is CAPPED at SUBSTEP_MAX_N — NOT the ~960 it would be uncapped. This is the line
+	#     that kills the spiral: the per-frame Verlet count can never scale with dt past the cap.
+	var uncapped := int(ceil(16.0 / ORB.SUBSTEP_MAX))       # ~960 — what the loop ran BEFORE the fix
+	_ok(uncapped > 900, "without a cap a 16-s frame would run ~%d substeps (the unbounded loop)" % uncapped)
+	_ok(ORB.substep_count(16.0) == ORB.SUBSTEP_MAX_N, "substep_count(16 s) == SUBSTEP_MAX_N (%d) — CAPPED, not %d" % [ORB.SUBSTEP_MAX_N, uncapped])
+	_ok(ORB.substep_count(1.0e9) == ORB.SUBSTEP_MAX_N, "substep_count(1e9 s) == SUBSTEP_MAX_N (bound holds for any dt)")
+
+	# (2b) The real step() over a huge dt returns a FINITE state in bounded work (the cap makes it survive the
+	#      recovery frame — it does not hang looping ~960 times, nor produce NaN/inf).
+	var st := ORB.make(body, DV.v(GRAV.r_vox(body) + 500.0, 0.0, 0.0), DV.v(0.0, 100.0, 0.0))
+	st.step(16.0, DV.v(0.0, 0.0, 0.0))
+	_ok(_dv_finite(st.pos) and _dv_finite(st.vel), "step(16 s) returns a finite [pos,vel] in bounded work (no hang, no NaN/inf)")
+
+	# (3) The per-frame dt clamp: a runaway dt is capped to MAX_NAV_DT; a normal frame is BYTE-NEUTRAL (dt < clamp
+	#     passes through unchanged); a non-positive dt is 0. And the CLAMPED dt through step is ≤ 2 substeps —
+	#     the actual live wiring (player clamps, then any integrator steps) is bounded to a trivial count.
+	_ok(NAV.clamp_nav_dt(16.0) == NAV.MAX_NAV_DT, "clamp_nav_dt(16 s) == MAX_NAV_DT (%.4f) — runaway dt bounded" % NAV.MAX_NAV_DT)
+	_ok(NAV.clamp_nav_dt(1.0 / 60.0) == 1.0 / 60.0, "clamp_nav_dt(1/60) == 1/60 (a normal frame is untouched — byte-neutral)")
+	_ok(NAV.clamp_nav_dt(-1.0) == 0.0, "clamp_nav_dt(negative) == 0 (no negative dt reaches the path)")
+	_ok(ORB.substep_count(NAV.clamp_nav_dt(16.0)) <= 3, "clamp→step over a huge dt is a tiny substep count (≤ 3, vs ~%d uncapped — the live-wired bound)" % uncapped)
+
+	# (4) The finite-difference guard: v_fix = Δp · fd_inv_dt cannot blow up on a near-zero delta. fd_inv_dt is
+	#     bounded by 1/MIN_FD_DT, so an enormous Δp / near-zero dt yields a bounded (if capped) derived velocity.
+	var inv_max := 1.0 / NAV.MIN_FD_DT
+	_ok(NAV.fd_inv_dt(0.0) == inv_max, "fd_inv_dt(0) == 1/MIN_FD_DT (%.0f) — near-zero delta cannot divide-by-zero" % inv_max)
+	_ok(NAV.fd_inv_dt(1.0e-12) == inv_max, "fd_inv_dt(1e-12) is clamped to 1/MIN_FD_DT (bounded, not 1e12)")
+	_ok(NAV.fd_inv_dt(1.0 / 60.0) == 60.0, "fd_inv_dt(1/60) == 60 (a normal delta is exact — byte-neutral)")
+	# A concrete blow-up attempt: a 1000-block position jump over a 1e-15-s delta.
+	var v_blow := DV.scale(DV.v(1000.0, 0.0, 0.0), NAV.fd_inv_dt(1.0e-15))
+	_ok(_dv_finite(v_blow) and DV.length(v_blow) <= 1000.0 * inv_max, "v_fix from a 1000-block jump over ~0 dt is bounded (|v| ≤ 1000/MIN_FD_DT, finite)")
+
+## True iff every component of a DVec3 is finite (no NaN / inf) — the bounded-work sanity check.
+func _dv_finite(p: PackedFloat64Array) -> bool:
+	return is_finite(p[0]) and is_finite(p[1]) and is_finite(p[2])

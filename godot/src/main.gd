@@ -169,6 +169,11 @@ func _process(_delta: float) -> void:
 	# (also stranded below the return) is only needed above h≈6.4k and is a separate FP_SCALED_BODY pass.
 	if _player != null and (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
 		_player.world.update_shell_camera_set(_player.camera_global_transform().origin)
+	# COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the sky's current Sun direction into the far-ring shell
+	# tint shader so the space-side terminator band tracks the same Sun as the ground ramp. Gated on the flag +
+	# a live sky; the WorldManager/ring setters self-guard, so flag-off is byte-identical (never called).
+	if _player != null and _cosmos_sky != null and CubeSphere.SHELL_TERMINATOR_TINT and CubeSphere.FACETED:
+		_player.world.set_far_ring_sun_dir(_cosmos_sky.current_sun_dir())
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin

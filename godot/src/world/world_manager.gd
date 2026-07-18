@@ -2241,6 +2241,12 @@ func update_shell_camera_set(cam: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.apply_camera_set(cam)
 
+## COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the current Sun direction to the far-ring shell tint shader.
+## No-op with no faceted ring or the flag off (the setter self-guards) ⇒ byte-identical.
+func set_far_ring_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_terminator_sun_dir(sun_dir)
+
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).
 func shell_telemetry() -> Dictionary:

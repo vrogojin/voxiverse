@@ -632,6 +632,45 @@ const ATMO_VISUAL_RAMP := false
 ## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
 const SN_SUN_OCCLUSION := false
 
+## COSMOS-LOD-SKY L1 (docs/COSMOS-LOD-SKY-DESIGN.md §7.3) — MOONSHINE (v0: zero-draw ambient moonlight). When
+## true, CosmosSky._ramp_environment adds a cool ambient term to the NIGHT side scaled by the Moon's ephemeris
+## illuminated fraction × how high the Moon rides × the night authority (1−twilight): full moon ⇒ a meaningfully
+## brighter blue-grey night, new moon ⇒ the shipped floor EXACTLY. Composes UNDER the SN4a/b altitude authorities.
+## Lunar eclipse falls out for free (CosmosSky.moon_eclipse_factor reuses occlusion_factor with the Moon behind
+## Earth) — it dims the ambient term and reddens the Moon impostor toward the §6 umbra crimson. ZERO draws, ZERO
+## bytes (Environment ambient-energy write + one impostor albedo write per frame). Default FALSE ⇒ BYTE-IDENTICAL:
+## no ambient term, the Moon albedo stays the shipped grey. Requires ORBITAL_SKY. Gate G-SKY-MOONSHINE; the night
+## LOOK is live-only. SAFE to bake ON (no shader/draw risk).
+const SKY_MOONSHINE := false
+
+## COSMOS-LOD-SKY L1 v1 (docs/COSMOS-LOD-SKY-DESIGN.md §7.3) — MOONSHINE as a REAL second DirectionalLight for
+## actual moon-shadows-on-terrain. In gl_compat every extra per-pixel light renders lit geometry in an ADDITIVE
+## pass — worst case approaches DOUBLING the ~200-draw budget — so this is the draw-count VISUAL-RISK half and is
+## a SEPARATE flag from the v0 ambient above, DEFAULT OFF even at export until a live draw-count/worst-frame A/B
+## passes. v0 is the permanent fallback. Requires SKY_MOONSHINE. LIVE-ONLY (measured A/B); no headless gate beyond
+## the energy formula (shared with v0).
+const SKY_MOONSHINE_LIGHT := false
+const MOON_LIGHT_MAX := 0.08      # v1 second-light peak energy (× illuminated_fraction × night authority)
+
+## COSMOS-LOD-SKY L2 (docs/COSMOS-LOD-SKY-DESIGN.md §6a) — the GROUND sunrise/sunset scattering ramp. When true,
+## CosmosSky._ramp_environment recolours the sky/fog/ambient toward the real Rayleigh direct-light transmittance
+## T_c(μ)=exp(−τ_c·m(μ)) — sea-level optical depths τ=(0.245,0.098,0.042) B/G/R, Kasten–Young air mass m(μ) — as
+## the Sun nears the horizon: deep-blue → cyan → gold → orange → crimson, EMERGING from the physics with no
+## hand-painted gradient. Environment property writes ONLY (the SN4a pattern) — ZERO bytes, ZERO shaders. Default
+## FALSE ⇒ BYTE-IDENTICAL: the shipped two-colour NIGHT→DAY lerp is untouched. Requires ORBITAL_SKY. Gate
+## G-SKY-SCATTER (curve/endpoints/monotone/C¹/off-identity); the sunset LOOK is live-only. SAFE class (no shader).
+const SKY_SCATTER_RAMP := false
+
+## COSMOS-LOD-SKY L3 (docs/COSMOS-LOD-SKY-DESIGN.md §6b) — the SPACE-side terminator band. When true, the far-ring
+## shell material becomes a lit vertex-colour SHADER carrying a `sun_dir` uniform; per vertex μ = normalize(v)·sun_dir
+## and ALBEDO *= mix(1, scatter_tint(μ), band(μ)) — the SAME T(μ) ramp as L2, so the sunset arc you saw from orbit
+## and the sky you see on the ground agree by construction. THIS IS THE ONE VISUAL-RISK stage (the P3 shader-failure
+## class on gl_compat): DEFAULT FALSE, screenshot-gated, and the StandardMaterial fallback is retained PERMANENTLY
+## (flag off ⇒ FacetFarRing._make_material returns the shipped StandardMaterial verbatim — byte-identical, the shell
+## is untouched). Gate G-SHELL-TINT proves the per-vertex tint MATH + the fallback identity; the render is live-only.
+## Requires ORBITAL_SKY + FACETED. Do NOT bake ON without a live screenshot.
+const SHELL_TERMINATOR_TINT := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

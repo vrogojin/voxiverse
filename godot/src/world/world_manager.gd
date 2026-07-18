@@ -2233,6 +2233,14 @@ func apply_scaled_body(cam: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.apply_scaled_placement(cam)
 
+## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): drive the far ring's camera-radial
+## emitted-set law + one-shot prewarm arming from this frame's camera (render frame). No faceted ring (fallback/
+## flat) ⇒ no-op. Called per frame by main._process under (FP_SHELL_CAMERA_SET or FP_SHELL_PREWARM); independent
+## of apply_scaled_body (separate flag/driver — the shell fix is standalone-correct below h ≈ 6.3 k without SN3).
+func update_shell_camera_set(cam: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.apply_camera_set(cam)
+
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets
 ## the accumulators — RemoteBridge samples it once per telemetry window so a 0.5 s snowfall spike is attributed as its own

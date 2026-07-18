@@ -187,6 +187,13 @@ func _process(_delta: float) -> void:
 		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
 		_player.world.apply_scaled_body(cam)
 
+	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
+	# CAMERA radial direction (so the whole visible cap renders from orbit, not just the active facet's hemisphere)
+	# and arm the one-shot whole-planet prewarm. Independent of FP_SCALED_BODY (S1 is standalone-correct below the
+	# limb-clip altitude). DEAD (never called) with both shell flags off ⇒ the far ring is byte-identical to shipped.
+	if (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
+		_player.world.update_shell_camera_set(cam)
+
 func _setup_environment() -> void:
 	var env := Environment.new()
 

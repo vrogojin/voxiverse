@@ -14,6 +14,13 @@ extends Node
 ## the SAME WorldManager break/place/collapse + inventory pipeline (reach + rules enforced). `wait`/
 ## `screenshot`/`stop`/`reload` are unchanged from P2. An op outside the whitelist is `bad_op`.
 ##
+## SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): `dev_nav`/`nav`/`thrust`/`roll` add the dev/test space-nav verbs
+## so the orchestrator can fly scripted orbital/interplanetary missions. `dev_nav`(F) and `nav`(O/G/R) resolve
+## synchronously via the player's gated remote_set_dev_nav/remote_nav_verb; `thrust`(WASD+Space/Ctrl) and
+## `roll`(Q/E) are TIMED held-input steps that arm the player's own intent seam for `seconds` then release it —
+## the SAME analytic fly / dev-flight / coast paths a human's keystrokes drive. All inert unless the space-nav
+## flags are enabled AND dev-nav is engaged (they report `blocked`/no-op otherwise).
+##
 ## SECURITY: the executor's actuator surface is EXACTLY the five player intent fields (remote_drive/
 ## input/run/jump/yaw_rate) + the reused player break/place/select_slot/set_fly/pitch methods + the
 ## screenshot/reload requests. It synthesises no raw key/mouse input and reaches nothing outside game
@@ -47,6 +54,7 @@ const TURN_TOL_DEG := 0.5                  # §4.5 completion tolerance (degrees
 const TURN_WATCHDOG_S := 10.0              # §4.5 belt-and-braces (can't realistically fire)
 const JUMP_WATCHDOG_S := 5.0               # §4.6 never-grounded ⇒ `timeout`
 const LOOK_WATCHDOG_S := 10.0              # look easing bound
+const ROLL_RATE_DEG := 60.0               # SPACE-FLY: the roll step's held rate (deg/s) → rad/s seam (docs/COSMOS-SPACEFLY-DESIGN.md)
 const PITCH_MIN_DEG := -85.0               # §1.1 look.pitch_deg clamp
 const PITCH_MAX_DEG := 85.0
 
@@ -65,6 +73,7 @@ var _cur: Dictionary = {}                  # the step in flight ({} between step
 var _step_t0 := 0                          # msec at step start (dur_s)
 
 var _wait_deadline := 0                    # msec — `wait`
+var _hold_deadline := 0                    # msec — SPACE-FLY `thrust`/`roll` timed HELD-input step (docs/COSMOS-SPACEFLY-DESIGN.md)
 var _shot_deadline := 0                    # msec — `screenshot` watchdog
 var _shot_id := -1
 var _shot_done := false
@@ -148,8 +157,14 @@ func _process(_delta: float) -> void:
 				_finish_step("ok" if _shot_ok else "timeout")
 			elif Time.get_ticks_msec() >= _shot_deadline:
 				_finish_step("timeout")
+		"thrust", "roll":
+			# SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): a TIMED held-input step. The seam (remote_input/run or
+			# remote_roll_rate) was armed in _start_step and is consumed by the player's own _move / _attitude_tick
+			# every tick; here we only watch the clock and release it (via _zero_intent in _finish_step) at the deadline.
+			if Time.get_ticks_msec() >= _hold_deadline:
+				_finish_step("ok")
 		# move / turn / look / jump advance from physics_tick (below); stop / reload / set_fly / break /
-		# place / select_slot resolve synchronously in _start_step; nothing else to poll here.
+		# place / select_slot / dev_nav / nav resolve synchronously in _start_step; nothing else to poll here.
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -307,6 +322,34 @@ func _start_jump() -> void:
 	_jump_deadline = Time.get_ticks_msec() + int(JUMP_WATCHDOG_S * 1000.0)
 
 
+# ── SPACE-FLY held-input steps (docs/COSMOS-SPACEFLY-DESIGN.md) ──────────────────────────────────────
+## thrust: arm the body-local wish (dx=strafe, dy=vertical, dz=forward; +Z back to match the WASD `input`
+## shape) + run for `seconds`. The seam feeds the player's own fly / dev-flight / coast-exit path each tick;
+## the deadline poll (in _process) releases it. Vertical thrust (dy) is how a scripted flight climbs to orbit
+## and de-orbits; forward (dz<0) is prograde. No motion happens unless dev-nav/fly is engaged.
+func _start_thrust() -> void:
+	var seconds := float(_cur.get("seconds", 0.0))
+	if seconds <= 0.0:
+		_finish_step("bad_op")
+		return
+	var wish := Vector3(float(_cur.get("dx", 0.0)), float(_cur.get("dy", 0.0)), float(_cur.get("dz", 0.0)))
+	var run := str(_cur.get("gait", "walk")) == "run"
+	if is_instance_valid(player) and player.has_method("remote_set_thrust"):
+		player.call("remote_set_thrust", wish, run)
+	_hold_deadline = Time.get_ticks_msec() + int(round(seconds * 1000.0))
+
+## roll: hold a Q/E roll rate (dir left=+ / right=−) for `seconds`. Only bites under ORBIT_ATTITUDE in SPACE.
+func _start_roll() -> void:
+	var seconds := float(_cur.get("seconds", 0.0))
+	if seconds <= 0.0:
+		_finish_step("bad_op")
+		return
+	var roll_sign := 1.0 if str(_cur.get("dir", "left")) == "left" else -1.0
+	if is_instance_valid(player) and player.has_method("remote_set_roll"):
+		player.call("remote_set_roll", roll_sign * deg_to_rad(ROLL_RATE_DEG))
+	_hold_deadline = Time.get_ticks_msec() + int(round(seconds * 1000.0))
+
+
 # ── seam helpers ─────────────────────────────────────────────────────────────────────────────────────
 ## Zero every intent field so the rover halts within one physics tick (called FIRST on any terminal event).
 func _zero_intent() -> void:
@@ -317,6 +360,7 @@ func _zero_intent() -> void:
 	player.set("remote_run", false)
 	player.set("remote_jump", false)
 	player.set("remote_yaw_rate", 0.0)
+	player.set("remote_roll_rate", 0.0)        # SPACE-FLY: release a held roll on any terminal event (override/abort/step end)
 
 
 ## The body-local wish vector for a heading — the SAME shape as the WASD `input` (forward = −Z).
@@ -419,6 +463,25 @@ func _start_step() -> void:
 			if is_instance_valid(player) and player.has_method("remote_place"):
 				okk = bool(player.call("remote_place", _block_arg(_cur.get("block", 0)), _target_arg(_cur.get("target", "aim"))))
 			_finish_step("ok" if okk else "blocked")
+		"dev_nav":
+			# SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): F — drive dev-nav to a definite state. `blocked` when the
+			# space-nav build is not running (SN_DEVNAV off), so a scripted flight fails loudly rather than flying blind.
+			var on := bool(_cur.get("on", false))
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_set_dev_nav"):
+				okk = bool(player.call("remote_set_dev_nav", on))
+			_finish_step("ok" if okk else "blocked")
+		"nav":
+			# SPACE-FLY: O/G/R — orbit-coast / geostationary / detach. `blocked` when the verb is inert (not dev-nav,
+			# no BCI state, wrong mode) — the SAME condition a human keypress would be a no-op under.
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_nav_verb"):
+				okk = bool(player.call("remote_nav_verb", str(_cur.get("verb", ""))))
+			_finish_step("ok" if okk else "blocked")
+		"thrust":
+			_start_thrust()
+		"roll":
+			_start_roll()
 		"stop":
 			_finish_step("ok")                     # a labelled fence — the queue continues (§4.6)
 		"reload":

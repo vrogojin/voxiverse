@@ -1,0 +1,25 @@
+{
+  "name": "deorbit-land",
+  "description": "From orbit, exit the coast, descend through the atmosphere (SN-BRAKE caps the fall), drop dev-nav and land on the surface — assert landed (on_ground + planetary).",
+  "_notes": "Precondition: in orbit / coasting (run ascent-to-orbit + o-coast-hold first). A second nav:orbit toggles the coast OFF; vertical-down thrust lowers the craft; below 384 the nav machine returns to PLANETARY and SN_ATMO_BRAKING caps the descent speed. dev_nav:false re-enables the capsule so the player stands. Tune the descent seconds from the streamed alt.",
+  "legs": [
+    {
+      "name": "exit the free-coast",
+      "steps": [ { "op": "nav", "verb": "orbit" } ],
+      "settle_s": 1.0,
+      "expect": { "coasting": false }
+    },
+    {
+      "name": "de-orbit descent (SN-BRAKE caps the fall)",
+      "steps": [ { "op": "thrust", "dy": -1.0, "seconds": 30, "gait": "run" } ],
+      "settle_s": 2.0,
+      "expect": { "nav_mode": "planetary", "alt_lt": 384 }
+    },
+    {
+      "name": "land — drop dev-nav to the surface",
+      "steps": [ { "op": "dev_nav", "on": false }, { "op": "wait", "seconds": 3 } ],
+      "settle_s": 2.0,
+      "expect": { "landed": true, "flying": false, "body": "earth" }
+    }
+  ]
+}

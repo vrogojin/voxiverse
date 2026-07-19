@@ -92,7 +92,11 @@ const MAX_TOTAL_DURATION_S = 180;    // Σ expected step time (watchdog outer bo
 const MAX_CMD_BYTES = 16 * 1024;     // sequence JSON size
 const STALE_S = 120;                 // `issued` older than this => rejected (a delayed/re-sent file must not fire late)
 // Closed op whitelist (design §1.1 + resolved D5 full-agency set). Validation only routes in P1.
-const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload']);
+const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload',
+  // COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — dev/test space-nav verbs. Still consent-gated + control-token
+  // gated exactly like every op; the relay only ROUTES, the rover re-validates and executes behind the grant.
+  'dev_nav', 'nav', 'thrust', 'roll']);
+const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
 function loadToken() {
@@ -287,6 +291,26 @@ function validateStep(st) {
     }
     case 'stop': return okEst(0.1);
     case 'reload': return okEst(2.0);                   // §6.6: reload the browser to pick up a fresh deploy (grant-gated, game-side)
+    // COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the space-nav test verbs.
+    case 'dev_nav': {                                   // F: toggle dev-nav to a definite state
+      if (typeof st.on !== 'boolean') return rej('caps', 'dev_nav.on must be a bool');
+      return okEst(0.2);
+    }
+    case 'nav': {                                       // O/G/R: orbit-coast / geostationary / detach
+      if (!['orbit', 'geostation', 'detach'].includes(st.verb)) return rej('caps', `bad nav.verb '${st.verb}'`);
+      return okEst(0.2);
+    }
+    case 'thrust': {                                     // WASD+Space/Ctrl held: dx/dy/dz body-local wish for `seconds`
+      if (typeof st.seconds !== 'number' || !(st.seconds > 0) || st.seconds > MAX_HOLD_S) return rej('caps', `thrust.seconds must be in (0,${MAX_HOLD_S}]`);
+      for (const k of ['dx', 'dy', 'dz']) if (st[k] !== undefined && (typeof st[k] !== 'number' || !isFinite(st[k]))) return rej('caps', `thrust.${k} not finite`);
+      if (st.gait !== undefined && !['walk', 'run'].includes(st.gait)) return rej('caps', `bad gait '${st.gait}'`);
+      return okEst(st.seconds);
+    }
+    case 'roll': {                                       // Q/E held: roll for `seconds`
+      if (typeof st.seconds !== 'number' || !(st.seconds > 0) || st.seconds > MAX_HOLD_S) return rej('caps', `roll.seconds must be in (0,${MAX_HOLD_S}]`);
+      if (st.dir !== undefined && !['left', 'right'].includes(st.dir)) return rej('caps', `bad roll dir '${st.dir}'`);
+      return okEst(st.seconds);
+    }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');
       return okEst(0.5);

@@ -72,7 +72,11 @@ const UNATTENDED_RESUME_IDLE_MS := 5000     # §6.6: after an override in UNATTE
 const MAX_STEPS := 64
 const MAX_MOVE_BLOCKS := 128
 const STALE_S := 120.0
-const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload"]
+const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload",
+	# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the dev/test space-nav verbs. Behind CONTROL_ENABLED like
+	# every op; the executor that runs them exists only under a live grant, so this list is dead in normal play.
+	"dev_nav", "nav", "thrust", "roll"]
+const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
 # COSMOS-PERF L2 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §1.1/§4 L2) — capture hygiene. The synchronous
@@ -779,6 +783,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var nt = player.call("nav_telemetry")
 			if nt is Dictionary and not (nt as Dictionary).is_empty():
 				msg.merge(nt as Dictionary)
+			# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): the self-verification telemetry (alt/v_circ/orbit_r/
+			# body/dev_nav/coasting/flying/on_ground/att) a scripted test flight asserts each mechanic on. ADDITIVE +
+			# empty-dict-guarded — space_telemetry() returns {} when the nav machine is off (byte-identical stream).
+			if player.has_method("space_telemetry"):
+				var stel = player.call("space_telemetry")
+				if stel is Dictionary and not (stel as Dictionary).is_empty():
+					msg.merge(stel as Dictionary)
 		# COSMOS-ORBITAL-SHELL H-B: the live camera far plane, so "shell emitted but far side clipped" (far-plane) is
 		# directly readable next to sh_d/sh_h (compare far to the limb tangent √(d²−R²)). Guarded; 0 when absent.
 		if player.has_method("camera_far"):
@@ -1094,6 +1105,16 @@ func _validate_cmd(m: Dictionary) -> String:
 			var b = (st as Dictionary).get("blocks", null)
 			if not (b is float or b is int) or float(b) <= 0.0 or float(b) > MAX_MOVE_BLOCKS:
 				return "caps"
+		# SPACE-FLY: thrust/roll are TIMED holds — the seconds must be a finite, bounded, positive number.
+		if op == "thrust" or op == "roll":
+			var s = (st as Dictionary).get("seconds", null)
+			if not (s is float or s is int) or float(s) <= 0.0 or float(s) > MAX_HOLD_S:
+				return "caps"
+		# SPACE-FLY: dev_nav.on must be a bool; nav.verb must be a known verb.
+		if op == "dev_nav" and not ((st as Dictionary).get("on", null) is bool):
+			return "caps"
+		if op == "nav" and not ["orbit", "geostation", "detach"].has(str((st as Dictionary).get("verb", ""))):
+			return "caps"
 	return ""
 
 

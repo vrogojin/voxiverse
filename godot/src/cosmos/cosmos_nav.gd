@@ -89,6 +89,66 @@ static func fd_inv_dt(dt: float) -> float:
 	return 1.0 / maxf(dt, MIN_FD_DT)
 
 # ---------------------------------------------------------------------------------------
+# G-REENTRY velocity/state sanity (2026-07-19 live de-orbit blowup). The SN2 finite-difference velocity is
+# Δp/dt of whatever the position DID — including a discontinuity (a half-committed crossing left the lattice
+# pose in a stale frame → an ~11 k-block one-frame jump → v_fd = 642074 b/s). That garbage was then ADOPTED
+# as a physical velocity by the free-fall re-seed and latched (the player "escaped" outward for minutes).
+# Two invariants close the class:
+#   sane_v        — a derived/adopted BCI velocity must be finite and ≤ FD_SPEED_MAX, else fall back to the
+#                   last known-good velocity (velocity-continuous, SN-R1) or rest. A position discontinuity
+#                   can then never become motion.
+#   clamp_bci_state — an integrated BCI [p,v] must be finite and inside the body's SOI, else revert to the
+#                   pre-step state / clamp to the SOI sphere with the outward radial velocity removed. A
+#                   garbage state can then never take the player to work-unbounded altitudes (the 27 s/frame
+#                   streaming collapse observed at 35·R).
+# FD_SPEED_MAX = 20000 b/s: 2× the largest legitimate speed authority in the game (SN_DEV_V_MAX = 10000,
+# INTERSTELLAR; every orbital/escape speed at this scale is ≤ ~600), so no real flight is ever clipped,
+# while the 642074-class finite-difference of any frame-sized teleport is rejected outright.
+# ---------------------------------------------------------------------------------------
+const FD_SPEED_MAX := 20000.0
+
+## True iff `v` is a well-formed, finite, ≤ FD_SPEED_MAX DVec3. Pure.
+static func v_is_sane(v: PackedFloat64Array) -> bool:
+	if v.size() != 3:
+		return false
+	if is_nan(v[0]) or is_nan(v[1]) or is_nan(v[2]) or is_inf(v[0]) or is_inf(v[1]) or is_inf(v[2]):
+		return false
+	return DV.length(v) <= FD_SPEED_MAX
+
+## Sanitize a derived/adopted BCI velocity: return `v` if sane; else the last-good `fallback` if sane; else
+## rest. Always returns a fresh 3-vector (never aliases the inputs). Pure; gate G-NAV-SANEV.
+static func sane_v(v: PackedFloat64Array, fallback: PackedFloat64Array) -> PackedFloat64Array:
+	if v_is_sane(v):
+		return PackedFloat64Array([v[0], v[1], v[2]])
+	if v_is_sane(fallback):
+		return PackedFloat64Array([fallback[0], fallback[1], fallback[2]])
+	return DV.v(0.0, 0.0, 0.0)
+
+## Sanitize an integrated BCI [p, v] against the pre-step [p_prev, v_prev]: any non-finite component reverts
+## the WHOLE state to the pre-step pair (never adopt a broken integration); a radius beyond `r_max` (the
+## body's SOI, or any caller cap; INF ⇒ no radius clamp) is clamped onto the r_max sphere with the OUTWARD
+## radial velocity component removed (the tangential part is preserved — velocity-continuous at the clamp).
+## Returns [p, v] as fresh vectors. Pure; gate G-NAV-SOICLAMP.
+static func clamp_bci_state(p: PackedFloat64Array, v: PackedFloat64Array,
+		p_prev: PackedFloat64Array, v_prev: PackedFloat64Array, r_max: float) -> Array:
+	var bad := p.size() != 3 or v.size() != 3
+	if not bad:
+		for i in 3:
+			if is_nan(p[i]) or is_inf(p[i]) or is_nan(v[i]) or is_inf(v[i]):
+				bad = true
+				break
+	if bad:
+		return [PackedFloat64Array([p_prev[0], p_prev[1], p_prev[2]]),
+			PackedFloat64Array([v_prev[0], v_prev[1], v_prev[2]])]
+	var r := DV.length(p)
+	if is_inf(r_max) or r <= r_max or r <= 0.0:
+		return [PackedFloat64Array([p[0], p[1], p[2]]), PackedFloat64Array([v[0], v[1], v[2]])]
+	var rhat := DV.scale(p, 1.0 / r)
+	var v_out := DV.dot(v, rhat)
+	var v_new := DV.sub(v, DV.scale(rhat, maxf(v_out, 0.0)))   # strip only the OUTWARD radial part
+	return [DV.scale(rhat, r_max), v_new]
+
+# ---------------------------------------------------------------------------------------
 # Per-body derived radii (SPACE-NAV §3/§4). Pure reads of the ephemeris + GM_dyn scale bridge.
 # ---------------------------------------------------------------------------------------
 

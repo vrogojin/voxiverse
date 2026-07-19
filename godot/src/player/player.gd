@@ -90,6 +90,17 @@ var _nav_have_prev := false
 var _nav_tele: Dictionary = {}
 var _nav_last_v_bci := PackedFloat64Array()   # last derived BCI velocity (seeds dev-flight for a seamless handoff)
 
+# G-REENTRY FIX A (2026-07-19 live de-orbit blowup) — the facet frame the lattice `position` is EXPRESSED in.
+# The crossing protocol is two-phase (world_manager.maybe_cross_facet commits TerrainConfig.set_active_facet,
+# THEN the caller applies the returned reframed pose via apply_reframe) with a long fallible pipeline between
+# the two (redesignate / pool / far ring / restream). Any abort in that pipeline — or any future rogue
+# set_active_facet — leaves the ACTIVE frame flipped while `position` still holds the OLD facet's lattice
+# numbers; reinterpreting them in the new facet's decorrelated frame (offsets up to ±32768) is a one-frame
+# teleport of |Δframe| blocks (11081 live at re-entry; the SN2 finite-difference then reads Δp/dt ≈ 642074 b/s
+# and the free-fall re-seed adopts it — the "escape" latch). _heal_frame_desync() makes frame/pose consistency
+# an INVARIANT: every physics frame starts by re-expressing the pose if the active facet changed without us.
+var _pos_fid := -1
+
 # COSMOS-ORBITAL-O1O4 O4c (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.5 / SPACE-NAV §8): the SOI dominant body — the
 # body whose local dynamics (spin frame, GM_dyn, feel-gravity, drag, terrain) the player reads. `_dominant_body()`
 # is THE single accessor and returns this; it is "earth" always with CubeSphere.SOI_SWAP off (byte-identical), and
@@ -298,6 +309,9 @@ func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
 		position = new_pos
 	else:
 		global_position = new_pos
+	# G-REENTRY FIX A: `position` is now expressed in the CURRENT active facet's lattice — record it so
+	# _heal_frame_desync() can prove (and restore) frame/pose consistency every physics frame.
+	_pos_fid = TerrainConfig.active_facet()
 	# SN-FIX #2 (FP_CROSS_KEEP_HEADING): the position reframe above is what keeps position CONTINUOUS across the
 	# seam — it is untouched. The horizontal heading + velocity twist by `yaw_delta` (which re-aligns them to B's
 	# lattice frame) is factored into the pure `reframe_twist` so the gate drives both flag states. Flag off ⇒ the
@@ -314,6 +328,29 @@ static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, ke
 	if keep_heading:
 		return [cur_yaw, cur_vel]
 	return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]
+
+## G-REENTRY FIX A (the live re-entry teleport) — frame/pose consistency as an INVARIANT, not a protocol hope.
+## If the active facet changed since `position` was last expressed (a crossing pipeline that aborted between
+## world_manager's set_active_facet and our apply_reframe, or any other actor flipping the active facet), the
+## lattice pose is STALE: reading it in the new facet's decorrelated frame is a |Δframe|-block teleport (the
+## live 11081-block atmosphere-entry jump; 25.7k in the headless reproduction). Heal it LOSSLESSLY by applying
+## the exact committed-crossing math (reframe_position64 + the crossing-basis yaw twist via apply_reframe) —
+## the same world point, heading and velocity re-expressed, so the heal itself is position/velocity-continuous
+## (SN-R1). One int compare per frame in the healthy case. Proven by G-REENTRY-CONTINUOUS (fid-desync gate).
+func _heal_frame_desync() -> void:
+	if not CubeSphere.FACETED:
+		return
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return                                              # no active frame to express in — keep the stamp we have
+	if _pos_fid < 0 or _pos_fid == fid:
+		_pos_fid = fid
+		return
+	var from := _pos_fid
+	var np: Array = _FacetAtlasCls.reframe_position64(from, fid, position.x, position.y, position.z)
+	var ex: Vector3 = _FacetAtlasCls.crossing_basis(from, fid) * Vector3(1.0, 0.0, 0.0)
+	apply_reframe(Vector3(np[0], np[1], np[2]), atan2(ex.z, ex.x))   # also re-stamps _pos_fid = fid
+	print("[Player] frame desync healed: pose re-expressed %d -> %d (aborted crossing pipeline?)" % [from, fid])
 
 func _capture_mouse() -> void:
 	# Web quirk (Godot #102209): after Esc the pointer won't re-lock unless we
@@ -527,6 +564,9 @@ func _unhandled_input(event: InputEvent) -> void:
 func _physics_process(delta: float) -> void:
 	if frozen or world == null:
 		return
+	# G-REENTRY FIX A: restore frame/pose consistency FIRST, before any consumer (movers, floor, nav)
+	# reads `position` — a half-committed crossing from LAST frame must never be interpreted this frame.
+	_heal_frame_desync()
 	# REMOTE-DRIVE (§4.3): snapshot the pre-locomotion LATTICE position so the executor measures pure
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
@@ -630,6 +670,11 @@ func _nav_tick(delta: float) -> void:
 	# use its BCI velocity instead of the finite difference (which would just re-derive it, less precisely).
 	# Off dev-flight (SN2-only, or PLANETARY) this is exactly the shipped bci[1] finite-difference path.
 	var v_bci: PackedFloat64Array = _dev_v_bci if (_dev_active and _dev_have_v) else bci[1]
+	# G-REENTRY FIX B: the finite difference is Δp/dt of whatever position DID — including a discontinuity
+	# (crossing abort, injected teleport). Sanitize before ANY consumer (nav machine, telemetry, the
+	# _nav_last_v_bci seed the free-fall/dev-flight re-seed from): garbage falls back to the last-good
+	# velocity (velocity-continuous), so a position jump can never become adopted motion (the 642074 latch).
+	v_bci = _CosmosNavCls.sane_v(v_bci, _nav_last_v_bci)
 	_nav.tick(body, p_bci, v_bci, _nav_clock, delta)
 	_nav_prev_fix = p_fix
 	_nav_have_prev = true
@@ -845,8 +890,11 @@ static func free_fall_regime(is_flying: bool, alt: float, no_ceiling_bounce: boo
 
 ## SN-FIX #3 — the flight→fall velocity seed (continuity): the free-fall starts from the last SN2 finite-difference
 ## BCI velocity so there is NO jump at F-off. A missing/short vector rests (zero). Pure.
+## G-REENTRY FIX B (belt+suspenders on top of the _nav_tick sanitizer): a garbage seed (NaN or beyond
+## CosmosNav.FD_SPEED_MAX — the finite-difference of a position teleport) rests instead of being adopted,
+## so the free-fall can never launch the player on a discontinuity artifact (the live 642074 escape latch).
 static func fall_seed(last_v_bci: PackedFloat64Array) -> PackedFloat64Array:
-	if last_v_bci.size() == 3:
+	if last_v_bci.size() == 3 and _CosmosNavCls.v_is_sane(last_v_bci):
 		return PackedFloat64Array([last_v_bci[0], last_v_bci[1], last_v_bci[2]])
 	return PackedFloat64Array([0.0, 0.0, 0.0])
 
@@ -884,10 +932,14 @@ func _coast_step(delta: float, v_bci: PackedFloat64Array, body: String) -> Packe
 	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
 	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
 	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
-	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, os.pos, os.vel)[0]
+	# G-REENTRY FIX C: never adopt a broken/unbounded integration — NaN reverts to the pre-step state and a
+	# radius beyond the body's SOI clamps onto it (outward radial velocity stripped). The player can then
+	# never ride this path to garbage altitudes where per-frame work explodes (the live 27 s frames at 35·R).
+	var safe := _CosmosNavCls.clamp_bci_state(os.pos, os.vel, p_bci, v_bci, _CosmosNavCls.soi_radius(body))
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, safe[0], safe[1])[0]
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
 	position = Vector3(lat[0], lat[1], lat[2])
-	return os.vel
+	return safe[1]
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — one physics tick of the O free-coast: integrate the shared Kepler coast
 ## from `_coast_v_bci` (seeded tangential by the O toggle) and write the lattice `position`. A stable circular seed
@@ -951,12 +1003,14 @@ func _coast_step_kepler(delta: float, p_bci: PackedFloat64Array, v_bci: PackedFl
 	var t := _nav_clock
 	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
 	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
+	# G-REENTRY FIX C: same integration guard as _coast_step — NaN reverts, beyond-SOI clamps (see there).
+	var safe := _CosmosNavCls.clamp_bci_state(os.pos, os.vel, p_bci, v_bci, _CosmosNavCls.soi_radius(body))
 	# DISPLAY-ONLY: project the new BCI position back to the lattice for rendering/streaming/collision. This value
-	# is NEVER read back into the integrator (that read-back was the pump) — the carried `os.pos` is the truth.
-	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, os.pos, os.vel)[0]
+	# is NEVER read back into the integrator (that read-back was the pump) — the carried BCI pair is the truth.
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, safe[0], safe[1])[0]
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
 	position = Vector3(lat[0], lat[1], lat[2])
-	return [os.pos, os.vel]
+	return [safe[0], safe[1]]
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — is there a thrust/movement input this tick (the coast-exit trigger)? WASD
 ## (input.x/z) or the vertical verb (Space/Ctrl, or the remote `input.y`). Pure read of the already-polled input.

@@ -2305,6 +2305,12 @@ func set_far_ring_sun_dir(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_terminator_sun_dir(sun_dir)
 
+## COSMOS ATMO-SKY A5 (FP_SHELL_ABSOLUTE): forward the current Sun direction into the far-ring shell v2 shader.
+## No-op with no faceted ring or the flag off (the setter self-guards) ⇒ byte-identical.
+func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_shell_absolute_sun_dir(sun_dir)
+
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).
 func shell_telemetry() -> Dictionary:

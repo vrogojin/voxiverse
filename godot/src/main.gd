@@ -203,6 +203,23 @@ func _process(_delta: float) -> void:
 	# a live sky; the WorldManager/ring setters self-guard, so flag-off is byte-identical (never called).
 	if _player != null and _cosmos_sky != null and CubeSphere.SHELL_TERMINATOR_TINT and CubeSphere.FACETED:
 		_player.world.set_far_ring_sun_dir(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO-SKY A5 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C2): forward the Sun direction + the scaled planet
+	# render centre into the far-ring shell v2 shader (absolute self-shaded globe). Same forwarding discipline as
+	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_SHELL_ABSOLUTE and CubeSphere.FACETED:
+		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
+	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
+	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),
+	# the same stranded-driver class as the shell-driver fix (0b2a934). Camera near/far ramp with altitude + the
+	# far ring gets its distance clamp, un-clipping the planet from altitude/deep space. Gated on FP_SN3_MAIN_LIVE
+	# ⇒ flag-off is byte-identical (never runs; the legacy block below is untouched and stays dead in faceted).
+	# The A0/legacy blocks are mutually exclusive by the FLAT⇔FACETED coupling, so there is no double-drive.
+	if _player != null and CubeSphere.FP_SN3_MAIN_LIVE and CosmosScale.on() and CubeSphere.FACETED:
+		var a0_cam := _player.camera_global_transform().origin
+		var a0_d := a0_cam.distance_to(_player.world.planet_render_centre())
+		_player.apply_scaled_camera_planes(a0_d - FacetAtlas.R_BLOCKS, a0_d)
+		_player.world.apply_scaled_body(a0_cam)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin

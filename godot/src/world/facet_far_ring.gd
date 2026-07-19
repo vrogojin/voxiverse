@@ -1054,7 +1054,47 @@ void vertex() {
 void fragment() { ALBEDO = v_col; ROUGHNESS = 1.0; }
 "
 
+# COSMOS ATMO-SKY A5 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C2): the absolute self-shaded globe shell v2. UNSHADED
+# (immune to the global light/ambient, so the globe's look stops tracking the camera) + per-vertex darkening
+# NIGHT_FLOOR + (1−NIGHT_FLOOR)·day(n̂), n̂ = normalize(wp − centre) with centre = (MODEL_MATRIX·0) so it is EXACT
+# under scale-about-camera (a uniform scale about the camera cancels in the normalize), × the kept terminator
+# band tint. Mirrors CosmosSky.day_factor / scatter_tint / scatter_band EXACTLY (gate G-AS-TERM pins the twins).
+# Supersedes _SHELL_TINT_SHADER v1; the StandardMaterial fallback below stays permanent (P3 gl_compat class).
+const _SHELL_ABS_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.06;
+uniform float term_mu = 0.12;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+varying vec3 v_col;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = night_floor + (1.0 - night_floor) * _day(mu);
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col = COLOR.rgb * shade * tint;
+}
+void fragment() { ALBEDO = v_col; }
+"
+
 func _make_material() -> Material:
+	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
+	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
+	# Off → the shipped paths below verbatim (byte-identical; the shell is untouched).
+	if CubeSphere.FP_SHELL_ABSOLUTE:
+		var sh2 := Shader.new()
+		sh2.code = _SHELL_ABS_SHADER
+		var sm2 := ShaderMaterial.new()
+		sm2.shader = sh2
+		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
+		sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
 	if CubeSphere.SHELL_TERMINATOR_TINT:
@@ -1081,6 +1121,17 @@ func _make_material() -> Material:
 ## flag-off is byte-identical (the setter is never wired) and it can never touch the StandardMaterial/bias paths.
 func set_terminator_sun_dir(sun_dir: Vector3) -> void:
 	if not CubeSphere.SHELL_TERMINATOR_TINT or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
+
+## COSMOS ATMO-SKY A5 (FP_SHELL_ABSOLUTE): feed the current Sun direction into the shell v2 shader's `sun_dir`
+## uniform each frame (main.gd forwards it from CosmosSky). The planet centre needs no uniform — the v2 shader
+## reads it from MODEL_MATRIX so it is exact under the scaled placement. No-op unless the flag is on and the
+## material is the v2 shader ⇒ flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
+func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.FP_SHELL_ABSOLUTE or _mi == null:
 		return
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:

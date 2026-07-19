@@ -732,6 +732,83 @@ const FP_SKY_DSKY_R := false
 ## stay green. Gate verify_climate G-SEAS-TILT (δ=±23.4° at solstices) + G-SEAS-PURE.
 const FP_SEASONS := false
 
+# =====================================================================================================
+# COSMOS ATMO-SKY (docs/COSMOS-ATMO-SKY-DESIGN.md) — the unified atmosphere + celestial + day/night
+# rebuild. ONE physically-motivated model consistent from outer space and from the surface (the
+# terminator from orbit and the sunset on the ground are the SAME curves). Staged A0..A6, every flag
+# default FALSE ⇒ BYTE-IDENTICAL (the curve math is pure static in CosmosSky, driven directly by the
+# gates; the flags only decide whether the sky/light/shell COMPOSE it in-game). All shaders (shell v2,
+# atmosphere halo, moon phase) keep a PERMANENT StandardMaterial/analytic fallback (P3 gl_compat class):
+# any compile failure ⇒ the flag stays off and the shipped path ships. See the design §4 stage table.
+# =====================================================================================================
+
+## A0 (design §2.0 / §4). Move the SN3 scaled-body driver block (main._process) ABOVE the FLAT_WORLD
+## early-return, so with FP_SCALED_BODY baked ON it actually RUNS in the faceted production game
+## (FLAT_WORLD=true) — the camera near/far ramp with altitude and the far ring gets its distance clamp,
+## un-clipping the planet from altitude/deep space (the shipped 9000 far plane clips the far side above
+## h≈3-6 k; from the pilot's d=167 k the planet is entirely gone). The SAME stranded-driver class as the
+## shell-driver fix (0b2a934). Off ⇒ the block stays below the return, DEAD in faceted (byte-identical).
+## Must bake WITH A1 (once the planet renders at d≫D_SKY the sky impostors/dome would draw over it —
+## occlusion becomes mandatory). Gate G-AS-FARRAMP.
+const FP_SN3_MAIN_LIVE := false
+
+## A1 (design §2.1 hazard / §3 C5 / §4). Analytic planet-disc OCCLUSION of the sky. Once A0 renders the
+## planet at distances ≫ D_SKY, the opaque Sun/Moon impostors (at D_SKY≈8143) would draw IN FRONT of the
+## Earth disc and the additive star dome would sprinkle stars OVER the planet. When true, the Sun/Moon
+## impostors are hidden (visible=false) when the planet disc covers their direction (occlusion_factor
+## reused: the sun/moon is behind the disc ⇔ occ==0), and the star-dome shader discards fragments inside
+## the planet disc via planet_dir/planet_cos_ang uniforms. D_SKY stays const — the sky is angular, occlusion
+## is analytic (NOT distance-chased). Off ⇒ impostors always visible, star mask uniform passes everything
+## (planet_cos_ang = 2.0 > 1 ⇒ never discards) ⇒ byte-identical. Requires ORBITAL_SKY. Gate G-AS-OCC.
+const FP_SKY_PLANET_OCCLUDE := false
+
+## A2 (design §3 C5 / §4). Sun/Moon PERCEPTUAL PRESENCE. The impostor is sized to the real 0.53° angular
+## diameter → ≈8 px, and gl_compat has no bloom/HDR glare, so the Sun is an invisible dot. When true: an
+## angular-size FLOOR is applied to each impostor radius (SUN_MIN_ANG/MOON_MIN_ANG), an additive
+## radial-falloff GLARE quad is added on the Sun (~5× disc radius, brightness ×occ(cam) so it dies at
+## sunset/eclipse/umbra), and the Sun disc colour reddens by T(μ_cam,0). Off ⇒ exact-angular impostors,
+## no glare node ⇒ byte-identical. Requires ORBITAL_SKY. LIVE-ONLY LOOK; the floor math is gated.
+const FP_SUN_PRESENCE := false
+const SUN_MIN_ANG_DEG := 2.0      # perceptual angular-diameter floor for the Sun impostor (taste)
+const MOON_MIN_ANG_DEG := 1.5     # perceptual angular-diameter floor for the Moon impostor (taste)
+const SUN_GLARE_RADII := 5.0      # glare quad half-size in Sun-disc radii
+
+## A3 (design §2.3 / §3 C3 / §4). atmo_vis(h) replaces the space_mix 192..960 band with a 0.5·ATMO_TOP..
+## ATMO_TOP fade (exactly 0 at/above ATMO_TOP=384 — the tint is star-black in space, fixing the orbit
+## sky-colour bug). star_fade = max(night_fade, 1−atmo_vis(h)); SKY_SCATTER_RAMP's weight gains ·atmo_vis
+## so it can finally bake ON. Off ⇒ CosmosSky uses space_mix + the shipped scatter weight (byte-identical).
+## Requires ORBITAL_SKY. Gate G-AS-ZERO.
+const FP_ATMO_SPACE_ZERO := false
+
+## A4 (design §2.2 / §3 C1 / §4). ABSOLUTE day/night light. The DirectionalLight energy becomes occ(cam)
+## ALWAYS (no space_mix authority lerp) with an altitude-widened penumbra pen(h) (long twilight at the
+## ground, sharp in vacuum), the light COLOUR reddens by T(μ_cam,0), and the ambient umbra authority is
+## likewise removed (continuous, absolute). Fixes "the dark side lights up as you descend" (the through-
+## planet DirectionalLight lit the night side below h≈192). The Moon self-phase shader lands HERE
+## (regression guard: with C1 dimming the global light at night the shaded-Moon impostor would black out —
+## the shader computes Lambert phase from a sun_dir uniform, unshaded). Off ⇒ occlusion_light /
+## occlusion_ambient authority lerps + the shipped shaded Moon material (byte-identical). Gate G-AS-ABSLIGHT.
+const FP_LIGHT_ABSOLUTE := false
+
+## A5 (design §2.2-3/4 / §3 C2 / §4). The globe far-ring shell shader v2: UNSHADED (immune to the global
+## light/ambient, so the globe's look stops tracking the camera), per-vertex NIGHT_FLOOR + (1−NIGHT_FLOOR)·
+## day(n̂) darkening with n̂ = normalize(wp − planet_centre) where planet_centre is a UNIFORM fed the scaled
+## render centre (fixes the origin-assumption that breaks under scale-about-camera), × the kept terminator
+## band tint. Supersedes SHELL_TERMINATOR_TINT v1 (the band tint is retained inside v2). StandardMaterial
+## fallback retained permanently. Off ⇒ FacetFarRing._make_material returns the shipped path (byte-identical).
+## Requires ORBITAL_SKY + FACETED. Gate G-AS-TERM. Do NOT bake ON without a live screenshot (P3 shader class).
+const FP_SHELL_ABSOLUTE := false
+
+## A6 (design §2.4 / §3 C4 / §4). The atmosphere shell — ONE inverted additive SphereMesh (radius
+## R + 2·ATMO_TOP, planet-centred, riding the same scaled placement as the far ring; cull_front +
+## blend_add + depth_draw_never so it never occludes and the planet's depth kills it behind the disc).
+## Its closed-form fragment shader is the blue limb HALO from outside AND the horizon-band sky from inside,
+## by the SAME day/T/band curves as C2/C5 (seamless by construction). C3 (the camera Environment sky) is
+## gated by atmo_vis so the base tint is 0 in space and this shell composes additively. Off ⇒ no shell node,
+## no camera-sky change beyond A3 ⇒ byte-identical. Requires ORBITAL_SKY. Depends on A3 (no double tint) +
+## A5 (matching curves). Gate G-AS-LIMB. LIVE-ONLY LOOK (P3 shader class); analytic StandardMaterial fallback.
+const FP_ATMO_SHELL := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

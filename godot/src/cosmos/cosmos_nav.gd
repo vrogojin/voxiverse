@@ -122,6 +122,33 @@ static func soi_radius(body: String) -> float:
 		return INF
 	return a * pow(GRAV.gm_dyn(body) / EPH.gm_game(par), 0.4)
 
+## The DEEPEST-SOI body dominating a point at BCI position `p_bci` relative to `from_body`, at time t
+## (O1O4 §3.5 / SPACE-NAV §5.2, O4c). Two moves, mirror images:
+##   (a) CHILD CAPTURE — for each satellite of `from_body`, re-express the point into that child's BCI frame
+##       (OrbitalState.reexpress_soi) and, if it lies within the child's SOI·(1∓hyst), the child dominates.
+##   (b) PARENT ESCAPE — if `from_body` itself orbits a parent and the point has left `from_body`'s own
+##       SOI·(1±hyst), the parent dominates.
+## Else `from_body` keeps dominion. `hyst` is the fractional SOI hysteresis band (SPACE-NAV §5.2, 0.02): the
+## boundary is contracted for capture and expanded for release IN THE INCUMBENT'S FAVOUR (incumbent == the body
+## the point is currently expressed relative to, `from_body`), so a grazing trajectory cannot flap. hyst == 0 ⇒
+## the raw geometric boundary (the gate drives both). Pure: no engine state, no allocation beyond frame temps.
+## NOTE this returns the IMMEDIATE neighbour in the SOI tree (child or parent) — one hop per call; the caller
+## re-tests from the new body next tick, which walks a multi-level hierarchy one boundary at a time (correct:
+## you cannot enter a grandchild's SOI without first entering the child's, by nesting).
+static func soi_dominant(from_body: String, p_bci: PackedFloat64Array, t: float, hyst: float = 0.0) -> String:
+	# (a) child capture — a satellite whose (contracted) SOI contains the point wins.
+	for child in EPH.children_of(from_body):
+		var pc: PackedFloat64Array = ORB.reexpress_soi(from_body, child, t, p_bci, DV.v(0.0, 0.0, 0.0))[0]
+		if DV.length(pc) < soi_radius(child) * (1.0 - hyst):
+			return child
+	# (b) parent escape — left our own (expanded) SOI ⇒ hand up to the parent.
+	var par := EPH.parent_of(from_body)
+	if par != "":
+		var rs := soi_radius(from_body)
+		if not is_inf(rs) and DV.length(p_bci) > rs * (1.0 + hyst):
+			return par
+	return from_body
+
 ## The §4.4 geo-guard radius: min(1.2·r_geo_dyn, 0.9·R_SOI). Below it, the body's own spin defines a
 ## stationary orbit ⇒ planet-frame (HIGH_ORBIT) territory. Handles r_geo == INF (no spin).
 static func geo_cap(body: String) -> float:

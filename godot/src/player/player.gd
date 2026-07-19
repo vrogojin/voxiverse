@@ -90,6 +90,19 @@ var _nav_have_prev := false
 var _nav_tele: Dictionary = {}
 var _nav_last_v_bci := PackedFloat64Array()   # last derived BCI velocity (seeds dev-flight for a seamless handoff)
 
+# COSMOS-ORBITAL-O1O4 O4c (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.5 / SPACE-NAV §8): the SOI dominant body — the
+# body whose local dynamics (spin frame, GM_dyn, feel-gravity, drag, terrain) the player reads. `_dominant_body()`
+# is THE single accessor and returns this; it is "earth" always with CubeSphere.SOI_SWAP off (byte-identical), and
+# under the flag is refreshed each physics tick from the active facet (surface/walk/land ⇒ FacetAtlas.body_name_of_fid)
+# or, while coasting, from the SOI test on the carried BCI position (CosmosNav.soi_dominant, with the swap
+# re-expression applied to `_coast_p/v_bci`). Every generalized "earth"→_dominant_body() site downstream reads it.
+var _dom_body := "earth"
+# Earth walk-feel baseline captured in _ready (after the M1 feel hook): gravity/jump the per-body feel scales from.
+# _apply_body_feel(body) sets gravity = base·(g_body/g_earth), jump = base·√(g_body/g_earth) — preserving JUMP
+# HEIGHT while HANG TIME scales ~1/√g (Moon ×2.5). Earth ⇒ ratio 1 ⇒ the shipped 9.8/8.0 (byte-neutral).
+var _feel_earth_g := 9.8
+var _feel_earth_jump := 8.0
+
 # COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7): dev-nav state. `_dev_nav` (F under SN_DEVNAV) turns
 # dev-nav ON (rides `flying` — noclip + the mode-appropriate controller). In PLANETARY the shipped lattice fly
 # path is used UNCHANGED (§7.2); in the orbital modes the velocity-command controller (CosmosDevFlight) owns the
@@ -189,6 +202,11 @@ func _ready() -> void:
 		var s := CubeSphere.SURFACE_GRAVITY / CubeSphere.SURFACE_GRAVITY   # g_body/9.81; Earth = 1.0
 		gravity *= s
 		jump_velocity *= sqrt(s)
+	# COSMOS-ORBITAL-O1O4 O4c: capture the Earth walk-feel baseline (post the M1 hook) so per-body feel scaling on
+	# a dominant-body swap (Moon ⇒ 1/6 g, floaty jumps) is exact and reversible. No behaviour change here — off
+	# SOI_SWAP _apply_body_feel is never called and these fields are never re-read.
+	_feel_earth_g = gravity
+	_feel_earth_jump = jump_velocity
 
 	# Build the camera rig in code to keep scenes minimal and robust.
 	_camera = Camera3D.new()
@@ -327,7 +345,7 @@ func window_camera_transform() -> Transform3D:
 ## b_active updates across a crossing while the frozen b_start stays scene-constant, so the blend re-references
 ## automatically (§6.2). θ is read fresh from the f64 nav clock (no basis accumulation ⇒ no f32 drift).
 func _attitude_scene_basis() -> Basis:
-	var theta := _EphCls.spin_angle("earth", _nav_clock)
+	var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
 	if _att_mode == ATT_SPACE:
 		return _CosmosAttitudeCls.scene_basis(_att_q, theta)
 	# RECOVER: express the frozen scene start in the current facet lattice, slerp to the surface target.
@@ -347,7 +365,7 @@ func _attitude_active_basis() -> Basis:
 ## position mechanics — hover drift, free-fall, dev-flight — compose untouched). Only reached under the flag.
 func _attitude_tick(delta: float) -> void:
 	var committed_planetary := int(_nav.mode) == _CosmosNavCls.PLANETARY
-	var theta := _EphCls.spin_angle("earth", _nav_clock)
+	var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
 	match _att_mode:
 		ATT_SURFACE:
 			# Leave PLANETARY ⇒ go inertial. Seed q_bci from the CURRENT displayed (child-camera) basis so the
@@ -564,6 +582,11 @@ func _physics_process(delta: float) -> void:
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
 	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
 		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
+	# COSMOS-ORBITAL-O1O4 O4c: resolve the dominant gravitational body (SOI/facet-driven) BEFORE the nav tick so
+	# every "earth"→_dominant_body() consumer this frame reads one consistent value. No-op (not even called) off
+	# SOI_SWAP ⇒ _dom_body stays "earth" and the whole feed is byte-identical.
+	if CubeSphere.SOI_SWAP:
+		_refresh_dominant_body()
 	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
 	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
 	if _nav != null:
@@ -597,18 +620,22 @@ func _nav_tick(delta: float) -> void:
 	if _nav_have_prev and delta > 0.0:
 		# Bounded reciprocal (fd_inv_dt = 1/max(delta, MIN_FD_DT)) so a near-zero delta cannot blow up v_fix.
 		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), _CosmosNavCls.fd_inv_dt(delta))
-	var bci: Array = _OrbitalStateCls.fixed_to_bci("earth", _nav_clock, p_fix, v_fix)
+	# COSMOS-ORBITAL-O1O4 O4c: the dominant body drives the spin frame + GM_dyn for the BCI derivation, the nav
+	# machine, and the telemetry. _dominant_body() == "earth" off SOI_SWAP ⇒ byte-identical; on the Moon (active
+	# facet a Moon fid) it is "moon" ⇒ the whole nav readout is expressed in the Moon's frame with no other change.
+	var body := _dominant_body()
+	var bci: Array = _OrbitalStateCls.fixed_to_bci(body, _nav_clock, p_fix, v_fix)
 	var p_bci: PackedFloat64Array = bci[0]
 	# COSMOS SPACE-NAV SN5: when the dev-flight controller drove position THIS frame it OWNS the velocity —
 	# use its BCI velocity instead of the finite difference (which would just re-derive it, less precisely).
 	# Off dev-flight (SN2-only, or PLANETARY) this is exactly the shipped bci[1] finite-difference path.
 	var v_bci: PackedFloat64Array = _dev_v_bci if (_dev_active and _dev_have_v) else bci[1]
-	_nav.tick("earth", p_bci, v_bci, _nav_clock, delta)
+	_nav.tick(body, p_bci, v_bci, _nav_clock, delta)
 	_nav_prev_fix = p_fix
 	_nav_have_prev = true
 	_nav_last_v_bci = v_bci                                  # seed for the next orbital dev-flight handoff (SN5)
 	_dev_p_bci = p_bci                                       # stash for the O/G key handlers (SN5b)
-	_nav_tele = _CosmosNavCls.telemetry(_nav, "earth", p_bci, v_bci, _nav_clock)
+	_nav_tele = _CosmosNavCls.telemetry(_nav, body, p_bci, v_bci, _nav_clock)
 	# SN5b: refresh the compass strip from the camera forward re-expressed in BCI (spin axis = BCI +Z).
 	if _dev_overlay != null and _dev_overlay.is_built():
 		var rmag := _DVCls.length(p_bci)
@@ -658,15 +685,48 @@ func orbit_v_circ() -> float:
 	var r := _FacetAtlasCls.R_BLOCKS + radial_altitude()
 	if r <= 0.0:
 		return 0.0
-	return sqrt(CosmosGravity.gm_dyn("earth") / r)
+	return sqrt(CosmosGravity.gm_dyn(_dominant_body()) / r)
 
-## SN-BRAKE (per-body generic, architectural): the dominant body whose atmosphere/gravity the local descent
-## physics reads. Today the only walkable body is Earth (the faceted planet), so this returns "earth"; when the
-## O4a multi-body atlas lands this is the ONE place that resolves the active dominant body — the drag/gravity
-## kernels already take `body`, so generalizing is a single change here (the shipped free-fall/_fall_exit_vy
-## literals stay "earth" until that lands). Kept a method so the SN-BRAKE caller never hardcodes the body.
+## COSMOS-ORBITAL-O1O4 O4c (§3.5 / SPACE-NAV §8) — THE dominant-body accessor. Returns the body whose local
+## dynamics (spin frame via CosmosEphemeris, GM_dyn/gravity via CosmosGravity, drag/re-entry via OrbitalState,
+## and the terrain the player walks) every generalized call site reads. With CubeSphere.SOI_SWAP OFF it returns
+## "earth" UNCONDITIONALLY — so all the "earth"→_dominant_body() plumbing below is BYTE-IDENTICAL to the shipped
+## literals (the G-O4C-OFF keystone). Under the flag it returns `_dom_body`, refreshed each tick by
+## _refresh_dominant_body() (active-facet body on the surface; SOI-tested during a coast). Cheap (a field read).
 func _dominant_body() -> String:
-	return "earth"
+	return _dom_body if CubeSphere.SOI_SWAP else "earth"
+
+## COSMOS-ORBITAL-O1O4 O4c — update `_dom_body` for THIS tick (called before _nav_tick under SOI_SWAP). Two
+## sources, by regime:
+##   • COASTING (a real orbit, `_orbit_coast_move` owns the carried BCI position): the coast performs the SOI
+##     test + swap re-expression itself (it must re-express `_coast_p/v_bci`), so this is a NO-OP for it.
+##   • SURFACE / WALK / LAND (on an active facet): the facet's body IS the dominant body — a Moon fid ⇒ "moon".
+##     A change (Earth↔Moon) re-applies the per-body walk feel (gravity/jump). This is what makes standing/
+##     walking/landing on the Moon read Moon gravity + Moon terrain with no other call-site change.
+## No-op off SOI_SWAP (never called). Pure bookkeeping — never touches pos/vel.
+func _refresh_dominant_body() -> void:
+	if _orbit_coasting and _coast_p_bci.size() == 3:
+		return                                              # the coast owns the swap (see _orbit_coast_move)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return
+	var fb := _FacetAtlasCls.body_name_of_fid(fid)
+	if fb != _dom_body:
+		_dom_body = fb
+		_apply_body_feel(fb)
+
+## COSMOS-ORBITAL-O1O4 O4c / SPACE-NAV §8.4 — apply `body`'s walking feel gravity. gravity = the shipped Earth
+## baseline scaled by the real surface-gravity ratio (CosmosGravity.feel_g); jump_velocity scaled by its √ so
+## JUMP HEIGHT (h = v²/2g) is preserved while HANG TIME lengthens ~1/√g — the Moon's ×2.5 float out of the box.
+## Earth ⇒ ratio 1 ⇒ exactly the _ready values (a no-op, so an Earth→Earth "change" never perturbs feel). The
+## analytic floor/wall/ceiling queries need NO change: "down" is −Y in the lattice on every body (§3.3 theorem).
+func _apply_body_feel(body: String) -> void:
+	var g_earth := CosmosGravity.feel_g("earth")
+	if g_earth <= 0.0:
+		return
+	var ratio := CosmosGravity.feel_g(body) / g_earth
+	gravity = _feel_earth_g * ratio
+	jump_velocity = _feel_earth_jump * sqrt(ratio)
 
 ## COSMOS SPACE-NAV SN5 (§7.1): F toggled dev-nav. Dev-nav rides `flying` (noclip): entering disables the
 ## capsule (the shipped fly escape-hatch semantics), leaving re-enables it. The controller's velocity seed is
@@ -721,7 +781,11 @@ static func hover_drift_lattice(fid: int, mode: int, pos: Vector3) -> Vector3:
 	if fid < 0:
 		return Vector3.ZERO
 	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, pos.x, pos.y, pos.z)
-	var drift_fix := _CosmosNavCls.hover_drift_fixed(mode, "earth", _DVCls.v(w[0], w[1], w[2]))
+	# O4c: this is a STATIC (gate-driven) helper, so the body comes from the facet, not the instance accessor —
+	# the facet's body IS the dominant body when hovering over it. Gated so off SOI_SWAP it is exactly "earth"
+	# (a Moon fid only exists under MULTI_BODY, which SOI_SWAP requires) — byte-identical to the shipped literal.
+	var body := _FacetAtlasCls.body_name_of_fid(fid) if CubeSphere.SOI_SWAP else "earth"
+	var drift_fix := _CosmosNavCls.hover_drift_fixed(mode, body, _DVCls.v(w[0], w[1], w[2]))
 	return _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(drift_fix[0], drift_fix[1], drift_fix[2])
 
 ## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-MODE kinematic fly: gravity-off, full 6-DOF in the FULL look
@@ -803,7 +867,7 @@ func _free_fall_move(delta: float) -> void:
 	if not _fall_have_v:
 		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
 		_fall_have_v = true
-	_fall_v_bci = _coast_step(delta, _fall_v_bci, "earth")   # shared Kepler coast (free-fall literal body stays "earth")
+	_fall_v_bci = _coast_step(delta, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
 	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
@@ -846,6 +910,22 @@ func _orbit_coast_move(delta: float) -> void:
 	var out := _coast_step_kepler(delta, _coast_p_bci, _coast_v_bci, _dominant_body())
 	_coast_p_bci = out[0]
 	_coast_v_bci = out[1]
+	# COSMOS-ORBITAL-O1O4 O4c (§3.5) — the SOI dominant-body SWAP. After the integration tick, test whether the
+	# carried BCI point (in the current body's frame) has crossed a sphere-of-influence boundary; if the deepest
+	# SOI now belongs to a different body, RE-EXPRESS the carried [p,v] into that body's BCI frame (an exact,
+	# physics-preserving translation through the heliocentric frame — OrbitalState.reexpress_soi) and adopt it.
+	# ±SOI_HYST guards against boundary flapping. Physics is untouched (the player's real motion is identical);
+	# only the origin the next tick integrates from — and the walk/land feel — change. No-op off SOI_SWAP.
+	# LIVE-ONLY residue: the lattice `position` re-projection + landing-facet migration across the 384 k-block
+	# transfer is a real fly, not headless-provable — the swap STATE math here is what G-SOI-SWAP proves.
+	if CubeSphere.SOI_SWAP:
+		var newb := _CosmosNavCls.soi_dominant(_dom_body, _coast_p_bci, _nav_clock, CubeSphere.SOI_HYST)
+		if newb != _dom_body:
+			var re := _OrbitalStateCls.reexpress_soi(_dom_body, newb, _nav_clock, _coast_p_bci, _coast_v_bci)
+			_coast_p_bci = re[0]
+			_coast_v_bci = re[1]
+			_dom_body = newb
+			_apply_body_feel(newb)
 	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere, periodically add a small prograde
 	# Δv so it re-lifts instead of decaying in. Self-limiting (caps at circular speed) ⇒ never boosts to escape.
 	_coast_boost_cd -= delta
@@ -897,8 +977,9 @@ func _fall_exit_vy() -> float:
 		return velocity.y
 	var t := _nav_clock
 	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
-	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
-	var vf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_bci, _fall_v_bci)[1]
+	var body := _dominant_body()
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	var vf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, p_bci, _fall_v_bci)[1]
 	var v_lat := _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(vf[0], vf[1], vf[2])
 	return v_lat.y
 
@@ -930,7 +1011,8 @@ func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
 	# lattice → body-fixed world → BCI position (the SN1 frame maps; body coords are planet-pinned).
 	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
 	var p_fix := _DVCls.v(w[0], w[1], w[2])
-	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci("earth", t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	var body := _dominant_body()                            # O4c: dev-flight expresses over the dominant body
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
 	var mode := int(_nav.mode)
 	# Seed the controller's velocity on the first orbital tick from the last SN2-derived BCI velocity (seamless
 	# handoff from the PLANETARY lattice fly); if none is available yet, rest in the current frame (carrier).
@@ -938,7 +1020,7 @@ func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
 		if _nav_last_v_bci.size() == 3:
 			_dev_v_bci = PackedFloat64Array([_nav_last_v_bci[0], _nav_last_v_bci[1], _nav_last_v_bci[2]])
 		else:
-			_dev_v_bci = _CosmosNavCls.carrier_velocity(mode, "earth", p_bci, _DVCls.v(0.0, 0.0, 0.0), t)
+			_dev_v_bci = _CosmosNavCls.carrier_velocity(mode, body, p_bci, _DVCls.v(0.0, 0.0, 0.0), t)
 		_dev_have_v = true
 	# Camera basis (window/lattice orientation) → BCI axis columns for the fully camera-relative wish.
 	var cb := window_camera_transform().basis
@@ -953,12 +1035,12 @@ func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
 		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
 		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
 	var wish_bci := _DevFlightCls.wish_dir(cam_x, cam_y, cam_z, Vector3(input.x, vy, input.z))
-	var cap := _DevFlightCls.speed_cap(mode, "earth", p_bci, t, running)
-	var out: Array = _DevFlightCls.step(mode, "earth", p_bci, _dev_v_bci, t, delta, wish_bci, cap)
+	var cap := _DevFlightCls.speed_cap(mode, body, p_bci, t, running)
+	var out: Array = _DevFlightCls.step(mode, body, p_bci, _dev_v_bci, t, delta, wish_bci, cap)
 	var p_new: PackedFloat64Array = out[0]
 	_dev_v_bci = out[1]
 	# BCI → body-fixed → lattice, and write it back as the player's canonical position.
-	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_new, _dev_v_bci)[0]
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, p_new, _dev_v_bci)[0]
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
 	position = Vector3(lat[0], lat[1], lat[2])
 	_horiz_vel = Vector3.ZERO
@@ -970,7 +1052,7 @@ func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
 ## (no ω⃗×p term for a direction): the position component of fixed_to_bci is exactly R_z(θ)·d.
 func _dev_dir_to_bci(fid: int, t: float, d_lat: Vector3) -> PackedFloat64Array:
 	var wd := _FacetAtlasCls.frame_basis(fid) * d_lat
-	return _OrbitalStateCls.fixed_to_bci("earth", t, _DVCls.v(wd.x, wd.y, wd.z), _DVCls.v(0.0, 0.0, 0.0))[0]
+	return _OrbitalStateCls.fixed_to_bci(_dominant_body(), t, _DVCls.v(wd.x, wd.y, wd.z), _DVCls.v(0.0, 0.0, 0.0))[0]
 
 ## COSMOS SPACE-NAV SN5b (§7.4): the O/G/R dev-nav toggles. Pure re-uses of the gated kernel math
 ## (CosmosDevFlight.release_circular / geostationary_snap, CosmosNav.toggle_r_latch). O and G are explicit
@@ -1015,7 +1097,7 @@ func _dev_toggle_key(keycode: int) -> void:
 						_dev_orbital_commit = true
 				else:
 					var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
-					_dev_v_bci = _DevFlightCls.release_circular("earth", _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+					_dev_v_bci = _DevFlightCls.release_circular(_dominant_body(), _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
 					_dev_have_v = true
 					# SN-FIX #3: O is the explicit "commit to orbital flight" verb — latch it so the velocity-command
 					# controller now owns flight (under SN_NO_CEILING_BOUNCE; the latch is inert with the flag off).
@@ -1024,11 +1106,11 @@ func _dev_toggle_key(keycode: int) -> void:
 			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
 			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
 			if mode == _CosmosNavCls.HIGH_ORBIT and fid >= 0:
-				var snap := _DevFlightCls.geostationary_snap("earth", _dev_p_bci)
+				var snap := _DevFlightCls.geostationary_snap(_dominant_body(), _dev_p_bci)
 				if snap.size() == 2:
 					var p_new: PackedFloat64Array = snap[0]
 					var v_new: PackedFloat64Array = snap[1]
-					var pf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed("earth", t, p_new, v_new)[0]
+					var pf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(_dominant_body(), t, p_new, v_new)[0]
 					var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf[0], pf[1], pf[2])
 					position = Vector3(lat[0], lat[1], lat[2])
 					_dev_v_bci = v_new

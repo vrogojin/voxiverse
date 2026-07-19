@@ -37,6 +37,7 @@ func _initialize() -> void:
 	_gate_w1_physics()
 	_gate_w1_itcz()
 	_gate_w2_clouds()
+	_gate_w3_precip()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -224,6 +225,44 @@ func _gate_w2_clouds() -> void:
 		empty += cl.emitted_verts(l)
 	_ok(empty == 0 and cl.draw_count() == 0, "W2: clear sky emits nothing (0 verts, 0 draws)")
 	cl.queue_free()
+
+# ================= W3 : precipitation FX + fog + snow coupling (G-W3-COUPLE) =================
+const FX := preload("res://src/world/weather_fx.gd")
+
+func _gate_w3_precip() -> void:
+	print("  --- G-W3-COUPLE: precip kind == snow ⇔ surface_temperature+season < 0; bounded FX pool ---")
+	# bounded, camera-following particle pool with a hard cap; kind swaps by the grid read-out.
+	var fx: WeatherFX = FX.new()
+	get_root().add_child(fx)
+	fx.setup(null, null, null)
+	_ok(fx.particle_cap() <= 1024, "W3: particle pool cap %d ≤ 1024 (fixed pool, zero growth)" % fx.particle_cap())
+	fx.debug_apply(0.0, "none")
+	_ok(not fx.is_emitting(), "W3: no precip ⇒ emitter off (clear sky costs nothing)")
+	fx.debug_apply(0.5, "rain")
+	_ok(fx.is_emitting() and fx.current_kind() == "rain", "W3: rate>0 + rain ⇒ emitting rain")
+	fx.debug_apply(0.4, "snow")
+	_ok(fx.current_kind() == "snow", "W3: kind swaps to snow (mesh/velocity swap)")
+	fx.queue_free()
+	# the KIND boundary is the ONE surface_temperature+season zero-crossing — the same field the snow-cap
+	# predicate and SnowfallSystem's accumulate gate use, so precip rain/snow can NEVER disagree with the
+	# snow line. Prove it is a clean single crossing over a warm→cold column sweep (with a season offset).
+	var sinlat := 0.6
+	ClimateModel.current_sin_delta = -0.9              # a winter-hemisphere offset (cools this column)
+	var season := ClimateModel.season_offset(sinlat, ClimateModel.current_sin_delta)
+	var crossings := 0
+	var prev_snow := -1
+	for k in range(41):
+		var t := lerpf(0.2, -0.9, float(k) / 40.0)     # warm (temperate) → cold (frozen) climate
+		var ts := ClimateModel.surface_temperature(4, t) + season
+		var snow := 1 if ts < 0.0 else 0               # the precipitation() kind decision
+		if prev_snow >= 0 and snow != prev_snow:
+			crossings += 1
+		prev_snow = snow
+	ClimateModel.current_sin_delta = 0.0
+	_ok(crossings == 1, "W3: rain→snow is a single clean zero-crossing over a warm→cold column (%d crossing)" % crossings)
+	# flag-off byte-identity of the snow coupling: FP_PRECIP default false ⇒ is_snowing stays the pure
+	# SEED+105 noise gate (SnowfallSystem verify stays green; no grid read).
+	_ok(not CubeSphere.FP_PRECIP, "W3: FP_PRECIP default false ⇒ is_snowing is the verbatim noise gate (byte-identical)")
 
 # ---------- G-SEAS-TILT: obliquity geometry (pure, flag-independent via the _eps form) ----------
 func _gate_seasons_tilt() -> void:

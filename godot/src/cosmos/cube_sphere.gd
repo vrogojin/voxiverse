@@ -663,6 +663,16 @@ const FP_CLIMATE_GRID := false
 ## water). Default FALSE ⇒ no CloudLayers node ⇒ zero bytes / byte-identical. Cloud LOOK is LIVE-ONLY.
 const FP_CLOUDS := false
 
+## COSMOS CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5 / §7) — PRECIPITATION as threshold read-outs
+## of the weather grid: rain/snow/fog. ONE reused camera-following particle node (hard amount cap ≤1024),
+## the Environment fog density driven from grid humidity (composed MULTIPLICATIVELY with SN4a's altitude
+## ramp so space stays clear), and SnowfallSystem.is_snowing upgraded to couple to the grid (kind==snow,
+## the SEED+105 noise becoming the sub-cell structure). Kind (rain/snow) resolves through the ONE
+## surface_temperature+season zero-crossing, so precip agrees with the snow-cap boundary (G-W3-COUPLE).
+## Requires FP_CLIMATE_GRID. Default FALSE ⇒ no FX node, is_snowing verbatim ⇒ byte-identical. Precip
+## FEEL/fog mood is LIVE-ONLY.
+const FP_PRECIP := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

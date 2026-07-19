@@ -296,12 +296,23 @@ func baseline_depth(x: int, z: int) -> int:
 
 ## The storm gate at column (x, z) for the CURRENT step: a spatially-coherent, time-evolving field. Pure
 ## in (SEED+105, step_counter, position) — the whole reason a scripted run is deterministic.
+##
+## CLIMATE W3 (§1.5): under FP_PRECIP the gate COUPLES to the weather grid — it snows here only when the
+## grid is actually precipitating snow at this column (kind==snow AND rate>0), with the SEED+105 noise
+## demoted to the SUB-CELL structure (both must agree). Flag off (or grid absent) ⇒ verbatim the shipped
+## noise gate, byte-identical. The kind resolves through the ONE surface_temperature+season zero-crossing,
+## so accumulation and the grid's rain/snow boundary can never disagree.
 func is_snowing(x: int, z: int) -> bool:
 	var v := _weather.get_noise_3d(
 		float(x) * _WEATHER_XZ_FREQ,
 		float(z) * _WEATHER_XZ_FREQ,
 		float(step_counter) * WEATHER_SPEED)
-	return v > WEATHER_THRESHOLD
+	var noise_gate := v > WEATHER_THRESHOLD
+	if CubeSphere.FP_PRECIP and world != null and world.environment != null:
+		var g := TerrainConfig.height_at(x, z)
+		var p := world.environment.precipitation(Vector3(float(x), float(g + 1), float(z)))
+		return noise_gate and float(p.get("rate", 0.0)) > 0.0 and String(p.get("kind", "none")) == "snow"
+	return noise_gate
 
 # --- tile enumeration (§4.2) ---------------------------------------------------
 

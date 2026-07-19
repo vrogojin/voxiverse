@@ -50,11 +50,12 @@ const F_INST := 7     # instability index (storm potential)                     
 ## The sweep slice — the ≤0.7 ms/frame CPU budget knob (§1.4, G-W1-CPU). Sized so the single-threaded,
 ## ZERO-ALLOCATION arithmetic sweep fits the main-thread budget in WASM: measured native ≈5.5 µs/cell
 ## (interpreted GDScript), and a compute-bound WASM loop runs ~3–4× native (NOT the ×25 dlmalloc-convoy
-## factor of the ALLOCATION-bound generator), so 32 cells ≈ 0.18 ms native ≈ 0.55–0.7 ms web. A full sweep
-## is then 6144/32 = 192 frames ≈ 3.2 s at 60 fps — a slow-but-bounded weather clock (dt_game accumulates
-## the real elapsed game-time, so physics still tracks real time). Halve this if a live A/B measures worse;
-## the C++ sweep-kernel port (L5 pattern) is the escape hatch for full-speed weather.
-const CELLS_PER_FRAME := 32
+## factor of the ALLOCATION-bound generator), so 24 cells ≈ 0.13 ms native ≈ 0.53 ms web (×4) — a
+## comfortable margin under the 0.7 ms/frame budget. A full sweep is then 6144/24 = 256 frames ≈ 4.3 s at
+## 60 fps — a slow-but-bounded weather clock (dt_game accumulates the real elapsed game-time, so physics
+## still tracks real time). Halve this if a live A/B measures worse; the C++ sweep-kernel port (L5 pattern)
+## is the escape hatch for full-speed weather.
+const CELLS_PER_FRAME := 24
 const INIT_PER_FRAME := 32            ## static-basis build slice (§1.7) — amortized over ~3.2 s of startup
 const DT_GAME_DEFAULT := 1.0          ## game-seconds advanced per sweep when no clock delta is available
 const DT_GAME_MAX := 120.0            ## clamp a long real gap (tab restore) so relaxation never over-steps

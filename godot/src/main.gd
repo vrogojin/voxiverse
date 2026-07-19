@@ -106,6 +106,16 @@ func _ready() -> void:
 		add_child(clouds)
 		clouds.setup(world.environment, player)
 
+	# CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5): precipitation particles + fog, a read-only view of
+	# the grid (rule 2). Built only under both flags; default OFF ⇒ no node ⇒ byte-identical. The Environment
+	# (from the WorldEnvironment stub) is driven for fog; the player is the camera provider.
+	if CubeSphere.FP_PRECIP and CubeSphere.FP_CLIMATE_GRID:
+		var we2 := get_node_or_null("WorldEnvironment") as WorldEnvironment
+		var fx := WeatherFX.new()
+		fx.name = "WeatherFX"
+		add_child(fx)
+		fx.setup(world.environment, we2.environment if we2 != null else null, player)
+
 	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
 	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
 	# on-device (esp. the M4 seam-handoff frame/memory budget). DEMO instrumentation — revert

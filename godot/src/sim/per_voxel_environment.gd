@@ -251,12 +251,27 @@ func cloud_cover(pos: Vector3, _layer: int = 0) -> float:
 		return 0.0
 	return clampf(_weather.cloud_water_at_dir(_dir_of_pos(pos)) / WeatherSystem.CW_MAX, 0.0, 1.0)
 
+## CLIMATE W2 (cloudfix): cloud cover sampled directly by a sphere DIRECTION (the weather grid is a global
+## field over directions). The curved cloud dome spans many facets, so it samples per-tile radial directions
+## instead of a single facet's lattice column — this bypasses the window/lattice fold `cloud_cover` uses.
+func cloud_cover_dir(dir: Vector3, _layer: int = 0) -> float:
+	if _weather == null or not _weather.is_ready():
+		return 0.0
+	return clampf(_weather.cloud_water_at_dir(dir) / WeatherSystem.CW_MAX, 0.0, 1.0)
+
 ## CLIMATE W4 (§4.4): is the column of `pos` CONVECTIVE (thunderstorm potential)? Emergent from the grid
 ## instability field; false without the grid. Consumed by the cumulonimbus extrusion and lightning/hail FX.
 func is_convective(pos: Vector3) -> bool:
 	if _weather == null or not _weather.is_ready():
 		return false
 	return _weather.is_convective_at_dir(_dir_of_pos(pos))
+
+## CLIMATE W4 (cloudfix): convective flag sampled directly by a sphere DIRECTION (dome companion to
+## cloud_cover_dir — the cumulonimbus extrusion samples per-tile radial directions).
+func is_convective_dir(dir: Vector3) -> bool:
+	if _weather == null or not _weather.is_ready():
+		return false
+	return _weather.is_convective_at_dir(dir)
 
 ## CLIMATE W4: the raw instability index at `pos` (storm intensity readout). 0 without the grid.
 func instability(pos: Vector3) -> float:

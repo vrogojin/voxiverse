@@ -2,16 +2,30 @@ class_name CloudLayers
 extends Node3D
 ## COSMOS CLIMATE W2 — the 3-layer semi-cubic cloud mesher (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4).
 ## A read-only VIEW of the weather grid (engine rule 2): cloud geometry is a pure function of the grid's
-## cloud-water field (via PerVoxelEnvironment.cloud_cover) + the SEED+106 downscale noise. Blocky prisms in
+## cloud-water field (via PerVoxelEnvironment.cloud_cover_dir) + the SEED+106 downscale noise. Blocky prisms in
 ## the terrain's own visual language (unshaded vertex-colour material like the far ring), NOT billboards or
 ## volumetrics.
 ##
-## NEVER-OOM (§8 rows 4–5): ONE camera-following, world-snapped 64×64 tile lattice per altitude band, meshed
-## into a SINGLE reused CPU scratch (allocated once at worst-case capacity — no per-rebuild growth) then
+## LOCAL-SURFACE FRAME (cloudfix 2026-07-19): the deploy renders the planet in the ORBITAL_SKY fixed frame —
+## the planet centre is the scene ORIGIN and the local surface up at the camera is `cam.normalized()` (the exact
+## convention CosmosSky uses for the Sun elevation / day-night ramp; the clouds share the player camera provider,
+## so they MUST share the frame). Clouds are therefore a CURVED SHELL: each tile sits on the sphere of radius
+## R_BLOCKS+altitude and its face normal IS the radial direction there, so the sheets lie horizontal OVER the
+## terrain at every point of the dome instead of being an axis-aligned +Y slab (the "clouds protrude into space /
+## 90° wrong" live bug — the old mesher built boxes in the global-Y frame, correct only at the north pole). The
+## weather grid is a GLOBAL field over sphere DIRECTIONS, so cover is sampled by each tile's radial direction
+## (works across facet boundaries, no window/lattice fold needed).
+##
+## ATMOSPHERE-GATED: clouds exist ONLY while the camera is within the atmosphere band (radial altitude ≤
+## ATMO_TOP). In orbit/space the meshes are cleared — no clouds hang at orbital altitude ("rains in orbit" bug).
+##
+## NEVER-OOM (§8 rows 4–5): ONE camera-following, camera-snapped LATTICE×LATTICE tile dome per altitude band,
+## meshed into a SINGLE reused CPU scratch (allocated once at worst-case capacity — no per-rebuild growth) then
 ## uploaded to one of exactly 3 ArrayMesh surfaces (3 draw calls total). A HARD vertex cap makes the worst
 ## case unconditional; greedy row-merge makes full overcast the CHEAPEST mesh, not the worst (G-W2-BYTES).
 ## Meshes rebuild incrementally: one layer per REBUILD_INTERVAL frames, round-robin, so no frame pays for
-## more than one layer. Byte-bounded + draw-bounded are headless-proven; the cloud LOOK is LIVE-ONLY.
+## more than one layer. Byte-bounded + draw-bounded + frame-orientation + altitude-gating are headless-proven;
+## the cloud LOOK is LIVE-ONLY.
 
 const _CLOUD_SALT := 106                ## SEED+106 — the cloud/precip downscale texture (TerrainConfig salt registry)
 
@@ -22,15 +36,17 @@ const LATTICE := 64                     ## tiles per side → a 2048-block cloud
 const REBUILD_INTERVAL := 16            ## frames between a layer's rebuilds (round-robin, §4.2)
 const CAP_VERTS := 24576                ## HARD per-layer vertex cap (§8 row 4) — emission stops here
 const STORM_TILE_CAP := 64              ## W4: max cumulonimbus towers per rebuild (§4.2 — bounded extra verts)
-const STORM_TOP := 256.0                ## W4: cumulonimbus tower top (< L1); anvil forms near here
+const STORM_TOP := 256.0                ## W4: cumulonimbus tower top ALTITUDE (< ATMO_TOP); anvil forms near here
 const STORM_TINT := Color(0.45, 0.47, 0.54)  ## dark storm-cloud vertex colour
 
 # --- altitude bands (blocks; all below ATMO_TOP = 384) + type params (§4.2) ----
-const ALT := [144.0, 216.0, 310.0]      ## L0 cumulus, L1 stratus, L2 cirrus base heights
+const ALT := [144.0, 216.0, 310.0]      ## L0 cumulus, L1 stratus, L2 cirrus base ALTITUDES (radial, above surface)
 const THICK := [3.0, 1.0, 0.6]          ## slab thickness per layer
 const THRESH := [0.18, 0.30, 0.12]      ## cloud-cover threshold for a tile to be present per layer
 const BUMP := [2.5, 0.5, 0.3]           ## chunky top-height variation per layer (the semi-cubic look)
 const TINT := [Color(0.95, 0.96, 0.98), Color(0.80, 0.82, 0.86), Color(0.90, 0.92, 0.97)]
+
+const NOISE_FREQ := 0.004               ## downscale-noise frequency in BLOCKS (sampled along the tangent world scale)
 
 var _env: PerVoxelEnvironment = null
 var _cam_provider: Node = null
@@ -47,7 +63,17 @@ var _cursor := 0                        ## next layer to rebuild (round-robin)
 var _emitted := [0, 0, 0]               ## last emitted vertex count per layer (gate/telemetry)
 var _test_force := -1.0                 ## gate hook: ≥0 overrides cloud_cover with this value
 var _test_storm := false                ## gate hook: force every L0 run convective (storm-cap test)
+var _test_ignore_altitude := false      ## gate hook: build regardless of camera altitude (byte/draw/storm gates)
+var _debug_cam := Vector3.ZERO          ## gate hook: an explicit camera scene position (headless has no provider)
+var _has_debug_cam := false
 var _storm_count := 0                   ## cumulonimbus towers emitted this rebuild (≤ STORM_TILE_CAP)
+
+# --- per-rebuild local-surface frame (planet centre = scene origin; up = cam.normalized()); members so the
+#     emit path allocates nothing (NEVER-OOM). Rebuilt at the head of every rebuild_layer.
+var _up := Vector3.UP
+var _t1 := Vector3.RIGHT
+var _t2 := Vector3.BACK
+var _R := FacetAtlas.R_BLOCKS
 
 func setup(env: PerVoxelEnvironment, cam_provider: Node = null) -> void:
 	_env = env
@@ -88,16 +114,48 @@ func _process(_delta: float) -> void:
 	rebuild_layer(_cursor)
 	_cursor = (_cursor + 1) % LAYERS
 
+## Radial altitude (blocks above the voxel surface) of the camera — the same signal CosmosSky ramps the sky on.
+func _radial_altitude(cam: Vector3) -> float:
+	return cam.length() - _R
+
+## True while the camera sits inside the atmosphere band (clouds/precip exist only here — never in orbit/space).
+func in_atmosphere(cam: Vector3) -> bool:
+	if _test_ignore_altitude:
+		return true
+	return _radial_altitude(cam) <= CubeSphere.ATMO_TOP
+
+## Build the local-surface tangent frame at the camera: up = radial (planet centre = scene origin), t1/t2 an
+## orthonormal tangent pair. Stored in members so the per-tile emit path never allocates.
+func _build_frame(cam: Vector3) -> void:
+	_R = FacetAtlas.R_BLOCKS
+	_up = cam.normalized() if cam.length() > 1.0 else Vector3.UP
+	var ref := Vector3(0, 1, 0)
+	if absf(_up.dot(ref)) > 0.99:
+		ref = Vector3(1, 0, 0)
+	_t1 = _up.cross(ref).normalized()
+	_t2 = _up.cross(_t1).normalized()
+
+## Radial direction (unit) at tangent offset (a, b) from the camera ground point — normalize the tangent-plane
+## surface point (up·R + a·t1 + b·t2). This IS the local surface up at that tile, so a face built normal to it
+## lies horizontal over the terrain there.
+func _tile_dir(a: float, b: float) -> Vector3:
+	return (_up * _R + _t1 * a + _t2 * b).normalized()
+
 # ---------------------------------------------------------------------------------------
 # Rebuild ONE layer into the shared scratch, then upload to its ArrayMesh (one surface, one draw). Greedy
-# row-merge along +x; a hard vertex cap. World-snapped to the tile grid so a moving player never forces a
-# full re-emit (the mesh just shifts with the camera tile origin).
+# row-merge along +a (tangent x); a hard vertex cap. Camera-centred tangent dome so a moving player never
+# forces a full re-emit (the dome shifts with the camera; the cloud PATTERN is direction-sampled so it stays
+# put on the sphere). Cleared entirely above the atmosphere (no clouds in orbit).
 # ---------------------------------------------------------------------------------------
 func rebuild_layer(layer: int) -> void:
 	var cam := _cam_origin()
-	var ox := int(floor(cam.x / float(TILE_BLOCKS))) - LATTICE / 2
-	var oz := int(floor(cam.z / float(TILE_BLOCKS))) - LATTICE / 2
-	var n := 0                                        # vertices written to the scratch
+	if not in_atmosphere(cam):
+		_emitted[layer] = 0
+		_upload(layer, 0)                             # clear: no clouds in space
+		return
+	_build_frame(cam)
+	var half := LATTICE / 2
+	var n := 0                                         # vertices written to the scratch
 	var alt := float(ALT[layer])
 	var thick := float(THICK[layer])
 	var bump := float(BUMP[layer])
@@ -106,17 +164,15 @@ func rebuild_layer(layer: int) -> void:
 	for tz in range(LATTICE):
 		if n >= CAP_VERTS:
 			break
-		var gz := oz + tz
-		var wz := float(gz * TILE_BLOCKS)
+		var b0 := float(tz - half) * float(TILE_BLOCKS)
 		var run_start := -1
 		var tx := 0
 		while tx <= LATTICE:
 			var present := false
-			var cover := 0.0
 			if tx < LATTICE:
-				var gx := ox + tx
-				var wx := float(gx * TILE_BLOCKS)
-				cover = _cover_at(wx + 16.0, wz + 16.0, layer)
+				var a_c := (float(tx - half) + 0.5) * float(TILE_BLOCKS)
+				var b_c := b0 + 0.5 * float(TILE_BLOCKS)
+				var cover := _cover_at(_tile_dir(a_c, b_c), layer)
 				present = cover > float(THRESH[layer])
 			if present and run_start < 0:
 				run_start = tx
@@ -126,61 +182,72 @@ func rebuild_layer(layer: int) -> void:
 					# W4: a convective L0 run becomes a towering cumulonimbus (capped count) — darker + taller.
 					var storm := false
 					if (CubeSphere.FP_STORMS or _test_storm) and layer == 0 and _storm_count < STORM_TILE_CAP:
-						storm = _is_storm_run(ox + run_start, ox + tx, gz, alt)
+						storm = _is_storm_run(run_start, tx, tz, half)
 						if storm:
 							_storm_count += 1
-					n = _emit_box(n, ox + run_start, ox + tx, gz, alt, thick, bump, tint, layer, storm)
+					n = _emit_box(n, run_start - half, tx - half, tz - half, alt, thick, bump, tint, layer, storm)
 				run_start = -1
 			tx += 1
 	_emitted[layer] = n
 	_upload(layer, n)
 
-## Cover value at world (wx, wz) for `layer`: the grid cloud water (via PerVoxelEnvironment) modulated by
-## the SEED+106 downscale noise. The gate hook `_test_force` overrides the grid for synthetic full cover.
-func _cover_at(wx: float, wz: float, layer: int) -> float:
+## Cover value for radial direction `dir` and `layer`: the grid cloud water (via PerVoxelEnvironment) modulated
+## by the SEED+106 downscale noise. The gate hook `_test_force` overrides the grid for synthetic full cover.
+func _cover_at(dir: Vector3, layer: int) -> float:
 	var base := _test_force
 	if base < 0.0:
-		base = _env.cloud_cover(Vector3(wx, ALT[layer], wz), layer) if _env != null else 0.0
+		base = _env.cloud_cover_dir(dir, layer) if _env != null else 0.0
 	# noise MODULATES the grid base (ragged sub-cell edges), it never creates cloud from nothing — a clear
 	# grid cell (base 0) stays clear, so clouds only cost geometry where the weather actually has cloud water.
-	var noise := _noise.get_noise_3d(wx * 0.004, wz * 0.004, float(layer) * 13.0)
+	# Sampled along the world tangent scale (dir·R·freq) so the ragged edges are LOCKED to the sphere, not the
+	# camera-following tile grid.
+	var noise := _noise.get_noise_3dv(dir * (_R * NOISE_FREQ) + Vector3(0.0, 0.0, float(layer) * 13.0))
 	return clampf(base * (1.0 + noise * 0.6), 0.0, 1.0)
 
-## True iff the L0 run [x0,x1) at row tz is convective (a thunderstorm column) — the emergent grid flag
-## (or the gate's forced-storm hook). Sampled at the run centre.
-func _is_storm_run(x0: int, x1: int, tz: int, alt: float) -> bool:
+## True iff the L0 run [c0,c1) at row tz is convective (a thunderstorm column) — the emergent grid flag (or the
+## gate's forced-storm hook). Sampled at the run centre's radial direction. (c0,c1,tz are absolute tile indices.)
+func _is_storm_run(c0: int, c1: int, tz: int, half: int) -> bool:
 	if _test_storm:
 		return true
 	if _env == null:
 		return false
-	var midx := (x0 + x1) / 2
-	return _env.is_convective(Vector3(float(midx * TILE_BLOCKS) + 16.0, alt, float(tz * TILE_BLOCKS) + 16.0))
+	var a_c := (float((c0 + c1) / 2 - half) + 0.5) * float(TILE_BLOCKS)
+	var b_c := (float(tz - half) + 0.5) * float(TILE_BLOCKS)
+	return _env.is_convective_dir(_tile_dir(a_c, b_c))
 
-## Emit one merged box spanning tile columns [x0, x1) at row tz, at the layer altitude. Non-indexed
-## triangles (top + 4 sides; the bottom is unseen from below the deck and skipped). A convective run
-## extrudes to a towering cumulonimbus (dark, up to STORM_TOP) — same mesh, bounded extra height, no extra
-## verts. Returns the new count.
-func _emit_box(n: int, x0: int, x1: int, tz: int, alt: float, thick: float, bump: float, tint: Color, layer: int, storm := false) -> int:
-	var wx0 := float(x0 * TILE_BLOCKS)
-	var wx1 := float(x1 * TILE_BLOCKS)
-	var wz0 := float(tz * TILE_BLOCKS)
-	var wz1 := float((tz + 1) * TILE_BLOCKS)
-	var h := STORM_TOP if storm else _quantize_top(alt, thick, bump, x0, tz, layer)
-	var b := alt
+## Emit one merged box spanning tile columns [cx0, cx1) at row cz (all CAMERA-CENTRED tile indices: 0 == the
+## camera column) at the layer altitude, ON THE SHELL. Each corner is placed radially (dir·radius, planet centre
+## = scene origin) so the box lies curved over the terrain and its faces are normal to the radial. Non-indexed
+## triangles (top + 4 sides; the bottom is unseen from below the deck and skipped). A convective run extrudes to
+## a towering cumulonimbus (dark, up to STORM_TOP) — same mesh, bounded extra height, no extra verts.
+func _emit_box(n: int, cx0: int, cx1: int, cz: int, alt: float, thick: float, bump: float, tint: Color, layer: int, storm := false) -> int:
+	var a0 := float(cx0) * float(TILE_BLOCKS)
+	var a1 := float(cx1) * float(TILE_BLOCKS)
+	var b0 := float(cz) * float(TILE_BLOCKS)
+	var b1 := float(cz + 1) * float(TILE_BLOCKS)
+	var top_alt := STORM_TOP if storm else _quantize_top(alt, thick, bump, cx0, cz, layer)
+	var rt := _R + top_alt                                       # top shell radius
+	var rb := _R + alt                                           # base shell radius
 	var c := STORM_TINT if storm else tint
-	# top quad (two tris)
-	n = _quad(n, Vector3(wx0, h, wz0), Vector3(wx1, h, wz0), Vector3(wx1, h, wz1), Vector3(wx0, h, wz1), c)
-	# four sides (darker underside tint for depth)
+	# corner radial directions (shared by base + top)
+	var d00 := _tile_dir(a0, b0)
+	var d10 := _tile_dir(a1, b0)
+	var d11 := _tile_dir(a1, b1)
+	var d01 := _tile_dir(a0, b1)
+	# top quad (two tris) — normal ≈ radial (horizontal over the terrain)
+	n = _quad(n, d00 * rt, d10 * rt, d11 * rt, d01 * rt, c)
+	# four sides (darker underside tint for depth): base → top along each edge
 	var cs := c.darkened(0.15)
-	n = _quad(n, Vector3(wx0, b, wz0), Vector3(wx1, b, wz0), Vector3(wx1, h, wz0), Vector3(wx0, h, wz0), cs)
-	n = _quad(n, Vector3(wx1, b, wz1), Vector3(wx0, b, wz1), Vector3(wx0, h, wz1), Vector3(wx1, h, wz1), cs)
-	n = _quad(n, Vector3(wx0, b, wz1), Vector3(wx0, b, wz0), Vector3(wx0, h, wz0), Vector3(wx0, h, wz1), cs)
-	n = _quad(n, Vector3(wx1, b, wz0), Vector3(wx1, b, wz1), Vector3(wx1, h, wz1), Vector3(wx1, h, wz0), cs)
+	n = _quad(n, d00 * rb, d10 * rb, d10 * rt, d00 * rt, cs)
+	n = _quad(n, d11 * rb, d01 * rb, d01 * rt, d11 * rt, cs)
+	n = _quad(n, d01 * rb, d00 * rb, d00 * rt, d01 * rt, cs)
+	n = _quad(n, d10 * rb, d11 * rb, d11 * rt, d10 * rt, cs)
 	return n
 
-## Top height (blocks) of a box: the layer altitude + a chunky, quantized noise bump (the semi-cubic look).
-func _quantize_top(alt: float, thick: float, bump: float, x0: int, tz: int, layer: int) -> float:
-	var nz := _noise.get_noise_3d(float(x0) * 0.6, float(tz) * 0.6, float(layer) * 7.0)
+## Top ALTITUDE (blocks above surface) of a box: the layer altitude + a chunky, quantized noise bump (the
+## semi-cubic look). Keyed on the camera-centred tile indices (stable within a rebuild).
+func _quantize_top(alt: float, thick: float, bump: float, cx0: int, cz: int, layer: int) -> float:
+	var nz := _noise.get_noise_3d(float(cx0) * 0.6, float(cz) * 0.6, float(layer) * 7.0)
 	var extra: float = round(maxf(0.0, nz) * bump * 2.0) * 0.5     # quantized to half-blocks
 	return alt + thick + extra
 
@@ -211,12 +278,16 @@ func _upload(layer: int, n: int) -> void:
 func _cam_origin() -> Vector3:
 	if _cam_provider != null and _cam_provider.has_method("camera_global_transform"):
 		return (_cam_provider.camera_global_transform() as Transform3D).origin
+	if _has_debug_cam:
+		return _debug_cam
 	return global_transform.origin
 
 # ---------------------------------------------------------------------------------------
-# Gate / inspection support (headless verify_climate). Not on the live hot path.
+# Gate / inspection support (headless verify_weather). Not on the live hot path.
 # ---------------------------------------------------------------------------------------
 func debug_set_camera(pos: Vector3) -> void:
+	_debug_cam = pos
+	_has_debug_cam = true
 	global_transform = Transform3D(Basis.IDENTITY, pos)
 
 func debug_force_cover(v: float) -> void:
@@ -224,6 +295,35 @@ func debug_force_cover(v: float) -> void:
 
 func debug_force_storm(on: bool) -> void:
 	_test_storm = on
+
+## Gate hook: build regardless of camera radial altitude (so the byte/draw/storm gates can place the camera at
+## arbitrary probe positions without the atmosphere gate zeroing the mesh). The live path never sets this.
+func debug_ignore_altitude(on: bool) -> void:
+	_test_ignore_altitude = on
+
+## Gate hook: the local-surface up used at the current camera (radial, planet centre = scene origin).
+func debug_up() -> Vector3:
+	_build_frame(_cam_origin())
+	return _up
+
+## Gate hook: the shell-face normal at tangent offset (a, b) from the camera — the radial direction there. For
+## the central tile (0,0) this equals the camera up; a face built with this normal lies horizontal over terrain.
+func debug_shell_normal(a: float, b: float) -> Vector3:
+	_build_frame(_cam_origin())
+	return _tile_dir(a, b)
+
+## Gate hook: the normal of the FIRST emitted top quad (verts 0..2), or ZERO if nothing emitted. Proves the
+## live-emitted geometry is oriented to the radial, not the global +Y.
+func debug_first_top_normal() -> Vector3:
+	if _emitted_total() < 3:
+		return Vector3.ZERO
+	return (_sv[1] - _sv[0]).cross(_sv[2] - _sv[0]).normalized()
+
+func _emitted_total() -> int:
+	var t := 0
+	for e in _emitted:
+		t += int(e)
+	return t
 
 func storm_tower_count() -> int:
 	return _storm_count

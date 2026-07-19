@@ -676,6 +676,13 @@ func radial_altitude() -> float:
 			return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - _FacetAtlasCls.R_BLOCKS
 	return position.y
 
+## CLIMATE W3 (cloudfix): the camera position in the ACTIVE FACET's LATTICE frame (local coords) — the frame
+## the weather grid indexes by (PerVoxelEnvironment._dir_of_pos folds the lattice column via FacetAtlas.cell_dir).
+## The player rides the ActiveFrame so its LOCAL transform IS the lattice pose; the camera sits eye_height up the
+## local +Y. WeatherFX samples precip/humidity/convection here while placing the FX geometry in scene space.
+func camera_lattice_origin() -> Vector3:
+	return Vector3(position.x, position.y + eye_height, position.z)
+
 ## SN-FIX #1b (SN_HUD_NAV, 2026-07-18 live-pilot request): the player's current speed in blocks/s for the HUD.
 ## Prefers the nav machine's body-centred-inertial |v_bci| (`_nav_tele`, the same value the RemoteBridge streams),
 ## and falls back to the CharacterBody3D lattice speed when the nav machine is off (SN_NAV_MODES false ⇒ empty

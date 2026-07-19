@@ -319,6 +319,21 @@ const BACKSTOP_SINK_FRAC := 0.5
 ## planar-corner path verbatim, FLAT byte-identical (6042/0). Flipped ON at export after the live no-see-through pass.
 const FP_SHELL_WELD := false
 
+## COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3 / §6) — the RADIAL DATUM shift (the seam-step KILL). The near
+## field places a column's surface g blocks up from the facet's OWN mean plane along its OWN normal
+## (lattice_to_world64's y·n̂ term); adjacent facets' planes sit at DIFFERENT signed distances from the shared true
+## edge, so the same g lands at different altitudes — the ∝R datum step (5.30 blocks @ R=6371), the 8-block cliff.
+## When true (requires FACETED), each column gains an integer datum shift S = round(solve |p0 + s·n̂| = R) ∈ [0, ~7]
+## applied as a PURE RE-INDEX: a cell at lattice y resolves worldgen at true y − S (resolve_cell/worldgen run
+## UNCHANGED in true-height space — strata, sea fill, snow, trees all ride S), and every surface funnel returns
+## g + S. The placed surface then sits at altitude R + g (a pure function of d̂), so adjacent facets agree to ≤1
+## block quantization + ≤0.15 cosine at every seam. S is pure arithmetic over the frozen atlas frame + R — zero new
+## persistent memory, worker-safe, C++-mirrorable (VoxelGeneratorCosmos already receives facet_frame/off/r). The
+## vertical envelope grows by ≤ DATUM_SHIFT_MAX (worldgen y-bounds get that headroom under the flag). Default OFF ⇒
+## S ≡ 0 at every call site (FacetAtlas.datum_shift returns 0), so the world is byte-identical (FLAT 6042/0, G-O4-EQ
+## hashes unchanged). Flipped ON at export after the live cliffs-gone pass. Truth gate: verify_facet_datum.gd.
+const FP_RADIAL_DATUM := false
+
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
 ## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already

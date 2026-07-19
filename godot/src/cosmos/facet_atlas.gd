@@ -435,6 +435,32 @@ static func facet_corner_dirs(fid: int) -> PackedFloat64Array:
 		out[ci * 3 + 0] = d.x; out[ci * 3 + 1] = d.y; out[ci * 3 + 2] = d.z
 	return out
 
+## COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3) — the per-column DATUM SHIFT S(fid,x,z). The lattice height
+## at which the sphere datum crosses this column: solve |p0 + s·n̂| = R for s ≥ 0, where p0 is the column base
+## point on the facet plane (cell centre x+0.5, z+0.5, y=0). s ∈ [0, ~7] at R=6371 (0 near corners, the sagitta at
+## centre) — it only ever RAISES a column, never cuts it. Rounded to an integer so it is a pure RE-INDEX (a cell at
+## lattice y resolves worldgen at true y − S). Pure arithmetic over the FROZEN frame + R (worker-safe, allocation-
+## free, C++-mirrorable with zero new frozen data). Returns 0 unless FP_RADIAL_DATUM — so every call site is
+## byte-identical with the flag off BY CONSTRUCTION (no per-site guard needed). DATUM_SHIFT_MAX bounds it for the
+## worldgen y-envelope headroom. The C++ VoxelGeneratorCosmos mirrors this EXACTLY (same frame, same formula).
+const DATUM_SHIFT_MAX := 8       # >= max round(s) at Earth R=6371 (sagitta 6.81 ⇒ 7); +1 slack for the y-bound headroom
+static func datum_shift(fid: int, x: int, z: int) -> int:
+	if not CubeSphere.FP_RADIAL_DATUM:
+		return 0
+	var f := fid * 12
+	var fx := float(x) + 0.5 - float(_off[fid * 2])
+	var fz := float(z) + 0.5 - float(_off[fid * 2 + 1])
+	# p0 = lattice_to_world64(fid, x+0.5, 0, z+0.5) — the column base point on the facet plane (f64)
+	var p0x := _frame[f + 0] + fx * _frame[f + 3] + fz * _frame[f + 9]
+	var p0y := _frame[f + 1] + fx * _frame[f + 4] + fz * _frame[f + 10]
+	var p0z := _frame[f + 2] + fx * _frame[f + 5] + fz * _frame[f + 11]
+	var b := p0x * _frame[f + 6] + p0y * _frame[f + 7] + p0z * _frame[f + 8]   # p0·n̂ (the plane offset)
+	var r := r_of(fid)
+	var disc := b * b + r * r - (p0x * p0x + p0y * p0y + p0z * p0z)
+	if disc < 0.0:
+		disc = 0.0
+	return int(round(-b + sqrt(disc)))
+
 ## The world position of facet `fid`'s planarized corner `ci` (0..3, CCW) — c0' + q_ci·(ê_u, ê_w). f64 [x,y,z].
 ## The SAME planar frames the near voxel world uses, so the far ring meets the near facet cleanly at ridges.
 static func facet_planar_corner(fid: int, ci: int) -> Array:

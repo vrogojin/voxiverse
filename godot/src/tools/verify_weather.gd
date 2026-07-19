@@ -37,6 +37,8 @@ func _initialize() -> void:
 	_gate_w1_physics()
 	_gate_w1_itcz()
 	_gate_w2_clouds()
+	_gate_cloud_frame()
+	_gate_cloud_altitude()
 	_gate_w3_precip()
 	_gate_w4_storms()
 
@@ -198,6 +200,7 @@ func _gate_w2_clouds() -> void:
 	var cl: CloudLayers = CLOUDS.new()
 	get_root().add_child(cl)
 	cl.setup(null, null)                               # no env: the gate drives cover directly
+	cl.debug_ignore_altitude(true)                     # this gate probes bytes/draws at arbitrary cam positions
 	cl.debug_set_camera(Vector3(1234.0, 0.0, -5678.0))
 	# scratch allocated once at the vertex cap; capture identity by size.
 	var rep := cl.byte_report()
@@ -226,6 +229,70 @@ func _gate_w2_clouds() -> void:
 		empty += cl.emitted_verts(l)
 	_ok(empty == 0 and cl.draw_count() == 0, "W2: clear sky emits nothing (0 verts, 0 draws)")
 	cl.queue_free()
+
+# ===== G-CLOUD-FRAME : cloud sheets are horizontal over the terrain (normal == local radial, not global +Y) =====
+func _gate_cloud_frame() -> void:
+	print("  --- G-CLOUD-FRAME: cloud sheet normal == local radial (facet up), NOT axis-aligned +Y ---")
+	var R := FacetAtlas.R_BLOCKS
+	# Probe several surface positions whose radial up is DEFINITELY not +Y (the old global-Y slab bug is only
+	# correct at the north pole). up must equal cam.normalized(); the central-tile shell normal must equal up.
+	var dirs := [Vector3(1, 0, 0), Vector3(0, 0, 1), Vector3(0.6, 0.5, -0.62435).normalized(), Vector3(-0.4, -0.3, 0.866).normalized()]
+	var frame_ok := true
+	for d in dirs:
+		var cl: CloudLayers = CLOUDS.new()
+		get_root().add_child(cl)
+		cl.setup(null, null)
+		cl.debug_set_camera(d * (R + 30.0))            # a surface-altitude camera along this radial
+		var up: Vector3 = cl.debug_up()
+		if up.dot(d) < 0.9999:
+			frame_ok = false
+		if cl.debug_shell_normal(0.0, 0.0).dot(up) < 0.9999:
+			frame_ok = false
+		cl.queue_free()
+	_ok(frame_ok, "FRAME: up == cam.normalized() (radial) and central-tile normal == up, across 4 non-polar radials")
+	# END-TO-END on the EMITTED geometry: camera along +X (up=+X). The old +Y slab would give a top-quad normal
+	# ⟂ +X (dot≈0). Assert the emitted top face is normal to the RADIAL (dot(up) high) and NOT to global +Y.
+	var cx: CloudLayers = CLOUDS.new()
+	get_root().add_child(cx)
+	cx.setup(null, null)
+	cx.debug_set_camera(Vector3(1, 0, 0) * (R + 30.0))
+	cx.debug_force_cover(1.0)
+	cx.rebuild_layer(0)
+	var up_x: Vector3 = cx.debug_up()
+	var nrm: Vector3 = cx.debug_first_top_normal()
+	_ok(nrm != Vector3.ZERO and absf(nrm.dot(up_x)) > 0.85,
+		"FRAME: emitted top-quad normal ∥ radial up (|n·up|=%.3f > 0.85 — horizontal over terrain)" % absf(nrm.dot(up_x)))
+	_ok(absf(nrm.dot(Vector3(0, 1, 0))) < 0.3,
+		"FRAME: emitted top-quad normal is NOT the global +Y slab (|n·Y|=%.3f < 0.3 — the 90° bug is gone)" % absf(nrm.dot(Vector3(0, 1, 0))))
+	cx.queue_free()
+
+# ===== G-CLOUD-ALTITUDE : clouds+precip exist in-atmosphere, ABSENT in orbit/space (radial alt > ATMO_TOP) =====
+func _gate_cloud_altitude() -> void:
+	print("  --- G-CLOUD-ALTITUDE: clouds/precip present below ATMO_TOP=%.0f, cleared in orbit ---" % CubeSphere.ATMO_TOP)
+	var R := FacetAtlas.R_BLOCKS
+	var up := Vector3(0.5, 0.7, 0.5).normalized()
+	# In-atmosphere (radial alt 100 < 384): forced overcast ⇒ clouds emit.
+	var cin: CloudLayers = CLOUDS.new()
+	get_root().add_child(cin)
+	cin.setup(null, null)
+	cin.debug_force_cover(1.0)
+	cin.debug_set_camera(up * (R + 100.0))
+	cin.rebuild_all_now()
+	var in_verts := cin.emitted_verts(0) + cin.emitted_verts(1) + cin.emitted_verts(2)
+	_ok(in_verts > 0, "ALTITUDE: at radial-alt 100 (in atmosphere) overcast clouds emit (%d verts)" % in_verts)
+	# In orbit (radial alt 500 > 384): SAME forced overcast ⇒ NO clouds, NO draws (cleared).
+	cin.debug_set_camera(up * (R + 500.0))
+	cin.rebuild_all_now()
+	var orb_verts := cin.emitted_verts(0) + cin.emitted_verts(1) + cin.emitted_verts(2)
+	_ok(orb_verts == 0 and cin.draw_count() == 0, "ALTITUDE: at radial-alt 500 (orbit) clouds are CLEARED (0 verts, 0 draws) despite overcast")
+	cin.queue_free()
+	# WeatherFX shares the same band predicate: precip/fog gate ON below ATMO_TOP, OFF above.
+	var fx: WeatherFX = FX.new()
+	get_root().add_child(fx)
+	fx.setup(null, null, null)
+	_ok(fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP - 1.0)), "ALTITUDE: WeatherFX in-atmosphere just below ATMO_TOP (precip enabled)")
+	_ok(not fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP + 50.0)), "ALTITUDE: WeatherFX in space above ATMO_TOP (precip disabled — no rain in orbit)")
+	fx.queue_free()
 
 # ================= W3 : precipitation FX + fog + snow coupling (G-W3-COUPLE) =================
 const FX := preload("res://src/world/weather_fx.gd")
@@ -286,6 +353,7 @@ func _gate_w4_storms() -> void:
 	var cl: CloudLayers = CLOUDS.new()
 	get_root().add_child(cl)
 	cl.setup(null, null)
+	cl.debug_ignore_altitude(true)
 	cl.debug_set_camera(Vector3.ZERO)
 	cl.debug_force_cover(1.0)
 	cl.debug_force_storm(true)

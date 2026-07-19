@@ -12,8 +12,10 @@ extends Node3D
 
 const AMOUNT_CAP := 1024              ## hard particle-pool cap (§8 row 6)
 const BOX := 48.0                     ## emission box half-extent around the camera (blocks)
-const SPAWN_H := 40.0                 ## height above the camera the precip spawns at
+const SPAWN_H := 40.0                 ## height above the camera the precip spawns at (along the radial up)
 const FOG_GAIN := 2.5                 ## how strongly near-saturated air thickens the fog
+const RAIN_G := 120.0                 ## rain/hail fall acceleration magnitude (applied along −up = radial down)
+const SNOW_G := 14.0                  ## snow fall acceleration magnitude (gentler)
 
 var _env: PerVoxelEnvironment = null
 var _environment: Environment = null
@@ -84,18 +86,53 @@ func _process(delta: float) -> void:
 	if _particles == null:
 		return
 	var cam := _cam_origin()
-	# keep the emitter box centred above the camera (camera-following, fixed pool).
-	global_transform = Transform3D(Basis.IDENTITY, cam + Vector3(0.0, SPAWN_H, 0.0))
-	var precip := _env.precipitation(cam) if _env != null else {"rate": 0.0, "kind": "none"}
+	# LOCAL-SURFACE FRAME (cloudfix 2026-07-19): the planet centre is the scene origin, so the radial up at the
+	# camera is cam.normalized() (the CosmosSky convention the clouds share). Orient the emitter so its slab is
+	# horizontal over the terrain and precip falls along −up (radial down), NOT global −Y — otherwise on a tilted
+	# facet the rain streaks sideways ("90° wrong"). ZERO allocation: transform + property writes only.
+	var up := cam.normalized() if cam.length() > 1.0 else Vector3.UP
+	var ref := Vector3(0, 1, 0)
+	if absf(up.dot(ref)) > 0.99:
+		ref = Vector3(1, 0, 0)
+	var t1 := up.cross(ref).normalized()
+	var t2 := up.cross(t1).normalized()
+	var emit_basis := Basis(t1, up, t2)
+	_particles.global_transform = Transform3D(emit_basis, cam + up * SPAWN_H)
+	# ATMOSPHERE GATE: no precip / no fog thickening in orbit or space (radial altitude > ATMO_TOP).
+	if not _in_atmosphere(cam):
+		_apply(0.0, "none")
+		if _environment != null:
+			_environment.fog_density = _base_fog
+		_drive_lightning(delta, false)
+		return
+	# Sample the weather grid at the camera's ACTIVE-FACET LATTICE column (the frame _dir_of_pos folds); the FX
+	# geometry above is in scene space, but the grid is indexed by lattice columns. Falls back to the scene cam
+	# for a provider without the lattice accessor (headless/no player) — harmless, the grid is null there anyway.
+	var col := _grid_pos(cam)
+	var precip := _env.precipitation(col) if _env != null else {"rate": 0.0, "kind": "none"}
 	var rate := float(precip.get("rate", 0.0))
 	var kind := String(precip.get("kind", "none"))
 	# W4: a convective column upgrades falling rain to HAIL and can flash lightning.
-	var storm := CubeSphere.FP_STORMS and _env != null and _env.is_convective(cam)
+	var storm := CubeSphere.FP_STORMS and _env != null and _env.is_convective(col)
 	if storm and rate > 0.0 and kind == "rain":
 		kind = "hail"
 	_apply(rate, kind)
-	_drive_fog(cam)
+	# steer the active fall acceleration along the radial down (−up) so streaks/flakes drop toward the ground.
+	var g := SNOW_G if _kind == "snow" else RAIN_G
+	(_particles.process_material as ParticleProcessMaterial).gravity = -up * g
+	_drive_fog(col)
 	_drive_lightning(delta, storm)
+
+## True while the camera is inside the atmosphere band — precip/fog exist only here (never in orbit/space).
+func _in_atmosphere(cam: Vector3) -> bool:
+	return (cam.length() - FacetAtlas.R_BLOCKS) <= CubeSphere.ATMO_TOP
+
+## The camera position in the active-facet LATTICE frame (what the weather grid indexes). Uses the player's
+## accessor when present; otherwise the scene cam (headless gate has no grid, so the value is unused).
+func _grid_pos(cam: Vector3) -> Vector3:
+	if _cam_provider != null and _cam_provider.has_method("camera_lattice_origin"):
+		return _cam_provider.camera_lattice_origin()
+	return cam
 
 ## Lightning: while a storm is overhead, fire a brief flash on a cooldown and fade it out. A single
 ## reused OmniLight (energy writes only) — bounded, no per-frame allocation. Distance-delayed thunder
@@ -103,7 +140,9 @@ func _process(delta: float) -> void:
 func _drive_lightning(delta: float, storm: bool) -> void:
 	if _flash == null:
 		return
-	_flash.global_transform = Transform3D(Basis.IDENTITY, _cam_origin() + Vector3(0.0, SPAWN_H, 0.0))
+	var cam := _cam_origin()
+	var up := cam.normalized() if cam.length() > 1.0 else Vector3.UP
+	_flash.global_transform = Transform3D(Basis.IDENTITY, cam + up * SPAWN_H)
 	_flash_cooldown -= delta
 	if storm and _flash_cooldown <= 0.0:
 		_flash_energy = 4.0                          # strike
@@ -141,6 +180,10 @@ func _cam_origin() -> Vector3:
 # --- gate / inspection support -------------------------------------------------
 func debug_apply(rate: float, kind: String) -> void:
 	_apply(rate, kind)
+
+## Gate hook: is a scene camera position inside the atmosphere band? (the precip/fog altitude gate predicate)
+func debug_in_atmosphere(cam: Vector3) -> bool:
+	return _in_atmosphere(cam)
 
 func particle_cap() -> int:
 	return _particles.amount if _particles != null else 0

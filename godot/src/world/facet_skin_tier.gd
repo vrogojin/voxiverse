@@ -597,8 +597,10 @@ static func gd_sample(fid: int, packed: PackedInt64Array) -> Dictionary:
 		var pr: Vector4 = TerrainConfig.column_profile(x, z, ctx)
 		var g := int(pr.x)
 		var biome := int(pr.y)
-		var w := g < TerrainConfig.SEA_LEVEL
-		heights[i] = float(g)
+		var w := g < TerrainConfig.SEA_LEVEL          # water is a TRUE-space property (uses unshifted g)
+		# COSMOS FS2 (§3.2): the skin lands on the datum-shifted surface (g + S) so it agrees with the near
+		# voxels and the radial far shell (One-Surface Law). S ≡ 0 with FP_RADIAL_DATUM off ⇒ byte-identical.
+		heights[i] = float(g + (FacetAtlas.datum_shift(fid, x, z) if CubeSphere.FACETED else 0))
 		biomes[i] = biome
 		water[i] = 1 if w else 0
 		colors[i] = FarPalette.color_for(g, biome, pr.w, w)

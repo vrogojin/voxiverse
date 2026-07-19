@@ -415,6 +415,26 @@ static func world_to_lattice64(fid: int, wx: float, wy: float, wz: float) -> Arr
 		dx * _frame[f + 6] + dy * _frame[f + 7] + dz * _frame[f + 8],
 		dx * _frame[f + 9] + dy * _frame[f + 10] + dz * _frame[f + 11] + float(_off[fid * 2 + 1])]
 
+## COSMOS FS1 (docs/COSMOS-FACET-SEAMS-DESIGN.md §4.1) — facet `fid`'s 4 TRUE cube-sphere corner DIRECTIONS
+## (unit f64, CCW: 00,10,11,01), as a flat 12-f64 array [d0.xyz, d1.xyz, d2.xyz, d3.xyz]. Unlike
+## facet_planar_corner (each facet's OWN planarized projection — adjacent facets disagree at a shared edge by
+## the ∝R datum step), these are the shared cube-grid vertex dirs: two facets sharing a grid edge read the
+## SAME vertex_dir for their shared corners, so a far vertex emitted RADIALLY from a bilerp of these welds
+## bit-identically to the neighbour's (within a cube face; across the 12 cube edges they agree to f64 rounding).
+## Decodes the LOCAL (face,a,b) within `fid`'s body (Earth ⇒ base 0, k=K), so it is body-correct. Pure/frozen.
+static func facet_corner_dirs(fid: int) -> PackedFloat64Array:
+	var kb := k_of(fid); var lf := fid - fid_base_of(fid)
+	var face := int(lf / (kb * kb))
+	var rem := lf - face * kb * kb
+	var a := int(rem / kb); var b := rem - a * kb
+	var out := PackedFloat64Array()
+	out.resize(12)
+	var ij := [[a, b], [a + 1, b], [a + 1, b + 1], [a, b + 1]]
+	for ci in range(4):
+		var d := CosmosFacet.vertex_dir(face, ij[ci][0], ij[ci][1], kb)
+		out[ci * 3 + 0] = d.x; out[ci * 3 + 1] = d.y; out[ci * 3 + 2] = d.z
+	return out
+
 ## The world position of facet `fid`'s planarized corner `ci` (0..3, CCW) — c0' + q_ci·(ê_u, ê_w). f64 [x,y,z].
 ## The SAME planar frames the near voxel world uses, so the far ring meets the near facet cleanly at ridges.
 static func facet_planar_corner(fid: int, ci: int) -> Array:

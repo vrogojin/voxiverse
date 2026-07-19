@@ -117,6 +117,34 @@ static func frozen_colors() -> PackedColorArray:
 		_water, _ice, _lava, _snow, _sand, _gravel, _red_sand, _mud,
 		_podzol, _grass, _leaf, _stone, _taiga, _forest])
 
+## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3) — the airless Moon far-ring palette, generalized per
+## body exactly like the Earth colours above: every RGB is a BlockCatalog tint (regolith / basalt maria /
+## anorthosite highlands), so a recolour follows by construction. The surface is a regolith blanket over the
+## host rock, so each vertex reads as regolith tinted toward its host: maria darker (toward basalt), highlands
+## brighter (toward anorthosite). Resolved once, lazily; the moon materials are registered only under MULTI_BODY,
+## so this is called only from the Moon ring (FP_MOON_RING) and never perturbs the Earth palette above.
+static var _moon_ready := false
+static var _regolith: Color
+static var _basalt: Color
+static var _anorthosite: Color
+static func ensure_moon_ready() -> void:
+	if _moon_ready:
+		return
+	BlockCatalog.ensure_moon_materials()
+	_regolith = BlockCatalog.color_of(BlockCatalog.id_of(&"regolith"))
+	_basalt = BlockCatalog.color_of(BlockCatalog.id_of(&"basalt"))
+	_anorthosite = BlockCatalog.color_of(BlockCatalog.id_of(&"anorthosite"))
+	_moon_ready = true
+
+## The per-vertex Moon far-ring colour for a moon biome (B_MOON_MARIA / _HIGHLANDS / _POLAR). Regolith blended
+## toward the host rock: maria toward dark basalt, highlands (and the polar hook, routed as highlands v1) toward
+## bright anorthosite — a desaturated grey scale that matches the near voxel world's regolith/basalt/anorthosite.
+static func moon_color_for(biome: int) -> Color:
+	ensure_moon_ready()
+	if biome == TerrainConfig.B_MOON_MARIA:
+		return _regolith.lerp(_basalt, 0.55)      # dark maria plains
+	return _regolith.lerp(_anorthosite, 0.45)     # bright highlands / polar
+
 ## THE per-vertex colour (LOD-DESIGN §2.3). A clamped sea vertex takes the sea regime
 ## colour; a dry-land vertex above the freeze line whitens (the altitude snow line — the
 ## exact ClimateModel.surface_temperature < 0 predicate worldgen stamps caps with, gated

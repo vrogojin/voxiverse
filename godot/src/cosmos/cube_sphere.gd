@@ -696,6 +696,19 @@ const SHELL_TERMINATOR_TINT := false
 ## gate: src/tools/verify_body_lod.gd (G-BODY-LOD / G-LOD-CEILING / G-LOD-NOPOP).
 const FP_BODY_LOD := false
 
+## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3/§4/§5, the M2 stage). The Moon's own coarse far-ring:
+## when FP_BODY_LOD promotes the Moon IMPOSTOR→RING on approach (relief_px ≥ TAU_POP, d ≲ 120 k), CosmosSky
+## builds a body-parameterized far ring for the Moon body (MoonFarRing over FacetAtlas' moon fid range, K=14,
+## r_of=1737, moon_profile_at_dir + a moon regolith/maria/highlands palette) so the Moon shows REAL cratered
+## terrain instead of the flat impostor disc — airless (no atmosphere/clouds). The ring is placed to MATCH the
+## impostor exactly (same sky centre + angular radius, scaled about the camera), so the handover is sub-pixel BY
+## the law that triggers it (G-SSE-INV). Built WHOLE on promotion, FREED WHOLE on eviction (demote, d ≳ 150 k) —
+## nothing grows with time/approach count. HARD budget (§3/§5): ≤ 2.5 MB GPU + 0.94 MB CPU, inside the 32 MB
+## far-tier ceiling (N_RING_MAX=2). Requires MULTI_BODY (the Moon facets exist) + FP_BODY_LOD (the tier decision).
+## Default FALSE ⇒ BYTE-IDENTICAL (FLAT 6042/0): the MoonFarRing node is never created and the CosmosSky ring
+## block is never entered. Truth gate: src/tools/verify_moonring.gd (G-MOON-RING / -BUDGET / -NOPOP).
+const FP_MOON_RING := false
+
 ## COSMOS-LOD-SKY M1 — the D_SKY O3 revisit (docs/COSMOS-LOD-SKY-DESIGN.md §1/§11, cosmos_sky.gd:26). The sky
 ## impostor/star-dome placement radius CosmosSky.D_SKY = 8000 was sized for R = 3072 (2.6·R); after the rescale
 ## to R = 6371 it sits at only 1.26·R — too close to the planet — and its literal value no longer tracks the

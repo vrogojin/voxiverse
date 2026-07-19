@@ -67,6 +67,8 @@ var _moon_up := 0.0                 # clamp(moon_dir·up, 0, 1) — how high the
 var _moon_illum := 0.0              # ephemeris illuminated fraction (0 new … 1 full)
 var _moon_eclipse := 1.0            # lunar-eclipse factor (1 clear … 0 deep umbra)
 var _moon_light: DirectionalLight3D = null   # L1 v1 real second light (SKY_MOONSHINE_LIGHT); null unless built
+var _moon_ring: MoonFarRing = null           # M2 (FP_MOON_RING): the Moon's coarse far ring, built on RING promotion
+var _moon_ring_axis := Vector3.ZERO          # body-coords cull axis of the last ring build (drift-rebuild trigger)
 var _cur_sun_dir := Vector3(1.0, 0.0, 0.0)   # L3: last body-fixed Sun direction, exposed via current_sun_dir()
 const _MOON_ALBEDO_BASE := Color(0.72, 0.72, 0.70)   # shipped grey (see _build_nodes); umbra reddens toward crimson
 ## The active sky placement radius (blocks), resolved ONCE in _build_nodes: the derived R-safe value under
@@ -371,6 +373,19 @@ func _build_nodes() -> void:
 	_stars.sorting_offset = -1.0
 	add_child(_stars)
 
+	# --- COSMOS-LOD-SKY M2 (FP_MOON_RING): the Moon's coarse far ring. Created ONLY when the flag + MULTI_BODY
+	# are on (the Moon facets must exist in the atlas); built lazily on the IMPOSTOR→RING promotion and placed to
+	# match the impostor exactly (see _update_moon_ring). The tier decision comes from FP_BODY_LOD's per-frame
+	# consult. Flag off ⇒ this node never exists ⇒ byte-identical (the impostor path above is untouched).
+	if CubeSphere.FP_MOON_RING and CubeSphere.MULTI_BODY:
+		FacetAtlas.warm_up()                              # idempotent; ensures the Moon body rows exist
+		var mbi := FacetAtlas.body_index("moon")
+		if mbi >= 0:
+			_moon_ring = MoonFarRing.new()
+			_moon_ring.name = "MoonFarRing"
+			add_child(_moon_ring)
+			_moon_ring.setup(mbi)
+
 func _process(_delta: float) -> void:
 	if _clock == null:
 		return
@@ -435,6 +450,12 @@ func _update_sky(t: float) -> void:
 	# impostor writes above are unchanged. Fully inside the flag guard ⇒ byte-identical with the flag off.
 	if CubeSphere.FP_BODY_LOD:
 		_update_body_lod(t, cam_origin)
+
+	# COSMOS-LOD-SKY M2 (FP_MOON_RING): once the law latches the Moon at RING, build/show its real-terrain far
+	# ring and hide the impostor; on demote, evict the ring and restore the impostor. Placed to match the impostor
+	# exactly (same centre + angular radius) so the handover is sub-pixel. No-op unless the ring node exists.
+	if _moon_ring != null:
+		_update_moon_ring(cam_origin, moon_dir, moon_ang)
 
 ## Drive the Environment background/ambient from the Sun's elevation. Elevation = sun_dir · up, where
 ## up is the radial direction at the camera (planet centre = origin under the fixed frame). Night (sun
@@ -559,6 +580,42 @@ func _update_body_lod(t: float, _cam_origin: Vector3) -> void:
 		if next != prev:
 			print(BodyLod.transition_log(body, prev, next, d, BodyLod.relief_px(e, d, kpx)))
 			_lod_tier[body] = next
+
+## COSMOS-LOD-SKY M2 (FP_MOON_RING) — the per-frame Moon far-ring driver. Reads the tier the FP_BODY_LOD law
+## latched for the Moon (_lod_tier); at RING it builds (once, or on axis drift) + shows the real cratered ring
+## and hides the impostor; below RING it evicts the whole ring and restores the impostor. The ring is placed to
+## MATCH the impostor exactly — the same sky centre (cam + moon_dir·D_SKY) and angular radius (D_SKY·tan(ang/2)),
+## via a uniform scale about the body centre — so its silhouette equals the impostor's sphere to sub-pixel and
+## the handover is seamless (SEAMLESS-SCALES / G-SSE-INV). NEVER-OOM: built whole, freed whole on demote.
+## Rebuild threshold: the visible Moon hemisphere turns as the Earth-relative direction drifts; rebuild the emit
+## set past a few degrees (caches persist, bounded by the body's facet count — within the §3 CPU budget).
+const MOON_RING_REBUILD_DEG := 4.0
+func _update_moon_ring(cam_origin: Vector3, moon_dir: Vector3, moon_ang: float) -> void:
+	var tier := int(_lod_tier.get("moon", BodyLod.POINT))
+	if tier < BodyLod.RING:
+		if _moon_ring.is_built():
+			_moon_ring.evict()
+		_moon.visible = true
+		return
+	# RING: the cull axis is the direction from the Moon centre toward the camera, in the Moon's ABSOLUTE body
+	# frame. The ring mesh is placed unrotated (identity orientation ⇒ body axes == render axes) with the Moon
+	# centred at cam + moon_dir·D_SKY, so the camera lies along −moon_dir from that centre.
+	var axis := (-moon_dir).normalized()
+	if not _moon_ring.is_built() or _moon_ring_axis.angle_to(axis) > deg_to_rad(MOON_RING_REBUILD_DEG):
+		_moon_ring.build([axis.x, axis.y, axis.z])
+		_moon_ring_axis = axis
+	# Place to match the impostor: centre + uniform scale sizing the Moon datum (R_moon) to the impostor's
+	# angular radius at D_SKY. Relief (craters) scales with it, so it is sub-pixel at the RING threshold and grows
+	# on approach exactly as the impostor's disc does — the "detail grows as you get closer" payoff.
+	var sky_radius := maxf(_dsky * tan(moon_ang * 0.5), 0.001)
+	var scale := sky_radius / EPH.radius_of("moon")
+	var center := cam_origin + moon_dir * _dsky
+	_moon_ring.place(Transform3D(Basis.IDENTITY.scaled(Vector3(scale, scale, scale)), center))
+	_moon.visible = false                            # make-before-break: the ring is committed above, now hide the disc
+
+## Gate/telemetry access to the live Moon ring (null unless FP_MOON_RING + MULTI_BODY built it).
+func moon_ring() -> MoonFarRing:
+	return _moon_ring
 
 ## Device-px viewport height for the K_px consult, read defensively (this runs only under FP_BODY_LOD, never
 ## in the headless sky gate). Falls back to a 1080p nominal when no viewport is available.

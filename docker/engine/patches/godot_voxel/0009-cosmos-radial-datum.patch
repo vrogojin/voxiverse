@@ -1,0 +1,123 @@
+COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2) — the FP_RADIAL_DATUM C++ mirror.
+
+Applies AFTER 0008 (glob order), on the fully-patched VoxelGeneratorCosmos. Adds the per-column
+datum shift S = round(solve |p0 + s*n_hat| = R), mirroring FacetAtlas.datum_shift EXACTLY from the
+already-frozen facet_frame/off/r (zero new frozen data): resolve each cell at true y - S in
+generate_block, +S headroom on both all-air bounds, and g + S skin heights in sample_columns.
+Gated by the `radial_datum` config bool (plumbed from module_world + facet_skin_tier); returns 0
+when off => byte-identical to the pre-FS2 engine. Kept as a standalone patch (not inline edits to
+0007/0008) so the hunk offsets are git-generated and cannot drift against the earlier patches.
+
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index aff1f00..be01784 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -90,6 +90,7 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 
+ 	p.faceted = bool(config.get("faceted", false));
+ 	p.m5c_corner = bool(config.get("m5c_corner", false));
++	p.radial_datum = bool(config.get("radial_datum", false)); // COSMOS FS2 §3.2
+ 
+ 	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
+ 	p.facet_off = get_i32_param(config, "facet_off");
+@@ -273,6 +274,28 @@ void VoxelGeneratorCosmos::cell_dir(
+ 	out_z = dz / l;
+ }
+ 
++// COSMOS FS2 (§3.2): the per-column datum shift S. EXACT mirror of FacetAtlas.datum_shift -- p0 is the
++// column base point on the facet plane (cell centre x+0.5, z+0.5, y=0), b = p0.n_hat (the plane offset),
++// and s solves |p0 + s*n_hat| = R for s >= 0. round() matches GDScript's round-half-away-from-zero.
++int VoxelGeneratorCosmos::datum_shift(const Parameters &p, int fid, int x, int z) {
++	if (!p.radial_datum) {
++		return 0;
++	}
++	const int f = fid * 12;
++	const double fx = double(x) + 0.5 - double(p.facet_off[fid * 2]);
++	const double fz = double(z) + 0.5 - double(p.facet_off[fid * 2 + 1]);
++	const double p0x = p.facet_frame[f + 0] + fx * p.facet_frame[f + 3] + fz * p.facet_frame[f + 9];
++	const double p0y = p.facet_frame[f + 1] + fx * p.facet_frame[f + 4] + fz * p.facet_frame[f + 10];
++	const double p0z = p.facet_frame[f + 2] + fx * p.facet_frame[f + 5] + fz * p.facet_frame[f + 11];
++	const double b = p0x * p.facet_frame[f + 6] + p0y * p.facet_frame[f + 7] + p0z * p.facet_frame[f + 8];
++	const double r = p.facet_r_blocks;
++	double disc = b * b + r * r - (p0x * p0x + p0y * p0y + p0z * p0z);
++	if (disc < 0.0) {
++		disc = 0.0;
++	}
++	return int(Math::round(-b + Math::sqrt(disc)));
++}
++
+ // Port of TerrainConfig._mountain_factor (2D, flat world).
+ double VoxelGeneratorCosmos::mountain_factor(const Parameters &p, double c, double fx, double fz) {
+ 	const double m = cosmos::smoothstep(
+@@ -1634,7 +1657,7 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 	const int fid = p.gen_facet;
+ 
+ 	// Cheap constant all-air early-outs (no noise).
+-	if (oy > MAX_SURFACE_Y + max_above && oy > sea) {
++	if (oy > MAX_SURFACE_Y + max_above + ((p.radial_datum && fid >= 0) ? 8 : 0) && oy > sea) { // COSMOS FS2 §3.2: +S headroom
+ 		return result;
+ 	}
+ 	if (oy + size.y <= WORLD_BOTTOM_Y) {
+@@ -1660,7 +1683,7 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 	}
+ 
+ 	// Whole-block all-air (profiled).
+-	int top = max_h + max_above;
++	int top = max_h + max_above + ((p.radial_datum && fid >= 0) ? 8 : 0); // COSMOS FS2 §3.2: +S headroom (DATUM_SHIFT_MAX)
+ 	if (sea > top) {
+ 		top = sea;
+ 	}
+@@ -1676,9 +1699,13 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 			const int wz = oz + z;
+ 			const int g = int(pr.x);
+ 			const int srun = slope_run_core(p, fid, wx, wz, g);
++			// COSMOS FS2 (§3.2): this column's datum shift. resolve_cell runs in TRUE-height space at wy - S,
++			// so the cell at lattice wy renders worldgen's true wy - S (the column raised by S). junction_modify
++			// stays at LATTICE wy -- its near-vertical ridge planes are height-independent (mask unchanged by S).
++			const int col_ds = datum_shift(p, fid, wx, wz);
+ 			for (int y = 0; y < size.y; ++y) {
+ 				const int wy = oy + y;
+-				int64_t v = resolve_cell_core(p, fid, wx, wy, wz, pr, srun);
++				int64_t v = resolve_cell_core(p, fid, wx, wy - col_ds, wz, pr, srun);
+ 				if (fid >= 0) {
+ 					v = junction_modify(p, fid, wx, wy, wz, v);
+ 				}
+@@ -1810,8 +1837,10 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
+ 		const int g = int(pr.x);
+ 		const int biome = int(pr.y);
+ 		const double t = double(pr.w);
+-		const bool w = g < cosmos::SEA_LEVEL;
+-		hw[i] = float(g);
++		const bool w = g < cosmos::SEA_LEVEL;   // water is a TRUE-space property (unshifted g)
++		// COSMOS FS2 (§3.2): the skin lands on the datum-shifted surface g + S (mirrors gd_sample), so it
++		// agrees with the near voxels and the radial far shell. datum_shift returns 0 unless radial_datum.
++		hw[i] = float(g + datum_shift(_params, fid, x, z));
+ 		bw[i] = biome;
+ 		ww[i] = w ? 1 : 0;
+ 		cw[i] = far_color(_params, g, biome, t, w);
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index 7aa3e67..3543b60 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -194,6 +194,10 @@ private:
+ 	// traps. Named after the TerrainConfig / TreeGen statics they port, so a reader can diff them
+ 	// against the GDScript side by side -- which is the only way this stays byte-equal over time.
+ 	static void cell_dir(const Parameters &p, int fid, int x, int z, double &out_x, double &out_y, double &out_z);
++	// COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): the per-column datum shift S = round(solve
++	// |p0 + s*n_hat| = R). Mirrors FacetAtlas.datum_shift EXACTLY (same frozen frame + R). Returns 0
++	// unless p.radial_datum.
++	static int datum_shift(const Parameters &p, int fid, int x, int z);
+ 	static double mountain_factor(const Parameters &p, double c, double fx, double fz);
+ 	static double mountain_factor3(const Parameters &p, double c, double px, double py, double pz);
+ 	static int height_c(const Parameters &p, double c, double fx, double fz);
+@@ -322,6 +326,10 @@ private:
+ 		// here, because a `const` there is a runtime value to us.
+ 		bool faceted = false;
+ 		bool m5c_corner = false;
++		// COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): the per-column datum re-index. When true, a
++		// faceted cell at lattice y resolves worldgen at true y - datum_shift(fid,x,z) (the whole column
++		// raised by S so the placed surface is radial). Mirrors CubeSphere.FP_RADIAL_DATUM; false => byte-equal.
++		bool radial_datum = false;
+ 
+ 		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
+ 		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is

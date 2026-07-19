@@ -182,10 +182,8 @@ index 0d461a9..aff1f00 100644
 +		const int g = int(pr.x);
 +		const int biome = int(pr.y);
 +		const double t = double(pr.w);
-+		const bool w = g < cosmos::SEA_LEVEL;   // water is a TRUE-space property (unshifted g)
-+		// COSMOS FS2 (§3.2): the skin lands on the datum-shifted surface g + S (mirrors gd_sample), so it
-+		// agrees with the near voxels and the radial far shell. datum_shift returns 0 unless radial_datum.
-+		hw[i] = float(g + datum_shift(_params, fid, x, z));
++		const bool w = g < cosmos::SEA_LEVEL;
++		hw[i] = float(g);
 +		bw[i] = biome;
 +		ww[i] = w ? 1 : 0;
 +		cw[i] = far_color(_params, g, biome, t, w);

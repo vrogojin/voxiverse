@@ -90,6 +90,8 @@ const SOIL_GAIN := 0.02               ## soil wetting per unit of rain (land)
 const SOIL_DRY := 0.001               ## soil drainage/drying per sweep
 const INST_QW := 0.6                  ## humidity weight in the CAPE proxy
 const INST_REF := 6.0                 ## instability reference the surplus is measured above
+const INST_STORM_THRESH := 8.0        ## instability above this (with cloud water) flags a cell CONVECTIVE (W4)
+const CONV_CW_MIN := 1.0              ## minimum cloud water for a convective flag (needs moisture to storm)
 const T_CLAMP := 60.0                 ## |T anomaly| ceiling
 const LAT_BANDS := 12                 ## zonal-mean bins for the pressure reference
 
@@ -420,7 +422,7 @@ func _update_cell(idx: int, read: PackedFloat32Array, write: PackedFloat32Array)
 
 	# --- (5) instability (CAPE proxy) — a hot + wet surface under the lapse-cooled aloft level;
 	# T (warm anomaly) plus the moisture surplus, measured above a reference. Flags W4 convection.
-	var inst := maxf(0.0, T + INST_QW * q - INST_REF)
+	var inst := instability_of(T, q)
 
 	# --- write, all fields hard-clamped (bounded by construction) --------------------------
 	write[b + F_T] = clampf(T, -T_CLAMP, T_CLAMP)
@@ -580,6 +582,31 @@ func cloud_water_at_dir(d: Vector3) -> float:
 
 func instability_at_dir(d: Vector3) -> float:
 	return field_at_dir(d, F_INST)
+
+## The CAPE-proxy instability of a (temperature anomaly, humidity) pair — the ONE formula the sweep and
+## the W4 storm gate share, so "convective" is exactly the same emergent quantity everywhere.
+func instability_of(t_anom: float, q: float) -> float:
+	return maxf(0.0, t_anom + INST_QW * q - INST_REF)
+
+## CLIMATE W4 (§4.4 / §5): is this cell CONVECTIVE — instability over threshold AND cloud water present?
+## Emergent from the state (hot + wet organizes), never scripted (G-W4-EMERGE).
+func is_convective_cell(cell: int) -> bool:
+	var b := cell * FIELDS
+	var buf := _read_buf()
+	return buf[b + F_INST] > INST_STORM_THRESH and buf[b + F_CW] > CONV_CW_MIN
+
+func is_convective_at_dir(d: Vector3) -> bool:
+	if not _ready:
+		return false
+	return is_convective_cell(cell_of_dir(d))
+
+## Count of convective cells over the grid — G-W4-EMERGE asserts storms emerge (>0) but stay bounded (<N).
+func convective_count() -> int:
+	var n := 0
+	for idx in range(N_CELLS):
+		if is_convective_cell(idx):
+			n += 1
+	return n
 
 func pressure_anomaly_at_dir(d: Vector3) -> float:
 	return field_at_dir(d, F_P)

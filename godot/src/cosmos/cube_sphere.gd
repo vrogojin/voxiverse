@@ -673,6 +673,16 @@ const FP_CLOUDS := false
 ## FEEL/fog mood is LIVE-ONLY.
 const FP_PRECIP := false
 
+## COSMOS CLIMATE W4 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4.4/§5 / §7) — THUNDERSTORMS from the grid's
+## CAPE-proxy instability field. Convective cells (instability over threshold + cloud water) become
+## towering cumulonimbus in CloudLayers (dark, up to 256, capped ≤64 towers/rebuild — bounded extra
+## height, no extra draws), flash lightning (ONE reused omni flash, energy writes only) and drop hail
+## (WeatherFX kind swap) in WeatherFX. Emergent from state, NEVER scripted per-phenomenon (G-W4-EMERGE).
+## The behaviours live INSIDE the W2 (CloudLayers) / W3 (WeatherFX) nodes, gated on this flag — so it needs
+## FP_CLOUDS + FP_PRECIP. Default FALSE ⇒ those nodes behave exactly as W2/W3 ⇒ byte-identical. Storm
+## drama (flash timing, tower look) is LIVE-ONLY.
+const FP_STORMS := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

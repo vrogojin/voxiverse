@@ -21,6 +21,9 @@ const TILE_BLOCKS := 32                 ## one cloud tile edge (blocks)
 const LATTICE := 64                     ## tiles per side → a 2048-block cloud dome around the camera
 const REBUILD_INTERVAL := 16            ## frames between a layer's rebuilds (round-robin, §4.2)
 const CAP_VERTS := 24576                ## HARD per-layer vertex cap (§8 row 4) — emission stops here
+const STORM_TILE_CAP := 64              ## W4: max cumulonimbus towers per rebuild (§4.2 — bounded extra verts)
+const STORM_TOP := 256.0                ## W4: cumulonimbus tower top (< L1); anvil forms near here
+const STORM_TINT := Color(0.45, 0.47, 0.54)  ## dark storm-cloud vertex colour
 
 # --- altitude bands (blocks; all below ATMO_TOP = 384) + type params (§4.2) ----
 const ALT := [144.0, 216.0, 310.0]      ## L0 cumulus, L1 stratus, L2 cirrus base heights
@@ -43,6 +46,8 @@ var _frame := 0
 var _cursor := 0                        ## next layer to rebuild (round-robin)
 var _emitted := [0, 0, 0]               ## last emitted vertex count per layer (gate/telemetry)
 var _test_force := -1.0                 ## gate hook: ≥0 overrides cloud_cover with this value
+var _test_storm := false                ## gate hook: force every L0 run convective (storm-cap test)
+var _storm_count := 0                   ## cumulonimbus towers emitted this rebuild (≤ STORM_TILE_CAP)
 
 func setup(env: PerVoxelEnvironment, cam_provider: Node = null) -> void:
 	_env = env
@@ -97,6 +102,7 @@ func rebuild_layer(layer: int) -> void:
 	var thick := float(THICK[layer])
 	var bump := float(BUMP[layer])
 	var tint: Color = TINT[layer]
+	_storm_count = 0
 	for tz in range(LATTICE):
 		if n >= CAP_VERTS:
 			break
@@ -117,7 +123,13 @@ func rebuild_layer(layer: int) -> void:
 			elif not present and run_start >= 0:
 				# close a run [run_start, tx) → one box, if it fits the cap.
 				if n + 30 <= CAP_VERTS:
-					n = _emit_box(n, ox + run_start, ox + tx, gz, alt, thick, bump, tint, layer)
+					# W4: a convective L0 run becomes a towering cumulonimbus (capped count) — darker + taller.
+					var storm := false
+					if (CubeSphere.FP_STORMS or _test_storm) and layer == 0 and _storm_count < STORM_TILE_CAP:
+						storm = _is_storm_run(ox + run_start, ox + tx, gz, alt)
+						if storm:
+							_storm_count += 1
+					n = _emit_box(n, ox + run_start, ox + tx, gz, alt, thick, bump, tint, layer, storm)
 				run_start = -1
 			tx += 1
 	_emitted[layer] = n
@@ -134,16 +146,28 @@ func _cover_at(wx: float, wz: float, layer: int) -> float:
 	var noise := _noise.get_noise_3d(wx * 0.004, wz * 0.004, float(layer) * 13.0)
 	return clampf(base * (1.0 + noise * 0.6), 0.0, 1.0)
 
+## True iff the L0 run [x0,x1) at row tz is convective (a thunderstorm column) — the emergent grid flag
+## (or the gate's forced-storm hook). Sampled at the run centre.
+func _is_storm_run(x0: int, x1: int, tz: int, alt: float) -> bool:
+	if _test_storm:
+		return true
+	if _env == null:
+		return false
+	var midx := (x0 + x1) / 2
+	return _env.is_convective(Vector3(float(midx * TILE_BLOCKS) + 16.0, alt, float(tz * TILE_BLOCKS) + 16.0))
+
 ## Emit one merged box spanning tile columns [x0, x1) at row tz, at the layer altitude. Non-indexed
-## triangles (top + 4 sides; the bottom is unseen from below the deck and skipped). Returns the new count.
-func _emit_box(n: int, x0: int, x1: int, tz: int, alt: float, thick: float, bump: float, tint: Color, layer: int) -> int:
+## triangles (top + 4 sides; the bottom is unseen from below the deck and skipped). A convective run
+## extrudes to a towering cumulonimbus (dark, up to STORM_TOP) — same mesh, bounded extra height, no extra
+## verts. Returns the new count.
+func _emit_box(n: int, x0: int, x1: int, tz: int, alt: float, thick: float, bump: float, tint: Color, layer: int, storm := false) -> int:
 	var wx0 := float(x0 * TILE_BLOCKS)
 	var wx1 := float(x1 * TILE_BLOCKS)
 	var wz0 := float(tz * TILE_BLOCKS)
 	var wz1 := float((tz + 1) * TILE_BLOCKS)
-	var h := _quantize_top(alt, thick, bump, x0, tz, layer)
+	var h := STORM_TOP if storm else _quantize_top(alt, thick, bump, x0, tz, layer)
 	var b := alt
-	var c := tint
+	var c := STORM_TINT if storm else tint
 	# top quad (two tris)
 	n = _quad(n, Vector3(wx0, h, wz0), Vector3(wx1, h, wz0), Vector3(wx1, h, wz1), Vector3(wx0, h, wz1), c)
 	# four sides (darker underside tint for depth)
@@ -197,6 +221,12 @@ func debug_set_camera(pos: Vector3) -> void:
 
 func debug_force_cover(v: float) -> void:
 	_test_force = v
+
+func debug_force_storm(on: bool) -> void:
+	_test_storm = on
+
+func storm_tower_count() -> int:
+	return _storm_count
 
 func rebuild_all_now() -> void:
 	for l in range(LAYERS):

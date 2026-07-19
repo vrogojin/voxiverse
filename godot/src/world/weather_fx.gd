@@ -23,6 +23,10 @@ var _rain_mat: ParticleProcessMaterial
 var _snow_mat: ParticleProcessMaterial
 var _base_fog := 0.0
 var _kind := "none"
+# W4: ONE reused flash light for lightning + a fade timer (bounded, property/energy writes only).
+var _flash: OmniLight3D = null
+var _flash_energy := 0.0
+var _flash_cooldown := 0.0
 
 func setup(env: PerVoxelEnvironment, environment: Environment, cam_provider: Node = null) -> void:
 	_env = env
@@ -44,6 +48,14 @@ func setup(env: PerVoxelEnvironment, environment: Environment, cam_provider: Nod
 	_particles.emitting = false
 	_particles.amount_ratio = 0.0
 	add_child(_particles)
+	# W4 lightning: one reused omni flash (off until a storm fires); zero cost otherwise.
+	_flash = OmniLight3D.new()
+	_flash.name = "LightningFlash"
+	_flash.omni_range = 2048.0
+	_flash.light_energy = 0.0
+	_flash.light_color = Color(0.85, 0.9, 1.0)
+	_flash.shadow_enabled = false
+	add_child(_flash)
 
 func _make_process(gravity: Vector3, spread: float, _col: Color) -> ParticleProcessMaterial:
 	var m := ParticleProcessMaterial.new()
@@ -68,7 +80,7 @@ func _make_particle_mesh(col: Color) -> QuadMesh:
 	q.material = mat
 	return q
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if _particles == null:
 		return
 	var cam := _cam_origin()
@@ -77,8 +89,27 @@ func _process(_delta: float) -> void:
 	var precip := _env.precipitation(cam) if _env != null else {"rate": 0.0, "kind": "none"}
 	var rate := float(precip.get("rate", 0.0))
 	var kind := String(precip.get("kind", "none"))
+	# W4: a convective column upgrades falling rain to HAIL and can flash lightning.
+	var storm := CubeSphere.FP_STORMS and _env != null and _env.is_convective(cam)
+	if storm and rate > 0.0 and kind == "rain":
+		kind = "hail"
 	_apply(rate, kind)
 	_drive_fog(cam)
+	_drive_lightning(delta, storm)
+
+## Lightning: while a storm is overhead, fire a brief flash on a cooldown and fade it out. A single
+## reused OmniLight (energy writes only) — bounded, no per-frame allocation. Distance-delayed thunder
+## audio is an optional live-only add (no bundled asset).
+func _drive_lightning(delta: float, storm: bool) -> void:
+	if _flash == null:
+		return
+	_flash.global_transform = Transform3D(Basis.IDENTITY, _cam_origin() + Vector3(0.0, SPAWN_H, 0.0))
+	_flash_cooldown -= delta
+	if storm and _flash_cooldown <= 0.0:
+		_flash_energy = 4.0                          # strike
+		_flash_cooldown = randf_range(1.5, 5.0)
+	_flash_energy = maxf(0.0, _flash_energy - delta * 12.0)   # fast decay (a 2-frame-ish pulse)
+	_flash.light_energy = _flash_energy
 
 func _apply(rate: float, kind: String) -> void:
 	if rate <= 0.0:

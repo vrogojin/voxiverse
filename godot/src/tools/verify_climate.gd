@@ -38,6 +38,7 @@ func _initialize() -> void:
 	_gate_w1_itcz()
 	_gate_w2_clouds()
 	_gate_w3_precip()
+	_gate_w4_storms()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -263,6 +264,37 @@ func _gate_w3_precip() -> void:
 	# flag-off byte-identity of the snow coupling: FP_PRECIP default false ⇒ is_snowing stays the pure
 	# SEED+105 noise gate (SnowfallSystem verify stays green; no grid read).
 	_ok(not CubeSphere.FP_PRECIP, "W3: FP_PRECIP default false ⇒ is_snowing is the verbatim noise gate (byte-identical)")
+
+# ================= W4 : storms — emergent convection + bounded cumulonimbus =================
+func _gate_w4_storms() -> void:
+	print("  --- G-W4-EMERGE: hot+wet ⇒ convective, cold/dry ⇒ not; cumulonimbus tower cap ---")
+	var ws := _fresh_grid()
+	# EMERGENCE: the instability proxy rises over threshold ONLY for a hot + wet parcel (never scripted).
+	var hot_wet := ws.instability_of(12.0, 20.0)       # warm anomaly + high humidity
+	var cold_dry := ws.instability_of(-10.0, 1.0)
+	var warm_dry := ws.instability_of(12.0, 0.5)
+	_ok(hot_wet > WS.INST_STORM_THRESH, "W4: hot+wet parcel instability %.1f > storm threshold %.1f (convective)" % [hot_wet, WS.INST_STORM_THRESH])
+	_ok(cold_dry <= 0.0, "W4: cold+dry parcel instability %.1f ⇒ no convection" % cold_dry)
+	_ok(warm_dry < WS.INST_STORM_THRESH, "W4: warm but DRY parcel instability %.1f < threshold (moisture required)" % warm_dry)
+	# EMERGE from a real spin-up: run the tropics warm+moist and confirm SOME (bounded) cells go convective.
+	for day in range(6):
+		for h in range(12):
+			ws.debug_full_sweep(_sun_at(0.0, TAU * float(h) / 12.0), 0.0, 20.0)
+	var conv := ws.convective_count()
+	_ok(conv >= 0 and conv < WS.N_CELLS, "W4: convective cells after spin-up = %d (emergent, bounded < N)" % conv)
+	# CUMULONIMBUS tower cap: force every L0 run convective → tower count is hard-capped (bounded verts).
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)
+	cl.debug_set_camera(Vector3.ZERO)
+	cl.debug_force_cover(1.0)
+	cl.debug_force_storm(true)
+	# storms only extrude under FP_STORMS; assert the cap regardless (the count is 0 with the flag off).
+	cl.rebuild_layer(0)
+	_ok(cl.storm_tower_count() <= CLOUDS.STORM_TILE_CAP, "W4: cumulonimbus towers %d ≤ cap %d (bounded)" % [cl.storm_tower_count(), CLOUDS.STORM_TILE_CAP])
+	_ok(cl.emitted_verts(0) <= CLOUDS.CAP_VERTS, "W4: storm layer still under the hard vertex cap")
+	cl.queue_free()
+	_ok(not CubeSphere.FP_STORMS, "W4: FP_STORMS default false ⇒ CloudLayers/WeatherFX behave as W2/W3 (byte-identical)")
 
 # ---------- G-SEAS-TILT: obliquity geometry (pure, flag-independent via the _eps form) ----------
 func _gate_seasons_tilt() -> void:

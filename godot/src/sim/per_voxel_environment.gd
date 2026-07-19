@@ -251,6 +251,19 @@ func cloud_cover(pos: Vector3, _layer: int = 0) -> float:
 		return 0.0
 	return clampf(_weather.cloud_water_at_dir(_dir_of_pos(pos)) / WeatherSystem.CW_MAX, 0.0, 1.0)
 
+## CLIMATE W4 (§4.4): is the column of `pos` CONVECTIVE (thunderstorm potential)? Emergent from the grid
+## instability field; false without the grid. Consumed by the cumulonimbus extrusion and lightning/hail FX.
+func is_convective(pos: Vector3) -> bool:
+	if _weather == null or not _weather.is_ready():
+		return false
+	return _weather.is_convective_at_dir(_dir_of_pos(pos))
+
+## CLIMATE W4: the raw instability index at `pos` (storm intensity readout). 0 without the grid.
+func instability(pos: Vector3) -> float:
+	if _weather == null or not _weather.is_ready():
+		return 0.0
+	return _weather.instability_at_dir(_dir_of_pos(pos))
+
 ## Electric current density (stub: none).
 func electric_current(_pos: Vector3) -> float:
 	return 0.0

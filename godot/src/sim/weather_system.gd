@@ -121,6 +121,12 @@ var _delta_lat := 0.0                 ## subsolar latitude (rad), frozen for the
 var _dt_game := DT_GAME_DEFAULT       ## game-seconds elapsed this sweep
 var _last_sweep_time := 0.0           ## game-time at the last sweep start
 var _sweep_time_valid := false
+# FP_WEATHER_THREAD safety-gate hook (OFF on the live path; only G-WTHREAD-SAFE sets it). When ≥0 the
+# threaded worker_sweep IGNORES the physics and fills the ENTIRE back buffer with this monotonically-rising
+# sentinel value, cell by cell. A fully-published front buffer is then uniform; a torn read of a mid-write
+# buffer would show mixed sentinels — so the gate detects any front/back leak by a pure value check with no
+# racy control-scalar reads. -1 ⇒ real physics (the live behaviour); never touched off the gate.
+var _safety_fill := -1.0
 
 # --- init slicing (§1.7) -------------------------------------------------------
 var _init_cell := 0                   ## next basis cell to build
@@ -296,6 +302,69 @@ func _finish_sweep() -> void:
 	_cursor = 0
 	_sweep_index += 1
 	_read_is_a = not _read_is_a          # the buffer we just wrote becomes the read buffer
+
+# ---------------------------------------------------------------------------------------
+# THREADED PATH (FP_WEATHER_THREAD, docs/COSMOS-CLIMATE-BIOMES-DESIGN.md — worker offload). These split the
+# main-thread `step_slice` into (a) `worker_sweep`, run on the DEDICATED weather thread by EnvSimWorker,
+# which computes ONE complete sweep into the BACK buffer, and (b) `commit_swap`, run on the MAIN thread at
+# the single sync point, which PUBLISHES that sweep by flipping the read pointer. The split is the whole
+# reason it is race-free: the worker only ever WRITES the buffer the main thread is NOT reading (the back),
+# and the front pointer is mutated only by `commit_swap`, only while the worker is quiesced between sweeps.
+#
+# DETERMINISM: `worker_sweep` derives its forcing purely from `game_time` (the sun/δ via the ephemeris, and
+# dt_game = game_time − last as SIM-TIME), so it is a pure function of (state, SEED, game_time) exactly like
+# the sliced main-thread sweep — no wall-clock reads. Threading only changes WHICH game_time each sweep sees
+# (cadence), never the per-cell math (it calls the identical `_update_cell`). G-WTHREAD-EVOLVE drives this
+# on the real thread in lockstep and gets a byte-exact hash match against the same drive run synchronously.
+# ---------------------------------------------------------------------------------------
+
+## WORKER THREAD: compute one COMPLETE sweep into the BACK buffer (the one the main thread is not reading),
+## leaving the FRONT (read) buffer untouched. Does NOT publish — `commit_swap` (main thread) does the flip.
+func worker_sweep(game_time: float) -> void:
+	if not _ready:
+		return
+	_cursor = 0
+	_begin_sweep(game_time)
+	var write := _buf_b if _read_is_a else _buf_a    # BACK: exclusive to the worker this sweep
+	if _safety_fill >= 0.0:
+		# G-WTHREAD-SAFE only: fill the whole back buffer with one rising sentinel (bypasses physics).
+		_safety_fill += 1.0
+		var v := _safety_fill
+		for k in range(write.size()):
+			write[k] = v
+		_cursor = 0
+		return
+	var read := _buf_a if _read_is_a else _buf_b     # FRONT: read-only source (shared with the main thread)
+	for idx in range(N_CELLS):
+		_update_cell(idx, read, write)
+	_cursor = 0
+
+## MAIN THREAD, at the single synchronisation point (the worker is blocked between sweeps): PUBLISH the sweep
+## the worker just wrote by flipping the read pointer, so the freshly-written back buffer becomes the front.
+func commit_swap() -> void:
+	_read_is_a = not _read_is_a
+	_sweep_index += 1
+
+## G-WTHREAD-SAFE hook: enter/leave the uniform-sentinel fill mode (see `_safety_fill`). Gate-only. On entry
+## BOTH buffers are set uniform (0.0) so the front is a consistent sentinel from the very first read (the
+## seeded physics state is not uniform, which would otherwise read as a false "torn" before the first swap).
+func debug_set_safety_fill(on: bool) -> void:
+	_safety_fill = 0.0 if on else -1.0
+	if on:
+		_buf_a.fill(0.0)
+		_buf_b.fill(0.0)
+
+## G-WTHREAD-SAFE hook: is the whole FRONT buffer a single value (a consistent, non-torn published sweep)?
+## Returns the sentinel value if uniform, or -1.0 if any slot disagrees (a torn read ⇒ a front/back leak).
+func debug_front_uniform_value() -> float:
+	var buf := _read_buf()
+	if buf.size() == 0:
+		return -1.0
+	var v := buf[0]
+	for k in range(buf.size()):
+		if buf[k] != v:
+			return -1.0
+	return v
 
 # ---------------------------------------------------------------------------------------
 # One cell update — reads neighbours from `read`, writes the 8 fields to `write`. All arithmetic on

@@ -772,6 +772,20 @@ const FP_PRECIP := false
 ## drama (flash timing, tower look) is LIVE-ONLY.
 const FP_STORMS := false
 
+## COSMOS CLIMATE — WEATHER ON A WORKER THREAD (live pilot request: "use a separate dedicated thread for the
+## weather simulation, and later for all other environmental simulations, to offload the main game cycle").
+## When true AND FP_CLIMATE_GRID is on, WorldManager runs the WeatherSystem sweep on a DEDICATED worker thread
+## (EnvSimWorker) instead of slicing it on the main loop: the worker advances the grid into the BACK buffer,
+## the main thread only does a pointer-flip SWAP of the already-existing double buffer at one sync point and
+## READS the front buffer — so the per-frame main-thread weather cost drops to ~0 (kills the walking hitch the
+## coarse per-frame sweep caused). The sweep advances by SIM-TIME so it stays frame-rate-independent and
+## deterministic given (SEED + game_time); the worker writes back / main reads front / the swap is the only
+## sync (no data race — G-WTHREAD-SAFE). Composes with FP_CLIMATE_GRID (thread only matters when the grid is
+## on). Default FALSE ⇒ the shipped main-thread sliced sweep runs verbatim ⇒ BYTE-IDENTICAL (FLAT unchanged);
+## the class isn't even instantiated. NEVER-OOM: adds only the thread stack + a mutex/semaphore, no buffers
+## (the double buffer already exists). Gate verify_weather_thread G-WTHREAD-SAFE/EVOLVE/MAINCOST + teardown.
+const FP_WEATHER_THREAD := false
+
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
 ## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;

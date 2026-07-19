@@ -55,8 +55,66 @@ func _initialize() -> void:
 	_gate_cont()
 	_gate_geo()
 	_gate_nospiral()
+	_gate_reentry_guards()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# ------------------------------------------------------------------ G-NAV-REENTRY (2026-07-19 blowup fixes)
+## The re-entry classifier bands at the natural Earth/1000 scale, plus the two guard kernels added for the
+## live de-orbit blowup (position teleport → 642074 b/s finite-difference latch → escape + 27 s frames):
+## sane_v (G-NAV-SANEV) and clamp_bci_state (G-NAV-SOICLAMP). All pure statics.
+func _gate_reentry_guards() -> void:
+	print("  --- G-NAV-REENTRY: atmosphere-band classification at Earth/1000 + velocity/state guards ---")
+	var r_vox := GRAV.r_vox("earth")
+	# A de-orbit descent state just ABOVE the atmosphere (h=392, 82 b/s radial fall — the live telemetry):
+	# raw AND low_orbit-incumbent both classify LOW_ORBIT (h > 384; > 352 with the incumbent's −32 margin).
+	var p_hi := DV.v(0.0, 0.0, r_vox + 392.0)
+	var v_fall := DV.v(0.0, 0.0, -82.0)
+	_ok(NAV.classify("earth", p_hi, v_fall, 0.0) == NAV.LOW_ORBIT, "h=392 (raw): LOW_ORBIT (above the 384 band)")
+	_ok(NAV.classify("earth", p_hi, v_fall, 0.0, NAV.LOW_ORBIT) == NAV.LOW_ORBIT, "h=392 (incumbent LOW): LOW_ORBIT (hysteresis keeps it above 352)")
+	# Just BELOW the band: raw at h=380 → PLANETARY; incumbent LOW_ORBIT flips only under 352 (the −32 margin).
+	_ok(NAV.classify("earth", DV.v(0.0, 0.0, r_vox + 380.0), v_fall, 0.0) == NAV.PLANETARY, "h=380 (raw): PLANETARY (inside the 384 band)")
+	_ok(NAV.classify("earth", DV.v(0.0, 0.0, r_vox + 360.0), v_fall, 0.0, NAV.LOW_ORBIT) == NAV.LOW_ORBIT, "h=360 (incumbent LOW): still LOW_ORBIT (hysteresis)")
+	_ok(NAV.classify("earth", DV.v(0.0, 0.0, r_vox + 344.0), v_fall, 0.0, NAV.LOW_ORBIT) == NAV.PLANETARY, "h=344 (incumbent LOW): PLANETARY (crossed 352 — the descent hands off)")
+	# The live blowup radius r≈17844 (alt 11473) is inside the 4R vicinity ⇒ LOW_ORBIT is the DESIGNED
+	# classification there — the live "stuck low_orbit" at that altitude was correct; the bug was upstream.
+	_ok(NAV.classify("earth", DV.v(0.0, 0.0, 17844.0), v_fall, 0.0, NAV.LOW_ORBIT) == NAV.LOW_ORBIT, "r=17844 (4R vicinity): LOW_ORBIT by design")
+
+	# G-NAV-SANEV — the finite-difference/adopted-velocity guard.
+	var good := DV.v(10.0, -80.0, 3.0)
+	var prev := DV.v(1.0, -60.0, 0.0)
+	var out := NAV.sane_v(good, prev)
+	_ok(out[0] == 10.0 and out[1] == -80.0 and out[2] == 3.0, "sane_v passes a physical velocity through unchanged")
+	var junk := DV.v(0.0, 642074.0, 0.0)                     # the live latch value — the teleport's Δp/dt
+	out = NAV.sane_v(junk, prev)
+	_ok(out[0] == prev[0] and out[1] == prev[1] and out[2] == prev[2], "sane_v rejects the 642074 b/s teleport artifact → last-good fallback (velocity-continuous)")
+	out = NAV.sane_v(junk, junk)
+	_ok(DV.length(out) == 0.0, "sane_v with no good fallback rests (never adopts garbage)")
+	out = NAV.sane_v(DV.v(NAN, 0.0, 0.0), prev)
+	_ok(out[1] == prev[1], "sane_v rejects NaN components")
+	_ok(NAV.v_is_sane(DV.v(0.0, NAV.FD_SPEED_MAX - 1.0, 0.0)), "v_is_sane admits speeds up to FD_SPEED_MAX (no legit flight clipped: 2x SN_DEV_V_MAX)")
+	_ok(not NAV.v_is_sane(PackedFloat64Array()), "v_is_sane rejects a malformed (empty) vector")
+
+	# G-NAV-SOICLAMP — the integrated-state guard.
+	var p0 := DV.v(0.0, 0.0, r_vox + 300.0)
+	var v0 := DV.v(250.0, 0.0, 0.0)
+	var soi := NAV.soi_radius("earth")
+	_ok(soi > 4.0 * r_vox and not is_inf(soi), "earth SOI is finite and far outside the vicinity (%.0f)" % soi)
+	# In-bounds state passes through bit-equal.
+	var st := NAV.clamp_bci_state(p0, v0, DV.v(0.0, 0.0, r_vox + 301.0), DV.v(249.0, 0.0, 0.0), soi)
+	_ok(st[0][2] == p0[2] and st[1][0] == v0[0], "clamp_bci_state passes an in-SOI finite state through unchanged")
+	# NaN reverts the WHOLE state to the pre-step pair.
+	st = NAV.clamp_bci_state(DV.v(NAN, 0.0, 0.0), v0, p0, v0, soi)
+	_ok(st[0][2] == p0[2] and st[1][0] == v0[0], "clamp_bci_state reverts a NaN integration to the pre-step state")
+	# Beyond-SOI clamps onto the SOI sphere and strips ONLY the outward radial velocity.
+	var p_far := DV.v(0.0, 0.0, soi * 2.0)
+	var v_out := DV.v(30.0, 0.0, 100.0)                      # 100 outward radial + 30 tangential
+	st = NAV.clamp_bci_state(p_far, v_out, p0, v0, soi)
+	_ok(absf(DV.length(st[0]) - soi) < 1.0e-6 * soi, "clamp_bci_state clamps a beyond-SOI radius onto the SOI sphere")
+	_ok(absf(float(st[1][0]) - 30.0) < 1.0e-9 and absf(float(st[1][2])) < 1.0e-9, "clamp: outward radial velocity stripped, tangential preserved (velocity-continuous)")
+	# Inward motion at the clamp is NOT stripped (a fall back toward the planet proceeds).
+	st = NAV.clamp_bci_state(p_far, DV.v(0.0, 0.0, -50.0), p0, v0, soi)
+	_ok(absf(float(st[1][2]) + 50.0) < 1.0e-9, "clamp keeps INWARD radial velocity (recovery fall proceeds)")
 
 # ---------- a BCI state at radius r on the equator (XY plane) with speed-ratio u tangential ----------
 # Tangential (prograde-east) velocity of magnitude u·v_circ(r). Pure setup helper for synthetic rows.

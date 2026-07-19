@@ -130,6 +130,17 @@ static func radius_of(body: String) -> float:
 static func parent_of(body: String) -> String:
 	return String(BODIES[body]["parent"])
 
+## The bodies whose parent is `body` (its satellites) — e.g. children_of("earth") == ["moon"],
+## children_of("sun") == ["earth"]. Used by the SOI dominant-body test (SPACE-NAV §5.2, O4c): a point
+## inside a child's sphere-of-influence is dominated by that child. Pure; the small BODIES dict is
+## scanned in registration order (deterministic). Leaf bodies (the Moon) return [].
+static func children_of(body: String) -> Array:
+	var out: Array = []
+	for name in BODIES:
+		if String(BODIES[name]["parent"]) == body:
+			out.append(name)
+	return out
+
 static func orbit_a(body: String) -> float:
 	return float(BODIES[body]["a"])
 

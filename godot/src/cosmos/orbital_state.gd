@@ -261,6 +261,22 @@ static func bci_to_helio(body: String, t: float, p_bci: PackedFloat64Array, v_bc
 static func helio_to_bci(body: String, t: float, p_hel: PackedFloat64Array, v_hel: PackedFloat64Array) -> Array:
 	return [DV.sub(p_hel, EPH.body_pos_helio(body, t)), DV.sub(v_hel, EPH.body_vel_helio(body, t))]
 
+## SOI dominant-body SWAP re-expression (O1O4 §3.5 point 1 / SPACE-NAV §5.2 SOI-swap row). Re-express a
+## body-centred-inertial [pos,vel] state from `from_body`'s BCI frame into `to_body`'s BCI frame at time t.
+## It routes through the shared heliocentric inertial frame (the ONE frame both bodies are pinned in):
+##   p_helio = p + from_pos_helio(t)  →  p' = p_helio − to_pos_helio(t)  ⇒  p' = p − (to_pos − from_pos)_helio.
+## Exact, pure, and — because the heliocentric frame is inertial and the map is a pure translation of BOTH
+## p and v by the same closed-form ephemeris vectors — it CONSERVES the physical state: the player's motion
+## through space is identical before and after; only the origin the integrator measures from changes. This is
+## the whole content of the SOI swap (the design's "p' = p − moon_pos(t); v' = v − moon_vel(t)" for the
+## Earth→Moon case, generalized to any pair). Returns [p_bci', v_bci']. Gate G-SOI-SWAP asserts the round-trip
+## and that heliocentric-expressed position+velocity are continuous (Δ == 0) across the swap.
+static func reexpress_soi(from_body: String, to_body: String, t: float, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array) -> Array:
+	if from_body == to_body:
+		return [PackedFloat64Array([p_bci[0], p_bci[1], p_bci[2]]), PackedFloat64Array([v_bci[0], v_bci[1], v_bci[2]])]
+	var hel := bci_to_helio(from_body, t, p_bci, v_bci)
+	return helio_to_bci(to_body, t, hel[0], hel[1])
+
 # ---------------------------------------------------------------------------------------
 # Off-surface render placement — anchor-follow (§2.8; SPACE-NAV R2, ADOPTED). The shipped integer
 # floating-origin anchor (world_manager `_anchor_offset`, REANCHOR_TRIGGER_BLOCKS = 8192) starts firing

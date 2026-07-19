@@ -968,6 +968,32 @@ const BODY_R := {
 ## gate + the future O4c SOI/landing wiring; the Moon soaks DARK (unreachable in-game) until then.
 const MULTI_BODY := false
 
+## COSMOS-ORBITAL-O1O4 §3.5 / SPACE-NAV SN6c (Part B, O4c) — the SOI-swap + walkable-Moon LANDING master toggle.
+## MULTI_BODY builds the Moon atlas DARK (unreachable); SOI_SWAP is what makes the Moon a REAL destination —
+## the dominant gravitational body switches Earth↔Moon at the sphere-of-influence boundary, the player's local
+## dynamics (spin frame, GM_dyn, feel-gravity, drag) re-express around whichever body owns the deepest SOI,
+## and walking/landing read that body's terrain. It is the ONE flag `player._dominant_body()` consults: OFF ⇒
+## `_dominant_body()` returns "earth" unconditionally, so EVERY generalized "earth"→_dominant_body() call site
+## resolves to the shipped literal and the walk/nav/coast paths are BYTE-IDENTICAL to Earth-only (the G-O4C-OFF
+## keystone). Requires MULTI_BODY (the Moon facets must exist) — asserted lazily by _dominant_body only ever
+## returning a body that FacetAtlas registered. Gates G-SOI-SWAP / G-MOON-LAND / G-MOON-WALK (verify_o4c).
+## LIVE-ONLY residue: actually flying a transfer to + landing on + walking the Moon (the coast-to-SOI integration
+## across 384 k blocks is a real fly, not headless-provable) — baked ON only after MULTI_BODY + a live round trip.
+const SOI_SWAP := false
+
+## SPACE-NAV §5.2 — the ±band on the SOI boundary for the dominant-body swap hysteresis (fractional). A craft on a
+## grazing trajectory must cross INTO a body's SOI below r_soi·(1−SOI_HYST) to be captured and back OUT above
+## r_soi·(1+SOI_HYST) to be released — so it cannot flap bodies at the boundary. 2 % per the design. Data.
+const SOI_HYST := 0.02
+
+## SPACE-NAV §8.3 / D-O4-5 — the re-entry pre-warm altitude (blocks) is PER-BODY: an ATMOSPHERE-LESS body has no
+## terminal-velocity drag cap, so a ballistic descent arrives 2–3× faster than Earth's braked re-entry and needs a
+## deeper pool pre-warm to keep streaming ahead of the lander (≥ 24 s at ~170 b/s). Airless ⇒ 4096; Earth (drag-
+## capped) keeps the shipped ORBIT_PREWARM_H. Pure per-body accessor. Earth is the ONLY atmosphere body
+## (mirrors OrbitalState.has_atmo — inlined here to keep this core file free of a cosmos-kernel preload cycle).
+static func orbit_prewarm_h(body: String) -> float:
+	return ORBIT_PREWARM_H if body == "earth" else 4096.0
+
 # ---------------------------------------------------------------------------------------
 # COSMOS M1 — the single, easily-flippable planet toggle (docs/COSMOS-PLANET-TOPOLOGY.md §9 M1,
 # §3.5, §3.4, §6.1). THIS is the whole safety net: when FLAT_WORLD is true (the default) the

@@ -102,6 +102,12 @@ static func body_of_fid(fid: int) -> int:
 			return bi
 	return maxi(_nbodies - 1, 0)
 
+## The NAME of `fid`'s body ("earth"/"moon") — the string the dynamics kernels (CosmosEphemeris /
+## CosmosGravity / CosmosNav / OrbitalState) key on. O4c's `_dominant_body()` reads this to resolve the
+## body the player is standing/landing on directly from the active facet (a Moon fid ⇒ "moon"). Pure.
+static func body_name_of_fid(fid: int) -> String:
+	return String(BODY_TABLE[body_of_fid(fid)]["name"])
+
 ## The faceting resolution k of `fid`'s body (Earth ⇒ K).
 static func k_of(fid: int) -> int:
 	return _body_k[body_of_fid(fid)]

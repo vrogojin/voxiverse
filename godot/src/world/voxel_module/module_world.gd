@@ -2970,7 +2970,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# entirely below the bedrock floor generates nothing, so it must not pay the ~column-profile
 	# pass at all. Uses only CONSTANTS (no noise). MAX_SURFACE_Y is a proven upper bound on
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
-	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
+	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3): the per-column datum re-index is active on this facet.
+	# The surface rises by up to DATUM_SHIFT_MAX, so the y-envelope bounds gain that headroom; and the bulk/colbulk/
+	# stamp optimisations (which assume the surface is at true g) are FORCED OFF so the plain per-cell path — the one
+	# the C++ generator mirrors — runs and resolves each cell at true y − S. _rd false ⇒ every branch below is the
+	# shipped code verbatim (byte-identical when FP_RADIAL_DATUM is off / non-faceted).
+	var _rd := CubeSphere.FP_RADIAL_DATUM and gen_facet >= 0
+	var _ds_head := FacetAtlas.DATUM_SHIFT_MAX if _rd else 0
+	if oy > TerrainConfig.MAX_SURFACE_Y + max_above + _ds_head and oy > sea:
 		_gen_acc(0, _t0)                                  # T1 class 0: constant air early-out
 		return
 	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
@@ -3061,7 +3068,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# wrongly filled — a straddling/edge block falls back to per-cell. Flag OFF → this is skipped entirely → the
 	# generator is byte-identical per-cell (FLAT 6035/0; G-M2-ID compares two module generators that share the
 	# const flag, so both bulk-fill identically → still equal).
-	if fp_bulk and s == 1 and flat_world and size.x == size.y and size.y == size.z:
+	if fp_bulk and not _rd and s == 1 and flat_world and size.x == size.y and size.y == size.z:
 		var by_top = oy + size.y                      # one past the top cell (cells are oy .. by_top-1)
 		if by_top <= min_h - BULK_MAX_FILLER:
 			var fill_arid := -1
@@ -3081,7 +3088,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
 	# solid top is far below SEA_LEVEL but water still fills up to it.
-	var top = max_h + max_above
+	var top = max_h + max_above + _ds_head               # FS2: +S headroom (the surface rises by ≤ DATUM_SHIFT_MAX)
 	if sea > top: top = sea
 	if oy > top:
 		_gen_acc(0, _t0)                                  # T1 class 0: profiled all-air block
@@ -3094,7 +3101,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# optimisation stays off (never fill a stale index). FACETED: v1 requires the WHOLE block box to be interior
 	# to all four ridges — exactly the whole-block fill's gate — so no beyond-ridge cell that junction_modify
 	# would mask to AIR is ever filled; ridge straddlers stay fully per-cell.
-	var cb_on = fp_colbulk and s == 1 and flat_world and size.x == size.y and size.y == size.z \
+	var cb_on = fp_colbulk and not _rd and s == 1 and flat_world and size.x == size.y and size.y == size.z \
 		and bulk_stone_arid >= 0 and bulk_stone_arid < mcount \
 		and bulk_deepslate_arid >= 0 and bulk_deepslate_arid < mcount
 	if cb_on and gen_facet >= 0:
@@ -3220,6 +3227,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				if not need_cells:
 					continue
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
+			# COSMOS FS2 (design 3.2): this column's datum shift. resolve_cell runs in TRUE-height space at
+			# wy - S, so the cell at lattice wy renders worldgen's true wy - S (the whole column raised by S).
+			# cb_on is forced OFF under _rd, so the col_hi/deep-fill R1 branches never run with the datum shift.
+			var col_ds := FacetAtlas.datum_shift(gen_facet, wx, wz) if _rd else 0
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
 				var wy = oy + y * s
@@ -3229,7 +3240,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 					if wy < deep_top and (wy > BULK_DEEPSLATE_TOP_Y \
 							or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
 						continue                      # R1: already emitted by this column's deep fill runs
-				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
+				var v = TerrainConfig.resolve_cell(wx, wy - col_ds, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
 				if col_jinv != 0:
@@ -3567,6 +3578,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
 	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
 	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
+	gen.set("radial_datum", CubeSphere.FP_RADIAL_DATUM)  # COSMOS FS2 §3.2: the C++ mirror resolves each cell at true y − S
 	# GEN-EFFICIENCY Fix A: freeze the bulk-underground flag + the two fill ARIDs (the cube ARID a plain deep STONE /
 	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
@@ -3621,6 +3633,7 @@ func _make_cpp_generator(src_gen: Object) -> Object:
 	cfg["flat_world"] = src_gen.get("flat_world")
 	cfg["faceted"] = CubeSphere.FACETED
 	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
+	cfg["radial_datum"] = CubeSphere.FP_RADIAL_DATUM     # COSMOS FS2 §3.2
 	cfg["model_count"] = src_gen.get("model_count")
 	cfg["waterlog"] = src_gen.get("waterlog")
 	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set

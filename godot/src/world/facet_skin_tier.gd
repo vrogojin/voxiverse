@@ -561,6 +561,7 @@ static func _build_cpp_gen(active_fid: int) -> Object:
 		"temperature": ns["temperature"], "humidity": ns["humidity"], "mountain": ns["mountain"],
 		"seed": ns["seed"], "gen_face": 0, "gen_n": 0, "gen_facet": active_fid,
 		"flat_world": true, "faceted": CubeSphere.FACETED, "m5c_corner": CubeSphere.M5C_CORNER,
+		"radial_datum": CubeSphere.FP_RADIAL_DATUM,   # COSMOS FS2 §3.2: the skin sample_columns adds S in C++ too
 		"cube_arid": PackedInt32Array([0, 1, 2, 3, 4, 5, 6, 7]),
 		"block_ids": TerrainConfig.appearance_surface_materials(), "model_count": 8, "waterlog": false,
 		"id_wood": BlockCatalog.WOOD, "id_leaf": BlockCatalog.LEAF,
@@ -597,8 +598,10 @@ static func gd_sample(fid: int, packed: PackedInt64Array) -> Dictionary:
 		var pr: Vector4 = TerrainConfig.column_profile(x, z, ctx)
 		var g := int(pr.x)
 		var biome := int(pr.y)
-		var w := g < TerrainConfig.SEA_LEVEL
-		heights[i] = float(g)
+		var w := g < TerrainConfig.SEA_LEVEL          # water is a TRUE-space property (uses unshifted g)
+		# COSMOS FS2 (§3.2): the skin lands on the datum-shifted surface (g + S) so it agrees with the near
+		# voxels and the radial far shell (One-Surface Law). S ≡ 0 with FP_RADIAL_DATUM off ⇒ byte-identical.
+		heights[i] = float(g + (FacetAtlas.datum_shift(fid, x, z) if CubeSphere.FACETED else 0))
 		biomes[i] = biome
 		water[i] = 1 if w else 0
 		colors[i] = FarPalette.color_for(g, biome, pr.w, w)

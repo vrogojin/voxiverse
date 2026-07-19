@@ -760,6 +760,11 @@ func shell_telemetry() -> Dictionary:
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
 
+## COSMOS FS1 gate (G-SHELL-WELD): the horizon (CELLS) ABSOLUTE positions for facet `fid` — warms + returns the cache.
+func horizon_positions(fid: int) -> PackedVector3Array:
+	_ensure_cached(fid)
+	return _pos_cache[fid]
+
 ## TIER-DEPTH P2 gate: the SUNK (as-rendered) dense backstop vertex positions for facet `fid` — the cache (envelope or
 ## constant-relief) pushed in by the current emit sink (TierPlace.backstop_sink). The gate projects these onto the near
 ## height field (world_to_lattice64) to prove the rendered coarse surface never rises above the near block tops.
@@ -777,6 +782,21 @@ func backstop_raw_positions(fid: int) -> PackedVector3Array:
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
 	if _pos_cache.has(fid):
+		return
+	# COSMOS FS1 (§4.1): the WELD path emits every vertex RADIALLY from the SHARED cube-sphere corner dirs, so a
+	# facet's edge welds bit-identically to its neighbour's (One-Surface Law). Textually separate from the shipped
+	# planar-corner path so flag-off is byte-identical.
+	if CubeSphere.FP_SHELL_WELD:
+		var cd := FacetAtlas.facet_corner_dirs(fid)
+		var pos := PackedVector3Array()
+		var col := PackedColorArray()
+		var stride := CELLS + 1
+		for gj in range(stride):
+			for gi in range(stride):
+				_weld_node(cd, float(gi) / float(CELLS), float(gj) / float(CELLS), pos, col)
+		# CELLS is the coarse resolution — the coarse-owns-edge snap is a no-op here (cstride==1).
+		_pos_cache[fid] = pos
+		_col_cache[fid] = col
 		return
 	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
 	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
@@ -827,14 +847,25 @@ func _ensure_backstop_cached(fid: int) -> void:
 	if TierPlace.envelope_on():
 		_ensure_backstop_cached_env(fid)
 		return
-	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
-	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
-	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
-	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
 	var pos := PackedVector3Array()
 	var col := PackedColorArray()
+	# COSMOS FS1 (§4.1/§4.2): radial weld from shared corner dirs + the coarse-owns-edge T-junction (the dense
+	# BACKSTOP_CELLS outer ring is snapped onto the CELLS=4 coarse chord so it welds a horizon 4-edge crack-free).
+	if CubeSphere.FP_SHELL_WELD:
+		var cd := FacetAtlas.facet_corner_dirs(fid)
+		for gj in range(stride):
+			for gi in range(stride):
+				_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+		_weld_snap_edges(pos, cells)
+		_bpos_cache[fid] = pos
+		_bcol_cache[fid] = col
+		return
+	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
+	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
+	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
+	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
 	for gj in range(stride):
 		for gi in range(stride):
 			var s := float(gi) / float(cells)
@@ -863,6 +894,12 @@ func _ensure_backstop_cached(fid: int) -> void:
 ## the far ring's own profile_at_dir funnel (byte-equal to sample_columns by the one-sampler law), so no facet-param→
 ## lattice remap is introduced. NEVER-OOM: the fine grid is transient and bounded; no cache grows with walk distance.
 func _ensure_backstop_cached_env(fid: int) -> void:
+	# COSMOS FS1 (§4): the WELD path — fine near-g grid sampled along the SHARED corner dirs, each coarse vertex
+	# placed RADIALLY at the min-envelope height, outer ring snapped to the coarse chord. env(i) ≤ direct g, so an
+	# env backstop always sits AT-OR-BELOW a welded horizon neighbour (no see-through); env↔env welds exactly.
+	if CubeSphere.FP_SHELL_WELD:
+		_ensure_backstop_cached_env_weld(fid)
+		return
 	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
 	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
 	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
@@ -919,6 +956,54 @@ func _ensure_backstop_cached_env(fid: int) -> void:
 			var vp := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
 			var vg := int(vp.x)
 			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+	_bpos_cache[fid] = pos
+	_bcol_cache[fid] = col
+
+## COSMOS FS1 (§4) — the WELD twin of _ensure_backstop_cached_env: identical min-envelope construction, but every
+## direction comes from the SHARED corner dirs and every vertex is placed RADIALLY (d̂·(R+relief)), then the outer
+## ring is snapped to the coarse chord. Kept a separate function so the shipped envelope path stays byte-identical.
+func _ensure_backstop_cached_env_weld(fid: int) -> void:
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var mult := TierPlace.ENV_FINE_MULT
+	var fine := cells * mult
+	var fstride := fine + 1
+	# Fine near-g grid over the facet, sampled along the shared corner dirs (one profile_at_dir per fine node).
+	var fg := PackedInt32Array()
+	fg.resize(fstride * fstride)
+	for fj in range(fstride):
+		for fi in range(fstride):
+			var d := _weld_unit(cd, float(fi) / float(fine), float(fj) / float(fine))
+			fg[fj * fstride + fi] = int(TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS).x)
+	# Skew dilation (identical derivation to the shipped env builder).
+	var edge_blocks := (PI * 0.5 * FacetAtlas.R_BLOCKS) / float(FacetAtlas.K)
+	var fine_pitch := edge_blocks / float(fine)
+	var dil := int(ceil(TierPlace.ENV_DILATE_BLOCKS / maxf(fine_pitch, 0.001)))
+	var half := mult + dil
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var d := _weld_unit(cd, float(gi) / float(cells), float(gj) / float(cells))
+			var fic := gi * mult
+			var fjc := gj * mult
+			var gmin := 1 << 30
+			for wj in range(fjc - half, fjc + half + 1):
+				if wj < 0 or wj >= fstride:
+					continue
+				var rowoff := wj * fstride
+				for wi in range(fic - half, fic + half + 1):
+					if wi < 0 or wi >= fstride:
+						continue
+					var gg: int = fg[rowoff + wi]
+					if gg < gmin:
+						gmin = gg
+			pos.append(_weld_place(d, gmin))                     # ABSOLUTE, radial, envelope height, un-sunk
+			var vp := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+			var vg := int(vp.x)
+			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+	_weld_snap_edges(pos, cells)
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
 
@@ -1031,6 +1116,48 @@ func _facet_centre_dir(fid: int) -> Array:
 
 static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t
+
+## COSMOS FS1 (§4.1): the unit sphere direction at grid node (s,t) from the SHARED cube-sphere corner dirs `cd`
+## (12 f64). The bilerp + normalize stay f64; only the final Vector3 is f32 — so two facets sharing a grid edge
+## (identical corner dirs, identical s,t) cast to the SAME f32 direction ⇒ their shared-edge vertices weld.
+func _weld_unit(cd: PackedFloat64Array, s: float, t: float) -> Vector3:
+	var ux := _bilerp(cd[0], cd[3], cd[6], cd[9], s, t)
+	var uy := _bilerp(cd[1], cd[4], cd[7], cd[10], s, t)
+	var uz := _bilerp(cd[2], cd[5], cd[8], cd[11], s, t)
+	var ln := sqrt(ux * ux + uy * uy + uz * uz)
+	return Vector3(ux / ln, uy / ln, uz / ln)
+
+## COSMOS FS1 (§4.1 / One-Surface Law): the ABSOLUTE radial world point of unit direction `d` at surface height
+## `g` — d·(R + relief). The SAME altitude law the datum-shifted near field (FS2) and skin use, so near↔far agree.
+func _weld_place(d: Vector3, g: int) -> Vector3:
+	var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+	return d * (FacetAtlas.R_BLOCKS + relief)
+
+## COSMOS FS1 (§4.1): emit grid node (s,t)'s welded radial position + far-palette colour into pos/col.
+func _weld_node(cd: PackedFloat64Array, s: float, t: float, pos: PackedVector3Array, col: PackedColorArray) -> void:
+	var d := _weld_unit(cd, s, t)
+	var prof := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+	var g := int(prof.x)
+	pos.append(_weld_place(d, g))
+	col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+
+## COSMOS FS1 (§4.2): the COARSE-OWNS-EDGE T-junction rule. A dense facet (cells > CELLS) snaps each outer-ring
+## INTERIOR vertex onto the CELLS=4 coarse chord (a straight-line interp of the ring's own coarse-index vertices),
+## so its shared edge is colinear with — and welds crack-free to — a horizon 4-edge (and to another dense facet
+## that snapped the same way). No-op for a horizon facet (cells == CELLS ⇒ cstride 1). Corners are left exact.
+func _weld_snap_edges(pos: PackedVector3Array, cells: int) -> void:
+	var cstride := cells / CELLS
+	if cstride <= 1:
+		return
+	var stride := cells + 1
+	for i in range(1, cells):
+		var c0 := (i / cstride) * cstride                # lower coarse index on the edge
+		var c1 := mini(c0 + cstride, cells)              # upper coarse index
+		var lo := float(i - c0) / float(cstride)
+		pos[i * stride + 0] = pos[c0 * stride + 0].lerp(pos[c1 * stride + 0], lo)            # West (gi=0)
+		pos[i * stride + cells] = pos[c0 * stride + cells].lerp(pos[c1 * stride + cells], lo)  # East (gi=cells)
+		pos[0 * stride + i] = pos[0 * stride + c0].lerp(pos[0 * stride + c1], lo)             # South (gj=0)
+		pos[cells * stride + i] = pos[cells * stride + c0].lerp(pos[cells * stride + c1], lo)  # North (gj=cells)
 
 # COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT, §6b): the space-side terminator band. A lit vertex-colour spatial
 # shader (same render class as the StandardMaterial3D / the P3 bias shader) plus a `sun_dir` uniform: per VERTEX

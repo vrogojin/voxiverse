@@ -303,6 +303,37 @@ const BACKSTOP_CELLS := 16
 ## facet chord sagitta at any radius (≈6 at R=3072, ≈13 at R=6371). 0.5 reproduces the shipped 6-block sink at R=3072.
 const BACKSTOP_SINK_FRAC := 0.5
 
+## COSMOS FS1 (docs/COSMOS-FACET-SEAMS-DESIGN.md §4 / §6) — the SHELL WELD. The shipped far ring builds each facet
+## quad by bilerping its OWN planarized corners (facet_planar_corner) then adding radial relief: adjacent facets
+## project the shared true edge onto DIFFERENT planes, so their shared-edge chords disagree by up to the ∝R datum
+## step (5.30 blocks @ R=6371) — a see-through slit along every seam (RC2a), which generate_normals cannot merge
+## (positions never bit-identical) and no skirt covers. When true (requires FACETED), the ring emits every vertex
+## RADIALLY from a bilerp of the SHARED cube-sphere corner DIRECTIONS (FacetAtlas.facet_corner_dirs): v = d̂·(R +
+## relief(g(d̂))). Two facets sharing a grid edge then compute the SAME edge vertices (same shared corner dirs,
+## same t) ⇒ the shell welds and closes (One-Surface Law §0). Mixed tessellation (backstop 16 vs horizon 4) is
+## handled by the COARSE-OWNS-EDGE rule: a dense facet's outer-ring vertices are snapped onto the CELLS=4 coarse
+## chord (role-agnostic — a 16-facet always meets a 4-chord, so it welds a horizon 4-edge AND a backstop that did
+## the same). The current uniform BACKSTOP_SINK is KEPT (§4.3: radial verts sunk ~13 stay under the plane-anchored
+## near field, 13 > sagitta 6.8 + chord error — G-SHELL-UNDER holds); FS3 re-derives the sink once the datum fix
+## (FS2) removes the sagitta. Zero new memory (same caches, radial VALUES not new counts). Default OFF → the shipped
+## planar-corner path verbatim, FLAT byte-identical (6042/0). Flipped ON at export after the live no-see-through pass.
+const FP_SHELL_WELD := false
+
+## COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3 / §6) — the RADIAL DATUM shift (the seam-step KILL). The near
+## field places a column's surface g blocks up from the facet's OWN mean plane along its OWN normal
+## (lattice_to_world64's y·n̂ term); adjacent facets' planes sit at DIFFERENT signed distances from the shared true
+## edge, so the same g lands at different altitudes — the ∝R datum step (5.30 blocks @ R=6371), the 8-block cliff.
+## When true (requires FACETED), each column gains an integer datum shift S = round(solve |p0 + s·n̂| = R) ∈ [0, ~7]
+## applied as a PURE RE-INDEX: a cell at lattice y resolves worldgen at true y − S (resolve_cell/worldgen run
+## UNCHANGED in true-height space — strata, sea fill, snow, trees all ride S), and every surface funnel returns
+## g + S. The placed surface then sits at altitude R + g (a pure function of d̂), so adjacent facets agree to ≤1
+## block quantization + ≤0.15 cosine at every seam. S is pure arithmetic over the frozen atlas frame + R — zero new
+## persistent memory, worker-safe, C++-mirrorable (VoxelGeneratorCosmos already receives facet_frame/off/r). The
+## vertical envelope grows by ≤ DATUM_SHIFT_MAX (worldgen y-bounds get that headroom under the flag). Default OFF ⇒
+## S ≡ 0 at every call site (FacetAtlas.datum_shift returns 0), so the world is byte-identical (FLAT 6042/0, G-O4-EQ
+## hashes unchanged). Flipped ON at export after the live cliffs-gone pass. Truth gate: verify_facet_datum.gd.
+const FP_RADIAL_DATUM := false
+
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
 ## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already

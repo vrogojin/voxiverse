@@ -1162,7 +1162,16 @@ static func analytic_column_profile(x: int, z: int) -> Vector4:
 	# COSMOS FACETED (§3.3): thread a facet-carrying ctx sharing the persistent memo (facet-scoped key). The
 	# facet only changes via set_active_facet, which clears the memo — so entries never go stale or collide.
 	if CubeSphere.FACETED:
-		return column_profile(x, z, _acquire_facet_ctx())
+		# COSMOS FS2 (§3.2): THE surface funnel — the placed surface is g + S(active_facet, x, z). Every main-thread
+		# surface consumer (height_at, floor scan, DDA, GroundCollider, find_spawn, TreeGen anchor, PerVoxelEnvironment)
+		# reads through here, so they all follow the datum shift automatically. The MEMO stays TRUE (column_profile is
+		# unshifted); this returns a shifted COPY (.x only). S ≡ 0 with FP_RADIAL_DATUM off ⇒ byte-identical.
+		var p := column_profile(x, z, _acquire_facet_ctx())
+		if _active_facet >= 0:
+			var s := FacetAtlas.datum_shift(_active_facet, x, z)
+			if s != 0:
+				return Vector4(p.x + float(s), p.y, p.z, p.w)
+		return p
 	if CubeSphere.FLAT_WORLD:
 		return column_profile(x, z)
 	return column_profile(x, z, _acquire_ctx(_active_face))
@@ -1217,7 +1226,14 @@ static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx, mwi
 ## (x,y,z) — VOXEL-DATA-STRUCTURE §7.1 tier 2. THE terrain function.
 static func generated_cell(x: int, y: int, z: int) -> int:
 	var p := column_profile(x, z)
-	return resolve_cell(x, y, z, int(p.x), int(p.y), p.z, p.w)
+	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): the datum re-index at the ANALYTIC window exit (the twin
+	# of the module worker's buffer-write exit). resolve_cell/worldgen run UNCHANGED in TRUE-height space — the
+	# lattice cell y renders what worldgen puts at true y − S(active_facet, x, z). S ≡ 0 with FP_RADIAL_DATUM off
+	# (and in flat/curved mode, where _active_facet < 0) ⇒ byte-identical. Pairs with the g + S surface funnel.
+	var yy := y
+	if CubeSphere.FACETED and _active_facet >= 0:
+		yy = y - FacetAtlas.datum_shift(_active_facet, x, z)
+	return resolve_cell(x, yy, z, int(p.x), int(p.y), p.z, p.w)
 
 ## The per-cell pipeline given a column's precomputed profile scalars (g, biome, c, t). Returns the PACKED
 ## cell value. THE single hot function both render paths share. COSMOS-FRAME-ORIENTATION §6: resolve_cell

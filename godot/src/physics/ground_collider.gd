@@ -419,6 +419,16 @@ func _finish_build() -> void:
 ## genuinely-edited columns. The queries below are the LIGHT surface/cap ones (no generated_cell).
 func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 	var edited := world.is_edited_column(x, z)
+	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): thread the per-column datum shift S so the collider
+	# matches the datum-shifted render (generated_cell / the surface funnel). The whole column raises by S:
+	# h becomes g + S (all surface-relative logic — slope run, snow, cap — then follows), the sea surface becomes
+	# SEA_LEVEL + S (lattice), and a tree cell at lattice y is worldgen's true y − S. S ≡ 0 with FP_RADIAL_DATUM
+	# off / non-faceted ⇒ byte-identical. active_facet is the collider's own facet (no chart under FACETED).
+	var col_ds := 0
+	if CubeSphere.FP_RADIAL_DATUM and CubeSphere.FACETED and TerrainConfig.active_facet() >= 0:
+		col_ds = FacetAtlas.datum_shift(TerrainConfig.active_facet(), x, z)
+		h += col_ds
+	var sea_s := TerrainConfig.SEA_LEVEL + col_ds
 	var y := _build_ylo
 	# A shaft dug deeper than DEPTH below the region floor: descend to the true solid floor so
 	# it still gets a floor box. Only edited columns can have removed cells, so only they pay it.
@@ -495,21 +505,21 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 				if y < rr.y:
 					solid = true
 					modifier = TerrainConfig.slope_run_modifier_at(srun, h, y)   # slope cap cell (0 = full cube below/within)
-				elif y <= TerrainConfig.SEA_LEVEL:
+				elif y <= sea_s:
 					solid = true                        # sea fill above the run
-				elif world.tree_block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+				elif world.tree_block_at(x, y - col_ds, z, _build_pc) != BlockCatalog.AIR:
 					solid = true                        # tree above the run
 			else:
 				# Snow accumulation cell? The lip (if any) owns g+1, so exclude it from the snow plane there.
 				var remaining := -1
-				if s_depth > 0 and h >= TerrainConfig.SEA_LEVEL and not (s_capped == 1 and y == h + 1):
+				if s_depth > 0 and h >= sea_s and not (s_capped == 1 and y == h + 1):
 					remaining = s_depth - (y - (h + 1)) * 10
 				if remaining >= 10:
 					solid = true                        # a full snow cube → box run
 				elif remaining >= 1:
 					solid = true
 					modifier = CellCodec.make_layer(remaining)   # the fractional top LAYER → prism
-				elif y == h + 1 and h >= TerrainConfig.SEA_LEVEL:
+				elif y == h + 1 and h >= sea_s:
 					var lip := world.col_surface_cap_modifier(x, z, _build_pc)
 					if lip != 0:
 						solid = true                    # smoothed grass cap lip
@@ -524,13 +534,13 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 								snow_fill_mod = CellCodec.make_layer(lf)
 						else:
 							modifier = lip
-					elif y <= TerrainConfig.SEA_LEVEL:
+					elif y <= sea_s:
 						solid = true                    # sea fill (water/ice) → full-cube box
-					elif world.tree_block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+					elif world.tree_block_at(x, y - col_ds, z, _build_pc) != BlockCatalog.AIR:
 						solid = true                    # tree wood/leaf → full-cube box
-				elif y <= TerrainConfig.SEA_LEVEL:
+				elif y <= sea_s:
 					solid = true                        # sea fill (water/ice) → full-cube box
-				elif world.tree_block_at(x, y, z, _build_pc) != BlockCatalog.AIR:
+				elif world.tree_block_at(x, y - col_ds, z, _build_pc) != BlockCatalog.AIR:
 					solid = true                        # tree wood/leaf → full-cube box
 		if solid and modifier != 0:
 			if run_start != 0x7fffffff:

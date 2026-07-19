@@ -2005,7 +2005,7 @@ index 0000000..0d461a9
 +	const int fid = p.gen_facet;
 +
 +	// Cheap constant all-air early-outs (no noise).
-+	if (oy > MAX_SURFACE_Y + max_above && oy > sea) {
++	if (oy > MAX_SURFACE_Y + max_above + ((p.radial_datum && fid >= 0) ? 8 : 0) && oy > sea) { // COSMOS FS2 §3.2: +S headroom
 +		return result;
 +	}
 +	if (oy + size.y <= WORLD_BOTTOM_Y) {

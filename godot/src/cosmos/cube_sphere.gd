@@ -708,6 +708,56 @@ const FP_BODY_LOD := false
 ## CANNOT be a large multiple of R (the far plane boxes it at ≤ 1.35·R); raising that further is a CAMERA_FAR
 ## change, out of M1 scope — the gate asserts the derived value clears R and flags loudly if R ever approaches it.
 const FP_SKY_DSKY_R := false
+## COSMOS CLIMATE W0 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3 / §7) — REAL AXIAL SEASONS. When true the
+## ephemeris fills Earth's reserved axial_tilt slot (23.4° = 0.4084 rad): dir_to_bodyfixed composes the
+## obliquity (R_spin·R_tilt) so CosmosSky's sun arcs get seasonal (low winter / high summer / polar
+## day-night) for free, and ClimateModel.season_offset(sinlat, sinδ) shifts the sim-layer temperature and
+## the SnowfallSystem snow line with the subsolar latitude δ(t). WORLDGEN IS UNTOUCHED — the offset is added
+## ONLY by sim-layer callers (PerVoxelEnvironment / SnowfallSystem), so generated_cell/profile_at_dir stay
+## pure of the clock (G-SEAS-PURE) and the C++ frozen epoch survives. Default FALSE ⇒ effective_tilt≡0
+## (R_tilt=I) and no offset is ever added ⇒ BYTE-IDENTICAL to the shipped no-tilt kernel; the O1/tidal gates
+## stay green. Gate verify_climate G-SEAS-TILT (δ=±23.4° at solstices) + G-SEAS-PURE.
+const FP_SEASONS := false
+
+## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
+## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
+## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem
+## discipline). A sliced sweep (128 cells/frame) integrates insolation → T, a diagnostic thermal-low
+## pressure, an analytic + geostrophic + friction DIAGNOSTIC wind (cannot go unstable), semi-Lagrangian
+## moisture with evap/condense/rain-out + orographic lift, and a CAPE instability proxy. NO rendering (that
+## is W2/W3/W4); PerVoxelEnvironment exposes humidity/wind/pressure/precip/cloud reads. Deterministic (pure
+## of SEED + state + sweep index). Default FALSE ⇒ WeatherSystem is never instantiated ⇒ zero bytes / zero
+## CPU / byte-identical. Gate verify_climate G-W1-BYTES/CPU/DET/PHYS/ITCZ/INIT.
+const FP_CLIMATE_GRID := false
+
+## COSMOS CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4 / §7) — the 3-layer semi-cubic CLOUD mesher
+## (CloudLayers). A read-only view of the weather grid: blocky prisms (cumulus/stratus/cirrus at 3
+## altitudes, all < ATMO_TOP 384) in the terrain's own vertex-colour language, from a camera-following
+## world-snapped 64×64 tile lattice + SEED+106 noise, greedy row-merged into ONE reused CPU scratch
+## uploaded to exactly 3 ArrayMesh surfaces (3 draw calls). HARD vertex cap ⇒ overcast is the cheapest
+## mesh, the worst case bounded (≤2.4 MiB, G-W2-BYTES/DRAWS). Requires FP_CLIMATE_GRID (reads its cloud
+## water). Default FALSE ⇒ no CloudLayers node ⇒ zero bytes / byte-identical. Cloud LOOK is LIVE-ONLY.
+const FP_CLOUDS := false
+
+## COSMOS CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5 / §7) — PRECIPITATION as threshold read-outs
+## of the weather grid: rain/snow/fog. ONE reused camera-following particle node (hard amount cap ≤1024),
+## the Environment fog density driven from grid humidity (composed MULTIPLICATIVELY with SN4a's altitude
+## ramp so space stays clear), and SnowfallSystem.is_snowing upgraded to couple to the grid (kind==snow,
+## the SEED+105 noise becoming the sub-cell structure). Kind (rain/snow) resolves through the ONE
+## surface_temperature+season zero-crossing, so precip agrees with the snow-cap boundary (G-W3-COUPLE).
+## Requires FP_CLIMATE_GRID. Default FALSE ⇒ no FX node, is_snowing verbatim ⇒ byte-identical. Precip
+## FEEL/fog mood is LIVE-ONLY.
+const FP_PRECIP := false
+
+## COSMOS CLIMATE W4 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4.4/§5 / §7) — THUNDERSTORMS from the grid's
+## CAPE-proxy instability field. Convective cells (instability over threshold + cloud water) become
+## towering cumulonimbus in CloudLayers (dark, up to 256, capped ≤64 towers/rebuild — bounded extra
+## height, no extra draws), flash lightning (ONE reused omni flash, energy writes only) and drop hail
+## (WeatherFX kind swap) in WeatherFX. Emergent from state, NEVER scripted per-phenomenon (G-W4-EMERGE).
+## The behaviours live INSIDE the W2 (CloudLayers) / W3 (WeatherFX) nodes, gated on this flag — so it needs
+## FP_CLOUDS + FP_PRECIP. Default FALSE ⇒ those nodes behave exactly as W2/W3 ⇒ byte-identical. Storm
+## drama (flash timing, tower look) is LIVE-ONLY.
+const FP_STORMS := false
 
 ## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
 ## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS

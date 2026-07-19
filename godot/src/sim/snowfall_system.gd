@@ -126,6 +126,12 @@ func _process_column(x: int, z: int, player_col: Vector2i) -> int:
 	var g := TerrainConfig.height_at(x, z)
 	var t := TerrainConfig.column_profile(x, z).w
 	var ts := ClimateModel.surface_temperature(g, t)
+	# CLIMATE W0 (§3.4): the seasonal snow line. The offset shifts this column's freeze test with the
+	# subsolar latitude — snow advances in the winter hemisphere and retreats in summer, entirely inside
+	# the existing SNOW_EDIT_BUDGET / SIM_RADIUS footprint (no global restamp). Flag-off ⇒ never evaluated
+	# ⇒ byte-identical to the shipped snow sim. The signed latitude comes from the env's chart (0 when flat).
+	if CubeSphere.FP_SEASONS and world.environment != null:
+		ts += ClimateModel.season_offset(world.environment.signed_sinlat(x, z), ClimateModel.current_sin_delta)
 
 	# (1) Piggyback the M1 melt/freeze EVALUATOR on the exposed surface cell (§4.3.4): bounded (one call
 	# per processed column), main-thread, and its SET (freeze) edge stays self-gated to the generated
@@ -290,12 +296,23 @@ func baseline_depth(x: int, z: int) -> int:
 
 ## The storm gate at column (x, z) for the CURRENT step: a spatially-coherent, time-evolving field. Pure
 ## in (SEED+105, step_counter, position) — the whole reason a scripted run is deterministic.
+##
+## CLIMATE W3 (§1.5): under FP_PRECIP the gate COUPLES to the weather grid — it snows here only when the
+## grid is actually precipitating snow at this column (kind==snow AND rate>0), with the SEED+105 noise
+## demoted to the SUB-CELL structure (both must agree). Flag off (or grid absent) ⇒ verbatim the shipped
+## noise gate, byte-identical. The kind resolves through the ONE surface_temperature+season zero-crossing,
+## so accumulation and the grid's rain/snow boundary can never disagree.
 func is_snowing(x: int, z: int) -> bool:
 	var v := _weather.get_noise_3d(
 		float(x) * _WEATHER_XZ_FREQ,
 		float(z) * _WEATHER_XZ_FREQ,
 		float(step_counter) * WEATHER_SPEED)
-	return v > WEATHER_THRESHOLD
+	var noise_gate := v > WEATHER_THRESHOLD
+	if CubeSphere.FP_PRECIP and world != null and world.environment != null:
+		var g := TerrainConfig.height_at(x, z)
+		var p := world.environment.precipitation(Vector3(float(x), float(g + 1), float(z)))
+		return noise_gate and float(p.get("rate", 0.0)) > 0.0 and String(p.get("kind", "none")) == "snow"
+	return noise_gate
 
 # --- tile enumeration (§4.2) ---------------------------------------------------
 

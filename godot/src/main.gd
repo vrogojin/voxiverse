@@ -83,14 +83,38 @@ func _ready() -> void:
 	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp
 	# (day-night), placing the Sun light + Sun/Moon impostors + star dome from the pure ephemeris; the
 	# clock is advanced in _process (below). The player is the parallax-free camera provider.
-	if CubeSphere.ORBITAL_SKY:
+	# CLIMATE W0/W1 (FP_SEASONS / FP_CLIMATE_GRID) also need the celestial clock (subsolar latitude +
+	# insolation game-time), so build it whenever ANY of them is on; the Sun/Moon/sky nodes stay
+	# ORBITAL_SKY-only. The clock is injected into the WorldManager so the weather grid can read game-time.
+	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS or CubeSphere.FP_CLIMATE_GRID:
 		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
+		world.set_cosmos_clock(_cosmos_clock)
+	if CubeSphere.ORBITAL_SKY:
 		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
 		var env: Environment = we.environment if we != null else null
 		_cosmos_sky = CosmosSky.new()
 		_cosmos_sky.name = "CosmosSky"
 		add_child(_cosmos_sky)
 		_cosmos_sky.setup(_cosmos_clock, env, player)
+
+	# CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4): the 3-layer cloud mesher, a read-only view of the
+	# weather grid (rule 2). Built only under BOTH flags (it reads the grid's cloud water); default OFF ⇒ no
+	# node ⇒ byte-identical. The player is the camera provider; PerVoxelEnvironment is the grid read interface.
+	if CubeSphere.FP_CLOUDS and CubeSphere.FP_CLIMATE_GRID:
+		var clouds := CloudLayers.new()
+		clouds.name = "CloudLayers"
+		add_child(clouds)
+		clouds.setup(world.environment, player)
+
+	# CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5): precipitation particles + fog, a read-only view of
+	# the grid (rule 2). Built only under both flags; default OFF ⇒ no node ⇒ byte-identical. The Environment
+	# (from the WorldEnvironment stub) is driven for fog; the player is the camera provider.
+	if CubeSphere.FP_PRECIP and CubeSphere.FP_CLIMATE_GRID:
+		var we2 := get_node_or_null("WorldEnvironment") as WorldEnvironment
+		var fx := WeatherFX.new()
+		fx.name = "WeatherFX"
+		add_child(fx)
+		fx.setup(world.environment, we2.environment if we2 != null else null, player)
 
 	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
 	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
@@ -159,6 +183,11 @@ func _process(_delta: float) -> void:
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
 	if _cosmos_clock != null:
 		_cosmos_clock.advance(_delta)
+		# CLIMATE W0 (§3): publish the current subsolar sin-latitude once per frame (main thread) so the
+		# sim-layer season offset (PerVoxelEnvironment / SnowfallSystem) tracks the seasons. Flag-off ⇒ never
+		# written ⇒ stays 0 ⇒ zero seasonal offset (byte-identical). Pure ephemeris read, no allocation.
+		if CubeSphere.FP_SEASONS:
+			ClimateModel.current_sin_delta = sin(CosmosEphemeris.subsolar_latitude(_cosmos_clock.now()))
 	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
 	# CAMERA radial direction + arm the one-shot prewarm. The FACETED production game ships FLAT_WORLD=true and RETURNS
 	# below, so — exactly like the sky clock above — this MUST run BEFORE that early-return or the driver is DEAD (the

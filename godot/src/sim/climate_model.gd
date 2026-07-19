@@ -53,3 +53,25 @@ static func surface_temperature(surface_y: int, t: float) -> float:
 ## (same rationale as `surface_temperature`), so it never rises above the sea-level baseline.
 static func air_temperature(y: float, t: float) -> float:
 	return climate_base(t) - LAPSE_RATE * maxf(y, 0.0)
+
+# --- CLIMATE W0: real axial seasons (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3) -----------------------
+# The seasonal temperature term is a SIM-LAYER offset, added ONLY by PerVoxelEnvironment and
+# SnowfallSystem — never by surface_temperature/air_temperature above, so worldgen and the C++ port
+# never see the clock (G-SEAS-PURE). It is a pure function of the column's signed sin-latitude and the
+# subsolar sin-latitude; the two multiply so the summer hemisphere warms and the winter hemisphere cools.
+
+## Peak mid-latitude seasonal swing scale (°C). ~±10 °C at |sinlat|·|sinδ| ≈ 0.4 (a real temperate swing).
+const SEASON_GAIN := 25.0
+
+## SIM-ONLY seasonal phase: sin of the current subsolar latitude δ(t), written once per frame on the MAIN
+## thread by main.gd from the celestial clock (under FP_SEASONS). Default 0 ⇒ zero seasonal offset, so a
+## build with the flag off (main never writes it) is byte-identical. NEVER read by worldgen (§3 purity) —
+## a static var deliberately kept out of the pure surface/air-temperature signatures.
+static var current_sin_delta: float = 0.0
+
+## Seasonal temperature offset (°C) for a column at signed sin-latitude `sinlat`, given the subsolar
+## sin-latitude `sin_delta`: SEASON_GAIN·sinlat·sin_delta. Summer hemisphere (sinlat·sin_delta > 0) warms,
+## winter cools; the equator (sinlat = 0) and equinoxes (sin_delta = 0) are neutral. PURE; applied ONLY by
+## sim-layer callers so `surface_temperature`/`air_temperature`/worldgen stay clock-independent.
+static func season_offset(sinlat: float, sin_delta: float) -> float:
+	return SEASON_GAIN * sinlat * sin_delta

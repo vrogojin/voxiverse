@@ -59,6 +59,13 @@ var _moon: MeshInstance3D = null
 var _stars: MeshInstance3D = null
 var _moon_mat: StandardMaterial3D = null
 var _star_mat: ShaderMaterial = null
+var _sun_mat: StandardMaterial3D = null           # A2: kept so the Sun disc can redden by T(μ_cam) each frame
+var _glare: MeshInstance3D = null                 # A2 (FP_SUN_PRESENCE): the additive Sun glare quad; null unless built
+var _glare_mat: ShaderMaterial = null
+var _moon_phase_mat: ShaderMaterial = null        # A4 (FP_LIGHT_ABSOLUTE): the unshaded self-phase Moon material; null unless built
+var _atmo_shell: MeshInstance3D = null            # A6 (FP_ATMO_SHELL): the additive atmosphere limb/sky shell; null unless built
+var _atmo_shell_mat: ShaderMaterial = null
+const _SUN_EMISSION_BASE := Color(1.0, 0.96, 0.85)   # A2: the shipped Sun emission/albedo; reddened by T(μ) at dusk
 
 ## L1 moonshine per-frame inputs, computed in _update_sky (which holds t + the Moon geometry) and read by
 ## _ramp_environment. Defaults ⇒ zero moonshine, so a direct _ramp_environment call (the SN4 gate) is
@@ -88,6 +95,12 @@ shader_type spatial;
 render_mode unshaded, cull_front, blend_add, depth_draw_never, shadows_disabled, fog_disabled;
 
 uniform float star_fade : hint_range(0.0, 1.0) = 1.0;
+// COSMOS ATMO-SKY A1 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C5): the analytic planet-disc mask. planet_dir is the
+// LOCAL-frame (dome-basis) direction toward the planet centre; planet_cos_ang = cos(planet angular radius).
+// Fragments whose view direction falls INSIDE the disc are discarded so stars never sprinkle over the planet
+// once A0 renders it at d≫D_SKY. Default planet_cos_ang = 2.0 (> 1) ⇒ the test never fires ⇒ byte-identical.
+uniform vec3 planet_dir = vec3(0.0, 0.0, 1.0);
+uniform float planet_cos_ang = 2.0;
 
 varying vec3 v_dir;
 
@@ -103,6 +116,8 @@ float hash13(vec3 p) {
 
 void fragment() {
 	vec3 d = normalize(v_dir);
+	// A1: discard fragments inside the planet's angular disc (planet_cos_ang=2.0 default ⇒ never — byte-identical).
+	if (dot(d, normalize(planet_dir)) > planet_cos_ang) discard;
 	vec3 g = d * 140.0;
 	vec3 cell = floor(g);
 	float h = hash13(cell);
@@ -120,6 +135,94 @@ void fragment() {
 	// black, which is the very bug being fixed here. With blend_add this ALBEDO is added to the sky
 	// behind it, so black = adds nothing (the by-day case) and stars = additive points at night.
 	ALBEDO = (vec3(star) * 2.2 + vec3(0.7, 0.75, 1.0) * band) * star_fade;
+}
+"""
+
+# COSMOS ATMO-SKY A4 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C5): the Moon SELF-PHASE shader. UNSHADED — its lit
+# hemisphere is computed per-fragment from a `sun_dir` uniform (world normal · sun_dir), so it is IMMUNE to the
+# global DirectionalLight being dimmed to 0 on the night side by C1 (the shipped shaded-Moon material would
+# black out exactly when the Moon should shine). Phase (crescent→full) falls out of the Lambert term; the
+# eclipse redden feeds `base_albedo`. Built ONLY under FP_LIGHT_ABSOLUTE; the StandardMaterial stays otherwise.
+const _MOON_PHASE_SHADER := """
+shader_type spatial;
+render_mode unshaded, fog_disabled, shadows_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform vec3 base_albedo : source_color = vec3(0.72, 0.72, 0.70);
+uniform float ambient = 0.02;
+varying vec3 v_wn;
+void vertex() { v_wn = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz; }
+void fragment() {
+	float lam = max(dot(normalize(v_wn), normalize(sun_dir)), 0.0);
+	ALBEDO = base_albedo * (ambient + (1.0 - ambient) * lam);
+}
+"""
+
+# COSMOS ATMO-SKY A2 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C5): the Sun GLARE quad. gl_compat has no bloom/HDR, so
+# the exact 0.53° Sun disc is an invisible dot; this additive radial-falloff quad is the perceptual job real
+# glare does. blend_add + depth_draw_never (never occludes; the planet's depth kills it behind the disc, the
+# star-dome discipline). Its `intensity` is driven ×occ(cam) so it dies at sunset/eclipse/umbra. Built ONLY
+# under FP_SUN_PRESENCE. `disable_fog` is intrinsic (fog_disabled) — celestial, beyond the atmosphere.
+const _SUN_GLARE_SHADER := """
+shader_type spatial;
+render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, shadows_disabled;
+uniform vec3 glare_color : source_color = vec3(1.0, 0.95, 0.85);
+uniform float intensity = 1.0;
+void fragment() {
+	float r = length(UV - vec2(0.5)) * 2.0;   // 0 at centre → 1 at the quad edge
+	float a = smoothstep(1.0, 0.0, r);
+	a *= a;                                     // sharpen the falloff toward a bright core
+	ALBEDO = glare_color * a * intensity;
+}
+"""
+
+# COSMOS ATMO-SKY A6 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C4): the atmosphere shell — ONE object that is the blue
+# limb HALO from outside AND the horizon-band sky from inside. A SphereMesh of radius R+SHELL_ATMO_MULT·ATMO_TOP,
+# planet-centred; cull_front (one fragment per view direction, inside OR outside) + blend_add + depth_draw_never
+# (never occludes; the planet's own depth kills it behind the disc — the star-dome discipline). The closed-form
+# per-pixel fragment mirrors CosmosSky.shell_geom + shell_limb_color EXACTLY (gate G-AS-LIMB): chord through the
+# shell (planet-occluded) × ρ(h_min) × the SAME day/T/band curves as C1/C2, so the limb reddens across the
+# terminator and darkens on the night side by the ground-sunset curves — seamless by construction. No loops/
+# textures/volumetrics (gl_compat-safe). StandardMaterial has no analytic twin, so the fallback is: flag off ⇒
+# no shell node at all (the camera sky A3 is the base layer). Uniforms fed each frame in _update_sky.
+const _ATMO_SHELL_SHADER := """
+shader_type spatial;
+render_mode unshaded, cull_front, blend_add, depth_draw_never, shadows_disabled, fog_disabled;
+uniform vec3 cam = vec3(0.0);
+uniform vec3 centre = vec3(0.0);
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float r_solid = 6371.0;
+uniform float r_outer = 7139.0;
+uniform float h_scale = 128.0;
+uniform float term_mu = 0.12;
+uniform float gain = 1.6;
+uniform vec3 rayleigh_blue : source_color = vec3(0.15, 0.38, 0.92);
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 wp = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 dir = normalize(wp - cam);
+	vec3 oc = centre - cam;
+	float dc2 = dot(oc, oc);
+	float tca = dot(oc, dir);
+	float b2 = max(dc2 - tca * tca, 0.0);
+	float b = sqrt(b2);
+	if (b >= r_outer) { ALBEDO = vec3(0.0); }
+	else {
+		float h_min = b - r_solid;
+		float half_out = sqrt(max(r_outer * r_outer - b2, 0.0));
+		float seg_start = max(tca - half_out, 0.0);
+		float seg_end = tca + half_out;
+		if (b < r_solid) { float t_hit = tca - sqrt(max(r_solid * r_solid - b2, 0.0)); if (t_hit > 0.0) seg_end = min(seg_end, t_hit); }
+		float chord = max(seg_end - seg_start, 0.0);
+		vec3 xhat = normalize((cam + tca * dir) - centre);
+		float mu = dot(xhat, normalize(sun_dir));
+		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
+		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+		float l = strength * _day(mu) * gain;
+		ALBEDO = rayleigh_blue * tint * l;
+	}
 }
 """
 
@@ -198,6 +301,119 @@ static func occlusion_ambient(sun_dir: Vector3, p: Vector3, h: float, r_vox: flo
 	var authority := space_mix(h, has_atmo)
 	var occ := occlusion_factor(sun_dir, p, r_vox)
 	return lerpf(1.0, lerpf(AMBIENT_UMBRA, 1.0, occ), authority)
+
+# ---------------------------------------------------------------------------------------
+# COSMOS ATMO-SKY (docs/COSMOS-ATMO-SKY-DESIGN.md §3) — the UNIFIED atmosphere/day-night statics. ALL pure
+# (engine-free), so the gate (verify_atmo_sky.gd) drives them DIRECTLY and is FLAG-INDEPENDENT; the A0-A6
+# flags only decide whether the sky/light/shell COMPOSE them in-game. Every function is C¹ in its altitude/
+# angle argument (smoothstep is Hermite; exp is C∞). ZERO bytes: scalar math, no geometry, no allocation.
+# ---------------------------------------------------------------------------------------
+
+## A3 (§3 C3): the IN-ATMOSPHERE authority — 1 at the surface, exactly 0 at/above ATMO_TOP (star-black in
+## space). Replaces space_mix's 192..960 band with a 0.5·ATMO_TOP..ATMO_TOP fade so the whole tint/star
+## crossover happens INSIDE the atmosphere (ρ(ATMO_TOP)=e⁻³≈5%). Airless body ⇒ 0 everywhere (no sky).
+const ATMO_VIS_LO := 0.5 * H_ATMO            # 192 — start of the vis→0 fade
+## A4 (§3 C1): the twilight penumbra half-width (rad) as a function of altitude. Long at the ground
+## (~1.5-min sunset over the 45.5-min day), sharp in vacuum (a hard terminator from orbit).
+const PEN_GROUND := 0.10                      # penumbra half-width at h=0 (rad) — the long ground twilight
+const PEN_SPACE := 0.005                      # penumbra half-width in vacuum (rad) — ~solar angular radius
+## A5/A6 (§3 C2/C4): the ABSOLUTE terminator half-width (in μ = n̂·ŝ) for the day/night great-circle factor.
+const TERMINATOR_MU := 0.12                   # day(x̂) crosses 0→1 over ±this about x̂·ŝ = 0
+## A5 (§3 C2): the globe night-hemisphere floor so it stays faintly earthshine-readable, never pure black.
+const SHELL_NIGHT_FLOOR := 0.06
+## A6 (§3 C4): the atmosphere shell outer radius = R + SHELL_ATMO_MULT·ATMO_TOP, and the additive limb tint.
+const SHELL_ATMO_MULT := 2.0
+const RAYLEIGH_BLUE := Color(0.15, 0.38, 0.92)   # the τ⃗-weighted Rayleigh sky/limb hue (taste; live-only look)
+const SHELL_LIMB_GAIN := 1.6                  # additive limb/sky intensity scale (tuned once vs the ground sky)
+
+## A3 atmo_vis(h): 1 (surface) → 0 (space), C¹. On an airless body there is no atmosphere ⇒ 0 everywhere.
+static func atmo_vis(h: float, has_atmo: bool) -> float:
+	if not has_atmo:
+		return 0.0
+	return 1.0 - smoothstep(ATMO_VIS_LO, H_ATMO, h)
+
+## A4 pen(h): the twilight penumbra half-width (rad) — PEN_GROUND at the surface, PEN_SPACE at/above ATMO_TOP.
+static func pen(h: float) -> float:
+	return lerpf(PEN_GROUND, PEN_SPACE, clampf(h / H_ATMO, 0.0, 1.0))
+
+## A4 occlusion_factor with a CALLER-SUPPLIED penumbra half-width (the altitude-varying twilight). Identical
+## to occlusion_factor when penum == OCC_PENUMBRA; kept separate so occlusion_factor stays byte-untouched.
+static func occlusion_factor_pen(sun_dir: Vector3, p: Vector3, r_vox: float, penum: float) -> float:
+	var dist := p.length()
+	if dist <= 0.0:
+		return 1.0
+	var ang_radius := asin(clampf(r_vox / dist, 0.0, 1.0))
+	var to_center := -p / dist
+	var alpha := acos(clampf(sun_dir.dot(to_center), -1.0, 1.0))
+	return smoothstep(ang_radius - penum, ang_radius + penum, alpha)
+
+## A4 C1: the ABSOLUTE DirectionalLight energy — occ(cam) ALWAYS (no space_mix authority lerp), with the
+## altitude-widened penumbra pen(h). Dark side dark from EVERY camera position (kills the through-planet
+## lighting); at the surface occ degenerates into the sun-below-horizon test (§2.2), so this IS the sunset
+## dimmer too. NOTE: unlike occlusion_light this does NOT reach 1.0 on the surface day side unless the sun is
+## up — that is the point (absolute day/night), so it is a SEPARATE function, not a byte-hand-off to shipped.
+static func light_energy_absolute(sun_dir: Vector3, p: Vector3, h: float, r_vox: float) -> float:
+	return occlusion_factor_pen(sun_dir, p, r_vox, pen(h))
+
+## A4 C1: the ABSOLUTE ambient multiplier — lerp(AMBIENT_UMBRA, 1, occ) continuous, no authority. Night =
+## the umbra floor everywhere (restores the pre-ORBITAL_SKY ambient-only night), day = full fill.
+static func ambient_absolute(sun_dir: Vector3, p: Vector3, h: float, r_vox: float) -> float:
+	var occ := occlusion_factor_pen(sun_dir, p, r_vox, pen(h))
+	return lerpf(AMBIENT_UMBRA, 1.0, occ)
+
+## A5/A6 C2: the ABSOLUTE terminator day factor at surface direction x̂ — mu = x̂·ŝ. 0 on the night
+## hemisphere, 1 on the day hemisphere, exactly 0.5 on the great circle x̂·ŝ = 0 (⊥ ŝ by construction).
+static func day_factor(mu: float) -> float:
+	return smoothstep(-TERMINATOR_MU, TERMINATOR_MU, mu)
+
+## A5 C2: the globe per-vertex darkening at mu = n̂·ŝ — NIGHT_FLOOR + (1−NIGHT_FLOOR)·day(mu), in [FLOOR,1].
+static func shell_day_shade(mu: float) -> float:
+	return SHELL_NIGHT_FLOOR + (1.0 - SHELL_NIGHT_FLOOR) * day_factor(mu)
+
+## A4 Moon self-phase twin: the disc-integrated lit fraction of a Lambert sphere at phase-cosine cos_phase
+## (cos of the sun–observer angle seen from the Moon) = (1+cos_phase)/2 — EXACTLY EPH.illuminated_fraction,
+## so the unshaded per-fragment Lambert shader and the ephemeris agree by construction (gate G-AS-ABSLIGHT).
+static func lambert_illum_fraction(cos_phase: float) -> float:
+	return 0.5 * (1.0 + clampf(cos_phase, -1.0, 1.0))
+
+## A6 C4: the atmosphere shell outer radius (blocks) = r_solid + SHELL_ATMO_MULT·ATMO_TOP.
+static func shell_outer_r(r_solid: float) -> float:
+	return r_solid + SHELL_ATMO_MULT * H_ATMO
+
+## A6 C4: the CLOSED-FORM view-ray shell geometry (no volumetrics). Returns [chord, h_min]:
+##   • chord = the FORWARD path length (blocks) inside the atmosphere shell but OUTSIDE the solid planet and
+##     in FRONT of the planet's near surface (the solid disc occludes the far atmosphere — the limb integral);
+##     handles camera INSIDE the shell (near entry clamped to 0 ⇒ the horizon-band sky) and OUTSIDE it.
+##   • h_min = closest-approach altitude of the ray to the planet centre, minus r_solid (drives ρ(max(h_min,0))).
+## `dir` must be unit. Pure geometry — the GLSL twin mirrors this exactly (gate G-AS-LIMB).
+static func shell_geom(cam: Vector3, centre: Vector3, dir: Vector3, r_solid: float, r_outer: float) -> Array:
+	var oc := centre - cam
+	var dc2 := oc.dot(oc)
+	var tca := oc.dot(dir)
+	var b2 := maxf(dc2 - tca * tca, 0.0)
+	var b := sqrt(b2)
+	var h_min := b - r_solid
+	if b >= r_outer:
+		return [0.0, h_min]                       # the ray misses the atmosphere entirely
+	var half_out := sqrt(maxf(r_outer * r_outer - b2, 0.0))
+	var seg_start := maxf(tca - half_out, 0.0)    # forward entry into the shell (0 when the camera is inside)
+	var seg_end := tca + half_out                  # forward exit from the shell
+	if b < r_solid:                                # the infinite line pierces the solid planet…
+		var t_hit := tca - sqrt(maxf(r_solid * r_solid - b2, 0.0))   # …near-surface intersection
+		if t_hit > 0.0:                            # …but only occlude when that hit is IN FRONT (else the ray looks away)
+			seg_end = minf(seg_end, t_hit)
+	return [maxf(seg_end - seg_start, 0.0), h_min]
+
+## A6 C4: the additive limb/sky colour twin. mu = x̂_ca·ŝ (surface dir at closest approach); cos_day drives
+## day(mu) so the limb reddens across the terminator and goes dark on the night side — the SAME curves as the
+## ground sunset (C1) and the globe (C2). Out = RAYLEIGH_BLUE·mix(1,T(mu),band(mu)) · day(mu) · L, additive.
+static func shell_limb_color(mu: float, chord: float, h_min: float) -> Color:
+	var strength := chord * exp(-maxf(h_min, 0.0) / H_SCALE) / H_SCALE   # single-sample optical path ∝ chord·ρ(h_min)
+	var t := scatter_tint(mu)
+	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
+	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
+	var l := strength * day_factor(mu) * SHELL_LIMB_GAIN
+	return Color(base.r * l, base.g * l, base.b * l)
 
 # ---------------------------------------------------------------------------------------
 # COSMOS-LOD-SKY task 2 (docs/COSMOS-LOD-SKY-DESIGN.md §6, §7.3) — celestial lighting statics. ALL pure
@@ -304,8 +520,26 @@ func _build_nodes() -> void:
 	# bodies are BEYOND the atmosphere by definition and must never be fogged.
 	sun_mat.disable_fog = true
 	_sun.material_override = sun_mat
+	_sun_mat = sun_mat                                    # A2: reddened by T(μ_cam) each frame under FP_SUN_PRESENCE
 	_sun.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_sun)
+
+	# --- A2 (FP_SUN_PRESENCE): the additive Sun glare quad. Built ONLY under the flag ⇒ no extra node/draw with it
+	# off (byte-identical). Placed + intensity-driven each frame in _update_sky; billboarded toward the camera.
+	if CubeSphere.FP_SUN_PRESENCE:
+		_glare = MeshInstance3D.new()
+		_glare.name = "SunGlare"
+		_glare.mesh = QuadMesh.new()
+		var gsh := Shader.new()
+		gsh.code = _SUN_GLARE_SHADER
+		_glare_mat = ShaderMaterial.new()
+		_glare_mat.shader = gsh
+		_glare_mat.set_shader_parameter("glare_color", Vector3(1.0, 0.95, 0.85))
+		_glare_mat.set_shader_parameter("intensity", 1.0)
+		_glare.material_override = _glare_mat
+		_glare.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_glare.sorting_offset = -0.5                      # sort with the additive dome, never against the opaque disc
+		add_child(_glare)
 
 	# --- THE DirectionalLight (day-night sun light). Shadows OFF by default (D11 / risk #6).
 	_sun_light = DirectionalLight3D.new()
@@ -338,6 +572,17 @@ func _build_nodes() -> void:
 	_moon_mat.metallic = 0.0
 	_moon_mat.disable_fog = true                          # BLACK-SKY FIX — see the Sun note above (fog opaque at 8820 > D_SKY)
 	_moon.material_override = _moon_mat
+	# --- A4 (FP_LIGHT_ABSOLUTE): the unshaded self-phase material replaces the shaded StandardMaterial so the Moon
+	# does NOT black out when C1 dims the global light at night. Built + selected ONLY under the flag ⇒ off is
+	# byte-identical (override stays the shipped _moon_mat). The eclipse redden then feeds `base_albedo` (see _update_sky).
+	if CubeSphere.FP_LIGHT_ABSOLUTE:
+		var msh := Shader.new()
+		msh.code = _MOON_PHASE_SHADER
+		_moon_phase_mat = ShaderMaterial.new()
+		_moon_phase_mat.shader = msh
+		_moon_phase_mat.set_shader_parameter("base_albedo", _MOON_ALBEDO_BASE)
+		_moon_phase_mat.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		_moon.material_override = _moon_phase_mat
 	_moon.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_moon)
 
@@ -372,6 +617,36 @@ func _build_nodes() -> void:
 	# cannot occlude, this just keeps it out of the transparent sort against the impostors.
 	_stars.sorting_offset = -1.0
 	add_child(_stars)
+
+	# --- A6 (FP_ATMO_SHELL): the atmosphere limb/sky shell. Built ONLY under the flag ⇒ no node/draw with it off
+	# (byte-identical). Radius = R + SHELL_ATMO_MULT·ATMO_TOP, planet-centred at the scene origin; the near-space
+	# (h < D_ENGAGE) regime is unscaled so it aligns with the unscaled far ring exactly. Uniforms driven per frame.
+	if CubeSphere.FP_ATMO_SHELL:
+		var r_vox := CosmosGravity.r_vox(OBSERVER)
+		var r_outer := shell_outer_r(r_vox)
+		_atmo_shell = MeshInstance3D.new()
+		_atmo_shell.name = "AtmosphereShell"
+		var ash_mesh := SphereMesh.new()
+		ash_mesh.radius = r_outer
+		ash_mesh.height = r_outer * 2.0
+		ash_mesh.radial_segments = 48
+		ash_mesh.rings = 24
+		_atmo_shell.mesh = ash_mesh
+		var ash_sh := Shader.new()
+		ash_sh.code = _ATMO_SHELL_SHADER
+		_atmo_shell_mat = ShaderMaterial.new()
+		_atmo_shell_mat.shader = ash_sh
+		_atmo_shell_mat.set_shader_parameter("centre", Vector3.ZERO)
+		_atmo_shell_mat.set_shader_parameter("r_solid", r_vox)
+		_atmo_shell_mat.set_shader_parameter("r_outer", r_outer)
+		_atmo_shell_mat.set_shader_parameter("h_scale", H_SCALE)
+		_atmo_shell_mat.set_shader_parameter("term_mu", TERMINATOR_MU)
+		_atmo_shell_mat.set_shader_parameter("gain", SHELL_LIMB_GAIN)
+		_atmo_shell_mat.set_shader_parameter("rayleigh_blue", Vector3(RAYLEIGH_BLUE.r, RAYLEIGH_BLUE.g, RAYLEIGH_BLUE.b))
+		_atmo_shell.material_override = _atmo_shell_mat
+		_atmo_shell.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_atmo_shell.sorting_offset = -0.9                 # additive, with the dome; never sorts against the opaque discs
+		add_child(_atmo_shell)
 
 	# --- COSMOS-LOD-SKY M2 (FP_MOON_RING): the Moon's coarse far ring. Created ONLY when the flag + MULTI_BODY
 	# are on (the Moon facets must exist in the atlas); built lazily on the IMPOSTOR→RING promotion and placed to
@@ -410,16 +685,60 @@ func _update_sky(t: float) -> void:
 	# (i.e. +Z = sun_dir). look_at points local −Z at the target, so look from cam toward (cam − sun_dir).
 	_sun_light.transform = _looking_along(-sun_dir, cam_origin)
 
-	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter.
-	var sun_ang := EPH.angular_diameter("sun", OBSERVER, t)
-	_place_impostor(_sun, cam_origin + sun_dir * _dsky, _dsky * tan(sun_ang * 0.5))
+	# --- A1/A2 planet-occlusion + presence inputs (evaluated only when a flag is on ⇒ byte-identical off) ---
+	var r_vox_sky := 0.0
+	var occ_cam := 1.0                                       # sun visibility from the camera (0 = behind the planet disc)
+	if CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE:
+		r_vox_sky = CosmosGravity.r_vox(OBSERVER)
+		occ_cam = occlusion_factor(sun_dir, cam_origin, r_vox_sky)
 
-	# Moon impostor: body-fixed direction from Earth, exact angular size, lit by the shared light.
+	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter. A2 floors the angular
+	# size (the real 0.53° disc is an invisible ~8-px dot on gl_compat with no glare); off ⇒ the exact size.
+	var sun_ang := EPH.angular_diameter("sun", OBSERVER, t)
+	if CubeSphere.FP_SUN_PRESENCE:
+		sun_ang = maxf(sun_ang, deg_to_rad(CubeSphere.SUN_MIN_ANG_DEG))
+	var sun_pos := cam_origin + sun_dir * _dsky
+	var sun_r := _dsky * tan(sun_ang * 0.5)
+	_place_impostor(_sun, sun_pos, sun_r)
+
+	# Moon impostor: body-fixed direction from Earth, exact angular size (A2-floored), lit by the shared light.
 	var moon_dir := EPH.dir_to_bodyfixed(OBSERVER, "moon", t)
 	if moon_dir == Vector3.ZERO:
 		moon_dir = Vector3(-1.0, 0.0, 0.0)
 	var moon_ang := EPH.angular_diameter("moon", OBSERVER, t)
+	if CubeSphere.FP_SUN_PRESENCE:
+		moon_ang = maxf(moon_ang, deg_to_rad(CubeSphere.MOON_MIN_ANG_DEG))
 	_place_impostor(_moon, cam_origin + moon_dir * _dsky, _dsky * tan(moon_ang * 0.5))
+
+	# A4 (FP_LIGHT_ABSOLUTE): drive the Moon self-phase shader's sun direction — its lit hemisphere faces the
+	# Sun exactly as the shipped shaded material did under the DirectionalLight, but unshaded ⇒ never blacks out
+	# when C1 dims the global light at night. No-op unless the phase material was built (byte-identical off).
+	if _moon_phase_mat != null:
+		_moon_phase_mat.set_shader_parameter("sun_dir", sun_dir)
+
+	# A2 (FP_SUN_PRESENCE): redden the Sun disc by the direct-light transmittance T(μ_cam) so it agrees with the
+	# sunset sky, and drive the additive glare quad (billboarded at the Sun, brightness ×occ so it dies at
+	# sunset/eclipse/umbra). occ_cam is the same planet-occlusion the disc uses. Flag off ⇒ none of this runs.
+	if CubeSphere.FP_SUN_PRESENCE:
+		var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+		var mu_cam := sun_dir.dot(up_s)
+		var st := scatter_tint(mu_cam)                       # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
+		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
+		if _sun_mat != null:
+			_sun_mat.emission = reddened
+			_sun_mat.albedo_color = reddened
+		if _glare != null:
+			_place_glare(sun_pos, sun_r * CubeSphere.SUN_GLARE_RADII, cam_origin)
+			_glare_mat.set_shader_parameter("intensity", occ_cam)
+			_glare_mat.set_shader_parameter("glare_color", Vector3(reddened.r, reddened.g, reddened.b))
+			_glare.visible = occ_cam > 0.001
+
+	# A1 (FP_SKY_PLANET_OCCLUDE): hide the Sun/Moon impostors when the planet disc covers their direction (once A0
+	# renders the planet at d≫D_SKY the opaque discs would otherwise draw IN FRONT of it). occlusion_factor==0
+	# means the body is behind the disc. Flag off ⇒ both stay visible (byte-identical). Star-dome mask below.
+	if CubeSphere.FP_SKY_PLANET_OCCLUDE:
+		_sun.visible = occ_cam >= 0.5
+		_moon.visible = occlusion_factor(moon_dir, cam_origin, r_vox_sky) >= 0.5
 
 	# --- L1 MOONSHINE (SKY_MOONSHINE, §7.3). Compute the Moon geometry _ramp_environment reads, redden the
 	# impostor through a lunar eclipse, and (v1) aim the optional real second light. Flag off ⇒ this whole block
@@ -431,7 +750,12 @@ func _update_sky(t: float) -> void:
 		_moon_eclipse = moon_eclipse_factor(t)
 		# Eclipse redden: blend the shipped grey toward the §6 horizon crimson as the Moon enters the umbra.
 		var umbra := scatter_tint(0.0)                       # deep crimson (m≈38 horizon transmittance)
-		_moon_mat.albedo_color = _MOON_ALBEDO_BASE.lerp(umbra, 1.0 - _moon_eclipse)
+		var moon_albedo := _MOON_ALBEDO_BASE.lerp(umbra, 1.0 - _moon_eclipse)
+		# A4: under the self-phase shader the eclipse redden feeds `base_albedo`; else the shipped StandardMaterial.
+		if _moon_phase_mat != null:
+			_moon_phase_mat.set_shader_parameter("base_albedo", moon_albedo)
+		else:
+			_moon_mat.albedo_color = moon_albedo
 		if _moon_light != null:                              # v1 (SKY_MOONSHINE_LIGHT): a real −moon_dir light
 			_moon_light.transform = _looking_along(-moon_dir, cam_origin)
 			var night_authority := 1.0 - clampf((clampf(sun_dir.dot(up), -1.0, 1.0) + 0.15) / 0.30, 0.0, 1.0)
@@ -439,8 +763,25 @@ func _update_sky(t: float) -> void:
 
 	# Star dome: centred on the camera, rotated by −Earth spin (the stars wheel as the planet turns).
 	var spin := EPH.spin_angle(OBSERVER, t)
-	var star_xf := Transform3D(Basis(Vector3(0, 0, 1), -spin), cam_origin)
-	_stars.transform = star_xf
+	var star_basis := Basis(Vector3(0, 0, 1), -spin)
+	_stars.transform = Transform3D(star_basis, cam_origin)
+	# A1 (FP_SKY_PLANET_OCCLUDE): feed the star-dome planet-disc mask (LOCAL dome frame, so it composes with the
+	# −spin rotation). Above the surface the disc covers a real solid angle → stars inside it are discarded; at/
+	# inside the surface nothing is masked. Flag off ⇒ never written (planet_cos_ang stays the 2.0 default = no mask).
+	if CubeSphere.FP_SKY_PLANET_OCCLUDE and _star_mat != null:
+		var dist_s := cam_origin.length()
+		if dist_s > r_vox_sky and r_vox_sky > 0.0:
+			_star_mat.set_shader_parameter("planet_dir", star_basis.inverse() * (-cam_origin / dist_s))
+			_star_mat.set_shader_parameter("planet_cos_ang", cos(asin(clampf(r_vox_sky / dist_s, 0.0, 1.0))))
+		else:
+			_star_mat.set_shader_parameter("planet_cos_ang", 2.0)   # at/inside the surface: mask nothing
+
+	# A6 (FP_ATMO_SHELL): feed the atmosphere shell its camera + Sun direction (centre/R/gain are static uniforms
+	# set at build). The shell is planet-centred at the scene origin; the camera moves within/around it. No-op
+	# unless the shell was built ⇒ byte-identical off.
+	if _atmo_shell_mat != null:
+		_atmo_shell_mat.set_shader_parameter("cam", cam_origin)
+		_atmo_shell_mat.set_shader_parameter("sun_dir", sun_dir)
 
 	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up).
 	_ramp_environment(sun_dir, cam_origin)
@@ -467,42 +808,61 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var twilight := clampf((elev + 0.15) / 0.30, 0.0, 1.0)   # soft dawn/dusk band around the horizon
 	var night_fade := 1.0 - twilight                         # shipped star-fade: stars own the night sky
 
-	# --- SN4 altitude inputs (only evaluated when a flag is on; flag-off ⇒ byte-identical below) ---
+	# --- SN4 / ATMO-SKY altitude inputs (only evaluated when a flag is on; flag-off ⇒ byte-identical below) ---
 	var atmo_on := CubeSphere.ATMO_VISUAL_RAMP
 	var occ_on := CubeSphere.SN_SUN_OCCLUSION
+	var atmo_zero := CubeSphere.FP_ATMO_SPACE_ZERO           # A3: atmo_vis replaces the space_mix band
+	var light_abs := CubeSphere.FP_LIGHT_ABSOLUTE           # A4: absolute occ-always light + ambient
 	var h := 0.0
 	var r_vox := 0.0
 	var has_atmo := true
-	if atmo_on or occ_on:
+	if atmo_on or occ_on or atmo_zero or light_abs:
 		r_vox = CosmosGravity.r_vox(OBSERVER)
 		h = cam_origin.length() - r_vox                      # radial altitude above the voxel surface
 		has_atmo = OrbitalState.has_atmo(OBSERVER)
-	var sm := space_mix(h, has_atmo) if atmo_on else 0.0
+	# The "space fraction" driving the sky-blacken / star-emerge / ambient-thin. A3 replaces the 192..960
+	# space_mix band with 1−atmo_vis (a 0.5·ATMO_TOP..ATMO_TOP fade, exactly 1 at/above ATMO_TOP ⇒ star-black
+	# in space with NO twilight leak). atmo_eff gates the blacken/fog path (either the shipped ramp or A3).
+	var atmo_eff := atmo_on or atmo_zero
+	var sm := 0.0
+	if atmo_zero:
+		sm = 1.0 - atmo_vis(h, has_atmo)
+	elif atmo_on:
+		sm = space_mix(h, has_atmo)
 
 	# BLACK-SKY FIX: fade the additive starfield out as twilight brightens, so stars own the night sky
 	# and add nothing at noon (the ramped blue background then reads through the dome untouched). Driven
 	# from the SAME elevation as the background ramp, so stars and sky can never disagree. Kept OUTSIDE
 	# the `_env == null` early-out below — the starfield must still ramp when there is no Environment.
-	# SN4a: stars ALSO emerge as the sky blackens with altitude (star_fade = max(night_fade, space_mix)).
+	# SN4a/A3: stars ALSO emerge as the sky blackens with altitude (star_fade = max(night_fade, space fraction)).
 	if _star_mat != null:
-		_star_mat.set_shader_parameter("star_fade", maxf(night_fade, sm) if atmo_on else night_fade)
+		_star_mat.set_shader_parameter("star_fade", maxf(night_fade, sm) if atmo_eff else night_fade)
 
-	# SN4b: the sun-occlusion dimmer drives the DirectionalLight energy. Computed OUTSIDE the `_env == null`
-	# guard — the light must dim even when there is no Environment. Flag-off ⇒ light_energy is never touched
-	# (stays the shipped 1.0 set in _build_nodes).
-	if occ_on:
+	# The DirectionalLight energy/colour. A4 (light_abs) is the ABSOLUTE occ-always dimmer with pen(h) twilight +
+	# T(μ) sunset-reddened colour — the dark side stays dark from EVERY camera (supersedes the SN4b authority
+	# lerp). Else SN4b's occlusion_light (authority-blended). Both OUTSIDE the `_env == null` guard — the light
+	# must dim without an Environment. Flag-off ⇒ light_energy/colour never touched (shipped 1.0 / white).
+	if light_abs:
+		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox)
+		_sun_light.light_color = scatter_tint(maxf(elev, 0.0))
+	elif occ_on:
 		_sun_light.light_energy = occlusion_light(sun_dir, cam_origin, h, r_vox, has_atmo)
 
 	if _env == null:
 		return
 	var sky := _SKY_NIGHT.lerp(_SKY_DAY, twilight)
 	var ambient := lerpf(_NIGHT_AMBIENT_ENERGY, 1.0, day)
-	if atmo_on:
-		# SN4a: sky → BLACK, ambient → AMBIENT_SPACE, fog thins with altitude (all composed onto the ramp).
+	if atmo_eff:
+		# SN4a/A3: sky → BLACK, ambient → AMBIENT_SPACE, fog thins with altitude (all composed onto the ramp).
+		# A3: black is reached exactly at ATMO_TOP (sm=1), so the space sky is star-black with NO day/night leak.
 		sky = sky.lerp(Color.BLACK, sm)
 		ambient *= ambient_scale(sm)
 		_env.fog_density = fog_density_at(h, has_atmo)
-	if occ_on:
+	# Ambient umbra factor: A4's absolute dimmer (continuous, no authority — the surface night side is dark
+	# too, restoring the pre-ORBITAL ambient-only night), else SN4b's altitude-authority occlusion_ambient.
+	if light_abs:
+		ambient *= ambient_absolute(sun_dir, cam_origin, h, r_vox)
+	elif occ_on:
 		ambient *= occlusion_ambient(sun_dir, cam_origin, h, r_vox, has_atmo)
 
 	# L2 SKY_SCATTER_RAMP (§6a): recolour the sky/fog toward the Rayleigh direct-light transmittance as the Sun
@@ -516,6 +876,8 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var amb_col_write := false
 	if CubeSphere.SKY_SCATTER_RAMP:
 		var w := sunset_weight(elev)
+		if atmo_zero:
+			w *= atmo_vis(h, has_atmo)                        # A3: the sunset recolour fades to 0 in space (no space tint)
 		if w > 0.0:
 			var st := scatter_tint(elev)
 			sky = sky.lerp(Color(sky.r * st.r, sky.g * st.g, sky.b * st.b), w)
@@ -563,6 +925,21 @@ func _looking_along(fwd: Vector3, origin: Vector3) -> Transform3D:
 func _place_impostor(mi: MeshInstance3D, pos: Vector3, radius: float) -> void:
 	var r := maxf(radius, 0.001)
 	mi.transform = Transform3D(Basis().scaled(Vector3(r, r, r)), pos)
+
+## A2 (FP_SUN_PRESENCE): billboard the glare QuadMesh at `pos`, +Z facing the camera, half-extent `half`.
+## QuadMesh spans ±0.5, so the basis is scaled by 2·half to reach the requested half-extent.
+func _place_glare(pos: Vector3, half: float, cam: Vector3) -> void:
+	var fz := cam - pos
+	if fz.length() < 1.0e-4:
+		fz = Vector3(0.0, 0.0, 1.0)
+	fz = fz.normalized()
+	var up := Vector3(0.0, 0.0, 1.0)
+	if absf(fz.dot(up)) > 0.99:
+		up = Vector3(0.0, 1.0, 0.0)
+	var fx := up.cross(fz).normalized()
+	var fy := fz.cross(fx).normalized()
+	var s := 2.0 * maxf(half, 0.001)
+	_glare.transform = Transform3D(Basis(fx, fy, fz).scaled(Vector3(s, s, s)), pos)
 
 ## COSMOS-LOD-SKY M1 (FP_BODY_LOD) — the per-frame LOD SELECTION consult (§2). For each celestial body,
 ## classify its presented tier from the angular-size law (relief_px vs TAU_POP, latched ±25% hysteresis) and

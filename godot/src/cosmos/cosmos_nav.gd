@@ -77,6 +77,11 @@ const ATMO_MARGIN := 32.0               # ±32 blocks absolute on the atmosphere
 # ---------------------------------------------------------------------------------------
 const MAX_NAV_DT := 0.03333333333333333  # 1/30 s — clamp on the dt fed to the space-nav per-frame path
 const MIN_FD_DT := 1.0e-4                 # floor (s) on the finite-difference dt so v_fix cannot blow up
+# G-REENTRY FIX D: cap on the REAL frame dt fed to the NavState DWELL (which is UX seconds, not integrator
+# time). Feeding it MAX_NAV_DT starves the 2-s dwell under multi-second frames (the live "stuck low_orbit
+# at 160k": ~10 frames in 147 s accrued 0.3 s) — the dwell must see wall time. Capped at 1 s so one absurd
+# hitch frame cannot alone commit a transient mode flap (still needs ≥ 2 consecutive agreeing frames).
+const NAV_DWELL_DT_MAX := 1.0
 
 ## Clamp a per-frame dt to the space-nav safe range [0, MAX_NAV_DT] (G-SN-NOSPIRAL). Pure; the player and the
 ## gate call this ONE function so the bound they enforce/assert are identical. dt ≤ 0 passes through as 0.

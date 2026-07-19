@@ -652,6 +652,13 @@ func _nav_tick(delta: float) -> void:
 	# G-SN-NOSPIRAL: clamp the per-frame dt fed to the nav path so a post-hitch huge frame (a 16-s recovery
 	# frame was seen live) can never feed a runaway dt into the clock advance, the finite difference, or any
 	# integration downstream. 1/30 s ⇒ a normal 60-fps tick (dt = 1/60) is UNCHANGED (byte-neutral common case).
+	# G-REENTRY FIX D (dwell starvation — the corroborated "stuck low_orbit at 160k"): the NavState dwell is
+	# UX time ("the raw mode held 2 s") and must accumulate REAL elapsed seconds, not the clamped integrator
+	# dt. Under multi-second frames the clamped dt (≤ 1/30 per frame) starves the dwell — ~10 frames in 147 s
+	# accrued 0.3 s live, so the raw DEEP_SPACE reclassification never committed. Pass the real frame delta,
+	# capped at NAV_DWELL_DT_MAX so one absurd hitch frame cannot single-handedly commit a transient flap.
+	# A normal 60-fps frame (raw == 1/60 < 1/30) passes both identically — byte-neutral common case.
+	var dwell_dt := minf(delta, _CosmosNavCls.NAV_DWELL_DT_MAX) if delta > 0.0 else 0.0
 	delta = _CosmosNavCls.clamp_nav_dt(delta)
 	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
 	var p_fix := _DVCls.v(w[0], w[1], w[2])                 # body-fixed (planet-pinned) world position, f64
@@ -675,7 +682,7 @@ func _nav_tick(delta: float) -> void:
 	# _nav_last_v_bci seed the free-fall/dev-flight re-seed from): garbage falls back to the last-good
 	# velocity (velocity-continuous), so a position jump can never become adopted motion (the 642074 latch).
 	v_bci = _CosmosNavCls.sane_v(v_bci, _nav_last_v_bci)
-	_nav.tick(body, p_bci, v_bci, _nav_clock, delta)
+	_nav.tick(body, p_bci, v_bci, _nav_clock, dwell_dt)     # FIX D: dwell advances by REAL (capped) frame time
 	_nav_prev_fix = p_fix
 	_nav_have_prev = true
 	_nav_last_v_bci = v_bci                                  # seed for the next orbital dev-flight handoff (SN5)

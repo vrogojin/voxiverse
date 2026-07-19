@@ -116,6 +116,26 @@ func _gate_reentry_guards() -> void:
 	st = NAV.clamp_bci_state(p_far, DV.v(0.0, 0.0, -50.0), p0, v0, soi)
 	_ok(absf(float(st[1][2]) + 50.0) < 1.0e-9, "clamp keeps INWARD radial velocity (recovery fall proceeds)")
 
+	# FIX D — dwell starvation (the corroborated "stuck low_orbit at 160k"). The dwell is UX seconds: fed
+	# real (capped) frame time, a persistent raw reclassification commits in ceil(2s/dt) frames even when
+	# frames are seconds long; fed the CLAMPED integrator dt (1/30) it would take 60 frames (~15 min wall at
+	# 14 s/frame — the live starvation). Drive the kernel with both dts and assert the bound the player
+	# wiring now uses (NAV_DWELL_DT_MAX = 1.0) commits in 2-3 slow frames.
+	var ns := NAV.NavState.new()
+	ns.mode = NAV.LOW_ORBIT
+	var p_deep := DV.v(0.0, 0.0, 20.0 * r_vox)               # far outside the well/vicinity ⇒ raw != LOW_ORBIT
+	var v_deep := DV.v(0.0, 0.0, 0.0)
+	var n_slow := 0
+	while int(ns.mode) == NAV.LOW_ORBIT and n_slow < 10:
+		ns.tick("earth", p_deep, v_deep, 0.0, NAV.NAV_DWELL_DT_MAX)   # the wiring's capped REAL dt per slow frame
+		n_slow += 1
+	_ok(int(ns.mode) != NAV.LOW_ORBIT and n_slow <= 3, "dwell fed capped REAL dt commits the reclassification in %d slow frames (≤3)" % n_slow)
+	var ns2 := NAV.NavState.new()
+	ns2.mode = NAV.LOW_ORBIT
+	for i in 10:
+		ns2.tick("earth", p_deep, v_deep, 0.0, NAV.MAX_NAV_DT)        # the OLD wiring's clamped dt
+	_ok(int(ns2.mode) == NAV.LOW_ORBIT, "falsify: dwell fed the clamped integrator dt is still STARVED after 10 slow frames (the live stuck-mode)")
+
 # ---------- a BCI state at radius r on the equator (XY plane) with speed-ratio u tangential ----------
 # Tangential (prograde-east) velocity of magnitude u·v_circ(r). Pure setup helper for synthetic rows.
 func _state_at(body: String, r: float, u: float) -> Array:

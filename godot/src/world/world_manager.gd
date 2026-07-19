@@ -143,6 +143,10 @@ var _snowfall: SnowfallSystem
 # the game-time for insolation/seasons; null ⇒ the grid runs on its own default dt (still a valid diurnal
 # cycle once the clock exists). Both null in the shipped flat game ⇒ zero cost.
 var _weather: WeatherSystem
+# FP_WEATHER_THREAD: the dedicated weather WORKER thread (null unless the flag is on). Once the static basis
+# is built on the main thread, the sweep is handed to this worker (EnvSimWorker) so the per-frame main-thread
+# cost collapses to a swap check. Stopped/joined in _exit_tree (no dangling thread on scene exit).
+var _weather_worker: EnvSimWorker = null
 var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
@@ -263,6 +267,11 @@ func _ready() -> void:
 		_weather = WeatherSystem.new()
 		_weather.setup()
 		environment.set_weather(_weather)
+		# FP_WEATHER_THREAD: create (but do not yet start) the weather worker. It is started from _process
+		# only once the static basis is fully built on the main thread (build_init is sliced over startup),
+		# so the thread never races the one-time basis construction. Flag off ⇒ null ⇒ the main-thread path.
+		if CubeSphere.FP_WEATHER_THREAD:
+			_weather_worker = EnvSimWorker.new(_weather)
 	# Far-distance terrain layer (LOD-DESIGN): render-only, collision-free, voxel-worker-free —
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
@@ -332,7 +341,19 @@ func _process(delta: float) -> void:
 	if _weather != null:
 		var gt := _cosmos_clock.now() if _cosmos_clock != null else 0.0
 		var t_w := Time.get_ticks_usec()
-		_weather.process(delta, gt)
+		if _weather_worker != null:
+			# FP_WEATHER_THREAD: the sweep runs OFF the main thread. Build the static basis on the main thread
+			# (sliced, exactly as the shipped path — a bounded one-time startup cost, not the per-frame hitch),
+			# then hand the steady-state sweep to the worker. Once handed off the main thread only polls: a
+			# swap check + an occasional pointer flip ⇒ ~0 main-thread cost (G-WTHREAD-MAINCOST).
+			if not _weather.is_ready():
+				_weather.build_init()
+				if _weather.is_ready():
+					_weather_worker.start()   # basis done → spin the thread (it blocks until the first poll)
+			else:
+				_weather_worker.poll(gt)
+		else:
+			_weather.process(delta, gt)
 		_weather_us_max = maxi(_weather_us_max, Time.get_ticks_usec() - t_w)
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
@@ -371,6 +392,13 @@ func _process(delta: float) -> void:
 		if _lod_excl_accum >= 0.5:
 			_lod_excl_accum = 0.0
 			_facet_ring_sync_exclusion()
+
+## FP_WEATHER_THREAD: JOIN the weather worker before the node is torn down so no thread outlives the scene
+## (the SnowfallSystem/pool teardown discipline). stop() is safe if the worker was never started, and a
+## no-op when the flag is off (the worker is null). Byte-identical with the flag off (the method is inert).
+func _exit_tree() -> void:
+	if _weather_worker != null:
+		_weather_worker.stop()
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a

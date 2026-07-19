@@ -110,6 +110,7 @@ func _initialize() -> void:
 		print("  G-DATUM-OCEAN: worst sea-surface step over seams touching ocean = %.4f blocks" % max_ocean)
 		_ok(max_ocean <= 1.15, "ocean seam step %.4f > 1.15 — the sea does not ride S" % max_ocean)
 		_gate_radial()
+		_gate_wired()
 	else:
 		print("  G-DATUM-OFF: worst placed-surface step (flag off, S=0) = %.4f blocks" % max_step)
 		_ok(absf(max_step - 5.30) <= 0.20, "flag-off step %.4f != ~5.30 — the FS0 cliff should return with S=0" % max_step)
@@ -134,3 +135,32 @@ func _gate_radial() -> void:
 					worst = maxf(worst, absf(_rlen(w) - (FA.R_BLOCKS + float(g))))
 	print("  G-DATUM-RADIAL: worst |placed_alt − (R+g)| over sampled columns = %.4f blocks" % worst)
 	_ok(worst <= 0.65, "placed surface is not radial: |alt − (R+g)| %.4f > 0.65" % worst)
+
+## G-DATUM-WIRED: the actual worldgen re-index is live — the surface funnel (height_at) returns g + S and the
+## analytic cell path (generated_cell) places the surface at lattice g + S with the raised band g+1..g+S filled.
+## This proves the GDScript wiring (analytic + funnel) does the shift, not just the datum_shift helper geometry.
+func _gate_wired() -> void:
+	var fid := FA.spawn_facet()
+	TerrainConfig.set_active_facet(fid)
+	var cc := FA.centre_cell(fid)
+	var checked := 0
+	var ok_h := true; var ok_solid := true; var ok_raise := true
+	for dxy in [[0, 0], [10, 10], [-10, 5], [5, -10], [20, -6], [-14, 12]]:
+		var x: int = cc.x + int(dxy[0]); var z: int = cc.y + int(dxy[1])
+		var g := int(TerrainConfig.facet_profile(fid, x, z).x)
+		var s := FA.datum_shift(fid, x, z)
+		if g <= TerrainConfig.SEA_LEVEL or s <= 0:
+			continue                                    # want a LAND column that actually shifts
+		checked += 1
+		if TerrainConfig.height_at(x, z) != g + s:
+			ok_h = false
+		if CellCodec.mat(TerrainConfig.generated_cell(x, g + s, z)) == 0:
+			ok_solid = false                            # the surface must be SOLID at lattice g+S
+		if CellCodec.mat(TerrainConfig.generated_cell(x, g + 1, z)) == 0:
+			ok_raise = false                            # the raised band g+1..g+S must be filled (was air pre-shift)
+	print("  G-DATUM-WIRED: %d land columns checked; height_at==g+S:%s surface-solid@g+S:%s raised-band-filled:%s" % [
+		checked, str(ok_h), str(ok_solid), str(ok_raise)])
+	_ok(checked >= 2, "no land column with S>0 sampled — cannot verify the wiring")
+	_ok(ok_h, "height_at does not return g + S (surface funnel not wired)")
+	_ok(ok_solid, "generated_cell is not solid at the placed surface g + S (analytic exit not wired)")
+	_ok(ok_raise, "the raised band g+1..g+S is not filled (the datum re-index did not run)")

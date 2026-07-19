@@ -561,6 +561,7 @@ static func _build_cpp_gen(active_fid: int) -> Object:
 		"temperature": ns["temperature"], "humidity": ns["humidity"], "mountain": ns["mountain"],
 		"seed": ns["seed"], "gen_face": 0, "gen_n": 0, "gen_facet": active_fid,
 		"flat_world": true, "faceted": CubeSphere.FACETED, "m5c_corner": CubeSphere.M5C_CORNER,
+		"radial_datum": CubeSphere.FP_RADIAL_DATUM,   # COSMOS FS2 §3.2: the skin sample_columns adds S in C++ too
 		"cube_arid": PackedInt32Array([0, 1, 2, 3, 4, 5, 6, 7]),
 		"block_ids": TerrainConfig.appearance_surface_materials(), "model_count": 8, "waterlog": false,
 		"id_wood": BlockCatalog.WOOD, "id_leaf": BlockCatalog.LEAF,

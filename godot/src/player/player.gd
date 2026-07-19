@@ -184,6 +184,10 @@ var remote_run := false                   # substitutes the KEY_SHIFT poll
 var remote_jump := false                  # one-shot latch, consumed by the grounded/fly jump branch (§4.6)
 var remote_yaw_rate := 0.0                # rad/s the executor is applying this tick (seam indicator; the
                                           # executor owns the exact rotate_y for seam-immune remaining-degrees)
+# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the ROLL seam. rad/s the executor is applying this tick,
+# OR'd into the KEY_Q/KEY_E poll in _attitude_tick's ATT_SPACE branch (the ONLY place roll is read). Zero in
+# normal play and while no roll step runs; the executor never exists off CONTROL_ENABLED, so byte-identical.
+var remote_roll_rate := 0.0
 var remote_exec: Node = null              # the RemoteControl executor; ticked from _physics_process (§4.3)
 
 func _ready() -> void:
@@ -376,10 +380,14 @@ func _attitude_tick(delta: float) -> void:
 				_camera.top_level = true
 				_write_attitude_camera()
 		ATT_SPACE:
-			# Q/E roll (held keys — a continuous rate, so polled here not in _unhandled_input).
+			# Q/E roll (held keys — a continuous rate, so polled here not in _unhandled_input). SPACE-FLY: the
+			# executor's remote_roll_rate (rad/s) is OR'd in as a rate offset so a scripted `roll` step twists the
+			# BCI attitude through the SAME apply_roll a human's Q/E does. Zero in normal play (byte-identical).
 			var roll := 0.0
 			if Input.is_key_pressed(KEY_Q): roll += 1.0
 			if Input.is_key_pressed(KEY_E): roll -= 1.0
+			if remote_roll_rate != 0.0 and CubeSphere.ORBIT_ROLL_RATE > 0.0:
+				roll += remote_roll_rate / CubeSphere.ORBIT_ROLL_RATE   # express the rad/s seam in apply_roll's ±1 rate units
 			if roll != 0.0:
 				_att_q = _CosmosAttitudeCls.apply_roll(_att_q, roll, delta, CubeSphere.ORBIT_ROLL_RATE)
 			# Return to PLANETARY (or a fast fall reaching the ground inside the dwell) ⇒ recover the surface pose.
@@ -1715,3 +1723,97 @@ func remote_place(block_id: int, target) -> bool:
 				return true
 			return false
 	return false
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# COSMOS SPACE-FLY DEV/TEST ACTUATORS (docs/COSMOS-SPACEFLY-DESIGN.md). The scriptable-flight surface the
+# RemoteControl executor drives so the ORCHESTRATOR can fly test missions headlessly. Each ROUTES THROUGH
+# THE SAME gated space-nav path a human's F/O/G/R/Q/E keystrokes take (`_toggle_dev_nav`, `_dev_toggle_key`,
+# the `_attitude_tick` roll poll, the `remote_input` thrust seam) — NO new flight math, NO parallel state.
+# All are safe no-ops when their gates are off (dev-nav not engaged, nav machine absent), so a call from a
+# harness or the executor before the space-nav flags are enabled simply reports `false`/`{}` and changes
+# nothing. The executor never exists off RemoteBridge.CONTROL_ENABLED ⇒ byte-identical in normal play.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## set_dev_nav (F): drive dev-nav to a definite ON/OFF state (idempotent — a human F is a toggle). Guarded by
+## SN_DEVNAV exactly as the KEY_F handler: with the flag off, dev-nav does not exist, so this reports false and
+## does nothing (the harness then knows the space-nav build is not the one running). Returns the resulting state
+## == requested on success, false otherwise.
+func remote_set_dev_nav(on: bool) -> bool:
+	if not CubeSphere.SN_DEVNAV:
+		return false
+	if _dev_nav != on:
+		_toggle_dev_nav()                          # the exact human-F path (fly on/off, overlay, seed reset)
+	return _dev_nav == on
+
+## nav verb (O/G/R): the dev-nav mode toggles. verb ∈ orbit(O) | geostation(G) | detach(R). Guarded EXACTLY as
+## the KEY_O/G/R handler (SN_DEVNAV && dev-nav engaged && the nav machine live && a BCI state exists), so it is a
+## no-op returning false whenever a human keypress would also be inert. Returns true iff the verb was dispatched.
+func remote_nav_verb(verb: String) -> bool:
+	if not (CubeSphere.SN_DEVNAV and _dev_nav and _nav != null):
+		return false
+	var keycode := 0
+	match verb:
+		"orbit": keycode = KEY_O
+		"geostation": keycode = KEY_G
+		"detach": keycode = KEY_R
+		_: return false
+	if _dev_p_bci.size() != 3:
+		return false                               # no BCI state yet — the same guard _dev_toggle_key applies
+	_dev_toggle_key(keycode)
+	return true
+
+## thrust seam (WASD + Space/Ctrl held): arm the body-local wish (x=strafe, y=vertical, z=forward, same shape as
+## the WASD/vertical polls) + run for THIS and every following tick until zeroed. In dev-nav this feeds the fly /
+## dev-flight / coast-exit paths identically to a held key. The executor sets this at a thrust step's start and
+## zeroes it (via remote_stop_thrust) at the step's deadline — a timed hold. No-op unless a caller sets it.
+func remote_set_thrust(wish: Vector3, run: bool) -> void:
+	remote_input = wish
+	remote_run = run
+	remote_drive = true
+
+## Release the thrust seam (the executor calls this at a thrust step's end; mirrors RemoteControl._zero_intent).
+func remote_stop_thrust() -> void:
+	remote_drive = false
+	remote_input = Vector3.ZERO
+	remote_run = false
+
+## roll seam (Q/E held): rad/s applied to the BCI attitude in _attitude_tick's SPACE branch. Zeroed by the
+## executor at the roll step's deadline. No-op unless ORBIT_ATTITUDE is engaged and the camera is emancipated.
+func remote_set_roll(rate: float) -> void:
+	remote_roll_rate = rate
+
+## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
+## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE
+## + guarded: returns {} when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` null), so the bridge merge adds
+## nothing and the shipped telemetry is byte-identical. With the space-nav flags on it streams alongside nav_mode/
+## v_bci (nav_telemetry) so ONE telemetry line fully describes the flight state. Pure read; no side effects.
+func space_telemetry() -> Dictionary:
+	if _nav == null:
+		return {}
+	var alt := radial_altitude()
+	var body := _dominant_body()
+	return {
+		"alt": snappedf(alt, 0.1),
+		"v_circ": snappedf(orbit_v_circ(), 0.01),
+		"orbit_r": snappedf(_FacetAtlasCls.R_BLOCKS + alt, 0.1),
+		"body": body,
+		"dev_nav": _dev_nav,
+		"coasting": _orbit_coasting,
+		"flying": flying,
+		"on_ground": _space_on_ground(),
+		"att": _space_att_name(),
+	}
+
+## True iff standing on terrain (not flying, feet at/near the analytic floor) — the harness's `landed` predicate
+## combines this with nav_mode == planetary. Cheap floor probe; false while flying.
+func _space_on_ground() -> bool:
+	if flying or world == null:
+		return false
+	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
+
+## The attitude-machine state name for telemetry (surface | space | recover). "surface" when ORBIT_ATTITUDE is off.
+func _space_att_name() -> String:
+	match _att_mode:
+		ATT_SPACE: return "space"
+		ATT_RECOVER: return "recover"
+		_: return "surface"

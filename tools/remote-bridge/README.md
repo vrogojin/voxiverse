@@ -190,9 +190,28 @@ control/
 
 **Caps (rejected whole-sequence, design §1.3):** ≤ 64 steps, `move.blocks` ≤ 128, Σ expected step
 time ≤ 180 s, JSON ≤ 16 KiB, `issued` not older than 120 s. Ops are a **closed whitelist**:
-`move turn look wait jump screenshot set_fly stop break place select_slot` (D5 full-agency set) — any
+`move turn look wait jump screenshot set_fly stop break place select_slot reload` (D5 full-agency set)
+plus the **SPACE-FLY** dev/test verbs `dev_nav nav thrust roll` (docs/COSMOS-SPACEFLY-DESIGN.md) — any
 other op fails validation. Reject reasons written to `rejected/<seq>.reject.txt`: `bad_json`, `caps`,
 `stale`, `duplicate`, `busy`, `no_consent`.
+
+### Space-fly verbs (scripted orbital/interplanetary test flights)
+
+```jsonc
+{ "op": "dev_nav", "on": true }                                              // F — dev-nav (fly) on/off
+{ "op": "nav", "verb": "orbit" }                                            // O — free-coast ("geostation"=G, "detach"=R)
+{ "op": "thrust", "dx": 0, "dy": 1, "dz": -1, "seconds": 25, "gait": "run" } // WASD + Space/Ctrl, held for `seconds` (≤120)
+{ "op": "roll", "dir": "left", "seconds": 3 }                              // Q/E roll, held
+```
+`dx`=strafe, `dy`=vertical, `dz`=forward (−Z). These route through the SAME gated space-nav path a human's
+keystrokes take and are inert unless the space-nav flags are on AND dev-nav is engaged. The extra
+self-verification telemetry (`alt`, `v_circ`, `orbit_r`, `body`, `dev_nav`, `coasting`, `flying`,
+`on_ground`, `att`) streams alongside `nav_mode`/`v_bci` when the nav machine is live.
+
+**Scripted flight harness:** `node flight.mjs flights/<name>.json` writes each leg's `cmd_seq` to the
+outbox, waits for `done.json`, and asserts the streamed telemetry (`node flight.mjs --list` for the canned
+flights: `ascent-to-orbit`, `o-coast-hold`, `deorbit-land`, `earth-moon-transfer`). The deterministic
+per-mechanic proof that needs no browser is the headless gate `res://src/tools/verify_spacefly.gd`.
 
 ### Consent state machine (relay side)
 

@@ -1,0 +1,19 @@
+{
+  "name": "ascent-to-orbit",
+  "description": "Take off from the Earth surface, climb past the atmosphere ceiling (384) into orbit, assert nav_mode flips to low/high_orbit.",
+  "_notes": "Durations assume fly_speed 16 b/s (run x2 = 32 b/s). 25 s of run-vertical thrust climbs ~800 blocks (well above the 384+32 orbit band). Tune seconds live from the streamed alt.",
+  "legs": [
+    {
+      "name": "engage dev-nav (F) + fly",
+      "steps": [ { "op": "dev_nav", "on": true } ],
+      "settle_s": 1.0,
+      "expect": { "dev_nav": true, "flying": true }
+    },
+    {
+      "name": "vertical ascent to orbit",
+      "steps": [ { "op": "thrust", "dy": 1.0, "seconds": 25, "gait": "run" } ],
+      "settle_s": 2.0,
+      "expect": { "nav_mode": ["low_orbit", "high_orbit"], "alt_gt": 384, "flying": true }
+    }
+  ]
+}

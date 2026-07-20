@@ -881,6 +881,16 @@ const FP_FOG_ARBITER := false
 ## G-B4-MOON. LIVE-ONLY LOOK. Depends B1 (size), B2 (calmer sky).
 const FP_MOON_PRESENCE := false
 
+## COSMOS ATMO2 B2 (docs/COSMOS-ATMO2-DESIGN.md §2.4/§3.3, stage B2). The atmosphere-shell brightness fix: the
+## A6 single-sample strength `chord·ρ(h_min)/H` overestimates the optical path 6–80× (a blown cyan-white sky
+## with stars showing through). Replace it with a BOUNDED, budget-normalized limb intensity — a saturating
+## transform of the optical column, peak-limb luminance ≈0.35 and surface horizon band ≈0.2–0.3 (§3.5) — so the
+## halo is a thin moderate blue ring the sun is always brighter than. Colour keeps the shared scatter_tint/band
+## (which IS the surface path-T⃗ ⇒ A5 and A6 stay harmonized). Both the GLSL twin (via a path_norm uniform,
+## default 0 = shipped) and the GDScript twin are gated. Off ⇒ byte-identical. Requires FP_ATMO_SHELL. Gate
+## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
+const FP_ATMO_PATH_SHELL := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

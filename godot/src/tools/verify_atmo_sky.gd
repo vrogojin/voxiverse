@@ -54,6 +54,7 @@ func _initialize() -> void:
 	_gate_b1_sun()
 	_gate_b5_fog()
 	_gate_b4_moon()
+	_gate_b2_limb()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -483,6 +484,59 @@ func _ecl_factor_incl(t: float, inc: float) -> float:
 	var mp := Vector3(a * cos(th), a * sin(th) * cos(inc), a * sin(th) * sin(inc))
 	var sd := EPH.dir_to("earth", "sun", t)
 	return SKY.occlusion_factor(sd, mp, EPH.radius_of("earth"))
+
+# ------------------------------------------------------------------ G-B2-LIMB (ATMO2 B2)
+func _gate_b2_limb() -> void:
+	print("  --- G-B2-LIMB: bounded budget-normalized atmosphere shell (peak ≤0.35), tint == A5 (ATMO2 §2.4) ---")
+	# Budget (§3.5): peak-limb luminance ≤ 0.35 and surface horizon band ≤ 0.30 across the (μ, chord, h_min) grid.
+	var peak := 0.0
+	var horiz_band := 0.0
+	for ci in range(1, 13):
+		var chord := 500.0 * float(ci)                       # 500..6000 blocks
+		for hi in range(0, 8):
+			var h_min := 10.0 * float(hi)                    # 0..70 blocks
+			for mi in range(-10, 11):
+				var mu := float(mi) / 10.0
+				var col := SKY.shell_limb_color_path(mu, chord, h_min)
+				peak = maxf(peak, col.get_luminance())
+				if mu >= 0.0 and mu <= 0.3 and chord <= 3500.0:   # the surface horizon band (surface-realistic chord)
+					horiz_band = maxf(horiz_band, col.get_luminance())
+	_ok(peak <= 0.35, "peak limb luminance ≤ 0.35 across the grid (%.3f)" % peak)
+	_ok(horiz_band <= 0.30, "surface horizon band luminance ≤ 0.30 (%.3f)" % horiz_band)
+	# The bound REDUCES the shipped single-sample overestimate at the bright limb (the 6–80× fix).
+	var old := SKY.shell_limb_color(0.5, 6000.0, 5.0)
+	var neu := SKY.shell_limb_color_path(0.5, 6000.0, 5.0)
+	_ok(neu.get_luminance() < old.get_luminance(), "bounded shell dimmer than the single-sample overestimate (%.2f < %.2f)" % [neu.get_luminance(), old.get_luminance()])
+	# Night side → 0 (day(μ)=0 for μ ≪ −term) even with a long chord.
+	var night := SKY.shell_limb_color_path(-0.5, 6000.0, 5.0)
+	_ok(night.r < 1e-4 and night.g < 1e-4 and night.b < 1e-4, "bounded shell dark on the night side")
+	# Monotone in the optical column (brighter with a longer chord at fixed μ,h_min).
+	var mono := true
+	var prev := -1.0
+	for ci in range(1, 40):
+		var l := SKY.shell_limb_color_path(0.4, 200.0 * float(ci), 5.0).get_luminance()
+		if l < prev - 1e-6: mono = false
+		prev = l
+	_ok(mono, "bounded shell monotone ↑ in the optical column")
+	# ATMO_TOP continuity: the shell colour is continuous as the view chord crosses the r_outer boundary (shell_geom
+	# chord is C⁰ there per G-AS-LIMB, and shell_limb_color_path is continuous in chord).
+	var r := 6371.0
+	var ro := SKY.shell_outer_r(r)
+	var below := SKY.shell_geom(Vector3(0.0, 0.0, ro - 1.0), Vector3.ZERO, Vector3(0.0, 0.0, 1.0), r, ro)
+	var above := SKY.shell_geom(Vector3(0.0, 0.0, ro + 1.0), Vector3.ZERO, Vector3(0.0, 0.0, 1.0), r, ro)
+	var c_below := SKY.shell_limb_color_path(0.3, below[0], below[1])
+	var c_above := SKY.shell_limb_color_path(0.3, above[0], above[1])
+	_ok(absf(c_below.get_luminance() - c_above.get_luminance()) < 0.05, "shell colour continuous across the ATMO_TOP crossing")
+	# C-SHELL tint == A5 far-shell tint on a shared μ grid: both use scatter_tint·scatter_band (= surface path-T⃗),
+	# so they are harmonized BY CONSTRUCTION (the A5 GLSL and the A6 base tint mirror shell_terminator_tint).
+	var tint_eq := true
+	for mi in range(-20, 21):
+		var mu := float(mi) / 20.0
+		var a5 := SKY.shell_terminator_tint(mu)              # the A5 far-shell band tint twin
+		# the A6 path shell's tint factor is the same mix(white, scatter_tint, band):
+		var a6 := Color.WHITE.lerp(SKY.scatter_tint(mu), SKY.scatter_band(mu))
+		if (a5 - a6).is_equal_approx(Color(0, 0, 0)) == false and absf(a5.r - a6.r) + absf(a5.g - a6.g) + absf(a5.b - a6.b) > 1e-6: tint_eq = false
+	_ok(tint_eq, "C-SHELL tint == A5 far-shell tint on the shared μ grid (harmonized by construction)")
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

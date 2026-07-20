@@ -209,6 +209,11 @@ uniform float r_outer = 7139.0;
 uniform float h_scale = 128.0;
 uniform float term_mu = 0.12;
 uniform float gain = 1.6;
+// B2 (FP_ATMO_PATH_SHELL): path_norm=0 ⇒ the shipped single-sample strength·gain (byte-identical); path_norm=1
+// ⇒ a bounded, budget-normalized limb intensity (peak ≈0.35) so the sky is never blown cyan-white.
+uniform float path_norm = 0.0;
+uniform float peak_l = 0.95;
+uniform float sat = 15.0;
 uniform vec3 rayleigh_blue : source_color = vec3(0.15, 0.38, 0.92);
 float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
 vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
@@ -234,7 +239,10 @@ void fragment() {
 		float mu = dot(xhat, normalize(sun_dir));
 		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
 		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
-		float l = strength * _day(mu) * gain;
+		// B2: bound the single-sample overestimate to the §3.5 budget (peak ≈0.35) via a saturating transform.
+		float l_ship = strength * gain;
+		float l_path = peak_l * (1.0 - exp(-strength / sat));
+		float l = mix(l_ship, l_path, path_norm) * _day(mu);
 		ALBEDO = rayleigh_blue * tint * l;
 	}
 }
@@ -427,6 +435,24 @@ static func shell_limb_color(mu: float, chord: float, h_min: float) -> Color:
 	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
 	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
 	var l := strength * day_factor(mu) * SHELL_LIMB_GAIN
+	return Color(base.r * l, base.g * l, base.b * l)
+
+## ATMO2 B2 (§2.4/§3.3): the peak limb intensity cap (the `l`-factor ceiling; base RAYLEIGH_BLUE luminance ≈
+## 0.37 ⇒ peak output luminance ≈ 0.34 ≤ the §3.5 budget of 0.35) and the saturation scale of the optical
+## column (tuned so the surface horizon band lands ≈0.2–0.3). These BOUND the single-sample overestimate.
+const SHELL_PEAK_L := 0.95
+const SHELL_SAT := 15.0
+
+## ATMO2 B2: the BOUNDED atmosphere-shell colour. Same base×tint as shell_limb_color, but the strength is a
+## SATURATING transform of the single-sample optical column (chord·ρ(h_min)/H) so it can never blow past the
+## §3.5 budget (peak-limb ≈0.35, surface horizon band ≈0.2–0.3), monotone in the optical path, →0 on the night
+## side. The GLSL twin mixes to this via `path_norm=1`. Colour = the shared scatter_tint/band (= surface path-T⃗).
+static func shell_limb_color_path(mu: float, chord: float, h_min: float) -> Color:
+	var ss := chord * exp(-maxf(h_min, 0.0) / H_SCALE) / H_SCALE     # the shipped single-sample optical column
+	var l := SHELL_PEAK_L * (1.0 - exp(-ss / SHELL_SAT)) * day_factor(mu)   # bounded, budget-normalized, day-gated
+	var t := scatter_tint(mu)
+	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
+	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
 	return Color(base.r * l, base.g * l, base.b * l)
 
 # ---------------------------------------------------------------------------------------
@@ -757,6 +783,12 @@ func _build_nodes() -> void:
 		_atmo_shell_mat.set_shader_parameter("term_mu", TERMINATOR_MU)
 		_atmo_shell_mat.set_shader_parameter("gain", SHELL_LIMB_GAIN)
 		_atmo_shell_mat.set_shader_parameter("rayleigh_blue", Vector3(RAYLEIGH_BLUE.r, RAYLEIGH_BLUE.g, RAYLEIGH_BLUE.b))
+		# B2 (FP_ATMO_PATH_SHELL): switch the shell to the bounded budget-normalized limb intensity. Off ⇒
+		# path_norm stays 0 ⇒ the shipped single-sample strength·gain ⇒ byte-identical.
+		if CubeSphere.FP_ATMO_PATH_SHELL:
+			_atmo_shell_mat.set_shader_parameter("path_norm", 1.0)
+			_atmo_shell_mat.set_shader_parameter("peak_l", SHELL_PEAK_L)
+			_atmo_shell_mat.set_shader_parameter("sat", SHELL_SAT)
 		_atmo_shell.material_override = _atmo_shell_mat
 		_atmo_shell.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_atmo_shell.sorting_offset = -0.9                 # additive, with the dome; never sorts against the opaque discs

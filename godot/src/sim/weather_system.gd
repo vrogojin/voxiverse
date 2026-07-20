@@ -60,6 +60,19 @@ const INIT_PER_FRAME := 32            ## static-basis build slice (§1.7) — am
 const DT_GAME_DEFAULT := 1.0          ## game-seconds advanced per sweep when no clock delta is available
 const DT_GAME_MAX := 120.0            ## clamp a long real gap (tab restore) so relaxation never over-steps
 
+## CLOUD-RATE (clouds2 2026-07-20) — the weather FIELD-evolution slowdown. The live pilot reported cloud
+## cover forming/dissipating in seconds; it should evolve over many MINUTES. Every prognostic field's
+## per-sweep change (the net T/Q/CW/SOIL delta = full-physics_result − old) is scaled by this factor before
+## it is written back, so the whole field evolves this-many-× slower WITHOUT retuning any individual physics
+## constant. 0.01 ⇒ ~100× slower cloud formation/drift/dissipation. It is a pure sub-step blend, so
+## determinism is preserved (pure of SEED + game-time). It does NOT touch the SUN/subsolar-latitude drive
+## (seasons ride game_time directly in _begin_sweep, never dt_game or this scale), so day-night and the
+## seasonal δ still proceed at full rate — only the moisture/temperature/cloud FIELD relaxes 100× slower.
+## The gate drivers (debug_full_sweep) default to scale 1.0 so the physics/ITCZ/storm gates keep asserting
+## the same emergent behaviour; only G-CLOUD-RATE compares 1.0 vs this const. The C++ sweep-kernel port is
+## the escape hatch if a live A/B wants faster-but-still-slow weather.
+const WEATHER_TIME_SCALE := 0.01
+
 # --- physics constants (§1.3; every one named, all clamps hard) ----------------
 const A_DIURNAL := 18.0               ## peak daytime warming anomaly at overhead sun (°C)
 const A_NIGHT := 8.0                  ## night-side cooling floor of the equilibrium anomaly (°C)
@@ -121,6 +134,10 @@ var _delta_lat := 0.0                 ## subsolar latitude (rad), frozen for the
 var _dt_game := DT_GAME_DEFAULT       ## game-seconds elapsed this sweep
 var _last_sweep_time := 0.0           ## game-time at the last sweep start
 var _sweep_time_valid := false
+## Per-sweep field-evolution sub-step scale (see WEATHER_TIME_SCALE). LIVE = 0.01 (100× slower field). The
+## gate drivers set it to 1.0 for a full-rate physics step so the physics/ITCZ/storm gates are unaffected;
+## G-CLOUD-RATE compares the two. A pure multiplier on the written prognostic delta ⇒ determinism preserved.
+var _time_scale := WEATHER_TIME_SCALE
 # FP_WEATHER_THREAD safety-gate hook (OFF on the live path; only G-WTHREAD-SAFE sets it). When ≥0 the
 # threaded worker_sweep IGNORES the physics and fills the ENTIRE back buffer with this monotonically-rising
 # sentinel value, cell by cell. A fully-published front buffer is then uniform; a torn read of a mid-write
@@ -489,15 +506,30 @@ func _update_cell(idx: int, read: PackedFloat32Array, write: PackedFloat32Array)
 	else:
 		soil = 1.0                          # ocean cell: pinned wet
 
+	# --- FIELD-EVOLUTION SUB-STEP (CLOUD-RATE) --------------------------------------------
+	# Blend the full-physics result toward the OLD value by _time_scale: the field advances only this
+	# fraction of the computed step per sweep, so the whole prognostic state (T/Q/CW/SOIL) evolves
+	# _time_scale-× slower (0.01 ⇒ ~100× slower clouds). The equilibrium is unchanged (a fixed point of the
+	# blend is a fixed point of the physics) — only the APPROACH RATE slows, so clouds still reach realistic
+	# cover, over minutes. At _time_scale == 1.0 (the gate drivers) this is the identity ⇒ byte-identical to
+	# the un-scaled sweep. The DIAGNOSTIC winds/pressure are instantaneous functions of the (now
+	# slowly-evolving) T/Q state, so they are written full and inherit the slow evolution naturally.
+	var scl := _time_scale
+	var T_w := clampf(read[b + F_T] + scl * (T - read[b + F_T]), -T_CLAMP, T_CLAMP)
+	var q_w := clampf(read[b + F_Q] + scl * (q - read[b + F_Q]), 0.0, Q_MAX)
+	var cw_w := clampf(read[b + F_CW] + scl * (cw - read[b + F_CW]), 0.0, CW_MAX)
+	var soil_w := clampf(read[b + F_SOIL] + scl * (soil - read[b + F_SOIL]), 0.0, 1.0)
+
 	# --- (5) instability (CAPE proxy) — a hot + wet surface under the lapse-cooled aloft level;
-	# T (warm anomaly) plus the moisture surplus, measured above a reference. Flags W4 convection.
-	var inst := instability_of(T, q)
+	# T (warm anomaly) plus the moisture surplus, measured above a reference. Flags W4 convection. Computed
+	# from the STORED (sub-stepped) T/q so "convective" reflects the actual slowly-evolving state.
+	var inst := instability_of(T_w, q_w)
 
 	# --- write, all fields hard-clamped (bounded by construction) --------------------------
-	write[b + F_T] = clampf(T, -T_CLAMP, T_CLAMP)
-	write[b + F_Q] = clampf(q, 0.0, Q_MAX)
-	write[b + F_CW] = clampf(cw, 0.0, CW_MAX)
-	write[b + F_SOIL] = clampf(soil, 0.0, 1.0)
+	write[b + F_T] = T_w
+	write[b + F_Q] = q_w
+	write[b + F_CW] = cw_w
+	write[b + F_SOIL] = soil_w
 	write[b + F_U] = u
 	write[b + F_V] = v
 	write[b + F_P] = p
@@ -694,7 +726,11 @@ func wind_en_at_dir(d: Vector3) -> Vector2:
 ## Run ONE full sweep with EXPLICIT solar forcing — bypasses the ephemeris so a headless gate can place
 ## the subsolar point at an arbitrary (declination, longitude) regardless of the FP_SEASONS default. This
 ## is how G-W1-ITCZ proves the rain band tracks δ, and G-W1-DET/PHYS drive deterministic spin-up.
-func debug_full_sweep(sun_bf: Vector3, delta_lat: float, dt_game: float) -> void:
+## `scale` is the field-evolution sub-step (see WEATHER_TIME_SCALE); it DEFAULTS to 1.0 so every existing
+## physics/ITCZ/storm/determinism gate drives a full-rate step (unaffected by the live 100× slowdown).
+## G-CLOUD-RATE passes 1.0 vs WEATHER_TIME_SCALE explicitly to measure the slowdown. Restores _time_scale so
+## the member (the LIVE 0.01) is never left mutated for a subsequent step_slice.
+func debug_full_sweep(sun_bf: Vector3, delta_lat: float, dt_game: float, scale := 1.0) -> void:
 	if not _ready:
 		return
 	_cursor = 0
@@ -702,11 +738,14 @@ func debug_full_sweep(sun_bf: Vector3, delta_lat: float, dt_game: float) -> void
 	_sun_bf = sun_bf if sun_bf != Vector3.ZERO else Vector3(1, 0, 0)
 	_delta_lat = delta_lat
 	_dt_game = dt_game
+	var save_scale := _time_scale
+	_time_scale = scale
 	var read := _buf_a if _read_is_a else _buf_b
 	var write := _buf_b if _read_is_a else _buf_a
 	for idx in range(N_CELLS):
 		_update_cell(idx, read, write)
 	_finish_sweep()
+	_time_scale = save_scale
 
 func cell_sinlat(idx: int) -> float:
 	return _sinlat[idx]

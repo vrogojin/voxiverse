@@ -38,7 +38,9 @@ func _initialize() -> void:
 	_gate_w1_itcz()
 	_gate_w2_clouds()
 	_gate_cloud_frame()
+	_gate_cloud_volume()
 	_gate_cloud_altitude()
+	_gate_cloud_rate()
 	_gate_w3_precip()
 	_gate_w4_storms()
 
@@ -266,6 +268,41 @@ func _gate_cloud_frame() -> void:
 		"FRAME: emitted top-quad normal is NOT the global +Y slab (|n·Y|=%.3f < 0.3 — the 90° bug is gone)" % absf(nrm.dot(Vector3(0, 1, 0))))
 	cx.queue_free()
 
+# ===== G-CLOUD-VOLUME : cloud boxes are 3-D puffy prisms (vertical extent, non-coplanar normals), not paper ==
+func _gate_cloud_volume() -> void:
+	print("  --- G-CLOUD-VOLUME: per-layer vertical extent (thickness), normals NOT all radial-coplanar ---")
+	var R := FacetAtlas.R_BLOCKS
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)
+	cl.debug_ignore_altitude(true)                     # probe geometry regardless of the atmosphere gate
+	cl.debug_force_cover(1.0)                           # overcast so every layer emits boxes
+	cl.debug_set_camera(Vector3(1, 0, 0) * (R + 40.0)) # up = +X (definitely not the global +Y frame)
+	var up: Vector3 = cl.debug_up()
+	# per-layer thickness (radial extent) + normal spread. THICK = [64, 16, 7] ⇒ extents must be well above 0
+	# and STRICTLY ordered cumulus > stratus > cirrus (differentiated puffiness).
+	var floor_thick := [24.0, 8.0, 3.0]                # generous per-layer minimum vertical extent (blocks)
+	var ext := [0.0, 0.0, 0.0]
+	var vol_ok := true
+	for l in range(3):
+		cl.rebuild_layer(l)
+		var nv := cl.emitted_verts(l)
+		var e: Vector2 = cl.debug_scratch_radial_extent(nv)
+		var thick := e.y - e.x
+		ext[l] = thick
+		_ok(thick > floor_thick[l], "VOLUME: layer %d vertical extent %.1f blocks > %.0f (has body, not paper)" % [l, thick, floor_thick[l]])
+		var ud: Vector2 = cl.debug_scratch_normal_updot(nv, up)
+		_ok(ud.x < 0.5, "VOLUME: layer %d has a non-radial face (min |n·up| %.3f < 0.5 — side walls ⇒ not all coplanar)" % [l, ud.x])
+		_ok(ud.y > 0.85, "VOLUME: layer %d has a near-radial face (max |n·up| %.3f > 0.85 — the horizontal lid)" % [l, ud.y])
+	_ok(ext[0] > ext[1] and ext[1] > ext[2], "VOLUME: extents cumulus %.0f > stratus %.0f > cirrus %.0f (differentiated puffiness)" % [ext[0], ext[1], ext[2]])
+	# still cheap under overcast (the greedy merge + 36-vert boxes) — the volume did not blow the cap.
+	var worst := 0
+	for l in range(3):
+		worst = maxi(worst, cl.emitted_verts(l))
+	_ok(worst <= CLOUDS.CAP_VERTS, "VOLUME: overcast emit %d verts/layer ≤ cap %d (thicker mesh still bounded)" % [worst, CLOUDS.CAP_VERTS])
+	_ok(worst < 5000, "VOLUME: overcast still CHEAP (%d verts — greedy merge intact despite volume)" % worst)
+	cl.queue_free()
+
 # ===== G-CLOUD-ALTITUDE : clouds+precip exist in-atmosphere, ABSENT in orbit/space (radial alt > ATMO_TOP) =====
 func _gate_cloud_altitude() -> void:
 	print("  --- G-CLOUD-ALTITUDE: clouds/precip present below ATMO_TOP=%.0f, cleared in orbit ---" % CubeSphere.ATMO_TOP)
@@ -293,6 +330,42 @@ func _gate_cloud_altitude() -> void:
 	_ok(fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP - 1.0)), "ALTITUDE: WeatherFX in-atmosphere just below ATMO_TOP (precip enabled)")
 	_ok(not fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP + 50.0)), "ALTITUDE: WeatherFX in space above ATMO_TOP (precip disabled — no rain in orbit)")
 	fx.queue_free()
+
+# ===== G-CLOUD-RATE : the weather FIELD evolves ~100× slower (WEATHER_TIME_SCALE), seasons untouched ========
+func _gate_cloud_rate() -> void:
+	print("  --- G-CLOUD-RATE: cloud-water change/sweep is ~1/WEATHER_TIME_SCALE (≈100×) slower; δ untouched ---")
+	_ok(WS.WEATHER_TIME_SCALE > 0.0 and WS.WEATHER_TIME_SCALE <= 0.02, "RATE: WEATHER_TIME_SCALE = %.4f (≈100× slowdown, in (0, 0.02])" % WS.WEATHER_TIME_SCALE)
+	# Two grids driven IDENTICALLY to the same active state (full-rate spin-up), then ONE more sweep: grid A at
+	# full rate (the old behaviour), grid B at WEATHER_TIME_SCALE (the live default). Same pre-state ⇒ the
+	# ratio of total |ΔCW| is exactly 1/scale (the blend is linear in scale off an identical read buffer).
+	var a := _fresh_grid()
+	var b := _fresh_grid()
+	for i in range(40):
+		var sun := _sun_at(0.12, float(i) * 0.3)
+		a.debug_full_sweep(sun, 0.12, 6.0, 1.0)
+		b.debug_full_sweep(sun, 0.12, 6.0, 1.0)
+	# snapshot cloud water (identical in both), take the measurement sweep, sum |ΔCW| over the grid.
+	var cw_before := PackedFloat32Array()
+	cw_before.resize(WS.N_CELLS)
+	for idx in range(WS.N_CELLS):
+		cw_before[idx] = a.field_at_cell(idx, WS.F_CW)
+	var sun_m := _sun_at(0.12, float(40) * 0.3)
+	a.debug_full_sweep(sun_m, 0.12, 6.0, 1.0)                 # baseline: full-rate step
+	b.debug_full_sweep(sun_m, 0.12, 6.0, WS.WEATHER_TIME_SCALE)  # scaled: the live 100×-slower step
+	var sum_a := 0.0
+	var sum_b := 0.0
+	for idx in range(WS.N_CELLS):
+		sum_a += absf(a.field_at_cell(idx, WS.F_CW) - cw_before[idx])
+		sum_b += absf(b.field_at_cell(idx, WS.F_CW) - cw_before[idx])
+	var ratio := sum_a / maxf(1.0e-9, sum_b)
+	print("    RATE detail: Σ|ΔCW| full=%.4f scaled=%.6f ratio=%.1f× (target ≈ %.0f×)" % [sum_a, sum_b, ratio, 1.0 / WS.WEATHER_TIME_SCALE])
+	_ok(sum_a > 1.0e-4, "RATE: baseline sweep actually changes cloud water (Σ|ΔCW| %.4f > 0 — a real measurement)" % sum_a)
+	_ok(sum_b > 0.0, "RATE: scaled field STILL evolves (Σ|ΔCW| %.6f > 0 — clouds form, just slowly)" % sum_b)
+	_ok(ratio > 50.0 and ratio < 200.0, "RATE: scaled evolution %.0f× slower than full-rate (≈100×, in [50, 200])" % ratio)
+	# seasons ride game_time, NOT the field scale: the subsolar latitude is identical regardless of scale (it is
+	# never routed through WEATHER_TIME_SCALE). Prove the sun/δ drive is untouched by the slowdown.
+	_ok(EPH.subsolar_latitude_eps(EPH.orbit_period("earth") * 0.25, 0.4084) > deg_to_rad(23.0),
+		"RATE: subsolar δ at June solstice still ≈ +23.4° (seasons ride game_time, unaffected by the field slowdown)")
 
 # ================= W3 : precipitation FX + fog + snow coupling (G-W3-COUPLE) =================
 const FX := preload("res://src/world/weather_fx.gd")

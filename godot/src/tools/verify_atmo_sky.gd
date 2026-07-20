@@ -574,6 +574,42 @@ func _gate_b3_nearnight() -> void:
 	_ok((m is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "atlas material twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
 	_ok((m is StandardMaterial3D) == (not CubeSphere.FP_NEAR_DAYLIGHT), "atlas material is the shipped StandardMaterial when flag off")
 
+	# SMOKE: the SHAPED/SOLID near-field material twins (block_materials.gd) compile under the flag and preserve
+	# the vertex-colour × texture × albedo day look (shade=1 ⇒ byte-equal to the shipped StandardMaterial). Both
+	# render paths + VoxelBody debris flow through BlockMaterials.get_for, so this is THE near-field ground look.
+	BlockCatalog.ensure_ready()
+	BlockMaterials.reset_cache()
+	var bm_tex := BlockMaterials.get_for(BlockCatalog.GRASS)                        # textured (opaque cube)
+	var bm_solid := BlockMaterials.get_for(BlockCatalog.STONE)                      # (grass/stone are textured; both exercise the opaque twin)
+	var bm_trans := BlockMaterials.get_for(BlockCatalog.id_of(&"water"))            # translucent (water)
+	var bm_snow := BlockMaterials.snow_capped_for(BlockCatalog.STONE)              # snow-cap variant (tinted twin)
+	_ok((bm_tex is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "block_materials textured twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	_ok((bm_tex is StandardMaterial3D) == (not CubeSphere.FP_NEAR_DAYLIGHT), "block_materials textured is the shipped StandardMaterial when flag off")
+	_ok((bm_solid is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "block_materials solid/opaque twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	_ok((bm_trans is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "block_materials translucent twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	_ok((bm_snow is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "block_materials snow-cap twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	if CubeSphere.FP_NEAR_DAYLIGHT:
+		# The twins carry the SAME shade kernel as the CPU near_shade the gate validated above (night_floor +
+		# term_mu), so shade=1 at noon ⇒ the vertex-colour/texture look is byte-preserved BY CONSTRUCTION.
+		var sm := bm_tex as ShaderMaterial
+		_ok(sm.get_shader_parameter("sun_dir") != null, "textured twin carries the sun_dir uniform")
+		_ok(is_equal_approx(float(sm.get_shader_parameter("night_floor")), SKY.NEAR_NIGHT_FLOOR), "textured twin night_floor == NEAR_NIGHT_FLOOR")
+		_ok(is_equal_approx(float(sm.get_shader_parameter("term_mu")), SKY.TERMINATOR_MU), "textured twin term_mu == TERMINATOR_MU (day look byte-preserved at μ=1)")
+		_ok(bool(sm.get_shader_parameter("use_vertex_color")) and bool(sm.get_shader_parameter("use_texture")), "textured twin keeps vertex-colour × texture")
+	BlockMaterials.reset_cache()                                                    # leave no daylight twins registered for later gates
+
+	# SMOKE: the CLOUD material twin (cloud_layers.gd) compiles under the flag; at night the clouds read moonlit/
+	# dark like the ground (same near_shade) instead of staying bright white. Flag off ⇒ the shipped StandardMaterial.
+	var clouds := CloudLayers.new()
+	var cm := clouds._make_material(0)
+	_ok((cm is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "cloud material twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	_ok((cm is StandardMaterial3D) == (not CubeSphere.FP_NEAR_DAYLIGHT), "cloud material is the shipped StandardMaterial when flag off")
+	if CubeSphere.FP_NEAR_DAYLIGHT:
+		var cms := cm as ShaderMaterial
+		_ok(cms.get_shader_parameter("sun_dir") != null, "cloud twin carries the sun_dir uniform")
+		_ok(is_equal_approx(float(cms.get_shader_parameter("night_floor")), SKY.NEAR_NIGHT_FLOOR), "cloud twin night_floor == NEAR_NIGHT_FLOOR (moonlit/dark at night, not bright white)")
+	clouds.free()
+
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:
 	print("  --- INERT: shipped flags leave _ramp_environment at the shipped day-night values ---")

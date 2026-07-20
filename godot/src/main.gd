@@ -14,6 +14,10 @@ var _player: Player
 var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _cosmos_sky: CosmosSky = null
 
+# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the cloud mesher node, held so the per-frame Sun direction can be forwarded
+# into its near-field daylight material twin (main._process). Null unless the cloud flags built it (byte-identical).
+var _clouds: CloudLayers = null
+
 func _ready() -> void:
 	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
 	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
@@ -105,6 +109,7 @@ func _ready() -> void:
 		clouds.name = "CloudLayers"
 		add_child(clouds)
 		clouds.setup(world.environment, player)
+		_clouds = clouds
 
 	# CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5): precipitation particles + fog, a read-only view of
 	# the grid (rule 2). Built only under both flags; default OFF ⇒ no node ⇒ byte-identical. The Environment
@@ -213,6 +218,10 @@ func _process(_delta: float) -> void:
 	# Same forwarding discipline; the WorldManager/module/atlas setters self-guard ⇒ flag-off is byte-identical.
 	if _player != null and _cosmos_sky != null and CubeSphere.FP_NEAR_DAYLIGHT:
 		_player.world.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
+		# The clouds are a sibling node (not under the WorldManager), so forward the Sun straight into their
+		# daylight twin — clouds read moonlit/dark at night like the ground. Self-guards ⇒ flag-off byte-identical.
+		if _clouds != null:
+			_clouds.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
 	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
 	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),

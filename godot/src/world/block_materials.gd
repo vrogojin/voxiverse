@@ -14,6 +14,100 @@ extends RefCounted
 static var _cache: Dictionary = {}    # int block_id -> StandardMaterial3D
 static var _snow_cache: Dictionary = {}   # int base block_id -> StandardMaterial3D (snow-capped variant, M1)
 
+# COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3 C-NEAR): every near-field daylight ShaderMaterial twin
+# built under FP_NEAR_DAYLIGHT is registered here so set_near_daylight_sun_dir can feed the Sun into all of them
+# each frame (both render paths + VoxelBody debris share this one static cache). Empty when the flag is off ⇒
+# the setter is a no-op ⇒ byte-identical.
+static var _daylight_twins: Array[ShaderMaterial] = []
+
+# The near-field daylight shader twins (ATMO2 B3): they MIRROR the shipped unshaded StandardMaterial3D looks
+# (_textured/_solid/_translucent) EXACTLY — same vertex-colour × texture × albedo output — and multiply the
+# absolute day/night shade(μ), μ = normalize(world_pos)·ŝ (planet centre = scene origin under the fixed frame).
+# shade=1 at noon ⇒ ALBEDO byte-equal to the StandardMaterial output; the night side dims to the night floor so
+# the near ground darkens exactly as the far shell does. sun_dir fed each frame (set_near_daylight_sun_dir). The
+# shade kernel is the CPU CosmosSky.near_shade twin (same NEAR_NIGHT_FLOOR/TERMINATOR_MU). gl_compat-safe (no
+# loops/derivatives). The StandardMaterial path (flag off) is the permanent P3 fallback (any compile failure ⇒
+# flag off ⇒ the shipped unshaded material verbatim).
+#
+# OPAQUE twin (_textured / _solid, + emissive lava): cull_disabled (both shipped looks are CULL_DISABLED), REPEAT
+# (the fallback mesher tiles one texture per world-metre), vertex-colour × albedo × texture. Emission is added
+# post-shade (unshaded EMISSION), so lava keeps its glow at night while its diffuse darkens.
+const _NEAR_DAYLIGHT_OPAQUE_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform sampler2D albedo_tex : source_color, filter_nearest_mipmap, repeat_enable;
+uniform bool use_texture = false;
+uniform vec4 albedo_color : source_color = vec4(1.0);
+uniform bool use_vertex_color = true;
+uniform vec3 emission_color : source_color = vec3(0.0);
+uniform float emission_energy = 0.0;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+varying vec3 v_wp;
+varying vec4 v_col;
+void vertex() { v_col = COLOR; v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 nrm = normalize(v_wp);
+	float mu = dot(nrm, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 base = albedo_color;
+	if (use_vertex_color) { base *= v_col; }
+	if (use_texture) { base *= texture(albedo_tex, UV); }
+	ALBEDO = base.rgb * shade;
+	EMISSION = emission_color * emission_energy;
+}
+"
+
+# TRANSLUCENT twin (_translucent: glass/water/ice) — alpha-blended with a depth pre-pass (== TRANSPARENCY_ALPHA_
+# DEPTH_PRE_PASS), vertex-colour OFF (placed panes keep their authored tint), REPEAT texture when present. Two
+# cull variants mirror the shipped material: water is double-sided (cull_disabled), glass/ice cull_back.
+const _NEAR_DAYLIGHT_TRANSLUCENT_DS_SHADER := "shader_type spatial;
+render_mode unshaded, depth_prepass_alpha, cull_disabled;
+uniform sampler2D albedo_tex : source_color, filter_nearest_mipmap, repeat_enable;
+uniform bool use_texture = false;
+uniform vec4 albedo_color : source_color = vec4(1.0);
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+varying vec3 v_wp;
+void vertex() { v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 nrm = normalize(v_wp);
+	float mu = dot(nrm, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 base = albedo_color;
+	if (use_texture) { base *= texture(albedo_tex, UV); }
+	ALBEDO = base.rgb * shade;
+	ALPHA = base.a;
+}
+"
+const _NEAR_DAYLIGHT_TRANSLUCENT_BACK_SHADER := "shader_type spatial;
+render_mode unshaded, depth_prepass_alpha, cull_back;
+uniform sampler2D albedo_tex : source_color, filter_nearest_mipmap, repeat_enable;
+uniform bool use_texture = false;
+uniform vec4 albedo_color : source_color = vec4(1.0);
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+varying vec3 v_wp;
+void vertex() { v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 nrm = normalize(v_wp);
+	float mu = dot(nrm, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 base = albedo_color;
+	if (use_texture) { base *= texture(albedo_tex, UV); }
+	ALBEDO = base.rgb * shade;
+	ALPHA = base.a;
+}
+"
+
 ## Render material for `block_id`; null for AIR. Cached across calls. Opaque blocks
 ## get a textured (or flat-swatch) unshaded material; translucent blocks (glass/water/
 ## ice, cull_group > 0) get an alpha-blended material (WGC §5.1); emissive blocks
@@ -36,7 +130,13 @@ static func get_for(block_id: int) -> Material:
 	# double-transform them. Return the plain StandardMaterial3D, same as flat (docs/…-REAL-GEOMETRY §1).
 	var mat: Material
 	if CubeSphere.FLAT_WORLD or CubeSphere.M5_REAL:
-		mat = _standard(block_id)
+		# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the near-field unshaded material carries the absolute day/night
+		# shade twin (keeps vertex-colour × texture EXACTLY, multiplies shade(μ)). Off ⇒ the shipped
+		# StandardMaterial3D verbatim (byte-identical); on ⇒ the ShaderMaterial twin of the SAME look.
+		if CubeSphere.FP_NEAR_DAYLIGHT:
+			mat = _standard_daylight(block_id)
+		else:
+			mat = _standard(block_id)
 	else:
 		mat = _bend_material(block_id)
 	_cache[block_id] = mat
@@ -59,6 +159,80 @@ static func _standard(block_id: int) -> StandardMaterial3D:
 		mat.emission = Color(color.r, color.g, color.b)
 		mat.emission_energy_multiplier = float(rd.get("emissive_glow", 1.0))
 	return mat
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the near-field DAYLIGHT twin of _standard — the SAME per-id look
+## (textured / flat-swatch / translucent, optional lava emission) rebuilt as a ShaderMaterial that multiplies
+## the absolute day/night shade(μ) onto the diffuse. Keeps vertex-colour × texture × albedo EXACTLY at noon
+## (shade=1) ⇒ the day look is byte-preserved; the night side darkens to the near night floor. Only built when
+## FP_NEAR_DAYLIGHT is on (never on the flag-off path ⇒ byte-identical). Registered for the per-frame sun_dir feed.
+static func _standard_daylight(block_id: int) -> ShaderMaterial:
+	var tex := BlockTextures.texture_for(block_id)
+	var rd := BlockCatalog.render_def_of(block_id)
+	var color := BlockCatalog.color_of(block_id)
+	var mat: ShaderMaterial
+	if rd.get("translucent", false):
+		mat = _daylight_translucent(tex, color, block_id == BlockCatalog.id_of(&"water"))
+	elif tex != null:
+		# textured: albedo white, vertex colour on, texture — matches _textured.
+		mat = _daylight_opaque(tex, Color(1, 1, 1), true)
+	else:
+		# flat swatch: albedo = colour, vertex colour on — matches _solid.
+		mat = _daylight_opaque(null, color, true)
+	if rd.get("emissive", false) and not rd.get("translucent", false):
+		mat.set_shader_parameter("emission_color", Color(color.r, color.g, color.b))
+		mat.set_shader_parameter("emission_energy", float(rd.get("emissive_glow", 1.0)))
+	return mat
+
+## Build one OPAQUE near-daylight twin (_textured / _solid look). `tex` null ⇒ flat swatch (no texture).
+## `albedo` is the base albedo_color (white for a textured block, the swatch colour for a no-tile block).
+## Registered in _daylight_twins for the per-frame sun_dir feed.
+static func _daylight_opaque(tex: Texture2D, albedo: Color, use_vertex_color: bool) -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = _NEAR_DAYLIGHT_OPAQUE_SHADER
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	if tex != null:
+		m.set_shader_parameter("albedo_tex", tex)
+		m.set_shader_parameter("use_texture", true)
+	else:
+		m.set_shader_parameter("use_texture", false)
+	m.set_shader_parameter("albedo_color", albedo)
+	m.set_shader_parameter("use_vertex_color", use_vertex_color)
+	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	_daylight_twins.append(m)
+	return m
+
+## Build one TRANSLUCENT near-daylight twin (_translucent look): alpha-blended + depth pre-pass, vertex colour
+## OFF, `color` carries the RGBA tint+alpha, optional texture. `double_sided` (water) ⇒ cull_disabled, else
+## (glass/ice) cull_back — mirroring the shipped material's culling exactly.
+static func _daylight_translucent(tex: Texture2D, color: Color, double_sided: bool) -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = _NEAR_DAYLIGHT_TRANSLUCENT_DS_SHADER if double_sided else _NEAR_DAYLIGHT_TRANSLUCENT_BACK_SHADER
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	if tex != null:
+		m.set_shader_parameter("albedo_tex", tex)
+		m.set_shader_parameter("use_texture", true)
+	else:
+		m.set_shader_parameter("use_texture", false)
+	m.set_shader_parameter("albedo_color", color)
+	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	_daylight_twins.append(m)
+	return m
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): feed the current Sun direction into EVERY near-field daylight twin (both
+## render paths + VoxelBody debris share this static cache). No-op unless the flag is on (nothing registered ⇒
+## the twins never exist) ⇒ byte-identical. Forwarded from CosmosSky via WorldManager (world_manager.gd).
+static func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.FP_NEAR_DAYLIGHT:
+		return
+	for m in _daylight_twins:
+		if m != null:
+			m.set_shader_parameter("sun_dir", sun_dir)
 
 ## The COSMOS M1 bend material (§3.4): a ShaderMaterial mirroring _standard's look (unshaded,
 ## textured / flat-swatch / translucent, optional emission) with the shared camera-centred sphere
@@ -104,17 +278,23 @@ static func _bend_material(block_id: int) -> ShaderMaterial:
 ## models; the fallback commits the surface with it). Zero new texture assets (reuses snow_block's
 ## tile); a base id with no snow_block tile falls back to a flat snow-tinted swatch. v2 (top/side
 ## split) stays deferred (MAX_SURFACES contention).
-static func snow_capped_for(base_id: int) -> StandardMaterial3D:
-	var cached: StandardMaterial3D = _snow_cache.get(base_id, null)
+static func snow_capped_for(base_id: int) -> Material:
+	var cached: Material = _snow_cache.get(base_id, null)
 	if cached != null:
 		return cached
 	var snow_id := BlockCatalog.id_of(&"snow_block")
 	var tex := BlockTextures.texture_for(snow_id)
 	var tint: Color = lerp(Color.WHITE, BlockCatalog.color_of(base_id), 0.18)
-	var mat: StandardMaterial3D
-	if tex != null:
-		mat = _textured(tex)
-		mat.albedo_color = tint            # tint the (white) snow texture toward the base hue
+	var mat: Material
+	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the snow-cap variant is a near-field unshaded material too, so it
+	# carries the daylight shade twin. The tint (albedo_color) rides the twin's albedo_color uniform, keeping
+	# texel × tint × vertex-colour EXACTLY at noon. Off ⇒ the shipped StandardMaterial3D verbatim (byte-identical).
+	if CubeSphere.FP_NEAR_DAYLIGHT:
+		mat = _daylight_opaque(tex, tint, true)   # tint the (white) snow texture toward the base hue
+	elif tex != null:
+		var sm := _textured(tex)
+		sm.albedo_color = tint            # tint the (white) snow texture toward the base hue
+		mat = sm
 	else:
 		mat = _solid(tint)
 	_snow_cache[base_id] = mat
@@ -128,6 +308,7 @@ static func snow_capped_for(base_id: int) -> StandardMaterial3D:
 static func reset_cache() -> void:
 	_cache.clear()
 	_snow_cache.clear()             # snow-cap variants (M1) rebind per session too
+	_daylight_twins.clear()         # ATMO2 B3: the near-daylight twins are held by the cleared caches — drop them too
 	if CubeSphere.M5_RENDER:
 		CosmosTruePlace.reset_materials()   # the M5 single-writer fan-out holds the cached materials — clear it too
 

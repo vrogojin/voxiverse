@@ -109,7 +109,47 @@ func setup(env: PerVoxelEnvironment, cam_provider: Node = null) -> void:
 		_meshes.append(mi)
 		_arr_meshes.append(am)
 
-func _make_material(_l: int) -> StandardMaterial3D:
+# COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3 C-NEAR): the near-field daylight TWIN of the cloud
+# material. Keeps the shipped unshaded vertex-colour × (white, α 0.82) look EXACTLY and multiplies the absolute
+# day/night shade(μ), μ = normalize(world_pos)·ŝ (planet centre = scene origin, the same fixed frame the tiles
+# are built in). shade=1 at noon ⇒ ALBEDO byte-equal to the StandardMaterial output; at night the clouds read
+# moonlit/dark like the ground (the moonshine floor via near_shade) instead of staying bright white — the whole
+# point. Same shade kernel as the ground twins (CosmosSky.near_shade). fog_disabled matches disable_fog=true.
+# StandardMaterial fallback = flag off (byte-identical + the P3 gl_compat compile-failure backstop).
+const _NEAR_DAYLIGHT_CLOUD_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled, fog_disabled;
+uniform vec4 albedo_color : source_color = vec4(1.0, 1.0, 1.0, 0.82);
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+varying vec3 v_wp;
+varying vec4 v_col;
+void vertex() { v_col = COLOR; v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 nrm = normalize(v_wp);
+	float mu = dot(nrm, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 base = albedo_color * v_col;
+	ALBEDO = base.rgb * shade;
+	ALPHA = base.a;
+}
+"
+
+func _make_material(_l: int) -> Material:
+	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the near-field daylight ShaderMaterial twin (keeps the vertex-colour ×
+	# white-α look EXACTLY, darkens the clouds at night like the ground). Off ⇒ the shipped StandardMaterial verbatim.
+	if CubeSphere.FP_NEAR_DAYLIGHT:
+		var sh := Shader.new()
+		sh.code = _NEAR_DAYLIGHT_CLOUD_SHADER
+		var sm := ShaderMaterial.new()
+		sm.shader = sh
+		sm.set_shader_parameter("albedo_color", Color(1, 1, 1, 0.82))
+		sm.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+		sm.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		return sm
 	var m := StandardMaterial3D.new()
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED       # cheap on gl_compat, like the far ring
 	m.vertex_color_use_as_albedo = true
@@ -118,6 +158,17 @@ func _make_material(_l: int) -> StandardMaterial3D:
 	m.disable_fog = true
 	m.cull_mode = BaseMaterial3D.CULL_DISABLED
 	return m
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): feed the current Sun direction into the cloud daylight twins each frame
+## (forwarded from CosmosSky via main.gd). No-op unless the flag is on and the layer materials are the twin ⇒
+## flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
+func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.FP_NEAR_DAYLIGHT:
+		return
+	for mi in _meshes:
+		var mat := mi.material_override
+		if mat is ShaderMaterial:
+			(mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
 
 func _process(_delta: float) -> void:
 	_frame += 1

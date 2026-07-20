@@ -2317,6 +2317,10 @@ func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	if _module_world != null and _module_world.has_method("set_near_daylight_sun_dir"):
 		_module_world.call("set_near_daylight_sun_dir", sun_dir)
+	# The per-id near-field materials (fallback mesher + module residual surfaces — slopes, translucent, water,
+	# lava — + VoxelBody debris) share the one static BlockMaterials cache; feed the Sun into every daylight twin.
+	# Self-guards on FP_NEAR_DAYLIGHT ⇒ flag-off is byte-identical (nothing registered, no-op).
+	BlockMaterials.set_near_daylight_sun_dir(sun_dir)
 
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).

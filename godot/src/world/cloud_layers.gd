@@ -35,15 +35,27 @@ const TILE_BLOCKS := 32                 ## one cloud tile edge (blocks)
 const LATTICE := 64                     ## tiles per side → a 2048-block cloud dome around the camera
 const REBUILD_INTERVAL := 16            ## frames between a layer's rebuilds (round-robin, §4.2)
 const CAP_VERTS := 24576                ## HARD per-layer vertex cap (§8 row 4) — emission stops here
+const BOX_VERTS := 36                   ## verts one puffy box emits (lumpy top quad 6 + underside 6 + 4 sides 24)
 const STORM_TILE_CAP := 64              ## W4: max cumulonimbus towers per rebuild (§4.2 — bounded extra verts)
 const STORM_TOP := 256.0                ## W4: cumulonimbus tower top ALTITUDE (< ATMO_TOP); anvil forms near here
 const STORM_TINT := Color(0.45, 0.47, 0.54)  ## dark storm-cloud vertex colour
 
 # --- altitude bands (blocks; all below ATMO_TOP = 384) + type params (§4.2) ----
 const ALT := [144.0, 216.0, 310.0]      ## L0 cumulus, L1 stratus, L2 cirrus base ALTITUDES (radial, above surface)
-const THICK := [3.0, 1.0, 0.6]          ## slab thickness per layer
+# --- VOLUME (clouds2 2026-07-20) ------------------------------------------------
+# The pilot saw the clouds as flat PAPER: THICK was ~3 blocks against 32-block tiles, so the boxes read as
+# sheets and merged runs got one flat lid. Each box is now a genuine puffy 3-D MASS — a closed prism with
+# real vertical extent (THICK), a raised centre CROWN (the billow), per-corner top LUMPs (the chunky
+# semi-cubic relief), and a bulged UNDERside — differentiated per type: cumulus fat & billowing, stratus
+# flatter, cirrus thin & wispy. All tops stay < ATMO_TOP (384): L0 144+64+18≈226, L1 216+16, L2 310+7.
+# The greedy row-merge and the hard vertex cap are untouched (BOX_VERTS is fixed at 42), so full overcast is
+# still the cheapest mesh (≤ a few long runs) and NEVER-OOM still binds.
+const THICK := [64.0, 16.0, 7.0]        ## slab body thickness per layer (base→top), blocks — the vertical extent
+const TOPVAR := [22.0, 5.0, 2.0]        ## per-BOX top-height step (chunky stepped cloudscape between boxes)
+const LUMP := [12.0, 3.0, 1.0]          ## per-CORNER top-height lump amplitude — the puffy relief on the lid
+const UNDER := [12.0, 2.5, 0.5]         ## per-CORNER UNDERside bulge (base dips below the deck) — body from below/side
 const THRESH := [0.18, 0.30, 0.12]      ## cloud-cover threshold for a tile to be present per layer
-const BUMP := [2.5, 0.5, 0.3]           ## chunky top-height variation per layer (the semi-cubic look)
+const BUMP := [2.5, 0.5, 0.3]           ## legacy per-box bump amplitude (still used by _quantize_top for the storm path)
 const TINT := [Color(0.95, 0.96, 0.98), Color(0.80, 0.82, 0.86), Color(0.90, 0.92, 0.97)]
 
 const NOISE_FREQ := 0.004               ## downscale-noise frequency in BLOCKS (sampled along the tangent world scale)
@@ -156,9 +168,6 @@ func rebuild_layer(layer: int) -> void:
 	_build_frame(cam)
 	var half := LATTICE / 2
 	var n := 0                                         # vertices written to the scratch
-	var alt := float(ALT[layer])
-	var thick := float(THICK[layer])
-	var bump := float(BUMP[layer])
 	var tint: Color = TINT[layer]
 	_storm_count = 0
 	for tz in range(LATTICE):
@@ -178,14 +187,14 @@ func rebuild_layer(layer: int) -> void:
 				run_start = tx
 			elif not present and run_start >= 0:
 				# close a run [run_start, tx) → one box, if it fits the cap.
-				if n + 30 <= CAP_VERTS:
+				if n + BOX_VERTS <= CAP_VERTS:
 					# W4: a convective L0 run becomes a towering cumulonimbus (capped count) — darker + taller.
 					var storm := false
 					if (CubeSphere.FP_STORMS or _test_storm) and layer == 0 and _storm_count < STORM_TILE_CAP:
 						storm = _is_storm_run(run_start, tx, tz, half)
 						if storm:
 							_storm_count += 1
-					n = _emit_box(n, run_start - half, tx - half, tz - half, alt, thick, bump, tint, layer, storm)
+					n = _emit_box(n, run_start - half, tx - half, tz - half, layer, tint, storm)
 				run_start = -1
 			tx += 1
 	_emitted[layer] = n
@@ -216,36 +225,67 @@ func _is_storm_run(c0: int, c1: int, tz: int, half: int) -> bool:
 	return _env.is_convective_dir(_tile_dir(a_c, b_c))
 
 ## Emit one merged box spanning tile columns [cx0, cx1) at row cz (all CAMERA-CENTRED tile indices: 0 == the
-## camera column) at the layer altitude, ON THE SHELL. Each corner is placed radially (dir·radius, planet centre
-## = scene origin) so the box lies curved over the terrain and its faces are normal to the radial. Non-indexed
-## triangles (top + 4 sides; the bottom is unseen from below the deck and skipped). A convective run extrudes to
-## a towering cumulonimbus (dark, up to STORM_TOP) — same mesh, bounded extra height, no extra verts.
-func _emit_box(n: int, cx0: int, cx1: int, cz: int, alt: float, thick: float, bump: float, tint: Color, layer: int, storm := false) -> int:
+## camera column) at the layer altitude, ON THE SHELL, as a CLOSED PUFFY PRISM (clouds2 volume). Each corner
+## is placed radially (dir·radius, planet centre = scene origin) so the box lies curved over the terrain and
+## its faces are normal to the radial. Geometry (36 verts): a per-corner LUMPY top lid (chunky puffy relief),
+## a per-corner bulged UNDERside (real body when seen from below/side/orbit), and 4 side walls whose height is
+## the layer THICKness — no longer a paper sheet. The lid's per-box height also steps (TOPVAR) so a run of
+## boxes reads as a chunky cloudscape, not one flat plane. A convective run extrudes to a towering
+## cumulonimbus (dark, top at STORM_TOP) — same 36-vert mesh, bounded extra height, no extra verts. The lid is
+## emitted FIRST so the frame gate reads a top face (its normal stays ≈ radial: the per-corner lumps are small
+## against the tile span, and merged runs are wide, so the lid is near-horizontal over the terrain).
+func _emit_box(n: int, cx0: int, cx1: int, cz: int, layer: int, tint: Color, storm := false) -> int:
+	var alt := float(ALT[layer])
+	var thick := float(THICK[layer])
 	var a0 := float(cx0) * float(TILE_BLOCKS)
 	var a1 := float(cx1) * float(TILE_BLOCKS)
 	var b0 := float(cz) * float(TILE_BLOCKS)
 	var b1 := float(cz + 1) * float(TILE_BLOCKS)
-	var top_alt := STORM_TOP if storm else _quantize_top(alt, thick, bump, cx0, cz, layer)
-	var rt := _R + top_alt                                       # top shell radius
-	var rb := _R + alt                                           # base shell radius
+	# per-BOX top base altitude: layer body height + a chunky stepped bump (or the tall storm top).
+	var top_base := STORM_TOP if storm else alt + thick + _step(float(cx0), float(cz), layer, float(TOPVAR[layer]))
+	var lump := 0.0 if storm else float(LUMP[layer])
+	var under := float(UNDER[layer])
 	var c := STORM_TINT if storm else tint
+	var cs := c.darkened(0.15)
 	# corner radial directions (shared by base + top)
 	var d00 := _tile_dir(a0, b0)
 	var d10 := _tile_dir(a1, b0)
 	var d11 := _tile_dir(a1, b1)
 	var d01 := _tile_dir(a0, b1)
-	# top quad (two tris) — normal ≈ radial (horizontal over the terrain)
-	n = _quad(n, d00 * rt, d10 * rt, d11 * rt, d01 * rt, c)
-	# four sides (darker underside tint for depth): base → top along each edge
-	var cs := c.darkened(0.15)
-	n = _quad(n, d00 * rb, d10 * rb, d10 * rt, d00 * rt, cs)
-	n = _quad(n, d11 * rb, d01 * rb, d01 * rt, d11 * rt, cs)
-	n = _quad(n, d01 * rb, d00 * rb, d00 * rt, d01 * rt, cs)
-	n = _quad(n, d10 * rb, d11 * rb, d11 * rt, d10 * rt, cs)
+	# per-corner top-lid radii (chunky puffy relief) and per-corner underside radii (base dips below the deck).
+	var rt00 := _R + top_base + _lumpv(a0, b0, layer, lump)
+	var rt10 := _R + top_base + _lumpv(a1, b0, layer, lump)
+	var rt11 := _R + top_base + _lumpv(a1, b1, layer, lump)
+	var rt01 := _R + top_base + _lumpv(a0, b1, layer, lump)
+	var rb00 := _R + alt - _lumpv(a0, b0, layer, under)
+	var rb10 := _R + alt - _lumpv(a1, b0, layer, under)
+	var rb11 := _R + alt - _lumpv(a1, b1, layer, under)
+	var rb01 := _R + alt - _lumpv(a0, b1, layer, under)
+	# TOP lid (two tris) — emitted FIRST; normal ≈ radial (horizontal over the terrain).
+	n = _quad(n, d00 * rt00, d10 * rt10, d11 * rt11, d01 * rt01, c)
+	# BOTTOM (underside) — reversed winding so its normal faces DOWN (−radial); real body from below.
+	n = _quad(n, d00 * rb00, d01 * rb01, d11 * rb11, d10 * rb10, cs)
+	# four side walls (darker for depth): base → top along each edge — the vertical extent (thickness).
+	n = _quad(n, d00 * rb00, d10 * rb10, d10 * rt10, d00 * rt00, cs)
+	n = _quad(n, d10 * rb10, d11 * rb11, d11 * rt11, d10 * rt10, cs)
+	n = _quad(n, d11 * rb11, d01 * rb01, d01 * rt01, d11 * rt11, cs)
+	n = _quad(n, d01 * rb01, d00 * rb00, d00 * rt00, d01 * rt01, cs)
 	return n
 
-## Top ALTITUDE (blocks above surface) of a box: the layer altitude + a chunky, quantized noise bump (the
-## semi-cubic look). Keyed on the camera-centred tile indices (stable within a rebuild).
+## A chunky per-corner height lump (blocks, ≥0) keyed on the corner's tangent-plane position (a, b) in blocks
+## — quantized to half-blocks for the semi-cubic look. Amplitude 0 ⇒ 0 (storms flatten the lid to the tower).
+func _lumpv(a: float, b: float, layer: int, amp: float) -> float:
+	if amp <= 0.0:
+		return 0.0
+	var nz := _noise.get_noise_3d(a * 0.03, b * 0.03, float(layer) * 7.0)
+	return round(maxf(0.0, nz) * amp * 2.0) * 0.5
+
+## A chunky per-BOX height step (blocks, ≥0) keyed on the camera-centred tile indices (stable within a rebuild).
+func _step(cx0: float, cz: float, layer: int, amp: float) -> float:
+	var nz := _noise.get_noise_3d(cx0 * 0.6, cz * 0.6, float(layer) * 7.0 + 3.0)
+	return round(maxf(0.0, nz) * amp * 2.0) * 0.5
+
+## Top ALTITUDE (blocks above surface) of a box (storm/legacy path): layer altitude + a chunky quantized bump.
 func _quantize_top(alt: float, thick: float, bump: float, cx0: int, cz: int, layer: int) -> float:
 	var nz := _noise.get_noise_3d(float(cx0) * 0.6, float(cz) * 0.6, float(layer) * 7.0)
 	var extra: float = round(maxf(0.0, nz) * bump * 2.0) * 0.5     # quantized to half-blocks
@@ -324,6 +364,36 @@ func _emitted_total() -> int:
 	for e in _emitted:
 		t += int(e)
 	return t
+
+## Gate hook (G-CLOUD-VOLUME): radial min/max (blocks) over the first `count` scratch verts — the geometry of
+## the LAST rebuilt layer. max−min is that layer's vertical extent (thickness), which must be non-zero (the
+## boxes are prisms with body, not paper sheets). Call rebuild_layer(L) then pass emitted_verts(L).
+func debug_scratch_radial_extent(count: int) -> Vector2:
+	if count <= 0:
+		return Vector2.ZERO
+	var mn := INF
+	var mx := 0.0
+	for i in range(count):
+		var r := _sv[i].length()
+		mn = minf(mn, r)
+		mx = maxf(mx, r)
+	return Vector2(mn, mx)
+
+## Gate hook (G-CLOUD-VOLUME): min and max |triangle-normal · up| over every emitted tri in the first `count`
+## scratch verts. A closed prism yields BOTH near-radial faces (top/bottom, |·up|≈1) AND near-tangential side
+## walls (|·up|≈0), so min < 0.5 proves the normals are NOT all radial-coplanar — i.e. the mesh has volume.
+func debug_scratch_normal_updot(count: int, up: Vector3) -> Vector2:
+	var mn := 1.0
+	var mx := 0.0
+	var i := 0
+	while i + 3 <= count:
+		var nrm := (_sv[i + 1] - _sv[i]).cross(_sv[i + 2] - _sv[i])
+		if nrm.length() > 1.0e-6:
+			var d := absf(nrm.normalized().dot(up))
+			mn = minf(mn, d)
+			mx = maxf(mx, d)
+		i += 3
+	return Vector2(mn, mx)
 
 func storm_tower_count() -> int:
 	return _storm_count

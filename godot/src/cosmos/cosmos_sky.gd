@@ -392,6 +392,23 @@ static func day_factor(mu: float) -> float:
 static func shell_day_shade(mu: float) -> float:
 	return SHELL_NIGHT_FLOOR + (1.0 - SHELL_NIGHT_FLOOR) * day_factor(mu)
 
+## ATMO2 B3 (§2.3/§3.3): the NEAR-FIELD night floor (0.10) and the near-field moonshine gain (retuned 0.5→0.15
+## to compose with the floor, §3.3). Separate from SHELL_NIGHT_FLOOR (0.06) and MOONSHINE_GAIN (0.5, ambient) so
+## those stay byte-identical; the near field is slightly brighter at night than the far shell (foreground readability).
+const NEAR_NIGHT_FLOOR := 0.10
+const NEAR_MOONSHINE_GAIN := 0.15
+
+## ATMO2 B3 C-NEAR twin: the absolute day/night shade multiplied onto the unshaded near materials at surface
+## direction cosine mu = normalize(MODEL·v)·ŝ. shade = max(night_floor + (1−night_floor)·day(mu), moonshine).
+## EQUALS shell_day_shade at the same surface point up to the floor difference (near/far agree by construction),
+## so the pilot's near/far night split is killed. noon (mu=1) ⇒ 1; sun below the terminator ⇒ the night floor.
+static func near_shade(mu: float, moonshine_term: float) -> float:
+	return maxf(NEAR_NIGHT_FLOOR + (1.0 - NEAR_NIGHT_FLOOR) * day_factor(mu), clampf(moonshine_term, 0.0, 1.0))
+
+## ATMO2 B3: the near-field moonshine term (composes into near_shade): gain·illum·moon_up·night_authority, ≤1.
+static func near_moonshine(illum_frac: float, moon_up: float, night_authority: float) -> float:
+	return NEAR_MOONSHINE_GAIN * clampf(illum_frac, 0.0, 1.0) * clampf(moon_up, 0.0, 1.0) * clampf(night_authority, 0.0, 1.0)
+
 ## A4 Moon self-phase twin: the disc-integrated lit fraction of a Lambert sphere at phase-cosine cos_phase
 ## (cos of the sun–observer angle seen from the Moon) = (1+cos_phase)/2 — EXACTLY EPH.illuminated_fraction,
 ## so the unshaded per-fragment Lambert shader and the ephemeris agree by construction (gate G-AS-ABSLIGHT).

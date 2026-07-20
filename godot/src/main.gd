@@ -208,6 +208,11 @@ func _process(_delta: float) -> void:
 	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
 	if _player != null and _cosmos_sky != null and CubeSphere.FP_SHELL_ABSOLUTE and CubeSphere.FACETED:
 		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the Sun direction into the near-field daylight material twin so
+	# the near ground darkens with the same absolute day/night as the far shell (kills the near/far night split).
+	# Same forwarding discipline; the WorldManager/module/atlas setters self-guard ⇒ flag-off is byte-identical.
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_NEAR_DAYLIGHT:
+		_player.world.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
 	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
 	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),

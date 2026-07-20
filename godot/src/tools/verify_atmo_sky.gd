@@ -55,6 +55,7 @@ func _initialize() -> void:
 	_gate_b5_fog()
 	_gate_b4_moon()
 	_gate_b2_limb()
+	_gate_b3_nearnight()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -537,6 +538,41 @@ func _gate_b2_limb() -> void:
 		var a6 := Color.WHITE.lerp(SKY.scatter_tint(mu), SKY.scatter_band(mu))
 		if (a5 - a6).is_equal_approx(Color(0, 0, 0)) == false and absf(a5.r - a6.r) + absf(a5.g - a6.g) + absf(a5.b - a6.b) > 1e-6: tint_eq = false
 	_ok(tint_eq, "C-SHELL tint == A5 far-shell tint on the shared μ grid (harmonized by construction)")
+
+# ------------------------------------------------------------------ G-B3-NEARNIGHT (ATMO2 B3)
+func _gate_b3_nearnight() -> void:
+	print("  --- G-B3-NEARNIGHT: near-field absolute day/night shade == far shell, dark at night (ATMO2 §2.3) ---")
+	# noon ⇒ 1 (shade is the identity multiply ⇒ the vertex-colour×texture day look is byte-preserved).
+	_ok(is_equal_approx(SKY.near_shade(1.0, 0.0), 1.0), "near shade at noon == 1 (day vertex/texture look byte-preserved)")
+	# Night side / sun below the terminator ⇒ dark ground at the night floor (≤ 0.12).
+	_ok(is_equal_approx(SKY.near_shade(-1.0, 0.0), SKY.NEAR_NIGHT_FLOOR), "night shade == NEAR_NIGHT_FLOOR")
+	_ok(SKY.near_shade(-1.0, 0.0) <= 0.12, "near shade on the night side ≤ 0.12 (genuinely dark ground)")
+	_ok(SKY.near_shade(-0.2, 0.0) <= 0.12, "sun below the terminator (dip+pen) ⇒ shade ≤ 0.12")
+	# Near/far CONSISTENCY: near shade == the far shell day-factor at the same surface point, up to the floor
+	# difference (0.10 near vs 0.06 far) — near AND far agree BY ASSERTION (the pilot's bug-6 split becomes a pin).
+	var worst := 0.0
+	var mono := true
+	var prev := -1.0
+	for i in range(-100, 101):
+		var mu := float(i) / 100.0
+		var ns := SKY.near_shade(mu, 0.0)
+		worst = maxf(worst, absf(ns - SKY.shell_day_shade(mu)))
+		if ns < prev - 1e-9: mono = false
+		prev = ns
+	_ok(worst <= (SKY.NEAR_NIGHT_FLOOR - SKY.SHELL_NIGHT_FLOOR) + 1e-6, "near shade == far shell day-factor ± floor diff (worst Δ %.4f)" % worst)
+	_ok(mono, "near shade monotone ↑ in μ (night → day)")
+	# Moonshine composes onto the night floor (retuned gain, below the ambient 0.5).
+	_ok(SKY.NEAR_MOONSHINE_GAIN < 0.5, "near moonshine gain retuned below the ambient MOONSHINE_GAIN (0.5)")
+	_ok(SKY.near_shade(-1.0, 0.15) >= SKY.NEAR_NIGHT_FLOOR, "moonshine raises the night floor (moonlit ground)")
+	var msn := SKY.near_moonshine(1.0, 1.0, 1.0)
+	_ok(is_equal_approx(msn, SKY.NEAR_MOONSHINE_GAIN), "near_moonshine peaks at the gain (full moon, high, deep night)")
+	# SMOKE: the atlas daylight twin material compiles under the flag (sed-true parses the GLSL); StandardMaterial off.
+	var atlas := BlockAtlas.new()
+	var img := Image.create(4, 4, false, Image.FORMAT_RGBA8)
+	var tex := ImageTexture.create_from_image(img)
+	var m := atlas._make_material(tex)
+	_ok((m is ShaderMaterial) == CubeSphere.FP_NEAR_DAYLIGHT, "atlas material twin is a ShaderMaterial iff FP_NEAR_DAYLIGHT")
+	_ok((m is StandardMaterial3D) == (not CubeSphere.FP_NEAR_DAYLIGHT), "atlas material is the shipped StandardMaterial when flag off")
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

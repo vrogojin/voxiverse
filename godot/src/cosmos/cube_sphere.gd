@@ -891,6 +891,16 @@ const FP_MOON_PRESENCE := false
 ## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
 const FP_ATMO_PATH_SHELL := false
 
+## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
+## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
+## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far
+## split). This flag routes the near materials through ShaderMaterial TWINS that keep vertex-colour×texture
+## EXACTLY and multiply an absolute day/night shade(μ), μ = normalize(MODEL·v)·ŝ (planet centre = scene origin),
+## so near AND far agree at the same surface point BY CONSTRUCTION. night_floor 0.10; a StandardMaterial fallback
+## is retained permanently (P3 gl_compat class). Off ⇒ the shipped unshaded materials ⇒ byte-identical. Requires
+## ORBITAL_SKY (the sun_dir source). Gate G-B3-NEARNIGHT. LIVE-ONLY LOOK. Depends B0 (curves).
+const FP_NEAR_DAYLIGHT := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

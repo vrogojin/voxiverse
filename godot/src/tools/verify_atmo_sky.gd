@@ -50,6 +50,7 @@ func _initialize() -> void:
 	_gate_abslight()
 	_gate_term()
 	_gate_limb()
+	_gate_b0_path()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -300,6 +301,72 @@ func _gate_limb() -> void:
 	var below := SKY.shell_geom(Vector3(0.0, 0.0, ro - 1.0), centre, dir_up, r, ro)
 	var above2 := SKY.shell_geom(Vector3(0.0, 0.0, ro + 1.0), centre, dir_up, r, ro)
 	_ok(absf(below[0] - above2[0]) < 3.0, "chord continuous across the ATMO_TOP (r_outer) crossing (Δ %.3f)" % absf(below[0] - above2[0]))
+
+# ------------------------------------------------------------------ G-B0-PATH (ATMO2 B0)
+func _gate_b0_path() -> void:
+	print("  --- G-B0-PATH: optical-path sun air-mass m(cam→sun), T⃗(m)·L(m) (ATMO2 §3.2) ---")
+	var r := GRAV.r_vox("earth")
+	# T⃗(0) == WHITE exactly (blinding white sun in vacuum, the §2.1 fix).
+	var t0 := SKY.path_transmittance(0.0)
+	_ok(t0.r == 1.0 and t0.g == 1.0 and t0.b == 1.0, "T⃗(0) == white exactly (space sun is white)")
+	_ok(SKY.path_luminance(0.0) == 1.0, "L(0) == 1 (full-brightness space sun)")
+	# m == 0 for a space-clear LOS (camera in space, sun overhead, ray leaves the atmosphere).
+	var cam_space := Vector3(0.0, 0.0, r + 50000.0)
+	var m_clear := SKY.optical_path_air_mass(cam_space, Vector3(0.0, 0.0, 1.0), r, true)
+	_ok(m_clear == 0.0, "m == 0 exactly for a space-clear LOS (sun ray never enters the shell)")
+	# Vertical-from-ground m == 1 ± 2%.
+	var m_vert := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(0.0, 0.0, 1.0), r, true)
+	_ok(absf(m_vert - 1.0) <= 0.02, "vertical-from-ground m == 1 +/-2 pct (m=%.4f)" % m_vert)
+	# Airless body ⇒ 0.
+	_ok(SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(0.0, 0.0, 1.0), r, false) == 0.0, "airless ⇒ m == 0")
+	# Surface horizon m ∈ [15,22]; full-limb-from-orbit m ∈ [30,40].
+	var m_horiz := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(1.0, 0.0, 0.0), r, true)
+	_ok(m_horiz >= 15.0 and m_horiz <= 22.0, "surface horizon m ∈ [15,22] (m=%.3f)" % m_horiz)
+	var d_orb := r + 3000.0
+	var sinq := r / d_orb
+	var cosq := sqrt(maxf(1.0 - sinq * sinq, 0.0))
+	var m_limb := SKY.optical_path_air_mass(Vector3(0.0, 0.0, d_orb), Vector3(sinq, 0.0, -cosq), r, true)
+	_ok(m_limb >= 30.0 and m_limb <= 40.0, "full-limb-from-orbit m ∈ [30,40] (m=%.3f)" % m_limb)
+	# Monotone in zenith angle at the surface (m rises as the sun descends from zenith to horizon).
+	var mono := true
+	var prev := -1.0
+	for i in range(0, 91):
+		var mu := cos(deg_to_rad(float(i)))                  # zenith 0..90° ⇒ mu_v 1..0
+		var d := Vector3(sqrt(maxf(1.0 - mu * mu, 0.0)), 0.0, mu)
+		var m := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), d, r, true)
+		if m < prev - 1e-6: mono = false
+		prev = m
+	_ok(mono, "surface m monotone in zenith angle (zenith→horizon)")
+	# K–Y SHAPE cross-check: surface optical m within 15% of Kasten–Young over elevations 5°–90°.
+	var worst_ky := 0.0
+	for e in range(5, 91, 5):
+		var mu := sin(deg_to_rad(float(e)))
+		var mopt := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(sqrt(maxf(1.0 - mu * mu, 0.0)), 0.0, mu), r, true)
+		var mky := SKY.air_mass(mu)
+		worst_ky = maxf(worst_ky, absf(mopt - mky) / mky)
+	_ok(worst_ky < 0.15, "surface m within 15 pct of Kasten-Young over 5deg-90deg (worst frac %.4f)" % worst_ky)
+	# C¹ across the tangent fold (μ_v=0): the two branches meet with ZERO slope, so the one-sided derivatives
+	# of m w.r.t. μ_v both → 0 there (no slope jump). Test at an in-atmosphere camera with a small ε.
+	var cam_fold := Vector3(0.0, 0.0, r + 200.0)
+	var eps := 1.0e-3
+	var m0 := SKY.optical_path_air_mass(cam_fold, Vector3(1.0, 0.0, 0.0), r, true)             # μ_v=0 (horizontal)
+	var m_pos := SKY.optical_path_air_mass(cam_fold, Vector3(sqrt(1.0 - eps * eps), 0.0, eps), r, true)   # ascending
+	var m_neg := SKY.optical_path_air_mass(cam_fold, Vector3(sqrt(1.0 - eps * eps), 0.0, -eps), r, true)  # descending
+	_ok(absf(m_pos - m0) < 0.05 and absf(m_neg - m0) < 0.05, "m continuous across the tangent fold (C⁰)")
+	var slope_up := (m_pos - m0) / eps
+	var slope_dn := (m0 - m_neg) / eps
+	_ok(absf(slope_up - slope_dn) < 1.0, "m C¹ across the tangent fold (one-sided slopes match, Δ %.4f)" % absf(slope_up - slope_dn))
+	# C⁰/continuity across the ATMO_TOP camera crossing (radial altitude sweep, fixed sun_dir).
+	var sd := Vector3(0.6, 0.0, -0.8).normalized()
+	var m_below := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r + SKY.H_ATMO - 2.0), sd, r, true)
+	var m_above := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r + SKY.H_ATMO + 2.0), sd, r, true)
+	_ok(absf(m_below - m_above) < 0.5, "m continuous across the ATMO_TOP camera crossing (Δ %.5f)" % absf(m_below - m_above))
+	# Light colour/energy a pure function of (position, sun_dir) — orientation-invariant (identical repeats).
+	var cam_t := Vector3(1000.0, 0.0, r + 80.0)
+	var sd_t := Vector3(0.3, 0.2, 0.9).normalized()
+	var m_a := SKY.optical_path_air_mass(cam_t, sd_t, r, true)
+	var m_b := SKY.optical_path_air_mass(cam_t, sd_t, r, true)
+	_ok(m_a == m_b and SKY.path_transmittance(m_a) == SKY.path_transmittance(m_b), "sun light is a pure function of (position, sun_dir) — orientation-invariant")
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

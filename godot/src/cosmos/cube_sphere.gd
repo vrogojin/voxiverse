@@ -840,6 +840,16 @@ const FP_SHELL_ABSOLUTE := false
 ## A5 (matching curves). Gate G-AS-LIMB. LIVE-ONLY LOOK (P3 shader class); analytic StandardMaterial fallback.
 const FP_ATMO_SHELL := false
 
+## COSMOS ATMO2 B0 (docs/COSMOS-ATMO2-DESIGN.md §3.2/§3.3, stage B0). The optical-PATH sun law: the Sun's
+## disc/glare colour AND the DirectionalLight colour/energy become the transmittance T⃗(m)·L(m) over the
+## atmospheric PATH along the viewer→sun ray (CosmosSky.optical_path_air_mass), not the camera-ELEVATION
+## Kasten–Young curve. m=0 in vacuum (blinding WHITE sun), ≈1 at surface noon (pale warm), ≈18 at the surface
+## horizon (deep red), ≈36 through the limb from orbit — one continuous law, C¹ across the atmosphere border,
+## K–Y retired from the live path (kept in the gate as the surface cross-check). The disc/glare/light penumbra
+## unify on pen(h). Off ⇒ the shipped A2/A4 μ-keyed colour is untouched ⇒ byte-identical. Requires ORBITAL_SKY
+## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
+const FP_SUN_PATHLIGHT := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

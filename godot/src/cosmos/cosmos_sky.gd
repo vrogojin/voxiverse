@@ -416,6 +416,80 @@ static func shell_limb_color(mu: float, chord: float, h_min: float) -> Color:
 	return Color(base.r * l, base.g * l, base.b * l)
 
 # ---------------------------------------------------------------------------------------
+# COSMOS ATMO2 (docs/COSMOS-ATMO2-DESIGN.md §3.2) — the OPTICAL-PATH kernel. The single physical law that
+# colours the Sun disc/glare, the DirectionalLight, and (B2) the atmosphere shell. All PURE STATIC (engine-
+# free), so the gate (G-B0-PATH) drives it DIRECTLY and is flag-independent. Two scale heights are split on
+# purpose: H_SCALE=128 is the amplitude/gameplay height (fog, drag, halo thickness — unchanged, shared with
+# SN1); H_OPT is the EXTINCTION-COLOUR height, chosen so the 1:1000 world's air-mass range matches the real
+# Earth m-range the shipped τ⃗ were measured against (m_horizon≈18, m_limb≈36). One declared const buys a
+# physical white-in-space → warm-noon → red-horizon → crimson-graze sun with NO regime switch, C¹ everywhere.
+# ---------------------------------------------------------------------------------------
+
+## §3.2: the extinction-colour scale height (blocks). Deliberately << H_SCALE (see the section note).
+const H_OPT := 30.0
+## §3.2 L(m): the broadband luminance extinction coefficient (dimmer sun through more air).
+const TAU_LUM := 0.10
+
+## §3.2 ρ_opt(h) = exp(−h/H_OPT): the extinction-colour density profile (distinct from the H_SCALE fog ρ).
+static func rho_opt(h: float) -> float:
+	return exp(-h / H_OPT)
+
+## §3.2 normalizer N = H_OPT·(1−e^(−ATMO_TOP/H_OPT)): the vertical-from-ground optical column, so m=1 there.
+static func opt_norm() -> float:
+	return H_OPT * (1.0 - exp(-H_ATMO / H_OPT))
+
+## §3.2 X_horiz(h): the tangent (horizontal) half-path optical column at altitude h (blocks). r_solid = R.
+static func x_horiz(h: float, r_solid: float) -> float:
+	return rho_opt(maxf(h, 0.0)) * sqrt(PI * (r_solid + maxf(h, 0.0)) * H_OPT / 2.0)
+
+## §3.2 X_up(h,μ_v): the ascending-ray optical column. μ_v = dir·up ≥ 0. C¹; μ_v=1 ⇒ ≈H_OPT·ρ (plane-
+## parallel vertical), μ_v=0 ⇒ ≡ X_horiz (the tangent fold) — 4 ops, no erf.
+static func x_up(h: float, mu_v: float, r_solid: float) -> float:
+	var hc := maxf(h, 0.0)
+	return H_OPT * rho_opt(hc) / sqrt(mu_v * mu_v + 2.0 * H_OPT / (PI * (r_solid + hc)))
+
+## §3.2 m(cam→sun ray): the NORMALIZED optical air mass along the viewer→sun ray. 0 for a space-clear LOS,
+## ≈1 vertical-from-ground, ≈18 at the surface horizon, ≈36 through the full limb from orbit. C¹ across the
+## tangent fold (μ_v=0) and the ATMO_TOP camera crossing (ρ_opt(ATMO_TOP)≈0 makes both branches meet). A pure
+## function of (camera position, sun_dir) — NOT camera orientation — so the light it drives is orientation-
+## invariant (G-B0-PATH). `sun_dir` is unit, TOWARD the sun. Airless body ⇒ 0 (no extinction).
+static func optical_path_air_mass(cam: Vector3, sun_dir: Vector3, r_solid: float, has_atmo: bool) -> float:
+	if not has_atmo:
+		return 0.0
+	var dist := cam.length()
+	var h := dist - r_solid
+	var up := (cam / dist) if dist > 1.0e-6 else Vector3.UP
+	var mu_v := sun_dir.dot(up)                       # dir·up: +1 sun at zenith, 0 at horizon, <0 below
+	var tca := -dist * mu_v                            # signed distance to closest approach (sun_dir·(centre−cam))
+	var b2 := maxf(dist * dist - tca * tca, 0.0)
+	var b := sqrt(b2)
+	var h_min := b - r_solid                           # closest-approach altitude of the (infinite) ray
+	var x := 0.0
+	if h >= H_ATMO:
+		# Camera in space: the forward ray re-enters the atmosphere only if it heads toward the planet
+		# (tca>0) and grazes the shell (h_min<ATMO_TOP). Else the LOS is clear ⇒ m=0 (blinding white sun).
+		if tca > 0.0 and h_min < H_ATMO:
+			x = 2.0 * x_horiz(maxf(h_min, 0.0), r_solid)   # full chord through the shell (X_space)
+		else:
+			x = 0.0
+	else:
+		# Camera inside the atmosphere.
+		if mu_v >= 0.0:
+			x = x_up(h, mu_v, r_solid)                 # ascending ray out to space
+		else:
+			# Descending ray that clears the planet (fold at the tangent): X_down = 2·X_horiz(h_min) − X_up.
+			x = 2.0 * x_horiz(maxf(h_min, 0.0), r_solid) - x_up(h, absf(mu_v), r_solid)
+	return maxf(x, 0.0) / opt_norm()
+
+## §3.2 T⃗(m) = exp(−τ⃗·m): the per-channel path transmittance colour (the sun/light hue). m=0 ⇒ WHITE.
+static func path_transmittance(m: float) -> Color:
+	return Color(exp(-TAU_R * m), exp(-TAU_G * m), exp(-TAU_B * m))
+
+## §3.2 L(m) = exp(−τ_lum·m): the broadband brightness factor (1 in space, dimming toward the horizon).
+static func path_luminance(m: float) -> float:
+	return exp(-TAU_LUM * m)
+
+# ---------------------------------------------------------------------------------------
 # COSMOS-LOD-SKY task 2 (docs/COSMOS-LOD-SKY-DESIGN.md §6, §7.3) — celestial lighting statics. ALL pure
 # (engine-free) so the gates (G-SKY-MOONSHINE / G-SKY-SCATTER / G-SHELL-TINT) drive them DIRECTLY and are
 # FLAG-INDEPENDENT; the flags only decide whether _ramp_environment / _make_material COMPOSE them in-game.
@@ -691,6 +765,10 @@ func _update_sky(t: float) -> void:
 	if CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE:
 		r_vox_sky = CosmosGravity.r_vox(OBSERVER)
 		occ_cam = occlusion_factor(sun_dir, cam_origin, r_vox_sky)
+	# B0 (FP_SUN_PATHLIGHT, §2.6): unify the disc/glare penumbra on pen(h) — the same altitude-widened twilight
+	# the absolute light uses — so the disc/glare and the DirectionalLight die together across the terminator.
+	if CubeSphere.FP_SUN_PATHLIGHT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
+		occ_cam = occlusion_factor_pen(sun_dir, cam_origin, r_vox_sky, pen(cam_origin.length() - r_vox_sky))
 
 	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter. A2 floors the angular
 	# size (the real 0.53° disc is an invisible ~8-px dot on gl_compat with no glare); off ⇒ the exact size.
@@ -720,18 +798,34 @@ func _update_sky(t: float) -> void:
 	# sunset sky, and drive the additive glare quad (billboarded at the Sun, brightness ×occ so it dies at
 	# sunset/eclipse/umbra). occ_cam is the same planet-occlusion the disc uses. Flag off ⇒ none of this runs.
 	if CubeSphere.FP_SUN_PRESENCE:
-		var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
-		var mu_cam := sun_dir.dot(up_s)
-		var st := scatter_tint(mu_cam)                       # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
+		# B0 (FP_SUN_PATHLIGHT): the disc/glare colour is the optical-PATH transmittance T⃗(m) along the
+		# camera→sun ray (WHITE in space, warm at noon, red at the horizon) and its brightness is L(m)·occ —
+		# NOT the camera-ELEVATION K–Y curve, which reddened the sun in vacuum. Off ⇒ the shipped K–Y path.
+		var st: Color
+		var lum := 1.0
+		if CubeSphere.FP_SUN_PATHLIGHT:
+			var r_ps := r_vox_sky if r_vox_sky > 0.0 else CosmosGravity.r_vox(OBSERVER)
+			var m_sun := optical_path_air_mass(cam_origin, sun_dir, r_ps, OrbitalState.has_atmo(OBSERVER))
+			st = path_transmittance(m_sun)
+			lum = path_luminance(m_sun)
+		else:
+			var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+			var mu_cam := sun_dir.dot(up_s)
+			st = scatter_tint(mu_cam)                        # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
 		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
 		if _sun_mat != null:
 			_sun_mat.emission = reddened
 			_sun_mat.albedo_color = reddened
+			if CubeSphere.FP_SUN_PATHLIGHT:
+				# Disc core stays white×T⃗; energy ∝ L(m)·occ so it is blinding in space, dim-red at sunset,
+				# gone in the umbra (the impostor is a crisp disc, not the K–Y-dimmed blob).
+				_sun_mat.emission_energy_multiplier = 8.0 * lum * maxf(occ_cam, 0.0)
 		if _glare != null:
 			_place_glare(sun_pos, sun_r * CubeSphere.SUN_GLARE_RADII, cam_origin)
-			_glare_mat.set_shader_parameter("intensity", occ_cam)
+			var glare_i := (lum * occ_cam) if CubeSphere.FP_SUN_PATHLIGHT else occ_cam
+			_glare_mat.set_shader_parameter("intensity", glare_i)
 			_glare_mat.set_shader_parameter("glare_color", Vector3(reddened.r, reddened.g, reddened.b))
-			_glare.visible = occ_cam > 0.001
+			_glare.visible = glare_i > 0.001
 
 	# A1 (FP_SKY_PLANET_OCCLUDE): hide the Sun/Moon impostors when the planet disc covers their direction (once A0
 	# renders the planet at d≫D_SKY the opaque discs would otherwise draw IN FRONT of it). occlusion_factor==0
@@ -813,10 +907,11 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var occ_on := CubeSphere.SN_SUN_OCCLUSION
 	var atmo_zero := CubeSphere.FP_ATMO_SPACE_ZERO           # A3: atmo_vis replaces the space_mix band
 	var light_abs := CubeSphere.FP_LIGHT_ABSOLUTE           # A4: absolute occ-always light + ambient
+	var path_light := CubeSphere.FP_SUN_PATHLIGHT           # B0: optical-path T⃗(m)·L(m) light colour/energy
 	var h := 0.0
 	var r_vox := 0.0
 	var has_atmo := true
-	if atmo_on or occ_on or atmo_zero or light_abs:
+	if atmo_on or occ_on or atmo_zero or light_abs or path_light:
 		r_vox = CosmosGravity.r_vox(OBSERVER)
 		h = cam_origin.length() - r_vox                      # radial altitude above the voxel surface
 		has_atmo = OrbitalState.has_atmo(OBSERVER)
@@ -842,7 +937,14 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	# T(μ) sunset-reddened colour — the dark side stays dark from EVERY camera (supersedes the SN4b authority
 	# lerp). Else SN4b's occlusion_light (authority-blended). Both OUTSIDE the `_env == null` guard — the light
 	# must dim without an Environment. Flag-off ⇒ light_energy/colour never touched (shipped 1.0 / white).
-	if light_abs:
+	if path_light:
+		# B0 (FP_SUN_PATHLIGHT): colour = T⃗(m) over the camera→sun optical path (WHITE in space, warm at noon,
+		# red at the horizon); energy = occ(pen(h)) · L(m). Supersedes A4's K–Y colour on the live light — the
+		# sunset reddening now comes from the physical path, matching the disc, the shell, and the near field.
+		var m_l := optical_path_air_mass(cam_origin, sun_dir, r_vox, has_atmo)
+		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox) * path_luminance(m_l)
+		_sun_light.light_color = path_transmittance(m_l)
+	elif light_abs:
 		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox)
 		_sun_light.light_color = scatter_tint(maxf(elev, 0.0))
 	elif occ_on:

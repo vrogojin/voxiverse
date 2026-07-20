@@ -431,6 +431,19 @@ func _pool_ramp_kick() -> void:
 ## can never collectively flood the 2 web workers + the main-thread mesh-apply. Shrinks (view_f > target) only UNLOAD,
 ## so every shrinking slot snaps immediately the same frame. Returns true while any slot still has growing to do.
 func _ramp_pool_step(delta: float) -> bool:
+	# FP_LANDING_STREAM_KICK: after a de-orbit LAND the active facet is the RESIDENT pool slot with no imminent
+	# successor (no crossing is pending), so the grow leg below runs at the raw _stream_pace — which the load
+	# controller pins at 0 whenever its backlog/apply gate is held closed (a far-ring/shell rebuild churning
+	# in-flight work). The active near field then never grows and issues zero load requests. Repair a collapsed
+	# view_target (a churned crossing may have left the active slot below the full near radius) so the pace floor
+	# below has a real goal to reach. NEVER-OOM: target is capped at near_render_radius (the existing active cap).
+	if CubeSphere.FP_LANDING_STREAM_KICK and _pool_active >= 0 and _pool.has(_pool_active) \
+			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+		var a: Dictionary = _pool[_pool_active]
+		var full := float(TerrainConfig.near_render_radius())
+		if float(a["view_target"]) < full - 0.5 and float(a["view_f"]) < full - 0.5:
+			a["ramp_from"] = float(a["view_f"])
+			a["view_target"] = full
 	var up_fid := -1
 	var up_spawn := 0
 	var up_active := false
@@ -473,6 +486,13 @@ func _ramp_pool_step(delta: float) -> bool:
 	# choke). Off ⇒ pace is untouched — the shipped ramp math verbatim, byte-identical.
 	if CubeSphere.FP_INFLIGHT_GATE:
 		pace *= clampf(1.0 - float(_inflight_main_q()) / float(CubeSphere.APPLY_CHOKE), 0.0, 1.0)
+	# FP_LANDING_STREAM_KICK: floor the RESIDENT active slot's grow pace (no imminent successor) at CTRL_RELIEF_FLOOR —
+	# AFTER the FP_INFLIGHT_GATE cut, so a load gate held at 0 (backlog/apply/shell thrash) can never freeze the near
+	# field. The committed-imminent slot keeps its own floor above; this closes the ONLY remaining unfloored grow path
+	# (the settled/landed active). Bounded: RAMP_SECONDS/0.25 ≈ 6 s to fill, view_target already capped (NEVER-OOM).
+	if CubeSphere.FP_LANDING_STREAM_KICK and up_fid == _pool_active \
+			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))

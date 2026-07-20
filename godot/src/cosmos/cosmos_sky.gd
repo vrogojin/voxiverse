@@ -167,10 +167,16 @@ shader_type spatial;
 render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, shadows_disabled;
 uniform vec3 glare_color : source_color = vec3(1.0, 0.95, 0.85);
 uniform float intensity = 1.0;
+// B1 (FP_SUN_APPARENT): tight=0 ⇒ the shipped single-lobe falloff (byte-identical); tight=1 ⇒ a bright
+// tight core (~1.5 disc radii @ ~0.9 over a 5-radii quad ⇒ r≈0.3) PLUS a soft wide skirt (to the 5-radii edge).
+uniform float tight = 0.0;
 void fragment() {
-	float r = length(UV - vec2(0.5)) * 2.0;   // 0 at centre → 1 at the quad edge
-	float a = smoothstep(1.0, 0.0, r);
-	a *= a;                                     // sharpen the falloff toward a bright core
+	float r = length(UV - vec2(0.5)) * 2.0;   // 0 at centre → 1 at the quad edge (5 disc radii)
+	float a_ship = smoothstep(1.0, 0.0, r);
+	a_ship *= a_ship;                           // sharpen the falloff toward a bright core
+	float core = smoothstep(0.30, 0.0, r) * 0.9;    // 0.9 at centre → 0 at ~1.5 disc radii
+	float skirt = smoothstep(1.0, 0.0, r) * 0.35;   // soft additive skirt out to the quad edge
+	float a = mix(a_ship, max(core, skirt), tight);
 	ALBEDO = glare_color * a * intensity;
 }
 """
@@ -566,6 +572,14 @@ func setup(clock: EPH.CosmosClock, env: Environment = null, cam_provider: Node =
 	_clock = clock
 	_env = env
 	_cam_provider = cam_provider
+	# B1 sub-flag (FP_SUN_GLOW, §3.4): enable the Compatibility-renderer glow with a HIGH hdr threshold so ONLY
+	# the sun disc/glare (the sole ≥0.9-luminance residents of the §3.5 budget) bloom — the LDR-honest "bloom"
+	# on gl_compat. Off ⇒ the Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an env.
+	if CubeSphere.FP_SUN_GLOW and CubeSphere.FP_SUN_APPARENT and _env != null:
+		_env.glow_enabled = true
+		_env.glow_hdr_threshold = 0.92
+		_env.glow_intensity = 0.8
+		_env.glow_bloom = 0.1
 	_build_nodes()
 	_update_sky(0.0 if _clock == null else _clock.now())
 
@@ -580,6 +594,12 @@ func _build_nodes() -> void:
 	var sun_mesh := SphereMesh.new()
 	sun_mesh.radial_segments = 32
 	sun_mesh.rings = 16
+	# B1 (FP_SUN_APPARENT): Godot's SphereMesh default radius is 0.5, so _place_impostor (which scales by the
+	# requested world radius) renders the disc at HALF its intended angular size. Set radius 1.0 so the disc hits
+	# its true 2.0° floor. Off ⇒ the shipped 0.5 default ⇒ byte-identical (half-size, the shipped look).
+	if CubeSphere.FP_SUN_APPARENT:
+		sun_mesh.radius = 1.0
+		sun_mesh.height = 2.0
 	_sun.mesh = sun_mesh
 	var sun_mat := StandardMaterial3D.new()
 	sun_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
@@ -610,6 +630,10 @@ func _build_nodes() -> void:
 		_glare_mat.shader = gsh
 		_glare_mat.set_shader_parameter("glare_color", Vector3(1.0, 0.95, 0.85))
 		_glare_mat.set_shader_parameter("intensity", 1.0)
+		# B1 (FP_SUN_APPARENT): retune the glare into a tight bright core + soft skirt (tight=1); off ⇒ tight=0 =
+		# the shipped single-lobe falloff (the uniform defaults to 0.0 ⇒ byte-identical).
+		if CubeSphere.FP_SUN_APPARENT:
+			_glare_mat.set_shader_parameter("tight", 1.0)
 		_glare.material_override = _glare_mat
 		_glare.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_glare.sorting_offset = -0.5                      # sort with the additive dome, never against the opaque disc
@@ -639,6 +663,10 @@ func _build_nodes() -> void:
 	var moon_mesh := SphereMesh.new()
 	moon_mesh.radial_segments = 32
 	moon_mesh.rings = 16
+	# B1 (FP_SUN_APPARENT): same SphereMesh-0.5 fix as the Sun — restore the Moon's true 1.5° angular floor.
+	if CubeSphere.FP_SUN_APPARENT:
+		moon_mesh.radius = 1.0
+		moon_mesh.height = 2.0
 	_moon.mesh = moon_mesh
 	_moon_mat = StandardMaterial3D.new()
 	_moon_mat.albedo_color = Color(0.72, 0.72, 0.70)

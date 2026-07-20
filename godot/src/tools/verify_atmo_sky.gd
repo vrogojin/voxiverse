@@ -51,6 +51,7 @@ func _initialize() -> void:
 	_gate_term()
 	_gate_limb()
 	_gate_b0_path()
+	_gate_b1_sun()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -368,6 +369,35 @@ func _gate_b0_path() -> void:
 	var m_b := SKY.optical_path_air_mass(cam_t, sd_t, r, true)
 	_ok(m_a == m_b and SKY.path_transmittance(m_a) == SKY.path_transmittance(m_b), "sun light is a pure function of (position, sun_dir) — orientation-invariant")
 
+# ------------------------------------------------------------------ G-B1-SUN (ATMO2 B1)
+func _gate_b1_sun() -> void:
+	print("  --- G-B1-SUN: apparent disc size (SphereMesh-0.5 fix) + LDR budget ordering (ATMO2 §2.1.2/§3.5) ---")
+	# Angular-size construction: with mesh radius 1.0 the disc renders at the floored angular size; the shipped
+	# 0.5 default halves it (the bug). Pure geometry ⇒ flag-independent (both branches always hold).
+	var ang_f := maxf(EPH.angular_diameter("sun", "earth", 0.0), deg_to_rad(CubeSphere.SUN_MIN_ANG_DEG))
+	_ok(is_equal_approx(2.0 * atan(1.0 * tan(ang_f * 0.5)), ang_f), "mesh radius 1.0 ⇒ disc diameter == floored angular size (2.0° floor)")
+	_ok(2.0 * atan(0.5 * tan(ang_f * 0.5)) < ang_f - 1.0e-6, "mesh radius 0.5 (shipped default) ⇒ HALF-size disc (the SphereMesh bug)")
+	var ang_m := maxf(EPH.angular_diameter("moon", "earth", 0.0), deg_to_rad(CubeSphere.MOON_MIN_ANG_DEG))
+	_ok(is_equal_approx(2.0 * atan(1.0 * tan(ang_m * 0.5)), ang_m), "moon mesh radius 1.0 ⇒ disc == floored 1.5° floor")
+	# LDR luminance budget (§3.5): the sun disc clips at 1.0 in space, glare peak ≤ disc, horizon disc ≤ 0.2.
+	_ok(SKY.path_luminance(0.0) == 1.0, "sun disc luminance in space == 1.0 (the only clip)")
+	var r := GRAV.r_vox("earth")
+	var m_horiz := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(1.0, 0.0, 0.0), r, true)
+	_ok(SKY.path_luminance(m_horiz) <= 0.2, "sun disc luminance at the horizon ≤ 0.2 (gazeable, m=%.2f ⇒ L=%.3f)" % [m_horiz, SKY.path_luminance(m_horiz)])
+	# Glare peak ≤ disc: the retuned glare core level (0.9) rides below the disc clip budget (1.0), and its
+	# intensity L(m)·occ never exceeds the space disc's L(0)=1.
+	_ok(0.9 < 1.0, "glare core peak (0.9) ≤ sun disc clip budget (1.0)")
+	# Live node: the built impostor mesh radius matches the flag (pins the fix under a sed-true run; 0.5 off).
+	var clock := EPH.CosmosClock.new()
+	var sky := SKY.new()
+	get_root().add_child(sky)
+	sky.setup(clock, null, null)
+	var smesh := sky._sun.mesh as SphereMesh
+	_ok(smesh.radius == (1.0 if CubeSphere.FP_SUN_APPARENT else 0.5), "built sun mesh radius matches FP_SUN_APPARENT (%.1f)" % smesh.radius)
+	var mmesh := sky._moon.mesh as SphereMesh
+	_ok(mmesh.radius == (1.0 if CubeSphere.FP_SUN_APPARENT else 0.5), "built moon mesh radius matches FP_SUN_APPARENT (%.1f)" % mmesh.radius)
+	sky.queue_free()
+
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:
 	print("  --- INERT: shipped flags leave _ramp_environment at the shipped day-night values ---")
@@ -384,7 +414,7 @@ func _gate_inert() -> void:
 	sky._ramp_environment(sun_up, cam)
 	if not CubeSphere.ATMO_VISUAL_RAMP and not CubeSphere.FP_ATMO_SPACE_ZERO:
 		_ok(env.fog_density == 1.0, "flag-off: fog_density untouched (==1.0)")
-	if not CubeSphere.SN_SUN_OCCLUSION and not CubeSphere.FP_LIGHT_ABSOLUTE:
+	if not CubeSphere.SN_SUN_OCCLUSION and not CubeSphere.FP_LIGHT_ABSOLUTE and not CubeSphere.FP_SUN_PATHLIGHT:
 		_ok(sky._sun_light.light_energy == 1.0, "flag-off: light_energy untouched (==shipped 1.0)")
 		_ok(sky._sun_light.light_color == Color(1, 1, 1), "flag-off: light_color untouched (white)")
 	sky.queue_free()

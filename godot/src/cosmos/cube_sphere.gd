@@ -850,6 +850,20 @@ const FP_ATMO_SHELL := false
 ## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
 const FP_SUN_PATHLIGHT := false
 
+## COSMOS ATMO2 B1 (docs/COSMOS-ATMO2-DESIGN.md §2.1.2/§3.3, stage B1). The apparent-disc fix: Godot's
+## SphereMesh default radius is 0.5 (not 1.0), so the shipped sun/moon impostors render at HALF their intended
+## angular size (sun 1.0° not 2.0°, moon 0.75° not 1.5°) — a blurry dot lost in the glare. Under this flag the
+## impostor meshes get radius 1.0 so the discs hit their true 2.0°/1.5° floors, and the glare quad is retuned
+## into a tight bright core (~1.5 disc radii @ ~0.9) + a soft skirt (5 radii). Off ⇒ the shipped 0.5-radius mesh
+## + shipped glare falloff ⇒ byte-identical. Requires FP_SUN_PRESENCE. Gate G-B1-SUN. LIVE-ONLY LOOK. Depends B0.
+const FP_SUN_APPARENT := false
+
+## COSMOS ATMO2 B1 sub-flag (docs §3.4). Compatibility-renderer glow with glow_hdr_threshold≈0.92 so ONLY the
+## sun disc/glare (the only ≥0.9-luminance residents of the §3.5 budget) bloom. P3 (gl_compat glow is a
+## simplified impl); if it misbehaves on device, off = the glare quad alone still delivers the bloom. Off ⇒ the
+## Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an Environment. LIVE-ONLY LOOK.
+const FP_SUN_GLOW := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

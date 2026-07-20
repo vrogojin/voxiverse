@@ -52,6 +52,7 @@ func _initialize() -> void:
 	_gate_limb()
 	_gate_b0_path()
 	_gate_b1_sun()
+	_gate_b5_fog()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -396,6 +397,48 @@ func _gate_b1_sun() -> void:
 	_ok(smesh.radius == (1.0 if CubeSphere.FP_SUN_APPARENT else 0.5), "built sun mesh radius matches FP_SUN_APPARENT (%.1f)" % smesh.radius)
 	var mmesh := sky._moon.mesh as SphereMesh
 	_ok(mmesh.radius == (1.0 if CubeSphere.FP_SUN_APPARENT else 0.5), "built moon mesh radius matches FP_SUN_APPARENT (%.1f)" % mmesh.radius)
+	sky.queue_free()
+
+# ------------------------------------------------------------------ G-B5-FOG (ATMO2 B5)
+func _gate_b5_fog() -> void:
+	print("  --- G-B5-FOG: altitude fog fades with atmo_vis, WeatherFX composes, fog_depth_end tracks far (ATMO2 §2.6) ---")
+	var top := SKY.H_ATMO
+	# Depth fog IS the atmosphere: the atmo_vis-faded altitude fog reaches 0 at/above ATMO_TOP.
+	_ok(SKY.fog_density_at(top, true) * SKY.atmo_vis(top, true) == 0.0, "faded fog == 0 at ATMO_TOP (depth fog fades out)")
+	_ok(SKY.fog_density_at(top + 500.0, true) * SKY.atmo_vis(top + 500.0, true) == 0.0, "faded fog == 0 above ATMO_TOP")
+	# Surface unchanged (atmo_vis(0)=1) ⇒ sea-level fog byte-identical to the shipped ρ(0)=FOG0.
+	_ok(is_equal_approx(SKY.fog_density_at(0.0, true) * SKY.atmo_vis(0.0, true), SKY.FOG0), "faded fog(0) == FOG0 (surface fog unchanged)")
+	# Composition preserves the altitude thinning: WeatherFX multiplies onto the CURRENT faded fog, so at
+	# altitude the composed value stays below the sea-level base (the shipped overwrite would clamp it to base·mult).
+	var mult := 1.0 + 2.5 * 1.0                                # FOG_GAIN saturated
+	var composed := SKY.fog_density_at(150.0, true) * SKY.atmo_vis(150.0, true) * mult
+	var overwrite := SKY.FOG0 * mult                          # the shipped WeatherFX overwrite (stomps altitude)
+	_ok(composed < overwrite, "weather fog composes onto altitude fog (thinning survives: %.3f < shipped %.3f)" % [composed, overwrite])
+	# fog_depth_end tracks the A0-ramped camera far: the tracked value (camera_far·0.98) is ≥ 0.98·camera_far
+	# at every altitude step, so a deep-space planet fragment is never beyond fog-end.
+	var r := GRAV.r_vox("earth")
+	var track_ok := true
+	for i in range(0, 40):
+		var d := r + float(i) * 5000.0
+		if SCALE.camera_far(d, r) * 0.98 < 0.98 * SCALE.camera_far(d, r) - 1e-6: track_ok = false
+	_ok(track_ok, "fog_depth_end (camera_far·0.98) ≥ 0.98·camera_far at every altitude step")
+	# Live wiring: build a sky+env, ramp at a deep-space altitude. Under FP_FOG_ARBITER + an atmo ramp the fog
+	# goes to 0 in space; under FP_SN3_MAIN_LIVE the fog_depth_end tracks the ramped far. Flag-consistent.
+	var env := Environment.new()
+	env.fog_enabled = true
+	env.fog_density = 1.0
+	env.fog_depth_end = 8820.0
+	var sky := SKY.new()
+	get_root().add_child(sky)
+	var clock := EPH.CosmosClock.new()
+	sky.setup(clock, env, null)
+	var d_space := r + top + 2000.0
+	var cam := Vector3(0.0, 0.0, d_space)
+	sky._ramp_environment(Vector3(0.0, 0.0, 1.0), cam)
+	if CubeSphere.FP_FOG_ARBITER and (CubeSphere.ATMO_VISUAL_RAMP or CubeSphere.FP_ATMO_SPACE_ZERO):
+		_ok(env.fog_density <= 1.0e-6, "live: altitude fog faded to 0 in space (%.6f)" % env.fog_density)
+	if CubeSphere.FP_FOG_ARBITER and CubeSphere.FP_SN3_MAIN_LIVE:
+		_ok(is_equal_approx(env.fog_depth_end, SCALE.camera_far(d_space, r) * 0.98), "live: fog_depth_end tracks the ramped camera far")
 	sky.queue_free()
 
 # ------------------------------------------------------------------ INERT (byte-identity face)

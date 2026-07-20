@@ -864,6 +864,14 @@ const FP_SUN_APPARENT := false
 ## Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an Environment. LIVE-ONLY LOOK.
 const FP_SUN_GLOW := false
 
+## COSMOS ATMO2 B5 (docs/COSMOS-ATMO2-DESIGN.md §2.6, stage B5). The fog arbiter: (a) WeatherFX MULTIPLIES its
+## humidity factor onto CosmosSky's altitude fog density (reads the current fog_density instead of overwriting
+## from a captured base — so FP_PRECIP no longer stomps the altitude thinning); (b) CosmosSky's altitude fog
+## fades with atmo_vis(h) so it reaches 0 at ATMO_TOP (depth fog IS the atmosphere); (c) fog_depth_end tracks
+## the A0-ramped camera far so a deep-space planet fragment is never painted the fog colour. Off ⇒ the shipped
+## overwrite + static fog_depth_end ⇒ byte-identical. Gate G-B5-FOG. Protects A0 (FP_SN3_MAIN_LIVE) in deep space.
+const FP_FOG_ARBITER := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

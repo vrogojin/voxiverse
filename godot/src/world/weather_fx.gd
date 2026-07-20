@@ -170,7 +170,15 @@ func _drive_fog(cam: Vector3) -> void:
 	var hum := _env.humidity(cam) if _env != null else 0.0
 	var sat := clampf(hum / WeatherSystem.Q_MAX, 0.0, 1.0)
 	var mult := 1.0 + FOG_GAIN * smoothstep(0.55, 0.95, sat)
-	_environment.fog_density = _base_fog * mult
+	# B5 (FP_FOG_ARBITER, §2.6): COMPOSE onto CosmosSky's altitude fog — read the CURRENT fog_density (which
+	# CosmosSky._ramp_environment set to the altitude ρ(h)·atmo_vis(h) earlier this frame) and multiply, instead
+	# of overwriting from the captured sea-level base (which stomped the altitude thinning dead). No compounding:
+	# CosmosSky rewrites fog_density every frame before WeatherFX (which _processes later in the tree). Off ⇒ the
+	# shipped overwrite from _base_fog ⇒ byte-identical.
+	if CubeSphere.FP_FOG_ARBITER:
+		_environment.fog_density = _environment.fog_density * mult
+	else:
+		_environment.fog_density = _base_fog * mult
 
 func _cam_origin() -> Vector3:
 	if _cam_provider != null and _cam_provider.has_method("camera_global_transform"):

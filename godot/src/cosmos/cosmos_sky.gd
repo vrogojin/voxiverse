@@ -936,10 +936,11 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var atmo_zero := CubeSphere.FP_ATMO_SPACE_ZERO           # A3: atmo_vis replaces the space_mix band
 	var light_abs := CubeSphere.FP_LIGHT_ABSOLUTE           # A4: absolute occ-always light + ambient
 	var path_light := CubeSphere.FP_SUN_PATHLIGHT           # B0: optical-path T⃗(m)·L(m) light colour/energy
+	var fog_arb := CubeSphere.FP_FOG_ARBITER                # B5: fog fades with atmo_vis + fog_depth_end tracks far
 	var h := 0.0
 	var r_vox := 0.0
 	var has_atmo := true
-	if atmo_on or occ_on or atmo_zero or light_abs or path_light:
+	if atmo_on or occ_on or atmo_zero or light_abs or path_light or fog_arb:
 		r_vox = CosmosGravity.r_vox(OBSERVER)
 		h = cam_origin.length() - r_vox                      # radial altitude above the voxel surface
 		has_atmo = OrbitalState.has_atmo(OBSERVER)
@@ -987,7 +988,17 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 		# A3: black is reached exactly at ATMO_TOP (sm=1), so the space sky is star-black with NO day/night leak.
 		sky = sky.lerp(Color.BLACK, sm)
 		ambient *= ambient_scale(sm)
-		_env.fog_density = fog_density_at(h, has_atmo)
+		# B5 (FP_FOG_ARBITER): depth fog IS the atmosphere — fade it with atmo_vis(h) so it reaches 0 at ATMO_TOP
+		# (else the shipped ρ(h) leaves ~5% haze at the ceiling that paints the deep-space planet). Off ⇒ shipped ρ(h).
+		var fd := fog_density_at(h, has_atmo)
+		if fog_arb:
+			fd *= atmo_vis(h, has_atmo)
+		_env.fog_density = fd
+	# B5 (FP_FOG_ARBITER): track the A0-ramped camera far so a deep-space planet fragment is never beyond
+	# fog-end (which the night ramp drives toward black). main.gd pins it at CAMERA_FAR·0.98; here it grows with
+	# altitude exactly as CosmosScale.camera_far does. Off ⇒ never written (the static main.gd value stands).
+	if fog_arb and CubeSphere.FP_SN3_MAIN_LIVE:
+		_env.fog_depth_end = CosmosScale.camera_far(cam_origin.length(), r_vox) * 0.98
 	# Ambient umbra factor: A4's absolute dimmer (continuous, no authority — the surface night side is dark
 	# too, restoring the pre-ORBITAL ambient-only night), else SN4b's altitude-authority occlusion_ambient.
 	if light_abs:

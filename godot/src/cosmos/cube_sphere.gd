@@ -552,6 +552,23 @@ const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hyste
 const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
 const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
 
+## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
+## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
+## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and
+## ZERO VoxelTerrain load requests for minutes. Root cause: the ACTIVE facet is the RESIDENT pool slot with NO
+## imminent successor (no crossing is pending once landed), so module_world._ramp_pool_step advances its view-distance
+## grow leg at the RAW _stream_pace — which the StreamLoadController pins at 0 whenever backlog_gated() holds (a
+## far-ring/shell rebuild churning in-flight work keeps it closed). Only the committed-IMMINENT slot carries a pace
+## FLOOR (CTRL_IMMINENT_COMMIT_PACE / CTRL_RELIEF_FLOOR); the resident active slot has none, so its view ramp — and
+## thus the near stream — freezes indefinitely at whatever radius the last crossing left it. When true, the resident
+## active slot (no imminent, or the imminent IS the active) (a) has its view_target snapped back up to the full near
+## radius if a churned crossing left it collapsed, and (b) has its grow pace floored at CTRL_RELIEF_FLOOR — AFTER the
+## FP_INFLIGHT_GATE feed-forward cut — so the near field always drives to completion within ~RAMP_SECONDS/0.25 ≈ 6 s
+## even while the load gate is held at 0. NEVER-OOM: view_target is capped at near_render_radius (the existing active
+## cap — no unbounding); only the fill RATE / a collapsed-target repair changes. Default OFF ⇒ _ramp_pool_step is the
+## exact shipped math (byte-identical; FLAT stays 6042/0). Flip ON at export after the live de-orbit-land A/B.
+const FP_LANDING_STREAM_KICK := false
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a

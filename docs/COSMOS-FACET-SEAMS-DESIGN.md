@@ -1,6 +1,11 @@
 # COSMOS-FACET-SEAMS-DESIGN — seam-continuous height, a closed shell, one surface law for every tier
 
 **Status:** root-cause + design (no engine code changed in this pass). Branch `deploy/perf-plus-sky`, 2026-07-19.
+**REVISED 2026-07-20 after the first live pilot — see `docs/COSMOS-FACET-SEAMS-V2.md`:** the root
+cause, FS0, FS1 (confirmed working live), the One-Height/One-Surface Laws, FS3, FS4 all stand;
+**FS2's integer content re-index is RETIRED** (pilot-falsified: the S-contours terrace the facet
+interior and break the smoothing ramps) and replaced by FS2′ `FP_DATUM_BAKE` — the same datum
+applied as a *continuous* displacement at the render/collision/input boundary, content untouched.
 **Author:** Fable (`design-facet-seams`). Read together with `COSMOS-SEAMLESS-SCALES-DESIGN.md`
 (the tier continuum this doc anchors geometrically), `COSMOS-FARRING-COVERAGE-DESIGN.md` (the
 backstop/sink machinery this doc lets shrink), `COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md` (the

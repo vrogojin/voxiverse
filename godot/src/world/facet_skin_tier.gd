@@ -537,7 +537,10 @@ static func _accum_normal(nrm: PackedVector3Array, pos: PackedVector3Array, a: i
 ## lattice_to_world64 is the exact placement map the near voxels and far ring use, so the skin lands on
 ## the same surface they do.
 static func _lattice_world(fid: int, x: float, y: float, z: float) -> Vector3:
-	var w := FacetAtlas.lattice_to_world64(fid, x, y, z)
+	# COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2): the skin lands on the datum-shifted (play-space) surface by
+	# lifting the lattice y by the CONTINUOUS s(fid,x,z) before the placement map — so it agrees with the near
+	# voxels (baked +s) and the radial far shell (One-Surface Law). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
+	var w := FacetAtlas.lattice_to_world64(fid, x, y + FacetAtlas.datum_lift(fid, x, z), z)
 	return Vector3(w[0], w[1], w[2])
 
 ## Pack a lattice column (x,z) into the int64 sample_columns expects: x low 32 bits, z high 32.

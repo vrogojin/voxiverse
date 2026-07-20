@@ -120,6 +120,7 @@ var _build_heights := PackedInt32Array()
 var _build_min_h := 0
 var _build_ylo := 0
 var _build_used := 0                          # box POOL slots consumed so far this pass
+var _emit_lift := 0.0                          # COSMOS FS2′: this column's continuous datum lift applied at box/prism emit
 var _build_cused := 0                         # prism POOL slots consumed so far this pass
 var _build_pc: Dictionary = {}                # per-build column-profile memo (height + biome)
 # Shape REUSE (no clear-all-then-add-all spike): each pass re-points the staging body's EXISTING
@@ -429,6 +430,12 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		col_ds = FacetAtlas.datum_shift(TerrainConfig.active_facet(), x, z)
 		h += col_ds
 	var sea_s := TerrainConfig.SEA_LEVEL + col_ds
+	# COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4): the collider matches the datum-LIFTED (play-space) render.
+	# Content is byte-identical (read in cell space below, unchanged), so the whole emitted column is translated up
+	# by the CONTINUOUS s at box/prism emit (_add_box / _add_prisms apply _emit_lift). 0.0 off ⇒ byte-identical.
+	_emit_lift = 0.0
+	if CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED and TerrainConfig.active_facet() >= 0:
+		_emit_lift = FacetAtlas.datum_lift(TerrainConfig.active_facet(), float(x) + 0.5, float(z) + 0.5)
 	var y := _build_ylo
 	# A shaft dug deeper than DEPTH below the region floor: descend to the true solid floor so
 	# it still gets a floor box. Only edited columns can have removed cells, so only they pay it.
@@ -571,7 +578,8 @@ func _add_box(bidx: int, x: int, z: int, y_bottom: int, y_top: int) -> void:
 		pool.append(box)
 	box.size = Vector3(1.0, float(y_top - y_bottom), 1.0)
 	_build_used += 1
-	var t := Transform3D(Basis(), Vector3(x + 0.5, (float(y_bottom) + float(y_top)) * 0.5, z + 0.5))
+	# COSMOS FS2′: lift the box centre by this column's continuous datum s (_emit_lift; 0.0 off ⇒ byte-identical).
+	var t := Transform3D(Basis(), Vector3(x + 0.5, (float(y_bottom) + float(y_top)) * 0.5 + _emit_lift, z + 0.5))
 	_attach(bidx, box.get_rid(), t)
 
 ## Attach a shape at the next body slot, REUSING an existing slot in place when the staging body
@@ -615,7 +623,9 @@ func _add_prisms(bidx: int, x: int, y: int, z: int, modifier: int) -> void:
 			pool.append(shape)
 		shape.points = pts
 		_build_cused += 1
-		_attach(bidx, shape.get_rid(), Transform3D.IDENTITY)
+		# COSMOS FS2′: the prism points are absolute; lift the whole shape by this column's continuous datum s
+		# (_emit_lift; 0.0 off ⇒ IDENTITY, byte-identical).
+		_attach(bidx, shape.get_rid(), Transform3D(Basis(), Vector3(0.0, _emit_lift, 0.0)))
 
 # --- accessors (used by the headless verify to inspect the collider) -----------
 

@@ -461,6 +461,48 @@ static func datum_shift(fid: int, x: int, z: int) -> int:
 		disc = 0.0
 	return int(round(-b + sqrt(disc)))
 
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2) — the CONTINUOUS datum lift s(fid, X, Z): the SAME solve as
+## datum_shift but left UNROUNDED (C∞, gradient ≤ 0.034 blocks/block, range [0, ~6.9]). This is the FS2′ boundary
+## displacement — play y = cell y + s — applied at render/physics/input while the voxel CONTENT stays byte-identical
+## (no re-index, no generator change). X/Z are CONTINUOUS lattice coordinates (cell centre x+0.5,z+0.5 for a per-column
+## physics query; the vertex's fractional x,z for the near-mesh bake) so the lifted surface is crack-free between
+## columns. The C++ VoxelMesherBlocky.set_facet_datum_bake mirrors this EXACTLY (same frozen frame + R). Returns 0.0
+## unless FP_DATUM_BAKE — so every call site (+s / −s) is byte-identical with the flag off BY CONSTRUCTION.
+static func datum_lift(fid: int, x: float, z: float) -> float:
+	if not CubeSphere.FP_DATUM_BAKE:
+		return 0.0
+	var f := fid * 12
+	var fx := x - float(_off[fid * 2])
+	var fz := z - float(_off[fid * 2 + 1])
+	# p0 = lattice_to_world64(fid, X, 0, Z) — the column point on the facet plane (f64)
+	var p0x := _frame[f + 0] + fx * _frame[f + 3] + fz * _frame[f + 9]
+	var p0y := _frame[f + 1] + fx * _frame[f + 4] + fz * _frame[f + 10]
+	var p0z := _frame[f + 2] + fx * _frame[f + 5] + fz * _frame[f + 11]
+	var b := p0x * _frame[f + 6] + p0y * _frame[f + 7] + p0z * _frame[f + 8]   # p0·n̂ (the plane offset)
+	var r := r_of(fid)
+	var disc := b * b + r * r - (p0x * p0x + p0y * p0y + p0z * p0z)
+	if disc < 0.0:
+		disc = 0.0
+	return -b + sqrt(disc)
+
+## COSMOS FS2′ (§2.2.1) — the FROZEN per-fid bake blob for VoxelMesherBlocky.set_facet_datum_bake (the near-mesh C++
+## per-vertex `y += s` hook, patch 0010). Pure numbers from the frozen atlas frame + R — the mesher worker reads an
+## immutable copy. `enabled` rides FP_DATUM_BAKE, so an unpatched binary (has_method-guarded caller) or the flag off
+## both leave the near mesh byte-identical. o/du/dv/nhat + off + R are exactly the terms datum_lift solves from.
+static func datum_bake_params(fid: int) -> Dictionary:
+	if not CubeSphere.FP_DATUM_BAKE or fid < 0:
+		return {"enabled": false}
+	var f := fid * 12
+	return {
+		"enabled": true,
+		"R": r_of(fid),
+		"o": PackedFloat64Array([_frame[f + 0], _frame[f + 1], _frame[f + 2]]),
+		"du": PackedFloat64Array([_frame[f + 3], _frame[f + 4], _frame[f + 5]]),
+		"dv": PackedFloat64Array([_frame[f + 9], _frame[f + 10], _frame[f + 11]]),
+		"nhat": PackedFloat64Array([_frame[f + 6], _frame[f + 7], _frame[f + 8]]),
+		"off": PackedInt32Array([_off[fid * 2], _off[fid * 2 + 1]]),
+	}
+
 ## The world position of facet `fid`'s planarized corner `ci` (0..3, CCW) — c0' + q_ci·(ê_u, ê_w). f64 [x,y,z].
 ## The SAME planar frames the near voxel world uses, so the far ring meets the near facet cleanly at ridges.
 static func facet_planar_corner(fid: int, ci: int) -> Array:

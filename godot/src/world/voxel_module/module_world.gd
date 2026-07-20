@@ -370,6 +370,7 @@ func setup() -> bool:
 	# COSMOS FP-CARVE (patch 0004): push the active facet's ridge planes into the mesher's carve blob BEFORE
 	# the terrain starts streaming, so the first meshed block already clips its seam junction sentinels.
 	_push_facet_carve()
+	_push_facet_datum_bake()                          # COSMOS FS2′ (patch 0010): the near-mesh per-vertex +s bake
 	# FP-M1c (§4.1): under the pool flag the active terrain lives in a FacetSlot under PlanetRoot (composite
 	# identity — byte-identical world placement to the direct-child path, just reparented), bounds-clamped to
 	# its own facet slab. Flag OFF ⇒ the shipped single-terrain scene graph (add_child at ZERO), untouched.
@@ -1545,6 +1546,7 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 ## push happens BEFORE restream() (B7) so no in-flight block can mesh a junction cell with stale planes.
 func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	_push_facet_carve()                               # push the NEW facet's ridge planes (B7: before restream)
+	_push_facet_datum_bake()                          # COSMOS FS2′ (patch 0010): re-affirm the near-mesh +s bake
 	restream(old_wrapper_pos)
 
 ## COSMOS FP-CARVE (patch 0004) — push the active facet's own-side ridge planes into the compiled mesher's
@@ -1564,6 +1566,16 @@ func _push_facet_carve() -> void:
 		"arid_base": _carve_base,
 		"arid_count": _carve_count,
 	})
+
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.1) — push the active facet's frozen datum-bake blob into the
+## compiled mesher's per-vertex `y += s` hook (VoxelMesherBlocky.set_facet_datum_bake, C++ patch 0010). has_method-
+## guarded: an unpatched binary ignores it and the near mesh is plain (no lift). datum_bake_params returns
+## {enabled:false} when FP_DATUM_BAKE is off / no active facet ⇒ byte-identical. Called at setup + each crossing,
+## exactly like _push_facet_carve (the active mesher is a pool slot already primed at spawn — this re-affirms it).
+func _push_facet_datum_bake() -> void:
+	if _mesher == null or not _mesher.has_method("set_facet_datum_bake"):
+		return
+	_mesher.call("set_facet_datum_bake", FacetAtlas.datum_bake_params(TerrainConfig.active_facet()))
 
 # ============================ FP-M1c Planet Assembly pool (flag: CubeSphere.FP_M1_POOL) ============================
 # The pooled rotated-neighbour terrains + re-designation crossing (docs/COSMOS-FP-M1-DESIGN.md §4, §5). Reuses THIS
@@ -1596,6 +1608,10 @@ func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
 			})
 		else:
 			mesher.call("set_facet_carve", {"enabled": false})
+	# COSMOS FS2′ (patch 0010): this slot's OWN datum-bake blob frozen on its fid (per-mesher, facet-static — each
+	# pool slot renders a different facet, so its near mesh lifts by ITS s). Guarded; {enabled:false} off ⇒ plain.
+	if mesher.has_method("set_facet_datum_bake"):
+		mesher.call("set_facet_datum_bake", FacetAtlas.datum_bake_params(fid))
 	var generator: Object = _make_generator(fid)   # OWN generator frozen on this fid's gen_facet (worker-safe)
 	if generator == null:
 		return {}
@@ -1993,6 +2009,7 @@ func pool_reset(to: int) -> bool:
 	_mesher = s["mesher"]
 	_generator = s["generator"]
 	_push_facet_carve()                              # re-point the (module-level) active mesher carve at `to`
+	_push_facet_datum_bake()                         # COSMOS FS2′ (patch 0010): re-point the near-mesh +s bake at `to`
 	_lod_setup()                                     # FP-M2b: rebuild the LOD layer under the fresh PlanetRoot
 	return true
 

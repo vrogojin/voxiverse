@@ -85,6 +85,9 @@ const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the nei
 # cooldown (a crossing cannot re-fire for the next N maybe_cross_facet calls — belt-and-suspenders vs ridge jitter).
 const FACET_CROSS_COOLDOWN := 6       # maybe_cross_facet calls (≈physics ticks) suppressed after a committed crossing
 var _cross_cooldown := 0              # remaining suppressed calls (decremented per call; 0 = ready)
+const FACET_CORNER_SLACK := 2.0       # COSMOS FS-W (§3): a corner-commit landing may be up to this far past one of the
+                                      # destination's ridges (a genuine 3-facet corner) and still commit — kept < |WALL_EPS|
+                                      # (3) so the player is always placed clear of the −3 ridge wall (never stranded).
 
 # FP-M1c Planet Assembly pool policy (docs/COSMOS-FP-M1-DESIGN.md §4.3). Amortization throttle (≤1 spawn AND ≤1
 # retire per POOL_SPAWN_INTERVAL_S) + the pool-miss counter (a re-designation crossing whose destination was not
@@ -1802,6 +1805,52 @@ func _apply_anchor_shift(a: Vector3) -> void:
 ## found again by its unchanged key from the new home face. Worldgen determinism holds because a
 ## global cell resolves through _curved_profile identically regardless of which window/home face
 ## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
+## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3): is the player genuinely PAST a ridge (own_dist < −1, well beyond
+## the −0.1 commit line)? Used to void the crossing cooldown so a corner zig-zag can never strand them in masked space.
+func _past_ridge_deep(fid: int, pos: Vector3) -> bool:
+	for slot in 4:
+		if FacetAtlas.own_dist(fid, slot, pos.x, pos.y, pos.z) < -1.0:
+			return true
+	return false
+
+## COSMOS FS-W (§3): resolve a grid-corner crossing BY DIRECTION when the single-edge landing fails containment.
+## Candidates = the crossed edge-neighbours ∪ the diagonal facet the player's world direction lands in
+## (FacetAtlas.facet_of_dir_body — the classifier oracle). Commit to the candidate whose reframed landing is DEEPEST
+## inside (argmax over candidates of the min-slot own_dist at the reframe), provided that best is not itself past a
+## ridge by more than FACET_CORNER_SLACK (keeps the player clear of the −3 wall). Returns {"to","np"} or {} to defer.
+func _corner_commit(fid: int, pos: Vector3) -> Dictionary:
+	var crossed := []
+	for slot in 4:
+		if FacetAtlas.own_dist(fid, slot, pos.x, pos.y, pos.z) < -FACET_CROSS_HYST:
+			crossed.append(slot)
+	if crossed.is_empty():
+		return {}
+	var cands := {}                                    # dedup by fid
+	for slot in crossed:
+		cands[FacetAtlas.seam_neighbour(fid, slot)] = true
+	# The diagonal (3-facet corner) the player is heading into — the direction oracle resolves it without the
+	# fragile seam_neighbour-composition, and doubles as the §3 cross-check.
+	var w := FacetAtlas.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	var fdir := FacetAtlas.facet_of_dir_body(FacetAtlas.body_of_fid(fid),
+		CubeSphere.DVec3.new(w[0], w[1], w[2]).normalized())
+	if fdir >= 0 and fdir != fid:
+		cands[fdir] = true
+	var best_to := -1
+	var best_np := []
+	var best_score := -INF
+	for c in cands:
+		var cnp := FacetAtlas.reframe_position64(fid, c, pos.x, pos.y, pos.z)
+		var mind := INF
+		for bslot in 4:
+			mind = minf(mind, FacetAtlas.own_dist(c, bslot, cnp[0], cnp[1], cnp[2]))
+		if mind > best_score:
+			best_score = mind
+			best_to = c
+			best_np = cnp
+	if best_to < 0 or best_score < -(FACET_CROSS_HYST + FACET_CORNER_SLACK):
+		return {}                                      # nothing lands clear of the wall → defer one tick
+	return {"to": best_to, "np": best_np}
+
 ## COSMOS FACETED §6.1 — the crossing handoff. When the player walks past an active-facet ridge (signed own_dist
 ## < −HYST, one-sided so jitter can't double-fire), re-frame them onto the neighbour facet: switch the active
 ## facet and return the f64-EXACT reframed position + the dihedral yaw twist for Player.apply_reframe. FP3a: the
@@ -1818,7 +1867,11 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 	# the whole facet (many ticks ≫ cooldown), so this never blocks a legitimate crossing.
 	if _cross_cooldown > 0:
 		_cross_cooldown -= 1
-		return {}
+		# COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3): the cooldown suppresses −0.1 ridge jitter — it must NOT
+		# strand the player deep in masked space. If they are genuinely PAST a ridge (own_dist < −1) fall through
+		# and commit this tick (the corner zig-zag case). Flag off ⇒ the shipped unconditional return (byte-identical).
+		if not (CubeSphere.FP_CROSS_CORNER_COMMIT and _past_ridge_deep(fid, player_pos)):
+			return {}
 	for slot in 4:
 		var s := FacetAtlas.own_dist(fid, slot, player_pos.x, player_pos.y, player_pos.z)
 		if s < -FACET_CROSS_HYST:
@@ -1838,7 +1891,17 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 					contained = false
 					break
 			if not contained:
-				continue
+				# COSMOS FS-W (§3): a grid-corner landing failed containment. Instead of deferring into the −3 wall,
+				# resolve the destination BY DIRECTION: the facet (crossed edge-neighbours ∪ their diagonal via
+				# facet_of_dir) whose reframed landing is DEEPEST inside (argmax of min-slot own_dist). Off ⇒ the
+				# shipped `continue` (byte-identical).
+				if not CubeSphere.FP_CROSS_CORNER_COMMIT:
+					continue
+				var cc := _corner_commit(fid, player_pos)
+				if cc.is_empty():
+					continue                       # tie / all too shallow → defer one tick (as shipped)
+				to = int(cc["to"])
+				np = cc["np"]
 			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
 			var yaw_delta := atan2(ex.z, ex.x)
 			# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
@@ -2848,15 +2911,31 @@ func surface_y(x: float, z: float) -> float:
 ## Horizontal movement into terrain is now stopped by blocked() (the player queries
 ## it per-axis), so the feet are always at or just above an air-topped surface and a
 ## valid floor is always found; the scan honours dug shafts/tunnels below as well.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4) — this column's CONTINUOUS datum lift s: the play↔cell boundary
+## map (play y = cell y + s). The physics funnels below (floor_under/blocked/ceiling/DDA) evaluate voxel CONTENT in
+## cell space and report in PLAY space by adding s per column (the content is byte-identical — FS2′ shifts the
+## boundary, not the world). 0.0 unless FP_DATUM_BAKE and an active facet ⇒ every funnel is byte-identical off.
+func _datum_lift(xi: int, zi: int) -> float:
+	if not (CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED):
+		return 0.0
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return 0.0
+	return FacetAtlas.datum_lift(fid, float(xi) + 0.5, float(zi) + 0.5)
+
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)   # in-cell footprint (ignored by full cubes; used by P5 shapes)
 	var fz := z - float(zi)
+	# COSMOS FS2′: convert the PLAY feet to CELL space for the (content) scan, report the found top back in PLAY
+	# space (+ s). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
+	var cell_feet := feet_y - s
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
 	# off. Scan length is bounded by the fall distance — cheap.
-	var start := int(floor(feet_y + 0.5))
+	var start := int(floor(cell_feet + 0.5))
 	var y := start
 	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
 	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
@@ -2866,9 +2945,9 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	while y > -1024:
 		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
-			return float(y) + here.y
+			return float(y) + here.y + s
 		y -= 1
-	return float(effective_height(xi, zi) + 1)
+	return float(effective_height(xi, zi) + 1) + s
 
 ## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
 ## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical
@@ -2888,6 +2967,12 @@ const _EPS := 1e-6
 ## → wall), a body span overlapping the ground finds its surface far above the buried
 ## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	# COSMOS FS2′: this column's play↔cell lift (0.0 unless FP_DATUM_BAKE). The ridge-wall own_dist test is a
+	# near-vertical plane distance, so it is evaluated in CELL space (feet_y − s); the headroom cell scan below
+	# takes a CELL-space top (top − s). floor_under already reports PLAY space. s ≡ 0.0 off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
 	# COSMOS FACETED §5.3: the ridge wall. Until the FP3 handoff lets the player cross onto the neighbour, an
 	# invisible wall sits just inside each active-facet ridge plane, so the player can stand on the own-side of
 	# every junction cell but not walk past P into the masked void. One own_dist test per ≤4 seams.
@@ -2895,10 +2980,8 @@ func blocked(x: float, z: float, feet_y: float) -> bool:
 		var fid := TerrainConfig.active_facet()
 		if fid >= 0:
 			for slot in 4:
-				if FacetAtlas.own_dist(fid, slot, x, feet_y, z) < FACET_WALL_EPS:
+				if FacetAtlas.own_dist(fid, slot, x, feet_y - s, z) < FACET_WALL_EPS:
 					return true
-	var xi := int(floor(x))
-	var zi := int(floor(z))
 	var fx := x - float(xi)
 	var fz := z - float(zi)
 	# Standable height at the target column, allowing an auto-step up to STEP_MAX.
@@ -2906,8 +2989,8 @@ func blocked(x: float, z: float, feet_y: float) -> bool:
 	if top - feet_y > STEP_MAX:
 		return true                                    # rise too big → wall (a full cube's 1.0 always is)
 	# Headroom above the (possibly auto-stepped) floor: the body must not clip a solid
-	# cell in (top, top + body height) at this footprint.
-	return not _headroom_clear(xi, zi, fx, fz, top)
+	# cell in (top, top + body height) at this footprint. _headroom_clear scans CELLS ⇒ cell-space top (top − s).
+	return not _headroom_clear(xi, zi, fx, fz, top - s)
 
 ## True if the player's body column (top .. top + body height) at footprint (fx, fz)
 ## in column (xi, zi) is clear of solid occupancy (SVS §5.2). The cell whose top the
@@ -2943,14 +3026,19 @@ func ceiling_scan(x: float, z: float, from_head_y: float, to_head_y: float) -> f
 	var zi := int(floor(z))
 	var fx := x - float(xi)
 	var fz := z - float(zi)
-	var y := int(floor(from_head_y))
-	var y_hi := int(floor(to_head_y))
+	# COSMOS FS2′: convert the PLAY head span to CELL space for the content scan, report the underside back in PLAY
+	# space (+ s). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
+	var from_cell := from_head_y - s
+	var to_cell := to_head_y - s
+	var y := int(floor(from_cell))
+	var y_hi := int(floor(to_cell))
 	while y <= y_hi:
 		var sp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 		if sp != Vector2.ZERO:
 			var occ_lo := float(y) + sp.x
-			if occ_lo >= from_head_y - _EPS:
-				return occ_lo
+			if occ_lo >= from_cell - _EPS:
+				return occ_lo + s
 		y += 1
 	return INF
 
@@ -2967,7 +3055,26 @@ func is_solid(pos: Vector3) -> bool:
 ## exact for modifier 0). P5 SEAM: for a shaped (ramp) cell, `cell_solid` still gates
 ## entry, then an in-cell surface ray test (SVS §5.3) refines the hit point/normal
 ## within the cell — full cubes need no refinement, so the boundary hit stands.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.5): the aim ray is cast in PLAY space against the rendered
+## (datum-lifted) surface. Lower the origin by the ray column's continuous s to CELL space, walk the DDA against
+## CONTENT (byte-identical, shipped path), then lift the returned hit POSITION back to play space by the HIT
+## column's s (the highlight renders at + s). Off (FP_DATUM_BAKE / non-faceted / no active facet) ⇒ the shipped
+## path verbatim — byte-identical. The returned `voxel` is a content cell either way (break/place stays cell-space).
 func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
+	if not (CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED and TerrainConfig.active_facet() >= 0):
+		return _aimed_voxel_cell(origin, dir, max_dist)
+	var s0 := _datum_lift(int(floor(origin.x)), int(floor(origin.z)))
+	var res := _aimed_voxel_cell(Vector3(origin.x, origin.y - s0, origin.z), dir, max_dist)
+	if res.has("position"):
+		var p: Vector3 = res["position"]
+		var sh := s0
+		if bool(res.get("hit", false)):
+			var v: Vector3i = res.get("voxel", Vector3i.ZERO)
+			sh = _datum_lift(v.x, v.z)
+		res["position"] = Vector3(p.x, p.y + sh, p.z)
+	return res
+
+func _aimed_voxel_cell(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
 	var d := dir.normalized()
 	var cell := Vector3i(int(floor(origin.x)), int(floor(origin.y)), int(floor(origin.z)))
 	var step := Vector3i(signi(int(sign(d.x))), signi(int(sign(d.y))), signi(int(sign(d.z))))

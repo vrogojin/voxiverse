@@ -334,6 +334,22 @@ const FP_SHELL_WELD := false
 ## hashes unchanged). Flipped ON at export after the live cliffs-gone pass. Truth gate: verify_facet_datum.gd.
 const FP_RADIAL_DATUM := false
 
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2) — the DATUM BAKE. RETIRES FP_RADIAL_DATUM (which terraced the facet
+## interior: its integer S = round(s) re-index stepped 1 block along ~7 contour rings and fought the corner smoother).
+## FS2′ keeps the voxel CONTENT byte-identical (no generator change — C++ patch 0009 is removed, the generator is
+## untouched) and instead applies the SAME datum, left CONTINUOUS and UNROUNDED, as a per-column vertical displacement
+## at the render/physics/input boundary: play y = cell y + s(fid,X,Z), s = −b + √(b²+R²−|p0|²) (FacetAtlas.datum_lift).
+## s is C∞ (gradient ≤ 0.034 blocks/block, range [0,~6.9]) so the rendered/walked surface sits at R+s (±0.15 cosine)
+## with NO ±1 rounding residual and ZERO new interior steps (the shipped smooth shape simply lifted). Application
+## surfaces (§2.2): near voxel mesh (the ONE engine touch — VoxelMesherBlocky.set_facet_datum_bake per-vertex `y += s`,
+## C++ patch 0010, the set_cosmos_bake precedent); skin (`+s` in _lattice_world); analytic floor/blocked/ceiling/DDA
+## convert play↔cell per column; GroundCollider/debris/highlight `+s`; far ring nothing (FS1 radial already IS
+## R+relief). Content, worldgen, resolve_cell, smoothing, sea/snow/strata thresholds, crossing algebra, edit keys are
+## ALL UNTOUCHED (cell space). Default OFF ⇒ FacetAtlas.datum_lift returns 0.0 at every site ⇒ byte-identical
+## (FLAT 6042/0). Requires ONE build.sh cycle for the mesher hook (module_in_web=yes). Gate: verify_facet_seams.gd
+## G-D2-SHAPE (flag-on near mesh == flag-off mesh + s·ŷ per vertex EXACTLY — no terracing can exist by construction).
+const FP_DATUM_BAKE := false
+
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
 ## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already
@@ -926,6 +942,31 @@ const SN_HUD_NAV := false
 ## heading + velocity (and forwards a zero twist to the remote executor). Default FALSE ⇒ the shipped yaw-twist
 ## is BYTE-IDENTICAL. This gates a SHIPPED fixed-frame behaviour. Gate G-SN-KEEPHEADING. Live-only: the feel.
 const FP_CROSS_KEEP_HEADING := false
+
+## COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5) — the orientation-twist FRAME-AWARE fix. world_yaw = frame_yaw +
+## local_yaw and, under the fixed frame, frame_yaw_B − frame_yaw_A = −yaw_delta, so the SHIPPED reframe twist
+## (local += yaw_delta) is ALREADY the world-heading-preserving branch. FP_CROSS_KEEP_HEADING (local unchanged) then
+## snaps the world heading by the FULL inter-frame yaw — and the live deploy runs BOTH FP_FIXED_FRAME and
+## FP_CROSS_KEEP_HEADING ON, so the heading DOUBLE-twists at every crossing (the pilot's "orientation glitch",
+## largest at cross-cube-face seams). When true, reframe_twist becomes frame-aware: under the fixed frame it applies
+## the +yaw_delta twist REGARDLESS of keep_heading (that branch preserves world heading); KEEP_HEADING's no-twist is
+## honoured only in the legacy/orbital-BCI frame it was designed for. Default FALSE ⇒ reframe_twist is BYTE-IDENTICAL
+## (the frame-aware branch is skipped). Gate G-TWIST-FRAME (verify_facet_seams.gd): under fixed frame, ON + KEEP_HEADING
+## preserves world heading with a SINGLE correct twist; OFF is byte-identical. Bake ON with FP_FIXED_FRAME.
+const FP_TWIST_FRAME_AWARE := false
+
+## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3) — CORNER COMMIT (kills the invisible wall). blocked() keeps a
+## permanent ridge wall at own_dist < FACET_WALL_EPS (−3), meant to be unreachable because a crossing commits at
+## own_dist < −HYST. But maybe_cross_facet REFUSES to commit near a facet-grid CORNER — (a) the containment check
+## (the reframed landing is past one of B's other ridges → `continue`) and (b) the 6-tick cooldown during a corner
+## zig-zag — and the analytic floor then carries the player on to −3 into the wall. When true, on a containment
+## failure the destination is resolved BY DIRECTION: argmax over {the crossed edge-neighbours, their common diagonal}
+## of min-slot own_dist at the reframed landing (FacetAtlas.facet_of_dir as the oracle/gate); and the cooldown is
+## VOIDED once own_dist < −1 (genuinely past the ridge — never park the player in masked space). The −3 wall stays as
+## an unreachable backstop; a diagonal pool-miss uses the existing spawn-then-redesignate path. Default FALSE ⇒
+## maybe_cross_facet is BYTE-IDENTICAL (containment `continue` + full cooldown). Gate G-CORNER-WALK: corner-grazing
+## traversals never blocked, ≤3 commits, direction-correct landing. GDScript-only (no rebuild). Independent of FS2′.
+const FP_CROSS_CORNER_COMMIT := false
 
 ## SN-FIX #3 (2026-07-18, live pilot report "bounced back at the atmosphere ceiling" + the full F-mode model the
 ## pilot then specified). The intended physics, gated as ONE switch:

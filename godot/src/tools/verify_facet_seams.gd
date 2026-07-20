@@ -173,6 +173,11 @@ func _initialize() -> void:
 	# ---- (c) live-placement probe: the REAL lattice_to_world64 + facet_profile path reproduces the step ----
 	_probe_live()
 
+	# ================= COSMOS-FACET-SEAMS-V2 gates (FS2′ / FS-W / twist) =================
+	_probe_datum_v2()      # G-D2-* : the CONTINUOUS datum lift collapses the seam step + is radial + mirror-exact
+	_gate_corner_walk()    # G-CORNER-WALK : corner-commit resolves a grid-corner clear of the −3 ridge wall
+	_gate_twist_frame()    # G-TWIST-FRAME : frame-aware reframe_twist preserves world heading (no double-twist)
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -222,3 +227,141 @@ func _probe_live() -> void:
 		w_fidA, w_slot, w_fidB, max_obs, w_pred, max_disagree])
 	_ok(max_obs > 4.5, "no seam reached cliff scale via the real placement path: max live step %.3f <= 4.5" % max_obs)
 	_ok(max_disagree <= 1.0, "real placement disagrees with the plane-datum geometry by %.3f > 1.0" % max_disagree)
+
+## The FS2′ C++ mirror formula (EXACT transcription of voxel_mesher_blocky.cpp::facet_datum_lift) recomputed in
+## GDScript from FacetAtlas.datum_bake_params — so G-D2-SHAPE-MIRROR can assert it == FacetAtlas.datum_lift.
+func _cpp_lift(params: Dictionary, X: float, Z: float) -> float:
+	var o: PackedFloat64Array = params["o"]; var du: PackedFloat64Array = params["du"]
+	var dv: PackedFloat64Array = params["dv"]; var nh: PackedFloat64Array = params["nhat"]
+	var off: PackedInt32Array = params["off"]; var r: float = params["R"]
+	var fx := X - float(off[0]); var fz := Z - float(off[1])
+	var p0x := o[0] + fx * du[0] + fz * dv[0]
+	var p0y := o[1] + fx * du[1] + fz * dv[1]
+	var p0z := o[2] + fx * du[2] + fz * dv[2]
+	var b := p0x * nh[0] + p0y * nh[1] + p0z * nh[2]
+	var disc := b * b + r * r - (p0x * p0x + p0y * p0y + p0z * p0z)
+	if disc < 0.0:
+		disc = 0.0
+	return -b + sqrt(disc)
+
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.3) — G-D2-*. The CONTINUOUS datum lift, applied through the REAL
+## placement path, must (ON) collapse the seam step to ≤0.3, make the placed surface RADIAL (|len|≈R+g), stay
+## CONTINUOUS between columns (gradient ≤0.06), and mirror the C++ bake formula EXACTLY; (OFF) leave the geometry
+## byte-identical (the pinned 5.30 step returns — datum_lift ≡ 0). Reuses the _probe_live seam walk.
+func _probe_datum_v2() -> void:
+	var r := FA.R_BLOCKS
+	var on := CubeSphere.FP_DATUM_BAKE
+	var max_step := 0.0
+	var max_radial := 0.0
+	var max_grad := 0.0
+	var max_mirror := 0.0
+	for face in range(6):
+		for a in range(K):
+			for b in range(K):
+				var fidA := (face * K + a) * K + b
+				# G-D2-SHAPE-MIRROR + G-D2-CONT: the lift the near mesh bakes == datum_lift, and is smooth.
+				var params := FA.datum_bake_params(fidA)
+				if bool(params.get("enabled", false)):
+					var cc := FA.centre_cell(fidA)
+					var s00 := FA.datum_lift(fidA, float(cc.x) + 0.5, float(cc.y) + 0.5)
+					var s10 := FA.datum_lift(fidA, float(cc.x) + 1.5, float(cc.y) + 0.5)
+					var s01 := FA.datum_lift(fidA, float(cc.x) + 0.5, float(cc.y) + 1.5)
+					max_grad = maxf(max_grad, maxf(absf(s10 - s00), absf(s01 - s00)))
+					max_mirror = maxf(max_mirror, absf(_cpp_lift(params, float(cc.x) + 0.5, float(cc.y) + 0.5) - s00))
+				for slot in range(4):
+					var fidB := FA.seam_neighbour(fidA, slot)
+					var ev := _edge_ij(a, b, slot)
+					var d0 := _vdir(face, ev[0], ev[1], K)
+					var d1 := _vdir(face, ev[2], ev[3], K)
+					for t in _TS:
+						var dm := _norm(_lerp3(d0, d1, t))
+						var q := _scale(dm, r)
+						var g := int(TerrainConfig.profile_at_dir(dm[0], dm[1], dm[2], r).x)
+						var la := FA.world_to_lattice64(fidA, q[0], q[1], q[2])
+						var lb := FA.world_to_lattice64(fidB, q[0], q[1], q[2])
+						var sA := FA.datum_lift(fidA, la[0], la[2])
+						var sB := FA.datum_lift(fidB, lb[0], lb[2])
+						var wa := FA.lattice_to_world64(fidA, la[0], float(g) + sA, la[2])
+						var wb := FA.lattice_to_world64(fidB, lb[0], float(g) + sB, lb[2])
+						max_step = maxf(max_step, absf(_len(wa) - _len(wb)))
+						max_radial = maxf(max_radial, absf(_len(wa) - (r + float(g))))
+	print("  FS2′ (FP_DATUM_BAKE=%s): lifted seam step max=%.3f  radial |len−(R+g)| max=%.3f  s-gradient max=%.4f  mirror max=%s" % [
+		str(on), max_step, max_radial, max_grad, str(max_mirror)])
+	if on:
+		_ok(max_step <= 0.30, "G-D2-SEAM: lifted seam step %.3f > 0.30 (datum did not collapse the cliff)" % max_step)
+		_ok(max_radial <= 0.30, "G-D2-LIFT-RADIAL: placed surface not radial, |len−(R+g)| %.3f > 0.30" % max_radial)
+		_ok(max_grad <= 0.06, "G-D2-CONT: s gradient %.4f > 0.06 (would terrace)" % max_grad)
+		_ok(max_mirror <= 1.0e-9, "G-D2-SHAPE-MIRROR: C++ formula != datum_lift by %.2e" % max_mirror)
+	else:
+		_ok(absf(max_step - 5.30) <= 0.10, "G-D2-OFF: datum_lift≡0 must leave the 5.30 step; got %.3f" % max_step)
+
+## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3) — G-CORNER-WALK. At a facet-grid corner the single-edge landing
+## fails containment (the shipped `continue` → the −3 ridge wall). WorldManager._corner_commit must instead resolve
+## a destination BY DIRECTION whose reframed landing is CLEAR of the wall (min own_dist > FACET_WALL_EPS), matching
+## facet_of_dir; and _past_ridge_deep must flag a deep-past position so the cooldown never strands the player. The
+## helpers are flag-agnostic (pure geometry) so this runs without booting a world.
+func _gate_corner_walk() -> void:
+	var wm := WorldManager.new()
+	var HYST: float = wm.FACET_CROSS_HYST
+	var WALL: float = wm.FACET_WALL_EPS
+	var exercised := 0
+	var resolved := 0
+	var deep_ok := 0
+	# The +X+Z grid corner of each facet: a lattice column just past BOTH the E (slot 0) and N (slot 2) ridges.
+	for fidA in range(min(FA.body_facet_count(0), 24)):
+		var dmx := FA.dom_max(fidA)
+		var g := int(TerrainConfig.facet_profile(fidA, dmx.x - 1, dmx.y - 1).x)
+		var pos := Vector3(float(dmx.x) + 2.5, float(g), float(dmx.y) + 2.5)
+		# Count how many of A's own ridges this position is past (needs ≥2 to be a genuine corner case).
+		var crossed := 0
+		for slot in 4:
+			if FA.own_dist(fidA, slot, pos.x, pos.y, pos.z) < -HYST:
+				crossed += 1
+		if crossed < 2:
+			continue
+		exercised += 1
+		if wm._past_ridge_deep(fidA, pos):
+			deep_ok += 1
+		var cc := wm._corner_commit(fidA, pos)
+		if cc.is_empty():
+			continue
+		var to := int(cc["to"])
+		var np: Array = cc["np"]
+		# The committed landing must be CLEAR of the −3 ridge wall on every side (never strand into blocked()).
+		var mind := INF
+		for bslot in 4:
+			mind = minf(mind, FA.own_dist(to, bslot, np[0], np[1], np[2]))
+		# Direction oracle cross-check: the committed facet is the one the world direction lands in.
+		var w := FA.lattice_to_world64(fidA, pos.x, pos.y, pos.z)
+		var fdir := FA.facet_of_dir_body(FA.body_of_fid(fidA),
+			CubeSphere.DVec3.new(w[0], w[1], w[2]).normalized())
+		if mind > WALL and to == fdir:
+			resolved += 1
+	wm.free()
+	print("  FS-W corner-commit: exercised=%d resolved(clear-of-wall & dir-correct)=%d deep-past=%d" % [
+		exercised, resolved, deep_ok])
+	_ok(exercised >= 4, "G-CORNER-WALK: too few grid-corner cases exercised (%d)" % exercised)
+	_ok(resolved == exercised, "G-CORNER-WALK: %d/%d corners not resolved clear of the wall / dir-correct" % [resolved, exercised])
+	_ok(deep_ok == exercised, "G-CORNER-WALK: _past_ridge_deep failed to flag %d deep-past corners" % (exercised - deep_ok))
+
+## COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5) — G-TWIST-FRAME. Under the fixed frame world_yaw = frame_yaw +
+## local_yaw with frame_yaw_B − frame_yaw_A = −yaw_delta, so preserving WORLD heading requires local += yaw_delta.
+## Assert: shipped (off) = +yaw_delta; KEEP_HEADING legacy = no twist; FRAME-AWARE+fixed = +yaw_delta REGARDLESS of
+## keep_heading (the single correct world-preserving twist, killing the double-twist); FRAME-AWARE+legacy honours
+## keep_heading. reframe_twist is a pure static — tested directly, all four combinations.
+func _gate_twist_frame() -> void:
+	var yd := 0.7
+	var y0 := 0.3
+	var vel := Vector3(1.0, 0.0, 2.0)
+	var want := wrapf(y0 + yd, -PI, PI)
+	var off: Array = Player.reframe_twist(y0, vel, yd, false, false, false)
+	_ok(absf(wrapf(off[0] - want, -PI, PI)) <= 1.0e-6, "twist off: shipped +yaw_delta not applied")
+	var keep: Array = Player.reframe_twist(y0, vel, yd, true, false, false)
+	_ok(keep[0] == y0 and keep[1] == vel, "twist KEEP_HEADING(legacy): heading/vel must be unchanged")
+	var fa: Array = Player.reframe_twist(y0, vel, yd, true, true, true)
+	_ok(absf(wrapf(fa[0] - want, -PI, PI)) <= 1.0e-6 and fa[1].is_equal_approx(vel.rotated(Vector3.UP, yd)),
+		"G-TWIST-FRAME: frame-aware+fixed+keep must apply +yaw_delta (world-heading preserving), not no-twist")
+	var fa_off: Array = Player.reframe_twist(y0, vel, yd, false, true, true)
+	_ok(absf(wrapf(fa_off[0] - want, -PI, PI)) <= 1.0e-6, "G-TWIST-FRAME: frame-aware+fixed(no keep) = +yaw_delta")
+	var fal: Array = Player.reframe_twist(y0, vel, yd, true, true, false)
+	_ok(fal[0] == y0 and fal[1] == vel, "G-TWIST-FRAME: frame-aware+LEGACY+keep must honour keep_heading (no twist)")

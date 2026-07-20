@@ -326,14 +326,26 @@ func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
 	# lattice frame) is factored into the pure `reframe_twist` so the gate drives both flag states. Flag off ⇒ the
 	# shipped twist (byte-identical); flag on ⇒ heading + velocity are preserved (the pilot's world heading stays,
 	# the ground's dihedral tilt is carried separately by the ActiveFrame/camera).
-	var tw := reframe_twist(rotation.y, velocity, yaw_delta, CubeSphere.FP_CROSS_KEEP_HEADING)
+	# COSMOS FS2-V2 (§5): pass the frame-aware flag + whether the fixed frame is active so KEEP_HEADING does not
+	# double-twist the world heading under the fixed frame (the shipped +yaw_delta twist already preserves it).
+	var tw := reframe_twist(rotation.y, velocity, yaw_delta, CubeSphere.FP_CROSS_KEEP_HEADING,
+		CubeSphere.FP_TWIST_FRAME_AWARE, _frame.enabled())
 	rotation.y = tw[0]
 	velocity = tw[1]
 
 ## SN-FIX #2 (FP_CROSS_KEEP_HEADING) — the pure crossing heading/velocity twist decision, factored out for the
 ## gate (no node state). `keep_heading` off ⇒ the shipped twist about UP by `yaw_delta`; on ⇒ heading + velocity
 ## are returned UNCHANGED (world heading preserved across the crossing). Returns [new_yaw, new_velocity].
-static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, keep_heading: bool) -> Array:
+static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, keep_heading: bool,
+		frame_aware: bool = false, frame_fixed: bool = false) -> Array:
+	# COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5): FRAME-AWARE twist. Under the fixed frame the world heading
+	# is frame_yaw + local_yaw with frame_yaw_B − frame_yaw_A = −yaw_delta, so the +yaw_delta twist (below) is the
+	# branch that PRESERVES world heading; KEEP_HEADING's no-twist would then snap the heading by the full inter-
+	# frame yaw (the double-twist glitch when FP_FIXED_FRAME + FP_CROSS_KEEP_HEADING are both live). With
+	# FP_TWIST_FRAME_AWARE on AND the fixed frame active, apply +yaw_delta REGARDLESS of keep_heading. Default off
+	# (frame_aware=false) ⇒ this branch is skipped and the function is byte-identical to the shipped 4-arg form.
+	if frame_aware and frame_fixed:
+		return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]
 	if keep_heading:
 		return [cur_yaw, cur_vel]
 	return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]

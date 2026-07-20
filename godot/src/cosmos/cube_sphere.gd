@@ -872,6 +872,15 @@ const FP_SUN_GLOW := false
 ## overwrite + static fog_depth_end ⇒ byte-identical. Gate G-B5-FOG. Protects A0 (FP_SN3_MAIN_LIVE) in deep space.
 const FP_FOG_ARBITER := false
 
+## COSMOS ATMO2 B4 (docs/COSMOS-ATMO2-DESIGN.md §2.2/§3.3, stage B4). The Moon presence fix: (a) the self-phase
+## shader's flat `ambient=0.02` becomes an EARTHSHINE FLOOR 0.11 so a crescent/new moon is a faint disc, not
+## black-on-black; (b) the ephemeris Moon gets its real 5.1° orbital inclination so it clears Earth's ~0.95°
+## umbra cone at most oppositions (eclipses become the rare node event they should be, not every full moon).
+## The inclination is gated HERE (effective_incl → 0 with the flag off), so the SN1/O1/ephemeris suites stay
+## byte-identical when off. Requires FP_LIGHT_ABSOLUTE (the self-phase shader) + FP_SUN_APPARENT (size). Gate
+## G-B4-MOON. LIVE-ONLY LOOK. Depends B1 (size), B2 (calmer sky).
+const FP_MOON_PRESENCE := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

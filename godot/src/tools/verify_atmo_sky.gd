@@ -53,6 +53,7 @@ func _initialize() -> void:
 	_gate_b0_path()
 	_gate_b1_sun()
 	_gate_b5_fog()
+	_gate_b4_moon()
 	_gate_inert()
 	_gate_smoke()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -440,6 +441,48 @@ func _gate_b5_fog() -> void:
 	if CubeSphere.FP_FOG_ARBITER and CubeSphere.FP_SN3_MAIN_LIVE:
 		_ok(is_equal_approx(env.fog_depth_end, SCALE.camera_far(d_space, r) * 0.98), "live: fog_depth_end tracks the ramped camera far")
 	sky.queue_free()
+
+# ------------------------------------------------------------------ G-B4-MOON (ATMO2 B4)
+func _gate_b4_moon() -> void:
+	print("  --- G-B4-MOON: earthshine floor + disc luminance + rare eclipses via 5.1° inclination (ATMO2 §2.2) ---")
+	# Disc-luminance budget with the earthshine floor (§3.5): full-moon ≥ 0.4, new-moon a faint disc (not black).
+	var full := SKY.moon_disc_luminance(1.0, SKY.MOON_EARTHSHINE)
+	var newm := SKY.moon_disc_luminance(0.0, SKY.MOON_EARTHSHINE)
+	_ok(full >= 0.4, "full-moon disc luminance ≥ 0.4 (%.3f)" % full)
+	_ok(newm >= 0.05, "new-moon disc ≥ earthshine floor, readable not black (%.3f)" % newm)
+	_ok(SKY.moon_disc_luminance(0.0, 0.02) < 0.02, "shipped ambient 0.02 ⇒ near-black new moon (documents the bug: %.4f)" % SKY.moon_disc_luminance(0.0, 0.02))
+	_ok(SKY.MOON_EARTHSHINE >= 0.10 and SKY.MOON_EARTHSHINE <= 0.12, "earthshine floor in [0.10,0.12] (%.2f)" % SKY.MOON_EARTHSHINE)
+	# effective_incl gating: 5.1° under FP_MOON_PRESENCE, 0 otherwise (byte-off keeps the coplanar kernel).
+	_ok(EPH.effective_incl("moon") == (EPH.MOON_INCL if CubeSphere.FP_MOON_PRESENCE else 0.0), "moon effective_incl gated by FP_MOON_PRESENCE")
+	_ok(EPH.effective_incl("earth") == 0.0, "earth incl unchanged (0) — inclination is moon-only")
+	# Eclipse duty over ~a year of full-moon oppositions, computed DIRECTLY for coplanar vs 5.1°-tilted moon
+	# positions (flag-independent — proves the tilt reduces eclipses regardless of the shipped flag). With the
+	# tilt the Moon clears the ~0.95° umbra at almost every opposition (rare node event); coplanar it is eclipsed.
+	var period := EPH.orbit_period("moon")
+	var opp := 0
+	var cop := 0
+	var tilt := 0
+	var n := 8000
+	for i in range(n):
+		var t := period * 14.0 * float(i) / float(n)
+		if EPH.illuminated_fraction("earth", "moon", "sun", t) > 0.995:   # near full moon (opposition)
+			opp += 1
+			if _ecl_factor_incl(t, 0.0) < 0.5: cop += 1
+			if _ecl_factor_incl(t, EPH.MOON_INCL) < 0.5: tilt += 1
+	var cop_duty := float(cop) / maxf(float(opp), 1.0)
+	var tilt_duty := float(tilt) / maxf(float(opp), 1.0)
+	_ok(tilt_duty < cop_duty, "5.1° inclination REDUCES eclipse duty vs coplanar (%.3f < %.3f)" % [tilt_duty, cop_duty])
+	_ok(tilt_duty < 0.05, "tilted eclipse duty rare (< 5 pct of full-moon-window samples: %.3f)" % tilt_duty)
+
+## B4 gate helper: the lunar-eclipse factor at time t with an EXPLICIT orbital inclination (rad), mirroring
+## CosmosSky.moon_eclipse_factor + the ATMO2 body_pos_parent tilt, so the gate can compare coplanar vs tilted
+## without depending on the FP_MOON_PRESENCE flag.
+func _ecl_factor_incl(t: float, inc: float) -> float:
+	var th := EPH.orbit_angle("moon", t)
+	var a := EPH.orbit_a("moon")
+	var mp := Vector3(a * cos(th), a * sin(th) * cos(inc), a * sin(th) * sin(inc))
+	var sd := EPH.dir_to("earth", "sun", t)
+	return SKY.occlusion_factor(sd, mp, EPH.radius_of("earth"))
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

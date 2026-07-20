@@ -78,6 +78,14 @@ var _moon_ring: MoonFarRing = null           # M2 (FP_MOON_RING): the Moon's coa
 var _moon_ring_axis := Vector3.ZERO          # body-coords cull axis of the last ring build (drift-rebuild trigger)
 var _cur_sun_dir := Vector3(1.0, 0.0, 0.0)   # L3: last body-fixed Sun direction, exposed via current_sun_dir()
 const _MOON_ALBEDO_BASE := Color(0.72, 0.72, 0.70)   # shipped grey (see _build_nodes); umbra reddens toward crimson
+## ATMO2 B4: the earthshine floor for the Moon self-phase shader (§3.3, 0.10–0.12) — a crescent/new moon is a
+## faint disc, not black. Replaces the shipped flat 0.02 `ambient` ONLY under FP_MOON_PRESENCE.
+const MOON_EARTHSHINE := 0.11
+## ATMO2 B4 twin: the Moon impostor's disc-mean luminance under the self-phase shader ALBEDO =
+## base·(earthshine + (1−earthshine)·lit). lit = disc-integrated illuminated fraction (full=1, new=0). Pins the
+## §3.5 budget: full-moon ≥ 0.4, new-moon ≥ the earthshine floor (never the black-on-black bug at 0.02).
+static func moon_disc_luminance(illum_frac: float, earthshine: float) -> float:
+	return _MOON_ALBEDO_BASE.get_luminance() * (earthshine + (1.0 - earthshine) * clampf(illum_frac, 0.0, 1.0))
 ## The active sky placement radius (blocks), resolved ONCE in _build_nodes: the derived R-safe value under
 ## FP_SKY_DSKY_R, else the shipped literal D_SKY (byte-identical). Everything downstream reads this, never D_SKY.
 var _dsky := D_SKY
@@ -684,6 +692,10 @@ func _build_nodes() -> void:
 		_moon_phase_mat.shader = msh
 		_moon_phase_mat.set_shader_parameter("base_albedo", _MOON_ALBEDO_BASE)
 		_moon_phase_mat.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		# B4 (FP_MOON_PRESENCE): raise the flat 0.02 ambient to an EARTHSHINE FLOOR so a crescent/new moon is a
+		# faint readable disc, not black-on-black. Off ⇒ the shader default 0.02 stands ⇒ byte-identical look.
+		if CubeSphere.FP_MOON_PRESENCE:
+			_moon_phase_mat.set_shader_parameter("ambient", MOON_EARTHSHINE)
 		_moon.material_override = _moon_phase_mat
 	_moon.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_moon)

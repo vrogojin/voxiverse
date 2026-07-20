@@ -809,6 +809,12 @@ func appearance_count() -> int:
 func atlas():
 	return _atlas
 
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the shared atlas material's daylight
+## twin. No-op with no atlas or the flag off (the atlas setter self-guards) ⇒ byte-identical.
+func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if _atlas != null and _atlas.has_method("set_near_daylight_sun_dir"):
+		_atlas.set_near_daylight_sun_dir(sun_dir)
+
 func library_model(arid: int) -> Object:
 	if _library == null:
 		return null

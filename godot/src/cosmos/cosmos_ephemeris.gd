@@ -189,7 +189,12 @@ static func body_pos_parent(body: String, t: float) -> PackedFloat64Array:
 	if parent_of(body) == "" or a <= 0.0:
 		return DV.v(0.0, 0.0, 0.0)
 	var th := orbit_angle(body, t)
-	return DV.v(a * cos(th), a * sin(th), 0.0)
+	# ATMO2 B4: tilt the orbit plane by the effective inclination about the X axis (line of nodes at θ=0).
+	# incl=0 (flag off) ⇒ the shipped coplanar XY-plane result EXACTLY (cos0=1, sin0=0) ⇒ byte-identical.
+	var inc := effective_incl(body)
+	if inc == 0.0:
+		return DV.v(a * cos(th), a * sin(th), 0.0)
+	return DV.v(a * cos(th), a * sin(th) * cos(inc), a * sin(th) * sin(inc))
 
 ## Heliocentric (system-centre) position of `body` (DVec3 blocks): the chain of parent-relative
 ## offsets up to the Sun at the origin. Pure recursion over the (acyclic) parent graph.
@@ -209,7 +214,11 @@ static func body_vel_parent(body: String, t: float) -> PackedFloat64Array:
 		return DV.v(0.0, 0.0, 0.0)
 	var n := omega_orbit(body)
 	var th := orbit_angle(body, t)
-	return DV.v(-a * n * sin(th), a * n * cos(th), 0.0)
+	# ATMO2 B4: the exact time-derivative of the inclination-tilted body_pos_parent. incl=0 ⇒ byte-identical.
+	var inc := effective_incl(body)
+	if inc == 0.0:
+		return DV.v(-a * n * sin(th), a * n * cos(th), 0.0)
+	return DV.v(-a * n * sin(th), a * n * cos(th) * cos(inc), a * n * cos(th) * sin(inc))
 
 ## Heliocentric (system-centre) velocity of `body` (DVec3 blocks/s): the chain of parent-relative
 ## velocities up to the Sun (at rest at the origin). Pure recursion over the acyclic parent graph —
@@ -266,6 +275,16 @@ static func effective_tilt(body: String) -> float:
 	if not CubeSphere.FP_SEASONS:
 		return 0.0
 	return float(BODIES[body]["axial_tilt"])
+
+## ATMO2 B4 (§2.2/§3.3): the orbital inclination (rad) actually APPLIED to `body`'s orbit plane. Gated by
+## CubeSphere.FP_MOON_PRESENCE — with the flag OFF this returns 0 for every body, so body_pos_parent collapses
+## to the shipped coplanar XY-plane kernel and is BYTE-IDENTICAL (SN1/O1/ephemeris suites unchanged). ON, the
+## Moon reads 5.1° so it clears Earth's umbra cone at most oppositions ⇒ eclipses become the rare node event.
+const MOON_INCL := 0.08901179   # 5.1° in radians (mean lunar orbital inclination to the ecliptic)
+static func effective_incl(body: String) -> float:
+	if body == "moon" and CubeSphere.FP_MOON_PRESENCE:
+		return MOON_INCL
+	return float(BODIES[body]["incl"])
 
 ## Unit direction (Vector3) from `from_body` to `to_body`, expressed in `from_body`'s BODY-FIXED
 ## frame at t — the inertial direction rotated by −spin_angle(from_body) about the spin axis (+Z,

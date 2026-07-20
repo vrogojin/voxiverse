@@ -873,6 +873,67 @@ const FP_SHELL_ABSOLUTE := false
 ## A5 (matching curves). Gate G-AS-LIMB. LIVE-ONLY LOOK (P3 shader class); analytic StandardMaterial fallback.
 const FP_ATMO_SHELL := false
 
+## COSMOS ATMO2 B0 (docs/COSMOS-ATMO2-DESIGN.md §3.2/§3.3, stage B0). The optical-PATH sun law: the Sun's
+## disc/glare colour AND the DirectionalLight colour/energy become the transmittance T⃗(m)·L(m) over the
+## atmospheric PATH along the viewer→sun ray (CosmosSky.optical_path_air_mass), not the camera-ELEVATION
+## Kasten–Young curve. m=0 in vacuum (blinding WHITE sun), ≈1 at surface noon (pale warm), ≈18 at the surface
+## horizon (deep red), ≈36 through the limb from orbit — one continuous law, C¹ across the atmosphere border,
+## K–Y retired from the live path (kept in the gate as the surface cross-check). The disc/glare/light penumbra
+## unify on pen(h). Off ⇒ the shipped A2/A4 μ-keyed colour is untouched ⇒ byte-identical. Requires ORBITAL_SKY
+## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
+const FP_SUN_PATHLIGHT := false
+
+## COSMOS ATMO2 B1 (docs/COSMOS-ATMO2-DESIGN.md §2.1.2/§3.3, stage B1). The apparent-disc fix: Godot's
+## SphereMesh default radius is 0.5 (not 1.0), so the shipped sun/moon impostors render at HALF their intended
+## angular size (sun 1.0° not 2.0°, moon 0.75° not 1.5°) — a blurry dot lost in the glare. Under this flag the
+## impostor meshes get radius 1.0 so the discs hit their true 2.0°/1.5° floors, and the glare quad is retuned
+## into a tight bright core (~1.5 disc radii @ ~0.9) + a soft skirt (5 radii). Off ⇒ the shipped 0.5-radius mesh
+## + shipped glare falloff ⇒ byte-identical. Requires FP_SUN_PRESENCE. Gate G-B1-SUN. LIVE-ONLY LOOK. Depends B0.
+const FP_SUN_APPARENT := false
+
+## COSMOS ATMO2 B1 sub-flag (docs §3.4). Compatibility-renderer glow with glow_hdr_threshold≈0.92 so ONLY the
+## sun disc/glare (the only ≥0.9-luminance residents of the §3.5 budget) bloom. P3 (gl_compat glow is a
+## simplified impl); if it misbehaves on device, off = the glare quad alone still delivers the bloom. Off ⇒ the
+## Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an Environment. LIVE-ONLY LOOK.
+const FP_SUN_GLOW := false
+
+## COSMOS ATMO2 B5 (docs/COSMOS-ATMO2-DESIGN.md §2.6, stage B5). The fog arbiter: (a) WeatherFX MULTIPLIES its
+## humidity factor onto CosmosSky's altitude fog density (reads the current fog_density instead of overwriting
+## from a captured base — so FP_PRECIP no longer stomps the altitude thinning); (b) CosmosSky's altitude fog
+## fades with atmo_vis(h) so it reaches 0 at ATMO_TOP (depth fog IS the atmosphere); (c) fog_depth_end tracks
+## the A0-ramped camera far so a deep-space planet fragment is never painted the fog colour. Off ⇒ the shipped
+## overwrite + static fog_depth_end ⇒ byte-identical. Gate G-B5-FOG. Protects A0 (FP_SN3_MAIN_LIVE) in deep space.
+const FP_FOG_ARBITER := false
+
+## COSMOS ATMO2 B4 (docs/COSMOS-ATMO2-DESIGN.md §2.2/§3.3, stage B4). The Moon presence fix: (a) the self-phase
+## shader's flat `ambient=0.02` becomes an EARTHSHINE FLOOR 0.11 so a crescent/new moon is a faint disc, not
+## black-on-black; (b) the ephemeris Moon gets its real 5.1° orbital inclination so it clears Earth's ~0.95°
+## umbra cone at most oppositions (eclipses become the rare node event they should be, not every full moon).
+## The inclination is gated HERE (effective_incl → 0 with the flag off), so the SN1/O1/ephemeris suites stay
+## byte-identical when off. Requires FP_LIGHT_ABSOLUTE (the self-phase shader) + FP_SUN_APPARENT (size). Gate
+## G-B4-MOON. LIVE-ONLY LOOK. Depends B1 (size), B2 (calmer sky).
+const FP_MOON_PRESENCE := false
+
+## COSMOS ATMO2 B2 (docs/COSMOS-ATMO2-DESIGN.md §2.4/§3.3, stage B2). The atmosphere-shell brightness fix: the
+## A6 single-sample strength `chord·ρ(h_min)/H` overestimates the optical path 6–80× (a blown cyan-white sky
+## with stars showing through). Replace it with a BOUNDED, budget-normalized limb intensity — a saturating
+## transform of the optical column, peak-limb luminance ≈0.35 and surface horizon band ≈0.2–0.3 (§3.5) — so the
+## halo is a thin moderate blue ring the sun is always brighter than. Colour keeps the shared scatter_tint/band
+## (which IS the surface path-T⃗ ⇒ A5 and A6 stay harmonized). Both the GLSL twin (via a path_norm uniform,
+## default 0 = shipped) and the GDScript twin are gated. Off ⇒ byte-identical. Requires FP_ATMO_SHELL. Gate
+## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
+const FP_ATMO_PATH_SHELL := false
+
+## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
+## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
+## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far
+## split). This flag routes the near materials through ShaderMaterial TWINS that keep vertex-colour×texture
+## EXACTLY and multiply an absolute day/night shade(μ), μ = normalize(MODEL·v)·ŝ (planet centre = scene origin),
+## so near AND far agree at the same surface point BY CONSTRUCTION. night_floor 0.10; a StandardMaterial fallback
+## is retained permanently (P3 gl_compat class). Off ⇒ the shipped unshaded materials ⇒ byte-identical. Requires
+## ORBITAL_SKY (the sun_dir source). Gate G-B3-NEARNIGHT. LIVE-ONLY LOOK. Depends B0 (curves).
+const FP_NEAR_DAYLIGHT := false
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

@@ -78,6 +78,14 @@ var _moon_ring: MoonFarRing = null           # M2 (FP_MOON_RING): the Moon's coa
 var _moon_ring_axis := Vector3.ZERO          # body-coords cull axis of the last ring build (drift-rebuild trigger)
 var _cur_sun_dir := Vector3(1.0, 0.0, 0.0)   # L3: last body-fixed Sun direction, exposed via current_sun_dir()
 const _MOON_ALBEDO_BASE := Color(0.72, 0.72, 0.70)   # shipped grey (see _build_nodes); umbra reddens toward crimson
+## ATMO2 B4: the earthshine floor for the Moon self-phase shader (§3.3, 0.10–0.12) — a crescent/new moon is a
+## faint disc, not black. Replaces the shipped flat 0.02 `ambient` ONLY under FP_MOON_PRESENCE.
+const MOON_EARTHSHINE := 0.11
+## ATMO2 B4 twin: the Moon impostor's disc-mean luminance under the self-phase shader ALBEDO =
+## base·(earthshine + (1−earthshine)·lit). lit = disc-integrated illuminated fraction (full=1, new=0). Pins the
+## §3.5 budget: full-moon ≥ 0.4, new-moon ≥ the earthshine floor (never the black-on-black bug at 0.02).
+static func moon_disc_luminance(illum_frac: float, earthshine: float) -> float:
+	return _MOON_ALBEDO_BASE.get_luminance() * (earthshine + (1.0 - earthshine) * clampf(illum_frac, 0.0, 1.0))
 ## The active sky placement radius (blocks), resolved ONCE in _build_nodes: the derived R-safe value under
 ## FP_SKY_DSKY_R, else the shipped literal D_SKY (byte-identical). Everything downstream reads this, never D_SKY.
 var _dsky := D_SKY
@@ -167,10 +175,16 @@ shader_type spatial;
 render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, shadows_disabled;
 uniform vec3 glare_color : source_color = vec3(1.0, 0.95, 0.85);
 uniform float intensity = 1.0;
+// B1 (FP_SUN_APPARENT): tight=0 ⇒ the shipped single-lobe falloff (byte-identical); tight=1 ⇒ a bright
+// tight core (~1.5 disc radii @ ~0.9 over a 5-radii quad ⇒ r≈0.3) PLUS a soft wide skirt (to the 5-radii edge).
+uniform float tight = 0.0;
 void fragment() {
-	float r = length(UV - vec2(0.5)) * 2.0;   // 0 at centre → 1 at the quad edge
-	float a = smoothstep(1.0, 0.0, r);
-	a *= a;                                     // sharpen the falloff toward a bright core
+	float r = length(UV - vec2(0.5)) * 2.0;   // 0 at centre → 1 at the quad edge (5 disc radii)
+	float a_ship = smoothstep(1.0, 0.0, r);
+	a_ship *= a_ship;                           // sharpen the falloff toward a bright core
+	float core = smoothstep(0.30, 0.0, r) * 0.9;    // 0.9 at centre → 0 at ~1.5 disc radii
+	float skirt = smoothstep(1.0, 0.0, r) * 0.35;   // soft additive skirt out to the quad edge
+	float a = mix(a_ship, max(core, skirt), tight);
 	ALBEDO = glare_color * a * intensity;
 }
 """
@@ -195,6 +209,11 @@ uniform float r_outer = 7139.0;
 uniform float h_scale = 128.0;
 uniform float term_mu = 0.12;
 uniform float gain = 1.6;
+// B2 (FP_ATMO_PATH_SHELL): path_norm=0 ⇒ the shipped single-sample strength·gain (byte-identical); path_norm=1
+// ⇒ a bounded, budget-normalized limb intensity (peak ≈0.35) so the sky is never blown cyan-white.
+uniform float path_norm = 0.0;
+uniform float peak_l = 0.95;
+uniform float sat = 15.0;
 uniform vec3 rayleigh_blue : source_color = vec3(0.15, 0.38, 0.92);
 float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
 vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
@@ -220,7 +239,10 @@ void fragment() {
 		float mu = dot(xhat, normalize(sun_dir));
 		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
 		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
-		float l = strength * _day(mu) * gain;
+		// B2: bound the single-sample overestimate to the §3.5 budget (peak ≈0.35) via a saturating transform.
+		float l_ship = strength * gain;
+		float l_path = peak_l * (1.0 - exp(-strength / sat));
+		float l = mix(l_ship, l_path, path_norm) * _day(mu);
 		ALBEDO = rayleigh_blue * tint * l;
 	}
 }
@@ -370,6 +392,23 @@ static func day_factor(mu: float) -> float:
 static func shell_day_shade(mu: float) -> float:
 	return SHELL_NIGHT_FLOOR + (1.0 - SHELL_NIGHT_FLOOR) * day_factor(mu)
 
+## ATMO2 B3 (§2.3/§3.3): the NEAR-FIELD night floor (0.10) and the near-field moonshine gain (retuned 0.5→0.15
+## to compose with the floor, §3.3). Separate from SHELL_NIGHT_FLOOR (0.06) and MOONSHINE_GAIN (0.5, ambient) so
+## those stay byte-identical; the near field is slightly brighter at night than the far shell (foreground readability).
+const NEAR_NIGHT_FLOOR := 0.10
+const NEAR_MOONSHINE_GAIN := 0.15
+
+## ATMO2 B3 C-NEAR twin: the absolute day/night shade multiplied onto the unshaded near materials at surface
+## direction cosine mu = normalize(MODEL·v)·ŝ. shade = max(night_floor + (1−night_floor)·day(mu), moonshine).
+## EQUALS shell_day_shade at the same surface point up to the floor difference (near/far agree by construction),
+## so the pilot's near/far night split is killed. noon (mu=1) ⇒ 1; sun below the terminator ⇒ the night floor.
+static func near_shade(mu: float, moonshine_term: float) -> float:
+	return maxf(NEAR_NIGHT_FLOOR + (1.0 - NEAR_NIGHT_FLOOR) * day_factor(mu), clampf(moonshine_term, 0.0, 1.0))
+
+## ATMO2 B3: the near-field moonshine term (composes into near_shade): gain·illum·moon_up·night_authority, ≤1.
+static func near_moonshine(illum_frac: float, moon_up: float, night_authority: float) -> float:
+	return NEAR_MOONSHINE_GAIN * clampf(illum_frac, 0.0, 1.0) * clampf(moon_up, 0.0, 1.0) * clampf(night_authority, 0.0, 1.0)
+
 ## A4 Moon self-phase twin: the disc-integrated lit fraction of a Lambert sphere at phase-cosine cos_phase
 ## (cos of the sun–observer angle seen from the Moon) = (1+cos_phase)/2 — EXACTLY EPH.illuminated_fraction,
 ## so the unshaded per-fragment Lambert shader and the ephemeris agree by construction (gate G-AS-ABSLIGHT).
@@ -414,6 +453,98 @@ static func shell_limb_color(mu: float, chord: float, h_min: float) -> Color:
 	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
 	var l := strength * day_factor(mu) * SHELL_LIMB_GAIN
 	return Color(base.r * l, base.g * l, base.b * l)
+
+## ATMO2 B2 (§2.4/§3.3): the peak limb intensity cap (the `l`-factor ceiling; base RAYLEIGH_BLUE luminance ≈
+## 0.37 ⇒ peak output luminance ≈ 0.34 ≤ the §3.5 budget of 0.35) and the saturation scale of the optical
+## column (tuned so the surface horizon band lands ≈0.2–0.3). These BOUND the single-sample overestimate.
+const SHELL_PEAK_L := 0.95
+const SHELL_SAT := 15.0
+
+## ATMO2 B2: the BOUNDED atmosphere-shell colour. Same base×tint as shell_limb_color, but the strength is a
+## SATURATING transform of the single-sample optical column (chord·ρ(h_min)/H) so it can never blow past the
+## §3.5 budget (peak-limb ≈0.35, surface horizon band ≈0.2–0.3), monotone in the optical path, →0 on the night
+## side. The GLSL twin mixes to this via `path_norm=1`. Colour = the shared scatter_tint/band (= surface path-T⃗).
+static func shell_limb_color_path(mu: float, chord: float, h_min: float) -> Color:
+	var ss := chord * exp(-maxf(h_min, 0.0) / H_SCALE) / H_SCALE     # the shipped single-sample optical column
+	var l := SHELL_PEAK_L * (1.0 - exp(-ss / SHELL_SAT)) * day_factor(mu)   # bounded, budget-normalized, day-gated
+	var t := scatter_tint(mu)
+	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
+	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
+	return Color(base.r * l, base.g * l, base.b * l)
+
+# ---------------------------------------------------------------------------------------
+# COSMOS ATMO2 (docs/COSMOS-ATMO2-DESIGN.md §3.2) — the OPTICAL-PATH kernel. The single physical law that
+# colours the Sun disc/glare, the DirectionalLight, and (B2) the atmosphere shell. All PURE STATIC (engine-
+# free), so the gate (G-B0-PATH) drives it DIRECTLY and is flag-independent. Two scale heights are split on
+# purpose: H_SCALE=128 is the amplitude/gameplay height (fog, drag, halo thickness — unchanged, shared with
+# SN1); H_OPT is the EXTINCTION-COLOUR height, chosen so the 1:1000 world's air-mass range matches the real
+# Earth m-range the shipped τ⃗ were measured against (m_horizon≈18, m_limb≈36). One declared const buys a
+# physical white-in-space → warm-noon → red-horizon → crimson-graze sun with NO regime switch, C¹ everywhere.
+# ---------------------------------------------------------------------------------------
+
+## §3.2: the extinction-colour scale height (blocks). Deliberately << H_SCALE (see the section note).
+const H_OPT := 30.0
+## §3.2 L(m): the broadband luminance extinction coefficient (dimmer sun through more air).
+const TAU_LUM := 0.10
+
+## §3.2 ρ_opt(h) = exp(−h/H_OPT): the extinction-colour density profile (distinct from the H_SCALE fog ρ).
+static func rho_opt(h: float) -> float:
+	return exp(-h / H_OPT)
+
+## §3.2 normalizer N = H_OPT·(1−e^(−ATMO_TOP/H_OPT)): the vertical-from-ground optical column, so m=1 there.
+static func opt_norm() -> float:
+	return H_OPT * (1.0 - exp(-H_ATMO / H_OPT))
+
+## §3.2 X_horiz(h): the tangent (horizontal) half-path optical column at altitude h (blocks). r_solid = R.
+static func x_horiz(h: float, r_solid: float) -> float:
+	return rho_opt(maxf(h, 0.0)) * sqrt(PI * (r_solid + maxf(h, 0.0)) * H_OPT / 2.0)
+
+## §3.2 X_up(h,μ_v): the ascending-ray optical column. μ_v = dir·up ≥ 0. C¹; μ_v=1 ⇒ ≈H_OPT·ρ (plane-
+## parallel vertical), μ_v=0 ⇒ ≡ X_horiz (the tangent fold) — 4 ops, no erf.
+static func x_up(h: float, mu_v: float, r_solid: float) -> float:
+	var hc := maxf(h, 0.0)
+	return H_OPT * rho_opt(hc) / sqrt(mu_v * mu_v + 2.0 * H_OPT / (PI * (r_solid + hc)))
+
+## §3.2 m(cam→sun ray): the NORMALIZED optical air mass along the viewer→sun ray. 0 for a space-clear LOS,
+## ≈1 vertical-from-ground, ≈18 at the surface horizon, ≈36 through the full limb from orbit. C¹ across the
+## tangent fold (μ_v=0) and the ATMO_TOP camera crossing (ρ_opt(ATMO_TOP)≈0 makes both branches meet). A pure
+## function of (camera position, sun_dir) — NOT camera orientation — so the light it drives is orientation-
+## invariant (G-B0-PATH). `sun_dir` is unit, TOWARD the sun. Airless body ⇒ 0 (no extinction).
+static func optical_path_air_mass(cam: Vector3, sun_dir: Vector3, r_solid: float, has_atmo: bool) -> float:
+	if not has_atmo:
+		return 0.0
+	var dist := cam.length()
+	var h := dist - r_solid
+	var up := (cam / dist) if dist > 1.0e-6 else Vector3.UP
+	var mu_v := sun_dir.dot(up)                       # dir·up: +1 sun at zenith, 0 at horizon, <0 below
+	var tca := -dist * mu_v                            # signed distance to closest approach (sun_dir·(centre−cam))
+	var b2 := maxf(dist * dist - tca * tca, 0.0)
+	var b := sqrt(b2)
+	var h_min := b - r_solid                           # closest-approach altitude of the (infinite) ray
+	var x := 0.0
+	if h >= H_ATMO:
+		# Camera in space: the forward ray re-enters the atmosphere only if it heads toward the planet
+		# (tca>0) and grazes the shell (h_min<ATMO_TOP). Else the LOS is clear ⇒ m=0 (blinding white sun).
+		if tca > 0.0 and h_min < H_ATMO:
+			x = 2.0 * x_horiz(maxf(h_min, 0.0), r_solid)   # full chord through the shell (X_space)
+		else:
+			x = 0.0
+	else:
+		# Camera inside the atmosphere.
+		if mu_v >= 0.0:
+			x = x_up(h, mu_v, r_solid)                 # ascending ray out to space
+		else:
+			# Descending ray that clears the planet (fold at the tangent): X_down = 2·X_horiz(h_min) − X_up.
+			x = 2.0 * x_horiz(maxf(h_min, 0.0), r_solid) - x_up(h, absf(mu_v), r_solid)
+	return maxf(x, 0.0) / opt_norm()
+
+## §3.2 T⃗(m) = exp(−τ⃗·m): the per-channel path transmittance colour (the sun/light hue). m=0 ⇒ WHITE.
+static func path_transmittance(m: float) -> Color:
+	return Color(exp(-TAU_R * m), exp(-TAU_G * m), exp(-TAU_B * m))
+
+## §3.2 L(m) = exp(−τ_lum·m): the broadband brightness factor (1 in space, dimming toward the horizon).
+static func path_luminance(m: float) -> float:
+	return exp(-TAU_LUM * m)
 
 # ---------------------------------------------------------------------------------------
 # COSMOS-LOD-SKY task 2 (docs/COSMOS-LOD-SKY-DESIGN.md §6, §7.3) — celestial lighting statics. ALL pure
@@ -492,6 +623,14 @@ func setup(clock: EPH.CosmosClock, env: Environment = null, cam_provider: Node =
 	_clock = clock
 	_env = env
 	_cam_provider = cam_provider
+	# B1 sub-flag (FP_SUN_GLOW, §3.4): enable the Compatibility-renderer glow with a HIGH hdr threshold so ONLY
+	# the sun disc/glare (the sole ≥0.9-luminance residents of the §3.5 budget) bloom — the LDR-honest "bloom"
+	# on gl_compat. Off ⇒ the Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an env.
+	if CubeSphere.FP_SUN_GLOW and CubeSphere.FP_SUN_APPARENT and _env != null:
+		_env.glow_enabled = true
+		_env.glow_hdr_threshold = 0.92
+		_env.glow_intensity = 0.8
+		_env.glow_bloom = 0.1
 	_build_nodes()
 	_update_sky(0.0 if _clock == null else _clock.now())
 
@@ -506,6 +645,12 @@ func _build_nodes() -> void:
 	var sun_mesh := SphereMesh.new()
 	sun_mesh.radial_segments = 32
 	sun_mesh.rings = 16
+	# B1 (FP_SUN_APPARENT): Godot's SphereMesh default radius is 0.5, so _place_impostor (which scales by the
+	# requested world radius) renders the disc at HALF its intended angular size. Set radius 1.0 so the disc hits
+	# its true 2.0° floor. Off ⇒ the shipped 0.5 default ⇒ byte-identical (half-size, the shipped look).
+	if CubeSphere.FP_SUN_APPARENT:
+		sun_mesh.radius = 1.0
+		sun_mesh.height = 2.0
 	_sun.mesh = sun_mesh
 	var sun_mat := StandardMaterial3D.new()
 	sun_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
@@ -536,6 +681,10 @@ func _build_nodes() -> void:
 		_glare_mat.shader = gsh
 		_glare_mat.set_shader_parameter("glare_color", Vector3(1.0, 0.95, 0.85))
 		_glare_mat.set_shader_parameter("intensity", 1.0)
+		# B1 (FP_SUN_APPARENT): retune the glare into a tight bright core + soft skirt (tight=1); off ⇒ tight=0 =
+		# the shipped single-lobe falloff (the uniform defaults to 0.0 ⇒ byte-identical).
+		if CubeSphere.FP_SUN_APPARENT:
+			_glare_mat.set_shader_parameter("tight", 1.0)
 		_glare.material_override = _glare_mat
 		_glare.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_glare.sorting_offset = -0.5                      # sort with the additive dome, never against the opaque disc
@@ -565,6 +714,10 @@ func _build_nodes() -> void:
 	var moon_mesh := SphereMesh.new()
 	moon_mesh.radial_segments = 32
 	moon_mesh.rings = 16
+	# B1 (FP_SUN_APPARENT): same SphereMesh-0.5 fix as the Sun — restore the Moon's true 1.5° angular floor.
+	if CubeSphere.FP_SUN_APPARENT:
+		moon_mesh.radius = 1.0
+		moon_mesh.height = 2.0
 	_moon.mesh = moon_mesh
 	_moon_mat = StandardMaterial3D.new()
 	_moon_mat.albedo_color = Color(0.72, 0.72, 0.70)
@@ -582,6 +735,10 @@ func _build_nodes() -> void:
 		_moon_phase_mat.shader = msh
 		_moon_phase_mat.set_shader_parameter("base_albedo", _MOON_ALBEDO_BASE)
 		_moon_phase_mat.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		# B4 (FP_MOON_PRESENCE): raise the flat 0.02 ambient to an EARTHSHINE FLOOR so a crescent/new moon is a
+		# faint readable disc, not black-on-black. Off ⇒ the shader default 0.02 stands ⇒ byte-identical look.
+		if CubeSphere.FP_MOON_PRESENCE:
+			_moon_phase_mat.set_shader_parameter("ambient", MOON_EARTHSHINE)
 		_moon.material_override = _moon_phase_mat
 	_moon.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_moon)
@@ -643,6 +800,12 @@ func _build_nodes() -> void:
 		_atmo_shell_mat.set_shader_parameter("term_mu", TERMINATOR_MU)
 		_atmo_shell_mat.set_shader_parameter("gain", SHELL_LIMB_GAIN)
 		_atmo_shell_mat.set_shader_parameter("rayleigh_blue", Vector3(RAYLEIGH_BLUE.r, RAYLEIGH_BLUE.g, RAYLEIGH_BLUE.b))
+		# B2 (FP_ATMO_PATH_SHELL): switch the shell to the bounded budget-normalized limb intensity. Off ⇒
+		# path_norm stays 0 ⇒ the shipped single-sample strength·gain ⇒ byte-identical.
+		if CubeSphere.FP_ATMO_PATH_SHELL:
+			_atmo_shell_mat.set_shader_parameter("path_norm", 1.0)
+			_atmo_shell_mat.set_shader_parameter("peak_l", SHELL_PEAK_L)
+			_atmo_shell_mat.set_shader_parameter("sat", SHELL_SAT)
 		_atmo_shell.material_override = _atmo_shell_mat
 		_atmo_shell.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_atmo_shell.sorting_offset = -0.9                 # additive, with the dome; never sorts against the opaque discs
@@ -691,6 +854,10 @@ func _update_sky(t: float) -> void:
 	if CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE:
 		r_vox_sky = CosmosGravity.r_vox(OBSERVER)
 		occ_cam = occlusion_factor(sun_dir, cam_origin, r_vox_sky)
+	# B0 (FP_SUN_PATHLIGHT, §2.6): unify the disc/glare penumbra on pen(h) — the same altitude-widened twilight
+	# the absolute light uses — so the disc/glare and the DirectionalLight die together across the terminator.
+	if CubeSphere.FP_SUN_PATHLIGHT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
+		occ_cam = occlusion_factor_pen(sun_dir, cam_origin, r_vox_sky, pen(cam_origin.length() - r_vox_sky))
 
 	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter. A2 floors the angular
 	# size (the real 0.53° disc is an invisible ~8-px dot on gl_compat with no glare); off ⇒ the exact size.
@@ -720,18 +887,34 @@ func _update_sky(t: float) -> void:
 	# sunset sky, and drive the additive glare quad (billboarded at the Sun, brightness ×occ so it dies at
 	# sunset/eclipse/umbra). occ_cam is the same planet-occlusion the disc uses. Flag off ⇒ none of this runs.
 	if CubeSphere.FP_SUN_PRESENCE:
-		var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
-		var mu_cam := sun_dir.dot(up_s)
-		var st := scatter_tint(mu_cam)                       # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
+		# B0 (FP_SUN_PATHLIGHT): the disc/glare colour is the optical-PATH transmittance T⃗(m) along the
+		# camera→sun ray (WHITE in space, warm at noon, red at the horizon) and its brightness is L(m)·occ —
+		# NOT the camera-ELEVATION K–Y curve, which reddened the sun in vacuum. Off ⇒ the shipped K–Y path.
+		var st: Color
+		var lum := 1.0
+		if CubeSphere.FP_SUN_PATHLIGHT:
+			var r_ps := r_vox_sky if r_vox_sky > 0.0 else CosmosGravity.r_vox(OBSERVER)
+			var m_sun := optical_path_air_mass(cam_origin, sun_dir, r_ps, OrbitalState.has_atmo(OBSERVER))
+			st = path_transmittance(m_sun)
+			lum = path_luminance(m_sun)
+		else:
+			var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+			var mu_cam := sun_dir.dot(up_s)
+			st = scatter_tint(mu_cam)                        # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
 		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
 		if _sun_mat != null:
 			_sun_mat.emission = reddened
 			_sun_mat.albedo_color = reddened
+			if CubeSphere.FP_SUN_PATHLIGHT:
+				# Disc core stays white×T⃗; energy ∝ L(m)·occ so it is blinding in space, dim-red at sunset,
+				# gone in the umbra (the impostor is a crisp disc, not the K–Y-dimmed blob).
+				_sun_mat.emission_energy_multiplier = 8.0 * lum * maxf(occ_cam, 0.0)
 		if _glare != null:
 			_place_glare(sun_pos, sun_r * CubeSphere.SUN_GLARE_RADII, cam_origin)
-			_glare_mat.set_shader_parameter("intensity", occ_cam)
+			var glare_i := (lum * occ_cam) if CubeSphere.FP_SUN_PATHLIGHT else occ_cam
+			_glare_mat.set_shader_parameter("intensity", glare_i)
 			_glare_mat.set_shader_parameter("glare_color", Vector3(reddened.r, reddened.g, reddened.b))
-			_glare.visible = occ_cam > 0.001
+			_glare.visible = glare_i > 0.001
 
 	# A1 (FP_SKY_PLANET_OCCLUDE): hide the Sun/Moon impostors when the planet disc covers their direction (once A0
 	# renders the planet at d≫D_SKY the opaque discs would otherwise draw IN FRONT of it). occlusion_factor==0
@@ -813,10 +996,12 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	var occ_on := CubeSphere.SN_SUN_OCCLUSION
 	var atmo_zero := CubeSphere.FP_ATMO_SPACE_ZERO           # A3: atmo_vis replaces the space_mix band
 	var light_abs := CubeSphere.FP_LIGHT_ABSOLUTE           # A4: absolute occ-always light + ambient
+	var path_light := CubeSphere.FP_SUN_PATHLIGHT           # B0: optical-path T⃗(m)·L(m) light colour/energy
+	var fog_arb := CubeSphere.FP_FOG_ARBITER                # B5: fog fades with atmo_vis + fog_depth_end tracks far
 	var h := 0.0
 	var r_vox := 0.0
 	var has_atmo := true
-	if atmo_on or occ_on or atmo_zero or light_abs:
+	if atmo_on or occ_on or atmo_zero or light_abs or path_light or fog_arb:
 		r_vox = CosmosGravity.r_vox(OBSERVER)
 		h = cam_origin.length() - r_vox                      # radial altitude above the voxel surface
 		has_atmo = OrbitalState.has_atmo(OBSERVER)
@@ -842,7 +1027,14 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	# T(μ) sunset-reddened colour — the dark side stays dark from EVERY camera (supersedes the SN4b authority
 	# lerp). Else SN4b's occlusion_light (authority-blended). Both OUTSIDE the `_env == null` guard — the light
 	# must dim without an Environment. Flag-off ⇒ light_energy/colour never touched (shipped 1.0 / white).
-	if light_abs:
+	if path_light:
+		# B0 (FP_SUN_PATHLIGHT): colour = T⃗(m) over the camera→sun optical path (WHITE in space, warm at noon,
+		# red at the horizon); energy = occ(pen(h)) · L(m). Supersedes A4's K–Y colour on the live light — the
+		# sunset reddening now comes from the physical path, matching the disc, the shell, and the near field.
+		var m_l := optical_path_air_mass(cam_origin, sun_dir, r_vox, has_atmo)
+		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox) * path_luminance(m_l)
+		_sun_light.light_color = path_transmittance(m_l)
+	elif light_abs:
 		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox)
 		_sun_light.light_color = scatter_tint(maxf(elev, 0.0))
 	elif occ_on:
@@ -857,7 +1049,17 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 		# A3: black is reached exactly at ATMO_TOP (sm=1), so the space sky is star-black with NO day/night leak.
 		sky = sky.lerp(Color.BLACK, sm)
 		ambient *= ambient_scale(sm)
-		_env.fog_density = fog_density_at(h, has_atmo)
+		# B5 (FP_FOG_ARBITER): depth fog IS the atmosphere — fade it with atmo_vis(h) so it reaches 0 at ATMO_TOP
+		# (else the shipped ρ(h) leaves ~5% haze at the ceiling that paints the deep-space planet). Off ⇒ shipped ρ(h).
+		var fd := fog_density_at(h, has_atmo)
+		if fog_arb:
+			fd *= atmo_vis(h, has_atmo)
+		_env.fog_density = fd
+	# B5 (FP_FOG_ARBITER): track the A0-ramped camera far so a deep-space planet fragment is never beyond
+	# fog-end (which the night ramp drives toward black). main.gd pins it at CAMERA_FAR·0.98; here it grows with
+	# altitude exactly as CosmosScale.camera_far does. Off ⇒ never written (the static main.gd value stands).
+	if fog_arb and CubeSphere.FP_SN3_MAIN_LIVE:
+		_env.fog_depth_end = CosmosScale.camera_far(cam_origin.length(), r_vox) * 0.98
 	# Ambient umbra factor: A4's absolute dimmer (continuous, no authority — the surface night side is dark
 	# too, restoring the pre-ORBITAL ambient-only night), else SN4b's altitude-authority occlusion_ambient.
 	if light_abs:

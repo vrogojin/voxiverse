@@ -140,6 +140,11 @@ var _dev_orbital_commit := false
 # (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
 var _fall_v_bci := PackedFloat64Array()
 var _fall_have_v := false
+# G-LANDING FIX (SN_FOFF_RADIAL_FALL) — one-shot latch set by the EXPLICIT F flight-off toggle. The next
+# free-fall seed keeps only the RADIAL component of the flight velocity (quit-flying = commit to landing);
+# automatic regime transitions never set it, so their SN-R1 velocity continuity is untouched. DEAD (never
+# consumed) with the flag off.
+var _foff_radial := false
 # COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — the O free-coast state. `_orbit_coasting` is set by the O toggle in
 # LOW/HIGH orbit; while true, each physics frame integrates `_coast_v_bci` under GM_dyn/r² gravity (the shared
 # Kepler coast, seeded tangential by O) and re-projects to the lattice `position` — a stable circular seed holds
@@ -558,6 +563,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				else:
 					flying = not flying
 					velocity = Vector3.ZERO
+					if not flying:
+						_foff_radial = true                  # G-LANDING: explicit flight-off = land-commit latch
 					# Fly is a GUARANTEED escape hatch: while airborne the capsule is
 					# disabled so no loose body can collide with (and therefore shove or
 					# wedge) the player. Re-enabled on landing. See _move_horizontal.
@@ -740,6 +747,14 @@ func camera_lattice_origin() -> Vector3:
 ## and falls back to the CharacterBody3D lattice speed when the nav machine is off (SN_NAV_MODES false ⇒ empty
 ## `_nav_tele`). Pure read; no state.
 func nav_speed_bci() -> float:
+	# G-LANDING HUD FIX (2026-07-20 live pilot: a LANDED player read "spd 14.5" forever — the ω×r spin carrier,
+	# because raw |v_bci| never reads 0 on a rotating planet). Prefer the MODE-appropriate frame speed the nav
+	# machine already computes (`frame_v` = CosmosNav.hud_velocity): PLANETARY ⇒ surface (body-fixed) speed —
+	# carrier-subtracted, 0 when standing; LOW/HIGH ⇒ |v_bci| exactly as before; DEEP ⇒ heliocentric. Falls back
+	# to |v_bci| then the lattice speed when the machine is off. HUD-only (the RemoteBridge telemetry keeps BOTH
+	# frame_v and v_bci fields unchanged).
+	if _nav_tele.has("frame_v"):
+		return float(_nav_tele["frame_v"])
 	if _nav_tele.has("v_bci"):
 		return float(_nav_tele["v_bci"])
 	return velocity.length()
@@ -802,6 +817,8 @@ func _toggle_dev_nav() -> void:
 	_dev_nav = not _dev_nav
 	flying = _dev_nav
 	velocity = Vector3.ZERO
+	if not _dev_nav:
+		_foff_radial = true                                  # G-LANDING: explicit flight-off = land-commit latch
 	_dev_have_v = false
 	_dev_active = false
 	_dev_orbital_commit = false                              # SN-FIX #3: entering/leaving dev-nav is never mid-orbit
@@ -920,6 +937,21 @@ static func fall_seed(last_v_bci: PackedFloat64Array) -> PackedFloat64Array:
 		return PackedFloat64Array([last_v_bci[0], last_v_bci[1], last_v_bci[2]])
 	return PackedFloat64Array([0.0, 0.0, 0.0])
 
+## G-LANDING (SN_FOFF_RADIAL_FALL) — the RADIAL projection of a fall seed: v_radial = (v·r̂)·r̂ with r̂ = p/|p|
+## (BCI). Applied ONLY when the pilot EXPLICITLY toggles flight off (the `_foff_radial` latch): quitting flight
+## commits to a fall toward the planet centre — the tangential/orbital component is dropped so the descent
+## lands instead of coasting sideways for minutes ("gravity not properly reinstantiated" live report). Both
+## radial signs are preserved (an upward component still decelerates under gravity — no impulse toward the
+## planet is injected, only the sideways coast is removed). Degenerate p ⇒ the seed unchanged. Pure static.
+static func fall_seed_radial(seed: PackedFloat64Array, p_bci: PackedFloat64Array) -> PackedFloat64Array:
+	if seed.size() != 3 or p_bci.size() != 3:
+		return seed
+	var r := _DVCls.length(p_bci)
+	if r <= 0.0:
+		return seed
+	var rhat := _DVCls.scale(p_bci, 1.0 / r)
+	return _DVCls.scale(rhat, _DVCls.dot(seed, rhat))
+
 ## SN-FIX #3 — one free-fall tick: integrate the planet-centred point-mass gravity (GM_dyn/r², velocity-Verlet
 ## via OrbitalState) in the BCI frame and re-project to the lattice `position`. Seeded on entry from the last
 ## flight velocity (continuous). NO surface-rotation drag (BCI is inertial). Off-facet ⇒ a straight-down lattice
@@ -936,6 +968,15 @@ func _free_fall_move(delta: float) -> void:
 		return
 	if not _fall_have_v:
 		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
+		# G-LANDING (SN_FOFF_RADIAL_FALL): the pilot EXPLICITLY quit flight (F latch) ⇒ commit to landing —
+		# keep only the radial component so the fall goes DOWN, not into a sideways coast. Automatic regime
+		# entries never set the latch ⇒ their seed stays fully continuous (SN-R1). Flag off ⇒ latch unread.
+		if CubeSphere.SN_FOFF_RADIAL_FALL and _foff_radial:
+			var wsd: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+			var psd: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock,
+				_DVCls.v(wsd[0], wsd[1], wsd[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+			_fall_v_bci = fall_seed_radial(_fall_v_bci, psd)
+		_foff_radial = false
 		_fall_have_v = true
 	_fall_v_bci = _coast_step(delta, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
 	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
@@ -1274,6 +1315,10 @@ func _move(delta: float) -> void:
 	if CubeSphere.SN_NO_CEILING_BOUNCE and CubeSphere.FACETED and free_fall_regime(flying, radial_altitude(), true):
 		_free_fall_move(delta)
 		return
+	# G-LANDING (SN_FOFF_RADIAL_FALL) latch hygiene: reaching the surface-walk regime FULFILS any pending
+	# land-commit — clear the one-shot latch so an F-off made on the ground can never leak into a much-later
+	# AUTOMATIC free-fall seed (whose SN-R1 velocity continuity must stay untouched). Inert bookkeeping off-flag.
+	_foff_radial = false
 	if _fall_have_v:
 		# Leaving free-fall (dropped below the ceiling): seed velocity.y from the BCI fall velocity so the surface
 		# walk's gravity continues from the true downward speed — a continuous flight→fall→surface handoff.

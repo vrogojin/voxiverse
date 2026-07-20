@@ -943,6 +943,15 @@ const SN_NO_CEILING_BOUNCE := false
 ## actually keeps up (no storm) needs a live re-fly — the gate proves the descent is braked, not that the
 ## generator wins. Follow-up if braking alone is insufficient: pre-generate the landing column during the fall.
 const SN_ATMO_BRAKING := false
+## G-LANDING FIX (2026-07-20 live pilot: "gravity not properly reinstantiated when quitting orbiting and
+## flight mode") — the F-OFF LAND-COMMIT verb. With the flag ON, toggling FLIGHT OFF (F) treats the exit as
+## an explicit "quit flying, take me down": the free-fall seed keeps ONLY the RADIAL component of the last
+## flight velocity (the tangential/orbital part is dropped), so the pilot falls toward the planet centre and
+## LANDS instead of retaining a shallow tangential coast that spirals for minutes. Scoped to the EXPLICIT F
+## toggle only — automatic regime transitions (ceiling handoffs, walk→fall) keep full velocity continuity
+## (SN-R1), and the O free-coast remains the way to KEEP an orbit. Default FALSE ⇒ byte-identical (the latch
+## is never consumed; the shipped continuous seed is byte-for-byte). Gate G-LANDING-FOFF (verify_landing).
+const SN_FOFF_RADIAL_FALL := false
 ## SN-BRAKE descent terminal speed (blocks/s) — the speed a re-entry brakes to below ATMO_TOP. Set to 20 for
 ## the natural 1:1000 model: datum gravity is now 9.8 (≈5× weaker than the old 72×-model 50.9), so k0 =
 ## datum_gravity/ATMO_BRAKE_TERMINAL² is smaller and the drag relaxes SLOWER over the fixed 384-block band

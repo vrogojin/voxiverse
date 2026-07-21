@@ -26,6 +26,14 @@ const MAX_COLUMN_UPDATES := 32      ## per step, within the tile
 const MAX_CELL_WRITES := 32         ## HARD per-step cell-write cap (⇒ ≤ ~4 block remeshes)
 const MAX_STEPS_PER_FRAME := 4      ## anti-spiral clamp: never run more than this many fixed steps in one _process
 
+# --- COSMOS-PERF UNATTENDED R2 (FP_SNOW_SLICED): de-burst the on-ground step (§2.2 W2) ----------------
+const SLICE_COLUMNS := 8            ## per-frame column slice when FP_SNOW_SLICED — the 0.5 s step (≤32 cols) is
+                                    ## drained SLICE_COLUMNS/frame (≤4 frames @ ≤32 cols) so no frame does the burst
+const SNOW_SLICED_EDIT_CAP := 64_000  ## lower snow-`_edits` ceiling under FP_SNOW_SLICED (W4 coordination): bounds the
+                                    ## session's snow trail so a crossing's O(all edits) index scan can't grow without
+                                    ## bound. Well above the ~10-20k near-footprint; NEVER-OOM (a hard cap, existing
+                                    ## snow still evolves). Flag-off uses SNOW_EDIT_BUDGET verbatim (byte-identical).
+
 # --- the per-step rule constants (§4.3) ----------------------------------------
 const SNOW_STORM_EXTRA := 6         ## a storm may pile D up to D_baseline + this many tenths above the static baseline
 const WEATHER_THRESHOLD := 0.25     ## is_snowing where the salted weather noise exceeds this
@@ -48,6 +56,15 @@ var _weather: FastNoiseLite
 var _accum: float = 0.0
 var _budget_logged: bool = false
 
+# --- FP_SNOW_SLICED drain state (a step in progress, spread across frames) ---------------------------
+var _slice_active: bool = false          ## a fixed step is mid-drain (its columns not all processed yet)
+var _slice_cols: Array[Vector2i] = []    ## the ordered columns of the in-progress step (== step_now's sequence)
+var _slice_idx: int = 0                  ## how many of _slice_cols have been processed so far
+var _slice_writes: int = 0               ## writes accumulated across the in-progress step (honours MAX_CELL_WRITES)
+var _slice_dirty: bool = false           ## kept for symmetry with step_now (a write happened ⇒ one ground rebuild)
+var _slice_player_col: Vector2i = Vector2i.ZERO  ## player column snapshotted at step-begin (held for the whole drain)
+var last_slice_cols: int = 0             ## columns processed in the most recent sliced process() call (gate bound)
+
 func setup(wm: WorldManager) -> void:
 	world = wm
 	_snow_id = BlockCatalog.id_of(&"snow_block")
@@ -67,15 +84,106 @@ func setup(wm: WorldManager) -> void:
 func process(delta: float, player_pos: Vector3) -> void:
 	if world == null:
 		return
+	var player_col := Vector2i(int(floor(player_pos.x)), int(floor(player_pos.z)))
+	if CubeSphere.FP_SNOW_SLICED:
+		process_sliced(delta, player_col)   # R2: de-burst — one step at a time, drained SLICE_COLUMNS/frame
+		return
 	_accum += delta
 	var steps := 0
 	while _accum >= STEP_SECONDS and steps < MAX_STEPS_PER_FRAME:
 		_accum -= STEP_SECONDS
 		steps += 1
-		step_now(Vector2i(int(floor(player_pos.x)), int(floor(player_pos.z))))
+		step_now(player_col)
 	# Drop any backlog beyond the clamp so we don't spiral on the next frame.
 	if _accum >= STEP_SECONDS:
 		_accum = fmod(_accum, STEP_SECONDS)
+
+# --- COSMOS-PERF UNATTENDED R2 (§2.2): the sliced, hitch-decoupled game loop -------------------------
+
+## FP_SNOW_SLICED replacement for the burst accumulator. Semantics vs the shipped path:
+##   (a) NO catch-up — when the accumulator crosses STEP_SECONDS with no step in flight, EXACTLY ONE step is
+##       started and any backlog is discarded (a hitch can never queue more steps → no self-rescheduling).
+##   (b) SLICE — the started step's ≤MAX_COLUMN_UPDATES columns are drained SLICE_COLUMNS per frame; the single
+##       per-step ground rebuild + the step_counter advance happen only when the LAST column is processed.
+## The per-step column set, order, write cap and outcome are IDENTICAL to `step_now` for the same
+## (step_counter, player_col) — the sim result over time is byte-equal to the burst path; only the per-frame
+## cost is flattened. This method is the direct entry the gate drives (it does not itself read the flag, so it
+## is exercisable in the default flag-off build).
+func process_sliced(delta: float, player_col: Vector2i) -> void:
+	last_slice_cols = 0
+	if world == null:
+		return
+	_accum += delta
+	# (a) At most ONE step becomes due per drain; discard hitch backlog so a long frame doesn't schedule bursts.
+	if not _slice_active and _accum >= STEP_SECONDS:
+		_accum -= STEP_SECONDS
+		if _accum >= STEP_SECONDS:
+			_accum = fmod(_accum, STEP_SECONDS)   # drop the backlog (a 2 s hitch runs ONE step, not four)
+		_begin_step(player_col)
+	# (b) Drain up to SLICE_COLUMNS columns of the in-progress step this frame.
+	if _slice_active:
+		_drain_slice()
+
+## Snapshot the current step (same setup as step_now: rotating tile + in-radius columns + rotation window) into
+## _slice_cols and arm the drain. An EMPTY step (no tiles / no in-radius columns) advances step_counter at once,
+## exactly like step_now's early returns, and never arms.
+func _begin_step(player_col: Vector2i) -> void:
+	_slice_player_col = player_col
+	_slice_writes = 0
+	_slice_dirty = false
+	_slice_idx = 0
+	last_writes = 0
+	last_step_cells.clear()
+	_slice_cols = _ordered_step_columns(player_col)
+	if _slice_cols.is_empty():
+		step_counter += 1          # empty step: matches step_now's tiles/cols early-return (no rebuild)
+		return
+	_slice_active = true
+
+## Process the next SLICE_COLUMNS columns of the in-progress step (honouring the MAX_CELL_WRITES per-step cap,
+## exactly as step_now's loop break). When the last column is done: one debounced ground rebuild iff anything
+## was written, advance step_counter, disarm.
+func _drain_slice() -> void:
+	var processed := 0
+	while _slice_idx < _slice_cols.size() and processed < SLICE_COLUMNS:
+		if _slice_writes >= MAX_CELL_WRITES:
+			_slice_idx = _slice_cols.size()   # write cap hit: skip the rest, exactly like step_now's `break`
+			break
+		var col: Vector2i = _slice_cols[_slice_idx]
+		_slice_writes += _process_column(col.x, col.y, _slice_player_col)
+		_slice_idx += 1
+		processed += 1
+	last_slice_cols = processed
+	if _slice_idx >= _slice_cols.size():
+		last_writes = _slice_writes
+		if _slice_writes > 0:
+			world.sim_ground_rebuild()        # ONE rebuild per step, at the END of the drain (as step_now)
+		step_counter += 1
+		_slice_active = false
+
+## The ordered column sequence a step would visit for the current step_counter + player_col — transcribed from
+## step_now so the sliced drain reproduces its writes exactly. Returns [] for an empty step (no tiles / cols).
+func _ordered_step_columns(player_col: Vector2i) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var tiles := _tiles_for(player_col)
+	if tiles.is_empty():
+		return out
+	var ti := step_counter % tiles.size()
+	var rotations := step_counter / tiles.size()
+	var cols := _in_radius_columns(tiles[ti], player_col)
+	if cols.is_empty():
+		return out
+	var start := (rotations * MAX_COLUMN_UPDATES) % cols.size()
+	var n := mini(MAX_COLUMN_UPDATES, cols.size())
+	for k in range(n):
+		out.append(cols[(start + k) % cols.size()])
+	return out
+
+## The active snow-`_edits` ceiling: lowered under FP_SNOW_SLICED (W4 — keep the per-crossing edit-index scan
+## bounded over a long session), the shipped budget otherwise (byte-identical). Pure of instance state so the
+## gate can assert both arms.
+static func edit_budget(sliced: bool) -> int:
+	return SNOW_SLICED_EDIT_CAP if sliced else SNOW_EDIT_BUDGET
 
 # --- one deterministic fixed step (§4.2) ---------------------------------------
 
@@ -198,7 +306,7 @@ func _grow_cell(cell: Vector3i, newv: int, player_col: Vector2i) -> bool:
 		return false                                      # baseline-equal: never written (persist-cost-free)
 	var had := world.has_edit(cell)
 	if not had:
-		if snow_cells >= SNOW_EDIT_BUDGET:
+		if snow_cells >= edit_budget(CubeSphere.FP_SNOW_SLICED):
 			_log_budget()
 			return false                                  # at cap: stop ADDING columns (existing ones evolve)
 		snow_cells += 1
@@ -220,7 +328,7 @@ func _melt_cell(cell: Vector3i, newv: int) -> bool:
 		return false                                      # already at baseline: no change
 	var had := world.has_edit(cell)
 	if not had:
-		if snow_cells >= SNOW_EDIT_BUDGET:
+		if snow_cells >= edit_budget(CubeSphere.FP_SNOW_SLICED):
 			return false
 		snow_cells += 1
 	world._write_cell(cell, newc)
@@ -246,8 +354,9 @@ func _log_budget() -> void:
 	if _budget_logged:
 		return
 	_budget_logged = true
-	push_warning("[SnowfallSystem] snow-edit budget (%d cells) reached — no longer ADDING snow columns; existing snow still evolves, player edits untouched." % SNOW_EDIT_BUDGET)
-	print("[SnowfallSystem] snow-edit BUDGET reached (%d cells) — freezing the accumulation footprint." % SNOW_EDIT_BUDGET)
+	var cap := edit_budget(CubeSphere.FP_SNOW_SLICED)
+	push_warning("[SnowfallSystem] snow-edit budget (%d cells) reached — no longer ADDING snow columns; existing snow still evolves, player edits untouched." % cap)
+	print("[SnowfallSystem] snow-edit BUDGET reached (%d cells) — freezing the accumulation footprint." % cap)
 
 # --- reading the dynamic column state ------------------------------------------
 

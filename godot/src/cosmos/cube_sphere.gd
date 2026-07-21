@@ -725,6 +725,21 @@ const SHELL_FALL_REEMIT_MS := 1000    # min wall-ms between throttled off-surfac
 ## on landing, no spiral: delta is not accumulated while skipped). Byte-identical off. Gate G-SNOW-AIRBORNE (verify_snow_airborne.gd).
 const FP_SNOW_SKIP_AIRBORNE := false
 
+## COSMOS-PERF FALL-COLLAPSE FIX D — R1 "true warm budget" (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §2.1/§4 R1, item W1;
+## the ROOT of the sh_wfail thrash in ALL modes — walk, fly, fall). The shipped FacetFarRing._warm_front charges the
+## WHOLE 6·K² = 3456-facet front-visibility SCAN against the 3 ms WARM_BUDGET_MS: the per-fid budget check fires even
+## when nothing needs warming, so on web (×25 GDScript) the scan alone exceeds 3 ms and _warm_front returns false
+## FOREVER — even when every facet is already cached. `done`/`_srf_converged`/`_orbit_converged` NEVER become true →
+## the idle short-circuits are unreachable → ~3 ms/frame is burned + the deferred re-emit never fires (`_pending` never
+## consumed) in EVERY mode, including a flat ground walk with zero crossings (measured p50 21 fps, sh_wfail +3.5/frame).
+## FIX (R1): budget only the REAL warm WORK (time spent in _ensure_cached), NOT the read-only scan, and return true the
+## moment a full scan finds nothing uncached — regardless of elapsed time. The scan also goes O(visible) via a
+## precomputed packed centre-dir array (no per-fid _centre_dir dict lookup). `done` then becomes reachable, so the warm
+## CONVERGES (within ~2 s of any drift) and FP_SHELL_ORBIT_IDLE / FP_SHELL_FALL_HOLD can finally idle the scan (sh_wfail
+## flatlines). Byte-identical off (callers use the shipped _warm_front verbatim). Rides with FP_SHELL_ORBIT_IDLE +
+## FP_SHELL_FALL_HOLD at deploy. Gate G-WARM-TRUE-BUDGET (verify_shell.gd).
+const FP_WARM_TRUE_BUDGET := false
+
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
 ## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the

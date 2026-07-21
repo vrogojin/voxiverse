@@ -753,6 +753,27 @@ const FP_WARM_TRUE_BUDGET := false
 ## edit-index scan (W4) without bound (NEVER-OOM: a hard cap; existing snow still evolves). Default FALSE ⇒
 ## `process` uses the shipped burst accumulator verbatim ⇒ BYTE-IDENTICAL. Gate G-SNOW-SLICED (verify_snow_sliced.gd).
 const FP_SNOW_SLICED := false
+## COSMOS-PERF UNATTENDED R3 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §0-W3 / §5 R3) — the ALTITUDE REGIME GATE.
+## In orbit/fall (draws ≈ 30 = only the shell + sky on screen) the whole near-field active-facet machinery still
+## churns every physics tick: the ground track sweeps facets, so maybe_cross_facet commits redesignations (up to
+## ~10/s), each doing a full _rebuild_window_indices scan (O(all edits) — up to 200 k snow cells), a one-frame
+## 128→96 view SHRINK SNAP (block-unload burst → the wasm dlmalloc convoy), a gravity/collider/far-ring resync,
+## plus per-tick _manage_facet_pool churn — NONE of it visible from 150 km up. This is the fall's phys_ms 160–228 ms.
+## FP_ALT_REGIME FREEZES that invisible work above ATMO_TOP (the "ORBITAL" regime, radial altitude vs ATMO_TOP with
+## ALT_REGIME_HYST hysteresis): maybe_cross_facet returns early (facet frozen — no redesignation / window-rebuild /
+## shrink-snap / gravity / collider), _manage_facet_pool is suspended (targets held), and the main-thread snow step is
+## gated off (composes with FP_SNOW_SKIP_AIRBORNE). The shell/sky (what IS on screen) keeps updating — only the near
+## field freezes. On DESCENT back below the gate (re-entry) exactly ONE redesignation restores the near field onto the
+## true sub-camera facet (FacetAtlas.facet_of_dir) so a landing has terrain — the player pose heals losslessly via
+## _heal_frame_desync + the returned crossing dict, and FP_LANDING_STREAM_KICK then grows the near view for touchdown.
+## NEVER-OOM: pure state gate, no new retained buffers. Default FALSE ⇒ BYTE-IDENTICAL (every read is flag-gated; the
+## regime never leaves SURFACE, no early return fires). Gate: verify_alt_regime.gd (scripted fall altitude-sweep). Bake
+## ON at export after the browser A/B. Requires FACETED = true.
+const FP_ALT_REGIME := false
+## Hysteresis half-band (blocks) about ATMO_TOP for the regime latch: enter ORBITAL above ATMO_TOP + ALT_REGIME_HYST,
+## return to SURFACE below ATMO_TOP − ALT_REGIME_HYST. Prevents regime flapping (and re-entry redesignation churn) when
+## the radial altitude jitters across the 384-block ceiling during a grazing pass.
+const ALT_REGIME_HYST := 32.0
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),

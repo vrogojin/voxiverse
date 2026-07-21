@@ -71,7 +71,6 @@ void fragment() {
 	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
 	vec4 t = texture(atlas_tex, UV);
 	ALBEDO = v_col.rgb * t.rgb * shade;
-	ALPHA = t.a;
 }
 "
 var grid := Vector2i(GRID, GRID)              # atlas_size_in_tiles the cube models are configured with

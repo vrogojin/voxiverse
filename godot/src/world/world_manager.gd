@@ -2067,8 +2067,11 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 	if _fixed_frame_on():
 		# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
 		#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
-		#    planet-absolute space. O(1) — never terrain.
-		_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
+		#    planet-absolute space. O(1) — never terrain. (Null-guard: _fixed_frame_on() is a pure flag read, but the
+		#    ActiveFrame node is only built once _ready runs — a redesignation raced before that, e.g. a headless
+		#    harness driving the crossing pre-_ready, must not crash; the live game always has it, so byte-identical.)
+		if _active_frame != null:
+			_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
 		# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
 		#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
 		#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);

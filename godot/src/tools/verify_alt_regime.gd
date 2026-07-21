@@ -19,10 +19,20 @@ extends SceneTree
 ##     scheme, flag on or off, must converge to) AND the near field is present (solid terrain under the player).
 ## With FP_ALT_REGIME OFF it asserts the machine is fully inert (no freeze, zero restores) — the byte-identical baseline.
 ##
-## RUN (needs FACETED = true; sed-toggle FP_ALT_REGIME = true for the freeze/restore asserts):
+## LANDING-SAFETY UNDER THE FULL DEPLOY SET: the gate awaits the WorldManager's _ready so the ActiveFrame node
+## (FP_FIXED_FRAME) and the near-field pool (FP_M1_POOL + module) are really built before the fall — the re-entry
+## restore then exercises the REAL fixed-frame flip + pool re-designation, and the landing assertions prove the player
+## ends on the correct facet with SOLID terrain even with the crossing/terrain flags on (FP_FIXED_FRAME, FP_DATUM_BAKE,
+## FP_RADIAL_DATUM, FP_CROSS_CORNER_COMMIT, FP_TWIST_FRAME_AWARE, FP_CPPGEN, FP_LANDING_STREAM_KICK, the SN nav flags).
+## The gate prints the compiled deploy-flag state; it passes under BOTH the minimal set and the full deploy set.
+##
+## RUN — minimal (needs FACETED = true; sed-toggle FP_ALT_REGIME = true for the freeze/restore asserts):
 ##   sed -i 's/const FACETED := false/const FACETED := true/' godot/src/cosmos/cube_sphere.gd
 ##   sed -i 's/const FP_ALT_REGIME := false/const FP_ALT_REGIME := true/' godot/src/cosmos/cube_sphere.gd
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_alt_regime.gd
+## RUN — full deploy set (the landing-safety config; also sed these true):
+##   FP_FIXED_FRAME FP_M1_POOL FP_M2_LOD FP_CPPGEN FP_DATUM_BAKE FP_RADIAL_DATUM FP_CROSS_CORNER_COMMIT
+##   FP_TWIST_FRAME_AWARE FP_LANDING_STREAM_KICK SN_NAV_MODES SN_NO_CEILING_BOUNCE SN_FOFF_RADIAL_FALL (+ atmosphere B0-B5)
 ## Exits 0 all-pass / 1 on any failure.
 
 const TC := preload("res://src/world/terrain_config.gd")
@@ -64,6 +74,12 @@ func _initialize() -> void:
 	var gate_lo := CubeSphere.ATMO_TOP - CubeSphere.ALT_REGIME_HYST
 	print("  FP_ALT_REGIME=%s  ATMO_TOP=%.0f  HYST=%.0f  (enter ORBITAL >%.0f, re-enter SURFACE <%.0f)"
 		% [str(on), CubeSphere.ATMO_TOP, CubeSphere.ALT_REGIME_HYST, gate_hi, gate_lo])
+	# The deploy-relevant flags this gate must prove landing-safe UNDER (the re-entry restore interacts with the
+	# fixed-frame flip + datum-baked terrain heights + corner-commit crossing + the landing stream kick).
+	print("  deploy flags: FIXED_FRAME=%s M1_POOL=%s M2_LOD=%s CPPGEN=%s DATUM_BAKE=%s RADIAL_DATUM=%s CORNER_COMMIT=%s TWIST_FRAME_AWARE=%s LANDING_STREAM_KICK=%s"
+		% [str(CubeSphere.FP_FIXED_FRAME), str(CubeSphere.FP_M1_POOL), str(CubeSphere.FP_M2_LOD), str(CubeSphere.FP_CPPGEN),
+		   str(CubeSphere.FP_DATUM_BAKE), str(CubeSphere.FP_RADIAL_DATUM), str(CubeSphere.FP_CROSS_CORNER_COMMIT),
+		   str(CubeSphere.FP_TWIST_FRAME_AWARE), str(CubeSphere.FP_LANDING_STREAM_KICK)])
 
 	# ---- Build the fall path. Start at facet A's centre; the fall has two phases matching the live W3 scenario:
 	#   Phase 1 (ORBITAL ground-track sweep): at a fixed high altitude the horizontal position moves HUNDREDS of blocks
@@ -74,6 +90,11 @@ func _initialize() -> void:
 	var A := FA.spawn_facet()
 	TC.set_active_facet(A)
 	var w := WorldManager.new(); w.name = "AltRegime"; get_root().add_child(w)
+	# Let the WorldManager's _ready run to completion — under the full deploy set (FP_FIXED_FRAME + FP_M1_POOL + the
+	# module) _ready builds the ActiveFrame node + the near-field pool. Pumping frames makes the gate exercise the REAL
+	# fixed-frame restore path (the ActiveFrame flip + pool re-designation), not a half-constructed harness stub.
+	for _rf in range(4):
+		await process_frame
 
 	var cc := FA.centre_cell(A)
 	var feet := w.surface_y(float(cc.x) + 0.5, float(cc.y) + 0.5)

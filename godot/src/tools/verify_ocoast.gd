@@ -52,6 +52,7 @@ func _initialize() -> void:
 	_gate_yaw_tangent()
 	_gate_exit_continuity()
 	_gate_substep_cap()
+	_gate_full_dt_invariance()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -189,3 +190,86 @@ func _gate_substep_cap() -> void:
 	var r_end := DV.length(os.pos)
 	_ok(is_finite(r_end) and not is_nan(r_end), "(e) radius stays finite under repeated clamped huge dt (no NaN)")
 	_ok(r_end > 0.1 * r0 and r_end < 10.0 * r0, "(e) radius stays bounded (%.0f, no spiral-in / blow-up)" % r_end)
+
+# ---------- (f) FIX B (FP_COAST_FULL_DT): the fall trajectory is frame-dt-INVARIANT (no time-dilation) ----------
+## COSMOS-PERF FALL-COLLAPSE FIX B — G-COAST-FULLDT. The live fall-from-orbit ran at ~5 fps (200 ms frames); the
+## shipped movers clamp the per-frame dt to 1/30 s and DROP the remainder, so the coast advanced only ~1/6 of the
+## real elapsed game time per frame → the fall ran in slow-motion (the "10× too slow" the pilot reported). This gate
+## integrates the SAME free-fall trajectory three ways and proves the FIX-B substepping is frame-dt-invariant while
+## the shipped clamp-and-drop is not:
+##   • FINE  (reference): 1/60-s steps covering T seconds of game time.
+##   • FULL  (FIX B on):  big 200-ms frames, each covered by coast_substep_count/dt substeps of ≤ MAX_NAV_DT — must
+##                        integrate the SAME T seconds and reach the SAME altitude/velocity as FINE (within tol).
+##   • DROP  (shipped):   the same big 200-ms frames clamped-and-dropped to 1/30 s each — integrates only ~T/6 game
+##                        seconds over the same frames ⇒ falls far LESS (the dilation the fix removes).
+func _gate_full_dt_invariance() -> void:
+	print("  --- (f) FIX B FULL-DT: fall trajectory is frame-dt-invariant (FULL == FINE; DROP dilates) ---")
+	# Pure-helper contract: a normal 60-fps frame is ONE substep of the full delta (byte-identical to clamp_nav_dt).
+	_ok(NAV.coast_substep_count(1.0 / 60.0) == 1, "(f) coast_substep_count(1/60) == 1 (normal frame = one substep)")
+	_ok(_rel(NAV.coast_substep_dt(1.0 / 60.0), 1.0 / 60.0) < 1.0e-12, "(f) coast_substep_dt(1/60) == 1/60 (byte-identical common case)")
+	# A hitched 200-ms frame is covered by N ≤ MAX_NAV_DT substeps summing to the FULL 200 ms (no drop).
+	var n2 := NAV.coast_substep_count(0.2)
+	var h2 := NAV.coast_substep_dt(0.2)
+	_ok(h2 <= NAV.MAX_NAV_DT + 1.0e-12, "(f) coast_substep_dt(200 ms) ≤ MAX_NAV_DT (each substep stays integrator-stable)")
+	_ok(_rel(h2 * float(n2), 0.2) < 1.0e-12, "(f) N·h covers the FULL 200 ms (no dropped time — the anti-dilation)")
+	# Anti-spiral cap: a catastrophic multi-second frame integrates at most COAST_CATCHUP_MAX with a bounded N.
+	_ok(NAV.coast_substep_count(16.0) <= int(ceil(NAV.COAST_CATCHUP_MAX / NAV.MAX_NAV_DT)) + 1,
+		"(f) coast_substep_count(16 s) bounded (≤ %d — catch-up capped at COAST_CATCHUP_MAX, no spiral)" % (int(ceil(NAV.COAST_CATCHUP_MAX / NAV.MAX_NAV_DT)) + 1))
+	_ok(NAV.coast_substep_dt(16.0) * float(NAV.coast_substep_count(16.0)) <= NAV.COAST_CATCHUP_MAX + 1.0e-9,
+		"(f) a 16 s hitch integrates ≤ COAST_CATCHUP_MAX (%.1f s) of game time (bounded catch-up)" % NAV.COAST_CATCHUP_MAX)
+
+	# End-to-end trajectory: a near-radial fall from ~900 blocks altitude, integrated over T real seconds.
+	var body := "earth"
+	var R := GRAV.r_vox(body)
+	var r0 := R + 900.0
+	var p0 := DV.v(r0, 0.0, 0.0)
+	var v0 := DV.v(0.0, 0.0, 0.0)                            # pure radial free-fall (gravity only)
+	var T := 3.0                                            # seconds of real/game time to cover
+	var fine_dts: Array = []
+	for _i in range(int(round(T * 60.0))):
+		fine_dts.append(1.0 / 60.0)
+	var big_dts: Array = []
+	for _i in range(int(round(T / 0.2))):
+		big_dts.append(0.2)                                 # 5 fps — the live fall's frame time
+	var fine := _integrate_frames(body, p0, v0, fine_dts, "fine")
+	var full := _integrate_frames(body, p0, v0, big_dts, "full")
+	var drop := _integrate_frames(body, p0, v0, big_dts, "drop")
+	# FULL integrates the full T of game time; DROP only ~T/6 (clamp 1/30 per 0.2-s frame).
+	_ok(_rel(float(full["t"]), T) < 1.0e-9, "(f) FULL integrates the full %.1f s of game time (t=%.3f)" % [T, float(full["t"])])
+	_ok(_rel(float(fine["t"]), T) < 1.0e-9, "(f) FINE reference integrates %.1f s (t=%.3f)" % [T, float(fine["t"])])
+	_ok(float(drop["t"]) < 0.25 * T, "(f) DROP integrates only ~T/6 (%.3f s ≪ %.1f) — the shipped time-dilation" % [float(drop["t"]), T])
+	# FULL reaches the SAME altitude/velocity as the fine reference (frame-dt-invariant trajectory).
+	var drop_fine := (r0 - float(fine["r"]))
+	var drop_full := (r0 - float(full["r"]))
+	var drop_drop := (r0 - float(drop["r"]))
+	_ok(_rel(float(full["r"]), float(fine["r"])) < 2.0e-3, "(f) FULL end-altitude matches FINE within 0.2%% (fell %.1f vs %.1f blocks)" % [drop_full, drop_fine])
+	_ok(_rel(float(full["v"]), float(fine["v"])) < 5.0e-3, "(f) FULL end-speed matches FINE within 0.5%% (%.2f vs %.2f b/s)" % [float(full["v"]), float(fine["v"])])
+	# DROP falls dramatically LESS in the same wall-clock — the visible slow-motion the fix eliminates.
+	_ok(drop_drop < 0.5 * drop_full, "(f) DROP falls < half as far in the same wall-clock (%.1f vs %.1f blocks) — dilation" % [drop_drop, drop_full])
+
+## Integrate the shared coast (pure gravity) over a list of per-frame `frame_dts` in one of three modes:
+##   "fine" — step each dt directly (small-dt reference).
+##   "full" — FIX B: cover each frame with coast_substep_count/dt substeps of ≤ MAX_NAV_DT (the full real delta).
+##   "drop" — shipped: advance only clamp_nav_dt(dt) per frame (clamp-and-drop; the remainder is lost → dilation).
+## Returns {p, v, r, t} — final BCI pos/vel, radius, and total GAME time integrated. This is exactly the per-frame
+## loop the player's coast movers run (os.step is the shared OrbitalState symplectic integrator).
+func _integrate_frames(body: String, p0: PackedFloat64Array, v0: PackedFloat64Array, frame_dts: Array, mode: String) -> Dictionary:
+	var os = ORB.make(body, p0, v0)
+	var a0 := DV.v(0.0, 0.0, 0.0)
+	var t_game := 0.0
+	for fdt in frame_dts:
+		match mode:
+			"fine":
+				os.step(fdt, a0)
+				t_game += fdt
+			"full":
+				var n := NAV.coast_substep_count(fdt)
+				var h := NAV.coast_substep_dt(fdt)
+				for _i in range(n):
+					os.step(h, a0)
+				t_game += h * float(n)
+			_:  # "drop" — the shipped clamp-and-drop
+				var cd := NAV.clamp_nav_dt(fdt)
+				os.step(cd, a0)
+				t_game += cd
+	return {"p": os.pos, "v": os.vel, "r": DV.length(os.pos), "t": t_game}

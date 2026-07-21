@@ -112,6 +112,11 @@ var _prewarm_cursor := -1                   # -1 = not started; 0..6·K² = next
 var _emit_cached_only := false              # the current rebuild emits ONLY cache-ready facets (true-orbit progressive path)
 var _last_emit_cache_size := 0             # total cached facets at the last progressive re-emit (re-emit-on-growth throttle)
 var _was_done := false                      # _warm_front returned true last orbit frame (fire ONE final full emit on completion, no prewarm-churn)
+# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): the off-surface (true-orbit) analogue of `_srf_converged`.
+# The orbit branch re-ran the full 6·K² _warm_front dot scan EVERY airborne frame (the ~67 ms proc baseline the live
+# fall-from-orbit telemetry shows with draws=32). Once the front is fully warmed + emitted with nothing pending, the
+# scan can be skipped until the next drift snapshot re-sets `_pending` — matching the shipped surface idle frame.
+var _orbit_converged := false               # front fully cached + emitted, nothing pending → skip the per-frame warm scan (FP_SHELL_ORBIT_IDLE)
 # COSMOS TIER-DEPTH-PRIORITY warm-converge (FP_TIER_WARM_CONVERGE): the SURFACE progressive-emit state (isolated from the
 # orbit S1b vars above so the two paths never alias). `_srf_converged` gates the idle short-circuit (no per-frame warm scan
 # once the whole front is cached + emitted); `_srf_last_bcache`/`_srf_last_ccache` are the dense/coarse cache sizes at the
@@ -328,6 +333,12 @@ func _process(_dt: float) -> void:
 	# visible_fids() consume THIS pair, so the warmed set and the emitted set can never disagree.
 	var p := _cull_params()
 	if _shell_orbit():
+		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
+		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
+		# until the next drift snapshot re-sets `_pending`. Mirrors the surface `_srf_converged` gate. Off ⇒ the scan runs
+		# every frame exactly as today (byte-identical). The next drift (shell_set_camera_abs) clears it via `_pending`.
+		if CubeSphere.FP_SHELL_ORBIT_IDLE and not _pending and _orbit_converged:
+			return
 		# COSMOS-ORBITAL-SHELL S1b (§3): TRUE ORBIT — progressive cached-subset emit. Never block the whole rebuild on
 		# the ~1900-facet cap being cached in ONE frame (impossible under web ×25 warm cost → the live far-side stall).
 		# Warm cumulatively under budget, emit the cache-ready subset now, re-emit as coverage grows (throttled by
@@ -347,6 +358,9 @@ func _process(_dt: float) -> void:
 			_emit_cached_only = true
 			_begin_rebuild()
 		_was_done = done
+		# FIX A: converged once the front is fully warmed AND the pending emit has been consumed (async clears _pending
+		# in _dispatch_async_rebuild). The next drift snapshot re-sets _pending, which the top-of-branch gate honours.
+		_orbit_converged = done and not _pending
 	elif TierPlace.warm_converge_on():
 		# TIER-DEPTH warm-converge: the SURFACE path adopts the progressive discipline so a stale un-sunk backstop quad
 		# never lingers over live near meshes while the dense caches warm (the over-near strip / sh_wfail thrash).

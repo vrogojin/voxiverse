@@ -684,6 +684,17 @@ const SHELL_PREWARM_DWELL_S := 5.0   # seconds sustained above OFFSURFACE_Y befo
 ## contract. The SURFACE (floored) + flag-off paths keep the shipped all-or-nothing warm gate verbatim (byte-identical).
 const SHELL_REEMIT_GROWTH := 64      # re-emit the growing cached cap every N newly-cached facets (progressive-fill cadence)
 
+## COSMOS-PERF FALL-COLLAPSE FIX A (fix/voxiverse-fall-perf) — the off-surface (true-orbit) far-ring warm scan
+## idle short-circuit. The SURFACE progressive path (_surface_converge_emit) already skips its per-frame full
+## 6·K² _warm_front scan once the front is fully cached AND emitted (`_srf_converged`), matching the shipped
+## zero-cost idle frame. The OFF-SURFACE (_shell_orbit) branch had NO such gate — it re-ran the whole-planet
+## front-visible dot scan EVERY frame while airborne (the ~67 ms proc baseline the live fall-from-orbit telemetry
+## shows with draws=32, i.e. NOT geometry/gen). This flag adds the SAME converged idle gate to the orbit branch:
+## once `done` (front fully warmed) with nothing pending, the scan is skipped until the next drift snapshot re-sets
+## `_pending`. Byte-identical off (the scan runs exactly as today). Requires FP_SHELL_CAMERA_SET (the orbit branch
+## is only reached when the camera-set law is engaged off-surface). Gate G-SHELL-ORBIT-IDLE (verify_orbital.gd).
+const FP_SHELL_ORBIT_IDLE := false
+
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
 ## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the
@@ -1149,6 +1160,19 @@ const ORBIT_T_REC := 0.8
 ## Requires SN_DEVNAV (O is a dev-nav toggle) + FACETED. Default FALSE ⇒ BYTE-IDENTICAL: O keeps its shipped
 ## velocity-command behaviour and no coast state is ever set. Gate G-OCOAST (verify_ocoast.gd).
 const ORBIT_COAST := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX B (fix/voxiverse-fall-perf) — full-real-dt coast integration (anti time-dilation).
+## The shared Kepler coast + free-fall movers CLAMP the per-frame dt to CosmosNav.MAX_NAV_DT (1/30 s) and DROP the
+## remainder (G-SN-NOSPIRAL). That bounds integrator work, but when a frame HITCHES (the live fall-from-orbit ran at
+## ~5 fps / 200 ms frames) the coast then advances only 1/30 s of game time per 200 ms real frame → the fall runs at
+## ~1/6 real speed (the pilot's "fall is 10× too slow" slow-motion). With this flag ON the movers integrate the FULL
+## real elapsed delta each frame via internal substeps of ≤ MAX_NAV_DT (each substep is still ≤ 1/30 s ⇒ identical
+## per-substep stability), capped at CosmosNav.COAST_CATCHUP_MAX seconds total per frame (anti-spiral: a catastrophic
+## multi-second hitch integrates at most that, bounding the substep count). A normal 60-fps frame (delta = 1/60 <
+## MAX_NAV_DT) is ONE substep of the full delta ⇒ byte-identical common case. Off ⇒ the shipped clamp-and-drop
+## behaviour verbatim (byte-identical). Gate G-COAST-FULLDT (verify_ocoast.gd): a fall integrated with one big dt
+## (chunked here) matches many small dts within tol — frame-dt-invariant trajectory.
+const FP_COAST_FULL_DT := false
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

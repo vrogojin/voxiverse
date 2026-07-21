@@ -26,6 +26,11 @@ extends SceneTree
 ##       godot/src/cosmos/cube_sphere.gd
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_shell.gd
 ##   then REVERT the sed. Exits 0 all-pass / 1 on any failure.
+## NOTE (FIX A2): keep FP_SHELL_FALL_HOLD OFF for this run. The COVER/NOPOP/LIMB gates teleport the camera and assert
+## visible_fids tracks it EXACTLY every call (a tight per-call cap) — the SHIPPED law, which FALL_HOLD deliberately
+## relaxes during flight (a held generous cap ≤ CAP_MAX, still G-SHELL-BOUND-bounded, that CONTAINS the visible cap in
+## continuous motion so there are no holes). G-SHELL-FALLHOLD below is flag-INDEPENDENT (drives the pure static both
+## ways) and is the fix's validation, so it runs regardless of the compiled FP_SHELL_FALL_HOLD.
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FFR := preload("res://src/world/facet_far_ring.gd")
@@ -68,6 +73,7 @@ func _initialize() -> void:
 		_gate_prewarm(active)
 	else:
 		print("  (G-SHELL-PREWARM skipped — sed FP_SHELL_PREWARM = true to run S2)")
+	_gate_fall_hold(active)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -532,3 +538,64 @@ func _gate_prewarm(active: int) -> void:
 	ring.call("_prewarm_step", 100.0)
 	_ok(int(ring.call("coarse_cache_size")) == csize and int(ring.call("prewarm_cursor")) == cur, "G-SHELL-PREWARM: idempotent after completion (cache %d, cursor %d unchanged)" % [csize, cur])
 	ring.free()
+
+# ---------------- G-SHELL-FALLHOLD (FIX A2, FP_SHELL_FALL_HOLD): a fall does NOT re-emit-thrash every frame ----------------
+## COSMOS-PERF FALL-COLLAPSE FIX A2 — the case my first attempt (FP_SHELL_ORBIT_IDLE) MISSED. During an active fall the
+## visible-cap angular radius θ_h = acos(R/d) shifts > 5° EVERY frame near the surface (dθ_h/dd → ∞ as d → R, and the
+## fall is FAST so d steps are large), so the shipped reactive trigger re-snapshots (⇒ re-emits ⇒ a synchronous
+## _rebuild_full + the warm never converges) EVERY frame — the live 200-600 ms spikes / sh_wfail thrash. This gate
+## SIMULATES that fall (a real free-fall descent, dt = 200 ms @ ~5 fps, gravity-accelerated d steps like the live
+## telemetry) and drives the PURE trigger `shell_fall_should_reemit` both ways: with hold OFF it thrashes; with hold ON
+## the radial re-emit is suppressed (the held generous cap covers the shrinking visible cap) so re-emits stay flat.
+func _gate_fall_hold(active: int) -> void:
+	print("  --- G-SHELL-FALLHOLD (FIX A2): a fast descent does NOT re-emit every frame with the cap held ---")
+	# byte-off: hold=false is the shipped trigger verbatim (drift > slack−2° OR |Δθ_h| > 5°); floor change always fires.
+	_ok(FFR.shell_fall_should_reemit(false, false, deg_to_rad(6.0), 0.0, 0) == true, "G-SHELL-FALLHOLD: hold-off |Δθ_h|=6° > 5° ⇒ re-emit (shipped)")
+	_ok(FFR.shell_fall_should_reemit(false, false, deg_to_rad(3.0), 0.0, 0) == false, "G-SHELL-FALLHOLD: hold-off |Δθ_h|=3° < 5° ⇒ no re-emit (shipped)")
+	_ok(FFR.shell_fall_should_reemit(false, false, deg_to_rad(-6.0), 0.0, 0) == true, "G-SHELL-FALLHOLD: hold-off shrink 6° ⇒ re-emit (the shipped per-frame thrash on descent)")
+	_ok(FFR.shell_fall_should_reemit(true, true, deg_to_rad(-30.0), 0.0, 0) == true, "G-SHELL-FALLHOLD: hold-on floor/regime change ALWAYS re-emits (correctness)")
+	_ok(FFR.shell_fall_should_reemit(true, false, deg_to_rad(-30.0), 0.0, 0) == false, "G-SHELL-FALLHOLD: hold-on descent SHRINK (Δθ_h=−30°) does NOT re-emit (cap held)")
+	_ok(FFR.shell_fall_should_reemit(true, false, deg_to_rad(CubeSphere.SHELL_FALL_MARGIN_DEG + 1.0), 0.0, 0) == true, "G-SHELL-FALLHOLD: hold-on CLIMB past the held margin re-emits (no limb holes)")
+	# throttle: an axis sweep before the throttle elapses holds; after it elapses it re-emits.
+	_ok(FFR.shell_fall_should_reemit(true, false, 0.0, deg_to_rad(CubeSphere.SHELL_SLACK_DEG), 0) == false, "G-SHELL-FALLHOLD: hold-on axis sweep BEFORE throttle (elapsed 0) holds")
+	_ok(FFR.shell_fall_should_reemit(true, false, 0.0, deg_to_rad(CubeSphere.SHELL_SLACK_DEG), CubeSphere.SHELL_FALL_REEMIT_MS) == true, "G-SHELL-FALLHOLD: hold-on axis sweep AFTER throttle re-emits")
+
+	# End-to-end: simulate a REAL free-fall descent (like the live fall) and count scheduled re-emits each way.
+	var off_count := _sim_descent(false)
+	var on_count := _sim_descent(true)
+	print("    descent re-emits: hold OFF = %d (shipped thrash), hold ON = %d (cap held)" % [off_count, on_count])
+	_ok(on_count <= 2, "G-SHELL-FALLHOLD: hold ON schedules ≤ 2 re-emits over the whole fall (%d — essentially just engage)" % on_count)
+	_ok(off_count >= 5, "G-SHELL-FALLHOLD: hold OFF re-emits repeatedly (%d — each a synchronous _rebuild_full spike)" % off_count)
+	_ok(off_count >= 3 * on_count, "G-SHELL-FALLHOLD: hold ON cuts scheduled re-emits ≥ 3× vs shipped (%d → %d)" % [off_count, on_count])
+
+## Simulate a gravity-accelerated free-fall descent (R+900 → surface, dt = 200 ms @ ~5 fps, like the live fall) and
+## count how many far-ring re-emits the trigger schedules. Pure radial fall (fixed axis ⇒ drift = 0), so this isolates
+## the RADIAL θ_h trigger — the near-surface acos(R/d) blow-up that makes the shipped path re-snapshot every frame.
+func _sim_descent(hold: bool) -> int:
+	var R := _R
+	var d := R + 900.0
+	var v := 0.0
+	var g := 9.8
+	var dt := 0.2                              # 5 fps — the live fall's frame time
+	var t_ms := 0
+	var last_theta := -1.0                     # < 0 ⇒ first frame engages
+	var last_ms := 0
+	var count := 0
+	var frames := 0
+	while d > R + 0.25 and frames < 5000:
+		v += g * dt
+		d -= v * dt
+		var theta_h := acos(clampf(R / maxf(d, R), -1.0, 1.0))
+		if last_theta < 0.0:
+			count += 1                          # first engage always snapshots
+			last_theta = theta_h
+			last_ms = t_ms
+		else:
+			var dtheta := theta_h - last_theta
+			if FFR.shell_fall_should_reemit(hold, false, dtheta, 0.0, t_ms - last_ms):
+				count += 1
+				last_theta = theta_h
+				last_ms = t_ms
+		t_ms += 200
+		frames += 1
+	return count

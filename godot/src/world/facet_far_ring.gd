@@ -117,6 +117,12 @@ var _was_done := false                      # _warm_front returned true last orb
 # fall-from-orbit telemetry shows with draws=32). Once the front is fully warmed + emitted with nothing pending, the
 # scan can be skipped until the next drift snapshot re-sets `_pending` — matching the shipped surface idle frame.
 var _orbit_converged := false               # front fully cached + emitted, nothing pending → skip the per-frame warm scan (FP_SHELL_ORBIT_IDLE)
+# COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD): hold the cap during a fall — suppress the per-frame radial
+# re-snapshot (the near-surface acos(R/d) blow-up) + throttle the off-surface re-emit so the synchronous rebuild
+# can't fire every frame. `_snapshot_count` is the thrash diagnostic (times a re-emit was SCHEDULED) the gate reads.
+var _last_snapshot_ms := 0                   # wall-ms of the last shell snapshot (throttle base for the fall-hold re-emit)
+var _last_rebuild_ms := 0                    # wall-ms of the last orbit-branch _begin_rebuild (throttle base for grew re-emits)
+var _snapshot_count := 0                     # diagnostics: times _shell_snapshot fired (a scheduled re-emit) — flat during a held fall
 # COSMOS TIER-DEPTH-PRIORITY warm-converge (FP_TIER_WARM_CONVERGE): the SURFACE progressive-emit state (isolated from the
 # orbit S1b vars above so the two paths never alias). `_srf_converged` gates the idle short-circuit (no per-frame warm scan
 # once the whole front is cached + emitted); `_srf_last_bcache`/`_srf_last_ccache` are the dense/coarse cache sizes at the
@@ -228,7 +234,12 @@ func apply_camera_set(cam: Vector3) -> void:
 func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 	var r := FacetAtlas.R_BLOCKS
 	var theta_h := acos(clampf(r / maxf(d, r), -1.0, 1.0))   # visible-cap angular radius (0 at/below the surface, < 90° always)
-	var theta_emit := minf(theta_h + deg_to_rad(CubeSphere.SHELL_RELIEF_DEG + CubeSphere.SHELL_SLACK_DEG),
+	# COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD): off-surface (airborne) carry a GENEROUS extra margin so a
+	# shrinking visible cap during a descent stays inside the held cap ⇒ no radial re-emit needed. Byte-identical off
+	# (extra == 0) and on the floored surface. See shell_fall_should_reemit for the matching suppressed radial trigger.
+	var fall_hold := CubeSphere.FP_SHELL_FALL_HOLD and not floored
+	var extra := deg_to_rad(CubeSphere.SHELL_FALL_MARGIN_DEG) if fall_hold else 0.0
+	var theta_emit := minf(theta_h + deg_to_rad(CubeSphere.SHELL_RELIEF_DEG + CubeSphere.SHELL_SLACK_DEG) + extra,
 			deg_to_rad(CubeSphere.SHELL_CAP_MAX_DEG))
 	if floored:
 		theta_emit = maxf(theta_emit, deg_to_rad(90.0))       # surface floor: keep the shipped hemisphere while near tiers are live
@@ -237,13 +248,31 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 	if not _cam_set:
 		_cam_set = true                                       # first engage → snapshot + force a re-emit onto the camera axis
 		_shell_snapshot(dir, new_cos, theta_h, floored)
+		_last_snapshot_ms = Time.get_ticks_msec()
 		return
 	var drift := acos(clampf(dir[0] * _emit_dir_last[0] + dir[1] * _emit_dir_last[1] + dir[2] * _emit_dir_last[2], -1.0, 1.0))
-	var dth := absf(theta_h - _emit_thetah_last)
-	if floored != _emit_floored_last \
-			or drift > deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0) \
-			or dth > deg_to_rad(5.0):
+	var dtheta := theta_h - _emit_thetah_last                 # SIGNED: > 0 = the visible cap grew (a climb); < 0 = shrank (a descent)
+	if shell_fall_should_reemit(fall_hold, floored != _emit_floored_last, dtheta, drift, Time.get_ticks_msec() - _last_snapshot_ms):
 		_shell_snapshot(dir, new_cos, theta_h, floored)
+		_last_snapshot_ms = Time.get_ticks_msec()
+
+## COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD) — the re-emit-trigger decision, split out PURE + static so
+## the descent gate (G-SHELL-FALLHOLD) drives it directly with synthetic inputs (no wall-clock, no node). A floor/regime
+## change ALWAYS re-emits. With `hold` OFF: the shipped reactive triggers verbatim (axis drift past slack − 2°, OR
+## |Δθ_h| > 5°) — byte-identical. With `hold` ON: the per-frame radial trigger is SUPPRESSED for a shrinking cap (the
+## near-surface acos blow-up during a fall) — re-emit ONLY when the cap must GROW past the held generous margin
+## (a climb — else holes appear at the limb), or the axis SWEEPS past slack AND the throttle (SHELL_FALL_REEMIT_MS) has
+## elapsed. `dtheta` is SIGNED (> 0 = grew); `drift` is the axis angle since the last snapshot (rad); `elapsed_ms` is
+## the wall-ms since the last snapshot. Bounds the far-ring re-emit (⇒ the synchronous _rebuild_full) to ≤ 1/throttle.
+static func shell_fall_should_reemit(hold: bool, floor_changed: bool, dtheta: float, drift: float, elapsed_ms: int) -> bool:
+	if floor_changed:
+		return true
+	var swept := drift > deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0)
+	if not hold:
+		return swept or absf(dtheta) > deg_to_rad(5.0)       # shipped reactive trigger (byte-identical)
+	if dtheta > deg_to_rad(CubeSphere.SHELL_FALL_MARGIN_DEG):
+		return true                                          # visible cap OUTGREW the held cap (a climb) — re-emit to avoid limb holes
+	return swept and elapsed_ms >= CubeSphere.SHELL_FALL_REEMIT_MS
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): commit a new emit axis/cap and schedule the deferred re-emit (the warm + async
 ## build + single swap are the shipped pipeline; only _pending + the axis/cap snapshot change here).
@@ -254,6 +283,7 @@ func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool) 
 	_emit_thetah_last = theta_h
 	_emit_floored_last = floored
 	_pending = true
+	_snapshot_count += 1                                       # FIX A2 diagnostic: a scheduled re-emit (flat during a held fall)
 
 ## COSMOS-ORBITAL-SHELL S2 (§4): the one-shot whole-planet coarse-cache warm. After SHELL_PREWARM_DWELL_S sustained
 ## off-surface, fill the SHIPPED _pos_cache/_col_cache for every uncached facet under the existing WARM_BUDGET_MS
@@ -353,10 +383,17 @@ func _process(_dt: float) -> void:
 		# the front cap (progressive reveal); and ONCE when the front cap just finished caching (done ↑) to capture the
 		# tail. Once done, the growth trigger is gated off so background prewarm back-filling never churns re-emits.
 		var grew := (not done) and (sz - _last_emit_cache_size) >= CubeSphere.SHELL_REEMIT_GROWTH
-		if _pending or grew or (done and not _was_done):
+		# FIX A2 (FP_SHELL_FALL_HOLD): a `_pending` (a genuine, now-throttled snapshot) or a floor-tail (done↑) re-emits
+		# immediately; the PROGRESSIVE `grew` re-emit is throttled to ≤ 1/SHELL_FALL_REEMIT_MS so a cap that can't fully
+		# warm within budget on web (done never true) cannot fire a SYNCHRONOUS _rebuild_full every few frames (the spikes).
+		var grew_ok := grew
+		if CubeSphere.FP_SHELL_FALL_HOLD and grew and not _pending:
+			grew_ok = Time.get_ticks_msec() - _last_rebuild_ms >= CubeSphere.SHELL_FALL_REEMIT_MS
+		if _pending or grew_ok or (done and not _was_done):
 			_last_emit_cache_size = sz
 			_emit_cached_only = true
 			_begin_rebuild()
+			_last_rebuild_ms = Time.get_ticks_msec()
 		_was_done = done
 		# FIX A: converged once the front is fully warmed AND the pending emit has been consumed (async clears _pending
 		# in _dispatch_async_rebuild). The next drift snapshot re-sets _pending, which the top-of-branch gate honours.
@@ -748,6 +785,7 @@ func take_events() -> Array:
 # --- gate diagnostics ---
 func is_rebuild_pending() -> bool: return _pending
 func reemit_count() -> int: return _reemit_count
+func snapshot_count() -> int: return _snapshot_count            # FIX A2 (G-SHELL-FALLHOLD): scheduled re-emits — flat during a held fall
 func is_emitted(fid: int) -> bool: return _emitted.has(fid)
 func emitted_count() -> int: return _emitted.size()
 func is_backstop(fid: int) -> bool: return _is_backstop(fid)     # COSMOS far-ring full coverage — gate visibility

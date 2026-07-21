@@ -775,6 +775,40 @@ const FP_ALT_REGIME := false
 ## the radial altitude jitters across the 384-block ceiling during a grazing pass.
 const ALT_REGIME_HYST := 32.0
 
+## COSMOS-PERF UNATTENDED R5 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §5 R5, item W4) — the INCREMENTAL PER-FID EDIT INDEX.
+## `_rebuild_window_indices` (run on EVERY facet crossing, world_manager.gd) and `_translate_active` (fallback/collapse/
+## save consumers) both rescan the WHOLE `_edits` overlay — O(all edits) — and filter to the active facet. Snow authors
+## up to ~200 k `_edits` cells over a session, so the crossing scan grows unbounded and crossings get PROGRESSIVELY
+## SLOWER the longer you play (the measured 1.7–19 ms crossing_ms was a young session; W4 is the "crossings slow down
+## over a session" cause). When true, WorldManager maintains a per-facet index `_edits_by_fid` (fid → {edit_key → true})
+## in the SINGLE write/erase choke points (`_write_cell` adds, `sim_revert_cell` removes), so the crossing rebuild and
+## the active-facet projection touch ONLY the incoming facet's edits — O(active-fid), INDEPENDENT of the total edit
+## count. The index membership is a byte-exact subset of `_edits` (same choke points), so the rebuilt `_edit_columns`/
+## `_placed_top` are IDENTICAL to the full-scan result — only the WORK is bounded. FACETED-only (the (fid,cell) int key
+## carries the fid; FLAT/curved keys are Vector3i/global and take neither the index nor the FACETED rebuild branch).
+## NEVER-OOM: one bool per existing edit key, bounded by the same SNOW_SLICED_EDIT_CAP that bounds `_edits` itself; a
+## fid's bucket is dropped when it empties. Default FALSE ⇒ the shipped O(all-edits) scan verbatim ⇒ BYTE-IDENTICAL
+## (the index is never built or read). Gate: verify_edit_fid_index.gd (200 k-seeded-edits O(window) proof). Requires
+## FACETED = true. Bake ON at export.
+const FP_EDIT_FID_INDEX := false
+
+## COSMOS-PERF UNATTENDED R4 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §5 R4) — PACE the crossing view SHRINK SNAP.
+## On a crossing, `redesignate` (module_world.gd) drops the FROM slot's max_view_distance 128 → 96 in ONE frame, and
+## `_ramp_pool_step` SNAPS every shrinking slot to its target the same frame. That one-frame block-unload BURST trips
+## the wasm dlmalloc allocator convoy (memory voxiverse-walk-perf-root-cause) — a crossing/descent worst-frame spike.
+## When true, a shrink is routed through the existing per-slot ramp machinery instead of snapped: `redesignate` sets the
+## FROM slot's view_target to 96 but LEAVES view_f at its current radius, and `_ramp_pool_step` steps each shrinking slot
+## DOWN by at most SHRINK_STEP_BLOCKS per frame (one shell of mesh-blocks freed per frame) until it reaches the target.
+## The END STATE is identical (view_f == 96, same blocks unloaded in total) — only the per-frame unload count is bounded,
+## so the free burst is spread over ⌈Δview / SHRINK_STEP_BLOCKS⌉ frames. NEVER-OOM: the FROM slot merely holds its larger
+## (already-allocated) view a few extra frames before shrinking — strictly ≤ one extra slot at 128 view for a bounded
+## handful of frames, no new retained buffers, no OOM headroom change. Default FALSE ⇒ the shipped one-frame snap verbatim
+## ⇒ BYTE-IDENTICAL. Gate: verify_shrink_paced.gd. Requires FACETED + FP_M1_POOL. Bake ON at export.
+const FP_SHRINK_PACED := false
+## Per-frame view-distance shrink step (blocks) under FP_SHRINK_PACED — one 16-block mesh-block shell freed per frame,
+## so a 128→96 crossing shrink de-bursts across 2 frames (32 / 16) instead of a single-frame unload of both shells.
+const SHRINK_STEP_BLOCKS := 16
+
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
 ## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the

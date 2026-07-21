@@ -98,6 +98,10 @@ const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
 # flag-OFF (FP-S1) restream path only, which the pool never takes (redesignate replaces restream).
 const RAMP_START_BLOCKS := 48.0
 const RAMP_SECONDS := 1.5
+# COSMOS-PERF UNATTENDED R4 (FP_SHRINK_PACED): max view-distance a shrinking slot sheds per frame — one 16-block
+# mesh-block shell. A crossing's 128→96 FROM-slot shrink then de-bursts across ⌈32/16⌉ = 2 frames instead of a
+# single-frame unload of both shells (the wasm dlmalloc convoy trigger). Mirrors CubeSphere.SHRINK_STEP_BLOCKS.
+const SHRINK_STEP_BLOCKS := 16.0
 var _ramp_active := false
 var _ramp_view := 0.0
 var _ramp_target := 0.0
@@ -448,15 +452,27 @@ func _ramp_pool_step(delta: float) -> bool:
 	var up_fid := -1
 	var up_spawn := 0
 	var up_active := false
+	var shrinking := false                       # R4: a paced shrink still has blocks to shed → keep processing alive
 	for fid in _pool:
 		var s: Dictionary = _pool[fid]
 		var cur: float = s["view_f"]
 		var tgt: float = s["view_target"]
 		if cur > tgt + 0.5:
-			# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
-			s["view_f"] = tgt
-			s["view"] = int(round(tgt))
-			_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+			if CubeSphere.FP_SHRINK_PACED:
+				# COSMOS-PERF UNATTENDED R4: PACE the unload — shed at most SHRINK_STEP_BLOCKS (one mesh-block shell)
+				# this frame instead of snapping to tgt, so the free burst spreads over ⌈Δview/step⌉ frames (no
+				# one-frame 128→96 dlmalloc convoy). Same END STATE (reaches tgt), only the per-frame delta is bounded.
+				var nv := maxf(cur - SHRINK_STEP_BLOCKS, tgt)
+				s["view_f"] = nv
+				s["view"] = int(round(nv))
+				_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+				if nv > tgt + 0.5:
+					shrinking = true             # not yet at target → more shrink frames to come
+			else:
+				# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
+				s["view_f"] = tgt
+				s["view"] = int(round(tgt))
+				_set_if(s["terrain"], "max_view_distance", int(s["view"]))
 		elif cur < tgt - 0.5:
 			# Grow candidate — pick ONE: active wins; else the oldest (smallest spawn_ms).
 			var is_active := (int(fid) == _pool_active)
@@ -466,7 +482,9 @@ func _ramp_pool_step(delta: float) -> bool:
 				up_spawn = int(s["spawn_ms"])
 				up_active = is_active
 	if up_fid < 0:
-		return false
+		# R4: no grow candidate, but a paced shrink in flight must keep the ramp processing alive so it finishes
+		# shedding on later frames. Off ⇒ `shrinking` is always false ⇒ the shipped `return false` (byte-identical).
+		return shrinking
 	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
 	var sc: Dictionary = _pool[up_fid]
 	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
@@ -1941,12 +1959,21 @@ func redesignate(to: int) -> bool:
 	_pool[to]["ramp_from"] = float(_pool[to]["view_f"])   # ramp from wherever `to` sits now (96 warm, or mid-ramp)
 	_pool[to]["editable"] = true
 	if _pool.has(from):
-		_set_if(_pool[from]["terrain"], "max_view_distance", 96)
-		_pool[from]["view"] = 96
-		_pool[from]["view_f"] = 96.0
-		_pool[from]["view_target"] = 96.0
-		_pool[from]["ramp_from"] = 96.0
-		_pool[from]["editable"] = false
+		if CubeSphere.FP_SHRINK_PACED:
+			# COSMOS-PERF UNATTENDED R4: PACE the 128→96 unload. Set the target to 96 but LEAVE view_f/view at the
+			# current (larger) radius so _ramp_pool_step steps it down ≤SHRINK_STEP_BLOCKS/frame — the FROM slot holds
+			# its larger (already-allocated) view for a bounded handful of frames instead of freeing both shells in ONE
+			# frame (the dlmalloc convoy). Same end state (view_f → 96). editable flips immediately (identity unchanged).
+			_pool[from]["view_target"] = 96.0
+			_pool[from]["ramp_from"] = float(_pool[from]["view_f"])
+			_pool[from]["editable"] = false
+		else:
+			_set_if(_pool[from]["terrain"], "max_view_distance", 96)
+			_pool[from]["view"] = 96
+			_pool[from]["view_f"] = 96.0
+			_pool[from]["view_target"] = 96.0
+			_pool[from]["ramp_from"] = 96.0
+			_pool[from]["editable"] = false
 	_pool_ramp_kick()
 	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
 	_pool_active = to
@@ -2179,6 +2206,26 @@ func pool_view_target(fid: int) -> int:
 ## drives the ramp from _process. No-op-safe: just calls the same step _process uses.
 func pool_ramp_tick(delta: float) -> bool:
 	return _ramp_pool_step(delta)
+
+# --- COSMOS-PERF UNATTENDED R4 (FP_SHRINK_PACED) gate hooks — for verify_shrink_paced.gd. Test-only; no live caller. ---
+## Seed a bookkeeping-only pool slot (the ramp math reads/writes the dict; `_set_if` no-ops on a stub terrain that
+## lacks max_view_distance). Lets the gate drive the shrink pacing + the redesignate FROM-slot rebalance without a
+## live godot_voxel pool. Pass a plain Node as `terrain` so `_set_if` is a safe no-op.
+func test_seed_pool_slot(fid: int, view_f: float, view_target: float, active: bool, terrain: Object) -> void:
+	_pool[fid] = {
+		"terrain": terrain, "mesher": null, "generator": null, "slot": null,
+		"view": int(round(view_f)), "view_f": view_f, "view_target": view_target,
+		"ramp_from": view_f, "editable": active, "spawn_ms": Time.get_ticks_msec(),
+	}
+	if active:
+		_pool_active = fid
+## The bookkeeping (float) live view radius of a slot — the honest ramp state (pool_view reads the real terrain, which
+## a seeded stub slot lacks). -1 if absent.
+func test_pool_view_f(fid: int) -> float:
+	return float(_pool[fid]["view_f"]) if _pool.has(fid) else -1.0
+## Install a stub PlanetRoot so the gate can call the REAL `redesignate` (its top guard needs a non-null root).
+func test_set_planet_root(n: Node3D) -> void:
+	_planet_root = n
 ## The shared baked library / a fid-frozen generator / a fid-carve mesher / the carve range — the SEAM gates build
 ## meshes with these directly (the spike_* accessors' pool-flag twins; available whenever FP_M1_POOL is on).
 func pool_library() -> Object:

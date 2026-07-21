@@ -189,6 +189,16 @@ var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = a
 # skips its per-cell overlay scan on columns absent here (their overlay is empty), collapsing
 # the region's ~30k Vector3i lookups to the handful of genuinely-edited columns.
 var _edit_columns: Dictionary = {}    # Vector2i(x, z) -> true
+# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): the INCREMENTAL per-facet edit index. Maps a facet id to the SET of
+# `_edits` keys authored on it (fid -> {edit_key -> true}). Maintained in the single write/erase choke points
+# (`_write_cell` adds, `sim_revert_cell` removes) under FACETED, so a crossing's `_rebuild_window_indices` +
+# `_translate_active` touch ONLY the incoming facet's edits (O(active-fid)) instead of rescanning the whole `_edits`
+# dict (O(all edits) — up to ~200 k snow cells). A byte-exact subset of `_edits` (same choke points). Empty + unused
+# with the flag off (byte-identical) or under FLAT/curved (non-int keys carry no fid — those paths keep the full scan).
+var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> true)
+# The number of edit keys the LAST `_rebuild_window_indices` iterated (the O() the crossing paid): == the active
+# facet's edit count with FP_EDIT_FID_INDEX on, == the total edit count with it off. Read by verify_edit_fid_index.gd.
+var _rebuild_scanned: int = 0
 # Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
 # ONLY the rare cells that carry a block-entity document (container inventory, sign
 # text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
@@ -365,6 +375,36 @@ func alt_regime_orbital() -> bool:
 ## gate asserts this is exactly 1 across a fall (zero above the gate, one at re-entry). Read-only.
 func alt_redesignate_count() -> int:
 	return _alt_redesignate_count
+
+# --- COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX) introspection — for verify_edit_fid_index.gd. Read-only. ---
+## Edit keys the LAST `_rebuild_window_indices` iterated (the crossing's O() work): active-fid count (index on) vs
+## total (off). The O(window) proof asserts this is bounded + independent of the total edit count.
+func rebuild_scanned_last() -> int:
+	return _rebuild_scanned
+## Total `_edits` overlay size (all facets). The gate seeds ~200 k and checks rebuild_scanned_last() ≪ this.
+func edit_count() -> int:
+	return _edits.size()
+## The per-fid index bucket for `fid` (edit_key -> true), or {} if none. The correctness gate compares its key set
+## against a full `_edits` scan filtered to `fid` (the index MUST equal the full scan).
+func edits_for_fid(fid: int) -> Dictionary:
+	return _edits_by_fid.get(fid, {})
+## All `_edits` keys (every facet) — the correctness gate's full-scan reference source.
+func all_edit_keys() -> Array:
+	return _edits.keys()
+## The packed cell value stored at edit key `k` (0 if absent) — the gate's reference for the `_placed_top` high-water.
+func all_edit_value(k: Variant) -> int:
+	return int(_edits.get(k, 0))
+## The rebuilt window PERF indices — the correctness gate compares these against a manual full-scan reference to
+## prove the indexed rebuild produced byte-identical `_edit_columns`/`_placed_top`.
+func debug_edit_columns() -> Dictionary:
+	return _edit_columns
+func debug_placed_top() -> Dictionary:
+	return _placed_top
+## Seed one overlay edit at `cell` in the CURRENT active facet's frame, skipping the render paint (headless gates
+## have no module/streamer). Routes through the ONE write choke point so the R5 index is exercised exactly as a live
+## snow/place write would maintain it. Test-only helper (verify_edit_fid_index.gd); no live caller.
+func seed_edit_for_test(cell: Vector3i, packed: int) -> void:
+	_write_cell(cell, packed, null, false)
 
 ## The player's RADIAL altitude (blocks above the planet surface) derived from a lattice position in the CURRENT active
 ## facet's frame — the WorldManager-side mirror of Player.radial_altitude() (lattice → world via FacetAtlas, minus the
@@ -894,6 +934,10 @@ func _edit_key(cell: Vector3i) -> Variant:
 ## copy). Curved uses the dedicated window/region unfolds (placed_cells_window / save_region) instead.
 func _overlay_v3i() -> Dictionary:
 	if CubeSphere.FACETED and _chart == null:
+		# COSMOS-PERF UNATTENDED R5: hand the per-fid index's active-facet keys so the projection is O(active-fid),
+		# not a full-dict scan. Off ⇒ the shipped full-scan-and-filter (byte-identical result set).
+		if CubeSphere.FP_EDIT_FID_INDEX:
+			return _translate_active(_edits, _edits_by_fid.get(TerrainConfig.active_facet(), {}).keys())
 		return _translate_active(_edits)
 	return _edits
 
@@ -907,11 +951,14 @@ func _meta_v3i() -> Dictionary:
 ## The (fid, cell)→Vector3i projection of a key-global dict (`_edits` or `_meta`) filtered to the active
 ## facet. Only ever called under FACETED (the caller gates), where `_chart` is null and the unpacked
 ## cell equals the window cell.
-func _translate_active(src: Dictionary) -> Dictionary:
+func _translate_active(src: Dictionary, keys: Variant = null) -> Dictionary:
 	var out := {}
 	var active := TerrainConfig.active_facet()
-	for k in src.keys():
-		if FacetAtlas.edit_key_fid(k) != active:
+	# R5: when `keys` is supplied (the per-fid index's active bucket) every key already belongs to `active`, so the
+	# fid filter is skipped — O(active-fid). `keys == null` ⇒ the shipped full-dict scan + filter (byte-identical).
+	var ks: Array = (keys as Array) if keys != null else src.keys()
+	for k in ks:
+		if keys == null and FacetAtlas.edit_key_fid(k) != active:
 			continue
 		var u := FacetAtlas.edit_key_unpack(k)
 		out[u[1]] = src[k]
@@ -1315,6 +1362,16 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 			block_entity_orphaned.emit(cell, old_meta)
 	if not _edits.has(ek):
 		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): file the NEW key under its facet so a crossing rebuild
+		# touches only this facet's edits. FACETED-only (ek is the (fid,cell) int); a value UPDATE to an existing
+		# key leaves membership — and this index — unchanged, so it is maintained here at first-write only.
+		if CubeSphere.FP_EDIT_FID_INDEX and CubeSphere.FACETED and _chart == null:
+			var _fid: int = FacetAtlas.edit_key_fid(ek)
+			var _bucket: Variant = _edits_by_fid.get(_fid)
+			if _bucket == null:
+				_bucket = {}
+				_edits_by_fid[_fid] = _bucket
+			(_bucket as Dictionary)[ek] = true
 	# COSMOS-FRAME-ORIENTATION §6.4: store the directional modifier in its CANONICAL (true-face) frame so
 	# it survives a flip; PAINT the window-frame value (the current render). No-op for a full cube.
 	_edits[ek] = _overlay_canon_modifier(cell, packed)
@@ -1339,7 +1396,18 @@ func has_edit(cell: Vector3i) -> bool:
 func sim_revert_cell(cell: Vector3i) -> void:
 	# COSMOS: erase by the global edit key and repaint the folded generated value (cell_value_at falls
 	# through to the folded worldgen once the edit is gone). Byte-identical to main in FLAT_WORLD.
-	if _edits.erase(_edit_key(cell)):
+	var ek: Variant = _edit_key(cell)
+	if _edits.erase(ek):
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): the ONLY `_edits` erase — drop the key from its facet bucket
+		# so the index stays a byte-exact subset of `_edits`; retire the bucket when it empties (NEVER-OOM). Off / non-
+		# FACETED ⇒ the index is empty and this is a no-op (byte-identical).
+		if CubeSphere.FP_EDIT_FID_INDEX and CubeSphere.FACETED and _chart == null:
+			var _fid: int = FacetAtlas.edit_key_fid(ek)
+			var _bucket: Variant = _edits_by_fid.get(_fid)
+			if _bucket != null:
+				(_bucket as Dictionary).erase(ek)
+				if (_bucket as Dictionary).is_empty():
+					_edits_by_fid.erase(_fid)
 		_paint_cell(cell, cell_value_at(cell))
 
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
@@ -2610,8 +2678,15 @@ func _rebuild_window_indices() -> void:
 	# index them directly by their unpacked cell (x, z) / y high-water mark.
 	if CubeSphere.FACETED and _chart == null:
 		var active := TerrainConfig.active_facet()
-		for k in _edits.keys():
-			if FacetAtlas.edit_key_fid(k) != active:
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): iterate ONLY the active facet's edits from the per-fid index
+		# (O(active-fid)) instead of the whole `_edits` dict (O(all edits) — up to ~200 k snow cells). The index is a
+		# byte-exact subset filed by the same write/erase choke points, so the rebuilt indices are IDENTICAL. Off ⇒ the
+		# shipped full scan + per-key fid filter (byte-identical). `_rebuild_scanned` records the work actually paid.
+		var indexed: bool = CubeSphere.FP_EDIT_FID_INDEX
+		var ks: Array = _edits_by_fid.get(active, {}).keys() if indexed else _edits.keys()
+		_rebuild_scanned = ks.size()
+		for k in ks:
+			if not indexed and FacetAtlas.edit_key_fid(k) != active:
 				continue
 			var cell: Vector3i = FacetAtlas.edit_key_unpack(k)[1]
 			var col := Vector2i(cell.x, cell.z)

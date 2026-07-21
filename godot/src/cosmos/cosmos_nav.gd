@@ -88,6 +88,32 @@ const NAV_DWELL_DT_MAX := 1.0
 static func clamp_nav_dt(dt: float) -> float:
 	return minf(dt, MAX_NAV_DT) if dt > 0.0 else 0.0
 
+# ---------------------------------------------------------------------------------------
+# COSMOS-PERF FALL-COLLAPSE FIX B (FP_COAST_FULL_DT) — full-real-dt coast substepping (anti time-dilation).
+# clamp_nav_dt bounds work by DROPPING the dt beyond MAX_NAV_DT — correct for stability, but a hitched frame then
+# advances only 1/30 s of game time per real frame, so the coast (free-fall / orbit) runs in slow-motion (the live
+# ~5 fps fall ran at ~1/6 real speed). These helpers instead cover the FULL real delta with N uniform substeps of
+# ≤ MAX_NAV_DT each (each still ≤ 1/30 s ⇒ same per-substep integrator stability), capped at COAST_CATCHUP_MAX s of
+# real time per frame so a catastrophic multi-second hitch integrates a bounded amount (anti-spiral: N ≤ 30). A
+# normal 60-fps frame (delta = 1/60 < MAX_NAV_DT) is exactly ONE substep of the full delta ⇒ byte-identical.
+# ---------------------------------------------------------------------------------------
+const COAST_CATCHUP_MAX := 1.0            # s — max real time a single frame may integrate (anti-spiral catch-up cap)
+
+## Number of ≤MAX_NAV_DT integrator substeps to cover the full real frame `delta` this tick, capped so the total
+## integrated span is ≤ COAST_CATCHUP_MAX (⇒ N ≤ ceil(COAST_CATCHUP_MAX/MAX_NAV_DT) = 30). 0 for dt ≤ 0. Pure.
+static func coast_substep_count(delta: float) -> int:
+	if delta <= 0.0:
+		return 0
+	return maxi(1, int(ceil(minf(delta, COAST_CATCHUP_MAX) / MAX_NAV_DT)))
+
+## The uniform substep dt (≤ MAX_NAV_DT) that covers min(delta, COAST_CATCHUP_MAX) in coast_substep_count(delta)
+## steps: the caller loops coast_substep_count(delta) times integrating this dt each. 0 for dt ≤ 0. Pure.
+static func coast_substep_dt(delta: float) -> float:
+	var n := coast_substep_count(delta)
+	if n <= 0:
+		return 0.0
+	return minf(delta, COAST_CATCHUP_MAX) / float(n)
+
 ## Bounded reciprocal for the finite-difference velocity (v_fix = Δp · fd_inv_dt): 1/max(dt, MIN_FD_DT).
 ## Never larger than 1/MIN_FD_DT, so a near-zero delta cannot produce an unbounded derived velocity.
 static func fd_inv_dt(dt: float) -> float:

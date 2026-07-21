@@ -972,14 +972,20 @@ static func fall_seed_radial(seed: PackedFloat64Array, p_bci: PackedFloat64Array
 ## flight velocity (continuous). NO surface-rotation drag (BCI is inertial). Off-facet ⇒ a straight-down lattice
 ## fallback so the player is never stranded. LIVE-ONLY: the feel of the fall; the gravity math is G-SN-FALLGRAV.
 func _free_fall_move(delta: float) -> void:
-	delta = _CosmosNavCls.clamp_nav_dt(delta)               # G-SN-NOSPIRAL: bound the post-hitch dt
+	# COSMOS-PERF FALL-COLLAPSE FIX B (FP_COAST_FULL_DT): cover the FULL real frame delta with N uniform substeps of
+	# ≤ MAX_NAV_DT each (anti time-dilation) instead of clamping-and-dropping. Off ⇒ N=1 substep of clamp_nav_dt(delta)
+	# — byte-identical to the shipped G-SN-NOSPIRAL clamp-and-drop. The one-time seed below runs ONCE, not per substep.
+	var _fd_full := CubeSphere.FP_COAST_FULL_DT
+	var _fd_n := _CosmosNavCls.coast_substep_count(delta) if _fd_full else 1
+	var _fd_h := _CosmosNavCls.coast_substep_dt(delta) if _fd_full else _CosmosNavCls.clamp_nav_dt(delta)
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		# Off-facet safety: fall straight down in the lattice (never strand the player above a retired facet). Do
 		# NOT set _fall_have_v here — leaving it false keeps _fall_v_bci unseeded so a later on-facet tick seeds it
 		# cleanly (from _nav_last_v_bci) instead of feeding an empty array to OrbitalState.make.
-		velocity.y -= gravity * delta
-		position.y += velocity.y * delta
+		for _si in _fd_n:
+			velocity.y -= gravity * _fd_h
+			position.y += velocity.y * _fd_h
 		return
 	if not _fall_have_v:
 		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
@@ -993,7 +999,8 @@ func _free_fall_move(delta: float) -> void:
 			_fall_v_bci = fall_seed_radial(_fall_v_bci, psd)
 		_foff_radial = false
 		_fall_have_v = true
-	_fall_v_bci = _coast_step(delta, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
+	for _si in _fd_n:
+		_fall_v_bci = _coast_step(_fd_h, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
 	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
@@ -1026,7 +1033,13 @@ func _coast_step(delta: float, v_bci: PackedFloat64Array, body: String) -> Packe
 ## later exit to the dev-flight controller is velocity-continuous. Off-facet ⇒ hold (never strand). LIVE-ONLY: the
 ## feel of orbiting; the orbit math (holds radius / ellipse / escape) is G-OCOAST.
 func _orbit_coast_move(delta: float) -> void:
-	delta = _CosmosNavCls.clamp_nav_dt(delta)               # G-SN-NOSPIRAL: bound the post-hitch dt (no spiral)
+	# COSMOS-PERF FALL-COLLAPSE FIX B (FP_COAST_FULL_DT): integrate the FULL real frame delta in N ≤ MAX_NAV_DT substeps
+	# (anti time-dilation). Off ⇒ N=1 substep of clamp_nav_dt(delta) — byte-identical to the shipped clamp-and-drop.
+	# The SOI-swap test + station-keeping bookkeeping below run ONCE per frame (over the final carried state); the
+	# station-keeping cooldown decrements by the REAL integrated span (`_fd_h * _fd_n`, == clamp_nav_dt(delta) off).
+	var _fd_full := CubeSphere.FP_COAST_FULL_DT
+	var _fd_n := _CosmosNavCls.coast_substep_count(delta) if _fd_full else 1
+	var _fd_h := _CosmosNavCls.coast_substep_dt(delta) if _fd_full else _CosmosNavCls.clamp_nav_dt(delta)
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		velocity = Vector3.ZERO
@@ -1037,9 +1050,10 @@ func _orbit_coast_move(delta: float) -> void:
 	if _coast_p_bci.size() != 3:
 		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
 		_coast_p_bci = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
-	var out := _coast_step_kepler(delta, _coast_p_bci, _coast_v_bci, _dominant_body())
-	_coast_p_bci = out[0]
-	_coast_v_bci = out[1]
+	for _si in _fd_n:
+		var out := _coast_step_kepler(_fd_h, _coast_p_bci, _coast_v_bci, _dominant_body())
+		_coast_p_bci = out[0]
+		_coast_v_bci = out[1]
 	# COSMOS-ORBITAL-O1O4 O4c (§3.5) — the SOI dominant-body SWAP. After the integration tick, test whether the
 	# carried BCI point (in the current body's frame) has crossed a sphere-of-influence boundary; if the deepest
 	# SOI now belongs to a different body, RE-EXPRESS the carried [p,v] into that body's BCI frame (an exact,
@@ -1058,7 +1072,8 @@ func _orbit_coast_move(delta: float) -> void:
 			_apply_body_feel(newb)
 	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere, periodically add a small prograde
 	# Δv so it re-lifts instead of decaying in. Self-limiting (caps at circular speed) ⇒ never boosts to escape.
-	_coast_boost_cd -= delta
+	# FIX B: decrement by the REAL integrated span this frame (== clamp_nav_dt(delta) with the flag off — byte-identical).
+	_coast_boost_cd -= _fd_h * float(_fd_n)
 	if _coast_boost_cd <= 0.0:
 		var dv := _DevFlightCls.station_keep_dv(_dominant_body(), _coast_p_bci, _coast_v_bci)
 		if _DVCls.length(dv) > 0.0:

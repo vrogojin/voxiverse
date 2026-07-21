@@ -96,6 +96,15 @@ const FACET_CORNER_SLACK := 2.0       # COSMOS FS-W (§3): a corner-commit landi
 var _last_pool_spawn_ms := -100000
 var _last_pool_retire_ms := -100000
 var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME, §0-W3/§5): the altitude regime latch. `_alt_orbital` is true while the
+# player is above the ATMO_TOP gate (ORBITAL — the near field is frozen: no per-tick redesignation / pool-manage /
+# snow / shrink-snap); it flips with ALT_REGIME_HYST hysteresis in _update_alt_regime (driven from update_streaming).
+# `_alt_reentry_pending` is armed on the ORBITAL→SURFACE transition and consumed by the very next maybe_cross_facet to
+# do the ONE restore redesignation onto the true sub-camera facet. `_alt_redesignate_count` (test-visible) counts those
+# restores. All three are inert (false/0, never read) with FP_ALT_REGIME off ⇒ byte-identical.
+var _alt_orbital := false
+var _alt_reentry_pending := false
+var _alt_redesignate_count := 0
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -342,11 +351,58 @@ func _snow_skip_airborne() -> bool:
 static func snow_skip_airborne(alt_y: float) -> bool:
 	return CubeSphere.FP_SNOW_SKIP_AIRBORNE and alt_y > CubeSphere.OFFSURFACE_Y
 
+## COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME) — true while the near-field machinery is FROZEN (the ORBITAL regime): no
+## per-tick redesignation, no _manage_facet_pool churn, no main-thread snow step. The ONE cheap gate every freeze site
+## reads. Byte-identical false with the flag off (the latch never leaves SURFACE, so `_alt_orbital` stays false).
+func _alt_frozen() -> bool:
+	return CubeSphere.FP_ALT_REGIME and _alt_orbital
+
+## Public read of the ORBITAL regime latch (the freeze predicate) — for the verify_alt_regime altitude-sweep gate.
+func alt_regime_orbital() -> bool:
+	return _alt_frozen()
+
+## Public read of the cumulative re-entry restore count (redesignations forced by crossing the gate downward) — the
+## gate asserts this is exactly 1 across a fall (zero above the gate, one at re-entry). Read-only.
+func alt_redesignate_count() -> int:
+	return _alt_redesignate_count
+
+## The player's RADIAL altitude (blocks above the planet surface) derived from a lattice position in the CURRENT active
+## facet's frame — the WorldManager-side mirror of Player.radial_altitude() (lattice → world via FacetAtlas, minus the
+## planet radius). This is the physically-correct "how far up am I" the sky/atmo/weather gates already use (vs the
+## cheap plane-relative lattice-y the pool/snow off-surface tests use). Non-faceted / no active facet ⇒ the raw y.
+func _radial_altitude_lattice(player_pos: Vector3) -> float:
+	if not CubeSphere.FACETED:
+		return player_pos.y
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return player_pos.y
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - FacetAtlas.R_BLOCKS
+
+## COSMOS-PERF UNATTENDED R3 — advance the altitude regime latch from the current player position (called once per
+## physics tick from update_streaming, under FP_ALT_REGIME). Hysteresis about ATMO_TOP: enter ORBITAL only above
+## ATMO_TOP + ALT_REGIME_HYST, return to SURFACE only below ATMO_TOP − ALT_REGIME_HYST (so a grazing pass across the
+## ceiling never flaps the freeze / re-entry restore). On the ORBITAL→SURFACE edge it arms `_alt_reentry_pending`, which
+## the next maybe_cross_facet consumes to restore the near field onto the sub-camera facet. No-op with the flag off.
+func _update_alt_regime(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_ALT_REGIME or not CubeSphere.FACETED:
+		return
+	var alt := _radial_altitude_lattice(player_pos)
+	if _alt_orbital:
+		if alt < CubeSphere.ATMO_TOP - CubeSphere.ALT_REGIME_HYST:
+			_alt_orbital = false
+			_alt_reentry_pending = true   # armed for the next maybe_cross_facet: ONE restore redesignation
+	else:
+		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_HYST:
+			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
-	if _snowfall != null and _have_player_pos and not _snow_skip_airborne():
+	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
+	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
+	if _snowfall != null and _have_player_pos and not _snow_skip_airborne() and not _alt_frozen():
 		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
 		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)
@@ -707,6 +763,10 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME): advance the altitude regime latch FIRST (before the pool-manage /
+	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
+	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.
+	_update_alt_regime(player_pos)
 	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
@@ -721,7 +781,10 @@ func update_streaming(player_pos: Vector3) -> void:
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
-	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
+	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
+	# churn) while the ORBITAL near field is frozen — none of it is visible at altitude, and the pool targets are held
+	# until re-entry. `not _alt_frozen()` is byte-identical true with FP_ALT_REGIME off.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null and not _alt_frozen():
 		_manage_facet_pool(player_pos)
 	if CubeSphere.M5C_CORNER:
 		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
@@ -1874,6 +1937,21 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		return {}
+	# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME): the altitude regime gate — the §0-W3 killer. `_update_alt_regime`
+	# (run first, in update_streaming) owns the latch; here we only ACT on it. Two one-shot cases take priority over the
+	# whole crossing pipeline:
+	#   • RE-ENTRY (just descended below the gate): do the ONE restore redesignation onto the true sub-camera facet so a
+	#     landing has terrain, then hand off to normal crossings + FP_LANDING_STREAM_KICK below the gate.
+	#   • ORBITAL (frozen): return early — NO redesignation / _rebuild_window_indices / 128→96 shrink-snap / gravity /
+	#     collider work. None of it is on screen at altitude (draws ≈ 30 = shell + sky). This is the fall's phys_ms.
+	# Placed before the cooldown/ridge scan so the freeze is total and the restore is not gated by a stale cooldown.
+	# Flag off ⇒ neither branch is reachable (`_alt_reentry_pending`/`_alt_orbital` never set) — byte-identical.
+	if CubeSphere.FP_ALT_REGIME:
+		if _alt_reentry_pending:
+			_alt_reentry_pending = false
+			return _alt_reentry_restore(fid, player_pos)
+		if _alt_orbital:
+			return {}
 	# FP-S1(c): cooldown — after a committed crossing, suppress the next FACET_CROSS_COOLDOWN calls so a crossing
 	# can never re-fire immediately (ridge-jitter / residual oscillation). A genuine sequential crossing traverses
 	# the whole facet (many ticks ≫ cooldown), so this never blocks a legitimate crossing.
@@ -1914,125 +1992,151 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 					continue                       # tie / all too shallow → defer one tick (as shipped)
 				to = int(cc["to"])
 				np = cc["np"]
-			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
-			var yaw_delta := atan2(ex.z, ex.x)
-			# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
-			# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
-			# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
-			var _cross_t0 := Time.get_ticks_usec()
-			var _rebuild_us := 0
-			var _redesig_us := 0
-			var _far_us := 0
-			TerrainConfig.set_active_facet(to)
-			# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
-			# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
-			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
-			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
-			var _rebuild_t0 := Time.get_ticks_usec()
-			_rebuild_window_indices()
-			_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
-			# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
-			# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
-			# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
-			var redesignated := false
-			var _redesig_t0 := Time.get_ticks_usec()
-			if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
-				redesignated = bool(_module_world.call("redesignate", to))
-				if not redesignated:
-					# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
-					# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
-					_pool_miss_count += 1
-					if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
-						redesignated = bool(_module_world.call("redesignate", to))
-					if not redesignated and _module_world.has_method("pool_reset"):
-						# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
-						# blank. NOT the FP-S1 set_facet path.
-						redesignated = bool(_module_world.call("pool_reset", to))
-			_redesig_us = Time.get_ticks_usec() - _redesig_t0
-			if redesignated:
-				# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
-				# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
-				# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
-				var _far_t0 := Time.get_ticks_usec()
-				if _facet_ring != null:
-					_facet_ring.set_active(to)
-					_facet_ring_sync_exclusion()
-				if _skin != null:
-					_skin.call("set_active", to)
-				_far_us = Time.get_ticks_usec() - _far_t0
-			else:
-				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
-				# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
-				if _module_world != null and _module_world.has_method("set_facet"):
-					var old_mod_pos: Vector3 = _module_world.position
-					_module_world.call("set_facet", to, old_mod_pos)
-				if _facet_ring != null:
-					_facet_ring.set_active(to)
-				if _skin != null:
-					_skin.call("set_active", to)
-				_flip_settling = true
-				_restream()
-			# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
-			# redesignate() SKIPPED the PlanetRoot transform write (module_world, flag-gated), so NO
-			# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
-			# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
-			if _fixed_frame_on():
-				# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
-				#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
-				#    planet-absolute space. O(1) — never terrain.
-				_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
-				# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
-				#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
-				#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
-				#    sleepers keep their global pose → stay asleep. (The player is NOT compensated here — apply_reframe
-				#    assigns its lattice-B local next; the collider is rebuilt below.)
-				var cross_delta := FacetAtlas.crossing_transform(fid, to)
-				for c in _frame_host().get_children():
-					if c is VoxelBody:
-						var vb := c as VoxelBody
-						var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
-						vb.transform = cross_delta * vb.transform
-						vb.sleeping = was_sleeping
-				# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
-				#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
-				#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
-				_sync_gravity_areas()
-				# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
-				#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
-				#    entirely when no awake debris are near, exactly as today).
-				if _ground != null:
-					_ground.note_facet_crossing()
-			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
-			print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
-				"RE-DESIGNATION" if redesignated else "restream + far re-place"])
-			# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
-			# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
-			# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
-			# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
-			var _cross_us := Time.get_ticks_usec() - _cross_t0
-			var _rd: Dictionary = {}
-			if _module_world != null and _module_world.has_method("take_last_redesignate"):
-				_rd = _module_world.call("take_last_redesignate")
-			var _rec := {
-				"ev": "crossing",
-				"from_fid": fid, "to_fid": to,
-				"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
-				"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
-				"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
-				"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
-				"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
-				"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
-				"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
-				"live_neighbours": int(_rd.get("live_neighbours", 0)),
-				"lod_tiles": int(_rd.get("lod_tiles", 0)),
-				"redesignated": redesignated,
-			}
-			_crossing_events.append(_rec)
-			while _crossing_events.size() > CROSSING_EVENTS_MAX:
-				_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
-			return {"crossed": true, "from": fid, "to": to,
-				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+			return _commit_facet_change(fid, to, np, slot)
 	return {}
+
+## COSMOS FP-FIXED-FRAME §2.2 / FP-M1c — the committed facet-change bookkeeping, shared by a normal seam crossing
+## (maybe_cross_facet) and the R3 re-entry restore (_alt_reentry_restore). `to` is the destination facet, `np` the
+## f64 reframed player landing (FacetAtlas.reframe_position64), `slot` the crossed seam slot (-1 for a re-entry
+## restore — a direct facet_of_dir jump, not a seam march). Returns the `{crossed,…}` dict the player consumes via
+## apply_reframe. This is the ONLY place the active facet flips + the near field re-designates. Byte-identical to the
+## shipped inline crossing (a pure extract-method refactor; every path/instrumentation line is unchanged).
+func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary:
+	var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
+	var yaw_delta := atan2(ex.z, ex.x)
+	# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
+	# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
+	# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
+	var _cross_t0 := Time.get_ticks_usec()
+	var _rebuild_us := 0
+	var _redesig_us := 0
+	var _far_us := 0
+	TerrainConfig.set_active_facet(to)
+	# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
+	# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
+	# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
+	# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
+	var _rebuild_t0 := Time.get_ticks_usec()
+	_rebuild_window_indices()
+	_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
+	# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
+	# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
+	# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
+	var redesignated := false
+	var _redesig_t0 := Time.get_ticks_usec()
+	if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
+		redesignated = bool(_module_world.call("redesignate", to))
+		if not redesignated:
+			# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
+			# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
+			_pool_miss_count += 1
+			if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
+				redesignated = bool(_module_world.call("redesignate", to))
+			if not redesignated and _module_world.has_method("pool_reset"):
+				# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
+				# blank. NOT the FP-S1 set_facet path.
+				redesignated = bool(_module_world.call("pool_reset", to))
+	_redesig_us = Time.get_ticks_usec() - _redesig_t0
+	if redesignated:
+		# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
+		# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
+		# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
+		var _far_t0 := Time.get_ticks_usec()
+		if _facet_ring != null:
+			_facet_ring.set_active(to)
+			_facet_ring_sync_exclusion()
+		if _skin != null:
+			_skin.call("set_active", to)
+		_far_us = Time.get_ticks_usec() - _far_t0
+	else:
+		# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
+		# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
+		if _module_world != null and _module_world.has_method("set_facet"):
+			var old_mod_pos: Vector3 = _module_world.position
+			_module_world.call("set_facet", to, old_mod_pos)
+		if _facet_ring != null:
+			_facet_ring.set_active(to)
+		if _skin != null:
+			_skin.call("set_active", to)
+		_flip_settling = true
+		_restream()
+	# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
+	# redesignate() SKIPPED the PlanetRoot transform write (module_world, flag-gated), so NO
+	# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
+	# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
+	if _fixed_frame_on():
+		# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
+		#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
+		#    planet-absolute space. O(1) — never terrain.
+		_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
+		# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
+		#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
+		#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
+		#    sleepers keep their global pose → stay asleep. (The player is NOT compensated here — apply_reframe
+		#    assigns its lattice-B local next; the collider is rebuilt below.)
+		var cross_delta := FacetAtlas.crossing_transform(fid, to)
+		for c in _frame_host().get_children():
+			if c is VoxelBody:
+				var vb := c as VoxelBody
+				var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
+				vb.transform = cross_delta * vb.transform
+				vb.sleeping = was_sleeping
+		# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
+		#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
+		#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
+		_sync_gravity_areas()
+		# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
+		#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
+		#    entirely when no awake debris are near, exactly as today).
+		if _ground != null:
+			_ground.note_facet_crossing()
+	_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
+	print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
+		"RE-DESIGNATION" if redesignated else "restream + far re-place"])
+	# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
+	# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
+	# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
+	# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
+	var _cross_us := Time.get_ticks_usec() - _cross_t0
+	var _rd: Dictionary = {}
+	if _module_world != null and _module_world.has_method("take_last_redesignate"):
+		_rd = _module_world.call("take_last_redesignate")
+	var _rec := {
+		"ev": "crossing",
+		"from_fid": fid, "to_fid": to,
+		"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
+		"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
+		"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
+		"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
+		"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
+		"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
+		"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
+		"live_neighbours": int(_rd.get("live_neighbours", 0)),
+		"lod_tiles": int(_rd.get("lod_tiles", 0)),
+		"redesignated": redesignated,
+	}
+	_crossing_events.append(_rec)
+	while _crossing_events.size() > CROSSING_EVENTS_MAX:
+		_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
+	return {"crossed": true, "from": fid, "to": to,
+		"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+
+## COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME, §0-W3) — the ONE re-entry restore. On descent back below the ATMO_TOP
+## gate the frozen active facet is stale (the ground track drifted while frozen), so redesignate directly onto the
+## TRUE sub-camera facet (FacetAtlas.facet_of_dir of the player's world direction) — a single O(1) _commit_facet_change,
+## NOT a slow seam-by-seam walk. The player pose is re-expressed by the returned crossing dict (apply_reframe) and the
+## _heal_frame_desync invariant, so the restore is position/velocity-continuous. If the sub-camera facet already IS the
+## frozen facet (a purely radial descent) nothing needs restoring — return {} and let the resumed pool + FP_LANDING_
+## STREAM_KICK grow the near view for touchdown. Only reached under FP_ALT_REGIME, once, on the ORBITAL→SURFACE edge.
+func _alt_reentry_restore(fid: int, player_pos: Vector3) -> Dictionary:
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	var to := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	if to < 0 or to == fid:
+		return {}   # already on the sub-camera facet — the frozen near field is correct; pool/stream resumes next tick
+	_alt_redesignate_count += 1
+	var np: Array = FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+	print("[WorldManager] R3 re-entry restore: redesignate %d -> %d (sub-camera facet, alt gate)" % [fid, to])
+	return _commit_facet_change(fid, to, np, -1)
 
 ## FP-M1c (§4.3): the neighbour-pool manager, run every physics tick from update_streaming (pool flag only).
 ## Spawn a facet whose own-side ridge distance is below D_WARM (nearest first), retire a pooled neighbour past

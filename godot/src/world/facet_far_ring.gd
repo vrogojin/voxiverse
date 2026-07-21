@@ -112,6 +112,15 @@ var _prewarm_cursor := -1                   # -1 = not started; 0..6·K² = next
 var _emit_cached_only := false              # the current rebuild emits ONLY cache-ready facets (true-orbit progressive path)
 var _last_emit_cache_size := 0             # total cached facets at the last progressive re-emit (re-emit-on-growth throttle)
 var _was_done := false                      # _warm_front returned true last orbit frame (fire ONE final full emit on completion, no prewarm-churn)
+# COSMOS TIER-DEPTH-PRIORITY warm-converge (FP_TIER_WARM_CONVERGE): the SURFACE progressive-emit state (isolated from the
+# orbit S1b vars above so the two paths never alias). `_srf_converged` gates the idle short-circuit (no per-frame warm scan
+# once the whole front is cached + emitted); `_srf_last_bcache`/`_srf_last_ccache` are the dense/coarse cache sizes at the
+# last progressive emit — a grown dense cache (a new sunk backstop) re-emits immediately (kills the stale over-near quad),
+# coarse growth batches at SHELL_REEMIT_GROWTH (far-horizon holes are benign). All scalars → NEVER-OOM.
+var _srf_converged := false
+var _srf_was_done := false
+var _srf_last_bcache := 0
+var _srf_last_ccache := 0
 # Live-path telemetry counters/values (remote_bridge streams shell_telemetry() → disambiguate the live driver→warm→emit chain).
 var _begin_rebuild_count := 0               # times _begin_rebuild fired (0 post-engage ⇒ the emit never runs = warm-gate stall)
 var _warm_pass_count := 0                   # _warm_front returned true (cap fully cached in one frame)
@@ -338,6 +347,10 @@ func _process(_dt: float) -> void:
 			_emit_cached_only = true
 			_begin_rebuild()
 		_was_done = done
+	elif TierPlace.warm_converge_on():
+		# TIER-DEPTH warm-converge: the SURFACE path adopts the progressive discipline so a stale un-sunk backstop quad
+		# never lingers over live near meshes while the dense caches warm (the over-near strip / sh_wfail thrash).
+		_surface_converge_emit(p)
 	else:
 		# SURFACE (floored) / shipped: the all-or-nothing warm gate (byte-identical; the worker never sees an uncached facet).
 		if not _pending:
@@ -348,6 +361,34 @@ func _process(_dt: float) -> void:
 			_begin_rebuild()
 		else:
 			_warm_fail_count += 1
+
+## COSMOS TIER-DEPTH-PRIORITY warm-converge (FP_TIER_WARM_CONVERGE, §5.3 / §7 P1): the SURFACE progressive-emit driver
+## that replaces the all-or-nothing warm gate. Warm cumulatively under WARM_BUDGET_MS, then emit the cache-ready subset
+## (visible_fids(true) filters an uncached backstop OUT — it is never drawn as a stale un-sunk quad), re-emitting the
+## MOMENT a new dense backstop cache lands so a just-entered pool facet flips to SUNK the frame it is ready (kills the
+## over-near strip); far-horizon coarse growth batches at SHELL_REEMIT_GROWTH (its transient holes sit behind the near
+## disk). Idle short-circuit preserves the shipped zero-cost steady state: once the whole front is cached AND emitted
+## (`_srf_converged`) it does no work until the next role-event (`_pending`). `p` = [cull axis, cos threshold] (shipped
+## active-facet law on the surface). Bounded re-emits (≤ backstop count) + scalar state ⇒ NEVER-OOM.
+func _surface_converge_emit(p: Array) -> void:
+	if not _pending and _srf_converged:
+		return                                    # steady state — no per-frame warm scan (matches the shipped idle frame)
+	_emit_cached_only = true
+	var done := _warm_front(p[0], p[1])
+	if done:
+		_warm_pass_count += 1
+	else:
+		_warm_fail_count += 1
+	var b_ready := _bpos_cache.size()             # a grown dense cache == a new sunk backstop ready to replace a stale quad
+	var c_ready := _pos_cache.size()
+	var back_grew := b_ready > _srf_last_bcache
+	var horizon_grew := (c_ready - _srf_last_ccache) >= CubeSphere.SHELL_REEMIT_GROWTH
+	if _pending or back_grew or horizon_grew or (done and not _srf_was_done):
+		_srf_last_bcache = b_ready
+		_srf_last_ccache = c_ready
+		_begin_rebuild()                          # emits visible_fids(true) — cache-ready facets only, sunk backstops included
+	_srf_was_done = done
+	_srf_converged = done                         # fully cached + emitted ⇒ idle until the next role-event re-sets _pending
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,

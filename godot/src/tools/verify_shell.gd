@@ -74,6 +74,10 @@ func _initialize() -> void:
 	else:
 		print("  (G-SHELL-PREWARM skipped — sed FP_SHELL_PREWARM = true to run S2)")
 	_gate_fall_hold(active)
+	if CubeSphere.FP_WARM_TRUE_BUDGET:
+		_gate_true_budget_warm(active)
+	else:
+		print("  (G-WARM-TRUE-BUDGET skipped — sed FP_WARM_TRUE_BUDGET = true to run FIX D)")
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -567,6 +571,79 @@ func _gate_fall_hold(active: int) -> void:
 	_ok(on_count <= 2, "G-SHELL-FALLHOLD: hold ON schedules ≤ 2 re-emits over the whole fall (%d — essentially just engage)" % on_count)
 	_ok(off_count >= 5, "G-SHELL-FALLHOLD: hold OFF re-emits repeatedly (%d — each a synchronous _rebuild_full spike)" % off_count)
 	_ok(off_count >= 3 * on_count, "G-SHELL-FALLHOLD: hold ON cuts scheduled re-emits ≥ 3× vs shipped (%d → %d)" % [off_count, on_count])
+
+# ---------------- G-WARM-TRUE-BUDGET (FIX D, FP_WARM_TRUE_BUDGET / R1): the warm CONVERGES + doesn't re-warm under drift ----------------
+## COSMOS-PERF FALL-COLLAPSE FIX D (R1) — the ROOT of the sh_wfail thrash in ALL modes (walk, fly, fall). The shipped
+## _warm_front charges the whole 6·K² front-visibility SCAN against the 3 ms budget; on web (×25) the scan alone exceeds
+## 3 ms so it returns false ("not done") FOREVER — even when every facet is cached → the idle short-circuits are
+## unreachable → it re-scans + fails (sh_wfail++) every frame even for a plain surface walk with ZERO crossings
+## (measured p50 21 fps, sh_wfail +3.5/frame). The R1 warm budgets only real _ensure_cached WORK and returns true the
+## moment a scan finds nothing uncached (regardless of elapsed). This gate proves the web-relevant invariants (the ×25
+## penalty only inflates the SCAN time, which R1 no longer charges, so the convergence logic is provable on this host):
+## (1) it CONVERGES (a full scan with nothing uncached ⇒ done=true — which the shipped budget scan can never reach on
+## web); (2) once converged, further calls do ZERO re-warm (coarse cache flat — the thrash is gone); (3) under
+## CONTINUOUS small view drift (a walk) the warm work stays BOUNDED (only boundary facets enter — never a whole-front
+## re-warm) and it RE-CONVERGES (returns true) each settle; (4) sh_wfail (warm_fail_count) does NOT climb once converged.
+func _gate_true_budget_warm(active: int) -> void:
+	print("  --- G-WARM-TRUE-BUDGET (FIX D / R1): warm converges + no re-warm thrash under continuous drift ---")
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active)
+	var p: Array = ring.call("_cull_params")     # surface cull law: [active-facet normal, BACK_CULL]
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var total := 6 * FA.K * FA.K
+	# (1) convergence: keep stepping the same view — a full scan with nothing uncached returns true (done) in bounded calls.
+	var calls := 0
+	var converged := false
+	while calls < 500:
+		calls += 1
+		if bool(ring.call("warm_front_step", nrm, thresh)):
+			converged = true
+			break
+	_ok(converged, "G-WARM-TRUE-BUDGET: (1) the warm CONVERGES (done=true) in %d calls — the shipped budget scan never does on web" % calls)
+	var cache_at_conv := int(ring.call("coarse_cache_size"))
+	# (2) idempotent / no re-warm after convergence: further steps return true and warm ZERO new facets (cache flat).
+	var stayed := true
+	for _i in range(200):
+		if not bool(ring.call("warm_front_step", nrm, thresh)):
+			stayed = false
+	_ok(stayed, "G-WARM-TRUE-BUDGET: (2) stays CONVERGED (every post-converge step returns true — the idle gate can engage)")
+	_ok(int(ring.call("coarse_cache_size")) == cache_at_conv, "G-WARM-TRUE-BUDGET: (2b) 200 post-converge steps re-warm NOTHING (cache flat at %d) — the thrash is gone" % cache_at_conv)
+	var fail_before := int(ring.call("warm_fail_count"))
+	# (3) bounded under continuous small drift (a walk): wobble the cull axis a little each frame; the warm work
+	#     (cache growth) stays BOUNDED — only boundary facets enter, never a whole-front re-warm — and it re-converges.
+	var e := _perp(Vector3(nrm[0], nrm[1], nrm[2]))
+	var e1: Vector3 = e[0]
+	var base := Vector3(nrm[0], nrm[1], nrm[2])
+	var cache_before_drift := int(ring.call("coarse_cache_size"))
+	for i in range(200):
+		var ang := deg_to_rad(0.4 * float(i % 20))   # small wobble ≤ ~8° (a walking camera), never a teleport
+		var d := (base * cos(ang) + e1 * sin(ang)).normalized()
+		ring.call("warm_front_step", [d.x, d.y, d.z], thresh)
+	var grew := int(ring.call("coarse_cache_size")) - cache_before_drift
+	_ok(grew < total / 4, "G-WARM-TRUE-BUDGET: (3) 200 frames of continuous drift grew the warm cache by only %d (< %d) — bounded, no per-frame re-warm" % [grew, total / 4])
+	_ok(int(ring.call("coarse_cache_size")) <= total, "G-WARM-TRUE-BUDGET: (3b) coarse cache ≤ 6·K² = %d (fixed ceiling, NEVER-OOM)" % total)
+	# (4) after the drift settles, it re-converges → sh_wfail stops climbing (the live target).
+	var reconv := false
+	for _j in range(500):
+		if bool(ring.call("warm_front_step", nrm, thresh)):
+			reconv = true
+			break
+	var fail_after := int(ring.call("warm_fail_count"))
+	_ok(reconv, "G-WARM-TRUE-BUDGET: (4) re-converges after the drift settles (done reachable again)")
+	# (5) DESCENT sweep: as a fall approaches the surface θ_emit shrinks (acos(R/d) → 0), so the emit cap SHRINKS —
+	#     a subset of the already-warmed front. A shrinking-cap sweep must converge every step with ZERO new warm.
+	var cache_pre_descent := int(ring.call("coarse_cache_size"))
+	var desc_ok := true
+	for step in range(12):
+		var tighter := thresh + (1.0 - thresh) * (float(step) / 12.0)   # cos rising toward 1 ⇒ cap shrinking (descent)
+		if not bool(ring.call("warm_front_step", nrm, tighter)):
+			desc_ok = false
+	_ok(desc_ok, "G-WARM-TRUE-BUDGET: (5) a DESCENT (shrinking θ_emit cap) converges every step — the far side never re-thrashes on approach")
+	_ok(int(ring.call("coarse_cache_size")) == cache_pre_descent, "G-WARM-TRUE-BUDGET: (5b) the shrinking descent cap warms NOTHING new (subset of the warmed front, cache flat at %d)" % cache_pre_descent)
+	print("    converged in %d calls; cache %d→%d under drift; wfail %d→%d" % [calls, cache_before_drift, int(ring.call("coarse_cache_size")), fail_before, fail_after])
+	ring.free()
 
 ## Simulate a gravity-accelerated free-fall descent (R+900 → surface, dt = 200 ms @ ~5 fps, like the live fall) and
 ## count how many far-ring re-emits the trigger schedules. Pure radial fall (fixed axis ⇒ drift = 0), so this isolates

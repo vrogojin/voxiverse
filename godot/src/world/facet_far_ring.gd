@@ -123,6 +123,11 @@ var _orbit_converged := false               # front fully cached + emitted, noth
 var _last_snapshot_ms := 0                   # wall-ms of the last shell snapshot (throttle base for the fall-hold re-emit)
 var _last_rebuild_ms := 0                    # wall-ms of the last orbit-branch _begin_rebuild (throttle base for grew re-emits)
 var _snapshot_count := 0                     # diagnostics: times _shell_snapshot fired (a scheduled re-emit) — flat during a held fall
+# COSMOS-PERF FALL-COLLAPSE FIX D (FP_WARM_TRUE_BUDGET, R1): O(visible) scan support. `_centre_pack` is a lazily-built
+# packed array of all 6·K² facet centre-dirs — iterated inline in _warm_front_true_budget so the per-frame scan avoids
+# the per-fid _centre_dir DICT lookup + the _front_visible function-call overhead (the ×25 web scan cost). Bounded (one
+# fixed-size array ≤ 6·K² Vector3 ⇒ NEVER-OOM), built once. Empty (never built) off-flag.
+var _centre_pack := PackedVector3Array()
 # COSMOS TIER-DEPTH-PRIORITY warm-converge (FP_TIER_WARM_CONVERGE): the SURFACE progressive-emit state (isolated from the
 # orbit S1b vars above so the two paths never alias). `_srf_converged` gates the idle short-circuit (no per-frame warm scan
 # once the whole front is cached + emitted); `_srf_last_bcache`/`_srf_last_ccache` are the dense/coarse cache sizes at the
@@ -373,7 +378,7 @@ func _process(_dt: float) -> void:
 		# the ~1900-facet cap being cached in ONE frame (impossible under web ×25 warm cost → the live far-side stall).
 		# Warm cumulatively under budget, emit the cache-ready subset now, re-emit as coverage grows (throttled by
 		# SHELL_REEMIT_GROWTH). The async worker still reads only cache-ready facets (visible_fids cache-filters here).
-		var done := _warm_front(p[0], p[1])
+		var done := _warm_front_step(p[0], p[1])
 		if done:
 			_warm_pass_count += 1
 		else:
@@ -407,7 +412,7 @@ func _process(_dt: float) -> void:
 		if not _pending:
 			return
 		_emit_cached_only = false
-		if _warm_front(p[0], p[1]):   # all front-hemisphere facets cached → safe to re-emit this frame
+		if _warm_front_step(p[0], p[1]):   # all front-hemisphere facets cached → safe to re-emit this frame
 			_warm_pass_count += 1
 			_begin_rebuild()
 		else:
@@ -425,7 +430,7 @@ func _surface_converge_emit(p: Array) -> void:
 	if not _pending and _srf_converged:
 		return                                    # steady state — no per-frame warm scan (matches the shipped idle frame)
 	_emit_cached_only = true
-	var done := _warm_front(p[0], p[1])
+	var done := _warm_front_step(p[0], p[1])
 	if done:
 		_warm_pass_count += 1
 	else:
@@ -568,6 +573,65 @@ func _warm_front(nrm: Array, thresh: float) -> bool:
 				if Time.get_ticks_usec() - t0 > budget_us:
 					return false     # budget spent — finish warming next frame
 	return true
+
+## COSMOS-PERF FALL-COLLAPSE FIX D (FP_WARM_TRUE_BUDGET, R1) — the warm-path dispatcher. Off ⇒ the shipped _warm_front
+## verbatim (byte-identical). On ⇒ the "true budget" scan below. All three _process warm sites route through here so
+## surface (walk) + orbit (fall) both get the convergence fix.
+func _warm_front_step(nrm: Array, thresh: float) -> bool:
+	if CubeSphere.FP_WARM_TRUE_BUDGET:
+		return _warm_front_true_budget(nrm, thresh)
+	return _warm_front(nrm, thresh)
+
+## COSMOS-PERF FALL-COLLAPSE FIX D (R1) — build the packed centre-dir array ONCE (6·K² Vector3). Iterated inline by
+## _warm_front_true_budget so the scan avoids the per-fid _centre_dir dict lookup. Idempotent; bounded ⇒ NEVER-OOM.
+func _ensure_centre_pack() -> void:
+	var total := 6 * FacetAtlas.K * FacetAtlas.K
+	if _centre_pack.size() == total:
+		return
+	_centre_pack.resize(total)
+	for fid in range(total):
+		var cd := _facet_centre_dir(fid)
+		_centre_pack[fid] = Vector3(cd[0], cd[1], cd[2])
+
+## COSMOS-PERF FALL-COLLAPSE FIX D (R1) — the "true warm budget" front-hemisphere warm. Scans the whole front (inline
+## over the packed centre-dir array — no per-fid dict lookup / function call) and warms uncached facets, but charges
+## ONLY the actual _ensure_cached WORK against WARM_BUDGET_MS, never the read-only scan. Returns true the moment a full
+## scan finds NOTHING uncached — regardless of elapsed time. That is the R1 fix: the shipped _warm_front charges the
+## whole 3456-facet scan against the budget, so on web ×25 the scan alone exceeds 3 ms and it returns false FOREVER even
+## when every facet is cached (`done` unreachable → the idle gates never engage → ~3 ms/frame + sh_wfail burned in every
+## mode). Here `done` becomes reachable, so the warm CONVERGES and the caller's idle short-circuit then stops the scan.
+## `_front_visible`'s active/excluded skip is inlined (surface only, per the shipped law). NEVER-OOM: caches only grow,
+## one fixed packed array. Returns false when the WARM budget is spent mid-scan (uncached facets remain — resume next frame).
+func _warm_front_true_budget(nrm: Array, thresh: float) -> bool:
+	_ensure_centre_pack()
+	var total := 6 * FacetAtlas.K * FacetAtlas.K
+	var nv := Vector3(nrm[0], nrm[1], nrm[2])
+	var full_cover := CubeSphere.FP_FARRING_FULL_COVER
+	var surface_skip := not full_cover and not _shell_orbit()   # the shipped active/excluded skip applies on the surface only
+	var budget_us := int(WARM_BUDGET_MS * 1000.0)
+	var warm_us := 0                                            # ONLY real _ensure_cached time is charged (R1)
+	var clean := true                                          # no uncached front facet met this scan ⇒ converged
+	for fid in range(total):
+		if _centre_pack[fid].dot(nv) < thresh:                 # back-hemisphere cull (cheapest, rejects most fids) — read-only, not budgeted
+			continue
+		if surface_skip and (fid == _active_fid or _excluded.has(fid)):
+			continue
+		if full_cover and _is_backstop(fid):
+			if not _bpos_cache.has(fid):
+				clean = false
+				var w0 := Time.get_ticks_usec()
+				_ensure_backstop_cached(fid)
+				warm_us += Time.get_ticks_usec() - w0
+				if warm_us > budget_us:
+					return false                              # WARM budget spent (not the scan) — more to warm next frame
+		elif not _pos_cache.has(fid):
+			clean = false
+			var w1 := Time.get_ticks_usec()
+			_ensure_cached(fid)
+			warm_us += Time.get_ticks_usec() - w1
+			if warm_us > budget_us:
+				return false
+	return clean                                              # full scan, nothing left to warm ⇒ CONVERGED (regardless of scan time)
 
 ## `thresh` is the emit cut on cd·nrm: the shipped BACK_CULL (front-hemisphere) under the active-facet law, or
 ## cos(θ_emit) under the COSMOS-ORBITAL-SHELL S1 camera-set law. The active/excluded skip is axis-independent
@@ -786,6 +850,8 @@ func take_events() -> Array:
 func is_rebuild_pending() -> bool: return _pending
 func reemit_count() -> int: return _reemit_count
 func snapshot_count() -> int: return _snapshot_count            # FIX A2 (G-SHELL-FALLHOLD): scheduled re-emits — flat during a held fall
+func warm_fail_count() -> int: return _warm_fail_count          # FIX D (G-WARM-TRUE-BUDGET): sh_wfail — must FLATLINE once the warm converges
+func warm_front_step(nrm: Array, thresh: float) -> bool: return _warm_front_step(nrm, thresh)   # FIX D: gate driver entry
 func is_emitted(fid: int) -> bool: return _emitted.has(fid)
 func emitted_count() -> int: return _emitted.size()
 func is_backstop(fid: int) -> bool: return _is_backstop(fid)     # COSMOS far-ring full coverage — gate visibility

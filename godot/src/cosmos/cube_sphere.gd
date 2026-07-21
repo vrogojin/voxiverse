@@ -739,6 +739,20 @@ const FP_SNOW_SKIP_AIRBORNE := false
 ## flatlines). Byte-identical off (callers use the shipped _warm_front verbatim). Rides with FP_SHELL_ORBIT_IDLE +
 ## FP_SHELL_FALL_HOLD at deploy. Gate G-WARM-TRUE-BUDGET (verify_shell.gd).
 const FP_WARM_TRUE_BUDGET := false
+## COSMOS-PERF UNATTENDED R2 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §2.2, item W2) — DE-BURST the on-ground
+## snowfall step. The shipped SnowfallSystem runs the whole 0.5 s fixed step (up to 32 columns × worldgen
+## noise + env queries + up to 32 writes + one ground rebuild) in ONE main-thread `_process` call, and its
+## wall-clock accumulator runs up to MAX_STEPS_PER_FRAME=4 steps back-to-back after any hitch — the 126-145 ms
+## snow_ms bursts, with hitch-coupling (a hitch reschedules the next). When true, SnowfallSystem.process instead
+## (a) DROPS catch-up (after a hitch it starts exactly ONE step and discards the backlog — a hitch never queues
+## more steps) and (b) SLICES that step across frames (SLICE_COLUMNS columns/frame, ONE ground rebuild when the
+## step finishes) so no single frame does the burst. The step MATH is untouched (same columns, same order, same
+## write cap, same deterministic outcome for a given step_counter+player_col — just spread), so accumulation/melt
+## over time is identical; only the per-frame COST is flattened. It also lowers the snow-authored `_edits` ceiling
+## to SNOW_SLICED_EDIT_CAP (< SNOW_EDIT_BUDGET) so a long session's snow trail can't grow the per-crossing
+## edit-index scan (W4) without bound (NEVER-OOM: a hard cap; existing snow still evolves). Default FALSE ⇒
+## `process` uses the shipped burst accumulator verbatim ⇒ BYTE-IDENTICAL. Gate G-SNOW-SLICED (verify_snow_sliced.gd).
+const FP_SNOW_SLICED := false
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),

@@ -176,7 +176,8 @@ func _initialize() -> void:
 	# ================= COSMOS-FACET-SEAMS-V2 gates (FS2′ / FS-W / twist) =================
 	_probe_datum_v2()      # G-D2-* : the CONTINUOUS datum lift collapses the seam step + is radial + mirror-exact
 	_gate_corner_walk()    # G-CORNER-WALK : corner-commit resolves a grid-corner clear of the −3 ridge wall
-	_gate_twist_frame()    # G-TWIST-FRAME : frame-aware reframe_twist preserves world heading (no double-twist)
+	_gate_twist_frame()    # G-TWIST-FRAME + G-CROSS-HEADING : frame-aware reframe_twist preserves world heading
+	await _gate_datum_collide()  # G-DATUM-COLLIDE : the physics floor the player stands on == the datum-baked render
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -295,6 +296,55 @@ func _probe_datum_v2() -> void:
 	else:
 		_ok(absf(max_step - 5.30) <= 0.10, "G-D2-OFF: datum_lift≡0 must leave the 5.30 step; got %.3f" % max_step)
 
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4) — G-DATUM-COLLIDE (the LIVE embed pin). The invariant: the
+## surface the player SEES (the C++ near-mesh datum bake, y += s) and the surface they COLLIDE with (the analytic
+## floor_under the player rests on) are the SAME height per column. Boots a real WorldManager on the spawn facet and,
+## over a grid of columns, compares WorldManager.floor_under (collision, play space) against the INDEPENDENT render
+## surface = cell-space content top (effective_height+1, NO datum) + the EXACT C++ per-vertex lift (_cpp_lift, the
+## transcription of voxel_mesher_blocky.cpp). If any physics funnel dropped s while the mesh applied it (or vice-
+## versa), the mismatch = s (up to ~6.9 blocks) and the player embeds. Must agree ≤ 0.10 block. Off ⇒ skipped.
+func _gate_datum_collide() -> void:
+	if not (CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED):
+		print("  G-DATUM-COLLIDE: skipped (needs FP_DATUM_BAKE + FACETED sed-on)")
+		return
+	var fid := FA.spawn_facet()
+	TerrainConfig.set_active_facet(fid)
+	var wm := WorldManager.new()
+	wm.name = "SeamCollideWorld"
+	get_root().add_child(wm)
+	await process_frame
+	await process_frame
+	var cc := FA.centre_cell(fid)
+	var params := FA.datum_bake_params(fid)
+	var worst := 0.0
+	var worst_s := 0.0
+	var n := 0
+	for dx in range(-30, 31, 4):
+		for dz in range(-30, 31, 4):
+			var x: int = cc.x + dx; var z: int = cc.y + dz
+			# COLLISION: the analytic floor the player rests on (floor_under snaps position.y here) — play space, +s.
+			var col_floor: float = wm.floor_under(float(x) + 0.5, float(z) + 0.5, 400.0)
+			var s: float = FA.datum_lift(fid, float(x) + 0.5, float(z) + 0.5)
+			# Restrict to FULL-CUBE surface columns (cell-space top is integer) so the independent render model
+			# (effective_height+1 + C++ lift) is exact — a slab/ramp top (0.5) is a shape the physics + mesh both
+			# render identically but this gate can't model without the mesher shape logic (out of scope: this pins
+			# the LIFT, not the shape). Classify by the physics cell-space top; skip non-integer (shaped) columns.
+			var cell_top_phys: float = col_floor - s
+			if absf(cell_top_phys - round(cell_top_phys)) > 0.02:
+				continue
+			# RENDER (independent of the physics lift): cell-space full-cube top + the EXACT C++ near-mesh lift.
+			var render_y: float = float(wm.effective_height(x, z) + 1) + _cpp_lift(params, float(x) + 0.5, float(z) + 0.5)
+			worst = maxf(worst, absf(col_floor - render_y))
+			worst_s = maxf(worst_s, s)
+			n += 1
+	print("  G-DATUM-COLLIDE: %d full-cube columns  worst |collision_floor − render_surface| = %.5f  (max s in play = %.3f)" % [
+		n, worst, worst_s])
+	_ok(n >= 20, "G-DATUM-COLLIDE: too few full-cube columns sampled (%d) to pin the invariant" % n)
+	_ok(worst_s > 1.0, "G-DATUM-COLLIDE: no lifted column sampled (s≈0) — cannot prove the funnel applies the bake")
+	_ok(worst <= 0.10, "G-DATUM-COLLIDE: physics floor != datum-baked render by %.4f > 0.10 (the live embed)" % worst)
+	wm.queue_free()
+	await process_frame
+
 ## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3) — G-CORNER-WALK. At a facet-grid corner the single-edge landing
 ## fails containment (the shipped `continue` → the −3 ridge wall). WorldManager._corner_commit must instead resolve
 ## a destination BY DIRECTION whose reframed landing is CLEAR of the wall (min own_dist > FACET_WALL_EPS), matching
@@ -344,24 +394,92 @@ func _gate_corner_walk() -> void:
 	_ok(resolved == exercised, "G-CORNER-WALK: %d/%d corners not resolved clear of the wall / dir-correct" % [resolved, exercised])
 	_ok(deep_ok == exercised, "G-CORNER-WALK: _past_ridge_deep failed to flag %d deep-past corners" % (exercised - deep_ok))
 
-## COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5) — G-TWIST-FRAME. Under the fixed frame world_yaw = frame_yaw +
-## local_yaw with frame_yaw_B − frame_yaw_A = −yaw_delta, so preserving WORLD heading requires local += yaw_delta.
-## Assert: shipped (off) = +yaw_delta; KEEP_HEADING legacy = no twist; FRAME-AWARE+fixed = +yaw_delta REGARDLESS of
-## keep_heading (the single correct world-preserving twist, killing the double-twist); FRAME-AWARE+legacy honours
-## keep_heading. reframe_twist is a pure static — tested directly, all four combinations.
+## COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5) — G-TWIST-FRAME. Under the fixed frame the player's WORLD state
+## is frame_basis(fid)·local_state, so a crossing preserves it iff local_B = crossing_basis(A,B)·local_A. The about-
+## UP action of crossing_basis(A,B) is a rotation by −yaw_delta (LIVE-verified in _gate_cross_heading below), so the
+## world-preserving local twist is −yaw_delta for BOTH heading and velocity — NOT +yaw_delta (the shipped/legacy
+## twist DOUBLE-twists under the fixed frame → the live crossing-heading glitch). Assert: shipped (off) = +yaw_delta
+## (byte-identical legacy); KEEP_HEADING legacy = no twist; FRAME-AWARE+fixed = −yaw_delta REGARDLESS of keep_heading
+## (the single correct world-preserving twist); FRAME-AWARE+legacy honours keep_heading. reframe_twist is a pure
+## static — tested directly, all combinations.
 func _gate_twist_frame() -> void:
 	var yd := 0.7
 	var y0 := 0.3
 	var vel := Vector3(1.0, 0.0, 2.0)
-	var want := wrapf(y0 + yd, -PI, PI)
+	var want_plus := wrapf(y0 + yd, -PI, PI)     # legacy/shipped twist (frame off)
+	var want_minus := wrapf(y0 - yd, -PI, PI)    # frame-aware world-preserving twist (frame on)
 	var off: Array = Player.reframe_twist(y0, vel, yd, false, false, false)
-	_ok(absf(wrapf(off[0] - want, -PI, PI)) <= 1.0e-6, "twist off: shipped +yaw_delta not applied")
+	_ok(absf(wrapf(off[0] - want_plus, -PI, PI)) <= 1.0e-6, "twist off: shipped +yaw_delta not applied")
 	var keep: Array = Player.reframe_twist(y0, vel, yd, true, false, false)
 	_ok(keep[0] == y0 and keep[1] == vel, "twist KEEP_HEADING(legacy): heading/vel must be unchanged")
 	var fa: Array = Player.reframe_twist(y0, vel, yd, true, true, true)
-	_ok(absf(wrapf(fa[0] - want, -PI, PI)) <= 1.0e-6 and fa[1].is_equal_approx(vel.rotated(Vector3.UP, yd)),
-		"G-TWIST-FRAME: frame-aware+fixed+keep must apply +yaw_delta (world-heading preserving), not no-twist")
+	_ok(absf(wrapf(fa[0] - want_minus, -PI, PI)) <= 1.0e-6 and fa[1].is_equal_approx(vel.rotated(Vector3.UP, -yd)),
+		"G-TWIST-FRAME: frame-aware+fixed+keep must apply −yaw_delta (world-heading preserving), not +yaw_delta/no-twist")
 	var fa_off: Array = Player.reframe_twist(y0, vel, yd, false, true, true)
-	_ok(absf(wrapf(fa_off[0] - want, -PI, PI)) <= 1.0e-6, "G-TWIST-FRAME: frame-aware+fixed(no keep) = +yaw_delta")
+	_ok(absf(wrapf(fa_off[0] - want_minus, -PI, PI)) <= 1.0e-6, "G-TWIST-FRAME: frame-aware+fixed(no keep) = −yaw_delta")
 	var fal: Array = Player.reframe_twist(y0, vel, yd, true, true, false)
 	_ok(fal[0] == y0 and fal[1] == vel, "G-TWIST-FRAME: frame-aware+LEGACY+keep must honour keep_heading (no twist)")
+	_gate_cross_heading()
+
+## COSMOS FS2-V2 (§5) — G-CROSS-HEADING (the LIVE regression pin). Assert WORLD-heading + WORLD-velocity CONTINUITY
+## across a real crossing, computed through the ACTUAL FacetAtlas.frame_basis (not an assumed frame_yaw algebra).
+## For every real seam with a non-degenerate dihedral, the player faces/moves in A's frame; after apply_reframe's
+## twist the SAME physical world direction must result in B's frame. The frame-aware+fixed reframe_twist (−yaw_delta)
+## must hold Δworld_heading ≤ 2° (residual = the intentionally-dropped dihedral tilt, player stays upright); the
+## legacy +yaw_delta must FAIL continuity (≈2·|yaw_delta|) — proving the sign is what fixes it. Runs only when the
+## fixed frame is engaged (the live combo); otherwise reports the algebra check above.
+func _gate_cross_heading() -> void:
+	if not (CubeSphere.FP_FIXED_FRAME and CubeSphere.FP_DATUM_BAKE):
+		print("  G-CROSS-HEADING: skipped (needs FP_FIXED_FRAME + FP_DATUM_BAKE sed-on for the live combo)")
+		return
+	# pick a seam whose about-UP yaw_delta is clearly non-degenerate (|yd| in (0.2, 2.8) — not ~0, not ~π)
+	var best_a := -1; var best_b := -1; var best_yd := 0.0; var best_err := INF
+	for face in range(6):
+		for a in range(0, K, 2):
+			for b in range(0, K, 2):
+				var fidA := (face * K + a) * K + b
+				for slot in range(4):
+					var fidB := FA.seam_neighbour(fidA, slot)
+					if fidB < 0 or fidB == fidA:
+						continue
+					var ex: Vector3 = FA.crossing_basis(fidA, fidB) * Vector3(1.0, 0.0, 0.0)
+					var yd := atan2(ex.z, ex.x)
+					var e: float = absf(absf(yd) - 1.0)
+					if absf(yd) > 0.2 and absf(yd) < 2.8 and e < best_err:
+						best_err = e; best_yd = yd; best_a = fidA; best_b = fidB
+	if best_a < 0:
+		_ok(false, "G-CROSS-HEADING: no non-degenerate seam found (atlas not warmed?)")
+		return
+	var basisA := FA.frame_basis(best_a)
+	var basisB := FA.frame_basis(best_b)
+	var vel := Vector3(0.6, 0.0, 0.9)
+	var worst_fix := 0.0
+	var worst_legacy := 0.0
+	for y0 in [0.0, 0.4, -1.1, 2.0]:
+		# The player stays UPRIGHT (+Y up) and the dihedral tilt is carried by the frame/camera, so the preserved
+		# invariant is the AZIMUTHAL heading in the local tangent plane — express each world direction back in A's
+		# frame and compare atan2(z,x). (A raw 3D angle would count the intentionally-dropped dihedral tilt as error.)
+		var wfA := basisA * (Basis(Vector3.UP, y0) * Vector3(0, 0, -1))       # world forward before
+		var wvA := basisA * vel                                              # world velocity before
+		var azfA := _tangent_az(basisA, wfA); var azvA := _tangent_az(basisA, wvA)
+		# frame-aware+fixed twist (the FIX): −yaw_delta on heading + velocity
+		var tw: Array = Player.reframe_twist(y0, vel, best_yd, true, true, true)
+		var wfB := basisB * (Basis(Vector3.UP, tw[0]) * Vector3(0, 0, -1))
+		var wvB: Vector3 = basisB * tw[1]
+		var dfix_h: float = absf(rad_to_deg(wrapf(_tangent_az(basisA, wfB) - azfA, -PI, PI)))
+		var dfix_v: float = absf(rad_to_deg(wrapf(_tangent_az(basisA, wvB) - azvA, -PI, PI)))
+		worst_fix = maxf(worst_fix, maxf(dfix_h, dfix_v))
+		# legacy +yaw_delta (the BUG): must NOT be continuous
+		var wfL := basisB * (Basis(Vector3.UP, wrapf(y0 + best_yd, -PI, PI)) * Vector3(0, 0, -1))
+		var dleg: float = absf(rad_to_deg(wrapf(_tangent_az(basisA, wfL) - azfA, -PI, PI)))
+		worst_legacy = maxf(worst_legacy, dleg)
+	print("  G-CROSS-HEADING: seam A=%d B=%d yaw_delta=%.4f  fix worst tangent-Δ=%.3f deg  legacy(+yd) worst=%.3f deg" % [
+		best_a, best_b, best_yd, worst_fix, worst_legacy])
+	_ok(worst_fix <= 2.0, "G-CROSS-HEADING: frame-aware −yaw_delta must hold world heading/velocity azimuth ≤2° (got %.2f)" % worst_fix)
+	_ok(worst_legacy > 10.0, "G-CROSS-HEADING: legacy +yaw_delta should VISIBLY break continuity (got %.2f — sign fix not exercised)" % worst_legacy)
+
+## The azimuth of world direction `w` inside frame `b`'s local tangent plane (about the local up) — atan2(z,x) of
+## the direction re-expressed in the frame. The player's perceived heading under the fixed frame.
+func _tangent_az(b: Basis, w: Vector3) -> float:
+	var lv: Vector3 = b.transposed() * w
+	return atan2(lv.z, lv.x)

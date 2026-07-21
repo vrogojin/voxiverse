@@ -338,14 +338,17 @@ func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
 ## are returned UNCHANGED (world heading preserved across the crossing). Returns [new_yaw, new_velocity].
 static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, keep_heading: bool,
 		frame_aware: bool = false, frame_fixed: bool = false) -> Array:
-	# COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5): FRAME-AWARE twist. Under the fixed frame the world heading
-	# is frame_yaw + local_yaw with frame_yaw_B − frame_yaw_A = −yaw_delta, so the +yaw_delta twist (below) is the
-	# branch that PRESERVES world heading; KEEP_HEADING's no-twist would then snap the heading by the full inter-
-	# frame yaw (the double-twist glitch when FP_FIXED_FRAME + FP_CROSS_KEEP_HEADING are both live). With
-	# FP_TWIST_FRAME_AWARE on AND the fixed frame active, apply +yaw_delta REGARDLESS of keep_heading. Default off
-	# (frame_aware=false) ⇒ this branch is skipped and the function is byte-identical to the shipped 4-arg form.
+	# COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5): FRAME-AWARE twist. Under the fixed frame the player's WORLD
+	# state is frame_basis(fid)·local_state, so preserving it across a crossing needs local_B = crossing_basis(A,B)·
+	# local_A. crossing_basis(A,B) = frame_basis(B)⁻¹·frame_basis(A); its horizontal (about-UP) action is a rotation
+	# by −yaw_delta (yaw_delta = atan2(ex.z, ex.x) of A's +X in B, and Basis(UP,θ)·x̂ has atan2(z,x) = −θ). So the
+	# WORLD-heading-and-velocity-preserving twist is −yaw_delta, NOT +yaw_delta (the shipped/legacy +yaw_delta
+	# DOUBLE-twists under the fixed frame: measured 2·|yaw_delta| heading error at a 58° seam — the live glitch).
+	# Verified empirically (verify_facet_seams G-CROSS-HEADING) against the real frame_basis: −yaw_delta ⇒ Δ≈0,
+	# +yaw_delta ⇒ Δ≈2·yaw_delta. Applies REGARDLESS of keep_heading (heading MUST track the velocity twist, else
+	# facing and motion decouple). Default off (frame_aware=false) ⇒ skipped, byte-identical to the shipped form.
 	if frame_aware and frame_fixed:
-		return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]
+		return [wrapf(cur_yaw - yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, -yaw_delta)]
 	if keep_heading:
 		return [cur_yaw, cur_vel]
 	return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]

@@ -692,8 +692,38 @@ const SHELL_REEMIT_GROWTH := 64      # re-emit the growing cached cap every N ne
 ## shows with draws=32, i.e. NOT geometry/gen). This flag adds the SAME converged idle gate to the orbit branch:
 ## once `done` (front fully warmed) with nothing pending, the scan is skipped until the next drift snapshot re-sets
 ## `_pending`. Byte-identical off (the scan runs exactly as today). Requires FP_SHELL_CAMERA_SET (the orbit branch
-## is only reached when the camera-set law is engaged off-surface). Gate G-SHELL-ORBIT-IDLE (verify_orbital.gd).
+## is only reached when the camera-set law is engaged off-surface). NOTE: inert ALONE during an active fall — the
+## per-frame radial re-snapshot (below) keeps `_pending` set so it never idles. Must be paired with FP_SHELL_FALL_HOLD.
+## Gate G-SHELL-ORBIT-IDLE (verify_orbital.gd).
 const FP_SHELL_ORBIT_IDLE := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX A2 (fix/voxiverse-fall-perf) — HOLD the far-ring cap during a fall (kill the
+## per-frame re-emit thrash). Root cause of why FIX A was inert live: the camera-set re-emit trigger
+## (shell_set_camera_abs) re-snapshots whenever θ_h = acos(R/d) shifts > 5°. Near the surface acos blows up
+## (dθ_h/dd → ∞ as d → R), so during the FINAL approach of a fall θ_h swings > 5° EVERY frame → `_pending` re-sets
+## every frame → the warm never converges (FIX A never idles) AND every `_pending` fires a full re-emit (a
+## SYNCHRONOUS _rebuild_full when FP_FARRING_ASYNC_REBUILD is off — the 200-600 ms proc spikes / sh_wfail thrash the
+## live telemetry shows). The whole globe is ALREADY one meshed draw ([[voxiverse-orbital-shell]]); chasing the exact
+## visible cap frame-by-frame is pure thrash. With this flag ON: (1) an off-surface (airborne) snapshot sizes θ_emit
+## GENEROUSLY (+SHELL_FALL_MARGIN_DEG) so a shrinking visible cap during descent stays inside the held cap, and
+## (2) the radial trigger is SUPPRESSED for a shrinking cap (a descent) — re-emit only when the cap must GROW past the
+## held margin (a climb, to avoid holes), or the axis SWEEPS past slack AND SHELL_FALL_REEMIT_MS has elapsed (throttle).
+## `_pending` then stops re-setting every frame ⇒ FP_SHELL_ORBIT_IDLE actually idles the scan, and the synchronous
+## rebuild is bounded to ≤ 1 / SHELL_FALL_REEMIT_MS. A floor/regime crossing always re-emits (correctness). Byte-
+## identical off (the shipped reactive 5°/slack triggers, no generous margin). Requires FP_SHELL_CAMERA_SET; pair with
+## FP_SHELL_ORBIT_IDLE. Gate G-SHELL-FALLHOLD (verify_shell.gd).
+const FP_SHELL_FALL_HOLD := false
+const SHELL_FALL_MARGIN_DEG := 12.0   # extra θ_emit margin the held cap carries off-surface (absorbs the descent θ_h shrink); also the GROW re-emit threshold
+const SHELL_FALL_REEMIT_MS := 1000    # min wall-ms between throttled off-surface re-emits (axis sweep / progressive grow) during a fall
+
+## COSMOS-PERF FALL-COLLAPSE FIX C (fix/voxiverse-fall-perf) — skip the main-thread snowfall fixed-step while the
+## player is AIRBORNE (a HIGH FLYER above OFFSURFACE_Y, e.g. falling from orbit). SnowfallSystem.process runs a
+## deterministic per-frame batch (up to MAX_STEPS_PER_FRAME) around the player's ground column — the ~71 ms snow_ms
+## spike the fall telemetry shows. At flight altitude there is NO walkable ground snow under the camera to evolve, so
+## the step is pure wasted main-thread time that compounds the fall collapse. Gated skip: above OFFSURFACE_Y (the same
+## cheap lattice-y "high flyer" test the pool freeze uses) the sim is not stepped (its state simply FREEZES — restored
+## on landing, no spiral: delta is not accumulated while skipped). Byte-identical off. Gate G-SNOW-AIRBORNE (verify_snow_airborne.gd).
+const FP_SNOW_SKIP_AIRBORNE := false
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
 ## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),

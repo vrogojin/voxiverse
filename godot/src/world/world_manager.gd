@@ -330,11 +330,23 @@ func _ready() -> void:
 func set_cosmos_clock(clock: CosmosEphemeris.CosmosClock) -> void:
 	_cosmos_clock = clock
 
+## COSMOS-PERF FALL-COLLAPSE FIX C (FP_SNOW_SKIP_AIRBORNE): true when the player is a HIGH FLYER (lattice altitude
+## above the active-facet plane > OFFSURFACE_Y — the same cheap y-test the pool off-surface freeze uses) and the
+## snowfall fixed-step should be skipped (no walkable ground snow under the camera at flight altitude). Byte-identical
+## false with the flag off (never skips). Pure read of `_last_player_pos`.
+func _snow_skip_airborne() -> bool:
+	return snow_skip_airborne(_last_player_pos.y)
+
+## The FIX C predicate as a PURE static (flag- and OFFSURFACE_Y-driven), split out so G-SNOW-AIRBORNE drives it
+## directly with a synthetic altitude — no WorldManager instance needed. Byte-identical false with the flag off.
+static func snow_skip_airborne(alt_y: float) -> bool:
+	return CubeSphere.FP_SNOW_SKIP_AIRBORNE and alt_y > CubeSphere.OFFSURFACE_Y
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
-	if _snowfall != null and _have_player_pos:
+	if _snowfall != null and _have_player_pos and not _snow_skip_airborne():
 		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
 		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)

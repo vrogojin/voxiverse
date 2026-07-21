@@ -50,6 +50,12 @@ static func envelope_on() -> bool:
 static func depth_bias_on() -> bool:
 	return CubeSphere.FP_TIER_DEPTH_BIAS
 
+## P1-adjacent: is the surface warm-gate convergence (progressive cached-subset emit) active? Requires the full-coverage
+## far ring (the backstop dense caches are the thing whose slow warm strands the all-or-nothing gate). Off ⇒ the shipped
+## all-or-nothing surface warm gate runs verbatim (byte-identical).
+static func warm_converge_on() -> bool:
+	return CubeSphere.FP_TIER_WARM_CONVERGE and CubeSphere.FP_FARRING_FULL_COVER
+
 ## The radial sink (blocks) applied to backstop vertices at emit. Under the envelope the sink collapses to the
 ## small ε guard (the envelope already carries the lower-bound in the vertex height); otherwise it is DERIVED
 ## from facet geometry — BACKSTOP_SINK_FRAC × the facet cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge

@@ -389,6 +389,24 @@ const FP_TIER_ENVELOPE := false
 ## StandardMaterial3D + near 0.05, byte-identical (FLAT 6035/0). Truth gate: verify_tier_depth.gd G-TIER-DEPTH-BIAS.
 const FP_TIER_DEPTH_BIAS := false
 
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — the SURFACE WARM-GATE
+## CONVERGENCE fix (the `sh_wfail` weld-thrash). On the surface path the far ring's re-emit is blocked by an
+## ALL-OR-NOTHING warm gate: `_warm_front` must cache EVERY front facet in ONE WARM_BUDGET_MS frame before a single
+## `_begin_rebuild` fires. Under the web ×25 warm cost a newly-backstop facet's DENSE min-envelope cache
+## (~(ENV_FINE_MULT·BACKSTOP_CELLS+1)² ≈ 4k profile samples) can eat a whole frame's budget by itself, so on a
+## ridge-crossing / pool-change / camera-set drift the gate returns false for MANY frames WITHOUT emitting
+## (sh_wfail ≫ 0). Meanwhile the PREVIOUS committed mesh still draws the just-entered pool facet as an UNSUNK CELLS=4
+## coarse quad OVER the live near meshes = the over-near strip lingers the whole warm window. When true (requires
+## FP_FARRING_FULL_COVER), the surface path adopts the orbit S1b PROGRESSIVE discipline: warm cumulatively, emit the
+## cache-ready subset now, and RE-EMIT the moment a new dense backstop cache lands (`_bpos_cache` grew) — so a
+## just-entered pool facet flips to a SUNK backstop the frame its cache is ready (an uncached backstop is FILTERED
+## OUT, never drawn as a stale un-sunk quad), and once the whole front is cached one final full emit lands the tail.
+## NEVER-OOM: reads only the existing fid-keyed caches (no parallel/growing warm set); the extra re-emits are bounded
+## by the backstop count (≤ pool + STICKY_RING1_MAX). Default OFF → the shipped all-or-nothing gate verbatim
+## (byte-identical, FLAT 6035/0). Flipped ON at export alongside the tier flags. Truth gate: verify_tier_depth.gd
+## G-TIER-WARM-CONVERGE.
+const FP_TIER_WARM_CONVERGE := false
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles

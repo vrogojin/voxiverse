@@ -19,13 +19,22 @@ extends SceneTree
 ##                                                policy. Asserts the shader parsed (uniform present) and the bias value; OFF ⇒
 ##                                                StandardMaterial3D (unchanged) ⇒ red.
 ##
-## RUN (all three, green):
+##   G-TIER-FARNEAR   (FP_TIER_STICKY_BACKSTOP)  — the reported LIVE symptom, pinned: a ring-1 RIDGE neighbour (the facet
+##                                                the player crosses toward) renders its far surface AT-OR-BELOW the near
+##                                                block tops (sticky sinks it). CONTRAST: the same facet as an unsunk
+##                                                CELLS=4 quad pokes +18 over near = the over-near strip STICKY removes.
+##   G-TIER-WARM-CONVERGE (FP_TIER_WARM_CONVERGE) — the `sh_wfail` thrash fix: an UNWARMED backstop facet is FILTERED from
+##                                                a progressive emit (never a stale un-sunk quad over live near meshes) and
+##                                                flips to a SUNK backstop the frame its dense cache is ready.
+##
+## RUN (all, green):
 ##   sed -i 's/const FACETED := false/const FACETED := true/;s/const FP_FARRING_FULL_COVER := false/const FP_FARRING_FULL_COVER := true/;\
 ##           s/const FP_TIER_STICKY_BACKSTOP := false/const FP_TIER_STICKY_BACKSTOP := true/;\
 ##           s/const FP_TIER_ENVELOPE := false/const FP_TIER_ENVELOPE := true/;\
-##           s/const FP_TIER_DEPTH_BIAS := false/const FP_TIER_DEPTH_BIAS := true/' godot/src/cosmos/cube_sphere.gd
+##           s/const FP_TIER_DEPTH_BIAS := false/const FP_TIER_DEPTH_BIAS := true/;\
+##           s/const FP_TIER_WARM_CONVERGE := false/const FP_TIER_WARM_CONVERGE := true/' godot/src/cosmos/cube_sphere.gd
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_tier_depth.gd
-##   then REVERT the sed. FALSIFY: re-run with any ONE tier flag left false → its sub-gate fails.
+##   then REVERT the sed. FALSIFY: re-run with any ONE tier flag left false → its sub-gate fails (or SKIPs, phase-guarded).
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FFR := preload("res://src/world/facet_far_ring.gd")
@@ -54,6 +63,8 @@ func _initialize() -> void:
 	_gate_envelope(active)
 	_gate_sticky(active)
 	_gate_depth_bias(active)
+	_gate_farnear(active)
+	_gate_warm_converge(active)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -296,6 +307,107 @@ func _check_biased(m: Material, who: String, want_bias: float) -> void:
 	_ok(has_param, "G-TIER-DEPTH-BIAS: %s shader parsed with the tier_bias uniform" % who)
 	_ok(is_equal_approx(float(sh.get_shader_parameter("tier_bias")), want_bias),
 		"G-TIER-DEPTH-BIAS: %s tier_bias = %s (k quanta)" % [who, str(want_bias)])
+
+# =====================================================================================================
+# G-TIER-FARNEAR (P1+P2, the reported live symptom) — FAR NEVER OVER NEAR for a ring-1 RIDGE neighbour. This is the
+# pilot's "red/brown far strip pokes over the near ridge" pinned headlessly: a mountainous facet ADJACENT to the active
+# facet (a ring-1 seam neighbour — exactly what the player crosses toward) must render its far surface AT-OR-BELOW the
+# near block tops everywhere. STICKY makes that ring-1 facet a SUNK backstop from the first build; the envelope/derived
+# sink puts it low enough. The CONTRAST proves the flag is load-bearing: the SAME facet drawn as the shipped unsunk
+# CELLS=4 quad (the sticky-OFF path) pokes over near = the strip. Phase-guarded on sticky_on() (off ⇒ SKIPPED green).
+# =====================================================================================================
+func _gate_farnear(active: int) -> void:
+	if not TierPlace.sticky_on():
+		print("  --- G-TIER-FARNEAR: SKIPPED (FP_TIER_STICKY_BACKSTOP off) ---")
+		return
+	print("  --- G-TIER-FARNEAR: a ring-1 RIDGE neighbour's far surface stays below the near block tops (no over-near strip) ---")
+	# The ridge = the globally worst-relief facet; put an active facet ADJACENT to it, so the ridge is a ring-1
+	# (seam) neighbour of active — the case the design's make-before-break targets (a facet the player crosses toward).
+	var ridge: int = _worst_relief_facets(1)[0]
+	var active_a := -1
+	for slot in range(4):
+		var n := FA.seam_neighbour(ridge, slot)
+		if n >= 0:
+			active_a = n; break
+	_ok(active_a >= 0, "G-TIER-FARNEAR: found an active facet adjacent to ridge facet %d" % ridge)
+	if active_a < 0:
+		return
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active_a)                # setup → _recompute_sticky seeds ring-1(active_a) ∋ ridge → drawn SUNK
+	# The ridge is a ring-1 neighbour ⇒ a sticky backstop, drawn sunk in the committed mesh BEFORE it ever enters the pool.
+	_ok(bool(ring.call("is_sticky", ridge)), "G-TIER-FARNEAR: ridge %d is a sticky ring-1 backstop of active %d" % [ridge, active_a])
+	_ok(bool(ring.call("is_backstop", ridge)), "G-TIER-FARNEAR: ridge %d is drawn as a (sunk) backstop, not a plain far quad" % ridge)
+	var near := float(TerrainConfig.near_render_radius())
+	var centre := _centre_dir(ridge)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	# THE invariant: the AS-RENDERED (envelope+sink) backstop surface over the whole ridge facet sits at-or-below the
+	# near block tops — projected onto the near height field along the facet normal (the skew-aware poke oracle).
+	var rendered: PackedVector3Array = ring.call("backstop_rendered_positions", ridge)
+	var margin := _worst_poke(ridge, rendered, cells, near, centre)
+	_ok(margin < 0.0, "G-TIER-FARNEAR: ring-1 ridge far surface ≤ near tops (worst margin %.2f < 0)" % margin)
+	# CONTRAST (why STICKY is load-bearing): the SAME ridge drawn as the shipped UNSUNK CELLS=4 far quad — what a
+	# ring-1 neighbour OUTSIDE the pool renders as with sticky OFF — pokes OVER the near tops = the live over-near strip.
+	var plain := _const_sink_positions(ridge, FFR.CELLS, 0.0)
+	var pmargin := _worst_poke(ridge, plain, FFR.CELLS, near, centre)
+	_ok(pmargin > 0.0, "G-TIER-FARNEAR-CONTRAST: the unsunk CELLS=4 ring-1 quad pokes over near (+%.2f) — the strip STICKY removes" % pmargin)
+	print("    ridge=%d active=%d | sunk-backstop margin %.2f (need < 0); unsunk-quad margin %.2f (need > 0)" % [ridge, active_a, margin, pmargin])
+	ring.free()
+
+# =====================================================================================================
+# G-TIER-WARM-CONVERGE (FP_TIER_WARM_CONVERGE) — the surface warm-gate CONVERGENCE / anti-thrash property. The live
+# `sh_wfail` bug: a facet ENTERING the pool keeps its stale UNSUNK coarse quad over live near meshes for the whole
+# many-frame dense-cache warm window, because the all-or-nothing gate emits NOTHING until every front facet is cached.
+# The fix's invariant, pinned here without needing the web ×25 budget: an UNWARMED backstop facet is FILTERED OUT of a
+# progressive emit (never drawn as a stale un-sunk quad), and it flips to a SUNK backstop the moment its cache is ready.
+# Phase-guarded on warm_converge_on() (off ⇒ SKIPPED green — the shipped all-or-nothing gate is unchanged).
+# =====================================================================================================
+func _gate_warm_converge(active: int) -> void:
+	if not TierPlace.warm_converge_on():
+		print("  --- G-TIER-WARM-CONVERGE: SKIPPED (FP_TIER_WARM_CONVERGE off) ---")
+		return
+	print("  --- G-TIER-WARM-CONVERGE: an unwarmed backstop is FILTERED (not a stale un-sunk quad); emitted SUNK once ready ---")
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("setup", active)                  # caches the front set: active + ring-1 dense (sunk), others coarse
+	# C = a front-visible facet that is NOT active and NOT sticky ring-1 (so it is coarse-only after setup — no dense cache).
+	var r1 := {}
+	for f in TierPlace.ring1(active):
+		r1[int(f)] = true
+	var nrm := FA.facet_normal64(active)
+	var nv := Vector3(nrm[0], nrm[1], nrm[2])
+	var k := FA.K
+	var c := -1
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				if fid == active or r1.has(fid):
+					continue
+				if _centre_dir(fid).dot(nv) < 0.0:   # front-visible (BACK_CULL = 0)
+					continue
+				c = fid; break
+			if c >= 0: break
+		if c >= 0: break
+	_ok(c >= 0, "G-TIER-WARM-CONVERGE: found a front-visible non-sticky facet C=%d" % c)
+	if c < 0:
+		ring.free(); return
+	# C enters the pool → it is a backstop NOW, but its DENSE cache is NOT built yet (the mid-warm frame, ×25 on web).
+	ring.call("set_pool_excluded", PackedInt32Array([c]))
+	_ok(bool(ring.call("is_backstop", c)), "G-TIER-WARM-CONVERGE: C=%d is a backstop after entering the pool" % c)
+	# A PROGRESSIVE emit (cache-ready subset) with C's dense cache absent: C must be FILTERED OUT — never drawn as the
+	# stale un-sunk coarse quad that is the over-near strip. (Sabotage: emit the full set instead ⇒ C drawn un-sunk ⇒ the bug.)
+	ring.set("_emit_cached_only", true)
+	ring.call("_rebuild_full")
+	_ok(not bool(ring.call("is_emitted", c)),
+		"G-TIER-WARM-CONVERGE: unwarmed backstop C=%d is FILTERED from the progressive emit (no stale un-sunk quad)" % c)
+	# Now C's dense cache lands (a later warm frame). The next emit draws it as a SUNK backstop — the strip is gone.
+	var _warm: PackedVector3Array = ring.call("backstop_rendered_positions", c)   # forces _ensure_backstop_cached(C)
+	ring.set("_emit_cached_only", true)
+	ring.call("_rebuild_full")
+	_ok(bool(ring.call("is_emitted", c)) and bool(ring.call("is_emitted_backstop", c)),
+		"G-TIER-WARM-CONVERGE: once its cache is ready, C=%d is emitted SUNK (backstop) — converged, no thrash" % c)
+	ring.free()
 
 # --- shared helpers (mirroring verify_farring_cover so the two gates are directly comparable) ---
 func _centre_dir(fid: int) -> Vector3:

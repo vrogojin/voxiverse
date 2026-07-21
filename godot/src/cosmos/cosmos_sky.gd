@@ -86,6 +86,16 @@ const MOON_EARTHSHINE := 0.11
 ## §3.5 budget: full-moon ≥ 0.4, new-moon ≥ the earthshine floor (never the black-on-black bug at 0.02).
 static func moon_disc_luminance(illum_frac: float, earthshine: float) -> float:
 	return _MOON_ALBEDO_BASE.get_luminance() * (earthshine + (1.0 - earthshine) * clampf(illum_frac, 0.0, 1.0))
+## ATMO2 (bug-3 fix): the Moon disc albedo reddened by the SAME optical-path transmittance T⃗(m) as the Sun — the
+## Moon obeys the identical atmosphere law: NEUTRAL/white overhead (short path m≈1) → RED at the horizon (long path
+## m≈18). The shipped path applied NO path colour to the Moon, so its only reddening was the eclipse dim — which,
+## with a coplanar orbit, fired at every high full moon → the pilot's inverted "red when high, white at horizon".
+## `base` already carries the (now rare, incl-gated) eclipse redden; this composes the horizon reddening on top.
+## Pure/static so the gate (G-B4) drives it directly. `moon_dir` is unit, TOWARD the Moon; cam is planet-absolute.
+static func moon_path_albedo(base: Color, cam: Vector3, moon_dir: Vector3, r_solid: float, has_atmo: bool) -> Color:
+	var m := optical_path_air_mass(cam, moon_dir, r_solid, has_atmo)
+	var tm := path_transmittance(m)
+	return Color(base.r * tm.r, base.g * tm.g, base.b * tm.b)
 ## The active sky placement radius (blocks), resolved ONCE in _build_nodes: the derived R-safe value under
 ## FP_SKY_DSKY_R, else the shipped literal D_SKY (byte-identical). Everything downstream reads this, never D_SKY.
 var _dsky := D_SKY
@@ -235,7 +245,15 @@ void fragment() {
 		float seg_end = tca + half_out;
 		if (b < r_solid) { float t_hit = tca - sqrt(max(r_solid * r_solid - b2, 0.0)); if (t_hit > 0.0) seg_end = min(seg_end, t_hit); }
 		float chord = max(seg_end - seg_start, 0.0);
-		vec3 xhat = normalize((cam + tca * dir) - centre);
+		// Sun-angle datum for day/night gating + terminator tint. Shipped (path_norm=0): the infinite-line
+		// closest-approach point (byte-identical). B2 (path_norm=1): the CHORD-MIDPOINT direction — the point in
+		// the atmosphere segment actually being viewed. The closest-approach proxy lands on the HORIZON RING for
+		// near-vertical surface rays (mu≈0 ⇒ the terminator band tint + a lit night zenith), which is exactly the
+		// olive day sky + blue night halo the pilot reported; the midpoint is correct for surface AND orbit.
+		vec3 xca = (cam + tca * dir) - centre;
+		vec3 xmid = (cam + 0.5 * (seg_start + seg_end) * dir) - centre;
+		vec3 xsel = (path_norm > 0.5) ? xmid : xca;
+		vec3 xhat = (length(xsel) > 1e-4) ? normalize(xsel) : -normalize(sun_dir);   // degenerate ⇒ dark (night)
 		float mu = dot(xhat, normalize(sun_dir));
 		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
 		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
@@ -471,6 +489,31 @@ static func shell_limb_color_path(mu: float, chord: float, h_min: float) -> Colo
 	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
 	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
 	return Color(base.r * l, base.g * l, base.b * l)
+
+## ATMO2 (night-halo / green-sky fix): the shell's sun-angle datum μ = x̂·ŝ, computed at the CHORD MIDPOINT of the
+## view ray through the shell — the twin of the B2 shader's `xmid` branch (path_norm=1). Replaces the infinite-line
+## closest-approach proxy, which for near-vertical SURFACE rays lands on the horizon ring (μ≈0) and so lit the night
+## zenith blue and tinted the day zenith olive. The midpoint is the atmosphere segment actually viewed, correct for
+## surface AND orbit. Feed the result into shell_limb_color_path so a NIGHT-side upward view resolves to μ<0 ⇒ 0.
+## Mirrors shell_geom's segment math exactly (gate G-B2 night-zero pins the twin). `dir`, `sun_dir` must be unit.
+static func shell_view_mu(cam: Vector3, centre: Vector3, dir: Vector3, r_solid: float, r_outer: float, sun_dir: Vector3) -> float:
+	var oc := centre - cam
+	var dc2 := oc.dot(oc)
+	var tca := oc.dot(dir)
+	var b2 := maxf(dc2 - tca * tca, 0.0)
+	if sqrt(b2) >= r_outer:
+		return -1.0                                    # misses the shell (no contribution) ⇒ night default
+	var half_out := sqrt(maxf(r_outer * r_outer - b2, 0.0))
+	var seg_start := maxf(tca - half_out, 0.0)
+	var seg_end := tca + half_out
+	if sqrt(b2) < r_solid:
+		var t_hit := tca - sqrt(maxf(r_solid * r_solid - b2, 0.0))
+		if t_hit > 0.0:
+			seg_end = minf(seg_end, t_hit)
+	var pt := cam + dir * (0.5 * (seg_start + seg_end)) - centre
+	if pt.length() < 1.0e-4:
+		return -1.0                                    # degenerate (ray through centre) ⇒ dark
+	return pt.normalized().dot(sun_dir.normalized())
 
 # ---------------------------------------------------------------------------------------
 # COSMOS ATMO2 (docs/COSMOS-ATMO2-DESIGN.md §3.2) — the OPTICAL-PATH kernel. The single physical law that
@@ -934,6 +977,11 @@ func _update_sky(t: float) -> void:
 		# Eclipse redden: blend the shipped grey toward the §6 horizon crimson as the Moon enters the umbra.
 		var umbra := scatter_tint(0.0)                       # deep crimson (m≈38 horizon transmittance)
 		var moon_albedo := _MOON_ALBEDO_BASE.lerp(umbra, 1.0 - _moon_eclipse)
+		# ATMO2 (bug-3 fix): compose the atmospheric path transmittance so the Moon obeys the SAME law as the Sun —
+		# neutral overhead, red at the horizon. Off ⇒ the shipped eclipse-only grey (byte-identical). The eclipse
+		# redden above is now rare (incl=5.1° under FP_MOON_PRESENCE) so this is the Moon's dominant colour law.
+		if CubeSphere.FP_SUN_PATHLIGHT:
+			moon_albedo = moon_path_albedo(moon_albedo, cam_origin, moon_dir, CosmosGravity.r_vox(OBSERVER), OrbitalState.has_atmo(OBSERVER))
 		# A4: under the self-phase shader the eclipse redden feeds `base_albedo`; else the shipped StandardMaterial.
 		if _moon_phase_mat != null:
 			_moon_phase_mat.set_shader_parameter("base_albedo", moon_albedo)

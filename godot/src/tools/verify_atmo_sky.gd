@@ -475,6 +475,34 @@ func _gate_b4_moon() -> void:
 	var tilt_duty := float(tilt) / maxf(float(opp), 1.0)
 	_ok(tilt_duty < cop_duty, "5.1° inclination REDUCES eclipse duty vs coplanar (%.3f < %.3f)" % [tilt_duty, cop_duty])
 	_ok(tilt_duty < 0.05, "tilted eclipse duty rare (< 5 pct of full-moon-window samples: %.3f)" % tilt_duty)
+	# G-B4 COLOR-LAW (bug-3 fix): the Moon obeys the SAME atmospheric path transmittance as the Sun — NEUTRAL/white
+	# overhead (short path), RED at the horizon (long path). Monotone reddening as elevation drops. This replaces the
+	# inverted "red when high" the pilot saw (which was eclipse-at-every-opposition on the coplanar orbit).
+	var rm := GRAV.r_vox("earth")
+	var base := SKY._MOON_ALBEDO_BASE
+	var zc := SKY.moon_path_albedo(base, Vector3(0.0, 0.0, rm), Vector3(0.0, 0.0, 1.0), rm, true)   # overhead
+	var hc := SKY.moon_path_albedo(base, Vector3(0.0, 0.0, rm), Vector3(1.0, 0.0, 0.0), rm, true)   # at the horizon
+	_ok(zc.r / maxf(zc.b, 1e-6) < 1.5, "moon near-neutral overhead (R/B=%.2f < 1.5, white/grey disc)" % (zc.r / maxf(zc.b, 1e-6)))
+	_ok(hc.r / maxf(hc.b, 1e-6) > 3.0, "moon reddened at the horizon (R/B=%.2f > 3, long-path red)" % (hc.r / maxf(hc.b, 1e-6)))
+	var mono_red := true
+	var prev_ratio := 0.0
+	for e in range(90, 4, -5):                                     # zenith -> horizon
+		var mu := sin(deg_to_rad(float(e)))
+		var dir := Vector3(sqrt(maxf(1.0 - mu * mu, 0.0)), 0.0, mu)
+		var c := SKY.moon_path_albedo(base, Vector3(0.0, 0.0, rm), dir, rm, true)
+		var ratio := c.r / maxf(c.b, 1e-6)
+		if ratio < prev_ratio - 1e-6: mono_red = false
+		prev_ratio = ratio
+	_ok(mono_red, "moon reddening monotone as elevation drops (white overhead -> red horizon, NOT inverted)")
+	# Eclipse redden ONLY near a real umbra alignment (opposition): when the Moon is not ~full, factor == 1 (no
+	# redden) regardless of how HIGH it rides — the direct pin of "eclipse only during actual umbra alignment".
+	var per := EPH.orbit_period("moon")
+	var no_redden_off_opp := true
+	for i in range(240):
+		var t := per * float(i) / 240.0
+		if EPH.illuminated_fraction("earth", "moon", "sun", t) < 0.9:
+			if SKY.moon_eclipse_factor(t) < 0.999: no_redden_off_opp = false
+	_ok(no_redden_off_opp, "eclipse factor == 1 away from opposition (no redden unless real umbra alignment)")
 
 ## B4 gate helper: the lunar-eclipse factor at time t with an EXPLICIT orbital inclination (rad), mirroring
 ## CosmosSky.moon_eclipse_factor + the ATMO2 body_pos_parent tilt, so the gate can compare coplanar vs tilted
@@ -511,6 +539,34 @@ func _gate_b2_limb() -> void:
 	# Night side → 0 (day(μ)=0 for μ ≪ −term) even with a long chord.
 	var night := SKY.shell_limb_color_path(-0.5, 6000.0, 5.0)
 	_ok(night.r < 1e-4 and night.g < 1e-4 and night.b < 1e-4, "bounded shell dark on the night side")
+	# G-B2 NIGHT-ZERO (the pilot's blue-halo fix): a SURFACE camera on the deep NIGHT hemisphere; every UPWARD view
+	# ray must add ~0 shell light. The shipped closest-approach mu proxy landed on the horizon ring (mu~0) for
+	# near-vertical rays => a lit night zenith; shell_view_mu (chord midpoint) resolves them to mu<0 => 0.
+	var rr := 6371.0
+	var ro2 := SKY.shell_outer_r(rr)
+	var sun_ns := Vector3(0.0, 0.0, 1.0)
+	var cam_night := Vector3(0.0, 0.0, -1.0) * (rr + 2.0)
+	var night_dark := true
+	var worst_night := 0.0
+	for az in range(0, 360, 30):
+		for el in range(30, 91, 15):
+			var a := deg_to_rad(float(az))
+			var ev := deg_to_rad(float(el))
+			var up := Vector3(0.0, 0.0, -1.0)
+			var horiz := Vector3(cos(a), sin(a), 0.0)
+			var dir := (up * sin(ev) + horiz * cos(ev)).normalized()
+			var geom := SKY.shell_geom(cam_night, Vector3.ZERO, dir, rr, ro2)
+			var mu := SKY.shell_view_mu(cam_night, Vector3.ZERO, dir, rr, ro2, sun_ns)
+			var lum := SKY.shell_limb_color_path(mu, geom[0], geom[1]).get_luminance()
+			worst_night = maxf(worst_night, lum)
+			if lum > 0.02: night_dark = false
+	_ok(night_dark, "shell dark on the NIGHT hemisphere: upward views add ~0 (worst %.4f) - no blue night halo" % worst_night)
+	var cam_day := Vector3(0.0, 0.0, 1.0) * (rr + 2.0)
+	var mu_z := SKY.shell_view_mu(cam_day, Vector3.ZERO, Vector3(0.0, 0.0, 1.0), rr, ro2, sun_ns)
+	_ok(mu_z > 0.9, "day zenith view mu ~ +1 (scatter band off, no olive recolour, mu=%.3f)" % mu_z)
+	var geom_z := SKY.shell_geom(cam_day, Vector3.ZERO, Vector3(0.0, 0.0, 1.0), rr, ro2)
+	var col_z := SKY.shell_limb_color_path(mu_z, geom_z[0], geom_z[1])
+	_ok(col_z.b >= col_z.r and col_z.b >= col_z.g, "day zenith shell blue-dominant (B>=R,G, no green cast)")
 	# Monotone in the optical column (brighter with a longer chord at fixed μ,h_min).
 	var mono := true
 	var prev := -1.0

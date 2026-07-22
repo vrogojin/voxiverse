@@ -1438,6 +1438,26 @@ const FP_FALL_TIMING := false
 const FP_FALL_ATT_GATE := false
 const FALL_ATT_GATE_Y := 200.0   # lattice-y above which the ground-contact floor query is skipped (no terrain reaches this)
 
+## COSMOS-PERF FALL — THE root-cause fix (supersedes the FP_FALL_ATT_GATE band-aid; they COMPOSE). floor_under()
+## scans DOWN cell-by-cell FROM THE FEET, so its cost = (feet_y − floor_y) cell queries. Walking (feet≈floor) is
+## ~1-2 cells (cheap); a FALL FROM ALTITUDE (feet≈R+900) is ~900 cell_value_at queries PER CALL (~86 ms/frame — the
+## fall-fps collapse; the "bounded by fall distance — cheap" comment was FALSE for a fall from orbit). t_att_us
+## (the _attitude caller, now also FALL_ATT_GATE-skipped) AND t_move_us (the surface-fall/collision caller, still
+## spiking below the att gate) both hit it. FIX: make the scan O(bounded) regardless of altitude WITHOUT moving the
+## floor the player stands on. floor_under first probes MARGIN cells DOWN from the feet (near-surface: the floor is
+## in the first 1-2 → the shipped scan verbatim, BIT-IDENTICAL walking/standing/landing); if that finds no floor the
+## feet are far above everything near them, so the scan JUMPS to a cheap CEILING on the highest solid cell —
+## max(col_height + MARGIN, placed_top + 1): col_height is the procedural heightmap top (a direct query — NO scan,
+## covers terrain + trees ≤14 above surface with MARGIN headroom), placed_top is the O(1) per-column high-water of
+## PLAYER-PLACED cells (so a tower rising above the heightmap+MARGIN is covered EXACTLY) — and continues normally
+## down to the real floor. The jump lands just above the true floor, so it returns the SAME floor the shipped scan
+## would (bit-identical), in ≤ ~MARGIN cells instead of ∝ altitude. Reuses the existing `_placed_top` index (zero
+## new memory — NEVER-OOM). Default OFF ⇒ the shipped from-feet unbounded scan verbatim (byte-identical). Gate
+## G-FLOOR-BOUNDED (verify_floor_bounded.gd): EQUIVALENCE (across terrain/trees/towers/water/datum, feet near AND
+## far ⇒ bit-identical) + BOUNDED (feet far above ⇒ scan iters ≤ ~2·MARGIN, INDEPENDENT of feet altitude).
+const FP_FLOOR_BOUNDED := false
+const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jumping to the cheap surface estimate
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

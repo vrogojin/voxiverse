@@ -135,6 +135,10 @@ func _initialize() -> void:
 			b_cols += 1
 			var it := []
 			for alt in [200.0, 900.0, 2000.0]:
+				# Measure the RAW bounded SCAN's altitude-independence: clear any memo first so each altitude pays a
+				# full scan (the memo's O(1) short-circuit — which would make higher altitudes cheaper — is proven
+				# separately in GROUP D). No-op when FP_FLOOR_MEMO is off (the dict is always empty then).
+				w._floor_top.clear()
 				var _f := w.floor_under(x, z, floor_here + alt)
 				it.append(w._floor_scan_iters)
 				max_iters = maxi(max_iters, w._floor_scan_iters)
@@ -184,6 +188,61 @@ func _initialize() -> void:
 		_ok(grows_with_alt, "OFF: shipped scan iters grow ∝ feet altitude (the root cause the fix removes)")
 		_ok(max_iters > 1500, "OFF: a surf+2000 fall costs >1500 scan iters/call (max_iters=%d)" % max_iters)
 		print("  NOTE: sed FP_FLOOR_BOUNDED=true to exercise the BOUNDED (altitude-independent) assertions.")
+
+	# ---- GROUP D: MEMO (FP_FLOOR_MEMO) — the RE-ENTRY residual fix. O(1) per repeated fall column + edit invalidation. --
+	var memo_on := CubeSphere.FP_FLOOR_MEMO
+	if memo_on:
+		# A simulated re-entry fall down ONE column: feet descends step-by-step. The FIRST call scans (cold), every
+		# later call (feet still above the cached topmost) must be a memo HIT — O(1), a couple of iterations — and
+		# STILL bit-identical to the reference. This is the per-frame _move storm collapsing to one scan per column.
+		var mx := bx + 3
+		var mz := bz + 3
+		var fx3 := float(mx) + 0.5
+		var fz3 := float(mz) + 0.5
+		var floor_m := _ref_floor(w, fx3, fz3, 3000.0)
+		var first_iters := 0
+		var hit_max_iters := 0
+		var memo_mismatch := 0
+		var descent := [900.0, 800.0, 700.0, 600.0, 500.0, 400.0, 300.0, 200.0, 120.0, 100.0, 100.0]
+		for i in range(descent.size()):
+			var feet: float = floor_m + descent[i]
+			var fb := w.floor_under(fx3, fz3, feet)
+			if fb != _ref_floor(w, fx3, fz3, feet):
+				memo_mismatch += 1
+			if i == 0:
+				first_iters = w._floor_scan_iters
+			else:
+				hit_max_iters = maxi(hit_max_iters, w._floor_scan_iters)
+		print("  GROUP D: memo col(%d,%d) floor=%.2f first_iters=%d hit_max_iters=%d mismatch=%d cached_top=%d"
+			% [mx, mz, floor_m, first_iters, hit_max_iters, memo_mismatch, int(w._floor_top.get(Vector2i(mx, mz), -0x40000000))])
+		_ok(memo_mismatch == 0, "MEMO: floor_under == reference across a descending fall with the cache live (bit-identical)")
+		_ok(first_iters > margin / 2, "MEMO: the FIRST fall-column call still pays the full scan (%d iters — populates the memo)" % first_iters)
+		_ok(hit_max_iters <= 3, "MEMO: every later fall-column frame is O(1) (≤3 iters, was ∝ scan; hit_max=%d)" % hit_max_iters)
+		# INVALIDATION via the REAL public break/place API (the _write_cell / break_terrain choke points). Prime the
+		# memo (a fall query), then place a SUPPORTED block on the surface perch (first air cell above the ground, so
+		# the structural solver keeps it). floor_under must now report the NEW higher floor bit-identically — proving
+		# the write dropped the stale memo. Then break it and confirm the floor returns to the terrain surface.
+		var inv_ok := true
+		var _pf := w.floor_under(fx3, fz3, floor_m + 700.0)       # prime the memo
+		var perch_cell := int(w.surface_y(fx3, fz3))             # first air cell above the surface (terrain-supported)
+		w.place_block(Vector3i(mx, perch_cell, mz), BC.STONE)
+		var after_place := w.floor_under(fx3, fz3, floor_m + 700.0)
+		if after_place != _ref_floor(w, fx3, fz3, floor_m + 700.0):
+			inv_ok = false
+		if after_place <= floor_m:                               # the floor must have RISEN onto the placed block
+			inv_ok = false
+		_pf = w.floor_under(fx3, fz3, floor_m + 700.0)          # re-prime on the new (raised) surface
+		w.break_terrain(Vector3i(mx, perch_cell, mz))
+		var after_break := w.floor_under(fx3, fz3, floor_m + 700.0)
+		if after_break != _ref_floor(w, fx3, fz3, floor_m + 700.0):
+			inv_ok = false
+		if after_break != floor_m:                              # back to the original terrain surface
+			inv_ok = false
+		print("  GROUP D: invalidation floor=%.2f after_place=%.2f after_break=%.2f ok=%s"
+			% [floor_m, after_place, after_break, str(inv_ok)])
+		_ok(inv_ok, "MEMO invalidation: place/break at a memoized column re-derives the floor exactly (choke-point erase)")
+	else:
+		print("  NOTE: sed FP_FLOOR_MEMO=true (with FP_FLOOR_BOUNDED=true) to exercise the MEMO O(1)/invalidation gates.")
 
 	w.queue_free()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])

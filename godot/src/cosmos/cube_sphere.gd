@@ -1458,6 +1458,29 @@ const FALL_ATT_GATE_Y := 200.0   # lattice-y above which the ground-contact floo
 const FP_FLOOR_BOUNDED := false
 const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jumping to the cheap surface estimate
 
+## COSMOS-PERF FALL — the RE-ENTRY residual (composes on FP_FLOOR_BOUNDED; inert unless it is also on). FP_FLOOR_BOUNDED
+## capped floor_under's scan COUNT at ~MARGIN, but the per-frame _move landing query still ran ~MARGIN cell_value_at
+## calls EVERY frame during atmosphere re-entry (~380→100), and there the near field is FP_ALT_REGIME-frozen so each
+## of those calls hits the COLD C++ generator (~0.15 ms each ⇒ 13-38 ms/frame = t_move_us, a ~1.5 s dip at 10-34 fps)
+## until the streamer refills. FP_FLOOR_MEMO memoizes, per WINDOW column, the CELL index of the TOPMOST solid-with-
+## air-above (`_floor_top`). Nothing solid exists above that cell (proof: if it did, the highest such solid would be a
+## higher solid-with-air-above), so when the feet are AT/ABOVE the cached cell a scan from the feet reaches it through
+## air alone — floor_under jumps STRAIGHT there (O(1): 2 cell reads) instead of scanning the whole gap. The cache is
+## POPULATED only from the FP_FLOOR_BOUNDED jump branch, whose scan provably starts above ALL solids, so the first
+## floor it finds IS the column's topmost surface. During a near-vertical fall the player's (x,z) is ~constant, so the
+## expensive scan runs ONCE per column and every later frame is O(1) — the storm collapses to a single hitch/column.
+## Bit-identical: a hit recomputes the SAME return (`float(y*) + span(y*,fx,fz).y + s`) the shipped scan would (the
+## skipped cells are all air ⇒ no floor). INVALIDATED at the same choke points the edit indices use — `_write_cell` /
+## `sim_revert_cell` erase the column (break/place/snow/collapse stay exact), a crossing/flip clears it
+## (`_rebuild_window_indices`), an origin shift re-keys it (`_shift_window_bookkeeping`); generated terrain never
+## changes and the datum shifts the boundary not the content, so a cell index needs no other invalidation. NEVER-OOM:
+## `_floor_top` is capped at FLOOR_MEMO_CAP columns and cleared wholesale on overflow (a clear just forces recompute).
+## Default OFF ⇒ no cache read/write ⇒ FP_FLOOR_BOUNDED behaviour verbatim (byte-identical). Gate G-FLOOR-BOUNDED
+## (verify_floor_bounded.gd): MEMO equivalence (hits bit-identical to the reference), invalidation (an edit moves the
+## floor and the memo follows), and O(1)-per-column (a repeated fall column caches after one scan).
+const FP_FLOOR_MEMO := false
+const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

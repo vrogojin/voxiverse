@@ -999,8 +999,14 @@ func _free_fall_move(delta: float) -> void:
 			_fall_v_bci = fall_seed_radial(_fall_v_bci, psd)
 		_foff_radial = false
 		_fall_have_v = true
-	for _si in _fd_n:
-		_fall_v_bci = _coast_step(_fd_h, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE lattice↔BCI re-projection + N cheap
+	# BCI steps (vs N per-substep re-projections + N allocations — the live ~150 ms/frame fall collapse). Off ⇒ the
+	# shipped per-substep chain verbatim (byte-identical). N=1 (FP_COAST_FULL_DT off) makes both paths identical.
+	if CubeSphere.FP_COAST_BATCH:
+		_fall_v_bci = _coast_batch(_fd_h, _fd_n, _fall_v_bci, _dominant_body())
+	else:
+		for _si in _fd_n:
+			_fall_v_bci = _coast_step(_fd_h, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
 	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
@@ -1026,6 +1032,24 @@ func _coast_step(delta: float, v_bci: PackedFloat64Array, body: String) -> Packe
 	position = Vector3(lat[0], lat[1], lat[2])
 	return safe[1]
 
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH) — the BATCHED free-fall coast: the whole substep batch behind ONE
+## lattice↔BCI re-projection. Structurally the N-substep `_coast_step` loop with the lattice_to_world64/fixed_to_bci
+## pulled out ABOVE the loop and bci_to_fixed/world_to_lattice64 pulled out BELOW it, so the N cheap BCI Verlet steps
+## (CosmosNav.coast_batch_bci — reuses ONE OrbitalState, clamps per step) run with NO lattice work and ONE allocation
+## regardless of N. Numerically equal to the per-substep chain within the f32 `position` round-trip the batch removes
+## (strictly more accurate). ONE lattice_to_world64 + ONE world_to_lattice64 + ONE OrbitalState.make per call — the
+## perf invariant the gate G-COAST-BATCH asserts by mirroring this exact structure and counting the conversions/makes.
+func _coast_batch(delta: float, n: int, v_bci: PackedFloat64Array, body: String) -> PackedFloat64Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)   # ONE lattice→world
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]   # ONE world→BCI
+	var out := _CosmosNavCls.coast_batch_bci(body, p_bci, v_bci, delta, n, _CosmosNavCls.soi_radius(body))   # N cheap BCI steps, ONE make
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, out[0], out[1])[0]   # ONE BCI→world
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])   # ONE world→lattice
+	position = Vector3(lat[0], lat[1], lat[2])
+	return out[1]
+
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — one physics tick of the O free-coast: integrate the shared Kepler coast
 ## from `_coast_v_bci` (seeded tangential by the O toggle) and write the lattice `position`. A stable circular seed
 ## HOLDS radius; an off-circular seed evolves into an ellipse / decay / escape. The coast mirrors its BCI velocity
@@ -1050,10 +1074,18 @@ func _orbit_coast_move(delta: float) -> void:
 	if _coast_p_bci.size() != 3:
 		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
 		_coast_p_bci = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
-	for _si in _fd_n:
-		var out := _coast_step_kepler(_fd_h, _coast_p_bci, _coast_v_bci, _dominant_body())
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE re-projection + N cheap BCI steps
+	# (vs N per-substep re-projections + N allocations). The carried [p,v] path is BIT-identical batched (never reads
+	# `position` back). Off ⇒ the shipped per-substep loop verbatim (byte-identical); N=1 makes both paths identical.
+	if CubeSphere.FP_COAST_BATCH:
+		var out := _coast_batch_kepler(_fd_h, _fd_n, _coast_p_bci, _coast_v_bci, _dominant_body())
 		_coast_p_bci = out[0]
 		_coast_v_bci = out[1]
+	else:
+		for _si in _fd_n:
+			var out := _coast_step_kepler(_fd_h, _coast_p_bci, _coast_v_bci, _dominant_body())
+			_coast_p_bci = out[0]
+			_coast_v_bci = out[1]
 	# COSMOS-ORBITAL-O1O4 O4c (§3.5) — the SOI dominant-body SWAP. After the integration tick, test whether the
 	# carried BCI point (in the current body's frame) has crossed a sphere-of-influence boundary; if the deepest
 	# SOI now belongs to a different body, RE-EXPRESS the carried [p,v] into that body's BCI frame (an exact,
@@ -1104,6 +1136,22 @@ func _coast_step_kepler(delta: float, p_bci: PackedFloat64Array, v_bci: PackedFl
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
 	position = Vector3(lat[0], lat[1], lat[2])
 	return [safe[0], safe[1]]
+
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH) — the BATCHED orbit coast: the whole substep batch carried in the
+## BCI frame with ONE display-only lattice write. Because `_coast_step_kepler` carries [p,v] and NEVER reads
+## `position` back (the display projection is thrown away and overwritten), the per-substep loop's only per-tick
+## outputs are the carried [p,v] and the display `position` — so batching is BIT-identical: N cheap BCI Verlet steps
+## (CosmosNav.coast_batch_bci, ONE OrbitalState) then ONE bci_to_fixed + world_to_lattice64 for the final display
+## position. ZERO lattice_to_world64 (the orbit never reconstructs from `position`) + ONE world_to_lattice64 + ONE
+## OrbitalState.make per call, regardless of N. Returns [p_bci', v_bci']. Gate G-COAST-BATCH.
+func _coast_batch_kepler(delta: float, n: int, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array, body: String) -> Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var out := _CosmosNavCls.coast_batch_bci(body, p_bci, v_bci, delta, n, _CosmosNavCls.soi_radius(body))   # N cheap BCI steps, ONE make
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, out[0], out[1])[0]   # ONE BCI→world (display only)
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])   # ONE world→lattice (display only)
+	position = Vector3(lat[0], lat[1], lat[2])
+	return out
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — is there a thrust/movement input this tick (the coast-exit trigger)? WASD
 ## (input.x/z) or the vertical verb (Space/Ctrl, or the remote `input.y`). Pure read of the already-polled input.

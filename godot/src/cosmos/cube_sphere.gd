@@ -1288,6 +1288,23 @@ const ORBIT_COAST := false
 ## (chunked here) matches many small dts within tol — frame-dt-invariant trajectory.
 const FP_COAST_FULL_DT := false
 
+## COSMOS-PERF FALL-COLLAPSE FIX (fix/voxiverse-coast-batch) — BATCH the coast substeps. RIDES WITH FP_COAST_FULL_DT
+## (it optimizes exactly that path). The shipped movers cover the full frame delta with N ≤ 30 substeps, but each
+## substep calls _coast_step / _coast_step_kepler, which RE-PROJECTS the whole state lattice↔BCI (lattice_to_world64
+## → fixed_to_bci → OrbitalState.make [a fresh ALLOCATION] → step → clamp → bci_to_fixed → world_to_lattice64) EVERY
+## time — so N substeps = N full re-projections + N allocations (the live fall's ~150 ms/frame, the last fall-perf
+## blocker: hovering at alt 701 ran 49 fps, falling through the SAME altitude 6 fps). With this flag ON the movers
+## convert lattice→BCI ONCE per frame, run the N cheap symplectic velocity-Verlet steps ENTIRELY in the BCI frame
+## (reusing ONE OrbitalState — zero per-substep allocation, zero per-substep lattice re-projection, clamp_bci_state
+## NaN/SOI guard preserved per step), then re-project BCI→lattice ONCE. The free-fall path becomes O(1) re-projections
+## + N cheap f64 integrator steps regardless of N. Off ⇒ the shipped per-substep chain verbatim (byte-identical). The
+## orbit coast (_coast_step_kepler carries the BCI [p,v] and never reads position back) is BIT-identical batched; the
+## free-fall coast (_coast_step reconstructs p from the f32 lattice `position` each substep) matches within the f32
+## round-trip tolerance (the batch is strictly MORE accurate — no per-substep f32 truncation). Gate G-COAST-BATCH
+## (verify_coast_batch.gd): trajectory-equivalence + exactly ONE lattice re-projection per frame regardless of N +
+## exactly ONE OrbitalState allocation per frame (vs N). Requires the coast path (FACETED + SN_DEVNAV/ORBIT_COAST/fall).
+const FP_COAST_BATCH := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

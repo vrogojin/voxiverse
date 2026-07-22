@@ -70,10 +70,13 @@ func _initialize() -> void:
 	TC.warm_up()
 	FA.warm_up()
 	var on := CubeSphere.FP_ALT_REGIME
-	var gate_hi := CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_HYST
-	var gate_lo := CubeSphere.ATMO_TOP - CubeSphere.ALT_REGIME_HYST
-	print("  FP_ALT_REGIME=%s  ATMO_TOP=%.0f  HYST=%.0f  (enter ORBITAL >%.0f, re-enter SURFACE <%.0f)"
-		% [str(on), CubeSphere.ATMO_TOP, CubeSphere.ALT_REGIME_HYST, gate_hi, gate_lo])
+	# RE-ENTRY FIX: the freeze RELEASES at ATMO_TOP + ALT_REGIME_REENTRY_PREP (ABOVE the surface ceiling, so the near
+	# field is correct before surface physics) and ENTERS one hysteresis band higher. `gate_hi` is the ENTER (freeze)
+	# threshold; `gate_lo` is the RELEASE (re-entry restore) threshold.
+	var gate_hi := CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST
+	var gate_lo := CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP
+	print("  FP_ALT_REGIME=%s  ATMO_TOP=%.0f  HYST=%.0f  PREP=%.0f  (enter ORBITAL >%.0f, re-enter SURFACE <%.0f)"
+		% [str(on), CubeSphere.ATMO_TOP, CubeSphere.ALT_REGIME_HYST, CubeSphere.ALT_REGIME_REENTRY_PREP, gate_hi, gate_lo])
 	# The deploy-relevant flags this gate must prove landing-safe UNDER (the re-entry restore interacts with the
 	# fixed-frame flip + datum-baked terrain heights + corner-commit crossing + the landing stream kick).
 	print("  deploy flags: FIXED_FRAME=%s M1_POOL=%s M2_LOD=%s CPPGEN=%s DATUM_BAKE=%s RADIAL_DATUM=%s CORNER_COMMIT=%s TWIST_FRAME_AWARE=%s LANDING_STREAM_KICK=%s"

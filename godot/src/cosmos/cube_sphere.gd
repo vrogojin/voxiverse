@@ -770,10 +770,21 @@ const FP_SNOW_SLICED := false
 ## regime never leaves SURFACE, no early return fires). Gate: verify_alt_regime.gd (scripted fall altitude-sweep). Bake
 ## ON at export after the browser A/B. Requires FACETED = true.
 const FP_ALT_REGIME := false
-## Hysteresis half-band (blocks) about ATMO_TOP for the regime latch: enter ORBITAL above ATMO_TOP + ALT_REGIME_HYST,
-## return to SURFACE below ATMO_TOP − ALT_REGIME_HYST. Prevents regime flapping (and re-entry redesignation churn) when
-## the radial altitude jitters across the 384-block ceiling during a grazing pass.
+## Hysteresis half-band (blocks) about ATMO_TOP for the regime latch. Prevents regime flapping (and re-entry
+## redesignation churn) when the radial altitude jitters during a grazing pass.
 const ALT_REGIME_HYST := 32.0
+## COSMOS-PERF UNATTENDED R3 RE-ENTRY FIX (the live "fall-from-orbit tunnels through the planet to the antipode
+## surface" bug). The ORBITAL freeze must RELEASE — and fire the ONE re-entry redesignation onto the true sub-camera
+## facet — while the player is STILL ABOVE the surface-physics ceiling (ATMO_TOP), so that floor/collision/walk
+## queries never run against the STALE frozen launch facet. The original release at ATMO_TOP − ALT_REGIME_HYST (352)
+## sat ~32 blocks INSIDE the surface regime: for the [352, 384] band the player walked/collided against the launch
+## facet's terrain while physically over a FAR facet (the real ground absent → the fall-through / late pop the pilot
+## sees as a teleport to the opposite side). This margin releases the freeze at ATMO_TOP + ALT_REGIME_REENTRY_PREP,
+## so the near field is redesignated onto the sub-camera facet BEFORE surface physics begins AND has the whole
+## sub-ceiling descent to stream (fixing the slow-web fall-through). The freeze still ENTERS only above
+## ATMO_TOP + ALT_REGIME_REENTRY_PREP + ALT_REGIME_HYST, so the high-orbit bulk stays frozen (the perf win). Only
+## read under FP_ALT_REGIME ⇒ byte-identical off. Gate: verify_reentry.gd scenario (f) (frozen-orbit re-entry).
+const ALT_REGIME_REENTRY_PREP := 32.0
 
 ## COSMOS-PERF UNATTENDED R5 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §5 R5, item W4) — the INCREMENTAL PER-FID EDIT INDEX.
 ## `_rebuild_window_indices` (run on EVERY facet crossing, world_manager.gd) and `_translate_active` (fallback/collapse/

@@ -431,20 +431,27 @@ func _radial_altitude_lattice(player_pos: Vector3) -> float:
 	return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - FacetAtlas.R_BLOCKS
 
 ## COSMOS-PERF UNATTENDED R3 — advance the altitude regime latch from the current player position (called once per
-## physics tick from update_streaming, under FP_ALT_REGIME). Hysteresis about ATMO_TOP: enter ORBITAL only above
-## ATMO_TOP + ALT_REGIME_HYST, return to SURFACE only below ATMO_TOP − ALT_REGIME_HYST (so a grazing pass across the
-## ceiling never flaps the freeze / re-entry restore). On the ORBITAL→SURFACE edge it arms `_alt_reentry_pending`, which
-## the next maybe_cross_facet consumes to restore the near field onto the sub-camera facet. No-op with the flag off.
+## physics tick from update_streaming, under FP_ALT_REGIME). The freeze RELEASES (and arms the ONE re-entry
+## redesignation) at ATMO_TOP + ALT_REGIME_REENTRY_PREP — ABOVE the surface-physics ceiling (ATMO_TOP) — so the near
+## field lands on the true sub-camera facet BEFORE floor/collision/walk ever run, never against the STALE frozen
+## launch facet (the RE-ENTRY FIX: the "fall-from-orbit tunnels through the planet to the antipode" bug — surface
+## physics against the wrong facet's terrain → fall-through / late pop). It ENTERS one hysteresis band higher, at
+## ATMO_TOP + ALT_REGIME_REENTRY_PREP + ALT_REGIME_HYST, so a grazing pass never flaps the freeze and the high-orbit
+## bulk stays frozen. On the ORBITAL→SURFACE edge it arms `_alt_reentry_pending`, which the next maybe_cross_facet
+## consumes to restore the near field onto the sub-camera facet. No-op with the flag off.
 func _update_alt_regime(player_pos: Vector3) -> void:
 	if not CubeSphere.FP_ALT_REGIME or not CubeSphere.FACETED:
 		return
 	var alt := _radial_altitude_lattice(player_pos)
 	if _alt_orbital:
-		if alt < CubeSphere.ATMO_TOP - CubeSphere.ALT_REGIME_HYST:
+		# Release ABOVE the surface ceiling so the near field is correct BEFORE surface physics begins AND has the
+		# whole sub-ceiling descent to stream (the slow-web fall-through fix). Was ATMO_TOP − ALT_REGIME_HYST (352),
+		# which sat inside the surface regime → surface queries hit the stale frozen far facet for ~32 blocks.
+		if alt < CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP:
 			_alt_orbital = false
 			_alt_reentry_pending = true   # armed for the next maybe_cross_facet: ONE restore redesignation
 	else:
-		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_HYST:
+		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST:
 			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
 
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a

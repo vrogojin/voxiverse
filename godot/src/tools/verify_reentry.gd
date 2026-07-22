@@ -31,6 +31,7 @@ const DV := preload("res://src/cosmos/dvec3.gd")
 const ORB := preload("res://src/cosmos/orbital_state.gd")
 const NAV := preload("res://src/cosmos/cosmos_nav.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const GRAV := preload("res://src/cosmos/cosmos_gravity.gd")
 
 var _pass := 0
 var _fail := 0
@@ -78,6 +79,15 @@ func _run() -> void:
 	# maybe_cross_facet pipeline: set_active_facet committed, apply_reframe never ran). The stale lattice
 	# pose reinterpreted in the new facet's decorrelated frame IS the live one-frame teleport.
 	await _fid_desync()
+
+	# --- (f): FP_ALT_REGIME frozen-orbit re-entry — the live "fall-from-orbit tunnels through the planet to the
+	# antipode surface" bug. A real tangential orbit sweeps the ground track to a FAR facet while the near field is
+	# frozen; the ONE re-entry restore must land the near field onto the true sub-camera facet BEFORE the player drops
+	# into the surface-physics regime (alt < ATMO_TOP: floor/collision/walk), else those queries run against the STALE
+	# frozen launch facet — the real terrain isn't there → fall-through / late pop (the perceived teleport). Gated on
+	# FP_ALT_REGIME (only meaningful with the freeze on).
+	if CubeSphere.FP_ALT_REGIME:
+		await _frozen_orbit_reentry()
 
 	_finish()
 
@@ -281,5 +291,92 @@ func _fid_desync() -> void:
 	# and no garbage velocity is adopted. OLD code: jump ≈ 45.9 k here (11081 live), v_bci latch ~10⁵⁻⁶.
 	_ok(jump <= 25.0, "desync healed: one-frame |Δw| %.1f ≤ 25 blocks (OLD code teleports ~45.9k; live 11081)" % jump)
 	_ok(max_vbci < 1500.0, "desync healed: |v_bci| stays physical (max %.1f < 1500; OLD code latches the jump/dt)" % max_vbci)
+	pl.queue_free()
+	await process_frame
+
+## (f) FP_ALT_REGIME frozen-orbit re-entry (the live fall-from-orbit teleport). Seed a REAL tangential orbit at high
+## altitude over facet A; the freeze holds A while the ground track sweeps to a FAR facet, then the descent fires the
+## ONE re-entry restore. Drives the REAL Player._physics_process end-to-end. Asserts:
+##   • CONTINUITY  — planet-fixed |Δw| per frame ≤ real motion (no world teleport at the deferred redesignation);
+##   • NEAR-FIELD-READY — the near field is redesignated onto the true sub-camera facet BEFORE the player enters the
+##     surface-physics regime (alt < ATMO_TOP), so floor/collision/walk NEVER query the STALE frozen far facet. This
+##     is the fails-before invariant: with the OLD release at ATMO_TOP−HYST the freeze holds ~32 blocks INTO the
+##     surface regime, so surface physics runs against the launch facet's terrain (the real ground absent → the fall-
+##     through / tunnel-to-antipode). The fix releases the freeze ABOVE ATMO_TOP.
+##   • LANDING     — the descent lands on SOLID terrain on the physically-correct sub-camera facet.
+func _frozen_orbit_reentry() -> void:
+	print("  --- frozen-orbit re-entry (FP_ALT_REGIME: fall-from-orbit tunnel-to-antipode) ---")
+	var A := TerrainConfig.active_facet()
+	var cc := FacetAtlas.centre_cell(A)
+	var pl = _make_player(Vector2(float(cc.x) + 0.5, float(cc.y) + 0.5), 900.0, 0.0)
+	await process_frame
+	# Seed a real sub-circular tangential orbit (an ellipse that plunges on the far side): the ground track sweeps a
+	# large angular distance while the near field is frozen at A.
+	var fid := TerrainConfig.active_facet()
+	var w0: Array = FA.lattice_to_world64(fid, pl.position.x, pl.position.y, pl.position.z)
+	var r0 := sqrt(w0[0]*w0[0] + w0[1]*w0[1] + w0[2]*w0[2])
+	var vcirc := sqrt(GRAV.gm_dyn("earth") / r0)
+	var wu: Array = FA.lattice_to_world64(fid, pl.position.x + 1.0, pl.position.y, pl.position.z + 0.37)
+	var tang := Vector3(wu[0]-w0[0], wu[1]-w0[1], wu[2]-w0[2]).normalized()
+	var vfix := tang * (0.72 * vcirc)
+	var bci: Array = ORB.fixed_to_bci("earth", pl._nav_clock, DV.v(w0[0], w0[1], w0[2]), DV.v(vfix.x, vfix.y, vfix.z))
+	pl._nav_last_v_bci = bci[1]
+	pl._fall_have_v = false
+	pl.frozen = false                      # drive the REAL _physics_process end-to-end (like scenarios (d)/(e))
+
+	var dt := 1.0 / 60.0
+	var prev_w := _wpos(pl)
+	var max_jump := 0.0
+	var swept_far := false                 # the ground track drifted off the launch facet A while frozen
+	var restore_alt := -1.0                # radial altitude at the ONE re-entry redesignation
+	var stale_surface_frames := 0          # frames where alt < ATMO_TOP but the active facet is NOT the sub-camera facet
+	var worst_stale := ""                  # a sample of the worst stale-surface frame
+	var landed := false
+	var prev_fid := A
+	for f in range(4000):
+		pl._physics_process(dt)
+		var w := _wpos(pl)
+		var af := TerrainConfig.active_facet()
+		var alt := w.length() - FA.R_BLOCKS
+		var sub := FA.facet_of_dir(CubeSphere.DVec3.new(w.x, w.y, w.z))
+		var jump := (w - prev_w).length()
+		if jump > max_jump: max_jump = jump
+		if sub != A and sub >= 0: swept_far = true
+		if af != prev_fid and restore_alt < 0.0:
+			restore_alt = alt              # the first (the ONE) re-entry redesignation
+		# THE INVARIANT: once in the surface-physics regime (alt < ATMO_TOP), the active facet must be the sub-camera
+		# facet — surface floor/collision/walk must query the terrain UNDER the player, never the stale frozen facet.
+		if alt < CubeSphere.ATMO_TOP and af != sub and sub >= 0:
+			stale_surface_frames += 1
+			if worst_stale == "":
+				worst_stale = "alt=%.1f active=%d sub=%d" % [alt, af, sub]
+		prev_w = w; prev_fid = af
+		if alt < 20.0 and absf(pl.velocity.y) < 0.1 and f > 120:
+			landed = true; break
+		if alt < -120.0:
+			break                          # fell THROUGH the terrain
+		if alt > 4000.0:
+			break
+	var land_fid := TerrainConfig.active_facet()
+	var wl := _wpos(pl)
+	var land_sub := FA.facet_of_dir(CubeSphere.DVec3.new(wl.x, wl.y, wl.z))
+	var land_alt := wl.length() - FA.R_BLOCKS
+	var land_solid := false
+	var surf := int(round(_wm.surface_y(pl.position.x, pl.position.z)))
+	for dy in range(0, 8):
+		if _wm.block_id_at(Vector3i(int(floor(pl.position.x)), surf - dy, int(floor(pl.position.z)))) > 0:
+			land_solid = true; break
+	print("    swept_far=%s restore_alt=%.1f (ATMO_TOP=%.0f) stale_surface_frames=%d [%s] max_jump=%.2f land_fid=%d land_sub=%d land_alt=%.1f solid=%s"
+		% [str(swept_far), restore_alt, CubeSphere.ATMO_TOP, stale_surface_frames, worst_stale, max_jump, land_fid, land_sub, land_alt, str(land_solid)])
+	# The orbit must actually exercise the freeze (a far ground-track sweep) — else the scenario proves nothing.
+	_ok(swept_far, "frozen-orbit: the ground track swept to a far facet while frozen (the freeze is exercised)")
+	# CONTINUITY: the planet-fixed position never teleports at the deferred redesignation (the reframe is lossless).
+	_ok(max_jump <= 25.0, "frozen-orbit: planet-fixed position continuous across re-entry (max |Δw| %.2f ≤ 25 blocks)" % max_jump)
+	# NEAR-FIELD-READY (the fix): the near field is on the sub-camera facet BEFORE surface physics runs. OLD code
+	# releases at ATMO_TOP−HYST ⇒ ~32 blocks of surface walk against the stale far facet ⇒ stale_surface_frames > 0.
+	_ok(stale_surface_frames == 0, "frozen-orbit: surface physics NEVER runs against the stale frozen facet (stale_surface_frames=%d; OLD code: freeze holds below ATMO_TOP)" % stale_surface_frames)
+	_ok(restore_alt >= CubeSphere.ATMO_TOP, "frozen-orbit: re-entry restore fires ABOVE the surface ceiling (restore_alt=%.1f ≥ ATMO_TOP=%.0f)" % [restore_alt, CubeSphere.ATMO_TOP])
+	# LANDING: on solid terrain on the physically-correct sub-camera facet (not tunnelled through / stranded).
+	_ok(landed and land_solid and land_fid == land_sub, "frozen-orbit: landed on SOLID correct-facet terrain (fid=%d sub=%d alt=%.1f solid=%s)" % [land_fid, land_sub, land_alt, str(land_solid)])
 	pl.queue_free()
 	await process_frame

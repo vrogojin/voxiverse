@@ -44,7 +44,13 @@ const FREEZE_ECC_MAX := 0.999                          # v1 freezes only ellipti
 # Construction.
 # ---------------------------------------------------------------------------------------
 
+## Allocation counter (FP_COAST_BATCH gate G-COAST-BATCH). Every make() is a fresh OrbitalState allocation; the
+## coast-batch fix's whole point is doing ONE per frame instead of N (one per substep). A monotonic int the gate
+## resets + reads to prove the allocation invariant on the REAL constructor — never read at runtime, zero-cost.
+static var make_calls: int = 0
+
 static func make(body_: String, pos_bci: PackedFloat64Array, vel_bci: PackedFloat64Array) -> OrbitalState:
+	make_calls += 1
 	var s := OrbitalState.new()
 	s.body = body_
 	s.mode = ACTIVE

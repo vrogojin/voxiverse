@@ -114,6 +114,34 @@ static func coast_substep_dt(delta: float) -> float:
 		return 0.0
 	return minf(delta, COAST_CATCHUP_MAX) / float(n)
 
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH) — the BATCHED BCI coast integrator. Run `n` symplectic
+## velocity-Verlet substeps of `dt` each ENTIRELY in the body-centred-inertial frame from the seed [p_bci, v_bci]
+## under `body`, reusing ONE OrbitalState (ORB.make is called EXACTLY ONCE for all n substeps — zero per-substep
+## allocation) and applying the clamp_bci_state NaN/SOI guard AFTER each step (identical safety to the per-substep
+## _coast_step / _coast_step_kepler chain, which clamps every substep). Returns [p_bci', v_bci'] as fresh vectors.
+##
+## This is the physics core that lets the player's coast movers do ONE lattice↔BCI re-projection per frame instead
+## of N: the caller converts lattice→BCI once, calls this for the whole substep batch (which touches NO scene /
+## lattice / FacetAtlas state — pure f64 in the BCI frame), then converts BCI→lattice once. Because os.step is
+## deterministic on (pos,vel), n batched steps of one OrbitalState are BIT-identical to n fresh make()+single-step
+## calls seeded from the carried state — so the orbit coast (which carries [p,v]) is numerically exact; the free-fall
+## coast differs only by the per-substep f32 `position` round-trip the batch removes (the batch is strictly more
+## accurate). Pure static; NEVER-OOM (one OrbitalState + bounded transient DVec3 temps, n ≤ 30). Gate G-COAST-BATCH.
+static func coast_batch_bci(body: String, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array,
+		dt: float, n: int, r_max: float) -> Array:
+	var os = ORB.make(body, p_bci, v_bci)                   # ONE allocation for the whole batch (vs N per-substep)
+	var a0 := DV.v(0.0, 0.0, 0.0)                            # pure free coast (no thrust/drag)
+	for _i in n:
+		var p_prev: PackedFloat64Array = os.pos             # pre-step state (os.step rebinds pos/vel to fresh arrays)
+		var v_prev: PackedFloat64Array = os.vel
+		os.step(dt, a0)
+		# G-REENTRY FIX C guard, per substep — same as _coast_step / _coast_step_kepler: NaN reverts, beyond-SOI clamps.
+		var safe := clamp_bci_state(os.pos, os.vel, p_prev, v_prev, r_max)
+		os.pos = safe[0]
+		os.vel = safe[1]
+	return [PackedFloat64Array([os.pos[0], os.pos[1], os.pos[2]]),
+		PackedFloat64Array([os.vel[0], os.vel[1], os.vel[2]])]
+
 ## Bounded reciprocal for the finite-difference velocity (v_fix = Δp · fd_inv_dt): 1/max(dt, MIN_FD_DT).
 ## Never larger than 1/MIN_FD_DT, so a near-zero delta cannot produce an unbounded derived velocity.
 static func fd_inv_dt(dt: float) -> float:

@@ -790,6 +790,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 				var stel = player.call("space_telemetry")
 				if stel is Dictionary and not (stel as Dictionary).is_empty():
 					msg.merge(stel as Dictionary)
+		# COSMOS-PERF FALL-TIMING (FP_FALL_TIMING): the per-segment CPU µs (window MAX) for the free-fall hotspot hunt.
+		# ADDITIVE + empty-dict-guarded exactly like space_telemetry — fall_timing() returns {} with the flag off (the
+		# accumulator was never written), so a shipped build stamps NO t_*_us keys (byte-identical telemetry).
+		if player.has_method("fall_timing"):
+			var ft = player.call("fall_timing")
+			if ft is Dictionary and not (ft as Dictionary).is_empty():
+				msg.merge(ft as Dictionary)
 		# COSMOS-ORBITAL-SHELL H-B: the live camera far plane, so "shell emitted but far side clipped" (far-plane) is
 		# directly readable next to sh_d/sh_h (compare far to the limb tangent √(d²−R²)). Guarded; 0 when absent.
 		if player.has_method("camera_far"):

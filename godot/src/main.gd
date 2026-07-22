@@ -256,10 +256,19 @@ func _process(_delta: float) -> void:
 			if reapply:
 				_fs_last_d = a0_d
 		var freeze := CubeSphere.FP_FALL_SCALE_FREEZE
+		# FP_FALL_TIMING: time the two altitude-driven scaled-body writes separately (camera near/far frustum re-fit
+		# vs the far-ring scale-about-camera placement — the AABB culling-BVH re-insert). Pushed into the player's
+		# fall-timing dict so they ride out through fall_timing(). Off ⇒ the flag test only (byte-identical).
+		var _ft_on := CubeSphere.FP_FALL_TIMING
+		var _ft_t := 0
 		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_CAM):
+			if _ft_on: _ft_t = Time.get_ticks_usec()
 			_player.apply_scaled_camera_planes(a0_d - FacetAtlas.R_BLOCKS, a0_d)
+			if _ft_on: _player.ft_record("t_scaledbody_us", Time.get_ticks_usec() - _ft_t)
 		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_RING):
+			if _ft_on: _ft_t = Time.get_ticks_usec()
 			_player.world.apply_scaled_body(a0_cam)
+			if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin
@@ -285,8 +294,16 @@ func _process(_delta: float) -> void:
 	if CosmosScale.on() and CubeSphere.FACETED:
 		var centre := _player.world.planet_render_centre()
 		var d := cam.distance_to(centre)
+		# FP_FALL_TIMING: same scaled-body split as the A0 block above (this legacy path runs only when NOT FLAT_WORLD;
+		# the production faceted game returns before here — instrumented for completeness). Off ⇒ flag test only.
+		var _ft_on := CubeSphere.FP_FALL_TIMING
+		var _ft_t := 0
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
+		if _ft_on: _player.ft_record("t_scaledbody_us", Time.get_ticks_usec() - _ft_t)
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_player.world.apply_scaled_body(cam)
+		if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

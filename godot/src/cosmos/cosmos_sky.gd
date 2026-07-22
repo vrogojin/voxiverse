@@ -882,9 +882,16 @@ func _build_nodes() -> void:
 func _process(_delta: float) -> void:
 	if _clock == null:
 		return
+	# FP_FALL_TIMING: time the whole sky recompute (t_sky_us) and push it into the player's fall-timing dict so it
+	# rides out through fall_timing(). Off ⇒ the flag test only (no timer call, no key) — byte-identical.
+	var _ft_on := CubeSphere.FP_FALL_TIMING
+	var _ft_t := 0
 	# COSMOS-PERF FALL-ALTRATE (FP_FALL_ATMO_THROTTLE): off ⇒ the shipped every-frame recompute (byte-identical).
 	if not CubeSphere.FP_FALL_ATMO_THROTTLE:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_update_sky(_clock.now())
+		if _ft_on and _cam_provider != null and _cam_provider.has_method("ft_record"):
+			_cam_provider.call("ft_record", "t_sky_us", Time.get_ticks_usec() - _ft_t)
 		return
 	# Throttle the whole recompute during a fast descent: derive the radial (altitude) speed from the camera
 	# origin distance, then hold the last uniforms unless motion is slow/steady (converge exactly) or
@@ -900,7 +907,10 @@ func _process(_delta: float) -> void:
 	var ms_since := (now_msec - _atmo_apply_msec) if _atmo_apply_msec >= 0 else 0x7fffffff
 	if FallThrottle.should_reapply(true, vspeed, ms_since):
 		_atmo_apply_msec = now_msec
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_update_sky(_clock.now())
+		if _ft_on and _cam_provider != null and _cam_provider.has_method("ft_record"):
+			_cam_provider.call("ft_record", "t_sky_us", Time.get_ticks_usec() - _ft_t)
 
 ## Re-place the sky from the ephemeris at time t. ONLY transforms/uniforms are written (no allocation,
 ## no geometry rebuild) — the per-frame cost is a handful of node writes (§4.1). NOTE: CosmosSky is a

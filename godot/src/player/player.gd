@@ -202,6 +202,13 @@ var _camfar_prev_d := -1.0
 var _camfar_prev_usec := -1
 var _camfar_apply_msec := -1
 
+# COSMOS-PERF FALL-TIMING (FP_FALL_TIMING) — per-frame CPU-segment timers, DIAGNOSTIC. `_ft` holds the window MAX
+# µs per segment key (t_move_us / t_coast_us / t_stream_us / t_nav_us / t_att_us / t_pushbodies_us / t_aim_us and,
+# pushed in from main._process / CosmosSky, t_scaledbody_us / t_farring_us / t_sky_us) plus n_coast_calls. Written
+# ONLY under the flag (the segment wrappers are gated), so off the dict stays empty ⇒ fall_timing() returns {} ⇒
+# byte-identical telemetry. Cleared each telemetry window (on read by fall_timing) ⇒ NEVER-OOM (bounded key set).
+var _ft := {}
+
 # ── REMOTE-DRIVE INTENT SEAM (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4.2) ─────────────────────────
 # The ONLY hook the RemoteControl executor drives the rover through: it injects INTENT at the exact
 # level a human does (the WASD/Shift/Space polls in _move), so commanded motion flows through the
@@ -636,12 +643,20 @@ func _physics_process(delta: float) -> void:
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
 	var _pre_move_pos := position
+	# FP_FALL_TIMING: time the whole _move (the free-fall coast lives inside it — split out as t_coast_us). Off ⇒
+	# the flag test is the only added work (no timer call, no key). See fall_timing().
+	var _ft_on := CubeSphere.FP_FALL_TIMING
+	var _ft_t := 0
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_move(delta)
+	if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
 	var _tick_move_delta := position - _pre_move_pos
 	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
 	# when the frame is off / at identity). update_streaming feeds the collider/pool/streamer, all lattice consumers.
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	world.update_streaming(position)
+	if _ft_on: _ft_max("t_stream_us", Time.get_ticks_usec() - _ft_t)
 	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
 	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
 	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
@@ -680,8 +695,12 @@ func _physics_process(delta: float) -> void:
 			global_position = reloc["pos"]
 			velocity = reloc["vel"]
 			rotation.y += float(reloc["yaw_delta"])
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_push_bodies(delta)
+	if _ft_on: _ft_max("t_pushbodies_us", Time.get_ticks_usec() - _ft_t)
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_update_aim()
+	if _ft_on: _ft_max("t_aim_us", Time.get_ticks_usec() - _ft_t)
 	# REMOTE-DRIVE (§4.3): tick the executor AFTER the origin/frame corrections (so the crossing yaw_delta
 	# is known) but with the PRE-correction locomotion delta captured at the top. No-op in normal play
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
@@ -695,12 +714,16 @@ func _physics_process(delta: float) -> void:
 	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
 	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
 	if _nav != null:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_nav_tick(delta)
+		if _ft_on: _ft_max("t_nav_us", Time.get_ticks_usec() - _ft_t)
 	# COSMOS ORBIT-FRAME (§3.2): advance the inertial-attitude machine AFTER the nav tick, so it reads the
 	# freshest COMMITTED nav mode + the just-advanced clock. DEAD unless the flag AND the nav machine are live —
 	# off-flag the machine never leaves SURFACE, the camera node is never emancipated, so this is byte-identical.
 	if CubeSphere.ORBIT_ATTITUDE and _nav != null:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_attitude_tick(delta)
+		if _ft_on: _ft_max("t_att_us", Time.get_ticks_usec() - _ft_t)
 
 ## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
 ## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world
@@ -1043,16 +1066,28 @@ func _free_fall_move(delta: float) -> void:
 	# and advance it by ONE universal-variable two-body step over the whole real frame delta (O(1)/frame, ZERO Verlet
 	# substeps, no time-dilation, exact). This is THE fall-collapse fix (the Verlet substep loops below are the spiral).
 	# Off ⇒ the shipped FP_COAST_BATCH / per-substep Verlet chain verbatim (byte-identical). Takes precedence when on.
+	# FP_FALL_TIMING: time the coast integrator (t_coast_us) + count the substeps (n_coast_calls — a runaway inner
+	# loop would show here). t_move_us − t_coast_us = the rest of _move. Off ⇒ the flag test only (byte-identical).
+	var _ft_on := CubeSphere.FP_FALL_TIMING
+	var _ft_t := 0
+	if _ft_on: _ft_t = Time.get_ticks_usec()
+	var _n_coast := 0
 	if CubeSphere.FP_FREEFALL_RAILS:
 		_coast_freefall_rails(delta, _dominant_body())
+		_n_coast = 1
 	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE lattice↔BCI re-projection + N cheap
 	# BCI steps (vs N per-substep re-projections + N allocations — the live ~150 ms/frame fall collapse). Off ⇒ the
 	# shipped per-substep chain verbatim (byte-identical). N=1 (FP_COAST_FULL_DT off) makes both paths identical.
 	elif CubeSphere.FP_COAST_BATCH:
 		_fall_v_bci = _coast_batch(_fd_h, _fd_n, _fall_v_bci, _dominant_body())
+		_n_coast = _fd_n
 	else:
 		for _si in _fd_n:
 			_fall_v_bci = _coast_step(_fd_h, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
+		_n_coast = _fd_n
+	if _ft_on:
+		_ft_max("t_coast_us", Time.get_ticks_usec() - _ft_t)
+		_ft_max("n_coast_calls", _n_coast)
 	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
@@ -2082,3 +2117,28 @@ func _space_att_name() -> String:
 		ATT_SPACE: return "space"
 		ATT_RECOVER: return "recover"
 		_: return "surface"
+
+# ── COSMOS-PERF FALL-TIMING (FP_FALL_TIMING) diagnostic instrument ───────────────────────────────
+## Record the running per-window MAX for one segment key (µs). Called only from the flag-gated segment wrappers
+## (and from ft_record for main/sky-pushed segments), so with the flag off nothing ever writes ⇒ `_ft` stays empty.
+func _ft_max(key: String, us: int) -> void:
+	if us > int(_ft.get(key, 0)):
+		_ft[key] = us
+
+## Cross-node push seam: main._process (scaled-body / far-ring) and CosmosSky._process (sky recompute) time their
+## own segment and forward the µs here so ALL fall-timing keys travel out through the one fall_timing() telemetry
+## merge. Self-gated on the flag so an errant caller off-flag can never add a key (byte-identical off).
+func ft_record(key: String, us: int) -> void:
+	if not CubeSphere.FP_FALL_TIMING:
+		return
+	_ft_max(key, us)
+
+## Fall-timing telemetry: the just-elapsed window's per-segment MAX µs, then RESET for the next window. Empty (⇒
+## merges nothing ⇒ byte-identical) whenever the flag is off — nothing ever populated `_ft`. RemoteBridge merges
+## this into each 4-Hz telemetry record exactly like space_telemetry (additive + empty-dict-guarded).
+func fall_timing() -> Dictionary:
+	if _ft.is_empty():
+		return {}
+	var out: Dictionary = _ft.duplicate()
+	_ft.clear()
+	return out

@@ -1415,6 +1415,20 @@ const FP_FALL_FREEZE_RING := true     # the far-ring scale-about-camera write pa
 ## pinned at FAR_MIN and the ring scale is 1, so a band is a literal no-op there; higher up the step is < 0.3%).
 const FALL_FREEZE_BAND := 48.0
 
+## COSMOS-PERF FALL-TIMING (fix/voxiverse-fall-timing, 2026-07-22) — a DIAGNOSTIC INSTRUMENT (not a fix). A browser
+## profile proved the free-fall (dev_nav off, gravity coast) 5-fps collapse is game CPU, not GPU, but the WASM is
+## unsymbolicated so the hot segment is unnamed. FP_FALL_TIMING wraps every major per-(physics/process)-frame work
+## segment in Time.get_ticks_usec() deltas — RELIABLE within a single frame (no rAF/vsync wait, unlike the
+## TIME_PROCESS-family proc_ms/phys_ms which read the whole-frame period on threaded web) — and publishes the
+## per-segment window-MAX µs in the telemetry (t_move_us / t_coast_us / t_stream_us / t_nav_us / t_att_us /
+## t_pushbodies_us / t_aim_us in player._physics_process+_free_fall_move; t_scaledbody_us / t_farring_us in
+## main._process; t_sky_us in CosmosSky._process), plus n_coast_calls (coast-integrator substeps/frame — catches a
+## runaway inner loop). Bake it ON, drive a fall, read which segment is the hundreds-of-µs→ms cost, then dispatch
+## the real fix there. Off ⇒ NO timer calls, the accumulator dict stays empty ⇒ fall_timing() returns {} ⇒ NO
+## telemetry keys added (byte-identical). NEVER-OOM: a fixed handful of int-keyed maxima, cleared every telemetry
+## window. Gate G-FALL-TIMING (verify_fall_timing.gd): byte-off default + the plumbing populates/clears the keys.
+const FP_FALL_TIMING := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

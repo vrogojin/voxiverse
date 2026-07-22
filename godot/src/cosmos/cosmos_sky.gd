@@ -53,6 +53,13 @@ var _clock: EPH.CosmosClock = null
 var _env: Environment = null
 var _cam_provider: Node = null                 # anything with camera_global_transform() -> Transform3D (the Player)
 
+# COSMOS-PERF FALL-ALTRATE (FP_FALL_ATMO_THROTTLE): throttle state for the per-frame _update_sky recompute. The
+# sun/moon/shell uniforms + all the Environment fog/ambient/background writes are held during a fast descent and
+# refreshed ≤ 1/FALL_THROTTLE_MS. −1 sentinels (no prior sample) ⇒ the first _process always updates. DEAD off the flag.
+var _atmo_prev_d := -1.0
+var _atmo_prev_usec := -1
+var _atmo_apply_msec := -1
+
 var _sun: MeshInstance3D = null
 var _sun_light: DirectionalLight3D = null
 var _moon: MeshInstance3D = null
@@ -870,7 +877,25 @@ func _build_nodes() -> void:
 func _process(_delta: float) -> void:
 	if _clock == null:
 		return
-	_update_sky(_clock.now())
+	# COSMOS-PERF FALL-ALTRATE (FP_FALL_ATMO_THROTTLE): off ⇒ the shipped every-frame recompute (byte-identical).
+	if not CubeSphere.FP_FALL_ATMO_THROTTLE:
+		_update_sky(_clock.now())
+		return
+	# Throttle the whole recompute during a fast descent: derive the radial (altitude) speed from the camera
+	# origin distance, then hold the last uniforms unless motion is slow/steady (converge exactly) or
+	# FALL_THROTTLE_MS has elapsed. The sun/stars freeze for ≤ FALL_THROTTLE_MS while plummeting (imperceptible).
+	var now_usec := Time.get_ticks_usec()
+	var d := _camera_origin().length()
+	var vspeed := 0.0
+	if _atmo_prev_usec >= 0:
+		vspeed = FallThrottle.radial_speed(_atmo_prev_d, d, float(now_usec - _atmo_prev_usec) / 1.0e6)
+	_atmo_prev_d = d
+	_atmo_prev_usec = now_usec
+	var now_msec := Time.get_ticks_msec()
+	var ms_since := (now_msec - _atmo_apply_msec) if _atmo_apply_msec >= 0 else 0x7fffffff
+	if FallThrottle.should_reapply(true, vspeed, ms_since):
+		_atmo_apply_msec = now_msec
+		_update_sky(_clock.now())
 
 ## Re-place the sky from the ephemeris at time t. ONLY transforms/uniforms are written (no allocation,
 ## no geometry rebuild) — the per-frame cost is a handful of node writes (§4.1). NOTE: CosmosSky is a

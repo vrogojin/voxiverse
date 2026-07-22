@@ -147,6 +147,13 @@ var _dbg_h := 0.0                           # latest radial altitude h = d − R
 var _dbg_theta_emit_deg := 0.0              # latest θ_emit (deg)
 var _dbg_scale := 1.0                       # latest SN3 scaled-body scale s (1.0 = no clamp) — H-B far-plane/placement signal
 
+# COSMOS-PERF FALL-ALTRATE (FP_FALL_RING_HOLD): throttle state for the per-frame scaled-placement transform write.
+# The 55k-triangle ring's scaled world transform changes its AABB → a culling-BVH re-insert every frame; hold it
+# during a fast descent and re-apply ≤ 1/FALL_THROTTLE_MS. −1 sentinels ⇒ the first call always applies. DEAD off the flag.
+var _ringhold_prev_d := -1.0
+var _ringhold_prev_usec := -1
+var _ringhold_apply_msec := -1
+
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
 	_recompute_sticky()              # TIER-DEPTH P1: seed the sticky backstop set so ring-1 is sunk from the first build (no-op with the flag off)
@@ -199,8 +206,22 @@ func render_centre() -> Vector3:
 ## on the main thread (like set_active's rigid re-place); the async worker is unaffected (it reads only caches).
 func apply_scaled_placement(cam: Vector3) -> void:
 	var base := _placement_xform()
-	var s := CosmosScale.scale_for(cam.distance_to(base.origin), FacetAtlas.R_BLOCKS)
+	var d := cam.distance_to(base.origin)
+	var s := CosmosScale.scale_for(d, FacetAtlas.R_BLOCKS)
 	_dbg_scale = s                                  # H-B telemetry: the SN3 clamp scale actually applied to the ring this frame
+	# COSMOS-PERF FALL-ALTRATE (FP_FALL_RING_HOLD): off ⇒ the shipped every-frame transform write (byte-identical).
+	if CubeSphere.FP_FALL_RING_HOLD:
+		var now_usec := Time.get_ticks_usec()
+		var vspeed := 0.0
+		if _ringhold_prev_usec >= 0:
+			vspeed = FallThrottle.radial_speed(_ringhold_prev_d, d, float(now_usec - _ringhold_prev_usec) / 1.0e6)
+		_ringhold_prev_d = d
+		_ringhold_prev_usec = now_usec
+		var now_msec := Time.get_ticks_msec()
+		var ms_since := (now_msec - _ringhold_apply_msec) if _ringhold_apply_msec >= 0 else 0x7fffffff
+		if not FallThrottle.should_reapply(true, vspeed, ms_since):
+			return                                  # hold the last scaled placement (no AABB/BVH churn this frame)
+		_ringhold_apply_msec = now_msec
 	transform = CosmosScale.scale_about_camera(cam, s) * base   # s == 1 ⇒ identity·base == base (near regime unchanged)
 
 ## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): the per-frame camera-set driver. `cam`

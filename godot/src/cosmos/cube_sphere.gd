@@ -1429,6 +1429,15 @@ const FALL_FREEZE_BAND := 48.0
 ## window. Gate G-FALL-TIMING (verify_fall_timing.gd): byte-off default + the plumbing populates/clears the keys.
 const FP_FALL_TIMING := false
 
+## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY
+## free-fall frame; at high altitude the near field is ALT_REGIME-frozen so the floor query hits a slow regenerate
+## path (~86-175 ms/frame — the entire fall collapse, proven by t_att_us telemetry). Dev-fly is smooth because
+## flying==true skips it. Gate: above FALL_ATT_GATE_Y (far above any terrain+datum) ground contact is impossible,
+## so skip the floor query; below it (near the surface, near field resident ⇒ floor_under cheap) it runs as shipped.
+## Default OFF ⇒ byte-identical (the every-frame floor query, unchanged).
+const FP_FALL_ATT_GATE := false
+const FALL_ATT_GATE_Y := 200.0   # lattice-y above which the ground-contact floor query is skipped (no terrain reaches this)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

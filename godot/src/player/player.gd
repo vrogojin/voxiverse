@@ -525,6 +525,13 @@ func _write_attitude_camera() -> void:
 func _attitude_ground_contact() -> bool:
 	if flying or world == null:
 		return false
+	# COSMOS-PERF FALL: floor_under() hits a slow path at high altitude (the near field is ALT_REGIME-frozen and
+	# not resident, so the analytic floor query regenerates) — measured ~86-175 ms/frame, the ENTIRE fall-fps
+	# collapse (t_att_us). Ground contact is physically impossible far above the tallest terrain, so skip the
+	# per-frame floor query until the player is within reach of the surface. The threshold sits far above any
+	# terrain+datum relief, so the recovery still fires with huge margin on the approach. Byte-identical off.
+	if CubeSphere.FP_FALL_ATT_GATE and position.y > CubeSphere.FALL_ATT_GATE_Y:
+		return false
 	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
 
 ## COSMOS R2.2: place the DISPLAYED camera at the given (epoch-frame) transform. Physics/aim stay window.

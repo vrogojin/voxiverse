@@ -235,6 +235,118 @@ static func _solve_kepler(m: float, e: float) -> float:
 	return big_e
 
 # ---------------------------------------------------------------------------------------
+# CLOSED-FORM UNIVERSAL-VARIABLE PROPAGATION (FP_FREEFALL_RAILS — the free-fall RAILS core). ONE closed-form
+# two-body step: given a body-centred [r0, v0] and a time span dt, return [r, v] at t0+dt via the universal
+# anomaly χ + Stumpff C/S and the f/g functions (Bate-Mueller-White / Vallado Alg. 8). This is the drift-free,
+# O(1)-per-frame replacement for the free-fall's velocity-Verlet substep loop: the whole frame delta is covered
+# in ONE call (no OUTER coast-substep loop, no INNER Verlet substeps — those are the fall-collapse spiral).
+#
+# WHY UNIVERSAL VARIABLES (not the classical coe_to_rv above): a fall from orbit that strips its tangential
+# velocity (SN_FOFF_RADIAL_FALL) is a DEGENERATE RADIAL trajectory — angular momentum h = r×v = 0, so the
+# perifocal frame / e-vector direction the classical elements need are undefined (a singularity). The universal
+# formulation NEVER divides by h; it reduces the rectilinear (h≈0) fall to the same f/g update as an ellipse,
+# so radial AND sub-orbital (tangential) seeds are handled by ONE branch-free formula. Elliptic, parabolic and
+# hyperbolic conics are also unified (the branch is only in the initial χ guess and the Stumpff argument sign).
+#
+# BOUNDED WORK (G-FREEFALL-RAILS O(1) invariant): the Newton solve for χ runs a FIXED cap of UV_ITER_MAX
+# iterations INDEPENDENT of dt / fps (like _solve_kepler's `for _i in range(12)`) — NOT a dt-scaled substep
+# count. The caller propagates one CARRIED [p,v] by the (catch-up-capped) frame delta, so the per-call χ is a
+# small anomaly advance and Newton converges in ~2–4 iterations regardless of frame rate. uv_iters is a
+# monotonic instrumentation counter (like make_calls) the gate reads to PROVE the per-frame iteration count is
+# bounded and dt-independent; never read at runtime, zero-cost.
+# ---------------------------------------------------------------------------------------
+
+const UV_ITER_MAX := 32                 # HARD cap on the universal-Kepler Newton iterations (dt-INDEPENDENT — the O(1) bound)
+const UV_TOL := 1.0e-11                 # χ convergence tolerance (blocks^½ scale); Newton hits it in a few iters for a per-frame dt
+const UV_Z_SMALL := 1.0e-6              # |ψ| below which the Stumpff series (not the trig/hyper closed form) is used (avoids 0/0)
+
+## Instrumentation counter (gate G-FREEFALL-RAILS). Incremented once per universal-Kepler Newton iteration by
+## propagate_uv; the gate resets + reads it to assert the per-frame solve count is bounded (≤ UV_ITER_MAX) and
+## does NOT scale with dt/fps. Never read at runtime.
+static var uv_iters: int = 0
+
+## Stumpff C(z) = Σ (−z)^k / (2k+2)!  — (1−cos√z)/z for z>0, (cosh√−z−1)/(−z) for z<0, 1/2 at z=0. Series near 0.
+static func _stumpff_c(z: float) -> float:
+	if z > UV_Z_SMALL:
+		var sz := sqrt(z)
+		return (1.0 - cos(sz)) / z
+	if z < -UV_Z_SMALL:
+		var sz := sqrt(-z)
+		return (cosh(sz) - 1.0) / (-z)
+	return 0.5 - z / 24.0 + (z * z) / 720.0                  # Taylor about 0 (accurate for |z| < UV_Z_SMALL)
+
+## Stumpff S(z) = Σ (−z)^k / (2k+3)!  — (√z−sin√z)/√z³ for z>0, (sinh√−z−√−z)/√−z³ for z<0, 1/6 at z=0. Series near 0.
+static func _stumpff_s(z: float) -> float:
+	if z > UV_Z_SMALL:
+		var sz := sqrt(z)
+		return (sz - sin(sz)) / (sz * sz * sz)
+	if z < -UV_Z_SMALL:
+		var sz := sqrt(-z)
+		return (sinh(sz) - sz) / (sz * sz * sz)
+	return 1.0 / 6.0 - z / 120.0 + (z * z) / 5040.0          # Taylor about 0
+
+## Propagate a body-centred two-body state [r0_vec, v0_vec] (DVec3, blocks / blocks·s⁻¹) forward by `dt` seconds
+## under `mu`, in closed form via the universal variable. Returns [r_vec, v_vec] as fresh DVec3. dt == 0 (or a
+## degenerate r0) returns a copy of the input. Pure static, f64. Handles radial (h≈0), elliptic, parabolic and
+## hyperbolic states with ONE formula. Newton for χ is capped at UV_ITER_MAX iterations (dt-INDEPENDENT).
+static func propagate_uv(mu: float, r0_vec: PackedFloat64Array, v0_vec: PackedFloat64Array, dt: float) -> Array:
+	var r0 := DV.length(r0_vec)
+	if dt == 0.0 or r0 <= 0.0:
+		return [PackedFloat64Array([r0_vec[0], r0_vec[1], r0_vec[2]]),
+			PackedFloat64Array([v0_vec[0], v0_vec[1], v0_vec[2]])]
+	var sqrt_mu := sqrt(mu)
+	var v0sq := DV.dot(v0_vec, v0_vec)
+	var rv0 := DV.dot(r0_vec, v0_vec)                        # r0·v0
+	var alpha := 2.0 / r0 - v0sq / mu                        # = 1/a (>0 ellipse, ≈0 parabola, <0 hyperbola)
+
+	# --- initial guess for the universal anomaly χ (Vallado Alg. 8) ---
+	var chi := 0.0
+	if alpha > UV_Z_SMALL:                                   # elliptic (incl. the radial degenerate ellipse)
+		chi = sqrt_mu * dt * alpha
+	elif alpha < -UV_Z_SMALL:                               # hyperbolic
+		var a := 1.0 / alpha                                # < 0
+		var sdt := 1.0 if dt >= 0.0 else -1.0
+		var denom := rv0 + sdt * sqrt(-mu * a) * (1.0 - r0 * alpha)
+		if absf(denom) > 1.0e-300:
+			chi = sdt * sqrt(-a) * log((-2.0 * mu * alpha * dt) / denom)
+		else:
+			chi = sqrt_mu * dt / r0
+	else:                                                   # near-parabolic: a stable, well-scaled seed
+		chi = sqrt_mu * dt / r0
+
+	# --- Newton solve for χ: FIXED cap, dt-INDEPENDENT (the O(1) bound the gate asserts) ---
+	var r := r0
+	for _i in range(UV_ITER_MAX):
+		uv_iters += 1
+		var psi := chi * chi * alpha
+		var c2 := _stumpff_c(psi)
+		var c3 := _stumpff_s(psi)
+		r = chi * chi * c2 + (rv0 / sqrt_mu) * chi * (1.0 - psi * c3) + r0 * (1.0 - psi * c2)
+		# time residual: sqrt_mu·dt − [χ³·c3 + (r0·v0/√mu)·χ²·c2 + r0·χ·(1−ψ·c3)]
+		var num := sqrt_mu * dt - (chi * chi * chi * c3 + (rv0 / sqrt_mu) * chi * chi * c2 + r0 * chi * (1.0 - psi * c3))
+		var dchi := num / r
+		chi += dchi
+		if absf(dchi) < UV_TOL:
+			break
+
+	# --- f/g functions → [r, v] at t0+dt ---
+	var psi_f := chi * chi * alpha
+	var c2f := _stumpff_c(psi_f)
+	var c3f := _stumpff_s(psi_f)
+	var f := 1.0 - (chi * chi / r0) * c2f
+	var g := dt - (chi * chi * chi / sqrt_mu) * c3f
+	var r_vec := DV.add(DV.scale(r0_vec, f), DV.scale(v0_vec, g))
+	var rmag := DV.length(r_vec)
+	if rmag <= 0.0:
+		# Passed through / at the centre (a full radial plunge to r=0). Degenerate; return the position as-is
+		# with the input velocity so the caller's SOI/NaN guard and terrain collision take over safely.
+		return [r_vec, PackedFloat64Array([v0_vec[0], v0_vec[1], v0_vec[2]])]
+	var gdot := 1.0 - (chi * chi / rmag) * c2f
+	var fdot := (sqrt_mu / (rmag * r0)) * chi * (psi_f * c3f - 1.0)
+	var v_vec := DV.add(DV.scale(r0_vec, fdot), DV.scale(v0_vec, gdot))
+	return [r_vec, v_vec]
+
+# ---------------------------------------------------------------------------------------
 # The frame algebra (§2.4 / §5.1) — pure static exact affine maps. θ = spin_angle(body,t),
 # ω⃗ = omega_spin(body)·ẑ. Every map is invertible in closed form ⇒ each handoff has a continuity gate.
 # ---------------------------------------------------------------------------------------

@@ -140,6 +140,13 @@ var _dev_orbital_commit := false
 # (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
 var _fall_v_bci := PackedFloat64Array()
 var _fall_have_v := false
+# COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the carried BCI fall POSITION for the closed-form (RAILS)
+# free-fall coast. Like the orbit coast's `_coast_p_bci`, the closed-form path carries [p,v] in the BCI frame
+# across frames (advanced by ONE universal-variable step/frame) instead of reconstructing p from the f32 lattice
+# `position` each frame — so the per-frame integration is O(1) and touches no lattice state. Re-seeded (cleared)
+# on every fresh fall entry (below), so a new fall reconstructs it once from the current lattice pose. DEAD
+# (never read) with FP_FREEFALL_RAILS off — the shipped Verlet coast carries only `_fall_v_bci`.
+var _fall_p_bci := PackedFloat64Array()
 # G-LANDING FIX (SN_FOFF_RADIAL_FALL) — one-shot latch set by the EXPLICIT F flight-off toggle. The next
 # free-fall seed keeps only the RADIAL component of the flight velocity (quit-flying = commit to landing);
 # automatic regime transitions never set it, so their SN-R1 velocity continuity is untouched. DEAD (never
@@ -1027,10 +1034,21 @@ func _free_fall_move(delta: float) -> void:
 			_fall_v_bci = fall_seed_radial(_fall_v_bci, psd)
 		_foff_radial = false
 		_fall_have_v = true
+		# FP_FREEFALL_RAILS: clear the carried BCI fall position so the closed-form coast re-seeds it ONCE from the
+		# current lattice pose on this fresh fall entry (the carried [p,v] must not leak across separate falls). Only
+		# touched under the flag ⇒ the shipped Verlet path (which never reads _fall_p_bci) is byte-identical.
+		if CubeSphere.FP_FREEFALL_RAILS:
+			_fall_p_bci = PackedFloat64Array()
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS): the CLOSED-FORM (RAILS) free-fall coast — carry the BCI [p,v]
+	# and advance it by ONE universal-variable two-body step over the whole real frame delta (O(1)/frame, ZERO Verlet
+	# substeps, no time-dilation, exact). This is THE fall-collapse fix (the Verlet substep loops below are the spiral).
+	# Off ⇒ the shipped FP_COAST_BATCH / per-substep Verlet chain verbatim (byte-identical). Takes precedence when on.
+	if CubeSphere.FP_FREEFALL_RAILS:
+		_coast_freefall_rails(delta, _dominant_body())
 	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE lattice↔BCI re-projection + N cheap
 	# BCI steps (vs N per-substep re-projections + N allocations — the live ~150 ms/frame fall collapse). Off ⇒ the
 	# shipped per-substep chain verbatim (byte-identical). N=1 (FP_COAST_FULL_DT off) makes both paths identical.
-	if CubeSphere.FP_COAST_BATCH:
+	elif CubeSphere.FP_COAST_BATCH:
 		_fall_v_bci = _coast_batch(_fd_h, _fd_n, _fall_v_bci, _dominant_body())
 	else:
 		for _si in _fd_n:
@@ -1077,6 +1095,34 @@ func _coast_batch(delta: float, n: int, v_bci: PackedFloat64Array, body: String)
 	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])   # ONE world→lattice
 	position = Vector3(lat[0], lat[1], lat[2])
 	return out[1]
+
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the CLOSED-FORM (RAILS) free-fall coast. Carries the BCI
+## fall [p,v] in f64 across frames (like the orbit coast's `_coast_p_bci`/`_coast_v_bci`) and advances it by ONE
+## universal-variable two-body step over the WHOLE real frame delta (CosmosNav.coast_kepler_bci → propagate_uv):
+## O(1) per frame — NO OUTER coast-substep loop, NO INNER Verlet substeps (those dt-scaled loops are the ~5 fps
+## fall-collapse spiral), no time-dilation, and exact for the two-body problem. The universal-variable form is
+## robust on the RADIAL (h≈0) fall a classical Kepler-element propagation is singular on. Structurally the orbit
+## coast's `_coast_batch_kepler`, but with the closed-form step in place of the N-Verlet batch: ZERO
+## lattice_to_world64 in steady state (carries [p,v]; seeds `_fall_p_bci` from the lattice ONCE per fall) + ONE
+## world_to_lattice64 for the display/stream/collision `position` + ONE propagate_uv, regardless of frame dt.
+## Precondition: on an active facet (fid >= 0 — the caller handles the off-facet fallback). Gate G-FREEFALL-RAILS.
+func _coast_freefall_rails(delta: float, body: String) -> void:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	# Seed the carried BCI fall position ONCE from the current lattice pose (cleared on each fresh fall entry). This
+	# is the ONLY lattice_to_world64 the closed-form fall does, and only on the first frame of a fall.
+	if _fall_p_bci.size() != 3:
+		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+		_fall_p_bci = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	# ONE closed-form universal-variable step over the whole (catch-up-capped) real delta — O(1), no substeps. The
+	# clamp_bci_state NaN/SOI guard (once per frame — identical safety to the Verlet coast) is folded into coast_kepler_bci.
+	var out := _CosmosNavCls.coast_kepler_bci(body, _fall_p_bci, _fall_v_bci, delta, _CosmosNavCls.soi_radius(body))
+	_fall_p_bci = out[0]
+	_fall_v_bci = out[1]
+	# ONE BCI→lattice re-projection for rendering / streaming / collision (display only — never read back).
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, _fall_p_bci, _fall_v_bci)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
 
 ## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — one physics tick of the O free-coast: integrate the shared Kepler coast
 ## from `_coast_v_bci` (seeded tangential by the O toggle) and write the lattice `position`. A stable circular seed

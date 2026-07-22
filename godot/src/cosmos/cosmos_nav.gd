@@ -142,6 +142,25 @@ static func coast_batch_bci(body: String, p_bci: PackedFloat64Array, v_bci: Pack
 	return [PackedFloat64Array([os.pos[0], os.pos[1], os.pos[2]]),
 		PackedFloat64Array([os.vel[0], os.vel[1], os.vel[2]])]
 
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the CLOSED-FORM free-fall coast. The batched Verlet coast
+## (coast_batch_bci) removed the per-substep re-projection/allocation but still runs N (≤ 30) × inner (≤ 8)
+## velocity-Verlet substeps per frame — a dt-scaled loop that spirals as the frame slows (the live 91.7 ms
+## `phys_ms` at ~5 fps). This propagates the SAME free coast in ONE closed-form universal-variable step over the
+## WHOLE (catch-up-capped) frame delta: O(1) per frame, ZERO substeps, no time-dilation, and EXACT for the
+## two-body problem (strictly better than Verlet). It reuses OrbitalState.propagate_uv (which handles the radial
+## h≈0 singularity a pure Kepler-element form cannot). The caller carries [p,v] in BCI (like the orbit coast) so
+## this touches NO lattice/scene state. The dt is capped at COAST_CATCHUP_MAX (anti-spiral: a multi-second hitch
+## advances at most that in ONE closed-form call — the Newton solve stays bounded). Then the SAME clamp_bci_state
+## NaN/SOI guard as the Verlet coast. Returns [p_bci', v_bci'] fresh. Pure static; NEVER-OOM (bounded f64 temps).
+## Gate G-FREEFALL-RAILS: trajectory-equivalence to the Verlet coast + the O(1) (one propagate, bounded iters,
+## zero dt-scaled substeps) perf invariant.
+static func coast_kepler_bci(body: String, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array,
+		delta: float, r_max: float) -> Array:
+	var dt := minf(delta, COAST_CATCHUP_MAX) if delta > 0.0 else 0.0
+	var rv := ORB.propagate_uv(GRAV.gm_dyn(body), p_bci, v_bci, dt)
+	var safe := clamp_bci_state(rv[0], rv[1], p_bci, v_bci, r_max)
+	return [safe[0], safe[1]]
+
 ## Bounded reciprocal for the finite-difference velocity (v_fix = Δp · fd_inv_dt): 1/max(dt, MIN_FD_DT).
 ## Never larger than 1/MIN_FD_DT, so a near-zero delta cannot produce an unbounded derived velocity.
 static func fd_inv_dt(dt: float) -> float:

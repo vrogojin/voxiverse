@@ -18,6 +18,13 @@ var _cosmos_sky: CosmosSky = null
 # into its near-field daylight material twin (main._process). Null unless the cloud flags built it (byte-identical).
 var _clouds: CloudLayers = null
 
+# COSMOS-PERF FALL-SCALE (FP_FALL_SCALE_FREEZE): band state for the altitude-driven scaled-body writes. _fs_prev_d/
+# _usec derive the radial speed; _fs_last_d is the distance at the last re-apply (band anchor). −1 sentinels ⇒ the
+# first frame always re-applies. DEAD off the flag (never sampled ⇒ byte-identical shipped every-frame writes).
+var _fs_prev_d := -1.0
+var _fs_prev_usec := -1
+var _fs_last_d := -1.0
+
 func _ready() -> void:
 	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
 	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
@@ -232,8 +239,27 @@ func _process(_delta: float) -> void:
 	if _player != null and CubeSphere.FP_SN3_MAIN_LIVE and CosmosScale.on() and CubeSphere.FACETED:
 		var a0_cam := _player.camera_global_transform().origin
 		var a0_d := a0_cam.distance_to(_player.world.planet_render_centre())
-		_player.apply_scaled_camera_planes(a0_d - FacetAtlas.R_BLOCKS, a0_d)
-		_player.world.apply_scaled_body(a0_cam)
+		# COSMOS-PERF FALL-SCALE (FP_FALL_SCALE_FREEZE): ONE band decision covering BOTH altitude-driven scaled-body
+		# writes (camera near/far + far-ring scale-about-camera). Off ⇒ reapply stays true ⇒ both write every frame
+		# (byte-identical). On + fast fall ⇒ re-apply only when altitude crosses a FALL_FREEZE_BAND edge. Slow/steady
+		# (orbit/hover, radial ≤ threshold) ⇒ always true ⇒ exact value every frame (byte-identical to the shipped
+		# orbit). Sub-flags gate WHICH write is frozen so the winning half can be A/B-isolated.
+		var reapply := true
+		if CubeSphere.FP_FALL_SCALE_FREEZE:
+			var fs_usec := Time.get_ticks_usec()
+			var fs_v := 0.0
+			if _fs_prev_usec >= 0:
+				fs_v = FallThrottle.radial_speed(_fs_prev_d, a0_d, float(fs_usec - _fs_prev_usec) / 1.0e6)
+			_fs_prev_d = a0_d
+			_fs_prev_usec = fs_usec
+			reapply = FallThrottle.should_reapply_band(true, fs_v, a0_d, _fs_last_d, CubeSphere.FALL_FREEZE_BAND)
+			if reapply:
+				_fs_last_d = a0_d
+		var freeze := CubeSphere.FP_FALL_SCALE_FREEZE
+		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_CAM):
+			_player.apply_scaled_camera_planes(a0_d - FacetAtlas.R_BLOCKS, a0_d)
+		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_RING):
+			_player.world.apply_scaled_body(a0_cam)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin

@@ -1350,6 +1350,49 @@ const FP_FALL_RING_HOLD := false
 const FALL_THROTTLE_VSPEED := 3.0
 const FALL_THROTTLE_MS := 100
 
+## COSMOS-PERF FALL-SCALE (fix/voxiverse-fall-scale, 2026-07-22) — the fall-from-orbit fps collapse re-bisected
+## after two decisive clues: (1) ORBIT at ~250 b/s tangential is SMOOTH but a fall at 7-29 b/s radial is 7 fps ⇒
+## the cost is ALTITUDE CHANGING, not camera speed; (2) the fall was smooth BEFORE the atmosphere/shader work and
+## degraded as it went in ⇒ the cost lives in the ATMOSPHERE SHELL, not the (older) scaled-body. Two default-OFF
+## bisect flags isolate the culprit LIVE on a fast fall (~29 b/s); both are byte-identical off, GDScript-only,
+## NEVER-OOM (a few scalar state vars), and MUST NOT touch the smooth constant-altitude orbit/hover (radial ≈ 0 ⇒
+## never engages ⇒ shipped every-frame path). Gate G-FALL-SCALE (verify_fall_scale.gd) drives the pure cores.
+
+## FP_FALL_SHELL_OFF (PRIME suspect) — the atmosphere shell (_atmo_shell, FP_ATMO_SHELL) is a planet-CENTRED
+## additive SphereMesh rendered `cull_front, blend_add, depth_draw_never, unshaded`: its transform NEVER changes
+## (it does not ride the scaled-body), but with no depth write there is NO early-Z rejection, so EVERY covered
+## fragment runs the full per-fragment optical-path (chord/transmittance) shader EVERY frame. Its cost is screen-
+## COVERAGE bound and balloons as the camera descends into the shell (a thin limb from orbit → the whole screen
+## once inside the shell). This flag HIDES the shell (_atmo_shell.visible=false + skips its uniform writes) while
+## |radial speed| > SHELL_OFF_VSPEED (a fall). If hiding it makes the fall smooth, the additive shell overdraw IS
+## the cost. Off ⇒ always visible (byte-identical). Orbit/hover hold altitude ⇒ radial ≈ 0 ⇒ shell stays visible.
+const FP_FALL_SHELL_OFF := false
+
+## Radial (altitude) speed (blocks/s) above which FP_FALL_SHELL_OFF counts the motion as a fall and hides the
+## shell. Chosen well below the slowest real fall (~7 b/s) and above orbit/hover radial jitter (≈ 0) so a
+## constant-altitude orbit NEVER hides the shell (byte-identical there) but any descent does.
+const SHELL_OFF_VSPEED := 1.0
+
+## FP_FALL_SCALE_FREEZE (SECONDARY — the scaled-body experiment) — freeze ALL the altitude-driven scaled-body
+## writes together (camera near/far planes + the far-ring scale-about-camera transform) during a fast radial
+## fall, quantized to altitude BANDS: re-apply ONLY when the camera→body-centre distance crosses a FALL_FREEZE_BAND
+## edge (vs every frame). One flag covering BOTH writes ⇒ an unambiguous combined A/B (unlike the 3 time-throttle
+## flags). Off ⇒ every-frame writes (byte-identical). Slow/steady (orbit/hover, radial ≤ FALL_THROTTLE_VSPEED) ⇒
+## always re-applies the EXACT value ⇒ converges instantly + leaves the smooth orbit byte-identical. Sub-flags
+## FP_FALL_FREEZE_CAM / FP_FALL_FREEZE_RING select WHICH write participates so the winning half can be isolated
+## (set one false ⇒ that write stays every-frame while the other is banded). NOTE: the far-ring scale is s == 1
+## below H_ENGAGE (≈ 12.5 k blocks) so its placement is already constant during a low fall — freezing the RING is
+## predicted to be a no-op there; the camera planes are the only scaled-body value that differs orbit-vs-fall.
+const FP_FALL_SCALE_FREEZE := false
+const FP_FALL_FREEZE_CAM := true      # the camera near/far write participates in the freeze (set false to leave it every-frame)
+const FP_FALL_FREEZE_RING := true     # the far-ring scale-about-camera write participates in the freeze (set false to leave it every-frame)
+
+## The altitude-band width (blocks) for FP_FALL_SCALE_FREEZE. During a fast fall the scaled-body writes re-apply
+## once per band crossed (⇒ re-apply COUNT ∝ altitude traversed / BAND, INDEPENDENT of frame rate). Small enough
+## that the per-band step in the camera far-plane / ring scale is imperceptible (below ~3.5 k alt the far plane is
+## pinned at FAR_MIN and the ring scale is 1, so a band is a literal no-op there; higher up the step is < 0.3%).
+const FALL_FREEZE_BAND := 48.0
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

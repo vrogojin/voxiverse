@@ -36,3 +36,29 @@ static func should_reapply(flag_on: bool, vspeed_abs: float, ms_since_applied: i
 	if not is_fast(vspeed_abs):
 		return true                       # slow / steady / at rest: write the exact value (converges instantly)
 	return ms_since_applied >= CubeSphere.FALL_THROTTLE_MS
+
+## COSMOS-PERF FALL-SCALE — the ALTITUDE-BAND variant of the decision (FP_FALL_SCALE_FREEZE). The band index of a
+## camera→body-centre distance d: which FALL_FREEZE_BAND-wide altitude shell d falls in. band ≤ 0 ⇒ a single band
+## (0) ⇒ the write only ever applies once until motion slows (degenerate; guarded so no div-by-zero). Pure.
+static func band_index(d: float, band: float) -> int:
+	if band <= 0.0:
+		return 0
+	return int(floor(d / band))
+
+## THE banded decision: should the consumer RE-APPLY its altitude-ramped write this frame, or HOLD the last one
+## until the altitude crosses a band edge? Same contract as should_reapply but the fast-motion gate is a BAND
+## crossing (⇒ re-apply COUNT ∝ |Δaltitude| / band, INDEPENDENT of frame rate AND descent rate) rather than a
+## wall-clock interval.
+##   flag_on          — the master FP_FALL_SCALE_FREEZE (false ⇒ always true ⇒ byte-identical every-frame write).
+##   vspeed_abs       — current absolute radial speed (blocks/s); ≤ threshold ⇒ always re-apply (exact convergence).
+##   cur_d            — this frame's camera→body-centre distance (blocks).
+##   last_applied_d   — the distance at the last re-apply (< 0 ⇒ no prior apply ⇒ always re-apply).
+##   band             — FALL_FREEZE_BAND (blocks). Pure; no allocation.
+static func should_reapply_band(flag_on: bool, vspeed_abs: float, cur_d: float, last_applied_d: float, band: float) -> bool:
+	if not flag_on:
+		return true                       # byte-identical off: the shipped every-frame write
+	if not is_fast(vspeed_abs):
+		return true                       # slow / steady / orbit / hover: write the exact value (converges instantly)
+	if last_applied_d < 0.0:
+		return true                       # first apply (no held band yet)
+	return band_index(cur_d, band) != band_index(last_applied_d, band)

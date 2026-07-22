@@ -199,6 +199,10 @@ var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> tr
 # The number of edit keys the LAST `_rebuild_window_indices` iterated (the O() the crossing paid): == the active
 # facet's edit count with FP_EDIT_FID_INDEX on, == the total edit count with it off. Read by verify_edit_fid_index.gd.
 var _rebuild_scanned: int = 0
+# COSMOS-PERF FALL (FP_FLOOR_BOUNDED): the number of `cell_value_at` scan iterations the LAST `floor_under` call ran.
+# Read by verify_floor_bounded.gd to prove the fall scan is altitude-INDEPENDENT (≤ ~2·MARGIN, not ∝ feet-y). Pure
+# introspection — never read by gameplay, carries no world state (does not affect the byte-identical off contract).
+var _floor_scan_iters: int = 0
 # Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
 # ONLY the rare cells that carry a block-entity document (container inventory, sign
 # text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
@@ -3139,15 +3143,44 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	var cell_feet := feet_y - s
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
-	# off. Scan length is bounded by the fall distance — cheap.
+	# off. (The scan length used to be justified as "bounded by the fall distance —
+	# cheap"; that is FALSE for a fall from orbit — feet ≈ R+900 ⇒ ~900 cell_value_at
+	# queries/call ⇒ ~86 ms/frame. FP_FLOOR_BOUNDED below bounds it.)
 	var start := int(floor(cell_feet + 0.5))
 	var y := start
+	_floor_scan_iters = 0
+	# COSMOS-PERF FALL (FP_FLOOR_BOUNDED): PROBE the first MARGIN cells DOWN from the feet. Near the surface
+	# (walking/standing/landing — feet within MARGIN of the floor) the floor is found in the first 1-2 cells, so
+	# this loop returns the SAME value scanning the SAME cells in the SAME order as the shipped unbounded scan —
+	# BIT-IDENTICAL. Only if the probe finds NO floor (the feet are more than MARGIN above everything near them —
+	# a fall) do we skip the guaranteed-generated-air gap by jumping the scan to a cheap heightmap-based start.
+	# Off ⇒ this whole block is skipped (y stays = start) and the loop below is the shipped scan verbatim.
+	if CubeSphere.FP_FLOOR_BOUNDED:
+		var probe_floor := start - CubeSphere.FLOOR_BOUNDED_MARGIN
+		while y > probe_floor:
+			_floor_scan_iters += 1
+			var hp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+			if hp != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+				return float(y) + hp.y + s
+			y -= 1
+		# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
+		# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
+		# DIRECT query (no scan), and every generated solid (terrain + trees, ≤ MAX_ABOVE_SURFACE=14 higher) sits
+		# at or below it; and (b) `placed_top + 1`: the per-column high-water of PLAYER-PLACED cells (an O(1)
+		# `_placed_top` lookup), so a tower rising ABOVE the heightmap+MARGIN is still covered exactly. Jump the
+		# scan to that ceiling — skipping the pure-air gap above it the shipped path would grind through — but
+		# NEVER move the scan UP past where the probe already reached (`mini` keeps it a continuation when the
+		# ceiling is not below). The jump lands the scan just above the true floor, so it finds the SAME floor
+		# the shipped from-feet scan would (bit-identical), now in ≤ ~MARGIN cells instead of ∝ feet altitude.
+		var ceil_est := maxi(col_height(xi, zi) + CubeSphere.FLOOR_BOUNDED_MARGIN, placed_top(xi, zi) + 1)
+		y = mini(y, ceil_est)
 	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
 	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
 	# seafloor, while a solid cell yields its filled interval — the floor is the top of
 	# the first occupied cell that has an empty span directly above (its top = span.y;
 	# 1.0 for a full cube ⇒ float(y+1), byte-identical to the old solid/air-above test).
 	while y > -1024:
+		_floor_scan_iters += 1
 		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
 			return float(y) + here.y + s

@@ -1305,6 +1305,28 @@ const FP_COAST_FULL_DT := false
 ## exactly ONE OrbitalState allocation per frame (vs N). Requires the coast path (FACETED + SN_DEVNAV/ORBIT_COAST/fall).
 const FP_COAST_BATCH := false
 
+## COSMOS-PERF FALL-COLLAPSE FIX (fix/voxiverse-freefall-rails, 2026-07-22) — CLOSED-FORM (RAILS) free-fall coast.
+## PROVEN root cause (live telemetry): DEV-FLY (thrust) is 60 fps at every altitude; the gravity FREE-FALL coast
+## is ~5 fps with `phys_ms` = 91.7 ms rendering the IDENTICAL scene ⇒ the collapse is PHYSICS, not rendering. The
+## free-fall integrates gravity with velocity-Verlet substeps: FP_COAST_FULL_DT wraps an OUTER coast-substep loop
+## (≤ 30, covering the full frame delta) around OrbitalState.step's INNER Verlet substep loop (≤ 8) — a dt-scaled
+## per-frame loop that spirals (slower frame → bigger delta → more substeps → slower). FP_COAST_BATCH removed the
+## per-substep re-projection/allocation but the Verlet substeps themselves remain and still spiral.
+##
+## With this flag ON the free-fall uses the SAME machinery that makes the ORBIT coast smooth: it carries the BCI
+## [p,v] and advances it each frame by ONE CLOSED-FORM universal-variable two-body step (CosmosNav.coast_kepler_bci
+## → OrbitalState.propagate_uv) over the whole (catch-up-capped) frame delta — O(1) per frame, ZERO substeps, no
+## time-dilation, and EXACT (better than Verlet). The universal-variable form handles the RADIAL (h≈0) degenerate
+## trajectory a classical Kepler-element propagation is singular on (SN_FOFF_RADIAL_FALL strips the tangential
+## velocity → a rectilinear fall); its Newton solve for the universal anomaly is a FIXED ≤ UV_ITER_MAX iterations
+## INDEPENDENT of dt/fps (not a dt-scaled substep count — that is the whole point). Composes with the radial-fall
+## seed, FP_LANDING_STREAM_KICK and the re-entry/landing path (same clamp_bci_state NaN/SOI guard, once per frame;
+## the lattice re-projection stays one per frame). Off ⇒ the shipped Verlet coast verbatim (byte-identical). Gate
+## G-FREEFALL-RAILS (verify_freefall_rails.gd): closed-form vs Verlet trajectory-equivalence over long radial AND
+## sub-orbital falls across varied frame dt + the O(1)-per-frame proof (one propagate, bounded dt-independent
+## iters, zero dt-scaled substeps, one lattice re-projection). Requires the fall path (FACETED + SN_NO_CEILING_BOUNCE).
+const FP_FREEFALL_RAILS := false
+
 ## COSMOS-PERF FALL-ALTRATE (fix/voxiverse-fall-altrate) — the descent-rate-driven residue. LIVE (2026-07-22):
 ## hovering at altitude = 49 fps, controlled descent = 26 fps, free-fall from orbit (~29 b/s) = 7 fps — fps is
 ## monotone in |dAlt/dt|, NOT in the fall code path. Already ruled out (this session): the far-ring warm/re-emit

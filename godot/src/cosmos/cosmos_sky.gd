@@ -60,6 +60,11 @@ var _atmo_prev_d := -1.0
 var _atmo_prev_usec := -1
 var _atmo_apply_msec := -1
 
+# COSMOS-PERF FALL-SCALE (FP_FALL_SHELL_OFF): radial-speed state for hiding the additive atmosphere shell during a
+# fast fall. −1 sentinels ⇒ the first frame reads 0 speed (shell stays visible). DEAD off the flag (never sampled).
+var _shelloff_prev_d := -1.0
+var _shelloff_prev_usec := -1
+
 var _sun: MeshInstance3D = null
 var _sun_light: DirectionalLight3D = null
 var _moon: MeshInstance3D = null
@@ -1036,8 +1041,25 @@ func _update_sky(t: float) -> void:
 	# set at build). The shell is planet-centred at the scene origin; the camera moves within/around it. No-op
 	# unless the shell was built ⇒ byte-identical off.
 	if _atmo_shell_mat != null:
-		_atmo_shell_mat.set_shader_parameter("cam", cam_origin)
-		_atmo_shell_mat.set_shader_parameter("sun_dir", sun_dir)
+		# COSMOS-PERF FALL-SCALE (FP_FALL_SHELL_OFF): the shell is a planet-centred additive sphere rendered
+		# cull_front + depth_draw_never, so every covered fragment runs the per-fragment optical-path shader EVERY
+		# frame with NO early-Z rejection — a screen-COVERAGE-bound cost that balloons as the camera descends into
+		# the shell. Bisect: HIDE it (and skip its uniform writes) while |radial speed| > SHELL_OFF_VSPEED (a fall).
+		# Off ⇒ always visible + written (byte-identical). Orbit/hover hold altitude ⇒ radial ≈ 0 ⇒ never hidden.
+		var shell_hidden := false
+		if CubeSphere.FP_FALL_SHELL_OFF and _atmo_shell != null:
+			var soff_usec := Time.get_ticks_usec()
+			var soff_d := cam_origin.length()
+			var soff_v := 0.0
+			if _shelloff_prev_usec >= 0:
+				soff_v = FallThrottle.radial_speed(_shelloff_prev_d, soff_d, float(soff_usec - _shelloff_prev_usec) / 1.0e6)
+			_shelloff_prev_d = soff_d
+			_shelloff_prev_usec = soff_usec
+			shell_hidden = soff_v > CubeSphere.SHELL_OFF_VSPEED
+			_atmo_shell.visible = not shell_hidden
+		if not shell_hidden:
+			_atmo_shell_mat.set_shader_parameter("cam", cam_origin)
+			_atmo_shell_mat.set_shader_parameter("sun_dir", sun_dir)
 
 	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up).
 	_ramp_environment(sun_dir, cam_origin)

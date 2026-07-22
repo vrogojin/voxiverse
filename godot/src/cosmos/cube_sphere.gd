@@ -1305,6 +1305,51 @@ const FP_COAST_FULL_DT := false
 ## exactly ONE OrbitalState allocation per frame (vs N). Requires the coast path (FACETED + SN_DEVNAV/ORBIT_COAST/fall).
 const FP_COAST_BATCH := false
 
+## COSMOS-PERF FALL-ALTRATE (fix/voxiverse-fall-altrate) — the descent-rate-driven residue. LIVE (2026-07-22):
+## hovering at altitude = 49 fps, controlled descent = 26 fps, free-fall from orbit (~29 b/s) = 7 fps — fps is
+## monotone in |dAlt/dt|, NOT in the fall code path. Already ruled out (this session): the far-ring warm/re-emit
+## (FP_SHELL_FALL_HOLD holds it flat), the near field (FP_ALT_REGIME freezes it), the coast integrator
+## (FP_COAST_BATCH batched it — no fall-fps change). Headless timing PROVES the two GDScript suspects are
+## descent-INDEPENDENT: CosmosSky._update_sky ≈ 33 us/frame and WorldManager.update_streaming ≈ 2.7 us/frame,
+## FLAT across hover/slow/fast (probe_fall_altrate.gd). So the residue is NOT GDScript compute — it is the
+## RENDER-SERVER re-evaluation triggered by the handful of per-frame values that RAMP WITH ALTITUDE and are
+## re-written EVERY frame: the camera near/far planes + fog depth-end (CosmosScale ramp), the CosmosSky shader
+## uniforms + Environment writes, and the far-ring scaled placement transform. Each ramps proportionally to the
+## altitude delta, so during a fast descent they thrash the projection / fog / culling / big-mesh-AABB paths at
+## 60 Hz. These three flags THROTTLE those re-writes to a bounded rate DURING FAST VERTICAL MOTION only, holding
+## the last value (which converges to the exact value the instant vertical speed drops below the threshold —
+## FallThrottle.should_reapply returns true whenever the flag is off OR the motion is slow/steady). Independent,
+## each byte-identical off, GDScript-only, NEVER-OOM (no allocation, a few scalar state vars per consumer).
+## A/B each LIVE to isolate the winner. Gate G-FALL-ALTRATE (verify_fall_altrate.gd): byte-off identity + a
+## slow/steady state always re-applies (exact convergence) + the fast-motion re-apply rate is bounded and
+## independent of descent rate and frame rate.
+##
+## FP_FALL_CAMFAR_HOLD — hold the camera near/far planes (the altitude-ramped projection frustum) during a fast
+## descent (re-apply ≤ every FALL_THROTTLE_MS, or immediately when the far plane must GROW so the far ring is never
+## clipped on a climb). Predicted BIGGEST win (a per-frame far-plane ramp re-fits the render-server frustum / the
+## directional-shadow split range every frame). Off ⇒ apply_scaled_camera_planes writes every frame (byte-identical).
+## The fog depth-end ramp rides the same altitude signal but is written in the CosmosSky path ⇒ FP_FALL_ATMO_THROTTLE.
+const FP_FALL_CAMFAR_HOLD := false
+
+## FP_FALL_ATMO_THROTTLE — throttle the WHOLE CosmosSky per-frame recompute (_update_sky: the sun/moon/shell
+## uniforms + all the Environment fog/ambient/background writes) to ≤ 1/FALL_THROTTLE_MS during a fast descent,
+## holding the last uniforms (the sky is visually frozen for ≤ FALL_THROTTLE_MS while plummeting — imperceptible;
+## resumes per-frame the instant the descent slows). Off ⇒ _update_sky runs every frame (byte-identical).
+const FP_FALL_ATMO_THROTTLE := false
+
+## FP_FALL_RING_HOLD — hold the far-ring's per-frame SN3 scaled-placement transform (the 55k-triangle mesh's
+## scaled world transform, which changes the instance AABB → a culling-BVH re-insert every frame) during a fast
+## descent, re-applying ≤ every FALL_THROTTLE_MS. Off ⇒ apply_scaled_placement writes every frame (byte-identical).
+const FP_FALL_RING_HOLD := false
+
+## Shared FallThrottle tuning. FALL_THROTTLE_VSPEED = the radial (altitude) speed (blocks/s) above which a descent
+## counts as "fast" and the throttles engage — chosen below the live controlled-descent rate (fps already sags
+## there) and well above surface walk/jump radial jitter, so ground play never throttles. FALL_THROTTLE_MS = the
+## minimum wall-time between re-applies while fast (⇒ ≤ 1000/MS re-applies per second, INDEPENDENT of descent rate
+## and frame rate — the "bounded per-frame work" the gate asserts).
+const FALL_THROTTLE_VSPEED := 3.0
+const FALL_THROTTLE_MS := 100
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

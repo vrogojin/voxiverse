@@ -188,6 +188,13 @@ var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
 
+# COSMOS-PERF FALL-ALTRATE (FP_FALL_CAMFAR_HOLD): throttle state for the altitude-ramped camera near/far planes.
+# _camfar_prev_d/_usec derive the radial speed; _camfar_apply_msec throttles the re-apply to ≤ 1/FALL_THROTTLE_MS
+# during a fast descent. All −1 sentinels (no prior sample) ⇒ the first call always applies. DEAD off the flag.
+var _camfar_prev_d := -1.0
+var _camfar_prev_usec := -1
+var _camfar_apply_msec := -1
+
 # ── REMOTE-DRIVE INTENT SEAM (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4.2) ─────────────────────────
 # The ONLY hook the RemoteControl executor drives the rover through: it injects INTENT at the exact
 # level a human does (the WASD/Shift/Space polls in _move), so commanded motion flows through the
@@ -516,9 +523,30 @@ func set_render_camera(t: Transform3D) -> void:
 ## altitude, d = |camera − body_centre| (blocks). At h = 0 / d = R these are the shipped 0.05 / 9000. Called
 ## per frame by main._process under FP_SCALED_BODY only; DEAD (never called) with the flag off.
 func apply_scaled_camera_planes(h: float, d: float) -> void:
-	if _camera != null:
+	if _camera == null:
+		return
+	var new_far := CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
+	# COSMOS-PERF FALL-ALTRATE (FP_FALL_CAMFAR_HOLD): off ⇒ the shipped every-frame write (byte-identical).
+	if not CubeSphere.FP_FALL_CAMFAR_HOLD:
 		_camera.near = CosmosScale.camera_near(h)
-		_camera.far = CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
+		_camera.far = new_far
+		return
+	# Throttle the ramp during fast vertical motion: derive the radial speed from the last d sample, then hold the
+	# last-applied planes unless (a) motion is slow/steady (converge exactly), (b) FALL_THROTTLE_MS has elapsed, or
+	# (c) the far plane must GROW (a climb — never hold a far plane smaller than the ring needs, or it clips).
+	var now_usec := Time.get_ticks_usec()
+	var vspeed := 0.0
+	if _camfar_prev_usec >= 0:
+		vspeed = FallThrottle.radial_speed(_camfar_prev_d, d, float(now_usec - _camfar_prev_usec) / 1.0e6)
+	_camfar_prev_d = d
+	_camfar_prev_usec = now_usec
+	var now_msec := Time.get_ticks_msec()
+	var ms_since := (now_msec - _camfar_apply_msec) if _camfar_apply_msec >= 0 else 0x7fffffff
+	var must_grow := new_far > _camera.far + 1.0
+	if must_grow or FallThrottle.should_reapply(true, vspeed, ms_since):
+		_camera.near = CosmosScale.camera_near(h)
+		_camera.far = new_far
+		_camfar_apply_msec = now_msec
 
 ## COSMOS-ORBITAL-SHELL H-B telemetry: the LIVE camera far plane (blocks). At orbit distance d the far ring's limb
 ## sits at √(d²−R²) from the camera; if far < that the limb-ward part of the visible disc is CLIPPED (the far side

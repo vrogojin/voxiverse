@@ -1601,7 +1601,13 @@ func _move(delta: float) -> void:
 			position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
 			velocity.y = 0.0
 
+	# FP_FALL_TIMING: split out the per-frame landing floor query (t_floor_us) — the re-entry residual the
+	# FP_FLOOR_MEMO cache targets (cold-generator scans in _move). Off ⇒ the flag test only (byte-identical).
+	var _ft_on2 := CubeSphere.FP_FALL_TIMING
+	var _ft_t2 := 0
+	if _ft_on2: _ft_t2 = Time.get_ticks_usec()
 	var terrain_floor := world.floor_under(position.x, position.z, position.y)
+	if _ft_on2: _ft_max("t_floor_us", Time.get_ticks_usec() - _ft_t2)
 	var floor_y := terrain_floor
 
 	# Stand ON a detached voxel body directly under the feet instead of falling

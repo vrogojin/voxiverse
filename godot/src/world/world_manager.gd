@@ -214,6 +214,13 @@ var _meta: Dictionary = {}            # Vector3i -> Dictionary (JSON-subset docu
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
+# COSMOS-PERF FALL (FP_FLOOR_MEMO): per-WINDOW-column memo of the CELL index of the topmost solid-with-air-above
+# (floor_under's answer seen from above all solids). Lets a repeated fall column resolve floor_under in O(1) instead
+# of re-scanning ~MARGIN cold-generator cells every frame. INVALIDATED at the write/remap choke points (_write_cell,
+# sim_revert_cell erase the column; _rebuild_window_indices clears; _shift_window_bookkeeping re-keys). Capped at
+# FLOOR_MEMO_CAP and cleared wholesale on overflow (NEVER-OOM). Empty + unread with FP_FLOOR_MEMO off (byte-identical).
+var _floor_top: Dictionary = {}       # Vector2i(x, z) -> int (topmost standable CELL y)
+const _FLOOR_MEMO_NONE := -0x40000000 # sentinel: no memo for this column (never a real floor cell)
 # Sparse per-joint reinforcement (glue/weld/cement; STRUCTURAL-INTEGRITY §4.2/§7):
 # canonical key Vector4i(min_cell.x, .y, .z, axis) -> reinforcement id. Lives
 # OUTSIDE the four cell axes (it is per-FACE, not per-cell). The structural solver
@@ -1376,6 +1383,10 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 				_bucket = {}
 				_edits_by_fid[_fid] = _bucket
 			(_bucket as Dictionary)[ek] = true
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): this write changes the column's occupancy, so drop its cached topmost-floor
+	# (break/place/collapse/snow all funnel here) — the next floor_under recomputes it exactly. No-op with the flag off.
+	if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+		_floor_top.erase(Vector2i(cell.x, cell.z))
 	# COSMOS-FRAME-ORIENTATION §6.4: store the directional modifier in its CANONICAL (true-face) frame so
 	# it survives a flip; PAINT the window-frame value (the current render). No-op for a full cube.
 	_edits[ek] = _overlay_canon_modifier(cell, packed)
@@ -1402,6 +1413,9 @@ func sim_revert_cell(cell: Vector3i) -> void:
 	# through to the folded worldgen once the edit is gone). Byte-identical to main in FLAT_WORLD.
 	var ek: Variant = _edit_key(cell)
 	if _edits.erase(ek):
+		# COSMOS-PERF FALL (FP_FLOOR_MEMO): reverting a cell to bare changes the column's occupancy — drop its memo.
+		if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+			_floor_top.erase(Vector2i(cell.x, cell.z))
 		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): the ONLY `_edits` erase — drop the key from its facet bucket
 		# so the index stays a byte-exact subset of `_edits`; retire the bucket when it empties (NEVER-OOM). Off / non-
 		# FACETED ⇒ the index is empty and this is a no-op (byte-identical).
@@ -2678,6 +2692,10 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 func _rebuild_window_indices() -> void:
 	_edit_columns = {}
 	_placed_top = {}
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): a crossing/flip re-bases WINDOW columns onto different global columns, so the
+	# window-keyed floor memo is stale — drop it wholesale (it re-populates lazily on the next fall). No-op off-flag.
+	if CubeSphere.FP_FLOOR_MEMO:
+		_floor_top = {}
 	# FP-M1a: FACETED (no chart) — the active facet lattice IS the window, so keep this facet's edits and
 	# index them directly by their unpacked cell (x, z) / y high-water mark.
 	if CubeSphere.FACETED and _chart == null:
@@ -2767,6 +2785,13 @@ func _shift_window_bookkeeping(d: Vector2i) -> void:
 	for k: Vector2i in _placed_top.keys():
 		new_top[k - d] = _placed_top[k]
 	_placed_top = new_top
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): an origin shift re-anchors the SAME world under shifted window coords, so the
+	# memo stays valid — re-key column (x, z) → (x − Δ, z − Δ) (the topmost CELL y is unchanged). No-op off-flag.
+	if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+		var new_ft := {}
+		for k: Vector2i in _floor_top.keys():
+			new_ft[k - d] = _floor_top[k]
+		_floor_top = new_ft
 	if not _joint_mods.is_empty():
 		var new_j := {}
 		for k: Vector4i in _joint_mods.keys():
@@ -3149,6 +3174,7 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	var start := int(floor(cell_feet + 0.5))
 	var y := start
 	_floor_scan_iters = 0
+	var populate := false          # true ⇒ the tail scan starts ABOVE all solids, so its first floor IS the column's topmost (cacheable)
 	# COSMOS-PERF FALL (FP_FLOOR_BOUNDED): PROBE the first MARGIN cells DOWN from the feet. Near the surface
 	# (walking/standing/landing — feet within MARGIN of the floor) the floor is found in the first 1-2 cells, so
 	# this loop returns the SAME value scanning the SAME cells in the SAME order as the shipped unbounded scan —
@@ -3156,24 +3182,35 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	# a fall) do we skip the guaranteed-generated-air gap by jumping the scan to a cheap heightmap-based start.
 	# Off ⇒ this whole block is skipped (y stays = start) and the loop below is the shipped scan verbatim.
 	if CubeSphere.FP_FLOOR_BOUNDED:
-		var probe_floor := start - CubeSphere.FLOOR_BOUNDED_MARGIN
-		while y > probe_floor:
-			_floor_scan_iters += 1
-			var hp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
-			if hp != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
-				return float(y) + hp.y + s
-			y -= 1
-		# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
-		# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
-		# DIRECT query (no scan), and every generated solid (terrain + trees, ≤ MAX_ABOVE_SURFACE=14 higher) sits
-		# at or below it; and (b) `placed_top + 1`: the per-column high-water of PLAYER-PLACED cells (an O(1)
-		# `_placed_top` lookup), so a tower rising ABOVE the heightmap+MARGIN is still covered exactly. Jump the
-		# scan to that ceiling — skipping the pure-air gap above it the shipped path would grind through — but
-		# NEVER move the scan UP past where the probe already reached (`mini` keeps it a continuation when the
-		# ceiling is not below). The jump lands the scan just above the true floor, so it finds the SAME floor
-		# the shipped from-feet scan would (bit-identical), now in ≤ ~MARGIN cells instead of ∝ feet altitude.
-		var ceil_est := maxi(col_height(xi, zi) + CubeSphere.FLOOR_BOUNDED_MARGIN, placed_top(xi, zi) + 1)
-		y = mini(y, ceil_est)
+		# COSMOS-PERF FALL (FP_FLOOR_MEMO): if this column's topmost solid-with-air-above is cached AND the feet are
+		# at/above it, nothing solid sits above that cell (proof: a higher solid would itself be a higher
+		# solid-with-air-above), so a scan from the feet reaches it through air alone — jump STRAIGHT there and let
+		# the tail loop return it in one iteration (O(1); skips the probe). Off ⇒ the sentinel ⇒ this never fires.
+		var cached := int(_floor_top.get(Vector2i(xi, zi), _FLOOR_MEMO_NONE)) if CubeSphere.FP_FLOOR_MEMO else _FLOOR_MEMO_NONE
+		if cached != _FLOOR_MEMO_NONE and start >= cached:
+			y = cached
+		else:
+			var probe_floor := start - CubeSphere.FLOOR_BOUNDED_MARGIN
+			while y > probe_floor:
+				_floor_scan_iters += 1
+				var hp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+				if hp != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+					return float(y) + hp.y + s
+				y -= 1
+			# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
+			# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
+			# DIRECT query (no scan), and every generated solid (terrain + trees, ≤ MAX_ABOVE_SURFACE=14 higher) sits
+			# at or below it; and (b) `placed_top + 1`: the per-column high-water of PLAYER-PLACED cells (an O(1)
+			# `_placed_top` lookup), so a tower rising ABOVE the heightmap+MARGIN is still covered exactly. Jump the
+			# scan to that ceiling — skipping the pure-air gap above it the shipped path would grind through — but
+			# NEVER move the scan UP past where the probe already reached (`mini` keeps it a continuation when the
+			# ceiling is not below). The jump lands the scan just above the true floor, so it finds the SAME floor
+			# the shipped from-feet scan would (bit-identical), now in ≤ ~MARGIN cells instead of ∝ feet altitude.
+			var ceil_est := maxi(col_height(xi, zi) + CubeSphere.FLOOR_BOUNDED_MARGIN, placed_top(xi, zi) + 1)
+			y = mini(y, ceil_est)
+			# We reach the ceiling (y == ceil_est) only when it is BELOW the probed band ⇒ the scan now starts above
+			# EVERY solid in the column, so the first floor it finds is the column's topmost surface — safe to memoize.
+			populate = CubeSphere.FP_FLOOR_MEMO and y == ceil_est
 	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
 	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
 	# seafloor, while a solid cell yields its filled interval — the floor is the top of
@@ -3183,9 +3220,18 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 		_floor_scan_iters += 1
 		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+			if populate:
+				_floor_memo_put(Vector2i(xi, zi), y)
 			return float(y) + here.y + s
 		y -= 1
 	return float(effective_height(xi, zi) + 1) + s
+
+## FP_FLOOR_MEMO: store column `col`'s topmost-standable CELL y. NEVER-OOM — past FLOOR_MEMO_CAP columns the whole
+## memo is dropped (a clear only forces a recompute, which is bit-identical), so the dict can never grow unbounded.
+func _floor_memo_put(col: Vector2i, top_y: int) -> void:
+	if _floor_top.size() >= CubeSphere.FLOOR_MEMO_CAP and not _floor_top.has(col):
+		_floor_top.clear()
+	_floor_top[col] = top_y
 
 ## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
 ## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical

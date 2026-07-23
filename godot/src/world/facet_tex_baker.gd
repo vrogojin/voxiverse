@@ -138,6 +138,15 @@ func _rebuild_texture() -> void:
 	var imgs: Array[Image] = []
 	for f in range(6):
 		var img: Image = _pages[f]
+		# COVERAGE-CORRECT MIPS (§ live-fix 2): premultiply RGB by A BEFORE generate_mipmaps. Godot box-filters
+		# R/G/B independently of A (straight alpha), so a boundary mip texel between a baked facet (rgb, a=1) and
+		# an un-baked one (0, a=0) would average real colour with literal BLACK into rgb → a dark seam along the
+		# bake frontier once wt>0 (cam_dist>600). Premultiplied, the box filter becomes coverage-weighted
+		# (rgb = Σ rgb·a / N, a = Σ a / N), so an un-baked texel contributes 0 to BOTH sums; the shell shader
+		# un-premultiplies on read (col = rgb/a) to recover the true colour. No-op on mip-0 baked texels (a=1 ⇒
+		# rgb·1) so G-FT-BAKE (get_pixel at mip 0) is unchanged; idempotent on the a∈{0,1} sentinel so a Phase-2
+		# re-blit + re-upload stays correct.
+		img.premultiply_alpha()
 		img.generate_mipmaps()
 		imgs.append(img)
 	if _tex == null:

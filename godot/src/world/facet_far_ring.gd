@@ -969,6 +969,16 @@ func backstop_rendered_positions(fid: int) -> PackedVector3Array:
 	_ensure_backstop_cached(fid)
 	return _sunk_positions(_bpos_cache[fid])
 
+## NO-PROTRUSION G-NPT gate: the AS-RENDERED coarse-horizon vertex grid for facet `fid`. Under FP_ENV_ALL the coarse
+## `_pos_cache` carries min-envelope heights AND the emit path sinks it by the ε guard (the coarse twin of the
+## backstop sink), so this returns the same ε-sunk surface the live emit draws; with the flag off it returns the
+## shipped raw exact-chord `_pos_cache` (what the un-enveloped horizon really renders — where R-A/R-B protrude).
+func horizon_rendered_positions(fid: int) -> PackedVector3Array:
+	_ensure_cached(fid)
+	if TierPlace.env_all_on():
+		return _sunk_positions(_pos_cache[fid])
+	return _pos_cache[fid]
+
 ## TIER-DEPTH P2 gate: the RAW (un-sunk) dense backstop cache for facet `fid` — the ENVELOPE heights under FP_TIER_ENVELOPE,
 ## the plain profile_at_dir relief otherwise. The gate applies its OWN fixed ε sink to this so it can prove the ENVELOPE
 ## property in isolation (a lower bound at a small sink) vs the plain sample (which needs the full 6-block sink to hold).
@@ -979,6 +989,15 @@ func backstop_raw_positions(fid: int) -> PackedVector3Array:
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
 	if _pos_cache.has(fid):
+		return
+	# NO-PROTRUSION §0.3 (FP_ENV_ALL): the coarse HORIZON cache (R-A / R-B) becomes a min-envelope LOWER BOUND too —
+	# every CELLS=4 vertex placed radially at env(v) = min near g over its dilated footprint, with EDGE-CANON on the
+	# shared boundary so it still welds. Requires FP_SHELL_WELD (checked in env_all_on) — the enveloped surface is a
+	# pure radial field. Textually separate so the flag-off path below is byte-identical.
+	if TierPlace.env_all_on():
+		var g := _env_weld_grid(fid, CELLS)
+		_pos_cache[fid] = g[0]
+		_col_cache[fid] = g[1]
 		return
 	# COSMOS FS1 (§4.1): the WELD path emits every vertex RADIALLY from the SHARED cube-sphere corner dirs, so a
 	# facet's edge welds bit-identically to its neighbour's (One-Surface Law). Textually separate from the shipped
@@ -1041,7 +1060,7 @@ func _ensure_backstop_cached(fid: int) -> void:
 	# TIER-DEPTH P2 (§5.1): under the min-envelope rule each vertex height becomes a PROVABLE lower bound of the near
 	# surface over its dilated footprint, replacing the constant sink. Separate builder so the flag-off path is textually
 	# the shipped per-vertex profile sample (byte-identical).
-	if TierPlace.envelope_on():
+	if TierPlace.envelope_on() or TierPlace.env_all_on():
 		_ensure_backstop_cached_env(fid)
 		return
 	var cells := CubeSphere.BACKSTOP_CELLS
@@ -1160,6 +1179,14 @@ func _ensure_backstop_cached_env(fid: int) -> void:
 ## direction comes from the SHARED corner dirs and every vertex is placed RADIALLY (d̂·(R+relief)), then the outer
 ## ring is snapped to the coarse chord. Kept a separate function so the shipped envelope path stays byte-identical.
 func _ensure_backstop_cached_env_weld(fid: int) -> void:
+	# NO-PROTRUSION §0.3 (FP_ENV_ALL): the dense backstop shares the SAME EDGE-CANON boundary rule as the coarse
+	# horizon cache so the two tiers weld to each other (coarse-index boundary/corner values coincide). The shipped
+	# FP_TIER_ENVELOPE-only path (plain 2-D footprint below) is left byte-identical — this branch only runs under env_all.
+	if TierPlace.env_all_on():
+		var g := _env_weld_grid(fid, CubeSphere.BACKSTOP_CELLS)
+		_bpos_cache[fid] = g[0]
+		_bcol_cache[fid] = g[1]
+		return
 	var cd := FacetAtlas.facet_corner_dirs(fid)
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
@@ -1203,6 +1230,161 @@ func _ensure_backstop_cached_env_weld(fid: int) -> void:
 	_weld_snap_edges(pos, cells)
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
+
+# =====================================================================================================
+# NO-PROTRUSION §0.3 (FP_ENV_ALL) — the GLOBAL ENVELOPE HEIGHT LAW builder, shared by the coarse horizon cache
+# (cells=CELLS) and the dense backstop cache (cells=BACKSTOP_CELLS). Every vertex is placed RADIALLY from the
+# shared corner dirs at a min-envelope height env(v) = min{ near g over v's dilated footprint }, so a rendered
+# triangle (a convex combination of three vertex lower bounds) stays ≤ the true surface. Boundary vertices use
+# the EDGE-CANON rule — their footprint is derived ONLY from the SHARED edge data at a resolution-INDEPENDENT
+# canonical pitch/reach — so a coarse facet and an adjacent dense facet compute the SAME value at a shared
+# corner/coarse-index edge node ⇒ the shell still welds (FP_SHELL_WELD preserved). Interior vertices use the
+# cheap pre-sampled 2-D fine grid. The ε sink is applied at EMIT (not baked) so the raw caches keep welding
+# (horizon_positions / backstop_raw_positions coincide). Returns [pos, col]; the caller stores into the right cache.
+# =====================================================================================================
+func _env_weld_grid(fid: int, cells: int) -> Array:
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var stride := cells + 1
+	var cstride := cells / CELLS                       # 1 for the coarse facet, BACKSTOP_CELLS/CELLS for the dense one
+	var mult := TierPlace.ENV_FINE_MULT
+	var fine := cells * mult
+	var fstride := fine + 1
+	# Pre-sample the fine near-g grid along the SHARED corner dirs (interior 2-D footprint source; one profile per node).
+	var fg := PackedInt32Array()
+	fg.resize(fstride * fstride)
+	for fj in range(fstride):
+		for fi in range(fstride):
+			var d := _weld_unit(cd, float(fi) / float(fine), float(fj) / float(fine))
+			fg[fj * fstride + fi] = int(TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS).x)
+	var edge_blocks := (PI * 0.5 * FacetAtlas.R_BLOCKS) / float(FacetAtlas.K)
+	var fine_pitch := edge_blocks / float(fine)
+	# The RADIAL-vs-NORMAL skew: a far vertex placed radially at height h projects along the near n̂ onto a column
+	# displaced by ≈ h·tan(α), α ≤ the facet half-diagonal — up to ~relief·0.046 ≈ 6-8 blocks on a high mountain, and
+	# MORE than the shipped ENV_DILATE_BLOCKS(6) covers (measured raw residual +6.2 at dilation 6 ⇒ the min missed
+	# the truly-overlaid column). env_all dilates the footprint by a generous rescale-safe skew allowance (~0.3 of a
+	# coarse cell ≈ 31 blocks at R=6371, covering relief up to ~650) so the min ALWAYS includes the projected column
+	# ⇒ raw residual < ε. Env_all-LOCAL (does not touch the shipped ENV_DILATE_BLOCKS ⇒ FP_TIER_ENVELOPE unmoved).
+	var skew := edge_blocks / float(CELLS) * 0.3
+	var dil := int(ceil(skew / maxf(fine_pitch, 0.001)))
+	var half := mult + dil                             # interior footprint = ±1 own-cell (±mult fine) + skew dilation
+	# CANONICAL (resolution-independent) edge/corner extents: reach = 1 coarse (CELLS) cell + the skew allowance
+	# (covers a boundary node's incident triangles on BOTH facets + the projected column); pitch derived from the
+	# FINEST reference (BACKSTOP_CELLS) so a coarse and a dense facet sample the same set at a shared node — all fixed
+	# constants, identical every facet ⇒ shared boundary/corner values coincide (weld preserved).
+	var reach := edge_blocks / float(CELLS) + skew
+	# Canonical boundary pitch ≈ half a BACKSTOP cell (~13 blocks): fine enough that the between-sample residual
+	# (≈ step²·|h''|/8 ≲ 1 block on the worst mountain facet) stays well under the ε sink (G-NPT-BOUND pins it),
+	# yet coarse enough that the disc/band sample counts stay bounded. Fixed constant ⇒ coarse and dense agree.
+	var step := edge_blocks / float(2 * CubeSphere.BACKSTOP_CELLS)
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var d := _weld_unit(cd, float(gi) / float(cells), float(gj) / float(cells))
+			var gmin := _env_node_min(cd, cells, cstride, gi, gj, fg, fstride, mult, half, reach, step)
+			pos.append(_weld_place(d, gmin))            # ABSOLUTE, radial, envelope height, un-sunk (ε applied at emit)
+			var vp := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+			var vg := int(vp.x)
+			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+	_weld_snap_edges(pos, cells)                        # dense: snap fine edge verts onto the EDGE-CANON coarse chord (no-op at CELLS)
+	return [pos, col]
+
+## The min near-g over grid node (gi,gj)'s envelope footprint. INTERIOR node → the cheap pre-sampled 2-D fine grid
+## (±half). BOUNDARY node → EDGE-CANON (shared-derived, so both facets agree): a CORNER samples a rotationally-
+## symmetric disc about the shared corner dir; a COARSE-INDEX edge node samples the shared 1-D edge line + a
+## sign-symmetric perpendicular band. A non-coarse-index (fine) edge node falls back to the 2-D footprint because
+## `_weld_snap_edges` overwrites it with the coarse chord anyway (so its value never renders).
+func _env_node_min(cd: PackedFloat64Array, cells: int, cstride: int, gi: int, gj: int,
+		fg: PackedInt32Array, fstride: int, mult: int, half: int, reach: float, step: float) -> int:
+	var on_w := gi == 0
+	var on_e := gi == cells
+	var on_s := gj == 0
+	var on_n := gj == cells
+	var nb := int(on_w) + int(on_e) + int(on_s) + int(on_n)
+	if nb >= 2:                                         # CORNER — canonical disc about the shared corner dir
+		var dc := _weld_unit(cd, float(gi) / float(cells), float(gj) / float(cells))
+		return _env_corner_min(dc, reach, step)
+	if nb == 1:
+		var along_idx := gj if (on_w or on_e) else gi
+		if along_idx % cstride == 0:                    # coarse-index edge node — canonical line + perp band
+			var ca: Vector3
+			var cb: Vector3
+			var u: float
+			if on_s:
+				ca = Vector3(cd[0], cd[1], cd[2]); cb = Vector3(cd[3], cd[4], cd[5]); u = float(gi) / float(cells)
+			elif on_n:
+				ca = Vector3(cd[9], cd[10], cd[11]); cb = Vector3(cd[6], cd[7], cd[8]); u = float(gi) / float(cells)
+			elif on_w:
+				ca = Vector3(cd[0], cd[1], cd[2]); cb = Vector3(cd[9], cd[10], cd[11]); u = float(gj) / float(cells)
+			else:
+				ca = Vector3(cd[3], cd[4], cd[5]); cb = Vector3(cd[6], cd[7], cd[8]); u = float(gj) / float(cells)
+			return _env_edge_min(ca, cb, u, reach, step)
+	# INTERIOR (or a fine edge node that will be snapped): 2-D footprint over the pre-sampled fine grid.
+	var fic := gi * mult
+	var fjc := gj * mult
+	var gmin := 1 << 30
+	for wj in range(fjc - half, fjc + half + 1):
+		if wj < 0 or wj >= fstride:
+			continue
+		var rowoff := wj * fstride
+		for wi in range(fic - half, fic + half + 1):
+			if wi < 0 or wi >= fstride:
+				continue
+			var gg: int = fg[rowoff + wi]
+			if gg < gmin:
+				gmin = gg
+	return gmin
+
+## EDGE-CANON corner: min near g over a rotationally-symmetric DISC of angular radius reach/R about the shared
+## corner dir `d`. The tangent frame is a DETERMINISTIC function of d ONLY (pick the world axis least aligned with
+## d, orthonormalize) — so every facet meeting at this corner (any arity) builds the identical sample set ⇒ the
+## corner welds. Rings at the canonical pitch, angular samples densified with radius so no dip is missed.
+func _env_corner_min(d: Vector3, reach: float, step: float) -> int:
+	var ref := Vector3(0.0, 1.0, 0.0)
+	if absf(d.y) >= absf(d.x) and absf(d.y) >= absf(d.z):
+		ref = Vector3(1.0, 0.0, 0.0)                    # d ~ ±Y → use X as the reference so the cross is well-conditioned
+	var u := (ref - d * ref.dot(d)).normalized()
+	var v := d.cross(u).normalized()
+	var r := FacetAtlas.R_BLOCKS
+	var nr := int(ceil(reach / step))
+	var gmin := int(TerrainConfig.profile_at_dir(d.x, d.y, d.z, r).x)   # the corner itself (rad 0)
+	for ri in range(1, nr + 1):
+		var rad := float(ri) * step
+		var na := maxi(6, int(ceil((2.0 * PI * rad) / step)))
+		var ainc := (2.0 * PI) / float(na)
+		var scale := rad / r                            # angular offset ≈ tan θ for the small facet-scale θ
+		for ai in range(na):
+			var ang := float(ai) * ainc
+			var off := u * (cos(ang) * scale) + v * (sin(ang) * scale)
+			var sd := (d + off).normalized()
+			var g := int(TerrainConfig.profile_at_dir(sd.x, sd.y, sd.z, r).x)
+			if g < gmin:
+				gmin = g
+	return gmin
+
+## EDGE-CANON edge: min near g over the shared 1-D edge line (param a' ∈ [u±reach] along the corner-dir lerp) × a
+## SIGN-SYMMETRIC perpendicular band (±p, p = normalize(edge_dir × radial)). The two facets sharing the edge pass
+## the same corner dirs (possibly swapped) and the mirrored parameter (u'=1−u); commutative-add lerp + the ±p / ±off
+## symmetry make the sample SET bit-identical either side ⇒ the coarse-index edge nodes weld. Clamped to the edge
+## extent [0,1] so a near-corner footprint samples the corner dir (matches the neighbour's clamp — still symmetric).
+func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float) -> int:
+	var edge_dir := cb - ca
+	var edge_blocks := (PI * 0.5 * FacetAtlas.R_BLOCKS) / float(FacetAtlas.K)
+	var du := step / edge_blocks
+	var r := FacetAtlas.R_BLOCKS
+	var np := int(ceil(reach / step))
+	var gmin := 1 << 30
+	for ia in range(-np, np + 1):
+		var ap := clampf(u + float(ia) * du, 0.0, 1.0)
+		var d_e := (ca * (1.0 - ap) + cb * ap).normalized()          # = _weld_unit on the edge (bit-identical either side)
+		var p := edge_dir.cross(d_e).normalized()                    # in-surface perpendicular (±symmetric across facets)
+		for ip in range(-np, np + 1):
+			var off := (float(ip) * step) / r
+			var sd := (d_e + p * off).normalized()
+			var g := int(TerrainConfig.profile_at_dir(sd.x, sd.y, sd.z, r).x)
+			if g < gmin:
+				gmin = g
+	return gmin
 
 ## COSMOS far-ring full coverage (§2): return a copy of grid positions `p` pushed radially inward by BACKSTOP_SINK
 ## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
@@ -1271,7 +1453,10 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
 	else:
-		pos = _pos_cache[fid]
+		# NO-PROTRUSION §0.3: under FP_ENV_ALL the coarse HORIZON cache is an envelope lower bound too — apply the
+		# SAME ε sink the backstop gets so the retained emit-time sink covers the between-fine-sample residual (R-A).
+		# Off ⇒ the shipped raw _pos_cache emit verbatim (byte-identical).
+		pos = _sunk_positions(_pos_cache[fid]) if TierPlace.env_all_on() else _pos_cache[fid]
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
@@ -1328,7 +1513,11 @@ func _ensure_tri_cached(fid: int) -> void:
 	if _tri_pos_cache.has(fid):
 		return
 	_ensure_cached(fid)
-	var pos: PackedVector3Array = _pos_cache[fid]
+	# NO-PROTRUSION §0.3: the FAST (memcpy) assembler pre-triangulates the coarse cache; under FP_ENV_ALL bake the
+	# same ε sink into that source so a fast rebuild draws the coarse envelope SUNK exactly like the SurfaceTool emit
+	# path (_emit_cached). Off ⇒ the shipped raw _pos_cache (byte-identical). The raw _pos_cache itself is untouched
+	# (horizon_positions / the weld gate still read the un-sunk envelope).
+	var pos: PackedVector3Array = _sunk_positions(_pos_cache[fid]) if TierPlace.env_all_on() else _pos_cache[fid]
 	var col: PackedColorArray = _col_cache[fid]
 	var stride := CELLS + 1
 	var tp := PackedVector3Array()

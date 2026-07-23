@@ -407,6 +407,13 @@ const FP_TIER_DEPTH_BIAS := false
 ## G-TIER-WARM-CONVERGE.
 const FP_TIER_WARM_CONVERGE := false
 
+## COSMOS NO-PROTRUSION (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §0.3) — GLOBAL ENVELOPE HEIGHT LAW.
+## Every far-ring vertex (coarse horizon AND dense backstop, weld+non-weld) stores min(fine g over its dilated
+## footprint)+ε sink → rendered surface ≤ true surface EVERYWHERE/every regime (kills R-A/R-B/R-C protrusion).
+## Fine heights reuse FacetTexBaker's sample grid; EDGE-CANON keeps seams weld-exact. Requires FP_FARRING_FULL_COVER
+## + FP_SHELL_WELD. Default OFF → shipped path verbatim, FLAT byte-identical (6042/0). Gate: verify_no_protrusion.gd.
+const FP_ENV_ALL := false
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles

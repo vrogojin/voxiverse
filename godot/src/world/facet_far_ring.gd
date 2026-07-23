@@ -1538,11 +1538,15 @@ void vertex() {
 }
 void fragment() {
 	vec4 tx = texture(base_map, vec3(v_uv, v_face));
-	// COVERAGE GATE (§ live-fix): tx.a is the bake coverage (0 = never baked → the un-baked far hemisphere).
-	// Multiply wt by it so an un-baked facet shows the shipped vertex-colour far ring (NEVER black from orbit);
-	// a baked facet (alpha 1) cross-fades to the satellite image on the shipped 600..1800 distance ramp.
+	// COVERAGE GATE + UN-PREMULTIPLY (§ live-fix 2): the base map is PREMULTIPLIED alpha, so recover the true
+	// (un-darkened) colour by dividing rgb by coverage — near a bake frontier this cancels the mip/bilinear
+	// average of an un-baked (rgb=0,a=0) neighbour so there is NO black bleed into the seam. tx.a is the bake
+	// coverage: multiply wt by it so an un-baked facet (a≈0) shows the shipped vertex-colour far ring (NEVER
+	// black from orbit) and the un-premultiply degenerate case falls back to v_col_raw (doubly safe). A baked
+	// facet (a=1) cross-fades to the satellite image on the shipped 600..1800 distance ramp. One opaque draw.
+	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
 	float wt = smoothstep(600.0, 1800.0, v_cam) * tx.a;
-	ALBEDO = mix(v_col_raw, tx.rgb, wt) * v_st;
+	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
 

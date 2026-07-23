@@ -45,6 +45,7 @@ func _initialize() -> void:
 		_gate_uv(fid)
 		_gate_palette(fid)
 		_gate_cover(fid)
+		_gate_bleed()
 	else:
 		print("  (texture path OFF — G-FT-BAKE/UV/PALETTE/COVER need FP_FACET_TEX && FP_SHELL_ABSOLUTE ON; OFF-identity by G-FT-OFF)")
 
@@ -280,6 +281,28 @@ func _gate_cover(fid: int) -> void:
 	# exactly the reported blocker (black far hemisphere). Assert the two states DIFFER in alpha.
 	_ok(baker.texel_color(fid, 8, 8).a != baker.texel_color(other, 8, 8).a,
 		"G-FT-COVER falsify: bake FLIPS coverage alpha 0→1 (baked %.1f ≠ un-baked %.1f)" % [baker.texel_color(fid, 8, 8).a, baker.texel_color(other, 8, 8).a])
+
+# --- G-FT-BLEED: premultiplied-alpha mips are coverage-correct (no black bleed at the bake frontier) ---------
+# Pure CPU math (the review noted the gate can't exercise GPU sampling): model a 1-level box mip of the 2×2
+# block [ baked(color,a=1), un-baked(0,a=0), un-baked, un-baked ] the way the baker (premultiply → box filter)
+# + shader (divide by coverage) actually process it, and prove it recovers the TRUE colour, where the OLD
+# straight-alpha path darkened toward black.
+func _gate_bleed() -> void:
+	var color := Color(0.60, 0.50, 0.30, 1.0)
+	# Premultiplied source texels: baked = color·1 = color (a=1); un-baked = 0·0 = 0 (a=0). Box-average of 4.
+	var pm_r := (color.r + 0.0 + 0.0 + 0.0) / 4.0
+	var pm_g := (color.g + 0.0 + 0.0 + 0.0) / 4.0
+	var pm_b := (color.b + 0.0 + 0.0 + 0.0) / 4.0
+	var pm_a := (1.0 + 0.0 + 0.0 + 0.0) / 4.0                     # = 0.25 coverage
+	# FIX (shader): un-premultiply → recover the true colour (coverage-correct, NOT darkened toward black).
+	var rec := Vector3(pm_r / pm_a, pm_g / pm_a, pm_b / pm_a)
+	var eps := 1e-4
+	var d := absf(rec.x - color.r) + absf(rec.y - color.g) + absf(rec.z - color.b)
+	_ok(d < eps, "G-FT-BLEED: premultiplied mip + un-premultiply recovers the true colour (Δ=%.6f < %.4f) — no black bleed" % [d, eps])
+	# FAIL-BEFORE (old shader): straight mip rgb used directly (no divide) = color/4 → darkened toward black.
+	var old := Vector3(pm_r, pm_g, pm_b)
+	var dark := absf(old.x - color.r) + absf(old.y - color.g) + absf(old.z - color.b)
+	_ok(dark > 0.3 and dark > d, "G-FT-BLEED fail-before: straight mip (no un-premultiply) darkens toward black (Δ=%.4f > 0.3, brightness %.0f%%)" % [dark, 100.0 * pm_a])
 
 static func _bil(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t

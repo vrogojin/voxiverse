@@ -333,7 +333,10 @@ func _ready() -> void:
 		# the flag off nothing is instantiated and the far ring is byte-identical. Prewarm the currently-emitted
 		# facet set synchronously (masked by the same ShaderPrewarm hold as the ring's initial _rebuild_full), then
 		# bind the 6-layer base map into the ring's shell shader. NEVER-OOM: fixed pages (≈ 8.2 MB, total_bytes()).
-		if CubeSphere.FP_FACET_TEX:
+		# LOW #3: the textured far ring exists only under the (unshaded) absolute shell shader, so the baker is
+		# created only when BOTH flags are on — under FP_FACET_TEX alone the UV emission + tex shader are inert,
+		# so a baker/texture would just waste memory. Both are in the deploy set.
+		if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
 			_facet_tex = FacetTexBaker.new()
 			_facet_tex.setup(TerrainConfig.active_facet())
 			_facet_tex.prewarm(_facet_ring.visible_fids())

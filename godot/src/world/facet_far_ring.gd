@@ -47,6 +47,12 @@ var _bcol_cache: Dictionary = {}     # fid -> PackedColorArray
 # generate_normals (both C++, no GDScript per-vertex calls) → the normal array is BIT-IDENTICAL to the SurfaceTool path.
 var _tri_pos_cache: Dictionary = {}  # fid -> PackedVector3Array (96 verts: the facet's tri soup, ABSOLUTE coords)
 var _tri_col_cache: Dictionary = {}  # fid -> PackedColorArray   (96 colors, per _emit_cached order)
+# COSMOS LOD-TEXTURE Phase 1 (§1.3): parallel tri-order UV/UV2 caches for the FAST assembler, built ONLY under
+# FP_FACET_TEX (zero bytes / never touched with the flag off). UV = ((a+s)/K,(b+t)/K) is the facet-grid param;
+# UV2 = (face, -1) selects the base-map layer (close-up slot is always -1 in Phase 1). Same push order as
+# _tri_pos_cache so _build_fast's append_array carries them index-aligned into the mesh.
+var _tri_uv_cache: Dictionary = {}   # fid -> PackedVector2Array (96 uvs, per _emit_cached order)
+var _tri_uv2_cache: Dictionary = {}  # fid -> PackedVector2Array (96 uv2s: (face,-1))
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -798,23 +804,34 @@ func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
 func _build_fast(fids: PackedInt32Array) -> Mesh:
 	var pos := PackedVector3Array()
 	var col := PackedColorArray()
+	# COSMOS LOD-TEXTURE Phase 1 (§1.3): the tri-order UV/UV2 arrays, grown alongside pos/col ONLY under
+	# FP_FACET_TEX (off ⇒ empty + never assigned to the surface → byte-identical mesh format).
+	var tex := _tex_on()
+	var uv := PackedVector2Array()
+	var uv2 := PackedVector2Array()
 	for fid in fids:
 		# COSMOS far-ring full coverage (§4): a sunk backstop facet cannot ride the pre-triangulated memcpy (its
 		# vertices are pushed radially inward per-vertex at BACKSTOP_CELLS). Under FULL_COVER it falls back to the
 		# per-vertex sunk expansion (a handful of facets — §5); non-backstop facets keep the memcpy fast path. The
 		# vertex order/winding matches _emit_cached exactly, so the later global generate_normals is bit-identical.
 		if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
-			_append_backstop_tris(pos, col, fid)
+			_append_backstop_tris(pos, col, fid, uv, uv2)
 		else:
 			_ensure_tri_cached(fid)
 			pos.append_array(_tri_pos_cache[fid])
 			col.append_array(_tri_col_cache[fid])
+			if tex:
+				uv.append_array(_tri_uv_cache[fid])
+				uv2.append_array(_tri_uv2_cache[fid])
 	if pos.size() == 0:
 		return ArrayMesh.new()
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = pos
 	arr[Mesh.ARRAY_COLOR] = col
+	if tex:
+		arr[Mesh.ARRAY_TEX_UV] = uv
+		arr[Mesh.ARRAY_TEX_UV2] = uv2
 	var flat := ArrayMesh.new()
 	flat.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)   # normal-less; positions + colors only
 	var st := SurfaceTool.new()
@@ -1202,12 +1219,23 @@ func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
 ## COSMOS far-ring full coverage (§4): expand backstop facet `fid`'s dense sunk grid into the tri soup (same two tris
 ## per cell, same winding, same per-vertex colours as _emit_cached) and append it to the fast path's packed arrays. Used
 ## only by _build_fast under FULL_COVER for the handful of backstop facets that cannot ride the pre-triangulated memcpy.
-func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int) -> void:
+func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
+		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
 	_ensure_backstop_cached(fid)
 	var gp := _sunk_positions(_bpos_cache[fid])
 	var gc: PackedColorArray = _bcol_cache[fid]
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
+	# COSMOS LOD-TEXTURE Phase 1 (§1.3): the dense backstop grid carries the SAME facet-param UVs (denser cells,
+	# same [0,1]² span). Only under FP_FACET_TEX (the caller passes real uv/uv2 arrays); off ⇒ they stay empty.
+	var tex := _tex_on()
+	var t_a := 0; var t_b := 0; var t_k := 1
+	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), -1.0)
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
 	for gj in range(cells):
 		for gi in range(cells):
 			var i0 := gj * stride + gi
@@ -1218,6 +1246,15 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 			pos.push_back(gp[i1]); pos.push_back(gp[i2]); pos.push_back(gp[i3])
 			col.push_back(gc[i0]); col.push_back(gc[i2]); col.push_back(gc[i1])
 			col.push_back(gc[i1]); col.push_back(gc[i2]); col.push_back(gc[i3])
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv.push_back(Vector2(u0, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v0))
+				uv.push_back(Vector2(u1, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v1))
+				for _i in range(6):
+					uv2.push_back(fuv2)
 
 ## COSMOS far-ring full coverage (§2/§4): emit facet `fid`'s tri soup into `st`. A backstop facet (under FULL_COVER)
 ## emits its DENSE cache with the BACKSTOP_SINK radial push applied per vertex (pre-computed once here via _sunk_positions
@@ -1238,18 +1275,48 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
+	# COSMOS LOD-TEXTURE Phase 1 (§1.3): decode the facet's texture params ONCE. With the flag off `tex` is false
+	# and the emit runs the shipped set_color/add_vertex sequence VERBATIM (byte-identical, zero overhead).
+	var tex := _tex_on()
+	var t_a := 0
+	var t_b := 0
+	var t_k := 1
+	var uv2 := Vector2.ZERO
+	var inv_k := 0.0
+	var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		uv2 = Vector2(float(d[0]), -1.0)   # (face, close-up slot: always -1 in Phase 1)
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k)
+		inv_c = 1.0 / float(cells)
 	for gj in range(cells):
 		for gi in range(cells):
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride
 			var i3 := i2 + 1
-			st.set_color(col[i0]); st.add_vertex(pos[i0])
-			st.set_color(col[i2]); st.add_vertex(pos[i2])
-			st.set_color(col[i1]); st.add_vertex(pos[i1])
-			st.set_color(col[i1]); st.add_vertex(pos[i1])
-			st.set_color(col[i2]); st.add_vertex(pos[i2])
-			st.set_color(col[i3]); st.add_vertex(pos[i3])
+			if tex:
+				# UV = ((a + node_s)/K, (b + node_t)/K); node params: i0=(gi,gj) i1=(gi+1,gj) i2=(gi,gj+1) i3=(gi+1,gj+1)
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				var uv0 := Vector2(u0, v0); var uv1 := Vector2(u1, v0)
+				var uv2c := Vector2(u0, v1); var uv3 := Vector2(u1, v1)
+				st.set_uv(uv0); st.set_uv2(uv2); st.set_color(col[i0]); st.add_vertex(pos[i0])
+				st.set_uv(uv2c); st.set_uv2(uv2); st.set_color(col[i2]); st.add_vertex(pos[i2])
+				st.set_uv(uv1); st.set_uv2(uv2); st.set_color(col[i1]); st.add_vertex(pos[i1])
+				st.set_uv(uv1); st.set_uv2(uv2); st.set_color(col[i1]); st.add_vertex(pos[i1])
+				st.set_uv(uv2c); st.set_uv2(uv2); st.set_color(col[i2]); st.add_vertex(pos[i2])
+				st.set_uv(uv3); st.set_uv2(uv2); st.set_color(col[i3]); st.add_vertex(pos[i3])
+			else:
+				st.set_color(col[i0]); st.add_vertex(pos[i0])
+				st.set_color(col[i2]); st.add_vertex(pos[i2])
+				st.set_color(col[i1]); st.add_vertex(pos[i1])
+				st.set_color(col[i1]); st.add_vertex(pos[i1])
+				st.set_color(col[i2]); st.add_vertex(pos[i2])
+				st.set_color(col[i3]); st.add_vertex(pos[i3])
 			n += 2
 	return n
 
@@ -1266,6 +1333,18 @@ func _ensure_tri_cached(fid: int) -> void:
 	var stride := CELLS + 1
 	var tp := PackedVector3Array()
 	var tc := PackedColorArray()
+	# COSMOS LOD-TEXTURE Phase 1 (§1.3): build the parallel tri-order UV/UV2 arrays ONLY under FP_FACET_TEX
+	# (off ⇒ these stay empty and _build_fast never reads them → byte-identical). Same push order as pos/col.
+	var tex := _tex_on()
+	var tu := PackedVector2Array()
+	var tu2 := PackedVector2Array()
+	var t_a := 0; var t_b := 0; var t_k := 1
+	var uv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		uv2 = Vector2(float(d[0]), -1.0)
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(CELLS)
 	for gj in range(CELLS):
 		for gi in range(CELLS):
 			var i0 := gj * stride + gi
@@ -1276,8 +1355,22 @@ func _ensure_tri_cached(fid: int) -> void:
 			tp.push_back(pos[i1]); tp.push_back(pos[i2]); tp.push_back(pos[i3])
 			tc.push_back(col[i0]); tc.push_back(col[i2]); tc.push_back(col[i1])
 			tc.push_back(col[i1]); tc.push_back(col[i2]); tc.push_back(col[i3])
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				var uv0 := Vector2(u0, v0); var uv1 := Vector2(u1, v0)
+				var uv2c := Vector2(u0, v1); var uv3 := Vector2(u1, v1)
+				tu.push_back(uv0); tu.push_back(uv2c); tu.push_back(uv1)
+				tu.push_back(uv1); tu.push_back(uv2c); tu.push_back(uv3)
+				for _i in range(6):
+					tu2.push_back(uv2)
 	_tri_pos_cache[fid] = tp
 	_tri_col_cache[fid] = tc
+	if tex:
+		_tri_uv_cache[fid] = tu
+		_tri_uv2_cache[fid] = tu2
 
 func _centre_dir(fid: int) -> Array:
 	if _centre_cache.has(fid):
@@ -1293,6 +1386,25 @@ func _facet_centre_dir(fid: int) -> Array:
 		s[0] += c[0]; s[1] += c[1]; s[2] += c[2]
 	var ln: float = sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2])
 	return [s[0] / ln, s[1] / ln, s[2] / ln]
+
+## COSMOS LOD-TEXTURE Phase 1 (§1.3): decode `fid` → [face, a, b, k] in its body's local (face,a,b) indexing
+## (Earth ⇒ base 0, k=K). The base-map layer is `face`; UV = ((a+s)/k, (b+t)/k). Mirrors FacetTexBaker._decode
+## so the emitted UVs land exactly on the baked facet rect.
+## COSMOS LOD-TEXTURE Phase 1 (§1.3 / LOW #3): UV/UV2 emission requires BOTH FP_FACET_TEX and FP_SHELL_ABSOLUTE.
+## The textured sampler lives ONLY in the (unshaded) _SHELL_ABS_SHADER; under a LIT StandardMaterial the extra
+## per-vertex UV/UV2 would split shared-corner verts in generate_normals (faint cube-edge creases) AND never be
+## sampled. Gating on both keeps FP_FACET_TEX-alone byte-identical to shipped (no UV arrays, no creases).
+func _tex_on() -> bool:
+	return CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE
+
+func _tex_decode(fid: int) -> Array:
+	var kb := FacetAtlas.k_of(fid)
+	var lf := fid - FacetAtlas.fid_base_of(fid)
+	var face := int(lf / (kb * kb))
+	var rem := lf - face * kb * kb
+	var a := int(rem / kb)
+	var b := rem - a * kb
+	return [face, a, b, kb]
 
 static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t
@@ -1389,13 +1501,65 @@ void vertex() {
 void fragment() { ALBEDO = v_col; }
 "
 
+# COSMOS LOD-TEXTURE Phase 1 (§1.3): the TEXTURED variant of _SHELL_ABS_SHADER, compiled ONLY under FP_FACET_TEX.
+# Identical day/night shade·tint law (the shipped look), but ALBEDO is a per-fragment cross-fade from the raw
+# vertex colour to the baked base-map texture, weighted by camera distance: wt = smoothstep(TEX_D0=600,
+# TEX_D1=1800, cam_dist). At d < 600 wt = 0 ⇒ ALBEDO == COLOR.rgb·shade·tint EXACTLY (the shipped shell is
+# bit-preserved near); above 1800 the smooth satellite image wins. ONE opaque draw — a fragment albedo blend,
+# no transparency, no sorting. base_map is bound each session by set_facet_tex (null until then → black texels,
+# irrelevant since wt≈0 near where it would show). Phase 1 has NO close-up branch (closeup_map compiled out).
+const _SHELL_ABS_TEX_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.06;
+uniform float term_mu = 0.12;
+uniform sampler2DArray base_map : source_color, filter_linear_mipmap;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+varying vec3 v_col_raw;
+varying vec3 v_st;
+varying vec2 v_uv;
+varying float v_face;
+varying float v_cam;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = night_floor + (1.0 - night_floor) * _day(mu);
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col_raw = COLOR.rgb;
+	v_st = vec3(shade) * tint;
+	v_uv = UV;
+	v_face = UV2.x;
+	v_cam = distance(wp, CAMERA_POSITION_WORLD);
+}
+void fragment() {
+	vec4 tx = texture(base_map, vec3(v_uv, v_face));
+	// COVERAGE GATE + UN-PREMULTIPLY (§ live-fix 2): the base map is PREMULTIPLIED alpha, so recover the true
+	// (un-darkened) colour by dividing rgb by coverage — near a bake frontier this cancels the mip/bilinear
+	// average of an un-baked (rgb=0,a=0) neighbour so there is NO black bleed into the seam. tx.a is the bake
+	// coverage: multiply wt by it so an un-baked facet (a≈0) shows the shipped vertex-colour far ring (NEVER
+	// black from orbit) and the un-premultiply degenerate case falls back to v_col_raw (doubly safe). A baked
+	// facet (a=1) cross-fades to the satellite image on the shipped 600..1800 distance ramp. One opaque draw.
+	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
+	float wt = smoothstep(600.0, 1800.0, v_cam) * tx.a;
+	ALBEDO = mix(v_col_raw, col, wt) * v_st;
+}
+"
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
 	# Off → the shipped paths below verbatim (byte-identical; the shell is untouched).
 	if CubeSphere.FP_SHELL_ABSOLUTE:
 		var sh2 := Shader.new()
-		sh2.code = _SHELL_ABS_SHADER
+		# COSMOS LOD-TEXTURE Phase 1 (§1.3): pick the textured variant only when FP_FACET_TEX is on. Flag off ⇒
+		# the shipped _SHELL_ABS_SHADER string VERBATIM (byte-identical material). base_map is bound later by
+		# set_facet_tex (once the baker has built the array).
+		sh2.code = _SHELL_ABS_TEX_SHADER if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
@@ -1443,6 +1607,33 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
+
+## COSMOS LOD-TEXTURE Phase 1 (§1.3): bind the baker's 6-layer base map into the shell shader's `base_map`
+## uniform. No-op unless FP_FACET_TEX is on and the material is the textured shader ⇒ flag-off is byte-identical
+## (never wired; the shipped shader has no base_map sampler). Called once by WorldManager after the prewarm bake.
+func set_facet_tex(tex: Texture) -> void:
+	if not _tex_on() or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("base_map", tex)
+
+## COSMOS LOD-TEXTURE Phase 1 gate (G-FT-UV): facet `fid`'s tri-soup UVs (the emitted ARRAY_TEX_UV for that
+## facet, in _emit_cached order). Empty unless FP_FACET_TEX is on. Lets the gate assert per-facet UV mapping +
+## same-face neighbour continuity without dissecting the merged mesh.
+func gate_facet_uvs(fid: int) -> PackedVector2Array:
+	_ensure_tri_cached(fid)
+	return _tri_uv_cache.get(fid, PackedVector2Array())
+
+## COSMOS LOD-TEXTURE Phase 1 gate (G-FT-UV / G-FT-OFF): the committed ring surface's raw arrays (ARRAY_VERTEX,
+## ARRAY_COLOR, ARRAY_TEX_UV, ARRAY_TEX_UV2, …). Empty when nothing is built. Read-only.
+func mesh_arrays() -> Array:
+	if _mi == null or _mi.mesh == null:
+		return []
+	var mesh: ArrayMesh = _mi.mesh
+	if mesh.get_surface_count() == 0:
+		return []
+	return mesh.surface_get_arrays(0)
 
 ## Triangle count of the built ring mesh (gate).
 func triangle_count() -> int:

@@ -417,6 +417,20 @@ const FP_TIER_WARM_CONVERGE := false
 ## never grow. CDLOD morph / pitch-2..8 extension rings / tree impostors are LATER stages, not built here.
 const FP_SKIN_TIER := false
 
+## COSMOS LOD-TEXTURE Phase 1 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6 Phase 1) — per-facet baked "satellite" far
+## texture. A FacetTexBaker (RefCounted, owned by WorldManager, created only under FP_FACET_TEX && FACETED)
+## composites the real top-block catalog colours (VoxelGeneratorCosmos.sample_columns — the one-sampler law)
+## into a fine Image per facet, box-averages it down to BASE_TEXELS=16 per facet edge, and blits it into a
+## 6-layer 384² Texture2DArray (one page per cube face). The far ring gains ARRAY_TEX_UV = ((a+s)/K,(b+t)/K)
+## + ARRAY_TEX_UV2 = (face,-1) and its absolute shell shader mixes vertex-colour ↔ texture by a distance
+## smoothstep (wt: 0 below TEX_D0=600, 1 above TEX_D1=1800) so the shipped near look is bit-preserved and the
+## planet reads as a smooth albedo image from orbit. ONE opaque draw (a per-fragment albedo blend, no
+## transparency). Default OFF ⇒ the baker/textures/UV caches + UV mesh arrays are NEVER created and the far
+## ring mesh + material are bit-identical to shipped (FLAT 6042/0, verify_faceted unmoved). Requires FACETED.
+## NEVER-OOM: fixed-size pages (base-tier-only ≈ 8.2 MB ceiling, FacetTexBaker.total_bytes()). Flipped ON at
+## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
+const FP_FACET_TEX := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

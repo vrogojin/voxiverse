@@ -68,6 +68,7 @@ var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resyn
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
+var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -327,6 +328,19 @@ func _ready() -> void:
 			_skin.name = "FacetSkinTier"
 			add_child(_skin)
 			_skin.call("setup", afid)
+		# COSMOS LOD-TEXTURE Phase 1 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): the per-facet baked "satellite" far
+		# texture. Created ONLY under FP_FACET_TEX (a RefCounted, not a scene node — pure data owned here), so with
+		# the flag off nothing is instantiated and the far ring is byte-identical. Prewarm the currently-emitted
+		# facet set synchronously (masked by the same ShaderPrewarm hold as the ring's initial _rebuild_full), then
+		# bind the 6-layer base map into the ring's shell shader. NEVER-OOM: fixed pages (≈ 8.2 MB, total_bytes()).
+		# LOW #3: the textured far ring exists only under the (unshaded) absolute shell shader, so the baker is
+		# created only when BOTH flags are on — under FP_FACET_TEX alone the UV emission + tex shader are inert,
+		# so a baker/texture would just waste memory. Both are in the deploy set.
+		if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
+			_facet_tex = FacetTexBaker.new()
+			_facet_tex.setup(TerrainConfig.active_facet())
+			_facet_tex.prewarm(_facet_ring.visible_fids())
+			_facet_ring.set_facet_tex(_facet_tex.base_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"

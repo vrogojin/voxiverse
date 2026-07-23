@@ -18,11 +18,28 @@ signal aimed_voxel_changed(info: Dictionary)
 # on the editor class-cache (the FLM/FLB convention). Used as the type of `_frame` below.
 const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
 
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§10): preloaded kernels for the gated nav-frame
+# machine (same FLM/FLB convention — preload, not the global class-name). DEAD unless CubeSphere.SN_NAV_MODES.
+const _CosmosNavCls := preload("res://src/cosmos/cosmos_nav.gd")
+const _OrbitalStateCls := preload("res://src/cosmos/orbital_state.gd")
+const _DVCls := preload("res://src/cosmos/dvec3.gd")
+const _EphCls := preload("res://src/cosmos/cosmos_ephemeris.gd")
+const _FacetAtlasCls := preload("res://src/cosmos/facet_atlas.gd")
+# COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7): the dev-flight velocity-command controller (pure
+# static). DEAD unless CubeSphere.SN_DEVNAV drives it in-game; the trajectory MATH is headless-gated
+# (verify_dev_flight — G-SN-DEVFLIGHT). Same FLM/FLB preload convention.
+const _DevFlightCls := preload("res://src/cosmos/cosmos_dev_flight.gd")
+# COSMOS SPACE-NAV SN5b (§7.3): the dev-nav overlay set (compass + guides). Lazy-built on F, freed on toggle.
+const _DevNavOverlayCls := preload("res://src/player/dev_nav_overlay.gd")
+# COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §7): the pure inertial-attitude kernel. DEAD unless
+# CubeSphere.ORBIT_ATTITUDE (same FLM/FLB preload convention — the machine below never leaves SURFACE off-flag).
+const _CosmosAttitudeCls := preload("res://src/cosmos/cosmos_attitude.gd")
+
 @export var walk_speed := 5.5
 @export var run_speed := 9.5
 @export var fly_speed := 16.0
 @export var jump_velocity := 8.0
-@export var gravity := 22.0
+@export var gravity := 9.8
 @export var eye_height := 1.7
 @export var mouse_sensitivity := 0.0025
 @export var reach := 8.0
@@ -59,6 +76,117 @@ var frozen := false
 # all the maps are numeric no-ops → byte-identical to today. Phase 2 rotates the frame with zero call-site change.
 var _frame: _FrameAdapterCls
 
+# COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): the nav-frame machine. `_nav` is NULL unless
+# CubeSphere.SN_NAV_MODES ⇒ the whole feed is dead (flag-off byte-identical). The machine READS the player's
+# body-centred BCI state each physics tick (derived from the shipped lattice `position` via the SN1 frame
+# maps) and re-expresses the HUD velocity — it never writes pos/vel (the §5.4 theorem). `_nav_tele` is the
+# additive RemoteBridge telemetry dict (nav_mode/frame_v/|v_bci|), surfaced via nav_telemetry().
+# LIVE-ONLY-VALIDATED (honest, per SN1's precedent): the KERNEL + machine are headless-gated (verify_nav), but
+# this in-game BCI derivation is validated only in a live session — the flag ships false until then.
+var _nav: RefCounted = null
+var _nav_clock := 0.0                         # local nav time (s); reused main's ORBITAL_SKY clock is not required
+var _nav_prev_fix := PackedFloat64Array()     # previous body-fixed world position (finite-difference velocity)
+var _nav_have_prev := false
+var _nav_tele: Dictionary = {}
+var _nav_last_v_bci := PackedFloat64Array()   # last derived BCI velocity (seeds dev-flight for a seamless handoff)
+
+# G-REENTRY FIX A (2026-07-19 live de-orbit blowup) — the facet frame the lattice `position` is EXPRESSED in.
+# The crossing protocol is two-phase (world_manager.maybe_cross_facet commits TerrainConfig.set_active_facet,
+# THEN the caller applies the returned reframed pose via apply_reframe) with a long fallible pipeline between
+# the two (redesignate / pool / far ring / restream). Any abort in that pipeline — or any future rogue
+# set_active_facet — leaves the ACTIVE frame flipped while `position` still holds the OLD facet's lattice
+# numbers; reinterpreting them in the new facet's decorrelated frame (offsets up to ±32768) is a one-frame
+# teleport of |Δframe| blocks (11081 live at re-entry; the SN2 finite-difference then reads Δp/dt ≈ 642074 b/s
+# and the free-fall re-seed adopts it — the "escape" latch). _heal_frame_desync() makes frame/pose consistency
+# an INVARIANT: every physics frame starts by re-expressing the pose if the active facet changed without us.
+var _pos_fid := -1
+
+# COSMOS-ORBITAL-O1O4 O4c (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.5 / SPACE-NAV §8): the SOI dominant body — the
+# body whose local dynamics (spin frame, GM_dyn, feel-gravity, drag, terrain) the player reads. `_dominant_body()`
+# is THE single accessor and returns this; it is "earth" always with CubeSphere.SOI_SWAP off (byte-identical), and
+# under the flag is refreshed each physics tick from the active facet (surface/walk/land ⇒ FacetAtlas.body_name_of_fid)
+# or, while coasting, from the SOI test on the carried BCI position (CosmosNav.soi_dominant, with the swap
+# re-expression applied to `_coast_p/v_bci`). Every generalized "earth"→_dominant_body() site downstream reads it.
+var _dom_body := "earth"
+# Earth walk-feel baseline captured in _ready (after the M1 feel hook): gravity/jump the per-body feel scales from.
+# _apply_body_feel(body) sets gravity = base·(g_body/g_earth), jump = base·√(g_body/g_earth) — preserving JUMP
+# HEIGHT while HANG TIME scales ~1/√g (Moon ×2.5). Earth ⇒ ratio 1 ⇒ the shipped 9.8/8.0 (byte-neutral).
+var _feel_earth_g := 9.8
+var _feel_earth_jump := 8.0
+
+# COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7): dev-nav state. `_dev_nav` (F under SN_DEVNAV) turns
+# dev-nav ON (rides `flying` — noclip + the mode-appropriate controller). In PLANETARY the shipped lattice fly
+# path is used UNCHANGED (§7.2); in the orbital modes the velocity-command controller (CosmosDevFlight) owns the
+# BCI velocity `_dev_v_bci` and re-projects the kinematic BCI position back to the lattice `position` each tick.
+# All DEAD with SN_DEVNAV off (F stays the shipped bare fly toggle → byte-identical). LIVE-ONLY-VALIDATED: the
+# in-game feel + the BCI↔lattice re-projection at altitude are a morning-session check; the controller MATH is
+# headless-proven by G-SN-DEVFLIGHT.
+var _dev_nav := false
+var _dev_v_bci := PackedFloat64Array()         # the controller's BCI velocity state (kinematic; owned while orbital)
+var _dev_have_v := false                        # false until seeded on the first orbital tick (from _nav_last_v_bci)
+var _dev_active := false                         # true on ticks the orbital controller drove position (feeds _nav_tick)
+var _dev_p_bci := PackedFloat64Array()          # last BCI position (stashed for the O/G key handlers)
+var _dev_overlay: Control = null                # the SN5b overlay set (compass + guides); null unless dev-nav on
+# SN-FIX #3 (SN_NO_CEILING_BOUNCE): the explicit orbital-commit latch. Under the flag the auto mode→dev-flight
+# handoff is deferred (kinematic lattice fly is kept through the atmosphere→orbit band so a climb is not
+# decelerated at the ceiling); the orbital velocity-command controller engages only after the pilot EXPLICITLY
+# commits with the O "release-to-orbit" verb. Cleared on dev-nav toggle and whenever the mode is PLANETARY.
+# DEAD (always false) with the flag off ⇒ the shipped auto-handoff is byte-identical.
+var _dev_orbital_commit := false
+# SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-OFF free-fall state. When F is off ABOVE the atmosphere ceiling the
+# player free-falls in the planet-centred (inertial) BCI frame under GM_dyn/r² (no surface-rotation drag); the
+# BCI velocity is integrated here and seeded — on the flight→fall handoff — from the last SN2 finite-difference
+# BCI velocity so there is NO velocity jump. Below the ceiling the shipped surface-feel walk gravity takes over
+# (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
+var _fall_v_bci := PackedFloat64Array()
+var _fall_have_v := false
+# COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the carried BCI fall POSITION for the closed-form (RAILS)
+# free-fall coast. Like the orbit coast's `_coast_p_bci`, the closed-form path carries [p,v] in the BCI frame
+# across frames (advanced by ONE universal-variable step/frame) instead of reconstructing p from the f32 lattice
+# `position` each frame — so the per-frame integration is O(1) and touches no lattice state. Re-seeded (cleared)
+# on every fresh fall entry (below), so a new fall reconstructs it once from the current lattice pose. DEAD
+# (never read) with FP_FREEFALL_RAILS off — the shipped Verlet coast carries only `_fall_v_bci`.
+var _fall_p_bci := PackedFloat64Array()
+# G-LANDING FIX (SN_FOFF_RADIAL_FALL) — one-shot latch set by the EXPLICIT F flight-off toggle. The next
+# free-fall seed keeps only the RADIAL component of the flight velocity (quit-flying = commit to landing);
+# automatic regime transitions never set it, so their SN-R1 velocity continuity is untouched. DEAD (never
+# consumed) with the flag off.
+var _foff_radial := false
+# COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — the O free-coast state. `_orbit_coasting` is set by the O toggle in
+# LOW/HIGH orbit; while true, each physics frame integrates `_coast_v_bci` under GM_dyn/r² gravity (the shared
+# Kepler coast, seeded tangential by O) and re-projects to the lattice `position` — a stable circular seed holds
+# radius (the fix for "orbits then hangs"). The coast mirrors `_coast_v_bci` into `_dev_v_bci` each tick so the
+# nav machine reads the true orbital velocity AND an exit to the dev-flight controller is velocity-continuous
+# (SN-R1). DEAD (never set) with ORBIT_COAST off ⇒ the shipped O velocity-command path is byte-identical.
+var _orbit_coasting := false
+var _coast_v_bci := PackedFloat64Array()
+# SN-ODECAY FIX (G-ODECAY, verify_odecay.gd): the coast's BCI POSITION carried in f64 across ticks, MIRRORING
+# `_coast_v_bci`. The original coast reconstructed p from the body-FIXED f32 `position` each tick and re-projected
+# with the SAME t, rotating p by one tick of planet spin (ω·dt) relative to the un-rotated f64 velocity — this
+# desynchronised the (p,v) pair and PUMPED orbital eccentricity (periapsis drops each orbit until the surface
+# handoff arrests the player on the far side: the live "arcs to the opposite side and stops"). Carrying [p,v] in
+# f64 and writing `position` as a DISPLAY-ONLY projection removes the round-trip. Empty ⇒ unseeded (reconstruct once).
+var _coast_p_bci := PackedFloat64Array()
+# SN-ODECAY station-keeping cooldown (s): the O free-coast periodically adds a small PROGRADE Δv when the orbit
+# nears the atmosphere (CosmosDevFlight.station_keep_dv), so a decaying orbit re-lifts instead of spiralling in.
+# Counts down each coast tick; a correction fires + resets it. DEAD off ORBIT_COAST ⇒ byte-identical.
+var _coast_boost_cd := 0.0
+
+# COSMOS ORBIT-FRAME (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3) — the inertial-attitude state machine. ALL DEAD
+# (mode pinned ATT_SURFACE, camera never emancipated) unless CubeSphere.ORBIT_ATTITUDE AND _nav != null, so the
+# input/camera/window_camera_transform branches all fall through to the shipped surface FPS path (byte-identical).
+# SURFACE = shipped clamped-euler (rotation.y + _pitch). SPACE = the BCI quaternion _att_q (facet-decoupled,
+# 6DOF). RECOVER = the landing slerp back to a gravity-aligned surface pose (Phase C; Phase A hands back instantly).
+const ATT_SURFACE := 0
+const ATT_SPACE := 1
+const ATT_RECOVER := 2                          # (Phase C) the smooth landing-recovery blend state
+var _att_mode := ATT_SURFACE
+var _att_q := Quaternion.IDENTITY              # the camera basis in the BCI (inertial) frame (SPACE)
+var _att_recover_b_start := Basis()            # RECOVER (Phase C): the frozen SCENE basis at the leave-SPACE instant
+var _att_recover_yaw := 0.0                     # RECOVER: the target surface yaw (mouse-drivable during the blend)
+var _att_recover_pitch := 0.0                   # RECOVER: the target surface pitch (clamped ±1.5)
+var _att_recover_alpha := 0.0                   # RECOVER: the 0→1 blend parameter (ramps over ORBIT_T_REC)
+
 var _camera: Camera3D
 var _ray: RayCast3D
 var _capsule: CapsuleShape3D
@@ -66,6 +194,20 @@ var _body_shape: CollisionShape3D        # the player's capsule collider (disabl
 var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
+
+# COSMOS-PERF FALL-ALTRATE (FP_FALL_CAMFAR_HOLD): throttle state for the altitude-ramped camera near/far planes.
+# _camfar_prev_d/_usec derive the radial speed; _camfar_apply_msec throttles the re-apply to ≤ 1/FALL_THROTTLE_MS
+# during a fast descent. All −1 sentinels (no prior sample) ⇒ the first call always applies. DEAD off the flag.
+var _camfar_prev_d := -1.0
+var _camfar_prev_usec := -1
+var _camfar_apply_msec := -1
+
+# COSMOS-PERF FALL-TIMING (FP_FALL_TIMING) — per-frame CPU-segment timers, DIAGNOSTIC. `_ft` holds the window MAX
+# µs per segment key (t_move_us / t_coast_us / t_stream_us / t_nav_us / t_att_us / t_pushbodies_us / t_aim_us and,
+# pushed in from main._process / CosmosSky, t_scaledbody_us / t_farring_us / t_sky_us) plus n_coast_calls. Written
+# ONLY under the flag (the segment wrappers are gated), so off the dict stays empty ⇒ fall_timing() returns {} ⇒
+# byte-identical telemetry. Cleared each telemetry window (on read by fall_timing) ⇒ NEVER-OOM (bounded key set).
+var _ft := {}
 
 # ── REMOTE-DRIVE INTENT SEAM (docs/COSMOS-REMOTE-CONTROL-DESIGN.md §4.2) ─────────────────────────
 # The ONLY hook the RemoteControl executor drives the rover through: it injects INTENT at the exact
@@ -79,6 +221,10 @@ var remote_run := false                   # substitutes the KEY_SHIFT poll
 var remote_jump := false                  # one-shot latch, consumed by the grounded/fly jump branch (§4.6)
 var remote_yaw_rate := 0.0                # rad/s the executor is applying this tick (seam indicator; the
                                           # executor owns the exact rotate_y for seam-immune remaining-degrees)
+# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the ROLL seam. rad/s the executor is applying this tick,
+# OR'd into the KEY_Q/KEY_E poll in _attitude_tick's ATT_SPACE branch (the ONLY place roll is read). Zero in
+# normal play and while no roll step runs; the executor never exists off CONTROL_ENABLED, so byte-identical.
+var remote_roll_rate := 0.0
 var remote_exec: Node = null              # the RemoteControl executor; ticked from _physics_process (§4.3)
 
 func _ready() -> void:
@@ -97,6 +243,11 @@ func _ready() -> void:
 		var s := CubeSphere.SURFACE_GRAVITY / CubeSphere.SURFACE_GRAVITY   # g_body/9.81; Earth = 1.0
 		gravity *= s
 		jump_velocity *= sqrt(s)
+	# COSMOS-ORBITAL-O1O4 O4c: capture the Earth walk-feel baseline (post the M1 hook) so per-body feel scaling on
+	# a dominant-body swap (Moon ⇒ 1/6 g, floaty jumps) is exact and reversible. No behaviour change here — off
+	# SOI_SWAP _apply_body_feel is never called and these fields are never re-read.
+	_feel_earth_g = gravity
+	_feel_earth_jump = jump_velocity
 
 	# Build the camera rig in code to keep scenes minimal and robust.
 	_camera = Camera3D.new()
@@ -110,6 +261,17 @@ func _ready() -> void:
 	# must reach it; otherwise the shipped FarTerrain / near-only value.
 	if CubeSphere.FACETED:
 		_camera.far = FacetFarRing.CAMERA_FAR
+		# TIER-DEPTH P3 (§3.3): raise the near plane 0.05 → 0.25 (5× depth precision — precision scales linearly with
+		# near) so the per-tier depth bias holds past ~1 km. 0.25 is far inside the 0.4-radius capsule, so no near-clip.
+		# Flag off → near stays Godot's default 0.05 (byte-identical).
+		if CubeSphere.FP_TIER_DEPTH_BIAS:
+			_camera.near = TierPlace.CAMERA_NEAR
+		# SPACE-NAV SN3 (§5.4): the altitude-continuous frustum. At ground (h = 0) these are EXACTLY the shipped
+		# 0.05 / 9000 (byte-identical initial); the SN3 driver (main._process) ramps them per frame with altitude.
+		# Overrides the depth-bias 0.25 with the design's 0.05 near floor. DEAD unless FP_SCALED_BODY is on.
+		if CosmosScale.on():
+			_camera.near = CosmosScale.camera_near(0.0)
+			_camera.far = CosmosScale.camera_far(FacetAtlas.R_BLOCKS, FacetAtlas.R_BLOCKS)
 	else:
 		_camera.far = FarTerrain.FAR_CAMERA_FAR if FarTerrain.ENABLED else float(TerrainConfig.RENDER_RADIUS_BLOCKS) * 2.2
 	_camera.fov = 75.0
@@ -151,6 +313,10 @@ func _ready() -> void:
 
 	_capture_mouse()
 
+	# COSMOS SPACE-NAV SN2: build the nav-frame machine ONLY under the flag (else it stays null ⇒ dead).
+	if CubeSphere.SN_NAV_MODES:
+		_nav = _CosmosNavCls.NavState.new()
+
 ## Set the initial facing (yaw about Y) and camera pitch. Call after the player
 ## is in the tree (the camera is built in _ready).
 func set_initial_look(yaw: float, pitch: float) -> void:
@@ -173,8 +339,63 @@ func apply_reframe(new_pos: Vector3, yaw_delta: float) -> void:
 		position = new_pos
 	else:
 		global_position = new_pos
-	rotation.y = wrapf(rotation.y + yaw_delta, -PI, PI)
-	velocity = velocity.rotated(Vector3.UP, yaw_delta)
+	# G-REENTRY FIX A: `position` is now expressed in the CURRENT active facet's lattice — record it so
+	# _heal_frame_desync() can prove (and restore) frame/pose consistency every physics frame.
+	_pos_fid = TerrainConfig.active_facet()
+	# SN-FIX #2 (FP_CROSS_KEEP_HEADING): the position reframe above is what keeps position CONTINUOUS across the
+	# seam — it is untouched. The horizontal heading + velocity twist by `yaw_delta` (which re-aligns them to B's
+	# lattice frame) is factored into the pure `reframe_twist` so the gate drives both flag states. Flag off ⇒ the
+	# shipped twist (byte-identical); flag on ⇒ heading + velocity are preserved (the pilot's world heading stays,
+	# the ground's dihedral tilt is carried separately by the ActiveFrame/camera).
+	# COSMOS FS2-V2 (§5): pass the frame-aware flag + whether the fixed frame is active so KEEP_HEADING does not
+	# double-twist the world heading under the fixed frame (the shipped +yaw_delta twist already preserves it).
+	var tw := reframe_twist(rotation.y, velocity, yaw_delta, CubeSphere.FP_CROSS_KEEP_HEADING,
+		CubeSphere.FP_TWIST_FRAME_AWARE, _frame.enabled())
+	rotation.y = tw[0]
+	velocity = tw[1]
+
+## SN-FIX #2 (FP_CROSS_KEEP_HEADING) — the pure crossing heading/velocity twist decision, factored out for the
+## gate (no node state). `keep_heading` off ⇒ the shipped twist about UP by `yaw_delta`; on ⇒ heading + velocity
+## are returned UNCHANGED (world heading preserved across the crossing). Returns [new_yaw, new_velocity].
+static func reframe_twist(cur_yaw: float, cur_vel: Vector3, yaw_delta: float, keep_heading: bool,
+		frame_aware: bool = false, frame_fixed: bool = false) -> Array:
+	# COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5): FRAME-AWARE twist. Under the fixed frame the player's WORLD
+	# state is frame_basis(fid)·local_state, so preserving it across a crossing needs local_B = crossing_basis(A,B)·
+	# local_A. crossing_basis(A,B) = frame_basis(B)⁻¹·frame_basis(A); its horizontal (about-UP) action is a rotation
+	# by −yaw_delta (yaw_delta = atan2(ex.z, ex.x) of A's +X in B, and Basis(UP,θ)·x̂ has atan2(z,x) = −θ). So the
+	# WORLD-heading-and-velocity-preserving twist is −yaw_delta, NOT +yaw_delta (the shipped/legacy +yaw_delta
+	# DOUBLE-twists under the fixed frame: measured 2·|yaw_delta| heading error at a 58° seam — the live glitch).
+	# Verified empirically (verify_facet_seams G-CROSS-HEADING) against the real frame_basis: −yaw_delta ⇒ Δ≈0,
+	# +yaw_delta ⇒ Δ≈2·yaw_delta. Applies REGARDLESS of keep_heading (heading MUST track the velocity twist, else
+	# facing and motion decouple). Default off (frame_aware=false) ⇒ skipped, byte-identical to the shipped form.
+	if frame_aware and frame_fixed:
+		return [wrapf(cur_yaw - yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, -yaw_delta)]
+	if keep_heading:
+		return [cur_yaw, cur_vel]
+	return [wrapf(cur_yaw + yaw_delta, -PI, PI), cur_vel.rotated(Vector3.UP, yaw_delta)]
+
+## G-REENTRY FIX A (the live re-entry teleport) — frame/pose consistency as an INVARIANT, not a protocol hope.
+## If the active facet changed since `position` was last expressed (a crossing pipeline that aborted between
+## world_manager's set_active_facet and our apply_reframe, or any other actor flipping the active facet), the
+## lattice pose is STALE: reading it in the new facet's decorrelated frame is a |Δframe|-block teleport (the
+## live 11081-block atmosphere-entry jump; 25.7k in the headless reproduction). Heal it LOSSLESSLY by applying
+## the exact committed-crossing math (reframe_position64 + the crossing-basis yaw twist via apply_reframe) —
+## the same world point, heading and velocity re-expressed, so the heal itself is position/velocity-continuous
+## (SN-R1). One int compare per frame in the healthy case. Proven by G-REENTRY-CONTINUOUS (fid-desync gate).
+func _heal_frame_desync() -> void:
+	if not CubeSphere.FACETED:
+		return
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return                                              # no active frame to express in — keep the stamp we have
+	if _pos_fid < 0 or _pos_fid == fid:
+		_pos_fid = fid
+		return
+	var from := _pos_fid
+	var np: Array = _FacetAtlasCls.reframe_position64(from, fid, position.x, position.y, position.z)
+	var ex: Vector3 = _FacetAtlasCls.crossing_basis(from, fid) * Vector3(1.0, 0.0, 0.0)
+	apply_reframe(Vector3(np[0], np[1], np[2]), atan2(ex.z, ex.x))   # also re-stamps _pos_fid = fid
+	print("[Player] frame desync healed: pose re-expressed %d -> %d (aborted crossing pipeline?)" % [from, fid])
 
 func _capture_mouse() -> void:
 	# Web quirk (Godot #102209): after Esc the pointer won't re-lock unless we
@@ -192,21 +413,193 @@ func camera_global_transform() -> Transform3D:
 ## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state
 ## (yaw via global_transform, _pitch) NOT from _camera.global (which we override), so there is no feedback loop.
 func window_camera_transform() -> Transform3D:
+	# COSMOS ORBIT-FRAME (§3.3): in SPACE/RECOVER the displayed camera is the inertial 6DOF pose, not the euler
+	# reconstruction — this ONE seam is what makes dev-flight wishes, the SN5b compass, aim and the prewarm all
+	# consume the 6DOF attitude with no further edits (§5). Flag off / SURFACE ⇒ the shipped euler transform,
+	# byte-identical. The origin is the SAME eye-height offset in both branches (only the basis differs).
+	if CubeSphere.ORBIT_ATTITUDE and _att_mode != ATT_SURFACE:
+		return Transform3D(_attitude_scene_basis(), global_transform * Vector3(0, eye_height, 0))
 	var cam_local := Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
 	return global_transform * cam_local
+
+## COSMOS ORBIT-FRAME (§3.2/§3.5): the current DISPLAYED scene (render) basis. SPACE composes R_z(−θ)·Basis(q_bci);
+## RECOVER (Phase C) is the eased slerp toward the gravity-aligned surface pose in the CURRENT active facet frame —
+## b_active updates across a crossing while the frozen b_start stays scene-constant, so the blend re-references
+## automatically (§6.2). θ is read fresh from the f64 nav clock (no basis accumulation ⇒ no f32 drift).
+func _attitude_scene_basis() -> Basis:
+	var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
+	if _att_mode == ATT_SPACE:
+		return _CosmosAttitudeCls.scene_basis(_att_q, theta)
+	# RECOVER: express the frozen scene start in the current facet lattice, slerp to the surface target.
+	var b_active := _attitude_active_basis()
+	var b_lat_start_q := (b_active.transposed() * _att_recover_b_start).orthonormalized().get_rotation_quaternion()
+	return _CosmosAttitudeCls.recover_blend(b_active, b_lat_start_q, _att_recover_yaw, _att_recover_pitch, _att_recover_alpha)
+
+## The active facet's lattice basis in scene coords (b_active), or identity off-facet. Used by the attitude seam.
+func _attitude_active_basis() -> Basis:
+	var fid := TerrainConfig.active_facet()
+	return _FacetAtlasCls.frame_basis(fid) if fid >= 0 else Basis()
+
+## COSMOS ORBIT-FRAME (§3.2) — advance the SURFACE/SPACE/RECOVER machine one physics tick. The trigger is the
+## COMMITTED nav mode (PLANETARY ⇔ h < 384±32 with the 2-s dwell — reused so the attitude inherits exactly the
+## nav hysteresis and can never flap faster than the HUD). It writes ONLY the camera node's global transform in
+## SPACE/RECOVER and hands back the surface euler on landing — it NEVER touches position/velocity (the pilot's
+## position mechanics — hover drift, free-fall, dev-flight — compose untouched). Only reached under the flag.
+func _attitude_tick(delta: float) -> void:
+	var committed_planetary := int(_nav.mode) == _CosmosNavCls.PLANETARY
+	var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
+	match _att_mode:
+		ATT_SURFACE:
+			# Leave PLANETARY ⇒ go inertial. Seed q_bci from the CURRENT displayed (child-camera) basis so the
+			# view does not pop (C0), then emancipate the camera and write the space pose.
+			if not committed_planetary:
+				_att_q = _CosmosAttitudeCls.seed_bci(_camera.global_transform.basis, theta)
+				_att_mode = ATT_SPACE
+				_camera.top_level = true
+				_write_attitude_camera()
+		ATT_SPACE:
+			# Q/E roll (held keys — a continuous rate, so polled here not in _unhandled_input). SPACE-FLY: the
+			# executor's remote_roll_rate (rad/s) is OR'd in as a rate offset so a scripted `roll` step twists the
+			# BCI attitude through the SAME apply_roll a human's Q/E does. Zero in normal play (byte-identical).
+			var roll := 0.0
+			if Input.is_key_pressed(KEY_Q): roll += 1.0
+			if Input.is_key_pressed(KEY_E): roll -= 1.0
+			if remote_roll_rate != 0.0 and CubeSphere.ORBIT_ROLL_RATE > 0.0:
+				roll += remote_roll_rate / CubeSphere.ORBIT_ROLL_RATE   # express the rad/s seam in apply_roll's ±1 rate units
+			if roll != 0.0:
+				_att_q = _CosmosAttitudeCls.apply_roll(_att_q, roll, delta, CubeSphere.ORBIT_ROLL_RATE)
+			# Return to PLANETARY (or a fast fall reaching the ground inside the dwell) ⇒ recover the surface pose.
+			if committed_planetary or _attitude_ground_contact():
+				_attitude_leave_space(theta)
+			else:
+				_write_attitude_camera()
+		ATT_RECOVER:
+			# Phase C: re-leaving PLANETARY mid-recovery ⇒ re-seed q_bci from the DISPLAYED (blended) basis so the
+			# jump back to SPACE is continuous. Otherwise ramp α over ORBIT_T_REC and hand back at α ≥ 1.
+			if not committed_planetary:
+				_att_q = _CosmosAttitudeCls.seed_bci(_camera.global_transform.basis, theta)
+				_att_mode = ATT_SPACE
+				_write_attitude_camera()
+			else:
+				_att_recover_alpha += (delta / CubeSphere.ORBIT_T_REC) if CubeSphere.ORBIT_T_REC > 0.0 else 1.0
+				if _att_recover_alpha >= 1.0:
+					_attitude_handback(_att_recover_yaw, _att_recover_pitch)
+				else:
+					_write_attitude_camera()
+
+## Leave SPACE for the surface: derive the gravity-aligned surface (yaw*, pitch*) from the current displayed
+## basis. Under ORBIT_LAND_RECOVER (Phase C) begin a smooth slerp (the ATT_RECOVER state); else hand back
+## INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0, documented).
+func _attitude_leave_space(theta: float) -> void:
+	var b_scene := _CosmosAttitudeCls.scene_basis(_att_q, theta)
+	var tp := _CosmosAttitudeCls.recover_target(_attitude_active_basis(), b_scene)
+	if CubeSphere.ORBIT_LAND_RECOVER:
+		_att_recover_b_start = b_scene
+		_att_recover_yaw = tp.x
+		_att_recover_pitch = tp.y
+		_att_recover_alpha = 0.0
+		_att_mode = ATT_RECOVER
+		_write_attitude_camera()                            # α=0 shows the frozen basis exactly (continuity)
+	else:
+		_attitude_handback(tp.x, tp.y)
+
+## Hand the surface FPS parametrization back: write rotation.y/_pitch, un-emancipate the camera to its shipped
+## child pose, return to SURFACE. The child basis b_active·R_y(yaw)·R_x(pitch) equals the displayed basis at
+## α=1, so there is no jump at the hand-back frame (Phase C); Phase A drops any residual roll here.
+func _attitude_handback(yaw: float, pitch: float) -> void:
+	rotation.y = yaw
+	_pitch = clampf(pitch, -1.5, 1.5)
+	_camera.top_level = false
+	_camera.transform = Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
+	_att_mode = ATT_SURFACE
+
+## Write the emancipated camera's global transform to the current SPACE/RECOVER pose (the M5_REAL top_level
+## mechanism). The pose (basis + eye origin) is exactly window_camera_transform() in these modes, so aim + any
+## camera-derived wish stay consistent through the one seam.
+func _write_attitude_camera() -> void:
+	_camera.global_transform = window_camera_transform()
+
+## Ground-contact safety trigger (§3.2): while NOT flying, a fast free-fall can reach the surface inside the 2-s
+## nav dwell — recover before the player stands on terrain with a space attitude. Flying (dev-nav) never counts
+## (you recover when the nav mode commits PLANETARY, not while actively flying).
+func _attitude_ground_contact() -> bool:
+	if flying or world == null:
+		return false
+	# COSMOS-PERF FALL: floor_under() hits a slow path at high altitude (the near field is ALT_REGIME-frozen and
+	# not resident, so the analytic floor query regenerates) — measured ~86-175 ms/frame, the ENTIRE fall-fps
+	# collapse (t_att_us). Ground contact is physically impossible far above the tallest terrain, so skip the
+	# per-frame floor query until the player is within reach of the surface. The threshold sits far above any
+	# terrain+datum relief, so the recovery still fires with huge margin on the approach. Byte-identical off.
+	# A player-placed TOWER can rise ABOVE this gate (natural terrain maxes ~112 + trees, but a placed tower
+	# can reach ~352 > FALL_ATT_GATE_Y). Skipping the floor query then leaves the camera in a space attitude
+	# after landing ON the tower. Mirror FP_FLOOR_BOUNDED's `_placed_top` consult: raise the gate by the
+	# column's PLACED high-water so the recovery still fires within reach of a tall tower's top. With no
+	# placement the column's placed_top is a deep-negative sentinel ⇒ the RHS is hugely negative ⇒ the test
+	# collapses to `position.y > FALL_ATT_GATE_Y` (byte-identical to before on natural terrain).
+	if CubeSphere.FP_FALL_ATT_GATE and position.y > CubeSphere.FALL_ATT_GATE_Y \
+			and position.y > float(world.placed_top(int(floor(position.x)), int(floor(position.z)))) + CubeSphere.FALL_ATT_GATE_Y:
+		return false
+	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
 
 ## COSMOS R2.2: place the DISPLAYED camera at the given (epoch-frame) transform. Physics/aim stay window.
 func set_render_camera(t: Transform3D) -> void:
 	if _camera != null:
 		_camera.global_transform = t
 
+## SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.4): ramp the camera near/far with altitude so the
+## climb to orbit stays C0 (no frustum pop) and the far plane always reaches the horizon tangent. h = radial
+## altitude, d = |camera − body_centre| (blocks). At h = 0 / d = R these are the shipped 0.05 / 9000. Called
+## per frame by main._process under FP_SCALED_BODY only; DEAD (never called) with the flag off.
+func apply_scaled_camera_planes(h: float, d: float) -> void:
+	if _camera == null:
+		return
+	var new_far := CosmosScale.camera_far(d, FacetAtlas.R_BLOCKS)
+	# COSMOS-PERF FALL-ALTRATE (FP_FALL_CAMFAR_HOLD): off ⇒ the shipped every-frame write (byte-identical).
+	if not CubeSphere.FP_FALL_CAMFAR_HOLD:
+		_camera.near = CosmosScale.camera_near(h)
+		_camera.far = new_far
+		return
+	# Throttle the ramp during fast vertical motion: derive the radial speed from the last d sample, then hold the
+	# last-applied planes unless (a) motion is slow/steady (converge exactly), (b) FALL_THROTTLE_MS has elapsed, or
+	# (c) the far plane must GROW (a climb — never hold a far plane smaller than the ring needs, or it clips).
+	var now_usec := Time.get_ticks_usec()
+	var vspeed := 0.0
+	if _camfar_prev_usec >= 0:
+		vspeed = FallThrottle.radial_speed(_camfar_prev_d, d, float(now_usec - _camfar_prev_usec) / 1.0e6)
+	_camfar_prev_d = d
+	_camfar_prev_usec = now_usec
+	var now_msec := Time.get_ticks_msec()
+	var ms_since := (now_msec - _camfar_apply_msec) if _camfar_apply_msec >= 0 else 0x7fffffff
+	var must_grow := new_far > _camera.far + 1.0
+	if must_grow or FallThrottle.should_reapply(true, vspeed, ms_since):
+		_camera.near = CosmosScale.camera_near(h)
+		_camera.far = new_far
+		_camfar_apply_msec = now_msec
+
+## COSMOS-ORBITAL-SHELL H-B telemetry: the LIVE camera far plane (blocks). At orbit distance d the far ring's limb
+## sits at √(d²−R²) from the camera; if far < that the limb-ward part of the visible disc is CLIPPED (the far side
+## reads blank even though the shell emitted it). Read-only; the remote bridge streams it alongside the shell state.
+func camera_far() -> float:
+	return _camera.far if _camera != null else 0.0
+
 func _unhandled_input(event: InputEvent) -> void:
 	if frozen:
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		rotate_y(-event.relative.x * mouse_sensitivity)
-		_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
-		_camera.rotation.x = _pitch
+		# COSMOS ORBIT-FRAME (§3.4): in SPACE the mouse composes CAMERA-LOCAL quaternion increments (yaw + UNLIMITED
+		# pitch) on the BCI attitude; in RECOVER it drives the surface recovery target (clamped). Flag off / SURFACE
+		# ⇒ the shipped clamped-euler handler BYTE-IDENTICALLY (the machine never leaves SURFACE with the flag off).
+		if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
+			_att_q = _CosmosAttitudeCls.apply_look(_att_q, event.relative.x, event.relative.y, mouse_sensitivity)
+		elif CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_RECOVER:
+			# Phase C: during the landing blend the mouse drives the surface recovery TARGET (clamped) so the pilot
+			# never loses look control; the slerp target moves continuously, the displayed basis stays C0.
+			_att_recover_yaw = wrapf(_att_recover_yaw - event.relative.x * mouse_sensitivity, -PI, PI)
+			_att_recover_pitch = clampf(_att_recover_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
+		else:
+			rotate_y(-event.relative.x * mouse_sensitivity)
+			_pitch = clampf(_pitch - event.relative.y * mouse_sensitivity, -1.5, 1.5)
+			_camera.rotation.x = _pitch
 	elif event is InputEventMouseButton and event.pressed:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			_capture_mouse()
@@ -233,27 +626,51 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_ESCAPE:
 				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 			KEY_F:
-				flying = not flying
-				velocity = Vector3.ZERO
-				# Fly is a GUARANTEED escape hatch: while airborne the capsule is
-				# disabled so no loose body can collide with (and therefore shove or
-				# wedge) the player. Re-enabled on landing. See _move_horizontal.
-				if _body_shape != null:
-					_body_shape.disabled = flying
+				# COSMOS SPACE-NAV SN5 (§7.1): under SN_DEVNAV, F toggles DEV-NAV (the mode-appropriate flight
+				# controller + overlays) instead of the bare fly toggle. Flag OFF ⇒ the ELSE branch is the shipped
+				# fly toggle BYTE-IDENTICALLY (nothing about dev-nav is touched). See _toggle_dev_nav.
+				if CubeSphere.SN_DEVNAV:
+					_toggle_dev_nav()
+				else:
+					flying = not flying
+					velocity = Vector3.ZERO
+					if not flying:
+						_foff_radial = true                  # G-LANDING: explicit flight-off = land-commit latch
+					# Fly is a GUARANTEED escape hatch: while airborne the capsule is
+					# disabled so no loose body can collide with (and therefore shove or
+					# wedge) the player. Re-enabled on landing. See _move_horizontal.
+					if _body_shape != null:
+						_body_shape.disabled = flying
+			KEY_O, KEY_G, KEY_R:
+				# COSMOS SPACE-NAV SN5b (§7.4): the dev-nav toggles. Live ONLY while dev-nav is engaged (F);
+				# otherwise inert (they carry no shipped binding). Flag off / not dev-nav ⇒ no-op.
+				if CubeSphere.SN_DEVNAV and _dev_nav and _nav != null:
+					_dev_toggle_key(event.keycode)
 
 func _physics_process(delta: float) -> void:
 	if frozen or world == null:
 		return
+	# G-REENTRY FIX A: restore frame/pose consistency FIRST, before any consumer (movers, floor, nav)
+	# reads `position` — a half-committed crossing from LAST frame must never be interpreted this frame.
+	_heal_frame_desync()
 	# REMOTE-DRIVE (§4.3): snapshot the pre-locomotion LATTICE position so the executor measures pure
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
 	var _pre_move_pos := position
+	# FP_FALL_TIMING: time the whole _move (the free-fall coast lives inside it — split out as t_coast_us). Off ⇒
+	# the flag test is the only added work (no timer call, no key). See fall_timing().
+	var _ft_on := CubeSphere.FP_FALL_TIMING
+	var _ft_t := 0
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_move(delta)
+	if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
 	var _tick_move_delta := position - _pre_move_pos
 	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
 	# when the frame is off / at identity). update_streaming feeds the collider/pool/streamer, all lattice consumers.
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	world.update_streaming(position)
+	if _ft_on: _ft_max("t_stream_us", Time.get_ticks_usec() - _ft_t)
 	# COSMOS M2 (§3.2): re-anchor the floating origin when we walk far from it. The returned shift
 	# is an EXACT integer translation the world already applied to its render nodes; subtracting it
 	# here keeps the player's WORLD position continuous (no teleport). Vector3.ZERO in FLAT_WORLD, so
@@ -279,7 +696,9 @@ func _physics_process(delta: float) -> void:
 			apply_reframe(cross["new_pos"], cross["yaw_delta"])
 			# REMOTE-DRIVE (§4.4): forward the seam's yaw twist so the executor rotates its along-heading
 			# accumulator vector identically — distance walked stays continuous across the crossing.
-			_reframe_yaw = float(cross["yaw_delta"])
+			# SN-FIX #2: under FP_CROSS_KEEP_HEADING the heading is NOT twisted (see apply_reframe), so the
+			# executor's along-heading accumulator must NOT rotate either — forward a zero twist to stay consistent.
+			_reframe_yaw = 0.0 if CubeSphere.FP_CROSS_KEEP_HEADING else float(cross["yaw_delta"])
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §5): the corner anomaly seal. If the player entered the R_b
 	# cylinder about a cube vertex (or, defensively, a double-out column), relocate/eject them via the bisector
 	# teleport / seam glue — position, velocity and heading-relative yaw. Flag- and chart-gated no-op otherwise;
@@ -290,13 +709,730 @@ func _physics_process(delta: float) -> void:
 			global_position = reloc["pos"]
 			velocity = reloc["vel"]
 			rotation.y += float(reloc["yaw_delta"])
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_push_bodies(delta)
+	if _ft_on: _ft_max("t_pushbodies_us", Time.get_ticks_usec() - _ft_t)
+	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_update_aim()
+	if _ft_on: _ft_max("t_aim_us", Time.get_ticks_usec() - _ft_t)
 	# REMOTE-DRIVE (§4.3): tick the executor AFTER the origin/frame corrections (so the crossing yaw_delta
 	# is known) but with the PRE-correction locomotion delta captured at the top. No-op in normal play
 	# (remote_exec is null — the executor only exists under a live control grant, flag-gated OFF today).
 	if remote_exec != null and is_instance_valid(remote_exec) and remote_exec.has_method("physics_tick"):
 		remote_exec.call("physics_tick", delta, _tick_move_delta, _reframe_yaw)
+	# COSMOS-ORBITAL-O1O4 O4c: resolve the dominant gravitational body (SOI/facet-driven) BEFORE the nav tick so
+	# every "earth"→_dominant_body() consumer this frame reads one consistent value. No-op (not even called) off
+	# SOI_SWAP ⇒ _dom_body stays "earth" and the whole feed is byte-identical.
+	if CubeSphere.SOI_SWAP:
+		_refresh_dominant_body()
+	# COSMOS SPACE-NAV SN2: advance the nav-frame machine (gated — `_nav` is null with the flag off, so this
+	# is a single null-check per tick and nothing else). It only READS the derived BCI state (§5.4 theorem).
+	if _nav != null:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_nav_tick(delta)
+		if _ft_on: _ft_max("t_nav_us", Time.get_ticks_usec() - _ft_t)
+	# COSMOS ORBIT-FRAME (§3.2): advance the inertial-attitude machine AFTER the nav tick, so it reads the
+	# freshest COMMITTED nav mode + the just-advanced clock. DEAD unless the flag AND the nav machine are live —
+	# off-flag the machine never leaves SURFACE, the camera node is never emancipated, so this is byte-identical.
+	if CubeSphere.ORBIT_ATTITUDE and _nav != null:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_attitude_tick(delta)
+		if _ft_on: _ft_max("t_att_us", Time.get_ticks_usec() - _ft_t)
+
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5): advance the nav-frame machine from the
+## player's shipped LATTICE `position`. Derives the body-centred BCI [pos,vel] via the SN1 frame maps (world
+## coords are body-FIXED — the planet is pinned — so p_bci = R_z(θ)·p_fix; velocity is a finite difference of
+## the body-fixed world position mapped through fixed→bci), classifies with the 2-s dwell, and stores the
+## HUD/telemetry re-expression. Reads only; never writes pos/vel. Earth-only (the Moon is SN6). No-op off the
+## faceted planet (the nav machine's frame is the cosmos planet). LIVE-ONLY-VALIDATED — see the field comment.
+func _nav_tick(delta: float) -> void:
+	if not CubeSphere.FACETED:
+		return
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return
+	# G-SN-NOSPIRAL: clamp the per-frame dt fed to the nav path so a post-hitch huge frame (a 16-s recovery
+	# frame was seen live) can never feed a runaway dt into the clock advance, the finite difference, or any
+	# integration downstream. 1/30 s ⇒ a normal 60-fps tick (dt = 1/60) is UNCHANGED (byte-neutral common case).
+	# G-REENTRY FIX D (dwell starvation — the corroborated "stuck low_orbit at 160k"): the NavState dwell is
+	# UX time ("the raw mode held 2 s") and must accumulate REAL elapsed seconds, not the clamped integrator
+	# dt. Under multi-second frames the clamped dt (≤ 1/30 per frame) starves the dwell — ~10 frames in 147 s
+	# accrued 0.3 s live, so the raw DEEP_SPACE reclassification never committed. Pass the real frame delta,
+	# capped at NAV_DWELL_DT_MAX so one absurd hitch frame cannot single-handedly commit a transient flap.
+	# A normal 60-fps frame (raw == 1/60 < 1/30) passes both identically — byte-neutral common case.
+	var dwell_dt := minf(delta, _CosmosNavCls.NAV_DWELL_DT_MAX) if delta > 0.0 else 0.0
+	delta = _CosmosNavCls.clamp_nav_dt(delta)
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])                 # body-fixed (planet-pinned) world position, f64
+	_nav_clock += delta * _EphCls.TIME_WARP
+	var v_fix := _DVCls.v(0.0, 0.0, 0.0)
+	if _nav_have_prev and delta > 0.0:
+		# Bounded reciprocal (fd_inv_dt = 1/max(delta, MIN_FD_DT)) so a near-zero delta cannot blow up v_fix.
+		v_fix = _DVCls.scale(_DVCls.sub(p_fix, _nav_prev_fix), _CosmosNavCls.fd_inv_dt(delta))
+	# COSMOS-ORBITAL-O1O4 O4c: the dominant body drives the spin frame + GM_dyn for the BCI derivation, the nav
+	# machine, and the telemetry. _dominant_body() == "earth" off SOI_SWAP ⇒ byte-identical; on the Moon (active
+	# facet a Moon fid) it is "moon" ⇒ the whole nav readout is expressed in the Moon's frame with no other change.
+	var body := _dominant_body()
+	var bci: Array = _OrbitalStateCls.fixed_to_bci(body, _nav_clock, p_fix, v_fix)
+	var p_bci: PackedFloat64Array = bci[0]
+	# COSMOS SPACE-NAV SN5: when the dev-flight controller drove position THIS frame it OWNS the velocity —
+	# use its BCI velocity instead of the finite difference (which would just re-derive it, less precisely).
+	# Off dev-flight (SN2-only, or PLANETARY) this is exactly the shipped bci[1] finite-difference path.
+	var v_bci: PackedFloat64Array = _dev_v_bci if (_dev_active and _dev_have_v) else bci[1]
+	# G-REENTRY FIX B: the finite difference is Δp/dt of whatever position DID — including a discontinuity
+	# (crossing abort, injected teleport). Sanitize before ANY consumer (nav machine, telemetry, the
+	# _nav_last_v_bci seed the free-fall/dev-flight re-seed from): garbage falls back to the last-good
+	# velocity (velocity-continuous), so a position jump can never become adopted motion (the 642074 latch).
+	v_bci = _CosmosNavCls.sane_v(v_bci, _nav_last_v_bci)
+	_nav.tick(body, p_bci, v_bci, _nav_clock, dwell_dt)     # FIX D: dwell advances by REAL (capped) frame time
+	_nav_prev_fix = p_fix
+	_nav_have_prev = true
+	_nav_last_v_bci = v_bci                                  # seed for the next orbital dev-flight handoff (SN5)
+	_dev_p_bci = p_bci                                       # stash for the O/G key handlers (SN5b)
+	_nav_tele = _CosmosNavCls.telemetry(_nav, body, p_bci, v_bci, _nav_clock)
+	# SN5b: refresh the compass strip from the camera forward re-expressed in BCI (spin axis = BCI +Z).
+	if _dev_overlay != null and _dev_overlay.is_built():
+		var rmag := _DVCls.length(p_bci)
+		if rmag > 0.0:
+			var rhat := _DVCls.scale(p_bci, 1.0 / rmag)
+			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
+			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
+			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
+
+## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
+## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
+func nav_telemetry() -> Dictionary:
+	return _nav_tele
+
+## SN-FIX #1 (SN_HUD_NAV): the current nav-mode NAME for the HUD — the SAME string the RemoteBridge nav_mode
+## telemetry uses. "—" when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` is null). Pure read.
+func nav_mode_name() -> String:
+	if _nav == null:
+		return "—"
+	return _CosmosNavCls.NAV_NAMES[int(_nav.mode)]
+
+## SN-FIX #1 (SN_HUD_NAV): the player's radial altitude in blocks for the HUD. On the faceted planet it is
+## |world(lattice)| − R_BLOCKS (the same h the nav machine classifies on); off the faceted planet (FLAT) it is
+## the lattice y (height above the ground plane). Pure read; no state.
+func radial_altitude() -> float:
+	if CubeSphere.FACETED:
+		var fid := TerrainConfig.active_facet()
+		if fid >= 0:
+			var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+			return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - _FacetAtlasCls.R_BLOCKS
+	return position.y
+
+## CLIMATE W3 (cloudfix): the camera position in the ACTIVE FACET's LATTICE frame (local coords) — the frame
+## the weather grid indexes by (PerVoxelEnvironment._dir_of_pos folds the lattice column via FacetAtlas.cell_dir).
+## The player rides the ActiveFrame so its LOCAL transform IS the lattice pose; the camera sits eye_height up the
+## local +Y. WeatherFX samples precip/humidity/convection here while placing the FX geometry in scene space.
+func camera_lattice_origin() -> Vector3:
+	return Vector3(position.x, position.y + eye_height, position.z)
+
+## SN-FIX #1b (SN_HUD_NAV, 2026-07-18 live-pilot request): the player's current speed in blocks/s for the HUD.
+## Prefers the nav machine's body-centred-inertial |v_bci| (`_nav_tele`, the same value the RemoteBridge streams),
+## and falls back to the CharacterBody3D lattice speed when the nav machine is off (SN_NAV_MODES false ⇒ empty
+## `_nav_tele`). Pure read; no state.
+func nav_speed_bci() -> float:
+	# G-LANDING HUD FIX (2026-07-20 live pilot: a LANDED player read "spd 14.5" forever — the ω×r spin carrier,
+	# because raw |v_bci| never reads 0 on a rotating planet). Prefer the MODE-appropriate frame speed the nav
+	# machine already computes (`frame_v` = CosmosNav.hud_velocity): PLANETARY ⇒ surface (body-fixed) speed —
+	# carrier-subtracted, 0 when standing; LOW/HIGH ⇒ |v_bci| exactly as before; DEEP ⇒ heliocentric. Falls back
+	# to |v_bci| then the lattice speed when the machine is off. HUD-only (the RemoteBridge telemetry keeps BOTH
+	# frame_v and v_bci fields unchanged).
+	if _nav_tele.has("frame_v"):
+		return float(_nav_tele["frame_v"])
+	if _nav_tele.has("v_bci"):
+		return float(_nav_tele["v_bci"])
+	return velocity.length()
+
+## SN-FIX #1b (SN_HUD_NAV): the LOCAL circular-orbit speed reference v_circ = √(GM_dyn/r) at the player's current
+## radius r = R_BLOCKS + radial_altitude() — so the pilot can read how close their speed is to a stable orbit
+## (≈260 b/s at the surface). Reads GM_dyn (SPACE-NAV §3, the local-dynamics scale — NOT the sky's GM_game) for the
+## home body. Pure math; 0 at/below the centre. Cheap (one sqrt).
+func orbit_v_circ() -> float:
+	var r := _FacetAtlasCls.R_BLOCKS + radial_altitude()
+	if r <= 0.0:
+		return 0.0
+	return sqrt(CosmosGravity.gm_dyn(_dominant_body()) / r)
+
+## COSMOS-ORBITAL-O1O4 O4c (§3.5 / SPACE-NAV §8) — THE dominant-body accessor. Returns the body whose local
+## dynamics (spin frame via CosmosEphemeris, GM_dyn/gravity via CosmosGravity, drag/re-entry via OrbitalState,
+## and the terrain the player walks) every generalized call site reads. With CubeSphere.SOI_SWAP OFF it returns
+## "earth" UNCONDITIONALLY — so all the "earth"→_dominant_body() plumbing below is BYTE-IDENTICAL to the shipped
+## literals (the G-O4C-OFF keystone). Under the flag it returns `_dom_body`, refreshed each tick by
+## _refresh_dominant_body() (active-facet body on the surface; SOI-tested during a coast). Cheap (a field read).
+func _dominant_body() -> String:
+	return _dom_body if CubeSphere.SOI_SWAP else "earth"
+
+## COSMOS-ORBITAL-O1O4 O4c — update `_dom_body` for THIS tick (called before _nav_tick under SOI_SWAP). Two
+## sources, by regime:
+##   • COASTING (a real orbit, `_orbit_coast_move` owns the carried BCI position): the coast performs the SOI
+##     test + swap re-expression itself (it must re-express `_coast_p/v_bci`), so this is a NO-OP for it.
+##   • SURFACE / WALK / LAND (on an active facet): the facet's body IS the dominant body — a Moon fid ⇒ "moon".
+##     A change (Earth↔Moon) re-applies the per-body walk feel (gravity/jump). This is what makes standing/
+##     walking/landing on the Moon read Moon gravity + Moon terrain with no other call-site change.
+## No-op off SOI_SWAP (never called). Pure bookkeeping — never touches pos/vel.
+func _refresh_dominant_body() -> void:
+	if _orbit_coasting and _coast_p_bci.size() == 3:
+		return                                              # the coast owns the swap (see _orbit_coast_move)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return
+	var fb := _FacetAtlasCls.body_name_of_fid(fid)
+	if fb != _dom_body:
+		_dom_body = fb
+		_apply_body_feel(fb)
+
+## COSMOS-ORBITAL-O1O4 O4c / SPACE-NAV §8.4 — apply `body`'s walking feel gravity. gravity = the shipped Earth
+## baseline scaled by the real surface-gravity ratio (CosmosGravity.feel_g); jump_velocity scaled by its √ so
+## JUMP HEIGHT (h = v²/2g) is preserved while HANG TIME lengthens ~1/√g — the Moon's ×2.5 float out of the box.
+## Earth ⇒ ratio 1 ⇒ exactly the _ready values (a no-op, so an Earth→Earth "change" never perturbs feel). The
+## analytic floor/wall/ceiling queries need NO change: "down" is −Y in the lattice on every body (§3.3 theorem).
+func _apply_body_feel(body: String) -> void:
+	var g_earth := CosmosGravity.feel_g("earth")
+	if g_earth <= 0.0:
+		return
+	var ratio := CosmosGravity.feel_g(body) / g_earth
+	gravity = _feel_earth_g * ratio
+	jump_velocity = _feel_earth_jump * sqrt(ratio)
+
+## COSMOS SPACE-NAV SN5 (§7.1): F toggled dev-nav. Dev-nav rides `flying` (noclip): entering disables the
+## capsule (the shipped fly escape-hatch semantics), leaving re-enables it. The controller's velocity seed is
+## dropped so the first orbital tick re-seeds from the live SN2 velocity. Only reachable under SN_DEVNAV.
+func _toggle_dev_nav() -> void:
+	_dev_nav = not _dev_nav
+	flying = _dev_nav
+	velocity = Vector3.ZERO
+	if not _dev_nav:
+		_foff_radial = true                                  # G-LANDING: explicit flight-off = land-commit latch
+	_dev_have_v = false
+	_dev_active = false
+	_dev_orbital_commit = false                              # SN-FIX #3: entering/leaving dev-nav is never mid-orbit
+	_orbit_coasting = false                                  # ORBIT_COAST (§7.4): toggling dev-nav ends any free-coast
+	_coast_p_bci = PackedFloat64Array()                      # SN-ODECAY: drop the carried BCI pos (re-entry re-seeds)
+	if _body_shape != null:
+		_body_shape.disabled = flying
+	# SN5b (§7.3): lazily build the overlay set on entry, free it on exit (NEVER-OOM — nothing retained off).
+	if _dev_nav:
+		if _dev_overlay == null:
+			_dev_overlay = _DevNavOverlayCls.new()
+			add_child(_dev_overlay)
+			_dev_overlay.build(self, _FacetAtlasCls.R_BLOCKS)
+	elif _dev_overlay != null:
+		_dev_overlay.free_overlays()
+		_dev_overlay.queue_free()
+		_dev_overlay = null
+
+## True iff dev-nav is engaged (F under SN_DEVNAV). Read by the overlays (SN5b) and the HUD.
+func dev_nav_active() -> bool:
+	return _dev_nav
+
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the ORBITAL dev-flight handoff decision, factored out so the gate drives
+## it directly (pure, no state). Returns true iff the velocity-command controller should own this fly tick.
+## Flag OFF: exactly the shipped test — any orbital mode hands off (byte-identical). Flag ON: an orbital mode
+## hands off ONLY once the pilot has explicitly committed (O verb) — so climbing through the atmosphere ceiling
+## keeps the shipped kinematic lattice fly (climb velocity preserved, no ramp/deceleration = no bounce).
+static func orbital_handoff(mode: int, orbital_commit: bool, no_ceiling_bounce: bool) -> bool:
+	if mode == _CosmosNavCls.PLANETARY:
+		return false
+	if no_ceiling_bounce:
+		return orbital_commit
+	return true
+
+## SN-FIX (2026-07-18 live-pilot FIX-B, SN_NO_CEILING_BOUNCE) — the LATTICE-frame hover drift for the kinematic
+## fly (the "detach from the planet spin" fix). Lifts the lattice pose to the body-fixed world (lattice_to_world64),
+## asks the nav kernel for the body-fixed hover drift (0 in PLANETARY; −ω⃗×p_fix in LOW_ORBIT+ — CosmosNav.
+## hover_drift_fixed), then rotates that world velocity back into the lattice frame (frame_basis is orthonormal ⇒
+## inverse == transpose, the same rotation world_to_lattice64 applies to positions). Result: a LATTICE velocity
+## that, added each tick, makes a zero-input hover hold the nav-frame rest — surface-following in the atmosphere,
+## inertial (surface spins beneath) in orbit. Pure + fid-parameterised so the gate drives it with no live scene.
+## Off-facet (fid < 0) ⇒ zero (no body-fixed reference — the caller is already in its off-facet fallback anyway).
+static func hover_drift_lattice(fid: int, mode: int, pos: Vector3) -> Vector3:
+	if fid < 0:
+		return Vector3.ZERO
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	# O4c: this is a STATIC (gate-driven) helper, so the body comes from the facet, not the instance accessor —
+	# the facet's body IS the dominant body when hovering over it. Gated so off SOI_SWAP it is exactly "earth"
+	# (a Moon fid only exists under MULTI_BODY, which SOI_SWAP requires) — byte-identical to the shipped literal.
+	var body := _FacetAtlasCls.body_name_of_fid(fid) if CubeSphere.SOI_SWAP else "earth"
+	var drift_fix := _CosmosNavCls.hover_drift_fixed(mode, body, _DVCls.v(w[0], w[1], w[2]))
+	return _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(drift_fix[0], drift_fix[1], drift_fix[2])
+
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-MODE kinematic fly: gravity-off, full 6-DOF in the FULL look
+## direction (camera basis incl. pitch), constant speed at ALL altitudes. Forward (input.z=−1) maps to the
+## camera look (−cam.z, pitched); Space/Ctrl add the camera up axis. The camera basis is in the lattice/window
+## orientation, so the resulting direction is a LATTICE direction (position is lattice). No velocity state that
+## gravity could act on ⇒ crossing the atmosphere ceiling never decelerates the climb.
+func _kinematic_look_fly(delta: float, input: Vector3, running: bool) -> void:
+	var speed := fly_speed * (2.0 if running else 1.0)
+	var vy := 0.0
+	if remote_drive:
+		vy = input.y
+	else:
+		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
+		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+	# COSMOS ORBIT-FRAME Phase B (§5(a)): in SPACE (or the RECOVER blend) fly the FULL inertial camera basis
+	# re-expressed in the active facet lattice, with Space/Ctrl on CAMERA-local ±Y (microgravity has no world
+	# vertical). The nav-frame carrier drift composes UNCHANGED (a zero-input hover still holds the BCI rest).
+	# Flag off / SURFACE ⇒ the shipped body-yaw+pitch construction below, byte-identical.
+	if CubeSphere.ORBIT_6DOF_FLY and _att_mode != ATT_SURFACE:
+		var afid := TerrainConfig.active_facet()
+		if afid >= 0:
+			var b_lat_cam := _CosmosAttitudeCls.lat_cam_basis(_FacetAtlasCls.frame_basis(afid), _attitude_scene_basis())
+			var dir6 := b_lat_cam * Vector3(input.x, vy, input.z)   # forward = look, strafe = camera X, vy = camera Y
+			if dir6.length() > 0.0:
+				dir6 = dir6.normalized()
+			var carrier6 := hover_drift_lattice(afid, int(_nav.mode), position) if _nav != null else Vector3.ZERO
+			position += (dir6 * speed + carrier6) * delta
+			_horiz_vel = Vector3(dir6.x, 0.0, dir6.z) * speed
+			velocity = Vector3.ZERO
+			return
+	# FP-FIXED-FRAME: `position` is a LATTICE pose, so the fly direction MUST be a LATTICE direction. The player
+	# body's `transform.basis` is the local (lattice) YAW basis; the camera PITCH (_pitch about local X) adds the
+	# look-up/down component → forward flies where you look. Space/Ctrl (vy) are straight LATTICE up/down.
+	# (The prior code used window_camera_transform() = GLOBAL basis on a lattice position, so the facet's world
+	# tilt scrambled the axes — Space went sideways/underground. transform.basis keeps it all in-frame.)
+	var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(input.x, 0.0, input.z)   # strafe + forward(incl pitch)
+	var dir := transform.basis * look_local + Vector3(0.0, vy, 0.0)
+	if dir.length() > 0.0:
+		dir = dir.normalized()
+	# SN-FIX (2026-07-18 live-pilot FIX-B): the nav-frame carrier drift about the CURRENT hover point, integrated
+	# ON TOP of the look-fly input velocity. In PLANETARY it is zero (the lattice hover already tracks the spinning
+	# surface — fly over the ground, unchanged). In LOW_ORBIT+ it is −ω⃗×p in the lattice, so a zero-input hover
+	# holds a BCI-inertial point and the body-fixed surface rotates beneath at the spin rate — the pilot "observes
+	# from a steady point how the planet is spinning". A velocity (no position jump), so crossing the LOW_ORBIT
+	# boundary (nav hysteresis at 384) is a seamless frame detach, not a teleport. `_nav != null` always holds here.
+	var carrier := hover_drift_lattice(TerrainConfig.active_facet(), int(_nav.mode), position) if _nav != null else Vector3.ZERO
+	position += (dir * speed + carrier) * delta
+	_horiz_vel = Vector3(dir.x, 0.0, dir.z) * speed
+	velocity = Vector3.ZERO
+
+## SN-FIX #3 (SN_NO_CEILING_BOUNCE) — the F-OFF gravity regime, factored for the gate. Free-fall (planet-centred
+## GM_dyn/r² frame) applies iff the flag is on, we are NOT flying, and the radial altitude is at/above the
+## atmosphere ceiling. Below the ceiling ⇒ false ⇒ the shipped surface-feel walk gravity/frame. Pure.
+static func free_fall_regime(is_flying: bool, alt: float, no_ceiling_bounce: bool) -> bool:
+	return no_ceiling_bounce and not is_flying and alt >= CubeSphere.ATMO_TOP
+
+## SN-FIX #3 — the flight→fall velocity seed (continuity): the free-fall starts from the last SN2 finite-difference
+## BCI velocity so there is NO jump at F-off. A missing/short vector rests (zero). Pure.
+## G-REENTRY FIX B (belt+suspenders on top of the _nav_tick sanitizer): a garbage seed (NaN or beyond
+## CosmosNav.FD_SPEED_MAX — the finite-difference of a position teleport) rests instead of being adopted,
+## so the free-fall can never launch the player on a discontinuity artifact (the live 642074 escape latch).
+static func fall_seed(last_v_bci: PackedFloat64Array) -> PackedFloat64Array:
+	if last_v_bci.size() == 3 and _CosmosNavCls.v_is_sane(last_v_bci):
+		return PackedFloat64Array([last_v_bci[0], last_v_bci[1], last_v_bci[2]])
+	return PackedFloat64Array([0.0, 0.0, 0.0])
+
+## G-LANDING (SN_FOFF_RADIAL_FALL) — the RADIAL projection of a fall seed: v_radial = (v·r̂)·r̂ with r̂ = p/|p|
+## (BCI). Applied ONLY when the pilot EXPLICITLY toggles flight off (the `_foff_radial` latch): quitting flight
+## commits to a fall toward the planet centre — the tangential/orbital component is dropped so the descent
+## lands instead of coasting sideways for minutes ("gravity not properly reinstantiated" live report). Both
+## radial signs are preserved (an upward component still decelerates under gravity — no impulse toward the
+## planet is injected, only the sideways coast is removed). Degenerate p ⇒ the seed unchanged. Pure static.
+static func fall_seed_radial(seed: PackedFloat64Array, p_bci: PackedFloat64Array) -> PackedFloat64Array:
+	if seed.size() != 3 or p_bci.size() != 3:
+		return seed
+	var r := _DVCls.length(p_bci)
+	if r <= 0.0:
+		return seed
+	var rhat := _DVCls.scale(p_bci, 1.0 / r)
+	return _DVCls.scale(rhat, _DVCls.dot(seed, rhat))
+
+## SN-FIX #3 — one free-fall tick: integrate the planet-centred point-mass gravity (GM_dyn/r², velocity-Verlet
+## via OrbitalState) in the BCI frame and re-project to the lattice `position`. Seeded on entry from the last
+## flight velocity (continuous). NO surface-rotation drag (BCI is inertial). Off-facet ⇒ a straight-down lattice
+## fallback so the player is never stranded. LIVE-ONLY: the feel of the fall; the gravity math is G-SN-FALLGRAV.
+func _free_fall_move(delta: float) -> void:
+	# COSMOS-PERF FALL-COLLAPSE FIX B (FP_COAST_FULL_DT): cover the FULL real frame delta with N uniform substeps of
+	# ≤ MAX_NAV_DT each (anti time-dilation) instead of clamping-and-dropping. Off ⇒ N=1 substep of clamp_nav_dt(delta)
+	# — byte-identical to the shipped G-SN-NOSPIRAL clamp-and-drop. The one-time seed below runs ONCE, not per substep.
+	var _fd_full := CubeSphere.FP_COAST_FULL_DT
+	var _fd_n := _CosmosNavCls.coast_substep_count(delta) if _fd_full else 1
+	var _fd_h := _CosmosNavCls.coast_substep_dt(delta) if _fd_full else _CosmosNavCls.clamp_nav_dt(delta)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		# Off-facet safety: fall straight down in the lattice (never strand the player above a retired facet). Do
+		# NOT set _fall_have_v here — leaving it false keeps _fall_v_bci unseeded so a later on-facet tick seeds it
+		# cleanly (from _nav_last_v_bci) instead of feeding an empty array to OrbitalState.make.
+		for _si in _fd_n:
+			velocity.y -= gravity * _fd_h
+			position.y += velocity.y * _fd_h
+		return
+	if not _fall_have_v:
+		_fall_v_bci = fall_seed(_nav_last_v_bci)             # seamless seed from the flight velocity
+		# G-LANDING (SN_FOFF_RADIAL_FALL): the pilot EXPLICITLY quit flight (F latch) ⇒ commit to landing —
+		# keep only the radial component so the fall goes DOWN, not into a sideways coast. Automatic regime
+		# entries never set the latch ⇒ their seed stays fully continuous (SN-R1). Flag off ⇒ latch unread.
+		if CubeSphere.SN_FOFF_RADIAL_FALL and _foff_radial:
+			var wsd: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+			var psd: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock,
+				_DVCls.v(wsd[0], wsd[1], wsd[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+			_fall_v_bci = fall_seed_radial(_fall_v_bci, psd)
+		_foff_radial = false
+		_fall_have_v = true
+		# FP_FREEFALL_RAILS: clear the carried BCI fall position so the closed-form coast re-seeds it ONCE from the
+		# current lattice pose on this fresh fall entry (the carried [p,v] must not leak across separate falls). Only
+		# touched under the flag ⇒ the shipped Verlet path (which never reads _fall_p_bci) is byte-identical.
+		if CubeSphere.FP_FREEFALL_RAILS:
+			_fall_p_bci = PackedFloat64Array()
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS): the CLOSED-FORM (RAILS) free-fall coast — carry the BCI [p,v]
+	# and advance it by ONE universal-variable two-body step over the whole real frame delta (O(1)/frame, ZERO Verlet
+	# substeps, no time-dilation, exact). This is THE fall-collapse fix (the Verlet substep loops below are the spiral).
+	# Off ⇒ the shipped FP_COAST_BATCH / per-substep Verlet chain verbatim (byte-identical). Takes precedence when on.
+	# FP_FALL_TIMING: time the coast integrator (t_coast_us) + count the substeps (n_coast_calls — a runaway inner
+	# loop would show here). t_move_us − t_coast_us = the rest of _move. Off ⇒ the flag test only (byte-identical).
+	var _ft_on := CubeSphere.FP_FALL_TIMING
+	var _ft_t := 0
+	if _ft_on: _ft_t = Time.get_ticks_usec()
+	var _n_coast := 0
+	if CubeSphere.FP_FREEFALL_RAILS:
+		_coast_freefall_rails(delta, _dominant_body())
+		_n_coast = 1
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE lattice↔BCI re-projection + N cheap
+	# BCI steps (vs N per-substep re-projections + N allocations — the live ~150 ms/frame fall collapse). Off ⇒ the
+	# shipped per-substep chain verbatim (byte-identical). N=1 (FP_COAST_FULL_DT off) makes both paths identical.
+	elif CubeSphere.FP_COAST_BATCH:
+		_fall_v_bci = _coast_batch(_fd_h, _fd_n, _fall_v_bci, _dominant_body())
+		_n_coast = _fd_n
+	else:
+		for _si in _fd_n:
+			_fall_v_bci = _coast_step(_fd_h, _fall_v_bci, _dominant_body())   # shared Kepler coast under the dominant body (O4c: Moon-aware)
+		_n_coast = _fd_n
+	if _ft_on:
+		_ft_max("t_coast_us", Time.get_ticks_usec() - _ft_t)
+		_ft_max("n_coast_calls", _n_coast)
+	velocity = Vector3.ZERO                                  # velocity.y is re-seeded on the surface handoff
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) + SN-FIX #3 (free-fall) — the SHARED Kepler coast integrator. ONE tick of
+## planet-centred point-mass gravity (GM_dyn/r² via OrbitalState velocity-Verlet, substep-capped) in the BCI frame
+## from the seed velocity `v_bci`, re-projecting the new BCI position back to the lattice `position`, and RETURNING
+## the new BCI velocity. Pure free coast (no thrust/drag). PRECONDITION: on an active facet (fid >= 0 — the caller
+## handles the off-facet fallback). This is the ONE code path both the free-fall (seeded straight-down) and the O
+## orbit (seeded tangential) share — gravity alone decides straight fall vs stable orbit vs ellipse/escape.
+func _coast_step(delta: float, v_bci: PackedFloat64Array, body: String) -> PackedFloat64Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
+	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
+	# G-REENTRY FIX C: never adopt a broken/unbounded integration — NaN reverts to the pre-step state and a
+	# radius beyond the body's SOI clamps onto it (outward radial velocity stripped). The player can then
+	# never ride this path to garbage altitudes where per-frame work explodes (the live 27 s frames at 35·R).
+	var safe := _CosmosNavCls.clamp_bci_state(os.pos, os.vel, p_bci, v_bci, _CosmosNavCls.soi_radius(body))
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, safe[0], safe[1])[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	return safe[1]
+
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH) — the BATCHED free-fall coast: the whole substep batch behind ONE
+## lattice↔BCI re-projection. Structurally the N-substep `_coast_step` loop with the lattice_to_world64/fixed_to_bci
+## pulled out ABOVE the loop and bci_to_fixed/world_to_lattice64 pulled out BELOW it, so the N cheap BCI Verlet steps
+## (CosmosNav.coast_batch_bci — reuses ONE OrbitalState, clamps per step) run with NO lattice work and ONE allocation
+## regardless of N. Numerically equal to the per-substep chain within the f32 `position` round-trip the batch removes
+## (strictly more accurate). ONE lattice_to_world64 + ONE world_to_lattice64 + ONE OrbitalState.make per call — the
+## perf invariant the gate G-COAST-BATCH asserts by mirroring this exact structure and counting the conversions/makes.
+func _coast_batch(delta: float, n: int, v_bci: PackedFloat64Array, body: String) -> PackedFloat64Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)   # ONE lattice→world
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]   # ONE world→BCI
+	var out := _CosmosNavCls.coast_batch_bci(body, p_bci, v_bci, delta, n, _CosmosNavCls.soi_radius(body))   # N cheap BCI steps, ONE make
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, out[0], out[1])[0]   # ONE BCI→world
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])   # ONE world→lattice
+	position = Vector3(lat[0], lat[1], lat[2])
+	return out[1]
+
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the CLOSED-FORM (RAILS) free-fall coast. Carries the BCI
+## fall [p,v] in f64 across frames (like the orbit coast's `_coast_p_bci`/`_coast_v_bci`) and advances it by ONE
+## universal-variable two-body step over the WHOLE real frame delta (CosmosNav.coast_kepler_bci → propagate_uv):
+## O(1) per frame — NO OUTER coast-substep loop, NO INNER Verlet substeps (those dt-scaled loops are the ~5 fps
+## fall-collapse spiral), no time-dilation, and exact for the two-body problem. The universal-variable form is
+## robust on the RADIAL (h≈0) fall a classical Kepler-element propagation is singular on. Structurally the orbit
+## coast's `_coast_batch_kepler`, but with the closed-form step in place of the N-Verlet batch: ZERO
+## lattice_to_world64 in steady state (carries [p,v]; seeds `_fall_p_bci` from the lattice ONCE per fall) + ONE
+## world_to_lattice64 for the display/stream/collision `position` + ONE propagate_uv, regardless of frame dt.
+## Precondition: on an active facet (fid >= 0 — the caller handles the off-facet fallback). Gate G-FREEFALL-RAILS.
+func _coast_freefall_rails(delta: float, body: String) -> void:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	# Seed the carried BCI fall position ONCE from the current lattice pose (cleared on each fresh fall entry). This
+	# is the ONLY lattice_to_world64 the closed-form fall does, and only on the first frame of a fall.
+	if _fall_p_bci.size() != 3:
+		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+		_fall_p_bci = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	# ONE closed-form universal-variable step over the whole (catch-up-capped) real delta — O(1), no substeps. The
+	# clamp_bci_state NaN/SOI guard (once per frame — identical safety to the Verlet coast) is folded into coast_kepler_bci.
+	var out := _CosmosNavCls.coast_kepler_bci(body, _fall_p_bci, _fall_v_bci, delta, _CosmosNavCls.soi_radius(body))
+	_fall_p_bci = out[0]
+	_fall_v_bci = out[1]
+	# ONE BCI→lattice re-projection for rendering / streaming / collision (display only — never read back).
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, _fall_p_bci, _fall_v_bci)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — one physics tick of the O free-coast: integrate the shared Kepler coast
+## from `_coast_v_bci` (seeded tangential by the O toggle) and write the lattice `position`. A stable circular seed
+## HOLDS radius; an off-circular seed evolves into an ellipse / decay / escape. The coast mirrors its BCI velocity
+## into `_dev_v_bci` (and marks `_dev_active`) so the nav machine classifies on the true orbital velocity and any
+## later exit to the dev-flight controller is velocity-continuous. Off-facet ⇒ hold (never strand). LIVE-ONLY: the
+## feel of orbiting; the orbit math (holds radius / ellipse / escape) is G-OCOAST.
+func _orbit_coast_move(delta: float) -> void:
+	# COSMOS-PERF FALL-COLLAPSE FIX B (FP_COAST_FULL_DT): integrate the FULL real frame delta in N ≤ MAX_NAV_DT substeps
+	# (anti time-dilation). Off ⇒ N=1 substep of clamp_nav_dt(delta) — byte-identical to the shipped clamp-and-drop.
+	# The SOI-swap test + station-keeping bookkeeping below run ONCE per frame (over the final carried state); the
+	# station-keeping cooldown decrements by the REAL integrated span (`_fd_h * _fd_n`, == clamp_nav_dt(delta) off).
+	var _fd_full := CubeSphere.FP_COAST_FULL_DT
+	var _fd_n := _CosmosNavCls.coast_substep_count(delta) if _fd_full else 1
+	var _fd_h := _CosmosNavCls.coast_substep_dt(delta) if _fd_full else _CosmosNavCls.clamp_nav_dt(delta)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		velocity = Vector3.ZERO
+		return
+	# SN-ODECAY FIX: integrate the CARRIED f64 BCI [p,v] (no per-tick f32 position read-back — the eccentricity
+	# pump). Defensive seed: if `_coast_p_bci` is unseeded (the O handler seeds it from `_dev_p_bci`), reconstruct
+	# it ONCE from the current lattice `position` (the pre-fix first-tick value).
+	if _coast_p_bci.size() != 3:
+		var w0: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+		_coast_p_bci = _OrbitalStateCls.fixed_to_bci(_dominant_body(), _nav_clock, _DVCls.v(w0[0], w0[1], w0[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	# COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH): batch the N substeps into ONE re-projection + N cheap BCI steps
+	# (vs N per-substep re-projections + N allocations). The carried [p,v] path is BIT-identical batched (never reads
+	# `position` back). Off ⇒ the shipped per-substep loop verbatim (byte-identical); N=1 makes both paths identical.
+	if CubeSphere.FP_COAST_BATCH:
+		var out := _coast_batch_kepler(_fd_h, _fd_n, _coast_p_bci, _coast_v_bci, _dominant_body())
+		_coast_p_bci = out[0]
+		_coast_v_bci = out[1]
+	else:
+		for _si in _fd_n:
+			var out := _coast_step_kepler(_fd_h, _coast_p_bci, _coast_v_bci, _dominant_body())
+			_coast_p_bci = out[0]
+			_coast_v_bci = out[1]
+	# COSMOS-ORBITAL-O1O4 O4c (§3.5) — the SOI dominant-body SWAP. After the integration tick, test whether the
+	# carried BCI point (in the current body's frame) has crossed a sphere-of-influence boundary; if the deepest
+	# SOI now belongs to a different body, RE-EXPRESS the carried [p,v] into that body's BCI frame (an exact,
+	# physics-preserving translation through the heliocentric frame — OrbitalState.reexpress_soi) and adopt it.
+	# ±SOI_HYST guards against boundary flapping. Physics is untouched (the player's real motion is identical);
+	# only the origin the next tick integrates from — and the walk/land feel — change. No-op off SOI_SWAP.
+	# LIVE-ONLY residue: the lattice `position` re-projection + landing-facet migration across the 384 k-block
+	# transfer is a real fly, not headless-provable — the swap STATE math here is what G-SOI-SWAP proves.
+	if CubeSphere.SOI_SWAP:
+		var newb := _CosmosNavCls.soi_dominant(_dom_body, _coast_p_bci, _nav_clock, CubeSphere.SOI_HYST)
+		if newb != _dom_body:
+			var re := _OrbitalStateCls.reexpress_soi(_dom_body, newb, _nav_clock, _coast_p_bci, _coast_v_bci)
+			_coast_p_bci = re[0]
+			_coast_v_bci = re[1]
+			_dom_body = newb
+			_apply_body_feel(newb)
+	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere, periodically add a small prograde
+	# Δv so it re-lifts instead of decaying in. Self-limiting (caps at circular speed) ⇒ never boosts to escape.
+	# FIX B: decrement by the REAL integrated span this frame (== clamp_nav_dt(delta) with the flag off — byte-identical).
+	_coast_boost_cd -= _fd_h * float(_fd_n)
+	if _coast_boost_cd <= 0.0:
+		var dv := _DevFlightCls.station_keep_dv(_dominant_body(), _coast_p_bci, _coast_v_bci)
+		if _DVCls.length(dv) > 0.0:
+			_coast_v_bci = _DVCls.add(_coast_v_bci, dv)
+			_coast_boost_cd = _DevFlightCls.STATION_KEEP_COOLDOWN
+	_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+	_dev_have_v = true                                       # SN-R1: the dev-flight seed mirrors the coast velocity
+	_horiz_vel = Vector3.ZERO
+	velocity = Vector3.ZERO
+	_dev_active = true                                       # tells _nav_tick the coast owns the BCI velocity this frame
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — SN-ODECAY FIX. The Kepler coast step that carries the BCI [p,v] pair in
+## f64 ACROSS ticks and writes the lattice `position` as a DISPLAY-ONLY projection (never read back). Distinct from
+## the shared `_coast_step` (which reconstructs p from `position` every tick — correct for the short, near-radial
+## free-fall, but for a long tangential orbit the SAME-t fixed↔BCI round-trip rotates p by one tick of planet spin
+## relative to the f64 velocity and pumps eccentricity). Pure central free coast (no thrust/drag). Precondition:
+## on an active facet (fid >= 0 — the caller guards). Returns [p_bci_new, v_bci_new]. Proven by G-ODECAY.
+func _coast_step_kepler(delta: float, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array, body: String) -> Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var os = _OrbitalStateCls.make(body, p_bci, v_bci)
+	os.step(delta, _DVCls.v(0.0, 0.0, 0.0))                 # pure free coast (no thrust/drag)
+	# G-REENTRY FIX C: same integration guard as _coast_step — NaN reverts, beyond-SOI clamps (see there).
+	var safe := _CosmosNavCls.clamp_bci_state(os.pos, os.vel, p_bci, v_bci, _CosmosNavCls.soi_radius(body))
+	# DISPLAY-ONLY: project the new BCI position back to the lattice for rendering/streaming/collision. This value
+	# is NEVER read back into the integrator (that read-back was the pump) — the carried BCI pair is the truth.
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, safe[0], safe[1])[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	return [safe[0], safe[1]]
+
+## COSMOS-PERF FALL-COLLAPSE FIX (FP_COAST_BATCH) — the BATCHED orbit coast: the whole substep batch carried in the
+## BCI frame with ONE display-only lattice write. Because `_coast_step_kepler` carries [p,v] and NEVER reads
+## `position` back (the display projection is thrown away and overwritten), the per-substep loop's only per-tick
+## outputs are the carried [p,v] and the display `position` — so batching is BIT-identical: N cheap BCI Verlet steps
+## (CosmosNav.coast_batch_bci, ONE OrbitalState) then ONE bci_to_fixed + world_to_lattice64 for the final display
+## position. ZERO lattice_to_world64 (the orbit never reconstructs from `position`) + ONE world_to_lattice64 + ONE
+## OrbitalState.make per call, regardless of N. Returns [p_bci', v_bci']. Gate G-COAST-BATCH.
+func _coast_batch_kepler(delta: float, n: int, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array, body: String) -> Array:
+	var fid := TerrainConfig.active_facet()
+	var t := _nav_clock
+	var out := _CosmosNavCls.coast_batch_bci(body, p_bci, v_bci, delta, n, _CosmosNavCls.soi_radius(body))   # N cheap BCI steps, ONE make
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, out[0], out[1])[0]   # ONE BCI→world (display only)
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])   # ONE world→lattice (display only)
+	position = Vector3(lat[0], lat[1], lat[2])
+	return out
+
+## COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — is there a thrust/movement input this tick (the coast-exit trigger)? WASD
+## (input.x/z) or the vertical verb (Space/Ctrl, or the remote `input.y`). Pure read of the already-polled input.
+func _coast_thrust_input(input: Vector3) -> bool:
+	if input.x != 0.0 or input.z != 0.0:
+		return true
+	if remote_drive:
+		return absf(input.y) > 0.0
+	return Input.is_key_pressed(KEY_SPACE) or Input.is_key_pressed(KEY_CTRL)
+
+## SN-FIX #3 — the free-fall → surface handoff: the LATTICE vertical velocity (velocity.y) equivalent of the
+## current BCI fall velocity, so the surface-feel gravity continues from the true downward speed (continuous at
+## the ceiling). Uses the SN1 frame maps; near the facet centre the lattice normal is the radial, so this is the
+## fall's descent rate. Returns the current velocity.y unchanged if no fall velocity / off-facet.
+func _fall_exit_vy() -> float:
+	var fid := TerrainConfig.active_facet()
+	if fid < 0 or _fall_v_bci.size() != 3:
+		return velocity.y
+	var t := _nav_clock
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var body := _dominant_body()
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, _DVCls.v(w[0], w[1], w[2]), _DVCls.v(0.0, 0.0, 0.0))[0]
+	var vf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, p_bci, _fall_v_bci)[1]
+	var v_lat := _FacetAtlasCls.frame_basis(fid).transposed() * Vector3(vf[0], vf[1], vf[2])
+	return v_lat.y
+
+## COSMOS SPACE-NAV SN5 (§7.2): the ORBITAL-mode dev-flight step. Reads the current lattice `position`, lifts it
+## to the BCI frame, runs the velocity-command controller (CosmosDevFlight — the SN-R1-seamless kernel proven by
+## G-SN-DEVFLIGHT), and re-projects the new kinematic BCI position back to the lattice `position`. The controller
+## OWNS `_dev_v_bci` while orbital (seeded from the last SN2 velocity on entry ⇒ seamless from the PLANETARY
+## lattice fly). LIVE-ONLY-VALIDATED: the BCI↔lattice re-projection is only meaningful while the player is
+## roughly over the active facet (a morning-session check); the controller math itself is headless-proven.
+func _dev_flight_move(delta: float, input: Vector3, running: bool) -> void:
+	# G-SN-NOSPIRAL: clamp the dt so a post-hitch huge frame cannot fling the kinematic BCI position by
+	# v·dt with a runaway dt (nor feed one to the controller). Byte-neutral for a normal 60-fps tick.
+	delta = _CosmosNavCls.clamp_nav_dt(delta)
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		# Off-facet safety: fall back to the shipped lattice fly for this tick (never strand the player).
+		var vy0 := 0.0
+		if not remote_drive:
+			if Input.is_key_pressed(KEY_SPACE): vy0 += 1.0
+			if Input.is_key_pressed(KEY_CTRL): vy0 -= 1.0
+		var wish0 := (transform.basis * Vector3(input.x, 0, input.z))
+		wish0.y = 0.0
+		if wish0.length() > 0.0:
+			wish0 = wish0.normalized()
+		position += (wish0 + Vector3(0, vy0, 0)) * fly_speed * (2.0 if running else 1.0) * delta
+		velocity = Vector3.ZERO
+		return
+	var t := _nav_clock
+	# lattice → body-fixed world → BCI position (the SN1 frame maps; body coords are planet-pinned).
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var p_fix := _DVCls.v(w[0], w[1], w[2])
+	var body := _dominant_body()                            # O4c: dev-flight expresses over the dominant body
+	var p_bci: PackedFloat64Array = _OrbitalStateCls.fixed_to_bci(body, t, p_fix, _DVCls.v(0.0, 0.0, 0.0))[0]
+	var mode := int(_nav.mode)
+	# Seed the controller's velocity on the first orbital tick from the last SN2-derived BCI velocity (seamless
+	# handoff from the PLANETARY lattice fly); if none is available yet, rest in the current frame (carrier).
+	if not _dev_have_v:
+		if _nav_last_v_bci.size() == 3:
+			_dev_v_bci = PackedFloat64Array([_nav_last_v_bci[0], _nav_last_v_bci[1], _nav_last_v_bci[2]])
+		else:
+			_dev_v_bci = _CosmosNavCls.carrier_velocity(mode, body, p_bci, _DVCls.v(0.0, 0.0, 0.0), t)
+		_dev_have_v = true
+	# Camera basis (window/lattice orientation) → BCI axis columns for the fully camera-relative wish.
+	var cb := window_camera_transform().basis
+	var cam_x := _dev_dir_to_bci(fid, t, cb.x)
+	var cam_y := _dev_dir_to_bci(fid, t, cb.y)
+	var cam_z := _dev_dir_to_bci(fid, t, cb.z)
+	# Vertical (Space/Ctrl) — camera-relative up/down, matching the shipped fly verbs.
+	var vy := 0.0
+	if remote_drive:
+		vy = input.y
+	else:
+		if Input.is_key_pressed(KEY_SPACE): vy += 1.0
+		if Input.is_key_pressed(KEY_CTRL): vy -= 1.0
+	var wish_bci := _DevFlightCls.wish_dir(cam_x, cam_y, cam_z, Vector3(input.x, vy, input.z))
+	var cap := _DevFlightCls.speed_cap(mode, body, p_bci, t, running)
+	var out: Array = _DevFlightCls.step(mode, body, p_bci, _dev_v_bci, t, delta, wish_bci, cap)
+	var p_new: PackedFloat64Array = out[0]
+	_dev_v_bci = out[1]
+	# BCI → body-fixed → lattice, and write it back as the player's canonical position.
+	var pf_new: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(body, t, p_new, _dev_v_bci)[0]
+	var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf_new[0], pf_new[1], pf_new[2])
+	position = Vector3(lat[0], lat[1], lat[2])
+	_horiz_vel = Vector3.ZERO
+	velocity = Vector3.ZERO
+	_dev_active = true                                       # tells _nav_tick the controller owns velocity this frame
+
+## COSMOS SPACE-NAV SN5: map a LATTICE direction to a BCI direction — frame_basis(fid) lifts it to the body-fixed
+## world frame, then the SN1 fixed→bci position map (R_z(θ)) rotates it into the inertial frame. Pure rotation
+## (no ω⃗×p term for a direction): the position component of fixed_to_bci is exactly R_z(θ)·d.
+func _dev_dir_to_bci(fid: int, t: float, d_lat: Vector3) -> PackedFloat64Array:
+	var wd := _FacetAtlasCls.frame_basis(fid) * d_lat
+	return _OrbitalStateCls.fixed_to_bci(_dominant_body(), t, _DVCls.v(wd.x, wd.y, wd.z), _DVCls.v(0.0, 0.0, 0.0))[0]
+
+## COSMOS SPACE-NAV SN5b (§7.4): the O/G/R dev-nav toggles. Pure re-uses of the gated kernel math
+## (CosmosDevFlight.release_circular / geostationary_snap, CosmosNav.toggle_r_latch). O and G are explicit
+## user commands (allowed dev verbs), applied to the controller's BCI state; R flips the classifier's detach
+## latch. LIVE-ONLY: the resulting FEEL + the G teleport re-projection at altitude (morning). Only reached
+## under SN_DEVNAV while dev-nav is engaged (the key handler guards it).
+func _dev_toggle_key(keycode: int) -> void:
+	if _dev_p_bci.size() != 3:
+		return                                              # no BCI state yet (nav machine hasn't ticked)
+	var mode := int(_nav.mode)
+	var t := _nav_clock
+	var fid := TerrainConfig.active_facet()
+	match keycode:
+		KEY_R:
+			_nav.toggle_r_latch()                           # §7.4 R: latch DEEP_SPACE expression from HIGH_ORBIT
+		KEY_O:
+			# O — circular-orbit release (LOW/HIGH). Under ORBIT_COAST (§7.4) O engages a REAL Keplerian free-coast
+			# (gravity-integrated each frame — a stable orbit HOLDS, fixing "orbits then hangs"); O again leaves it.
+			# Flag off ⇒ the shipped velocity-command release (which decays to rest with no ongoing input — the bug).
+			if mode == _CosmosNavCls.LOW_ORBIT or mode == _CosmosNavCls.HIGH_ORBIT:
+				if CubeSphere.ORBIT_COAST:
+					var body := _dominant_body()
+					if _orbit_coasting:
+						# O again → leave the coast. Seed the dev-flight velocity-command from the CURRENT coast
+						# velocity (SN-R1 — no jump) and commit so the controller owns flight from here.
+						_orbit_coasting = false
+						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+						_dev_have_v = true
+						_dev_orbital_commit = true
+						_coast_p_bci = PackedFloat64Array()     # SN-ODECAY: drop the carried BCI pos so a re-entry re-seeds
+					else:
+						# O → enter the free-coast. Seed v = v_circ·t̂ with t̂ = the YAW-heading tangent (the BODY
+						# basis forward, PITCH IGNORED — pitch never tilts the orbit plane). Gravity does the rest.
+						var look_yaw := _dev_dir_to_bci(fid, t, _DevFlightCls.coast_seed_look_lattice(transform.basis)) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+						_coast_v_bci = _DevFlightCls.release_circular(body, _dev_p_bci, look_yaw, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+						# SN-ODECAY FIX: seed the carried f64 BCI position from `_dev_p_bci` — the EXACT point
+						# release_circular made the velocity circular for, so the integrated orbit starts perfectly circular.
+						_coast_p_bci = PackedFloat64Array([_dev_p_bci[0], _dev_p_bci[1], _dev_p_bci[2]])
+						_orbit_coasting = true
+						_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
+						_dev_have_v = true
+						_dev_orbital_commit = true
+				else:
+					var look := _dev_dir_to_bci(fid, t, -window_camera_transform().basis.z) if fid >= 0 else _DVCls.v(0.0, 1.0, 0.0)
+					_dev_v_bci = _DevFlightCls.release_circular(_dominant_body(), _dev_p_bci, look, _dev_v_bci if _dev_have_v else _DVCls.v(0.0, 0.0, 0.0))
+					_dev_have_v = true
+					# SN-FIX #3: O is the explicit "commit to orbital flight" verb — latch it so the velocity-command
+					# controller now owns flight (under SN_NO_CEILING_BOUNCE; the latch is inert with the flag off).
+					_dev_orbital_commit = true
+		KEY_G:
+			# G — geostationary snap (HIGH only): teleport to r_geo at the current longitude, v = ω⃗×p. Over a body
+			# with no stationary orbit (r_geo > SOI) the snap returns empty ⇒ "none" (no-op here).
+			if mode == _CosmosNavCls.HIGH_ORBIT and fid >= 0:
+				var snap := _DevFlightCls.geostationary_snap(_dominant_body(), _dev_p_bci)
+				if snap.size() == 2:
+					var p_new: PackedFloat64Array = snap[0]
+					var v_new: PackedFloat64Array = snap[1]
+					var pf: PackedFloat64Array = _OrbitalStateCls.bci_to_fixed(_dominant_body(), t, p_new, v_new)[0]
+					var lat: Array = _FacetAtlasCls.world_to_lattice64(fid, pf[0], pf[1], pf[2])
+					position = Vector3(lat[0], lat[1], lat[2])
+					_dev_v_bci = v_new
+					_dev_have_v = true
 
 func _move(delta: float) -> void:
 	# Horizontal intent in the player's yaw frame.
@@ -317,6 +1453,48 @@ func _move(delta: float) -> void:
 
 	var running := remote_run if remote_drive else Input.is_key_pressed(KEY_SHIFT)
 	if flying:
+		# COSMOS SPACE-NAV SN5 (§7.2): under dev-nav, once the nav machine reads an ORBITAL frame (LOW/HIGH/
+		# DEEP/INTER) the velocity-command controller takes over — it owns the BCI velocity and re-projects the
+		# kinematic BCI position back to the lattice. In PLANETARY the shipped lattice fly below is used UNCHANGED
+		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
+		_dev_active = false
+		_fall_have_v = false                                # flying ⇒ not falling; next F-off re-seeds the free-fall
+		var use_devnav := _dev_nav and _nav != null
+		# COSMOS SPACE-NAV §7.4 (ORBIT_COAST): the O free-coast. While coasting, gravity integrates the orbit each
+		# frame (a stable circular seed HOLDS radius — the fix for "orbits then hangs"). EXIT: (b) any thrust/movement
+		# input hands off to the dev-flight velocity-command (SN-R1: `_dev_v_bci` already mirrors the coast velocity
+		# ⇒ no jump); (c) dropping into the atmosphere (PLANETARY) hands off to the shipped surface/dev path. On exit
+		# we fall through to the handoff below with `_dev_orbital_commit` set. Flag off ⇒ `_orbit_coasting` is never
+		# true ⇒ this whole block is skipped (byte-identical).
+		if CubeSphere.ORBIT_COAST and use_devnav and _orbit_coasting:
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY or _coast_thrust_input(input):
+				_orbit_coasting = false
+				_dev_orbital_commit = true                  # commit the mirrored coast velocity to the controller
+			else:
+				_orbit_coast_move(delta)
+				return
+		# SN-FIX #3 (SN_NO_CEILING_BOUNCE): `orbital_handoff` gates the O-COMMITTED orbital controller. Flag off ⇒
+		# it is the shipped `mode != PLANETARY` test (byte-identical auto-handoff). Flag on ⇒ it also requires the
+		# explicit O commit (`_dev_orbital_commit`), so the O velocity-command controller (a follow-up) runs ONLY
+		# after the pilot commits — its per-mode caps + SN-R1 continuity are untouched.
+		if use_devnav and orbital_handoff(int(_nav.mode), _dev_orbital_commit, CubeSphere.SN_NO_CEILING_BOUNCE):
+			_dev_flight_move(delta, input, running)
+			return
+		# SN-FIX #3: F-MODE MODEL — under the flag, dev-nav fly is a GRAVITY-OFF kinematic fly in the FULL look
+		# direction (camera forward incl. pitch), at ALL altitudes. No controller ramp, no deceleration crossing
+		# the atmosphere ceiling: the "bounce" is gone and looking up + forward climbs straight into orbit.
+		if use_devnav and CubeSphere.SN_NO_CEILING_BOUNCE:
+			_dev_have_v = false                             # drop the seed so a later O-commit re-seeds cleanly
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY:
+				_dev_orbital_commit = false
+			_kinematic_look_fly(delta, input, running)
+			return
+		# Shipped lattice fly: the bare fly toggle (SN_DEVNAV off), or dev-nav PLANETARY with SN_NO_CEILING_BOUNCE
+		# off. Drop the controller's velocity seed so the next ORBITAL entry re-seeds from the fresh SN2 velocity.
+		if _dev_nav:
+			_dev_have_v = false
+			if int(_nav.mode) == _CosmosNavCls.PLANETARY:
+				_dev_orbital_commit = false
 		var speed := fly_speed * (2.0 if running else 1.0)
 		var vy := 0.0
 		if remote_drive:
@@ -329,6 +1507,24 @@ func _move(delta: float) -> void:
 		_horiz_vel = wish * speed
 		velocity = Vector3.ZERO
 		return
+
+	# SN-FIX #3 (SN_NO_CEILING_BOUNCE): F-OFF gravity is WHERE-aware. ABOVE the atmosphere ceiling the player is in
+	# the planet-centred (inertial) frame — free-fall under GM_dyn/r² toward the planet centre, NO surface-rotation
+	# drag (that frame switch is the nav machine's carrier ω⃗×p → 0). BELOW the ceiling the shipped surface-feel
+	# gravity/frame takes over; the fall's radial velocity is handed to velocity.y so the transition is continuous.
+	# Flag off / FLAT ⇒ skipped ⇒ the shipped walk is byte-identical.
+	if CubeSphere.SN_NO_CEILING_BOUNCE and CubeSphere.FACETED and free_fall_regime(flying, radial_altitude(), true):
+		_free_fall_move(delta)
+		return
+	# G-LANDING (SN_FOFF_RADIAL_FALL) latch hygiene: reaching the surface-walk regime FULFILS any pending
+	# land-commit — clear the one-shot latch so an F-off made on the ground can never leak into a much-later
+	# AUTOMATIC free-fall seed (whose SN-R1 velocity continuity must stay untouched). Inert bookkeeping off-flag.
+	_foff_radial = false
+	if _fall_have_v:
+		# Leaving free-fall (dropped below the ceiling): seed velocity.y from the BCI fall velocity so the surface
+		# walk's gravity continues from the true downward speed — a continuous flight→fall→surface handoff.
+		velocity.y = _fall_exit_vy()
+		_fall_have_v = false
 
 	var speed := run_speed if running else walk_speed
 	_horiz_vel = wish * speed
@@ -378,6 +1574,19 @@ func _move(delta: float) -> void:
 	# FP-FIXED-FRAME (§2.3): `velocity` stays our own LATTICE bookkeeping (never fed to move_and_slide), so gravity
 	# integration and the vertical floor/ceiling scans all run on the LOCAL (lattice) y — byte-identical at identity.
 	velocity.y -= gravity * delta
+	# SN-BRAKE (§6): atmospheric DESCENT braking. Below ATMO_TOP a fast re-entry (the F-off free-fall velocity
+	# handed to velocity.y at 384) decelerates toward ATMO_BRAKE_TERMINAL under the density-profiled SN1 drag,
+	# so the descent never outruns terrain streaming (the fix for the ~141 m/s landing generation storm).
+	# DESCENT-ONLY (velocity.y < 0) so a jump's rise is untouched; per-body via _dominant_body() (no hardcoded
+	# Earth); the drag impulse is sign-clamped so drag alone can slow the fall to rest but never flips it upward
+	# (semi-implicit stability under a big post-hitch dt). Density ≈ 0 at 384 ⇒ continuous with the space
+	# free-fall (which owns h ≥ 384 with NO drag). Flag off / FLAT / airless ⇒ no term ⇒ byte-identical.
+	if CubeSphere.SN_ATMO_BRAKING and CubeSphere.FACETED and velocity.y < 0.0:
+		var a_brake := _OrbitalStateCls.atmo_brake_accel(_dominant_body(), radial_altitude(), velocity.y)
+		var dvy := a_brake * delta
+		if dvy > -velocity.y:                                # never decelerate past a standstill from drag alone
+			dvy = -velocity.y
+		velocity.y += dvy
 	var prev_head_y := position.y + PLAYER_HEIGHT   # head BEFORE this frame's rise
 	position.y += velocity.y * delta
 
@@ -399,7 +1608,13 @@ func _move(delta: float) -> void:
 			position.y = ceiling_y - PLAYER_HEIGHT - CEILING_EPS
 			velocity.y = 0.0
 
+	# FP_FALL_TIMING: split out the per-frame landing floor query (t_floor_us) — the re-entry residual the
+	# FP_FLOOR_MEMO cache targets (cold-generator scans in _move). Off ⇒ the flag test only (byte-identical).
+	var _ft_on2 := CubeSphere.FP_FALL_TIMING
+	var _ft_t2 := 0
+	if _ft_on2: _ft_t2 = Time.get_ticks_usec()
 	var terrain_floor := world.floor_under(position.x, position.z, position.y)
+	if _ft_on2: _ft_max("t_floor_us", Time.get_ticks_usec() - _ft_t2)
 	var floor_y := terrain_floor
 
 	# Stand ON a detached voxel body directly under the feet instead of falling
@@ -828,3 +2043,122 @@ func remote_place(block_id: int, target) -> bool:
 				return true
 			return false
 	return false
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# COSMOS SPACE-FLY DEV/TEST ACTUATORS (docs/COSMOS-SPACEFLY-DESIGN.md). The scriptable-flight surface the
+# RemoteControl executor drives so the ORCHESTRATOR can fly test missions headlessly. Each ROUTES THROUGH
+# THE SAME gated space-nav path a human's F/O/G/R/Q/E keystrokes take (`_toggle_dev_nav`, `_dev_toggle_key`,
+# the `_attitude_tick` roll poll, the `remote_input` thrust seam) — NO new flight math, NO parallel state.
+# All are safe no-ops when their gates are off (dev-nav not engaged, nav machine absent), so a call from a
+# harness or the executor before the space-nav flags are enabled simply reports `false`/`{}` and changes
+# nothing. The executor never exists off RemoteBridge.CONTROL_ENABLED ⇒ byte-identical in normal play.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## set_dev_nav (F): drive dev-nav to a definite ON/OFF state (idempotent — a human F is a toggle). Guarded by
+## SN_DEVNAV exactly as the KEY_F handler: with the flag off, dev-nav does not exist, so this reports false and
+## does nothing (the harness then knows the space-nav build is not the one running). Returns the resulting state
+## == requested on success, false otherwise.
+func remote_set_dev_nav(on: bool) -> bool:
+	if not CubeSphere.SN_DEVNAV:
+		return false
+	if _dev_nav != on:
+		_toggle_dev_nav()                          # the exact human-F path (fly on/off, overlay, seed reset)
+	return _dev_nav == on
+
+## nav verb (O/G/R): the dev-nav mode toggles. verb ∈ orbit(O) | geostation(G) | detach(R). Guarded EXACTLY as
+## the KEY_O/G/R handler (SN_DEVNAV && dev-nav engaged && the nav machine live && a BCI state exists), so it is a
+## no-op returning false whenever a human keypress would also be inert. Returns true iff the verb was dispatched.
+func remote_nav_verb(verb: String) -> bool:
+	if not (CubeSphere.SN_DEVNAV and _dev_nav and _nav != null):
+		return false
+	var keycode := 0
+	match verb:
+		"orbit": keycode = KEY_O
+		"geostation": keycode = KEY_G
+		"detach": keycode = KEY_R
+		_: return false
+	if _dev_p_bci.size() != 3:
+		return false                               # no BCI state yet — the same guard _dev_toggle_key applies
+	_dev_toggle_key(keycode)
+	return true
+
+## thrust seam (WASD + Space/Ctrl held): arm the body-local wish (x=strafe, y=vertical, z=forward, same shape as
+## the WASD/vertical polls) + run for THIS and every following tick until zeroed. In dev-nav this feeds the fly /
+## dev-flight / coast-exit paths identically to a held key. The executor sets this at a thrust step's start and
+## zeroes it (via remote_stop_thrust) at the step's deadline — a timed hold. No-op unless a caller sets it.
+func remote_set_thrust(wish: Vector3, run: bool) -> void:
+	remote_input = wish
+	remote_run = run
+	remote_drive = true
+
+## Release the thrust seam (the executor calls this at a thrust step's end; mirrors RemoteControl._zero_intent).
+func remote_stop_thrust() -> void:
+	remote_drive = false
+	remote_input = Vector3.ZERO
+	remote_run = false
+
+## roll seam (Q/E held): rad/s applied to the BCI attitude in _attitude_tick's SPACE branch. Zeroed by the
+## executor at the roll step's deadline. No-op unless ORBIT_ATTITUDE is engaged and the camera is emancipated.
+func remote_set_roll(rate: float) -> void:
+	remote_roll_rate = rate
+
+## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
+## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE
+## + guarded: returns {} when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` null), so the bridge merge adds
+## nothing and the shipped telemetry is byte-identical. With the space-nav flags on it streams alongside nav_mode/
+## v_bci (nav_telemetry) so ONE telemetry line fully describes the flight state. Pure read; no side effects.
+func space_telemetry() -> Dictionary:
+	if _nav == null:
+		return {}
+	var alt := radial_altitude()
+	var body := _dominant_body()
+	return {
+		"alt": snappedf(alt, 0.1),
+		"v_circ": snappedf(orbit_v_circ(), 0.01),
+		"orbit_r": snappedf(_FacetAtlasCls.R_BLOCKS + alt, 0.1),
+		"body": body,
+		"dev_nav": _dev_nav,
+		"coasting": _orbit_coasting,
+		"flying": flying,
+		"on_ground": _space_on_ground(),
+		"att": _space_att_name(),
+	}
+
+## True iff standing on terrain (not flying, feet at/near the analytic floor) — the harness's `landed` predicate
+## combines this with nav_mode == planetary. Cheap floor probe; false while flying.
+func _space_on_ground() -> bool:
+	if flying or world == null:
+		return false
+	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
+
+## The attitude-machine state name for telemetry (surface | space | recover). "surface" when ORBIT_ATTITUDE is off.
+func _space_att_name() -> String:
+	match _att_mode:
+		ATT_SPACE: return "space"
+		ATT_RECOVER: return "recover"
+		_: return "surface"
+
+# ── COSMOS-PERF FALL-TIMING (FP_FALL_TIMING) diagnostic instrument ───────────────────────────────
+## Record the running per-window MAX for one segment key (µs). Called only from the flag-gated segment wrappers
+## (and from ft_record for main/sky-pushed segments), so with the flag off nothing ever writes ⇒ `_ft` stays empty.
+func _ft_max(key: String, us: int) -> void:
+	if us > int(_ft.get(key, 0)):
+		_ft[key] = us
+
+## Cross-node push seam: main._process (scaled-body / far-ring) and CosmosSky._process (sky recompute) time their
+## own segment and forward the µs here so ALL fall-timing keys travel out through the one fall_timing() telemetry
+## merge. Self-gated on the flag so an errant caller off-flag can never add a key (byte-identical off).
+func ft_record(key: String, us: int) -> void:
+	if not CubeSphere.FP_FALL_TIMING:
+		return
+	_ft_max(key, us)
+
+## Fall-timing telemetry: the just-elapsed window's per-segment MAX µs, then RESET for the next window. Empty (⇒
+## merges nothing ⇒ byte-identical) whenever the flag is off — nothing ever populated `_ft`. RemoteBridge merges
+## this into each 4-Hz telemetry record exactly like space_telemetry (additive + empty-dict-guarded).
+func fall_timing() -> Dictionary:
+	if _ft.is_empty():
+		return {}
+	var out: Dictionary = _ft.duplicate()
+	_ft.clear()
+	return out

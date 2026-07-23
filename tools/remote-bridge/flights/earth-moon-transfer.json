@@ -1,0 +1,33 @@
+{
+  "name": "earth-moon-transfer",
+  "description": "TEMPLATE (needs live Δv tuning): climb to a high orbit, R-detach to deep-space expression, coast a raising trajectory toward the Moon, and check the SOI hands off (body flips earth→moon).",
+  "_notes": "Hitting a target transfer requires closed-loop Δv reasoning the current dev verbs do NOT precisely provide (there is no fine burn-to-target op) — the DETERMINISTIC SOI-swap + reexpress proof lives in the headless gate verify_spacefly.gd (gate F). This live template exercises the plumbing (high-orbit → detach → coast → long wait) so the orchestrator can watch the streamed body/nav_mode; expect to tune the coast and wait live, and bring in Fable for the maneuver targeting. SOI_SWAP must be enabled in the running build for body to ever read 'moon'.",
+  "legs": [
+    {
+      "name": "engage dev-nav + climb high",
+      "steps": [ { "op": "dev_nav", "on": true }, { "op": "thrust", "dy": 1.0, "seconds": 45, "gait": "run" } ],
+      "settle_s": 2.0,
+      "expect": { "nav_mode": ["high_orbit", "low_orbit"], "alt_gt": 384 }
+    },
+    {
+      "name": "R — detach to deep-space expression",
+      "steps": [ { "op": "nav", "verb": "detach" } ],
+      "settle_s": 1.0
+    },
+    {
+      "name": "prograde raise + coast toward the Moon",
+      "steps": [
+        { "op": "thrust", "dz": -1.0, "seconds": 20, "gait": "run" },
+        { "op": "nav", "verb": "orbit" }
+      ],
+      "settle_s": 1.0,
+      "expect": { "coasting": true }
+    },
+    {
+      "name": "cruise (watch for SOI hand-off to the Moon)",
+      "steps": [ { "op": "wait", "seconds": 5 } ],
+      "hold_s": 60,
+      "expect": { "body": "moon" }
+    }
+  ]
+}

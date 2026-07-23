@@ -6,18 +6,21 @@ class_name CosmosEphemeris
 ## NO randi(). This makes it worker-safe and headless-gate-testable (verify_orbital_sky.gd), and it
 ## carries the whole scale/time/mass model that O1+ (real orbits, SOI, grids) reads as data.
 ##
-## THE LOCKED SCALE MODEL (§3.3, decision D2, USER-LOCKED):
-##   1 unit = 1 block = 1 m. Celestial lengths are real km ÷ 1000. One Earth rotation = 20 min real,
-##   so time runs 72× (86400 s ÷ 1200 s). 1:1000 lengths + 72× time cannot keep real masses, so
-##   GM is the FREE PARAMETER chosen (via Kepler) to keep Newton exact at those two scales:
-##       GM_game = GM_real × s_L³ / s_T²  = GM_real × (10⁻³)³ × 72²  = GM_real × 5.184×10⁻⁶
-##   Corollaries: every period = real ÷ 72, every orbital speed = real × 0.072, every dimensionless
-##   ratio (angular sizes, eclipse geometry, orbits-per-day) is EXACTLY real. One clock: ephemeris
-##   time = real seconds; the scaled GM alone produces the 72× sky.
+## THE SCALE MODEL — STRICT 1:1000 SPACETIME (§3.3, USER-LOCKED 2026-07-18, natural Earth/1000):
+##   1 unit = 1 block = 1 m. Celestial lengths are real km ÷ 1000 (s_L = 1/1000). Time is scaled by the
+##   SAME rule so acceleration (length/time²) is INVARIANT: s_T² = s_L ⇒ s_T = √s_L = 1/√1000, i.e. game
+##   time runs √1000 = 31.62× faster than reality (NOT the old 72×). Then the GM that keeps Newton exact is
+##       GM_game = GM_real × s_L³ / s_T²  = GM_real × (10⁻³)³ × (√1000)²  = GM_real × 1×10⁻⁶
+##   which for Earth is 3.986e8 = SURFACE_GRAVITY·R² (CubeSphere.gm_for) — so the far-field Kepler GM and the
+##   near-field FEEL anchor COINCIDE. Consequences (all self-consistent, ONE clock): gravity is 9.8 for BOTH
+##   walking AND orbit (no split); surface v_circ = √(GM/R) = 250 b/s, low-orbit period ≈ 160 s, escape ≈ 354;
+##   one Earth day = 86400/√1000 ≈ 2732.6 s ≈ 45.5 min. Because the SKY (sun/moon/day/eclipses) runs on the
+##   same clock it slows to the same √1000 rate — orbit ↔ day ↔ gravity stay in sync, no desync. Every
+##   dimensionless ratio (angular sizes, eclipse geometry, orbits-per-day) is still EXACTLY real.
 ##
-## This table is SEPARATE from CubeSphere.gm_for() — that stays the near-field FEEL anchor (§3.3.1,
-## walk gravity 22); this GM table is the far-field Kepler truth (supersedes gm_for above the blend
-## band, which is O1). O0 uses this kernel for the sky only (Sun/Moon direction + day-night).
+## Since GM_game now EQUALS CubeSphere.gm_for by construction (§3.3.1, walk gravity 9.8), the far-field Kepler
+## truth and the near-field feel anchor agree at the datum — the O1 blend band is continuous with no GM step.
+## O0 uses this kernel for the sky (Sun/Moon direction + day-night); O1+ read the same GM for real orbits.
 ##
 ## PRECISION: positions are DVecF64 (PackedFloat64Array) — Earth–Sun 1.496e8 needs f64; the render
 ## layer downgrades DIRECTIONS to Vector3 (§4.3).
@@ -28,16 +31,23 @@ const DV := preload("res://src/cosmos/dvec3.gd")
 # Scale constants (§3.3) — the three locked numbers everything else derives from.
 # ---------------------------------------------------------------------------------------
 
-## Time compression: game runs this many times faster than reality (86400 s day / 1200 s day).
-const TIME_COMPRESSION := 72.0
-## One Earth solar day in game seconds (= real 86400 s ÷ 72). The Earth spin period.
-const DAY_GAME := 1200.0
 ## Length scale: 1 game block = 1000 real metres for celestial quantities (real km → blocks).
+## s_L = 1/1000. Defined first — the time and GM scales derive from it under the STRICT 1:1000 rule.
 const LENGTH_SCALE := 1.0e-3
-## The GM scaling law (§3.3): GM_game = GM_real × s_L³/s_T² = (10⁻³)³ × 72². Written as the literal
-## 5.184e-6 (== 1e-9 × 5184) so the intent is legible; asserted against the computed product by the
-## gate (they agree to f64 ulp — the direct == is a 1-ulp miss, hence a tolerance there).
-const GM_SCALE := 5.184e-6
+## Time compression: game runs this many times faster than reality. STRICT 1:1000 SPACETIME (§3.3):
+## for acceleration = length/time² to be scale-INVARIANT we need s_T² = s_L ⇒ s_T = √s_L = 1/√1000, i.e.
+## time compression = 1/s_T = √1000 = 31.6227766 (NOT the old 72×). This is the value that keeps gravity
+## the SAME 9.8 for walking AND orbit and keeps the whole clock — orbits, day, sun/moon, eclipses — on ONE
+## coherent scale. Written as the literal √1000 (sqrt is not allowed in a const expr); the gate checks it.
+const TIME_COMPRESSION := 31.622776601683793
+## One Earth solar day in game seconds (= real 86400 s ÷ √1000 ≈ 2732.6 s ≈ 45.5 min). DERIVED from
+## TIME_COMPRESSION so the day tracks the one time scale (was 1200 s / 20 min under the old 72× model).
+const DAY_GAME := 86400.0 / TIME_COMPRESSION
+## The GM scaling law (§3.3): GM_game = GM_real × s_L³/s_T² = (10⁻³)³ × (√1000)² = 1e-9 × 1000 = 1e-6.
+## DERIVED (not a hand literal) so the Newton scaling law holds by construction. Under strict 1:1000 this
+## makes GM_game(earth) = 3.986e14 × 1e-6 = 3.986e8 ≈ SURFACE_GRAVITY·R² (CubeSphere.gm_for) — the far-field
+## Kepler GM and the near-field feel anchor now COINCIDE, so orbit gravity == walk gravity == 9.8 (no split).
+const GM_SCALE := LENGTH_SCALE * LENGTH_SCALE * LENGTH_SCALE * TIME_COMPRESSION * TIME_COMPRESSION
 
 ## Global time-warp multiplier (D2 note / §3.4): v1 = 1 (a warp>1 scales the SKY only unless GM is
 ## co-scaled, so it ships at 1). The clock multiplies real dt by this — the ONE knob for fast-forward.
@@ -64,8 +74,12 @@ const BODIES := {
 	},
 	"earth": {
 		"gm_real": 3.986e14, "r": 6371.0, "parent": "sun", "a": 149.6e6, "m0": 0.0,
-		"spin_period": 1200.0, "spin_phase0": 0.0, "tidal": false,
-		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.0,
+		"spin_period": DAY_GAME, "spin_phase0": 0.0, "tidal": false,   # one solar day = √1000-scaled ≈ 2732.6 s
+		# CLIMATE W0 (§3): real obliquity ε = 23.4° = 0.4084 rad. USED only when CubeSphere.FP_SEASONS is on
+		# (effective_tilt gates it → 0 with the flag off, so dir_to_bodyfixed stays byte-identical). incl still
+		# 0 (the orbit plane == the ecliptic); the tilt lives purely in the body-fixed frame, so orbit/period/
+		# tidal math is untouched.
+		"ecc": 0.0, "incl": 0.0, "axial_tilt": 0.4084,
 	},
 	"moon": {
 		"gm_real": 4.905e12, "r": 1737.0, "parent": "earth", "a": 384400.0, "m0": 0.0,
@@ -86,7 +100,7 @@ class CosmosClock extends RefCounted:
 	func _init(t0: float = 0.0) -> void:
 		t = t0
 
-	## Advance the clock by a REAL frame delta (seconds); the sky moves 72× via the scaled GM, and
+	## Advance the clock by a REAL frame delta (seconds); the sky moves √1000× via the scaled GM, and
 	## TIME_WARP (=1) is the only extra multiplier. Pure accumulation — no wall clock is read here.
 	func advance(real_dt: float) -> void:
 		t += real_dt * CosmosEphemeris.TIME_WARP
@@ -104,8 +118,9 @@ static func has_body(body: String) -> bool:
 static func gm_real(body: String) -> float:
 	return float(BODIES[body]["gm_real"])
 
-## GM_game = GM_real × GM_SCALE — DERIVED so the scaling law is exact (§3.3). Matches the doc's
-## canonical hand-values (2.066e9 / 2.543e7 / 6.880e14) to 4 sig figs (gate asserts).
+## GM_game = GM_real × GM_SCALE — DERIVED so the scaling law is exact (§3.3). Under the natural strict-1:1000
+## clock (GM_SCALE = 1e-6) the canonical values are 3.986e8 (earth) / 4.905e6 (moon) / 1.327e14 (sun) — the
+## earth value equals SURFACE_GRAVITY·R² (gate asserts).
 static func gm_game(body: String) -> float:
 	return float(BODIES[body]["gm_real"]) * GM_SCALE
 
@@ -114,6 +129,17 @@ static func radius_of(body: String) -> float:
 
 static func parent_of(body: String) -> String:
 	return String(BODIES[body]["parent"])
+
+## The bodies whose parent is `body` (its satellites) — e.g. children_of("earth") == ["moon"],
+## children_of("sun") == ["earth"]. Used by the SOI dominant-body test (SPACE-NAV §5.2, O4c): a point
+## inside a child's sphere-of-influence is dominated by that child. Pure; the small BODIES dict is
+## scanned in registration order (deterministic). Leaf bodies (the Moon) return [].
+static func children_of(body: String) -> Array:
+	var out: Array = []
+	for name in BODIES:
+		if String(BODIES[name]["parent"]) == body:
+			out.append(name)
+	return out
 
 static func orbit_a(body: String) -> float:
 	return float(BODIES[body]["a"])
@@ -163,7 +189,12 @@ static func body_pos_parent(body: String, t: float) -> PackedFloat64Array:
 	if parent_of(body) == "" or a <= 0.0:
 		return DV.v(0.0, 0.0, 0.0)
 	var th := orbit_angle(body, t)
-	return DV.v(a * cos(th), a * sin(th), 0.0)
+	# ATMO2 B4: tilt the orbit plane by the effective inclination about the X axis (line of nodes at θ=0).
+	# incl=0 (flag off) ⇒ the shipped coplanar XY-plane result EXACTLY (cos0=1, sin0=0) ⇒ byte-identical.
+	var inc := effective_incl(body)
+	if inc == 0.0:
+		return DV.v(a * cos(th), a * sin(th), 0.0)
+	return DV.v(a * cos(th), a * sin(th) * cos(inc), a * sin(th) * sin(inc))
 
 ## Heliocentric (system-centre) position of `body` (DVec3 blocks): the chain of parent-relative
 ## offsets up to the Sun at the origin. Pure recursion over the (acyclic) parent graph.
@@ -172,6 +203,32 @@ static func body_pos_helio(body: String, t: float) -> PackedFloat64Array:
 	if par == "":
 		return DV.v(0.0, 0.0, 0.0)                     # the Sun is the origin
 	return DV.add(body_pos_helio(par, t), body_pos_parent(body, t))
+
+## Velocity of `body` RELATIVE TO ITS PARENT (DVec3 blocks/s), parent inertial frame — the exact
+## closed-form time-derivative of body_pos_parent for a circular orbit (SPACE-NAV §5.1): with
+## angle θ = M0 + n·t, d/dt (a cos θ, a sin θ, 0) = a·n·(−sin θ, cos θ, 0). Pure f64; the twin of
+## body_pos_parent that the HIGH_ORBIT↔DEEP_SPACE handoff and the SOI-swap re-expression consume.
+static func body_vel_parent(body: String, t: float) -> PackedFloat64Array:
+	var a := orbit_a(body)
+	if parent_of(body) == "" or a <= 0.0:
+		return DV.v(0.0, 0.0, 0.0)
+	var n := omega_orbit(body)
+	var th := orbit_angle(body, t)
+	# ATMO2 B4: the exact time-derivative of the inclination-tilted body_pos_parent. incl=0 ⇒ byte-identical.
+	var inc := effective_incl(body)
+	if inc == 0.0:
+		return DV.v(-a * n * sin(th), a * n * cos(th), 0.0)
+	return DV.v(-a * n * sin(th), a * n * cos(th) * cos(inc), a * n * cos(th) * sin(inc))
+
+## Heliocentric (system-centre) velocity of `body` (DVec3 blocks/s): the chain of parent-relative
+## velocities up to the Sun (at rest at the origin). Pure recursion over the acyclic parent graph —
+## the exact analogue of body_pos_helio, so p_helio and v_helio are a consistent (position, velocity)
+## pair at every t. This is the ONE new ephemeris accessor SN1 adds (SPACE-NAV §5.1).
+static func body_vel_helio(body: String, t: float) -> PackedFloat64Array:
+	var par := parent_of(body)
+	if par == "":
+		return DV.v(0.0, 0.0, 0.0)                     # the Sun is at rest at the origin
+	return DV.add(body_vel_helio(par, t), body_vel_parent(body, t))
 
 ## Body-fixed spin angle (rad) of `body` at t. Tidal lock is the one-line rule (§4.2):
 ## spin_angle(moon) = orbit_angle(moon) + PI ⇒ the same face stays parent-ward forever.
@@ -209,21 +266,128 @@ static func angular_diameter(body: String, from_body: String, t: float) -> float
 		return 0.0
 	return 2.0 * atan(radius_of(body) / dist)
 
+## CLIMATE W0 (§3): the axial obliquity (rad) actually APPLIED to `body`'s body-fixed frame. The frozen
+## table value gated by CubeSphere.FP_SEASONS — with the flag OFF this returns 0 for every body, so
+## dir_to_bodyfixed / subsolar_latitude below collapse to the shipped no-tilt kernel (R_tilt = I) and are
+## BYTE-IDENTICAL. ON, Earth reads 0.4084 rad (23.4°) → seasonal sun arcs and the subsolar-latitude wave.
+## Reading a CubeSphere const keeps the kernel pure (CubeSphere is engine-free math, no singleton/clock).
+static func effective_tilt(body: String) -> float:
+	if not CubeSphere.FP_SEASONS:
+		return 0.0
+	return float(BODIES[body]["axial_tilt"])
+
+## ATMO2 B4 (§2.2/§3.3): the orbital inclination (rad) actually APPLIED to `body`'s orbit plane. Gated by
+## CubeSphere.FP_MOON_PRESENCE — with the flag OFF this returns 0 for every body, so body_pos_parent collapses
+## to the shipped coplanar XY-plane kernel and is BYTE-IDENTICAL (SN1/O1/ephemeris suites unchanged). ON, the
+## Moon reads 5.1° so it clears Earth's umbra cone at most oppositions ⇒ eclipses become the rare node event.
+const MOON_INCL := 0.08901179   # 5.1° in radians (mean lunar orbital inclination to the ecliptic)
+static func effective_incl(body: String) -> float:
+	if body == "moon" and CubeSphere.FP_MOON_PRESENCE:
+		return MOON_INCL
+	return float(BODIES[body]["incl"])
+
 ## Unit direction (Vector3) from `from_body` to `to_body`, expressed in `from_body`'s BODY-FIXED
 ## frame at t — the inertial direction rotated by −spin_angle(from_body) about the spin axis (+Z,
 ## north per the CubeSphere face frame). This is what the sky layer consumes: as Earth spins the
-## Sun sweeps around the observer (day-night) with zero geometry work (§4.1/§8.2). incl/tilt = 0,
-## so a −Z-axis rotation is exact for v1.
+## Sun sweeps around the observer (day-night) with zero geometry work (§4.1/§8.2).
+##
+## CLIMATE W0: the body-fixed frame is R_spin(θ)·R_tilt(ε) — the obliquity tilts the pole off the orbit
+## normal, fixed in inertial space, so as Earth orbits its north pole leans sun-ward in summer and away in
+## winter (the WHOLE of seasons). We express the inertial direction in that frame: first R_x(−ε) (tilt the
+## pole from +Z toward the equinox line), then R_z(−θ) (spin about the tilted pole). ε=0 (flag off) ⇒ only
+## the spin rotation runs ⇒ byte-identical to the shipped kernel. The Z-component after R_x(−ε) IS the sine
+## of the local declination, so this and subsolar_latitude() agree by construction.
 static func dir_to_bodyfixed(from_body: String, to_body: String, t: float) -> Vector3:
-	var d_inertial := dir_to(from_body, to_body, t)
+	var d := dir_to(from_body, to_body, t)
+	var eps := effective_tilt(from_body)
+	if eps != 0.0:
+		# R_x(−ε): (x, y·cosε + z·sinε, −y·sinε + z·cosε) — tilt the north axis by the obliquity.
+		var ce := cos(eps)
+		var se := sin(eps)
+		d = Vector3(d.x, d.y * ce + d.z * se, -d.y * se + d.z * ce)
 	var ang := -spin_angle(from_body, t)
 	var c := cos(ang)
 	var s := sin(ang)
 	# R_z(ang) · d : rotate about +Z (the spin/north axis); Z component is untouched.
 	return Vector3(
-		c * d_inertial.x - s * d_inertial.y,
-		s * d_inertial.x + c * d_inertial.y,
-		d_inertial.z)
+		c * d.x - s * d.y,
+		s * d.x + c * d.y,
+		d.z)
+
+## CLIMATE W0 (§3): the SUBSOLAR LATITUDE δ(t) (rad) — the latitude where the Sun stands at zenith. It is
+## the sine of the Sun's north-axis component in Earth's tilted (but unspun) frame: with the inertial Sun
+## direction ŝ and R_x(−ε) applied, z' = −ŝ_y·sinε + ŝ_z·cosε, δ = asin(z'). Since the Sun sits in the
+## ecliptic (ŝ_z ≈ 0) this is δ ≈ asin(sinε·sinM) → +23.4° at the June solstice (M=π/2), −23.4° in
+## December, 0 at the equinoxes. This is the SAME z' the tilted dir_to_bodyfixed produces, so the sky sun
+## arc and the season offset can never disagree. Pure; ε gated by FP_SEASONS (0 ⇒ δ≡0, no seasons).
+static func subsolar_latitude(t: float) -> float:
+	return subsolar_latitude_eps(t, effective_tilt("earth"))
+
+## The explicit-obliquity form of subsolar_latitude — a pure function of (t, ε) that does NOT read the
+## flag, so a gate can assert δ = ±23.4° at the solstices regardless of the shipped FP_SEASONS default.
+static func subsolar_latitude_eps(t: float, eps: float) -> float:
+	var s := dir_to_f64("earth", "sun", t)          # inertial f64 unit direction to the Sun
+	var z_pole := -s[1] * sin(eps) + s[2] * cos(eps)
+	return asin(clampf(z_pole, -1.0, 1.0))
+
+## CLIMATE W0: `body`'s spin-axis (north-pole) unit direction in the INERTIAL frame = R_x(ε)·(+Z) =
+## (0, −sinε, cosε). Fixed in inertial space (obliquity is constant) — celestial north for the sky/nav.
+## ε gated by FP_SEASONS ⇒ (0,0,1) with the flag off (byte-identical to the untilted +Z pole).
+static func pole_axis_inertial(body: String) -> Vector3:
+	var eps := effective_tilt(body)
+	return Vector3(0.0, -sin(eps), cos(eps))
+
+## COSMOS-LOD-SKY L0 (docs/COSMOS-LOD-SKY-DESIGN.md §7.2, G-MOON-PHASE) — celestial PHASE geometry, pure f64.
+## The phase angle ψ at `body` is the Source–body–Observer angle: the angle, seen AT `body`, between the
+## direction to the light source and the direction to the observer. For the Moon (observer=earth, source=sun):
+## full moon ⇒ Sun and Earth lie the same way from the Moon ⇒ ψ≈0; new moon ⇒ opposite ⇒ ψ≈π. This is exactly
+## the light-vs-view geometry the shipped CosmosSky Moon impostor is rendered with (a sphere lit along −sun_dir,
+## viewed from earth), so the illuminated fraction below IS the rendered lit fraction — the gate proves it, no
+## new render code. Pure statics: dead unless a gate / the moonshine term calls them (no byte impact).
+static func phase_angle(observer: String, body: String, source: String, t: float) -> float:
+	var pb := body_pos_helio(body, t)
+	var to_source := DV.normalized_v3(DV.sub(body_pos_helio(source, t), pb))
+	var to_observer := DV.normalized_v3(DV.sub(body_pos_helio(observer, t), pb))
+	if to_source == Vector3.ZERO or to_observer == Vector3.ZERO:
+		return 0.0
+	return to_source.angle_to(to_observer)
+
+## Illuminated fraction of `body`'s disc as seen from `observer`, lit by `source`: f = (1+cos ψ)/2 ∈ [0,1].
+## 1 = full (ψ=0), 0.5 = quarter (ψ=π/2), 0 = new (ψ=π). This is the textbook lit fraction of a sphere at
+## phase angle ψ — the value the shipped lit-sphere impostor shows automatically (§7.2). Reused by SKY_MOONSHINE.
+static func illuminated_fraction(observer: String, body: String, source: String, t: float) -> float:
+	return 0.5 * (1.0 + cos(phase_angle(observer, body, source, t)))
+
+## Sky-plane direction, seen from `observer`, of `body`'s bright limb (the illuminated edge points toward the
+## source). = the component of the observer→source direction perpendicular to the observer→body line of sight,
+## normalized. Perpendicular to the line of sight by construction; the terminator on the disc is ⊥ to it. The
+## gate asserts it is a valid unit vector, ⊥ the view direction, and sunward — i.e. the shipped sphere's
+## terminator orientation is the real ephemeris one (§7.2 bright-limb position angle == projected sun direction).
+static func bright_limb_dir(observer: String, body: String, source: String, t: float) -> Vector3:
+	var po := body_pos_helio(observer, t)
+	var m_hat := DV.normalized_v3(DV.sub(body_pos_helio(body, t), po))       # observer → body (line of sight)
+	var s_hat := DV.normalized_v3(DV.sub(body_pos_helio(source, t), po))     # observer → source
+	if m_hat == Vector3.ZERO or s_hat == Vector3.ZERO:
+		return Vector3.ZERO
+	var proj := s_hat - m_hat * s_hat.dot(m_hat)                             # sunward, projected onto the sky plane
+	if proj.length() < 1.0e-12:
+		return Vector3.ZERO
+	return proj.normalized()
+
+## Solar ELONGATION of `body` from `observer`: the on-sky angle between the source and the body (Sun–observer–
+## body angle). Ties phase to geometry — at first/last quarter (f=0.5) the elongation is ≈90° (the gate checks it).
+static func elongation(observer: String, body: String, source: String, t: float) -> float:
+	var po := body_pos_helio(observer, t)
+	var to_body := DV.normalized_v3(DV.sub(body_pos_helio(body, t), po))
+	var to_source := DV.normalized_v3(DV.sub(body_pos_helio(source, t), po))
+	if to_body == Vector3.ZERO or to_source == Vector3.ZERO:
+		return 0.0
+	return to_source.angle_to(to_body)
+
+## Position of `body` relative to its parent as a render-side Vector3 (blocks). Thin wrapper over the f64
+## body_pos_parent for the eclipse geometry in CosmosSky (the Moon's offset from Earth's centre).
+static func body_pos_parent_v3(body: String, t: float) -> Vector3:
+	return DV.to_v3_scaled(body_pos_parent(body, t), 1.0)
 
 ## Sub-`target` longitude (rad) on `body`'s surface — the body-fixed azimuth of the direction from
 ## `body` to `target`. For a tidally-locked moon toward its parent this is CONSTANT (the tidal-lock

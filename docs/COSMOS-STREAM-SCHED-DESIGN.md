@@ -27,10 +27,25 @@ designed for permanent scarcity, not a transient backlog.
 > stale blocks. Everything is flag-gated OFF == byte-identical, NEVER-OOM-ledgered, and judged
 > on **integrated whole-walk metrics** (§8) designed to auto-reject the L4b class of error.
 
-Reading map: §1 assess the user's tricks · §2 cost model + generation tricks · §3 engine
-machinery · §4 scheduling model · §5 skin tier · §6 full trick catalogue (invented + rejected)
-· §7 ranked plan · §8 measurement protocol · §9 implementation change map (build from this)
-· §10 SOTA · §11 risks.
+> **FIELD UPDATE (2026-07-17 PM — supersedes this doc's §2.3 cost model and §7 ranking).**
+> T1, R1 and R7 were implemented (commits `a6374c0`, `d448035`, `f1d1642`; flags OFF) and A/B'd
+> on the SW-1 route. **The §2.3 per-class cost model is measured-WRONG** — see the corrected
+> table in §2.3a. Two corrections dominate: (a) the web multiplier over native is **~×25**
+> (337.7 / 13.7 ms on the underground class), not the ~×10 this doc assumed; (b) the
+> **surface-crossing class is ~560 ms/block, not 5–15 ms — 46 % of all generation time — and
+> nothing in the R-plan targeted it.** R1+R7 were **rejected by this doc's own §8 ship rule**
+> (M4 −13 % vs the −50 % target; M1 +14 %, M2 −17 %, one 11.2 s worst freeze) — the protocol
+> worked as designed. R1/R7 are *correct* (R7's byte-equality gate passed and survived a
+> deliberate falsification: a sabotaged build produced 43 635 caught mismatches) but they are
+> not wins. **The consequence, argued in §2.6: the C++ generator port (WALK-PERF L5a) is
+> promoted from contingency to THE plan; R3 (skin) follows it; the scheduling items demote to
+> demand-shaping polish.** Sections below are annotated rather than rewritten so the record of
+> what was predicted vs measured stays legible.
+
+Reading map: §1 assess the user's tricks · §2 cost model + generation tricks (§2.3a measured
+correction, §2.6 the surface-class verdict + L5 decision) · §3 engine machinery · §4 scheduling
+model · §5 skin tier · §6 full trick catalogue (invented + rejected) · §7 ranked plan ·
+§8 measurement protocol · §9 implementation change map · §10 SOTA · §11 risks.
 
 ---
 
@@ -109,6 +124,43 @@ Mix model (walking mix ≈ 30 % air/cheap, 25 % bulk-qualified, 25 % gate-failed
 native average 5.7 → 2.5 ms ⇒ **supply 23–35 → ~50–80 blocks/s (~2–2.5×)**. The mix is the soft
 spot; the T1 per-class timer verifies it before R1 is judged.
 
+### 2.3a FIELD CORRECTION (2026-07-17 PM) — the measured table; §2.3's model is wrong
+
+T1 ran on the SW-1 route (real laptop, web). Measured per-class (wall-clock per block at N=6,
+contention included) vs what §2.3 assumed:
+
+| class | §2.3 assumed | **measured share** | **measured ms/block** | **share of total gen time** |
+|---|---|---|---|---|
+| air/cheap | 30 % | **53.3 %** | 7.9 | 2 % |
+| underground bulk-qualified | 25 % | **5.8 %** | 17.5 | 1 % |
+| underground gate-failed | 25 % @ 13.7 ms *native* | **26.6 %** | **337.7** | **51 %** |
+| surface-crossing | 20 % @ 5–15 ms *native* | **14.4 %** | **559.8** | **46 %** |
+
+Total route gen time 423 s. The classes are internally consistent with the earlier per-block
+average (Σ share×cost ≈ 176 ms ≈ the measured 173 ms @N=6), so the instrument is trusted. Two
+model errors, called out plainly:
+
+1. **The web multiplier is ~×25, not ~×10** (337.7 / 13.7 on the one class with a clean native
+   twin). Every "web ≈ ×10" number in this doc understates by ~2.5×; the ~×25 is per-block wall
+   time under 6-worker SMT contention, consistent with `WALK-PERF` §2.9's oversubscription model.
+2. **The surface-crossing class is ~40× more expensive than modeled** (560 ms vs "5–15 ms
+   native" ≈ 125–375 ms even at ×25 — and its native basis was itself an unmeasured guess). It
+   is **46 % of all generation time and no R-item targeted it.** §2.3's own observation ("a
+   surface block resolves every cell") was right; the conclusion drawn from it — that R1 was the
+   cheapest big win — was wrong, because R1 does not touch this class.
+
+**A/B outcome (COLBULK+STAMP ON vs OFF, identical route):** M1 25.36→28.92 (+14 %, worse),
+M2 9.6→8.0 fps (−17 %, worse), M4 −13 % (kill target was −50 %), worst p90 130→163.8, worst max
+408.9→**11 214 ms**. **Rejected by the §8 ship rule.** Self-consistent diagnosis: R1 moved its
+own class 337.7→243.3 ms (**−28 %**, not the predicted 5–14× — the fillable fraction of the
+class is far smaller than modeled: ridge-straddling, dither/bedrock-straddling and near-surface
+blocks all keep per-cell paths, and the remaining profile pass + loop mechanics carry the full
+VM multiplier), −28 % on ~half the work ≈ the −13 % M4 observed. The 11.2 s ON-build worst
+freeze is unexplained (possible stamping pathology on overlapping blobs or a `fill_area`
+hot-path issue) — **must be root-caused before either flag is ever reconsidered.** R1/R7 remain
+in-tree, correct (R7's equality gate passed 6035/0 and survived deliberate falsification —
+43 635 mismatches caught on a sabotaged build), flags OFF. Consequence in §2.6.
+
 ### 2.4 R1b/R1c — two free riders on the same edit
 
 - **R1b, per-column air ceiling.** The y-loop resolves above-surface cells to the block top; the
@@ -159,6 +211,64 @@ derivation into `TerrainConfig` statics that both paths call). Consequences:
 
 R7 is R1's v2 — same edit site, replaces the lossy fills with fill+stamp. Ship R1 first (simpler,
 carries the throughput), then R7 behind its own flag with the equality gate.
+*(Field status: both built, correct, and rejected as wins — §2.3a. Kept in-tree, flags OFF.)*
+
+### 2.6 FIELD VERDICT — where the 560 ms/block goes, and the L5 decision
+
+**Anatomy of the surface-crossing class (the new #1 term, 46 % of gen time).** 560 ms/block ≈
+256 columns × ~2.2 ms/col web ≈ ~85–90 µs/col native × the measured ~×25. The native µs are
+accounted for by the parts of the GEN-EFFICIENCY column model that R1 deliberately preserves
+because they are **eye-relevant**:
+
+```
+per surface column (native): slope_run_of ~5.0  +  profile ~2.0
+  + filler band ~4 cells × 1.9                                (dirt/sand/terracotta — visible when exposed)
+  + surface cell shaping (SHARP-SLOPE payload, caps, shore/liquid composites)
+  + ~10–14 above-surface cells × ~5 (TreeGen stencil gate, snow accumulation, sea)
+  ≈ the "68 µs surface/above + 7 overhead" term of the 319 µs model — now known to ride ×25, not ×10
+```
+
+This is not waste: it *is* the visible world. Script-side options for it, examined and closed:
+a per-column single-pass emitter that hoists tree/snow/sea decisions out of `resolve_cell`
+(bounded ~2×, still interpreter-bound); R1b's air ceiling (saves only in-block air rows — the
+class's cost is not air); feature-skipping (a visual regression, vetoed by definition). **The
+algorithm is fine at ~85 µs/col native; the ×25 interpreter multiplier is the cost. No
+script-side transformation removes a multiplier — only compilation does.** The R1 field result
+is the empirical proof of the same point from the other side: even *removable* work (bulk
+underground) only yielded −28 % script-side, because the profile pass, loop mechanics and
+fallback paths still carry the full VM tax.
+
+**Decision — L5(a) is promoted from contingency to THE plan.** Grounds:
+
+1. The two dominant classes (97 % of measured gen time) are both per-cell-interpreter-bound;
+   neither has a script-side order-of-magnitude lever (§2.3a for underground-in-practice, above
+   for surface).
+2. The port shape must be: **the whole `_generate_block` inner path as a C++ generator class in
+   our module patch set** (patches 0001–0006 prove the toolchain), reading the same frozen ARID
+   tables (PackedInt32Arrays cross the boundary once at setup) — NOT per-cell GDScript→C++
+   calls, whose call overhead would eat the win. Ports: `column_profile`/`facet_profile`,
+   `slope_run_of`, `resolve_cell` (+ its tree/snow/slope/liquid/carve helpers), the emit loop,
+   `junction_modify`. Expected: surface 560 → ~5–20 ms, underground 338 → ~2–10 ms (compiled
+   wasm ≈ ×2–3 over native, not ×25) ⇒ **supply 30–35 → ~300+ blocks/s ⇒ supply ≥ demand at
+   every speed**; streaming episodes — and the main-thread degradation window that tracks them
+   (`WALK-PERF` §1.5) — shrink ~10×; M1/M4 collapse together.
+3. The correctness risk is fenced by exactly the discipline R7 just field-proved: an N-block
+   **byte-equality gate** (C++ generator output == GDScript generator output) that demonstrably
+   catches real diffs (43 635 mismatches on the falsification build), plus FLAT verify 6035/0
+   and the G-M2-ID equality gates. The port ships OFF behind a flag until the gate is green at
+   N ≥ 256 across biomes, depth bands, ridges and tree stencils.
+
+**And R3 (skin)? Deferred immediately behind L5, not instead of it — with its numbers
+honestly re-derived.** The skin's own sampling is GDScript `column_profile` on the same ×25
+tax: 2.29 µs/col native → ~60 µs web ⇒ a full 256-disc ≈ **3–5 s** on the builder thread, not
+the 1–2 s promised at ×10 — still a ~10× improvement on today's ~45 s, but marginal against its
+build cost *while the voxel field itself stays starved*. The decisive coupling: **L5 ports the
+very function the skin samples.** Post-L5, (a) the near field fills at 300+ blocks/s, which
+already transforms time-to-cover, and (b) a skin tile costs ~2–3 ms instead of ~60 ms, making R3
+a trivial follow-on for the 128–256 annulus. Building R3 first would mean building it slow, then
+rebuilding its economics after the port anyway. **One path: L5(a) now; R3 as the first post-L5
+item; R2/R9 remain valid cheap demand-shapers that help both before and after (unaffected by
+the cost-model error); R5/R6/U-knobs re-evaluated after L5's numbers land.**
 
 ---
 
@@ -350,6 +460,18 @@ the profile pass >25 % of post-R1 worker time; mechanism already designed
 
 ## 7. Ranked plan
 
+> **FIELD RE-RANKING (2026-07-17 PM, after T1/R1/R7 landed — see §2.3a/§2.6).** The table below
+> is kept as the record of what was predicted; the operative ranking is now:
+> **1) L5(a) C++ generator port** (promoted to THE plan — §2.6; spec pointer: `WALK-PERF` §4 L5,
+> port shape and gates in §2.6 item 2–3; Opus should draft its own patch-level design doc from
+> those constraints before coding), **2) R3 skin** as the first post-L5 item (its sampling cost
+> drops ~25× with the port), **3) R2 + R9** (cheap demand-shapers, unaffected by the cost-model
+> error, still worth their one-conditional/15-line cost), **4) everything else re-evaluated
+> after L5's SW-1 numbers.** Statuses: T1 SHIPPED; R1 SHIPPED-OFF (rejected by the §8 rule:
+> M4 −13 % vs −50 % target, M1/M2 regressed; its class moved only −28 %); R7 SHIPPED-OFF
+> (byte-equality gate green and falsification-tested, but no win to carry it — and the ON
+> build's 11.2 s worst freeze must be root-caused before any reconsideration).
+
 All flags in `godot/src/cosmos/cube_sphere.gd`, `const`, default **OFF**, OFF == byte-identical;
 FLAT `verify_feature` 6035/0 must hold (6056/0 orbital).
 
@@ -369,10 +491,10 @@ FLAT `verify_feature` 6035/0 must hold (6056/0 orbital).
 The `WALK-PERF` ladder (L3 allocation diet, L5 C++ port) stays orthogonal; **re-decide L5 after
 R1+R7 land** — they remove exactly the work L5 would port.
 
-**Staging:** S1 = T1 (deploy, measure mix + stale share) → S2 = R1(+b,c) → S3 = R2 + R9 (one
-deploy; both tiny) → S4 = R3 (behind heap instrument) → S5 = R4 (batch patch 0007 with the
-task-#5 heap-stat line; one rebuild) → S6 = R7 → S7 = conditionals (R5/R6/R8, U1–U3 by user
-taste). Each stage ships alone, measured on SW-1 before the next.
+**Staging (superseded by the field re-ranking above; kept for the record):** S1 = T1 → S2 =
+R1(+b,c) → S3 = R2 + R9 → S4 = R3 → S5 = R4 → S6 = R7 → S7 = conditionals. **Operative staging
+now:** S1' = L5(a) design-then-port with the byte-equality gate (§2.6) → S2' = R3 (post-port
+economics) → S3' = R2 + R9 → S4' = re-run SW-1, re-decide R4/R5/R6/U-knobs from the new numbers.
 
 ---
 

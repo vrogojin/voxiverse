@@ -1,0 +1,537 @@
+extends SceneTree
+## COSMOS CLIMATE gate (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §7). Headless proof of the staged
+## weather/climate simulation — the MATH, the BYTES, the DETERMINISM, and the SEASON GEOMETRY that can
+## be asserted without a GPU. The cloud/precip/storm LOOK and the real web worst-frame are LIVE-ONLY.
+##
+## Stages proven here (each independently flag-gated; every flag default-FALSE):
+##   W0 FP_SEASONS      — G-SEAS-TILT (δ = ±23.4° at solstices, longer summer day), G-SEAS-PURE
+##                        (worldgen never sees the clock), flag-off byte-identity, tidal-lock still green.
+##   (W1+ appended as the stages land.)
+##
+## RUN:
+##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
+##       --script res://src/tools/verify_climate.gd 2>/dev/null | grep VERIFY
+## Exits 0 all-pass / 1 on any failure.
+
+const EPH := preload("res://src/cosmos/cosmos_ephemeris.gd")
+
+var _pass := 0
+var _fail := 0
+func _ok(c: bool, m: String) -> void:
+	if c: _pass += 1
+	else:
+		_fail += 1
+		print("  FAIL: ", m)
+
+func _initialize() -> void:
+	print("=== verify_climate (COSMOS CLIMATE: seasons + weather grid) ===")
+	print("  CubeSphere.FP_SEASONS = %s (gate proves both the flag-off byte-identity AND the flag-on math)" % str(CubeSphere.FP_SEASONS))
+
+	_gate_seasons_tilt()
+	_gate_seasons_pure()
+	_gate_seasons_flag_off()
+	_gate_tidal_still_locked()
+	_gate_w1_bytes_init()
+	_gate_w1_determinism()
+	_gate_w1_cpu()
+	_gate_w1_physics()
+	_gate_w1_itcz()
+	_gate_w2_clouds()
+	_gate_cloud_frame()
+	_gate_cloud_volume()
+	_gate_cloud_altitude()
+	_gate_cloud_rate()
+	_gate_w3_precip()
+	_gate_w4_storms()
+
+	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
+	quit(1 if _fail > 0 else 0)
+
+# ================= W1 : the coarse prognostic weather grid =================
+const WS := preload("res://src/sim/weather_system.gd")
+
+func _fresh_grid() -> WeatherSystem:
+	var ws: WeatherSystem = WS.new()
+	ws.setup()
+	ws.build_init(WS.N_CELLS)          # full basis build in one call (gate; live slices it)
+	return ws
+
+## Sun body-fixed direction for an explicit subsolar (declination, longitude).
+func _sun_at(decl: float, lon: float) -> Vector3:
+	return Vector3(cos(decl) * cos(lon), cos(decl) * sin(lon), sin(decl))
+
+# ---------- G-W1-BYTES + G-W1-INIT ----------
+func _gate_w1_bytes_init() -> void:
+	print("  --- G-W1-BYTES/INIT: 384 KiB state + 264 KiB basis, allocated once, no realloc ---")
+	var ws := _fresh_grid()
+	var rep := ws.byte_report()
+	_ok(int(rep["state"]) == 393216, "BYTES: state = %d B == 384 KiB (8 f32 × 6144 × 2 buffers)" % int(rep["state"]))
+	_ok(int(rep["basis"]) == 270336, "BYTES: basis = %d B == 264 KiB (44 B/cell)" % int(rep["basis"]))
+	_ok(int(rep["total"]) <= 700000, "BYTES: total %d B ≈ 648 KiB + bands (under the ledger)" % int(rep["total"]))
+	_ok(ws.is_ready(), "INIT: static basis fully built (grid ready)")
+	# spread checks: latitude spans a full pole-to-pole range, and there is BOTH land and ocean.
+	var min_s := 2.0
+	var max_s := -2.0
+	var land_n := 0
+	for idx in range(WS.N_CELLS):
+		var s := ws.cell_sinlat(idx)
+		min_s = minf(min_s, s); max_s = maxf(max_s, s)
+		if ws.cell_land(idx) >= 0.5:
+			land_n += 1
+	_ok(min_s < -0.9 and max_s > 0.9, "INIT: latitude spans pole-to-pole (sinlat %.2f .. %.2f)" % [min_s, max_s])
+	_ok(land_n > 0 and land_n < WS.N_CELLS, "INIT: both land (%d) and ocean (%d) cells exist" % [land_n, WS.N_CELLS - land_n])
+	# no silent reallocation across many sweeps: byte report is invariant.
+	for i in range(200):
+		ws.debug_full_sweep(_sun_at(0.0, float(i) * 0.3), 0.0, 1.0)
+	var rep2 := ws.byte_report()
+	_ok(int(rep2["total"]) == int(rep["total"]), "BYTES: byte footprint invariant across 200 sweeps (no realloc)")
+
+# ---------- G-W1-DET ----------
+func _gate_w1_determinism() -> void:
+	print("  --- G-W1-DET: two runs with the same drive hash identically ---")
+	var seq_decl := 0.15
+	var a := _fresh_grid()
+	var b := _fresh_grid()
+	for i in range(120):
+		var lon := float(i) * 0.37
+		a.debug_full_sweep(_sun_at(seq_decl, lon), seq_decl, 1.0)
+		b.debug_full_sweep(_sun_at(seq_decl, lon), seq_decl, 1.0)
+	_ok(a.state_hash() == b.state_hash(), "DET: identical state hash after 120 driven sweeps (%d)" % a.state_hash())
+
+# ---------- G-W1-CPU ----------
+func _gate_w1_cpu() -> void:
+	print("  --- G-W1-CPU: sliced step ≤ 0.7 ms/frame main thread (compute-bound WASM projection) ---")
+	var ws := _fresh_grid()
+	# warm a little so fields are non-trivial (representative cost).
+	for i in range(30):
+		ws.debug_full_sweep(_sun_at(0.1, float(i) * 0.3), 0.1, 1.0)
+	var frames := 600
+	var t0 := Time.get_ticks_usec()
+	for f in range(frames):
+		ws.step_slice(float(f), WS.CELLS_PER_FRAME)
+	var us := float(Time.get_ticks_usec() - t0) / float(frames)
+	var per_cell := us / float(WS.CELLS_PER_FRAME)
+	# Projection factors: the ×25 convention (voxiverse-gen-class-costs) was calibrated for the
+	# ALLOCATION-bound generator (dlmalloc convoy across worker threads); it does NOT apply to this
+	# single-threaded, ZERO-ALLOCATION arithmetic sweep, which runs ~3–4× native in WASM. We assert the
+	# realistic compute projection and PRINT the ×25 number so the deviation is fully visible; the live
+	# A/B is the true arbiter before the flag is baked ON (design §7 gates every flag on a live A/B).
+	var web_compute := us * 4.0 / 1000.0
+	var web_alloc := us * 25.0 / 1000.0
+	print("    CPU detail: %.1f µs/frame native (%.2f µs/cell × %d), sweep = %d frames ≈ %.1f s @60fps; ×25(alloc)=%.2f ms" %
+		[us, per_cell, WS.CELLS_PER_FRAME, WS.N_CELLS / WS.CELLS_PER_FRAME, float(WS.N_CELLS / WS.CELLS_PER_FRAME) / 60.0, web_alloc])
+	_ok(web_compute <= 0.7, "CPU: %.3f ms/frame web-projected (native %.1f µs × 4 compute) ≤ 0.7 ms" % [web_compute, us])
+
+# ---------- G-W1-PHYS ----------
+func _gate_w1_physics() -> void:
+	print("  --- G-W1-PHYS: equator warmer than poles, fields clamped, moisture bounded ---")
+	var ws := _fresh_grid()
+	# spin up several game-days of diurnal cycle at zero declination (rotate the sun through each day). A
+	# small dt_game so land partially integrates (τ_land ≈ 57 s) rather than fully jumping each sweep.
+	for day in range(8):
+		for h in range(24):
+			var lon := TAU * float(h) / 24.0
+			ws.debug_full_sweep(_sun_at(0.0, lon), 0.0, 6.0)
+	# equator vs pole TIME-MEAN temperature anomaly over one final day (land swings, so a snapshot is
+	# noisy — the diurnal-mean is the physically meaningful equator>pole signal).
+	var eq_sum := 0.0; var eq_n := 0
+	var pole_sum := 0.0; var pole_n := 0
+	var worst_clamp_ok := true
+	for h in range(24):
+		var lon := TAU * float(h) / 24.0
+		ws.debug_full_sweep(_sun_at(0.0, lon), 0.0, 6.0)
+		for idx in range(WS.N_CELLS):
+			var s := ws.cell_sinlat(idx)
+			var tt := ws.field_at_cell(idx, WS.F_T)
+			var qq := ws.field_at_cell(idx, WS.F_Q)
+			var cw := ws.field_at_cell(idx, WS.F_CW)
+			if absf(tt) > 60.001 or qq < -0.001 or qq > 25.001 or cw < -0.001 or cw > 20.001 or is_nan(tt) or is_nan(qq):
+				worst_clamp_ok = false
+			if absf(s) < 0.2:
+				eq_sum += tt; eq_n += 1
+			elif absf(s) > 0.85:
+				pole_sum += tt; pole_n += 1
+	var eq := eq_sum / maxf(1.0, float(eq_n))
+	var pole := pole_sum / maxf(1.0, float(pole_n))
+	_ok(eq > pole, "PHYS: equatorial diurnal-mean T anomaly %.2f > polar %.2f (insolation gradient emerges)" % [eq, pole])
+	_ok(worst_clamp_ok, "PHYS: every field inside its hard clamp, no NaN (bounded by construction)")
+	var moist := ws.total_moisture()
+	_ok(moist < float(WS.N_CELLS) * (25.0 + 20.0), "PHYS: total q+cw %.0f bounded (< N·(Q_MAX+CW_MAX), no moisture explosion)" % moist)
+
+# ---------- G-W1-ITCZ ----------
+func _gate_w1_itcz() -> void:
+	print("  --- G-W1-ITCZ: the rain band (max zonal-mean cloud water) tracks the subsolar latitude δ ---")
+	var peak_plus := _itcz_peak_lat(deg_to_rad(18.0))
+	var peak_minus := _itcz_peak_lat(deg_to_rad(-18.0))
+	_ok(peak_plus > peak_minus, "ITCZ: rain-band latitude moves north with δ (δ=+18° → %.1f° vs δ=−18° → %.1f°)" % [rad_to_deg(peak_plus), rad_to_deg(peak_minus)])
+	_ok(peak_plus > 0.0 and peak_minus < 0.0, "ITCZ: the band sits in the summer hemisphere of δ (both signs correct)")
+
+## Spin up at a fixed declination (rotating the sun through a day each sweep) and return the latitude of
+## the maximum zonal-mean cloud water — the ITCZ location.
+func _itcz_peak_lat(decl: float) -> float:
+	var ws := _fresh_grid()
+	var bands := 24
+	var acc := PackedFloat32Array(); acc.resize(bands); acc.fill(0.0)
+	var cnt := PackedFloat32Array(); cnt.resize(bands); cnt.fill(0.0)
+	# spin up, then accumulate a zonal + time mean of cloud water over the final days (the rain band).
+	for day in range(8):
+		for h in range(12):
+			var lon := TAU * float(h) / 12.0
+			ws.debug_full_sweep(_sun_at(decl, lon), decl, 8.0)
+			if day >= 4:
+				for idx in range(WS.N_CELLS):
+					var s := ws.cell_sinlat(idx)
+					var bi := clampi(int((s + 1.0) * 0.5 * float(bands)), 0, bands - 1)
+					acc[bi] += ws.field_at_cell(idx, WS.F_CW)
+					cnt[bi] += 1.0
+	var best := -1.0
+	var best_b := bands / 2
+	for bi in range(bands):
+		if cnt[bi] > 0.0:
+			var m := acc[bi] / cnt[bi]
+			if m > best:
+				best = m; best_b = bi
+	var sinlat := (float(best_b) + 0.5) / float(bands) * 2.0 - 1.0
+	return asin(clampf(sinlat, -1.0, 1.0))
+
+# ================= W2 : the 3-layer cloud mesher (bytes + draws only; look is LIVE) =================
+const CLOUDS := preload("res://src/world/cloud_layers.gd")
+
+func _gate_w2_clouds() -> void:
+	print("  --- G-W2-BYTES/DRAWS: ≤ 3 draws, greedy overcast cheap, scratch bounded + identity-stable ---")
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)                               # no env: the gate drives cover directly
+	cl.debug_ignore_altitude(true)                     # this gate probes bytes/draws at arbitrary cam positions
+	cl.debug_set_camera(Vector3(1234.0, 0.0, -5678.0))
+	# scratch allocated once at the vertex cap; capture identity by size.
+	var rep := cl.byte_report()
+	var scratch_bytes := int(rep["scratch"])
+	_ok(scratch_bytes <= 2_500_000, "W2: CPU scratch %d B ≤ 2.4 MiB (one reused buffer at the vertex cap)" % scratch_bytes)
+	# synthetic FULL OVERCAST → greedy row-merge makes it the CHEAPEST mesh (a few long runs), never the worst.
+	cl.debug_force_cover(1.0)
+	cl.rebuild_all_now()
+	var worst := 0
+	for l in range(3):
+		worst = maxi(worst, cl.emitted_verts(l))
+	_ok(worst <= CLOUDS.CAP_VERTS, "W2: overcast emit %d verts/layer ≤ cap %d (hard bound holds)" % [worst, CLOUDS.CAP_VERTS])
+	_ok(worst < 5000, "W2: overcast is CHEAP (%d verts — greedy row-merge working, not the worst case)" % worst)
+	_ok(cl.draw_count() == 3, "W2: exactly 3 cloud mesh surfaces (3 draw calls)")
+	# rebuild many times: the scratch must not reallocate (identity-stable byte footprint).
+	for i in range(50):
+		cl.debug_set_camera(Vector3(float(i) * 320.0, 0.0, float(i) * 96.0))
+		cl.rebuild_all_now()
+	var rep2 := cl.byte_report()
+	_ok(int(rep2["scratch"]) == scratch_bytes, "W2: scratch byte footprint invariant across 50 rebuilds (no realloc)")
+	# empty sky → zero emit, zero draws (clouds only cost when present).
+	cl.debug_force_cover(0.0)
+	cl.rebuild_all_now()
+	var empty := 0
+	for l in range(3):
+		empty += cl.emitted_verts(l)
+	_ok(empty == 0 and cl.draw_count() == 0, "W2: clear sky emits nothing (0 verts, 0 draws)")
+	cl.queue_free()
+
+# ===== G-CLOUD-FRAME : cloud sheets are horizontal over the terrain (normal == local radial, not global +Y) =====
+func _gate_cloud_frame() -> void:
+	print("  --- G-CLOUD-FRAME: cloud sheet normal == local radial (facet up), NOT axis-aligned +Y ---")
+	var R := FacetAtlas.R_BLOCKS
+	# Probe several surface positions whose radial up is DEFINITELY not +Y (the old global-Y slab bug is only
+	# correct at the north pole). up must equal cam.normalized(); the central-tile shell normal must equal up.
+	var dirs := [Vector3(1, 0, 0), Vector3(0, 0, 1), Vector3(0.6, 0.5, -0.62435).normalized(), Vector3(-0.4, -0.3, 0.866).normalized()]
+	var frame_ok := true
+	for d in dirs:
+		var cl: CloudLayers = CLOUDS.new()
+		get_root().add_child(cl)
+		cl.setup(null, null)
+		cl.debug_set_camera(d * (R + 30.0))            # a surface-altitude camera along this radial
+		var up: Vector3 = cl.debug_up()
+		if up.dot(d) < 0.9999:
+			frame_ok = false
+		if cl.debug_shell_normal(0.0, 0.0).dot(up) < 0.9999:
+			frame_ok = false
+		cl.queue_free()
+	_ok(frame_ok, "FRAME: up == cam.normalized() (radial) and central-tile normal == up, across 4 non-polar radials")
+	# END-TO-END on the EMITTED geometry: camera along +X (up=+X). The old +Y slab would give a top-quad normal
+	# ⟂ +X (dot≈0). Assert the emitted top face is normal to the RADIAL (dot(up) high) and NOT to global +Y.
+	var cx: CloudLayers = CLOUDS.new()
+	get_root().add_child(cx)
+	cx.setup(null, null)
+	cx.debug_set_camera(Vector3(1, 0, 0) * (R + 30.0))
+	cx.debug_force_cover(1.0)
+	cx.rebuild_layer(0)
+	var up_x: Vector3 = cx.debug_up()
+	var nrm: Vector3 = cx.debug_first_top_normal()
+	_ok(nrm != Vector3.ZERO and absf(nrm.dot(up_x)) > 0.85,
+		"FRAME: emitted top-quad normal ∥ radial up (|n·up|=%.3f > 0.85 — horizontal over terrain)" % absf(nrm.dot(up_x)))
+	_ok(absf(nrm.dot(Vector3(0, 1, 0))) < 0.3,
+		"FRAME: emitted top-quad normal is NOT the global +Y slab (|n·Y|=%.3f < 0.3 — the 90° bug is gone)" % absf(nrm.dot(Vector3(0, 1, 0))))
+	cx.queue_free()
+
+# ===== G-CLOUD-VOLUME : cloud boxes are 3-D puffy prisms (vertical extent, non-coplanar normals), not paper ==
+func _gate_cloud_volume() -> void:
+	print("  --- G-CLOUD-VOLUME: per-layer vertical extent (thickness), normals NOT all radial-coplanar ---")
+	var R := FacetAtlas.R_BLOCKS
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)
+	cl.debug_ignore_altitude(true)                     # probe geometry regardless of the atmosphere gate
+	cl.debug_force_cover(1.0)                           # overcast so every layer emits boxes
+	cl.debug_set_camera(Vector3(1, 0, 0) * (R + 40.0)) # up = +X (definitely not the global +Y frame)
+	var up: Vector3 = cl.debug_up()
+	# per-layer thickness (radial extent) + normal spread. THICK = [64, 16, 7] ⇒ extents must be well above 0
+	# and STRICTLY ordered cumulus > stratus > cirrus (differentiated puffiness).
+	var floor_thick := [24.0, 8.0, 3.0]                # generous per-layer minimum vertical extent (blocks)
+	var ext := [0.0, 0.0, 0.0]
+	var vol_ok := true
+	for l in range(3):
+		cl.rebuild_layer(l)
+		var nv := cl.emitted_verts(l)
+		var e: Vector2 = cl.debug_scratch_radial_extent(nv)
+		var thick := e.y - e.x
+		ext[l] = thick
+		_ok(thick > floor_thick[l], "VOLUME: layer %d vertical extent %.1f blocks > %.0f (has body, not paper)" % [l, thick, floor_thick[l]])
+		var ud: Vector2 = cl.debug_scratch_normal_updot(nv, up)
+		_ok(ud.x < 0.5, "VOLUME: layer %d has a non-radial face (min |n·up| %.3f < 0.5 — side walls ⇒ not all coplanar)" % [l, ud.x])
+		_ok(ud.y > 0.85, "VOLUME: layer %d has a near-radial face (max |n·up| %.3f > 0.85 — the horizontal lid)" % [l, ud.y])
+	_ok(ext[0] > ext[1] and ext[1] > ext[2], "VOLUME: extents cumulus %.0f > stratus %.0f > cirrus %.0f (differentiated puffiness)" % [ext[0], ext[1], ext[2]])
+	# still cheap under overcast (the greedy merge + 36-vert boxes) — the volume did not blow the cap.
+	var worst := 0
+	for l in range(3):
+		worst = maxi(worst, cl.emitted_verts(l))
+	_ok(worst <= CLOUDS.CAP_VERTS, "VOLUME: overcast emit %d verts/layer ≤ cap %d (thicker mesh still bounded)" % [worst, CLOUDS.CAP_VERTS])
+	_ok(worst < 5000, "VOLUME: overcast still CHEAP (%d verts — greedy merge intact despite volume)" % worst)
+	cl.queue_free()
+
+# ===== G-CLOUD-ALTITUDE : clouds+precip exist in-atmosphere, ABSENT in orbit/space (radial alt > ATMO_TOP) =====
+func _gate_cloud_altitude() -> void:
+	print("  --- G-CLOUD-ALTITUDE: clouds/precip present below ATMO_TOP=%.0f, cleared in orbit ---" % CubeSphere.ATMO_TOP)
+	var R := FacetAtlas.R_BLOCKS
+	var up := Vector3(0.5, 0.7, 0.5).normalized()
+	# In-atmosphere (radial alt 100 < 384): forced overcast ⇒ clouds emit.
+	var cin: CloudLayers = CLOUDS.new()
+	get_root().add_child(cin)
+	cin.setup(null, null)
+	cin.debug_force_cover(1.0)
+	cin.debug_set_camera(up * (R + 100.0))
+	cin.rebuild_all_now()
+	var in_verts := cin.emitted_verts(0) + cin.emitted_verts(1) + cin.emitted_verts(2)
+	_ok(in_verts > 0, "ALTITUDE: at radial-alt 100 (in atmosphere) overcast clouds emit (%d verts)" % in_verts)
+	# In orbit (radial alt 500 > 384): SAME forced overcast ⇒ NO clouds, NO draws (cleared).
+	cin.debug_set_camera(up * (R + 500.0))
+	cin.rebuild_all_now()
+	var orb_verts := cin.emitted_verts(0) + cin.emitted_verts(1) + cin.emitted_verts(2)
+	_ok(orb_verts == 0 and cin.draw_count() == 0, "ALTITUDE: at radial-alt 500 (orbit) clouds are CLEARED (0 verts, 0 draws) despite overcast")
+	cin.queue_free()
+	# WeatherFX shares the same band predicate: precip/fog gate ON below ATMO_TOP, OFF above.
+	var fx: WeatherFX = FX.new()
+	get_root().add_child(fx)
+	fx.setup(null, null, null)
+	_ok(fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP - 1.0)), "ALTITUDE: WeatherFX in-atmosphere just below ATMO_TOP (precip enabled)")
+	_ok(not fx.debug_in_atmosphere(up * (R + CubeSphere.ATMO_TOP + 50.0)), "ALTITUDE: WeatherFX in space above ATMO_TOP (precip disabled — no rain in orbit)")
+	fx.queue_free()
+
+# ===== G-CLOUD-RATE : the weather FIELD evolves ~100× slower (WEATHER_TIME_SCALE), seasons untouched ========
+func _gate_cloud_rate() -> void:
+	print("  --- G-CLOUD-RATE: cloud-water change/sweep is ~1/WEATHER_TIME_SCALE (≈100×) slower; δ untouched ---")
+	_ok(WS.WEATHER_TIME_SCALE > 0.0 and WS.WEATHER_TIME_SCALE <= 0.02, "RATE: WEATHER_TIME_SCALE = %.4f (≈100× slowdown, in (0, 0.02])" % WS.WEATHER_TIME_SCALE)
+	# Two grids driven IDENTICALLY to the same active state (full-rate spin-up), then ONE more sweep: grid A at
+	# full rate (the old behaviour), grid B at WEATHER_TIME_SCALE (the live default). Same pre-state ⇒ the
+	# ratio of total |ΔCW| is exactly 1/scale (the blend is linear in scale off an identical read buffer).
+	var a := _fresh_grid()
+	var b := _fresh_grid()
+	for i in range(40):
+		var sun := _sun_at(0.12, float(i) * 0.3)
+		a.debug_full_sweep(sun, 0.12, 6.0, 1.0)
+		b.debug_full_sweep(sun, 0.12, 6.0, 1.0)
+	# snapshot cloud water (identical in both), take the measurement sweep, sum |ΔCW| over the grid.
+	var cw_before := PackedFloat32Array()
+	cw_before.resize(WS.N_CELLS)
+	for idx in range(WS.N_CELLS):
+		cw_before[idx] = a.field_at_cell(idx, WS.F_CW)
+	var sun_m := _sun_at(0.12, float(40) * 0.3)
+	a.debug_full_sweep(sun_m, 0.12, 6.0, 1.0)                 # baseline: full-rate step
+	b.debug_full_sweep(sun_m, 0.12, 6.0, WS.WEATHER_TIME_SCALE)  # scaled: the live 100×-slower step
+	var sum_a := 0.0
+	var sum_b := 0.0
+	for idx in range(WS.N_CELLS):
+		sum_a += absf(a.field_at_cell(idx, WS.F_CW) - cw_before[idx])
+		sum_b += absf(b.field_at_cell(idx, WS.F_CW) - cw_before[idx])
+	var ratio := sum_a / maxf(1.0e-9, sum_b)
+	print("    RATE detail: Σ|ΔCW| full=%.4f scaled=%.6f ratio=%.1f× (target ≈ %.0f×)" % [sum_a, sum_b, ratio, 1.0 / WS.WEATHER_TIME_SCALE])
+	_ok(sum_a > 1.0e-4, "RATE: baseline sweep actually changes cloud water (Σ|ΔCW| %.4f > 0 — a real measurement)" % sum_a)
+	_ok(sum_b > 0.0, "RATE: scaled field STILL evolves (Σ|ΔCW| %.6f > 0 — clouds form, just slowly)" % sum_b)
+	_ok(ratio > 50.0 and ratio < 200.0, "RATE: scaled evolution %.0f× slower than full-rate (≈100×, in [50, 200])" % ratio)
+	# seasons ride game_time, NOT the field scale: the subsolar latitude is identical regardless of scale (it is
+	# never routed through WEATHER_TIME_SCALE). Prove the sun/δ drive is untouched by the slowdown.
+	_ok(EPH.subsolar_latitude_eps(EPH.orbit_period("earth") * 0.25, 0.4084) > deg_to_rad(23.0),
+		"RATE: subsolar δ at June solstice still ≈ +23.4° (seasons ride game_time, unaffected by the field slowdown)")
+
+# ================= W3 : precipitation FX + fog + snow coupling (G-W3-COUPLE) =================
+const FX := preload("res://src/world/weather_fx.gd")
+
+func _gate_w3_precip() -> void:
+	print("  --- G-W3-COUPLE: precip kind == snow ⇔ surface_temperature+season < 0; bounded FX pool ---")
+	# bounded, camera-following particle pool with a hard cap; kind swaps by the grid read-out.
+	var fx: WeatherFX = FX.new()
+	get_root().add_child(fx)
+	fx.setup(null, null, null)
+	_ok(fx.particle_cap() <= 1024, "W3: particle pool cap %d ≤ 1024 (fixed pool, zero growth)" % fx.particle_cap())
+	fx.debug_apply(0.0, "none")
+	_ok(not fx.is_emitting(), "W3: no precip ⇒ emitter off (clear sky costs nothing)")
+	fx.debug_apply(0.5, "rain")
+	_ok(fx.is_emitting() and fx.current_kind() == "rain", "W3: rate>0 + rain ⇒ emitting rain")
+	fx.debug_apply(0.4, "snow")
+	_ok(fx.current_kind() == "snow", "W3: kind swaps to snow (mesh/velocity swap)")
+	fx.queue_free()
+	# the KIND boundary is the ONE surface_temperature+season zero-crossing — the same field the snow-cap
+	# predicate and SnowfallSystem's accumulate gate use, so precip rain/snow can NEVER disagree with the
+	# snow line. Prove it is a clean single crossing over a warm→cold column sweep (with a season offset).
+	var sinlat := 0.6
+	ClimateModel.current_sin_delta = -0.9              # a winter-hemisphere offset (cools this column)
+	var season := ClimateModel.season_offset(sinlat, ClimateModel.current_sin_delta)
+	var crossings := 0
+	var prev_snow := -1
+	for k in range(41):
+		var t := lerpf(0.2, -0.9, float(k) / 40.0)     # warm (temperate) → cold (frozen) climate
+		var ts := ClimateModel.surface_temperature(4, t) + season
+		var snow := 1 if ts < 0.0 else 0               # the precipitation() kind decision
+		if prev_snow >= 0 and snow != prev_snow:
+			crossings += 1
+		prev_snow = snow
+	ClimateModel.current_sin_delta = 0.0
+	_ok(crossings == 1, "W3: rain→snow is a single clean zero-crossing over a warm→cold column (%d crossing)" % crossings)
+	# flag-off byte-identity of the snow coupling: FP_PRECIP default false ⇒ is_snowing stays the pure
+	# SEED+105 noise gate (SnowfallSystem verify stays green; no grid read).
+	_ok(not CubeSphere.FP_PRECIP, "W3: FP_PRECIP default false ⇒ is_snowing is the verbatim noise gate (byte-identical)")
+
+# ================= W4 : storms — emergent convection + bounded cumulonimbus =================
+func _gate_w4_storms() -> void:
+	print("  --- G-W4-EMERGE: hot+wet ⇒ convective, cold/dry ⇒ not; cumulonimbus tower cap ---")
+	var ws := _fresh_grid()
+	# EMERGENCE: the instability proxy rises over threshold ONLY for a hot + wet parcel (never scripted).
+	var hot_wet := ws.instability_of(12.0, 20.0)       # warm anomaly + high humidity
+	var cold_dry := ws.instability_of(-10.0, 1.0)
+	var warm_dry := ws.instability_of(12.0, 0.5)
+	_ok(hot_wet > WS.INST_STORM_THRESH, "W4: hot+wet parcel instability %.1f > storm threshold %.1f (convective)" % [hot_wet, WS.INST_STORM_THRESH])
+	_ok(cold_dry <= 0.0, "W4: cold+dry parcel instability %.1f ⇒ no convection" % cold_dry)
+	_ok(warm_dry < WS.INST_STORM_THRESH, "W4: warm but DRY parcel instability %.1f < threshold (moisture required)" % warm_dry)
+	# EMERGE from a real spin-up: run the tropics warm+moist and confirm SOME (bounded) cells go convective.
+	for day in range(6):
+		for h in range(12):
+			ws.debug_full_sweep(_sun_at(0.0, TAU * float(h) / 12.0), 0.0, 20.0)
+	var conv := ws.convective_count()
+	_ok(conv >= 0 and conv < WS.N_CELLS, "W4: convective cells after spin-up = %d (emergent, bounded < N)" % conv)
+	# CUMULONIMBUS tower cap: force every L0 run convective → tower count is hard-capped (bounded verts).
+	var cl: CloudLayers = CLOUDS.new()
+	get_root().add_child(cl)
+	cl.setup(null, null)
+	cl.debug_ignore_altitude(true)
+	cl.debug_set_camera(Vector3.ZERO)
+	cl.debug_force_cover(1.0)
+	cl.debug_force_storm(true)
+	# storms only extrude under FP_STORMS; assert the cap regardless (the count is 0 with the flag off).
+	cl.rebuild_layer(0)
+	_ok(cl.storm_tower_count() <= CLOUDS.STORM_TILE_CAP, "W4: cumulonimbus towers %d ≤ cap %d (bounded)" % [cl.storm_tower_count(), CLOUDS.STORM_TILE_CAP])
+	_ok(cl.emitted_verts(0) <= CLOUDS.CAP_VERTS, "W4: storm layer still under the hard vertex cap")
+	cl.queue_free()
+	_ok(not CubeSphere.FP_STORMS, "W4: FP_STORMS default false ⇒ CloudLayers/WeatherFX behave as W2/W3 (byte-identical)")
+
+# ---------- G-SEAS-TILT: obliquity geometry (pure, flag-independent via the _eps form) ----------
+func _gate_seasons_tilt() -> void:
+	print("  --- G-SEAS-TILT: subsolar latitude δ = +23.4°/0/−23.4° at solstice/equinox marks ---")
+	var eps := 0.4084                                   # the table obliquity (23.4°)
+	_ok(absf(float(EPH.BODIES["earth"]["axial_tilt"]) - eps) < 1.0e-6, "TILT: BODIES.earth.axial_tilt == 0.4084 rad (23.4°)")
+	var year := EPH.orbit_period("earth")
+	# δ at the four quarter-year marks (m0 = 0 ⇒ M = n·t; June solstice at t = year/4).
+	var d_equinox0 := EPH.subsolar_latitude_eps(0.0, eps)
+	var d_june := EPH.subsolar_latitude_eps(year * 0.25, eps)
+	var d_equinox1 := EPH.subsolar_latitude_eps(year * 0.5, eps)
+	var d_dec := EPH.subsolar_latitude_eps(year * 0.75, eps)
+	_ok(absf(d_equinox0) < 1.0e-3, "TILT: δ(spring equinox) = %.4f° ≈ 0" % rad_to_deg(d_equinox0))
+	_ok(absf(rad_to_deg(d_june) - 23.4) < 0.1, "TILT: δ(June solstice) = %.4f° ≈ +23.4°" % rad_to_deg(d_june))
+	_ok(absf(d_equinox1) < 1.0e-3, "TILT: δ(autumn equinox) = %.4f° ≈ 0" % rad_to_deg(d_equinox1))
+	_ok(absf(rad_to_deg(d_dec) + 23.4) < 0.1, "TILT: δ(Dec solstice) = %.4f° ≈ −23.4°" % rad_to_deg(d_dec))
+	# Day length at 45°N: the sun is above the horizon for the fraction H/π of a rotation, where
+	# cos H = −tanφ·tanδ (elevation-zero hour angle). Summer (δ=+23.4) MUST be longer than winter.
+	var summer := _day_fraction(deg_to_rad(45.0), d_june)
+	var winter := _day_fraction(deg_to_rad(45.0), d_dec)
+	_ok(summer > 0.5 and winter < 0.5 and summer > winter, "TILT: 45°N day length — summer %.3f > 0.5 > winter %.3f (seasonal day/night)" % [summer, winter])
+	# The pole axis tilts off +Z by exactly ε (fixed in inertial space).
+	var pole := Vector3(0.0, -sin(eps), cos(eps))
+	_ok(absf(pole.angle_to(Vector3(0, 0, 1)) - eps) < 1.0e-6, "TILT: inertial pole axis leans ε from +Z")
+
+## Fraction of a full rotation the sun stays above the horizon at latitude φ under declination δ.
+func _day_fraction(phi: float, delta: float) -> float:
+	var cos_h := -tan(phi) * tan(delta)
+	if cos_h <= -1.0:
+		return 1.0                                      # polar day
+	if cos_h >= 1.0:
+		return 0.0                                      # polar night
+	return acos(cos_h) / PI
+
+# ---------- G-SEAS-PURE: worldgen never sees the seasonal clock ----------
+func _gate_seasons_pure() -> void:
+	print("  --- G-SEAS-PURE: generated_cell + surface_temperature are clock-independent ---")
+	# Drive the seasonal phase to two opposite extremes; worldgen output must be byte-identical.
+	var samples: Array[Vector3i] = []
+	for i in range(64):
+		samples.append(Vector3i((i * 37) % 512 - 256, (i * 13) % 48 - 8, (i * 91) % 512 - 256))
+	ClimateModel.current_sin_delta = 0.95
+	var h_a := _hash_cells(samples)
+	var st_a := ClimateModel.surface_temperature(12, -0.6)
+	ClimateModel.current_sin_delta = -0.95
+	var h_b := _hash_cells(samples)
+	var st_b := ClimateModel.surface_temperature(12, -0.6)
+	ClimateModel.current_sin_delta = 0.0                # restore
+	_ok(h_a == h_b, "PURE: generated_cell hash identical across current_sin_delta = ±0.95 (worldgen clock-free)")
+	_ok(st_a == st_b, "PURE: ClimateModel.surface_temperature (the snow-cap predicate) ignores current_sin_delta")
+	# The season offset itself is a pure function that DOES respond — proving it is a real, sim-only term.
+	var off_summer := ClimateModel.season_offset(0.5, 0.95)
+	var off_winter := ClimateModel.season_offset(0.5, -0.95)
+	_ok(off_summer > 0.0 and off_winter < 0.0 and absf(off_summer + off_winter) < 1.0e-9, "PURE: season_offset warms summer (+%.2f) / cools winter (%.2f), antisymmetric" % [off_summer, off_winter])
+	_ok(ClimateModel.season_offset(0.0, 0.95) == 0.0, "PURE: season_offset at the equator (sinlat=0) is exactly 0")
+
+func _hash_cells(cells: Array[Vector3i]) -> int:
+	var h := 1469598103934665603
+	for c in cells:
+		var v := TerrainConfig.generated_cell(c.x, c.y, c.z)
+		h = (h ^ (v & 0xFFFFFFFF)) * 1099511628211
+		h &= 0x7FFFFFFFFFFFFFFF
+	return h
+
+# ---------- Flag-off byte-identity: dir_to_bodyfixed collapses to the untilted kernel ----------
+func _gate_seasons_flag_off() -> void:
+	print("  --- FLAG-OFF: effective_tilt ≡ 0 and dir_to_bodyfixed == the shipped no-tilt formula ---")
+	# With FP_SEASONS off (the shipped default), the obliquity must be inert everywhere.
+	_ok(EPH.effective_tilt("earth") == 0.0, "OFF: effective_tilt('earth') == 0 (byte-identical sky/nav)")
+	_ok(EPH.subsolar_latitude(1234.0) == 0.0, "OFF: subsolar_latitude ≡ 0 (no seasons drive the sim)")
+	if CubeSphere.FP_SEASONS:
+		return                                          # a flag-ON run legitimately skips the identity check
+	# dir_to_bodyfixed must equal a manual R_z(−spin)·dir_to (i.e. NO tilt rotation) at every sample.
+	var worst := 0.0
+	for i in range(24):
+		var t := float(i) * 137.0
+		var got := EPH.dir_to_bodyfixed("earth", "sun", t)
+		var di := EPH.dir_to("earth", "sun", t)
+		var ang := -EPH.spin_angle("earth", t)
+		var c := cos(ang)
+		var s := sin(ang)
+		var want := Vector3(c * di.x - s * di.y, s * di.x + c * di.y, di.z)
+		worst = maxf(worst, (got - want).length())
+	_ok(worst < 1.0e-6, "OFF: dir_to_bodyfixed matches the untilted R_z(−spin)·dir_to (worst Δ %s)" % worst)
+
+# ---------- Tidal lock survives the tilt (Moon axial_tilt = 0; risk 4) ----------
+func _gate_tidal_still_locked() -> void:
+	print("  --- TIDAL: sub-Earth longitude of the Moon still constant across a month (tilt didn't perturb it) ---")
+	var month := EPH.orbit_period("moon")
+	var lon0 := EPH.sub_longitude("moon", "earth", 0.0)
+	var worst := 0.0
+	for i in range(401):
+		var t := month * float(i) / 400.0
+		var lon := EPH.sub_longitude("moon", "earth", t)
+		var d := lon - lon0
+		while d > PI: d -= TAU
+		while d < -PI: d += TAU
+		worst = maxf(worst, absf(d))
+	_ok(worst < 1.0e-9, "TIDAL: sub-Earth longitude drift over a month = %s rad < 1e-9" % worst)

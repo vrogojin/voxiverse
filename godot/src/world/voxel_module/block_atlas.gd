@@ -46,7 +46,33 @@ const SNOW_CAP_TINT := 0.18
 
 var texture: Texture2D = null                 # the baked atlas (ImageTexture)
 var image: Image = null                       # the source Image (kept so the verify gate can sample cells)
-var material: StandardMaterial3D = null       # the ONE shared opaque atlas material (identity-checked by G-ATLAS-MAT)
+var material: Material = null                 # the ONE shared opaque atlas material (StandardMaterial3D, or the B3 ShaderMaterial twin under FP_NEAR_DAYLIGHT; identity-checked by G-ATLAS-MAT)
+
+# COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3): the near-field daylight TWIN of the shared atlas
+# material. Keeps vertex-colour×texture EXACTLY (UNSHADED base, white albedo, double-sided, nearest-mipmap +
+# CLAMP) and multiplies an absolute day/night shade(μ), μ = normalize(world_pos)·ŝ (planet centre = scene origin
+# under the fixed frame, §1). shade=1 at noon ⇒ ALBEDO byte-equal to the shipped StandardMaterial output; the
+# night side dims to night_floor so the near ground goes dark exactly as the far shell does. sun_dir fed each
+# frame (set_near_daylight_sun_dir). gl_compat-safe (no loops/derivatives). StandardMaterial fallback = flag off.
+const _NEAR_DAYLIGHT_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform sampler2D atlas_tex : source_color, filter_nearest_mipmap, repeat_disable;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+varying vec3 v_wp;
+varying vec4 v_col;
+void vertex() { v_col = COLOR; v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 n = normalize(v_wp);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 t = texture(atlas_tex, UV);
+	ALBEDO = v_col.rgb * t.rgb * shade;
+}
+"
 var grid := Vector2i(GRID, GRID)              # atlas_size_in_tiles the cube models are configured with
 var _cell_of: Dictionary = {}                 # block_id -> Vector2i(col, row); only opaque cubes that got a cell
 var _snow_cap_cell: Dictionary = {}           # base block_id -> Vector2i; the snow-CAP variant cell (Stage 2, §2.6)
@@ -238,7 +264,19 @@ func _paint_swatch(cell: Vector2i, color: Color) -> void:
 ## The ONE shared opaque atlas material — mirrors block_materials._textured (UNSHADED, white albedo, double-sided,
 ## NEAREST_WITH_MIPMAPS, vertex_color_use_as_albedo) EXCEPT texture_repeat is CLAMP (design §4.3: repeat would wrap
 ## a cell's 0..1 UVs into its neighbour; the cube unit-cell UVs are 0..1 within one cell, so clamp is correct).
-func _make_material(tex: Texture2D) -> StandardMaterial3D:
+func _make_material(tex: Texture2D) -> Material:
+	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the near-field daylight ShaderMaterial twin (keeps vertex-colour×texture
+	# EXACTLY, multiplies the absolute day/night shade). Off ⇒ the shipped StandardMaterial verbatim (byte-identical).
+	if CubeSphere.FP_NEAR_DAYLIGHT:
+		var sh := Shader.new()
+		sh.code = _NEAR_DAYLIGHT_SHADER
+		var sm := ShaderMaterial.new()
+		sm.shader = sh
+		sm.set_shader_parameter("atlas_tex", tex)
+		sm.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+		sm.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		return sm
 	var mat := StandardMaterial3D.new()
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.albedo_color = Color(1, 1, 1)
@@ -248,3 +286,12 @@ func _make_material(tex: Texture2D) -> StandardMaterial3D:
 	mat.texture_repeat = false                      # CLAMP (§4.3)
 	mat.vertex_color_use_as_albedo = true
 	return mat
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): feed the current Sun direction into the near-field daylight twin each
+## frame (forwarded from CosmosSky via module_world/WorldManager). No-op unless the flag is on and the material
+## is the ShaderMaterial twin ⇒ flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
+func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.FP_NEAR_DAYLIGHT:
+		return
+	if material is ShaderMaterial:
+		(material as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)

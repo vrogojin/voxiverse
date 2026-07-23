@@ -1107,7 +1107,8 @@ func _gate_pool_ramp() -> void:
 	_ok(settled and v2 == tgt, "G-M1-RAMP: neighbour ramp REACHED its target (%d) and settled after ~RAMP_SECONDS of ticks" % tgt)
 
 	# 4) Re-designation: `to`(B) target becomes the near radius (128) and RAMPS up (not stepped); old active A SNAPS
-	#    its shrink to 96 immediately (a shrink only unloads).
+	#    its shrink to 96 immediately (a shrink only unloads) — OR, under COSMOS-PERF R4 (FP_SHRINK_PACED), PACES that
+	#    shrink through the ramp (view held above 96 the same frame, stepping ≤SHRINK_STEP_BLOCKS/frame to 96).
 	var near := TC.near_render_radius()
 	_ok(bool(mod.call("redesignate", B)), "G-M1-RAMP: redesignate(%d) POOL HIT" % B)
 	var b_tgt := int(mod.call("pool_view_target", B))
@@ -1115,14 +1116,23 @@ func _gate_pool_ramp() -> void:
 	_ok(b_tgt == near, "G-M1-RAMP: redesignate set `to` view target to the near radius (%d)" % near)
 	_ok(b_view_now < near, "G-M1-RAMP: right after redesignate `to` view (%d) is STILL below the near radius (%d) — it ramps, not steps" % [b_view_now, near])
 	var a_view := int(mod.call("pool_view", active))
-	_ok(a_view == 96, "G-M1-RAMP: the old active facet SNAPPED its shrink to the neighbour radius (96) immediately (view=%d)" % a_view)
-	# Drive the `to` ramp home.
+	if CubeSphere.FP_SHRINK_PACED:
+		# R4: the old active is NOT snapped — the same frame it is still above 96, with its target set to 96 so the
+		# ramp paces the unload down over ≥2 frames (no one-frame 128→96 dlmalloc convoy). Same END STATE (96) below.
+		_ok(a_view > 96, "G-M1-RAMP(paced): old active NOT snapped — view (%d) still above 96 the same frame (shrink paced)" % a_view)
+		_ok(int(mod.call("pool_view_target", active)) == 96, "G-M1-RAMP(paced): old active view target set to 96 (the paced goal)")
+	else:
+		_ok(a_view == 96, "G-M1-RAMP: the old active facet SNAPPED its shrink to the neighbour radius (96) immediately (view=%d)" % a_view)
+	# Drive the `to` ramp home (and, under FP_SHRINK_PACED, the old active's paced shrink).
 	for _j in range(240):
 		if not bool(mod.call("pool_ramp_tick", 0.05)):
 			break
 	var b_final := int(mod.call("pool_view", B))
 	print("  [G-M1-RAMP] post-crossing `to` ramp: view=%d target=%d" % [b_final, near])
 	_ok(b_final == near, "G-M1-RAMP: post-crossing `to` ramp REACHED the near radius (%d)" % near)
+	if CubeSphere.FP_SHRINK_PACED:
+		# R4: the paced shrink reaches the SAME end state the snap would (96) — only the per-frame work was bounded.
+		_ok(int(mod.call("pool_view", active)) == 96, "G-M1-RAMP(paced): old active paced shrink REACHED 96 (same end state as the snap)")
 
 	mod.queue_free()
 	holder.queue_free()

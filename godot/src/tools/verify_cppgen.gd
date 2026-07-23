@@ -133,6 +133,9 @@ func _initialize() -> void:
 	# masks for canonical(), liquid lrids). Merged in from the ONE main-thread freeze helper.
 	for k in TerrainConfig.material_tables():
 		cfg[k] = TerrainConfig.material_tables()[k]
+	# SEAMLESS-SCALES §7.2 item 2: the frozen cheap-tier palette (14 colours in FarColor order) that
+	# sample_columns paints columns with. Single-sourced from FarPalette so C++/GDScript cannot drift.
+	cfg["far_colors"] = FarPalette.frozen_colors()
 	if faceted:
 		cfg["facet_frame"] = atlas["facet_frame"]
 		cfg["facet_off"] = atlas["facet_off"]
@@ -239,14 +242,20 @@ func _initialize() -> void:
 	var live_cell: int = gen.call("resolve_cell", fid, 0, -64, 0)   # y=-64 is always bedrock -> non -1
 	_ok(live_cell != -1,
 		"G-CG-STAGED — resolve_cell is LIVE (S3): returns a real packed cell, not the staged -1")
-	var staged_cols: Dictionary = gen.call("sample_columns", -1, PackedInt64Array([0]))
-	_ok(staged_cols.has("heights") and staged_cols.has("biomes") \
-			and staged_cols.has("water") and staged_cols.has("colors"),
+	# sample_columns went LIVE in C1 (SEAMLESS-SCALES §7.2 item 2). Its staged marker (empty arrays +
+	# staged=true) is inverted here exactly as column_profile/resolve_cell were: a live batch sampler
+	# returns the key set with real data and NO `staged` marker, so a regression that re-stubs it goes red.
+	var live_cols: Dictionary = gen.call("sample_columns", fid, PackedInt64Array([_pack_xz(0, 0)]))
+	_ok(live_cols.has("heights") and live_cols.has("biomes") \
+			and live_cols.has("water") and live_cols.has("colors"),
 		"G-CG-STAGED — sample_columns returns the §7.2 key set {heights,biomes,water,colors}")
-	_ok(bool(staged_cols.get("staged", false)),
-		"G-CG-STAGED — sample_columns is marked staged (this assert MUST be inverted when S2/S3 lands)")
+	_ok(not live_cols.has("staged"),
+		"G-CG-STAGED — sample_columns is LIVE (S2/S3): no staged marker (the inverted tripwire)")
+	_ok((live_cols["heights"] as PackedFloat32Array).size() == 1,
+		"G-CG-STAGED — sample_columns returns exactly one entry per requested column")
 
 	_s2_column_gates(gen, faceted, fid)
+	_s_columns_gates(gen, faceted, fid)
 	_s3_cell_gates(gen, faceted, fid)
 
 	_done(0 if _fail == 0 else 1)
@@ -545,6 +554,148 @@ func _s2_column_gates(gen: Object, faceted: bool, fid: int) -> void:
 		% [prof_bad, n_cols, ("" if prof_bad == 0 else ("; first: " + first_prof_msg))])
 	_ok(slope_bad == 0, "G-CG-SLOPE — %d/%d slope runs mismatched%s"
 		% [slope_bad, n_cols, ("" if slope_bad == 0 else ("; first: " + first_slope_msg))])
+
+## Pack a lattice column (x, z) into the int64 sample_columns expects: x in the low 32 bits, z in the
+## high 32 (VoxelGeneratorCosmos unpacks through int32_t, so negative lattice coords survive).
+func _pack_xz(x: int, z: int) -> int:
+	return (x & 0xffffffff) | ((z & 0xffffffff) << 32)
+
+## ------------------------------------------------------------------------------------------------
+## C1 — the batch column gate. C++ sample_columns(fid, cells) heights/biomes/water/colors == the
+## GDScript column_profile / FarPalette.color_for over >= 1e4 columns, spanning biomes, coasts and
+## facet-EDGE (ridge/seam) columns. This is what makes the skin tier safe: a skin tile and the voxels
+## it overdraws sample the SAME core, so heights cannot disagree; and the skin meets the far ring
+## because both take the same FarPalette classifier.
+##
+##   G-CG-COLUMNS       every requested column's height/biome/water/colour matches the GDScript oracle.
+##   G-CG-COLUMNS-COVER the sweep is not vacuous: >= 1e4 columns, >= 5 biomes, coast columns present,
+##                      and facet-edge (ridge/seam) columns explicitly included.
+##   G-CG-COLUMNS-FALS  the comparator is not vacuous: a +1 height perturbation and a tweaked colour are
+##                      both flagged by the same equality tests the gate uses (proves it can go red).
+## ------------------------------------------------------------------------------------------------
+func _s_columns_gates(gen: Object, faceted: bool, fid: int) -> void:
+	# Column groups, per facet (faceted) or per flat anchor. Each group is sampled with ONE
+	# sample_columns call — that batch shape is the whole point (§7.2).
+	var groups: Array = []                 # [[fid, [ [x,z], ... ]], ...]
+	var edge_cols := 0
+	if faceted:
+		var nf: int = int(FacetAtlas.frozen_atlas()["facet_count"])
+		# Prefer slope-firing facets (mountain terrain — the interesting biomes/coasts), then top up by
+		# stride for breadth, mirroring the S2 sweep's facet selection.
+		var picks: Array = []
+		var f := 0
+		while f < nf and picks.size() < 8:
+			var lo: Vector2i = FacetAtlas.dom_min(f)
+			var hi: Vector2i = FacetAtlas.dom_max(f)
+			TerrainConfig.set_active_facet(f)
+			if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of((lo.x + hi.x) / 2, (lo.y + hi.y) / 2)):
+				picks.append(f)
+			f += 1
+		TerrainConfig.set_active_facet(fid)
+		var step: int = maxi(1, nf / 16)
+		f = 0
+		while f < nf and picks.size() < 16:
+			if not picks.has(f):
+				picks.append(f)
+			f += step
+		for pf in picks:
+			var lo2: Vector2i = FacetAtlas.dom_min(pf)
+			var hi2: Vector2i = FacetAtlas.dom_max(pf)
+			var cx := (lo2.x + hi2.x) / 2
+			var cz := (lo2.y + hi2.y) / 2
+			var cols: Array = []
+			for dz in range(-14, 14):
+				for dx in range(-14, 14):
+					cols.append([cx + dx, cz + dz])
+			# Facet-EDGE (ridge/seam) columns: the four domain borders. These are the columns a skin
+			# tile shares with the neighbour facet's tile, so parity here is what the design demands.
+			for e in range(lo2.x, hi2.x + 1):
+				cols.append([e, lo2.y]); cols.append([e, hi2.y]); edge_cols += 2
+			for e2 in range(lo2.y, hi2.y + 1):
+				cols.append([lo2.x, e2]); cols.append([hi2.x, e2]); edge_cols += 2
+			groups.append([pf, cols])
+	else:
+		var ocean := Vector2i(512, 0)
+		for radius in range(64, 4096, 64):
+			var oc := TerrainConfig.column_profile(radius, 0, {})
+			if int(oc.x) < TerrainConfig.SEA_LEVEL - 2:
+				ocean = Vector2i(radius, 0)
+				break
+		for a in [TerrainConfig.find_spawn(), TerrainConfig.find_mountain(),
+				TerrainConfig.find_cold(), TerrainConfig.find_coast(), ocean]:
+			var cols3: Array = []
+			for dz in range(-24, 24):
+				for dx in range(-24, 24):
+					cols3.append([a.x + dx, a.y + dz])
+			groups.append([-1, cols3])
+
+	var n_cols := 0
+	var h_bad := 0
+	var b_bad := 0
+	var w_bad := 0
+	var c_bad := 0
+	var first := ""
+	var biomes_seen := {}
+	var coast_cols := 0
+
+	for grp in groups:
+		var sfid: int = grp[0]
+		var cols: Array = grp[1]
+		var pcache = TerrainConfig.GenCtx.new(0, sfid) if faceted else {}
+		var packed := PackedInt64Array()
+		packed.resize(cols.size())
+		for i in range(cols.size()):
+			packed[i] = _pack_xz(int(cols[i][0]), int(cols[i][1]))
+		var res: Dictionary = gen.call("sample_columns", sfid, packed)
+		var hs: PackedFloat32Array = res["heights"]
+		var bs: PackedInt32Array = res["biomes"]
+		var ws: PackedByteArray = res["water"]
+		var cs: PackedColorArray = res["colors"]
+		if hs.size() != cols.size():
+			_ok(false, "G-CG-COLUMNS — sample_columns returned %d entries for %d columns" % [hs.size(), cols.size()])
+			return
+		for i in range(cols.size()):
+			var x: int = int(cols[i][0])
+			var z: int = int(cols[i][1])
+			var gd: Vector4 = TerrainConfig.column_profile(x, z, pcache)
+			var g := int(gd.x)
+			var biome := int(gd.y)
+			var w := g < TerrainConfig.SEA_LEVEL
+			n_cols += 1
+			biomes_seen[biome] = true
+			if g >= TerrainConfig.SEA_LEVEL - 2 and g <= TerrainConfig.SEA_LEVEL + 2:
+				coast_cols += 1
+			if int(hs[i]) != g:
+				h_bad += 1
+				if first == "":
+					first = "(%d,%d) height C++ %d != GD %d" % [x, z, int(hs[i]), g]
+			if int(bs[i]) != biome:
+				b_bad += 1
+			if (int(ws[i]) != 0) != w:
+				w_bad += 1
+			var want: Color = FarPalette.color_for(g, biome, gd.w, w)
+			if cs[i] != want:
+				c_bad += 1
+				if first == "":
+					first = "(%d,%d) colour C++ %s != GD %s" % [x, z, str(cs[i]), str(want)]
+
+	print("  ... G-CG-COLUMNS swept %d columns (%d edge) across %d groups" % [n_cols, edge_cols, groups.size()])
+	_ok(n_cols >= 10000, "G-CG-COLUMNS-COVER — swept %d columns (>= 1e4)" % n_cols)
+	_ok(biomes_seen.size() >= 5, "G-CG-COLUMNS-COVER — %d distinct biomes: %s" % [biomes_seen.size(), str(biomes_seen.keys())])
+	_ok(coast_cols > 0, "G-CG-COLUMNS-COVER — %d coast/sea-level columns" % coast_cols)
+	_ok(not faceted or edge_cols > 0, "G-CG-COLUMNS-COVER — %d facet-edge (ridge/seam) columns included" % edge_cols)
+	_ok(h_bad == 0, "G-CG-COLUMNS — %d/%d heights mismatched%s" % [h_bad, n_cols, ("" if h_bad == 0 else ("; first: " + first))])
+	_ok(b_bad == 0, "G-CG-COLUMNS — %d/%d biomes mismatched" % [b_bad, n_cols])
+	_ok(w_bad == 0, "G-CG-COLUMNS — %d/%d water flags mismatched" % [w_bad, n_cols])
+	_ok(c_bad == 0, "G-CG-COLUMNS — %d/%d colours mismatched%s" % [c_bad, n_cols, ("" if c_bad == 0 else ("; first: " + first))])
+
+	# G-CG-COLUMNS-FALS — the comparator is not vacuous. Feed the SAME equality tests a deliberately
+	# corrupted value and require rejection, so "0 mismatched" means the comparator discriminates.
+	var sample: Dictionary = gen.call("sample_columns", fid, PackedInt64Array([_pack_xz(0, 0)]))
+	var h0: float = (sample["heights"] as PackedFloat32Array)[0]
+	var c0: Color = (sample["colors"] as PackedColorArray)[0]
+	_ok(int(h0 + 1.0) != int(h0), "G-CG-COLUMNS-FALS — the height comparator REJECTS a +1 perturbation")
+	_ok(c0 != Color(c0.r + 0.05, c0.g, c0.b, c0.a), "G-CG-COLUMNS-FALS — the colour comparator REJECTS a tweaked colour")
 
 ## Exact equality. NOT approximate: C++ and GDScript call the same const method on the same Noise
 ## instance, so any difference at all is a broken assumption about the marshalling boundary, not a

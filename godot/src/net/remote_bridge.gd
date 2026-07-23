@@ -72,7 +72,11 @@ const UNATTENDED_RESUME_IDLE_MS := 5000     # §6.6: after an override in UNATTE
 const MAX_STEPS := 64
 const MAX_MOVE_BLOCKS := 128
 const STALE_S := 120.0
-const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload"]
+const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload",
+	# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the dev/test space-nav verbs. Behind CONTROL_ENABLED like
+	# every op; the executor that runs them exists only under a live grant, so this list is dead in normal play.
+	"dev_nav", "nav", "thrust", "roll"]
+const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
 # COSMOS-PERF L2 (docs/COSMOS-PERF-ARCHITECTURE-ANALYSIS.md §1.1/§4 L2) — capture hygiene. The synchronous
@@ -134,6 +138,7 @@ var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hu
 var _win_acc := 0.0
 var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
+var _win_had_capture := false       # T2f: this window initiated an ambient frame capture (~35 ms readback) — stamp cap=1 so analysis can exclude it
 
 # MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
 # godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
@@ -409,6 +414,11 @@ func _process(delta: float) -> void:
 	# array check when there is nothing to send (the normal case), which is byte-free vs the ambient stream.
 	_drain_crossing_events()
 
+	# ── Far-ring build/swap timing events (T2e) ──────────────────────────────────────────────────
+	# Same event-drain discipline as the crossing events: drained every frame, published as distinct {"type":"farring"}
+	# records the moment a rebuild swaps in. Normally empty (a rebuild is seconds apart), so this is a guarded no-op.
+	_drain_farring_events()
+
 	# ── Telemetry tick ────────────────────────────────────────────────────────────────────────
 	if _win_acc >= TELEMETRY_INTERVAL:
 		_send_telemetry()
@@ -644,6 +654,18 @@ func _send_telemetry() -> void:
 			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
 
+	# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer attribution + the capture-window marker. snow_ms/ctrl_ms
+	# are this window's WORST single-frame snowfall-step / controller-tick cost (WorldManager accumulates the max, resets on
+	# read); cap=1 marks a window whose frames include the ambient capture readback (~35 ms) so the §6 metrics can exclude
+	# capture-polluted windows honestly. Telemetry-only — no frame behaviour changes.
+	if is_instance_valid(world) and world.has_method("take_perf_attrib"):
+		var pa = world.call("take_perf_attrib")
+		if pa is Dictionary:
+			msg.merge(pa as Dictionary)
+	if _win_had_capture:
+		msg["cap"] = 1
+		_win_had_capture = false
+
 	# CROSSING-FASTGEN obs-2 fix (4): stamp the EXPORTED FP_* flag set into the FIRST telemetry record (deploy flips these
 	# via sed before export, so reading the compiled consts gives exactly-what-shipped provenance — BUILD-INFO.txt is
 	# written during the earlier engine build, before the sed, so it cannot). Emitted once (small, static); read live.
@@ -655,6 +677,12 @@ func _send_telemetry() -> void:
 			"FP_VEL_PREDICT": CubeSphere.FP_VEL_PREDICT, "FP_FIXED_FRAME": CubeSphere.FP_FIXED_FRAME,
 			"FP_FARRING_FULL_COVER": CubeSphere.FP_FARRING_FULL_COVER, "FP_NO_NEAR_LOD": CubeSphere.FP_NO_NEAR_LOD,
 			"FP_ATLAS_MATERIAL": CubeSphere.FP_ATLAS_MATERIAL, "POOL_CROSSING_PREGEN": CubeSphere.POOL_CROSSING_PREGEN,
+			# T2d (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): the post-port provenance gap — we could not prove what build
+			# produced a telemetry file (the async far-ring / CPPGEN / sky deploy state was unknown from telemetry alone).
+			"FP_CPPGEN": CubeSphere.FP_CPPGEN, "FP_FARRING_FAST_REBUILD": CubeSphere.FP_FARRING_FAST_REBUILD,
+			"FP_FARRING_ASYNC_REBUILD": CubeSphere.FP_FARRING_ASYNC_REBUILD, "ORBITAL_SKY": CubeSphere.ORBITAL_SKY,
+			"FP_COLBULK": CubeSphere.FP_COLBULK, "FP_STAMP": CubeSphere.FP_STAMP,
+			"FP_INFLIGHT_GATE": CubeSphere.FP_INFLIGHT_GATE,
 		}
 
 	# Telemetry is small (~1 KB) and the signal we most want to keep, so it is NOT shed at the frame
@@ -696,6 +724,28 @@ func _drain_crossing_events() -> void:
 				"end_usec": Time.get_ticks_usec() + POST_CROSS_WINDOW_MS * 1000, "worst_ms": 0.0, "frames": 0})
 
 
+## T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): drain WorldManager's far-ring build/swap timing queue and publish each
+## record as a distinct {"type":"farring", path, build_ms, swap_ms, verts} JSON on the authed telemetry socket (the relay
+## appends any unknown JSON line to telemetry.jsonl — no relay change). Same guards/backpressure as the crossing drain, so
+## it never crashes the bridge nor piles onto a stalled socket. The record already carries its own "type":"farring".
+func _drain_farring_events() -> void:
+	if not is_instance_valid(world) or not world.has_method("take_farring_events"):
+		return
+	var events: Array = world.call("take_farring_events")
+	if events.is_empty():
+		return
+	for ev in events:
+		if not (ev is Dictionary):
+			continue
+		if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN \
+				or _ws.get_current_outbound_buffered_amount() >= OUTBOUND_BUFFER_BYTES - 65536:
+			break
+		var msg: Dictionary = (ev as Dictionary).duplicate()
+		msg["t"] = Time.get_unix_time_from_system()
+		msg["up_ms"] = Time.get_ticks_msec()
+		_ws.send_text(JSON.stringify(msg))
+
+
 ## A1-REFINE (#114): track the worst frame in each open post-crossing window; when a window closes, emit a
 ## {"ev":"crossing_after"} record attributing that DEFERRED spike to its crossing — the real cost the
 ## synchronous transform_ms bracket misses. Bounded (POST_CROSS_MAX), no-op when no window is open.
@@ -726,6 +776,31 @@ func _merge_rich_state(msg: Dictionary) -> void:
 	if is_instance_valid(player):
 		var p := player.global_position
 		msg["pos"] = [snappedf(p.x, 0.01), snappedf(p.y, 0.01), snappedf(p.z, 0.01)]
+		# COSMOS SPACE-NAV SN2 (§7.5): the nav-frame machine telemetry (nav_mode/frame_v/|v_bci|/nav_frame),
+		# ADDITIVE + GUARDED — an empty dict (flag-off, or the method absent) merges nothing, so a build with
+		# SN_NAV_MODES=false stamps exactly the shipped fields (byte-identical telemetry).
+		if player.has_method("nav_telemetry"):
+			var nt = player.call("nav_telemetry")
+			if nt is Dictionary and not (nt as Dictionary).is_empty():
+				msg.merge(nt as Dictionary)
+			# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): the self-verification telemetry (alt/v_circ/orbit_r/
+			# body/dev_nav/coasting/flying/on_ground/att) a scripted test flight asserts each mechanic on. ADDITIVE +
+			# empty-dict-guarded — space_telemetry() returns {} when the nav machine is off (byte-identical stream).
+			if player.has_method("space_telemetry"):
+				var stel = player.call("space_telemetry")
+				if stel is Dictionary and not (stel as Dictionary).is_empty():
+					msg.merge(stel as Dictionary)
+		# COSMOS-PERF FALL-TIMING (FP_FALL_TIMING): the per-segment CPU µs (window MAX) for the free-fall hotspot hunt.
+		# ADDITIVE + empty-dict-guarded exactly like space_telemetry — fall_timing() returns {} with the flag off (the
+		# accumulator was never written), so a shipped build stamps NO t_*_us keys (byte-identical telemetry).
+		if player.has_method("fall_timing"):
+			var ft = player.call("fall_timing")
+			if ft is Dictionary and not (ft as Dictionary).is_empty():
+				msg.merge(ft as Dictionary)
+		# COSMOS-ORBITAL-SHELL H-B: the live camera far plane, so "shell emitted but far side clipped" (far-plane) is
+		# directly readable next to sh_d/sh_h (compare far to the limb tangent √(d²−R²)). Guarded; 0 when absent.
+		if player.has_method("camera_far"):
+			msg["cam_far"] = snappedf(float(player.call("camera_far")), 0.1)
 	# Active facet is a global (faceted mode); -1 when non-faceted. Static call is always safe.
 	msg["facet"] = TerrainConfig.active_facet()
 	if is_instance_valid(world):
@@ -751,6 +826,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var ls = world.call("lod_stats")
 			if ls is Dictionary and not (ls as Dictionary).is_empty():
 				msg["lod"] = ls
+			# COSMOS-ORBITAL-SHELL live-path telemetry — the far-ring driver→warm→emit→draw state, so ONE orbit fly
+			# disambiguates the far-side-blank stage (warm/emit stall vs draw/far-plane vs wrong axis). ADDITIVE +
+			# empty-dict-guarded: with the camera-set law off/never-engaged shell_telemetry() is {} → nothing stamped.
+		if world.has_method("shell_telemetry"):
+			var sh = world.call("shell_telemetry")
+			if sh is Dictionary and not (sh as Dictionary).is_empty():
+				msg.merge(sh as Dictionary)
 
 
 ## Capture the game canvas and send it as a binary JPEG frame, unless a capture is already inflight
@@ -767,6 +849,7 @@ func _maybe_capture_frame() -> void:
 	if _ws.get_current_outbound_buffered_amount() > OUTBOUND_BACKPRESSURE_BYTES:
 		return   # socket is behind — drop this frame rather than pile on latency
 	_capturing = true
+	_win_had_capture = true           # T2f: the ~35 ms readback lands this frame → mark the window for capture-exclusion in analysis
 	_capture_frame_async()
 
 
@@ -1029,6 +1112,16 @@ func _validate_cmd(m: Dictionary) -> String:
 			var b = (st as Dictionary).get("blocks", null)
 			if not (b is float or b is int) or float(b) <= 0.0 or float(b) > MAX_MOVE_BLOCKS:
 				return "caps"
+		# SPACE-FLY: thrust/roll are TIMED holds — the seconds must be a finite, bounded, positive number.
+		if op == "thrust" or op == "roll":
+			var s = (st as Dictionary).get("seconds", null)
+			if not (s is float or s is int) or float(s) <= 0.0 or float(s) > MAX_HOLD_S:
+				return "caps"
+		# SPACE-FLY: dev_nav.on must be a bool; nav.verb must be a known verb.
+		if op == "dev_nav" and not ((st as Dictionary).get("on", null) is bool):
+			return "caps"
+		if op == "nav" and not ["orbit", "geostation", "detach"].has(str((st as Dictionary).get("verb", ""))):
+			return "caps"
 	return ""
 
 

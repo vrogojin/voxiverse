@@ -73,6 +73,7 @@ var _lod_mesher = null
 # the MINIMUM leg duration, stretched (never compressed) under load; pace 0 fully HOLDS a grow. Shrinks (unloads) are
 # never throttled. Default 1.0 → byte-identical to the shipped fixed ramp (M2c never calls it with <1; M2d does).
 var _stream_pace := 1.0
+var _voxel_engine: Object = null              # FP_INFLIGHT_GATE (P1): lazily-cached VoxelEngine singleton for the main-thread apply-queue read
 var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
 var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
                                               # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
@@ -97,6 +98,10 @@ const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
 # flag-OFF (FP-S1) restream path only, which the pool never takes (redesignate replaces restream).
 const RAMP_START_BLOCKS := 48.0
 const RAMP_SECONDS := 1.5
+# COSMOS-PERF UNATTENDED R4 (FP_SHRINK_PACED): max view-distance a shrinking slot sheds per frame — one 16-block
+# mesh-block shell. A crossing's 128→96 FROM-slot shrink then de-bursts across ⌈32/16⌉ = 2 frames instead of a
+# single-frame unload of both shells (the wasm dlmalloc convoy trigger). Mirrors CubeSphere.SHRINK_STEP_BLOCKS.
+const SHRINK_STEP_BLOCKS := 16.0
 var _ramp_active := false
 var _ramp_view := 0.0
 var _ramp_target := 0.0
@@ -369,6 +374,7 @@ func setup() -> bool:
 	# COSMOS FP-CARVE (patch 0004): push the active facet's ridge planes into the mesher's carve blob BEFORE
 	# the terrain starts streaming, so the first meshed block already clips its seam junction sentinels.
 	_push_facet_carve()
+	_push_facet_datum_bake()                          # COSMOS FS2′ (patch 0010): the near-mesh per-vertex +s bake
 	# FP-M1c (§4.1): under the pool flag the active terrain lives in a FacetSlot under PlanetRoot (composite
 	# identity — byte-identical world placement to the direct-child path, just reparented), bounds-clamped to
 	# its own facet slab. Flag OFF ⇒ the shipped single-terrain scene graph (add_child at ZERO), untouched.
@@ -430,18 +436,43 @@ func _pool_ramp_kick() -> void:
 ## can never collectively flood the 2 web workers + the main-thread mesh-apply. Shrinks (view_f > target) only UNLOAD,
 ## so every shrinking slot snaps immediately the same frame. Returns true while any slot still has growing to do.
 func _ramp_pool_step(delta: float) -> bool:
+	# FP_LANDING_STREAM_KICK: after a de-orbit LAND the active facet is the RESIDENT pool slot with no imminent
+	# successor (no crossing is pending), so the grow leg below runs at the raw _stream_pace — which the load
+	# controller pins at 0 whenever its backlog/apply gate is held closed (a far-ring/shell rebuild churning
+	# in-flight work). The active near field then never grows and issues zero load requests. Repair a collapsed
+	# view_target (a churned crossing may have left the active slot below the full near radius) so the pace floor
+	# below has a real goal to reach. NEVER-OOM: target is capped at near_render_radius (the existing active cap).
+	if CubeSphere.FP_LANDING_STREAM_KICK and _pool_active >= 0 and _pool.has(_pool_active) \
+			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+		var a: Dictionary = _pool[_pool_active]
+		var full := float(TerrainConfig.near_render_radius())
+		if float(a["view_target"]) < full - 0.5 and float(a["view_f"]) < full - 0.5:
+			a["ramp_from"] = float(a["view_f"])
+			a["view_target"] = full
 	var up_fid := -1
 	var up_spawn := 0
 	var up_active := false
+	var shrinking := false                       # R4: a paced shrink still has blocks to shed → keep processing alive
 	for fid in _pool:
 		var s: Dictionary = _pool[fid]
 		var cur: float = s["view_f"]
 		var tgt: float = s["view_target"]
 		if cur > tgt + 0.5:
-			# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
-			s["view_f"] = tgt
-			s["view"] = int(round(tgt))
-			_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+			if CubeSphere.FP_SHRINK_PACED:
+				# COSMOS-PERF UNATTENDED R4: PACE the unload — shed at most SHRINK_STEP_BLOCKS (one mesh-block shell)
+				# this frame instead of snapping to tgt, so the free burst spreads over ⌈Δview/step⌉ frames (no
+				# one-frame 128→96 dlmalloc convoy). Same END STATE (reaches tgt), only the per-frame delta is bounded.
+				var nv := maxf(cur - SHRINK_STEP_BLOCKS, tgt)
+				s["view_f"] = nv
+				s["view"] = int(round(nv))
+				_set_if(s["terrain"], "max_view_distance", int(s["view"]))
+				if nv > tgt + 0.5:
+					shrinking = true             # not yet at target → more shrink frames to come
+			else:
+				# Shrink = pure unload → snap now (cheap), for every shrinking slot the same frame.
+				s["view_f"] = tgt
+				s["view"] = int(round(tgt))
+				_set_if(s["terrain"], "max_view_distance", int(s["view"]))
 		elif cur < tgt - 0.5:
 			# Grow candidate — pick ONE: active wins; else the oldest (smallest spawn_ms).
 			var is_active := (int(fid) == _pool_active)
@@ -451,7 +482,9 @@ func _ramp_pool_step(delta: float) -> bool:
 				up_spawn = int(s["spawn_ms"])
 				up_active = is_active
 	if up_fid < 0:
-		return false
+		# R4: no grow candidate, but a paced shrink in flight must keep the ramp processing alive so it finishes
+		# shedding on later frames. Off ⇒ `shrinking` is always false ⇒ the shipped `return false` (byte-identical).
+		return shrinking
 	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
 	var sc: Dictionary = _pool[up_fid]
 	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
@@ -466,10 +499,38 @@ func _ramp_pool_step(delta: float) -> bool:
 		# crossing target finishes filling DURING the approach instead of bursting at the seam; an uncommitted imminent
 		# keeps the shipped RELIEF_FLOOR trickle. Memory-neutral (same view_target); only the fill RATE changes.
 		pace = maxf(pace, CubeSphere.CTRL_IMMINENT_COMMIT_PACE if _imminent_committed else CubeSphere.CTRL_RELIEF_FLOOR)
+	# FP_INFLIGHT_GATE (P1) feed-forward: cut the ramp pace by the main-thread apply-queue depth so admission never
+	# outruns the apply/upload stage (the post-port choke). Applied AFTER the imminent floor so the committed imminent
+	# slot keeps its priority ORDER but is still throttled by the apply queue (its old exemption assumed gen was the
+	# choke). Off ⇒ pace is untouched — the shipped ramp math verbatim, byte-identical.
+	if CubeSphere.FP_INFLIGHT_GATE:
+		pace *= clampf(1.0 - float(_inflight_main_q()) / float(CubeSphere.APPLY_CHOKE), 0.0, 1.0)
+	# FP_LANDING_STREAM_KICK: floor the RESIDENT active slot's grow pace (no imminent successor) at CTRL_RELIEF_FLOOR —
+	# AFTER the FP_INFLIGHT_GATE cut, so a load gate held at 0 (backlog/apply/shell thrash) can never freeze the near
+	# field. The committed-imminent slot keeps its own floor above; this closes the ONLY remaining unfloored grow path
+	# (the settled/landed active). Bounded: RAMP_SECONDS/0.25 ≈ 6 s to fill, view_target already capped (NEVER-OOM).
+	if CubeSphere.FP_LANDING_STREAM_KICK and up_fid == _pool_active \
+			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
 	return true
+
+## FP_INFLIGHT_GATE (P1): the current main-thread apply/free queue depth (VoxelEngine tasks.main_thread) for the
+## feed-forward ramp pace cut. Lazy cached-singleton lookup; returns 0 when the engine/stat is unavailable (⇒ no
+## throttle). Called only from _ramp_pool_step under the flag, i.e. only while a slot is actively growing — at most
+## once per frame, so the extra get_stats() is negligible and never runs with the flag off.
+func _inflight_main_q() -> int:
+	if _voxel_engine == null:
+		if Engine.has_singleton("VoxelEngine"):
+			_voxel_engine = Engine.get_singleton("VoxelEngine")
+		else:
+			return 0
+	if not _voxel_engine.has_method("get_stats"):
+		return 0
+	var st: Dictionary = _voxel_engine.call("get_stats")
+	return int((st.get("tasks", {}) as Dictionary).get("main_thread", 0))
 
 ## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
 ## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
@@ -765,6 +826,12 @@ func appearance_count() -> int:
 ## bootstrap block id to its library model index (== id for the bootstrap set).
 func atlas():
 	return _atlas
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the shared atlas material's daylight
+## twin. No-op with no atlas or the flag off (the atlas setter self-guards) ⇒ byte-identical.
+func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if _atlas != null and _atlas.has_method("set_near_daylight_sun_dir"):
+		_atlas.set_near_daylight_sun_dir(sun_dir)
 
 func library_model(arid: int) -> Object:
 	if _library == null:
@@ -1523,6 +1590,7 @@ func set_home_face(face: int, old_wrapper_pos: Vector3 = Vector3.INF, mwin: Arra
 ## push happens BEFORE restream() (B7) so no in-flight block can mesh a junction cell with stale planes.
 func set_facet(fid: int, old_wrapper_pos: Vector3 = Vector3.INF) -> void:
 	_push_facet_carve()                               # push the NEW facet's ridge planes (B7: before restream)
+	_push_facet_datum_bake()                          # COSMOS FS2′ (patch 0010): re-affirm the near-mesh +s bake
 	restream(old_wrapper_pos)
 
 ## COSMOS FP-CARVE (patch 0004) — push the active facet's own-side ridge planes into the compiled mesher's
@@ -1542,6 +1610,16 @@ func _push_facet_carve() -> void:
 		"arid_base": _carve_base,
 		"arid_count": _carve_count,
 	})
+
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.1) — push the active facet's frozen datum-bake blob into the
+## compiled mesher's per-vertex `y += s` hook (VoxelMesherBlocky.set_facet_datum_bake, C++ patch 0010). has_method-
+## guarded: an unpatched binary ignores it and the near mesh is plain (no lift). datum_bake_params returns
+## {enabled:false} when FP_DATUM_BAKE is off / no active facet ⇒ byte-identical. Called at setup + each crossing,
+## exactly like _push_facet_carve (the active mesher is a pool slot already primed at spawn — this re-affirms it).
+func _push_facet_datum_bake() -> void:
+	if _mesher == null or not _mesher.has_method("set_facet_datum_bake"):
+		return
+	_mesher.call("set_facet_datum_bake", FacetAtlas.datum_bake_params(TerrainConfig.active_facet()))
 
 # ============================ FP-M1c Planet Assembly pool (flag: CubeSphere.FP_M1_POOL) ============================
 # The pooled rotated-neighbour terrains + re-designation crossing (docs/COSMOS-FP-M1-DESIGN.md §4, §5). Reuses THIS
@@ -1574,6 +1652,10 @@ func _pool_build_slot(fid: int, view_blocks: int, editable: bool) -> Dictionary:
 			})
 		else:
 			mesher.call("set_facet_carve", {"enabled": false})
+	# COSMOS FS2′ (patch 0010): this slot's OWN datum-bake blob frozen on its fid (per-mesher, facet-static — each
+	# pool slot renders a different facet, so its near mesh lifts by ITS s). Guarded; {enabled:false} off ⇒ plain.
+	if mesher.has_method("set_facet_datum_bake"):
+		mesher.call("set_facet_datum_bake", FacetAtlas.datum_bake_params(fid))
 	var generator: Object = _make_generator(fid)   # OWN generator frozen on this fid's gen_facet (worker-safe)
 	if generator == null:
 		return {}
@@ -1877,12 +1959,21 @@ func redesignate(to: int) -> bool:
 	_pool[to]["ramp_from"] = float(_pool[to]["view_f"])   # ramp from wherever `to` sits now (96 warm, or mid-ramp)
 	_pool[to]["editable"] = true
 	if _pool.has(from):
-		_set_if(_pool[from]["terrain"], "max_view_distance", 96)
-		_pool[from]["view"] = 96
-		_pool[from]["view_f"] = 96.0
-		_pool[from]["view_target"] = 96.0
-		_pool[from]["ramp_from"] = 96.0
-		_pool[from]["editable"] = false
+		if CubeSphere.FP_SHRINK_PACED:
+			# COSMOS-PERF UNATTENDED R4: PACE the 128→96 unload. Set the target to 96 but LEAVE view_f/view at the
+			# current (larger) radius so _ramp_pool_step steps it down ≤SHRINK_STEP_BLOCKS/frame — the FROM slot holds
+			# its larger (already-allocated) view for a bounded handful of frames instead of freeing both shells in ONE
+			# frame (the dlmalloc convoy). Same end state (view_f → 96). editable flips immediately (identity unchanged).
+			_pool[from]["view_target"] = 96.0
+			_pool[from]["ramp_from"] = float(_pool[from]["view_f"])
+			_pool[from]["editable"] = false
+		else:
+			_set_if(_pool[from]["terrain"], "max_view_distance", 96)
+			_pool[from]["view"] = 96
+			_pool[from]["view_f"] = 96.0
+			_pool[from]["view_target"] = 96.0
+			_pool[from]["ramp_from"] = 96.0
+			_pool[from]["editable"] = false
 	_pool_ramp_kick()
 	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
 	_pool_active = to
@@ -1971,6 +2062,7 @@ func pool_reset(to: int) -> bool:
 	_mesher = s["mesher"]
 	_generator = s["generator"]
 	_push_facet_carve()                              # re-point the (module-level) active mesher carve at `to`
+	_push_facet_datum_bake()                         # COSMOS FS2′ (patch 0010): re-point the near-mesh +s bake at `to`
 	_lod_setup()                                     # FP-M2b: rebuild the LOD layer under the fresh PlanetRoot
 	return true
 
@@ -1987,11 +2079,33 @@ func pool_active() -> int:
 ## cost lives inside VoxelTerrain::_process (these fields will show it) or it lives OUTSIDE it (they
 ## will all be small, and the hitch is render/upload — a completely different fix). Telemetry-only,
 ## read-only, no behaviour change; guarded so a missing method/terrain simply yields {}.
+## T2b (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): SUM VoxelTerrain::_process timings over ALL live pool slots, not just
+## the active _terrain — the imminent-prefill slot is where a crossing's apply burst lands and its main-thread cost was
+## invisible (the shipped read saw only _terrain). The active slot IS a _pool entry (the module keeps _terrain ==
+## _pool[_pool_active]["terrain"]), so iterating the pool alone avoids double-counting; the single _terrain is the
+## fallback on the non-pool path. Every returned key is a per-frame numeric field, so a plain per-key sum is correct and
+## the RemoteBridge consumer (which reads by key name) sees each field aggregated across the whole live pool.
 func terrain_main_thread_stats() -> Dictionary:
-	if _terrain == null or not _terrain.has_method("get_statistics"):
-		return {}
-	var d = _terrain.call("get_statistics")
-	return (d as Dictionary) if d is Dictionary else {}
+	var terrains: Array = []
+	if not _pool.is_empty():
+		for fid in _pool.keys():
+			var t = _pool[fid].get("terrain")
+			if t != null:
+				terrains.append(t)
+	elif _terrain != null:
+		terrains.append(_terrain)
+	var out: Dictionary = {}
+	for t in terrains:
+		if not (t as Object).has_method("get_statistics"):
+			continue
+		var d = t.call("get_statistics")
+		if not (d is Dictionary):
+			continue
+		for k in (d as Dictionary).keys():
+			var v = (d as Dictionary)[k]
+			if v is int or v is float:
+				out[k] = out.get(k, 0) + v
+	return out
 
 ## STREAM-SCHED T1 (docs/COSMOS-STREAM-SCHED-DESIGN.md §9.1) — the per-class generation histogram, summed over
 ## EVERY live generator (the active slot + each pool slot owns its own instance, frozen on its own facet epoch;
@@ -2061,6 +2175,23 @@ func pool_bounds(fid: int) -> AABB:
 ## A pool terrain node (the gate's is_area_meshed / statistics probes). null if absent.
 func pool_terrain(fid: int) -> Node3D:
 	return _pool[fid]["terrain"] if _pool.has(fid) else null
+
+## COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): is facet `fid`'s near voxel field fully meshed over the
+## fid-LATTICE box `aabb`? The skin builds tiles in fid-lattice, and a VoxelTerrain's is_area_meshed operates
+## in its OWN voxel (= fid-lattice) coordinates regardless of the slot's Node3D transform — the SAME reason
+## pool_seam_meshed reframes into fid-lattice before probing — so the tile AABB maps in directly, no reframe.
+## Returns false (→ the skin RENDERS the tile) whenever the fid is not live, its terrain lacks the probe, or
+## the box is not fully meshed (a streaming hole). This is the underlay coverage the skin's covered-tile skip
+## consumes; it is a pure read, so it adds no streaming/apply cost.
+func skin_near_meshed(fid: int, aabb: AABB) -> bool:
+	var t: Object = null
+	if _pool.has(fid):
+		t = _pool[fid]["terrain"]
+	elif fid == _pool_active or fid == TerrainConfig.active_facet():
+		t = _terrain
+	if t == null or not t.has_method("is_area_meshed"):
+		return false
+	return bool(t.call("is_area_meshed", aabb))
 ## FP-M1c view-ramp introspection (§5). pool_view: the LIVE engine-applied max_view_distance (read off the terrain,
 ## not the bookkeeping int — the honest value the ramp gate asserts). pool_view_target: the ramp goal. -1 if absent.
 func pool_view(fid: int) -> int:
@@ -2075,6 +2206,26 @@ func pool_view_target(fid: int) -> int:
 ## drives the ramp from _process. No-op-safe: just calls the same step _process uses.
 func pool_ramp_tick(delta: float) -> bool:
 	return _ramp_pool_step(delta)
+
+# --- COSMOS-PERF UNATTENDED R4 (FP_SHRINK_PACED) gate hooks — for verify_shrink_paced.gd. Test-only; no live caller. ---
+## Seed a bookkeeping-only pool slot (the ramp math reads/writes the dict; `_set_if` no-ops on a stub terrain that
+## lacks max_view_distance). Lets the gate drive the shrink pacing + the redesignate FROM-slot rebalance without a
+## live godot_voxel pool. Pass a plain Node as `terrain` so `_set_if` is a safe no-op.
+func test_seed_pool_slot(fid: int, view_f: float, view_target: float, active: bool, terrain: Object) -> void:
+	_pool[fid] = {
+		"terrain": terrain, "mesher": null, "generator": null, "slot": null,
+		"view": int(round(view_f)), "view_f": view_f, "view_target": view_target,
+		"ramp_from": view_f, "editable": active, "spawn_ms": Time.get_ticks_msec(),
+	}
+	if active:
+		_pool_active = fid
+## The bookkeeping (float) live view radius of a slot — the honest ramp state (pool_view reads the real terrain, which
+## a seeded stub slot lacks). -1 if absent.
+func test_pool_view_f(fid: int) -> float:
+	return float(_pool[fid]["view_f"]) if _pool.has(fid) else -1.0
+## Install a stub PlanetRoot so the gate can call the REAL `redesignate` (its top guard needs a non-null root).
+func test_set_planet_root(n: Node3D) -> void:
+	_planet_root = n
 ## The shared baked library / a fid-frozen generator / a fid-carve mesher / the carve range — the SEAM gates build
 ## meshes with these directly (the spike_* accessors' pool-flag twins; available whenever FP_M1_POOL is on).
 func pool_library() -> Object:
@@ -2909,7 +3060,14 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# entirely below the bedrock floor generates nothing, so it must not pay the ~column-profile
 	# pass at all. Uses only CONSTANTS (no noise). MAX_SURFACE_Y is a proven upper bound on
 	# height_at (verify asserts it), so this can never skip a block that holds real content.
-	if oy > TerrainConfig.MAX_SURFACE_Y + max_above and oy > sea:
+	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3): the per-column datum re-index is active on this facet.
+	# The surface rises by up to DATUM_SHIFT_MAX, so the y-envelope bounds gain that headroom; and the bulk/colbulk/
+	# stamp optimisations (which assume the surface is at true g) are FORCED OFF so the plain per-cell path — the one
+	# the C++ generator mirrors — runs and resolves each cell at true y − S. _rd false ⇒ every branch below is the
+	# shipped code verbatim (byte-identical when FP_RADIAL_DATUM is off / non-faceted).
+	var _rd := CubeSphere.FP_RADIAL_DATUM and gen_facet >= 0
+	var _ds_head := FacetAtlas.DATUM_SHIFT_MAX if _rd else 0
+	if oy > TerrainConfig.MAX_SURFACE_Y + max_above + _ds_head and oy > sea:
 		_gen_acc(0, _t0)                                  # T1 class 0: constant air early-out
 		return
 	if oy + size.y * s <= TerrainConfig.BEDROCK_FLOOR:
@@ -3000,7 +3158,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# wrongly filled — a straddling/edge block falls back to per-cell. Flag OFF → this is skipped entirely → the
 	# generator is byte-identical per-cell (FLAT 6035/0; G-M2-ID compares two module generators that share the
 	# const flag, so both bulk-fill identically → still equal).
-	if fp_bulk and s == 1 and flat_world and size.x == size.y and size.y == size.z:
+	if fp_bulk and not _rd and s == 1 and flat_world and size.x == size.y and size.y == size.z:
 		var by_top = oy + size.y                      # one past the top cell (cells are oy .. by_top-1)
 		if by_top <= min_h - BULK_MAX_FILLER:
 			var fill_arid := -1
@@ -3020,7 +3178,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# Whole block above every surface + tree cap AND above the sea cap -> all air
 	# (leave buffer default 0). The sea term matters over deep ocean, where the
 	# solid top is far below SEA_LEVEL but water still fills up to it.
-	var top = max_h + max_above
+	var top = max_h + max_above + _ds_head               # FS2: +S headroom (the surface rises by ≤ DATUM_SHIFT_MAX)
 	if sea > top: top = sea
 	if oy > top:
 		_gen_acc(0, _t0)                                  # T1 class 0: profiled all-air block
@@ -3033,7 +3191,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	# optimisation stays off (never fill a stale index). FACETED: v1 requires the WHOLE block box to be interior
 	# to all four ridges — exactly the whole-block fill's gate — so no beyond-ridge cell that junction_modify
 	# would mask to AIR is ever filled; ridge straddlers stay fully per-cell.
-	var cb_on = fp_colbulk and s == 1 and flat_world and size.x == size.y and size.y == size.z \
+	var cb_on = fp_colbulk and not _rd and s == 1 and flat_world and size.x == size.y and size.y == size.z \
 		and bulk_stone_arid >= 0 and bulk_stone_arid < mcount \
 		and bulk_deepslate_arid >= 0 and bulk_deepslate_arid < mcount
 	if cb_on and gen_facet >= 0:
@@ -3159,6 +3317,10 @@ func _generate_block(buffer, origin_in_voxels, lod):
 				if not need_cells:
 					continue
 			var srun = TerrainConfig.slope_run_of(wx, wz, pcache)
+			# COSMOS FS2 (design 3.2): this column's datum shift. resolve_cell runs in TRUE-height space at
+			# wy - S, so the cell at lattice wy renders worldgen's true wy - S (the whole column raised by S).
+			# cb_on is forced OFF under _rd, so the col_hi/deep-fill R1 branches never run with the datum shift.
+			var col_ds := FacetAtlas.datum_shift(gen_facet, wx, wz) if _rd else 0
 			var col_jinv = 0 if flat_world else rjinv[idx2]   # COSMOS-FRAME-ORIENTATION §6: this column's window J⁻¹
 			for y in range(size.y):
 				var wy = oy + y * s
@@ -3168,7 +3330,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 					if wy < deep_top and (wy > BULK_DEEPSLATE_TOP_Y \
 							or (wy < BULK_DEEPSLATE_FULL_Y and wy >= BULK_BEDROCK_TOP_Y)):
 						continue                      # R1: already emitted by this column's deep fill runs
-				var v = TerrainConfig.resolve_cell(wx, wy, wz, g, biome, cc, tt, pcache, srun)
+				var v = TerrainConfig.resolve_cell(wx, wy - col_ds, wz, g, biome, cc, tt, pcache, srun)
 				# §6: resolve_cell is CANONICAL; rotate the directional modifier into the WINDOW render frame at
 				# this buffer-write exit by the column's frozen J⁻¹. No-op for full cubes / identity → byte-identical.
 				if col_jinv != 0:
@@ -3506,6 +3668,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_n", CubeSphere.n_for(CubeSphere.HOME_BODY))
 	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
 	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
+	gen.set("radial_datum", CubeSphere.FP_RADIAL_DATUM)  # COSMOS FS2 §3.2: the C++ mirror resolves each cell at true y − S
 	# GEN-EFFICIENCY Fix A: freeze the bulk-underground flag + the two fill ARIDs (the cube ARID a plain deep STONE /
 	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
@@ -3560,6 +3723,7 @@ func _make_cpp_generator(src_gen: Object) -> Object:
 	cfg["flat_world"] = src_gen.get("flat_world")
 	cfg["faceted"] = CubeSphere.FACETED
 	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
+	cfg["radial_datum"] = CubeSphere.FP_RADIAL_DATUM     # COSMOS FS2 §3.2
 	cfg["model_count"] = src_gen.get("model_count")
 	cfg["waterlog"] = src_gen.get("waterlog")
 	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set

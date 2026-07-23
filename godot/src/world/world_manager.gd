@@ -4,6 +4,9 @@ extends Node3D
 # FP-FIXED-FRAME: preload the FrameAdapter (not the global class_name) so this always-parsed core script never
 # depends on the stale editor class-cache (the same convention as FLM/FLB in verify_fp_m2). Used as a type below.
 const _FrameAdapterCls := preload("res://src/world/frame_adapter.gd")
+# COSMOS SEAMLESS-SCALES C3: preload the skin tier (not the class_name) for the same reason as _FrameAdapterCls —
+# this always-parsed core must not depend on the editor class-cache. DEAD unless CubeSphere.FP_SKIN_TIER.
+const _SkinTierCls := preload("res://src/world/facet_skin_tier.gd")
 ## Owns "the world": picks the rendering path, drives streaming, and exposes the
 ## analytic queries (solidity, surface height, voxel raycast) that the player and
 ## HUD use regardless of path. Also holds the decoupled sim layer (material
@@ -64,6 +67,7 @@ var _player_abs_max: float = 0.0
 var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resync (fixed-frame only, §10 decision 2)
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -81,6 +85,9 @@ const FACET_CROSS_HYST := 0.1         # COSMOS FACETED §6.1: cross onto the nei
 # cooldown (a crossing cannot re-fire for the next N maybe_cross_facet calls — belt-and-suspenders vs ridge jitter).
 const FACET_CROSS_COOLDOWN := 6       # maybe_cross_facet calls (≈physics ticks) suppressed after a committed crossing
 var _cross_cooldown := 0              # remaining suppressed calls (decremented per call; 0 = ready)
+const FACET_CORNER_SLACK := 2.0       # COSMOS FS-W (§3): a corner-commit landing may be up to this far past one of the
+                                      # destination's ridges (a genuine 3-facet corner) and still commit — kept < |WALL_EPS|
+                                      # (3) so the player is always placed clear of the −3 ridge wall (never stranded).
 
 # FP-M1c Planet Assembly pool policy (docs/COSMOS-FP-M1-DESIGN.md §4.3). Amortization throttle (≤1 spawn AND ≤1
 # retire per POOL_SPAWN_INTERVAL_S) + the pool-miss counter (a re-designation crossing whose destination was not
@@ -89,6 +96,15 @@ var _cross_cooldown := 0              # remaining suppressed calls (decremented 
 var _last_pool_spawn_ms := -100000
 var _last_pool_retire_ms := -100000
 var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME, §0-W3/§5): the altitude regime latch. `_alt_orbital` is true while the
+# player is above the ATMO_TOP gate (ORBITAL — the near field is frozen: no per-tick redesignation / pool-manage /
+# snow / shrink-snap); it flips with ALT_REGIME_HYST hysteresis in _update_alt_regime (driven from update_streaming).
+# `_alt_reentry_pending` is armed on the ORBITAL→SURFACE transition and consumed by the very next maybe_cross_facet to
+# do the ONE restore redesignation onto the true sub-camera facet. `_alt_redesignate_count` (test-visible) counts those
+# restores. All three are inert (false/0, never read) with FP_ALT_REGIME off ⇒ byte-identical.
+var _alt_orbital := false
+var _alt_reentry_pending := false
+var _alt_redesignate_count := 0
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -134,8 +150,24 @@ const CORNER_EDIT_LOCK := true
 # break/place edit. It is INERT until the player's position has been reported at least once (so it never
 # runs during the frozen prewarm, or in a headless world that has no player).
 var _snowfall: SnowfallSystem
+# COSMOS CLIMATE W1: the coarse prognostic weather grid (null unless FP_CLIMATE_GRID). Stepped from
+# _process on the main thread; PerVoxelEnvironment reads it. `_cosmos_clock` (injected by main.gd) gives
+# the game-time for insolation/seasons; null ⇒ the grid runs on its own default dt (still a valid diurnal
+# cycle once the clock exists). Both null in the shipped flat game ⇒ zero cost.
+var _weather: WeatherSystem
+# FP_WEATHER_THREAD: the dedicated weather WORKER thread (null unless the flag is on). Once the static basis
+# is built on the main thread, the sweep is handed to this worker (EnvSimWorker) so the per-frame main-thread
+# cost collapses to a swap check. Stopped/joined in _exit_tree (no dangling thread on scene exit).
+var _weather_worker: EnvSimWorker = null
+var _cosmos_clock: CosmosEphemeris.CosmosClock = null
+var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
+# of the snowfall fixed step + the load-controller tick since the last telemetry drain; RemoteBridge samples the max once
+# per window (take_perf_attrib) so the 0.5 s snowfall spike is attributed instead of folded anonymously into worst_ms.
+var _snow_us_max := 0
+var _ctrl_us_max := 0
 # CROSSING-FASTGEN obs-2 fix (3): the EMA'd player speed (blocks/s), measured from the inter-update position delta and
 # consumed ONLY under FP_VEL_PREDICT to lead the imminent promote/commit distances. Computed lazily inside its flag gate
 # in update_streaming, so with the flag off it stays 0 and this is a literal no-op (no behaviour change, no read path).
@@ -157,6 +189,20 @@ var _edits: Dictionary = {}           # Vector3i -> int packed cell value (0 = a
 # skips its per-cell overlay scan on columns absent here (their overlay is empty), collapsing
 # the region's ~30k Vector3i lookups to the handful of genuinely-edited columns.
 var _edit_columns: Dictionary = {}    # Vector2i(x, z) -> true
+# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): the INCREMENTAL per-facet edit index. Maps a facet id to the SET of
+# `_edits` keys authored on it (fid -> {edit_key -> true}). Maintained in the single write/erase choke points
+# (`_write_cell` adds, `sim_revert_cell` removes) under FACETED, so a crossing's `_rebuild_window_indices` +
+# `_translate_active` touch ONLY the incoming facet's edits (O(active-fid)) instead of rescanning the whole `_edits`
+# dict (O(all edits) — up to ~200 k snow cells). A byte-exact subset of `_edits` (same choke points). Empty + unused
+# with the flag off (byte-identical) or under FLAT/curved (non-int keys carry no fid — those paths keep the full scan).
+var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> true)
+# The number of edit keys the LAST `_rebuild_window_indices` iterated (the O() the crossing paid): == the active
+# facet's edit count with FP_EDIT_FID_INDEX on, == the total edit count with it off. Read by verify_edit_fid_index.gd.
+var _rebuild_scanned: int = 0
+# COSMOS-PERF FALL (FP_FLOOR_BOUNDED): the number of `cell_value_at` scan iterations the LAST `floor_under` call ran.
+# Read by verify_floor_bounded.gd to prove the fall scan is altitude-INDEPENDENT (≤ ~2·MARGIN, not ∝ feet-y). Pure
+# introspection — never read by gameplay, carries no world state (does not affect the byte-identical off contract).
+var _floor_scan_iters: int = 0
 # Per-cell METADATA store (VOXEL-DATA-STRUCTURE §4.1): a SECOND sparse dict holding
 # ONLY the rare cells that carry a block-entity document (container inventory, sign
 # text, …). It carries NO occupancy/solidity semantics (rule-1 objection answered) —
@@ -168,6 +214,13 @@ var _meta: Dictionary = {}            # Vector3i -> Dictionary (JSON-subset docu
 # Per-column monotonic high-water mark of the highest y ever PLACED (breaking a
 # placed block does NOT lower it). Only bounds the collider's above-surface scan.
 var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
+# COSMOS-PERF FALL (FP_FLOOR_MEMO): per-WINDOW-column memo of the CELL index of the topmost solid-with-air-above
+# (floor_under's answer seen from above all solids). Lets a repeated fall column resolve floor_under in O(1) instead
+# of re-scanning ~MARGIN cold-generator cells every frame. INVALIDATED at the write/remap choke points (_write_cell,
+# sim_revert_cell erase the column; _rebuild_window_indices clears; _shift_window_bookkeeping re-keys). Capped at
+# FLOOR_MEMO_CAP and cleared wholesale on overflow (NEVER-OOM). Empty + unread with FP_FLOOR_MEMO off (byte-identical).
+var _floor_top: Dictionary = {}       # Vector2i(x, z) -> int (topmost standable CELL y)
+const _FLOOR_MEMO_NONE := -0x40000000 # sentinel: no memo for this column (never a real floor cell)
 # Sparse per-joint reinforcement (glue/weld/cement; STRUCTURAL-INTEGRITY §4.2/§7):
 # canonical key Vector4i(min_cell.x, .y, .z, axis) -> reinforcement id. Lives
 # OUTSIDE the four cell axes (it is per-FACE, not per-cell). The structural solver
@@ -237,6 +290,21 @@ func _ready() -> void:
 	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
 	_snowfall = SnowfallSystem.new()
 	_snowfall.setup(self)
+
+	# COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1.5): the ONE coarse prognostic weather grid.
+	# Owned + stepped here exactly like SnowfallSystem (SnowfallSystem-style: constructed ONLY under the flag,
+	# so all flags off ⇒ the class isn't even instantiated ⇒ zero bytes / zero CPU). PerVoxelEnvironment READS
+	# it (engine rule 2). The static basis is built sliced over startup frames (§1.7); the game_time it needs
+	# for insolation is injected via the celestial clock (main.gd → set_cosmos_clock). Default OFF → byte-identical.
+	if CubeSphere.FP_CLIMATE_GRID:
+		_weather = WeatherSystem.new()
+		_weather.setup()
+		environment.set_weather(_weather)
+		# FP_WEATHER_THREAD: create (but do not yet start) the weather worker. It is started from _process
+		# only once the static basis is fully built on the main thread (build_init is sliced over startup),
+		# so the thread never races the one-time basis construction. Flag off ⇒ null ⇒ the main-thread path.
+		if CubeSphere.FP_WEATHER_THREAD:
+			_weather_worker = EnvSimWorker.new(_weather)
 	# Far-distance terrain layer (LOD-DESIGN): render-only, collision-free, voxel-worker-free —
 	# part of "the world" WorldManager owns. Path-agnostic (it reads only TerrainConfig/BlockCatalog/
 	# ClimateModel), so it runs identically over the module world, the GDScript fallback and headless.
@@ -248,6 +316,17 @@ func _ready() -> void:
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near
+		# voxels and the far-ring backstop. Gated on FP_SKIN_TIER (default OFF → node never created →
+		# byte-identical). Peer node placed like the far ring; driven from update_streaming/crossing/reanchor.
+		# LIVE-LOOP NOTE: node + gates are validated headless; the live per-frame scheduling frame-math is
+		# pending the AM real-GPU validation pass (the flag stays OFF until then).
+		if CubeSphere.FP_SKIN_TIER:
+			var afid := TerrainConfig.active_facet()
+			_skin = _SkinTierCls.new()
+			_skin.name = "FacetSkinTier"
+			add_child(_skin)
+			_skin.call("setup", afid)
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -276,12 +355,135 @@ func _ready() -> void:
 			_streamer.visible = false
 		print("[WorldManager] DEV_HIDE_NEAR: near chunk render hidden (far layer isolated)")
 
+## CLIMATE W1: inject the celestial clock so the weather grid can read game-time (insolation/seasons).
+## main.gd calls this once after building the clock; null-safe (the grid falls back to its default dt).
+func set_cosmos_clock(clock: CosmosEphemeris.CosmosClock) -> void:
+	_cosmos_clock = clock
+
+## COSMOS-PERF FALL-COLLAPSE FIX C (FP_SNOW_SKIP_AIRBORNE): true when the player is a HIGH FLYER (lattice altitude
+## above the active-facet plane > OFFSURFACE_Y — the same cheap y-test the pool off-surface freeze uses) and the
+## snowfall fixed-step should be skipped (no walkable ground snow under the camera at flight altitude). Byte-identical
+## false with the flag off (never skips). Pure read of `_last_player_pos`.
+func _snow_skip_airborne() -> bool:
+	return snow_skip_airborne(_last_player_pos.y)
+
+## The FIX C predicate as a PURE static (flag- and OFFSURFACE_Y-driven), split out so G-SNOW-AIRBORNE drives it
+## directly with a synthetic altitude — no WorldManager instance needed. Byte-identical false with the flag off.
+static func snow_skip_airborne(alt_y: float) -> bool:
+	return CubeSphere.FP_SNOW_SKIP_AIRBORNE and alt_y > CubeSphere.OFFSURFACE_Y
+
+## COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME) — true while the near-field machinery is FROZEN (the ORBITAL regime): no
+## per-tick redesignation, no _manage_facet_pool churn, no main-thread snow step. The ONE cheap gate every freeze site
+## reads. Byte-identical false with the flag off (the latch never leaves SURFACE, so `_alt_orbital` stays false).
+func _alt_frozen() -> bool:
+	return CubeSphere.FP_ALT_REGIME and _alt_orbital
+
+## Public read of the ORBITAL regime latch (the freeze predicate) — for the verify_alt_regime altitude-sweep gate.
+func alt_regime_orbital() -> bool:
+	return _alt_frozen()
+
+## Public read of the cumulative re-entry restore count (redesignations forced by crossing the gate downward) — the
+## gate asserts this is exactly 1 across a fall (zero above the gate, one at re-entry). Read-only.
+func alt_redesignate_count() -> int:
+	return _alt_redesignate_count
+
+# --- COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX) introspection — for verify_edit_fid_index.gd. Read-only. ---
+## Edit keys the LAST `_rebuild_window_indices` iterated (the crossing's O() work): active-fid count (index on) vs
+## total (off). The O(window) proof asserts this is bounded + independent of the total edit count.
+func rebuild_scanned_last() -> int:
+	return _rebuild_scanned
+## Total `_edits` overlay size (all facets). The gate seeds ~200 k and checks rebuild_scanned_last() ≪ this.
+func edit_count() -> int:
+	return _edits.size()
+## The per-fid index bucket for `fid` (edit_key -> true), or {} if none. The correctness gate compares its key set
+## against a full `_edits` scan filtered to `fid` (the index MUST equal the full scan).
+func edits_for_fid(fid: int) -> Dictionary:
+	return _edits_by_fid.get(fid, {})
+## All `_edits` keys (every facet) — the correctness gate's full-scan reference source.
+func all_edit_keys() -> Array:
+	return _edits.keys()
+## The packed cell value stored at edit key `k` (0 if absent) — the gate's reference for the `_placed_top` high-water.
+func all_edit_value(k: Variant) -> int:
+	return int(_edits.get(k, 0))
+## The rebuilt window PERF indices — the correctness gate compares these against a manual full-scan reference to
+## prove the indexed rebuild produced byte-identical `_edit_columns`/`_placed_top`.
+func debug_edit_columns() -> Dictionary:
+	return _edit_columns
+func debug_placed_top() -> Dictionary:
+	return _placed_top
+## Seed one overlay edit at `cell` in the CURRENT active facet's frame, skipping the render paint (headless gates
+## have no module/streamer). Routes through the ONE write choke point so the R5 index is exercised exactly as a live
+## snow/place write would maintain it. Test-only helper (verify_edit_fid_index.gd); no live caller.
+func seed_edit_for_test(cell: Vector3i, packed: int) -> void:
+	_write_cell(cell, packed, null, false)
+
+## The player's RADIAL altitude (blocks above the planet surface) derived from a lattice position in the CURRENT active
+## facet's frame — the WorldManager-side mirror of Player.radial_altitude() (lattice → world via FacetAtlas, minus the
+## planet radius). This is the physically-correct "how far up am I" the sky/atmo/weather gates already use (vs the
+## cheap plane-relative lattice-y the pool/snow off-surface tests use). Non-faceted / no active facet ⇒ the raw y.
+func _radial_altitude_lattice(player_pos: Vector3) -> float:
+	if not CubeSphere.FACETED:
+		return player_pos.y
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return player_pos.y
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - FacetAtlas.R_BLOCKS
+
+## COSMOS-PERF UNATTENDED R3 — advance the altitude regime latch from the current player position (called once per
+## physics tick from update_streaming, under FP_ALT_REGIME). The freeze RELEASES (and arms the ONE re-entry
+## redesignation) at ATMO_TOP + ALT_REGIME_REENTRY_PREP — ABOVE the surface-physics ceiling (ATMO_TOP) — so the near
+## field lands on the true sub-camera facet BEFORE floor/collision/walk ever run, never against the STALE frozen
+## launch facet (the RE-ENTRY FIX: the "fall-from-orbit tunnels through the planet to the antipode" bug — surface
+## physics against the wrong facet's terrain → fall-through / late pop). It ENTERS one hysteresis band higher, at
+## ATMO_TOP + ALT_REGIME_REENTRY_PREP + ALT_REGIME_HYST, so a grazing pass never flaps the freeze and the high-orbit
+## bulk stays frozen. On the ORBITAL→SURFACE edge it arms `_alt_reentry_pending`, which the next maybe_cross_facet
+## consumes to restore the near field onto the sub-camera facet. No-op with the flag off.
+func _update_alt_regime(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_ALT_REGIME or not CubeSphere.FACETED:
+		return
+	var alt := _radial_altitude_lattice(player_pos)
+	if _alt_orbital:
+		# Release ABOVE the surface ceiling so the near field is correct BEFORE surface physics begins AND has the
+		# whole sub-ceiling descent to stream (the slow-web fall-through fix). Was ATMO_TOP − ALT_REGIME_HYST (352),
+		# which sat inside the surface regime → surface queries hit the stale frozen far facet for ~32 blocks.
+		if alt < CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP:
+			_alt_orbital = false
+			_alt_reentry_pending = true   # armed for the next maybe_cross_facet: ONE restore redesignation
+	else:
+		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST:
+			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
-	if _snowfall != null and _have_player_pos:
+	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
+	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
+	if _snowfall != null and _have_player_pos and not _snow_skip_airborne() and not _alt_frozen():
+		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
+		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)
+	# COSMOS CLIMATE W1: advance the weather grid one sweep slice (main thread). The game_time drives
+	# insolation/seasons; with no clock yet (or flag off) it simply doesn't run. Timed separately so the
+	# ≤0.7 ms/frame budget can be attributed (RemoteBridge take_perf_attrib).
+	if _weather != null:
+		var gt := _cosmos_clock.now() if _cosmos_clock != null else 0.0
+		var t_w := Time.get_ticks_usec()
+		if _weather_worker != null:
+			# FP_WEATHER_THREAD: the sweep runs OFF the main thread. Build the static basis on the main thread
+			# (sliced, exactly as the shipped path — a bounded one-time startup cost, not the per-frame hitch),
+			# then hand the steady-state sweep to the worker. Once handed off the main thread only polls: a
+			# swap check + an occasional pointer flip ⇒ ~0 main-thread cost (G-WTHREAD-MAINCOST).
+			if not _weather.is_ready():
+				_weather.build_init()
+				if _weather.is_ready():
+					_weather_worker.start()   # basis done → spin the thread (it blocks until the first poll)
+			else:
+				_weather_worker.poll(gt)
+		else:
+			_weather.process(delta, gt)
+		_weather_us_max = maxi(_weather_us_max, Time.get_ticks_usec() - t_w)
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
 	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
@@ -295,7 +497,9 @@ func _process(delta: float) -> void:
 	# FacetLodMesher reads its credit for LOD apply-ms + build grants (surfaces 1-2). The pool ramp pace (surface 3)
 	# and the promote gate (surface 4) are M2d — set_stream_pace stays at its 1.0 default here (byte-identical ramp).
 	if _load_ctrl != null:
+		var t_ctrl := Time.get_ticks_usec()   # T2f: attribute the controller tick
 		_load_ctrl.tick(Time.get_ticks_msec() / 1000.0)
+		_ctrl_us_max = maxi(_ctrl_us_max, Time.get_ticks_usec() - t_ctrl)
 	# FP-M2d (§6.5.3 surfaces 3-4): drive the pool view-ramp PACE from the controller every frame (stream_pace() folds
 	# in the vox_gen backlog gate — 0 holds neighbour growth while the pool has not drained), and, only under SUSTAINED
 	# overload, apply the pause-first LOD demote relief. With FP_M2_LOD off neither is called (pace stays 1.0 — byte-identical).
@@ -317,6 +521,13 @@ func _process(delta: float) -> void:
 		if _lod_excl_accum >= 0.5:
 			_lod_excl_accum = 0.0
 			_facet_ring_sync_exclusion()
+
+## FP_WEATHER_THREAD: JOIN the weather worker before the node is torn down so no thread outlives the scene
+## (the SnowfallSystem/pool teardown discipline). stop() is safe if the worker was never started, and a
+## no-op when the flag is off (the worker is null). Byte-identical with the flag off (the method is inert).
+func _exit_tree() -> void:
+	if _weather_worker != null:
+		_weather_worker.stop()
 
 func _setup_module_path() -> void:
 	# module_world.gd touches godot_voxel only via ClassDB/strings and a
@@ -610,9 +821,28 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME): advance the altitude regime latch FIRST (before the pool-manage /
+	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
+	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.
+	_update_alt_regime(player_pos)
+	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
+	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
+	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
+	if _skin != null:
+		# COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): hand the skin a coverage Callable so it can drop
+		# tiles that sit wholly behind the CONFIRMED-meshed near voxels (pure fill overdraw). Routed to
+		# module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the fallback /
+		# no-module path leaves the skin's skip inert (byte-identical, renders every in-range tile).
+		var cover_query := Callable()
+		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
+			cover_query = Callable(_module_world, "skin_near_meshed")
+		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
-	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null:
+	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
+	# churn) while the ORBITAL near field is frozen — none of it is visible at altitude, and the pool targets are held
+	# until re-entry. `not _alt_frozen()` is byte-identical true with FP_ALT_REGIME off.
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _module_world != null and not _alt_frozen():
 		_manage_facet_pool(player_pos)
 	if CubeSphere.M5C_CORNER:
 		m5c_glue_bodies()                 # M5c §6: keep awake debris/projectiles out of the wedge each frame
@@ -722,6 +952,10 @@ func _edit_key(cell: Vector3i) -> Variant:
 ## copy). Curved uses the dedicated window/region unfolds (placed_cells_window / save_region) instead.
 func _overlay_v3i() -> Dictionary:
 	if CubeSphere.FACETED and _chart == null:
+		# COSMOS-PERF UNATTENDED R5: hand the per-fid index's active-facet keys so the projection is O(active-fid),
+		# not a full-dict scan. Off ⇒ the shipped full-scan-and-filter (byte-identical result set).
+		if CubeSphere.FP_EDIT_FID_INDEX:
+			return _translate_active(_edits, _edits_by_fid.get(TerrainConfig.active_facet(), {}).keys())
 		return _translate_active(_edits)
 	return _edits
 
@@ -735,11 +969,14 @@ func _meta_v3i() -> Dictionary:
 ## The (fid, cell)→Vector3i projection of a key-global dict (`_edits` or `_meta`) filtered to the active
 ## facet. Only ever called under FACETED (the caller gates), where `_chart` is null and the unpacked
 ## cell equals the window cell.
-func _translate_active(src: Dictionary) -> Dictionary:
+func _translate_active(src: Dictionary, keys: Variant = null) -> Dictionary:
 	var out := {}
 	var active := TerrainConfig.active_facet()
-	for k in src.keys():
-		if FacetAtlas.edit_key_fid(k) != active:
+	# R5: when `keys` is supplied (the per-fid index's active bucket) every key already belongs to `active`, so the
+	# fid filter is skipped — O(active-fid). `keys == null` ⇒ the shipped full-dict scan + filter (byte-identical).
+	var ks: Array = (keys as Array) if keys != null else src.keys()
+	for k in ks:
+		if keys == null and FacetAtlas.edit_key_fid(k) != active:
 			continue
 		var u := FacetAtlas.edit_key_unpack(k)
 		out[u[1]] = src[k]
@@ -1143,6 +1380,20 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 			block_entity_orphaned.emit(cell, old_meta)
 	if not _edits.has(ek):
 		_edit_columns[Vector2i(cell.x, cell.z)] = true   # first edit in this column (PERF index)
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): file the NEW key under its facet so a crossing rebuild
+		# touches only this facet's edits. FACETED-only (ek is the (fid,cell) int); a value UPDATE to an existing
+		# key leaves membership — and this index — unchanged, so it is maintained here at first-write only.
+		if CubeSphere.FP_EDIT_FID_INDEX and CubeSphere.FACETED and _chart == null:
+			var _fid: int = FacetAtlas.edit_key_fid(ek)
+			var _bucket: Variant = _edits_by_fid.get(_fid)
+			if _bucket == null:
+				_bucket = {}
+				_edits_by_fid[_fid] = _bucket
+			(_bucket as Dictionary)[ek] = true
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): this write changes the column's occupancy, so drop its cached topmost-floor
+	# (break/place/collapse/snow all funnel here) — the next floor_under recomputes it exactly. No-op with the flag off.
+	if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+		_floor_top.erase(Vector2i(cell.x, cell.z))
 	# COSMOS-FRAME-ORIENTATION §6.4: store the directional modifier in its CANONICAL (true-face) frame so
 	# it survives a flip; PAINT the window-frame value (the current render). No-op for a full cube.
 	_edits[ek] = _overlay_canon_modifier(cell, packed)
@@ -1167,7 +1418,21 @@ func has_edit(cell: Vector3i) -> bool:
 func sim_revert_cell(cell: Vector3i) -> void:
 	# COSMOS: erase by the global edit key and repaint the folded generated value (cell_value_at falls
 	# through to the folded worldgen once the edit is gone). Byte-identical to main in FLAT_WORLD.
-	if _edits.erase(_edit_key(cell)):
+	var ek: Variant = _edit_key(cell)
+	if _edits.erase(ek):
+		# COSMOS-PERF FALL (FP_FLOOR_MEMO): reverting a cell to bare changes the column's occupancy — drop its memo.
+		if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+			_floor_top.erase(Vector2i(cell.x, cell.z))
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): the ONLY `_edits` erase — drop the key from its facet bucket
+		# so the index stays a byte-exact subset of `_edits`; retire the bucket when it empties (NEVER-OOM). Off / non-
+		# FACETED ⇒ the index is empty and this is a no-op (byte-identical).
+		if CubeSphere.FP_EDIT_FID_INDEX and CubeSphere.FACETED and _chart == null:
+			var _fid: int = FacetAtlas.edit_key_fid(ek)
+			var _bucket: Variant = _edits_by_fid.get(_fid)
+			if _bucket != null:
+				(_bucket as Dictionary).erase(ek)
+				if (_bucket as Dictionary).is_empty():
+					_edits_by_fid.erase(_fid)
 		_paint_cell(cell, cell_value_at(cell))
 
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
@@ -1687,6 +1952,9 @@ func _apply_anchor_shift(a: Vector3) -> void:
 	# 2. Far ring (its mesh is ABSOLUTE) rides the same shift; the offset survives crossings (set_active folds it in).
 	if _facet_ring != null and _facet_ring.has_method("shift_anchor"):
 		_facet_ring.shift_anchor(a)
+	# 2b. Skin tier (its mesh is ABSOLUTE too) rides the same shift, exactly like the far ring.
+	if _skin != null:
+		_skin.call("shift_anchor", a)
 	# 3. ActiveFrame origin drops by a (basis unchanged); player/GroundCollider/debris/viewer keep their lattice locals.
 	if _active_frame != null:
 		_active_frame.position -= a
@@ -1705,6 +1973,52 @@ func _apply_anchor_shift(a: Vector3) -> void:
 ## found again by its unchanged key from the new home face. Worldgen determinism holds because a
 ## global cell resolves through _curved_profile identically regardless of which window/home face
 ## reaches it (§8.2). The fallback path drops + rebuilds its chunks at the normal budget; the module
+## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3): is the player genuinely PAST a ridge (own_dist < −1, well beyond
+## the −0.1 commit line)? Used to void the crossing cooldown so a corner zig-zag can never strand them in masked space.
+func _past_ridge_deep(fid: int, pos: Vector3) -> bool:
+	for slot in 4:
+		if FacetAtlas.own_dist(fid, slot, pos.x, pos.y, pos.z) < -1.0:
+			return true
+	return false
+
+## COSMOS FS-W (§3): resolve a grid-corner crossing BY DIRECTION when the single-edge landing fails containment.
+## Candidates = the crossed edge-neighbours ∪ the diagonal facet the player's world direction lands in
+## (FacetAtlas.facet_of_dir_body — the classifier oracle). Commit to the candidate whose reframed landing is DEEPEST
+## inside (argmax over candidates of the min-slot own_dist at the reframe), provided that best is not itself past a
+## ridge by more than FACET_CORNER_SLACK (keeps the player clear of the −3 wall). Returns {"to","np"} or {} to defer.
+func _corner_commit(fid: int, pos: Vector3) -> Dictionary:
+	var crossed := []
+	for slot in 4:
+		if FacetAtlas.own_dist(fid, slot, pos.x, pos.y, pos.z) < -FACET_CROSS_HYST:
+			crossed.append(slot)
+	if crossed.is_empty():
+		return {}
+	var cands := {}                                    # dedup by fid
+	for slot in crossed:
+		cands[FacetAtlas.seam_neighbour(fid, slot)] = true
+	# The diagonal (3-facet corner) the player is heading into — the direction oracle resolves it without the
+	# fragile seam_neighbour-composition, and doubles as the §3 cross-check.
+	var w := FacetAtlas.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	var fdir := FacetAtlas.facet_of_dir_body(FacetAtlas.body_of_fid(fid),
+		CubeSphere.DVec3.new(w[0], w[1], w[2]).normalized())
+	if fdir >= 0 and fdir != fid:
+		cands[fdir] = true
+	var best_to := -1
+	var best_np := []
+	var best_score := -INF
+	for c in cands:
+		var cnp := FacetAtlas.reframe_position64(fid, c, pos.x, pos.y, pos.z)
+		var mind := INF
+		for bslot in 4:
+			mind = minf(mind, FacetAtlas.own_dist(c, bslot, cnp[0], cnp[1], cnp[2]))
+		if mind > best_score:
+			best_score = mind
+			best_to = c
+			best_np = cnp
+	if best_to < 0 or best_score < -(FACET_CROSS_HYST + FACET_CORNER_SLACK):
+		return {}                                      # nothing lands clear of the wall → defer one tick
+	return {"to": best_to, "np": best_np}
+
 ## COSMOS FACETED §6.1 — the crossing handoff. When the player walks past an active-facet ridge (signed own_dist
 ## < −HYST, one-sided so jitter can't double-fire), re-frame them onto the neighbour facet: switch the active
 ## facet and return the f64-EXACT reframed position + the dihedral yaw twist for Player.apply_reframe. FP3a: the
@@ -1716,12 +2030,31 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 	var fid := TerrainConfig.active_facet()
 	if fid < 0:
 		return {}
+	# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME): the altitude regime gate — the §0-W3 killer. `_update_alt_regime`
+	# (run first, in update_streaming) owns the latch; here we only ACT on it. Two one-shot cases take priority over the
+	# whole crossing pipeline:
+	#   • RE-ENTRY (just descended below the gate): do the ONE restore redesignation onto the true sub-camera facet so a
+	#     landing has terrain, then hand off to normal crossings + FP_LANDING_STREAM_KICK below the gate.
+	#   • ORBITAL (frozen): return early — NO redesignation / _rebuild_window_indices / 128→96 shrink-snap / gravity /
+	#     collider work. None of it is on screen at altitude (draws ≈ 30 = shell + sky). This is the fall's phys_ms.
+	# Placed before the cooldown/ridge scan so the freeze is total and the restore is not gated by a stale cooldown.
+	# Flag off ⇒ neither branch is reachable (`_alt_reentry_pending`/`_alt_orbital` never set) — byte-identical.
+	if CubeSphere.FP_ALT_REGIME:
+		if _alt_reentry_pending:
+			_alt_reentry_pending = false
+			return _alt_reentry_restore(fid, player_pos)
+		if _alt_orbital:
+			return {}
 	# FP-S1(c): cooldown — after a committed crossing, suppress the next FACET_CROSS_COOLDOWN calls so a crossing
 	# can never re-fire immediately (ridge-jitter / residual oscillation). A genuine sequential crossing traverses
 	# the whole facet (many ticks ≫ cooldown), so this never blocks a legitimate crossing.
 	if _cross_cooldown > 0:
 		_cross_cooldown -= 1
-		return {}
+		# COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3): the cooldown suppresses −0.1 ridge jitter — it must NOT
+		# strand the player deep in masked space. If they are genuinely PAST a ridge (own_dist < −1) fall through
+		# and commit this tick (the corner zig-zag case). Flag off ⇒ the shipped unconditional return (byte-identical).
+		if not (CubeSphere.FP_CROSS_CORNER_COMMIT and _past_ridge_deep(fid, player_pos)):
+			return {}
 	for slot in 4:
 		var s := FacetAtlas.own_dist(fid, slot, player_pos.x, player_pos.y, player_pos.z)
 		if s < -FACET_CROSS_HYST:
@@ -1741,122 +2074,165 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 					contained = false
 					break
 			if not contained:
-				continue
-			var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
-			var yaw_delta := atan2(ex.z, ex.x)
-			# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
-			# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
-			# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
-			var _cross_t0 := Time.get_ticks_usec()
-			var _rebuild_us := 0
-			var _redesig_us := 0
-			var _far_us := 0
-			TerrainConfig.set_active_facet(to)
-			# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
-			# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
-			# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
-			# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
-			var _rebuild_t0 := Time.get_ticks_usec()
-			_rebuild_window_indices()
-			_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
-			# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
-			# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
-			# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
-			var redesignated := false
-			var _redesig_t0 := Time.get_ticks_usec()
-			if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
-				redesignated = bool(_module_world.call("redesignate", to))
-				if not redesignated:
-					# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
-					# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
-					_pool_miss_count += 1
-					if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
-						redesignated = bool(_module_world.call("redesignate", to))
-					if not redesignated and _module_world.has_method("pool_reset"):
-						# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
-						# blank. NOT the FP-S1 set_facet path.
-						redesignated = bool(_module_world.call("pool_reset", to))
-			_redesig_us = Time.get_ticks_usec() - _redesig_t0
-			if redesignated:
-				# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
-				# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
-				# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
-				var _far_t0 := Time.get_ticks_usec()
-				if _facet_ring != null:
-					_facet_ring.set_active(to)
-					_facet_ring_sync_exclusion()
-				_far_us = Time.get_ticks_usec() - _far_t0
-			else:
-				# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
-				# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
-				if _module_world != null and _module_world.has_method("set_facet"):
-					var old_mod_pos: Vector3 = _module_world.position
-					_module_world.call("set_facet", to, old_mod_pos)
-				if _facet_ring != null:
-					_facet_ring.set_active(to)
-				_flip_settling = true
-				_restream()
-			# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
-			# redesignate() SKIPPED the PlanetRoot transform write (module_world, flag-gated), so NO
-			# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
-			# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
-			if _fixed_frame_on():
-				# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
-				#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
-				#    planet-absolute space. O(1) — never terrain.
-				_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
-				# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
-				#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
-				#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
-				#    sleepers keep their global pose → stay asleep. (The player is NOT compensated here — apply_reframe
-				#    assigns its lattice-B local next; the collider is rebuilt below.)
-				var cross_delta := FacetAtlas.crossing_transform(fid, to)
-				for c in _frame_host().get_children():
-					if c is VoxelBody:
-						var vb := c as VoxelBody
-						var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
-						vb.transform = cross_delta * vb.transform
-						vb.sleeping = was_sleeping
-				# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
-				#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
-				#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
-				_sync_gravity_areas()
-				# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
-				#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
-				#    entirely when no awake debris are near, exactly as today).
-				if _ground != null:
-					_ground.note_facet_crossing()
-			_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
-			print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
-				"RE-DESIGNATION" if redesignated else "restream + far re-place"])
-			# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
-			# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
-			# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
-			# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
-			var _cross_us := Time.get_ticks_usec() - _cross_t0
-			var _rd: Dictionary = {}
-			if _module_world != null and _module_world.has_method("take_last_redesignate"):
-				_rd = _module_world.call("take_last_redesignate")
-			var _rec := {
-				"ev": "crossing",
-				"from_fid": fid, "to_fid": to,
-				"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
-				"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
-				"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
-				"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
-				"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
-				"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
-				"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
-				"live_neighbours": int(_rd.get("live_neighbours", 0)),
-				"lod_tiles": int(_rd.get("lod_tiles", 0)),
-				"redesignated": redesignated,
-			}
-			_crossing_events.append(_rec)
-			while _crossing_events.size() > CROSSING_EVENTS_MAX:
-				_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
-			return {"crossed": true, "from": fid, "to": to,
-				"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+				# COSMOS FS-W (§3): a grid-corner landing failed containment. Instead of deferring into the −3 wall,
+				# resolve the destination BY DIRECTION: the facet (crossed edge-neighbours ∪ their diagonal via
+				# facet_of_dir) whose reframed landing is DEEPEST inside (argmax of min-slot own_dist). Off ⇒ the
+				# shipped `continue` (byte-identical).
+				if not CubeSphere.FP_CROSS_CORNER_COMMIT:
+					continue
+				var cc := _corner_commit(fid, player_pos)
+				if cc.is_empty():
+					continue                       # tie / all too shallow → defer one tick (as shipped)
+				to = int(cc["to"])
+				np = cc["np"]
+			return _commit_facet_change(fid, to, np, slot)
 	return {}
+
+## COSMOS FP-FIXED-FRAME §2.2 / FP-M1c — the committed facet-change bookkeeping, shared by a normal seam crossing
+## (maybe_cross_facet) and the R3 re-entry restore (_alt_reentry_restore). `to` is the destination facet, `np` the
+## f64 reframed player landing (FacetAtlas.reframe_position64), `slot` the crossed seam slot (-1 for a re-entry
+## restore — a direct facet_of_dir jump, not a seam march). Returns the `{crossed,…}` dict the player consumes via
+## apply_reframe. This is the ONLY place the active facet flips + the near field re-designates. Byte-identical to the
+## shipped inline crossing (a pure extract-method refactor; every path/instrumentation line is unchanged).
+func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary:
+	var ex := FacetAtlas.crossing_basis(fid, to) * Vector3(1.0, 0.0, 0.0)   # A's +X in B-lattice → twist
+	var yaw_delta := atan2(ex.z, ex.x)
+	# A1 CROSSING INSTRUMENTATION (#114): time the whole committed crossing + its phases (rebuild-window,
+	# redesignate, far-ring). Only runs once a crossing actually commits (this is the crossing path), so it
+	# adds no per-frame cost; the record is published event-driven by RemoteBridge (see take_crossing_events).
+	var _cross_t0 := Time.get_ticks_usec()
+	var _rebuild_us := 0
+	var _redesig_us := 0
+	var _far_us := 0
+	TerrainConfig.set_active_facet(to)
+	# FP-M1a (§6.2): the overlay `_edits`/`_meta` are (fid, cell)-GLOBAL — untouched and now correct in
+	# B's frame WITHOUT migration (an A-edit stays keyed to A; a B-edit resolves in B). But the WINDOW-keyed
+	# PERF indices (`_edit_columns`/`_placed_top`) are in the OLD active lattice, so re-derive them for B by
+	# filtering `fid == B` (the collider's fast-path gate stays exact across the crossing).
+	var _rebuild_t0 := Time.get_ticks_usec()
+	_rebuild_window_indices()
+	_rebuild_us = Time.get_ticks_usec() - _rebuild_t0
+	# The EDITABLE facet swaps to B. FP-M1c (pool ON): re-designation -- the pool already holds B, so a single
+	# PlanetRoot transform swap + view rebalance makes B active and A a rotated neighbour, no teardown. Pool
+	# OFF (FP-S1 fallback below): the old set_facet teardown + M4 cover restream. Far ring re-placed either way.
+	var redesignated := false
+	var _redesig_t0 := Time.get_ticks_usec()
+	if CubeSphere.FP_M1_POOL and _module_world != null and _module_world.has_method("redesignate"):
+		redesignated = bool(_module_world.call("redesignate", to))
+		if not redesignated:
+			# POOL-MISS (destination not pre-warmed): `to` is ALWAYS a seam-neighbour of the active facet, so spawn
+			# it NOW (milliseconds) then re-designate -- still a HIT, no teardown. Track the miss (gate 0 in a walk).
+			_pool_miss_count += 1
+			if _module_world.has_method("pool_spawn") and bool(_module_world.call("pool_spawn", to)):
+				redesignated = bool(_module_world.call("redesignate", to))
+			if not redesignated and _module_world.has_method("pool_reset"):
+				# Pathological (neighbour cap hit): rebuild the pool fresh on `to` -- degraded but consistent + never
+				# blank. NOT the FP-S1 set_facet path.
+				redesignated = bool(_module_world.call("pool_reset", to))
+	_redesig_us = Time.get_ticks_usec() - _redesig_t0
+	if redesignated:
+		# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
+		# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
+		# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
+		var _far_t0 := Time.get_ticks_usec()
+		if _facet_ring != null:
+			_facet_ring.set_active(to)
+			_facet_ring_sync_exclusion()
+		if _skin != null:
+			_skin.call("set_active", to)
+		_far_us = Time.get_ticks_usec() - _far_t0
+	else:
+		# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
+		# when FP_M1_POOL is off; unreachable under the pool (redesignate/spawn/reset always succeed).
+		if _module_world != null and _module_world.has_method("set_facet"):
+			var old_mod_pos: Vector3 = _module_world.position
+			_module_world.call("set_facet", to, old_mod_pos)
+		if _facet_ring != null:
+			_facet_ring.set_active(to)
+		if _skin != null:
+			_skin.call("set_active", to)
+		_flip_settling = true
+		_restream()
+	# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
+	# redesignate() SKIPPED the PlanetRoot transform write (module_world, flag-gated), so NO
+	# NOTIFICATION_TRANSFORM_CHANGED / per-mesh-block re-place fired (the 200–772 ms spike is gone). Instead we
+	# re-place ONLY the ~10 NON-terrain children by flipping the ActiveFrame node from T_from to T_to:
+	if _fixed_frame_on():
+		# 4. ActiveFrame → T_to (the new active facet's TRUE absolute transform, folded through the re-anchor
+		#    offset). Its children (player, collider, debris) keep their LATTICE locals; their globals follow to
+		#    planet-absolute space. O(1) — never terrain. (Null-guard: _fixed_frame_on() is a pure flag read, but the
+		#    ActiveFrame node is only built once _ready runs — a redesignation raced before that, e.g. a headless
+		#    harness driving the crossing pre-_ready, must not crash; the live game always has it, so byte-identical.)
+		if _active_frame != null:
+			_active_frame.transform = _anchored(FacetAtlas.facet_transform(to))
+		# 5. Debris compensation (§5 — also fixes the latent facet_atlas.gd:300 stranded-debris bug): the parent
+		#    flip T_from→T_to would drag every VoxelBody child, so cancel it with Δ = T_to⁻¹·T_from on each body's
+		#    LOCAL → its ABSOLUTE pose is preserved exactly. Velocities are physics-server-GLOBAL (untouched);
+		#    sleepers keep their global pose → stay asleep. (The player is NOT compensated here — apply_reframe
+		#    assigns its lattice-B local next; the collider is rebuilt below.)
+		var cross_delta := FacetAtlas.crossing_transform(fid, to)
+		for c in _frame_host().get_children():
+			if c is VoxelBody:
+				var vb := c as VoxelBody
+				var was_sleeping := vb.sleeping   # preserve dormancy — a same-global re-place must not wake it
+				vb.transform = cross_delta * vb.transform
+				vb.sleeping = was_sleeping
+		# 6. Resync the per-facet gravity volumes to the new live pool (§10 decision 2): `to`'s box already exists
+		#    (it was a live neighbour) and is now re-stamped as the higher-priority active box; the old active stays
+		#    a live neighbour with its own T_from-up box. Each debris keeps falling along ITS OWN facet's up.
+		_sync_gravity_areas()
+		# 8. GroundCollider: its live box shapes are in the OLD active lattice → now stale under the flipped frame.
+		#    Force a fresh core-then-fill rebuild at the new active-lattice column (normal budget; still gated OFF
+		#    entirely when no awake debris are near, exactly as today).
+		if _ground != null:
+			_ground.note_facet_crossing()
+	_cross_cooldown = FACET_CROSS_COOLDOWN   # FP-S1(c): no re-fire for the next N ticks
+	print("[WorldManager] facet cross %d -> %d (slot %d, %s)" % [fid, to, slot,
+		"RE-DESIGNATION" if redesignated else "restream + far re-place"])
+	# A1 CROSSING INSTRUMENTATION (#114): assemble + enqueue the per-crossing attribution record. The module
+	# side (redesignate) measured the transform write + block count; drain it and combine with the crossing-total
+	# split here. transform_ms is THE headline (the NOTIFICATION_TRANSFORM_CHANGED re-place spike). RemoteBridge
+	# drains _crossing_events and publishes each as a distinct {"type":"crossing",…} JSON on the authed socket.
+	var _cross_us := Time.get_ticks_usec() - _cross_t0
+	var _rd: Dictionary = {}
+	if _module_world != null and _module_world.has_method("take_last_redesignate"):
+		_rd = _module_world.call("take_last_redesignate")
+	var _rec := {
+		"ev": "crossing",
+		"from_fid": fid, "to_fid": to,
+		"crossing_ms": snappedf(float(_cross_us) / 1000.0, 0.01),
+		"transform_ms": snappedf(float(_rd.get("transform_us", 0)) / 1000.0, 0.01),
+		"redesignate_ms": snappedf(float(_rd.get("redesignate_us", 0)) / 1000.0, 0.01),
+		"rebuild_ms": snappedf(float(_rebuild_us) / 1000.0, 0.01),
+		"far_ms": snappedf(float(_far_us) / 1000.0, 0.01),
+		"redesig_call_ms": snappedf(float(_redesig_us) / 1000.0, 0.01),
+		"blocks_replaced": int(_rd.get("blocks_replaced", 0)),
+		"live_neighbours": int(_rd.get("live_neighbours", 0)),
+		"lod_tiles": int(_rd.get("lod_tiles", 0)),
+		"redesignated": redesignated,
+	}
+	_crossing_events.append(_rec)
+	while _crossing_events.size() > CROSSING_EVENTS_MAX:
+		_crossing_events.pop_front()   # NEVER-OOM: drop the oldest if no bridge is draining
+	return {"crossed": true, "from": fid, "to": to,
+		"new_pos": Vector3(float(np[0]), float(np[1]), float(np[2])), "yaw_delta": yaw_delta}
+
+## COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME, §0-W3) — the ONE re-entry restore. On descent back below the ATMO_TOP
+## gate the frozen active facet is stale (the ground track drifted while frozen), so redesignate directly onto the
+## TRUE sub-camera facet (FacetAtlas.facet_of_dir of the player's world direction) — a single O(1) _commit_facet_change,
+## NOT a slow seam-by-seam walk. The player pose is re-expressed by the returned crossing dict (apply_reframe) and the
+## _heal_frame_desync invariant, so the restore is position/velocity-continuous. If the sub-camera facet already IS the
+## frozen facet (a purely radial descent) nothing needs restoring — return {} and let the resumed pool + FP_LANDING_
+## STREAM_KICK grow the near view for touchdown. Only reached under FP_ALT_REGIME, once, on the ORBITAL→SURFACE edge.
+func _alt_reentry_restore(fid: int, player_pos: Vector3) -> Dictionary:
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	var to := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	if to < 0 or to == fid:
+		return {}   # already on the sub-camera facet — the frozen near field is correct; pool/stream resumes next tick
+	_alt_redesignate_count += 1
+	var np: Array = FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+	print("[WorldManager] R3 re-entry restore: redesignate %d -> %d (sub-camera facet, alt gate)" % [fid, to])
+	return _commit_facet_change(fid, to, np, -1)
 
 ## FP-M1c (§4.3): the neighbour-pool manager, run every physics tick from update_streaming (pool flag only).
 ## Spawn a facet whose own-side ridge distance is below D_WARM (nearest first), retire a pooled neighbour past
@@ -2125,6 +2501,17 @@ func _facet_ring_sync_exclusion() -> void:
 				excluded.append(f)
 	_facet_ring.set_pool_excluded(excluded)
 
+## COSMOS SEAMLESS-SCALES C3: the facets the skin should cover — the active facet plus the live-pool
+## neighbours (the front-hemisphere facets the near disc/annulus can reach). Mirrors the far ring's
+## excluded set so the skin and the pool cover the same facets.
+func _skin_candidate_fids() -> PackedInt32Array:
+	var out := PackedInt32Array([TerrainConfig.active_facet()])
+	if _module_world != null and _module_world.has_method("pool_neighbour_fids"):
+		for f in (_module_world.call("pool_neighbour_fids") as Array):
+			if not out.has(int(f)):
+				out.append(int(f))
+	return out
+
 ## FP-M1c gate accessor: the count of re-designation POOL-MISS fallbacks so far (must be ~0 in a normal walk).
 func pool_miss_count() -> int:
 	return _pool_miss_count
@@ -2153,6 +2540,81 @@ func take_crossing_events() -> Array:
 		return []
 	var out := _crossing_events
 	_crossing_events = []
+	return out
+
+## T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): drain the FacetFarRing's per-rebuild build/swap timing records for the
+## telemetry socket. Guarded for the non-faceted / fallback path (no ring) → always [] there. RemoteBridge publishes each
+## as a distinct {"type":"farring",…} JSON line (same event-drain pattern as take_crossing_events); the record convicts
+## or acquits the §2.2c zero-queue crossing stall (far-ring re-emit is the prime suspect).
+func take_farring_events() -> Array:
+	if _facet_ring == null or not _facet_ring.has_method("take_events"):
+		return []
+	return _facet_ring.take_events()
+
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2): the planet centre in the current render
+## frame (the far-ring placement translation), for the SN3 driver to derive the camera distance/altitude. No
+## faceted ring (fallback / flat) ⇒ the origin. DEAD unless FP_SCALED_BODY is on (only main._process calls it).
+func planet_render_centre() -> Vector3:
+	if _facet_ring == null:
+		return Vector3.ZERO
+	return _facet_ring.render_centre()
+
+## COSMOS SPACE-NAV SN3 (§5.2): apply the scaled-body distance clamp to the far ring for this frame. No-op when
+## there is no faceted ring. Below D_ENGAGE this is byte-identical to the shipped placement (the clamp scale is
+## exactly 1). Called per frame by main._process under FP_SCALED_BODY only.
+func apply_scaled_body(cam: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.apply_scaled_placement(cam)
+
+## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): drive the far ring's camera-radial
+## emitted-set law + one-shot prewarm arming from this frame's camera (render frame). No faceted ring (fallback/
+## flat) ⇒ no-op. Called per frame by main._process under (FP_SHELL_CAMERA_SET or FP_SHELL_PREWARM); independent
+## of apply_scaled_body (separate flag/driver — the shell fix is standalone-correct below h ≈ 6.3 k without SN3).
+func update_shell_camera_set(cam: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.apply_camera_set(cam)
+
+## COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the current Sun direction to the far-ring shell tint shader.
+## No-op with no faceted ring or the flag off (the setter self-guards) ⇒ byte-identical.
+func set_far_ring_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_terminator_sun_dir(sun_dir)
+
+## COSMOS ATMO-SKY A5 (FP_SHELL_ABSOLUTE): forward the current Sun direction into the far-ring shell v2 shader.
+## No-op with no faceted ring or the flag off (the setter self-guards) ⇒ byte-identical.
+func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_shell_absolute_sun_dir(sun_dir)
+
+## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
+## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
+## + the atlas setter both self-guard) ⇒ byte-identical.
+func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
+	if _module_world != null and _module_world.has_method("set_near_daylight_sun_dir"):
+		_module_world.call("set_near_daylight_sun_dir", sun_dir)
+	# The per-id near-field materials (fallback mesher + module residual surfaces — slopes, translucent, water,
+	# lava — + VoxelBody debris) share the one static BlockMaterials cache; feed the Sun into every daylight twin.
+	# Self-guards on FP_NEAR_DAYLIGHT ⇒ flag-off is byte-identical (nothing registered, no-op).
+	BlockMaterials.set_near_daylight_sun_dir(sun_dir)
+
+## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
+## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).
+func shell_telemetry() -> Dictionary:
+	if _facet_ring == null or not _facet_ring.has_method("shell_telemetry"):
+		return {}
+	return _facet_ring.shell_telemetry()
+
+## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
+## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets
+## the accumulators — RemoteBridge samples it once per telemetry window so a 0.5 s snowfall spike is attributed as its own
+## number rather than folded anonymously into worst_ms. Read-only w.r.t. gameplay; the timers are passive ticks_usec reads.
+func take_perf_attrib() -> Dictionary:
+	var out := {
+		"snow_ms": snappedf(float(_snow_us_max) / 1000.0, 0.01),
+		"ctrl_ms": snappedf(float(_ctrl_us_max) / 1000.0, 0.01),
+	}
+	_snow_us_max = 0
+	_ctrl_us_max = 0
 	return out
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
@@ -2237,12 +2699,23 @@ func maybe_flip_home_face(player_pos: Vector3) -> bool:
 func _rebuild_window_indices() -> void:
 	_edit_columns = {}
 	_placed_top = {}
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): a crossing/flip re-bases WINDOW columns onto different global columns, so the
+	# window-keyed floor memo is stale — drop it wholesale (it re-populates lazily on the next fall). No-op off-flag.
+	if CubeSphere.FP_FLOOR_MEMO:
+		_floor_top = {}
 	# FP-M1a: FACETED (no chart) — the active facet lattice IS the window, so keep this facet's edits and
 	# index them directly by their unpacked cell (x, z) / y high-water mark.
 	if CubeSphere.FACETED and _chart == null:
 		var active := TerrainConfig.active_facet()
-		for k in _edits.keys():
-			if FacetAtlas.edit_key_fid(k) != active:
+		# COSMOS-PERF UNATTENDED R5 (FP_EDIT_FID_INDEX): iterate ONLY the active facet's edits from the per-fid index
+		# (O(active-fid)) instead of the whole `_edits` dict (O(all edits) — up to ~200 k snow cells). The index is a
+		# byte-exact subset filed by the same write/erase choke points, so the rebuilt indices are IDENTICAL. Off ⇒ the
+		# shipped full scan + per-key fid filter (byte-identical). `_rebuild_scanned` records the work actually paid.
+		var indexed: bool = CubeSphere.FP_EDIT_FID_INDEX
+		var ks: Array = _edits_by_fid.get(active, {}).keys() if indexed else _edits.keys()
+		_rebuild_scanned = ks.size()
+		for k in ks:
+			if not indexed and FacetAtlas.edit_key_fid(k) != active:
 				continue
 			var cell: Vector3i = FacetAtlas.edit_key_unpack(k)[1]
 			var col := Vector2i(cell.x, cell.z)
@@ -2319,6 +2792,13 @@ func _shift_window_bookkeeping(d: Vector2i) -> void:
 	for k: Vector2i in _placed_top.keys():
 		new_top[k - d] = _placed_top[k]
 	_placed_top = new_top
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO): an origin shift re-anchors the SAME world under shifted window coords, so the
+	# memo stays valid — re-key column (x, z) → (x − Δ, z − Δ) (the topmost CELL y is unchanged). No-op off-flag.
+	if CubeSphere.FP_FLOOR_MEMO and not _floor_top.is_empty():
+		var new_ft := {}
+		for k: Vector2i in _floor_top.keys():
+			new_ft[k - d] = _floor_top[k]
+		_floor_top = new_ft
 	if not _joint_mods.is_empty():
 		var new_j := {}
 		for k: Vector4i in _joint_mods.keys():
@@ -2382,6 +2862,14 @@ func load_region(region_key: int, chunk: ZoneChunk, resolver: Callable = Callabl
 		var wxy := _chart.window_of(gi, gj)
 		var win := Vector3i(wxy.x, gr, wxy.y)
 		_write_cell(win, packed, chunk.meta_at(idx))
+		# Defensive (FP_FLOOR_BOUNDED landmine): unlike place_block, this restore path never raised the
+		# per-column PLACED high-water mark, so a restored tower would be INVISIBLE to `ceil_est`/`_attitude_
+		# ground_contact` (a wrong-floor / suppressed-recovery bug the moment either flag consults `_placed_top`).
+		# Mirror place_block for every restored non-air cell. Cheap; no effect on the value-only round-trip gate.
+		if id > BlockCatalog.AIR:
+			var pkey := Vector2i(win.x, win.z)
+			if win.y > int(_placed_top.get(pkey, -0x40000000)):
+				_placed_top[pkey] = win.y
 
 # --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------
 # The generated world is a pure function (tier 2) and is NEVER serialized; only the edit
@@ -2456,7 +2944,14 @@ func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = 
 				% [name, ZoneChunk.PLACEHOLDER_MATERIAL])
 		var packed := CellCodec.pack(id, chunk.modifier_at(idx), chunk.state_at(idx))
 		var local := ZoneChunk.from_local_index(idx)
-		_write_cell(region_origin + local, packed, chunk.meta_at(idx))
+		var wcell := region_origin + local
+		_write_cell(wcell, packed, chunk.meta_at(idx))
+		# Defensive (FP_FLOOR_BOUNDED landmine): mirror place_block's PLACED high-water update so a restored
+		# tower is visible to `ceil_est`/`_attitude_ground_contact`. See load_region for the full rationale.
+		if id > BlockCatalog.AIR:
+			var pkey := Vector2i(wcell.x, wcell.z)
+			if wcell.y > int(_placed_top.get(pkey, -0x40000000)):
+				_placed_top[pkey] = wcell.y
 
 static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 	return cell.x >= origin.x and cell.x < origin.x + s \
@@ -2672,27 +3167,116 @@ func surface_y(x: float, z: float) -> float:
 ## Horizontal movement into terrain is now stopped by blocked() (the player queries
 ## it per-axis), so the feet are always at or just above an air-topped surface and a
 ## valid floor is always found; the scan honours dug shafts/tunnels below as well.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4) — this column's CONTINUOUS datum lift s: the play↔cell boundary
+## map (play y = cell y + s). The physics funnels below (floor_under/blocked/ceiling/DDA) evaluate voxel CONTENT in
+## cell space and report in PLAY space by adding s per column (the content is byte-identical — FS2′ shifts the
+## boundary, not the world). 0.0 unless FP_DATUM_BAKE and an active facet ⇒ every funnel is byte-identical off.
+func _datum_lift(xi: int, zi: int) -> float:
+	if not (CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED):
+		return 0.0
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return 0.0
+	return FacetAtlas.datum_lift(fid, float(xi) + 0.5, float(zi) + 0.5)
+
 func floor_under(x: float, z: float, feet_y: float) -> float:
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)   # in-cell footprint (ignored by full cubes; used by P5 shapes)
 	var fz := z - float(zi)
+	# COSMOS FS2′: convert the PLAY feet to CELL space for the (content) scan, report the found top back in PLAY
+	# space (+ s). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
+	var cell_feet := feet_y - s
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
-	# off. Scan length is bounded by the fall distance — cheap.
-	var start := int(floor(feet_y + 0.5))
+	# off. (The scan length used to be justified as "bounded by the fall distance —
+	# cheap"; that is FALSE for a fall from orbit — feet ≈ R+900 ⇒ ~900 cell_value_at
+	# queries/call ⇒ ~86 ms/frame. FP_FLOOR_BOUNDED below bounds it.)
+	var start := int(floor(cell_feet + 0.5))
 	var y := start
+	_floor_scan_iters = 0
+	var populate := false          # true ⇒ the tail scan starts ABOVE all solids, so its first floor IS the column's topmost (cacheable)
+	# COSMOS-PERF FALL (FP_FLOOR_BOUNDED): PROBE the first MARGIN cells DOWN from the feet. Near the surface
+	# (walking/standing/landing — feet within MARGIN of the floor) the floor is found in the first 1-2 cells, so
+	# this loop returns the SAME value scanning the SAME cells in the SAME order as the shipped unbounded scan —
+	# BIT-IDENTICAL. Only if the probe finds NO floor (the feet are more than MARGIN above everything near them —
+	# a fall) do we skip the guaranteed-generated-air gap by jumping the scan to a cheap heightmap-based start.
+	# Off ⇒ this whole block is skipped (y stays = start) and the loop below is the shipped scan verbatim.
+	if CubeSphere.FP_FLOOR_BOUNDED:
+		# COSMOS-PERF FALL (FP_FLOOR_MEMO): if this column's topmost solid-with-air-above is cached AND the feet are
+		# at/above it, nothing solid sits above that cell (proof: a higher solid would itself be a higher
+		# solid-with-air-above), so a scan from the feet reaches it through air alone — jump STRAIGHT there and let
+		# the tail loop return it in one iteration (O(1); skips the probe). Off ⇒ the sentinel ⇒ this never fires.
+		var cached := int(_floor_top.get(Vector2i(xi, zi), _FLOOR_MEMO_NONE)) if CubeSphere.FP_FLOOR_MEMO else _FLOOR_MEMO_NONE
+		if cached != _FLOOR_MEMO_NONE and start >= cached:
+			y = cached
+		else:
+			var probe_floor := start - CubeSphere.FLOOR_BOUNDED_MARGIN
+			while y > probe_floor:
+				_floor_scan_iters += 1
+				var hp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+				if hp != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
+					return float(y) + hp.y + s
+				y -= 1
+			# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
+			# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
+			# DIRECT query (no scan), and every generated solid (terrain + trees, ≤ MAX_ABOVE_SURFACE=14 higher) sits
+			# at or below it; and (b) `placed_top + 1`: the per-column high-water of PLAYER-PLACED cells (an O(1)
+			# `_placed_top` lookup), so a tower rising ABOVE the heightmap+MARGIN is still covered exactly. Jump the
+			# scan to that ceiling — skipping the pure-air gap above it the shipped path would grind through — but
+			# NEVER move the scan UP past where the probe already reached (`mini` keeps it a continuation when the
+			# ceiling is not below). The jump lands the scan just above the true floor, so it finds the SAME floor
+			# the shipped from-feet scan would (bit-identical), now in ≤ ~MARGIN cells instead of ∝ feet altitude.
+			var ceil_est := maxi(col_height(xi, zi) + CubeSphere.FLOOR_BOUNDED_MARGIN, placed_top(xi, zi) + 1)
+			y = mini(y, ceil_est)
+			# We reach the ceiling (y == ceil_est) only when it is BELOW the probed band ⇒ the scan now starts above
+			# EVERY solid in the column, so the first floor it finds is the column's topmost surface — safe to memoize.
+			populate = CubeSphere.FP_FLOOR_MEMO and y == ceil_est
 	# Merged contract (INTEGRATION-DECISIONS §3): the per-cell test is `_occ_span`, so
 	# non-solid materials (water) yield the empty span and are scanned THROUGH to the
 	# seafloor, while a solid cell yields its filled interval — the floor is the top of
 	# the first occupied cell that has an empty span directly above (its top = span.y;
 	# 1.0 for a full cube ⇒ float(y+1), byte-identical to the old solid/air-above test).
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO) footprint-safety: `populate` is only true when the scan jumped to
+	# `ceil_est` — a footprint-INDEPENDENT ceiling above EVERY solid in the column — so the descent passes
+	# through the whole air gap first. `memo_safe` stays true only while every above-floor cell is plain
+	# (footprint-independent) air; a shaped/ramp/seam cell (solid material but empty span at THIS footprint)
+	# flips it false, because at another footprint that cell could BE the floor. We then cache only when the
+	# found floor is itself a plain full cube — guaranteeing a HIT reproduces this floor at ANY footprint.
+	var memo_safe := true
 	while y > -1024:
-		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		_floor_scan_iters += 1
+		var v_here := cell_value_at(Vector3i(xi, y, zi))
+		var here := _occ_span(v_here, fx, fz)
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
-			return float(y) + here.y
+			if populate and memo_safe and _span_indep_full(v_here):
+				_floor_memo_put(Vector2i(xi, zi), y)
+			return float(y) + here.y + s
+		if populate and not _span_indep_empty(v_here):
+			memo_safe = false          # a footprint-DEPENDENT cell sits above the floor → unsafe to cache this column
 		y -= 1
-	return float(effective_height(xi, zi) + 1)
+	return float(effective_height(xi, zi) + 1) + s
+
+## FP_FLOOR_MEMO: store column `col`'s topmost-standable CELL y. NEVER-OOM — past FLOOR_MEMO_CAP columns the whole
+## memo is dropped (a clear only forces a recompute, which is bit-identical), so the dict can never grow unbounded.
+func _floor_memo_put(col: Vector2i, top_y: int) -> void:
+	if _floor_top.size() >= CubeSphere.FLOOR_MEMO_CAP and not _floor_top.has(col):
+		_floor_top.clear()
+	_floor_top[col] = top_y
+
+## FP_FLOOR_MEMO footprint-safety predicates. `floor_under`'s memo caches a column's floor by CELL index only,
+## but `_occ_span` varies WITHIN a cell for shaped terrain — a ramp/slab/junction cell (SUB-VOXEL-SMOOTHING,
+## default on) is solid at one in-cell footprint and air at another, and snow raises the top by a footprint-
+## dependent amount. A column is safe to memoize ONLY when its topmost floor is a PLAIN FULL CUBE (span (0,1)
+## for EVERY footprint) and every cell above it is PLAIN air (span ZERO for every footprint); then a cache HIT
+## jumps to that cell and the tail scan reproduces the SAME floor at ANY footprint (no shaped cell above can
+## become the real, higher floor at a different footprint). Any nonzero shape modifier or snow fill makes the
+## span footprint-DEPENDENT, so such a column is excluded and falls back to the (always-correct) bounded scan.
+func _span_indep_full(v: int) -> bool:
+	return BlockCatalog.solidity_of(CellCodec.mat(v)) >= 0.5 and CellCodec.modifier(v) == 0 and CellCodec.snow_fill(v) == 0
+func _span_indep_empty(v: int) -> bool:
+	return BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5
 
 ## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
 ## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical
@@ -2712,6 +3296,12 @@ const _EPS := 1e-6
 ## → wall), a body span overlapping the ground finds its surface far above the buried
 ## feet (→ wall), and open air raises nothing (→ not blocked).
 func blocked(x: float, z: float, feet_y: float) -> bool:
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	# COSMOS FS2′: this column's play↔cell lift (0.0 unless FP_DATUM_BAKE). The ridge-wall own_dist test is a
+	# near-vertical plane distance, so it is evaluated in CELL space (feet_y − s); the headroom cell scan below
+	# takes a CELL-space top (top − s). floor_under already reports PLAY space. s ≡ 0.0 off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
 	# COSMOS FACETED §5.3: the ridge wall. Until the FP3 handoff lets the player cross onto the neighbour, an
 	# invisible wall sits just inside each active-facet ridge plane, so the player can stand on the own-side of
 	# every junction cell but not walk past P into the masked void. One own_dist test per ≤4 seams.
@@ -2719,10 +3309,8 @@ func blocked(x: float, z: float, feet_y: float) -> bool:
 		var fid := TerrainConfig.active_facet()
 		if fid >= 0:
 			for slot in 4:
-				if FacetAtlas.own_dist(fid, slot, x, feet_y, z) < FACET_WALL_EPS:
+				if FacetAtlas.own_dist(fid, slot, x, feet_y - s, z) < FACET_WALL_EPS:
 					return true
-	var xi := int(floor(x))
-	var zi := int(floor(z))
 	var fx := x - float(xi)
 	var fz := z - float(zi)
 	# Standable height at the target column, allowing an auto-step up to STEP_MAX.
@@ -2730,8 +3318,8 @@ func blocked(x: float, z: float, feet_y: float) -> bool:
 	if top - feet_y > STEP_MAX:
 		return true                                    # rise too big → wall (a full cube's 1.0 always is)
 	# Headroom above the (possibly auto-stepped) floor: the body must not clip a solid
-	# cell in (top, top + body height) at this footprint.
-	return not _headroom_clear(xi, zi, fx, fz, top)
+	# cell in (top, top + body height) at this footprint. _headroom_clear scans CELLS ⇒ cell-space top (top − s).
+	return not _headroom_clear(xi, zi, fx, fz, top - s)
 
 ## True if the player's body column (top .. top + body height) at footprint (fx, fz)
 ## in column (xi, zi) is clear of solid occupancy (SVS §5.2). The cell whose top the
@@ -2767,14 +3355,19 @@ func ceiling_scan(x: float, z: float, from_head_y: float, to_head_y: float) -> f
 	var zi := int(floor(z))
 	var fx := x - float(xi)
 	var fz := z - float(zi)
-	var y := int(floor(from_head_y))
-	var y_hi := int(floor(to_head_y))
+	# COSMOS FS2′: convert the PLAY head span to CELL space for the content scan, report the underside back in PLAY
+	# space (+ s). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
+	var s := _datum_lift(xi, zi)
+	var from_cell := from_head_y - s
+	var to_cell := to_head_y - s
+	var y := int(floor(from_cell))
+	var y_hi := int(floor(to_cell))
 	while y <= y_hi:
 		var sp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 		if sp != Vector2.ZERO:
 			var occ_lo := float(y) + sp.x
-			if occ_lo >= from_head_y - _EPS:
-				return occ_lo
+			if occ_lo >= from_cell - _EPS:
+				return occ_lo + s
 		y += 1
 	return INF
 
@@ -2791,7 +3384,26 @@ func is_solid(pos: Vector3) -> bool:
 ## exact for modifier 0). P5 SEAM: for a shaped (ramp) cell, `cell_solid` still gates
 ## entry, then an in-cell surface ray test (SVS §5.3) refines the hit point/normal
 ## within the cell — full cubes need no refinement, so the boundary hit stands.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.5): the aim ray is cast in PLAY space against the rendered
+## (datum-lifted) surface. Lower the origin by the ray column's continuous s to CELL space, walk the DDA against
+## CONTENT (byte-identical, shipped path), then lift the returned hit POSITION back to play space by the HIT
+## column's s (the highlight renders at + s). Off (FP_DATUM_BAKE / non-faceted / no active facet) ⇒ the shipped
+## path verbatim — byte-identical. The returned `voxel` is a content cell either way (break/place stays cell-space).
 func aimed_voxel(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
+	if not (CubeSphere.FP_DATUM_BAKE and CubeSphere.FACETED and TerrainConfig.active_facet() >= 0):
+		return _aimed_voxel_cell(origin, dir, max_dist)
+	var s0 := _datum_lift(int(floor(origin.x)), int(floor(origin.z)))
+	var res := _aimed_voxel_cell(Vector3(origin.x, origin.y - s0, origin.z), dir, max_dist)
+	if res.has("position"):
+		var p: Vector3 = res["position"]
+		var sh := s0
+		if bool(res.get("hit", false)):
+			var v: Vector3i = res.get("voxel", Vector3i.ZERO)
+			sh = _datum_lift(v.x, v.z)
+		res["position"] = Vector3(p.x, p.y + sh, p.z)
+	return res
+
+func _aimed_voxel_cell(origin: Vector3, dir: Vector3, max_dist: float = 8.0) -> Dictionary:
 	var d := dir.normalized()
 	var cell := Vector3i(int(floor(origin.x)), int(floor(origin.y)), int(floor(origin.z)))
 	var step := Vector3i(signi(int(sign(d.x))), signi(int(sign(d.y))), signi(int(sign(d.z))))

@@ -1,0 +1,153 @@
+COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2) — the FP_DATUM_BAKE near-mesh hook.
+
+Applies AFTER 0008 (glob order), on the fully-patched VoxelMesherBlocky. Adds set_facet_datum_bake(Dictionary)
++ the FacetDatumBakeParams blob + a per-vertex build()-time lift: every near-mesh vertex is raised by the
+CONTINUOUS per-column datum s = -b + sqrt(b^2 + R^2 - |p0|^2) along the facet-lattice up axis (local +Y), so the
+flat-lattice near field renders at the radial surface R+s while the voxel CONTENT stays byte-identical (positions
+only, no re-index, NO generator change). facet_datum_lift mirrors FacetAtlas.datum_lift EXACTLY from the already-
+frozen atlas frame row (o/du/dv/nhat + off + R). enabled=false (or an empty dict / an unpatched binary via the
+has_method guard) => the plain flat mesher, byte-identical to the pre-FS2' engine. This REPLACES the retired FS2
+generator patch (0009, removed): the generator is untouched. Kept as a standalone patch so the hunk offsets are
+git-generated and cannot drift against the earlier mesher patches (0003 near-bake, 0004 facet-carve).
+
+diff --git a/meshers/blocky/voxel_mesher_blocky.cpp b/meshers/blocky/voxel_mesher_blocky.cpp
+index d738785..e1b69b9 100644
+--- a/meshers/blocky/voxel_mesher_blocky.cpp
++++ b/meshers/blocky/voxel_mesher_blocky.cpp
+@@ -821,6 +821,58 @@ void VoxelMesherBlocky::set_facet_carve(Dictionary d) {
+ 	_parameters.facet_carve = fc;
+ }
+ 
++// COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.1): install/clear the frozen-per-facet datum bake. Parsed from
++// FacetAtlas.datum_bake_params; written under the parameters write-lock so the mesh workers pick up the whole blob
++// atomically via their build() snapshot. enabled=false (or an empty dict) restores the plain flat mesher exactly.
++void VoxelMesherBlocky::set_facet_datum_bake(Dictionary d) {
++	FacetDatumBakeParams fd;
++	fd.enabled = bool(d.get("enabled", false));
++	if (fd.enabled) {
++		fd.R = double(d.get("R", 1.0));
++		const PackedFloat64Array o = d.get("o", PackedFloat64Array());
++		const PackedFloat64Array du = d.get("du", PackedFloat64Array());
++		const PackedFloat64Array dv = d.get("dv", PackedFloat64Array());
++		const PackedFloat64Array nh = d.get("nhat", PackedFloat64Array());
++		for (int k = 0; k < 3; ++k) {
++			if (k < o.size()) {
++				fd.o[k] = o[k];
++			}
++			if (k < du.size()) {
++				fd.du[k] = du[k];
++			}
++			if (k < dv.size()) {
++				fd.dv[k] = dv[k];
++			}
++			if (k < nh.size()) {
++				fd.nhat[k] = nh[k];
++			}
++		}
++		const PackedInt32Array off = d.get("off", PackedInt32Array());
++		for (int k = 0; k < 2 && k < off.size(); ++k) {
++			fd.off[k] = off[k];
++		}
++	}
++	RWLockWrite wlock(_parameters_lock);
++	_parameters.facet_datum = fd;
++}
++
++// COSMOS FS2′: the continuous per-column datum lift s at CONTINUOUS lattice coords (vx, vz) — EXACT mirror of
++// FacetAtlas.datum_lift. p0 = o + (vx−offx)·du + (vz−offz)·dv is the column point on the facet plane; b = p0·n̂;
++// s solves |p0 + s·n̂| = R for s ≥ 0. Pure arithmetic, no branches on chart topology (thread-safe on the snapshot).
++static inline double facet_datum_lift(const VoxelMesherBlocky::FacetDatumBakeParams &p, double vx, double vz) {
++	const double fx = vx - double(p.off[0]);
++	const double fz = vz - double(p.off[1]);
++	const double p0x = p.o[0] + fx * p.du[0] + fz * p.dv[0];
++	const double p0y = p.o[1] + fx * p.du[1] + fz * p.dv[1];
++	const double p0z = p.o[2] + fx * p.du[2] + fz * p.dv[2];
++	const double b = p0x * p.nhat[0] + p0y * p.nhat[1] + p0z * p.nhat[2];
++	double disc = b * b + p.R * p.R - (p0x * p0x + p0y * p0y + p0z * p0z);
++	if (disc < 0.0) {
++		disc = 0.0;
++	}
++	return -b + std::sqrt(disc);
++}
++
+ Dictionary VoxelMesherBlocky::get_facet_carve() const {
+ 	FacetCarveParams fc;
+ 	{
+@@ -1096,6 +1148,28 @@ void VoxelMesherBlocky::build(VoxelMesher::Output &output, const VoxelMesher::In
+ 		}
+ 	}
+ 
++	// COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.1): the facet DATUM BAKE. Lift every near-mesh vertex by the
++	// CONTINUOUS per-column datum s along the facet-lattice up axis (local +Y) so the flat-lattice near field renders
++	// at the radial surface R+s — the voxel CONTENT is untouched (positions only, no re-index). s is C∞ per column,
++	// so the surface is crack-free between blocks (each vertex uses its OWN fractional x,z). Mutually exclusive with
++	// the curved cosmos bake above (faceted mode ⇒ cosmos.enabled is false). Disabled ⇒ the flat mesher is byte-
++	// identical. Runs on the mesh worker with a per-mesher frozen snapshot (thread-safe). Normals are left as the
++	// flat-cube normals (the ≤2° lift tilt is cosmetically negligible in this ambient-lit scene — §2.1).
++	if (params.facet_datum.enabled) {
++		const FacetDatumBakeParams &fd = params.facet_datum;
++		const Vector3i wo = input.origin_in_voxels; // block's global facet-lattice voxel origin
++		for (Arrays &arrays : arrays_per_material) {
++			const unsigned int vcount = (unsigned int)arrays.positions.size();
++			for (unsigned int i = 0; i < vcount; ++i) {
++				Vector3f lp = arrays.positions[i];
++				const double vx = double(wo.x) + double(lp.x);
++				const double vz = double(wo.z) + double(lp.z);
++				lp.y += (float)facet_datum_lift(fd, vx, vz);
++				arrays.positions[i] = lp;
++			}
++		}
++	}
++
+ 	// TODO Optimization: we could return a single byte array and use Mesh::add_surface down the line?
+ 	// That API does not seem to exist yet though.
+ 
+@@ -1267,6 +1341,8 @@ void VoxelMesherBlocky::_bind_methods() {
+ 
+ 	ClassDB::bind_method(D_METHOD("set_facet_carve", "params"), &VoxelMesherBlocky::set_facet_carve);
+ 	ClassDB::bind_method(D_METHOD("get_facet_carve"), &VoxelMesherBlocky::get_facet_carve);
++	ClassDB::bind_method(
++			D_METHOD("set_facet_datum_bake", "params"), &VoxelMesherBlocky::set_facet_datum_bake); // COSMOS FS2′
+ 	ClassDB::bind_method(
+ 			D_METHOD("facet_carve_debug_cell", "x", "y", "z"), &VoxelMesherBlocky::facet_carve_debug_cell);
+ 
+diff --git a/meshers/blocky/voxel_mesher_blocky.h b/meshers/blocky/voxel_mesher_blocky.h
+index 41b04ac..266eb0d 100644
+--- a/meshers/blocky/voxel_mesher_blocky.h
++++ b/meshers/blocky/voxel_mesher_blocky.h
+@@ -69,6 +69,27 @@ public:
+ 	// dict layout — lets verify_facet_carve_cpp assert the compiled clip == ShapeMesh.build_carve_faces.
+ 	Dictionary facet_carve_debug_cell(int x, int y, int z) const;
+ 
++	// COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.1): install/clear the frozen-per-facet DATUM BAKE. It lifts
++	// every near-mesh vertex by the CONTINUOUS per-column datum s = −b + sqrt(b²+R²−|p0|²) along the facet-lattice
++	// up axis (+Y), so the flat-lattice near field renders at the radial surface R+s with the voxel CONTENT byte-
++	// identical (no re-index, no generator change). `params_dict` = {enabled:bool, R:float, o/du/dv/nhat:
++	// PackedFloat64Array(3), off:PackedInt32Array(2)} — the frozen atlas frame row. empty/enabled=false ⇒ plain
++	// flat mesher (byte-identical). has_method-guarded on the game side. Mirrors FacetAtlas.datum_lift exactly.
++	void set_facet_datum_bake(Dictionary params_dict);
++
++	// COSMOS FS2′: the frozen-per-facet datum-bake blob. Pure numbers (atlas frame row + R + off), read as an
++	// immutable copy by the mesh workers. Public so the build()-side lift helper can name it. Mirrors
++	// FacetAtlas.datum_bake_params. Cube-topology-free — plain arithmetic, no chart logic crosses here.
++	struct FacetDatumBakeParams {
++		bool enabled = false;
++		double R = 1.0;
++		double o[3] = { 0, 0, 0 };     // facet plane origin (c0')
++		double du[3] = { 1, 0, 0 };    // lattice +X world dir
++		double dv[3] = { 0, 0, 1 };    // lattice +Z world dir
++		double nhat[3] = { 0, 1, 0 };  // facet normal (lattice +Y up)
++		int off[2] = { 0, 0 };         // facet lattice offset (subtracted from the global voxel x,z)
++	};
++
+ 	// TODO GDX: Resource::duplicate() cannot be overriden (while it can in modules).
+ 	// This will lead to performance degradation and maybe unexpected behavior
+ #if defined(ZN_GODOT)
+@@ -125,6 +146,7 @@ private:
+ 		Ref<VoxelBlockyLibraryBase> library;
+ 		CosmosBakeParams cosmos; // COSMOS R2.1: near-field true-position bake (disabled by default)
+ 		FacetCarveParams facet_carve; // COSMOS FP-CARVE: per-facet junction bevels (disabled by default)
++		FacetDatumBakeParams facet_datum; // COSMOS FS2′: per-facet continuous datum lift (disabled by default)
+ 	};
+ 
+ 	struct Cache {

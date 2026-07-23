@@ -1,0 +1,24 @@
+{
+  "name": "o-coast-hold",
+  "description": "From orbit, release the O free-coast (real Keplerian orbit) and hold — assert the orbit is sustained (radius spread < 2%) at v_circ over a multi-period window.",
+  "_notes": "Precondition: already in low/high_orbit (run ascent-to-orbit first, or start airborne above 384). The O verb (nav:orbit) seeds v = v_circ along the yaw heading; gravity then holds the orbit. hold_s samples orbit_r; a stable orbit keeps the spread tiny. Raise hold_s toward one orbital period for a full-lap check.",
+  "legs": [
+    {
+      "name": "aim prograde (yaw heading sets the orbit plane)",
+      "steps": [ { "op": "look", "pitch_deg": 0 } ],
+      "settle_s": 0.5
+    },
+    {
+      "name": "O — release to free-coast",
+      "steps": [ { "op": "nav", "verb": "orbit" } ],
+      "settle_s": 1.0,
+      "expect": { "coasting": true, "near_v_circ_pct": 3 }
+    },
+    {
+      "name": "hold the orbit (sustained N periods)",
+      "steps": [ { "op": "wait", "seconds": 2 } ],
+      "hold_s": 30,
+      "expect": { "coasting": true, "orbit_r_spread_lt_pct": 2, "near_v_circ_pct": 3 }
+    }
+  ]
+}

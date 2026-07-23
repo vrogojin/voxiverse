@@ -189,6 +189,18 @@ const FP_STAMP := false
 ## weakened to make the port pass.
 const FP_CPPGEN := false
 
+## COSMOS CLIMATE-BIOMES B1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §6/§7) — the Whittaker temperature×moisture
+## biome classifier. When true, TerrainConfig._biome swaps its shipped first-match chain for a
+## temperature-band × humidity-band table that appends B_SAVANNA / B_JUNGLE, TreeGen grows acacia (savanna),
+## jungle (jungle) and cactus (desert) species, and FarPalette shows tan/green savanna/jungle bands from orbit.
+## Biome is a PURE function of position (+ static latitude/humidity proxy) — zero per-voxel storage, no RNG, no
+## climate-sim dependency (it reads only worldgen noise, exactly like today). This is a NEW-WORLD look change:
+## default OFF → _biome runs the shipped chain verbatim, TreeGen never plants the new species, and the world is
+## BYTE-IDENTICAL (FLAT 6035/0 + the terrain hash unchanged — the compatibility proof). Independent of the W*
+## weather flags (biomes never read the sim). Gates: src/tools/verify_climate.gd (band ordering, determinism,
+## byte-identical OFF, new-species determinism, palette bands).
+const FP_CLIMATE_BIOMES := false
+
 ## COSMOS FP-NEIGHBOUR-SEAM-POLISH (docs/COSMOS-FP-M2-DESIGN.md §7.6) — polish the ACTIVE↔LOD seam LOOK so the
 ## LOD neighbour blocks coincide with the live full-res facet at the shared ridge (the user's "ugly seam"
 ## complaint). Two in-budget, off-pool (builder-thread) moves, BOTH inside the LOD memory ledger (LOD_MAX_BYTES_MB
@@ -286,6 +298,124 @@ const FP_FARRING_FULL_COVER := false
 ## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
+## Rescale-safe backstop sink: TierPlace.backstop_sink() derives the radial sink as BACKSTOP_SINK_FRAC × the facet
+## cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge = (π/2·R)/K), so it scales with R and clears the coarse-grid
+## facet chord sagitta at any radius (≈6 at R=3072, ≈13 at R=6371). 0.5 reproduces the shipped 6-block sink at R=3072.
+const BACKSTOP_SINK_FRAC := 0.5
+
+## COSMOS FS1 (docs/COSMOS-FACET-SEAMS-DESIGN.md §4 / §6) — the SHELL WELD. The shipped far ring builds each facet
+## quad by bilerping its OWN planarized corners (facet_planar_corner) then adding radial relief: adjacent facets
+## project the shared true edge onto DIFFERENT planes, so their shared-edge chords disagree by up to the ∝R datum
+## step (5.30 blocks @ R=6371) — a see-through slit along every seam (RC2a), which generate_normals cannot merge
+## (positions never bit-identical) and no skirt covers. When true (requires FACETED), the ring emits every vertex
+## RADIALLY from a bilerp of the SHARED cube-sphere corner DIRECTIONS (FacetAtlas.facet_corner_dirs): v = d̂·(R +
+## relief(g(d̂))). Two facets sharing a grid edge then compute the SAME edge vertices (same shared corner dirs,
+## same t) ⇒ the shell welds and closes (One-Surface Law §0). Mixed tessellation (backstop 16 vs horizon 4) is
+## handled by the COARSE-OWNS-EDGE rule: a dense facet's outer-ring vertices are snapped onto the CELLS=4 coarse
+## chord (role-agnostic — a 16-facet always meets a 4-chord, so it welds a horizon 4-edge AND a backstop that did
+## the same). The current uniform BACKSTOP_SINK is KEPT (§4.3: radial verts sunk ~13 stay under the plane-anchored
+## near field, 13 > sagitta 6.8 + chord error — G-SHELL-UNDER holds); FS3 re-derives the sink once the datum fix
+## (FS2) removes the sagitta. Zero new memory (same caches, radial VALUES not new counts). Default OFF → the shipped
+## planar-corner path verbatim, FLAT byte-identical (6042/0). Flipped ON at export after the live no-see-through pass.
+const FP_SHELL_WELD := false
+
+## COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3 / §6) — the RADIAL DATUM shift (the seam-step KILL). The near
+## field places a column's surface g blocks up from the facet's OWN mean plane along its OWN normal
+## (lattice_to_world64's y·n̂ term); adjacent facets' planes sit at DIFFERENT signed distances from the shared true
+## edge, so the same g lands at different altitudes — the ∝R datum step (5.30 blocks @ R=6371), the 8-block cliff.
+## When true (requires FACETED), each column gains an integer datum shift S = round(solve |p0 + s·n̂| = R) ∈ [0, ~7]
+## applied as a PURE RE-INDEX: a cell at lattice y resolves worldgen at true y − S (resolve_cell/worldgen run
+## UNCHANGED in true-height space — strata, sea fill, snow, trees all ride S), and every surface funnel returns
+## g + S. The placed surface then sits at altitude R + g (a pure function of d̂), so adjacent facets agree to ≤1
+## block quantization + ≤0.15 cosine at every seam. S is pure arithmetic over the frozen atlas frame + R — zero new
+## persistent memory, worker-safe, C++-mirrorable (VoxelGeneratorCosmos already receives facet_frame/off/r). The
+## vertical envelope grows by ≤ DATUM_SHIFT_MAX (worldgen y-bounds get that headroom under the flag). Default OFF ⇒
+## S ≡ 0 at every call site (FacetAtlas.datum_shift returns 0), so the world is byte-identical (FLAT 6042/0, G-O4-EQ
+## hashes unchanged). Flipped ON at export after the live cliffs-gone pass. Truth gate: verify_facet_datum.gd.
+const FP_RADIAL_DATUM := false
+
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2) — the DATUM BAKE. RETIRES FP_RADIAL_DATUM (which terraced the facet
+## interior: its integer S = round(s) re-index stepped 1 block along ~7 contour rings and fought the corner smoother).
+## FS2′ keeps the voxel CONTENT byte-identical (no generator change — C++ patch 0009 is removed, the generator is
+## untouched) and instead applies the SAME datum, left CONTINUOUS and UNROUNDED, as a per-column vertical displacement
+## at the render/physics/input boundary: play y = cell y + s(fid,X,Z), s = −b + √(b²+R²−|p0|²) (FacetAtlas.datum_lift).
+## s is C∞ (gradient ≤ 0.034 blocks/block, range [0,~6.9]) so the rendered/walked surface sits at R+s (±0.15 cosine)
+## with NO ±1 rounding residual and ZERO new interior steps (the shipped smooth shape simply lifted). Application
+## surfaces (§2.2): near voxel mesh (the ONE engine touch — VoxelMesherBlocky.set_facet_datum_bake per-vertex `y += s`,
+## C++ patch 0010, the set_cosmos_bake precedent); skin (`+s` in _lattice_world); analytic floor/blocked/ceiling/DDA
+## convert play↔cell per column; GroundCollider/debris/highlight `+s`; far ring nothing (FS1 radial already IS
+## R+relief). Content, worldgen, resolve_cell, smoothing, sea/snow/strata thresholds, crossing algebra, edit keys are
+## ALL UNTOUCHED (cell space). Default OFF ⇒ FacetAtlas.datum_lift returns 0.0 at every site ⇒ byte-identical
+## (FLAT 6042/0). Requires ONE build.sh cycle for the mesher hook (module_in_web=yes). Gate: verify_facet_seams.gd
+## G-D2-SHAPE (flag-on near mesh == flag-off mesh + s·ŷ per vertex EXACTLY — no terracing can exist by construction).
+const FP_DATUM_BAKE := false
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
+## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
+## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already
+## applied on it — a 15-25-block poke-through FLASH on every crossing/pool change near mountains. When true (requires
+## FP_FARRING_FULL_COVER), the far ring's backstop role is made STICKY: the set is grown EAGERLY to active ∪ the
+## active facet's ring-1 neighbours ∪ recently-active (so a facet is ALREADY drawn sunk BEFORE it enters the pool and
+## near meshes arrive — "sink early"), and a facet LEAVING the set keeps its backstop role for STICKY_HOLD more
+## role-events ("unsink late") so it never reverts to a coarse unsunk quad while near meshes may still be applied.
+## NEVER-OOM: the dense backstop cache grows from ≤ 1+POOL_MAX_NEIGHBOURS (5) to ≤ 1+STICKY_RING1_MAX (12) facets
+## ≈ +96 kB — a stated, bounded ceiling (G-TIER-STICKY-BOUND). Default OFF → `_sticky` stays empty, `_is_backstop`
+## is the shipped active∪`_excluded`, FLAT stays 6035/0 (byte-identical). Flipped ON at export after the live A/B.
+const FP_TIER_STICKY_BACKSTOP := false
+const STICKY_HOLD := 2            # role-events an ex-backstop facet stays sunk before it may revert (≥ worst rebuild latency)
+const STICKY_RING1_MAX := 12      # hard cap on the sticky backstop set (1 active + ≤8 ring-1 + a few recently-active)
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.1 / §7 P2) — the MIN-ENVELOPE vertex rule.
+## Fixes RC-A (the steady ~4-block poke at a mountain flank near a facet corner): the constant BACKSTOP_SINK is
+## arithmetically insufficient in the tail because the far ring pushes relief along the sphere RADIUS d̂ while the
+## near lattice stacks blocks along the facet NORMAL n̂ — a resolution-independent skew of up to ~5-8 blocks that no
+## sink/cell tuning removes. When true (requires FP_FARRING_FULL_COVER), each dense backstop vertex's height becomes a
+## PROVABLE LOWER ENVELOPE: env(i) = min{ near g over i's dilated 2×2-coarse-cell footprint } − ε, sampled at
+## TierPlace.ENV_FINE_MULT × the coarse resolution (the footprint min bounds the interpolation/aliasing/skew terms by
+## construction, §5.1). The constant sink then collapses to the small ε guard (TierPlace.backstop_sink()). Zero
+## PERSISTENT memory (same 17² grids, different values); +~(ENV_FINE_MULT·CELLS+1)² transient profile samples per facet
+## cache build. Applies to BACKSTOP facets (distant CELLS=4 facets are a follow-up). Default OFF → the vertex height is
+## the shipped profile_at_dir g and the sink is BACKSTOP_SINK (byte-identical, FLAT 6035/0). Truth gate: verify_tier_depth.gd G-TIER-ENVELOPE.
+const FP_TIER_ENVELOPE := false
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.2 / §3.3 / §7 P3) — per-tier WINDOW-SPACE
+## depth bias + a raised camera near plane. Addresses RC-C (24-bit depth precision, latent past ~1 km): a constant
+## window-space offset of k depth quanta (POSITION.z += 2k·2⁻²⁴·w) pushes each coarser tier exactly k quanta behind at
+## EVERY distance, so coincident surfaces resolve in tier order (blocks > skin > far ring) even where an eye-space sink
+## has collapsed into one quantum. When true, the far-ring + skin StandardMaterial3D are replaced by an equivalent LIT
+## vertex-colour ShaderMaterial carrying the bias (k = TierPlace.FAR_BIAS_K = 8 far ring, TierPlace.SKIN_BIAS_K = 4 skin;
+## near blocks stay UNBIASED/authoritative), and player.gd raises the faceted camera near plane 0.05 → 0.25 (5× depth
+## precision for free — precision scales linearly with near). Zero memory (2 small shaders). Default OFF → the shipped
+## StandardMaterial3D + near 0.05, byte-identical (FLAT 6035/0). Truth gate: verify_tier_depth.gd G-TIER-DEPTH-BIAS.
+const FP_TIER_DEPTH_BIAS := false
+
+## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — the SURFACE WARM-GATE
+## CONVERGENCE fix (the `sh_wfail` weld-thrash). On the surface path the far ring's re-emit is blocked by an
+## ALL-OR-NOTHING warm gate: `_warm_front` must cache EVERY front facet in ONE WARM_BUDGET_MS frame before a single
+## `_begin_rebuild` fires. Under the web ×25 warm cost a newly-backstop facet's DENSE min-envelope cache
+## (~(ENV_FINE_MULT·BACKSTOP_CELLS+1)² ≈ 4k profile samples) can eat a whole frame's budget by itself, so on a
+## ridge-crossing / pool-change / camera-set drift the gate returns false for MANY frames WITHOUT emitting
+## (sh_wfail ≫ 0). Meanwhile the PREVIOUS committed mesh still draws the just-entered pool facet as an UNSUNK CELLS=4
+## coarse quad OVER the live near meshes = the over-near strip lingers the whole warm window. When true (requires
+## FP_FARRING_FULL_COVER), the surface path adopts the orbit S1b PROGRESSIVE discipline: warm cumulatively, emit the
+## cache-ready subset now, and RE-EMIT the moment a new dense backstop cache lands (`_bpos_cache` grew) — so a
+## just-entered pool facet flips to a SUNK backstop the frame its cache is ready (an uncached backstop is FILTERED
+## OUT, never drawn as a stale un-sunk quad), and once the whole front is cached one final full emit lands the tail.
+## NEVER-OOM: reads only the existing fid-keyed caches (no parallel/growing warm set); the extra re-emits are bounded
+## by the backstop count (≤ pool + STICKY_RING1_MAX). Default OFF → the shipped all-or-nothing gate verbatim
+## (byte-identical, FLAT 6035/0). Flipped ON at export alongside the tier flags. Truth gate: verify_tier_depth.gd
+## G-TIER-WARM-CONVERGE.
+const FP_TIER_WARM_CONVERGE := false
+
+## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
+## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
+## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles
+## built from VoxelGeneratorCosmos.sample_columns (§7.2 item 2) — exact 1-block silhouette, SUNK SKIN blocks so
+## the near voxels strictly overdraw it and it overdraws the backstop (overlap + shared sampling + sink, no fade).
+## Requires FACETED (flat has no atlas). Default OFF → WorldManager never creates the node, FLAT stays byte-identical
+## (6035/0). Flipped ON at export after the live A/B. HARD 8 MB ceiling (FacetSkinTier.MAX_BYTES) — evict-farthest,
+## never grow. CDLOD morph / pitch-2..8 extension rings / tree impostors are LATER stages, not built here.
+const FP_SKIN_TIER := false
 
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
@@ -437,6 +567,42 @@ static func vel_lead(speed: float) -> float:
 ## changes). Set == CTRL_RELIEF_FLOOR to restore the shipped 0.25 trickle (the A/B knob).
 const CTRL_IMMINENT_COMMIT_PACE := 1.0
 
+## COSMOS-PERF POST-PORT P1 (docs/COSMOS-PERF-POSTPORT-DESIGN.md §4 P1) — FP_INFLIGHT_GATE: admission paced by TOTAL
+## in-flight work, not the gen backlog alone. The C++ worldgen port made generation fast (supply ≥ demand at every
+## speed), so the freeze bottleneck INVERTED to the main-thread mesh apply/upload stage — vox_main (mean 0.002 the
+## entire pre-port history) now spikes 17–87 exactly inside the 300–881 ms worst frames. The shipped admission signal
+## (vox_gen > CTRL_BACKLOG_MAX) paces the stage that is no longer the choke and is blind to the one that is: it admits
+## shell bursts the downstream apply stage cannot absorb, so they land compressed. When true, the StreamLoadController's
+## backlog_gated() switches to the in-flight signal F = tasks.generation + tasks.meshing + INFLIGHT_MAIN_K·tasks.main_thread
+## with hysteresis (close at F > INFLIGHT_MAX, re-open at F < INFLIGHT_MIN), and module_world's per-slot view ramp applies
+## a feed-forward pace cut  pace *= clampf(1 − main_q/APPLY_CHOKE, 0, 1)  (main_q = tasks.main_thread) INCLUDING the
+## committed-imminent floor — the imminent slot keeps priority ORDER but must not outrun the apply stage (its old
+## exemption assumed gen was the choke). Zero memory: it strictly DELAYS admission (NEVER-OOM). Default OFF ⇒
+## backlog_gated() is the exact shipped  vox_gen > CTRL_BACKLOG_MAX(300)  behaviour byte-identical, the ramp pace is
+## untouched, FLAT stays 6035/0. Flipped ON at export after the live SW-1C A/B (the established sed-at-export pattern).
+const FP_INFLIGHT_GATE := false
+const INFLIGHT_MAX := 192        # close the gate above this F (≈0.6 s of pipe at the measured 300+/s drain)
+const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hysteresis band prevents admission thrash
+const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
+const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
+
+## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
+## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
+## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and
+## ZERO VoxelTerrain load requests for minutes. Root cause: the ACTIVE facet is the RESIDENT pool slot with NO
+## imminent successor (no crossing is pending once landed), so module_world._ramp_pool_step advances its view-distance
+## grow leg at the RAW _stream_pace — which the StreamLoadController pins at 0 whenever backlog_gated() holds (a
+## far-ring/shell rebuild churning in-flight work keeps it closed). Only the committed-IMMINENT slot carries a pace
+## FLOOR (CTRL_IMMINENT_COMMIT_PACE / CTRL_RELIEF_FLOOR); the resident active slot has none, so its view ramp — and
+## thus the near stream — freezes indefinitely at whatever radius the last crossing left it. When true, the resident
+## active slot (no imminent, or the imminent IS the active) (a) has its view_target snapped back up to the full near
+## radius if a churned crossing left it collapsed, and (b) has its grow pace floored at CTRL_RELIEF_FLOOR — AFTER the
+## FP_INFLIGHT_GATE feed-forward cut — so the near field always drives to completion within ~RAMP_SECONDS/0.25 ≈ 6 s
+## even while the load gate is held at 0. NEVER-OOM: view_target is capped at near_render_radius (the existing active
+## cap — no unbounding); only the fill RATE / a collapsed-target repair changes. Default OFF ⇒ _ramp_pool_step is the
+## exact shipped math (byte-identical; FLAT stays 6042/0). Flip ON at export after the live de-orbit-land A/B.
+const FP_LANDING_STREAM_KICK := false
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a
@@ -446,6 +612,885 @@ const CTRL_IMMINENT_COMMIT_PACE := 1.0
 ## is added; the FLAT gate stays green. The CosmosEphemeris/DVecF64 kernels are pure statics — DEAD
 ## (never instantiated) with the flag off. Flipped ON at export after the live-GPU sunset screenshot.
 const ORBITAL_SKY := false
+
+## COSMOS ORBITAL O1 / SPACE-NAV SN1 (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §2.1, docs/COSMOS-SPACE-NAV-DESIGN.md
+## §10 SN1) — the ORBITAL substrate master flag + its constants. FP_M3_ORBIT defaults FALSE ⇒ the engine is
+## BYTE-IDENTICAL: nothing below is created, the CosmosGravity/OrbitalState kernels are pure statics DEAD with the
+## flag off, and SURFACE/FLY locomotion is untouched. The blend band is radial altitude h = |p_fixed| − R_body:
+## below H_BLEND_LO = pure shipped lattice feel gravity (walking game intact); above H_BLEND_HI = pure GM_dyn/r²
+## inertial regime; in between a slerp/lerp blend (CosmosGravity.gravity_fixed). NOTE (SPACE-NAV R1): the parent
+## O1O4 §2.8 H_FARSWAP impostor-swap is REJECTED (SEAMLESS-SCALES) and the const is deliberately NOT created here —
+## far-ring persistence + the SN3 scaled clamp replace it. All local dynamics read GM_dyn (SPACE-NAV §3), not the
+## sky's GM_game. NEVER-OOM: OrbitalState ~100 B/entity, hard-capped at ORBIT_ACTIVE_MAX (player = 1 in O1).
+const FP_M3_ORBIT := false        # master flag; OFF ⇒ byte-identical (nothing below is created)
+const H_BLEND_LO := 128.0         # radial altitude (blocks): below = pure lattice feel gravity (shipped)
+const H_BLEND_HI := 512.0         # above = pure GM_dyn/r² inertial regime (> ATMO_TOP, > OFFSURFACE_Y)
+const ATMO_TOP := 384.0           # atmosphere ceiling (D10; near-field scale, user-locked)
+const ORBIT_THRUST_G2 := 25.0     # gear-2 thrust authority, m/s²
+const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital entities (NEVER-OOM)
+const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with the controller commit band)
+const ORBIT_PREWARM_H := 1024.0   # descending through this altitude designates + pre-warms the landing facet
+
+## COSMOS SPACE-NAV SN3 (docs/COSMOS-SPACE-NAV-DESIGN.md §10 / docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.5) —
+## the BORDER-CONTINUITY master flag: the atmosphere↔space border + the climb to orbit render with NO pop. Off
+## ⇒ BYTE-IDENTICAL: the scaled-body clamp is absent (nothing scales — CosmosScale.on() is false so its whole
+## path is DEAD), the camera keeps its shipped near/far (0.05 / FacetFarRing.CAMERA_FAR = 9000), and the far
+## ring retires exactly as today (never at an altitude cutoff). On ⇒ the far ring persists to any altitude under
+## the continuous distance clamp s = min(1, D_ENGAGE/d) placed camera-relative, and the camera near/far ramp
+## with altitude (CosmosScale). ZERO added bytes (§9: same far-ring mesh/nodes; only camera params + a per-frame
+## node-transform scale). REPLACES the rejected O1O4 §2.8 H_FARSWAP impostor-swap (SPACE-NAV R1). Flipped ON at
+## export after the AM remote-bridge screendiff proves the climb is pop-free (§10 SN3 live-only).
+const FP_SCALED_BODY := false
+
+## COSMOS ORBITAL-SHELL S1 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3) — drive the far-ring emitted set from the
+## CAMERA radial direction instead of the player's active-facet normal, so the WHOLE visible cap renders from
+## orbit (fixing the "far hemisphere blank from space" bug). The shipped ring emits only the hemisphere around
+## `_active_fid`'s normal and refreshes it only on surface crossings; off-surface the radial direction drifts
+## across facets with NO crossing fired, so the emitted hemisphere stays pinned near the departure region and the
+## far side is simply ABSENT from the mesh (facet_far_ring.gd:291-302 / world_manager.gd:2117-2122). When true,
+## the emit cull axis becomes ĉ = normalize(camera − body_centre) (ABSOLUTE planet space) with an altitude-derived
+## cap θ_emit = min(arccos(R/d) + SHELL_RELIEF_DEG + SHELL_SLACK_DEG, SHELL_CAP_MAX_DEG), re-emitted (via the
+## EXISTING deferred-warm + async-build + single-swap pipeline, verbatim — no new mesh/build path) when ĉ drifts
+## past SHELL_SLACK_DEG − 2° or θ_h shifts > 5°. A SURFACE FLOOR keeps θ_emit ≥ 90° below OFFSURFACE_Y, so the
+## on-foot regime is byte-VISUALLY identical to shipped (the facets that then differ from the active-facet law all
+## sit behind the limb, occluded by the planet body). This is a POLICY change only: no second globe/representation,
+## the same absolute vertex-coloured merged mesh, ONE draw call. Worst emitted mesh at the 96° cap ≈ 61 k tris /
+## 7.3 MB (Δ ≤ +0.7 MB over the shipped hemisphere) — NEVER-OOM: capped by θ_cap, flat vs time/altitude. Default
+## OFF ⇒ the shipped active-facet law runs verbatim, byte-identical (FLAT 6035/0). Requires FACETED. The full
+## altitude range above h ≈ 6.3 k also needs FP_SCALED_BODY (SN3 near/far ramp); S1 is standalone-correct below.
+## Flipped ON at export after the live orbit re-fly. Truth gate: src/tools/verify_shell.gd.
+const FP_SHELL_CAMERA_SET := false
+const SHELL_RELIEF_DEG := 8.0     # relief margin: terrain of height h pokes past the limb by ≈ √(2h/R); 8° covers ≥ 30-block relief
+const SHELL_SLACK_DEG := 15.0     # drift slack: re-emits are scheduled (fired at SLACK − 2° = 13°), not reactive, so the old set still contains the visible cap until the new build lands
+const SHELL_CAP_MAX_DEG := 96.0   # emit cap ceiling (facet-centre test grants ~half-facet slop like BACK_CULL = 0); 105° is the pre-approved limb fallback
+
+## COSMOS ORBITAL-SHELL S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §4/§9) — a ONE-SHOT background whole-planet warm of
+## the far-ring COARSE cache (all 6·K² facets) once sustained off-surface, so passing over a never-visited longitude
+## from orbit is a pure cached emit + async build (no warm lag). Fills ONLY the same fid-keyed _pos_cache/_col_cache
+## the ring already uses (hard cap 6·K² ≈ 2.4 MB — a ceiling already reachable by circumnavigating on foot; the shell
+## reaches it in one orbit), never a parallel store, under the existing WARM_BUDGET_MS per frame, strictly once per
+## session (a cursor). Default OFF ⇒ never armed, byte-identical (FLAT 6035/0). Requires FACETED. Depends on S1 only.
+const FP_SHELL_PREWARM := false
+const SHELL_PREWARM_DWELL_S := 5.0   # seconds sustained above OFFSURFACE_Y before the one-shot warm arms (ignores a brief pop above the ceiling)
+## COSMOS ORBITAL-SHELL S1b (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3) — PROGRESSIVE emit in the true-orbit regime.
+## The shipped far ring emits only after _warm_front caches EVERY front-hemisphere facet within one WARM_BUDGET_MS
+## frame (all-or-nothing). On the surface that holds — you cross facet-by-facet and the cap stays warm — but entering
+## orbit exposes ~1900 never-visited facets AT ONCE, and on web (×25 profile cost) that cap can never cache in a
+## single 3 ms frame, so _begin_rebuild never fires post-ascent and the far side stays stale (the live bug the
+## direct-call gates never exercised). Under FP_SHELL_CAMERA_SET, off-surface (not floored) the emit proceeds on the
+## CACHED SUBSET each rebuild and grows as _warm_front + FP_SHELL_PREWARM fill the cache — re-emitted every
+## SHELL_REEMIT_GROWTH newly-cached facets — so coverage appears immediately and converges, never stalling. The
+## async worker still only ever reads cached facets (the emitted set is cache-filtered), preserving its read-only
+## contract. The SURFACE (floored) + flag-off paths keep the shipped all-or-nothing warm gate verbatim (byte-identical).
+const SHELL_REEMIT_GROWTH := 64      # re-emit the growing cached cap every N newly-cached facets (progressive-fill cadence)
+
+## COSMOS-PERF FALL-COLLAPSE FIX A (fix/voxiverse-fall-perf) — the off-surface (true-orbit) far-ring warm scan
+## idle short-circuit. The SURFACE progressive path (_surface_converge_emit) already skips its per-frame full
+## 6·K² _warm_front scan once the front is fully cached AND emitted (`_srf_converged`), matching the shipped
+## zero-cost idle frame. The OFF-SURFACE (_shell_orbit) branch had NO such gate — it re-ran the whole-planet
+## front-visible dot scan EVERY frame while airborne (the ~67 ms proc baseline the live fall-from-orbit telemetry
+## shows with draws=32, i.e. NOT geometry/gen). This flag adds the SAME converged idle gate to the orbit branch:
+## once `done` (front fully warmed) with nothing pending, the scan is skipped until the next drift snapshot re-sets
+## `_pending`. Byte-identical off (the scan runs exactly as today). Requires FP_SHELL_CAMERA_SET (the orbit branch
+## is only reached when the camera-set law is engaged off-surface). NOTE: inert ALONE during an active fall — the
+## per-frame radial re-snapshot (below) keeps `_pending` set so it never idles. Must be paired with FP_SHELL_FALL_HOLD.
+## Gate G-SHELL-ORBIT-IDLE (verify_orbital.gd).
+const FP_SHELL_ORBIT_IDLE := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX A2 (fix/voxiverse-fall-perf) — HOLD the far-ring cap during a fall (kill the
+## per-frame re-emit thrash). Root cause of why FIX A was inert live: the camera-set re-emit trigger
+## (shell_set_camera_abs) re-snapshots whenever θ_h = acos(R/d) shifts > 5°. Near the surface acos blows up
+## (dθ_h/dd → ∞ as d → R), so during the FINAL approach of a fall θ_h swings > 5° EVERY frame → `_pending` re-sets
+## every frame → the warm never converges (FIX A never idles) AND every `_pending` fires a full re-emit (a
+## SYNCHRONOUS _rebuild_full when FP_FARRING_ASYNC_REBUILD is off — the 200-600 ms proc spikes / sh_wfail thrash the
+## live telemetry shows). The whole globe is ALREADY one meshed draw ([[voxiverse-orbital-shell]]); chasing the exact
+## visible cap frame-by-frame is pure thrash. With this flag ON: (1) an off-surface (airborne) snapshot sizes θ_emit
+## GENEROUSLY (+SHELL_FALL_MARGIN_DEG) so a shrinking visible cap during descent stays inside the held cap, and
+## (2) the radial trigger is SUPPRESSED for a shrinking cap (a descent) — re-emit only when the cap must GROW past the
+## held margin (a climb, to avoid holes), or the axis SWEEPS past slack AND SHELL_FALL_REEMIT_MS has elapsed (throttle).
+## `_pending` then stops re-setting every frame ⇒ FP_SHELL_ORBIT_IDLE actually idles the scan, and the synchronous
+## rebuild is bounded to ≤ 1 / SHELL_FALL_REEMIT_MS. A floor/regime crossing always re-emits (correctness). Byte-
+## identical off (the shipped reactive 5°/slack triggers, no generous margin). Requires FP_SHELL_CAMERA_SET; pair with
+## FP_SHELL_ORBIT_IDLE. Gate G-SHELL-FALLHOLD (verify_shell.gd).
+const FP_SHELL_FALL_HOLD := false
+const SHELL_FALL_MARGIN_DEG := 12.0   # extra θ_emit margin the held cap carries off-surface (absorbs the descent θ_h shrink); also the GROW re-emit threshold
+const SHELL_FALL_REEMIT_MS := 1000    # min wall-ms between throttled off-surface re-emits (axis sweep / progressive grow) during a fall
+
+## COSMOS-PERF FALL-COLLAPSE FIX C (fix/voxiverse-fall-perf) — skip the main-thread snowfall fixed-step while the
+## player is AIRBORNE (a HIGH FLYER above OFFSURFACE_Y, e.g. falling from orbit). SnowfallSystem.process runs a
+## deterministic per-frame batch (up to MAX_STEPS_PER_FRAME) around the player's ground column — the ~71 ms snow_ms
+## spike the fall telemetry shows. At flight altitude there is NO walkable ground snow under the camera to evolve, so
+## the step is pure wasted main-thread time that compounds the fall collapse. Gated skip: above OFFSURFACE_Y (the same
+## cheap lattice-y "high flyer" test the pool freeze uses) the sim is not stepped (its state simply FREEZES — restored
+## on landing, no spiral: delta is not accumulated while skipped). Byte-identical off. Gate G-SNOW-AIRBORNE (verify_snow_airborne.gd).
+const FP_SNOW_SKIP_AIRBORNE := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX D — R1 "true warm budget" (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §2.1/§4 R1, item W1;
+## the ROOT of the sh_wfail thrash in ALL modes — walk, fly, fall). The shipped FacetFarRing._warm_front charges the
+## WHOLE 6·K² = 3456-facet front-visibility SCAN against the 3 ms WARM_BUDGET_MS: the per-fid budget check fires even
+## when nothing needs warming, so on web (×25 GDScript) the scan alone exceeds 3 ms and _warm_front returns false
+## FOREVER — even when every facet is already cached. `done`/`_srf_converged`/`_orbit_converged` NEVER become true →
+## the idle short-circuits are unreachable → ~3 ms/frame is burned + the deferred re-emit never fires (`_pending` never
+## consumed) in EVERY mode, including a flat ground walk with zero crossings (measured p50 21 fps, sh_wfail +3.5/frame).
+## FIX (R1): budget only the REAL warm WORK (time spent in _ensure_cached), NOT the read-only scan, and return true the
+## moment a full scan finds nothing uncached — regardless of elapsed time. The scan also goes O(visible) via a
+## precomputed packed centre-dir array (no per-fid _centre_dir dict lookup). `done` then becomes reachable, so the warm
+## CONVERGES (within ~2 s of any drift) and FP_SHELL_ORBIT_IDLE / FP_SHELL_FALL_HOLD can finally idle the scan (sh_wfail
+## flatlines). Byte-identical off (callers use the shipped _warm_front verbatim). Rides with FP_SHELL_ORBIT_IDLE +
+## FP_SHELL_FALL_HOLD at deploy. Gate G-WARM-TRUE-BUDGET (verify_shell.gd).
+const FP_WARM_TRUE_BUDGET := false
+## COSMOS-PERF UNATTENDED R2 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §2.2, item W2) — DE-BURST the on-ground
+## snowfall step. The shipped SnowfallSystem runs the whole 0.5 s fixed step (up to 32 columns × worldgen
+## noise + env queries + up to 32 writes + one ground rebuild) in ONE main-thread `_process` call, and its
+## wall-clock accumulator runs up to MAX_STEPS_PER_FRAME=4 steps back-to-back after any hitch — the 126-145 ms
+## snow_ms bursts, with hitch-coupling (a hitch reschedules the next). When true, SnowfallSystem.process instead
+## (a) DROPS catch-up (after a hitch it starts exactly ONE step and discards the backlog — a hitch never queues
+## more steps) and (b) SLICES that step across frames (SLICE_COLUMNS columns/frame, ONE ground rebuild when the
+## step finishes) so no single frame does the burst. The step MATH is untouched (same columns, same order, same
+## write cap, same deterministic outcome for a given step_counter+player_col — just spread), so accumulation/melt
+## over time is identical; only the per-frame COST is flattened. It also lowers the snow-authored `_edits` ceiling
+## to SNOW_SLICED_EDIT_CAP (< SNOW_EDIT_BUDGET) so a long session's snow trail can't grow the per-crossing
+## edit-index scan (W4) without bound (NEVER-OOM: a hard cap; existing snow still evolves). Default FALSE ⇒
+## `process` uses the shipped burst accumulator verbatim ⇒ BYTE-IDENTICAL. Gate G-SNOW-SLICED (verify_snow_sliced.gd).
+const FP_SNOW_SLICED := false
+## COSMOS-PERF UNATTENDED R3 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §0-W3 / §5 R3) — the ALTITUDE REGIME GATE.
+## In orbit/fall (draws ≈ 30 = only the shell + sky on screen) the whole near-field active-facet machinery still
+## churns every physics tick: the ground track sweeps facets, so maybe_cross_facet commits redesignations (up to
+## ~10/s), each doing a full _rebuild_window_indices scan (O(all edits) — up to 200 k snow cells), a one-frame
+## 128→96 view SHRINK SNAP (block-unload burst → the wasm dlmalloc convoy), a gravity/collider/far-ring resync,
+## plus per-tick _manage_facet_pool churn — NONE of it visible from 150 km up. This is the fall's phys_ms 160–228 ms.
+## FP_ALT_REGIME FREEZES that invisible work above ATMO_TOP (the "ORBITAL" regime, radial altitude vs ATMO_TOP with
+## ALT_REGIME_HYST hysteresis): maybe_cross_facet returns early (facet frozen — no redesignation / window-rebuild /
+## shrink-snap / gravity / collider), _manage_facet_pool is suspended (targets held), and the main-thread snow step is
+## gated off (composes with FP_SNOW_SKIP_AIRBORNE). The shell/sky (what IS on screen) keeps updating — only the near
+## field freezes. On DESCENT back below the gate (re-entry) exactly ONE redesignation restores the near field onto the
+## true sub-camera facet (FacetAtlas.facet_of_dir) so a landing has terrain — the player pose heals losslessly via
+## _heal_frame_desync + the returned crossing dict, and FP_LANDING_STREAM_KICK then grows the near view for touchdown.
+## NEVER-OOM: pure state gate, no new retained buffers. Default FALSE ⇒ BYTE-IDENTICAL (every read is flag-gated; the
+## regime never leaves SURFACE, no early return fires). Gate: verify_alt_regime.gd (scripted fall altitude-sweep). Bake
+## ON at export after the browser A/B. Requires FACETED = true.
+const FP_ALT_REGIME := false
+## Hysteresis half-band (blocks) about ATMO_TOP for the regime latch. Prevents regime flapping (and re-entry
+## redesignation churn) when the radial altitude jitters during a grazing pass.
+const ALT_REGIME_HYST := 32.0
+## COSMOS-PERF UNATTENDED R3 RE-ENTRY FIX (the live "fall-from-orbit tunnels through the planet to the antipode
+## surface" bug). The ORBITAL freeze must RELEASE — and fire the ONE re-entry redesignation onto the true sub-camera
+## facet — while the player is STILL ABOVE the surface-physics ceiling (ATMO_TOP), so that floor/collision/walk
+## queries never run against the STALE frozen launch facet. The original release at ATMO_TOP − ALT_REGIME_HYST (352)
+## sat ~32 blocks INSIDE the surface regime: for the [352, 384] band the player walked/collided against the launch
+## facet's terrain while physically over a FAR facet (the real ground absent → the fall-through / late pop the pilot
+## sees as a teleport to the opposite side). This margin releases the freeze at ATMO_TOP + ALT_REGIME_REENTRY_PREP,
+## so the near field is redesignated onto the sub-camera facet BEFORE surface physics begins AND has the whole
+## sub-ceiling descent to stream (fixing the slow-web fall-through). The freeze still ENTERS only above
+## ATMO_TOP + ALT_REGIME_REENTRY_PREP + ALT_REGIME_HYST, so the high-orbit bulk stays frozen (the perf win). Only
+## read under FP_ALT_REGIME ⇒ byte-identical off. Gate: verify_reentry.gd scenario (f) (frozen-orbit re-entry).
+const ALT_REGIME_REENTRY_PREP := 32.0
+
+## COSMOS-PERF UNATTENDED R5 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §5 R5, item W4) — the INCREMENTAL PER-FID EDIT INDEX.
+## `_rebuild_window_indices` (run on EVERY facet crossing, world_manager.gd) and `_translate_active` (fallback/collapse/
+## save consumers) both rescan the WHOLE `_edits` overlay — O(all edits) — and filter to the active facet. Snow authors
+## up to ~200 k `_edits` cells over a session, so the crossing scan grows unbounded and crossings get PROGRESSIVELY
+## SLOWER the longer you play (the measured 1.7–19 ms crossing_ms was a young session; W4 is the "crossings slow down
+## over a session" cause). When true, WorldManager maintains a per-facet index `_edits_by_fid` (fid → {edit_key → true})
+## in the SINGLE write/erase choke points (`_write_cell` adds, `sim_revert_cell` removes), so the crossing rebuild and
+## the active-facet projection touch ONLY the incoming facet's edits — O(active-fid), INDEPENDENT of the total edit
+## count. The index membership is a byte-exact subset of `_edits` (same choke points), so the rebuilt `_edit_columns`/
+## `_placed_top` are IDENTICAL to the full-scan result — only the WORK is bounded. FACETED-only (the (fid,cell) int key
+## carries the fid; FLAT/curved keys are Vector3i/global and take neither the index nor the FACETED rebuild branch).
+## NEVER-OOM: one bool per existing edit key, bounded by the same SNOW_SLICED_EDIT_CAP that bounds `_edits` itself; a
+## fid's bucket is dropped when it empties. Default FALSE ⇒ the shipped O(all-edits) scan verbatim ⇒ BYTE-IDENTICAL
+## (the index is never built or read). Gate: verify_edit_fid_index.gd (200 k-seeded-edits O(window) proof). Requires
+## FACETED = true. Bake ON at export.
+const FP_EDIT_FID_INDEX := false
+
+## COSMOS-PERF UNATTENDED R4 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §5 R4) — PACE the crossing view SHRINK SNAP.
+## On a crossing, `redesignate` (module_world.gd) drops the FROM slot's max_view_distance 128 → 96 in ONE frame, and
+## `_ramp_pool_step` SNAPS every shrinking slot to its target the same frame. That one-frame block-unload BURST trips
+## the wasm dlmalloc allocator convoy (memory voxiverse-walk-perf-root-cause) — a crossing/descent worst-frame spike.
+## When true, a shrink is routed through the existing per-slot ramp machinery instead of snapped: `redesignate` sets the
+## FROM slot's view_target to 96 but LEAVES view_f at its current radius, and `_ramp_pool_step` steps each shrinking slot
+## DOWN by at most SHRINK_STEP_BLOCKS per frame (one shell of mesh-blocks freed per frame) until it reaches the target.
+## The END STATE is identical (view_f == 96, same blocks unloaded in total) — only the per-frame unload count is bounded,
+## so the free burst is spread over ⌈Δview / SHRINK_STEP_BLOCKS⌉ frames. NEVER-OOM: the FROM slot merely holds its larger
+## (already-allocated) view a few extra frames before shrinking — strictly ≤ one extra slot at 128 view for a bounded
+## handful of frames, no new retained buffers, no OOM headroom change. Default FALSE ⇒ the shipped one-frame snap verbatim
+## ⇒ BYTE-IDENTICAL. Gate: verify_shrink_paced.gd. Requires FACETED + FP_M1_POOL. Bake ON at export.
+const FP_SHRINK_PACED := false
+## Per-frame view-distance shrink step (blocks) under FP_SHRINK_PACED — one 16-block mesh-block shell freed per frame,
+## so a 128→96 crossing shrink de-bursts across 2 frames (32 / 16) instead of a single-frame unload of both shells.
+const SHRINK_STEP_BLOCKS := 16
+
+## COSMOS SPACE-NAV SN2 (docs/COSMOS-SPACE-NAV-DESIGN.md §4/§5/§10) — the five-mode NAV-FRAME machine
+## master flag. When true, the player maintains a CosmosNav.NavState (classify + 2-s dwell + R-latch),
+## re-expresses the HUD velocity in the current nav frame, and stamps nav_mode/frame_v/|v_bci| into the
+## RemoteBridge telemetry. Default FALSE ⇒ BYTE-IDENTICAL: the NavState is never created, CosmosNav is a
+## pure DEAD static, the HUD/telemetry are unchanged (nav_telemetry() returns {} ⇒ the guarded merge adds
+## nothing). The five modes are RE-EXPRESSIONS of the ONE SN1 f64 BCI state (§0.1) — a mode flip touches
+## NOTHING physical, so this flag adds zero per-frame allocation and cannot perturb the scene or state.
+const SN_NAV_MODES := false
+
+## COSMOS SPACE-NAV SN5 (docs/COSMOS-SPACE-NAV-DESIGN.md §7/§10) — the DEV-NAV master flag. When true, F enters
+## dev-nav (the mode-appropriate velocity-command flight controller + the overlay set) instead of the bare fly
+## toggle; the controller re-expresses the shipped fly input into the current nav frame (planetary hover tracks
+## the spinning surface, orbital hover station-keeps) and is SN-R1-seamless across mode boundaries. Default
+## FALSE ⇒ BYTE-IDENTICAL: F is the shipped bare fly toggle, no dev-flight controller runs, no overlay node is
+## created, CosmosDevFlight is a pure DEAD static. Requires SN_NAV_MODES (the controller reads the NavState).
+## NEVER-OOM: the controller is O(bytes) (no retained state — the caller owns [p,v]); the SN5b overlays are
+## lazy, reused, freed on toggle, hard-capped ≤ 64 KB (§9). The FEEL of flying + the LOOK of the overlays are
+## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
+## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
+const SN_DEVNAV := false
+
+## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
+## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
+## the shipped sun-elevation ramp: fog thins (fog_density = exp(−h/H_SCALE)), the sky lerps to BLACK as
+## space_mix rises (smoothstep 0.5·H_ATMO..2.5·H_ATMO), stars emerge (star_fade = max(night_fade, space_mix)),
+## ambient dims to AMBIENT_SPACE. On an airless body (has_atmo=false) space_mix≡1 ⇒ black starry sky at the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: _ramp_environment writes exactly the shipped day-night values
+## (fog_density stays 1.0, no altitude term is evaluated). Requires ORBITAL_SKY (the ramp lives in CosmosSky).
+## ZERO added bytes (O(1) Environment property writes/frame), NO shaders/materials — Environment props only.
+## Headless-PROVEN: the curve MATH + endpoints (G-SN-RAMP). LIVE-ONLY: the actual LOOK (limb, sunset legibility).
+const ATMO_VISUAL_RAMP := false
+
+## COSMOS SPACE-NAV SN4b (docs/COSMOS-SPACE-NAV-DESIGN.md §6.3) — the ANALYTIC SUN-OCCLUSION DIMMER. Without
+## shadow maps the DirectionalLight lights a player behind the planet; this dims light_energy to 0 when the
+## body occludes the sun (α between ŝ and −p̂ < asin(R_vox/|p|), soft ±0.005 rad penumbra). Pure f64, one
+## scalar/frame, ZERO bytes. Blended by altitude with the shipped elevation ramp (authority = space_mix(h)) so
+## exactly one driver owns any regime — at the surface the elevation ramp owns (light_energy stays 1.0), in
+## space the occlusion dimmer owns (night side dark from orbit). Airless bodies: occlusion owns from the
+## surface. Default FALSE ⇒ BYTE-IDENTICAL: light_energy is never written (stays the shipped 1.0). Gate
+## G-SN-OCCLUDE (headless-proven math); the LOOK of the orbital night side is LIVE-ONLY.
+const SN_SUN_OCCLUSION := false
+
+## COSMOS-LOD-SKY L1 (docs/COSMOS-LOD-SKY-DESIGN.md §7.3) — MOONSHINE (v0: zero-draw ambient moonlight). When
+## true, CosmosSky._ramp_environment adds a cool ambient term to the NIGHT side scaled by the Moon's ephemeris
+## illuminated fraction × how high the Moon rides × the night authority (1−twilight): full moon ⇒ a meaningfully
+## brighter blue-grey night, new moon ⇒ the shipped floor EXACTLY. Composes UNDER the SN4a/b altitude authorities.
+## Lunar eclipse falls out for free (CosmosSky.moon_eclipse_factor reuses occlusion_factor with the Moon behind
+## Earth) — it dims the ambient term and reddens the Moon impostor toward the §6 umbra crimson. ZERO draws, ZERO
+## bytes (Environment ambient-energy write + one impostor albedo write per frame). Default FALSE ⇒ BYTE-IDENTICAL:
+## no ambient term, the Moon albedo stays the shipped grey. Requires ORBITAL_SKY. Gate G-SKY-MOONSHINE; the night
+## LOOK is live-only. SAFE to bake ON (no shader/draw risk).
+const SKY_MOONSHINE := false
+
+## COSMOS-LOD-SKY L1 v1 (docs/COSMOS-LOD-SKY-DESIGN.md §7.3) — MOONSHINE as a REAL second DirectionalLight for
+## actual moon-shadows-on-terrain. In gl_compat every extra per-pixel light renders lit geometry in an ADDITIVE
+## pass — worst case approaches DOUBLING the ~200-draw budget — so this is the draw-count VISUAL-RISK half and is
+## a SEPARATE flag from the v0 ambient above, DEFAULT OFF even at export until a live draw-count/worst-frame A/B
+## passes. v0 is the permanent fallback. Requires SKY_MOONSHINE. LIVE-ONLY (measured A/B); no headless gate beyond
+## the energy formula (shared with v0).
+const SKY_MOONSHINE_LIGHT := false
+const MOON_LIGHT_MAX := 0.08      # v1 second-light peak energy (× illuminated_fraction × night authority)
+
+## COSMOS-LOD-SKY L2 (docs/COSMOS-LOD-SKY-DESIGN.md §6a) — the GROUND sunrise/sunset scattering ramp. When true,
+## CosmosSky._ramp_environment recolours the sky/fog/ambient toward the real Rayleigh direct-light transmittance
+## T_c(μ)=exp(−τ_c·m(μ)) — sea-level optical depths τ=(0.245,0.098,0.042) B/G/R, Kasten–Young air mass m(μ) — as
+## the Sun nears the horizon: deep-blue → cyan → gold → orange → crimson, EMERGING from the physics with no
+## hand-painted gradient. Environment property writes ONLY (the SN4a pattern) — ZERO bytes, ZERO shaders. Default
+## FALSE ⇒ BYTE-IDENTICAL: the shipped two-colour NIGHT→DAY lerp is untouched. Requires ORBITAL_SKY. Gate
+## G-SKY-SCATTER (curve/endpoints/monotone/C¹/off-identity); the sunset LOOK is live-only. SAFE class (no shader).
+const SKY_SCATTER_RAMP := false
+
+## COSMOS-LOD-SKY L3 (docs/COSMOS-LOD-SKY-DESIGN.md §6b) — the SPACE-side terminator band. When true, the far-ring
+## shell material becomes a lit vertex-colour SHADER carrying a `sun_dir` uniform; per vertex μ = normalize(v)·sun_dir
+## and ALBEDO *= mix(1, scatter_tint(μ), band(μ)) — the SAME T(μ) ramp as L2, so the sunset arc you saw from orbit
+## and the sky you see on the ground agree by construction. THIS IS THE ONE VISUAL-RISK stage (the P3 shader-failure
+## class on gl_compat): DEFAULT FALSE, screenshot-gated, and the StandardMaterial fallback is retained PERMANENTLY
+## (flag off ⇒ FacetFarRing._make_material returns the shipped StandardMaterial verbatim — byte-identical, the shell
+## is untouched). Gate G-SHELL-TINT proves the per-vertex tint MATH + the fallback identity; the render is live-only.
+## Requires ORBITAL_SKY + FACETED. Do NOT bake ON without a live screenshot.
+const SHELL_TERMINATOR_TINT := false
+## COSMOS-LOD-SKY M1 (docs/COSMOS-LOD-SKY-DESIGN.md §2/§5/§9) — the multi-body distance-LOD SELECTION LAW.
+## When true, CosmosSky consults BodyLod each frame to classify every celestial body's presented tier
+## (POINT → IMPOSTOR → RING) from its angular size — relief_px = e_relief/d·K_px vs TAU_POP, ±25% hysteresis —
+## and logs each impostor↔ring handover under the G-SSE-INV sub-pixel no-pop discipline. M1 SELECTS + ACCOUNTS
+## only: the law's output for the real Sun/Moon at their true distances is IMPOSTOR (Sun e_relief=0 ⇒ impostor
+## forever; Moon relief_px≈0.23 px ≪ 1), so NO placement/mesh changes — the visible detail-on-approach needs
+## M2's per-body RING build (FP_MOON_RING, rides O4c). The BodyLod kernel is pure statics (no engine deps, no
+## alloc, caller owns the latched tier) and DEAD with this flag off ⇒ BYTE-IDENTICAL (FLAT 6035/0): the sky's
+## per-frame writes are untouched, no BodyLod call is made. NEVER-OOM: selection + byte bookkeeping only, no new
+## allocation — the 32 MB far-tier ceiling (N_RING_MAX=2 resident rings, dominant-exclusive dense/skin) is
+## ACCOUNTING the gate asserts, not new bytes. Requires ORBITAL_SKY (the consult lives in CosmosSky). Truth
+## gate: src/tools/verify_body_lod.gd (G-BODY-LOD / G-LOD-CEILING / G-LOD-NOPOP).
+const FP_BODY_LOD := false
+
+## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3/§4/§5, the M2 stage). The Moon's own coarse far-ring:
+## when FP_BODY_LOD promotes the Moon IMPOSTOR→RING on approach (relief_px ≥ TAU_POP, d ≲ 120 k), CosmosSky
+## builds a body-parameterized far ring for the Moon body (MoonFarRing over FacetAtlas' moon fid range, K=14,
+## r_of=1737, moon_profile_at_dir + a moon regolith/maria/highlands palette) so the Moon shows REAL cratered
+## terrain instead of the flat impostor disc — airless (no atmosphere/clouds). The ring is placed to MATCH the
+## impostor exactly (same sky centre + angular radius, scaled about the camera), so the handover is sub-pixel BY
+## the law that triggers it (G-SSE-INV). Built WHOLE on promotion, FREED WHOLE on eviction (demote, d ≳ 150 k) —
+## nothing grows with time/approach count. HARD budget (§3/§5): ≤ 2.5 MB GPU + 0.94 MB CPU, inside the 32 MB
+## far-tier ceiling (N_RING_MAX=2). Requires MULTI_BODY (the Moon facets exist) + FP_BODY_LOD (the tier decision).
+## Default FALSE ⇒ BYTE-IDENTICAL (FLAT 6042/0): the MoonFarRing node is never created and the CosmosSky ring
+## block is never entered. Truth gate: src/tools/verify_moonring.gd (G-MOON-RING / -BUDGET / -NOPOP).
+const FP_MOON_RING := false
+
+## COSMOS-LOD-SKY M1 — the D_SKY O3 revisit (docs/COSMOS-LOD-SKY-DESIGN.md §1/§11, cosmos_sky.gd:26). The sky
+## impostor/star-dome placement radius CosmosSky.D_SKY = 8000 was sized for R = 3072 (2.6·R); after the rescale
+## to R = 6371 it sits at only 1.26·R — too close to the planet — and its literal value no longer tracks the
+## far clip. When true, CosmosSky uses CosmosSky.d_sky_derived() = CAMERA_FAR·SKY_FAR_MARGIN/STAR_DOME_MULT
+## (≈ 8143): as far OUTSIDE the planet as the 9000-block camera far clip allows, with the star dome (radius
+## D·1.05) fully inside the clip by a stated margin — derived from CAMERA_FAR so it can never clip and tracks
+## any future far-plane change. Default FALSE ⇒ BYTE-IDENTICAL: CosmosSky keeps the shipped literal 8000
+## everywhere (placement + star mesh). Requires ORBITAL_SKY. Gate: the D_SKY section of verify_body_lod.gd
+## (impostor outside R, star dome inside the far clip). NOTE: at R=6371 with a 9000 far clip the impostor
+## CANNOT be a large multiple of R (the far plane boxes it at ≤ 1.35·R); raising that further is a CAMERA_FAR
+## change, out of M1 scope — the gate asserts the derived value clears R and flags loudly if R ever approaches it.
+const FP_SKY_DSKY_R := false
+## COSMOS CLIMATE W0 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3 / §7) — REAL AXIAL SEASONS. When true the
+## ephemeris fills Earth's reserved axial_tilt slot (23.4° = 0.4084 rad): dir_to_bodyfixed composes the
+## obliquity (R_spin·R_tilt) so CosmosSky's sun arcs get seasonal (low winter / high summer / polar
+## day-night) for free, and ClimateModel.season_offset(sinlat, sinδ) shifts the sim-layer temperature and
+## the SnowfallSystem snow line with the subsolar latitude δ(t). WORLDGEN IS UNTOUCHED — the offset is added
+## ONLY by sim-layer callers (PerVoxelEnvironment / SnowfallSystem), so generated_cell/profile_at_dir stay
+## pure of the clock (G-SEAS-PURE) and the C++ frozen epoch survives. Default FALSE ⇒ effective_tilt≡0
+## (R_tilt=I) and no offset is ever added ⇒ BYTE-IDENTICAL to the shipped no-tilt kernel; the O1/tidal gates
+## stay green. Gate verify_climate G-SEAS-TILT (δ=±23.4° at solstices) + G-SEAS-PURE.
+const FP_SEASONS := false
+
+# =====================================================================================================
+# COSMOS ATMO-SKY (docs/COSMOS-ATMO-SKY-DESIGN.md) — the unified atmosphere + celestial + day/night
+# rebuild. ONE physically-motivated model consistent from outer space and from the surface (the
+# terminator from orbit and the sunset on the ground are the SAME curves). Staged A0..A6, every flag
+# default FALSE ⇒ BYTE-IDENTICAL (the curve math is pure static in CosmosSky, driven directly by the
+# gates; the flags only decide whether the sky/light/shell COMPOSE it in-game). All shaders (shell v2,
+# atmosphere halo, moon phase) keep a PERMANENT StandardMaterial/analytic fallback (P3 gl_compat class):
+# any compile failure ⇒ the flag stays off and the shipped path ships. See the design §4 stage table.
+# =====================================================================================================
+
+## A0 (design §2.0 / §4). Move the SN3 scaled-body driver block (main._process) ABOVE the FLAT_WORLD
+## early-return, so with FP_SCALED_BODY baked ON it actually RUNS in the faceted production game
+## (FLAT_WORLD=true) — the camera near/far ramp with altitude and the far ring gets its distance clamp,
+## un-clipping the planet from altitude/deep space (the shipped 9000 far plane clips the far side above
+## h≈3-6 k; from the pilot's d=167 k the planet is entirely gone). The SAME stranded-driver class as the
+## shell-driver fix (0b2a934). Off ⇒ the block stays below the return, DEAD in faceted (byte-identical).
+## Must bake WITH A1 (once the planet renders at d≫D_SKY the sky impostors/dome would draw over it —
+## occlusion becomes mandatory). Gate G-AS-FARRAMP.
+const FP_SN3_MAIN_LIVE := false
+
+## A1 (design §2.1 hazard / §3 C5 / §4). Analytic planet-disc OCCLUSION of the sky. Once A0 renders the
+## planet at distances ≫ D_SKY, the opaque Sun/Moon impostors (at D_SKY≈8143) would draw IN FRONT of the
+## Earth disc and the additive star dome would sprinkle stars OVER the planet. When true, the Sun/Moon
+## impostors are hidden (visible=false) when the planet disc covers their direction (occlusion_factor
+## reused: the sun/moon is behind the disc ⇔ occ==0), and the star-dome shader discards fragments inside
+## the planet disc via planet_dir/planet_cos_ang uniforms. D_SKY stays const — the sky is angular, occlusion
+## is analytic (NOT distance-chased). Off ⇒ impostors always visible, star mask uniform passes everything
+## (planet_cos_ang = 2.0 > 1 ⇒ never discards) ⇒ byte-identical. Requires ORBITAL_SKY. Gate G-AS-OCC.
+const FP_SKY_PLANET_OCCLUDE := false
+
+## A2 (design §3 C5 / §4). Sun/Moon PERCEPTUAL PRESENCE. The impostor is sized to the real 0.53° angular
+## diameter → ≈8 px, and gl_compat has no bloom/HDR glare, so the Sun is an invisible dot. When true: an
+## angular-size FLOOR is applied to each impostor radius (SUN_MIN_ANG/MOON_MIN_ANG), an additive
+## radial-falloff GLARE quad is added on the Sun (~5× disc radius, brightness ×occ(cam) so it dies at
+## sunset/eclipse/umbra), and the Sun disc colour reddens by T(μ_cam,0). Off ⇒ exact-angular impostors,
+## no glare node ⇒ byte-identical. Requires ORBITAL_SKY. LIVE-ONLY LOOK; the floor math is gated.
+const FP_SUN_PRESENCE := false
+const SUN_MIN_ANG_DEG := 2.0      # perceptual angular-diameter floor for the Sun impostor (taste)
+const MOON_MIN_ANG_DEG := 1.5     # perceptual angular-diameter floor for the Moon impostor (taste)
+const SUN_GLARE_RADII := 5.0      # glare quad half-size in Sun-disc radii
+
+## A3 (design §2.3 / §3 C3 / §4). atmo_vis(h) replaces the space_mix 192..960 band with a 0.5·ATMO_TOP..
+## ATMO_TOP fade (exactly 0 at/above ATMO_TOP=384 — the tint is star-black in space, fixing the orbit
+## sky-colour bug). star_fade = max(night_fade, 1−atmo_vis(h)); SKY_SCATTER_RAMP's weight gains ·atmo_vis
+## so it can finally bake ON. Off ⇒ CosmosSky uses space_mix + the shipped scatter weight (byte-identical).
+## Requires ORBITAL_SKY. Gate G-AS-ZERO.
+const FP_ATMO_SPACE_ZERO := false
+
+## A4 (design §2.2 / §3 C1 / §4). ABSOLUTE day/night light. The DirectionalLight energy becomes occ(cam)
+## ALWAYS (no space_mix authority lerp) with an altitude-widened penumbra pen(h) (long twilight at the
+## ground, sharp in vacuum), the light COLOUR reddens by T(μ_cam,0), and the ambient umbra authority is
+## likewise removed (continuous, absolute). Fixes "the dark side lights up as you descend" (the through-
+## planet DirectionalLight lit the night side below h≈192). The Moon self-phase shader lands HERE
+## (regression guard: with C1 dimming the global light at night the shaded-Moon impostor would black out —
+## the shader computes Lambert phase from a sun_dir uniform, unshaded). Off ⇒ occlusion_light /
+## occlusion_ambient authority lerps + the shipped shaded Moon material (byte-identical). Gate G-AS-ABSLIGHT.
+const FP_LIGHT_ABSOLUTE := false
+
+## A5 (design §2.2-3/4 / §3 C2 / §4). The globe far-ring shell shader v2: UNSHADED (immune to the global
+## light/ambient, so the globe's look stops tracking the camera), per-vertex NIGHT_FLOOR + (1−NIGHT_FLOOR)·
+## day(n̂) darkening with n̂ = normalize(wp − planet_centre) where planet_centre is a UNIFORM fed the scaled
+## render centre (fixes the origin-assumption that breaks under scale-about-camera), × the kept terminator
+## band tint. Supersedes SHELL_TERMINATOR_TINT v1 (the band tint is retained inside v2). StandardMaterial
+## fallback retained permanently. Off ⇒ FacetFarRing._make_material returns the shipped path (byte-identical).
+## Requires ORBITAL_SKY + FACETED. Gate G-AS-TERM. Do NOT bake ON without a live screenshot (P3 shader class).
+const FP_SHELL_ABSOLUTE := false
+
+## A6 (design §2.4 / §3 C4 / §4). The atmosphere shell — ONE inverted additive SphereMesh (radius
+## R + 2·ATMO_TOP, planet-centred, riding the same scaled placement as the far ring; cull_front +
+## blend_add + depth_draw_never so it never occludes and the planet's depth kills it behind the disc).
+## Its closed-form fragment shader is the blue limb HALO from outside AND the horizon-band sky from inside,
+## by the SAME day/T/band curves as C2/C5 (seamless by construction). C3 (the camera Environment sky) is
+## gated by atmo_vis so the base tint is 0 in space and this shell composes additively. Off ⇒ no shell node,
+## no camera-sky change beyond A3 ⇒ byte-identical. Requires ORBITAL_SKY. Depends on A3 (no double tint) +
+## A5 (matching curves). Gate G-AS-LIMB. LIVE-ONLY LOOK (P3 shader class); analytic StandardMaterial fallback.
+const FP_ATMO_SHELL := false
+
+## COSMOS ATMO2 B0 (docs/COSMOS-ATMO2-DESIGN.md §3.2/§3.3, stage B0). The optical-PATH sun law: the Sun's
+## disc/glare colour AND the DirectionalLight colour/energy become the transmittance T⃗(m)·L(m) over the
+## atmospheric PATH along the viewer→sun ray (CosmosSky.optical_path_air_mass), not the camera-ELEVATION
+## Kasten–Young curve. m=0 in vacuum (blinding WHITE sun), ≈1 at surface noon (pale warm), ≈18 at the surface
+## horizon (deep red), ≈36 through the limb from orbit — one continuous law, C¹ across the atmosphere border,
+## K–Y retired from the live path (kept in the gate as the surface cross-check). The disc/glare/light penumbra
+## unify on pen(h). Off ⇒ the shipped A2/A4 μ-keyed colour is untouched ⇒ byte-identical. Requires ORBITAL_SKY
+## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
+const FP_SUN_PATHLIGHT := false
+
+## COSMOS ATMO2 B1 (docs/COSMOS-ATMO2-DESIGN.md §2.1.2/§3.3, stage B1). The apparent-disc fix: Godot's
+## SphereMesh default radius is 0.5 (not 1.0), so the shipped sun/moon impostors render at HALF their intended
+## angular size (sun 1.0° not 2.0°, moon 0.75° not 1.5°) — a blurry dot lost in the glare. Under this flag the
+## impostor meshes get radius 1.0 so the discs hit their true 2.0°/1.5° floors, and the glare quad is retuned
+## into a tight bright core (~1.5 disc radii @ ~0.9) + a soft skirt (5 radii). Off ⇒ the shipped 0.5-radius mesh
+## + shipped glare falloff ⇒ byte-identical. Requires FP_SUN_PRESENCE. Gate G-B1-SUN. LIVE-ONLY LOOK. Depends B0.
+const FP_SUN_APPARENT := false
+
+## COSMOS ATMO2 B1 sub-flag (docs §3.4). Compatibility-renderer glow with glow_hdr_threshold≈0.92 so ONLY the
+## sun disc/glare (the only ≥0.9-luminance residents of the §3.5 budget) bloom. P3 (gl_compat glow is a
+## simplified impl); if it misbehaves on device, off = the glare quad alone still delivers the bloom. Off ⇒ the
+## Environment glow is untouched ⇒ byte-identical. Requires FP_SUN_APPARENT + an Environment. LIVE-ONLY LOOK.
+const FP_SUN_GLOW := false
+
+## COSMOS ATMO2 B5 (docs/COSMOS-ATMO2-DESIGN.md §2.6, stage B5). The fog arbiter: (a) WeatherFX MULTIPLIES its
+## humidity factor onto CosmosSky's altitude fog density (reads the current fog_density instead of overwriting
+## from a captured base — so FP_PRECIP no longer stomps the altitude thinning); (b) CosmosSky's altitude fog
+## fades with atmo_vis(h) so it reaches 0 at ATMO_TOP (depth fog IS the atmosphere); (c) fog_depth_end tracks
+## the A0-ramped camera far so a deep-space planet fragment is never painted the fog colour. Off ⇒ the shipped
+## overwrite + static fog_depth_end ⇒ byte-identical. Gate G-B5-FOG. Protects A0 (FP_SN3_MAIN_LIVE) in deep space.
+const FP_FOG_ARBITER := false
+
+## COSMOS ATMO2 B4 (docs/COSMOS-ATMO2-DESIGN.md §2.2/§3.3, stage B4). The Moon presence fix: (a) the self-phase
+## shader's flat `ambient=0.02` becomes an EARTHSHINE FLOOR 0.11 so a crescent/new moon is a faint disc, not
+## black-on-black; (b) the ephemeris Moon gets its real 5.1° orbital inclination so it clears Earth's ~0.95°
+## umbra cone at most oppositions (eclipses become the rare node event they should be, not every full moon).
+## The inclination is gated HERE (effective_incl → 0 with the flag off), so the SN1/O1/ephemeris suites stay
+## byte-identical when off. Requires FP_LIGHT_ABSOLUTE (the self-phase shader) + FP_SUN_APPARENT (size). Gate
+## G-B4-MOON. LIVE-ONLY LOOK. Depends B1 (size), B2 (calmer sky).
+const FP_MOON_PRESENCE := false
+
+## COSMOS ATMO2 B2 (docs/COSMOS-ATMO2-DESIGN.md §2.4/§3.3, stage B2). The atmosphere-shell brightness fix: the
+## A6 single-sample strength `chord·ρ(h_min)/H` overestimates the optical path 6–80× (a blown cyan-white sky
+## with stars showing through). Replace it with a BOUNDED, budget-normalized limb intensity — a saturating
+## transform of the optical column, peak-limb luminance ≈0.35 and surface horizon band ≈0.2–0.3 (§3.5) — so the
+## halo is a thin moderate blue ring the sun is always brighter than. Colour keeps the shared scatter_tint/band
+## (which IS the surface path-T⃗ ⇒ A5 and A6 stay harmonized). Both the GLSL twin (via a path_norm uniform,
+## default 0 = shipped) and the GDScript twin are gated. Off ⇒ byte-identical. Requires FP_ATMO_SHELL. Gate
+## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
+const FP_ATMO_PATH_SHELL := false
+
+## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
+## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
+## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far
+## split). This flag routes the near materials through ShaderMaterial TWINS that keep vertex-colour×texture
+## EXACTLY and multiply an absolute day/night shade(μ), μ = normalize(MODEL·v)·ŝ (planet centre = scene origin),
+## so near AND far agree at the same surface point BY CONSTRUCTION. night_floor 0.10; a StandardMaterial fallback
+## is retained permanently (P3 gl_compat class). Off ⇒ the shipped unshaded materials ⇒ byte-identical. Requires
+## ORBITAL_SKY (the sun_dir source). Gate G-B3-NEARNIGHT. LIVE-ONLY LOOK. Depends B0 (curves).
+const FP_NEAR_DAYLIGHT := false
+
+## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
+## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
+## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem
+## discipline). A sliced sweep (128 cells/frame) integrates insolation → T, a diagnostic thermal-low
+## pressure, an analytic + geostrophic + friction DIAGNOSTIC wind (cannot go unstable), semi-Lagrangian
+## moisture with evap/condense/rain-out + orographic lift, and a CAPE instability proxy. NO rendering (that
+## is W2/W3/W4); PerVoxelEnvironment exposes humidity/wind/pressure/precip/cloud reads. Deterministic (pure
+## of SEED + state + sweep index). Default FALSE ⇒ WeatherSystem is never instantiated ⇒ zero bytes / zero
+## CPU / byte-identical. Gate verify_climate G-W1-BYTES/CPU/DET/PHYS/ITCZ/INIT.
+const FP_CLIMATE_GRID := false
+
+## COSMOS CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4 / §7) — the 3-layer semi-cubic CLOUD mesher
+## (CloudLayers). A read-only view of the weather grid: blocky prisms (cumulus/stratus/cirrus at 3
+## altitudes, all < ATMO_TOP 384) in the terrain's own vertex-colour language, from a camera-following
+## world-snapped 64×64 tile lattice + SEED+106 noise, greedy row-merged into ONE reused CPU scratch
+## uploaded to exactly 3 ArrayMesh surfaces (3 draw calls). HARD vertex cap ⇒ overcast is the cheapest
+## mesh, the worst case bounded (≤2.4 MiB, G-W2-BYTES/DRAWS). Requires FP_CLIMATE_GRID (reads its cloud
+## water). Default FALSE ⇒ no CloudLayers node ⇒ zero bytes / byte-identical. Cloud LOOK is LIVE-ONLY.
+const FP_CLOUDS := false
+
+## COSMOS CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5 / §7) — PRECIPITATION as threshold read-outs
+## of the weather grid: rain/snow/fog. ONE reused camera-following particle node (hard amount cap ≤1024),
+## the Environment fog density driven from grid humidity (composed MULTIPLICATIVELY with SN4a's altitude
+## ramp so space stays clear), and SnowfallSystem.is_snowing upgraded to couple to the grid (kind==snow,
+## the SEED+105 noise becoming the sub-cell structure). Kind (rain/snow) resolves through the ONE
+## surface_temperature+season zero-crossing, so precip agrees with the snow-cap boundary (G-W3-COUPLE).
+## Requires FP_CLIMATE_GRID. Default FALSE ⇒ no FX node, is_snowing verbatim ⇒ byte-identical. Precip
+## FEEL/fog mood is LIVE-ONLY.
+const FP_PRECIP := false
+
+## COSMOS CLIMATE W4 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4.4/§5 / §7) — THUNDERSTORMS from the grid's
+## CAPE-proxy instability field. Convective cells (instability over threshold + cloud water) become
+## towering cumulonimbus in CloudLayers (dark, up to 256, capped ≤64 towers/rebuild — bounded extra
+## height, no extra draws), flash lightning (ONE reused omni flash, energy writes only) and drop hail
+## (WeatherFX kind swap) in WeatherFX. Emergent from state, NEVER scripted per-phenomenon (G-W4-EMERGE).
+## The behaviours live INSIDE the W2 (CloudLayers) / W3 (WeatherFX) nodes, gated on this flag — so it needs
+## FP_CLOUDS + FP_PRECIP. Default FALSE ⇒ those nodes behave exactly as W2/W3 ⇒ byte-identical. Storm
+## drama (flash timing, tower look) is LIVE-ONLY.
+const FP_STORMS := false
+
+## COSMOS CLIMATE — WEATHER ON A WORKER THREAD (live pilot request: "use a separate dedicated thread for the
+## weather simulation, and later for all other environmental simulations, to offload the main game cycle").
+## When true AND FP_CLIMATE_GRID is on, WorldManager runs the WeatherSystem sweep on a DEDICATED worker thread
+## (EnvSimWorker) instead of slicing it on the main loop: the worker advances the grid into the BACK buffer,
+## the main thread only does a pointer-flip SWAP of the already-existing double buffer at one sync point and
+## READS the front buffer — so the per-frame main-thread weather cost drops to ~0 (kills the walking hitch the
+## coarse per-frame sweep caused). The sweep advances by SIM-TIME so it stays frame-rate-independent and
+## deterministic given (SEED + game_time); the worker writes back / main reads front / the swap is the only
+## sync (no data race — G-WTHREAD-SAFE). Composes with FP_CLIMATE_GRID (thread only matters when the grid is
+## on). Default FALSE ⇒ the shipped main-thread sliced sweep runs verbatim ⇒ BYTE-IDENTICAL (FLAT unchanged);
+## the class isn't even instantiated. NEVER-OOM: adds only the thread stack + a mutex/semaphore, no buffers
+## (the double buffer already exists). Gate verify_weather_thread G-WTHREAD-SAFE/EVOLVE/MAINCOST + teardown.
+const FP_WEATHER_THREAD := false
+
+## SN-FIX #1 (2026-07-18, live pilot request) — the NAV HUD readout. When true, main.gd builds a small
+## NavHUD CanvasLayer that shows the player's lattice position (rounded x,y,z), radial altitude (|world|−R_BLOCKS
+## when faceted, else lattice y) and the current nav-mode name (the same string as the RemoteBridge nav_mode;
+## "—" when SN_NAV_MODES is off). Default FALSE ⇒ BYTE-IDENTICAL: no NavHUD node is created, no new per-frame
+## work. Additive, read-only (mirrors the ThermometerHUD pattern). Gate G-SN-HUDNAV (lifecycle + formatting).
+const SN_HUD_NAV := false
+
+## SN-FIX #2 (2026-07-18, live pilot report) — PRESERVE HEADING across facet crossings. The shipped fixed-frame
+## reframe (player.gd apply_reframe) twists rotation.y + velocity by the seam's horizontal `yaw_delta` so a
+## walk stays world-continuous; the pilot reports this SWINGS their horizontal heading at crossings and wants
+## it FIXED (the ground may tilt — carried by the ActiveFrame/camera — but the heading must NOT rotate). When
+## true, apply_reframe does the POSITION reframe exactly as shipped but SKIPS the horizontal yaw twist of
+## heading + velocity (and forwards a zero twist to the remote executor). Default FALSE ⇒ the shipped yaw-twist
+## is BYTE-IDENTICAL. This gates a SHIPPED fixed-frame behaviour. Gate G-SN-KEEPHEADING. Live-only: the feel.
+const FP_CROSS_KEEP_HEADING := false
+
+## COSMOS FS2-V2 (docs/COSMOS-FACET-SEAMS-V2.md §5) — the orientation-twist FRAME-AWARE fix. world_yaw = frame_yaw +
+## local_yaw and, under the fixed frame, frame_yaw_B − frame_yaw_A = −yaw_delta, so the SHIPPED reframe twist
+## (local += yaw_delta) is ALREADY the world-heading-preserving branch. FP_CROSS_KEEP_HEADING (local unchanged) then
+## snaps the world heading by the FULL inter-frame yaw — and the live deploy runs BOTH FP_FIXED_FRAME and
+## FP_CROSS_KEEP_HEADING ON, so the heading DOUBLE-twists at every crossing (the pilot's "orientation glitch",
+## largest at cross-cube-face seams). When true, reframe_twist becomes frame-aware: under the fixed frame it applies
+## the +yaw_delta twist REGARDLESS of keep_heading (that branch preserves world heading); KEEP_HEADING's no-twist is
+## honoured only in the legacy/orbital-BCI frame it was designed for. Default FALSE ⇒ reframe_twist is BYTE-IDENTICAL
+## (the frame-aware branch is skipped). Gate G-TWIST-FRAME (verify_facet_seams.gd): under fixed frame, ON + KEEP_HEADING
+## preserves world heading with a SINGLE correct twist; OFF is byte-identical. Bake ON with FP_FIXED_FRAME.
+const FP_TWIST_FRAME_AWARE := false
+
+## COSMOS FS-W (docs/COSMOS-FACET-SEAMS-V2.md §3) — CORNER COMMIT (kills the invisible wall). blocked() keeps a
+## permanent ridge wall at own_dist < FACET_WALL_EPS (−3), meant to be unreachable because a crossing commits at
+## own_dist < −HYST. But maybe_cross_facet REFUSES to commit near a facet-grid CORNER — (a) the containment check
+## (the reframed landing is past one of B's other ridges → `continue`) and (b) the 6-tick cooldown during a corner
+## zig-zag — and the analytic floor then carries the player on to −3 into the wall. When true, on a containment
+## failure the destination is resolved BY DIRECTION: argmax over {the crossed edge-neighbours, their common diagonal}
+## of min-slot own_dist at the reframed landing (FacetAtlas.facet_of_dir as the oracle/gate); and the cooldown is
+## VOIDED once own_dist < −1 (genuinely past the ridge — never park the player in masked space). The −3 wall stays as
+## an unreachable backstop; a diagonal pool-miss uses the existing spawn-then-redesignate path. Default FALSE ⇒
+## maybe_cross_facet is BYTE-IDENTICAL (containment `continue` + full cooldown). Gate G-CORNER-WALK: corner-grazing
+## traversals never blocked, ≤3 commits, direction-correct landing. GDScript-only (no rebuild). Independent of FS2′.
+const FP_CROSS_CORNER_COMMIT := false
+
+## SN-FIX #3 (2026-07-18, live pilot report "bounced back at the atmosphere ceiling" + the full F-mode model the
+## pilot then specified). The intended physics, gated as ONE switch:
+##   (1) F-MODE (dev-nav fly) is GRAVITY-OFF ALWAYS — a kinematic fly in the FULL look direction (camera forward
+##       incl. pitch), constant speed at every altitude. Looking up + forward climbs straight through the
+##       atmosphere ceiling (ATMO_TOP=384) into orbit with NO deceleration/bounce. (The bounce was the shipped
+##       dev-nav auto-handoff to the CosmosDevFlight velocity-command controller, which ramped the climb toward
+##       the command at DEV_ACCEL — headless-confirmed 32→~1 b/s. That controller now runs ONLY after the pilot
+##       EXPLICITLY commits with the O "release-to-orbit" verb; O behaviour itself is a follow-up, untouched.)
+##   (2) F-OFF gravity is WHERE-aware: ABOVE 384 the player free-falls in the PLANET-CENTRED (inertial) frame
+##       under GM_dyn/r² toward the planet centre — NO surface-rotation drag (you keep the planet's solar orbit,
+##       don't co-rotate with the surface). Crossing BACK DOWN under 384, the SURFACE frame + surface-feel
+##       gravity resume. The frame/rotation-drag switch at 384 is the existing nav-mode carrier (ω⃗×p → 0); the
+##       flight↔fall and fall↔surface handoffs seed velocity so there is NO jump.
+## Default FALSE ⇒ BYTE-IDENTICAL: dev-nav keeps its shipped auto-handoff fly and F-off is the shipped lattice
+## walk gravity; nothing free-falls. Requires SN_DEVNAV + FACETED to have any effect. Gate G-SN-NOBOUNCE
+## (decision/regime/gravity/continuity, headless). Live-only: the FEEL of the seamless climb + the fall.
+const SN_NO_CEILING_BOUNCE := false
+
+## SN-BRAKE (2026-07-18, live pilot "fell F-off from orbit at ~141 m/s → generation storm on landing";
+## docs/COSMOS-SPACE-NAV-DESIGN.md §6 / COSMOS-ORBITAL-O1O4-DESIGN.md §2.6). ATMOSPHERIC DESCENT BRAKING: a
+## craft entering the atmosphere fast decelerates toward a low terminal velocity BEFORE it reaches the surface,
+## so the descent never outruns terrain streaming (the fast landing was outrunning the generator). The SN1 drag
+## law a_drag = −k(h)·|v|·v, k(h) = k0·exp(−h/DRAG_H_SCALE) (density ~0 at ATMO_TOP, max at h=0), is applied to
+## the DESCENT vertical velocity on the below-ATMO_TOP surface-frame path (where the F-off fall velocity is
+## handed to velocity.y). k0 = datum_gravity(body)/ATMO_BRAKE_TERMINAL² ⇒ terminal == ATMO_BRAKE_TERMINAL for
+## ANY body (per-body generic — reads the dominant body, NOT a hardcoded Earth). ABOVE ATMO_TOP: NO drag (the
+## planet-centred free-fall owns space, unchanged). Continuous at 384 (density ≈ 0 there ⇒ no jump). SEPARATE
+## from the ORBITAL integrator's own DRAG_TERMINAL (that drag is untouched). Default FALSE ⇒ BYTE-IDENTICAL:
+## no brake term is evaluated, the shipped surface walk is byte-for-byte. Requires FACETED. Gate G-SN-BRAKE
+## (braked-to-terminal / density profile / no-drag-above-384 / per-body, headless). LIVE-ONLY: that streaming
+## actually keeps up (no storm) needs a live re-fly — the gate proves the descent is braked, not that the
+## generator wins. Follow-up if braking alone is insufficient: pre-generate the landing column during the fall.
+const SN_ATMO_BRAKING := false
+## G-LANDING FIX (2026-07-20 live pilot: "gravity not properly reinstantiated when quitting orbiting and
+## flight mode") — the F-OFF LAND-COMMIT verb. With the flag ON, toggling FLIGHT OFF (F) treats the exit as
+## an explicit "quit flying, take me down": the free-fall seed keeps ONLY the RADIAL component of the last
+## flight velocity (the tangential/orbital part is dropped), so the pilot falls toward the planet centre and
+## LANDS instead of retaining a shallow tangential coast that spirals for minutes. Scoped to the EXPLICIT F
+## toggle only — automatic regime transitions (ceiling handoffs, walk→fall) keep full velocity continuity
+## (SN-R1), and the O free-coast remains the way to KEEP an orbit. Default FALSE ⇒ byte-identical (the latch
+## is never consumed; the shipped continuous seed is byte-for-byte). Gate G-LANDING-FOFF (verify_landing).
+const SN_FOFF_RADIAL_FALL := false
+## SN-BRAKE descent terminal speed (blocks/s) — the speed a re-entry brakes to below ATMO_TOP. Set to 20 for
+## the natural 1:1000 model: datum gravity is now 9.8 (≈5× weaker than the old 72×-model 50.9), so k0 =
+## datum_gravity/ATMO_BRAKE_TERMINAL² is smaller and the drag relaxes SLOWER over the fixed 384-block band
+## (ATMO_TOP is USER-LOCKED at 384 — retune drag, not the border). 20 is the strongest reasonable terminal that
+## keeps a STEEP re-entry from the natural 250-b/s orbit STREAM-SAFE within 384 blocks: a −250 dive arrives
+## ≈25.3 b/s, a −300 dive ≈26.5, even a −350 (escape-speed) dive ≈27.8 — all under the ~30-b/s stream-supply
+## floor (voxiverse-streaming-supply-demand), while 20 b/s reads as a firm descent, not a hard stop. Terminal ==
+## √(datum_gravity/k0) == ATMO_BRAKE_TERMINAL by construction (per-body generic). Single named const — dial live
+## (raise toward the orbital DRAG_TERMINAL 55 once a pre-gen landing column removes the streaming constraint).
+const ATMO_BRAKE_TERMINAL := 20.0
+
+## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
+## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
+## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,
+## no pop), decouples the camera from the facet frame (top_level global write B_cam = R_z(−θ)·Basis(q)), and
+## routes mouse to camera-local yaw + UNLIMITED pitch and Q/E to roll. Returning to PLANETARY re-derives the
+## surface FPS yaw/pitch and hands back INSTANTLY (Phase A — yaw/pitch continuous, any roll snaps to 0; the
+## smooth slerp is Phase C, ORBIT_LAND_RECOVER). This alone fixes BOTH live-pilot bugs ("sky rotates with the
+## planet" + "roll/pitch tied to the facet"): the star dome is ALREADY inertially fixed (R_z(−θ)), so making the
+## camera inertial freezes the stars and detaches the attitude with ZERO sky-render change. Requires SN_NAV_MODES
+## (reads player._nav) AND FACETED. Default FALSE ⇒ BYTE-IDENTICAL: the machine never leaves SURFACE, the
+## input/camera/window_camera_transform branches all fall through to the shipped surface FPS path, the camera
+## node is never emancipated. Gates G-ORBIT-ATT (seed round-trip / >90° pitch / roll / inertial hold) + G-ORBIT-SKY
+## (the −θ dome counter-rotation regression). LIVE-ONLY: the top_level camera render + the feel of 6DOF + frozen stars.
+const ORBIT_ATTITUDE := false
+## ORBIT-FRAME tunable (live-tuned): the Q/E roll rate (rad/s). Consulted only under ORBIT_ATTITUDE in SPACE;
+## the pure kernel takes it as an argument so the gate drives it directly. (Phases B/C add their own flags.)
+const ORBIT_ROLL_RATE := 1.2
+## COSMOS ORBIT-FRAME Phase B (docs/COSMOS-ORBIT-FRAME-DESIGN.md §5) — fly the FULL 6DOF look. When true (AND
+## ORBIT_ATTITUDE AND in SPACE), the kinematic look-fly builds its direction from the inertial camera basis
+## re-expressed in the lattice (frame_basis-transpose times B_cam_scene = CosmosAttitude.lat_cam_basis), with
+## Space/Ctrl on CAMERA-local +/-Y (microgravity has no world vertical); the hover carrier drift composes
+## UNCHANGED (a zero-input hover still holds the BCI rest, G-SN-HOVERDRIFT stays valid). The dev-flight velocity
+## controller becomes fully 6DOF for FREE via the window_camera_transform seam (asserted, not edited). Default
+## FALSE ⇒ the shipped body-yaw+pitch lattice construction, byte-identical (and _kinematic_look_fly is only
+## reached under SN_NO_CEILING_BOUNCE dev-nav). Requires ORBIT_ATTITUDE + SN_DEVNAV. Gate G-ORBIT-FLY.
+const ORBIT_6DOF_FLY := false
+## COSMOS ORBIT-FRAME Phase C (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3.5) — the SMOOTH landing recovery. When true
+## (AND ORBIT_ATTITUDE), leaving SPACE enters a RECOVER blend instead of the Phase A instant hand-back: the
+## displayed basis slerps (smoothstep, C1) from the frozen space attitude to the gravity-aligned surface FPS pose
+## over ORBIT_T_REC seconds, mouse-drivable during the blend, converging from ANY attitude (incl. roll pi) along
+## the shortest great-circle arc; ground contact is an extra leave trigger. At alpha=1 the hand-back writes exactly
+## the basis already displayed (no jump). Re-leaving PLANETARY mid-blend re-seeds q_bci from the displayed basis
+## (always continuous). Default FALSE ⇒ the Phase A INSTANT hand-back. Requires ORBIT_ATTITUDE. Gate G-ORBIT-REC.
+const ORBIT_LAND_RECOVER := false
+## ORBIT-FRAME tunable (live-tuned): the RECOVER blend duration (s). Consulted only under ORBIT_LAND_RECOVER.
+const ORBIT_T_REC := 0.8
+
+## COSMOS SPACE-NAV §7.4 (docs/COSMOS-SPACE-NAV-DESIGN.md) — the O toggle becomes a REAL Keplerian free-coast.
+## Pressing O seeds v_bci = v_circ·t̂ (t̂ = the player's YAW-heading tangent ⊥ r̂, PITCH IGNORED) and then each
+## physics frame integrates the OrbitalState under GM_dyn/r² gravity — the SAME symplectic coast the SN-FIX #3
+## free-fall uses — so a circular seed HOLDS a stable orbit and an off-circular seed evolves into an ellipse /
+## decay / escape (KSP-style, emergent from the vector). Fixes the live bug where O set a dev-flight velocity-
+## COMMAND that ramped back to rest ("orbits a few seconds then hangs in space") because nothing integrated
+## gravity. Movement/thrust input exits to the dev-flight velocity-command (SN-R1 continuity — the coast mirrors
+## its BCI velocity into the controller each tick, so there is no jump); dropping into the atmosphere (PLANETARY)
+## also exits to the shipped surface/dev path. Per-body generic (reads the dominant body, not a hardcoded Earth).
+## Requires SN_DEVNAV (O is a dev-nav toggle) + FACETED. Default FALSE ⇒ BYTE-IDENTICAL: O keeps its shipped
+## velocity-command behaviour and no coast state is ever set. Gate G-OCOAST (verify_ocoast.gd).
+const ORBIT_COAST := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX B (fix/voxiverse-fall-perf) — full-real-dt coast integration (anti time-dilation).
+## The shared Kepler coast + free-fall movers CLAMP the per-frame dt to CosmosNav.MAX_NAV_DT (1/30 s) and DROP the
+## remainder (G-SN-NOSPIRAL). That bounds integrator work, but when a frame HITCHES (the live fall-from-orbit ran at
+## ~5 fps / 200 ms frames) the coast then advances only 1/30 s of game time per 200 ms real frame → the fall runs at
+## ~1/6 real speed (the pilot's "fall is 10× too slow" slow-motion). With this flag ON the movers integrate the FULL
+## real elapsed delta each frame via internal substeps of ≤ MAX_NAV_DT (each substep is still ≤ 1/30 s ⇒ identical
+## per-substep stability), capped at CosmosNav.COAST_CATCHUP_MAX seconds total per frame (anti-spiral: a catastrophic
+## multi-second hitch integrates at most that, bounding the substep count). A normal 60-fps frame (delta = 1/60 <
+## MAX_NAV_DT) is ONE substep of the full delta ⇒ byte-identical common case. Off ⇒ the shipped clamp-and-drop
+## behaviour verbatim (byte-identical). Gate G-COAST-FULLDT (verify_ocoast.gd): a fall integrated with one big dt
+## (chunked here) matches many small dts within tol — frame-dt-invariant trajectory.
+const FP_COAST_FULL_DT := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX (fix/voxiverse-coast-batch) — BATCH the coast substeps. RIDES WITH FP_COAST_FULL_DT
+## (it optimizes exactly that path). The shipped movers cover the full frame delta with N ≤ 30 substeps, but each
+## substep calls _coast_step / _coast_step_kepler, which RE-PROJECTS the whole state lattice↔BCI (lattice_to_world64
+## → fixed_to_bci → OrbitalState.make [a fresh ALLOCATION] → step → clamp → bci_to_fixed → world_to_lattice64) EVERY
+## time — so N substeps = N full re-projections + N allocations (the live fall's ~150 ms/frame, the last fall-perf
+## blocker: hovering at alt 701 ran 49 fps, falling through the SAME altitude 6 fps). With this flag ON the movers
+## convert lattice→BCI ONCE per frame, run the N cheap symplectic velocity-Verlet steps ENTIRELY in the BCI frame
+## (reusing ONE OrbitalState — zero per-substep allocation, zero per-substep lattice re-projection, clamp_bci_state
+## NaN/SOI guard preserved per step), then re-project BCI→lattice ONCE. The free-fall path becomes O(1) re-projections
+## + N cheap f64 integrator steps regardless of N. Off ⇒ the shipped per-substep chain verbatim (byte-identical). The
+## orbit coast (_coast_step_kepler carries the BCI [p,v] and never reads position back) is BIT-identical batched; the
+## free-fall coast (_coast_step reconstructs p from the f32 lattice `position` each substep) matches within the f32
+## round-trip tolerance (the batch is strictly MORE accurate — no per-substep f32 truncation). Gate G-COAST-BATCH
+## (verify_coast_batch.gd): trajectory-equivalence + exactly ONE lattice re-projection per frame regardless of N +
+## exactly ONE OrbitalState allocation per frame (vs N). Requires the coast path (FACETED + SN_DEVNAV/ORBIT_COAST/fall).
+const FP_COAST_BATCH := false
+
+## COSMOS-PERF FALL-COLLAPSE FIX (fix/voxiverse-freefall-rails, 2026-07-22) — CLOSED-FORM (RAILS) free-fall coast.
+## PROVEN root cause (live telemetry): DEV-FLY (thrust) is 60 fps at every altitude; the gravity FREE-FALL coast
+## is ~5 fps with `phys_ms` = 91.7 ms rendering the IDENTICAL scene ⇒ the collapse is PHYSICS, not rendering. The
+## free-fall integrates gravity with velocity-Verlet substeps: FP_COAST_FULL_DT wraps an OUTER coast-substep loop
+## (≤ 30, covering the full frame delta) around OrbitalState.step's INNER Verlet substep loop (≤ 8) — a dt-scaled
+## per-frame loop that spirals (slower frame → bigger delta → more substeps → slower). FP_COAST_BATCH removed the
+## per-substep re-projection/allocation but the Verlet substeps themselves remain and still spiral.
+##
+## With this flag ON the free-fall uses the SAME machinery that makes the ORBIT coast smooth: it carries the BCI
+## [p,v] and advances it each frame by ONE CLOSED-FORM universal-variable two-body step (CosmosNav.coast_kepler_bci
+## → OrbitalState.propagate_uv) over the whole (catch-up-capped) frame delta — O(1) per frame, ZERO substeps, no
+## time-dilation, and EXACT (better than Verlet). The universal-variable form handles the RADIAL (h≈0) degenerate
+## trajectory a classical Kepler-element propagation is singular on (SN_FOFF_RADIAL_FALL strips the tangential
+## velocity → a rectilinear fall); its Newton solve for the universal anomaly is a FIXED ≤ UV_ITER_MAX iterations
+## INDEPENDENT of dt/fps (not a dt-scaled substep count — that is the whole point). Composes with the radial-fall
+## seed, FP_LANDING_STREAM_KICK and the re-entry/landing path (same clamp_bci_state NaN/SOI guard, once per frame;
+## the lattice re-projection stays one per frame). Off ⇒ the shipped Verlet coast verbatim (byte-identical). Gate
+## G-FREEFALL-RAILS (verify_freefall_rails.gd): closed-form vs Verlet trajectory-equivalence over long radial AND
+## sub-orbital falls across varied frame dt + the O(1)-per-frame proof (one propagate, bounded dt-independent
+## iters, zero dt-scaled substeps, one lattice re-projection). Requires the fall path (FACETED + SN_NO_CEILING_BOUNCE).
+const FP_FREEFALL_RAILS := false
+
+## COSMOS-PERF FALL-ALTRATE (fix/voxiverse-fall-altrate) — the descent-rate-driven residue. LIVE (2026-07-22):
+## hovering at altitude = 49 fps, controlled descent = 26 fps, free-fall from orbit (~29 b/s) = 7 fps — fps is
+## monotone in |dAlt/dt|, NOT in the fall code path. Already ruled out (this session): the far-ring warm/re-emit
+## (FP_SHELL_FALL_HOLD holds it flat), the near field (FP_ALT_REGIME freezes it), the coast integrator
+## (FP_COAST_BATCH batched it — no fall-fps change). Headless timing PROVES the two GDScript suspects are
+## descent-INDEPENDENT: CosmosSky._update_sky ≈ 33 us/frame and WorldManager.update_streaming ≈ 2.7 us/frame,
+## FLAT across hover/slow/fast (probe_fall_altrate.gd). So the residue is NOT GDScript compute — it is the
+## RENDER-SERVER re-evaluation triggered by the handful of per-frame values that RAMP WITH ALTITUDE and are
+## re-written EVERY frame: the camera near/far planes + fog depth-end (CosmosScale ramp), the CosmosSky shader
+## uniforms + Environment writes, and the far-ring scaled placement transform. Each ramps proportionally to the
+## altitude delta, so during a fast descent they thrash the projection / fog / culling / big-mesh-AABB paths at
+## 60 Hz. These three flags THROTTLE those re-writes to a bounded rate DURING FAST VERTICAL MOTION only, holding
+## the last value (which converges to the exact value the instant vertical speed drops below the threshold —
+## FallThrottle.should_reapply returns true whenever the flag is off OR the motion is slow/steady). Independent,
+## each byte-identical off, GDScript-only, NEVER-OOM (no allocation, a few scalar state vars per consumer).
+## A/B each LIVE to isolate the winner. Gate G-FALL-ALTRATE (verify_fall_altrate.gd): byte-off identity + a
+## slow/steady state always re-applies (exact convergence) + the fast-motion re-apply rate is bounded and
+## independent of descent rate and frame rate.
+##
+## FP_FALL_CAMFAR_HOLD — hold the camera near/far planes (the altitude-ramped projection frustum) during a fast
+## descent (re-apply ≤ every FALL_THROTTLE_MS, or immediately when the far plane must GROW so the far ring is never
+## clipped on a climb). Predicted BIGGEST win (a per-frame far-plane ramp re-fits the render-server frustum / the
+## directional-shadow split range every frame). Off ⇒ apply_scaled_camera_planes writes every frame (byte-identical).
+## The fog depth-end ramp rides the same altitude signal but is written in the CosmosSky path ⇒ FP_FALL_ATMO_THROTTLE.
+const FP_FALL_CAMFAR_HOLD := false
+
+## FP_FALL_ATMO_THROTTLE — throttle the WHOLE CosmosSky per-frame recompute (_update_sky: the sun/moon/shell
+## uniforms + all the Environment fog/ambient/background writes) to ≤ 1/FALL_THROTTLE_MS during a fast descent,
+## holding the last uniforms (the sky is visually frozen for ≤ FALL_THROTTLE_MS while plummeting — imperceptible;
+## resumes per-frame the instant the descent slows). Off ⇒ _update_sky runs every frame (byte-identical).
+const FP_FALL_ATMO_THROTTLE := false
+
+## FP_FALL_RING_HOLD — hold the far-ring's per-frame SN3 scaled-placement transform (the 55k-triangle mesh's
+## scaled world transform, which changes the instance AABB → a culling-BVH re-insert every frame) during a fast
+## descent, re-applying ≤ every FALL_THROTTLE_MS. Off ⇒ apply_scaled_placement writes every frame (byte-identical).
+const FP_FALL_RING_HOLD := false
+
+## Shared FallThrottle tuning. FALL_THROTTLE_VSPEED = the radial (altitude) speed (blocks/s) above which a descent
+## counts as "fast" and the throttles engage — chosen below the live controlled-descent rate (fps already sags
+## there) and well above surface walk/jump radial jitter, so ground play never throttles. FALL_THROTTLE_MS = the
+## minimum wall-time between re-applies while fast (⇒ ≤ 1000/MS re-applies per second, INDEPENDENT of descent rate
+## and frame rate — the "bounded per-frame work" the gate asserts).
+const FALL_THROTTLE_VSPEED := 3.0
+const FALL_THROTTLE_MS := 100
+
+## COSMOS-PERF FALL-SCALE (fix/voxiverse-fall-scale, 2026-07-22) — the fall-from-orbit fps collapse re-bisected
+## after two decisive clues: (1) ORBIT at ~250 b/s tangential is SMOOTH but a fall at 7-29 b/s radial is 7 fps ⇒
+## the cost is ALTITUDE CHANGING, not camera speed; (2) the fall was smooth BEFORE the atmosphere/shader work and
+## degraded as it went in ⇒ the cost lives in the ATMOSPHERE SHELL, not the (older) scaled-body. Two default-OFF
+## bisect flags isolate the culprit LIVE on a fast fall (~29 b/s); both are byte-identical off, GDScript-only,
+## NEVER-OOM (a few scalar state vars), and MUST NOT touch the smooth constant-altitude orbit/hover (radial ≈ 0 ⇒
+## never engages ⇒ shipped every-frame path). Gate G-FALL-SCALE (verify_fall_scale.gd) drives the pure cores.
+
+## FP_FALL_SHELL_OFF (PRIME suspect) — the atmosphere shell (_atmo_shell, FP_ATMO_SHELL) is a planet-CENTRED
+## additive SphereMesh rendered `cull_front, blend_add, depth_draw_never, unshaded`: its transform NEVER changes
+## (it does not ride the scaled-body), but with no depth write there is NO early-Z rejection, so EVERY covered
+## fragment runs the full per-fragment optical-path (chord/transmittance) shader EVERY frame. Its cost is screen-
+## COVERAGE bound and balloons as the camera descends into the shell (a thin limb from orbit → the whole screen
+## once inside the shell). This flag HIDES the shell (_atmo_shell.visible=false + skips its uniform writes) while
+## |radial speed| > SHELL_OFF_VSPEED (a fall). If hiding it makes the fall smooth, the additive shell overdraw IS
+## the cost. Off ⇒ always visible (byte-identical). Orbit/hover hold altitude ⇒ radial ≈ 0 ⇒ shell stays visible.
+const FP_FALL_SHELL_OFF := false
+
+## Radial (altitude) speed (blocks/s) above which FP_FALL_SHELL_OFF counts the motion as a fall and hides the
+## shell. Chosen well below the slowest real fall (~7 b/s) and above orbit/hover radial jitter (≈ 0) so a
+## constant-altitude orbit NEVER hides the shell (byte-identical there) but any descent does.
+const SHELL_OFF_VSPEED := 1.0
+
+## FP_FALL_SCALE_FREEZE (SECONDARY — the scaled-body experiment) — freeze ALL the altitude-driven scaled-body
+## writes together (camera near/far planes + the far-ring scale-about-camera transform) during a fast radial
+## fall, quantized to altitude BANDS: re-apply ONLY when the camera→body-centre distance crosses a FALL_FREEZE_BAND
+## edge (vs every frame). One flag covering BOTH writes ⇒ an unambiguous combined A/B (unlike the 3 time-throttle
+## flags). Off ⇒ every-frame writes (byte-identical). Slow/steady (orbit/hover, radial ≤ FALL_THROTTLE_VSPEED) ⇒
+## always re-applies the EXACT value ⇒ converges instantly + leaves the smooth orbit byte-identical. Sub-flags
+## FP_FALL_FREEZE_CAM / FP_FALL_FREEZE_RING select WHICH write participates so the winning half can be isolated
+## (set one false ⇒ that write stays every-frame while the other is banded). NOTE: the far-ring scale is s == 1
+## below H_ENGAGE (≈ 12.5 k blocks) so its placement is already constant during a low fall — freezing the RING is
+## predicted to be a no-op there; the camera planes are the only scaled-body value that differs orbit-vs-fall.
+const FP_FALL_SCALE_FREEZE := false
+const FP_FALL_FREEZE_CAM := true      # the camera near/far write participates in the freeze (set false to leave it every-frame)
+const FP_FALL_FREEZE_RING := true     # the far-ring scale-about-camera write participates in the freeze (set false to leave it every-frame)
+
+## The altitude-band width (blocks) for FP_FALL_SCALE_FREEZE. During a fast fall the scaled-body writes re-apply
+## once per band crossed (⇒ re-apply COUNT ∝ altitude traversed / BAND, INDEPENDENT of frame rate). Small enough
+## that the per-band step in the camera far-plane / ring scale is imperceptible (below ~3.5 k alt the far plane is
+## pinned at FAR_MIN and the ring scale is 1, so a band is a literal no-op there; higher up the step is < 0.3%).
+const FALL_FREEZE_BAND := 48.0
+
+## COSMOS-PERF FALL-TIMING (fix/voxiverse-fall-timing, 2026-07-22) — a DIAGNOSTIC INSTRUMENT (not a fix). A browser
+## profile proved the free-fall (dev_nav off, gravity coast) 5-fps collapse is game CPU, not GPU, but the WASM is
+## unsymbolicated so the hot segment is unnamed. FP_FALL_TIMING wraps every major per-(physics/process)-frame work
+## segment in Time.get_ticks_usec() deltas — RELIABLE within a single frame (no rAF/vsync wait, unlike the
+## TIME_PROCESS-family proc_ms/phys_ms which read the whole-frame period on threaded web) — and publishes the
+## per-segment window-MAX µs in the telemetry (t_move_us / t_coast_us / t_stream_us / t_nav_us / t_att_us /
+## t_pushbodies_us / t_aim_us in player._physics_process+_free_fall_move; t_scaledbody_us / t_farring_us in
+## main._process; t_sky_us in CosmosSky._process), plus n_coast_calls (coast-integrator substeps/frame — catches a
+## runaway inner loop). Bake it ON, drive a fall, read which segment is the hundreds-of-µs→ms cost, then dispatch
+## the real fix there. Off ⇒ NO timer calls, the accumulator dict stays empty ⇒ fall_timing() returns {} ⇒ NO
+## telemetry keys added (byte-identical). NEVER-OOM: a fixed handful of int-keyed maxima, cleared every telemetry
+## window. Gate G-FALL-TIMING (verify_fall_timing.gd): byte-off default + the plumbing populates/clears the keys.
+const FP_FALL_TIMING := false
+
+## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY
+## free-fall frame; at high altitude the near field is ALT_REGIME-frozen so the floor query hits a slow regenerate
+## path (~86-175 ms/frame — the entire fall collapse, proven by t_att_us telemetry). Dev-fly is smooth because
+## flying==true skips it. Gate: above FALL_ATT_GATE_Y (far above any terrain+datum) ground contact is impossible,
+## so skip the floor query; below it (near the surface, near field resident ⇒ floor_under cheap) it runs as shipped.
+## Default OFF ⇒ byte-identical (the every-frame floor query, unchanged).
+const FP_FALL_ATT_GATE := false
+const FALL_ATT_GATE_Y := 200.0   # lattice-y above which the ground-contact floor query is skipped (no terrain reaches this)
+
+## COSMOS-PERF FALL — THE root-cause fix (supersedes the FP_FALL_ATT_GATE band-aid; they COMPOSE). floor_under()
+## scans DOWN cell-by-cell FROM THE FEET, so its cost = (feet_y − floor_y) cell queries. Walking (feet≈floor) is
+## ~1-2 cells (cheap); a FALL FROM ALTITUDE (feet≈R+900) is ~900 cell_value_at queries PER CALL (~86 ms/frame — the
+## fall-fps collapse; the "bounded by fall distance — cheap" comment was FALSE for a fall from orbit). t_att_us
+## (the _attitude caller, now also FALL_ATT_GATE-skipped) AND t_move_us (the surface-fall/collision caller, still
+## spiking below the att gate) both hit it. FIX: make the scan O(bounded) regardless of altitude WITHOUT moving the
+## floor the player stands on. floor_under first probes MARGIN cells DOWN from the feet (near-surface: the floor is
+## in the first 1-2 → the shipped scan verbatim, BIT-IDENTICAL walking/standing/landing); if that finds no floor the
+## feet are far above everything near them, so the scan JUMPS to a cheap CEILING on the highest solid cell —
+## max(col_height + MARGIN, placed_top + 1): col_height is the procedural heightmap top (a direct query — NO scan,
+## covers terrain + trees ≤14 above surface with MARGIN headroom), placed_top is the O(1) per-column high-water of
+## PLAYER-PLACED cells (so a tower rising above the heightmap+MARGIN is covered EXACTLY) — and continues normally
+## down to the real floor. The jump lands just above the true floor, so it returns the SAME floor the shipped scan
+## would (bit-identical), in ≤ ~MARGIN cells instead of ∝ altitude. Reuses the existing `_placed_top` index (zero
+## new memory — NEVER-OOM). Default OFF ⇒ the shipped from-feet unbounded scan verbatim (byte-identical). Gate
+## G-FLOOR-BOUNDED (verify_floor_bounded.gd): EQUIVALENCE (across terrain/trees/towers/water/datum, feet near AND
+## far ⇒ bit-identical) + BOUNDED (feet far above ⇒ scan iters ≤ ~2·MARGIN, INDEPENDENT of feet altitude).
+const FP_FLOOR_BOUNDED := false
+const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jumping to the cheap surface estimate
+
+## COSMOS-PERF FALL — the RE-ENTRY residual (composes on FP_FLOOR_BOUNDED; inert unless it is also on). FP_FLOOR_BOUNDED
+## capped floor_under's scan COUNT at ~MARGIN, but the per-frame _move landing query still ran ~MARGIN cell_value_at
+## calls EVERY frame during atmosphere re-entry (~380→100), and there the near field is FP_ALT_REGIME-frozen so each
+## of those calls hits the COLD C++ generator (~0.15 ms each ⇒ 13-38 ms/frame = t_move_us, a ~1.5 s dip at 10-34 fps)
+## until the streamer refills. FP_FLOOR_MEMO memoizes, per WINDOW column, the CELL index of the TOPMOST solid-with-
+## air-above (`_floor_top`). Nothing solid exists above that cell (proof: if it did, the highest such solid would be a
+## higher solid-with-air-above), so when the feet are AT/ABOVE the cached cell a scan from the feet reaches it through
+## air alone — floor_under jumps STRAIGHT there (O(1): 2 cell reads) instead of scanning the whole gap. The cache is
+## POPULATED only from the FP_FLOOR_BOUNDED jump branch, whose scan provably starts above ALL solids, so the first
+## floor it finds IS the column's topmost surface. During a near-vertical fall the player's (x,z) is ~constant, so the
+## expensive scan runs ONCE per column and every later frame is O(1) — the storm collapses to a single hitch/column.
+## Bit-identical: a hit recomputes the SAME return (`float(y*) + span(y*,fx,fz).y + s`) the shipped scan would (the
+## skipped cells are all air ⇒ no floor). INVALIDATED at the same choke points the edit indices use — `_write_cell` /
+## `sim_revert_cell` erase the column (break/place/snow/collapse stay exact), a crossing/flip clears it
+## (`_rebuild_window_indices`), an origin shift re-keys it (`_shift_window_bookkeeping`); generated terrain never
+## changes and the datum shifts the boundary not the content, so a cell index needs no other invalidation. NEVER-OOM:
+## `_floor_top` is capped at FLOOR_MEMO_CAP columns and cleared wholesale on overflow (a clear just forces recompute).
+## Default OFF ⇒ no cache read/write ⇒ FP_FLOOR_BOUNDED behaviour verbatim (byte-identical). Gate G-FLOOR-BOUNDED
+## (verify_floor_bounded.gd): MEMO equivalence (hits bit-identical to the reference), invalidation (an edit moves the
+## floor and the memo follows), and O(1)-per-column (a repeated fall column caches after one scan).
+const FP_FLOOR_MEMO := false
+const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
@@ -524,6 +1569,40 @@ const BODY_R := {
 	"mercury": 2440,
 	"moon": 1737,
 }
+
+## COSMOS-ORBITAL-O1O4 §3.1 (Part B, O4) — the WALKABLE-MOON master toggle. When true, FacetAtlas.warm_up
+## APPENDS the Moon's 6·14² = 1176 facets into the global fid namespace (Earth fids 0..3455 at base 0 stay
+## BIT-UNCHANGED; Moon fids at base 3456) and TerrainConfig.facet_profile dispatches Moon fids to the airless
+## moon worldgen. Default FALSE ⇒ ONLY Earth rows exist — facet_count/memory/terrain-hash are BYTE-IDENTICAL
+## to the pre-refactor tree (the G-O4-OFF / G-O4-EQ keystone). Flipped ON (sed-toggled) only by the multibody
+## gate + the future O4c SOI/landing wiring; the Moon soaks DARK (unreachable in-game) until then.
+const MULTI_BODY := false
+
+## COSMOS-ORBITAL-O1O4 §3.5 / SPACE-NAV SN6c (Part B, O4c) — the SOI-swap + walkable-Moon LANDING master toggle.
+## MULTI_BODY builds the Moon atlas DARK (unreachable); SOI_SWAP is what makes the Moon a REAL destination —
+## the dominant gravitational body switches Earth↔Moon at the sphere-of-influence boundary, the player's local
+## dynamics (spin frame, GM_dyn, feel-gravity, drag) re-express around whichever body owns the deepest SOI,
+## and walking/landing read that body's terrain. It is the ONE flag `player._dominant_body()` consults: OFF ⇒
+## `_dominant_body()` returns "earth" unconditionally, so EVERY generalized "earth"→_dominant_body() call site
+## resolves to the shipped literal and the walk/nav/coast paths are BYTE-IDENTICAL to Earth-only (the G-O4C-OFF
+## keystone). Requires MULTI_BODY (the Moon facets must exist) — asserted lazily by _dominant_body only ever
+## returning a body that FacetAtlas registered. Gates G-SOI-SWAP / G-MOON-LAND / G-MOON-WALK (verify_o4c).
+## LIVE-ONLY residue: actually flying a transfer to + landing on + walking the Moon (the coast-to-SOI integration
+## across 384 k blocks is a real fly, not headless-provable) — baked ON only after MULTI_BODY + a live round trip.
+const SOI_SWAP := false
+
+## SPACE-NAV §5.2 — the ±band on the SOI boundary for the dominant-body swap hysteresis (fractional). A craft on a
+## grazing trajectory must cross INTO a body's SOI below r_soi·(1−SOI_HYST) to be captured and back OUT above
+## r_soi·(1+SOI_HYST) to be released — so it cannot flap bodies at the boundary. 2 % per the design. Data.
+const SOI_HYST := 0.02
+
+## SPACE-NAV §8.3 / D-O4-5 — the re-entry pre-warm altitude (blocks) is PER-BODY: an ATMOSPHERE-LESS body has no
+## terminal-velocity drag cap, so a ballistic descent arrives 2–3× faster than Earth's braked re-entry and needs a
+## deeper pool pre-warm to keep streaming ahead of the lander (≥ 24 s at ~170 b/s). Airless ⇒ 4096; Earth (drag-
+## capped) keeps the shipped ORBIT_PREWARM_H. Pure per-body accessor. Earth is the ONLY atmosphere body
+## (mirrors OrbitalState.has_atmo — inlined here to keep this core file free of a cosmos-kernel preload cycle).
+static func orbit_prewarm_h(body: String) -> float:
+	return ORBIT_PREWARM_H if body == "earth" else 4096.0
 
 # ---------------------------------------------------------------------------------------
 # COSMOS M1 — the single, easily-flippable planet toggle (docs/COSMOS-PLANET-TOPOLOGY.md §9 M1,

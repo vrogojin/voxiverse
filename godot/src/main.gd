@@ -14,6 +14,17 @@ var _player: Player
 var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _cosmos_sky: CosmosSky = null
 
+# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): the cloud mesher node, held so the per-frame Sun direction can be forwarded
+# into its near-field daylight material twin (main._process). Null unless the cloud flags built it (byte-identical).
+var _clouds: CloudLayers = null
+
+# COSMOS-PERF FALL-SCALE (FP_FALL_SCALE_FREEZE): band state for the altitude-driven scaled-body writes. _fs_prev_d/
+# _usec derive the radial speed; _fs_last_d is the distance at the last re-apply (band anchor). −1 sentinels ⇒ the
+# first frame always re-applies. DEAD off the flag (never sampled ⇒ byte-identical shipped every-frame writes).
+var _fs_prev_d := -1.0
+var _fs_prev_usec := -1
+var _fs_last_d := -1.0
+
 func _ready() -> void:
 	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
 	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
@@ -69,19 +80,53 @@ func _ready() -> void:
 	hud.player = player
 	add_child(hud)
 
+	# SN-FIX #1 (docs/COSMOS-SPACE-NAV-DESIGN.md; live pilot request 2026-07-18): the NAV readout — lattice
+	# position + radial altitude + nav-mode name. Behind SN_HUD_NAV (default OFF → no node is created and the
+	# shipped HUD stack is byte-identical). Additive, read-only.
+	if CubeSphere.SN_HUD_NAV:
+		var nav_hud := NavHUD.new()
+		nav_hud.name = "NavHUD"
+		nav_hud.player = player
+		add_child(nav_hud)
+
 	# COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0): the living sky. Behind
 	# CubeSphere.ORBITAL_SKY (default OFF → this block is skipped and the shipped flat-ambient
 	# environment above is byte-identical). When on, CosmosSky OWNS/overrides the environment ramp
 	# (day-night), placing the Sun light + Sun/Moon impostors + star dome from the pure ephemeris; the
 	# clock is advanced in _process (below). The player is the parallax-free camera provider.
-	if CubeSphere.ORBITAL_SKY:
+	# CLIMATE W0/W1 (FP_SEASONS / FP_CLIMATE_GRID) also need the celestial clock (subsolar latitude +
+	# insolation game-time), so build it whenever ANY of them is on; the Sun/Moon/sky nodes stay
+	# ORBITAL_SKY-only. The clock is injected into the WorldManager so the weather grid can read game-time.
+	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS or CubeSphere.FP_CLIMATE_GRID:
 		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
+		world.set_cosmos_clock(_cosmos_clock)
+	if CubeSphere.ORBITAL_SKY:
 		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
 		var env: Environment = we.environment if we != null else null
 		_cosmos_sky = CosmosSky.new()
 		_cosmos_sky.name = "CosmosSky"
 		add_child(_cosmos_sky)
 		_cosmos_sky.setup(_cosmos_clock, env, player)
+
+	# CLIMATE W2 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §4): the 3-layer cloud mesher, a read-only view of the
+	# weather grid (rule 2). Built only under BOTH flags (it reads the grid's cloud water); default OFF ⇒ no
+	# node ⇒ byte-identical. The player is the camera provider; PerVoxelEnvironment is the grid read interface.
+	if CubeSphere.FP_CLOUDS and CubeSphere.FP_CLIMATE_GRID:
+		var clouds := CloudLayers.new()
+		clouds.name = "CloudLayers"
+		add_child(clouds)
+		clouds.setup(world.environment, player)
+		_clouds = clouds
+
+	# CLIMATE W3 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §5): precipitation particles + fog, a read-only view of
+	# the grid (rule 2). Built only under both flags; default OFF ⇒ no node ⇒ byte-identical. The Environment
+	# (from the WorldEnvironment stub) is driven for fog; the player is the camera provider.
+	if CubeSphere.FP_PRECIP and CubeSphere.FP_CLIMATE_GRID:
+		var we2 := get_node_or_null("WorldEnvironment") as WorldEnvironment
+		var fx := WeatherFX.new()
+		fx.name = "WeatherFX"
+		add_child(fx)
+		fx.setup(world.environment, we2.environment if we2 != null else null, player)
 
 	# Diagnostic perf overlay (top-right): FPS/min-FPS, proc+phys ms, draw calls/primitives,
 	# video mem, and godot_voxel worker/pool counts — so the COSMOS curved demos can be measured
@@ -150,6 +195,80 @@ func _process(_delta: float) -> void:
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
 	if _cosmos_clock != null:
 		_cosmos_clock.advance(_delta)
+		# CLIMATE W0 (§3): publish the current subsolar sin-latitude once per frame (main thread) so the
+		# sim-layer season offset (PerVoxelEnvironment / SnowfallSystem) tracks the seasons. Flag-off ⇒ never
+		# written ⇒ stays 0 ⇒ zero seasonal offset (byte-identical). Pure ephemeris read, no allocation.
+		if CubeSphere.FP_SEASONS:
+			ClimateModel.current_sin_delta = sin(CosmosEphemeris.subsolar_latitude(_cosmos_clock.now()))
+	# COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§9): drive the far-ring emitted set from the
+	# CAMERA radial direction + arm the one-shot prewarm. The FACETED production game ships FLAT_WORLD=true and RETURNS
+	# below, so — exactly like the sky clock above — this MUST run BEFORE that early-return or the driver is DEAD (the
+	# live far-side-blank bug: the hook used to sit after the return → update_shell_camera_set was never called →
+	# shell_telemetry() came back {} every frame). Gated on the shell flags + FACETED (flag-off ⇒ never called ⇒
+	# byte-identical); _player-null-guarded. At the user's low orbit the shipped faceted far plane (9000) already
+	# reaches the far-ring limb √(d²−R²), so this driver-move alone renders the far side; the SN3 scaled-body ramp
+	# (also stranded below the return) is only needed above h≈6.4k and is a separate FP_SCALED_BODY pass.
+	if _player != null and (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
+		_player.world.update_shell_camera_set(_player.camera_global_transform().origin)
+	# COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the sky's current Sun direction into the far-ring shell
+	# tint shader so the space-side terminator band tracks the same Sun as the ground ramp. Gated on the flag +
+	# a live sky; the WorldManager/ring setters self-guard, so flag-off is byte-identical (never called).
+	if _player != null and _cosmos_sky != null and CubeSphere.SHELL_TERMINATOR_TINT and CubeSphere.FACETED:
+		_player.world.set_far_ring_sun_dir(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO-SKY A5 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C2): forward the Sun direction + the scaled planet
+	# render centre into the far-ring shell v2 shader (absolute self-shaded globe). Same forwarding discipline as
+	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_SHELL_ABSOLUTE and CubeSphere.FACETED:
+		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the Sun direction into the near-field daylight material twin so
+	# the near ground darkens with the same absolute day/night as the far shell (kills the near/far night split).
+	# Same forwarding discipline; the WorldManager/module/atlas setters self-guard ⇒ flag-off is byte-identical.
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_NEAR_DAYLIGHT:
+		_player.world.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
+		# The clouds are a sibling node (not under the WorldManager), so forward the Sun straight into their
+		# daylight twin — clouds read moonlit/dark at night like the ground. Self-guards ⇒ flag-off byte-identical.
+		if _clouds != null:
+			_clouds.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
+	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
+	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
+	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),
+	# the same stranded-driver class as the shell-driver fix (0b2a934). Camera near/far ramp with altitude + the
+	# far ring gets its distance clamp, un-clipping the planet from altitude/deep space. Gated on FP_SN3_MAIN_LIVE
+	# ⇒ flag-off is byte-identical (never runs; the legacy block below is untouched and stays dead in faceted).
+	# The A0/legacy blocks are mutually exclusive by the FLAT⇔FACETED coupling, so there is no double-drive.
+	if _player != null and CubeSphere.FP_SN3_MAIN_LIVE and CosmosScale.on() and CubeSphere.FACETED:
+		var a0_cam := _player.camera_global_transform().origin
+		var a0_d := a0_cam.distance_to(_player.world.planet_render_centre())
+		# COSMOS-PERF FALL-SCALE (FP_FALL_SCALE_FREEZE): ONE band decision covering BOTH altitude-driven scaled-body
+		# writes (camera near/far + far-ring scale-about-camera). Off ⇒ reapply stays true ⇒ both write every frame
+		# (byte-identical). On + fast fall ⇒ re-apply only when altitude crosses a FALL_FREEZE_BAND edge. Slow/steady
+		# (orbit/hover, radial ≤ threshold) ⇒ always true ⇒ exact value every frame (byte-identical to the shipped
+		# orbit). Sub-flags gate WHICH write is frozen so the winning half can be A/B-isolated.
+		var reapply := true
+		if CubeSphere.FP_FALL_SCALE_FREEZE:
+			var fs_usec := Time.get_ticks_usec()
+			var fs_v := 0.0
+			if _fs_prev_usec >= 0:
+				fs_v = FallThrottle.radial_speed(_fs_prev_d, a0_d, float(fs_usec - _fs_prev_usec) / 1.0e6)
+			_fs_prev_d = a0_d
+			_fs_prev_usec = fs_usec
+			reapply = FallThrottle.should_reapply_band(true, fs_v, a0_d, _fs_last_d, CubeSphere.FALL_FREEZE_BAND)
+			if reapply:
+				_fs_last_d = a0_d
+		var freeze := CubeSphere.FP_FALL_SCALE_FREEZE
+		# FP_FALL_TIMING: time the two altitude-driven scaled-body writes separately (camera near/far frustum re-fit
+		# vs the far-ring scale-about-camera placement — the AABB culling-BVH re-insert). Pushed into the player's
+		# fall-timing dict so they ride out through fall_timing(). Off ⇒ the flag test only (byte-identical).
+		var _ft_on := CubeSphere.FP_FALL_TIMING
+		var _ft_t := 0
+		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_CAM):
+			if _ft_on: _ft_t = Time.get_ticks_usec()
+			_player.apply_scaled_camera_planes(a0_d - FacetAtlas.R_BLOCKS, a0_d)
+			if _ft_on: _player.ft_record("t_scaledbody_us", Time.get_ticks_usec() - _ft_t)
+		if reapply or not (freeze and CubeSphere.FP_FALL_FREEZE_RING):
+			if _ft_on: _ft_t = Time.get_ticks_usec()
+			_player.world.apply_scaled_body(a0_cam)
+			if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
 	if CubeSphere.FLAT_WORLD or _player == null:
 		return
 	var cam := _player.camera_global_transform().origin
@@ -166,6 +285,25 @@ func _process(_delta: float) -> void:
 			_player.world.m5_epoch_camera(_player.global_position, _player.window_camera_transform()))
 	else:
 		CosmosBend.set_camera(cam)                     # near field: the camera-centred bend (R1, bend path)
+
+	# SPACE-NAV SN3 (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §5.2-5.4): border continuity. Ramp the camera near/far
+	# with altitude and place the far ring under the angular-size-preserving distance clamp, so the atmosphere↔
+	# space border and the climb to orbit render with NO pop. Below D_ENGAGE the clamp scale is exactly 1 (near
+	# regime byte-identical). DEAD with FP_SCALED_BODY off. Independent of the camera-write above (near/far are
+	# separate properties from the camera transform), so it composes with the M5_REAL / bend paths untouched.
+	if CosmosScale.on() and CubeSphere.FACETED:
+		var centre := _player.world.planet_render_centre()
+		var d := cam.distance_to(centre)
+		# FP_FALL_TIMING: same scaled-body split as the A0 block above (this legacy path runs only when NOT FLAT_WORLD;
+		# the production faceted game returns before here — instrumented for completeness). Off ⇒ flag test only.
+		var _ft_on := CubeSphere.FP_FALL_TIMING
+		var _ft_t := 0
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_player.apply_scaled_camera_planes(d - FacetAtlas.R_BLOCKS, d)
+		if _ft_on: _player.ft_record("t_scaledbody_us", Time.get_ticks_usec() - _ft_t)
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_player.world.apply_scaled_body(cam)
+		if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

@@ -190,6 +190,12 @@ var _link_open := false             # last emitted link_state (so we emit only o
 var _auto_frames_enabled := true
 var _last_window_worst_ms := 0.0
 
+# DEV-SNAPSHOT (user-triggered F8, RemoteBridgeActivator): a monotonically-incrementing counter stamped into
+# each user_snapshot telemetry event, so the agent can correlate "the user just asked me to look" against the
+# refreshed frame-latest.jpg. Only ever touched on the keypress path (rare, user-initiated) — zero per-frame
+# cost, no ambient _capturing/worker state shared, byte-identical stream until the user actually presses F8.
+var _snap_n := 0
+
 # ── P2 control state (all inert while CONTROL_ENABLED is false — never touched on the Phase-1 path) ──
 var _control_state := "none"        # none | granted
 var _grant_id := ""                 # game-generated random id echoed on cmd_ack (binds results to this consent)
@@ -935,6 +941,39 @@ func _send_frame_jpg(jpg: PackedByteArray) -> void:
 		var packet := PackedByteArray([FRAME_TAG])
 		packet.append_array(jpg)
 		_ws.send(packet)
+
+
+## DEV-SNAPSHOT (user-triggered): the user pressed F8 (RemoteBridgeActivator) to say "look at exactly what I
+## see right now — there's a rendering artifact here". Unlike the ambient stream (downscaled, 0.5 fps, threaded),
+## this is a DELIBERATE, RARE, FULL-RESOLUTION grab so the artifact reads clearly. Self-contained: a fresh
+## viewport readback + full-res 0.9-quality JPEG encoded inline (no ambient _capturing/worker state touched),
+## sent over the EXISTING FRAME_TAG path (relay refreshes frame-latest.jpg + the frames/ ring — no relay change),
+## then a {"ev":"user_snapshot"} telemetry event AFTER the frame so the agent knows a deliberate shot just landed.
+## No-op (returns false) unless the socket is OPEN and auth_ok'd. One await frame_post_draw makes the readback
+## valid without disturbing the ambient state machine; the encode reuses _encode_shot's 2 MiB-safe stepping.
+func capture_user_snapshot() -> bool:
+	if _ws == null or not _authed or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return false
+	await RenderingServer.frame_post_draw            # ensure the current frame is drawn before the readback
+	if _ws == null or not is_inside_tree() or not _authed or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return false
+	var img := _grab_viewport_image()                # viewport ONLY — the game canvas, never the screen
+	if img == null:
+		return false
+	var jpg := _encode_shot(img)                     # full-res @ SHOT_JPG_QUALITY (0.9), capped < relay maxPayload
+	if jpg.size() == 0:
+		return false
+	_send_frame_jpg(jpg)                             # FRAME_TAG → relay writes frame-latest.jpg + frames/ ring
+	_snap_n += 1
+	# Emit AFTER the frame so frame-latest.jpg is already the deliberate shot when this event is read.
+	_send_text_guarded({
+		"type": "user_snapshot", "ev": "user_snapshot",
+		"n": _snap_n,
+		"t": Time.get_unix_time_from_system(),
+		"w": img.get_width(), "h": img.get_height(),   # _encode_shot may have downscaled to fit the cap → true sent dims
+		"bytes": jpg.size(),
+	})
+	return true
 
 
 ## Phase-1 auth handshake (extracted so the inbound loop reads cleanly). Only a real {"type":"auth_ok"}

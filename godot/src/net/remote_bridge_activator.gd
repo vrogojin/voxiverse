@@ -28,6 +28,12 @@ extends Node
 # binding uses it). Change here if a conflict ever surfaces.
 const CHORD_KEY := KEY_F9
 
+# DEV-SNAPSHOT hotkey: a SINGLE key (F8) that, while the bridge is live+authed, uploads a full-resolution grab of
+# the CURRENT frame to the relay so the agent can see exactly what the user is looking at (to point out a rendering
+# artifact). Single key (no chord) — F8 is free in major browsers and is NOT a game bind (unlike Ctrl+Shift+F9's
+# toggle). Event-driven only: consumed ONLY when the bridge is live, otherwise it falls through byte-identically.
+const SNAP_KEY := KEY_F8
+
 var world: Node = null
 var player: Node3D = null
 var _preset_token := ""              # URL-param/env token captured at boot (may be "")
@@ -82,6 +88,14 @@ func _unhandled_key_input(event: InputEvent) -> void:
 			_bridge.revoke_control()
 			_clear_unattended()               # Esc CLEARS the persistent unattended grant (hard, §6.6)
 			return
+	# ── DEV-SNAPSHOT (F8): only meaningful when the bridge is actually live+authed. Consumed ONLY then, so
+	# with the bridge inactive F8 is byte-identically untouched (no game/browser bind uses it either). ──
+	if k.keycode == SNAP_KEY and not k.ctrl_pressed and not k.shift_pressed and not k.alt_pressed and not k.meta_pressed \
+			and is_instance_valid(_bridge) and _live:
+		get_viewport().set_input_as_handled()
+		_bridge.capture_user_snapshot()
+		_flash_snapshot_sent()
+		return
 	if k.keycode == CHORD_KEY and k.ctrl_pressed and k.shift_pressed and not k.alt_pressed and not k.meta_pressed:
 		get_viewport().set_input_as_handled()
 		_toggle()
@@ -222,6 +236,41 @@ func _refresh_badge() -> void:
 func _hide_badge() -> void:
 	if _badge != null:
 		_badge.visible = false
+
+
+## DEV-SNAPSHOT feedback: a brief (~1 s) "Snapshot sent" flash so the user knows F8 worked. Self-contained
+## transient CanvasLayer (mirrors the badge's label/stylebox pattern) that queue_free()s itself after 1 s — it
+## deliberately does NOT touch the persistent live badge. Built only on an actual F8 press, so it costs nothing
+## until used. Layer 205 sits just above the badge (200) and below the token prompt/consent modal (210/220).
+func _flash_snapshot_sent() -> void:
+	var flash := CanvasLayer.new()
+	flash.layer = 205
+	add_child(flash)
+	var panel := PanelContainer.new()
+	panel.anchor_left = 0.5
+	panel.anchor_right = 0.5
+	panel.anchor_top = 1.0
+	panel.anchor_bottom = 1.0
+	panel.offset_top = -64.0
+	panel.offset_bottom = -36.0
+	panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	panel.grow_vertical = Control.GROW_DIRECTION_BEGIN
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.06, 0.34, 0.12, 0.86)      # green = "sent OK", distinct from the red live badge
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(8.0)
+	panel.add_theme_stylebox_override("panel", sb)
+	flash.add_child(panel)
+	var lbl := Label.new()
+	lbl.text = "● Snapshot sent"
+	lbl.add_theme_font_size_override("font_size", 16)
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	panel.add_child(lbl)
+	var t := get_tree().create_timer(1.0)
+	t.timeout.connect(func() -> void:
+		if is_instance_valid(flash):
+			flash.queue_free())
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════

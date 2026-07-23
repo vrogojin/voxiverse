@@ -2862,6 +2862,14 @@ func load_region(region_key: int, chunk: ZoneChunk, resolver: Callable = Callabl
 		var wxy := _chart.window_of(gi, gj)
 		var win := Vector3i(wxy.x, gr, wxy.y)
 		_write_cell(win, packed, chunk.meta_at(idx))
+		# Defensive (FP_FLOOR_BOUNDED landmine): unlike place_block, this restore path never raised the
+		# per-column PLACED high-water mark, so a restored tower would be INVISIBLE to `ceil_est`/`_attitude_
+		# ground_contact` (a wrong-floor / suppressed-recovery bug the moment either flag consults `_placed_top`).
+		# Mirror place_block for every restored non-air cell. Cheap; no effect on the value-only round-trip gate.
+		if id > BlockCatalog.AIR:
+			var pkey := Vector2i(win.x, win.z)
+			if win.y > int(_placed_top.get(pkey, -0x40000000)):
+				_placed_top[pkey] = win.y
 
 # --- tier-3 persistence: ZoneChunk save/load (VOXEL-DATA-STRUCTURE §4/§5) -------
 # The generated world is a pure function (tier 2) and is NEVER serialized; only the edit
@@ -2936,7 +2944,14 @@ func load_edits(region_origin: Vector3i, chunk: ZoneChunk, resolver: Callable = 
 				% [name, ZoneChunk.PLACEHOLDER_MATERIAL])
 		var packed := CellCodec.pack(id, chunk.modifier_at(idx), chunk.state_at(idx))
 		var local := ZoneChunk.from_local_index(idx)
-		_write_cell(region_origin + local, packed, chunk.meta_at(idx))
+		var wcell := region_origin + local
+		_write_cell(wcell, packed, chunk.meta_at(idx))
+		# Defensive (FP_FLOOR_BOUNDED landmine): mirror place_block's PLACED high-water update so a restored
+		# tower is visible to `ceil_est`/`_attitude_ground_contact`. See load_region for the full rationale.
+		if id > BlockCatalog.AIR:
+			var pkey := Vector2i(wcell.x, wcell.z)
+			if wcell.y > int(_placed_top.get(pkey, -0x40000000)):
+				_placed_top[pkey] = wcell.y
 
 static func _in_region(cell: Vector3i, origin: Vector3i, s: int) -> bool:
 	return cell.x >= origin.x and cell.x < origin.x + s \
@@ -3223,13 +3238,23 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	# seafloor, while a solid cell yields its filled interval — the floor is the top of
 	# the first occupied cell that has an empty span directly above (its top = span.y;
 	# 1.0 for a full cube ⇒ float(y+1), byte-identical to the old solid/air-above test).
+	# COSMOS-PERF FALL (FP_FLOOR_MEMO) footprint-safety: `populate` is only true when the scan jumped to
+	# `ceil_est` — a footprint-INDEPENDENT ceiling above EVERY solid in the column — so the descent passes
+	# through the whole air gap first. `memo_safe` stays true only while every above-floor cell is plain
+	# (footprint-independent) air; a shaped/ramp/seam cell (solid material but empty span at THIS footprint)
+	# flips it false, because at another footprint that cell could BE the floor. We then cache only when the
+	# found floor is itself a plain full cube — guaranteeing a HIT reproduces this floor at ANY footprint.
+	var memo_safe := true
 	while y > -1024:
 		_floor_scan_iters += 1
-		var here := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
+		var v_here := cell_value_at(Vector3i(xi, y, zi))
+		var here := _occ_span(v_here, fx, fz)
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
-			if populate:
+			if populate and memo_safe and _span_indep_full(v_here):
 				_floor_memo_put(Vector2i(xi, zi), y)
 			return float(y) + here.y + s
+		if populate and not _span_indep_empty(v_here):
+			memo_safe = false          # a footprint-DEPENDENT cell sits above the floor → unsafe to cache this column
 		y -= 1
 	return float(effective_height(xi, zi) + 1) + s
 
@@ -3239,6 +3264,19 @@ func _floor_memo_put(col: Vector2i, top_y: int) -> void:
 	if _floor_top.size() >= CubeSphere.FLOOR_MEMO_CAP and not _floor_top.has(col):
 		_floor_top.clear()
 	_floor_top[col] = top_y
+
+## FP_FLOOR_MEMO footprint-safety predicates. `floor_under`'s memo caches a column's floor by CELL index only,
+## but `_occ_span` varies WITHIN a cell for shaped terrain — a ramp/slab/junction cell (SUB-VOXEL-SMOOTHING,
+## default on) is solid at one in-cell footprint and air at another, and snow raises the top by a footprint-
+## dependent amount. A column is safe to memoize ONLY when its topmost floor is a PLAIN FULL CUBE (span (0,1)
+## for EVERY footprint) and every cell above it is PLAIN air (span ZERO for every footprint); then a cache HIT
+## jumps to that cell and the tail scan reproduces the SAME floor at ANY footprint (no shaped cell above can
+## become the real, higher floor at a different footprint). Any nonzero shape modifier or snow fill makes the
+## span footprint-DEPENDENT, so such a column is excluded and falls back to the (always-correct) bounded scan.
+func _span_indep_full(v: int) -> bool:
+	return BlockCatalog.solidity_of(CellCodec.mat(v)) >= 0.5 and CellCodec.modifier(v) == 0 and CellCodec.snow_fill(v) == 0
+func _span_indep_empty(v: int) -> bool:
+	return BlockCatalog.solidity_of(CellCodec.mat(v)) < 0.5
 
 ## Max in-cell rise a walker may auto-step over without being blocked (SVS §5.2). A
 ## full cube's rise is 1.0 m > STEP_MAX, so every full cube still blocks (byte-identical

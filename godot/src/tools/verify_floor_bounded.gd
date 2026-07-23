@@ -244,6 +244,73 @@ func _initialize() -> void:
 	else:
 		print("  NOTE: sed FP_FLOOR_MEMO=true (with FP_FLOOR_BOUNDED=true) to exercise the MEMO O(1)/invalidation gates.")
 
+	# ---- GROUP E: FOOTPRINT-SAFE MEMO (FP_FLOOR_MEMO) — the CROSS-FOOTPRINT fall-through bug + perf non-regression. ---
+	# GROUP D holds ONE in-cell footprint (0.5, 0.5) constant, so it never exercises the memo across two footprints of
+	# the SAME column. But `_occ_span` is FOOTPRINT-dependent for shaped terrain (SUB-VOXEL-SMOOTHING ramps/slopes): a
+	# sloped top cell is AIR at one in-cell corner and SOLID at another. The memo keys by column only, so populating it
+	# from footprint A (where the shape is air ⇒ the topmost solid is the CUBE below) and then querying footprint B
+	# (where the shape is solid ⇒ the TRUE floor is one cell HIGHER) makes a by-column memo jump to the cube and, scanning
+	# only DOWN, MISS the shape → the player falls through / lands on the wrong floor. The fix makes the memo footprint-
+	# SAFE: a column is cached only when its topmost floor is a PLAIN full cube AND every cell above it is PLAIN air, so a
+	# HIT reproduces the exact floor at ANY footprint. This group MUST FAIL on the pre-fix by-column memo and PASS after.
+	if memo_on:
+		# (E1) NON-REGRESSION: a PLAIN full-cube tower must STILL be memoized and O(1) on a hit (keep the fall-fps win).
+		var ex := bx - 7
+		var ez := bz + 6
+		var esurf := int(round(w.surface_y(float(ex) + 0.5, float(ez) + 0.5)))
+		var etop := esurf + margin + 30
+		for h in range(esurf, etop + 1):
+			w.seed_edit_for_test(Vector3i(ex, h, ez), BC.STONE)   # a stack of PLAIN full cubes
+		w.debug_placed_top()[Vector2i(ex, ez)] = etop
+		var efx := float(ex) + 0.5
+		var efz := float(ez) + 0.5
+		var efloor := _ref_floor(w, efx, efz, float(etop) + 900.0)
+		w._floor_top.clear()
+		var _e1a := w.floor_under(efx, efz, efloor + 900.0)        # cold populate
+		var e1_first := w._floor_scan_iters
+		var _e1b := w.floor_under(efx, efz, efloor + 400.0)        # HIT
+		var e1_hit := w._floor_scan_iters
+		var e1_cached := int(w._floor_top.get(Vector2i(ex, ez), -0x40000000))
+		print("  GROUP E1 (plain cube): floor=%.2f first=%d hit=%d cached=%d" % [efloor, e1_first, e1_hit, e1_cached])
+		_ok(e1_cached == etop, "MEMO-SAFE non-regression: a PLAIN full-cube column IS still memoized (perf win preserved)")
+		_ok(e1_hit <= 3, "MEMO-SAFE non-regression: a full-cube column HIT stays O(1) (≤3 iters; hit=%d)" % e1_hit)
+
+		# (E2) THE BUG: a full cube with a footprint-DEPENDENT SLOPE on top. make_slope(-2,-2,2,2) clamps to span ZERO at
+		# the low corner (0.2,0.2) and to a full span at the high corner (0.8,0.8) — the exact SUB-VOXEL-SMOOTHING hazard.
+		var rx := bx + 6
+		var rz := bz - 7
+		var rsurf := int(round(w.surface_y(float(rx) + 0.5, float(rz) + 0.5)))
+		var rcube := rsurf + margin + 30                              # topmost PLAIN cube of a supported stack
+		for h in range(rsurf, rcube + 1):
+			w.seed_edit_for_test(Vector3i(rx, h, rz), BC.STONE)
+		var slope_mod := CellCodec.make_slope(-2, -2, 2, 2)          # air at (0.2,0.2), solid at (0.8,0.8)
+		w.seed_edit_for_test(Vector3i(rx, rcube + 1, rz), CellCodec.pack(BC.STONE, slope_mod, 0))
+		w.debug_placed_top()[Vector2i(rx, rz)] = rcube + 1
+		var slope_v := w.cell_value_at(Vector3i(rx, rcube + 1, rz))
+		var spanA := w._occ_span(slope_v, 0.2, 0.2)                  # footprint A: expected ZERO
+		var spanB := w._occ_span(slope_v, 0.8, 0.8)                  # footprint B: expected non-zero (solid)
+		var differ := spanA == Vector2.ZERO and spanB != Vector2.ZERO
+		print("  GROUP E2 setup: slope cell=%d spanA=%s spanB=%s differ=%s" % [rcube + 1, str(spanA), str(spanB), str(differ)])
+		_ok(differ, "MEMO-SAFE setup: the slope top cell is AIR at footprint A (%s) and SOLID at footprint B (%s)" % [str(spanA), str(spanB)])
+		var xA := float(rx) + 0.2
+		var zA := float(rz) + 0.2
+		var xB := float(rx) + 0.8
+		var zB := float(rz) + 0.8
+		w._floor_top.clear()
+		# Populate the memo from footprint A with the feet HIGH (a fall → the bounded JUMP → the populate path).
+		var floorA_ref := _ref_floor(w, xA, zA, float(rcube + 1) + 900.0)
+		var fbA := w.floor_under(xA, zA, floorA_ref + 900.0)
+		var a_ok := fbA == floorA_ref
+		# Now query footprint B on the SAME column. Reference = a FRESH unbounded scan at B (the true top-of-slope floor).
+		var floorB_ref := _ref_floor(w, xB, zB, float(rcube + 1) + 900.0)
+		var fbB := w.floor_under(xB, zB, floorB_ref + 700.0)         # a by-column memo (the bug) would HIT and fall through
+		var cachedR := int(w._floor_top.get(Vector2i(rx, rz), -0x40000000))
+		print("  GROUP E2 (slope top): floorA=%.2f fbA=%.2f | floorB_ref=%.2f fbB=%.2f cached=%d"
+			% [floorA_ref, fbA, floorB_ref, fbB, cachedR])
+		_ok(a_ok, "MEMO-SAFE: floor_under at footprint A == reference (%.4f) — the populate query itself is exact" % floorA_ref)
+		_ok(fbB == floorB_ref, "MEMO-SAFE: floor_under at footprint B == fresh reference scan (%.4f), got %.4f — NO cross-footprint fall-through" % [floorB_ref, fbB])
+		_ok(cachedR == -0x40000000, "MEMO-SAFE: the shaped (slope-top) column is EXCLUDED from the cache (footprint-dependent span)")
+
 	w.queue_free()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)

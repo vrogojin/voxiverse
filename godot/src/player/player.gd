@@ -530,7 +530,14 @@ func _attitude_ground_contact() -> bool:
 	# collapse (t_att_us). Ground contact is physically impossible far above the tallest terrain, so skip the
 	# per-frame floor query until the player is within reach of the surface. The threshold sits far above any
 	# terrain+datum relief, so the recovery still fires with huge margin on the approach. Byte-identical off.
-	if CubeSphere.FP_FALL_ATT_GATE and position.y > CubeSphere.FALL_ATT_GATE_Y:
+	# A player-placed TOWER can rise ABOVE this gate (natural terrain maxes ~112 + trees, but a placed tower
+	# can reach ~352 > FALL_ATT_GATE_Y). Skipping the floor query then leaves the camera in a space attitude
+	# after landing ON the tower. Mirror FP_FLOOR_BOUNDED's `_placed_top` consult: raise the gate by the
+	# column's PLACED high-water so the recovery still fires within reach of a tall tower's top. With no
+	# placement the column's placed_top is a deep-negative sentinel ⇒ the RHS is hugely negative ⇒ the test
+	# collapses to `position.y > FALL_ATT_GATE_Y` (byte-identical to before on natural terrain).
+	if CubeSphere.FP_FALL_ATT_GATE and position.y > CubeSphere.FALL_ATT_GATE_Y \
+			and position.y > float(world.placed_top(int(floor(position.x)), int(floor(position.z)))) + CubeSphere.FALL_ATT_GATE_Y:
 		return false
 	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
 

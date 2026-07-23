@@ -38,13 +38,15 @@ func _initialize() -> void:
 	TC.set_active_facet(fid)
 	print("  flag FP_FACET_TEX = %s, spawn facet = %d (K=%d, R=%d)" % [str(CubeSphere.FP_FACET_TEX), fid, FA.K, int(FA.R_BLOCKS)])
 
+	var tex_on := CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE   # LOW #3: the textured ring needs BOTH
 	_gate_off(fid)
-	if CubeSphere.FP_FACET_TEX:
+	if tex_on:
 		_gate_bake(fid)
 		_gate_uv(fid)
 		_gate_palette(fid)
+		_gate_cover(fid)
 	else:
-		print("  (FP_FACET_TEX OFF — G-FT-BAKE / G-FT-UV / G-FT-PALETTE require the flag ON; OFF-identity asserted by G-FT-OFF)")
+		print("  (texture path OFF — G-FT-BAKE/UV/PALETTE/COVER need FP_FACET_TEX && FP_SHELL_ABSOLUTE ON; OFF-identity by G-FT-OFF)")
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -64,7 +66,7 @@ func _gate_off(spawn_fid: int) -> void:
 	var nverts := (arr[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
 	var uv: Variant = arr[Mesh.ARRAY_TEX_UV]
 	var uv2: Variant = arr[Mesh.ARRAY_TEX_UV2]
-	if CubeSphere.FP_FACET_TEX:
+	if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
 		var nu := (uv as PackedVector2Array).size() if uv != null else 0
 		var nu2 := (uv2 as PackedVector2Array).size() if uv2 != null else 0
 		_ok(nu == nverts and nu2 == nverts,
@@ -243,6 +245,41 @@ func _gate_palette(fid: int) -> void:
 			cnt2 += 1
 	var mean2 := (sum2 / float(cnt2)) if cnt2 > 0 else 0.0
 	_ok(mean2 > mean, "G-FT-PALETTE falsify: a wrong (antipodal) facet's palette disagrees more (mean Δ=%.4f > %.4f)" % [mean2, mean])
+
+# --- G-FT-COVER: un-baked facets contribute ZERO texture (alpha 0 → wt 0 → shipped vertex-colour, never black) --
+func _gate_cover(fid: int) -> void:
+	var baker := FacetTexBaker.new()
+	baker.setup(fid)
+	baker.bake_facet(fid)                               # bake ONLY this facet — every other facet stays un-baked
+	var bt := FacetTexBaker.BASE_TEXELS
+	var k := FA.K
+	# A same-face neighbour of `fid` shares its page but was NOT baked (proves partial-page coverage).
+	var face := int(fid / (k * k))
+	var rem := fid - face * k * k
+	var a := int(rem / k); var b := rem - a * k
+	var other := (face * k + ((a + 1) % k)) * k + b
+	_ok(other != fid, "G-FT-COVER: chose an un-baked same-face neighbour (%d) of the baked facet (%d)" % [other, fid])
+
+	# The baked facet: every texel is opaque (alpha 1) → the shader's wt gate can engage → textured from orbit.
+	var baked_opaque := true
+	for ty in range(bt):
+		for tx in range(bt):
+			if absf(baker.texel_color(fid, tx, ty).a - 1.0) > 1e-4: baked_opaque = false
+	_ok(baked_opaque and baker.is_baked(fid), "G-FT-COVER: a BAKED facet's texels are alpha 1 (wt can engage → satellite image)")
+
+	# The un-baked facet: every texel is transparent (alpha 0). In the shader wt = smoothstep(...) * alpha = 0,
+	# so it renders the shipped vertex-colour far ring — the far hemisphere is NEVER black from orbit (the bug).
+	var unbaked_clear := true
+	for ty in range(bt):
+		for tx in range(bt):
+			if baker.texel_color(other, tx, ty).a != 0.0: unbaked_clear = false
+	_ok(unbaked_clear and not baker.is_baked(other),
+		"G-FT-COVER: an UN-BAKED facet's texels are alpha 0 (wt → 0 → shipped vertex-colour, never black)")
+
+	# Falsify: the un-baked sentinel must be TRANSPARENT, not opaque black — an opaque (alpha 1) sentinel is
+	# exactly the reported blocker (black far hemisphere). Assert the two states DIFFER in alpha.
+	_ok(baker.texel_color(fid, 8, 8).a != baker.texel_color(other, 8, 8).a,
+		"G-FT-COVER falsify: bake FLIPS coverage alpha 0→1 (baked %.1f ≠ un-baked %.1f)" % [baker.texel_color(fid, 8, 8).a, baker.texel_color(other, 8, 8).a])
 
 static func _bil(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t

@@ -55,10 +55,16 @@ func setup(active_fid: int) -> void:
 	else:
 		push_warning("FacetTexBaker: VoxelGeneratorCosmos absent — using the GDScript oracle sampler (slow).")
 		_sampler = Callable(FacetSkinTier, "gd_sample")
+	# COVERAGE SENTINEL (§ live-fix): un-baked texels stay ALPHA 0. The shell shader gates the vertex-colour↔
+	# texture blend on texel alpha (wt *= texel.a), so a facet the prewarm/Phase-2 driver has NOT baked yet
+	# samples alpha 0 → wt 0 → the shipped vertex-colour far ring (NEVER a black un-baked hemisphere from orbit).
+	# A baked texel is written alpha 1 by bake_facet. This is per-texel coverage — strictly better than a
+	# per-facet flag (soft boundary, no per-vertex plumbing, worker-safe) and composes with Phase 2's progressive
+	# bake (a facet lights up the moment its texels turn opaque).
 	_pages.resize(6)
 	for f in range(6):
 		var img := Image.create(_page, _page, true, Image.FORMAT_RGBA8)
-		img.fill(Color(0.0, 0.0, 0.0, 1.0))
+		img.fill(Color(0.0, 0.0, 0.0, 0.0))
 		_pages[f] = img
 
 ## Synchronous prewarm of the currently-emitted facet set (§6 Phase 1). Bakes each facet's base map into its
@@ -71,9 +77,11 @@ func prewarm(fids: PackedInt32Array) -> void:
 
 # --- the bake (§1.1) -----------------------------------------------------------------------------
 
-## The fine BAKE_SRC×BAKE_SRC grid of top-block colours for facet `fid`, sampled via sample_columns one row
-## at a time (fi → s, fj → t, matching the far ring's UV = ((a+s)/K,(b+t)/K)). Public so the gate re-samples
-## the SAME grid the bake box-averages (G-FT-BAKE) — the sampler is pure, so two calls are byte-identical.
+## The fine BAKE_SRC×BAKE_SRC grid of top-block colours for facet `fid` in ONE sample_columns call (LOW #4:
+## the whole ~1024-column facet at once, like FacetSkinTier's 1089-column tile — ~32× fewer calls than a
+## per-row bake; the per-row slice is reserved for Phase 2's budgeted path). fi → s, fj → t, matching the far
+## ring's UV = ((a+s)/K,(b+t)/K). Public so the gate re-samples the SAME grid the bake box-averages (G-FT-BAKE)
+## — the sampler is pure, so two calls are byte-identical.
 func sample_fine(fid: int) -> PackedColorArray:
 	# The facet's 4 lattice (x,z) corners: its param (s,t)=00,10,11,01 corners mapped through the exact
 	# world_to_lattice64, so a fine param maps to the lattice column sample_columns wants (cell_dir agrees).
@@ -83,22 +91,18 @@ func sample_fine(fid: int) -> PackedColorArray:
 		var w := FacetAtlas.facet_planar_corner(fid, ci)
 		var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
 		lc[ci] = Vector2(float(l[0]), float(l[2]))
-	var fine := PackedColorArray()
-	fine.resize(BAKE_SRC * BAKE_SRC)
 	var packed := PackedInt64Array()
-	packed.resize(BAKE_SRC)
+	packed.resize(BAKE_SRC * BAKE_SRC)
 	for fj in range(BAKE_SRC):
 		var t := (float(fj) + 0.5) / float(BAKE_SRC)
+		var row := fj * BAKE_SRC
 		for fi in range(BAKE_SRC):
 			var s := (float(fi) + 0.5) / float(BAKE_SRC)
 			var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
 			var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
-			packed[fi] = _pack_xz(int(round(lx)), int(round(lz)))
-		var res: Dictionary = _sampler.call(fid, packed)
-		var cols: PackedColorArray = res["colors"]
-		for fi in range(BAKE_SRC):
-			fine[fj * BAKE_SRC + fi] = cols[fi]
-	return fine
+			packed[row + fi] = _pack_xz(int(round(lx)), int(round(lz)))
+	var res: Dictionary = _sampler.call(fid, packed)   # ONE C++ call for the whole facet
+	return res["colors"]
 
 ## Composite facet `fid`'s base map into its cube-face page: box-average the fine grid down to BASE_TEXELS²
 ## and blit into the facet's rect [a·16..)×[b·16..). Idempotent (a re-bake overwrites the same rect bit-exactly

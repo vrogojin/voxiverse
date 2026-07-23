@@ -806,7 +806,7 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 	var col := PackedColorArray()
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): the tri-order UV/UV2 arrays, grown alongside pos/col ONLY under
 	# FP_FACET_TEX (off ⇒ empty + never assigned to the surface → byte-identical mesh format).
-	var tex := CubeSphere.FP_FACET_TEX
+	var tex := _tex_on()
 	var uv := PackedVector2Array()
 	var uv2 := PackedVector2Array()
 	for fid in fids:
@@ -1228,7 +1228,7 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 	var stride := cells + 1
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): the dense backstop grid carries the SAME facet-param UVs (denser cells,
 	# same [0,1]² span). Only under FP_FACET_TEX (the caller passes real uv/uv2 arrays); off ⇒ they stay empty.
-	var tex := CubeSphere.FP_FACET_TEX
+	var tex := _tex_on()
 	var t_a := 0; var t_b := 0; var t_k := 1
 	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
@@ -1277,7 +1277,7 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var n := 0
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): decode the facet's texture params ONCE. With the flag off `tex` is false
 	# and the emit runs the shipped set_color/add_vertex sequence VERBATIM (byte-identical, zero overhead).
-	var tex := CubeSphere.FP_FACET_TEX
+	var tex := _tex_on()
 	var t_a := 0
 	var t_b := 0
 	var t_k := 1
@@ -1335,7 +1335,7 @@ func _ensure_tri_cached(fid: int) -> void:
 	var tc := PackedColorArray()
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): build the parallel tri-order UV/UV2 arrays ONLY under FP_FACET_TEX
 	# (off ⇒ these stay empty and _build_fast never reads them → byte-identical). Same push order as pos/col.
-	var tex := CubeSphere.FP_FACET_TEX
+	var tex := _tex_on()
 	var tu := PackedVector2Array()
 	var tu2 := PackedVector2Array()
 	var t_a := 0; var t_b := 0; var t_k := 1
@@ -1390,6 +1390,13 @@ func _facet_centre_dir(fid: int) -> Array:
 ## COSMOS LOD-TEXTURE Phase 1 (§1.3): decode `fid` → [face, a, b, k] in its body's local (face,a,b) indexing
 ## (Earth ⇒ base 0, k=K). The base-map layer is `face`; UV = ((a+s)/k, (b+t)/k). Mirrors FacetTexBaker._decode
 ## so the emitted UVs land exactly on the baked facet rect.
+## COSMOS LOD-TEXTURE Phase 1 (§1.3 / LOW #3): UV/UV2 emission requires BOTH FP_FACET_TEX and FP_SHELL_ABSOLUTE.
+## The textured sampler lives ONLY in the (unshaded) _SHELL_ABS_SHADER; under a LIT StandardMaterial the extra
+## per-vertex UV/UV2 would split shared-corner verts in generate_normals (faint cube-edge creases) AND never be
+## sampled. Gating on both keeps FP_FACET_TEX-alone byte-identical to shipped (no UV arrays, no creases).
+func _tex_on() -> bool:
+	return CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE
+
 func _tex_decode(fid: int) -> Array:
 	var kb := FacetAtlas.k_of(fid)
 	var lf := fid - FacetAtlas.fid_base_of(fid)
@@ -1530,9 +1537,12 @@ void vertex() {
 	v_cam = distance(wp, CAMERA_POSITION_WORLD);
 }
 void fragment() {
-	vec3 albedo_tex = texture(base_map, vec3(v_uv, v_face)).rgb;
-	float wt = smoothstep(600.0, 1800.0, v_cam);
-	ALBEDO = mix(v_col_raw, albedo_tex, wt) * v_st;
+	vec4 tx = texture(base_map, vec3(v_uv, v_face));
+	// COVERAGE GATE (§ live-fix): tx.a is the bake coverage (0 = never baked → the un-baked far hemisphere).
+	// Multiply wt by it so an un-baked facet shows the shipped vertex-colour far ring (NEVER black from orbit);
+	// a baked facet (alpha 1) cross-fades to the satellite image on the shipped 600..1800 distance ramp.
+	float wt = smoothstep(600.0, 1800.0, v_cam) * tx.a;
+	ALBEDO = mix(v_col_raw, tx.rgb, wt) * v_st;
 }
 "
 
@@ -1598,7 +1608,7 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 ## uniform. No-op unless FP_FACET_TEX is on and the material is the textured shader ⇒ flag-off is byte-identical
 ## (never wired; the shipped shader has no base_map sampler). Called once by WorldManager after the prewarm bake.
 func set_facet_tex(tex: Texture) -> void:
-	if not CubeSphere.FP_FACET_TEX or _mi == null:
+	if not _tex_on() or _mi == null:
 		return
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:

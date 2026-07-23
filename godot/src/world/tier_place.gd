@@ -25,6 +25,16 @@ const ENV_FINE_MULT := 4          # fine-sample density = ENV_FINE_MULT × BACKS
 const ENV_DILATE_BLOCKS := 6.0    # footprint dilation (blocks) for the radial-vs-normal skew reach (relief·sin α_max
                                   # ≤ ~5-6 at K=24): the far vertex lands displaced ≤ this from its footprint b.
 
+# --- NO-PROTRUSION (FP_ENV_ALL, §0.3/§0.4) — the GLOBAL envelope ε, sized to the MEASURED inherent residual --------
+const ENV_ALL_EPS_FRAC := 0.45    # the FP_ENV_ALL ε guard SCALES with the facet cell like ENV_EPS_FRAC, but larger:
+                                  # even after the min-envelope removes the terrain-curvature over-estimate, a residual
+                                  # ≈ the sagitta / radial-vs-normal datum offset (~6.2 blocks at R=6371, the SAME
+                                  # residual the shipped FP_TIER_ENVELOPE backstop leaves — verify_tier_depth's +1.05
+                                  # poke) remains that NO footprint widening removes. G-NPT-BOUND measures it and this
+                                  # guard (ε = max(ENV_EPS_G, 0.45·cell) ≈ 11.7 at R=6371) provably covers it so the
+                                  # rendered surface is ≤ true with ZERO protrusion. env_all-SCOPED: FP_TIER_ENVELOPE
+                                  # keeps its own 0.2 guard ⇒ verify_tier_depth is byte-unmoved.
+
 # --- P3 depth bias (§5.2 / §3.3) --------------------------------------------------------------------
 const DEPTH_QUANTUM := 5.9604644775390625e-08   # 2⁻²⁴ — one window-depth quantum of the WebGL2 24-bit buffer.
 const FAR_BIAS_K := 8             # far ring (backstop + distant): pushed 8 quanta behind at every distance.
@@ -50,6 +60,13 @@ static func envelope_on() -> bool:
 static func depth_bias_on() -> bool:
 	return CubeSphere.FP_TIER_DEPTH_BIAS
 
+## NO-PROTRUSION (§0.3): is the GLOBAL ENVELOPE HEIGHT LAW active? Requires the full-coverage far ring (the thing
+## whose caches carry the vertex heights) AND FP_SHELL_WELD (env_all only implements the radial-weld builders — the
+## shipped planar path is never enveloped, so a weld-off run stays byte-identical). When on, EVERY far-ring vertex
+## (coarse horizon + dense backstop) is a min-envelope lower bound and the ε sink applies to the coarse path too.
+static func env_all_on() -> bool:
+	return CubeSphere.FP_ENV_ALL and CubeSphere.FP_FARRING_FULL_COVER and CubeSphere.FP_SHELL_WELD
+
 ## P1-adjacent: is the surface warm-gate convergence (progressive cached-subset emit) active? Requires the full-coverage
 ## far ring (the backstop dense caches are the thing whose slow warm strands the all-or-nothing gate). Off ⇒ the shipped
 ## all-or-nothing surface warm gate runs verbatim (byte-identical).
@@ -63,6 +80,9 @@ static func warm_converge_on() -> bool:
 ## any radius; ≈ 6 at R=3072, ≈ 13 at R=6371). This is the ONE site the sink value is decided.
 static func backstop_sink() -> float:
 	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	if env_all_on():
+		return maxf(ENV_EPS_G, ENV_ALL_EPS_FRAC * cell)   # NO-PROTRUSION: the larger global-envelope guard (covers the
+		                                                  # inherent radial/datum residual; env_all-scoped ⇒ tier gate unmoved)
 	if envelope_on():
 		return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)   # ε guard scales with the cell (rescale-safe), floored at 1.5
 	return CubeSphere.BACKSTOP_SINK_FRAC * cell

@@ -423,6 +423,22 @@ const FP_ENV_ALL := false
 ## Default OFF → main-thread warm verbatim (byte-identical). ORBIT-scoped (surface warm path unchanged).
 const FP_ENV_WARM_ASYNC := false
 
+## COSMOS NO-PROTRUSION FIDELITY (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §1 F2) — MID-RING DENSE promotion.
+## Promote every far-ring facet within ~ring-2 (an angular disc ≈ MID_DENSE_RINGS facet-edges of the sub-camera /
+## emit axis) to emit its DENSE grid (BACKSTOP_CELLS=16, ~26-block cells) instead of the coarse 5×5 (CELLS=4,
+## ~104-block chords) — 4× finer geometry AND ~16× smaller chord error EXACTLY in the 400-1200 block band the player
+## looks at when they rise a little or look at the horizon. Reuses the dense backstop cache builders / env lower bound
+## (_ensure_backstop_cached_env), so a promoted facet is a provable no-protrusion lower bound too (joins G-NPT-SURF).
+## The dense build is routed through the SAME scheduling as backstop: budget-sliced on the main-thread surface warm
+## (_warm_front_true_budget) and OFF-THREAD on the far-ring worker under FP_ENV_WARM_ASYNC in orbit — NO synchronous
+## 16 ms/facet main-thread stall. NEVER-OOM: the disc is a fixed angular set (~ring-2 count) and promoted caches are
+## REAPED as the sub-point moves, so _bpos_cache stays bounded to backstop ∪ ring-2 (~+16 facets ≈ +130 KB).
+## Requires FP_FARRING_FULL_COVER (dense caches only exist there). Default OFF → the _is_backstop-driven emission
+## verbatim (empty disc ⇒ every predicate reduces to the shipped backstop role → byte-identical, FLAT 6042/0).
+const FP_MID_DENSE := false
+## MID_DENSE angular reach: the dense-promotion disc radius in facet-edge angles (facet edge ≈ (π/2·R)/K). 2 ⇒ ring-2.
+const MID_DENSE_RINGS := 2.0
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles

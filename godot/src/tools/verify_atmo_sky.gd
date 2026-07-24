@@ -56,6 +56,7 @@ func _initialize() -> void:
 	_gate_b4_moon()
 	_gate_b2_limb()
 	_gate_o1_ground()
+	_gate_term_sun_cont()
 	_gate_b3_nearnight()
 	_gate_inert()
 	_gate_smoke()
@@ -766,3 +767,58 @@ func _gate_smoke() -> void:
 	_ok(mat != null, "far-ring _make_material returns a material")
 	_ok((mat is ShaderMaterial) == (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.SHELL_TERMINATOR_TINT or TierPlace.depth_bias_on()), "shell material type consistent with the flags")
 	fr.free()
+
+# ------------------------------------------------------------------ G-TSC (FP_TERM_SUN_CONT)
+# The terminator sun-pop fix. Drives the pure ground-floored occlusion directly (flag-independent, like the rest
+# of the gate): the disc/light presence must be CONTINUOUS per walk-step (no ±1-block jump), where the shipped
+# binary flip (occ_pen ≥ 0.5 ⇒ visible 0/1) pops because dep(h)=asin(r/dist) is SINGULAR in eye-height h.
+func _gate_term_sun_cont() -> void:
+	print("  --- G-TSC: terminator sun continuity — ground-floored occlusion kills the per-step disc pop ---")
+	var r := GRAV.r_vox("earth")
+	var sun := Vector3(1.0, 0.0, 0.0)
+	var up := Vector3(0.0, 1.0, 0.0)                          # local vertical ⊥ sun ⇒ sun sits on the horizon
+	var h_eye: float = CubeSphere.TERM_SUN_H_EYE_MIN
+	# (1) BELOW-DATUM KINK: as the eye crosses the datum sphere (dist=r) occlusion_factor_pen PINS ang_radius at
+	# 90° (r/dist clamps >1) — a hard kink in h that jerks the terminator. The floored variant samples
+	# dist_eff=max(dist, r+H_EYE_MIN), so it is smooth across the datum. Sun just below the horizon (el −0.3°).
+	var el_lo := deg_to_rad(-0.3)
+	var sdir_lo := (sun * cos(el_lo) + up * sin(el_lo)).normalized()
+	var worst_ground := 0.0
+	var any_pos := false
+	var prev_g := -1.0
+	for i in range(0, 41):                                    # h from −5..+5 blocks in ¼-block steps (across the datum)
+		var h := -5.0 + 0.25 * float(i)
+		var p := up * (r + h)
+		var og := SKY.occlusion_factor_ground(sdir_lo, p, r, SKY.pen(maxf(h, 0.0)), h_eye)
+		if og > 1.0e-4: any_pos = true
+		if prev_g >= 0.0: worst_ground = maxf(worst_ground, absf(og - prev_g))
+		prev_g = og
+	_ok(worst_ground < 0.15, "occ_ground max per-¼-block step across the datum < 0.15 (worst %.4f)" % worst_ground)
+	_ok(any_pos, "occ_ground > 0 near the datum at el −0.3° (disc present in the penumbra, not hard-hidden)")
+	# (2) ABOVE-GROUND PER-STEP POP: sun 2° BELOW the horizon (el −2°). dep(h) crosses 2° near h≈3.9, so the shipped
+	# binary presence flips 0→1 within a single 1-block step there; the fix presents intensity = occ_ground (a
+	# continuous fade) which must never step ≥ 0.15/block. This is the exact "Sun pops in after a step" pathology.
+	var el_hi := deg_to_rad(-2.0)
+	var sdir_hi := (sun * cos(el_hi) + up * sin(el_hi)).normalized()
+	var worst_cont := 0.0
+	var binary_jump := 0.0
+	var prev_c := -1.0
+	var prev_b := -1.0
+	for i in range(0, 13):                                    # h 0..12 blocks in 1-block steps (a walking terrain profile)
+		var h := float(i)
+		var p := up * (r + h)
+		var oc := SKY.occlusion_factor_ground(sdir_hi, p, r, SKY.pen(h), h_eye)
+		var ob := SKY.occlusion_factor_pen(sdir_hi, p, r, SKY.pen(h))
+		var bin := 1.0 if ob >= 0.5 else 0.0
+		if prev_c >= 0.0: worst_cont = maxf(worst_cont, absf(oc - prev_c))
+		if prev_b >= 0.0: binary_jump = maxf(binary_jump, absf(bin - prev_b))
+		prev_c = oc
+		prev_b = bin
+	_ok(worst_cont < 0.15, "continuous presence (occ_ground) max per-1-block step < 0.15 (worst %.4f)" % worst_cont)
+	_ok(binary_jump > 0.99, "shipped BINARY presence DOES pop ≥0.99 in one step here (the bug the fix removes): %.2f" % binary_jump)
+	# (3) SLOPE BOUND: the flooring caps the sun-hide angle's per-block slope. Compare floored vs un-floored dep(h)
+	# across the worst 1-block step just above the datum — floored must be ≤ un-floored.
+	var dep_un := absf(asin(clampf(r / (r + 0.25), 0.0, 1.0)) - asin(clampf(r / (r + 1.25), 0.0, 1.0)))
+	var dep_fl := absf(asin(clampf(r / maxf(r + 0.25, r + h_eye), 0.0, 1.0)) - asin(clampf(r / maxf(r + 1.25, r + h_eye), 0.0, 1.0)))
+	_ok(dep_fl <= dep_un + 1e-9, "floored sun-hide slope ≤ un-floored just above the datum (singularity bounded): fl %.6f ≤ un %.6f" % [dep_fl, dep_un])
+	_ok(CubeSphere.TERM_SUN_H_EYE_MIN > 0.0, "TERM_SUN_H_EYE_MIN defined (%.2f blocks)" % CubeSphere.TERM_SUN_H_EYE_MIN)

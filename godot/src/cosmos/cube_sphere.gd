@@ -1056,6 +1056,17 @@ const SUN_MIN_ANG_DEG := 2.0      # perceptual angular-diameter floor for the Su
 const MOON_MIN_ANG_DEG := 1.5     # perceptual angular-diameter floor for the Moon impostor (taste)
 const SUN_GLARE_RADII := 5.0      # glare quad half-size in Sun-disc radii
 
+## TERMINATOR-SUN CONTINUITY (fix: Sun disc POPS in/out per walk-step at dawn/dusk). Root cause (Fable): the
+## disc visibility was a BINARY flip `occ_cam >= 0.5`, and the sun-hide angle dep(h)≈√(2h/R) is SINGULAR in
+## eye-height h (infinite slope at the ground, pinned/kinked below the datum) — so a ±1-block step jerks the
+## flip threshold by up to a whole disc radius. When on: (1) the disc/Moon fade CONTINUOUSLY by occlusion
+## (albedo·occ, unshaded) and stay `visible` on a >0.001 threshold — no boolean flip; (2) occ_cam and the
+## absolute light/ambient sample a GROUND-FLOORED distance (dist_eff = max(dist, r_vox+H_EYE_MIN)) that caps
+## dep's slope at ~0.36°/block. Off ⇒ the binary flip + un-floored occ (byte-identical). Requires
+## FP_SKY_PLANET_OCCLUDE (disc/Moon presence) and/or FP_LIGHT_ABSOLUTE (light/ambient). Gate G-TSC.
+const FP_TERM_SUN_CONT := false
+const TERM_SUN_H_EYE_MIN := 2.0   # min eye-height (blocks) the occlusion distance is floored to — bounds dep'(h)
+
 ## A3 (design §2.3 / §3 C3 / §4). atmo_vis(h) replaces the space_mix 192..960 band with a 0.5·ATMO_TOP..
 ## ATMO_TOP fade (exactly 0 at/above ATMO_TOP=384 — the tint is star-black in space, fixing the orbit
 ## sky-colour bug). star_fade = max(night_fade, 1−atmo_vis(h)); SKY_SCATTER_RAMP's weight gains ·atmo_vis

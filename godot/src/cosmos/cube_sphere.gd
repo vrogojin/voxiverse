@@ -414,6 +414,15 @@ const FP_TIER_WARM_CONVERGE := false
 ## + FP_SHELL_WELD. Default OFF → shipped path verbatim, FLAT byte-identical (6042/0). Gate: verify_no_protrusion.gd.
 const FP_ENV_ALL := false
 
+## COSMOS NO-PROTRUSION PERF — build the FP_ENV_ALL env caches on the far-ring WORKER thread (bounded batch per
+## dispatch) instead of the main-thread warm. The EDGE-CANON disc/band sampling makes ONE coarse env facet ~16 ms
+## native (~8k profile_at_dir calls), which blows the 3 ms WARM_BUDGET_MS grain: in the ORBIT regime the far ring
+## warms ~1700 facets 1-per-frame on the MAIN thread (both _warm_front + _prewarm) → sustained 51 ms proc / climbing
+## hitches. This relocates the identical build to the worker (same heights, gate byte-unmoved) so it never touches
+## the frame budget; the progressive reveal grows ENV_WARM_BATCH facets/cycle. Requires FP_ENV_ALL + async far ring.
+## Default OFF → main-thread warm verbatim (byte-identical). ORBIT-scoped (surface warm path unchanged).
+const FP_ENV_WARM_ASYNC := false
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles

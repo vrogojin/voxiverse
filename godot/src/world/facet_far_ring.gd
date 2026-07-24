@@ -46,6 +46,15 @@ var _col_cache: Dictionary = {}      # fid -> PackedColorArray
 # sink automatically on the next rebuild (the cache is role-agnostic). NEVER populated with the flag off (zero cost).
 var _bpos_cache: Dictionary = {}     # fid -> PackedVector3Array (dense, ABSOLUTE, un-sunk)
 var _bcol_cache: Dictionary = {}     # fid -> PackedColorArray
+# COSMOS NO-PROTRUSION FIDELITY §1 F2 (FP_MID_DENSE): the set of facets currently PROMOTED to the dense grid because
+# they fall inside the ~ring-2 angular disc around the emit axis (the sub-camera / player point). A promoted facet
+# warms + emits from the SAME dense _bpos_cache/env builders the backstop uses (dense + ε-sunk envelope lower bound),
+# so it sharpens the mid-distance band AND stays no-protrusion-provable. Recomputed on emit-axis drift and REAPED as
+# the sub-point moves (a facet that leaves the disc AND is not a live backstop frees its dense cache), so _bpos_cache
+# stays bounded to backstop ∪ ring-2 (~+16 facets, the stated NEVER-OOM ceiling). Empty with FP_MID_DENSE off.
+var _mid_dense: Dictionary = {}      # fid -> true: currently mid-dense-promoted
+var _mid_dense_axis: Array = [2.0, 0.0, 0.0]   # last emit axis the disc was computed for (>1 sentinel ⇒ force first compute)
+var _mid_dense_cos := 0.0            # cos(MID_DENSE_RINGS · facet-edge angle); computed lazily once (0 ⇒ uncomputed)
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -95,7 +104,13 @@ var _async_arrays: Array = []           # worker → main: the committed surface
 # which set_pool_excluded MUTATES on the main thread mid-crossing — so the worker must NOT evaluate the role live (that
 # would race the dict). The role is snapshotted here on the main thread at dispatch (fid -> true); the worker only reads
 # this frozen dict, preserving the existing "worker reads read-only per-facet state" contract. Empty with the flag off.
+# FP_MID_DENSE: this dict is now the frozen DENSE-TARGET set (backstop ∪ mid-dense disc) — every facet the worker must
+# warm + emit from the dense cache. With FP_MID_DENSE off it is exactly the shipped backstop set (byte-identical).
 var _async_backstop: Dictionary = {}
+# FP_MID_DENSE: the frozen mid-dense subset of the dense-target set (promoted, NOT a live backstop). Lets the worker /
+# swap book-keeping tell a mid-distance promotion (which draws COARSE as a fallback until its dense cache is warmed —
+# it is NOT under a near mesh, so a hole would flicker) apart from a true backstop (covered by near voxels; filtered).
+var _async_mid: Dictionary = {}
 # FP_ENV_WARM_ASYNC: the FROZEN "this worker warms its own uncached env caches" decision for the in-flight build.
 # Snapshotted on the main thread at dispatch (orbit + env_all + async only) so the worker's warm/emit is stable for
 # its lifetime; false ⇒ the shipped read-only worker (caches pre-warmed on main). Never changes mid-run.
@@ -412,6 +427,10 @@ func _process(_dt: float) -> void:
 	# else the shipped active-facet normal + BACK_CULL (byte-identical). Both _warm_front and the rebuild's
 	# visible_fids() consume THIS pair, so the warmed set and the emitted set can never disagree.
 	var p := _cull_params()
+	# NO-PROTRUSION FIDELITY §1 F2 (FP_MID_DENSE): refresh the ring-2 dense-promotion disc for the current emit axis and
+	# reap any promotion that left it (bounded _bpos_cache). Here — past the `_async_building` guard (worker idle, safe to
+	# erase caches), before the warm/emit below so this frame's warm builds/dispatches the freshly-promoted set. No-op off.
+	_recompute_mid_dense(p)
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -555,7 +574,7 @@ func _count_uncached_visible(p: Array) -> int:
 				var fid := (face * k + a) * k + b
 				if not _front_visible(fid, nrm, thresh):
 					continue
-				if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+				if _dense_warm(fid):   # FP_MID_DENSE: a mid-dense target still needs its dense cache (keeps orbit dispatching)
 					if not _bpos_cache.has(fid):
 						cnt += 1
 				elif not _pos_cache.has(fid):
@@ -594,13 +613,18 @@ func _dispatch_async_rebuild() -> void:
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
 	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
-	# COSMOS far-ring full coverage (§4): freeze the backstop role on the MAIN thread so the worker never reads `_excluded`
-	# live (set_pool_excluded may mutate it mid-run). Only populated under FULL_COVER; empty otherwise → worker sinks nothing.
+	# COSMOS far-ring full coverage (§4): freeze the DENSE-TARGET role on the MAIN thread so the worker never reads
+	# `_excluded` live (set_pool_excluded may mutate it mid-run). `_async_backstop` = backstop ∪ mid-dense disc (the
+	# facets the worker warms + emits dense); `_async_mid` = the mid-dense-only subset (drawn COARSE as a fallback until
+	# its dense cache is warmed). Only populated under FULL_COVER; empty otherwise → worker sinks nothing (byte-identical).
 	_async_backstop = {}
+	_async_mid = {}
 	if CubeSphere.FP_FARRING_FULL_COVER:
 		for fid in _async_fids:
-			if _is_backstop(fid):
+			if _dense_warm(fid):
 				_async_backstop[fid] = true
+				if _is_mid_dense(fid):
+					_async_mid[fid] = true
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -616,22 +640,34 @@ func _async_build_worker() -> void:
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var warmed := 0
 	for fid in _async_fids:
-		# backstop role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
-		var backstop := CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid)
-		# FP_ENV_WARM_ASYNC: build this facet's env cache HERE (off-thread) if it is missing, up to ENV_WARM_BATCH per
-		# dispatch. `_async_env_warm` is the frozen main-thread decision (env_all + orbit + async), and while this worker
-		# runs the main thread touches none of these caches (the `_async_building` gate in _process), so this single
-		# writer + no concurrent reader is safe. A facet still uncached after the batch is skipped now, revealed a later
-		# dispatch. Off ⇒ `_async_env_warm` false ⇒ this whole block is inert and the loop is the shipped read-only emit.
-		if _async_env_warm and not _worker_cache_ready(fid):
-			if warmed >= ENV_WARM_BATCH:
-				continue
-			if backstop:
-				_ensure_backstop_cached(fid)
-			else:
-				_ensure_cached(fid)
-			warmed += 1
-		_emit_cached(st, fid, backstop)
+		# DENSE-TARGET role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
+		var target := CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid)
+		# FP_ENV_WARM_ASYNC / FP_MID_DENSE: build this facet's cache HERE (off-thread) if it is missing, up to
+		# ENV_WARM_BATCH per dispatch. A DENSE TARGET (backstop ∪ mid-dense) warms its dense _bpos_cache; every other
+		# facet its coarse _pos_cache — so a promoted mid-dense facet's ~16 ms env build runs OFF-THREAD too, never on
+		# the frame budget. `_async_env_warm` is the frozen main-thread decision (env_all + orbit + async), and while
+		# this worker runs the main thread touches none of these caches (the `_async_building` gate), so this single
+		# writer + no concurrent reader is safe. Off ⇒ `_async_env_warm` false ⇒ the block is inert (shipped read-only).
+		if _async_env_warm:
+			var have: bool = _bpos_cache.has(fid) if target else _pos_cache.has(fid)
+			if not have:
+				if warmed >= ENV_WARM_BATCH:
+					# Not warmed this cycle: a mid-dense target still draws its COARSE cache (prewarm-ready) so the band
+					# never flickers a hole; a plain coarse facet with no cache is skipped (shipped hole, next cycle).
+					if _pos_cache.has(fid):
+						_emit_cached(st, fid, false)
+					continue
+				if target:
+					_ensure_backstop_cached(fid)
+				else:
+					_ensure_cached(fid)
+				warmed += 1
+		# Emit by cache PRESENCE (never sunk-read a missing dense cache): a warmed/ready dense target → dense sunk; a
+		# mid-dense target whose dense cache is still pending → its coarse fallback; every other facet → coarse (shipped).
+		if target and _bpos_cache.has(fid):
+			_emit_cached(st, fid, true)
+		elif _pos_cache.has(fid):
+			_emit_cached(st, fid, false)
 	st.generate_normals()
 	_async_arrays = st.commit_to_arrays()
 	_async_build_us = Time.get_ticks_usec() - t0
@@ -668,9 +704,15 @@ func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
 		# cycle (batch-bounded warm). Record ONLY those actually drawn so `_emitted` never claims an un-drawn facet. Off ⇒
 		# every fid was cache-filtered before dispatch, so this guard is a no-op (byte-identical committed set).
 		if _async_env_warm and not _worker_cache_ready(fid):
+			# FP_MID_DENSE: a mid-dense target whose dense cache is still pending WAS drawn coarse this cycle (its
+			# fallback), so it is emitted — record it. A skipped backstop / uncached coarse facet was not. Off ⇒ empty.
+			if _async_mid.has(fid) and _pos_cache.has(fid):
+				_emitted[fid] = true
 			continue
 		_emitted[fid] = true
-		if _async_backstop.has(fid):
+		# TIER-DEPTH P1: record as SUNK only what the worker actually drew dense (dense cache present) — a mid-dense
+		# target still on its coarse fallback is NOT a sunk backstop. Off ⇒ `_async_backstop.has` (all ready). Same.
+		if _async_backstop.has(fid) and _bpos_cache.has(fid):
 			_emitted_backstop[fid] = true
 	_reemit_count += 1
 	_push_event("async", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
@@ -691,7 +733,7 @@ func _warm_front(nrm: Array, thresh: float) -> bool:
 				# COSMOS far-ring full coverage (§4): backstop facets warm their DENSE cache; every other facet the
 				# shipped grid cache. Warming on the MAIN thread here (before any async dispatch) keeps the worker's
 				# read-only cache contract — the worker only ever reads _bpos_cache/_pos_cache, never builds them.
-				if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+				if _dense_warm(fid):   # FP_MID_DENSE: backstop ∪ mid-dense disc warm their dense cache (main-thread here)
 					if not _bpos_cache.has(fid):
 						_ensure_backstop_cached(fid)
 				elif not _pos_cache.has(fid):
@@ -742,7 +784,7 @@ func _warm_front_true_budget(nrm: Array, thresh: float) -> bool:
 			continue
 		if surface_skip and (fid == _active_fid or _excluded.has(fid)):
 			continue
-		if full_cover and _is_backstop(fid):
+		if _dense_warm(fid):   # FP_MID_DENSE: backstop ∪ mid-dense disc — build the dense cache, charged to the warm budget
 			if not _bpos_cache.has(fid):
 				clean = false
 				var w0 := Time.get_ticks_usec()
@@ -792,6 +834,101 @@ func _is_backstop(fid: int) -> bool:
 		return false
 	return fid == _active_fid or _excluded.has(fid) or _sticky.has(fid)
 
+## NO-PROTRUSION FIDELITY §1 F2 (FP_MID_DENSE): is the mid-ring dense promotion active at all? Requires the flag and
+## FP_FARRING_FULL_COVER (the dense _bpos_cache / env builders only exist under full coverage). Off ⇒ `_mid_dense`
+## stays empty ⇒ every predicate below reduces to the shipped `_is_backstop` role (byte-identical emission).
+func _mid_dense_on() -> bool:
+	return CubeSphere.FP_MID_DENSE and CubeSphere.FP_FARRING_FULL_COVER
+
+## FP_MID_DENSE: the DENSE WARM TARGET — a facet whose dense _bpos_cache should be built (backstop ∪ mid-dense disc).
+## Drives every WARM site (main-thread budget slice + the worker's off-thread batch) so a promoted facet's ~16 ms env
+## build is scheduled EXACTLY like a backstop's — never a synchronous main-thread stall. Off ⇒ the shipped backstop set.
+func _dense_warm(fid: int) -> bool:
+	if not CubeSphere.FP_FARRING_FULL_COVER:
+		return false
+	return _is_backstop(fid) or _mid_dense.has(fid)
+
+## FP_MID_DENSE: the DENSE EMIT role — a facet actually drawn from the dense (ε-sunk envelope) cache THIS build. A true
+## backstop always emits dense (its caller pre-ensures the cache, as shipped); a promoted mid-dense facet emits dense
+## ONLY once its dense cache is warmed (else it draws COARSE as a seamless fallback — no hole, no missing-key read).
+## Off ⇒ `_mid_dense` empty ⇒ `FP_FARRING_FULL_COVER and _is_backstop(fid)` verbatim.
+func _emit_dense(fid: int) -> bool:
+	if not CubeSphere.FP_FARRING_FULL_COVER:
+		return false
+	if _is_backstop(fid):
+		return true
+	return _mid_dense.has(fid) and _bpos_cache.has(fid)
+
+## FP_MID_DENSE: a facet promoted by the mid-ring disc that is NOT also a live backstop (the transient-coarse-fallback
+## class). Off / not promoted ⇒ false.
+func _is_mid_dense(fid: int) -> bool:
+	return _mid_dense.has(fid) and not _is_backstop(fid)
+
+## FP_MID_DENSE gate visibility: does facet `fid` emit from the dense cache right now? (public accessor for
+## verify_no_protrusion's mid-dense reconstruction tier.)
+func is_dense_emit(fid: int) -> bool:
+	return _emit_dense(fid)
+
+## FP_MID_DENSE gate visibility: is facet `fid` currently PROMOTED into the ring-2 disc? (independent of whether its
+## dense cache is warmed yet — the gate reconstructs the dense as-rendered surface it WILL draw once warmed.)
+func is_mid_dense_promoted(fid: int) -> bool:
+	return _mid_dense.has(fid)
+
+## FP_MID_DENSE bytes-ledger accessor: the count of currently mid-dense-promoted facets (for the NEVER-OOM gate assertion).
+func mid_dense_count() -> int:
+	return _mid_dense.size()
+
+## FP_MID_DENSE §1 F2: recompute the ring-2 dense-promotion disc around the current emit axis `p[0]` (the sub-camera /
+## player direction), and REAP any previously-promoted dense cache that has left the disc AND is not a live backstop —
+## so `_bpos_cache` stays bounded to backstop ∪ ring-2 (the stated NEVER-OOM ceiling), even as the sub-point sweeps the
+## globe in orbit. Main thread only, and only from `_process` AFTER the `_async_building` guard (the worker reads
+## `_bpos_cache`, so the reap never races it). Axis-gated: a still camera re-runs nothing (steady-state zero cost).
+## No-op with FP_MID_DENSE off (the flag guard clears any residue and returns) ⇒ byte-identical.
+func _recompute_mid_dense(p: Array) -> void:
+	if not _mid_dense_on():
+		if not _mid_dense.is_empty():
+			_reap_mid_dense({})            # flag flipped off mid-run — drop all promotions, free their caches
+			_mid_dense = {}
+		return
+	var nrm: Array = p[0]
+	var nx := float(nrm[0]); var ny := float(nrm[1]); var nz := float(nrm[2])
+	# Axis-change gate: skip the scan while the emit axis is essentially unchanged (the disc, hence the promoted set,
+	# is unmoved). MID_DENSE_AXIS_HOLD_COS ≈ cos(¼ facet-edge) — far tighter than the disc so a facet never straddles.
+	var hold_cos := 1.0 - 0.25 * (1.0 - _mid_dense_threshold())   # a small fraction of the disc half-angle
+	if not _mid_dense.is_empty() and _mid_dense_axis[0] * nx + _mid_dense_axis[1] * ny + _mid_dense_axis[2] * nz >= hold_cos:
+		return
+	_mid_dense_axis = [nx, ny, nz]
+	var cos_thr := _mid_dense_threshold()
+	var next := {}
+	var k := FacetAtlas.K
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				var cd := _centre_dir(fid)
+				if cd[0] * nx + cd[1] * ny + cd[2] * nz >= cos_thr:
+					next[int(fid)] = true
+	_reap_mid_dense(next)
+	_mid_dense = next
+
+## FP_MID_DENSE: cos(MID_DENSE_RINGS · facet-edge angle). Facet edge subtends ≈ (π/2)/K rad at a face centre; the disc
+## radius is MID_DENSE_RINGS of those. Computed once (cached).
+func _mid_dense_threshold() -> float:
+	if _mid_dense_cos == 0.0:
+		var facet_ang := (PI * 0.5) / float(FacetAtlas.K)
+		_mid_dense_cos = cos(CubeSphere.MID_DENSE_RINGS * facet_ang)
+	return _mid_dense_cos
+
+## FP_MID_DENSE: free the dense cache of every promoted facet NOT in `keep` and NOT a live backstop (whose dense cache
+## the backstop role still needs). Bounded ⇒ NEVER-OOM. Called only on the main thread while the worker is idle.
+func _reap_mid_dense(keep: Dictionary) -> void:
+	for fid in _mid_dense.keys():
+		var f := int(fid)
+		if keep.has(f) or _is_backstop(f):
+			continue
+		_bpos_cache.erase(f)
+		_bcol_cache.erase(f)
+
 ## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded
 ## / setup). Make-before-break: the TARGET = active ∪ ring-1 neighbours (the design's set; a facet the player can cross into
 ## is a seam neighbour = ring-1, so it is already drawn sunk BEFORE it enters the pool and near meshes arrive). Unsink-late
@@ -831,7 +968,7 @@ func _rebuild_full() -> void:
 	for fid in fids:
 		_ensure_emit_cached(fid)
 		_emitted[fid] = true
-		if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+		if _emit_dense(fid):   # FP_MID_DENSE: backstop ∪ ready mid-dense are drawn dense (SUNK) — _ensure_emit_cached built the cache
 			_emitted_backstop[fid] = true
 	# COSMOS-PERF L1: pick the mesh assembler. FAST = packed-array memcpy + one add_surface_from_arrays; the shipped
 	# SurfaceTool path stays the default (byte-identical mesh). Both consume the SAME visible fids in the SAME order.
@@ -850,7 +987,7 @@ func _rebuild_full() -> void:
 	if CubeSphere.FP_FARRING_FULL_COVER:
 		var extra := (CubeSphere.BACKSTOP_CELLS * CubeSphere.BACKSTOP_CELLS - CELLS * CELLS) * 2
 		for fid in fids:
-			if _is_backstop(fid):
+			if _emit_dense(fid):   # FP_MID_DENSE: dense facets (backstop ∪ ready mid-dense) carry the denser tri count
 				tris += extra
 	_push_event("sync", build_us, swap_us, tris * 3)   # T2e: verts = 3·tris (cheap; no surface read-back on the crossing frame)
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
@@ -883,6 +1020,9 @@ func visible_fids(cached_only := false) -> PackedInt32Array:
 func _emit_cache_ready(fid: int) -> bool:
 	if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
 		return _bpos_cache.has(fid)
+	# FP_MID_DENSE: a promoted mid-dense facet is ready as soon as its COARSE cache exists (it draws coarse as a
+	# seamless fallback until its dense cache is warmed) — so a mid-distance facet is NEVER filtered to a hole while
+	# its heavy env cache builds. Off ⇒ this is the shipped coarse readiness for every non-backstop facet.
 	return _pos_cache.has(fid)
 
 ## SHIPPED assembler: per-vertex SurfaceTool emission + generate_normals (the ~332k GDScript→C++ round-trip path).
@@ -891,7 +1031,7 @@ func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for fid in fids:
 		_ensure_emit_cached(fid)
-		_emit_cached(st, fid, CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid))   # main thread — live role is safe
+		_emit_cached(st, fid, _emit_dense(fid))   # main thread — live role is safe; _ensure_emit_cached built the dense cache
 	st.generate_normals()
 	return st.commit()
 
@@ -913,7 +1053,7 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 		# vertices are pushed radially inward per-vertex at BACKSTOP_CELLS). Under FULL_COVER it falls back to the
 		# per-vertex sunk expansion (a handful of facets — §5); non-backstop facets keep the memcpy fast path. The
 		# vertex order/winding matches _emit_cached exactly, so the later global generate_normals is bit-identical.
-		if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+		if _emit_dense(fid):   # FP_MID_DENSE: backstop ∪ ready mid-dense → the dense sunk expansion (off the memcpy fast path)
 			_append_backstop_tris(pos, col, fid, uv, uv2)
 		else:
 			_ensure_tri_cached(fid)
@@ -1144,7 +1284,7 @@ func _ensure_cached(fid: int) -> void:
 ## backstop cache for a backstop facet under FULL_COVER, else the shipped CELLS grid. Called by every synchronous
 ## assembler path before it emits; the async path warms these on the main thread in _warm_front instead.
 func _ensure_emit_cached(fid: int) -> void:
-	if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+	if _dense_warm(fid):   # FP_MID_DENSE: backstop ∪ mid-dense disc build the dense cache (sync assembler path)
 		_ensure_backstop_cached(fid)
 	else:
 		_ensure_cached(fid)

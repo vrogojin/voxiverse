@@ -66,6 +66,7 @@ func _initialize() -> void:
 	_gate_descent(active, sel)
 	_gate_bound(active, sel)
 	_gate_weld(active, sel)
+	_gate_mid_dense_ledger(active)
 	_gate_edit_stub()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -92,6 +93,28 @@ func _gate_surf(active: int, sel: Array) -> void:
 		var cm := _probe_random(fid, ex, CELLS, N_PROBE)
 		if cm > contrast:
 			contrast = cm; contrast_fid = fid
+	# §1 F2 (FP_MID_DENSE): fold the AS-RENDERED DENSE reconstruction of each facet — promoted into the ring-2 disc
+	# around its own centre — into the SAME `worst` accumulator + assertion. So with the flag on, the mid-distance
+	# dense tier the player looks at is covered by G-NPT-SURF's zero-protrusion contract too (no new assertion → the
+	# 32/0 count is unmoved). Each facet is probed at BACKSTOP_CELLS as the live emit draws it (backstop_rendered_positions
+	# = the ε-sunk dense envelope cache). Off ⇒ this block is skipped (byte-identical to the coarse-only reconstruction).
+	var dense_worst := -1.0e30
+	var dense_fid := -1
+	var dense_cnt := 0
+	if CubeSphere.FP_MID_DENSE:
+		for fid in sel:
+			var c := _centre_dir(fid)
+			ring.call("_recompute_mid_dense", [[c.x, c.y, c.z], 0.0])
+			if not bool(ring.call("is_mid_dense_promoted", fid)):
+				continue
+			dense_cnt += 1
+			var dp: PackedVector3Array = ring.call("backstop_rendered_positions", fid)
+			var dm := _probe_random(fid, dp, CubeSphere.BACKSTOP_CELLS, N_PROBE)
+			if dm > dense_worst:
+				dense_worst = dm; dense_fid = fid
+			if dm > worst:
+				worst = dm; worst_fid = fid
+		print("    F2 mid-dense: %d/%d selected facets promoted+reconstructed DENSE; dense worst protrusion = %+.2f blocks (facet %d)" % [dense_cnt, sel.size(), dense_worst, dense_fid])
 	_ok(worst <= 0.0,
 		"G-NPT-SURF: rendered far surface ≤ near truth (worst protrusion %+.2f blocks, facet %d, need ≤ 0)" % [worst, worst_fid])
 	print("    rendered worst protrusion = %+.2f blocks (facet %d); exact-chord CONTRAST = %+.2f blocks (facet %d)" % [worst, worst_fid, contrast, contrast_fid])
@@ -195,6 +218,38 @@ func _gate_bound(active: int, sel: Array) -> void:
 # =====================================================================================================
 func _gate_edit_stub() -> void:
 	print("  --- G-NPT-EDIT: SKIPPED (Phase N2 / FP_ENV_EDITS — not part of N0/N1) ---")
+
+# =====================================================================================================
+# G-NPT-MIDDENSE-LEDGER (§1 F2 / FP_MID_DENSE) — the mid-ring dense promotion is NEVER-OOM bounded. A ring-2 disc is
+# a FIXED angular set (~ring-2 count) and promoted caches are reaped as the sub-point moves, so the extra dense-cache
+# memory is bounded to a small ceiling (design: ~+16 facets ≈ +130 KB). Promote a disc, count the promoted facets and
+# their dense-cache bytes, and assert both stay under a hard ceiling. SKIPPED (no assertion) with the flag off, so the
+# MID-off run is exactly the shipped 32/0.
+# =====================================================================================================
+const MID_DENSE_FACET_CEIL := 40            # NEVER-OOM ceiling on concurrently-promoted facets (ring-2 disc ≈ 13-20)
+const DENSE_BYTES_PER_FACET := 8092         # (BACKSTOP_CELLS+1)² × (Vector3 12 B + Color 16 B) = 289 × 28
+func _gate_mid_dense_ledger(active: int) -> void:
+	if not CubeSphere.FP_MID_DENSE:
+		print("  --- G-NPT-MIDDENSE-LEDGER: SKIPPED (FP_MID_DENSE off) ---")
+		return
+	print("  --- G-NPT-MIDDENSE-LEDGER: the ring-2 dense promotion is NEVER-OOM bounded ---")
+	var ring: Node3D = _mk_ring(active)
+	# Promote the disc around a spread of sub-points; take the WORST (largest) promoted count as the ceiling witness.
+	var worst_cnt := 0
+	var probe := [active]
+	for f in _select_curved_facets(6, active):
+		probe.append(int(f))
+	for center in probe:
+		var c := _centre_dir(center)
+		ring.call("_recompute_mid_dense", [[c.x, c.y, c.z], 0.0])
+		worst_cnt = maxi(worst_cnt, int(ring.call("mid_dense_count")))
+	var kb := float(worst_cnt * DENSE_BYTES_PER_FACET) / 1024.0
+	_ok(worst_cnt <= MID_DENSE_FACET_CEIL,
+		"G-NPT-MIDDENSE-LEDGER: promoted facets %d ≤ %d ceiling (≈ %.0f KB extra dense cache ≤ %.0f KB); NEVER-OOM bounded" % [
+			worst_cnt, MID_DENSE_FACET_CEIL, kb, float(MID_DENSE_FACET_CEIL * DENSE_BYTES_PER_FACET) / 1024.0])
+	print("    worst promoted disc = %d facets ≈ %.0f KB extra dense cache (ceiling %d facets / %.0f KB)" % [
+		worst_cnt, kb, MID_DENSE_FACET_CEIL, float(MID_DENSE_FACET_CEIL * DENSE_BYTES_PER_FACET) / 1024.0])
+	ring.free()
 
 # =====================================================================================================
 # G-NPT-WELD — the EDGE-CANON envelope still WELDS (a fast, self-contained subset of verify_shell_weld @ env_all):

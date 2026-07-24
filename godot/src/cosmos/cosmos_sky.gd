@@ -482,6 +482,30 @@ static func ambient_absolute(sun_dir: Vector3, p: Vector3, h: float, r_vox: floa
 	var occ := occlusion_factor_pen(sun_dir, p, r_vox, pen(h))
 	return lerpf(AMBIENT_UMBRA, 1.0, occ)
 
+## FP_TERM_SUN_CONT: occlusion_factor_pen with the occluder DISTANCE FLOORED to r_vox + H_EYE_MIN. The sun-hide
+## angle dep(h) = asin(r_vox/dist) has d(dep)/dh → ∞ as dist → r_vox (eye at the datum) and PINS at 90° below it
+## (oceans/valleys), so a ±1-block walk step jerks the terminator threshold by up to a whole disc radius ⇒ the
+## disc pops per step. Flooring dist at r_vox + H_EYE_MIN caps dep'(h) at ~asin math near a finite floor
+## (≈0.36°/block at H_EYE_MIN=2), removing the singularity AND the below-datum kink. Kept SEPARATE from
+## occlusion_factor_pen (gate-driven, byte-untouched). H_EYE_MIN passed in so the gate can sweep it.
+static func occlusion_factor_ground(sun_dir: Vector3, p: Vector3, r_vox: float, penum: float, h_eye_min: float) -> float:
+	var dist := maxf(p.length(), r_vox + h_eye_min)
+	if dist <= 0.0:
+		return 1.0
+	var ang_radius := asin(clampf(r_vox / dist, 0.0, 1.0))
+	var to_center := -p / p.length() if p.length() > 0.0 else Vector3.UP
+	var alpha := acos(clampf(sun_dir.dot(to_center), -1.0, 1.0))
+	return smoothstep(ang_radius - penum, ang_radius + penum, alpha)
+
+## FP_TERM_SUN_CONT variants of the absolute light/ambient: same laws, but the occlusion samples the ground-
+## floored distance so per-step brightness stops jittering at low altitude. Off ⇒ light_energy_absolute /
+## ambient_absolute (the un-floored gate-driven functions) run instead — byte-identical.
+static func light_energy_ground(sun_dir: Vector3, p: Vector3, h: float, r_vox: float, h_eye_min: float) -> float:
+	return occlusion_factor_ground(sun_dir, p, r_vox, pen(h), h_eye_min)
+
+static func ambient_ground(sun_dir: Vector3, p: Vector3, h: float, r_vox: float, h_eye_min: float) -> float:
+	return lerpf(AMBIENT_UMBRA, 1.0, occlusion_factor_ground(sun_dir, p, r_vox, pen(h), h_eye_min))
+
 ## A5/A6 C2: the ABSOLUTE terminator day factor at surface direction x̂ — mu = x̂·ŝ. 0 on the night
 ## hemisphere, 1 on the day hemisphere, exactly 0.5 on the great circle x̂·ŝ = 0 (⊥ ŝ by construction).
 static func day_factor(mu: float) -> float:
@@ -1032,6 +1056,12 @@ func _update_sky(t: float) -> void:
 	# the absolute light uses — so the disc/glare and the DirectionalLight die together across the terminator.
 	if CubeSphere.FP_SUN_PATHLIGHT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
 		occ_cam = occlusion_factor_pen(sun_dir, cam_origin, r_vox_sky, pen(cam_origin.length() - r_vox_sky))
+	# FP_TERM_SUN_CONT: re-evaluate occ_cam with the GROUND-FLOORED occluder distance so the disc/glare terminator
+	# threshold stops jittering per walk-step near the ground (dep(h) singularity). Uses the same pen(h) penumbra
+	# as B0 when on, else the fixed OCC_PENUMBRA. Off ⇒ occ_cam untouched (byte-identical).
+	if CubeSphere.FP_TERM_SUN_CONT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
+		var penum_cam := pen(cam_origin.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
+		occ_cam = occlusion_factor_ground(sun_dir, cam_origin, r_vox_sky, penum_cam, CubeSphere.TERM_SUN_H_EYE_MIN)
 
 	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter. A2 floors the angular
 	# size (the real 0.53° disc is an invisible ~8-px dot on gl_compat with no glare); off ⇒ the exact size.
@@ -1050,6 +1080,14 @@ func _update_sky(t: float) -> void:
 	if CubeSphere.FP_SUN_PRESENCE:
 		moon_ang = maxf(moon_ang, deg_to_rad(CubeSphere.MOON_MIN_ANG_DEG))
 	_place_impostor(_moon, cam_origin + moon_dir * _dsky, _dsky * tan(moon_ang * 0.5))
+
+	# FP_TERM_SUN_CONT: the Moon has the SAME per-step disc pop as the Sun (its A1 flip used the SHARP 0.005-rad
+	# penumbra, so it is worse). Compute a continuous, ground-floored Moon occlusion once here; the visible-flip and
+	# the albedo fade below reuse it. Off ⇒ stays 1.0 and neither site reads it (byte-identical).
+	var moon_occ := 1.0
+	if CubeSphere.FP_TERM_SUN_CONT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
+		var penum_moon := pen(cam_origin.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
+		moon_occ = occlusion_factor_ground(moon_dir, cam_origin, r_vox_sky, penum_moon, CubeSphere.TERM_SUN_H_EYE_MIN)
 
 	# A4 (FP_LIGHT_ABSOLUTE): drive the Moon self-phase shader's sun direction — its lit hemisphere faces the
 	# Sun exactly as the shipped shaded material did under the DirectionalLight, but unshaded ⇒ never blacks out
@@ -1077,8 +1115,14 @@ func _update_sky(t: float) -> void:
 			st = scatter_tint(mu_cam)                        # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
 		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
 		if _sun_mat != null:
-			_sun_mat.emission = reddened
-			_sun_mat.albedo_color = reddened
+			# FP_TERM_SUN_CONT: fade the UNSHADED disc smoothly by occlusion instead of the binary visible-flip
+			# (which pops per walk-step at the terminator). Under B0 the emission ENERGY already ∝ occ_cam (below),
+			# so only the albedo self-render needs the factor; without B0 the emission colour carries the disc, so
+			# fade that too. Off ⇒ disc_occ = 1 (emission/albedo = reddened, byte-identical).
+			var disc_occ := maxf(occ_cam, 0.0) if CubeSphere.FP_TERM_SUN_CONT else 1.0
+			var reddened_occ := Color(reddened.r * disc_occ, reddened.g * disc_occ, reddened.b * disc_occ)
+			_sun_mat.emission = reddened_occ if (CubeSphere.FP_TERM_SUN_CONT and not CubeSphere.FP_SUN_PATHLIGHT) else reddened
+			_sun_mat.albedo_color = reddened_occ if CubeSphere.FP_TERM_SUN_CONT else reddened
 			if CubeSphere.FP_SUN_PATHLIGHT:
 				# Disc core stays white×T⃗; energy ∝ L(m)·occ so it is blinding in space, dim-red at sunset,
 				# gone in the umbra (the impostor is a crisp disc, not the K–Y-dimmed blob).
@@ -1094,8 +1138,14 @@ func _update_sky(t: float) -> void:
 	# renders the planet at d≫D_SKY the opaque discs would otherwise draw IN FRONT of it). occlusion_factor==0
 	# means the body is behind the disc. Flag off ⇒ both stay visible (byte-identical). Star-dome mask below.
 	if CubeSphere.FP_SKY_PLANET_OCCLUDE:
-		_sun.visible = occ_cam >= 0.5
-		_moon.visible = occlusion_factor(moon_dir, cam_origin, r_vox_sky) >= 0.5
+		if CubeSphere.FP_TERM_SUN_CONT:
+			# Continuous presence: keep the disc VISIBLE while any light survives (the albedo/energy fade above
+			# does the dimming) — no boolean flip to pop per step. occ_cam/moon_occ are the ground-floored factors.
+			_sun.visible = occ_cam > 0.001
+			_moon.visible = moon_occ > 0.001
+		else:
+			_sun.visible = occ_cam >= 0.5
+			_moon.visible = occlusion_factor(moon_dir, cam_origin, r_vox_sky) >= 0.5
 
 	# --- L1 MOONSHINE (SKY_MOONSHINE, §7.3). Compute the Moon geometry _ramp_environment reads, redden the
 	# impostor through a lunar eclipse, and (v1) aim the optional real second light. Flag off ⇒ this whole block
@@ -1113,6 +1163,10 @@ func _update_sky(t: float) -> void:
 		# redden above is now rare (incl=5.1° under FP_MOON_PRESENCE) so this is the Moon's dominant colour law.
 		if CubeSphere.FP_SUN_PATHLIGHT:
 			moon_albedo = moon_path_albedo(moon_albedo, cam_origin, moon_dir, CosmosGravity.r_vox(OBSERVER), OrbitalState.has_atmo(OBSERVER))
+		# FP_TERM_SUN_CONT: fade the Moon disc by its ground-floored occlusion (same continuous law as the Sun), so
+		# it dims smoothly behind the planet limb instead of the A1 boolean flip. Off ⇒ moon_occ = 1 (no-op).
+		if CubeSphere.FP_TERM_SUN_CONT:
+			moon_albedo = Color(moon_albedo.r * moon_occ, moon_albedo.g * moon_occ, moon_albedo.b * moon_occ)
 		# A4: under the self-phase shader the eclipse redden feeds `base_albedo`; else the shipped StandardMaterial.
 		if _moon_phase_mat != null:
 			_moon_phase_mat.set_shader_parameter("base_albedo", moon_albedo)
@@ -1228,10 +1282,12 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 		# red at the horizon); energy = occ(pen(h)) · L(m). Supersedes A4's K–Y colour on the live light — the
 		# sunset reddening now comes from the physical path, matching the disc, the shell, and the near field.
 		var m_l := optical_path_air_mass(cam_origin, sun_dir, r_vox, has_atmo)
-		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox) * path_luminance(m_l)
+		# FP_TERM_SUN_CONT: ground-floored occlusion so the DirectionalLight energy stops stepping per walk-step at
+		# low altitude (the dep(h) singularity fed the pen(h) occlusion here too). Off ⇒ light_energy_absolute.
+		_sun_light.light_energy = (light_energy_ground(sun_dir, cam_origin, h, r_vox, CubeSphere.TERM_SUN_H_EYE_MIN) if CubeSphere.FP_TERM_SUN_CONT else light_energy_absolute(sun_dir, cam_origin, h, r_vox)) * path_luminance(m_l)
 		_sun_light.light_color = path_transmittance(m_l)
 	elif light_abs:
-		_sun_light.light_energy = light_energy_absolute(sun_dir, cam_origin, h, r_vox)
+		_sun_light.light_energy = light_energy_ground(sun_dir, cam_origin, h, r_vox, CubeSphere.TERM_SUN_H_EYE_MIN) if CubeSphere.FP_TERM_SUN_CONT else light_energy_absolute(sun_dir, cam_origin, h, r_vox)
 		_sun_light.light_color = scatter_tint(maxf(elev, 0.0))
 	elif occ_on:
 		_sun_light.light_energy = occlusion_light(sun_dir, cam_origin, h, r_vox, has_atmo)
@@ -1259,7 +1315,8 @@ func _ramp_environment(sun_dir: Vector3, cam_origin: Vector3) -> void:
 	# Ambient umbra factor: A4's absolute dimmer (continuous, no authority — the surface night side is dark
 	# too, restoring the pre-ORBITAL ambient-only night), else SN4b's altitude-authority occlusion_ambient.
 	if light_abs:
-		ambient *= ambient_absolute(sun_dir, cam_origin, h, r_vox)
+		# FP_TERM_SUN_CONT: ground-floored ambient too, so the twilight fill stops stepping per walk-step.
+		ambient *= ambient_ground(sun_dir, cam_origin, h, r_vox, CubeSphere.TERM_SUN_H_EYE_MIN) if CubeSphere.FP_TERM_SUN_CONT else ambient_absolute(sun_dir, cam_origin, h, r_vox)
 	elif occ_on:
 		ambient *= occlusion_ambient(sun_dir, cam_origin, h, r_vox, has_atmo)
 

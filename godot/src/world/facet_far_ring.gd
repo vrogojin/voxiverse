@@ -22,6 +22,14 @@ const BACK_CULL := 0.0               # front hemisphere only — back-side facet
 const CAMERA_FAR := 9000.0           # the planet spans ~2R; the player camera far must reach it in faceted mode
 const FOG_BEGIN := 2200.0            # fog only far out, so the whole planet reads
 const WARM_BUDGET_MS := 3.0          # FP-S1(d): per-frame cache-warm budget for newly-front-hemisphere facets
+const ENV_WARM_BATCH := 12           # FP_ENV_WARM_ASYNC: max uncached env facets ONE worker dispatch builds before it
+                                     # emits the ready subset. Off-thread ⇒ never touches the frame budget; bounded ⇒
+                                     # NEVER-OOM. The orbit reveal grows ~ENV_WARM_BATCH facets per worker cycle.
+
+# FP_ENV_WARM_ASYNC instrumentation (telemetry-only, env_all path). Counts _env_weld_grid builds by the thread they
+# ran on, so the perf fix is provable: OFF ⇒ all builds on MAIN; ON ⇒ builds on the WORKER, main count frozen.
+static var env_build_main := 0
+static var env_build_worker := 0
 
 var _active_fid := -1
 # COSMOS FP-FIXED-FRAME re-anchor (§3): the accumulated floating-origin shift. Under the fixed frame the ring pins @
@@ -88,6 +96,10 @@ var _async_arrays: Array = []           # worker → main: the committed surface
 # would race the dict). The role is snapshotted here on the main thread at dispatch (fid -> true); the worker only reads
 # this frozen dict, preserving the existing "worker reads read-only per-facet state" contract. Empty with the flag off.
 var _async_backstop: Dictionary = {}
+# FP_ENV_WARM_ASYNC: the FROZEN "this worker warms its own uncached env caches" decision for the in-flight build.
+# Snapshotted on the main thread at dispatch (orbit + env_all + async only) so the worker's warm/emit is stable for
+# its lifetime; false ⇒ the shipped read-only worker (caches pre-warmed on main). Never changes mid-run.
+var _async_env_warm := false
 # T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
 # RemoteBridge (take_events) so the §2.2c "zero-queue crossing stall" (far-ring re-emit prime suspect) is convicted or
 # acquitted in one run. Bounded FIFO (NEVER-OOM: a drain-less headless session can never grow it). `_async_build_us` is
@@ -123,6 +135,7 @@ var _was_done := false                      # _warm_front returned true last orb
 # fall-from-orbit telemetry shows with draws=32). Once the front is fully warmed + emitted with nothing pending, the
 # scan can be skipped until the next drift snapshot re-sets `_pending` — matching the shipped surface idle frame.
 var _orbit_converged := false               # front fully cached + emitted, nothing pending → skip the per-frame warm scan (FP_SHELL_ORBIT_IDLE)
+var _orbit_emitted_once := false            # FP_ENV_WARM_ASYNC: a worker-warm orbit dispatch has fired at least once this engage (fill the mesh even at 0 growth)
 # COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD): hold the cap during a fall — suppress the per-frame radial
 # re-snapshot (the near-surface acos(R/d) blow-up) + throttle the off-surface re-emit so the synchronous rebuild
 # can't fire every frame. `_snapshot_count` is the thrash diagnostic (times a re-emit was SCHEDULED) the gate reads.
@@ -327,6 +340,11 @@ func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool) 
 func _prewarm_step(dt: float) -> void:
 	if not CubeSphere.FP_SHELL_PREWARM:
 		return
+	# FP_ENV_WARM_ASYNC: the one-shot whole-planet warm fills the SAME _pos_cache the worker now builds off-thread. On
+	# the main thread each env facet is ~16 ms, so this prewarm is exactly the second half of the orbit main-thread
+	# stall — let the worker fill caches on demand (bounded batch/cycle) instead. No-op on the surface (offsurface false).
+	if _env_warm_async_on():
+		return
 	var total := FacetAtlas.K * FacetAtlas.K * 6
 	if _prewarm_cursor >= total:
 		return                                # done this session (one-shot)
@@ -400,6 +418,13 @@ func _process(_dt: float) -> void:
 		# until the next drift snapshot re-sets `_pending`. Mirrors the surface `_srf_converged` gate. Off ⇒ the scan runs
 		# every frame exactly as today (byte-identical). The next drift (shell_set_camera_abs) clears it via `_pending`.
 		if CubeSphere.FP_SHELL_ORBIT_IDLE and not _pending and _orbit_converged:
+			return
+		# FP_ENV_WARM_ASYNC: relocate the heavy env-cache build off the main thread. Instead of warming ~1 x 16 ms env
+		# facet per frame on the main thread (the 51 ms orbit stall), dispatch a worker that warms a bounded batch and
+		# emits the ready subset; the main thread only pays the cheap swap. Byte-identical heights (same builder) ⇒ the
+		# no-protrusion gate is unmoved. Scoped to env_all + orbit + async; off ⇒ the shipped S1b path below runs verbatim.
+		if _env_warm_async_on():
+			_orbit_warm_async(p)
 			return
 		# COSMOS-ORBITAL-SHELL S1b (§3): TRUE ORBIT — progressive cached-subset emit. Never block the whole rebuild on
 		# the ~1900-facet cap being cached in ONE frame (impossible under web ×25 warm cost → the live far-side stall).
@@ -494,6 +519,56 @@ func _cull_params() -> Array:
 func _shell_orbit() -> bool:
 	return _cam_set and not _emit_floored_last
 
+## FP_ENV_WARM_ASYNC: is the env-cache build relocated to the far-ring worker? Requires the flag, the env_all regime
+## (the only path whose ~16 ms/facet EDGE-CANON build blows the warm budget), the ORBIT regime (where the whole planet
+## is drawn coarse ⇒ the main-thread warm burst), and a real worker to build on. Off in any of those ⇒ the shipped
+## main-thread warm runs verbatim (byte-identical). Read on the main thread; snapshotted into `_async_env_warm` at dispatch.
+func _env_warm_async_on() -> bool:
+	return CubeSphere.FP_ENV_WARM_ASYNC and TierPlace.env_all_on() and _shell_orbit() and _async_enabled()
+
+## FP_ENV_WARM_ASYNC: the ORBIT driver when the env build lives on the worker. No main-thread warm at all — a cheap
+## dot-scan counts uncached visible facets, then (when the worker is idle: _process guards this behind `not _async_building`)
+## a worker dispatch warms a bounded batch + emits the ready subset. Re-dispatched each idle frame until the front is
+## fully cached (`remaining == 0`), then idles like the shipped `_orbit_converged` short-circuit. The reveal grows
+## ENV_WARM_BATCH facets per worker cycle — same total work as the shipped warm, but entirely off the frame budget.
+func _orbit_warm_async(p: Array) -> void:
+	_emit_cached_only = true
+	var remaining := _count_uncached_visible(p)
+	# Dispatch when: a fresh drift/engage (`_pending`), any facet still to warm (progressive reveal), or the mesh has
+	# never been emitted this engage (fill it even at 0 growth). Each dispatch's worker warms the next batch off-thread.
+	if _pending or remaining > 0 or not _orbit_emitted_once:
+		_begin_rebuild()
+		_orbit_emitted_once = true
+	# Converged once every visible facet is cached AND the pending emit was consumed — the next drift re-sets `_pending`.
+	_orbit_converged = remaining == 0 and not _pending
+
+## FP_ENV_WARM_ASYNC: how many front-hemisphere facets still lack their emit cache. Cheap (front-cull dot + a dict
+## `has()` per fid — NO profile sampling), so it is safe to run every idle frame. Mirrors visible_fids' cull + role.
+func _count_uncached_visible(p: Array) -> int:
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var k := FacetAtlas.K
+	var cnt := 0
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				if not _front_visible(fid, nrm, thresh):
+					continue
+				if CubeSphere.FP_FARRING_FULL_COVER and _is_backstop(fid):
+					if not _bpos_cache.has(fid):
+						cnt += 1
+				elif not _pos_cache.has(fid):
+					cnt += 1
+	return cnt
+
+## FP_ENV_WARM_ASYNC: is facet `fid`'s emit cache present, given its FROZEN backstop role? (worker-thread reader —
+## uses the snapshot dict, never live `_is_backstop`, so it never races set_pool_excluded).
+func _worker_cache_ready(fid: int) -> bool:
+	if _async_backstop.has(fid):
+		return _bpos_cache.has(fid)
+	return _pos_cache.has(fid)
+
 ## COSMOS-PERF STEP 2: whether the off-main-thread rebuild path is live (flag on AND real background workers exist —
 ## a single-core build has no worker to flip is_task_completed, so it must fall back to the synchronous rebuild).
 func _async_enabled() -> bool:
@@ -512,9 +587,13 @@ func _begin_rebuild() -> void:
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
 func _dispatch_async_rebuild() -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
+	# FP_ENV_WARM_ASYNC: when the worker builds its OWN env caches, hand it the FULL front set (uncached included) so it
+	# can warm a bounded batch and emit them the same cycle. Frozen here so the worker's warm/emit is stable for its run
+	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
+	_async_env_warm = _env_warm_async_on()
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
-	_async_fids = visible_fids(_emit_cached_only)
+	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
 	# COSMOS far-ring full coverage (§4): freeze the backstop role on the MAIN thread so the worker never reads `_excluded`
 	# live (set_pool_excluded may mutate it mid-run). Only populated under FULL_COVER; empty otherwise → worker sinks nothing.
 	_async_backstop = {}
@@ -535,9 +614,24 @@ func _async_build_worker() -> void:
 	var t0 := Time.get_ticks_usec()   # T2e: off-thread build wall time (read on main after is_task_completed)
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var warmed := 0
 	for fid in _async_fids:
 		# backstop role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
-		_emit_cached(st, fid, CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid))
+		var backstop := CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid)
+		# FP_ENV_WARM_ASYNC: build this facet's env cache HERE (off-thread) if it is missing, up to ENV_WARM_BATCH per
+		# dispatch. `_async_env_warm` is the frozen main-thread decision (env_all + orbit + async), and while this worker
+		# runs the main thread touches none of these caches (the `_async_building` gate in _process), so this single
+		# writer + no concurrent reader is safe. A facet still uncached after the batch is skipped now, revealed a later
+		# dispatch. Off ⇒ `_async_env_warm` false ⇒ this whole block is inert and the loop is the shipped read-only emit.
+		if _async_env_warm and not _worker_cache_ready(fid):
+			if warmed >= ENV_WARM_BATCH:
+				continue
+			if backstop:
+				_ensure_backstop_cached(fid)
+			else:
+				_ensure_cached(fid)
+			warmed += 1
+		_emit_cached(st, fid, backstop)
 	st.generate_normals()
 	_async_arrays = st.commit_to_arrays()
 	_async_build_us = Time.get_ticks_usec() - t0
@@ -570,6 +664,11 @@ func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
 	_emitted.clear()
 	_emitted_backstop.clear()   # TIER-DEPTH P1: the async build drew the FROZEN `_async_backstop` roles as sunk
 	for fid in fids:
+		# FP_ENV_WARM_ASYNC: `fids` is the FULL front but the worker emitted only the facets whose cache was ready this
+		# cycle (batch-bounded warm). Record ONLY those actually drawn so `_emitted` never claims an un-drawn facet. Off ⇒
+		# every fid was cache-filtered before dispatch, so this guard is a no-op (byte-identical committed set).
+		if _async_env_warm and not _worker_cache_ready(fid):
+			continue
 		_emitted[fid] = true
 		if _async_backstop.has(fid):
 			_emitted_backstop[fid] = true
@@ -1243,6 +1342,12 @@ func _ensure_backstop_cached_env_weld(fid: int) -> void:
 # (horizon_positions / backstop_raw_positions coincide). Returns [pos, col]; the caller stores into the right cache.
 # =====================================================================================================
 func _env_weld_grid(fid: int, cells: int) -> Array:
+	# FP_ENV_WARM_ASYNC telemetry: attribute this (heavy) build to its thread, so the relocation is provable — OFF the
+	# builds land on MAIN; ON they land on the far-ring worker while env_build_main stays frozen. Cheap thread-id compare.
+	if OS.get_thread_caller_id() == OS.get_main_thread_id():
+		env_build_main += 1
+	else:
+		env_build_worker += 1
 	var cd := FacetAtlas.facet_corner_dirs(fid)
 	var stride := cells + 1
 	var cstride := cells / CELLS                       # 1 for the coarse facet, BACKSTOP_CELLS/CELLS for the dense one

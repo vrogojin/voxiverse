@@ -69,6 +69,7 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -341,6 +342,10 @@ func _ready() -> void:
 			_facet_tex.setup(TerrainConfig.active_facet())
 			_facet_tex.prewarm(_facet_ring.visible_fids())
 			_facet_ring.set_facet_tex(_facet_tex.base_texture())
+			# COSMOS LOD-TEXTURE Phase 4: bind the (all-transparent-at-setup) close-up array now so the shader's
+			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
+			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
+			_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -851,6 +856,21 @@ func update_streaming(player_pos: Vector3) -> void:
 		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
 			cover_query = Callable(_module_world, "skin_near_meshed")
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
+	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
+	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,
+	# see THE HARD PERF CONSTRAINT); when the close-up slot map changes (epoch bump) push it + the reverse-map to the
+	# ring (which re-emits so UV2.y carries the new slots) and bind the close-up texture the first time it exists. No-op
+	# unless FP_FACET_TEX && FP_SHELL_ABSOLUTE created the baker (byte-identical off).
+	if _facet_tex != null and _facet_ring != null:
+		var eaxis := _facet_ring.shell_emit_axis()
+		var offs: bool = _facet_ring.shell_offsurface()
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		if _facet_tex.slots_epoch() != _tex_slots_epoch:
+			_tex_slots_epoch = _facet_tex.slots_epoch()
+			if _facet_tex.closeup_texture() != null:
+				_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
+			_facet_ring.set_closeup_slots(_facet_tex.closeup_slots(), _facet_tex.closeup_facet_map())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
@@ -2617,6 +2637,13 @@ func shell_telemetry() -> Dictionary:
 	if _facet_ring == null or not _facet_ring.has_method("shell_telemetry"):
 		return {}
 	return _facet_ring.shell_telemetry()
+
+## COSMOS LOD-TEXTURE Phase 2 telemetry: the far-texture bake ledger (coverage, close-up residency, per-frame bake ms,
+## byte ledger) streamed via the remote bridge next to shell_telemetry(). {} when the baker is absent (flag off).
+func tex_telemetry() -> Dictionary:
+	if _facet_tex == null:
+		return {}
+	return _facet_tex.tex_telemetry()
 
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets

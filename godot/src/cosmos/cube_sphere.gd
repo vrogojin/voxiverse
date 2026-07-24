@@ -423,6 +423,19 @@ const FP_ENV_ALL := false
 ## Default OFF → main-thread warm verbatim (byte-identical). ORBIT-scoped (surface warm path unchanged).
 const FP_ENV_WARM_ASYNC := false
 
+## COSMOS NO-PROTRUSION COVERAGE — the FP_ENV_WARM_ASYNC fix. FP_ENV_ALL made a facet's EMIT wait on its warmed
+## per-facet ENVELOPE cache, and FP_ENV_WARM_ASYNC builds those on the worker at only ENV_WARM_BATCH/cycle, so in
+## orbit the worker runs ~180 facets behind the visible set ⇒ the near hemisphere renders BLACK for 10 s+ and resets
+## on camera move (live: sh_emit 766 < sh_visN 947). When on: an un-warmed coarse facet draws its CHEAP exact-chord
+## weld cache (~300× cheaper than the env build) IMMEDIATELY, then upgrades to the env envelope IN PLACE when the
+## worker warms it — coverage becomes structural (emitted == visible from dispatch #1). The transient un-warmed facet
+## shows the shipped pre-FP_ENV_ALL exact-chord look (worst +52 blk, edge-on ≈ sub-px at the limb) instead of black —
+## the same "un-upgraded = shipped look, never black" law as the LOD texture. SAFE against protrusion: the fallback is
+## ORBIT-ONLY (_shell_orbit, backstop role off, no near voxels); descent (_emit_floored_last) uses the SYNC full-env
+## warm, so the chord never pokes through near terrain. Off / env_all off / not-orbit ⇒ inert (byte-identical).
+## Requires FP_ENV_ALL + FP_ENV_WARM_ASYNC + FP_SHELL_WELD. Gate G-COVER (verify_env_warm_async §C).
+const FP_ENV_FALLBACK_EMIT := false
+
 ## COSMOS NO-PROTRUSION FIDELITY (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §1 F2) — MID-RING DENSE promotion.
 ## Promote every far-ring facet within ~ring-2 (an angular disc ≈ MID_DENSE_RINGS facet-edges of the sub-camera /
 ## emit axis) to emit its DENSE grid (BACKSTOP_CELLS=16, ~26-block cells) instead of the coarse 5×5 (CELLS=4,

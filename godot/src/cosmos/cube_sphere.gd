@@ -463,6 +463,25 @@ const FP_SKIN_TIER := false
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
 
+## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
+## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
+## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the
+## sub-camera direction (the ring's _emit_axis). Each promoted facet's 128² fine grid is baked from the SAME
+## VoxelGeneratorCosmos.sample_columns one-sampler path as the base map (row-sliced under a strict per-frame budget,
+## never a main-thread stall). The absolute shell shader gains `wc = smoothstep(CLOSEUP_FAR, CLOSEUP_NEAR, cam_dist)`
+## and `albedo = mix(base_map, closeup_map[slot], wc)`; the slot rides UV2.y (−1 ⇒ base-map fallback: softening,
+## never a hole). Default OFF ⇒ the close-up array/queue/uniform + UV2 slot are NEVER created (UV2.y stays −1, the
+## closeup sampler is never compiled) ⇒ byte-identical to Phase-1/shipped. NEVER-OOM: 64×128² RGBA8+mips ≈ 5.6 MB
+## fixed at creation, LRU evicts ONLY outside-cap facets (the base map is the safe floor). Requires FP_FACET_TEX.
+const FP_FACET_TEX_CLOSEUP := false
+const FACET_TEX_BAKE_BUDGET_MS := 2.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
+const CLOSEUP_MAX := 64                    # close-up Texture2DArray layer count (fixed at creation → NEVER-OOM)
+const CLOSEUP_TEXELS := 128               # texels per close-up facet edge (≈3.3 blocks/texel, 8× the base map)
+const CLOSEUP_SLICE_ROWS := 16            # rows baked per budget slice (16·128 = 2048 sample_columns cols ≈ 0.5 ms native)
+const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up tier saturates (wc = 1)
+const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
+const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

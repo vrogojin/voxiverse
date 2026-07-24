@@ -839,6 +839,12 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var sh = world.call("shell_telemetry")
 			if sh is Dictionary and not (sh as Dictionary).is_empty():
 				msg.merge(sh as Dictionary)
+			# COSMOS LOD-TEXTURE Phase 2: the far-texture bake ledger (coverage, close-up residency, per-frame bake ms,
+			# bytes). ADDITIVE + empty-dict-guarded: {} with FP_FACET_TEX off ⇒ nothing stamped (byte-identical stream).
+		if world.has_method("tex_telemetry"):
+			var tx = world.call("tex_telemetry")
+			if tx is Dictionary and not (tx as Dictionary).is_empty():
+				msg.merge(tx as Dictionary)
 
 
 ## Capture the game canvas and send it as a binary JPEG frame, unless a capture is already inflight

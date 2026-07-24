@@ -39,6 +39,7 @@ func _initialize() -> void:
 	print("  flag FP_FACET_TEX = %s, spawn facet = %d (K=%d, R=%d)" % [str(CubeSphere.FP_FACET_TEX), fid, FA.K, int(FA.R_BLOCKS)])
 
 	var tex_on := CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE   # LOW #3: the textured ring needs BOTH
+	var cu_on := tex_on and CubeSphere.FP_FACET_TEX_CLOSEUP                   # Phase 4: close-up needs its own flag too
 	_gate_off(fid)
 	if tex_on:
 		_gate_bake(fid)
@@ -46,6 +47,12 @@ func _initialize() -> void:
 		_gate_palette(fid)
 		_gate_cover(fid)
 		_gate_bleed()
+		_gate_budget(fid)                    # Phase 2/4: bounded per-frame bake (G-FT-BUDGET) — the make-or-break
+		if cu_on:
+			_gate_closeup_bake(fid)          # Phase 4: G-FT-CLOSEUP-BAKE (128² texel == generator sample)
+			_gate_slot(fid)                  # Phase 4: G-FT-SLOT (≤64 resident, evict only outside cap)
+		else:
+			print("  (close-up path OFF — G-FT-CLOSEUP-BAKE/SLOT need FP_FACET_TEX_CLOSEUP ON)")
 	else:
 		print("  (texture path OFF — G-FT-BAKE/UV/PALETTE/COVER need FP_FACET_TEX && FP_SHELL_ABSOLUTE ON; OFF-identity by G-FT-OFF)")
 
@@ -303,6 +310,201 @@ func _gate_bleed() -> void:
 	var old := Vector3(pm_r, pm_g, pm_b)
 	var dark := absf(old.x - color.r) + absf(old.y - color.g) + absf(old.z - color.b)
 	_ok(dark > 0.3 and dark > d, "G-FT-BLEED fail-before: straight mip (no un-premultiply) darkens toward black (Δ=%.4f > 0.3, brightness %.0f%%)" % [dark, 100.0 * pm_a])
+
+# --- G-FT-BUDGET: the per-frame bake cost stays bounded across a scripted drive (THE HARD PERF CONSTRAINT) ---
+# Drives the budgeted baker.update() over a scripted orbit (rotating emit axis, off-surface) WITHOUT any prewarm, so
+# every bake unit (base whole-facet + close-up row-slice) is charged. Measures each update()'s wall time and asserts
+# the worst per-frame bake NEVER exceeds the budget by more than one bake unit (check-BEFORE model), AND that base
+# coverage converges. This is the make-or-break proof: no prior fidelity tier stayed bounded on the main thread.
+func _gate_budget(fid: int) -> void:
+	var budget := CubeSphere.FACET_TEX_BAKE_BUDGET_MS
+	# One bake UNIT ceiling (native): a base facet ≈ 0.9 ms; a close-up 16-row slice ≈ 0.5 ms; plus per-bake axis
+	# scans + a first-frame texture upload. The check-BEFORE model bounds a frame at budget + one unit; measure it.
+	var unit_ceil := 3.0
+	var cd := _centre_dir(fid)
+	var worst_ms := 0.0
+	var over_count := 0
+
+	# PHASE A — on-surface progressive BASE coverage: close-up is inert (off-surface only), so base gets the full
+	# budget → coverage must advance monotonically, every frame bounded. This is the Phase-2 progressive proof.
+	var ba := FacetTexBaker.new()
+	ba.setup(fid)
+	ba.prewarm(PackedInt32Array())        # production builds the base array at setup (behind the load hold) — do the same
+	var last := 0
+	var monotonic := true
+	for f in range(200):
+		# drift the axis a little so nearest-unbaked coverage spreads outward from the spawn point
+		var ax := Vector3(cd[0], cd[1], cd[2]).rotated(Vector3(0, 1, 0) if absf(cd[1]) < 0.9 else Vector3(1, 0, 0), float(f) * 0.01)
+		var t0 := Time.get_ticks_usec()
+		ba.update([ax.x, ax.y, ax.z], false, budget)
+		var ms := float(Time.get_ticks_usec() - t0) / 1000.0
+		worst_ms = maxf(worst_ms, ms)
+		if ms > budget + unit_ceil: over_count += 1
+		if ba.baked_count() < last: monotonic = false
+		last = ba.baked_count()
+	_ok(ba.baked_count() > 0 and monotonic,
+		"G-FT-BUDGET: on-surface base coverage advances monotonically under budget (%d / %d baked)" % [ba.baked_count(), 6 * FA.K * FA.K])
+
+	# PHASE B — off-surface orbit sweep: close-up promotion + row-sliced bakes active. The make-or-break: every frame
+	# stays bounded by budget + one unit while the sub-camera point sweeps the globe, and residency never exceeds
+	# CLOSEUP_MAX (it turns over as the cap moves — the fast sweep out-runs the bake, which is the safe direction).
+	var bb := FacetTexBaker.new()
+	bb.setup(fid)
+	bb.prewarm(PackedInt32Array())        # base array built at setup (production behind the load hold)
+	var peak_resident := 0
+	for f in range(240):
+		var ax := Vector3(cd[0], cd[1], cd[2]).rotated(Vector3(0, 1, 0) if absf(cd[1]) < 0.9 else Vector3(1, 0, 0), float(f) * 0.03)
+		var t0 := Time.get_ticks_usec()
+		bb.update([ax.x, ax.y, ax.z], true, budget)
+		var ms := float(Time.get_ticks_usec() - t0) / 1000.0
+		worst_ms = maxf(worst_ms, ms)
+		if ms > budget + unit_ceil: over_count += 1
+		peak_resident = maxi(peak_resident, bb.closeup_resident_count())
+	_ok(over_count == 0,
+		"G-FT-BUDGET: worst per-frame bake = %.3f ms ≤ budget %.1f + one unit %.1f ms over 440 frames (%d overruns)" % [worst_ms, budget, unit_ceil, over_count])
+	_ok(peak_resident <= CubeSphere.CLOSEUP_MAX,
+		"G-FT-BUDGET: off-surface close-up residency ≤ CLOSEUP_MAX (peak %d ≤ %d)" % [peak_resident, CubeSphere.CLOSEUP_MAX])
+	print("    [G-FT-BUDGET] worst-frame update = %.3f ms (bound %.1f); base baked %d, off-surface peak-resident %d, bytes %.2f MB" %
+		[worst_ms, budget + unit_ceil, ba.baked_count(), peak_resident, float(bb.total_bytes()) / (1024.0 * 1024.0)])
+
+	# Falsify: a ZERO budget starts at most one unit — the loop must not run away (the check-BEFORE invariant).
+	var b2 := FacetTexBaker.new(); b2.setup(fid)
+	var t1 := Time.get_ticks_usec()
+	b2.update([cd[0], cd[1], cd[2]], false, 0.0)
+	var ms0 := float(Time.get_ticks_usec() - t1) / 1000.0
+	_ok(ms0 <= unit_ceil, "G-FT-BUDGET falsify: a 0 ms budget starts at most one unit (%.3f ms ≤ %.1f)" % [ms0, unit_ceil])
+	# NEVER-OOM ledger with close-up ON (§4): ≤ 20 MB all-flags-on ceiling.
+	var mb := float(bb.total_bytes()) / (1024.0 * 1024.0)
+	_ok(bb.total_bytes() <= FacetTexBaker.FACET_TEX_BYTES_MAX,
+		"G-FT-BUDGET: total_bytes = %.2f MB ≤ %.0f MB ceiling (base + close-up all-on)" % [mb, float(FacetTexBaker.FACET_TEX_BYTES_MAX) / (1024.0 * 1024.0)])
+
+# --- G-FT-CLOSEUP-BAKE: a resident close-up layer's 128² texels == the generator sample at each column (box-avg 1:1) --
+func _gate_closeup_bake(fid: int) -> void:
+	var baker := FacetTexBaker.new()
+	baker.setup(fid)
+	var cd := _centre_dir(fid)
+	# Drive the budgeted path with the axis pinned on `fid` (it is the nearest want → baked first) until it is resident.
+	var resident := false
+	for _f in range(400):
+		baker.update([cd[0], cd[1], cd[2]], true, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		if baker.closeup_slot(fid) >= 0:
+			resident = true
+			break
+	_ok(resident, "G-FT-CLOSEUP-BAKE: facet %d became a resident close-up layer under the budgeted drive (slot %d)" % [fid, baker.closeup_slot(fid)])
+	if not resident:
+		return
+	# Expected colours: the generator sample at each close-up texel's column (same mapping the baker uses).
+	var n := CubeSphere.CLOSEUP_TEXELS
+	var lc := PackedVector2Array(); lc.resize(4)
+	for ci in range(4):
+		var w := FA.facet_planar_corner(fid, ci)
+		var l := FA.world_to_lattice64(fid, w[0], w[1], w[2])
+		lc[ci] = Vector2(float(l[0]), float(l[2]))
+	var gen = FacetSkinTier._build_cpp_gen(fid)
+	var sampler := Callable(gen, "sample_columns") if gen != null else Callable(FacetSkinTier, "gd_sample")
+	# Spot-check a stride of texels (full 128² is 16k columns — a stride keeps the gate fast but representative).
+	var stride := 11
+	var packed := PackedInt64Array()
+	var coords := []
+	for ty in range(0, n, stride):
+		for tx in range(0, n, stride):
+			var s := (float(tx) + 0.5) / float(n)
+			var t := (float(ty) + 0.5) / float(n)
+			var lx := int(round(_bil(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bil(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			packed.append((lx & 0xffffffff) | ((lz & 0xffffffff) << 32))
+			coords.append(Vector2i(tx, ty))
+	var res: Dictionary = sampler.call(fid, packed)
+	var cols: PackedColorArray = res["colors"]
+	var eps := 0.02                                   # premult round-trip + 8-bit quant
+	var worst := 0.0
+	for i in range(coords.size()):
+		var c: Vector2i = coords[i]
+		var expect: Color = cols[i]
+		var got := baker.closeup_texel_color(fid, c.x, c.y)
+		worst = maxf(worst, maxf(absf(got.r - expect.r), maxf(absf(got.g - expect.g), absf(got.b - expect.b))))
+	_ok(worst <= eps, "G-FT-CLOSEUP-BAKE: every close-up texel == the generator sample at its column (worst Δ=%.4f ≤ %.3f, %d texels)" % [worst, eps, coords.size()])
+	# Falsify: comparing a texel to a DIFFERENT column (shifted) must disagree somewhere.
+	var mism := 0.0
+	for i in range(coords.size() - 1):
+		var c: Vector2i = coords[i]
+		var wrong: Color = cols[i + 1]
+		var got := baker.closeup_texel_color(fid, c.x, c.y)
+		mism = maxf(mism, absf(got.r - wrong.r) + absf(got.g - wrong.g) + absf(got.b - wrong.b))
+	_ok(mism > eps, "G-FT-CLOSEUP-BAKE falsify: a shifted-column comparison disagrees (worst Δ=%.4f > %.3f)" % [mism, eps])
+
+# --- G-FT-SLOT: ≤ CLOSEUP_MAX resident; an in-cap facet is never evicted; eviction only outside the cap ------------
+func _gate_slot(fid: int) -> void:
+	var baker := FacetTexBaker.new()
+	baker.setup(fid)
+	var cd := _centre_dir(fid)
+	var axis := Vector3(cd[0], cd[1], cd[2])
+	var rot_axis := (Vector3(0, 1, 0) if absf(axis.y) < 0.9 else Vector3(1, 0, 0))
+	# Sweep the emit axis across several positions; at each, run the budgeted drive to (near) convergence.
+	var max_resident := 0
+	var in_cap_evict_violations := 0
+	var prev_residents := {}
+	var prev_axis := axis
+	for step in range(10):
+		var ax := axis.rotated(rot_axis, float(step) * 0.04)   # ~2.3° per step (a fraction of the 17° cap → overlap)
+		for _f in range(120):
+			baker.update([ax.x, ax.y, ax.z], true, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		# Invariant 1: residency never exceeds the fixed layer count.
+		max_resident = maxi(max_resident, baker.closeup_resident_count())
+		# Invariant 2: every facet resident at the PREVIOUS axis that is no longer resident now was OUTSIDE the
+		# current want cap when it dropped (evict-only-outside-cap) → an in-cap facet is NEVER evicted.
+		var now := baker.closeup_slots()
+		for f in prev_residents.keys():
+			if not now.has(f) and baker.closeup_in_cap(int(f)):
+				in_cap_evict_violations += 1
+		prev_residents = now
+		prev_axis = ax
+	print("    [G-FT-SLOT] peak resident close-up layers = %d (cap %d); final resident %d" % [max_resident, CubeSphere.CLOSEUP_MAX, baker.closeup_resident_count()])
+	_ok(max_resident <= CubeSphere.CLOSEUP_MAX and max_resident > 1,
+		"G-FT-SLOT: resident close-up layers accumulate and stay ≤ CLOSEUP_MAX (peak %d ≤ %d)" % [max_resident, CubeSphere.CLOSEUP_MAX])
+	_ok(in_cap_evict_violations == 0,
+		"G-FT-SLOT: an in-cap facet is NEVER evicted (%d violations)" % in_cap_evict_violations)
+	# Invariant 3: the reverse-map is exact — every resident facet's layer→(a,b) entry decodes back to that facet.
+	var slots := baker.closeup_slots()
+	var fmap := baker.closeup_facet_map()
+	var map_ok := slots.size() > 0
+	for f in slots.keys():
+		var layer := int(slots[f])
+		var k := FA.K
+		var lf := int(f) - FA.fid_base_of(int(f))
+		var a := int((lf % (k * k)) / k)
+		var b := (lf % (k * k)) % k
+		if absf(fmap[layer].x - float(a)) > 0.5 or absf(fmap[layer].y - float(b)) > 0.5:
+			map_ok = false
+	_ok(map_ok, "G-FT-SLOT: the cu_facet reverse-map decodes every resident layer back to its facet (a,b) (%d resident)" % slots.size())
+	# Invariant 4: a resident facet's emitted UV2.y carries its slot (≥0); the ring re-emits it into the mesh.
+	var ring := FacetFarRing.new()
+	get_root().add_child(ring)
+	ring.setup(fid)
+	ring.set_closeup_slots(baker.closeup_slots(), baker.closeup_facet_map())
+	ring.force_rebuild()
+	var some_fid := -1
+	for f in slots.keys():
+		some_fid = int(f); break
+	if some_fid >= 0:
+		var uv2 := ring.gate_facet_uv2(some_fid)
+		var slot_in_mesh := uv2.size() > 0 and uv2[0].y >= 0.0
+		_ok(slot_in_mesh, "G-FT-SLOT: a resident facet's emitted UV2.y carries its close-up slot (%.0f)" % (uv2[0].y if uv2.size() > 0 else -9.0))
+	ring.queue_free()
+	# Falsify: driving on-surface (offsurface=false) promotes NOTHING (close-up is an off-surface feature).
+	var b2 := FacetTexBaker.new(); b2.setup(fid)
+	for _f in range(60):
+		b2.update([cd[0], cd[1], cd[2]], false, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+	_ok(b2.closeup_resident_count() == 0, "G-FT-SLOT falsify: on-surface drive promotes zero close-up layers (resident %d)" % b2.closeup_resident_count())
+
+## Facet centre direction (unit) — sum of the 4 planar corners, normalized (the baker/ring convention).
+func _centre_dir(fid: int) -> Array:
+	var s := [0.0, 0.0, 0.0]
+	for ci in range(4):
+		var c := FA.facet_planar_corner(fid, ci)
+		s[0] += c[0]; s[1] += c[1]; s[2] += c[2]
+	var ln: float = sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2])
+	return [s[0] / ln, s[1] / ln, s[2] / ln]
 
 static func _bil(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t

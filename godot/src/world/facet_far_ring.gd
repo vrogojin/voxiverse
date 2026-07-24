@@ -70,6 +70,13 @@ var _tri_col_cache: Dictionary = {}  # fid -> PackedColorArray   (96 colors, per
 # _tri_pos_cache so _build_fast's append_array carries them index-aligned into the mesh.
 var _tri_uv_cache: Dictionary = {}   # fid -> PackedVector2Array (96 uvs, per _emit_cached order)
 var _tri_uv2_cache: Dictionary = {}  # fid -> PackedVector2Array (96 uv2s: (face,-1))
+# COSMOS LOD-TEXTURE Phase 4 (§1.2 T2t): the CLOSE-UP slot map (fid → resident layer) the shader reads via UV2.y.
+# Pushed from WorldManager (main thread) each time the baker's slots_epoch bumps. `_slot_snapshot` is the FROZEN copy
+# the mesh build reads — refreshed on the MAIN thread at each build entry (_rebuild_full / _dispatch_async_rebuild)
+# so the async worker's _emit_cached reads a stable map for its lifetime (same freeze contract as _async_backstop).
+# Empty with FP_FACET_TEX_CLOSEUP off ⇒ _slot_of returns -1 everywhere ⇒ UV2.y == -1, byte-identical to Phase 1.
+var _closeup_slots: Dictionary = {}  # fid -> layer (live; written by set_closeup_slots on the main thread)
+var _slot_snapshot: Dictionary = {}  # fid -> layer (frozen at build entry; read by the emit — worker-safe)
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -606,6 +613,7 @@ func _begin_rebuild() -> void:
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
 func _dispatch_async_rebuild() -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
+	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the slot map on MAIN before the worker reads it (no-op off)
 	# FP_ENV_WARM_ASYNC: when the worker builds its OWN env caches, hand it the FULL front set (uncached included) so it
 	# can warm a bounded batch and emit them the same cycle. Frozen here so the worker's warm/emit is stable for its run
 	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
@@ -962,6 +970,7 @@ func _recompute_sticky() -> void:
 ## from force_rebuild (the gate). NOT called synchronously by a crossing — that is the whole point of FP-S1(d).
 func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
+	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the close-up slot map for this build (no-op off)
 	var fids := visible_fids(_emit_cached_only)   # S1b: cache-filtered in the true-orbit progressive path, full set otherwise (shipped)
 	_emitted.clear()
 	_emitted_backstop.clear()   # TIER-DEPTH P1: record which fids this build draws SUNK (the make-before-break gate reads it)
@@ -1061,7 +1070,19 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 			col.append_array(_tri_col_cache[fid])
 			if tex:
 				uv.append_array(_tri_uv_cache[fid])
-				uv2.append_array(_tri_uv2_cache[fid])
+				# COSMOS LOD-TEXTURE Phase 4: the close-up slot is DYNAMIC (LRU per emit axis), so the fast path
+				# cannot ride the permanent (face,-1) uv2 cache once FP_FACET_TEX_CLOSEUP is on — rebuild the 96 uv2s
+				# inline with this rebuild's slot (face is stable, .y = current layer or -1). Off ⇒ the cached (face,-1)
+				# append verbatim (byte-identical to Phase 1). Cheap: 96 pushes/facet, only under the close-up flag.
+				if _cu_on():
+					var face: int = _tex_decode(fid)[0]
+					var sv := Vector2(float(face), _slot_of(fid))
+					var cu2: PackedVector2Array = _tri_uv2_cache[fid].duplicate()
+					for i in range(cu2.size()):
+						cu2[i] = sv
+					uv2.append_array(cu2)
+				else:
+					uv2.append_array(_tri_uv2_cache[fid])
 	if pos.size() == 0:
 		return ArrayMesh.new()
 	var arr := []
@@ -1139,6 +1160,9 @@ func sticky_count() -> int: return _sticky.size()               # TIER-DEPTH P1:
 # COSMOS-ORBITAL-SHELL S1/S2 gate visibility
 func shell_cam_set() -> bool: return _cam_set                   # is the camera-set law currently governing the emit set
 func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE): the current emit cull axis
+## COSMOS LOD-TEXTURE Phase 4: the driver's off-surface decision (camera-set + not floored) — WorldManager gates the
+## close-up promotion on this (the close-up tier is an off-surface / orbit-approach feature; on-surface it stays base map).
+func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
 func shell_emit_cos() -> float: return _emit_cos                # cos(θ_emit): the current emit threshold
 func coarse_cache_size() -> int: return _pos_cache.size()       # S2: how many facets' coarse caches are warmed (prewarm ≤ 6·K²)
 func prewarm_cursor() -> int: return _prewarm_cursor            # S2: prewarm progress (≥ 6·K² ⇒ one-shot complete)
@@ -1660,7 +1684,7 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		fuv2 = Vector2(float(d[0]), -1.0)
+		fuv2 = Vector2(float(d[0]), _slot_of(fid))
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
 	for gj in range(cells):
@@ -1716,7 +1740,7 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		uv2 = Vector2(float(d[0]), -1.0)   # (face, close-up slot: always -1 in Phase 1)
+		uv2 = Vector2(float(d[0]), _slot_of(fid))   # (face, close-up slot: -1 unless FP_FACET_TEX_CLOSEUP promoted it)
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k)
 		inv_c = 1.0 / float(cells)
@@ -1830,6 +1854,24 @@ func _facet_centre_dir(fid: int) -> Array:
 ## sampled. Gating on both keeps FP_FACET_TEX-alone byte-identical to shipped (no UV arrays, no creases).
 func _tex_on() -> bool:
 	return CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE
+
+## COSMOS LOD-TEXTURE Phase 4: the close-up tier is live (needs the base textured ring + its own flag). Off ⇒ every
+## close-up path (slot injection, closeup sampler, cu_facet uniform) is inert ⇒ the mesh + material are Phase-1-identical.
+func _cu_on() -> bool:
+	return CubeSphere.FP_FACET_TEX_CLOSEUP and _tex_on()
+
+## The close-up layer for `fid` from the FROZEN build snapshot (worker-safe), or −1 (base-map fallback). Empty
+## snapshot (close-up off / not driven) ⇒ −1 everywhere ⇒ UV2.y == −1, byte-identical to Phase 1.
+func _slot_of(fid: int) -> float:
+	return float(_slot_snapshot.get(fid, -1))
+
+## COSMOS LOD-TEXTURE Phase 4: refresh the frozen slot snapshot the mesh emit reads. MAIN thread only (both build
+## entries call it before any worker dispatch), so the async worker's _emit_cached reads a map stable for its run.
+func _refresh_slot_snapshot() -> void:
+	if _cu_on():
+		_slot_snapshot = _closeup_slots.duplicate()
+	elif not _slot_snapshot.is_empty():
+		_slot_snapshot = {}
 
 func _tex_decode(fid: int) -> Array:
 	var kb := FacetAtlas.k_of(fid)
@@ -1984,6 +2026,67 @@ void fragment() {
 }
 "
 
+# COSMOS LOD-TEXTURE Phase 4 (§1.2 T2t / §1.3): the CLOSE-UP variant — the Phase-1 tex shader PLUS a second
+# Texture2DArray sampled per-facet at 128² (8× finer). The slot rides UV2.y (v_slot; −1 ⇒ base-map only). The exact
+# facet-local UV is (v_uv·K − (a,b)); (a,b) comes from the `cu_facet` reverse-map uniform keyed by the vertex's own
+# slot (NOT an in-shader floor of v_uv, which is edge-ambiguous where fract(integer)=0). wc = smoothstep(CLOSEUP_FAR,
+# CLOSEUP_NEAR, cam_dist) sharpens on approach; a missing/uncovered slot degrades to the base map (softening, never a
+# hole). Compiled ONLY under FP_FACET_TEX_CLOSEUP; the base branch is byte-identical to _SHELL_ABS_TEX_SHADER so a
+# facet with slot −1 renders exactly the Phase-1 result. cu_facet[64] MUST match CubeSphere.CLOSEUP_MAX.
+const _SHELL_ABS_TEX_CU_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.06;
+uniform float term_mu = 0.12;
+uniform sampler2DArray base_map : source_color, filter_linear_mipmap;
+uniform sampler2DArray closeup_map : source_color, filter_linear_mipmap;
+uniform vec2 cu_facet[64];
+uniform float cu_k = 24.0;
+uniform float cu_near = 1200.0;
+uniform float cu_far = 4000.0;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+varying vec3 v_col_raw;
+varying vec3 v_st;
+varying vec2 v_uv;
+varying float v_face;
+varying float v_slot;
+varying float v_cam;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = night_floor + (1.0 - night_floor) * _day(mu);
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col_raw = COLOR.rgb;
+	v_st = vec3(shade) * tint;
+	v_uv = UV;
+	v_face = UV2.x;
+	v_slot = UV2.y;
+	v_cam = distance(wp, CAMERA_POSITION_WORLD);
+}
+void fragment() {
+	vec4 tx = texture(base_map, vec3(v_uv, v_face));
+	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
+	float cov = tx.a;
+	if (v_slot >= 0.0) {
+		int s = int(v_slot + 0.5);
+		vec2 ab = cu_facet[s];
+		vec2 local = clamp(vec2(v_uv.x * cu_k - ab.x, v_uv.y * cu_k - ab.y), 0.0, 1.0);
+		vec4 cu = texture(closeup_map, vec3(local, v_slot));
+		vec3 cucol = (cu.a > 0.0001) ? (cu.rgb / cu.a) : col;   // premultiplied like the base page
+		float wc = smoothstep(cu_far, cu_near, v_cam) * cu.a;   // sharpen on approach, coverage-gated
+		col = mix(col, cucol, wc);
+		cov = max(cov, cu.a);
+	}
+	float wt = smoothstep(600.0, 1800.0, v_cam) * cov;
+	ALBEDO = mix(v_col_raw, col, wt) * v_st;
+}
+"
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -1993,12 +2096,26 @@ func _make_material() -> Material:
 		# COSMOS LOD-TEXTURE Phase 1 (§1.3): pick the textured variant only when FP_FACET_TEX is on. Flag off ⇒
 		# the shipped _SHELL_ABS_SHADER string VERBATIM (byte-identical material). base_map is bound later by
 		# set_facet_tex (once the baker has built the array).
-		sh2.code = _SHELL_ABS_TEX_SHADER if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+		# COSMOS LOD-TEXTURE Phase 4: the close-up shader variant wins when FP_FACET_TEX_CLOSEUP is on (it subsumes the
+		# Phase-1 tex shader — a slot of −1 renders the identical base-map result). Off ⇒ the Phase-1 / shipped string.
+		if _cu_on():
+			sh2.code = _SHELL_ABS_TEX_CU_SHADER
+		else:
+			sh2.code = _SHELL_ABS_TEX_SHADER if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
 		sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
 		sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		if _cu_on():
+			sm2.set_shader_parameter("cu_k", float(FacetAtlas.K))
+			sm2.set_shader_parameter("cu_near", CubeSphere.CLOSEUP_NEAR)
+			sm2.set_shader_parameter("cu_far", CubeSphere.CLOSEUP_FAR)
+			var seed := PackedVector2Array()   # cu_facet reverse-map seeded to (-1,-1) — no facet resident yet
+			seed.resize(CubeSphere.CLOSEUP_MAX)
+			for i in range(CubeSphere.CLOSEUP_MAX):
+				seed[i] = Vector2(-1.0, -1.0)
+			sm2.set_shader_parameter("cu_facet", seed)
 		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
@@ -2051,6 +2168,43 @@ func set_facet_tex(tex: Texture) -> void:
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("base_map", tex)
+
+## COSMOS LOD-TEXTURE Phase 4: bind the baker's close-up Texture2DArray into the shell shader's `closeup_map`. No-op
+## unless FP_FACET_TEX_CLOSEUP is on and the material is the close-up shader ⇒ flag-off is byte-identical (never wired).
+func set_facet_closeup_tex(tex: Texture) -> void:
+	if not _cu_on() or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("closeup_map", tex)
+
+## COSMOS LOD-TEXTURE Phase 4: push the baker's current slot map (fid→layer) + layer→(a,b) reverse-map. Main thread
+## only (WorldManager, when the baker's epoch bumps). Updates the live `_closeup_slots` (frozen into the mesh at the
+## next build) and the `cu_facet` shader uniform (read live per fragment). Requests a re-emit so the new slots reach
+## the mesh's UV2.y. No-op with the flag off.
+func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void:
+	if not _cu_on():
+		return
+	_closeup_slots = slots
+	if _mi != null:
+		var mat := _mi.material_override
+		if mat is ShaderMaterial and facet_map.size() == CubeSphere.CLOSEUP_MAX:
+			(mat as ShaderMaterial).set_shader_parameter("cu_facet", facet_map)
+	_pending = true                  # re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
+
+## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
+## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).
+func gate_facet_uv2(fid: int) -> PackedVector2Array:
+	if not _tex_on():
+		return PackedVector2Array()
+	# Build the per-facet uv2 the same way the emit does (face, current slot) so the gate reads the live mapping.
+	var out := PackedVector2Array()
+	var face: int = _tex_decode(fid)[0]
+	var sv := Vector2(float(face), _slot_of(fid))
+	out.resize(96)
+	for i in range(96):
+		out[i] = sv
+	return out
 
 ## COSMOS LOD-TEXTURE Phase 1 gate (G-FT-UV): facet `fid`'s tri-soup UVs (the emitted ARRAY_TEX_UV for that
 ## facet, in _emit_cached order). Empty unless FP_FACET_TEX is on. Lets the gate assert per-facet UV mapping +

@@ -38,6 +38,11 @@ var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
+# FP_ENV_FALLBACK_EMIT: fid -> true once `_pos_cache[fid]` holds the ENV envelope (vs a cheap chord fallback still
+# awaiting its worker upgrade). Distinguishes "coarse cache present" from "coarse cache is the min-envelope" so the
+# orbit warm keeps dispatching until every visible facet is truly enveloped, while emitting the chord meanwhile. The
+# coarse caches are NEVER erased (monotonic), so this can never go stale. Empty with the flag off (byte-identical).
+var _env_done: Dictionary = {}       # fid -> true (env envelope built, not just a chord fallback)
 # COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md §3): the SEPARATE dense caches for "backstop"
 # facets (the active facet + the live-pool `_excluded` set) under FP_FARRING_FULL_COVER. Built lazily at BACKSTOP_CELLS
 # (denser than the shipped CELLS=4) by _ensure_backstop_cached; the shipped _pos_cache/_col_cache stay at CELLS for the
@@ -584,7 +589,9 @@ func _count_uncached_visible(p: Array) -> int:
 				if _dense_warm(fid):   # FP_MID_DENSE: a mid-dense target still needs its dense cache (keeps orbit dispatching)
 					if not _bpos_cache.has(fid):
 						cnt += 1
-				elif not _pos_cache.has(fid):
+				# FP_ENV_FALLBACK_EMIT: a chord fallback present but NOT yet enveloped still needs warming — count by
+				# `_env_done`, so `remaining` keeps dispatching until FULL env convergence (not just chord coverage).
+				elif not (_env_done.has(fid) if CubeSphere.FP_ENV_FALLBACK_EMIT else _pos_cache.has(fid)):
 					cnt += 1
 	return cnt
 
@@ -657,17 +664,32 @@ func _async_build_worker() -> void:
 		# this worker runs the main thread touches none of these caches (the `_async_building` gate), so this single
 		# writer + no concurrent reader is safe. Off ⇒ `_async_env_warm` false ⇒ the block is inert (shipped read-only).
 		if _async_env_warm:
-			var have: bool = _bpos_cache.has(fid) if target else _pos_cache.has(fid)
+			# FP_ENV_FALLBACK_EMIT: "have" means the FINAL cache — dense for a target, the ENV envelope (`_env_done`) for a
+			# coarse facet. A chord fallback present in `_pos_cache` does NOT count as done, so this facet stays queued for
+			# its env upgrade. Off ⇒ the shipped `_pos_cache.has` presence test (a chord and an env are indistinguishable).
+			var have: bool
+			if CubeSphere.FP_ENV_FALLBACK_EMIT:
+				have = _bpos_cache.has(fid) if target else _env_done.has(fid)
+			else:
+				have = _bpos_cache.has(fid) if target else _pos_cache.has(fid)
 			if not have:
 				if warmed >= ENV_WARM_BATCH:
-					# Not warmed this cycle: a mid-dense target still draws its COARSE cache (prewarm-ready) so the band
-					# never flickers a hole; a plain coarse facet with no cache is skipped (shipped hole, next cycle).
+					# Batch spent this cycle. FP_ENV_FALLBACK_EMIT: fill the CHEAP exact-chord coarse cache so this facet
+					# draws NOW (never a black hole) — its env upgrade lands a later cycle. Off ⇒ a mid-dense target draws
+					# its prewarm-ready coarse cache; a plain uncached coarse facet is skipped (shipped hole, next cycle).
+					if CubeSphere.FP_ENV_FALLBACK_EMIT:
+						_ensure_chord_cached(fid)
 					if _pos_cache.has(fid):
 						_emit_cached(st, fid, false)
 					continue
 				if target:
 					_ensure_backstop_cached(fid)
 				else:
+					# FP_ENV_FALLBACK_EMIT: if a chord fallback is sitting in `_pos_cache`, drop it so _ensure_cached rebuilds
+					# the ENV envelope in place (same key, no second store); `_env_done` is set inside that env branch.
+					if CubeSphere.FP_ENV_FALLBACK_EMIT and _pos_cache.has(fid) and not _env_done.has(fid):
+						_pos_cache.erase(fid)
+						_col_cache.erase(fid)
 					_ensure_cached(fid)
 				warmed += 1
 		# Emit by cache PRESENCE (never sunk-read a missing dense cache): a warmed/ready dense target → dense sunk; a
@@ -711,7 +733,10 @@ func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
 		# FP_ENV_WARM_ASYNC: `fids` is the FULL front but the worker emitted only the facets whose cache was ready this
 		# cycle (batch-bounded warm). Record ONLY those actually drawn so `_emitted` never claims an un-drawn facet. Off ⇒
 		# every fid was cache-filtered before dispatch, so this guard is a no-op (byte-identical committed set).
-		if _async_env_warm and not _worker_cache_ready(fid):
+		# FP_ENV_FALLBACK_EMIT: EVERY visible facet was drawn this cycle (its env envelope OR a cheap chord fallback), so
+		# coverage is structural — record all, restoring the sh_emit == sh_visN invariant (no black holes). Off ⇒ the
+		# shipped guard below records only cache-ready facets (the batch-bounded warm may leave holes).
+		if _async_env_warm and not CubeSphere.FP_ENV_FALLBACK_EMIT and not _worker_cache_ready(fid):
 			# FP_MID_DENSE: a mid-dense target whose dense cache is still pending WAS drawn coarse this cycle (its
 			# fallback), so it is emitted — record it. A skipped backstop / uncached coarse facet was not. Off ⇒ empty.
 			if _async_mid.has(fid) and _pos_cache.has(fid):
@@ -1203,6 +1228,7 @@ func shell_telemetry() -> Dictionary:
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,
 		"sh_cached": _pos_cache.size(),
+		"sh_envN": _env_done.size(),   # FP_ENV_FALLBACK_EMIT: facets truly enveloped (vs chord fallback) — live upgrade convergence
 		"sh_bcached": _bpos_cache.size(),
 		"sh_prewarm": _prewarm_cursor,
 		"sh_off": _offsurface,
@@ -1249,6 +1275,30 @@ func backstop_raw_positions(fid: int) -> PackedVector3Array:
 	_ensure_backstop_cached(fid)
 	return _bpos_cache[fid]
 
+# FP_ENV_FALLBACK_EMIT: build a facet's CHEAP exact-chord WELD arrays (the shipped pre-FP_ENV_ALL coarse surface,
+# CELLS=4, ~25 profile samples) — ~300× cheaper than the env envelope build. Shared by the FP_SHELL_WELD coarse path
+# above and by _ensure_chord_cached (the orbit fallback). Pure sampling; no cache/scene touch.
+func _weld_chord_arrays(fid: int) -> Array:
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	var stride := CELLS + 1
+	for gj in range(stride):
+		for gi in range(stride):
+			_weld_node(cd, float(gi) / float(CELLS), float(gj) / float(CELLS), pos, col)
+	return [pos, col]
+
+# FP_ENV_FALLBACK_EMIT: ensure facet `fid` has SOME coarse cache to emit — the cheap exact-chord weld — WITHOUT
+# marking `_env_done`, so the orbit warm still upgrades it to the min-envelope later (erase + _ensure_cached in the
+# worker). Keeps orbit coverage structural (never a black hole) while the ~300×-heavier env build streams in behind.
+# Only ever called under the env_all + async + fallback regime (pure orbit — no near terrain for a chord to poke).
+func _ensure_chord_cached(fid: int) -> void:
+	if _pos_cache.has(fid):
+		return
+	var a := _weld_chord_arrays(fid)
+	_pos_cache[fid] = a[0]
+	_col_cache[fid] = a[1]
+
 # Compute + cache facet `fid`'s ABSOLUTE-coord terrain quad once (built from its planarized corners + radial relief).
 func _ensure_cached(fid: int) -> void:
 	if _pos_cache.has(fid):
@@ -1261,21 +1311,17 @@ func _ensure_cached(fid: int) -> void:
 		var g := _env_weld_grid(fid, CELLS)
 		_pos_cache[fid] = g[0]
 		_col_cache[fid] = g[1]
+		if CubeSphere.FP_ENV_FALLBACK_EMIT:
+			_env_done[fid] = true    # this coarse cache IS the min-envelope (not a chord fallback)
 		return
 	# COSMOS FS1 (§4.1): the WELD path emits every vertex RADIALLY from the SHARED cube-sphere corner dirs, so a
 	# facet's edge welds bit-identically to its neighbour's (One-Surface Law). Textually separate from the shipped
 	# planar-corner path so flag-off is byte-identical.
 	if CubeSphere.FP_SHELL_WELD:
-		var cd := FacetAtlas.facet_corner_dirs(fid)
-		var pos := PackedVector3Array()
-		var col := PackedColorArray()
-		var stride := CELLS + 1
-		for gj in range(stride):
-			for gi in range(stride):
-				_weld_node(cd, float(gi) / float(CELLS), float(gj) / float(CELLS), pos, col)
 		# CELLS is the coarse resolution — the coarse-owns-edge snap is a no-op here (cstride==1).
-		_pos_cache[fid] = pos
-		_col_cache[fid] = col
+		var a := _weld_chord_arrays(fid)
+		_pos_cache[fid] = a[0]
+		_col_cache[fid] = a[1]
 		return
 	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
 	var c1 := FacetAtlas.facet_planar_corner(fid, 1)

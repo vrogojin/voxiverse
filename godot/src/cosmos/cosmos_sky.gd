@@ -278,6 +278,75 @@ void fragment() {
 }
 """
 
+# COSMOS O1 (FP_ATMO_GROUND_BUDGET): the ground-budget shell shader VARIANT. Byte-for-byte the shipped
+# _ATMO_SHELL_SHADER above, plus (a) a new `peak_l_ground` uniform (≈0.30) and (b) a `hit_ground` flag set in the
+# solid-surface branch (`b < r_solid && t_hit > 0`); the l_path budget picks peak_l_ground for GROUND-HIT rays
+# (the lit day-disc annulus) and the shipped peak_l for LIMB / sky rays. Used ONLY when the flag is on; off ⇒
+# _ATMO_SHELL_SHADER (verbatim) is used ⇒ byte-identical. Twin: shell_limb_color_path_ground (gate G-O1-GROUND).
+const _ATMO_SHELL_SHADER_GROUND := """
+shader_type spatial;
+render_mode unshaded, cull_front, blend_add, depth_draw_never, shadows_disabled, fog_disabled;
+uniform vec3 cam = vec3(0.0);
+uniform vec3 centre = vec3(0.0);
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float r_solid = 6371.0;
+uniform float r_outer = 7139.0;
+uniform float h_scale = 128.0;
+uniform float term_mu = 0.12;
+uniform float gain = 1.6;
+// B2 (FP_ATMO_PATH_SHELL): path_norm=0 ⇒ the shipped single-sample strength·gain (byte-identical); path_norm=1
+// ⇒ a bounded, budget-normalized limb intensity (peak ≈0.35) so the sky is never blown cyan-white.
+uniform float path_norm = 0.0;
+uniform float peak_l = 0.95;
+// O1 (FP_ATMO_GROUND_BUDGET): the SEPARATE lower budget for GROUND-HIT rays (the lit day-disc annulus). The
+// 0.95 limb budget over an un-extinguished lit surface clips the day disc to white; 0.30 caps that annulus.
+uniform float peak_l_ground = 0.30;
+uniform float sat = 15.0;
+uniform vec3 rayleigh_blue : source_color = vec3(0.15, 0.38, 0.92);
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 wp = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 dir = normalize(wp - cam);
+	vec3 oc = centre - cam;
+	float dc2 = dot(oc, oc);
+	float tca = dot(oc, dir);
+	float b2 = max(dc2 - tca * tca, 0.0);
+	float b = sqrt(b2);
+	if (b >= r_outer) { ALBEDO = vec3(0.0); }
+	else {
+		float h_min = b - r_solid;
+		float half_out = sqrt(max(r_outer * r_outer - b2, 0.0));
+		float seg_start = max(tca - half_out, 0.0);
+		float seg_end = tca + half_out;
+		bool hit_ground = false;
+		if (b < r_solid) { float t_hit = tca - sqrt(max(r_solid * r_solid - b2, 0.0)); if (t_hit > 0.0) { seg_end = min(seg_end, t_hit); hit_ground = true; } }
+		float chord = max(seg_end - seg_start, 0.0);
+		// Sun-angle datum for day/night gating + terminator tint. Shipped (path_norm=0): the infinite-line
+		// closest-approach point (byte-identical). B2 (path_norm=1): the CHORD-MIDPOINT direction — the point in
+		// the atmosphere segment actually being viewed. The closest-approach proxy lands on the HORIZON RING for
+		// near-vertical surface rays (mu≈0 ⇒ the terminator band tint + a lit night zenith), which is exactly the
+		// olive day sky + blue night halo the pilot reported; the midpoint is correct for surface AND orbit.
+		vec3 xca = (cam + tca * dir) - centre;
+		vec3 xmid = (cam + 0.5 * (seg_start + seg_end) * dir) - centre;
+		vec3 xsel = (path_norm > 0.5) ? xmid : xca;
+		vec3 xhat = (length(xsel) > 1e-4) ? normalize(xsel) : -normalize(sun_dir);   // degenerate ⇒ dark (night)
+		float mu = dot(xhat, normalize(sun_dir));
+		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
+		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+		// B2: bound the single-sample overestimate to the §3.5 budget (peak ≈0.35) via a saturating transform.
+		// O1: GROUND-HIT rays use the lower peak_l_ground so the lit day-disc annulus can't clip to white.
+		float l_ship = strength * gain;
+		float peak = hit_ground ? peak_l_ground : peak_l;
+		float l_path = peak * (1.0 - exp(-strength / sat));
+		float l = mix(l_ship, l_path, path_norm) * _day(mu);
+		ALBEDO = rayleigh_blue * tint * l;
+	}
+}
+"""
+
 # Shipped flat-ambient values (main._setup_environment) — reused verbatim as the NIGHT floor so a
 # night sky matches today's look exactly, and DAY brightens above them.
 const _NIGHT_AMBIENT := Color(1, 1, 1)
@@ -490,13 +559,31 @@ static func shell_limb_color(mu: float, chord: float, h_min: float) -> Color:
 const SHELL_PEAK_L := 0.95
 const SHELL_SAT := 15.0
 
+## COSMOS O1 (§2): the SEPARATE, lower peak budget for GROUND-HIT shell rays (the day-disc outer annulus whose
+## view ray terminates on the solid surface). The 0.95 limb budget over ground the shell does NOT extinguish
+## behind it stacks to +0.77 additive → white-cyan clip; 0.30 caps the ground-annulus additive at ≤+0.26. Only
+## bites under FP_ATMO_GROUND_BUDGET; the LIMB / sky-ray budget (SHELL_PEAK_L) is untouched. Tunable.
+const SHELL_PEAK_L_GROUND := 0.30
+
 ## ATMO2 B2: the BOUNDED atmosphere-shell colour. Same base×tint as shell_limb_color, but the strength is a
 ## SATURATING transform of the single-sample optical column (chord·ρ(h_min)/H) so it can never blow past the
 ## §3.5 budget (peak-limb ≈0.35, surface horizon band ≈0.2–0.3), monotone in the optical path, →0 on the night
 ## side. The GLSL twin mixes to this via `path_norm=1`. Colour = the shared scatter_tint/band (= surface path-T⃗).
 static func shell_limb_color_path(mu: float, chord: float, h_min: float) -> Color:
+	return shell_limb_color_path_peak(mu, chord, h_min, SHELL_PEAK_L)
+
+## COSMOS O1 (§2): the GROUND-HIT twin of shell_limb_color_path — identical math, but the lower SHELL_PEAK_L_GROUND
+## budget. The GLSL ground-budget variant selects this peak (peak_l_ground) when the view ray hits the solid
+## surface (`b < r_solid && t_hit > 0`); the LIMB / sky path keeps SHELL_PEAK_L. Twin of that branch (G-O1-GROUND).
+static func shell_limb_color_path_ground(mu: float, chord: float, h_min: float) -> Color:
+	return shell_limb_color_path_peak(mu, chord, h_min, SHELL_PEAK_L_GROUND)
+
+## The peak-parametrized kernel shared by the limb (SHELL_PEAK_L) and ground (SHELL_PEAK_L_GROUND) twins. With
+## peak = SHELL_PEAK_L it is BIT-IDENTICAL to the shipped shell_limb_color_path body (the only change is the
+## budget constant threaded as a parameter), so the shipped limb look is provably untouched.
+static func shell_limb_color_path_peak(mu: float, chord: float, h_min: float, peak: float) -> Color:
 	var ss := chord * exp(-maxf(h_min, 0.0) / H_SCALE) / H_SCALE     # the shipped single-sample optical column
-	var l := SHELL_PEAK_L * (1.0 - exp(-ss / SHELL_SAT)) * day_factor(mu)   # bounded, budget-normalized, day-gated
+	var l := peak * (1.0 - exp(-ss / SHELL_SAT)) * day_factor(mu)   # bounded, budget-normalized, day-gated
 	var t := scatter_tint(mu)
 	var recolour := Color.WHITE.lerp(t, scatter_band(mu))
 	var base := Color(RAYLEIGH_BLUE.r * recolour.r, RAYLEIGH_BLUE.g * recolour.g, RAYLEIGH_BLUE.b * recolour.b)
@@ -845,7 +932,8 @@ func _build_nodes() -> void:
 		ash_mesh.rings = 24
 		_atmo_shell.mesh = ash_mesh
 		var ash_sh := Shader.new()
-		ash_sh.code = _ATMO_SHELL_SHADER
+		# O1 (FP_ATMO_GROUND_BUDGET): select the ground-budget variant string. Off ⇒ the shipped shader verbatim.
+		ash_sh.code = _ATMO_SHELL_SHADER_GROUND if CubeSphere.FP_ATMO_GROUND_BUDGET else _ATMO_SHELL_SHADER
 		_atmo_shell_mat = ShaderMaterial.new()
 		_atmo_shell_mat.shader = ash_sh
 		_atmo_shell_mat.set_shader_parameter("centre", Vector3.ZERO)
@@ -861,6 +949,9 @@ func _build_nodes() -> void:
 			_atmo_shell_mat.set_shader_parameter("path_norm", 1.0)
 			_atmo_shell_mat.set_shader_parameter("peak_l", SHELL_PEAK_L)
 			_atmo_shell_mat.set_shader_parameter("sat", SHELL_SAT)
+		# O1 (FP_ATMO_GROUND_BUDGET): feed the ground-hit budget (the variant shader exposes peak_l_ground).
+		if CubeSphere.FP_ATMO_GROUND_BUDGET:
+			_atmo_shell_mat.set_shader_parameter("peak_l_ground", SHELL_PEAK_L_GROUND)
 		_atmo_shell.material_override = _atmo_shell_mat
 		_atmo_shell.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_atmo_shell.sorting_offset = -0.9                 # additive, with the dome; never sorts against the opaque discs

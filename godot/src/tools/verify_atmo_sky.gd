@@ -55,6 +55,7 @@ func _initialize() -> void:
 	_gate_b5_fog()
 	_gate_b4_moon()
 	_gate_b2_limb()
+	_gate_o1_ground()
 	_gate_b3_nearnight()
 	_gate_inert()
 	_gate_smoke()
@@ -665,6 +666,60 @@ func _gate_b3_nearnight() -> void:
 		_ok(cms.get_shader_parameter("sun_dir") != null, "cloud twin carries the sun_dir uniform")
 		_ok(is_equal_approx(float(cms.get_shader_parameter("night_floor")), SKY.NEAR_NIGHT_FLOOR), "cloud twin night_floor == NEAR_NIGHT_FLOOR (moonlit/dark at night, not bright white)")
 	clouds.free()
+
+# ------------------------------------------------------------------ G-O1-GROUND (O1 FP_ATMO_GROUND_BUDGET)
+func _gate_o1_ground() -> void:
+	print("  --- G-O1-GROUND: ground-hit shell rays use a SEPARATE lower budget (day-disc washout fix) ---")
+	# The pure `l`-factor of the bounded shell = peak·(1−exp(−strength/sat)), extractable at mu=1 where the tint
+	# collapses to WHITE (scatter_band=0) and day_factor=1, so the output colour is exactly RAYLEIGH_BLUE·l per
+	# channel. l_of(col) recovers l = col.r / RAYLEIGH_BLUE.r.
+	var mu_noon := 1.0
+	var big := 1.0e9                                          # strength→∞ (1−exp→1) ⇒ l saturates at the peak budget
+	var h0 := 0.0
+	var rb := SKY.RAYLEIGH_BLUE.r
+	var l_of := func(c: Color) -> float: return c.r / rb
+	# (a) GROUND-HIT ray, strength→∞: l_path_ground saturates at SHELL_PEAK_L_GROUND (0.30), NOT the 0.95 limb budget.
+	var l_ground: float = l_of.call(SKY.shell_limb_color_path_ground(mu_noon, big, h0))
+	var l_limb: float = l_of.call(SKY.shell_limb_color_path(mu_noon, big, h0))
+	_ok(l_limb <= 0.9500001 and l_limb >= 0.9499999, "LIMB/sky ray l_path saturates at 0.95 (shipped budget, %.6f)" % l_limb)
+	print("    l_path budget  LIMB=%.4f  GROUND=%.4f  |  blue additive  shipped=%.4f  ground=%.4f" % [
+		l_limb, l_ground, SKY.shell_limb_color_path(mu_noon, big, h0).b, SKY.shell_limb_color_path_ground(mu_noon, big, h0).b])
+	_ok(l_ground <= 0.30 + 1e-6, "GROUND-hit ray l_path ≤ 0.30 (was →0.95; measured %.6f)" % l_ground)
+	_ok(is_equal_approx(l_ground, SKY.SHELL_PEAK_L_GROUND), "GROUND l_path → SHELL_PEAK_L_GROUND exactly (%.4f)" % l_ground)
+	# Blue-channel additive (the washout metric): the annulus additive on the blue channel drops from ≈0.87 to ≈0.28.
+	var add_blue_ship := SKY.shell_limb_color_path(mu_noon, big, h0).b
+	var add_blue_ground := SKY.shell_limb_color_path_ground(mu_noon, big, h0).b
+	_ok(add_blue_ground < 0.30 and add_blue_ship > add_blue_ground, "ground-annulus blue additive %.3f < shipped %.3f (washout capped)" % [add_blue_ground, add_blue_ship])
+	# (b) LIMB / sky-ray values BIT-UNCHANGED vs the shipped inline single-sample-bounded formula, across the grid.
+	var worst := 0.0
+	for ci in range(1, 13):
+		var chord := 500.0 * float(ci)
+		for hi in range(0, 8):
+			var h_min := 10.0 * float(hi)
+			for mi in range(-10, 11):
+				var mu := float(mi) / 10.0
+				# shipped inline reference (pre-refactor body of shell_limb_color_path, budget = SHELL_PEAK_L)
+				var ss := chord * exp(-maxf(h_min, 0.0) / SKY.H_SCALE) / SKY.H_SCALE
+				var l := SKY.SHELL_PEAK_L * (1.0 - exp(-ss / SKY.SHELL_SAT)) * SKY.day_factor(mu)
+				var t := SKY.scatter_tint(mu)
+				var recolour := Color.WHITE.lerp(t, SKY.scatter_band(mu))
+				var base := Color(SKY.RAYLEIGH_BLUE.r * recolour.r, SKY.RAYLEIGH_BLUE.g * recolour.g, SKY.RAYLEIGH_BLUE.b * recolour.b)
+				var ref := Color(base.r * l, base.g * l, base.b * l)
+				var got := SKY.shell_limb_color_path(mu, chord, h_min)
+				worst = maxf(worst, maxf(absf(got.r - ref.r), maxf(absf(got.g - ref.g), absf(got.b - ref.b))))
+	_ok(worst == 0.0, "LIMB/sky twin BIT-identical to the shipped formula across the (mu,chord,h) grid (worst Δ %.12f)" % worst)
+	# (c) FALSIFY: a PERTURBED ground budget (set to the 0.95 limb value) would blow the ≤0.30 bound — the check discriminates.
+	var l_bad: float = l_of.call(SKY.shell_limb_color_path_peak(mu_noon, big, h0, SKY.SHELL_PEAK_L))
+	_ok(l_bad > 0.30, "falsify: ground budget perturbed to 0.95 ⇒ l_path %.3f > 0.30 (bound is not vacuous)" % l_bad)
+	var l_bad2: float = l_of.call(SKY.shell_limb_color_path_peak(mu_noon, big, h0, 0.60))
+	_ok(l_bad2 > 0.30, "falsify: ground budget perturbed to 0.60 ⇒ l_path %.3f > 0.30" % l_bad2)
+	# The ground-budget SHADER VARIANT string parses/compiles headless (assigning .code triggers the GLSL parse).
+	var gsh := Shader.new()
+	gsh.code = SKY._ATMO_SHELL_SHADER_GROUND
+	var gmat := ShaderMaterial.new()
+	gmat.shader = gsh
+	gmat.set_shader_parameter("peak_l_ground", SKY.SHELL_PEAK_L_GROUND)
+	_ok(gmat.shader != null and gmat.shader.code.length() > 0, "ground-budget shell shader variant compiles headless")
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

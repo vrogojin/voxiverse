@@ -1092,6 +1092,17 @@ const FP_MOON_PRESENCE := false
 ## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
 const FP_ATMO_PATH_SHELL := false
 
+## COSMOS O1 (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §2). The day-side washout fix: the B2 bounded shell
+## budget `SHELL_PEAK_L` (0.95) was tuned for the LIMB (sky-only rays that never terminate on the solid surface).
+## But GROUND-HIT rays — the wide outer annulus of the lit day disc where the view ray ends on the surface —
+## reuse the SAME additive budget over ground that is NOT extinguished behind them, so the in-scatter stacks on
+## the lit surface (+0.77 additive measured at alt 1323) and clips the day disc to white-cyan under the LINEAR
+## tonemap. This flag gives ground-hit rays a SEPARATE, lower budget `SHELL_PEAK_L_GROUND` (≈0.30) in the l_path
+## formula; the LIMB / sky-ray path stays EXACTLY as shipped (0.95). Off ⇒ the shell shader string is the shipped
+## verbatim + peak_l_ground unset ⇒ byte-identical. Requires FP_ATMO_SHELL + FP_ATMO_PATH_SHELL (the budget only
+## bites on the bounded path). Gate G-O1-GROUND. LIVE-ONLY LOOK (P3 shader class). Depends B2.
+const FP_ATMO_GROUND_BUDGET := false
+
 ## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
 ## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
 ## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far

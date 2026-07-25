@@ -2508,6 +2508,12 @@ func mesh_arrays() -> Array:
 		return []
 	return mesh.surface_get_arrays(0)
 
+## COSMOS BLOCK-LOD P1: the far ring's shared material — the L2 block ring (FacetBlockLodRing, a child node) reuses it
+## verbatim so the shell shade·tint law + per-frame sun_dir composition apply to the block tiles for free. Null before
+## setup(). Read-only accessor (the block ring never mutates it).
+func shell_material() -> Material:
+	return _mi.material_override if _mi != null else null
+
 ## Triangle count of the built ring mesh (gate).
 func triangle_count() -> int:
 	if _mi == null or _mi.mesh == null:

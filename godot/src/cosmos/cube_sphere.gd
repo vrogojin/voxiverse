@@ -512,6 +512,19 @@ const FP_BLOCKY_FARRING := false
 ## + edit cascade). Gate: verify_block_lod.gd (G-BLD-PYR / G-BLD-MIN / G-BLD-DETERMINISM). Requires FACETED.
 const FP_BLOCK_LOD := false
 
+## COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5/§9) — tuning constants for the ONE visible L2 ring the
+## FacetBlockLodRing meshes from the P0 pyramid. Pure data (no behaviour with FP_BLOCK_LOD off — the ring node is
+## never constructed ⇒ these are never read). BLOCK_LOD_LEVEL 2 = pitch-4 megablocks; the band is an angular annulus
+## around the active facet's sub-point (BAND_MIN..BAND_MAX blocks of surface arc), so the L2 ring sits just beyond the
+## near voxel field and over the sunk far ring. BLOCK_LOD_BYTES_MAX is the HARD mesh-byte ceiling (§5 v1 = 16 MB); the
+## per-facet tile LRU stops building / wholesale-clears on breach. BLOCK_LOD_TILES_PER_UPDATE bounds per-frame build
+## work (one facet's L0 bake + mesh) so a full-band fill can never spike a single frame.
+const BLOCK_LOD_LEVEL := 2                   # L2 (pitch = 2^2 = 4 blocks)
+const BLOCK_LOD_BAND_MIN := 700.0           # inner band radius (blocks of surface arc from the active sub-point)
+const BLOCK_LOD_BAND_MAX := 1400.0          # outer band radius (blocks)
+const BLOCK_LOD_BYTES_MAX := 16 * 1024 * 1024   # NEVER-OOM hard ceiling for resident L2 tile meshes (§5 v1 = 16 MB)
+const BLOCK_LOD_TILES_PER_UPDATE := 1       # facet tiles built per streaming update (bounded per-frame work)
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

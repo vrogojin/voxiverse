@@ -69,6 +69,7 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: the visible L2 block ring; null unless FP_BLOCK_LOD
 var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
@@ -350,6 +351,16 @@ func _ready() -> void:
 			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
 			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
 			_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
+		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§9): the visible L2 (pitch-4) block ring meshed
+		# from the P0 pyramid, drawn OVER the sunk far ring. Created ONLY under FP_BLOCK_LOD (⇒ absent + byte-identical
+		# off, like _skin / _facet_tex). Added as a CHILD of the far ring so it inherits the far ring's ABSOLUTE
+		# placement transform verbatim (T_active⁻¹ / anchor / SN3 scale) with zero transform book-keeping of its own;
+		# shares the far ring's material so the shell shade·tint law + sun_dir composition come for free.
+		if CubeSphere.FP_BLOCK_LOD:
+			_block_lod = FacetBlockLodRing.new()
+			_block_lod.name = "FacetBlockLodRing"
+			_facet_ring.add_child(_block_lod)
+			_block_lod.setup(TerrainConfig.active_facet(), _facet_ring.shell_material())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -895,6 +906,12 @@ func update_streaming(player_pos: Vector3) -> void:
 			if _facet_tex.closeup_texture() != null:
 				_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
 			_facet_ring.set_closeup_slots(_facet_tex.closeup_slots(), _facet_tex.closeup_facet_map())
+		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§9): drive the L2 block ring from the SAME active
+		# facet + far-ring visible (front-hemisphere) set the far ring uses. It selects the 700..1400-block angular
+		# annulus, builds ≤ BLOCK_LOD_TILES_PER_UPDATE missing tiles/update under the byte ceiling, and frees tiles that
+		# left the band. No-op unless FP_BLOCK_LOD created the node (byte-identical off).
+		if _block_lod != null and _facet_ring != null:
+			_block_lod.update(TerrainConfig.active_facet(), _facet_ring.visible_fids())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync

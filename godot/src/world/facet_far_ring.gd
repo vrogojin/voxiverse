@@ -135,6 +135,10 @@ var _async_env_warm := false
 # emit SUNK, chord or env)? Distinguishes the floored dense-chord path from the orbit path (backstop role off) in the
 # worker. False in orbit / off ⇒ the worker's dense handling is the shipped orbit behaviour.
 var _async_floored := false
+# FP_ENV_FALL_HOLD: frozen at dispatch — this dispatch is CHORD-ONLY (fill coverage, emit, but do NO expensive env
+# builds). Set while the player falls fast: the worker keeps hole=0 with cheap chords (no env alloc firehose ⇒ no
+# convoy), and the driver only dispatches when coverage actually changes (no continuous whole-shell re-emit churn).
+var _async_chord_only := false
 # FP_ENV_FALL_HOLD: set true by WorldManager while the player is descending fast — pauses the env-upgrade dispatch
 # (chords keep coverage) so the worker's allocation firehose stops stalling the shared WASM allocator / physics tick.
 var _fall_hold := false
@@ -534,11 +538,16 @@ func _surface_converge_emit(p: Array) -> void:
 			return
 		_emit_cached_only = true
 		var remaining := _count_uncached_visible(p)
-		# FP_ENV_FALL_HOLD: while falling fast, dispatch ONLY on genuine coverage events (_pending / first emit), never
-		# on the env-upgrade convergence (remaining>0) — the chords already cover (hole=0), so the worker (+ its whole-
-		# shell re-emit alloc firehose) idles during the plunge and resumes the frame the hold lifts. Off ⇒ same as before.
-		var env_warm_ok := not (CubeSphere.FP_ENV_FALL_HOLD and _fall_hold)
-		if _pending or (remaining > 0 and env_warm_ok) or not _orbit_emitted_once:
+		# FP_ENV_FALL_HOLD: while falling fast, dispatch is CHORD-ONLY and fires ONLY when COVERAGE changes (a visible
+		# facet still has no cache) or on a genuine role event (_pending) — never for the env-upgrade convergence. So the
+		# chords keep hole=0 (the transition reveal is chord-filled), but the worker does NO env builds and the whole-
+		# shell re-emit only runs when coverage actually changes (no continuous alloc firehose). Off ⇒ shipped remaining>0.
+		var want := _pending or not _orbit_emitted_once
+		if CubeSphere.FP_ENV_FALL_HOLD and _fall_hold:
+			if _count_uncovered_visible(p) > 0: want = true
+		elif remaining > 0:
+			want = true
+		if want:
 			_begin_rebuild()
 			_orbit_emitted_once = true
 		_srf_converged = remaining == 0 and not _pending
@@ -613,10 +622,14 @@ func _orbit_warm_async(p: Array) -> void:
 	var remaining := _count_uncached_visible(p)
 	# Dispatch when: a fresh drift/engage (`_pending`), any facet still to warm (progressive reveal), or the mesh has
 	# never been emitted this engage (fill it even at 0 growth). Each dispatch's worker warms the next batch off-thread.
-	# FP_ENV_FALL_HOLD: while falling fast, suppress the remaining>0 (env-upgrade) dispatch here too — calms the >384
-	# band's worst frames; chords keep coverage. Off ⇒ byte-identical.
-	var env_warm_ok := not (CubeSphere.FP_ENV_FALL_HOLD and _fall_hold)
-	if _pending or (remaining > 0 and env_warm_ok) or not _orbit_emitted_once:
+	# FP_ENV_FALL_HOLD: falling fast ⇒ chord-only, dispatch only when COVERAGE changes (uncovered visible facet), never
+	# for env upgrade — calms the >384 band's worst frames while chords keep coverage. Off ⇒ shipped remaining>0.
+	var want := _pending or not _orbit_emitted_once
+	if CubeSphere.FP_ENV_FALL_HOLD and _fall_hold:
+		if _count_uncovered_visible(p) > 0: want = true
+	elif remaining > 0:
+		want = true
+	if want:
 		_begin_rebuild()
 		_orbit_emitted_once = true
 	# Converged once every visible facet is cached AND the pending emit was consumed — the next drift re-sets `_pending`.
@@ -643,6 +656,28 @@ func _count_uncached_visible(p: Array) -> int:
 				# FP_ENV_FALLBACK_EMIT: a chord fallback present but NOT yet enveloped still needs warming — count by
 				# `_env_done`, so `remaining` keeps dispatching until FULL env convergence (not just chord coverage).
 				elif not (_env_done.has(fid) if CubeSphere.FP_ENV_FALLBACK_EMIT else _pos_cache.has(fid)):
+					cnt += 1
+	return cnt
+
+## FP_ENV_FALL_HOLD: how many visible facets have NO cache AT ALL (not even a chord) — i.e. a real COVERAGE gap, as
+## opposed to _count_uncached_visible's "not yet ENVELOPED". While the fall-hold is active the driver dispatches
+## (chord-only) exactly when this is > 0, so the transition reveal is chord-filled (hole=0) without the continuous
+## env re-emit churn. A chord counts as covered. Same cheap dot-cull + dict-has as _count_uncached_visible.
+func _count_uncovered_visible(p: Array) -> int:
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var k := FacetAtlas.K
+	var cnt := 0
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var fid := (face * k + a) * k + b
+				if not _front_visible(fid, nrm, thresh):
+					continue
+				if _dense_warm(fid):
+					if not _bpos_cache.has(fid):
+						cnt += 1
+				elif not _pos_cache.has(fid):
 					cnt += 1
 	return cnt
 
@@ -677,6 +712,7 @@ func _dispatch_async_rebuild() -> void:
 	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
 	_async_env_warm = _env_async_any()
 	_async_floored = _env_async_floored_on()   # FP_ENV_FLOORED_ASYNC: frozen regime — floored dense targets emit sunk
+	_async_chord_only = CubeSphere.FP_ENV_FALL_HOLD and _fall_hold   # chord-only while falling fast (coverage, no env)
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
 	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
@@ -706,6 +742,9 @@ func _async_build_worker() -> void:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var warmed := 0
+	# FP_ENV_FALL_HOLD: a CHORD-ONLY dispatch caps the env batch at 0 → every facet takes the cheap chord-fill path
+	# below (coverage stays complete, hole=0), NO expensive env build runs. Off / not-holding ⇒ the full ENV_WARM_BATCH.
+	var env_batch := 0 if _async_chord_only else ENV_WARM_BATCH
 	for fid in _async_fids:
 		# DENSE-TARGET role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
 		var target := CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid)
@@ -731,7 +770,7 @@ func _async_build_worker() -> void:
 			else:
 				have = _bpos_cache.has(fid) if target else _pos_cache.has(fid)
 			if not have:
-				if warmed >= ENV_WARM_BATCH:
+				if warmed >= env_batch:
 					# Batch spent this cycle. FP_ENV_FALLBACK_EMIT: fill the CHEAP chord so this facet draws NOW (never a
 					# hole) — its env upgrade lands a later cycle. A FLOORED dense TARGET fills its DENSE chord and emits
 					# SUNK (full sink → never pokes through near terrain); every other facet its coarse chord. Off ⇒ a

@@ -2102,6 +2102,32 @@ func remote_stop_thrust() -> void:
 func remote_set_roll(rate: float) -> void:
 	remote_roll_rate = rate
 
+## DEV TIME-CHEAT (remote `set_time`, docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set the celestial time-of-day so
+## the player's CURRENT surface position sits at a chosen local solar time. `local_hours` ∈ [0,24] (12 = local
+## noon, Sun highest); if `sun_elev_deg` is finite it instead lands the Sun at that elevation above the local
+## horizon. Folds a persistent f64 offset into the ONE celestial clock the whole ephemeris reads (sun + moon +
+## planets + spin/day-night all move together — no per-body special-case). Returns false (a no-op) when there is
+## no clock (ORBITAL_SKY/climate off), mirroring remote_nav_verb's inert-guard so a scripted set fails loudly.
+## The planet is pinned at scene identity with its centre at the world origin (the fixed-frame keystone), so the
+## player's world position IS its body-fixed surface vector; the ephemeris body-fixed frame is that scene frame.
+func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
+	if world == null:
+		return false
+	var clock: CosmosEphemeris.CosmosClock = world.cosmos_clock()
+	if clock == null:
+		return false
+	var up_bf := global_position                    # planet centred at world origin ⇒ world pos == body-fixed surface vector
+	if up_bf.length() < 1.0e-6:
+		return false
+	var t_eff := clock.now()                         # solve relative to the current (possibly already-offset) phase
+	var delta: float
+	if is_finite(sun_elev_deg):
+		delta = _EphCls.offset_for_sun_elev(CosmosSky.OBSERVER, up_bf, t_eff, sun_elev_deg)
+	else:
+		delta = _EphCls.offset_for_local_hours(CosmosSky.OBSERVER, up_bf, t_eff, local_hours)
+	clock.add_offset(delta)
+	return true
+
 ## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
 ## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE
 ## + guarded: returns {} when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` null), so the bridge merge adds

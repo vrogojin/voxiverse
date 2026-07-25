@@ -95,7 +95,10 @@ const STALE_S = 120;                 // `issued` older than this => rejected (a 
 const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload',
   // COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — dev/test space-nav verbs. Still consent-gated + control-token
   // gated exactly like every op; the relay only ROUTES, the rover re-validates and executes behind the grant.
-  'dev_nav', 'nav', 'thrust', 'roll']);
+  'dev_nav', 'nav', 'thrust', 'roll',
+  // DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set celestial time-of-day at the player. The relay
+  // only ROUTES + bounds-checks; the rover re-validates and executes behind the grant, like every op.
+  'set_time']);
 const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
@@ -310,6 +313,13 @@ function validateStep(st) {
       if (typeof st.seconds !== 'number' || !(st.seconds > 0) || st.seconds > MAX_HOLD_S) return rej('caps', `roll.seconds must be in (0,${MAX_HOLD_S}]`);
       if (st.dir !== undefined && !['left', 'right'].includes(st.dir)) return rej('caps', `bad roll dir '${st.dir}'`);
       return okEst(st.seconds);
+    }
+    case 'set_time': {                                   // DEV TIME-CHEAT: local_hours ∈ [0,24]; optional sun_elev_deg ∈ [-90,90]
+      if (typeof st.local_hours !== 'number' || !isFinite(st.local_hours) || st.local_hours < 0 || st.local_hours > 24)
+        return rej('caps', 'set_time.local_hours must be in [0,24]');
+      if (st.sun_elev_deg !== undefined && (typeof st.sun_elev_deg !== 'number' || !isFinite(st.sun_elev_deg) || st.sun_elev_deg < -90 || st.sun_elev_deg > 90))
+        return rej('caps', 'set_time.sun_elev_deg must be in [-90,90]');
+      return okEst(0.2);
     }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');

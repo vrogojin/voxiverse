@@ -75,7 +75,10 @@ const STALE_S := 120.0
 const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload",
 	# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the dev/test space-nav verbs. Behind CONTROL_ENABLED like
 	# every op; the executor that runs them exists only under a live grant, so this list is dead in normal play.
-	"dev_nav", "nav", "thrust", "roll"]
+	"dev_nav", "nav", "thrust", "roll",
+	# DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set the celestial time-of-day at the player.
+	# Behind CONTROL_ENABLED like every op; resolves synchronously via player.remote_set_time.
+	"set_time"]
 const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
@@ -1167,6 +1170,15 @@ func _validate_cmd(m: Dictionary) -> String:
 			return "caps"
 		if op == "nav" and not ["orbit", "geostation", "detach"].has(str((st as Dictionary).get("verb", ""))):
 			return "caps"
+		# DEV TIME-CHEAT: local_hours ∈ [0,24]; optional sun_elev_deg ∈ [-90,90]. Bounds re-checked here on the
+		# rover (the relay validates too); an out-of-range value is a `caps` reject, never clamped silently.
+		if op == "set_time":
+			var lh = (st as Dictionary).get("local_hours", null)
+			if not (lh is float or lh is int) or float(lh) < 0.0 or float(lh) > 24.0:
+				return "caps"
+			var se = (st as Dictionary).get("sun_elev_deg", null)
+			if se != null and (not (se is float or se is int) or float(se) < -90.0 or float(se) > 90.0):
+				return "caps"
 	return ""
 
 

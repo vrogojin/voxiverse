@@ -95,18 +95,36 @@ const BODIES := {
 # (the gate asserts the sum), and the ephemeris is a pure function of t (no hidden clock read).
 # ---------------------------------------------------------------------------------------
 class CosmosClock extends RefCounted:
-	var t: float = 0.0                         # f64 seconds since epoch
+	var t: float = 0.0                         # f64 seconds since epoch (advanced by the frame loop)
+	## DEV TIME-CHEAT (remote `set_time`, docs/COSMOS-REMOTE-CONTROL-DESIGN.md): a persistent f64 seconds
+	## offset ADDED to the accumulated clock by now(). Default 0.0 ⇒ now() == t ⇒ ZERO behaviour change
+	## (byte-identical). Because EVERY celestial read (sun/moon/planets/spin, day-night, the weather grid)
+	## goes through now(), setting this ONE field re-orients the whole ephemeris coherently — no per-body
+	## special-casing. advance() only ever touches `t`, so after a set the clock keeps ticking from the
+	## new phase (persistent). The remote cheat computes the offset needed to land the player's current
+	## surface position at a chosen local solar time (offset_for_local_hours) and folds it in via add_offset.
+	var offset: float = 0.0
 
 	func _init(t0: float = 0.0) -> void:
 		t = t0
 
 	## Advance the clock by a REAL frame delta (seconds); the sky moves √1000× via the scaled GM, and
-	## TIME_WARP (=1) is the only extra multiplier. Pure accumulation — no wall clock is read here.
+	## TIME_WARP (=1) is the only extra multiplier. Pure accumulation — no wall clock is read here. NB:
+	## only `t` accumulates; the dev time-cheat `offset` is preserved, so the set phase persists as time runs.
 	func advance(real_dt: float) -> void:
 		t += real_dt * CosmosEphemeris.TIME_WARP
 
 	func now() -> float:
-		return t
+		return t + offset
+
+	## DEV TIME-CHEAT: set the persistent offset to an absolute value (0.0 restores the un-cheated clock).
+	func set_offset(o: float) -> void:
+		offset = o
+
+	## DEV TIME-CHEAT: fold an INCREMENTAL delta into the offset — what the remote `set_time` op applies
+	## (offset_for_local_hours returns a delta relative to the CURRENT now()). Composes cleanly across calls.
+	func add_offset(d: float) -> void:
+		offset += d
 
 # ---------------------------------------------------------------------------------------
 # Body-table accessors (pure reads of the frozen const table).
@@ -401,3 +419,69 @@ static func sub_longitude(body: String, target: String, t: float) -> float:
 	var bx := c * di[0] - s * di[1]
 	var by := s * di[0] + c * di[1]
 	return atan2(by, bx)
+
+# ---------------------------------------------------------------------------------------
+# DEV TIME-CHEAT (remote `set_time`) — pure statics that map a chosen LOCAL SOLAR TIME at a surface
+# point to the persistent CosmosClock offset that lands it there. Engine-free & deterministic (gate
+# verify_time_cheat.gd drives them directly), so they add ZERO bytes to the shipped path (dead unless
+# the CONTROL_ENABLED remote op calls them). CONVENTION: the ephemeris body-fixed frame IS the render/
+# scene frame (CosmosSky places dir_to_bodyfixed(...) straight into world space, planet centred at the
+# origin), so `up_bf` — the unit surface normal at the player, = player_world_pos.normalized() — and the
+# body-fixed Sun direction share one frame. +Z is the spin/north axis; longitude = atan2(y, x).
+# ---------------------------------------------------------------------------------------
+
+## The LOCAL HOUR-ANGLE rate d(ha)/dt (rad/s) for `observer` — the SOLAR-day rate: the surface spins at
+## omega_spin while the Sun's inertial direction drifts at omega_orbit, so the subsolar meridian sweeps a
+## point at (omega_spin − omega_orbit). For Earth this is 2π / (√1000-scaled solar day ≈ 2740 s). The whole
+## ha(t) is EXACTLY linear in t at this rate when the axial tilt is 0 (the shipped FP_SEASONS-off kernel),
+## so the offset solve below is exact there (and a close dev-cheat approximation under a small obliquity).
+static func local_hour_angle_rate(observer: String) -> float:
+	return omega_spin(observer) - omega_orbit(observer)
+
+## The local solar HOUR ANGLE (rad, wrapped to [−π,π]) of the Sun at a surface point whose body-fixed up is
+## `up_bf`, at time t: ha = longitude(point) − longitude(sub-solar meridian). ha = 0 ⇒ the Sun is on the
+## point's meridian (local noon, daily-max elevation); ha = ±π ⇒ midnight. `up_bf` need not be unit (only its
+## azimuth is used). Reads the SAME dir_to_bodyfixed the sky renders, so this agrees with what the player sees.
+static func local_hour_angle(observer: String, up_bf: Vector3, t: float) -> float:
+	var sun_bf := dir_to_bodyfixed(observer, "sun", t)
+	var lon_p := atan2(up_bf.y, up_bf.x)
+	var lon_s := atan2(sun_bf.y, sun_bf.x)
+	return wrapf(lon_p - lon_s, -PI, PI)
+
+## The local solar TIME in hours ∈ [0,24) at `up_bf` and t: 12 h at ha=0 (noon), 0/24 h at ha=±π (midnight).
+static func local_solar_hours(observer: String, up_bf: Vector3, t: float) -> float:
+	return fposmod(12.0 + local_hour_angle(observer, up_bf, t) / TAU * 24.0, 24.0)
+
+## DEV TIME-CHEAT core: the clock-offset DELTA (game seconds, may be negative) to add so that, at the point
+## whose body-fixed up is `up_bf`, the local solar hour angle becomes `ha_target` (rad). Solves the linear
+## ha(t)=const+rate·t for the SHORTEST signed step (wrap to [−π,π]) so a set never spins through extra days.
+static func offset_for_hour_angle(observer: String, up_bf: Vector3, t: float, ha_target: float) -> float:
+	var rate := local_hour_angle_rate(observer)
+	if rate == 0.0:
+		return 0.0
+	var ha0 := local_hour_angle(observer, up_bf, t)
+	return wrapf(ha_target - ha0, -PI, PI) / rate
+
+## DEV TIME-CHEAT primary: the clock-offset DELTA to add so the point `up_bf` reads local solar time
+## `target_hours` ∈ [0,24] (12 = local noon, Sun highest). Maps hours→hour-angle (noon=0) then solves.
+static func offset_for_local_hours(observer: String, up_bf: Vector3, t: float, target_hours: float) -> float:
+	var ha_target := (fposmod(target_hours, 24.0) - 12.0) / 24.0 * TAU
+	return offset_for_hour_angle(observer, up_bf, t, ha_target)
+
+## DEV TIME-CHEAT optional: the clock-offset DELTA to add so the Sun stands at elevation `elev_deg` above
+## the local horizon at `up_bf`. Uses the spin-INVARIANT solar declination (asin of the body-fixed Sun's
+## north component — unchanged by the spin we vary) with the point's latitude in the standard elevation
+## law sin(e)=sinφ·sinδ+cosφ·cosδ·cos(ha); the target elevation is clamped to the point's achievable
+## [min,max] for the day (cos ha clamped to [−1,1]), and the AFTERNOON solution (ha ≥ 0) is chosen.
+static func offset_for_sun_elev(observer: String, up_bf: Vector3, t: float, elev_deg: float) -> float:
+	var u := up_bf.normalized()
+	if u == Vector3.ZERO:
+		return 0.0
+	var sun_bf := dir_to_bodyfixed(observer, "sun", t)
+	var lat := asin(clampf(u.z, -1.0, 1.0))                       # point latitude φ
+	var dec := asin(clampf(sun_bf.z, -1.0, 1.0))                  # solar declination δ (spin-invariant)
+	var e := deg_to_rad(clampf(elev_deg, -90.0, 90.0))
+	var denom := cos(lat) * cos(dec)
+	var cos_ha := 1.0 if absf(denom) < 1.0e-9 else (sin(e) - sin(lat) * sin(dec)) / denom
+	var ha_target := acos(clampf(cos_ha, -1.0, 1.0))              # ∈ [0,π]; afternoon branch (ha ≥ 0)
+	return offset_for_hour_angle(observer, u, t, ha_target)

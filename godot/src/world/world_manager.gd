@@ -383,6 +383,12 @@ func _ready() -> void:
 func set_cosmos_clock(clock: CosmosEphemeris.CosmosClock) -> void:
 	_cosmos_clock = clock
 
+## The celestial clock (or null when no ORBITAL_SKY/climate clock was injected). Read-only accessor so the
+## dev remote `set_time` cheat (player.remote_set_time, CONTROL_ENABLED-gated) can fold a time offset into
+## the ONE clock the whole ephemeris/sky reads. Null off ORBITAL_SKY ⇒ the cheat is a no-op.
+func cosmos_clock() -> CosmosEphemeris.CosmosClock:
+	return _cosmos_clock
+
 ## COSMOS-PERF FALL-COLLAPSE FIX C (FP_SNOW_SKIP_AIRBORNE): true when the player is a HIGH FLYER (lattice altitude
 ## above the active-facet plane > OFFSURFACE_Y — the same cheap y-test the pool off-surface freeze uses) and the
 ## snowfall fixed-step should be skipped (no walkable ground snow under the camera at flight altitude). Byte-identical

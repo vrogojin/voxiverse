@@ -502,6 +502,16 @@ const FP_FACET_TEX := false
 ## welded emit VERBATIM (textually-separate branch, byte-identical). Gate G-BLK-RING.
 const FP_BLOCKY_FARRING := false
 
+## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
+## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
+## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /
+## MAJORITY surface-id / OR water — the no-protrusion-by-containment rule, §3). There is NO render/update path yet, so
+## NOTHING in the running engine calls FacetBlockLod ⇒ byte-identical off is AUTOMATIC regardless of this flag's value
+## (the flag only anchors the phase chain + lets the gate reference the class constants). Later phases wire it in:
+## FP_BLOCK_LOD_RINGS (ladder+LRU+fade), FP_BLOCK_LOD_GLOBAL (L5 resident), FP_BLOCK_LOD_REALBAKE / _EDITS (live voxels
+## + edit cascade). Gate: verify_block_lod.gd (G-BLD-PYR / G-BLD-MIN / G-BLD-DETERMINISM). Requires FACETED.
+const FP_BLOCK_LOD := false
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

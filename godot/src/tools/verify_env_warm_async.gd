@@ -87,6 +87,63 @@ func _init() -> void:
 		ok = _expect(env_n == FacetFarRing.ENV_WARM_BATCH, "C env bound honoured (only the batch is enveloped; the rest chord)") and ok
 	else:
 		ok = _expect(covered == FacetFarRing.ENV_WARM_BATCH, "C (fallback OFF) shipped hole: only the batch is covered (would black-hole in orbit)") and ok
+
+	# E) FLOORED COVERAGE MID-CONVERGENCE (G-FLOOR-COVER, FP_ENV_FLOORED_ASYNC). The descent regression: on the ground
+	# _shell_orbit()=false ⇒ the orbit mitigations were inert ⇒ emit cache-gated (the brown wedge) + 16-40ms/facet env
+	# on MAIN (the hitch). With _async_floored, ONE worker dispatch of a >batch front with DENSE targets must: (i) leave
+	# every visible facet with a DRAW cache — dense (sunk) for targets, coarse for the rest, NO holes; (ii) build ALL env
+	# on the WORKER (env_build_main==0 — the perf assert that catches the main-thread stall class).
+	if CubeSphere.FP_ENV_FLOORED_ASYNC:
+		var ring4 := FacetFarRing.new()
+		FacetFarRing.env_build_main = 0
+		FacetFarRing.env_build_worker = 0
+		var fids4 := PackedInt32Array()
+		var backstop4 := {}
+		for fid in range(500, 500 + FacetFarRing.ENV_WARM_BATCH + 40):
+			fids4.append(fid)
+		for i in range(10):                                  # ~10 dense targets (backstop role, near-terrain facets)
+			backstop4[500 + i] = true
+		ring4._async_fids = fids4
+		ring4._async_backstop = backstop4
+		ring4._async_env_warm = true
+		ring4._async_floored = true
+		ring4._async_building = true
+		var task4: int = WorkerThreadPool.add_task(Callable(ring4, "_async_build_worker"), false, "floored coverage")
+		WorkerThreadPool.wait_for_task_completion(task4)
+		var covered4 := 0
+		var targets_dense := 0
+		for fid in fids4:
+			if backstop4.has(fid):
+				if ring4._bpos_cache.has(fid):               # dense target → dense cache (sunk on emit), NEVER a coarse hole
+					covered4 += 1; targets_dense += 1
+			elif ring4._pos_cache.has(fid):
+				covered4 += 1
+		print("E) floored coverage %d/%d (targets dense-cached %d/10); env_main=%d env_worker=%d benv=%d envN=%d" % [
+			covered4, fids4.size(), targets_dense, FacetFarRing.env_build_main, FacetFarRing.env_build_worker,
+			ring4._benv_done.size(), ring4._env_done.size()])
+		ok = _expect(covered4 == fids4.size(), "E floored coverage == visible (dense targets dense-cached, none holed)") and ok
+		ok = _expect(targets_dense == 10, "E every dense target has a dense (sunk) cache — never an un-sunk coarse poke") and ok
+		ok = _expect(FacetFarRing.env_build_main == 0, "E env_build_main == 0 (no 16-40ms main-thread env stall on the ground)") and ok
+		ok = _expect(FacetFarRing.env_build_worker > 0, "E env upgrades ran on the WORKER this cycle") and ok
+
+		# F) CHORD-UPGRADE-ON-GROUND (latent leak): a coarse chord minted (e.g. in orbit) must env-UPGRADE under a floored
+		# worker pass — not be treated as "cached" forever (the silent R-A/R-B protrusion re-leak). Mint a chord, then run
+		# floored worker dispatches until the fid is enveloped.
+		var ring5 := FacetFarRing.new()
+		var fid5 := 900
+		ring5._ensure_chord_cached(fid5)                     # mint a coarse chord (no _env_done)
+		var pre := ring5._env_done.has(fid5)
+		var far := PackedInt32Array([fid5])
+		ring5._async_fids = far
+		ring5._async_backstop = {}
+		ring5._async_env_warm = true
+		ring5._async_floored = true
+		ring5._async_building = true
+		var task5: int = WorkerThreadPool.add_task(Callable(ring5, "_async_build_worker"), false, "chord upgrade")
+		WorkerThreadPool.wait_for_task_completion(task5)
+		print("F) chord-upgrade: env_done pre=%s post=%s" % [str(pre), str(ring5._env_done.has(fid5))])
+		ok = _expect(not pre, "F a freshly minted chord is NOT env_done") and ok
+		ok = _expect(ring5._env_done.has(fid5), "F the chord env-UPGRADES on a floored pass (no silent protrusion re-leak)") and ok
 	_finish(ok)
 
 func _expect(cond: bool, label: String) -> bool:

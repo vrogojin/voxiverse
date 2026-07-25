@@ -87,6 +87,14 @@ static func backstop_sink() -> float:
 		return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)   # ε guard scales with the cell (rescale-safe), floored at 1.5
 	return CubeSphere.BACKSTOP_SINK_FRAC * cell
 
+## FP_ENV_FLOORED_ASYNC: the FULL radial sink for a CHORD fallback vertex — the exact pre-envelope BACKSTOP_SINK
+## (BACKSTOP_SINK_FRAC × cell, ≈13 at R=6371), regardless of env_all. A chord is the raw profile sample, NOT the
+## min-envelope, so it needs the full sink (not the ε) to sit ≤ the near surface — byte-for-byte the FULL_COVER
+## backstop that shipped live before FP_ENV_ALL. Used by _emit_cached for a not-yet-enveloped dense/coarse facet.
+static func backstop_sink_chord() -> float:
+	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	return CubeSphere.BACKSTOP_SINK_FRAC * cell
+
 ## P3: the window-space depth-bias uniform value for tier `k` quanta = 2·k·2⁻²⁴ (POSITION.z += bias·w).
 static func bias_for_k(k: int) -> float:
 	return 2.0 * float(k) * DEPTH_QUANTUM

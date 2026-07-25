@@ -1077,6 +1077,9 @@ func _reap_mid_dense(keep: Dictionary) -> void:
 			continue
 		_bpos_cache.erase(f)
 		_bcol_cache.erase(f)
+		_benv_done.erase(f)   # FP_ENV_FLOORED_ASYNC: drop the "dense-enveloped" flag with the cache it describes, else a
+		                      # later re-promotion rebuilds a cheap chord but _emit_cached still reads the ε sink (protrusion)
+		                      # and the warm/count paths think it is converged (stale coverage).
 
 ## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded
 ## / setup). Make-before-break: the TARGET = active ∪ ring-1 neighbours (the design's set; a facet the player can cross into

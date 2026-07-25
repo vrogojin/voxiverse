@@ -856,8 +856,8 @@ func update_streaming(player_pos: Vector3) -> void:
 					_fall_vy_ema = lerpf(_fall_vy_ema, (player_pos.y - _last_player_pos.y) / dtf, 0.3)
 		_fall_last_usec = nowu
 		var hold := _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY
-		if CubeSphere.FP_ENV_FALL_HOLD and _far != null and _far.has_method("set_fall_hold"):
-			_far.set_fall_hold(hold)
+		if CubeSphere.FP_ENV_FALL_HOLD and _facet_ring != null and _facet_ring.has_method("set_fall_hold"):
+			_facet_ring.set_fall_hold(hold)   # the FACETED far ring (FacetFarRing) — NOT _far (FarTerrain, null in faceted mode)
 		if CubeSphere.FP_LAND_RAMP_HOLD and using_module and _module_world != null and _module_world.has_method("set_fall_hold"):
 			_module_world.set_fall_hold(hold)
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is

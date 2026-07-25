@@ -500,7 +500,11 @@ func _ramp_pool_step(delta: float) -> bool:
 		return shrinking
 	# Advance ONLY the chosen slot this frame (RAMP_SECONDS to traverse ramp_from → view_target).
 	var sc: Dictionary = _pool[up_fid]
-	var span := maxf(float(sc["view_target"]) - float(sc["ramp_from"]), 1.0)
+	# FP_LAND_RAMP_HOLD: the grow leg must ALSO respect the landing-disc clamp (not just candidate selection) — else a slot
+	# spawned below the disc mid-plunge ramps past it toward the full radius (the alloc firehose the hold prevents) and
+	# oscillates. `view_target` is left intact so the slot restores after touchdown; only the effective ceiling is clamped.
+	var sc_tgt := minf(float(sc["view_target"]), hold_clamp)
+	var span := maxf(sc_tgt - float(sc["ramp_from"]), 1.0)
 	# FP-M2c surface 3: the GROW leg is paced by the load controller (RAMP_SECONDS = the min duration, stretched under
 	# load; pace 0 holds the grow). Default pace 1.0 → the shipped ramp math verbatim. Shrinks above snapped separately.
 	# CONTROLLER-FIX §P3c: the committed imminent slot must keep streaming even when surface-3 pace is held at 0 (else a
@@ -525,7 +529,7 @@ func _ramp_pool_step(delta: float) -> bool:
 	if CubeSphere.FP_LANDING_STREAM_KICK and up_fid == _pool_active \
 			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
 		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
-	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, float(sc["view_target"]))
+	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, sc_tgt)   # FP_LAND_RAMP_HOLD: ceiling = clamped tgt
 	sc["view"] = int(round(float(sc["view_f"])))
 	_set_if(sc["terrain"], "max_view_distance", int(sc["view"]))
 	return true

@@ -43,6 +43,10 @@ var _col_cache: Dictionary = {}      # fid -> PackedColorArray
 # orbit warm keeps dispatching until every visible facet is truly enveloped, while emitting the chord meanwhile. The
 # coarse caches are NEVER erased (monotonic), so this can never go stale. Empty with the flag off (byte-identical).
 var _env_done: Dictionary = {}       # fid -> true (env envelope built, not just a chord fallback)
+# FP_ENV_FLOORED_ASYNC: the DENSE mirror of _env_done — fid -> true once `_bpos_cache[fid]` holds the min-ENVELOPE
+# dense grid (vs a full-sink chord fallback awaiting its worker upgrade). Lets the floored warm keep dispatching to
+# true dense-env convergence and lets _emit_cached pick the ε sink (env) vs the full sink (chord). Empty off.
+var _benv_done: Dictionary = {}      # fid -> true (dense env envelope built, not just a dense chord fallback)
 # COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md §3): the SEPARATE dense caches for "backstop"
 # facets (the active facet + the live-pool `_excluded` set) under FP_FARRING_FULL_COVER. Built lazily at BACKSTOP_CELLS
 # (denser than the shipped CELLS=4) by _ensure_backstop_cached; the shipped _pos_cache/_col_cache stay at CELLS for the
@@ -127,6 +131,10 @@ var _async_mid: Dictionary = {}
 # Snapshotted on the main thread at dispatch (orbit + env_all + async only) so the worker's warm/emit is stable for
 # its lifetime; false ⇒ the shipped read-only worker (caches pre-warmed on main). Never changes mid-run.
 var _async_env_warm := false
+# FP_ENV_FLOORED_ASYNC: frozen at dispatch — is this a FLOORED-regime warm (near terrain present ⇒ dense targets must
+# emit SUNK, chord or env)? Distinguishes the floored dense-chord path from the orbit path (backstop role off) in the
+# worker. False in orbit / off ⇒ the worker's dense handling is the shipped orbit behaviour.
+var _async_floored := false
 # T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
 # RemoteBridge (take_events) so the §2.2c "zero-queue crossing stall" (far-ring re-emit prime suspect) is convicted or
 # acquitted in one run. Bounded FIFO (NEVER-OOM: a drain-less headless session can never grow it). `_async_build_us` is
@@ -510,6 +518,20 @@ func _process(_dt: float) -> void:
 ## (`_srf_converged`) it does no work until the next role-event (`_pending`). `p` = [cull axis, cos threshold] (shipped
 ## active-facet law on the surface). Bounded re-emits (≤ backstop count) + scalar state ⇒ NEVER-OOM.
 func _surface_converge_emit(p: Array) -> void:
+	# FP_ENV_FLOORED_ASYNC: on the ground / de-orbit descent, mirror the ORBIT path — the WORKER chord-fills coverage
+	# and env-warms a bounded batch/cycle; NO main-thread env build (kills the 16-40ms/facet hitch), no cache race
+	# (the worker is the sole writer under `_async_building`). Dispatch until every visible facet is truly enveloped
+	# (_count_uncached_visible counts by _benv_done/_env_done). Coverage is structural from dispatch #1 (chord fill).
+	if _env_async_floored_on():
+		if not _pending and _srf_converged:
+			return
+		_emit_cached_only = true
+		var remaining := _count_uncached_visible(p)
+		if _pending or remaining > 0 or not _orbit_emitted_once:
+			_begin_rebuild()
+			_orbit_emitted_once = true
+		_srf_converged = remaining == 0 and not _pending
+		return
 	if not _pending and _srf_converged:
 		return                                    # steady state — no per-frame warm scan (matches the shipped idle frame)
 	_emit_cached_only = true
@@ -557,6 +579,19 @@ func _shell_orbit() -> bool:
 func _env_warm_async_on() -> bool:
 	return CubeSphere.FP_ENV_WARM_ASYNC and TierPlace.env_all_on() and _shell_orbit() and _async_enabled()
 
+## FP_ENV_FLOORED_ASYNC: the FLOORED/descent twin of _env_warm_async_on — relocate the env warm to the worker (and
+## draw chord fallbacks meanwhile) on the ground / during de-orbit (NOT _shell_orbit). Requires the fallback machinery
+## (FP_ENV_FALLBACK_EMIT) + env_all + a real worker. The camera-set law drives the floored emit here (_cam_set), so
+## this is scoped to the camera-set floored regime — the pure-walk surface without the shell law keeps the shipped
+## main-thread warm (byte-identical). Off in any requirement ⇒ false ⇒ the shipped floored warm runs verbatim.
+func _env_async_floored_on() -> bool:
+	return CubeSphere.FP_ENV_FLOORED_ASYNC and CubeSphere.FP_ENV_FALLBACK_EMIT \
+		and TierPlace.env_all_on() and _cam_set and _emit_floored_last and _async_enabled()
+
+## Either regime warms env on the worker (+ chord fallback on emit). Used to snapshot `_async_env_warm` at dispatch.
+func _env_async_any() -> bool:
+	return _env_warm_async_on() or _env_async_floored_on()
+
 ## FP_ENV_WARM_ASYNC: the ORBIT driver when the env build lives on the worker. No main-thread warm at all — a cheap
 ## dot-scan counts uncached visible facets, then (when the worker is idle: _process guards this behind `not _async_building`)
 ## a worker dispatch warms a bounded batch + emits the ready subset. Re-dispatched each idle frame until the front is
@@ -587,7 +622,9 @@ func _count_uncached_visible(p: Array) -> int:
 				if not _front_visible(fid, nrm, thresh):
 					continue
 				if _dense_warm(fid):   # FP_MID_DENSE: a mid-dense target still needs its dense cache (keeps orbit dispatching)
-					if not _bpos_cache.has(fid):
+					# FP_ENV_FLOORED_ASYNC: a dense CHORD present but not yet enveloped still needs warming — count by
+					# `_benv_done` so the floored warm keeps dispatching to full dense-env convergence.
+					if not (_benv_done.has(fid) if CubeSphere.FP_ENV_FLOORED_ASYNC else _bpos_cache.has(fid)):
 						cnt += 1
 				# FP_ENV_FALLBACK_EMIT: a chord fallback present but NOT yet enveloped still needs warming — count by
 				# `_env_done`, so `remaining` keeps dispatching until FULL env convergence (not just chord coverage).
@@ -624,7 +661,8 @@ func _dispatch_async_rebuild() -> void:
 	# FP_ENV_WARM_ASYNC: when the worker builds its OWN env caches, hand it the FULL front set (uncached included) so it
 	# can warm a bounded batch and emit them the same cycle. Frozen here so the worker's warm/emit is stable for its run
 	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
-	_async_env_warm = _env_warm_async_on()
+	_async_env_warm = _env_async_any()
+	_async_floored = _env_async_floored_on()   # FP_ENV_FLOORED_ASYNC: frozen regime — floored dense targets emit sunk
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
 	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
@@ -667,22 +705,39 @@ func _async_build_worker() -> void:
 			# FP_ENV_FALLBACK_EMIT: "have" means the FINAL cache — dense for a target, the ENV envelope (`_env_done`) for a
 			# coarse facet. A chord fallback present in `_pos_cache` does NOT count as done, so this facet stays queued for
 			# its env upgrade. Off ⇒ the shipped `_pos_cache.has` presence test (a chord and an env are indistinguishable).
+			# "have" = the FINAL cache. Coarse: the ENV envelope (`_env_done`) — a chord in `_pos_cache` is NOT done, so it
+			# stays queued for upgrade. Target: the dense cache; under FP_ENV_FLOORED_ASYNC the dense ENVELOPE (`_benv_done`)
+			# — a dense chord is NOT done either. Off ⇒ the shipped presence test (chord and env indistinguishable).
 			var have: bool
 			if CubeSphere.FP_ENV_FALLBACK_EMIT:
-				have = _bpos_cache.has(fid) if target else _env_done.has(fid)
+				if target:
+					have = _benv_done.has(fid) if _async_floored else _bpos_cache.has(fid)
+				else:
+					have = _env_done.has(fid)
 			else:
 				have = _bpos_cache.has(fid) if target else _pos_cache.has(fid)
 			if not have:
 				if warmed >= ENV_WARM_BATCH:
-					# Batch spent this cycle. FP_ENV_FALLBACK_EMIT: fill the CHEAP exact-chord coarse cache so this facet
-					# draws NOW (never a black hole) — its env upgrade lands a later cycle. Off ⇒ a mid-dense target draws
-					# its prewarm-ready coarse cache; a plain uncached coarse facet is skipped (shipped hole, next cycle).
+					# Batch spent this cycle. FP_ENV_FALLBACK_EMIT: fill the CHEAP chord so this facet draws NOW (never a
+					# hole) — its env upgrade lands a later cycle. A FLOORED dense TARGET fills its DENSE chord and emits
+					# SUNK (full sink → never pokes through near terrain); every other facet its coarse chord. Off ⇒ a
+					# mid-dense target draws its prewarm coarse cache; a plain uncached coarse facet is skipped (shipped hole).
 					if CubeSphere.FP_ENV_FALLBACK_EMIT:
-						_ensure_chord_cached(fid)
-					if _pos_cache.has(fid):
+						if target and _async_floored:
+							_ensure_backstop_chord_cached(fid)
+						else:
+							_ensure_chord_cached(fid)
+					if target and _bpos_cache.has(fid):
+						_emit_cached(st, fid, true)
+					elif _pos_cache.has(fid):
 						_emit_cached(st, fid, false)
 					continue
 				if target:
+					# FP_ENV_FLOORED_ASYNC: a dense CHORD fallback present → drop it so _ensure_backstop_cached rebuilds the
+					# dense ENVELOPE in place (marks _benv_done). Off ⇒ the shipped first dense build.
+					if _async_floored and _bpos_cache.has(fid) and not _benv_done.has(fid):
+						_bpos_cache.erase(fid)
+						_bcol_cache.erase(fid)
 					_ensure_backstop_cached(fid)
 				else:
 					# FP_ENV_FALLBACK_EMIT: if a chord fallback is sitting in `_pos_cache`, drop it so _ensure_cached rebuilds
@@ -1229,6 +1284,7 @@ func shell_telemetry() -> Dictionary:
 		"sh_cachedN": cachedN,
 		"sh_cached": _pos_cache.size(),
 		"sh_envN": _env_done.size(),   # FP_ENV_FALLBACK_EMIT: facets truly enveloped (vs chord fallback) — live upgrade convergence
+		"sh_benvN": _benv_done.size(), # FP_ENV_FLOORED_ASYNC: DENSE facets truly enveloped (vs full-sink chord) — floored upgrade convergence
 		"sh_bcached": _bpos_cache.size(),
 		"sh_prewarm": _prewarm_cursor,
 		"sh_off": _offsurface,
@@ -1354,6 +1410,15 @@ func _ensure_cached(fid: int) -> void:
 ## backstop cache for a backstop facet under FULL_COVER, else the shipped CELLS grid. Called by every synchronous
 ## assembler path before it emits; the async path warms these on the main thread in _warm_front instead.
 func _ensure_emit_cached(fid: int) -> void:
+	# FP_ENV_FLOORED_ASYNC: the SYNC assembler (force_rebuild / crossings) must NOT env-build inline on the ground — one
+	# _ensure_cached env build is 16-40ms and force_rebuild touches the whole front (a multi-second stall under env_all).
+	# Build the CHEAP chord instead (dense chord = full-sink, coarse chord = ε-sunk); the worker upgrades env behind.
+	if _env_async_floored_on():
+		if _dense_warm(fid):
+			_ensure_backstop_chord_cached(fid)
+		else:
+			_ensure_chord_cached(fid)
+		return
 	if _dense_warm(fid):   # FP_MID_DENSE: backstop ∪ mid-dense disc build the dense cache (sync assembler path)
 		_ensure_backstop_cached(fid)
 	else:
@@ -1363,6 +1428,25 @@ func _ensure_emit_cached(fid: int) -> void:
 ## once. Identical construction to _ensure_cached (planar corners + radial relief + FarPalette colour) but at the denser
 ## resolution so the between-sample chord error stays below the near mountain relief. The BACKSTOP_SINK radial push is
 ## NOT baked here — it is applied per emitted vertex (so the cache is role-agnostic and survives a crossing unchanged).
+# FP_ENV_FLOORED_ASYNC: build the CHEAP dense CHORD cache (the pre-envelope BACKSTOP_CELLS weld, ~289 profile calls)
+# WITHOUT marking `_benv_done` — so the floored path draws a dense target SUNK immediately (full-sink, never poking
+# through near terrain) while the ~16-40ms dense ENVELOPE upgrade streams in on the worker. Requires FP_SHELL_WELD
+# (env_all_on already requires it). Mirrors _ensure_chord_cached one tier up. Only called under the floored regime.
+func _ensure_backstop_chord_cached(fid: int) -> void:
+	if _bpos_cache.has(fid):
+		return
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+	_weld_snap_edges(pos, cells)
+	_bpos_cache[fid] = pos
+	_bcol_cache[fid] = col
+
 func _ensure_backstop_cached(fid: int) -> void:
 	if _bpos_cache.has(fid):
 		return
@@ -1371,6 +1455,8 @@ func _ensure_backstop_cached(fid: int) -> void:
 	# the shipped per-vertex profile sample (byte-identical).
 	if TierPlace.envelope_on() or TierPlace.env_all_on():
 		_ensure_backstop_cached_env(fid)
+		if CubeSphere.FP_ENV_FLOORED_ASYNC:
+			_benv_done[fid] = true    # this dense cache IS the min-envelope (not a full-sink chord fallback)
 		return
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
@@ -1705,7 +1791,11 @@ func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float
 ## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
 ## emit so a shared grid vertex is not re-normalized per triangle. Pure math — safe on the async worker thread.
 func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
-	var sink := TierPlace.backstop_sink()   # TIER-DEPTH P2: ε guard under the envelope, else the shipped BACKSTOP_SINK
+	return _sunk_positions_amt(p, TierPlace.backstop_sink())   # TIER-DEPTH P2: ε guard under the envelope, else BACKSTOP_SINK
+
+# FP_ENV_FLOORED_ASYNC: sink by an EXPLICIT amount — a not-yet-enveloped chord fallback uses the FULL sink
+# (backstop_sink_chord) instead of the envelope ε, so it still sits ≤ the near surface until its env upgrade lands.
+func _sunk_positions_amt(p: PackedVector3Array, sink: float) -> PackedVector3Array:
 	var out := PackedVector3Array()
 	out.resize(p.size())
 	for i in range(p.size()):
@@ -1764,7 +1854,13 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var col: PackedColorArray
 	var cells := CELLS
 	if sunk:
-		pos = _sunk_positions(_bpos_cache[fid])
+		# FP_ENV_FLOORED_ASYNC: a dense CHORD fallback (not yet enveloped) uses the FULL sink so it stays ≤ the near
+		# surface; an enveloped dense cache uses the ε sink (the envelope already carries the lower bound). Off ⇒ the
+		# shipped backstop_sink() everywhere (byte-identical; _benv_done is empty).
+		if CubeSphere.FP_ENV_FLOORED_ASYNC and not _benv_done.has(fid):
+			pos = _sunk_positions_amt(_bpos_cache[fid], TierPlace.backstop_sink_chord())
+		else:
+			pos = _sunk_positions(_bpos_cache[fid])
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
 	else:

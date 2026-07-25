@@ -1618,6 +1618,17 @@ const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wh
 ## This is the cheap "follow the FAR TERRAIN collision at speed" the descent regime wants. Gate G-FALLPHYS.
 const FP_ANALYTIC_COL_MEMO := false
 
+## COSMOS DE-ORBIT PHYS FIX 2 — pause the far-ring ENV-WARM during a fast descent. FP_ENV_FLOORED_ASYNC keeps the
+## far-ring worker building envelopes + re-uploading the whole shell mesh EVERY worker-idle frame while the emit axis
+## sweeps during a plunge; on WASM all threads share ONE dlmalloc (the convoy), so that allocation firehose stalls the
+## physics tick (most of the descent phys_ms is allocator-WAIT, NOT real physics — Fable). The clean pre-env-chain
+## build had none of it. When on, while |downward lattice speed| > ENV_FALL_HOLD_VY the floored/orbit warm dispatches
+## ONLY on genuine coverage events (_pending / first emit), NEVER on the env-upgrade convergence (remaining>0) — the
+## chord fallback already holds full coverage (hole=0 proven), so envelope SHARPENING simply waits until you slow /
+## land, then resumes. Off ⇒ never held (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-ENV-FALL-HOLD.
+const FP_ENV_FALL_HOLD := false
+const ENV_FALL_HOLD_VY := 20.0     # downward lattice speed (blocks/s) above which env-warm pauses (walk/jump ≈ 0-9)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

@@ -1607,6 +1607,17 @@ const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jum
 const FP_FLOOR_MEMO := false
 const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
 
+## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
+## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
+## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME
+## column, every frame ⇒ phys_ms 100-330 ms, 1-5 fps ("jerky as hell"). Root cause (Fable): generated_cell passes
+## column_profile a null pcache (unlike generated_cell_global, which threads the shared persistent memo). When on,
+## the main-thread FACETED generated_cell routes through the SAME facet-scoped _analytic_ctx memo the global path
+## uses, so the scan computes the profile ONCE + hits the memo for the rest ⇒ ~3-8 ms. Byte-identical off (shipped
+## null-pcache path); memo entries are pure fn of (facet,x,z), cleared on facet change + cap ⇒ NEVER-OOM, no stale.
+## This is the cheap "follow the FAR TERRAIN collision at speed" the descent regime wants. Gate G-FALLPHYS.
+const FP_ANALYTIC_COL_MEMO := false
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

@@ -321,6 +321,23 @@ html, body {
 		const GAME_STEPS = 4;
 		let essentialReady = false;
 
+		// Fail-safe watchdog. Once the engine wasm finishes downloading, the browser
+		// compiles + instantiates it (SharedArrayBuffer + worker threads) and then
+		// main.gd drives the game phases — a window in which Godot fires NO progress
+		// callback. If that whole bridge never completes (voxiverseEssentialReady
+		// never fires), the user must NEVER be trapped behind the splash: after a
+		// generous timeout we reveal the world + enable "Enter World" regardless.
+		const WATCHDOG_MS = 45000;
+		let watchdogTimer = null;
+
+		// Remote-control mode: the dev remote-bridge opens the page as ?remote=<token>.
+		// An unattended remote operator has nobody to click "Enter World", so in this
+		// mode the splash auto-advances through the same reveal+enter path a human
+		// click would take. Detected ONCE at load; normal human users are unaffected.
+		let REMOTE_MODE = false;
+		try { REMOTE_MODE = new URLSearchParams(location.search).has('remote'); }
+		catch (e) { REMOTE_MODE = /[?&]remote=/.test(location.search); }
+
 		function setPhase(text) { phaseEl.firstChild.nodeValue = text; }
 		function setCount(text) { countEl.textContent = text ? '  ' + text : ''; }
 		function setBar(frac, working) {
@@ -341,12 +358,49 @@ html, body {
 			splash.classList.add('revealed');
 			enterBtn.classList.add('ready');
 			hintEl.textContent = 'Remaining terrain keeps baking in the background.';
+			// Remote (unattended) sessions have no one to click — take the same path
+			// the button click does. Runs for BOTH the real essentialReady reveal and
+			// the fail-safe watchdog reveal, so remote mode is never trapped.
+			if (REMOTE_MODE) { enterWorld(); }
 		}
 		function enterWorld() {
 			if (splash.classList.contains('hidden')) { return; }
 			splash.classList.add('hidden');
 			const c = document.getElementById('canvas');
 			if (c) { c.focus(); }
+		}
+
+		// Indeterminate "Starting engine…" state. Entered when the engine-download
+		// byte progress reaches/exceeds total (or total is unknown): the wasm is now
+		// compiling + instantiating with worker threads and Godot reports nothing, so
+		// a static "Downloading engine 100%" would look hung. A full shimmer bar (no
+		// number) honestly signals "alive, working" without faking forward progress.
+		function enterStartingEngine() {
+			if (essentialReady) { return; }
+			setPhase('Starting engine…');
+			setCount('');
+			setBar(1, true);
+			statusProgressInner.style.width = '100%';
+			armWatchdog();
+		}
+
+		// Arm the fail-safe reveal exactly once. Idempotent: repeated onProgress(100%)
+		// calls and the startGame resolution all funnel here without re-arming.
+		function armWatchdog() {
+			if (watchdogTimer !== null || essentialReady) { return; }
+			watchdogTimer = setTimeout(function () {
+				watchdogTimer = null;
+				if (essentialReady) { return; }
+				console.warn('[voxiverse] Fail-safe watchdog: voxiverseEssentialReady() did not fire within '
+					+ (WATCHDOG_MS / 1000) + 's of the engine download completing — revealing the world anyway.');
+				// Mark ready so any late real signal is a harmless no-op, then reveal.
+				essentialReady = true;
+				setPhase('Ready');
+				setCount('');
+				setBar(1, false);
+				setSteps(GAME_STEPS);
+				revealWorld();
+			}, WATCHDOG_MS);
 		}
 
 		// ================= REAL progress bridge (game -> JS) =================
@@ -370,6 +424,7 @@ html, body {
 		window.voxiverseEssentialReady = function () {
 			if (essentialReady) { return; }
 			essentialReady = true;
+			if (watchdogTimer !== null) { clearTimeout(watchdogTimer); watchdogTimer = null; }
 			setPhase('Ready');
 			setCount('');
 			setBar(1, false);
@@ -417,22 +472,29 @@ html, body {
 			engine.startGame({
 				onProgress: function (current, total) {
 					if (essentialReady) { return; }
-					if (total > 0) {
+					if (total > 0 && current < total) {
+						// Real byte progress: show the download percentage.
+						setPhase('Downloading engine');
 						setBar(current / total, false);
 						setCount(Math.floor(current / total * 100) + '%');
 						statusProgressInner.style.width = (current / total * 100) + '%';
 					} else {
-						setBar(0, true);
-						setCount('');
+						// Download complete (current >= total) or size unknown: the wasm
+						// is now compiling + instantiating with threads and Godot goes
+						// silent. Switch to the indeterminate "Starting engine…" state
+						// so it never freezes on a static "Downloading engine 100%".
+						enterStartingEngine();
 					}
 				},
 			}).then(function () {
 				// Engine main loop has started. The game (main.gd) now drives the
 				// splash via voxiverseProgress / voxiverseEssentialReady; keep the
-				// splash up until the essential near set is ready.
+				// splash up (indeterminate) until the essential near set is ready.
+				// Arm the watchdog here too, in case onProgress never reported 100%.
 				if (!essentialReady) {
 					setPhase('Building world');
-					setBar(0, true);
+					setBar(1, true);
+					armWatchdog();
 				}
 			}, displayFailureNotice);
 		}

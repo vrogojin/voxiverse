@@ -407,6 +407,66 @@ const FP_TIER_DEPTH_BIAS := false
 ## G-TIER-WARM-CONVERGE.
 const FP_TIER_WARM_CONVERGE := false
 
+## COSMOS NO-PROTRUSION (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §0.3) — GLOBAL ENVELOPE HEIGHT LAW.
+## Every far-ring vertex (coarse horizon AND dense backstop, weld+non-weld) stores min(fine g over its dilated
+## footprint)+ε sink → rendered surface ≤ true surface EVERYWHERE/every regime (kills R-A/R-B/R-C protrusion).
+## Fine heights reuse FacetTexBaker's sample grid; EDGE-CANON keeps seams weld-exact. Requires FP_FARRING_FULL_COVER
+## + FP_SHELL_WELD. Default OFF → shipped path verbatim, FLAT byte-identical (6042/0). Gate: verify_no_protrusion.gd.
+const FP_ENV_ALL := false
+
+## COSMOS NO-PROTRUSION PERF — build the FP_ENV_ALL env caches on the far-ring WORKER thread (bounded batch per
+## dispatch) instead of the main-thread warm. The EDGE-CANON disc/band sampling makes ONE coarse env facet ~16 ms
+## native (~8k profile_at_dir calls), which blows the 3 ms WARM_BUDGET_MS grain: in the ORBIT regime the far ring
+## warms ~1700 facets 1-per-frame on the MAIN thread (both _warm_front + _prewarm) → sustained 51 ms proc / climbing
+## hitches. This relocates the identical build to the worker (same heights, gate byte-unmoved) so it never touches
+## the frame budget; the progressive reveal grows ENV_WARM_BATCH facets/cycle. Requires FP_ENV_ALL + async far ring.
+## Default OFF → main-thread warm verbatim (byte-identical). ORBIT-scoped (surface warm path unchanged).
+const FP_ENV_WARM_ASYNC := false
+
+## COSMOS NO-PROTRUSION COVERAGE — the FP_ENV_WARM_ASYNC fix. FP_ENV_ALL made a facet's EMIT wait on its warmed
+## per-facet ENVELOPE cache, and FP_ENV_WARM_ASYNC builds those on the worker at only ENV_WARM_BATCH/cycle, so in
+## orbit the worker runs ~180 facets behind the visible set ⇒ the near hemisphere renders BLACK for 10 s+ and resets
+## on camera move (live: sh_emit 766 < sh_visN 947). When on: an un-warmed coarse facet draws its CHEAP exact-chord
+## weld cache (~300× cheaper than the env build) IMMEDIATELY, then upgrades to the env envelope IN PLACE when the
+## worker warms it — coverage becomes structural (emitted == visible from dispatch #1). The transient un-warmed facet
+## shows the shipped pre-FP_ENV_ALL exact-chord look (worst +52 blk, edge-on ≈ sub-px at the limb) instead of black —
+## the same "un-upgraded = shipped look, never black" law as the LOD texture. SAFE against protrusion: the fallback is
+## ORBIT-ONLY (_shell_orbit, backstop role off, no near voxels); descent (_emit_floored_last) uses the SYNC full-env
+## warm, so the chord never pokes through near terrain. Off / env_all off / not-orbit ⇒ inert (byte-identical).
+## Requires FP_ENV_ALL + FP_ENV_WARM_ASYNC + FP_SHELL_WELD. Gate G-COVER (verify_env_warm_async §C).
+const FP_ENV_FALLBACK_EMIT := false
+
+## COSMOS NO-PROTRUSION COVERAGE — the FLOORED/descent extension of FP_ENV_FALLBACK_EMIT. The orbit fix is scoped to
+## _shell_orbit(), so on the ground / during de-orbit descent (_emit_floored_last ⇒ floored) both the chord fallback
+## AND the off-thread warm go inert: FP_ENV_ALL's ~16-40 ms/facet env build then warms SYNCHRONOUSLY on the main
+## thread (2-22 fps / proc 95-457 ms hitch) and emit is cache-gated again (sh_emit ~1340 < sh_visN 1728 ⇒ a flat
+## brown coarse-facet wedge at the near↔far boundary). When on, the floored path splits work by COST (Fable): the
+## CHEAP chord (coarse 25 / dense ~289 profile calls) warms on the budgeted MAIN thread — full coverage in ~0.5 s,
+## no hitch — while the expensive env envelope upgrades on the WORKER behind it (same batch machinery as orbit). Also
+## closes a latent leak: an orbit-minted chord passed the floored warm's `_pos_cache.has` test as "cached" and was
+## never env-upgraded on the ground (silent R-A/R-B protrusion re-leak). Near-terrain SAFE: any facet near terrain is
+## a DENSE TARGET (sticky ring-1 pre-empts pool entry) and dense targets emit with the FULL BACKSTOP_SINK when still
+## on a chord (byte-for-byte the pre-envelope backstop that shipped live for weeks), never an un-sunk +52 chord.
+## Off / env_all off / fallback off ⇒ inert (byte-identical). Requires FP_ENV_FALLBACK_EMIT + async far ring.
+## Gate G-FLOOR-COVER (verify_env_warm_async §E/F).
+const FP_ENV_FLOORED_ASYNC := false
+
+## COSMOS NO-PROTRUSION FIDELITY (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §1 F2) — MID-RING DENSE promotion.
+## Promote every far-ring facet within ~ring-2 (an angular disc ≈ MID_DENSE_RINGS facet-edges of the sub-camera /
+## emit axis) to emit its DENSE grid (BACKSTOP_CELLS=16, ~26-block cells) instead of the coarse 5×5 (CELLS=4,
+## ~104-block chords) — 4× finer geometry AND ~16× smaller chord error EXACTLY in the 400-1200 block band the player
+## looks at when they rise a little or look at the horizon. Reuses the dense backstop cache builders / env lower bound
+## (_ensure_backstop_cached_env), so a promoted facet is a provable no-protrusion lower bound too (joins G-NPT-SURF).
+## The dense build is routed through the SAME scheduling as backstop: budget-sliced on the main-thread surface warm
+## (_warm_front_true_budget) and OFF-THREAD on the far-ring worker under FP_ENV_WARM_ASYNC in orbit — NO synchronous
+## 16 ms/facet main-thread stall. NEVER-OOM: the disc is a fixed angular set (~ring-2 count) and promoted caches are
+## REAPED as the sub-point moves, so _bpos_cache stays bounded to backstop ∪ ring-2 (~+16 facets ≈ +130 KB).
+## Requires FP_FARRING_FULL_COVER (dense caches only exist there). Default OFF → the _is_backstop-driven emission
+## verbatim (empty disc ⇒ every predicate reduces to the shipped backstop role → byte-identical, FLAT 6042/0).
+const FP_MID_DENSE := false
+## MID_DENSE angular reach: the dense-promotion disc radius in facet-edge angles (facet edge ≈ (π/2·R)/K). 2 ⇒ ring-2.
+const MID_DENSE_RINGS := 2.0
+
 ## COSMOS SEAMLESS-SCALES §4/§10 C3 — the heightfield SKIN tier (FacetSkinTier). Between the near voxel field
 ## (0..~128) and the far-ring backstop (~12.5-block cells) is a resolution gap where, post-L5, arriving voxel
 ## meshes still visibly change the ground shape (obs-2/3). The skin fills it: per-facet pitch-1 heightfield tiles
@@ -430,6 +490,25 @@ const FP_SKIN_TIER := false
 ## NEVER-OOM: fixed-size pages (base-tier-only ≈ 8.2 MB ceiling, FacetTexBaker.total_bytes()). Flipped ON at
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
+
+## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
+## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
+## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the
+## sub-camera direction (the ring's _emit_axis). Each promoted facet's 128² fine grid is baked from the SAME
+## VoxelGeneratorCosmos.sample_columns one-sampler path as the base map (row-sliced under a strict per-frame budget,
+## never a main-thread stall). The absolute shell shader gains `wc = smoothstep(CLOSEUP_FAR, CLOSEUP_NEAR, cam_dist)`
+## and `albedo = mix(base_map, closeup_map[slot], wc)`; the slot rides UV2.y (−1 ⇒ base-map fallback: softening,
+## never a hole). Default OFF ⇒ the close-up array/queue/uniform + UV2 slot are NEVER created (UV2.y stays −1, the
+## closeup sampler is never compiled) ⇒ byte-identical to Phase-1/shipped. NEVER-OOM: 64×128² RGBA8+mips ≈ 5.6 MB
+## fixed at creation, LRU evicts ONLY outside-cap facets (the base map is the safe floor). Requires FP_FACET_TEX.
+const FP_FACET_TEX_CLOSEUP := false
+const FACET_TEX_BAKE_BUDGET_MS := 2.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
+const CLOSEUP_MAX := 64                    # close-up Texture2DArray layer count (fixed at creation → NEVER-OOM)
+const CLOSEUP_TEXELS := 128               # texels per close-up facet edge (≈3.3 blocks/texel, 8× the base map)
+const CLOSEUP_SLICE_ROWS := 16            # rows baked per budget slice (16·128 = 2048 sample_columns cols ≈ 0.5 ms native)
+const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up tier saturates (wc = 1)
+const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
+const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
 
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
@@ -1005,6 +1084,17 @@ const SUN_MIN_ANG_DEG := 2.0      # perceptual angular-diameter floor for the Su
 const MOON_MIN_ANG_DEG := 1.5     # perceptual angular-diameter floor for the Moon impostor (taste)
 const SUN_GLARE_RADII := 5.0      # glare quad half-size in Sun-disc radii
 
+## TERMINATOR-SUN CONTINUITY (fix: Sun disc POPS in/out per walk-step at dawn/dusk). Root cause (Fable): the
+## disc visibility was a BINARY flip `occ_cam >= 0.5`, and the sun-hide angle dep(h)≈√(2h/R) is SINGULAR in
+## eye-height h (infinite slope at the ground, pinned/kinked below the datum) — so a ±1-block step jerks the
+## flip threshold by up to a whole disc radius. When on: (1) the disc/Moon fade CONTINUOUSLY by occlusion
+## (albedo·occ, unshaded) and stay `visible` on a >0.001 threshold — no boolean flip; (2) occ_cam and the
+## absolute light/ambient sample a GROUND-FLOORED distance (dist_eff = max(dist, r_vox+H_EYE_MIN)) that caps
+## dep's slope at ~0.36°/block. Off ⇒ the binary flip + un-floored occ (byte-identical). Requires
+## FP_SKY_PLANET_OCCLUDE (disc/Moon presence) and/or FP_LIGHT_ABSOLUTE (light/ambient). Gate G-TSC.
+const FP_TERM_SUN_CONT := false
+const TERM_SUN_H_EYE_MIN := 2.0   # min eye-height (blocks) the occlusion distance is floored to — bounds dep'(h)
+
 ## A3 (design §2.3 / §3 C3 / §4). atmo_vis(h) replaces the space_mix 192..960 band with a 0.5·ATMO_TOP..
 ## ATMO_TOP fade (exactly 0 at/above ATMO_TOP=384 — the tint is star-black in space, fixing the orbit
 ## sky-colour bug). star_fade = max(night_fade, 1−atmo_vis(h)); SKY_SCATTER_RAMP's weight gains ·atmo_vis
@@ -1091,6 +1181,17 @@ const FP_MOON_PRESENCE := false
 ## default 0 = shipped) and the GDScript twin are gated. Off ⇒ byte-identical. Requires FP_ATMO_SHELL. Gate
 ## G-B2-LIMB. LIVE-ONLY LOOK (P3 shader class). Depends B0.
 const FP_ATMO_PATH_SHELL := false
+
+## COSMOS O1 (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §2). The day-side washout fix: the B2 bounded shell
+## budget `SHELL_PEAK_L` (0.95) was tuned for the LIMB (sky-only rays that never terminate on the solid surface).
+## But GROUND-HIT rays — the wide outer annulus of the lit day disc where the view ray ends on the surface —
+## reuse the SAME additive budget over ground that is NOT extinguished behind them, so the in-scatter stacks on
+## the lit surface (+0.77 additive measured at alt 1323) and clips the day disc to white-cyan under the LINEAR
+## tonemap. This flag gives ground-hit rays a SEPARATE, lower budget `SHELL_PEAK_L_GROUND` (≈0.30) in the l_path
+## formula; the LIMB / sky-ray path stays EXACTLY as shipped (0.95). Off ⇒ the shell shader string is the shipped
+## verbatim + peak_l_ground unset ⇒ byte-identical. Requires FP_ATMO_SHELL + FP_ATMO_PATH_SHELL (the budget only
+## bites on the bounded path). Gate G-O1-GROUND. LIVE-ONLY LOOK (P3 shader class). Depends B2.
+const FP_ATMO_GROUND_BUDGET := false
 
 ## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
 ## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
@@ -1505,6 +1606,50 @@ const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jum
 ## floor and the memo follows), and O(1)-per-column (a repeated fall column caches after one scan).
 const FP_FLOOR_MEMO := false
 const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
+
+## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
+## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
+## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME
+## column, every frame ⇒ phys_ms 100-330 ms, 1-5 fps ("jerky as hell"). Root cause (Fable): generated_cell passes
+## column_profile a null pcache (unlike generated_cell_global, which threads the shared persistent memo). When on,
+## the main-thread FACETED generated_cell routes through the SAME facet-scoped _analytic_ctx memo the global path
+## uses, so the scan computes the profile ONCE + hits the memo for the rest ⇒ ~3-8 ms. Byte-identical off (shipped
+## null-pcache path); memo entries are pure fn of (facet,x,z), cleared on facet change + cap ⇒ NEVER-OOM, no stale.
+## This is the cheap "follow the FAR TERRAIN collision at speed" the descent regime wants. Gate G-FALLPHYS.
+const FP_ANALYTIC_COL_MEMO := false
+
+## COSMOS DE-ORBIT PHYS FIX 2 — pause the far-ring ENV-WARM during a fast descent. FP_ENV_FLOORED_ASYNC keeps the
+## far-ring worker building envelopes + re-uploading the whole shell mesh EVERY worker-idle frame while the emit axis
+## sweeps during a plunge; on WASM all threads share ONE dlmalloc (the convoy), so that allocation firehose stalls the
+## physics tick (most of the descent phys_ms is allocator-WAIT, NOT real physics — Fable). The clean pre-env-chain
+## build had none of it. When on, while |downward lattice speed| > ENV_FALL_HOLD_VY the floored/orbit warm dispatches
+## ONLY on genuine coverage events (_pending / first emit), NEVER on the env-upgrade convergence (remaining>0) — the
+## chord fallback already holds full coverage (hole=0 proven), so envelope SHARPENING simply waits until you slow /
+## land, then resumes. Off ⇒ never held (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-ENV-FALL-HOLD.
+const FP_ENV_FALL_HOLD := false
+const ENV_FALL_HOLD_VY := 20.0     # downward lattice speed (blocks/s) above which env-warm pauses (walk/jump ≈ 0-9)
+
+## COSMOS DE-ORBIT PHYS FIX 3 — shrink the near VOXEL view during a fast descent (the near-surface landing dip).
+## Root cause (Fable): the near dip (alt ~38-94) is the 128-block near-voxel view sphere plunging INTO terrain —
+## every solid block entering it must gen+mesh+UPLOAD (the post-port apply-bound #58), unmasked once the phys fix
+## removed the convoy. The regime principle applied to RENDERING: at high descent speed the near voxel field is
+## scenery the far-ring chords already cover (hole=0 proven), so while |downward vy| > ENV_FALL_HOLD_VY the module
+## clamps every pool slot's grow target to LAND_RAMP_HOLD_BLOCKS (a small landing disc); on hold release (≈ touchdown)
+## the existing landing-kick + paced ramp grow it back to the full near radius over ~6 s while the player stands
+## still — the streaming burst moves to where it is least perceptible AND is admission-paced. Physics is analytic
+## (never reads meshes) so landing correctness is untouched. Off ⇒ never clamped (byte-identical). Requires
+## FP_ENV_FALL_HOLD (shares its vy signal). Gate G-LAND-RAMP.
+const FP_LAND_RAMP_HOLD := false
+const LAND_RAMP_HOLD_BLOCKS := 64.0   # near-view radius (blocks) held during the fast fall; grows to full after touchdown
+
+## COSMOS DE-ORBIT PHYS FIX 3b — pace the far-ring ENV-warm RESUME at the touchdown moment. When FP_ENV_FALL_HOLD
+## lifts as the player slows to land, ~1700 deferred env upgrades otherwise fire back-to-back (12/cycle, a whole-
+## shell re-emit each) right when the landing-kick near-stream burst also hits → the alt-8 proc spike (391ms live).
+## When on, the floored env-upgrade (remaining>0) dispatch fires at most once per ENV_RESUME_MS — coverage (chord)
+## and _pending dispatches stay IMMEDIATE (hole=0 unaffected); env still converges in a few seconds. Off ⇒ full-rate
+## resume (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-LAND-RAMP.
+const FP_ENV_RESUME_PACED := false
+const ENV_RESUME_MS := 300            # min ms between floored env-upgrade dispatches (the touchdown resume throttle)
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

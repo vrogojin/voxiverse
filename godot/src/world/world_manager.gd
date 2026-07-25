@@ -69,6 +69,7 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -164,6 +165,10 @@ var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+# FP_ENV_FALL_HOLD: position-based downward-speed estimate (blocks/s, EMA) to pause the far-ring env-warm during a
+# fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
+var _fall_last_usec: int = -1
+var _fall_vy_ema: float = 0.0
 # T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
 # of the snowfall fixed step + the load-controller tick since the last telemetry drain; RemoteBridge samples the max once
 # per window (take_perf_attrib) so the 0.5 s snowfall spike is attributed instead of folded anonymously into worst_ms.
@@ -341,6 +346,10 @@ func _ready() -> void:
 			_facet_tex.setup(TerrainConfig.active_facet())
 			_facet_tex.prewarm(_facet_ring.visible_fids())
 			_facet_ring.set_facet_tex(_facet_tex.base_texture())
+			# COSMOS LOD-TEXTURE Phase 4: bind the (all-transparent-at-setup) close-up array now so the shader's
+			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
+			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
+			_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -831,6 +840,26 @@ func update_streaming(player_pos: Vector3) -> void:
 				if sp < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
 					_player_speed = lerpf(_player_speed, sp, 0.3)
 		_last_stream_usec = now_usec
+	# FP_ENV_FALL_HOLD: estimate the DOWNWARD lattice speed (blocks/s, EMA) and hand it to the far ring so it pauses
+	# env-warm during a fast plunge (the env-build worker + whole-shell re-emit alloc firehose stalls the shared WASM
+	# allocator ⇒ physics tick). Position-based (works even under the rails coast that zeroes velocity); a per-update
+	# speed above the crossing/flip clamp is a relocation, not motion, and is rejected. Off ⇒ never called (byte-identical).
+	# FP_LAND_RAMP_HOLD shares the same vy signal to shrink the near VOXEL view during the plunge. One estimate,
+	# forwarded to both the far ring (env-warm pause) and the module (near-view clamp). Off both ⇒ never runs.
+	if CubeSphere.FP_ENV_FALL_HOLD or CubeSphere.FP_LAND_RAMP_HOLD:
+		var nowu := Time.get_ticks_usec()
+		if _have_player_pos and _fall_last_usec >= 0:
+			var dtf := float(nowu - _fall_last_usec) / 1.0e6
+			if dtf > 0.0:
+				var spd := player_pos.distance_to(_last_player_pos) / dtf
+				if spd < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
+					_fall_vy_ema = lerpf(_fall_vy_ema, (player_pos.y - _last_player_pos.y) / dtf, 0.3)
+		_fall_last_usec = nowu
+		var hold := _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY
+		if CubeSphere.FP_ENV_FALL_HOLD and _facet_ring != null and _facet_ring.has_method("set_fall_hold"):
+			_facet_ring.set_fall_hold(hold)   # the FACETED far ring (FacetFarRing) — NOT _far (FarTerrain, null in faceted mode)
+		if CubeSphere.FP_LAND_RAMP_HOLD and using_module and _module_world != null and _module_world.has_method("set_fall_hold"):
+			_module_world.set_fall_hold(hold)
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
@@ -851,6 +880,21 @@ func update_streaming(player_pos: Vector3) -> void:
 		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
 			cover_query = Callable(_module_world, "skin_near_meshed")
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
+	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
+	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,
+	# see THE HARD PERF CONSTRAINT); when the close-up slot map changes (epoch bump) push it + the reverse-map to the
+	# ring (which re-emits so UV2.y carries the new slots) and bind the close-up texture the first time it exists. No-op
+	# unless FP_FACET_TEX && FP_SHELL_ABSOLUTE created the baker (byte-identical off).
+	if _facet_tex != null and _facet_ring != null:
+		var eaxis := _facet_ring.shell_emit_axis()
+		var offs: bool = _facet_ring.shell_offsurface()
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		if _facet_tex.slots_epoch() != _tex_slots_epoch:
+			_tex_slots_epoch = _facet_tex.slots_epoch()
+			if _facet_tex.closeup_texture() != null:
+				_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
+			_facet_ring.set_closeup_slots(_facet_tex.closeup_slots(), _facet_tex.closeup_facet_map())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
@@ -2617,6 +2661,13 @@ func shell_telemetry() -> Dictionary:
 	if _facet_ring == null or not _facet_ring.has_method("shell_telemetry"):
 		return {}
 	return _facet_ring.shell_telemetry()
+
+## COSMOS LOD-TEXTURE Phase 2 telemetry: the far-texture bake ledger (coverage, close-up residency, per-frame bake ms,
+## byte ledger) streamed via the remote bridge next to shell_telemetry(). {} when the baker is absent (flag off).
+func tex_telemetry() -> Dictionary:
+	if _facet_tex == null:
+		return {}
+	return _facet_tex.tex_telemetry()
 
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets

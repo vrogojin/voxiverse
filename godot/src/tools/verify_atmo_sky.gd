@@ -55,6 +55,8 @@ func _initialize() -> void:
 	_gate_b5_fog()
 	_gate_b4_moon()
 	_gate_b2_limb()
+	_gate_o1_ground()
+	_gate_term_sun_cont()
 	_gate_b3_nearnight()
 	_gate_inert()
 	_gate_smoke()
@@ -666,6 +668,60 @@ func _gate_b3_nearnight() -> void:
 		_ok(is_equal_approx(float(cms.get_shader_parameter("night_floor")), SKY.NEAR_NIGHT_FLOOR), "cloud twin night_floor == NEAR_NIGHT_FLOOR (moonlit/dark at night, not bright white)")
 	clouds.free()
 
+# ------------------------------------------------------------------ G-O1-GROUND (O1 FP_ATMO_GROUND_BUDGET)
+func _gate_o1_ground() -> void:
+	print("  --- G-O1-GROUND: ground-hit shell rays use a SEPARATE lower budget (day-disc washout fix) ---")
+	# The pure `l`-factor of the bounded shell = peak·(1−exp(−strength/sat)), extractable at mu=1 where the tint
+	# collapses to WHITE (scatter_band=0) and day_factor=1, so the output colour is exactly RAYLEIGH_BLUE·l per
+	# channel. l_of(col) recovers l = col.r / RAYLEIGH_BLUE.r.
+	var mu_noon := 1.0
+	var big := 1.0e9                                          # strength→∞ (1−exp→1) ⇒ l saturates at the peak budget
+	var h0 := 0.0
+	var rb := SKY.RAYLEIGH_BLUE.r
+	var l_of := func(c: Color) -> float: return c.r / rb
+	# (a) GROUND-HIT ray, strength→∞: l_path_ground saturates at SHELL_PEAK_L_GROUND (0.30), NOT the 0.95 limb budget.
+	var l_ground: float = l_of.call(SKY.shell_limb_color_path_ground(mu_noon, big, h0))
+	var l_limb: float = l_of.call(SKY.shell_limb_color_path(mu_noon, big, h0))
+	_ok(l_limb <= 0.9500001 and l_limb >= 0.9499999, "LIMB/sky ray l_path saturates at 0.95 (shipped budget, %.6f)" % l_limb)
+	print("    l_path budget  LIMB=%.4f  GROUND=%.4f  |  blue additive  shipped=%.4f  ground=%.4f" % [
+		l_limb, l_ground, SKY.shell_limb_color_path(mu_noon, big, h0).b, SKY.shell_limb_color_path_ground(mu_noon, big, h0).b])
+	_ok(l_ground <= 0.30 + 1e-6, "GROUND-hit ray l_path ≤ 0.30 (was →0.95; measured %.6f)" % l_ground)
+	_ok(is_equal_approx(l_ground, SKY.SHELL_PEAK_L_GROUND), "GROUND l_path → SHELL_PEAK_L_GROUND exactly (%.4f)" % l_ground)
+	# Blue-channel additive (the washout metric): the annulus additive on the blue channel drops from ≈0.87 to ≈0.28.
+	var add_blue_ship := SKY.shell_limb_color_path(mu_noon, big, h0).b
+	var add_blue_ground := SKY.shell_limb_color_path_ground(mu_noon, big, h0).b
+	_ok(add_blue_ground < 0.30 and add_blue_ship > add_blue_ground, "ground-annulus blue additive %.3f < shipped %.3f (washout capped)" % [add_blue_ground, add_blue_ship])
+	# (b) LIMB / sky-ray values BIT-UNCHANGED vs the shipped inline single-sample-bounded formula, across the grid.
+	var worst := 0.0
+	for ci in range(1, 13):
+		var chord := 500.0 * float(ci)
+		for hi in range(0, 8):
+			var h_min := 10.0 * float(hi)
+			for mi in range(-10, 11):
+				var mu := float(mi) / 10.0
+				# shipped inline reference (pre-refactor body of shell_limb_color_path, budget = SHELL_PEAK_L)
+				var ss := chord * exp(-maxf(h_min, 0.0) / SKY.H_SCALE) / SKY.H_SCALE
+				var l := SKY.SHELL_PEAK_L * (1.0 - exp(-ss / SKY.SHELL_SAT)) * SKY.day_factor(mu)
+				var t := SKY.scatter_tint(mu)
+				var recolour := Color.WHITE.lerp(t, SKY.scatter_band(mu))
+				var base := Color(SKY.RAYLEIGH_BLUE.r * recolour.r, SKY.RAYLEIGH_BLUE.g * recolour.g, SKY.RAYLEIGH_BLUE.b * recolour.b)
+				var ref := Color(base.r * l, base.g * l, base.b * l)
+				var got := SKY.shell_limb_color_path(mu, chord, h_min)
+				worst = maxf(worst, maxf(absf(got.r - ref.r), maxf(absf(got.g - ref.g), absf(got.b - ref.b))))
+	_ok(worst == 0.0, "LIMB/sky twin BIT-identical to the shipped formula across the (mu,chord,h) grid (worst Δ %.12f)" % worst)
+	# (c) FALSIFY: a PERTURBED ground budget (set to the 0.95 limb value) would blow the ≤0.30 bound — the check discriminates.
+	var l_bad: float = l_of.call(SKY.shell_limb_color_path_peak(mu_noon, big, h0, SKY.SHELL_PEAK_L))
+	_ok(l_bad > 0.30, "falsify: ground budget perturbed to 0.95 ⇒ l_path %.3f > 0.30 (bound is not vacuous)" % l_bad)
+	var l_bad2: float = l_of.call(SKY.shell_limb_color_path_peak(mu_noon, big, h0, 0.60))
+	_ok(l_bad2 > 0.30, "falsify: ground budget perturbed to 0.60 ⇒ l_path %.3f > 0.30" % l_bad2)
+	# The ground-budget SHADER VARIANT string parses/compiles headless (assigning .code triggers the GLSL parse).
+	var gsh := Shader.new()
+	gsh.code = SKY._ATMO_SHELL_SHADER_GROUND
+	var gmat := ShaderMaterial.new()
+	gmat.shader = gsh
+	gmat.set_shader_parameter("peak_l_ground", SKY.SHELL_PEAK_L_GROUND)
+	_ok(gmat.shader != null and gmat.shader.code.length() > 0, "ground-budget shell shader variant compiles headless")
+
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:
 	print("  --- INERT: shipped flags leave _ramp_environment at the shipped day-night values ---")
@@ -711,3 +767,58 @@ func _gate_smoke() -> void:
 	_ok(mat != null, "far-ring _make_material returns a material")
 	_ok((mat is ShaderMaterial) == (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.SHELL_TERMINATOR_TINT or TierPlace.depth_bias_on()), "shell material type consistent with the flags")
 	fr.free()
+
+# ------------------------------------------------------------------ G-TSC (FP_TERM_SUN_CONT)
+# The terminator sun-pop fix. Drives the pure ground-floored occlusion directly (flag-independent, like the rest
+# of the gate): the disc/light presence must be CONTINUOUS per walk-step (no ±1-block jump), where the shipped
+# binary flip (occ_pen ≥ 0.5 ⇒ visible 0/1) pops because dep(h)=asin(r/dist) is SINGULAR in eye-height h.
+func _gate_term_sun_cont() -> void:
+	print("  --- G-TSC: terminator sun continuity — ground-floored occlusion kills the per-step disc pop ---")
+	var r := GRAV.r_vox("earth")
+	var sun := Vector3(1.0, 0.0, 0.0)
+	var up := Vector3(0.0, 1.0, 0.0)                          # local vertical ⊥ sun ⇒ sun sits on the horizon
+	var h_eye: float = CubeSphere.TERM_SUN_H_EYE_MIN
+	# (1) BELOW-DATUM KINK: as the eye crosses the datum sphere (dist=r) occlusion_factor_pen PINS ang_radius at
+	# 90° (r/dist clamps >1) — a hard kink in h that jerks the terminator. The floored variant samples
+	# dist_eff=max(dist, r+H_EYE_MIN), so it is smooth across the datum. Sun just below the horizon (el −0.3°).
+	var el_lo := deg_to_rad(-0.3)
+	var sdir_lo := (sun * cos(el_lo) + up * sin(el_lo)).normalized()
+	var worst_ground := 0.0
+	var any_pos := false
+	var prev_g := -1.0
+	for i in range(0, 41):                                    # h from −5..+5 blocks in ¼-block steps (across the datum)
+		var h := -5.0 + 0.25 * float(i)
+		var p := up * (r + h)
+		var og := SKY.occlusion_factor_ground(sdir_lo, p, r, SKY.pen(maxf(h, 0.0)), h_eye)
+		if og > 1.0e-4: any_pos = true
+		if prev_g >= 0.0: worst_ground = maxf(worst_ground, absf(og - prev_g))
+		prev_g = og
+	_ok(worst_ground < 0.15, "occ_ground max per-¼-block step across the datum < 0.15 (worst %.4f)" % worst_ground)
+	_ok(any_pos, "occ_ground > 0 near the datum at el −0.3° (disc present in the penumbra, not hard-hidden)")
+	# (2) ABOVE-GROUND PER-STEP POP: sun 2° BELOW the horizon (el −2°). dep(h) crosses 2° near h≈3.9, so the shipped
+	# binary presence flips 0→1 within a single 1-block step there; the fix presents intensity = occ_ground (a
+	# continuous fade) which must never step ≥ 0.15/block. This is the exact "Sun pops in after a step" pathology.
+	var el_hi := deg_to_rad(-2.0)
+	var sdir_hi := (sun * cos(el_hi) + up * sin(el_hi)).normalized()
+	var worst_cont := 0.0
+	var binary_jump := 0.0
+	var prev_c := -1.0
+	var prev_b := -1.0
+	for i in range(0, 13):                                    # h 0..12 blocks in 1-block steps (a walking terrain profile)
+		var h := float(i)
+		var p := up * (r + h)
+		var oc := SKY.occlusion_factor_ground(sdir_hi, p, r, SKY.pen(h), h_eye)
+		var ob := SKY.occlusion_factor_pen(sdir_hi, p, r, SKY.pen(h))
+		var bin := 1.0 if ob >= 0.5 else 0.0
+		if prev_c >= 0.0: worst_cont = maxf(worst_cont, absf(oc - prev_c))
+		if prev_b >= 0.0: binary_jump = maxf(binary_jump, absf(bin - prev_b))
+		prev_c = oc
+		prev_b = bin
+	_ok(worst_cont < 0.15, "continuous presence (occ_ground) max per-1-block step < 0.15 (worst %.4f)" % worst_cont)
+	_ok(binary_jump > 0.99, "shipped BINARY presence DOES pop ≥0.99 in one step here (the bug the fix removes): %.2f" % binary_jump)
+	# (3) SLOPE BOUND: the flooring caps the sun-hide angle's per-block slope. Compare floored vs un-floored dep(h)
+	# across the worst 1-block step just above the datum — floored must be ≤ un-floored.
+	var dep_un := absf(asin(clampf(r / (r + 0.25), 0.0, 1.0)) - asin(clampf(r / (r + 1.25), 0.0, 1.0)))
+	var dep_fl := absf(asin(clampf(r / maxf(r + 0.25, r + h_eye), 0.0, 1.0)) - asin(clampf(r / maxf(r + 1.25, r + h_eye), 0.0, 1.0)))
+	_ok(dep_fl <= dep_un + 1e-9, "floored sun-hide slope ≤ un-floored just above the datum (singularity bounded): fl %.6f ≤ un %.6f" % [dep_fl, dep_un])
+	_ok(CubeSphere.TERM_SUN_H_EYE_MIN > 0.0, "TERM_SUN_H_EYE_MIN defined (%.2f blocks)" % CubeSphere.TERM_SUN_H_EYE_MIN)

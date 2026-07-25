@@ -144,6 +144,30 @@ func _init() -> void:
 		print("F) chord-upgrade: env_done pre=%s post=%s" % [str(pre), str(ring5._env_done.has(fid5))])
 		ok = _expect(not pre, "F a freshly minted chord is NOT env_done") and ok
 		ok = _expect(ring5._env_done.has(fid5), "F the chord env-UPGRADES on a floored pass (no silent protrusion re-leak)") and ok
+
+		# G) CHORD-ONLY dispatch (FP_ENV_FALL_HOLD): a fall-hold pass (_async_chord_only) must keep FULL coverage but do
+		# ZERO env builds — the cheap chords hold hole=0 while the plunge's alloc firehose stops. Fresh ring, floored,
+		# chord-only, >batch front → coverage complete AND env_build_worker == 0.
+		var ring6 := FacetFarRing.new()
+		FacetFarRing.env_build_main = 0
+		FacetFarRing.env_build_worker = 0
+		var fids6 := PackedInt32Array()
+		for fid in range(700, 700 + FacetFarRing.ENV_WARM_BATCH + 30):
+			fids6.append(fid)
+		ring6._async_fids = fids6
+		ring6._async_backstop = {}
+		ring6._async_env_warm = true
+		ring6._async_floored = true
+		ring6._async_chord_only = true          # the fall-hold pass
+		ring6._async_building = true
+		var task6: int = WorkerThreadPool.add_task(Callable(ring6, "_async_build_worker"), false, "chord-only")
+		WorkerThreadPool.wait_for_task_completion(task6)
+		var cov6 := 0
+		for fid in fids6:
+			if ring6._pos_cache.has(fid): cov6 += 1
+		print("G) chord-only: coverage %d/%d; env_worker=%d envN=%d" % [cov6, fids6.size(), FacetFarRing.env_build_worker, ring6._env_done.size()])
+		ok = _expect(cov6 == fids6.size(), "G chord-only keeps FULL coverage (chords, no holes)") and ok
+		ok = _expect(FacetFarRing.env_build_worker == 0, "G chord-only did ZERO env builds (no alloc firehose during the plunge)") and ok
 	_finish(ok)
 
 func _expect(cond: bool, label: String) -> bool:

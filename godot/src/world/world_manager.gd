@@ -844,7 +844,9 @@ func update_streaming(player_pos: Vector3) -> void:
 	# env-warm during a fast plunge (the env-build worker + whole-shell re-emit alloc firehose stalls the shared WASM
 	# allocator ⇒ physics tick). Position-based (works even under the rails coast that zeroes velocity); a per-update
 	# speed above the crossing/flip clamp is a relocation, not motion, and is rejected. Off ⇒ never called (byte-identical).
-	if CubeSphere.FP_ENV_FALL_HOLD and _far != null and _far.has_method("set_fall_hold"):
+	# FP_LAND_RAMP_HOLD shares the same vy signal to shrink the near VOXEL view during the plunge. One estimate,
+	# forwarded to both the far ring (env-warm pause) and the module (near-view clamp). Off both ⇒ never runs.
+	if CubeSphere.FP_ENV_FALL_HOLD or CubeSphere.FP_LAND_RAMP_HOLD:
 		var nowu := Time.get_ticks_usec()
 		if _have_player_pos and _fall_last_usec >= 0:
 			var dtf := float(nowu - _fall_last_usec) / 1.0e6
@@ -853,7 +855,11 @@ func update_streaming(player_pos: Vector3) -> void:
 				if spd < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
 					_fall_vy_ema = lerpf(_fall_vy_ema, (player_pos.y - _last_player_pos.y) / dtf, 0.3)
 		_fall_last_usec = nowu
-		_far.set_fall_hold(_fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY)
+		var hold := _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY
+		if CubeSphere.FP_ENV_FALL_HOLD and _far != null and _far.has_method("set_fall_hold"):
+			_far.set_fall_hold(hold)
+		if CubeSphere.FP_LAND_RAMP_HOLD and using_module and _module_world != null and _module_world.has_method("set_fall_hold"):
+			_module_world.set_fall_hold(hold)
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos

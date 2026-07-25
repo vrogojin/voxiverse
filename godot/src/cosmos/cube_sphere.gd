@@ -1642,6 +1642,15 @@ const ENV_FALL_HOLD_VY := 20.0     # downward lattice speed (blocks/s) above whi
 const FP_LAND_RAMP_HOLD := false
 const LAND_RAMP_HOLD_BLOCKS := 64.0   # near-view radius (blocks) held during the fast fall; grows to full after touchdown
 
+## COSMOS DE-ORBIT PHYS FIX 3b — pace the far-ring ENV-warm RESUME at the touchdown moment. When FP_ENV_FALL_HOLD
+## lifts as the player slows to land, ~1700 deferred env upgrades otherwise fire back-to-back (12/cycle, a whole-
+## shell re-emit each) right when the landing-kick near-stream burst also hits → the alt-8 proc spike (391ms live).
+## When on, the floored env-upgrade (remaining>0) dispatch fires at most once per ENV_RESUME_MS — coverage (chord)
+## and _pending dispatches stay IMMEDIATE (hole=0 unaffected); env still converges in a few seconds. Off ⇒ full-rate
+## resume (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-LAND-RAMP.
+const FP_ENV_RESUME_PACED := false
+const ENV_RESUME_MS := 300            # min ms between floored env-upgrade dispatches (the touchdown resume throttle)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

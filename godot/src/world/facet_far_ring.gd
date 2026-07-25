@@ -142,6 +142,8 @@ var _async_chord_only := false
 # FP_ENV_FALL_HOLD: set true by WorldManager while the player is descending fast — pauses the env-upgrade dispatch
 # (chords keep coverage) so the worker's allocation firehose stops stalling the shared WASM allocator / physics tick.
 var _fall_hold := false
+# FP_ENV_RESUME_PACED: ms of the last floored ENV-upgrade dispatch — throttles the touchdown resume burst.
+var _last_env_dispatch_ms := 0
 # T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
 # RemoteBridge (take_events) so the §2.2c "zero-queue crossing stall" (far-ring re-emit prime suspect) is convicted or
 # acquitted in one run. Bounded FIFO (NEVER-OOM: a drain-less headless session can never grow it). `_async_build_us` is
@@ -537,20 +539,26 @@ func _surface_converge_emit(p: Array) -> void:
 		if not _pending and _srf_converged:
 			return
 		_emit_cached_only = true
-		var remaining := _count_uncached_visible(p)
-		# FP_ENV_FALL_HOLD: while falling fast, dispatch is CHORD-ONLY and fires ONLY when COVERAGE changes (a visible
-		# facet still has no cache) or on a genuine role event (_pending) — never for the env-upgrade convergence. So the
-		# chords keep hole=0 (the transition reveal is chord-filled), but the worker does NO env builds and the whole-
-		# shell re-emit only runs when coverage actually changes (no continuous alloc firehose). Off ⇒ shipped remaining>0.
+		var hold := CubeSphere.FP_ENV_FALL_HOLD and _fall_hold
 		var want := _pending or not _orbit_emitted_once
-		if CubeSphere.FP_ENV_FALL_HOLD and _fall_hold:
+		var converged := false
+		if hold:
+			# CHORD-ONLY: dispatch only when COVERAGE changes (a visible facet still has no cache) — never for the env
+			# upgrade. ONE scan (uncovered); chords keep hole=0, worker does no env, no continuous re-emit. NOT converged
+			# (env resumes when the hold lifts). Hoisted below the hold test so the held frame runs a single 6·K² scan.
 			if _count_uncovered_visible(p) > 0: want = true
-		elif remaining > 0:
-			want = true
+		else:
+			var remaining := _count_uncached_visible(p)
+			converged = remaining == 0 and not _pending
+			# FP_ENV_RESUME_PACED: throttle the env-upgrade (non-coverage) dispatch so the touchdown resume doesn't burst
+			# back-to-back; _pending / first-emit stay immediate above. Off ⇒ every-frame dispatch (byte-identical).
+			if remaining > 0 and (not CubeSphere.FP_ENV_RESUME_PACED or (Time.get_ticks_msec() - _last_env_dispatch_ms) >= CubeSphere.ENV_RESUME_MS):
+				want = true
+				_last_env_dispatch_ms = Time.get_ticks_msec()
 		if want:
 			_begin_rebuild()
 			_orbit_emitted_once = true
-		_srf_converged = remaining == 0 and not _pending
+		_srf_converged = converged
 		return
 	if not _pending and _srf_converged:
 		return                                    # steady state — no per-frame warm scan (matches the shipped idle frame)

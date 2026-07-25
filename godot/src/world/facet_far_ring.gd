@@ -1128,7 +1128,9 @@ func _rebuild_full() -> void:
 	# T2e: time the mesh BUILD (assembler) and the SWAP (mesh assign / RID create + instance update) separately — two
 	# ticks_usec reads either side of the split assignment, telemetry-only, no behavioural change.
 	var t_build := Time.get_ticks_usec()
-	var new_mesh: Mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	# FP_BLOCKY_FARRING: the fast (memcpy) path replays a pre-triangulated SMOOTH tri soup — route the sync rebuild
+	# through _build_surfacetool → _emit_cached so it emits BLOCKS. Off ⇒ the shipped fast/surfacetool choice (byte-identical).
+	var new_mesh: Mesh = _build_fast(fids) if (CubeSphere.FP_FARRING_FAST_REBUILD and not CubeSphere.FP_BLOCKY_FARRING) else _build_surfacetool(fids)
 	var build_us := Time.get_ticks_usec() - t_build
 	var t_swap := Time.get_ticks_usec()
 	_mi.mesh = new_mesh
@@ -1913,6 +1915,79 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 ## Pure CPU + const reads only — safe on the async worker thread (no scene-tree / RenderingServer access). `sunk` is
 ## decided by the CALLER (live `_is_backstop` on the main-thread sync path; the frozen `_async_backstop` snapshot on the
 ## worker) so this function never reads the mutable `_excluded` off-thread.
+## FP_BLOCKY_FARRING: emit facet `fid`'s cached grid as flat-topped BLOCKS instead of the smooth welded surface. Per
+## grid cell: a FLAT top at MIN(the 4 corner radii) + a vertical wall on each internal edge (closing the height step —
+## watertight) + a facet-edge skirt. `pos` already carries the env sink, so the block top (a min of the corners) sits
+## ≤ the smooth bilinear surface everywhere ⇒ no-protrusion holds a fortiori (G-BLK-RING). The far-ring material is
+## cull_disabled, so wall winding is free. tex-UV mapping is added by the caller's tex branch (v1: vertex-colored).
+## Returns the triangle count. Reads only the passed arrays (thread-safe on the worker, same as _emit_cached).
+func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int) -> int:
+	var ncell := cells * cells
+	var top_r := PackedFloat32Array(); top_r.resize(ncell)
+	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
+	for i in range(stride * stride):
+		var p: Vector3 = pos[i]
+		var l := p.length()
+		dirs[i] = (p / l) if l > 1.0 else Vector3.UP
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0c := gj * stride + gi
+			top_r[gj * cells + gi] = minf(minf(pos[i0c].length(), pos[i0c + 1].length()),
+				minf(pos[i0c + stride].length(), pos[i0c + stride + 1].length()))
+	# skirt = one coarse block's radial pitch (the block's own height scale) — facet edges never see through.
+	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
+	var n := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			var r: float = top_r[gj * cells + gi]
+			var c: Color = col[i0]
+			var t0 := dirs[i0] * r; var t1 := dirs[i1] * r; var t2 := dirs[i2] * r; var t3 := dirs[i3] * r
+			# FLAT top (2 tris) — all four corners at the same (min) radius.
+			st.set_color(c); st.add_vertex(t0)
+			st.set_color(c); st.add_vertex(t2)
+			st.set_color(c); st.add_vertex(t1)
+			st.set_color(c); st.add_vertex(t1)
+			st.set_color(c); st.add_vertex(t2)
+			st.set_color(c); st.add_vertex(t3)
+			n += 2
+			# +gi internal edge (shared corners i1,i3) — ONE wall per edge, max→min; boundary edge → skirt.
+			if gi + 1 < cells:
+				var rn: float = top_r[gj * cells + gi + 1]
+				if absf(r - rn) > 0.01:
+					n += _emit_wall(st, dirs[i1], dirs[i3], r, rn, c if r >= rn else col[i0 + 1])
+			else:
+				n += _emit_wall(st, dirs[i1], dirs[i3], r, r - skirt, c)
+			# +gj internal edge (shared corners i2,i3).
+			if gj + 1 < cells:
+				var rd: float = top_r[(gj + 1) * cells + gi]
+				if absf(r - rd) > 0.01:
+					n += _emit_wall(st, dirs[i2], dirs[i3], r, rd, c if r >= rd else col[i0 + stride])
+			else:
+				n += _emit_wall(st, dirs[i2], dirs[i3], r, r - skirt, c)
+			# -gi / -gj FACET-boundary skirts (first row/col only) — the outer silhouette against the tier beneath.
+			if gi == 0:
+				n += _emit_wall(st, dirs[i0], dirs[i2], r, r - skirt, c)
+			if gj == 0:
+				n += _emit_wall(st, dirs[i0], dirs[i1], r, r - skirt, c)
+	return n
+
+## FP_BLOCKY_FARRING: a vertical wall quad between two edge directions from top radius to bottom (2 tris). Material is
+## cull_disabled so winding is free; emits the higher-block's colour. Caller guarantees a real step (or a skirt).
+func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float, c: Color) -> int:
+	var hi := maxf(r0, r1); var lo := minf(r0, r1)
+	var a_hi := da * hi; var b_hi := db * hi; var a_lo := da * lo; var b_lo := db * lo
+	st.set_color(c); st.add_vertex(a_hi)
+	st.set_color(c); st.add_vertex(a_lo)
+	st.set_color(c); st.add_vertex(b_hi)
+	st.set_color(c); st.add_vertex(b_hi)
+	st.set_color(c); st.add_vertex(a_lo)
+	st.set_color(c); st.add_vertex(b_lo)
+	return 2
+
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
@@ -1935,6 +2010,10 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
+	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
+	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
+	if CubeSphere.FP_BLOCKY_FARRING:
+		return _emit_blocky(st, pos, col, cells, stride)
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): decode the facet's texture params ONCE. With the flag off `tex` is false
 	# and the emit runs the shipped set_color/add_vertex sequence VERBATIM (byte-identical, zero overhead).
 	var tex := _tex_on()

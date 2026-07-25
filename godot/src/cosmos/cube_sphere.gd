@@ -491,6 +491,17 @@ const FP_SKIN_TIER := false
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
 
+## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
+## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
+## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async
+## mechanism — ZERO new memory, ZERO new streaming. Kills BOTH live complaints at once: the smooth↔blocky aesthetic
+## SWAP disappears (far is now coarse blocks, one continuous voxel look), and the "far terrain too low" step SHRINKS
+## (min over ONE cell brings the surface UP toward the near blocks, vs the min-envelope's ~26-52-block footprint).
+## No-protrusion PRESERVED a fortiori: min of 4 corners ≤ any interior bilinear point ≤ (FP_ENV_ALL) the true surface,
+## so the blocky top is pointwise BELOW the already-gated smooth surface (G-NPT stays green). Off ⇒ the shipped smooth
+## welded emit VERBATIM (textually-separate branch, byte-identical). Gate G-BLK-RING.
+const FP_BLOCKY_FARRING := false
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

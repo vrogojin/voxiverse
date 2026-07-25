@@ -436,6 +436,21 @@ const FP_ENV_WARM_ASYNC := false
 ## Requires FP_ENV_ALL + FP_ENV_WARM_ASYNC + FP_SHELL_WELD. Gate G-COVER (verify_env_warm_async §C).
 const FP_ENV_FALLBACK_EMIT := false
 
+## COSMOS NO-PROTRUSION COVERAGE — the FLOORED/descent extension of FP_ENV_FALLBACK_EMIT. The orbit fix is scoped to
+## _shell_orbit(), so on the ground / during de-orbit descent (_emit_floored_last ⇒ floored) both the chord fallback
+## AND the off-thread warm go inert: FP_ENV_ALL's ~16-40 ms/facet env build then warms SYNCHRONOUSLY on the main
+## thread (2-22 fps / proc 95-457 ms hitch) and emit is cache-gated again (sh_emit ~1340 < sh_visN 1728 ⇒ a flat
+## brown coarse-facet wedge at the near↔far boundary). When on, the floored path splits work by COST (Fable): the
+## CHEAP chord (coarse 25 / dense ~289 profile calls) warms on the budgeted MAIN thread — full coverage in ~0.5 s,
+## no hitch — while the expensive env envelope upgrades on the WORKER behind it (same batch machinery as orbit). Also
+## closes a latent leak: an orbit-minted chord passed the floored warm's `_pos_cache.has` test as "cached" and was
+## never env-upgraded on the ground (silent R-A/R-B protrusion re-leak). Near-terrain SAFE: any facet near terrain is
+## a DENSE TARGET (sticky ring-1 pre-empts pool entry) and dense targets emit with the FULL BACKSTOP_SINK when still
+## on a chord (byte-for-byte the pre-envelope backstop that shipped live for weeks), never an un-sunk +52 chord.
+## Off / env_all off / fallback off ⇒ inert (byte-identical). Requires FP_ENV_FALLBACK_EMIT + async far ring.
+## Gate G-FLOOR-COVER (verify_env_warm_async §E/F).
+const FP_ENV_FLOORED_ASYNC := false
+
 ## COSMOS NO-PROTRUSION FIDELITY (docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md §1 F2) — MID-RING DENSE promotion.
 ## Promote every far-ring facet within ~ring-2 (an angular disc ≈ MID_DENSE_RINGS facet-edges of the sub-camera /
 ## emit axis) to emit its DENSE grid (BACKSTOP_CELLS=16, ~26-block cells) instead of the coarse 5×5 (CELLS=4,

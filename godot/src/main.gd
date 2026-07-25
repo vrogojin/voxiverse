@@ -48,6 +48,12 @@ func _ready() -> void:
 	var world := WorldManager.new()
 	world.name = "WorldManager"
 	add_child(world)
+	# BOOT SPLASH (#75): push honest boot milestones to the branded web shell. Every call is
+	# web-guarded (OS.has_feature("web")) so native/headless is byte-identical — the FLAT gate,
+	# which never runs main.gd anyway, is unaffected. done/total are REAL completed-milestone
+	# counts fired at real code points (world built → scene wired → prewarm → essential ready),
+	# NOT a faked numeric %. Step 1: WorldManager built (its _ready warmed the terrain/atlas).
+	_web_progress("Preparing terrain", 1, 4)
 
 	var player := Player.new()
 	_player = player
@@ -79,6 +85,8 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
+	# BOOT SPLASH (#75) step 2: the core scene graph (world + player + HUD stack) is wired.
+	_web_progress("Building world", 2, 4)
 
 	# SN-FIX #1 (docs/COSMOS-SPACE-NAV-DESIGN.md; live pilot request 2026-07-18): the NAV readout — lattice
 	# position + radial altitude + nav-mode name. Behind SN_HUD_NAV (default OFF → no node is created and the
@@ -165,10 +173,20 @@ func _ready() -> void:
 	# combination for a few frames, hidden behind a "Loading…" overlay, so ANGLE does
 	# all the compiles up front. The player is FROZEN until it reports finished.
 	player.frozen = true
+	# BOOT SPLASH (#75) step 3: the shader/pipeline prewarm + terrain-meshed hold begins. This is
+	# the long phase (ANGLE pipeline compiles, then the module near-view meshes behind the overlay);
+	# the web shell shimmers the bar here so it never looks frozen (no faked forward %).
+	_web_progress("Prewarming shaders", 3, 4)
 	var prewarm := ShaderPrewarm.new()
 	prewarm.name = "ShaderPrewarm"
 	add_child(prewarm)
-	prewarm.begin(player, func() -> void: player.frozen = false)
+	# on_done fires when the prewarm's PHASE-2 hold confirms the essential near view is meshed
+	# (initial_view_meshed) and the player is unfrozen — i.e. the "essential near set ready"
+	# milestone. Step 4 + reveal/enable-Enter in the shell; background bake keeps running.
+	prewarm.begin(player, func() -> void:
+		player.frozen = false
+		_web_progress("Ready", 4, 4)
+		_web_essential_ready())
 
 	# COSMOS M1 (§3.4): the render bend is camera-centred, so register + seed the global bend
 	# uniforms now. FLAT_WORLD (default) leaves them untouched — no bend materials are ever built.
@@ -304,6 +322,25 @@ func _process(_delta: float) -> void:
 		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_player.world.apply_scaled_body(cam)
 		if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
+
+## BOOT SPLASH (#75): push a boot milestone to the branded web shell's global JS hook. WEB-ONLY
+## (OS.has_feature("web")) so native/headless is byte-identical and the FLAT verify gate is untouched.
+## `phase` is a fixed, code-controlled label (no user data ⇒ no escaping needed); done/total are REAL
+## completed-milestone counts. If the shell's function is absent (stock shell / older cache), the call
+## no-ops in JS (`window.voxiverseProgress && ...`). Never throws on native (guarded out entirely).
+func _web_progress(phase: String, done: int, total: int) -> void:
+	if not OS.has_feature("web"):
+		return
+	JavaScriptBridge.eval(
+		"window.voxiverseProgress && window.voxiverseProgress('%s',%d,%d);" % [phase, done, total], true)
+
+## BOOT SPLASH (#75): signal the shell that the essential near set is ready — reveal the world +
+## enable the Enter button. Same web-guard discipline as _web_progress.
+func _web_essential_ready() -> void:
+	if not OS.has_feature("web"):
+		return
+	JavaScriptBridge.eval(
+		"window.voxiverseEssentialReady && window.voxiverseEssentialReady();", true)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

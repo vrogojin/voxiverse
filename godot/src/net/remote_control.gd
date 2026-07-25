@@ -482,6 +482,16 @@ func _start_step() -> void:
 			_start_thrust()
 		"roll":
 			_start_roll()
+		"set_time":
+			# DEV TIME-CHEAT: set the celestial time-of-day at the player's current surface position. Resolves
+			# synchronously via player.remote_set_time (folds an offset into the ONE ephemeris clock). `blocked`
+			# when there is no celestial clock (ORBITAL_SKY off) — the same inert condition dev_nav/nav report under.
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_set_time"):
+				var elev = _cur.get("sun_elev_deg", null)
+				var elev_f: float = float(elev) if (elev is float or elev is int) else NAN
+				okk = bool(player.call("remote_set_time", float(_cur.get("local_hours", 12.0)), elev_f))
+			_finish_step("ok" if okk else "blocked")
 		"stop":
 			_finish_step("ok")                     # a labelled fence — the queue continues (§4.6)
 		"reload":

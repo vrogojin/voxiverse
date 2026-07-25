@@ -983,7 +983,13 @@ static func profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> Vector
 ## profile_at_dir at R_BLOCKS (byte-identical — r_of(earth) == R_BLOCKS), the Moon (body 1) samples the airless
 ## moon_profile_at_dir. Everything downstream (GenCtx threading, column memo, resolve_cell, LOD/far-ring) flows
 ## UNCHANGED — the profile is the single choke point both render paths and all queries share.
+## Instrumentation for the de-orbit phys gate (G-FALLPHYS): counts the EXPENSIVE column-profile computes so the
+## gate can prove FP_ANALYTIC_COL_MEMO collapses a floor scan's ~400 recomputes to ~1. Cheap unconditional counter;
+## it changes no behaviour and is never read in-game.
+static var _profile_computes := 0
+
 static func facet_profile(fid: int, x: int, z: int) -> Vector4:
+	_profile_computes += 1
 	var d := FacetAtlas.cell_dir(fid, x, z)
 	var r := FacetAtlas.r_of(fid)
 	if FacetAtlas.body_of_fid(fid) == 0:
@@ -1225,6 +1231,18 @@ static func worker_fold_column(gen_face: int, vx: int, vz: int, ctx: GenCtx, mwi
 ## Pure generation (no edits): the PACKED cell value the WORLD GENERATOR puts at
 ## (x,y,z) — VOXEL-DATA-STRUCTURE §7.1 tier 2. THE terrain function.
 static func generated_cell(x: int, y: int, z: int) -> int:
+	# FP_ANALYTIC_COL_MEMO (de-orbit phys fix): on the main-thread FACETED path, thread the SHARED persistent per-
+	# column memo (the same _analytic_ctx generated_cell_global / analytic_column_profile use) so a vertical scan
+	# (floor_under's ~400 cells/frame during a de-orbit fall) computes the expensive column profile ONCE and hits the
+	# memo for the rest — instead of a fresh facet_profile per cell (the phys_ms explosion). The memo is a pure fn of
+	# (facet,x,z) (cleared on facet change + cap), resolve_cell(ctx) is byte-identical to resolve_cell(null) (the
+	# worker path), and the datum shift is applied identically ⇒ ON == OFF bit-for-bit, just faster. Off / non-faceted
+	# / off-thread ⇒ the shipped null-pcache body below (byte-identical). Mirrors generated_cell_global exactly.
+	if CubeSphere.FP_ANALYTIC_COL_MEMO and CubeSphere.FACETED and _active_facet >= 0 and _on_main_thread():
+		var ctx := _acquire_facet_ctx()
+		var pm := column_profile(x, z, ctx)
+		var yym := y - FacetAtlas.datum_shift(_active_facet, x, z)
+		return resolve_cell(x, yym, z, int(pm.x), int(pm.y), pm.z, pm.w, ctx)
 	var p := column_profile(x, z)
 	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): the datum re-index at the ANALYTIC window exit (the twin
 	# of the module worker's buffer-write exit). resolve_cell/worldgen run UNCHANGED in TRUE-height space — the

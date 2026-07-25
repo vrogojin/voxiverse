@@ -135,6 +135,9 @@ var _async_env_warm := false
 # emit SUNK, chord or env)? Distinguishes the floored dense-chord path from the orbit path (backstop role off) in the
 # worker. False in orbit / off ⇒ the worker's dense handling is the shipped orbit behaviour.
 var _async_floored := false
+# FP_ENV_FALL_HOLD: set true by WorldManager while the player is descending fast — pauses the env-upgrade dispatch
+# (chords keep coverage) so the worker's allocation firehose stops stalling the shared WASM allocator / physics tick.
+var _fall_hold := false
 # T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
 # RemoteBridge (take_events) so the §2.2c "zero-queue crossing stall" (far-ring re-emit prime suspect) is convicted or
 # acquitted in one run. Bounded FIFO (NEVER-OOM: a drain-less headless session can never grow it). `_async_build_us` is
@@ -517,6 +520,10 @@ func _process(_dt: float) -> void:
 ## disk). Idle short-circuit preserves the shipped zero-cost steady state: once the whole front is cached AND emitted
 ## (`_srf_converged`) it does no work until the next role-event (`_pending`). `p` = [cull axis, cos threshold] (shipped
 ## active-facet law on the surface). Bounded re-emits (≤ backstop count) + scalar state ⇒ NEVER-OOM.
+## FP_ENV_FALL_HOLD: WorldManager sets this while the player descends fast. Plain state write (no work here).
+func set_fall_hold(v: bool) -> void:
+	_fall_hold = v
+
 func _surface_converge_emit(p: Array) -> void:
 	# FP_ENV_FLOORED_ASYNC: on the ground / de-orbit descent, mirror the ORBIT path — the WORKER chord-fills coverage
 	# and env-warms a bounded batch/cycle; NO main-thread env build (kills the 16-40ms/facet hitch), no cache race
@@ -527,7 +534,11 @@ func _surface_converge_emit(p: Array) -> void:
 			return
 		_emit_cached_only = true
 		var remaining := _count_uncached_visible(p)
-		if _pending or remaining > 0 or not _orbit_emitted_once:
+		# FP_ENV_FALL_HOLD: while falling fast, dispatch ONLY on genuine coverage events (_pending / first emit), never
+		# on the env-upgrade convergence (remaining>0) — the chords already cover (hole=0), so the worker (+ its whole-
+		# shell re-emit alloc firehose) idles during the plunge and resumes the frame the hold lifts. Off ⇒ same as before.
+		var env_warm_ok := not (CubeSphere.FP_ENV_FALL_HOLD and _fall_hold)
+		if _pending or (remaining > 0 and env_warm_ok) or not _orbit_emitted_once:
 			_begin_rebuild()
 			_orbit_emitted_once = true
 		_srf_converged = remaining == 0 and not _pending
@@ -602,7 +613,10 @@ func _orbit_warm_async(p: Array) -> void:
 	var remaining := _count_uncached_visible(p)
 	# Dispatch when: a fresh drift/engage (`_pending`), any facet still to warm (progressive reveal), or the mesh has
 	# never been emitted this engage (fill it even at 0 growth). Each dispatch's worker warms the next batch off-thread.
-	if _pending or remaining > 0 or not _orbit_emitted_once:
+	# FP_ENV_FALL_HOLD: while falling fast, suppress the remaining>0 (env-upgrade) dispatch here too — calms the >384
+	# band's worst frames; chords keep coverage. Off ⇒ byte-identical.
+	var env_warm_ok := not (CubeSphere.FP_ENV_FALL_HOLD and _fall_hold)
+	if _pending or (remaining > 0 and env_warm_ok) or not _orbit_emitted_once:
 		_begin_rebuild()
 		_orbit_emitted_once = true
 	# Converged once every visible facet is cached AND the pending emit was consumed — the next drift re-sets `_pending`.

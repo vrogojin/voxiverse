@@ -1607,6 +1607,28 @@ const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jum
 const FP_FLOOR_MEMO := false
 const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
 
+## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
+## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
+## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME
+## column, every frame ⇒ phys_ms 100-330 ms, 1-5 fps ("jerky as hell"). Root cause (Fable): generated_cell passes
+## column_profile a null pcache (unlike generated_cell_global, which threads the shared persistent memo). When on,
+## the main-thread FACETED generated_cell routes through the SAME facet-scoped _analytic_ctx memo the global path
+## uses, so the scan computes the profile ONCE + hits the memo for the rest ⇒ ~3-8 ms. Byte-identical off (shipped
+## null-pcache path); memo entries are pure fn of (facet,x,z), cleared on facet change + cap ⇒ NEVER-OOM, no stale.
+## This is the cheap "follow the FAR TERRAIN collision at speed" the descent regime wants. Gate G-FALLPHYS.
+const FP_ANALYTIC_COL_MEMO := false
+
+## COSMOS DE-ORBIT PHYS FIX 2 — pause the far-ring ENV-WARM during a fast descent. FP_ENV_FLOORED_ASYNC keeps the
+## far-ring worker building envelopes + re-uploading the whole shell mesh EVERY worker-idle frame while the emit axis
+## sweeps during a plunge; on WASM all threads share ONE dlmalloc (the convoy), so that allocation firehose stalls the
+## physics tick (most of the descent phys_ms is allocator-WAIT, NOT real physics — Fable). The clean pre-env-chain
+## build had none of it. When on, while |downward lattice speed| > ENV_FALL_HOLD_VY the floored/orbit warm dispatches
+## ONLY on genuine coverage events (_pending / first emit), NEVER on the env-upgrade convergence (remaining>0) — the
+## chord fallback already holds full coverage (hole=0 proven), so envelope SHARPENING simply waits until you slow /
+## land, then resumes. Off ⇒ never held (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-ENV-FALL-HOLD.
+const FP_ENV_FALL_HOLD := false
+const ENV_FALL_HOLD_VY := 20.0     # downward lattice speed (blocks/s) above which env-warm pauses (walk/jump ≈ 0-9)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

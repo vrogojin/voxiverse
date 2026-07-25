@@ -165,6 +165,10 @@ var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+# FP_ENV_FALL_HOLD: position-based downward-speed estimate (blocks/s, EMA) to pause the far-ring env-warm during a
+# fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
+var _fall_last_usec: int = -1
+var _fall_vy_ema: float = 0.0
 # T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
 # of the snowfall fixed step + the load-controller tick since the last telemetry drain; RemoteBridge samples the max once
 # per window (take_perf_attrib) so the 0.5 s snowfall spike is attributed instead of folded anonymously into worst_ms.
@@ -836,6 +840,20 @@ func update_streaming(player_pos: Vector3) -> void:
 				if sp < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
 					_player_speed = lerpf(_player_speed, sp, 0.3)
 		_last_stream_usec = now_usec
+	# FP_ENV_FALL_HOLD: estimate the DOWNWARD lattice speed (blocks/s, EMA) and hand it to the far ring so it pauses
+	# env-warm during a fast plunge (the env-build worker + whole-shell re-emit alloc firehose stalls the shared WASM
+	# allocator ⇒ physics tick). Position-based (works even under the rails coast that zeroes velocity); a per-update
+	# speed above the crossing/flip clamp is a relocation, not motion, and is rejected. Off ⇒ never called (byte-identical).
+	if CubeSphere.FP_ENV_FALL_HOLD and _far != null and _far.has_method("set_fall_hold"):
+		var nowu := Time.get_ticks_usec()
+		if _have_player_pos and _fall_last_usec >= 0:
+			var dtf := float(nowu - _fall_last_usec) / 1.0e6
+			if dtf > 0.0:
+				var spd := player_pos.distance_to(_last_player_pos) / dtf
+				if spd < CubeSphere.VEL_PREDICT_SPEED_CLAMP:
+					_fall_vy_ema = lerpf(_fall_vy_ema, (player_pos.y - _last_player_pos.y) / dtf, 0.3)
+		_fall_last_usec = nowu
+		_far.set_fall_hold(_fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY)
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos

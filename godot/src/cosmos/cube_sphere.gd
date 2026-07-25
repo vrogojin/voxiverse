@@ -1629,6 +1629,28 @@ const FP_ANALYTIC_COL_MEMO := false
 const FP_ENV_FALL_HOLD := false
 const ENV_FALL_HOLD_VY := 20.0     # downward lattice speed (blocks/s) above which env-warm pauses (walk/jump ≈ 0-9)
 
+## COSMOS DE-ORBIT PHYS FIX 3 — shrink the near VOXEL view during a fast descent (the near-surface landing dip).
+## Root cause (Fable): the near dip (alt ~38-94) is the 128-block near-voxel view sphere plunging INTO terrain —
+## every solid block entering it must gen+mesh+UPLOAD (the post-port apply-bound #58), unmasked once the phys fix
+## removed the convoy. The regime principle applied to RENDERING: at high descent speed the near voxel field is
+## scenery the far-ring chords already cover (hole=0 proven), so while |downward vy| > ENV_FALL_HOLD_VY the module
+## clamps every pool slot's grow target to LAND_RAMP_HOLD_BLOCKS (a small landing disc); on hold release (≈ touchdown)
+## the existing landing-kick + paced ramp grow it back to the full near radius over ~6 s while the player stands
+## still — the streaming burst moves to where it is least perceptible AND is admission-paced. Physics is analytic
+## (never reads meshes) so landing correctness is untouched. Off ⇒ never clamped (byte-identical). Requires
+## FP_ENV_FALL_HOLD (shares its vy signal). Gate G-LAND-RAMP.
+const FP_LAND_RAMP_HOLD := false
+const LAND_RAMP_HOLD_BLOCKS := 64.0   # near-view radius (blocks) held during the fast fall; grows to full after touchdown
+
+## COSMOS DE-ORBIT PHYS FIX 3b — pace the far-ring ENV-warm RESUME at the touchdown moment. When FP_ENV_FALL_HOLD
+## lifts as the player slows to land, ~1700 deferred env upgrades otherwise fire back-to-back (12/cycle, a whole-
+## shell re-emit each) right when the landing-kick near-stream burst also hits → the alt-8 proc spike (391ms live).
+## When on, the floored env-upgrade (remaining>0) dispatch fires at most once per ENV_RESUME_MS — coverage (chord)
+## and _pending dispatches stay IMMEDIATE (hole=0 unaffected); env still converges in a few seconds. Off ⇒ full-rate
+## resume (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-LAND-RAMP.
+const FP_ENV_RESUME_PACED := false
+const ENV_RESUME_MS := 300            # min ms between floored env-upgrade dispatches (the touchdown resume throttle)
+
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier
 const CORNER_ZONE_R := 72        # eager-flip zone radius (raw cells about a vertex)   [§4, §7]

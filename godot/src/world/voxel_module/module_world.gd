@@ -80,6 +80,10 @@ var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the commit
                                               # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
 var _imminent_committed := false              # CROSSING-JERKINESS FIX: true once the imminent ridge_dist < POOL_D_COMMIT
                                               # (published by WorldManager) → its ramp uses CTRL_IMMINENT_COMMIT_PACE (full)
+# FP_LAND_RAMP_HOLD: set by WorldManager while the player descends fast — clamps every pool slot's grow target to
+# LAND_RAMP_HOLD_BLOCKS so the near voxel view shrinks during the plunge (the far-ring chords already cover it) and
+# grows back to the full radius after touchdown. Plain state; the clamp is applied in _ramp_pool_step.
+var _fall_hold := false
 # §10 memory ledger anchors (per-terrain FP-R0 live measurement 18 MB @ view96 unclamped; clamp strictly reduces).
 const POOL_NEIGHBOUR_MEM_BUDGET_MB := 20      # per neighbour, view 96, bounds-clamped
 const POOL_ACTIVE_MEM_BUDGET_MB := 40         # active, view 128, bounds-clamped
@@ -435,7 +439,16 @@ func _pool_ramp_kick() -> void:
 ## newly-requested view volume per frame to a single slot's RAMP_SECONDS-paced step, so N slots ramping concurrently
 ## can never collectively flood the 2 web workers + the main-thread mesh-apply. Shrinks (view_f > target) only UNLOAD,
 ## so every shrinking slot snaps immediately the same frame. Returns true while any slot still has growing to do.
+## FP_LAND_RAMP_HOLD: WorldManager sets this while the player descends fast (shares FP_ENV_FALL_HOLD's vy signal).
+func set_fall_hold(v: bool) -> void:
+	_fall_hold = v
+
 func _ramp_pool_step(delta: float) -> bool:
+	# FP_LAND_RAMP_HOLD: while falling fast, clamp every slot's EFFECTIVE grow target to a small landing disc so the
+	# near voxel view shrinks (the far-ring chords cover 64-128 — hole=0 proven); the REAL view_target is left intact,
+	# so on hold release (touchdown) the slot grows back to the full radius under the existing landing-kick/paced ramp.
+	# Off / not-holding ⇒ 1e9 clamp ⇒ tgt == view_target (byte-identical).
+	var hold_clamp := (CubeSphere.LAND_RAMP_HOLD_BLOCKS if (CubeSphere.FP_LAND_RAMP_HOLD and _fall_hold) else 1.0e9)
 	# FP_LANDING_STREAM_KICK: after a de-orbit LAND the active facet is the RESIDENT pool slot with no imminent
 	# successor (no crossing is pending), so the grow leg below runs at the raw _stream_pace — which the load
 	# controller pins at 0 whenever its backlog/apply gate is held closed (a far-ring/shell rebuild churning
@@ -456,7 +469,7 @@ func _ramp_pool_step(delta: float) -> bool:
 	for fid in _pool:
 		var s: Dictionary = _pool[fid]
 		var cur: float = s["view_f"]
-		var tgt: float = s["view_target"]
+		var tgt: float = minf(float(s["view_target"]), hold_clamp)   # FP_LAND_RAMP_HOLD: effective target clamped while falling
 		if cur > tgt + 0.5:
 			if CubeSphere.FP_SHRINK_PACED:
 				# COSMOS-PERF UNATTENDED R4: PACE the unload — shed at most SHRINK_STEP_BLOCKS (one mesh-block shell)

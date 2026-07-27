@@ -113,19 +113,28 @@ var _sticky_hold: Dictionary = {}    # fid -> int (role-events left before this 
 # mesh — the make-before-break invariant is "every pool facet is an emitted backstop at the moment near meshes apply",
 # and that is a property of the LAST rebuild's roles, not the live `_is_backstop`. Recorded at each rebuild/swap.
 var _emitted_backstop: Dictionary = {}   # fid -> true (drawn sunk in the committed mesh)
-# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3): the per-cell occlusion-cull state. `_cull_cover_query` is
-# the near-coverage callable (fid, fid-lattice AABB) -> bool, routed to module_world.skin_near_meshed; INVALID (no
-# module / fallback path) ⇒ cull inert (byte-identical). `_cull_mask` is fid -> PackedByteArray(BACKSTOP_CELLS²): 1 =
-# this 26-block cell is CONFIRMED covered by the near field and NOT emitted. `_cull_streak` is the matching per-cell
-# count of CONSECUTIVE covered reads (the CULL_CONFIRM=2 hysteresis); reset to 0 (and the mask bit cleared) INSTANTLY
-# on the first uncovered read. Pruned to the live backstop set each probe ⇒ ≤ ~16 × 256 B, bounded (NEVER-OOM). All
-# empty / never read with the flag off. `_cull_changed` latches a mask flip so `_process` re-emits; `_cull_last_ms`
-# throttles the probe to the CULL_REAP_MS cadence.
+# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3 + round-2 live-perf fix): the per-cell occlusion-cull state.
+# `_cull_cover_query` is the near-coverage callable (fid, fid-lattice AABB) -> bool, routed to module_world.skin_near_meshed;
+# INVALID (no module / fallback path) ⇒ cull inert (byte-identical). TWO masks, DECOUPLED, so a full far-ring rebuild
+# (≈1 s SYNC) never fires per probe as coverage churns under live streaming:
+#   `_cull_mask`      — the LIVE per-cell hysteresis output, updated EVERY probe (1 = this 26-block cell is confirmed
+#                       covered). Drives the rebuild DECISION only; the emit never reads it.
+#   `_committed_cull` — the SNAPSHOT the current mesh reflects; the EMIT (`is_cell_culled`) reads THIS. Only written at a
+#                       rebuild: APPLY (settled) copies the live mask; FLUSH (safety) clears it to full emission.
+# `_cull_streak` is the matching per-cell consecutive-covered-read count (the CULL_CONFIRM=2 hysteresis). All pruned to
+# the live backstop set each probe ⇒ ≤ ~16 × 256 B, bounded (NEVER-OOM). Empty / never read with the flag off.
+# `_cull_changed` latches a LIVE-mask flip within one probe pass (settle detector); `_cull_stable_probes` counts
+# consecutive no-change probes; `_cull_last_ms` throttles the probe to CULL_REAP_MS; `_cull_last_reemit_ms` rate-limits
+# the APPLY rebuild; `_cull_reemit_count` is the rebuild tally the cost gate asserts is bounded.
 var _cull_cover_query: Callable = Callable()
-var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): 1 = culled (confirmed covered)
+var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): LIVE 1 = culled (confirmed covered)
+var _committed_cull: Dictionary = {}     # fid -> PackedByteArray(BACKSTOP_CELLS²): what the CURRENT mesh emits (read by is_cell_culled)
 var _cull_streak: Dictionary = {}        # fid -> PackedByteArray(BACKSTOP_CELLS²): consecutive covered-read count
-var _cull_changed := false               # a mask bit flipped since the last rebuild → _process re-emits
+var _cull_changed := false               # a LIVE-mask bit flipped this probe pass (resets the settle counter)
+var _cull_stable_probes := 0             # consecutive probes with NO live-mask change (settle detector)
 var _cull_last_ms := 0                   # throttle clock for the coverage re-probe (CULL_REAP_MS)
+var _cull_last_reemit_ms := 0            # last APPLY rebuild wall-ms (rate-limit ≥ CULL_REBUILD_MS)
+var _cull_reemit_count := 0              # far-ring rebuilds this cull has triggered (bounded — G-CV-NOCHURN-COST)
 # COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
 # (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
 # per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
@@ -1196,13 +1205,87 @@ func cull_feed(fid: int, ci: int, covered: bool) -> bool:
 	_cull_streak[fid] = streak
 	return mask[ci] == 1
 
-## Emit-time read: is facet `fid`'s cell `ci` currently CONFIRMED covered (⇒ suppress it)? False unless the cull is active
-## and this fid carries a mask (a live backstop facet in range). Pure lookup, no probe — the mask is refreshed by `_cull_probe`.
+## Emit-time read: does the CURRENT mesh suppress facet `fid`'s cell `ci`? Reads the COMMITTED snapshot (NOT the live
+## churning mask) so the emitted geometry only ever changes at a rebuild — never per probe. False unless the cull is
+## active. Pure lookup.
 func is_cell_culled(fid: int, ci: int) -> bool:
 	if not _cull_on():
 		return false
-	var mask: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+	var mask: PackedByteArray = _committed_cull.get(fid, PackedByteArray())
 	return ci >= 0 and ci < mask.size() and mask[ci] == 1
+
+## Would any committed-culled cell be a HOLE right now — i.e. is it un-culled in the LIVE mask (near has retreated /
+## un-meshed there)? Drives the prompt FLUSH safety path. A committed 1 with a live 0 means the mesh omits a cell the near
+## field no longer covers ⇒ must re-emit. The +CULL_DILATE dilation makes the live 0 arrive while the tight cell is still
+## covered, so this fires BEFORE an actual hole.
+func _cull_committed_unsafe() -> bool:
+	for fid in _committed_cull.keys():
+		var cm: PackedByteArray = _committed_cull[fid]
+		var lm: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+		for ci in range(cm.size()):
+			if cm[ci] == 1 and (ci >= lm.size() or lm[ci] == 0):
+				return true
+	return false
+
+## Do the live and committed masks differ in their EFFECTIVE cull set (which cells are 1)? An all-zero facet array and an
+## absent facet are equal (both cull nothing) — so an APPLY of a mask that culls nothing never fires a spurious rebuild.
+func _cull_mask_differs() -> bool:
+	for fid in _cull_mask.keys():
+		if _facet_cull_differs(_cull_mask[fid], _committed_cull.get(fid, PackedByteArray())):
+			return true
+	for fid in _committed_cull.keys():
+		if not _cull_mask.has(fid) and _any_bit_set(_committed_cull[fid]):
+			return true
+	return false
+
+## Bit-wise cull difference between two per-facet arrays, treating an out-of-range index as 0.
+func _facet_cull_differs(a: PackedByteArray, b: PackedByteArray) -> bool:
+	var n := maxi(a.size(), b.size())
+	for ci in range(n):
+		var av: int = a[ci] if ci < a.size() else 0
+		var bv: int = b[ci] if ci < b.size() else 0
+		if av != bv:
+			return true
+	return false
+
+func _any_bit_set(a: PackedByteArray) -> bool:
+	for v in a:
+		if v == 1:
+			return true
+	return false
+
+## Deep-copy the live mask into the committed snapshot (APPLY). PackedByteArrays are value types; duplicate so a later live
+## mutation cannot alias the committed emit source.
+func _cull_commit_apply() -> void:
+	_committed_cull.clear()
+	for fid in _cull_mask.keys():
+		_committed_cull[fid] = (_cull_mask[fid] as PackedByteArray).duplicate()
+
+## Clear the committed snapshot (FLUSH → full emission). Used by the safety path so a stale cull can never outlive the
+## near coverage that justified it.
+func _cull_commit_flush() -> void:
+	_committed_cull.clear()
+
+## DECOUPLED rebuild decision (round-2 live-perf fix — headlessly testable; `now_ms` injectable). Given the freshly-probed
+## live mask this pass and whether it changed, decide whether the far ring must re-emit, and update the committed snapshot:
+##   FLUSH  — a committed-culled cell just un-culled (near retreated): clear committed to full emission NOW (safety, holes
+##            worse than overdraw), un-rate-limited. Returns true.
+##   APPLY  — the live mask has been STABLE for CULL_SETTLE_PROBES probes AND differs from committed AND ≥ CULL_REBUILD_MS
+##            since the last APPLY: copy the live mask into committed (the settled standing-still optimization). Returns true.
+##   else   — no rebuild (committed unchanged) → during sustained streaming the churning live mask triggers NOTHING.
+func _cull_decide_reemit(changed: bool, now_ms: int) -> bool:
+	_cull_stable_probes = 0 if changed else _cull_stable_probes + 1
+	if _cull_committed_unsafe():
+		_cull_commit_flush()
+		_cull_reemit_count += 1
+		return true
+	if _cull_stable_probes >= CubeSphere.CULL_SETTLE_PROBES and _cull_mask_differs() \
+			and now_ms - _cull_last_reemit_ms >= CubeSphere.CULL_REBUILD_MS:
+		_cull_commit_apply()
+		_cull_last_reemit_ms = now_ms
+		_cull_reemit_count += 1
+		return true
+	return false
 
 ## The fid-lattice AABB the coverage probe asks about for backstop cell (gi,gj), DILATED by ±CULL_DILATE horizontally and
 ## banded by ±CULL_Y_MARGIN radially. Built from the cell's 4 dense-cache corner positions (ABSOLUTE world) mapped back to
@@ -1238,18 +1321,20 @@ func _cull_probe_cell(fid: int, gi: int, gj: int) -> bool:
 	return bool(_cull_cover_query.call(fid, _cull_cell_aabb(fid, gi, gj)))
 
 ## Per-frame (from `_process`, throttled to CULL_REAP_MS): re-probe every cell of every LIVE backstop facet whose dense cache
-## exists, advancing the hysteresis state machine. Prunes `_cull_mask`/`_cull_streak` to the current backstop set (NEVER-OOM),
-## and latches a re-emit (`_pending`) when any cell's culled bit flipped. No-op unless the cull is active. Cheap-boolean
-## octree reads only (the skin already pays this class of cost live); returns immediately while the cull is off.
+## exists, advancing the hysteresis state machine (cheap O(cells) — is_area_meshed octree reads only). Prunes the masks to
+## the current backstop set (NEVER-OOM). Then the DECOUPLED decision (`_cull_decide_reemit`) fires a far-ring rebuild ONLY
+## on a settle (APPLY) or a safety (FLUSH) transition — NOT per probe — so the ~1 s sync rebuild can no longer run every
+## frame as coverage churns under live streaming (the round-2 regression). No-op unless the cull is active.
 func _cull_update() -> void:
 	if not _cull_on():
-		if not _cull_mask.is_empty():
-			_cull_mask.clear(); _cull_streak.clear()   # flag flipped off mid-run — drop all state
+		if not _cull_mask.is_empty() or not _committed_cull.is_empty():
+			_cull_mask.clear(); _cull_streak.clear(); _committed_cull.clear()   # flag flipped off mid-run — drop all state
 		return
 	var now := Time.get_ticks_msec()
 	if now - _cull_last_ms < CubeSphere.CULL_REAP_MS:
 		return
 	_cull_last_ms = now
+	_cull_changed = false                                # per-pass live-mask-change latch (settle detector)
 	var cells := CubeSphere.BACKSTOP_CELLS
 	# The set of facets that CAN be near-covered = live backstop facets with a dense cache (near meshes only around them).
 	var live := {}
@@ -1259,13 +1344,18 @@ func _cull_update() -> void:
 			for gj in range(cells):
 				for gi in range(cells):
 					cull_feed(fid, gj * cells + gi, _cull_probe_cell(fid, gi, gj))
-	# Prune state for facets no longer backstop (they emit full again next rebuild) — bounded footprint.
+	# Prune LIVE + streak state for facets no longer backstop (bounded footprint); a committed facet that left the set is
+	# dropped too, and that counts as a live-mask change so the settle counter restarts (the committed emit is stale).
 	for fid in _cull_mask.keys():
 		if not live.has(fid):
 			_cull_mask.erase(fid); _cull_streak.erase(fid)
 			_cull_changed = true
-	if _cull_changed:
-		_cull_changed = false
+	for fid in _committed_cull.keys():
+		if not live.has(fid):
+			_committed_cull.erase(fid)
+			_cull_changed = true
+	# DECOUPLED: rebuild only on a settle/safety transition — never per probe.
+	if _cull_decide_reemit(_cull_changed, now):
 		_pending = true                                 # re-emit through whichever _process path is active
 
 ## FP_MID_DENSE gate visibility: does facet `fid` emit from the dense cache right now? (public accessor for

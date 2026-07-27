@@ -735,6 +735,20 @@ const FP_BOOT_ASYNC := false
 ## synchronous boot cost stays small (~BOOT_SEED_FACETS × per-facet warm); the rest stream in over subsequent frames.
 const BOOT_SEED_FACETS := 48
 
+## MANIFEST BAKE SLICE (perf/voxiverse-load-profile round 4) — FP_MANIFEST_SLICE. Symptom (live profile): world_build's
+## wb_module_setup = 22.2s, dominated by module_world._build_gen_manifest baking ~8000 appearance models synchronously
+## (each triggers a GPU geometry read-back). Most are COLD-biome variants a temperate spawn does not touch in its first
+## seconds: snow-fill composites (~1580) + sharp slopes (~5160) + waterlog twins (~632). When ON, setup() bakes only the
+## CORE synchronously (dry gen-appearance ~650 + snow-cap ~320 + snow LAYER + seam carve — the shapes a temperate spawn's
+## near field needs), and the cold bulk bakes AFTER essential-ready (WorldManager.begin_deferred_boot_work → one helper
+## per frame), followed by a bounded near-view RE-RAMP so any cell generated with a cube fallback during the defer window
+## remeshes with the completed library (no permanent wrong-shape — the regression a naive defer would cause). An unbaked
+## cold slot cube-falls-back on the worker meanwhile (right substance, wrong silhouette, never a hole). Default OFF ⇒ the
+## shipped one-shot synchronous bake (byte-identical; FLAT stays 6042/0). Flip ON at export after the live A/B.
+## TRADEOFF: the deferred cold helpers are monolithic, so each lands as one multi-second frame in the first seconds of
+## play (3 hitches) — acceptable vs +16s to essential-ready, and A/B-gated. Finer intra-helper slicing is a follow-up.
+const FP_MANIFEST_SLICE := false
+
 ## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
 ## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
 ## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and

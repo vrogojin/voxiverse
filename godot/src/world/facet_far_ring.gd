@@ -226,6 +226,19 @@ var _boot_warm := false
 var _boot_fids: PackedInt32Array = PackedInt32Array()
 var _boot_cursor := 0
 var _boot_last_emit_size := 0
+# FP_BOOT_ASYNC (round 4): HOLD the background warm until essential-ready fires (main.gd → open_boot_gate). During the
+# ShaderPrewarm/pre-essential-ready window the far-ring background warm was starving the prewarm's compile frames (live
+# profile: prewarm_phase1 39s at ~550ms/frame while the ring warmed 36→1716). Holding it means only the synchronous seed
+# is drawn until the player is in; then the far side fills WHILE playing (fog/near field hide the pop-in). A wall-clock
+# FAILSAFE opens the gate anyway so a missed release can never permanently strand the far hemisphere at the seed.
+var _boot_gate_open := false
+var _boot_setup_ms := 0
+const BOOT_GATE_FAILSAFE_MS := 20000   # open the warm gate this long after setup even if essential-ready never signalled
+
+## FP_BOOT_ASYNC (round 4): main.gd (via WorldManager.release_far_ring_boot_warm) calls this at essential-ready to let
+## the background far-ring warm proceed — off the prewarm/compile critical path. Idempotent; no-op with the flag off.
+func open_boot_gate() -> void:
+	_boot_gate_open = true
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
@@ -247,6 +260,7 @@ func setup(active_fid: int) -> void:
 ## the SAME _emit_cached_only / _ensure_emit_cached path the true-orbit progressive emit uses, so the mesh is index-aligned
 ## and every downstream consumer is unchanged.
 func _boot_begin() -> void:
+	_boot_setup_ms = Time.get_ticks_msec()
 	_boot_fids = _order_front_by_proximity()
 	var seed := mini(CubeSphere.BOOT_SEED_FACETS, _boot_fids.size())
 	for i in range(seed):
@@ -533,7 +547,13 @@ func _process(_dt: float) -> void:
 	# A crossing during boot-warm still renders: set_active re-places the absolute mesh rigidly; its deferred exclusion
 	# re-emit is served by the shipped _pending path once boot-warm completes. Off ⇒ never entered (byte-identical).
 	if CubeSphere.FP_BOOT_ASYNC and _boot_warm:
-		_boot_warm_step()
+		# Round 4: hold the warm off the prewarm/compile critical path until essential-ready opens the gate (or the
+		# wall-clock failsafe trips). Until then only the synchronous seed is drawn — the far side does not contend
+		# with the shader-compile frames.
+		if not _boot_gate_open and Time.get_ticks_msec() - _boot_setup_ms >= BOOT_GATE_FAILSAFE_MS:
+			_boot_gate_open = true
+		if _boot_gate_open:
+			_boot_warm_step()
 		return
 	_prewarm_step(_dt)               # COSMOS-ORBITAL-SHELL S2: one-shot whole-planet warm (no-op unless FP_SHELL_PREWARM + off-surface)
 	if _async_building:

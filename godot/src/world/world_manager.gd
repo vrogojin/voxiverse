@@ -961,10 +961,11 @@ func update_streaming(player_pos: Vector3) -> void:
 func initial_view_meshed(center: Vector3) -> bool:
 	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
 		# FP_LOAD_RAMP (perf/voxiverse-load-profile): with the initial view ramping in, hold the splash until a
-		# MODEST surround (LOAD_RAMP_ESSENTIAL_HALF ≈ 96) is meshed rather than a bare 40-block bubble — so
-		# "playable" means actually-surrounded. The ShaderPrewarm [floor, cap] window still bounds the wait
-		# (never hangs). Off ⇒ the shipped 40³ box (byte-identical).
-		var half := Vector3(96.0, 32.0, 96.0) if CubeSphere.FP_LOAD_RAMP else Vector3(40.0, 32.0, 40.0)
+		# MODEST surround is meshed rather than a bare 40-block bubble — so "playable" means actually-surrounded.
+		# Round 4: 64³ (not 96³) — the 96³ box could not mesh inside the cap on web (the hold always hit the cap),
+		# so reveal a little earlier and let the ring keep filling; the ShaderPrewarm [floor, cap] window still bounds
+		# the wait (never hangs). Off ⇒ the shipped 40³ box (byte-identical).
+		var half := Vector3(64.0, 32.0, 64.0) if CubeSphere.FP_LOAD_RAMP else Vector3(40.0, 32.0, 40.0)
 		return bool(_module_world.call("area_meshed", center, half))
 	return true                                     # fallback path / no module → no terrain-format hold
 
@@ -977,6 +978,15 @@ func view_meshed(center: Vector3, half: Vector3) -> bool:
 	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
 		return bool(_module_world.call("area_meshed", center, half))
 	return true
+
+## FP_BOOT_ASYNC (round 4): let the deferred far-ring background warm proceed — called by main.gd at essential-ready so
+## the warm runs WHILE the player plays instead of starving the shader-prewarm compile frames. No-op off the flag / no
+## ring. Also kicks the deferred manifest bake (FP_MANIFEST_SLICE) so the cold-biome models bake off the boot path.
+func begin_deferred_boot_work() -> void:
+	if _facet_ring != null and _facet_ring.has_method("open_boot_gate"):
+		_facet_ring.open_boot_gate()
+	if _module_world != null and _module_world.has_method("begin_deferred_manifest_bake"):
+		_module_world.call("begin_deferred_manifest_bake")
 
 # --- terrain editing (block breaking + placing) --------------------------------
 

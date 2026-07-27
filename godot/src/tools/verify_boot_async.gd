@@ -66,6 +66,10 @@ func _initialize() -> void:
 			cached0, CubeSphere.BOOT_SEED_FACETS, front_total])
 		_ok(cached0 < front_total, "ON: setup did NOT cache the whole hemisphere synchronously")
 		_ok(warming0, "ON: boot warm is armed after setup")
+		# Round 4: the warm is HELD until essential-ready. Assert the hold, then open the gate and drive convergence.
+		ring._process(0.016)
+		_ok(ring.boot_cached_count() == cached0, "ON: warm is HELD before the gate opens (no growth until essential-ready)")
+		ring.open_boot_gate()
 		# Drive _process: the cache must grow monotonically and converge to the full front count.
 		var prev := cached0
 		var monotone := true

@@ -9,7 +9,10 @@ is not the vision — the far terrain must wear real block-atlas FACES. **§2U (
 §2R.3 and amends §3): the tiled per-material pattern is still not the vision — the band just beyond
 the near field must be the REAL top-down bake of each facet's actual blocks (each block's own face
 at its own position); NO drawn grid lines; and the far ring must sit at the SAME level as the near
-blocks, with fully-covered far cells OCCLUSION-CULLED instead of sunk.** Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
+blocks, with fully-covered far cells OCCLUSION-CULLED instead of sunk.** **§2V (round 4, on the
+live U0+U1 build): the far SKIN must be a REAL TOP-DOWN SHOT of the near blocky terrain incl.
+TREES (edits later) — one shot-derived skin pyramid at every distance, a continuous descent
+fidelity ramp (no flat-color middle stage), and ONE lighting law shared by near and far.** Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
 texture — the TEXTURE mechanism), `docs/COSMOS-BLOCK-LOD-DESIGN.md` (the decimated-block pyramid —
 the GEOMETRY mechanism), `docs/COSMOS-SEAMLESS-SCALES-DESIGN.md` (composition law §0.5),
 `docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md`.
@@ -424,6 +427,173 @@ cells → culled far; first un-culled cells → true level (U3), real per-block 
 | E3 | Coverage probe cost (256-cell masks × 9 facets) | probe only cells within NEAR_COVER_R, on the 100 ms reap cadence — the skin already pays this class of cost live |
 | E4 | Band layer count pressure (mountainous ring-1 wants ring-2) | 9-layer v1 ceiling is structural; ring-2 only behind heap+fps A/B |
 
+## 2V. REDESIGN 3 — the real-shot skin pyramid, continuous descent, unified lighting
+
+User verdict on live U0+U1: "looks way better", but the block-id × tiles band is still a
+reconstruction *trick* to his eye, not "a REAL SHOT of the near blocky terrain" — it misses the
+on-surface decorations (TREES now, digs/builds later) and the depth cues a photograph has. He
+accepts the heavy bake ("generate all the NEAR blocky surface of the planet and bake into
+chunk/facet skins") with two constraints: skins built from the **16×16 per-block texture
+equivalents** (no finer), and **geometry stays the existing low-res far geometry — only the skin
+changes**. Two live bugs ride along: the descent flat-color stage and the near/far lighting
+mismatch. All three are one design.
+
+### 2V.0 RTT reconsidered — and re-rejected, with the numbers and a new killer argument
+
+**(A) True GPU RTT** (mesh each facet's near blocks + trees + edits off-screen, render top-down,
+read back):
+
+1. **Time**: a facet is ≈170 near chunks (417²/32²); at the measured web meshing rate
+   (~130 ms/chunk, [[streaming supply<demand]]) that is ≈22 s of meshing per facet, ≈**21 hours
+   planet-wide**, before any render or readback. Even band-only (9 facets) is ≈3 min of meshing
+   per crossing — vs ~1-2 s for the analytic bake.
+2. **Readback**: `get_image()` per bake is a synchronous multi-ms GPU stall on ANGLE, on the
+   render thread, per facet — the exact hitch class every perf round has fought.
+3. **Determinism**: GPU/driver-dependent pixels break every headless gate downstream.
+4. **The new killer — lighting bakes wrong.** A shot rendered under today's sun freezes that sun
+   into the skin; with a 45.5-minute day the baked shadows are visibly wrong within minutes. The
+   skin must be baked in **albedo space** (sun-independent) with lighting applied live by the
+   shader — which an RTT of the lit near mesh cannot produce without a second unlit render path.
+
+**(B) Analytic composite — CHOSEN, upgraded to shot-equivalence.** The near block material is
+verifiably simple: `_NEAR_DAYLIGHT_SHADER` (`block_atlas.gd:57-75`) is `ALBEDO = v_col.rgb ×
+atlas_texel × shade(sun)` — **no AO, no per-face normal response, no specular**. Therefore a
+top-down orthographic shot of the near field is, pixel for pixel, `tile[block_id] × block_tint ×
+shade` — a function the baker can evaluate exactly, deterministically, off the render pipeline,
+for facets that were never meshed. (B) does not approximate the shot; it **is** the shot's own
+math. Honest divergence disclosure: if the near look later gains effects outside this model
+(dynamic entity shadows, particles), those stay out of the skin — terrain + static decorations
+only.
+
+### 2V.1 The skin source: one column record, three stored forms (the pyramid)
+
+**One source function** (new, the heart of the design): `surface_shot(fid, x, z)` → per column
+`{block_id, tint, shade}` where:
+
+- `block_id` = the exposed top block **including decorations**: the TreeGen canopy/trunk/cactus
+  occupancy is a pure deterministic function (`TreeGen.has_tree/tree_base/_species_for` +
+  canopy-radius test, `tree_gen.gd:89-142` — one tree per 10×10 grid cell, jittered, radius ≤2),
+  so a `TreeGen.top_decoration(x, z)` static resolves leaves/trunk over terrain in O(neighbour
+  grid cells). Edits splat in later via the shipped Phase-3 choke points — the source composes,
+  v1 ships generated + trees.
+- `tint` = the same per-block vertex tint the near mesh applies (`v_col`).
+- `shade` = the **sun-independent** photographic depth cues the id×tiles trick lacked: analytic
+  AO/hillshade from neighbour column height deltas (cliff-base darkening), canopy ground-shadow
+  dot under trees, water-depth darkening. Baked into the skin because they are static; **sun
+  shading is never baked** (§2V.0 item 4) — it is applied live by the unified law (§2V.3).
+
+**Three stored forms, all derived from this one source** — the existing three tiers, upgraded in
+place rather than a new system:
+
+| Tier | Storage | Content | Resolution shown |
+|---|---|---|---|
+| Band (active + ring-1, 9 layers) | `band_map` → **RG8** {block_id, shade} 2 B/block (512²/facet) | rendered per-fragment as `tile[id] × tint × shade` — the full shot at up to 16 tex/block from the tiles | blocks ≥ ~2 px |
+| Close-up pages (64 × 128²) | RGB, **rebaked as true downscales of the shot** (was: FarPalette biome color) | box-mean of `tile_mean[id] × tint × shade` over the 3.3-blk footprint | mid distances |
+| Base pages (6 × 384², whole planet) | RGB, same shot-downscale rebake | 26-blk box-mean of the shot | orbit |
+
+The user's "16×16 equivalents" bound is honored structurally: the finest stored arrangement is 1
+record/block and the tiles supply ≤16-texel/block detail on demand; nothing stores more. The
+"generate ALL the near surface" ask is satisfied **lazily and boundedly**: every facet's full
+column surface (terrain + trees) IS generated when any of its tiers bakes; the base pages make the
+whole planet converge to real-shot coverage (a background upgrade cursor, §2V.2), finer tiers
+stream by view. Flat storage of the shot planet-wide is vetoed by arithmetic: 16 tex/blk RGBA =
+**615 GB**, even 1 tex/blk = 2.4 GB; the factored pyramid renders the identical pixels from
+≈10 MB resident.
+
+**Per-facet stays the residency unit** (unchanged §2U.1 reasoning); the chunk is the bake/upload
+slice. Full-fidelity band bake ≈1-2 s/facet sliced under the 2 ms budget (E2 posture: coarser
+tiers cover meanwhile — a softening, never a hole, never flat biome color once V3 lands).
+
+### 2V.2 Bug 1 — the descent flat-color stage: mechanism and the continuous ramp
+
+**Mechanism (found, cite):** fidelity is keyed to *regime*, not to the screen. Crossing into the
+surface regime fires `_evict_all_closeup` (`facet_tex_baker.gd:240-244`) — every close-up
+promotion is dumped at the exact moment of descent — and the band machinery hasn't warmed yet, so
+between ~ATMO_TOP and band-warm the only resident skin is the 26-blk **biome-color** base page:
+the "LOW-RES COLORED" stage. Fidelity is non-monotonic by construction today.
+
+**Fix — one screen-space promotion law (`FP_SKIN_SSE`), replacing regime keying:**
+
+1. Delete the on-surface evict-all; close-up slots persist under LRU pressure only.
+2. Per candidate facet, required level = f(on-screen block size) (the SSE law, SEAMLESS-SCALES
+   §3): promote base → close-up → band as the facet's blocks approach ~2 px, largest-deficit
+   first, under the shipped bake budget, with hysteresis. Distance shrinking ⇒ level
+   non-decreasing until the near mesh takes over: **monotone by construction** (gate G-VD-MONO
+   drives a scripted descent and asserts per-facet resident level never regresses).
+3. With V3, even the worst transient (base page only) is a *blurry real shot*, not flat biome
+   color — the floor of the ramp rises from "wrong picture" to "soft picture".
+
+This absorbs stage T2 (`FP_FACET_TEX_SURF`): band membership generalizes from "ring-1 on surface"
+to "facets whose blocks exceed ~2 px on screen" — which IS ring-1 when standing and the nadir cap
+when descending.
+
+### 2V.3 Bug 2 — unified lighting: the three verified mismatches and the one law
+
+Verified against the two live shaders:
+
+| | Near (`_NEAR_DAYLIGHT_SHADER`, `block_atlas.gd:57-75`) | Far shell (`_SHELL_ABS_TEX_SHADER`, :2405-2428) |
+|---|---|---|
+| Normal | `normalize(v_wp)` — position from the **scene origin**: a pseudo-normal that is not the planet radial in the facet-local frame | `normalize(wp − centre)` — the true sphere radial |
+| Terminator | none — plain `_day(mu)` | scatter band + `_scatter_tint(mu)` warm tint |
+| Night floor | `max(shade, moonshine)` uniform | `night_floor` only, no moonshine |
+
+Any one of these alone breaks the seam; together they are the user's "totally different light".
+
+**The law: ONE shared GLSL snippet, one uniform set, one normal definition.** A single GDScript
+const `VoxiLight.SHADE_GLSL` (new tiny file) string-included into BOTH shaders (and
+`TierPlace._TIER_SHADER`): `voxi_shade(n, sun_dir) → shade·tint` carrying the far shell's full
+model (day smoothstep + scatter tint + night floor) **plus** the moonshine floor; uniforms
+(`sun_dir, night_floor, term_mu, moonshine`) set from one WorldManager site for every material.
+The normal becomes the **true planet radial in both**: the near material gains a
+`planet_centre` uniform (the frame adapter knows the centre in the active local frame) so
+`n = normalize(v_wp − planet_centre)` — for near top faces this equals the far skin's normal at
+the same spot, so a near block top and the far texel covering it shade **identically at every sun
+angle, including the terminator**. String-included = still one compiled program per material —
+zero added ANGLE compiles. Gates: **G-VL-EQ** — headless numeric sweep of both materials'
+shade·tint over (sun elevation × latitude) grids, equal within ε; falsified by perturbing one
+constant. Plus a terminator screenshot pair at the seam in the live sweep.
+
+### 2V.4 Ledger delta
+
+| Item | Bytes |
+|---|---|
+| band_map L8 → RG8 (9 × 512² × 2 B) | +2.4 MB (4.7 total) |
+| pages shot-rebake (same sizes, new content) | 0 |
+| tree/shade bake scratch (1 facet, transient) | 0.4 MB |
+| **§2V delta** | **≈ +2.8 MB** → combined ceiling **46 MB** |
+
+Bake-time ledger: band facet full fidelity ≈1-2 s sliced (unchanged E2); base-page shot upgrade
+uses sparse sampling (4×4 columns per 26-blk texel ≈ 4096 columns/facet ≈ 4 ms C++) → planet
+background cursor ≈ **15 s** total, after an unchanged fast boot (two-generation pages: g0 =
+today's palette bake at boot, g1 = shot upgrade in the background, nearest-first — G-VP-BOOT pins
+boot time).
+
+### 2V.5 Stages V1–V5 — built for PARALLEL agents
+
+| Stage | Flag | Scope (files) | Parallel? |
+|---|---|---|---|
+| **V1** unified lighting | `FP_SHADE_UNIFIED` | new `voxi_light.gd` + shader-string edits in `block_atlas.gd`, `facet_far_ring.gd`, `tier_place.gd` | **Independent.** Touches only lighting tails of shaders |
+| **V2** band shot | `FP_BAND_SHOT` | baker band path (RG8 + `TreeGen.top_decoration` + AO/shade bake) + band branch albedo head of the shell shader | **Independent** of V1/V3 (V1+V2 both edit shell shader strings — different regions; split the string const or merge serially) |
+| **V3** pages shot-rebake | `FP_PAGES_SHOT` | `facet_tex_baker.gd` page-bake functions + g0/g1 cursor | **Independent** (baker only; different functions than V2) |
+| **V4** continuous SSE ramp | `FP_SKIN_SSE` | baker `update()` + WorldManager streaming hook (evict-all removal + level law) | Develop in parallel; **merge after V2+V3** for full effect (works degraded against current formats) |
+| **V5** integration + descent live A/B + flip | — | — | **Serial, last**; composes with the in-flight U2/U3 branches (`feat/voxiverse-cull-covered`, `feat/voxiverse-farring-level`) which are fully independent of V1–V4 |
+
+Gates: G-VL-EQ (V1); **G-VS-SHOT** (band fragment ≡ analytic `tile[id]×tint×shade` at texel
+centres), **G-VS-TREE** (forest facet: canopy/trunk ids exactly at TreeGen's deterministic
+positions; falsify by salting the hash), G-VS-BYTES (V2); **G-VP-DOWNSCALE** (page texel ≡
+box-mean of shot samples within ε), G-VP-BOOT (V3); **G-VD-MONO**, G-VD-BUDGET (V4); all
+default-off byte-identical + FLAT 6042/0. Max concurrency: **V1 ∥ V2 ∥ V3 ∥ (U2→U3)** = four
+agents, V4 joining as V2/V3 land, V5 solo.
+
+### 2V.6 Risks added by 2V
+
+| # | Risk | Mitigation |
+|---|---|---|
+| F1 | Near-frame `planet_centre` uniform wrong during crossings/re-anchor (lighting pops at facet flips) | single update site next to the existing sun_dir sync; G-VL-EQ re-run across a scripted crossing |
+| F2 | Tree bake cost (GDScript TreeGen in v1) blows the 2 ms budget on forest facets | per-slice tree pass is ~17 grid cells/32-blk row; check-before-unit discipline; C++ mirror is the v2 knob |
+| F3 | Two agents editing shell shader strings (V1 lighting tail, V2 albedo head) | split the shader const into ALBEDO/LIGHT sub-strings first (a 10-line prep commit, serialized before spawning) |
+| F4 | Baked `shade` double-darkening with future dynamic shadows | shade holds only static cues (AO/canopy/water); documented single-owner rule |
+
 ## 3. Near→far blend — no swap, ever
 
 The #1 aesthetic requirement decomposes into three independent mechanisms, all existing:
@@ -475,7 +645,8 @@ The close-up tier today is **off-surface only** — on-surface it evicts every p
 | **`FP_BLOCKY_TEX` / `FP_BLOCK_LOD_TEX` themselves** | **+2 UV channels on existing meshes (~+25% mesh bytes), 0 textures, 0 staging** | flag-gated array construction |
 | `FP_BLOCK_DETAIL` (§2R): detail_map + id pages + staging | **+3 MB** | fixed-size at creation |
 | `FP_BAND_BLOCK_MAP` (§2U): band_map 9 layers + 1 staging layer + masks | **+2.7 MB** | fixed layer count; ring-2 A/B-gated |
-| **Combined worst case (all flags)** | **≈ 43 MB + ring delta** | new gate **G-TL-LEDGER** sums all ledgers and asserts the arithmetic every step |
+| `FP_BAND_SHOT`/`FP_PAGES_SHOT` (§2V): RG8 band + shot scratch | **+2.8 MB** | fixed-size; pages rebake in place |
+| **Combined worst case (all flags)** | **≈ 46 MB + ring delta** | new gate **G-TL-LEDGER** sums all ledgers and asserts the arithmetic every step |
 
 All ceilings are structural (fixed-size buffers, capped LRUs); every breach response is wholesale
 clear + re-prewarm, never partial thrash. Zero-extra-memory when off: every piece is gate-constructed
@@ -541,10 +712,11 @@ soup cache is the symmetric fix — a T4 knob, default off.
 | **T4** boot + churn hygiene | rides `FP_BOOT_ASYNC` (no new flag) | async prewarm→progressive bake behind boot milestone; churn-guard verified under textured blocky; combined ledger telemetry | **G-TL-LEDGER**, G-FT-BUDGET re-run with blocky on, boot-time budget assert |
 | **T5** flip + retire plain | sed-ON at export: BLOCKY_FARRING, FACET_TEX(+CLOSEUP, +SURF), BLOCKY_TEX, BLOCK_LOD(+TEX) | live A/B (Xvfb sweep: orbit both hemispheres, descent, horizon, night limb, cube edges) + browser-heap A/B; NEAREST-vs-LINEAR filter call; optional `FP_FARRING_SUPPRESS_COVERED` | the only visual-judgment stage; rollback = flags off (byte-identical by the T1-T3 gates) |
 
-**Live-feedback rounds appended the U-series (§2U.4): U0 gridless → U1 band block map → U2
-covered-cell cull → U3 same-level — U2 strictly before U3.** With T1/T1b already deployed, the
-live-driven priority order is U0 (trivial), U1 (the real-bake centerpiece), U2, U3, then T2/T3
-resume.
+**Live-feedback rounds appended the U-series (§2U.4) and V-series (§2V.5).** With T1/T1b/U0/U1
+deployed and U2/U3 in flight, the live-driven order is now the V-series (V1 ∥ V2 ∥ V3 parallel,
+V4 after V2+V3, V5 last). **T2 (`FP_FACET_TEX_SURF`) is ABSORBED by V4's screen-space law** —
+regime-keyed promotion is the root cause of the descent flat-color bug (§2V.2) and is retired,
+not extended. T3 (textured L2 tiles) resumes after V5.
 
 Order rationale: T1 is the largest visual payoff per line of code and carries the single open
 platform risk (R6) to live proof *before* anything builds on it; T2/T3 are independent after T1;

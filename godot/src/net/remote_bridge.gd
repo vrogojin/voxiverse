@@ -265,8 +265,29 @@ static func preset_token() -> String:
 	return str(cfg.get("token", ""))
 
 
+## OPT-IN DEV AUTO-GRANT (owner request) — the boot URL's `grant=<control-key>` value, else "". WEB ONLY:
+## location.search via JavaScriptBridge, the SAME mechanism dial_config() reads `remote=`. The activator feeds
+## this to the EXISTING unattended machinery (arm_unattended_rearm) under its CONTROL_ENABLED path so control
+## arms WITHOUT a human consent click; it is NOT called from anywhere else, so with control disabled this is
+## dead code (never invoked → FLAT byte-identical). SECURITY: this is NOT a new wire secret — the raw key only
+## ever leaves the browser as the HMAC grant_proof the manual consent flow already sends (see _compute_grant_proof).
+## The observe token WITHOUT this param arms nothing here, so the two-factor model is preserved.
+static func preset_grant() -> String:
+	if not OS.has_feature("web"):
+		return ""
+	var raw = JavaScriptBridge.eval("window.location.search", true)
+	if raw == null:
+		return ""
+	return _parse_query_value(str(raw), "grant")
+
+
 ## Extract the `remote` value from a raw `?a=b&remote=TOK&c=d` query string (leading `?` optional).
 static func _parse_query_token(query: String) -> String:
+	return _parse_query_value(query, "remote")
+
+
+## Generic single-value query parser (leading `?` optional). Returns the uri-decoded value of `key`, else "".
+static func _parse_query_value(query: String, key: String) -> String:
 	var q := query
 	if q.begins_with("?"):
 		q = q.substr(1)
@@ -274,7 +295,7 @@ static func _parse_query_token(query: String) -> String:
 		var eq := pair.find("=")
 		if eq < 0:
 			continue
-		if pair.substr(0, eq) == "remote":
+		if pair.substr(0, eq) == key:
 			return pair.substr(eq + 1).uri_decode()
 	return ""
 

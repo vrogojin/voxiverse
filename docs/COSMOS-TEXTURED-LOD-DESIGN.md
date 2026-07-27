@@ -4,9 +4,12 @@
 screenshots of the real facets rendering with real blocks surface" projected onto decimated blocky
 geometry. NOT low-res colored skins, NOT unblended plain-colored squares.**
 
-Status: DESIGN (Fable). **Revised after live user feedback ("why are we STILL rendering just biome
-COLORS, not textures?") — see §2R, which supersedes §1.4's filter knob and sharpens §2: the baked
-color map alone is NOT the vision; the far terrain must wear the real block-atlas FACES.** Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
+Status: DESIGN (Fable). **Revised twice on live user feedback.** §2R (round 1): the color map alone
+is not the vision — the far terrain must wear real block-atlas FACES. **§2U (round 2, supersedes
+§2R.3 and amends §3): the tiled per-material pattern is still not the vision — the band just beyond
+the near field must be the REAL top-down bake of each facet's actual blocks (each block's own face
+at its own position); NO drawn grid lines; and the far ring must sit at the SAME level as the near
+blocks, with fully-covered far cells OCCLUSION-CULLED instead of sunk.** Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
 texture — the TEXTURE mechanism), `docs/COSMOS-BLOCK-LOD-DESIGN.md` (the decimated-block pyramid —
 the GEOMETRY mechanism), `docs/COSMOS-SEAMLESS-SCALES-DESIGN.md` (composition law §0.5),
 `docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md`.
@@ -232,13 +235,11 @@ with no distance uniforms, no branches, per-fragment-free. The grid borders live
 texels, so they fade on the same schedule. An optional explicit clamp
 (`wd = 1 - smoothstep(...)`) is reserved as a shimmer knob for the live sweep, expected unused.
 
-### 2R.3 Block-grid lines
+### 2R.3 Block-grid lines — **SUPERSEDED by §2U.2 (live feedback round 2: NO grid)**
 
-Baked into each detail layer as a 1–2-texel darkened border — the same idiom the near atlas tiles
-carry, zero ALU, mip-faded with the pattern, and on 26-block backstop cells the texel grid IS the
-mega-block geometry grid, so texture edges and geometry edges coincide by construction. An
-`fwidth`-antialiased procedural grid overlay is the crisper A/B alternative (a few ALU, no memory)
-— decided at the T5 live review, not now.
+(Original: 1–2-texel darkened borders baked into each detail layer.) The user rejected drawn grid
+lines: block structure must come from the real baked block arrangement + the geometry. §2U.2
+removes the borders; §2U.1's per-block band bake is what carries the structure instead.
 
 ### 2R.4 NEVER-OOM delta and the rejected bake-it-in option
 
@@ -278,6 +279,151 @@ texel boundaries; REPEAT phase continuous within a face page), FLAT 6042/0.
 | D3 | `texelFetch` on `sampler2DArray` + 4–5 array samplers per draw on ANGLE | core GLES 3.0 / WebGL2 (min 16 fragment samplers); rides the same T1 live smoke as R6 |
 | D4 | id NEAREST vs color LINEAR mismatch at material boundaries (a grass tile tinted by a half-blended shoreline color) | 1 texel wide, reads as a shore/transition block; disclosed, not fought |
 
+## 2U. REDESIGN 2 — real band bake, no grid, same-level + cull (live corrections 1–3)
+
+The three corrections interact: the band's real per-block bake (1) is what makes grid removal (2)
+safe, and both only read as "the same world continuing" if the far terrain sits at the near
+terrain's level with covered cells culled (3). Designed as one coherent unit.
+
+### 2U.1 Correction 1 — the near-far BAND renders the REAL top-down bake (`FP_BAND_BLOCK_MAP`)
+
+**Why the tiled detail failed the eyeball**: FP_BLOCK_DETAIL's material id varies only per macro
+texel (26 blk base / 3.3 blk close-up). Within a texel, ONE face tile repeats — the user correctly
+sees a pattern, not his terrain: the actual per-block arrangement (this stone outcrop, that dirt
+path, this pond edge, that tree) lives at 1-block frequency and was averaged away.
+
+**The factorization that makes a real bake affordable.** A direct RGBA bake that shows face detail
+needs ≥8 texels/block: 417²·8²·4 B ≈ **44.5 MB per facet** — dead on arrival, and a 1-texel/block
+RGBA bake (696 KB/facet) shows only flat per-block colors — the "colors not textures" failure again
+at band range where blocks are 4–60 px. But the top-down image of column (x,z) is by construction
+`tile[id(x,z)]` sampled at the intra-block UV: **arrangement × pattern**. Store them factored:
+
+- **Arrangement**: a per-facet **block-id grid at 1 byte per block** — `band_map`, a Texture2DArray
+  of `BAND_LAYERS` layers × 512² L8 (covers the ~433² lattice domain incl. margin), one facet per
+  layer. 262 KB/layer.
+- **Pattern**: the existing 16-layer 64² `detail_map` (§2R.1) — shared planet-wide, now storing
+  **RAW un-normalized tiles** (see §2U.2).
+
+The fragment shader then computes the flattened bake per pixel:
+`bid = texelFetch(band_map, ivec3(block_xy, slot)); albedo = texture(detail_map, vec3(block_uv, bid))`
+— **pixel-for-pixel the analytic top-down composite of the actual atlas tiles per column**, with
+full 64-texel/block face fidelity, at ~1/250th the bytes of storing it flattened. This is the
+user's "real baked top-down view", stored in its factored form.
+
+**Band residency — per-FACET units, chunk-sliced baking** (the "facet vs chunk" question):
+
+- **Residency/addressing unit: the facet.** Everything fid-keyed already exists — the edit
+  invalidation choke points (`FacetAtlas.edit_key_fid`), the LRU-by-angular-distance axis, the
+  async warm scheduler, the close-up slot machinery the shader will reuse. A chunk-unit scheme
+  would need a second address space plus a per-chunk reverse-map texture in the shader, to save at
+  most a fraction of 262 KB/facet — complexity without a memory win at these sizes.
+- **Bake/upload unit: the chunk (32-block row-slices).** The bake proceeds in row-slices under the
+  shipped `FACET_TEX_BAKE_BUDGET_MS=2.0` check-before-each-unit discipline
+  (`facet_tex_baker.gd:223-251`), uploading sub-rects per slice — no frame hitch, no dlmalloc
+  churn (fixed-size arrays, C++-side sampling).
+- **Band set**: the active facet + ring-1 = **9 layers ≈ 2.4 MB GPU** (v1). Ring-2 (25 layers,
+  6.5 MB) is a measured-A/B knob only. CPU staging: ONE layer (the active facet, for incremental
+  edit splats); evicted/returning facets re-bake from the generator.
+- **Id source**: the same per-column classifier chain the block-LOD pyramid L0 bakes
+  (`facet_block_lod.gd:62-85`: `TerrainConfig.facet_profile` → top/biome/water), mapped
+  biome→block id, **plus the TreeGen canopy columns and the fid-keyed edit overlay** (the
+  FP_FACET_TEX_EDITS Phase-3 splat mechanism re-baking band rows on digs/builds). A quarry or
+  tower appears in the band as its real blocks. v1 ships generated+trees; edits ride the existing
+  Phase-3 hooks.
+- **Slot lookup without new vertex channels**: one slot number space in UV2.y — `0..63` = close-up
+  layer, `64..64+BAND_LAYERS` = band layer (a band facet needs no close-up: the band is strictly
+  finer). The `cu_facet`-style reverse-map uniform (:2432-2435) extends to band slots unchanged.
+
+**Two-tier albedo, exactly as the lead framed it**: band facets = the real block map (this
+section); everything beyond = the §2R color-map + mip-faded detail (which converges to the plain
+satellite color with distance, §2R.2). The band boundary is invisible: a facet leaving the band
+falls back to close-up/base pages — same hues (same catalog), coarser arrangement — at distances
+where a block is ≤2 px anyway.
+
+### 2U.2 Correction 2 — no grid, and why nothing goes flat
+
+- The 1–2-texel baked borders are **removed** from the detail layers. No procedural `fwidth` grid
+  either. Block structure now comes from (a) the band's real per-block id changes — adjacent
+  blocks wear different faces exactly where the terrain actually changes material, (b) each tile's
+  own 64² texture, and (c) the blocky geometry steps (walls) of §1.
+- **Raw tiles + per-layer mean uniform** replace the §2R mean-normalized bake: `detail_map` stores
+  the PNG tiles verbatim (band pixels thereby match the near-atlas pixels **exactly** — the band
+  is literally the near look, downscaled), and the far modulation branch divides by a
+  `tile_mean[16]` vec3 uniform (`col × dt.rgb / (2·mean)` ≡ the §2R law numerically) so the
+  mip-degradation theorem (§2R.2) still holds: top mips → mean ⇒ far albedo → the color map.
+- Disclosed and correct: a mono-material plain (all grass) shows no block boundaries at distance —
+  same as the real near field viewed from afar. That is honesty, not flatness; the relief walls
+  still carve the silhouette.
+
+### 2U.3 Correction 3 — same level + cull-not-sink (`FP_FARRING_CULL_COVERED`, `FP_FARRING_LEVEL`)
+
+**The sink has two jobs today; each gets a better mechanism.** `TierPlace.backstop_sink()` — the
+ONE site the sink is decided (`tier_place.gd:76-94`, ≈13 blocks at R=6371) — exists to (i) hide
+far-geometry poke-through where near and far coexist, and (ii) win the z-order for near. The user
+reads the result as "far land displaced much deeper" (task #72). Replacement:
+
+1. **Cull covered cells (his verbatim fix).** Per far-ring cell (backstop 26-blk granularity), a
+   coverage bit: probed through the **already-shipped** covered-tile-skip signal — the skin's
+   `(fid, lattice AABB) → module_world.skin_near_meshed` callable (godot_voxel `is_area_meshed`,
+   `facet_skin_tier.gd:79-99`), with its proven discipline: probe only within `NEAR_COVER_R=144`,
+   `COVER_Y_MARGIN=40` radial band, re-probe on the `REAP_INTERVAL_MS=100` cadence,
+   `COVER_CONFIRM=2` consecutive-reads hysteresis. A facet's mask is 256 bits (32 B); a mask
+   change marks the facet for the existing async re-emit. Covered cells are **not emitted at
+   all** — no draw, no z-fight, no poke-through, and edit-protrusion (near dug below the
+   generated surface) becomes impossible in exactly the region where it can occur.
+2. **Asymmetric hysteresis for the seam** (the hole-safety law): **culling requires 2 confirmed
+   covered reads; un-culling is instant on the first un-covered read AND probes a dilated AABB**
+   (cell + 32-block margin) so the cell re-emits while the surrounding near mesh still visually
+   covers it. Holes are worse than overdraw, so every ambiguity resolves toward drawing. The
+   near field's own unload is paced (the R4/R5 paced shrink), slower than the 100 ms probe
+   cadence — the re-emit wins the race by construction, and gate G-CV-SAFE proves it headlessly.
+3. **Same level for what remains.** With cull live, `backstop_sink()` collapses to the
+   `ENV_EPS_G=1.5` residual guard only (the between-fine-sample envelope floor — a correctness
+   bound, not a visual displacement); the ~13-block visual sink is deleted. Z-order where near
+   and far still coexist (the un-culled fringe) moves to the **already-shipped window-space
+   depth bias** (`TierPlace.FAR_BIAS_K=8` quanta, `POSITION.z += tier_bias·w`,
+   `tier_place.gd:38-42,98-106,138-158`) — depth precedence with zero geometric displacement.
+   Combined with the band's real heights (MIN over one 26-blk cell), the first far cell beyond
+   the near field now sits at the near blocks' level wearing their real faces: #72 closed
+   structurally.
+
+**Fallback disclosure**: the coverage callable is module-path only; on the GDScript fallback path
+it is invalid ⇒ "never covered" ⇒ cull inert and the sink law must stay — `FP_FARRING_LEVEL`
+therefore requires a valid coverage probe at setup (else it self-disables to today's sink,
+logged in telemetry).
+
+### 2U.4 Ledger delta and stages U0–U3
+
+| Item | Bytes |
+|---|---|
+| band_map 9×512² L8 (v1, ring-1) | 2.36 MB |
+| band CPU staging (1 active layer) | 0.26 MB |
+| coverage masks (32 B × ≤9 probed facets) + hysteresis dicts | < 1 KB |
+| grid removal / raw tiles / mean uniform | 0 |
+| **§2U delta** | **≈ +2.7 MB** → combined ceiling **43 MB** (ring-2 band: +4.2 MB, A/B-gated) |
+
+| Stage | Flag (requires) | Delivers | Gates |
+|---|---|---|---|
+| **U0** gridless raw tiles | `FP_DETAIL_GRID := false` (grid becomes opt-in) | borders removed; raw tiles + `tile_mean` uniform | **G-U0-EQ** (far modulation numerically ≡ §2R within ε), FLAT 6042/0 |
+| **U1** band block map | `FP_BAND_BLOCK_MAP` (FP_BLOCK_DETAIL) | 9-layer band array, slot-space extension, chunk-sliced bake, tree+edit splats | **G-BB-EXACT** (band fragment == analytic `tile[id]` composite at texel centres; id == classifier incl. trees), **G-BB-BYTES**, **G-BB-SLOT** (residency = active+ring-1; evict only on ring exit), **G-BB-OFF** |
+| **U2** covered-cell cull | `FP_FARRING_CULL_COVERED` (module path) | per-cell mask via `skin_near_meshed`, asymmetric hysteresis, async re-emit | **G-CV-SAFE** (scripted walk/dig/ascend drive: culled set ⊆ meshed-true set every step), **G-CV-REAPPEAR**, **G-CV-CHURN** (standing still ⇒ zero mask changes/rebuilds) |
+| **U3** same-level | `FP_FARRING_LEVEL` (FP_FARRING_CULL_COVERED) | sink → ENV_EPS_G only; fringe z-order via shipped FAR_BIAS_K depth bias | **G-LV-NOPROT** (envelope ≤ true surface with only the 1.5 guard; falsified by dropping the guard), **G-LV-SEAM** (band cell top radius == near block top within RELIEF quantization), byte-off |
+
+Ordering is load-bearing: **U2 strictly before U3** — the sink currently hides near/far
+coexistence artifacts, so it can only be removed where cull already guarantees non-coexistence.
+U0 is immediate; U1 is the independent visual centerpiece. End state at the seam: near meshed
+cells → culled far; first un-culled cells → true level (U3), real per-block faces (U1), no grid
+(U0) — the near field continues outward as the same blocks, decimated.
+
+### 2U.5 Risks added by 2U
+
+| # | Risk | Mitigation |
+|---|---|---|
+| E1 | **Cull seam holes** during fast transitions (near unmeshes before the far cell's async re-emit swaps in) | the asymmetric hysteresis + dilated un-cull probe + paced near shrink; G-CV-SAFE drives dig/ascend/sprint scripts headlessly; worst residual = ≤1 rebuild-latency sliver, biased away by the margin |
+| E2 | Band bake cost on crossings (a new 433² id bake per facet entering ring-1) | chunk-row slices under the shipped 2 ms budget (≈35 slices/facet, ~1-2 s to full band fidelity; close-up/base pages cover meanwhile — a softening, never a hole) |
+| E3 | Coverage probe cost (256-cell masks × 9 facets) | probe only cells within NEAR_COVER_R, on the 100 ms reap cadence — the skin already pays this class of cost live |
+| E4 | Band layer count pressure (mountainous ring-1 wants ring-2) | 9-layer v1 ceiling is structural; ring-2 only behind heap+fps A/B |
+
 ## 3. Near→far blend — no swap, ever
 
 The #1 aesthetic requirement decomposes into three independent mechanisms, all existing:
@@ -287,9 +433,12 @@ The #1 aesthetic requirement decomposes into three independent mechanisms, all e
    welded look survives nowhere the eye can land (the sunk smooth backstop is *under* the blocky
    emit when covered; FacetSkinTier stays retired — BLOCK-LOD §6).
 2. **Geometric containment, not stitching**: every coarser tier is pointwise ≤ the finer one
-   (corner-MIN `_emit_blocky`:2050-2053; pyramid MIN-decimate `facet_block_lod.gd:21`; env sink) —
+   (corner-MIN `_emit_blocky`:2050-2053; pyramid MIN-decimate `facet_block_lod.gd:21`) —
    finer strictly overdraws coarser in the overlap band, skirts close silhouette steps
    (`_emit_blocky`:2055, `_mesh_l2`:240-244). No swap event exists in the geometry at all.
+   **Amended by §2U.3**: inside the near field the far tier is now CULLED (not sunk-and-overdrawn),
+   and the visual ε/backstop sink is replaced by the ENV_EPS_G guard + window-space depth bias —
+   containment remains the height law, displacement stops being the z-order mechanism.
 3. **Albedo continuity, per-fragment, in one opaque draw**: near real block textures →
    `wt·tx.a`-blended satellite image over the same catalog-derived vertex colors — the shipped
    coverage-gated ramp (:2416-2428). Temporal arrivals (L2 tile build/evict) use the block-LOD
@@ -325,7 +474,8 @@ The close-up tier today is **off-surface only** — on-surface it evicts every p
 | L2 tiles `BLOCK_LOD_BYTES_MAX` | **16 MB** | per-tile ledger + LRU + wholesale-clear (`facet_block_lod_ring.gd:28-31,134-136,153-161`) |
 | **`FP_BLOCKY_TEX` / `FP_BLOCK_LOD_TEX` themselves** | **+2 UV channels on existing meshes (~+25% mesh bytes), 0 textures, 0 staging** | flag-gated array construction |
 | `FP_BLOCK_DETAIL` (§2R): detail_map + id pages + staging | **+3 MB** | fixed-size at creation |
-| **Combined worst case (all flags)** | **≈ 40 MB + ring delta** | new gate **G-TL-LEDGER** sums all ledgers and asserts the arithmetic every step |
+| `FP_BAND_BLOCK_MAP` (§2U): band_map 9 layers + 1 staging layer + masks | **+2.7 MB** | fixed layer count; ring-2 A/B-gated |
+| **Combined worst case (all flags)** | **≈ 43 MB + ring delta** | new gate **G-TL-LEDGER** sums all ledgers and asserts the arithmetic every step |
 
 All ceilings are structural (fixed-size buffers, capped LRUs); every breach response is wholesale
 clear + re-prewarm, never partial thrash. Zero-extra-memory when off: every piece is gate-constructed
@@ -390,6 +540,11 @@ soup cache is the symmetric fix — a T4 knob, default off.
 | **T3** textured L2 tiles | `FP_BLOCK_LOD_TEX` (BLOCK_LOD ∧ BLOCKY_TEX) | UVs in `_mesh_l2`; shared-Shader second material with `TEX_D0/D1` uniforms (300/700) | **G-BLD-UV**, G-BLD suite re-run, **G-TD-UNIFORM** (default uniforms ⇒ ring pixels/bytes unchanged) |
 | **T4** boot + churn hygiene | rides `FP_BOOT_ASYNC` (no new flag) | async prewarm→progressive bake behind boot milestone; churn-guard verified under textured blocky; combined ledger telemetry | **G-TL-LEDGER**, G-FT-BUDGET re-run with blocky on, boot-time budget assert |
 | **T5** flip + retire plain | sed-ON at export: BLOCKY_FARRING, FACET_TEX(+CLOSEUP, +SURF), BLOCKY_TEX, BLOCK_LOD(+TEX) | live A/B (Xvfb sweep: orbit both hemispheres, descent, horizon, night limb, cube edges) + browser-heap A/B; NEAREST-vs-LINEAR filter call; optional `FP_FARRING_SUPPRESS_COVERED` | the only visual-judgment stage; rollback = flags off (byte-identical by the T1-T3 gates) |
+
+**Live-feedback rounds appended the U-series (§2U.4): U0 gridless → U1 band block map → U2
+covered-cell cull → U3 same-level — U2 strictly before U3.** With T1/T1b already deployed, the
+live-driven priority order is U0 (trivial), U1 (the real-bake centerpiece), U2, U3, then T2/T3
+resume.
 
 Order rationale: T1 is the largest visual payoff per line of code and carries the single open
 platform risk (R6) to live proof *before* anything builds on it; T2/T3 are independent after T1;

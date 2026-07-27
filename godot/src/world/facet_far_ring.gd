@@ -1571,6 +1571,10 @@ func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE):
 ## COSMOS LOD-TEXTURE Phase 4: the driver's off-surface decision (camera-set + not floored) — WorldManager gates the
 ## close-up promotion on this (the close-up tier is an off-surface / orbit-approach feature; on-surface it stays base map).
 func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
+## COSMOS TEXTURED-LOD V4 (FP_SKIN_SSE): the camera's scale-correct distance from the body centre (blocks), computed each
+## frame by apply_camera_set. WorldManager forwards it to FacetTexBaker.update so the screen-space promotion law can size a
+## facet's on-screen blocks. 0 until the camera-set driver has run ⇒ the baker's SSE law falls back to the regime path.
+func shell_cam_dist() -> float: return _dbg_d
 func shell_emit_cos() -> float: return _emit_cos                # cos(θ_emit): the current emit threshold
 func coarse_cache_size() -> int: return _pos_cache.size()       # S2: how many facets' coarse caches are warmed (prewarm ≤ 6·K²)
 func prewarm_cursor() -> int: return _prewarm_cursor            # S2: prewarm progress (≥ 6·K² ⇒ one-shot complete)

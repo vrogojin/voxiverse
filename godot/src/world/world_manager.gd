@@ -959,9 +959,13 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _facet_tex != null and _facet_ring != null:
 		var eaxis := _facet_ring.shell_emit_axis()
 		var offs: bool = _facet_ring.shell_offsurface()
+		# COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the camera's scale-correct distance from the body centre so the baker's
+		# screen-space MONOTONE promotion law can size each facet's on-screen blocks (no regime evict-all on descent). 0 until
+		# the camera-set driver has armed ⇒ the baker's SSE law falls back to the shipped regime path (byte-identical off).
+		var cam_dist: float = _facet_ring.shell_cam_dist() if _facet_ring.has_method("shell_cam_dist") else -1.0
 		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
 		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
-		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet())
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist)
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:
 			_tex_slots_epoch = _facet_tex.slots_epoch()
 			if _facet_tex.closeup_texture() != null:

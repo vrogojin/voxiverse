@@ -444,16 +444,39 @@ func _rebuild_id_texture() -> void:
 ##
 ## TH1 (FP_TEX_BAKE_WORKER): when the offload is live, this dispatches to _update_worker — the heavy compute leaves
 ## the frame onto the job-lane worker and main only orchestrates + commits. Off ⇒ the today-exact on-main path below.
-func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
+func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	if _worker_on:
-		_update_worker(emit_axis, offsurface, budget_ms, active_fid)
+		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:
-		_update_main(emit_axis, offsurface, budget_ms, active_fid)
+		_update_main(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 
 ## The on-main per-frame bake driver — the shipped path (FP_TEX_BAKE_WORKER off), byte-untouched by TH1.
-func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
+func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	var start := Time.get_ticks_usec()
 	var budget_us := int(budget_ms * 1000.0)
+	# COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the screen-space MONOTONE promotion law. When on (and cam_dist is a real
+	# scale-correct distance from the body centre), BOTH the band and close-up want-sets are driven by each facet's on-screen
+	# block size (per-facet camera distance) — NOT by the flight regime — so a descent only ever INCREASES fidelity (no
+	# regime evict-all dumping the close-up tier at surface entry). Largest-deficit-first = the finer BAND tier is served
+	# before the CLOSE-UP tier under the shared budget; both drain nearest-first (check-before-slice ⇒ bounded worst frame).
+	# Degraded fallback (cam_dist ≤ 0, e.g. the shell driver never armed) ⇒ the shipped regime path below (safe, monotone-
+	# neutral). See _recompute_want_sse / _recompute_band_want_sse. Absorbs T2: on-surface band membership is now "screen
+	# demands it" (the nadir cap), not "ring-1 on surface".
+	if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0:
+		if _bm_on and active_fid >= 0:
+			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
+			_bake_band_budgeted(start, budget_us)          # finest tier (largest deficit) first
+		if _cu_on:
+			_recompute_want_sse(emit_axis, cam_dist)       # NO regime gate, NO evict-all
+			_bake_closeup_budgeted(start, budget_us)       # whatever budget the band left
+		_bake_base_progressive(start, budget_us, emit_axis)
+		_flush_base_uploads()
+		_flush_closeup_uploads()
+		var spent_sse := Time.get_ticks_usec() - start
+		_budget_spent_us = spent_sse
+		_worst_frame_us = maxi(_worst_frame_us, spent_sse)
+		_main_bake_us = spent_sse
+		return
 	# Split the shared budget so BOTH tiers progress every frame: the close-up crisp win (off-surface) gets the first
 	# CU_SHARE, base coverage the remainder — so a rotating orbit never starves progressive base coverage, and when the
 	# close-up cap is fully resident its unused share falls through to base. Both sub-phases check the budget BEFORE each
@@ -498,16 +521,24 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 ## a unit is on the worker, this does nothing (holds) — the pump reaps + commits it, then the next update picks the
 ## next unit. So main pays ~0 for compute; coverage fills one unit per round-trip (matching today's web throughput,
 ## which already managed <1 heavy unit per frame under the budget), with NO frame stall.
-func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
+func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	var start := Time.get_ticks_usec()
 	if not _job_inflight:
 		# --- MAIN orchestration (identical want/evict logic as _update_main; cheap pure dot scans) ---
-		if _cu_on and offsurface:
-			_recompute_want(emit_axis)
-		elif _cu_on and not _cu_want.is_empty():
-			_evict_all_closeup()
-		if _bm_on and active_fid >= 0:
-			_recompute_band_want(active_fid)
+		# COSMOS TEXTURED-LOD V4 (§2V.2): the SSE monotone law drives the want-sets when on + cam_dist known (NO evict-all);
+		# else the shipped regime-keyed orchestration below. _select_worker_unit's close-up>band>base priority is unchanged.
+		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0:
+			if _bm_on and active_fid >= 0:
+				_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
+			if _cu_on:
+				_recompute_want_sse(emit_axis, cam_dist)
+		else:
+			if _cu_on and offsurface:
+				_recompute_want(emit_axis)
+			elif _cu_on and not _cu_want.is_empty():
+				_evict_all_closeup()
+			if _bm_on and active_fid >= 0:
+				_recompute_band_want(active_fid)
 		# --- pick ONE compute unit (priority: visible close-up > near band > progressive base), freeze + dispatch ---
 		if _select_worker_unit(offsurface, emit_axis, active_fid):
 			_job_inflight = true
@@ -522,8 +553,9 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 ## (close-up when off-surface, then band, then progressive base). Begin state (staging Image, lattice corners, resume
 ## row) is set up on MAIN here; only the pixel fill runs on the worker. Continues an in-progress multi-slice facet.
 func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) -> bool:
-	# Close-up (the crisp win the player is looking at) first, when off-surface.
-	if _cu_on and offsurface:
+	# Close-up (the crisp win the player is looking at) first, when off-surface — or, under the V4 screen-space law
+	# (FP_SKIN_SSE), whenever the SSE recompute has admitted close-up demand (a non-empty want-set), regardless of regime.
+	if _cu_on and (offsurface or (CubeSphere.FP_SKIN_SSE and not _cu_want.is_empty())):
 		if _cu_bake_fid >= 0:
 			_job_kind = "cu"; return true            # continue the in-progress close-up facet
 		var cf := _next_want_to_bake()
@@ -742,6 +774,52 @@ func _recompute_want(axis: Array) -> void:
 		_cu_bake_fid = -1; _cu_bake_layer = -1; _cu_bake_img = null
 	_cu_want = want
 
+## COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the SCREEN-SPACE close-up want-set — the monotone replacement for the
+## regime/angular-cap _recompute_want. `cam_dist` is the camera's scale-correct distance from the body centre; `axis` is
+## the sub-camera unit direction, so the camera in ABSOLUTE mesh space is axis·cam_dist. A facet whose blocks exceed the
+## close-up screen threshold — i.e. whose per-facet camera distance is within CLOSEUP_FAR, on the near hemisphere — is
+## wanted, NEAREST first, capped to CLOSEUP_MAX (== the layer pool, so the cap itself frees layers for closer facets).
+## HYSTERESIS: a facet already RESIDENT is held to the wider CLOSEUP_FAR·SSE_HYST release distance, so one the player is
+## approaching never churns at the boundary. NO regime gate, NO evict-all → as cam_dist shrinks the want only GROWS toward
+## the camera and the nearest (nadir) facet is never the LRU victim ⇒ its resolved tier is monotone non-decreasing.
+func _recompute_want_sse(axis: Array, cam_dist: float) -> void:
+	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+	if ax * ax + ay * ay + az * az < 0.5:
+		return                                  # degenerate axis (camera at centre) — hold the last want-set
+	var r := FacetAtlas.R_BLOCKS
+	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
+	var promote := CubeSphere.CLOSEUP_FAR
+	var release := CubeSphere.CLOSEUP_FAR * CubeSphere.SSE_HYST
+	var cand := []                              # [dist, fid] — near-hemisphere facets within the (hysteretic) threshold
+	for fid in range(_base_all):
+		var cd := _centre_pack[fid]
+		if cd.x * ax + cd.y * ay + cd.z * az <= 0.0:
+			continue                            # far hemisphere (behind the limb) — never a close-up candidate
+		var dx := camx - cd.x * r; var dy := camy - cd.y * r; var dz := camz - cd.z * r
+		var dist := sqrt(dx * dx + dy * dy + dz * dz)
+		var thr: float = release if _cu_slots.has(fid) else promote
+		if dist <= thr:
+			cand.append([dist, fid])
+	cand.sort()                                 # nearest (smallest dist) first
+	var want := {}
+	var n := mini(cand.size(), CubeSphere.CLOSEUP_MAX)
+	for i in range(n):
+		# Store a POSITIVE closeness (larger = nearer) so _next_want_to_bake's shared best-score floor (which the angular
+		# path seeds at a dot ≥ −1) still selects the nearest facet; a raw −dist would sit below that floor and be skipped.
+		want[int(cand[i][1])] = 1.0 / (1.0 + float(cand[i][0]))
+	# Evict residents that fell out of the capped want (past release, or bumped by CLOSEUP_MAX closer facets). NEVER an
+	# evict-all: only genuinely-farther tiles leave, so the approached facet keeps its layer (monotone).
+	for fid in _cu_slots.keys():
+		if not want.has(int(fid)):
+			_evict_closeup(int(fid))
+	# Abandon the in-progress bake only if its facet left the want (its layer returns to the pool).
+	if _cu_bake_fid >= 0 and not want.has(_cu_bake_fid):
+		if not _cu_free.has(_cu_bake_layer):
+			_cu_free.append(_cu_bake_layer)
+		_cu_bake_fid = -1; _cu_bake_layer = -1; _cu_bake_img = null
+	_cu_want = want
+	_cu_want_axis = [ax, ay, az]
+
 ## Bake promoted-but-not-resident facets (nearest the axis first), ROW-SLICED, until the budget line. Continues an
 ## in-progress facet across updates. A facet needs a free/evictable layer to start; if all layers are in-cap
 ## residents, it is skipped (stays base map) — NEVER evicts an in-cap facet.
@@ -950,6 +1028,48 @@ func _recompute_band_want(active_fid: int) -> void:
 			_bm_free.append(_bm_bake_layer)
 		_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
 	_bm_want = want
+
+## COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the SCREEN-SPACE band want-set — the monotone replacement for the
+## active∪ring-1 _recompute_band_want. The BAND is the FINEST tier (real per-block ids, blocks ≥ ~2 px), so it is wanted
+## for facets whose per-facet camera distance falls within CLOSEUP_NEAR (where the close-up tier saturates and the band
+## takes over), NEAREST first, capped to BAND_LAYERS. This is the T2 absorption: on-surface the nadir facet has the
+## SMALLEST distance so it always wins a band slot (no special-case floor needed); at orbit its blocks are < 2 px so it
+## stays base. HYSTERESIS via CLOSEUP_NEAR·SSE_HYST for residents; evict-only-when-farther (never the nearest/nadir facet)
+## ⇒ as cam_dist shrinks the nadir facet's band residency is monotone. `active_fid` only tie-breaks the bake order.
+func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> void:
+	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+	if ax * ax + ay * ay + az * az < 0.5:
+		_recompute_band_want(active_fid)        # degenerate axis — fall back to the ring residency (safe)
+		return
+	var r := FacetAtlas.R_BLOCKS
+	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
+	var promote := CubeSphere.CLOSEUP_NEAR
+	var release := CubeSphere.CLOSEUP_NEAR * CubeSphere.SSE_HYST
+	var cand := []                              # [dist, fid]
+	for fid in range(_base_all):
+		var cd := _centre_pack[fid]
+		if cd.x * ax + cd.y * ay + cd.z * az <= 0.0:
+			continue                            # far hemisphere (behind the limb) — never a band candidate
+		var dx := camx - cd.x * r; var dy := camy - cd.y * r; var dz := camz - cd.z * r
+		var dist := sqrt(dx * dx + dy * dy + dz * dz)
+		var thr: float = release if _bm_slots.has(fid) else promote
+		if dist <= thr:
+			cand.append([dist, fid])
+	cand.sort()                                 # nearest first → the capped want is the BAND_LAYERS nearest facets
+	var want := {}
+	var n := mini(cand.size(), CubeSphere.BAND_LAYERS)
+	for i in range(n):
+		want[int(cand[i][1])] = true
+	# Evict residents that fell out of the capped want (never the active/approached facet — it is always nearest).
+	for fid in _bm_slots.keys():
+		if not want.has(int(fid)):
+			_evict_band(int(fid))
+	if _bm_bake_fid >= 0 and not want.has(_bm_bake_fid):
+		if not _bm_free.has(_bm_bake_layer):
+			_bm_free.append(_bm_bake_layer)
+		_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
+	_bm_want = want
+	_bm_want_active = active_fid
 
 ## Bake band-but-not-resident facets (active first, then ring order), ROW-SLICED, until the budget line. Continues an
 ## in-progress facet across updates. A facet needs a free layer to start; if none is free (all in-ring residents) it is
@@ -1168,6 +1288,19 @@ func detail_on() -> bool:
 
 func is_baked(fid: int) -> bool:
 	return _baked.has(fid)
+
+## COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the RESOLVED skin fidelity tier currently resident for facet `fid` —
+## the gate surface G-VD-MONO asserts is monotone non-decreasing across a descent. 3 = band (real per-block ids), 2 =
+## close-up page, 1 = base map (baked), 0 = un-baked (vertex colour). A coarser value means the shader shows a lower-
+## fidelity skin there; the descent-flat-color bug (Bug 1) is exactly this value REGRESSING (2→1) mid-descent.
+func resolved_tier(fid: int) -> int:
+	if _bm_slots.has(fid):
+		return 3
+	if _cu_slots.has(fid):
+		return 2
+	if _baked.has(fid):
+		return 1
+	return 0
 
 func baked_count() -> int:
 	return _baked.size()

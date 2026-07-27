@@ -2775,7 +2775,32 @@ const _BAND_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
 		ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
 	}
 "
-static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_MAP) -> String:
+# COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1: FP_BAND_SHOT): the SHOT band branch. Identical
+# addressing to _BAND_ALBEDO, but the band_map is RG8 {block_id, shade}: read BOTH channels (.rg), decode R→id (the top
+# block INCLUDING trees, since surface_shot composited the canopy), and MULTIPLY the sun-independent shade byte (.g) into
+# the per-block face so the composite is `col · detail_tile[id] · 2 · shade` = detail_tile[id] × tint × shade — the real
+# top-down shot with its baked AO/hillshade/canopy/water depth. The live sun/moon shade·tint (v_st) is applied on top
+# UNCHANGED (single-owner rule §2V.6 F4: v_st owns dynamic light, band shade owns static depth — no double-darkening).
+# The far-far ELSE tiled path is byte-identical to _BAND_ALBEDO's. Injected only when FP_BAND_SHOT is on (else _BAND_ALBEDO
+# verbatim); still ONE string splice ⇒ zero new compiled programs. %d = BAND_LAYERS (same literal as _BAND_ALBEDO).
+const _BAND_SHOT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		vec2 _buv = _luv * _N;
+		ivec2 _ib = clamp(ivec2(_buv), ivec2(0), ivec2(_N) - ivec2(1));
+		vec2 _rg = texelFetch(band_map, ivec3(_ib, _bs), 0).rg;
+		int _bid = int(_rg.r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? (col * texture(detail_map, vec3(fract(_buv), float(_bid))).rgb * 2.0 * _rg.g) : col;
+		ALBEDO = mix(v_col_raw, _bcol, wt) * v_st;
+	} else {
+		int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+		vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+		ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+	}
+"
+static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_MAP, shot := CubeSphere.FP_BAND_SHOT) -> String:
 	if not CubeSphere.FP_BLOCK_DETAIL:
 		return code
 	code = code.replace(
@@ -2792,7 +2817,12 @@ static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_M
 		code = code.replace(_DETAIL_UNIFORMS, _DETAIL_UNIFORMS + (_BAND_UNIFORMS % [bl, bl]))
 		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
 		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
-		code = code.replace(_DETAIL_ALBEDO, _BAND_ALBEDO % bl)
+		# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band branch reads RG8 {id, shade} — it multiplies the baked
+		# sun-independent shade into the per-block face so ALBEDO = detail_tile[id] × tint × shade (the real shot incl the
+		# baked AO/hillshade depth). `shot` is a param (defaults to the flag) so the gate can build both; off ⇒ the U1 L8
+		# id-only band branch VERBATIM (byte-identical). Both variants are ONE string splice — zero new compiled programs.
+		var band_albedo := _BAND_SHOT_ALBEDO if shot else _BAND_ALBEDO
+		code = code.replace(_DETAIL_ALBEDO, band_albedo % bl)
 		# When the close-up variant is live, its UV2.y also carries band slots (64+): guard the close-up branch to the
 		# 0..63 slot space so a band facet never indexes closeup_map out of range. No-op on the base tex shader.
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
@@ -3007,8 +3037,8 @@ static func gate_tex_shader_detail(cu: bool) -> String:
 ## COSMOS TEXTURED-LOD U1 gate surface (G-BB-OFF): the FP_BLOCK_DETAIL string with the band injection FORCED off vs on,
 ## so the gate can assert (a) band-off ≡ the shipped detail string (byte-identical), (b) band-on is ADDITIVE only (still
 ## exactly ONE shader_type → zero new compiled programs) and declares the band_map/band_facet samplers + v_bslot varying.
-static func gate_band_shader(cu: bool, band: bool) -> String:
-	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER, band)
+static func gate_band_shader(cu: bool, band: bool, shot := CubeSphere.FP_BAND_SHOT) -> String:
+	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER, band, shot)
 
 ## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
 ## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).

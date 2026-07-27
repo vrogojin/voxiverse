@@ -564,7 +564,26 @@ const FP_BAND_BLOCK_MAP := false
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
 const BAND_LAYERS := 9                     # band residency = active + ring-1 (≤ 9 layers → 2.36 MB GPU, fixed at creation)
 const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the L8 band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+
+## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
+## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
+## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the
+## near blocky terrain"). This flag upgrades the band from L8 {id} to RG8 {block_id, shade} 2 B/block, both channels
+## sourced from the ONE shot function SurfaceShot.surface_shot(fid,x,z): R = the exposed top block's material id
+## INCLUDING TreeGen canopy/trunk decorations (the tree column reads P_LEAF, not the terrain beneath), G = the
+## SUN-INDEPENDENT analytic depth byte (AO / hillshade / cliff-base / water-depth / canopy ground-shadow). The shell
+## ALBEDO band branch then renders `albedo = detail_tile[id] × tint × shade` at the intra-block UV — the real per-block
+## shot with trees + baked depth, with the live sun/moon shade·tint (v_st) still applied on top (the single-owner
+## rule, §2V.6 F4: the baked shade holds ONLY static cues, never sun). Reuses the U1 residency/slot/chunk-row-slice
+## machinery unchanged (a content + format change to the band bake, not new residency); the bake runs on the shipped
+## TH1 worker path (surface_shot is pure + facet-scoped via a per-slice GenCtx). Requires FP_FACET_TEX ∧
+## FP_BLOCK_DETAIL ∧ FP_BAND_BLOCK_MAP. Off ⇒ the band stays L8 and the shader band branch is BYTE-IDENTICAL to the
+## U1 result (FLAT 6042/0). NEVER-OOM: the band tier grows by ×2 (L8→RG8) to a fixed BAND_LAYERS × BAND_TEXELS² RG8
+## (4.5 MB GPU) + ONE RG8 staging layer (0.5 MB) ⇒ ≈ +2.8 MB → combined ceiling 46 MB. Gate: verify_band_shot.gd
+## (G-VS-SHOT / G-VS-BYTES / G-VS-OFF).
+const FP_BAND_SHOT := false
+const BAND_SHOT_BYTES_MAX := 6 * 1024 * 1024  # NEVER-OOM ceiling for the RG8 band tier (2× L8; (9+1) × 512² × 2 B < 6 MB)
 
 ## COSMOS TEXTURED-LOD V1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the ONE lighting law shared by the near blocks and
 ## the far skin so the orbit→surface transition is stitchless (the user's #1 requirement). §2V.3 root-caused three

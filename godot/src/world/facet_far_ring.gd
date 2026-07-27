@@ -341,7 +341,17 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 		return
 	var drift := acos(clampf(dir[0] * _emit_dir_last[0] + dir[1] * _emit_dir_last[1] + dir[2] * _emit_dir_last[2], -1.0, 1.0))
 	var dtheta := theta_h - _emit_thetah_last                 # SIGNED: > 0 = the visible cap grew (a climb); < 0 = shrank (a descent)
-	if shell_fall_should_reemit(fall_hold, floored != _emit_floored_last, dtheta, drift, Time.get_ticks_msec() - _last_snapshot_ms):
+	var reemit := shell_fall_should_reemit(fall_hold, floored != _emit_floored_last, dtheta, drift, Time.get_ticks_msec() - _last_snapshot_ms)
+	# COSMOS DEV-FLY HANG (FP_SHELL_CLIMB_NO_CHURN): below OFFSURFACE_Y the emitted cap is FLOORED to 90° and stays there
+	# for every θ_h < 67° (all altitudes below ~9900 blocks), so a powered climb's growing θ_h fires the |Δθ_h| > 5°
+	# trigger to re-emit an IDENTICAL hemisphere set — a redundant blocky-mesh rebuild + GL/ANGLE upload (the render-thread
+	# churn suspected in the dev-fly hard-hang). Suppress the re-emit ONLY when the committed set is PROVABLY unchanged:
+	# still floored, the cap cos is identical to the committed cap, and the axis has not swept. Axis drift, a floor/regime
+	# crossing, or any genuine cap change all still re-emit above (correctness — no limb holes). Off ⇒ shipped (byte-identical).
+	if reemit and CubeSphere.FP_SHELL_CLIMB_NO_CHURN and floored and floored == _emit_floored_last \
+			and is_equal_approx(new_cos, _emit_cos) and drift <= deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0):
+		reemit = false                                        # identical floored cap + no axis sweep → the rebuild would emit the SAME set (churn)
+	if reemit:
 		_shell_snapshot(dir, new_cos, theta_h, floored)
 		_last_snapshot_ms = Time.get_ticks_msec()
 

@@ -846,6 +846,19 @@ const FP_SHELL_FALL_HOLD := false
 const SHELL_FALL_MARGIN_DEG := 12.0   # extra θ_emit margin the held cap carries off-surface (absorbs the descent θ_h shrink); also the GROW re-emit threshold
 const SHELL_FALL_REEMIT_MS := 1000    # min wall-ms between throttled off-surface re-emits (axis sweep / progressive grow) during a fall
 
+## COSMOS DEV-FLY HANG (fix/voxiverse-devfly-hang) — the CLIMB counterpart of FP_SHELL_FALL_HOLD. Below OFFSURFACE_Y the
+## emitted cap is FLOORED to θ_emit ≥ 90° (shell_set_camera_abs), and that floor BINDS for every θ_h < 90 − (RELIEF +
+## SLACK) = 67° — i.e. for every altitude below ~9900 blocks. So a straight powered climb from the ground grows θ_h
+## (acos(R/d)) but the ACTUALLY-EMITTED far-ring set stays the SAME 90° hemisphere the whole way; the shipped reactive
+## trigger nonetheless fires a full re-emit every |Δθ_h| > 5° (~2× over a 7→210 climb), each rebuilding + re-uploading
+## an IDENTICAL-coverage blocky mesh (the churn suspected in the live dev-fly hard-hang: the render thread stalls on the
+## redundant GL/ANGLE mesh upload while the main loop runs on, then blocks on the full command queue). With this flag ON
+## the θ_h-only re-emit is SUPPRESSED while floored AND the committed cap cos is unchanged AND the axis has not swept —
+## i.e. only when the new emitted set is PROVABLY identical to the committed one; axis drift, floor/regime crossings, and
+## any genuine cap change still re-emit (correctness, no limb holes). Byte-VISUALLY-identical on (the floored set is
+## θ_h-independent while the floor binds); byte-identical OFF (the shipped trigger verbatim). Requires FP_SHELL_CAMERA_SET.
+const FP_SHELL_CLIMB_NO_CHURN := false
+
 ## COSMOS-PERF FALL-COLLAPSE FIX C (fix/voxiverse-fall-perf) — skip the main-thread snowfall fixed-step while the
 ## player is AIRBORNE (a HIGH FLYER above OFFSURFACE_Y, e.g. falling from orbit). SnowfallSystem.process runs a
 ## deterministic per-frame batch (up to MAX_STEPS_PER_FRAME) around the player's ground column — the ~71 ms snow_ms

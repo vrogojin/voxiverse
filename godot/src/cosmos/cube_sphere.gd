@@ -647,6 +647,19 @@ const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up
 const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
 const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
 
+## COSMOS TEXTURED-LOD V3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1/§2V.5: FP_PAGES_SHOT) — rebake the base + close-up
+## texture PAGES as true box-downscales of the REAL surface shot (SurfaceShot.surface_shot: tint × static-shade, trees
+## composited on top) instead of the FarPalette biome COLOUR average. This is what kills "biome colours" at the base
+## (orbit) and close-up (mid) tiers: a page texel becomes the box-mean of the near daylight material's own per-block
+## appearance (§2V.0 (B)), sun-independent (sun shading stays live in the shader, V1's domain). Requires FP_FACET_TEX
+## (the baker only exists under it). Two-GENERATION pages keep BOOT unchanged: g0 = today's palette bake at prewarm +
+## progressive coverage (fast boot, byte-identical timing), g1 = a background cursor that re-bakes each already-covered
+## facet to shot-coverage over time (nearest-axis first, then a global sweep — the whole planet converges after boot).
+## Off ⇒ the g1 cursor never runs, _bake_facet_pixels always bakes the palette colour ⇒ BYTE-IDENTICAL palette bake
+## (FLAT 6042/0). NEVER-OOM: reuses the existing page allocation + upload path (no new textures); the shot scratch is a
+## transient BAKE_SRC² PackedColorArray pair (≈0.4 MB, §2V.4). Gate: verify_pages_shot.gd (G-VP-DOWNSCALE / G-VP-BOOT).
+const FP_PAGES_SHOT := false
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

@@ -53,6 +53,18 @@ var _budget_spent_us := 0            # last update's total bake wall-us (budget 
 var _worst_frame_us := 0             # worst per-update bake wall-us this session (the bounded-cost proof surface)
 var _base_cursor := 0                # global sweep cursor for coverage of facets outside every emit-axis cap
 
+# COSMOS TEXTURED-LOD V3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1: FP_PAGES_SHOT) — the g0/g1 two-generation page
+# bake. g0 = today's FarPalette biome-colour box-average (prewarm + progressive coverage, so BOOT is unchanged/fast).
+# g1 = a background cursor that re-bakes each ALREADY-covered facet as a box-downscale of the REAL surface shot
+# (SurfaceShot.surface_shot: tint × static-shade, trees composited) — nearest-emit-axis first, then a global sweep, so
+# the whole planet converges to shot coverage lazily AFTER boot. Off (_shot_on false) ⇒ the g1 cursor never runs and
+# _bake_facet_pixels always bakes the palette colour ⇒ byte-identical. Close-up pages bake shot directly under _shot_on
+# (they are transient/promotion-driven, never part of boot). NEVER-OOM: _shot_baked is one bounded 6·K² dict; no new
+# textures; the shot scratch is a transient BAKE_SRC² PackedColorArray pair.
+var _shot_on := false                # FP_PAGES_SHOT && the baker exists (set in setup; requires FP_FACET_TEX structurally)
+var _shot_baked: Dictionary = {}     # fid -> true: facets whose page has been re-baked to the real shot (g1 coverage)
+var _shot_cursor := 0                # global g1 sweep cursor (whole-planet shot convergence beyond the emit-axis cap)
+
 # COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1): the per-texel material-id page(s), baked ALONGSIDE
 # the colour page under FP_BLOCK_DETAIL. 6 face pages of _page² L8 (id 0 = un-baked; id = FarPalette.detail_pattern + 1),
 # texelFetch NEAREST in the shader — a SEPARATE texture from the colour page so the premultiplied-coverage frontier law
@@ -130,6 +142,7 @@ var _worker_on := false             # FP_TEX_BAKE_WORKER && _lane != null (the o
 var _job_inflight := false          # a compute unit is dispatched onto the worker (single in-flight gate)
 var _job_kind := ""                 # the in-flight unit's tier: "base" | "cu" | "bm"
 var _job_base_fid := -1             # the in-flight base unit's facet (kind == "base")
+var _job_base_shot := false         # V3 (FP_PAGES_SHOT): the in-flight base unit is a g1 shot re-bake (vs a g0 coverage bake)
 var _cu_last_done := false          # the close-up compute slice just finished its facet (commit finalizes residency)
 var _bm_last_done := false          # the band compute slice just finished its facet (commit uploads + finalizes)
 var _main_bake_us := 0              # the bake work paid ON MAIN in the last update() (the G-TW-MAINCOST proof surface):
@@ -170,6 +183,15 @@ func setup(active_fid: int) -> void:
 			var idimg := Image.create(_page, _page, false, Image.FORMAT_L8)
 			idimg.fill(Color(0.0, 0.0, 0.0, 1.0))    # id 0 = un-baked
 			_id_pages[f] = idimg
+	# COSMOS TEXTURED-LOD V3: arm the g0/g1 shot rebake. The baker only exists under FP_FACET_TEX (WorldManager
+	# gated-construction), so _shot_on already satisfies the requires-FP_FACET_TEX rule. Pre-warm every static
+	# SurfaceShot.surface_shot touches HERE on main (FarPalette/BlockCatalog lazy-init), so the TH1 worker never
+	# races a first-touch init when a g1/close-up shot slice runs on the lane worker.
+	_shot_on = CubeSphere.FP_PAGES_SHOT
+	if _shot_on:
+		FarPalette.ensure_ready()
+		FarPalette.ensure_detail_ready()
+		BlockCatalog.ensure_ready()
 	_ensure_centre_pack()               # one-time centre-dir cache → cheap per-update want/base scans
 	# COSMOS LOD-TEXTURE Phase 4: allocate the CLOSE-UP staging layers (fixed CLOSEUP_MAX × 128² → NEVER-OOM) and
 	# seed the free-layer pool. Only under FP_FACET_TEX_CLOSEUP → zero close-up bytes with the flag off.
@@ -256,16 +278,36 @@ func bake_facet(fid: int) -> void:
 	_bake_facet_pixels(fid)
 	_baked[fid] = true
 
+## COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): the g1 entry — re-bake facet `fid`'s page as the REAL-shot box-downscale
+## (tint × static-shade incl trees) in place, and mark it baked + shot. The synchronous twin of the g1 cursor unit,
+## used by the gate + a direct upgrade. Does NOT upload — a caller batches _rebuild_texture()/_flush_base_uploads().
+func bake_facet_shot(fid: int) -> void:
+	_bake_facet_pixels(fid, true)
+	_baked[fid] = true
+	_shot_baked[fid] = true
+
 ## TH1: the PIXEL compute of bake_facet WITHOUT the `_baked[fid]` residency write — pure CPU (sample_columns +
 ## box-average set_pixel composite + id classify), writing ONLY into the facet's page/id staging Images. Worker-safe
 ## (the residency dict is mutated on main at commit, never here). bake_facet(=this + `_baked[fid]=true`) is the
 ## unchanged on-main entry; the worker base unit calls this and the commit sets `_baked`.
-func _bake_facet_pixels(fid: int) -> void:
+func _bake_facet_pixels(fid: int, shot := false) -> void:
 	var d := _decode(fid)
 	var face: int = d[0]
 	var a: int = d[1]
 	var b: int = d[2]
-	var fine := sample_fine(fid)
+	# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): the colour source is the REAL shot (tint × static-shade incl trees) in g1
+	# shot mode, else today's FarPalette biome colour (g0). `id_src` stays the UNshaded material colour so the T1b id map
+	# keeps classifying the true material even under shot (shade is a scalar the id lookup must not see). In g0 mode there
+	# is one source (fine) and the id classifies from the very same box-averaged colour → byte-identical to the shipped bake.
+	var col_src: PackedColorArray
+	var id_src: PackedColorArray
+	if shot:
+		var sh := sample_fine_shot(fid)     # [appearance = tint×shade, tint] over the same BAKE_SRC² fine grid
+		col_src = sh[0]
+		id_src = sh[1]
+	else:
+		col_src = sample_fine(fid)
+		id_src = col_src
 	var img: Image = _pages[face]
 	var ox := a * BASE_TEXELS
 	var oy := b * BASE_TEXELS
@@ -279,7 +321,7 @@ func _bake_facet_pixels(fid: int) -> void:
 			for sy in range(DOWNS):
 				var row := (ty * DOWNS + sy) * BAKE_SRC + tx * DOWNS
 				for sx in range(DOWNS):
-					var c: Color = fine[row + sx]
+					var c: Color = col_src[row + sx]
 					r += c.r
 					g += c.g
 					bl += c.b
@@ -289,10 +331,58 @@ func _bake_facet_pixels(fid: int) -> void:
 			# same value color_for feeds the ring — and store id = FarPalette.detail_pattern + 1 (0 stays un-baked). A
 			# uniform texel's average IS its exact palette colour (interior exact, G-BD-ID); a boundary picks the nearer
 			# (§2R.6 D4). One classify per stored texel (not per fine sample) keeps the bake unit under G-FT-BUDGET.
+			# V3: under shot the id classifies from the UNshaded tint mean (id_src), not the shaded colour page.
 			if _bd_on:
-				var id := FarPalette.detail_pattern(avg) + 1
+				var id_col := avg
+				if shot:
+					var tr := 0.0
+					var tg := 0.0
+					var tb := 0.0
+					for sy in range(DOWNS):
+						var trow := (ty * DOWNS + sy) * BAKE_SRC + tx * DOWNS
+						for sx in range(DOWNS):
+							var tc: Color = id_src[trow + sx]
+							tr += tc.r
+							tg += tc.g
+							tb += tc.b
+					id_col = Color(tr * inv, tg * inv, tb * inv, 1.0)
+				var id := FarPalette.detail_pattern(id_col) + 1
 				var lv := float(id) / 255.0
 				idimg.set_pixel(ox + tx, oy + ty, Color(lv, lv, lv, 1.0))
+
+## COSMOS TEXTURED-LOD V3 (§2V.1): the fine BAKE_SRC×BAKE_SRC grid of the REAL SHOT per column — the near daylight
+## material's own per-block appearance a top-down photo would show (§2V.0 (B)), which the page box-downscales. Returns
+## [appearance, tint] PackedColorArrays over the SAME lattice grid sample_fine samples (same corner mapping + rounding),
+## so g0↔g1 differ ONLY in the colour source, never the footprint. appearance = tint × static-shade (sun-independent:
+## the sun shade is applied live by the shell shader, V1); tint is the un-shaded material colour for the id classify.
+## Pure: SurfaceShot.surface_shot is deterministic (TerrainConfig/TreeGen/FarPalette/BlockCatalog statics + a facet-homed
+## GenCtx), so it is worker-safe (the TH1 base/close-up shot units run this on the lane worker). Public so the gate
+## re-samples the SAME grid the page box-averages (G-VP-DOWNSCALE) — two calls are byte-identical.
+func sample_fine_shot(fid: int) -> Array:
+	var lc := PackedVector2Array()
+	lc.resize(4)
+	for ci in range(4):
+		var w := FacetAtlas.facet_planar_corner(fid, ci)
+		var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
+		lc[ci] = Vector2(float(l[0]), float(l[2]))
+	var pcache = TerrainConfig.GenCtx.new(0, fid) if CubeSphere.FACETED else null
+	var appear := PackedColorArray()
+	appear.resize(BAKE_SRC * BAKE_SRC)
+	var tint := PackedColorArray()
+	tint.resize(BAKE_SRC * BAKE_SRC)
+	for fj in range(BAKE_SRC):
+		var t := (float(fj) + 0.5) / float(BAKE_SRC)
+		var row := fj * BAKE_SRC
+		for fi in range(BAKE_SRC):
+			var s := (float(fi) + 0.5) / float(BAKE_SRC)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			var rec := SurfaceShot.surface_shot(fid, lx, lz, pcache)
+			var tc: Color = rec["tint"]
+			var sh: float = rec["shade"]
+			appear[row + fi] = Color(tc.r * sh, tc.g * sh, tc.b * sh, 1.0)
+			tint[row + fi] = Color(tc.r, tc.g, tc.b, 1.0)
+	return [appear, tint]
 
 ## (Re)generate mipmaps on every page and (re)build the GPU Texture2DArray. Phase 1 builds it once after the
 ## prewarm batch; the per-layer update_layer path (Phase 2/3) is retained for the incremental case.
@@ -377,7 +467,16 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 	if _bm_on and active_fid >= 0:
 		_recompute_band_want(active_fid)
 		_bake_band_budgeted(start, budget_us)
-	# Phase 2: progressive BASE coverage with the remaining budget (whole-facet units, check-before-each).
+	# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): the g1 background cursor — re-bake already-covered (g0) facets to the REAL
+	# shot, nearest-emit-axis first then a global sweep (whole-planet convergence). Runs BEFORE g0 coverage so it is not
+	# starved by the thousands of un-covered facets: the two generations ping-pong — coverage adds a fast g0 facet, the
+	# next cursor pass upgrades it to the shot (a covered facet is always a soft picture, never flat biome colour). A
+	# whole-facet shot bake is heavy in GDScript (F2 risk); production runs it OFF-MAIN on the TH1 worker (the compute
+	# leaves the frame), and the flag is default-off pending the C++ surface_shot mirror. No-op off _shot_on ⇒ the page
+	# bake stays the g0 palette colour (boot + coverage byte-identical). Check-before-each like coverage.
+	if _shot_on:
+		_bake_shot_progressive(start, budget_us, emit_axis)
+	# Phase 2: progressive BASE coverage (g0 palette) with the remaining budget (whole-facet units, check-before-each).
 	_bake_base_progressive(start, budget_us, emit_axis)
 	# Bounded incremental uploads (main-thread RenderingServer touch): ≤ a few pages/layers per update.
 	_flush_base_uploads()
@@ -433,11 +532,19 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 		var bf := _next_band_to_bake()
 		if bf >= 0 and _begin_band_bake(bf):
 			_job_kind = "bm"; return true
-	# Progressive base coverage last.
+	# V3 (FP_PAGES_SHOT): the g1 shot rebake — upgrade a covered-but-un-shot facet to the real shot (nearest-axis first).
+	# Runs BEFORE g0 coverage (same order as the on-main cursor): the two generations ping-pong across worker round-trips
+	# — when the upgrade queue empties, coverage below adds a g0 facet, which the next round upgrades. Off _shot_on ⇒
+	# skipped ⇒ coverage-only (byte-identical). The heavy shot compute runs on the lane worker (off-main) here.
+	if _shot_on and _shot_baked.size() < _baked.size():
+		var sf := _next_shot_fid(emit_axis)
+		if sf >= 0:
+			_job_base_fid = sf; _job_base_shot = true; _job_kind = "base"; return true
+	# Progressive base coverage (g0 palette) last.
 	if _baked.size() < _base_all:
 		var pf := _next_base_fid(emit_axis)
 		if pf >= 0:
-			_job_base_fid = pf; _job_kind = "base"; return true
+			_job_base_fid = pf; _job_base_shot = false; _job_kind = "base"; return true
 	return false
 
 ## WORKER THREAD: run the in-flight unit's PIXEL compute into its staging Image only (NO RenderingServer / tree touch,
@@ -446,7 +553,7 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 func _worker_compute_unit() -> void:
 	match _job_kind:
 		"base":
-			_bake_facet_pixels(_job_base_fid)
+			_bake_facet_pixels(_job_base_fid, _job_base_shot)   # V3: _job_base_shot ⇒ g1 real-shot re-bake (worker-safe, pure)
 			var face := face_of(_job_base_fid)
 			var img: Image = _pages[face]
 			img.premultiply_alpha()               # coverage-correct mips (same as _flush_base_uploads); idempotent on a∈{0,1}
@@ -462,6 +569,8 @@ func _worker_commit_unit() -> void:
 	match _job_kind:
 		"base":
 			_commit_base_facet(_job_base_fid)
+			if _job_base_shot:
+				_shot_baked[_job_base_fid] = true   # V3: mark g1 shot coverage (single-writer on main)
 		"cu":
 			_cu_commit_slice()
 			_flush_closeup_uploads()
@@ -469,6 +578,7 @@ func _worker_commit_unit() -> void:
 			_bm_commit_slice()                    # the band's update_layer + reverse-map live here (main only)
 	_job_kind = ""
 	_job_base_fid = -1
+	_job_base_shot = false
 	_job_inflight = false
 
 ## MAIN: upload facet `fid`'s base page (premultiply + mips already done on the worker) + mark it baked. Upload-only —
@@ -526,6 +636,50 @@ func _next_base_fid(axis: Array) -> int:
 		var fid := _base_cursor
 		_base_cursor = (_base_cursor + 1) % _base_all
 		if not _baked.has(fid):
+			return fid
+	return -1
+
+# --- V3: the g1 shot-rebake cursor (FP_PAGES_SHOT) -----------------------------------------------
+
+## Re-bake already-covered (g0) facets to the REAL shot until the budget line. Priority mirrors coverage: the covered
+## facet NEAREST the emit axis first (the shot upgrade grows where the player looks), then a global cursor sweep so the
+## WHOLE planet converges to shot coverage. Whole-facet units; the budget is checked BEFORE each (never mid-unit → the
+## worst frame stays budget + one unit). A shot re-bake overwrites the facet's page rect in place (no new bytes) and
+## dirties its face for the shared incremental upload. Runs ONLY after g0 coverage, so it never delays first-appearance.
+func _bake_shot_progressive(start: int, budget_us: int, axis: Array) -> void:
+	if _shot_baked.size() >= _base_all:
+		return
+	while _shot_baked.size() < _base_all:
+		if Time.get_ticks_usec() - start >= budget_us:
+			return                          # budget line reached → resume next update (CHECK-BEFORE, never mid-unit)
+		var fid := _next_shot_fid(axis)
+		if fid < 0:
+			return                          # no covered-but-un-shot facet available this update
+		_bake_facet_pixels(fid, true)       # g1: real-shot box-downscale into the same page rect
+		_shot_baked[fid] = true
+		_base_dirty[face_of(fid)] = true
+
+## The next facet to shot-rebake: a facet that IS g0-covered (`_baked`) but NOT yet shot (`_shot_baked`), preferring the
+## largest dot to `axis` (nearest the sub-camera point), else the global cursor sweep. Requiring `_baked` first keeps the
+## g0 coverage generation ahead of the g1 upgrade (boot-safe ordering). Returns -1 when every covered facet is shot.
+func _next_shot_fid(axis: Array) -> int:
+	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+	var best := -1
+	var best_dot := -2.0
+	if ax * ax + ay * ay + az * az > 0.5:
+		for fid in range(_base_all):
+			if _shot_baked.has(fid) or not _baked.has(fid):
+				continue
+			var cd := _centre_pack[fid]
+			var d := cd.x * ax + cd.y * ay + cd.z * az
+			if d > best_dot:
+				best_dot = d; best = fid
+		if best >= 0:
+			return best
+	for _i in range(_base_all):
+		var fid := _shot_cursor
+		_shot_cursor = (_shot_cursor + 1) % _base_all
+		if _baked.has(fid) and not _shot_baked.has(fid):
 			return fid
 	return -1
 
@@ -665,27 +819,44 @@ func _cu_compute_slice() -> void:
 	var r0 := _cu_bake_row
 	var r1 := mini(r0 + CubeSphere.CLOSEUP_SLICE_ROWS, n)
 	var rows := r1 - r0
-	var packed := PackedInt64Array()
-	packed.resize(rows * n)
 	var lc := _cu_bake_lc
-	for rj in range(rows):
-		var fj := r0 + rj
-		var t := (float(fj) + 0.5) / float(n)
-		var base := rj * n
-		for fi in range(n):
-			var s := (float(fi) + 0.5) / float(n)
-			var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
-			var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
-			packed[base + fi] = _pack_xz(int(round(lx)), int(round(lz)))
-	var res: Dictionary = _sampler.call(_cu_bake_fid, packed)
-	var cols: PackedColorArray = res["colors"]
 	var img: Image = _cu_bake_img
-	for rj in range(rows):
-		var fj := r0 + rj
-		var base := rj * n
-		for fi in range(n):
-			var c: Color = cols[base + fi]
-			img.set_pixel(fi, fj, Color(c.r, c.g, c.b, 1.0))
+	if _shot_on:
+		# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): each close-up texel is the REAL shot at its column (1:1 here, no
+		# box-average) — tint × static-shade incl trees (§2V.1). Sun shading stays live in the shell shader (V1), so
+		# only the static cues are baked. SurfaceShot is pure/deterministic ⇒ worker-safe (this runs on the TH1 lane).
+		var pcache = TerrainConfig.GenCtx.new(0, _cu_bake_fid) if CubeSphere.FACETED else null
+		for rj in range(rows):
+			var fj := r0 + rj
+			var t := (float(fj) + 0.5) / float(n)
+			for fi in range(n):
+				var s := (float(fi) + 0.5) / float(n)
+				var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+				var rec := SurfaceShot.surface_shot(_cu_bake_fid, lx, lz, pcache)
+				var tc: Color = rec["tint"]
+				var sh: float = rec["shade"]
+				img.set_pixel(fi, fj, Color(tc.r * sh, tc.g * sh, tc.b * sh, 1.0))
+	else:
+		var packed := PackedInt64Array()
+		packed.resize(rows * n)
+		for rj in range(rows):
+			var fj := r0 + rj
+			var t := (float(fj) + 0.5) / float(n)
+			var base := rj * n
+			for fi in range(n):
+				var s := (float(fi) + 0.5) / float(n)
+				var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
+				var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
+				packed[base + fi] = _pack_xz(int(round(lx)), int(round(lz)))
+		var res: Dictionary = _sampler.call(_cu_bake_fid, packed)
+		var cols: PackedColorArray = res["colors"]
+		for rj in range(rows):
+			var fj := r0 + rj
+			var base := rj * n
+			for fi in range(n):
+				var c: Color = cols[base + fi]
+				img.set_pixel(fi, fj, Color(c.r, c.g, c.b, 1.0))
 	_cu_bake_row = r1
 	if r1 < n:
 		return                              # more slices next update
@@ -971,6 +1142,16 @@ func is_baked(fid: int) -> bool:
 func baked_count() -> int:
 	return _baked.size()
 
+# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT) gate/telemetry surface.
+func shot_on() -> bool:
+	return _shot_on
+
+func is_shot_baked(fid: int) -> bool:
+	return _shot_baked.has(fid)
+
+func shot_baked_count() -> int:
+	return _shot_baked.size()
+
 # --- Phase 4 close-up accessors + telemetry (gate + WorldManager surface) -------------------------
 
 ## The CLOSEUP_MAX-layer close-up map bound into the ring's `closeup_map` uniform (null until the first bake). Off ⇒ null.
@@ -1094,6 +1275,16 @@ func _gate_force_worker(lane: JobLane) -> void:
 func worker_offload_on() -> bool:
 	return _worker_on
 
+## Gate-only hook (V3): force the g0/g1 shot generation on/off independent of FP_PAGES_SHOT, so verify_pages_shot can
+## drive BOTH the palette (g0-only) and shot paths in one flag state (the byte-identity + convergence A/B). Pre-warms the
+## statics surface_shot touches (matches setup) so a forced-on drive is worker-safe. Never called in production.
+func _gate_set_shot(on: bool) -> void:
+	_shot_on = on
+	if on:
+		FarPalette.ensure_ready()
+		FarPalette.ensure_detail_ready()
+		BlockCatalog.ensure_ready()
+
 ## Is a compute unit currently dispatched onto the lane worker? (gate: pump until this is false + lane idle.)
 func job_inflight() -> bool:
 	return _job_inflight
@@ -1118,6 +1309,8 @@ func tex_telemetry() -> Dictionary:
 		"cu_want": _cu_want.size(),
 		"cu_free": _cu_free.size(),
 		"cu_epoch": _slots_epoch,
+		"shot_on": _shot_on,
+		"shot_baked": _shot_baked.size(),
 	}
 
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under

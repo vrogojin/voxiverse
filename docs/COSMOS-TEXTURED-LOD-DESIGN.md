@@ -4,7 +4,9 @@
 screenshots of the real facets rendering with real blocks surface" projected onto decimated blocky
 geometry. NOT low-res colored skins, NOT unblended plain-colored squares.**
 
-Status: DESIGN (Fable). Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
+Status: DESIGN (Fable). **Revised after live user feedback ("why are we STILL rendering just biome
+COLORS, not textures?") — see §2R, which supersedes §1.4's filter knob and sharpens §2: the baked
+color map alone is NOT the vision; the far terrain must wear the real block-atlas FACES.** Parents: `docs/COSMOS-LOD-TEXTURE-DESIGN.md` (the FP_FACET_TEX satellite
 texture — the TEXTURE mechanism), `docs/COSMOS-BLOCK-LOD-DESIGN.md` (the decimated-block pyramid —
 the GEOMETRY mechanism), `docs/COSMOS-SEAMLESS-SCALES-DESIGN.md` (composition law §0.5),
 `docs/COSMOS-NO-PROTRUSION-FIDELITY-DESIGN.md`.
@@ -123,10 +125,10 @@ Every hue at every tier derives from `BlockCatalog.color_of` via `FarPalette.col
 (`far_palette.gd:36-63`, `sample_columns` colors) — the near blocks and the far image track the
 catalog together by construction, so the blend is hue-stable end to end.
 
-**Filter knob (disclosed)**: `filter_linear_mipmap` gives the "scaled-down screenshot" gradient
-across a mega-block top; if the user prefers DH-crisp one-color-per-texel blockiness, a
-NEAREST-filter (or UV-quantize-to-texel-center) variant is a one-uniform A/B — decide at T5 live
-review, not now.
+**Filter knob — SUPERSEDED by §2R.** Live feedback proved the dichotomy false: LINEAR = smoothed
+biome colors (what the user rejected on screen), NEAREST = flat colored squares (rejected earlier).
+Neither is "real block surface". The macro map stops being the final albedo and becomes the
+tint+index layer under the real block-face detail tiles (§2R).
 
 ## 2. Bake source: analytic `sample_columns` composite — RTT rejected (again, harder)
 
@@ -157,6 +159,124 @@ LOD-TEXTURE §1.1 gave, which have only gotten stronger since:
    are the parent doc's **Phase 3 `FP_FACET_TEX_EDITS`** (fid-keyed choke-point invalidation at
    `_write_cell`/`sim_revert_cell` + incremental splat), which composes with this design unchanged:
    it re-bakes the *pages*; blocky geometry and L2 tiles read the same pages.
+
+## 2R. REDESIGN — real block-atlas faces on the far terrain (`FP_BLOCK_DETAIL`)
+
+### 2R.0 What the live eyeball proved
+
+The deployed textured ring (coverage gate removed) shows **smoothed biome colors** — correctly. The
+baked page stores ONE box-averaged catalog color per texel: LINEAR filtering renders it as color
+gradients; NEAREST renders it as flat colored squares. Neither can ever show the block's atlas
+image (grass-top pattern, stone speckle, sand grain) because that information was averaged away at
+bake time. The color map is necessary (macro tint, biome/latitude/edit truth) but **not sufficient**.
+
+**Physics constraint that shapes the fix**: at far-ring distances a TRUE 1-block face is sub-pixel
+(1 block ≈ 2.3 px at d=600, 0.7 px at 2000, K_px≈1407). Texture tiled at 1-block frequency mips
+straight back to its average — i.e. to exactly the color map on screen now. So "see real block
+faces far away" has one honest form: render the faces **at the scale the far terrain's blocks
+actually have** — the macro-texel / mega-block scale — and let that scale refine toward 1 real
+block as the camera approaches.
+
+### 2R.1 The chosen method: the baked page becomes an indexed BLOCK MAP (lead option 1, sharpened)
+
+**Law: one real block-face tile per macro texel.** Each baked texel stops meaning "this color" and
+starts meaning "**a block of material M, tinted C**": the fragment shader renders the real atlas
+face of M, modulated by C, with a block-edge border. Base page texel = 26 blocks ⇒ the far world
+reads as built of 26-block textured mega-blocks; where a close-up page is resident (T2 band /
+orbit cap) the block scale is 3.3 blocks — near-real-block scale at 700–1400; the near field is
+real 1-block atlas faces (`FP_ATLAS_MATERIAL`). Same faces at every tier, only the block scale
+changes — literally "the SAME world at lower resolution".
+
+Three components:
+
+1. **Detail array — the real faces, from the real assets.** A `Texture2DArray detail_map`,
+   `DETAIL_LAYERS≈16` layers × 64² RGBA8 + mips ≈ **0.35 MB**, built at setup from the SAME PNG
+   tiles the near-block atlas uses (`BlockTextures.TILES` → `res://assets/textures/pack`;
+   `BlockAtlas.CELL_PX=64`, `block_atlas.gd:38-40,137-208`): grass-top, stone, sand, snow, water,
+   dirt/forest floor, canopy, taiga, jungle, rock, beach, ice. Each layer is
+   **mean-normalized** (rescaled so its average = 0.5) and gets a 1–2-texel darkened border (the
+   block-grid line, §2R.3). A dedicated small array — NOT the 1024² near atlas bound directly —
+   because per-layer hardware REPEAT + correct per-layer mips avoid the classic atlas problems
+   (mip bleed across tiles, `fract()` breaking derivative mip selection, `textureGrad`
+   workarounds).
+2. **Material-id pages — small, separate, NEAREST.** `id_map`: 6 layers × 384² **L8** ≈ 0.9 MB
+   (+ close-up twin 64 × 128² L8 ≈ 1.0 MB), id 0 = un-baked. Written by `FacetTexBaker` next to
+   each color texel from the same biome/water/snow classifier `FarPalette.color_for` already
+   consumes (`far_palette.gd:36-63`) — deterministic, edit-rebake (Phase 3) updates color and id
+   together. **A separate texture, not the base page's alpha**: the live-hardened
+   premultiplied-coverage frontier law (`facet_far_ring.gd:2416-2428`) stays byte-untouched, and
+   a LINEAR-filtered alpha cannot carry ids anyway. Read via `texelFetch` (core GLES3, ignores
+   filtering, no second sampler state needed).
+3. **Composition — extend the existing shader strings in place** (`_SHELL_ABS_TEX_SHADER` + the
+   close-up variant; still exactly ONE compiled program per session, zero new ANGLE ~3 s compiles):
+
+```glsl
+uniform sampler2DArray detail_map : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2DArray id_map     : filter_nearest;
+// fragment(), after the shipped coverage-gated `col` / `wt` (:2416-2428):
+int   mid = int(texelFetch(id_map, ivec3(v_uv * PAGE_TEXELS, int(v_face)), 0).r * 255.0 + 0.5);
+vec2  buv = v_uv * PAGE_TEXELS;                       // ONE tile per macro texel; REPEAT wraps
+vec4  dt  = texture(detail_map, vec3(buv, float(mid)));
+vec3  face_col = col * dt.rgb * 2.0;                  // macro tint × mean-normalized real face
+ALBEDO = mix(v_col_raw, (mid > 0) ? face_col : col, wt) * v_st;
+```
+
+The close-up branch swaps in the close-up page's texel count + id twin, so the block scale
+refines 26 → 3.3 blocks exactly where the close-up pages are resident.
+
+### 2R.2 Graceful far degradation — by mip arithmetic, not uniforms
+
+Because every detail layer is mean-normalized to 0.5, its top mips converge to 0.5 ⇒
+`face_col → col`: with distance the block faces fade into **exactly today's satellite color map**
+with no distance uniforms, no branches, per-fragment-free. The grid borders live in the same
+texels, so they fade on the same schedule. An optional explicit clamp
+(`wd = 1 - smoothstep(...)`) is reserved as a shimmer knob for the live sweep, expected unused.
+
+### 2R.3 Block-grid lines
+
+Baked into each detail layer as a 1–2-texel darkened border — the same idiom the near atlas tiles
+carry, zero ALU, mip-faded with the pattern, and on 26-block backstop cells the texel grid IS the
+mega-block geometry grid, so texture edges and geometry edges coincide by construction. An
+`fwidth`-antialiased procedural grid overlay is the crisper A/B alternative (a few ALU, no memory)
+— decided at the T5 live review, not now.
+
+### 2R.4 NEVER-OOM delta and the rejected bake-it-in option
+
+| Item | Bytes |
+|---|---|
+| detail_map 16×64² RGBA8+mips | 0.35 MB |
+| id pages 6×384² L8 + close-up 64×128² L8 (no mips, NEAREST) | 1.9 MB |
+| CPU staging for id pages | 0.7 MB |
+| **FP_BLOCK_DETAIL delta** | **≈ +3 MB** → combined ceiling **40 MB** (was ≈36, §5) |
+
+**Option 2 (bake atlas texels into the pages at N texels/block) — rejected by arithmetic**: 1
+texel/block planet-wide = 6·(24·417)²·4 B ≈ **2.4 GB**; even restricting to the 64 close-up facets
+at 1 texel/block ≈ 44 MB for a sliver of coverage. The detail-tile method delivers the same pixels
+(tile × tint is exactly what those texels would contain) for 0.35 MB reused planet-wide.
+
+### 2R.5 Flag, stage, gates
+
+**`FP_BLOCK_DETAIL`** — requires `FP_FACET_TEX` only. Deliberately **orthogonal to geometry**: it
+upgrades the smooth ring, the blocky ring (`FP_BLOCKY_TEX`), and the L2 tiles alike, because it is
+pure bake+shader — no mesh or UV change beyond what T1 already emits. With `FP_BLOCKY_TEX` it
+completes the vision (blocky relief + real faces); alone it already puts real block faces on the
+deployed ring, which is the user's live complaint — so it slots in as **T1b, deployable
+immediately after (or in parallel with) T1**.
+
+Gates: **G-BD-OFF** (flag off ⇒ shader strings + page bytes bit-identical to T1), **G-BD-ID**
+(id texel == classifier(sampled column); id 0 ⇔ un-baked; edits re-bake color+id together),
+**G-BD-NORM** (each detail layer's mean within ε of 0.5 ⇒ top-mip ≡ macro — the degradation
+theorem, falsify with an un-normalized layer), **G-BD-TILE** (tile boundaries coincide with id
+texel boundaries; REPEAT phase continuous within a face page), FLAT 6042/0.
+
+### 2R.6 Risks specific to 2R
+
+| # | Risk | Mitigation |
+|---|---|---|
+| D1 | Shimmer/aliasing of block-frequency pattern + borders at grazing angles on real GPUs | mean-normalized mips are the anti-shimmer mechanism; baked (mip-faded) borders; reserved wd clamp; T5 sweep is the judge |
+| D2 | **Expectation**: literal 1-block-scale faces at far-ring distances are sub-pixel — impossible for any method | the close-up band (3.3 blk ≈ real-block scale at 700–1400) is where near-true scale appears; pushing it farther = close-up page budget knob (128²→256², ×4 bytes), measured A/B only |
+| D3 | `texelFetch` on `sampler2DArray` + 4–5 array samplers per draw on ANGLE | core GLES 3.0 / WebGL2 (min 16 fragment samplers); rides the same T1 live smoke as R6 |
+| D4 | id NEAREST vs color LINEAR mismatch at material boundaries (a grass tile tinted by a half-blended shoreline color) | 1 texel wide, reads as a shore/transition block; disclosed, not fought |
 
 ## 3. Near→far blend — no swap, ever
 
@@ -204,7 +324,8 @@ The close-up tier today is **off-surface only** — on-surface it evicts every p
 | Blocky far-ring mesh delta (walls/skirts vs smooth) | ≤ ~3× shipped ring surface bytes; **0 new data memory** (same `_pos/_col` caches, :2034-2094) | measured by gate G-BT-BYTES; transient single merged mesh |
 | L2 tiles `BLOCK_LOD_BYTES_MAX` | **16 MB** | per-tile ledger + LRU + wholesale-clear (`facet_block_lod_ring.gd:28-31,134-136,153-161`) |
 | **`FP_BLOCKY_TEX` / `FP_BLOCK_LOD_TEX` themselves** | **+2 UV channels on existing meshes (~+25% mesh bytes), 0 textures, 0 staging** | flag-gated array construction |
-| **Combined worst case (all flags)** | **≈ 36 MB + ring delta** | new gate **G-TL-LEDGER** sums all three ledgers and asserts the arithmetic every step |
+| `FP_BLOCK_DETAIL` (§2R): detail_map + id pages + staging | **+3 MB** | fixed-size at creation |
+| **Combined worst case (all flags)** | **≈ 40 MB + ring delta** | new gate **G-TL-LEDGER** sums all ledgers and asserts the arithmetic every step |
 
 All ceilings are structural (fixed-size buffers, capped LRUs); every breach response is wholesale
 clear + re-prewarm, never partial thrash. Zero-extra-memory when off: every piece is gate-constructed
@@ -264,6 +385,7 @@ soup cache is the symmetric fix — a T4 knob, default off.
 |---|---|---|---|
 | **T0** design-validate | — (no engine code) | headless combined-flags build proving today's mutual exclusion (blocky mesh has no `ARRAY_TEX_UV`) + full baseline suites green on the integration branch | existing: verify_facet_tex, G-BLK-RING, verify_block_lod, FLAT 6042/0 |
 | **T1** textured blocky ring | `FP_BLOCKY_TEX` (BLOCKY_FARRING ∧ FACET_TEX ∧ SHELL_ABSOLUTE) | UV/UV2 in `_emit_blocky` tops+walls+skirts; **the vision visible from orbit + horizon** | **G-BT-OFF** (flag off ⇒ blocky surface arrays bit-identical), **G-BT-UV** (every blocky vert's UV inside its facet rect; wall UV == top-edge UV), **G-BT-NOPROT** (geometry identical tex on/off), G-BT-BYTES; live smoke = R6 confirm |
+| **T1b** real block faces (§2R) | `FP_BLOCK_DETAIL` (FACET_TEX) | detail_map from the near-block PNG tiles + L8 id pages + shader extension — real atlas faces at macro-texel scale, mip-degrading to the color map | **G-BD-OFF/ID/NORM/TILE**; shares T1's live smoke (D3) |
 | **T2** surface close-up | `FP_FACET_TEX_SURF` (FACET_TEX_CLOSEUP) | band-annulus page promotion on-surface (no more evict-all) | **G-FT-SURF** (band facets promoted ≤64 slots; eviction outside-band only; off ⇒ evict-all branch verbatim) |
 | **T3** textured L2 tiles | `FP_BLOCK_LOD_TEX` (BLOCK_LOD ∧ BLOCKY_TEX) | UVs in `_mesh_l2`; shared-Shader second material with `TEX_D0/D1` uniforms (300/700) | **G-BLD-UV**, G-BLD suite re-run, **G-TD-UNIFORM** (default uniforms ⇒ ring pixels/bytes unchanged) |
 | **T4** boot + churn hygiene | rides `FP_BOOT_ASYNC` (no new flag) | async prewarm→progressive bake behind boot milestone; churn-guard verified under textured blocky; combined ledger telemetry | **G-TL-LEDGER**, G-FT-BUDGET re-run with blocky on, boot-time budget assert |
@@ -295,5 +417,11 @@ T4 is pure hygiene; T5 is judgment. Each stage off ⇒ the previous stage's exac
   survives only as the automatic sub-texel fallback.
 - **Alpha-blended tier cross-fades** — locked out (SEAMLESS-SCALES §0.5): sorting hazard + double
   fill on WebGL2; all fades stay per-fragment in one opaque material or screen-door dither.
-- **A new texture system for mega-blocks** (per-block atlas tiles on LOD geometry) — duplicates the
-  baker; the satellite pages already carry the per-column real-surface image at every needed pitch.
+- **Baking atlas texels into the pages** (per-block resolution in the macro map) — 2.4 GB
+  planet-wide at 1 texel/block; 44 MB for just the 64 close-up facets (§2R.4). The tiled detail
+  array delivers the same pixels for 0.35 MB.
+- **Color-map-only far albedo** (the pre-2R design's endpoint) — live-falsified by the user: an
+  averaged color map, however filtered, cannot show block faces (§2R.0).
+- **Indexing the detail tile from the RGB color** (no id channel) — nearest-palette-color matching
+  breaks under latitude/height/edit tinting (FarPalette modulates hues continuously); an explicit
+  1-byte id is robust and costs 1.9 MB.

@@ -502,6 +502,19 @@ const FP_FACET_TEX := false
 ## welded emit VERBATIM (textually-separate branch, byte-identical). Gate G-BLK-RING.
 const FP_BLOCKY_FARRING := false
 
+## COSMOS TEXTURED-LOD T1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §1.2) — paint the blocky far ring with the FP_FACET_TEX
+## satellite pages instead of one flat corner-colour per mega-block. The blocky geometry already IS "the real relief,
+## decimated, no-protrusion by MIN-containment"; the baked satellite texture already IS "the real block surface,
+## downscaled" — this flag composes them by emitting the SAME node-param UVs the smooth path emits (_emit_cached §1.3:
+## UV = ((a+node_s)/K,(b+node_t)/K), UV2 = (face, slot)) onto every blocky top quad, and inheriting the top-edge UVs
+## onto the walls/skirts (a vertical smear of the block's own texel stripe). The already-shipped coverage-gated shell
+## shader (wt = smoothstep(600,1800,cam)·tx.a, premultiply-safe) then paints each mega-block with the downscaled image
+## of its real blocks — the user's headline vision, visible from orbit. ZERO new shader strings, ZERO new textures
+## (reuses the FP_FACET_TEX pages), the ring stays ONE opaque draw, GEOMETRY byte-identical (only UV/UV2 arrays added).
+## Requires FP_BLOCKY_FARRING && FP_FACET_TEX && FP_SHELL_ABSOLUTE (only does anything when all three are on). Off ⇒
+## _emit_blocky emits exactly as today (no UV arrays, byte-identical). Gates G-BT-OFF/UV/NOPROT/BYTES.
+const FP_BLOCKY_TEX := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

@@ -118,6 +118,23 @@ var _bm_active_fid := -1           # the ACTIVE facet whose L8 staging image is 
 var _bm_active_img: Image = null   #   layer, for incremental edit splats + a headless-readable band id surface)
 var _bm_epoch := 0                  # bumped on any _bm_slots / reverse-map change → WorldManager pushes the new maps
 
+# COSMOS MAIN-THREAD ORCHESTRATION TH1 (FP_TEX_BAKE_WORKER) — the per-frame bake COMPUTE moved onto the TH0 job-lane
+# worker, so update() on MAIN only orchestrates + pays the update_layer commit. Single in-flight per baker (the
+# far-ring contract): while a compute unit is on the worker, update() does nothing (holds), the lane's pump reaps it
+# and runs the commit on main. The worker touches ONLY the preallocated staging Images (_pages/_cu_layers/_bm_bake_img)
+# + its own resume ints (single-writer while in flight); every residency dict (_baked/_cu_slots/_bm_slots/_cu_dirty +
+# epochs) is mutated ONLY on main at commit, so nothing is read+written across threads. Off ⇒ _worker_on false ⇒ the
+# today-exact on-main path (_update_main), lane never touched. Requires FP_JOB_LANE (the lane must exist).
+var _lane: JobLane = null           # the shared TH0 JobLane (set by WorldManager); null ⇒ on-main path
+var _worker_on := false             # FP_TEX_BAKE_WORKER && _lane != null (the offload is live)
+var _job_inflight := false          # a compute unit is dispatched onto the worker (single in-flight gate)
+var _job_kind := ""                 # the in-flight unit's tier: "base" | "cu" | "bm"
+var _job_base_fid := -1             # the in-flight base unit's facet (kind == "base")
+var _cu_last_done := false          # the close-up compute slice just finished its facet (commit finalizes residency)
+var _bm_last_done := false          # the band compute slice just finished its facet (commit uploads + finalizes)
+var _main_bake_us := 0              # the bake work paid ON MAIN in the last update() (the G-TW-MAINCOST proof surface):
+									#   on-main path = the whole compute; worker path = orchestration + submit only (~0)
+
 # --- lifecycle -----------------------------------------------------------------------------------
 
 ## Build this epoch's sampler (compiled VoxelGeneratorCosmos frozen for `active_fid`, else the GDScript oracle
@@ -236,6 +253,14 @@ func sample_fine(fid: int) -> PackedColorArray:
 ## and blit into the facet's rect [a·16..)×[b·16..). Idempotent (a re-bake overwrites the same rect bit-exactly
 ## → G-FT-BAKE determinism). Does NOT upload — prewarm()/the gate call _rebuild_texture() after a batch.
 func bake_facet(fid: int) -> void:
+	_bake_facet_pixels(fid)
+	_baked[fid] = true
+
+## TH1: the PIXEL compute of bake_facet WITHOUT the `_baked[fid]` residency write — pure CPU (sample_columns +
+## box-average set_pixel composite + id classify), writing ONLY into the facet's page/id staging Images. Worker-safe
+## (the residency dict is mutated on main at commit, never here). bake_facet(=this + `_baked[fid]=true`) is the
+## unchanged on-main entry; the worker base unit calls this and the commit sets `_baked`.
+func _bake_facet_pixels(fid: int) -> void:
 	var d := _decode(fid)
 	var face: int = d[0]
 	var a: int = d[1]
@@ -268,7 +293,6 @@ func bake_facet(fid: int) -> void:
 				var id := FarPalette.detail_pattern(avg) + 1
 				var lv := float(id) / 255.0
 				idimg.set_pixel(ox + tx, oy + ty, Color(lv, lv, lv, 1.0))
-	_baked[fid] = true
 
 ## (Re)generate mipmaps on every page and (re)build the GPU Texture2DArray. Phase 1 builds it once after the
 ## prewarm batch; the per-layer update_layer path (Phase 2/3) is retained for the incremental case.
@@ -323,7 +347,17 @@ func _rebuild_id_texture() -> void:
 ## most a bounded number of whole facets (~0.9 ms each) per update. Worst-case per-update bake cost is therefore
 ## budget + one unit — bounded by construction, and PROVEN by the headless G-FT-BUDGET scripted drive (which asserts
 ## `worst_frame_ms` never exceeds the bound and the loop never STARTED a unit past the budget line).
+##
+## TH1 (FP_TEX_BAKE_WORKER): when the offload is live, this dispatches to _update_worker — the heavy compute leaves
+## the frame onto the job-lane worker and main only orchestrates + commits. Off ⇒ the today-exact on-main path below.
 func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
+	if _worker_on:
+		_update_worker(emit_axis, offsurface, budget_ms, active_fid)
+	else:
+		_update_main(emit_axis, offsurface, budget_ms, active_fid)
+
+## The on-main per-frame bake driver — the shipped path (FP_TEX_BAKE_WORKER off), byte-untouched by TH1.
+func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
 	var start := Time.get_ticks_usec()
 	var budget_us := int(budget_ms * 1000.0)
 	# Split the shared budget so BOTH tiers progress every frame: the close-up crisp win (off-surface) gets the first
@@ -351,6 +385,106 @@ func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := 
 	var spent := Time.get_ticks_usec() - start
 	_budget_spent_us = spent
 	_worst_frame_us = maxi(_worst_frame_us, spent)
+	_main_bake_us = spent               # on-main path: the WHOLE bake compute was paid on main (the G-TW-MAINCOST baseline)
+
+# --- TH1: the worker-offload per-frame driver (FP_TEX_BAKE_WORKER) -------------------------------
+
+## The MAIN-thread half of the offload: orchestrate (cheap, pure dot-scan want/evict — same as _update_main), pick ONE
+## bake UNIT, freeze it and dispatch its COMPUTE to the job-lane worker; the worker fills the preallocated staging
+## Image, and the lane's commit (main) pays only the update_layer + the residency bookkeeping. Single in-flight: while
+## a unit is on the worker, this does nothing (holds) — the pump reaps + commits it, then the next update picks the
+## next unit. So main pays ~0 for compute; coverage fills one unit per round-trip (matching today's web throughput,
+## which already managed <1 heavy unit per frame under the budget), with NO frame stall.
+func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
+	var start := Time.get_ticks_usec()
+	if not _job_inflight:
+		# --- MAIN orchestration (identical want/evict logic as _update_main; cheap pure dot scans) ---
+		if _cu_on and offsurface:
+			_recompute_want(emit_axis)
+		elif _cu_on and not _cu_want.is_empty():
+			_evict_all_closeup()
+		if _bm_on and active_fid >= 0:
+			_recompute_band_want(active_fid)
+		# --- pick ONE compute unit (priority: visible close-up > near band > progressive base), freeze + dispatch ---
+		if _select_worker_unit(offsurface, emit_axis, active_fid):
+			_job_inflight = true
+			_lane.submit(JobLane.PRIORITY_TEXTURE,
+				Callable(self, "_worker_compute_unit"), Callable(self, "_worker_commit_unit"), "tex-" + _job_kind)
+	var spent := Time.get_ticks_usec() - start
+	_budget_spent_us = spent
+	_main_bake_us = spent               # worker path: main paid ONLY orchestration + submit — the compute left the frame
+	_worst_frame_us = maxi(_worst_frame_us, spent)
+
+## Choose + BEGIN the next compute unit; sets _job_kind and returns true if there is work. Mirrors the on-main priority
+## (close-up when off-surface, then band, then progressive base). Begin state (staging Image, lattice corners, resume
+## row) is set up on MAIN here; only the pixel fill runs on the worker. Continues an in-progress multi-slice facet.
+func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) -> bool:
+	# Close-up (the crisp win the player is looking at) first, when off-surface.
+	if _cu_on and offsurface:
+		if _cu_bake_fid >= 0:
+			_job_kind = "cu"; return true            # continue the in-progress close-up facet
+		var cf := _next_want_to_bake()
+		if cf >= 0 and _begin_closeup_bake(cf):
+			_job_kind = "cu"; return true
+	# Near-far band next.
+	if _bm_on and active_fid >= 0:
+		if _bm_bake_fid >= 0:
+			_job_kind = "bm"; return true            # continue the in-progress band facet
+		var bf := _next_band_to_bake()
+		if bf >= 0 and _begin_band_bake(bf):
+			_job_kind = "bm"; return true
+	# Progressive base coverage last.
+	if _baked.size() < _base_all:
+		var pf := _next_base_fid(emit_axis)
+		if pf >= 0:
+			_job_base_fid = pf; _job_kind = "base"; return true
+	return false
+
+## WORKER THREAD: run the in-flight unit's PIXEL compute into its staging Image only (NO RenderingServer / tree touch,
+## NO residency-dict write — G-TW-NOTREE). For base: composite + premultiply + mips on the page. For close-up/band:
+## one row-slice. All shared bookkeeping is deferred to _worker_commit_unit on main.
+func _worker_compute_unit() -> void:
+	match _job_kind:
+		"base":
+			_bake_facet_pixels(_job_base_fid)
+			var face := face_of(_job_base_fid)
+			var img: Image = _pages[face]
+			img.premultiply_alpha()               # coverage-correct mips (same as _flush_base_uploads); idempotent on a∈{0,1}
+			img.generate_mipmaps()
+		"cu":
+			_cu_compute_slice()
+		"bm":
+			_bm_compute_slice()
+
+## MAIN THREAD (lane commit): pay ONLY the GPU upload + finalize the residency bookkeeping single-writer on main, then
+## release the in-flight gate so the next update picks the next unit.
+func _worker_commit_unit() -> void:
+	match _job_kind:
+		"base":
+			_commit_base_facet(_job_base_fid)
+		"cu":
+			_cu_commit_slice()
+			_flush_closeup_uploads()
+		"bm":
+			_bm_commit_slice()                    # the band's update_layer + reverse-map live here (main only)
+	_job_kind = ""
+	_job_base_fid = -1
+	_job_inflight = false
+
+## MAIN: upload facet `fid`'s base page (premultiply + mips already done on the worker) + mark it baked. Upload-only —
+## the compute never touched the GPU. Lazily builds the array only if prewarm never ran (headless edge; GPU on main).
+func _commit_base_facet(fid: int) -> void:
+	var face := face_of(fid)
+	_baked[fid] = true                            # residency dict mutated ONLY on main (single-writer)
+	if _tex == null:
+		_rebuild_texture()                        # first coverage bake before any prewarm — build the whole array (main)
+		return
+	_tex.update_layer(_pages[face], face)
+	if _bd_on:
+		if _id_tex == null:
+			_rebuild_id_texture()
+		else:
+			_id_tex.update_layer(_id_pages[face], face)
 
 # --- Phase 2: progressive base-map coverage ------------------------------------------------------
 
@@ -515,10 +649,18 @@ func _begin_closeup_bake(fid: int) -> bool:
 		_cu_bake_lc[ci] = Vector2(float(l[0]), float(l[2]))
 	return true
 
-## Sample CLOSEUP_SLICE_ROWS more rows of the in-progress facet's 128² fine grid (one sample_columns call each) and
-## write the top-block colours straight (alpha 1) into the staging layer. On the last row: premultiply + mips, mark
-## the layer dirty (upload), make it RESIDENT (_cu_slots[fid]=layer) + record its (a,b) in the shader reverse-map.
+## On-main close-up slice = compute + commit inline (byte-untouched shipped path). TH1 splits these so the compute runs
+## on the worker (pixels only) and the commit (residency + upload) runs on main — same ops, same order, same bytes.
 func _bake_closeup_slice() -> void:
+	_cu_compute_slice()
+	_cu_commit_slice()
+
+## PIXEL compute (worker-safe): sample CLOSEUP_SLICE_ROWS more rows of the in-progress facet's 128² fine grid (one
+## sample_columns call) and write the top-block colours straight (alpha 1) into the staging layer. On the last row,
+## premultiply + mips (coverage-correct like the base page). Writes ONLY the staging Image + resume ints — NO residency
+## dict, NO RenderingServer. Sets _cu_last_done so the commit knows to finalize.
+func _cu_compute_slice() -> void:
+	_cu_last_done = false
 	var n := _cu_texels
 	var r0 := _cu_bake_row
 	var r1 := mini(r0 + CubeSphere.CLOSEUP_SLICE_ROWS, n)
@@ -547,9 +689,16 @@ func _bake_closeup_slice() -> void:
 	_cu_bake_row = r1
 	if r1 < n:
 		return                              # more slices next update
-	# Facet complete → premultiply + mips (coverage-correct like the base page), mark resident + dirty.
 	img.premultiply_alpha()
 	img.generate_mipmaps()
+	_cu_last_done = true
+
+## MAIN commit: if the facet just completed, mark the layer dirty (upload), make it RESIDENT (_cu_slots[fid]=layer),
+## record its (a,b) reverse-map + bump the epoch. Every residency-dict write is here (single-writer on main).
+func _cu_commit_slice() -> void:
+	if not _cu_last_done:
+		return
+	_cu_last_done = false
 	var layer := _cu_bake_layer
 	var fid := _cu_bake_fid
 	_cu_slots[fid] = layer
@@ -675,11 +824,19 @@ func _begin_band_bake(fid: int) -> bool:
 	_bm_bake_ny = clampi(int(round((_bm_bake_lc[3] - _bm_bake_lc[0]).length())), 1, _bm_texels)
 	return true
 
-## Sample BAND_SLICE_ROWS more block-rows (by) of the in-progress facet's Nx×Ny param grid (ONE sample_columns call per
-## slice) and write each column's REAL top-block material id (FarPalette.detail_pattern+1 — no box-average) into the
-## staging layer. On the last row: make it RESIDENT (_bm_slots[fid]=layer), record its (a,b) + (Nx,Ny) reverse-map,
-## mark it dirty (upload) and bump the epoch. The classify is the SAME chain the id_map/base map use (one-sampler law).
+## On-main band slice = compute + commit inline (byte-untouched shipped path). TH1 splits these so the id compute runs
+## on the worker (staging Image only) and the commit (update_layer + reverse-map) runs on main — same bytes, and the
+## update_layer moves from mid-slice to the commit (observationally identical: nothing reads the GPU layer between).
 func _bake_band_slice() -> void:
+	_bm_compute_slice()
+	_bm_commit_slice()
+
+## PIXEL compute (worker-safe): sample BAND_SLICE_ROWS more block-rows (by) of the in-progress facet's Nx×Ny param grid
+## (ONE sample_columns call) and write each column's REAL top-block material id (FarPalette.detail_pattern+1 — no
+## box-average) into the staging layer. Writes ONLY the staging Image + resume ints — NO update_layer, NO residency
+## dict, NO RenderingServer. Sets _bm_last_done so the commit knows to upload + finalize.
+func _bm_compute_slice() -> void:
+	_bm_last_done = false
 	var nx := _bm_bake_nx
 	var ny := _bm_bake_ny
 	var r0 := _bm_bake_row
@@ -710,15 +867,23 @@ func _bake_band_slice() -> void:
 	_bm_bake_row = r1
 	if r1 < ny:
 		return                              # more slices next update
-	# Facet complete → upload this ONE staging layer (the only band CPU staging image alive) into the GPU array, make it
-	# resident + record its reverse-map, then release the image. Bounded: at most a few band facets complete per update.
+	_bm_last_done = true
+
+## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
+## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch
+## and release the image. All residency-dict writes + update_layer are here (main only).
+func _bm_commit_slice() -> void:
+	if not _bm_last_done:
+		return
+	_bm_last_done = false
 	var layer := _bm_bake_layer
 	var fid := _bm_bake_fid
+	var img: Image = _bm_bake_img
 	var d := _decode(fid)
 	_bm_tex.update_layer(img, layer)
 	_bm_slots[fid] = layer
 	_bm_facet[layer] = Vector2(float(d[1]), float(d[2]))
-	_bm_n[layer] = Vector2(float(nx), float(ny))
+	_bm_n[layer] = Vector2(float(_bm_bake_nx), float(_bm_bake_ny))
 	# Retain ONLY the active facet's L8 staging image on CPU (the design's single staging layer — for the Phase-3 edit
 	# splats + a headless-readable id surface; get_layer_data can't read a GPU array headless). Non-active band facets
 	# drop their image (re-bake from the generator on return) so band CPU stays at one layer.
@@ -911,6 +1076,33 @@ func worst_frame_ms() -> float:
 
 func budget_spent_ms() -> float:
 	return float(_budget_spent_us) / 1000.0
+
+# --- TH1 (FP_TEX_BAKE_WORKER) offload wiring + gate surface --------------------------------------
+
+## WorldManager wires the shared TH0 job lane in here after setup(). `_worker_on` is live ONLY when the flag is on AND
+## the lane exists (FP_JOB_LANE) — so FP_TEX_BAKE_WORKER is inert without the lane (the design's requires-FP_JOB_LANE).
+func set_job_lane(lane: JobLane) -> void:
+	_lane = lane
+	_worker_on = CubeSphere.FP_TEX_BAKE_WORKER and lane != null
+
+## Gate-only hook: force the offload path with a supplied lane, independent of the FP_TEX_BAKE_WORKER const, so
+## verify_tex_worker can drive BOTH paths in one flag state (the byte-identity comparison). Never called in production.
+func _gate_force_worker(lane: JobLane) -> void:
+	_lane = lane
+	_worker_on = true
+
+func worker_offload_on() -> bool:
+	return _worker_on
+
+## Is a compute unit currently dispatched onto the lane worker? (gate: pump until this is false + lane idle.)
+func job_inflight() -> bool:
+	return _job_inflight
+
+## The bake work paid ON MAIN in the last update() (ms) — the G-TW-MAINCOST proof: on-main path = the whole compute
+## (large), worker path = orchestration + submit only (~0, the compute left the frame). Uploads are paid separately at
+## the lane commit (JobLane.take_main_commit_ms), bounded to ≤ a few update_layer per frame.
+func main_bake_ms() -> float:
+	return float(_main_bake_us) / 1000.0
 
 ## Phase 2 telemetry (§6): the bake ledger streamed next to shell_telemetry() via the remote bridge. Bytes + coverage
 ## + close-up residency + the bounded-cost proof (worst per-update bake ms). {} when nothing has been baked yet.

@@ -379,6 +379,10 @@ func _ready() -> void:
 		if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
 			_facet_tex = FacetTexBaker.new()
 			_facet_tex.setup(TerrainConfig.active_facet())
+			# COSMOS MAIN-THREAD ORCHESTRATION TH1 (FP_TEX_BAKE_WORKER): hand the baker the TH0 job lane so its
+			# per-frame bake COMPUTE dispatches to the WorkerThreadPool worker (main pays only the update_layer).
+			# No-op unless FP_TEX_BAKE_WORKER && the lane exists (FP_JOB_LANE) — the prewarm below stays on main.
+			_facet_tex.set_job_lane(_job_lane)
 			_facet_tex.prewarm(_facet_ring.visible_fids())
 			_facet_ring.set_facet_tex(_facet_tex.base_texture())
 			# COSMOS LOD-TEXTURE Phase 4: bind the (all-transparent-at-setup) close-up array now so the shader's

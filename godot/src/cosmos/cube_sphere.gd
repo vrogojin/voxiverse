@@ -670,6 +670,21 @@ const OFFSURFACE_Y := 256.0
 ## never constructed, never pumped, and `main_commit_ms` reports 0.0. Truth gate: src/tools/verify_job_lane.gd.
 const FP_JOB_LANE := false
 
+## COSMOS MAIN-THREAD ORCHESTRATION TH1 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §6, table row TH1) — the
+## FIRST subsystem routed through the TH0 JobLane: the FacetTexBaker per-frame bake. Today ALL of the bake COMPUTE
+## runs on the MAIN thread inside FacetTexBaker.update() — the fine sample_columns grid + set_pixel/id composite +
+## the U1 band chunk-rows + premultiply_alpha + generate_mipmaps — which at web ×25 is the observed proc_ms ~90-140
+## spike (fps 40) even standing still. Only the Texture2DArray.update_layer GPU upload is a true main-thread commit.
+## When true (AND FP_JOB_LANE — the lane must exist, else this is inert): each per-frame bake UNIT (a base facet, a
+## close-up row-slice, a band chunk-row) has its COMPUTE dispatched to the WorkerThreadPool worker via the job lane
+## at PRIORITY_TEXTURE (single in-flight per baker — the far-ring contract), writing into the baker's PREALLOCATED
+## staging Images (single-writer while in flight, reused — no per-job alloc, the dlmalloc-convoy guard); the main
+## thread pays ONLY the bounded update_layer at the lane's commit. All residency bookkeeping (slots/epochs/_baked/
+## dirty) stays single-writer on MAIN (mutated at commit), so the sampler-pure bake is BYTE-IDENTICAL to the on-main
+## bake (G-TW-EXACT). The setup prewarm still bakes synchronously on main (unchanged). Default OFF ⇒ BYTE-IDENTICAL:
+## the baker branches to its today-exact on-main update() and never touches the lane. Truth gate: verify_tex_worker.gd.
+const FP_TEX_BAKE_WORKER := false
+
 ## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
 ## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
 ## are floored to, so COVERAGE relief flows even at credit 0 (§P3a/§P3c); a relief-only candidate restriction keeps it

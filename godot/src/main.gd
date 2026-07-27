@@ -400,6 +400,13 @@ func _boot_on_essential_ready(player: Node3D) -> void:
 	_boot_marks["essential_ready_from_boot"] = Time.get_ticks_msec() - _boot_t0
 	if player != null and player.has_method("camera_global_transform"):
 		_settle_center = player.call("camera_global_transform").origin
+	# FP_BOOT_ASYNC / FP_MANIFEST_SLICE (round 4): the player is now in — release the deferred boot work (far-ring
+	# background warm + cold-biome manifest bake) so it runs WHILE playing instead of on the pre-essential-ready
+	# critical path (where it starved the shader-compile frames). No-op with the flags off.
+	if player != null:
+		var w := player.get("world") as Node
+		if w != null and w.has_method("begin_deferred_boot_work"):
+			w.call("begin_deferred_boot_work")
 	_settle_armed = true
 	_boot_print_profile()
 

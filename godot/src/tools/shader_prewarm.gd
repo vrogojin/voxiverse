@@ -133,6 +133,10 @@ var _warm_center := Vector3.ZERO               # camera world position the near-
 var _t_begin_ms := 0
 var _t_phase1_end_ms := 0
 var _lift_reason := "?"
+# Round 4: the PHASE-2 hold cap was measured in ACCUMULATED delta (_wait_time), which under-counts real time when frames
+# are slow/clamped (live: _wait_time hit the 8s cap but wall time was 16.5s). Cap on WALL clock instead so "8s" is 8s
+# real time. _t_phase2_start_ms is the wall-clock start of the module-meshed hold.
+var _t_phase2_start_ms := 0
 
 ## BOOT-LOAD PROFILE: print + (web) mirror a [BOOT] line. Fixed labels only (no user data).
 func _boot_pw_log(s: String) -> void:
@@ -252,14 +256,19 @@ func _process(delta: float) -> void:
 		return
 	# Module build: hold within a bounded [FLOOR, CAP] window, lifting early once the near view is
 	# meshed (so its render+compile frame lands hidden), else at the cap so we never hang.
-	_wait_time += delta
+	# Round 4: measure the window in WALL clock (Time.get_ticks_msec), NOT accumulated delta — a slow/clamped-delta
+	# frame made the shipped delta-cap under-count real time (8s cap ⇒ 16.5s wall). Wall time makes the cap literal.
+	if _t_phase2_start_ms == 0:
+		_t_phase2_start_ms = Time.get_ticks_msec()
+	var elapsed := float(Time.get_ticks_msec() - _t_phase2_start_ms) / 1000.0
+	_wait_time = elapsed                       # kept for the [BOOT] prewarm_phase2 log
 	var meshed := true
 	if _watch_world.has_method("initial_view_meshed"):
 		meshed = bool(_watch_world.call("initial_view_meshed", _warm_center))
-	# FP_LOAD_RAMP: wider essential surround → a larger cap so the ~96³ box has time to mesh (still bounded).
+	# FP_LOAD_RAMP: wider essential surround → a larger cap so the essential box has time to mesh (still bounded, wall clock).
 	var max_wait := LOAD_RAMP_MAX_WAIT_SEC if CubeSphere.FP_LOAD_RAMP else TERRAIN_MAX_WAIT_SEC
-	if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) or _wait_time >= max_wait:
-		_lift_reason = "meshed" if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) else "cap@%.1fs" % max_wait
+	if (meshed and elapsed >= TERRAIN_MIN_HOLD_SEC) or elapsed >= max_wait:
+		_lift_reason = "meshed" if (meshed and elapsed >= TERRAIN_MIN_HOLD_SEC) else "cap@%.1fs" % max_wait
 		_finish()
 
 ## Free (and detach) the warm-up meshes. Detaching via remove_child makes the child

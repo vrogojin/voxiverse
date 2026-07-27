@@ -273,6 +273,15 @@ var _atlas_shape_mesh_cache: Dictionary = {}   # String key -> ArrayMesh (atlas-
 # the authoritative source the gate replays (material_override(i) == atlas.material AND every surface-i UV ∈ cell i).
 var capture_atlas_probes := false
 var _atlas_probes: Array = []            # [{arid:int, cells:Array[Vector2i]}] — one per atlas-routed shaped model
+# FP_MANIFEST_SLICE (perf/voxiverse-load-profile round 4): the cold-biome manifest bake (wet/waterlog + snow-fill
+# composites + sharp slopes ≈ the bulk of the ~22s setup bake) deferred off the boot critical path. Core (dry appearance
+# + snow-cap + layer + carve) bakes synchronously in _build_gen_manifest so a temperate spawn's near field is correct at
+# once; the cold bulk bakes across post-essential-ready frames (one helper/frame), then a bounded near-view re-ramp
+# remeshes so no already-generated cell stays a permanent plain-cube fallback. All inert with the flag off (shipped bake).
+var _manifest_cold_pending := false      # true between setup (core baked) and the deferred cold bake completing
+var _manifest_defer_go := false          # essential-ready fired → run the deferred cold helpers
+var _manifest_cold_stage := 0            # next cold step: 0=wet, 1=comps, 2=slope, 3=bake+remesh (then done)
+var _manifest_library: Object = null     # the VoxelBlockyLibrary the deferred helpers append to (== _library)
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
@@ -444,8 +453,12 @@ func _process(delta: float) -> void:
 	# FP-M2b: drain + apply finished LOD meshes/aprons under the mesher's own per-frame budget (off the voxel pool).
 	if _lod_mesher != null:
 		_lod_mesher.tick()
-	# Stay processing only while there is still ramp / cover / pool-ramp / LOD work to do; otherwise go dormant.
-	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null)
+	# FP_MANIFEST_SLICE: advance the deferred cold-biome bake by one helper this frame (off the boot path).
+	if CubeSphere.FP_MANIFEST_SLICE and _manifest_defer_go and _manifest_cold_pending:
+		_manifest_cold_step()
+	# Stay processing only while there is still ramp / cover / pool-ramp / LOD / deferred-manifest work to do.
+	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null \
+		or (_manifest_defer_go and _manifest_cold_pending))
 
 ## FP-M1c: (re)enable per-frame processing so the per-slot pool view ramp advances. Safe to call repeatedly; a no-op
 ## when the pool flag is off or the near render is dev-hidden (the ramp must never re-grow a deliberately hidden field).
@@ -995,7 +1008,11 @@ func _build_gen_manifest(library: Object) -> void:
 	# Water models: NATIVE waterlogged twins (WATERLOGGING §4) or LEGACY wet composites + slab
 	# (WATER-SHORE §4.2). Same anti-drift discipline (add_model() == expected ARID); any drift aborts
 	# the water manifest (leaving -1 / cube fallback) but keeps the dry manifest intact.
-	var wet := _build_wet_manifest(library, total)
+	# FP_MANIFEST_SLICE: DEFER the cold-biome bulk (wet/waterlog + snow-fill composites + sharp slopes) off the boot
+	# critical path — they bake after essential-ready (_manifest_cold_step). Core (dry + snow-cap + layer + carve) stays
+	# synchronous. Off ⇒ all bake here exactly as shipped (byte-identical).
+	var slice := CubeSphere.FP_MANIFEST_SLICE
+	var wet := 0 if slice else _build_wet_manifest(library, total)
 	appended += wet
 
 	# Snow-cap state variants (M1 ADR §5.2): a snow-variant cube + snow-variant shape per emitted
@@ -1012,14 +1029,22 @@ func _build_gen_manifest(library: Object) -> void:
 
 	# Snow-FILL composites (SNOW-ACCUMULATION §2.6/§2.7): the curated 2-surface baked models for a
 	# terrain ramp buried/filled by the snow plane, at levels {3,5,8,10} — the largest bake line item.
-	var comps := _build_comp_manifest(library, total)
+	# FP_MANIFEST_SLICE: deferred (cold-biome; a temperate spawn's near field has none). See _manifest_cold_step.
+	var comps := 0 if slice else _build_comp_manifest(library, total)
 	appended += comps
 	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
-	var slope := _build_slope_manifest(library, total)
+	# FP_MANIFEST_SLICE: deferred (the biggest line item, ~5160 models). See _manifest_cold_step.
+	var slope := 0 if slice else _build_slope_manifest(library, total)
 	appended += slope
 	# COSMOS FP-CARVE (patch 0004): the seam junction carve-SENTINEL cubes (empty/no-op when not faceted).
 	var junctions := _build_carve_manifest(library, total)
 	appended += junctions
+
+	# FP_MANIFEST_SLICE: the cold-biome helpers above were skipped — arm the deferred bake (run after essential-ready).
+	if slice:
+		_manifest_cold_pending = true
+		_manifest_library = library
+		print("[module_world] FP_MANIFEST_SLICE: core manifest baked synchronously; cold-biome bulk (wet/comps/slope) DEFERRED to post-essential-ready")
 
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
@@ -1048,6 +1073,77 @@ func _build_gen_manifest(library: Object) -> void:
 	else:
 		print("[module_world] baked legacy water manifest: %d models (water slab ARID=%d; non-water liquids render as plain cubes)"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER]])
+
+## FP_MANIFEST_SLICE: called at essential-ready (WorldManager.begin_deferred_boot_work → main.gd) — start running the
+## deferred cold-biome bakes off the boot critical path (one helper per _process frame). No-op with the flag off / no
+## pending cold bake. Enables per-frame processing; _process drives _manifest_cold_step until done.
+func begin_deferred_manifest_bake() -> void:
+	if not CubeSphere.FP_MANIFEST_SLICE or not _manifest_cold_pending or _manifest_library == null:
+		return
+	_manifest_defer_go = true
+	set_process(true)
+
+## FP_MANIFEST_SLICE: advance the deferred cold-biome bake by ONE helper this frame (each is a multi-second synchronous
+## bake, so one-per-frame spreads the ~16s off the boot path — the player is already in). Stage 3 does the final
+## library re-bake + the bounded near-view re-ramp remesh so any cell generated with a cube fallback during the defer
+## window upgrades to its true shape. Called from _process only while _manifest_defer_go && _manifest_cold_pending.
+func _manifest_cold_step() -> void:
+	var total := _cube_arid.size()
+	match _manifest_cold_stage:
+		0:
+			_build_wet_manifest(_manifest_library, total)
+		1:
+			_build_comp_manifest(_manifest_library, total)
+		2:
+			_build_slope_manifest(_manifest_library, total)
+		3:
+			if _manifest_library.has_method("bake"):
+				_manifest_library.call("bake")           # one re-bake now that the cold models are appended
+			_manifest_remesh_near()                      # remesh so cube-fallback cold cells upgrade
+			_manifest_cold_pending = false
+			_manifest_defer_go = false
+			print("[module_world] FP_MANIFEST_SLICE: cold-biome manifest baked (deferred) + near view re-ramped for remesh")
+	_manifest_cold_stage += 1
+
+## FP_MANIFEST_SLICE: force a remesh of the near field by re-ramping its view distance from RAMP_START — reducing then
+## re-growing max_view_distance makes godot_voxel drop + re-mesh the annulus with the now-complete library (a cold cell
+## that rendered as a cube fallback during the defer window comes back with its true shape). Reuses the EXISTING ramp
+## machinery on BOTH paths (pool active slot via _ramp_pool_step, else the single-terrain _ramp_active leg), so it is
+## bounded to the near radius (NEVER-OOM) and pool-safe (it only writes max_view_distance / slot ramp state).
+func _manifest_remesh_near() -> void:
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _pool.has(_pool_active):
+		var a: Dictionary = _pool[_pool_active]
+		var full := float(TerrainConfig.near_render_radius())
+		a["view_f"] = RAMP_START_BLOCKS
+		a["ramp_from"] = RAMP_START_BLOCKS
+		a["view_target"] = full
+		a["view"] = int(RAMP_START_BLOCKS)
+		_set_if(a["terrain"], "max_view_distance", int(RAMP_START_BLOCKS))
+		_pool_ramp_kick()
+	elif _terrain != null:
+		_ramp_view = RAMP_START_BLOCKS
+		_ramp_target = float(TerrainConfig.near_render_radius())
+		_ramp_active = _ramp_target > RAMP_START_BLOCKS
+		_set_if(_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
+		set_process(true)
+
+## FP_MANIFEST_SLICE introspection for verify_manifest_slice.gd — read-only.
+func manifest_cold_pending() -> bool:
+	return _manifest_cold_pending
+## Count of baked (non -1) slots in a frozen ARID table — the gate checks core > 0 always, and cold == 0 until deferred.
+func manifest_baked_count(which: String) -> int:
+	var arr: PackedInt32Array
+	match which:
+		"gen": arr = _gen_arid
+		"snow": arr = _snow_arid
+		"comp": arr = _comp_arid_l3
+		"slope": arr = _slope_arid
+		_: return -1
+	var n := 0
+	for v in arr:
+		if v >= 0:
+			n += 1
+	return n
 
 ## Bake the snow-cap state VARIANT models and freeze them into `_snow_arid` (M1 ADR §5.2). For each
 ## cappable material (grass/podzol/sand/stone — stone tops B_MOUNTAINS peaks) it appends: a snow-variant

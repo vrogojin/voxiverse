@@ -86,6 +86,12 @@ var _tri_uv2_cache: Dictionary = {}  # fid -> PackedVector2Array (96 uv2s: (face
 # Empty with FP_FACET_TEX_CLOSEUP off ⇒ _slot_of returns -1 everywhere ⇒ UV2.y == -1, byte-identical to Phase 1.
 var _closeup_slots: Dictionary = {}  # fid -> layer (live; written by set_closeup_slots on the main thread)
 var _slot_snapshot: Dictionary = {}  # fid -> layer (frozen at build entry; read by the emit — worker-safe)
+# COSMOS TEXTURED-LOD U1 (§2U.1: FP_BAND_BLOCK_MAP): the BAND slot map (fid → resident band layer). Rides UV2.y in the
+# 64+ range (64+layer), TAKING PRIORITY over the close-up slot (0..63) since the band is strictly finer. Pushed from
+# WorldManager when the baker's band_epoch bumps; `_band_slot_snapshot` is the frozen copy the mesh emit reads (same
+# main-thread freeze contract as _slot_snapshot). Empty off FP_BAND_BLOCK_MAP ⇒ UV2.y never ≥ 64 (byte-identical).
+var _band_slots: Dictionary = {}     # fid -> band layer (live; written by set_band_slots on the main thread)
+var _band_slot_snapshot: Dictionary = {}  # fid -> band layer (frozen at build entry; read by the emit — worker-safe)
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -2307,18 +2313,30 @@ func _tex_on() -> bool:
 func _cu_on() -> bool:
 	return CubeSphere.FP_FACET_TEX_CLOSEUP and _tex_on()
 
-## The close-up layer for `fid` from the FROZEN build snapshot (worker-safe), or −1 (base-map fallback). Empty
-## snapshot (close-up off / not driven) ⇒ −1 everywhere ⇒ UV2.y == −1, byte-identical to Phase 1.
+## COSMOS TEXTURED-LOD U1: the band tier is live (needs the base textured ring + block detail + its own flag). Off ⇒
+## every band path (64+ slot, band_map sampler, band_facet/band_n uniforms) is inert ⇒ mesh + material unchanged.
+func _bm_on() -> bool:
+	return CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_BLOCK_DETAIL and _tex_on()
+
+## The slot for `fid` from the FROZEN build snapshot (worker-safe), fed to UV2.y at emit. A BAND facet wins with 64+layer
+## (the shader's real-block path); else the close-up layer (0..63); else −1 (base-map / tiled fallback). Empty snapshots
+## (both tiers off / not driven) ⇒ −1 everywhere ⇒ byte-identical to Phase 1.
 func _slot_of(fid: int) -> float:
+	if _band_slot_snapshot.has(fid):
+		return float(64 + int(_band_slot_snapshot[fid]))
 	return float(_slot_snapshot.get(fid, -1))
 
-## COSMOS LOD-TEXTURE Phase 4: refresh the frozen slot snapshot the mesh emit reads. MAIN thread only (both build
-## entries call it before any worker dispatch), so the async worker's _emit_cached reads a map stable for its run.
+## COSMOS LOD-TEXTURE Phase 4 / U1: refresh the frozen slot snapshots the mesh emit reads. MAIN thread only (both build
+## entries call it before any worker dispatch), so the async worker's _emit_cached reads maps stable for its run.
 func _refresh_slot_snapshot() -> void:
 	if _cu_on():
 		_slot_snapshot = _closeup_slots.duplicate()
 	elif not _slot_snapshot.is_empty():
 		_slot_snapshot = {}
+	if _bm_on():
+		_band_slot_snapshot = _band_slots.duplicate()
+	elif not _band_slot_snapshot.is_empty():
+		_band_slot_snapshot = {}
 
 func _tex_decode(fid: int) -> Array:
 	var kb := FacetAtlas.k_of(fid)
@@ -2551,7 +2569,38 @@ const _DETAIL_ALBEDO := "	int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_
 	vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
 	ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
 "
-static func _apply_block_detail(code: String) -> String:
+
+# COSMOS TEXTURED-LOD U1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.1: FP_BAND_BLOCK_MAP): the BAND real-block injection,
+# ADDITIVE on top of the FP_BLOCK_DETAIL injection — same string-splice discipline, ZERO new shader_type/compiled
+# programs (still exactly ONE per shell string). For a BAND facet (UV2.y ≥ 64 → band slot = UV2.y − 64) the fragment
+# reads the per-block material id from `band_map` at the fragment's block coord (buv = facet-local-uv · band_n[slot])
+# and composites detail_map[id] at the intra-block UV (fract(buv)) — reconstructing PER PIXEL the analytic real
+# top-down composite of the facet's ACTUAL blocks at their ACTUAL positions. A non-band facet (UV2.y < 64) falls
+# through to the §2R.1 tiled id_map path unchanged (far-far degrades gracefully). Injected only under FP_BAND_BLOCK_MAP;
+# off ⇒ the shader string is EXACTLY the FP_BLOCK_DETAIL result (G-BB-OFF byte-identity). BAND_LAYERS is interpolated
+# as a literal so the GLSL array sizes are integer-constant.
+const _BAND_UNIFORMS := "uniform sampler2DArray band_map : filter_nearest;
+uniform vec2 band_facet[%d];
+uniform vec2 band_n[%d];
+uniform float band_k = 24.0;
+"
+const _BAND_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		vec2 _buv = _luv * _N;
+		ivec2 _ib = clamp(ivec2(_buv), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? (col * texture(detail_map, vec3(fract(_buv), float(_bid))).rgb * 2.0) : col;
+		ALBEDO = mix(v_col_raw, _bcol, wt) * v_st;
+	} else {
+		int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+		vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+		ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+	}
+"
+static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_MAP) -> String:
 	if not CubeSphere.FP_BLOCK_DETAIL:
 		return code
 	code = code.replace(
@@ -2559,6 +2608,19 @@ static func _apply_block_detail(code: String) -> String:
 		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + _DETAIL_UNIFORMS)
 	code = code.replace(
 		"	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _DETAIL_ALBEDO)
+	# COSMOS TEXTURED-LOD U1: layer the BAND real-block path on top when FP_BAND_BLOCK_MAP is on. Additive: declare the
+	# band uniforms after the detail ones, carry UV2.y into a v_bslot varying, and swap the tiled ALBEDO block for the
+	# band-branching one (band facet ⇒ real per-block map; else the identical tiled path). Byte-identical to the
+	# FP_BLOCK_DETAIL result when the flag is off. `band` is a param (defaults to the flag) so the gate can build both.
+	if band:
+		var bl := CubeSphere.BAND_LAYERS
+		code = code.replace(_DETAIL_UNIFORMS, _DETAIL_UNIFORMS + (_BAND_UNIFORMS % [bl, bl]))
+		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+		code = code.replace(_DETAIL_ALBEDO, _BAND_ALBEDO % bl)
+		# When the close-up variant is live, its UV2.y also carries band slots (64+): guard the close-up branch to the
+		# 0..63 slot space so a band facet never indexes closeup_map out of range. No-op on the base tex shader.
+		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
 	return code
 
 func _make_material() -> Material:
@@ -2590,6 +2652,19 @@ func _make_material() -> Material:
 			for i in range(CubeSphere.CLOSEUP_MAX):
 				seed[i] = Vector2(-1.0, -1.0)
 			sm2.set_shader_parameter("cu_facet", seed)
+		# COSMOS TEXTURED-LOD U1: seed the band reverse-maps to sentinels (no band facet resident yet). band_map is bound
+		# later by set_facet_band once the baker built the array; band_facet/band_n arrive via set_band_slots.
+		if _bm_on():
+			sm2.set_shader_parameter("band_k", float(FacetAtlas.K))
+			var bfacet := PackedVector2Array()
+			var bn := PackedVector2Array()
+			bfacet.resize(CubeSphere.BAND_LAYERS)
+			bn.resize(CubeSphere.BAND_LAYERS)
+			for i in range(CubeSphere.BAND_LAYERS):
+				bfacet[i] = Vector2(-1.0, -1.0)
+				bn[i] = Vector2(0.0, 0.0)
+			sm2.set_shader_parameter("band_facet", bfacet)
+			sm2.set_shader_parameter("band_n", bn)
 		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
@@ -2677,6 +2752,31 @@ func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void
 			(mat as ShaderMaterial).set_shader_parameter("cu_facet", facet_map)
 	_pending = true                  # re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
 
+## COSMOS TEXTURED-LOD U1 (§2U.1): bind the baker's band id map into the shell shader's `band_map` uniform. No-op unless
+## the band tier is live and the material is the textured shader ⇒ flag-off is byte-identical (never wired). Called by
+## WorldManager once the baker built the band array.
+func set_facet_band(tex: Texture) -> void:
+	if not _bm_on() or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("band_map", tex)
+
+## COSMOS TEXTURED-LOD U1 (§2U.1): push the baker's current band slot map (fid→layer) + the layer→(a,b) and layer→(Nx,Ny)
+## reverse-maps. Main thread only (WorldManager, when the baker's band_epoch bumps): updates the live `_band_slots` (frozen
+## into the mesh at the next build so UV2.y carries 64+layer) and the band_facet/band_n shader uniforms (read live per
+## fragment), then requests a re-emit. No-op with the band tier off.
+func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
+	if not _bm_on():
+		return
+	_band_slots = slots
+	if _mi != null:
+		var mat := _mi.material_override
+		if mat is ShaderMaterial and facet_map.size() == CubeSphere.BAND_LAYERS and n_map.size() == CubeSphere.BAND_LAYERS:
+			(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
+			(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
+	_pending = true                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
+
 ## COSMOS TEXTURED-LOD T1b gate surface (G-BD-OFF/TILE): the RAW textured shell shader string (no detail) and the
 ## FP_BLOCK_DETAIL-injected result, so the gate can assert byte-identity off and additive-only injection on, with the
 ## shader_type count unchanged (zero new compiled programs).
@@ -2684,6 +2784,12 @@ static func gate_tex_shader_raw(cu: bool) -> String:
 	return _SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER
 static func gate_tex_shader_detail(cu: bool) -> String:
 	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER)
+
+## COSMOS TEXTURED-LOD U1 gate surface (G-BB-OFF): the FP_BLOCK_DETAIL string with the band injection FORCED off vs on,
+## so the gate can assert (a) band-off ≡ the shipped detail string (byte-identical), (b) band-on is ADDITIVE only (still
+## exactly ONE shader_type → zero new compiled programs) and declares the band_map/band_facet samplers + v_bslot varying.
+static func gate_band_shader(cu: bool, band: bool) -> String:
+	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER, band)
 
 ## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
 ## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).

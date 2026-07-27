@@ -89,6 +89,35 @@ var _slots_epoch := 0                # bumped on any _cu_slots change so WorldMa
 # stall). Built once (setup); bounded ⇒ NEVER-OOM. Mirrors FacetFarRing._centre_pack.
 var _centre_pack := PackedVector3Array()
 
+# COSMOS TEXTURED-LOD U1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.1: FP_BAND_BLOCK_MAP) — the near-far BAND's REAL
+# per-block id map. A BAND_LAYERS×BAND_TEXELS² L8 Texture2DArray: layer `slot` holds facet fid's per-block material id
+# (FarPalette.detail_pattern+1, from the SAME sampler colour chain FacetBlockLod L0 classifies — 1 block per texel,
+# NO box-average, so the real arrangement survives). PARAM-space (texel (bx,by) = the top block at facet param
+# ((bx+0.5)/Nx,(by+0.5)/Ny)) so it covers exactly the visible facet quad [0,1]² and fits 512 even where the lattice
+# DOMAIN bbox exceeds it (measured up to 583; the core facet edge is ≤ ~410). The shader reads band_facet[slot]=(a,b)
+# + band_n[slot]=(Nx,Ny) to map a fragment's facet-uv → block coord. Residency = active ∪ ring-1 (≤ BAND_LAYERS);
+# chunk-row (BAND_SLICE_ROWS) sliced under the shared budget; evicted only on ring exit; a returning facet re-bakes.
+# All zero / never created off FP_BAND_BLOCK_MAP. NEVER-OOM: fixed BAND_LAYERS × BAND_TEXELS² L8 + ONE staging layer.
+var _bm_on := false                  # FP_BAND_BLOCK_MAP && _bd_on && the baker exists (set in setup)
+var _bm_texels := 0                  # BAND_TEXELS (512)
+var _bm_tex: Texture2DArray = null   # the BAND_LAYERS-layer GPU band id map (bound into the ring's band_map uniform)
+var _bm_slots: Dictionary = {}       # fid -> layer (RESIDENT: baked + uploaded; the value fed to UV2.y as 64+layer)
+var _bm_facet := PackedVector2Array()  # layer -> (a,b) reverse map for the shader's band_facet uniform
+var _bm_n := PackedVector2Array()      # layer -> (Nx,Ny) block-count reverse map for the shader's band_n uniform
+var _bm_free: Array = []             # free layer indices (reuse pool)
+var _bm_want: Dictionary = {}        # fid -> true: the current band set (active ∪ ring-1, capped to BAND_LAYERS)
+var _bm_want_active := -1            # the active fid the want-set was last computed for (skip the recompute when unchanged)
+var _bm_bake_fid := -1              # facet whose band bake is in progress (row-sliced across frames); -1 = idle
+var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
+var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
+var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² L8 staging image (id 0 until rows fill in)
+var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
+var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
+var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
+var _bm_active_fid := -1           # the ACTIVE facet whose L8 staging image is retained on CPU (the design's ONE staging
+var _bm_active_img: Image = null   #   layer, for incremental edit splats + a headless-readable band id surface)
+var _bm_epoch := 0                  # bumped on any _bm_slots / reverse-map change → WorldManager pushes the new maps
+
 # --- lifecycle -----------------------------------------------------------------------------------
 
 ## Build this epoch's sampler (compiled VoxelGeneratorCosmos frozen for `active_fid`, else the GDScript oracle
@@ -145,6 +174,26 @@ func setup(active_fid: int) -> void:
 		# so a completed bake only does a cheap per-layer update_layer — never a mid-play create_from_images spike.
 		_cu_tex = Texture2DArray.new()
 		_cu_tex.create_from_images(cimgs)
+	# COSMOS TEXTURED-LOD U1 (§2U.1): allocate the BAND id map (BAND_LAYERS x BAND_TEXELS^2 L8, id 0 everywhere = un-baked)
+	# and seed the free-layer pool + reverse maps. Requires FP_BLOCK_DETAIL (the band composites detail_map[id]) so _bm_on
+	# implies _bd_on. Only under FP_BAND_BLOCK_MAP -> zero band bytes with the flag off. Built ONCE (all id 0 -> the shader's
+	# band branch is skipped until a facet is baked resident); a completed bake only does a cheap update_layer.
+	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and _bd_on
+	if _bm_on:
+		_bm_texels = CubeSphere.BAND_TEXELS
+		_bm_facet.resize(CubeSphere.BAND_LAYERS)
+		_bm_n.resize(CubeSphere.BAND_LAYERS)
+		_bm_free.clear()
+		var bimgs: Array[Image] = []
+		for i in range(CubeSphere.BAND_LAYERS):
+			var bimg := Image.create(_bm_texels, _bm_texels, false, Image.FORMAT_L8)
+			bimg.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
+			_bm_facet[i] = Vector2(-1.0, -1.0)
+			_bm_n[i] = Vector2(0.0, 0.0)
+			_bm_free.append(i)
+			bimgs.append(bimg)
+		_bm_tex = Texture2DArray.new()
+		_bm_tex.create_from_images(bimgs)
 
 ## Synchronous prewarm of the currently-emitted facet set (§6 Phase 1). Bakes each facet's base map into its
 ## page, then uploads the whole 6-layer array once. Masked by the same ShaderPrewarm hold as the ring's initial
@@ -274,7 +323,7 @@ func _rebuild_id_texture() -> void:
 ## most a bounded number of whole facets (~0.9 ms each) per update. Worst-case per-update bake cost is therefore
 ## budget + one unit — bounded by construction, and PROVEN by the headless G-FT-BUDGET scripted drive (which asserts
 ## `worst_frame_ms` never exceeds the bound and the loop never STARTED a unit past the budget line).
-func update(emit_axis: Array, offsurface: bool, budget_ms: float) -> void:
+func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1) -> void:
 	var start := Time.get_ticks_usec()
 	var budget_us := int(budget_ms * 1000.0)
 	# Split the shared budget so BOTH tiers progress every frame: the close-up crisp win (off-surface) gets the first
@@ -287,6 +336,13 @@ func update(emit_axis: Array, offsurface: bool, budget_ms: float) -> void:
 		_bake_closeup_budgeted(start, cu_line)
 	elif _cu_on and not _cu_want.is_empty():
 		_evict_all_closeup()               # on-surface (or flag path change): drop every promotion → all base-map, bytes freed to the pool
+	# COSMOS TEXTURED-LOD U1 (§2U.1): drive the near-far BAND — refresh residency to active ∪ ring-1 (evict on ring exit),
+	# then bake missing band facets ROW-SLICED under the SHARED budget (check-before-slice, never mid-slice → bounded like
+	# the close-up tier). No-op off FP_BAND_BLOCK_MAP or with no active facet. Band gets the budget FIRST (it is the near
+	# aesthetic the user is looking at); progressive base coverage below spends whatever remains.
+	if _bm_on and active_fid >= 0:
+		_recompute_band_want(active_fid)
+		_bake_band_budgeted(start, budget_us)
 	# Phase 2: progressive BASE coverage with the remaining budget (whole-facet units, check-before-each).
 	_bake_base_progressive(start, budget_us, emit_axis)
 	# Bounded incremental uploads (main-thread RenderingServer touch): ≤ a few pages/layers per update.
@@ -544,6 +600,147 @@ func _flush_closeup_uploads() -> void:
 			_cu_tex.update_layer(_cu_layers[int(layer)], int(layer))
 	_cu_dirty.clear()
 
+# --- U1: the near-far BAND real-block id map (§2U.1) ---------------------------------------------
+
+## Recompute the band residency (active ∪ ring-1, capped to BAND_LAYERS) and EVICT residents that left the ring. The
+## want-set changes only on a facet crossing, so this is skipped while `active_fid` is unchanged — the standing camera
+## re-runs nothing. Eviction frees the layer back to the pool (a facet leaving the band falls back to the §2R tiled
+## detail path — same catalog hues, coarser arrangement, at distances where a block is ≤ 2 px). Bumps the epoch.
+func _recompute_band_want(active_fid: int) -> void:
+	if active_fid == _bm_want_active and not _bm_want.is_empty():
+		return
+	_bm_want_active = active_fid
+	var want := {}
+	var ring := TierPlace.ring1(active_fid)          # [active, 4 seam, diagonals…]; take the nearest BAND_LAYERS
+	for i in range(ring.size()):
+		if want.size() >= CubeSphere.BAND_LAYERS:
+			break
+		want[int(ring[i])] = true
+	# Evict residents no longer in the band ring (the evict-only-on-ring-exit invariant the gate checks).
+	for fid in _bm_slots.keys():
+		if not want.has(int(fid)):
+			_evict_band(int(fid))
+	# If the in-progress bake's facet left the ring, abandon it (its layer returns to the pool).
+	if _bm_bake_fid >= 0 and not want.has(_bm_bake_fid):
+		if not _bm_free.has(_bm_bake_layer):
+			_bm_free.append(_bm_bake_layer)
+		_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
+	_bm_want = want
+
+## Bake band-but-not-resident facets (active first, then ring order), ROW-SLICED, until the budget line. Continues an
+## in-progress facet across updates. A facet needs a free layer to start; if none is free (all in-ring residents) it is
+## skipped (stays on the tiled detail path) — NEVER evicts an in-ring facet. Check-before-slice ⇒ bounded worst frame.
+func _bake_band_budgeted(start: int, budget_us: int) -> void:
+	while Time.get_ticks_usec() - start < budget_us:   # CHECK-BEFORE each slice (never mid-slice)
+		if _bm_bake_fid < 0:
+			var fid := _next_band_to_bake()
+			if fid < 0:
+				return                      # band fully resident/queued this ring
+			if not _begin_band_bake(fid):
+				return                      # no free layer (all in-ring resident) — leave it on the tiled path
+		_bake_band_slice()
+
+## The next wanted band facet that is neither resident nor already baking (active preferred, then ring order). -1 when done.
+func _next_band_to_bake() -> int:
+	if _bm_want.has(_bm_want_active) and not _bm_slots.has(_bm_want_active) and _bm_want_active != _bm_bake_fid:
+		return _bm_want_active
+	for fid in _bm_want.keys():
+		var f := int(fid)
+		if not _bm_slots.has(f) and f != _bm_bake_fid:
+			return f
+	return -1
+
+## Acquire a free layer for `fid` and start its row-sliced band bake. Computes the facet's 4 lattice corners (the SAME
+## mapping sample_fine uses) + its per-axis block counts Nx,Ny (round of the core edge, ≤ BAND_TEXELS). Returns false if
+## no layer is free (every layer is an in-ring resident) — `fid` then stays on the tiled detail path this ring.
+func _begin_band_bake(fid: int) -> bool:
+	if _bm_free.is_empty():
+		return false
+	var layer := int(_bm_free.pop_back())
+	_bm_bake_fid = fid
+	_bm_bake_layer = layer
+	_bm_bake_row = 0
+	var img: Image = Image.create(_bm_texels, _bm_texels, false, Image.FORMAT_L8)
+	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in
+	_bm_bake_img = img
+	_bm_bake_lc.resize(4)
+	for ci in range(4):
+		var w := FacetAtlas.facet_planar_corner(fid, ci)
+		var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
+		_bm_bake_lc[ci] = Vector2(float(l[0]), float(l[2]))
+	# Core facet block counts: |lc1-lc0| along s (UV.x), |lc3-lc0| along t (UV.y). Clamp to [1, BAND_TEXELS] so 1 texel
+	# maps to ~1 lattice block and the map never over-runs its 512 edge (the DOMAIN bbox can exceed 512; the param edge
+	# does not). This is the shader's band_n[slot] (block-frequency for both the id lookup and the intra-block UV).
+	_bm_bake_nx = clampi(int(round((_bm_bake_lc[1] - _bm_bake_lc[0]).length())), 1, _bm_texels)
+	_bm_bake_ny = clampi(int(round((_bm_bake_lc[3] - _bm_bake_lc[0]).length())), 1, _bm_texels)
+	return true
+
+## Sample BAND_SLICE_ROWS more block-rows (by) of the in-progress facet's Nx×Ny param grid (ONE sample_columns call per
+## slice) and write each column's REAL top-block material id (FarPalette.detail_pattern+1 — no box-average) into the
+## staging layer. On the last row: make it RESIDENT (_bm_slots[fid]=layer), record its (a,b) + (Nx,Ny) reverse-map,
+## mark it dirty (upload) and bump the epoch. The classify is the SAME chain the id_map/base map use (one-sampler law).
+func _bake_band_slice() -> void:
+	var nx := _bm_bake_nx
+	var ny := _bm_bake_ny
+	var r0 := _bm_bake_row
+	var r1 := mini(r0 + CubeSphere.BAND_SLICE_ROWS, ny)
+	var rows := r1 - r0
+	var lc := _bm_bake_lc
+	var packed := PackedInt64Array()
+	packed.resize(rows * nx)
+	for rj in range(rows):
+		var by := r0 + rj
+		var t := (float(by) + 0.5) / float(ny)
+		var base := rj * nx
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
+			var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
+			packed[base + bx] = _pack_xz(int(round(lx)), int(round(lz)))
+	var res: Dictionary = _sampler.call(_bm_bake_fid, packed)
+	var cols: PackedColorArray = res["colors"]
+	var img: Image = _bm_bake_img
+	for rj in range(rows):
+		var by := r0 + rj
+		var base := rj * nx
+		for bx in range(nx):
+			var id := FarPalette.detail_pattern(cols[base + bx]) + 1
+			var lv := float(id) / 255.0
+			img.set_pixel(bx, by, Color(lv, lv, lv, 1.0))
+	_bm_bake_row = r1
+	if r1 < ny:
+		return                              # more slices next update
+	# Facet complete → upload this ONE staging layer (the only band CPU staging image alive) into the GPU array, make it
+	# resident + record its reverse-map, then release the image. Bounded: at most a few band facets complete per update.
+	var layer := _bm_bake_layer
+	var fid := _bm_bake_fid
+	var d := _decode(fid)
+	_bm_tex.update_layer(img, layer)
+	_bm_slots[fid] = layer
+	_bm_facet[layer] = Vector2(float(d[1]), float(d[2]))
+	_bm_n[layer] = Vector2(float(nx), float(ny))
+	# Retain ONLY the active facet's L8 staging image on CPU (the design's single staging layer — for the Phase-3 edit
+	# splats + a headless-readable id surface; get_layer_data can't read a GPU array headless). Non-active band facets
+	# drop their image (re-bake from the generator on return) so band CPU stays at one layer.
+	if fid == _bm_want_active:
+		_bm_active_fid = fid
+		_bm_active_img = img
+	_bm_epoch += 1
+	_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
+
+## Evict band facet `fid`: free its layer, drop it from residency. The reverse-map (a,b)/(Nx,Ny) is left as-is until the
+## layer is reused (a returning facet re-bakes it) so a mesh vertex carrying the stale 64+slot for the ≤1-frame window
+## before the re-emit lands still samples a coherent layer (a soft no-op). The GPU layer keeps its stale id data until
+## reused — harmless (no facet's UV2.y points at it once evicted). Bumps the epoch.
+func _evict_band(fid: int) -> void:
+	if not _bm_slots.has(fid):
+		return
+	var layer := int(_bm_slots[fid])
+	_bm_slots.erase(fid)
+	if not _bm_free.has(layer):
+		_bm_free.append(layer)
+	_bm_epoch += 1
+
 func _centre_dir(fid: int) -> Array:
 	var v := _cdir(fid)
 	return [v.x, v.y, v.z]
@@ -653,6 +850,62 @@ func closeup_texel_color(fid: int, tx: int, ty: int) -> Color:
 		return Color(c.r / c.a, c.g / c.a, c.b / c.a, c.a)
 	return c
 
+# --- U1 band accessors (gate + WorldManager surface) ---------------------------------------------
+
+## The BAND_LAYERS-layer L8 band id map bound into the ring's `band_map` uniform (null off FP_BAND_BLOCK_MAP). Built
+## whole (all id 0) at setup, so it is non-null whenever the band tier is live — its layers fill in as facets bake.
+func band_texture() -> Texture2DArray:
+	return _bm_tex
+
+func band_on() -> bool:
+	return _bm_on
+
+## The RESIDENT band layer for `fid`, or −1 (tiled-detail fallback). WorldManager maps this to UV2.y as 64+layer at emit.
+func band_slot(fid: int) -> int:
+	return int(_bm_slots.get(fid, -1))
+
+## A COPY of the resident band slot map (fid→layer) for WorldManager to push to the ring when the epoch bumps.
+func band_slots() -> Dictionary:
+	return _bm_slots.duplicate()
+
+## The layer→(a,b) reverse map for the shader's `band_facet` uniform (facet-local UV = v_uv·K − (a,b)).
+func band_facet_map() -> PackedVector2Array:
+	return _bm_facet
+
+## The layer→(Nx,Ny) block-count reverse map for the shader's `band_n` uniform (block frequency: id lookup + intra-block UV).
+func band_n_map() -> PackedVector2Array:
+	return _bm_n
+
+## Bumped on any band resident-slot / reverse-map change → WorldManager pushes the new maps + requests a re-emit.
+func band_epoch() -> int:
+	return _bm_epoch
+
+func band_resident_count() -> int:
+	return _bm_slots.size()
+
+func band_want_count() -> int:
+	return _bm_want.size()
+
+## Is facet `fid` currently in the band ring (active ∪ ring-1)? (gate G-BB-SLOT: evict-only-on-ring-exit invariant.)
+func band_in_ring(fid: int) -> bool:
+	return _bm_want.has(fid)
+
+## The RESIDENT facet's per-axis block counts (Nx,Ny), or (0,0) if not resident. Gate surface for the shader-addressing check.
+func band_n_of(fid: int) -> Vector2:
+	if not _bm_slots.has(fid):
+		return Vector2(0.0, 0.0)
+	return _bm_n[int(_bm_slots[fid])]
+
+## The stored band id (0 = un-baked, else FarPalette.detail_pattern+1) at the ACTIVE band facet's block (bx,by) ∈
+## [0,Nx)×[0,Ny). Reads the retained active-facet CPU staging image (a GPU Texture2DArray layer is not readable headless);
+## the active facet is the one the gate exercises, so this is the real stored id. −1 for a non-active / non-resident facet.
+func band_id_at(fid: int, bx: int, by: int) -> int:
+	if not _bm_on or fid != _bm_active_fid or _bm_active_img == null:
+		return -1
+	if bx < 0 or by < 0 or bx >= _bm_texels or by >= _bm_texels:
+		return -1
+	return int(round(_bm_active_img.get_pixel(bx, by).r * 255.0))
+
 func worst_frame_ms() -> float:
 	return float(_worst_frame_us) / 1000.0
 
@@ -696,7 +949,21 @@ func total_bytes() -> int:
 		total += 6 * id_px                     # 6 CPU staging id pages
 		total += 6 * id_px                     # 6-layer GPU id array (L8, no mips)
 		total += FacetDetailAtlas.total_bytes()
+	# COSMOS TEXTURED-LOD U1 (§2U.4): the band id map — BAND_LAYERS × BAND_TEXELS² L8 GPU array (2.36 MB, no mips) + ONE
+	# CPU staging image (the in-progress bake; row-sliced facets return re-bake from the generator, no per-facet CPU store).
+	if _bm_on:
+		var bm_px := _bm_texels * _bm_texels          # one L8 band layer, bytes
+		total += CubeSphere.BAND_LAYERS * bm_px        # BAND_LAYERS-layer GPU array (L8, no mips)
+		total += bm_px                                 # ONE CPU staging image (the active in-progress bake)
 	return total
+
+## COSMOS TEXTURED-LOD U1 (§2U.4): the band tier's own byte ledger (GPU array + one staging image), asserted ≤ BAND_BYTES_MAX
+## by G-BB-BYTES. Zero off the flag. Kept separate so the gate can check the +2.7 MB delta arithmetic exactly.
+func band_bytes() -> int:
+	if not _bm_on:
+		return 0
+	var bm_px := _bm_texels * _bm_texels
+	return CubeSphere.BAND_LAYERS * bm_px + bm_px
 
 # --- helpers -------------------------------------------------------------------------------------
 

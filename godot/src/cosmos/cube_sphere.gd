@@ -543,6 +543,29 @@ const FP_BLOCK_DETAIL := false
 ## border-present when true).
 const FP_DETAIL_GRID := false
 
+## COSMOS TEXTURED-LOD U1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.1 — live correction 1: the near-far BAND renders the
+## REAL top-down bake). FP_BLOCK_DETAIL's tiled id_map varies only per macro texel (26-blk cell) so ONE face tile
+## REPEATS within a texel — the user correctly reads a pattern, not his terrain. This flag makes the BAND facets
+## (active + ring-1) instead sample a per-facet `band_map` — a BAND_LAYERS×BAND_TEXELS² L8 Texture2DArray, 1 byte per
+## block = the material id (FarPalette.detail_pattern+1, from the SAME per-column classifier chain FacetBlockLod L0
+## bakes) of the real top block at that column. The fragment shader reconstructs the flattened top-down composite
+## PER PIXEL — `bid = texelFetch(band_map, block_xz); albedo = col · detail_map[bid] at fract(block_uv) · 2` — i.e.
+## the analytic `tile[id(x,z)]` (arrangement × pattern) at full 64-texel/block face fidelity, at ~1/250th the bytes of
+## a flat RGBA bake. Band facets thus wear their ACTUAL blocks at their ACTUAL positions (this outcrop, that pond
+## edge), blending seamlessly into the near blocky terrain; far-far facets keep the §2R.1 tiled color-map path. The
+## band slot rides UV2.y in the 64+ range (0..63 stays the close-up slot space); residency = active ∪ ring-1 (≤
+## BAND_LAYERS), chunk-row (BAND_SLICE_ROWS) sliced under FACET_TEX_BAKE_BUDGET_MS, evicted only on ring exit. ZERO
+## new shader_type/compiled programs (the band lines are string-injected into the EXISTING shell tex shaders only when
+## this flag is on). Requires FP_FACET_TEX ∧ FP_BLOCK_DETAIL. Off ⇒ the band_map array is NEVER built, the shader
+## strings are BYTE-IDENTICAL to FP_BLOCK_DETAIL, UV2.y never carries a band slot (FLAT 6042/0). NEVER-OOM: fixed
+## BAND_LAYERS × BAND_TEXELS² L8 (2.36 MB GPU) + ONE CPU staging layer (0.26 MB) ⇒ ≈ +2.7 MB → combined ceiling 43 MB.
+## Gate: verify_band_map.gd (G-BB-EXACT / G-BB-BYTES / G-BB-SLOT / G-BB-OFF).
+const FP_BAND_BLOCK_MAP := false
+const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
+const BAND_LAYERS := 9                     # band residency = active + ring-1 (≤ 9 layers → 2.36 MB GPU, fixed at creation)
+const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
+const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

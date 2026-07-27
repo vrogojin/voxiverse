@@ -70,6 +70,7 @@ var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendere
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
 var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
+var _tex_band_epoch := -1             # COSMOS TEXTURED-LOD U1: last band slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -376,6 +377,11 @@ func _ready() -> void:
 			# FP_BLOCK_DETAIL (set_facet_detail is flag-guarded; the atlas/id pages are never built by the baker either).
 			if CubeSphere.FP_BLOCK_DETAIL:
 				_facet_ring.set_facet_detail(FacetDetailAtlas.build(), _facet_tex.id_texture())
+				# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
+				# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
+				# then. No-op off FP_BAND_BLOCK_MAP (set_facet_band + band_texture are flag-guarded).
+				if CubeSphere.FP_BAND_BLOCK_MAP:
+					_facet_ring.set_facet_band(_facet_tex.band_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -926,12 +932,19 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _facet_tex != null and _facet_ring != null:
 		var eaxis := _facet_ring.shell_emit_axis()
 		var offs: bool = _facet_ring.shell_offsurface()
-		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
+		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet())
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:
 			_tex_slots_epoch = _facet_tex.slots_epoch()
 			if _facet_tex.closeup_texture() != null:
 				_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
 			_facet_ring.set_closeup_slots(_facet_tex.closeup_slots(), _facet_tex.closeup_facet_map())
+		# COSMOS TEXTURED-LOD U1: push the band slot map + reverse-maps when the baker's band epoch bumps (a facet baked
+		# resident or evicted on a crossing) so UV2.y carries the new 64+ slots and the shader's band_facet/band_n update.
+		if _facet_tex.band_epoch() != _tex_band_epoch:
+			_tex_band_epoch = _facet_tex.band_epoch()
+			_facet_ring.set_band_slots(_facet_tex.band_slots(), _facet_tex.band_facet_map(), _facet_tex.band_n_map())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync

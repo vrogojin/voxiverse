@@ -2534,6 +2534,33 @@ void fragment() {
 }
 "
 
+# COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1/§2R.3): inject the block-FACE detail sampling into
+# the ALREADY-COMPILED shell tex shader string — no new shader_type, no new compiled program (same one shell program per
+# session). Two string replacements on the EXISTING code: (1) declare the shared `detail_map` (REPEAT, mip) + the per-
+# texel `id_map` (NEAREST) samplers after `base_map`; (2) replace the final ALBEDO line so, when a texel's id > 0, the
+# composed colour `col` is modulated by that material's real block face at ONE tile per macro texel (buv = v_uv·384,
+# REPEAT). Because each detail layer is mean-normalised (mean 0.5) and `face_col = col·detail·2.0`, the pattern mips back
+# to `col` with distance ⇒ far degrades to exactly the colour map (§2R.2). Off FP_BLOCK_DETAIL ⇒ the code is returned
+# UNCHANGED (byte-identical shader string, identical program) — the G-BD-OFF identity. Applied to BOTH tex variants
+# (base + close-up): the base id/frequency modulates whatever `col` the fragment composed (close-up id twin deferred).
+const _DETAIL_UNIFORMS := "uniform sampler2DArray detail_map : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2DArray id_map : filter_nearest;
+const float DETAIL_PAGE = 384.0;
+"
+const _DETAIL_ALBEDO := "	int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+	vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+	ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+"
+static func _apply_block_detail(code: String) -> String:
+	if not CubeSphere.FP_BLOCK_DETAIL:
+		return code
+	code = code.replace(
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + _DETAIL_UNIFORMS)
+	code = code.replace(
+		"	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _DETAIL_ALBEDO)
+	return code
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -2546,9 +2573,9 @@ func _make_material() -> Material:
 		# COSMOS LOD-TEXTURE Phase 4: the close-up shader variant wins when FP_FACET_TEX_CLOSEUP is on (it subsumes the
 		# Phase-1 tex shader — a slot of −1 renders the identical base-map result). Off ⇒ the Phase-1 / shipped string.
 		if _cu_on():
-			sh2.code = _SHELL_ABS_TEX_CU_SHADER
+			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER)
 		else:
-			sh2.code = _SHELL_ABS_TEX_SHADER if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
@@ -2625,6 +2652,17 @@ func set_facet_closeup_tex(tex: Texture) -> void:
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("closeup_map", tex)
 
+## COSMOS TEXTURED-LOD T1b: bind the shared detail atlas + the baker's id map into the shell shader's `detail_map` /
+## `id_map` uniforms. No-op unless FP_BLOCK_DETAIL && the textured shader is live ⇒ flag-off is byte-identical (never
+## wired; the shader string has no detail samplers). Called once by WorldManager after the prewarm bake.
+func set_facet_detail(detail_tex: Texture, id_tex: Texture) -> void:
+	if not (_tex_on() and CubeSphere.FP_BLOCK_DETAIL) or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("detail_map", detail_tex)
+		(mat as ShaderMaterial).set_shader_parameter("id_map", id_tex)
+
 ## COSMOS LOD-TEXTURE Phase 4: push the baker's current slot map (fid→layer) + layer→(a,b) reverse-map. Main thread
 ## only (WorldManager, when the baker's epoch bumps). Updates the live `_closeup_slots` (frozen into the mesh at the
 ## next build) and the `cu_facet` shader uniform (read live per fragment). Requests a re-emit so the new slots reach
@@ -2638,6 +2676,14 @@ func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void
 		if mat is ShaderMaterial and facet_map.size() == CubeSphere.CLOSEUP_MAX:
 			(mat as ShaderMaterial).set_shader_parameter("cu_facet", facet_map)
 	_pending = true                  # re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
+
+## COSMOS TEXTURED-LOD T1b gate surface (G-BD-OFF/TILE): the RAW textured shell shader string (no detail) and the
+## FP_BLOCK_DETAIL-injected result, so the gate can assert byte-identity off and additive-only injection on, with the
+## shader_type count unchanged (zero new compiled programs).
+static func gate_tex_shader_raw(cu: bool) -> String:
+	return _SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER
+static func gate_tex_shader_detail(cu: bool) -> String:
+	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER)
 
 ## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
 ## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).

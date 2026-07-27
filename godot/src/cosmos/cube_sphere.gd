@@ -515,6 +515,23 @@ const FP_BLOCKY_FARRING := false
 ## _emit_blocky emits exactly as today (no UV arrays, byte-identical). Gates G-BT-OFF/UV/NOPROT/BYTES.
 const FP_BLOCKY_TEX := false
 
+## COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R) — the far terrain wears the REAL block-atlas FACES
+## (grass-top / stone speckle / sand grain + a mega-block grid), not just the box-averaged biome COLOUR of the base
+## page. Pure bake+shader (NO mesh/UV change beyond what FP_FACET_TEX already emits): (1) a shared 16-layer×64²
+## Texture2DArray `detail_map` of the SAME BlockTextures.TILES PNG faces the near blocks wear, MEAN-NORMALIZED so its
+## top mips → 0.5 (⇒ far degrades to exactly today's colour map, no distance uniforms) with a baked mega-block grid
+## border, REPEAT wrap, mips on (~0.35 MB, built ONCE, shared by every facet); (2) an `id_map` — a 6×384² L8
+## per-texel material-id page baked alongside the colour page by FacetTexBaker from FarPalette's own biome/water/snow
+## classifier (id 0 = un-baked; texelFetch NEAREST, so its crisp ids never bleed and never touch the colour page's
+## premultiplied-coverage frontier law); (3) the SAME two shell shader strings extended in place (one tile per macro
+## texel: buv = v_uv·384, REPEAT; face_col = col·detail·2.0) — ZERO new shader_type/compiled programs (the detail lines
+## are string-injected only when this flag is on, so the compiled shell count is unchanged). Requires FP_FACET_TEX
+## (orthogonal to geometry — it upgrades the smooth ring, the blocky ring and the L2 tiles alike). Off ⇒ the detail
+## array + id pages are NEVER built and the shader strings are BYTE-IDENTICAL to FP_FACET_TEX (FLAT 6042/0). NEVER-OOM:
+## fixed-size buffers (≈ +2 MB over the FP_FACET_TEX ledger → combined ceiling well under 40 MB). Gate:
+## verify_block_detail.gd (G-BD-OFF/ID/NORM/TILE).
+const FP_BLOCK_DETAIL := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

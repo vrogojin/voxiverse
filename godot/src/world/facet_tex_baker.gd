@@ -53,6 +53,15 @@ var _budget_spent_us := 0            # last update's total bake wall-us (budget 
 var _worst_frame_us := 0             # worst per-update bake wall-us this session (the bounded-cost proof surface)
 var _base_cursor := 0                # global sweep cursor for coverage of facets outside every emit-axis cap
 
+# COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1): the per-texel material-id page(s), baked ALONGSIDE
+# the colour page under FP_BLOCK_DETAIL. 6 face pages of _page² L8 (id 0 = un-baked; id = FarPalette.detail_pattern + 1),
+# texelFetch NEAREST in the shader — a SEPARATE texture from the colour page so the premultiplied-coverage frontier law
+# (_rebuild_texture) stays byte-untouched and a LINEAR colour page never smears ids. All zero / never created off the
+# flag. NEVER-OOM: fixed 6 × _page² L8 (no mips), a fraction of the colour ledger.
+var _bd_on := false                  # FP_BLOCK_DETAIL && the baker exists (set in setup)
+var _id_pages: Array = []            # 6 face Images (L8) — CPU staging + re-blit source for the id map
+var _id_tex: Texture2DArray = null   # the 6-layer GPU id map (bound into the ring's id_map uniform)
+
 # COSMOS LOD-TEXTURE Phase 4 (§1.2 T2t / §6 Phase 4): the CLOSE-UP tier. A second Texture2DArray of CLOSEUP_MAX
 # layers of CLOSEUP_TEXELS², one cap facet per layer, LRU by angular distance to the emit axis. Each promoted facet
 # is baked ROW-SLICED under the shared budget (a 128² one-call bake is ~4 ms — over budget — so it is split into
@@ -105,6 +114,16 @@ func setup(active_fid: int) -> void:
 		img.fill(Color(0.0, 0.0, 0.0, 0.0))
 		_pages[f] = img
 	_base_all = 6 * _k * _k
+	# COSMOS TEXTURED-LOD T1b: allocate the 6 L8 id pages (id 0 everywhere = un-baked). Only under FP_BLOCK_DETAIL →
+	# zero id bytes with the flag off. bake_facet writes each texel's FarPalette.detail_pattern + 1 next to its colour.
+	_bd_on = CubeSphere.FP_BLOCK_DETAIL
+	if _bd_on:
+		FarPalette.ensure_detail_ready()
+		_id_pages.resize(6)
+		for f in range(6):
+			var idimg := Image.create(_page, _page, false, Image.FORMAT_L8)
+			idimg.fill(Color(0.0, 0.0, 0.0, 1.0))    # id 0 = un-baked
+			_id_pages[f] = idimg
 	_ensure_centre_pack()               # one-time centre-dir cache → cheap per-update want/base scans
 	# COSMOS LOD-TEXTURE Phase 4: allocate the CLOSE-UP staging layers (fixed CLOSEUP_MAX × 128² → NEVER-OOM) and
 	# seed the free-layer pool. Only under FP_FACET_TEX_CLOSEUP → zero close-up bytes with the flag off.
@@ -177,6 +196,7 @@ func bake_facet(fid: int) -> void:
 	var ox := a * BASE_TEXELS
 	var oy := b * BASE_TEXELS
 	var inv := 1.0 / float(DOWNS * DOWNS)
+	var idimg: Image = _id_pages[face] if _bd_on else null
 	for ty in range(BASE_TEXELS):
 		for tx in range(BASE_TEXELS):
 			var r := 0.0
@@ -189,7 +209,16 @@ func bake_facet(fid: int) -> void:
 					r += c.r
 					g += c.g
 					bl += c.b
-			img.set_pixel(ox + tx, oy + ty, Color(r * inv, g * inv, bl * inv, 1.0))
+			var avg := Color(r * inv, g * inv, bl * inv, 1.0)
+			img.set_pixel(ox + tx, oy + ty, avg)
+			# COSMOS TEXTURED-LOD T1b: classify this macro texel's material from its STORED (box-averaged) colour — the
+			# same value color_for feeds the ring — and store id = FarPalette.detail_pattern + 1 (0 stays un-baked). A
+			# uniform texel's average IS its exact palette colour (interior exact, G-BD-ID); a boundary picks the nearer
+			# (§2R.6 D4). One classify per stored texel (not per fine sample) keeps the bake unit under G-FT-BUDGET.
+			if _bd_on:
+				var id := FarPalette.detail_pattern(avg) + 1
+				var lv := float(id) / 255.0
+				idimg.set_pixel(ox + tx, oy + ty, Color(lv, lv, lv, 1.0))
 	_baked[fid] = true
 
 ## (Re)generate mipmaps on every page and (re)build the GPU Texture2DArray. Phase 1 builds it once after the
@@ -215,6 +244,22 @@ func _rebuild_texture() -> void:
 	else:
 		for f in range(6):
 			_tex.update_layer(imgs[f], f)
+	_rebuild_id_texture()
+
+## COSMOS TEXTURED-LOD T1b: (re)build the 6-layer L8 id map (NEAREST, no mips, no premultiply — id is not colour). No-op
+## off FP_BLOCK_DETAIL. Built once after the prewarm batch; incremental faces ride _flush_base_uploads' update_layer.
+func _rebuild_id_texture() -> void:
+	if not _bd_on:
+		return
+	var imgs: Array[Image] = []
+	for f in range(6):
+		imgs.append(_id_pages[f])
+	if _id_tex == null:
+		_id_tex = Texture2DArray.new()
+		_id_tex.create_from_images(imgs)
+	else:
+		for f in range(6):
+			_id_tex.update_layer(imgs[f], f)
 
 # --- Phase 2 (progressive base coverage) + Phase 4 (close-up) per-frame driver -------------------
 
@@ -308,6 +353,13 @@ func _flush_base_uploads() -> void:
 		img.premultiply_alpha()
 		img.generate_mipmaps()
 		_tex.update_layer(img, int(face))
+		# COSMOS TEXTURED-LOD T1b: re-upload the same face's id page (baked in lockstep with its colour). Lazily create
+		# the id array on the first flush if the prewarm never ran (mirrors the colour _rebuild_texture fallback above).
+		if _bd_on:
+			if _id_tex == null:
+				_rebuild_id_texture()
+			else:
+				_id_tex.update_layer(_id_pages[int(face)], int(face))
 	_base_dirty.clear()
 
 # --- Phase 4: close-up promotion + row-sliced bake -----------------------------------------------
@@ -534,6 +586,23 @@ func texel_color(fid: int, tx: int, ty: int) -> Color:
 	var img: Image = _pages[int(d[0])]
 	return img.get_pixel(int(d[1]) * BASE_TEXELS + tx, int(d[2]) * BASE_TEXELS + ty)
 
+## COSMOS TEXTURED-LOD T1b: the 6-layer L8 id map bound into the ring's `id_map` uniform (null until the first bake
+## batch / off the flag). Gate + WorldManager surface.
+func id_texture() -> Texture2DArray:
+	return _id_tex
+
+## The stored id (0 = un-baked, else FarPalette.detail_pattern + 1) at facet `fid`'s local texel (tx,ty). Off ⇒ -1.
+## Gate surface for G-BD-ID / G-BD-OFF.
+func id_at(fid: int, tx: int, ty: int) -> int:
+	if not _bd_on:
+		return -1
+	var d := _decode(fid)
+	var img: Image = _id_pages[int(d[0])]
+	return int(round(img.get_pixel(int(d[1]) * BASE_TEXELS + tx, int(d[2]) * BASE_TEXELS + ty).r * 255.0))
+
+func detail_on() -> bool:
+	return _bd_on
+
 func is_baked(fid: int) -> bool:
 	return _baked.has(fid)
 
@@ -620,6 +689,13 @@ func total_bytes() -> int:
 		var cu_cpu := CubeSphere.CLOSEUP_MAX * lpx                 # fixed CLOSEUP_MAX staging layers
 		var cu_gpu := (CubeSphere.CLOSEUP_MAX * lpx * 4) / 3       # GPU array + mip tail (×1.333)
 		total += cu_cpu + cu_gpu
+	# COSMOS TEXTURED-LOD T1b: the id pages (6 × _page² L8, no mips) — CPU staging + GPU array — plus the shared detail
+	# atlas (built by FacetDetailAtlas, counted once here so the ledger is whole). Fixed-size ⇒ NEVER-OOM.
+	if _bd_on:
+		var id_px := _page * _page            # one L8 page, bytes
+		total += 6 * id_px                     # 6 CPU staging id pages
+		total += 6 * id_px                     # 6-layer GPU id array (L8, no mips)
+		total += FacetDetailAtlas.total_bytes()
 	return total
 
 # --- helpers -------------------------------------------------------------------------------------

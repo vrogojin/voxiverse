@@ -371,6 +371,11 @@ func _ready() -> void:
 			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
 			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
 			_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
+			# COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R): bind the shared block-face detail atlas
+			# (built ONCE, pure) + the baker's per-texel id map so the far terrain wears the real block faces. No-op off
+			# FP_BLOCK_DETAIL (set_facet_detail is flag-guarded; the atlas/id pages are never built by the baker either).
+			if CubeSphere.FP_BLOCK_DETAIL:
+				_facet_ring.set_facet_detail(FacetDetailAtlas.build(), _facet_tex.id_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"

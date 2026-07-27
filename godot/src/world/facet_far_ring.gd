@@ -2035,9 +2035,15 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 ## grid cell: a FLAT top at MIN(the 4 corner radii) + a vertical wall on each internal edge (closing the height step —
 ## watertight) + a facet-edge skirt. `pos` already carries the env sink, so the block top (a min of the corners) sits
 ## ≤ the smooth bilinear surface everywhere ⇒ no-protrusion holds a fortiori (G-BLK-RING). The far-ring material is
-## cull_disabled, so wall winding is free. tex-UV mapping is added by the caller's tex branch (v1: vertex-colored).
-## Returns the triangle count. Reads only the passed arrays (thread-safe on the worker, same as _emit_cached).
-func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int) -> int:
+## cull_disabled, so wall winding is free.
+## COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (caller passes tex=true + the facet `fid`) each top quad carries the
+## SAME node-param UVs the smooth _emit_cached path emits — UV = ((a+node_s)/K,(b+node_t)/K), UV2 = (face, slot) — and the
+## walls/skirts INHERIT their top-edge nodes' UVs (a vertical smear of the block's own texel stripe). UVs never move a
+## vertex (no-protrusion unchanged, G-BT-NOPROT). Off (tex=false, the default / the shipped blocky call) ⇒ NO set_uv/set_uv2
+## is issued and the emit is byte-identical to shipped (G-BT-OFF). Returns the triangle count. Reads only the passed arrays
+## (+ fid decode, a pure function) → thread-safe on the worker, same as _emit_cached.
+func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int = -1, tex: bool = false) -> int:
 	var ncell := cells * cells
 	var top_r := PackedFloat32Array(); top_r.resize(ncell)
 	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
@@ -2050,6 +2056,14 @@ func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArra
 			var i0c := gj * stride + gi
 			top_r[gj * cells + gi] = minf(minf(pos[i0c].length(), pos[i0c + 1].length()),
 				minf(pos[i0c + stride].length(), pos[i0c + stride + 1].length()))
+	# COSMOS TEXTURED-LOD T1 (§1.2): decode the facet's tex params ONCE (identical to _emit_cached). node UV for grid node
+	# (ni,nj) = ((a + ni/cells)/K, (b + nj/cells)/K) — the SAME pure function of loop indices the smooth path uses.
+	var fuv2 := Vector2.ZERO; var t_a := 0; var t_b := 0; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		t_a = d[1]; t_b = d[2]
+		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
 	# skirt = one coarse block's radial pitch (the block's own height scale) — facet edges never see through.
 	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
 	var n := 0
@@ -2062,46 +2076,75 @@ func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArra
 			var r: float = top_r[gj * cells + gi]
 			var c: Color = col[i0]
 			var t0 := dirs[i0] * r; var t1 := dirs[i1] * r; var t2 := dirs[i2] * r; var t3 := dirs[i3] * r
-			# FLAT top (2 tris) — all four corners at the same (min) radius.
-			st.set_color(c); st.add_vertex(t0)
-			st.set_color(c); st.add_vertex(t2)
-			st.set_color(c); st.add_vertex(t1)
-			st.set_color(c); st.add_vertex(t1)
-			st.set_color(c); st.add_vertex(t2)
-			st.set_color(c); st.add_vertex(t3)
+			# node-param UVs of this cell's 4 corners (only computed under tex; off ⇒ Vector2.ZERO, never emitted).
+			var uv0 := Vector2.ZERO; var uv1 := Vector2.ZERO; var uv2 := Vector2.ZERO; var uv3 := Vector2.ZERO
+			if tex:
+				var uu0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var uu1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var vv0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var vv1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv0 = Vector2(uu0, vv0); uv1 = Vector2(uu1, vv0)   # i0=(gi,gj)  i1=(gi+1,gj)
+				uv2 = Vector2(uu0, vv1); uv3 = Vector2(uu1, vv1)   # i2=(gi,gj+1) i3=(gi+1,gj+1)
+			# FLAT top (2 tris) — all four corners at the same (min) radius. UVs = each corner's node param.
+			if tex:
+				st.set_uv(uv0); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t0)
+				st.set_uv(uv2); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t2)
+				st.set_uv(uv1); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t1)
+				st.set_uv(uv1); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t1)
+				st.set_uv(uv2); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t2)
+				st.set_uv(uv3); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t3)
+			else:
+				st.set_color(c); st.add_vertex(t0)
+				st.set_color(c); st.add_vertex(t2)
+				st.set_color(c); st.add_vertex(t1)
+				st.set_color(c); st.add_vertex(t1)
+				st.set_color(c); st.add_vertex(t2)
+				st.set_color(c); st.add_vertex(t3)
 			n += 2
 			# +gi internal edge (shared corners i1,i3) — ONE wall per edge, max→min; boundary edge → skirt.
 			if gi + 1 < cells:
 				var rn: float = top_r[gj * cells + gi + 1]
 				if absf(r - rn) > 0.01:
-					n += _emit_wall(st, dirs[i1], dirs[i3], r, rn, c if r >= rn else col[i0 + 1])
+					n += _emit_wall(st, dirs[i1], dirs[i3], r, rn, c if r >= rn else col[i0 + 1], tex, uv1, uv3, fuv2)
 			else:
-				n += _emit_wall(st, dirs[i1], dirs[i3], r, r - skirt, c)
+				n += _emit_wall(st, dirs[i1], dirs[i3], r, r - skirt, c, tex, uv1, uv3, fuv2)
 			# +gj internal edge (shared corners i2,i3).
 			if gj + 1 < cells:
 				var rd: float = top_r[(gj + 1) * cells + gi]
 				if absf(r - rd) > 0.01:
-					n += _emit_wall(st, dirs[i2], dirs[i3], r, rd, c if r >= rd else col[i0 + stride])
+					n += _emit_wall(st, dirs[i2], dirs[i3], r, rd, c if r >= rd else col[i0 + stride], tex, uv2, uv3, fuv2)
 			else:
-				n += _emit_wall(st, dirs[i2], dirs[i3], r, r - skirt, c)
+				n += _emit_wall(st, dirs[i2], dirs[i3], r, r - skirt, c, tex, uv2, uv3, fuv2)
 			# -gi / -gj FACET-boundary skirts (first row/col only) — the outer silhouette against the tier beneath.
 			if gi == 0:
-				n += _emit_wall(st, dirs[i0], dirs[i2], r, r - skirt, c)
+				n += _emit_wall(st, dirs[i0], dirs[i2], r, r - skirt, c, tex, uv0, uv2, fuv2)
 			if gj == 0:
-				n += _emit_wall(st, dirs[i0], dirs[i1], r, r - skirt, c)
+				n += _emit_wall(st, dirs[i0], dirs[i1], r, r - skirt, c, tex, uv0, uv1, fuv2)
 	return n
 
 ## FP_BLOCKY_FARRING: a vertical wall quad between two edge directions from top radius to bottom (2 tris). Material is
 ## cull_disabled so winding is free; emits the higher-block's colour. Caller guarantees a real step (or a skirt).
-func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float, c: Color) -> int:
+## COSMOS TEXTURED-LOD T1 (§1.2): under `tex`, both the top AND bottom vert of each side inherit that side's top-edge node
+## UV (`uva`/`uvb`) — a vertical smear of the top's texel stripe down the wall; UV2 is the facet-constant `fuv2`. Off ⇒ no
+## set_uv/set_uv2 → byte-identical to the shipped wall.
+func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float, c: Color,
+		tex: bool = false, uva: Vector2 = Vector2.ZERO, uvb: Vector2 = Vector2.ZERO, fuv2: Vector2 = Vector2.ZERO) -> int:
 	var hi := maxf(r0, r1); var lo := minf(r0, r1)
 	var a_hi := da * hi; var b_hi := db * hi; var a_lo := da * lo; var b_lo := db * lo
-	st.set_color(c); st.add_vertex(a_hi)
-	st.set_color(c); st.add_vertex(a_lo)
-	st.set_color(c); st.add_vertex(b_hi)
-	st.set_color(c); st.add_vertex(b_hi)
-	st.set_color(c); st.add_vertex(a_lo)
-	st.set_color(c); st.add_vertex(b_lo)
+	if tex:
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_hi)
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_lo)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_hi)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_hi)
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_lo)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_lo)
+	else:
+		st.set_color(c); st.add_vertex(a_hi)
+		st.set_color(c); st.add_vertex(a_lo)
+		st.set_color(c); st.add_vertex(b_hi)
+		st.set_color(c); st.add_vertex(b_hi)
+		st.set_color(c); st.add_vertex(a_lo)
+		st.set_color(c); st.add_vertex(b_lo)
 	return 2
 
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
@@ -2128,8 +2171,11 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var n := 0
 	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
 	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
+	# COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (∧ FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE, i.e. _tex_on()) the blocky
+	# emit ALSO carries the satellite-page node-param UVs so the mega-blocks are textured, not flat-coloured. Off ⇒ tex is
+	# false ⇒ NO UV arrays (byte-identical to shipped blocky). _tex_on() gates FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE.
 	if CubeSphere.FP_BLOCKY_FARRING:
-		return _emit_blocky(st, pos, col, cells, stride)
+		return _emit_blocky(st, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on())
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): decode the facet's texture params ONCE. With the flag off `tex` is false
 	# and the emit runs the shipped set_color/add_vertex sequence VERBATIM (byte-identical, zero overhead).
 	var tex := _tex_on()

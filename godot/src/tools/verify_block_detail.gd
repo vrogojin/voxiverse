@@ -8,8 +8,9 @@ extends SceneTree
 ##               ids ∈ [1, DETAIL_PATTERNS]; an UN-baked facet's id texels are 0.
 ##   G-BD-NORM — every detail layer's per-channel mean ≈ 0.5 (the degradation theorem: top mip ≡ colour map), and the
 ##               RAW (un-normalized) tile mean is NOT 0.5 (the falsifier).
-##   G-BD-TILE — one detail tile per macro texel (DETAIL_PAGE == K·BASE_TEXELS), REPEAT wrap declared, and a baked
-##               darkened mega-block grid border is present in each pattern layer.
+##   G-BD-TILE — one detail tile per macro texel (DETAIL_PAGE == K·BASE_TEXELS), REPEAT wrap declared, and the U0 grid
+##               law (§2U.2): FP_DETAIL_GRID OFF (default) ⇒ NO darkened border ring (border≈interior mean, raw
+##               edge-to-edge tile); FP_DETAIL_GRID ON ⇒ the darkened mega-block grid border IS present in each layer.
 
 const TC := preload("res://src/world/terrain_config.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
@@ -191,10 +192,14 @@ func _gate_tile(fid: int) -> void:
 	_ok(det.contains("repeat_enable"), "G-BD-TILE: detail_map declared REPEAT (per-layer wrap, continuous phase within a face)")
 	_ok(det.contains("v_uv * DETAIL_PAGE"), "G-BD-TILE: detail UV = v_uv · DETAIL_PAGE (block/texel sampling frequency)")
 
-	# A darkened mega-block grid border is baked into each pattern layer: a corner (border) texel is darker than the
-	# layer's interior mean on at least one channel, by more than quantization.
+	# U0 (§2U.2 "no grid"): with FP_DETAIL_GRID FALSE (default) the border ring is NOT painted — border texels equal the
+	# interior stat, no systematic darkening at the tile edge (raw edge-to-edge tile). With FP_DETAIL_GRID TRUE the
+	# historical darkened mega-block grid border IS present (a border texel darker than the interior mean by > quant).
+	var grid := CubeSphere.FP_DETAIL_GRID
 	var worst_layer := -1
-	var min_gap := 1.0
+	var min_gap := 1.0          # smallest interior−border mean across layers
+	var max_gap := 0.0          # largest interior−border mean across layers
+	var worst_max_layer := -1
 	var bw := FacetDetailAtlas.DETAIL_BORDER
 	for layer in range(1, FarPalette.DETAIL_PATTERNS + 1):
 		var img := FacetDetailAtlas.layer_image(layer)
@@ -213,4 +218,15 @@ func _gate_tile(fid: int) -> void:
 		var gap := (iss / float(iin)) - (bs / float(bn))
 		if gap < min_gap:
 			min_gap = gap; worst_layer = layer
-	_ok(min_gap > 0.02, "G-BD-TILE: every pattern layer has a darkened mega-block grid border (worst interior−border mean=%.3f, layer %d)" % [min_gap, worst_layer])
+		if absf(gap) > max_gap:
+			max_gap = absf(gap); worst_max_layer = layer
+	# Measured separation (all 12 pattern layers): grid ON ⇒ every gap POSITIVE and large (min +0.49, border darkened by
+	# BORDER_MUL=0.5); grid OFF ⇒ small SIGNED noise from real tile texture (max |Δ| = 0.117, jungle_leaves). A single
+	# boundary of 0.2 sits cleanly between the two regimes and falsifies either way (grid on with an accidentally-raw
+	# tile would have min_gap ≤ 0.12 < 0.2 ⇒ fail; a stray darkened border with grid off would push |Δ| ≥ 0.49 > 0.2 ⇒ fail).
+	if grid:
+		_ok(min_gap > 0.2, "G-BD-TILE: FP_DETAIL_GRID on ⇒ EVERY pattern layer has a systematically darkened mega-block grid border (worst interior−border mean=%.3f > 0.2, layer %d)" % [min_gap, worst_layer])
+	else:
+		# No border painted ⇒ border and interior are the SAME centred tile; any Δ is just the real texture's edge/interior
+		# variation (small, either sign) — NO systematic darkening at the tile edge, raw edge-to-edge, near-atlas-exact.
+		_ok(max_gap < 0.2, "G-BD-TILE: FP_DETAIL_GRID off (default) ⇒ NO darkened border ring — border≈interior mean (worst |Δ|=%.3f < 0.2, layer %d), raw edge-to-edge tile" % [max_gap, worst_max_layer])

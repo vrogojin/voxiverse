@@ -13,9 +13,12 @@ extends RefCounted
 ## distance uniforms, no branches, per-fragment free. Centring (v − mean + 0.5) preserves the tile's PATTERN at full
 ## contrast (only the brightness is neutralised — the hue comes from the colour page), so the real texture survives.
 ##
-## GRID BORDER (§2R.3). A DETAIL_BORDER-texel darkened ring is baked into every layer BEFORE centring, so a
-## darker-than-mean mega-block grid line reads on every tile and mip-fades on the same schedule as the pattern. On a
-## 26-block backstop cell the texel grid IS the geometry grid, so texture and geometry edges coincide by construction.
+## GRID BORDER (§2R.3, now OPT-IN behind CubeSphere.FP_DETAIL_GRID — §2U.2 live correction 2: "there should be NO grid").
+## Historically a DETAIL_BORDER-texel darkened ring was baked into every layer BEFORE centring, drawing a mega-block grid
+## line on the far terrain. The user rejected drawn grid lines, so by DEFAULT (FP_DETAIL_GRID == false) the tiles are
+## built RAW — the mean-normalized block face edge-to-edge, no border, pixel-exact with the near atlas. When
+## FP_DETAIL_GRID == true the historical ring is restored (toggleable, not deleted): on a 26-block backstop cell the
+## texel grid IS the geometry grid, so texture and geometry edges coincide. _darken_border is a no-op when the flag is off.
 ##
 ## Layer index == the stored id (FarPalette pattern + 1); layer 0 is an unused neutral (id 0 = un-baked, never sampled
 ## — the shader gates detail on mid > 0). Materials with no CC0 tile (water/lava) get a flat-0.5 patterned-border layer
@@ -60,8 +63,8 @@ static func build() -> Texture2DArray:
 	tex.create_from_images(imgs)
 	return tex
 
-## One centred, grid-bordered layer from tile `stem` (or the flat neutral when stem == "" / the PNG is absent). RGBA8,
-## mips generated. Alpha 1 throughout (opaque modulation).
+## One centred layer from tile `stem` (or the flat neutral when stem == "" / the PNG is absent); the darkened grid
+## border is applied only under FP_DETAIL_GRID (raw edge-to-edge by default). RGBA8, mips generated. Alpha 1 throughout.
 static func _build_layer(stem: String) -> Image:
 	if stem == "":
 		return _neutral_layer()
@@ -85,7 +88,8 @@ static func _build_layer(stem: String) -> Image:
 	img.generate_mipmaps()
 	return img
 
-## A flat mid-grey (0.5) layer with the darkened grid border (⇒ face_col = col with a grid line; used for water/lava/pad).
+## A flat mid-grey (0.5) layer (⇒ face_col = col; used for water/lava/pad). The grid border is applied only under
+## FP_DETAIL_GRID (a no-op by default).
 static func _neutral_layer() -> Image:
 	var img := Image.create(DETAIL_TEXELS, DETAIL_TEXELS, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0.5, 0.5, 0.5, 1.0))
@@ -94,8 +98,11 @@ static func _neutral_layer() -> Image:
 	img.generate_mipmaps()
 	return img
 
-## Multiply the outer DETAIL_BORDER-texel ring's RGB by BORDER_MUL (the baked mega-block grid line).
+## Multiply the outer DETAIL_BORDER-texel ring's RGB by BORDER_MUL (the baked mega-block grid line). Gated on
+## CubeSphere.FP_DETAIL_GRID — a NO-OP by default (§2U.2: no grid ⇒ raw edge-to-edge tiles); only paints when opted in.
 static func _darken_border(img: Image) -> void:
+	if not CubeSphere.FP_DETAIL_GRID:
+		return
 	var n := DETAIL_TEXELS
 	for y in range(n):
 		for x in range(n):

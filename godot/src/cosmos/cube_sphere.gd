@@ -532,6 +532,17 @@ const FP_BLOCKY_TEX := false
 ## verify_block_detail.gd (G-BD-OFF/ID/NORM/TILE).
 const FP_BLOCK_DETAIL := false
 
+## COSMOS TEXTURED-LOD U0 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.2 — live correction 2: "there should be NO grid").
+## The original §2R.3 baked a DETAIL_BORDER-texel darkened ring into every FacetDetailAtlas layer, drawing a mega-block
+## grid line on the far terrain. The user rejected drawn grid lines — block structure must come from the real baked
+## block arrangement + geometry, not painted borders. FP_DETAIL_GRID makes that ring OPT-IN: default FALSE ⇒ the detail
+## tiles are built RAW (mean-normalized block face ONLY, edge-to-edge, no darkened border — pixel-exact with the near
+## atlas). TRUE ⇒ the historical §2R.3 grid-border behaviour is preserved (toggleable, not deleted). Only affects the
+## build of the detail atlas; id-page, shader sampling and mean-normalization are unchanged. Requires FP_BLOCK_DETAIL to
+## have any effect (no atlas is built otherwise). Gate: verify_block_detail.gd (G-BD-TILE asserts NO border when false,
+## border-present when true).
+const FP_DETAIL_GRID := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

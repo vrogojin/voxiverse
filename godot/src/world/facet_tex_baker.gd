@@ -99,6 +99,7 @@ var _centre_pack := PackedVector3Array()
 # chunk-row (BAND_SLICE_ROWS) sliced under the shared budget; evicted only on ring exit; a returning facet re-bakes.
 # All zero / never created off FP_BAND_BLOCK_MAP. NEVER-OOM: fixed BAND_LAYERS × BAND_TEXELS² L8 + ONE staging layer.
 var _bm_on := false                  # FP_BAND_BLOCK_MAP && _bd_on && the baker exists (set in setup)
+var _bm_shot := false                # COSMOS TEXTURED-LOD §2V V2: FP_BAND_SHOT && _bm_on ⇒ band is RG8 {id,shade} (real shot incl trees)
 var _bm_texels := 0                  # BAND_TEXELS (512)
 var _bm_tex: Texture2DArray = null   # the BAND_LAYERS-layer GPU band id map (bound into the ring's band_map uniform)
 var _bm_slots: Dictionary = {}       # fid -> layer (RESIDENT: baked + uploaded; the value fed to UV2.y as 64+layer)
@@ -110,7 +111,7 @@ var _bm_want_active := -1            # the active fid the want-set was last comp
 var _bm_bake_fid := -1              # facet whose band bake is in progress (row-sliced across frames); -1 = idle
 var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
 var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
-var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² L8 staging image (id 0 until rows fill in)
+var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² staging image (L8 {id} / RG8 {id,shade} under FP_BAND_SHOT; id 0 until rows fill in)
 var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
 var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
 var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
@@ -196,6 +197,9 @@ func setup(active_fid: int) -> void:
 	# implies _bd_on. Only under FP_BAND_BLOCK_MAP -> zero band bytes with the flag off. Built ONCE (all id 0 -> the shader's
 	# band branch is skipped until a facet is baked resident); a completed bake only does a cheap update_layer.
 	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and _bd_on
+	# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band stores RG8 {block_id, shade} (the real shot incl trees) instead
+	# of L8 {id}. Off ⇒ _bm_shot false ⇒ the L8 format + id-only bake below are BYTE-IDENTICAL to the U1 band.
+	_bm_shot = CubeSphere.FP_BAND_SHOT and _bm_on
 	if _bm_on:
 		_bm_texels = CubeSphere.BAND_TEXELS
 		_bm_facet.resize(CubeSphere.BAND_LAYERS)
@@ -203,7 +207,7 @@ func setup(active_fid: int) -> void:
 		_bm_free.clear()
 		var bimgs: Array[Image] = []
 		for i in range(CubeSphere.BAND_LAYERS):
-			var bimg := Image.create(_bm_texels, _bm_texels, false, Image.FORMAT_L8)
+			var bimg := Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 			bimg.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
 			_bm_facet[i] = Vector2(-1.0, -1.0)
 			_bm_n[i] = Vector2(0.0, 0.0)
@@ -809,8 +813,8 @@ func _begin_band_bake(fid: int) -> bool:
 	_bm_bake_fid = fid
 	_bm_bake_layer = layer
 	_bm_bake_row = 0
-	var img: Image = Image.create(_bm_texels, _bm_texels, false, Image.FORMAT_L8)
-	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in
+	var img: Image = Image.create(_bm_texels, _bm_texels, false, _band_img_format())
+	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in (RG8 under shot: shade 0 too, unread while id 0)
 	_bm_bake_img = img
 	_bm_bake_lc.resize(4)
 	for ci in range(4):
@@ -843,31 +847,57 @@ func _bm_compute_slice() -> void:
 	var r1 := mini(r0 + CubeSphere.BAND_SLICE_ROWS, ny)
 	var rows := r1 - r0
 	var lc := _bm_bake_lc
-	var packed := PackedInt64Array()
-	packed.resize(rows * nx)
-	for rj in range(rows):
-		var by := r0 + rj
-		var t := (float(by) + 0.5) / float(ny)
-		var base := rj * nx
-		for bx in range(nx):
-			var s := (float(bx) + 0.5) / float(nx)
-			var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
-			var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
-			packed[base + bx] = _pack_xz(int(round(lx)), int(round(lz)))
-	var res: Dictionary = _sampler.call(_bm_bake_fid, packed)
-	var cols: PackedColorArray = res["colors"]
-	var img: Image = _bm_bake_img
-	for rj in range(rows):
-		var by := r0 + rj
-		var base := rj * nx
-		for bx in range(nx):
-			var id := FarPalette.detail_pattern(cols[base + bx]) + 1
-			var lv := float(id) / 255.0
-			img.set_pixel(bx, by, Color(lv, lv, lv, 1.0))
+	if _bm_shot:
+		# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): write the REAL top-down SHOT — R = surface_shot.block_id (the exposed
+		# top block INCLUDING TreeGen decorations, so a tree column reads its canopy id, not the terrain beneath), G = the
+		# sun-independent analytic shade byte. One SurfaceShot.surface_shot call per column (pure + facet-scoped via a fresh
+		# per-slice GenCtx so terrain + trees resolve on THIS facet — no _active_facet read on the worker). The C++ sampler
+		# is not consulted: surface_shot IS the id/tree derivation (no re-derivation here). Memo bounded to this slice.
+		_bm_compute_slice_shot(r0, r1, nx, ny, lc)
+	else:
+		var packed := PackedInt64Array()
+		packed.resize(rows * nx)
+		for rj in range(rows):
+			var by := r0 + rj
+			var t := (float(by) + 0.5) / float(ny)
+			var base := rj * nx
+			for bx in range(nx):
+				var s := (float(bx) + 0.5) / float(nx)
+				var lx := _bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)
+				var lz := _bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)
+				packed[base + bx] = _pack_xz(int(round(lx)), int(round(lz)))
+		var res: Dictionary = _sampler.call(_bm_bake_fid, packed)
+		var cols: PackedColorArray = res["colors"]
+		var img: Image = _bm_bake_img
+		for rj in range(rows):
+			var by := r0 + rj
+			var base := rj * nx
+			for bx in range(nx):
+				var id := FarPalette.detail_pattern(cols[base + bx]) + 1
+				var lv := float(id) / 255.0
+				img.set_pixel(bx, by, Color(lv, lv, lv, 1.0))
 	_bm_bake_row = r1
 	if r1 < ny:
 		return                              # more slices next update
 	_bm_last_done = true
+
+## COSMOS TEXTURED-LOD §2V V2 worker-safe SHOT compute for rows [r0,r1): each column's REAL top-down record from
+## SurfaceShot.surface_shot (block_id incl trees + sun-independent shade) into the RG8 staging layer (R=id, G=shade).
+## A FRESH per-slice GenCtx homes every terrain/tree query on _bm_bake_fid (a captured facet VALUE — never the mutable
+## _active_facet global) so the worker is race-free; its memo is bounded to this slice and released on return.
+func _bm_compute_slice_shot(r0: int, r1: int, nx: int, ny: int, lc: PackedVector2Array) -> void:
+	var fid := _bm_bake_fid
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var img: Image = _bm_bake_img
+	for by in range(r0, r1):
+		var t := (float(by) + 0.5) / float(ny)
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			var rec := SurfaceShot.surface_shot(fid, lx, lz, ctx)
+			var idv := float(int(rec["block_id"])) / 255.0
+			img.set_pixel(bx, by, Color(idv, float(rec["shade"]), 0.0, 1.0))
 
 ## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
 ## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch
@@ -1071,6 +1101,23 @@ func band_id_at(fid: int, bx: int, by: int) -> int:
 		return -1
 	return int(round(_bm_active_img.get_pixel(bx, by).r * 255.0))
 
+## COSMOS TEXTURED-LOD §2V V2: the stored SHOT shade byte (G channel of the RG8 band) ∈ [0,1] at the ACTIVE band facet's
+## block (bx,by), or −1.0 off FP_BAND_SHOT / non-active / out of range. Gate surface for G-VS-SHOT (the shade round-trips).
+func band_shade_at(fid: int, bx: int, by: int) -> float:
+	if not _bm_shot or fid != _bm_active_fid or _bm_active_img == null:
+		return -1.0
+	if bx < 0 or by < 0 or bx >= _bm_texels or by >= _bm_texels:
+		return -1.0
+	return _bm_active_img.get_pixel(bx, by).g
+
+## COSMOS TEXTURED-LOD §2V V2: is the band a REAL SHOT (RG8 {id,shade} incl trees) rather than the U1 L8 {id} map?
+func band_shot_on() -> bool:
+	return _bm_shot
+
+## The band staging / GPU layer format: RG8 {id, shade} under FP_BAND_SHOT (the real shot, §2V), else L8 {id} (U1 band).
+func _band_img_format() -> int:
+	return Image.FORMAT_RG8 if _bm_shot else Image.FORMAT_L8
+
 func worst_frame_ms() -> float:
 	return float(_worst_frame_us) / 1000.0
 
@@ -1144,8 +1191,9 @@ func total_bytes() -> int:
 	# COSMOS TEXTURED-LOD U1 (§2U.4): the band id map — BAND_LAYERS × BAND_TEXELS² L8 GPU array (2.36 MB, no mips) + ONE
 	# CPU staging image (the in-progress bake; row-sliced facets return re-bake from the generator, no per-facet CPU store).
 	if _bm_on:
-		var bm_px := _bm_texels * _bm_texels          # one L8 band layer, bytes
-		total += CubeSphere.BAND_LAYERS * bm_px        # BAND_LAYERS-layer GPU array (L8, no mips)
+		var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 {id,shade} shot = 2 B/block; U1 L8 {id} = 1 B/block
+		var bm_px := _bm_texels * _bm_texels * bpp     # one band layer, bytes
+		total += CubeSphere.BAND_LAYERS * bm_px        # BAND_LAYERS-layer GPU array (no mips)
 		total += bm_px                                 # ONE CPU staging image (the active in-progress bake)
 	return total
 
@@ -1154,7 +1202,8 @@ func total_bytes() -> int:
 func band_bytes() -> int:
 	if not _bm_on:
 		return 0
-	var bm_px := _bm_texels * _bm_texels
+	var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 shot = 2 B/block; U1 L8 = 1 B/block
+	var bm_px := _bm_texels * _bm_texels * bpp
 	return CubeSphere.BAND_LAYERS * bm_px + bm_px
 
 # --- helpers -------------------------------------------------------------------------------------

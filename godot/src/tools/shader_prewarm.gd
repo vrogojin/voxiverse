@@ -81,6 +81,10 @@ const WARMUP_FRAMES := 12
 ##     (their vertex format is already warmed by the grid pile).
 const TERRAIN_MIN_HOLD_SEC := 1.5      # floor: minimum module-build hold, so the near view meshes+compiles hidden
 const TERRAIN_MAX_WAIT_SEC := 4.0      # cap: lift even if is_area_meshed never confirms — never hang the loader
+## FP_LOAD_RAMP (perf/voxiverse-load-profile): with the initial view ramping in over RAMP_SECONDS, the essential-ready
+## hold waits on a wider ~96³ surround (WorldManager.initial_view_meshed), which takes longer to mesh than the 40³
+## bubble — so give the [floor, cap] window more headroom while STILL bounding it (never hang). Used only under the flag.
+const LOAD_RAMP_MAX_WAIT_SEC := 8.0
 
 ## Warm-up cube edge length (m). Small so the whole superset fits inside the frustum
 ## a couple of metres ahead of the camera.
@@ -237,7 +241,9 @@ func _process(delta: float) -> void:
 	var meshed := true
 	if _watch_world.has_method("initial_view_meshed"):
 		meshed = bool(_watch_world.call("initial_view_meshed", _warm_center))
-	if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) or _wait_time >= TERRAIN_MAX_WAIT_SEC:
+	# FP_LOAD_RAMP: wider essential surround → a larger cap so the ~96³ box has time to mesh (still bounded).
+	var max_wait := LOAD_RAMP_MAX_WAIT_SEC if CubeSphere.FP_LOAD_RAMP else TERRAIN_MAX_WAIT_SEC
+	if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) or _wait_time >= max_wait:
 		_finish()
 
 ## Free (and detach) the warm-up meshes. Detaching via remove_child makes the child

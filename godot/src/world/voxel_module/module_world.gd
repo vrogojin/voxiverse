@@ -357,8 +357,14 @@ func setup() -> bool:
 	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
 	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
 	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): start the FIRST cold load SMALL (RAMP_START_BLOCKS) and grow to
+	# the full radius over RAMP_SECONDS — the same load-shaping the post-flip restream ramp already does — so the
+	# initial disk is not requested in one 2.6k-block burst behind a 4 s overlay. Off ⇒ the shipped full-radius slam.
+	var _initial_view := TerrainConfig.near_render_radius()
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		_initial_view = int(minf(RAMP_START_BLOCKS, float(_initial_view)))
 	_set_if(_terrain, "max_view_distance",
-		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else TerrainConfig.near_render_radius())
+		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else _initial_view)
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -390,7 +396,21 @@ func setup() -> bool:
 		add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
 	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
-	set_process(false)
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): ramp the FIRST load in too. Reuse the EXACT existing mechanism:
+	#   * pool path (FP_M1_POOL) — the active slot was seeded ramping in _pool_init_active (view_f = RAMP_START,
+	#     view_target = full); kick per-frame processing so _ramp_pool_step grows it (active wins the grow channel).
+	#   * single-terrain path — arm the same _ramp_active leg restream() uses (RAMP_START → near_render_radius()).
+	# Off ⇒ set_process(false), the shipped idle-until-restream behaviour (byte-identical).
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		if CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
+			_pool_ramp_kick()
+		else:
+			_ramp_target = float(TerrainConfig.near_render_radius())
+			_ramp_view = RAMP_START_BLOCKS
+			_ramp_active = _ramp_target > RAMP_START_BLOCKS
+			set_process(_ramp_active)
+	else:
+		set_process(false)
 	return true
 
 ## COSMOS Stage 4 — drive the post-flip view-distance ramp. Grows the fresh terrain's max_view_distance
@@ -1886,12 +1906,20 @@ func _pool_init_active() -> void:
 	_planet_root.add_child(slot)
 	slot.add_child(_terrain)
 	var arv := TerrainConfig.near_render_radius()
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): seed the active slot RAMPING from RAMP_START_BLOCKS (the terrain's
+	# max_view_distance was set to the same start in setup) so _ramp_pool_step grows it to the full radius over
+	# RAMP_SECONDS on the first load — instead of the shipped slam (view_f == view_target == full, "NO ramp"). The
+	# final view is unchanged (view_target stays arv). Off ⇒ start == arv ⇒ the exact shipped no-ramp seed (byte-identical).
+	var _av_start := float(arv)
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		_av_start = minf(RAMP_START_BLOCKS, float(arv))
 	_pool[_pool_active] = {
 		"terrain": _terrain, "slot": slot, "mesher": _mesher, "generator": _generator,
-		"spawn_ms": Time.get_ticks_msec(), "view": arv,
+		"spawn_ms": Time.get_ticks_msec(), "view": int(_av_start),
 		"editable": true, "fid": _pool_active,
-		# Active at init keeps its already-set full near view — NO ramp (target == current). (§5)
-		"view_f": float(arv), "view_target": float(arv), "ramp_from": float(arv),
+		# Active at init keeps its already-set full near view — NO ramp (target == current) — UNLESS FP_LOAD_RAMP
+		# ramps the first load (view_f = RAMP_START, view_target = full). (§5)
+		"view_f": _av_start, "view_target": float(arv), "ramp_from": _av_start,
 	}
 
 ## Spawn a render-only neighbour terrain for facet `fid` (view 96). Enforces the caps: FP_M1_POOL on, faceted, a

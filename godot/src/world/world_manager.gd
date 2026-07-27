@@ -934,7 +934,12 @@ func update_streaming(player_pos: Vector3) -> void:
 ## so no extra hold is needed). Half-extents cover the near, always-first-to-mesh view.
 func initial_view_meshed(center: Vector3) -> bool:
 	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
-		return bool(_module_world.call("area_meshed", center, Vector3(40.0, 32.0, 40.0)))
+		# FP_LOAD_RAMP (perf/voxiverse-load-profile): with the initial view ramping in, hold the splash until a
+		# MODEST surround (LOAD_RAMP_ESSENTIAL_HALF ≈ 96) is meshed rather than a bare 40-block bubble — so
+		# "playable" means actually-surrounded. The ShaderPrewarm [floor, cap] window still bounds the wait
+		# (never hangs). Off ⇒ the shipped 40³ box (byte-identical).
+		var half := Vector3(96.0, 32.0, 96.0) if CubeSphere.FP_LOAD_RAMP else Vector3(40.0, 32.0, 40.0)
+		return bool(_module_world.call("area_meshed", center, half))
 	return true                                     # fallback path / no module → no terrain-format hold
 
 ## BOOT-LOAD PROFILE (perf/voxiverse-load-profile): read-only "is this arbitrary box meshed?" accessor used by

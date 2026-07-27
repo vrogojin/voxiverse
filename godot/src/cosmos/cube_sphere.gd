@@ -700,6 +700,22 @@ const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hyste
 const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
 const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
 
+## INITIAL-LOAD VIEW RAMP (perf/voxiverse-load-profile) — FP_LOAD_RAMP. Symptom: the FIRST cold load slams the near
+## VoxelTerrain's max_view_distance to the full near radius (near_render_radius(): 256 flat / 128 faceted) in ONE
+## step at module setup — both on the single-terrain path (module_world.setup → _set_if max_view_distance) AND the
+## FP_M1_POOL active-slot init (_pool_init_active seeds view_f == view_target == full, "NO ramp"). godot_voxel then
+## queues the WHOLE view sphere (~2.6k blocks flat) in a single pass; the ShaderPrewarm overlay only holds ≤4 s and
+## only waits on a tiny 40³ box, so the splash lifts while the bulk of the disk is still generating — the multi-minute
+## post-splash fill. When ON, the FIRST load starts at the EXISTING module_world.RAMP_START_BLOCKS (48) and grows to
+## the full target over RAMP_SECONDS (1.5 s) using the EXACT same ramp the post-flip restream / neighbour-pool spawns
+## already use (single-terrain _ramp_active leg, or the active pool slot via _ramp_pool_step) — the nearest ring meshes
+## first (playable in seconds), worker load spreads across frames instead of a one-pass burst, and the far ring covers
+## the rim until it fills. The final view is IDENTICAL — pure load-shaping. It ALSO widens the ShaderPrewarm essential-
+## ready hold from a 40³ box to ~96³ (LOAD_RAMP_ESSENTIAL_HALF) with a longer [floor, cap] window so "playable" means
+## actually-surrounded, not a 40-block bubble. Default OFF ⇒ the shipped one-pass slam verbatim (byte-identical; FLAT
+## stays 6042/0). Flip ON at export after the live world_settled A/B (perf/voxiverse-load-profile instrumentation).
+const FP_LOAD_RAMP := false
+
 ## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
 ## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
 ## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and

@@ -632,6 +632,21 @@ const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up
 const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
 const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
 
+## COSMOS TEXTURED-LOD V4 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.2/§2V.5: FP_SKIN_SSE) — the screen-space MONOTONE skin
+## promotion law. Bug 1 (the descent flat-color drop): fidelity is keyed to the flight REGIME today, so crossing into the
+## surface regime fires FacetTexBaker._evict_all_closeup — dumping every close-up promotion at the exact moment of descent —
+## leaving only the 26-blk biome-color base until the near band warms (non-monotone by construction). The fix RETIRES the
+## regime evict-all and drives BOTH the close-up and band want-sets by each facet's on-screen block size instead: a facet is
+## promoted base→close-up→band as its per-facet camera distance shrinks past CLOSEUP_FAR then CLOSEUP_NEAR (blocks approach
+## ~2 px), NEAREST/largest-deficit first, under the shipped bake budget, with SSE_HYST hysteresis. Distance shrinking during
+## a descent ⇒ resolved level non-decreasing until the near mesh takes over: MONOTONE by construction (gate G-VD-MONO). This
+## ABSORBS stage T2 (FP_FACET_TEX_SURF): band membership generalizes from "ring-1 on surface" to "screen-space demands it".
+## Default OFF ⇒ update() runs the shipped regime-keyed path byte-for-byte (evict-all intact) ⇒ FLAT 6042/0. Format-agnostic:
+## a promotion-law change only — it works DEGRADED against the current page/band formats and lands full effect after V2+V3.
+## Zero added bytes (reuses the CLOSEUP/BAND layer pools). Gates: G-VD-MONO (monotone descent), G-VD-BUDGET, G-VD-OFF.
+const FP_SKIN_SSE := false
+const SSE_HYST := 1.25                    # release-distance factor: a resident tier is only demoted past promote·SSE_HYST (no boundary churn)
+
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
 ## SELECTOR (§6.1/§6.3): LOD_TAU_PX — the screen-space-error threshold (px per megablock, desired ℓ = largest with

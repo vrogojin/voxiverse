@@ -658,6 +658,18 @@ const CTRL_CREDIT_AI := 0.1
 const CTRL_PROMOTE_CREDIT := 0.5
 const OFFSURFACE_Y := 256.0
 
+## COSMOS MAIN-THREAD ORCHESTRATION TH0 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §6) — the priority
+## JOB LANE foundation for the pilot's "the main thread deals ONLY with the orchestration of other threads"
+## directive. When true, WorldManager constructs ONE `JobLane` (godot/src/world/job_lane.gd) and pumps it
+## each frame; the lane multiplexes future offloaded COMPUTE (TH1 tex bake, TH2 far-ring warm, TH3 manifest,
+## TH4 skin/snow) onto the EXISTING WorkerThreadPool (≤2 slots, NEVER a new thread — the pool is fixed at 16
+## and ledgered at 15) and pays only a bounded main-thread commit per frame, drained highest-priority-first so
+## bulk work can't starve a crossing-critical rebuild. TH0 is INFRASTRUCTURE ONLY: the lane + the
+## `main_commit_ms` telemetry counter exist, but NOTHING is routed through it yet (TH1+ move the subsystems),
+## so ON changes nothing observable but the added telemetry field. Default OFF ⇒ BYTE-IDENTICAL: the lane is
+## never constructed, never pumped, and `main_commit_ms` reports 0.0. Truth gate: src/tools/verify_job_lane.gd.
+const FP_JOB_LANE := false
+
 ## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
 ## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
 ## are floored to, so COVERAGE relief flows even at credit 0 (§P3a/§P3c); a relief-only candidate restriction keeps it

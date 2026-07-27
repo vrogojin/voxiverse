@@ -162,6 +162,11 @@ var _weather: WeatherSystem
 # is built on the main thread, the sweep is handed to this worker (EnvSimWorker) so the per-frame main-thread
 # cost collapses to a swap check. Stopped/joined in _exit_tree (no dangling thread on scene exit).
 var _weather_worker: EnvSimWorker = null
+# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): the ONE priority job lane every future offload dispatches
+# COMPUTE through (onto the existing WorkerThreadPool, no new thread) and gets a bounded main-thread commit back.
+# Constructed + pumped ONLY under the flag; null ⇒ the shipped main-thread path, byte-identical. TH0 routes
+# NOTHING through it yet — it is the infrastructure TH1+ build on. `main_commit_ms` telemetry reads its drain time.
+var _job_lane: JobLane = null
 var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
@@ -316,6 +321,14 @@ func _ready() -> void:
 	# path-agnostic. It is created here but stays inert until the player reports a position (see _process).
 	_snowfall = SnowfallSystem.new()
 	_snowfall.setup(self)
+
+	# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): construct the priority job lane (SnowfallSystem-style —
+	# ONLY under the flag, so off ⇒ the class is not even instantiated ⇒ zero bytes / zero CPU, byte-identical).
+	# It dispatches onto the EXISTING WorkerThreadPool (≤2 slots, no new thread) and is pumped each frame from
+	# _process. TH0 routes NOTHING through it yet; it is the foundation TH1+ (tex bake / far-ring warm / manifest)
+	# hand their compute to. `main_commit_ms` telemetry reads its bounded main-thread drain time.
+	if CubeSphere.FP_JOB_LANE:
+		_job_lane = JobLane.new()
 
 	# COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1.5): the ONE coarse prognostic weather grid.
 	# Owned + stepped here exactly like SnowfallSystem (SnowfallSystem-style: constructed ONLY under the flag,
@@ -550,6 +563,11 @@ func _process(delta: float) -> void:
 		else:
 			_weather.process(delta, gt)
 		_weather_us_max = maxi(_weather_us_max, Time.get_ticks_usec() - t_w)
+	# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): pump the job lane once per frame — reap finished workers,
+	# pay the bounded main-thread commit (its own drain-time telemetry), refill worker slots highest-priority-first.
+	# TH0 nothing is enqueued, so this is a no-op walk of empty queues; the flag-off path skips it entirely (null).
+	if _job_lane != null:
+		_job_lane.pump()
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
 	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
@@ -2757,6 +2775,10 @@ func take_perf_attrib() -> Dictionary:
 	var out := {
 		"snow_ms": snappedf(float(_snow_us_max) / 1000.0, 0.01),
 		"ctrl_ms": snappedf(float(_ctrl_us_max) / 1000.0, 0.01),
+		# COSMOS MAIN-THREAD ORCHESTRATION TH0: the job lane's bounded MAIN-THREAD commit/drain time this window
+		# (0.0 with the flag off / no lane). This is the number that must DROP as TH1+ move compute off main —
+		# it isolates the main-thread commit cost from the worker compute (which no longer sits on the frame).
+		"main_commit_ms": snappedf(_job_lane.take_main_commit_ms() if _job_lane != null else 0.0, 0.01),
 	}
 	_snow_us_max = 0
 	_ctrl_us_max = 0

@@ -566,6 +566,27 @@ const BAND_LAYERS := 9                     # band residency = active + ring-1 (�
 const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
 const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
 
+## COSMOS TEXTURED-LOD U2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3a: cull, don't sink). Today the
+## backstop facets (active ∪ live-pool, drawn at BACKSTOP_CELLS) are emitted UNDER the near voxels — the sink hides the
+## coexistence, but far land pokes through / shows under near where the two overlap (the user's #72). This flag STOPS
+## emitting a backstop far-ring CELL (26-block, BACKSTOP_CELLS granularity) once the near voxel field FULLY covers its
+## footprint, so near and far never coexist there at all — no z-fight, no poke-through, no see-under. Coverage is the
+## ALREADY-SHIPPED near-mesh signal: the skin's (fid, fid-lattice AABB) → module_world.skin_near_meshed callable
+## (godot_voxel is_area_meshed). Seam-safety is an ASYMMETRIC hysteresis (the whole point): a cell needs CULL_CONFIRM=2
+## consecutive COVERED reads to CULL, but un-culls INSTANTLY on the first UNcovered read, and the probe uses a
+## +CULL_DILATE=32-block DILATED AABB so a cell begins re-emitting while the surrounding near mesh still covers it — the
+## re-emit wins the race against the paced near-shrink (slower than the CULL_REAP_MS=100 probe cadence). Holes are worse
+## than overdraw, so every ambiguity resolves toward DRAWING (gate G-CV-SAFE proves culled ⊆ covered every step). On the
+## GDScript / non-module path the coverage callable is invalid ⇒ "never covered" ⇒ cull is inert (today's behaviour).
+## Off ⇒ no cell is ever suppressed, no coverage probe runs, no cull state is allocated → FLAT byte-identical (6042/0).
+## Gate: verify_cull_covered.gd (G-CV-SAFE / G-CV-REAPPEAR / G-CV-CHURN). NEVER-OOM: ≤256-cell byte masks × backstop
+## facets (≤ ~16, pruned to the live backstop set each probe) ⇒ a few KB, bounded, no growth with walk distance.
+const FP_FARRING_CULL_COVERED := false
+const CULL_CONFIRM := 2                     # asymmetric hysteresis: 2 consecutive COVERED reads to CULL (churn guard)
+const CULL_DILATE := 32.0                   # blocks the coverage-probe AABB is dilated by (re-emit before near retreats)
+const CULL_Y_MARGIN := 40.0                 # radial half-band of the probe AABB around the cell top (mirrors skin COVER_Y_MARGIN)
+const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches skin REAP_INTERVAL_MS; slower near-shrink wins the race)
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

@@ -113,6 +113,19 @@ var _sticky_hold: Dictionary = {}    # fid -> int (role-events left before this 
 # mesh — the make-before-break invariant is "every pool facet is an emitted backstop at the moment near meshes apply",
 # and that is a property of the LAST rebuild's roles, not the live `_is_backstop`. Recorded at each rebuild/swap.
 var _emitted_backstop: Dictionary = {}   # fid -> true (drawn sunk in the committed mesh)
+# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3): the per-cell occlusion-cull state. `_cull_cover_query` is
+# the near-coverage callable (fid, fid-lattice AABB) -> bool, routed to module_world.skin_near_meshed; INVALID (no
+# module / fallback path) ⇒ cull inert (byte-identical). `_cull_mask` is fid -> PackedByteArray(BACKSTOP_CELLS²): 1 =
+# this 26-block cell is CONFIRMED covered by the near field and NOT emitted. `_cull_streak` is the matching per-cell
+# count of CONSECUTIVE covered reads (the CULL_CONFIRM=2 hysteresis); reset to 0 (and the mask bit cleared) INSTANTLY
+# on the first uncovered read. Pruned to the live backstop set each probe ⇒ ≤ ~16 × 256 B, bounded (NEVER-OOM). All
+# empty / never read with the flag off. `_cull_changed` latches a mask flip so `_process` re-emits; `_cull_last_ms`
+# throttles the probe to the CULL_REAP_MS cadence.
+var _cull_cover_query: Callable = Callable()
+var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): 1 = culled (confirmed covered)
+var _cull_streak: Dictionary = {}        # fid -> PackedByteArray(BACKSTOP_CELLS²): consecutive covered-read count
+var _cull_changed := false               # a mask bit flipped since the last rebuild → _process re-emits
+var _cull_last_ms := 0                   # throttle clock for the coverage re-probe (CULL_REAP_MS)
 # COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
 # (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
 # per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
@@ -558,6 +571,11 @@ func set_pool_excluded(fids: Array) -> void:
 ## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
+	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
+	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
+	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
+	# so THIS frame's rebuild honours the fresh mask.
+	_cull_update()
 	# FP_BOOT_ASYNC: while the initial hemisphere cache is still filling, warm the next budgeted batch + progressive re-emit,
 	# then return — the boot warm owns the ring until the front is fully cached (it then restores the shipped paths below).
 	# A crossing during boot-warm still renders: set_active re-places the absolute mesh rigidly; its deferred exclusion
@@ -1134,6 +1152,121 @@ func _emit_dense(fid: int) -> bool:
 ## class). Off / not promoted ⇒ false.
 func _is_mid_dense(fid: int) -> bool:
 	return _mid_dense.has(fid) and not _is_backstop(fid)
+
+# --- COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3): occlusion-cull covered backstop cells -------------------
+
+## Wire the near-coverage callable (fid, fid-lattice AABB) -> bool — the SAME signal the skin's covered-tile skip uses,
+## routed by WorldManager to module_world.skin_near_meshed (godot_voxel is_area_meshed). An INVALID callable (no module /
+## GDScript fallback path) leaves the cull inert ("never covered" ⇒ nothing culled) — the design's disclosed fallback.
+func set_cover_query(q: Callable) -> void:
+	_cull_cover_query = q
+
+## Is the U2 cull active this run? Requires the flag AND a valid coverage callable (module path). Off / no query ⇒ no
+## cell is ever suppressed and no state is allocated → byte-identical.
+func _cull_on() -> bool:
+	return CubeSphere.FP_FARRING_CULL_COVERED and _cull_cover_query.is_valid()
+
+## THE ASYMMETRIC-HYSTERESIS STATE MACHINE (headlessly testable — the gate drives it with mocked booleans). Advance cell
+## `ci` of facet `fid` by ONE coverage read `covered`. Culling requires CULL_CONFIRM consecutive COVERED reads; un-culling
+## is INSTANT on the first UNcovered read (streak → 0, mask bit cleared). Returns the new culled bit. Latches `_cull_changed`
+## on any flip so `_process` re-emits. Holes are worse than overdraw, so every ambiguity resolves toward DRAWING.
+## INVARIANT (G-CV-SAFE): the returned bit is 1 ⇒ the LAST read was covered ⇒ culled ⊆ covered, ALWAYS.
+func cull_feed(fid: int, ci: int, covered: bool) -> bool:
+	var ncell := CubeSphere.BACKSTOP_CELLS * CubeSphere.BACKSTOP_CELLS
+	if ci < 0 or ci >= ncell:
+		return false
+	var mask: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+	var streak: PackedByteArray = _cull_streak.get(fid, PackedByteArray())
+	if mask.size() != ncell:
+		mask = PackedByteArray(); mask.resize(ncell)   # zero-filled: nothing culled
+		streak = PackedByteArray(); streak.resize(ncell)
+	var was: int = mask[ci]
+	if covered:
+		var s: int = streak[ci]
+		if s < CubeSphere.CULL_CONFIRM:
+			s += 1
+		streak[ci] = s
+		mask[ci] = 1 if s >= CubeSphere.CULL_CONFIRM else 0
+	else:
+		streak[ci] = 0
+		mask[ci] = 0                                     # INSTANT un-cull — the first uncovered read always draws
+	if mask[ci] != was:
+		_cull_changed = true
+	_cull_mask[fid] = mask
+	_cull_streak[fid] = streak
+	return mask[ci] == 1
+
+## Emit-time read: is facet `fid`'s cell `ci` currently CONFIRMED covered (⇒ suppress it)? False unless the cull is active
+## and this fid carries a mask (a live backstop facet in range). Pure lookup, no probe — the mask is refreshed by `_cull_probe`.
+func is_cell_culled(fid: int, ci: int) -> bool:
+	if not _cull_on():
+		return false
+	var mask: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+	return ci >= 0 and ci < mask.size() and mask[ci] == 1
+
+## The fid-lattice AABB the coverage probe asks about for backstop cell (gi,gj), DILATED by ±CULL_DILATE horizontally and
+## banded by ±CULL_Y_MARGIN radially. Built from the cell's 4 dense-cache corner positions (ABSOLUTE world) mapped back to
+## the facet's own lattice via FacetAtlas.world_to_lattice64 — the SAME frame godot_voxel's is_area_meshed operates in (as
+## skin_near_meshed documents), so no new remap is introduced. Dilation makes the probed box a SUPERSET of the visible
+## cell ⇒ is_area_meshed (which is true only when the WHOLE box is meshed) gets STRICTER, i.e. cull is harder / safer, and
+## the box uncovers at its dilated boundary while the tight cell is still covered → the cell re-emits before near retreats.
+func _cull_cell_aabb(fid: int, gi: int, gj: int) -> AABB:
+	var pos: PackedVector3Array = _bpos_cache[fid]
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var i0 := gj * stride + gi
+	var idx := [i0, i0 + 1, i0 + stride, i0 + stride + 1]
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for k in idx:
+		var p: Vector3 = pos[k]
+		var l: Array = FacetAtlas.world_to_lattice64(fid, p.x, p.y, p.z)
+		var lx := float(l[0]); var ly := float(l[1]); var lz := float(l[2])
+		lo.x = minf(lo.x, lx); lo.y = minf(lo.y, ly); lo.z = minf(lo.z, lz)
+		hi.x = maxf(hi.x, lx); hi.y = maxf(hi.y, ly); hi.z = maxf(hi.z, lz)
+	var d := CubeSphere.CULL_DILATE
+	var ym := CubeSphere.CULL_Y_MARGIN
+	var pos_lo := Vector3(lo.x - d, lo.y - ym, lo.z - d)
+	var size := Vector3((hi.x - lo.x) + 2.0 * d, (hi.y - lo.y) + 2.0 * ym, (hi.z - lo.z) + 2.0 * d)
+	return AABB(pos_lo, size)
+
+## Probe cell (gi,gj) of backstop facet `fid`: ask the near-coverage callable whether the dilated fid-lattice AABB is fully
+## meshed. False on an invalid callable (fallback path) — never over-cull. Main thread only (reads the live _bpos_cache).
+func _cull_probe_cell(fid: int, gi: int, gj: int) -> bool:
+	if not _cull_cover_query.is_valid():
+		return false
+	return bool(_cull_cover_query.call(fid, _cull_cell_aabb(fid, gi, gj)))
+
+## Per-frame (from `_process`, throttled to CULL_REAP_MS): re-probe every cell of every LIVE backstop facet whose dense cache
+## exists, advancing the hysteresis state machine. Prunes `_cull_mask`/`_cull_streak` to the current backstop set (NEVER-OOM),
+## and latches a re-emit (`_pending`) when any cell's culled bit flipped. No-op unless the cull is active. Cheap-boolean
+## octree reads only (the skin already pays this class of cost live); returns immediately while the cull is off.
+func _cull_update() -> void:
+	if not _cull_on():
+		if not _cull_mask.is_empty():
+			_cull_mask.clear(); _cull_streak.clear()   # flag flipped off mid-run — drop all state
+		return
+	var now := Time.get_ticks_msec()
+	if now - _cull_last_ms < CubeSphere.CULL_REAP_MS:
+		return
+	_cull_last_ms = now
+	var cells := CubeSphere.BACKSTOP_CELLS
+	# The set of facets that CAN be near-covered = live backstop facets with a dense cache (near meshes only around them).
+	var live := {}
+	for fid in _bpos_cache.keys():
+		if _is_backstop(fid):
+			live[fid] = true
+			for gj in range(cells):
+				for gi in range(cells):
+					cull_feed(fid, gj * cells + gi, _cull_probe_cell(fid, gi, gj))
+	# Prune state for facets no longer backstop (they emit full again next rebuild) — bounded footprint.
+	for fid in _cull_mask.keys():
+		if not live.has(fid):
+			_cull_mask.erase(fid); _cull_streak.erase(fid)
+			_cull_changed = true
+	if _cull_changed:
+		_cull_changed = false
+		_pending = true                                 # re-emit through whichever _process path is active
 
 ## FP_MID_DENSE gate visibility: does facet `fid` emit from the dense cache right now? (public accessor for
 ## verify_no_protrusion's mid-dense reconstruction tier.)
@@ -2011,8 +2144,12 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 		fuv2 = Vector2(float(d[0]), _slot_of(fid))
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
+	# U2: cull confirmed-covered cells on the fast (memcpy) backstop path too — not appended at all (byte-identical off).
+	var cull_dense := _cull_on()
 	for gj in range(cells):
 		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride
@@ -2072,9 +2209,14 @@ func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArra
 		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
 	# skirt = one coarse block's radial pitch (the block's own height scale) — facet edges never see through.
 	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
+	# U2: this facet's cells are cullable only when it is a dense (BACKSTOP_CELLS) backstop AND the cull is active. top_r
+	# above is still computed for EVERY cell so an emitted cell adjacent to a culled one keeps its correct flank wall.
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and fid >= 0 and _cull_on()
 	var n := 0
 	for gj in range(cells):
 		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue                    # confirmed covered by near voxels — not emitted at all (no draw, no poke-through)
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride
@@ -2197,8 +2339,12 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k)
 		inv_c = 1.0 / float(cells)
+	# U2: cull confirmed-covered cells on the dense (BACKSTOP_CELLS) smooth path — not emitted at all (byte-identical off).
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and _cull_on()
 	for gj in range(cells):
 		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride

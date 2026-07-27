@@ -914,15 +914,20 @@ func update_streaming(player_pos: Vector3) -> void:
 	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
+	# COSMOS SEAMLESS-SCALES C3 / TEXTURED-LOD U2: the near-coverage Callable — is a fid-lattice AABB fully meshed in the
+	# near voxel field? Routed to module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the
+	# fallback / no-module path leaves BOTH consumers (the skin's covered-tile skip AND the far-ring covered-cell cull)
+	# inert → byte-identical. Computed once here and shared by the skin and the far ring.
+	var cover_query := Callable()
+	if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
+		cover_query = Callable(_module_world, "skin_near_meshed")
 	if _skin != null:
-		# COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): hand the skin a coverage Callable so it can drop
-		# tiles that sit wholly behind the CONFIRMED-meshed near voxels (pure fill overdraw). Routed to
-		# module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the fallback /
-		# no-module path leaves the skin's skip inert (byte-identical, renders every in-range tile).
-		var cover_query := Callable()
-		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
-			cover_query = Callable(_module_world, "skin_near_meshed")
+		# hand the skin the coverage query so it can drop tiles wholly behind confirmed-meshed near voxels (fill overdraw).
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): hand the far ring the SAME coverage query so it stops emitting
+	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
+	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
+		_facet_ring.set_cover_query(cover_query)
 	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
 	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
 	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,

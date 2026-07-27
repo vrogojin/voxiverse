@@ -143,6 +143,11 @@ func _activate(token: String) -> void:
 		if uid != "":
 			# #113 (§9.4): the stored control key (ck) re-proves the fresh nonce after a reload wiped RAM.
 			_bridge.arm_unattended_rearm(uid, str(stored.get("ck", "")))
+		# OPT-IN DEV AUTO-GRANT (owner request): a boot URL `&grant=<control-key>` arms the unattended
+		# machinery WITHOUT a consent click, overriding any stored grant for THIS session. The observe
+		# token alone (no &grant) never reaches this, so the two-factor model is preserved. Web-only +
+		# CONTROL_ENABLED-gated → inert in a normal build. See _auto_grant_from_url.
+		_auto_grant_from_url()
 	add_child(_bridge)
 	_show_badge(false)                # "dialing…" until the socket actually opens
 	print("[REMOTE] activation requested (token-gated, fixed relay)")
@@ -478,6 +483,49 @@ func _allow_unattended() -> void:
 	_close_consent()
 	if is_instance_valid(_bridge):
 		_bridge.grant_control(uid, true, key)
+
+
+## OPT-IN DEV AUTO-GRANT (owner request, web only). If the boot URL carried `&grant=<control-key>`, arm the
+## EXACT unattended machinery the human "Enable UNATTENDED" opt-in uses (_allow_unattended above), minus the
+## click: an opaque per-grant id (_gen_id, F3), the persisted {uid, ck} in localStorage (_store_unattended),
+## and arm_unattended_rearm — so the relay-side grant_proof is computed byte-for-byte as today (§9.2 HMAC).
+## The relay needs NO change: it validates the proof, never whether a human clicked.
+##
+## SECURITY (each property load-bearing — see report):
+##   * TWO-FACTOR PRESERVED — the observe token alone (no &grant) returns "" here and arms nothing; control
+##     still requires the SAME second factor (the control key) the manual consent modal demands. Auto-grant
+##     only removes the human CLICK, never the secret. This is the owner's explicit opt-in.
+##   * NO NEW WIRE SECRET — the raw key never leaves the browser except as the existing HMAC grant_proof
+##     (RemoteBridge._compute_grant_proof); nothing new is transmitted.
+##   * URL-STRIPPED + NEVER LOGGED — the key is removed from the address bar / history immediately (so it
+##     can't linger as a referrer or in back/forward history) and is never printed (masked below).
+## Gated by the CONTROL_ENABLED caller (_activate), so on a plain checkout (control off) this is never invoked.
+func _auto_grant_from_url() -> void:
+	if not OS.has_feature("web"):
+		return
+	var grant_key := RemoteBridge.preset_grant().strip_edges()
+	# Strip `&grant=` from the visible URL FIRST — before anything can await/log — so the control key never
+	# lingers in the address bar, browser history, or a later referer, whether or not it armed a grant.
+	_strip_grant_from_url()
+	if grant_key == "":
+		return                                     # no &grant → behaviour UNCHANGED (modal / stored grant / observe)
+	if not is_instance_valid(_bridge):
+		return
+	var uid := _gen_id()                            # opaque per-grant id — identical to _allow_unattended (F3)
+	_store_unattended(uid, grant_key)               # persist {uid, ck} exactly like the human unattended opt-in
+	_bridge.arm_unattended_rearm(uid, grant_key)    # arm the re-arm → _on_control_offer auto-grants, NO modal
+	print("[REMOTE] auto-grant armed from &grant (unattended; control key masked)")   # key NEVER printed
+
+
+## Remove the `grant` param from the address bar + browser history via history.replaceState so the control key
+## cannot linger in the URL, back/forward history, or a later referer. Web-only; wrapped in try/catch so a
+## malformed URL can never throw. replaceState fires ONLY when `grant` is actually present (no spurious rewrite).
+func _strip_grant_from_url() -> void:
+	if not OS.has_feature("web"):
+		return
+	JavaScriptBridge.eval("(function(){try{var u=new URL(window.location.href);" \
+		+ "if(u.searchParams.has('grant')){u.searchParams.delete('grant');" \
+		+ "history.replaceState(null,document.title,u.toString());}}catch(e){}})()", true)
 
 
 func _deny_consent() -> void:

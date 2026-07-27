@@ -168,10 +168,48 @@ void fragment() {
 }
 "
 
+# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the biased-tier fallback far
+# material, self-shaded by the SHARED VoxiLight law so — where this material carries the far ring instead of the shell
+# absolute shader — it shades IDENTICALLY to the near blocks. UNSHADED (like the shell) + the TRUE planet-radial normal
+# n = normalize(wp − MODEL·0), × voxi_shade, keeping the P3 window-space depth bias. VoxiLight.SHADE_GLSL is string-
+# included (pure concatenation — ONE shader_type, zero new compiled program). Off ⇒ make_biased_material uses _TIER_
+# SHADER verbatim (byte-identical). sun_dir is fed each frame via FacetFarRing.set_shell_absolute_sun_dir (relaxed guard).
+const _TIER_UNIFIED_HEAD := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform float tier_bias;
+"
+const _TIER_UNIFIED_TAIL := "varying vec3 v_col;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	v_col = COLOR.rgb * voxi_shade(n, sun_dir);
+	POSITION = PROJECTION_MATRIX * (MODELVIEW_MATRIX * vec4(VERTEX, 1.0));
+	POSITION.z += tier_bias * POSITION.w;
+}
+void fragment() {
+	ALBEDO = v_col;
+	ROUGHNESS = 1.0;
+}
+"
+
+## The biased-tier shader source. `unified` off (default = the flag) ⇒ the shipped _TIER_SHADER VERBATIM; on ⇒ the same
+## depth-biased material self-shaded by the shared VoxiLight law. Exposed static so the G-VL-EQ gate can build both.
+static func tier_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
+	if unified:
+		return _TIER_UNIFIED_HEAD + VoxiLight.SHADE_GLSL + _TIER_UNIFIED_TAIL
+	return _TIER_SHADER
+
 static func make_biased_material(bias: float) -> ShaderMaterial:
 	var sh := Shader.new()
-	sh.code = _TIER_SHADER
+	sh.code = tier_shader_code()
 	var m := ShaderMaterial.new()
 	m.shader = sh
 	m.set_shader_parameter("tier_bias", bias)
+	# Unified: seed the ONE uniform set so the tier material shades identically to near/far (sun_dir fed each frame).
+	if CubeSphere.FP_SHADE_UNIFIED:
+		m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		m.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+		m.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+		m.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
 	return m

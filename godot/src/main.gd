@@ -288,7 +288,9 @@ func _process(_delta: float) -> void:
 	# COSMOS ATMO-SKY A5 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C2): forward the Sun direction + the scaled planet
 	# render centre into the far-ring shell v2 shader (absolute self-shaded globe). Same forwarding discipline as
 	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
-	if _player != null and _cosmos_sky != null and CubeSphere.FP_SHELL_ABSOLUTE and CubeSphere.FACETED:
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also drive the feed when the biased-tier fallback material carries the
+	# far ring (shell-absolute off) so its unified self-shade tracks the Sun. Off both flags ⇒ never called (byte-id).
+	if _player != null and _cosmos_sky != null and (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED) and CubeSphere.FACETED:
 		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the Sun direction into the near-field daylight material twin so
 	# the near ground darkens with the same absolute day/night as the far shell (kills the near/far night split).

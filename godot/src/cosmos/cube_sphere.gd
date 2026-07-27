@@ -566,6 +566,21 @@ const BAND_LAYERS := 9                     # band residency = active + ring-1 (�
 const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
 const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
 
+## COSMOS TEXTURED-LOD V1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the ONE lighting law shared by the near blocks and
+## the far skin so the orbit→surface transition is stitchless (the user's #1 requirement). §2V.3 root-caused three
+## verified mismatches — near used normalize(v_wp) (scene-origin pseudo-normal, NOT the planet radial), lacked the far
+## shell's terminator scatter tint, and carried a moonshine floor the far lacked — the "totally different light". This
+## flag string-INCLUDES VoxiLight.SHADE_GLSL (voxi_shade(n, sd) → shade·tint = day + scatter tint + night floor +
+## moonshine floor) into the near atlas shader (block_atlas.gd), the shell LIGHT sub-strings (facet_far_ring.gd) and
+## TierPlace._TIER_SHADER — pure concatenation, ZERO new shader_type/compiled program. It also gives the near shader the
+## TRUE planet-radial normal via a new `planet_centre` uniform (n = normalize(wp − planet_centre); far/tier read the
+## centre from MODEL·0), pushed each frame from ONE WorldManager site (set_near_daylight_sun_dir) next to the sun_dir
+## sync so it stays fresh across facet crossings/re-anchors (§2V.6 F1, from FacetFarRing.render_centre). Result: a near
+## block top and the far texel covering it shade IDENTICALLY at every sun angle including the terminator (G-VL-EQ).
+## Off ⇒ nothing includes the snippet, no planet_centre is pushed, every shader string is BYTE-IDENTICAL and every near
+## material keeps NEAR_NIGHT_FLOOR — FLAT 6042/0. Gate: verify_shade_unified.gd (G-VL-EQ, incl. a scripted crossing).
+const FP_SHADE_UNIFIED := false
+
 ## COSMOS TEXTURED-LOD U2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3a: cull, don't sink). Today the
 ## backstop facets (active ∪ live-pool, drawn at BACKSTOP_CELLS) are emitted UNDER the near voxels — the sink hides the
 ## coexistence, but far land pokes through / shows under near where the two overlap (the user's #72). This flag STOPS

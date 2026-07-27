@@ -883,6 +883,12 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	if _atlas != null and _atlas.has_method("set_near_daylight_sun_dir"):
 		_atlas.set_near_daylight_sun_dir(sun_dir)
 
+## COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): forward the planet centre (render frame) into the shared atlas material's
+## unified near shader. No-op with no atlas or the flag off (the atlas setter self-guards) ⇒ byte-identical.
+func set_near_daylight_planet_centre(centre: Vector3) -> void:
+	if _atlas != null and _atlas.has_method("set_near_daylight_planet_centre"):
+		_atlas.set_near_daylight_planet_centre(centre)
+
 func library_model(arid: int) -> Object:
 	if _library == null:
 		return null

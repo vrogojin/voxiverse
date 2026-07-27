@@ -2798,6 +2798,37 @@ static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_M
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
 	return code
 
+# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): swap the shell LIGHT head's inline
+# lighting law for the SHARED VoxiLight.SHADE_GLSL snippet (string-included — pure concatenation, ZERO new shader_type /
+# compiled program). Four surgical replacements, all on the LIGHT head ONLY (the ALBEDO tail / texture sampling is
+# untouched, so V2 never conflicts): (1) the 3-uniform block → the snippet (which declares sun_dir/night_floor/term_mu +
+# moonshine + the helpers + voxi_shade); (2) delete the now-duplicate inline helper fns; (3) delete the inline mu/shade/
+# tint compute; (4) emit the shade·tint via voxi_shade(n, sun_dir). Adds the moonshine floor the far shell lacked; the
+# TRUE planet-radial normal n = normalize(wp − centre) is ALREADY the shell's normal (centre = MODEL·0), so the far
+# texel now matches the near block top exactly. Applies to BOTH tex variants and the non-tex _SHELL_ABS_SHADER (their
+# v_st / v_col emit lines differ — both handled). `unified` is a param (defaults to the flag) so the gate builds both.
+# Off ⇒ every anchor is left untouched (String.replace of an absent/identity anchor is a no-op) ⇒ code returned VERBATIM.
+static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
+	if not unified:
+		return code
+	# (1) delete the inline helper functions FIRST — before the snippet is inserted — so this only strips the shell's
+	# own copy and never the identical block the snippet re-supplies (order matters: SHADE_GLSL contains these lines).
+	code = code.replace(
+		"float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }\nvec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }\nfloat _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }\nfloat _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }\n",
+		"")
+	# (2) uniforms → shared snippet (declares sun_dir/night_floor/term_mu/moonshine + helpers + voxi_shade)
+	code = code.replace(
+		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform float night_floor = 0.06;\nuniform float term_mu = 0.12;\n",
+		VoxiLight.SHADE_GLSL)
+	# (3) delete the inline mu/shade/tint compute (voxi_shade now carries it)
+	code = code.replace(
+		"	float mu = dot(n, normalize(sun_dir));\n	float shade = night_floor + (1.0 - night_floor) * _day(mu);\n	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));\n",
+		"")
+	# (4) emit shade·tint via the shared law — the tex variants store v_st, the non-tex shell folds it into v_col
+	code = code.replace("	v_st = vec3(shade) * tint;\n", "	v_st = voxi_shade(n, sun_dir);\n")
+	code = code.replace("	v_col = COLOR.rgb * shade * tint;\n", "	v_col = COLOR.rgb * voxi_shade(n, sun_dir);\n")
+	return code
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -2813,11 +2844,22 @@ func _make_material() -> Material:
 			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER)
 		else:
 			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+		# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): string-include the SHARED VoxiLight lighting law into the LIGHT head
+		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
+		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
+		sh2.code = _apply_shade_unified(sh2.code)
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
-		sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
-		sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		# Unified: the ONE uniform set (values from VoxiLight — night_floor 0.06 == SHELL_NIGHT_FLOOR, moonshine floor).
+		# Off: the shipped SHELL_NIGHT_FLOOR / TERMINATOR_MU (the moonshine set is a no-op — the shader has no such uniform).
+		if CubeSphere.FP_SHADE_UNIFIED:
+			sm2.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+			sm2.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+			sm2.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+		else:
+			sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
+			sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
 		if _cu_on():
 			sm2.set_shader_parameter("cu_k", float(FacetAtlas.K))
 			sm2.set_shader_parameter("cu_near", CubeSphere.CLOSEUP_NEAR)
@@ -2877,7 +2919,9 @@ func set_terminator_sun_dir(sun_dir: Vector3) -> void:
 ## reads it from MODEL_MATRIX so it is exact under the scaled placement. No-op unless the flag is on and the
 ## material is the v2 shader ⇒ flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
 func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
-	if not CubeSphere.FP_SHELL_ABSOLUTE or _mi == null:
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also feed the sun when the biased-tier fallback material carries the far
+	# ring (FP_SHELL_ABSOLUTE off, tier path) so its unified self-shade tracks the Sun. Off both flags ⇒ byte-identical.
+	if not (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED) or _mi == null:
 		return
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:

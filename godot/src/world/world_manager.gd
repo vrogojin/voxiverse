@@ -2756,6 +2756,16 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	# lava — + VoxelBody debris) share the one static BlockMaterials cache; feed the Sun into every daylight twin.
 	# Self-guards on FP_NEAR_DAYLIGHT ⇒ flag-off is byte-identical (nothing registered, no-op).
 	BlockMaterials.set_near_daylight_sun_dir(sun_dir)
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, §2V.6 F1): THE single uniform-push site — push the TRUE planet centre
+	# (in the current render frame) to the near daylight twin at the SAME frame the sun_dir syncs, so its radial normal
+	# matches the far shell's and can NEVER go stale across a facet crossing / re-anchor. render_centre() folds the
+	# active facet transform (or the fixed-frame −anchor), so re-reading it every frame is inherently fresh. Off ⇒ never
+	# computed / pushed ⇒ byte-identical. The GDScript-fallback path (no facet ring) leaves planet_centre at the origin,
+	# which degrades the unified normal to the shipped normalize(v_wp) — safe, self-consistent.
+	if CubeSphere.FP_SHADE_UNIFIED and _facet_ring != null:
+		var centre: Vector3 = _facet_ring.render_centre()
+		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):
+			_module_world.call("set_near_daylight_planet_centre", centre)
 
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).

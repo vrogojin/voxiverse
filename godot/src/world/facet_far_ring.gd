@@ -2608,7 +2608,7 @@ void fragment() { ALBEDO = v_col; }
 # bit-preserved near); above 1800 the smooth satellite image wins. ONE opaque draw — a fragment albedo blend,
 # no transparency, no sorting. base_map is bound each session by set_facet_tex (null until then → black texels,
 # irrelevant since wt≈0 near where it would show). Phase 1 has NO close-up branch (closeup_map compiled out).
-const _SHELL_ABS_TEX_SHADER := "shader_type spatial;
+const _SHELL_ABS_TEX_LIGHT := "shader_type spatial;
 render_mode unshaded, cull_disabled;
 uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float night_floor = 0.06;
@@ -2636,7 +2636,8 @@ void vertex() {
 	v_face = UV2.x;
 	v_cam = distance(wp, CAMERA_POSITION_WORLD);
 }
-void fragment() {
+"
+const _SHELL_ABS_TEX_ALBEDO := "void fragment() {
 	vec4 tx = texture(base_map, vec3(v_uv, v_face));
 	// COVERAGE GATE + UN-PREMULTIPLY (§ live-fix 2): the base map is PREMULTIPLIED alpha, so recover the true
 	// (un-darkened) colour by dividing rgb by coverage — near a bake frontier this cancels the mip/bilinear
@@ -2649,6 +2650,13 @@ void fragment() {
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
+# COSMOS TEXTURED-LOD §2V PREP (F3): the shell tex shader string is SPLIT into a LIGHT head (uniforms + the
+# sun/shade/tint lighting law + vertex()) and an ALBEDO tail (fragment() — texture sampling + the ALBEDO
+# composite). Concatenated they are BYTE-IDENTICAL to the pre-split string (verify_shot_prep G-SP-SHADER-
+# IDENTICAL pins it against the frozen golden). V1 (unified lighting) edits ONLY the LIGHT head; V2 (band
+# shot) edits ONLY the ALBEDO tail — different string constants, no merge conflict. Nothing else changes:
+# every existing reader of _SHELL_ABS_TEX_SHADER keeps working (it is now the derived concatenation).
+const _SHELL_ABS_TEX_SHADER := _SHELL_ABS_TEX_LIGHT + _SHELL_ABS_TEX_ALBEDO
 
 # COSMOS LOD-TEXTURE Phase 4 (§1.2 T2t / §1.3): the CLOSE-UP variant — the Phase-1 tex shader PLUS a second
 # Texture2DArray sampled per-facet at 128² (8× finer). The slot rides UV2.y (v_slot; −1 ⇒ base-map only). The exact
@@ -2657,7 +2665,7 @@ void fragment() {
 # CLOSEUP_NEAR, cam_dist) sharpens on approach; a missing/uncovered slot degrades to the base map (softening, never a
 # hole). Compiled ONLY under FP_FACET_TEX_CLOSEUP; the base branch is byte-identical to _SHELL_ABS_TEX_SHADER so a
 # facet with slot −1 renders exactly the Phase-1 result. cu_facet[64] MUST match CubeSphere.CLOSEUP_MAX.
-const _SHELL_ABS_TEX_CU_SHADER := "shader_type spatial;
+const _SHELL_ABS_TEX_CU_LIGHT := "shader_type spatial;
 render_mode unshaded, cull_disabled;
 uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float night_floor = 0.06;
@@ -2692,7 +2700,8 @@ void vertex() {
 	v_slot = UV2.y;
 	v_cam = distance(wp, CAMERA_POSITION_WORLD);
 }
-void fragment() {
+"
+const _SHELL_ABS_TEX_CU_ALBEDO := "void fragment() {
 	vec4 tx = texture(base_map, vec3(v_uv, v_face));
 	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
 	float cov = tx.a;
@@ -2710,6 +2719,13 @@ void fragment() {
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
+# COSMOS TEXTURED-LOD §2V PREP (F3): the shell tex shader string is SPLIT into a LIGHT head (uniforms + the
+# sun/shade/tint lighting law + vertex()) and an ALBEDO tail (fragment() — texture sampling + the ALBEDO
+# composite). Concatenated they are BYTE-IDENTICAL to the pre-split string (verify_shot_prep G-SP-SHADER-
+# IDENTICAL pins it against the frozen golden). V1 (unified lighting) edits ONLY the LIGHT head; V2 (band
+# shot) edits ONLY the ALBEDO tail — different string constants, no merge conflict. Nothing else changes:
+# every existing reader of _SHELL_ABS_TEX_CU_SHADER keeps working (it is now the derived concatenation).
+const _SHELL_ABS_TEX_CU_SHADER := _SHELL_ABS_TEX_CU_LIGHT + _SHELL_ABS_TEX_CU_ALBEDO
 
 # COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1/§2R.3): inject the block-FACE detail sampling into
 # the ALREADY-COMPILED shell tex shader string — no new shader_type, no new compiled program (same one shell program per

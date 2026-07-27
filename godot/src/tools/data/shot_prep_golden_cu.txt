@@ -1,0 +1,52 @@
+shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.06;
+uniform float term_mu = 0.12;
+uniform sampler2DArray base_map : source_color, filter_linear_mipmap;
+uniform sampler2DArray closeup_map : source_color, filter_linear_mipmap;
+uniform vec2 cu_facet[64];
+uniform float cu_k = 24.0;
+uniform float cu_near = 1200.0;
+uniform float cu_far = 4000.0;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+varying vec3 v_col_raw;
+varying vec3 v_st;
+varying vec2 v_uv;
+varying float v_face;
+varying float v_slot;
+varying float v_cam;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = night_floor + (1.0 - night_floor) * _day(mu);
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col_raw = COLOR.rgb;
+	v_st = vec3(shade) * tint;
+	v_uv = UV;
+	v_face = UV2.x;
+	v_slot = UV2.y;
+	v_cam = distance(wp, CAMERA_POSITION_WORLD);
+}
+void fragment() {
+	vec4 tx = texture(base_map, vec3(v_uv, v_face));
+	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
+	float cov = tx.a;
+	if (v_slot >= 0.0) {
+		int s = int(v_slot + 0.5);
+		vec2 ab = cu_facet[s];
+		vec2 local = clamp(vec2(v_uv.x * cu_k - ab.x, v_uv.y * cu_k - ab.y), 0.0, 1.0);
+		vec4 cu = texture(closeup_map, vec3(local, v_slot));
+		vec3 cucol = (cu.a > 0.0001) ? (cu.rgb / cu.a) : col;   // premultiplied like the base page
+		float wc = smoothstep(cu_far, cu_near, v_cam) * cu.a;   // sharpen on approach, coverage-gated
+		col = mix(col, cucol, wc);
+		cov = max(cov, cu.a);
+	}
+	float wt = cov;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate
+	ALBEDO = mix(v_col_raw, col, wt) * v_st;
+}

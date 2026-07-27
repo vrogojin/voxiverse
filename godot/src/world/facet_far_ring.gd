@@ -2468,7 +2468,7 @@ void fragment() {
 	// black from orbit) and the un-premultiply degenerate case falls back to v_col_raw (doubly safe). A baked
 	// facet (a=1) cross-fades to the satellite image on the shipped 600..1800 distance ramp. One opaque draw.
 	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
-	float wt = smoothstep(600.0, 1800.0, v_cam) * tx.a;
+	float wt = tx.a;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate; mip/LOD handles scaling
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
@@ -2529,7 +2529,7 @@ void fragment() {
 		col = mix(col, cucol, wc);
 		cov = max(cov, cu.a);
 	}
-	float wt = smoothstep(600.0, 1800.0, v_cam) * cov;
+	float wt = cov;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "

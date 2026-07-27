@@ -587,6 +587,22 @@ const CULL_DILATE := 32.0                   # blocks the coverage-probe AABB is 
 const CULL_Y_MARGIN := 40.0                 # radial half-band of the probe AABB around the cell top (mirrors skin COVER_Y_MARGIN)
 const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches skin REAP_INTERVAL_MS; slower near-shrink wins the race)
 
+## COSMOS TEXTURED-LOD U3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3b: same level, not sink). The
+## far ring is emitted radially SUNK below the near surface: TierPlace.backstop_sink() ≈ 13 blocks at R=6371 — the
+## sink's TWO jobs were (i) hide far poke-through where near+far coexist and (ii) win the z-order for near. The user
+## reads the result as "far land displaced much deeper than near" (#72). U2 (FP_FARRING_CULL_COVERED) removed job (i)
+## structurally — a covered cell is no longer emitted at all, so near and far never coexist where the cull is live.
+## THIS flag then removes the ~13-block VISUAL sink: the radial sink COLLAPSES to the ENV_EPS_G correctness guard only
+## (max(ENV_EPS_G=1.5, ENV_EPS_FRAC×cell) — the same between-fine-sample floor the min-envelope uses; ≈1.5 at R=3072,
+## ≈5.2 at R=6371), so the far backstop reads at the near blocks' LEVEL (a tiny ε below to avoid exact-coincident
+## z-fight, never a deep displacement). Fringe z-order at the thin un-culled seam rides the ALREADY-SHIPPED FAR_BIAS_K
+## window-space depth bias (TierPlace.far_bias / FP_TIER_DEPTH_BIAS) — depth precedence with ZERO geometric sink.
+## REQUIRES U2: the reduction only applies where FacetFarRing._level_on() holds (the flag AND _cull_on() — the U2 flag
+## AND a VALID coverage probe). On the GDScript fallback path the probe is invalid ⇒ cull inert ⇒ this self-disables
+## to today's full sink (the design's disclosed fallback). Off (or U2 off) ⇒ _sunk_positions applies the full
+## backstop_sink() verbatim → FLAT byte-identical (6042/0). Gate: verify_farring_level.gd (G-LV-NOPROT / G-LV-SEAM).
+const FP_FARRING_LEVEL := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

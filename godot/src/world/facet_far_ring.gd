@@ -1166,6 +1166,13 @@ func set_cover_query(q: Callable) -> void:
 func _cull_on() -> bool:
 	return CubeSphere.FP_FARRING_CULL_COVERED and _cull_cover_query.is_valid()
 
+## COSMOS TEXTURED-LOD U3 (FP_FARRING_LEVEL, §2U.3): is the SAME-LEVEL sink reduction active this run? Requires the
+## flag AND the U2 cull actually running (_cull_on: FP_FARRING_CULL_COVERED + a VALID coverage probe) — the sink can
+## only collapse to the ε guard where the cull guarantees near/far never coexist. Off / no query ⇒ the full backstop
+## sink stays (self-disables to today's sink on the GDScript fallback path). Byte-identical when either flag is off.
+func _level_on() -> bool:
+	return CubeSphere.FP_FARRING_LEVEL and _cull_on()
+
 ## THE ASYMMETRIC-HYSTERESIS STATE MACHINE (headlessly testable — the gate drives it with mocked booleans). Advance cell
 ## `ci` of facet `fid` by ONE coverage read `covered`. Culling requires CULL_CONFIRM consecutive COVERED reads; un-culling
 ## is INSTANT on the first UNcovered read (streak → 0, mask bit cleared). Returns the new culled bit. Latches `_cull_changed`
@@ -2112,6 +2119,12 @@ func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float
 ## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
 ## emit so a shared grid vertex is not re-normalized per triangle. Pure math — safe on the async worker thread.
 func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
+	# COSMOS TEXTURED-LOD U3 (FP_FARRING_LEVEL): with the U2 cull live (near/far never coexist where covered), the
+	# radial sink COLLAPSES from the ~13-block visual sink to the ENV_EPS_G correctness guard — the far ring reads at
+	# the near surface's LEVEL. Self-disables to the full sink when the cull is inert (invalid coverage probe). Fringe
+	# z-order at the thin un-culled seam rides the shipped FAR_BIAS_K depth bias, not this sink. Off ⇒ full sink verbatim.
+	if _level_on():
+		return _sunk_positions_amt(p, TierPlace.backstop_sink_level())
 	return _sunk_positions_amt(p, TierPlace.backstop_sink())   # TIER-DEPTH P2: ε guard under the envelope, else BACKSTOP_SINK
 
 # FP_ENV_FLOORED_ASYNC: sink by an EXPLICIT amount — a not-yet-enveloped chord fallback uses the FULL sink

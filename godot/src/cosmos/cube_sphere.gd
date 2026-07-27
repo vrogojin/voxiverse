@@ -716,6 +716,25 @@ const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, lin
 ## stays 6042/0). Flip ON at export after the live world_settled A/B (perf/voxiverse-load-profile instrumentation).
 const FP_LOAD_RAMP := false
 
+## INITIAL FAR-RING CACHE DEFER (perf/voxiverse-load-profile) — FP_BOOT_ASYNC. Symptom (live profile): world_build =
+## 113.8s, of which ~90s is FacetFarRing.setup()'s SYNCHRONOUS initial _rebuild_full — it caches EVERY front-hemisphere
+## facet (~1716) in one main-thread call before the game can proceed (each facet's env/column cache is the web ×25 cost).
+## The whole hemisphere does NOT need to be cached before the player can play: on the surface the near voxel field covers
+## the ground and fog hides ~2R, so only the facets near the active facet (the local horizon) are actually visible at
+## spawn. When ON, setup() caches only a bounded PROXIMITY SEED (BOOT_SEED_FACETS, nearest-first) synchronously and emits
+## it, then warms the remaining front facets across frames in _process under a per-frame budget (WARM_BUDGET_MS), re-
+## emitting the growing cached subset every SHELL_REEMIT_GROWTH facets — the EXACT _emit_cached_only / _ensure_emit_cached
+## progressive machinery the true-orbit path already uses. The player reaches essential-ready in seconds; the far
+## hemisphere fills in the background (distant/back facets are off-screen while it does). Final coverage is identical.
+## RISK: a facet not yet warmed draws as no far quad — visible only if the near field + fog don't cover it (mid-distance
+## on a clear sightline); the proximity seed + fast near-horizon warm keep the visible ring solid, so pop-in is confined
+## to distances the fog already hides. Default OFF ⇒ the shipped synchronous full _rebuild_full (byte-identical; FLAT
+## stays 6042/0 — FLAT has no far ring). Flip ON at export after the live world_settled A/B.
+const FP_BOOT_ASYNC := false
+## FP_BOOT_ASYNC: facets cached synchronously at boot (the proximity seed covering the spawn horizon). Bounded so the
+## synchronous boot cost stays small (~BOOT_SEED_FACETS × per-facet warm); the rest stream in over subsequent frames.
+const BOOT_SEED_FACETS := 48
+
 ## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
 ## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
 ## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and

@@ -217,6 +217,16 @@ var _ringhold_prev_d := -1.0
 var _ringhold_prev_usec := -1
 var _ringhold_apply_msec := -1
 
+# FP_BOOT_ASYNC (perf/voxiverse-load-profile): the boot-progressive far-ring warm state. `_boot_warm` is true while the
+# initial full-hemisphere cache is being filled across frames (after a bounded synchronous seed). `_boot_fids` is the
+# front-hemisphere set ordered NEAREST-FIRST to the active facet (so the visible horizon warms before the off-screen
+# far side); `_boot_cursor` is the next fid to warm; `_boot_last_emit_size` throttles the progressive re-emit. All inert
+# (false/0/empty, never read) with the flag off ⇒ setup() runs the shipped synchronous _rebuild_full (byte-identical).
+var _boot_warm := false
+var _boot_fids: PackedInt32Array = PackedInt32Array()
+var _boot_cursor := 0
+var _boot_last_emit_size := 0
+
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
 	_recompute_sticky()              # TIER-DEPTH P1: seed the sticky backstop set so ring-1 is sunk from the first build (no-op with the flag off)
@@ -224,8 +234,77 @@ func setup(active_fid: int) -> void:
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
 	add_child(_mi)
-	_rebuild_full()                  # initial build — synchronous (spawn is masked by the ShaderPrewarm hold)
+	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
+	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
+	if CubeSphere.FP_BOOT_ASYNC:
+		_boot_begin()
+	else:
+		_rebuild_full()              # initial build — synchronous (spawn is masked by the ShaderPrewarm hold)
 	set_process(true)
+
+## FP_BOOT_ASYNC: seed the far ring with a bounded, nearest-first subset of the front hemisphere synchronously (covering
+## the spawn horizon the fog/near field do not), emit it, and arm the per-frame progressive warm for the remainder. Uses
+## the SAME _emit_cached_only / _ensure_emit_cached path the true-orbit progressive emit uses, so the mesh is index-aligned
+## and every downstream consumer is unchanged.
+func _boot_begin() -> void:
+	_boot_fids = _order_front_by_proximity()
+	var seed := mini(CubeSphere.BOOT_SEED_FACETS, _boot_fids.size())
+	for i in range(seed):
+		_ensure_emit_cached(_boot_fids[i])
+	_boot_cursor = seed
+	_boot_warm = _boot_cursor < _boot_fids.size()
+	_emit_cached_only = true          # emit only the cached (growing) subset — visible_fids() cache-filters
+	_rebuild_full()                   # draws the seed now
+	_boot_last_emit_size = _pos_cache.size() + _bpos_cache.size()
+
+## FP_BOOT_ASYNC: the front-hemisphere fids ordered by DESCENDING alignment to the active facet's centre (nearest first),
+## so the visible local horizon warms before the off-screen far side. Cheap dot-product sort over ~1716 dirs (once).
+func _order_front_by_proximity() -> PackedInt32Array:
+	var fids := visible_fids()        # full front set (active/excluded already filtered on the surface)
+	var acd := _centre_dir(_active_fid)
+	var scored: Array = []
+	scored.resize(fids.size())
+	for i in fids.size():
+		var cd := _centre_dir(fids[i])
+		scored[i] = [-(cd[0] * acd[0] + cd[1] * acd[1] + cd[2] * acd[2]), int(fids[i])]  # negate → ascending sort = nearest first
+	scored.sort()
+	var out := PackedInt32Array()
+	out.resize(scored.size())
+	for i in scored.size():
+		out[i] = int((scored[i] as Array)[1])
+	return out
+
+## FP_BOOT_ASYNC: warm the next batch of far-ring facet caches under a per-frame budget, re-emitting the growing cached
+## subset every SHELL_REEMIT_GROWTH facets (and once at completion). When the whole front is cached it restores the
+## shipped full-emit path (_emit_cached_only=false) and requests one clean rebuild. Runs on the main thread — no worker.
+func _boot_warm_step() -> void:
+	var t0 := Time.get_ticks_usec()
+	var budget_us := int(WARM_BUDGET_MS * 1000.0)
+	while _boot_cursor < _boot_fids.size():
+		_ensure_emit_cached(_boot_fids[_boot_cursor])
+		_boot_cursor += 1
+		if Time.get_ticks_usec() - t0 > budget_us:
+			break
+	var done := _boot_cursor >= _boot_fids.size()
+	var sz := _pos_cache.size() + _bpos_cache.size()
+	if done or (sz - _boot_last_emit_size) >= CubeSphere.SHELL_REEMIT_GROWTH:
+		_boot_last_emit_size = sz
+		_emit_cached_only = true
+		_rebuild_full()               # emit the grown cached subset
+	if done:
+		_boot_warm = false
+		_emit_cached_only = false     # everything cached → restore the shipped full-emit for later crossings/re-emits
+		_pending = true               # one clean full rebuild next frame (all cached ⇒ identical to the shipped mesh)
+
+## FP_BOOT_ASYNC introspection for verify_boot_async.gd — read-only. Facets whose emit cache is built so far.
+func boot_cached_count() -> int:
+	return _pos_cache.size() + _bpos_cache.size()
+## The full front-hemisphere facet count (the target the boot warm converges to).
+func boot_front_total() -> int:
+	return visible_fids().size()
+## Still filling the initial cache across frames?
+func boot_warming() -> bool:
+	return _boot_warm
 
 ## FP3 §6.1 / FP-S1(d) crossing: re-place the planet into facet `new_fid`'s render frame (rigid, O(1)) and DEFER the
 ## exclusion/terminator re-emit + any new-facet noise caching to _process (off the crossing frame, under a budget).
@@ -459,6 +538,13 @@ func set_pool_excluded(fids: Array) -> void:
 ## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
+	# FP_BOOT_ASYNC: while the initial hemisphere cache is still filling, warm the next budgeted batch + progressive re-emit,
+	# then return — the boot warm owns the ring until the front is fully cached (it then restores the shipped paths below).
+	# A crossing during boot-warm still renders: set_active re-places the absolute mesh rigidly; its deferred exclusion
+	# re-emit is served by the shipped _pending path once boot-warm completes. Off ⇒ never entered (byte-identical).
+	if CubeSphere.FP_BOOT_ASYNC and _boot_warm:
+		_boot_warm_step()
+		return
 	_prewarm_step(_dt)               # COSMOS-ORBITAL-SHELL S2: one-shot whole-planet warm (no-op unless FP_SHELL_PREWARM + off-surface)
 	if _async_building:
 		return

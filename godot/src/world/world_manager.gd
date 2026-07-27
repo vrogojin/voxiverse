@@ -234,7 +234,23 @@ const _FLOOR_MEMO_NONE := -0x40000000 # sentinel: no memo for this column (never
 # with a missing cell is never queried).
 var _joint_mods: Dictionary = {}      # Vector4i -> int reinforcement id
 
+# BOOT-LOAD PROFILE (perf/voxiverse-load-profile): running timestamp for the world_build SUB-phase timing below, so a
+# fresh load breaks the ~114s world_build into wb_module_setup (the ~23s manifest bake) / wb_setup_mid / wb_farring (the
+# ~90s far-ring cache) / wb_rest. Pure Time.get_ticks_msec() deltas + one print/console.log each — no per-frame cost.
+var _wb_last := 0
+
+## BOOT-LOAD PROFILE: emit one world_build sub-phase duration (ms since the previous wb mark). Same [BOOT] format as
+## main.gd's boot phases so they interleave in the console. Called a handful of times inside _ready only.
+func _wb_mark(phase: String) -> void:
+	var now := Time.get_ticks_msec()
+	var dt := now - _wb_last
+	_wb_last = now
+	print("[BOOT] %s %d ms" % [phase, dt])
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("console.log('[BOOT] %s %d ms');" % [phase, dt], true)
+
 func _ready() -> void:
+	_wb_last = Time.get_ticks_msec()
 	environment = PerVoxelEnvironment.new()
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
@@ -263,6 +279,9 @@ func _ready() -> void:
 		_setup_module_path()
 	if not using_module:
 		_setup_fallback_path()
+	# BOOT-LOAD PROFILE: the render-path setup — on the module path this is where module_world.setup()'s ~23s appearance-
+	# manifest bake lands (its own "setup timing: … manifest=…ms" print is a sub-total of this).
+	_wb_mark("wb_module_setup")
 
 	# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7 P1): install the play-frame bridge. When the
 	# flag is on, ActiveFrame is a Node3D @ IDENTITY (Phase 1) that hosts the player, GroundCollider and loose
@@ -317,6 +336,8 @@ func _ready() -> void:
 	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
 	# COSMOS FACETED (§5.2): replace FarTerrain (the flat/curved global-index heightmap — a giant misplaced
 	# sheet under a single facet) with the facet far ring: the whole planet rendered around the active facet.
+	# BOOT-LOAD PROFILE: the collider/snow/weather setup between the manifest and the far ring.
+	_wb_mark("wb_setup_mid")
 	if CubeSphere.FACETED and FacetFarRing.ENABLED:
 		_facet_ring = FacetFarRing.new()
 		_facet_ring.name = "FacetFarRing"
@@ -362,9 +383,14 @@ func _ready() -> void:
 			_far.position = _chart.node_origin()      # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org (=−org at spawn)
 			_far.set_chart(_chart)                     # COSMOS R1 (M5_REAL): the far bakes/aligns against the chart
 
+	# BOOT-LOAD PROFILE: the far-ring setup — under FACETED this is FacetFarRing.setup()'s initial cache (the ~90s in the
+	# shipped synchronous build; a bounded seed under FP_BOOT_ASYNC, the rest streamed across frames).
+	_wb_mark("wb_farring")
+
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
+	_wb_mark("wb_rest")
 
 	# COSMOS R1 DEV: hide the NEAR chunk render so the baked far layer can be inspected alone (render-only —
 	# analytic physics + GroundCollider are untouched, so movement/collision are unchanged). Curved + dev only.

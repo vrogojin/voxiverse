@@ -620,6 +620,16 @@ const CULL_CONFIRM := 2                     # asymmetric hysteresis: 2 consecuti
 const CULL_DILATE := 32.0                   # blocks the coverage-probe AABB is dilated by (re-emit before near retreats)
 const CULL_Y_MARGIN := 40.0                 # radial half-band of the probe AABB around the cell top (mirrors skin COVER_Y_MARGIN)
 const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches skin REAP_INTERVAL_MS; slower near-shrink wins the race)
+## U2 LIVE-PERF FIX (round 2 — the sustained-1075ms regression): the cull DECOUPLES the live per-probe mask from the
+## COMMITTED mesh. A far-ring rebuild is expensive (~1 s SYNC when FP_FARRING_ASYNC_REBUILD is off), so it must NOT fire
+## every probe as `is_area_meshed` legitimately churns under live streaming (that was the 0.3 fps freeze). Instead the
+## EMIT reads a `_committed_cull` snapshot, and a rebuild fires ONLY on two bounded transitions: (APPLY) the live mask has
+## been STABLE for CULL_SETTLE_PROBES probes AND differs from committed — the standing-still optimization, rate-limited to
+## ≥ CULL_REBUILD_MS apart (mirrors the skin's standing-still reap); and (FLUSH) a committed-culled cell has just
+## un-culled in the live mask — the prompt no-hole safety, which clears committed to full emission (holes worse than
+## overdraw). During sustained motion the live mask churns but committed stays flushed-empty ⇒ ZERO added rebuilds.
+const CULL_SETTLE_PROBES := 3               # consecutive no-change probes (≈300 ms) before a settled cull is APPLIED to the mesh
+const CULL_REBUILD_MS := 250               # min wall-ms between APPLY rebuilds (the FLUSH safety path is un-rate-limited)
 
 ## COSMOS TEXTURED-LOD U3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3b: same level, not sink). The
 ## far ring is emitted radially SUNK below the near surface: TierPlace.backstop_sink() ≈ 13 blocks at R=6371 — the

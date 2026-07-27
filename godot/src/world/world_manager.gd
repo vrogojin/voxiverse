@@ -937,6 +937,16 @@ func initial_view_meshed(center: Vector3) -> bool:
 		return bool(_module_world.call("area_meshed", center, Vector3(40.0, 32.0, 40.0)))
 	return true                                     # fallback path / no module → no terrain-format hold
 
+## BOOT-LOAD PROFILE (perf/voxiverse-load-profile): read-only "is this arbitrary box meshed?" accessor used by
+## main.gd's post-splash "world_settled" timer to measure how long the bulk near view (much larger than the tiny
+## 40-box the ShaderPrewarm hold waits on) takes to stream in after the splash lifts. Same is_area_meshed query as
+## initial_view_meshed, just with a caller-chosen half-extent. Telemetry-only; no gameplay read path; fallback/no
+## module → true (nothing to wait on). Never called per-frame in a hot loop (main throttles it to ~2 Hz).
+func view_meshed(center: Vector3, half: Vector3) -> bool:
+	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
+		return bool(_module_world.call("area_meshed", center, half))
+	return true
+
 # --- terrain editing (block breaking + placing) --------------------------------
 
 ## THE composed cell query (VOXEL-DATA-STRUCTURE §7.1): edit overlay first, else

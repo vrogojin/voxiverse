@@ -127,6 +127,18 @@ var _watch_terrain := false                   # PHASE 2 enabled? set by begin() 
 var _wait_time := 0.0                          # accumulated seconds in the terrain-meshed hold
 var _watch_world: Node = null                  # WorldManager to poll for initial_view_meshed (PHASE 2)
 var _warm_center := Vector3.ZERO               # camera world position the near-view AABB is built around
+# BOOT-LOAD PROFILE (perf/voxiverse-load-profile): split the prewarm hold into PHASE 1 (the pipeline-compile grid frames)
+# vs PHASE 2 (the terrain-meshed hold) + WHY it lifted (meshed vs cap), so the live profile shows whether the measured
+# ~50s prewarm_meshhold is the mesh hold hitting the cap or the grid frames. Pure ticks_msec — no behavioural change.
+var _t_begin_ms := 0
+var _t_phase1_end_ms := 0
+var _lift_reason := "?"
+
+## BOOT-LOAD PROFILE: print + (web) mirror a [BOOT] line. Fixed labels only (no user data).
+func _boot_pw_log(s: String) -> void:
+	print(s)
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("console.log('%s');" % s, true)
 
 ## Kick off the warm-up: spawn the superset pile in front of `player`'s camera, raise
 ## the "Loading…" overlay, and begin the frame countdown. `on_done` (and the
@@ -134,6 +146,7 @@ var _warm_center := Vector3.ZERO               # camera world position the near-
 ## torn down — main.gd re-enables the player there.
 func begin(player: Node3D, on_done: Callable = Callable()) -> void:
 	_on_done = on_done
+	_t_begin_ms = Time.get_ticks_msec()       # BOOT-LOAD PROFILE: PHASE 1 start
 	_watch_terrain = true                     # real boot → run PHASE 2 (hold for the streamed terrain)
 	transform = Transform3D.IDENTITY          # instances are placed in WORLD coords below
 	var cam := _camera_xform(player)
@@ -224,6 +237,8 @@ func _process(delta: float) -> void:
 		return
 	if _frame == WARMUP_FRAMES:
 		_free_meshes()                        # pile compiles done → drop it (also stops it inflating draws)
+		_t_phase1_end_ms = Time.get_ticks_msec()
+		_boot_pw_log("[BOOT] prewarm_phase1 %d ms (%d compile frames)" % [_t_phase1_end_ms - _t_begin_ms, WARMUP_FRAMES])
 		return
 	# _frame > WARMUP_FRAMES.
 	if not _watch_terrain:
@@ -244,6 +259,7 @@ func _process(delta: float) -> void:
 	# FP_LOAD_RAMP: wider essential surround → a larger cap so the ~96³ box has time to mesh (still bounded).
 	var max_wait := LOAD_RAMP_MAX_WAIT_SEC if CubeSphere.FP_LOAD_RAMP else TERRAIN_MAX_WAIT_SEC
 	if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) or _wait_time >= max_wait:
+		_lift_reason = "meshed" if (meshed and _wait_time >= TERRAIN_MIN_HOLD_SEC) else "cap@%.1fs" % max_wait
 		_finish()
 
 ## Free (and detach) the warm-up meshes. Detaching via remove_child makes the child
@@ -257,6 +273,12 @@ func _free_meshes() -> void:
 
 func _finish() -> void:
 	_finished = true
+	# BOOT-LOAD PROFILE: PHASE 2 (terrain-meshed hold) duration + why it lifted — pinpoints whether prewarm_meshhold is
+	# the grid frames (PHASE 1) or the mesh hold hitting the cap. _t_phase1_end_ms is 0 on the verify/no-hold path.
+	var p2_from := _t_phase1_end_ms if _t_phase1_end_ms > 0 else _t_begin_ms
+	if _t_begin_ms > 0:
+		_boot_pw_log("[BOOT] prewarm_phase2 %d ms (lift=%s, wait=%.1fs)" % [
+			Time.get_ticks_msec() - p2_from, _lift_reason, _wait_time])
 	if _instances.size() > 0:
 		_free_meshes()
 	if _overlay != null and is_instance_valid(_overlay):

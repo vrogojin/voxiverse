@@ -108,6 +108,13 @@ var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate
 var _alt_orbital := false
 var _alt_reentry_pending := false
 var _alt_redesignate_count := 0
+# COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3): the ground-anchored-viewer state. `_anchor_released` is the
+# hysteretic release latch (true past ANCHOR_REL_HI, false again below ANCHOR_REL_LO/ANCHOR_HYST) — it selects the
+# ramp's lower knee so ascent releases at REL_LO while descent re-grows to full only below REL_LO/HYST (no flap).
+# `_anchor_last_write_ms` debounces the two viewer writes (offset + view_distance) to ≥ ANCHOR_WRITE_DEBOUNCE_MS. All
+# inert (never read; no writes issued) with FP_APPROACH_ANCHOR off ⇒ byte-identical.
+var _anchor_released := false
+var _anchor_last_write_ms := -100000
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -537,6 +544,56 @@ func _update_alt_regime(player_pos: Vector3) -> void:
 		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST:
 			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
 
+## COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3.1/§3.2) — the ground-anchored viewer + τ-timed release,
+## driven once per streaming tick from update_streaming. `h` is the SAME analytic altitude the regime ladder uses
+## (_radial_altitude_lattice → radius − R_BLOCKS; NEVER the voxel buffer — collision/floor queries are untouched).
+## (a) ANCHOR: offset_y = clamp(O_base − h, −h + ANCHOR_MARGIN, O_base) pins the viewer's WORLD radial altitude to
+## O_base (the sub-player ground) for every h, so the meshed plate stays inside the unchanged ellipsoid on climb.
+## (b) RELEASE: the camera-to-plate distance ≈ h (plate anchored directly below); ramp view_distance down across
+## [ANCHOR_REL_LO, ANCHOR_REL_HI] so the plate recedes rim-inward (every unloading block ≤ τ px). The hysteresis
+## latch `_anchor_released` picks the ramp's lower knee: ANCHOR_REL_LO while resident (ascent releases at ~700),
+## ANCHOR_REL_LO/ANCHOR_HYST once released (descent re-grows to full only below ~609) — no flap around the knee.
+## Both writes are debounced to ≥ ANCHOR_WRITE_DEBOUNCE_MS (anti re-mesh churn; the FP-M1c staged-view precedent).
+## No-op / byte-identical with the flag off, off FACETED, on the fallback path, or before the viewer attaches.
+func _update_approach_anchor(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_APPROACH_ANCHOR or not CubeSphere.FACETED:
+		return
+	if not using_module or _module_world == null or not _module_world.has_method("set_approach_anchor"):
+		return
+	var now_ms := Time.get_ticks_msec()
+	if now_ms - _anchor_last_write_ms < CubeSphere.ANCHOR_WRITE_DEBOUNCE_MS:
+		return                                 # debounce: at most one offset/view write per ANCHOR_WRITE_DEBOUNCE_MS
+	_anchor_last_write_ms = now_ms
+	_apply_approach_anchor(player_pos)
+
+## The compute+apply core shared by the debounced driver and the verify hook (approach_anchor_step_now). Advances the
+## release-latch hysteresis, computes the anchor offset + release view_distance from the analytic altitude, and pushes
+## both to the single player VoxelViewer. Pure w.r.t. gameplay — it only mutates the viewer node (render/streaming).
+func _apply_approach_anchor(player_pos: Vector3) -> void:
+	var h := _radial_altitude_lattice(player_pos)   # the regime-ladder altitude (analytic; never the voxel buffer)
+	var o_base := TerrainConfig.clamped_viewer_offset_y()
+	var offset_y := CubeSphere.approach_offset_y(h, o_base)
+	# Advance the hysteresis latch (Schmitt on the FULL-resident knee), then pick the ramp's lower knee from it.
+	var d := maxf(h, 0.0)                            # camera-to-plate distance ≈ altitude above the anchored ground
+	if d >= CubeSphere.ANCHOR_REL_HI:
+		_anchor_released = true
+	elif d <= CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST:
+		_anchor_released = false
+	var lo := (CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST) if _anchor_released else CubeSphere.ANCHOR_REL_LO
+	var full := float(TerrainConfig.near_render_radius())
+	var view_f := CubeSphere.approach_view_distance(d, full, lo)
+	_module_world.call("set_approach_anchor", offset_y, int(round(view_f)))
+
+## FP_APPROACH_ANCHOR verify hook (verify_approach_anchor.gd — no live caller): run one compute+apply immediately,
+## bypassing the wall-clock debounce (headless ticks are sub-ms apart). Gated exactly like the driver so an OFF build
+## is a no-op. Mirrors the module's pool_ramp_tick test-hook pattern.
+func approach_anchor_step_now(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_APPROACH_ANCHOR or not CubeSphere.FACETED:
+		return
+	if not using_module or _module_world == null or not _module_world.has_method("set_approach_anchor"):
+		return
+	_apply_approach_anchor(player_pos)
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
@@ -933,6 +990,11 @@ func update_streaming(player_pos: Vector3) -> void:
 	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
 	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.
 	_update_alt_regime(player_pos)
+	# COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR): keep the meshed near plate anchored to the sub-player ground
+	# during a climb and release it rim-inward only once its blocks are sub-τ on screen. Debounced viewer offset +
+	# view_distance writes; no-op / byte-identical with the flag off. Runs after the alt regime so the freezes above
+	# ATMO_TOP stay authoritative (the released plate is empty up there anyway).
+	_update_approach_anchor(player_pos)
 	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.

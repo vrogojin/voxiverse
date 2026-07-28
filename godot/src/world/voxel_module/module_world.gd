@@ -476,6 +476,31 @@ func _pool_ramp_kick() -> void:
 func set_fall_hold(v: bool) -> void:
 	_fall_hold = v
 
+## COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3.1/§3.2): drive the EXISTING single player VoxelViewer's
+## vertical offset (a) and horizontal streaming radius (b) each streaming tick while airborne, so the meshed near
+## plate stays anchored to the sub-player ground and releases only rim-inward once sub-τ on screen. Both levers are
+## the same viewer node DEV_HIDE_NEAR already proves safe live (offset = local +Y, view_distance = streaming radius);
+## NOTHING is allocated — this only MUTATES two existing properties, so the airborne plate holds at most the grounded
+## set (G-AA-BYTES). No-op when the viewer is absent (fallback path / no player). WorldManager gates the whole call on
+## FP_APPROACH_ANCHOR && FACETED, so with the flag off this is never reached and the viewer is byte-identical.
+func set_approach_anchor(offset_y: float, view_distance: int) -> void:
+	var v := _viewer as Node3D
+	if v == null:
+		return
+	v.position = Vector3(v.position.x, offset_y, v.position.z)
+	_set_if(_viewer, "view_distance", view_distance)
+
+## S1 introspection (verify_approach_anchor.gd — no live caller): the viewer's LOCAL +Y offset, its engine-applied
+## view_distance, and its instance id (G-AA-BYTES asserts the SAME viewer object serves grounded and airborne — no
+## re-instantiation). NAN / -1 / 0 when no viewer.
+func viewer_offset_y() -> float:
+	var v := _viewer as Node3D
+	return v.position.y if v != null else NAN
+func viewer_view_distance() -> int:
+	return int(_viewer.get("view_distance")) if (_viewer != null and _has_prop(_viewer, "view_distance")) else -1
+func viewer_instance_id() -> int:
+	return _viewer.get_instance_id() if _viewer != null else 0
+
 func _ramp_pool_step(delta: float) -> bool:
 	# FP_LAND_RAMP_HOLD: while falling fast, clamp every slot's EFFECTIVE grow target to a small landing disc so the
 	# near voxel view shrinks (the far-ring chords cover 64-128 — hole=0 proven); the REAL view_target is left intact,

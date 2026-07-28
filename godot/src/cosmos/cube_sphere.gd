@@ -966,6 +966,56 @@ const FP_MANIFEST_SLICE := false
 ## exact shipped math (byte-identical; FLAT stays 6042/0). Flip ON at export after the live de-orbit-land A/B.
 const FP_LANDING_STREAM_KICK := false
 
+## COSMOS SEAMLESS-TRANSITION S1 (docs/COSMOS-SEAMLESS-TRANSITION-DESIGN.md §3 — FP_APPROACH_ANCHOR). Symptom
+## (the user's literal complaint, §0.1): the near VoxelViewer is a CHILD of the player with up-reach U ≈ 64
+## blocks, so climbing ~64 blocks empties the WHOLE near field while a block still subtends ≈22 px — an abrupt
+## "pop" to the flat far skin (~2 orders of magnitude above the ≈2 px invisibility threshold). Fix (pure
+## streaming POLICY — NO new buffers/shaders/bytes, same safety class as DEV_HIDE_NEAR):
+##   (a) ANCHOR (§3.1): while airborne, drive the EXISTING viewer vertical offset each streaming tick
+##       (debounced ≥ ANCHOR_WRITE_DEBOUNCE_MS) so the viewer stays pinned to the sub-player surface point:
+##       offset_y = clamp(O_base − h, −h + ANCHOR_MARGIN, O_base), O_base = TerrainConfig.clamped_viewer_offset_y()
+##       (today's +12), h = the SAME analytic altitude the regime ladder uses (WorldManager._radial_altitude_lattice
+##       → radius − R_BLOCKS; NEVER the voxel buffer). Then the viewer's WORLD radial altitude = h + offset_y = O_base
+##       for all h — the already-meshed plate stays inside the unchanged ±ellipsoid at any altitude. Vertical-only;
+##       horizontal tracking is unchanged (walk streaming).
+##   (b) RELEASE (§3.2): a block at camera-distance d subtends ≈ K_px/d px (K_px≈1407) → sub-τ at D_REL = K_px/τ ≈
+##       700 for τ = ANCHOR_TAU_PX. As the camera's distance to the plate (≈ h, plate anchored directly below)
+##       crosses ANCHOR_REL_LO → ANCHOR_REL_HI, ramp the viewer view_distance DOWN monotonically so the plate
+##       recedes rim-inward (every unloading block is already ≤ τ px). Above the band the plate is empty (today's
+##       orbit state); FP_ALT_REGIME / OFFSURFACE_Y freezes are UNCHANGED. DESCENT bonus: re-grow with ANCHOR_HYST
+##       hysteresis (fully resident again only once d < ANCHOR_REL_LO / ANCHOR_HYST ≈ 609) so near streaming
+##       restarts ~700 instead of ~416 — composes with (does not replace) FP_LANDING_STREAM_KICK + the alt-regime
+##       release. NEVER-OOM: same viewer, same 128-block bubble; the airborne plate holds AT MOST the grounded set.
+## Default OFF ⇒ WorldManager._update_approach_anchor early-returns, attach_viewer is byte-identical, FLAT stays
+## 6042/0. Requires FACETED (like all cosmos flags — the offset law only runs on the composite-identity active
+## facet). Gate: verify_approach_anchor.gd (G-AA-OFF / G-AA-ANCHOR / G-AA-TAU / G-AA-BYTES). Does NOT enable
+## FP_FARRING_LEVEL/U2 (S1b) — S1 ships alone; a residual ~13-block level jump at the reveal is accepted for now.
+const FP_APPROACH_ANCHOR := false
+const ANCHOR_TAU_PX := 2.0            # screen-space release threshold (px/block); sub-τ ⇒ safe to unload
+const ANCHOR_REL_LO := 700.0          # camera-to-plate distance (blocks) where release BEGINS (≈ K_px/τ, D_REL)
+const ANCHOR_REL_HI := 900.0          # distance where the plate is fully released (view_distance → 0)
+const ANCHOR_HYST := 1.15             # descent hysteresis: fully resident again only below ANCHOR_REL_LO/HYST
+const ANCHOR_WRITE_DEBOUNCE_MS := 100 # min ms between viewer offset/view writes (anti re-mesh churn; FP-M1c precedent)
+const ANCHOR_MARGIN := 4.0            # safety floor (blocks): the viewer never sinks below datum+ANCHOR_MARGIN
+
+## S1 (a) — the anchor offset law (§3.1), pure/static so the gate asserts the identical formula the driver applies.
+## Returns the viewer LOCAL +Y so its WORLD radial altitude == o_base (the sub-player ground the player left) for any
+## player altitude h ≥ 0. Bounds = the design's clamp [−h+ANCHOR_MARGIN, o_base], but applied FLOOR-AFTER-CAP (not
+## clampf, which is cap-after-floor) so that DEEP below the datum — where the two bounds cross (−h+margin > o_base at
+## h < margin−o_base) — the FLOOR wins and the viewer world altitude never sinks below datum+ANCHOR_MARGIN. For h ≥ 0
+## the bounds never cross and the result is exactly o_base − h (world alt == o_base), identical to clampf.
+static func approach_offset_y(h: float, o_base: float) -> float:
+	return maxf(minf(o_base - h, o_base), -h + ANCHOR_MARGIN)
+
+## S1 (b) — the release ramp (§3.2), pure/static. Given the camera-to-plate distance d, the full near radius, and
+## the (hysteretic) lower knee `lo`, returns the target view_distance: `full` at/below `lo`, linearly down to 0 at
+## ANCHOR_REL_HI, 0 above. Monotone non-increasing in d. The driver picks lo = ANCHOR_REL_LO while resident and
+## ANCHOR_REL_LO/ANCHOR_HYST once released (the descent re-grow band) — the hysteresis knee.
+static func approach_view_distance(d: float, full: float, lo: float) -> float:
+	if ANCHOR_REL_HI <= lo:
+		return 0.0 if d >= ANCHOR_REL_HI else full
+	return full * clampf((ANCHOR_REL_HI - d) / (ANCHOR_REL_HI - lo), 0.0, 1.0)
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a

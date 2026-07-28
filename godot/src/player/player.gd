@@ -1935,6 +1935,13 @@ func ground_probe_position() -> Vector3:
 ## set_fly (§4.6): replicate the KEY_F branch exactly — toggle fly, zero velocity, disable/enable the
 ## capsule so no loose body can wedge the player while airborne.
 func remote_set_fly(on: bool) -> void:
+	# DEV-FLY DESYNC FIX (Option 1): turning fly OFF while dev-nav is engaged must route through the real
+	# dev-nav teardown, else `_dev_nav` stays stuck true while `flying` goes false — after which the idempotent
+	# remote_set_dev_nav(true) re-arm is a no-op (reports success) and thrust silently takes the walk path (no lift).
+	# Keeps the invariant `_dev_nav ⇒ flying` so the next remote_set_dev_nav(true) re-engages cleanly.
+	if not on and _dev_nav:
+		_toggle_dev_nav()
+		return
 	flying = on
 	velocity = Vector3.ZERO
 	if _body_shape != null:
@@ -2063,6 +2070,12 @@ func remote_set_dev_nav(on: bool) -> bool:
 		return false
 	if _dev_nav != on:
 		_toggle_dev_nav()                          # the exact human-F path (fly on/off, overlay, seed reset)
+	elif on and not flying:
+		# DEV-FLY DESYNC FIX (Option 2, self-heal): repair a `flying`=false / `_dev_nav`=true desync left by a
+		# prior remote_set_fly(false)/override so the orchestrator's re-arm reliably re-engages lift.
+		flying = true
+		if _body_shape != null:
+			_body_shape.disabled = true
 	return _dev_nav == on
 
 ## nav verb (O/G/R): the dev-nav mode toggles. verb ∈ orbit(O) | geostation(G) | detach(R). Guarded EXACTLY as

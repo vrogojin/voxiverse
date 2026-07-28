@@ -373,6 +373,10 @@ func _ready() -> void:
 			_block_lod = FacetBlockLodRing.new()
 			_block_lod.name = "FacetBlockLodRing"
 			add_child(_block_lod)
+			# TH4: hand it the TH0 job lane BEFORE setup so the ~1 s L0 bake runs on a worker (no crossing/boot stall);
+			# main pays only the ArrayMesh commit, drained by the _job_lane.pump() already in _process. With FP_JOB_LANE
+			# off (no lane) the ring falls back to a synchronous inline build (correct, but the P1 stall — pair the flags).
+			_block_lod.set_job_lane(_job_lane)
 			_block_lod.setup(TerrainConfig.active_facet())
 			_block_lod.place(_facet_ring.transform)
 		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near

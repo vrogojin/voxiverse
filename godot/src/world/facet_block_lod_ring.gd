@@ -55,12 +55,48 @@ var _material: ShaderMaterial = null
 var _sun_dir := Vector3(1.0, 0.0, 0.0)
 var _wholesale_clears := 0             # diagnostics: ledger-breach wholesale clears (gate reads to prove it fired)
 
+# COSMOS MAIN-THREAD ORCHESTRATION TH4 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §2 — same worker/commit split
+# the §2V FacetTexBaker proved): the ~1 s analytic L0 bake + greedy mesh (_build_facet_arrays, PURE) runs on the TH0
+# JobLane WORKER; MAIN pays ONLY the commit (ArrayMesh + add_child + ledger). Single in-flight (one staging slot) —
+# a crossing enqueues the ≤5 band facets and they stream in one-per-round-trip; during the gap the sunk far ring
+# backstops (no hole). The offload is live iff a lane was handed in (set_job_lane) — else the synchronous fallback
+# (headless gate / no FP_JOB_LANE) drains inline, byte-identical to the P1 build.
+var _lane: JobLane = null
+var _worker_on := false                # _lane != null: the async offload is live (main never bakes)
+var _pending: Array = []               # fids queued to bake (band-ordered; async path), not yet dispatched/resident
+var _bake_busy := false                # single in-flight: a facet is on the worker (or awaiting its commit)
+var _staging_fid := -1                 # the facet currently on the worker
+var _staging_arrays: Dictionary = {}   # worker→main handoff (submitter-owned single-writer while in flight)
+var _statics_warm := false             # the worker-touched statics (noise / palette) were prewarmed on MAIN
+
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
 	_material = _make_material()
+	_prewarm_statics(active_fid)
 	set_process(true)
 	rebuild(active_fid)
+
+
+## TH4 (FP_TEX_BAKE_WORKER's set_job_lane twin): hand the block-LOD ring the ONE TH0 job lane. Once set, the L0
+## bake + greedy mesh runs on a WorkerThreadPool worker and MAIN pays only the commit ⇒ no crossing stall. Null lane
+## (or never called) ⇒ the synchronous fallback (byte-identical to the P1 inline build; used by the headless gate).
+func set_job_lane(lane: JobLane) -> void:
+	_lane = lane
+	_worker_on = lane != null
+
+
+## §2V "pre-warm statics on MAIN before the worker touches them": the worker path calls TerrainConfig.facet_profile
+## (lazy noise init) + FarPalette.color_for (lazy palette / BlockCatalog init). Trigger both once on the main thread
+## so the worker only ever READS the finished statics (no init race — the exact discipline FacetTexBaker.prewarm uses).
+func _prewarm_statics(active_fid: int) -> void:
+	if _statics_warm:
+		return
+	FacetAtlas.warm_up()
+	FarPalette.ensure_ready()
+	var p := TerrainConfig.facet_profile(active_fid, 0, 0)   # forces TerrainConfig._ensure_noise on MAIN
+	FarPalette.color_for(int(p.x), int(p.y), p.w, false)     # forces FarPalette/BlockCatalog/ClimateModel ready on MAIN
+	_statics_warm = true
 
 
 ## The L1 band for `active_fid`: the active facet ∪ its 4 ridge (seam) neighbours. Bounded (§5/§7) so the streamed
@@ -74,19 +110,76 @@ func band_fids(active_fid: int) -> Array:
 	return out
 
 
-## Re-place + re-stream the band for a (possibly new) active facet. Called on setup and on every crossing. Builds any
-## band facet not yet resident, touches the LRU of the whole band, then evicts down to the cap / ledger (never the
-## band). O(band) builds per crossing; a facet already resident is a pure LRU touch (no rebuild — the far-ring cache
-## discipline). Placement (the node transform) is mirrored from the far ring by WorldManager via place().
+## Re-place + re-stream the band for a (possibly new) active facet. Called on setup and on every crossing. Enqueues any
+## band facet not yet resident (async: streamed one-per-round-trip on the worker — MAIN never bakes), touches the LRU
+## of the whole band, prunes stale pending, then evicts down to the cap / ledger (never the band). A facet already
+## resident is a pure LRU touch. With NO lane (headless gate) the queue drains inline (byte-identical to P1).
 func rebuild(active_fid: int) -> void:
 	_active_fid = active_fid
 	var band := band_fids(active_fid)
 	var now := Time.get_ticks_msec()
 	for fid in band:
-		if not _mesh_by_fid.has(fid):
-			_build_facet(fid)
 		_lru[fid] = now
+		if _mesh_by_fid.has(fid) or fid == _staging_fid:
+			continue
+		if not _pending.has(fid):
+			_pending.append(fid)
+	# Drop pending facets no longer in the band (a crossing moved on before they baked — the far-ring warm discipline).
+	var i := _pending.size() - 1
+	while i >= 0:
+		if not band.has(_pending[i]):
+			_pending.remove_at(i)
+		i -= 1
+	if not _worker_on:
+		_drain_pending_sync()          # no lane: build inline (gate / FP_JOB_LANE off) — the P1 path, unchanged
+	else:
+		_maybe_dispatch()              # kick the worker if idle (commit of the previous unit re-arms via _process)
 	_enforce_budget(band)
+
+
+## Build every queued facet inline on the calling thread (the synchronous fallback: no job lane). Used by the headless
+## gate (which reads the meshes immediately) and any build with FP_JOB_LANE off. Byte-identical to the P1 behaviour.
+func _drain_pending_sync() -> void:
+	while not _pending.is_empty():
+		var fid: int = _pending.pop_front()
+		if not _mesh_by_fid.has(fid):
+			_commit_facet_arrays(fid, _build_facet_arrays(fid))
+
+
+## MAIN, once per frame (via _process): if the worker is idle and a facet is queued, dispatch ONE bake unit to the
+## lane. The worker fills _staging_arrays (single-writer, single in-flight); the lane's commit uploads it on main.
+func _maybe_dispatch() -> void:
+	if not _worker_on or _bake_busy or _pending.is_empty():
+		return
+	# Skip any queued facet already resident (a re-cross may have re-added it after it committed).
+	while not _pending.is_empty() and _mesh_by_fid.has(_pending[0]):
+		_pending.pop_front()
+	if _pending.is_empty():
+		return
+	_staging_fid = _pending.pop_front()
+	_bake_busy = true
+	_lane.submit(JobLane.PRIORITY_OPPORTUNISTIC,
+		Callable(self, "_worker_bake"), Callable(self, "_worker_commit"), "blocklod")
+
+
+## WORKER THREAD: the heavy pure compute (L0 bake + greedy mesh) into the single staging slot. Touches NO
+## RenderingServer / scene tree (only reads the prewarmed statics + writes the submitter-owned _staging_arrays).
+func _worker_bake() -> void:
+	_staging_arrays = _build_facet_arrays(_staging_fid)
+
+
+## MAIN THREAD (lane commit, budgeted): upload the staged arrays (ArrayMesh + add_child + ledger) — the ONLY GPU/tree
+## touch, and the cheap part. Then re-arm: clear the in-flight slot + re-enforce the budget (a facet baked while the
+## band moved on is committed then LRU-evicted). The next _process dispatches the next queued facet.
+func _worker_commit() -> void:
+	var fid := _staging_fid
+	var arr := _staging_arrays
+	_staging_arrays = {}
+	_staging_fid = -1
+	_bake_busy = false
+	if not _mesh_by_fid.has(fid):
+		_commit_facet_arrays(fid, arr)
+	_enforce_budget(band_fids(_active_fid))
 
 
 ## Set the render placement (absolute planet coords → current render frame). Mirrors the far ring's own node
@@ -109,6 +202,9 @@ func _process(_delta: float) -> void:
 	# screen-door-discards until (now − arrival) exceeds BLOCK_LOD_DITHER_S. One uniform write/frame.
 	if _material != null:
 		_material.set_shader_parameter("u_now", float(Time.get_ticks_msec()) / 1000.0)
+	# TH4: dispatch the next queued bake unit if the worker is free (the lane's commit, pumped by WorldManager, cleared
+	# _bake_busy). No-op when synchronous (no lane), idle, or already busy — main pays ~0 here.
+	_maybe_dispatch()
 
 
 # ---- ledger / LRU (NEVER-OOM §5) -------------------------------------------------------------------------------
@@ -133,6 +229,17 @@ func draw_count() -> int:
 
 func wholesale_clears() -> int:
 	return _wholesale_clears
+
+# --- async observables (headless gate: G-BLD-MAINCOST) ----------------------------------------------------------
+func is_baking() -> bool:
+	return _bake_busy
+
+func pending_count() -> int:
+	return _pending.size()
+
+## True once the worker path has fully streamed the current band (nothing queued, nothing on the worker).
+func async_idle() -> bool:
+	return _pending.is_empty() and not _bake_busy
 
 
 ## Evict resident facets outside `band`, LRU-first, until BOTH the LRU-facet cap AND the byte ledger are satisfied.
@@ -186,8 +293,10 @@ func _evict(fid: int) -> void:
 
 # ---- meshing (§4) ----------------------------------------------------------------------------------------------
 
-func _build_facet(fid: int) -> void:
-	var arr := _build_facet_arrays(fid)
+## MAIN THREAD — the CHEAP commit: turn worker-built (or inline-built) arrays into an ArrayMesh + MeshInstance and
+## charge the ledger. This is the ONLY RenderingServer / scene-tree touch; the ~1 s bake is NOT here (it produced
+## `arr`). G-BLD-MAINCOST measures exactly this cost vs the whole synchronous build.
+func _commit_facet_arrays(fid: int, arr: Dictionary) -> void:
 	var verts: PackedVector3Array = arr["verts"]
 	if verts.is_empty():
 		return

@@ -138,6 +138,46 @@ func _initialize() -> void:
 
 	ring.queue_free()
 
+	# ================= G-BLD-MAINCOST — the ~1 s L0 bake must LEAVE the main thread (TH4 async) ================
+	# Mirrors §2V's G-TW-MAINCOST (61.7 ms → 0.9 ms). Build the SAME facet two ways and compare the MAIN-thread cost:
+	#   (a) SYNC  — the P1 path: _build_facet_arrays + _commit on main = the whole ~1 s stall (what a crossing paid).
+	#   (b) ASYNC — a JobLane: the worker runs _build_facet_arrays; MAIN pays only the ArrayMesh commit (lane drain).
+	# A crossing that once froze main for ~1 s now pays only the bounded commit ⇒ FP_BLOCK_LOD is live-safe.
+	var mc_fid := 305
+
+	# (a) synchronous full main build (statics prewarmed on main first — a fair comparison; the async path prewarms too).
+	var sync_ring := FacetBlockLodRing.new()
+	root.add_child(sync_ring)
+	sync_ring._prewarm_statics(mc_fid)
+	var ts := Time.get_ticks_usec()
+	sync_ring._commit_facet_arrays(mc_fid, sync_ring._build_facet_arrays(mc_fid))
+	var sync_ms := float(Time.get_ticks_usec() - ts) / 1000.0
+
+	# (b) async: worker bakes, main only commits (measured via the lane's accumulated main-commit clock).
+	var lane := JobLane.new(1)
+	var async_ring := FacetBlockLodRing.new()
+	root.add_child(async_ring)
+	async_ring._prewarm_statics(mc_fid)
+	async_ring.set_job_lane(lane)
+	lane.take_main_commit_ms()                       # reset the accumulator
+	async_ring._pending = [mc_fid]
+	async_ring._maybe_dispatch()                     # submit the bake unit to the worker
+	var guard := 0
+	while not async_ring.async_idle() and guard < 20000:
+		lane.pump()
+		async_ring._maybe_dispatch()
+		OS.delay_msec(1)
+		guard += 1
+	var async_ms := lane.take_main_commit_ms()       # ONLY the commit ran on main; the ~1 s bake was on the worker
+
+	var committed := async_ring.resident_fids().has(mc_fid)
+	_ok(committed, "G-BLD-MAINCOST: async worker path committed facet %d (baked off-main, uploaded on main)" % mc_fid)
+	_ok(sync_ms > 50.0, "G-BLD-MAINCOST: SYNC main build is a real stall (%.1f ms > 50) — the cost to eliminate" % sync_ms)
+	_ok(async_ms * 4.0 < sync_ms, "G-BLD-MAINCOST: ASYNC main cost %.2f ms ≪ SYNC %.1f ms (bake left the frame, ≥4×)" % [async_ms, sync_ms])
+	print("  INFO G-BLD-MAINCOST: crossing main-thread cost per facet  BEFORE(sync)=%.1f ms  →  AFTER(async commit)=%.2f ms" % [sync_ms, async_ms])
+	sync_ring.queue_free()
+	async_ring.queue_free()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 

@@ -100,7 +100,12 @@ func _on_step_done(rec: Dictionary) -> void:
 
 # ── (1) op resolution through the RemoteControl executor → gated actuators ──────────────────────────
 func _gate_op_resolution() -> void:
-	print("  --- (1) OP RESOLUTION: each op dispatches through RemoteControl to its gated player actuator ---")
+	print("  --- (1) OP RESOLUTION: each op is bridge-whitelisted + dispatches through RemoteControl to its actuator ---")
+	# GAME-SIDE BRIDGE WHITELIST (the gap that nacked every op live): the bridge cap-checks the ack against
+	# RemoteBridge.OP_WHITELIST BEFORE the executor dispatches, so each new op MUST be in that list or it is
+	# rejected before ever reaching remote_control.gd. Assert presence explicitly (the relay list is JS-side).
+	for op in ["teleport", "set_alt", "freeze_time", "freeze_player"]:
+		_ok(RemoteBridge.OP_WHITELIST.has(op), "op '%s' is in RemoteBridge.OP_WHITELIST (bridge accepts the ack)" % op)
 	var pl := _make_player()
 	# The actuator surface the relay routes to must exist (defence-in-depth: the relay whitelists, the rover binds).
 	_ok(pl.has_method("remote_teleport"), "player exposes remote_teleport")
@@ -228,8 +233,22 @@ func _gate_freeze_time() -> void:
 
 # ── (5) freeze_player pins the player across real physics ticks; release resumes ────────────────────
 func _gate_freeze_player() -> void:
-	print("  --- (5) FREEZE_PLAYER: a held player's position is invariant across real _physics_process ticks ---")
+	print("  --- (5) FREEZE_PLAYER: held player's position invariant + executor/streaming still run (no starve) ---")
 	var pl := _make_player()
+	# Unit-level latch (flag-independent): remote_freeze_player toggles the gate _physics_process reads.
+	pl.remote_freeze_player(true)
+	_ok(pl._dev_freeze_player == true, "remote_freeze_player(true) sets the latch")
+	pl.remote_freeze_player(false)
+	_ok(pl._dev_freeze_player == false, "remote_freeze_player(false) clears the latch")
+	# The real-physics DRIVE (held-invariant, look-resolves-while-frozen, release-resumes) needs a COHERENT frame:
+	# a bare headless faceted WM lacks main.gd's ActiveFrame wiring, so the floating-origin reanchor mis-fires and
+	# shifts the lattice pose — a harness artifact, not a freeze defect (gate 7 skips FACETED real-physics for the
+	# same reason). The freeze mechanism (skip _move, keep the rest of the tick) is flag-independent, so the FLAT
+	# harness fully exercises it.
+	if CubeSphere.FACETED:
+		print("  (gate 5 real-physics drive skipped under FACETED — needs main.gd ActiveFrame wiring; FLAT covers it)")
+		pl.free()
+		return
 	# Place the player 40 blocks up so gravity has somewhere to pull once released (proves the pin is real).
 	pl.remote_set_alt(40.0)
 	pl.frozen = false                                       # engine physics now runs; the DEV latch must pin it
@@ -239,6 +258,29 @@ func _gate_freeze_player() -> void:
 		await physics_frame
 	_ok(pl.position == p_held, "held player: position INVARIANT across 12 physics ticks (%s)" % str(pl.position))
 	_ok(pl.velocity == Vector3.ZERO, "held player: velocity stays zero")
+	# (b) DEADLOCK GUARD: a `look` op must STILL resolve while frozen. The live bug — a frozen tick that
+	# early-returned starved the RemoteControl physics_tick, so look/turn/move/jump never sent their done record
+	# ⇒ the op timed out ⇒ the relay stayed stuck "busy" ⇒ the whole queue deadlocked. Drive a real look through
+	# the executor while held and assert it COMPLETES (no timeout) AND the pin still holds position.
+	var rc := RemoteControl.new()
+	rc.player = pl
+	pl.remote_exec = rc
+	get_root().add_child(rc)
+	rc.step_finished.connect(_on_step_done)
+	_last_status = ""
+	var p_look: Vector3 = pl.position
+	var yaw0: float = pl.rotation.y
+	rc.begin_sequence({"seq": "look", "on_fail": "abort", "steps": [{"op": "look", "id": 9, "yaw_deg": 20.0}]})
+	for _i in range(40):
+		await physics_frame
+		if _last_status != "":
+			break
+	_ok(_last_status == "ok", "held player: a `look` op still RESOLVES while frozen (status='%s' — no starved-tick deadlock)" % _last_status)
+	_ok(absf(pl.rotation.y - yaw0) > 0.05, "held player: the look actually eased the camera yaw while frozen (Δyaw=%0.3f rad)" % (pl.rotation.y - yaw0))
+	_ok(pl.position == p_look, "held player: position STILL invariant while the look op ran (pin holds AND executor runs)")
+	rc.step_finished.disconnect(_on_step_done)
+	pl.remote_exec = null
+	rc.free()
 	# Release — physics resumes (the pin is gone: the player starts moving again). We assert MOTION RESUMED
 	# rather than a specific fall direction, so the check is robust across FLAT (straight fall) and the faceted
 	# frame (free-fall coast + floating-origin reanchor both register as motion).

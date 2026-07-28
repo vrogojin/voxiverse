@@ -659,13 +659,6 @@ func _physics_process(delta: float) -> void:
 	# G-REENTRY FIX A: restore frame/pose consistency FIRST, before any consumer (movers, floor, nav)
 	# reads `position` — a half-committed crossing from LAST frame must never be interpreted this frame.
 	_heal_frame_desync()
-	# DEV/TEST freeze_player: pin the player (no gravity, no dev-fly drift, no orbital coast) for a genuinely
-	# stationary capture. We early-return BEFORE _move / streaming / nav so `position` is invariant across ticks
-	# (the gate asserts this). Velocity is zeroed so nothing integrates on resume. Default off ⇒ byte-identical
-	# normal play (the branch is not taken); only ever set through remote_freeze_player under a live grant.
-	if _dev_freeze_player:
-		velocity = Vector3.ZERO
-		return
 	# REMOTE-DRIVE (§4.3): snapshot the pre-locomotion LATTICE position so the executor measures pure
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
@@ -674,9 +667,18 @@ func _physics_process(delta: float) -> void:
 	# the flag test is the only added work (no timer call, no key). See fall_timing().
 	var _ft_on := CubeSphere.FP_FALL_TIMING
 	var _ft_t := 0
-	if _ft_on: _ft_t = Time.get_ticks_usec()
-	_move(delta)
-	if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
+	# DEV/TEST freeze_player: pin the player for a stationary capture by suppressing ONLY the player's own MOTION
+	# INTEGRATION (skip _move — gravity, dev-fly drift, orbital coast, locomotion) and zeroing velocity. The REST of
+	# the tick still runs — the RemoteControl executor's physics_tick (so look/turn/move/jump ops still send their
+	# done record instead of timing out and deadlocking the relay queue), the origin/frame corrections, the
+	# streaming/bake kick, and the camera. `position` stays invariant across ticks (nothing else writes it while
+	# held). Default off ⇒ the else-branch runs verbatim (byte-identical normal play); set only via remote_freeze_player.
+	if _dev_freeze_player:
+		velocity = Vector3.ZERO
+	else:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_move(delta)
+		if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
 	var _tick_move_delta := position - _pre_move_pos
 	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global

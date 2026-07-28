@@ -78,7 +78,11 @@ const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "se
 	"dev_nav", "nav", "thrust", "roll",
 	# DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set the celestial time-of-day at the player.
 	# Behind CONTROL_ENABLED like every op; resolves synchronously via player.remote_set_time.
-	"set_time"]
+	"set_time",
+	# DEV/TEST INSTRUMENTATION (dev-instrument tooling) — precise camera placement + stable capture. Behind
+	# CONTROL_ENABLED like every op; the bridge cap-checks the ack against THIS list before the executor
+	# dispatches, so they MUST be here or the ack is nacked before it ever reaches remote_control.gd.
+	"teleport", "set_alt", "freeze_time", "freeze_player"]
 const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)

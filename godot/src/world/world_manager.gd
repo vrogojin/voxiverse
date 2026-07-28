@@ -69,6 +69,7 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
 var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
 var _tex_band_epoch := -1             # COSMOS TEXTURED-LOD U1: last band slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
@@ -364,6 +365,16 @@ func _ready() -> void:
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4): the L1 (2-block-pitch) megablock rim ring — real
+		# greedy-meshed blocky relief OVER the far skin, engaging at the near rim (~128) out to the ridge-1 band
+		# (~700). Sibling of the far ring, gated on FP_BLOCK_LOD (default OFF → node never created → byte-identical).
+		# Placed each frame from the far ring's own transform (one frame) + fed the same Sun; rebuilt on crossings.
+		if CubeSphere.FP_BLOCK_LOD:
+			_block_lod = FacetBlockLodRing.new()
+			_block_lod.name = "FacetBlockLodRing"
+			add_child(_block_lod)
+			_block_lod.setup(TerrainConfig.active_facet())
+			_block_lod.place(_facet_ring.transform)
 		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near
 		# voxels and the far-ring backstop. Gated on FP_SKIN_TIER (default OFF → node never created →
 		# byte-identical). Peer node placed like the far ring; driven from update_streaming/crossing/reanchor.
@@ -1012,6 +1023,10 @@ func update_streaming(player_pos: Vector3) -> void:
 	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
 	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
 		_facet_ring.set_cover_query(cover_query)
+	# COSMOS BLOCK-LOD P1: keep the L1 rim ring in the far ring's frame (its mesh is absolute planet coords, placed by
+	# the SAME node transform so L1 and the far skin overlap exactly). No-op / byte-identical unless FP_BLOCK_LOD.
+	if _block_lod != null and _facet_ring != null:
+		_block_lod.place(_facet_ring.transform)
 	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
 	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
 	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,
@@ -2366,6 +2381,8 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_facet_ring_sync_exclusion()
 		if _skin != null:
 			_skin.call("set_active", to)
+		if _block_lod != null:
+			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
 		_far_us = Time.get_ticks_usec() - _far_t0
 	else:
 		# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
@@ -2377,6 +2394,8 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_facet_ring.set_active(to)
 		if _skin != null:
 			_skin.call("set_active", to)
+		if _block_lod != null:
+			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
 		_flip_settling = true
 		_restream()
 	# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
@@ -2811,6 +2830,10 @@ func set_far_ring_sun_dir(sun_dir: Vector3) -> void:
 func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_shell_absolute_sun_dir(sun_dir)
+	# COSMOS BLOCK-LOD P1: the L1 rim ring shades by the SAME shell shade·tint law (radial normal) — feed it the same
+	# Sun at the same frame so the megablocks day/night-match the far skin. No-op / byte-identical unless FP_BLOCK_LOD.
+	if _block_lod != null:
+		_block_lod.set_sun_dir(sun_dir)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

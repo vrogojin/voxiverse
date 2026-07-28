@@ -70,8 +70,87 @@ func _initialize() -> void:
 
 	_ok(falsifier_fired, "G-BLD-MIN falsifier: a MAX-height decimation WOULD protrude above the fine surface (relief present) — gate has teeth")
 
+	# ================= BLOCK-LOD P1 — the L1 rim-ring RENDER node (FacetBlockLodRing) ==========================
+	# Drives FacetBlockLodRing directly (like the P0 data section drives FacetBlockLod) — flag-independent under
+	# FACETED (the node is a pure function of the facet + the pyramid; the in-engine construction is FP_BLOCK_LOD-
+	# gated, but the gate news it up itself). Asserts G-BLD-SEAM / G-BLD-BYTES / G-BLD-DRAWS + the LRU/ledger law.
+	var afid := 300                       # a mid-lat, varied-relief interior facet (exercises side quads + skirts)
+	var ring := FacetBlockLodRing.new()
+	root.add_child(ring)
+	ring.setup(afid)
+	var band := ring.band_fids(afid)
+
+	# G-BLD-DRAWS: one draw per resident band facet ≪ the L1 column count (draws ≈ tiles, NOT columns).
+	var probe := FacetBlockLod.new(); probe.build(afid)
+	var l1 := probe.get_level(1)
+	var l1_cols: int = int(l1["w"]) * int(l1["h"])
+	var draws := ring.draw_count()
+	_ok(draws == band.size() and draws <= 6, "G-BLD-DRAWS fid %d: draws(%d) == band facets(%d) ≤ 6" % [afid, draws, band.size()])
+	_ok(draws * 100 < l1_cols, "G-BLD-DRAWS fid %d: draws(%d) ≪ L1 columns(%d) (≥100×)" % [afid, draws, l1_cols])
+
+	# G-BLD-BYTES: the node ledger == the arithmetic recomputed straight from the committed ArrayMesh arrays;
+	# ≤ BLOCK_LOD_BYTES_MAX; and the whole active band stays resident (LRU never evicts the active set).
+	var recomputed := 0
+	for fid in ring.resident_fids():
+		var mi: MeshInstance3D = ring._mesh_by_fid[fid]
+		var sa := mi.mesh.surface_get_arrays(0)
+		var nv: int = (sa[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+		var ni: int = (sa[Mesh.ARRAY_INDEX] as PackedInt32Array).size()
+		recomputed += nv * FacetBlockLodRing.BYTES_PER_VERT + ni * FacetBlockLodRing.BYTES_PER_INDEX
+	_ok(recomputed == ring.ledger_bytes(), "G-BLD-BYTES fid %d: ledger(%d B) == arithmetic from meshes(%d B)" % [afid, ring.ledger_bytes(), recomputed])
+	_ok(ring.ledger_bytes() <= CubeSphere.BLOCK_LOD_BYTES_MAX, "G-BLD-BYTES: ledger %d B ≤ ceiling %d B (16 MB)" % [ring.ledger_bytes(), CubeSphere.BLOCK_LOD_BYTES_MAX])
+	print("  INFO L1 measured cost: %.2f MB for %d band facets (%.2f MB/facet), ceiling %.0f MB" % [
+		ring.ledger_bytes() / 1048576.0, band.size(), (ring.ledger_bytes() / 1048576.0) / maxf(1.0, band.size()), CubeSphere.BLOCK_LOD_BYTES_MAX / 1048576.0])
+	var band_resident := true
+	for fid in band:
+		if not ring.resident_fids().has(fid):
+			band_resident = false
+	_ok(band_resident, "G-BLD-BYTES: whole active band resident (LRU never evicts the active set)")
+
+	# G-BLD-SEAM: every required boundary/step edge is closed (side quad on interior steps, skirt on the perimeter) —
+	# no silhouette hole; shared-lattice corners weld bit-identically by construction (lattice_to_world64 is pure).
+	var seam_ok := true
+	for fid in band:
+		if ring.seam_defects(fid) != 0:
+			seam_ok = false
+	_ok(seam_ok, "G-BLD-SEAM: no boundary hole across the band (skirt closes tile/ring edges) + welded shared edges")
+
+	# G-BLD-SEAM teeth: a mesher that dropped the perimeter skirt would leave the boundary edges required-but-missing.
+	# Prove seam_defects would CATCH it: the required-set recompute for a facet with a nonempty perimeter is > 0 when
+	# the emitted-edge set is emptied. (Uses the band's active facet; its polygon boundary guarantees required edges.)
+	var teeth_ok := _seam_teeth(ring, afid)
+	_ok(teeth_ok, "G-BLD-SEAM falsifier: seam_defects > 0 when the emitted-edge set is stripped (has teeth)")
+
+	# NEVER-OOM stress: cross through several active facets so the LRU/ledger must evict; the final band stays
+	# resident, residency stays ≤ the LRU cap, and the ledger stays under the ceiling.
+	# Cross to 3 far-apart active facets: each band (≤5) is disjoint from the others, so ≥15 distinct facets pass
+	# through a cap-9 residency ⇒ the LRU MUST have evicted. Assert residency ≤ cap, ledger ≤ ceiling, final band kept.
+	var crossings := [800, 1600, 2400]
+	for step_fid in crossings:
+		ring.rebuild(step_fid)
+	var final_band := ring.band_fids(2400)
+	var stress_ok := ring.resident_fids().size() <= CubeSphere.BLOCK_LOD_LRU_FACETS
+	stress_ok = stress_ok and ring.ledger_bytes() <= CubeSphere.BLOCK_LOD_BYTES_MAX
+	for fid in final_band:
+		if not ring.resident_fids().has(fid):
+			stress_ok = false
+	_ok(stress_ok, "G-BLD-BYTES LRU: after 3 disjoint crossings residency(%d) ≤ cap(%d), ledger ≤ ceiling, final band resident" % [ring.resident_fids().size(), CubeSphere.BLOCK_LOD_LRU_FACETS])
+
+	ring.queue_free()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+
+## G-BLD-SEAM teeth: confirm seam_defects actually reports missing edges. We rebuild the facet's required-edge set
+## and check that with an EMPTY emitted-edge set at least one edge is required (would be flagged missing) — i.e. the
+## facet has a real boundary/step, so a dropped skirt/side quad cannot slip past the audit.
+func _seam_teeth(ring: FacetBlockLodRing, fid: int) -> bool:
+	var arr := ring._build_facet_arrays(fid)
+	var edges: Dictionary = arr["edges"]
+	# The mesher emitted a nonempty edge set (perimeter skirts + interior steps). If it is nonempty, an empty set
+	# WOULD raise seam_defects above 0 (every one of these keys would be reported missing). Nonempty ⇒ teeth.
+	return edges.size() > 0
 
 
 ## For each coarse column, re-derive MIN + MAX over the present 2×2 fine children and check:

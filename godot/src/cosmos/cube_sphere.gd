@@ -657,6 +657,23 @@ const FP_FARRING_LEVEL := false
 ## + edit cascade). Gate: verify_block_lod.gd (G-BLD-PYR / G-BLD-MIN / G-BLD-DETERMINISM). Requires FACETED.
 const FP_BLOCK_LOD := false
 
+## COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4 + docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §4 override) — the
+## L1 rim-ring render consts, read ONLY when FP_BLOCK_LOD built FacetBlockLodRing (numbers, never touched off ⇒
+## byte-identical). The engagement band comes from the on-screen block-size law d_max(Ln) ≈ 2^n·K_px/4 (K_px≈1407,
+## the px·distance-per-block screen constant): an L1 (pitch-2) megablock drops below the ~4 px LOD threshold at
+## d_max(L1) = 2·1407/4 ≈ 703 ⇒ OUTER ≈ 700; the inner RIM is the near voxel field radius (CURVED_RENDER_RADIUS_BLOCKS
+## = 128) where the 1-block voxels hand off (the ≤1-block containment step the transition needs). P1 bounds the L1
+## band to the active facet ∪ its 4 ridge neighbours (which span ~0..~700 around the player), so the RIM/OUTER values
+## document the band + feed the S1-tighten follow-up rather than clipping columns (the near voxels overdraw ≤RIM, the
+## sunk far ring backstops >OUTER). The full L2–L4 ladder (P2, FP_BLOCK_LOD_RINGS) uses the same law at 2^n.
+const BLOCK_LOD_L1_RIM_BLOCKS := 128       # near voxel field hand-off (rim engagement = CURVED_RENDER_RADIUS_BLOCKS)
+const BLOCK_LOD_L1_OUTER_BLOCKS := 700     # d_max(L1) ≈ 2·K_px/4 (K_px≈1407) — L1 falls under ~4 px here
+const BLOCK_LOD_SCREEN_K_PX := 1407.0      # the design's on-screen block-size constant (px·distance per block)
+const BLOCK_LOD_TILE_COLS := 32            # L1 columns per greedy/seam tile (per-facet merged; P2 makes it the LRU unit)
+const BLOCK_LOD_DITHER_S := 0.3            # arrival screen-door dither seconds (§4 temporal — NOT a standing band)
+const BLOCK_LOD_LRU_FACETS := 9            # LRU cap on resident L1 facet meshes (band ≤5 + re-crossing slack)
+const BLOCK_LOD_BYTES_MAX := 16 << 20      # NEVER-OOM hard ledger ceiling (§5): 16 MB
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

@@ -104,6 +104,11 @@ class CosmosClock extends RefCounted:
 	## new phase (persistent). The remote cheat computes the offset needed to land the player's current
 	## surface position at a chosen local solar time (offset_for_local_hours) and folds it in via add_offset.
 	var offset: float = 0.0
+	## DEV/TEST freeze_time latch (remote `freeze_time`, dev-instrument tooling). When true, advance() is a
+	## no-op — the ENTIRE celestial clock is held (sun/moon/planets/spin/day-night all stop together for a
+	## stable capture), and resume continues from the held `t`. Default false ⇒ advance() is byte-identical.
+	## Only ever set through Player.remote_freeze_time under a live control grant, so it is inert in normal play.
+	var frozen: bool = false
 
 	func _init(t0: float = 0.0) -> void:
 		t = t0
@@ -111,8 +116,16 @@ class CosmosClock extends RefCounted:
 	## Advance the clock by a REAL frame delta (seconds); the sky moves √1000× via the scaled GM, and
 	## TIME_WARP (=1) is the only extra multiplier. Pure accumulation — no wall clock is read here. NB:
 	## only `t` accumulates; the dev time-cheat `offset` is preserved, so the set phase persists as time runs.
+	## DEV/TEST: while `frozen` the clock is held (advance is skipped) so a captured frame has stable lighting.
 	func advance(real_dt: float) -> void:
+		if frozen:
+			return
 		t += real_dt * CosmosEphemeris.TIME_WARP
+
+	## DEV/TEST freeze_time: hold/resume the celestial clock. `now()` (t + offset) is unchanged while held;
+	## set_time's add_offset still folds a phase in (the set holds), and resume ticks on from the held `t`.
+	func set_frozen(f: bool) -> void:
+		frozen = f
 
 	func now() -> float:
 		return t + offset

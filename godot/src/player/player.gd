@@ -69,6 +69,12 @@ var flying := false
 ## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
 var frozen := false
 
+# DEV/TEST freeze_player latch (dev-instrument tooling): pins the player (early-return in _physics_process) so a
+# capture hold is genuinely stationary — no gravity, no dev-fly drift, no orbital coast. Default false ⇒ the
+# _physics_process branch is never taken (byte-identical normal play); only set through remote_freeze_player
+# under a live control grant. Distinct from `frozen` (the one-shot boot-prewarm freeze main.gd owns).
+var _dev_freeze_player := false
+
 # COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.3): the coordinate-frame adapter that bridges the
 # player's canonical LATTICE frame (its LOCAL transform under WorldManager's ActiveFrame) and the GLOBAL/absolute
 # frame the physics server + renderer consume. Every physics-boundary conversion below routes through it. Fetched
@@ -653,6 +659,13 @@ func _physics_process(delta: float) -> void:
 	# G-REENTRY FIX A: restore frame/pose consistency FIRST, before any consumer (movers, floor, nav)
 	# reads `position` — a half-committed crossing from LAST frame must never be interpreted this frame.
 	_heal_frame_desync()
+	# DEV/TEST freeze_player: pin the player (no gravity, no dev-fly drift, no orbital coast) for a genuinely
+	# stationary capture. We early-return BEFORE _move / streaming / nav so `position` is invariant across ticks
+	# (the gate asserts this). Velocity is zeroed so nothing integrates on resume. Default off ⇒ byte-identical
+	# normal play (the branch is not taken); only ever set through remote_freeze_player under a live grant.
+	if _dev_freeze_player:
+		velocity = Vector3.ZERO
+		return
 	# REMOTE-DRIVE (§4.3): snapshot the pre-locomotion LATTICE position so the executor measures pure
 	# _move() displacement — uncontaminated by the reanchor/flip/cross corrections that follow. Captured
 	# here and forwarded to physics_tick at the END of the frame (once the crossing yaw_delta is known).
@@ -2140,6 +2153,130 @@ func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
 		delta = _EphCls.offset_for_local_hours(CosmosSky.OBSERVER, up_bf, t_eff, local_hours)
 	clock.add_offset(delta)
 	return true
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# DEV/TEST INSTRUMENTATION ACTUATORS (dev-instrument tooling) — teleport / set_alt / freeze_time /
+# freeze_player. The comfortable-analysis surface the RemoteControl executor drives so the orchestrator can
+# place the camera PRECISELY and hold a STABLE frame for autonomous visual capture (no fly-overshoot, no
+# altitude drift, no 45-min day/night creep). Each is CONTROL_ENABLED-gated (the executor only exists under a
+# grant) and the freeze latches default OFF ⇒ byte-identical in normal play. teleport/set_alt derive surface
+# height from the ANALYTIC column law (world.surface_y — the shared heightmap, NEVER the voxel buffer) and
+# route through the SAME safe reposition (_dev_reposition), which re-seeds fid/pose/BCI CONSISTENTLY so the
+# known re-entry teleport blowup (fid/pose desync + finite-difference velocity latch) cannot occur.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## SAFE REPOSITION (the anti-blowup core). Place the player at `lattice_pos` expressed in facet `fid`'s lattice
+## frame and re-seed EVERY piece of state the crossing/re-entry machinery relies on, so no consumer this frame
+## or next can interpret the jump as motion or read a stale frame:
+##   1. commit active facet = fid, WRITE position, STAMP _pos_fid = fid ⇒ _heal_frame_desync() sees pose/frame
+##      consistency (a no-op) — the 11081-block "stale-frame teleport" (G-REENTRY FIX A) is structurally impossible.
+##   2. zero velocity + DROP the finite-difference history (_nav_have_prev = false) so _nav_tick RESTS one frame
+##      instead of computing Δp/dt across the jump (the 642074 v_bci latch, G-REENTRY FIX B) — then re-derives fresh.
+##   3. clear every carried BCI / coast / dev-flight / free-fall latch so the controllers re-seed from the NEW
+##      lattice pose (no stale [p,v] pair keeps driving the old orbit and ignoring the teleport).
+##   4. kick streaming so the near field + far ring + block-LOD re-place around the new spot (the same per-frame
+##      call the engine drives; the huge one-frame jump is rejected by update_streaming's velocity-predict clamp).
+func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
+	if fid >= 0:
+		TerrainConfig.set_active_facet(fid)
+	position = lattice_pos
+	_pos_fid = TerrainConfig.active_facet()                 # frame/pose consistent ⇒ _heal_frame_desync() no-op
+	velocity = Vector3.ZERO
+	# Drop the finite-difference + every carried BCI/coast/free-fall/dev-flight latch (the re-entry latch guards).
+	_nav_have_prev = false
+	_nav_prev_fix = PackedFloat64Array()
+	_nav_last_v_bci = PackedFloat64Array()
+	_dev_active = false
+	_dev_have_v = false
+	_dev_v_bci = PackedFloat64Array()
+	_dev_p_bci = PackedFloat64Array()
+	_orbit_coasting = false
+	_coast_p_bci = PackedFloat64Array()
+	_coast_v_bci = PackedFloat64Array()
+	_fall_p_bci = PackedFloat64Array()
+	_fall_v_bci = PackedFloat64Array()
+	_foff_radial = false
+	if world != null:
+		world.update_streaming(position)
+
+## teleport (dev): place the player at an absolute pose. `mode` == "xyz" ⇒ `a`,`b`,`c` are ACTIVE-FACET LATTICE
+## coords (the frame `position` lives in — the same frame set_alt / snapshots operate in; kept in the CURRENT
+## facet, so no facet change and no desync). `mode` == "geo" ⇒ `a` = lat_deg, `b` = lon_deg, `c` = alt (blocks
+## above the LOCAL analytic surface); the facet is resolved from the world direction and the surface height from
+## world.surface_y. Returns true on success, false when there is no world.
+func remote_teleport(mode: String, a: float, b: float, c: float) -> bool:
+	if world == null:
+		return false
+	if mode == "geo":
+		return _dev_teleport_geo(a, b, c)
+	_dev_reposition(TerrainConfig.active_facet(), Vector3(a, b, c))
+	return true
+
+## teleport geodetic: lat/lon (world body-fixed geographic — +Y is the pole; lon measured around +Y from +X
+## toward +Z) → a surface column; place `alt` blocks above its ANALYTIC surface (world.surface_y). The facet is
+## resolved by scanning the Earth facets for the one whose polygon contains the mapped column, so the pose lands
+## in a self-consistent facet frame. Returns false if no facet contains the direction (should not happen for a
+## unit sphere) or there is no world.
+func _dev_teleport_geo(lat_deg: float, lon_deg: float, alt: float) -> bool:
+	if world == null:
+		return false
+	var lat := deg_to_rad(clampf(lat_deg, -90.0, 90.0))
+	var lon := deg_to_rad(lon_deg)
+	var dir := Vector3(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon))   # unit world direction (+Y pole)
+	var col := _dev_facet_column(dir)
+	if col.is_empty():
+		return false
+	var fid: int = int(col["fid"])
+	var xf := float(int(col["x"])) + 0.5
+	var zf := float(int(col["z"])) + 0.5
+	TerrainConfig.set_active_facet(fid)                     # surface_y reads the ACTIVE facet's column
+	var sy := world.surface_y(xf, zf)
+	_dev_reposition(fid, Vector3(xf, sy + alt, zf))
+	return true
+
+## Resolve the world direction `dir` to {fid, x, z} (the Earth facet + integer lattice column containing it), or
+## {} if none matches. Scans only the Earth body's facets; first containing polygon wins. Dev-only (O(6·k²)).
+func _dev_facet_column(dir: Vector3) -> Dictionary:
+	var d := dir.normalized()
+	var w := d * _FacetAtlasCls.R_BLOCKS
+	var base := _FacetAtlasCls.fid_base(0)                  # Earth = body index 0
+	var n := _FacetAtlasCls.body_facet_count(0)
+	for fid in range(base, base + n):
+		var l: Array = _FacetAtlasCls.world_to_lattice64(fid, w.x, w.y, w.z)
+		var xi := floori(l[0])
+		var zi := floori(l[2])
+		if _FacetAtlasCls.in_polygon(fid, xi, zi, 0.5):
+			return {"fid": fid, "x": xi, "z": zi}
+	return {}
+
+## set_alt (dev): teleport straight to `alt` blocks above the CURRENT sub-player ANALYTIC surface, keeping the
+## current facet + lattice x,z EXACTLY (zero horizontal move). The most-used framing op. Returns true on success.
+func remote_set_alt(alt: float) -> bool:
+	if world == null:
+		return false
+	var sy := world.surface_y(position.x, position.z)
+	_dev_reposition(TerrainConfig.active_facet(), Vector3(position.x, sy + alt, position.z))
+	return true
+
+## freeze_time (dev): pause/resume the ONE celestial clock the whole ephemeris reads (sun/moon/planets/spin/
+## day-night all stop together for a stable capture). set_time still folds an offset while frozen (the phase
+## holds); resume continues from the held time. Returns false (a no-op) when there is no clock (ORBITAL_SKY off),
+## mirroring remote_set_time's inert-guard so a scripted freeze fails loudly rather than silently.
+func remote_freeze_time(on: bool) -> bool:
+	if world == null:
+		return false
+	var clock: CosmosEphemeris.CosmosClock = world.cosmos_clock()
+	if clock == null:
+		return false
+	clock.set_frozen(on)
+	return true
+
+## freeze_player (dev): pin the player — no gravity, no dev-fly drift, no orbital coast — so a hold is genuinely
+## stationary for a clean frame. Zeroes velocity immediately; the latch makes _physics_process an early-return
+## no-op while on (position invariant across ticks). Off restores normal physics. Inert unless a caller sets it.
+func remote_freeze_player(on: bool) -> void:
+	_dev_freeze_player = on
+	velocity = Vector3.ZERO
 
 ## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
 ## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE

@@ -57,17 +57,28 @@ var _wholesale_clears := 0             # diagnostics: ledger-breach wholesale cl
 
 # COSMOS MAIN-THREAD ORCHESTRATION TH4 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §2 — same worker/commit split
 # the §2V FacetTexBaker proved): the ~1 s analytic L0 bake + greedy mesh (_build_facet_arrays, PURE) runs on the TH0
-# JobLane WORKER; MAIN pays ONLY the commit (ArrayMesh + add_child + ledger). Single in-flight (one staging slot) —
-# a crossing enqueues the ≤5 band facets and they stream in one-per-round-trip; during the gap the sunk far ring
-# backstops (no hole). The offload is live iff a lane was handed in (set_job_lane) — else the synchronous fallback
-# (headless gate / no FP_JOB_LANE) drains inline, byte-identical to the P1 build.
+# JobLane WORKER; MAIN pays ONLY the commit (ArrayMesh + add_child + ledger). CONVERGENCE: the whole band (≤5) is
+# submitted UP FRONT on arrival/crossing at PRIORITY_BLOCK_LOD (above the far-skin g1 shot convergence), so the units
+# COMPUTE in parallel on the lane's free worker slots (not serialized one-per-round-trip) and the active transition
+# band fills within a couple of seconds. Each unit carries its OWN staging buffer (a BakeUnit RefCounted, single-
+# writer per worker ⇒ no shared-Dictionary race); the MAIN commit stays paced by the lane's per-frame drain budget
+# (each upload ≈ 2 ms), so main_commit stays ≈0. During the fill gap the sunk far ring backstops (no hole). The
+# offload is live iff a lane was handed in (set_job_lane) — else the synchronous fallback (headless gate / no
+# FP_JOB_LANE) drains inline, byte-identical to the P1 build. NEVER-OOM: transient staging is bounded by the lane's
+# in-flight slots (≤2) + the ≤6/frame commit drain, freed on commit; the 16 MB committed-mesh ledger is unchanged.
 var _lane: JobLane = null
 var _worker_on := false                # _lane != null: the async offload is live (main never bakes)
-var _pending: Array = []               # fids queued to bake (band-ordered; async path), not yet dispatched/resident
-var _bake_busy := false                # single in-flight: a facet is on the worker (or awaiting its commit)
-var _staging_fid := -1                 # the facet currently on the worker
-var _staging_arrays: Dictionary = {}   # worker→main handoff (submitter-owned single-writer while in flight)
+var _inflight: Dictionary = {}         # fid -> BakeUnit: submitted (computing or awaiting commit), NOT yet resident
 var _statics_warm := false             # the worker-touched statics (noise / palette) were prewarmed on MAIN
+var _dispatch_rounds := 0              # diagnostics: rebuild() calls that submitted ≥1 unit (G-BLD-CONVERGE observable)
+
+## One async bake unit: its own staging buffer so multiple units compute concurrently without sharing a mutable
+## structure across threads (the worker writes ONLY its own `arrays`; MAIN reads it in the commit). RefCounted ⇒
+## auto-freed once dropped from _inflight after the commit (transient staging, NEVER-OOM).
+class BakeUnit:
+	extends RefCounted
+	var fid := -1
+	var arrays: Dictionary = {}
 
 
 func setup(active_fid: int) -> void:
@@ -110,75 +121,56 @@ func band_fids(active_fid: int) -> Array:
 	return out
 
 
-## Re-place + re-stream the band for a (possibly new) active facet. Called on setup and on every crossing. Enqueues any
-## band facet not yet resident (async: streamed one-per-round-trip on the worker — MAIN never bakes), touches the LRU
-## of the whole band, prunes stale pending, then evicts down to the cap / ledger (never the band). A facet already
-## resident is a pure LRU touch. With NO lane (headless gate) the queue drains inline (byte-identical to P1).
+## Re-place + re-stream the band for a (possibly new) active facet. Called on setup and on every crossing. Submits
+## EVERY not-yet-resident band facet UP FRONT to the lane at PRIORITY_BLOCK_LOD (so the ≤5 units compute in parallel
+## on the free worker slots and beat the far-skin g1 refinement — no starvation), touches the LRU of the whole band,
+## then evicts down to the cap / ledger (never the band). A facet already resident (or in flight) is a pure LRU touch.
+## With NO lane (headless gate / FP_JOB_LANE off) it builds inline (byte-identical to P1).
 func rebuild(active_fid: int) -> void:
 	_active_fid = active_fid
 	var band := band_fids(active_fid)
 	var now := Time.get_ticks_msec()
+	var submitted := 0
 	for fid in band:
 		_lru[fid] = now
-		if _mesh_by_fid.has(fid) or fid == _staging_fid:
+		if _mesh_by_fid.has(fid):
 			continue
-		if not _pending.has(fid):
-			_pending.append(fid)
-	# Drop pending facets no longer in the band (a crossing moved on before they baked — the far-ring warm discipline).
-	var i := _pending.size() - 1
-	while i >= 0:
-		if not band.has(_pending[i]):
-			_pending.remove_at(i)
-		i -= 1
-	if not _worker_on:
-		_drain_pending_sync()          # no lane: build inline (gate / FP_JOB_LANE off) — the P1 path, unchanged
-	else:
-		_maybe_dispatch()              # kick the worker if idle (commit of the previous unit re-arms via _process)
+		if not _worker_on:
+			_commit_facet_arrays(fid, _build_facet_arrays(fid))   # sync fallback: inline build (P1 path, unchanged)
+		elif not _inflight.has(fid):
+			_submit_bake(fid)                                     # async: dispatch the whole band up front
+			submitted += 1
+	if submitted > 0:
+		_dispatch_rounds += 1
 	_enforce_budget(band)
 
 
-## Build every queued facet inline on the calling thread (the synchronous fallback: no job lane). Used by the headless
-## gate (which reads the meshes immediately) and any build with FP_JOB_LANE off. Byte-identical to the P1 behaviour.
-func _drain_pending_sync() -> void:
-	while not _pending.is_empty():
-		var fid: int = _pending.pop_front()
-		if not _mesh_by_fid.has(fid):
-			_commit_facet_arrays(fid, _build_facet_arrays(fid))
+## Submit one facet's bake to the lane: its own BakeUnit staging buffer (single-writer on the worker), high priority
+## so the active transition band converges ahead of far-skin refinement. The lane runs ≤_max_inflight units at once.
+func _submit_bake(fid: int) -> void:
+	var unit := BakeUnit.new()
+	unit.fid = fid
+	_inflight[fid] = unit
+	_lane.submit(JobLane.PRIORITY_BLOCK_LOD,
+		Callable(self, "_worker_bake").bind(unit), Callable(self, "_worker_commit").bind(unit), "blocklod-%d" % fid)
 
 
-## MAIN, once per frame (via _process): if the worker is idle and a facet is queued, dispatch ONE bake unit to the
-## lane. The worker fills _staging_arrays (single-writer, single in-flight); the lane's commit uploads it on main.
-func _maybe_dispatch() -> void:
-	if not _worker_on or _bake_busy or _pending.is_empty():
-		return
-	# Skip any queued facet already resident (a re-cross may have re-added it after it committed).
-	while not _pending.is_empty() and _mesh_by_fid.has(_pending[0]):
-		_pending.pop_front()
-	if _pending.is_empty():
-		return
-	_staging_fid = _pending.pop_front()
-	_bake_busy = true
-	_lane.submit(JobLane.PRIORITY_OPPORTUNISTIC,
-		Callable(self, "_worker_bake"), Callable(self, "_worker_commit"), "blocklod")
+## WORKER THREAD: the heavy pure compute (L0 bake + greedy mesh) into THIS unit's own buffer. Touches NO
+## RenderingServer / scene tree (only reads the prewarmed statics + writes unit.arrays — single-writer, race-free).
+func _worker_bake(unit: BakeUnit) -> void:
+	unit.arrays = _build_facet_arrays(unit.fid)
 
 
-## WORKER THREAD: the heavy pure compute (L0 bake + greedy mesh) into the single staging slot. Touches NO
-## RenderingServer / scene tree (only reads the prewarmed statics + writes the submitter-owned _staging_arrays).
-func _worker_bake() -> void:
-	_staging_arrays = _build_facet_arrays(_staging_fid)
-
-
-## MAIN THREAD (lane commit, budgeted): upload the staged arrays (ArrayMesh + add_child + ledger) — the ONLY GPU/tree
-## touch, and the cheap part. Then re-arm: clear the in-flight slot + re-enforce the budget (a facet baked while the
-## band moved on is committed then LRU-evicted). The next _process dispatches the next queued facet.
-func _worker_commit() -> void:
-	var fid := _staging_fid
-	var arr := _staging_arrays
-	_staging_arrays = {}
-	_staging_fid = -1
-	_bake_busy = false
+## MAIN THREAD (lane commit, paced by the drain budget): upload this unit's staged arrays (ArrayMesh + add_child +
+## ledger) — the ONLY GPU/tree touch, the cheap part (≈2 ms). Drop the unit from in-flight (RefCounted frees the
+## staging), then re-enforce the budget (a unit baked while the band moved on commits then LRU-evicts). Commits are
+## bounded ≤6/frame by the lane, so a whole-band burst spreads without a main hitch.
+func _worker_commit(unit: BakeUnit) -> void:
+	var fid := unit.fid
+	_inflight.erase(fid)
 	if not _mesh_by_fid.has(fid):
-		_commit_facet_arrays(fid, arr)
+		_commit_facet_arrays(fid, unit.arrays)
+	unit.arrays = {}
 	_enforce_budget(band_fids(_active_fid))
 
 
@@ -202,9 +194,8 @@ func _process(_delta: float) -> void:
 	# screen-door-discards until (now − arrival) exceeds BLOCK_LOD_DITHER_S. One uniform write/frame.
 	if _material != null:
 		_material.set_shader_parameter("u_now", float(Time.get_ticks_msec()) / 1000.0)
-	# TH4: dispatch the next queued bake unit if the worker is free (the lane's commit, pumped by WorldManager, cleared
-	# _bake_busy). No-op when synchronous (no lane), idle, or already busy — main pays ~0 here.
-	_maybe_dispatch()
+	# TH4: the whole band is submitted up front by rebuild(); the lane (pumped by WorldManager) runs + commits the
+	# units. Nothing to dispatch per-frame here — main pays only the u_now uniform write.
 
 
 # ---- ledger / LRU (NEVER-OOM §5) -------------------------------------------------------------------------------
@@ -230,16 +221,19 @@ func draw_count() -> int:
 func wholesale_clears() -> int:
 	return _wholesale_clears
 
-# --- async observables (headless gate: G-BLD-MAINCOST) ----------------------------------------------------------
+# --- async observables (headless gate: G-BLD-MAINCOST / G-BLD-CONVERGE) ------------------------------------------
+func inflight_count() -> int:
+	return _inflight.size()
+
+func dispatch_rounds() -> int:
+	return _dispatch_rounds
+
 func is_baking() -> bool:
-	return _bake_busy
+	return not _inflight.is_empty()
 
-func pending_count() -> int:
-	return _pending.size()
-
-## True once the worker path has fully streamed the current band (nothing queued, nothing on the worker).
+## True once the worker path has fully streamed the current band (nothing computing, nothing awaiting commit).
 func async_idle() -> bool:
-	return _pending.is_empty() and not _bake_busy
+	return _inflight.is_empty()
 
 
 ## Evict resident facets outside `band`, LRU-first, until BOTH the LRU-facet cap AND the byte ledger are satisfied.

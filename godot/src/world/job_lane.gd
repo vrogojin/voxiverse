@@ -28,11 +28,15 @@ extends RefCounted
 ## marshalling buffers (those are the submitter's preallocated ledgers). Even its own Job bookkeeping is
 ## POOLED (a free-list, `_free`) so a steady stream of submits does not churn the shared WASM allocator.
 
-# Priority bands (higher dispatches first) — the design's ordering: crossing > tex bake > manifest > opportunistic.
-const PRIORITY_CRITICAL := 100      # crossing-critical far-ring rebuild (TH2 force paths)
-const PRIORITY_TEXTURE := 70        # facet-tex base / close-up bake (TH1)
+# Priority bands (higher dispatches first) — the design's ordering: crossing > active transition band > tex bake >
+# manifest > opportunistic.
+const PRIORITY_CRITICAL := 100      # crossing-critical far-ring rebuild (TH2 force paths) — must win (no blank world)
+const PRIORITY_BLOCK_LOD := 80      # BLOCK-LOD L1 rim band bake (TH4): the ACTIVE near→far transition the player is
+                                    # flying through — it must converge in a few seconds, so it outranks the far-skin
+                                    # texture refinement (§2V g1 shot convergence) that would otherwise starve it.
+const PRIORITY_TEXTURE := 70        # facet-tex base / close-up / g1 shot bake (TH1) — far-skin refinement
 const PRIORITY_MANIFEST := 40       # manifest model construction (TH3)
-const PRIORITY_OPPORTUNISTIC := 10  # skin tiles / block-LOD / bulk warm (TH4)
+const PRIORITY_OPPORTUNISTIC := 10  # skin tiles / bulk warm (TH4)
 
 # Default main-thread drain budget — the commit phase never spends more than this per frame (design §3: the
 # main thread pays ONLY the bounded commit). Callers may override per-pump for a specific subsystem cadence.

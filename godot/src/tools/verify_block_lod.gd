@@ -154,18 +154,16 @@ func _initialize() -> void:
 	var sync_ms := float(Time.get_ticks_usec() - ts) / 1000.0
 
 	# (b) async: worker bakes, main only commits (measured via the lane's accumulated main-commit clock).
-	var lane := JobLane.new(1)
+	var lane := JobLane.new(2)
 	var async_ring := FacetBlockLodRing.new()
 	root.add_child(async_ring)
 	async_ring._prewarm_statics(mc_fid)
 	async_ring.set_job_lane(lane)
 	lane.take_main_commit_ms()                       # reset the accumulator
-	async_ring._pending = [mc_fid]
-	async_ring._maybe_dispatch()                     # submit the bake unit to the worker
+	async_ring._submit_bake(mc_fid)                  # submit the single bake unit to the worker (own staging buffer)
 	var guard := 0
-	while not async_ring.async_idle() and guard < 20000:
+	while not async_ring.async_idle() and guard < 30000:
 		lane.pump()
-		async_ring._maybe_dispatch()
 		OS.delay_msec(1)
 		guard += 1
 	var async_ms := lane.take_main_commit_ms()       # ONLY the commit ran on main; the ~1 s bake was on the worker
@@ -177,6 +175,46 @@ func _initialize() -> void:
 	print("  INFO G-BLD-MAINCOST: crossing main-thread cost per facet  BEFORE(sync)=%.1f ms  →  AFTER(async commit)=%.2f ms" % [sync_ms, async_ms])
 	sync_ring.queue_free()
 	async_ring.queue_free()
+
+	# ================= G-BLD-CONVERGE — the whole band bakes in a couple of seconds, not starved ================
+	# The live report: draws stuck at far-only, +2 facets in 50 s — the band was dispatched one-per-round-trip at
+	# OPPORTUNISTIC priority, starved behind §2V's g1 shot convergence. Fix: submit the WHOLE band up front at
+	# PRIORITY_BLOCK_LOD (> texture), computing in parallel on the free worker slots. Assert: (1) one rebuild submits
+	# the whole band (1 dispatch round, not band_size); (2) it converges fully resident; (3) MAIN commit stays ≈0;
+	# (4) ledger ≤ 16 MB; (5) block-LOD outranks the texture lane.
+	_ok(JobLane.PRIORITY_BLOCK_LOD > JobLane.PRIORITY_TEXTURE,
+		"G-BLD-CONVERGE: block-LOD priority (%d) > texture (%d) — the transition band beats far-skin g1 refinement" % [JobLane.PRIORITY_BLOCK_LOD, JobLane.PRIORITY_TEXTURE])
+	var cfid := 1500
+	var clane := JobLane.new(2)
+	var cring := FacetBlockLodRing.new()
+	root.add_child(cring)
+	cring._prewarm_statics(cfid)
+	cring.set_job_lane(clane)
+	clane.take_main_commit_ms()
+	cring.rebuild(cfid)                               # ONE rebuild → whole band submitted up front
+	var cband := cring.band_fids(cfid)
+	var missing := 0
+	for fid in cband:
+		if not cring.resident_fids().has(fid):
+			missing += 1
+	_ok(cring.inflight_count() == missing and cring.dispatch_rounds() == 1,
+		"G-BLD-CONVERGE: whole band (%d, %d missing) submitted UP FRONT in 1 dispatch round (in-flight=%d, not serialized)" % [cband.size(), missing, cring.inflight_count()])
+	var cguard := 0
+	while not cring.async_idle() and cguard < 40000:
+		clane.pump()
+		OS.delay_msec(1)
+		cguard += 1
+	var conv_ms := clane.take_main_commit_ms()
+	var all_res := true
+	for fid in cband:
+		if not cring.resident_fids().has(fid):
+			all_res = false
+	_ok(all_res, "G-BLD-CONVERGE: full band resident after convergence (not starved)")
+	_ok(cring.dispatch_rounds() <= 2, "G-BLD-CONVERGE: converged in %d dispatch round(s) ≤ band+slack (was ~%d serialized)" % [cring.dispatch_rounds(), cband.size()])
+	_ok(conv_ms < 100.0, "G-BLD-CONVERGE: whole-band MAIN commit %.2f ms ≈ 0 (the ~%d s of bakes stayed on the worker)" % [conv_ms, cband.size()])
+	_ok(cring.ledger_bytes() <= CubeSphere.BLOCK_LOD_BYTES_MAX, "G-BLD-CONVERGE: ledger %d B ≤ 16 MB after the whole-band burst" % cring.ledger_bytes())
+	print("  INFO G-BLD-CONVERGE: band=%d  dispatch_rounds=%d (was ~%d one-per-round serialized)  whole-band main_commit=%.2f ms" % [cband.size(), cring.dispatch_rounds(), cband.size(), conv_ms])
+	cring.queue_free()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)

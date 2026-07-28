@@ -38,8 +38,12 @@ extends Node3D
 ## the measured ledger == arithmetic, LRU never evicts the active band, draws ≈ facets, and the no-protrusion + weld
 ## laws (G-BLD-MIN / G-BLD-PYR / G-BLD-SEAM / G-BLD-BYTES / G-BLD-DRAWS).
 
-const LEVEL := 1                       # P1: the L1 (2-block pitch) tier — the rim ring (Fable §4 override)
-const PITCH := 1 << LEVEL              # 2 blocks per L1 megablock
+# P2 GENERALIZATION (docs/COSMOS-BLOCK-LOD-DESIGN.md §4 ladder) — the level is now a PER-INSTANCE parameter, not a
+# const. P1 (FP_BLOCK_LOD) constructs the ring at the default _level==1 (byte-identical to the shipped L1 rim ring);
+# the P2 ladder (FacetBlockLodLadder, FP_BLOCK_LOD_RINGS) constructs one ring per level L2..cap via setup(fid, n).
+# Everything downstream (pitch, greedy tile size, ledger) derives from _level, so ONE mesher serves the whole ladder.
+var _level := 1                        # this ring's pyramid level (1=L1 rim / P1; 2..5 = the P2 ladder tiers)
+var _pitch := 2                        # blocks per megablock at this level (1 << _level)
 
 # Per-vertex ArrayMesh cost (no NORMAL array — the unshaded shader derives the radial normal): position(12) +
 # color(16) + uv(8) = 36 B/vertex; indices are int32 (4 B). The ledger below sums exactly this.
@@ -47,10 +51,13 @@ const BYTES_PER_VERT := 36
 const BYTES_PER_INDEX := 4
 
 var _active_fid := -1
+var _band: Array = []                  # the protected (never-evicted) facet set last streamed — ridge-1 (P1) or ladder-assigned
 var _mesh_by_fid: Dictionary = {}      # fid -> MeshInstance3D (one draw per resident facet)
 var _bytes_by_fid: Dictionary = {}     # fid -> int (arithmetic mesh bytes; summed into _ledger_bytes)
 var _lru: Dictionary = {}              # fid -> last-touched ms (LRU eviction key; band fids never evicted)
 var _ledger_bytes := 0                 # Σ _bytes_by_fid — the NEVER-OOM ledger (≤ BLOCK_LOD_BYTES_MAX)
+var _byte_cap := CubeSphere.BLOCK_LOD_BYTES_MAX   # per-ring byte ceiling; the ladder lifts this to govern globally
+var _lru_cap := CubeSphere.BLOCK_LOD_LRU_FACETS   # per-ring resident-facet cap (residency bound; band never evicted)
 var _material: ShaderMaterial = null
 var _sun_dir := Vector3(1.0, 0.0, 0.0)
 var _wholesale_clears := 0             # diagnostics: ledger-breach wholesale clears (gate reads to prove it fired)
@@ -81,12 +88,30 @@ class BakeUnit:
 	var arrays: Dictionary = {}
 
 
-func setup(active_fid: int) -> void:
+## P2: `level` selects the pyramid tier (1=L1 rim / P1 default; 2..5 = ladder). Byte-identical to P1 at level==1.
+## `do_rebuild` = false lets the ladder create a tier ring WITHOUT the P1 ridge-1 initial stream (the ladder drives its
+## own per-level assigned band right after) — avoids leaving near ridge-1 facets stranded at a coarse level.
+func setup(active_fid: int, level: int = 1, do_rebuild: bool = true) -> void:
+	_level = clampi(level, 1, FacetBlockLod.LEVELS - 1)
+	_pitch = 1 << _level
 	_active_fid = active_fid
 	_material = _make_material()
 	_prewarm_statics(active_fid)
 	set_process(true)
-	rebuild(active_fid)
+	if do_rebuild:
+		rebuild(active_fid)
+
+
+func level() -> int:
+	return _level
+
+
+## P2 shared-budget hook: the ladder governs the CROSS-LEVEL byte ceiling, so it lifts each managed ring's own byte
+## cap (leaving only the per-ring LRU-facet cap as a residency bound) and does the finest-first coarsening itself.
+## Untouched ⇒ the P1 defaults (16 MB / 9 facets) — byte-identical.
+func set_caps(byte_cap: int, lru_facets: int) -> void:
+	_byte_cap = byte_cap
+	_lru_cap = lru_facets
 
 
 ## TH4 (FP_TEX_BAKE_WORKER's set_job_lane twin): hand the block-LOD ring the ONE TH0 job lane. Once set, the L0
@@ -128,10 +153,18 @@ func band_fids(active_fid: int) -> Array:
 ## With NO lane (headless gate / FP_JOB_LANE off) it builds inline (byte-identical to P1).
 func rebuild(active_fid: int) -> void:
 	_active_fid = active_fid
-	var band := band_fids(active_fid)
+	rebuild_band(band_fids(active_fid))
+
+
+## P2: stream an EXPLICIT set of facets at this ring's level (the ladder assigns per-level bands by the distance law).
+## `fids` becomes the protected band (never LRU-evicted). Submits every not-yet-resident facet UP FRONT to the lane
+## (parallel worker slots), LRU-touches the whole set, then enforces the per-ring budget. rebuild() routes through
+## here with the ridge-1 band ⇒ P1 is byte-identical (same submit/enforce path, same protected set).
+func rebuild_band(fids: Array) -> void:
+	_band = fids
 	var now := Time.get_ticks_msec()
 	var submitted := 0
-	for fid in band:
+	for fid in fids:
 		_lru[fid] = now
 		if _mesh_by_fid.has(fid):
 			continue
@@ -142,7 +175,27 @@ func rebuild(active_fid: int) -> void:
 			submitted += 1
 	if submitted > 0:
 		_dispatch_rounds += 1
-	_enforce_budget(band)
+	_enforce_budget(fids)
+
+
+## The protected band this ring last streamed (ridge-1 for P1; the ladder's per-level assignment for L2..L5). The
+## cross-level coordinator reads it to know which facets NOT to coarsen away.
+func current_band() -> Array:
+	return _band
+
+
+## P2 GLOBAL reuse: greedy-mesh `fid` from an EXTERNALLY-sampled level dict (the L5 store), returning the same
+## {verts,colors,uvs,indices,bytes,...} arrays the ladder commits. Lets FacetBlockLodGlobal share ONE mesher + shade
+## law without re-baking L0. Pure w.r.t. the scene tree.
+func mesh_arrays_from_level(fid: int, lvl: Dictionary) -> Dictionary:
+	return _build_facet_arrays(fid, lvl)
+
+## The shared unshaded vertex-colour material (shell shade·tint + arrival dither). Lazily built so a mesher-only ring
+## (never setup()) can hand it to the global tier's merged MeshInstances ⇒ ONE shade law near↔L1↔ladder↔L5↔skin.
+func shared_material() -> ShaderMaterial:
+	if _material == null:
+		_material = _make_material()
+	return _material
 
 
 ## Submit one facet's bake to the lane: its own BakeUnit staging buffer (single-writer on the worker), high priority
@@ -171,7 +224,7 @@ func _worker_commit(unit: BakeUnit) -> void:
 	if not _mesh_by_fid.has(fid):
 		_commit_facet_arrays(fid, unit.arrays)
 	unit.arrays = {}
-	_enforce_budget(band_fids(_active_fid))
+	_enforce_budget(_band)
 
 
 ## Set the render placement (absolute planet coords → current render frame). Mirrors the far ring's own node
@@ -242,23 +295,47 @@ func async_idle() -> bool:
 ## facets) and is the irreducible floor.
 func _enforce_budget(band: Array) -> void:
 	# 1) LRU cap on resident facets.
-	while _mesh_by_fid.size() > CubeSphere.BLOCK_LOD_LRU_FACETS:
+	while _mesh_by_fid.size() > _lru_cap:
 		var victim := _lru_victim(band)
 		if victim < 0:
 			break
 		_evict(victim)
 	# 2) Byte ledger.
-	if _ledger_bytes <= CubeSphere.BLOCK_LOD_BYTES_MAX:
+	if _ledger_bytes <= _byte_cap:
 		return
-	while _ledger_bytes > CubeSphere.BLOCK_LOD_BYTES_MAX:
+	while _ledger_bytes > _byte_cap:
 		var victim := _lru_victim(band)
 		if victim < 0:
 			break                                  # only the band remains — the bounded floor
 		_evict(victim)
 	# 3) Wholesale-clear guard: if a single band build overran the ceiling, drop every non-band facet in one sweep
 	#    (already achieved above); record the breach so the gate can see the safety fired.
-	if _ledger_bytes > CubeSphere.BLOCK_LOD_BYTES_MAX:
+	if _ledger_bytes > _byte_cap:
 		_wholesale_clears += 1
+
+
+## P2 cross-level coarsening hook (FacetBlockLodLadder): evict this ring's single LRU-oldest non-`band` facet and
+## return the bytes freed (0 if nothing outside the band is resident). The ladder calls this finest-level-first on a
+## shared-ceiling breach ("drop the finest streamed level first") — a facet dropped here still has the coarser tiers +
+## the sunk far ring underneath, so no hole. Distinct from _enforce_budget (which bounds ONE ring against its own cap).
+func evict_one_lru(band: Array) -> int:
+	var victim := _lru_victim(band)
+	if victim < 0:
+		return 0
+	var freed := int(_bytes_by_fid.get(victim, 0))
+	_evict(victim)
+	return freed
+
+
+## P2 hard-breach coarsening: wholesale-clear this ENTIRE ring (band included) and return the bytes freed. The
+## coordinator calls this on the FINEST streamed level when even the protected bands overrun the shared ceiling
+## ("drop the finest streamed level first", design §5) — the coarser tiers + the sunk far ring still cover the band ⇒
+## no hole. Idempotent (0 when already empty).
+func clear_all() -> int:
+	var freed := _ledger_bytes
+	for fid in _mesh_by_fid.keys():
+		_evict(fid)
+	return freed
 
 
 func _lru_victim(band: Array) -> int:
@@ -318,17 +395,24 @@ func _commit_facet_arrays(fid: int, arr: Dictionary) -> void:
 ## Greedy-mesh facet `fid`'s L1 tier into absolute-coord arrays. Pure w.r.t. the RenderingServer (a gate can call it
 ## directly). Returns {verts, colors, uvs, indices, bytes, n_top, n_side, n_skirt, edges}. `edges` is the set of
 ## emitted vertical-edge keys (side + skirt) — the seam bookkeeping G-BLD-SEAM audits against the required set.
-func _build_facet_arrays(fid: int) -> Dictionary:
-	var lod := FacetBlockLod.new()
-	lod.build(fid)
-	var lvl := lod.get_level(LEVEL)
+func _build_facet_arrays(fid: int, lvl_override: Dictionary = {}) -> Dictionary:
+	# P2: the L5 GLOBAL tier passes its already-sampled L5 level dict so the merged-mesh path reuses THIS exact greedy
+	# mesher / weld law / palette / shade material without re-baking a full L0 pyramid per facet. Empty ⇒ the P1/ladder
+	# path builds the pyramid analytically (unchanged).
+	var lvl: Dictionary
+	if lvl_override.is_empty():
+		var lod := FacetBlockLod.new()
+		lod.build(fid)
+		lvl = lod.get_level(_level)
+	else:
+		lvl = lvl_override
 	var w: int = lvl["w"]
 	var h: int = lvl["h"]
 	var top: PackedInt32Array = lvl["top"]
 	var idb: PackedByteArray = lvl["id"]
 	var wat: PackedByteArray = lvl["water"]
 	var dmin := FacetAtlas.dom_min(fid)
-	var half := PITCH >> 1
+	var half := _pitch >> 1
 
 	# Emitted mask + per-column colour (RGBA8-packed for greedy equality) + the Color itself.
 	var emit := PackedByteArray(); emit.resize(w * h)
@@ -337,8 +421,8 @@ func _build_facet_arrays(fid: int) -> Dictionary:
 	for cz in range(h):
 		for cx in range(w):
 			var ci := cz * w + cx
-			var lx := dmin.x + cx * PITCH + half      # representative L0 cell (coarse-cell centre)
-			var lz := dmin.y + cz * PITCH + half
+			var lx := dmin.x + cx * _pitch + half      # representative L0 cell (coarse-cell centre)
+			var lz := dmin.y + cz * _pitch + half
 			if not FacetAtlas.in_polygon(fid, lx, lz, 0.0):
 				emit[ci] = 0
 				continue
@@ -391,10 +475,10 @@ func _build_facet_arrays(fid: int) -> Dictionary:
 				for xx in range(rw):
 					used[(cz + zz) * w + cx + xx] = 1
 			# quad corners on the shared integer lattice (bit-identical welds — G-SKIN-EDGE)
-			var x0 := dmin.x + cx * PITCH
-			var x1 := dmin.x + (cx + rw) * PITCH
-			var z0 := dmin.y + cz * PITCH
-			var z1 := dmin.y + (cz + rh) * PITCH
+			var x0 := dmin.x + cx * _pitch
+			var x1 := dmin.x + (cx + rw) * _pitch
+			var z0 := dmin.y + cz * _pitch
+			var z1 := dmin.y + (cz + rh) * _pitch
 			var c: Color = cols[ci]
 			_add_quad(verts, vcol, uvs, idx,
 				_w(fid, x0, th, z0), _w(fid, x1, th, z0), _w(fid, x1, th, z1), _w(fid, x0, th, z1),
@@ -425,25 +509,25 @@ func _build_facet_arrays(fid: int) -> Dictionary:
 						continue                       # neighbour at-or-above covers this edge
 					y_lo = nb_top                       # interior wall down to the shorter neighbour
 				else:
-					y_lo = th - PITCH                   # boundary skirt: drop one coarse pitch to the backstop
+					y_lo = th - _pitch                   # boundary skirt: drop one coarse pitch to the backstop
 					is_skirt = true
 				# shared-edge endpoints (integer lattice) + the canonical edge key
 				var xa: int; var za: int; var xb: int; var zb: int; var key: String
 				if d == Vector2i(1, 0):
-					xa = dmin.x + (cx + 1) * PITCH; za = dmin.y + cz * PITCH
-					xb = xa; zb = dmin.y + (cz + 1) * PITCH
+					xa = dmin.x + (cx + 1) * _pitch; za = dmin.y + cz * _pitch
+					xb = xa; zb = dmin.y + (cz + 1) * _pitch
 					key = "x:%d:%d" % [cx + 1, cz]
 				elif d == Vector2i(-1, 0):
-					xa = dmin.x + cx * PITCH; za = dmin.y + cz * PITCH
-					xb = xa; zb = dmin.y + (cz + 1) * PITCH
+					xa = dmin.x + cx * _pitch; za = dmin.y + cz * _pitch
+					xb = xa; zb = dmin.y + (cz + 1) * _pitch
 					key = "x:%d:%d" % [cx, cz]
 				elif d == Vector2i(0, 1):
-					xa = dmin.x + cx * PITCH; za = dmin.y + (cz + 1) * PITCH
-					xb = dmin.x + (cx + 1) * PITCH; zb = za
+					xa = dmin.x + cx * _pitch; za = dmin.y + (cz + 1) * _pitch
+					xb = dmin.x + (cx + 1) * _pitch; zb = za
 					key = "z:%d:%d" % [cx, cz + 1]
 				else:
-					xa = dmin.x + cx * PITCH; za = dmin.y + cz * PITCH
-					xb = dmin.x + (cx + 1) * PITCH; zb = za
+					xa = dmin.x + cx * _pitch; za = dmin.y + cz * _pitch
+					xb = dmin.x + (cx + 1) * _pitch; zb = za
 					key = "z:%d:%d" % [cx, cz]
 				_add_quad(verts, vcol, uvs, idx,
 					_w(fid, xa, y_lo, za), _w(fid, xb, y_lo, zb), _w(fid, xb, th, zb), _w(fid, xa, th, za),
@@ -477,15 +561,15 @@ func seam_defects(fid: int) -> int:
 	# Re-derive emit + top exactly as the mesher does.
 	var lod := FacetBlockLod.new()
 	lod.build(fid)
-	var lvl := lod.get_level(LEVEL)
+	var lvl := lod.get_level(_level)
 	var top: PackedInt32Array = lvl["top"]
 	var dmin := FacetAtlas.dom_min(fid)
-	var half := PITCH >> 1
+	var half := _pitch >> 1
 	var emit := PackedByteArray(); emit.resize(w * h)
 	for cz in range(h):
 		for cx in range(w):
-			var lx := dmin.x + cx * PITCH + half
-			var lz := dmin.y + cz * PITCH + half
+			var lx := dmin.x + cx * _pitch + half
+			var lz := dmin.y + cz * _pitch + half
 			emit[cz * w + cx] = 1 if FacetAtlas.in_polygon(fid, lx, lz, 0.0) else 0
 	var dirs := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 	var missing := 0

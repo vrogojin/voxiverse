@@ -674,6 +674,44 @@ const BLOCK_LOD_DITHER_S := 0.3            # arrival screen-door dither seconds 
 const BLOCK_LOD_LRU_FACETS := 9            # LRU cap on resident L1 facet meshes (band ≤5 + re-crossing slack)
 const BLOCK_LOD_BYTES_MAX := 16 << 20      # NEVER-OOM hard ledger ceiling (§5): 16 MB
 
+## COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5/§9) — the L2..L4 streamed ladder + the L5 GLOBAL
+## always-resident tier, so blocky relief extends to the horizon with a power-of-2 fidelity fall-off. BOTH default
+## false, byte-identical off (gated construction — WorldManager never news the nodes up), each REQUIRES FP_BLOCK_LOD.
+## FP_BLOCK_LOD_RINGS: FacetBlockLodLadder owns one generalized FacetBlockLodRing per level 2..BLOCK_LOD_MAX_LEVEL,
+## assigns each nearby facet a level by the on-screen block-size law (level_for_distance, d_max(Ln)≈2^n·K_px/4), and
+## streams+LRUs the per-level bands under ONE shared ceiling, coarsening finest-first on breach.
+## FP_BLOCK_LOD_GLOBAL: FacetBlockLodGlobal holds the L5 column DATA for ALL 3456 facets always resident (the never-
+## evicted floor) + a byte-capped camera-facing merged mesh set. Gate: verify_block_lod.gd (G-BLD-LADDER/RINGS/GLOBAL).
+const FP_BLOCK_LOD_RINGS := false
+const FP_BLOCK_LOD_GLOBAL := false
+
+## Ladder level cap (2..5) — the INCREMENTAL DEPLOY knob. cap=2 ships L2 only; cap=4 ships the L2..L4 ladder (default);
+## cap=5 adds an L5 streamed ring on top of the global tier. The ladder streams levels 2..cap; global owns whole-planet L5.
+const BLOCK_LOD_MAX_LEVEL := 4
+const BLOCK_LOD_GLOBAL_LEVEL := 5          # the global tier's pyramid level (pitch 32)
+const BLOCK_LOD_LADDER_LRU := 8            # per-ladder-ring resident-facet cap AND per-level assigned-band cap (nearest-N)
+const BLOCK_LOD_LADDER_MAX_FACETS := 48    # hard cap on facets enumerated per ladder rebuild (bounds the BFS + draws)
+
+## L5 GLOBAL mesh budget (NEVER-OOM). MEASURED: a full-globe L5 greedy mesh is ~158 MB (285 quads/facet × 3456 ×
+## ~160 B/quad) — INFEASIBLE under any ceiling (design §5's "8–12 MB" assumed ~40–80 quads/facet; the real relief at
+## 32-block pitch merges far less). So the always-resident L5 payload is the DATA store (~3 MB, never evicted); the
+## visible blocky mesh is a camera-facing nearest-facet set MERGED into ≤ BLOCK_LOD_GLOBAL_DRAWS ArrayMeshes and hard-
+## capped at BLOCK_LOD_GLOBAL_MESH_BYTES. Beyond it the sunk far ring + FP_FACET_TEX skin backstop (design-correct:
+## L5 blocks go sub-pixel from orbit ⇒ the smooth satellite is the right tier there). No hole ever (far ring underneath).
+const BLOCK_LOD_GLOBAL_MESH_BYTES := 8 << 20
+const BLOCK_LOD_GLOBAL_DRAWS := 6          # merge visible L5 facets into ≤ this many meshes (gl_compat draw-ceiling safe)
+const BLOCK_LOD_GLOBAL_MESH_FACETS := 96   # nearest-camera facets meshed at L5 (≤ this; × ~47 KB ≈ 4.5 MB ≤ the cap)
+
+## NEVER-OOM EXPANDED ceiling: raise the SHARED block-LOD ledger (P1 L1 + ladder + global mesh) from 16 MB to 28 MB —
+## which lets L1 stay resident alongside the L2..L4 ladder (design §5: "expand toward 28 MB (re-add L1) ONLY if live
+## heap+fps A/B is green"). Default OFF ⇒ 16 MB governs and the coordinator drops L1 (finest) first. Flip AFTER an A/B.
+const BLOCK_LOD_BYTES_EXPANDED := 28 << 20
+const BLOCK_LOD_EXPANDED_ENABLED := false
+
+## The active shared block-LOD ceiling — 28 MB iff the expanded path is explicitly enabled, else the 16 MB default.
+static func block_lod_ceiling() -> int:
+	return BLOCK_LOD_BYTES_EXPANDED if BLOCK_LOD_EXPANDED_ENABLED else BLOCK_LOD_BYTES_MAX
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

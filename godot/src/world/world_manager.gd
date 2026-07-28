@@ -70,6 +70,8 @@ var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendere
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
 var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
+var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
+var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
 var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
 var _tex_band_epoch := -1             # COSMOS TEXTURED-LOD U1: last band slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
@@ -379,6 +381,27 @@ func _ready() -> void:
 			_block_lod.set_job_lane(_job_lane)
 			_block_lod.setup(TerrainConfig.active_facet())
 			_block_lod.place(_facet_ring.transform)
+			# COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5): the L2..L4 streamed ladder + the L5 GLOBAL
+			# always-resident tier — blocky relief to the horizon with a power-of-2 fall-off. Both gated + default OFF ⇒
+			# byte-identical. The ladder governs the SHARED NEVER-OOM ceiling (P1 L1 + L2..L4 + global mesh coarsened
+			# finest-first) — it is registered the L1 ring + the global tier so one ledger binds them all.
+			if CubeSphere.FP_BLOCK_LOD_GLOBAL:
+				_block_lod_global = FacetBlockLodGlobal.new()
+				_block_lod_global.name = "FacetBlockLodGlobal"
+				add_child(_block_lod_global)
+				_block_lod_global.set_job_lane(_job_lane)
+				_block_lod_global.setup(TerrainConfig.active_facet())
+				_block_lod_global.place(_facet_ring.transform)
+			if CubeSphere.FP_BLOCK_LOD_RINGS:
+				_block_lod_ladder = FacetBlockLodLadder.new()
+				_block_lod_ladder.name = "FacetBlockLodLadder"
+				add_child(_block_lod_ladder)
+				_block_lod_ladder.set_job_lane(_job_lane)
+				_block_lod_ladder.register_l1(_block_lod)
+				if _block_lod_global != null:
+					_block_lod_ladder.set_global(_block_lod_global)
+				_block_lod_ladder.setup(TerrainConfig.active_facet())
+				_block_lod_ladder.place(_facet_ring.transform)
 		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near
 		# voxels and the far-ring backstop. Gated on FP_SKIN_TIER (default OFF → node never created →
 		# byte-identical). Peer node placed like the far ring; driven from update_streaming/crossing/reanchor.
@@ -1031,6 +1054,11 @@ func update_streaming(player_pos: Vector3) -> void:
 	# the SAME node transform so L1 and the far skin overlap exactly). No-op / byte-identical unless FP_BLOCK_LOD.
 	if _block_lod != null and _facet_ring != null:
 		_block_lod.place(_facet_ring.transform)
+	# COSMOS BLOCK-LOD P2: keep the L2..L4 ladder + the L5 global tier in the SAME far-ring frame (absolute meshes).
+	if _block_lod_ladder != null and _facet_ring != null:
+		_block_lod_ladder.place(_facet_ring.transform)
+	if _block_lod_global != null and _facet_ring != null:
+		_block_lod_global.place(_facet_ring.transform)
 	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
 	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
 	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,
@@ -2387,6 +2415,10 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_skin.call("set_active", to)
 		if _block_lod != null:
 			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
+		if _block_lod_ladder != null:
+			_block_lod_ladder.rebuild(to)    # COSMOS BLOCK-LOD P2: re-assign + re-stream the L2..L4 ladder on crossing
+		if _block_lod_global != null:
+			_block_lod_global.rebuild(to)    # COSMOS BLOCK-LOD P2: re-mesh the near L5 cap around the new active facet
 		_far_us = Time.get_ticks_usec() - _far_t0
 	else:
 		# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
@@ -2400,6 +2432,10 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_skin.call("set_active", to)
 		if _block_lod != null:
 			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
+		if _block_lod_ladder != null:
+			_block_lod_ladder.rebuild(to)    # COSMOS BLOCK-LOD P2: re-assign + re-stream the L2..L4 ladder on crossing
+		if _block_lod_global != null:
+			_block_lod_global.rebuild(to)    # COSMOS BLOCK-LOD P2: re-mesh the near L5 cap around the new active facet
 		_flip_settling = true
 		_restream()
 	# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
@@ -2838,6 +2874,11 @@ func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 	# Sun at the same frame so the megablocks day/night-match the far skin. No-op / byte-identical unless FP_BLOCK_LOD.
 	if _block_lod != null:
 		_block_lod.set_sun_dir(sun_dir)
+	# COSMOS BLOCK-LOD P2: the ladder + global tiers shade by the SAME shell law — feed them the same Sun each frame.
+	if _block_lod_ladder != null:
+		_block_lod_ladder.set_sun_dir(sun_dir)
+	if _block_lod_global != null:
+		_block_lod_global.set_sun_dir(sun_dir)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

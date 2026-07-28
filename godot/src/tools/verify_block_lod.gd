@@ -216,6 +216,159 @@ func _initialize() -> void:
 	print("  INFO G-BLD-CONVERGE: band=%d  dispatch_rounds=%d (was ~%d one-per-round serialized)  whole-band main_commit=%.2f ms" % [cband.size(), cring.dispatch_rounds(), cband.size(), conv_ms])
 	cring.queue_free()
 
+	# ================= BLOCK-LOD P2 — the L2..L4 LADDER + the L5 GLOBAL tier ====================================
+	# Drives FacetBlockLodLadder / FacetBlockLodGlobal directly (flag-independent under FACETED, like the P0/P1
+	# sections). Asserts G-BLD-LADDER (full pyramid + screen-space level law), G-BLD-RINGS (stream/LRU/dither/cap),
+	# G-BLD-GLOBAL (all 3456 resident data floor, never evicted, arithmetic bytes), G-BLD-BYTES (shared ceiling +
+	# finest-first coarsen + expanded knob), G-BLD-MAINCOST (multi-level crossing commit-only).
+
+	# ---- G-BLD-LADDER: the on-screen block-size law + the full L1..L5 pyramid + containment every level ----------
+	var law_ok := FacetBlockLodLadder.level_for_distance(500.0) == 1
+	law_ok = law_ok and FacetBlockLodLadder.level_for_distance(1000.0) == 2
+	law_ok = law_ok and FacetBlockLodLadder.level_for_distance(2000.0) == 3
+	law_ok = law_ok and FacetBlockLodLadder.level_for_distance(4000.0) == 4
+	law_ok = law_ok and FacetBlockLodLadder.level_for_distance(8000.0) == 5
+	_ok(law_ok, "G-BLD-LADDER: level_for_distance picks the tier per distance (500→L1 1000→L2 2000→L3 4000→L4 8000→L5)")
+	var dmax_ok := true
+	for n in range(3, 6):
+		if not is_equal_approx(FacetBlockLodLadder.d_max(n), 2.0 * FacetBlockLodLadder.d_max(n - 1)):
+			dmax_ok = false
+	_ok(dmax_ok, "G-BLD-LADDER: d_max(Ln) == 2·d_max(Ln−1) (power-of-2 band doubling to the horizon)")
+	var plod := FacetBlockLod.new(); plod.build(300)
+	var chain_ok := true
+	var contain_ok := true
+	for n in range(1, 6):
+		var redec := FacetBlockLod.decimate(plod.get_level(n - 1))
+		if not FacetBlockLod.level_equals(redec, plod.get_level(n)):
+			chain_ok = false
+		var rr := _check_min(plod.get_level(n - 1), plod.get_level(n))
+		if not rr[1]:
+			contain_ok = false
+	_ok(chain_ok, "G-BLD-LADDER fid 300: L1..L5 == decimate chain EXACTLY (pyramid invariant across the whole ladder)")
+	_ok(contain_ok, "G-BLD-LADDER fid 300: coarse ≤ finer at EVERY level L1..L5 (no protrusion up the ladder)")
+	plod = null
+
+	# ---- G-BLD-RINGS: L2..L4 stream + level cap + draws bounded + dither + LRU-across-crossings no-hole ----------
+	var cap: int = CubeSphere.BLOCK_LOD_MAX_LEVEL
+	var lad := FacetBlockLodLadder.new()
+	root.add_child(lad)
+	lad.setup(300)
+	var lvls := lad.active_levels()
+	var cap_ok := lvls.size() > 0 and int(lvls[0]) == 2
+	for lv in lvls:
+		if int(lv) > cap:
+			cap_ok = false
+	_ok(cap_ok, "G-BLD-RINGS: ladder streams L2..L%d, max level ≤ BLOCK_LOD_MAX_LEVEL(%d) — active=%s" % [cap, cap, str(lvls)])
+	var lad_draws := lad.draw_count()
+	var sum_tiles := 0
+	for lv in lvls:
+		sum_tiles += lad.level_tile_count(int(lv))
+	_ok(lad_draws == sum_tiles and lad_draws <= (cap - 1) * CubeSphere.BLOCK_LOD_LADDER_LRU,
+		"G-BLD-RINGS: draws(%d) == Σ per-level tiles ≤ (levels)·(LRU) — bounded by TILES not blocks" % lad_draws)
+	# arrival-dither clock carried on a ladder tile (UV.x = arrival > 0): the per-level temporal fade.
+	var dith_ok := false
+	var l2ring := lad.ring_for(2)
+	var l2band: Array = lad.assign_levels(300).get(2, [])
+	if l2ring != null and not l2band.is_empty():
+		var a2 := l2ring._build_facet_arrays(int(l2band[0]))
+		var uvs2: PackedVector2Array = a2["uvs"]
+		dith_ok = uvs2.size() > 0 and uvs2[0].x > 0.0
+	_ok(dith_ok, "G-BLD-RINGS: arrival-dither clock (UV.x) carried on every ladder tile (per-level temporal fade)")
+	# LRU across crossings: residency ≤ cap per ring, the freshly-assigned band always resident (no hole under the ring).
+	for step in [900, 1700, 2500, 300]:
+		lad.rebuild(step)
+	var cross_ok := true
+	for lv in lad.active_levels():
+		var lr := lad.ring_for(int(lv))
+		if lr.resident_fids().size() > CubeSphere.BLOCK_LOD_LADDER_LRU:
+			cross_ok = false
+		for fid in lr.current_band():
+			if not lr.resident_fids().has(fid):
+				cross_ok = false
+	_ok(cross_ok, "G-BLD-RINGS: after 4 crossings each ring residency ≤ LRU(%d) AND its assigned band stays resident (no hole)" % CubeSphere.BLOCK_LOD_LADDER_LRU)
+	print("  INFO ladder: levels=%s draws=%d total=%.2f MB  L2=%.2f L3=%.2f L4=%.2f MB" % [
+		str(lad.active_levels()), lad.draw_count(), lad.total_bytes() / 1048576.0,
+		lad.level_bytes(2) / 1048576.0, lad.level_bytes(3) / 1048576.0, lad.level_bytes(4) / 1048576.0])
+	lad.queue_free()
+
+	# ---- G-BLD-GLOBAL: L5 DATA for ALL 3456 facets, always resident + never evicted; bytes == arithmetic ---------
+	var glane := JobLane.new(2)
+	var glob := FacetBlockLodGlobal.new()
+	root.add_child(glob)
+	glob.set_job_lane(glane)
+	glob.setup(300)                                  # dispatches the 6 cube-face DATA units on the worker
+	var gg := 0
+	while not glob.data_ready() and gg < 200000:
+		glane.pump()
+		OS.delay_msec(1)
+		gg += 1
+	_ok(glob.facets_baked() == glob.facets_total() and glob.facets_total() == 3456,
+		"G-BLD-GLOBAL: L5 DATA baked for ALL %d facets (progressive worker bake, main never blocked)" % glob.facets_total())
+	_ok(glob.data_bytes() == glob.data_bytes_arithmetic(),
+		"G-BLD-GLOBAL: data floor %.2f MB == arithmetic Σ(w5·h5)·%d B" % [glob.data_bytes() / 1048576.0, FacetBlockLodGlobal.BYTES_PER_COL])
+	_ok(glob.draw_count() <= CubeSphere.BLOCK_LOD_GLOBAL_DRAWS and glob.mesh_bytes() <= CubeSphere.BLOCK_LOD_GLOBAL_MESH_BYTES,
+		"G-BLD-GLOBAL: visible mesh draws(%d) ≤ %d and bytes(%.2f MB) ≤ cap — NEVER-OOM (full-globe L5 mesh = ~158 MB, avoided)" % [
+			glob.draw_count(), CubeSphere.BLOCK_LOD_GLOBAL_DRAWS, glob.mesh_bytes() / 1048576.0])
+	var floor0 := glob.data_bytes()
+	for step in [1000, 2000, 3000]:
+		glob.rebuild(step)
+	_ok(glob.data_bytes() == floor0 and glob.facets_baked() == 3456,
+		"G-BLD-GLOBAL: DATA floor never LRU-evicted across crossings (%.2f MB stable, all 3456 resident)" % [floor0 / 1048576.0])
+	print("  INFO L5 global: data floor %.2f MB (all 3456) + visible mesh %.2f MB in %d draws (cap %d MB)" % [
+		glob.data_bytes() / 1048576.0, glob.mesh_bytes() / 1048576.0, glob.draw_count(), CubeSphere.BLOCK_LOD_GLOBAL_MESH_BYTES / 1048576])
+
+	# ---- G-BLD-BYTES: the SHARED ceiling — L1 + ladder + global under ONE budget, finest-first coarsen, floor kept -
+	_ok(CubeSphere.block_lod_ceiling() == CubeSphere.BLOCK_LOD_BYTES_MAX and not CubeSphere.BLOCK_LOD_EXPANDED_ENABLED,
+		"G-BLD-BYTES: default shared ceiling == 16 MB (expanded path disabled by default)")
+	_ok(CubeSphere.BLOCK_LOD_BYTES_EXPANDED == (28 << 20),
+		"G-BLD-BYTES: expanded ceiling const == 28 MB (flip BLOCK_LOD_EXPANDED_ENABLED after a live heap A/B to re-add L1)")
+	var l1r := FacetBlockLodRing.new(); root.add_child(l1r); l1r.setup(300, 1)   # the P1 L1 rim ring (~11 MB)
+	var lad2 := FacetBlockLodLadder.new(); root.add_child(lad2); lad2.setup(300)  # the L2..L4 ladder (~11 MB)
+	lad2.register_l1(l1r)
+	lad2.set_global(glob)
+	var pre := lad2.total_bytes()
+	lad2.enforce_shared_budget()
+	var post := lad2.total_bytes()
+	_ok(pre > CubeSphere.block_lod_ceiling(),
+		"G-BLD-BYTES: pre-enforce total %.2f MB breaches the 16 MB ceiling (L1+ladder+global together)" % [pre / 1048576.0])
+	_ok(post <= CubeSphere.block_lod_ceiling(),
+		"G-BLD-BYTES: post-enforce total %.2f MB ≤ ceiling — coarsened under ONE shared budget" % [post / 1048576.0])
+	_ok(l1r.ledger_bytes() < lad2.level_bytes(2) or l1r.ledger_bytes() == 0,
+		"G-BLD-BYTES: FINEST-FIRST — L1(%.2f MB) dropped before the coarser L2(%.2f MB) survived" % [l1r.ledger_bytes() / 1048576.0, lad2.level_bytes(2) / 1048576.0])
+	_ok(glob.data_bytes() == floor0,
+		"G-BLD-BYTES: L5 global DATA floor PROTECTED through the breach (%.2f MB intact, never coarsened)" % [floor0 / 1048576.0])
+	_ok(lad2.wholesale_clears() >= 1,
+		"G-BLD-BYTES: wholesale-clear fired on the hard breach (%d finest-level drops recorded)" % lad2.wholesale_clears())
+	print("  INFO G-BLD-BYTES: shared ledger  BEFORE=%.2f MB  →  AFTER=%.2f MB (ceiling %.0f MB); global floor %.2f MB kept" % [
+		pre / 1048576.0, post / 1048576.0, CubeSphere.block_lod_ceiling() / 1048576.0, floor0 / 1048576.0])
+	l1r.queue_free()
+	lad2.queue_free()
+	glob.queue_free()
+
+	# ---- G-BLD-MAINCOST (multi-level): a crossing through L2..L4 pays commit-only on main (no sync bake stall) ----
+	var mlane := JobLane.new(2)
+	var mlad := FacetBlockLodLadder.new()
+	root.add_child(mlad)
+	mlad.set_job_lane(mlane)
+	mlad.setup(1500)                                 # first band on the worker
+	var mw := 0
+	while not mlad.async_idle() and mw < 60000:
+		mlane.pump()
+		OS.delay_msec(1)
+		mw += 1
+	mlane.take_main_commit_ms()                       # reset — measure ONLY the crossing below
+	mlad.rebuild(700)                                 # crossing to a new active facet → new multi-level band
+	var mw2 := 0
+	while not mlad.async_idle() and mw2 < 60000:
+		mlane.pump()
+		OS.delay_msec(1)
+		mw2 += 1
+	var lad_commit := mlane.take_main_commit_ms()
+	_ok(mlad.async_idle(), "G-BLD-MAINCOST(ladder): the whole L2..L4 crossing band converged on the worker")
+	_ok(lad_commit < 150.0, "G-BLD-MAINCOST(ladder): multi-level crossing MAIN commit %.2f ms ≈ 0 (every tier baked off-main)" % lad_commit)
+	print("  INFO G-BLD-MAINCOST(ladder): multi-level crossing main-commit = %.2f ms (bakes stayed on the worker)" % lad_commit)
+	mlad.queue_free()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 

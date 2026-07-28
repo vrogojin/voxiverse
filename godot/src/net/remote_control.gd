@@ -492,6 +492,40 @@ func _start_step() -> void:
 				var elev_f: float = float(elev) if (elev is float or elev is int) else NAN
 				okk = bool(player.call("remote_set_time", float(_cur.get("local_hours", 12.0)), elev_f))
 			_finish_step("ok" if okk else "blocked")
+		"teleport":
+			# DEV/TEST INSTRUMENT: place the player at an absolute pose. EITHER {x,y,z} (active-facet lattice) OR
+			# {lat_deg,lon_deg,alt} (geodetic surface + altitude). Resolves synchronously via player.remote_teleport,
+			# which routes through the SAME safe reposition (fid/pose/BCI re-seed) — no fid/pose/velocity desync.
+			# `blocked` when there is no world (the same inert condition set_time/dev_nav report under).
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_teleport"):
+				if _cur.has("lat_deg") or _cur.has("lon_deg"):
+					okk = bool(player.call("remote_teleport", "geo",
+						float(_cur.get("lat_deg", 0.0)), float(_cur.get("lon_deg", 0.0)), float(_cur.get("alt", 0.0))))
+				else:
+					okk = bool(player.call("remote_teleport", "xyz",
+						float(_cur.get("x", 0.0)), float(_cur.get("y", 0.0)), float(_cur.get("z", 0.0))))
+			_finish_step("ok" if okk else "blocked")
+		"set_alt":
+			# DEV/TEST INSTRUMENT: teleport straight to `alt` above the CURRENT sub-player surface (zero horizontal
+			# move) — the most-used framing op. A teleport special-case; same safe reposition, same inert guard.
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_set_alt"):
+				okk = bool(player.call("remote_set_alt", float(_cur.get("alt", 0.0))))
+			_finish_step("ok" if okk else "blocked")
+		"freeze_time":
+			# DEV/TEST INSTRUMENT: hold/resume the celestial clock (stable lighting for capture). `blocked` when
+			# there is no clock (ORBITAL_SKY off) — the same inert condition set_time reports under.
+			var okk := false
+			if is_instance_valid(player) and player.has_method("remote_freeze_time"):
+				okk = bool(player.call("remote_freeze_time", bool(_cur.get("on", false))))
+			_finish_step("ok" if okk else "blocked")
+		"freeze_player":
+			# DEV/TEST INSTRUMENT: pin/release the player so a hold is genuinely stationary. Always resolves ok
+			# (a latch set on the player; inert unless CONTROL_ENABLED). No world/clock dependency.
+			if is_instance_valid(player) and player.has_method("remote_freeze_player"):
+				player.call("remote_freeze_player", bool(_cur.get("on", false)))
+			_finish_step("ok")
 		"stop":
 			_finish_step("ok")                     # a labelled fence — the queue continues (§4.6)
 		"reload":

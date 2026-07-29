@@ -69,11 +69,20 @@ var flying := false
 ## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
 var frozen := false
 
-# DEV/TEST freeze_player latch (dev-instrument tooling): pins the player (early-return in _physics_process) so a
-# capture hold is genuinely stationary — no gravity, no dev-fly drift, no orbital coast. Default false ⇒ the
-# _physics_process branch is never taken (byte-identical normal play); only set through remote_freeze_player
-# under a live control grant. Distinct from `frozen` (the one-shot boot-prewarm freeze main.gd owns).
+# DEV/TEST freeze_player latch (dev-instrument tooling): pins the player by suppressing ONLY its motion integration
+# (skip _move — gravity, dev-fly drift, orbital coast) while the rest of the tick runs, so a capture hold is
+# genuinely stationary yet the executor/streaming/camera are never starved. Default false ⇒ the _physics_process
+# branch is never taken (byte-identical normal play); only set through remote_freeze_player under a live control
+# grant. Distinct from `frozen` (the one-shot boot-prewarm freeze main.gd owns).
 var _dev_freeze_player := false
+
+# DEV/TEST fall-through guard latch (dev-instrument tooling): armed by a dev teleport / set_alt / freeze-release
+# so the ensuing settle/drop can never leave the player BELOW the analytic surface (the live "buried at alt −18,
+# floor 26 blocks under the terrain" from a stale fast-regime-crossing floor query). Default false ⇒ the
+# _physics_process branch is never taken (byte-identical normal play); disarmed once the player lands cleanly.
+var _dev_land_guard := false
+# Feet more than this many blocks below the analytic surface ⇒ the dev guard clamps them up (below-floor tolerance).
+const DEV_LAND_EPS := 0.5
 
 # COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.3): the coordinate-frame adapter that bridges the
 # player's canonical LATTICE frame (its LOCAL transform under WorldManager's ActiveFrame) and the GLOBAL/absolute
@@ -724,6 +733,13 @@ func _physics_process(delta: float) -> void:
 			global_position = reloc["pos"]
 			velocity = reloc["vel"]
 			rotation.y += float(reloc["yaw_delta"])
+	# DEV/TEST fall-through guard (dev-instrument tooling): after a dev teleport / freeze-release drop, catch a
+	# landing that a stale fast-regime-crossing floor query put BELOW the real surface. Armed ONLY by the dev
+	# actuators (which exist only under a live CONTROL_ENABLED grant); `_dev_land_guard` is false in normal play
+	# ⇒ this is never entered ⇒ byte-identical. Runs AFTER the origin/frame corrections so `position` + the active
+	# facet are final for the frame (surface_y reads the settled facet's column).
+	if _dev_land_guard:
+		_dev_land_clamp()
 	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_push_bodies(delta)
 	if _ft_on: _ft_max("t_pushbodies_us", Time.get_ticks_usec() - _ft_t)
@@ -2198,8 +2214,40 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 	_fall_p_bci = PackedFloat64Array()
 	_fall_v_bci = PackedFloat64Array()
 	_foff_radial = false
+	# Arm the fall-through guard so the ensuing settle/drop is caught at the surface (never below), and disarm the
+	# fly/coast so a re-derived ground query applies (a dev teleport lands you on the ground, not in a flight state).
+	_dev_land_guard = true
 	if world != null:
 		world.update_streaming(position)
+		# FLOOR-SETTLE: re-derive the FRESH analytic surface at the target (the active facet is set above; set_active_facet
+		# cleared any per-column memo on a facet change, and surface_y is recomputed each call — no stale height). If the
+		# placement is AT/BELOW the surface, clamp the feet exactly onto it, grounded — a ground teleport never lands
+		# inside/below terrain. A placement ABOVE the surface (set_alt to altitude) is left as-is; the guard catches its fall.
+		var sy := world.surface_y(position.x, position.z)
+		if position.y < sy + DEV_LAND_EPS:
+			position.y = sy
+			velocity = Vector3.ZERO
+			_fall_have_v = false
+			_dev_land_guard = false                         # already settled on the ground — nothing to catch
+
+## DEV/TEST fall-through guard — clamp the player up onto the FRESH analytic surface when a dev teleport / freeze
+## drop left the feet below it. Uses world.surface_y (the shared heightmap analytic law, NEVER the voxel buffer)
+## so it is immune to the stale fast-regime-crossing floor_under that buried the player live. Inert while flying /
+## dev-flying (legitimate sub-surface flight is untouched) and when the feet are at/above the surface (so a normal
+## descent is unaffected — it only ever fires when genuinely below the ground). Disarms after one clean landing.
+func _dev_land_clamp() -> void:
+	if world == null or flying or _dev_nav or _dev_freeze_player:
+		return                                              # inert while flying / dev-flying / held (freeze stays invariant)
+	var sy := world.surface_y(position.x, position.z)
+	if position.y < sy - DEV_LAND_EPS:
+		position.y = sy                                     # snap the feet onto the true surface top
+		if velocity.y < 0.0:
+			velocity.y = 0.0                                # kill the downward fall (grounded)
+		# Settle the fall / carried BCI latches so nav re-derives at rest on the ground.
+		_fall_have_v = false
+		_fall_v_bci = PackedFloat64Array()
+		_fall_p_bci = PackedFloat64Array()
+		_dev_land_guard = false                             # landed cleanly — disarm
 
 ## teleport (dev): place the player at an absolute pose. `mode` == "xyz" ⇒ `a`,`b`,`c` are ACTIVE-FACET LATTICE
 ## coords (the frame `position` lives in — the same frame set_alt / snapshots operate in; kept in the CURRENT
@@ -2274,11 +2322,15 @@ func remote_freeze_time(on: bool) -> bool:
 	return true
 
 ## freeze_player (dev): pin the player — no gravity, no dev-fly drift, no orbital coast — so a hold is genuinely
-## stationary for a clean frame. Zeroes velocity immediately; the latch makes _physics_process an early-return
-## no-op while on (position invariant across ticks). Off restores normal physics. Inert unless a caller sets it.
+## stationary for a clean frame. Suppresses ONLY the player's motion integration while on (position invariant
+## across ticks); the rest of the tick keeps running. Zeroes velocity. RELEASING (on=false) re-arms the
+## fall-through guard so a drop from altitude in a non-flying state lands on the surface, not through it. Inert
+## unless a caller sets it.
 func remote_freeze_player(on: bool) -> void:
 	_dev_freeze_player = on
 	velocity = Vector3.ZERO
+	if not on and not flying and not _dev_nav:
+		_dev_land_guard = true                              # the ensuing free-fall must land ON the surface (guard catches)
 
 ## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
 ## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE

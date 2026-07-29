@@ -72,6 +72,7 @@ func _run() -> void:
 		await _gate_no_blowup()
 	else:
 		print("  (gate 7 NO-BLOWUP skipped — FLAT tree; the nav machine is absent, so there is no v_bci to latch)")
+	await _gate_fall_through()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -296,6 +297,7 @@ func _gate_off_inert() -> void:
 	print("  --- (6) OFF INERT: freeze latches default off; a fresh clock advances normally ---")
 	var pl := _make_player()
 	_ok(pl._dev_freeze_player == false, "_dev_freeze_player defaults false (byte-identical normal play)")
+	_ok(pl._dev_land_guard == false, "_dev_land_guard defaults false (fall-through guard never fires in normal play)")
 	pl.free()
 	var c := EPH.CosmosClock.new()
 	_ok(c.frozen == false, "CosmosClock.frozen defaults false")
@@ -336,3 +338,71 @@ func _gate_no_blowup() -> void:
 	_ok(max_vbci < 10000.0, "no-blowup: BCI velocity stays bounded (max %0.1f b/s ≪ the 642074 re-entry latch)" % max_vbci)
 	_ok(max_vel < 5000.0, "no-blowup: player velocity stays bounded (max %0.2f b/s — no runaway integration)" % max_vel)
 	pl.free()
+
+# ── (8) FALL-THROUGH LANDING — dev teleport / freeze-drop lands ON the surface, never below ──────────
+## The live bug: set_alt 1800 → freeze_player on → off → free-fell from orbit with zeroed velocity, crossed the
+## alt regimes, and landed via a STALE fast-regime-crossing floor query at alt −18, buried ~26 blocks under the
+## rendered terrain (a reload was needed). The fix: a dev-armed fall-through guard clamps the feet up onto the
+## FRESH analytic surface (world.surface_y). Driven in the COHERENT FLAT harness (a bare faceted WM's missing
+## ActiveFrame makes the floating-origin reanchor mis-fire — the gate 5/7 artifact); the guard logic is
+## flag-independent, so FLAT fully exercises it.
+func _gate_fall_through() -> void:
+	print("  --- (8) FALL-THROUGH LANDING: dev teleport / freeze-drop settles ON the surface, never below ---")
+	if CubeSphere.FACETED:
+		print("  (gate 8 real-physics drive skipped under FACETED — needs main.gd ActiveFrame wiring; FLAT covers the guard)")
+		return
+	# (a) set_alt(8) places the player at surface+8 (ABOVE the ground, never below) — checked immediately.
+	var pla := _make_player()
+	var sy0: float = _wm.surface_y(pla.position.x, pla.position.z)
+	pla.remote_set_alt(8.0)
+	_ok(absf(pla.position.y - (sy0 + 8.0)) < 1.0e-3, "set_alt(8): placed at surface+8 (y=%0.3f, above ground not below)" % pla.position.y)
+	pla.free()
+
+	# (b) THE EXACT REPRO: set_alt to altitude, freeze_player on, off, free-fall, and assert a CLEAN landing.
+	var plb := _make_player()
+	var col_x: float = plb.position.x
+	var col_z: float = plb.position.z
+	var sy: float = _wm.surface_y(col_x, col_z)
+	plb.remote_set_alt(60.0)
+	plb.frozen = false
+	plb.remote_freeze_player(true)
+	for _i in range(6):
+		await physics_frame
+	plb.remote_freeze_player(false)                         # release ⇒ the free-fall drop (the live repro)
+	var landed := false
+	for _i in range(400):
+		await physics_frame
+		if plb.velocity.y == 0.0 and plb.position.y <= sy + 0.6:
+			landed = true
+			break
+	_ok(landed, "drop-from-altitude: the player LANDED (grounded within 400 ticks)")
+	_ok(plb.position.y >= sy - PlayerCls.DEV_LAND_EPS, "drop-from-altitude: settled AT/ABOVE the surface (y=%0.2f ≥ %0.2f − ε), NEVER buried" % [plb.position.y, sy])
+	_ok(absf(plb.position.y - sy) < 1.0, "drop-from-altitude: landed at the CORRECT surface height for the column (Δ=%0.3f)" % (plb.position.y - sy))
+	_ok(plb._space_on_ground(), "drop-from-altitude: on_ground true after the drop")
+	_ok(plb.position.x == col_x and plb.position.z == col_z, "drop-from-altitude: no horizontal drift (same column)")
+	plb.free()
+
+	# (c) TUNNEL GUARD (the failure mode, staged directly): armed guard + feet placed 30 blocks BELOW the surface
+	# (the stale-floor overshoot). One tick must clamp them UP onto the surface, grounded, downward velocity killed.
+	var plc := _make_player()
+	var syc: float = _wm.surface_y(plc.position.x, plc.position.z)
+	plc.frozen = false
+	plc._dev_land_guard = true
+	plc.position.y = syc - 30.0
+	plc.velocity = Vector3(0.0, -50.0, 0.0)
+	await physics_frame
+	_ok(plc.position.y >= syc - PlayerCls.DEV_LAND_EPS, "tunnel guard: a below-surface player is clamped UP onto the surface (y=%0.2f, surface=%0.2f)" % [plc.position.y, syc])
+	_ok(plc.velocity.y >= 0.0, "tunnel guard: the downward fall velocity is killed on the clamp (vy=%0.2f)" % plc.velocity.y)
+	plc.free()
+
+	# (d) LEGITIMATE FLIGHT UNTOUCHED: with fly on, the guard must NOT clamp a sub-surface fly (byte-identical
+	# flight). Arm the guard, fly, place below the surface, tick, and assert the guard did NOT move the player up.
+	var pld := _make_player()
+	var syf: float = _wm.surface_y(pld.position.x, pld.position.z)
+	pld.frozen = false
+	pld.flying = true
+	pld._dev_land_guard = true
+	pld.position.y = syf - 30.0
+	await physics_frame
+	_ok(pld.position.y < syf - PlayerCls.DEV_LAND_EPS, "flight untouched: the guard does NOT clamp a FLYING player below the surface (y=%0.2f)" % pld.position.y)
+	pld.free()

@@ -3471,8 +3471,18 @@ func reinforce_joint(a: Vector3i, b: Vector3i, reinf_id: int) -> bool:
 
 ## Walkable surface height (world y of the top of the ground) at (x, z), accounting
 ## for broken blocks from the TOP — used for spawning pillars and the grounded test.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2): the placed/walked surface sits at PLAY y = cell y + s
+## (the per-column datum lift). floor_under/blocked/ceiling_scan/the DDA and the near mesh all report/emit in
+## PLAY space (+ s) — this is the SAME surface the render draws (verify_facet_seams G-D2-SHAPE defines the
+## rendered near-mesh top as effective_height+1 + s). surface_y drives spawn, set_alt/teleport, the grounded
+## clamp, VoxelBody rest and the border pillars, so it MUST add s too: omitting it placed the player s blocks
+## (up to the facet-centre sagitta, ~5-7 @ R=6371) BELOW the visible ground — a set_alt(5)/spawn that sinks.
+## s ≡ 0.0 with FP_DATUM_BAKE off (and in flat/curved mode, where _active_facet < 0) ⇒ byte-identical; this
+## rides FP_DATUM_BAKE's own gate. Mirrors floor_under's no-floor fallback (float(effective_height+1) + s).
 func surface_y(x: float, z: float) -> float:
-	return float(effective_height(int(floor(x)), int(floor(z))) + 1)
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	return float(effective_height(xi, zi) + 1) + _datum_lift(xi, zi)
 
 ## The y the player should stand at in column (x, z) given their current feet
 ## height. Plain, NO-CLIMB floor: scan DOWN from the feet for the first solid block

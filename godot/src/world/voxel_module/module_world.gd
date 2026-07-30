@@ -124,6 +124,10 @@ const NEAR_COVER_MAX_SECONDS := 10.0       # hard transient bound (≤ far COVER
 ## must not pin the cover to its timeout, and the 96→128 annulus sits behind the far layer's curved inner
 ## hole (INNER_HOLE_CURVED = 112) plus fog, so retiring there is invisible (§4).
 const NEAR_COVER_MESHED_HALF := Vector3(96.0, 32.0, 96.0)
+## COSMOS STREAM-SETTLE: the TIGHT column half-extent player_column_meshed() probes — just the immediate ground
+## under a re-anchored teleport (not the whole near disc), so the settle releases as soon as the player has solid
+## terrain beneath them. Y spans well above/below the feet to cover the +Y viewer offset + any relief.
+const SETTLE_COLUMN_HALF := Vector3(8.0, 40.0, 8.0)
 var _cover_terrain: Node3D = null          # the frozen old VoxelTerrain (flag ON only); null in the default
 var _cover_age := 0.0                       # seconds the current cover has lived
 var _cover_released := false                # WorldManager's handshake fired (re-mirror done) — safe to retire on meshed
@@ -2927,6 +2931,21 @@ func _new_field_meshed() -> bool:
 	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
 		else v.global_position - global_position
 	var half := NEAR_COVER_MESHED_HALF
+	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS STREAM-SETTLE: is the ACTIVE near field MESHED in a TIGHT column around the player (the settle-release
+## probe — a dev teleport/fast-travel is held hovering at surface_y until this passes, so the player is never
+## dropped into un-streamed void)? Uses the SAME viewer-world-point→terrain-local frame handling as
+## _new_field_meshed (frame-correct under the fixed frame), but a small SETTLE_COLUMN_HALF so it releases as soon
+## as the IMMEDIATE ground column is present — not the whole 96-block near disc. Returns false (keep holding until
+## the cap) when there is no viewer/terrain or the module lacks is_area_meshed.
+func player_column_meshed() -> bool:
+	var v := _viewer as Node3D
+	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
+		return false
+	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
+		else v.global_position - global_position
+	var half := SETTLE_COLUMN_HALF
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
 
 ## COSMOS M4 Stage 2: free the frozen near cover (null-safe) and print one retirement telemetry line (§9.3

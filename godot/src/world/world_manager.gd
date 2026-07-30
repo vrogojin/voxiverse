@@ -632,6 +632,51 @@ func approach_anchor_step_now(player_pos: Vector3) -> void:
 		return
 	_apply_approach_anchor(player_pos)
 
+## COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle) — the dev teleport / fast-travel RE-ANCHOR. A dev
+## _dev_reposition sets the active facet + player pose, but the near field (the godot_voxel VoxelViewer's terrain)
+## is a POOL keyed to a facet: on a jump to a FRESH FAR facet nothing re-designates the near pool onto it, so the
+## meshed near bubble stays stranded on the OLD facet (the live "player in space, draws≈43, near field elsewhere"
+## symptom) and never streams in at the new spot. This drives the SAME committed redesignation a seam crossing uses
+## — but for a DIRECT jump (slot −1, like the R3 re-entry restore) — so the near pool + far ring + block-LOD + the
+## ActiveFrame all re-derive onto the new sub-player facet NOW, then re-applies the S1 approach anchor immediately
+## (bypassing the wall-clock debounce) so the viewer offset/view are correct at the new spot this frame. The
+## returned reframe dict is intentionally DISCARDED — the teleport already committed the player's pose. No-op /
+## byte-identical off FACETED (FLAT viewers are children of the player and already follow horizontally).
+func dev_reanchor_near(player_pos: Vector3) -> void:
+	if not CubeSphere.FACETED:
+		return
+	var to := TerrainConfig.active_facet()
+	if to < 0:
+		return
+	# The facet the near pool CURRENTLY holds (module truth — independent of TerrainConfig timing). If it already
+	# matches the target the near field is on the right facet (a same-facet teleport) and only streaming re-centres.
+	if using_module and _module_world != null and _module_world.has_method("pool_active"):
+		var from := int(_module_world.call("pool_active"))
+		if from >= 0 and from != to:
+			# Reuse the committed-crossing bookkeeping for the redesignation (pool redesignate/spawn/reset, far-ring +
+			# skin + block-LOD re-place, ActiveFrame flip, gravity/collider resync). slot −1 = a direct jump (no seam).
+			# np is unused by the caller path here (we discard the return), so pass the current pose.
+			_commit_facet_change(from, to, [player_pos.x, player_pos.y, player_pos.z], -1)
+	# Re-derive the S1 ground-anchored viewer offset + release view_distance at the NEW altitude immediately (the
+	# per-tick driver is wall-clock debounced; this hook bypasses it, exactly like verify_approach_anchor).
+	approach_anchor_step_now(player_pos)
+
+## COSMOS STREAM-SETTLE: is the near field MESHED in a tight column under the player yet (the settle-release probe)?
+## Routes to the module's is_area_meshed column check; false on the fallback / no-module path (settle then rides its
+## hard cap instead of hanging). `player_pos` is accepted for signature symmetry — the module probes the viewer point.
+func near_column_meshed(_player_pos: Vector3) -> bool:
+	if not (using_module and _module_world != null and _module_world.has_method("player_column_meshed")):
+		return false
+	return bool(_module_world.call("player_column_meshed"))
+
+## COSMOS STREAM-SETTLE: can the near-coverage probe actually answer here (FACETED + godot_voxel module with the
+## column probe)? The dev teleport only ENGAGES the hover-until-meshed settle when this is true; on the FLAT /
+## fallback path it keeps the shipped immediate ground clamp (byte-identical), so a no-module dev teleport never
+## hangs on a probe that can never pass.
+func near_coverage_available() -> bool:
+	return CubeSphere.FACETED and using_module and _module_world != null \
+		and _module_world.has_method("player_column_meshed")
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).

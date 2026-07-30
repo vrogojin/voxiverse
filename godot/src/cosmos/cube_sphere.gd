@@ -1437,6 +1437,27 @@ const FP_MOON_RING := false
 ## CANNOT be a large multiple of R (the far plane boxes it at ≤ 1.35·R); raising that further is a CAMERA_FAR
 ## change, out of M1 scope — the gate asserts the derived value clears R and flags loudly if R ever approaches it.
 const FP_SKY_DSKY_R := false
+## COSMOS ORBIT-SPACE (this session) — ALTITUDE-TRACKING star dome. FP_SKY_DSKY_R fixes the dome radius to the
+## STATIC CAMERA_FAR (9000 ⇒ dome ≈ 8143), which is correct at ground but too small in high orbit: at alt 8000
+## the camera is ~14371 from the planet centre and the planet limb sits at √(d²−R²) ≈ 12882 — well OUTSIDE the
+## 8143 dome, so the dome collapses into the disc and real space cannot composite around the limb (the gray-blue
+## wash the player sees at 8000). When true, the star dome + sun/moon placement track the ALTITUDE-SCALED far
+## plane CosmosScale.camera_far(d,R) (exactly as B5's fog-end already does), so the dome grows with altitude and
+## always clears the limb: dome edge = camera_far·SKY_FAR_MARGIN < camera_far (never clips), > limb tangent. At
+## ground camera_far==FAR_MIN==9000 ⇒ the scale factor is EXACTLY 1.0 (C0-continuous, night stars unchanged), so
+## the near/ground regime is untouched. NOTE a blind CAMERA_FAR raise is WRONG: it would push the fixed dome
+## beyond the 9000 ground clip and cull night stars on the surface — the dome MUST track altitude, not be a bigger
+## constant. Requires FP_SKY_DSKY_R (+ FP_SCALED_BODY for the ramp). Default FALSE ⇒ BYTE-IDENTICAL (scale≡1,
+## static _dsky). Gate: verify_atmo_sky.gd (ground continuity + dome-clears-limb-at-alt-8000).
+const FP_SKY_DSKY_ALT := false
+## COSMOS HUD (this session) — VACUUM-AWARE thermometer. The shipped HUD prints air/ground temperature as a raw
+## number everywhere, which in orbit shows (a) values BELOW absolute zero (the altitude lapse extrapolates the air
+## curve to e.g. −541 °C — physically impossible) and (b) an "air" temperature where there is no air. When true:
+## every shown temperature is clamped to ≥ −273.0 °C (absolute zero floor); in vacuum (radial altitude above the
+## atmosphere ceiling ATMO_TOP ⇒ no air) the AIR temp reads "--"; and when in space AND not standing on a body
+## surface the GROUND temp reads "--" (it resolves to a real value again on the Moon/Earth surface). Default FALSE
+## ⇒ BYTE-IDENTICAL (the shipped "%5.1f °C" strings). Gate: verify_hud_temp.gd.
+const FP_HUD_VACUUM_TEMP := false
 ## COSMOS CLIMATE W0 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3 / §7) — REAL AXIAL SEASONS. When true the
 ## ephemeris fills Earth's reserved axial_tilt slot (23.4° = 0.4084 rad): dir_to_bodyfixed composes the
 ## obliquity (R_spin·R_tilt) so CosmosSky's sun arcs get seasonal (low winter / high summer / polar

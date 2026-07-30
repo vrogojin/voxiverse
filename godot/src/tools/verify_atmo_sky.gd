@@ -45,6 +45,7 @@ func _initialize() -> void:
 		str(CubeSphere.FP_ATMO_SHELL)])
 	FacetAtlas.warm_up()
 	_gate_farramp()
+	_gate_dsky_alt()
 	_gate_occ()
 	_gate_zero()
 	_gate_abslight()
@@ -90,6 +91,39 @@ func _gate_farramp() -> void:
 	# A concrete deep-space case: the pilot's d ≈ 167 k must reach past the limb √(d²−R²).
 	var d_deep := r + 160000.0
 	_ok(SCALE.camera_far(d_deep, r) > sqrt(d_deep * d_deep - r * r), "far reaches past the limb at deep-space d")
+
+# --------------------------------------------------------------- G-AS-DSKYALT (FP_SKY_DSKY_ALT)
+# The altitude-tracking star dome. d_sky_derived_at(d,R) must (1) equal the STATIC d_sky_derived() at/below the
+# FAR_MIN crossing (dome_scale==1 ⇒ byte-identical ground regime), and (2) in high orbit clear the planet limb
+# √(d²−R²) while its edge (·STAR_DOME_MULT) stays inside the camera far clip (never culled). This is the fix for
+# the "no real space at alt 8000" wash: the static 8143 dome collapses into the disc; this one grows past it.
+func _gate_dsky_alt() -> void:
+	print("  --- G-AS-DSKYALT: altitude-tracking star dome clears the limb, stays inside the far clip ---")
+	var r := FacetAtlas.R_BLOCKS
+	# (1) Ground continuity — EXACT: at d=R the far plane is FAR_MIN, so the altitude twin == the static dome.
+	_ok(SKY.d_sky_derived_at(r, r) == SKY.d_sky_derived(), "d_sky_derived_at(R,R) == d_sky_derived() (dome_scale==1 at ground)")
+	# Below the FAR_MIN crossing (~alt 3.5k) the far plane is still 9000 ⇒ still == the static dome (scale 1).
+	_ok(SKY.d_sky_derived_at(r + 1000.0, r) == SKY.d_sky_derived(), "dome_scale==1 below the far-ramp crossing (alt 1k)")
+	# (2) High orbit (alt 8000): the dome must clear the limb, and its edge must stay inside the far clip.
+	var alts := [4000.0, 8000.0, 20000.0, 160000.0]
+	var clears := true
+	var inside := true
+	var grows := true
+	var prev := SKY.d_sky_derived()
+	for h in alts:
+		var d: float = r + h
+		var limb: float = sqrt(d * d - r * r)
+		var dome: float = SKY.d_sky_derived_at(d, r)
+		if dome <= limb: clears = false                                   # dome must sit OUTSIDE the visible disc
+		if dome * SKY.STAR_DOME_MULT > SCALE.camera_far(d, r): inside = false  # edge must stay inside the clip
+		if dome < prev - 1e-6: grows = false                             # monotone non-decreasing with altitude
+		prev = dome
+	_ok(clears, "dome radius > limb √(d²−R²) at alt 4k/8k/20k/160k")
+	_ok(inside, "dome edge (·1.05) < camera_far at every altitude (never frustum-culled)")
+	_ok(grows, "dome radius grows monotonically with altitude")
+	# The concrete alt-8000 headline number (the player's report): dome comfortably clears the ~12.9k limb.
+	var d8: float = r + 8000.0
+	_ok(SKY.d_sky_derived_at(d8, r) > sqrt(d8 * d8 - r * r), "alt 8000: dome clears the limb (real space composites)")
 
 # ------------------------------------------------------------------ G-AS-OCC (A1)
 func _gate_occ() -> void:

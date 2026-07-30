@@ -2420,6 +2420,13 @@ func space_telemetry() -> Dictionary:
 		"att": _space_att_name(),
 	}
 
+## VACUUM HUD (FP_HUD_VACUUM_TEMP): public read of the analytic on-surface state — the SAME predicate the
+## RemoteBridge telemetry reports as `on_ground` (via space_telemetry → _space_on_ground). The thermometer
+## uses it to keep GROUND temp a real number while the pilot stands on a body, blanking it ("--") only when
+## in space AND off any surface. Pure read; no state.
+func is_on_surface() -> bool:
+	return _space_on_ground()
+
 ## True iff standing on terrain (not flying, feet at/near the analytic floor) — the harness's `landed` predicate
 ## combines this with nav_mode == planetary. Cheap floor probe; false while flying.
 func _space_on_ground() -> bool:

@@ -1450,6 +1450,18 @@ const FP_SKY_DSKY_R := false
 ## constant. Requires FP_SKY_DSKY_R (+ FP_SCALED_BODY for the ramp). Default FALSE ⇒ BYTE-IDENTICAL (scale≡1,
 ## static _dsky). Gate: verify_atmo_sky.gd (ground continuity + dome-clears-limb-at-alt-8000).
 const FP_SKY_DSKY_ALT := false
+## COSMOS ORBIT-SPACE (this session) — PLANET-CENTRE-RELATIVE sky geometry. CosmosSky assumes the planet sits at
+## the scene ORIGIN and derives altitude/up/sun-elevation/occlusion/light from cam_origin.length(). But under the
+## floating-origin / scaled-body frame the planet is offset to WorldManager.planet_render_centre() above the
+## re-anchor (REANCHOR_TRIGGER_BLOCKS=8192): the camera is kept near the origin while the planet moves away, so
+## cam_origin.length() COLLAPSES toward ~0 at high orbit → the sky's h≈0 → atmo_vis=1 → sm=0 → the day-sky colour
+## (SKY_DAY = the gray-blue) renders in space instead of black, AND the altitude-keyed light over-brightens the
+## far-ring (the blown-out planet). Below the re-anchor (alt ≲ 3.5k) the planet is still ~at origin ⇒ correct
+## (why alt 2500 was black but 8000 was blue on the SAME build). When true, the sky's GEOMETRY math uses
+## cam_rel = cam_origin − planet_render_centre() (true planet-relative position); NODE PLACEMENT (sun/moon/star
+## dome, which sit AT the camera) stays on the raw cam_origin. Default FALSE ⇒ cam_rel ≡ cam_origin ⇒
+## BYTE-IDENTICAL. Requires FACETED (+ the SN3/scaled-body frame to matter). Live-verified via orbit snapshot.
+const FP_SKY_PLANET_CENTRE := false
 ## COSMOS HUD (this session) — VACUUM-AWARE thermometer. The shipped HUD prints air/ground temperature as a raw
 ## number everywhere, which in orbit shows (a) values BELOW absolute zero (the altitude lapse extrapolates the air
 ## curve to e.g. −541 °C — physically impossible) and (b) an "air" temperature where there is no air. When true:

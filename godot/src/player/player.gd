@@ -437,6 +437,12 @@ func _capture_mouse() -> void:
 func camera_global_transform() -> Transform3D:
 	return _camera.global_transform if _camera != null else global_transform
 
+## FP_SKY_PLANET_CENTRE: the planet's render-frame centre (the floating-origin / scaled-body offset). CosmosSky
+## subtracts this from the camera origin so its altitude/up/sun-elevation/light math is planet-relative even above
+## the re-anchor, where the camera stays near the scene origin and the planet is offset. ZERO before the ring exists.
+func planet_render_centre() -> Vector3:
+	return world.planet_render_centre() if world != null else Vector3.ZERO
+
 ## COSMOS R2.2 (Design Z): the WINDOW-space camera transform (what the camera is in pre-COSMOS window space)
 ## — body yaw+position × the pitch+eye camera-local. Main maps this into the static epoch render frame via
 ## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state

@@ -1045,6 +1045,16 @@ func _process(_delta: float) -> void:
 func _update_sky(t: float) -> void:
 	var cam_origin := _camera_origin()
 
+	# FP_SKY_PLANET_CENTRE (COSMOS ORBIT-SPACE, this session): the PLANET-RELATIVE camera position. All the sky's
+	# altitude/up/sun-elevation/occlusion/light/fog math below assumes the planet sits at the scene origin, but the
+	# floating-origin / scaled-body frame offsets it to planet_render_centre() above the re-anchor — so cam_origin
+	# (origin-relative) is NOT the true planet-relative position at high orbit. cam_rel corrects it; NODE PLACEMENT
+	# (sun/moon/star dome, which sit AT the camera) keeps the raw cam_origin. Off ⇒ cam_rel ≡ cam_origin (ZERO
+	# centre) ⇒ BYTE-IDENTICAL.
+	var cam_rel := cam_origin
+	if CubeSphere.FP_SKY_PLANET_CENTRE and _cam_provider != null and _cam_provider.has_method("planet_render_centre"):
+		cam_rel = cam_origin - (_cam_provider.planet_render_centre() as Vector3)
+
 	# FP_SKY_DSKY_ALT (COSMOS ORBIT-SPACE, this session): grow the star-dome + sun/moon placement radius with
 	# altitude so the dome clears the planet limb in high orbit. The static _dsky is sized for the 9000 ground clip
 	# and, above radial altitude ≈ 3.5k, sits INSIDE the visible disc → the gray-blue "no space at alt 8000" wash.
@@ -1055,7 +1065,7 @@ func _update_sky(t: float) -> void:
 	var dsky_eff := _dsky
 	var dome_scale := 1.0
 	if CubeSphere.FP_SKY_DSKY_ALT and CubeSphere.FP_SKY_DSKY_R:
-		dsky_eff = d_sky_derived_at(cam_origin.length(), FacetAtlas.R_BLOCKS)
+		dsky_eff = d_sky_derived_at(cam_rel.length(), FacetAtlas.R_BLOCKS)
 		dome_scale = dsky_eff / _dsky
 
 	# Sun direction in Earth's BODY-FIXED frame ⇒ day-night emerges from Earth's spin (§8.2).
@@ -1074,17 +1084,17 @@ func _update_sky(t: float) -> void:
 	var occ_cam := 1.0                                       # sun visibility from the camera (0 = behind the planet disc)
 	if CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE:
 		r_vox_sky = CosmosGravity.r_vox(OBSERVER)
-		occ_cam = occlusion_factor(sun_dir, cam_origin, r_vox_sky)
+		occ_cam = occlusion_factor(sun_dir, cam_rel, r_vox_sky)
 	# B0 (FP_SUN_PATHLIGHT, §2.6): unify the disc/glare penumbra on pen(h) — the same altitude-widened twilight
 	# the absolute light uses — so the disc/glare and the DirectionalLight die together across the terminator.
 	if CubeSphere.FP_SUN_PATHLIGHT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
-		occ_cam = occlusion_factor_pen(sun_dir, cam_origin, r_vox_sky, pen(cam_origin.length() - r_vox_sky))
+		occ_cam = occlusion_factor_pen(sun_dir, cam_rel, r_vox_sky, pen(cam_rel.length() - r_vox_sky))
 	# FP_TERM_SUN_CONT: re-evaluate occ_cam with the GROUND-FLOORED occluder distance so the disc/glare terminator
 	# threshold stops jittering per walk-step near the ground (dep(h) singularity). Uses the same pen(h) penumbra
 	# as B0 when on, else the fixed OCC_PENUMBRA. Off ⇒ occ_cam untouched (byte-identical).
 	if CubeSphere.FP_TERM_SUN_CONT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
-		var penum_cam := pen(cam_origin.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
-		occ_cam = occlusion_factor_ground(sun_dir, cam_origin, r_vox_sky, penum_cam, CubeSphere.TERM_SUN_H_EYE_MIN)
+		var penum_cam := pen(cam_rel.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
+		occ_cam = occlusion_factor_ground(sun_dir, cam_rel, r_vox_sky, penum_cam, CubeSphere.TERM_SUN_H_EYE_MIN)
 
 	# Sun impostor: at cam + sun_dir·D_SKY, radius sized to its exact angular diameter. A2 floors the angular
 	# size (the real 0.53° disc is an invisible ~8-px dot on gl_compat with no glare); off ⇒ the exact size.
@@ -1109,8 +1119,8 @@ func _update_sky(t: float) -> void:
 	# the albedo fade below reuse it. Off ⇒ stays 1.0 and neither site reads it (byte-identical).
 	var moon_occ := 1.0
 	if CubeSphere.FP_TERM_SUN_CONT and (CubeSphere.FP_SKY_PLANET_OCCLUDE or CubeSphere.FP_SUN_PRESENCE):
-		var penum_moon := pen(cam_origin.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
-		moon_occ = occlusion_factor_ground(moon_dir, cam_origin, r_vox_sky, penum_moon, CubeSphere.TERM_SUN_H_EYE_MIN)
+		var penum_moon := pen(cam_rel.length() - r_vox_sky) if CubeSphere.FP_SUN_PATHLIGHT else OCC_PENUMBRA
+		moon_occ = occlusion_factor_ground(moon_dir, cam_rel, r_vox_sky, penum_moon, CubeSphere.TERM_SUN_H_EYE_MIN)
 
 	# A4 (FP_LIGHT_ABSOLUTE): drive the Moon self-phase shader's sun direction — its lit hemisphere faces the
 	# Sun exactly as the shipped shaded material did under the DirectionalLight, but unshaded ⇒ never blacks out
@@ -1129,11 +1139,11 @@ func _update_sky(t: float) -> void:
 		var lum := 1.0
 		if CubeSphere.FP_SUN_PATHLIGHT:
 			var r_ps := r_vox_sky if r_vox_sky > 0.0 else CosmosGravity.r_vox(OBSERVER)
-			var m_sun := optical_path_air_mass(cam_origin, sun_dir, r_ps, OrbitalState.has_atmo(OBSERVER))
+			var m_sun := optical_path_air_mass(cam_rel, sun_dir, r_ps, OrbitalState.has_atmo(OBSERVER))
 			st = path_transmittance(m_sun)
 			lum = path_luminance(m_sun)
 		else:
-			var up_s := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+			var up_s := cam_rel.normalized() if cam_rel.length() > 1.0 else Vector3.UP
 			var mu_cam := sun_dir.dot(up_s)
 			st = scatter_tint(mu_cam)                        # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
 		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
@@ -1168,13 +1178,13 @@ func _update_sky(t: float) -> void:
 			_moon.visible = moon_occ > 0.001
 		else:
 			_sun.visible = occ_cam >= 0.5
-			_moon.visible = occlusion_factor(moon_dir, cam_origin, r_vox_sky) >= 0.5
+			_moon.visible = occlusion_factor(moon_dir, cam_rel, r_vox_sky) >= 0.5
 
 	# --- L1 MOONSHINE (SKY_MOONSHINE, §7.3). Compute the Moon geometry _ramp_environment reads, redden the
 	# impostor through a lunar eclipse, and (v1) aim the optional real second light. Flag off ⇒ this whole block
 	# is skipped: the moonshine inputs stay 0 (no ambient add) and the Moon albedo stays the shipped grey.
 	if CubeSphere.SKY_MOONSHINE:
-		var up := cam_origin.normalized() if cam_origin.length() > 1.0 else Vector3.UP
+		var up := cam_rel.normalized() if cam_rel.length() > 1.0 else Vector3.UP
 		_moon_up = clampf(moon_dir.dot(up), 0.0, 1.0)
 		_moon_illum = EPH.illuminated_fraction(OBSERVER, "moon", "sun", t)
 		_moon_eclipse = moon_eclipse_factor(t)
@@ -1185,7 +1195,7 @@ func _update_sky(t: float) -> void:
 		# neutral overhead, red at the horizon. Off ⇒ the shipped eclipse-only grey (byte-identical). The eclipse
 		# redden above is now rare (incl=5.1° under FP_MOON_PRESENCE) so this is the Moon's dominant colour law.
 		if CubeSphere.FP_SUN_PATHLIGHT:
-			moon_albedo = moon_path_albedo(moon_albedo, cam_origin, moon_dir, CosmosGravity.r_vox(OBSERVER), OrbitalState.has_atmo(OBSERVER))
+			moon_albedo = moon_path_albedo(moon_albedo, cam_rel, moon_dir, CosmosGravity.r_vox(OBSERVER), OrbitalState.has_atmo(OBSERVER))
 		# FP_TERM_SUN_CONT: fade the Moon disc by its ground-floored occlusion (same continuous law as the Sun), so
 		# it dims smoothly behind the planet limb instead of the A1 boolean flip. Off ⇒ moon_occ = 1 (no-op).
 		if CubeSphere.FP_TERM_SUN_CONT:
@@ -1215,9 +1225,9 @@ func _update_sky(t: float) -> void:
 	# −spin rotation). Above the surface the disc covers a real solid angle → stars inside it are discarded; at/
 	# inside the surface nothing is masked. Flag off ⇒ never written (planet_cos_ang stays the 2.0 default = no mask).
 	if CubeSphere.FP_SKY_PLANET_OCCLUDE and _star_mat != null:
-		var dist_s := cam_origin.length()
+		var dist_s := cam_rel.length()
 		if dist_s > r_vox_sky and r_vox_sky > 0.0:
-			_star_mat.set_shader_parameter("planet_dir", star_basis.inverse() * (-cam_origin / dist_s))
+			_star_mat.set_shader_parameter("planet_dir", star_basis.inverse() * (-cam_rel / dist_s))
 			_star_mat.set_shader_parameter("planet_cos_ang", cos(asin(clampf(r_vox_sky / dist_s, 0.0, 1.0))))
 		else:
 			_star_mat.set_shader_parameter("planet_cos_ang", 2.0)   # at/inside the surface: mask nothing
@@ -1234,7 +1244,7 @@ func _update_sky(t: float) -> void:
 		var shell_hidden := false
 		if CubeSphere.FP_FALL_SHELL_OFF and _atmo_shell != null:
 			var soff_usec := Time.get_ticks_usec()
-			var soff_d := cam_origin.length()
+			var soff_d := cam_rel.length()
 			var soff_v := 0.0
 			if _shelloff_prev_usec >= 0:
 				soff_v = FallThrottle.radial_speed(_shelloff_prev_d, soff_d, float(soff_usec - _shelloff_prev_usec) / 1.0e6)
@@ -1243,11 +1253,19 @@ func _update_sky(t: float) -> void:
 			shell_hidden = soff_v > CubeSphere.SHELL_OFF_VSPEED
 			_atmo_shell.visible = not shell_hidden
 		if not shell_hidden:
-			_atmo_shell_mat.set_shader_parameter("cam", cam_origin)
+			# FP_SKY_PLANET_CENTRE: the shell mesh is planet-centred with a Vector3.ZERO `centre` uniform, so it must
+			# ride the planet's render-frame offset (else it stays around the scene origin while the planet is offset in
+			# orbit) and its `cam` uniform is the planet-relative camera. planet_c ≡ 0 off ⇒ position 0 + cam_origin
+			# (byte-identical).
+			var planet_c := cam_origin - cam_rel
+			if CubeSphere.FP_SKY_PLANET_CENTRE:
+				_atmo_shell.position = planet_c
+			_atmo_shell_mat.set_shader_parameter("cam", cam_rel)
 			_atmo_shell_mat.set_shader_parameter("sun_dir", sun_dir)
 
-	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up).
-	_ramp_environment(sun_dir, cam_origin)
+	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up). Uses the PLANET-
+	# RELATIVE camera (cam_rel) so altitude/up/light are correct above the floating-origin re-anchor (FP_SKY_PLANET_CENTRE).
+	_ramp_environment(sun_dir, cam_rel)
 
 	# COSMOS-LOD-SKY M1 (FP_BODY_LOD): consult the multi-body LOD selection law + log any impostor↔ring
 	# handover. SELECTION ONLY — no placement/mesh change (the real Sun/Moon stay IMPOSTOR by the law), so the

@@ -620,7 +620,16 @@ func _apply_approach_anchor(player_pos: Vector3) -> void:
 	var lo := (CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST) if _anchor_released else CubeSphere.ANCHOR_REL_LO
 	var full := float(TerrainConfig.near_render_radius())
 	var view_f := CubeSphere.approach_view_distance(d, full, lo)
-	_module_world.call("set_approach_anchor", offset_y, int(round(view_f)))
+	var near_vd := int(round(view_f))
+	_module_world.call("set_approach_anchor", offset_y, near_vd)
+	# COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (SEAMLESS-SCALES §4): drive the L1 megablock ring's EFFECTIVE
+	# engagement rim from the SAME near view_distance just written to the viewer, so as S1 shrinks the near field below
+	# the static 128 the L1 hand-off tracks it inward (near-voxels → L1, never a far-skin/L2 annulus). Only when
+	# FP_BLOCK_LOD built the ring (this whole method already runs only under FP_APPROACH_ANCHOR) ⇒ the coupling is active
+	# iff BOTH flags are on; with either off the ring keeps its static 128 (byte-identical). Inherits S1's debounce +
+	# monotone ramp (same call site) — no re-mesh churn (the ring meshes whole facets; this is a bookkeeping value).
+	if CubeSphere.FP_BLOCK_LOD and _block_lod != null:
+		_block_lod.set_effective_rim(CubeSphere.block_lod_effective_rim(near_vd))
 
 ## FP_APPROACH_ANCHOR verify hook (verify_approach_anchor.gd — no live caller): run one compute+apply immediately,
 ## bypassing the wall-clock debounce (headless ticks are sub-ms apart). Gated exactly like the driver so an OFF build

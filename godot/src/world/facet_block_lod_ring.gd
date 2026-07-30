@@ -30,8 +30,13 @@ extends Node3D
 ##
 ## COMPOSITION (§6): L1 emits OVER the far-ring skin (the far ring stays as the sunk always-there backstop
 ## underneath). With S1 (FP_APPROACH_ANCHOR) also on, the near plate recedes into L1 blocks instead of flat paint.
-## NOTE (follow-up, NOT this task): S1's release distance should later tighten to the L1 engagement distance
-## (BLOCK_LOD_L1_RIM_BLOCKS) so the near plate hands directly to the L1 rim.
+## S1↔L1 RIM COUPLING (SEAMLESS-SCALES §4, implemented): the ring's EFFECTIVE engagement rim (effective_rim) is driven
+## by WorldManager from the SAME S1-ramped near view_distance it writes to the viewer — effective_rim =
+## min(BLOCK_LOD_L1_RIM_BLOCKS, near_vd) (CubeSphere.block_lod_effective_rim). As S1 shrinks the near field below 128
+## the L1 hand-off point tracks it inward so there is NEVER an uncovered annulus (near-edge..128) exposing far skin/L2.
+## Because L1 already meshes WHOLE facets (0..facet-edge — the near voxels merely OVERDRAW ≤ rim), tracking the rim is a
+## bookkeeping value only: it adds ZERO tiles / triggers NO re-mesh (the inward coverage was always there, revealed as
+## the near field recedes). Set only when BOTH FP_APPROACH_ANCHOR and FP_BLOCK_LOD are on; else it stays the static 128.
 ##
 ## NEVER-OOM (§5): a hard ledger BLOCK_LOD_BYTES_MAX (16 MB), an LRU cap on resident L1 facet meshes, wholesale-clear
 ## on breach, and the L1 band bounded to the active facet + ridge-1 neighbours. The gate (verify_block_lod.gd) asserts
@@ -60,6 +65,11 @@ var _byte_cap := CubeSphere.BLOCK_LOD_BYTES_MAX   # per-ring byte ceiling; the l
 var _lru_cap := CubeSphere.BLOCK_LOD_LRU_FACETS   # per-ring resident-facet cap (residency bound; band never evicted)
 var _material: ShaderMaterial = null
 var _sun_dir := Vector3(1.0, 0.0, 0.0)
+# S1↔L1 rim coupling (SEAMLESS-SCALES §4): the EFFECTIVE inner engagement rim (blocks) where the near voxel field hands
+# off to this tier. Static BLOCK_LOD_L1_RIM_BLOCKS (128) by default; driven DOWN to the S1-ramped near view_distance by
+# WorldManager (via block_lod_effective_rim) only when FP_APPROACH_ANCHOR is also on. Bookkeeping only — the mesh already
+# covers 0..facet-edge (whole facets), so this never re-clips geometry (zero tiles, no re-mesh). The gate reads it back.
+var _effective_rim := CubeSphere.BLOCK_LOD_L1_RIM_BLOCKS
 var _wholesale_clears := 0             # diagnostics: ledger-breach wholesale clears (gate reads to prove it fired)
 
 # COSMOS MAIN-THREAD ORCHESTRATION TH4 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §2 — same worker/commit split
@@ -104,6 +114,20 @@ func setup(active_fid: int, level: int = 1, do_rebuild: bool = true) -> void:
 
 func level() -> int:
 	return _level
+
+
+## S1↔L1 rim coupling (SEAMLESS-SCALES §4): set this ring's EFFECTIVE inner engagement rim (blocks). WorldManager pushes
+## min(BLOCK_LOD_L1_RIM_BLOCKS, near_view_distance) from the SAME value S1 (FP_APPROACH_ANCHOR) writes to the near
+## VoxelViewer each debounced tick, so the L1 hand-off tracks the receding near field with no uncovered annulus. Idempotent
+## + clamped ≥0. Bookkeeping only (whole-facet mesh already covers inward) ⇒ NO re-mesh, zero added tiles. Untouched ⇒ 128.
+func set_effective_rim(rim: int) -> void:
+	_effective_rim = maxi(rim, 0)
+
+
+## The current effective inner engagement rim (blocks) — 128 static, or the S1-ramped near view_distance once it drops
+## below 128. The gate asserts this == min(128, near_view_distance) across the S1 ramp (no gap), and == 128 when uncoupled.
+func effective_rim() -> int:
+	return _effective_rim
 
 
 ## P2 shared-budget hook: the ladder governs the CROSS-LEVEL byte ceiling, so it lifts each managed ring's own byte

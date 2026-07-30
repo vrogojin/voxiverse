@@ -137,6 +137,50 @@ func _initialize() -> void:
 	_ok(caught, "G-AA-TAU(math): FALSIFY — a non-monotone (grow-mid-climb) release sequence is detected as violating")
 
 	# ---------------------------------------------------------------------------------------------------------------
+	# G-S1L1-COUPLE (math): the S1↔L1 rim coupling (SEAMLESS-SCALES §4 — "release into coarse blocks, not paint").
+	# Across the S1 release ramp (near view_distance sweeping full→0 with altitude) the L1 megablock ring's EFFECTIVE
+	# inner engagement rim must track the near field so there is NO uncovered annulus between the near edge and L1:
+	# effective_rim == near_vd whenever near_vd < RIM(128), and == the static RIM when the near field is full (≥ RIM).
+	# Falsify with a PINNED rim (always 128): it leaves the near_vd..128 gap (the tone step) once the near field recedes.
+	# ---------------------------------------------------------------------------------------------------------------
+	var RIM := CubeSphere.BLOCK_LOD_L1_RIM_BLOCKS
+	var couple_tracks := true          # rim == near_vd when near_vd < RIM (L1 follows the near field inward → no gap)
+	var couple_full := true            # rim == RIM when near_vd ≥ RIM (handoff unchanged at full near field)
+	var couple_no_gap := true          # rim ≤ near_vd always (rim never OUTSIDE the near edge → no uncovered annulus)
+	var couple_le_rim := true          # rim ≤ RIM always (never engages OUTSIDE the static rim)
+	var pinned_gap_seen := false       # FALSIFY: a pinned static-128 rim DOES leave a gap somewhere on the ramp
+	for i in range(0, 121):
+		var d := float(i) * 10.0
+		var near_vd := int(round(CubeSphere.approach_view_distance(d, full, lo_knee)))
+		var rim := CubeSphere.block_lod_effective_rim(near_vd)
+		if near_vd < RIM and rim != near_vd:
+			couple_tracks = false
+		if near_vd >= RIM and rim != RIM:
+			couple_full = false
+		if rim > near_vd:
+			couple_no_gap = false
+		if rim > RIM:
+			couple_le_rim = false
+		if near_vd < RIM and RIM != near_vd:
+			pinned_gap_seen = true     # the pinned static rim (128) leaves near_vd..128 uncovered here
+	_ok(couple_tracks, "G-S1L1-COUPLE(math): effective_rim == near view_distance whenever it is < RIM(%d) — L1 follows the near field inward (no gap)" % RIM)
+	_ok(couple_full, "G-S1L1-COUPLE(math): effective_rim == static RIM(%d) when the near field is full (near_vd ≥ RIM) — handoff unchanged at ground" % RIM)
+	_ok(couple_no_gap and couple_le_rim, "G-S1L1-COUPLE(math): effective_rim ≤ near_vd AND ≤ RIM(%d) across the whole ramp — NO uncovered annulus (near-edge..L1) at any altitude" % RIM)
+	_ok(pinned_gap_seen, "G-S1L1-COUPLE(math): FALSIFY — a PINNED static-128 rim leaves the near_vd..128 gap on the ramp (the tone step the coupling closes)")
+	# Ring plumbing (flag-independent): a fresh, undriven L1 ring reports the static RIM (either-flag-off byte-identical);
+	# the setter/getter track a pushed coupled value; a full near field on descent clamps back to RIM (no double-cover).
+	var ring := FacetBlockLodRing.new()
+	var default_rim := ring.effective_rim()
+	ring.set_effective_rim(CubeSphere.block_lod_effective_rim(70))     # mid-release: near_vd=70 ⇒ rim=70
+	var driven_rim := ring.effective_rim()
+	ring.set_effective_rim(CubeSphere.block_lod_effective_rim(9999))   # descent: near field full again ⇒ clamp to RIM
+	var regrown_rim := ring.effective_rim()
+	ring.free()
+	_ok(default_rim == RIM, "G-S1L1-COUPLE: an undriven L1 ring reports the static RIM(%d) — either-flag-off keeps the shipped rim" % RIM)
+	_ok(driven_rim == 70, "G-S1L1-COUPLE: set_effective_rim plumbs the coupled value (near_vd=70 ⇒ rim=70)")
+	_ok(regrown_rim == RIM, "G-S1L1-COUPLE: descent re-grow — a full near field clamps the rim back to RIM(%d) (no double-cover flicker)" % RIM)
+
+	# ---------------------------------------------------------------------------------------------------------------
 	# PART B — DRIVER (needs the godot_voxel module + a live viewer). Proves the OFF gating (zero writes) or the ON
 	# behaviour (offset tracks the anchor, view ramps down, same viewer object airborne == grounded).
 	# ---------------------------------------------------------------------------------------------------------------
@@ -207,12 +251,19 @@ func _initialize() -> void:
 	var seen_full := false
 	var seen_zero := false
 	var anchored_steps := 0
+	var drv_rim_couple := true       # G-S1L1-COUPLE(driver): live L1 ring rim == min(RIM, viewer view_distance)
+	var couple_steps := 0            # driver-integration steps exercised (0 ⇒ FP_BLOCK_LOD off, ring not built)
 	for i in range(0, 121):
 		var h := float(i) * 10.0                        # lattice y sweep 0 → 1200
 		var pos := Vector3(px, h, pz)
 		w.approach_anchor_step_now(pos)                 # bypass the debounce (headless ticks are sub-ms apart)
 		var off := float(w._module_world.call("viewer_offset_y"))
 		var view := int(w._module_world.call("viewer_view_distance"))
+		# S1↔L1 rim coupling: if FP_BLOCK_LOD also built the ring, its effective rim tracks the SAME view just written.
+		if w._block_lod != null:
+			couple_steps += 1
+			if w._block_lod.effective_rim() != CubeSphere.block_lod_effective_rim(view):
+				drv_rim_couple = false
 		# G-AA-ANCHOR(driver): the AIRBORNE regime is radial altitude ≥ 0 (the centre cell sits a few blocks BELOW the
 		# datum at lattice y=0, where the anchor correctly caps at O_base). Where airborne, the viewer radial altitude =
 		# _radial(player) + local offset stays pinned to O_base — the plate stays where the player left the ground.
@@ -243,6 +294,10 @@ func _initialize() -> void:
 	# serves both — no new node, no new buffer. This pins the voxel-memory ledger: airborne ≤ grounded (zero new bytes).
 	_ok(drv_view_le_grounded, "G-AA-BYTES: airborne view_distance never exceeds the grounded full radius (resident bytes airborne ≤ grounded)")
 	_ok(drv_id_stable, "G-AA-BYTES: the SAME viewer object serves grounded and airborne (no re-instantiation / new node)")
+	if couple_steps > 0:
+		_ok(drv_rim_couple, "G-S1L1-COUPLE(driver): the live L1 ring effective_rim tracks min(%d, viewer view_distance) across the ascent (%d steps)" % [CubeSphere.BLOCK_LOD_L1_RIM_BLOCKS, couple_steps])
+	else:
+		print("  NOTE: FP_BLOCK_LOD off ⇒ no L1 ring built; G-S1L1-COUPLE(driver) integration skipped (pure-math + plumbing layers stand). sed FP_BLOCK_LOD=true to exercise it.")
 
 	# DESCENT re-grow with hysteresis: coming down from orbit, the view re-grows and is FULL again by ~re_lo (~609),
 	# earlier than the old alt-regime release (~416). Monotone non-decreasing as we descend.

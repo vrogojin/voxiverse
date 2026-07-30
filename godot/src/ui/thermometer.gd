@@ -48,18 +48,53 @@ func _process(_delta: float) -> void:
 	var env := world.environment
 	var air := env.temperature(player.head_position())
 	var ground := env.temperature(player.ground_probe_position())
-	_air_label.text = "Air temp:     %5.1f °C" % air
-	_ground_label.text = "Ground temp:  %5.1f °C" % ground
+	# VACUUM-AWARE HUD (FP_HUD_VACUUM_TEMP, docs cube_sphere.gd): clamp to absolute zero, and blank
+	# ("--") the air in vacuum / the ground when in space off any surface. Flag OFF ⇒ the exact shipped
+	# strings (byte-identical). The predicates reuse the SAME accessors RemoteBridge streams as `alt` /
+	# `on_ground` (Player.radial_altitude / Player.is_on_surface), so the HUD can never disagree with them.
+	if CubeSphere.FP_HUD_VACUUM_TEMP:
+		var alt := player.radial_altitude()
+		var on_surf: bool = player.is_on_surface()
+		_air_label.text = hud_air_text(alt, air)
+		_ground_label.text = hud_ground_text(alt, on_surf, ground)
+	else:
+		_air_label.text = "Air temp:     %5.1f °C" % air
+		_ground_label.text = "Ground temp:  %5.1f °C" % ground
 
 	var aimed: Dictionary = player.get_aimed()
 	var aim_txt := "aim: (none)"
 	if aimed.get("hit", false):
 		var v: Vector3i = aimed["voxel"]
 		var vt := env.temperature(Vector3(v.x + 0.5, v.y + 0.5, v.z + 0.5))
+		# VACUUM-AWARE HUD: the aimed-voxel temp is never "--", but it IS clamped to absolute zero when the flag is on.
+		var vt_show := clamp_temp(vt) if CubeSphere.FP_HUD_VACUUM_TEMP else vt
 		# Composed cell query -> real material name for whatever block is aimed
 		# (grass/dirt/stone/wood/leaf/placed), via the authoritative BlockCatalog.
 		var id: int = world.block_id_at(v)
 		var mat_name := BlockCatalog.name_of(id)
-		aim_txt = "aim: %s %s  %.1f °C" % [mat_name, str(v), vt]
+		aim_txt = "aim: %s %s  %.1f °C" % [mat_name, str(v), vt_show]
 	var mode := "FLY" if player.flying else "WALK"
 	_info_label.text = "%s | %s\nWASD move  Shift run  Space jump  F fly  1-9/wheel slot  LMB break  RMB place  Esc free" % [mode, aim_txt]
+
+
+# ── VACUUM-AWARE HUD helpers (FP_HUD_VACUUM_TEMP) ─────────────────────────────────────────────────
+# Pure static functions so the gate (verify_hud_temp.gd) can exercise the display logic directly,
+# with no live player/SceneTree. Used by _process above when the flag is on.
+
+## Absolute-zero floor: no displayed temperature may read below −273.0 °C.
+static func clamp_temp(t: float) -> float:
+	return maxf(t, -273.0)
+
+## Air-temp line. In vacuum (radial altitude above the atmosphere ceiling ATMO_TOP ⇒ no air) the number
+## is replaced by "--" in the SAME 5-wide field the "%5.1f" number used; otherwise the real clamped value.
+static func hud_air_text(alt: float, temp: float) -> String:
+	if alt > CubeSphere.ATMO_TOP:
+		return "Air temp:     %5s °C" % "--"
+	return "Air temp:     %5.1f °C" % clamp_temp(temp)
+
+## Ground-temp line. Blank ("--") only when in space (alt > ATMO_TOP) AND not standing on any surface;
+## on a body surface (Moon/Earth) it shows the real clamped value even above the ceiling.
+static func hud_ground_text(alt: float, on_surface: bool, temp: float) -> String:
+	if alt > CubeSphere.ATMO_TOP and not on_surface:
+		return "Ground temp:  %5s °C" % "--"
+	return "Ground temp:  %5.1f °C" % clamp_temp(temp)

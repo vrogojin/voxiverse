@@ -41,6 +41,16 @@ const SKY_FAR_MARGIN := 0.95      # keep the star dome edge ≤ 95% of the camer
 static func d_sky_derived() -> float:
 	return FacetFarRing.CAMERA_FAR * SKY_FAR_MARGIN / STAR_DOME_MULT
 
+## FP_SKY_DSKY_ALT — the ALTITUDE-SCALED twin of d_sky_derived(). The static dome (d_sky_derived ≈ 8143) is sized
+## for the 9000-block GROUND clip; in high orbit the planet limb sits at √(d²−R²), which OUTGROWS 8143 above
+## radial altitude ≈ 3.5k, so the dome collapses into the disc and space cannot composite around the limb. This
+## twin tracks the ORBITAL camera far plane CosmosScale.camera_far(d,r) (= max(9000, 1.2·√(d²−R²))) exactly as
+## B5's fog-end does, giving dome_eff = 1.086·limb (always clears the limb) with the dome EDGE at 1.14·limb <
+## 1.2·limb == camera_far (always inside the clip, never culled). At d = R the far plane is FAR_MIN == 9000, so
+## d_sky_derived_at(R,R) == d_sky_derived() ⇒ dome_scale == 1.0 at ground (C0-continuous, byte-identical). Pure math.
+static func d_sky_derived_at(d: float, r: float) -> float:
+	return CosmosScale.camera_far(d, r) * SKY_FAR_MARGIN / STAR_DOME_MULT
+
 ## The observer body whose body-fixed frame is the scene frame (the dominant body). O0 = Earth.
 const OBSERVER := "earth"
 
@@ -1035,6 +1045,19 @@ func _process(_delta: float) -> void:
 func _update_sky(t: float) -> void:
 	var cam_origin := _camera_origin()
 
+	# FP_SKY_DSKY_ALT (COSMOS ORBIT-SPACE, this session): grow the star-dome + sun/moon placement radius with
+	# altitude so the dome clears the planet limb in high orbit. The static _dsky is sized for the 9000 ground clip
+	# and, above radial altitude ≈ 3.5k, sits INSIDE the visible disc → the gray-blue "no space at alt 8000" wash.
+	# dsky_eff tracks CosmosScale.camera_far (the same altitude-continuous far plane the frustum + fog-end use);
+	# dome_scale is the uniform instance scale applied to the fixed-radius dome mesh. Off (or FP_SKY_DSKY_R off) ⇒
+	# dsky_eff == _dsky and dome_scale == 1.0 ⇒ BYTE-IDENTICAL. C0-continuous: at ground camera_far == FAR_MIN so
+	# dsky_eff == _dsky exactly.
+	var dsky_eff := _dsky
+	var dome_scale := 1.0
+	if CubeSphere.FP_SKY_DSKY_ALT and CubeSphere.FP_SKY_DSKY_R:
+		dsky_eff = d_sky_derived_at(cam_origin.length(), FacetAtlas.R_BLOCKS)
+		dome_scale = dsky_eff / _dsky
+
 	# Sun direction in Earth's BODY-FIXED frame ⇒ day-night emerges from Earth's spin (§8.2).
 	var sun_dir := EPH.dir_to_bodyfixed(OBSERVER, "sun", t)
 	if sun_dir == Vector3.ZERO:
@@ -1068,8 +1091,8 @@ func _update_sky(t: float) -> void:
 	var sun_ang := EPH.angular_diameter("sun", OBSERVER, t)
 	if CubeSphere.FP_SUN_PRESENCE:
 		sun_ang = maxf(sun_ang, deg_to_rad(CubeSphere.SUN_MIN_ANG_DEG))
-	var sun_pos := cam_origin + sun_dir * _dsky
-	var sun_r := _dsky * tan(sun_ang * 0.5)
+	var sun_pos := cam_origin + sun_dir * dsky_eff
+	var sun_r := dsky_eff * tan(sun_ang * 0.5)
 	_place_impostor(_sun, sun_pos, sun_r)
 
 	# Moon impostor: body-fixed direction from Earth, exact angular size (A2-floored), lit by the shared light.
@@ -1079,7 +1102,7 @@ func _update_sky(t: float) -> void:
 	var moon_ang := EPH.angular_diameter("moon", OBSERVER, t)
 	if CubeSphere.FP_SUN_PRESENCE:
 		moon_ang = maxf(moon_ang, deg_to_rad(CubeSphere.MOON_MIN_ANG_DEG))
-	_place_impostor(_moon, cam_origin + moon_dir * _dsky, _dsky * tan(moon_ang * 0.5))
+	_place_impostor(_moon, cam_origin + moon_dir * dsky_eff, dsky_eff * tan(moon_ang * 0.5))
 
 	# FP_TERM_SUN_CONT: the Moon has the SAME per-step disc pop as the Sun (its A1 flip used the SHARP 0.005-rad
 	# penumbra, so it is worse). Compute a continuous, ground-floored Moon occlusion once here; the visible-flip and
@@ -1180,7 +1203,14 @@ func _update_sky(t: float) -> void:
 	# Star dome: centred on the camera, rotated by −Earth spin (the stars wheel as the planet turns).
 	var spin := EPH.spin_angle(OBSERVER, t)
 	var star_basis := Basis(Vector3(0, 0, 1), -spin)
-	_stars.transform = Transform3D(star_basis, cam_origin)
+	# FP_SKY_DSKY_ALT: uniformly scale the fixed-radius dome mesh so its world radius tracks dsky_eff (clears the
+	# limb in high orbit). dome_scale == 1.0 off ⇒ Transform3D(star_basis, cam_origin) verbatim (byte-identical).
+	# star_basis itself stays a PURE rotation — the planet-occlusion planet_dir below reads it unscaled, so the
+	# angular mask (and the shader's unit local-frame directions) are unaffected by the scale.
+	if dome_scale == 1.0:
+		_stars.transform = Transform3D(star_basis, cam_origin)
+	else:
+		_stars.transform = Transform3D(star_basis.scaled(Vector3(dome_scale, dome_scale, dome_scale)), cam_origin)
 	# A1 (FP_SKY_PLANET_OCCLUDE): feed the star-dome planet-disc mask (LOCAL dome frame, so it composes with the
 	# −spin rotation). Above the surface the disc covers a real solid angle → stars inside it are discarded; at/
 	# inside the surface nothing is masked. Flag off ⇒ never written (planet_cos_ang stays the 2.0 default = no mask).

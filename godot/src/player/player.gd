@@ -84,6 +84,20 @@ var _dev_land_guard := false
 # Feet more than this many blocks below the analytic surface ⇒ the dev guard clamps them up (below-floor tolerance).
 const DEV_LAND_EPS := 0.5
 
+# COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle): the teleport/fast-travel "settling" latch. A dev teleport to
+# a fresh far facet re-anchors the near field but the voxel view has NOT streamed/meshed there yet — so instead of
+# dropping the player into un-streamed void (the live "player in space, buried on land" symptom) we HOLD them
+# hovering at the analytic surface_y (no fall, control held) until the near-coverage probe says their column is
+# meshed, or a hard cap elapses. Only engaged by _dev_reposition on a GROUND teleport when the world can actually
+# answer the coverage probe (FACETED + module); default false ⇒ byte-identical normal play + FLAT dev teleports.
+var _settle_active := false
+var _settle_elapsed := 0.0
+# Hard cap: release the settle after this many seconds even if coverage never arrives, so a teleport can NEVER hang.
+const SETTLE_CAP_S := 6.0
+# Only engage the settle when the placement is within this many blocks of the surface (a ground teleport). A higher
+# placement is an intended hover (e.g. set_alt to altitude for a capture) and must NOT be force-landed.
+const SETTLE_ENGAGE_BAND := 12.0
+
 # COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.3): the coordinate-frame adapter that bridges the
 # player's canonical LATTICE frame (its LOCAL transform under WorldManager's ActiveFrame) and the GLOBAL/absolute
 # frame the physics server + renderer consume. Every physics-boundary conversion below routes through it. Fetched
@@ -684,6 +698,11 @@ func _physics_process(delta: float) -> void:
 	# held). Default off ⇒ the else-branch runs verbatim (byte-identical normal play); set only via remote_freeze_player.
 	if _dev_freeze_player:
 		velocity = Vector3.ZERO
+	elif _settle_active:
+		# COSMOS STREAM-SETTLE: while settling after a teleport, SUPPRESS motion integration (no fall) and hold the
+		# player at the analytic surface until the near field has meshed their column (or the cap). Consults the
+		# world's near-coverage probe each tick. Only ever active after a dev teleport on a coverage-capable world.
+		_settle_step(delta, world.near_column_meshed(position))
 	else:
 		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_move(delta)
@@ -2218,17 +2237,32 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 	# fly/coast so a re-derived ground query applies (a dev teleport lands you on the ground, not in a flight state).
 	_dev_land_guard = true
 	if world != null:
+		# COSMOS STREAM-SETTLE: re-anchor the near field onto the NEW sub-player facet NOW (redesignate the near pool +
+		# far ring + block-LOD + ActiveFrame + re-apply the S1 approach anchor), so the meshed near bubble follows the
+		# teleport instead of stranding on the old facet. No-op / byte-identical off FACETED. MUST precede update_streaming
+		# so the same-frame streaming kick targets the re-designated facet.
+		world.dev_reanchor_near(position)
 		world.update_streaming(position)
 		# FLOOR-SETTLE: re-derive the FRESH analytic surface at the target (the active facet is set above; set_active_facet
 		# cleared any per-column memo on a facet change, and surface_y is recomputed each call — no stale height). If the
 		# placement is AT/BELOW the surface, clamp the feet exactly onto it, grounded — a ground teleport never lands
 		# inside/below terrain. A placement ABOVE the surface (set_alt to altitude) is left as-is; the guard catches its fall.
 		var sy := world.surface_y(position.x, position.z)
+		# COSMOS STREAM-SETTLE: a NEW placement supersedes any prior settle hold (so a high set_alt after a ground
+		# teleport is never re-trapped at the surface). Re-engaged below only for a genuine ground placement.
+		_settle_active = false
 		if position.y < sy + DEV_LAND_EPS:
 			position.y = sy
 			velocity = Vector3.ZERO
 			_fall_have_v = false
 			_dev_land_guard = false                         # already settled on the ground — nothing to catch
+		# COSMOS STREAM-SETTLE: engage the hover-until-meshed hold ONLY for a GROUND placement (within SETTLE_ENGAGE_BAND
+		# of the surface) AND only when the world can actually answer the near-coverage probe (FACETED + module). A HIGHER
+		# placement is an intended hover (e.g. set_alt to altitude for a capture) and is left untouched — never force-landed.
+		# On FLAT / the fallback path the immediate clamp above is final (byte-identical shipped behaviour — no settle).
+		if position.y < sy + SETTLE_ENGAGE_BAND \
+				and world.has_method("near_coverage_available") and world.near_coverage_available():
+			_settle_begin(sy)
 
 ## DEV/TEST fall-through guard — clamp the player up onto the FRESH analytic surface when a dev teleport / freeze
 ## drop left the feet below it. Uses world.surface_y (the shared heightmap analytic law, NEVER the voxel buffer)
@@ -2248,6 +2282,38 @@ func _dev_land_clamp() -> void:
 		_fall_v_bci = PackedFloat64Array()
 		_fall_p_bci = PackedFloat64Array()
 		_dev_land_guard = false                             # landed cleanly — disarm
+
+## COSMOS STREAM-SETTLE: enter the hover-until-meshed "settling" state after a ground teleport/fast-travel. Holds the
+## player pinned at the analytic surface `sy` (no fall, motion integration suppressed) so they are never dropped into
+## an un-streamed column while the re-anchored near field ramps in. Released by _settle_step once the coverage probe
+## passes or the hard cap elapses. Zeroes velocity + drops the free-fall latch so nothing carries motion across.
+func _settle_begin(_sy: float) -> void:
+	_settle_active = true
+	_settle_elapsed = 0.0
+	velocity = Vector3.ZERO
+	_fall_have_v = false
+
+## COSMOS STREAM-SETTLE: advance the settling hold one physics tick. `covered` is the near-coverage probe result
+## (world.near_column_meshed) — supplied by the caller so this is unit-drivable headlessly (the gate scripts coverage
+## arriving after N ticks). While held: pin the feet at the FRESH analytic surface_y, zero velocity (control held, no
+## fall). RELEASE when the column is meshed OR the hard cap (SETTLE_CAP_S) elapses — snap onto the surface, ARM the
+## fall-through guard (catch any residual below-surface drop as the last blocks apply), and clear the latch. No-op
+## when not settling. Returns true on the tick it releases (test-visible).
+func _settle_step(delta: float, covered: bool) -> bool:
+	if not _settle_active:
+		return false
+	_settle_elapsed += delta
+	var sy := world.surface_y(position.x, position.z) if world != null else position.y
+	position.y = sy                                         # hover pinned at the surface (never fall while un-meshed)
+	velocity = Vector3.ZERO
+	if covered or _settle_elapsed >= SETTLE_CAP_S:
+		position.y = sy                                    # snap onto the surface top, grounded
+		velocity = Vector3.ZERO
+		_fall_have_v = false
+		_dev_land_guard = true                             # arm the guard so the release lands ON the surface, not through it
+		_settle_active = false
+		return true
+	return false
 
 ## teleport (dev): place the player at an absolute pose. `mode` == "xyz" ⇒ `a`,`b`,`c` are ACTIVE-FACET LATTICE
 ## coords (the frame `position` lives in — the same frame set_alt / snapshots operate in; kept in the CURRENT

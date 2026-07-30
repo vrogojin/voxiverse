@@ -674,6 +674,23 @@ const BLOCK_LOD_DITHER_S := 0.3            # arrival screen-door dither seconds 
 const BLOCK_LOD_LRU_FACETS := 9            # LRU cap on resident L1 facet meshes (band ≤5 + re-crossing slack)
 const BLOCK_LOD_BYTES_MAX := 16 << 20      # NEVER-OOM hard ledger ceiling (§5): 16 MB
 
+## COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §4 — "release into coarse
+## blocks, not paint"). The last near→far seam: on a fly-up FP_APPROACH_ANCHOR (S1) ramps the near VoxelViewer
+## view_distance DOWN (full 128 → 0) so the near voxel plate recedes rim-inward. The L1 megablock ring engages at the
+## static rim BLOCK_LOD_L1_RIM_BLOCKS (=128 = the near field's FULL radius). Once S1 shrinks the near view_distance
+## BELOW 128 the near field ends at <128 while the L1 hand-off point stays pinned at 128 — the annulus (near-edge..128)
+## would read as far skin / L2, not L1 (the tone step). This pure/static law drives the L1 ring's EFFECTIVE engagement
+## rim from the near field's CURRENT (S1-ramped) view_distance so the hand-off is always near-voxels → L1 with NO
+## uncovered annulus: effective_rim = min(BLOCK_LOD_L1_RIM_BLOCKS, near_vd). At full near view_distance (≥128) it is the
+## static 128 (unchanged); as the near field shrinks it tracks it exactly (clamped ≥0). The L1 ring meshes WHOLE facets
+## (0..facet-edge, no radial clip — the near voxels merely OVERDRAW ≤ rim), so tracking the rim inward adds ZERO tiles;
+## L1 min-height is at-or-below the near terrain ⇒ the region they share is safe/overdrawn, revealed cleanly as the near
+## field recedes. Pure static so the gate asserts the identical formula the driver applies. Wired ONLY when BOTH
+## FP_APPROACH_ANCHOR and FP_BLOCK_LOD are on (a coordination between S1 and P1); with either off the ring keeps the
+## static rim (byte-identical). No new tunable — the coupling is the exact `min`.
+static func block_lod_effective_rim(near_vd: int) -> int:
+	return mini(BLOCK_LOD_L1_RIM_BLOCKS, maxi(near_vd, 0))
+
 ## COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5/§9) — the L2..L4 streamed ladder + the L5 GLOBAL
 ## always-resident tier, so blocky relief extends to the horizon with a power-of-2 fidelity fall-off. BOTH default
 ## false, byte-identical off (gated construction — WorldManager never news the nodes up), each REQUIRES FP_BLOCK_LOD.

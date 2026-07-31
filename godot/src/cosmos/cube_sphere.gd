@@ -1992,6 +1992,23 @@ const FP_DEV_TP_REFRAME := false
 ## identical (the shipped maybe_cross_facet path runs verbatim). Requires FACETED. Pairs with FP_DEV_TP_REFRAME.
 const FP_TP_FLOOR_WELD := false
 
+## COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC) — the GENERAL descent fall-through guard (the live "flew over a FAR
+## region, descended, fell THROUGH the ground to alt −20" report; set_alt 8 there also landed at −20 ⇒ surface_y ≈ −28,
+## deep/wrong). Root cause: a fast/high flight drifts the true sub-camera facet MANY facets away from the active facet
+## while adjacent seam crossings are cooldown/containment-deferred and the high-flyer pool freeze (_pool_off_surface)
+## deliberately suppresses re-designation — so the active facet LAGS. floor_under / surface_y then evaluate the player's
+## column against the STALE facet's piecewise-FLAT datum plane; extended thousands of blocks past its ridge domain that
+## flat plane sinks far below the sphere (surface_y ≈ −28 at a far spot that really has trees at the surface), so the
+## descending player lands on the deep lie / falls through. FP_TP_FLOOR_WELD fixed exactly this class but ONLY for a dev
+## geo-teleport (armed by _dev_teleport_geo). When true, ANY genuine (non-flying) descent resyncs the active facet onto
+## the true facet_of_dir owner — WorldManager.resync_subcamera_facet, a direct O(1) redesignation (the _alt_reentry_restore
+## path, position/velocity-continuous via the returned reframe + _heal_frame_desync) — so floor_under / surface_y read the
+## owner's REAL surface and the fall lands ON it. NON-ADJACENT owner only (an adjacent flip stays the domain of
+## maybe_cross_facet's −HYST/cooldown/containment hysteresis, never fought) ⇒ normal walking is byte-identical. Requires
+## FACETED. Default FALSE ⇒ resync_subcamera_facet is never called (the player gates the whole block) ⇒ byte-identical.
+## Gate: verify_descent_facet_resync (a far non-adjacent desync settles at/above the true surface, with a falsifier).
+const FP_DESCENT_FACET_RESYNC := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

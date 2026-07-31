@@ -44,6 +44,13 @@ var _active_fid := -1
 # (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
 var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
+# COSMOS PLANET-LOD-CONFIG P0 (§2.4): the last-bound §2V skin textures, cached so set_skin_active can UNBIND them at
+# orbit (freeing the base map from the sampler → the shell falls back to the plain vertex-colour FarPalette backstop:
+# tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
+var _skin_base_tex: Texture = null
+var _skin_band_tex: Texture = null
+var _skin_cu_tex: Texture = null
+var _skin_active := true              # §2V skin currently bound (true = shipped); set false while the orbit tier owns the disc
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
 # FP_ENV_FALLBACK_EMIT: fid -> true once `_pos_cache[fid]` holds the ENV envelope (vs a cheap chord fallback still
@@ -3231,15 +3238,39 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 func set_facet_tex(tex: Texture) -> void:
 	if not _tex_on() or _mi == null:
 		return
+	_skin_base_tex = tex                              # cache for set_skin_active (orbit §2V retire/restore)
 	var mat := _mi.material_override
-	if mat is ShaderMaterial:
+	if mat is ShaderMaterial and _skin_active:
 		(mat as ShaderMaterial).set_shader_parameter("base_map", tex)
+
+## COSMOS PLANET-LOD-CONFIG P0 (§2.4 — REPLACE, not overlay): retire / restore the smooth §2V skin. When the orbit
+## megablock tier engages above the swap it OWNS the disc, so we UNBIND the base/band/close-up samplers on the far ring
+## → the shell shader's texture weight collapses (tx.a≈0 ⇒ wt=0) and the far ring reads as the plain vertex-colour
+## FarPalette backstop (round silhouette + rim intact, NO blotch) UNDER the crisp megablocks. On descent (`active` true)
+## the cached textures are rebound → the shipped skin path resumes. Self-guards on _tex_on() ⇒ never called / inert with
+## FP_BLOCK_LOD_ORBIT (or FP_FACET_TEX) off ⇒ byte-identical. Idempotent.
+func set_skin_active(active: bool) -> void:
+	if _skin_active == active:
+		return
+	_skin_active = active
+	if not _tex_on() or _mi == null:
+		return
+	var mat := _mi.material_override
+	if not (mat is ShaderMaterial):
+		return
+	var m := mat as ShaderMaterial
+	m.set_shader_parameter("base_map", _skin_base_tex if active else null)
+	if _skin_band_tex != null:
+		m.set_shader_parameter("band_map", _skin_band_tex if active else null)
+	if _skin_cu_tex != null:
+		m.set_shader_parameter("closeup_map", _skin_cu_tex if active else null)
 
 ## COSMOS LOD-TEXTURE Phase 4: bind the baker's close-up Texture2DArray into the shell shader's `closeup_map`. No-op
 ## unless FP_FACET_TEX_CLOSEUP is on and the material is the close-up shader ⇒ flag-off is byte-identical (never wired).
 func set_facet_closeup_tex(tex: Texture) -> void:
 	if not _cu_on() or _mi == null:
 		return
+	_skin_cu_tex = tex
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("closeup_map", tex)
@@ -3275,6 +3306,7 @@ func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void
 func set_facet_band(tex: Texture) -> void:
 	if not _bm_on() or _mi == null:
 		return
+	_skin_band_tex = tex
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("band_map", tex)

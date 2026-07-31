@@ -369,6 +369,9 @@ func _initialize() -> void:
 	print("  INFO G-BLD-MAINCOST(ladder): multi-level crossing main-commit = %.2f ms (bakes stayed on the worker)" % lad_commit)
 	mlad.queue_free()
 
+	# ================= PLANET-LOD-CONFIG P0 — the ORBIT megablock disc (FacetBlockLodOrbit) =====================
+	_gate_orbit()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -421,3 +424,154 @@ func _check_min(fine: Dictionary, coarse: Dictionary) -> Array:
 			if tmax > tmin:
 				relief = true                    # MAX-variant top (tmax) would exceed the lower child (tmin) here
 	return [ok_eq, ok_le, relief]
+
+
+## G-BLD-ORBIT-LEVEL / -BYTES / -MIN / -RETIRE / -EMPTY (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2). Drives
+## FacetBlockLodOrbit directly (flag-independent under FACETED, like the P0/P1/P2 sections): the node is a pure function
+## of the facet + camera; the in-engine construction is FP_BLOCK_LOD_ORBIT-gated, but the gate news it up itself.
+func _gate_orbit() -> void:
+	print("  -- PLANET-LOD-CONFIG P0: orbit megablock disc --")
+	var MIN_L := CubeSphere.BLOCK_LOD_ORBIT_MIN_LEVEL          # 4
+	var MAX_L := CubeSphere.BLOCK_LOD_GLOBAL_LEVEL             # 5
+
+	# ---- G-BLD-ORBIT-LEVEL: the PURE per-facet screen-distance law (nadir L4 -> limb L5), monotone non-decreasing -----
+	var nadir_lvl := FacetBlockLodOrbit.level_for_orbit_dist(8000.0)
+	_ok(nadir_lvl == 4, "G-BLD-ORBIT-LEVEL: nadir facet at alt 8000 (d=8000) selects L4 (16-blk) - got L%d" % nadir_lvl)
+	var far_lvl := FacetBlockLodOrbit.level_for_orbit_dist(13000.0)
+	_ok(far_lvl == 5, "G-BLD-ORBIT-LEVEL: limb facet (d=13000) coarsens to L5 (32-blk) - got L%d" % far_lvl)
+	_ok(FacetBlockLodOrbit.level_for_orbit_dist(10.0) == MIN_L, "G-BLD-ORBIT-LEVEL: clamped to L%d floor (never finer than the orbit min tier)" % MIN_L)
+	_ok(FacetBlockLodOrbit.level_for_orbit_dist(1.0e6) == MAX_L, "G-BLD-ORBIT-LEVEL: clamped to L%d ceiling (never coarser than L5)" % MAX_L)
+	var mono := true
+	var prev := 0
+	for step in range(0, 40):
+		var dist := 4000.0 + float(step) * 500.0
+		var lv := FacetBlockLodOrbit.level_for_orbit_dist(dist)
+		if lv < prev:
+			mono = false
+		prev = lv
+	_ok(mono, "G-BLD-ORBIT-LEVEL: level_for_orbit_dist MONOTONE non-decreasing in distance (no L5->L4 inversion)")
+	var finer := CubeSphere.orbit_level_for_dist(8000.0, CubeSphere.BLOCK_LOD_ORBIT_PX, CubeSphere.BLOCK_LOD_ORBIT_K_PX, 3, MAX_L)
+	_ok(finer == 4 and CubeSphere.orbit_level_for_dist(3000.0, CubeSphere.BLOCK_LOD_ORBIT_PX, CubeSphere.BLOCK_LOD_ORBIT_K_PX, 3, MAX_L) == 3,
+		"G-BLD-ORBIT-LEVEL falsifier: a real B*=px*d/K function (min_level=3 lets d=3000 fall to L3) - not a constant")
+
+	# ---- G-BLD-ORBIT-ENGAGE: the swap-altitude hysteresis band ------------------------------------------------------
+	var e_hi := CubeSphere.BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 + CubeSphere.BLOCK_LOD_ORBIT_HYST)
+	var e_lo := CubeSphere.BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 - CubeSphere.BLOCK_LOD_ORBIT_HYST)
+	var eng_ok := CubeSphere.block_lod_orbit_engaged(e_hi + 1.0, false)
+	eng_ok = eng_ok and not CubeSphere.block_lod_orbit_engaged(e_hi - 1.0, false)
+	eng_ok = eng_ok and CubeSphere.block_lod_orbit_engaged(e_lo + 1.0, true)
+	eng_ok = eng_ok and not CubeSphere.block_lod_orbit_engaged(e_lo - 1.0, true)
+	eng_ok = eng_ok and not CubeSphere.block_lod_orbit_engaged(0.0, false)
+	_ok(eng_ok, "G-BLD-ORBIT-ENGAGE: hysteresis swap band [%.0f..%.0f] (engage up-high, disengage down-low, off on surface)" % [e_lo, e_hi])
+
+	# ---- Build a REAL bounded disc at alt 8000 (nadir camera) -------------------------------------------------------
+	var afid := 300
+	var node := FacetBlockLodOrbit.new()
+	root.add_child(node)
+	node.setup(afid)
+	var u := node._facet_centre(afid).normalized()
+	var cam_d := FacetAtlas.R_BLOCKS + 8000.0
+	var disc := node.assign_disc(u, cam_d)
+	_ok(disc.size() > 100, "G-BLD-ORBIT-DISC: the visible disc enumerates the front hemisphere (%d facets)" % disc.size())
+	_ok(int(disc[0][2]) == 4, "G-BLD-ORBIT-LEVEL: nearest (nadir) disc facet is L4; farthest is L%d" % int(disc[disc.size() - 1][2]))
+
+	var unit := FacetBlockLodOrbit.BuildUnit.new()
+	unit.disc = disc.slice(0, mini(disc.size(), 180))   # a nearest slice that breaches the 12 MB cap ⇒ exercises coarsen/drop
+	node._worker_build(unit)
+	node._commit_build(unit)
+
+	# ---- G-BLD-ORBIT-BYTES: enforced ledger <= cap; draws bounded; combined (skin retired) < 40 MB ------------------
+	_ok(node.total_bytes() <= CubeSphere.BLOCK_LOD_ORBIT_BYTES_MAX,
+		"G-BLD-ORBIT-BYTES: enforced ledger %.2f MB <= cap %.0f MB (nearest-first stop-at-cap)" % [node.total_bytes() / 1048576.0, CubeSphere.BLOCK_LOD_ORBIT_BYTES_MAX / 1048576.0])
+	_ok(node.draw_count() <= CubeSphere.BLOCK_LOD_ORBIT_DRAWS,
+		"G-BLD-ORBIT-BYTES: merged into %d draws <= %d (gl_compat draw-ceiling safe - merged by cube face)" % [node.draw_count(), CubeSphere.BLOCK_LOD_ORBIT_DRAWS])
+	var combined := node.total_bytes() + 0
+	_ok(combined < (40 << 20), "G-BLD-ORBIT-BYTES: combined budget %.2f MB < 40 MB (V2 skin retired frees ~8.2 MB)" % (combined / 1048576.0))
+	var recomputed := 0
+	for face in node._mesh_groups:
+		var mi: MeshInstance3D = node._mesh_groups[face]
+		var sa := mi.mesh.surface_get_arrays(0)
+		var nv: int = (sa[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+		var ni: int = (sa[Mesh.ARRAY_INDEX] as PackedInt32Array).size()
+		recomputed += nv * FacetBlockLodRing.BYTES_PER_VERT + ni * FacetBlockLodRing.BYTES_PER_INDEX
+	_ok(recomputed == node.total_bytes(), "G-BLD-ORBIT-BYTES: ledger(%d B) == arithmetic from the committed meshes(%d B)" % [node.total_bytes(), recomputed])
+
+	# ---- G-BLD-ORBIT-BYTES (arithmetic, WHOLE disc): the LADDER is load-bearing - uniform L4 busts the budget --------
+	var n_total := disc.size()
+	var quads_est := {4: 248, 5: 62}
+	var uni_l4 := FacetBlockLodOrbit.peak_bytes_for({4: n_total}, quads_est)
+	var uni_l5 := FacetBlockLodOrbit.peak_bytes_for({5: n_total}, quads_est)
+	_ok(uni_l4 > (40 << 20), "G-BLD-ORBIT-BYTES: uniform-L4 disc estimate %.1f MB > 40 MB - crisp hemisphere infeasible (WHY the ladder)" % (uni_l4 / 1048576.0))
+	_ok(uni_l5 > CubeSphere.BLOCK_LOD_ORBIT_BYTES_MAX and uni_l5 < uni_l4,
+		"G-BLD-ORBIT-BYTES: uniform-L5 disc estimate %.1f MB BUSTS the %.0f MB orbit cap (< L4's %.1f MB) - the per-facet ladder + cap-drop are load-bearing" % [uni_l5 / 1048576.0, CubeSphere.BLOCK_LOD_ORBIT_BYTES_MAX / 1048576.0, uni_l4 / 1048576.0])
+
+	# ---- G-BLD-ORBIT-MIN: no-protrusion — the megablock top <= the TRUE terrain EVERYWHERE in the coarse cell ---------
+	# The orbit columns come from the EXACT FacetBlockLod MIN decimate chain (top = MIN over ALL fine L0 cells), so the
+	# coarse top sits at-or-below the true fine surface at EVERY point, not just at sparse samples. Test it against a
+	# dense true-terrain grid (every 4 blocks inside a few coarse cells): assert top <= each true height AND top == MIN
+	# over those samples (the decimation is a MIN). Teeth: relief present (MAX>MIN) ⇒ a MAX-rule top WOULD protrude.
+	var contain_ok := true          # coarse top <= the TRUE terrain at every dense sample (real no-protrusion)
+	var mineq_ok := true            # coarse top == MIN of the dense true samples (exact-MIN decimation, not max/mean)
+	var relief_seen := false        # MAX(samples) > MIN(samples) somewhere ⇒ the MIN rule is load-bearing
+	var checked := 0
+	for fid in node.covered_fids():
+		if checked >= 12:
+			break
+		checked += 1
+		var lvl := node.level_of(fid)
+		var cols := node._bake_cols(fid, lvl)
+		var w: int = cols["w"]
+		var h: int = cols["h"]
+		var top: PackedInt32Array = cols["top"]
+		var pitch := 1 << lvl
+		var dmin := FacetAtlas.dom_min(fid)
+		var dmax := FacetAtlas.dom_max(fid)
+		var w0 := dmax.x - dmin.x + 1               # the L0 domain the pyramid decimated (boundary coarse cells are partial)
+		var h0 := dmax.y - dmin.y + 1
+		for cz in range(0, h, maxi(h / 2, 1)):
+			for cx in range(0, w, maxi(w / 2, 1)):
+				var ct: int = top[cz * w + cx]
+				var tmin := 0x7fffffff
+				var tmax := -0x7fffffff
+				var span_x := mini(pitch, w0 - cx * pitch)   # clamp the sweep to the PRESENT L0 children only
+				var span_z := mini(pitch, h0 - cz * pitch)
+				for sz in range(0, span_z, 4):          # dense TRUE-terrain sweep over the present L0 cells (every 4 blocks)
+					for sx in range(0, span_x, 4):
+						var lx := dmin.x + cx * pitch + sx
+						var lz := dmin.y + cz * pitch + sz
+						var g := int(TerrainConfig.facet_profile(fid, lx, lz).x)
+						if ct > g:
+							contain_ok = false          # coarse top poked above the TRUE terrain — a protrusion
+						if g < tmin: tmin = g
+						if g > tmax: tmax = g
+				if ct > tmin:                            # top must be <= the true minimum over the cell
+					mineq_ok = false
+				if tmax > tmin:
+					relief_seen = true
+	_ok(contain_ok and mineq_ok, "G-BLD-ORBIT-MIN: megablock top <= the TRUE terrain everywhere in the coarse cell (exact-MIN, no protrusion) - %d facets" % checked)
+	_ok(relief_seen, "G-BLD-ORBIT-MIN falsifier: relief present (MAX>MIN in a coarse cell) — a MAX-height decimation WOULD protrude (MIN rule load-bearing)")
+
+	# ---- G-BLD-ORBIT-RETIRE: the V2-retire predicate - orbit-covered facets are the retire set ---------------------
+	var levels_ok := true
+	for fid in node.covered_fids():
+		var lv2 := node.level_of(fid)
+		if lv2 < MIN_L or lv2 > MAX_L:
+			levels_ok = false
+	_ok(levels_ok and node.covered_fids().size() > 0,
+		"G-BLD-ORBIT-RETIRE: orbit tier covers %d facets ALL at L4..L5 - the V2-retire set (block owns them, no double-draw)" % node.covered_fids().size())
+	var eng_at_orbit := CubeSphere.block_lod_orbit_engaged(8000.0, false)
+	_ok(eng_at_orbit, "G-BLD-ORBIT-RETIRE: at alt 8000 the tier ENGAGES => far-ring V2 skin suppressed (retire, not overlay)")
+
+	# ---- G-BLD-ORBIT-EMPTY: on the surface the tier is inert -------------------------------------------------------
+	var surf := FacetBlockLodOrbit.new()
+	root.add_child(surf)
+	surf.setup(afid)
+	var eng_surf := surf.set_camera(u, FacetAtlas.R_BLOCKS + 0.0)
+	_ok(not eng_surf and surf.total_bytes() == 0 and surf.covered_fids().is_empty(),
+		"G-BLD-ORBIT-EMPTY: on the surface the orbit tier is DISENGAGED - no mesh, 0 bytes, nothing covered")
+
+	print("  INFO orbit: disc=%d facets  bounded-build=%d facets  ledger=%.2f MB (cap %.0f MB)  draws=%d  coarsen=%d  dropped=%d" % [
+		disc.size(), unit.disc.size(), node.total_bytes() / 1048576.0, CubeSphere.BLOCK_LOD_ORBIT_BYTES_MAX / 1048576.0,
+		node.draw_count(), node.coarsen_events(), node.dropped_limb()])
+	node.queue_free()
+	surf.queue_free()

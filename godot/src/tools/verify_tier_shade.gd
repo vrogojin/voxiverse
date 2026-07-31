@@ -51,6 +51,7 @@ func _initialize() -> void:
 	FacetAtlas.warm_up()
 	_gate_shade()
 	_gate_shader_strings()
+	_gate_livesun()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -149,3 +150,43 @@ func _gate_shader_strings() -> void:
 		_ok(fix.contains("normalize(v_wp - planet_centre)"), "block_materials: flag on ⇒ TRUE radial normal")
 		_ok(fix.contains("uniform vec3 planet_centre"), "block_materials: flag on ⇒ planet_centre uniform declared")
 		_ok(not fix.contains("normalize(v_wp)\n") and not fix.contains("normalize(v_wp);"), "block_materials: flag on ⇒ no residual origin-normal")
+
+## G-TS-LIVESUN + G-TS-UNIFIED: the block-LOD tier reads a LIVE, SHARED sun_dir uniform (never a per-facet baked-in
+## value), and it shades by the SAME true planet-radial (MODEL·0) normal the far-ring shell uses — so two facets whose
+## meshes are committed at DIFFERENT sim-times shade IDENTICALLY at a given clock, and no per-tile sun patchwork can form.
+func _gate_livesun() -> void:
+	print("  --- G-TS-LIVESUN/UNIFIED: block-LOD reads ONE shared live sun_dir + the far-shell MODEL·0 normal ---")
+	var ring := FacetBlockLodRing.new()
+	# ONE shared material for every facet mesh (shared_material() is idempotent) — the whole point: all committed
+	# facet meshes carry material_override == this one material, so a single per-frame uniform write repaints them ALL.
+	var m1 := ring.shared_material()
+	var m2 := ring.shared_material()
+	_ok(m1 == m2, "block-LOD shared_material() is ONE material instance (all facet meshes share it → one live uniform)")
+
+	# The pushed sun_dir lands on the shared uniform UNMODIFIED (no sign flip / no frame remap) — the far ring and the
+	# block-LOD tier are fed the SAME current_sun_dir, so their day/night terminators agree (no mirrored sweep between tiers).
+	var sun := Vector3(0.37, -0.51, 0.77).normalized()
+	ring.set_sun_dir(sun)
+	var got: Vector3 = m1.get_shader_parameter("sun_dir")
+	_ok(got.distance_to(sun) < 1.0e-6, "block-LOD set_sun_dir writes the sun VERBATIM to the shared uniform (no mirror/remap)")
+
+	# BAKE-TIME INDEPENDENCE: the shade is a pure function of (this live uniform, geometry) — it holds NO per-facet
+	# bake-time sun. The material's shader computes the radial normal from MODEL·0 (the true planet centre in the render
+	# frame), exactly like the far-ring _SHELL_ABS_SHADER — so a facet meshed at dawn and one meshed at noon read the
+	# identical live sun at any later clock. Assert the shared material's shader carries the far-shell normal law.
+	var code: String = m1.shader.code
+	_ok(code.contains("MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)"), "block-LOD normal centre = MODEL·0 (true planet centre, not scene origin)")
+	_ok(code.contains("normalize(wp - centre)"), "block-LOD normal = normalize(wp - centre) — the far-shell radial (unified)")
+	_ok(not code.contains("normalize(wp);") and not code.contains("normalize(wp)\n"), "block-LOD does NOT use the origin-assuming normalize(wp)")
+	# The shade must read the sun_dir UNIFORM (live), not a constant — proves no bake-time capture.
+	_ok(code.contains("uniform vec3 sun_dir"), "block-LOD shade reads the live sun_dir uniform (not a baked-in constant)")
+
+	# Two facets 'committed at different times' would each get material_override == m1 (see _commit_facet_arrays):
+	# assert the commit path binds the shared material, so their shade is bake-time-independent by construction.
+	var a1 := ring._build_facet_arrays(0)
+	if not (a1["verts"] as PackedVector3Array).is_empty():
+		ring._commit_facet_arrays(0, a1)
+		var mesh_by: Dictionary = ring._mesh_by_fid
+		var mi: MeshInstance3D = mesh_by.get(0, null)
+		_ok(mi != null and mi.material_override == m1, "a committed facet mesh binds the ONE shared material (bake-time-independent shade)")
+	ring.free()

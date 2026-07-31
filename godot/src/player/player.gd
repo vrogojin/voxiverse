@@ -93,6 +93,9 @@ const DEV_LAND_EPS := 0.5
 # normal play — the latch is set by no other path). Cleared when the guard disarms (a clean landing) or on a new reposition.
 var _tp_land_active := false
 var _tp_owner_fid := -1
+var _tp_land_frames := 0   # FP_TP_FLOOR_WELD: 1 while a dev-teleport surface floor-hold is armed (0 = released)
+var _tp_land_x := 0.0       # FP_TP_FLOOR_WELD: the teleport column the surface floor-hold is pinned to
+var _tp_land_z := 0.0
 
 # COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle): the teleport/fast-travel "settling" latch. A dev teleport to
 # a fresh far facet re-anchors the near field but the voxel view has NOT streamed/meshed there yet — so instead of
@@ -1704,6 +1707,17 @@ func _move(delta: float) -> void:
 	if _ft_on2: _ft_t2 = Time.get_ticks_usec()
 	var terrain_floor := world.floor_under(position.x, position.z, position.y)
 	if _ft_on2: _ft_max("t_floor_us", Time.get_ticks_usec() - _ft_t2)
+	# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): after a dev geo-teleport, the analytic column scan floor_under
+	# can disagree with the analytic surface_y at the SAME facet/column (measured: floor_under −12.1 vs surface_y
+	# +11.9 at lat8/lon2 — a datum/column-scan mismatch), so the falling player tunnels the true grass surface and
+	# lands on the deep fill. Facet is correct (own_dist ≫ −HYST, no crossing) so the prior facet-weld did nothing.
+	# Fix: for a brief landing window, floor the descent at surface_y (the shared-heightmap law the mesh follows) so
+	# the teleport lands ON the surface. Dev-only (_tp_land_frames armed solely by _dev_teleport_geo); off-flag ⇒ skip.
+	if CubeSphere.FP_TP_FLOOR_WELD and _tp_land_frames > 0:
+		if absf(position.x - _tp_land_x) <= 3.0 and absf(position.z - _tp_land_z) <= 3.0:
+			terrain_floor = maxf(terrain_floor, world.surface_y(position.x, position.z))
+		else:
+			_tp_land_frames = 0   # walked away from the teleport column — release (floor_under is correct there)
 	var floor_y := terrain_floor
 
 	# Stand ON a detached voxel body directly under the feet instead of falling
@@ -2429,6 +2443,12 @@ func _dev_teleport_geo(lat_deg: float, lon_deg: float, alt: float) -> bool:
 	# the reposition already settled the player onto the ground (small alt) or engaged the hover settle.
 	_tp_owner_fid = fid
 	_tp_land_active = _dev_land_guard and not _settle_active
+	# FP_TP_FLOOR_WELD: arm the surface_y floor-hold PINNED TO THIS COLUMN. floor_under is persistently wrong here
+	# (not transient), so hold the descent floor at surface_y while the player stays near the teleport column, and
+	# release the moment they walk away (where floor_under is correct). Cleared by the proximity check in _move.
+	_tp_land_frames = 1
+	_tp_land_x = xf
+	_tp_land_z = zf
 	return true
 
 ## Resolve the world direction `dir` to {fid, x, z} (the Earth facet + integer lattice column containing it), or

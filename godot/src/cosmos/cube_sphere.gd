@@ -1810,6 +1810,27 @@ const SN_FOFF_RADIAL_FALL := false
 ## (raise toward the orbital DRAG_TERMINAL 55 once a pre-gen landing column removes the streaming constraint).
 const ATMO_BRAKE_TERMINAL := 20.0
 
+## DEV-FLIGHT CRUISE MODE (2026-07-31 dev request) — Elite-Dangerous-style SUPERCRUISE for the dev fly camera.
+## While DEV-FLYING in SPACE (radial altitude above the nearest body's surface > ATMO_TOP), HOLDING the C key
+## flies the player straight along the CAMERA LOOK direction at a speed that grows EXPONENTIALLY with distance
+## from the nearest body's surface. RELEASE C ⇒ INSTANT STOP (kinematic fly, velocity held 0). Engage needs
+## dev-flight active + in-space + C held. Default FALSE ⇒ BYTE-IDENTICAL (C never polled). Gate G-CRUISE.
+const CRUISE_MODE := false
+## Cruise speed law (blocks/s; 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks). speed(alt) =
+## clamp(MIN·2^(alt/BAND), MIN, MAX). MIN 200 = crawl just above ATMO_TOP; BAND 4000 = doubles/4000 blocks (cap
+## by ~18.6k alt); MAX 5000 = Earth→Moon crossing ≈ 77 s (1–3 min window). radial_altitude() = nearest-body alt.
+const CRUISE_SPEED_MIN := 200.0
+const CRUISE_SPEED_BAND := 4000.0
+const CRUISE_SPEED_MAX := 5000.0
+
+## Pure cruise SPEED LAW (blocks/s). Monotone; == MIN at/below alt 0; doubles per BAND; clamped [MIN,MAX].
+static func cruise_speed(alt: float) -> float:
+	return clampf(CRUISE_SPEED_MIN * pow(2.0, alt / CRUISE_SPEED_BAND), CRUISE_SPEED_MIN, CRUISE_SPEED_MAX)
+
+## Pure ENGAGE PREDICATE: dev-flight AND in-space AND C held (the live call ANDs with CRUISE_MODE).
+static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
+	return dev_fly and in_space and c_held
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

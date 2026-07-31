@@ -1515,6 +1515,21 @@ func _move(delta: float) -> void:
 		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
 		_dev_active = false
 		_fall_have_v = false                                # flying ⇒ not falling; next F-off re-seeds the free-fall
+		# DEV-FLIGHT CRUISE MODE (CubeSphere.CRUISE_MODE): while dev-flying IN SPACE (radial alt > ATMO_TOP), HOLDING C
+		# flies the camera LOOK dir at an exponential distance-scaled speed; release C ⇒ instant stop (kinematic, no
+		# residual drift). Flag OFF ⇒ C never polled ⇒ byte-identical. Uses radial_altitude() (nearest/dominant body).
+		if CubeSphere.CRUISE_MODE and not remote_drive:
+			var cruise_alt := radial_altitude()
+			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, Input.is_key_pressed(KEY_C)):
+				var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
+				var look_dir := (transform.basis * look_local)
+				if look_dir.length() > 0.0:
+					look_dir = look_dir.normalized()
+				var cruise_v := CubeSphere.cruise_speed(cruise_alt)
+				position += look_dir * cruise_v * delta
+				_horiz_vel = Vector3(look_dir.x, 0.0, look_dir.z) * cruise_v
+				velocity = Vector3.ZERO                      # kinematic fly; release ⇒ instant stop (no residual)
+				return
 		var use_devnav := _dev_nav and _nav != null
 		# COSMOS SPACE-NAV §7.4 (ORBIT_COAST): the O free-coast. While coasting, gravity integrates the orbit each
 		# frame (a stable circular seed HOLDS radius — the fix for "orbits then hangs"). EXIT: (b) any thrust/movement

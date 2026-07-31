@@ -40,6 +40,11 @@ static var env_build_main := 0
 static var env_build_worker := 0
 
 var _active_fid := -1
+# COSMOS FAR-CRUISE NEVER-BLACK (FP_FARRING_ACTIVE_NOBLACK): the active facet to emit UN-SUNK this build (the near field
+# is genuinely absent under the camera → draw at the true surface, not a sunk well), else -1. Written ONLY on the main
+# thread in _noblack_guarantee (past the _async_building guard), so the worker's _emit_cached reads a value stable for
+# its run — same single-writer / no-concurrent-write contract as _active_fid. -1 (and byte-identical) with the flag off.
+var _noblack_unsink_fid := -1
 # COSMOS FP-FIXED-FRAME re-anchor (§3): the accumulated floating-origin shift. Under the fixed frame the ring pins @
 # (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
 var _anchor_offset: Vector3 = Vector3.ZERO
@@ -634,6 +639,10 @@ func _process(_dt: float) -> void:
 	# reap any promotion that left it (bounded _bpos_cache). Here — past the `_async_building` guard (worker idle, safe to
 	# erase caches), before the warm/emit below so this frame's warm builds/dispatches the freshly-promoted set. No-op off.
 	_recompute_mid_dense(p)
+	# COSMOS FAR-CRUISE NEVER-BLACK: guarantee the sub-camera (active) facet paints an opaque backstop with NO warm-lag
+	# black and NO sunk well where the near field is absent. Past the _async_building guard (safe to touch caches), before
+	# the regime branches so THIS frame's emit honours it. No-op with the flag off / off-surface (byte-identical).
+	_noblack_guarantee(p)
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -752,6 +761,62 @@ func _surface_converge_emit(p: Array) -> void:
 		_begin_rebuild()                          # emits visible_fids(true) — cache-ready facets only, sunk backstops included
 	_srf_was_done = done
 	_srf_converged = done                         # fully cached + emitted ⇒ idle until the next role-event re-sets _pending
+
+## COSMOS FAR-CRUISE NEVER-BLACK: on the FLOORED surface, guarantee the sub-camera (active) facet paints an opaque
+## backstop with NO warm-lag black gap and NO sunk well where the near field is absent. Runs each non-building frame
+## (past the _async_building guard, before the regime branches) so it holds in every surface regime. (a) force a cheap
+## dense CHORD into _bpos_cache the instant the active facet's cache is missing — so the cache-filtered emit never drops
+## it (kills the BLACK); (b) probe the near field UNDER the camera and, when it is NOT meshed, mark the active facet to
+## emit UN-SUNK (true surface); (c) set _pending on any state change / when it is not currently drawn so the emit path
+## re-draws it once (then the idle short-circuits hold — no churn). Off / off-surface / no active facet ⇒ inert (byte-
+## identical). NEVER-OOM: one facet's existing dense cache + one int, no per-frame alloc, no growth with walk distance.
+func _noblack_guarantee(p: Array) -> void:
+	if not (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER):
+		return
+	if _shell_orbit() or _active_fid < 0:
+		_noblack_unsink_fid = -1
+		return
+	# Only guarantee when the active facet is genuinely in the emitted front (it always is on the floored surface —
+	# _front_visible forces it — but stay defensive against a degenerate cull axis).
+	if not _front_visible(_active_fid, p[0], p[1]):
+		_noblack_unsink_fid = -1
+		return
+	var fid := _active_fid
+	# (a) IMMEDIATE cache — never wait for the per-frame warm to reach the sub-camera facet. A missing cache is dropped
+	# from the cache-filtered emit set (visible_fids(true) / _emit_cache_ready) → the initial BLACK. A dense chord is
+	# cheap (~289 profile samples, one facet) and gives full coverage NOW; the normal warm upgrades it to the envelope.
+	var built_now := false
+	if not _bpos_cache.has(fid):
+		_ensure_backstop_chord_cached(fid)
+		built_now = true
+	# (b) un-sink WHERE the near field is genuinely absent under the camera (probe the SAME coverage callable U2 uses).
+	var uncovered := not _noblack_near_meshed(fid)
+	var new_unsink := fid if uncovered else -1
+	# (c) re-emit once on any change or if the active facet is not currently drawn; then the idle short-circuits hold.
+	if built_now or new_unsink != _noblack_unsink_fid or not _emitted.has(fid):
+		_pending = true
+	_noblack_unsink_fid = new_unsink
+
+## COSMOS FAR-CRUISE NEVER-BLACK: is the near voxel field actually meshed in a TIGHT column UNDER THE CAMERA on the
+## active facet? Uses the SAME (fid, fid-lattice AABB) → module_world.skin_near_meshed (godot_voxel is_area_meshed)
+## callable the U2 cull uses. An INVALID callable (GDScript / no-module path) ⇒ assume COVERED (keep the shipped SUNK
+## backstop — never worse than today). The probe point is the sub-camera surface point under the camera-set axis (else
+## the facet centre) mapped into the facet's own lattice — the frame is_area_meshed operates in (as skin_near_meshed
+## documents). Main thread only (reads the live _emit_axis / _cull_cover_query).
+func _noblack_near_meshed(fid: int) -> bool:
+	if not _cull_cover_query.is_valid():
+		return true
+	var dir: Array
+	if _cam_set and (_emit_axis[0] != 0.0 or _emit_axis[1] != 0.0 or _emit_axis[2] != 0.0):
+		dir = _emit_axis                                 # ABSOLUTE sub-camera direction (under the player)
+	else:
+		dir = _facet_centre_dir(fid)                     # fallback: the facet centre (no camera-set axis maintained)
+	var r := FacetAtlas.R_BLOCKS
+	var l: Array = FacetAtlas.world_to_lattice64(fid, dir[0] * r, dir[1] * r, dir[2] * r)
+	var h := CubeSphere.NOBLACK_PROBE_HALF
+	var yh := CubeSphere.NOBLACK_PROBE_YHALF
+	var aabb := AABB(Vector3(float(l[0]) - h, float(l[1]) - yh, float(l[2]) - h), Vector3(2.0 * h, 2.0 * yh, 2.0 * h))
+	return bool(_cull_cover_query.call(fid, aabb))
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
@@ -1129,6 +1194,13 @@ func _warm_front_true_budget(nrm: Array, thresh: float) -> bool:
 ## cos(θ_emit) under the COSMOS-ORBITAL-SHELL S1 camera-set law. The active/excluded skip is axis-independent
 ## (near voxels cover those facets), so the shell law changes only the axis (nrm) + the cut (thresh), never this.
 func _front_visible(fid: int, nrm: Array, thresh: float) -> bool:
+	# COSMOS FAR-CRUISE NEVER-BLACK: the sub-camera (active) facet is DIRECTLY under the camera on the floored surface —
+	# it must ALWAYS be drawn. A stale / slack camera-set emit axis must never cull it into a black hole (the far-cruise
+	# symptom). This forces it into every warmed / emitted / uncached-count scan (all route through here). Off / off-
+	# surface / no full-cover ⇒ untouched (byte-identical); on-surface it was already a backstop, so this only defeats a
+	# cull, never changes an ordinary facet.
+	if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER and fid == _active_fid and not _shell_orbit():
+		return true
 	# COSMOS far-ring full coverage (§2): with FP_FARRING_FULL_COVER on, the active facet + `_excluded` set are NO
 	# LONGER skipped — they are drawn as sunk "backstop" facets (see _is_backstop / _emit_cached) so the near-disk
 	# annular hole is filled. Only the back-hemisphere cull remains. With the flag off, the shipped exclusions apply
@@ -2411,7 +2483,9 @@ func _sunk_positions_amt(p: PackedVector3Array, sink: float) -> PackedVector3Arr
 func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
 		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
 	_ensure_backstop_cached(fid)
-	var gp := _sunk_positions(_bpos_cache[fid])
+	# COSMOS FAR-CRUISE NEVER-BLACK: un-sink the sub-camera facet where the near field is absent (true surface, not a
+	# sunk well). Off / covered ⇒ the shipped sunk positions (byte-identical).
+	var gp: PackedVector3Array = _bpos_cache[fid] if (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid) else _sunk_positions(_bpos_cache[fid])
 	var gc: PackedColorArray = _bcol_cache[fid]
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
@@ -2581,10 +2655,15 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var col: PackedColorArray
 	var cells := CELLS
 	if sunk:
+		# COSMOS FAR-CRUISE NEVER-BLACK: the sub-camera facet where the near field is genuinely absent emits UN-SUNK — at
+		# the TRUE radial surface, so it reads as a seamless coarse backstop (never a sunk well). No near voxels exist here
+		# to hide behind, so there is nothing to z-fight. Off / covered ⇒ the shipped sink below (byte-identical).
+		if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid:
+			pos = _bpos_cache[fid]
 		# FP_ENV_FLOORED_ASYNC: a dense CHORD fallback (not yet enveloped) uses the FULL sink so it stays ≤ the near
 		# surface; an enveloped dense cache uses the ε sink (the envelope already carries the lower bound). Off ⇒ the
 		# shipped backstop_sink() everywhere (byte-identical; _benv_done is empty).
-		if CubeSphere.FP_ENV_FLOORED_ASYNC and not _benv_done.has(fid):
+		elif CubeSphere.FP_ENV_FLOORED_ASYNC and not _benv_done.has(fid):
 			pos = _sunk_positions_amt(_bpos_cache[fid], TierPlace.backstop_sink_chord())
 		else:
 			pos = _sunk_positions(_bpos_cache[fid])

@@ -1631,6 +1631,19 @@ const FP_ATMO_PATH_SHELL := false
 ## bites on the bounded path). Gate G-O1-GROUND. LIVE-ONLY LOOK (P3 shader class). Depends B2.
 const FP_ATMO_GROUND_BUDGET := false
 
+## COSMOS PLANET-VIEW §2 (docs/COSMOS-PLANET-VIEW-DESIGN.md §2.1–2.4). The honest atmosphere RIM: fixes the
+## shell so it reads as a thin, concentric, scale-tracked hairline instead of an oversized, offset, detached ring.
+## Three compounding faults, all fixed under this flag: (2.1) the rim GEOMETRY is capped at R+ATMO_TOP (SHELL_RIM_MULT
+## → 1.0, fed via the r_outer UNIFORM so it needs no mesh rebuild) and the BRIGHTNESS is concentrated into a short
+## scale height H_RIM (≈48) so the bright band hugs the limb at ~1.5% of R; (2.2) the shell shader is fed the
+## RENDER-frame camera (cam_origin) + RENDER-frame centre (planet_render_centre) so wp/cam/centre share one frame —
+## superseding the FP_SKY_PLANET_CENTRE cam=cam_rel/centre=0 mismatch that slid the limb off above the re-anchor;
+## (2.3) the shell node rides the SAME scaled-body clamp s = CosmosScale.scale_for(d, R) the far ring uses, with
+## r_solid/r_outer/centre scaled to match, so the rim shrinks WITH the disc in deep space. Below D_ENGAGE s==1 ⇒ the
+## unscaled placement. Off ⇒ the shipped FP_SKY_PLANET_CENTRE/FP_ATMO_SHELL behaviour verbatim (byte-identical).
+## Requires FP_ATMO_SHELL (no shell node otherwise). Gate G-AS-RIM. LIVE-ONLY LOOK (P3 shader class).
+const FP_ATMO_RIM := false
+
 ## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
 ## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
 ## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far

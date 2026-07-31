@@ -239,6 +239,9 @@ uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float r_solid = 6371.0;
 uniform float r_outer = 7139.0;
 uniform float h_scale = 128.0;
+// PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the BRIGHTNESS scale height for the exp falloff. Defaults to 128 (== the
+// fed h_scale) ⇒ byte-identical; fed H_RIM (≈48) under FP_ATMO_RIM to concentrate the bright band into a hairline.
+uniform float h_rim = 128.0;
 uniform float term_mu = 0.12;
 uniform float gain = 1.6;
 // B2 (FP_ATMO_PATH_SHELL): path_norm=0 ⇒ the shipped single-sample strength·gain (byte-identical); path_norm=1
@@ -277,7 +280,7 @@ void fragment() {
 		vec3 xsel = (path_norm > 0.5) ? xmid : xca;
 		vec3 xhat = (length(xsel) > 1e-4) ? normalize(xsel) : -normalize(sun_dir);   // degenerate ⇒ dark (night)
 		float mu = dot(xhat, normalize(sun_dir));
-		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
+		float strength = chord * exp(-max(h_min, 0.0) / h_rim) / h_scale;
 		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
 		// B2: bound the single-sample overestimate to the §3.5 budget (peak ≈0.35) via a saturating transform.
 		float l_ship = strength * gain;
@@ -302,6 +305,9 @@ uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float r_solid = 6371.0;
 uniform float r_outer = 7139.0;
 uniform float h_scale = 128.0;
+// PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the BRIGHTNESS scale height for the exp falloff. Defaults to 128 (== the
+// fed h_scale) ⇒ byte-identical; fed H_RIM (≈48) under FP_ATMO_RIM to concentrate the bright band into a hairline.
+uniform float h_rim = 128.0;
 uniform float term_mu = 0.12;
 uniform float gain = 1.6;
 // B2 (FP_ATMO_PATH_SHELL): path_norm=0 ⇒ the shipped single-sample strength·gain (byte-identical); path_norm=1
@@ -344,7 +350,7 @@ void fragment() {
 		vec3 xsel = (path_norm > 0.5) ? xmid : xca;
 		vec3 xhat = (length(xsel) > 1e-4) ? normalize(xsel) : -normalize(sun_dir);   // degenerate ⇒ dark (night)
 		float mu = dot(xhat, normalize(sun_dir));
-		float strength = chord * exp(-max(h_min, 0.0) / h_scale) / h_scale;
+		float strength = chord * exp(-max(h_min, 0.0) / h_rim) / h_scale;
 		vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
 		// B2: bound the single-sample overestimate to the §3.5 budget (peak ≈0.35) via a saturating transform.
 		// O1: GROUND-HIT rays use the lower peak_l_ground so the lit day-disc annulus can't clip to white.
@@ -457,6 +463,19 @@ const SHELL_ATMO_MULT := 2.0
 const RAYLEIGH_BLUE := Color(0.15, 0.38, 0.92)   # the τ⃗-weighted Rayleigh sky/limb hue (taste; live-only look)
 const SHELL_LIMB_GAIN := 1.6                  # additive limb/sky intensity scale (tuned once vs the ground sky)
 
+## PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the HONEST rim geometry ceiling multiplier — the shell lit annulus ends at
+## r_solid + SHELL_RIM_MULT·ATMO_TOP = R + 384 (1.06·R), where the sky goes star-black (atmo_vis→0), instead of the
+## shipped 2·ATMO_TOP (1.12·R) that left a fat blue ring OUTSIDE the limb. Fed to the shader via the r_outer UNIFORM
+## (no mesh rebuild): the mesh stays at shell_outer_r, the shader keys blue on b < r_outer, so a lower r_outer
+## simply tightens the lit band. Off ⇒ r_outer stays shell_outer_r ⇒ byte-identical.
+const SHELL_RIM_MULT := 1.0
+## PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the rim BRIGHTNESS scale height (blocks). The bright band falls as
+## exp(−h_min/H_RIM); with H_RIM≈48 it decays to ≈5% (e⁻³) by h≈3·H_RIM=144 blocks (~2% of R) — an Earth-like
+## hairline that thickens toward the surface (the chord through the dense layer lengthens as b→R) and is essentially
+## gone at the geometric ceiling. In the spirit of the extinction-colour H_OPT=30 << the fog H_SCALE=128. Off ⇒ the
+## shell exp falloff uses h_scale (128) ⇒ byte-identical.
+const H_RIM := 48.0
+
 ## A3 atmo_vis(h): 1 (surface) → 0 (space), C¹. On an airless body there is no atmosphere ⇒ 0 everywhere.
 static func atmo_vis(h: float, has_atmo: bool) -> float:
 	if not has_atmo:
@@ -551,6 +570,22 @@ static func lambert_illum_fraction(cos_phase: float) -> float:
 ## A6 C4: the atmosphere shell outer radius (blocks) = r_solid + SHELL_ATMO_MULT·ATMO_TOP.
 static func shell_outer_r(r_solid: float) -> float:
 	return r_solid + SHELL_ATMO_MULT * H_ATMO
+
+## PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the HONEST rim outer radius (blocks) = r_solid + SHELL_RIM_MULT·ATMO_TOP
+## (= R + 384 = 1.06·R). The lit blue annulus truly ends where the atmosphere ends. Fed as the shader r_outer
+## uniform (the mesh sphere stays at shell_outer_r; the shader emits nothing beyond r_outer).
+static func rim_outer_r(r_solid: float) -> float:
+	return r_solid + SHELL_RIM_MULT * H_ATMO
+
+## PLANET-VIEW §2.4 (FP_ATMO_RIM): the rim's angular gap (radians) = the rim's angular radius minus the disc's, as
+## the camera at distance d (blocks) from the planet centre sees them: asin(rim_outer_r/d) − asin(r_solid/d). This
+## is the width of the blue hairline OUTSIDE the solid limb — a small, distance-shrinking value (the honest rim),
+## versus the shipped 2·ATMO_TOP shell's fat ~3.5° annulus. Invariant to the scaled-body clamp s (a uniform scale
+## about the camera scales r_solid AND d by the same s ⇒ the ratio, hence the asin difference, is unchanged).
+static func rim_angular_gap(d: float, r_solid: float) -> float:
+	if d <= rim_outer_r(r_solid):
+		return PI * 0.5
+	return asin(rim_outer_r(r_solid) / d) - asin(r_solid / d)
 
 ## A6 C4: the CLOSED-FORM view-ray shell geometry (no volumetrics). Returns [chord, h_min]:
 ##   • chord = the FORWARD path length (blocks) inside the atmosphere shell but OUTSIDE the solid planet and
@@ -974,6 +1009,9 @@ func _build_nodes() -> void:
 		_atmo_shell_mat.set_shader_parameter("r_solid", r_vox)
 		_atmo_shell_mat.set_shader_parameter("r_outer", r_outer)
 		_atmo_shell_mat.set_shader_parameter("h_scale", H_SCALE)
+		# PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the brightness scale height. Off ⇒ H_SCALE (128) == h_scale ⇒ the exp
+		# falloff is byte-identical to the shipped strength; on ⇒ H_RIM (≈48) concentrates the bright band to a hairline.
+		_atmo_shell_mat.set_shader_parameter("h_rim", H_RIM if CubeSphere.FP_ATMO_RIM else H_SCALE)
 		_atmo_shell_mat.set_shader_parameter("term_mu", TERMINATOR_MU)
 		_atmo_shell_mat.set_shader_parameter("gain", SHELL_LIMB_GAIN)
 		_atmo_shell_mat.set_shader_parameter("rayleigh_blue", Vector3(RAYLEIGH_BLUE.r, RAYLEIGH_BLUE.g, RAYLEIGH_BLUE.b))
@@ -1258,9 +1296,26 @@ func _update_sky(t: float) -> void:
 			# orbit) and its `cam` uniform is the planet-relative camera. planet_c ≡ 0 off ⇒ position 0 + cam_origin
 			# (byte-identical).
 			var planet_c := cam_origin - cam_rel
-			if CubeSphere.FP_SKY_PLANET_CENTRE:
-				_atmo_shell.position = planet_c
-			_atmo_shell_mat.set_shader_parameter("cam", cam_rel)
+			if CubeSphere.FP_ATMO_RIM:
+				# PLANET-VIEW §2.2–2.4 (FP_ATMO_RIM): SUPERSEDE the FP_SKY_PLANET_CENTRE frame. (2.2) FRAME-CORRECT — feed
+				# the RENDER-frame camera (cam_origin) and RENDER-frame centre, so the shader's wp (INV_VIEW·VERTEX, render
+				# frame), cam and centre are all one frame (the cam_rel/centre=0 pairing desynced above the re-anchor).
+				# (2.3) SCALE-TRACK — ride the SAME scaled-body clamp s = scale_for(d, R) the far ring uses (d = camera→
+				# planet-centre distance = cam_rel.length()). scale_about_camera(cam_origin, s) composed with the planet-
+				# centre placement scales the node by s about the camera; centre → cam_origin − s·cam_rel, r_solid → s·R,
+				# r_outer → s·rim_outer_r. Below D_ENGAGE s==1 ⇒ the unscaled placement. (2.1) HONEST RIM — r_outer is the
+				# tightened rim ceiling (R+ATMO_TOP via the uniform, no mesh rebuild); the mesh stays at shell_outer_r.
+				var r_vox_rim := CosmosGravity.r_vox(OBSERVER)
+				var s_rim := CosmosScale.scale_for(cam_rel.length(), FacetAtlas.R_BLOCKS)
+				_atmo_shell.transform = CosmosScale.scale_about_camera(cam_origin, s_rim) * Transform3D(Basis.IDENTITY, planet_c)
+				_atmo_shell_mat.set_shader_parameter("cam", cam_origin)
+				_atmo_shell_mat.set_shader_parameter("centre", cam_origin - s_rim * cam_rel)
+				_atmo_shell_mat.set_shader_parameter("r_solid", s_rim * r_vox_rim)
+				_atmo_shell_mat.set_shader_parameter("r_outer", s_rim * rim_outer_r(r_vox_rim))
+			else:
+				if CubeSphere.FP_SKY_PLANET_CENTRE:
+					_atmo_shell.position = planet_c
+				_atmo_shell_mat.set_shader_parameter("cam", cam_rel)
 			_atmo_shell_mat.set_shader_parameter("sun_dir", sun_dir)
 
 	# Day-night environment ramp from the Sun's elevation over the local horizon (radial up). Uses the PLANET-

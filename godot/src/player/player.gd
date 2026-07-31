@@ -84,6 +84,16 @@ var _dev_land_guard := false
 # Feet more than this many blocks below the analytic surface ⇒ the dev guard clamps them up (below-floor tolerance).
 const DEV_LAND_EPS := 0.5
 
+# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD) — the dev GEO-teleport landing weld. `_dev_teleport_geo` resolves the
+# owner facet + surface, drops the player from altitude, and arms the fall-through guard. But a facet crossing that
+# fires MID-FALL (live) reframes position into a neighbour lattice, so surface_y/floor_under then read the neighbour's
+# deep column and the guard never catches (the player sinks to the deep fill). While `_tp_land_active` (armed ONLY by
+# `_dev_teleport_geo`, and only meaningful under FP_TP_FLOOR_WELD), `_physics_process` re-asserts the owner facet and
+# SUPPRESSES crossings so the floor stays on the resolved owner column. Default false ⇒ never welded (byte-identical
+# normal play — the latch is set by no other path). Cleared when the guard disarms (a clean landing) or on a new reposition.
+var _tp_land_active := false
+var _tp_owner_fid := -1
+
 # COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle): the teleport/fast-travel "settling" latch. A dev teleport to
 # a fresh far facet re-anchors the near field but the voxel view has NOT streamed/meshed there yet — so instead of
 # dropping the player into un-streamed void (the live "player in space, buried on land" symptom) we HOLD them
@@ -738,7 +748,15 @@ func _physics_process(delta: float) -> void:
 	# Dormant until FP3b removes the FP2 ridge wall (which stops the player before the crossing threshold); the
 	# reframe is position-exact + upright (physics snaps yaw, camera eases the dihedral). FLAT/non-faceted: skip.
 	var _reframe_yaw := 0.0
-	if CubeSphere.FACETED:
+	if CubeSphere.FACETED and CubeSphere.FP_TP_FLOOR_WELD and _tp_land_active and _dev_land_guard:
+		# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): a dev geo-teleport landing is in progress — WELD to the resolved
+		# owner facet and SUPPRESS crossings so floor_under / _dev_land_clamp keep reading the owner column and catch the
+		# fall at the true surface (never a neighbour's deep seafloor). Re-asserting each frame defeats any actor that
+		# tried to flip the active frame on the teleport jump. Dev-only (the latch is set solely by _dev_teleport_geo);
+		# gated on the armed guard so the weld can never outlive the landing. Off-flag ⇒ this whole branch is skipped.
+		TerrainConfig.set_active_facet(_tp_owner_fid)
+		_pos_fid = _tp_owner_fid
+	elif CubeSphere.FACETED:
 		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
 		var cross := world.maybe_cross_facet(position)
 		if not cross.is_empty():
@@ -2260,6 +2278,8 @@ func remote_look_planet(pitch_off_deg: float = 0.0) -> void:
 ##   4. kick streaming so the near field + far ring + block-LOD re-place around the new spot (the same per-frame
 ##      call the engine drives; the huge one-frame jump is rejected by update_streaming's velocity-predict clamp).
 func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
+	# FP_TP_FLOOR_WELD: drop any stale geo-teleport weld (a fresh reposition supersedes it; _dev_teleport_geo re-arms it).
+	_tp_land_active = false
 	if fid >= 0:
 		TerrainConfig.set_active_facet(fid)
 	position = lattice_pos
@@ -2336,6 +2356,7 @@ func _dev_land_clamp() -> void:
 		_fall_v_bci = PackedFloat64Array()
 		_fall_p_bci = PackedFloat64Array()
 		_dev_land_guard = false                             # landed cleanly — disarm
+		_tp_land_active = false                             # FP_TP_FLOOR_WELD: landing done — release the owner-facet weld
 
 ## COSMOS STREAM-SETTLE: enter the hover-until-meshed "settling" state after a ground teleport/fast-travel. Holds the
 ## player pinned at the analytic surface `sy` (no fall, motion integration suppressed) so they are never dropped into
@@ -2402,6 +2423,12 @@ func _dev_teleport_geo(lat_deg: float, lon_deg: float, alt: float) -> bool:
 	TerrainConfig.set_active_facet(fid)                     # surface_y reads the ACTIVE facet's column
 	var sy := world.surface_y(xf, zf)
 	_dev_reposition(fid, Vector3(xf, sy + alt, zf))
+	# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): if the placement is above the surface and will free-fall (the guard
+	# is armed and no meshed-hover settle took over), WELD the ensuing landing to this resolved owner facet so a
+	# mid-fall crossing cannot flip the frame out from under the fall-through guard. Dev-only; no-op off-flag / when
+	# the reposition already settled the player onto the ground (small alt) or engaged the hover settle.
+	_tp_owner_fid = fid
+	_tp_land_active = _dev_land_guard and not _settle_active
 	return true
 
 ## Resolve the world direction `dir` to {fid, x, z} (the Earth facet + integer lattice column containing it), or

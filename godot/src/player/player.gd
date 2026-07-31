@@ -2289,12 +2289,11 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 		# so the same-frame streaming kick targets the re-designated facet.
 		world.dev_reanchor_near(position)
 		world.update_streaming(position)
-		# COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME): update_streaming above can fire a SPURIOUS facet crossing on the
-		# huge teleport jump, flipping TerrainConfig's ACTIVE frame to a NEIGHBOUR while `position` still holds the OWNER
-		# (fid) lattice coords. The surface_y read below would then resolve the NEIGHBOUR's terrain at those coords — a
-		# different sphere direction, often deep OCEAN → the feet clamp onto the seafloor and the player is buried (the
-		# lat 8/lon 2 fall-through). Restore the owner frame `position` is in before the surface read so surface_y is read
-		# against the CORRECT column. Dev-only (this runs under CONTROL_ENABLED); off ⇒ current behaviour (byte-identical).
+		# COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME) — BACKSTOP to the _dev_facet_column facet_of_dir fix: `fid` is now
+		# the contained TRUE owner, so update_streaming's crossing scan should not fire here. If any actor still flips the
+		# ACTIVE frame to a NEIGHBOUR while `position` holds the OWNER (fid) lattice coords, the surface_y read below would
+		# resolve the neighbour's terrain at those coords (a different sphere direction, often deep) → the feet clamp onto
+		# the seafloor. Re-assert the owner frame before the surface read. Dev-only (CONTROL_ENABLED); off ⇒ byte-identical.
 		if CubeSphere.FP_DEV_TP_REFRAME and fid >= 0 and TerrainConfig.active_facet() != fid:
 			TerrainConfig.set_active_facet(fid)
 			_pos_fid = fid
@@ -2407,9 +2406,27 @@ func _dev_teleport_geo(lat_deg: float, lon_deg: float, alt: float) -> bool:
 
 ## Resolve the world direction `dir` to {fid, x, z} (the Earth facet + integer lattice column containing it), or
 ## {} if none matches. Scans only the Earth body's facets; first containing polygon wins. Dev-only (O(6·k²)).
+##
+## COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME) — THE root cure for the lat 8/lon 2 buried-at-alt-−17 teleport.
+## The shipped scan below picks the FIRST facet whose grown (grow=0.5) polygon contains the column. That growth
+## accepts a column up to ~½ cell PAST a facet's ridge (measured: own_dist ∈ (−0.6, −HYST) for 288 columns in
+## this atlas), so the placement is judged "past the ridge" by maybe_cross_facet — which uses the seam-plane
+## own_dist, NOT the grown polygon. The player then RE-crosses to the neighbour every physics frame, and the
+## post-teleport fall/settle re-reads surface_y on the crossed (deep, un-reframed) neighbour column → sinks into
+## the seafloor and stays (a ONE-shot re-assert can't hold, since it re-fires each frame). Resolving the owner by
+## DIRECTION via facet_of_dir (the SAME cube-sphere classifier the ridges agree with — G-M2-DIR round-trips it to
+## every facet) instead returns the TRUE owner, whose landing is contained in all four ridges (own_dist ≥ −HYST),
+## so no spurious crossing ever fires and surface_y stays on the correct column throughout the fall. Same surface
+## height (direction-pure), just the self-consistent facet. Dev-only (CONTROL_ENABLED); flag off ⇒ the grow=0.5
+## scan verbatim (byte-identical).
 func _dev_facet_column(dir: Vector3) -> Dictionary:
 	var d := dir.normalized()
 	var w := d * _FacetAtlasCls.R_BLOCKS
+	if CubeSphere.FP_DEV_TP_REFRAME:
+		var owner := _FacetAtlasCls.facet_of_dir(CubeSphere.DVec3.new(d.x, d.y, d.z))
+		if owner >= 0:
+			var lo: Array = _FacetAtlasCls.world_to_lattice64(owner, w.x, w.y, w.z)
+			return {"fid": owner, "x": floori(lo[0]), "z": floori(lo[2])}
 	var base := _FacetAtlasCls.fid_base(0)                  # Earth = body index 0
 	var n := _FacetAtlasCls.body_facet_count(0)
 	for fid in range(base, base + n):

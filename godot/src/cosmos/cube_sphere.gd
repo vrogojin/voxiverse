@@ -672,6 +672,26 @@ const CULL_REBUILD_MS := 250               # min wall-ms between APPLY rebuilds 
 ## backstop_sink() verbatim → FLAT byte-identical (6042/0). Gate: verify_farring_level.gd (G-LV-NOPROT / G-LV-SEAM).
 const FP_FARRING_LEVEL := false
 
+## COSMOS FAR-CRUISE NEVER-BLACK (fix/voxiverse-farcruise-black). After a long space CRUISE (dev-fly / Cruise Mode) +
+## descent far from spawn, the near VoxelTerrain has not (re)meshed the sub-camera facet, so the far ring's active-facet
+## backstop is the ONLY thing that can paint the ground under the player. Three shipped gaps make it fail there and
+## produce the live "black substance": (1) the backstop's dense cache is warm-LAGGED (built over frames), so the active
+## facet is DROPPED from the cache-filtered emit set (visible_fids(true) / _emit_cache_ready) → BLACK, then FLAT-coarse
+## once it warms in seconds later; (2) a stale / slack camera-set emit axis can CULL the sub-camera facet out of the
+## front set → BLACK; (3) once warmed it is SUNK ~13 blocks below the true surface with no near voxels to hide behind →
+## a coarse "well". This flag GUARANTEES the sub-camera (active) facet is, on the FLOORED surface: (a) cache-built
+## IMMEDIATELY (a cheap dense CHORD) the instant it is missing — no warm-lag black; (b) NEVER culled from the emitted
+## set (directly under the camera → always drawn, immune to a slack axis); (c) emitted UN-SUNK (at the true radial
+## surface) WHEN the near field has NOT actually meshed it (probed via the SAME skin_near_meshed / is_area_meshed
+## coverage callable U2 uses) — so it reads as a seamless coarse backstop, never black and never a sunk well. Where the
+## near field IS meshed under the camera the shipped SUNK backstop is kept verbatim (no z-fight / no regression near
+## spawn). Requires FP_FARRING_FULL_COVER (the backstop only exists there). NEVER-OOM: the guarantee touches ONE facet's
+## existing dense cache and one int — no new dict, no per-frame alloc, no growth with walk distance. Off ⇒ every path
+## below is a const-guarded no-op → FLAT byte-identical (6042/0). Gate: verify_farcover.gd (G-FC-*).
+const FP_FARRING_ACTIVE_NOBLACK := false
+const NOBLACK_PROBE_HALF := 10.0    # fid-lattice half-extent (blocks) of the under-camera coverage probe column — TIGHT so it reads meshed under the player near spawn but absent at a cruise gap
+const NOBLACK_PROBE_YHALF := 96.0   # radial half-extent (blocks) of the probe column — spans surface relief so a meshed near column reads as covered
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

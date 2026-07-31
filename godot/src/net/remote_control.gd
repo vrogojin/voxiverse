@@ -440,7 +440,15 @@ func _start_step() -> void:
 		"turn":
 			_start_turn()
 		"look":
-			_start_look()
+			# DEV NADIR-LOCK: a `planet_lock` field on the whitelisted `look` op aims the frozen camera straight at the
+			# planet render centre (the inertial orbital attitude makes a plain pitched look unreliable). Routed through
+			# `look` so the relay forwards it verbatim — NO relay-whitelist change / restart (which wipes the grant).
+			if bool(_cur.get("planet_lock", false)):
+				if is_instance_valid(player) and player.has_method("remote_look_planet"):
+					player.call("remote_look_planet", float(_cur.get("pitch_off_deg", 0.0)))
+				_finish_step("ok")
+			else:
+				_start_look()
 		"jump":
 			_start_jump()
 		"set_fly":

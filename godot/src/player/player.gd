@@ -2197,6 +2197,31 @@ func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
 	clock.add_offset(delta)
 	return true
 
+## DEV NADIR-LOCK (orbit screenshot framing): aim the frozen camera straight at world.planet_render_centre() so
+## an automated orbit screenshot centres the planet at ANY altitude — a plain pitched `look` is unreliable because
+## the orbital attitude is inertial. Direct camera set (holds while frozen, nothing rewrites it) + seed the space
+## attitude quaternion so window_camera_transform reproduces the basis on unfreeze. pitch_off_deg: +up (planet
+## drops toward the bottom of frame). No-op before the far ring exists. CONTROL_ENABLED-gated via the executor.
+func remote_look_planet(pitch_off_deg: float = 0.0) -> void:
+	if _camera == null or world == null:
+		return
+	var c := _camera.global_transform.origin
+	var p := planet_render_centre()
+	if p == Vector3.ZERO or c.distance_to(p) < 1.0e-3:
+		return
+	var dir := (p - c).normalized()
+	var up_hint := _camera.global_transform.basis.y
+	if absf(dir.dot(up_hint.normalized())) > 0.999:
+		up_hint = _camera.global_transform.basis.x
+	var look_t := _camera.global_transform.looking_at(c + dir, up_hint)
+	if pitch_off_deg != 0.0:
+		look_t.basis = Basis(look_t.basis.x.normalized(), deg_to_rad(pitch_off_deg)) * look_t.basis
+	look_t.basis = look_t.basis.orthonormalized()
+	_camera.global_transform = look_t
+	if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
+		var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
+		_att_q = _CosmosAttitudeCls.seed_bci(look_t.basis, theta)
+
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 # DEV/TEST INSTRUMENTATION ACTUATORS (dev-instrument tooling) — teleport / set_alt / freeze_time /
 # freeze_player. The comfortable-analysis surface the RemoteControl executor drives so the orchestrator can

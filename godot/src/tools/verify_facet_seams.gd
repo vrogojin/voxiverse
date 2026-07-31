@@ -176,6 +176,7 @@ func _initialize() -> void:
 
 	# ================= COSMOS-FACET-SEAMS-V2 gates (FS2′ / FS-W / twist) =================
 	_probe_datum_v2()      # G-D2-* : the CONTINUOUS datum lift collapses the seam step + is radial + mirror-exact
+	_gate_datum_edge_weld()  # G-EDGE-WELD : the near-LOD apron must ride the SAME datum as the baked near mesh (no black seam)
 	_gate_corner_walk()    # G-CORNER-WALK : corner-commit resolves a grid-corner clear of the −3 ridge wall
 	_gate_twist_frame()    # G-TWIST-FRAME + G-CROSS-HEADING : frame-aware reframe_twist preserves world heading
 	await _gate_datum_collide()  # G-DATUM-COLLIDE : the physics floor the player stands on == the datum-baked render
@@ -361,6 +362,71 @@ func _probe_datum_v2() -> void:
 		_ok(max_mirror <= 1.0e-9, "G-D2-SHAPE-MIRROR: C++ formula != datum_lift by %.2e" % max_mirror)
 	else:
 		_ok(absf(max_step - 5.30) <= 0.10, "G-D2-OFF: datum_lift≡0 must leave the 5.30 step; got %.3f" % max_step)
+
+## COSMOS FS2′ EDGE WELD (docs/COSMOS-FACET-SEAMS-V2.md §2.2) — G-EDGE-WELD. Pins the near-LOD seam BLACK-LINE / BLACK-
+## CLIFF root cause and proves FP_DATUM_EDGE_WELD fixes it, as PURE geometry (flag-agnostic: the datum lift s is solved
+## independently from the frozen frame, so this runs with only FACETED sed-on — no rebuild/bake needed). For every
+## Earth seam it reproduces the apron ridge top EXACTLY as FacetLodBuilder._build_apron does (snap g UP to the fs
+## megablock grid), against the datum-baked near surface g+s the active VoxelTerrain renders:
+##   - UN-WELDED (shipped LOD apron, top = ceil(g/fs)·fs, NO +s): the near surface stands g+s ABOVE it ⇒ a downward
+##     GAP of up to the sagitta s (~5-7 blocks) at the border — the uncovered vertical band = the black seam line/face.
+##   - WELDED (FP_DATUM_EDGE_WELD, top += s): the apron rides the SAME datum ⇒ it always COVERS the near surface, the
+##     residual being only the ceil megablock snap ∈ [0, fs) (overlap-not-gap), NEVER a downward gap. s cancels exactly.
+## Also reaffirms the apron lift == the C++ near-mesh bake formula (_cpp_lift) at the ridge column, so the two meet.
+func _gate_datum_edge_weld() -> void:
+	var r := FA.R_BLOCKS
+	var fs := 2.0                            # ℓ1 near-ridge megablock pitch (A2 §7.6 pins near ridges to ℓ1, s_max=2)
+	var s_maxi := 2
+	var worst_gap_unwelded := 0.0            # max downward gap the shipped apron leaves (the black band) — expect ~sagitta
+	var worst_over := 0.0                    # max apron overcover with the weld (must stay < fs — bounded overlap)
+	var worst_under := 0.0                   # max apron UNDERCOVER with the weld (must be 0 — never a downward gap)
+	var max_mirror := 0.0                    # |independent s − C++ bake lift| at the ridge column (must be ~0)
+	var samples := 0
+	for face in range(6):
+		for a in range(0, K, 3):
+			for b in range(0, K, 3):
+				var owner := (face * K + a) * K + b
+				var params := FA.datum_bake_params(owner)
+				for slot in range(4):
+					var ring: Array = FA.seam_ring(owner, slot)
+					if ring.size() < 2:
+						continue
+					var r0: Vector3 = ring[0]; var r1: Vector3 = ring[1]
+					for t in _TS:
+						var w: Vector3 = r0.lerp(r1, t)
+						if w.length() < 1.0e-6:
+							continue
+						var d := w.normalized()
+						var g := int(TerrainConfig.profile_at_dir(d.x, d.y, d.z, r).x)
+						var la: Array = FA.world_to_lattice64(owner, w.x, w.y, w.z)
+						# The datum lift s at this ridge column, solved INDEPENDENTLY from the frozen frame (== datum_lift's
+						# −b+√(b²+R²−|p0|²), flag-agnostic so the geometry is pinned even with FP_DATUM_BAKE off here).
+						var p0: Array = FA.lattice_to_world64(owner, la[0], 0.0, la[2])
+						var nh: Array = FA.facet_normal64(owner)
+						var bb: float = p0[0] * nh[0] + p0[1] * nh[1] + p0[2] * nh[2]
+						var disc: float = bb * bb + r * r - (p0[0] * p0[0] + p0[1] * p0[1] + p0[2] * p0[2])
+						if disc < 0.0:
+							disc = 0.0
+						var s_geo: float = -bb + sqrt(disc)
+						var apron_top := float(int(ceil(float(g) / fs)) * s_maxi)   # shipped LOD apron ridge top (cell space)
+						var near_surf: float = float(g) + s_geo                      # the datum-baked near mesh surface
+						# UN-WELDED: near surface minus the (un-lifted) apron top → a positive number is a black gap.
+						worst_gap_unwelded = maxf(worst_gap_unwelded, near_surf - apron_top)
+						# WELDED: apron top gains +s → cover = (apron_top + s) − near_surf = apron_top − g ∈ [0, fs).
+						var cover: float = (apron_top + s_geo) - near_surf
+						worst_over = maxf(worst_over, cover)
+						worst_under = maxf(worst_under, -cover)
+						if bool(params.get("enabled", false)):
+							max_mirror = maxf(max_mirror, absf(_cpp_lift(params, la[0], la[2]) - s_geo))
+						samples += 1
+	print("  G-EDGE-WELD: samples=%d  un-welded worst black-gap=%.3f  welded overcover=%.3f (<fs=%.1f) undercover=%.6f  mirror=%s" % [
+		samples, worst_gap_unwelded, worst_over, fs, worst_under, str(max_mirror)])
+	_ok(samples >= 500, "G-EDGE-WELD: too few seam columns sampled (%d)" % samples)
+	_ok(worst_gap_unwelded > 1.0, "G-EDGE-WELD: the un-welded LOD apron must leave a >1-block black gap (got %.3f) — root cause not reproduced" % worst_gap_unwelded)
+	_ok(worst_under <= 1.0e-6, "G-EDGE-WELD: the welded apron must NEVER sit below the near surface (undercover %.4f) — the black band would remain" % worst_under)
+	_ok(worst_over < fs + 1.0e-6, "G-EDGE-WELD: welded apron overcover %.3f must stay < fs=%.1f (bounded overlap, not a new cliff)" % [worst_over, fs])
+	if CubeSphere.FP_DATUM_BAKE:
+		_ok(max_mirror <= 1.0e-6, "G-EDGE-WELD: apron lift != C++ near-mesh bake at the ridge by %s (tiers would not meet)" % str(max_mirror))
 
 ## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4) — G-DATUM-COLLIDE (the LIVE embed pin). The invariant: the
 ## surface the player SEES (the C++ near-mesh datum bake, y += s) and the surface they COLLIDE with (the analytic

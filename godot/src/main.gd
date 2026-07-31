@@ -280,6 +280,11 @@ func _process(_delta: float) -> void:
 	# (also stranded below the return) is only needed above h≈6.4k and is a separate FP_SCALED_BODY pass.
 	if _player != null and (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
 		_player.world.update_shell_camera_set(_player.camera_global_transform().origin)
+	# COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): drive the crisp orbit megablock disc
+	# from this frame's camera — engage/retire §2V above the swap, re-assign the L4→L5 disc on drift. Gated on
+	# FP_BLOCK_LOD_ORBIT + FACETED; the WorldManager method self-guards (no node ⇒ no-op) ⇒ flag-off byte-identical.
+	if _player != null and CubeSphere.FP_BLOCK_LOD_ORBIT and CubeSphere.FACETED:
+		_player.world.update_block_lod_orbit(_player.camera_global_transform().origin)
 	# COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the sky's current Sun direction into the far-ring shell
 	# tint shader so the space-side terminator band tracks the same Sun as the ground ramp. Gated on the flag +
 	# a live sky; the WorldManager/ring setters self-guard, so flag-off is byte-identical (never called).

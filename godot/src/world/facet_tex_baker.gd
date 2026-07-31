@@ -444,7 +444,17 @@ func _rebuild_id_texture() -> void:
 ##
 ## TH1 (FP_TEX_BAKE_WORKER): when the offload is live, this dispatches to _update_worker — the heavy compute leaves
 ## the frame onto the job-lane worker and main only orchestrates + commits. Off ⇒ the today-exact on-main path below.
+## COSMOS PLANET-LOD-CONFIG P0 (§2.4): freeze the §2V page bakes while the orbit megablock tier owns the disc — the
+## user's "bake pop-in at orbit" complaint. Frozen ⇒ update() is a no-op (no sample_columns page rebakes), so orbiting
+## adds ZERO bake latency; the far ring's skin samplers are already unbound (set_skin_active) so nothing draws it.
+## Resumed on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called) ⇒ byte-identical.
+var _frozen := false
+func set_frozen(frozen: bool) -> void:
+	_frozen = frozen
+
 func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
+	if _frozen:
+		return
 	if _worker_on:
 		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:

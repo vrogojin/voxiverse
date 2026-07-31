@@ -754,6 +754,70 @@ const BLOCK_LOD_EXPANDED_ENABLED := false
 static func block_lod_ceiling() -> int:
 	return BLOCK_LOD_BYTES_EXPANDED if BLOCK_LOD_EXPANDED_ENABLED else BLOCK_LOD_BYTES_MAX
 
+## COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2 — "crisp BLOCKY megablocks from orbit").
+## THE orbit render phase: above a swap altitude, mesh the WHOLE visible disc as DISTANCE-LADDERED megablocks (L4 at
+## the nadir → L5 toward the limb, a PER-FACET screen-distance selection — NOT one uniform level) riding the far ring's
+## scaled-body clamp, and RETIRE the smooth §2V "satellite" skin above the swap (swap, don't overlay). This replaces
+## the blotchy 26-block/texel base map the user rejected with crisp voxel-edged geometry AND removes the on-the-fly
+## §2V bake latency at orbit. GATED CONSTRUCTION sibling of the far ring / ladder / global (FacetBlockLodOrbit): the
+## node only exists when FP_BLOCK_LOD_ORBIT is on ⇒ byte-identical off (WorldManager never news it up; nothing calls
+## it). REQUIRES FP_BLOCK_LOD (needs the FacetBlockLod pyramid data model) + FACETED (needs the far ring frame).
+const FP_BLOCK_LOD_ORBIT := false
+
+## Swap altitude (blocks, radial). Above this the orbit block mesh engages + §2V retires; below it the shipped skin
+## path runs unchanged. ~4000 = where §2V has already shed its band/close-up tiers so only the 26-blk base map remains
+## (its texels are already >2 px past here — the design's "engage where the base map is the only skin tier and blows
+## past 2 px"). A ±25% hysteresis band (BLOCK_LOD_ORBIT_HYST) prevents flip-flop at the boundary (mirrors CosmosScale).
+const BLOCK_LOD_ORBIT_ENGAGE_H := 4000.0
+const BLOCK_LOD_ORBIT_HYST := 0.25
+
+## The on-screen megablock-size law (§2.2). A megablock of edge B blocks at camera distance d subtends px = B/d·K_px
+## screen px; solving for the block size that lands at the target px* gives B*(d) = px*·d/K_px, and the ladder level is
+## the smallest pyramid tier whose pitch 2^n ≥ B* (so a megablock reads ≈ px* px), clamped to [MIN_LEVEL, GLOBAL_LEVEL].
+## px*=1.5 (crisp, not chunky); K_px=771 is the 1080p/70°-fov viewport constant the design's alt-8000 live snapshot uses
+## (viewport_h/(2·tan(fov/2))). MIN_LEVEL=4 caps the finest orbit tier at L4 (16-blk) — L3 at orbit busts the byte cap
+## (uniform L4 hemisphere ≈ 32–48 MB; the design forbids finer than L4 out here). Result at alt 8000: nadir ≈15.6 blk →
+## L4 (a small patch, dist≈8000..8224), everything past it → L5 (32-blk) — exactly "L4 nadir → L5 limb", NOT uniform.
+const BLOCK_LOD_ORBIT_PX := 1.5
+const BLOCK_LOD_ORBIT_K_PX := 771.0
+const BLOCK_LOD_ORBIT_MIN_LEVEL := 4          # finest orbit tier (L4 = 16-blk); coarser toward the limb
+## (GLOBAL_LEVEL = 5 = the coarsest orbit tier, already defined above as the L5 pitch-32 megablock.)
+
+## NEVER-OOM (§2.3): the orbit block mesh's hard byte ceiling. Start 12 MB (the design's "+12 MB → ~62 quads/facet over
+## 1728 facets fits an L4-nadir/L5-limb blend"); expand to 16 on a green live A/B. Because §2V is RETIRED (its ≈8.2 MB
+## base map freed, NOT overlaid) the COMBINED block-LOD + far-ring budget stays well under the 40 MB web ceiling. The
+## FacetBlockLodOrbit ledger sums REAL committed mesh bytes and stops meshing (coarsen L4→L5, then drop farthest-limb
+## facets — the sunk far ring backstops them) the instant a facet would breach this cap ⇒ it can never OOM.
+const BLOCK_LOD_ORBIT_BYTES_MAX := 12 << 20
+
+## Hard cap on the visible-disc facets the orbit tier ENUMERATES per re-assign (bounds the bake + the distance sort;
+## the front hemisphere is ~1728 facets — this caps the worst case). The BYTE ledger is the real NEVER-OOM guard; this
+## just bounds compute. Re-assign is throttled by a camera-drift threshold (no per-frame re-tessellation churn, §2.5/§5).
+const BLOCK_LOD_ORBIT_MAX_FACETS := 1800
+const BLOCK_LOD_ORBIT_DRAWS := 6              # merge the accepted facets into ≤ this many meshes by cube face (draw-safe)
+const BLOCK_LOD_ORBIT_FRONT_COS := -0.05     # visible-disc test: emit facets with dot(facet_dir, cam_dir) > this (front
+                                             # hemisphere + a hair past the horizon so the limb ring is covered/densified)
+const BLOCK_LOD_ORBIT_REASSIGN_DEG := 3.0    # re-assign only when the sub-camera direction drifts past this many degrees
+const BLOCK_LOD_ORBIT_REASSIGN_DH := 400.0   # …or the camera altitude drifts past this many blocks (whichever first)
+
+## The screen-distance megablock LEVEL law (§2.2), PURE + gate-checked. `dist` = camera→facet-centre distance (blocks).
+## n = smallest level with pitch 2^n ≥ B*(dist); clamp to [min_level, max_level]. Monotone NON-DECREASING in dist (a
+## farther facet never gets a FINER tier) — the "no protrusion / no inversion" ladder guarantee the gate asserts.
+static func orbit_level_for_dist(dist: float, px: float, k_px: float, min_level: int, max_level: int) -> int:
+	var b_star: float = px * maxf(dist, 0.0) / maxf(k_px, 1.0)   # target megablock edge (blocks) for px* on screen
+	var n := min_level
+	while n < max_level and float(1 << n) < b_star:
+		n += 1
+	return clampi(n, min_level, max_level)
+
+## The swap engage/disengage predicate with hysteresis (mirrors CosmosScale.should_retire). Engage the orbit block mesh
+## + retire §2V once altitude rises past ENGAGE_H·(1+HYST); disengage only once it drops below ENGAGE_H·(1−HYST). The
+## ±HYST band is the seamless cross-fade window (no hard pop at the boundary — the two regimes co-exist across it).
+static func block_lod_orbit_engaged(h: float, currently_engaged: bool) -> bool:
+	if currently_engaged:
+		return h > BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 - BLOCK_LOD_ORBIT_HYST)
+	return h > BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 + BLOCK_LOD_ORBIT_HYST)
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the

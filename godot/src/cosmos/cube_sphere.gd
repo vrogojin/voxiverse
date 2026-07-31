@@ -1763,6 +1763,29 @@ const FP_ATMO_RIM := false
 ## ORBITAL_SKY (the sun_dir source). Gate G-B3-NEARNIGHT. LIVE-ONLY LOOK. Depends B0 (curves).
 const FP_NEAR_DAYLIGHT := false
 
+## COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit) — the SURGICAL day/night-normal fix for the
+## near-field daylight twins. The shipped B3 twins compute the radial normal as μ = normalize(world_pos)·ŝ,
+## i.e. they assume the planet centre is the SCENE ORIGIN. That holds only when planet_render_centre() == 0;
+## the live faceted build places the planet centre AWAY from the origin (T_active⁻¹ render frame — proven
+## non-zero by the set_time up_bf fix, commit 4aa9d56), so normalize(world_pos) is NOT the true radial and the
+## near ground shades for the WRONG day/night — a facet region stays day-lit past true dusk and its (live,
+## smoothstep) terminator sweeps dark at the wrong clock time, meeting the correct MODEL·0-normal far ring at a
+## SHARP facet/tier seam. This flag switches the near twins (atlas module path + BlockMaterials fallback/residual
+## + debris) to n = normalize(v_wp − planet_centre) with planet_centre fed each frame from planet_render_centre()
+## — the SAME true radial the far shell derives from MODEL·0 — while keeping the shipped shade law (night_floor
+## 0.10 / term_mu / moonshine) otherwise byte-for-byte. FP_SHADE_UNIFIED already does this for the atlas path, so
+## this is the isolated normal-only fix for the shipped (non-unified) live config. Off ⇒ the shipped
+## normalize(v_wp) shader verbatim + no centre push ⇒ byte-identical. Requires FP_NEAR_DAYLIGHT. Gate
+## verify_tier_shade (G-TS-NEARNIGHT / G-TS-FALSIFY).
+const FP_NIGHT_TERRAIN_CENTRE := false
+
+## True iff the near-field daylight twins must carry a planet_centre uniform + true-radial normal — either via the
+## unified law (FP_SHADE_UNIFIED) or the isolated normal-only fix (FP_NIGHT_TERRAIN_CENTRE). Both need
+## FP_NEAR_DAYLIGHT (the twins only exist then). Read by block_atlas / block_materials (shader select + uniform
+## set) and WorldManager (per-frame centre push). Off ⇒ false everywhere ⇒ byte-identical.
+static func near_centre_fix_on() -> bool:
+	return FP_NEAR_DAYLIGHT and (FP_SHADE_UNIFIED or FP_NIGHT_TERRAIN_CENTRE)
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

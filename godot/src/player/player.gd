@@ -2134,6 +2134,50 @@ func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
 	clock.add_offset(delta)
 	return true
 
+## DEV LOOK-AT-PLANET (remote `look_planet`) — aim the camera straight at the planet's render centre so an
+## automated orbit screenshot frames the planet at ANY altitude. WHY it exists: in orbit the camera uses an
+## INERTIAL attitude (_att_q, fixed in space), so a plain pitched `look` can't reliably centre the planet — its
+## screen direction depends on the unpredictable attitude seed. This points the DISPLAYED camera forward (−Z)
+## straight at world.planet_render_centre() from the current camera origin.
+##
+## PERSISTENCE UNDER freeze_player(true): the orchestrator freezes the player first, which makes
+## _physics_process return early (so _attitude_tick never runs to overwrite the pose) — the same reason a plain
+## `look` sticks while frozen. We (1) write _camera.global_transform DIRECTLY (correct-by-construction centring,
+## which persists because nothing rewrites it while frozen), and (2) seed the backing inertial attitude _att_q
+## via CosmosAttitude.seed_bci so that window_camera_transform() reproduces the SAME basis if any writer
+## (an unfreeze, or a window-camera rewrite) later consults it — no view pop.
+##
+## pitch_off_deg: POSITIVE tilts the camera UP off dead-centre (rotates the forward axis toward the camera up
+## about its right axis), so the planet centre shifts toward the BOTTOM of frame — used to frame the full disk
+## vs the limb. 0 = dead-centre. Robust for the frozen ORBITAL case (the important one); on the surface it still
+## centres the displayed camera while frozen, but does not rewrite body yaw, so an unfreeze reverts (dev tool).
+func remote_look_planet(pitch_off_deg: float = 0.0) -> void:
+	if _camera == null or world == null:
+		return
+	var c := _camera.global_transform.origin
+	var p := planet_render_centre()
+	# ZERO = the far ring does not exist yet (planet_render_centre sentinel); coincident C==P ⇒ no direction.
+	if p == Vector3.ZERO or c.distance_to(p) < 1.0e-3:
+		return
+	var dir := (p - c).normalized()
+	# Build a look basis whose −Z faces the planet, keeping the current camera up as the roll hint (stable
+	# horizon); fall back to another axis if the hint is (near) parallel to dir so looking_at never degenerates.
+	var up_hint := _camera.global_transform.basis.y
+	if absf(dir.dot(up_hint.normalized())) > 0.999:
+		up_hint = _camera.global_transform.basis.x
+	var look_t := _camera.global_transform.looking_at(c + dir, up_hint)
+	# Optional framing tilt about the camera's (world-space) right axis. Pre-multiply ⇒ rotate the whole basis in
+	# world space about the right axis; +deg tilts the optical axis UP (planet drops toward the bottom of frame).
+	if pitch_off_deg != 0.0:
+		look_t.basis = Basis(look_t.basis.x.normalized(), deg_to_rad(pitch_off_deg)) * look_t.basis
+	look_t.basis = look_t.basis.orthonormalized()
+	# (1) Direct set — centres the DISPLAYED camera now and holds while frozen (nothing rewrites it).
+	_camera.global_transform = look_t
+	# (2) Seed the inertial attitude so the space-attitude writer reproduces this basis (no pop on unfreeze).
+	if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
+		var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
+		_att_q = _CosmosAttitudeCls.seed_bci(look_t.basis, theta)
+
 ## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
 ## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE
 ## + guarded: returns {} when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` null), so the bridge merge adds

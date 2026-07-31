@@ -98,7 +98,10 @@ const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screensho
   'dev_nav', 'nav', 'thrust', 'roll',
   // DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set celestial time-of-day at the player. The relay
   // only ROUTES + bounds-checks; the rover re-validates and executes behind the grant, like every op.
-  'set_time']);
+  'set_time',
+  // DEV LOOK-AT-PLANET (orbit screenshot framing) — aim the camera straight at the planet render centre so an
+  // automated orbit shot centres the planet at any altitude. Relay only ROUTES + bounds-checks; rover executes.
+  'look_planet']);
 const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
@@ -320,6 +323,11 @@ function validateStep(st) {
       if (st.sun_elev_deg !== undefined && (typeof st.sun_elev_deg !== 'number' || !isFinite(st.sun_elev_deg) || st.sun_elev_deg < -90 || st.sun_elev_deg > 90))
         return rej('caps', 'set_time.sun_elev_deg must be in [-90,90]');
       return okEst(0.2);
+    }
+    case 'look_planet': {                                // aim the frozen camera at the planet render centre (orbit shot framing)
+      if (st.pitch_off_deg !== undefined && (typeof st.pitch_off_deg !== 'number' || !isFinite(st.pitch_off_deg) || st.pitch_off_deg < -90 || st.pitch_off_deg > 90))
+        return rej('caps', 'look_planet.pitch_off_deg must be in [-90,90]');
+      return okEst(0.4);
     }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');

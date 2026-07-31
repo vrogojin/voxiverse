@@ -440,7 +440,16 @@ func _start_step() -> void:
 		"turn":
 			_start_turn()
 		"look":
-			_start_look()
+			# DEV NADIR-LOCK (orbit screenshot framing): a `planet_lock` field on the whitelisted `look` op aims the
+			# frozen camera straight at the planet render centre (the inertial attitude seed makes a plain pitched look
+			# unreliable at orbit). Routed through `look` — not a new op — so the RELAY forwards it verbatim with NO
+			# relay-whitelist change (the standalone `look_planet` op needs a relay restart, which wipes the grant).
+			if bool(_cur.get("planet_lock", false)):
+				if is_instance_valid(player) and player.has_method("remote_look_planet"):
+					player.call("remote_look_planet", float(_cur.get("pitch_off_deg", 0.0)))
+				_finish_step("ok")
+			else:
+				_start_look()
 		"jump":
 			_start_jump()
 		"set_fly":
@@ -492,6 +501,14 @@ func _start_step() -> void:
 				var elev_f: float = float(elev) if (elev is float or elev is int) else NAN
 				okk = bool(player.call("remote_set_time", float(_cur.get("local_hours", 12.0)), elev_f))
 			_finish_step("ok" if okk else "blocked")
+		"look_planet":
+			# DEV LOOK-AT-PLANET (orbit screenshot framing): aim the frozen camera straight at the planet render
+			# centre so an automated orbit shot centres the planet at any altitude (the inertial attitude seed makes
+			# a plain pitched `look` unreliable). Resolves synchronously via player.remote_look_planet, which no-ops
+			# when the far ring is absent — a dev tool, so we always report `ok` (mirrors set_fly).
+			if is_instance_valid(player) and player.has_method("remote_look_planet"):
+				player.call("remote_look_planet", float(_cur.get("pitch_off_deg", 0.0)))
+			_finish_step("ok")
 		"stop":
 			_finish_step("ok")                     # a labelled fence — the queue continues (§4.6)
 		"reload":

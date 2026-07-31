@@ -1921,6 +1921,21 @@ static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
 ## CONTROL_ENABLED); off ⇒ byte-identical. A dev-instrument fix — normal walking never hits it (proven: 6450-column sweep, 0 fall-throughs).
 const FP_DEV_TP_REFRAME := false
 
+## COSMOS FALL-THROUGH FIX (2026-07-31) — dev-teleport FLOOR WELD. Backstop to FP_DEV_TP_REFRAME: even with the
+## owner facet resolved and contained at the placement (verify_dev_teleport_owner: min own_dist ≫ −HYST, no crossing
+## fires headlessly), a dev geo-teleport that DROPS from altitude can still trip a facet crossing MID-FALL live (the
+## reported lat 8/lon 2 landing block z −229→−232 is a reframe shift — a pure −Y fall cannot move z). The crossing
+## flips the ACTIVE facet + reframes position into the neighbour lattice; from that frame surface_y AND floor_under
+## both resolve the NEIGHBOUR's deep column (≈ −6360 seafloor), so the fall-through guard (_dev_land_clamp reads
+## surface_y in the CURRENT frame) never catches — the player free-falls through the true owner surface and settles
+## on the deep underground fill (deepslate ≈ −18). When true, the player WELDS to the resolved owner facet for the
+## duration of the post-geo-teleport landing: while the land guard is armed it re-asserts active = owner and
+## SUPPRESSES facet crossings, so floor_under / _dev_land_clamp keep reading the owner column and catch the fall at
+## the true surface (grass), never the deep fill. Scoped to the dev geo-teleport landing (_tp_land_active, set ONLY
+## by _dev_teleport_geo under CONTROL_ENABLED) AND the armed guard, so normal play never enters it. Off ⇒ byte-
+## identical (the shipped maybe_cross_facet path runs verbatim). Requires FACETED. Pairs with FP_DEV_TP_REFRAME.
+const FP_TP_FLOOR_WELD := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

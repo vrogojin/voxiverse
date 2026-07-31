@@ -1688,6 +1688,19 @@ const FP_ATMO_SHELL := false
 ## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
 const FP_SUN_PATHLIGHT := false
 
+## COSMOS DIMSUN (docs/COSMOS-ATMO2-DESIGN.md §3.5, this fix). The low-elevation sun-disc BRIGHTNESS fix. Under
+## FP_SUN_PATHLIGHT the Sun disc's radiance was base·T⃗(m)·8·L(m)·occ — atmospheric extinction applied TWICE: once
+## chromatically via the transmittance colour T⃗(m)=exp(−τ⃗·m) AND again broadband via L(m)=exp(−0.10·m) on the
+## emission energy. At the horizon (m≈18) that stacks to ≈m² extinction, collapsing the disc to a dim near-black
+## dot exactly when a rising/setting sun should be a big warm sunrise/sunset disc. This flag (a) renormalizes the
+## disc's transmittance to a chroma-preserving HUE (brightest channel → 1) so the disc keeps its warm reddening
+## but NOT the luminance collapse, and (b) drops the L(m) double-extinction from the disc/glare energy — the
+## occlusion occ still fades the disc as it truly sinks below the horizon/limb, and the DirectionalLight (scene
+## illuminance) keeps its full T⃗(m)·L(m) dimming (untouched). Midday (m≈1, T⃗≈white) is a ~no-op. Off ⇒ the
+## disc radiance is byte-identical to the shipped B0 path. Requires FP_SUN_PRESENCE (+ FP_SUN_PATHLIGHT for the
+## live path). Gate G-DIMSUN. LIVE-ONLY LOOK.
+const FP_SUN_DISC_WARM := false
+
 ## COSMOS ATMO2 B1 (docs/COSMOS-ATMO2-DESIGN.md §2.1.2/§3.3, stage B1). The apparent-disc fix: Godot's
 ## SphereMesh default radius is 0.5 (not 1.0), so the shipped sun/moon impostors render at HALF their intended
 ## angular size (sun 1.0° not 2.0°, moon 0.75° not 1.5°) — a blurry dot lost in the glare. Under this flag the

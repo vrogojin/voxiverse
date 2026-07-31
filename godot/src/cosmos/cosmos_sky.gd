@@ -758,6 +758,27 @@ static func path_transmittance(m: float) -> Color:
 static func path_luminance(m: float) -> float:
 	return exp(-TAU_LUM * m)
 
+## DIMSUN (FP_SUN_DISC_WARM): the chroma-preserving disc HUE — a transmittance/tint colour renormalized so its
+## brightest channel is exactly 1.0. Keeps the warm sunrise/sunset REDDENING of T⃗(m) (the ratio between channels
+## is untouched) but discards the LUMINANCE collapse that made the low sun a dim near-black dot. Near noon T⃗≈white
+## so this is ≈identity; at the horizon T⃗≈(0.47,0.16,0.01) ⇒ hue≈(1.0,0.35,0.02): a bright warm orange, not black.
+## Pure/static (gate G-DIMSUN drives it directly). Degenerate (all channels ~0) ⇒ black in, black out.
+static func sun_disc_hue(t: Color) -> Color:
+	var mx := maxf(maxf(t.r, t.g), maxf(t.b, 1.0e-4))
+	return Color(t.r / mx, t.g / mx, t.b / mx)
+
+## DIMSUN twin: the Sun disc's emissive radiance LUMINANCE at optical air mass m (the emission colour × the
+## emission_energy_multiplier the impostor actually renders, occ folded in by the caller as 1 here). warm=false
+## reproduces the shipped B0 path disc base·T⃗(m)·8·L(m) — collapsing to ≈0 at the horizon (the bug); warm=true is
+## the fixed disc base·hue(T⃗(m))·8 — bright at the horizon. The gate asserts warm ≫ shipped at low elevation and
+## warm ≥ shipped (no dimming) at noon, and falsifies that the shipped disc genuinely collapses at the horizon.
+static func sun_disc_luminance(m: float, warm: bool) -> float:
+	var st := path_transmittance(m)
+	var hue := sun_disc_hue(st) if warm else st
+	var energy := 8.0 if warm else 8.0 * path_luminance(m)
+	var c := Color(_SUN_EMISSION_BASE.r * hue.r, _SUN_EMISSION_BASE.g * hue.g, _SUN_EMISSION_BASE.b * hue.b)
+	return c.get_luminance() * energy
+
 # ---------------------------------------------------------------------------------------
 # COSMOS-LOD-SKY task 2 (docs/COSMOS-LOD-SKY-DESIGN.md §6, §7.3) — celestial lighting statics. ALL pure
 # (engine-free) so the gates (G-SKY-MOONSHINE / G-SKY-SCATTER / G-SHELL-TINT) drive them DIRECTLY and are
@@ -1185,6 +1206,11 @@ func _update_sky(t: float) -> void:
 			var up_s := cam_rel.normalized() if cam_rel.length() > 1.0 else Vector3.UP
 			var mu_cam := sun_dir.dot(up_s)
 			st = scatter_tint(mu_cam)                        # air_mass clamps μ∈[0,1]; horizon ⇒ deep crimson
+		# DIMSUN (FP_SUN_DISC_WARM): renormalize the disc's transmittance to a chroma-preserving HUE so the low sun
+		# keeps its warm reddening but not the luminance collapse (the disc was extinction-dimmed twice: T⃗ colour ×
+		# L(m) energy). The DirectionalLight's own T⃗(m) colour/energy above is untouched. Off ⇒ st unchanged.
+		if CubeSphere.FP_SUN_DISC_WARM:
+			st = sun_disc_hue(st)
 		var reddened := Color(_SUN_EMISSION_BASE.r * st.r, _SUN_EMISSION_BASE.g * st.g, _SUN_EMISSION_BASE.b * st.b)
 		if _sun_mat != null:
 			# FP_TERM_SUN_CONT: fade the UNSHADED disc smoothly by occlusion instead of the binary visible-flip
@@ -1198,10 +1224,15 @@ func _update_sky(t: float) -> void:
 			if CubeSphere.FP_SUN_PATHLIGHT:
 				# Disc core stays white×T⃗; energy ∝ L(m)·occ so it is blinding in space, dim-red at sunset,
 				# gone in the umbra (the impostor is a crisp disc, not the K–Y-dimmed blob).
-				_sun_mat.emission_energy_multiplier = 8.0 * lum * maxf(occ_cam, 0.0)
+				# DIMSUN (FP_SUN_DISC_WARM): drop the L(m) double-extinction from the disc energy — the warm hue above
+				# carries the reddening; occ alone fades the disc below the horizon. Off ⇒ 8·L(m)·occ (byte-identical).
+				var disc_lum := 1.0 if CubeSphere.FP_SUN_DISC_WARM else lum
+				_sun_mat.emission_energy_multiplier = 8.0 * disc_lum * maxf(occ_cam, 0.0)
 		if _glare != null:
 			_place_glare(sun_pos, sun_r * CubeSphere.SUN_GLARE_RADII, cam_origin)
-			var glare_i := (lum * occ_cam) if CubeSphere.FP_SUN_PATHLIGHT else occ_cam
+			# DIMSUN: match the disc — drop L(m) from the glare intensity so the sunset glare stays bright warm.
+			var glare_lum := 1.0 if CubeSphere.FP_SUN_DISC_WARM else lum
+			var glare_i := (glare_lum * occ_cam) if CubeSphere.FP_SUN_PATHLIGHT else occ_cam
 			_glare_mat.set_shader_parameter("intensity", glare_i)
 			_glare_mat.set_shader_parameter("glare_color", Vector3(reddened.r, reddened.g, reddened.b))
 			_glare.visible = glare_i > 0.001

@@ -2431,6 +2431,41 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			return _commit_facet_change(fid, to, np, slot)
 	return {}
 
+## COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC) — the GENERAL descent facet resync. A fast/high flight over a FAR
+## region drifts the true sub-camera facet many facets away from the active facet while adjacent crossings are cooldown/
+## containment-deferred and the high-flyer pool freeze (_pool_off_surface) deliberately suppresses re-designation — so the
+## active facet LAGS. On a genuine (non-flying) descent the floor MUST be the real surface, but floor_under / surface_y
+## evaluate the player's column against the STALE facet's piecewise-FLAT datum plane — extended far past its ridge domain
+## that flat plane sinks hundreds of blocks below the sphere (the live surface_y ≈ −28 at a far spot with trees). This
+## redesignates the active facet DIRECTLY onto the true facet_of_dir owner (the _alt_reentry_restore path — one O(1)
+## _commit_facet_change, position/velocity-continuous via the returned reframe + the _heal_frame_desync invariant), so
+## floor_under / surface_y read the owner's REAL surface. Guard: NON-ADJACENT owner only — an adjacent flip is the domain
+## of maybe_cross_facet's −HYST/cooldown/containment hysteresis (never fought → normal walking is byte-identical). Returns
+## the crossing dict (Player.apply_reframe consumes it) or {} (no resync). Off-flag / not-faceted ⇒ the guard returns {}.
+func resync_subcamera_facet(player_pos: Vector3) -> Dictionary:
+	if not (CubeSphere.FACETED and CubeSphere.FP_DESCENT_FACET_RESYNC):
+		return {}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return {}
+	# The player's active-lattice position → planet-absolute direction → the TRUE sub-camera facet (the exact
+	# high-flyer-drift computation _pool_off_surface already trusts). The lattice↔world map is frame-consistent by
+	# the crossing invariant, so this is the real owner no matter how stale the active facet has become.
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	var to := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	if to < 0 or to == fid:
+		return {}
+	# ADJACENT owner ⇒ defer to maybe_cross_facet (its hysteresis owns seam crossings so a −0.1 ridge-jitter flip can
+	# never double-fire). Only a NON-ADJACENT owner (drifted ≥ 2 facets — unreachable by the adjacent-only seam march,
+	# so unambiguously a stale-facet desync, never a normal walk step) is resynced here.
+	for slot in 4:
+		if FacetAtlas.seam_neighbour(fid, slot) == to:
+			return {}
+	var np: Array = FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+	_alt_redesignate_count += 1
+	print("[WorldManager] descent facet resync: redesignate %d -> %d (sub-camera facet, non-adjacent desync)" % [fid, to])
+	return _commit_facet_change(fid, to, np, -1)
+
 ## COSMOS FP-FIXED-FRAME §2.2 / FP-M1c — the committed facet-change bookkeeping, shared by a normal seam crossing
 ## (maybe_cross_facet) and the R3 re-entry restore (_alt_reentry_restore). `to` is the destination facet, `np` the
 ## f64 reframed player landing (FacetAtlas.reframe_position64), `slot` the crossed seam slot (-1 for a re-entry

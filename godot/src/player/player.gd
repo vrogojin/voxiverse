@@ -760,6 +760,19 @@ func _physics_process(delta: float) -> void:
 		TerrainConfig.set_active_facet(_tp_owner_fid)
 		_pos_fid = _tp_owner_fid
 	elif CubeSphere.FACETED:
+		# COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC): a genuine (non-flying) descent/landing over a FAR region
+		# can leave the active facet DESYNCED from the true sub-camera facet — a fast/high flight drifts many facets
+		# while adjacent crossings are cooldown/containment-deferred and the high-flyer pool freeze suppresses resync.
+		# floor_under / surface_y then read the STALE facet's piecewise-FLAT datum plane, which — extended thousands of
+		# blocks past its ridge domain — sinks far below the sphere (measured surface_y ≈ −28 at a far spot with trees),
+		# so the fall lands on the deep lie / falls through. When NOT flying (a real fall the floor must catch), resync
+		# the active facet onto the true facet_of_dir owner (a direct O(1) redesignation, the _alt_reentry_restore path)
+		# BEFORE maybe_cross_facet so the floor this frame is the owner's real surface. NON-ADJACENT desyncs only (the
+		# adjacent hysteresis crossing is never fought). Off-flag ⇒ this whole block is skipped ⇒ byte-identical.
+		if CubeSphere.FP_DESCENT_FACET_RESYNC and not flying and not _dev_nav:
+			var resync := world.resync_subcamera_facet(position)
+			if not resync.is_empty():
+				apply_reframe(resync["new_pos"], resync["yaw_delta"])
 		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
 		var cross := world.maybe_cross_facet(position)
 		if not cross.is_empty():

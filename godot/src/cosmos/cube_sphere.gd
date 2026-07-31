@@ -1848,6 +1848,15 @@ static func cruise_speed(alt: float) -> float:
 static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
 	return dev_fly and in_space and c_held
 
+## COSMOS FALL-THROUGH FIX (2026-07-31) — dev-teleport facet-frame re-assert. A dev teleport (_dev_reposition) can
+## have update_streaming fire a spurious facet crossing on the huge position jump, flipping the ACTIVE frame to a
+## neighbour while `position` still holds the OWNER lattice coords; surface_y then resolves the neighbour's terrain
+## (a different sphere direction, often deep ocean) and the feet clamp onto the seafloor → the player is buried (the
+## lat 8/lon 2 fall-through, root-caused: the STATIC floor math is correct, the ACTIVE FACET is wrong for the position).
+## When true, _dev_reposition restores the owner facet after streaming before the surface read. Dev-only (runs under
+## CONTROL_ENABLED); off ⇒ byte-identical. A dev-instrument fix — normal walking never hits it (proven: 6450-column sweep, 0 fall-throughs).
+const FP_DEV_TP_REFRAME := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

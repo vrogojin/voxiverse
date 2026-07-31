@@ -2289,6 +2289,15 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 		# so the same-frame streaming kick targets the re-designated facet.
 		world.dev_reanchor_near(position)
 		world.update_streaming(position)
+		# COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME): update_streaming above can fire a SPURIOUS facet crossing on the
+		# huge teleport jump, flipping TerrainConfig's ACTIVE frame to a NEIGHBOUR while `position` still holds the OWNER
+		# (fid) lattice coords. The surface_y read below would then resolve the NEIGHBOUR's terrain at those coords — a
+		# different sphere direction, often deep OCEAN → the feet clamp onto the seafloor and the player is buried (the
+		# lat 8/lon 2 fall-through). Restore the owner frame `position` is in before the surface read so surface_y is read
+		# against the CORRECT column. Dev-only (this runs under CONTROL_ENABLED); off ⇒ current behaviour (byte-identical).
+		if CubeSphere.FP_DEV_TP_REFRAME and fid >= 0 and TerrainConfig.active_facet() != fid:
+			TerrainConfig.set_active_facet(fid)
+			_pos_fid = fid
 		# FLOOR-SETTLE: re-derive the FRESH analytic surface at the target (the active facet is set above; set_active_facet
 		# cleared any per-column memo on a facet change, and surface_y is recomputed each call — no stale height). If the
 		# placement is AT/BELOW the surface, clamp the feet exactly onto it, grounded — a ground teleport never lands

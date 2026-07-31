@@ -295,7 +295,16 @@ func _process(_delta: float) -> void:
 	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
 	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also drive the feed when the biased-tier fallback material carries the
 	# far ring (shell-absolute off) so its unified self-shade tracks the Sun. Off both flags ⇒ never called (byte-id).
-	if _player != null and _cosmos_sky != null and (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED) and CubeSphere.FACETED:
+	# COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): ALSO drive it under this flag so the block-LOD tiers'
+	# ONE shared_material() sun_dir is refreshed EVERY FRAME with the SAME current_sun_dir the far-ring shell uses —
+	# regardless of whether FP_SHELL_ABSOLUTE gates the shell-material push. Without this, block-LOD set_sun_dir is only
+	# reached via the shell-absolute gate, so if FP_BLOCK_LOD ships without FP_SHELL_ABSOLUTE the block-LOD materials
+	# freeze at the default sun (1,0,0) and every facet renders for a FIXED sun — the per-facet "frozen/offset" day/night
+	# patchwork (incl. red scatter-tint on grazing-normal facets) while the far ring + near field track live time. The
+	# block_lod.set_sun_dir calls inside set_far_ring_shell_absolute are UNCONDITIONAL (only the shell-material push
+	# self-gates on FP_SHELL_ABSOLUTE), so this cheap shared-uniform write unifies all tiers to the live Sun. Off ⇒ the
+	# shipped gate verbatim ⇒ byte-identical.
+	if _player != null and _cosmos_sky != null and (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED or CubeSphere.FP_NIGHT_TERRAIN_CENTRE) and CubeSphere.FACETED:
 		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the Sun direction into the near-field daylight material twin so
 	# the near ground darkens with the same absolute day/night as the far shell (kills the near/far night split).

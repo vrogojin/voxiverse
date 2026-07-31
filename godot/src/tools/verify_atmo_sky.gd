@@ -59,6 +59,7 @@ func _initialize() -> void:
 	_gate_o1_ground()
 	_gate_atmo_rim()
 	_gate_term_sun_cont()
+	_gate_dimsun()
 	_gate_b3_nearnight()
 	_gate_inert()
 	_gate_smoke()
@@ -921,3 +922,43 @@ func _gate_term_sun_cont() -> void:
 	var dep_fl := absf(asin(clampf(r / maxf(r + 0.25, r + h_eye), 0.0, 1.0)) - asin(clampf(r / maxf(r + 1.25, r + h_eye), 0.0, 1.0)))
 	_ok(dep_fl <= dep_un + 1e-9, "floored sun-hide slope ≤ un-floored just above the datum (singularity bounded): fl %.6f ≤ un %.6f" % [dep_fl, dep_un])
 	_ok(CubeSphere.TERM_SUN_H_EYE_MIN > 0.0, "TERM_SUN_H_EYE_MIN defined (%.2f blocks)" % CubeSphere.TERM_SUN_H_EYE_MIN)
+
+# ------------------------------------------------------------------ G-DIMSUN (FP_SUN_DISC_WARM)
+# The low-elevation sun-DISC brightness fix. The shipped B0 disc radiance is base·T⃗(m)·8·L(m): extinction applied
+# TWICE (chromatic T⃗ + broadband L), so at the horizon (m≈18) the disc collapses to a dim near-black dot — the
+# washed-out sunrise/sunset sun the pilot reported. The warm disc keeps the WARM HUE (chroma-preserving) but drops
+# the L(m) double-extinction, so it stays a bright warm disc that fades only via occlusion as it truly sets.
+func _gate_dimsun() -> void:
+	print("  --- G-DIMSUN: low-elevation sun-disc brightness (warm hue, no double extinction) ---")
+	var r := GRAV.r_vox("earth")
+	var m_noon := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(0.0, 0.0, 1.0), r, true)   # ≈1
+	var m_horiz := SKY.optical_path_air_mass(Vector3(0.0, 0.0, r), Vector3(1.0, 0.0, 0.0), r, true)  # ≈18
+	# (1) HUE PRESERVED: sun_disc_hue keeps the channel RATIO (warmth) — brightest channel is exactly 1, and R≥G≥B
+	# reddening order is untouched. At the horizon that is a bright warm orange (R=1), not the dim T⃗ itself.
+	var th := SKY.path_transmittance(m_horiz)
+	var hue := SKY.sun_disc_hue(th)
+	var mx := maxf(maxf(hue.r, hue.g), hue.b)
+	_ok(absf(mx - 1.0) <= 1.0e-5, "disc hue brightest channel == 1.0 (no luminance collapse): max=%.4f" % mx)
+	_ok(hue.r >= hue.g and hue.g >= hue.b, "disc hue keeps the warm R≥G≥B reddening order at the horizon")
+	_ok(absf(hue.r * th.g - hue.g * th.r) <= 1.0e-6, "disc hue preserves chroma (channel ratios unchanged vs T⃗)")
+	# (2) BRIGHT AT THE HORIZON: the fixed disc radiance is MUCH brighter than the shipped double-extinguished disc.
+	var lo_warm := SKY.sun_disc_luminance(m_horiz, true)
+	var lo_ship := SKY.sun_disc_luminance(m_horiz, false)
+	_ok(lo_warm >= 2.5, "warm disc is bright at the horizon (L=%.3f ≥ 2.5, big warm sunset sun)" % lo_warm)
+	_ok(lo_warm >= 4.0 * lo_ship, "warm disc ≫ shipped disc at the horizon (%.3f vs %.3f, ≥4×)" % [lo_warm, lo_ship])
+	# (3) FALSIFIER: the SHIPPED disc genuinely collapses at the horizon (proves the bug is real, not a vacuous test).
+	_ok(lo_ship < 1.0, "falsify: shipped B0 disc collapses to dim at the horizon (L=%.3f < 1.0) — the bug" % lo_ship)
+	# (4) NO MIDDAY REGRESSION: at noon (T⃗≈white) the warm disc is ≈the shipped bright disc and never dimmer.
+	var noon_warm := SKY.sun_disc_luminance(m_noon, true)
+	var noon_ship := SKY.sun_disc_luminance(m_noon, false)
+	_ok(noon_warm >= noon_ship - 1.0e-6, "warm disc never dims midday (warm %.3f ≥ shipped %.3f)" % [noon_warm, noon_ship])
+	_ok(noon_warm >= 6.0, "warm disc stays a bright noon sun (L=%.3f ≥ 6.0)" % noon_warm)
+	# (5) MONOTONE: brighter as the sun climbs (m falls), so there is no inversion — noon ≥ horizon.
+	_ok(noon_warm >= lo_warm, "warm disc noon ≥ horizon (no inversion): %.3f ≥ %.3f" % [noon_warm, lo_warm])
+	# (6) OFF IS BYTE-IDENTICAL: with the flag off the disc renders base·T⃗(m)·8·L(m) exactly. Reconstruct that
+	# closed form independently and confirm sun_disc_luminance(_,false) reproduces it — so the gate's shipped path
+	# IS the live flag-off path (the fix is provably a no-op when FP_SUN_DISC_WARM is off).
+	var base := SKY._SUN_EMISSION_BASE
+	var tm := SKY.path_transmittance(m_horiz)
+	var expected := Color(base.r * tm.r, base.g * tm.g, base.b * tm.b).get_luminance() * 8.0 * SKY.path_luminance(m_horiz)
+	_ok(absf(SKY.sun_disc_luminance(m_horiz, false) - expected) <= 1.0e-6, "flag-off disc == shipped base·T⃗(m)·8·L(m) exactly (Δ %.2e)" % absf(SKY.sun_disc_luminance(m_horiz, false) - expected))

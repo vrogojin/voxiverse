@@ -298,6 +298,14 @@ const FP_FARRING_FULL_COVER := false
 ## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
+## COSMOS PLANET-VIEW §3 (B) — the LIMB (silhouette) densification. The far ring meshes every facet at CELLS=4, so the
+## planet's silhouette from orbit is a coarse polygon (the "jagged/unfinished limb"). When true (requires FACETED + the
+## orbit camera-set law), ONLY the ~1-facet-thick ring of facets straddling the horizon tangent — |centre·ĉ − cos θ_h|
+## within LIMB_DENSE_BAND facet half-widths — emits at LIMB_DENSE_CELLS instead of 4, and ONLY off-surface (`_offsurface`);
+## the interior stays at CELLS=4 and the surface hot path is never touched. The ring is ~O(√facets_in_cap) ≈ 40–60 facets,
+## capped to LIMB_DENSE_MAX_FACETS (see facet_far_ring.gd), so the resident dense set is bounded (~+0.5 MB peak — a MEASURED
+## A/B ceiling bump). Default OFF → the far ring emits every facet at CELLS=4 exactly as today, FLAT stays byte-identical.
+const FP_FARRING_LIMB_DENSE := false
 ## Rescale-safe backstop sink: TierPlace.backstop_sink() derives the radial sink as BACKSTOP_SINK_FRAC × the facet
 ## cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge = (π/2·R)/K), so it scales with R and clears the coarse-grid
 ## facet chord sagitta at any radius (≈6 at R=3072, ≈13 at R=6371). 0.5 reproduces the shipped 6-block sink at R=3072.

@@ -470,11 +470,12 @@ const SHELL_LIMB_GAIN := 1.6                  # additive limb/sky intensity scal
 ## simply tightens the lit band. Off ⇒ r_outer stays shell_outer_r ⇒ byte-identical.
 const SHELL_RIM_MULT := 1.0
 ## PLANET-VIEW §2.1/§2.4 (FP_ATMO_RIM): the rim BRIGHTNESS scale height (blocks). The bright band falls as
-## exp(−h_min/H_RIM); with H_RIM≈48 it decays to ≈5% (e⁻³) by h≈3·H_RIM=144 blocks (~2% of R) — an Earth-like
-## hairline that thickens toward the surface (the chord through the dense layer lengthens as b→R) and is essentially
-## gone at the geometric ceiling. In the spirit of the extinction-colour H_OPT=30 << the fog H_SCALE=128. Off ⇒ the
-## shell exp falloff uses h_scale (128) ⇒ byte-identical.
-const H_RIM := 48.0
+## exp(−h_min/H_RIM) and decays to ≈5% (e⁻³) by h≈3·H_RIM. SIZED TO THE ATMOSPHERE BORDER: H_RIM = ATMO_TOP/3 =
+## 128 so the visible halo reaches ~ATMO_TOP (384 = where the air ends / '--' / space begins), NOT a hairline that
+## dies at ~144 well inside the declared atmosphere (the 48 value looked realistic-thin but did NOT match the
+## border — user 2026-07-31). The shell geometry is capped at R+ATMO_TOP (SHELL_RIM_MULT=1) so the blue fills the
+## atmosphere band exactly and fades to black AT the ceiling. Off ⇒ the shell falloff uses h_scale (128) ⇒ byte-identical.
+const H_RIM := 128.0
 
 ## A3 atmo_vis(h): 1 (surface) → 0 (space), C¹. On an airless body there is no atmosphere ⇒ 0 everywhere.
 static func atmo_vis(h: float, has_atmo: bool) -> float:

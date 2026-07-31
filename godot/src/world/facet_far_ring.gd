@@ -3127,6 +3127,22 @@ static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UN
 	code = code.replace("	v_col = COLOR.rgb * shade * tint;\n", "	v_col = COLOR.rgb * voxi_shade(n, sun_dir);\n")
 	return code
 
+## COSMOS PLANET-VIEW P4 (docs/COSMOS-PLANET-VIEW-DESIGN.md §3(A)/P4, FP_FAR_SKIN_FINE): sharpen the blotchy far-orbit skin
+## by making the ALREADY-BAKED close-up (finer 128²/facet) skin VISIBLE at far-orbit for the sub-camera disc. The shipped
+## close-up ALBEDO fades the fine map out beyond CLOSEUP_FAR (wc = smoothstep(cu_far,cu_near,v_cam) → 0 at orbit); this
+## replaces that ONE line with wc = cu.a — the fine map shown wherever a facet has a resident close-up slot + bake coverage,
+## at ALL distances, exactly the "texture EVERYWHERE" law the base wt already follows. The far-orbit fine set is BOUNDED by
+## the baker's orbit promotion (FAR_SKIN_FINE_MAX nearest facets), so this only sharpens the disc the player looks at; a
+## facet with no slot keeps v_slot = -1 → base-map floor (never a hole). Only when FP_FAR_SKIN_FINE AND the close-up shader
+## variant is compiled (_cu_on() ⇒ FP_FACET_TEX_CLOSEUP required); off ⇒ the exact target line is absent (base tex shader)
+## or the flag is off ⇒ code returned VERBATIM (byte-identical shell string, FLAT 6042/0).
+func _apply_far_skin_fine(code: String, fine := CubeSphere.FP_FAR_SKIN_FINE) -> String:
+	if not (fine and _cu_on()):
+		return code
+	return code.replace(
+		"		float wc = smoothstep(cu_far, cu_near, v_cam) * cu.a;   // sharpen on approach, coverage-gated\n",
+		"		float wc = cu.a;   // FP_FAR_SKIN_FINE: fine skin visible at ALL distances incl. far-orbit (coverage-gated)\n")
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -3146,6 +3162,9 @@ func _make_material() -> Material:
 		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
 		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
 		sh2.code = _apply_shade_unified(sh2.code)
+		# COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): make the already-baked finer close-up skin VISIBLE at far-orbit for the
+		# sub-camera disc (a one-line wc swap on the close-up ALBEDO). Off / close-up off ⇒ code returned verbatim (byte-identical).
+		sh2.code = _apply_far_skin_fine(sh2.code)
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))

@@ -81,6 +81,12 @@ var _id_tex: Texture2DArray = null   # the 6-layer GPU id map (bound into the ri
 # (or vertex colour) until its layer is ready → no hitch, no hole. NEVER-OOM: fixed CLOSEUP_MAX layers, LRU evicts
 # ONLY facets outside the current cap (the base map is the safe floor). All zero / never created with the flag off.
 var _cu_on := false                  # FP_FACET_TEX_CLOSEUP && the baker exists (set in setup)
+# COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): reuse the close-up finer page to SHARPEN the far-orbit skin. When on (requires
+# _cu_on ⇒ FP_FACET_TEX_CLOSEUP), the orbit driver replaces the close-up want-set with a SELF-DRIVEN sub-camera disc capped
+# to FAR_SKIN_FINE_MAX facets (only while off-surface at cam_dist > CLOSEUP_FAR), so the reused close-up pool spends a bounded
+# working-set on the orbit skin. The shell shader (facet_far_ring._apply_far_skin_fine) shows it at far-orbit. Off ⇒ inert.
+var _fine_on := false                # FP_FAR_SKIN_FINE && _cu_on (the orbit fine promotion is live)
+var _fine_peak_bytes := 0            # peak orbit fine working-set bytes observed this session (the MEASURED A/B proof surface)
 var _cu_texels := 0                  # CLOSEUP_TEXELS (128)
 var _cu_tex: Texture2DArray = null   # the CLOSEUP_MAX-layer GPU close-up map (bound into the ring's closeup_map)
 var _cu_layers: Array = []           # CLOSEUP_MAX staging Images (128² RGBA8, premult+mips) — the re-blit source
@@ -218,6 +224,9 @@ func setup(active_fid: int) -> void:
 	# and seed the free-layer pool + reverse maps. Requires FP_BLOCK_DETAIL (the band composites detail_map[id]) so _bm_on
 	# implies _bd_on. Only under FP_BAND_BLOCK_MAP -> zero band bytes with the flag off. Built ONCE (all id 0 -> the shader's
 	# band branch is skipped until a facet is baked resident); a completed bake only does a cheap update_layer.
+	# COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): arm the orbit fine promotion. Requires _cu_on (the close-up pool + shell
+	# shader path structurally supply the finer skin) — off ⇒ _fine_on false ⇒ the orbit driver is byte-identical to close-up.
+	_fine_on = CubeSphere.FP_FAR_SKIN_FINE and _cu_on
 	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and _bd_on
 	# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band stores RG8 {block_id, shade} (the real shot incl trees) instead
 	# of L8 {id}. Off ⇒ _bm_shot false ⇒ the L8 format + id-only bake below are BYTE-IDENTICAL to the U1 band.
@@ -467,7 +476,7 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
 			_bake_band_budgeted(start, budget_us)          # finest tier (largest deficit) first
 		if _cu_on:
-			_recompute_want_sse(emit_axis, cam_dist)       # NO regime gate, NO evict-all
+			_recompute_closeup_want(emit_axis, cam_dist, offsurface, true)  # FP_FAR_SKIN_FINE: fine orbit disc at orbit, else SSE
 			_bake_closeup_budgeted(start, budget_us)       # whatever budget the band left
 		_bake_base_progressive(start, budget_us, emit_axis)
 		_flush_base_uploads()
@@ -483,7 +492,7 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 	# unit (never mid-unit), so the worst frame is bounded by budget + one bake unit regardless of the split.
 	var cu_line := int(float(budget_us) * 0.75)
 	if _cu_on and offsurface:
-		_recompute_want(emit_axis)
+		_recompute_closeup_want(emit_axis, cam_dist, offsurface, false)  # FP_FAR_SKIN_FINE: fine orbit disc at orbit, else angular cap
 		_bake_closeup_budgeted(start, cu_line)
 	elif _cu_on and not _cu_want.is_empty():
 		_evict_all_closeup()               # on-surface (or flag path change): drop every promotion → all base-map, bytes freed to the pool
@@ -531,10 +540,10 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 			if _bm_on and active_fid >= 0:
 				_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
 			if _cu_on:
-				_recompute_want_sse(emit_axis, cam_dist)
+				_recompute_closeup_want(emit_axis, cam_dist, offsurface, true)   # FP_FAR_SKIN_FINE: fine orbit disc at orbit
 		else:
 			if _cu_on and offsurface:
-				_recompute_want(emit_axis)
+				_recompute_closeup_want(emit_axis, cam_dist, offsurface, false)  # FP_FAR_SKIN_FINE: fine orbit disc at orbit
 			elif _cu_on and not _cu_want.is_empty():
 				_evict_all_closeup()
 			if _bm_on and active_fid >= 0:
@@ -819,6 +828,97 @@ func _recompute_want_sse(axis: Array, cam_dist: float) -> void:
 		_cu_bake_fid = -1; _cu_bake_layer = -1; _cu_bake_img = null
 	_cu_want = want
 	_cu_want_axis = [ax, ay, az]
+
+## COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): the close-up want-set dispatcher. At ORBIT (fine active: off-surface, cam_dist >
+## CLOSEUP_FAR) it drives the SELF-DRIVEN sub-camera fine disc (bounded to FAR_SKIN_FINE_MAX); otherwise it is the shipped
+## SSE / angular close-up recompute VERBATIM. Off the flag ⇒ _fine_orbit_active is always false ⇒ this reduces to the exact
+## shipped call (byte-identical). `sse` picks the shipped near path (screen-space vs angular) when the fine path is inactive.
+func _recompute_closeup_want(axis: Array, cam_dist: float, offsurface: bool, sse: bool) -> void:
+	if _fine_orbit_active(offsurface, cam_dist):
+		_recompute_fine_orbit_want(axis, cam_dist)
+	elif sse:
+		_recompute_want_sse(axis, cam_dist)
+	else:
+		_recompute_want(axis)
+
+## COSMOS PLANET-VIEW P4: is the orbit fine promotion live THIS update? Requires the flag (_fine_on), off-surface, and a real
+## FAR-ORBIT altitude (cam_dist is distance from the body centre = R + h, so the far-orbit test is h = cam_dist − R >
+## CLOSEUP_FAR — the same altitude beyond which the shipped close-up SSE promotes nothing and the shader fades the fine map
+## out). Below that (near orbit / surface) the shipped close-up promotion + shader fade run unchanged.
+func _fine_orbit_active(offsurface: bool, cam_dist: float) -> bool:
+	return _fine_on and offsurface and (cam_dist - FacetAtlas.R_BLOCKS) > CubeSphere.CLOSEUP_FAR
+
+## COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): the SELF-DRIVEN orbit fine want-set — the FAR_SKIN_FINE_MAX facets NEAREST the
+## sub-camera axis that also fall within FAR_SKIN_FINE_CAP_DEG of it (the central disc the player looks at from orbit), so the
+## reused close-up pool spends a BOUNDED working-set on the far-orbit skin. Residents outside the capped disc are evicted, so
+## residency ≤ FAR_SKIN_FINE_MAX (the byte cap binds on real layer bytes). Independent of the SSE/regime near law — at orbit
+## the SSE promote threshold (CLOSEUP_FAR) admits nothing, so the fine path must promote the disc itself. Tracks the peak bytes.
+func _recompute_fine_orbit_want(axis: Array, _cam_dist: float) -> void:
+	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+	if ax * ax + ay * ay + az * az < 0.5:
+		return                                      # degenerate axis (camera at centre) — hold the last want-set
+	var cos_cap := cos(deg_to_rad(CubeSphere.FAR_SKIN_FINE_CAP_DEG))
+	var scored := {}                                # fid -> dot(axis) for facets inside the disc (larger = nearer the sub-point)
+	for fid in range(_base_all):
+		var cd := _centre_pack[fid]
+		var d := cd.x * ax + cd.y * ay + cd.z * az
+		if d >= cos_cap:
+			scored[fid] = d
+	var want := fine_top_n(scored, CubeSphere.FAR_SKIN_FINE_MAX)   # keep the FAR_SKIN_FINE_MAX nearest — the bounded fine set
+	# Evict residents that fell out of the capped disc (frees the layer back to the close-up pool → base-map floor, no hole).
+	for fid in _cu_slots.keys():
+		if not want.has(int(fid)):
+			_evict_closeup(int(fid))
+	# Abandon the in-progress bake if its facet left the disc (its layer returns to the pool).
+	if _cu_bake_fid >= 0 and not want.has(_cu_bake_fid):
+		if not _cu_free.has(_cu_bake_layer):
+			_cu_free.append(_cu_bake_layer)
+		_cu_bake_fid = -1; _cu_bake_layer = -1; _cu_bake_img = null
+	_cu_want = want
+	_cu_want_axis = [ax, ay, az]
+	# MEASURED A/B: record the peak orbit fine working-set bytes (bounded ≤ FAR_SKIN_FINE_MAX layers by construction).
+	_fine_peak_bytes = maxi(_fine_peak_bytes, fine_working_bytes())
+
+## COSMOS PLANET-VIEW P4: from a {fid: score} map (score larger ⇒ nearer), keep only the `max_n` HIGHEST-score entries — the
+## nearest sub-camera facets. Pure/static ⇒ gate-testable (bounded ≤ max_n, picks the largest scores). ≤ max_n entries pass through.
+static func fine_top_n(scored: Dictionary, max_n: int) -> Dictionary:
+	if scored.size() <= max_n:
+		return scored.duplicate()
+	var arr := []                                   # [score, fid]
+	for fid in scored.keys():
+		arr.append([float(scored[fid]), int(fid)])
+	arr.sort()                                      # ascending by score; the tail is the nearest
+	var out := {}
+	for i in range(max_n):
+		var e = arr[arr.size() - 1 - i]
+		out[int(e[1])] = float(e[0])
+	return out
+
+## COSMOS PLANET-VIEW P4: the peak BYTES a `max_n`-layer orbit fine working-set costs at `texels²` RGBA8 — CPU staging + GPU
+## array with the ×4/3 mip tail, the SAME per-layer accounting total_bytes() uses for the close-up pool. Pure ⇒ the gate
+## asserts fine_peak_bytes(FAR_SKIN_FINE_MAX, CLOSEUP_TEXELS) ≤ FAR_SKIN_FINE_BYTES_MAX (the NEVER-OOM ceiling) exactly.
+static func fine_peak_bytes(max_n: int, texels: int) -> int:
+	var lpx := texels * texels * 4                  # one RGBA8 layer, bytes
+	return max_n * (lpx + (lpx * 4) / 3)            # CPU staging + GPU array (+mip tail ×1.333) per layer
+
+## COSMOS PLANET-VIEW P4: the CURRENT orbit fine working-set bytes (resident close-up layers under the fine cap). Zero off the
+## flag. Bounded ≤ fine_peak_bytes(FAR_SKIN_FINE_MAX, CLOSEUP_TEXELS) because _recompute_fine_orbit_want caps residency.
+func fine_working_bytes() -> int:
+	if not _fine_on:
+		return 0
+	return fine_peak_bytes(_cu_slots.size(), _cu_texels)
+
+func fine_on() -> bool:
+	return _fine_on
+
+## COSMOS PLANET-VIEW P4: gate/telemetry predicate — is the orbit fine promotion live for this (offsurface, cam_dist)?
+## False off the flag and everywhere on the surface / below CLOSEUP_FAR (the "empty off the flag / on the surface" invariant).
+func fine_orbit_active(offsurface: bool, cam_dist: float) -> bool:
+	return _fine_orbit_active(offsurface, cam_dist)
+
+## The peak orbit fine working-set bytes seen this session (the MEASURED A/B proof; streamed via tex_telemetry).
+func fine_peak_working_bytes() -> int:
+	return _fine_peak_bytes
 
 ## Bake promoted-but-not-resident facets (nearest the axis first), ROW-SLICED, until the budget line. Continues an
 ## in-progress facet across updates. A facet needs a free/evictable layer to start; if all layers are in-cap
@@ -1491,6 +1591,11 @@ func tex_telemetry() -> Dictionary:
 		"cu_epoch": _slots_epoch,
 		"shot_on": _shot_on,
 		"shot_baked": _shot_baked.size(),
+		# COSMOS PLANET-VIEW P4 (FP_FAR_SKIN_FINE): the orbit fine working-set ledger (0 off the flag).
+		"fine_on": _fine_on,
+		"fine_resident": (_cu_slots.size() if _fine_on else 0),
+		"fine_bytes_kb": fine_working_bytes() / 1024,
+		"fine_peak_kb": _fine_peak_bytes / 1024,
 	}
 
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under

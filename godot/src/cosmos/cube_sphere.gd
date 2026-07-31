@@ -684,6 +684,27 @@ const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up
 const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
 const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
 
+## COSMOS PLANET-VIEW P4 (docs/COSMOS-PLANET-VIEW-DESIGN.md §3(A)/P4 — sharpen the blotchy far-orbit skin). From orbit the
+## planet wears the §2V base skin (BASE_TEXELS=16/facet ≈ 26 blocks/texel), so coastlines read as soft BLOBS. The CLOSE-UP
+## tier (FP_FACET_TEX_CLOSEUP: 128²/facet, 8× finer, worker-paced row-sliced bake, LRU-capped, in the FacetTexBaker ledger)
+## ALREADY bakes the sub-camera disc at orbit (its off-surface promotion), but the shell shader fades it out beyond CLOSEUP_FAR
+## (wc = smoothstep(cu_far,cu_near,v_cam) → 0 at orbit distances), so far-orbit shows only the coarse base. THIS flag reuses
+## that finer skin WHOLESALE (ZERO new textures — requires FP_FACET_TEX_CLOSEUP) and adds exactly two things: (1) a SELF-DRIVING
+## orbit promotion (FacetTexBaker._recompute_fine_orbit_want) that, only while off-surface at cam_dist > CLOSEUP_FAR, promotes
+## the FAR_SKIN_FINE_MAX nearest facets within FAR_SKIN_FINE_CAP_DEG of the sub-camera axis — the disc the player looks at —
+## and evicts everything else, so the orbit fine WORKING-SET is bounded to FAR_SKIN_FINE_MAX close-up layers; (2) a one-line
+## flag-gated shell-shader swap (wc = cu.a — the fine map shown wherever a facet has a resident slot + bake coverage, at ALL
+## distances, the SAME "texture everywhere" law the base wt already follows), so the already-baked fine skin is VISIBLE at
+## far-orbit. Orbit-only: below CLOSEUP_FAR / on the surface the shipped close-up promotion + fade run UNCHANGED. MEASURED /
+## NEVER-OOM: no new allocation (reuses the fixed close-up pool); the orbit fine working-set binds on REAL close-up-layer bytes
+## (FacetTexBaker.fine_working_bytes() ≤ FAR_SKIN_FINE_BYTES_MAX; FAR_SKIN_FINE_MAX × 128²-layer ≈ 1.9 MB). Off ⇒ the orbit
+## promotion never runs and the shell wc string is the shipped smoothstep VERBATIM ⇒ byte-identical (FLAT 6042/0). Gate:
+## verify_far_skin_fine.gd (G-FSF-BYTES / G-FSF-SELECT / G-FSF-ORBIT / G-FSF-SURFACE / G-FSF-OFF).
+const FP_FAR_SKIN_FINE := false
+const FAR_SKIN_FINE_MAX := 13             # orbit fine WORKING-SET cap (nearest sub-camera facets shown fine from orbit): 13 × 128²-layer ≈ 1.90 MB ≤ ceiling
+const FAR_SKIN_FINE_CAP_DEG := 12.0       # sub-camera disc half-angle the orbit fine set is drawn from (≤ CLOSEUP_CAP_DEG — the central disc)
+const FAR_SKIN_FINE_BYTES_MAX := 2 * 1024 * 1024   # NEVER-OOM ceiling for the orbit fine working-set (asserted against REAL close-up layer bytes)
+
 ## COSMOS TEXTURED-LOD V3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1/§2V.5: FP_PAGES_SHOT) — rebake the base + close-up
 ## texture PAGES as true box-downscales of the REAL surface shot (SurfaceShot.surface_shot: tint × static-shade, trees
 ## composited on top) instead of the FarPalette biome COLOUR average. This is what kills "biome colours" at the base
@@ -1687,6 +1708,42 @@ const SN_FOFF_RADIAL_FALL := false
 ## √(datum_gravity/k0) == ATMO_BRAKE_TERMINAL by construction (per-body generic). Single named const — dial live
 ## (raise toward the orbital DRAG_TERMINAL 55 once a pre-gen landing column removes the streaming constraint).
 const ATMO_BRAKE_TERMINAL := 20.0
+
+## DEV-FLIGHT CRUISE MODE (2026-07-31 dev request) — Elite-Dangerous-style SUPERCRUISE for the dev fly camera.
+## While DEV-FLYING in SPACE (radial altitude above the nearest body's surface > ATMO_TOP), HOLDING the C key
+## flies the player straight along the CAMERA LOOK direction (forward = the pitch-included lattice look dir the
+## shipped F-fly uses) at a speed that grows EXPONENTIALLY with distance from the nearest body's surface —
+## crawling just above the atmosphere, screaming across interplanetary gaps. RELEASE C ⇒ INSTANT STOP (the fly
+## path is kinematic, velocity is held at 0, so no input ⇒ no drift). Engage needs ALL of: dev-flight active +
+## in-space + C held. On the surface, in atmosphere, or when not dev-flying, C is a NO-OP (C is bound to nothing
+## else — grep-verified). Default FALSE ⇒ BYTE-IDENTICAL: the C key is never polled, the cruise branch is never
+## entered, the shipped fly/walk paths are byte-for-byte. Gate G-CRUISE (verify_cruise): the pure speed law +
+## engage predicate. LIVE-ONLY: the actual supercruise feel.
+const CRUISE_MODE := false
+## Cruise speed law consts (blocks/s; the model is 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks).
+##   speed(alt) = clamp(MIN · 2^(alt/BAND), MIN, MAX), alt = dist(camera → nearest body centre) − body radius.
+##   • MIN 200 — a brisk-but-controllable crawl just above ATMO_TOP (~ the natural LEO v_circ ≈ 260 b/s), so
+##     cruise is slow-yet-non-zero right at the vacuum boundary where you maneuver near a planet.
+##   • BAND 4000 — speed DOUBLES every 4000 blocks of altitude. The MAX cap is reached at
+##     alt = BAND·log2(MAX/MIN) ≈ 4000·log2(25) ≈ 18.6k blocks (~5% of the way to the Moon), so the first ~18k
+##     blocks are a smooth accelerating departure and the rest of the trip is at cap.
+##   • MAX 5000 — sized to the Earth→Moon gap (384400 blocks): at cap the crossing is 384400/5000 ≈ 77 s ≈ 1.3
+##     min, inside the requested ~1–3 min window (2100 b/s ⇒ 3 min … 6400 b/s ⇒ 1 min). NOT the naive 200000 —
+##     that would cross the (only ~384k-block) Earth–Moon gap in ~2 s, unusable at this 1:1000 scale.
+const CRUISE_SPEED_MIN := 200.0
+const CRUISE_SPEED_BAND := 4000.0
+const CRUISE_SPEED_MAX := 5000.0
+
+## Pure cruise SPEED LAW (blocks/s) at altitude `alt` (blocks above the nearest body's SURFACE). Monotone
+## increasing; == MIN at/below alt 0; doubles per CRUISE_SPEED_BAND; clamped to [MIN, MAX]. Flag-independent
+## (the gate drives it directly); the live cruise tick calls it with radial_altitude().
+static func cruise_speed(alt: float) -> float:
+	return clampf(CRUISE_SPEED_MIN * pow(2.0, alt / CRUISE_SPEED_BAND), CRUISE_SPEED_MIN, CRUISE_SPEED_MAX)
+
+## Pure ENGAGE PREDICATE: cruise runs iff dev-flight is active AND the player is in space AND the C key is held.
+## The live call ANDs this with CRUISE_MODE (flag off ⇒ never engaged). Flag-independent for the gate.
+static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
+	return dev_fly and in_space and c_held
 
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while

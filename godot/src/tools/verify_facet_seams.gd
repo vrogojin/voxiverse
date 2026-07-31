@@ -27,6 +27,7 @@ extends SceneTree
 ##   then REVERT the sed. Exits 0 all-pass / 1 on any failure.
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const FFR := preload("res://src/world/facet_far_ring.gd")   # COSMOS PLANET-VIEW §3 (B): FP_FARRING_LIMB_DENSE limb-ring selection
 const K := 24
 
 var _pass := 0
@@ -179,8 +180,73 @@ func _initialize() -> void:
 	_gate_twist_frame()    # G-TWIST-FRAME + G-CROSS-HEADING : frame-aware reframe_twist preserves world heading
 	await _gate_datum_collide()  # G-DATUM-COLLIDE : the physics floor the player stands on == the datum-baked render
 
+	_gate_limb_dense()     # G-LIMB-* : FP_FARRING_LIMB_DENSE silhouette-ring selection (pure) + orbit-only guard
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+## COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. Assert the PURE silhouette-ring selection (FacetFarRing.is_limb_facet):
+##  (1) a facet at the exact horizon tangent (φ = θ_h) is flagged; the sub-camera facet (φ ≈ 0) and a facet well inside the
+##      disc are NOT — the ring is a thin shell about the tangent, never the whole cap.
+##  (2) over ALL 3456 facet centre dirs at a representative orbit (alt 8000 ⇒ d = R + 8000), the flagged set is NON-EMPTY,
+##      BOUNDED (≤ LIMB_DENSE_MAX_FACETS and ≪ the visible-disc facet count), and every flagged facet lies within the band
+##      of the tangent — i.e. an O(√cap) ring, not O(cap).
+##  (3) the emit predicate is inert off-surface / flag-off: a fresh FacetFarRing (_offsurface=false, flag const false) has an
+##      EMPTY _limb_set after _refresh_limb_set(), so _is_limb_dense is false for every facet (byte-identical off-path).
+func _gate_limb_dense() -> void:
+	var r := FA.R_BLOCKS
+	var d := r + 8000.0                                    # representative near/far-orbit camera distance
+	var cos_th := r / d
+	var th := acos(cos_th)
+	var half := (PI * 0.5 / float(K)) * 0.5               # facet angular half-width
+	var band := FFR.LIMB_DENSE_BAND * half
+	# (1) pure-predicate sanity — flag the tangent, reject the interior and a facet a full band inside the tangent.
+	_ok(FFR.is_limb_facet(cos(th), cos_th, band), "G-LIMB-PURE: a facet AT the horizon tangent must be flagged")
+	_ok(not FFR.is_limb_facet(1.0, cos_th, band), "G-LIMB-PURE: the sub-camera facet (φ=0) must NOT be flagged")
+	_ok(not FFR.is_limb_facet(cos(th - 2.0 * band), cos_th, band), "G-LIMB-PURE: a facet a full 2·band inside the tangent must NOT be flagged")
+	_ok(not FFR.is_limb_facet(cos(th + 2.0 * band), cos_th, band), "G-LIMB-PURE: a facet a full 2·band beyond the tangent must NOT be flagged")
+	# (2) the flagged set over the whole globe is a bounded ring about the tangent (not empty, not the cap).
+	var ax := Vector3(0.37, 0.51, 0.77).normalized()      # an arbitrary sub-camera axis (not aligned to any facet)
+	var ring := 0
+	var disc := 0                                          # facets inside the visible cap (φ < θ_h) — the "whole cap" baseline
+	var worst_off := 0.0                                  # max |φ − θ_h| among flagged (must stay within band)
+	for face in range(6):
+		for a in range(K):
+			for b in range(K):
+				var fid := (face * K + a) * K + b
+				var c := _facet_centre(fid)
+				var dot := c.dot(ax)
+				var phi := acos(clampf(dot, -1.0, 1.0))
+				if phi < th:
+					disc += 1
+				if FFR.is_limb_facet(dot, cos_th, band):
+					ring += 1
+					worst_off = maxf(worst_off, absf(phi - th))
+	print("  G-LIMB-RING: d=%.0f θ_h=%.2f° band=%.2f°  ring=%d  disc(cap)=%d  worst|Δ|=%.3f°  cap=%d" % [
+		d, rad_to_deg(th), rad_to_deg(band), ring, disc, rad_to_deg(worst_off), FFR.LIMB_DENSE_MAX_FACETS])
+	_ok(ring > 0, "G-LIMB-RING: the silhouette ring must be non-empty at a representative orbit (got %d)" % ring)
+	_ok(ring <= FFR.LIMB_DENSE_MAX_FACETS, "G-LIMB-RING: ring %d must fit the NEVER-OOM cap %d (raise the cap or shrink the band)" % [ring, FFR.LIMB_DENSE_MAX_FACETS])
+	_ok(ring < disc / 2, "G-LIMB-RING: ring %d must be ≪ the visible cap %d (a thin shell, not the whole disc)" % [ring, disc])
+	_ok(worst_off <= band + 1.0e-6, "G-LIMB-RING: every flagged facet must lie within the band of the tangent (worst %.3f° > band %.3f°)" % [rad_to_deg(worst_off), rad_to_deg(band)])
+	# (3) off-surface / flag-off guard: a fresh node's _refresh_limb_set leaves _limb_set empty ⇒ _is_limb_dense false.
+	var ffr = FFR.new()
+	var fids := PackedInt32Array([0, 1, 2, 100, 500, 1000])
+	ffr._refresh_limb_set(fids)                            # _offsurface=false + _cam_set=false (defaults) ⇒ no selection
+	var any_dense := false
+	for fid in fids:
+		if ffr._is_limb_dense(fid):
+			any_dense = true
+	_ok(not any_dense, "G-LIMB-OFF: _refresh_limb_set must select NOTHING when off-surface / flag-off (byte-identical off-path)")
+	ffr.free()
+
+## COSMOS PLANET-VIEW §3 (B): a facet's centre unit direction — the mean of its four planar corner dirs, normalized (the
+## same construction FacetFarRing._facet_centre_dir uses). Used by _gate_limb_dense to probe the pure ring selection.
+func _facet_centre(fid: int) -> Vector3:
+	var s := Vector3.ZERO
+	for ci in range(4):
+		var c: Array = FA.facet_planar_corner(fid, ci)
+		s += Vector3(c[0], c[1], c[2])
+	return s.normalized()
 
 ## Live-placement mechanism proof: for EVERY seam, place the SAME surface g on both facets AT the true shared
 ## sphere edge point d̂ through the REAL placement function (FacetAtlas.world_to_lattice64 → lattice_to_world64)

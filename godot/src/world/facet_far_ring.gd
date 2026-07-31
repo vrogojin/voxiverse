@@ -17,6 +17,14 @@ extends Node3D
 
 const ENABLED := true
 const CELLS := 4                     # heightmap cells per facet edge (far LOD) — k=24 facets are small
+# COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE tuning (all DEAD with the flag off).
+const LIMB_DENSE_CELLS := 8          # silhouette-ring facets emit at this resolution (vs CELLS=4) so the limb reads round
+const LIMB_DENSE_BAND := 1.0         # limb-ring half-thickness in facet angular half-widths ⇒ a ~1-facet-thick ring
+                                     # (band_rad = this × the facet half-angle; |φ − θ_h| < band_rad flags the facet). The
+                                     # design's 1.5 gave a ~3-facet-thick ring (~148 facets); 1.0 is a true 1-facet ring.
+const LIMB_DENSE_MAX_FACETS := 128   # NEVER-OOM cap on the resident densified set. The full silhouette circumference at K=24
+                                     # is ~90 facets around, so a 1-facet ring is ~90–100 (NOT the design's optimistic 40–60);
+                                     # 128 gives headroom + the trim binds hard. Mesh delta ~+8 KB/facet ⇒ ≲ 1.0 MB peak.
 const RELIEF := 1.0                  # blocks of radial relief per (g − SEA_LEVEL)
 const BACK_CULL := 0.0               # front hemisphere only — back-side facets sit below the surface horizon
 const CAMERA_FAR := 9000.0           # the planet spans ~2R; the player camera far must reach it in faceted mode
@@ -54,7 +62,17 @@ var _benv_done: Dictionary = {}      # fid -> true (dense env envelope built, no
 # applied PER EMITTED VERTEX in _emit_cached, so a facet that transitions backstop→distant across a crossing drops the
 # sink automatically on the next rebuild (the cache is role-agnostic). NEVER populated with the flag off (zero cost).
 var _bpos_cache: Dictionary = {}     # fid -> PackedVector3Array (dense, ABSOLUTE, un-sunk)
-var _bcol_cache: Dictionary = {}     # fid -> PackedColorArray
+var _bcol_cache: Dictionary = {}
+# COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. `_limb_set` is the FROZEN silhouette-ring set (fid -> true) for the
+# CURRENT mesh build — facets straddling the horizon tangent, emitted at LIMB_DENSE_CELLS instead of CELLS=4. It is
+# recomputed on the MAIN thread at each rebuild / async dispatch (freeze contract like `_async_backstop`) so the worker
+# reads it race-free, and the dense `_limb_pos_cache`/`_limb_col_cache` are REAPED to it each refresh (resident ≤
+# LIMB_DENSE_MAX_FACETS ⇒ NEVER-OOM). The limb caches mirror `_ensure_cached`'s un-sunk construction at the denser
+# resolution (weld/env/planar), so a limb facet welds to its CELLS=4 coarse neighbours. All empty with the flag off
+# (or on the surface) ⇒ `_is_limb_dense` false everywhere ⇒ byte-identical.
+var _limb_set: Dictionary = {}       # fid -> true: on the current silhouette ring (drawn at LIMB_DENSE_CELLS)
+var _limb_pos_cache: Dictionary = {} # fid -> PackedVector3Array (LIMB_DENSE_CELLS grid, ABSOLUTE, un-sunk)
+var _limb_col_cache: Dictionary = {} # fid -> PackedColorArray     # fid -> PackedColorArray
 # COSMOS NO-PROTRUSION FIDELITY §1 F2 (FP_MID_DENSE): the set of facets currently PROMOTED to the dense grid because
 # they fall inside the ~ring-2 angular disc around the emit axis (the sub-camera / player point). A promoted facet
 # warms + emits from the SAME dense _bpos_cache/env builders the backstop uses (dense + ε-sunk envelope lower bound),
@@ -873,6 +891,7 @@ func _dispatch_async_rebuild() -> void:
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
 	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
+	_refresh_limb_set(_async_fids)   # COSMOS PLANET-VIEW §3 (B): freeze the silhouette-ring set on MAIN before the worker reads it (no-op off)
 	# COSMOS far-ring full coverage (§4): freeze the DENSE-TARGET role on the MAIN thread so the worker never reads
 	# `_excluded` live (set_pool_excluded may mutate it mid-run). `_async_backstop` = backstop ∪ mid-dense disc (the
 	# facets the worker warms + emits dense); `_async_mid` = the mid-dense-only subset (drawn COARSE as a fallback until
@@ -1161,6 +1180,149 @@ func _emit_dense(fid: int) -> bool:
 ## class). Off / not promoted ⇒ false.
 func _is_mid_dense(fid: int) -> bool:
 	return _mid_dense.has(fid) and not _is_backstop(fid)
+
+## COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE: is facet `fid` on the CURRENT silhouette ring? Reads ONLY the frozen
+## `_limb_set` (computed on the main thread at the last rebuild/dispatch), so it is race-free on the async worker. Empty
+## with the flag off / on the surface ⇒ false everywhere ⇒ byte-identical.
+func _is_limb_dense(fid: int) -> bool:
+	return _limb_set.has(fid)
+
+## COSMOS PLANET-VIEW §3 (B): the PURE silhouette-ring test, factored static so the headless gate drives it with synthetic
+## d/R. A facet whose centre makes angle φ = acos(centre·ĉ) with the sub-camera axis ĉ is on the limb ring when it is within
+## `band_rad` of the horizon-tangent angle θ_h = acos(cos_theta_h) (cos θ_h = R/d). Symmetric about the tangent so the ring
+## is ~1 facet thick on BOTH sides of the exact silhouette.
+static func is_limb_facet(centre_dot_c: float, cos_theta_h: float, band_rad: float) -> bool:
+	var phi := acos(clampf(centre_dot_c, -1.0, 1.0))
+	var th := acos(clampf(cos_theta_h, -1.0, 1.0))
+	return absf(phi - th) < band_rad
+
+## The cube-sphere facet angular HALF-width (rad) = half the facet edge angle (π/2K). The limb band is LIMB_DENSE_BAND × this.
+static func _facet_half_angle() -> float:
+	return (PI * 0.5 / float(FacetAtlas.K)) * 0.5
+
+## COSMOS PLANET-VIEW §3 (B): recompute the silhouette-ring set from the CURRENT emit-axis/horizon snapshot and REAP stale
+## dense caches. Called on the MAIN thread at each rebuild/dispatch (before the worker reads `_limb_set`), passed the visible
+## fids so it only ever considers emitted facets. ONLY off-surface (orbit) under the camera-set law; on the surface / with the
+## flag off it clears the set + reaps ALL limb caches ⇒ `_is_limb_dense` false everywhere (byte-identical). Bounds the resident
+## dense set to LIMB_DENSE_MAX_FACETS (closest-to-tangent kept) — NEVER-OOM. Rides the EXISTING cap-drift/re-emit cadence (no
+## new re-emit trigger): the axis/θ_h only change on a `_shell_snapshot`, so the ring is only recomputed when a rebuild fires.
+func _refresh_limb_set(fids: PackedInt32Array) -> void:
+	var want := {}
+	if CubeSphere.FP_FARRING_LIMB_DENSE and _offsurface and _cam_set and _emit_thetah_last >= 0.0:
+		var cos_th := cos(_emit_thetah_last)              # = R/d at the last snapshot (the horizon tangent)
+		var band := LIMB_DENSE_BAND * _facet_half_angle()
+		var picked: Array = []
+		for fid in fids:
+			var cd := _centre_dir(fid)
+			var dot: float = cd[0] * _emit_axis[0] + cd[1] * _emit_axis[1] + cd[2] * _emit_axis[2]
+			if is_limb_facet(dot, cos_th, band):
+				# key = angular distance from the exact tangent (so the cap trim keeps the truest limb facets)
+				picked.append([absf(acos(clampf(dot, -1.0, 1.0)) - _emit_thetah_last), int(fid)])
+		if picked.size() > LIMB_DENSE_MAX_FACETS:
+			picked.sort()                                 # ascending by |Δ|; keep the closest-to-tangent cap-many
+			picked.resize(LIMB_DENSE_MAX_FACETS)
+		for e in picked:
+			want[int((e as Array)[1])] = true
+	_limb_set = want
+	# Reap dense caches no longer on the ring so resident bytes track the CURRENT limb only (bounded ⇒ NEVER-OOM).
+	for fid in _limb_pos_cache.keys():
+		if not want.has(fid):
+			_limb_pos_cache.erase(fid)
+			_limb_col_cache.erase(fid)
+
+## COSMOS PLANET-VIEW §3 (B): build (once) facet `fid`'s DENSE (LIMB_DENSE_CELLS) ABSOLUTE-coord, UN-SUNK terrain grid,
+## mirroring `_ensure_cached`'s env/weld/planar branch structure at the higher resolution so it welds to its CELLS=4 coarse
+## neighbours (EDGE-CANON shared-node values are resolution-independent). Idempotent + pure sampling (profile_at_dir +
+## FacetAtlas only), so it is safe to warm lazily on the async worker (single-writer under the `_async_building` gate).
+func _ensure_limb_cached(fid: int) -> void:
+	if _limb_pos_cache.has(fid):
+		return
+	var cells := LIMB_DENSE_CELLS
+	var g: Array
+	if TierPlace.env_all_on():
+		g = _env_weld_grid(fid, cells)                    # min-envelope dense grid (same builder the backstop uses)
+	elif CubeSphere.FP_SHELL_WELD:
+		g = _weld_chord_arrays_n(fid, cells)              # radial weld from the shared corner dirs
+	else:
+		g = _planar_grid_arrays(fid, cells)               # shipped planar-corner path at the denser resolution
+	_limb_pos_cache[fid] = g[0]
+	_limb_col_cache[fid] = g[1]
+
+## COSMOS PLANET-VIEW §3 (B): the `cells`-parametrized twin of `_weld_chord_arrays` (which is hardcoded to CELLS). Same
+## radial weld, denser grid. Used only by the limb path (gated) so the shipped CELLS builder is untouched (byte-identical).
+func _weld_chord_arrays_n(fid: int, cells: int) -> Array:
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	var stride := cells + 1
+	for gj in range(stride):
+		for gi in range(stride):
+			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+	return [pos, col]
+
+## COSMOS PLANET-VIEW §3 (B): the `cells`-parametrized twin of `_ensure_cached`'s shipped planar-corner path. Same bilerp +
+## radial-relief construction, denser grid. Used only by the limb path (gated) so the shipped builder is untouched.
+func _planar_grid_arrays(fid: int, cells: int) -> Array:
+	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
+	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
+	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
+	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
+	var stride := cells + 1
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var s := float(gi) / float(cells)
+			var t := float(gj) / float(cells)
+			var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
+			var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
+			var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
+			var ln := sqrt(bx * bx + by * by + bz * bz)
+			var dx := bx / ln; var dy := by / ln; var dz := bz / ln
+			var prof := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
+			var g := int(prof.x)
+			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))
+			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+	return [pos, col]
+
+## COSMOS PLANET-VIEW §3 (B): expand a limb facet's dense grid into the fast-path tri soup (same two tris/cell, same winding,
+## same per-vertex colours as `_emit_cached`) and append to `_build_fast`'s packed arrays — the limb analogue of
+## `_append_backstop_tris`. Un-sunk (ε-sunk under env_all, matching the coarse emit) so it welds to the coarse neighbours.
+func _append_limb_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
+		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
+	_ensure_limb_cached(fid)
+	var gp: PackedVector3Array = _sunk_positions(_limb_pos_cache[fid]) if TierPlace.env_all_on() else _limb_pos_cache[fid]
+	var gc: PackedColorArray = _limb_col_cache[fid]
+	var cells := LIMB_DENSE_CELLS
+	var stride := cells + 1
+	var tex := _tex_on()
+	var t_a := 0; var t_b := 0; var t_k := 1
+	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			pos.push_back(gp[i0]); pos.push_back(gp[i2]); pos.push_back(gp[i1])
+			pos.push_back(gp[i1]); pos.push_back(gp[i2]); pos.push_back(gp[i3])
+			col.push_back(gc[i0]); col.push_back(gc[i2]); col.push_back(gc[i1])
+			col.push_back(gc[i1]); col.push_back(gc[i2]); col.push_back(gc[i3])
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv.push_back(Vector2(u0, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v0))
+				uv.push_back(Vector2(u1, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v1))
+				for _i in range(6):
+					uv2.push_back(fuv2)
 
 # --- COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3): occlusion-cull covered backstop cells -------------------
 
@@ -1468,6 +1630,7 @@ func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
 	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the close-up slot map for this build (no-op off)
 	var fids := visible_fids(_emit_cached_only)   # S1b: cache-filtered in the true-orbit progressive path, full set otherwise (shipped)
+	_refresh_limb_set(fids)          # COSMOS PLANET-VIEW §3 (B): freeze the silhouette-ring set + reap stale limb caches (no-op off)
 	_emitted.clear()
 	_emitted_backstop.clear()   # TIER-DEPTH P1: record which fids this build draws SUNK (the make-before-break gate reads it)
 	for fid in fids:
@@ -1496,6 +1659,8 @@ func _rebuild_full() -> void:
 		for fid in fids:
 			if _emit_dense(fid):   # FP_MID_DENSE: dense facets (backstop ∪ ready mid-dense) carry the denser tri count
 				tris += extra
+	if CubeSphere.FP_FARRING_LIMB_DENSE and not _limb_set.is_empty():
+		tris += _limb_set.size() * (LIMB_DENSE_CELLS * LIMB_DENSE_CELLS - CELLS * CELLS) * 2   # limb-ring facets carry the denser tri count
 	_push_event("sync", build_us, swap_us, tris * 3)   # T2e: verts = 3·tris (cheap; no surface read-back on the crossing frame)
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
 
@@ -1562,6 +1727,8 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 		# vertex order/winding matches _emit_cached exactly, so the later global generate_normals is bit-identical.
 		if _emit_dense(fid):   # FP_MID_DENSE: backstop ∪ ready mid-dense → the dense sunk expansion (off the memcpy fast path)
 			_append_backstop_tris(pos, col, fid, uv, uv2)
+		elif _is_limb_dense(fid):   # COSMOS PLANET-VIEW §3 (B): a limb facet → the dense un-sunk expansion (off the memcpy fast path)
+			_append_limb_tris(pos, col, fid, uv, uv2)
 		else:
 			_ensure_tri_cached(fid)
 			pos.append_array(_tri_pos_cache[fid])
@@ -2416,6 +2583,13 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 			pos = _sunk_positions(_bpos_cache[fid])
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
+	elif _is_limb_dense(fid):
+		# COSMOS PLANET-VIEW §3 (B): a silhouette-ring facet emits its DENSE (LIMB_DENSE_CELLS) un-sunk grid so the limb
+		# reads round. ε-sunk under env_all exactly like the coarse path below, so it welds to its CELLS=4 neighbours.
+		_ensure_limb_cached(fid)
+		pos = _sunk_positions(_limb_pos_cache[fid]) if TierPlace.env_all_on() else _limb_pos_cache[fid]
+		col = _limb_col_cache[fid]
+		cells = LIMB_DENSE_CELLS
 	else:
 		# NO-PROTRUSION §0.3: under FP_ENV_ALL the coarse HORIZON cache is an envelope lower bound too — apply the
 		# SAME ε sink the backstop gets so the retained emit-time sink covers the between-fine-sample residual (R-A).

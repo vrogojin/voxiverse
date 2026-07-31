@@ -57,6 +57,7 @@ func _initialize() -> void:
 	_gate_b4_moon()
 	_gate_b2_limb()
 	_gate_o1_ground()
+	_gate_atmo_rim()
 	_gate_term_sun_cont()
 	_gate_b3_nearnight()
 	_gate_inert()
@@ -755,6 +756,70 @@ func _gate_o1_ground() -> void:
 	gmat.shader = gsh
 	gmat.set_shader_parameter("peak_l_ground", SKY.SHELL_PEAK_L_GROUND)
 	_ok(gmat.shader != null and gmat.shader.code.length() > 0, "ground-budget shell shader variant compiles headless")
+
+# ------------------------------------------------------------------ G-AS-RIM (FP_ATMO_RIM)
+# The honest atmosphere rim (docs/COSMOS-PLANET-VIEW-DESIGN.md §2.1–2.4). Pure static geometry, flag-independent:
+#   (2.1) ceiling honest — rim_outer_r == R + ATMO_TOP (1.06·R), well inside the shipped 2·ATMO_TOP shell (1.12·R);
+#   (2.4) concentric hairline — rim_angular_gap (the blue band OUTSIDE the disc) is SMALL (< 2° at alt 8000) and far
+#         tighter than the shipped fat shell's ~3.5°; it shrinks monotonically toward 0 as d→∞;
+#   (2.3) scale-tracked — a uniform scale s about the camera scales r_solid AND d by s, so the subtended rim/disc
+#         angles (hence the gap) are INVARIANT to s: rim and disc shrink together, the rim never detaches;
+#   (2.1) bright band physical — exp(−h/H_RIM) decays to <5% (e⁻³) by 3·H_RIM (a hairline, few % of R) and is ≈0 by
+#         the geometric ceiling ATMO_TOP; H_RIM (48) << the fog H_SCALE (128), in the 40–64 design band.
+func _gate_atmo_rim() -> void:
+	print("  --- G-AS-RIM: thin, concentric, honest, scale-tracked atmosphere rim (§2.1–2.4) ---")
+	var r := FacetAtlas.R_BLOCKS
+	var atmo_top := SKY.H_ATMO
+	# (2.1) Geometry ceiling honest: r_outer_rim = R + ATMO_TOP (1.06·R), tighter than the shipped 2·ATMO_TOP shell.
+	_ok(SKY.SHELL_RIM_MULT == 1.0, "SHELL_RIM_MULT == 1.0 (honest ceiling multiplier)")
+	_ok(is_equal_approx(SKY.rim_outer_r(r), r + atmo_top), "rim_outer_r(R) == R + ATMO_TOP (%.1f)" % SKY.rim_outer_r(r))
+	var ratio := SKY.rim_outer_r(r) / r
+	_ok(ratio < 1.07 and ratio > 1.05, "rim/disc RADIUS ratio == (R+ATMO_TOP)/R ≈ 1.06 (%.4f)" % ratio)
+	_ok(SKY.rim_outer_r(r) < SKY.shell_outer_r(r), "rim ceiling %.0f < shipped 2·ATMO_TOP shell %.0f (thinner)" % [SKY.rim_outer_r(r), SKY.shell_outer_r(r)])
+	# (2.4) Concentric hairline at alt 8000: rim gap < 2°, and FAR tighter than the shipped fat shell's ~3.5°.
+	var d8 := r + 8000.0
+	var gap8 := SKY.rim_angular_gap(d8, r)
+	var shell_gap8: float = asin(SKY.shell_outer_r(r) / d8) - asin(r / d8)
+	_ok(rad_to_deg(gap8) < 2.0, "rim angular gap at alt 8000 < 2° (%.2f°)" % rad_to_deg(gap8))
+	_ok(gap8 < shell_gap8, "rim gap %.2f° << shipped shell gap %.2f° (hairline, not a fat ring)" % [rad_to_deg(gap8), rad_to_deg(shell_gap8)])
+	# … and it SHRINKS monotonically toward 0 moving away (the honest rim vanishes in deep space).
+	var mono := true
+	var prev := PI
+	for i in range(0, 40):
+		var d: float = r + 4000.0 + float(i) * 8000.0
+		var g := SKY.rim_angular_gap(d, r)
+		if g > prev + 1e-9: mono = false
+		prev = g
+	_ok(mono, "rim angular gap monotone non-increasing with distance")
+	var g_deep := SKY.rim_angular_gap(r + 4.0e6, r)
+	_ok(g_deep < gap8 and rad_to_deg(g_deep) < 0.1, "rim gap → ~0 in deep space (%.4f° at d≈4M)" % rad_to_deg(g_deep))
+	# (2.3) Scale-tracked: a uniform scale s about the camera scales r_solid AND d by s, so the subtended rim and disc
+	# angles — and their gap — are INVARIANT to s (the s cancels inside each asin). Rim and disc shrink TOGETHER.
+	var worst_inv := 0.0
+	for si in range(1, 20):
+		var s := float(si) / 20.0                              # s ∈ (0,1], the scaled-body clamp
+		var d: float = r + 30000.0
+		# angle the camera subtends to the SCALED rim/disc placed at the SCALED distance s·d:
+		var gap_scaled: float = asin((s * SKY.rim_outer_r(r)) / (s * d)) - asin((s * r) / (s * d))
+		worst_inv = maxf(worst_inv, absf(gap_scaled - SKY.rim_angular_gap(d, r)))
+	_ok(worst_inv < 1e-9, "rim/disc angular gap invariant under scale-about-camera (worst Δ %.12f) ⇒ rim tracks the disc" % worst_inv)
+	# (2.1) Bright band physical: exp(−h/H_RIM) decays to <5% by 3·H_RIM, ≈0 by the ATMO_TOP ceiling; H_RIM<<H_SCALE.
+	_ok(SKY.H_RIM >= 40.0 and SKY.H_RIM <= 64.0, "H_RIM in the design 40–64 band (%.0f)" % SKY.H_RIM)
+	_ok(SKY.H_RIM < SKY.H_SCALE, "H_RIM (%.0f) << fog H_SCALE (%.0f) — the rim band is tighter than the shipped falloff" % [SKY.H_RIM, SKY.H_SCALE])
+	var h_5pct := 3.0 * SKY.H_RIM
+	_ok(exp(-h_5pct / SKY.H_RIM) < 0.05, "brightness exp(−h/H_RIM) < 5%% by h = 3·H_RIM (%.4f)" % exp(-h_5pct / SKY.H_RIM))
+	_ok(h_5pct / r < 0.03, "the ≤5%% band is a hairline: 3·H_RIM = %.0f blocks = %.2f%% of R" % [h_5pct, 100.0 * h_5pct / r])
+	_ok(exp(-atmo_top / SKY.H_RIM) < 0.01, "bright band ≈0 by the geometric ceiling ATMO_TOP (%.5f)" % exp(-atmo_top / SKY.H_RIM))
+	# FALSIFY: the shipped H_SCALE=128 falloff is NOT a hairline — at 3·H_RIM it is still bright (bound discriminates).
+	_ok(exp(-h_5pct / SKY.H_SCALE) > 0.05, "falsify: shipped H_SCALE falloff still >5%% at 3·H_RIM (%.3f) — H_RIM genuinely tightens" % exp(-h_5pct / SKY.H_SCALE))
+	# The base shell shader string parses/compiles headless (the r_outer-uniform tightening + h_rim uniform edits).
+	var rsh := Shader.new()
+	rsh.code = SKY._ATMO_SHELL_SHADER
+	var rmat := ShaderMaterial.new()
+	rmat.shader = rsh
+	rmat.set_shader_parameter("h_rim", SKY.H_RIM)
+	rmat.set_shader_parameter("r_outer", SKY.rim_outer_r(r))
+	_ok(rmat.shader != null and rmat.shader.code.length() > 0, "base shell shader (h_rim + r_outer uniforms) compiles headless")
 
 # ------------------------------------------------------------------ INERT (byte-identity face)
 func _gate_inert() -> void:

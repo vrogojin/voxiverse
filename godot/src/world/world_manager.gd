@@ -3001,6 +3001,18 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	# active facet transform (or the fixed-frame −anchor), so re-reading it every frame is inherently fresh. Off ⇒ never
 	# computed / pushed ⇒ byte-identical. The GDScript-fallback path (no facet ring) leaves planet_centre at the origin,
 	# which degrades the unified normal to the shipped normalize(v_wp) — safe, self-consistent.
+	# COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): the same TRUE planet centre push, but for the
+	# ISOLATED normal-only fix (shipped shade law, unified off). Feeds BOTH the module atlas twin AND the BlockMaterials
+	# fallback/residual/debris twins (which the unified path above never covered), so the near ground's day/night
+	# terminator uses the true radial — killing the bright-at-night facet, the reversed east↔west sweep (the wrong
+	# outward-normal inverts the mu gradient), and the re-bake lag (the centre is now refreshed EVERY frame, never
+	# frozen at 0). Off ⇒ never computed / pushed ⇒ byte-identical. render_centre() folds the active facet transform
+	# (or the fixed-frame −anchor) so re-reading it every frame is inherently fresh, exactly like the far shell's MODEL·0.
+	if CubeSphere.near_centre_fix_on() and not CubeSphere.FP_SHADE_UNIFIED and _facet_ring != null:
+		var ncentre: Vector3 = _facet_ring.render_centre()
+		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):
+			_module_world.call("set_near_daylight_planet_centre", ncentre)
+		BlockMaterials.set_near_daylight_planet_centre(ncentre)
 	if CubeSphere.FP_SHADE_UNIFIED and _facet_ring != null:
 		var centre: Vector3 = _facet_ring.render_centre()
 		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):

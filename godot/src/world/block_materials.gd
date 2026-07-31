@@ -183,12 +183,29 @@ static func _standard_daylight(block_id: int) -> ShaderMaterial:
 		mat.set_shader_parameter("emission_energy", float(rd.get("emissive_glow", 1.0)))
 	return mat
 
+## COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): derive the true-radial-normal variant of a shipped
+## near-daylight shader by a PURE STRING TRANSFORM — insert the planet_centre uniform after the sun_dir uniform and
+## replace the origin-assuming pseudo-normal normalize(v_wp) with the true planet radial normalize(v_wp − planet_centre)
+## (the SAME normal the far shell derives from MODEL·0). Every other byte (the shipped shade law) is untouched, and with
+## planet_centre == 0 it is numerically identical to the shipped shader (safe default). Applied ONLY under
+## FP_NIGHT_TERRAIN_CENTRE; off ⇒ the shipped string verbatim ⇒ byte-identical.
+static func _centre_fix_code(src: String) -> String:
+	var out := src.replace(
+		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\n",
+		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);\n")
+	return out.replace("normalize(v_wp)", "normalize(v_wp - planet_centre)")
+
+## The near-daylight shader source for a shipped variant, centre-corrected under FP_NIGHT_TERRAIN_CENTRE. Exposed so
+## the gate can build BOTH variants without toggling the const. Off ⇒ the shipped string verbatim (byte-identical).
+static func near_daylight_code(src: String, centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
+	return _centre_fix_code(src) if centre_fix else src
+
 ## Build one OPAQUE near-daylight twin (_textured / _solid look). `tex` null ⇒ flat swatch (no texture).
 ## `albedo` is the base albedo_color (white for a textured block, the swatch colour for a no-tile block).
 ## Registered in _daylight_twins for the per-frame sun_dir feed.
 static func _daylight_opaque(tex: Texture2D, albedo: Color, use_vertex_color: bool) -> ShaderMaterial:
 	var sh := Shader.new()
-	sh.code = _NEAR_DAYLIGHT_OPAQUE_SHADER
+	sh.code = near_daylight_code(_NEAR_DAYLIGHT_OPAQUE_SHADER)
 	var m := ShaderMaterial.new()
 	m.shader = sh
 	if tex != null:
@@ -201,6 +218,8 @@ static func _daylight_opaque(tex: Texture2D, albedo: Color, use_vertex_color: bo
 	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
 	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
 	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
+		m.set_shader_parameter("planet_centre", Vector3.ZERO)   # seeded 0 (== shipped); fed the true centre per frame
 	_daylight_twins.append(m)
 	return m
 
@@ -209,7 +228,7 @@ static func _daylight_opaque(tex: Texture2D, albedo: Color, use_vertex_color: bo
 ## (glass/ice) cull_back — mirroring the shipped material's culling exactly.
 static func _daylight_translucent(tex: Texture2D, color: Color, double_sided: bool) -> ShaderMaterial:
 	var sh := Shader.new()
-	sh.code = _NEAR_DAYLIGHT_TRANSLUCENT_DS_SHADER if double_sided else _NEAR_DAYLIGHT_TRANSLUCENT_BACK_SHADER
+	sh.code = near_daylight_code(_NEAR_DAYLIGHT_TRANSLUCENT_DS_SHADER if double_sided else _NEAR_DAYLIGHT_TRANSLUCENT_BACK_SHADER)
 	var m := ShaderMaterial.new()
 	m.shader = sh
 	if tex != null:
@@ -221,6 +240,8 @@ static func _daylight_translucent(tex: Texture2D, color: Color, double_sided: bo
 	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
 	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
 	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
+		m.set_shader_parameter("planet_centre", Vector3.ZERO)   # seeded 0 (== shipped); fed the true centre per frame
 	_daylight_twins.append(m)
 	return m
 
@@ -233,6 +254,19 @@ static func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	for m in _daylight_twins:
 		if m != null:
 			m.set_shader_parameter("sun_dir", sun_dir)
+
+## COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): feed the TRUE planet centre (in the current render
+## frame) into EVERY near-field daylight twin each frame, so their radial normal n = normalize(v_wp − planet_centre)
+## matches the far shell's MODEL·0 normal and can NEVER go stale across a facet crossing / floating-origin re-anchor
+## (the "lag / fades-on-re-bake" symptom). No-op unless FP_NEAR_DAYLIGHT and FP_NIGHT_TERRAIN_CENTRE (the shipped
+## shader has no planet_centre uniform ⇒ the set would be inert anyway) ⇒ flag-off byte-identical. Forwarded from
+## WorldManager at the SAME per-frame site as the sun_dir feed.
+static func set_near_daylight_planet_centre(centre: Vector3) -> void:
+	if not (CubeSphere.FP_NEAR_DAYLIGHT and CubeSphere.FP_NIGHT_TERRAIN_CENTRE):
+		return
+	for m in _daylight_twins:
+		if m != null:
+			m.set_shader_parameter("planet_centre", centre)
 
 ## The COSMOS M1 bend material (§3.4): a ShaderMaterial mirroring _standard's look (unshaded,
 ## textured / flat-swatch / translucent, optional emission) with the shared camera-centred sphere

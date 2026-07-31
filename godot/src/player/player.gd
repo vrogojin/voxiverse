@@ -2232,7 +2232,12 @@ func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
 	var clock: CosmosEphemeris.CosmosClock = world.cosmos_clock()
 	if clock == null:
 		return false
-	var up_bf := global_position                    # planet centred at world origin ⇒ world pos == body-fixed surface vector
+	# COSMOS set_time FLOATING-ORIGIN FIX: the planet centre is at planet_render_centre() (NOT world origin) once the
+	# floating origin re-anchors on a long cruise / at high altitude — so raw global_position is NOT the body-fixed
+	# surface vector there (set_time then solves the local hour angle from a wrong longitude → wrong time of day far
+	# from spawn). Subtract the render centre exactly as the sky's cam_rel does (FP_SKY_PLANET_CENTRE), so set_time
+	# tracks the player's TRUE longitude everywhere. At spawn planet_render_centre()==0 ⇒ unchanged.
+	var up_bf := global_position - planet_render_centre()
 	if up_bf.length() < 1.0e-6:
 		return false
 	var t_eff := clock.now()                         # solve relative to the current (possibly already-offset) phase

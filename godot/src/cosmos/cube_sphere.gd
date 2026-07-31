@@ -358,6 +358,23 @@ const FP_RADIAL_DATUM := false
 ## G-D2-SHAPE (flag-on near mesh == flag-off mesh + s·ŷ per vertex EXACTLY — no terracing can exist by construction).
 const FP_DATUM_BAKE := false
 
+## COSMOS FS2′ EDGE WELD (docs/COSMOS-FACET-SEAMS-V2.md §2.2) — the MISSING near-LOD datum. FP_DATUM_BAKE lifts the
+## ACTIVE facet's near VoxelTerrain to the radial datum (VoxelMesherBlocky.set_facet_datum_bake per-vertex `y += s`)
+## and the skin (`+s` in _lattice_world) and the far ring (radial by construction) all agree — but the FacetLodBuilder
+## tier (the near rings of NON-active facets: LOD megablock tiles + ridge aprons) was NEVER made datum-aware. Its
+## tiles are meshed by a builder-owned VoxelMesherBlocky that never receives set_facet_datum_bake, and its aprons snap
+## the ridge top to `ceil(g/fs)·fs` in CELL space (facet_lod_builder._build_apron / _build_job) — the PLANE datum. So
+## at a facet border the active (lifted, radial) surface stands up to the sagitta s (~5-7 blocks) ABOVE the un-lifted
+## neighbour LOD/apron; the uncovered vertical band shows the black scene background = the seam BLACK LINE + BLACK
+## CLIFF FACE. When true (rides FP_DATUM_BAKE): the LOD builder pushes the per-fid datum bake onto its own mesher
+## before each tile build (lifting LOD tiles `+s`, mirroring the active mesher) AND the apron ridge/top gains `+s`
+## (FacetAtlas.datum_lift, the SAME lift the near mesh bakes) — so every near tier sits on ONE radial datum and the
+## apron always COVERS the lifted near surface (residual = the ceil megablock snap ∈ [0,fs), never a downward gap).
+## Default OFF ⇒ no set_facet_datum_bake call + apron lift term 0 ⇒ byte-identical (FLAT 6042/0). Self-consistent with
+## the bake off too: datum_lift≡0 / datum_bake_params.enabled=false ⇒ no lift on either surface. Gate: verify_facet_
+## seams.gd _gate_datum_edge_weld (the un-welded apron leaves a gap up to s; the welded apron covers to within fs).
+const FP_DATUM_EDGE_WELD := false
+
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
 ## (50-block-pitch) far quad for the whole deferred-rebuild window (~0.1-1 s) while near meshes are already

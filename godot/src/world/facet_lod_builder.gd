@@ -190,6 +190,13 @@ func _build_job(job: Dictionary) -> Dictionary:
 	buf.call("set_channel_depth", 0, 1)   # CHANNEL_TYPE, DEPTH_16_BIT
 	var gen: Object = job["gen"]
 	gen.call("generate_block", buf, Vector3(job["ox"], job["oy"], job["oz"]), job["lod"])
+	# COSMOS FS2′ EDGE WELD (FP_DATUM_EDGE_WELD): lift this tile's megablock surface onto the radial datum by
+	# pushing THIS fid's per-vertex datum bake onto the builder's own mesher — the SAME hook module_world sets on
+	# the active VoxelTerrain, so a neighbour LOD ring welds to the datum-baked active facet instead of standing a
+	# sagitta below it. datum_bake_params returns {enabled:false} when FP_DATUM_BAKE is off ⇒ no lift. OFF (flag) ⇒
+	# this call never runs ⇒ byte-identical. Serial on the builder thread; params are a frozen-atlas pure reader.
+	if CubeSphere.FP_DATUM_EDGE_WELD and _mesher.has_method("set_facet_datum_bake"):
+		_mesher.call("set_facet_datum_bake", FacetAtlas.datum_bake_params(int(job["fid"])))
 	var mesh: Mesh = _mesher.call("build_mesh", buf, [], {}) as Mesh
 	var verts := 0
 	var tris := 0
@@ -249,6 +256,15 @@ func _build_apron(job: Dictionary) -> Dictionary:
 		var g0 := int(prof0.x); var g1 := int(prof1.x)
 		var top0 := float(int(ceil(float(g0) / fs)) * s_max)            # snap UP to the s_max megablock top grid
 		var top1 := float(int(ceil(float(g1) / fs)) * s_max)
+		# COSMOS FS2′ EDGE WELD (FP_DATUM_EDGE_WELD): lift the apron ridge/top onto the SAME radial datum the near
+		# mesh bakes (play y = cell y + s), so the owner strip meets the datum-baked active facet at the ridge with no
+		# uncovered vertical band (the black seam line/cliff). The whole strip rides the ridge-sample lift in Y — the
+		# oO/nO outers derive from rA horizontally, so they inherit it; the residual over the strip width is bounded by
+		# the s-gradient (≤0.034/block ⇒ ≤~0.3 over fs) and tucked by the outer skirt. datum_lift≡0 when FP_DATUM_BAKE
+		# is off, and the whole term is gated ⇒ OFF = byte-identical.
+		if CubeSphere.FP_DATUM_EDGE_WELD:
+			top0 += FacetAtlas.datum_lift(owner, a0.x, a0.z)
+			top1 += FacetAtlas.datum_lift(owner, a1.x, a1.z)
 		# far water iff g < SEA_LEVEL — STRICT (g==SEA_LEVEL is dry beach/shelf sand in near); `<=` regressed the boundary.
 		var c0 := FarPalette.color_for(g0, int(prof0.y), prof0.w, g0 < sea)
 		var c1 := FarPalette.color_for(g1, int(prof1.y), prof1.w, g1 < sea)

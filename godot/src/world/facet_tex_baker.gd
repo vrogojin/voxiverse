@@ -1641,52 +1641,31 @@ func _update_band_parallel() -> void:
 ## under the mutex). sample_columns (C++) is re-entrant by godot_voxel's threaded-generator design; TreeGen/FarPalette
 ## reads are static + read-only (LUTs built on main). No residency dict is touched here.
 func _pbm_compute(i: int) -> void:
+	# GDScript terrain sample (SurfaceShot: column_profile + FarPalette + TreeGen, per-call ctx) — read-only static
+	# data, so it RUNS IN PARALLEL across worker threads (unlike the C++ sample_columns, which serialises on a lock).
 	var fid := int(_pbm_fid[i])
 	var tex := _bm_texels
 	var nx := int(_pbm_nx[i])
 	var ny := int(_pbm_ny[i])
 	var lc: PackedVector2Array = _pbm_lc[i]
 	var have_edits: bool = not _edit_snap.is_empty()
-	var packed := PackedInt64Array()
-	var lxs := PackedInt32Array()
-	var lzs := PackedInt32Array()
-	packed.resize(nx * ny)
-	lxs.resize(nx * ny)
-	lzs.resize(nx * ny)
-	for by in range(ny):
-		var t := (float(by) + 0.5) / float(ny)
-		var base := by * nx
-		for bx in range(nx):
-			var s := (float(bx) + 0.5) / float(nx)
-			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
-			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
-			lxs[base + bx] = lx
-			lzs[base + bx] = lz
-			packed[base + bx] = _pack_xz(lx, lz)
-	var res: Dictionary = _sampler.call(fid, packed)
-	var cols: PackedColorArray = res["colors"]
 	var ctx = TerrainConfig.GenCtx.new(0, fid)
 	var bytes := PackedByteArray()
 	bytes.resize(tex * tex)
 	bytes.fill(0)
 	for by in range(ny):
-		var base := by * nx
+		var t := (float(by) + 0.5) / float(ny)
 		var row_off := by * tex
 		for bx in range(nx):
-			var k := base + bx
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
 			var bid := -1
 			if have_edits:
-				bid = int(_edit_snap.get(Vector2i(lxs[k], lzs[k]), -1))
+				bid = int(_edit_snap.get(Vector2i(lx, lz), -1))
 			if bid < 0:
-				var deco := TreeGen.top_decoration(lxs[k], lzs[k], ctx)
-				if deco != BlockCatalog.AIR:
-					bid = deco
-			var idx: int
-			if bid >= 0:
-				idx = FarPalette.far_color_index_of_block(bid) + 1
-			else:
-				idx = FarPalette.far_color_index(cols[k]) + 1
-			bytes[row_off + bx] = idx
+				bid = int(SurfaceShot.surface_shot(fid, lx, lz, ctx)["block_id"])
+			bytes[row_off + bx] = FarPalette.far_color_index_of_block(bid) + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes
 	_pbm_mutex.unlock()

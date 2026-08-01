@@ -601,10 +601,10 @@ const FP_BAND_BLOCK_MAP := false
 ## stays pattern-textured). Requires FP_BAND_BLOCK_MAP ∧ FP_SKIN_SSE. NEVER-OOM: BAND_LAYERS×BAND_TEXELS² L8, fixed.
 const FP_SKIN_FLATCOLOR := false
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
-const BAND_LAYERS := 400                   # grown (user RAM budget); 400x2=800 band_facet+band_n vec2 uniforms < ~1024 frag limit; 400x512^2 L8 = 100MB
+const BAND_LAYERS := 180                   # known-good under the GPU array + fragment-uniform limits; growing past this needs a data-texture reverse-map (not uniform arrays)
 const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 110 * 1024 * 1024   # 400-layer L8 band GPU + staging
-const BAND_PROMOTE_DIST := 8000.0          # promote the sharp band from higher/wider orbit (bigger no-coarse-zone region)
+const BAND_BYTES_MAX := 48 * 1024 * 1024    # 180-layer L8 band
+const BAND_PROMOTE_DIST := 3600.0          # FP_SKIN_SSE band promote reach (blocks)
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)

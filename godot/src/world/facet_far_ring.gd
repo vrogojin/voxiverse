@@ -3210,7 +3210,7 @@ const _FLAT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
 "
 const _FINE_UNIFORM := "uniform sampler2DArray fine_map : filter_nearest;\n"
 const _FINE_ELSE := "\t} else {
-\t\tvec2 _q = floor(v_uv * 2.0);
+\t\tvec2 _q = clamp(floor(v_uv * 2.0), 0.0, 1.0);
 \t\tint _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
 \t\tivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
 \t\tint _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);

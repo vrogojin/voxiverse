@@ -622,8 +622,43 @@ static func band_layers() -> int:
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
 const BAND_LAYERS := 180                   # known-good under the GPU array + fragment-uniform limits; growing past this needs a data-texture reverse-map (not uniform arrays)
 const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 70 * 1024 * 1024    # 240-layer L8 band (240x512^2 = 63MB + staging)
-const BAND_PROMOTE_DIST := 8000.0          # FP_SKIN_SSE band promote reach (blocks) — reaches higher orbit to fill the 512-layer band
+const BAND_BYTES_MAX := 48 * 1024 * 1024    # shipped 180-layer L8 band ceiling (180x512^2 = 47.2MB + staging) — the byte-off value
+const BAND_BYTES_MAX_BIG := 70 * 1024 * 1024   # FP_BAND_META_TEX 240-layer ceiling (240x512^2 = 63MB + staging)
+## Effective band byte ceiling — tied to band_layers() so the flag-OFF gate keeps the shipped 48MB (Fable audit F3:
+## don't enlarge the NEVER-OOM ceiling unconditionally, or a flag-off over-alloc bug hides under a 70MB roof).
+static func band_bytes_max() -> int:
+	return BAND_BYTES_MAX_BIG if FP_BAND_META_TEX else BAND_BYTES_MAX
+## FP_SKIN_SSE band promote reach (blocks). 3600 ≈ 2.5·K_px — a band texel (1 block) stays ≳ 1 px only this close;
+## beyond it the whole-planet FINE tier (FP_PLANET_MAP, 3 blk/texel) owns the disc. Fable audit F1: promote 8000
+## pulled the SUB-PIXEL band over the nadir quad at mid-orbit (each band facet = 174k shots, worker-priority over
+## fine, uncommitted want-facets fell to the pale base) → the washed centre-quad. Kept at the shipped 3600 for BOTH
+## flag states (also fixes F3: the 8000 bump was unconditional, changing flag-off FP_SKIN_FLATCOLOR residency).
+const BAND_PROMOTE_DIST := 3600.0
+
+## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
+## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
+## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted
+## by the SAME map skin (band→fine→base) as the heightfield; smooth vertices carry radial density-gradient normals for
+## true relief lighting. NEVER-OOM: per-tier facet caps + SMOOTH_BYTES_MAX, fixed at creation. Default false ⇒ the
+## FacetSmoothTier is never constructed, byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd.
+const FP_FAR_SMOOTH := false
+## FP_FAR_SMOOTH_OVERHANG — the edit-cluster occupancy patches (dug arches/overhangs via FarDensity.occ_at). Requires
+## FP_FAR_SMOOTH. Item B4 — the designated cut if the night runs short. Default false.
+const FP_FAR_SMOOTH_OVERHANG := false
+## Smooth tier ladder (§2.4): cells-per-facet-edge per tier. Facet edge ≈ 417 blocks (K=24) ⇒ ~4/8/16/32-block pitch.
+const SMOOTH_S2_CELLS := 104
+const SMOOTH_S3_CELLS := 52
+const SMOOTH_S4_CELLS := 26
+const SMOOTH_S5_CELLS := 13
+## Residency caps: max facets held resident at each tier (NEVER-OOM, enforced by the LRU in B3). Worst-case far-tri
+## budget ≈ 9·21.6k + 25·5.4k + 64·1.4k + 200·0.34k ≈ 488k tris; +≤8 draws (tiers merged into ≤2 ArrayMeshes each).
+const SMOOTH_S2_MAX := 9
+const SMOOTH_S3_MAX := 25
+const SMOOTH_S4_MAX := 64
+const SMOOTH_S5_MAX := 200
+const SMOOTH_SKIRT_BLOCKS := 4.0            # always-on radial skirt along every facet-tile border (§2.4 crack backstop)
+const SMOOTH_BYTES_MAX := 96 * 1024 * 1024  # smooth mesh cache ceiling (worst ≈ 40MB + edit-patch headroom) — fixed
+const SMOOTH_BUILD_SLOTS := 8               # WorkerThreadPool tiles in flight (B2/B3 driver) — cores−1 ≤ 8
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)

@@ -1608,6 +1608,10 @@ func _setup_fine_map() -> void:
 
 ## Nearest un-baked whole-planet facet by emit axis (front-most first); covers all 6·K² facets, never evicted.
 func _next_fine_fid(axis: Array) -> int:
+	# Fable audit F4: once the whole planet is baked, both loops below scan all 6·K² (~7k) facets EVERY frame and
+	# find nothing — a permanent idle-CPU tax after convergence. Early-out the moment coverage is complete.
+	if _fine_baked.size() >= _base_all:
+		return -1
 	if axis.size() == 3:
 		var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
 		if ax * ax + ay * ay + az * az > 0.5:
@@ -1871,6 +1875,14 @@ func total_bytes() -> int:
 		var bm_px := _bm_texels * _bm_texels * bpp     # one band layer, bytes
 		total += CubeSphere.band_layers() * bm_px        # BAND_LAYERS-layer GPU array (no mips)
 		total += bm_px                                 # ONE CPU staging image (the active in-progress bake)
+	# COSMOS FAR-RENDER-OVERHAUL §1.4 (Fable audit F2): the FP_PLANET_MAP whole-planet FINE tier — 24 L8 sub-page
+	# layers of _fm_page² (=1536²), held BOTH as CPU staging Images (_fm_pages, the blit targets) AND the GPU array
+	# (_fm_tex, no mips). ~56.6 MB each = ~113 MB. Must be on the ledger or the NEVER-OOM cap is a lie. Fixed-size.
+	if _fm_on:
+		var fine_layers := 6 * 4                          # 6 faces × 2×2 quadrants
+		var fine_px := _fm_page * _fm_page                # one L8 sub-page layer, bytes
+		total += fine_layers * fine_px                    # CPU staging Images (_fm_pages)
+		total += fine_layers * fine_px                    # GPU array (_fm_tex, L8, no mips)
 	return total
 
 ## COSMOS TEXTURED-LOD U1 (§2U.4): the band tier's own byte ledger (GPU array + one staging image), asserted ≤ BAND_BYTES_MAX

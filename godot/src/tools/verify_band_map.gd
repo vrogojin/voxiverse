@@ -241,8 +241,8 @@ func _gate_bytes(fid: int) -> void:
 	var expect_bytes := CubeSphere.BAND_LAYERS * bm_px + bm_px
 	_ok(baker.band_bytes() == expect_bytes,
 		"G-BB-BYTES: band ledger == BAND_LAYERS·512² + one staging L8 = %d B (%.2f MB)" % [expect_bytes, float(expect_bytes) / 1048576.0])
-	_ok(baker.band_bytes() <= CubeSphere.BAND_BYTES_MAX,
-		"G-BB-BYTES: band tier ≤ BAND_BYTES_MAX (%.2f MB ≤ %.2f MB)" % [float(baker.band_bytes()) / 1048576.0, float(CubeSphere.BAND_BYTES_MAX) / 1048576.0])
+	_ok(baker.band_bytes() <= CubeSphere.band_bytes_max(),
+		"G-BB-BYTES: band tier ≤ band_bytes_max() (%.2f MB ≤ %.2f MB)" % [float(baker.band_bytes()) / 1048576.0, float(CubeSphere.band_bytes_max()) / 1048576.0])
 	# The whole baker (base + id + detail atlas + band) stays under the §2U combined ceiling (43 MB).
 	var ceil43 := 43 * 1024 * 1024
 	_ok(baker.total_bytes() <= ceil43,

@@ -38,7 +38,9 @@ var _wholesale_clears := 0             # cross-level coarsening sweeps that empt
 ## d_max(Ln): the distance (blocks) at which a level-n megablock (pitch 2^n) drops under the ~4 px LOD threshold —
 ## d_max ≈ 2^n · K_px / 4. Pure; the gate checks the band boundaries against this.
 static func d_max(level: int) -> float:
-	return float(1 << level) * CubeSphere.BLOCK_LOD_SCREEN_K_PX / 4.0
+	# COSMOS FAR-LOD QUALITY (B): K_px comes from the flag-gated helper — the shipped 1407 with FP_FARLOD_QUALITY off
+	# (byte-identical: verify_block_lod's 500→L1..8000→L5 bands unmoved), or the finer FARLOD_TARGET_PX-scaled value on.
+	return float(1 << level) * CubeSphere.block_lod_screen_k_px() / 4.0
 
 ## The tier a facet at distance `dist` blocks should render at: the smallest level whose d_max still covers it,
 ## clamped to [1, GLOBAL_LEVEL]. dist≤703→L1, ≤1407→L2, ≤2814→L3, ≤5628→L4, else→L5. This is the screen-space law

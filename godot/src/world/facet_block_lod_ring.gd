@@ -49,6 +49,12 @@ extends Node3D
 # Everything downstream (pitch, greedy tile size, ledger) derives from _level, so ONE mesher serves the whole ladder.
 var _level := 1                        # this ring's pyramid level (1=L1 rim / P1; 2..5 = the P2 ladder tiers)
 var _pitch := 2                        # blocks per megablock at this level (1 << _level)
+# COSMOS FAR-LOD QUALITY (A) — the radial sink (blocks) applied to EVERY emitted tier vertex (top + side + skirt) so the
+# megablock tops sit provably BELOW the near voxel field (no coplanar z-fight / poke-through at the transition). Read
+# from the flag-gated static at construction (0.0 when FP_FARLOD_QUALITY is off ⇒ _w is byte-identical). Uniform across
+# all levels + a pure function of the world point ⇒ welds stay bit-identical and no inter-level crack is introduced.
+# The gate (verify_farlod.gd) forces it on to prove the sink lands the tier ≤ the true analytic surface.
+var _farlod_sink := CubeSphere.farlod_block_sink()
 
 # Per-vertex ArrayMesh cost (no NORMAL array — the unshaded shader derives the radial normal): position(12) +
 # color(16) + uv(8) = 36 B/vertex; indices are int32 (4 B). The ledger below sums exactly this.
@@ -633,7 +639,13 @@ func seam_defects(fid: int) -> int:
 ## columns meeting at an edge produce BIT-IDENTICAL corners (same f64 inputs → same Vector3) ⇒ no crack (the weld law).
 func _w(fid: int, x: int, y: int, z: int) -> Vector3:
 	var a := FacetAtlas.lattice_to_world64(fid, float(x), float(y), float(z))
-	return Vector3(a[0], a[1], a[2])
+	var v := Vector3(a[0], a[1], a[2])
+	# COSMOS FAR-LOD QUALITY (A): push the vertex FARLOD_BLOCK_SINK blocks radially inward (planet centre = absolute
+	# origin, so the radial is v.normalized(), the SAME law FacetSkinTier._compose_position uses). Pure in v ⇒ two
+	# columns/facets sharing this corner still weld bit-identically. No-op (byte-identical) when _farlod_sink == 0.
+	if _farlod_sink > 0.0:
+		v -= v.normalized() * _farlod_sink
+	return v
 
 
 func _add_quad(verts: PackedVector3Array, vcol: PackedColorArray, uvs: PackedVector2Array, idx: PackedInt32Array,

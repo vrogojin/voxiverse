@@ -774,6 +774,51 @@ const BLOCK_LOD_EXPANDED_ENABLED := false
 static func block_lod_ceiling() -> int:
 	return BLOCK_LOD_BYTES_EXPANDED if BLOCK_LOD_EXPANDED_ENABLED else BLOCK_LOD_BYTES_MAX
 
+## COSMOS FAR-LOD QUALITY (task #farlod, docs/COSMOS-BLOCK-LOD-DESIGN.md §3/§4 refinement) — two surface far-terrain
+## defects, both fixed here, both OFF by default (byte-identical: every accessor below returns the shipped value / 0):
+##
+##  (A) NO-PROTRUSION for the block-LOD tiers. The L1 rim ring + L2..L5 ladder/global megablock tops are MIN-decimated
+##      (≤ the fine analytic surface by containment) but — unlike the far-ring backstop (BACKSTOP_SINK) and the skin
+##      (FacetSkinTier.SINK) — they carry NO radial sink and NO depth bias. Where a megablock top is COPLANAR with the
+##      near voxel field (flat/gently-sloped terrain, MIN==fine height) the two z-fight on the gl_compatibility 24-bit
+##      depth path (no prepass, weak early-z), so the coarse tier pokes THROUGH the near blocks at the transition. Fix:
+##      push every block-LOD tier vertex FARLOD_BLOCK_SINK blocks radially inward (a pure function of the world point ⇒
+##      welds stay bit-identical; uniform across levels ⇒ no new inter-level crack). Then near(0) > every block-LOD tier
+##      (sunk) > far-ring backstop — provably ≤ the true surface, zero protrusion. Gate: verify_farlod.gd G-FARLOD-SINK.
+##
+##  (B) FINER band selection. The ladder picks a facet's megablock level from d_max(Ln) = 2^n·K_px/4 with K_px≈1407 —
+##      the design's "~4 px at hand-off" law. That leaves mid-field megablocks 3–6 px on a typical display ("large
+##      squares"). block_lod_screen_k_px() rescales K_px so a megablock reads ≈ FARLOD_TARGET_PX at hand-off instead:
+##      finer levels persist to LARGER distances (each level's far edge shrinks pitch/d to the target), so coarse tiers
+##      only appear when genuinely far. The §2V pixel-skin (FP_FACET_TEX far-ring texture) and the sunk far ring remain
+##      the always-resident backstop BEYOND the ladder (never retired on the surface), so the farthest terrain stays
+##      pixel-fine in colour. NEVER-OOM: the finer selection changes only WHICH level the (already-capped) ≤48 ladder
+##      facets bake at — the LRU/facet caps + the finest-first shared-ceiling coarsening are unchanged; if the finer
+##      bands breach the ceiling the coordinator trims finest-first (far ring backstops), so memory stays bounded.
+##      Tunable live via FARLOD_TARGET_PX. Gate: verify_farlod.gd G-FARLOD-BAND.
+const FP_FARLOD_QUALITY := false
+const FARLOD_BLOCK_SINK := 3.0         # (A) radial sink (blocks) on every block-LOD tier vertex — clears the flat-terrain
+                                       # coplanar z-fight + the datum/f32 residual with margin, small enough to stay
+                                       # sub-pixel at the ≥128-block engagement rim (relief amplitude dwarfs it). Knob.
+const FARLOD_SHIP_PX := 4.0            # the shipped law's hand-off threshold (BLOCK_LOD_SCREEN_K_PX ≈ "4 px per block").
+const FARLOD_TARGET_PX := 1.5          # (B) target on-screen megablock size at level hand-off — the "≈1 px per real
+                                       # block when far" intent. Smaller ⇒ finer far (coarse levels pushed farther out),
+                                       # more block-LOD bytes (ceiling-bound). Operator tunes this live.
+
+## (A) The block-LOD tier radial sink in blocks — FARLOD_BLOCK_SINK when the flag is on, else 0.0 (⇒ the ring's _w is
+## byte-identical: no sink term). Read once per ring at construction (member initializer) so EVERY ring — the L1 rim,
+## each ladder level, and the global L5 mesher (which never calls setup()) — sinks uniformly.
+static func farlod_block_sink() -> float:
+	return FARLOD_BLOCK_SINK if FP_FARLOD_QUALITY else 0.0
+
+## (B) The effective on-screen block-size constant K_px the ladder's d_max/level_for_distance read. Flag ON ⇒ rescale
+## the shipped K_px by (FARLOD_SHIP_PX / FARLOD_TARGET_PX) so hand-off happens at ≈ FARLOD_TARGET_PX instead of ~4 px
+## (finer). Flag OFF ⇒ the shipped BLOCK_LOD_SCREEN_K_PX VERBATIM (verify_block_lod's 500→L1..8000→L5 bands unmoved).
+static func block_lod_screen_k_px() -> float:
+	if FP_FARLOD_QUALITY:
+		return BLOCK_LOD_SCREEN_K_PX * (FARLOD_SHIP_PX / FARLOD_TARGET_PX)
+	return BLOCK_LOD_SCREEN_K_PX
+
 ## COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2 — "crisp BLOCKY megablocks from orbit").
 ## THE orbit render phase: above a swap altitude, mesh the WHOLE visible disc as DISTANCE-LADDERED megablocks (L4 at
 ## the nadir → L5 toward the limb, a PER-FACET screen-distance selection — NOT one uniform level) riding the far ring's

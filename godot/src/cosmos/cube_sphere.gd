@@ -608,11 +608,14 @@ const FP_SKIN_FLATCOLOR := false
 const FP_BAND_META_TEX := false
 ## Band layer count when FP_BAND_META_TEX is on (the uniform-array path physically cannot host this — tied to the flag).
 const BAND_LAYERS_BIG := 512
+## Effective band layer count: 512 when FP_BAND_META_TEX (data-texture reverse-map, no uniform cap) else the array-safe 180.
+static func band_layers() -> int:
+	return BAND_LAYERS_BIG if FP_BAND_META_TEX else BAND_LAYERS
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
 const BAND_LAYERS := 180                   # known-good under the GPU array + fragment-uniform limits; growing past this needs a data-texture reverse-map (not uniform arrays)
 const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 48 * 1024 * 1024    # 180-layer L8 band
-const BAND_PROMOTE_DIST := 3600.0          # FP_SKIN_SSE band promote reach (blocks)
+const BAND_BYTES_MAX := 140 * 1024 * 1024   # 512-layer L8 band (512x512^2 = 134MB GPU + 1 staging) under FP_BAND_META_TEX
+const BAND_PROMOTE_DIST := 8000.0          # FP_SKIN_SSE band promote reach (blocks) — reaches higher orbit to fill the 512-layer band
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)

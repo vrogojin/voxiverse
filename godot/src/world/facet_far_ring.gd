@@ -3327,7 +3327,7 @@ func _make_material() -> Material:
 			sm2.set_shader_parameter("band_k", float(FacetAtlas.K))
 			if CubeSphere.FP_BAND_META_TEX:
 				# FP_BAND_META_TEX: seed the reverse-map DATA TEXTURE (sentinel a=-1) so band_meta is never unbound.
-				var mimg := Image.create(CubeSphere.BAND_LAYERS, 1, false, Image.FORMAT_RGBAF)
+				var mimg := Image.create(CubeSphere.band_layers(), 1, false, Image.FORMAT_RGBAF)
 				mimg.fill(Color(-1.0, -1.0, 0.0, 0.0))
 				sm2.set_shader_parameter("band_meta", ImageTexture.create_from_image(mimg))
 			else:
@@ -3479,7 +3479,7 @@ func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: Pac
 	_band_slots = slots
 	if _mi != null:
 		var mat := _mi.material_override
-		if mat is ShaderMaterial and facet_map.size() == CubeSphere.BAND_LAYERS and n_map.size() == CubeSphere.BAND_LAYERS:
+		if mat is ShaderMaterial and facet_map.size() == CubeSphere.band_layers() and n_map.size() == CubeSphere.band_layers():
 			if CubeSphere.FP_BAND_META_TEX:
 				_push_band_meta(mat as ShaderMaterial, facet_map, n_map)
 			else:
@@ -3490,7 +3490,7 @@ func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: Pac
 ## FP_BAND_META_TEX: pack (a,b,Nx,Ny) per band layer into the 512×1 RGBA32F reverse-map texture (one tiny update()),
 ## replacing the band_facet[]/band_n[] uniform arrays (which cap out at ~400 layers on ANGLE's fragment-uniform budget).
 func _push_band_meta(mat: ShaderMaterial, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
-	var n := CubeSphere.BAND_LAYERS
+	var n := CubeSphere.band_layers()
 	if _band_meta_img == null:
 		_band_meta_img = Image.create(n, 1, false, Image.FORMAT_RGBAF)
 	for i in range(n):

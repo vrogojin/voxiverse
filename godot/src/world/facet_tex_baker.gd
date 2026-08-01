@@ -249,11 +249,11 @@ func setup(active_fid: int) -> void:
 		FarPalette.ensure_far_index_ready()
 	if _bm_on:
 		_bm_texels = CubeSphere.BAND_TEXELS
-		_bm_facet.resize(CubeSphere.BAND_LAYERS)
-		_bm_n.resize(CubeSphere.BAND_LAYERS)
+		_bm_facet.resize(CubeSphere.band_layers())
+		_bm_n.resize(CubeSphere.band_layers())
 		_bm_free.clear()
 		var bimgs: Array[Image] = []
-		for i in range(CubeSphere.BAND_LAYERS):
+		for i in range(CubeSphere.band_layers()):
 			var bimg := Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 			bimg.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
 			_bm_facet[i] = Vector2(-1.0, -1.0)
@@ -1062,7 +1062,7 @@ func _recompute_band_want(active_fid: int) -> void:
 	var want := {}
 	var ring := TierPlace.ring1(active_fid)          # [active, 4 seam, diagonals…]; take the nearest BAND_LAYERS
 	for i in range(ring.size()):
-		if want.size() >= CubeSphere.BAND_LAYERS:
+		if want.size() >= CubeSphere.band_layers():
 			break
 		want[int(ring[i])] = true
 	# Evict residents no longer in the band ring (the evict-only-on-ring-exit invariant the gate checks).
@@ -1106,7 +1106,7 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 			cand.append([dist, fid])
 	cand.sort()                                 # nearest first → the capped want is the BAND_LAYERS nearest facets
 	var want := {}
-	var n := mini(cand.size(), CubeSphere.BAND_LAYERS)
+	var n := mini(cand.size(), CubeSphere.band_layers())
 	for i in range(n):
 		want[int(cand[i][1])] = true
 	# FP_SKIN_FLATCOLOR robustness: a TRANSIENT empty want (a bad axis/cam frame on a crossing) must NOT evict the whole
@@ -1761,7 +1761,7 @@ func total_bytes() -> int:
 	if _bm_on:
 		var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 {id,shade} shot = 2 B/block; U1 L8 {id} = 1 B/block
 		var bm_px := _bm_texels * _bm_texels * bpp     # one band layer, bytes
-		total += CubeSphere.BAND_LAYERS * bm_px        # BAND_LAYERS-layer GPU array (no mips)
+		total += CubeSphere.band_layers() * bm_px        # BAND_LAYERS-layer GPU array (no mips)
 		total += bm_px                                 # ONE CPU staging image (the active in-progress bake)
 	return total
 
@@ -1772,7 +1772,7 @@ func band_bytes() -> int:
 		return 0
 	var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 shot = 2 B/block; U1 L8 = 1 B/block
 	var bm_px := _bm_texels * _bm_texels * bpp
-	return CubeSphere.BAND_LAYERS * bm_px + bm_px
+	return CubeSphere.band_layers() * bm_px + bm_px
 
 # --- helpers -------------------------------------------------------------------------------------
 

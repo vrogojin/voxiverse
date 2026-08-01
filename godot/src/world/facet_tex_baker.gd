@@ -1567,7 +1567,7 @@ func _setup_parallel_band() -> void:
 	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE
 	if not _pbm_on:
 		return
-	_pbm_n = clampi(maxi(OS.get_processor_count() - 1, 6), 1, 8)   # force >=6 to probe the export pthread pool (get_processor_count under-reports on web)
+	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)   # scales when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	for i in range(_pbm_n):

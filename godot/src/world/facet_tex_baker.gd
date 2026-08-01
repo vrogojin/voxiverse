@@ -1635,7 +1635,7 @@ func _update_band_parallel() -> void:
 		_pbm_lc[i] = lc
 		_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
 		_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
-		_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), true, "flatband")
+		_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 
 ## WORKER: compute slot `i`'s FULL facet L8 index bytes (pure per-slot state; the only shared write is _pbm_bytes[i]
 ## under the mutex). sample_columns (C++) is re-entrant by godot_voxel's threaded-generator design; TreeGen/FarPalette
@@ -1722,6 +1722,13 @@ func main_bake_ms() -> float:
 
 ## Phase 2 telemetry (§6): the bake ledger streamed next to shell_telemetry() via the remote bridge. Bytes + coverage
 ## + close-up residency + the bounded-cost proof (worst per-update bake ms). {} when nothing has been baked yet.
+func _pbm_busy_count() -> int:
+	var c := 0
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) >= 0:
+			c += 1
+	return c
+
 func tex_telemetry() -> Dictionary:
 	return {
 		"tex_baked": _baked.size(),
@@ -1736,6 +1743,9 @@ func tex_telemetry() -> Dictionary:
 		"bm_free": _bm_free.size(),
 		"bm_bake": _bm_bake_fid,
 		"bm_epoch": _bm_epoch,
+		"pbm_n": _pbm_n,
+		"pbm_busy": _pbm_busy_count(),
+
 		"bm_facsz": band_facet_map().size(),
 		"cu_on": _cu_on,
 		"cu_resident": _cu_slots.size(),

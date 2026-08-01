@@ -127,6 +127,20 @@ var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
 var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
 var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² staging image (L8 {id} / RG8 {id,shade} under FP_BAND_SHOT; id 0 until rows fill in)
 var _bm_bake_bytes := PackedByteArray()   # FP_SKIN_FLATCOLOR: the L8 index bytes filled by the slices (direct byte writes, NO set_pixel → fast + unambiguous); the image is built from this at the last slice
+# FP_SKIN_FLATCOLOR MULTI-CORE band bake: fan N full-facet bakes across WorkerThreadPool (one per core) instead of the
+# single-in-flight JobLane unit. Each slot is a fully independent full-facet compute (pure: sample_columns + tree +
+# edit snapshot → L8 byte buffer); main commits finished slots each frame. Residency structures (_bm_slots/_bm_free/
+# _bm_facet/_bm_n/_bm_epoch/_bm_want) are shared with the single path but written ONLY on main (single-writer).
+var _pbm_on := false
+var _pbm_n := 0
+var _pbm_fid: Array = []            # slot -> fid being computed (-1 idle) [main-written pre-dispatch, worker-read]
+var _pbm_layer: Array = []          # slot -> reserved band layer
+var _pbm_task: Array = []           # slot -> WorkerThreadPool task id
+var _pbm_bytes: Array = []          # slot -> PackedByteArray result (worker-written under _pbm_mutex)
+var _pbm_lc: Array = []             # slot -> PackedVector2Array lattice corners
+var _pbm_nx: Array = []             # slot -> Nx
+var _pbm_ny: Array = []             # slot -> Ny
+var _pbm_mutex := Mutex.new()       # guards the result handoff (_pbm_bytes[i]) between worker and main
 var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
 var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
 var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
@@ -466,6 +480,12 @@ func set_frozen(frozen: bool) -> void:
 func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	if _frozen:
 		return
+	# FP_SKIN_FLATCOLOR multi-core band: refresh the residency want on main, then reap/dispatch the parallel full-facet
+	# bakes across all cores. The band is handled ENTIRELY here — the single-in-flight paths below skip it (not _pbm_on).
+	if _pbm_on:
+		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0 and _bm_on and active_fid >= 0:
+			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
+		_update_band_parallel()
 	if _worker_on:
 		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:
@@ -555,7 +575,7 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 		# COSMOS TEXTURED-LOD V4 (§2V.2): the SSE monotone law drives the want-sets when on + cam_dist known (NO evict-all);
 		# else the shipped regime-keyed orchestration below. _select_worker_unit's close-up>band>base priority is unchanged.
 		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0:
-			if _bm_on and active_fid >= 0:
+			if _bm_on and active_fid >= 0 and not _pbm_on:
 				_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
 			if _cu_on:
 				_recompute_want_sse(emit_axis, cam_dist)
@@ -564,7 +584,7 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 				_recompute_want(emit_axis)
 			elif _cu_on and not _cu_want.is_empty():
 				_evict_all_closeup()
-			if _bm_on and active_fid >= 0:
+			if _bm_on and active_fid >= 0 and not _pbm_on:
 				_recompute_band_want(active_fid)
 		# --- pick ONE compute unit (priority: visible close-up > near band > progressive base), freeze + dispatch ---
 		if _select_worker_unit(offsurface, emit_axis, active_fid):
@@ -588,8 +608,8 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 		var cf := _next_want_to_bake()
 		if cf >= 0 and _begin_closeup_bake(cf):
 			_job_kind = "cu"; return true
-	# Near-far band next.
-	if _bm_on and active_fid >= 0:
+	# Near-far band next — SKIPPED when the multi-core parallel band bake owns it (_pbm_on).
+	if _bm_on and active_fid >= 0 and not _pbm_on:
 		if _bm_bake_fid >= 0:
 			_job_kind = "bm"; return true            # continue the in-progress band facet
 		var bf := _next_band_to_bake()
@@ -1539,6 +1559,137 @@ func budget_spent_ms() -> float:
 func set_job_lane(lane: JobLane) -> void:
 	_lane = lane
 	_worker_on = CubeSphere.FP_TEX_BAKE_WORKER and lane != null
+	_setup_parallel_band()
+
+## FP_SKIN_FLATCOLOR: arm the multi-core band bake (needs the worker + SSE residency). Slot count = cores − 2 (leave
+## the main + render/gen threads headroom), capped at 8. Off ⇒ the shipped single-in-flight band path is used.
+func _setup_parallel_band() -> void:
+	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE
+	if not _pbm_on:
+		return
+	_pbm_n = clampi(OS.get_processor_count() - 2, 1, 8)
+	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
+	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
+	for i in range(_pbm_n):
+		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1
+		_pbm_bytes[i] = PackedByteArray()
+
+func _pbm_inflight(fid: int) -> bool:
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) == fid:
+			return true
+	return false
+
+## Nearest wanted band facet not resident and not already in-flight (active first, then any).
+func _next_band_parallel() -> int:
+	if _bm_want.has(_bm_want_active) and not _bm_slots.has(_bm_want_active) and not _pbm_inflight(_bm_want_active):
+		return _bm_want_active
+	for fid in _bm_want.keys():
+		var f := int(fid)
+		if not _bm_slots.has(f) and not _pbm_inflight(f):
+			return f
+	return -1
+
+## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
+## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
+func _update_band_parallel() -> void:
+	# 1) reap completed → commit on main (single-writer of the residency dicts)
+	for i in range(_pbm_n):
+		var fid := int(_pbm_fid[i])
+		if fid < 0 or not WorkerThreadPool.is_task_completed(int(_pbm_task[i])):
+			continue
+		WorkerThreadPool.wait_for_task_completion(int(_pbm_task[i]))   # reclaim + memory barrier
+		var layer := int(_pbm_layer[i])
+		_pbm_mutex.lock()
+		var bytes: PackedByteArray = _pbm_bytes[i]
+		_pbm_mutex.unlock()
+		if bytes.size() == _bm_texels * _bm_texels:
+			var img := Image.create_from_data(_bm_texels, _bm_texels, false, Image.FORMAT_L8, bytes)
+			_bm_tex.update_layer(img, layer)
+			_bm_slots[fid] = layer
+			var d := _decode(fid)
+			_bm_facet[layer] = Vector2(float(d[1]), float(d[2]))
+			_bm_n[layer] = Vector2(float(int(_pbm_nx[i])), float(int(_pbm_ny[i])))
+			_bm_epoch += 1
+		else:
+			_bm_free.append(layer)                                    # compute failed → return the layer
+		_pbm_fid[i] = -1; _pbm_task[i] = -1
+	# 2) dispatch idle slots to the next wanted facets (one WorkerThreadPool task each → runs on its own core)
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) >= 0:
+			continue
+		if _bm_free.is_empty():
+			break
+		var fid := _next_band_parallel()
+		if fid < 0:
+			break
+		var layer := int(_bm_free.pop_back())
+		var lc := PackedVector2Array()
+		lc.resize(4)
+		for ci in range(4):
+			var w := FacetAtlas.facet_planar_corner(fid, ci)
+			var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
+			lc[ci] = Vector2(float(l[0]), float(l[2]))
+		_pbm_fid[i] = fid
+		_pbm_layer[i] = layer
+		_pbm_lc[i] = lc
+		_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
+		_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
+		_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), true, "flatband")
+
+## WORKER: compute slot `i`'s FULL facet L8 index bytes (pure per-slot state; the only shared write is _pbm_bytes[i]
+## under the mutex). sample_columns (C++) is re-entrant by godot_voxel's threaded-generator design; TreeGen/FarPalette
+## reads are static + read-only (LUTs built on main). No residency dict is touched here.
+func _pbm_compute(i: int) -> void:
+	var fid := int(_pbm_fid[i])
+	var tex := _bm_texels
+	var nx := int(_pbm_nx[i])
+	var ny := int(_pbm_ny[i])
+	var lc: PackedVector2Array = _pbm_lc[i]
+	var have_edits: bool = not _edit_snap.is_empty()
+	var packed := PackedInt64Array()
+	var lxs := PackedInt32Array()
+	var lzs := PackedInt32Array()
+	packed.resize(nx * ny)
+	lxs.resize(nx * ny)
+	lzs.resize(nx * ny)
+	for by in range(ny):
+		var t := (float(by) + 0.5) / float(ny)
+		var base := by * nx
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			lxs[base + bx] = lx
+			lzs[base + bx] = lz
+			packed[base + bx] = _pack_xz(lx, lz)
+	var res: Dictionary = _sampler.call(fid, packed)
+	var cols: PackedColorArray = res["colors"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var bytes := PackedByteArray()
+	bytes.resize(tex * tex)
+	bytes.fill(0)
+	for by in range(ny):
+		var base := by * nx
+		var row_off := by * tex
+		for bx in range(nx):
+			var k := base + bx
+			var bid := -1
+			if have_edits:
+				bid = int(_edit_snap.get(Vector2i(lxs[k], lzs[k]), -1))
+			if bid < 0:
+				var deco := TreeGen.top_decoration(lxs[k], lzs[k], ctx)
+				if deco != BlockCatalog.AIR:
+					bid = deco
+			var idx: int
+			if bid >= 0:
+				idx = FarPalette.far_color_index_of_block(bid) + 1
+			else:
+				idx = FarPalette.far_color_index(cols[k]) + 1
+			bytes[row_off + bx] = idx
+	_pbm_mutex.lock()
+	_pbm_bytes[i] = bytes
+	_pbm_mutex.unlock()
 
 ## Gate-only hook: force the offload path with a supplied lane, independent of the FP_TEX_BAKE_WORKER const, so
 ## verify_tex_worker can drive BOTH paths in one flag state (the byte-identity comparison). Never called in production.

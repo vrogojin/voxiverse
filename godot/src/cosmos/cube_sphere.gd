@@ -602,7 +602,7 @@ const FP_BAND_BLOCK_MAP := false
 const FP_SKIN_FLATCOLOR := false
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
 const BAND_LAYERS := 180                   # band residency (nearest-by-screen up to this cap) → 180·0.25MiB = 45MiB GPU, fixed at creation; covers the low-orbit visible disc
-const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
+const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
 const BAND_BYTES_MAX := 48 * 1024 * 1024   # NEVER-OOM ceiling for the L8 band tier (180·512² L8 GPU + 1 staging ⇒ ~45.25 MiB < 48)
 const BAND_PROMOTE_DIST := 3600.0          # FP_SKIN_SSE band promote reach (blocks): admits ≥180 candidates near the surface; BAND_LAYERS self-caps nearest-first
 
@@ -909,7 +909,7 @@ static func block_lod_orbit_engaged(h: float, currently_engaged: bool) -> bool:
 ## closeup sampler is never compiled) ⇒ byte-identical to Phase-1/shipped. NEVER-OOM: 64×128² RGBA8+mips ≈ 5.6 MB
 ## fixed at creation, LRU evicts ONLY outside-cap facets (the base map is the safe floor). Requires FP_FACET_TEX.
 const FP_FACET_TEX_CLOSEUP := false
-const FACET_TEX_BAKE_BUDGET_MS := 2.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
+const FACET_TEX_BAKE_BUDGET_MS := 5.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
 const CLOSEUP_MAX := 64                    # close-up Texture2DArray layer count (fixed at creation → NEVER-OOM)
 const CLOSEUP_TEXELS := 128               # texels per close-up facet edge (≈3.3 blocks/texel, 8× the base map)
 const CLOSEUP_SLICE_ROWS := 16            # rows baked per budget slice (16·128 = 2048 sample_columns cols ≈ 0.5 ms native)

@@ -628,12 +628,14 @@ const BAND_BYTES_MAX_BIG := 70 * 1024 * 1024   # FP_BAND_META_TEX 240-layer ceil
 ## don't enlarge the NEVER-OOM ceiling unconditionally, or a flag-off over-alloc bug hides under a 70MB roof).
 static func band_bytes_max() -> int:
 	return BAND_BYTES_MAX_BIG if FP_BAND_META_TEX else BAND_BYTES_MAX
-## FP_SKIN_SSE band promote reach (blocks). 3600 ≈ 2.5·K_px — a band texel (1 block) stays ≳ 1 px only this close;
-## beyond it the whole-planet FINE tier (FP_PLANET_MAP, 3 blk/texel) owns the disc. Fable audit F1: promote 8000
-## pulled the SUB-PIXEL band over the nadir quad at mid-orbit (each band facet = 174k shots, worker-priority over
-## fine, uncommitted want-facets fell to the pale base) → the washed centre-quad. Kept at the shipped 3600 for BOTH
-## flag states (also fixes F3: the 8000 bump was unconditional, changing flag-off FP_SKIN_FLATCOLOR residency).
-const BAND_PROMOTE_DIST := 3600.0
+## FP_SKIN_SSE band promote reach (blocks). The band (1 block/texel) is a CLOSE-APPROACH sharpener: a band texel
+## stays ≳ 1 px only within ~K_px (1407) of the camera, so it's visually meaningful ONLY on low approach — below it
+## the whole-planet FINE tier (FP_PLANET_MAP, 3 blk/texel) is equal-or-better AND fully baked. Fable audit F1: at
+## 3600/8000 the SUB-PIXEL band promoted the nadir quad at mid-orbit (alt ~2000, dist < promote), and each band
+## facet's slow 174k-shot bake showed the PALE BASE meanwhile → the washed centre-quad. 1500 (~K_px) keeps the band
+## to genuine close approach; at alt ≥ ~1500 the fine tier owns the disc (no quad). Only read under FP_SKIN_FLATCOLOR
+## (byte-off unaffected). Belt-and-suspenders: the shader also falls an un-baked/evicted band texel to fine (F1 ii/iii).
+const BAND_PROMOTE_DIST := 1500.0
 
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets

@@ -3237,6 +3237,38 @@ const _FLAT_ALBEDO_META := "	int _bs = int(v_bslot + 0.5) - 64;
 		ALBEDO = mix(v_col_raw, col, wt) * v_st;
 	}
 "
+## FP_PLANET_MAP composite with the fine tier as the UNIVERSAL fallback (Fable audit F1 ii/iii). The whole-planet
+## fine sample is hoisted ABOVE the band branch, so a band facet whose texel is un-baked (_bid==0, mid-bake) OR whose
+## slot was evicted (band_meta sentinel _m.x < -0.5) falls to the FINE tier — which is always resident + baked —
+## instead of the pale coarse base. That removes the washed patches the band showed during its slow per-facet bake
+## (the centre-quad's remaining cause below the promote reach), while a BAKED band texel still overrides fine (sharp
+## 1 blk/texel on close approach). %d = fine sub-page edge (PLANET_MAP_QUAD·TEXELS).
+const _FLAT_ALBEDO_META_FINE := "	vec2 _q = clamp(floor(v_uv * 2.0), 0.0, 1.0);
+	int _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
+	ivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
+	int _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);
+	vec3 _fc = (_f8 > 0) ? far_lut[_f8 - 1] : col;
+	float _fw = (_f8 > 0) ? 1.0 : 0.0;
+	if (v_bslot >= 63.5) {
+		int _bs = int(v_bslot + 0.5) - 64;
+		vec4 _m = texelFetch(band_meta, ivec2(_bs, 0), 0);
+		vec3 _bc; float _bw;
+		if (_m.x < -0.5) {
+			_bc = _fc; _bw = _fw;
+		} else {
+			vec2 _ab = _m.xy;
+			vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+			vec2 _N = _m.zw;
+			ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+			int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+			_bc = (_bid > 0) ? far_lut[_bid - 1] : _fc;
+			_bw = (_bid > 0) ? 1.0 : _fw;
+		}
+		ALBEDO = mix(v_col_raw, _bc, max(wt, _bw)) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, _fc, max(wt, _fw)) * v_st;
+	}
+"
 static func _apply_flatcolor(code: String) -> String:
 	var bl := CubeSphere.BAND_LAYERS
 	var nlut := FarPalette.frozen_colors().size()
@@ -3246,10 +3278,11 @@ static func _apply_flatcolor(code: String) -> String:
 		var unis := _FLAT_UNIFORMS_META % nlut
 		var meta_albedo := _FLAT_ALBEDO_META
 		if CubeSphere.FP_PLANET_MAP:
-			# FP_PLANET_MAP: always-resident whole-planet fine tier — sample fine_map in the non-band else-branch.
+			# FP_PLANET_MAP: always-resident whole-planet fine tier — the UNIVERSAL fallback (band un-baked/evicted → fine,
+			# never the pale base; Fable audit F1 ii/iii). Hoisted-fine albedo replaces the whole band+else composite.
 			var pg := CubeSphere.PLANET_MAP_QUAD * CubeSphere.PLANET_MAP_TEXELS
 			unis = unis + _FINE_UNIFORM
-			meta_albedo = meta_albedo.replace("	} else {\n		ALBEDO = mix(v_col_raw, col, wt) * v_st;\n	}", _FINE_ELSE % [pg, pg - 1])
+			meta_albedo = _FLAT_ALBEDO_META_FINE % [pg, pg - 1]
 		code = code.replace(base_decl, base_decl + unis)
 		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
 		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")

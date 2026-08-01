@@ -1352,6 +1352,11 @@ func _evict_band(fid: int) -> void:
 	_bm_slots.erase(fid)
 	if not _bm_free.has(layer):
 		_bm_free.append(layer)
+	# Fable audit F1(ii): sentinel the freed layer's reverse-map row (-1,-1) so a far-ring mesh still carrying this
+	# layer's UV2.y (evicted but not yet re-emitted) reads the shader's `_m.x < -0.5` fallback → the always-baked FINE
+	# tier, NOT the stale (a,b) of a facet that may be reassigned to this layer next (which stretched a corner texel).
+	if layer >= 0 and layer < _bm_facet.size():
+		_bm_facet[layer] = Vector2(-1.0, -1.0)
 	_bm_epoch += 1
 
 func _centre_dir(fid: int) -> Array:

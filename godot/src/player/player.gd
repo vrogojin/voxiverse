@@ -261,6 +261,7 @@ var remote_drive := false                 # true only while a move step runs →
 var remote_input := Vector3.ZERO          # body-local wish, SAME shape as the WASD `input` vector
 var remote_run := false                   # substitutes the KEY_SHIFT poll
 var _remote_cruise_until_usec := 0         # DEV remote-cruise self-expiring deadline (usec); 0 ⇒ inert (byte-identical)
+var _remote_cruise_dir := 1                # +1 forward, -1 reverse (remote cruise direction)
 var remote_jump := false                  # one-shot latch, consumed by the grounded/fly jump branch (§4.6)
 var remote_yaw_rate := 0.0                # rad/s the executor is applying this tick (seam indicator; the
                                           # executor owns the exact rotate_y for seam-immune remaining-degrees)
@@ -1562,7 +1563,11 @@ func _move(delta: float) -> void:
 		# shipped `not remote_drive` + physical-C predicate exactly (byte-identical).
 		if CubeSphere.CRUISE_MODE and (remote_cruise_active() or not remote_drive):
 			var cruise_alt := radial_altitude()
-			var c_held := Input.is_key_pressed(KEY_C) or remote_cruise_active()
+			# C = forward cruise, B = REVERSE cruise (fly backward along the look dir). Either engages; when only B
+			# (or the remote reverse dir) is held, the look_dir is negated below.
+			var fwd_held := Input.is_key_pressed(KEY_C) or (remote_cruise_active() and _remote_cruise_dir >= 0)
+			var rev_held := Input.is_key_pressed(KEY_B) or (remote_cruise_active() and _remote_cruise_dir < 0)
+			var c_held := fwd_held or rev_held
 			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, c_held):
 				# FP_CRUISE_LOOKDIR: fly along the camera view in space. `position` is a LATTICE pose, so the look
 				# dir MUST be a LATTICE direction — the camera basis re-expressed in the active facet lattice (the
@@ -1577,6 +1582,8 @@ func _move(delta: float) -> void:
 				else:
 					var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
 					look_dir = (transform.basis * look_local)
+				if rev_held and not fwd_held:
+					look_dir = -look_dir                     # B / remote-reverse: cruise backward along the view
 				if look_dir.length() > 0.0:
 					look_dir = look_dir.normalized()
 				var cruise_v := CubeSphere.cruise_speed(cruise_alt)
@@ -2251,8 +2258,9 @@ func remote_stop_thrust() -> void:
 ## self-expiring deadline, so the cruise branch runs each tick WITHOUT remote_drive (which would gate cruise off).
 ## Only reachable through the CONTROL_ENABLED executor; `_remote_cruise_until_usec` stays 0 otherwise, so
 ## remote_cruise_active() is always false and the cruise branch is byte-identical to shipped.
-func remote_set_cruise(seconds: float) -> void:
+func remote_set_cruise(seconds: float, reverse: bool = false) -> void:
 	_remote_cruise_until_usec = Time.get_ticks_usec() + int(maxf(0.0, seconds) * 1.0e6)
+	_remote_cruise_dir = -1 if reverse else 1
 
 ## True while a remote cruise deadline is live (drives the cruise engage predicate alongside the physical C key).
 func remote_cruise_active() -> bool:

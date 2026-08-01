@@ -336,7 +336,7 @@ func _start_thrust() -> void:
 	# `seconds` — the scripted analogue of holding C. Mutually exclusive with the walk/dev-flight wish (cruise is
 	# kinematic + look-driven, so dx/dy/dz are ignored). Falls back to the normal thrust seam when cruise is unset.
 	if bool(_cur.get("cruise", false)) and is_instance_valid(player) and player.has_method("remote_set_cruise"):
-		player.call("remote_set_cruise", seconds)
+		player.call("remote_set_cruise", seconds, bool(_cur.get("cruise_reverse", false)))
 	else:
 		var wish := Vector3(float(_cur.get("dx", 0.0)), float(_cur.get("dy", 0.0)), float(_cur.get("dz", 0.0)))
 		var run := str(_cur.get("gait", "walk")) == "run"

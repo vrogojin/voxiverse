@@ -1738,7 +1738,7 @@ func tex_telemetry() -> Dictionary:
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under
 ## FP_FACET_TEX_CLOSEUP, CLOSEUP_MAX CPU staging layers + the close-up GPU array (+mips) ≈ 9.6 MB → ≈ 17.8 MB all-on.
 ## The gate asserts it stays under FACET_TEX_BYTES_MAX (20 MB). Every buffer is fixed-size at creation.
-const FACET_TEX_BYTES_MAX := 60 * 1024 * 1024   # raised for FP_SKIN_FLATCOLOR: base 8 + 180-layer L8 band ~45 MB ≈ 53 MB; HARD bounded cap, nothing grows with playtime
+const FACET_TEX_BYTES_MAX := 512 * 1024 * 1024   # user raised the RAM budget (1GB-class host); band grown + headroom for the whole-planet tier
 func total_bytes() -> int:
 	var page_px := _page * _page * 4          # one RGBA8 base page, bytes
 	var cpu := 6 * page_px                     # 6 CPU staging Images (kept for re-blit)

@@ -1585,7 +1585,11 @@ func _setup_parallel_band() -> void:
 	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE
 	if not _pbm_on:
 		return
-	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)   # scales when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE
+	# Use EVERY reported core for the background bake (the user asked for it). The −1 "reserve a core for main" left
+	# a 2-core browser with a SINGLE bake worker (pbm_busy=1 ⇒ whole-planet fine crawled at ~0.24 facet/s). The bake
+	# is off-thread WorkerThreadPool work + the tiles yield, so oversubscribing the main core by 1 is fine for a
+	# background task. Scales further when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE.
+	_pbm_n = clampi(OS.get_processor_count(), 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)
@@ -1781,7 +1785,11 @@ func _pbm_compute(i: int) -> void:
 			if have_edits:
 				bid = int(_edit_snap.get(Vector2i(lx, lz), -1))
 			if bid < 0:
-				bid = int(SurfaceShot.surface_shot(fid, lx, lz, ctx)["block_id"])
+				# The flat-colour band + whole-planet fine tiers store ONLY far_color_index (L8 palette id) — the
+				# shade byte surface_shot also computes is discarded here. top_block_id yields the SAME block_id
+				# without the ~5-neighbour AO shade compute ⇒ ~5-6× fewer column_profile calls (the decisive bake
+				# speedup on a low-core browser). Byte-identical output to surface_shot()["block_id"].
+				bid = SurfaceShot.top_block_id(lx, lz, ctx)
 			bytes[row_off + bx] = FarPalette.far_color_index_of_block(bid) + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes

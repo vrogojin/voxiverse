@@ -36,6 +36,22 @@ const WATER_DEPTH_MAX := 0.55
 const CANOPY_SHADOW := 0.07        # ground-shadow darkening per cardinal neighbour that is a tree canopy / trunk
 const CANOPY_SHADOW_MAX := 0.28
 
+## The exposed top-block PATTERN id ONLY (no shade, no tint) for lattice column (x, z) — the SAME `block_id`
+## surface_shot returns, computed WITHOUT the sun-independent AO shade (which the L8 flat-colour band + fine
+## tiers discard anyway; they store only far_color_index_of_block(id)). Shade costs ~5 extra column_profile +
+## 4 TreeGen neighbour queries per column, so skipping it makes the whole-planet fine/band bake ~5-6× cheaper —
+## the decisive speedup on a low-core web browser (OS.get_processor_count() small ⇒ few bake workers). Byte-
+## identical id to surface_shot()["block_id"] by construction. Use for any tier that stores palette-index only.
+static func top_block_id(x: int, z: int, pcache = null) -> int:
+	FarPalette.ensure_detail_ready()
+	var prof := TerrainConfig.column_profile(x, z, pcache)   # Vector4(g, biome, continent, temperature)
+	var g := int(prof.x)
+	var clamped_sea := g < TerrainConfig.SEA_LEVEL
+	var terr_col := FarPalette.color_for(g, int(prof.y), prof.w, clamped_sea)
+	var tree_id := TreeGen.top_decoration(x, z, pcache)
+	var top_col: Color = BlockCatalog.color_of(tree_id) if tree_id != BlockCatalog.AIR else terr_col
+	return FarPalette.detail_pattern(top_col) + 1
+
 ## THE source record for lattice column (x, z) on facet `fid`. See the file header for the field contract.
 static func surface_shot(fid: int, x: int, z: int, pcache = null) -> Dictionary:
 	FarPalette.ensure_detail_ready()

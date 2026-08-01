@@ -1,0 +1,17 @@
+{
+  "name": "set-noon",
+  "description": "DEV TIME-CHEAT demo: set the celestial time-of-day to local noon (sun overhead) at the player's current surface position, then a screenshot to capture the lit scene.",
+  "_notes": "Requires ORBITAL_SKY on (the celestial clock must exist) and CONTROL_ENABLED baked on at export + a live grant. set_time folds a persistent f64 offset into the ONE ephemeris clock, so sun+moon+planets+day-night all re-orient together. local_hours=12 puts the sun at its daily-max elevation for the player's latitude; 0 = midnight; sun_elev_deg (optional, [-90,90]) instead lands the sun at that elevation. The step passes through flight.mjs's generic {...s} spread exactly like look — no per-op harness code.",
+  "legs": [
+    {
+      "name": "set local noon (sun highest at the player)",
+      "steps": [ { "op": "set_time", "local_hours": 12 } ],
+      "settle_s": 1.0
+    },
+    {
+      "name": "capture the noon-lit scene",
+      "steps": [ { "op": "screenshot", "label": "noon" } ],
+      "settle_s": 0.5
+    }
+  ]
+}

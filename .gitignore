@@ -27,3 +27,7 @@ docker/engine/templates/BUILD-INFO.txt
 node_modules/
 *.log
 .DS_Store
+
+# machine-specific toolchain symlinks (never commit — main is clean)
+/docker/engine/bin
+/docker/engine/templates

@@ -85,6 +85,7 @@ var activated: bool = false       # false = pristine frozen cluster; true = dyna
 var _is_wood := false             # cached _has_wood() — wood is sandbox-dynamic (Godot sleep/wake)
 var _settle_timer := 0.0          # s of continuous calm accumulated (reset by any hot frame)
 var _coarse_timer := 0.0          # s of continuous coarse-calm (anti-livelock escape)
+var _active_age := 0.0            # s this body has been active (TREE-PHYS BOUND hard-freeze deadline)
 
 # Shared, no-bounce, medium-friction physics material for dynamic pieces. Built
 # once and reused (RigidBody3D shares it freely — it is immutable here).
@@ -240,6 +241,14 @@ func block_count() -> int:
 func _physics_process(delta: float) -> void:
 	if not activated or _is_wood or freeze:
 		return                                       # defensive; _physics_process is off in these states
+	# TREE-PHYS BOUND hard deadline: a dynamic body that has not reached rest within TREEPHYS_MAX_ACTIVE_SEC freezes to
+	# STATIC where it is, REGARDLESS of _grounded — so a body whose support query never confirms (far/faceted staleness)
+	# can no longer churn the physics server forever. Off ⇒ never trips (deadline never accrues to the threshold).
+	if CubeSphere.FP_TREEPHYS_BOUND:
+		_active_age += delta
+		if _active_age >= CubeSphere.TREEPHYS_MAX_ACTIVE_SEC:
+			_freeze_dormant()
+			return
 	var lin := linear_velocity.length()
 	var ang := angular_velocity.length()
 	if lin >= SETTLE_LINEAR or ang >= SETTLE_ANGULAR:
@@ -280,6 +289,7 @@ func wake() -> void:
 	sleeping = false
 	_settle_timer = 0.0                              # start the dwell fresh on reactivation
 	_coarse_timer = 0.0
+	_active_age = 0.0                                # restart the TREE-PHYS BOUND deadline on reactivation
 	set_physics_process(true)
 
 ## AWAKE = simulating (dynamic and not asleep). The collider gate counts only awake bodies, so
@@ -536,20 +546,27 @@ func _rebuild() -> void:
 	mi.mesh = mesh
 	add_child(mi)
 
-	# One collider per cell: a box for a full cube; for a shaped cell, ≤ 2 convex prisms
-	# (each top triangle extruded to the anchor face — always convex; SVS §4.3), so a
-	# loose ramp collides on its true slope, not a phantom cube.
-	for c: Vector3i in cells.keys():
-		var modifier: int = CellCodec.modifier(cells[c])
-		if modifier != 0:
-			_add_prism_colliders(c, modifier)
-		else:
-			var shape := BoxShape3D.new()
-			shape.size = Vector3(1, 1, 1)
-			var cs := CollisionShape3D.new()
-			cs.shape = shape
-			cs.position = Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
-			add_child(cs)
+	# COSMOS TREE-PHYS BOUND (CubeSphere.FP_TREEPHYS_BOUND): a LARGE component (> TREEPHYS_COLLIDER_CAP cells) does NOT
+	# emit a per-cell box field — a several-hundred-cell detachment carrying that many box colliders is what pins the
+	# physics server at 300-420 ms/frame. It collides as ONE BoxShape3D over the body's local cell AABB (O(1) physics
+	# cost), and (see the freeze block below) spawns dormant. The render mesh is untouched. Off ⇒ the per-cell path.
+	if _bounded_large():
+		_add_aabb_collider()
+	else:
+		# One collider per cell: a box for a full cube; for a shaped cell, ≤ 2 convex prisms
+		# (each top triangle extruded to the anchor face — always convex; SVS §4.3), so a
+		# loose ramp collides on its true slope, not a phantom cube.
+		for c: Vector3i in cells.keys():
+			var modifier: int = CellCodec.modifier(cells[c])
+			if modifier != 0:
+				_add_prism_colliders(c, modifier)
+			else:
+				var shape := BoxShape3D.new()
+				shape.size = Vector3(1, 1, 1)
+				var cs := CollisionShape3D.new()
+				cs.shape = shape
+				cs.position = Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5)
+				add_child(cs)
 
 	# Mass = Σ density × fill-fraction (SVS §6): a detached half-ramp of stone weighs
 	# 375 kg, not 1500. Full cubes reduce to the catalog mass exactly. Floor at 1 kg.
@@ -557,7 +574,13 @@ func _rebuild() -> void:
 	for c: Vector3i in cells.keys():
 		m += BlockCatalog.mass_of_value(cells[c])
 	mass = maxf(1.0, m)
-	freeze = not activated
+	# TREE-PHYS BOUND: a large component spawns DORMANT (freeze STATIC) — it renders + is walkable but never churns the
+	# sim; only wake() (a nearby edit) can reactivate it, and it re-settles via the active deadline. Off ⇒ `not activated`.
+	if _bounded_large():
+		freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
+		freeze = true
+	else:
+		freeze = not activated
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces
 	_is_wood = _has_wood()      # cache once (avoids a per-frame cell scan in the settle loop)
 	_refresh_dormancy()         # dormant bodies run NO _physics_process
@@ -610,6 +633,29 @@ func _add_prism_colliders(c: Vector3i, modifier: int) -> void:
 		var cs := CollisionShape3D.new()
 		cs.shape = shape
 		add_child(cs)
+
+## TREE-PHYS BOUND: true iff this body is a LARGE component that must be collision-bounded (one AABB box) and spawn
+## dormant. Only the pathological large-detachment case (the physics stall) is affected; normal canopies (≤ the cap)
+## are false ⇒ per-cell blocky debris exactly as today. Off ⇒ always false → byte-identical shipped behaviour.
+func _bounded_large() -> bool:
+	return CubeSphere.FP_TREEPHYS_BOUND and cells.size() > CubeSphere.TREEPHYS_COLLIDER_CAP
+
+## Emit ONE BoxShape3D covering the body's local cell AABB (cells occupy [c, c+1]) — the bounded-large collider. O(1)
+## in the cell count, so a several-hundred-cell body costs the physics server a single box instead of a box field.
+func _add_aabb_collider() -> void:
+	if cells.is_empty():
+		return
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for c: Vector3i in cells.keys():
+		lo = lo.min(Vector3(c))
+		hi = hi.max(Vector3(c) + Vector3.ONE)     # cell c occupies the unit cube [c, c+1]
+	var shape := BoxShape3D.new()
+	shape.size = hi - lo
+	var cs := CollisionShape3D.new()
+	cs.shape = shape
+	cs.position = (lo + hi) * 0.5
+	add_child(cs)
 
 ## Emit the exposed face of cell `c` on side `d` (unit metre quad, one texture
 ## tile). Double-sided material makes winding irrelevant.

@@ -27,6 +27,7 @@ extends SceneTree
 ##   then REVERT the sed. Exits 0 all-pass / 1 on any failure.
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const FFR := preload("res://src/world/facet_far_ring.gd")   # COSMOS PLANET-VIEW §3 (B): FP_FARRING_LIMB_DENSE limb-ring selection
 const K := 24
 
 var _pass := 0
@@ -175,12 +176,78 @@ func _initialize() -> void:
 
 	# ================= COSMOS-FACET-SEAMS-V2 gates (FS2′ / FS-W / twist) =================
 	_probe_datum_v2()      # G-D2-* : the CONTINUOUS datum lift collapses the seam step + is radial + mirror-exact
+	_gate_datum_edge_weld()  # G-EDGE-WELD : the near-LOD apron must ride the SAME datum as the baked near mesh (no black seam)
 	_gate_corner_walk()    # G-CORNER-WALK : corner-commit resolves a grid-corner clear of the −3 ridge wall
 	_gate_twist_frame()    # G-TWIST-FRAME + G-CROSS-HEADING : frame-aware reframe_twist preserves world heading
 	await _gate_datum_collide()  # G-DATUM-COLLIDE : the physics floor the player stands on == the datum-baked render
 
+	_gate_limb_dense()     # G-LIMB-* : FP_FARRING_LIMB_DENSE silhouette-ring selection (pure) + orbit-only guard
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+## COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. Assert the PURE silhouette-ring selection (FacetFarRing.is_limb_facet):
+##  (1) a facet at the exact horizon tangent (φ = θ_h) is flagged; the sub-camera facet (φ ≈ 0) and a facet well inside the
+##      disc are NOT — the ring is a thin shell about the tangent, never the whole cap.
+##  (2) over ALL 3456 facet centre dirs at a representative orbit (alt 8000 ⇒ d = R + 8000), the flagged set is NON-EMPTY,
+##      BOUNDED (≤ LIMB_DENSE_MAX_FACETS and ≪ the visible-disc facet count), and every flagged facet lies within the band
+##      of the tangent — i.e. an O(√cap) ring, not O(cap).
+##  (3) the emit predicate is inert off-surface / flag-off: a fresh FacetFarRing (_offsurface=false, flag const false) has an
+##      EMPTY _limb_set after _refresh_limb_set(), so _is_limb_dense is false for every facet (byte-identical off-path).
+func _gate_limb_dense() -> void:
+	var r := FA.R_BLOCKS
+	var d := r + 8000.0                                    # representative near/far-orbit camera distance
+	var cos_th := r / d
+	var th := acos(cos_th)
+	var half := (PI * 0.5 / float(K)) * 0.5               # facet angular half-width
+	var band := FFR.LIMB_DENSE_BAND * half
+	# (1) pure-predicate sanity — flag the tangent, reject the interior and a facet a full band inside the tangent.
+	_ok(FFR.is_limb_facet(cos(th), cos_th, band), "G-LIMB-PURE: a facet AT the horizon tangent must be flagged")
+	_ok(not FFR.is_limb_facet(1.0, cos_th, band), "G-LIMB-PURE: the sub-camera facet (φ=0) must NOT be flagged")
+	_ok(not FFR.is_limb_facet(cos(th - 2.0 * band), cos_th, band), "G-LIMB-PURE: a facet a full 2·band inside the tangent must NOT be flagged")
+	_ok(not FFR.is_limb_facet(cos(th + 2.0 * band), cos_th, band), "G-LIMB-PURE: a facet a full 2·band beyond the tangent must NOT be flagged")
+	# (2) the flagged set over the whole globe is a bounded ring about the tangent (not empty, not the cap).
+	var ax := Vector3(0.37, 0.51, 0.77).normalized()      # an arbitrary sub-camera axis (not aligned to any facet)
+	var ring := 0
+	var disc := 0                                          # facets inside the visible cap (φ < θ_h) — the "whole cap" baseline
+	var worst_off := 0.0                                  # max |φ − θ_h| among flagged (must stay within band)
+	for face in range(6):
+		for a in range(K):
+			for b in range(K):
+				var fid := (face * K + a) * K + b
+				var c := _facet_centre(fid)
+				var dot := c.dot(ax)
+				var phi := acos(clampf(dot, -1.0, 1.0))
+				if phi < th:
+					disc += 1
+				if FFR.is_limb_facet(dot, cos_th, band):
+					ring += 1
+					worst_off = maxf(worst_off, absf(phi - th))
+	print("  G-LIMB-RING: d=%.0f θ_h=%.2f° band=%.2f°  ring=%d  disc(cap)=%d  worst|Δ|=%.3f°  cap=%d" % [
+		d, rad_to_deg(th), rad_to_deg(band), ring, disc, rad_to_deg(worst_off), FFR.LIMB_DENSE_MAX_FACETS])
+	_ok(ring > 0, "G-LIMB-RING: the silhouette ring must be non-empty at a representative orbit (got %d)" % ring)
+	_ok(ring <= FFR.LIMB_DENSE_MAX_FACETS, "G-LIMB-RING: ring %d must fit the NEVER-OOM cap %d (raise the cap or shrink the band)" % [ring, FFR.LIMB_DENSE_MAX_FACETS])
+	_ok(ring < disc / 2, "G-LIMB-RING: ring %d must be ≪ the visible cap %d (a thin shell, not the whole disc)" % [ring, disc])
+	_ok(worst_off <= band + 1.0e-6, "G-LIMB-RING: every flagged facet must lie within the band of the tangent (worst %.3f° > band %.3f°)" % [rad_to_deg(worst_off), rad_to_deg(band)])
+	# (3) off-surface / flag-off guard: a fresh node's _refresh_limb_set leaves _limb_set empty ⇒ _is_limb_dense false.
+	var ffr = FFR.new()
+	var fids := PackedInt32Array([0, 1, 2, 100, 500, 1000])
+	ffr._refresh_limb_set(fids)                            # _offsurface=false + _cam_set=false (defaults) ⇒ no selection
+	var any_dense := false
+	for fid in fids:
+		if ffr._is_limb_dense(fid):
+			any_dense = true
+	_ok(not any_dense, "G-LIMB-OFF: _refresh_limb_set must select NOTHING when off-surface / flag-off (byte-identical off-path)")
+	ffr.free()
+
+## COSMOS PLANET-VIEW §3 (B): a facet's centre unit direction — the mean of its four planar corner dirs, normalized (the
+## same construction FacetFarRing._facet_centre_dir uses). Used by _gate_limb_dense to probe the pure ring selection.
+func _facet_centre(fid: int) -> Vector3:
+	var s := Vector3.ZERO
+	for ci in range(4):
+		var c: Array = FA.facet_planar_corner(fid, ci)
+		s += Vector3(c[0], c[1], c[2])
+	return s.normalized()
 
 ## Live-placement mechanism proof: for EVERY seam, place the SAME surface g on both facets AT the true shared
 ## sphere edge point d̂ through the REAL placement function (FacetAtlas.world_to_lattice64 → lattice_to_world64)
@@ -295,6 +362,71 @@ func _probe_datum_v2() -> void:
 		_ok(max_mirror <= 1.0e-9, "G-D2-SHAPE-MIRROR: C++ formula != datum_lift by %.2e" % max_mirror)
 	else:
 		_ok(absf(max_step - 5.30) <= 0.10, "G-D2-OFF: datum_lift≡0 must leave the 5.30 step; got %.3f" % max_step)
+
+## COSMOS FS2′ EDGE WELD (docs/COSMOS-FACET-SEAMS-V2.md §2.2) — G-EDGE-WELD. Pins the near-LOD seam BLACK-LINE / BLACK-
+## CLIFF root cause and proves FP_DATUM_EDGE_WELD fixes it, as PURE geometry (flag-agnostic: the datum lift s is solved
+## independently from the frozen frame, so this runs with only FACETED sed-on — no rebuild/bake needed). For every
+## Earth seam it reproduces the apron ridge top EXACTLY as FacetLodBuilder._build_apron does (snap g UP to the fs
+## megablock grid), against the datum-baked near surface g+s the active VoxelTerrain renders:
+##   - UN-WELDED (shipped LOD apron, top = ceil(g/fs)·fs, NO +s): the near surface stands g+s ABOVE it ⇒ a downward
+##     GAP of up to the sagitta s (~5-7 blocks) at the border — the uncovered vertical band = the black seam line/face.
+##   - WELDED (FP_DATUM_EDGE_WELD, top += s): the apron rides the SAME datum ⇒ it always COVERS the near surface, the
+##     residual being only the ceil megablock snap ∈ [0, fs) (overlap-not-gap), NEVER a downward gap. s cancels exactly.
+## Also reaffirms the apron lift == the C++ near-mesh bake formula (_cpp_lift) at the ridge column, so the two meet.
+func _gate_datum_edge_weld() -> void:
+	var r := FA.R_BLOCKS
+	var fs := 2.0                            # ℓ1 near-ridge megablock pitch (A2 §7.6 pins near ridges to ℓ1, s_max=2)
+	var s_maxi := 2
+	var worst_gap_unwelded := 0.0            # max downward gap the shipped apron leaves (the black band) — expect ~sagitta
+	var worst_over := 0.0                    # max apron overcover with the weld (must stay < fs — bounded overlap)
+	var worst_under := 0.0                   # max apron UNDERCOVER with the weld (must be 0 — never a downward gap)
+	var max_mirror := 0.0                    # |independent s − C++ bake lift| at the ridge column (must be ~0)
+	var samples := 0
+	for face in range(6):
+		for a in range(0, K, 3):
+			for b in range(0, K, 3):
+				var owner := (face * K + a) * K + b
+				var params := FA.datum_bake_params(owner)
+				for slot in range(4):
+					var ring: Array = FA.seam_ring(owner, slot)
+					if ring.size() < 2:
+						continue
+					var r0: Vector3 = ring[0]; var r1: Vector3 = ring[1]
+					for t in _TS:
+						var w: Vector3 = r0.lerp(r1, t)
+						if w.length() < 1.0e-6:
+							continue
+						var d := w.normalized()
+						var g := int(TerrainConfig.profile_at_dir(d.x, d.y, d.z, r).x)
+						var la: Array = FA.world_to_lattice64(owner, w.x, w.y, w.z)
+						# The datum lift s at this ridge column, solved INDEPENDENTLY from the frozen frame (== datum_lift's
+						# −b+√(b²+R²−|p0|²), flag-agnostic so the geometry is pinned even with FP_DATUM_BAKE off here).
+						var p0: Array = FA.lattice_to_world64(owner, la[0], 0.0, la[2])
+						var nh: Array = FA.facet_normal64(owner)
+						var bb: float = p0[0] * nh[0] + p0[1] * nh[1] + p0[2] * nh[2]
+						var disc: float = bb * bb + r * r - (p0[0] * p0[0] + p0[1] * p0[1] + p0[2] * p0[2])
+						if disc < 0.0:
+							disc = 0.0
+						var s_geo: float = -bb + sqrt(disc)
+						var apron_top := float(int(ceil(float(g) / fs)) * s_maxi)   # shipped LOD apron ridge top (cell space)
+						var near_surf: float = float(g) + s_geo                      # the datum-baked near mesh surface
+						# UN-WELDED: near surface minus the (un-lifted) apron top → a positive number is a black gap.
+						worst_gap_unwelded = maxf(worst_gap_unwelded, near_surf - apron_top)
+						# WELDED: apron top gains +s → cover = (apron_top + s) − near_surf = apron_top − g ∈ [0, fs).
+						var cover: float = (apron_top + s_geo) - near_surf
+						worst_over = maxf(worst_over, cover)
+						worst_under = maxf(worst_under, -cover)
+						if bool(params.get("enabled", false)):
+							max_mirror = maxf(max_mirror, absf(_cpp_lift(params, la[0], la[2]) - s_geo))
+						samples += 1
+	print("  G-EDGE-WELD: samples=%d  un-welded worst black-gap=%.3f  welded overcover=%.3f (<fs=%.1f) undercover=%.6f  mirror=%s" % [
+		samples, worst_gap_unwelded, worst_over, fs, worst_under, str(max_mirror)])
+	_ok(samples >= 500, "G-EDGE-WELD: too few seam columns sampled (%d)" % samples)
+	_ok(worst_gap_unwelded > 1.0, "G-EDGE-WELD: the un-welded LOD apron must leave a >1-block black gap (got %.3f) — root cause not reproduced" % worst_gap_unwelded)
+	_ok(worst_under <= 1.0e-6, "G-EDGE-WELD: the welded apron must NEVER sit below the near surface (undercover %.4f) — the black band would remain" % worst_under)
+	_ok(worst_over < fs + 1.0e-6, "G-EDGE-WELD: welded apron overcover %.3f must stay < fs=%.1f (bounded overlap, not a new cliff)" % [worst_over, fs])
+	if CubeSphere.FP_DATUM_BAKE:
+		_ok(max_mirror <= 1.0e-6, "G-EDGE-WELD: apron lift != C++ near-mesh bake at the ridge by %s (tiers would not meet)" % str(max_mirror))
 
 ## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2.2.4) — G-DATUM-COLLIDE (the LIVE embed pin). The invariant: the
 ## surface the player SEES (the C++ near-mesh datum bake, y += s) and the surface they COLLIDE with (the analytic

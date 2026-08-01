@@ -17,6 +17,14 @@ extends Node3D
 
 const ENABLED := true
 const CELLS := 4                     # heightmap cells per facet edge (far LOD) — k=24 facets are small
+# COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE tuning (all DEAD with the flag off).
+const LIMB_DENSE_CELLS := 8          # silhouette-ring facets emit at this resolution (vs CELLS=4) so the limb reads round
+const LIMB_DENSE_BAND := 1.0         # limb-ring half-thickness in facet angular half-widths ⇒ a ~1-facet-thick ring
+                                     # (band_rad = this × the facet half-angle; |φ − θ_h| < band_rad flags the facet). The
+                                     # design's 1.5 gave a ~3-facet-thick ring (~148 facets); 1.0 is a true 1-facet ring.
+const LIMB_DENSE_MAX_FACETS := 128   # NEVER-OOM cap on the resident densified set. The full silhouette circumference at K=24
+                                     # is ~90 facets around, so a 1-facet ring is ~90–100 (NOT the design's optimistic 40–60);
+                                     # 128 gives headroom + the trim binds hard. Mesh delta ~+8 KB/facet ⇒ ≲ 1.0 MB peak.
 const RELIEF := 1.0                  # blocks of radial relief per (g − SEA_LEVEL)
 const BACK_CULL := 0.0               # front hemisphere only — back-side facets sit below the surface horizon
 const CAMERA_FAR := 9000.0           # the planet spans ~2R; the player camera far must reach it in faceted mode
@@ -32,10 +40,22 @@ static var env_build_main := 0
 static var env_build_worker := 0
 
 var _active_fid := -1
+# COSMOS FAR-CRUISE NEVER-BLACK (FP_FARRING_ACTIVE_NOBLACK): the active facet to emit UN-SUNK this build (the near field
+# is genuinely absent under the camera → draw at the true surface, not a sunk well), else -1. Written ONLY on the main
+# thread in _noblack_guarantee (past the _async_building guard), so the worker's _emit_cached reads a value stable for
+# its run — same single-writer / no-concurrent-write contract as _active_fid. -1 (and byte-identical) with the flag off.
+var _noblack_unsink_fid := -1
 # COSMOS FP-FIXED-FRAME re-anchor (§3): the accumulated floating-origin shift. Under the fixed frame the ring pins @
 # (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
 var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
+# COSMOS PLANET-LOD-CONFIG P0 (§2.4): the last-bound §2V skin textures, cached so set_skin_active can UNBIND them at
+# orbit (freeing the base map from the sampler → the shell falls back to the plain vertex-colour FarPalette backstop:
+# tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
+var _skin_base_tex: Texture = null
+var _skin_band_tex: Texture = null
+var _skin_cu_tex: Texture = null
+var _skin_active := true              # §2V skin currently bound (true = shipped); set false while the orbit tier owns the disc
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
 # FP_ENV_FALLBACK_EMIT: fid -> true once `_pos_cache[fid]` holds the ENV envelope (vs a cheap chord fallback still
@@ -54,7 +74,17 @@ var _benv_done: Dictionary = {}      # fid -> true (dense env envelope built, no
 # applied PER EMITTED VERTEX in _emit_cached, so a facet that transitions backstop→distant across a crossing drops the
 # sink automatically on the next rebuild (the cache is role-agnostic). NEVER populated with the flag off (zero cost).
 var _bpos_cache: Dictionary = {}     # fid -> PackedVector3Array (dense, ABSOLUTE, un-sunk)
-var _bcol_cache: Dictionary = {}     # fid -> PackedColorArray
+var _bcol_cache: Dictionary = {}
+# COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. `_limb_set` is the FROZEN silhouette-ring set (fid -> true) for the
+# CURRENT mesh build — facets straddling the horizon tangent, emitted at LIMB_DENSE_CELLS instead of CELLS=4. It is
+# recomputed on the MAIN thread at each rebuild / async dispatch (freeze contract like `_async_backstop`) so the worker
+# reads it race-free, and the dense `_limb_pos_cache`/`_limb_col_cache` are REAPED to it each refresh (resident ≤
+# LIMB_DENSE_MAX_FACETS ⇒ NEVER-OOM). The limb caches mirror `_ensure_cached`'s un-sunk construction at the denser
+# resolution (weld/env/planar), so a limb facet welds to its CELLS=4 coarse neighbours. All empty with the flag off
+# (or on the surface) ⇒ `_is_limb_dense` false everywhere ⇒ byte-identical.
+var _limb_set: Dictionary = {}       # fid -> true: on the current silhouette ring (drawn at LIMB_DENSE_CELLS)
+var _limb_pos_cache: Dictionary = {} # fid -> PackedVector3Array (LIMB_DENSE_CELLS grid, ABSOLUTE, un-sunk)
+var _limb_col_cache: Dictionary = {} # fid -> PackedColorArray     # fid -> PackedColorArray
 # COSMOS NO-PROTRUSION FIDELITY §1 F2 (FP_MID_DENSE): the set of facets currently PROMOTED to the dense grid because
 # they fall inside the ~ring-2 angular disc around the emit axis (the sub-camera / player point). A promoted facet
 # warms + emits from the SAME dense _bpos_cache/env builders the backstop uses (dense + ε-sunk envelope lower bound),
@@ -86,6 +116,12 @@ var _tri_uv2_cache: Dictionary = {}  # fid -> PackedVector2Array (96 uv2s: (face
 # Empty with FP_FACET_TEX_CLOSEUP off ⇒ _slot_of returns -1 everywhere ⇒ UV2.y == -1, byte-identical to Phase 1.
 var _closeup_slots: Dictionary = {}  # fid -> layer (live; written by set_closeup_slots on the main thread)
 var _slot_snapshot: Dictionary = {}  # fid -> layer (frozen at build entry; read by the emit — worker-safe)
+# COSMOS TEXTURED-LOD U1 (§2U.1: FP_BAND_BLOCK_MAP): the BAND slot map (fid → resident band layer). Rides UV2.y in the
+# 64+ range (64+layer), TAKING PRIORITY over the close-up slot (0..63) since the band is strictly finer. Pushed from
+# WorldManager when the baker's band_epoch bumps; `_band_slot_snapshot` is the frozen copy the mesh emit reads (same
+# main-thread freeze contract as _slot_snapshot). Empty off FP_BAND_BLOCK_MAP ⇒ UV2.y never ≥ 64 (byte-identical).
+var _band_slots: Dictionary = {}     # fid -> band layer (live; written by set_band_slots on the main thread)
+var _band_slot_snapshot: Dictionary = {}  # fid -> band layer (frozen at build entry; read by the emit — worker-safe)
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
@@ -107,6 +143,28 @@ var _sticky_hold: Dictionary = {}    # fid -> int (role-events left before this 
 # mesh — the make-before-break invariant is "every pool facet is an emitted backstop at the moment near meshes apply",
 # and that is a property of the LAST rebuild's roles, not the live `_is_backstop`. Recorded at each rebuild/swap.
 var _emitted_backstop: Dictionary = {}   # fid -> true (drawn sunk in the committed mesh)
+# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3 + round-2 live-perf fix): the per-cell occlusion-cull state.
+# `_cull_cover_query` is the near-coverage callable (fid, fid-lattice AABB) -> bool, routed to module_world.skin_near_meshed;
+# INVALID (no module / fallback path) ⇒ cull inert (byte-identical). TWO masks, DECOUPLED, so a full far-ring rebuild
+# (≈1 s SYNC) never fires per probe as coverage churns under live streaming:
+#   `_cull_mask`      — the LIVE per-cell hysteresis output, updated EVERY probe (1 = this 26-block cell is confirmed
+#                       covered). Drives the rebuild DECISION only; the emit never reads it.
+#   `_committed_cull` — the SNAPSHOT the current mesh reflects; the EMIT (`is_cell_culled`) reads THIS. Only written at a
+#                       rebuild: APPLY (settled) copies the live mask; FLUSH (safety) clears it to full emission.
+# `_cull_streak` is the matching per-cell consecutive-covered-read count (the CULL_CONFIRM=2 hysteresis). All pruned to
+# the live backstop set each probe ⇒ ≤ ~16 × 256 B, bounded (NEVER-OOM). Empty / never read with the flag off.
+# `_cull_changed` latches a LIVE-mask flip within one probe pass (settle detector); `_cull_stable_probes` counts
+# consecutive no-change probes; `_cull_last_ms` throttles the probe to CULL_REAP_MS; `_cull_last_reemit_ms` rate-limits
+# the APPLY rebuild; `_cull_reemit_count` is the rebuild tally the cost gate asserts is bounded.
+var _cull_cover_query: Callable = Callable()
+var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): LIVE 1 = culled (confirmed covered)
+var _committed_cull: Dictionary = {}     # fid -> PackedByteArray(BACKSTOP_CELLS²): what the CURRENT mesh emits (read by is_cell_culled)
+var _cull_streak: Dictionary = {}        # fid -> PackedByteArray(BACKSTOP_CELLS²): consecutive covered-read count
+var _cull_changed := false               # a LIVE-mask bit flipped this probe pass (resets the settle counter)
+var _cull_stable_probes := 0             # consecutive probes with NO live-mask change (settle detector)
+var _cull_last_ms := 0                   # throttle clock for the coverage re-probe (CULL_REAP_MS)
+var _cull_last_reemit_ms := 0            # last APPLY rebuild wall-ms (rate-limit ≥ CULL_REBUILD_MS)
+var _cull_reemit_count := 0              # far-ring rebuilds this cull has triggered (bounded — G-CV-NOCHURN-COST)
 # COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
 # (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
 # per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
@@ -217,6 +275,29 @@ var _ringhold_prev_d := -1.0
 var _ringhold_prev_usec := -1
 var _ringhold_apply_msec := -1
 
+# FP_BOOT_ASYNC (perf/voxiverse-load-profile): the boot-progressive far-ring warm state. `_boot_warm` is true while the
+# initial full-hemisphere cache is being filled across frames (after a bounded synchronous seed). `_boot_fids` is the
+# front-hemisphere set ordered NEAREST-FIRST to the active facet (so the visible horizon warms before the off-screen
+# far side); `_boot_cursor` is the next fid to warm; `_boot_last_emit_size` throttles the progressive re-emit. All inert
+# (false/0/empty, never read) with the flag off ⇒ setup() runs the shipped synchronous _rebuild_full (byte-identical).
+var _boot_warm := false
+var _boot_fids: PackedInt32Array = PackedInt32Array()
+var _boot_cursor := 0
+var _boot_last_emit_size := 0
+# FP_BOOT_ASYNC (round 4): HOLD the background warm until essential-ready fires (main.gd → open_boot_gate). During the
+# ShaderPrewarm/pre-essential-ready window the far-ring background warm was starving the prewarm's compile frames (live
+# profile: prewarm_phase1 39s at ~550ms/frame while the ring warmed 36→1716). Holding it means only the synchronous seed
+# is drawn until the player is in; then the far side fills WHILE playing (fog/near field hide the pop-in). A wall-clock
+# FAILSAFE opens the gate anyway so a missed release can never permanently strand the far hemisphere at the seed.
+var _boot_gate_open := false
+var _boot_setup_ms := 0
+const BOOT_GATE_FAILSAFE_MS := 20000   # open the warm gate this long after setup even if essential-ready never signalled
+
+## FP_BOOT_ASYNC (round 4): main.gd (via WorldManager.release_far_ring_boot_warm) calls this at essential-ready to let
+## the background far-ring warm proceed — off the prewarm/compile critical path. Idempotent; no-op with the flag off.
+func open_boot_gate() -> void:
+	_boot_gate_open = true
+
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
 	_recompute_sticky()              # TIER-DEPTH P1: seed the sticky backstop set so ring-1 is sunk from the first build (no-op with the flag off)
@@ -224,8 +305,78 @@ func setup(active_fid: int) -> void:
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
 	add_child(_mi)
-	_rebuild_full()                  # initial build — synchronous (spawn is masked by the ShaderPrewarm hold)
+	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
+	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
+	if CubeSphere.FP_BOOT_ASYNC:
+		_boot_begin()
+	else:
+		_rebuild_full()              # initial build — synchronous (spawn is masked by the ShaderPrewarm hold)
 	set_process(true)
+
+## FP_BOOT_ASYNC: seed the far ring with a bounded, nearest-first subset of the front hemisphere synchronously (covering
+## the spawn horizon the fog/near field do not), emit it, and arm the per-frame progressive warm for the remainder. Uses
+## the SAME _emit_cached_only / _ensure_emit_cached path the true-orbit progressive emit uses, so the mesh is index-aligned
+## and every downstream consumer is unchanged.
+func _boot_begin() -> void:
+	_boot_setup_ms = Time.get_ticks_msec()
+	_boot_fids = _order_front_by_proximity()
+	var seed := mini(CubeSphere.BOOT_SEED_FACETS, _boot_fids.size())
+	for i in range(seed):
+		_ensure_emit_cached(_boot_fids[i])
+	_boot_cursor = seed
+	_boot_warm = _boot_cursor < _boot_fids.size()
+	_emit_cached_only = true          # emit only the cached (growing) subset — visible_fids() cache-filters
+	_rebuild_full()                   # draws the seed now
+	_boot_last_emit_size = _pos_cache.size() + _bpos_cache.size()
+
+## FP_BOOT_ASYNC: the front-hemisphere fids ordered by DESCENDING alignment to the active facet's centre (nearest first),
+## so the visible local horizon warms before the off-screen far side. Cheap dot-product sort over ~1716 dirs (once).
+func _order_front_by_proximity() -> PackedInt32Array:
+	var fids := visible_fids()        # full front set (active/excluded already filtered on the surface)
+	var acd := _centre_dir(_active_fid)
+	var scored: Array = []
+	scored.resize(fids.size())
+	for i in fids.size():
+		var cd := _centre_dir(fids[i])
+		scored[i] = [-(cd[0] * acd[0] + cd[1] * acd[1] + cd[2] * acd[2]), int(fids[i])]  # negate → ascending sort = nearest first
+	scored.sort()
+	var out := PackedInt32Array()
+	out.resize(scored.size())
+	for i in scored.size():
+		out[i] = int((scored[i] as Array)[1])
+	return out
+
+## FP_BOOT_ASYNC: warm the next batch of far-ring facet caches under a per-frame budget, re-emitting the growing cached
+## subset every SHELL_REEMIT_GROWTH facets (and once at completion). When the whole front is cached it restores the
+## shipped full-emit path (_emit_cached_only=false) and requests one clean rebuild. Runs on the main thread — no worker.
+func _boot_warm_step() -> void:
+	var t0 := Time.get_ticks_usec()
+	var budget_us := int(WARM_BUDGET_MS * 1000.0)
+	while _boot_cursor < _boot_fids.size():
+		_ensure_emit_cached(_boot_fids[_boot_cursor])
+		_boot_cursor += 1
+		if Time.get_ticks_usec() - t0 > budget_us:
+			break
+	var done := _boot_cursor >= _boot_fids.size()
+	var sz := _pos_cache.size() + _bpos_cache.size()
+	if done or (sz - _boot_last_emit_size) >= CubeSphere.SHELL_REEMIT_GROWTH:
+		_boot_last_emit_size = sz
+		_emit_cached_only = true
+		_rebuild_full()               # emit the grown cached subset
+	if done:
+		_boot_warm = false
+		_emit_cached_only = false     # everything cached → restore the shipped full-emit for later crossings/re-emits
+		_pending = true               # one clean full rebuild next frame (all cached ⇒ identical to the shipped mesh)
+
+## FP_BOOT_ASYNC introspection for verify_boot_async.gd — read-only. Facets whose emit cache is built so far.
+func boot_cached_count() -> int:
+	return _pos_cache.size() + _bpos_cache.size()
+## The full front-hemisphere facet count (the target the boot warm converges to).
+func boot_front_total() -> int:
+	return visible_fids().size()
+## Still filling the initial cache across frames?
+func boot_warming() -> bool:
+	return _boot_warm
 
 ## FP3 §6.1 / FP-S1(d) crossing: re-place the planet into facet `new_fid`'s render frame (rigid, O(1)) and DEFER the
 ## exclusion/terminator re-emit + any new-facet noise caching to _process (off the crossing frame, under a budget).
@@ -341,7 +492,17 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 		return
 	var drift := acos(clampf(dir[0] * _emit_dir_last[0] + dir[1] * _emit_dir_last[1] + dir[2] * _emit_dir_last[2], -1.0, 1.0))
 	var dtheta := theta_h - _emit_thetah_last                 # SIGNED: > 0 = the visible cap grew (a climb); < 0 = shrank (a descent)
-	if shell_fall_should_reemit(fall_hold, floored != _emit_floored_last, dtheta, drift, Time.get_ticks_msec() - _last_snapshot_ms):
+	var reemit := shell_fall_should_reemit(fall_hold, floored != _emit_floored_last, dtheta, drift, Time.get_ticks_msec() - _last_snapshot_ms)
+	# COSMOS DEV-FLY HANG (FP_SHELL_CLIMB_NO_CHURN): below OFFSURFACE_Y the emitted cap is FLOORED to 90° and stays there
+	# for every θ_h < 67° (all altitudes below ~9900 blocks), so a powered climb's growing θ_h fires the |Δθ_h| > 5°
+	# trigger to re-emit an IDENTICAL hemisphere set — a redundant blocky-mesh rebuild + GL/ANGLE upload (the render-thread
+	# churn suspected in the dev-fly hard-hang). Suppress the re-emit ONLY when the committed set is PROVABLY unchanged:
+	# still floored, the cap cos is identical to the committed cap, and the axis has not swept. Axis drift, a floor/regime
+	# crossing, or any genuine cap change all still re-emit above (correctness — no limb holes). Off ⇒ shipped (byte-identical).
+	if reemit and CubeSphere.FP_SHELL_CLIMB_NO_CHURN and floored and floored == _emit_floored_last \
+			and is_equal_approx(new_cos, _emit_cos) and drift <= deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0):
+		reemit = false                                        # identical floored cap + no axis sweep → the rebuild would emit the SAME set (churn)
+	if reemit:
 		_shell_snapshot(dir, new_cos, theta_h, floored)
 		_last_snapshot_ms = Time.get_ticks_msec()
 
@@ -449,6 +610,24 @@ func set_pool_excluded(fids: Array) -> void:
 ## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
+	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
+	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
+	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
+	# so THIS frame's rebuild honours the fresh mask.
+	_cull_update()
+	# FP_BOOT_ASYNC: while the initial hemisphere cache is still filling, warm the next budgeted batch + progressive re-emit,
+	# then return — the boot warm owns the ring until the front is fully cached (it then restores the shipped paths below).
+	# A crossing during boot-warm still renders: set_active re-places the absolute mesh rigidly; its deferred exclusion
+	# re-emit is served by the shipped _pending path once boot-warm completes. Off ⇒ never entered (byte-identical).
+	if CubeSphere.FP_BOOT_ASYNC and _boot_warm:
+		# Round 4: hold the warm off the prewarm/compile critical path until essential-ready opens the gate (or the
+		# wall-clock failsafe trips). Until then only the synchronous seed is drawn — the far side does not contend
+		# with the shader-compile frames.
+		if not _boot_gate_open and Time.get_ticks_msec() - _boot_setup_ms >= BOOT_GATE_FAILSAFE_MS:
+			_boot_gate_open = true
+		if _boot_gate_open:
+			_boot_warm_step()
+		return
 	_prewarm_step(_dt)               # COSMOS-ORBITAL-SHELL S2: one-shot whole-planet warm (no-op unless FP_SHELL_PREWARM + off-surface)
 	if _async_building:
 		return
@@ -460,6 +639,10 @@ func _process(_dt: float) -> void:
 	# reap any promotion that left it (bounded _bpos_cache). Here — past the `_async_building` guard (worker idle, safe to
 	# erase caches), before the warm/emit below so this frame's warm builds/dispatches the freshly-promoted set. No-op off.
 	_recompute_mid_dense(p)
+	# COSMOS FAR-CRUISE NEVER-BLACK: guarantee the sub-camera (active) facet paints an opaque backstop with NO warm-lag
+	# black and NO sunk well where the near field is absent. Past the _async_building guard (safe to touch caches), before
+	# the regime branches so THIS frame's emit honours it. No-op with the flag off / off-surface (byte-identical).
+	_noblack_guarantee(p)
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -578,6 +761,62 @@ func _surface_converge_emit(p: Array) -> void:
 		_begin_rebuild()                          # emits visible_fids(true) — cache-ready facets only, sunk backstops included
 	_srf_was_done = done
 	_srf_converged = done                         # fully cached + emitted ⇒ idle until the next role-event re-sets _pending
+
+## COSMOS FAR-CRUISE NEVER-BLACK: on the FLOORED surface, guarantee the sub-camera (active) facet paints an opaque
+## backstop with NO warm-lag black gap and NO sunk well where the near field is absent. Runs each non-building frame
+## (past the _async_building guard, before the regime branches) so it holds in every surface regime. (a) force a cheap
+## dense CHORD into _bpos_cache the instant the active facet's cache is missing — so the cache-filtered emit never drops
+## it (kills the BLACK); (b) probe the near field UNDER the camera and, when it is NOT meshed, mark the active facet to
+## emit UN-SUNK (true surface); (c) set _pending on any state change / when it is not currently drawn so the emit path
+## re-draws it once (then the idle short-circuits hold — no churn). Off / off-surface / no active facet ⇒ inert (byte-
+## identical). NEVER-OOM: one facet's existing dense cache + one int, no per-frame alloc, no growth with walk distance.
+func _noblack_guarantee(p: Array) -> void:
+	if not (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER):
+		return
+	if _shell_orbit() or _active_fid < 0:
+		_noblack_unsink_fid = -1
+		return
+	# Only guarantee when the active facet is genuinely in the emitted front (it always is on the floored surface —
+	# _front_visible forces it — but stay defensive against a degenerate cull axis).
+	if not _front_visible(_active_fid, p[0], p[1]):
+		_noblack_unsink_fid = -1
+		return
+	var fid := _active_fid
+	# (a) IMMEDIATE cache — never wait for the per-frame warm to reach the sub-camera facet. A missing cache is dropped
+	# from the cache-filtered emit set (visible_fids(true) / _emit_cache_ready) → the initial BLACK. A dense chord is
+	# cheap (~289 profile samples, one facet) and gives full coverage NOW; the normal warm upgrades it to the envelope.
+	var built_now := false
+	if not _bpos_cache.has(fid):
+		_ensure_backstop_chord_cached(fid)
+		built_now = true
+	# (b) un-sink WHERE the near field is genuinely absent under the camera (probe the SAME coverage callable U2 uses).
+	var uncovered := not _noblack_near_meshed(fid)
+	var new_unsink := fid if uncovered else -1
+	# (c) re-emit once on any change or if the active facet is not currently drawn; then the idle short-circuits hold.
+	if built_now or new_unsink != _noblack_unsink_fid or not _emitted.has(fid):
+		_pending = true
+	_noblack_unsink_fid = new_unsink
+
+## COSMOS FAR-CRUISE NEVER-BLACK: is the near voxel field actually meshed in a TIGHT column UNDER THE CAMERA on the
+## active facet? Uses the SAME (fid, fid-lattice AABB) → module_world.skin_near_meshed (godot_voxel is_area_meshed)
+## callable the U2 cull uses. An INVALID callable (GDScript / no-module path) ⇒ assume COVERED (keep the shipped SUNK
+## backstop — never worse than today). The probe point is the sub-camera surface point under the camera-set axis (else
+## the facet centre) mapped into the facet's own lattice — the frame is_area_meshed operates in (as skin_near_meshed
+## documents). Main thread only (reads the live _emit_axis / _cull_cover_query).
+func _noblack_near_meshed(fid: int) -> bool:
+	if not _cull_cover_query.is_valid():
+		return true
+	var dir: Array
+	if _cam_set and (_emit_axis[0] != 0.0 or _emit_axis[1] != 0.0 or _emit_axis[2] != 0.0):
+		dir = _emit_axis                                 # ABSOLUTE sub-camera direction (under the player)
+	else:
+		dir = _facet_centre_dir(fid)                     # fallback: the facet centre (no camera-set axis maintained)
+	var r := FacetAtlas.R_BLOCKS
+	var l: Array = FacetAtlas.world_to_lattice64(fid, dir[0] * r, dir[1] * r, dir[2] * r)
+	var h := CubeSphere.NOBLACK_PROBE_HALF
+	var yh := CubeSphere.NOBLACK_PROBE_YHALF
+	var aabb := AABB(Vector3(float(l[0]) - h, float(l[1]) - yh, float(l[2]) - h), Vector3(2.0 * h, 2.0 * yh, 2.0 * h))
+	return bool(_cull_cover_query.call(fid, aabb))
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
@@ -724,6 +963,7 @@ func _dispatch_async_rebuild() -> void:
 	# S1b: in the true-orbit progressive path _emit_cached_only filters to cache-ready facets, so the worker (which reads
 	# _pos_cache/_bpos_cache) never touches an uncached facet; every other path passes false ⇒ the shipped full front set.
 	_async_fids = visible_fids(false) if _async_env_warm else visible_fids(_emit_cached_only)
+	_refresh_limb_set(_async_fids)   # COSMOS PLANET-VIEW §3 (B): freeze the silhouette-ring set on MAIN before the worker reads it (no-op off)
 	# COSMOS far-ring full coverage (§4): freeze the DENSE-TARGET role on the MAIN thread so the worker never reads
 	# `_excluded` live (set_pool_excluded may mutate it mid-run). `_async_backstop` = backstop ∪ mid-dense disc (the
 	# facets the worker warms + emits dense); `_async_mid` = the mid-dense-only subset (drawn COARSE as a fallback until
@@ -954,6 +1194,13 @@ func _warm_front_true_budget(nrm: Array, thresh: float) -> bool:
 ## cos(θ_emit) under the COSMOS-ORBITAL-SHELL S1 camera-set law. The active/excluded skip is axis-independent
 ## (near voxels cover those facets), so the shell law changes only the axis (nrm) + the cut (thresh), never this.
 func _front_visible(fid: int, nrm: Array, thresh: float) -> bool:
+	# COSMOS FAR-CRUISE NEVER-BLACK: the sub-camera (active) facet is DIRECTLY under the camera on the floored surface —
+	# it must ALWAYS be drawn. A stale / slack camera-set emit axis must never cull it into a black hole (the far-cruise
+	# symptom). This forces it into every warmed / emitted / uncached-count scan (all route through here). Off / off-
+	# surface / no full-cover ⇒ untouched (byte-identical); on-surface it was already a backstop, so this only defeats a
+	# cull, never changes an ordinary facet.
+	if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER and fid == _active_fid and not _shell_orbit():
+		return true
 	# COSMOS far-ring full coverage (§2): with FP_FARRING_FULL_COVER on, the active facet + `_excluded` set are NO
 	# LONGER skipped — they are drawn as sunk "backstop" facets (see _is_backstop / _emit_cached) so the near-disk
 	# annular hole is filled. Only the back-hemisphere cull remains. With the flag off, the shipped exclusions apply
@@ -1012,6 +1259,352 @@ func _emit_dense(fid: int) -> bool:
 ## class). Off / not promoted ⇒ false.
 func _is_mid_dense(fid: int) -> bool:
 	return _mid_dense.has(fid) and not _is_backstop(fid)
+
+## COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE: is facet `fid` on the CURRENT silhouette ring? Reads ONLY the frozen
+## `_limb_set` (computed on the main thread at the last rebuild/dispatch), so it is race-free on the async worker. Empty
+## with the flag off / on the surface ⇒ false everywhere ⇒ byte-identical.
+func _is_limb_dense(fid: int) -> bool:
+	return _limb_set.has(fid)
+
+## COSMOS PLANET-VIEW §3 (B): the PURE silhouette-ring test, factored static so the headless gate drives it with synthetic
+## d/R. A facet whose centre makes angle φ = acos(centre·ĉ) with the sub-camera axis ĉ is on the limb ring when it is within
+## `band_rad` of the horizon-tangent angle θ_h = acos(cos_theta_h) (cos θ_h = R/d). Symmetric about the tangent so the ring
+## is ~1 facet thick on BOTH sides of the exact silhouette.
+static func is_limb_facet(centre_dot_c: float, cos_theta_h: float, band_rad: float) -> bool:
+	var phi := acos(clampf(centre_dot_c, -1.0, 1.0))
+	var th := acos(clampf(cos_theta_h, -1.0, 1.0))
+	return absf(phi - th) < band_rad
+
+## The cube-sphere facet angular HALF-width (rad) = half the facet edge angle (π/2K). The limb band is LIMB_DENSE_BAND × this.
+static func _facet_half_angle() -> float:
+	return (PI * 0.5 / float(FacetAtlas.K)) * 0.5
+
+## COSMOS PLANET-VIEW §3 (B): recompute the silhouette-ring set from the CURRENT emit-axis/horizon snapshot and REAP stale
+## dense caches. Called on the MAIN thread at each rebuild/dispatch (before the worker reads `_limb_set`), passed the visible
+## fids so it only ever considers emitted facets. ONLY off-surface (orbit) under the camera-set law; on the surface / with the
+## flag off it clears the set + reaps ALL limb caches ⇒ `_is_limb_dense` false everywhere (byte-identical). Bounds the resident
+## dense set to LIMB_DENSE_MAX_FACETS (closest-to-tangent kept) — NEVER-OOM. Rides the EXISTING cap-drift/re-emit cadence (no
+## new re-emit trigger): the axis/θ_h only change on a `_shell_snapshot`, so the ring is only recomputed when a rebuild fires.
+func _refresh_limb_set(fids: PackedInt32Array) -> void:
+	var want := {}
+	if CubeSphere.FP_FARRING_LIMB_DENSE and _offsurface and _cam_set and _emit_thetah_last >= 0.0:
+		var cos_th := cos(_emit_thetah_last)              # = R/d at the last snapshot (the horizon tangent)
+		var band := LIMB_DENSE_BAND * _facet_half_angle()
+		var picked: Array = []
+		for fid in fids:
+			var cd := _centre_dir(fid)
+			var dot: float = cd[0] * _emit_axis[0] + cd[1] * _emit_axis[1] + cd[2] * _emit_axis[2]
+			if is_limb_facet(dot, cos_th, band):
+				# key = angular distance from the exact tangent (so the cap trim keeps the truest limb facets)
+				picked.append([absf(acos(clampf(dot, -1.0, 1.0)) - _emit_thetah_last), int(fid)])
+		if picked.size() > LIMB_DENSE_MAX_FACETS:
+			picked.sort()                                 # ascending by |Δ|; keep the closest-to-tangent cap-many
+			picked.resize(LIMB_DENSE_MAX_FACETS)
+		for e in picked:
+			want[int((e as Array)[1])] = true
+	_limb_set = want
+	# Reap dense caches no longer on the ring so resident bytes track the CURRENT limb only (bounded ⇒ NEVER-OOM).
+	for fid in _limb_pos_cache.keys():
+		if not want.has(fid):
+			_limb_pos_cache.erase(fid)
+			_limb_col_cache.erase(fid)
+
+## COSMOS PLANET-VIEW §3 (B): build (once) facet `fid`'s DENSE (LIMB_DENSE_CELLS) ABSOLUTE-coord, UN-SUNK terrain grid,
+## mirroring `_ensure_cached`'s env/weld/planar branch structure at the higher resolution so it welds to its CELLS=4 coarse
+## neighbours (EDGE-CANON shared-node values are resolution-independent). Idempotent + pure sampling (profile_at_dir +
+## FacetAtlas only), so it is safe to warm lazily on the async worker (single-writer under the `_async_building` gate).
+func _ensure_limb_cached(fid: int) -> void:
+	if _limb_pos_cache.has(fid):
+		return
+	var cells := LIMB_DENSE_CELLS
+	var g: Array
+	if TierPlace.env_all_on():
+		g = _env_weld_grid(fid, cells)                    # min-envelope dense grid (same builder the backstop uses)
+	elif CubeSphere.FP_SHELL_WELD:
+		g = _weld_chord_arrays_n(fid, cells)              # radial weld from the shared corner dirs
+	else:
+		g = _planar_grid_arrays(fid, cells)               # shipped planar-corner path at the denser resolution
+	_limb_pos_cache[fid] = g[0]
+	_limb_col_cache[fid] = g[1]
+
+## COSMOS PLANET-VIEW §3 (B): the `cells`-parametrized twin of `_weld_chord_arrays` (which is hardcoded to CELLS). Same
+## radial weld, denser grid. Used only by the limb path (gated) so the shipped CELLS builder is untouched (byte-identical).
+func _weld_chord_arrays_n(fid: int, cells: int) -> Array:
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	var stride := cells + 1
+	for gj in range(stride):
+		for gi in range(stride):
+			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+	return [pos, col]
+
+## COSMOS PLANET-VIEW §3 (B): the `cells`-parametrized twin of `_ensure_cached`'s shipped planar-corner path. Same bilerp +
+## radial-relief construction, denser grid. Used only by the limb path (gated) so the shipped builder is untouched.
+func _planar_grid_arrays(fid: int, cells: int) -> Array:
+	var c0 := FacetAtlas.facet_planar_corner(fid, 0)
+	var c1 := FacetAtlas.facet_planar_corner(fid, 1)
+	var c2 := FacetAtlas.facet_planar_corner(fid, 2)
+	var c3 := FacetAtlas.facet_planar_corner(fid, 3)
+	var stride := cells + 1
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	for gj in range(stride):
+		for gi in range(stride):
+			var s := float(gi) / float(cells)
+			var t := float(gj) / float(cells)
+			var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
+			var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
+			var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
+			var ln := sqrt(bx * bx + by * by + bz * bz)
+			var dx := bx / ln; var dy := by / ln; var dz := bz / ln
+			var prof := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
+			var g := int(prof.x)
+			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))
+			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+	return [pos, col]
+
+## COSMOS PLANET-VIEW §3 (B): expand a limb facet's dense grid into the fast-path tri soup (same two tris/cell, same winding,
+## same per-vertex colours as `_emit_cached`) and append to `_build_fast`'s packed arrays — the limb analogue of
+## `_append_backstop_tris`. Un-sunk (ε-sunk under env_all, matching the coarse emit) so it welds to the coarse neighbours.
+func _append_limb_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
+		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
+	_ensure_limb_cached(fid)
+	var gp: PackedVector3Array = _sunk_positions(_limb_pos_cache[fid]) if TierPlace.env_all_on() else _limb_pos_cache[fid]
+	var gc: PackedColorArray = _limb_col_cache[fid]
+	var cells := LIMB_DENSE_CELLS
+	var stride := cells + 1
+	var tex := _tex_on()
+	var t_a := 0; var t_b := 0; var t_k := 1
+	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			pos.push_back(gp[i0]); pos.push_back(gp[i2]); pos.push_back(gp[i1])
+			pos.push_back(gp[i1]); pos.push_back(gp[i2]); pos.push_back(gp[i3])
+			col.push_back(gc[i0]); col.push_back(gc[i2]); col.push_back(gc[i1])
+			col.push_back(gc[i1]); col.push_back(gc[i2]); col.push_back(gc[i3])
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv.push_back(Vector2(u0, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v0))
+				uv.push_back(Vector2(u1, v0)); uv.push_back(Vector2(u0, v1)); uv.push_back(Vector2(u1, v1))
+				for _i in range(6):
+					uv2.push_back(fuv2)
+
+# --- COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED, §2U.3): occlusion-cull covered backstop cells -------------------
+
+## Wire the near-coverage callable (fid, fid-lattice AABB) -> bool — the SAME signal the skin's covered-tile skip uses,
+## routed by WorldManager to module_world.skin_near_meshed (godot_voxel is_area_meshed). An INVALID callable (no module /
+## GDScript fallback path) leaves the cull inert ("never covered" ⇒ nothing culled) — the design's disclosed fallback.
+func set_cover_query(q: Callable) -> void:
+	_cull_cover_query = q
+
+## Is the U2 cull active this run? Requires the flag AND a valid coverage callable (module path). Off / no query ⇒ no
+## cell is ever suppressed and no state is allocated → byte-identical.
+func _cull_on() -> bool:
+	return CubeSphere.FP_FARRING_CULL_COVERED and _cull_cover_query.is_valid()
+
+## COSMOS TEXTURED-LOD U3 (FP_FARRING_LEVEL, §2U.3): is the SAME-LEVEL sink reduction active this run? Requires the
+## flag AND the U2 cull actually running (_cull_on: FP_FARRING_CULL_COVERED + a VALID coverage probe) — the sink can
+## only collapse to the ε guard where the cull guarantees near/far never coexist. Off / no query ⇒ the full backstop
+## sink stays (self-disables to today's sink on the GDScript fallback path). Byte-identical when either flag is off.
+func _level_on() -> bool:
+	return CubeSphere.FP_FARRING_LEVEL and _cull_on()
+
+## THE ASYMMETRIC-HYSTERESIS STATE MACHINE (headlessly testable — the gate drives it with mocked booleans). Advance cell
+## `ci` of facet `fid` by ONE coverage read `covered`. Culling requires CULL_CONFIRM consecutive COVERED reads; un-culling
+## is INSTANT on the first UNcovered read (streak → 0, mask bit cleared). Returns the new culled bit. Latches `_cull_changed`
+## on any flip so `_process` re-emits. Holes are worse than overdraw, so every ambiguity resolves toward DRAWING.
+## INVARIANT (G-CV-SAFE): the returned bit is 1 ⇒ the LAST read was covered ⇒ culled ⊆ covered, ALWAYS.
+func cull_feed(fid: int, ci: int, covered: bool) -> bool:
+	var ncell := CubeSphere.BACKSTOP_CELLS * CubeSphere.BACKSTOP_CELLS
+	if ci < 0 or ci >= ncell:
+		return false
+	var mask: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+	var streak: PackedByteArray = _cull_streak.get(fid, PackedByteArray())
+	if mask.size() != ncell:
+		mask = PackedByteArray(); mask.resize(ncell)   # zero-filled: nothing culled
+		streak = PackedByteArray(); streak.resize(ncell)
+	var was: int = mask[ci]
+	if covered:
+		var s: int = streak[ci]
+		if s < CubeSphere.CULL_CONFIRM:
+			s += 1
+		streak[ci] = s
+		mask[ci] = 1 if s >= CubeSphere.CULL_CONFIRM else 0
+	else:
+		streak[ci] = 0
+		mask[ci] = 0                                     # INSTANT un-cull — the first uncovered read always draws
+	if mask[ci] != was:
+		_cull_changed = true
+	_cull_mask[fid] = mask
+	_cull_streak[fid] = streak
+	return mask[ci] == 1
+
+## Emit-time read: does the CURRENT mesh suppress facet `fid`'s cell `ci`? Reads the COMMITTED snapshot (NOT the live
+## churning mask) so the emitted geometry only ever changes at a rebuild — never per probe. False unless the cull is
+## active. Pure lookup.
+func is_cell_culled(fid: int, ci: int) -> bool:
+	if not _cull_on():
+		return false
+	var mask: PackedByteArray = _committed_cull.get(fid, PackedByteArray())
+	return ci >= 0 and ci < mask.size() and mask[ci] == 1
+
+## Would any committed-culled cell be a HOLE right now — i.e. is it un-culled in the LIVE mask (near has retreated /
+## un-meshed there)? Drives the prompt FLUSH safety path. A committed 1 with a live 0 means the mesh omits a cell the near
+## field no longer covers ⇒ must re-emit. The +CULL_DILATE dilation makes the live 0 arrive while the tight cell is still
+## covered, so this fires BEFORE an actual hole.
+func _cull_committed_unsafe() -> bool:
+	for fid in _committed_cull.keys():
+		var cm: PackedByteArray = _committed_cull[fid]
+		var lm: PackedByteArray = _cull_mask.get(fid, PackedByteArray())
+		for ci in range(cm.size()):
+			if cm[ci] == 1 and (ci >= lm.size() or lm[ci] == 0):
+				return true
+	return false
+
+## Do the live and committed masks differ in their EFFECTIVE cull set (which cells are 1)? An all-zero facet array and an
+## absent facet are equal (both cull nothing) — so an APPLY of a mask that culls nothing never fires a spurious rebuild.
+func _cull_mask_differs() -> bool:
+	for fid in _cull_mask.keys():
+		if _facet_cull_differs(_cull_mask[fid], _committed_cull.get(fid, PackedByteArray())):
+			return true
+	for fid in _committed_cull.keys():
+		if not _cull_mask.has(fid) and _any_bit_set(_committed_cull[fid]):
+			return true
+	return false
+
+## Bit-wise cull difference between two per-facet arrays, treating an out-of-range index as 0.
+func _facet_cull_differs(a: PackedByteArray, b: PackedByteArray) -> bool:
+	var n := maxi(a.size(), b.size())
+	for ci in range(n):
+		var av: int = a[ci] if ci < a.size() else 0
+		var bv: int = b[ci] if ci < b.size() else 0
+		if av != bv:
+			return true
+	return false
+
+func _any_bit_set(a: PackedByteArray) -> bool:
+	for v in a:
+		if v == 1:
+			return true
+	return false
+
+## Deep-copy the live mask into the committed snapshot (APPLY). PackedByteArrays are value types; duplicate so a later live
+## mutation cannot alias the committed emit source.
+func _cull_commit_apply() -> void:
+	_committed_cull.clear()
+	for fid in _cull_mask.keys():
+		_committed_cull[fid] = (_cull_mask[fid] as PackedByteArray).duplicate()
+
+## Clear the committed snapshot (FLUSH → full emission). Used by the safety path so a stale cull can never outlive the
+## near coverage that justified it.
+func _cull_commit_flush() -> void:
+	_committed_cull.clear()
+
+## DECOUPLED rebuild decision (round-2 live-perf fix — headlessly testable; `now_ms` injectable). Given the freshly-probed
+## live mask this pass and whether it changed, decide whether the far ring must re-emit, and update the committed snapshot:
+##   FLUSH  — a committed-culled cell just un-culled (near retreated): clear committed to full emission NOW (safety, holes
+##            worse than overdraw), un-rate-limited. Returns true.
+##   APPLY  — the live mask has been STABLE for CULL_SETTLE_PROBES probes AND differs from committed AND ≥ CULL_REBUILD_MS
+##            since the last APPLY: copy the live mask into committed (the settled standing-still optimization). Returns true.
+##   else   — no rebuild (committed unchanged) → during sustained streaming the churning live mask triggers NOTHING.
+func _cull_decide_reemit(changed: bool, now_ms: int) -> bool:
+	_cull_stable_probes = 0 if changed else _cull_stable_probes + 1
+	if _cull_committed_unsafe():
+		_cull_commit_flush()
+		_cull_reemit_count += 1
+		return true
+	if _cull_stable_probes >= CubeSphere.CULL_SETTLE_PROBES and _cull_mask_differs() \
+			and now_ms - _cull_last_reemit_ms >= CubeSphere.CULL_REBUILD_MS:
+		_cull_commit_apply()
+		_cull_last_reemit_ms = now_ms
+		_cull_reemit_count += 1
+		return true
+	return false
+
+## The fid-lattice AABB the coverage probe asks about for backstop cell (gi,gj), DILATED by ±CULL_DILATE horizontally and
+## banded by ±CULL_Y_MARGIN radially. Built from the cell's 4 dense-cache corner positions (ABSOLUTE world) mapped back to
+## the facet's own lattice via FacetAtlas.world_to_lattice64 — the SAME frame godot_voxel's is_area_meshed operates in (as
+## skin_near_meshed documents), so no new remap is introduced. Dilation makes the probed box a SUPERSET of the visible
+## cell ⇒ is_area_meshed (which is true only when the WHOLE box is meshed) gets STRICTER, i.e. cull is harder / safer, and
+## the box uncovers at its dilated boundary while the tight cell is still covered → the cell re-emits before near retreats.
+func _cull_cell_aabb(fid: int, gi: int, gj: int) -> AABB:
+	var pos: PackedVector3Array = _bpos_cache[fid]
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var i0 := gj * stride + gi
+	var idx := [i0, i0 + 1, i0 + stride, i0 + stride + 1]
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for k in idx:
+		var p: Vector3 = pos[k]
+		var l: Array = FacetAtlas.world_to_lattice64(fid, p.x, p.y, p.z)
+		var lx := float(l[0]); var ly := float(l[1]); var lz := float(l[2])
+		lo.x = minf(lo.x, lx); lo.y = minf(lo.y, ly); lo.z = minf(lo.z, lz)
+		hi.x = maxf(hi.x, lx); hi.y = maxf(hi.y, ly); hi.z = maxf(hi.z, lz)
+	var d := CubeSphere.CULL_DILATE
+	var ym := CubeSphere.CULL_Y_MARGIN
+	var pos_lo := Vector3(lo.x - d, lo.y - ym, lo.z - d)
+	var size := Vector3((hi.x - lo.x) + 2.0 * d, (hi.y - lo.y) + 2.0 * ym, (hi.z - lo.z) + 2.0 * d)
+	return AABB(pos_lo, size)
+
+## Probe cell (gi,gj) of backstop facet `fid`: ask the near-coverage callable whether the dilated fid-lattice AABB is fully
+## meshed. False on an invalid callable (fallback path) — never over-cull. Main thread only (reads the live _bpos_cache).
+func _cull_probe_cell(fid: int, gi: int, gj: int) -> bool:
+	if not _cull_cover_query.is_valid():
+		return false
+	return bool(_cull_cover_query.call(fid, _cull_cell_aabb(fid, gi, gj)))
+
+## Per-frame (from `_process`, throttled to CULL_REAP_MS): re-probe every cell of every LIVE backstop facet whose dense cache
+## exists, advancing the hysteresis state machine (cheap O(cells) — is_area_meshed octree reads only). Prunes the masks to
+## the current backstop set (NEVER-OOM). Then the DECOUPLED decision (`_cull_decide_reemit`) fires a far-ring rebuild ONLY
+## on a settle (APPLY) or a safety (FLUSH) transition — NOT per probe — so the ~1 s sync rebuild can no longer run every
+## frame as coverage churns under live streaming (the round-2 regression). No-op unless the cull is active.
+func _cull_update() -> void:
+	if not _cull_on():
+		if not _cull_mask.is_empty() or not _committed_cull.is_empty():
+			_cull_mask.clear(); _cull_streak.clear(); _committed_cull.clear()   # flag flipped off mid-run — drop all state
+		return
+	var now := Time.get_ticks_msec()
+	if now - _cull_last_ms < CubeSphere.CULL_REAP_MS:
+		return
+	_cull_last_ms = now
+	_cull_changed = false                                # per-pass live-mask-change latch (settle detector)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	# The set of facets that CAN be near-covered = live backstop facets with a dense cache (near meshes only around them).
+	var live := {}
+	for fid in _bpos_cache.keys():
+		if _is_backstop(fid):
+			live[fid] = true
+			for gj in range(cells):
+				for gi in range(cells):
+					cull_feed(fid, gj * cells + gi, _cull_probe_cell(fid, gi, gj))
+	# Prune LIVE + streak state for facets no longer backstop (bounded footprint); a committed facet that left the set is
+	# dropped too, and that counts as a live-mask change so the settle counter restarts (the committed emit is stale).
+	for fid in _cull_mask.keys():
+		if not live.has(fid):
+			_cull_mask.erase(fid); _cull_streak.erase(fid)
+			_cull_changed = true
+	for fid in _committed_cull.keys():
+		if not live.has(fid):
+			_committed_cull.erase(fid)
+			_cull_changed = true
+	# DECOUPLED: rebuild only on a settle/safety transition — never per probe.
+	if _cull_decide_reemit(_cull_changed, now):
+		_pending = true                                 # re-emit through whichever _process path is active
 
 ## FP_MID_DENSE gate visibility: does facet `fid` emit from the dense cache right now? (public accessor for
 ## verify_no_protrusion's mid-dense reconstruction tier.)
@@ -1116,6 +1709,7 @@ func _rebuild_full() -> void:
 	transform = _placement_xform()   # absolute → active-lattice render frame (identity under FP-FIXED-FRAME)
 	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the close-up slot map for this build (no-op off)
 	var fids := visible_fids(_emit_cached_only)   # S1b: cache-filtered in the true-orbit progressive path, full set otherwise (shipped)
+	_refresh_limb_set(fids)          # COSMOS PLANET-VIEW §3 (B): freeze the silhouette-ring set + reap stale limb caches (no-op off)
 	_emitted.clear()
 	_emitted_backstop.clear()   # TIER-DEPTH P1: record which fids this build draws SUNK (the make-before-break gate reads it)
 	for fid in fids:
@@ -1128,7 +1722,9 @@ func _rebuild_full() -> void:
 	# T2e: time the mesh BUILD (assembler) and the SWAP (mesh assign / RID create + instance update) separately — two
 	# ticks_usec reads either side of the split assignment, telemetry-only, no behavioural change.
 	var t_build := Time.get_ticks_usec()
-	var new_mesh: Mesh = _build_fast(fids) if CubeSphere.FP_FARRING_FAST_REBUILD else _build_surfacetool(fids)
+	# FP_BLOCKY_FARRING: the fast (memcpy) path replays a pre-triangulated SMOOTH tri soup — route the sync rebuild
+	# through _build_surfacetool → _emit_cached so it emits BLOCKS. Off ⇒ the shipped fast/surfacetool choice (byte-identical).
+	var new_mesh: Mesh = _build_fast(fids) if (CubeSphere.FP_FARRING_FAST_REBUILD and not CubeSphere.FP_BLOCKY_FARRING) else _build_surfacetool(fids)
 	var build_us := Time.get_ticks_usec() - t_build
 	var t_swap := Time.get_ticks_usec()
 	_mi.mesh = new_mesh
@@ -1142,6 +1738,8 @@ func _rebuild_full() -> void:
 		for fid in fids:
 			if _emit_dense(fid):   # FP_MID_DENSE: dense facets (backstop ∪ ready mid-dense) carry the denser tri count
 				tris += extra
+	if CubeSphere.FP_FARRING_LIMB_DENSE and not _limb_set.is_empty():
+		tris += _limb_set.size() * (LIMB_DENSE_CELLS * LIMB_DENSE_CELLS - CELLS * CELLS) * 2   # limb-ring facets carry the denser tri count
 	_push_event("sync", build_us, swap_us, tris * 3)   # T2e: verts = 3·tris (cheap; no surface read-back on the crossing frame)
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
 
@@ -1208,6 +1806,8 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 		# vertex order/winding matches _emit_cached exactly, so the later global generate_normals is bit-identical.
 		if _emit_dense(fid):   # FP_MID_DENSE: backstop ∪ ready mid-dense → the dense sunk expansion (off the memcpy fast path)
 			_append_backstop_tris(pos, col, fid, uv, uv2)
+		elif _is_limb_dense(fid):   # COSMOS PLANET-VIEW §3 (B): a limb facet → the dense un-sunk expansion (off the memcpy fast path)
+			_append_limb_tris(pos, col, fid, uv, uv2)
 		else:
 			_ensure_tri_cached(fid)
 			pos.append_array(_tri_pos_cache[fid])
@@ -1307,6 +1907,10 @@ func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE):
 ## COSMOS LOD-TEXTURE Phase 4: the driver's off-surface decision (camera-set + not floored) — WorldManager gates the
 ## close-up promotion on this (the close-up tier is an off-surface / orbit-approach feature; on-surface it stays base map).
 func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
+## COSMOS TEXTURED-LOD V4 (FP_SKIN_SSE): the camera's scale-correct distance from the body centre (blocks), computed each
+## frame by apply_camera_set. WorldManager forwards it to FacetTexBaker.update so the screen-space promotion law can size a
+## facet's on-screen blocks. 0 until the camera-set driver has run ⇒ the baker's SSE law falls back to the regime path.
+func shell_cam_dist() -> float: return _dbg_d
 func shell_emit_cos() -> float: return _emit_cos                # cos(θ_emit): the current emit threshold
 func coarse_cache_size() -> int: return _pos_cache.size()       # S2: how many facets' coarse caches are warmed (prewarm ≤ 6·K²)
 func prewarm_cursor() -> int: return _prewarm_cursor            # S2: prewarm progress (≥ 6·K² ⇒ one-shot complete)
@@ -1855,6 +2459,12 @@ func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float
 ## blocks (p − p̂·BACKSTOP_SINK) so the coarse backstop sits strictly behind the opaque near voxels. Computed once per
 ## emit so a shared grid vertex is not re-normalized per triangle. Pure math — safe on the async worker thread.
 func _sunk_positions(p: PackedVector3Array) -> PackedVector3Array:
+	# COSMOS TEXTURED-LOD U3 (FP_FARRING_LEVEL): with the U2 cull live (near/far never coexist where covered), the
+	# radial sink COLLAPSES from the ~13-block visual sink to the ENV_EPS_G correctness guard — the far ring reads at
+	# the near surface's LEVEL. Self-disables to the full sink when the cull is inert (invalid coverage probe). Fringe
+	# z-order at the thin un-culled seam rides the shipped FAR_BIAS_K depth bias, not this sink. Off ⇒ full sink verbatim.
+	if _level_on():
+		return _sunk_positions_amt(p, TierPlace.backstop_sink_level())
 	return _sunk_positions_amt(p, TierPlace.backstop_sink())   # TIER-DEPTH P2: ε guard under the envelope, else BACKSTOP_SINK
 
 # FP_ENV_FLOORED_ASYNC: sink by an EXPLICIT amount — a not-yet-enveloped chord fallback uses the FULL sink
@@ -1873,7 +2483,9 @@ func _sunk_positions_amt(p: PackedVector3Array, sink: float) -> PackedVector3Arr
 func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
 		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
 	_ensure_backstop_cached(fid)
-	var gp := _sunk_positions(_bpos_cache[fid])
+	# COSMOS FAR-CRUISE NEVER-BLACK: un-sink the sub-camera facet where the near field is absent (true surface, not a
+	# sunk well). Off / covered ⇒ the shipped sunk positions (byte-identical).
+	var gp: PackedVector3Array = _bpos_cache[fid] if (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid) else _sunk_positions(_bpos_cache[fid])
 	var gc: PackedColorArray = _bcol_cache[fid]
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
@@ -1887,8 +2499,12 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 		fuv2 = Vector2(float(d[0]), _slot_of(fid))
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
+	# U2: cull confirmed-covered cells on the fast (memcpy) backstop path too — not appended at all (byte-identical off).
+	var cull_dense := _cull_on()
 	for gj in range(cells):
 		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride
@@ -1913,20 +2529,153 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 ## Pure CPU + const reads only — safe on the async worker thread (no scene-tree / RenderingServer access). `sunk` is
 ## decided by the CALLER (live `_is_backstop` on the main-thread sync path; the frozen `_async_backstop` snapshot on the
 ## worker) so this function never reads the mutable `_excluded` off-thread.
+## FP_BLOCKY_FARRING: emit facet `fid`'s cached grid as flat-topped BLOCKS instead of the smooth welded surface. Per
+## grid cell: a FLAT top at MIN(the 4 corner radii) + a vertical wall on each internal edge (closing the height step —
+## watertight) + a facet-edge skirt. `pos` already carries the env sink, so the block top (a min of the corners) sits
+## ≤ the smooth bilinear surface everywhere ⇒ no-protrusion holds a fortiori (G-BLK-RING). The far-ring material is
+## cull_disabled, so wall winding is free.
+## COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (caller passes tex=true + the facet `fid`) each top quad carries the
+## SAME node-param UVs the smooth _emit_cached path emits — UV = ((a+node_s)/K,(b+node_t)/K), UV2 = (face, slot) — and the
+## walls/skirts INHERIT their top-edge nodes' UVs (a vertical smear of the block's own texel stripe). UVs never move a
+## vertex (no-protrusion unchanged, G-BT-NOPROT). Off (tex=false, the default / the shipped blocky call) ⇒ NO set_uv/set_uv2
+## is issued and the emit is byte-identical to shipped (G-BT-OFF). Returns the triangle count. Reads only the passed arrays
+## (+ fid decode, a pure function) → thread-safe on the worker, same as _emit_cached.
+func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int = -1, tex: bool = false) -> int:
+	var ncell := cells * cells
+	var top_r := PackedFloat32Array(); top_r.resize(ncell)
+	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
+	for i in range(stride * stride):
+		var p: Vector3 = pos[i]
+		var l := p.length()
+		dirs[i] = (p / l) if l > 1.0 else Vector3.UP
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0c := gj * stride + gi
+			top_r[gj * cells + gi] = minf(minf(pos[i0c].length(), pos[i0c + 1].length()),
+				minf(pos[i0c + stride].length(), pos[i0c + stride + 1].length()))
+	# COSMOS TEXTURED-LOD T1 (§1.2): decode the facet's tex params ONCE (identical to _emit_cached). node UV for grid node
+	# (ni,nj) = ((a + ni/cells)/K, (b + nj/cells)/K) — the SAME pure function of loop indices the smooth path uses.
+	var fuv2 := Vector2.ZERO; var t_a := 0; var t_b := 0; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		t_a = d[1]; t_b = d[2]
+		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
+	# skirt = one coarse block's radial pitch (the block's own height scale) — facet edges never see through.
+	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
+	# U2: this facet's cells are cullable only when it is a dense (BACKSTOP_CELLS) backstop AND the cull is active. top_r
+	# above is still computed for EVERY cell so an emitted cell adjacent to a culled one keeps its correct flank wall.
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and fid >= 0 and _cull_on()
+	var n := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue                    # confirmed covered by near voxels — not emitted at all (no draw, no poke-through)
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			var r: float = top_r[gj * cells + gi]
+			var c: Color = col[i0]
+			var t0 := dirs[i0] * r; var t1 := dirs[i1] * r; var t2 := dirs[i2] * r; var t3 := dirs[i3] * r
+			# node-param UVs of this cell's 4 corners (only computed under tex; off ⇒ Vector2.ZERO, never emitted).
+			var uv0 := Vector2.ZERO; var uv1 := Vector2.ZERO; var uv2 := Vector2.ZERO; var uv3 := Vector2.ZERO
+			if tex:
+				var uu0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var uu1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var vv0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var vv1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv0 = Vector2(uu0, vv0); uv1 = Vector2(uu1, vv0)   # i0=(gi,gj)  i1=(gi+1,gj)
+				uv2 = Vector2(uu0, vv1); uv3 = Vector2(uu1, vv1)   # i2=(gi,gj+1) i3=(gi+1,gj+1)
+			# FLAT top (2 tris) — all four corners at the same (min) radius. UVs = each corner's node param.
+			if tex:
+				st.set_uv(uv0); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t0)
+				st.set_uv(uv2); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t2)
+				st.set_uv(uv1); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t1)
+				st.set_uv(uv1); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t1)
+				st.set_uv(uv2); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t2)
+				st.set_uv(uv3); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(t3)
+			else:
+				st.set_color(c); st.add_vertex(t0)
+				st.set_color(c); st.add_vertex(t2)
+				st.set_color(c); st.add_vertex(t1)
+				st.set_color(c); st.add_vertex(t1)
+				st.set_color(c); st.add_vertex(t2)
+				st.set_color(c); st.add_vertex(t3)
+			n += 2
+			# +gi internal edge (shared corners i1,i3) — ONE wall per edge, max→min; boundary edge → skirt.
+			if gi + 1 < cells:
+				var rn: float = top_r[gj * cells + gi + 1]
+				if absf(r - rn) > 0.01:
+					n += _emit_wall(st, dirs[i1], dirs[i3], r, rn, c if r >= rn else col[i0 + 1], tex, uv1, uv3, fuv2)
+			else:
+				n += _emit_wall(st, dirs[i1], dirs[i3], r, r - skirt, c, tex, uv1, uv3, fuv2)
+			# +gj internal edge (shared corners i2,i3).
+			if gj + 1 < cells:
+				var rd: float = top_r[(gj + 1) * cells + gi]
+				if absf(r - rd) > 0.01:
+					n += _emit_wall(st, dirs[i2], dirs[i3], r, rd, c if r >= rd else col[i0 + stride], tex, uv2, uv3, fuv2)
+			else:
+				n += _emit_wall(st, dirs[i2], dirs[i3], r, r - skirt, c, tex, uv2, uv3, fuv2)
+			# -gi / -gj FACET-boundary skirts (first row/col only) — the outer silhouette against the tier beneath.
+			if gi == 0:
+				n += _emit_wall(st, dirs[i0], dirs[i2], r, r - skirt, c, tex, uv0, uv2, fuv2)
+			if gj == 0:
+				n += _emit_wall(st, dirs[i0], dirs[i1], r, r - skirt, c, tex, uv0, uv1, fuv2)
+	return n
+
+## FP_BLOCKY_FARRING: a vertical wall quad between two edge directions from top radius to bottom (2 tris). Material is
+## cull_disabled so winding is free; emits the higher-block's colour. Caller guarantees a real step (or a skirt).
+## COSMOS TEXTURED-LOD T1 (§1.2): under `tex`, both the top AND bottom vert of each side inherit that side's top-edge node
+## UV (`uva`/`uvb`) — a vertical smear of the top's texel stripe down the wall; UV2 is the facet-constant `fuv2`. Off ⇒ no
+## set_uv/set_uv2 → byte-identical to the shipped wall.
+func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float, c: Color,
+		tex: bool = false, uva: Vector2 = Vector2.ZERO, uvb: Vector2 = Vector2.ZERO, fuv2: Vector2 = Vector2.ZERO) -> int:
+	var hi := maxf(r0, r1); var lo := minf(r0, r1)
+	var a_hi := da * hi; var b_hi := db * hi; var a_lo := da * lo; var b_lo := db * lo
+	if tex:
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_hi)
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_lo)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_hi)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_hi)
+		st.set_uv(uva); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(a_lo)
+		st.set_uv(uvb); st.set_uv2(fuv2); st.set_color(c); st.add_vertex(b_lo)
+	else:
+		st.set_color(c); st.add_vertex(a_hi)
+		st.set_color(c); st.add_vertex(a_lo)
+		st.set_color(c); st.add_vertex(b_hi)
+		st.set_color(c); st.add_vertex(b_hi)
+		st.set_color(c); st.add_vertex(a_lo)
+		st.set_color(c); st.add_vertex(b_lo)
+	return 2
+
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
 	var cells := CELLS
 	if sunk:
+		# COSMOS FAR-CRUISE NEVER-BLACK: the sub-camera facet where the near field is genuinely absent emits UN-SUNK — at
+		# the TRUE radial surface, so it reads as a seamless coarse backstop (never a sunk well). No near voxels exist here
+		# to hide behind, so there is nothing to z-fight. Off / covered ⇒ the shipped sink below (byte-identical).
+		if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid:
+			pos = _bpos_cache[fid]
 		# FP_ENV_FLOORED_ASYNC: a dense CHORD fallback (not yet enveloped) uses the FULL sink so it stays ≤ the near
 		# surface; an enveloped dense cache uses the ε sink (the envelope already carries the lower bound). Off ⇒ the
 		# shipped backstop_sink() everywhere (byte-identical; _benv_done is empty).
-		if CubeSphere.FP_ENV_FLOORED_ASYNC and not _benv_done.has(fid):
+		elif CubeSphere.FP_ENV_FLOORED_ASYNC and not _benv_done.has(fid):
 			pos = _sunk_positions_amt(_bpos_cache[fid], TierPlace.backstop_sink_chord())
 		else:
 			pos = _sunk_positions(_bpos_cache[fid])
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
+	elif _is_limb_dense(fid):
+		# COSMOS PLANET-VIEW §3 (B): a silhouette-ring facet emits its DENSE (LIMB_DENSE_CELLS) un-sunk grid so the limb
+		# reads round. ε-sunk under env_all exactly like the coarse path below, so it welds to its CELLS=4 neighbours.
+		_ensure_limb_cached(fid)
+		pos = _sunk_positions(_limb_pos_cache[fid]) if TierPlace.env_all_on() else _limb_pos_cache[fid]
+		col = _limb_col_cache[fid]
+		cells = LIMB_DENSE_CELLS
 	else:
 		# NO-PROTRUSION §0.3: under FP_ENV_ALL the coarse HORIZON cache is an envelope lower bound too — apply the
 		# SAME ε sink the backstop gets so the retained emit-time sink covers the between-fine-sample residual (R-A).
@@ -1935,6 +2684,13 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
+	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
+	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
+	# COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (∧ FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE, i.e. _tex_on()) the blocky
+	# emit ALSO carries the satellite-page node-param UVs so the mega-blocks are textured, not flat-coloured. Off ⇒ tex is
+	# false ⇒ NO UV arrays (byte-identical to shipped blocky). _tex_on() gates FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE.
+	if CubeSphere.FP_BLOCKY_FARRING:
+		return _emit_blocky(st, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on())
 	# COSMOS LOD-TEXTURE Phase 1 (§1.3): decode the facet's texture params ONCE. With the flag off `tex` is false
 	# and the emit runs the shipped set_color/add_vertex sequence VERBATIM (byte-identical, zero overhead).
 	var tex := _tex_on()
@@ -1950,8 +2706,12 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool) -> int:
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k)
 		inv_c = 1.0 / float(cells)
+	# U2: cull confirmed-covered cells on the dense (BACKSTOP_CELLS) smooth path — not emitted at all (byte-identical off).
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and _cull_on()
 	for gj in range(cells):
 		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
 			var i0 := gj * stride + gi
 			var i1 := i0 + 1
 			var i2 := i0 + stride
@@ -2066,18 +2826,30 @@ func _tex_on() -> bool:
 func _cu_on() -> bool:
 	return CubeSphere.FP_FACET_TEX_CLOSEUP and _tex_on()
 
-## The close-up layer for `fid` from the FROZEN build snapshot (worker-safe), or −1 (base-map fallback). Empty
-## snapshot (close-up off / not driven) ⇒ −1 everywhere ⇒ UV2.y == −1, byte-identical to Phase 1.
+## COSMOS TEXTURED-LOD U1: the band tier is live (needs the base textured ring + block detail + its own flag). Off ⇒
+## every band path (64+ slot, band_map sampler, band_facet/band_n uniforms) is inert ⇒ mesh + material unchanged.
+func _bm_on() -> bool:
+	return CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_BLOCK_DETAIL and _tex_on()
+
+## The slot for `fid` from the FROZEN build snapshot (worker-safe), fed to UV2.y at emit. A BAND facet wins with 64+layer
+## (the shader's real-block path); else the close-up layer (0..63); else −1 (base-map / tiled fallback). Empty snapshots
+## (both tiers off / not driven) ⇒ −1 everywhere ⇒ byte-identical to Phase 1.
 func _slot_of(fid: int) -> float:
+	if _band_slot_snapshot.has(fid):
+		return float(64 + int(_band_slot_snapshot[fid]))
 	return float(_slot_snapshot.get(fid, -1))
 
-## COSMOS LOD-TEXTURE Phase 4: refresh the frozen slot snapshot the mesh emit reads. MAIN thread only (both build
-## entries call it before any worker dispatch), so the async worker's _emit_cached reads a map stable for its run.
+## COSMOS LOD-TEXTURE Phase 4 / U1: refresh the frozen slot snapshots the mesh emit reads. MAIN thread only (both build
+## entries call it before any worker dispatch), so the async worker's _emit_cached reads maps stable for its run.
 func _refresh_slot_snapshot() -> void:
 	if _cu_on():
 		_slot_snapshot = _closeup_slots.duplicate()
 	elif not _slot_snapshot.is_empty():
 		_slot_snapshot = {}
+	if _bm_on():
+		_band_slot_snapshot = _band_slots.duplicate()
+	elif not _band_slot_snapshot.is_empty():
+		_band_slot_snapshot = {}
 
 func _tex_decode(fid: int) -> Array:
 	var kb := FacetAtlas.k_of(fid)
@@ -2190,7 +2962,7 @@ void fragment() { ALBEDO = v_col; }
 # bit-preserved near); above 1800 the smooth satellite image wins. ONE opaque draw — a fragment albedo blend,
 # no transparency, no sorting. base_map is bound each session by set_facet_tex (null until then → black texels,
 # irrelevant since wt≈0 near where it would show). Phase 1 has NO close-up branch (closeup_map compiled out).
-const _SHELL_ABS_TEX_SHADER := "shader_type spatial;
+const _SHELL_ABS_TEX_LIGHT := "shader_type spatial;
 render_mode unshaded, cull_disabled;
 uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float night_floor = 0.06;
@@ -2218,7 +2990,8 @@ void vertex() {
 	v_face = UV2.x;
 	v_cam = distance(wp, CAMERA_POSITION_WORLD);
 }
-void fragment() {
+"
+const _SHELL_ABS_TEX_ALBEDO := "void fragment() {
 	vec4 tx = texture(base_map, vec3(v_uv, v_face));
 	// COVERAGE GATE + UN-PREMULTIPLY (§ live-fix 2): the base map is PREMULTIPLIED alpha, so recover the true
 	// (un-darkened) colour by dividing rgb by coverage — near a bake frontier this cancels the mip/bilinear
@@ -2227,10 +3000,17 @@ void fragment() {
 	// black from orbit) and the un-premultiply degenerate case falls back to v_col_raw (doubly safe). A baked
 	// facet (a=1) cross-fades to the satellite image on the shipped 600..1800 distance ramp. One opaque draw.
 	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
-	float wt = smoothstep(600.0, 1800.0, v_cam) * tx.a;
+	float wt = tx.a;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate; mip/LOD handles scaling
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
+# COSMOS TEXTURED-LOD §2V PREP (F3): the shell tex shader string is SPLIT into a LIGHT head (uniforms + the
+# sun/shade/tint lighting law + vertex()) and an ALBEDO tail (fragment() — texture sampling + the ALBEDO
+# composite). Concatenated they are BYTE-IDENTICAL to the pre-split string (verify_shot_prep G-SP-SHADER-
+# IDENTICAL pins it against the frozen golden). V1 (unified lighting) edits ONLY the LIGHT head; V2 (band
+# shot) edits ONLY the ALBEDO tail — different string constants, no merge conflict. Nothing else changes:
+# every existing reader of _SHELL_ABS_TEX_SHADER keeps working (it is now the derived concatenation).
+const _SHELL_ABS_TEX_SHADER := _SHELL_ABS_TEX_LIGHT + _SHELL_ABS_TEX_ALBEDO
 
 # COSMOS LOD-TEXTURE Phase 4 (§1.2 T2t / §1.3): the CLOSE-UP variant — the Phase-1 tex shader PLUS a second
 # Texture2DArray sampled per-facet at 128² (8× finer). The slot rides UV2.y (v_slot; −1 ⇒ base-map only). The exact
@@ -2239,7 +3019,7 @@ void fragment() {
 # CLOSEUP_NEAR, cam_dist) sharpens on approach; a missing/uncovered slot degrades to the base map (softening, never a
 # hole). Compiled ONLY under FP_FACET_TEX_CLOSEUP; the base branch is byte-identical to _SHELL_ABS_TEX_SHADER so a
 # facet with slot −1 renders exactly the Phase-1 result. cu_facet[64] MUST match CubeSphere.CLOSEUP_MAX.
-const _SHELL_ABS_TEX_CU_SHADER := "shader_type spatial;
+const _SHELL_ABS_TEX_CU_LIGHT := "shader_type spatial;
 render_mode unshaded, cull_disabled;
 uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
 uniform float night_floor = 0.06;
@@ -2274,7 +3054,8 @@ void vertex() {
 	v_slot = UV2.y;
 	v_cam = distance(wp, CAMERA_POSITION_WORLD);
 }
-void fragment() {
+"
+const _SHELL_ABS_TEX_CU_ALBEDO := "void fragment() {
 	vec4 tx = texture(base_map, vec3(v_uv, v_face));
 	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
 	float cov = tx.a;
@@ -2288,10 +3069,149 @@ void fragment() {
 		col = mix(col, cucol, wc);
 		cov = max(cov, cu.a);
 	}
-	float wt = smoothstep(600.0, 1800.0, v_cam) * cov;
+	float wt = cov;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate
 	ALBEDO = mix(v_col_raw, col, wt) * v_st;
 }
 "
+# COSMOS TEXTURED-LOD §2V PREP (F3): the shell tex shader string is SPLIT into a LIGHT head (uniforms + the
+# sun/shade/tint lighting law + vertex()) and an ALBEDO tail (fragment() — texture sampling + the ALBEDO
+# composite). Concatenated they are BYTE-IDENTICAL to the pre-split string (verify_shot_prep G-SP-SHADER-
+# IDENTICAL pins it against the frozen golden). V1 (unified lighting) edits ONLY the LIGHT head; V2 (band
+# shot) edits ONLY the ALBEDO tail — different string constants, no merge conflict. Nothing else changes:
+# every existing reader of _SHELL_ABS_TEX_CU_SHADER keeps working (it is now the derived concatenation).
+const _SHELL_ABS_TEX_CU_SHADER := _SHELL_ABS_TEX_CU_LIGHT + _SHELL_ABS_TEX_CU_ALBEDO
+
+# COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1/§2R.3): inject the block-FACE detail sampling into
+# the ALREADY-COMPILED shell tex shader string — no new shader_type, no new compiled program (same one shell program per
+# session). Two string replacements on the EXISTING code: (1) declare the shared `detail_map` (REPEAT, mip) + the per-
+# texel `id_map` (NEAREST) samplers after `base_map`; (2) replace the final ALBEDO line so, when a texel's id > 0, the
+# composed colour `col` is modulated by that material's real block face at ONE tile per macro texel (buv = v_uv·384,
+# REPEAT). Because each detail layer is mean-normalised (mean 0.5) and `face_col = col·detail·2.0`, the pattern mips back
+# to `col` with distance ⇒ far degrades to exactly the colour map (§2R.2). Off FP_BLOCK_DETAIL ⇒ the code is returned
+# UNCHANGED (byte-identical shader string, identical program) — the G-BD-OFF identity. Applied to BOTH tex variants
+# (base + close-up): the base id/frequency modulates whatever `col` the fragment composed (close-up id twin deferred).
+const _DETAIL_UNIFORMS := "uniform sampler2DArray detail_map : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2DArray id_map : filter_nearest;
+const float DETAIL_PAGE = 384.0;
+"
+const _DETAIL_ALBEDO := "	int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+	vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+	ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+"
+
+# COSMOS TEXTURED-LOD U1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.1: FP_BAND_BLOCK_MAP): the BAND real-block injection,
+# ADDITIVE on top of the FP_BLOCK_DETAIL injection — same string-splice discipline, ZERO new shader_type/compiled
+# programs (still exactly ONE per shell string). For a BAND facet (UV2.y ≥ 64 → band slot = UV2.y − 64) the fragment
+# reads the per-block material id from `band_map` at the fragment's block coord (buv = facet-local-uv · band_n[slot])
+# and composites detail_map[id] at the intra-block UV (fract(buv)) — reconstructing PER PIXEL the analytic real
+# top-down composite of the facet's ACTUAL blocks at their ACTUAL positions. A non-band facet (UV2.y < 64) falls
+# through to the §2R.1 tiled id_map path unchanged (far-far degrades gracefully). Injected only under FP_BAND_BLOCK_MAP;
+# off ⇒ the shader string is EXACTLY the FP_BLOCK_DETAIL result (G-BB-OFF byte-identity). BAND_LAYERS is interpolated
+# as a literal so the GLSL array sizes are integer-constant.
+const _BAND_UNIFORMS := "uniform sampler2DArray band_map : filter_nearest;
+uniform vec2 band_facet[%d];
+uniform vec2 band_n[%d];
+uniform float band_k = 24.0;
+"
+const _BAND_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		vec2 _buv = _luv * _N;
+		ivec2 _ib = clamp(ivec2(_buv), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? (col * texture(detail_map, vec3(fract(_buv), float(_bid))).rgb * 2.0) : col;
+		ALBEDO = mix(v_col_raw, _bcol, wt) * v_st;
+	} else {
+		int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+		vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+		ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+	}
+"
+# COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1: FP_BAND_SHOT): the SHOT band branch. Identical
+# addressing to _BAND_ALBEDO, but the band_map is RG8 {block_id, shade}: read BOTH channels (.rg), decode R→id (the top
+# block INCLUDING trees, since surface_shot composited the canopy), and MULTIPLY the sun-independent shade byte (.g) into
+# the per-block face so the composite is `col · detail_tile[id] · 2 · shade` = detail_tile[id] × tint × shade — the real
+# top-down shot with its baked AO/hillshade/canopy/water depth. The live sun/moon shade·tint (v_st) is applied on top
+# UNCHANGED (single-owner rule §2V.6 F4: v_st owns dynamic light, band shade owns static depth — no double-darkening).
+# The far-far ELSE tiled path is byte-identical to _BAND_ALBEDO's. Injected only when FP_BAND_SHOT is on (else _BAND_ALBEDO
+# verbatim); still ONE string splice ⇒ zero new compiled programs. %d = BAND_LAYERS (same literal as _BAND_ALBEDO).
+const _BAND_SHOT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		vec2 _buv = _luv * _N;
+		ivec2 _ib = clamp(ivec2(_buv), ivec2(0), ivec2(_N) - ivec2(1));
+		vec2 _rg = texelFetch(band_map, ivec3(_ib, _bs), 0).rg;
+		int _bid = int(_rg.r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? (col * texture(detail_map, vec3(fract(_buv), float(_bid))).rgb * 2.0 * _rg.g) : col;
+		ALBEDO = mix(v_col_raw, _bcol, wt) * v_st;
+	} else {
+		int _mid = int(texelFetch(id_map, ivec3(clamp(ivec2(v_uv * DETAIL_PAGE), ivec2(0), ivec2(int(DETAIL_PAGE) - 1)), int(v_face + 0.5)), 0).r * 255.0 + 0.5);
+		vec3 _face = col * texture(detail_map, vec3(v_uv * DETAIL_PAGE, float(_mid))).rgb * 2.0;
+		ALBEDO = mix(v_col_raw, (_mid > 0) ? _face : col, wt) * v_st;
+	}
+"
+static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_MAP, shot := CubeSphere.FP_BAND_SHOT) -> String:
+	if not CubeSphere.FP_BLOCK_DETAIL:
+		return code
+	code = code.replace(
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + _DETAIL_UNIFORMS)
+	code = code.replace(
+		"	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _DETAIL_ALBEDO)
+	# COSMOS TEXTURED-LOD U1: layer the BAND real-block path on top when FP_BAND_BLOCK_MAP is on. Additive: declare the
+	# band uniforms after the detail ones, carry UV2.y into a v_bslot varying, and swap the tiled ALBEDO block for the
+	# band-branching one (band facet ⇒ real per-block map; else the identical tiled path). Byte-identical to the
+	# FP_BLOCK_DETAIL result when the flag is off. `band` is a param (defaults to the flag) so the gate can build both.
+	if band:
+		var bl := CubeSphere.BAND_LAYERS
+		code = code.replace(_DETAIL_UNIFORMS, _DETAIL_UNIFORMS + (_BAND_UNIFORMS % [bl, bl]))
+		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+		# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band branch reads RG8 {id, shade} — it multiplies the baked
+		# sun-independent shade into the per-block face so ALBEDO = detail_tile[id] × tint × shade (the real shot incl the
+		# baked AO/hillshade depth). `shot` is a param (defaults to the flag) so the gate can build both; off ⇒ the U1 L8
+		# id-only band branch VERBATIM (byte-identical). Both variants are ONE string splice — zero new compiled programs.
+		var band_albedo := _BAND_SHOT_ALBEDO if shot else _BAND_ALBEDO
+		code = code.replace(_DETAIL_ALBEDO, band_albedo % bl)
+		# When the close-up variant is live, its UV2.y also carries band slots (64+): guard the close-up branch to the
+		# 0..63 slot space so a band facet never indexes closeup_map out of range. No-op on the base tex shader.
+		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+	return code
+
+# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): swap the shell LIGHT head's inline
+# lighting law for the SHARED VoxiLight.SHADE_GLSL snippet (string-included — pure concatenation, ZERO new shader_type /
+# compiled program). Four surgical replacements, all on the LIGHT head ONLY (the ALBEDO tail / texture sampling is
+# untouched, so V2 never conflicts): (1) the 3-uniform block → the snippet (which declares sun_dir/night_floor/term_mu +
+# moonshine + the helpers + voxi_shade); (2) delete the now-duplicate inline helper fns; (3) delete the inline mu/shade/
+# tint compute; (4) emit the shade·tint via voxi_shade(n, sun_dir). Adds the moonshine floor the far shell lacked; the
+# TRUE planet-radial normal n = normalize(wp − centre) is ALREADY the shell's normal (centre = MODEL·0), so the far
+# texel now matches the near block top exactly. Applies to BOTH tex variants and the non-tex _SHELL_ABS_SHADER (their
+# v_st / v_col emit lines differ — both handled). `unified` is a param (defaults to the flag) so the gate builds both.
+# Off ⇒ every anchor is left untouched (String.replace of an absent/identity anchor is a no-op) ⇒ code returned VERBATIM.
+static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
+	if not unified:
+		return code
+	# (1) delete the inline helper functions FIRST — before the snippet is inserted — so this only strips the shell's
+	# own copy and never the identical block the snippet re-supplies (order matters: SHADE_GLSL contains these lines).
+	code = code.replace(
+		"float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }\nvec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }\nfloat _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }\nfloat _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }\n",
+		"")
+	# (2) uniforms → shared snippet (declares sun_dir/night_floor/term_mu/moonshine + helpers + voxi_shade)
+	code = code.replace(
+		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform float night_floor = 0.06;\nuniform float term_mu = 0.12;\n",
+		VoxiLight.SHADE_GLSL)
+	# (3) delete the inline mu/shade/tint compute (voxi_shade now carries it)
+	code = code.replace(
+		"	float mu = dot(n, normalize(sun_dir));\n	float shade = night_floor + (1.0 - night_floor) * _day(mu);\n	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));\n",
+		"")
+	# (4) emit shade·tint via the shared law — the tex variants store v_st, the non-tex shell folds it into v_col
+	code = code.replace("	v_st = vec3(shade) * tint;\n", "	v_st = voxi_shade(n, sun_dir);\n")
+	code = code.replace("	v_col = COLOR.rgb * shade * tint;\n", "	v_col = COLOR.rgb * voxi_shade(n, sun_dir);\n")
+	return code
 
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
@@ -2305,14 +3225,25 @@ func _make_material() -> Material:
 		# COSMOS LOD-TEXTURE Phase 4: the close-up shader variant wins when FP_FACET_TEX_CLOSEUP is on (it subsumes the
 		# Phase-1 tex shader — a slot of −1 renders the identical base-map result). Off ⇒ the Phase-1 / shipped string.
 		if _cu_on():
-			sh2.code = _SHELL_ABS_TEX_CU_SHADER
+			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER)
 		else:
-			sh2.code = _SHELL_ABS_TEX_SHADER if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+		# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): string-include the SHARED VoxiLight lighting law into the LIGHT head
+		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
+		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
+		sh2.code = _apply_shade_unified(sh2.code)
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
-		sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
-		sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		# Unified: the ONE uniform set (values from VoxiLight — night_floor 0.06 == SHELL_NIGHT_FLOOR, moonshine floor).
+		# Off: the shipped SHELL_NIGHT_FLOOR / TERMINATOR_MU (the moonshine set is a no-op — the shader has no such uniform).
+		if CubeSphere.FP_SHADE_UNIFIED:
+			sm2.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+			sm2.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+			sm2.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+		else:
+			sm2.set_shader_parameter("night_floor", CosmosSky.SHELL_NIGHT_FLOOR)
+			sm2.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
 		if _cu_on():
 			sm2.set_shader_parameter("cu_k", float(FacetAtlas.K))
 			sm2.set_shader_parameter("cu_near", CubeSphere.CLOSEUP_NEAR)
@@ -2322,6 +3253,19 @@ func _make_material() -> Material:
 			for i in range(CubeSphere.CLOSEUP_MAX):
 				seed[i] = Vector2(-1.0, -1.0)
 			sm2.set_shader_parameter("cu_facet", seed)
+		# COSMOS TEXTURED-LOD U1: seed the band reverse-maps to sentinels (no band facet resident yet). band_map is bound
+		# later by set_facet_band once the baker built the array; band_facet/band_n arrive via set_band_slots.
+		if _bm_on():
+			sm2.set_shader_parameter("band_k", float(FacetAtlas.K))
+			var bfacet := PackedVector2Array()
+			var bn := PackedVector2Array()
+			bfacet.resize(CubeSphere.BAND_LAYERS)
+			bn.resize(CubeSphere.BAND_LAYERS)
+			for i in range(CubeSphere.BAND_LAYERS):
+				bfacet[i] = Vector2(-1.0, -1.0)
+				bn[i] = Vector2(0.0, 0.0)
+			sm2.set_shader_parameter("band_facet", bfacet)
+			sm2.set_shader_parameter("band_n", bn)
 		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
@@ -2359,7 +3303,9 @@ func set_terminator_sun_dir(sun_dir: Vector3) -> void:
 ## reads it from MODEL_MATRIX so it is exact under the scaled placement. No-op unless the flag is on and the
 ## material is the v2 shader ⇒ flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
 func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
-	if not CubeSphere.FP_SHELL_ABSOLUTE or _mi == null:
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also feed the sun when the biased-tier fallback material carries the far
+	# ring (FP_SHELL_ABSOLUTE off, tier path) so its unified self-shade tracks the Sun. Off both flags ⇒ byte-identical.
+	if not (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED) or _mi == null:
 		return
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
@@ -2371,18 +3317,53 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 func set_facet_tex(tex: Texture) -> void:
 	if not _tex_on() or _mi == null:
 		return
+	_skin_base_tex = tex                              # cache for set_skin_active (orbit §2V retire/restore)
 	var mat := _mi.material_override
-	if mat is ShaderMaterial:
+	if mat is ShaderMaterial and _skin_active:
 		(mat as ShaderMaterial).set_shader_parameter("base_map", tex)
+
+## COSMOS PLANET-LOD-CONFIG P0 (§2.4 — REPLACE, not overlay): retire / restore the smooth §2V skin. When the orbit
+## megablock tier engages above the swap it OWNS the disc, so we UNBIND the base/band/close-up samplers on the far ring
+## → the shell shader's texture weight collapses (tx.a≈0 ⇒ wt=0) and the far ring reads as the plain vertex-colour
+## FarPalette backstop (round silhouette + rim intact, NO blotch) UNDER the crisp megablocks. On descent (`active` true)
+## the cached textures are rebound → the shipped skin path resumes. Self-guards on _tex_on() ⇒ never called / inert with
+## FP_BLOCK_LOD_ORBIT (or FP_FACET_TEX) off ⇒ byte-identical. Idempotent.
+func set_skin_active(active: bool) -> void:
+	if _skin_active == active:
+		return
+	_skin_active = active
+	if not _tex_on() or _mi == null:
+		return
+	var mat := _mi.material_override
+	if not (mat is ShaderMaterial):
+		return
+	var m := mat as ShaderMaterial
+	m.set_shader_parameter("base_map", _skin_base_tex if active else null)
+	if _skin_band_tex != null:
+		m.set_shader_parameter("band_map", _skin_band_tex if active else null)
+	if _skin_cu_tex != null:
+		m.set_shader_parameter("closeup_map", _skin_cu_tex if active else null)
 
 ## COSMOS LOD-TEXTURE Phase 4: bind the baker's close-up Texture2DArray into the shell shader's `closeup_map`. No-op
 ## unless FP_FACET_TEX_CLOSEUP is on and the material is the close-up shader ⇒ flag-off is byte-identical (never wired).
 func set_facet_closeup_tex(tex: Texture) -> void:
 	if not _cu_on() or _mi == null:
 		return
+	_skin_cu_tex = tex
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("closeup_map", tex)
+
+## COSMOS TEXTURED-LOD T1b: bind the shared detail atlas + the baker's id map into the shell shader's `detail_map` /
+## `id_map` uniforms. No-op unless FP_BLOCK_DETAIL && the textured shader is live ⇒ flag-off is byte-identical (never
+## wired; the shader string has no detail samplers). Called once by WorldManager after the prewarm bake.
+func set_facet_detail(detail_tex: Texture, id_tex: Texture) -> void:
+	if not (_tex_on() and CubeSphere.FP_BLOCK_DETAIL) or _mi == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("detail_map", detail_tex)
+		(mat as ShaderMaterial).set_shader_parameter("id_map", id_tex)
 
 ## COSMOS LOD-TEXTURE Phase 4: push the baker's current slot map (fid→layer) + layer→(a,b) reverse-map. Main thread
 ## only (WorldManager, when the baker's epoch bumps). Updates the live `_closeup_slots` (frozen into the mesh at the
@@ -2397,6 +3378,46 @@ func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void
 		if mat is ShaderMaterial and facet_map.size() == CubeSphere.CLOSEUP_MAX:
 			(mat as ShaderMaterial).set_shader_parameter("cu_facet", facet_map)
 	_pending = true                  # re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
+
+## COSMOS TEXTURED-LOD U1 (§2U.1): bind the baker's band id map into the shell shader's `band_map` uniform. No-op unless
+## the band tier is live and the material is the textured shader ⇒ flag-off is byte-identical (never wired). Called by
+## WorldManager once the baker built the band array.
+func set_facet_band(tex: Texture) -> void:
+	if not _bm_on() or _mi == null:
+		return
+	_skin_band_tex = tex
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("band_map", tex)
+
+## COSMOS TEXTURED-LOD U1 (§2U.1): push the baker's current band slot map (fid→layer) + the layer→(a,b) and layer→(Nx,Ny)
+## reverse-maps. Main thread only (WorldManager, when the baker's band_epoch bumps): updates the live `_band_slots` (frozen
+## into the mesh at the next build so UV2.y carries 64+layer) and the band_facet/band_n shader uniforms (read live per
+## fragment), then requests a re-emit. No-op with the band tier off.
+func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
+	if not _bm_on():
+		return
+	_band_slots = slots
+	if _mi != null:
+		var mat := _mi.material_override
+		if mat is ShaderMaterial and facet_map.size() == CubeSphere.BAND_LAYERS and n_map.size() == CubeSphere.BAND_LAYERS:
+			(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
+			(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
+	_pending = true                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
+
+## COSMOS TEXTURED-LOD T1b gate surface (G-BD-OFF/TILE): the RAW textured shell shader string (no detail) and the
+## FP_BLOCK_DETAIL-injected result, so the gate can assert byte-identity off and additive-only injection on, with the
+## shader_type count unchanged (zero new compiled programs).
+static func gate_tex_shader_raw(cu: bool) -> String:
+	return _SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER
+static func gate_tex_shader_detail(cu: bool) -> String:
+	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER)
+
+## COSMOS TEXTURED-LOD U1 gate surface (G-BB-OFF): the FP_BLOCK_DETAIL string with the band injection FORCED off vs on,
+## so the gate can assert (a) band-off ≡ the shipped detail string (byte-identical), (b) band-on is ADDITIVE only (still
+## exactly ONE shader_type → zero new compiled programs) and declares the band_map/band_facet samplers + v_bslot varying.
+static func gate_band_shader(cu: bool, band: bool, shot := CubeSphere.FP_BAND_SHOT) -> String:
+	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER, band, shot)
 
 ## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
 ## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).

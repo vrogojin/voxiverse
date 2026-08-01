@@ -73,6 +73,68 @@ void fragment() {
 	ALBEDO = v_col.rgb * t.rgb * shade;
 }
 "
+
+# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the UNIFIED near shader. The
+# atlas_tex head + varyings + vertex()/fragment() are UNCHANGED, but the inline shade law is REPLACED by the shared
+# VoxiLight.SHADE_GLSL snippet (string-included — pure concatenation, still ONE shader_type / zero new compiled program),
+# and the pseudo-normal normalize(v_wp) becomes the TRUE planet radial normalize(v_wp − planet_centre) — the same normal
+# the far shell derives from MODEL·0, so a near block top and the far texel over it shade IDENTICALLY (incl. terminator).
+# planet_centre is a new uniform fed each frame from the WorldManager sun_dir site (render_centre → never stale, §2V.6 F1).
+# Built ONLY when FP_SHADE_UNIFIED is on; off ⇒ near_daylight_shader_code returns _NEAR_DAYLIGHT_SHADER verbatim.
+const _NEAR_UNIFIED_HEAD := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform sampler2D atlas_tex : source_color, filter_nearest_mipmap, repeat_disable;
+uniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);
+"
+const _NEAR_UNIFIED_TAIL := "varying vec3 v_wp;
+varying vec4 v_col;
+void vertex() { v_col = COLOR; v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+void fragment() {
+	vec3 n = normalize(v_wp - planet_centre);
+	vec4 t = texture(atlas_tex, UV);
+	ALBEDO = v_col.rgb * t.rgb * voxi_shade(n, sun_dir);
+}
+"
+
+# COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): the SHIPPED shade law (night_floor 0.10 / term_mu /
+# moonshine — NOT the unified VoxiLight law) with the ONLY correction being the true planet-radial normal
+# normalize(v_wp − planet_centre) in place of the origin-assuming normalize(v_wp). Byte-for-byte identical to
+# _NEAR_DAYLIGHT_SHADER except the added planet_centre uniform + the subtraction, so when planet_centre == 0 it is
+# numerically identical to the shipped shader (safe default) — WorldManager feeds the real render centre each frame.
+# Selected only under FP_NIGHT_TERRAIN_CENTRE (unified off); never compiled with the flag off ⇒ byte-identical.
+const _NEAR_DAYLIGHT_CENTRE_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform sampler2D atlas_tex : source_color, filter_nearest_mipmap, repeat_disable;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.10;
+uniform float term_mu = 0.12;
+uniform float moonshine = 0.0;
+uniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);
+varying vec3 v_wp;
+varying vec4 v_col;
+void vertex() { v_col = COLOR; v_wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+void fragment() {
+	vec3 n = normalize(v_wp - planet_centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);
+	vec4 t = texture(atlas_tex, UV);
+	ALBEDO = v_col.rgb * t.rgb * shade;
+}
+"
+
+## The near-field daylight shader source. `unified` off (default = the flag) ⇒ the shipped _NEAR_DAYLIGHT_SHADER
+## VERBATIM (byte-identical); on ⇒ the same look with the shared VoxiLight law + true planet-radial normal string-
+## included. `centre_fix` (FP_NIGHT_TERRAIN_CENTRE, unified off) ⇒ the shipped shade law with ONLY the true-radial
+## normal correction (_NEAR_DAYLIGHT_CENTRE_SHADER). Exposed static so gates can build every variant without toggling.
+static func near_daylight_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED,
+		centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
+	if unified:
+		return _NEAR_UNIFIED_HEAD + VoxiLight.SHADE_GLSL + _NEAR_UNIFIED_TAIL
+	if centre_fix:
+		return _NEAR_DAYLIGHT_CENTRE_SHADER
+	return _NEAR_DAYLIGHT_SHADER
+
 var grid := Vector2i(GRID, GRID)              # atlas_size_in_tiles the cube models are configured with
 var _cell_of: Dictionary = {}                 # block_id -> Vector2i(col, row); only opaque cubes that got a cell
 var _snow_cap_cell: Dictionary = {}           # base block_id -> Vector2i; the snow-CAP variant cell (Stage 2, §2.6)
@@ -269,12 +331,25 @@ func _make_material(tex: Texture2D) -> Material:
 	# EXACTLY, multiplies the absolute day/night shade). Off ⇒ the shipped StandardMaterial verbatim (byte-identical).
 	if CubeSphere.FP_NEAR_DAYLIGHT:
 		var sh := Shader.new()
-		sh.code = _NEAR_DAYLIGHT_SHADER
+		sh.code = near_daylight_shader_code()
 		var sm := ShaderMaterial.new()
 		sm.shader = sh
 		sm.set_shader_parameter("atlas_tex", tex)
-		sm.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
-		sm.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): the near field adopts the far shell's night floor + the moonshine
+		# floor + a planet_centre so it shades IDENTICALLY to the far skin (one uniform set). Off ⇒ the shipped
+		# NEAR_NIGHT_FLOOR path verbatim (the shader has no planet_centre/moonshine uniform ⇒ those sets never run).
+		if CubeSphere.FP_SHADE_UNIFIED:
+			sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+			sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+			sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+			sm.set_shader_parameter("planet_centre", Vector3.ZERO)
+		else:
+			sm.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+			sm.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+			# NIGHT-TERRAIN-CENTRE: the centre-fix shader carries a planet_centre uniform (shipped shade law otherwise).
+			# Seed ZERO (== the shipped normalize(v_wp)); WorldManager feeds the true render centre each frame.
+			if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
+				sm.set_shader_parameter("planet_centre", Vector3.ZERO)
 		sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
 		return sm
 	var mat := StandardMaterial3D.new()
@@ -295,3 +370,15 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 		return
 	if material is ShaderMaterial:
 		(material as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
+
+## COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, §2V.6 F1): feed the TRUE planet centre (in the current render frame) into
+## the near daylight twin so its radial normal n = normalize(v_wp − planet_centre) matches the far shell's at every
+## point — and stays FRESH across facet crossings/re-anchors (pushed from the WorldManager sun_dir site each frame).
+## No-op unless FP_SHADE_UNIFIED (the unified shader is the only one with a planet_centre uniform) ⇒ flag-off byte-id.
+## NIGHT-TERRAIN-CENTRE: also fed for the isolated normal-only fix (the centre-fix shader also has a planet_centre
+## uniform). near_centre_fix_on() covers BOTH the unified and the isolated flag ⇒ still byte-identical with both off.
+func set_near_daylight_planet_centre(centre: Vector3) -> void:
+	if not CubeSphere.near_centre_fix_on():
+		return
+	if material is ShaderMaterial:
+		(material as ShaderMaterial).set_shader_parameter("planet_centre", centre)

@@ -298,6 +298,14 @@ const FP_FARRING_FULL_COVER := false
 ## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
 const BACKSTOP_SINK := 6.0
 const BACKSTOP_CELLS := 16
+## COSMOS PLANET-VIEW §3 (B) — the LIMB (silhouette) densification. The far ring meshes every facet at CELLS=4, so the
+## planet's silhouette from orbit is a coarse polygon (the "jagged/unfinished limb"). When true (requires FACETED + the
+## orbit camera-set law), ONLY the ~1-facet-thick ring of facets straddling the horizon tangent — |centre·ĉ − cos θ_h|
+## within LIMB_DENSE_BAND facet half-widths — emits at LIMB_DENSE_CELLS instead of 4, and ONLY off-surface (`_offsurface`);
+## the interior stays at CELLS=4 and the surface hot path is never touched. The ring is ~O(√facets_in_cap) ≈ 40–60 facets,
+## capped to LIMB_DENSE_MAX_FACETS (see facet_far_ring.gd), so the resident dense set is bounded (~+0.5 MB peak — a MEASURED
+## A/B ceiling bump). Default OFF → the far ring emits every facet at CELLS=4 exactly as today, FLAT stays byte-identical.
+const FP_FARRING_LIMB_DENSE := false
 ## Rescale-safe backstop sink: TierPlace.backstop_sink() derives the radial sink as BACKSTOP_SINK_FRAC × the facet
 ## cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge = (π/2·R)/K), so it scales with R and clears the coarse-grid
 ## facet chord sagitta at any radius (≈6 at R=3072, ≈13 at R=6371). 0.5 reproduces the shipped 6-block sink at R=3072.
@@ -349,6 +357,23 @@ const FP_RADIAL_DATUM := false
 ## (FLAT 6042/0). Requires ONE build.sh cycle for the mesher hook (module_in_web=yes). Gate: verify_facet_seams.gd
 ## G-D2-SHAPE (flag-on near mesh == flag-off mesh + s·ŷ per vertex EXACTLY — no terracing can exist by construction).
 const FP_DATUM_BAKE := false
+
+## COSMOS FS2′ EDGE WELD (docs/COSMOS-FACET-SEAMS-V2.md §2.2) — the MISSING near-LOD datum. FP_DATUM_BAKE lifts the
+## ACTIVE facet's near VoxelTerrain to the radial datum (VoxelMesherBlocky.set_facet_datum_bake per-vertex `y += s`)
+## and the skin (`+s` in _lattice_world) and the far ring (radial by construction) all agree — but the FacetLodBuilder
+## tier (the near rings of NON-active facets: LOD megablock tiles + ridge aprons) was NEVER made datum-aware. Its
+## tiles are meshed by a builder-owned VoxelMesherBlocky that never receives set_facet_datum_bake, and its aprons snap
+## the ridge top to `ceil(g/fs)·fs` in CELL space (facet_lod_builder._build_apron / _build_job) — the PLANE datum. So
+## at a facet border the active (lifted, radial) surface stands up to the sagitta s (~5-7 blocks) ABOVE the un-lifted
+## neighbour LOD/apron; the uncovered vertical band shows the black scene background = the seam BLACK LINE + BLACK
+## CLIFF FACE. When true (rides FP_DATUM_BAKE): the LOD builder pushes the per-fid datum bake onto its own mesher
+## before each tile build (lifting LOD tiles `+s`, mirroring the active mesher) AND the apron ridge/top gains `+s`
+## (FacetAtlas.datum_lift, the SAME lift the near mesh bakes) — so every near tier sits on ONE radial datum and the
+## apron always COVERS the lifted near surface (residual = the ceil megablock snap ∈ [0,fs), never a downward gap).
+## Default OFF ⇒ no set_facet_datum_bake call + apron lift term 0 ⇒ byte-identical (FLAT 6042/0). Self-consistent with
+## the bake off too: datum_lift≡0 / datum_bake_params.enabled=false ⇒ no lift on either surface. Gate: verify_facet_
+## seams.gd _gate_datum_edge_weld (the un-welded apron leaves a gap up to s; the welded apron covers to within fs).
+const FP_DATUM_EDGE_WELD := false
 
 ## COSMOS TIER-DEPTH-PRIORITY (docs/COSMOS-TIER-DEPTH-PRIORITY-DESIGN.md §5.3 / §7 P1) — STICKY / MAKE-BEFORE-BREAK
 ## roles. Fixes RC-B (the dominant *visible* event): a facet ENTERING the live pool keeps its unsunk CELLS=4
@@ -491,6 +516,373 @@ const FP_SKIN_TIER := false
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
 
+## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
+## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
+## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async
+## mechanism — ZERO new memory, ZERO new streaming. Kills BOTH live complaints at once: the smooth↔blocky aesthetic
+## SWAP disappears (far is now coarse blocks, one continuous voxel look), and the "far terrain too low" step SHRINKS
+## (min over ONE cell brings the surface UP toward the near blocks, vs the min-envelope's ~26-52-block footprint).
+## No-protrusion PRESERVED a fortiori: min of 4 corners ≤ any interior bilinear point ≤ (FP_ENV_ALL) the true surface,
+## so the blocky top is pointwise BELOW the already-gated smooth surface (G-NPT stays green). Off ⇒ the shipped smooth
+## welded emit VERBATIM (textually-separate branch, byte-identical). Gate G-BLK-RING.
+const FP_BLOCKY_FARRING := false
+
+## COSMOS TEXTURED-LOD T1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §1.2) — paint the blocky far ring with the FP_FACET_TEX
+## satellite pages instead of one flat corner-colour per mega-block. The blocky geometry already IS "the real relief,
+## decimated, no-protrusion by MIN-containment"; the baked satellite texture already IS "the real block surface,
+## downscaled" — this flag composes them by emitting the SAME node-param UVs the smooth path emits (_emit_cached §1.3:
+## UV = ((a+node_s)/K,(b+node_t)/K), UV2 = (face, slot)) onto every blocky top quad, and inheriting the top-edge UVs
+## onto the walls/skirts (a vertical smear of the block's own texel stripe). The already-shipped coverage-gated shell
+## shader (wt = smoothstep(600,1800,cam)·tx.a, premultiply-safe) then paints each mega-block with the downscaled image
+## of its real blocks — the user's headline vision, visible from orbit. ZERO new shader strings, ZERO new textures
+## (reuses the FP_FACET_TEX pages), the ring stays ONE opaque draw, GEOMETRY byte-identical (only UV/UV2 arrays added).
+## Requires FP_BLOCKY_FARRING && FP_FACET_TEX && FP_SHELL_ABSOLUTE (only does anything when all three are on). Off ⇒
+## _emit_blocky emits exactly as today (no UV arrays, byte-identical). Gates G-BT-OFF/UV/NOPROT/BYTES.
+const FP_BLOCKY_TEX := false
+
+## COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R) — the far terrain wears the REAL block-atlas FACES
+## (grass-top / stone speckle / sand grain + a mega-block grid), not just the box-averaged biome COLOUR of the base
+## page. Pure bake+shader (NO mesh/UV change beyond what FP_FACET_TEX already emits): (1) a shared 16-layer×64²
+## Texture2DArray `detail_map` of the SAME BlockTextures.TILES PNG faces the near blocks wear, MEAN-NORMALIZED so its
+## top mips → 0.5 (⇒ far degrades to exactly today's colour map, no distance uniforms) with a baked mega-block grid
+## border, REPEAT wrap, mips on (~0.35 MB, built ONCE, shared by every facet); (2) an `id_map` — a 6×384² L8
+## per-texel material-id page baked alongside the colour page by FacetTexBaker from FarPalette's own biome/water/snow
+## classifier (id 0 = un-baked; texelFetch NEAREST, so its crisp ids never bleed and never touch the colour page's
+## premultiplied-coverage frontier law); (3) the SAME two shell shader strings extended in place (one tile per macro
+## texel: buv = v_uv·384, REPEAT; face_col = col·detail·2.0) — ZERO new shader_type/compiled programs (the detail lines
+## are string-injected only when this flag is on, so the compiled shell count is unchanged). Requires FP_FACET_TEX
+## (orthogonal to geometry — it upgrades the smooth ring, the blocky ring and the L2 tiles alike). Off ⇒ the detail
+## array + id pages are NEVER built and the shader strings are BYTE-IDENTICAL to FP_FACET_TEX (FLAT 6042/0). NEVER-OOM:
+## fixed-size buffers (≈ +2 MB over the FP_FACET_TEX ledger → combined ceiling well under 40 MB). Gate:
+## verify_block_detail.gd (G-BD-OFF/ID/NORM/TILE).
+const FP_BLOCK_DETAIL := false
+
+## COSMOS TEXTURED-LOD U0 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.2 — live correction 2: "there should be NO grid").
+## The original §2R.3 baked a DETAIL_BORDER-texel darkened ring into every FacetDetailAtlas layer, drawing a mega-block
+## grid line on the far terrain. The user rejected drawn grid lines — block structure must come from the real baked
+## block arrangement + geometry, not painted borders. FP_DETAIL_GRID makes that ring OPT-IN: default FALSE ⇒ the detail
+## tiles are built RAW (mean-normalized block face ONLY, edge-to-edge, no darkened border — pixel-exact with the near
+## atlas). TRUE ⇒ the historical §2R.3 grid-border behaviour is preserved (toggleable, not deleted). Only affects the
+## build of the detail atlas; id-page, shader sampling and mean-normalization are unchanged. Requires FP_BLOCK_DETAIL to
+## have any effect (no atlas is built otherwise). Gate: verify_block_detail.gd (G-BD-TILE asserts NO border when false,
+## border-present when true).
+const FP_DETAIL_GRID := false
+
+## COSMOS TEXTURED-LOD U1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.1 — live correction 1: the near-far BAND renders the
+## REAL top-down bake). FP_BLOCK_DETAIL's tiled id_map varies only per macro texel (26-blk cell) so ONE face tile
+## REPEATS within a texel — the user correctly reads a pattern, not his terrain. This flag makes the BAND facets
+## (active + ring-1) instead sample a per-facet `band_map` — a BAND_LAYERS×BAND_TEXELS² L8 Texture2DArray, 1 byte per
+## block = the material id (FarPalette.detail_pattern+1, from the SAME per-column classifier chain FacetBlockLod L0
+## bakes) of the real top block at that column. The fragment shader reconstructs the flattened top-down composite
+## PER PIXEL — `bid = texelFetch(band_map, block_xz); albedo = col · detail_map[bid] at fract(block_uv) · 2` — i.e.
+## the analytic `tile[id(x,z)]` (arrangement × pattern) at full 64-texel/block face fidelity, at ~1/250th the bytes of
+## a flat RGBA bake. Band facets thus wear their ACTUAL blocks at their ACTUAL positions (this outcrop, that pond
+## edge), blending seamlessly into the near blocky terrain; far-far facets keep the §2R.1 tiled color-map path. The
+## band slot rides UV2.y in the 64+ range (0..63 stays the close-up slot space); residency = active ∪ ring-1 (≤
+## BAND_LAYERS), chunk-row (BAND_SLICE_ROWS) sliced under FACET_TEX_BAKE_BUDGET_MS, evicted only on ring exit. ZERO
+## new shader_type/compiled programs (the band lines are string-injected into the EXISTING shell tex shaders only when
+## this flag is on). Requires FP_FACET_TEX ∧ FP_BLOCK_DETAIL. Off ⇒ the band_map array is NEVER built, the shader
+## strings are BYTE-IDENTICAL to FP_BLOCK_DETAIL, UV2.y never carries a band slot (FLAT 6042/0). NEVER-OOM: fixed
+## BAND_LAYERS × BAND_TEXELS² L8 (2.36 MB GPU) + ONE CPU staging layer (0.26 MB) ⇒ ≈ +2.7 MB → combined ceiling 43 MB.
+## Gate: verify_band_map.gd (G-BB-EXACT / G-BB-BYTES / G-BB-SLOT / G-BB-OFF).
+const FP_BAND_BLOCK_MAP := false
+const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
+const BAND_LAYERS := 9                     # band residency = active + ring-1 (≤ 9 layers → 2.36 MB GPU, fixed at creation)
+const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
+const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the L8 band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+
+## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
+## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
+## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the
+## near blocky terrain"). This flag upgrades the band from L8 {id} to RG8 {block_id, shade} 2 B/block, both channels
+## sourced from the ONE shot function SurfaceShot.surface_shot(fid,x,z): R = the exposed top block's material id
+## INCLUDING TreeGen canopy/trunk decorations (the tree column reads P_LEAF, not the terrain beneath), G = the
+## SUN-INDEPENDENT analytic depth byte (AO / hillshade / cliff-base / water-depth / canopy ground-shadow). The shell
+## ALBEDO band branch then renders `albedo = detail_tile[id] × tint × shade` at the intra-block UV — the real per-block
+## shot with trees + baked depth, with the live sun/moon shade·tint (v_st) still applied on top (the single-owner
+## rule, §2V.6 F4: the baked shade holds ONLY static cues, never sun). Reuses the U1 residency/slot/chunk-row-slice
+## machinery unchanged (a content + format change to the band bake, not new residency); the bake runs on the shipped
+## TH1 worker path (surface_shot is pure + facet-scoped via a per-slice GenCtx). Requires FP_FACET_TEX ∧
+## FP_BLOCK_DETAIL ∧ FP_BAND_BLOCK_MAP. Off ⇒ the band stays L8 and the shader band branch is BYTE-IDENTICAL to the
+## U1 result (FLAT 6042/0). NEVER-OOM: the band tier grows by ×2 (L8→RG8) to a fixed BAND_LAYERS × BAND_TEXELS² RG8
+## (4.5 MB GPU) + ONE RG8 staging layer (0.5 MB) ⇒ ≈ +2.8 MB → combined ceiling 46 MB. Gate: verify_band_shot.gd
+## (G-VS-SHOT / G-VS-BYTES / G-VS-OFF).
+const FP_BAND_SHOT := false
+const BAND_SHOT_BYTES_MAX := 6 * 1024 * 1024  # NEVER-OOM ceiling for the RG8 band tier (2× L8; (9+1) × 512² × 2 B < 6 MB)
+
+## COSMOS TEXTURED-LOD V1 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the ONE lighting law shared by the near blocks and
+## the far skin so the orbit→surface transition is stitchless (the user's #1 requirement). §2V.3 root-caused three
+## verified mismatches — near used normalize(v_wp) (scene-origin pseudo-normal, NOT the planet radial), lacked the far
+## shell's terminator scatter tint, and carried a moonshine floor the far lacked — the "totally different light". This
+## flag string-INCLUDES VoxiLight.SHADE_GLSL (voxi_shade(n, sd) → shade·tint = day + scatter tint + night floor +
+## moonshine floor) into the near atlas shader (block_atlas.gd), the shell LIGHT sub-strings (facet_far_ring.gd) and
+## TierPlace._TIER_SHADER — pure concatenation, ZERO new shader_type/compiled program. It also gives the near shader the
+## TRUE planet-radial normal via a new `planet_centre` uniform (n = normalize(wp − planet_centre); far/tier read the
+## centre from MODEL·0), pushed each frame from ONE WorldManager site (set_near_daylight_sun_dir) next to the sun_dir
+## sync so it stays fresh across facet crossings/re-anchors (§2V.6 F1, from FacetFarRing.render_centre). Result: a near
+## block top and the far texel covering it shade IDENTICALLY at every sun angle including the terminator (G-VL-EQ).
+## Off ⇒ nothing includes the snippet, no planet_centre is pushed, every shader string is BYTE-IDENTICAL and every near
+## material keeps NEAR_NIGHT_FLOOR — FLAT 6042/0. Gate: verify_shade_unified.gd (G-VL-EQ, incl. a scripted crossing).
+const FP_SHADE_UNIFIED := false
+
+## COSMOS TEXTURED-LOD U2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3a: cull, don't sink). Today the
+## backstop facets (active ∪ live-pool, drawn at BACKSTOP_CELLS) are emitted UNDER the near voxels — the sink hides the
+## coexistence, but far land pokes through / shows under near where the two overlap (the user's #72). This flag STOPS
+## emitting a backstop far-ring CELL (26-block, BACKSTOP_CELLS granularity) once the near voxel field FULLY covers its
+## footprint, so near and far never coexist there at all — no z-fight, no poke-through, no see-under. Coverage is the
+## ALREADY-SHIPPED near-mesh signal: the skin's (fid, fid-lattice AABB) → module_world.skin_near_meshed callable
+## (godot_voxel is_area_meshed). Seam-safety is an ASYMMETRIC hysteresis (the whole point): a cell needs CULL_CONFIRM=2
+## consecutive COVERED reads to CULL, but un-culls INSTANTLY on the first UNcovered read, and the probe uses a
+## +CULL_DILATE=32-block DILATED AABB so a cell begins re-emitting while the surrounding near mesh still covers it — the
+## re-emit wins the race against the paced near-shrink (slower than the CULL_REAP_MS=100 probe cadence). Holes are worse
+## than overdraw, so every ambiguity resolves toward DRAWING (gate G-CV-SAFE proves culled ⊆ covered every step). On the
+## GDScript / non-module path the coverage callable is invalid ⇒ "never covered" ⇒ cull is inert (today's behaviour).
+## Off ⇒ no cell is ever suppressed, no coverage probe runs, no cull state is allocated → FLAT byte-identical (6042/0).
+## Gate: verify_cull_covered.gd (G-CV-SAFE / G-CV-REAPPEAR / G-CV-CHURN). NEVER-OOM: ≤256-cell byte masks × backstop
+## facets (≤ ~16, pruned to the live backstop set each probe) ⇒ a few KB, bounded, no growth with walk distance.
+const FP_FARRING_CULL_COVERED := false
+const CULL_CONFIRM := 2                     # asymmetric hysteresis: 2 consecutive COVERED reads to CULL (churn guard)
+const CULL_DILATE := 32.0                   # blocks the coverage-probe AABB is dilated by (re-emit before near retreats)
+const CULL_Y_MARGIN := 40.0                 # radial half-band of the probe AABB around the cell top (mirrors skin COVER_Y_MARGIN)
+const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches skin REAP_INTERVAL_MS; slower near-shrink wins the race)
+## U2 LIVE-PERF FIX (round 2 — the sustained-1075ms regression): the cull DECOUPLES the live per-probe mask from the
+## COMMITTED mesh. A far-ring rebuild is expensive (~1 s SYNC when FP_FARRING_ASYNC_REBUILD is off), so it must NOT fire
+## every probe as `is_area_meshed` legitimately churns under live streaming (that was the 0.3 fps freeze). Instead the
+## EMIT reads a `_committed_cull` snapshot, and a rebuild fires ONLY on two bounded transitions: (APPLY) the live mask has
+## been STABLE for CULL_SETTLE_PROBES probes AND differs from committed — the standing-still optimization, rate-limited to
+## ≥ CULL_REBUILD_MS apart (mirrors the skin's standing-still reap); and (FLUSH) a committed-culled cell has just
+## un-culled in the live mask — the prompt no-hole safety, which clears committed to full emission (holes worse than
+## overdraw). During sustained motion the live mask churns but committed stays flushed-empty ⇒ ZERO added rebuilds.
+const CULL_SETTLE_PROBES := 3               # consecutive no-change probes (≈300 ms) before a settled cull is APPLIED to the mesh
+const CULL_REBUILD_MS := 250               # min wall-ms between APPLY rebuilds (the FLUSH safety path is un-rate-limited)
+
+## COSMOS TEXTURED-LOD U3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3b: same level, not sink). The
+## far ring is emitted radially SUNK below the near surface: TierPlace.backstop_sink() ≈ 13 blocks at R=6371 — the
+## sink's TWO jobs were (i) hide far poke-through where near+far coexist and (ii) win the z-order for near. The user
+## reads the result as "far land displaced much deeper than near" (#72). U2 (FP_FARRING_CULL_COVERED) removed job (i)
+## structurally — a covered cell is no longer emitted at all, so near and far never coexist where the cull is live.
+## THIS flag then removes the ~13-block VISUAL sink: the radial sink COLLAPSES to the ENV_EPS_G correctness guard only
+## (max(ENV_EPS_G=1.5, ENV_EPS_FRAC×cell) — the same between-fine-sample floor the min-envelope uses; ≈1.5 at R=3072,
+## ≈5.2 at R=6371), so the far backstop reads at the near blocks' LEVEL (a tiny ε below to avoid exact-coincident
+## z-fight, never a deep displacement). Fringe z-order at the thin un-culled seam rides the ALREADY-SHIPPED FAR_BIAS_K
+## window-space depth bias (TierPlace.far_bias / FP_TIER_DEPTH_BIAS) — depth precedence with ZERO geometric sink.
+## REQUIRES U2: the reduction only applies where FacetFarRing._level_on() holds (the flag AND _cull_on() — the U2 flag
+## AND a VALID coverage probe). On the GDScript fallback path the probe is invalid ⇒ cull inert ⇒ this self-disables
+## to today's full sink (the design's disclosed fallback). Off (or U2 off) ⇒ _sunk_positions applies the full
+## backstop_sink() verbatim → FLAT byte-identical (6042/0). Gate: verify_farring_level.gd (G-LV-NOPROT / G-LV-SEAM).
+const FP_FARRING_LEVEL := false
+
+## COSMOS FAR-CRUISE NEVER-BLACK (fix/voxiverse-farcruise-black). After a long space CRUISE (dev-fly / Cruise Mode) +
+## descent far from spawn, the near VoxelTerrain has not (re)meshed the sub-camera facet, so the far ring's active-facet
+## backstop is the ONLY thing that can paint the ground under the player. Three shipped gaps make it fail there and
+## produce the live "black substance": (1) the backstop's dense cache is warm-LAGGED (built over frames), so the active
+## facet is DROPPED from the cache-filtered emit set (visible_fids(true) / _emit_cache_ready) → BLACK, then FLAT-coarse
+## once it warms in seconds later; (2) a stale / slack camera-set emit axis can CULL the sub-camera facet out of the
+## front set → BLACK; (3) once warmed it is SUNK ~13 blocks below the true surface with no near voxels to hide behind →
+## a coarse "well". This flag GUARANTEES the sub-camera (active) facet is, on the FLOORED surface: (a) cache-built
+## IMMEDIATELY (a cheap dense CHORD) the instant it is missing — no warm-lag black; (b) NEVER culled from the emitted
+## set (directly under the camera → always drawn, immune to a slack axis); (c) emitted UN-SUNK (at the true radial
+## surface) WHEN the near field has NOT actually meshed it (probed via the SAME skin_near_meshed / is_area_meshed
+## coverage callable U2 uses) — so it reads as a seamless coarse backstop, never black and never a sunk well. Where the
+## near field IS meshed under the camera the shipped SUNK backstop is kept verbatim (no z-fight / no regression near
+## spawn). Requires FP_FARRING_FULL_COVER (the backstop only exists there). NEVER-OOM: the guarantee touches ONE facet's
+## existing dense cache and one int — no new dict, no per-frame alloc, no growth with walk distance. Off ⇒ every path
+## below is a const-guarded no-op → FLAT byte-identical (6042/0). Gate: verify_farcover.gd (G-FC-*).
+const FP_FARRING_ACTIVE_NOBLACK := false
+const NOBLACK_PROBE_HALF := 10.0    # fid-lattice half-extent (blocks) of the under-camera coverage probe column — TIGHT so it reads meshed under the player near spawn but absent at a cruise gap
+const NOBLACK_PROBE_YHALF := 96.0   # radial half-extent (blocks) of the probe column — spans surface relief so a meshed near column reads as covered
+
+## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
+## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
+## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /
+## MAJORITY surface-id / OR water — the no-protrusion-by-containment rule, §3). There is NO render/update path yet, so
+## NOTHING in the running engine calls FacetBlockLod ⇒ byte-identical off is AUTOMATIC regardless of this flag's value
+## (the flag only anchors the phase chain + lets the gate reference the class constants). Later phases wire it in:
+## FP_BLOCK_LOD_RINGS (ladder+LRU+fade), FP_BLOCK_LOD_GLOBAL (L5 resident), FP_BLOCK_LOD_REALBAKE / _EDITS (live voxels
+## + edit cascade). Gate: verify_block_lod.gd (G-BLD-PYR / G-BLD-MIN / G-BLD-DETERMINISM). Requires FACETED.
+const FP_BLOCK_LOD := false
+
+## COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4 + docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §4 override) — the
+## L1 rim-ring render consts, read ONLY when FP_BLOCK_LOD built FacetBlockLodRing (numbers, never touched off ⇒
+## byte-identical). The engagement band comes from the on-screen block-size law d_max(Ln) ≈ 2^n·K_px/4 (K_px≈1407,
+## the px·distance-per-block screen constant): an L1 (pitch-2) megablock drops below the ~4 px LOD threshold at
+## d_max(L1) = 2·1407/4 ≈ 703 ⇒ OUTER ≈ 700; the inner RIM is the near voxel field radius (CURVED_RENDER_RADIUS_BLOCKS
+## = 128) where the 1-block voxels hand off (the ≤1-block containment step the transition needs). P1 bounds the L1
+## band to the active facet ∪ its 4 ridge neighbours (which span ~0..~700 around the player), so the RIM/OUTER values
+## document the band + feed the S1-tighten follow-up rather than clipping columns (the near voxels overdraw ≤RIM, the
+## sunk far ring backstops >OUTER). The full L2–L4 ladder (P2, FP_BLOCK_LOD_RINGS) uses the same law at 2^n.
+const BLOCK_LOD_L1_RIM_BLOCKS := 128       # near voxel field hand-off (rim engagement = CURVED_RENDER_RADIUS_BLOCKS)
+const BLOCK_LOD_L1_OUTER_BLOCKS := 700     # d_max(L1) ≈ 2·K_px/4 (K_px≈1407) — L1 falls under ~4 px here
+const BLOCK_LOD_SCREEN_K_PX := 1407.0      # the design's on-screen block-size constant (px·distance per block)
+const BLOCK_LOD_TILE_COLS := 32            # L1 columns per greedy/seam tile (per-facet merged; P2 makes it the LRU unit)
+const BLOCK_LOD_DITHER_S := 0.3            # arrival screen-door dither seconds (§4 temporal — NOT a standing band)
+const BLOCK_LOD_LRU_FACETS := 9            # LRU cap on resident L1 facet meshes (band ≤5 + re-crossing slack)
+const BLOCK_LOD_BYTES_MAX := 16 << 20      # NEVER-OOM hard ledger ceiling (§5): 16 MB
+
+## COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (docs/COSMOS-SEAMLESS-SCALES-DESIGN.md §4 — "release into coarse
+## blocks, not paint"). The last near→far seam: on a fly-up FP_APPROACH_ANCHOR (S1) ramps the near VoxelViewer
+## view_distance DOWN (full 128 → 0) so the near voxel plate recedes rim-inward. The L1 megablock ring engages at the
+## static rim BLOCK_LOD_L1_RIM_BLOCKS (=128 = the near field's FULL radius). Once S1 shrinks the near view_distance
+## BELOW 128 the near field ends at <128 while the L1 hand-off point stays pinned at 128 — the annulus (near-edge..128)
+## would read as far skin / L2, not L1 (the tone step). This pure/static law drives the L1 ring's EFFECTIVE engagement
+## rim from the near field's CURRENT (S1-ramped) view_distance so the hand-off is always near-voxels → L1 with NO
+## uncovered annulus: effective_rim = min(BLOCK_LOD_L1_RIM_BLOCKS, near_vd). At full near view_distance (≥128) it is the
+## static 128 (unchanged); as the near field shrinks it tracks it exactly (clamped ≥0). The L1 ring meshes WHOLE facets
+## (0..facet-edge, no radial clip — the near voxels merely OVERDRAW ≤ rim), so tracking the rim inward adds ZERO tiles;
+## L1 min-height is at-or-below the near terrain ⇒ the region they share is safe/overdrawn, revealed cleanly as the near
+## field recedes. Pure static so the gate asserts the identical formula the driver applies. Wired ONLY when BOTH
+## FP_APPROACH_ANCHOR and FP_BLOCK_LOD are on (a coordination between S1 and P1); with either off the ring keeps the
+## static rim (byte-identical). No new tunable — the coupling is the exact `min`.
+static func block_lod_effective_rim(near_vd: int) -> int:
+	return mini(BLOCK_LOD_L1_RIM_BLOCKS, maxi(near_vd, 0))
+
+## COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5/§9) — the L2..L4 streamed ladder + the L5 GLOBAL
+## always-resident tier, so blocky relief extends to the horizon with a power-of-2 fidelity fall-off. BOTH default
+## false, byte-identical off (gated construction — WorldManager never news the nodes up), each REQUIRES FP_BLOCK_LOD.
+## FP_BLOCK_LOD_RINGS: FacetBlockLodLadder owns one generalized FacetBlockLodRing per level 2..BLOCK_LOD_MAX_LEVEL,
+## assigns each nearby facet a level by the on-screen block-size law (level_for_distance, d_max(Ln)≈2^n·K_px/4), and
+## streams+LRUs the per-level bands under ONE shared ceiling, coarsening finest-first on breach.
+## FP_BLOCK_LOD_GLOBAL: FacetBlockLodGlobal holds the L5 column DATA for ALL 3456 facets always resident (the never-
+## evicted floor) + a byte-capped camera-facing merged mesh set. Gate: verify_block_lod.gd (G-BLD-LADDER/RINGS/GLOBAL).
+const FP_BLOCK_LOD_RINGS := false
+const FP_BLOCK_LOD_GLOBAL := false
+
+## Ladder level cap (2..5) — the INCREMENTAL DEPLOY knob. cap=2 ships L2 only; cap=4 ships the L2..L4 ladder (default);
+## cap=5 adds an L5 streamed ring on top of the global tier. The ladder streams levels 2..cap; global owns whole-planet L5.
+const BLOCK_LOD_MAX_LEVEL := 4
+const BLOCK_LOD_GLOBAL_LEVEL := 5          # the global tier's pyramid level (pitch 32)
+const BLOCK_LOD_LADDER_LRU := 8            # per-ladder-ring resident-facet cap AND per-level assigned-band cap (nearest-N)
+const BLOCK_LOD_LADDER_MAX_FACETS := 48    # hard cap on facets enumerated per ladder rebuild (bounds the BFS + draws)
+
+## L5 GLOBAL mesh budget (NEVER-OOM). MEASURED: a full-globe L5 greedy mesh is ~158 MB (285 quads/facet × 3456 ×
+## ~160 B/quad) — INFEASIBLE under any ceiling (design §5's "8–12 MB" assumed ~40–80 quads/facet; the real relief at
+## 32-block pitch merges far less). So the always-resident L5 payload is the DATA store (~3 MB, never evicted); the
+## visible blocky mesh is a camera-facing nearest-facet set MERGED into ≤ BLOCK_LOD_GLOBAL_DRAWS ArrayMeshes and hard-
+## capped at BLOCK_LOD_GLOBAL_MESH_BYTES. Beyond it the sunk far ring + FP_FACET_TEX skin backstop (design-correct:
+## L5 blocks go sub-pixel from orbit ⇒ the smooth satellite is the right tier there). No hole ever (far ring underneath).
+const BLOCK_LOD_GLOBAL_MESH_BYTES := 8 << 20
+const BLOCK_LOD_GLOBAL_DRAWS := 6          # merge visible L5 facets into ≤ this many meshes (gl_compat draw-ceiling safe)
+const BLOCK_LOD_GLOBAL_MESH_FACETS := 96   # nearest-camera facets meshed at L5 (≤ this; × ~47 KB ≈ 4.5 MB ≤ the cap)
+
+## NEVER-OOM EXPANDED ceiling: raise the SHARED block-LOD ledger (P1 L1 + ladder + global mesh) from 16 MB to 28 MB —
+## which lets L1 stay resident alongside the L2..L4 ladder (design §5: "expand toward 28 MB (re-add L1) ONLY if live
+## heap+fps A/B is green"). Default OFF ⇒ 16 MB governs and the coordinator drops L1 (finest) first. Flip AFTER an A/B.
+const BLOCK_LOD_BYTES_EXPANDED := 28 << 20
+const BLOCK_LOD_EXPANDED_ENABLED := false
+
+## The active shared block-LOD ceiling — 28 MB iff the expanded path is explicitly enabled, else the 16 MB default.
+static func block_lod_ceiling() -> int:
+	return BLOCK_LOD_BYTES_EXPANDED if BLOCK_LOD_EXPANDED_ENABLED else BLOCK_LOD_BYTES_MAX
+
+## COSMOS FAR-LOD QUALITY (task #farlod, docs/COSMOS-BLOCK-LOD-DESIGN.md §3/§4 refinement) — two surface far-terrain
+## defects, both fixed here, both OFF by default (byte-identical: every accessor below returns the shipped value / 0):
+##
+##  (A) NO-PROTRUSION for the block-LOD tiers. The L1 rim ring + L2..L5 ladder/global megablock tops are MIN-decimated
+##      (≤ the fine analytic surface by containment) but — unlike the far-ring backstop (BACKSTOP_SINK) and the skin
+##      (FacetSkinTier.SINK) — they carry NO radial sink and NO depth bias. Where a megablock top is COPLANAR with the
+##      near voxel field (flat/gently-sloped terrain, MIN==fine height) the two z-fight on the gl_compatibility 24-bit
+##      depth path (no prepass, weak early-z), so the coarse tier pokes THROUGH the near blocks at the transition. Fix:
+##      push every block-LOD tier vertex FARLOD_BLOCK_SINK blocks radially inward (a pure function of the world point ⇒
+##      welds stay bit-identical; uniform across levels ⇒ no new inter-level crack). Then near(0) > every block-LOD tier
+##      (sunk) > far-ring backstop — provably ≤ the true surface, zero protrusion. Gate: verify_farlod.gd G-FARLOD-SINK.
+##
+##  (B) FINER band selection. The ladder picks a facet's megablock level from d_max(Ln) = 2^n·K_px/4 with K_px≈1407 —
+##      the design's "~4 px at hand-off" law. That leaves mid-field megablocks 3–6 px on a typical display ("large
+##      squares"). block_lod_screen_k_px() rescales K_px so a megablock reads ≈ FARLOD_TARGET_PX at hand-off instead:
+##      finer levels persist to LARGER distances (each level's far edge shrinks pitch/d to the target), so coarse tiers
+##      only appear when genuinely far. The §2V pixel-skin (FP_FACET_TEX far-ring texture) and the sunk far ring remain
+##      the always-resident backstop BEYOND the ladder (never retired on the surface), so the farthest terrain stays
+##      pixel-fine in colour. NEVER-OOM: the finer selection changes only WHICH level the (already-capped) ≤48 ladder
+##      facets bake at — the LRU/facet caps + the finest-first shared-ceiling coarsening are unchanged; if the finer
+##      bands breach the ceiling the coordinator trims finest-first (far ring backstops), so memory stays bounded.
+##      Tunable live via FARLOD_TARGET_PX. Gate: verify_farlod.gd G-FARLOD-BAND.
+const FP_FARLOD_QUALITY := false
+const FARLOD_BLOCK_SINK := 3.0         # (A) radial sink (blocks) on every block-LOD tier vertex — clears the flat-terrain
+                                       # coplanar z-fight + the datum/f32 residual with margin, small enough to stay
+                                       # sub-pixel at the ≥128-block engagement rim (relief amplitude dwarfs it). Knob.
+const FARLOD_SHIP_PX := 4.0            # the shipped law's hand-off threshold (BLOCK_LOD_SCREEN_K_PX ≈ "4 px per block").
+const FARLOD_TARGET_PX := 1.5          # (B) target on-screen megablock size at level hand-off — the "≈1 px per real
+                                       # block when far" intent. Smaller ⇒ finer far (coarse levels pushed farther out),
+                                       # more block-LOD bytes (ceiling-bound). Operator tunes this live.
+
+## (A) The block-LOD tier radial sink in blocks — FARLOD_BLOCK_SINK when the flag is on, else 0.0 (⇒ the ring's _w is
+## byte-identical: no sink term). Read once per ring at construction (member initializer) so EVERY ring — the L1 rim,
+## each ladder level, and the global L5 mesher (which never calls setup()) — sinks uniformly.
+static func farlod_block_sink() -> float:
+	return FARLOD_BLOCK_SINK if FP_FARLOD_QUALITY else 0.0
+
+## (B) The effective on-screen block-size constant K_px the ladder's d_max/level_for_distance read. Flag ON ⇒ rescale
+## the shipped K_px by (FARLOD_SHIP_PX / FARLOD_TARGET_PX) so hand-off happens at ≈ FARLOD_TARGET_PX instead of ~4 px
+## (finer). Flag OFF ⇒ the shipped BLOCK_LOD_SCREEN_K_PX VERBATIM (verify_block_lod's 500→L1..8000→L5 bands unmoved).
+static func block_lod_screen_k_px() -> float:
+	if FP_FARLOD_QUALITY:
+		return BLOCK_LOD_SCREEN_K_PX * (FARLOD_SHIP_PX / FARLOD_TARGET_PX)
+	return BLOCK_LOD_SCREEN_K_PX
+
+## COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2 — "crisp BLOCKY megablocks from orbit").
+## THE orbit render phase: above a swap altitude, mesh the WHOLE visible disc as DISTANCE-LADDERED megablocks (L4 at
+## the nadir → L5 toward the limb, a PER-FACET screen-distance selection — NOT one uniform level) riding the far ring's
+## scaled-body clamp, and RETIRE the smooth §2V "satellite" skin above the swap (swap, don't overlay). This replaces
+## the blotchy 26-block/texel base map the user rejected with crisp voxel-edged geometry AND removes the on-the-fly
+## §2V bake latency at orbit. GATED CONSTRUCTION sibling of the far ring / ladder / global (FacetBlockLodOrbit): the
+## node only exists when FP_BLOCK_LOD_ORBIT is on ⇒ byte-identical off (WorldManager never news it up; nothing calls
+## it). REQUIRES FP_BLOCK_LOD (needs the FacetBlockLod pyramid data model) + FACETED (needs the far ring frame).
+const FP_BLOCK_LOD_ORBIT := false
+
+## Swap altitude (blocks, radial). Above this the orbit block mesh engages + §2V retires; below it the shipped skin
+## path runs unchanged. ~4000 = where §2V has already shed its band/close-up tiers so only the 26-blk base map remains
+## (its texels are already >2 px past here — the design's "engage where the base map is the only skin tier and blows
+## past 2 px"). A ±25% hysteresis band (BLOCK_LOD_ORBIT_HYST) prevents flip-flop at the boundary (mirrors CosmosScale).
+const BLOCK_LOD_ORBIT_ENGAGE_H := 4000.0
+const BLOCK_LOD_ORBIT_HYST := 0.25
+
+## The on-screen megablock-size law (§2.2). A megablock of edge B blocks at camera distance d subtends px = B/d·K_px
+## screen px; solving for the block size that lands at the target px* gives B*(d) = px*·d/K_px, and the ladder level is
+## the smallest pyramid tier whose pitch 2^n ≥ B* (so a megablock reads ≈ px* px), clamped to [MIN_LEVEL, GLOBAL_LEVEL].
+## px*=1.5 (crisp, not chunky); K_px=771 is the 1080p/70°-fov viewport constant the design's alt-8000 live snapshot uses
+## (viewport_h/(2·tan(fov/2))). MIN_LEVEL=4 caps the finest orbit tier at L4 (16-blk) — L3 at orbit busts the byte cap
+## (uniform L4 hemisphere ≈ 32–48 MB; the design forbids finer than L4 out here). Result at alt 8000: nadir ≈15.6 blk →
+## L4 (a small patch, dist≈8000..8224), everything past it → L5 (32-blk) — exactly "L4 nadir → L5 limb", NOT uniform.
+const BLOCK_LOD_ORBIT_PX := 1.5
+const BLOCK_LOD_ORBIT_K_PX := 771.0
+const BLOCK_LOD_ORBIT_MIN_LEVEL := 4          # finest orbit tier (L4 = 16-blk); coarser toward the limb
+## (GLOBAL_LEVEL = 5 = the coarsest orbit tier, already defined above as the L5 pitch-32 megablock.)
+
+## NEVER-OOM (§2.3): the orbit block mesh's hard byte ceiling. Start 12 MB (the design's "+12 MB → ~62 quads/facet over
+## 1728 facets fits an L4-nadir/L5-limb blend"); expand to 16 on a green live A/B. Because §2V is RETIRED (its ≈8.2 MB
+## base map freed, NOT overlaid) the COMBINED block-LOD + far-ring budget stays well under the 40 MB web ceiling. The
+## FacetBlockLodOrbit ledger sums REAL committed mesh bytes and stops meshing (coarsen L4→L5, then drop farthest-limb
+## facets — the sunk far ring backstops them) the instant a facet would breach this cap ⇒ it can never OOM.
+const BLOCK_LOD_ORBIT_BYTES_MAX := 12 << 20
+
+## Hard cap on the visible-disc facets the orbit tier ENUMERATES per re-assign (bounds the bake + the distance sort;
+## the front hemisphere is ~1728 facets — this caps the worst case). The BYTE ledger is the real NEVER-OOM guard; this
+## just bounds compute. Re-assign is throttled by a camera-drift threshold (no per-frame re-tessellation churn, §2.5/§5).
+const BLOCK_LOD_ORBIT_MAX_FACETS := 1800
+const BLOCK_LOD_ORBIT_DRAWS := 6              # merge the accepted facets into ≤ this many meshes by cube face (draw-safe)
+const BLOCK_LOD_ORBIT_FRONT_COS := -0.05     # visible-disc test: emit facets with dot(facet_dir, cam_dir) > this (front
+                                             # hemisphere + a hair past the horizon so the limb ring is covered/densified)
+const BLOCK_LOD_ORBIT_REASSIGN_DEG := 3.0    # re-assign only when the sub-camera direction drifts past this many degrees
+const BLOCK_LOD_ORBIT_REASSIGN_DH := 400.0   # …or the camera altitude drifts past this many blocks (whichever first)
+
+## The screen-distance megablock LEVEL law (§2.2), PURE + gate-checked. `dist` = camera→facet-centre distance (blocks).
+## n = smallest level with pitch 2^n ≥ B*(dist); clamp to [min_level, max_level]. Monotone NON-DECREASING in dist (a
+## farther facet never gets a FINER tier) — the "no protrusion / no inversion" ladder guarantee the gate asserts.
+static func orbit_level_for_dist(dist: float, px: float, k_px: float, min_level: int, max_level: int) -> int:
+	var b_star: float = px * maxf(dist, 0.0) / maxf(k_px, 1.0)   # target megablock edge (blocks) for px* on screen
+	var n := min_level
+	while n < max_level and float(1 << n) < b_star:
+		n += 1
+	return clampi(n, min_level, max_level)
+
+## The swap engage/disengage predicate with hysteresis (mirrors CosmosScale.should_retire). Engage the orbit block mesh
+## + retire §2V once altitude rises past ENGAGE_H·(1+HYST); disengage only once it drops below ENGAGE_H·(1−HYST). The
+## ±HYST band is the seamless cross-fade window (no hard pop at the boundary — the two regimes co-exist across it).
+static func block_lod_orbit_engaged(h: float, currently_engaged: bool) -> bool:
+	if currently_engaged:
+		return h > BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 - BLOCK_LOD_ORBIT_HYST)
+	return h > BLOCK_LOD_ORBIT_ENGAGE_H * (1.0 + BLOCK_LOD_ORBIT_HYST)
+
 ## COSMOS LOD-TEXTURE Phase 4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §1.2 T2t / §6 Phase 4) — the CLOSE-UP satellite
 ## tier (requires FP_FACET_TEX). A SECOND Texture2DArray of CLOSEUP_MAX=64 layers of CLOSEUP_TEXELS=128² (≈3.3
 ## blocks/texel = 8× finer than the 26-block base map), one cap facet per layer, LRU by angular distance from the
@@ -509,6 +901,34 @@ const CLOSEUP_SLICE_ROWS := 16            # rows baked per budget slice (16·128
 const CLOSEUP_NEAR := 1200.0              # cam_dist (blocks) where the close-up tier saturates (wc = 1)
 const CLOSEUP_FAR := 4000.0               # cam_dist (blocks) where the close-up tier engages (wc = 0)
 const CLOSEUP_CAP_DEG := 17.0             # angular half-cap around the emit axis a facet must fall in to be promoted (~64 facets)
+
+## COSMOS TEXTURED-LOD V3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1/§2V.5: FP_PAGES_SHOT) — rebake the base + close-up
+## texture PAGES as true box-downscales of the REAL surface shot (SurfaceShot.surface_shot: tint × static-shade, trees
+## composited on top) instead of the FarPalette biome COLOUR average. This is what kills "biome colours" at the base
+## (orbit) and close-up (mid) tiers: a page texel becomes the box-mean of the near daylight material's own per-block
+## appearance (§2V.0 (B)), sun-independent (sun shading stays live in the shader, V1's domain). Requires FP_FACET_TEX
+## (the baker only exists under it). Two-GENERATION pages keep BOOT unchanged: g0 = today's palette bake at prewarm +
+## progressive coverage (fast boot, byte-identical timing), g1 = a background cursor that re-bakes each already-covered
+## facet to shot-coverage over time (nearest-axis first, then a global sweep — the whole planet converges after boot).
+## Off ⇒ the g1 cursor never runs, _bake_facet_pixels always bakes the palette colour ⇒ BYTE-IDENTICAL palette bake
+## (FLAT 6042/0). NEVER-OOM: reuses the existing page allocation + upload path (no new textures); the shot scratch is a
+## transient BAKE_SRC² PackedColorArray pair (≈0.4 MB, §2V.4). Gate: verify_pages_shot.gd (G-VP-DOWNSCALE / G-VP-BOOT).
+const FP_PAGES_SHOT := false
+
+## COSMOS TEXTURED-LOD V4 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.2/§2V.5: FP_SKIN_SSE) — the screen-space MONOTONE skin
+## promotion law. Bug 1 (the descent flat-color drop): fidelity is keyed to the flight REGIME today, so crossing into the
+## surface regime fires FacetTexBaker._evict_all_closeup — dumping every close-up promotion at the exact moment of descent —
+## leaving only the 26-blk biome-color base until the near band warms (non-monotone by construction). The fix RETIRES the
+## regime evict-all and drives BOTH the close-up and band want-sets by each facet's on-screen block size instead: a facet is
+## promoted base→close-up→band as its per-facet camera distance shrinks past CLOSEUP_FAR then CLOSEUP_NEAR (blocks approach
+## ~2 px), NEAREST/largest-deficit first, under the shipped bake budget, with SSE_HYST hysteresis. Distance shrinking during
+## a descent ⇒ resolved level non-decreasing until the near mesh takes over: MONOTONE by construction (gate G-VD-MONO). This
+## ABSORBS stage T2 (FP_FACET_TEX_SURF): band membership generalizes from "ring-1 on surface" to "screen-space demands it".
+## Default OFF ⇒ update() runs the shipped regime-keyed path byte-for-byte (evict-all intact) ⇒ FLAT 6042/0. Format-agnostic:
+## a promotion-law change only — it works DEGRADED against the current page/band formats and lands full effect after V2+V3.
+## Zero added bytes (reuses the CLOSEUP/BAND layer pools). Gates: G-VD-MONO (monotone descent), G-VD-BUDGET, G-VD-OFF.
+const FP_SKIN_SSE := false
+const SSE_HYST := 1.25                    # release-distance factor: a resident tier is only demoted past promote·SSE_HYST (no boundary churn)
 
 ## COSMOS FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6) — the SSE selector + request-grant budgeter + the closed-loop
 ## load-adaptive controller tunables. Consts so the gates assert them and M2d builds against a frozen contract.
@@ -535,6 +955,33 @@ const CTRL_CREDIT_MDF := 0.5
 const CTRL_CREDIT_AI := 0.1
 const CTRL_PROMOTE_CREDIT := 0.5
 const OFFSURFACE_Y := 256.0
+
+## COSMOS MAIN-THREAD ORCHESTRATION TH0 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §6) — the priority
+## JOB LANE foundation for the pilot's "the main thread deals ONLY with the orchestration of other threads"
+## directive. When true, WorldManager constructs ONE `JobLane` (godot/src/world/job_lane.gd) and pumps it
+## each frame; the lane multiplexes future offloaded COMPUTE (TH1 tex bake, TH2 far-ring warm, TH3 manifest,
+## TH4 skin/snow) onto the EXISTING WorkerThreadPool (≤2 slots, NEVER a new thread — the pool is fixed at 16
+## and ledgered at 15) and pays only a bounded main-thread commit per frame, drained highest-priority-first so
+## bulk work can't starve a crossing-critical rebuild. TH0 is INFRASTRUCTURE ONLY: the lane + the
+## `main_commit_ms` telemetry counter exist, but NOTHING is routed through it yet (TH1+ move the subsystems),
+## so ON changes nothing observable but the added telemetry field. Default OFF ⇒ BYTE-IDENTICAL: the lane is
+## never constructed, never pumped, and `main_commit_ms` reports 0.0. Truth gate: src/tools/verify_job_lane.gd.
+const FP_JOB_LANE := false
+
+## COSMOS MAIN-THREAD ORCHESTRATION TH1 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §6, table row TH1) — the
+## FIRST subsystem routed through the TH0 JobLane: the FacetTexBaker per-frame bake. Today ALL of the bake COMPUTE
+## runs on the MAIN thread inside FacetTexBaker.update() — the fine sample_columns grid + set_pixel/id composite +
+## the U1 band chunk-rows + premultiply_alpha + generate_mipmaps — which at web ×25 is the observed proc_ms ~90-140
+## spike (fps 40) even standing still. Only the Texture2DArray.update_layer GPU upload is a true main-thread commit.
+## When true (AND FP_JOB_LANE — the lane must exist, else this is inert): each per-frame bake UNIT (a base facet, a
+## close-up row-slice, a band chunk-row) has its COMPUTE dispatched to the WorkerThreadPool worker via the job lane
+## at PRIORITY_TEXTURE (single in-flight per baker — the far-ring contract), writing into the baker's PREALLOCATED
+## staging Images (single-writer while in flight, reused — no per-job alloc, the dlmalloc-convoy guard); the main
+## thread pays ONLY the bounded update_layer at the lane's commit. All residency bookkeeping (slots/epochs/_baked/
+## dirty) stays single-writer on MAIN (mutated at commit), so the sampler-pure bake is BYTE-IDENTICAL to the on-main
+## bake (G-TW-EXACT). The setup prewarm still bakes synchronously on main (unchanged). Default OFF ⇒ BYTE-IDENTICAL:
+## the baker branches to its today-exact on-main update() and never touches the lane. Truth gate: verify_tex_worker.gd.
+const FP_TEX_BAKE_WORKER := false
 
 ## COSMOS-FP-M2-CONTROLLER-FIX (un-starving the StreamLoadController; credit was pinned at 0 in production).
 ## RELIEF_FLOOR — the min credit-equivalent that surfaces 1-2 (LOD build grants + apply-ms) and the imminent view-ramp
@@ -679,6 +1126,55 @@ const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hyste
 const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
 const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
 
+## INITIAL-LOAD VIEW RAMP (perf/voxiverse-load-profile) — FP_LOAD_RAMP. Symptom: the FIRST cold load slams the near
+## VoxelTerrain's max_view_distance to the full near radius (near_render_radius(): 256 flat / 128 faceted) in ONE
+## step at module setup — both on the single-terrain path (module_world.setup → _set_if max_view_distance) AND the
+## FP_M1_POOL active-slot init (_pool_init_active seeds view_f == view_target == full, "NO ramp"). godot_voxel then
+## queues the WHOLE view sphere (~2.6k blocks flat) in a single pass; the ShaderPrewarm overlay only holds ≤4 s and
+## only waits on a tiny 40³ box, so the splash lifts while the bulk of the disk is still generating — the multi-minute
+## post-splash fill. When ON, the FIRST load starts at the EXISTING module_world.RAMP_START_BLOCKS (48) and grows to
+## the full target over RAMP_SECONDS (1.5 s) using the EXACT same ramp the post-flip restream / neighbour-pool spawns
+## already use (single-terrain _ramp_active leg, or the active pool slot via _ramp_pool_step) — the nearest ring meshes
+## first (playable in seconds), worker load spreads across frames instead of a one-pass burst, and the far ring covers
+## the rim until it fills. The final view is IDENTICAL — pure load-shaping. It ALSO widens the ShaderPrewarm essential-
+## ready hold from a 40³ box to ~96³ (LOAD_RAMP_ESSENTIAL_HALF) with a longer [floor, cap] window so "playable" means
+## actually-surrounded, not a 40-block bubble. Default OFF ⇒ the shipped one-pass slam verbatim (byte-identical; FLAT
+## stays 6042/0). Flip ON at export after the live world_settled A/B (perf/voxiverse-load-profile instrumentation).
+const FP_LOAD_RAMP := false
+
+## INITIAL FAR-RING CACHE DEFER (perf/voxiverse-load-profile) — FP_BOOT_ASYNC. Symptom (live profile): world_build =
+## 113.8s, of which ~90s is FacetFarRing.setup()'s SYNCHRONOUS initial _rebuild_full — it caches EVERY front-hemisphere
+## facet (~1716) in one main-thread call before the game can proceed (each facet's env/column cache is the web ×25 cost).
+## The whole hemisphere does NOT need to be cached before the player can play: on the surface the near voxel field covers
+## the ground and fog hides ~2R, so only the facets near the active facet (the local horizon) are actually visible at
+## spawn. When ON, setup() caches only a bounded PROXIMITY SEED (BOOT_SEED_FACETS, nearest-first) synchronously and emits
+## it, then warms the remaining front facets across frames in _process under a per-frame budget (WARM_BUDGET_MS), re-
+## emitting the growing cached subset every SHELL_REEMIT_GROWTH facets — the EXACT _emit_cached_only / _ensure_emit_cached
+## progressive machinery the true-orbit path already uses. The player reaches essential-ready in seconds; the far
+## hemisphere fills in the background (distant/back facets are off-screen while it does). Final coverage is identical.
+## RISK: a facet not yet warmed draws as no far quad — visible only if the near field + fog don't cover it (mid-distance
+## on a clear sightline); the proximity seed + fast near-horizon warm keep the visible ring solid, so pop-in is confined
+## to distances the fog already hides. Default OFF ⇒ the shipped synchronous full _rebuild_full (byte-identical; FLAT
+## stays 6042/0 — FLAT has no far ring). Flip ON at export after the live world_settled A/B.
+const FP_BOOT_ASYNC := false
+## FP_BOOT_ASYNC: facets cached synchronously at boot (the proximity seed covering the spawn horizon). Bounded so the
+## synchronous boot cost stays small (~BOOT_SEED_FACETS × per-facet warm); the rest stream in over subsequent frames.
+const BOOT_SEED_FACETS := 48
+
+## MANIFEST BAKE SLICE (perf/voxiverse-load-profile round 4) — FP_MANIFEST_SLICE. Symptom (live profile): world_build's
+## wb_module_setup = 22.2s, dominated by module_world._build_gen_manifest baking ~8000 appearance models synchronously
+## (each triggers a GPU geometry read-back). Most are COLD-biome variants a temperate spawn does not touch in its first
+## seconds: snow-fill composites (~1580) + sharp slopes (~5160) + waterlog twins (~632). When ON, setup() bakes only the
+## CORE synchronously (dry gen-appearance ~650 + snow-cap ~320 + snow LAYER + seam carve — the shapes a temperate spawn's
+## near field needs), and the cold bulk bakes AFTER essential-ready (WorldManager.begin_deferred_boot_work → one helper
+## per frame), followed by a bounded near-view RE-RAMP so any cell generated with a cube fallback during the defer window
+## remeshes with the completed library (no permanent wrong-shape — the regression a naive defer would cause). An unbaked
+## cold slot cube-falls-back on the worker meanwhile (right substance, wrong silhouette, never a hole). Default OFF ⇒ the
+## shipped one-shot synchronous bake (byte-identical; FLAT stays 6042/0). Flip ON at export after the live A/B.
+## TRADEOFF: the deferred cold helpers are monolithic, so each lands as one multi-second frame in the first seconds of
+## play (3 hitches) — acceptable vs +16s to essential-ready, and A/B-gated. Finer intra-helper slicing is a follow-up.
+const FP_MANIFEST_SLICE := false
+
 ## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
 ## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
 ## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and
@@ -695,6 +1191,56 @@ const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, lin
 ## cap — no unbounding); only the fill RATE / a collapsed-target repair changes. Default OFF ⇒ _ramp_pool_step is the
 ## exact shipped math (byte-identical; FLAT stays 6042/0). Flip ON at export after the live de-orbit-land A/B.
 const FP_LANDING_STREAM_KICK := false
+
+## COSMOS SEAMLESS-TRANSITION S1 (docs/COSMOS-SEAMLESS-TRANSITION-DESIGN.md §3 — FP_APPROACH_ANCHOR). Symptom
+## (the user's literal complaint, §0.1): the near VoxelViewer is a CHILD of the player with up-reach U ≈ 64
+## blocks, so climbing ~64 blocks empties the WHOLE near field while a block still subtends ≈22 px — an abrupt
+## "pop" to the flat far skin (~2 orders of magnitude above the ≈2 px invisibility threshold). Fix (pure
+## streaming POLICY — NO new buffers/shaders/bytes, same safety class as DEV_HIDE_NEAR):
+##   (a) ANCHOR (§3.1): while airborne, drive the EXISTING viewer vertical offset each streaming tick
+##       (debounced ≥ ANCHOR_WRITE_DEBOUNCE_MS) so the viewer stays pinned to the sub-player surface point:
+##       offset_y = clamp(O_base − h, −h + ANCHOR_MARGIN, O_base), O_base = TerrainConfig.clamped_viewer_offset_y()
+##       (today's +12), h = the SAME analytic altitude the regime ladder uses (WorldManager._radial_altitude_lattice
+##       → radius − R_BLOCKS; NEVER the voxel buffer). Then the viewer's WORLD radial altitude = h + offset_y = O_base
+##       for all h — the already-meshed plate stays inside the unchanged ±ellipsoid at any altitude. Vertical-only;
+##       horizontal tracking is unchanged (walk streaming).
+##   (b) RELEASE (§3.2): a block at camera-distance d subtends ≈ K_px/d px (K_px≈1407) → sub-τ at D_REL = K_px/τ ≈
+##       700 for τ = ANCHOR_TAU_PX. As the camera's distance to the plate (≈ h, plate anchored directly below)
+##       crosses ANCHOR_REL_LO → ANCHOR_REL_HI, ramp the viewer view_distance DOWN monotonically so the plate
+##       recedes rim-inward (every unloading block is already ≤ τ px). Above the band the plate is empty (today's
+##       orbit state); FP_ALT_REGIME / OFFSURFACE_Y freezes are UNCHANGED. DESCENT bonus: re-grow with ANCHOR_HYST
+##       hysteresis (fully resident again only once d < ANCHOR_REL_LO / ANCHOR_HYST ≈ 609) so near streaming
+##       restarts ~700 instead of ~416 — composes with (does not replace) FP_LANDING_STREAM_KICK + the alt-regime
+##       release. NEVER-OOM: same viewer, same 128-block bubble; the airborne plate holds AT MOST the grounded set.
+## Default OFF ⇒ WorldManager._update_approach_anchor early-returns, attach_viewer is byte-identical, FLAT stays
+## 6042/0. Requires FACETED (like all cosmos flags — the offset law only runs on the composite-identity active
+## facet). Gate: verify_approach_anchor.gd (G-AA-OFF / G-AA-ANCHOR / G-AA-TAU / G-AA-BYTES). Does NOT enable
+## FP_FARRING_LEVEL/U2 (S1b) — S1 ships alone; a residual ~13-block level jump at the reveal is accepted for now.
+const FP_APPROACH_ANCHOR := false
+const ANCHOR_TAU_PX := 2.0            # screen-space release threshold (px/block); sub-τ ⇒ safe to unload
+const ANCHOR_REL_LO := 700.0          # camera-to-plate distance (blocks) where release BEGINS (≈ K_px/τ, D_REL)
+const ANCHOR_REL_HI := 900.0          # distance where the plate is fully released (view_distance → 0)
+const ANCHOR_HYST := 1.15             # descent hysteresis: fully resident again only below ANCHOR_REL_LO/HYST
+const ANCHOR_WRITE_DEBOUNCE_MS := 100 # min ms between viewer offset/view writes (anti re-mesh churn; FP-M1c precedent)
+const ANCHOR_MARGIN := 4.0            # safety floor (blocks): the viewer never sinks below datum+ANCHOR_MARGIN
+
+## S1 (a) — the anchor offset law (§3.1), pure/static so the gate asserts the identical formula the driver applies.
+## Returns the viewer LOCAL +Y so its WORLD radial altitude == o_base (the sub-player ground the player left) for any
+## player altitude h ≥ 0. Bounds = the design's clamp [−h+ANCHOR_MARGIN, o_base], but applied FLOOR-AFTER-CAP (not
+## clampf, which is cap-after-floor) so that DEEP below the datum — where the two bounds cross (−h+margin > o_base at
+## h < margin−o_base) — the FLOOR wins and the viewer world altitude never sinks below datum+ANCHOR_MARGIN. For h ≥ 0
+## the bounds never cross and the result is exactly o_base − h (world alt == o_base), identical to clampf.
+static func approach_offset_y(h: float, o_base: float) -> float:
+	return maxf(minf(o_base - h, o_base), -h + ANCHOR_MARGIN)
+
+## S1 (b) — the release ramp (§3.2), pure/static. Given the camera-to-plate distance d, the full near radius, and
+## the (hysteretic) lower knee `lo`, returns the target view_distance: `full` at/below `lo`, linearly down to 0 at
+## ANCHOR_REL_HI, 0 above. Monotone non-increasing in d. The driver picks lo = ANCHOR_REL_LO while resident and
+## ANCHOR_REL_LO/ANCHOR_HYST once released (the descent re-grow band) — the hysteresis knee.
+static func approach_view_distance(d: float, full: float, lo: float) -> float:
+	if ANCHOR_REL_HI <= lo:
+		return 0.0 if d >= ANCHOR_REL_HI else full
+	return full * clampf((ANCHOR_REL_HI - d) / (ANCHOR_REL_HI - lo), 0.0, 1.0)
 
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
@@ -808,6 +1354,19 @@ const FP_SHELL_ORBIT_IDLE := false
 const FP_SHELL_FALL_HOLD := false
 const SHELL_FALL_MARGIN_DEG := 12.0   # extra θ_emit margin the held cap carries off-surface (absorbs the descent θ_h shrink); also the GROW re-emit threshold
 const SHELL_FALL_REEMIT_MS := 1000    # min wall-ms between throttled off-surface re-emits (axis sweep / progressive grow) during a fall
+
+## COSMOS DEV-FLY HANG (fix/voxiverse-devfly-hang) — the CLIMB counterpart of FP_SHELL_FALL_HOLD. Below OFFSURFACE_Y the
+## emitted cap is FLOORED to θ_emit ≥ 90° (shell_set_camera_abs), and that floor BINDS for every θ_h < 90 − (RELIEF +
+## SLACK) = 67° — i.e. for every altitude below ~9900 blocks. So a straight powered climb from the ground grows θ_h
+## (acos(R/d)) but the ACTUALLY-EMITTED far-ring set stays the SAME 90° hemisphere the whole way; the shipped reactive
+## trigger nonetheless fires a full re-emit every |Δθ_h| > 5° (~2× over a 7→210 climb), each rebuilding + re-uploading
+## an IDENTICAL-coverage blocky mesh (the churn suspected in the live dev-fly hard-hang: the render thread stalls on the
+## redundant GL/ANGLE mesh upload while the main loop runs on, then blocks on the full command queue). With this flag ON
+## the θ_h-only re-emit is SUPPRESSED while floored AND the committed cap cos is unchanged AND the axis has not swept —
+## i.e. only when the new emitted set is PROVABLY identical to the committed one; axis drift, floor/regime crossings, and
+## any genuine cap change still re-emit (correctness, no limb holes). Byte-VISUALLY-identical on (the floored set is
+## θ_h-independent while the floor binds); byte-identical OFF (the shipped trigger verbatim). Requires FP_SHELL_CAMERA_SET.
+const FP_SHELL_CLIMB_NO_CHURN := false
 
 ## COSMOS-PERF FALL-COLLAPSE FIX C (fix/voxiverse-fall-perf) — skip the main-thread snowfall fixed-step while the
 ## player is AIRBORNE (a HIGH FLYER above OFFSURFACE_Y, e.g. falling from orbit). SnowfallSystem.process runs a
@@ -1032,6 +1591,39 @@ const FP_MOON_RING := false
 ## CANNOT be a large multiple of R (the far plane boxes it at ≤ 1.35·R); raising that further is a CAMERA_FAR
 ## change, out of M1 scope — the gate asserts the derived value clears R and flags loudly if R ever approaches it.
 const FP_SKY_DSKY_R := false
+## COSMOS ORBIT-SPACE (this session) — ALTITUDE-TRACKING star dome. FP_SKY_DSKY_R fixes the dome radius to the
+## STATIC CAMERA_FAR (9000 ⇒ dome ≈ 8143), which is correct at ground but too small in high orbit: at alt 8000
+## the camera is ~14371 from the planet centre and the planet limb sits at √(d²−R²) ≈ 12882 — well OUTSIDE the
+## 8143 dome, so the dome collapses into the disc and real space cannot composite around the limb (the gray-blue
+## wash the player sees at 8000). When true, the star dome + sun/moon placement track the ALTITUDE-SCALED far
+## plane CosmosScale.camera_far(d,R) (exactly as B5's fog-end already does), so the dome grows with altitude and
+## always clears the limb: dome edge = camera_far·SKY_FAR_MARGIN < camera_far (never clips), > limb tangent. At
+## ground camera_far==FAR_MIN==9000 ⇒ the scale factor is EXACTLY 1.0 (C0-continuous, night stars unchanged), so
+## the near/ground regime is untouched. NOTE a blind CAMERA_FAR raise is WRONG: it would push the fixed dome
+## beyond the 9000 ground clip and cull night stars on the surface — the dome MUST track altitude, not be a bigger
+## constant. Requires FP_SKY_DSKY_R (+ FP_SCALED_BODY for the ramp). Default FALSE ⇒ BYTE-IDENTICAL (scale≡1,
+## static _dsky). Gate: verify_atmo_sky.gd (ground continuity + dome-clears-limb-at-alt-8000).
+const FP_SKY_DSKY_ALT := false
+## COSMOS ORBIT-SPACE (this session) — PLANET-CENTRE-RELATIVE sky geometry. CosmosSky assumes the planet sits at
+## the scene ORIGIN and derives altitude/up/sun-elevation/occlusion/light from cam_origin.length(). But under the
+## floating-origin / scaled-body frame the planet is offset to WorldManager.planet_render_centre() above the
+## re-anchor (REANCHOR_TRIGGER_BLOCKS=8192): the camera is kept near the origin while the planet moves away, so
+## cam_origin.length() COLLAPSES toward ~0 at high orbit → the sky's h≈0 → atmo_vis=1 → sm=0 → the day-sky colour
+## (SKY_DAY = the gray-blue) renders in space instead of black, AND the altitude-keyed light over-brightens the
+## far-ring (the blown-out planet). Below the re-anchor (alt ≲ 3.5k) the planet is still ~at origin ⇒ correct
+## (why alt 2500 was black but 8000 was blue on the SAME build). When true, the sky's GEOMETRY math uses
+## cam_rel = cam_origin − planet_render_centre() (true planet-relative position); NODE PLACEMENT (sun/moon/star
+## dome, which sit AT the camera) stays on the raw cam_origin. Default FALSE ⇒ cam_rel ≡ cam_origin ⇒
+## BYTE-IDENTICAL. Requires FACETED (+ the SN3/scaled-body frame to matter). Live-verified via orbit snapshot.
+const FP_SKY_PLANET_CENTRE := false
+## COSMOS HUD (this session) — VACUUM-AWARE thermometer. The shipped HUD prints air/ground temperature as a raw
+## number everywhere, which in orbit shows (a) values BELOW absolute zero (the altitude lapse extrapolates the air
+## curve to e.g. −541 °C — physically impossible) and (b) an "air" temperature where there is no air. When true:
+## every shown temperature is clamped to ≥ −273.0 °C (absolute zero floor); in vacuum (radial altitude above the
+## atmosphere ceiling ATMO_TOP ⇒ no air) the AIR temp reads "--"; and when in space AND not standing on a body
+## surface the GROUND temp reads "--" (it resolves to a real value again on the Moon/Earth surface). Default FALSE
+## ⇒ BYTE-IDENTICAL (the shipped "%5.1f °C" strings). Gate: verify_hud_temp.gd.
+const FP_HUD_VACUUM_TEMP := false
 ## COSMOS CLIMATE W0 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §3 / §7) — REAL AXIAL SEASONS. When true the
 ## ephemeris fills Earth's reserved axial_tilt slot (23.4° = 0.4084 rad): dir_to_bodyfixed composes the
 ## obliquity (R_spin·R_tilt) so CosmosSky's sun arcs get seasonal (low winter / high summer / polar
@@ -1141,6 +1733,19 @@ const FP_ATMO_SHELL := false
 ## (+ FP_SUN_PRESENCE for the disc/glare rewire). Gate G-B0-PATH. LIVE-ONLY LOOK.
 const FP_SUN_PATHLIGHT := false
 
+## COSMOS DIMSUN (docs/COSMOS-ATMO2-DESIGN.md §3.5, this fix). The low-elevation sun-disc BRIGHTNESS fix. Under
+## FP_SUN_PATHLIGHT the Sun disc's radiance was base·T⃗(m)·8·L(m)·occ — atmospheric extinction applied TWICE: once
+## chromatically via the transmittance colour T⃗(m)=exp(−τ⃗·m) AND again broadband via L(m)=exp(−0.10·m) on the
+## emission energy. At the horizon (m≈18) that stacks to ≈m² extinction, collapsing the disc to a dim near-black
+## dot exactly when a rising/setting sun should be a big warm sunrise/sunset disc. This flag (a) renormalizes the
+## disc's transmittance to a chroma-preserving HUE (brightest channel → 1) so the disc keeps its warm reddening
+## but NOT the luminance collapse, and (b) drops the L(m) double-extinction from the disc/glare energy — the
+## occlusion occ still fades the disc as it truly sinks below the horizon/limb, and the DirectionalLight (scene
+## illuminance) keeps its full T⃗(m)·L(m) dimming (untouched). Midday (m≈1, T⃗≈white) is a ~no-op. Off ⇒ the
+## disc radiance is byte-identical to the shipped B0 path. Requires FP_SUN_PRESENCE (+ FP_SUN_PATHLIGHT for the
+## live path). Gate G-DIMSUN. LIVE-ONLY LOOK.
+const FP_SUN_DISC_WARM := false
+
 ## COSMOS ATMO2 B1 (docs/COSMOS-ATMO2-DESIGN.md §2.1.2/§3.3, stage B1). The apparent-disc fix: Godot's
 ## SphereMesh default radius is 0.5 (not 1.0), so the shipped sun/moon impostors render at HALF their intended
 ## angular size (sun 1.0° not 2.0°, moon 0.75° not 1.5°) — a blurry dot lost in the glare. Under this flag the
@@ -1193,6 +1798,19 @@ const FP_ATMO_PATH_SHELL := false
 ## bites on the bounded path). Gate G-O1-GROUND. LIVE-ONLY LOOK (P3 shader class). Depends B2.
 const FP_ATMO_GROUND_BUDGET := false
 
+## COSMOS PLANET-VIEW §2 (docs/COSMOS-PLANET-VIEW-DESIGN.md §2.1–2.4). The honest atmosphere RIM: fixes the
+## shell so it reads as a thin, concentric, scale-tracked hairline instead of an oversized, offset, detached ring.
+## Three compounding faults, all fixed under this flag: (2.1) the rim GEOMETRY is capped at R+ATMO_TOP (SHELL_RIM_MULT
+## → 1.0, fed via the r_outer UNIFORM so it needs no mesh rebuild) and the BRIGHTNESS is concentrated into a short
+## scale height H_RIM (≈48) so the bright band hugs the limb at ~1.5% of R; (2.2) the shell shader is fed the
+## RENDER-frame camera (cam_origin) + RENDER-frame centre (planet_render_centre) so wp/cam/centre share one frame —
+## superseding the FP_SKY_PLANET_CENTRE cam=cam_rel/centre=0 mismatch that slid the limb off above the re-anchor;
+## (2.3) the shell node rides the SAME scaled-body clamp s = CosmosScale.scale_for(d, R) the far ring uses, with
+## r_solid/r_outer/centre scaled to match, so the rim shrinks WITH the disc in deep space. Below D_ENGAGE s==1 ⇒ the
+## unscaled placement. Off ⇒ the shipped FP_SKY_PLANET_CENTRE/FP_ATMO_SHELL behaviour verbatim (byte-identical).
+## Requires FP_ATMO_SHELL (no shell node otherwise). Gate G-AS-RIM. LIVE-ONLY LOOK (P3 shader class).
+const FP_ATMO_RIM := false
+
 ## COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3, stage B3). The bug-6 fix: the near-field materials
 ## are SHADING_MODE_UNSHADED (lighting baked into vertex COLOR), so A4's DirectionalLight dimmer reaches nothing
 ## and the near ground stays full-day-bright at night while the far ring correctly darkens (the pilot's near/far
@@ -1202,6 +1820,29 @@ const FP_ATMO_GROUND_BUDGET := false
 ## is retained permanently (P3 gl_compat class). Off ⇒ the shipped unshaded materials ⇒ byte-identical. Requires
 ## ORBITAL_SKY (the sun_dir source). Gate G-B3-NEARNIGHT. LIVE-ONLY LOOK. Depends B0 (curves).
 const FP_NEAR_DAYLIGHT := false
+
+## COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit) — the SURGICAL day/night-normal fix for the
+## near-field daylight twins. The shipped B3 twins compute the radial normal as μ = normalize(world_pos)·ŝ,
+## i.e. they assume the planet centre is the SCENE ORIGIN. That holds only when planet_render_centre() == 0;
+## the live faceted build places the planet centre AWAY from the origin (T_active⁻¹ render frame — proven
+## non-zero by the set_time up_bf fix, commit 4aa9d56), so normalize(world_pos) is NOT the true radial and the
+## near ground shades for the WRONG day/night — a facet region stays day-lit past true dusk and its (live,
+## smoothstep) terminator sweeps dark at the wrong clock time, meeting the correct MODEL·0-normal far ring at a
+## SHARP facet/tier seam. This flag switches the near twins (atlas module path + BlockMaterials fallback/residual
+## + debris) to n = normalize(v_wp − planet_centre) with planet_centre fed each frame from planet_render_centre()
+## — the SAME true radial the far shell derives from MODEL·0 — while keeping the shipped shade law (night_floor
+## 0.10 / term_mu / moonshine) otherwise byte-for-byte. FP_SHADE_UNIFIED already does this for the atlas path, so
+## this is the isolated normal-only fix for the shipped (non-unified) live config. Off ⇒ the shipped
+## normalize(v_wp) shader verbatim + no centre push ⇒ byte-identical. Requires FP_NEAR_DAYLIGHT. Gate
+## verify_tier_shade (G-TS-NEARNIGHT / G-TS-FALSIFY).
+const FP_NIGHT_TERRAIN_CENTRE := false
+
+## True iff the near-field daylight twins must carry a planet_centre uniform + true-radial normal — either via the
+## unified law (FP_SHADE_UNIFIED) or the isolated normal-only fix (FP_NIGHT_TERRAIN_CENTRE). Both need
+## FP_NEAR_DAYLIGHT (the twins only exist then). Read by block_atlas / block_materials (shader select + uniform
+## set) and WorldManager (per-frame centre push). Off ⇒ false everywhere ⇒ byte-identical.
+static func near_centre_fix_on() -> bool:
+	return FP_NEAR_DAYLIGHT and (FP_SHADE_UNIFIED or FP_NIGHT_TERRAIN_CENTRE)
 
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
@@ -1350,6 +1991,68 @@ const SN_FOFF_RADIAL_FALL := false
 ## √(datum_gravity/k0) == ATMO_BRAKE_TERMINAL by construction (per-body generic). Single named const — dial live
 ## (raise toward the orbital DRAG_TERMINAL 55 once a pre-gen landing column removes the streaming constraint).
 const ATMO_BRAKE_TERMINAL := 20.0
+
+## DEV-FLIGHT CRUISE MODE (2026-07-31 dev request) — Elite-Dangerous-style SUPERCRUISE for the dev fly camera.
+## While DEV-FLYING in SPACE (radial altitude above the nearest body's surface > ATMO_TOP), HOLDING the C key
+## flies the player straight along the CAMERA LOOK direction at a speed that grows EXPONENTIALLY with distance
+## from the nearest body's surface. RELEASE C ⇒ INSTANT STOP (kinematic fly, velocity held 0). Engage needs
+## dev-flight active + in-space + C held. Default FALSE ⇒ BYTE-IDENTICAL (C never polled). Gate G-CRUISE.
+const CRUISE_MODE := false
+## Cruise speed law (blocks/s; 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks). speed(alt) =
+## clamp(MIN·2^(alt/BAND), MIN, MAX). MIN 200 = crawl just above ATMO_TOP; BAND 4000 = doubles/4000 blocks (cap
+## by ~18.6k alt); MAX 5000 = Earth→Moon crossing ≈ 77 s (1–3 min window). radial_altitude() = nearest-body alt.
+const CRUISE_SPEED_MIN := 200.0
+const CRUISE_SPEED_BAND := 4000.0
+const CRUISE_SPEED_MAX := 5000.0
+
+## Pure cruise SPEED LAW (blocks/s). Monotone; == MIN at/below alt 0; doubles per BAND; clamped [MIN,MAX].
+static func cruise_speed(alt: float) -> float:
+	return clampf(CRUISE_SPEED_MIN * pow(2.0, alt / CRUISE_SPEED_BAND), CRUISE_SPEED_MIN, CRUISE_SPEED_MAX)
+
+## Pure ENGAGE PREDICATE: dev-flight AND in-space AND C held (the live call ANDs with CRUISE_MODE).
+static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
+	return dev_fly and in_space and c_held
+
+## COSMOS FALL-THROUGH FIX (2026-07-31) — dev-teleport facet-frame re-assert. A dev teleport (_dev_reposition) can
+## have update_streaming fire a spurious facet crossing on the huge position jump, flipping the ACTIVE frame to a
+## neighbour while `position` still holds the OWNER lattice coords; surface_y then resolves the neighbour's terrain
+## (a different sphere direction, often deep ocean) and the feet clamp onto the seafloor → the player is buried (the
+## lat 8/lon 2 fall-through, root-caused: the STATIC floor math is correct, the ACTIVE FACET is wrong for the position).
+## When true, _dev_reposition restores the owner facet after streaming before the surface read. Dev-only (runs under
+## CONTROL_ENABLED); off ⇒ byte-identical. A dev-instrument fix — normal walking never hits it (proven: 6450-column sweep, 0 fall-throughs).
+const FP_DEV_TP_REFRAME := false
+
+## COSMOS FALL-THROUGH FIX (2026-07-31) — dev-teleport FLOOR WELD. Backstop to FP_DEV_TP_REFRAME: even with the
+## owner facet resolved and contained at the placement (verify_dev_teleport_owner: min own_dist ≫ −HYST, no crossing
+## fires headlessly), a dev geo-teleport that DROPS from altitude can still trip a facet crossing MID-FALL live (the
+## reported lat 8/lon 2 landing block z −229→−232 is a reframe shift — a pure −Y fall cannot move z). The crossing
+## flips the ACTIVE facet + reframes position into the neighbour lattice; from that frame surface_y AND floor_under
+## both resolve the NEIGHBOUR's deep column (≈ −6360 seafloor), so the fall-through guard (_dev_land_clamp reads
+## surface_y in the CURRENT frame) never catches — the player free-falls through the true owner surface and settles
+## on the deep underground fill (deepslate ≈ −18). When true, the player WELDS to the resolved owner facet for the
+## duration of the post-geo-teleport landing: while the land guard is armed it re-asserts active = owner and
+## SUPPRESSES facet crossings, so floor_under / _dev_land_clamp keep reading the owner column and catch the fall at
+## the true surface (grass), never the deep fill. Scoped to the dev geo-teleport landing (_tp_land_active, set ONLY
+## by _dev_teleport_geo under CONTROL_ENABLED) AND the armed guard, so normal play never enters it. Off ⇒ byte-
+## identical (the shipped maybe_cross_facet path runs verbatim). Requires FACETED. Pairs with FP_DEV_TP_REFRAME.
+const FP_TP_FLOOR_WELD := false
+
+## COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC) — the GENERAL descent fall-through guard (the live "flew over a FAR
+## region, descended, fell THROUGH the ground to alt −20" report; set_alt 8 there also landed at −20 ⇒ surface_y ≈ −28,
+## deep/wrong). Root cause: a fast/high flight drifts the true sub-camera facet MANY facets away from the active facet
+## while adjacent seam crossings are cooldown/containment-deferred and the high-flyer pool freeze (_pool_off_surface)
+## deliberately suppresses re-designation — so the active facet LAGS. floor_under / surface_y then evaluate the player's
+## column against the STALE facet's piecewise-FLAT datum plane; extended thousands of blocks past its ridge domain that
+## flat plane sinks far below the sphere (surface_y ≈ −28 at a far spot that really has trees at the surface), so the
+## descending player lands on the deep lie / falls through. FP_TP_FLOOR_WELD fixed exactly this class but ONLY for a dev
+## geo-teleport (armed by _dev_teleport_geo). When true, ANY genuine (non-flying) descent resyncs the active facet onto
+## the true facet_of_dir owner — WorldManager.resync_subcamera_facet, a direct O(1) redesignation (the _alt_reentry_restore
+## path, position/velocity-continuous via the returned reframe + _heal_frame_desync) — so floor_under / surface_y read the
+## owner's REAL surface and the fall lands ON it. NON-ADJACENT owner only (an adjacent flip stays the domain of
+## maybe_cross_facet's −HYST/cooldown/containment hysteresis, never fought) ⇒ normal walking is byte-identical. Requires
+## FACETED. Default FALSE ⇒ resync_subcamera_facet is never called (the player gates the whole block) ⇒ byte-identical.
+## Gate: verify_descent_facet_resync (a far non-adjacent desync settles at/above the true surface, with a falsifier).
+const FP_DESCENT_FACET_RESYNC := false
 
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
@@ -2347,6 +3050,31 @@ static func corner_cells(k: int, n: int) -> Array:
 			"j": (n - 1) if dv > 0 else 0,
 		})
 	return out
+
+## COSMOS TREE-PHYS BOUND (task fix/voxiverse-treephys, docs/SIM-MODEL "physics dormant-by-default + NEVER-OOM/bounded").
+## A single block edit (chop a tree / undercut terrain) runs the StructuralSolver collapse, which can detach a LARGE
+## connected component and spawn it as ONE loose VoxelBody. The shipped VoxelBody builds ONE BoxShape3D collider PER
+## CELL (voxel_body.gd _rebuild) and stays fully DYNAMIC until it settles (_grounded) — so a several-hundred-cell
+## detachment drops a rigid body carrying hundreds of box colliders that the physics server broadphases/integrates
+## every frame, and if _grounded never confirms at a far/faceted spot the body NEVER freezes → phys_ms pins at
+## 300-420 ms and the game stalls at ~5 fps indefinitely (observed live at a far surface tree-chop). This bounds it:
+##
+##  (1) COLLIDER CAP. A component with > TREEPHYS_COLLIDER_CAP cells does NOT emit a per-cell box field; it collides as
+##      ONE BoxShape3D sized to the body's local cell AABB — O(1) physics cost regardless of cell count. The rendered
+##      mesh is untouched (still per-exposed-face), so it looks identical; only the (rare, pathological) large body's
+##      collision is coarsened. Normal tree canopies (≤ ~50 cells, below the cap) fall as real blocky debris as today.
+##  (2) LARGE ⇒ SPAWN DORMANT. A body over the cap spawns already FROZEN-STATIC (dormant, zero per-frame churn) — it
+##      renders + is walkable but never churns the sim. wake() can still reactivate it on a nearby edit (it then
+##      re-simulates as the single-AABB body — still bounded — and re-settles via the deadline below).
+##  (3) HARD ACTIVE DEADLINE. Any dynamic body that has not reached rest within TREEPHYS_MAX_ACTIVE_SEC freezes to
+##      STATIC where it is, regardless of _grounded — so a body whose support query never confirms (far/faceted
+##      staleness) can no longer churn forever. Belt-and-suspenders behind the same flag.
+##
+## Default OFF ⇒ every code path below is the shipped per-cell / never-deadline behaviour → byte-identical (FLAT
+## verify_feature 6042/0). Gate: verify_treephys.gd. Read live via VoxelBody as CubeSphere.FP_TREEPHYS_BOUND.
+const FP_TREEPHYS_BOUND := false
+const TREEPHYS_COLLIDER_CAP := 64      # a component over this many cells collides as ONE AABB box + spawns dormant
+const TREEPHYS_MAX_ACTIVE_SEC := 8.0   # hard deadline: a dynamic body not at rest by now freezes STATIC regardless
 
 # ---------------------------------------------------------------------------------------
 # Small helpers

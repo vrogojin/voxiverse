@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<!-- VOXIVERSE_BOOT_SPLASH_MARKER — branded boot/splash shell (task #75). Based on the
+     Godot 4.4 full-size web shell: every $GODOT_* placeholder and the Engine/startGame
+     bootstrap are preserved verbatim; the VOXIVERSE splash is layered ON TOP of the
+     canvas and never removes an engine hook. ALL CSS/JS is inline — no cross-origin
+     request whatsoever — so COOP/COEP cross-origin isolation (SharedArrayBuffer +
+     threads) is not broken (blank-page gotcha). -->
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+	<title>$GODOT_PROJECT_NAME</title>
+	<style>
+html, body {
+	margin: 0;
+	padding: 0;
+	border: 0;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	background-color: #0a0e17;
+	font-family: 'Trebuchet MS', 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
+	touch-action: none;
+}
+
+/* --- Godot canvas (engine target — id/behaviour unchanged from stock shell) --- */
+#canvas {
+	display: block;
+	position: absolute;
+	top: 0;
+	left: 0;
+	margin: 0;
+	color: white;
+	width: 100%;
+	height: 100%;
+	outline: none;
+}
+#canvas:focus {
+	outline: none;
+}
+
+/* --- Stock Godot status DOM (kept intact so the engine's own status callbacks
+       still have their targets). Visually hidden UNDER our branded splash. --- */
+#status {
+	position: absolute;
+	left: 0;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	display: none;              /* our splash owns the visible loading UI */
+	justify-content: center;
+	align-items: center;
+	pointer-events: none;
+}
+#status-progress {
+	width: 366px;
+	height: 7px;
+	background-color: #38363A;
+	border-radius: 4px;
+	overflow: hidden;
+}
+#status-progress-inner {
+	height: 100%;
+	width: 0;
+	background-color: #6cc5ff;
+	border-radius: 4px;
+	transition: width 0.2s linear;
+}
+#status-indeterminate { display: none; }
+#status-notice {
+	background-color: #5b5b5b;
+	border-radius: 4px;
+	padding: 6px 12px;
+	color: #e0e0e0;
+	max-width: 460px;
+}
+
+/* --- Branded VOXIVERSE splash overlay --- */
+#voxiverse-splash {
+	position: absolute;
+	inset: 0;
+	z-index: 100;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	text-align: center;
+	background:
+		radial-gradient(1200px 700px at 50% 22%, rgba(58, 92, 150, 0.35), rgba(10, 14, 23, 0) 62%),
+		linear-gradient(180deg, #0d1626 0%, #0a0e17 58%, #060810 100%);
+	color: #e8eef7;
+	opacity: 1;
+	transition: opacity 0.6s ease;
+	-webkit-user-select: none;
+	user-select: none;
+}
+#voxiverse-splash.revealed {
+	/* essential set ready: let the live world glow through while bake continues */
+	background:
+		radial-gradient(1200px 700px at 50% 22%, rgba(58, 92, 150, 0.20), rgba(10, 14, 23, 0) 62%),
+		linear-gradient(180deg, rgba(13, 22, 38, 0.72) 0%, rgba(10, 14, 23, 0.62) 100%);
+}
+#voxiverse-splash.hidden {
+	opacity: 0;
+	pointer-events: none;
+}
+
+.vx-mark {
+	display: flex;
+	gap: 10px;
+	margin-bottom: 6px;
+}
+.vx-cube {
+	width: 26px;
+	height: 26px;
+	border-radius: 5px;
+	background: linear-gradient(145deg, #7fd0ff, #3b7fd6);
+	box-shadow: 0 0 18px rgba(108, 197, 255, 0.55), inset 0 0 6px rgba(255,255,255,0.35);
+	animation: vx-bob 1.6s ease-in-out infinite;
+}
+.vx-cube:nth-child(2) { animation-delay: 0.18s; background: linear-gradient(145deg, #9be29b, #3fa14b); box-shadow: 0 0 18px rgba(120, 220, 130, 0.5), inset 0 0 6px rgba(255,255,255,0.35); }
+.vx-cube:nth-child(3) { animation-delay: 0.36s; background: linear-gradient(145deg, #d9c48b, #b08a3a); box-shadow: 0 0 18px rgba(220, 200, 130, 0.5), inset 0 0 6px rgba(255,255,255,0.35); }
+@keyframes vx-bob {
+	0%, 100% { transform: translateY(0); }
+	50% { transform: translateY(-9px); }
+}
+
+.vx-title {
+	font-size: clamp(34px, 7vw, 66px);
+	font-weight: 800;
+	letter-spacing: 0.22em;
+	margin: 14px 0 2px 0;
+	text-transform: uppercase;
+	background: linear-gradient(90deg, #bfe4ff, #ffffff 45%, #cfeecf);
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+	text-shadow: 0 2px 30px rgba(108, 197, 255, 0.25);
+}
+.vx-tag {
+	font-size: clamp(11px, 1.6vw, 14px);
+	letter-spacing: 0.32em;
+	text-transform: uppercase;
+	color: #8aa0bd;
+	margin-bottom: 34px;
+}
+
+.vx-progress-wrap {
+	width: min(420px, 76vw);
+}
+.vx-phase {
+	font-size: 14px;
+	letter-spacing: 0.06em;
+	color: #cfe0f5;
+	min-height: 20px;
+	margin-bottom: 10px;
+}
+.vx-count {
+	color: #7fa8d8;
+	font-variant-numeric: tabular-nums;
+}
+.vx-bar {
+	position: relative;
+	width: 100%;
+	height: 8px;
+	border-radius: 6px;
+	background: rgba(255, 255, 255, 0.08);
+	overflow: hidden;
+	box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+}
+.vx-bar-fill {
+	position: absolute;
+	left: 0;
+	top: 0;
+	height: 100%;
+	width: 0%;
+	border-radius: 6px;
+	background: linear-gradient(90deg, #3b7fd6, #6cc5ff 60%, #9be29b);
+	transition: width 0.35s ease;
+}
+/* Shimmer sweep — shows the loader is alive during a long phase whose step
+   count has not advanced (honest: it does NOT imply forward numeric progress). */
+.vx-bar.working .vx-bar-fill::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.45) 50%, rgba(255,255,255,0) 100%);
+	transform: translateX(-100%);
+	animation: vx-shimmer 1.25s linear infinite;
+}
+@keyframes vx-shimmer {
+	0% { transform: translateX(-100%); }
+	100% { transform: translateX(100%); }
+}
+
+.vx-steps {
+	display: flex;
+	justify-content: space-between;
+	margin-top: 12px;
+	gap: 6px;
+}
+.vx-step {
+	flex: 1;
+	height: 3px;
+	border-radius: 2px;
+	background: rgba(255,255,255,0.1);
+	transition: background 0.3s ease;
+}
+.vx-step.done { background: #6cc5ff; }
+
+.vx-enter {
+	margin-top: 34px;
+	padding: 13px 40px;
+	font-size: 16px;
+	font-weight: 700;
+	letter-spacing: 0.14em;
+	text-transform: uppercase;
+	color: #06101d;
+	background: linear-gradient(90deg, #7fd0ff, #9be29b);
+	border: none;
+	border-radius: 8px;
+	cursor: pointer;
+	opacity: 0.28;
+	pointer-events: none;
+	transition: opacity 0.4s ease, transform 0.12s ease, box-shadow 0.3s ease;
+	box-shadow: 0 6px 22px rgba(108, 197, 255, 0.0);
+}
+.vx-enter.ready {
+	opacity: 1;
+	pointer-events: auto;
+	box-shadow: 0 8px 28px rgba(108, 197, 255, 0.35);
+	animation: vx-pulse 1.8s ease-in-out infinite;
+}
+.vx-enter.ready:hover { transform: translateY(-1px); }
+.vx-enter.ready:active { transform: translateY(1px); }
+@keyframes vx-pulse {
+	0%, 100% { box-shadow: 0 8px 28px rgba(108, 197, 255, 0.30); }
+	50% { box-shadow: 0 8px 34px rgba(155, 226, 155, 0.5); }
+}
+
+.vx-hint {
+	margin-top: 16px;
+	font-size: 12px;
+	letter-spacing: 0.05em;
+	color: #6c82a0;
+	min-height: 16px;
+}
+.vx-error {
+	color: #ff9c8a;
+	max-width: 80vw;
+	white-space: pre-wrap;
+}
+	</style>
+	$GODOT_HEAD_INCLUDE
+</head>
+<body>
+	<canvas id="canvas">
+		Your browser does not support the canvas tag.
+	</canvas>
+
+	<!-- Stock Godot status DOM — kept so engine status callbacks always resolve. -->
+	<div id="status">
+		<div id="status-progress" style="display: none;" oncontextmenu="event.preventDefault();">
+			<div id="status-progress-inner"></div>
+		</div>
+		<div id="status-indeterminate" style="display: none;" oncontextmenu="event.preventDefault();"></div>
+		<div id="status-notice" class="godot" style="display: none;"></div>
+	</div>
+
+	<!-- Branded VOXIVERSE splash — layered above the canvas, driven by REAL game signals. -->
+	<div id="voxiverse-splash">
+		<div class="vx-mark">
+			<div class="vx-cube"></div>
+			<div class="vx-cube"></div>
+			<div class="vx-cube"></div>
+		</div>
+		<div class="vx-title">Voxiverse</div>
+		<div class="vx-tag">Voxel Immersive Simulation</div>
+		<div class="vx-progress-wrap">
+			<div class="vx-phase" id="vx-phase">Starting engine<span class="vx-count" id="vx-count"></span></div>
+			<div class="vx-bar working" id="vx-bar">
+				<div class="vx-bar-fill" id="vx-bar-fill"></div>
+			</div>
+			<div class="vx-steps" id="vx-steps">
+				<div class="vx-step" data-step="1"></div>
+				<div class="vx-step" data-step="2"></div>
+				<div class="vx-step" data-step="3"></div>
+				<div class="vx-step" data-step="4"></div>
+			</div>
+		</div>
+		<button class="vx-enter" id="vx-enter" type="button">Enter World</button>
+		<div class="vx-hint" id="vx-hint"></div>
+	</div>
+
+	<script src="$GODOT_URL"></script>
+	<script>
+	const GODOT_CONFIG = $GODOT_CONFIG;
+	const GODOT_THREADS_ENABLED = $GODOT_THREADS_ENABLED;
+	const engine = new Engine(GODOT_CONFIG);
+
+	(function () {
+		// --- Stock Godot status targets (kept live) ---
+		const statusProgress = document.getElementById('status-progress');
+		const statusProgressInner = document.getElementById('status-progress-inner');
+		const statusIndeterminate = document.getElementById('status-indeterminate');
+		const statusNotice = document.getElementById('status-notice');
+
+		// --- Branded splash elements ---
+		const splash = document.getElementById('voxiverse-splash');
+		const phaseEl = document.getElementById('vx-phase');
+		const countEl = document.getElementById('vx-count');
+		const barEl = document.getElementById('vx-bar');
+		const barFill = document.getElementById('vx-bar-fill');
+		const stepEls = document.getElementById('vx-steps').querySelectorAll('.vx-step');
+		const enterBtn = document.getElementById('vx-enter');
+		const hintEl = document.getElementById('vx-hint');
+
+		// Boot milestone total driven from the game (main.gd pushes done/total).
+		// The engine-download phase (below) reports its OWN byte progress and does
+		// not touch the step bar; the game phases own the 4 steps.
+		const GAME_STEPS = 4;
+		let essentialReady = false;
+
+		// Fail-safe watchdog. Once the engine wasm finishes downloading, the browser
+		// compiles + instantiates it (SharedArrayBuffer + worker threads) and then
+		// main.gd drives the game phases — a window in which Godot fires NO progress
+		// callback. If that whole bridge never completes (voxiverseEssentialReady
+		// never fires), the user must NEVER be trapped behind the splash: after a
+		// generous timeout we reveal the world + enable "Enter World" regardless.
+		const WATCHDOG_MS = 45000;
+		let watchdogTimer = null;
+
+		// Remote-control mode: the dev remote-bridge opens the page as ?remote=<token>.
+		// An unattended remote operator has nobody to click "Enter World", so in this
+		// mode the splash auto-advances through the same reveal+enter path a human
+		// click would take. Detected ONCE at load; normal human users are unaffected.
+		let REMOTE_MODE = false;
+		try { REMOTE_MODE = new URLSearchParams(location.search).has('remote'); }
+		catch (e) { REMOTE_MODE = /[?&]remote=/.test(location.search); }
+
+		function setPhase(text) { phaseEl.firstChild.nodeValue = text; }
+		function setCount(text) { countEl.textContent = text ? '  ' + text : ''; }
+		function setBar(frac, working) {
+			barFill.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+			if (working) { barEl.classList.add('working'); }
+			else { barEl.classList.remove('working'); }
+		}
+		function setSteps(done) {
+			stepEls.forEach(function (el) {
+				const s = parseInt(el.getAttribute('data-step'), 10);
+				if (s <= done) { el.classList.add('done'); }
+				else { el.classList.remove('done'); }
+			});
+		}
+
+		function revealWorld() {
+			// Essential near set is ready: let the world show through, enable start.
+			splash.classList.add('revealed');
+			enterBtn.classList.add('ready');
+			hintEl.textContent = 'Remaining terrain keeps baking in the background.';
+			// Remote (unattended) sessions have no one to click — take the same path
+			// the button click does. Runs for BOTH the real essentialReady reveal and
+			// the fail-safe watchdog reveal, so remote mode is never trapped.
+			if (REMOTE_MODE) { enterWorld(); }
+		}
+		function enterWorld() {
+			if (splash.classList.contains('hidden')) { return; }
+			splash.classList.add('hidden');
+			const c = document.getElementById('canvas');
+			if (c) { c.focus(); }
+		}
+
+		// Indeterminate "Starting engine…" state. Entered when the engine-download
+		// byte progress reaches/exceeds total (or total is unknown): the wasm is now
+		// compiling + instantiating with worker threads and Godot reports nothing, so
+		// a static "Downloading engine 100%" would look hung. A full shimmer bar (no
+		// number) honestly signals "alive, working" without faking forward progress.
+		function enterStartingEngine() {
+			if (essentialReady) { return; }
+			setPhase('Starting engine…');
+			setCount('');
+			setBar(1, true);
+			statusProgressInner.style.width = '100%';
+			armWatchdog();
+		}
+
+		// Arm the fail-safe reveal exactly once. Idempotent: repeated onProgress(100%)
+		// calls and the startGame resolution all funnel here without re-arming.
+		function armWatchdog() {
+			if (watchdogTimer !== null || essentialReady) { return; }
+			watchdogTimer = setTimeout(function () {
+				watchdogTimer = null;
+				if (essentialReady) { return; }
+				console.warn('[voxiverse] Fail-safe watchdog: voxiverseEssentialReady() did not fire within '
+					+ (WATCHDOG_MS / 1000) + 's of the engine download completing — revealing the world anyway.');
+				// Mark ready so any late real signal is a harmless no-op, then reveal.
+				essentialReady = true;
+				setPhase('Ready');
+				setCount('');
+				setBar(1, false);
+				setSteps(GAME_STEPS);
+				revealWorld();
+			}, WATCHDOG_MS);
+		}
+
+		// ================= REAL progress bridge (game -> JS) =================
+		// main.gd calls these ONLY on web (OS.has_feature("web")). done/total are
+		// REAL completed-milestone counts fired at real code points — not a faked %.
+		window.voxiverseProgress = function (phase, done, total) {
+			setPhase(String(phase));
+			const t = (typeof total === 'number' && total > 0) ? total : GAME_STEPS;
+			const d = (typeof done === 'number' && done >= 0) ? done : 0;
+			setSteps(d);
+			if (d >= t) {
+				setBar(1, false);
+				setCount('');
+			} else {
+				// Between milestones: fill to the last confirmed step and shimmer,
+				// so a multi-second phase never looks frozen (no fake forward %).
+				setBar(d / t, true);
+				setCount(d + ' / ' + t);
+			}
+		};
+		window.voxiverseEssentialReady = function () {
+			if (essentialReady) { return; }
+			essentialReady = true;
+			if (watchdogTimer !== null) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+			setPhase('Ready');
+			setCount('');
+			setBar(1, false);
+			setSteps(GAME_STEPS);
+			revealWorld();
+		};
+
+		enterBtn.addEventListener('click', enterWorld);
+		window.addEventListener('keydown', function (e) {
+			if ((e.key === 'Enter' || e.key === ' ') && essentialReady) { enterWorld(); }
+		});
+
+		// ================= Engine bootstrap (Godot stock flow) =================
+		function displayFailureNotice(err) {
+			console.error(err);
+			barEl.classList.remove('working');
+			setPhase('Failed to start');
+			enterBtn.style.display = 'none';
+			hintEl.className = 'vx-hint vx-error';
+			hintEl.textContent = (err && err.message) ? err.message : String(err);
+		}
+
+		const missing = Engine.getMissingFeatures({
+			threads: GODOT_THREADS_ENABLED,
+		});
+
+		if (missing.length !== 0) {
+			if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+				// Reload once through the service worker to add the COOP/COEP headers
+				// (mirrors the stock shell's cross-origin-isolation retry path).
+				Promise.race([
+					navigator.serviceWorker.getRegistration().then(function (registration) {
+						if (registration != null) { return Promise.reject(new Error('Service worker already exists.')); }
+						return registration;
+					}).then(function () { return engine.installServiceWorker(); }),
+					new Promise(function (resolve) { setTimeout(function () { resolve(); }, 2000); }),
+				]).then(function () { window.location.reload(); }).catch(function (err) {
+					console.error('Failed to install service worker:', err);
+				});
+			} else {
+				displayFailureNotice('This browser is missing required features:\n' + missing.join('\n'));
+			}
+		} else {
+			setPhase('Downloading engine');
+			engine.startGame({
+				onProgress: function (current, total) {
+					if (essentialReady) { return; }
+					if (total > 0 && current < total) {
+						// Real byte progress: show the download percentage.
+						setPhase('Downloading engine');
+						setBar(current / total, false);
+						setCount(Math.floor(current / total * 100) + '%');
+						statusProgressInner.style.width = (current / total * 100) + '%';
+					} else {
+						// Download complete (current >= total) or size unknown: the wasm
+						// is now compiling + instantiating with threads and Godot goes
+						// silent. Switch to the indeterminate "Starting engine…" state
+						// so it never freezes on a static "Downloading engine 100%".
+						enterStartingEngine();
+					}
+				},
+			}).then(function () {
+				// Engine main loop has started. The game (main.gd) now drives the
+				// splash via voxiverseProgress / voxiverseEssentialReady; keep the
+				// splash up (indeterminate) until the essential near set is ready.
+				// Arm the watchdog here too, in case onProgress never reported 100%.
+				if (!essentialReady) {
+					setPhase('Building world');
+					setBar(1, true);
+					armWatchdog();
+				}
+			}, displayFailureNotice);
+		}
+	})();
+	</script>
+</body>
+</html>

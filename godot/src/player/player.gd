@@ -69,6 +69,48 @@ var flying := false
 ## ShaderPrewarm reports finished. Gates both _physics_process and _unhandled_input.
 var frozen := false
 
+# DEV/TEST freeze_player latch (dev-instrument tooling): pins the player by suppressing ONLY its motion integration
+# (skip _move — gravity, dev-fly drift, orbital coast) while the rest of the tick runs, so a capture hold is
+# genuinely stationary yet the executor/streaming/camera are never starved. Default false ⇒ the _physics_process
+# branch is never taken (byte-identical normal play); only set through remote_freeze_player under a live control
+# grant. Distinct from `frozen` (the one-shot boot-prewarm freeze main.gd owns).
+var _dev_freeze_player := false
+
+# DEV/TEST fall-through guard latch (dev-instrument tooling): armed by a dev teleport / set_alt / freeze-release
+# so the ensuing settle/drop can never leave the player BELOW the analytic surface (the live "buried at alt −18,
+# floor 26 blocks under the terrain" from a stale fast-regime-crossing floor query). Default false ⇒ the
+# _physics_process branch is never taken (byte-identical normal play); disarmed once the player lands cleanly.
+var _dev_land_guard := false
+# Feet more than this many blocks below the analytic surface ⇒ the dev guard clamps them up (below-floor tolerance).
+const DEV_LAND_EPS := 0.5
+
+# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD) — the dev GEO-teleport landing weld. `_dev_teleport_geo` resolves the
+# owner facet + surface, drops the player from altitude, and arms the fall-through guard. But a facet crossing that
+# fires MID-FALL (live) reframes position into a neighbour lattice, so surface_y/floor_under then read the neighbour's
+# deep column and the guard never catches (the player sinks to the deep fill). While `_tp_land_active` (armed ONLY by
+# `_dev_teleport_geo`, and only meaningful under FP_TP_FLOOR_WELD), `_physics_process` re-asserts the owner facet and
+# SUPPRESSES crossings so the floor stays on the resolved owner column. Default false ⇒ never welded (byte-identical
+# normal play — the latch is set by no other path). Cleared when the guard disarms (a clean landing) or on a new reposition.
+var _tp_land_active := false
+var _tp_owner_fid := -1
+var _tp_land_frames := 0   # FP_TP_FLOOR_WELD: 1 while a dev-teleport surface floor-hold is armed (0 = released)
+var _tp_land_x := 0.0       # FP_TP_FLOOR_WELD: the teleport column the surface floor-hold is pinned to
+var _tp_land_z := 0.0
+
+# COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle): the teleport/fast-travel "settling" latch. A dev teleport to
+# a fresh far facet re-anchors the near field but the voxel view has NOT streamed/meshed there yet — so instead of
+# dropping the player into un-streamed void (the live "player in space, buried on land" symptom) we HOLD them
+# hovering at the analytic surface_y (no fall, control held) until the near-coverage probe says their column is
+# meshed, or a hard cap elapses. Only engaged by _dev_reposition on a GROUND teleport when the world can actually
+# answer the coverage probe (FACETED + module); default false ⇒ byte-identical normal play + FLAT dev teleports.
+var _settle_active := false
+var _settle_elapsed := 0.0
+# Hard cap: release the settle after this many seconds even if coverage never arrives, so a teleport can NEVER hang.
+const SETTLE_CAP_S := 6.0
+# Only engage the settle when the placement is within this many blocks of the surface (a ground teleport). A higher
+# placement is an intended hover (e.g. set_alt to altitude for a capture) and must NOT be force-landed.
+const SETTLE_ENGAGE_BAND := 12.0
+
 # COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2.3): the coordinate-frame adapter that bridges the
 # player's canonical LATTICE frame (its LOCAL transform under WorldManager's ActiveFrame) and the GLOBAL/absolute
 # frame the physics server + renderer consume. Every physics-boundary conversion below routes through it. Fetched
@@ -408,6 +450,12 @@ func _capture_mouse() -> void:
 func camera_global_transform() -> Transform3D:
 	return _camera.global_transform if _camera != null else global_transform
 
+## FP_SKY_PLANET_CENTRE: the planet's render-frame centre (the floating-origin / scaled-body offset). CosmosSky
+## subtracts this from the camera origin so its altitude/up/sun-elevation/light math is planet-relative even above
+## the re-anchor, where the camera stays near the scene origin and the planet is offset. ZERO before the ring exists.
+func planet_render_centre() -> Vector3:
+	return world.planet_render_centre() if world != null else Vector3.ZERO
+
 ## COSMOS R2.2 (Design Z): the WINDOW-space camera transform (what the camera is in pre-COSMOS window space)
 ## — body yaw+position × the pitch+eye camera-local. Main maps this into the static epoch render frame via
 ## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state
@@ -661,9 +709,23 @@ func _physics_process(delta: float) -> void:
 	# the flag test is the only added work (no timer call, no key). See fall_timing().
 	var _ft_on := CubeSphere.FP_FALL_TIMING
 	var _ft_t := 0
-	if _ft_on: _ft_t = Time.get_ticks_usec()
-	_move(delta)
-	if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
+	# DEV/TEST freeze_player: pin the player for a stationary capture by suppressing ONLY the player's own MOTION
+	# INTEGRATION (skip _move — gravity, dev-fly drift, orbital coast, locomotion) and zeroing velocity. The REST of
+	# the tick still runs — the RemoteControl executor's physics_tick (so look/turn/move/jump ops still send their
+	# done record instead of timing out and deadlocking the relay queue), the origin/frame corrections, the
+	# streaming/bake kick, and the camera. `position` stays invariant across ticks (nothing else writes it while
+	# held). Default off ⇒ the else-branch runs verbatim (byte-identical normal play); set only via remote_freeze_player.
+	if _dev_freeze_player:
+		velocity = Vector3.ZERO
+	elif _settle_active:
+		# COSMOS STREAM-SETTLE: while settling after a teleport, SUPPRESS motion integration (no fall) and hold the
+		# player at the analytic surface until the near field has meshed their column (or the cap). Consults the
+		# world's near-coverage probe each tick. Only ever active after a dev teleport on a coverage-capable world.
+		_settle_step(delta, world.near_column_meshed(position))
+	else:
+		if _ft_on: _ft_t = Time.get_ticks_usec()
+		_move(delta)
+		if _ft_on: _ft_max("t_move_us", Time.get_ticks_usec() - _ft_t)
 	var _tick_move_delta := position - _pre_move_pos
 	_tick_move_delta.y = 0.0
 	# FP-FIXED-FRAME (§2.3): world queries are LATTICE — the player's canonical pose is its LOCAL transform (== global
@@ -689,7 +751,28 @@ func _physics_process(delta: float) -> void:
 	# Dormant until FP3b removes the FP2 ridge wall (which stops the player before the crossing threshold); the
 	# reframe is position-exact + upright (physics snaps yaw, camera eases the dihedral). FLAT/non-faceted: skip.
 	var _reframe_yaw := 0.0
-	if CubeSphere.FACETED:
+	if CubeSphere.FACETED and CubeSphere.FP_TP_FLOOR_WELD and _tp_land_active and _dev_land_guard:
+		# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): a dev geo-teleport landing is in progress — WELD to the resolved
+		# owner facet and SUPPRESS crossings so floor_under / _dev_land_clamp keep reading the owner column and catch the
+		# fall at the true surface (never a neighbour's deep seafloor). Re-asserting each frame defeats any actor that
+		# tried to flip the active frame on the teleport jump. Dev-only (the latch is set solely by _dev_teleport_geo);
+		# gated on the armed guard so the weld can never outlive the landing. Off-flag ⇒ this whole branch is skipped.
+		TerrainConfig.set_active_facet(_tp_owner_fid)
+		_pos_fid = _tp_owner_fid
+	elif CubeSphere.FACETED:
+		# COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC): a genuine (non-flying) descent/landing over a FAR region
+		# can leave the active facet DESYNCED from the true sub-camera facet — a fast/high flight drifts many facets
+		# while adjacent crossings are cooldown/containment-deferred and the high-flyer pool freeze suppresses resync.
+		# floor_under / surface_y then read the STALE facet's piecewise-FLAT datum plane, which — extended thousands of
+		# blocks past its ridge domain — sinks far below the sphere (measured surface_y ≈ −28 at a far spot with trees),
+		# so the fall lands on the deep lie / falls through. When NOT flying (a real fall the floor must catch), resync
+		# the active facet onto the true facet_of_dir owner (a direct O(1) redesignation, the _alt_reentry_restore path)
+		# BEFORE maybe_cross_facet so the floor this frame is the owner's real surface. NON-ADJACENT desyncs only (the
+		# adjacent hysteresis crossing is never fought). Off-flag ⇒ this whole block is skipped ⇒ byte-identical.
+		if CubeSphere.FP_DESCENT_FACET_RESYNC and not flying and not _dev_nav:
+			var resync := world.resync_subcamera_facet(position)
+			if not resync.is_empty():
+				apply_reframe(resync["new_pos"], resync["yaw_delta"])
 		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
 		var cross := world.maybe_cross_facet(position)
 		if not cross.is_empty():
@@ -709,6 +792,13 @@ func _physics_process(delta: float) -> void:
 			global_position = reloc["pos"]
 			velocity = reloc["vel"]
 			rotation.y += float(reloc["yaw_delta"])
+	# DEV/TEST fall-through guard (dev-instrument tooling): after a dev teleport / freeze-release drop, catch a
+	# landing that a stale fast-regime-crossing floor query put BELOW the real surface. Armed ONLY by the dev
+	# actuators (which exist only under a live CONTROL_ENABLED grant); `_dev_land_guard` is false in normal play
+	# ⇒ this is never entered ⇒ byte-identical. Runs AFTER the origin/frame corrections so `position` + the active
+	# facet are final for the frame (surface_y reads the settled facet's column).
+	if _dev_land_guard:
+		_dev_land_clamp()
 	if _ft_on: _ft_t = Time.get_ticks_usec()
 	_push_bodies(delta)
 	if _ft_on: _ft_max("t_pushbodies_us", Time.get_ticks_usec() - _ft_t)
@@ -1459,6 +1549,21 @@ func _move(delta: float) -> void:
 		# (§7.2 "lattice path unchanged"). Flag off / no nav machine ⇒ `_dev_nav` is false ⇒ this is skipped.
 		_dev_active = false
 		_fall_have_v = false                                # flying ⇒ not falling; next F-off re-seeds the free-fall
+		# DEV-FLIGHT CRUISE MODE (CubeSphere.CRUISE_MODE): while dev-flying IN SPACE (radial alt > ATMO_TOP), HOLDING C
+		# flies the camera LOOK dir at an exponential distance-scaled speed; release C ⇒ instant stop (kinematic, no
+		# residual drift). Flag OFF ⇒ C never polled ⇒ byte-identical. Uses radial_altitude() (nearest/dominant body).
+		if CubeSphere.CRUISE_MODE and not remote_drive:
+			var cruise_alt := radial_altitude()
+			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, Input.is_key_pressed(KEY_C)):
+				var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
+				var look_dir := (transform.basis * look_local)
+				if look_dir.length() > 0.0:
+					look_dir = look_dir.normalized()
+				var cruise_v := CubeSphere.cruise_speed(cruise_alt)
+				position += look_dir * cruise_v * delta
+				_horiz_vel = Vector3(look_dir.x, 0.0, look_dir.z) * cruise_v
+				velocity = Vector3.ZERO                      # kinematic fly; release ⇒ instant stop (no residual)
+				return
 		var use_devnav := _dev_nav and _nav != null
 		# COSMOS SPACE-NAV §7.4 (ORBIT_COAST): the O free-coast. While coasting, gravity integrates the orbit each
 		# frame (a stable circular seed HOLDS radius — the fix for "orbits then hangs"). EXIT: (b) any thrust/movement
@@ -1615,6 +1720,17 @@ func _move(delta: float) -> void:
 	if _ft_on2: _ft_t2 = Time.get_ticks_usec()
 	var terrain_floor := world.floor_under(position.x, position.z, position.y)
 	if _ft_on2: _ft_max("t_floor_us", Time.get_ticks_usec() - _ft_t2)
+	# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): after a dev geo-teleport, the analytic column scan floor_under
+	# can disagree with the analytic surface_y at the SAME facet/column (measured: floor_under −12.1 vs surface_y
+	# +11.9 at lat8/lon2 — a datum/column-scan mismatch), so the falling player tunnels the true grass surface and
+	# lands on the deep fill. Facet is correct (own_dist ≫ −HYST, no crossing) so the prior facet-weld did nothing.
+	# Fix: for a brief landing window, floor the descent at surface_y (the shared-heightmap law the mesh follows) so
+	# the teleport lands ON the surface. Dev-only (_tp_land_frames armed solely by _dev_teleport_geo); off-flag ⇒ skip.
+	if CubeSphere.FP_TP_FLOOR_WELD and _tp_land_frames > 0:
+		if absf(position.x - _tp_land_x) <= 3.0 and absf(position.z - _tp_land_z) <= 3.0:
+			terrain_floor = maxf(terrain_floor, world.surface_y(position.x, position.z))
+		else:
+			_tp_land_frames = 0   # walked away from the teleport column — release (floor_under is correct there)
 	var floor_y := terrain_floor
 
 	# Stand ON a detached voxel body directly under the feet instead of falling
@@ -1935,6 +2051,13 @@ func ground_probe_position() -> Vector3:
 ## set_fly (§4.6): replicate the KEY_F branch exactly — toggle fly, zero velocity, disable/enable the
 ## capsule so no loose body can wedge the player while airborne.
 func remote_set_fly(on: bool) -> void:
+	# DEV-FLY DESYNC FIX (Option 1): turning fly OFF while dev-nav is engaged must route through the real
+	# dev-nav teardown, else `_dev_nav` stays stuck true while `flying` goes false — after which the idempotent
+	# remote_set_dev_nav(true) re-arm is a no-op (reports success) and thrust silently takes the walk path (no lift).
+	# Keeps the invariant `_dev_nav ⇒ flying` so the next remote_set_dev_nav(true) re-engages cleanly.
+	if not on and _dev_nav:
+		_toggle_dev_nav()
+		return
 	flying = on
 	velocity = Vector3.ZERO
 	if _body_shape != null:
@@ -2063,6 +2186,12 @@ func remote_set_dev_nav(on: bool) -> bool:
 		return false
 	if _dev_nav != on:
 		_toggle_dev_nav()                          # the exact human-F path (fly on/off, overlay, seed reset)
+	elif on and not flying:
+		# DEV-FLY DESYNC FIX (Option 2, self-heal): repair a `flying`=false / `_dev_nav`=true desync left by a
+		# prior remote_set_fly(false)/override so the orchestrator's re-arm reliably re-engages lift.
+		flying = true
+		if _body_shape != null:
+			_body_shape.disabled = true
 	return _dev_nav == on
 
 ## nav verb (O/G/R): the dev-nav mode toggles. verb ∈ orbit(O) | geostation(G) | detach(R). Guarded EXACTLY as
@@ -2102,6 +2231,310 @@ func remote_stop_thrust() -> void:
 func remote_set_roll(rate: float) -> void:
 	remote_roll_rate = rate
 
+## DEV TIME-CHEAT (remote `set_time`, docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set the celestial time-of-day so
+## the player's CURRENT surface position sits at a chosen local solar time. `local_hours` ∈ [0,24] (12 = local
+## noon, Sun highest); if `sun_elev_deg` is finite it instead lands the Sun at that elevation above the local
+## horizon. Folds a persistent f64 offset into the ONE celestial clock the whole ephemeris reads (sun + moon +
+## planets + spin/day-night all move together — no per-body special-case). Returns false (a no-op) when there is
+## no clock (ORBITAL_SKY/climate off), mirroring remote_nav_verb's inert-guard so a scripted set fails loudly.
+## The planet is pinned at scene identity with its centre at the world origin (the fixed-frame keystone), so the
+## player's world position IS its body-fixed surface vector; the ephemeris body-fixed frame is that scene frame.
+func remote_set_time(local_hours: float, sun_elev_deg: float = NAN) -> bool:
+	if world == null:
+		return false
+	var clock: CosmosEphemeris.CosmosClock = world.cosmos_clock()
+	if clock == null:
+		return false
+	# COSMOS set_time FLOATING-ORIGIN FIX: the planet centre is at planet_render_centre() (NOT world origin) once the
+	# floating origin re-anchors on a long cruise / at high altitude — so raw global_position is NOT the body-fixed
+	# surface vector there (set_time then solves the local hour angle from a wrong longitude → wrong time of day far
+	# from spawn). Subtract the render centre exactly as the sky's cam_rel does (FP_SKY_PLANET_CENTRE), so set_time
+	# tracks the player's TRUE longitude everywhere. At spawn planet_render_centre()==0 ⇒ unchanged.
+	var up_bf := global_position - planet_render_centre()
+	if up_bf.length() < 1.0e-6:
+		return false
+	var t_eff := clock.now()                         # solve relative to the current (possibly already-offset) phase
+	var delta: float
+	if is_finite(sun_elev_deg):
+		delta = _EphCls.offset_for_sun_elev(CosmosSky.OBSERVER, up_bf, t_eff, sun_elev_deg)
+	else:
+		delta = _EphCls.offset_for_local_hours(CosmosSky.OBSERVER, up_bf, t_eff, local_hours)
+	clock.add_offset(delta)
+	return true
+
+## DEV NADIR-LOCK (orbit screenshot framing): aim the frozen camera straight at world.planet_render_centre() so
+## an automated orbit screenshot centres the planet at ANY altitude — a plain pitched `look` is unreliable because
+## the orbital attitude is inertial. Direct camera set (holds while frozen, nothing rewrites it) + seed the space
+## attitude quaternion so window_camera_transform reproduces the basis on unfreeze. pitch_off_deg: +up (planet
+## drops toward the bottom of frame). No-op before the far ring exists. CONTROL_ENABLED-gated via the executor.
+func remote_look_planet(pitch_off_deg: float = 0.0) -> void:
+	if _camera == null or world == null:
+		return
+	var c := _camera.global_transform.origin
+	var p := planet_render_centre()
+	if p == Vector3.ZERO or c.distance_to(p) < 1.0e-3:
+		return
+	var dir := (p - c).normalized()
+	var up_hint := _camera.global_transform.basis.y
+	if absf(dir.dot(up_hint.normalized())) > 0.999:
+		up_hint = _camera.global_transform.basis.x
+	var look_t := _camera.global_transform.looking_at(c + dir, up_hint)
+	if pitch_off_deg != 0.0:
+		look_t.basis = Basis(look_t.basis.x.normalized(), deg_to_rad(pitch_off_deg)) * look_t.basis
+	look_t.basis = look_t.basis.orthonormalized()
+	_camera.global_transform = look_t
+	if CubeSphere.ORBIT_ATTITUDE and _att_mode == ATT_SPACE:
+		var theta := _EphCls.spin_angle(_dominant_body(), _nav_clock)
+		_att_q = _CosmosAttitudeCls.seed_bci(look_t.basis, theta)
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# DEV/TEST INSTRUMENTATION ACTUATORS (dev-instrument tooling) — teleport / set_alt / freeze_time /
+# freeze_player. The comfortable-analysis surface the RemoteControl executor drives so the orchestrator can
+# place the camera PRECISELY and hold a STABLE frame for autonomous visual capture (no fly-overshoot, no
+# altitude drift, no 45-min day/night creep). Each is CONTROL_ENABLED-gated (the executor only exists under a
+# grant) and the freeze latches default OFF ⇒ byte-identical in normal play. teleport/set_alt derive surface
+# height from the ANALYTIC column law (world.surface_y — the shared heightmap, NEVER the voxel buffer) and
+# route through the SAME safe reposition (_dev_reposition), which re-seeds fid/pose/BCI CONSISTENTLY so the
+# known re-entry teleport blowup (fid/pose desync + finite-difference velocity latch) cannot occur.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## SAFE REPOSITION (the anti-blowup core). Place the player at `lattice_pos` expressed in facet `fid`'s lattice
+## frame and re-seed EVERY piece of state the crossing/re-entry machinery relies on, so no consumer this frame
+## or next can interpret the jump as motion or read a stale frame:
+##   1. commit active facet = fid, WRITE position, STAMP _pos_fid = fid ⇒ _heal_frame_desync() sees pose/frame
+##      consistency (a no-op) — the 11081-block "stale-frame teleport" (G-REENTRY FIX A) is structurally impossible.
+##   2. zero velocity + DROP the finite-difference history (_nav_have_prev = false) so _nav_tick RESTS one frame
+##      instead of computing Δp/dt across the jump (the 642074 v_bci latch, G-REENTRY FIX B) — then re-derives fresh.
+##   3. clear every carried BCI / coast / dev-flight / free-fall latch so the controllers re-seed from the NEW
+##      lattice pose (no stale [p,v] pair keeps driving the old orbit and ignoring the teleport).
+##   4. kick streaming so the near field + far ring + block-LOD re-place around the new spot (the same per-frame
+##      call the engine drives; the huge one-frame jump is rejected by update_streaming's velocity-predict clamp).
+func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
+	# FP_TP_FLOOR_WELD: drop any stale geo-teleport weld (a fresh reposition supersedes it; _dev_teleport_geo re-arms it).
+	_tp_land_active = false
+	if fid >= 0:
+		TerrainConfig.set_active_facet(fid)
+	position = lattice_pos
+	_pos_fid = TerrainConfig.active_facet()                 # frame/pose consistent ⇒ _heal_frame_desync() no-op
+	velocity = Vector3.ZERO
+	# Drop the finite-difference + every carried BCI/coast/free-fall/dev-flight latch (the re-entry latch guards).
+	_nav_have_prev = false
+	_nav_prev_fix = PackedFloat64Array()
+	_nav_last_v_bci = PackedFloat64Array()
+	_dev_active = false
+	_dev_have_v = false
+	_dev_v_bci = PackedFloat64Array()
+	_dev_p_bci = PackedFloat64Array()
+	_orbit_coasting = false
+	_coast_p_bci = PackedFloat64Array()
+	_coast_v_bci = PackedFloat64Array()
+	_fall_p_bci = PackedFloat64Array()
+	_fall_v_bci = PackedFloat64Array()
+	_foff_radial = false
+	# Arm the fall-through guard so the ensuing settle/drop is caught at the surface (never below), and disarm the
+	# fly/coast so a re-derived ground query applies (a dev teleport lands you on the ground, not in a flight state).
+	_dev_land_guard = true
+	if world != null:
+		# COSMOS STREAM-SETTLE: re-anchor the near field onto the NEW sub-player facet NOW (redesignate the near pool +
+		# far ring + block-LOD + ActiveFrame + re-apply the S1 approach anchor), so the meshed near bubble follows the
+		# teleport instead of stranding on the old facet. No-op / byte-identical off FACETED. MUST precede update_streaming
+		# so the same-frame streaming kick targets the re-designated facet.
+		world.dev_reanchor_near(position)
+		world.update_streaming(position)
+		# COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME) — BACKSTOP to the _dev_facet_column facet_of_dir fix: `fid` is now
+		# the contained TRUE owner, so update_streaming's crossing scan should not fire here. If any actor still flips the
+		# ACTIVE frame to a NEIGHBOUR while `position` holds the OWNER (fid) lattice coords, the surface_y read below would
+		# resolve the neighbour's terrain at those coords (a different sphere direction, often deep) → the feet clamp onto
+		# the seafloor. Re-assert the owner frame before the surface read. Dev-only (CONTROL_ENABLED); off ⇒ byte-identical.
+		if CubeSphere.FP_DEV_TP_REFRAME and fid >= 0 and TerrainConfig.active_facet() != fid:
+			TerrainConfig.set_active_facet(fid)
+			_pos_fid = fid
+		# FLOOR-SETTLE: re-derive the FRESH analytic surface at the target (the active facet is set above; set_active_facet
+		# cleared any per-column memo on a facet change, and surface_y is recomputed each call — no stale height). If the
+		# placement is AT/BELOW the surface, clamp the feet exactly onto it, grounded — a ground teleport never lands
+		# inside/below terrain. A placement ABOVE the surface (set_alt to altitude) is left as-is; the guard catches its fall.
+		var sy := world.surface_y(position.x, position.z)
+		# COSMOS STREAM-SETTLE: a NEW placement supersedes any prior settle hold (so a high set_alt after a ground
+		# teleport is never re-trapped at the surface). Re-engaged below only for a genuine ground placement.
+		_settle_active = false
+		if position.y < sy + DEV_LAND_EPS:
+			position.y = sy
+			velocity = Vector3.ZERO
+			_fall_have_v = false
+			_dev_land_guard = false                         # already settled on the ground — nothing to catch
+		# COSMOS STREAM-SETTLE: engage the hover-until-meshed hold ONLY for a GROUND placement (within SETTLE_ENGAGE_BAND
+		# of the surface) AND only when the world can actually answer the near-coverage probe (FACETED + module). A HIGHER
+		# placement is an intended hover (e.g. set_alt to altitude for a capture) and is left untouched — never force-landed.
+		# On FLAT / the fallback path the immediate clamp above is final (byte-identical shipped behaviour — no settle).
+		if position.y < sy + SETTLE_ENGAGE_BAND \
+				and world.has_method("near_coverage_available") and world.near_coverage_available():
+			_settle_begin(sy)
+
+## DEV/TEST fall-through guard — clamp the player up onto the FRESH analytic surface when a dev teleport / freeze
+## drop left the feet below it. Uses world.surface_y (the shared heightmap analytic law, NEVER the voxel buffer)
+## so it is immune to the stale fast-regime-crossing floor_under that buried the player live. Inert while flying /
+## dev-flying (legitimate sub-surface flight is untouched) and when the feet are at/above the surface (so a normal
+## descent is unaffected — it only ever fires when genuinely below the ground). Disarms after one clean landing.
+func _dev_land_clamp() -> void:
+	if world == null or flying or _dev_nav or _dev_freeze_player:
+		return                                              # inert while flying / dev-flying / held (freeze stays invariant)
+	var sy := world.surface_y(position.x, position.z)
+	if position.y < sy - DEV_LAND_EPS:
+		position.y = sy                                     # snap the feet onto the true surface top
+		if velocity.y < 0.0:
+			velocity.y = 0.0                                # kill the downward fall (grounded)
+		# Settle the fall / carried BCI latches so nav re-derives at rest on the ground.
+		_fall_have_v = false
+		_fall_v_bci = PackedFloat64Array()
+		_fall_p_bci = PackedFloat64Array()
+		_dev_land_guard = false                             # landed cleanly — disarm
+		_tp_land_active = false                             # FP_TP_FLOOR_WELD: landing done — release the owner-facet weld
+
+## COSMOS STREAM-SETTLE: enter the hover-until-meshed "settling" state after a ground teleport/fast-travel. Holds the
+## player pinned at the analytic surface `sy` (no fall, motion integration suppressed) so they are never dropped into
+## an un-streamed column while the re-anchored near field ramps in. Released by _settle_step once the coverage probe
+## passes or the hard cap elapses. Zeroes velocity + drops the free-fall latch so nothing carries motion across.
+func _settle_begin(_sy: float) -> void:
+	_settle_active = true
+	_settle_elapsed = 0.0
+	velocity = Vector3.ZERO
+	_fall_have_v = false
+
+## COSMOS STREAM-SETTLE: advance the settling hold one physics tick. `covered` is the near-coverage probe result
+## (world.near_column_meshed) — supplied by the caller so this is unit-drivable headlessly (the gate scripts coverage
+## arriving after N ticks). While held: pin the feet at the FRESH analytic surface_y, zero velocity (control held, no
+## fall). RELEASE when the column is meshed OR the hard cap (SETTLE_CAP_S) elapses — snap onto the surface, ARM the
+## fall-through guard (catch any residual below-surface drop as the last blocks apply), and clear the latch. No-op
+## when not settling. Returns true on the tick it releases (test-visible).
+func _settle_step(delta: float, covered: bool) -> bool:
+	if not _settle_active:
+		return false
+	_settle_elapsed += delta
+	var sy := world.surface_y(position.x, position.z) if world != null else position.y
+	position.y = sy                                         # hover pinned at the surface (never fall while un-meshed)
+	velocity = Vector3.ZERO
+	if covered or _settle_elapsed >= SETTLE_CAP_S:
+		position.y = sy                                    # snap onto the surface top, grounded
+		velocity = Vector3.ZERO
+		_fall_have_v = false
+		_dev_land_guard = true                             # arm the guard so the release lands ON the surface, not through it
+		_settle_active = false
+		return true
+	return false
+
+## teleport (dev): place the player at an absolute pose. `mode` == "xyz" ⇒ `a`,`b`,`c` are ACTIVE-FACET LATTICE
+## coords (the frame `position` lives in — the same frame set_alt / snapshots operate in; kept in the CURRENT
+## facet, so no facet change and no desync). `mode` == "geo" ⇒ `a` = lat_deg, `b` = lon_deg, `c` = alt (blocks
+## above the LOCAL analytic surface); the facet is resolved from the world direction and the surface height from
+## world.surface_y. Returns true on success, false when there is no world.
+func remote_teleport(mode: String, a: float, b: float, c: float) -> bool:
+	if world == null:
+		return false
+	if mode == "geo":
+		return _dev_teleport_geo(a, b, c)
+	_dev_reposition(TerrainConfig.active_facet(), Vector3(a, b, c))
+	return true
+
+## teleport geodetic: lat/lon (world body-fixed geographic — +Y is the pole; lon measured around +Y from +X
+## toward +Z) → a surface column; place `alt` blocks above its ANALYTIC surface (world.surface_y). The facet is
+## resolved by scanning the Earth facets for the one whose polygon contains the mapped column, so the pose lands
+## in a self-consistent facet frame. Returns false if no facet contains the direction (should not happen for a
+## unit sphere) or there is no world.
+func _dev_teleport_geo(lat_deg: float, lon_deg: float, alt: float) -> bool:
+	if world == null:
+		return false
+	var lat := deg_to_rad(clampf(lat_deg, -90.0, 90.0))
+	var lon := deg_to_rad(lon_deg)
+	var dir := Vector3(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon))   # unit world direction (+Y pole)
+	var col := _dev_facet_column(dir)
+	if col.is_empty():
+		return false
+	var fid: int = int(col["fid"])
+	var xf := float(int(col["x"])) + 0.5
+	var zf := float(int(col["z"])) + 0.5
+	TerrainConfig.set_active_facet(fid)                     # surface_y reads the ACTIVE facet's column
+	var sy := world.surface_y(xf, zf)
+	_dev_reposition(fid, Vector3(xf, sy + alt, zf))
+	# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): if the placement is above the surface and will free-fall (the guard
+	# is armed and no meshed-hover settle took over), WELD the ensuing landing to this resolved owner facet so a
+	# mid-fall crossing cannot flip the frame out from under the fall-through guard. Dev-only; no-op off-flag / when
+	# the reposition already settled the player onto the ground (small alt) or engaged the hover settle.
+	_tp_owner_fid = fid
+	_tp_land_active = _dev_land_guard and not _settle_active
+	# FP_TP_FLOOR_WELD: arm the surface_y floor-hold PINNED TO THIS COLUMN. floor_under is persistently wrong here
+	# (not transient), so hold the descent floor at surface_y while the player stays near the teleport column, and
+	# release the moment they walk away (where floor_under is correct). Cleared by the proximity check in _move.
+	_tp_land_frames = 1
+	_tp_land_x = xf
+	_tp_land_z = zf
+	return true
+
+## Resolve the world direction `dir` to {fid, x, z} (the Earth facet + integer lattice column containing it), or
+## {} if none matches. Scans only the Earth body's facets; first containing polygon wins. Dev-only (O(6·k²)).
+##
+## COSMOS FALL-THROUGH FIX (FP_DEV_TP_REFRAME) — THE root cure for the lat 8/lon 2 buried-at-alt-−17 teleport.
+## The shipped scan below picks the FIRST facet whose grown (grow=0.5) polygon contains the column. That growth
+## accepts a column up to ~½ cell PAST a facet's ridge (measured: own_dist ∈ (−0.6, −HYST) for 288 columns in
+## this atlas), so the placement is judged "past the ridge" by maybe_cross_facet — which uses the seam-plane
+## own_dist, NOT the grown polygon. The player then RE-crosses to the neighbour every physics frame, and the
+## post-teleport fall/settle re-reads surface_y on the crossed (deep, un-reframed) neighbour column → sinks into
+## the seafloor and stays (a ONE-shot re-assert can't hold, since it re-fires each frame). Resolving the owner by
+## DIRECTION via facet_of_dir (the SAME cube-sphere classifier the ridges agree with — G-M2-DIR round-trips it to
+## every facet) instead returns the TRUE owner, whose landing is contained in all four ridges (own_dist ≥ −HYST),
+## so no spurious crossing ever fires and surface_y stays on the correct column throughout the fall. Same surface
+## height (direction-pure), just the self-consistent facet. Dev-only (CONTROL_ENABLED); flag off ⇒ the grow=0.5
+## scan verbatim (byte-identical).
+func _dev_facet_column(dir: Vector3) -> Dictionary:
+	var d := dir.normalized()
+	var w := d * _FacetAtlasCls.R_BLOCKS
+	if CubeSphere.FP_DEV_TP_REFRAME:
+		var owner := _FacetAtlasCls.facet_of_dir(CubeSphere.DVec3.new(d.x, d.y, d.z))
+		if owner >= 0:
+			var lo: Array = _FacetAtlasCls.world_to_lattice64(owner, w.x, w.y, w.z)
+			return {"fid": owner, "x": floori(lo[0]), "z": floori(lo[2])}
+	var base := _FacetAtlasCls.fid_base(0)                  # Earth = body index 0
+	var n := _FacetAtlasCls.body_facet_count(0)
+	for fid in range(base, base + n):
+		var l: Array = _FacetAtlasCls.world_to_lattice64(fid, w.x, w.y, w.z)
+		var xi := floori(l[0])
+		var zi := floori(l[2])
+		if _FacetAtlasCls.in_polygon(fid, xi, zi, 0.5):
+			return {"fid": fid, "x": xi, "z": zi}
+	return {}
+
+## set_alt (dev): teleport straight to `alt` blocks above the CURRENT sub-player ANALYTIC surface, keeping the
+## current facet + lattice x,z EXACTLY (zero horizontal move). The most-used framing op. Returns true on success.
+func remote_set_alt(alt: float) -> bool:
+	if world == null:
+		return false
+	var sy := world.surface_y(position.x, position.z)
+	_dev_reposition(TerrainConfig.active_facet(), Vector3(position.x, sy + alt, position.z))
+	return true
+
+## freeze_time (dev): pause/resume the ONE celestial clock the whole ephemeris reads (sun/moon/planets/spin/
+## day-night all stop together for a stable capture). set_time still folds an offset while frozen (the phase
+## holds); resume continues from the held time. Returns false (a no-op) when there is no clock (ORBITAL_SKY off),
+## mirroring remote_set_time's inert-guard so a scripted freeze fails loudly rather than silently.
+func remote_freeze_time(on: bool) -> bool:
+	if world == null:
+		return false
+	var clock: CosmosEphemeris.CosmosClock = world.cosmos_clock()
+	if clock == null:
+		return false
+	clock.set_frozen(on)
+	return true
+
+## freeze_player (dev): pin the player — no gravity, no dev-fly drift, no orbital coast — so a hold is genuinely
+## stationary for a clean frame. Suppresses ONLY the player's motion integration while on (position invariant
+## across ticks); the rest of the tick keeps running. Zeroes velocity. RELEASING (on=false) re-arms the
+## fall-through guard so a drop from altitude in a non-flying state lands on the surface, not through it. Inert
+## unless a caller sets it.
+func remote_freeze_player(on: bool) -> void:
+	_dev_freeze_player = on
+	velocity = Vector3.ZERO
+	if not on and not flying and not _dev_nav:
+		_dev_land_guard = true                              # the ensuing free-fall must land ON the surface (guard catches)
+
 ## COSMOS SPACE-FLY self-verification telemetry — the fields a scripted flight ASSERTS each mechanic on:
 ## altitude, |v_circ| reference, orbit radius, dominant body, dev-nav/coast/ground state, attitude mode. ADDITIVE
 ## + guarded: returns {} when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` null), so the bridge merge adds
@@ -2123,6 +2556,13 @@ func space_telemetry() -> Dictionary:
 		"on_ground": _space_on_ground(),
 		"att": _space_att_name(),
 	}
+
+## VACUUM HUD (FP_HUD_VACUUM_TEMP): public read of the analytic on-surface state — the SAME predicate the
+## RemoteBridge telemetry reports as `on_ground` (via space_telemetry → _space_on_ground). The thermometer
+## uses it to keep GROUND temp a real number while the pilot stands on a body, blanking it ("--") only when
+## in space AND off any surface. Pure read; no state.
+func is_on_surface() -> bool:
+	return _space_on_ground()
 
 ## True iff standing on terrain (not flying, feet at/near the analytic floor) — the harness's `landed` predicate
 ## combines this with nav_mode == planetary. Cheap floor probe; false while flying.

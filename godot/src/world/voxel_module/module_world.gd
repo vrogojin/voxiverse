@@ -124,6 +124,10 @@ const NEAR_COVER_MAX_SECONDS := 10.0       # hard transient bound (≤ far COVER
 ## must not pin the cover to its timeout, and the 96→128 annulus sits behind the far layer's curved inner
 ## hole (INNER_HOLE_CURVED = 112) plus fog, so retiring there is invisible (§4).
 const NEAR_COVER_MESHED_HALF := Vector3(96.0, 32.0, 96.0)
+## COSMOS STREAM-SETTLE: the TIGHT column half-extent player_column_meshed() probes — just the immediate ground
+## under a re-anchored teleport (not the whole near disc), so the settle releases as soon as the player has solid
+## terrain beneath them. Y spans well above/below the feet to cover the +Y viewer offset + any relief.
+const SETTLE_COLUMN_HALF := Vector3(8.0, 40.0, 8.0)
 var _cover_terrain: Node3D = null          # the frozen old VoxelTerrain (flag ON only); null in the default
 var _cover_age := 0.0                       # seconds the current cover has lived
 var _cover_released := false                # WorldManager's handshake fired (re-mirror done) — safe to retire on meshed
@@ -273,6 +277,15 @@ var _atlas_shape_mesh_cache: Dictionary = {}   # String key -> ArrayMesh (atlas-
 # the authoritative source the gate replays (material_override(i) == atlas.material AND every surface-i UV ∈ cell i).
 var capture_atlas_probes := false
 var _atlas_probes: Array = []            # [{arid:int, cells:Array[Vector2i]}] — one per atlas-routed shaped model
+# FP_MANIFEST_SLICE (perf/voxiverse-load-profile round 4): the cold-biome manifest bake (wet/waterlog + snow-fill
+# composites + sharp slopes ≈ the bulk of the ~22s setup bake) deferred off the boot critical path. Core (dry appearance
+# + snow-cap + layer + carve) bakes synchronously in _build_gen_manifest so a temperate spawn's near field is correct at
+# once; the cold bulk bakes across post-essential-ready frames (one helper/frame), then a bounded near-view re-ramp
+# remeshes so no already-generated cell stays a permanent plain-cube fallback. All inert with the flag off (shipped bake).
+var _manifest_cold_pending := false      # true between setup (core baked) and the deferred cold bake completing
+var _manifest_defer_go := false          # essential-ready fired → run the deferred cold helpers
+var _manifest_cold_stage := 0            # next cold step: 0=wet, 1=comps, 2=slope, 3=bake+remesh (then done)
+var _manifest_library: Object = null     # the VoxelBlockyLibrary the deferred helpers append to (== _library)
 
 ## Build the terrain. Returns true on success, false if the module is unusable.
 func setup() -> bool:
@@ -357,8 +370,14 @@ func setup() -> bool:
 	# Near-field radius: full 256 flat, cheaper CURVED_RENDER_RADIUS_BLOCKS on the planet (curved
 	# per-column worldgen is ~8× costlier, so the full radius overwhelms the 2 web threads — the far
 	# LOD covers the rest). near_render_radius() returns 256 in flat mode (byte-identical).
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): start the FIRST cold load SMALL (RAMP_START_BLOCKS) and grow to
+	# the full radius over RAMP_SECONDS — the same load-shaping the post-flip restream ramp already does — so the
+	# initial disk is not requested in one 2.6k-block burst behind a 4 s overlay. Off ⇒ the shipped full-radius slam.
+	var _initial_view := TerrainConfig.near_render_radius()
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		_initial_view = int(minf(RAMP_START_BLOCKS, float(_initial_view)))
 	_set_if(_terrain, "max_view_distance",
-		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else TerrainConfig.near_render_radius())
+		DEV_HIDDEN_VIEW_BLOCKS if _render_hidden else _initial_view)
 	# Coarse (32³) mesh blocks instead of the 16³ default. At a 256-block view distance
 	# with no LOD, 16³ mesh blocks produce ~1000+ surface meshes = ~1000+ draw calls, and
 	# on GL Compatibility via ANGLE→D3D11 (Intel HD in a browser) per-draw-call overhead —
@@ -390,7 +409,21 @@ func setup() -> bool:
 		add_child(_terrain)
 	# The initial load flooding the full disk is hidden by the ShaderPrewarm overlay hold, so only the
 	# post-flip restream needs the ramp — keep _process idle until restream() turns it on (Stage 4).
-	set_process(false)
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): ramp the FIRST load in too. Reuse the EXACT existing mechanism:
+	#   * pool path (FP_M1_POOL) — the active slot was seeded ramping in _pool_init_active (view_f = RAMP_START,
+	#     view_target = full); kick per-frame processing so _ramp_pool_step grows it (active wins the grow channel).
+	#   * single-terrain path — arm the same _ramp_active leg restream() uses (RAMP_START → near_render_radius()).
+	# Off ⇒ set_process(false), the shipped idle-until-restream behaviour (byte-identical).
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		if CubeSphere.FACETED and CubeSphere.FP_M1_POOL:
+			_pool_ramp_kick()
+		else:
+			_ramp_target = float(TerrainConfig.near_render_radius())
+			_ramp_view = RAMP_START_BLOCKS
+			_ramp_active = _ramp_target > RAMP_START_BLOCKS
+			set_process(_ramp_active)
+	else:
+		set_process(false)
 	return true
 
 ## COSMOS Stage 4 — drive the post-flip view-distance ramp. Grows the fresh terrain's max_view_distance
@@ -424,8 +457,12 @@ func _process(delta: float) -> void:
 	# FP-M2b: drain + apply finished LOD meshes/aprons under the mesher's own per-frame budget (off the voxel pool).
 	if _lod_mesher != null:
 		_lod_mesher.tick()
-	# Stay processing only while there is still ramp / cover / pool-ramp / LOD work to do; otherwise go dormant.
-	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null)
+	# FP_MANIFEST_SLICE: advance the deferred cold-biome bake by one helper this frame (off the boot path).
+	if CubeSphere.FP_MANIFEST_SLICE and _manifest_defer_go and _manifest_cold_pending:
+		_manifest_cold_step()
+	# Stay processing only while there is still ramp / cover / pool-ramp / LOD / deferred-manifest work to do.
+	set_process(_ramp_active or _cover_terrain != null or pool_ramping or _lod_mesher != null \
+		or (_manifest_defer_go and _manifest_cold_pending))
 
 ## FP-M1c: (re)enable per-frame processing so the per-slot pool view ramp advances. Safe to call repeatedly; a no-op
 ## when the pool flag is off or the near render is dev-hidden (the ramp must never re-grow a deliberately hidden field).
@@ -442,6 +479,31 @@ func _pool_ramp_kick() -> void:
 ## FP_LAND_RAMP_HOLD: WorldManager sets this while the player descends fast (shares FP_ENV_FALL_HOLD's vy signal).
 func set_fall_hold(v: bool) -> void:
 	_fall_hold = v
+
+## COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3.1/§3.2): drive the EXISTING single player VoxelViewer's
+## vertical offset (a) and horizontal streaming radius (b) each streaming tick while airborne, so the meshed near
+## plate stays anchored to the sub-player ground and releases only rim-inward once sub-τ on screen. Both levers are
+## the same viewer node DEV_HIDE_NEAR already proves safe live (offset = local +Y, view_distance = streaming radius);
+## NOTHING is allocated — this only MUTATES two existing properties, so the airborne plate holds at most the grounded
+## set (G-AA-BYTES). No-op when the viewer is absent (fallback path / no player). WorldManager gates the whole call on
+## FP_APPROACH_ANCHOR && FACETED, so with the flag off this is never reached and the viewer is byte-identical.
+func set_approach_anchor(offset_y: float, view_distance: int) -> void:
+	var v := _viewer as Node3D
+	if v == null:
+		return
+	v.position = Vector3(v.position.x, offset_y, v.position.z)
+	_set_if(_viewer, "view_distance", view_distance)
+
+## S1 introspection (verify_approach_anchor.gd — no live caller): the viewer's LOCAL +Y offset, its engine-applied
+## view_distance, and its instance id (G-AA-BYTES asserts the SAME viewer object serves grounded and airborne — no
+## re-instantiation). NAN / -1 / 0 when no viewer.
+func viewer_offset_y() -> float:
+	var v := _viewer as Node3D
+	return v.position.y if v != null else NAN
+func viewer_view_distance() -> int:
+	return int(_viewer.get("view_distance")) if (_viewer != null and _has_prop(_viewer, "view_distance")) else -1
+func viewer_instance_id() -> int:
+	return _viewer.get_instance_id() if _viewer != null else 0
 
 func _ramp_pool_step(delta: float) -> bool:
 	# FP_LAND_RAMP_HOLD: while falling fast, clamp every slot's EFFECTIVE grow target to a small landing disc so the
@@ -850,6 +912,12 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	if _atlas != null and _atlas.has_method("set_near_daylight_sun_dir"):
 		_atlas.set_near_daylight_sun_dir(sun_dir)
 
+## COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): forward the planet centre (render frame) into the shared atlas material's
+## unified near shader. No-op with no atlas or the flag off (the atlas setter self-guards) ⇒ byte-identical.
+func set_near_daylight_planet_centre(centre: Vector3) -> void:
+	if _atlas != null and _atlas.has_method("set_near_daylight_planet_centre"):
+		_atlas.set_near_daylight_planet_centre(centre)
+
 func library_model(arid: int) -> Object:
 	if _library == null:
 		return null
@@ -975,7 +1043,11 @@ func _build_gen_manifest(library: Object) -> void:
 	# Water models: NATIVE waterlogged twins (WATERLOGGING §4) or LEGACY wet composites + slab
 	# (WATER-SHORE §4.2). Same anti-drift discipline (add_model() == expected ARID); any drift aborts
 	# the water manifest (leaving -1 / cube fallback) but keeps the dry manifest intact.
-	var wet := _build_wet_manifest(library, total)
+	# FP_MANIFEST_SLICE: DEFER the cold-biome bulk (wet/waterlog + snow-fill composites + sharp slopes) off the boot
+	# critical path — they bake after essential-ready (_manifest_cold_step). Core (dry + snow-cap + layer + carve) stays
+	# synchronous. Off ⇒ all bake here exactly as shipped (byte-identical).
+	var slice := CubeSphere.FP_MANIFEST_SLICE
+	var wet := 0 if slice else _build_wet_manifest(library, total)
 	appended += wet
 
 	# Snow-cap state variants (M1 ADR §5.2): a snow-variant cube + snow-variant shape per emitted
@@ -992,14 +1064,22 @@ func _build_gen_manifest(library: Object) -> void:
 
 	# Snow-FILL composites (SNOW-ACCUMULATION §2.6/§2.7): the curated 2-surface baked models for a
 	# terrain ramp buried/filled by the snow plane, at levels {3,5,8,10} — the largest bake line item.
-	var comps := _build_comp_manifest(library, total)
+	# FP_MANIFEST_SLICE: deferred (cold-biome; a temperate spawn's near field has none). See _manifest_cold_step.
+	var comps := 0 if slice else _build_comp_manifest(library, total)
 	appended += comps
 	# SHARP-SLOPE dedicated slope tables (§4.1): dry + snow-capped variants per emitted (mat, payload).
-	var slope := _build_slope_manifest(library, total)
+	# FP_MANIFEST_SLICE: deferred (the biggest line item, ~5160 models). See _manifest_cold_step.
+	var slope := 0 if slice else _build_slope_manifest(library, total)
 	appended += slope
 	# COSMOS FP-CARVE (patch 0004): the seam junction carve-SENTINEL cubes (empty/no-op when not faceted).
 	var junctions := _build_carve_manifest(library, total)
 	appended += junctions
+
+	# FP_MANIFEST_SLICE: the cold-biome helpers above were skipped — arm the deferred bake (run after essential-ready).
+	if slice:
+		_manifest_cold_pending = true
+		_manifest_library = library
+		print("[module_world] FP_MANIFEST_SLICE: core manifest baked synchronously; cold-biome bulk (wet/comps/slope) DEFERRED to post-essential-ready")
 
 	if appended > 0 and library.has_method("bake"):
 		library.call("bake")                             # one batched bake: dry shapes + water + snow + slope models
@@ -1028,6 +1108,77 @@ func _build_gen_manifest(library: Object) -> void:
 	else:
 		print("[module_world] baked legacy water manifest: %d models (water slab ARID=%d; non-water liquids render as plain cubes)"
 			% [wet, _surface_arid[CellCodec.LIQ_WATER]])
+
+## FP_MANIFEST_SLICE: called at essential-ready (WorldManager.begin_deferred_boot_work → main.gd) — start running the
+## deferred cold-biome bakes off the boot critical path (one helper per _process frame). No-op with the flag off / no
+## pending cold bake. Enables per-frame processing; _process drives _manifest_cold_step until done.
+func begin_deferred_manifest_bake() -> void:
+	if not CubeSphere.FP_MANIFEST_SLICE or not _manifest_cold_pending or _manifest_library == null:
+		return
+	_manifest_defer_go = true
+	set_process(true)
+
+## FP_MANIFEST_SLICE: advance the deferred cold-biome bake by ONE helper this frame (each is a multi-second synchronous
+## bake, so one-per-frame spreads the ~16s off the boot path — the player is already in). Stage 3 does the final
+## library re-bake + the bounded near-view re-ramp remesh so any cell generated with a cube fallback during the defer
+## window upgrades to its true shape. Called from _process only while _manifest_defer_go && _manifest_cold_pending.
+func _manifest_cold_step() -> void:
+	var total := _cube_arid.size()
+	match _manifest_cold_stage:
+		0:
+			_build_wet_manifest(_manifest_library, total)
+		1:
+			_build_comp_manifest(_manifest_library, total)
+		2:
+			_build_slope_manifest(_manifest_library, total)
+		3:
+			if _manifest_library.has_method("bake"):
+				_manifest_library.call("bake")           # one re-bake now that the cold models are appended
+			_manifest_remesh_near()                      # remesh so cube-fallback cold cells upgrade
+			_manifest_cold_pending = false
+			_manifest_defer_go = false
+			print("[module_world] FP_MANIFEST_SLICE: cold-biome manifest baked (deferred) + near view re-ramped for remesh")
+	_manifest_cold_stage += 1
+
+## FP_MANIFEST_SLICE: force a remesh of the near field by re-ramping its view distance from RAMP_START — reducing then
+## re-growing max_view_distance makes godot_voxel drop + re-mesh the annulus with the now-complete library (a cold cell
+## that rendered as a cube fallback during the defer window comes back with its true shape). Reuses the EXISTING ramp
+## machinery on BOTH paths (pool active slot via _ramp_pool_step, else the single-terrain _ramp_active leg), so it is
+## bounded to the near radius (NEVER-OOM) and pool-safe (it only writes max_view_distance / slot ramp state).
+func _manifest_remesh_near() -> void:
+	if CubeSphere.FACETED and CubeSphere.FP_M1_POOL and _pool.has(_pool_active):
+		var a: Dictionary = _pool[_pool_active]
+		var full := float(TerrainConfig.near_render_radius())
+		a["view_f"] = RAMP_START_BLOCKS
+		a["ramp_from"] = RAMP_START_BLOCKS
+		a["view_target"] = full
+		a["view"] = int(RAMP_START_BLOCKS)
+		_set_if(a["terrain"], "max_view_distance", int(RAMP_START_BLOCKS))
+		_pool_ramp_kick()
+	elif _terrain != null:
+		_ramp_view = RAMP_START_BLOCKS
+		_ramp_target = float(TerrainConfig.near_render_radius())
+		_ramp_active = _ramp_target > RAMP_START_BLOCKS
+		_set_if(_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
+		set_process(true)
+
+## FP_MANIFEST_SLICE introspection for verify_manifest_slice.gd — read-only.
+func manifest_cold_pending() -> bool:
+	return _manifest_cold_pending
+## Count of baked (non -1) slots in a frozen ARID table — the gate checks core > 0 always, and cold == 0 until deferred.
+func manifest_baked_count(which: String) -> int:
+	var arr: PackedInt32Array
+	match which:
+		"gen": arr = _gen_arid
+		"snow": arr = _snow_arid
+		"comp": arr = _comp_arid_l3
+		"slope": arr = _slope_arid
+		_: return -1
+	var n := 0
+	for v in arr:
+		if v >= 0:
+			n += 1
+	return n
 
 ## Bake the snow-cap state VARIANT models and freeze them into `_snow_arid` (M1 ADR §5.2). For each
 ## cappable material (grass/podzol/sand/stone — stone tops B_MOUNTAINS peaks) it appends: a snow-variant
@@ -1886,12 +2037,20 @@ func _pool_init_active() -> void:
 	_planet_root.add_child(slot)
 	slot.add_child(_terrain)
 	var arv := TerrainConfig.near_render_radius()
+	# FP_LOAD_RAMP (perf/voxiverse-load-profile): seed the active slot RAMPING from RAMP_START_BLOCKS (the terrain's
+	# max_view_distance was set to the same start in setup) so _ramp_pool_step grows it to the full radius over
+	# RAMP_SECONDS on the first load — instead of the shipped slam (view_f == view_target == full, "NO ramp"). The
+	# final view is unchanged (view_target stays arv). Off ⇒ start == arv ⇒ the exact shipped no-ramp seed (byte-identical).
+	var _av_start := float(arv)
+	if CubeSphere.FP_LOAD_RAMP and not _render_hidden:
+		_av_start = minf(RAMP_START_BLOCKS, float(arv))
 	_pool[_pool_active] = {
 		"terrain": _terrain, "slot": slot, "mesher": _mesher, "generator": _generator,
-		"spawn_ms": Time.get_ticks_msec(), "view": arv,
+		"spawn_ms": Time.get_ticks_msec(), "view": int(_av_start),
 		"editable": true, "fid": _pool_active,
-		# Active at init keeps its already-set full near view — NO ramp (target == current). (§5)
-		"view_f": float(arv), "view_target": float(arv), "ramp_from": float(arv),
+		# Active at init keeps its already-set full near view — NO ramp (target == current) — UNLESS FP_LOAD_RAMP
+		# ramps the first load (view_f = RAMP_START, view_target = full). (§5)
+		"view_f": _av_start, "view_target": float(arv), "ramp_from": _av_start,
 	}
 
 ## Spawn a render-only neighbour terrain for facet `fid` (view 96). Enforces the caps: FP_M1_POOL on, faceted, a
@@ -2772,6 +2931,21 @@ func _new_field_meshed() -> bool:
 	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
 		else v.global_position - global_position
 	var half := NEAR_COVER_MESHED_HALF
+	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
+
+## COSMOS STREAM-SETTLE: is the ACTIVE near field MESHED in a TIGHT column around the player (the settle-release
+## probe — a dev teleport/fast-travel is held hovering at surface_y until this passes, so the player is never
+## dropped into un-streamed void)? Uses the SAME viewer-world-point→terrain-local frame handling as
+## _new_field_meshed (frame-correct under the fixed frame), but a small SETTLE_COLUMN_HALF so it releases as soon
+## as the IMMEDIATE ground column is present — not the whole 96-block near disc. Returns false (keep holding until
+## the cap) when there is no viewer/terrain or the module lacks is_area_meshed.
+func player_column_meshed() -> bool:
+	var v := _viewer as Node3D
+	if _terrain == null or v == null or not _terrain.has_method("is_area_meshed"):
+		return false
+	var center: Vector3 = (_terrain as Node3D).to_local(v.global_position) if _fixed_frame_on() \
+		else v.global_position - global_position
+	var half := SETTLE_COLUMN_HALF
 	return bool(_terrain.call("is_area_meshed", AABB(center - half, half * 2.0)))
 
 ## COSMOS M4 Stage 2: free the frozen near cover (null-safe) and print one retirement telemetry line (§9.3

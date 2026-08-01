@@ -87,6 +87,24 @@ static func backstop_sink() -> float:
 		return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)   # ε guard scales with the cell (rescale-safe), floored at 1.5
 	return CubeSphere.BACKSTOP_SINK_FRAC * cell
 
+## COSMOS TEXTURED-LOD U3 (§2U.3 — same level, cull-not-sink): is the far-ring SAME-LEVEL rule active at the FLAG
+## level? Requires U2's FP_FARRING_CULL_COVERED — the ~13-block visual sink can only be removed where the cull
+## guarantees near/far never coexist. Off ⇒ backstop_sink() keeps the full sink (byte-identical). NOTE: the far ring
+## additionally requires a VALID coverage probe at RUNTIME before it applies the reduction (FacetFarRing._level_on
+## gates on _cull_on), so on the GDScript fallback path (invalid probe) it self-disables to today's sink.
+static func level_on() -> bool:
+	return CubeSphere.FP_FARRING_LEVEL and CubeSphere.FP_FARRING_CULL_COVERED
+
+## COSMOS TEXTURED-LOD U3: the far ring's radial sink COLLAPSED to the ENV_EPS_G correctness guard only — the backstop
+## sits at essentially the near surface radius (a tiny ε below, never the ~13-block visual displacement). Same ε guard
+## the min-envelope uses (max(ENV_EPS_G, ENV_EPS_FRAC×cell); ≈1.5 floor at R=3072, ≈5.2 at R=6371) — it covers the
+## between-fine-sample residual so far ≤ near (no protrusion). Rescale-safe (scales with the facet cell like
+## backstop_sink). The far ring routes here (via _sunk_positions) ONLY when _level_on(); fringe z-order at the
+## un-culled seam is the shipped FAR_BIAS_K window-space depth bias, not this sink.
+static func backstop_sink_level() -> float:
+	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)
+
 ## FP_ENV_FLOORED_ASYNC: the FULL radial sink for a CHORD fallback vertex — the exact pre-envelope BACKSTOP_SINK
 ## (BACKSTOP_SINK_FRAC × cell, ≈13 at R=6371), regardless of env_all. A chord is the raw profile sample, NOT the
 ## min-envelope, so it needs the full sink (not the ε) to sit ≤ the near surface — byte-for-byte the FULL_COVER
@@ -150,10 +168,48 @@ void fragment() {
 }
 "
 
+# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): the biased-tier fallback far
+# material, self-shaded by the SHARED VoxiLight law so — where this material carries the far ring instead of the shell
+# absolute shader — it shades IDENTICALLY to the near blocks. UNSHADED (like the shell) + the TRUE planet-radial normal
+# n = normalize(wp − MODEL·0), × voxi_shade, keeping the P3 window-space depth bias. VoxiLight.SHADE_GLSL is string-
+# included (pure concatenation — ONE shader_type, zero new compiled program). Off ⇒ make_biased_material uses _TIER_
+# SHADER verbatim (byte-identical). sun_dir is fed each frame via FacetFarRing.set_shell_absolute_sun_dir (relaxed guard).
+const _TIER_UNIFIED_HEAD := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform float tier_bias;
+"
+const _TIER_UNIFIED_TAIL := "varying vec3 v_col;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	v_col = COLOR.rgb * voxi_shade(n, sun_dir);
+	POSITION = PROJECTION_MATRIX * (MODELVIEW_MATRIX * vec4(VERTEX, 1.0));
+	POSITION.z += tier_bias * POSITION.w;
+}
+void fragment() {
+	ALBEDO = v_col;
+	ROUGHNESS = 1.0;
+}
+"
+
+## The biased-tier shader source. `unified` off (default = the flag) ⇒ the shipped _TIER_SHADER VERBATIM; on ⇒ the same
+## depth-biased material self-shaded by the shared VoxiLight law. Exposed static so the G-VL-EQ gate can build both.
+static func tier_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
+	if unified:
+		return _TIER_UNIFIED_HEAD + VoxiLight.SHADE_GLSL + _TIER_UNIFIED_TAIL
+	return _TIER_SHADER
+
 static func make_biased_material(bias: float) -> ShaderMaterial:
 	var sh := Shader.new()
-	sh.code = _TIER_SHADER
+	sh.code = tier_shader_code()
 	var m := ShaderMaterial.new()
 	m.shader = sh
 	m.set_shader_parameter("tier_bias", bias)
+	# Unified: seed the ONE uniform set so the tier material shades identically to near/far (sun_dir fed each frame).
+	if CubeSphere.FP_SHADE_UNIFIED:
+		m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		m.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+		m.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+		m.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
 	return m

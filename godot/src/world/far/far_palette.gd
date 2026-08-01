@@ -145,6 +145,67 @@ static func moon_color_for(biome: int) -> Color:
 		return _regolith.lerp(_basalt, 0.55)      # dark maria plains
 	return _regolith.lerp(_anorthosite, 0.45)     # bright highlands / polar
 
+## COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R.1) — the SINGLE material-classifier for the far
+## detail (FP_BLOCK_DETAIL). The 12 detail PATTERNS the id_map indexes (a block-face tile in FacetDetailAtlas). Kept
+## HERE (not in the atlas) so the id a texel gets and the colour a texel gets both derive from the one FarPalette
+## palette — a recolour cannot make id and colour disagree. Stored id = pattern + 1 (0 reserved for un-baked).
+const P_GRASS := 0
+const P_STONE := 1
+const P_SAND := 2
+const P_SNOW := 3
+const P_DIRT := 4
+const P_LEAF := 5
+const P_GRAVEL := 6
+const P_MUD := 7
+const P_ICE := 8
+const P_JUNGLE := 9
+const P_WATER := 10
+const P_LAVA := 11
+const DETAIL_PATTERNS := 12
+
+static var _detail_ready := false
+static var _detail_rgb := PackedFloat32Array()     # classifier keys FLATTENED (r,g,b triples) — hot-loop friendly
+static var _detail_pat := PackedInt32Array()       # parallel: the pattern each key maps to
+
+## Resolve the classifier table once (idempotent). Each entry maps a palette colour → the block-face pattern that
+## SHARES its texture in the near atlas; the tint (which distinguishes taiga/savanna/grass, red_sand/sand, …) rides
+## the colour page, so several palette colours can share one pattern texture without losing their hue on screen. The
+## keys are stored as flat floats so the per-texel bake classify (thousands/facet) has no Color-object overhead.
+static func ensure_detail_ready() -> void:
+	if _detail_ready:
+		return
+	ensure_ready()
+	var keys := [
+		[_grass, P_GRASS], [_taiga, P_GRASS], [_savanna, P_GRASS], [_forest, P_LEAF], [_jungle, P_JUNGLE],
+		[_snow, P_SNOW], [_sand, P_SAND], [_red_sand, P_SAND], [_gravel, P_GRAVEL], [_mud, P_MUD],
+		[_podzol, P_DIRT], [_leaf, P_LEAF], [_stone, P_STONE], [_water, P_WATER], [_ice, P_ICE], [_lava, P_LAVA],
+	]
+	_detail_rgb.resize(keys.size() * 3)
+	_detail_pat.resize(keys.size())
+	for i in range(keys.size()):
+		var pc: Color = keys[i][0]
+		_detail_rgb[i * 3] = pc.r; _detail_rgb[i * 3 + 1] = pc.g; _detail_rgb[i * 3 + 2] = pc.b
+		_detail_pat[i] = keys[i][1]
+	_detail_ready = true
+
+## Classify a baked (top-block) colour to its detail PATTERN (0..DETAIL_PATTERNS-1) by nearest palette key. color_for
+## returns EXACTLY one of these palette colours for a fine texel, so an interior texel classifies to its true material
+## exactly; a box-averaged boundary texel picks the nearer of the two (the disclosed 1-texel shore transition, §2R.6 D4).
+static func detail_pattern(c: Color) -> int:
+	if not _detail_ready:
+		ensure_detail_ready()
+	var cr := c.r; var cg := c.g; var cb := c.b
+	var best := P_GRASS
+	var best_d := 1.0e30
+	var n := _detail_pat.size()
+	for i in range(n):
+		var j := i * 3
+		var dr := cr - _detail_rgb[j]; var dg := cg - _detail_rgb[j + 1]; var db := cb - _detail_rgb[j + 2]
+		var d := dr * dr + dg * dg + db * db
+		if d < best_d:
+			best_d = d; best = _detail_pat[i]
+	return best
+
 ## THE per-vertex colour (LOD-DESIGN §2.3). A clamped sea vertex takes the sea regime
 ## colour; a dry-land vertex above the freeze line whitens (the altitude snow line — the
 ## exact ClimateModel.surface_temperature < 0 predicate worldgen stamps caps with, gated

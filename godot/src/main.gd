@@ -25,6 +25,19 @@ var _fs_prev_d := -1.0
 var _fs_prev_usec := -1
 var _fs_last_d := -1.0
 
+# BOOT-LOAD PROFILE (perf/voxiverse-load-profile) — lightweight per-phase boot timing so ONE fresh browser load
+# reveals where the cold-load minutes go. Pure Time.get_ticks_msec() deltas + one print/console.log per milestone
+# (no per-frame cost of note — the post-splash settle poll is throttled to ~2 Hz and self-disarms once fired). No
+# gameplay behaviour changes; default-on because it is timing-only. Numbers land in the browser console as
+# `[BOOT] <phase> <ms> ms` lines plus one compact `[BOOT-PROFILE] {json}` summary line the operator can copy.
+var _boot_t0 := 0                 # ticks_msec at the top of _ready (engine handed control to the game)
+var _boot_last := 0               # ticks_msec of the previous milestone (for per-phase deltas)
+var _boot_marks: Dictionary = {}  # phase -> ms, accumulated for the summary line
+var _settle_armed := false        # post-splash "world_settled" timer running?
+var _settle_done := false         # fired (or capped) — stop polling
+var _settle_accum := 0.0          # throttle accumulator for the ~2 Hz settle poll
+var _settle_center := Vector3.ZERO # camera world pos captured at essential-ready (the meshed-box centre)
+
 func _ready() -> void:
 	# COSMOS FP0: the faceted-planet VISUAL SPIKE replaces the whole normal world (static demo planet + free
 	# camera) so the faceted look can be judged live. Default OFF → the normal game builds below, unchanged.
@@ -32,7 +45,13 @@ func _ready() -> void:
 		add_child(FacetedSpike.new())
 		return
 
+	# BOOT-LOAD PROFILE: t0 = the moment the engine hands the game control (WASM + .pck already downloaded
+	# + the SceneTree is up). Everything after this is game-side cold-load work we time phase-by-phase.
+	_boot_t0 = Time.get_ticks_msec()
+	_boot_last = _boot_t0
+
 	_setup_environment()
+	_boot_mark("environment")
 
 	# COSMOS FACETED (docs/COSMOS-FACETED-IMPL.md §4): build the facet atlas and install the spawn facet as the
 	# active facet BEFORE the WorldManager (its module generator freezes TerrainConfig.active_facet() at
@@ -48,6 +67,16 @@ func _ready() -> void:
 	var world := WorldManager.new()
 	world.name = "WorldManager"
 	add_child(world)
+	# BOOT SPLASH (#75): push honest boot milestones to the branded web shell. Every call is
+	# web-guarded (OS.has_feature("web")) so native/headless is byte-identical — the FLAT gate,
+	# which never runs main.gd anyway, is unaffected. done/total are REAL completed-milestone
+	# counts fired at real code points (world built → scene wired → prewarm → essential ready),
+	# NOT a faked numeric %. Step 1: WorldManager built (its _ready warmed the terrain/atlas).
+	_web_progress("Preparing terrain", 1, 4)
+	# BOOT-LOAD PROFILE: WorldManager.new()+add_child ran its whole _ready synchronously here — on the module
+	# path that includes module_world.setup() (VoxelBlockyLibrary config + the full generator ARID-mesh manifest
+	# bake) and, in FLAT, the emitted_modifiers() find_spawn/find_coast scan. This is the main-thread build phase.
+	_boot_mark("world_build")
 
 	var player := Player.new()
 	_player = player
@@ -68,6 +97,8 @@ func _ready() -> void:
 	player.global_position = Vector3(col.x + 0.5, world.surface_y(col.x, col.y) + 0.1, col.y + 0.5)
 	player.set_initial_look(0.0, -0.12)
 	world.on_player_ready(player)
+	# BOOT-LOAD PROFILE: spawn selection (find_spawn scan-out for temperate land + _find_flat 3x3 relief probe).
+	_boot_mark("player_spawn")
 
 	var hotbar := HotbarHUD.new()
 	hotbar.name = "HotbarHUD"
@@ -79,6 +110,10 @@ func _ready() -> void:
 	hud.world = world
 	hud.player = player
 	add_child(hud)
+	# BOOT SPLASH (#75) step 2: the core scene graph (world + player + HUD stack) is wired.
+	_web_progress("Building world", 2, 4)
+	# BOOT-LOAD PROFILE: hotbar + thermometer HUD construction (cheap; captured for completeness).
+	_boot_mark("hud_wire")
 
 	# SN-FIX #1 (docs/COSMOS-SPACE-NAV-DESIGN.md; live pilot request 2026-07-18): the NAV readout — lattice
 	# position + radial altitude + nav-mode name. Behind SN_HUD_NAV (default OFF → no node is created and the
@@ -164,11 +199,26 @@ func _ready() -> void:
 	# exploration. ShaderPrewarm draws one instance of every material/mesh-format
 	# combination for a few frames, hidden behind a "Loading…" overlay, so ANGLE does
 	# all the compiles up front. The player is FROZEN until it reports finished.
+	# BOOT-LOAD PROFILE: everything since hud_wire — the optional subsystems (sky/clouds/weather/perf HUD/remote
+	# bridge activator). All flag-gated; in the shipped FLAT build most are skipped, so this is normally tiny.
+	_boot_mark("subsystems")
+
 	player.frozen = true
+	# BOOT SPLASH (#75) step 3: the shader/pipeline prewarm + terrain-meshed hold begins. This is
+	# the long phase (ANGLE pipeline compiles, then the module near-view meshes behind the overlay);
+	# the web shell shimmers the bar here so it never looks frozen (no faked forward %).
+	_web_progress("Prewarming shaders", 3, 4)
 	var prewarm := ShaderPrewarm.new()
 	prewarm.name = "ShaderPrewarm"
 	add_child(prewarm)
-	prewarm.begin(player, func() -> void: player.frozen = false)
+	# on_done fires when the prewarm's PHASE-2 hold confirms the essential near view is meshed
+	# (initial_view_meshed) and the player is unfrozen — i.e. the "essential near set ready"
+	# milestone. Step 4 + reveal/enable-Enter in the shell; background bake keeps running.
+	prewarm.begin(player, func() -> void:
+		player.frozen = false
+		_web_progress("Ready", 4, 4)
+		_web_essential_ready()
+		_boot_on_essential_ready(player))
 
 	# COSMOS M1 (§3.4): the render bend is camera-centred, so register + seed the global bend
 	# uniforms now. FLAT_WORLD (default) leaves them untouched — no bend materials are ever built.
@@ -190,6 +240,26 @@ func _ready() -> void:
 ## Feed the camera position into the bend-origin global uniform each frame (curved mode only).
 ## The bend is continuous around the camera (§3.4), so walking simply rolls the world under you.
 func _process(_delta: float) -> void:
+	# BOOT-LOAD PROFILE: after the splash lifts (essential-ready), keep a THROTTLED (~2 Hz) watch on how long the
+	# BULK near view takes to finish streaming — the ShaderPrewarm hold only waits on a tiny 40-block box, so most
+	# of the 256-block near disk meshes AFTER the splash is dismissed. This "world_settled" milestone is the number
+	# that usually reveals the multi-minute fill. Self-disarms on first success (or a 15-min cap so it never polls
+	# forever). Cheap: one bool test per frame normally, one is_area_meshed call twice a second while armed.
+	if _settle_armed and not _settle_done:
+		_settle_accum += _delta
+		if _settle_accum >= 0.5:
+			_settle_accum = 0.0
+			if _player != null and _player.world.view_meshed(_settle_center, Vector3(160.0, 48.0, 160.0)):
+				_settle_done = true
+				var settled_ms := Time.get_ticks_msec() - _boot_t0
+				_boot_marks["world_settled_from_boot"] = settled_ms
+				print("[BOOT] world_settled %d ms (near 160-block box meshed since boot)" % settled_ms)
+				if OS.has_feature("web"):
+					JavaScriptBridge.eval("console.log('[BOOT] world_settled %d ms');" % settled_ms, true)
+				_boot_print_profile()
+			elif Time.get_ticks_msec() - _boot_t0 > 900000:
+				_settle_done = true   # 15-minute hard cap: give up polling, never leak a per-frame call forever
+
 	# COSMOS ORBITAL O0: advance the celestial clock every frame (independent of the render path). The
 	# sky moves 72× via the scaled GM; CosmosSky reads this clock in its own _process. Null (flag off)
 	# ⇒ untouched. Placed before the FLAT_WORLD early-return so the sky ticks in the flat/faceted game.
@@ -210,6 +280,11 @@ func _process(_delta: float) -> void:
 	# (also stranded below the return) is only needed above h≈6.4k and is a separate FP_SCALED_BODY pass.
 	if _player != null and (CubeSphere.FP_SHELL_CAMERA_SET or CubeSphere.FP_SHELL_PREWARM) and CubeSphere.FACETED:
 		_player.world.update_shell_camera_set(_player.camera_global_transform().origin)
+	# COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): drive the crisp orbit megablock disc
+	# from this frame's camera — engage/retire §2V above the swap, re-assign the L4→L5 disc on drift. Gated on
+	# FP_BLOCK_LOD_ORBIT + FACETED; the WorldManager method self-guards (no node ⇒ no-op) ⇒ flag-off byte-identical.
+	if _player != null and CubeSphere.FP_BLOCK_LOD_ORBIT and CubeSphere.FACETED:
+		_player.world.update_block_lod_orbit(_player.camera_global_transform().origin)
 	# COSMOS-LOD-SKY L3 (SHELL_TERMINATOR_TINT): forward the sky's current Sun direction into the far-ring shell
 	# tint shader so the space-side terminator band tracks the same Sun as the ground ramp. Gated on the flag +
 	# a live sky; the WorldManager/ring setters self-guard, so flag-off is byte-identical (never called).
@@ -218,7 +293,18 @@ func _process(_delta: float) -> void:
 	# COSMOS ATMO-SKY A5 (docs/COSMOS-ATMO-SKY-DESIGN.md §3 C2): forward the Sun direction + the scaled planet
 	# render centre into the far-ring shell v2 shader (absolute self-shaded globe). Same forwarding discipline as
 	# the L3 tint above; the setter self-guards on FP_SHELL_ABSOLUTE so flag-off is byte-identical (never wired).
-	if _player != null and _cosmos_sky != null and CubeSphere.FP_SHELL_ABSOLUTE and CubeSphere.FACETED:
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also drive the feed when the biased-tier fallback material carries the
+	# far ring (shell-absolute off) so its unified self-shade tracks the Sun. Off both flags ⇒ never called (byte-id).
+	# COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): ALSO drive it under this flag so the block-LOD tiers'
+	# ONE shared_material() sun_dir is refreshed EVERY FRAME with the SAME current_sun_dir the far-ring shell uses —
+	# regardless of whether FP_SHELL_ABSOLUTE gates the shell-material push. Without this, block-LOD set_sun_dir is only
+	# reached via the shell-absolute gate, so if FP_BLOCK_LOD ships without FP_SHELL_ABSOLUTE the block-LOD materials
+	# freeze at the default sun (1,0,0) and every facet renders for a FIXED sun — the per-facet "frozen/offset" day/night
+	# patchwork (incl. red scatter-tint on grazing-normal facets) while the far ring + near field track live time. The
+	# block_lod.set_sun_dir calls inside set_far_ring_shell_absolute are UNCONDITIONAL (only the shell-material push
+	# self-gates on FP_SHELL_ABSOLUTE), so this cheap shared-uniform write unifies all tiers to the live Sun. Off ⇒ the
+	# shipped gate verbatim ⇒ byte-identical.
+	if _player != null and _cosmos_sky != null and (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED or CubeSphere.FP_NIGHT_TERRAIN_CENTRE) and CubeSphere.FACETED:
 		_player.world.set_far_ring_shell_absolute(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the Sun direction into the near-field daylight material twin so
 	# the near ground darkens with the same absolute day/night as the far shell (kills the near/far night split).
@@ -304,6 +390,63 @@ func _process(_delta: float) -> void:
 		if _ft_on: _ft_t = Time.get_ticks_usec()
 		_player.world.apply_scaled_body(cam)
 		if _ft_on: _player.ft_record("t_farring_us", Time.get_ticks_usec() - _ft_t)
+
+## BOOT SPLASH (#75): push a boot milestone to the branded web shell's global JS hook. WEB-ONLY
+## (OS.has_feature("web")) so native/headless is byte-identical and the FLAT verify gate is untouched.
+## `phase` is a fixed, code-controlled label (no user data ⇒ no escaping needed); done/total are REAL
+## completed-milestone counts. If the shell's function is absent (stock shell / older cache), the call
+## no-ops in JS (`window.voxiverseProgress && ...`). Never throws on native (guarded out entirely).
+## BOOT-LOAD PROFILE: record + emit one boot-phase duration (ms since the previous milestone). Prints to the
+## engine log (native/headless) AND, on web, mirrors to the browser console so the operator sees it without a
+## debugger. Fixed code-controlled phase labels (no user data). Called a handful of times at boot only.
+func _boot_mark(phase: String) -> void:
+	var now := Time.get_ticks_msec()
+	var dt := now - _boot_last
+	_boot_last = now
+	_boot_marks[phase] = dt
+	print("[BOOT] %s %d ms" % [phase, dt])
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("console.log('[BOOT] %s %d ms');" % [phase, dt], true)
+
+## BOOT-LOAD PROFILE: the ShaderPrewarm on_done fired — the player is unfrozen and the splash's "essential ready"
+## milestone is up. Record the prewarm+mesh-hold phase and the total engine-control→playable time, then ARM the
+## post-splash "world_settled" watch (which reveals the bulk terrain fill that continues after the splash lifts).
+func _boot_on_essential_ready(player: Node3D) -> void:
+	_boot_mark("prewarm_meshhold")
+	_boot_marks["essential_ready_from_boot"] = Time.get_ticks_msec() - _boot_t0
+	if player != null and player.has_method("camera_global_transform"):
+		_settle_center = player.call("camera_global_transform").origin
+	# FP_BOOT_ASYNC / FP_MANIFEST_SLICE (round 4): the player is now in — release the deferred boot work (far-ring
+	# background warm + cold-biome manifest bake) so it runs WHILE playing instead of on the pre-essential-ready
+	# critical path (where it starved the shader-compile frames). No-op with the flags off.
+	if player != null:
+		var w := player.get("world") as Node
+		if w != null and w.has_method("begin_deferred_boot_work"):
+			w.call("begin_deferred_boot_work")
+	_settle_armed = true
+	_boot_print_profile()
+
+## BOOT-LOAD PROFILE: emit the compact one-line summary the operator copies — a phase:ms JSON map. Printed at
+## essential-ready and again once world_settled fires (so the second line carries the full-fill number).
+func _boot_print_profile() -> void:
+	var summary := JSON.stringify(_boot_marks)
+	print("[BOOT-PROFILE] ", summary)
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("console.log('[BOOT-PROFILE] %s');" % summary, true)
+
+func _web_progress(phase: String, done: int, total: int) -> void:
+	if not OS.has_feature("web"):
+		return
+	JavaScriptBridge.eval(
+		"window.voxiverseProgress && window.voxiverseProgress('%s',%d,%d);" % [phase, done, total], true)
+
+## BOOT SPLASH (#75): signal the shell that the essential near set is ready — reveal the world +
+## enable the Enter button. Same web-guard discipline as _web_progress.
+func _web_essential_ready() -> void:
+	if not OS.has_feature("web"):
+		return
+	JavaScriptBridge.eval(
+		"window.voxiverseEssentialReady && window.voxiverseEssentialReady();", true)
 
 func _setup_environment() -> void:
 	var env := Environment.new()

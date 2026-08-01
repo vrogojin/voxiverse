@@ -197,6 +197,32 @@ static func block_at(x: int, y: int, z: int, pcache = null) -> int:
 			return _cactus_block(gx, gz, dx, y, dz, gy)
 	return BlockCatalog.AIR
 
+## COSMOS TEXTURED-LOD §2V PREP (surface_shot source): the id of the TOPMOST tree block (leaf / trunk /
+## cactus) TreeGen places OVER the terrain at column (x, z), or BlockCatalog.AIR if this column carries no
+## tree above ground. Pure + deterministic — a queryable refactor over the EXISTING placement (block_at),
+## adding NO new placement logic, so it matches the near voxel world by construction. Consults ONLY the tree
+## of (x, z)'s own G×G grid cell (the one-tree-per-cell invariant), scanning that tree's bounded vertical
+## span [gy+1 .. gy+MAX_ABOVE_SURFACE] top-down: O(neighbour) = MAX_ABOVE_SURFACE hashed probes, no per-cell
+## search. Threads `pcache` through so terrain + trees resolve on the SAME facet (a GenCtx scoped to a facet,
+## or the active facet). Used by SurfaceShot.surface_shot to composite canopies onto the far skin.
+static func top_decoration(x: int, z: int, pcache = null) -> int:
+	var gx := floori(float(x) / float(G))
+	var gz := floori(float(z) / float(G))
+	if not has_tree(gx, gz, pcache):
+		return BlockCatalog.AIR
+	var b := _base_pos(gx, gz)
+	var gy := TerrainConfig.column_top(b.x, b.y, pcache)
+	if gy <= TerrainConfig.SEA_LEVEL:
+		return BlockCatalog.AIR                # submerged tree bases are suppressed (block_at agrees)
+	# Top-down from the highest a tree of this cell can reach to the first solid over the ground: the exposed
+	# decoration. Reuses block_at VERBATIM (same hashes / species / shape) so the result cannot drift from what
+	# the near world and the collapse pass place. MAX_ABOVE_SURFACE bounds even the tallest species (jungle).
+	for y in range(gy + MAX_ABOVE_SURFACE, gy, -1):
+		var id := block_at(x, y, z, pcache)
+		if id != BlockCatalog.AIR:
+			return id
+	return BlockCatalog.AIR
+
 ## Oak-shaped tree (also used, with birch ids, for birch): a WOOD trunk column,
 ## a 3x3-minus-centre canopy ring on the top two trunk layers, and a plus-shaped
 ## cap one layer above. Byte-identical to the pre-species oak when (log_id,

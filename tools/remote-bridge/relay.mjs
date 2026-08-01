@@ -95,8 +95,18 @@ const STALE_S = 120;                 // `issued` older than this => rejected (a 
 const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload',
   // COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — dev/test space-nav verbs. Still consent-gated + control-token
   // gated exactly like every op; the relay only ROUTES, the rover re-validates and executes behind the grant.
-  'dev_nav', 'nav', 'thrust', 'roll']);
+  'dev_nav', 'nav', 'thrust', 'roll',
+  // DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set celestial time-of-day at the player. The relay
+  // only ROUTES + bounds-checks; the rover re-validates and executes behind the grant, like every op.
+  'set_time',
+  // DEV/TEST INSTRUMENTATION (dev-instrument tooling) — precise camera placement + stable capture: teleport to an
+  // absolute pose, set altitude over the current spot, freeze the celestial clock, freeze the player. Consent- +
+  // control-token gated like every op; the relay only ROUTES + bounds-checks, the rover re-validates + executes.
+  'teleport', 'set_alt', 'freeze_time', 'freeze_player']);
 const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
+const TELEPORT_ALT_MIN = -64;        // DEV: min altitude (blocks above the local surface) — allow a small underground peek
+const TELEPORT_ALT_MAX = 200000;     // DEV: max altitude (blocks) — deep space, but finite
+const TELEPORT_XYZ_MAX = 1e6;        // DEV: |x|,|y|,|z| bound for absolute lattice teleport (finite, generous)
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
 function loadToken() {
@@ -310,6 +320,38 @@ function validateStep(st) {
       if (typeof st.seconds !== 'number' || !(st.seconds > 0) || st.seconds > MAX_HOLD_S) return rej('caps', `roll.seconds must be in (0,${MAX_HOLD_S}]`);
       if (st.dir !== undefined && !['left', 'right'].includes(st.dir)) return rej('caps', `bad roll dir '${st.dir}'`);
       return okEst(st.seconds);
+    }
+    case 'set_time': {                                   // DEV TIME-CHEAT: local_hours ∈ [0,24]; optional sun_elev_deg ∈ [-90,90]
+      if (typeof st.local_hours !== 'number' || !isFinite(st.local_hours) || st.local_hours < 0 || st.local_hours > 24)
+        return rej('caps', 'set_time.local_hours must be in [0,24]');
+      if (st.sun_elev_deg !== undefined && (typeof st.sun_elev_deg !== 'number' || !isFinite(st.sun_elev_deg) || st.sun_elev_deg < -90 || st.sun_elev_deg > 90))
+        return rej('caps', 'set_time.sun_elev_deg must be in [-90,90]');
+      return okEst(0.2);
+    }
+    case 'teleport': {                                   // DEV: EITHER {x,y,z} (active-facet lattice) OR {lat_deg,lon_deg,alt}
+      const hasGeo = st.lat_deg !== undefined || st.lon_deg !== undefined;
+      const hasXyz = st.x !== undefined || st.y !== undefined || st.z !== undefined;
+      if (hasGeo && hasXyz) return rej('caps', 'teleport: give EITHER {x,y,z} OR {lat_deg,lon_deg,alt}, not both');
+      if (hasGeo) {
+        if (typeof st.lat_deg !== 'number' || !isFinite(st.lat_deg) || st.lat_deg < -90 || st.lat_deg > 90) return rej('caps', 'teleport.lat_deg must be in [-90,90]');
+        if (typeof st.lon_deg !== 'number' || !isFinite(st.lon_deg) || st.lon_deg < -180 || st.lon_deg > 180) return rej('caps', 'teleport.lon_deg must be in [-180,180]');
+        if (typeof st.alt !== 'number' || !isFinite(st.alt) || st.alt < TELEPORT_ALT_MIN || st.alt > TELEPORT_ALT_MAX) return rej('caps', `teleport.alt must be in [${TELEPORT_ALT_MIN},${TELEPORT_ALT_MAX}]`);
+      } else if (hasXyz) {
+        for (const k of ['x', 'y', 'z']) if (typeof st[k] !== 'number' || !isFinite(st[k]) || Math.abs(st[k]) > TELEPORT_XYZ_MAX) return rej('caps', `teleport.${k} must be finite, |.| <= ${TELEPORT_XYZ_MAX}`);
+      } else return rej('caps', 'teleport needs {x,y,z} or {lat_deg,lon_deg,alt}');
+      return okEst(0.5);
+    }
+    case 'set_alt': {                                    // DEV: teleport to `alt` above the current sub-player surface
+      if (typeof st.alt !== 'number' || !isFinite(st.alt) || st.alt < TELEPORT_ALT_MIN || st.alt > TELEPORT_ALT_MAX) return rej('caps', `set_alt.alt must be in [${TELEPORT_ALT_MIN},${TELEPORT_ALT_MAX}]`);
+      return okEst(0.5);
+    }
+    case 'freeze_time': {                                // DEV: hold/resume the celestial clock
+      if (typeof st.on !== 'boolean') return rej('caps', 'freeze_time.on must be a bool');
+      return okEst(0.2);
+    }
+    case 'freeze_player': {                              // DEV: pin/release the player for a stationary capture
+      if (typeof st.on !== 'boolean') return rej('caps', 'freeze_player.on must be a bool');
+      return okEst(0.2);
     }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');

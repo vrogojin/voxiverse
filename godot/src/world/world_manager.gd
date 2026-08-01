@@ -69,7 +69,13 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
+var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
+var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
+var _block_lod_orbit: FacetBlockLodOrbit = null     # COSMOS PLANET-LOD-CONFIG P0: crisp orbit megablock disc; null unless FP_BLOCK_LOD_ORBIT
+var _orbit_skin_retired := false                    # latch: §2V skin currently suppressed on the far ring (orbit engaged)
 var _tex_slots_epoch := -1            # COSMOS LOD-TEXTURE Phase 4: last close-up slot epoch pushed to the ring (−1 = never)
+var _tex_band_epoch := -1             # COSMOS TEXTURED-LOD U1: last band slot epoch pushed to the ring (−1 = never)
 var _lod_excl_accum := 0.0            # FP-M2b: throttle the far-ring/LOD exclusion resync (covered set grows as builds apply)
 # FP-M2c (docs/COSMOS-FP-M2-DESIGN.md §6.5): the closed-loop load-adaptive admission controller. OWNED here, wired
 # to the LIVE measured-load source, forwarded to module_world (→ FacetLodMesher grants/apply + the pool ramp pace),
@@ -107,6 +113,13 @@ var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate
 var _alt_orbital := false
 var _alt_reentry_pending := false
 var _alt_redesignate_count := 0
+# COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3): the ground-anchored-viewer state. `_anchor_released` is the
+# hysteretic release latch (true past ANCHOR_REL_HI, false again below ANCHOR_REL_LO/ANCHOR_HYST) — it selects the
+# ramp's lower knee so ascent releases at REL_LO while descent re-grows to full only below REL_LO/HYST (no flap).
+# `_anchor_last_write_ms` debounces the two viewer writes (offset + view_distance) to ≥ ANCHOR_WRITE_DEBOUNCE_MS. All
+# inert (never read; no writes issued) with FP_APPROACH_ANCHOR off ⇒ byte-identical.
+var _anchor_released := false
+var _anchor_last_write_ms := -100000
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -161,6 +174,11 @@ var _weather: WeatherSystem
 # is built on the main thread, the sweep is handed to this worker (EnvSimWorker) so the per-frame main-thread
 # cost collapses to a swap check. Stopped/joined in _exit_tree (no dangling thread on scene exit).
 var _weather_worker: EnvSimWorker = null
+# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): the ONE priority job lane every future offload dispatches
+# COMPUTE through (onto the existing WorkerThreadPool, no new thread) and gets a bounded main-thread commit back.
+# Constructed + pumped ONLY under the flag; null ⇒ the shipped main-thread path, byte-identical. TH0 routes
+# NOTHING through it yet — it is the infrastructure TH1+ build on. `main_commit_ms` telemetry reads its drain time.
+var _job_lane: JobLane = null
 var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
@@ -234,7 +252,23 @@ const _FLOOR_MEMO_NONE := -0x40000000 # sentinel: no memo for this column (never
 # with a missing cell is never queried).
 var _joint_mods: Dictionary = {}      # Vector4i -> int reinforcement id
 
+# BOOT-LOAD PROFILE (perf/voxiverse-load-profile): running timestamp for the world_build SUB-phase timing below, so a
+# fresh load breaks the ~114s world_build into wb_module_setup (the ~23s manifest bake) / wb_setup_mid / wb_farring (the
+# ~90s far-ring cache) / wb_rest. Pure Time.get_ticks_msec() deltas + one print/console.log each — no per-frame cost.
+var _wb_last := 0
+
+## BOOT-LOAD PROFILE: emit one world_build sub-phase duration (ms since the previous wb mark). Same [BOOT] format as
+## main.gd's boot phases so they interleave in the console. Called a handful of times inside _ready only.
+func _wb_mark(phase: String) -> void:
+	var now := Time.get_ticks_msec()
+	var dt := now - _wb_last
+	_wb_last = now
+	print("[BOOT] %s %d ms" % [phase, dt])
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("console.log('[BOOT] %s %d ms');" % [phase, dt], true)
+
 func _ready() -> void:
+	_wb_last = Time.get_ticks_msec()
 	environment = PerVoxelEnvironment.new()
 	materials = MaterialRegistry.build_default()
 	SurfaceModel.ensure_ready()
@@ -263,6 +297,9 @@ func _ready() -> void:
 		_setup_module_path()
 	if not using_module:
 		_setup_fallback_path()
+	# BOOT-LOAD PROFILE: the render-path setup — on the module path this is where module_world.setup()'s ~23s appearance-
+	# manifest bake lands (its own "setup timing: … manifest=…ms" print is a sub-total of this).
+	_wb_mark("wb_module_setup")
 
 	# COSMOS FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §2/§7 P1): install the play-frame bridge. When the
 	# flag is on, ActiveFrame is a Node3D @ IDENTITY (Phase 1) that hosts the player, GroundCollider and loose
@@ -297,6 +334,14 @@ func _ready() -> void:
 	_snowfall = SnowfallSystem.new()
 	_snowfall.setup(self)
 
+	# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): construct the priority job lane (SnowfallSystem-style —
+	# ONLY under the flag, so off ⇒ the class is not even instantiated ⇒ zero bytes / zero CPU, byte-identical).
+	# It dispatches onto the EXISTING WorkerThreadPool (≤2 slots, no new thread) and is pumped each frame from
+	# _process. TH0 routes NOTHING through it yet; it is the foundation TH1+ (tex bake / far-ring warm / manifest)
+	# hand their compute to. `main_commit_ms` telemetry reads its bounded main-thread drain time.
+	if CubeSphere.FP_JOB_LANE:
+		_job_lane = JobLane.new()
+
 	# COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1.5): the ONE coarse prognostic weather grid.
 	# Owned + stepped here exactly like SnowfallSystem (SnowfallSystem-style: constructed ONLY under the flag,
 	# so all flags off ⇒ the class isn't even instantiated ⇒ zero bytes / zero CPU). PerVoxelEnvironment READS
@@ -317,11 +362,59 @@ func _ready() -> void:
 	# Gated on the single ENABLED const: false → no node, today's behaviour bit-for-bit.
 	# COSMOS FACETED (§5.2): replace FarTerrain (the flat/curved global-index heightmap — a giant misplaced
 	# sheet under a single facet) with the facet far ring: the whole planet rendered around the active facet.
+	# BOOT-LOAD PROFILE: the collider/snow/weather setup between the manifest and the far ring.
+	_wb_mark("wb_setup_mid")
 	if CubeSphere.FACETED and FacetFarRing.ENABLED:
 		_facet_ring = FacetFarRing.new()
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4): the L1 (2-block-pitch) megablock rim ring — real
+		# greedy-meshed blocky relief OVER the far skin, engaging at the near rim (~128) out to the ridge-1 band
+		# (~700). Sibling of the far ring, gated on FP_BLOCK_LOD (default OFF → node never created → byte-identical).
+		# Placed each frame from the far ring's own transform (one frame) + fed the same Sun; rebuilt on crossings.
+		if CubeSphere.FP_BLOCK_LOD:
+			_block_lod = FacetBlockLodRing.new()
+			_block_lod.name = "FacetBlockLodRing"
+			add_child(_block_lod)
+			# TH4: hand it the TH0 job lane BEFORE setup so the ~1 s L0 bake runs on a worker (no crossing/boot stall);
+			# main pays only the ArrayMesh commit, drained by the _job_lane.pump() already in _process. With FP_JOB_LANE
+			# off (no lane) the ring falls back to a synchronous inline build (correct, but the P1 stall — pair the flags).
+			_block_lod.set_job_lane(_job_lane)
+			_block_lod.setup(TerrainConfig.active_facet())
+			_block_lod.place(_facet_ring.transform)
+			# COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5): the L2..L4 streamed ladder + the L5 GLOBAL
+			# always-resident tier — blocky relief to the horizon with a power-of-2 fall-off. Both gated + default OFF ⇒
+			# byte-identical. The ladder governs the SHARED NEVER-OOM ceiling (P1 L1 + L2..L4 + global mesh coarsened
+			# finest-first) — it is registered the L1 ring + the global tier so one ledger binds them all.
+			if CubeSphere.FP_BLOCK_LOD_GLOBAL:
+				_block_lod_global = FacetBlockLodGlobal.new()
+				_block_lod_global.name = "FacetBlockLodGlobal"
+				add_child(_block_lod_global)
+				_block_lod_global.set_job_lane(_job_lane)
+				_block_lod_global.setup(TerrainConfig.active_facet())
+				_block_lod_global.place(_facet_ring.transform)
+			if CubeSphere.FP_BLOCK_LOD_RINGS:
+				_block_lod_ladder = FacetBlockLodLadder.new()
+				_block_lod_ladder.name = "FacetBlockLodLadder"
+				add_child(_block_lod_ladder)
+				_block_lod_ladder.set_job_lane(_job_lane)
+				_block_lod_ladder.register_l1(_block_lod)
+				if _block_lod_global != null:
+					_block_lod_ladder.set_global(_block_lod_global)
+				_block_lod_ladder.setup(TerrainConfig.active_facet())
+				_block_lod_ladder.place(_facet_ring.transform)
+			# COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): the crisp orbit megablock
+			# disc — above the swap altitude it meshes the whole visible disc as an L4-nadir→L5-limb distance ladder
+			# and retires the smooth §2V skin. Gated + default OFF ⇒ byte-identical (node never created). Placed each
+			# frame from the far ring's transform (rides the SN3 scaled-body clamp); driven by the camera in _process.
+			if CubeSphere.FP_BLOCK_LOD_ORBIT:
+				_block_lod_orbit = FacetBlockLodOrbit.new()
+				_block_lod_orbit.name = "FacetBlockLodOrbit"
+				add_child(_block_lod_orbit)
+				_block_lod_orbit.set_job_lane(_job_lane)
+				_block_lod_orbit.setup(TerrainConfig.active_facet())
+				_block_lod_orbit.place(_facet_ring.transform)
 		# COSMOS SEAMLESS-SCALES C3: the heightfield skin tier fills the 96..256 annulus between the near
 		# voxels and the far-ring backstop. Gated on FP_SKIN_TIER (default OFF → node never created →
 		# byte-identical). Peer node placed like the far ring; driven from update_streaming/crossing/reanchor.
@@ -344,12 +437,26 @@ func _ready() -> void:
 		if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
 			_facet_tex = FacetTexBaker.new()
 			_facet_tex.setup(TerrainConfig.active_facet())
+			# COSMOS MAIN-THREAD ORCHESTRATION TH1 (FP_TEX_BAKE_WORKER): hand the baker the TH0 job lane so its
+			# per-frame bake COMPUTE dispatches to the WorkerThreadPool worker (main pays only the update_layer).
+			# No-op unless FP_TEX_BAKE_WORKER && the lane exists (FP_JOB_LANE) — the prewarm below stays on main.
+			_facet_tex.set_job_lane(_job_lane)
 			_facet_tex.prewarm(_facet_ring.visible_fids())
 			_facet_ring.set_facet_tex(_facet_tex.base_texture())
 			# COSMOS LOD-TEXTURE Phase 4: bind the (all-transparent-at-setup) close-up array now so the shader's
 			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
 			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
 			_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
+			# COSMOS TEXTURED-LOD T1b (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2R): bind the shared block-face detail atlas
+			# (built ONCE, pure) + the baker's per-texel id map so the far terrain wears the real block faces. No-op off
+			# FP_BLOCK_DETAIL (set_facet_detail is flag-guarded; the atlas/id pages are never built by the baker either).
+			if CubeSphere.FP_BLOCK_DETAIL:
+				_facet_ring.set_facet_detail(FacetDetailAtlas.build(), _facet_tex.id_texture())
+				# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
+				# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
+				# then. No-op off FP_BAND_BLOCK_MAP (set_facet_band + band_texture are flag-guarded).
+				if CubeSphere.FP_BAND_BLOCK_MAP:
+					_facet_ring.set_facet_band(_facet_tex.band_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -362,9 +469,14 @@ func _ready() -> void:
 			_far.position = _chart.node_origin()      # COSMOS-FRAME-ORIENTATION §5.3: −M_win⁻¹·org (=−org at spawn)
 			_far.set_chart(_chart)                     # COSMOS R1 (M5_REAL): the far bakes/aligns against the chart
 
+	# BOOT-LOAD PROFILE: the far-ring setup — under FACETED this is FacetFarRing.setup()'s initial cache (the ~90s in the
+	# shipped synchronous build; a bounded seed under FP_BOOT_ASYNC, the rest streamed across frames).
+	_wb_mark("wb_farring")
+
 	path_selected.emit(using_module)
 	print("[WorldManager] rendering path: ",
 		"godot_voxel module" if using_module else "GDScript fallback")
+	_wb_mark("wb_rest")
 
 	# COSMOS R1 DEV: hide the NEAR chunk render so the baked far layer can be inspected alone (render-only —
 	# analytic physics + GroundCollider are untouched, so movement/collision are unchanged). Curved + dev only.
@@ -382,6 +494,12 @@ func _ready() -> void:
 ## main.gd calls this once after building the clock; null-safe (the grid falls back to its default dt).
 func set_cosmos_clock(clock: CosmosEphemeris.CosmosClock) -> void:
 	_cosmos_clock = clock
+
+## The celestial clock (or null when no ORBITAL_SKY/climate clock was injected). Read-only accessor so the
+## dev remote `set_time` cheat (player.remote_set_time, CONTROL_ENABLED-gated) can fold a time offset into
+## the ONE clock the whole ephemeris/sky reads. Null off ORBITAL_SKY ⇒ the cheat is a no-op.
+func cosmos_clock() -> CosmosEphemeris.CosmosClock:
+	return _cosmos_clock
 
 ## COSMOS-PERF FALL-COLLAPSE FIX C (FP_SNOW_SKIP_AIRBORNE): true when the player is a HIGH FLYER (lattice altitude
 ## above the active-facet plane > OFFSURFACE_Y — the same cheap y-test the pool off-surface freeze uses) and the
@@ -477,6 +595,110 @@ func _update_alt_regime(player_pos: Vector3) -> void:
 		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST:
 			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
 
+## COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3.1/§3.2) — the ground-anchored viewer + τ-timed release,
+## driven once per streaming tick from update_streaming. `h` is the SAME analytic altitude the regime ladder uses
+## (_radial_altitude_lattice → radius − R_BLOCKS; NEVER the voxel buffer — collision/floor queries are untouched).
+## (a) ANCHOR: offset_y = clamp(O_base − h, −h + ANCHOR_MARGIN, O_base) pins the viewer's WORLD radial altitude to
+## O_base (the sub-player ground) for every h, so the meshed plate stays inside the unchanged ellipsoid on climb.
+## (b) RELEASE: the camera-to-plate distance ≈ h (plate anchored directly below); ramp view_distance down across
+## [ANCHOR_REL_LO, ANCHOR_REL_HI] so the plate recedes rim-inward (every unloading block ≤ τ px). The hysteresis
+## latch `_anchor_released` picks the ramp's lower knee: ANCHOR_REL_LO while resident (ascent releases at ~700),
+## ANCHOR_REL_LO/ANCHOR_HYST once released (descent re-grows to full only below ~609) — no flap around the knee.
+## Both writes are debounced to ≥ ANCHOR_WRITE_DEBOUNCE_MS (anti re-mesh churn; the FP-M1c staged-view precedent).
+## No-op / byte-identical with the flag off, off FACETED, on the fallback path, or before the viewer attaches.
+func _update_approach_anchor(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_APPROACH_ANCHOR or not CubeSphere.FACETED:
+		return
+	if not using_module or _module_world == null or not _module_world.has_method("set_approach_anchor"):
+		return
+	var now_ms := Time.get_ticks_msec()
+	if now_ms - _anchor_last_write_ms < CubeSphere.ANCHOR_WRITE_DEBOUNCE_MS:
+		return                                 # debounce: at most one offset/view write per ANCHOR_WRITE_DEBOUNCE_MS
+	_anchor_last_write_ms = now_ms
+	_apply_approach_anchor(player_pos)
+
+## The compute+apply core shared by the debounced driver and the verify hook (approach_anchor_step_now). Advances the
+## release-latch hysteresis, computes the anchor offset + release view_distance from the analytic altitude, and pushes
+## both to the single player VoxelViewer. Pure w.r.t. gameplay — it only mutates the viewer node (render/streaming).
+func _apply_approach_anchor(player_pos: Vector3) -> void:
+	var h := _radial_altitude_lattice(player_pos)   # the regime-ladder altitude (analytic; never the voxel buffer)
+	var o_base := TerrainConfig.clamped_viewer_offset_y()
+	var offset_y := CubeSphere.approach_offset_y(h, o_base)
+	# Advance the hysteresis latch (Schmitt on the FULL-resident knee), then pick the ramp's lower knee from it.
+	var d := maxf(h, 0.0)                            # camera-to-plate distance ≈ altitude above the anchored ground
+	if d >= CubeSphere.ANCHOR_REL_HI:
+		_anchor_released = true
+	elif d <= CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST:
+		_anchor_released = false
+	var lo := (CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST) if _anchor_released else CubeSphere.ANCHOR_REL_LO
+	var full := float(TerrainConfig.near_render_radius())
+	var view_f := CubeSphere.approach_view_distance(d, full, lo)
+	var near_vd := int(round(view_f))
+	_module_world.call("set_approach_anchor", offset_y, near_vd)
+	# COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (SEAMLESS-SCALES §4): drive the L1 megablock ring's EFFECTIVE
+	# engagement rim from the SAME near view_distance just written to the viewer, so as S1 shrinks the near field below
+	# the static 128 the L1 hand-off tracks it inward (near-voxels → L1, never a far-skin/L2 annulus). Only when
+	# FP_BLOCK_LOD built the ring (this whole method already runs only under FP_APPROACH_ANCHOR) ⇒ the coupling is active
+	# iff BOTH flags are on; with either off the ring keeps its static 128 (byte-identical). Inherits S1's debounce +
+	# monotone ramp (same call site) — no re-mesh churn (the ring meshes whole facets; this is a bookkeeping value).
+	if CubeSphere.FP_BLOCK_LOD and _block_lod != null:
+		_block_lod.set_effective_rim(CubeSphere.block_lod_effective_rim(near_vd))
+
+## FP_APPROACH_ANCHOR verify hook (verify_approach_anchor.gd — no live caller): run one compute+apply immediately,
+## bypassing the wall-clock debounce (headless ticks are sub-ms apart). Gated exactly like the driver so an OFF build
+## is a no-op. Mirrors the module's pool_ramp_tick test-hook pattern.
+func approach_anchor_step_now(player_pos: Vector3) -> void:
+	if not CubeSphere.FP_APPROACH_ANCHOR or not CubeSphere.FACETED:
+		return
+	if not using_module or _module_world == null or not _module_world.has_method("set_approach_anchor"):
+		return
+	_apply_approach_anchor(player_pos)
+
+## COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle) — the dev teleport / fast-travel RE-ANCHOR. A dev
+## _dev_reposition sets the active facet + player pose, but the near field (the godot_voxel VoxelViewer's terrain)
+## is a POOL keyed to a facet: on a jump to a FRESH FAR facet nothing re-designates the near pool onto it, so the
+## meshed near bubble stays stranded on the OLD facet (the live "player in space, draws≈43, near field elsewhere"
+## symptom) and never streams in at the new spot. This drives the SAME committed redesignation a seam crossing uses
+## — but for a DIRECT jump (slot −1, like the R3 re-entry restore) — so the near pool + far ring + block-LOD + the
+## ActiveFrame all re-derive onto the new sub-player facet NOW, then re-applies the S1 approach anchor immediately
+## (bypassing the wall-clock debounce) so the viewer offset/view are correct at the new spot this frame. The
+## returned reframe dict is intentionally DISCARDED — the teleport already committed the player's pose. No-op /
+## byte-identical off FACETED (FLAT viewers are children of the player and already follow horizontally).
+func dev_reanchor_near(player_pos: Vector3) -> void:
+	if not CubeSphere.FACETED:
+		return
+	var to := TerrainConfig.active_facet()
+	if to < 0:
+		return
+	# The facet the near pool CURRENTLY holds (module truth — independent of TerrainConfig timing). If it already
+	# matches the target the near field is on the right facet (a same-facet teleport) and only streaming re-centres.
+	if using_module and _module_world != null and _module_world.has_method("pool_active"):
+		var from := int(_module_world.call("pool_active"))
+		if from >= 0 and from != to:
+			# Reuse the committed-crossing bookkeeping for the redesignation (pool redesignate/spawn/reset, far-ring +
+			# skin + block-LOD re-place, ActiveFrame flip, gravity/collider resync). slot −1 = a direct jump (no seam).
+			# np is unused by the caller path here (we discard the return), so pass the current pose.
+			_commit_facet_change(from, to, [player_pos.x, player_pos.y, player_pos.z], -1)
+	# Re-derive the S1 ground-anchored viewer offset + release view_distance at the NEW altitude immediately (the
+	# per-tick driver is wall-clock debounced; this hook bypasses it, exactly like verify_approach_anchor).
+	approach_anchor_step_now(player_pos)
+
+## COSMOS STREAM-SETTLE: is the near field MESHED in a tight column under the player yet (the settle-release probe)?
+## Routes to the module's is_area_meshed column check; false on the fallback / no-module path (settle then rides its
+## hard cap instead of hanging). `player_pos` is accepted for signature symmetry — the module probes the viewer point.
+func near_column_meshed(_player_pos: Vector3) -> bool:
+	if not (using_module and _module_world != null and _module_world.has_method("player_column_meshed")):
+		return false
+	return bool(_module_world.call("player_column_meshed"))
+
+## COSMOS STREAM-SETTLE: can the near-coverage probe actually answer here (FACETED + godot_voxel module with the
+## column probe)? The dev teleport only ENGAGES the hover-until-meshed settle when this is true; on the FLAT /
+## fallback path it keeps the shipped immediate ground clamp (byte-identical), so a no-module dev teleport never
+## hangs on a probe that can never pass.
+func near_coverage_available() -> bool:
+	return CubeSphere.FACETED and using_module and _module_world != null \
+		and _module_world.has_method("player_column_meshed")
+
 ## Step the dormant-by-default snowfall sim on the MAIN thread once the player position is known. It is a
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
@@ -507,6 +729,11 @@ func _process(delta: float) -> void:
 		else:
 			_weather.process(delta, gt)
 		_weather_us_max = maxi(_weather_us_max, Time.get_ticks_usec() - t_w)
+	# COSMOS MAIN-THREAD ORCHESTRATION TH0 (FP_JOB_LANE): pump the job lane once per frame — reap finished workers,
+	# pay the bounded main-thread commit (its own drain-time telemetry), refill worker slots highest-priority-first.
+	# TH0 nothing is enqueued, so this is a no-op walk of empty queues; the flag-off path skips it entirely (null).
+	if _job_lane != null:
+		_job_lane.pump()
 	# COSMOS FP-FIXED-FRAME §10 decision 2: keep the per-facet gravity volume set matching the live pool as neighbours
 	# spawn/retire between crossings (a fresh neighbour has no gravity box for ≤ this throttle window → a body over it
 	# falls along the active facet's up, ≤3.7° off, until synced). Cheap: _sync_gravity_areas no-ops when the set is
@@ -868,18 +1095,40 @@ func update_streaming(player_pos: Vector3) -> void:
 	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
 	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.
 	_update_alt_regime(player_pos)
+	# COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR): keep the meshed near plate anchored to the sub-player ground
+	# during a climb and release it rim-inward only once its blocks are sub-τ on screen. Debounced viewer offset +
+	# view_distance writes; no-op / byte-identical with the flag off. Runs after the alt regime so the freezes above
+	# ATMO_TOP stay authoritative (the released plate is empty up there anyway).
+	_update_approach_anchor(player_pos)
 	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
+	# COSMOS SEAMLESS-SCALES C3 / TEXTURED-LOD U2: the near-coverage Callable — is a fid-lattice AABB fully meshed in the
+	# near voxel field? Routed to module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the
+	# fallback / no-module path leaves BOTH consumers (the skin's covered-tile skip AND the far-ring covered-cell cull)
+	# inert → byte-identical. Computed once here and shared by the skin and the far ring.
+	var cover_query := Callable()
+	if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
+		cover_query = Callable(_module_world, "skin_near_meshed")
 	if _skin != null:
-		# COSMOS SEAMLESS-SCALES C3 (skin overdraw fix): hand the skin a coverage Callable so it can drop
-		# tiles that sit wholly behind the CONFIRMED-meshed near voxels (pure fill overdraw). Routed to
-		# module_world.skin_near_meshed (godot_voxel is_area_meshed); an invalid Callable on the fallback /
-		# no-module path leaves the skin's skip inert (byte-identical, renders every in-range tile).
-		var cover_query := Callable()
-		if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
-			cover_query = Callable(_module_world, "skin_near_meshed")
+		# hand the skin the coverage query so it can drop tiles wholly behind confirmed-meshed near voxels (fill overdraw).
 		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): hand the far ring the SAME coverage query so it stops emitting
+	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
+	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
+		_facet_ring.set_cover_query(cover_query)
+	# COSMOS BLOCK-LOD P1: keep the L1 rim ring in the far ring's frame (its mesh is absolute planet coords, placed by
+	# the SAME node transform so L1 and the far skin overlap exactly). No-op / byte-identical unless FP_BLOCK_LOD.
+	if _block_lod != null and _facet_ring != null:
+		_block_lod.place(_facet_ring.transform)
+	# COSMOS BLOCK-LOD P2: keep the L2..L4 ladder + the L5 global tier in the SAME far-ring frame (absolute meshes).
+	if _block_lod_ladder != null and _facet_ring != null:
+		_block_lod_ladder.place(_facet_ring.transform)
+	if _block_lod_global != null and _facet_ring != null:
+		_block_lod_global.place(_facet_ring.transform)
+	# COSMOS PLANET-LOD-CONFIG P0: keep the orbit megablock disc in the SAME far-ring frame (rides the SN3 clamp).
+	if _block_lod_orbit != null and _facet_ring != null:
+		_block_lod_orbit.place(_facet_ring.transform)
 	# COSMOS LOD-TEXTURE Phase 2+4 (docs/COSMOS-LOD-TEXTURE-DESIGN.md §6): drive the far-texture baker under the strict
 	# per-frame budget — progressive BASE coverage beyond the spawn hemisphere (nearest the emit axis first) + the
 	# CLOSE-UP tier promotion/bake when off-surface. All bake work is budget-sliced on the main thread (never a stall,
@@ -889,12 +1138,23 @@ func update_streaming(player_pos: Vector3) -> void:
 	if _facet_tex != null and _facet_ring != null:
 		var eaxis := _facet_ring.shell_emit_axis()
 		var offs: bool = _facet_ring.shell_offsurface()
-		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS)
+		# COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the camera's scale-correct distance from the body centre so the baker's
+		# screen-space MONOTONE promotion law can size each facet's on-screen blocks (no regime evict-all on descent). 0 until
+		# the camera-set driver has armed ⇒ the baker's SSE law falls back to the shipped regime path (byte-identical off).
+		var cam_dist: float = _facet_ring.shell_cam_dist() if _facet_ring.has_method("shell_cam_dist") else -1.0
+		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
+		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist)
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:
 			_tex_slots_epoch = _facet_tex.slots_epoch()
 			if _facet_tex.closeup_texture() != null:
 				_facet_ring.set_facet_closeup_tex(_facet_tex.closeup_texture())
 			_facet_ring.set_closeup_slots(_facet_tex.closeup_slots(), _facet_tex.closeup_facet_map())
+		# COSMOS TEXTURED-LOD U1: push the band slot map + reverse-maps when the baker's band epoch bumps (a facet baked
+		# resident or evicted on a crossing) so UV2.y carries the new 64+ slots and the shader's band_facet/band_n update.
+		if _facet_tex.band_epoch() != _tex_band_epoch:
+			_tex_band_epoch = _facet_tex.band_epoch()
+			_facet_ring.set_band_slots(_facet_tex.band_slots(), _facet_tex.band_facet_map(), _facet_tex.band_n_map())
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
@@ -928,8 +1188,33 @@ func update_streaming(player_pos: Vector3) -> void:
 ## so no extra hold is needed). Half-extents cover the near, always-first-to-mesh view.
 func initial_view_meshed(center: Vector3) -> bool:
 	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
-		return bool(_module_world.call("area_meshed", center, Vector3(40.0, 32.0, 40.0)))
+		# FP_LOAD_RAMP (perf/voxiverse-load-profile): with the initial view ramping in, hold the splash until a
+		# MODEST surround is meshed rather than a bare 40-block bubble — so "playable" means actually-surrounded.
+		# Round 4: 64³ (not 96³) — the 96³ box could not mesh inside the cap on web (the hold always hit the cap),
+		# so reveal a little earlier and let the ring keep filling; the ShaderPrewarm [floor, cap] window still bounds
+		# the wait (never hangs). Off ⇒ the shipped 40³ box (byte-identical).
+		var half := Vector3(64.0, 32.0, 64.0) if CubeSphere.FP_LOAD_RAMP else Vector3(40.0, 32.0, 40.0)
+		return bool(_module_world.call("area_meshed", center, half))
 	return true                                     # fallback path / no module → no terrain-format hold
+
+## BOOT-LOAD PROFILE (perf/voxiverse-load-profile): read-only "is this arbitrary box meshed?" accessor used by
+## main.gd's post-splash "world_settled" timer to measure how long the bulk near view (much larger than the tiny
+## 40-box the ShaderPrewarm hold waits on) takes to stream in after the splash lifts. Same is_area_meshed query as
+## initial_view_meshed, just with a caller-chosen half-extent. Telemetry-only; no gameplay read path; fallback/no
+## module → true (nothing to wait on). Never called per-frame in a hot loop (main throttles it to ~2 Hz).
+func view_meshed(center: Vector3, half: Vector3) -> bool:
+	if using_module and _module_world != null and _module_world.has_method("area_meshed"):
+		return bool(_module_world.call("area_meshed", center, half))
+	return true
+
+## FP_BOOT_ASYNC (round 4): let the deferred far-ring background warm proceed — called by main.gd at essential-ready so
+## the warm runs WHILE the player plays instead of starving the shader-prewarm compile frames. No-op off the flag / no
+## ring. Also kicks the deferred manifest bake (FP_MANIFEST_SLICE) so the cold-biome models bake off the boot path.
+func begin_deferred_boot_work() -> void:
+	if _facet_ring != null and _facet_ring.has_method("open_boot_gate"):
+		_facet_ring.open_boot_gate()
+	if _module_world != null and _module_world.has_method("begin_deferred_manifest_bake"):
+		_module_world.call("begin_deferred_manifest_bake")
 
 # --- terrain editing (block breaking + placing) --------------------------------
 
@@ -2146,6 +2431,41 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 			return _commit_facet_change(fid, to, np, slot)
 	return {}
 
+## COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC) — the GENERAL descent facet resync. A fast/high flight over a FAR
+## region drifts the true sub-camera facet many facets away from the active facet while adjacent crossings are cooldown/
+## containment-deferred and the high-flyer pool freeze (_pool_off_surface) deliberately suppresses re-designation — so the
+## active facet LAGS. On a genuine (non-flying) descent the floor MUST be the real surface, but floor_under / surface_y
+## evaluate the player's column against the STALE facet's piecewise-FLAT datum plane — extended far past its ridge domain
+## that flat plane sinks hundreds of blocks below the sphere (the live surface_y ≈ −28 at a far spot with trees). This
+## redesignates the active facet DIRECTLY onto the true facet_of_dir owner (the _alt_reentry_restore path — one O(1)
+## _commit_facet_change, position/velocity-continuous via the returned reframe + the _heal_frame_desync invariant), so
+## floor_under / surface_y read the owner's REAL surface. Guard: NON-ADJACENT owner only — an adjacent flip is the domain
+## of maybe_cross_facet's −HYST/cooldown/containment hysteresis (never fought → normal walking is byte-identical). Returns
+## the crossing dict (Player.apply_reframe consumes it) or {} (no resync). Off-flag / not-faceted ⇒ the guard returns {}.
+func resync_subcamera_facet(player_pos: Vector3) -> Dictionary:
+	if not (CubeSphere.FACETED and CubeSphere.FP_DESCENT_FACET_RESYNC):
+		return {}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return {}
+	# The player's active-lattice position → planet-absolute direction → the TRUE sub-camera facet (the exact
+	# high-flyer-drift computation _pool_off_surface already trusts). The lattice↔world map is frame-consistent by
+	# the crossing invariant, so this is the real owner no matter how stale the active facet has become.
+	var w := FacetAtlas.lattice_to_world64(fid, player_pos.x, player_pos.y, player_pos.z)
+	var to := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	if to < 0 or to == fid:
+		return {}
+	# ADJACENT owner ⇒ defer to maybe_cross_facet (its hysteresis owns seam crossings so a −0.1 ridge-jitter flip can
+	# never double-fire). Only a NON-ADJACENT owner (drifted ≥ 2 facets — unreachable by the adjacent-only seam march,
+	# so unambiguously a stale-facet desync, never a normal walk step) is resynced here.
+	for slot in 4:
+		if FacetAtlas.seam_neighbour(fid, slot) == to:
+			return {}
+	var np: Array = FacetAtlas.reframe_position64(fid, to, player_pos.x, player_pos.y, player_pos.z)
+	_alt_redesignate_count += 1
+	print("[WorldManager] descent facet resync: redesignate %d -> %d (sub-camera facet, non-adjacent desync)" % [fid, to])
+	return _commit_facet_change(fid, to, np, -1)
+
 ## COSMOS FP-FIXED-FRAME §2.2 / FP-M1c — the committed facet-change bookkeeping, shared by a normal seam crossing
 ## (maybe_cross_facet) and the R3 re-entry restore (_alt_reentry_restore). `to` is the destination facet, `np` the
 ## f64 reframed player landing (FacetAtlas.reframe_position64), `slot` the crossed seam slot (-1 for a re-entry
@@ -2198,6 +2518,14 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_facet_ring_sync_exclusion()
 		if _skin != null:
 			_skin.call("set_active", to)
+		if _block_lod != null:
+			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
+		if _block_lod_ladder != null:
+			_block_lod_ladder.rebuild(to)    # COSMOS BLOCK-LOD P2: re-assign + re-stream the L2..L4 ladder on crossing
+		if _block_lod_global != null:
+			_block_lod_global.rebuild(to)    # COSMOS BLOCK-LOD P2: re-mesh the near L5 cap around the new active facet
+		if _block_lod_orbit != null:
+			_block_lod_orbit.rebuild(to)     # COSMOS PLANET-LOD-CONFIG P0: re-centre the orbit disc on the new active facet
 		_far_us = Time.get_ticks_usec() - _far_t0
 	else:
 		# flag-OFF path only: the FP-S1 set_facet teardown (restream via the M4 cover). Byte-identical to today
@@ -2209,6 +2537,14 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 			_facet_ring.set_active(to)
 		if _skin != null:
 			_skin.call("set_active", to)
+		if _block_lod != null:
+			_block_lod.rebuild(to)           # COSMOS BLOCK-LOD P1: re-stream the L1 band (active ∪ ridge-1) on crossing
+		if _block_lod_ladder != null:
+			_block_lod_ladder.rebuild(to)    # COSMOS BLOCK-LOD P2: re-assign + re-stream the L2..L4 ladder on crossing
+		if _block_lod_global != null:
+			_block_lod_global.rebuild(to)    # COSMOS BLOCK-LOD P2: re-mesh the near L5 cap around the new active facet
+		if _block_lod_orbit != null:
+			_block_lod_orbit.rebuild(to)     # COSMOS PLANET-LOD-CONFIG P0: re-centre the orbit disc on the new active facet
 		_flip_settling = true
 		_restream()
 	# COSMOS FP-FIXED-FRAME §2.2 steps 4–8 (Phase 2 keystone) — the crossing is now pure O(1) bookkeeping.
@@ -2624,6 +2960,35 @@ func apply_scaled_body(cam: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.apply_scaled_placement(cam)
 
+## COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): drive the crisp orbit megablock disc from
+## this frame's camera. Recovers the ABSOLUTE sub-camera direction + distance-from-centre the SAME way the far ring's
+## apply_camera_set does (the mesh is absolute planet coords under _placement_xform; the SN3 scale is screen-invariant
+## so it never enters the direction/distance), feeds them to the orbit tier (engage/re-assign with hysteresis), then
+## RETIRES the §2V skin on the far ring while the tier is engaged (swap, not overlay — frees the base map + kills the
+## on-the-fly bake). No orbit node (flag off) ⇒ no-op ⇒ byte-identical. Called per frame by main._process under the flag.
+func update_block_lod_orbit(cam: Vector3) -> void:
+	if _block_lod_orbit == null or _facet_ring == null:
+		return
+	var base := _facet_ring.render_centre()          # the body centre in the RENDER frame (= _placement_xform().origin)
+	var rel := cam - base                             # camera relative to the body centre, render frame
+	var d := rel.length()
+	var abs_rel := _facet_ring.transform.basis.inverse() * rel   # rotate the offset back into ABSOLUTE mesh space
+	var u := abs_rel.normalized() if abs_rel.length() > 1.0e-6 else Vector3(0.0, 1.0, 0.0)
+	var engaged: bool = _block_lod_orbit.set_camera(u, d)
+	# §2V retire — but ONLY once the orbit mesh actually COVERS the disc (its first worker build has committed). Retiring
+	# on the bare `engaged` flip would blank the skin during the seconds-scale worker fill (no skin + no blocks yet); by
+	# gating on covered geometry the far ring keeps wearing §2V until the crisp megablocks are ready to overdraw it, so
+	# the swap is a clean hand-off with no blank window. Below the swap (or before the fill lands) the skin stays lit.
+	var retire := engaged and not _block_lod_orbit.covered_fids().is_empty()
+	if retire != _orbit_skin_retired:
+		_orbit_skin_retired = retire
+		# Suppress the smooth skin on the far ring so the orbit megablocks own the disc (the far ring stays as the sunk
+		# backstop — round silhouette + rim — but reads as the plain agreeing FarPalette, no blotch). Restore on descent.
+		if _facet_ring.has_method("set_skin_active"):
+			_facet_ring.set_skin_active(not retire)
+		if _facet_tex != null and _facet_tex.has_method("set_frozen"):
+			_facet_tex.set_frozen(retire)   # freeze §2V page bakes at orbit (no bake pop-in); resume on descent
+
 ## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): drive the far ring's camera-radial
 ## emitted-set law + one-shot prewarm arming from this frame's camera (render frame). No faceted ring (fallback/
 ## flat) ⇒ no-op. Called per frame by main._process under (FP_SHELL_CAMERA_SET or FP_SHELL_PREWARM); independent
@@ -2643,6 +3008,17 @@ func set_far_ring_sun_dir(sun_dir: Vector3) -> void:
 func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_shell_absolute_sun_dir(sun_dir)
+	# COSMOS BLOCK-LOD P1: the L1 rim ring shades by the SAME shell shade·tint law (radial normal) — feed it the same
+	# Sun at the same frame so the megablocks day/night-match the far skin. No-op / byte-identical unless FP_BLOCK_LOD.
+	if _block_lod != null:
+		_block_lod.set_sun_dir(sun_dir)
+	# COSMOS BLOCK-LOD P2: the ladder + global tiers shade by the SAME shell law — feed them the same Sun each frame.
+	if _block_lod_ladder != null:
+		_block_lod_ladder.set_sun_dir(sun_dir)
+	if _block_lod_global != null:
+		_block_lod_global.set_sun_dir(sun_dir)
+	if _block_lod_orbit != null:
+		_block_lod_orbit.set_sun_dir(sun_dir)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
@@ -2654,6 +3030,28 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 	# lava — + VoxelBody debris) share the one static BlockMaterials cache; feed the Sun into every daylight twin.
 	# Self-guards on FP_NEAR_DAYLIGHT ⇒ flag-off is byte-identical (nothing registered, no-op).
 	BlockMaterials.set_near_daylight_sun_dir(sun_dir)
+	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, §2V.6 F1): THE single uniform-push site — push the TRUE planet centre
+	# (in the current render frame) to the near daylight twin at the SAME frame the sun_dir syncs, so its radial normal
+	# matches the far shell's and can NEVER go stale across a facet crossing / re-anchor. render_centre() folds the
+	# active facet transform (or the fixed-frame −anchor), so re-reading it every frame is inherently fresh. Off ⇒ never
+	# computed / pushed ⇒ byte-identical. The GDScript-fallback path (no facet ring) leaves planet_centre at the origin,
+	# which degrades the unified normal to the shipped normalize(v_wp) — safe, self-consistent.
+	# COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): the same TRUE planet centre push, but for the
+	# ISOLATED normal-only fix (shipped shade law, unified off). Feeds BOTH the module atlas twin AND the BlockMaterials
+	# fallback/residual/debris twins (which the unified path above never covered), so the near ground's day/night
+	# terminator uses the true radial — killing the bright-at-night facet, the reversed east↔west sweep (the wrong
+	# outward-normal inverts the mu gradient), and the re-bake lag (the centre is now refreshed EVERY frame, never
+	# frozen at 0). Off ⇒ never computed / pushed ⇒ byte-identical. render_centre() folds the active facet transform
+	# (or the fixed-frame −anchor) so re-reading it every frame is inherently fresh, exactly like the far shell's MODEL·0.
+	if CubeSphere.near_centre_fix_on() and not CubeSphere.FP_SHADE_UNIFIED and _facet_ring != null:
+		var ncentre: Vector3 = _facet_ring.render_centre()
+		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):
+			_module_world.call("set_near_daylight_planet_centre", ncentre)
+		BlockMaterials.set_near_daylight_planet_centre(ncentre)
+	if CubeSphere.FP_SHADE_UNIFIED and _facet_ring != null:
+		var centre: Vector3 = _facet_ring.render_centre()
+		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):
+			_module_world.call("set_near_daylight_planet_centre", centre)
 
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).
@@ -2677,6 +3075,10 @@ func take_perf_attrib() -> Dictionary:
 	var out := {
 		"snow_ms": snappedf(float(_snow_us_max) / 1000.0, 0.01),
 		"ctrl_ms": snappedf(float(_ctrl_us_max) / 1000.0, 0.01),
+		# COSMOS MAIN-THREAD ORCHESTRATION TH0: the job lane's bounded MAIN-THREAD commit/drain time this window
+		# (0.0 with the flag off / no lane). This is the number that must DROP as TH1+ move compute off main —
+		# it isolates the main-thread commit cost from the worker compute (which no longer sits on the frame).
+		"main_commit_ms": snappedf(_job_lane.take_main_commit_ms() if _job_lane != null else 0.0, 0.01),
 	}
 	_snow_us_max = 0
 	_ctrl_us_max = 0
@@ -3221,8 +3623,18 @@ func reinforce_joint(a: Vector3i, b: Vector3i, reinf_id: int) -> bool:
 
 ## Walkable surface height (world y of the top of the ground) at (x, z), accounting
 ## for broken blocks from the TOP — used for spawning pillars and the grounded test.
+## COSMOS FS2′ (docs/COSMOS-FACET-SEAMS-V2.md §2): the placed/walked surface sits at PLAY y = cell y + s
+## (the per-column datum lift). floor_under/blocked/ceiling_scan/the DDA and the near mesh all report/emit in
+## PLAY space (+ s) — this is the SAME surface the render draws (verify_facet_seams G-D2-SHAPE defines the
+## rendered near-mesh top as effective_height+1 + s). surface_y drives spawn, set_alt/teleport, the grounded
+## clamp, VoxelBody rest and the border pillars, so it MUST add s too: omitting it placed the player s blocks
+## (up to the facet-centre sagitta, ~5-7 @ R=6371) BELOW the visible ground — a set_alt(5)/spawn that sinks.
+## s ≡ 0.0 with FP_DATUM_BAKE off (and in flat/curved mode, where _active_facet < 0) ⇒ byte-identical; this
+## rides FP_DATUM_BAKE's own gate. Mirrors floor_under's no-floor fallback (float(effective_height+1) + s).
 func surface_y(x: float, z: float) -> float:
-	return float(effective_height(int(floor(x)), int(floor(z))) + 1)
+	var xi := int(floor(x))
+	var zi := int(floor(z))
+	return float(effective_height(xi, zi) + 1) + _datum_lift(xi, zi)
 
 ## The y the player should stand at in column (x, z) given their current feet
 ## height. Plain, NO-CLIMB floor: scan DOWN from the feet for the first solid block

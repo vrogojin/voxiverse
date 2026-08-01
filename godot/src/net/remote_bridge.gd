@@ -75,7 +75,14 @@ const STALE_S := 120.0
 const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "set_fly", "stop", "break", "place", "select_slot", "reload",
 	# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — the dev/test space-nav verbs. Behind CONTROL_ENABLED like
 	# every op; the executor that runs them exists only under a live grant, so this list is dead in normal play.
-	"dev_nav", "nav", "thrust", "roll"]
+	"dev_nav", "nav", "thrust", "roll",
+	# DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set the celestial time-of-day at the player.
+	# Behind CONTROL_ENABLED like every op; resolves synchronously via player.remote_set_time.
+	"set_time",
+	# DEV/TEST INSTRUMENTATION (dev-instrument tooling) — precise camera placement + stable capture. Behind
+	# CONTROL_ENABLED like every op; the bridge cap-checks the ack against THIS list before the executor
+	# dispatches, so they MUST be here or the ack is nacked before it ever reaches remote_control.gd.
+	"teleport", "set_alt", "freeze_time", "freeze_player"]
 const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
@@ -262,8 +269,29 @@ static func preset_token() -> String:
 	return str(cfg.get("token", ""))
 
 
+## OPT-IN DEV AUTO-GRANT (owner request) — the boot URL's `grant=<control-key>` value, else "". WEB ONLY:
+## location.search via JavaScriptBridge, the SAME mechanism dial_config() reads `remote=`. The activator feeds
+## this to the EXISTING unattended machinery (arm_unattended_rearm) under its CONTROL_ENABLED path so control
+## arms WITHOUT a human consent click; it is NOT called from anywhere else, so with control disabled this is
+## dead code (never invoked → FLAT byte-identical). SECURITY: this is NOT a new wire secret — the raw key only
+## ever leaves the browser as the HMAC grant_proof the manual consent flow already sends (see _compute_grant_proof).
+## The observe token WITHOUT this param arms nothing here, so the two-factor model is preserved.
+static func preset_grant() -> String:
+	if not OS.has_feature("web"):
+		return ""
+	var raw = JavaScriptBridge.eval("window.location.search", true)
+	if raw == null:
+		return ""
+	return _parse_query_value(str(raw), "grant")
+
+
 ## Extract the `remote` value from a raw `?a=b&remote=TOK&c=d` query string (leading `?` optional).
 static func _parse_query_token(query: String) -> String:
+	return _parse_query_value(query, "remote")
+
+
+## Generic single-value query parser (leading `?` optional). Returns the uri-decoded value of `key`, else "".
+static func _parse_query_value(query: String, key: String) -> String:
 	var q := query
 	if q.begins_with("?"):
 		q = q.substr(1)
@@ -271,7 +299,7 @@ static func _parse_query_token(query: String) -> String:
 		var eq := pair.find("=")
 		if eq < 0:
 			continue
-		if pair.substr(0, eq) == "remote":
+		if pair.substr(0, eq) == key:
 			return pair.substr(eq + 1).uri_decode()
 	return ""
 
@@ -1167,6 +1195,15 @@ func _validate_cmd(m: Dictionary) -> String:
 			return "caps"
 		if op == "nav" and not ["orbit", "geostation", "detach"].has(str((st as Dictionary).get("verb", ""))):
 			return "caps"
+		# DEV TIME-CHEAT: local_hours ∈ [0,24]; optional sun_elev_deg ∈ [-90,90]. Bounds re-checked here on the
+		# rover (the relay validates too); an out-of-range value is a `caps` reject, never clamped silently.
+		if op == "set_time":
+			var lh = (st as Dictionary).get("local_hours", null)
+			if not (lh is float or lh is int) or float(lh) < 0.0 or float(lh) > 24.0:
+				return "caps"
+			var se = (st as Dictionary).get("sun_elev_deg", null)
+			if se != null and (not (se is float or se is int) or float(se) < -90.0 or float(se) > 90.0):
+				return "caps"
 	return ""
 
 

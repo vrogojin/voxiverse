@@ -1,0 +1,40 @@
+shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);
+uniform float night_floor = 0.06;
+uniform float term_mu = 0.12;
+uniform sampler2DArray base_map : source_color, filter_linear_mipmap;
+float _air_mass(float mu) { float m = clamp(mu, 0.0, 1.0); float h = degrees(asin(m)); return 1.0 / (m + 0.50572 * pow(h + 6.07995, -1.6364)); }
+vec3 _scatter_tint(float mu) { float m = _air_mass(mu); return vec3(exp(-0.042 * m), exp(-0.098 * m), exp(-0.245 * m)); }
+float _scatter_band(float mu) { float up = smoothstep(-0.10, 0.0, mu); float dn = 1.0 - smoothstep(0.15, 0.25, mu); return up * dn; }
+float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }
+varying vec3 v_col_raw;
+varying vec3 v_st;
+varying vec2 v_uv;
+varying float v_face;
+varying float v_cam;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	float mu = dot(n, normalize(sun_dir));
+	float shade = night_floor + (1.0 - night_floor) * _day(mu);
+	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));
+	v_col_raw = COLOR.rgb;
+	v_st = vec3(shade) * tint;
+	v_uv = UV;
+	v_face = UV2.x;
+	v_cam = distance(wp, CAMERA_POSITION_WORLD);
+}
+void fragment() {
+	vec4 tx = texture(base_map, vec3(v_uv, v_face));
+	// COVERAGE GATE + UN-PREMULTIPLY (§ live-fix 2): the base map is PREMULTIPLIED alpha, so recover the true
+	// (un-darkened) colour by dividing rgb by coverage — near a bake frontier this cancels the mip/bilinear
+	// average of an un-baked (rgb=0,a=0) neighbour so there is NO black bleed into the seam. tx.a is the bake
+	// coverage: multiply wt by it so an un-baked facet (a≈0) shows the shipped vertex-colour far ring (NEVER
+	// black from orbit) and the un-premultiply degenerate case falls back to v_col_raw (doubly safe). A baked
+	// facet (a=1) cross-fades to the satellite image on the shipped 600..1800 distance ramp. One opaque draw.
+	vec3 col = (tx.a > 0.0001) ? (tx.rgb / tx.a) : v_col_raw;
+	float wt = tx.a;   // texture EVERYWHERE at ALL distances (user directive): weight = bake coverage only, no distance gate; mip/LOD handles scaling
+	ALBEDO = mix(v_col_raw, col, wt) * v_st;
+}

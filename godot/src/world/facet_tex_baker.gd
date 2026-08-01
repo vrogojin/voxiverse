@@ -1219,24 +1219,51 @@ func _bm_compute_slice_shot(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 ## (a main-thread snapshot of this facet's edits, empty until Stage B) overrides a column's top block so dig-outs /
 ## placed blocks show on the far map. A FRESH per-slice GenCtx homes every query on _bm_bake_fid (race-free worker).
 func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector2Array) -> void:
+	# FAST flat-colour bake: terrain colours from the C++ sample_columns (like the non-shot L8 band) → far colour
+	# index; then a CHEAP TreeGen overlay (has_tree hash early-outs on ~all columns) + the edit snapshot decide the
+	# TOP block per texel. ~256× faster than a per-texel SurfaceShot (which ran column_profile on every texel).
 	var fid := _bm_bake_fid
-	var ctx = TerrainConfig.GenCtx.new(0, fid)
 	var img: Image = _bm_bake_img
 	var have_edits: bool = not _edit_snap.is_empty()
-	for by in range(r0, r1):
+	var rows := r1 - r0
+	var packed := PackedInt64Array()
+	var lxs := PackedInt32Array()
+	var lzs := PackedInt32Array()
+	packed.resize(rows * nx)
+	lxs.resize(rows * nx)
+	lzs.resize(rows * nx)
+	for rj in range(rows):
+		var by := r0 + rj
 		var t := (float(by) + 0.5) / float(ny)
+		var base := rj * nx
 		for bx in range(nx):
 			var s := (float(bx) + 0.5) / float(nx)
 			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
 			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			lxs[base + bx] = lx
+			lzs[base + bx] = lz
+			packed[base + bx] = _pack_xz(lx, lz)
+	var res: Dictionary = _sampler.call(fid, packed)   # C++ terrain colours (fast; no trees/edits)
+	var cols: PackedColorArray = res["colors"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)          # facet-homed pcache for the tree overlay (worker-safe)
+	for rj in range(rows):
+		var by := r0 + rj
+		var base := rj * nx
+		for bx in range(nx):
+			var i := base + bx
 			var bid := -1
 			if have_edits:
-				bid = int(_edit_snap.get(Vector2i(lx, lz), -1))
+				bid = int(_edit_snap.get(Vector2i(lxs[i], lzs[i]), -1))   # dig-out air / placed block wins
 			if bid < 0:
-				bid = int(SurfaceShot.surface_shot(fid, lx, lz, ctx)["block_id"])
-			var idx := FarPalette.far_color_index_of_block(bid) + 1
-			var lv := float(idx) / 255.0
-			img.set_pixel(bx, by, Color(lv, 0.0, 0.0, 1.0))
+				var deco := TreeGen.top_decoration(lxs[i], lzs[i], ctx)   # cheap: has_tree gate early-outs to AIR
+				if deco != BlockCatalog.AIR:
+					bid = deco
+			var idx: int
+			if bid >= 0:
+				idx = FarPalette.far_color_index_of_block(bid) + 1   # tree/edit top block → tile-mean colour idx
+			else:
+				idx = FarPalette.far_color_index(cols[i]) + 1        # bare terrain colour → nearest palette idx
+			img.set_pixel(bx, by, Color(float(idx) / 255.0, 0.0, 0.0, 1.0))
 
 ## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
 ## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch

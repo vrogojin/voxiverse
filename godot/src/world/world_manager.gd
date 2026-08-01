@@ -452,11 +452,12 @@ func _ready() -> void:
 			# FP_BLOCK_DETAIL (set_facet_detail is flag-guarded; the atlas/id pages are never built by the baker either).
 			if CubeSphere.FP_BLOCK_DETAIL:
 				_facet_ring.set_facet_detail(FacetDetailAtlas.build(), _facet_tex.id_texture())
-				# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
-				# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
-				# then. No-op off FP_BAND_BLOCK_MAP (set_facet_band + band_texture are flag-guarded).
-				if CubeSphere.FP_BAND_BLOCK_MAP:
-					_facet_ring.set_facet_band(_facet_tex.band_texture())
+			# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
+			# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
+			# then. FP_SKIN_FLATCOLOR needs this bind too (the flat band drops FP_BLOCK_DETAIL) — so it is OUTSIDE the
+			# detail gate now. No-op off FP_BAND_BLOCK_MAP (set_facet_band is _bm_on()-guarded).
+			if CubeSphere.FP_BAND_BLOCK_MAP and (CubeSphere.FP_BLOCK_DETAIL or CubeSphere.FP_SKIN_FLATCOLOR):
+				_facet_ring.set_facet_band(_facet_tex.band_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"

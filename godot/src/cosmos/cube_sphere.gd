@@ -613,7 +613,7 @@ const FP_BAND_META_TEX := false
 ## the multi-core _pbm GDScript-sampler path, nearest-first, NEVER evicted. Default false ⇒ no alloc, byte-off.
 ## Requires FP_SKIN_FLATCOLOR (shares far_lut). Gate: verify_planet_map.gd.
 const FP_PLANET_MAP := false
-const PLANET_MAP_TEXELS := 128             # texels/facet edge → 128 over ~417 blocks = 3.26 blocks/texel (8× the 16-texel base)
+const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.
 ## Effective band layer count: 512 when FP_BAND_META_TEX (data-texture reverse-map, no uniform cap) else the array-safe 180.

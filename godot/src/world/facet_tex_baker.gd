@@ -1705,29 +1705,36 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 		else:
 			_bm_free.append(layer)                                    # compute failed → return the layer
 		_pbm_fid[i] = -1; _pbm_task[i] = -1
-	# 2) dispatch idle slots to the next wanted facets (one WorkerThreadPool task each → runs on its own core)
-	for i in range(_pbm_n):
-		if int(_pbm_fid[i]) >= 0:
-			continue
-		if _bm_free.is_empty():
-			break
-		var fid := _next_band_parallel()
-		if fid < 0:
-			break
-		var layer := int(_bm_free.pop_back())
-		var lc := PackedVector2Array()
-		lc.resize(4)
-		for ci in range(4):
-			var w := FacetAtlas.facet_planar_corner(fid, ci)
-			var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
-			lc[ci] = Vector2(float(l[0]), float(l[2]))
-		_pbm_fid[i] = fid
-		_pbm_mode[i] = 0
-		_pbm_layer[i] = layer
-		_pbm_lc[i] = lc
-		_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
-		_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
-		_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
+	# The whole-planet FINE tier is the COVERAGE guarantee; the band is close-up SUGAR. While any facet is still
+	# un-fine-baked, the band yields ALL worker slots so the disc coverage fills fast (Fable F1 follow-up: the band's
+	# expensive 174k-shot/facet bakes at mid-orbit were hogging both workers, starving the fine tier → the washed
+	# mid-orbit disc). Once the planet is fully fine-covered, the band gets the slots to sharpen close approach. Uses
+	# the size sentinel (no _next_fine_fid side-effect on _fm_cursor).
+	var fine_pending: bool = _fm_on and _fine_baked.size() < _base_all
+	# 2) dispatch idle slots to the next wanted band facets — ONLY when the fine coverage tier has nothing pending.
+	if not fine_pending:
+		for i in range(_pbm_n):
+			if int(_pbm_fid[i]) >= 0:
+				continue
+			if _bm_free.is_empty():
+				break
+			var fid := _next_band_parallel()
+			if fid < 0:
+				break
+			var layer := int(_bm_free.pop_back())
+			var lc := PackedVector2Array()
+			lc.resize(4)
+			for ci in range(4):
+				var w := FacetAtlas.facet_planar_corner(fid, ci)
+				var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
+				lc[ci] = Vector2(float(l[0]), float(l[2]))
+			_pbm_fid[i] = fid
+			_pbm_mode[i] = 0
+			_pbm_layer[i] = layer
+			_pbm_lc[i] = lc
+			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
+			_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
+			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
 	if _fm_on:
 		for i in range(_pbm_n):

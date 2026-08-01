@@ -53,3 +53,47 @@ static func path_for(block_id: int) -> String:
 static func texture_for(block_id: int) -> Texture2D:
 	var p := path_for(block_id)
 	return null if p == "" else load(p) as Texture2D
+
+# FP_SKIN_TEXTURE_MEAN palette cache: tile stem -> average tile colour (computed once per stem).
+static var _mean_cache := {}
+
+## The MEAN colour of a block's texture tile (the colour the near TEXTURED block averages to on screen), so the
+## far §2V skin — which otherwise paints the flat BlockCatalog swatch — can present the SAME colour as the near
+## field. Fully-transparent texels (leaf/glass cutouts) are skipped. Falls back to the flat swatch when the block
+## has no tile or the image can't be read. Cached per stem (≤ ~24 tiles). Used only under FP_SKIN_TEXTURE_MEAN.
+static func mean_color_of(block_id: int) -> Color:
+	var swatch := BlockCatalog.color_of(block_id)
+	var stem: String = TILES.get(StringName(BlockCatalog.name_of(block_id)), "")
+	if stem == "":
+		return swatch                                   # no tile → the flat swatch (unchanged)
+	if _mean_cache.has(stem):
+		return _mean_cache[stem]
+	var col := swatch
+	var tex := load("%s/%s.png" % [DIR, stem]) as Texture2D
+	if tex != null:
+		var img := tex.get_image()
+		if img != null:
+			if img.is_compressed():
+				img = img.duplicate()
+				img.decompress()
+			var w := img.get_width()
+			var h := img.get_height()
+			var sx := maxi(1, w / 32)
+			var sy := maxi(1, h / 32)                   # subsample ≤ ~32×32 per tile (cheap, one-shot)
+			var r := 0.0
+			var g := 0.0
+			var b := 0.0
+			var n := 0.0
+			for y in range(0, h, sy):
+				for x in range(0, w, sx):
+					var c := img.get_pixel(x, y)
+					if c.a < 0.5:
+						continue                        # skip cutout texels (leaves/glass)
+					r += c.r
+					g += c.g
+					b += c.b
+					n += 1.0
+			if n >= 1.0:
+				col = Color(r / n, g / n, b / n, 1.0)
+	_mean_cache[stem] = col
+	return col

@@ -2953,6 +2953,15 @@ func planet_render_centre() -> Vector3:
 		return Vector3.ZERO
 	return _facet_ring.render_centre()
 
+## The planet's LIVE render placement (body-centred ABSOLUTE frame → scene): the FacetFarRing node's
+## global_transform, which folds T_active⁻¹ / the fixed-frame anchor AND the SN3 scaled-body clamp (position +
+## basis + scale). Anything built in the same absolute frame (the dev-nav overlay guides) rides this to sit ON
+## the rendered planet. Identity when there is no faceted ring yet.
+func planet_render_transform() -> Transform3D:
+	if _facet_ring == null:
+		return Transform3D.IDENTITY
+	return _facet_ring.global_transform
+
 ## COSMOS SPACE-NAV SN3 (§5.2): apply the scaled-body distance clamp to the far ring for this frame. No-op when
 ## there is no faceted ring. Below D_ENGAGE this is byte-identical to the shipped placement (the clamp scale is
 ## exactly 1). Called per frame by main._process under FP_SCALED_BODY only.

@@ -515,6 +515,13 @@ const FP_SKIN_TIER := false
 ## NEVER-OOM: fixed-size pages (base-tier-only ≈ 8.2 MB ceiling, FacetTexBaker.total_bytes()). Flipped ON at
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
+## FP_SKIN_TEXTURE_MEAN — the far §2V skin's per-block colour = the block's TEXTURE-TILE MEAN (what the near
+## textured block averages to on screen) instead of the flat BlockCatalog swatch. Root cause of "far land pixels
+## don't match near blocks at all": near renders the real CC0 tile (grass.png…), far paints the blocks.json
+## swatch — two unrelated colour sources. FarPalette._top_color routes every surface colour through
+## BlockTextures.mean_color_of when on; the C++ skin path inherits it via frozen_colors() (NO module rebuild).
+## Tile-less ids (water/lava) fall back to the swatch. Default FALSE ⇒ byte-identical. Requires FP_FACET_TEX.
+const FP_SKIN_TEXTURE_MEAN := false
 
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
@@ -1492,6 +1499,13 @@ const SN_NAV_MODES := false
 ## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
 ## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
 const SN_DEVNAV := false
+## FP_DEVNAV_GUIDE_FRAME — anchor the dev-nav 3-D overlay GUIDES (spin-axis, equator ring, facet borders) to the
+## planet's LIVE render placement (WorldManager.planet_render_transform() = the FacetFarRing node global_transform)
+## instead of the world origin. The guides are built in the body-centred ABSOLUTE frame; under the floating-origin
+## / scaled-body render the planet is offset+oriented+scaled away from origin, so origin-anchored guides float off
+## the planet ("guides totally off"). On ⇒ the guide root rides that exact transform each frame. Default FALSE ⇒
+## byte-identical (guides stay at origin). Requires SN_DEVNAV.
+const FP_DEVNAV_GUIDE_FRAME := false
 
 ## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
 ## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
@@ -1998,6 +2012,12 @@ const ATMO_BRAKE_TERMINAL := 20.0
 ## from the nearest body's surface. RELEASE C ⇒ INSTANT STOP (kinematic fly, velocity held 0). Engage needs
 ## dev-flight active + in-space + C held. Default FALSE ⇒ BYTE-IDENTICAL (C never polled). Gate G-CRUISE.
 const CRUISE_MODE := false
+## FP_CRUISE_LOOKDIR — cruise flies along the TRUE displayed camera forward (window_camera_transform basis · −Z),
+## not `transform.basis`. In ATT_SPACE the camera is emancipated (6DOF attitude), so transform.basis (the surface/
+## lattice orientation) points somewhere unrelated to where the pilot looks — cruise then flies "a totally wrong
+## direction". On ⇒ cruise supercruises exactly where the camera aims in EVERY attitude mode. Default FALSE ⇒
+## byte-identical (the old transform.basis path). Only meaningful when CRUISE_MODE is also on.
+const FP_CRUISE_LOOKDIR := false
 ## Cruise speed law (blocks/s; 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks). speed(alt) =
 ## clamp(MIN·2^(alt/BAND), MIN, MAX). MIN 200 = crawl just above ATMO_TOP; BAND 4000 = doubles/4000 blocks (cap
 ## by ~18.6k alt); MAX 5000 = Earth→Moon crossing ≈ 77 s (1–3 min window). radial_altitude() = nearest-body alt.

@@ -888,6 +888,10 @@ func _nav_tick(delta: float) -> void:
 			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
 			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
 			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
+		# FP_DEVNAV_GUIDE_FRAME: ride the guide root on the planet's live render placement (floating-origin +
+		# scaled-body) so the axis/equator/facet-border guides sit ON the rendered planet, not the world origin.
+		if CubeSphere.FP_DEVNAV_GUIDE_FRAME and world != null and _dev_overlay.has_method("set_guides_transform"):
+			_dev_overlay.set_guides_transform(world.planet_render_transform())
 
 ## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
 ## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
@@ -1555,8 +1559,14 @@ func _move(delta: float) -> void:
 		if CubeSphere.CRUISE_MODE and not remote_drive:
 			var cruise_alt := radial_altitude()
 			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, Input.is_key_pressed(KEY_C)):
-				var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
-				var look_dir := (transform.basis * look_local)
+				# FP_CRUISE_LOOKDIR: fly along the TRUE displayed camera forward (correct in ATT_SPACE where the
+				# camera is emancipated); off ⇒ the shipped transform.basis path (wrong direction in space).
+				var look_dir: Vector3
+				if CubeSphere.FP_CRUISE_LOOKDIR:
+					look_dir = window_camera_transform().basis * Vector3(0.0, 0.0, -1.0)
+				else:
+					var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
+					look_dir = (transform.basis * look_local)
 				if look_dir.length() > 0.0:
 					look_dir = look_dir.normalized()
 				var cruise_v := CubeSphere.cruise_speed(cruise_alt)

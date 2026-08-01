@@ -600,6 +600,14 @@ const FP_BAND_BLOCK_MAP := false
 ## up to BAND_LAYERS; the coarse base map backstops only the sub-pixel far limb. Default false ⇒ byte-identical (band
 ## stays pattern-textured). Requires FP_BAND_BLOCK_MAP ∧ FP_SKIN_SSE. NEVER-OOM: BAND_LAYERS×BAND_TEXELS² L8, fixed.
 const FP_SKIN_FLATCOLOR := false
+## FP_BAND_META_TEX — replace the band reverse-map UNIFORM ARRAYS (band_facet[N]/band_n[N]) in the flat-colour shell
+## shader with ONE RGBA32F data texture (band_meta, 512×1, texelFetch). The uniform arrays burn a fragment-uniform-vec
+## slot per layer and blew past the ~1024 ANGLE limit at 400 layers (live breakage → reverted). A data texture has no
+## such cap, so BAND_LAYERS can grow to the 2048 array-layer limit. Default false ⇒ the shipped uniform-array splice,
+## byte-identical (FLAT 6042/0). Requires FP_SKIN_FLATCOLOR. Gate: verify_band_meta.gd.
+const FP_BAND_META_TEX := false
+## Band layer count when FP_BAND_META_TEX is on (the uniform-array path physically cannot host this — tied to the flag).
+const BAND_LAYERS_BIG := 512
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
 const BAND_LAYERS := 180                   # known-good under the GPU array + fragment-uniform limits; growing past this needs a data-texture reverse-map (not uniform arrays)
 const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)

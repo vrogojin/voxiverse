@@ -54,6 +54,8 @@ var _mi: MeshInstance3D
 # tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
 var _skin_base_tex: Texture = null
 var _skin_band_tex: Texture = null
+var _band_meta_tex: ImageTexture = null   # FP_BAND_META_TEX: 512×1 RGBA32F reverse-map (a,b,Nx,Ny) per band layer (texelFetch, no uniform-vec cap)
+var _band_meta_img: Image = null          # CPU staging for _band_meta_tex.update()
 var _skin_cu_tex: Texture = null
 var _skin_active := true              # §2V skin currently bound (true = shipped); set false while the orbit tier owns the disc
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
@@ -3206,12 +3208,39 @@ const _FLAT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
 		ALBEDO = mix(v_col_raw, col, wt) * v_st;
 	}
 "
+const _FLAT_UNIFORMS_META := "uniform sampler2DArray band_map : filter_nearest;
+uniform sampler2D band_meta : filter_nearest;
+uniform float band_k = 24.0;
+uniform vec3 far_lut[%d];
+"
+const _FLAT_ALBEDO_META := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5) {
+		vec4 _m = texelFetch(band_meta, ivec2(_bs, 0), 0);
+		vec2 _ab = _m.xy;
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = _m.zw;
+		ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? far_lut[_bid - 1] : col;
+		float _w = max(wt, (_bid > 0) ? 1.0 : 0.0);
+		ALBEDO = mix(v_col_raw, _bcol, _w) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, col, wt) * v_st;
+	}
+"
 static func _apply_flatcolor(code: String) -> String:
 	var bl := CubeSphere.BAND_LAYERS
 	var nlut := FarPalette.frozen_colors().size()
-	code = code.replace(
-		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
-		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + (_FLAT_UNIFORMS % [bl, bl, nlut]))
+	var base_decl := "uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n"
+	if CubeSphere.FP_BAND_META_TEX:
+		# FP_BAND_META_TEX: band reverse-map via a data texture (texelFetch) instead of uniform arrays → no vec-uniform cap.
+		code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS_META % nlut))
+		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+		code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO_META)
+		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+		return code
+	code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS % [bl, bl, nlut]))
 	code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
 	code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
 	code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO % bl)
@@ -3296,15 +3325,21 @@ func _make_material() -> Material:
 		# later by set_facet_band once the baker built the array; band_facet/band_n arrive via set_band_slots.
 		if _bm_on():
 			sm2.set_shader_parameter("band_k", float(FacetAtlas.K))
-			var bfacet := PackedVector2Array()
-			var bn := PackedVector2Array()
-			bfacet.resize(CubeSphere.BAND_LAYERS)
-			bn.resize(CubeSphere.BAND_LAYERS)
-			for i in range(CubeSphere.BAND_LAYERS):
-				bfacet[i] = Vector2(-1.0, -1.0)
-				bn[i] = Vector2(0.0, 0.0)
-			sm2.set_shader_parameter("band_facet", bfacet)
-			sm2.set_shader_parameter("band_n", bn)
+			if CubeSphere.FP_BAND_META_TEX:
+				# FP_BAND_META_TEX: seed the reverse-map DATA TEXTURE (sentinel a=-1) so band_meta is never unbound.
+				var mimg := Image.create(CubeSphere.BAND_LAYERS, 1, false, Image.FORMAT_RGBAF)
+				mimg.fill(Color(-1.0, -1.0, 0.0, 0.0))
+				sm2.set_shader_parameter("band_meta", ImageTexture.create_from_image(mimg))
+			else:
+				var bfacet := PackedVector2Array()
+				var bn := PackedVector2Array()
+				bfacet.resize(CubeSphere.BAND_LAYERS)
+				bn.resize(CubeSphere.BAND_LAYERS)
+				for i in range(CubeSphere.BAND_LAYERS):
+					bfacet[i] = Vector2(-1.0, -1.0)
+					bn[i] = Vector2(0.0, 0.0)
+				sm2.set_shader_parameter("band_facet", bfacet)
+				sm2.set_shader_parameter("band_n", bn)
 			if CubeSphere.FP_SKIN_FLATCOLOR:
 				var lut := PackedVector3Array()   # far_lut = frozen_colors() tile-mean palette (id->flat colour)
 				for c in FarPalette.frozen_colors():
@@ -3445,9 +3480,26 @@ func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: Pac
 	if _mi != null:
 		var mat := _mi.material_override
 		if mat is ShaderMaterial and facet_map.size() == CubeSphere.BAND_LAYERS and n_map.size() == CubeSphere.BAND_LAYERS:
-			(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
-			(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
-	_pending = true                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
+			if CubeSphere.FP_BAND_META_TEX:
+				_push_band_meta(mat as ShaderMaterial, facet_map, n_map)
+			else:
+				(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
+				(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
+	_pending = true
+
+## FP_BAND_META_TEX: pack (a,b,Nx,Ny) per band layer into the 512×1 RGBA32F reverse-map texture (one tiny update()),
+## replacing the band_facet[]/band_n[] uniform arrays (which cap out at ~400 layers on ANGLE's fragment-uniform budget).
+func _push_band_meta(mat: ShaderMaterial, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
+	var n := CubeSphere.BAND_LAYERS
+	if _band_meta_img == null:
+		_band_meta_img = Image.create(n, 1, false, Image.FORMAT_RGBAF)
+	for i in range(n):
+		_band_meta_img.set_pixel(i, 0, Color(facet_map[i].x, facet_map[i].y, n_map[i].x, n_map[i].y))
+	if _band_meta_tex == null:
+		_band_meta_tex = ImageTexture.create_from_image(_band_meta_img)
+	else:
+		_band_meta_tex.update(_band_meta_img)
+	mat.set_shader_parameter("band_meta", _band_meta_tex)                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
 
 ## COSMOS TEXTURED-LOD T1b gate surface (G-BD-OFF/TILE): the RAW textured shell shader string (no detail) and the
 ## FP_BLOCK_DETAIL-injected result, so the gate can assert byte-identity off and additive-only injection on, with the

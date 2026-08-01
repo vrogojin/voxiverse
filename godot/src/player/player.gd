@@ -1564,11 +1564,16 @@ func _move(delta: float) -> void:
 			var cruise_alt := radial_altitude()
 			var c_held := Input.is_key_pressed(KEY_C) or remote_cruise_active()
 			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, c_held):
-				# FP_CRUISE_LOOKDIR: fly along the TRUE displayed camera forward (correct in ATT_SPACE where the
-				# camera is emancipated); off ⇒ the shipped transform.basis path (wrong direction in space).
+				# FP_CRUISE_LOOKDIR: fly along the camera view in space. `position` is a LATTICE pose, so the look
+				# dir MUST be a LATTICE direction — the camera basis re-expressed in the active facet lattice (the
+				# SAME construction _kinematic_look_fly uses). Using the GLOBAL window_camera_transform() basis here
+				# scrambles the axes under the facet's world tilt (flies the wrong way). ATT_SURFACE or flag off ⇒
+				# the shipped body-yaw+pitch path (byte-identical), which is already in-frame on the surface.
 				var look_dir: Vector3
-				if CubeSphere.FP_CRUISE_LOOKDIR:
-					look_dir = window_camera_transform().basis * Vector3(0.0, 0.0, -1.0)
+				var cr_afid := TerrainConfig.active_facet()
+				if CubeSphere.FP_CRUISE_LOOKDIR and CubeSphere.ORBIT_6DOF_FLY and _att_mode != ATT_SURFACE and cr_afid >= 0:
+					var b_lat_cam := _CosmosAttitudeCls.lat_cam_basis(_FacetAtlasCls.frame_basis(cr_afid), _attitude_scene_basis())
+					look_dir = b_lat_cam * Vector3(0.0, 0.0, -1.0)
 				else:
 					var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
 					look_dir = (transform.basis * look_local)

@@ -2829,7 +2829,7 @@ func _cu_on() -> bool:
 ## COSMOS TEXTURED-LOD U1: the band tier is live (needs the base textured ring + block detail + its own flag). Off ⇒
 ## every band path (64+ slot, band_map sampler, band_facet/band_n uniforms) is inert ⇒ mesh + material unchanged.
 func _bm_on() -> bool:
-	return CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_BLOCK_DETAIL and _tex_on()
+	return CubeSphere.FP_BAND_BLOCK_MAP and (CubeSphere.FP_BLOCK_DETAIL or CubeSphere.FP_SKIN_FLATCOLOR) and _tex_on()
 
 ## The slot for `fid` from the FROZEN build snapshot (worker-safe), fed to UV2.y at emit. A BAND facet wins with 64+layer
 ## (the shader's real-block path); else the close-up layer (0..63); else −1 (base-map / tiled fallback). Empty snapshots
@@ -3182,6 +3182,42 @@ static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_M
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
 	return code
 
+# FP_SKIN_FLATCOLOR (Minecraft-style per-block MAP SKIN): render a band-resident texel as a FLAT tile-mean COLOUR
+# (far_lut[id-1], the frozen_colors tile-mean palette) instead of the detail_map texture pattern. NO detail_map / id_map
+# dependency (drops FP_BLOCK_DETAIL) — a band facet shows per-block colours, a non-band facet falls to the coarse base
+# col (sub-pixel far limb). Mirrors the _BAND_ALBEDO addressing exactly; %d = BAND_LAYERS, far_lut sized to the palette.
+const _FLAT_UNIFORMS := "uniform sampler2DArray band_map : filter_nearest;
+uniform vec2 band_facet[%d];
+uniform vec2 band_n[%d];
+uniform float band_k = 24.0;
+uniform vec3 far_lut[%d];
+"
+const _FLAT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? far_lut[_bid - 1] : col;
+		float _w = max(wt, (_bid > 0) ? 1.0 : 0.0);
+		ALBEDO = mix(v_col_raw, _bcol, _w) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, col, wt) * v_st;
+	}
+"
+static func _apply_flatcolor(code: String) -> String:
+	var bl := CubeSphere.BAND_LAYERS
+	var nlut := FarPalette.frozen_colors().size()
+	code = code.replace(
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + (_FLAT_UNIFORMS % [bl, bl, nlut]))
+	code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+	code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+	code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO % bl)
+	code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+	return code
+
 # COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): swap the shell LIGHT head's inline
 # lighting law for the SHARED VoxiLight.SHADE_GLSL snippet (string-included — pure concatenation, ZERO new shader_type /
 # compiled program). Four surgical replacements, all on the LIGHT head ONLY (the ALBEDO tail / texture sampling is
@@ -3227,7 +3263,10 @@ func _make_material() -> Material:
 		if _cu_on():
 			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER)
 		else:
-			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+			if CubeSphere.FP_SKIN_FLATCOLOR and CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_FACET_TEX:
+				sh2.code = _apply_flatcolor(_SHELL_ABS_TEX_SHADER)   # Minecraft per-block flat-colour map skin (no detail patterns)
+			else:
+				sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
 		# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): string-include the SHARED VoxiLight lighting law into the LIGHT head
 		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
 		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
@@ -3266,6 +3305,11 @@ func _make_material() -> Material:
 				bn[i] = Vector2(0.0, 0.0)
 			sm2.set_shader_parameter("band_facet", bfacet)
 			sm2.set_shader_parameter("band_n", bn)
+			if CubeSphere.FP_SKIN_FLATCOLOR:
+				var lut := PackedVector3Array()   # far_lut = frozen_colors() tile-mean palette (id->flat colour)
+				for c in FarPalette.frozen_colors():
+					lut.append(Vector3(c.r, c.g, c.b))
+				sm2.set_shader_parameter("far_lut", lut)
 		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.

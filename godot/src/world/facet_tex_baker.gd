@@ -112,6 +112,8 @@ var _centre_pack := PackedVector3Array()
 # All zero / never created off FP_BAND_BLOCK_MAP. NEVER-OOM: fixed BAND_LAYERS × BAND_TEXELS² L8 + ONE staging layer.
 var _bm_on := false                  # FP_BAND_BLOCK_MAP && _bd_on && the baker exists (set in setup)
 var _bm_shot := false                # COSMOS TEXTURED-LOD §2V V2: FP_BAND_SHOT && _bm_on ⇒ band is RG8 {id,shade} (real shot incl trees)
+var _bm_flat := false                # FP_SKIN_FLATCOLOR: band is L8 {far-colour-index+1} (Minecraft map skin, tile-mean colour incl trees/edits)
+var _edit_snap := {}                 # FP_SKIN_FLATCOLOR: main-thread snapshot of the bake facet's edits {Vector2i(lx,lz)->block_id}; empty until Stage-B wires it
 var _bm_texels := 0                  # BAND_TEXELS (512)
 var _bm_tex: Texture2DArray = null   # the BAND_LAYERS-layer GPU band id map (bound into the ring's band_map uniform)
 var _bm_slots: Dictionary = {}       # fid -> layer (RESIDENT: baked + uploaded; the value fed to UV2.y as 64+layer)
@@ -218,10 +220,18 @@ func setup(active_fid: int) -> void:
 	# and seed the free-layer pool + reverse maps. Requires FP_BLOCK_DETAIL (the band composites detail_map[id]) so _bm_on
 	# implies _bd_on. Only under FP_BAND_BLOCK_MAP -> zero band bytes with the flag off. Built ONCE (all id 0 -> the shader's
 	# band branch is skipped until a facet is baked resident); a completed bake only does a cheap update_layer.
-	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and _bd_on
+	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and (_bd_on or CubeSphere.FP_SKIN_FLATCOLOR)
 	# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band stores RG8 {block_id, shade} (the real shot incl trees) instead
 	# of L8 {id}. Off ⇒ _bm_shot false ⇒ the L8 format + id-only bake below are BYTE-IDENTICAL to the U1 band.
 	_bm_shot = CubeSphere.FP_BAND_SHOT and _bm_on
+	# FP_SKIN_FLATCOLOR: bake the band as an L8 per-block COLOUR-INDEX map (tile-mean palette, incl trees) so the shell
+	# shader flat-colours it (no detail pattern). Prewarm the palette + classifier on the MAIN thread here so the
+	# offloaded band worker never races init (mirrors the shot prewarm). Mutually exclusive with the RG8 shot band.
+	_bm_flat = CubeSphere.FP_SKIN_FLATCOLOR and _bm_on and not _bm_shot
+	if _bm_flat:
+		BlockCatalog.ensure_ready()
+		FarPalette.ensure_ready()
+		FarPalette.ensure_far_index_ready()
 	if _bm_on:
 		_bm_texels = CubeSphere.BAND_TEXELS
 		_bm_facet.resize(CubeSphere.BAND_LAYERS)
@@ -1053,8 +1063,10 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 		return
 	var r := FacetAtlas.R_BLOCKS
 	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
-	var promote := CubeSphere.CLOSEUP_NEAR
-	var release := CubeSphere.CLOSEUP_NEAR * CubeSphere.SSE_HYST
+	# FP_SKIN_FLATCOLOR wants the per-block map out to the visible disc (up to BAND_LAYERS nearest); the shipped
+	# close-up reach (CLOSEUP_NEAR) only feeds ~ring-1. BAND_LAYERS still self-caps the nearest-first want.
+	var promote: float = CubeSphere.BAND_PROMOTE_DIST if CubeSphere.FP_SKIN_FLATCOLOR else CubeSphere.CLOSEUP_NEAR
+	var release := promote * CubeSphere.SSE_HYST
 	var cand := []                              # [dist, fid]
 	for fid in range(_base_all):
 		var cd := _centre_pack[fid]
@@ -1155,6 +1167,8 @@ func _bm_compute_slice() -> void:
 		# per-slice GenCtx so terrain + trees resolve on THIS facet — no _active_facet read on the worker). The C++ sampler
 		# is not consulted: surface_shot IS the id/tree derivation (no re-derivation here). Memo bounded to this slice.
 		_bm_compute_slice_shot(r0, r1, nx, ny, lc)
+	elif _bm_flat:
+		_bm_compute_slice_flat(r0, r1, nx, ny, lc)
 	else:
 		var packed := PackedInt64Array()
 		packed.resize(rows * nx)
@@ -1199,6 +1213,30 @@ func _bm_compute_slice_shot(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 			var rec := SurfaceShot.surface_shot(fid, lx, lz, ctx)
 			var idv := float(int(rec["block_id"])) / 255.0
 			img.set_pixel(bx, by, Color(idv, float(rec["shade"]), 0.0, 1.0))
+
+## FP_SKIN_FLATCOLOR worker-safe FLAT-COLOUR compute for rows [r0,r1): each column's exposed top block (SurfaceShot,
+## incl. TreeGen) -> its FarPalette tile-mean colour INDEX (0..13)+1, stored L8 in R (0 = un-baked). `_edit_snap`
+## (a main-thread snapshot of this facet's edits, empty until Stage B) overrides a column's top block so dig-outs /
+## placed blocks show on the far map. A FRESH per-slice GenCtx homes every query on _bm_bake_fid (race-free worker).
+func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector2Array) -> void:
+	var fid := _bm_bake_fid
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var img: Image = _bm_bake_img
+	var have_edits: bool = not _edit_snap.is_empty()
+	for by in range(r0, r1):
+		var t := (float(by) + 0.5) / float(ny)
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			var bid := -1
+			if have_edits:
+				bid = int(_edit_snap.get(Vector2i(lx, lz), -1))
+			if bid < 0:
+				bid = int(SurfaceShot.surface_shot(fid, lx, lz, ctx)["block_id"])
+			var idx := FarPalette.far_color_index_of_block(bid) + 1
+			var lv := float(idx) / 255.0
+			img.set_pixel(bx, by, Color(lv, 0.0, 0.0, 1.0))
 
 ## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
 ## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch
@@ -1506,7 +1544,7 @@ func tex_telemetry() -> Dictionary:
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under
 ## FP_FACET_TEX_CLOSEUP, CLOSEUP_MAX CPU staging layers + the close-up GPU array (+mips) ≈ 9.6 MB → ≈ 17.8 MB all-on.
 ## The gate asserts it stays under FACET_TEX_BYTES_MAX (20 MB). Every buffer is fixed-size at creation.
-const FACET_TEX_BYTES_MAX := 20 * 1024 * 1024
+const FACET_TEX_BYTES_MAX := 60 * 1024 * 1024   # raised for FP_SKIN_FLATCOLOR: base 8 + 180-layer L8 band ~45 MB ≈ 53 MB; HARD bounded cap, nothing grows with playtime
 func total_bytes() -> int:
 	var page_px := _page * _page * 4          # one RGBA8 base page, bytes
 	var cpu := 6 * page_px                     # 6 CPU staging Images (kept for re-blit)

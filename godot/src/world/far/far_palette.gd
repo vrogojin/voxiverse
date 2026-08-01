@@ -126,6 +126,44 @@ static func frozen_colors() -> PackedColorArray:
 		_water, _ice, _lava, _snow, _sand, _gravel, _red_sand, _mud,
 		_podzol, _grass, _leaf, _stone, _taiga, _forest])
 
+# FP_SKIN_FLATCOLOR: classify a colour / block to its index in frozen_colors() (0..13). The flat-color band stores
+# this index (L8, +1; 0 = un-baked); the shell shader's far_lut = frozen_colors() maps it back to the flat colour.
+# Both the LUT and this classifier resolve through frozen_colors() → _top_color, so under FP_SKIN_TEXTURE_MEAN every
+# far map texel == the near textured block's 16×16 tile-mean colour (interior texels classify exactly, distance 0).
+static var _fc_ready := false
+static var _fc_rgb := PackedFloat32Array()
+
+static func ensure_far_index_ready() -> void:
+	if _fc_ready:
+		return
+	ensure_ready()
+	var fc := frozen_colors()
+	_fc_rgb.resize(fc.size() * 3)
+	for i in range(fc.size()):
+		_fc_rgb[i * 3] = fc[i].r
+		_fc_rgb[i * 3 + 1] = fc[i].g
+		_fc_rgb[i * 3 + 2] = fc[i].b
+	_fc_ready = true
+
+static func far_color_index(c: Color) -> int:
+	ensure_far_index_ready()
+	var best := 0
+	var best_d := 1.0e30
+	var n := _fc_rgb.size() / 3
+	for i in range(n):
+		var j := i * 3
+		var dr := c.r - _fc_rgb[j]
+		var dg := c.g - _fc_rgb[j + 1]
+		var db := c.b - _fc_rgb[j + 2]
+		var d := dr * dr + dg * dg + db * db
+		if d < best_d:
+			best_d = d
+			best = i
+	return best
+
+static func far_color_index_of_block(block_id: int) -> int:
+	return far_color_index(_top_color(block_id))
+
 ## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3) — the airless Moon far-ring palette, generalized per
 ## body exactly like the Earth colours above: every RGB is a BlockCatalog tint (regolith / basalt maria /
 ## anorthosite highlands), so a recolour follows by construction. The surface is a regolith blanket over the

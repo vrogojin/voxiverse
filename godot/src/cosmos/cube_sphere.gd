@@ -593,10 +593,18 @@ const FP_DETAIL_GRID := false
 ## BAND_LAYERS × BAND_TEXELS² L8 (2.36 MB GPU) + ONE CPU staging layer (0.26 MB) ⇒ ≈ +2.7 MB → combined ceiling 43 MB.
 ## Gate: verify_band_map.gd (G-BB-EXACT / G-BB-BYTES / G-BB-SLOT / G-BB-OFF).
 const FP_BAND_BLOCK_MAP := false
+## FP_SKIN_FLATCOLOR — render the per-block band as FLAT tile-mean COLOUR (band id → far_lut[id], the frozen_colors
+## tile-mean palette) instead of the FP_BLOCK_DETAIL texture patterns (the "awkward" look). This IS the Minecraft-style
+## per-block map skin: 1 texel ≈ 1 block, each texel = the block's 16×16 texture averaged to one pixel (needs
+## FP_SKIN_TEXTURE_MEAN for the mean palette). Covers the whole visible disc via the FP_SKIN_SSE screen-space residency
+## up to BAND_LAYERS; the coarse base map backstops only the sub-pixel far limb. Default false ⇒ byte-identical (band
+## stays pattern-textured). Requires FP_BAND_BLOCK_MAP ∧ FP_SKIN_SSE. NEVER-OOM: BAND_LAYERS×BAND_TEXELS² L8, fixed.
+const FP_SKIN_FLATCOLOR := false
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
-const BAND_LAYERS := 9                     # band residency = active + ring-1 (≤ 9 layers → 2.36 MB GPU, fixed at creation)
+const BAND_LAYERS := 180                   # band residency (nearest-by-screen up to this cap) → 180·0.25MiB = 45MiB GPU, fixed at creation; covers the low-orbit visible disc
 const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the L8 band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+const BAND_BYTES_MAX := 48 * 1024 * 1024   # NEVER-OOM ceiling for the L8 band tier (180·512² L8 GPU + 1 staging ⇒ ~45.25 MiB < 48)
+const BAND_PROMOTE_DIST := 3600.0          # FP_SKIN_SSE band promote reach (blocks): admits ≥180 candidates near the surface; BAND_LAYERS self-caps nearest-first
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)

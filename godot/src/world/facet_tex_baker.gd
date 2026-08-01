@@ -141,6 +141,19 @@ var _pbm_lc: Array = []             # slot -> PackedVector2Array lattice corners
 var _pbm_nx: Array = []             # slot -> Nx
 var _pbm_ny: Array = []             # slot -> Ny
 var _pbm_mutex := Mutex.new()       # guards the result handoff (_pbm_bytes[i]) between worker and main
+var _pbm_mode: Array = []           # slot -> 0 band (bm_texels² → layer), 1 fine (fm_texels² → sub-page)
+# FP_PLANET_MAP fine tier — always-resident whole-planet L8 map, 24 sub-page layers (6 faces × 2×2 quadrants).
+var _fm_on := false
+var _fm_texels := 0                 # PLANET_MAP_TEXELS (128)
+var _fm_quad := 0                   # PLANET_MAP_QUAD (12); sub-page edge = quad·texels = 1536
+var _fm_page := 0
+var _fm_pages: Array = []           # 24 L8 sub-page staging Images (blit target)
+var _fm_tex: Texture2DArray = null  # 24-layer GPU array (bound as fine_map)
+var _fine_baked: Dictionary = {}    # fid -> true (baked into its sub-page)
+var _fm_dirty: Dictionary = {}      # layer -> true (needs update_layer)
+var _fm_epoch := 0
+var _fm_upload_cd := 0
+var _fm_cursor := 0
 var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
 var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
 var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
@@ -485,7 +498,7 @@ func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := 
 	if _pbm_on:
 		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0 and _bm_on and active_fid >= 0:
 			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
-		_update_band_parallel()
+		_update_band_parallel(emit_axis)
 	if _worker_on:
 		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:
@@ -1570,9 +1583,70 @@ func _setup_parallel_band() -> void:
 	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)   # scales when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
+	_pbm_mode.resize(_pbm_n)
 	for i in range(_pbm_n):
-		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1
+		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1; _pbm_mode[i] = 0
 		_pbm_bytes[i] = PackedByteArray()
+	_setup_fine_map()
+
+func _setup_fine_map() -> void:
+	_fm_on = CubeSphere.FP_PLANET_MAP and _pbm_on
+	if not _fm_on:
+		return
+	_fm_texels = CubeSphere.PLANET_MAP_TEXELS
+	_fm_quad = CubeSphere.PLANET_MAP_QUAD
+	_fm_page = _fm_quad * _fm_texels
+	FarPalette.ensure_far_index_ready()
+	var imgs: Array[Image] = []
+	for l in range(6 * 4):
+		var im := Image.create(_fm_page, _fm_page, false, Image.FORMAT_L8)
+		im.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
+		_fm_pages.append(im)
+		imgs.append(im)
+	_fm_tex = Texture2DArray.new()
+	_fm_tex.create_from_images(imgs)
+
+## Nearest un-baked whole-planet facet by emit axis (front-most first); covers all 6·K² facets, never evicted.
+func _next_fine_fid(axis: Array) -> int:
+	if axis.size() == 3:
+		var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+		if ax * ax + ay * ay + az * az > 0.5:
+			var best := -1
+			var best_d := -2.0
+			for fid in range(_base_all):
+				if _fine_baked.has(fid) or _pbm_inflight(fid):
+					continue
+				var cd := _centre_pack[fid]
+				var dt := cd.x * ax + cd.y * ay + cd.z * az
+				if dt > best_d:
+					best_d = dt; best = fid
+			if best >= 0:
+				return best
+	for k in range(_base_all):
+		var fid := (_fm_cursor + k) % _base_all
+		if not _fine_baked.has(fid) and not _pbm_inflight(fid):
+			_fm_cursor = (fid + 1) % _base_all
+			return fid
+	return -1
+
+## Commit a finished fine tile (128²) into its sub-page: layer = face·4 + qy·2 + qx, offset = (a%12, b%12)·128.
+func _fine_commit(fid: int, bytes: PackedByteArray) -> void:
+	if bytes.size() != _fm_texels * _fm_texels:
+		return
+	var d := _decode(fid)
+	var a := int(d[1]); var b := int(d[2])
+	var qx := a / _fm_quad; var qy := b / _fm_quad
+	var layer := int(d[0]) * 4 + qy * 2 + qx
+	var tile := Image.create_from_data(_fm_texels, _fm_texels, false, Image.FORMAT_L8, bytes)
+	_fm_pages[layer].blit_rect(tile, Rect2i(0, 0, _fm_texels, _fm_texels), Vector2i((a % _fm_quad) * _fm_texels, (b % _fm_quad) * _fm_texels))
+	_fm_dirty[layer] = true
+	_fine_baked[fid] = true
+
+## The fine tier GPU array (bound by WorldManager as the shader's fine_map). Null off FP_PLANET_MAP.
+func fine_texture() -> Texture2DArray:
+	return _fm_tex
+func fine_epoch() -> int:
+	return _fm_epoch
 
 func _pbm_inflight(fid: int) -> bool:
 	for i in range(_pbm_n):
@@ -1592,7 +1666,7 @@ func _next_band_parallel() -> int:
 
 ## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
 ## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
-func _update_band_parallel() -> void:
+func _update_band_parallel(emit_axis: Array = []) -> void:
 	# 1) reap completed → commit on main (single-writer of the residency dicts)
 	for i in range(_pbm_n):
 		var fid := int(_pbm_fid[i])
@@ -1603,6 +1677,10 @@ func _update_band_parallel() -> void:
 		_pbm_mutex.lock()
 		var bytes: PackedByteArray = _pbm_bytes[i]
 		_pbm_mutex.unlock()
+		if int(_pbm_mode[i]) == 1:
+			_fine_commit(fid, bytes)
+			_pbm_fid[i] = -1; _pbm_task[i] = -1
+			continue
 		if bytes.size() == _bm_texels * _bm_texels:
 			var img := Image.create_from_data(_bm_texels, _bm_texels, false, Image.FORMAT_L8, bytes)
 			_bm_tex.update_layer(img, layer)
@@ -1631,11 +1709,41 @@ func _update_band_parallel() -> void:
 			var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
 			lc[ci] = Vector2(float(l[0]), float(l[2]))
 		_pbm_fid[i] = fid
+		_pbm_mode[i] = 0
 		_pbm_layer[i] = layer
 		_pbm_lc[i] = lc
 		_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
 		_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
 		_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
+	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
+	if _fm_on:
+		for i in range(_pbm_n):
+			if int(_pbm_fid[i]) >= 0:
+				continue
+			var ff := _next_fine_fid(emit_axis)
+			if ff < 0:
+				break
+			var flc := PackedVector2Array()
+			flc.resize(4)
+			for ci in range(4):
+				var w := FacetAtlas.facet_planar_corner(ff, ci)
+				var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
+				flc[ci] = Vector2(float(l[0]), float(l[2]))
+			_pbm_fid[i] = ff
+			_pbm_mode[i] = 1
+			_pbm_layer[i] = -1
+			_pbm_lc[i] = flc
+			_pbm_nx[i] = _fm_texels
+			_pbm_ny[i] = _fm_texels
+			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
+		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads)
+		_fm_upload_cd -= 1
+		if _fm_upload_cd <= 0 and not _fm_dirty.is_empty():
+			var lyr := int(_fm_dirty.keys()[0])
+			_fm_tex.update_layer(_fm_pages[lyr], lyr)
+			_fm_dirty.erase(lyr)
+			_fm_epoch += 1
+			_fm_upload_cd = 15
 
 ## WORKER: compute slot `i`'s FULL facet L8 index bytes (pure per-slot state; the only shared write is _pbm_bytes[i]
 ## under the mutex). sample_columns (C++) is re-entrant by godot_voxel's threaded-generator design; TreeGen/FarPalette
@@ -1644,7 +1752,7 @@ func _pbm_compute(i: int) -> void:
 	# GDScript terrain sample (SurfaceShot: column_profile + FarPalette + TreeGen, per-call ctx) — read-only static
 	# data, so it RUNS IN PARALLEL across worker threads (unlike the C++ sample_columns, which serialises on a lock).
 	var fid := int(_pbm_fid[i])
-	var tex := _bm_texels
+	var tex := _fm_texels if int(_pbm_mode[i]) == 1 else _bm_texels
 	var nx := int(_pbm_nx[i])
 	var ny := int(_pbm_ny[i])
 	var lc: PackedVector2Array = _pbm_lc[i]

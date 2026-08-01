@@ -1146,6 +1146,8 @@ func update_streaming(player_pos: Vector3) -> void:
 		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
 		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
 		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist)
+		if CubeSphere.FP_PLANET_MAP:
+			_facet_ring.set_fine_map(_facet_tex.fine_texture())   # bind the whole-planet fine tier (survives re-emit)
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:
 			_tex_slots_epoch = _facet_tex.slots_epoch()
 			if _facet_tex.closeup_texture() != null:

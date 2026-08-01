@@ -3208,6 +3208,15 @@ const _FLAT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
 		ALBEDO = mix(v_col_raw, col, wt) * v_st;
 	}
 "
+const _FINE_UNIFORM := "uniform sampler2DArray fine_map : filter_nearest;\n"
+const _FINE_ELSE := "\t} else {
+\t\tvec2 _q = floor(v_uv * 2.0);
+\t\tint _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
+\t\tivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
+\t\tint _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);
+\t\tvec3 _fc = (_f8 > 0) ? far_lut[_f8 - 1] : col;
+\t\tALBEDO = mix(v_col_raw, _fc, max(wt, (_f8 > 0) ? 1.0 : 0.0)) * v_st;
+\t}"
 const _FLAT_UNIFORMS_META := "uniform sampler2DArray band_map : filter_nearest;
 uniform sampler2D band_meta : filter_nearest;
 uniform float band_k = 24.0;
@@ -3234,10 +3243,17 @@ static func _apply_flatcolor(code: String) -> String:
 	var base_decl := "uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n"
 	if CubeSphere.FP_BAND_META_TEX:
 		# FP_BAND_META_TEX: band reverse-map via a data texture (texelFetch) instead of uniform arrays → no vec-uniform cap.
-		code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS_META % nlut))
+		var unis := _FLAT_UNIFORMS_META % nlut
+		var meta_albedo := _FLAT_ALBEDO_META
+		if CubeSphere.FP_PLANET_MAP:
+			# FP_PLANET_MAP: always-resident whole-planet fine tier — sample fine_map in the non-band else-branch.
+			var pg := CubeSphere.PLANET_MAP_QUAD * CubeSphere.PLANET_MAP_TEXELS
+			unis = unis + _FINE_UNIFORM
+			meta_albedo = meta_albedo.replace("	} else {\n		ALBEDO = mix(v_col_raw, col, wt) * v_st;\n	}", _FINE_ELSE % [pg, pg - 1])
+		code = code.replace(base_decl, base_decl + unis)
 		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
 		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
-		code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO_META)
+		code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", meta_albedo)
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
 		return code
 	code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS % [bl, bl, nlut]))
@@ -3473,6 +3489,15 @@ func set_facet_band(tex: Texture) -> void:
 ## reverse-maps. Main thread only (WorldManager, when the baker's band_epoch bumps): updates the live `_band_slots` (frozen
 ## into the mesh at the next build so UV2.y carries 64+layer) and the band_facet/band_n shader uniforms (read live per
 ## fragment), then requests a re-emit. No-op with the band tier off.
+## FP_PLANET_MAP: bind the always-resident whole-planet fine tier array as the shell shader's fine_map. Called
+## per-frame by WorldManager (cheap) so it survives far-ring material re-emits. No-op off the flag / no material.
+func set_fine_map(tex) -> void:
+	if not CubeSphere.FP_PLANET_MAP or _mi == null or tex == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("fine_map", tex)
+
 func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
 	if not _bm_on():
 		return

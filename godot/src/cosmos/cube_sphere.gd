@@ -3051,6 +3051,31 @@ static func corner_cells(k: int, n: int) -> Array:
 		})
 	return out
 
+## COSMOS TREE-PHYS BOUND (task fix/voxiverse-treephys, docs/SIM-MODEL "physics dormant-by-default + NEVER-OOM/bounded").
+## A single block edit (chop a tree / undercut terrain) runs the StructuralSolver collapse, which can detach a LARGE
+## connected component and spawn it as ONE loose VoxelBody. The shipped VoxelBody builds ONE BoxShape3D collider PER
+## CELL (voxel_body.gd _rebuild) and stays fully DYNAMIC until it settles (_grounded) — so a several-hundred-cell
+## detachment drops a rigid body carrying hundreds of box colliders that the physics server broadphases/integrates
+## every frame, and if _grounded never confirms at a far/faceted spot the body NEVER freezes → phys_ms pins at
+## 300-420 ms and the game stalls at ~5 fps indefinitely (observed live at a far surface tree-chop). This bounds it:
+##
+##  (1) COLLIDER CAP. A component with > TREEPHYS_COLLIDER_CAP cells does NOT emit a per-cell box field; it collides as
+##      ONE BoxShape3D sized to the body's local cell AABB — O(1) physics cost regardless of cell count. The rendered
+##      mesh is untouched (still per-exposed-face), so it looks identical; only the (rare, pathological) large body's
+##      collision is coarsened. Normal tree canopies (≤ ~50 cells, below the cap) fall as real blocky debris as today.
+##  (2) LARGE ⇒ SPAWN DORMANT. A body over the cap spawns already FROZEN-STATIC (dormant, zero per-frame churn) — it
+##      renders + is walkable but never churns the sim. wake() can still reactivate it on a nearby edit (it then
+##      re-simulates as the single-AABB body — still bounded — and re-settles via the deadline below).
+##  (3) HARD ACTIVE DEADLINE. Any dynamic body that has not reached rest within TREEPHYS_MAX_ACTIVE_SEC freezes to
+##      STATIC where it is, regardless of _grounded — so a body whose support query never confirms (far/faceted
+##      staleness) can no longer churn forever. Belt-and-suspenders behind the same flag.
+##
+## Default OFF ⇒ every code path below is the shipped per-cell / never-deadline behaviour → byte-identical (FLAT
+## verify_feature 6042/0). Gate: verify_treephys.gd. Read live via VoxelBody as CubeSphere.FP_TREEPHYS_BOUND.
+const FP_TREEPHYS_BOUND := false
+const TREEPHYS_COLLIDER_CAP := 64      # a component over this many cells collides as ONE AABB box + spawns dormant
+const TREEPHYS_MAX_ACTIVE_SEC := 8.0   # hard deadline: a dynamic body not at rest by now freezes STATIC regardless
+
 # ---------------------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------------------

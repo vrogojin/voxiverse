@@ -126,6 +126,7 @@ var _bm_bake_fid := -1              # facet whose band bake is in progress (row-
 var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
 var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
 var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² staging image (L8 {id} / RG8 {id,shade} under FP_BAND_SHOT; id 0 until rows fill in)
+var _bm_bake_bytes := PackedByteArray()   # FP_SKIN_FLATCOLOR: the L8 index bytes filled by the slices (direct byte writes, NO set_pixel → fast + unambiguous); the image is built from this at the last slice
 var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
 var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
 var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
@@ -511,9 +512,15 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 	# then bake missing band facets ROW-SLICED under the SHARED budget (check-before-slice, never mid-slice → bounded like
 	# the close-up tier). No-op off FP_BAND_BLOCK_MAP or with no active facet. Band gets the budget FIRST (it is the near
 	# aesthetic the user is looking at); progressive base coverage below spends whatever remains.
-	if _bm_on and active_fid >= 0:
+	# FP_SKIN_FLATCOLOR + FP_SKIN_SSE: the SSE path (in _update_main's cam_dist>0 branch) OWNS the band residency
+	# (screen-space over the whole 180-facet disc). This fallback ring-1 recompute must NOT run for it — a TRANSIENT
+	# cam_dist≤0 on a facet crossing would otherwise shrink the disc to ring-1 (the visible fly-time churn / reset).
+	# Keep baking the already-committed SSE want (no recompute = no eviction) so the disc just holds + finishes.
+	if _bm_on and active_fid >= 0 and not (CubeSphere.FP_SKIN_SSE and CubeSphere.FP_SKIN_FLATCOLOR):
 		_recompute_band_want(active_fid)
 		_bake_band_budgeted(start, budget_us)
+	elif _bm_on and CubeSphere.FP_SKIN_SSE and CubeSphere.FP_SKIN_FLATCOLOR:
+		_bake_band_budgeted(start, budget_us)   # hold the disc; keep filling it even while cam_dist is transiently ≤ 0
 	# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): the g1 background cursor — re-bake already-covered (g0) facets to the REAL
 	# shot, nearest-emit-axis first then a global sweep (whole-planet convergence). Runs BEFORE g0 coverage so it is not
 	# starved by the thousands of un-covered facets: the two generations ping-pong — coverage adds a fast g0 facet, the
@@ -1082,6 +1089,12 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 	var n := mini(cand.size(), CubeSphere.BAND_LAYERS)
 	for i in range(n):
 		want[int(cand[i][1])] = true
+	# FP_SKIN_FLATCOLOR robustness: a TRANSIENT empty want (a bad axis/cam frame on a crossing) must NOT evict the whole
+	# resident disc — hold it and let the next valid frame reconcile. (A genuine high-orbit empty just keeps the bounded
+	# band resident a little longer; it is sub-pixel there anyway.)
+	if want.is_empty() and CubeSphere.FP_SKIN_FLATCOLOR and not _bm_slots.is_empty():
+		_bm_want_active = active_fid
+		return
 	# Evict residents that fell out of the capped want (never the active/approached facet — it is always nearest).
 	for fid in _bm_slots.keys():
 		if not want.has(int(fid)):
@@ -1129,6 +1142,9 @@ func _begin_band_bake(fid: int) -> bool:
 	var img: Image = Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in (RG8 under shot: shade 0 too, unread while id 0)
 	_bm_bake_img = img
+	if _bm_flat:                            # FP_SKIN_FLATCOLOR: the byte staging buffer the slices fill (id 0 = un-baked)
+		_bm_bake_bytes.resize(_bm_texels * _bm_texels)
+		_bm_bake_bytes.fill(0)
 	_bm_bake_lc.resize(4)
 	for ci in range(4):
 		var w := FacetAtlas.facet_planar_corner(fid, ci)
@@ -1219,11 +1235,11 @@ func _bm_compute_slice_shot(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 ## (a main-thread snapshot of this facet's edits, empty until Stage B) overrides a column's top block so dig-outs /
 ## placed blocks show on the far map. A FRESH per-slice GenCtx homes every query on _bm_bake_fid (race-free worker).
 func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector2Array) -> void:
-	# FAST flat-colour bake: terrain colours from the C++ sample_columns (like the non-shot L8 band) → far colour
-	# index; then a CHEAP TreeGen overlay (has_tree hash early-outs on ~all columns) + the edit snapshot decide the
-	# TOP block per texel. ~256× faster than a per-texel SurfaceShot (which ran column_profile on every texel).
+	# FAST flat-colour bake: terrain colours from the C++ sample_columns → far colour index; a CHEAP TreeGen overlay
+	# (has_tree hash early-outs) + the edit snapshot pick the TOP block. Indices are written DIRECTLY into the L8 byte
+	# buffer (no per-texel set_pixel); the staging Image is built once from the buffer on the last slice.
 	var fid := _bm_bake_fid
-	var img: Image = _bm_bake_img
+	var tex := _bm_texels
 	var have_edits: bool = not _edit_snap.is_empty()
 	var rows := r1 - r0
 	var packed := PackedInt64Array()
@@ -1249,6 +1265,7 @@ func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 	for rj in range(rows):
 		var by := r0 + rj
 		var base := rj * nx
+		var row_off := by * tex
 		for bx in range(nx):
 			var i := base + bx
 			var bid := -1
@@ -1263,7 +1280,9 @@ func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 				idx = FarPalette.far_color_index_of_block(bid) + 1   # tree/edit top block → tile-mean colour idx
 			else:
 				idx = FarPalette.far_color_index(cols[i]) + 1        # bare terrain colour → nearest palette idx
-			img.set_pixel(bx, by, Color(float(idx) / 255.0, 0.0, 0.0, 1.0))
+			_bm_bake_bytes[row_off + bx] = idx                    # direct L8 byte write (no set_pixel)
+	if r1 >= ny:                                             # last slice → build the L8 image from the byte buffer once
+		_bm_bake_img = Image.create_from_data(tex, tex, false, Image.FORMAT_L8, _bm_bake_bytes)
 
 ## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
 ## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch

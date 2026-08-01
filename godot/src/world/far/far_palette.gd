@@ -132,6 +132,7 @@ static func frozen_colors() -> PackedColorArray:
 # far map texel == the near textured block's 16×16 tile-mean colour (interior texels classify exactly, distance 0).
 static var _fc_ready := false
 static var _fc_rgb := PackedFloat32Array()
+static var _block_idx := PackedInt32Array()   # block_id -> far colour index (0..13), precomputed on the MAIN thread
 
 static func ensure_far_index_ready() -> void:
 	if _fc_ready:
@@ -143,6 +144,25 @@ static func ensure_far_index_ready() -> void:
 		_fc_rgb[i * 3] = fc[i].r
 		_fc_rgb[i * 3 + 1] = fc[i].g
 		_fc_rgb[i * 3 + 2] = fc[i].b
+	# CRITICAL (worker-safety): precompute block_id -> far colour index HERE (main thread only). _top_color routes
+	# through BlockTextures.mean_color_of, which load()s a PNG + get_image() the first time per tile — that MUST NOT
+	# run on the offloaded band-bake worker (it stalls/faults). The worker then only INDEXES _block_idx (pure read).
+	BlockCatalog.ensure_ready()
+	var n := BlockCatalog.count()
+	_block_idx.resize(n)
+	for id in range(n):
+		var c := _top_color(id)                 # main-thread mean_color_of (cached per tile stem)
+		var best := 0
+		var best_d := 1.0e30
+		for j in range(fc.size()):
+			var dr := c.r - _fc_rgb[j * 3]
+			var dg := c.g - _fc_rgb[j * 3 + 1]
+			var db := c.b - _fc_rgb[j * 3 + 2]
+			var d := dr * dr + dg * dg + db * db
+			if d < best_d:
+				best_d = d
+				best = j
+		_block_idx[id] = best
 	_fc_ready = true
 
 static func far_color_index(c: Color) -> int:
@@ -161,8 +181,12 @@ static func far_color_index(c: Color) -> int:
 			best = i
 	return best
 
+## Worker-safe: a PURE index into the precomputed _block_idx LUT (built on the main thread by ensure_far_index_ready
+## during the baker setup prewarm). NEVER loads a texture, so the offloaded band bake can call it per texel.
 static func far_color_index_of_block(block_id: int) -> int:
-	return far_color_index(_top_color(block_id))
+	if block_id >= 0 and block_id < _block_idx.size():
+		return _block_idx[block_id]
+	return 0                                        # AIR / out of range → index 0 (no texture load on the worker)
 
 ## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3) — the airless Moon far-ring palette, generalized per
 ## body exactly like the Earth colours above: every RGB is a BlockCatalog tint (regolith / basalt maria /

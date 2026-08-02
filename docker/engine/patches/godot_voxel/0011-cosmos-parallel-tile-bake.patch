@@ -885,3 +885,40 @@ index 7aa3e67..dbe9f04 100644
  		// S3: material ids resolve_cell projects to, frozen from TerrainConfig.material_tables().
  		int id_bedrock = 0, id_deepslate = 0, id_water = 0, id_lava = 0, id_ice = 0;
  		int id_sand = 0, id_red_sand = 0, id_gravel = 0, id_sandstone = 0, id_red_sandstone = 0;
+diff --git a/register_types.cpp b/register_types.cpp
+index 03aa4de..e38f230 100644
+--- a/register_types.cpp
++++ b/register_types.cpp
+@@ -1,6 +1,11 @@
+ #ifdef ZN_GODOT
+ // Module specific
+ #include "register_types.h"
++
++#ifdef __EMSCRIPTEN__
++// VOXIVERSE NEVER-OOM heap gate: EM_ASM to publish the true WASM heap size to page scope (see initialize_voxel_module).
++#include <emscripten.h>
++#endif
+ #endif
+ 
+ #include "constants/voxel_string_names.h"
+@@ -211,6 +216,20 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
+ 		open_log_file();
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++		// VOXIVERSE NEVER-OOM heap gate: expose the TRUE WASM linear-memory size to page scope so remote_bridge's
++		// _wasm_heap_mb() can read it. Godot's web export keeps the emscripten Module (and its heap views) inside a
++		// closure, so wasmMemory/HEAP8 are NOT page-scope globals, and performance.measureUserAgentSpecificMemory() is
++		// absent in some browsers. Here (inside the module) wasmMemory IS in scope; its .buffer.byteLength is the current
++		// sbrk heap (grows on demand) — the number that actually OOMs a tab. Installed once at module init.
++		EM_ASM({
++			self.__voxHeapSize = function() {
++				try { return wasmMemory.buffer.byteLength; }
++				catch (e) { try { return HEAPU8.buffer.byteLength; } catch (e2) { return -1; } }
++			};
++		});
++#endif
++
+ 		// TODO Enhancement: can I prevent users from instancing `VoxelEngine`?
+ 		// This class is used as a singleton so it's not really abstract.
+ 		// Should I use `register_abstract_class` anyways?

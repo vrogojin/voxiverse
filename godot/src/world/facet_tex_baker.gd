@@ -1914,6 +1914,7 @@ func tex_telemetry() -> Dictionary:
 		"pbm_busy": _pbm_busy_count(),
 		"offsurf": _offsurface,   # FP_CPP_FINE_BAKE diagnostic: C++ terrain path engages only when this is true
 		"cpp_on": (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null),
+		"cores": OS.get_processor_count(),   # web ⇒ navigator.hardwareConcurrency (the host logical cores the browser exposes)
 
 		"bm_facsz": band_facet_map().size(),
 		"cu_on": _cu_on,

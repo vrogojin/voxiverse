@@ -1862,7 +1862,17 @@ func _pbm_compute(i: int) -> void:
 					if eb >= 0:
 						fi = FarPalette.far_color_index_of_block(eb)
 				if fi < 0:
-					fi = SurfaceShot.top_far_index(lx, lz, ctx)
+					var deco := TreeGen.top_decoration(lx, lz, ctx)   # cheap has_tree early-out on non-tree columns
+					if deco != BlockCatalog.AIR:
+						fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))   # == top_far_index tree branch
+					else:
+						# NO-MEMO terrain (byte-equal to top_far_index): facet_profile directly, NOT column_profile. The
+						# per-facet memo NEVER hits on the fine bake's distinct columns — it only GROWS (≈4096 dict inserts
+						# per facet × 7 workers), and that shared-heap allocation is what convoys the workers (7 → 0.4 facet/s
+						# vs 1 clean at ~1). Skipping it should let the workers actually parallelise.
+						var prof := TerrainConfig.facet_profile(fid, lx, lz)
+						var g := int(prof.x)
+						fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
 				bytes[row_off + bx] = fi + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes

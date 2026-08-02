@@ -130,7 +130,7 @@ void fragment() {
 static func near_daylight_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED,
 		centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
 	if unified:
-		return _NEAR_UNIFIED_HEAD + VoxiLight.SHADE_GLSL + _NEAR_UNIFIED_TAIL
+		return _NEAR_UNIFIED_HEAD + VoxiLight.shade_glsl() + _NEAR_UNIFIED_TAIL
 	if centre_fix:
 		return _NEAR_DAYLIGHT_CENTRE_SHADER
 	return _NEAR_DAYLIGHT_SHADER

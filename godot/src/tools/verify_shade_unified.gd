@@ -64,7 +64,7 @@ func _tier_on() -> String:   return TierPlace.tier_shader_code(true)
 
 # --- G-VL-SNIPPET ----------------------------------------------------------------------------------------------
 func _gate_snippet() -> void:
-	var snip := VoxiLight.SHADE_GLSL
+	var snip := VoxiLight.shade_glsl()
 	_ok(snip.contains("vec3 voxi_shade(vec3 n, vec3 sd)"), "G-VL-SNIPPET: VoxiLight.SHADE_GLSL defines voxi_shade")
 	_ok(not snip.contains("shader_type"), "G-VL-SNIPPET: the snippet carries NO shader_type (pure body — zero new program)")
 	for pair in [["near", _near_on()], ["shell", _shell_on()], ["closeup", _cu_on()], ["abs", _abs_on()], ["tier", _tier_on()]]:
@@ -72,6 +72,12 @@ func _gate_snippet() -> void:
 			"G-VL-SNIPPET: %s unified shader string-INCLUDES VoxiLight.SHADE_GLSL verbatim" % pair[0])
 	# Falsification: a one-byte-perturbed snippet is NOT contained.
 	_ok(not (_near_on()).contains(snip + "x"), "G-VL-SNIPPET: a perturbed snippet is not contained (gate is falsifiable)")
+	# FP_TWILIGHT_AMBIENT pin: when the flag is ON the active snippet MUST diverge from the shipped base — else the
+	# .replace splice silently no-op'd (a changed SHADE_GLSL tail) and the twilight term was quietly lost. Off ⇒ identical.
+	if CubeSphere.FP_TWILIGHT_AMBIENT:
+		_ok(snip != VoxiLight.SHADE_GLSL, "G-VL-SNIPPET: FP_TWILIGHT_AMBIENT ON ⇒ shade_glsl() diverges from base (splice landed)")
+	else:
+		_ok(snip == VoxiLight.SHADE_GLSL, "G-VL-SNIPPET: FP_TWILIGHT_AMBIENT OFF ⇒ shade_glsl() == base (byte-identical)")
 
 # --- G-VL-NORMAL -----------------------------------------------------------------------------------------------
 func _gate_normal() -> void:

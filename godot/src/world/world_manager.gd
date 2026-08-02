@@ -452,11 +452,12 @@ func _ready() -> void:
 			# FP_BLOCK_DETAIL (set_facet_detail is flag-guarded; the atlas/id pages are never built by the baker either).
 			if CubeSphere.FP_BLOCK_DETAIL:
 				_facet_ring.set_facet_detail(FacetDetailAtlas.build(), _facet_tex.id_texture())
-				# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
-				# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
-				# then. No-op off FP_BAND_BLOCK_MAP (set_facet_band + band_texture are flag-guarded).
-				if CubeSphere.FP_BAND_BLOCK_MAP:
-					_facet_ring.set_facet_band(_facet_tex.band_texture())
+			# COSMOS TEXTURED-LOD U1 (§2U.1): bind the (all-un-baked at setup) band id map so the shader's band_map is
+			# never an unbound sampler; no facet carries a 64+ slot until the first band bake, so it is unsampled until
+			# then. FP_SKIN_FLATCOLOR needs this bind too (the flat band drops FP_BLOCK_DETAIL) — so it is OUTSIDE the
+			# detail gate now. No-op off FP_BAND_BLOCK_MAP (set_facet_band is _bm_on()-guarded).
+			if CubeSphere.FP_BAND_BLOCK_MAP and (CubeSphere.FP_BLOCK_DETAIL or CubeSphere.FP_SKIN_FLATCOLOR):
+				_facet_ring.set_facet_band(_facet_tex.band_texture())
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -1145,6 +1146,8 @@ func update_streaming(player_pos: Vector3) -> void:
 		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
 		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
 		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist)
+		if CubeSphere.FP_PLANET_MAP:
+			_facet_ring.set_fine_map(_facet_tex.fine_texture())   # bind the whole-planet fine tier (survives re-emit)
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:
 			_tex_slots_epoch = _facet_tex.slots_epoch()
 			if _facet_tex.closeup_texture() != null:
@@ -2952,6 +2955,15 @@ func planet_render_centre() -> Vector3:
 	if _facet_ring == null:
 		return Vector3.ZERO
 	return _facet_ring.render_centre()
+
+## The planet's LIVE render placement (body-centred ABSOLUTE frame → scene): the FacetFarRing node's
+## global_transform, which folds T_active⁻¹ / the fixed-frame anchor AND the SN3 scaled-body clamp (position +
+## basis + scale). Anything built in the same absolute frame (the dev-nav overlay guides) rides this to sit ON
+## the rendered planet. Identity when there is no faceted ring yet.
+func planet_render_transform() -> Transform3D:
+	if _facet_ring == null:
+		return Transform3D.IDENTITY
+	return _facet_ring.global_transform
 
 ## COSMOS SPACE-NAV SN3 (§5.2): apply the scaled-body distance clamp to the far ring for this frame. No-op when
 ## there is no faceted ring. Below D_ENGAGE this is byte-identical to the shipped placement (the clamp scale is

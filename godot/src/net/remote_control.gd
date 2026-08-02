@@ -332,10 +332,16 @@ func _start_thrust() -> void:
 	if seconds <= 0.0:
 		_finish_step("bad_op")
 		return
-	var wish := Vector3(float(_cur.get("dx", 0.0)), float(_cur.get("dy", 0.0)), float(_cur.get("dz", 0.0)))
-	var run := str(_cur.get("gait", "walk")) == "run"
-	if is_instance_valid(player) and player.has_method("remote_set_thrust"):
-		player.call("remote_set_thrust", wish, run)
+	# DEV cruise: `thrust` with cruise:true engages supercruise (camera look dir, distance-scaled speed) for
+	# `seconds` — the scripted analogue of holding C. Mutually exclusive with the walk/dev-flight wish (cruise is
+	# kinematic + look-driven, so dx/dy/dz are ignored). Falls back to the normal thrust seam when cruise is unset.
+	if bool(_cur.get("cruise", false)) and is_instance_valid(player) and player.has_method("remote_set_cruise"):
+		player.call("remote_set_cruise", seconds, bool(_cur.get("cruise_reverse", false)))
+	else:
+		var wish := Vector3(float(_cur.get("dx", 0.0)), float(_cur.get("dy", 0.0)), float(_cur.get("dz", 0.0)))
+		var run := str(_cur.get("gait", "walk")) == "run"
+		if is_instance_valid(player) and player.has_method("remote_set_thrust"):
+			player.call("remote_set_thrust", wish, run)
 	_hold_deadline = Time.get_ticks_msec() + int(round(seconds * 1000.0))
 
 ## roll: hold a Q/E roll rate (dir left=+ / right=−) for `seconds`. Only bites under ORBIT_ATTITUDE in SPACE.

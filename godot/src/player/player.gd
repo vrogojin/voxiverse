@@ -260,6 +260,8 @@ var _ft := {}
 var remote_drive := false                 # true only while a move step runs → _move uses remote_input/run
 var remote_input := Vector3.ZERO          # body-local wish, SAME shape as the WASD `input` vector
 var remote_run := false                   # substitutes the KEY_SHIFT poll
+var _remote_cruise_until_usec := 0         # DEV remote-cruise self-expiring deadline (usec); 0 ⇒ inert (byte-identical)
+var _remote_cruise_dir := 1                # +1 forward, -1 reverse (remote cruise direction)
 var remote_jump := false                  # one-shot latch, consumed by the grounded/fly jump branch (§4.6)
 var remote_yaw_rate := 0.0                # rad/s the executor is applying this tick (seam indicator; the
                                           # executor owns the exact rotate_y for seam-immune remaining-degrees)
@@ -888,6 +890,10 @@ func _nav_tick(delta: float) -> void:
 			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
 			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
 			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
+		# FP_DEVNAV_GUIDE_FRAME: ride the guide root on the planet's live render placement (floating-origin +
+		# scaled-body) so the axis/equator/facet-border guides sit ON the rendered planet, not the world origin.
+		if CubeSphere.FP_DEVNAV_GUIDE_FRAME and world != null and _dev_overlay.has_method("set_guides_transform"):
+			_dev_overlay.set_guides_transform(world.planet_render_transform())
 
 ## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
 ## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
@@ -1552,11 +1558,32 @@ func _move(delta: float) -> void:
 		# DEV-FLIGHT CRUISE MODE (CubeSphere.CRUISE_MODE): while dev-flying IN SPACE (radial alt > ATMO_TOP), HOLDING C
 		# flies the camera LOOK dir at an exponential distance-scaled speed; release C ⇒ instant stop (kinematic, no
 		# residual drift). Flag OFF ⇒ C never polled ⇒ byte-identical. Uses radial_altitude() (nearest/dominant body).
-		if CubeSphere.CRUISE_MODE and not remote_drive:
+		# DEV remote-cruise: remote_cruise_active() lets the CONTROL_ENABLED executor drive cruise for a timed hold
+		# (a human can't send a C keypress). Off ⇒ remote_cruise_active() is always false ⇒ this reduces to the
+		# shipped `not remote_drive` + physical-C predicate exactly (byte-identical).
+		if CubeSphere.CRUISE_MODE and (remote_cruise_active() or not remote_drive):
 			var cruise_alt := radial_altitude()
-			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, Input.is_key_pressed(KEY_C)):
-				var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
-				var look_dir := (transform.basis * look_local)
+			# C = forward cruise, B = REVERSE cruise (fly backward along the look dir). Either engages; when only B
+			# (or the remote reverse dir) is held, the look_dir is negated below.
+			var fwd_held := Input.is_key_pressed(KEY_C) or (remote_cruise_active() and _remote_cruise_dir >= 0)
+			var rev_held := Input.is_key_pressed(KEY_B) or (remote_cruise_active() and _remote_cruise_dir < 0)
+			var c_held := fwd_held or rev_held
+			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, c_held):
+				# FP_CRUISE_LOOKDIR: fly along the camera view in space. `position` is a LATTICE pose, so the look
+				# dir MUST be a LATTICE direction — the camera basis re-expressed in the active facet lattice (the
+				# SAME construction _kinematic_look_fly uses). Using the GLOBAL window_camera_transform() basis here
+				# scrambles the axes under the facet's world tilt (flies the wrong way). ATT_SURFACE or flag off ⇒
+				# the shipped body-yaw+pitch path (byte-identical), which is already in-frame on the surface.
+				var look_dir: Vector3
+				var cr_afid := TerrainConfig.active_facet()
+				if CubeSphere.FP_CRUISE_LOOKDIR and CubeSphere.ORBIT_6DOF_FLY and _att_mode != ATT_SURFACE and cr_afid >= 0:
+					var b_lat_cam := _CosmosAttitudeCls.lat_cam_basis(_FacetAtlasCls.frame_basis(cr_afid), _attitude_scene_basis())
+					look_dir = b_lat_cam * Vector3(0.0, 0.0, -1.0)
+				else:
+					var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
+					look_dir = (transform.basis * look_local)
+				if rev_held and not fwd_held:
+					look_dir = -look_dir                     # B / remote-reverse: cruise backward along the view
 				if look_dir.length() > 0.0:
 					look_dir = look_dir.normalized()
 				var cruise_v := CubeSphere.cruise_speed(cruise_alt)
@@ -2225,6 +2252,19 @@ func remote_stop_thrust() -> void:
 	remote_drive = false
 	remote_input = Vector3.ZERO
 	remote_run = false
+
+## DEV remote-cruise (remote `thrust` step with cruise:true) — the scripted-test analogue of HOLDING C, which a
+## remote drive cannot press. Engages supercruise for `seconds` along the current camera look dir via a
+## self-expiring deadline, so the cruise branch runs each tick WITHOUT remote_drive (which would gate cruise off).
+## Only reachable through the CONTROL_ENABLED executor; `_remote_cruise_until_usec` stays 0 otherwise, so
+## remote_cruise_active() is always false and the cruise branch is byte-identical to shipped.
+func remote_set_cruise(seconds: float, reverse: bool = false) -> void:
+	_remote_cruise_until_usec = Time.get_ticks_usec() + int(maxf(0.0, seconds) * 1.0e6)
+	_remote_cruise_dir = -1 if reverse else 1
+
+## True while a remote cruise deadline is live (drives the cruise engage predicate alongside the physical C key).
+func remote_cruise_active() -> bool:
+	return _remote_cruise_until_usec > 0 and Time.get_ticks_usec() < _remote_cruise_until_usec
 
 ## roll seam (Q/E held): rad/s applied to the BCI attitude in _attitude_tick's SPACE branch. Zeroed by the
 ## executor at the roll step's deadline. No-op unless ORBIT_ATTITUDE is engaged and the camera is emancipated.

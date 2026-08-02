@@ -515,6 +515,13 @@ const FP_SKIN_TIER := false
 ## NEVER-OOM: fixed-size pages (base-tier-only ≈ 8.2 MB ceiling, FacetTexBaker.total_bytes()). Flipped ON at
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
+## FP_SKIN_TEXTURE_MEAN — the far §2V skin's per-block colour = the block's TEXTURE-TILE MEAN (what the near
+## textured block averages to on screen) instead of the flat BlockCatalog swatch. Root cause of "far land pixels
+## don't match near blocks at all": near renders the real CC0 tile (grass.png…), far paints the blocks.json
+## swatch — two unrelated colour sources. FarPalette._top_color routes every surface colour through
+## BlockTextures.mean_color_of when on; the C++ skin path inherits it via frozen_colors() (NO module rebuild).
+## Tile-less ids (water/lava) fall back to the swatch. Default FALSE ⇒ byte-identical. Requires FP_FACET_TEX.
+const FP_SKIN_TEXTURE_MEAN := false
 
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
@@ -586,10 +593,74 @@ const FP_DETAIL_GRID := false
 ## BAND_LAYERS × BAND_TEXELS² L8 (2.36 MB GPU) + ONE CPU staging layer (0.26 MB) ⇒ ≈ +2.7 MB → combined ceiling 43 MB.
 ## Gate: verify_band_map.gd (G-BB-EXACT / G-BB-BYTES / G-BB-SLOT / G-BB-OFF).
 const FP_BAND_BLOCK_MAP := false
+## FP_SKIN_FLATCOLOR — render the per-block band as FLAT tile-mean COLOUR (band id → far_lut[id], the frozen_colors
+## tile-mean palette) instead of the FP_BLOCK_DETAIL texture patterns (the "awkward" look). This IS the Minecraft-style
+## per-block map skin: 1 texel ≈ 1 block, each texel = the block's 16×16 texture averaged to one pixel (needs
+## FP_SKIN_TEXTURE_MEAN for the mean palette). Covers the whole visible disc via the FP_SKIN_SSE screen-space residency
+## up to BAND_LAYERS; the coarse base map backstops only the sub-pixel far limb. Default false ⇒ byte-identical (band
+## stays pattern-textured). Requires FP_BAND_BLOCK_MAP ∧ FP_SKIN_SSE. NEVER-OOM: BAND_LAYERS×BAND_TEXELS² L8, fixed.
+const FP_SKIN_FLATCOLOR := false
+## FP_BAND_META_TEX — replace the band reverse-map UNIFORM ARRAYS (band_facet[N]/band_n[N]) in the flat-colour shell
+## shader with ONE RGBA32F data texture (band_meta, 512×1, texelFetch). The uniform arrays burn a fragment-uniform-vec
+## slot per layer and blew past the ~1024 ANGLE limit at 400 layers (live breakage → reverted). A data texture has no
+## such cap, so BAND_LAYERS can grow to the 2048 array-layer limit. Default false ⇒ the shipped uniform-array splice,
+## byte-identical (FLAT 6042/0). Requires FP_SKIN_FLATCOLOR. Gate: verify_band_meta.gd.
+const FP_BAND_META_TEX := false
+## Band layer count when FP_BAND_META_TEX is on (the uniform-array path physically cannot host this — tied to the flag).
+## FP_PLANET_MAP — an ALWAYS-RESIDENT whole-planet FINE map so orbiting never shows coarse/unbaked zones. L8
+## palette-index (far_lut) at PLANET_MAP_TEXELS/facet, stored as a 24-layer Texture2DArray of 1536² sub-pages
+## (6 faces × 2×2 quadrants of 12 facets; layer = face*4 + qy*2 + qx). ~57MB GPU. Baked whole-planet by a clone of
+## the multi-core _pbm GDScript-sampler path, nearest-first, NEVER evicted. Default false ⇒ no alloc, byte-off.
+## Requires FP_SKIN_FLATCOLOR (shares far_lut). Gate: verify_planet_map.gd.
+const FP_PLANET_MAP := false
+const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
+const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
+const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.
+## Effective band layer count: 512 when FP_BAND_META_TEX (data-texture reverse-map, no uniform cap) else the array-safe 180.
+static func band_layers() -> int:
+	return BAND_LAYERS_BIG if FP_BAND_META_TEX else BAND_LAYERS
 const BAND_TEXELS := 512                   # per-facet band-map edge in texels (covers a ≤512-block facet param edge, 1 texel/block)
-const BAND_LAYERS := 9                     # band residency = active + ring-1 (≤ 9 layers → 2.36 MB GPU, fixed at creation)
-const BAND_SLICE_ROWS := 32                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
-const BAND_BYTES_MAX := 3 * 1024 * 1024    # NEVER-OOM ceiling for the L8 band tier alone (2.36 GPU + 0.26 staging ⇒ < 3 MB)
+const BAND_LAYERS := 180                   # known-good under the GPU array + fragment-uniform limits; growing past this needs a data-texture reverse-map (not uniform arrays)
+const BAND_SLICE_ROWS := 128                # rows baked per budget slice (chunk-row; ≈ Nx·32 sample_columns cols per slice, under 2 ms)
+const BAND_BYTES_MAX := 48 * 1024 * 1024    # shipped 180-layer L8 band ceiling (180x512^2 = 47.2MB + staging) — the byte-off value
+const BAND_BYTES_MAX_BIG := 70 * 1024 * 1024   # FP_BAND_META_TEX 240-layer ceiling (240x512^2 = 63MB + staging)
+## Effective band byte ceiling — tied to band_layers() so the flag-OFF gate keeps the shipped 48MB (Fable audit F3:
+## don't enlarge the NEVER-OOM ceiling unconditionally, or a flag-off over-alloc bug hides under a 70MB roof).
+static func band_bytes_max() -> int:
+	return BAND_BYTES_MAX_BIG if FP_BAND_META_TEX else BAND_BYTES_MAX
+## FP_SKIN_SSE band promote reach (blocks). The band (1 block/texel) is a CLOSE-APPROACH sharpener: a band texel
+## stays ≳ 1 px only within ~K_px (1407) of the camera, so it's visually meaningful ONLY on low approach — below it
+## the whole-planet FINE tier (FP_PLANET_MAP, 3 blk/texel) is equal-or-better AND fully baked. Fable audit F1: at
+## 3600/8000 the SUB-PIXEL band promoted the nadir quad at mid-orbit (alt ~2000, dist < promote), and each band
+## facet's slow 174k-shot bake showed the PALE BASE meanwhile → the washed centre-quad. 1500 (~K_px) keeps the band
+## to genuine close approach; at alt ≥ ~1500 the fine tier owns the disc (no quad). Only read under FP_SKIN_FLATCOLOR
+## (byte-off unaffected). Belt-and-suspenders: the shader also falls an un-baked/evicted band texel to fine (F1 ii/iii).
+const BAND_PROMOTE_DIST := 1500.0
+
+## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
+## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
+## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted
+## by the SAME map skin (band→fine→base) as the heightfield; smooth vertices carry radial density-gradient normals for
+## true relief lighting. NEVER-OOM: per-tier facet caps + SMOOTH_BYTES_MAX, fixed at creation. Default false ⇒ the
+## FacetSmoothTier is never constructed, byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd.
+const FP_FAR_SMOOTH := false
+## FP_FAR_SMOOTH_OVERHANG — the edit-cluster occupancy patches (dug arches/overhangs via FarDensity.occ_at). Requires
+## FP_FAR_SMOOTH. Item B4 — the designated cut if the night runs short. Default false.
+const FP_FAR_SMOOTH_OVERHANG := false
+## Smooth tier ladder (§2.4): cells-per-facet-edge per tier. Facet edge ≈ 417 blocks (K=24) ⇒ ~4/8/16/32-block pitch.
+const SMOOTH_S2_CELLS := 104
+const SMOOTH_S3_CELLS := 52
+const SMOOTH_S4_CELLS := 26
+const SMOOTH_S5_CELLS := 13
+## Residency caps: max facets held resident at each tier (NEVER-OOM, enforced by the LRU in B3). Worst-case far-tri
+## budget ≈ 9·21.6k + 25·5.4k + 64·1.4k + 200·0.34k ≈ 488k tris; +≤8 draws (tiers merged into ≤2 ArrayMeshes each).
+const SMOOTH_S2_MAX := 9
+const SMOOTH_S3_MAX := 25
+const SMOOTH_S4_MAX := 64
+const SMOOTH_S5_MAX := 200
+const SMOOTH_SKIRT_BLOCKS := 4.0            # always-on radial skirt along every facet-tile border (§2.4 crack backstop)
+const SMOOTH_BYTES_MAX := 96 * 1024 * 1024  # smooth mesh cache ceiling (worst ≈ 40MB + edit-patch headroom) — fixed
+const SMOOTH_BUILD_SLOTS := 8               # WorkerThreadPool tiles in flight (B2/B3 driver) — cores−1 ≤ 8
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
@@ -624,6 +695,16 @@ const BAND_SHOT_BYTES_MAX := 6 * 1024 * 1024  # NEVER-OOM ceiling for the RG8 ba
 ## Off ⇒ nothing includes the snippet, no planet_centre is pushed, every shader string is BYTE-IDENTICAL and every near
 ## material keeps NEAR_NIGHT_FLOOR — FLAT 6042/0. Gate: verify_shade_unified.gd (G-VL-EQ, incl. a scripted crossing).
 const FP_SHADE_UNIFIED := false
+
+## FP_TWILIGHT_AMBIENT — a skylight/twilight ambient floor in the shared voxi_shade law. The shipped law is
+## direct-sun only (shade × scatter_tint); scatter_tint models atmospheric EXTINCTION, which collapses toward
+## black at low sun (air-mass ~38 at the horizon ⇒ tint ≈ (0.2, 0.02, 0)), so the ground goes near-black in the
+## last few degrees before sunset while the sun is still visibly up (the user's "too dark while the sun shines").
+## Real dusk stays lit because the whole sky is a diffuse source — this adds that: a cool ambient term active over
+## a twilight band of sun elevation (~−14°…+11°), peaking at the horizon, fading to the night floor below and to
+## clean daylight above. Uses VoxiLight.shade_glsl() so OFF ⇒ the shipped SHADE_GLSL verbatim (byte-identical,
+## FLAT 6042/0; verify_shade_unified still finds voxi_shade). Requires FP_SHADE_UNIFIED. Bake ON at export.
+const FP_TWILIGHT_AMBIENT := false
 
 ## COSMOS TEXTURED-LOD U2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3a: cull, don't sink). Today the
 ## backstop facets (active ∪ live-pool, drawn at BACKSTOP_CELLS) are emitted UNDER the near voxels — the sink hides the
@@ -894,7 +975,7 @@ static func block_lod_orbit_engaged(h: float, currently_engaged: bool) -> bool:
 ## closeup sampler is never compiled) ⇒ byte-identical to Phase-1/shipped. NEVER-OOM: 64×128² RGBA8+mips ≈ 5.6 MB
 ## fixed at creation, LRU evicts ONLY outside-cap facets (the base map is the safe floor). Requires FP_FACET_TEX.
 const FP_FACET_TEX_CLOSEUP := false
-const FACET_TEX_BAKE_BUDGET_MS := 2.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
+const FACET_TEX_BAKE_BUDGET_MS := 5.0     # §THE HARD PERF CONSTRAINT: per-frame bake budget, CHECKED BEFORE each bake unit
 const CLOSEUP_MAX := 64                    # close-up Texture2DArray layer count (fixed at creation → NEVER-OOM)
 const CLOSEUP_TEXELS := 128               # texels per close-up facet edge (≈3.3 blocks/texel, 8× the base map)
 const CLOSEUP_SLICE_ROWS := 16            # rows baked per budget slice (16·128 = 2048 sample_columns cols ≈ 0.5 ms native)
@@ -1492,6 +1573,13 @@ const SN_NAV_MODES := false
 ## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
 ## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
 const SN_DEVNAV := false
+## FP_DEVNAV_GUIDE_FRAME — anchor the dev-nav 3-D overlay GUIDES (spin-axis, equator ring, facet borders) to the
+## planet's LIVE render placement (WorldManager.planet_render_transform() = the FacetFarRing node global_transform)
+## instead of the world origin. The guides are built in the body-centred ABSOLUTE frame; under the floating-origin
+## / scaled-body render the planet is offset+oriented+scaled away from origin, so origin-anchored guides float off
+## the planet ("guides totally off"). On ⇒ the guide root rides that exact transform each frame. Default FALSE ⇒
+## byte-identical (guides stay at origin). Requires SN_DEVNAV.
+const FP_DEVNAV_GUIDE_FRAME := false
 
 ## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
 ## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
@@ -1998,6 +2086,12 @@ const ATMO_BRAKE_TERMINAL := 20.0
 ## from the nearest body's surface. RELEASE C ⇒ INSTANT STOP (kinematic fly, velocity held 0). Engage needs
 ## dev-flight active + in-space + C held. Default FALSE ⇒ BYTE-IDENTICAL (C never polled). Gate G-CRUISE.
 const CRUISE_MODE := false
+## FP_CRUISE_LOOKDIR — cruise flies along the TRUE displayed camera forward (window_camera_transform basis · −Z),
+## not `transform.basis`. In ATT_SPACE the camera is emancipated (6DOF attitude), so transform.basis (the surface/
+## lattice orientation) points somewhere unrelated to where the pilot looks — cruise then flies "a totally wrong
+## direction". On ⇒ cruise supercruises exactly where the camera aims in EVERY attitude mode. Default FALSE ⇒
+## byte-identical (the old transform.basis path). Only meaningful when CRUISE_MODE is also on.
+const FP_CRUISE_LOOKDIR := false
 ## Cruise speed law (blocks/s; 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks). speed(alt) =
 ## clamp(MIN·2^(alt/BAND), MIN, MAX). MIN 200 = crawl just above ATMO_TOP; BAND 4000 = doubles/4000 blocks (cap
 ## by ~18.6k alt); MAX 5000 = Earth→Moon crossing ≈ 77 s (1–3 min window). radial_altitude() = nearest-body alt.

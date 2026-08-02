@@ -55,6 +55,21 @@ vec3 voxi_shade(vec3 n, vec3 sd) {
 }
 "
 
+## COSMOS TWILIGHT — the shade snippet the shaders actually splice. FP_TWILIGHT_AMBIENT OFF ⇒ the shipped SHADE_GLSL
+## verbatim (byte-identical; every splice site + verify_shade_unified see the unchanged string). ON ⇒ voxi_shade adds a
+## cool ADDITIVE skylight term over a twilight band so the ground never goes near-black while the sun is up: `_twi`
+## peaks at the horizon (μ≈0) and tapers to 0 below ~−14° (into the night floor) and above ~+11° (clean daylight), and
+## TWI_RGB (= a dim cool dusk sky) is the diffuse fill the direct-sun-only law lacked. Kept as a localized string edit on
+## the ONE base so there is a single source of the law.
+const _TWI_RETURN := "	vec3 _direct = vec3(shade) * tint;
+	float _twi = smoothstep(-0.25, -0.02, mu) * (1.0 - smoothstep(-0.02, 0.20, mu));
+	return _direct + vec3(0.150, 0.180, 0.240) * _twi;
+}"
+static func shade_glsl() -> String:
+	if not CubeSphere.FP_TWILIGHT_AMBIENT:
+		return SHADE_GLSL
+	return SHADE_GLSL.replace("	return vec3(shade) * tint;\n}", _TWI_RETURN)
+
 # --- GDScript twin of the GLSL law (byte-for-byte equivalent) — the reference the G-VL-EQ numeric sweep drives ------
 
 static func _air_mass(mu: float) -> float:

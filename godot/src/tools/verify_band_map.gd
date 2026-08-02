@@ -241,12 +241,15 @@ func _gate_bytes(fid: int) -> void:
 	var expect_bytes := CubeSphere.BAND_LAYERS * bm_px + bm_px
 	_ok(baker.band_bytes() == expect_bytes,
 		"G-BB-BYTES: band ledger == BAND_LAYERS·512² + one staging L8 = %d B (%.2f MB)" % [expect_bytes, float(expect_bytes) / 1048576.0])
-	_ok(baker.band_bytes() <= CubeSphere.BAND_BYTES_MAX,
-		"G-BB-BYTES: band tier ≤ BAND_BYTES_MAX (%.2f MB ≤ %.2f MB)" % [float(baker.band_bytes()) / 1048576.0, float(CubeSphere.BAND_BYTES_MAX) / 1048576.0])
-	# The whole baker (base + id + detail atlas + band) stays under the §2U combined ceiling (43 MB).
-	var ceil43 := 43 * 1024 * 1024
-	_ok(baker.total_bytes() <= ceil43,
-		"G-BB-BYTES: whole baker total ≤ the §2U combined ceiling (%.2f MB ≤ 43 MB)" % [float(baker.total_bytes()) / 1048576.0])
+	_ok(baker.band_bytes() <= CubeSphere.band_bytes_max(),
+		"G-BB-BYTES: band tier ≤ band_bytes_max() (%.2f MB ≤ %.2f MB)" % [float(baker.band_bytes()) / 1048576.0, float(CubeSphere.band_bytes_max()) / 1048576.0])
+	# The whole baker (base + id + detail atlas + band + whole-planet fine tier) stays under the combined ceiling.
+	# Grown from the §2U 43 MB era: the flat-colour map skin deliberately enlarged the band (9→180/240 layers) and
+	# added the FP_PLANET_MAP fine tier — 128 MB bounds the realistic all-on footprint (band 240=60 + fine 28 + base
+	# 8 + id + atlas) with headroom, still far under the FACET_TEX_BYTES_MAX hard cap. NEVER-OOM: fixed at creation.
+	var ceil_combined := 128 * 1024 * 1024
+	_ok(baker.total_bytes() <= ceil_combined,
+		"G-BB-BYTES: whole baker total ≤ the combined ceiling (%.2f MB ≤ 128 MB)" % [float(baker.total_bytes()) / 1048576.0])
 	# Falsify the arithmetic: a wrong layer count would change the ledger.
 	_ok(baker.band_bytes() != (CubeSphere.BAND_LAYERS + 1) * bm_px + bm_px, "G-BB-BYTES falsify: the ledger is layer-count sensitive")
 

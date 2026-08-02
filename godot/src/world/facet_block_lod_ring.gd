@@ -674,7 +674,7 @@ func _make_material() -> ShaderMaterial:
 	var call: String
 	if CubeSphere.FP_SHADE_UNIFIED:
 		# The shared law declares sun_dir/night_floor/term_mu/moonshine + voxi_shade(n, sd).
-		light = VoxiLight.SHADE_GLSL
+		light = VoxiLight.shade_glsl()
 		call = "voxi_shade(n, sun_dir)"
 	else:
 		# Inline shell law (byte-mirrors _SHELL_ABS_SHADER's day/night shade·tint — the shipped far-skin look).

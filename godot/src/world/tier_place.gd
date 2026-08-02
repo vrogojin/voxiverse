@@ -197,7 +197,7 @@ void fragment() {
 ## depth-biased material self-shaded by the shared VoxiLight law. Exposed static so the G-VL-EQ gate can build both.
 static func tier_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
 	if unified:
-		return _TIER_UNIFIED_HEAD + VoxiLight.SHADE_GLSL + _TIER_UNIFIED_TAIL
+		return _TIER_UNIFIED_HEAD + VoxiLight.shade_glsl() + _TIER_UNIFIED_TAIL
 	return _TIER_SHADER
 
 static func make_biased_material(bias: float) -> ShaderMaterial:

@@ -112,6 +112,8 @@ var _centre_pack := PackedVector3Array()
 # All zero / never created off FP_BAND_BLOCK_MAP. NEVER-OOM: fixed BAND_LAYERS × BAND_TEXELS² L8 + ONE staging layer.
 var _bm_on := false                  # FP_BAND_BLOCK_MAP && _bd_on && the baker exists (set in setup)
 var _bm_shot := false                # COSMOS TEXTURED-LOD §2V V2: FP_BAND_SHOT && _bm_on ⇒ band is RG8 {id,shade} (real shot incl trees)
+var _bm_flat := false                # FP_SKIN_FLATCOLOR: band is L8 {far-colour-index+1} (Minecraft map skin, tile-mean colour incl trees/edits)
+var _edit_snap := {}                 # FP_SKIN_FLATCOLOR: main-thread snapshot of the bake facet's edits {Vector2i(lx,lz)->block_id}; empty until Stage-B wires it
 var _bm_texels := 0                  # BAND_TEXELS (512)
 var _bm_tex: Texture2DArray = null   # the BAND_LAYERS-layer GPU band id map (bound into the ring's band_map uniform)
 var _bm_slots: Dictionary = {}       # fid -> layer (RESIDENT: baked + uploaded; the value fed to UV2.y as 64+layer)
@@ -124,6 +126,34 @@ var _bm_bake_fid := -1              # facet whose band bake is in progress (row-
 var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
 var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
 var _bm_bake_img: Image = null      # the in-progress BAND_TEXELS² staging image (L8 {id} / RG8 {id,shade} under FP_BAND_SHOT; id 0 until rows fill in)
+var _bm_bake_bytes := PackedByteArray()   # FP_SKIN_FLATCOLOR: the L8 index bytes filled by the slices (direct byte writes, NO set_pixel → fast + unambiguous); the image is built from this at the last slice
+# FP_SKIN_FLATCOLOR MULTI-CORE band bake: fan N full-facet bakes across WorkerThreadPool (one per core) instead of the
+# single-in-flight JobLane unit. Each slot is a fully independent full-facet compute (pure: sample_columns + tree +
+# edit snapshot → L8 byte buffer); main commits finished slots each frame. Residency structures (_bm_slots/_bm_free/
+# _bm_facet/_bm_n/_bm_epoch/_bm_want) are shared with the single path but written ONLY on main (single-writer).
+var _pbm_on := false
+var _pbm_n := 0
+var _pbm_fid: Array = []            # slot -> fid being computed (-1 idle) [main-written pre-dispatch, worker-read]
+var _pbm_layer: Array = []          # slot -> reserved band layer
+var _pbm_task: Array = []           # slot -> WorkerThreadPool task id
+var _pbm_bytes: Array = []          # slot -> PackedByteArray result (worker-written under _pbm_mutex)
+var _pbm_lc: Array = []             # slot -> PackedVector2Array lattice corners
+var _pbm_nx: Array = []             # slot -> Nx
+var _pbm_ny: Array = []             # slot -> Ny
+var _pbm_mutex := Mutex.new()       # guards the result handoff (_pbm_bytes[i]) between worker and main
+var _pbm_mode: Array = []           # slot -> 0 band (bm_texels² → layer), 1 fine (fm_texels² → sub-page)
+# FP_PLANET_MAP fine tier — always-resident whole-planet L8 map, 24 sub-page layers (6 faces × 2×2 quadrants).
+var _fm_on := false
+var _fm_texels := 0                 # PLANET_MAP_TEXELS (128)
+var _fm_quad := 0                   # PLANET_MAP_QUAD (12); sub-page edge = quad·texels = 1536
+var _fm_page := 0
+var _fm_pages: Array = []           # 24 L8 sub-page staging Images (blit target)
+var _fm_tex: Texture2DArray = null  # 24-layer GPU array (bound as fine_map)
+var _fine_baked: Dictionary = {}    # fid -> true (baked into its sub-page)
+var _fm_dirty: Dictionary = {}      # layer -> true (needs update_layer)
+var _fm_epoch := 0
+var _fm_upload_cd := 0
+var _fm_cursor := 0
 var _bm_bake_lc := PackedVector2Array()  # the in-progress facet's 4 lattice corners (computed once per facet)
 var _bm_bake_nx := 0               # the in-progress facet's block count along s (round |lc1-lc0|)
 var _bm_bake_ny := 0               # the in-progress facet's block count along t (round |lc3-lc0|)
@@ -218,17 +248,25 @@ func setup(active_fid: int) -> void:
 	# and seed the free-layer pool + reverse maps. Requires FP_BLOCK_DETAIL (the band composites detail_map[id]) so _bm_on
 	# implies _bd_on. Only under FP_BAND_BLOCK_MAP -> zero band bytes with the flag off. Built ONCE (all id 0 -> the shader's
 	# band branch is skipped until a facet is baked resident); a completed bake only does a cheap update_layer.
-	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and _bd_on
+	_bm_on = CubeSphere.FP_BAND_BLOCK_MAP and (_bd_on or CubeSphere.FP_SKIN_FLATCOLOR)
 	# COSMOS TEXTURED-LOD §2V V2 (FP_BAND_SHOT): the band stores RG8 {block_id, shade} (the real shot incl trees) instead
 	# of L8 {id}. Off ⇒ _bm_shot false ⇒ the L8 format + id-only bake below are BYTE-IDENTICAL to the U1 band.
 	_bm_shot = CubeSphere.FP_BAND_SHOT and _bm_on
+	# FP_SKIN_FLATCOLOR: bake the band as an L8 per-block COLOUR-INDEX map (tile-mean palette, incl trees) so the shell
+	# shader flat-colours it (no detail pattern). Prewarm the palette + classifier on the MAIN thread here so the
+	# offloaded band worker never races init (mirrors the shot prewarm). Mutually exclusive with the RG8 shot band.
+	_bm_flat = CubeSphere.FP_SKIN_FLATCOLOR and _bm_on and not _bm_shot
+	if _bm_flat:
+		BlockCatalog.ensure_ready()
+		FarPalette.ensure_ready()
+		FarPalette.ensure_far_index_ready()
 	if _bm_on:
 		_bm_texels = CubeSphere.BAND_TEXELS
-		_bm_facet.resize(CubeSphere.BAND_LAYERS)
-		_bm_n.resize(CubeSphere.BAND_LAYERS)
+		_bm_facet.resize(CubeSphere.band_layers())
+		_bm_n.resize(CubeSphere.band_layers())
 		_bm_free.clear()
 		var bimgs: Array[Image] = []
-		for i in range(CubeSphere.BAND_LAYERS):
+		for i in range(CubeSphere.band_layers()):
 			var bimg := Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 			bimg.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
 			_bm_facet[i] = Vector2(-1.0, -1.0)
@@ -455,6 +493,12 @@ func set_frozen(frozen: bool) -> void:
 func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	if _frozen:
 		return
+	# FP_SKIN_FLATCOLOR multi-core band: refresh the residency want on main, then reap/dispatch the parallel full-facet
+	# bakes across all cores. The band is handled ENTIRELY here — the single-in-flight paths below skip it (not _pbm_on).
+	if _pbm_on:
+		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0 and _bm_on and active_fid >= 0:
+			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
+		_update_band_parallel(emit_axis)
 	if _worker_on:
 		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:
@@ -501,9 +545,15 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 	# then bake missing band facets ROW-SLICED under the SHARED budget (check-before-slice, never mid-slice → bounded like
 	# the close-up tier). No-op off FP_BAND_BLOCK_MAP or with no active facet. Band gets the budget FIRST (it is the near
 	# aesthetic the user is looking at); progressive base coverage below spends whatever remains.
-	if _bm_on and active_fid >= 0:
+	# FP_SKIN_FLATCOLOR + FP_SKIN_SSE: the SSE path (in _update_main's cam_dist>0 branch) OWNS the band residency
+	# (screen-space over the whole 180-facet disc). This fallback ring-1 recompute must NOT run for it — a TRANSIENT
+	# cam_dist≤0 on a facet crossing would otherwise shrink the disc to ring-1 (the visible fly-time churn / reset).
+	# Keep baking the already-committed SSE want (no recompute = no eviction) so the disc just holds + finishes.
+	if _bm_on and active_fid >= 0 and not (CubeSphere.FP_SKIN_SSE and CubeSphere.FP_SKIN_FLATCOLOR):
 		_recompute_band_want(active_fid)
 		_bake_band_budgeted(start, budget_us)
+	elif _bm_on and CubeSphere.FP_SKIN_SSE and CubeSphere.FP_SKIN_FLATCOLOR:
+		_bake_band_budgeted(start, budget_us)   # hold the disc; keep filling it even while cam_dist is transiently ≤ 0
 	# COSMOS TEXTURED-LOD V3 (FP_PAGES_SHOT): the g1 background cursor — re-bake already-covered (g0) facets to the REAL
 	# shot, nearest-emit-axis first then a global sweep (whole-planet convergence). Runs BEFORE g0 coverage so it is not
 	# starved by the thousands of un-covered facets: the two generations ping-pong — coverage adds a fast g0 facet, the
@@ -538,7 +588,7 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 		# COSMOS TEXTURED-LOD V4 (§2V.2): the SSE monotone law drives the want-sets when on + cam_dist known (NO evict-all);
 		# else the shipped regime-keyed orchestration below. _select_worker_unit's close-up>band>base priority is unchanged.
 		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0:
-			if _bm_on and active_fid >= 0:
+			if _bm_on and active_fid >= 0 and not _pbm_on:
 				_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
 			if _cu_on:
 				_recompute_want_sse(emit_axis, cam_dist)
@@ -547,7 +597,7 @@ func _update_worker(emit_axis: Array, offsurface: bool, budget_ms: float, active
 				_recompute_want(emit_axis)
 			elif _cu_on and not _cu_want.is_empty():
 				_evict_all_closeup()
-			if _bm_on and active_fid >= 0:
+			if _bm_on and active_fid >= 0 and not _pbm_on:
 				_recompute_band_want(active_fid)
 		# --- pick ONE compute unit (priority: visible close-up > near band > progressive base), freeze + dispatch ---
 		if _select_worker_unit(offsurface, emit_axis, active_fid):
@@ -571,8 +621,8 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 		var cf := _next_want_to_bake()
 		if cf >= 0 and _begin_closeup_bake(cf):
 			_job_kind = "cu"; return true
-	# Near-far band next.
-	if _bm_on and active_fid >= 0:
+	# Near-far band next — SKIPPED when the multi-core parallel band bake owns it (_pbm_on).
+	if _bm_on and active_fid >= 0 and not _pbm_on:
 		if _bm_bake_fid >= 0:
 			_job_kind = "bm"; return true            # continue the in-progress band facet
 		var bf := _next_band_to_bake()
@@ -1025,7 +1075,7 @@ func _recompute_band_want(active_fid: int) -> void:
 	var want := {}
 	var ring := TierPlace.ring1(active_fid)          # [active, 4 seam, diagonals…]; take the nearest BAND_LAYERS
 	for i in range(ring.size()):
-		if want.size() >= CubeSphere.BAND_LAYERS:
+		if want.size() >= CubeSphere.band_layers():
 			break
 		want[int(ring[i])] = true
 	# Evict residents no longer in the band ring (the evict-only-on-ring-exit invariant the gate checks).
@@ -1053,8 +1103,10 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 		return
 	var r := FacetAtlas.R_BLOCKS
 	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
-	var promote := CubeSphere.CLOSEUP_NEAR
-	var release := CubeSphere.CLOSEUP_NEAR * CubeSphere.SSE_HYST
+	# FP_SKIN_FLATCOLOR wants the per-block map out to the visible disc (up to BAND_LAYERS nearest); the shipped
+	# close-up reach (CLOSEUP_NEAR) only feeds ~ring-1. BAND_LAYERS still self-caps the nearest-first want.
+	var promote: float = CubeSphere.BAND_PROMOTE_DIST if CubeSphere.FP_SKIN_FLATCOLOR else CubeSphere.CLOSEUP_NEAR
+	var release := promote * CubeSphere.SSE_HYST
 	var cand := []                              # [dist, fid]
 	for fid in range(_base_all):
 		var cd := _centre_pack[fid]
@@ -1067,9 +1119,15 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 			cand.append([dist, fid])
 	cand.sort()                                 # nearest first → the capped want is the BAND_LAYERS nearest facets
 	var want := {}
-	var n := mini(cand.size(), CubeSphere.BAND_LAYERS)
+	var n := mini(cand.size(), CubeSphere.band_layers())
 	for i in range(n):
 		want[int(cand[i][1])] = true
+	# FP_SKIN_FLATCOLOR robustness: a TRANSIENT empty want (a bad axis/cam frame on a crossing) must NOT evict the whole
+	# resident disc — hold it and let the next valid frame reconcile. (A genuine high-orbit empty just keeps the bounded
+	# band resident a little longer; it is sub-pixel there anyway.)
+	if want.is_empty() and CubeSphere.FP_SKIN_FLATCOLOR and not _bm_slots.is_empty():
+		_bm_want_active = active_fid
+		return
 	# Evict residents that fell out of the capped want (never the active/approached facet — it is always nearest).
 	for fid in _bm_slots.keys():
 		if not want.has(int(fid)):
@@ -1117,6 +1175,9 @@ func _begin_band_bake(fid: int) -> bool:
 	var img: Image = Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in (RG8 under shot: shade 0 too, unread while id 0)
 	_bm_bake_img = img
+	if _bm_flat:                            # FP_SKIN_FLATCOLOR: the byte staging buffer the slices fill (id 0 = un-baked)
+		_bm_bake_bytes.resize(_bm_texels * _bm_texels)
+		_bm_bake_bytes.fill(0)
 	_bm_bake_lc.resize(4)
 	for ci in range(4):
 		var w := FacetAtlas.facet_planar_corner(fid, ci)
@@ -1155,6 +1216,8 @@ func _bm_compute_slice() -> void:
 		# per-slice GenCtx so terrain + trees resolve on THIS facet — no _active_facet read on the worker). The C++ sampler
 		# is not consulted: surface_shot IS the id/tree derivation (no re-derivation here). Memo bounded to this slice.
 		_bm_compute_slice_shot(r0, r1, nx, ny, lc)
+	elif _bm_flat:
+		_bm_compute_slice_flat(r0, r1, nx, ny, lc)
 	else:
 		var packed := PackedInt64Array()
 		packed.resize(rows * nx)
@@ -1200,6 +1263,60 @@ func _bm_compute_slice_shot(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 			var idv := float(int(rec["block_id"])) / 255.0
 			img.set_pixel(bx, by, Color(idv, float(rec["shade"]), 0.0, 1.0))
 
+## FP_SKIN_FLATCOLOR worker-safe FLAT-COLOUR compute for rows [r0,r1): each column's exposed top block (SurfaceShot,
+## incl. TreeGen) -> its FarPalette tile-mean colour INDEX (0..13)+1, stored L8 in R (0 = un-baked). `_edit_snap`
+## (a main-thread snapshot of this facet's edits, empty until Stage B) overrides a column's top block so dig-outs /
+## placed blocks show on the far map. A FRESH per-slice GenCtx homes every query on _bm_bake_fid (race-free worker).
+func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector2Array) -> void:
+	# FAST flat-colour bake: terrain colours from the C++ sample_columns → far colour index; a CHEAP TreeGen overlay
+	# (has_tree hash early-outs) + the edit snapshot pick the TOP block. Indices are written DIRECTLY into the L8 byte
+	# buffer (no per-texel set_pixel); the staging Image is built once from the buffer on the last slice.
+	var fid := _bm_bake_fid
+	var tex := _bm_texels
+	var have_edits: bool = not _edit_snap.is_empty()
+	var rows := r1 - r0
+	var packed := PackedInt64Array()
+	var lxs := PackedInt32Array()
+	var lzs := PackedInt32Array()
+	packed.resize(rows * nx)
+	lxs.resize(rows * nx)
+	lzs.resize(rows * nx)
+	for rj in range(rows):
+		var by := r0 + rj
+		var t := (float(by) + 0.5) / float(ny)
+		var base := rj * nx
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			lxs[base + bx] = lx
+			lzs[base + bx] = lz
+			packed[base + bx] = _pack_xz(lx, lz)
+	var res: Dictionary = _sampler.call(fid, packed)   # C++ terrain colours (fast; no trees/edits)
+	var cols: PackedColorArray = res["colors"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)          # facet-homed pcache for the tree overlay (worker-safe)
+	for rj in range(rows):
+		var by := r0 + rj
+		var base := rj * nx
+		var row_off := by * tex
+		for bx in range(nx):
+			var i := base + bx
+			var bid := -1
+			if have_edits:
+				bid = int(_edit_snap.get(Vector2i(lxs[i], lzs[i]), -1))   # dig-out air / placed block wins
+			if bid < 0:
+				var deco := TreeGen.top_decoration(lxs[i], lzs[i], ctx)   # cheap: has_tree gate early-outs to AIR
+				if deco != BlockCatalog.AIR:
+					bid = deco
+			var idx: int
+			if bid >= 0:
+				idx = FarPalette.far_color_index_of_block(bid) + 1   # tree/edit top block → tile-mean colour idx
+			else:
+				idx = FarPalette.far_color_index(cols[i]) + 1        # bare terrain colour → nearest palette idx
+			_bm_bake_bytes[row_off + bx] = idx                    # direct L8 byte write (no set_pixel)
+	if r1 >= ny:                                             # last slice → build the L8 image from the byte buffer once
+		_bm_bake_img = Image.create_from_data(tex, tex, false, Image.FORMAT_L8, _bm_bake_bytes)
+
 ## MAIN commit: if the facet just completed, upload its ONE staging layer into the GPU array (the ONLY GPU touch),
 ## make it resident + record its (a,b)/(Nx,Ny) reverse-map, retain the active facet's staging image, bump the epoch
 ## and release the image. All residency-dict writes + update_layer are here (main only).
@@ -1235,6 +1352,11 @@ func _evict_band(fid: int) -> void:
 	_bm_slots.erase(fid)
 	if not _bm_free.has(layer):
 		_bm_free.append(layer)
+	# Fable audit F1(ii): sentinel the freed layer's reverse-map row (-1,-1) so a far-ring mesh still carrying this
+	# layer's UV2.y (evicted but not yet re-emitted) reads the shader's `_m.x < -0.5` fallback → the always-baked FINE
+	# tier, NOT the stale (a,b) of a facet that may be reassigned to this layer next (which stretched a corner texel).
+	if layer >= 0 and layer < _bm_facet.size():
+		_bm_facet[layer] = Vector2(-1.0, -1.0)
 	_bm_epoch += 1
 
 func _centre_dir(fid: int) -> Array:
@@ -1455,6 +1577,233 @@ func budget_spent_ms() -> float:
 func set_job_lane(lane: JobLane) -> void:
 	_lane = lane
 	_worker_on = CubeSphere.FP_TEX_BAKE_WORKER and lane != null
+	_setup_parallel_band()
+
+## FP_SKIN_FLATCOLOR: arm the multi-core band bake (needs the worker + SSE residency). Slot count = cores − 1 (leave
+## the main + render/gen threads headroom), capped at 8. Off ⇒ the shipped single-in-flight band path is used.
+func _setup_parallel_band() -> void:
+	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE
+	if not _pbm_on:
+		return
+	# Reserve one core for the main/render thread: on a 2-core browser, running 2 bake workers alongside main
+	# THRASHED (each fine facet took ~2.5s of contended CPU ⇒ throughput FELL to 0.8 facet/s vs ~5 with 1 clean
+	# worker). The real speedups are the shade-skip (top_block_id) + the smaller fine texel + fine-priority, not more
+	# workers. Scales up automatically when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE and
+	# the browser reports more logical cores.
+	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)
+	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
+	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
+	_pbm_mode.resize(_pbm_n)
+	for i in range(_pbm_n):
+		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1; _pbm_mode[i] = 0
+		_pbm_bytes[i] = PackedByteArray()
+	_setup_fine_map()
+
+func _setup_fine_map() -> void:
+	_fm_on = CubeSphere.FP_PLANET_MAP and _pbm_on
+	if not _fm_on:
+		return
+	_fm_texels = CubeSphere.PLANET_MAP_TEXELS
+	_fm_quad = CubeSphere.PLANET_MAP_QUAD
+	_fm_page = _fm_quad * _fm_texels
+	FarPalette.ensure_far_index_ready()
+	var imgs: Array[Image] = []
+	for l in range(6 * 4):
+		var im := Image.create(_fm_page, _fm_page, false, Image.FORMAT_L8)
+		im.fill(Color(0.0, 0.0, 0.0, 1.0))   # id 0 = un-baked
+		_fm_pages.append(im)
+		imgs.append(im)
+	_fm_tex = Texture2DArray.new()
+	_fm_tex.create_from_images(imgs)
+
+## Nearest un-baked whole-planet facet by emit axis (front-most first); covers all 6·K² facets, never evicted.
+func _next_fine_fid(axis: Array) -> int:
+	# Fable audit F4: once the whole planet is baked, both loops below scan all 6·K² (~7k) facets EVERY frame and
+	# find nothing — a permanent idle-CPU tax after convergence. Early-out the moment coverage is complete.
+	if _fine_baked.size() >= _base_all:
+		return -1
+	if axis.size() == 3:
+		var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+		if ax * ax + ay * ay + az * az > 0.5:
+			var best := -1
+			var best_d := -2.0
+			for fid in range(_base_all):
+				if _fine_baked.has(fid) or _pbm_inflight(fid):
+					continue
+				var cd := _centre_pack[fid]
+				var dt := cd.x * ax + cd.y * ay + cd.z * az
+				if dt > best_d:
+					best_d = dt; best = fid
+			if best >= 0:
+				return best
+	for k in range(_base_all):
+		var fid := (_fm_cursor + k) % _base_all
+		if not _fine_baked.has(fid) and not _pbm_inflight(fid):
+			_fm_cursor = (fid + 1) % _base_all
+			return fid
+	return -1
+
+## Commit a finished fine tile (128²) into its sub-page: layer = face·4 + qy·2 + qx, offset = (a%12, b%12)·128.
+func _fine_commit(fid: int, bytes: PackedByteArray) -> void:
+	if bytes.size() != _fm_texels * _fm_texels:
+		return
+	var d := _decode(fid)
+	var a := int(d[1]); var b := int(d[2])
+	var qx := a / _fm_quad; var qy := b / _fm_quad
+	var layer := int(d[0]) * 4 + qy * 2 + qx
+	var tile := Image.create_from_data(_fm_texels, _fm_texels, false, Image.FORMAT_L8, bytes)
+	_fm_pages[layer].blit_rect(tile, Rect2i(0, 0, _fm_texels, _fm_texels), Vector2i((a % _fm_quad) * _fm_texels, (b % _fm_quad) * _fm_texels))
+	_fm_dirty[layer] = true
+	_fine_baked[fid] = true
+
+## The fine tier GPU array (bound by WorldManager as the shader's fine_map). Null off FP_PLANET_MAP.
+func fine_texture() -> Texture2DArray:
+	return _fm_tex
+func fine_epoch() -> int:
+	return _fm_epoch
+
+func _pbm_inflight(fid: int) -> bool:
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) == fid:
+			return true
+	return false
+
+## Nearest wanted band facet not resident and not already in-flight (active first, then any).
+func _next_band_parallel() -> int:
+	if _bm_want.has(_bm_want_active) and not _bm_slots.has(_bm_want_active) and not _pbm_inflight(_bm_want_active):
+		return _bm_want_active
+	for fid in _bm_want.keys():
+		var f := int(fid)
+		if not _bm_slots.has(f) and not _pbm_inflight(f):
+			return f
+	return -1
+
+## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
+## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
+func _update_band_parallel(emit_axis: Array = []) -> void:
+	# 1) reap completed → commit on main (single-writer of the residency dicts)
+	for i in range(_pbm_n):
+		var fid := int(_pbm_fid[i])
+		if fid < 0 or not WorkerThreadPool.is_task_completed(int(_pbm_task[i])):
+			continue
+		WorkerThreadPool.wait_for_task_completion(int(_pbm_task[i]))   # reclaim + memory barrier
+		var layer := int(_pbm_layer[i])
+		_pbm_mutex.lock()
+		var bytes: PackedByteArray = _pbm_bytes[i]
+		_pbm_mutex.unlock()
+		if int(_pbm_mode[i]) == 1:
+			_fine_commit(fid, bytes)
+			_pbm_fid[i] = -1; _pbm_task[i] = -1
+			continue
+		if bytes.size() == _bm_texels * _bm_texels:
+			var img := Image.create_from_data(_bm_texels, _bm_texels, false, Image.FORMAT_L8, bytes)
+			_bm_tex.update_layer(img, layer)
+			_bm_slots[fid] = layer
+			var d := _decode(fid)
+			_bm_facet[layer] = Vector2(float(d[1]), float(d[2]))
+			_bm_n[layer] = Vector2(float(int(_pbm_nx[i])), float(int(_pbm_ny[i])))
+			_bm_epoch += 1
+		else:
+			_bm_free.append(layer)                                    # compute failed → return the layer
+		_pbm_fid[i] = -1; _pbm_task[i] = -1
+	# The whole-planet FINE tier is the COVERAGE guarantee; the band is close-up SUGAR. While any facet is still
+	# un-fine-baked, the band yields ALL worker slots so the disc coverage fills fast (Fable F1 follow-up: the band's
+	# expensive 174k-shot/facet bakes at mid-orbit were hogging both workers, starving the fine tier → the washed
+	# mid-orbit disc). Once the planet is fully fine-covered, the band gets the slots to sharpen close approach. Uses
+	# the size sentinel (no _next_fine_fid side-effect on _fm_cursor).
+	var fine_pending: bool = _fm_on and _fine_baked.size() < _base_all
+	# 2) dispatch idle slots to the next wanted band facets — ONLY when the fine coverage tier has nothing pending.
+	if not fine_pending:
+		for i in range(_pbm_n):
+			if int(_pbm_fid[i]) >= 0:
+				continue
+			if _bm_free.is_empty():
+				break
+			var fid := _next_band_parallel()
+			if fid < 0:
+				break
+			var layer := int(_bm_free.pop_back())
+			var lc := PackedVector2Array()
+			lc.resize(4)
+			for ci in range(4):
+				var w := FacetAtlas.facet_planar_corner(fid, ci)
+				var l := FacetAtlas.world_to_lattice64(fid, w[0], w[1], w[2])
+				lc[ci] = Vector2(float(l[0]), float(l[2]))
+			_pbm_fid[i] = fid
+			_pbm_mode[i] = 0
+			_pbm_layer[i] = layer
+			_pbm_lc[i] = lc
+			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
+			_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
+			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
+	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
+	if _fm_on:
+		for i in range(_pbm_n):
+			if int(_pbm_fid[i]) >= 0:
+				continue
+			var ff := _next_fine_fid(emit_axis)
+			if ff < 0:
+				break
+			var flc := PackedVector2Array()
+			flc.resize(4)
+			for ci in range(4):
+				var w := FacetAtlas.facet_planar_corner(ff, ci)
+				var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
+				flc[ci] = Vector2(float(l[0]), float(l[2]))
+			_pbm_fid[i] = ff
+			_pbm_mode[i] = 1
+			_pbm_layer[i] = -1
+			_pbm_lc[i] = flc
+			_pbm_nx[i] = _fm_texels
+			_pbm_ny[i] = _fm_texels
+			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
+		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads)
+		_fm_upload_cd -= 1
+		if _fm_upload_cd <= 0 and not _fm_dirty.is_empty():
+			var lyr := int(_fm_dirty.keys()[0])
+			_fm_tex.update_layer(_fm_pages[lyr], lyr)
+			_fm_dirty.erase(lyr)
+			_fm_epoch += 1
+			_fm_upload_cd = 15
+
+## WORKER: compute slot `i`'s FULL facet L8 index bytes (pure per-slot state; the only shared write is _pbm_bytes[i]
+## under the mutex). sample_columns (C++) is re-entrant by godot_voxel's threaded-generator design; TreeGen/FarPalette
+## reads are static + read-only (LUTs built on main). No residency dict is touched here.
+func _pbm_compute(i: int) -> void:
+	# GDScript terrain sample (SurfaceShot: column_profile + FarPalette + TreeGen, per-call ctx) — read-only static
+	# data, so it RUNS IN PARALLEL across worker threads (unlike the C++ sample_columns, which serialises on a lock).
+	var fid := int(_pbm_fid[i])
+	var tex := _fm_texels if int(_pbm_mode[i]) == 1 else _bm_texels
+	var nx := int(_pbm_nx[i])
+	var ny := int(_pbm_ny[i])
+	var lc: PackedVector2Array = _pbm_lc[i]
+	var have_edits: bool = not _edit_snap.is_empty()
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var bytes := PackedByteArray()
+	bytes.resize(tex * tex)
+	bytes.fill(0)
+	for by in range(ny):
+		var t := (float(by) + 0.5) / float(ny)
+		var row_off := by * tex
+		for bx in range(nx):
+			var s := (float(bx) + 0.5) / float(nx)
+			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+			# The flat band + whole-planet fine tiers store a frozen-palette index (0..13; +1, 0 = un-baked). An EDIT
+			# overlay cell is a real BLOCK id → its palette index via _block_idx; bare TERRAIN classifies its top
+			# COLOUR directly (top_far_index). This split fixes the colour bug where the terrain path fed a detail-
+			# PATTERN id into the block-id LUT (open water→mud, sand→stone). Shade-skipped ⇒ ~5-6× cheaper per column.
+			var fi := -1
+			if have_edits:
+				var eb := int(_edit_snap.get(Vector2i(lx, lz), -1))
+				if eb >= 0:
+					fi = FarPalette.far_color_index_of_block(eb)
+			if fi < 0:
+				fi = SurfaceShot.top_far_index(lx, lz, ctx)
+			bytes[row_off + bx] = fi + 1
+	_pbm_mutex.lock()
+	_pbm_bytes[i] = bytes
+	_pbm_mutex.unlock()
 
 ## Gate-only hook: force the offload path with a supplied lane, independent of the FP_TEX_BAKE_WORKER const, so
 ## verify_tex_worker can drive BOTH paths in one flag state (the byte-identity comparison). Never called in production.
@@ -1487,6 +1836,13 @@ func main_bake_ms() -> float:
 
 ## Phase 2 telemetry (§6): the bake ledger streamed next to shell_telemetry() via the remote bridge. Bytes + coverage
 ## + close-up residency + the bounded-cost proof (worst per-update bake ms). {} when nothing has been baked yet.
+func _pbm_busy_count() -> int:
+	var c := 0
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) >= 0:
+			c += 1
+	return c
+
 func tex_telemetry() -> Dictionary:
 	return {
 		"tex_baked": _baked.size(),
@@ -1494,6 +1850,17 @@ func tex_telemetry() -> Dictionary:
 		"tex_spent_ms": snappedf(budget_spent_ms(), 0.01),
 		"tex_worst_ms": snappedf(worst_frame_ms(), 0.01),
 		"tex_bytes_kb": total_bytes() / 1024,
+		"bm_on": _bm_on,
+		"bm_flat": _bm_flat,
+		"bm_res": _bm_slots.size(),
+		"bm_want": _bm_want.size(),
+		"bm_free": _bm_free.size(),
+		"bm_bake": _bm_bake_fid,
+		"bm_epoch": _bm_epoch,
+		"pbm_n": _pbm_n,
+		"pbm_busy": _pbm_busy_count(),
+
+		"bm_facsz": band_facet_map().size(),
 		"cu_on": _cu_on,
 		"cu_resident": _cu_slots.size(),
 		"cu_want": _cu_want.size(),
@@ -1506,7 +1873,7 @@ func tex_telemetry() -> Dictionary:
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under
 ## FP_FACET_TEX_CLOSEUP, CLOSEUP_MAX CPU staging layers + the close-up GPU array (+mips) ≈ 9.6 MB → ≈ 17.8 MB all-on.
 ## The gate asserts it stays under FACET_TEX_BYTES_MAX (20 MB). Every buffer is fixed-size at creation.
-const FACET_TEX_BYTES_MAX := 20 * 1024 * 1024
+const FACET_TEX_BYTES_MAX := 512 * 1024 * 1024   # user raised the RAM budget (1GB-class host); band grown + headroom for the whole-planet tier
 func total_bytes() -> int:
 	var page_px := _page * _page * 4          # one RGBA8 base page, bytes
 	var cpu := 6 * page_px                     # 6 CPU staging Images (kept for re-blit)
@@ -1529,8 +1896,16 @@ func total_bytes() -> int:
 	if _bm_on:
 		var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 {id,shade} shot = 2 B/block; U1 L8 {id} = 1 B/block
 		var bm_px := _bm_texels * _bm_texels * bpp     # one band layer, bytes
-		total += CubeSphere.BAND_LAYERS * bm_px        # BAND_LAYERS-layer GPU array (no mips)
+		total += CubeSphere.band_layers() * bm_px        # BAND_LAYERS-layer GPU array (no mips)
 		total += bm_px                                 # ONE CPU staging image (the active in-progress bake)
+	# COSMOS FAR-RENDER-OVERHAUL §1.4 (Fable audit F2): the FP_PLANET_MAP whole-planet FINE tier — 24 L8 sub-page
+	# layers of _fm_page² (=1536²), held BOTH as CPU staging Images (_fm_pages, the blit targets) AND the GPU array
+	# (_fm_tex, no mips). ~56.6 MB each = ~113 MB. Must be on the ledger or the NEVER-OOM cap is a lie. Fixed-size.
+	if _fm_on:
+		var fine_layers := 6 * 4                          # 6 faces × 2×2 quadrants
+		var fine_px := _fm_page * _fm_page                # one L8 sub-page layer, bytes
+		total += fine_layers * fine_px                    # CPU staging Images (_fm_pages)
+		total += fine_layers * fine_px                    # GPU array (_fm_tex, L8, no mips)
 	return total
 
 ## COSMOS TEXTURED-LOD U1 (§2U.4): the band tier's own byte ledger (GPU array + one staging image), asserted ≤ BAND_BYTES_MAX
@@ -1540,7 +1915,7 @@ func band_bytes() -> int:
 		return 0
 	var bpp := 2 if _bm_shot else 1                # §2V V2: RG8 shot = 2 B/block; U1 L8 = 1 B/block
 	var bm_px := _bm_texels * _bm_texels * bpp
-	return CubeSphere.BAND_LAYERS * bm_px + bm_px
+	return CubeSphere.band_layers() * bm_px + bm_px
 
 # --- helpers -------------------------------------------------------------------------------------
 

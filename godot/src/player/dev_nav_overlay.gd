@@ -93,6 +93,14 @@ func set_facet_borders(loops: Array) -> void:
 	for v in loops:
 		_add_line(v, COL_BORDER, true)
 
+## Anchor the 3-D guide root to the planet's live render placement (FP_DEVNAV_GUIDE_FRAME). The guides are built
+## in the body-centred ABSOLUTE frame; `xf` is WorldManager.planet_render_transform() (folds the floating-origin
+## offset + active-frame orientation + scaled-body clamp), so the axis/equator/borders land ON the rendered
+## planet at every altitude. No-op until built.
+func set_guides_transform(xf: Transform3D) -> void:
+	if _line_root != null and is_instance_valid(_line_root):
+		_line_root.global_transform = xf
+
 ## Update the per-frame HUD scalars (compass heading + NavMode name). Cheap; triggers a Control redraw.
 func update_hud(heading_deg: float, nav_name: String) -> void:
 	_heading_deg = heading_deg

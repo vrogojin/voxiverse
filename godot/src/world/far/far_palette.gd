@@ -33,22 +33,31 @@ static var _jungle: Color     # B1: deep-green rainforest canopy (grass↔jungle
 
 ## Resolve every far-field colour from the catalog once. Idempotent; call before any
 ## lookup (FarTerrain warms it, but every accessor guards too).
+# FP_SKIN_TEXTURE_MEAN: resolve a surface colour from the block's TEXTURE-TILE MEAN (what the near textured
+# block averages to) instead of the flat catalog swatch, so the far skin's land colours match the near field.
+# Tile-less ids (water/lava/red_sand) fall back to the swatch inside mean_color_of ⇒ unchanged. Flag off ⇒ the
+# shipped color_of path exactly (byte-identical).
+static func _top_color(id: int) -> Color:
+	if CubeSphere.FP_SKIN_TEXTURE_MEAN:
+		return BlockTextures.mean_color_of(id)
+	return BlockCatalog.color_of(id)
+
 static func ensure_ready() -> void:
 	if _ready:
 		return
 	BlockCatalog.ensure_ready()
-	_water = BlockCatalog.color_of(BlockCatalog.id_of(&"water"))
-	_ice = BlockCatalog.color_of(BlockCatalog.id_of(&"ice"))
-	_lava = BlockCatalog.color_of(BlockCatalog.id_of(&"lava"))
-	_snow = BlockCatalog.color_of(BlockCatalog.id_of(&"snow_block"))
-	_sand = BlockCatalog.color_of(BlockCatalog.id_of(&"sand"))
-	_gravel = BlockCatalog.color_of(BlockCatalog.id_of(&"gravel"))
-	_red_sand = BlockCatalog.color_of(BlockCatalog.id_of(&"red_sand"))
-	_mud = BlockCatalog.color_of(BlockCatalog.id_of(&"mud"))
-	_podzol = BlockCatalog.color_of(BlockCatalog.id_of(&"podzol"))
-	_grass = BlockCatalog.color_of(BlockCatalog.GRASS)
-	_leaf = BlockCatalog.color_of(BlockCatalog.LEAF)
-	_stone = BlockCatalog.color_of(BlockCatalog.STONE)
+	_water = _top_color(BlockCatalog.id_of(&"water"))
+	_ice = _top_color(BlockCatalog.id_of(&"ice"))
+	_lava = _top_color(BlockCatalog.id_of(&"lava"))
+	_snow = _top_color(BlockCatalog.id_of(&"snow_block"))
+	_sand = _top_color(BlockCatalog.id_of(&"sand"))
+	_gravel = _top_color(BlockCatalog.id_of(&"gravel"))
+	_red_sand = _top_color(BlockCatalog.id_of(&"red_sand"))
+	_mud = _top_color(BlockCatalog.id_of(&"mud"))
+	_podzol = _top_color(BlockCatalog.id_of(&"podzol"))
+	_grass = _top_color(BlockCatalog.GRASS)
+	_leaf = _top_color(BlockCatalog.LEAF)
+	_stone = _top_color(BlockCatalog.STONE)
 	# Deterministic biome-mean tints (LOD-DESIGN §2.3.3): TAIGA is the 20% podzol / 80%
 	# grass mean of _biome_top's hash; FOREST tints grass toward leaf to stand in for the
 	# canopy the far field cannot draw as individual trees.
@@ -59,7 +68,7 @@ static func ensure_ready() -> void:
 	# they follow a recolour, exactly like every other far colour. Shown on the GDScript far path; the
 	# C++ skin path (frozen_colors, 14 entries) maps them to grass via its default until the enum extends.
 	_savanna = _grass.lerp(_sand, 0.40)
-	_jungle = _grass.lerp(BlockCatalog.color_of(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
+	_jungle = _grass.lerp(_top_color(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
 	_ready = true
 
 ## The sea-surface colour for a clamped (open-water) vertex of climate temperature `t`
@@ -116,6 +125,68 @@ static func frozen_colors() -> PackedColorArray:
 	return PackedColorArray([
 		_water, _ice, _lava, _snow, _sand, _gravel, _red_sand, _mud,
 		_podzol, _grass, _leaf, _stone, _taiga, _forest])
+
+# FP_SKIN_FLATCOLOR: classify a colour / block to its index in frozen_colors() (0..13). The flat-color band stores
+# this index (L8, +1; 0 = un-baked); the shell shader's far_lut = frozen_colors() maps it back to the flat colour.
+# Both the LUT and this classifier resolve through frozen_colors() → _top_color, so under FP_SKIN_TEXTURE_MEAN every
+# far map texel == the near textured block's 16×16 tile-mean colour (interior texels classify exactly, distance 0).
+static var _fc_ready := false
+static var _fc_rgb := PackedFloat32Array()
+static var _block_idx := PackedInt32Array()   # block_id -> far colour index (0..13), precomputed on the MAIN thread
+
+static func ensure_far_index_ready() -> void:
+	if _fc_ready:
+		return
+	ensure_ready()
+	var fc := frozen_colors()
+	_fc_rgb.resize(fc.size() * 3)
+	for i in range(fc.size()):
+		_fc_rgb[i * 3] = fc[i].r
+		_fc_rgb[i * 3 + 1] = fc[i].g
+		_fc_rgb[i * 3 + 2] = fc[i].b
+	# CRITICAL (worker-safety): precompute block_id -> far colour index HERE (main thread only). _top_color routes
+	# through BlockTextures.mean_color_of, which load()s a PNG + get_image() the first time per tile — that MUST NOT
+	# run on the offloaded band-bake worker (it stalls/faults). The worker then only INDEXES _block_idx (pure read).
+	BlockCatalog.ensure_ready()
+	var n := BlockCatalog.count()
+	_block_idx.resize(n)
+	for id in range(n):
+		var c := _top_color(id)                 # main-thread mean_color_of (cached per tile stem)
+		var best := 0
+		var best_d := 1.0e30
+		for j in range(fc.size()):
+			var dr := c.r - _fc_rgb[j * 3]
+			var dg := c.g - _fc_rgb[j * 3 + 1]
+			var db := c.b - _fc_rgb[j * 3 + 2]
+			var d := dr * dr + dg * dg + db * db
+			if d < best_d:
+				best_d = d
+				best = j
+		_block_idx[id] = best
+	_fc_ready = true
+
+static func far_color_index(c: Color) -> int:
+	ensure_far_index_ready()
+	var best := 0
+	var best_d := 1.0e30
+	var n := _fc_rgb.size() / 3
+	for i in range(n):
+		var j := i * 3
+		var dr := c.r - _fc_rgb[j]
+		var dg := c.g - _fc_rgb[j + 1]
+		var db := c.b - _fc_rgb[j + 2]
+		var d := dr * dr + dg * dg + db * db
+		if d < best_d:
+			best_d = d
+			best = i
+	return best
+
+## Worker-safe: a PURE index into the precomputed _block_idx LUT (built on the main thread by ensure_far_index_ready
+## during the baker setup prewarm). NEVER loads a texture, so the offloaded band bake can call it per texel.
+static func far_color_index_of_block(block_id: int) -> int:
+	if block_id >= 0 and block_id < _block_idx.size():
+		return _block_idx[block_id]
+	return 0                                        # AIR / out of range → index 0 (no texture load on the worker)
 
 ## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3) — the airless Moon far-ring palette, generalized per
 ## body exactly like the Earth colours above: every RGB is a BlockCatalog tint (regolith / basalt maria /

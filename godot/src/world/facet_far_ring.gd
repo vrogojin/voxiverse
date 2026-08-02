@@ -54,6 +54,8 @@ var _mi: MeshInstance3D
 # tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
 var _skin_base_tex: Texture = null
 var _skin_band_tex: Texture = null
+var _band_meta_tex: ImageTexture = null   # FP_BAND_META_TEX: 512×1 RGBA32F reverse-map (a,b,Nx,Ny) per band layer (texelFetch, no uniform-vec cap)
+var _band_meta_img: Image = null          # CPU staging for _band_meta_tex.update()
 var _skin_cu_tex: Texture = null
 var _skin_active := true              # §2V skin currently bound (true = shipped); set false while the orbit tier owns the disc
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
@@ -2829,7 +2831,7 @@ func _cu_on() -> bool:
 ## COSMOS TEXTURED-LOD U1: the band tier is live (needs the base textured ring + block detail + its own flag). Off ⇒
 ## every band path (64+ slot, band_map sampler, band_facet/band_n uniforms) is inert ⇒ mesh + material unchanged.
 func _bm_on() -> bool:
-	return CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_BLOCK_DETAIL and _tex_on()
+	return CubeSphere.FP_BAND_BLOCK_MAP and (CubeSphere.FP_BLOCK_DETAIL or CubeSphere.FP_SKIN_FLATCOLOR) and _tex_on()
 
 ## The slot for `fid` from the FROZEN build snapshot (worker-safe), fed to UV2.y at emit. A BAND facet wins with 64+layer
 ## (the shader's real-block path); else the close-up layer (0..63); else −1 (base-map / tiled fallback). Empty snapshots
@@ -3182,6 +3184,118 @@ static func _apply_block_detail(code: String, band := CubeSphere.FP_BAND_BLOCK_M
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
 	return code
 
+# FP_SKIN_FLATCOLOR (Minecraft-style per-block MAP SKIN): render a band-resident texel as a FLAT tile-mean COLOUR
+# (far_lut[id-1], the frozen_colors tile-mean palette) instead of the detail_map texture pattern. NO detail_map / id_map
+# dependency (drops FP_BLOCK_DETAIL) — a band facet shows per-block colours, a non-band facet falls to the coarse base
+# col (sub-pixel far limb). Mirrors the _BAND_ALBEDO addressing exactly; %d = BAND_LAYERS, far_lut sized to the palette.
+const _FLAT_UNIFORMS := "uniform sampler2DArray band_map : filter_nearest;
+uniform vec2 band_facet[%d];
+uniform vec2 band_n[%d];
+uniform float band_k = 24.0;
+uniform vec3 far_lut[%d];
+"
+const _FLAT_ALBEDO := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5 && _bs < %d) {
+		vec2 _ab = band_facet[_bs];
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = band_n[_bs];
+		ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? far_lut[_bid - 1] : col;
+		float _w = max(wt, (_bid > 0) ? 1.0 : 0.0);
+		ALBEDO = mix(v_col_raw, _bcol, _w) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, col, wt) * v_st;
+	}
+"
+const _FINE_UNIFORM := "uniform sampler2DArray fine_map : filter_nearest;\n"
+const _FINE_ELSE := "\t} else {
+\t\tvec2 _q = clamp(floor(v_uv * 2.0), 0.0, 1.0);
+\t\tint _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
+\t\tivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
+\t\tint _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);
+\t\tvec3 _fc = (_f8 > 0) ? far_lut[_f8 - 1] : col;
+\t\tALBEDO = mix(v_col_raw, _fc, max(wt, (_f8 > 0) ? 1.0 : 0.0)) * v_st;
+\t}"
+const _FLAT_UNIFORMS_META := "uniform sampler2DArray band_map : filter_nearest;
+uniform sampler2D band_meta : filter_nearest;
+uniform float band_k = 24.0;
+uniform vec3 far_lut[%d];
+"
+const _FLAT_ALBEDO_META := "	int _bs = int(v_bslot + 0.5) - 64;
+	if (v_bslot >= 63.5) {
+		vec4 _m = texelFetch(band_meta, ivec2(_bs, 0), 0);
+		vec2 _ab = _m.xy;
+		vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+		vec2 _N = _m.zw;
+		ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+		int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+		vec3 _bcol = (_bid > 0) ? far_lut[_bid - 1] : col;
+		float _w = max(wt, (_bid > 0) ? 1.0 : 0.0);
+		ALBEDO = mix(v_col_raw, _bcol, _w) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, col, wt) * v_st;
+	}
+"
+## FP_PLANET_MAP composite with the fine tier as the UNIVERSAL fallback (Fable audit F1 ii/iii). The whole-planet
+## fine sample is hoisted ABOVE the band branch, so a band facet whose texel is un-baked (_bid==0, mid-bake) OR whose
+## slot was evicted (band_meta sentinel _m.x < -0.5) falls to the FINE tier — which is always resident + baked —
+## instead of the pale coarse base. That removes the washed patches the band showed during its slow per-facet bake
+## (the centre-quad's remaining cause below the promote reach), while a BAKED band texel still overrides fine (sharp
+## 1 blk/texel on close approach). %d = fine sub-page edge (PLANET_MAP_QUAD·TEXELS).
+const _FLAT_ALBEDO_META_FINE := "	vec2 _q = clamp(floor(v_uv * 2.0), 0.0, 1.0);
+	int _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
+	ivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
+	int _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);
+	vec3 _fc = (_f8 > 0) ? far_lut[_f8 - 1] : col;
+	float _fw = (_f8 > 0) ? 1.0 : 0.0;
+	if (v_bslot >= 63.5) {
+		int _bs = int(v_bslot + 0.5) - 64;
+		vec4 _m = texelFetch(band_meta, ivec2(_bs, 0), 0);
+		vec3 _bc; float _bw;
+		if (_m.x < -0.5) {
+			_bc = _fc; _bw = _fw;
+		} else {
+			vec2 _ab = _m.xy;
+			vec2 _luv = clamp(vec2(v_uv.x * band_k - _ab.x, v_uv.y * band_k - _ab.y), 0.0, 1.0);
+			vec2 _N = _m.zw;
+			ivec2 _ib = clamp(ivec2(_luv * _N), ivec2(0), ivec2(_N) - ivec2(1));
+			int _bid = int(texelFetch(band_map, ivec3(_ib, _bs), 0).r * 255.0 + 0.5);
+			_bc = (_bid > 0) ? far_lut[_bid - 1] : _fc;
+			_bw = (_bid > 0) ? 1.0 : _fw;
+		}
+		ALBEDO = mix(v_col_raw, _bc, max(wt, _bw)) * v_st;
+	} else {
+		ALBEDO = mix(v_col_raw, _fc, max(wt, _fw)) * v_st;
+	}
+"
+static func _apply_flatcolor(code: String) -> String:
+	var bl := CubeSphere.BAND_LAYERS
+	var nlut := FarPalette.frozen_colors().size()
+	var base_decl := "uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n"
+	if CubeSphere.FP_BAND_META_TEX:
+		# FP_BAND_META_TEX: band reverse-map via a data texture (texelFetch) instead of uniform arrays → no vec-uniform cap.
+		var unis := _FLAT_UNIFORMS_META % nlut
+		var meta_albedo := _FLAT_ALBEDO_META
+		if CubeSphere.FP_PLANET_MAP:
+			# FP_PLANET_MAP: always-resident whole-planet fine tier — the UNIVERSAL fallback (band un-baked/evicted → fine,
+			# never the pale base; Fable audit F1 ii/iii). Hoisted-fine albedo replaces the whole band+else composite.
+			var pg := CubeSphere.PLANET_MAP_QUAD * CubeSphere.PLANET_MAP_TEXELS
+			unis = unis + _FINE_UNIFORM
+			meta_albedo = _FLAT_ALBEDO_META_FINE % [pg, pg - 1]
+		code = code.replace(base_decl, base_decl + unis)
+		code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+		code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", meta_albedo)
+		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+		return code
+	code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS % [bl, bl, nlut]))
+	code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
+	code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
+	code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO % bl)
+	code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+	return code
+
 # COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): swap the shell LIGHT head's inline
 # lighting law for the SHARED VoxiLight.SHADE_GLSL snippet (string-included — pure concatenation, ZERO new shader_type /
 # compiled program). Four surgical replacements, all on the LIGHT head ONLY (the ALBEDO tail / texture sampling is
@@ -3203,7 +3317,7 @@ static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UN
 	# (2) uniforms → shared snippet (declares sun_dir/night_floor/term_mu/moonshine + helpers + voxi_shade)
 	code = code.replace(
 		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform float night_floor = 0.06;\nuniform float term_mu = 0.12;\n",
-		VoxiLight.SHADE_GLSL)
+		VoxiLight.shade_glsl())
 	# (3) delete the inline mu/shade/tint compute (voxi_shade now carries it)
 	code = code.replace(
 		"	float mu = dot(n, normalize(sun_dir));\n	float shade = night_floor + (1.0 - night_floor) * _day(mu);\n	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));\n",
@@ -3227,7 +3341,10 @@ func _make_material() -> Material:
 		if _cu_on():
 			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER)
 		else:
-			sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
+			if CubeSphere.FP_SKIN_FLATCOLOR and CubeSphere.FP_BAND_BLOCK_MAP and CubeSphere.FP_FACET_TEX:
+				sh2.code = _apply_flatcolor(_SHELL_ABS_TEX_SHADER)   # Minecraft per-block flat-colour map skin (no detail patterns)
+			else:
+				sh2.code = _apply_block_detail(_SHELL_ABS_TEX_SHADER) if CubeSphere.FP_FACET_TEX else _SHELL_ABS_SHADER
 		# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): string-include the SHARED VoxiLight lighting law into the LIGHT head
 		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
 		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
@@ -3257,15 +3374,26 @@ func _make_material() -> Material:
 		# later by set_facet_band once the baker built the array; band_facet/band_n arrive via set_band_slots.
 		if _bm_on():
 			sm2.set_shader_parameter("band_k", float(FacetAtlas.K))
-			var bfacet := PackedVector2Array()
-			var bn := PackedVector2Array()
-			bfacet.resize(CubeSphere.BAND_LAYERS)
-			bn.resize(CubeSphere.BAND_LAYERS)
-			for i in range(CubeSphere.BAND_LAYERS):
-				bfacet[i] = Vector2(-1.0, -1.0)
-				bn[i] = Vector2(0.0, 0.0)
-			sm2.set_shader_parameter("band_facet", bfacet)
-			sm2.set_shader_parameter("band_n", bn)
+			if CubeSphere.FP_BAND_META_TEX:
+				# FP_BAND_META_TEX: seed the reverse-map DATA TEXTURE (sentinel a=-1) so band_meta is never unbound.
+				var mimg := Image.create(CubeSphere.band_layers(), 1, false, Image.FORMAT_RGBAF)
+				mimg.fill(Color(-1.0, -1.0, 0.0, 0.0))
+				sm2.set_shader_parameter("band_meta", ImageTexture.create_from_image(mimg))
+			else:
+				var bfacet := PackedVector2Array()
+				var bn := PackedVector2Array()
+				bfacet.resize(CubeSphere.BAND_LAYERS)
+				bn.resize(CubeSphere.BAND_LAYERS)
+				for i in range(CubeSphere.BAND_LAYERS):
+					bfacet[i] = Vector2(-1.0, -1.0)
+					bn[i] = Vector2(0.0, 0.0)
+				sm2.set_shader_parameter("band_facet", bfacet)
+				sm2.set_shader_parameter("band_n", bn)
+			if CubeSphere.FP_SKIN_FLATCOLOR:
+				var lut := PackedVector3Array()   # far_lut = frozen_colors() tile-mean palette (id->flat colour)
+				for c in FarPalette.frozen_colors():
+					lut.append(Vector3(c.r, c.g, c.b))
+				sm2.set_shader_parameter("far_lut", lut)
 		return sm2
 	# COSMOS-LOD-SKY L3: the terminator-tint shell shader wins when its flag is on (it subsumes the plain lit
 	# vertex-colour look; sun_dir is fed each frame via set_terminator_sun_dir). Off → the shipped paths verbatim.
@@ -3394,16 +3522,42 @@ func set_facet_band(tex: Texture) -> void:
 ## reverse-maps. Main thread only (WorldManager, when the baker's band_epoch bumps): updates the live `_band_slots` (frozen
 ## into the mesh at the next build so UV2.y carries 64+layer) and the band_facet/band_n shader uniforms (read live per
 ## fragment), then requests a re-emit. No-op with the band tier off.
+## FP_PLANET_MAP: bind the always-resident whole-planet fine tier array as the shell shader's fine_map. Called
+## per-frame by WorldManager (cheap) so it survives far-ring material re-emits. No-op off the flag / no material.
+func set_fine_map(tex) -> void:
+	if not CubeSphere.FP_PLANET_MAP or _mi == null or tex == null:
+		return
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("fine_map", tex)
+
 func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
 	if not _bm_on():
 		return
 	_band_slots = slots
 	if _mi != null:
 		var mat := _mi.material_override
-		if mat is ShaderMaterial and facet_map.size() == CubeSphere.BAND_LAYERS and n_map.size() == CubeSphere.BAND_LAYERS:
-			(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
-			(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
-	_pending = true                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
+		if mat is ShaderMaterial and facet_map.size() == CubeSphere.band_layers() and n_map.size() == CubeSphere.band_layers():
+			if CubeSphere.FP_BAND_META_TEX:
+				_push_band_meta(mat as ShaderMaterial, facet_map, n_map)
+			else:
+				(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
+				(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
+	_pending = true
+
+## FP_BAND_META_TEX: pack (a,b,Nx,Ny) per band layer into the 512×1 RGBA32F reverse-map texture (one tiny update()),
+## replacing the band_facet[]/band_n[] uniform arrays (which cap out at ~400 layers on ANGLE's fragment-uniform budget).
+func _push_band_meta(mat: ShaderMaterial, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
+	var n := CubeSphere.band_layers()
+	if _band_meta_img == null:
+		_band_meta_img = Image.create(n, 1, false, Image.FORMAT_RGBAF)
+	for i in range(n):
+		_band_meta_img.set_pixel(i, 0, Color(facet_map[i].x, facet_map[i].y, n_map[i].x, n_map[i].y))
+	if _band_meta_tex == null:
+		_band_meta_tex = ImageTexture.create_from_image(_band_meta_img)
+	else:
+		_band_meta_tex.update(_band_meta_img)
+	mat.set_shader_parameter("band_meta", _band_meta_tex)                  # re-emit so UV2.y carries the new band slots (rides the existing deferred pipeline)
 
 ## COSMOS TEXTURED-LOD T1b gate surface (G-BD-OFF/TILE): the RAW textured shell shader string (no detail) and the
 ## FP_BLOCK_DETAIL-injected result, so the gate can assert byte-identity off and additive-only injection on, with the

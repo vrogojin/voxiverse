@@ -44,9 +44,16 @@ static func residency_for_tier(tier: int) -> int:
 ##   pos : PackedVector3Array  (cells+1)²          nrm : PackedVector3Array density-gradient normals
 ##   col : PackedColorArray    skin fallback tint  uv  : PackedVector2Array ((a+s)/K,(b+t)/K) facet param
 ##   uv2 : PackedVector2Array  (face, slot)        idx : PackedInt32Array   2 tris/cell, front = outward
-## `slot` is written −1 here (B1: skin binding is B2's job — the driver stamps the real close-up/band/base slot then).
-static func build_tile(fid: int, cells: int) -> Dictionary:
+## `slot` is written −1 here (B2 overlay: UV2.y=-1 ⇒ the shell shader's fine/base branch paints it — no band).
+## `lift` (blocks) nudges every vertex radially outward: the B2 overlay draws the smooth mesh a hair ABOVE the
+## flat heightfield so it occludes it (sub-pixel at far distance) until the emit-exclusion path lands (increment 2).
+## `curved` places vertices on the CURVED SPHERE `dir·(R + relief)` instead of on the flat inscribed facet quad — the
+## piecewise-flat quads ARE the facet-boundary crease (adjacent flat tangent planes meet at a dihedral angle even at
+## sea level), so curving the base is what removes the "straight lines stitching facets"; it also sits the tile above
+## the inscribed heightfield (occlusion for free). Off (B1 gate) ⇒ the flat planar+relief placement node_at returns.
+static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false) -> Dictionary:
 	FarPalette.ensure_ready()
+	var r_datum := FacetAtlas.r_of(fid)
 	var corners := [
 		FacetAtlas.facet_planar_corner(fid, 0),
 		FacetAtlas.facet_planar_corner(fid, 1),
@@ -82,8 +89,12 @@ static func build_tile(fid: int, cells: int) -> Dictionary:
 			var s := float(gi) * inv
 			var node := FarDensity.node_at(corners, s, t)
 			var vi := gj * stride + gi
-			pos[vi] = node["pos"]
-			dirs[vi] = node["dir"]
+			var d: Vector3 = node["dir"]
+			if curved:
+				pos[vi] = d * (r_datum + float(node["relief"]) + lift)   # on the sphere → no dihedral crease across facets
+			else:
+				pos[vi] = (node["pos"] as Vector3) + d * lift            # flat planar+relief (B1 gate parity)
+			dirs[vi] = d
 			var g := int(node["g"])
 			col[vi] = FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
@@ -142,3 +153,161 @@ static func _decode(fid: int) -> Array:
 	var a := int(rem / kb)
 	var b := rem - a * kb
 	return [face, a, b, kb]
+
+# =====================================================================================================================
+# B2 INSTANCE — the worker-baked smooth-tile MeshInstance (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2.7). A
+# FacetFarRing owns ONE of these under FP_FAR_SMOOTH: it builds `build_tile` for a requested set of facets on
+# WorkerThreadPool slots (cloned from the baker's _pbm pattern), merges the resident tiles into ONE ArrayMesh surface,
+# and shares the ring's shell material so the map skin + every per-frame uniform bind come for free. Increment 1 draws
+# it as an overlay (a small radial `lift`) — the emit-exclusion + normal-lit relief variant + skirts land in B2 inc-2.
+# NEVER-OOM: resident tiles bounded by the requested set (≤ tier cap) + SMOOTH_BYTES_MAX ledger, fixed at creation.
+
+var _mi: MeshInstance3D = null
+var _material: Material = null
+var _lift: float = 0.0
+var _tiles: Dictionary = {}          # fid -> build_tile Dictionary (resident, committed on main)
+var _want: Dictionary = {}           # fid -> cells (the requested resident set; the driver refreshes it)
+var _bytes: int = 0                  # resident tile bytes (ledger)
+var _dirty: bool = false             # a commit/evict happened → rebuild the merged mesh this step
+# worker slots (single-writer of _s_* on main pre-dispatch; the worker writes only _s_result[i] under the mutex)
+var _sn: int = 0
+var _s_fid: PackedInt32Array
+var _s_cells: PackedInt32Array
+var _s_task: PackedInt32Array
+var _s_result: Array = []
+var _s_mutex: Mutex = null
+
+## Create the MeshInstance under `parent` (inherits the ring's placement transform), share `material`, prewarm the
+## worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one profile_at_dir) so `build_tile` is
+## worker-safe. `lift` (blocks) is the overlay nudge.
+func setup_instance(parent: Node3D, material: Material, lift: float) -> void:
+	FarPalette.ensure_ready()
+	BlockCatalog.ensure_ready()
+	TerrainConfig.profile_at_dir(0.0, 1.0, 0.0, FacetAtlas.R_BLOCKS)   # warm _ensure_noise on main
+	_material = material
+	_lift = lift
+	_mi = MeshInstance3D.new()
+	_mi.name = "FacetSmoothMesh"
+	if material != null:
+		_mi.material_override = material
+	parent.add_child(_mi)
+	_sn = clampi(OS.get_processor_count() - 1, 1, 4)
+	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
+	_s_cells = PackedInt32Array(); _s_cells.resize(_sn)
+	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
+	_s_result.resize(_sn)
+	_s_mutex = Mutex.new()
+
+## The driver's requested resident set: facets → cells (tier pitch). Evicts tiles that fell out of the set.
+func request(fids: Array, cells: int) -> void:
+	var w := {}
+	for f in fids:
+		w[int(f)] = cells
+	_want = w
+	for fid in _tiles.keys():
+		if not _want.has(int(fid)):
+			_bytes -= FacetSmoothTier.tile_bytes(_tiles[int(fid)])
+			_tiles.erase(int(fid))
+			_dirty = true
+
+## Per-frame: reap finished worker tiles (commit on main), dispatch idle slots to wanted-not-resident facets, and
+## rebuild the merged mesh once if anything changed. Bounded per call.
+func step() -> void:
+	if _mi == null:
+		return
+	for i in range(_sn):
+		if int(_s_task[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
+			continue
+		WorkerThreadPool.wait_for_task_completion(int(_s_task[i]))
+		var fid := int(_s_fid[i])
+		_s_mutex.lock()
+		var tile = _s_result[i]
+		_s_result[i] = null
+		_s_mutex.unlock()
+		if _want.has(fid) and tile != null and not _tiles.has(fid):
+			var tb: int = FacetSmoothTier.tile_bytes(tile)
+			if _bytes + tb <= CubeSphere.SMOOTH_BYTES_MAX:
+				_tiles[fid] = tile
+				_bytes += tb
+				_dirty = true
+		_s_fid[i] = -1
+		_s_task[i] = -1
+	for i in range(_sn):
+		if int(_s_fid[i]) >= 0:
+			continue
+		var fid := _next_want()
+		if fid < 0:
+			break
+		_s_fid[i] = fid
+		_s_cells[i] = int(_want[fid])
+		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
+		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
+		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
+	if _dirty:
+		_rebuild_mesh()
+		_dirty = false
+
+func _next_want() -> int:
+	for fid in _want.keys():
+		var f := int(fid)
+		if _tiles.has(f) or _inflight(f):
+			continue
+		return f
+	return -1
+
+func _inflight(fid: int) -> bool:
+	for i in range(_sn):
+		if int(_s_fid[i]) == fid:
+			return true
+	return false
+
+func _build_worker(i: int) -> void:
+	var fid := int(_s_fid[i])
+	var cells := int(_s_cells[i])
+	var tile := FacetSmoothTier.build_tile(fid, cells, _lift, true)   # curved sphere placement (kills the facet crease)
+	_s_mutex.lock()
+	_s_result[i] = tile
+	_s_mutex.unlock()
+
+## Concatenate every resident tile into ONE ArrayMesh surface (index-offset) → ≤ 1 extra draw for the whole smooth set.
+func _rebuild_mesh() -> void:
+	var P := PackedVector3Array()
+	var N := PackedVector3Array()
+	var C := PackedColorArray()
+	var U := PackedVector2Array()
+	var U2 := PackedVector2Array()
+	var I := PackedInt32Array()
+	for fid in _tiles.keys():
+		var t = _tiles[fid]
+		var base := P.size()
+		P.append_array(t["pos"])
+		N.append_array(t["nrm"])
+		C.append_array(t["col"])
+		U.append_array(t["uv"])
+		U2.append_array(t["uv2"])
+		for idx in (t["idx"] as PackedInt32Array):
+			I.append(base + idx)
+	var mesh := ArrayMesh.new()
+	if P.size() > 0:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = P
+		arr[Mesh.ARRAY_NORMAL] = N
+		arr[Mesh.ARRAY_COLOR] = C
+		arr[Mesh.ARRAY_TEX_UV] = U
+		arr[Mesh.ARRAY_TEX_UV2] = U2
+		arr[Mesh.ARRAY_INDEX] = I
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		if _material != null:
+			mesh.surface_set_material(0, _material)
+	_mi.mesh = mesh
+
+func resident_count() -> int:
+	return _tiles.size()
+
+func smooth_bytes() -> int:
+	return _bytes
+
+## The set of facets currently drawn smooth — the far-ring drops these from its heightfield emit (increment 2).
+func resident_fids() -> Array:
+	return _tiles.keys()

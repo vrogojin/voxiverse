@@ -466,6 +466,15 @@ static func material_tables() -> Dictionary:
 		"id_snow": _ID_SNOW, "id_mud": _ID_MUD, "id_podzol": _ID_PODZOL, "id_sulfur": _ID_SULFUR,
 		"id_cinnabar": _ID_CINNABAR,
 		"id_stone": BlockCatalog.STONE, "id_dirt": BlockCatalog.DIRT, "id_grass": BlockCatalog.GRASS,
+		# FP_CLIMATE_BIOMES / FP_SKIN_BLOCK_EXACT: the biome-exact C++ gen keys. Single home so BOTH the near-field
+		# FP_CPPGEN gen (module_world) AND the far tile-bake gen (facet_skin_tier) get the SAME biome logic and agree.
+		# climate_biomes → Whittaker savanna/jungle in biome_of; the 5 species ids feed acacia/jungle/cactus trees;
+		# skin_block_exact routes far_color/far_index through deco_far_idx[top_block_id]. Flags default false ⇒ legacy.
+		"climate_biomes": CubeSphere.FP_CLIMATE_BIOMES,
+		"skin_block_exact": CubeSphere.FP_SKIN_BLOCK_EXACT,
+		"id_acacia_log": BlockCatalog.id_of(&"acacia_log"), "id_acacia_leaf": BlockCatalog.id_of(&"acacia_leaves"),
+		"id_jungle_log": BlockCatalog.id_of(&"jungle_log"), "id_jungle_leaf": BlockCatalog.id_of(&"jungle_leaves"),
+		"id_cactus": BlockCatalog.id_of(&"cactus"),
 		"strata_seq": PackedInt32Array(_STRATA_SEQ),
 		"band_seq": PackedInt32Array(_BAND_SEQ),
 		"ore_stone": PackedInt32Array(_ORE_STONE),
@@ -2217,6 +2226,25 @@ static func _biome_top(biome: int, x: int, z: int) -> int:
 			return _ID_SAND
 		_:
 			return BlockCatalog.GRASS
+
+## FP_SKIN_BLOCK_EXACT (COSMOS-SKIN-BLOCK-EXACT-DESIGN): the VISIBLE top block id of a surface column — the single
+## authority the far skin classifies through (far_color_index_of_block(top_block_id)) so its colour is that block's
+## texture mean, matching the near field. Mirrors what resolve_cell shows at the top: submerged (g < SEA_LEVEL) → the
+## sea-fill surface block (ice/lava/water, same regime as _sea_block: frozen t < -0.55, molten t >= LAVA_SEA_T); else
+## the biome top block (_biome_top, or bedrock at a B_PILLAR corner), snow-capped to snow_block on a COLD + CAPPABLE
+## surface exactly as _with_snow_state gates it (non-cappable red_sand/mud/snow stay bare). Pure, worker-safe (reads
+## only scalars + the static block LUTs). Trees are classified separately by the bake's tree branch.
+static func top_block_id(g: int, biome: int, t: float, x: int, z: int) -> int:
+	if g < SEA_LEVEL:
+		if t < -0.55:
+			return _ID_ICE
+		if t >= LAVA_SEA_T:
+			return _ID_LAVA
+		return _ID_WATER
+	var base := _ID_BEDROCK if biome == B_PILLAR else _biome_top(biome, x, z)
+	if BlockCatalog.state_mask_of(base) & CellCodec.STATE_SNOW_CAPPED != 0 and ClimateModel.surface_temperature(g, t) < 0.0:
+		return _ID_SNOW
+	return base
 
 static func _underwater_floor(biome: int, x: int, z: int, t: float) -> int:
 	match biome:

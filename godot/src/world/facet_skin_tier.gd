@@ -571,6 +571,7 @@ static func _build_cpp_gen(active_fid: int) -> Object:
 		"id_spruce_log": BlockCatalog.id_of(&"spruce_log"), "id_spruce_leaf": BlockCatalog.id_of(&"spruce_leaves"),
 		"id_birch_log": BlockCatalog.id_of(&"birch_log"), "id_birch_leaf": BlockCatalog.id_of(&"birch_leaves"),
 		"far_colors": FarPalette.frozen_colors(),
+		"deco_far_idx": FarPalette.far_index_lut(),   # FP_CPP_TILE_BAKE: block id → far-palette index, for bake_far_tile's tree branch (byte-equal to far_color_index_of_block)
 	}
 	for k in TerrainConfig.material_tables():
 		cfg[k] = TerrainConfig.material_tables()[k]

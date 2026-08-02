@@ -523,6 +523,17 @@ const FP_FACET_TEX := false
 ## Tile-less ids (water/lava) fall back to the swatch. Default FALSE ⇒ byte-identical. Requires FP_FACET_TEX.
 const FP_SKIN_TEXTURE_MEAN := false
 
+## FP_SKIN_BLOCK_EXACT — the far skin classifies a surface column by the ACTUAL top BLOCK worldgen places there,
+## via far_color_index_of_block(top_block_id(...)), instead of FarPalette.color_for's SYNTHETIC biome-blend colours
+## (_savanna/_jungle/_forest/_taiga). User directive: "colors MUST correspond exactly to the original block
+## textures only; biomes define block textures, block textures define pixel colors for FAR skin." Both the GDScript
+## bake and the C++ bake_far_tile route through the SAME frozen deco_far_idx LUT ⇒ byte-equal by construction AND
+## texture-exact (savanna/jungle ground = grass texture mean; biomes differentiate via acacia/jungle TREES). Requires
+## the biome-exact C++ (Whittaker classifier + acacia/jungle tree species, patch 0011) to stay byte-equal under
+## FP_CLIMATE_BIOMES. NOT byte-identical to the shipped color_for look even flags-off (taiga speckle, forest→grass,
+## pillar, dry-ocean-floor) ⇒ its own flag; default FALSE. See docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md.
+const FP_SKIN_BLOCK_EXACT := false
+
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
 ## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async
@@ -613,6 +624,22 @@ const FP_BAND_META_TEX := false
 ## the multi-core _pbm GDScript-sampler path, nearest-first, NEVER evicted. Default false ⇒ no alloc, byte-off.
 ## Requires FP_SKIN_FLATCOLOR (shares far_lut). Gate: verify_planet_map.gd.
 const FP_PLANET_MAP := false
+## FP_CPP_FINE_BAKE — the _pbm fine/band bake samples terrain via the C++ VoxelGeneratorCosmos.sample_columns
+## (batched, ~10×/column) instead of the GDScript SurfaceShot. The C++ path serialises on a lock, so it was swapped
+## OUT for GDScript to PARALLELISE across cores — but on a LOW-core browser (OS.get_processor_count() small ⇒ ~1 bake
+## worker) that parallelism is imaginary and the 10× per-column wins: the whole-planet fine disc fills in ~30-40 s
+## instead of MINUTES. Byte-equal to the GDScript path by construction (terrain → far_color_index(cols) == color_for
+## by the one-sampler law G-CG-COLUMNS; tree → far_color_index(color_of); edit → far_color_index_of_block — the exact
+## top_far_index split). Off ⇒ the GDScript _pbm path verbatim; the C++ path also no-ops if the module is absent.
+const FP_CPP_FINE_BAKE := false
+## FP_CPP_TILE_BAKE — the WHOLE _pbm fine/band texel loop runs in ONE C++ VoxelGeneratorCosmos.bake_far_tile() call per
+## facet (bilerp + terrain + tree + palette classification), so a bake worker does ZERO GDScript / ZERO allocation per
+## texel. The REAL multi-core bake fix (docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md): the web WorkerThreadPool defaults
+## to ONE thread (so the GDScript _pbm slots never parallelised) + dlmalloc's global lock busy-waits on main — moving
+## the loop into C++ + raising the WTP thread count (project [threading], WEB_PTHREAD_POOL 24) lets N bake threads run
+## in parallel. Byte-equal by integer-LUT construction. Requires the engine rebuild (patch 0011) + FP_CPP_FINE_BAKE's
+## sampler. Off ⇒ GDScript path; if the engine lacks bake_far_tile the dispatch falls through to GDScript. Bake ON at export.
+const FP_CPP_TILE_BAKE := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

@@ -142,6 +142,8 @@ var _pbm_nx: Array = []             # slot -> Nx
 var _pbm_ny: Array = []             # slot -> Ny
 var _pbm_mutex := Mutex.new()       # guards the result handoff (_pbm_bytes[i]) between worker and main
 var _pbm_mode: Array = []           # slot -> 0 band (bm_texels² → layer), 1 fine (fm_texels² → sub-page)
+var _pbm_cpp: Array = []            # slot -> 1 use the C++ sample_columns terrain path (FP_CPP_FINE_BAKE ∧ OFF-SURFACE), 0 GDScript
+var _offsurface := false            # last update()'s regime: near field frozen (orbit) ⇒ the C++ generator lock is uncontended
 # FP_PLANET_MAP fine tier — always-resident whole-planet L8 map, 24 sub-page layers (6 faces × 2×2 quadrants).
 var _fm_on := false
 var _fm_texels := 0                 # PLANET_MAP_TEXELS (128)
@@ -493,6 +495,7 @@ func set_frozen(frozen: bool) -> void:
 func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
 	if _frozen:
 		return
+	_offsurface = offsurface   # gates the C++ fine-bake path: only off-surface is the near-field gen (⇒ the shared C++ lock) idle
 	# FP_SKIN_FLATCOLOR multi-core band: refresh the residency want on main, then reap/dispatch the parallel full-facet
 	# bakes across all cores. The band is handled ENTIRELY here — the single-in-flight paths below skip it (not _pbm_on).
 	if _pbm_on:
@@ -1594,6 +1597,7 @@ func _setup_parallel_band() -> void:
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)
+	_pbm_cpp.resize(_pbm_n)
 	for i in range(_pbm_n):
 		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1; _pbm_mode[i] = 0
 		_pbm_bytes[i] = PackedByteArray()
@@ -1731,6 +1735,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 				lc[ci] = Vector2(float(l[0]), float(l[2]))
 			_pbm_fid[i] = fid
 			_pbm_mode[i] = 0
+			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
 			_pbm_layer[i] = layer
 			_pbm_lc[i] = lc
 			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
@@ -1752,6 +1757,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 				flc[ci] = Vector2(float(l[0]), float(l[2]))
 			_pbm_fid[i] = ff
 			_pbm_mode[i] = 1
+			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
 			_pbm_layer[i] = -1
 			_pbm_lc[i] = flc
 			_pbm_nx[i] = _fm_texels
@@ -1786,10 +1792,10 @@ func _pbm_compute(i: int) -> void:
 	# the top_far_index split: EDIT cell → real block-id LUT; TREE → far_color_index(color_of); bare TERRAIN → the top
 	# COLOUR (far_color_index). FP_CPP_FINE_BAKE gets that terrain colour from ONE batched C++ sample_columns (~10×
 	# cheaper/column — the disc fills in ~30-40 s not minutes on a low-core browser); off ⇒ the GDScript path verbatim.
-	if CubeSphere.FP_CPP_FINE_BAKE and _sampler_obj != null:
-		# The C++ generator serialises on a GLOBAL lock the NEAR-FIELD terrain also holds. One whole-facet batch would
-		# hold it for the entire facet and block the main thread's near gen (fps → ~1). Call sample_columns PER ROW so
-		# the lock is released between rows and the near field interleaves — the shipped slice path's discipline.
+	if int(_pbm_cpp[i]) == 1:
+		# C++ terrain sample — used ONLY off-surface (near-field gen idle), decided on main at dispatch. The C++ generator
+		# serialises on a GLOBAL lock the near field also holds, so on the surface it would freeze the game (fps → ~1);
+		# off-surface that lock is uncontended. Still per-ROW so the brief holds never monopolise it.
 		var rp := PackedInt64Array(); rp.resize(nx)
 		var rlx := PackedInt32Array(); rlx.resize(nx)
 		var rlz := PackedInt32Array(); rlz.resize(nx)

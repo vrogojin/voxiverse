@@ -3317,7 +3317,7 @@ static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UN
 	# (2) uniforms → shared snippet (declares sun_dir/night_floor/term_mu/moonshine + helpers + voxi_shade)
 	code = code.replace(
 		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform float night_floor = 0.06;\nuniform float term_mu = 0.12;\n",
-		VoxiLight.SHADE_GLSL)
+		VoxiLight.shade_glsl())
 	# (3) delete the inline mu/shade/tint compute (voxi_shade now carries it)
 	code = code.replace(
 		"	float mu = dot(n, normalize(sun_dir));\n	float shade = night_floor + (1.0 - night_floor) * _day(mu);\n	vec3 tint = mix(vec3(1.0), _scatter_tint(mu), _scatter_band(mu));\n",

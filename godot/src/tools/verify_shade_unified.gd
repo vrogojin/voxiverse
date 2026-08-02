@@ -64,7 +64,7 @@ func _tier_on() -> String:   return TierPlace.tier_shader_code(true)
 
 # --- G-VL-SNIPPET ----------------------------------------------------------------------------------------------
 func _gate_snippet() -> void:
-	var snip := VoxiLight.SHADE_GLSL
+	var snip := VoxiLight.shade_glsl()
 	_ok(snip.contains("vec3 voxi_shade(vec3 n, vec3 sd)"), "G-VL-SNIPPET: VoxiLight.SHADE_GLSL defines voxi_shade")
 	_ok(not snip.contains("shader_type"), "G-VL-SNIPPET: the snippet carries NO shader_type (pure body — zero new program)")
 	for pair in [["near", _near_on()], ["shell", _shell_on()], ["closeup", _cu_on()], ["abs", _abs_on()], ["tier", _tier_on()]]:

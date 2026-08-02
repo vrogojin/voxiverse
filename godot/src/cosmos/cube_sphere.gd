@@ -696,6 +696,16 @@ const BAND_SHOT_BYTES_MAX := 6 * 1024 * 1024  # NEVER-OOM ceiling for the RG8 ba
 ## material keeps NEAR_NIGHT_FLOOR — FLAT 6042/0. Gate: verify_shade_unified.gd (G-VL-EQ, incl. a scripted crossing).
 const FP_SHADE_UNIFIED := false
 
+## FP_TWILIGHT_AMBIENT — a skylight/twilight ambient floor in the shared voxi_shade law. The shipped law is
+## direct-sun only (shade × scatter_tint); scatter_tint models atmospheric EXTINCTION, which collapses toward
+## black at low sun (air-mass ~38 at the horizon ⇒ tint ≈ (0.2, 0.02, 0)), so the ground goes near-black in the
+## last few degrees before sunset while the sun is still visibly up (the user's "too dark while the sun shines").
+## Real dusk stays lit because the whole sky is a diffuse source — this adds that: a cool ambient term active over
+## a twilight band of sun elevation (~−14°…+11°), peaking at the horizon, fading to the night floor below and to
+## clean daylight above. Uses VoxiLight.shade_glsl() so OFF ⇒ the shipped SHADE_GLSL verbatim (byte-identical,
+## FLAT 6042/0; verify_shade_unified still finds voxi_shade). Requires FP_SHADE_UNIFIED. Bake ON at export.
+const FP_TWILIGHT_AMBIENT := false
+
 ## COSMOS TEXTURED-LOD U2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3a: cull, don't sink). Today the
 ## backstop facets (active ∪ live-pool, drawn at BACKSTOP_CELLS) are emitted UNDER the near voxels — the sink hides the
 ## coexistence, but far land pokes through / shows under near where the two overlap (the user's #72). This flag STOPS

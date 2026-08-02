@@ -1,0 +1,466 @@
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index aff1f00..74c0a5f 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -5,6 +5,7 @@
+ #include "../../storage/voxel_buffer_gd.h"
+ 
+ #include <core/variant/dictionary.h>
++#include <core/math/vector2.h>
+ 
+ #include <vector>
+ 
+@@ -32,6 +33,42 @@ PackedInt32Array get_i32_param(const Dictionary &config, const char *key) {
+ 	return PackedInt32Array(config[key]);
+ }
+ 
++// FP_CPP_TILE_BAKE (F1, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2/§4): the 14 far-field colours'
++// FIXED order -- FarPalette.frozen_colors() (far_palette.gd) hands them over in EXACTLY this order, and
++// it is also `far_colors`' order (see Parameters::far_colors / far_color below). Declared here (rather
++// than next to far_color, its original location) because setup() needs FC_COUNT to size canon_idx.
++enum FarColor {
++	FC_WATER = 0, FC_ICE, FC_LAVA, FC_SNOW, FC_SAND, FC_GRAVEL, FC_RED_SAND, FC_MUD,
++	FC_PODZOL, FC_GRASS, FC_LEAF, FC_STONE, FC_TAIGA, FC_FOREST, FC_COUNT
++};
++// canon_idx reserves one extra slot, past the 14 far_colors entries, for the B_PILLAR corner-monument
++// grey LITERAL (far_color's `Color(0.20, 0.20, 0.23)`, not a catalog colour -- far_palette.gd:107 / 0008
++// hunk line 114). See Parameters::canon_idx.
++constexpr int FC_PILLAR = FC_COUNT;
++constexpr int FC_CANON_SIZE = FC_COUNT + 1;
++
++// A byte-equal port of FarPalette.far_color_index's nearest-RGB scan (far_palette.gd:170-182): `r,g,b`
++// (already widened to f64 by the caller, mirroring `c.r/c.g/c.b` read out of a f32 Color) against
++// `table[0..n)`'s f32 components, ALSO widened to f64 before the subtraction -- squared-distance, STRICT
++// `<` comparison. The strictness is load-bearing: it is what makes ties resolve to the FIRST matching
++// index (FarPalette's aliasing behaviour), not merely an optimization.
++int nearest_far_index(double r, double g, double b, const PackedColorArray &table, int n) {
++	int best = 0;
++	double best_d = 1.0e30;
++	for (int i = 0; i < n; ++i) {
++		const Color c = table[i];
++		const double dr = r - double(c.r);
++		const double dg = g - double(c.g);
++		const double db = b - double(c.b);
++		const double d = dr * dr + dg * dg + db * db;
++		if (d < best_d) {
++			best_d = d;
++			best = i;
++		}
++	}
++	return best;
++}
++
+ } // namespace
+ 
+ VoxelGeneratorCosmos::VoxelGeneratorCosmos() {}
+@@ -88,6 +125,29 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 	// leaves sample_columns' colours black; the S3/skin gates supply it. NOT validated as required.
+ 	p.far_colors = PackedColorArray(config.get("far_colors", PackedColorArray()));
+ 
++	// FP_CPP_TILE_BAKE (F1): the tree-branch LUT (block id -> far-palette index), handed over frozen
++	// exactly like far_colors -- see Parameters::deco_far_idx. Optional; bake_far_tile refuses without it.
++	p.deco_far_idx = get_i32_param(config, "deco_far_idx");
++
++	// FP_CPP_TILE_BAKE (F1): precompute the byte-equality LUT ONCE, here, on the main thread -- so
++	// far_index's hot path (bake_far_tile's per-texel classification) is integer-only. Mirrors
++	// FarPalette.far_color_index's nearest-RGB scan EXACTLY (see nearest_far_index above), applied to
++	// far_colors itself (canon_idx[0..13]) and to the B_PILLAR grey literal (canon_idx[FC_PILLAR]).
++	// Left empty (the "not supplied" state) when far_colors is undersized -- far_index / bake_far_tile
++	// then refuse rather than compute a plausible-but-arbitrary index.
++	if (p.far_colors.size() >= FC_COUNT) {
++		PackedInt32Array canon;
++		canon.resize(FC_CANON_SIZE);
++		for (int i = 0; i < FC_COUNT; ++i) {
++			const Color c = p.far_colors[i];
++			canon.set(i, nearest_far_index(double(c.r), double(c.g), double(c.b), p.far_colors, FC_COUNT));
++		}
++		const Color pillar(0.20, 0.20, 0.23);
++		canon.set(FC_PILLAR,
++				nearest_far_index(double(pillar.r), double(pillar.g), double(pillar.b), p.far_colors, FC_COUNT));
++		p.canon_idx = canon;
++	}
++
+ 	p.faceted = bool(config.get("faceted", false));
+ 	p.m5c_corner = bool(config.get("m5c_corner", false));
+ 
+@@ -493,6 +553,43 @@ int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int
+ 	}
+ }
+ 
++namespace {
++// TreeGen.MAX_ABOVE_SURFACE (tree_gen.gd:33). Not in cosmos_terrain.h: 0007's tree_block_at port never
++// needed its own copy (its caller, generate_block, bounds the emit loop's Y range itself). F1's
++// tree_top_decoration is the first C++ caller that must reproduce TreeGen.top_decoration's OWN scan
++// bound, so it is mirrored here as a literal. Keep it equal to tree_gen.gd's MAX_ABOVE_SURFACE (raised
++// 10->14 for the B1 jungle tree); a mismatch would only affect bake_far_tile's tree-decoration
++// classification, never voxel emission.
++constexpr int TREE_MAX_ABOVE_SURFACE = 14;
++} // namespace
++
++// FP_CPP_TILE_BAKE (F1): port of TreeGen.top_decoration (tree_gen.gd:208-224) -- the id of the TOPMOST
++// tree block (leaf/trunk) TreeGen places over column (x, z), or ID_AIR if the column carries no tree
++// above ground. Built ENTIRELY from the already-ported primitives above (tree_has_tree / tree_base_pos /
++// col_h / tree_block_at) -- no new sampling, so it cannot disagree with generate_block's own placements.
++int VoxelGeneratorCosmos::tree_top_decoration(const Parameters &p, int fid, int x, int z) {
++	const int gx = int(cosmos::floori(double(x) / double(cosmos::TREE_G)));
++	const int gz = int(cosmos::floori(double(z) / double(cosmos::TREE_G)));
++	if (!tree_has_tree(p, fid, gx, gz)) {
++		return cosmos::ID_AIR;
++	}
++	int bx, bz;
++	tree_base_pos(gx, gz, bx, bz);
++	const int gy = col_h(p, fid, bx, bz);
++	if (gy <= cosmos::SEA_LEVEL) {
++		return cosmos::ID_AIR; // submerged tree bases are suppressed (tree_block_at agrees)
++	}
++	// GDScript's `for y in range(gy + MAX_ABOVE_SURFACE, gy, -1)`: y from gy+MAX_ABOVE_SURFACE down to
++	// gy+1 inclusive, top-down, first non-air wins.
++	for (int y = gy + TREE_MAX_ABOVE_SURFACE; y > gy; --y) {
++		const int id = tree_block_at(p, fid, x, y, z);
++		if (id != cosmos::ID_AIR) {
++			return id;
++		}
++	}
++	return cosmos::ID_AIR;
++}
++
+ // --- SHARP-SLOPE -------------------------------------------------------------------------------
+ // Port of TerrainConfig._corner_targets. Vector4 (real_t) return is the GDScript type and its f32
+ // rounding is load-bearing: _slope_fires_only reads these back and rounds them on a quarter grid.
+@@ -1698,13 +1795,8 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 
+ // SEAMLESS-SCALES §7.2 item 2: the frozen cheap-tier palette indices. GDScript's FarPalette.frozen_colors()
+ // (verify_cppgen / module_world) hands the 14 colours over in EXACTLY this order; a mismatch would be
+-// caught the moment G-CG-COLUMNS compares against FarPalette.color_for.
+-namespace {
+-enum FarColor {
+-	FC_WATER = 0, FC_ICE, FC_LAVA, FC_SNOW, FC_SAND, FC_GRAVEL, FC_RED_SAND, FC_MUD,
+-	FC_PODZOL, FC_GRASS, FC_LEAF, FC_STONE, FC_TAIGA, FC_FOREST, FC_COUNT
+-};
+-} // namespace
++// caught the moment G-CG-COLUMNS compares against FarPalette.color_for. (The `FarColor` enum itself now
++// lives in the anonymous namespace near setup(), which needs FC_COUNT to size canon_idx.)
+ 
+ // A byte-equal port of FarPalette.color_for's BRANCH LOGIC (far_palette.gd:62-107). The RGB values are
+ // the catalog's, frozen in `far_colors`; only the selection is here. B_PILLAR's grey is a literal in
+@@ -1755,6 +1847,67 @@ Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, dou
+ 	}
+ }
+ 
++// FP_CPP_TILE_BAKE (F1, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2/§4): far_color's SAME branches,
++// returning the CANONICAL PALETTE INDEX (Parameters::canon_idx, precomputed once in setup() -- see
++// nearest_far_index) instead of a Color. This is the byte-equality construction: bake_far_tile's terrain
++// classification never re-derives FarPalette's nearest-RGB scan on the hot path, it only indexes a
++// frozen integer table.
++//
++// Deliberately NOT expressed as "far_color but table-swapped", nor as far_color calling this: for every
++// branch except B_PILLAR, `p.canon_idx[K]` and `p.far_colors[K]` denote the SAME colour (canon_idx[K] is
++// K's own nearest match within far_colors, which is K itself unless an earlier entry is an exact RGB
++// duplicate -- and then it is bit-identical to K's colour by construction of that alias), so the two
++// functions agree on every value there. B_PILLAR is the one leaf where they legitimately diverge:
++// far_color returns FarPalette's grey LITERAL (never in the far_colors table), while GDScript's bake path
++// actually computes `far_color_index(color_for(...))` for that texel -- i.e. the literal's NEAREST
++// palette index, which is exactly canon_idx[FC_PILLAR]. Keeping the two functions independent, side by
++// side, line-for-line diffable against far_palette.gd/facet_tex_baker.gd, is what makes that one
++// intentional divergence visible instead of buried in a conditional.
++int VoxelGeneratorCosmos::far_index(const Parameters &p, int g, int biome, double t, bool water) {
++	if (p.canon_idx.size() < FC_CANON_SIZE) {
++		return -1; // no palette frozen; bake_far_tile already refuses before this is ever called
++	}
++	if (water) {
++		// sea_color(t): frozen -> ice, molten -> lava, else water.
++		if (t < cosmos::CLIMATE_FROZEN) {
++			return p.canon_idx[FC_ICE];
++		}
++		if (t >= cosmos::LAVA_SEA_T) {
++			return p.canon_idx[FC_LAVA];
++		}
++		return p.canon_idx[FC_WATER];
++	}
++	// The altitude snow line: the exact ClimateModel.surface_temperature < 0 predicate, gated on
++	// g >= SEA_LEVEL (FarPalette's underwater guard).
++	if (g >= cosmos::SEA_LEVEL && surface_temperature(g, t) < 0.0) {
++		return p.canon_idx[FC_SNOW];
++	}
++	// biome_base(biome, t).
++	switch (biome) {
++		case cosmos::B_OCEAN:
++			return t > 0.0 ? p.canon_idx[FC_SAND] : p.canon_idx[FC_GRAVEL];
++		case cosmos::B_BEACH:
++		case cosmos::B_DESERT:
++			return p.canon_idx[FC_SAND];
++		case cosmos::B_BADLANDS:
++			return p.canon_idx[FC_RED_SAND];
++		case cosmos::B_SWAMP:
++			return p.canon_idx[FC_MUD];
++		case cosmos::B_SNOWY:
++			return p.canon_idx[FC_SNOW];
++		case cosmos::B_TAIGA:
++			return p.canon_idx[FC_TAIGA];
++		case cosmos::B_FOREST:
++			return p.canon_idx[FC_FOREST];
++		case cosmos::B_MOUNTAINS:
++			return p.canon_idx[FC_STONE];
++		case cosmos::B_PILLAR:
++			return p.canon_idx[FC_PILLAR]; // nearest-index to FarPalette's bedrock-grey corner literal
++		default:
++			return p.canon_idx[FC_GRASS]; // B_PLAINS and any unmapped
++	}
++}
++
+ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
+ 	// ENTRY POINT 2 (S2/S3 — LIVE). A thin loop over the ONE core (column_profile_core), never a second
+ 	// sampler: heights/biomes are exactly the voxel path's, so a skin tile and the voxels it overdraws
+@@ -1825,6 +1978,153 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
+ 	return d;
+ }
+ 
++namespace {
++
++// Pack a lattice column (x, z) into the int64 form facet_tex_baker.gd's `_pack_xz` (and sample_columns'
++// callers) use: x in the low 32 bits, z in the high 32, both reinterpreted through uint32 first so
++// negative lattice coordinates round-trip exactly (mirrors sample_columns' unpacking, in reverse).
++inline int64_t pack_xz(int x, int z) {
++	return int64_t(uint32_t(x)) | (int64_t(uint32_t(z)) << 32);
++}
++
++// A byte-equal port of facet_tex_baker.gd's static `_bilerp` (facet_tex_baker.gd:2016-2017): f64 math
++// over corner values that are ALREADY f32-narrowed by the caller (widened from the PackedVector2Array's
++// Vector2 -- real_t -- components), corner order (v00, v10, v11, v01).
++inline double bilerp(double v00, double v10, double v11, double v01, double s, double t) {
++	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t;
++}
++
++// FP_CPP_TILE_BAKE (F1): the per-call open-addressed table bake_far_tile's edit branch hashes into.
++// Built ONCE per call from `edit_cells`/`edit_far_idx` (both frozen main-thread snapshots at dispatch --
++// see facet_tex_baker.gd's `_edit_snap`), so the per-texel loop performs zero heap allocation. Presence
++// in the table (not the VALUE) signals "this column was edited" -- edit_far_idx[i] may legitimately be
++// 0 (a dug-to-air edit still resolves to SOME palette index via FarPalette.far_color_index_of_block), so
++// a `used` flag is kept alongside the key/value slots rather than relying on a sentinel value.
++struct EditTable {
++	std::vector<int64_t> keys;
++	std::vector<int32_t> vals;
++	std::vector<uint8_t> used;
++	uint32_t mask = 0;
++
++	void build(const PackedInt64Array &cells, const PackedInt32Array &far_idx) {
++		const int n = cells.size();
++		uint32_t cap = 16;
++		while (cap < uint32_t(n) * 2 + 1) {
++			cap <<= 1;
++		}
++		keys.assign(cap, 0);
++		vals.assign(cap, 0);
++		used.assign(cap, 0);
++		mask = cap - 1;
++		for (int i = 0; i < n; ++i) {
++			const int64_t key = cells[i];
++			uint64_t h = uint64_t(key) * 0x9E3779B97F4A7C15ULL;
++			uint32_t slot = uint32_t(h >> 32) & mask;
++			while (used[slot]) {
++				slot = (slot + 1) & mask;
++			}
++			used[slot] = 1;
++			keys[slot] = key;
++			vals[slot] = (i < far_idx.size()) ? far_idx[i] : 0;
++		}
++	}
++
++	bool find(int64_t key, int32_t *out_val) const {
++		if (mask == 0) {
++			return false;
++		}
++		uint64_t h = uint64_t(key) * 0x9E3779B97F4A7C15ULL;
++		uint32_t slot = uint32_t(h >> 32) & mask;
++		for (;;) {
++			if (!used[slot]) {
++				return false;
++			}
++			if (keys[slot] == key) {
++				*out_val = vals[slot];
++				return true;
++			}
++			slot = (slot + 1) & mask;
++		}
++	}
++};
++
++} // namespace
++
++// FP_CPP_TILE_BAKE (F1, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2): ENTRY POINT 4. The whole
++// _pbm_compute texel loop (facet_tex_baker.gd:1793-1880, cpp branch) in ONE call: one RWLockRead per
++// FACET (not per texel/row, unlike the chunked sample_columns dispatch this replaces), zero GDScript
++// calls and zero per-texel heap allocation in the steady state.
++//
++// Refuses (returns an EMPTY PackedByteArray) rather than emit a plausible-but-wrong tile when: not
++// ready, `fid` outside the frozen atlas, the palette LUT (`canon_idx`, derived from `far_colors`) or the
++// tree-decoration LUT (`deco_far_idx`) were never supplied, or the tile geometry is degenerate. This is
++// the 0008 "inert-but-well-formed" pattern: the generator stays fully functional for voxels either way.
++PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array lat_corners, int nx, int ny,
++		int tex, PackedInt64Array edit_cells, PackedInt32Array edit_far_idx) const {
++	RWLockRead rlock(_params_lock);
++	PackedByteArray out;
++	if (!_params.ready || !fid_ok(_params, fid) || _params.canon_idx.size() < FC_CANON_SIZE ||
++			_params.deco_far_idx.size() == 0 || lat_corners.size() < 4 || nx <= 0 || ny <= 0 || tex <= 0) {
++		return out;
++	}
++	const Parameters &p = _params;
++
++	out.resize(int64_t(tex) * int64_t(tex));
++	out.fill(0);
++
++	// f64 math over the f32 corner components -- see bilerp's comment. Widened here, once, rather than
++	// per texel.
++	const Vector2 c00 = lat_corners[0];
++	const Vector2 c10 = lat_corners[1];
++	const Vector2 c11 = lat_corners[2];
++	const Vector2 c01 = lat_corners[3];
++	const double v00x = double(c00.x), v00z = double(c00.y);
++	const double v10x = double(c10.x), v10z = double(c10.y);
++	const double v11x = double(c11.x), v11z = double(c11.y);
++	const double v01x = double(c01.x), v01z = double(c01.y);
++
++	const bool have_edits = edit_cells.size() > 0;
++	EditTable edit_table;
++	if (have_edits) {
++		edit_table.build(edit_cells, edit_far_idx);
++	}
++
++	uint8_t *w = out.ptrw();
++	for (int by = 0; by < ny; ++by) {
++		const double t = (double(by) + 0.5) / double(ny);
++		const int row_off = by * tex;
++		for (int bx = 0; bx < nx; ++bx) {
++			const double s = (double(bx) + 0.5) / double(nx);
++			const int lx = int(cosmos::roundi(bilerp(v00x, v10x, v11x, v01x, s, t)));
++			const int lz = int(cosmos::roundi(bilerp(v00z, v10z, v11z, v01z, s, t)));
++
++			// EDIT -> TREE -> TERRAIN, mirroring facet_tex_baker.gd's cpp branch exactly.
++			int fi = -1;
++			if (have_edits) {
++				int32_t ev = 0;
++				if (edit_table.find(pack_xz(lx, lz), &ev)) {
++					fi = ev;
++				}
++			}
++			if (fi < 0) {
++				const int deco = tree_top_decoration(p, fid, lx, lz);
++				if (deco != cosmos::ID_AIR) {
++					fi = (deco >= 0 && deco < p.deco_far_idx.size()) ? p.deco_far_idx[deco] : 0;
++				}
++			}
++			if (fi < 0) {
++				const Vector4 pr = column_profile_core(p, fid, lx, lz);
++				const int g = int(pr.x);
++				const int biome = int(pr.y);
++				const double temp = double(pr.w);
++				fi = far_index(p, g, biome, temp, g < cosmos::SEA_LEVEL);
++			}
++			w[row_off + bx] = uint8_t(fi + 1);
++		}
++	}
++	return out;
++}
++
+ // A facet id the frozen atlas actually covers. cell_dir indexes facet_frame directly, so an
+ // unchecked fid from script would read out of bounds -- checked once at the entry point rather than
+ // per core call, keeping the hot path clean while the boundary stays safe.
+@@ -1882,6 +2182,9 @@ void VoxelGeneratorCosmos::_bind_methods() {
+ 	// S1 -- while they are staged inert -- so the boundary shape is pinned by the gate from the start
+ 	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
+ 	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);
++	// FP_CPP_TILE_BAKE (F1): the full-tile far-map bake entry point (ENTRY POINT 4 above).
++	ClassDB::bind_method(D_METHOD("bake_far_tile", "fid", "lat_corners", "nx", "ny", "tex", "edit_cells", "edit_far_idx"),
++			&VoxelGeneratorCosmos::bake_far_tile);
+ 	ClassDB::bind_method(D_METHOD("_generate_block", "out_buffer", "origin_in_voxels", "lod"), &VoxelGeneratorCosmos::gd_generate_block);
+ 	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
+ 	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index 7aa3e67..d252abd 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -152,6 +152,31 @@ public:
+ 	// S2/S3: implement as a thin loop over column_profile_core. NOT as its own sampler.
+ 	Dictionary sample_columns(int fid, PackedInt64Array cells) const;
+ 
++	// --- ENTRY POINT 4: full-tile far-map bake (FP_CPP_TILE_BAKE, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2 F1) --
++	//
++	// The WHOLE _pbm_compute texel loop (facet_tex_baker.gd:1793-1880) in one call, so a worker's steady
++	// state allocates nothing and calls GDScript zero times per texel. ONE `RWLockRead` acquisition per
++	// FACET (not per texel/row), matching sample_columns' idiom.
++	//
++	// `lat_corners` is the tile's 4 lattice-param corners (v00, v10, v11, v01 -- the SAME order and the
++	// SAME f32 Vector2 values facet_tex_baker.gd's `lc` carries) for one facet's tile. Per texel (bx, by):
++	// s=(bx+0.5)/nx, t=(by+0.5)/ny; lattice coords via a verbatim `_bilerp` port (f64 math over the f32
++	// corners) then `int(round(..))`. Classification mirrors facet_tex_baker.gd's cpp branch
++	// branch-for-branch: edit (hash lookup in `edit_cells`/`edit_far_idx`) -> tree
++	// (`tree_top_decoration`) -> terrain (`far_index`). Writes `uint8_t(fi + 1)` (0 = un-baked) into a
++	// `tex`x`tex` buffer, `resize()`d once and zero-filled.
++	//
++	// BYTE-EQUALITY (see far_index / Parameters::canon_idx below): the per-texel classification is
++	// INTEGER-ONLY -- no float re-derivation of FarPalette's nearest-RGB scan happens on the hot path.
++	//
++	// `edit_cells`/`edit_far_idx` are parallel arrays (edit_far_idx[i] is the ALREADY-RESOLVED palette
++	// index for edit_cells[i]'s lattice column, i.e. FarPalette.far_color_index_of_block done GDScript-
++	// side at snapshot time) -- built into a per-call open-addressed hash, one alloc per call, never per
++	// texel. Missing `Parameters::deco_far_idx` (or `canon_idx`, i.e. `far_colors` never supplied) ->
++	// returns an EMPTY PackedByteArray: loud refusal, the generator stays fully functional for voxels.
++	PackedByteArray bake_far_tile(int fid, PackedVector2Array lat_corners, int nx, int ny, int tex,
++			PackedInt64Array edit_cells, PackedInt32Array edit_far_idx) const;
++
+ 	// Harness alias: some GDScript gates drive the generator by the VoxelGeneratorScript override name
+ 	// `_generate_block(buffer, origin, lod)` rather than the base virtual. Bind it so those gates run
+ 	// against the C++ generator identically -- the LIVE game path (VoxelTerrain -> generate_block) is
+@@ -208,6 +233,9 @@ private:
+ 	static int tree_oak_block(int gx, int gz, int dx, int y, int dz, int gy, int log_id, int leaf_id);
+ 	static int tree_spruce_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
+ 	static int tree_block_at(const Parameters &p, int fid, int x, int y, int z);
++	// FP_CPP_TILE_BAKE (F1): port of TreeGen.top_decoration (tree_gen.gd:208-224), built entirely from
++	// the primitives above -- see bake_far_tile.
++	static int tree_top_decoration(const Parameters &p, int fid, int x, int z);
+ 
+ 	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
+ 	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
+@@ -230,6 +258,15 @@ private:
+ 	// FarPalette.color_for's BRANCH LOGIC over the frozen `far_colors` (the RGB values are the
+ 	// catalog's, handed over once at setup). Pure over `p`; used only by sample_columns.
+ 	static Color far_color(const Parameters &p, int g, int biome, double t, bool water);
++	// FP_CPP_TILE_BAKE (F1): far_color's SAME branch logic, returning the CANONICAL PALETTE INDEX (via
++	// Parameters::canon_idx, precomputed once in setup()) instead of a Color -- the byte-equality
++	// construction bake_far_tile's terrain branch relies on. See far_color's/far_index's definitions:
++	// they are independent, side-by-side-diffable ports of the SAME GDScript branches (far_palette.gd's
++	// color_for), deliberately NOT expressed as one calling the other, because they legitimately diverge
++	// on exactly one leaf (B_PILLAR: far_color returns FarPalette's grey LITERAL; far_index returns that
++	// literal's nearest-palette-index, matching what GDScript's
++	// `far_color_index(color_for(...))` actually computes for the bake path).
++	static int far_index(const Parameters &p, int g, int biome, double t, bool water);
+ 	static int deep_family(const Parameters &p, int x, int y, int z);
+ 	static int strata_at(const Parameters &p, int x, int y, int z);
+ 	static int strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy);
+@@ -384,6 +421,26 @@ private:
+ 		// (S1 gate) omitted them; far_color then returns opaque black, which the colour gate ignores.
+ 		PackedColorArray far_colors;
+ 
++		// FP_CPP_TILE_BAKE (F1, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2): block id -> far-palette
++		// index (0..13), i.e. FarPalette.far_color_index_of_block precomputed for every catalog id,
++		// handed over frozen at setup() exactly like far_colors. Used ONLY by bake_far_tile's tree
++		// branch. Optional -- empty (or undersized relative to a queried block id, guarded per-lookup)
++		// means bake_far_tile refuses (empty PackedByteArray) rather than emit a wrong tile; every other
++		// entry point is unaffected.
++		PackedInt32Array deco_far_idx;
++
++		// FP_CPP_TILE_BAKE (F1): the BYTE-EQUALITY LUT. canon_idx[0..13] is, for each of the 14
++		// `far_colors` entries, the index of its NEAREST match within `far_colors` itself (by
++		// FarPalette.far_color_index's exact f32-widened-to-f64 nearest-RGB scan, first-wins on ties) --
++		// i.e. its own index, unless an earlier entry is an exact RGB duplicate, in which case FIRST-WINS
++		// aliasing (mirrored verbatim from far_palette.gd) resolves to that earlier index. canon_idx[14]
++		// (see far_index's FC_PILLAR) is the nearest match for the B_PILLAR corner-monument grey literal
++		// `Color(0.20, 0.20, 0.23)` (far_color's literal, 0008 hunk line 114) within the SAME table.
++		// Precomputed ONCE in setup() so far_index's hot path is integer-only -- no float
++		// re-derivation. Empty when far_colors was not supplied (< 14 entries); far_index and
++		// bake_far_tile treat that as a hard refusal.
++		PackedInt32Array canon_idx;
++
+ 		// S3: material ids resolve_cell projects to, frozen from TerrainConfig.material_tables().
+ 		int id_bedrock = 0, id_deepslate = 0, id_water = 0, id_lava = 0, id_ice = 0;
+ 		int id_sand = 0, id_red_sand = 0, id_gravel = 0, id_sandstone = 0, id_red_sandstone = 0;

@@ -145,6 +145,8 @@ var _pbm_ny: Array = []             # slot -> Ny
 var _pbm_mutex := Mutex.new()       # guards the result handoff (_pbm_bytes[i]) between worker and main
 var _pbm_mode: Array = []           # slot -> 0 band (bm_texels² → layer), 1 fine (fm_texels² → sub-page)
 var _pbm_cpp: Array = []            # slot -> 1 use the C++ sample_columns terrain path (FP_CPP_FINE_BAKE ∧ OFF-SURFACE), 0 GDScript
+var _pbm_tile: Array = []           # slot -> 1 use the C++ WHOLE-tile bake_far_tile() path (FP_CPP_TILE_BAKE), 0 = per-row/GDScript
+var _pbm_tile_ok := false           # setup latch: FP_CPP_TILE_BAKE ∧ engine has bake_far_tile() (else fall back to the 1-worker path)
 var _offsurface := false            # last update()'s regime: near field frozen (orbit) ⇒ the C++ generator lock is uncontended
 # FP_PLANET_MAP fine tier — always-resident whole-planet L8 map, 24 sub-page layers (6 faces × 2×2 quadrants).
 var _fm_on := false
@@ -1608,14 +1610,24 @@ func _setup_parallel_band() -> void:
 	# bake SLOWER. Cap at min(cores−1, WEB_BAKE_WORKERS): 1 on web (the measured optimum). The clean multi-core fix is a
 	# LOCK-FREE C++ parallel sample_columns in the module (like the near-field voxel gen, which does scale) — engine work.
 	# _detect_cores() is kept for the (correct) 'cores' telemetry; the near-field voxel gen DOES use the 16-pool.
-	_pbm_n = clampi(mini(_detect_cores() - 1, WEB_BAKE_WORKERS if OS.has_feature("web") else 8), 1, 8)
+	# FP_CPP_TILE_BAKE: the WHOLE tile bakes in ONE native bake_far_tile() call — zero per-texel GDScript/heap, so the bake
+	# thread runs pure C++ compute and the web WorkerThreadPool (now given >1 thread via project.godot worker_pool.web=5)
+	# genuinely parallelises. THIS is the lock-free path the note below asked for. Off (or old engine w/o the method): the
+	# GDScript convoy still holds → keep the 1-worker web optimum.
+	_pbm_tile_ok = CubeSphere.FP_CPP_TILE_BAKE and _sampler_obj != null and _sampler_obj.has_method("bake_far_tile")
+	if _pbm_tile_ok:
+		_pbm_n = clampi(mini(_detect_cores() - 2, 4), 1, 4)   # leave 2 cores for main + near-field voxel gen; cap 4 bake threads
+	else:
+		_pbm_n = clampi(mini(_detect_cores() - 1, WEB_BAKE_WORKERS if OS.has_feature("web") else 8), 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)
 	_pbm_cpp.resize(_pbm_n)
+	_pbm_tile.resize(_pbm_n)
 	for i in range(_pbm_n):
 		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1; _pbm_mode[i] = 0
 		_pbm_bytes[i] = PackedByteArray()
+		_pbm_cpp[i] = 0; _pbm_tile[i] = 0
 	_setup_fine_map()
 
 func _setup_fine_map() -> void:
@@ -1751,6 +1763,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_fid[i] = fid
 			_pbm_mode[i] = 0
 			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
+			_pbm_tile[i] = 1 if _pbm_tile_ok else 0
 			_pbm_layer[i] = layer
 			_pbm_lc[i] = lc
 			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
@@ -1773,6 +1786,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_fid[i] = ff
 			_pbm_mode[i] = 1
 			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
+			_pbm_tile[i] = 1 if _pbm_tile_ok else 0
 			_pbm_layer[i] = -1
 			_pbm_lc[i] = flc
 			_pbm_nx[i] = _fm_texels
@@ -1807,7 +1821,23 @@ func _pbm_compute(i: int) -> void:
 	# the top_far_index split: EDIT cell → real block-id LUT; TREE → far_color_index(color_of); bare TERRAIN → the top
 	# COLOUR (far_color_index). FP_CPP_FINE_BAKE gets that terrain colour from ONE batched C++ sample_columns (~10×
 	# cheaper/column — the disc fills in ~30-40 s not minutes on a low-core browser); off ⇒ the GDScript path verbatim.
-	if int(_pbm_cpp[i]) == 1:
+	var tiled := false
+	if int(_pbm_tile[i]) == 1:
+		# FP_CPP_TILE_BAKE: the ENTIRE tile bakes in ONE native bake_far_tile() call — no per-texel GDScript, no per-texel
+		# heap traffic — so the bake thread runs pure C++ compute and N threads genuinely parallelise on the (now
+		# multi-thread) web WorkerThreadPool. Byte-equal to the GDScript path below by integer-LUT construction
+		# (docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2). Empty/short return (deco LUT absent) ⇒ fall through untouched.
+		var edit_cells := PackedInt64Array()
+		var edit_far := PackedInt32Array()
+		if have_edits:
+			for k in _edit_snap:                     # snapshot is stable during a bake (main builds it, workers only read)
+				edit_cells.append(_pack_xz(int(k.x), int(k.y)))
+				edit_far.append(FarPalette.far_color_index_of_block(int(_edit_snap[k])))
+		var tb: PackedByteArray = _sampler_obj.call("bake_far_tile", fid, lc, nx, ny, tex, edit_cells, edit_far)
+		if tb.size() == tex * tex:
+			bytes = tb
+			tiled = true
+	if not tiled and int(_pbm_cpp[i]) == 1:
 		# C++ terrain sample — used ONLY off-surface (decided on main at dispatch), where the near-field gen (which shares
 		# the C++ generator's GLOBAL lock) is FROZEN. Sampled in ROW-BLOCKS: a whole-facet batch holds the lock long enough
 		# to still hitch the main thread (~fps 15), while per-row pays 64 marshalling round-trips (rate → 1/s). A block of
@@ -1852,7 +1882,7 @@ func _pbm_compute(i: int) -> void:
 						fi = FarPalette.far_color_index(cols[idx])
 					bytes[row_off + bx] = fi + 1
 			by0 += rows
-	else:
+	elif not tiled:
 		for by in range(ny):
 			var t := (float(by) + 0.5) / float(ny)
 			var row_off := by * tex

@@ -188,6 +188,13 @@ static func far_color_index_of_block(block_id: int) -> int:
 		return _block_idx[block_id]
 	return 0                                        # AIR / out of range → index 0 (no texture load on the worker)
 
+## The whole block_id → far-palette-index LUT (== _block_idx). FP_CPP_TILE_BAKE hands this frozen to the C++
+## generator (config "deco_far_idx") so bake_far_tile's tree branch resolves a decoration id → palette index in C++
+## with zero GDScript, byte-equal to far_color_index_of_block. Built main-thread by ensure_far_index_ready.
+static func far_index_lut() -> PackedInt32Array:
+	ensure_far_index_ready()
+	return _block_idx
+
 ## COSMOS-LOD-SKY M2 (docs/COSMOS-LOD-SKY-DESIGN.md §3) — the airless Moon far-ring palette, generalized per
 ## body exactly like the Earth colours above: every RGB is a BlockCatalog tint (regolith / basalt maria /
 ## anorthosite highlands), so a recolour follows by construction. The surface is a regolith blanket over the

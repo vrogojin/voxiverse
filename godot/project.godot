@@ -119,3 +119,14 @@ threads/count/margin_below_max=1
 ; A/B down to 4/3 via a deploy-time sed on this line; judge on post_worst_ms, not raw worst_ms.
 ; Default stays 6 (the user's explicit fill>smoothness choice) until a real-GPU A/B beats it.
 threads/main/time_budget_ms=6
+
+[threading]
+
+; COSMOS-CPP-PARALLEL-SAMPLER (FP_CPP_TILE_BAKE): the general WorkerThreadPool defaults to ONE thread on web
+; (OS_Web::get_default_thread_pool_size()==1) — so every _pbm bake add_task time-slices on a single thread and the
+; parallel fine-map bake was never parallel. Give it real capacity on web only (native autodetects fine). With
+; low_priority_thread_ratio 0.8 ⇒ max_low_priority = CLAMP(5·0.8,1,4)=4, so four low-priority bake tasks run
+; concurrently (default 0.3 ⇒ only ONE). Voxel gen uses its OWN [voxel] pool; WEB_PTHREAD_POOL raised 16→24 to seat
+; these + the voxel workers (ledger: voxel≤10 + WTP 5 + audio/IO/spare≤3 < 24). Export-baked; NEVER-OOM heap A/B.
+worker_pool/max_threads.web=5
+worker_pool/low_priority_thread_ratio.web=0.8

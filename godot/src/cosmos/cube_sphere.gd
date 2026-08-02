@@ -621,6 +621,14 @@ const FP_PLANET_MAP := false
 ## by the one-sampler law G-CG-COLUMNS; tree → far_color_index(color_of); edit → far_color_index_of_block — the exact
 ## top_far_index split). Off ⇒ the GDScript _pbm path verbatim; the C++ path also no-ops if the module is absent.
 const FP_CPP_FINE_BAKE := false
+## FP_CPP_TILE_BAKE — the WHOLE _pbm fine/band texel loop runs in ONE C++ VoxelGeneratorCosmos.bake_far_tile() call per
+## facet (bilerp + terrain + tree + palette classification), so a bake worker does ZERO GDScript / ZERO allocation per
+## texel. The REAL multi-core bake fix (docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md): the web WorkerThreadPool defaults
+## to ONE thread (so the GDScript _pbm slots never parallelised) + dlmalloc's global lock busy-waits on main — moving
+## the loop into C++ + raising the WTP thread count (project [threading], WEB_PTHREAD_POOL 24) lets N bake threads run
+## in parallel. Byte-equal by integer-LUT construction. Requires the engine rebuild (patch 0011) + FP_CPP_FINE_BAKE's
+## sampler. Off ⇒ GDScript path; if the engine lacks bake_far_tile the dispatch falls through to GDScript. Bake ON at export.
+const FP_CPP_TILE_BAKE := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

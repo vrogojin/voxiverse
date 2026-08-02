@@ -1594,7 +1594,10 @@ func _setup_parallel_band() -> void:
 	# worker). The real speedups are the shade-skip (top_block_id) + the smaller fine texel + fine-priority, not more
 	# workers. Scales up automatically when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE and
 	# the browser reports more logical cores.
-	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)
+	# DIAGNOSTIC: force 6 workers regardless of the browser-reported core count (navigator.hardwareConcurrency = 2 here,
+	# though the 16-thread pool can host more). If the host really has ≥6 cores the GDScript fine bake parallelises ~6×
+	# at good fps (it holds no C++ lock); if the host is genuinely 2-core it thrashes → tells us the browser count is real.
+	_pbm_n = clampi(maxi(OS.get_processor_count() - 1, 6), 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)

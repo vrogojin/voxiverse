@@ -84,3 +84,15 @@ V2 shot tint pages (surface_shot), FP_FAR_SMOOTH, warm-ups, verify_climate G-B1-
 
 NEVER-OOM: two bools + four ints + branch logic, zero new runtime allocations (deco_far_idx already resident).
 With this landed, FP_CLIMATE_BIOMES / FP_SKIN_TEXTURE_MEAN no longer force the fast tile bake off.
+
+## Disclosed residual near/far edge cases in top_block_id (fix in the far-geometry pass)
+top_block_id mirrors _biome_top + the sea/snow regime, but two narrow cases still diverge from resolve_cell
+(both far-skin only, both to be closed in the smooth-far-geometry work that revisits this tier):
+1. **Wet-shore snow guard**: _with_snow_state refuses the snow cap when CellCodec.liquid_field(v) != 0
+   (a partial-liquid shore composite). top_block_id lacks that guard, so a g==SEA_LEVEL cold shoreline with
+   a partial-liquid smoothed remainder bakes to snow while the near render shows the un-capped material.
+   FIX: add the `liquid_field != 0 → base (no cap)` guard (needs the C++ mirror + rebuild).
+2. **Slope-run sea/land discriminator**: top_block_id decides sea-vs-land purely from g < SEA_LEVEL and does
+   not consult the always-on SHARP-SLOPE run, so a steep coastal cliff whose slope hi breaches SEA_LEVEL
+   (g still < SEA_LEVEL) reports sea liquid though resolve_cell shows the exposed cliff material. Pre-existing
+   in the legacy color_for path too (same discriminator) — not a regression, but not yet mirrored.

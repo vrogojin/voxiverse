@@ -318,3 +318,19 @@ The B2 mesher's GDScript column sampling hits the same two walls ((a) one WTP th
 `Parameters` (a `bake_smooth_patch` sibling of `bake_far_tile`), never per-cell GDScript on
 a worker. The "lock-free parallel sampler" the baker comment asked for turns out to already
 exist — what was missing was threads to run it on and a boundary drawn at the right place.
+
+## LIVE RESULTS (2026-08-02, 8-core web deploy — closes §5 acceptance)
+
+- **NEVER-OOM heap A/B (F2 gate): PASS.** heap_mb instrument wired (register_types.cpp EM_ASM →
+  self.__voxHeapSize()). Peak WASM linear memory **412 MB at orbit** (pbm_busy=4, all tiers resident,
+  the worst case) = **20% of the 2048 MB WASM_MEM_MAX ceiling** (1.6 GB headroom). The always-on WTP
+  bump (max_threads.web=5 + WEB_PTHREAD_POOL=24, ~+8–10 MB thread stacks) is ~2% of the peak —
+  the two knobs are KEPT, no revert.
+- **Throughput (F1): ~12 facets/s at orbit** with the 4-thread tile bake (tex_baked 2052→2527 in 40 s)
+  vs the old ~1 facet/s GDScript baseline — ~12×, far past the ≥2.5× accept bar. fps ~26 during the
+  active fill (min 18), recovers to 59 (min 46, worst 21.6 ms) once covered. pool_threads confirmed 1→6.
+- **Byte-equality UNDER LIVE FLAGS** (FACETED+FP_CLIMATE_BIOMES+FP_SKIN_TEXTURE_MEAN+FP_SKIN_BLOCK_EXACT
+  sed-on, as the deploy runs them): verify_tile_bake **G-CPB 76/0** (72 tiles + 3136 edit cells + 8-way
+  concurrency); verify_cppgen near-field **G-CG-CELL 0/605184 mismatched**. FLAT flags-off 6042/0.
+  NOTE: the gate exercises the flag via the same sed-toggle the deploy uses (like FACETED); the default
+  headless run is flags-off, so run it sed-on to reproduce the live-flag proof.

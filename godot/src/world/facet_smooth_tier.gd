@@ -47,19 +47,19 @@ static func residency_for_tier(tier: int) -> int:
 ## `slot` is written −1 here (B2 overlay: UV2.y=-1 ⇒ the shell shader's fine/base branch paints it — no band).
 ## `lift` (blocks) nudges every vertex radially outward: the B2 overlay draws the smooth mesh a hair ABOVE the
 ## flat heightfield so it occludes it (sub-pixel at far distance) until the emit-exclusion path lands (increment 2).
-## `curved` places vertices on the CURVED SPHERE `dir·(R + relief)` instead of on the flat inscribed facet quad — the
-## piecewise-flat quads ARE the facet-boundary crease (adjacent flat tangent planes meet at a dihedral angle even at
-## sea level), so curving the base is what removes the "straight lines stitching facets"; it also sits the tile above
-## the inscribed heightfield (occlusion for free). Off (B1 gate) ⇒ the flat planar+relief placement node_at returns.
+## `curved` places vertices on the CURVED SPHERE `dir·(R + relief)`. Historically (pre-P0) this differed from the
+## `curved=false` branch, which placed vertices on the flat inscribed facet quad instead — the piecewise-flat
+## quads ARE the facet-boundary crease (adjacent flat tangent planes meet at a dihedral angle even at sea level).
+## Post-P0 (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2) `FarDensity.node_at`'s own `pos`/`planar` are ALREADY
+## the canon-dir radial placement (`dir·r_datum` + relief), so both branches now agree to float-associativity
+## rounding only — the parameter/branch stay (call-site compatibility; the B2 worker always passes `true`).
 static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
-	var corners := [
-		FacetAtlas.facet_planar_corner(fid, 0),
-		FacetAtlas.facet_planar_corner(fid, 1),
-		FacetAtlas.facet_planar_corner(fid, 2),
-		FacetAtlas.facet_planar_corner(fid, 3),
-	]
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the SHARED canon corner DIRECTIONS, not the facet's own
+	# planarized corner points — `FarDensity.node_at` bilerps these so a boundary node welds bit-identically to
+	# whichever facet is on the other side of the shared edge (`FacetAtlas.facet_corner_dirs`, `facet_atlas.gd:425`).
+	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
 	var dec := _decode(fid)
 	var face := int(dec[0])
 	var a := int(dec[1])
@@ -87,37 +87,42 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 		var t := float(gj) * inv
 		for gi in range(stride):
 			var s := float(gi) * inv
-			var node := FarDensity.node_at(corners, s, t)
+			var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
 			var vi := gj * stride + gi
 			var d: Vector3 = node["dir"]
 			if curved:
 				pos[vi] = d * (r_datum + float(node["relief"]) + lift)   # on the sphere → no dihedral crease across facets
 			else:
-				pos[vi] = (node["pos"] as Vector3) + d * lift            # flat planar+relief (B1 gate parity)
+				pos[vi] = (node["pos"] as Vector3) + d * lift            # node_at's own radial pos (B1 gate parity)
 			dirs[vi] = d
 			var g := int(node["g"])
 			col[vi] = FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
 			uv2[vi] = Vector2(float(face), -1.0)
 
-	# Per-vertex normal = normalized cross of the world-space tangents (central differences of the displaced grid
-	# = the density gradient on a heightfield, §2.5), oriented outward (dot with the radial dir). On a flat facet
-	# the tangents are the facet plane ⇒ the normal is radial (G-FS-DEGEN).
+	# Per-vertex normal. INTERIOR (§2.5): normalized cross of the world-space tangents (central differences of the
+	# displaced grid = the density gradient on a heightfield), oriented outward (dot with the radial dir). On a
+	# flat facet the tangents are the facet plane ⇒ the normal is radial (G-FS-DEGEN). BOUNDARY (s or t ∈ {0,1},
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 3, P0): the OLD clamped-stencil here (`i0=gi` at gi==0, etc.)
+	# is a one-sided in-tile difference — two facets sharing an edge would each clamp toward THEIR OWN interior
+	# and generally compute DIFFERENT normals there (a shading seam once P2 lights by normal). Route boundary
+	# nodes through `FarDensity.boundary_normal` instead — a pure function of the (already-welded, canon) `d`, so
+	# both sides get the bit-identical value.
 	for gj in range(stride):
 		for gi in range(stride):
 			var vi := gj * stride + gi
-			var i0 := gi - 1 if gi > 0 else gi
-			var i1 := gi + 1 if gi < cells else gi
-			var j0 := gj - 1 if gj > 0 else gj
-			var j1 := gj + 1 if gj < cells else gj
-			var ts := pos[gj * stride + i1] - pos[gj * stride + i0]
-			var tt := pos[j1 * stride + gi] - pos[j0 * stride + gi]
-			var nv := ts.cross(tt)
-			if nv.length_squared() <= 0.0:
-				nv = dirs[vi]
-			nv = nv.normalized()
-			if nv.dot(dirs[vi]) < 0.0:
-				nv = -nv
+			var nv: Vector3
+			if gi == 0 or gi == cells or gj == 0 or gj == cells:
+				nv = FarDensity.boundary_normal(dirs[vi], r_datum)
+			else:
+				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
+				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
+				nv = ts.cross(tt)
+				if nv.length_squared() <= 0.0:
+					nv = dirs[vi]
+				nv = nv.normalized()
+				if nv.dot(dirs[vi]) < 0.0:
+					nv = -nv
 			nrm[vi] = nv
 
 	var idx := PackedInt32Array()
@@ -135,6 +140,32 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 			ii += 6
 
 	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx}
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P0, mixed pitch) — the COARSE-OWNS-EDGE chord-snap, generalized
+## from the shipped `FacetFarRing._weld_snap_edges` (`facet_far_ring.gd:2939`, CELLS=4-only) to any tier pair on
+## the ladder (S2/S3/S4/S5, and the S5→shipped-CELLS=4-shell frontier): a fine tile at `cells` sitting next to a
+## coarser tile at `coarse_cells` (`cells` a whole multiple of `coarse_cells` — the ladder's node-superset property,
+## 104=2·52=4·26=8·13) snaps every boundary vertex NOT already on the coarse lattice onto a straight-line lerp of
+## its OWN coarse-index neighbours along that edge. Those coarse-index vertices already bit-match the coarse
+## neighbour's own vertices there (law 2's canon-dir weld — same (canon dirs, r_datum, s, t) ⇒ same `node_at`), so
+## the lerp reproduces the coarse tile's OWN straight polygon edge exactly ⇒ no crack at the mixed-pitch frontier.
+## Mutates `pos` in place (mirrors the shipped in-place `_weld_snap_edges`). No-op if `coarse_cells` doesn't evenly
+## divide `cells` or isn't strictly coarser (caller error guard — the ladder never calls it otherwise).
+static func snap_edges_to_coarse(pos: PackedVector3Array, cells: int, coarse_cells: int) -> void:
+	if coarse_cells <= 0 or coarse_cells >= cells or cells % coarse_cells != 0:
+		return
+	var cstride := cells / coarse_cells
+	var stride := cells + 1
+	for i in range(1, cells):
+		if i % cstride == 0:
+			continue                                     # already a coarse-index vertex — leave it exact
+		var c0 := (i / cstride) * cstride                # lower coarse index on the edge
+		var c1 := mini(c0 + cstride, cells)              # upper coarse index
+		var lo := float(i - c0) / float(cstride)
+		pos[i * stride + 0] = pos[c0 * stride + 0].lerp(pos[c1 * stride + 0], lo)             # West (gi=0)
+		pos[i * stride + cells] = pos[c0 * stride + cells].lerp(pos[c1 * stride + cells], lo)  # East (gi=cells)
+		pos[0 * stride + i] = pos[0 * stride + c0].lerp(pos[0 * stride + c1], lo)              # South (gj=0)
+		pos[cells * stride + i] = pos[cells * stride + c0].lerp(pos[cells * stride + c1], lo)  # North (gj=cells)
 
 ## Resident byte cost of a built tile (§2.7 ledger, `SMOOTH_BYTES_MAX`). pos/nrm 12 B each, col 16 B, uv/uv2 8 B
 ## each, idx 4 B — the ArrayMesh vertex-buffer footprint the LRU accounts against the NEVER-OOM cap.

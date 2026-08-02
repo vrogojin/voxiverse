@@ -705,6 +705,37 @@ const SMOOTH_SKIRT_BLOCKS := 4.0            # always-on radial skirt along every
 const SMOOTH_BYTES_MAX := 96 * 1024 * 1024  # smooth mesh cache ceiling (worst ≈ 40MB + edit-patch headroom) — fixed
 const SMOOTH_BUILD_SLOTS := 8               # WorkerThreadPool tiles in flight (B2/B3 driver) — cores−1 ≤ 8
 
+## FP_SMOOTH_RIM — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3: the S2 NEAR-COLLAR, the near↔far SEAM KILL. Requires
+## FP_FAR_SMOOTH (no S2 tier exists to assign otherwise). Today the visible NEAR↔FAR transition is blocky voxels →
+## the FP_FARRING_FULL_COVER dense sunk backstop (BACKSTOP_CELLS=16, ~26-block cells): a resolution+sink discontinuity
+## (§1.6 — "the dip becomes sub-block-scale" only once the far surface samples at S2's ~4-block pitch). This flag
+## assigns the S2 tier (SMOOTH_S2_CELLS=104, SMOOTH_S2_MAX=9 cap) to the active ∪ live-pool ("backstop-role") facets,
+## built with the §2.1 envelope-inside-disc + feather + ε-sink law (`FacetSmoothTier.build_tile_rim`): every vertex
+## inside R_env (near view distance + RIM_STREAM_MARGIN) sits at the min-envelope height − ε (never protrudes through
+## the near blocky terrain — the same `_env_weld_grid`/`_env_corner_min` no-protrusion law the backstop already
+## proves), blending to the TRUE relief height across a RIM_FEATHER_BLOCKS feather band, reading as ordinary S2
+## far-relief beyond it. The shared law-6 emit-exclusion (`visible_fids()`) already gives MAKE-BEFORE-BREAK for free:
+## a backstop-role facet keeps drawing its sunk `_bpos_cache` quad (unmodified) until the frame its S2 tile actually
+## COMMITS into `_smooth`'s resident set, at which point `visible_fids()` drops it from the backstop emit exactly as
+## it already does for S3-S5 (never a frame with neither). Sticky ring-1 facets (in `_sticky` but not live pool) are
+## NOT S2-assigned — they stay on the shipped S3 ladder path. Default false ⇒ `_rim_assign` is never called and no S2
+## tile is ever requested for a backstop-role facet — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd
+## (G-RIM-ENV/WELD/MBB). YELLOW stage — §7.1 perf-risk fallback ladder (ENV_FINE_MULT step-down, incremental rebuild,
+## BACKSTOP_CELLS 16→32) applies if the S2 envelope bake can't keep up with a walking player on a 2-core browser.
+const FP_SMOOTH_RIM := false
+## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
+## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
+## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).
+const RIM_REBUILD_BLOCKS := 24
+## §2.1: R_env = near view distance (TerrainConfig.near_render_radius(), 128 faceted) + this margin (blocks). Must
+## exceed RIM_REBUILD_BLOCKS so near voxels can never stream in outside the envelope zone BETWEEN two rim rebuilds
+## (the §2.1 invariant the design cites — 32 > 24 clears it with an 8-block guard band).
+const RIM_STREAM_MARGIN := 32.0
+## §2.1: the feather-band width (blocks) beyond R_env over which S2 vertex height blends min-envelope → true relief.
+## Position-keyed (a pure function of world position + the frozen player-column snapshot), so two adjacent S2 tiles
+## spanning the disc compute IDENTICAL boundary values ⇒ the weld canon survives the blend (G-RIM-WELD).
+const RIM_FEATHER_BLOCKS := 16.0
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

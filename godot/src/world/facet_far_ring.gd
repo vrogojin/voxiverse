@@ -55,6 +55,14 @@ var _mi: MeshInstance3D
 # commits (law 6, `visible_fids()`) — no overlay lift (P1 retires B2's `lift`; replacement, not overlay). null off (inert).
 var _smooth = null
 var _smooth_assign: Dictionary = {}   # fid -> tier (S3/S4/S5): the driver's own hysteresis-held request state (P1)
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): the player's ABSOLUTE world-space column, pushed once
+# per frame by WorldManager.update_streaming (`set_player_column`) — the centre of the S2 near-collar disc (§2.1).
+# Vector3.ZERO / never read (no S2 assignment ever fires) with the flag off.
+var _player_col_abs: Vector3 = Vector3.ZERO
+# §3 P3: the player column the CURRENTLY RESIDENT S2 tiles were last baked against + whether a baseline exists yet
+# (`_rim_assign`'s RIM_REBUILD_BLOCKS cadence gate). Unused with the flag off.
+var _rim_baked_col: Vector3 = Vector3.ZERO
+var _rim_have_baked := false
 # COSMOS PLANET-LOD-CONFIG P0 (§2.4): the last-bound §2V skin textures, cached so set_skin_active can UNBIND them at
 # orbit (freeing the base map from the sampler → the shell falls back to the plain vertex-colour FarPalette backstop:
 # tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
@@ -413,17 +421,78 @@ func set_active(new_fid: int) -> void:
 ## itself is main-thread and O(visible hemisphere), only the tile BUILD is off-thread), re-requests the hysteresis-held
 ## {facet → tier} assignment, then pumps the worker build/commit/rebuild. Sets `_pending` the frame residency actually
 ## changes so the shell's next emit honours the exclusion law (a facet just left/joined the smooth-resident set).
+## §3 P3 (FP_SMOOTH_RIM): folds the S2 near-collar assignment (active ∪ live-pool) into the `assign` dict BEFORE
+## `request()`, so the driver dispatches S2 and S3/S4/S5 builds through the ONE existing worker-slot/commit/dirty-tier
+## machinery (no separate pump). `_rim_assign` returns a NEW merged dict rather than mutating `assign` in place — GDScript
+## Dictionaries are reference types, and `_smooth_next_assignment` already stashed THIS SAME `assign` object into
+## `_smooth_assign` (the S3/S4/S5 hysteresis state); mutating it in place would leak S2 entries into next frame's
+## pass-1 hysteresis scan, which only knows the S3/S4/S5 `counts` keys (a `Dictionary` "out of bounds" — hit and
+## fixed during gate development). Off ⇒ `_rim_assign` is never called — byte-identical.
 func _smooth_drive() -> void:
 	var ranked := _smooth_ranked_fids(_active_fid)
 	var assign := _smooth_next_assignment(ranked)
+	if CubeSphere.FP_SMOOTH_RIM:
+		assign = _rim_assign(assign)
 	_smooth.request(assign)
 	_smooth.step()
 	if _smooth.consume_changed():
 		_pending = true
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): the S2 near-collar assignment — active ∪ live-pool
+## (`_excluded`, the "backstop-role" set near voxels actually own), capped at SMOOTH_S2_MAX (a defensive trim; in
+## practice active+`_excluded` ≤ 1+POOL_MAX_NEIGHBOURS(4) = 5, well inside the cap). Sticky-only ring-1 facets (in
+## `_sticky` but neither active nor live-pool) are DELIBERATELY excluded — they stay on the shipped S3 ladder path
+## (§3 P3: "sticky ring-1 facets stay S3"), matching what `_smooth_ranked_fids` already ranks them as. Returns a
+## COPY of `assign` with the S2 entries added (no collision on the copy: `_smooth_ranked_fids` already excludes
+## every backstop-role fid from `ranked`, so `_smooth_next_assignment` never assigned one of these keys) — the
+## caller's `_smooth_assign` (S3/S4/S5-only hysteresis state) is left untouched.
+##
+## Also owns the §2.1 REBUILD CADENCE: the frozen player-column snapshot only re-baselines (forcing every currently
+## resident S2 tile to re-bake against the fresh column) once the player has drifted > RIM_REBUILD_BLOCKS since the
+## last bake — never a per-frame rebake. `force_rebake` is a plain evict: the facet's role falls straight BACK to
+## its (still cached, still-warm) sunk backstop quad the instant it drops out of `_smooth`'s resident set (the SAME
+## law-6 `visible_fids()` exclusion check, run in reverse) and stays there until the freshly-baked S2 tile re-commits
+## — so there is NEVER a frame with neither the backstop nor an S2 tile resident for a pool facet (G-RIM-MBB).
+func _rim_assign(assign: Dictionary) -> Dictionary:
+	var merged := assign.duplicate()
+	var rim := {}
+	rim[_active_fid] = true
+	for f in _excluded.keys():
+		rim[int(f)] = true
+	var count := 0
+	for f in rim.keys():
+		if count >= CubeSphere.SMOOTH_S2_MAX:
+			break
+		merged[int(f)] = FacetSmoothTier.S2
+		count += 1
+	var drift := _player_col_abs.distance_to(_rim_baked_col) if _rim_have_baked else 0.0
+	if not _rim_have_baked or drift > CubeSphere.RIM_REBUILD_BLOCKS:
+		for f in rim.keys():
+			if _smooth.tier_of(int(f)) == FacetSmoothTier.S2:
+				_smooth.force_rebake(int(f))
+		_rim_baked_col = _player_col_abs
+		_rim_have_baked = true
+	_smooth.set_rim_params(_player_col_abs)
+	return merged
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2.1 (P3): R_env — the disc radius (blocks) inside which S2 vertices sit at
+## (or blend from) the min-envelope height. Near view distance (`TerrainConfig.near_render_radius()`, 128 faceted) +
+## RIM_STREAM_MARGIN(32); the margin exceeds RIM_REBUILD_BLOCKS(24) so near voxels can never stream in outside the
+## envelope zone BETWEEN two rim rebuilds (§2.1's stated invariant).
+static func rim_r_env() -> float:
+	return float(TerrainConfig.near_render_radius()) + CubeSphere.RIM_STREAM_MARGIN
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): push the player's ABSOLUTE world-space column
+## (WorldManager.update_streaming converts the lattice player_pos via `FacetAtlas.lattice_to_world64` before calling
+## this) once per frame — the centre `_rim_assign`/`build_tile_rim` blend the S2 disc/feather against. A no-op write
+## with the flag off (nothing ever reads `_player_col_abs` then).
+func set_player_column(col_abs: Vector3) -> void:
+	_player_col_abs = col_abs
+
 ## The active facet's visible-hemisphere neighbours, NEAREST-FIRST by BFS hop count across `FacetAtlas.seam_neighbour`
 ## (cross-face ring — NOT the retired in-face-only 3×3; that was a root cause of B2 being gated off, §1.3 defect 1).
-## Excludes the active facet itself and any backstop facet (near voxels own those — S2 collar is P3, out of scope here).
+## Excludes the active facet itself and any backstop facet (near voxels own those on the S3-S5 ladder; the S2
+## near-collar for backstop-role facets is assigned separately by `_rim_assign`, §3 P3).
 ## Bounded to a modest BFS-level overshoot past the hysteresis-widened total cap so a moving player's ranking always
 ## covers every facet the assignment pass could possibly need, without ever walking the whole planet.
 func _smooth_ranked_fids(active: int) -> Array:
@@ -476,6 +545,8 @@ func _smooth_next_assignment(ranked: Array) -> Dictionary:
 		if not _smooth_assign.has(f):
 			continue
 		var t: int = int(_smooth_assign[f])
+		if not counts.has(t):
+			continue   # defensive: this pass only understands S3/S4/S5 (a foreign tier — e.g. §3 P3's S2 — is never ranked here anyway)
 		var r: int = int(rank_of[f])
 		var within := false
 		if t == FacetSmoothTier.S3:
@@ -2430,8 +2501,14 @@ func _ensure_backstop_cached_env_weld(fid: int) -> void:
 # corner/coarse-index edge node ⇒ the shell still welds (FP_SHELL_WELD preserved). Interior vertices use the
 # cheap pre-sampled 2-D fine grid. The ε sink is applied at EMIT (not baked) so the raw caches keep welding
 # (horizon_positions / backstop_raw_positions coincide). Returns [pos, col]; the caller stores into the right cache.
+# STATIC (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3): no instance state is read — made static (with its whole
+# `_weld_unit`/`_weld_place`/`_weld_snap_edges`/`_env_node_min`/`_env_corner_min`/`_env_edge_min` call chain, same
+# reasoning) so `FacetSmoothTier.build_tile_rim` (the S2 near-collar builder, a different RefCounted with no ring
+# instance) can call it directly — "reuse the shipped envelope law, don't reinvent it" (§3 P3). Existing call sites
+# (unqualified within this class, `ring._env_weld_grid(...)` from the gate) are unaffected: GDScript resolves a
+# static method through an instance reference identically to an instance method call.
 # =====================================================================================================
-func _env_weld_grid(fid: int, cells: int) -> Array:
+static func _env_weld_grid(fid: int, cells: int) -> Array:
 	# FP_ENV_WARM_ASYNC telemetry: attribute this (heavy) build to its thread, so the relocation is provable — OFF the
 	# builds land on MAIN; ON they land on the far-ring worker while env_build_main stays frozen. Cheap thread-id compare.
 	if OS.get_thread_caller_id() == OS.get_main_thread_id():
@@ -2489,7 +2566,7 @@ func _env_weld_grid(fid: int, cells: int) -> Array:
 ## symmetric disc about the shared corner dir; a COARSE-INDEX edge node samples the shared 1-D edge line + a
 ## sign-symmetric perpendicular band. A non-coarse-index (fine) edge node falls back to the 2-D footprint because
 ## `_weld_snap_edges` overwrites it with the coarse chord anyway (so its value never renders).
-func _env_node_min(cd: PackedFloat64Array, cells: int, cstride: int, gi: int, gj: int,
+static func _env_node_min(cd: PackedFloat64Array, cells: int, cstride: int, gi: int, gj: int,
 		fg: PackedInt32Array, fstride: int, mult: int, half: int, reach: float, step: float) -> int:
 	var on_w := gi == 0
 	var on_e := gi == cells
@@ -2534,7 +2611,7 @@ func _env_node_min(cd: PackedFloat64Array, cells: int, cstride: int, gi: int, gj
 ## corner dir `d`. The tangent frame is a DETERMINISTIC function of d ONLY (pick the world axis least aligned with
 ## d, orthonormalize) — so every facet meeting at this corner (any arity) builds the identical sample set ⇒ the
 ## corner welds. Rings at the canonical pitch, angular samples densified with radius so no dip is missed.
-func _env_corner_min(d: Vector3, reach: float, step: float) -> int:
+static func _env_corner_min(d: Vector3, reach: float, step: float) -> int:
 	var ref := Vector3(0.0, 1.0, 0.0)
 	if absf(d.y) >= absf(d.x) and absf(d.y) >= absf(d.z):
 		ref = Vector3(1.0, 0.0, 0.0)                    # d ~ ±Y → use X as the reference so the cross is well-conditioned
@@ -2562,7 +2639,7 @@ func _env_corner_min(d: Vector3, reach: float, step: float) -> int:
 ## the same corner dirs (possibly swapped) and the mirrored parameter (u'=1−u); commutative-add lerp + the ±p / ±off
 ## symmetry make the sample SET bit-identical either side ⇒ the coarse-index edge nodes weld. Clamped to the edge
 ## extent [0,1] so a near-corner footprint samples the corner dir (matches the neighbour's clamp — still symmetric).
-func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float) -> int:
+static func _env_edge_min(ca: Vector3, cb: Vector3, u: float, reach: float, step: float) -> int:
 	var edge_dir := cb - ca
 	var edge_blocks := (PI * 0.5 * FacetAtlas.R_BLOCKS) / float(FacetAtlas.K)
 	var du := step / edge_blocks
@@ -2992,7 +3069,7 @@ static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t:
 ## COSMOS FS1 (§4.1): the unit sphere direction at grid node (s,t) from the SHARED cube-sphere corner dirs `cd`
 ## (12 f64). The bilerp + normalize stay f64; only the final Vector3 is f32 — so two facets sharing a grid edge
 ## (identical corner dirs, identical s,t) cast to the SAME f32 direction ⇒ their shared-edge vertices weld.
-func _weld_unit(cd: PackedFloat64Array, s: float, t: float) -> Vector3:
+static func _weld_unit(cd: PackedFloat64Array, s: float, t: float) -> Vector3:
 	var ux := _bilerp(cd[0], cd[3], cd[6], cd[9], s, t)
 	var uy := _bilerp(cd[1], cd[4], cd[7], cd[10], s, t)
 	var uz := _bilerp(cd[2], cd[5], cd[8], cd[11], s, t)
@@ -3001,7 +3078,7 @@ func _weld_unit(cd: PackedFloat64Array, s: float, t: float) -> Vector3:
 
 ## COSMOS FS1 (§4.1 / One-Surface Law): the ABSOLUTE radial world point of unit direction `d` at surface height
 ## `g` — d·(R + relief). The SAME altitude law the datum-shifted near field (FS2) and skin use, so near↔far agree.
-func _weld_place(d: Vector3, g: int) -> Vector3:
+static func _weld_place(d: Vector3, g: int) -> Vector3:
 	var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
 	return d * (FacetAtlas.R_BLOCKS + relief)
 
@@ -3017,7 +3094,7 @@ func _weld_node(cd: PackedFloat64Array, s: float, t: float, pos: PackedVector3Ar
 ## INTERIOR vertex onto the CELLS=4 coarse chord (a straight-line interp of the ring's own coarse-index vertices),
 ## so its shared edge is colinear with — and welds crack-free to — a horizon 4-edge (and to another dense facet
 ## that snapped the same way). No-op for a horizon facet (cells == CELLS ⇒ cstride 1). Corners are left exact.
-func _weld_snap_edges(pos: PackedVector3Array, cells: int) -> void:
+static func _weld_snap_edges(pos: PackedVector3Array, cells: int) -> void:
 	var cstride := cells / CELLS
 	if cstride <= 1:
 		return

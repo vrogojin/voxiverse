@@ -1118,6 +1118,15 @@ func update_streaming(player_pos: Vector3) -> void:
 	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
 	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
 		_facet_ring.set_cover_query(cover_query)
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): feed the frozen player-column snapshot (ABSOLUTE
+	# world coords, the far ring's own frame) so the S2 near-collar disc is centred on the ACTUAL player, not the
+	# active facet centre. `player_pos` is in the active facet's LATTICE frame (same convention `_radial_altitude_
+	# lattice` already converts) — mirror that conversion here. No-op / byte-identical unless FP_SMOOTH_RIM.
+	if CubeSphere.FP_SMOOTH_RIM and _facet_ring != null and _facet_ring.has_method("set_player_column"):
+		var _rim_afid := TerrainConfig.active_facet()
+		if _rim_afid >= 0:
+			var _rim_w := FacetAtlas.lattice_to_world64(_rim_afid, player_pos.x, player_pos.y, player_pos.z)
+			_facet_ring.set_player_column(Vector3(_rim_w[0], _rim_w[1], _rim_w[2]))
 	# COSMOS BLOCK-LOD P1: keep the L1 rim ring in the far ring's frame (its mesh is absolute planet coords, placed by
 	# the SAME node transform so L1 and the far skin overlap exactly). No-op / byte-identical unless FP_BLOCK_LOD.
 	if _block_lod != null and _facet_ring != null:

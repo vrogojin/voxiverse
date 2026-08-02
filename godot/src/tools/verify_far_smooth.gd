@@ -122,12 +122,25 @@ func _initialize() -> void:
 	_gate_lit_on()
 	_gate_lit_nrm([fid, fid_edge, fid_int])
 
+	# --- P3 near-collar (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3, FP_SMOOTH_RIM) ---
+	_ok(not CubeSphere.FP_SMOOTH_RIM, "G-RIM-OFF: FP_SMOOTH_RIM defaults false (byte-off; `_rim_assign` is never called)")
+	_gate_rim_env(fid_int)
+	_gate_rim_weld(fid_int)
+	_gate_rim_mbb()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
 # --- fixture helper: Earth fid at local (face,a,b) ---
 func _fid_of(face: int, a: int, b: int) -> int:
 	return (face * FA.K + a) * FA.K + b
+
+func _centre_dir(fid: int) -> Vector3:
+	var s := Vector3.ZERO
+	for ci in range(4):
+		var c := FA.facet_planar_corner(fid, ci)
+		s += Vector3(c[0], c[1], c[2])
+	return s.normalized()
 
 func _face_of(fid: int) -> int:
 	var kb := FA.k_of(fid)
@@ -669,3 +682,161 @@ func _gate_lit_nrm(fids: Array) -> void:
 					max_departure = maxf(max_departure, nv.angle_to(radial))
 	_ok(unit_outward, "G-FS-LIT-NRM: every smooth-tile normal (across %d candidate facets) is unit-length (usable for lighting)" % fids.size())
 	_ok(max_departure > 1.0e-4, "G-FS-LIT-NRM: at least one interior normal measurably departs (%.6f rad) from the pure radial direction — real relief signal for the P2 splice to shade with" % max_departure)
+
+# =====================================================================================================================
+# P3 near-collar gates (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3, FP_SMOOTH_RIM) --------------------------------------
+# =====================================================================================================================
+
+## G-RIM-ENV — the envelope-inside-disc no-protrusion proof for `FacetSmoothTier.build_tile_rim`: every S2 vertex
+## strictly inside R_env sits ≥ ε (`TierPlace.backstop_sink()`) below the true analytic surface — the SAME
+## min-envelope construction proof `_env_weld_grid` already carries for the coarse-horizon/dense-backstop tiers
+## (verify_no_protrusion.gd's G-NPT-*), generalized to S2's 104-cell pitch (the builder is cells-parametrized, reused
+## verbatim). FALSIFY: a deliberately-broken build (sink forced NEGATIVE, which pushes the vertex artificially UP)
+## DOES protrude at the SAME vertices — proving the check actually catches a real violation, not vacuously green.
+func _gate_rim_env(fid: int) -> void:
+	print("  --- G-RIM-ENV: S2 near-collar — every vertex inside R_env sits at min-envelope minus ε (never protrudes) ---")
+	var cells := FST.cells_for_tier(FST.S2)
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var player_col: Vector3 = centre_node["pos"]
+	var r_env := 80.0
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+	var stride := cells + 1
+	var inv := 1.0 / float(cells)
+
+	var tile := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink)
+	var pos: PackedVector3Array = tile["pos"]
+	var bad_tile := FST.build_tile_rim(fid, cells, player_col, r_env, feather, -5000.0)   # deliberately-broken contrast
+	var bad_pos: PackedVector3Array = bad_tile["pos"]
+
+	var inside_checked := 0
+	var min_margin := 1.0e30
+	var min_bad_margin := 1.0e30
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var node := FD.node_at(corner_dirs, r_datum, s, t)
+			var true_pos: Vector3 = node["pos"]
+			if true_pos.distance_to(player_col) > r_env:
+				continue    # only assert the STRICT ε-margin claim strictly inside the disc (w == 0 exactly there)
+			inside_checked += 1
+			var vi := gj * stride + gi
+			var d: Vector3 = node["dir"]
+			var true_relief := float(node["relief"])
+			var rendered_relief := (pos[vi] - d * r_datum).dot(d)
+			min_margin = minf(min_margin, true_relief - rendered_relief)
+			var bad_relief := (bad_pos[vi] - d * r_datum).dot(d)
+			min_bad_margin = minf(min_bad_margin, true_relief - bad_relief)
+	_ok(inside_checked > 0, "G-RIM-ENV: %d S2 vertices fall strictly inside R_env=%.0f (fixture exercises the disc branch)" % [inside_checked, r_env])
+	_ok(min_margin >= sink - 1.0e-3, "G-RIM-ENV: every inside-disc S2 vertex sits >= eps=%.2f below true (worst margin %.3f) — never protrudes through the near blocky terrain" % [sink, min_margin])
+	_ok(min_bad_margin < 0.0, "G-RIM-ENV-FALSIFY: a deliberately-broken build (sink forced negative) DOES protrude (worst margin %.3f < 0) — the check is not vacuous" % min_bad_margin)
+
+## G-RIM-WELD — two S2 tiles spanning the disc (built with the SAME frozen player_col/r_env/feather — the batch
+## contract `_rim_assign`/`FacetSmoothTier.set_rim_params` freezes) share bit-equal shared-boundary vertices: the
+## feather is position-keyed, so identical world position + identical frozen inputs ⇒ identical blend on both sides.
+func _gate_rim_weld(fid: int) -> void:
+	print("  --- G-RIM-WELD: two S2 tiles built with the SAME frozen player-column/R_env/feather weld at their shared edge ---")
+	var cells := FST.cells_for_tier(FST.S2)
+	var stride := cells + 1
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var player_col: Vector3 = centre_node["pos"]
+	var r_env := 80.0
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+	var tile_a := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink)
+	var pos_a: PackedVector3Array = tile_a["pos"]
+	var slots := [FA.S_EAST, FA.S_WEST, FA.S_NORTH, FA.S_SOUTH]
+	var edge_ok := true
+	var pairs_tested := 0
+	var eps_pos := 1.0e-6 * FA.R_BLOCKS
+	for slot in slots:
+		var nb := FA.seam_neighbour(fid, slot)
+		var tile_b := FST.build_tile_rim(nb, cells, player_col, r_env, feather, sink)
+		var pos_b: PackedVector3Array = tile_b["pos"]
+		var edge_a := _edge_indices(slot, cells, stride)
+		var boundary_b := _all_boundary_indices(cells, stride)
+		for ia in edge_a:
+			var pa: Vector3 = pos_a[ia]
+			var best_d := 1.0e18
+			for ib in boundary_b:
+				best_d = minf(best_d, pa.distance_squared_to(pos_b[ib]))
+			pairs_tested += 1
+			if sqrt(best_d) > eps_pos:
+				edge_ok = false
+	_ok(pairs_tested == stride * 4, "G-RIM-WELD: tested all %d boundary vertices across 4 slots" % (stride * 4))
+	_ok(edge_ok, "G-RIM-WELD: S2 tiles built with the SAME frozen player-column/R_env/feather share bit-equal boundary vertices (<=1e-6*R) — the blend survives the weld canon")
+
+## G-RIM-MBB — drives a REAL ring's P3 driver (pool + S2 assignment), including a deliberate mid-run REBUILD-CADENCE
+## churn (the player column jumps > RIM_REBUILD_BLOCKS, forcing `force_rebake` on every resident S2 tile), and
+## asserts every backstop-role facet (active ∪ live-pool) is, on EVERY step, in EXACTLY ONE of {the far ring's own
+## emit set (`visible_fids()`), a resident S2 tile} — never neither (a hole), never both (a z-fight). This is the
+## G-FS-EXCL invariant extended to precisely the set G-FS-EXCL deliberately skips ("near voxel world's
+## responsibility... deliberately out of scope there"). Driven OFF-SURFACE (`shell_set_camera_abs(floored=false)`,
+## the G-NPT-ORBIT technique) so `visible_fids()`'s active/excluded skip is disengaged and a backstop-role facet's
+## presence there is governed PURELY by the law-6 S2-residency exclusion under test — sed-independent of
+## FP_FARRING_FULL_COVER (whose sunk-quad emit is the real deploy target, but needs its own sed run — see
+## verify_no_protrusion.gd's precondition — to exercise; the underlying make-before-break MECHANISM under test here,
+## visible_fids()'s law-6 filter vs `_rim_assign`/`force_rebake`, is identical either way). Pokes `_rim_assign`
+## directly (bypassing the `FP_SMOOTH_RIM` compile-time guard) — the same "poke a flag-gated internal directly"
+## pattern `verify_env_warm_async.gd` uses and this very file's `_gate_p1` already relies on for `ring._smooth`.
+func _gate_rim_mbb() -> void:
+	print("  --- G-RIM-MBB: backstop-role facets are NEVER without a drawable role (ring emit XOR resident S2) ---")
+	var fid := _fid_of(3, 8, 9)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	var pool := PackedInt32Array()
+	for slot in range(4):
+		var nb := FA.seam_neighbour(fid, slot)
+		if nb >= 0:
+			pool.append(nb)
+	ring.set_pool_excluded(pool)
+	var c := _centre_dir(fid)
+	ring.shell_set_camera_abs([c.x, c.y, c.z], FA.R_BLOCKS + 1323.0, false)
+	_ok(bool(ring._shell_orbit()), "G-RIM-MBB: ring engaged into the off-surface regime (active/excluded skip disengaged)")
+
+	var probe := PackedInt32Array([fid])
+	for f in pool:
+		probe.append(int(f))
+
+	var col_a := c * (FA.R_BLOCKS + 5.0)
+	var col_b := _centre_dir(int(pool[0])) * (FA.R_BLOCKS + 5.0)
+	ring.set_player_column(col_a)
+
+	var never_neither := true
+	var never_both := true
+	var ever_s2 := false
+	var steps := 0
+	for iter in range(300):
+		if iter == 150:
+			ring.set_player_column(col_b)   # §2.1 cadence churn: drift > RIM_REBUILD_BLOCKS ⇒ force_rebake fires
+		var ranked = ring._smooth_ranked_fids(ring._active_fid)
+		var assign = ring._smooth_next_assignment(ranked)
+		assign = ring._rim_assign(assign)
+		ring._smooth.request(assign)
+		ring._smooth.step()
+		ring._smooth.consume_changed()
+		steps += 1
+		var visible := {}
+		for f in ring.visible_fids():
+			visible[int(f)] = true
+		for f in probe:
+			var in_visible: bool = visible.has(int(f))
+			var in_s2: bool = ring._smooth.is_resident(int(f)) and int(ring._smooth.tier_of(int(f))) == FST.S2
+			if in_s2:
+				ever_s2 = true
+			if not in_visible and not in_s2:
+				never_neither = false
+			if in_visible and in_s2:
+				never_both = false
+	_ok(steps > 0, "G-RIM-MBB: drove %d steps of the P3 driver (incl. a mid-run rebuild-cadence churn)" % steps)
+	_ok(ever_s2, "G-RIM-MBB: at least one backstop-role facet converged to a resident S2 tile (not a vacuous pass)")
+	_ok(never_neither, "G-RIM-MBB: every backstop-role facet is drawn every step (ring emit or resident S2) — never neither (no hole)")
+	_ok(never_both, "G-RIM-MBB: never both the ring emit AND a resident S2 tile simultaneously (no z-fight)")
+	ring.free()

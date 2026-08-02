@@ -153,6 +153,114 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 
 	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx}
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 / §2.1 (FP_SMOOTH_RIM) — the S2 NEAR-COLLAR builder. Same (cells+1)²
+## grid / index winding / UV-UV2 skin law as `build_tile` above, but every vertex HEIGHT is envelope-inside-disc +
+## feather + ε-sink instead of the plain true relief:
+##   w    = clamp((|vertex − player_col| − r_env) / feather, 0, 1)     -- 0 strictly inside the disc, 1 past the feather
+##   h(v) = lerp(env_pos(v), true_pos(v), w) − dir(v)·(sink · (1 − w))  -- the sink fades out exactly where w → 1
+## `env_pos` is the SAME min-envelope lower bound the shipped backstop/coarse-horizon caches use
+## (`FacetFarRing._env_weld_grid(fid, cells)`, reused verbatim — "don't reinvent it"): env_pos(v) ≤ true_pos(v)
+## radially, by the SAME dilated-footprint-minimum construction proof the backstop already carries. A convex blend
+## of two quantities that are both ≤ true, minus a non-negative sink, is still ≤ true — so the no-protrusion
+## invariant holds BY CONSTRUCTION inside the disc (never by a tuned constant), which is what G-RIM-ENV proves.
+## `player_col`/`r_env`/`feather`/`sink` are FROZEN inputs — the caller (`FacetSmoothTier`'s P1-instance worker glue)
+## snapshots them ONCE per build batch (the same single-writer discipline `_snap_plan` already uses), so this is a
+## PURE function of world position + these frozen scalars: two S2 tiles built in the SAME batch compute BIT-IDENTICAL
+## values at any shared boundary vertex (already bit-identical there by the P0 canon weld) ⇒ the weld canon survives
+## the blend (G-RIM-WELD). Past the feather (w=1, sink=0) this is EXACTLY `build_tile`'s plain true-height placement —
+## an S2 tile's facet-edge boundary (almost always beyond R_env+feather in practice — the disc is ≤ ~160 blocks,
+## the facet edge ~417) therefore already agrees with a neighbouring S3 tile's plain boundary before the frontier
+## snap even runs (belt-and-suspenders on top of `snap_edge_to_pitch`).
+static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT) -> Dictionary:
+	FarPalette.ensure_ready()
+	var r_datum := FacetAtlas.r_of(fid)
+	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
+	var dec := _decode(fid)
+	var face := int(dec[0])
+	var a := int(dec[1])
+	var b := int(dec[2])
+	var kb := int(dec[3])
+	var stride := cells + 1
+	var n := stride * stride
+
+	# Reuse the shipped no-protrusion envelope law verbatim (§3 P3: "don't reinvent it") — the SAME cells-parametrized
+	# min-envelope grid the coarse-horizon/dense-backstop caches build, made static so it is callable with no ring
+	# instance (facet_far_ring.gd `_env_weld_grid`).
+	var env := FacetFarRing._env_weld_grid(fid, cells)
+	var env_pos: PackedVector3Array = env[0]
+
+	var pos := PackedVector3Array()
+	var nrm := PackedVector3Array()
+	var col := PackedColorArray()
+	var uv := PackedVector2Array()
+	var uv2 := PackedVector2Array()
+	pos.resize(n)
+	nrm.resize(n)
+	col.resize(n)
+	uv.resize(n)
+	uv2.resize(n)
+	var dirs := PackedVector3Array()
+	dirs.resize(n)
+
+	var feather_safe := maxf(feather, 0.001)
+	var inv := 1.0 / float(cells)
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+			var vi := gj * stride + gi
+			var d: Vector3 = node["dir"]
+			var true_pos: Vector3 = d * (r_datum + float(node["relief"]))
+			var env_p: Vector3 = env_pos[vi]
+			var dist := true_pos.distance_to(player_col)
+			var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+			var blended: Vector3 = env_p.lerp(true_pos, w)
+			pos[vi] = blended - d * (sink * (1.0 - w))
+			dirs[vi] = d
+			var g := int(node["g"])
+			var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+			if normal_lit:
+				vc.a = 0.0
+			col[vi] = vc
+			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
+			uv2[vi] = Vector2(float(face), -1.0)
+
+	# Normals: identical law to `build_tile` — boundary via the canon `FarDensity.boundary_normal` (a pure function of
+	# `d` alone), interior via the central-difference cross of the FINAL (blended) grid tangents, so a normal-lit
+	# shade reads the ACTUAL collar surface (including the blend), not the unblended true relief.
+	for gj in range(stride):
+		for gi in range(stride):
+			var vi := gj * stride + gi
+			var nv: Vector3
+			if gi == 0 or gi == cells or gj == 0 or gj == cells:
+				nv = FarDensity.boundary_normal(dirs[vi], r_datum)
+			else:
+				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
+				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
+				nv = ts.cross(tt)
+				if nv.length_squared() <= 0.0:
+					nv = dirs[vi]
+				nv = nv.normalized()
+				if nv.dot(dirs[vi]) < 0.0:
+					nv = -nv
+			nrm[vi] = nv
+
+	var idx := PackedInt32Array()
+	idx.resize(cells * cells * 6)
+	var ii := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			var v00 := gj * stride + gi
+			var v10 := v00 + 1
+			var v01 := v00 + stride
+			var v11 := v01 + 1
+			idx[ii] = v00; idx[ii + 1] = v10; idx[ii + 2] = v11
+			idx[ii + 3] = v00; idx[ii + 4] = v11; idx[ii + 5] = v01
+			ii += 6
+
+	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx}
+
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P0, mixed pitch) — the COARSE-OWNS-EDGE chord-snap, generalized
 ## from the shipped `FacetFarRing._weld_snap_edges` (`facet_far_ring.gd:2939`, CELLS=4-only) to any tier pair on
 ## the ladder (S2/S3/S4/S5, and the S5→shipped-CELLS=4-shell frontier): a fine tile at `cells` sitting next to a
@@ -315,7 +423,7 @@ static func _decode(fid: int) -> Array:
 # bounded by the per-tier residency cap + SMOOTH_BYTES_MAX ledger, fixed at creation.
 
 var _material: Material = null
-var _mi: Array = [null, null, null, null]     # per-tier MeshInstance3D, indexed by the S2..S5 enum (S2 unused until P3)
+var _mi: Array = [null, null, null, null]     # per-tier MeshInstance3D, indexed by the S2..S5 enum
 var _tiles: Dictionary = {}          # fid -> build_tile Dictionary (resident, committed on main)
 var _tier_of: Dictionary = {}        # fid -> tier (S2..S5) of each resident tile
 var _want: Dictionary = {}           # fid -> tier (the driver's requested resident set)
@@ -325,6 +433,12 @@ var _snap_plan: Dictionary = {}      # fid -> PackedInt32Array[4] (EDGE_WEST..NO
 var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
 var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
 var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): the driver's LIVE player-column snapshot (absolute
+# world coords), written by `set_rim_params` on the main thread each frame BEFORE `step()` dispatches. `step()`
+# copies this into the per-slot frozen `_s_rim_col` at dispatch time (single-writer discipline, mirrors
+# `_snap_plan`/`_s_snap`) so an in-flight S2 worker never races a later frame's write. Vector3.ZERO / never read
+# with the flag off (S2 is never assigned ⇒ `_build_worker` never takes the rim branch).
+var _rim_col: Vector3 = Vector3.ZERO
 # worker slots (single-writer of _s_* on main pre-dispatch; the worker writes only _s_result[i] under the mutex)
 var _sn: int = 0
 var _s_fid: PackedInt32Array
@@ -332,17 +446,20 @@ var _s_tier: PackedInt32Array
 var _s_task: PackedInt32Array
 var _s_result: Array = []
 var _s_snap: Array = []              # per-slot frozen snap plan (PackedInt32Array[4] or empty), single-writer pre-dispatch
+var _s_rim_col: Array = []           # per-slot frozen player-column Vector3 (S2 builds only), single-writer pre-dispatch
 var _s_mutex: Mutex = null
 
-## Create one MeshInstance3D per ladder tier (S3/S4/S5) under `parent` (inherits the ring's placement transform),
+## Create one MeshInstance3D per ladder tier (S2/S3/S4/S5) under `parent` (inherits the ring's placement transform),
 ## sharing `material`; prewarm the worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one
-## profile_at_dir) so `build_tile` is worker-safe. An empty tier's MeshInstance3D carries a 0-surface mesh (0 draws).
+## profile_at_dir) so `build_tile`/`build_tile_rim` are worker-safe. An empty tier's MeshInstance3D carries a
+## 0-surface mesh (0 draws) — S2 stays empty (and its MeshInstance3D a harmless no-op node) unless FP_SMOOTH_RIM
+## actually assigns it (§3 P3).
 func setup_instance(parent: Node3D, material: Material) -> void:
 	FarPalette.ensure_ready()
 	BlockCatalog.ensure_ready()
 	TerrainConfig.profile_at_dir(0.0, 1.0, 0.0, FacetAtlas.R_BLOCKS)   # warm _ensure_noise on main
 	_material = material
-	for t in [S3, S4, S5]:
+	for t in [S2, S3, S4, S5]:
 		var mi := MeshInstance3D.new()
 		mi.name = "FacetSmoothMesh_T%d" % t
 		if material != null:
@@ -355,7 +472,15 @@ func setup_instance(parent: Node3D, material: Material) -> void:
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_result.resize(_sn)
 	_s_snap.resize(_sn)
+	_s_rim_col.resize(_sn)
 	_s_mutex = Mutex.new()
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): set the frozen player-column snapshot (ABSOLUTE world
+## coords) the NEXT `step()` dispatch batch will bake S2 collar tiles against. Called once per frame by the ring's
+## `_smooth_drive` BEFORE `step()` — main-thread-only write (matches the `_snap_plan`/`request()` single-writer
+## contract). A no-op call with the flag off (nothing ever reads `_rim_col` then).
+func set_rim_params(col: Vector3) -> void:
+	_rim_col = col
 
 # gi/gj tile-edge index → the FacetAtlas seam slot that borders it (EDGE_WEST..NORTH order, facet_atlas.gd:57-60).
 const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
@@ -395,6 +520,15 @@ func _evict(fid: int) -> void:
 	_dirty_tier[t] = true
 	_changed = true
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM, §2.1 rebuild cadence): force a currently-resident tile
+## to be dropped so the NEXT `request()`/`step()` re-bakes it fresh (reuses `_evict`'s ledger/dirty-tier/changed
+## bookkeeping verbatim). The facet's role falls straight back to whatever its emit-exclusion law resolves to while
+## no smooth tile is resident for it (for an S2/backstop-role facet: the still-warm sunk backstop quad) until the
+## fresh tile re-commits — never a frame with neither. No-op if `fid` isn't currently resident.
+func force_rebake(fid: int) -> void:
+	if _tiles.has(int(fid)):
+		_evict(int(fid))
+
 ## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
 ## facets, then rebuild AT MOST ONE dirty tier's ArrayMesh this call (the P1 perf fix — replaces the shipped B2
 ## O(everything) merged rebuild with an O(that tier's resident set) rebuild, ≤ 3 tier meshes total ⇒ ≤ +3 draws).
@@ -431,10 +565,11 @@ func step() -> void:
 		_s_fid[i] = fid
 		_s_tier[i] = tier
 		_s_snap[i] = _snap_plan.get(fid, PackedInt32Array())
+		_s_rim_col[i] = _rim_col   # §3 P3: freeze THIS batch's player column for the S2 branch (single-writer, mirrors _s_snap)
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	for t in [S3, S4, S5]:
+	for t in [S2, S3, S4, S5]:
 		if _dirty_tier[t]:
 			_rebuild_tier_mesh(t)
 			_dirty_tier[t] = false
@@ -458,7 +593,15 @@ func _build_worker(i: int) -> void:
 	var fid := int(_s_fid[i])
 	var tier := int(_s_tier[i])
 	var cells := FacetSmoothTier.cells_for_tier(tier)
-	var tile := FacetSmoothTier.build_tile(fid, cells, 0.0, true)   # curved sphere placement, lift retired to 0 (replacement law)
+	var tile: Dictionary
+	if tier == S2 and CubeSphere.FP_SMOOTH_RIM:
+		# §3 P3: the S2 near-collar — envelope-inside-disc + feather + ε sink, against THIS batch's frozen player
+		# column (never `_rim_col` live — the worker only reads its own slot's snapshot, taken pre-dispatch).
+		var col: Vector3 = _s_rim_col[i]
+		var r_env := FacetFarRing.rim_r_env()
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink())
+	else:
+		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true)   # curved sphere placement, lift retired to 0 (replacement law)
 	var plan: PackedInt32Array = _s_snap[i]
 	if plan.size() == 4:
 		var corner_dirs := FacetAtlas.facet_corner_dirs(fid)

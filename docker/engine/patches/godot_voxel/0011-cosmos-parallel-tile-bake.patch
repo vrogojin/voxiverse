@@ -1,5 +1,5 @@
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
-index aff1f00..74c0a5f 100644
+index aff1f00..093280a 100644
 --- a/generators/cosmos/voxel_generator_cosmos.cpp
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
 @@ -5,6 +5,7 @@
@@ -211,7 +211,7 @@ index aff1f00..74c0a5f 100644
  Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
  	// ENTRY POINT 2 (S2/S3 — LIVE). A thin loop over the ONE core (column_profile_core), never a second
  	// sampler: heights/biomes are exactly the voxel path's, so a skin tile and the voxels it overdraws
-@@ -1825,6 +1978,153 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
+@@ -1825,6 +1978,161 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
  	return d;
  }
  
@@ -300,13 +300,21 @@ index aff1f00..74c0a5f 100644
 +		int tex, PackedInt64Array edit_cells, PackedInt32Array edit_far_idx) const {
 +	RWLockRead rlock(_params_lock);
 +	PackedByteArray out;
++	// Refuse malformed requests. nx/ny MUST be <= tex: the write index by*tex+bx reaches (ny-1)*tex+nx-1, which exceeds
++	// tex*tex whenever nx>tex or ny>tex -> an out-of-bounds heap write via ptrw(). The GDScript callers clamp nx,ny to
++	// the texel count, but this method is ClassDB-exposed, so guard it here. Also cap tex to a sane texture edge so a
++	// bogus value can't attempt a giant tex*tex allocation.
 +	if (!_params.ready || !fid_ok(_params, fid) || _params.canon_idx.size() < FC_CANON_SIZE ||
-+			_params.deco_far_idx.size() == 0 || lat_corners.size() < 4 || nx <= 0 || ny <= 0 || tex <= 0) {
++			_params.deco_far_idx.size() == 0 || lat_corners.size() < 4 ||
++			nx <= 0 || ny <= 0 || tex <= 0 || tex > 4096 || nx > tex || ny > tex) {
 +		return out;
 +	}
 +	const Parameters &p = _params;
 +
-+	out.resize(int64_t(tex) * int64_t(tex));
++	if (out.resize(int64_t(tex) * int64_t(tex)) != OK) {
++		out.clear();
++		return out;
++	}
 +	out.fill(0);
 +
 +	// f64 math over the f32 corner components -- see bilerp's comment. Widened here, once, rather than
@@ -365,7 +373,7 @@ index aff1f00..74c0a5f 100644
  // A facet id the frozen atlas actually covers. cell_dir indexes facet_frame directly, so an
  // unchecked fid from script would read out of bounds -- checked once at the entry point rather than
  // per core call, keeping the hot path clean while the boundary stays safe.
-@@ -1882,6 +2182,9 @@ void VoxelGeneratorCosmos::_bind_methods() {
+@@ -1882,6 +2190,9 @@ void VoxelGeneratorCosmos::_bind_methods() {
  	// S1 -- while they are staged inert -- so the boundary shape is pinned by the gate from the start
  	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
  	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);

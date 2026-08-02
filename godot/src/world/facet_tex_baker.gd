@@ -1614,7 +1614,11 @@ func _setup_parallel_band() -> void:
 	# thread runs pure C++ compute and the web WorkerThreadPool (now given >1 thread via project.godot worker_pool.web=5)
 	# genuinely parallelises. THIS is the lock-free path the note below asked for. Off (or old engine w/o the method): the
 	# GDScript convoy still holds → keep the 1-worker web optimum.
-	_pbm_tile_ok = CubeSphere.FP_CPP_TILE_BAKE and _sampler_obj != null and _sampler_obj.has_method("bake_far_tile")
+	# The C++ far_index switch does NOT model the FP_CLIMATE_BIOMES Whittaker savanna/jungle blend, and deco_far_idx is
+	# built from mean_color_of under FP_SKIN_TEXTURE_MEAN (≠ the tree branch's color_of) — either flag would byte-diverge
+	# the tile bake from the GDScript path. Fall back to the GDScript bake while either is on (both default false).
+	_pbm_tile_ok = CubeSphere.FP_CPP_TILE_BAKE and _sampler_obj != null and _sampler_obj.has_method("bake_far_tile") \
+		and not CubeSphere.FP_CLIMATE_BIOMES and not CubeSphere.FP_SKIN_TEXTURE_MEAN
 	if _pbm_tile_ok:
 		_pbm_n = clampi(mini(_detect_cores() - 2, 4), 1, 4)   # leave 2 cores for main + near-field voxel gen; cap 4 bake threads
 	else:
@@ -1712,6 +1716,12 @@ func _next_band_parallel() -> int:
 ## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
 ## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
 func _update_band_parallel(emit_axis: Array = []) -> void:
+	# NEW-TASK slot cap (the REAP below always scans all _pbm_n so orbit-dispatched bakes still commit after we descend):
+	# only the parallel C++ tile bake OFF-SURFACE uses all _pbm_n slots — that's where the near-field gen is frozen so the
+	# cores are free AND where the whole-planet fill latency matters. On the surface the far skin is close-up sugar over a
+	# few facets and the cores belong to the near-field voxel workers, so cap to 1 (the measured web GDScript optimum; the
+	# native GDScript path parallelises fine, so full _pbm_n there). This is F3's conservative on-surface ruling.
+	var active: int = _pbm_n if (_pbm_tile_ok and _offsurface) else (1 if OS.has_feature("web") else _pbm_n)
 	# 1) reap completed → commit on main (single-writer of the residency dicts)
 	for i in range(_pbm_n):
 		var fid := int(_pbm_fid[i])
@@ -1745,7 +1755,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 	var fine_pending: bool = _fm_on and _fine_baked.size() < _base_all
 	# 2) dispatch idle slots to the next wanted band facets — ONLY when the fine coverage tier has nothing pending.
 	if not fine_pending:
-		for i in range(_pbm_n):
+		for i in range(active):
 			if int(_pbm_fid[i]) >= 0:
 				continue
 			if _bm_free.is_empty():
@@ -1763,7 +1773,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_fid[i] = fid
 			_pbm_mode[i] = 0
 			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
-			_pbm_tile[i] = 1 if _pbm_tile_ok else 0
+			_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
 			_pbm_layer[i] = layer
 			_pbm_lc[i] = lc
 			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
@@ -1771,7 +1781,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
 	if _fm_on:
-		for i in range(_pbm_n):
+		for i in range(active):
 			if int(_pbm_fid[i]) >= 0:
 				continue
 			var ff := _next_fine_fid(emit_axis)
@@ -1786,7 +1796,7 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_fid[i] = ff
 			_pbm_mode[i] = 1
 			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
-			_pbm_tile[i] = 1 if _pbm_tile_ok else 0
+			_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
 			_pbm_layer[i] = -1
 			_pbm_lc[i] = flc
 			_pbm_nx[i] = _fm_texels
@@ -1806,7 +1816,8 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 ## reads are static + read-only (LUTs built on main). No residency dict is touched here.
 func _pbm_compute(i: int) -> void:
 	# GDScript terrain sample (SurfaceShot: column_profile + FarPalette + TreeGen, per-call ctx) — read-only static
-	# data, so it RUNS IN PARALLEL across worker threads (unlike the C++ sample_columns, which serialises on a lock).
+	# data, so it RUNS IN PARALLEL across worker threads. The C++ paths (sample_columns / bake_far_tile) take only a
+	# per-instance RWLockRead — reader-parallel, does NOT serialise; the baker also holds its OWN generator instance.
 	var fid := int(_pbm_fid[i])
 	var tex := _fm_texels if int(_pbm_mode[i]) == 1 else _bm_texels
 	var nx := int(_pbm_nx[i])
@@ -1830,7 +1841,12 @@ func _pbm_compute(i: int) -> void:
 		var edit_cells := PackedInt64Array()
 		var edit_far := PackedInt32Array()
 		if have_edits:
-			for k in _edit_snap:                     # snapshot is stable during a bake (main builds it, workers only read)
+			# DEAD PATH TODAY: _edit_snap has no writer in the repo (far-skin edits are Stage-B), so have_edits is always
+			# false and this never runs. The GDScript branch below reads _edit_snap.get() per texel on the worker under the
+			# same "main doesn't mutate during a bake" contract. STAGE-B MUST build this snapshot at the DISPATCH sites into
+			# per-slot arrays (not iterate the shared Dictionary on the worker) before it wires a writer — an in-place
+			# insert/erase concurrent with this iteration would corrupt the hash table.
+			for k in _edit_snap:
 				edit_cells.append(_pack_xz(int(k.x), int(k.y)))
 				edit_far.append(FarPalette.far_color_index_of_block(int(_edit_snap[k])))
 		var tb: PackedByteArray = _sampler_obj.call("bake_far_tile", fid, lc, nx, ny, tex, edit_cells, edit_far)
@@ -1838,9 +1854,9 @@ func _pbm_compute(i: int) -> void:
 			bytes = tb
 			tiled = true
 	if not tiled and int(_pbm_cpp[i]) == 1:
-		# C++ terrain sample — used ONLY off-surface (decided on main at dispatch), where the near-field gen (which shares
-		# the C++ generator's GLOBAL lock) is FROZEN. Sampled in ROW-BLOCKS: a whole-facet batch holds the lock long enough
-		# to still hitch the main thread (~fps 15), while per-row pays 64 marshalling round-trips (rate → 1/s). A block of
+		# C++ terrain sample (superseded by the tile path above; kept for FP_CPP_FINE_BAKE). Used ONLY off-surface. The old
+		# per-row marshalling pays 64 round-trips (rate → 1/s); a whole-facet batch instead hitches the main thread (~fps 15)
+		# because the marshalling + PackedArray build runs on the calling thread, NOT because of any generator lock. A block of
 		# CPP_CHUNK_ROWS balances — few calls (rate kept) + short holds (fps kept). Byte-equal to color_for.
 		var chunk := CPP_CHUNK_ROWS
 		var cn := nx * chunk

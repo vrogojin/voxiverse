@@ -64,7 +64,15 @@ func _conc_task(k: int) -> void:
 func _init() -> void:
 	var fails := 0
 	var checks := 0
+	if not CubeSphere.FACETED or not CubeSphere.FLAT_WORLD:
+		print("G-CPB: SKIP — needs FACETED + FLAT_WORLD."); quit(0); return
+	# Same init chain the world/baker setup runs, so FacetAtlas frames + palettes exist in this bare SceneTree.
+	BlockCatalog.ensure_ready()
+	FarPalette.ensure_ready()
+	FarPalette.ensure_detail_ready()
 	FarPalette.ensure_far_index_ready()
+	TerrainConfig.warm_up()
+	FacetAtlas.warm_up()
 	_gen = FacetSkinTier._build_cpp_gen(0)
 	if _gen == null:
 		print("G-CPB: SKIP — VoxelGeneratorCosmos absent (module not compiled in). Gate is a no-op on the GDScript path.")
@@ -74,7 +82,7 @@ func _init() -> void:
 		quit(1); return
 
 	# ---- G-CPB-TILE: byte-equality over a facet sample × tile-shape cases -------------------------------------------
-	var n_facets := 6 * CubeSphere.K * CubeSphere.K
+	var n_facets: int = 6 * FacetAtlas.K * FacetAtlas.K
 	var sample := PackedInt32Array()
 	var step := maxi(1, n_facets / 24)
 	var f := 0

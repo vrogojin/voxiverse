@@ -24,6 +24,26 @@ extends SceneTree
 ##   G-FS-WELD-MIXED  — an S3 tile vs its (in-face) S4 neighbour: fine boundary nodes, after
 ##                      `FacetSmoothTier.snap_edges_to_coarse`, lie exactly on the coarse tile's own straight edge
 ##                      chord (and are shown to depart from it BEFORE the snap — the crack law 4 fixes).
+##
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P1 (§3 P1, this stage) — `FP_FAR_SMOOTH` re-arm: full SSE ladder over the
+## visible hemisphere + replacement rendering. Drives a REAL `FacetFarRing` through its P1 driver (`_smooth_drive` /
+## `_smooth_ranked_fids` / `_smooth_next_assignment`), manually attaching the smooth tier the way
+## `verify_env_warm_async.gd` pokes flag-gated internals directly (bypassing the `FP_FAR_SMOOTH` const guard that
+## only lives in `FacetFarRing.setup()`, so the driver itself is exercised byte-for-byte as shipped):
+##   G-FS-EXCL      — drive the tier ladder to convergence, then assert every front-hemisphere facet the far ring is
+##                    responsible for (excluding the active facet + backstop, which are the NEAR field's job) is in
+##                    EXACTLY ONE of {`visible_fids()` (shell/heightfield emit), `_smooth.is_resident()`} — never
+##                    neither (a hole), never both (a z-fight).
+##   G-FS-FRONTIER  — an S5 tile's edge bordering a NON-smooth-resident neighbour (the shipped CELLS=4 shell) is
+##                    snapped (`FacetSmoothTier.snap_edge_to_pitch`) onto that shell's OWN chord — first tied to the
+##                    ACTUAL shipped placement (`FacetFarRing._weld_place`/`_weld_unit`) at the CELLS=4 breakpoints,
+##                    then shown the raw (pre-snap) boundary departs from that chord and the snapped boundary lands
+##                    on it exactly (≤ 1e-9·R).
+##   G-FS-BYTES (P1)— the converged real driver's resident bytes ≤ SMOOTH_BYTES_MAX; falsified tier-count-sensitive
+##                    (shrinking the requested set strictly decreases `smooth_bytes()` — the ledger tracks live
+##                    residency, not a static estimate).
+##   G-FS-OFF (P1)  — a FRESH `FacetFarRing.setup()` (the real construction site, flag untouched) never constructs a
+##                    `FacetSmoothTier`; FLAT `verify_feature.gd` stays 6042/0 (checked separately, not in this file).
 
 const TC := preload("res://src/world/terrain_config.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
@@ -72,6 +92,10 @@ func _initialize() -> void:
 	var fid_int := _fid_of(0, 5, 5)
 	_gate_weld_edge_nrm(fid_int)
 	_gate_weld_mixed(fid_int, FA.S_EAST)
+
+	# --- P1 driver (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P1) ---
+	_gate_p1_off()
+	_gate_p1()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -345,3 +369,180 @@ func _gate_weld_mixed(fid: int, slot: int) -> void:
 		"G-FS-WELD-MIXED: snapped S3 boundary lies exactly on the S4 neighbour's own straight chord (crack-free mixed-pitch weld)")
 	_ok(coarse_exact,
 		"G-FS-WELD-MIXED: S3's own coarse-index vertices already bit-match the S4 neighbour there (law-2 canon-dir weld)")
+
+# =====================================================================================================================
+# P1 driver gates (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P1)
+# =====================================================================================================================
+
+## G-FS-OFF (P1): the REAL construction site — `FacetFarRing.setup()` — never builds a `FacetSmoothTier` while the
+## flag is false (the const's own value is already checked at the top of `_initialize`; this proves the call site).
+func _gate_p1_off() -> void:
+	var ring := FacetFarRing.new()
+	var fid := _fid_of(2, 3, 7)
+	ring.setup(fid)
+	_ok(ring._smooth == null, "G-FS-OFF (P1): FacetFarRing.setup() constructs no FacetSmoothTier with FP_FAR_SMOOTH false")
+
+## Drive `ring`'s P1 driver (`_smooth_drive`) until the smooth-resident set stops growing (bounded iterations —
+## each call is a cheap bounded BFS + O(1) worker-slot pump, so looping is fast; the real cost is the WorkerThreadPool
+## tile builds, which converge within a modest number of polls on any host).
+func _p1_converge(ring: FacetFarRing, max_iters: int) -> int:
+	var iters := 0
+	var stable := 0
+	var last := -1
+	while iters < max_iters and stable < 30:
+		ring._smooth_drive()
+		iters += 1
+		var n: int = ring._smooth.resident_count()
+		if n == last:
+			stable += 1
+		else:
+			stable = 0
+			last = n
+	return iters
+
+## G-FS-EXCL / G-FS-FRONTIER / G-FS-BYTES(P1): drive a real ring's P1 tier ladder to convergence and check the
+## exclusion invariant, the frontier snap, and the NEVER-OOM ledger.
+func _gate_p1() -> void:
+	var fid := _fid_of(1, 4, 6)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	# Manually attach the smooth tier — the same "poke a flag-gated internal directly" pattern
+	# `verify_env_warm_async.gd` uses, so the driver itself (unchanged by the const) is exercised as shipped.
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	var iters := _p1_converge(ring, 4000)
+	var resident: int = ring._smooth.resident_count()
+	print("  P1 driver: %d iterations, resident=%d tiles, bytes=%.2f MB" % [iters, resident, float(ring._smooth.smooth_bytes()) / 1048576.0])
+	_ok(resident > 0, "G-FS-EXCL: the P1 driver actually converges residents (not a vacuous pass)")
+
+	# --- G-FS-EXCL: exactly one of {shell emit, smooth-resident} for every facet the far ring owns. ---
+	var shell_set := {}
+	for f in ring.visible_fids():
+		shell_set[int(f)] = true
+	var p := ring._cull_params()
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var k := FA.K
+	var checked := 0
+	var excl_ok := true
+	for face in range(6):
+		for a in range(k):
+			for b in range(k):
+				var f := (face * k + a) * k + b
+				if not ring._front_visible(f, nrm, thresh):
+					continue
+				if f == fid or ring._is_backstop(f):
+					continue   # near voxel world's responsibility, not the far ring's — deliberately out of scope here
+				checked += 1
+				var in_shell: bool = shell_set.has(f)
+				var in_smooth: bool = ring._smooth.is_resident(f)
+				if in_shell == in_smooth:
+					excl_ok = false
+	_ok(checked > 0, "G-FS-EXCL: checked a non-empty far-ring-owned front-hemisphere set (%d facets)" % checked)
+	_ok(excl_ok, "G-FS-EXCL: every far-ring-owned facet is in EXACTLY ONE of {shell emit, smooth-resident} — never neither, never both")
+
+	# --- G-FS-FRONTIER: an S5 tile's shell-adjacent edge snaps onto the shipped CELLS=4 shell chord. ---
+	_gate_frontier(ring)
+
+	# --- G-FS-BYTES (P1): real ledger ≤ cap; falsify tier-count-sensitivity (shrink ⇒ strictly fewer bytes). ---
+	var bytes_before: int = ring._smooth.smooth_bytes()
+	_ok(bytes_before <= CubeSphere.SMOOTH_BYTES_MAX,
+		"G-FS-BYTES (P1): converged resident bytes %.2f MB ≤ SMOOTH_BYTES_MAX %.2f MB" % [float(bytes_before) / 1048576.0, float(CubeSphere.SMOOTH_BYTES_MAX) / 1048576.0])
+	var keep: Array = ring._smooth.resident_fids()
+	_ok(keep.size() > 1, "G-FS-BYTES (P1): the converged set has more than one resident tile (a meaningful shrink test)")
+	if keep.size() > 1:
+		var one := int(keep[0])
+		var one_tier := int(ring._smooth.tier_of(one))
+		ring._smooth.request({one: one_tier})   # evicts everything else synchronously (request()'s eviction runs on main)
+		var bytes_after: int = ring._smooth.smooth_bytes()
+		_ok(ring._smooth.resident_count() == 1, "G-FS-BYTES (P1): shrinking the request to one facet leaves exactly one resident")
+		_ok(bytes_after < bytes_before,
+			"G-FS-BYTES (P1): shrinking the request set strictly DECREASES resident bytes (%.2f MB -> %.2f MB) — the ledger tracks live residency, not a static estimate" % [float(bytes_before) / 1048576.0, float(bytes_after) / 1048576.0])
+
+## G-FS-FRONTIER: find an S5 tile with a shell-adjacent (non-smooth-resident-neighbour) edge from the converged
+## driver state, then (1) tie the frontier-snap reference breakpoints to the ACTUAL shipped shell placement
+## (`ring._weld_place`/`_weld_unit`), (2) show the raw boundary departs from that chord, (3) show the snapped
+## boundary lies on it exactly (≤ 1e-9·R).
+func _gate_frontier(ring: FacetFarRing) -> void:
+	var seam_slots := [FA.S_WEST, FA.S_EAST, FA.S_SOUTH, FA.S_NORTH]
+	var target_fid := -1
+	var target_edge := -1
+	for f in ring._smooth.resident_fids():
+		if int(ring._smooth.tier_of(f)) != FST.S5:
+			continue
+		for e in range(4):
+			var nb := FA.seam_neighbour(int(f), seam_slots[e])
+			if not ring._smooth.is_resident(nb):
+				target_fid = int(f)
+				target_edge = e
+				break
+		if target_fid >= 0:
+			break
+	_ok(target_fid >= 0, "G-FS-FRONTIER: the converged driver has at least one S5 tile with a shell-adjacent (frontier) edge")
+	if target_fid < 0:
+		return
+
+	var cells := FST.cells_for_tier(FST.S5)
+	var shell_cells := FacetFarRing.CELLS   # 4 — the shipped shell's pitch
+	var cd := FA.facet_corner_dirs(target_fid)
+	var r_datum := FA.r_of(target_fid)
+	var eps_tie := 1.0e-6 * FA.R_BLOCKS
+	var eps_snap := 1.0e-9 * FA.R_BLOCKS
+
+	# (1) Tie: at every CELLS=4 breakpoint on this edge, the reference position `snap_edge_to_pitch` targets
+	# (FarDensity.node_at's dir/relief, curved-placed) is bit-consistent with the ACTUAL shipped shell formula.
+	var tie_ok := true
+	for kk in range(shell_cells + 1):
+		var uu := float(kk) / float(shell_cells)
+		var st := _p1_edge_st(target_edge, uu)
+		var s: float = st[0]
+		var t: float = st[1]
+		var node := FD.node_at(cd, r_datum, s, t)
+		var mine: Vector3 = (node["dir"] as Vector3) * (r_datum + float(node["relief"]))
+		var shell := ring._weld_place(ring._weld_unit(cd, s, t), int(node["g"]))
+		if mine.distance_to(shell) > eps_tie:
+			tie_ok = false
+	_ok(tie_ok, "G-FS-FRONTIER: the frontier-snap reference breakpoints are bit-consistent with the ACTUAL shipped CELLS=4 shell placement (_weld_place/_weld_unit)")
+
+	# (2)/(3): raw vs snapped boundary against the shell chord (piecewise lerp of the SAME shipped-consistent breakpoints).
+	var tile := FST.build_tile(target_fid, cells, 0.0, true)
+	var raw_pos: PackedVector3Array = tile["pos"]
+	var pre_ok := _p1_edge_on_shell_chord(ring, cd, r_datum, cells, shell_cells, target_edge, raw_pos, eps_snap)
+	_ok(not pre_ok, "G-FS-FRONTIER: the RAW (pre-snap) S5 boundary departs from the CELLS=4 shell chord (the crack law 4 fixes)")
+
+	var snapped: PackedVector3Array = raw_pos.duplicate()
+	FST.snap_edge_to_pitch(snapped, cells, cd, r_datum, shell_cells, target_edge)
+	var post_ok := _p1_edge_on_shell_chord(ring, cd, r_datum, cells, shell_cells, target_edge, snapped, eps_snap)
+	_ok(post_ok, "G-FS-FRONTIER: after the frontier snap, every S5 rim node on that edge lies on the shipped CELLS=4 shell chord (<=1e-9*R)")
+
+## The (s,t) of a tile-edge parameter `u` for `edge` (FacetSmoothTier.EDGE_WEST..NORTH order).
+func _p1_edge_st(edge: int, u: float) -> Array:
+	if edge == FST.EDGE_WEST: return [0.0, u]
+	if edge == FST.EDGE_EAST: return [1.0, u]
+	if edge == FST.EDGE_SOUTH: return [u, 0.0]
+	return [u, 1.0]
+
+## True iff every non-corner node on tile edge `edge` (cells resolution) lies within `eps` of the shell-chord
+## piecewise-lerp of the shipped shell's OWN CELLS=`shell_cells` breakpoints on that same edge.
+func _p1_edge_on_shell_chord(ring: FacetFarRing, cd: PackedFloat64Array, r_datum: float, cells: int, shell_cells: int, edge: int, pos: PackedVector3Array, eps: float) -> bool:
+	var stride := cells + 1
+	var ok := true
+	for i in range(1, cells):
+		var u := float(i) / float(cells)
+		var seg := clampi(int(floor(u * float(shell_cells))), 0, shell_cells - 1)
+		var u0 := float(seg) / float(shell_cells)
+		var u1 := float(seg + 1) / float(shell_cells)
+		var lo := (u - u0) / (u1 - u0)
+		var st0 := _p1_edge_st(edge, u0)
+		var st1 := _p1_edge_st(edge, u1)
+		var p0 := ring._weld_place(ring._weld_unit(cd, st0[0], st0[1]), int(FD.node_at(cd, r_datum, st0[0], st0[1])["g"]))
+		var p1 := ring._weld_place(ring._weld_unit(cd, st1[0], st1[1]), int(FD.node_at(cd, r_datum, st1[0], st1[1])["g"]))
+		var chord: Vector3 = p0.lerp(p1, lo)
+		var vi: int
+		if edge == FST.EDGE_WEST: vi = i * stride + 0
+		elif edge == FST.EDGE_EAST: vi = i * stride + cells
+		elif edge == FST.EDGE_SOUTH: vi = 0 * stride + i
+		else: vi = cells * stride + i
+		if pos[vi].distance_to(chord) > eps:
+			ok = false
+	return ok

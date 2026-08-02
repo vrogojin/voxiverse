@@ -167,6 +167,113 @@ static func snap_edges_to_coarse(pos: PackedVector3Array, cells: int, coarse_cel
 		pos[0 * stride + i] = pos[0 * stride + c0].lerp(pos[0 * stride + c1], lo)              # South (gj=0)
 		pos[cells * stride + i] = pos[cells * stride + c0].lerp(pos[cells * stride + c1], lo)  # North (gj=cells)
 
+# Tile-local edge selector (gi/gj grid sense — matches verify_far_smooth.gd's `_edge_indices` FA.slot convention:
+# WEST=gi=0 ↔ FacetAtlas.S_WEST, EAST=gi=cells ↔ S_EAST, SOUTH=gj=0 ↔ S_SOUTH, NORTH=gj=cells ↔ S_NORTH).
+enum { EDGE_WEST = 0, EDGE_EAST = 1, EDGE_SOUTH = 2, EDGE_NORTH = 3 }
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P1 generalization of the P0 `snap_edges_to_coarse` above) — snap
+## ONE edge of a `cells`-resolution tile onto an ARBITRARY coarser reference pitch `pitch_cells` that need NOT
+## evenly divide `cells`. This is the S5(13)→shipped-CELLS(4)-shell frontier case (13 isn't a multiple of 4, so the
+## integer-ratio helper above no-ops there) — and, defensively, ANY tier tile whose neighbour is momentarily absent
+## from the smooth-resident set (still shell) during ladder convergence (make-before-break window). Re-evaluates
+## `FarDensity.node_at` at the reference pitch's OWN breakpoints — bit-consistent with what a tile actually built at
+## that pitch (or the shipped shell, `_weld_place`/`_weld_unit`, same bilerp + same add-then-multiply order, P0
+## canon) would place there — then piecewise-linearly interpolates this tile's non-breakpoint boundary nodes within
+## their enclosing reference segment (same COARSE-OWNS-EDGE law, generalized off the integer-ratio assumption).
+## No-op if `pitch_cells` isn't strictly coarser (the caller may call this unconditionally for all 4 edges; a
+## same-or-finer neighbour is a no-op here — coarse-owns-edge means THAT side snaps toward `cells`, not vice versa).
+static func snap_edge_to_pitch(pos: PackedVector3Array, cells: int, corner_dirs: PackedFloat64Array, r_datum: float, pitch_cells: int, edge: int) -> void:
+	if pitch_cells <= 0 or pitch_cells >= cells:
+		return
+	var stride := cells + 1
+	for i in range(1, cells):
+		var u := float(i) / float(cells)
+		var seg := clampi(int(floor(u * float(pitch_cells))), 0, pitch_cells - 1)
+		var u0 := float(seg) / float(pitch_cells)
+		var u1 := float(seg + 1) / float(pitch_cells)
+		var lo := (u - u0) / (u1 - u0)
+		var p0: Vector3
+		var p1: Vector3
+		var vi: int
+		match edge:
+			EDGE_WEST:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, 0.0, u0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, 0.0, u1)
+				vi = i * stride + 0
+			EDGE_EAST:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, 1.0, u0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, 1.0, u1)
+				vi = i * stride + cells
+			EDGE_SOUTH:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, u0, 0.0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, u1, 0.0)
+				vi = 0 * stride + i
+			_:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, u0, 1.0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, u1, 1.0)
+				vi = cells * stride + i
+		pos[vi] = p0.lerp(p1, lo)
+
+## The CURVED radial placement at facet-param (s,t) — matches `build_tile`'s curved branch (`d·(r_datum+relief)`,
+## lift=0, P1 retires the overlay lift) exactly, so a reference breakpoint here is bit-consistent with what a tile
+## actually built AT that pitch would place there.
+static func _pitch_node_pos(corner_dirs: PackedFloat64Array, r_datum: float, s: float, t: float) -> Vector3:
+	var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+	var d: Vector3 = node["dir"]
+	return d * (r_datum + float(node["relief"]))
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 5 — the always-on crack backstop. Appends a thin radially-INWARD
+## "curtain" of degenerate geometry along all 4 edges of an already-built tile, dropped `drop` blocks below the true
+## surface (planet-centred coords ⇒ `pos.normalized()` IS the outward radial, no separate dir array needed). Any
+## residual sub-pixel gap at a tile boundary (weld rounding, a neighbour mid-convergence) reveals this skirt, never
+## a see-through hole. Mutates `tile`'s packed arrays IN PLACE (worker-safe: only touches this tile's own arrays,
+## called AFTER any edge snap so the skirt hangs from the FINAL boundary position).
+static func append_skirt(tile: Dictionary, cells: int, drop: float) -> void:
+	var pos: PackedVector3Array = tile["pos"]
+	var nrm: PackedVector3Array = tile["nrm"]
+	var col: PackedColorArray = tile["col"]
+	var uv: PackedVector2Array = tile["uv"]
+	var uv2: PackedVector2Array = tile["uv2"]
+	var idx: PackedInt32Array = tile["idx"]
+	var stride := cells + 1
+	for edge in range(4):
+		var e := _edge_indices_list(edge, cells, stride)
+		var base := pos.size()
+		for vi in e:
+			var p: Vector3 = pos[vi]
+			var d := p.normalized()
+			pos.append(p - d * drop)
+			nrm.append(nrm[vi])
+			col.append(col[vi])
+			uv.append(uv[vi])
+			uv2.append(uv2[vi])
+		for k in range(e.size() - 1):
+			var a0: int = e[k]
+			var a1: int = e[k + 1]
+			var b0 := base + k
+			var b1 := base + k + 1
+			idx.append(a0); idx.append(a1); idx.append(b1)
+			idx.append(a0); idx.append(b1); idx.append(b0)
+	tile["pos"] = pos
+	tile["nrm"] = nrm
+	tile["col"] = col
+	tile["uv"] = uv
+	tile["uv2"] = uv2
+	tile["idx"] = idx
+
+static func _edge_indices_list(edge: int, cells: int, stride: int) -> Array:
+	var out := []
+	match edge:
+		EDGE_WEST:
+			for gj in range(stride): out.append(gj * stride + 0)
+		EDGE_EAST:
+			for gj in range(stride): out.append(gj * stride + cells)
+		EDGE_SOUTH:
+			for gi in range(stride): out.append(0 * stride + gi)
+		_:
+			for gi in range(stride): out.append(cells * stride + gi)
+	return out
+
 ## Resident byte cost of a built tile (§2.7 ledger, `SMOOTH_BYTES_MAX`). pos/nrm 12 B each, col 16 B, uv/uv2 8 B
 ## each, idx 4 B — the ArrayMesh vertex-buffer footprint the LRU accounts against the NEVER-OOM cap.
 static func tile_bytes(tile: Dictionary) -> int:
@@ -186,81 +293,120 @@ static func _decode(fid: int) -> Array:
 	return [face, a, b, kb]
 
 # =====================================================================================================================
-# B2 INSTANCE — the worker-baked smooth-tile MeshInstance (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2.7). A
-# FacetFarRing owns ONE of these under FP_FAR_SMOOTH: it builds `build_tile` for a requested set of facets on
-# WorkerThreadPool slots (cloned from the baker's _pbm pattern), merges the resident tiles into ONE ArrayMesh surface,
-# and shares the ring's shell material so the map skin + every per-frame uniform bind come for free. Increment 1 draws
-# it as an overlay (a small radial `lift`) — the emit-exclusion + normal-lit relief variant + skirts land in B2 inc-2.
-# NEVER-OOM: resident tiles bounded by the requested set (≤ tier cap) + SMOOTH_BYTES_MAX ledger, fixed at creation.
+# P1 INSTANCE (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P1) — the worker-baked smooth-tile MeshInstance set. A
+# FacetFarRing owns ONE of these under FP_FAR_SMOOTH: it builds `build_tile` for a requested {facet → tier}
+# assignment on WorkerThreadPool slots (cloned from the baker's _pbm pattern), snaps mixed-pitch/frontier edges
+# (law 4) + appends the always-on skirt (law 5), and rebuilds ONE PER-TIER ArrayMesh surface (S3/S4/S5 — never a
+# single O(everything) merge) so a commit only touches the ONE tier that changed. `lift` is RETIRED to 0 — P1 is a
+# REPLACEMENT tier (law 6: a facet is drawn by exactly one of {shell, smooth}), not a B2-style overlay. Shares the
+# ring's shell material so the map skin + every per-frame uniform bind come for free. NEVER-OOM: resident tiles
+# bounded by the per-tier residency cap + SMOOTH_BYTES_MAX ledger, fixed at creation.
 
-var _mi: MeshInstance3D = null
 var _material: Material = null
-var _lift: float = 0.0
+var _mi: Array = [null, null, null, null]     # per-tier MeshInstance3D, indexed by the S2..S5 enum (S2 unused until P3)
 var _tiles: Dictionary = {}          # fid -> build_tile Dictionary (resident, committed on main)
-var _want: Dictionary = {}           # fid -> cells (the requested resident set; the driver refreshes it)
-var _bytes: int = 0                  # resident tile bytes (ledger)
-var _dirty: bool = false             # a commit/evict happened → rebuild the merged mesh this step
+var _tier_of: Dictionary = {}        # fid -> tier (S2..S5) of each resident tile
+var _want: Dictionary = {}           # fid -> tier (the driver's requested resident set)
+var _snap_plan: Dictionary = {}      # fid -> PackedInt32Array[4] (EDGE_WEST..NORTH → neighbour's pitch, or
+                                      # FacetFarRing.CELLS if that neighbour isn't in `_want` this batch) — frozen at
+                                      # request() time so the worker never reads live `_want` (single-writer discipline).
+var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
+var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
+var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
 # worker slots (single-writer of _s_* on main pre-dispatch; the worker writes only _s_result[i] under the mutex)
 var _sn: int = 0
 var _s_fid: PackedInt32Array
-var _s_cells: PackedInt32Array
+var _s_tier: PackedInt32Array
 var _s_task: PackedInt32Array
 var _s_result: Array = []
+var _s_snap: Array = []              # per-slot frozen snap plan (PackedInt32Array[4] or empty), single-writer pre-dispatch
 var _s_mutex: Mutex = null
 
-## Create the MeshInstance under `parent` (inherits the ring's placement transform), share `material`, prewarm the
-## worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one profile_at_dir) so `build_tile` is
-## worker-safe. `lift` (blocks) is the overlay nudge.
-func setup_instance(parent: Node3D, material: Material, lift: float) -> void:
+## Create one MeshInstance3D per ladder tier (S3/S4/S5) under `parent` (inherits the ring's placement transform),
+## sharing `material`; prewarm the worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one
+## profile_at_dir) so `build_tile` is worker-safe. An empty tier's MeshInstance3D carries a 0-surface mesh (0 draws).
+func setup_instance(parent: Node3D, material: Material) -> void:
 	FarPalette.ensure_ready()
 	BlockCatalog.ensure_ready()
 	TerrainConfig.profile_at_dir(0.0, 1.0, 0.0, FacetAtlas.R_BLOCKS)   # warm _ensure_noise on main
 	_material = material
-	_lift = lift
-	_mi = MeshInstance3D.new()
-	_mi.name = "FacetSmoothMesh"
-	if material != null:
-		_mi.material_override = material
-	parent.add_child(_mi)
-	_sn = clampi(OS.get_processor_count() - 1, 1, 4)
+	for t in [S3, S4, S5]:
+		var mi := MeshInstance3D.new()
+		mi.name = "FacetSmoothMesh_T%d" % t
+		if material != null:
+			mi.material_override = material
+		parent.add_child(mi)
+		_mi[t] = mi
+	_sn = clampi(OS.get_processor_count() - 1, 1, CubeSphere.SMOOTH_BUILD_SLOTS)
 	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
-	_s_cells = PackedInt32Array(); _s_cells.resize(_sn)
+	_s_tier = PackedInt32Array(); _s_tier.resize(_sn)
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_result.resize(_sn)
+	_s_snap.resize(_sn)
 	_s_mutex = Mutex.new()
 
-## The driver's requested resident set: facets → cells (tier pitch). Evicts tiles that fell out of the set.
-func request(fids: Array, cells: int) -> void:
-	var w := {}
-	for f in fids:
-		w[int(f)] = cells
-	_want = w
-	for fid in _tiles.keys():
-		if not _want.has(int(fid)):
-			_bytes -= FacetSmoothTier.tile_bytes(_tiles[int(fid)])
-			_tiles.erase(int(fid))
-			_dirty = true
+# gi/gj tile-edge index → the FacetAtlas seam slot that borders it (EDGE_WEST..NORTH order, facet_atlas.gd:57-60).
+const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 
-## Per-frame: reap finished worker tiles (commit on main), dispatch idle slots to wanted-not-resident facets, and
-## rebuild the merged mesh once if anything changed. Bounded per call.
+## The driver's requested resident set: fid → tier (S3/S4/S5 only in P1). Freezes each wanted facet's per-edge snap
+## plan from THIS batch's assignment (law 4: an edge whose neighbour is in `assignments` snaps to that neighbour's
+## pitch if coarser; an edge whose neighbour is ABSENT this batch — still shell, or a transient convergence gap —
+## snaps to the shipped CELLS=4 shell pitch; a same-or-finer neighbour is a no-op via `snap_edge_to_pitch`'s own
+## guard). Evicts residents no longer wanted OR whose tier changed (frees the byte ledger, marks the OLD tier dirty).
+func request(assignments: Dictionary) -> void:
+	var w := {}
+	for fid in assignments.keys():
+		w[int(fid)] = int(assignments[fid])
+	_want = w
+	_snap_plan = {}
+	for fid in w.keys():
+		var f := int(fid)
+		var plan := PackedInt32Array()
+		plan.resize(4)
+		for e in range(4):
+			var nb := FacetAtlas.seam_neighbour(f, _EDGE_SEAM_SLOT[e])
+			if w.has(nb):
+				plan[e] = FacetSmoothTier.cells_for_tier(int(w[nb]))
+			else:
+				plan[e] = FacetFarRing.CELLS   # the shipped shell's pitch (always the coarsest — every ladder tier snaps toward it)
+		_snap_plan[f] = plan
+	for fid in _tiles.keys():
+		var f := int(fid)
+		if not _want.has(f) or int(_want[f]) != int(_tier_of[f]):
+			_evict(f)
+
+func _evict(fid: int) -> void:
+	var t: int = int(_tier_of[fid])
+	_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])
+	_tiles.erase(fid)
+	_tier_of.erase(fid)
+	_dirty_tier[t] = true
+	_changed = true
+
+## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
+## facets, then rebuild AT MOST ONE dirty tier's ArrayMesh this call (the P1 perf fix — replaces the shipped B2
+## O(everything) merged rebuild with an O(that tier's resident set) rebuild, ≤ 3 tier meshes total ⇒ ≤ +3 draws).
 func step() -> void:
-	if _mi == null:
+	if _sn == 0:
 		return
 	for i in range(_sn):
 		if int(_s_task[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
 		WorkerThreadPool.wait_for_task_completion(int(_s_task[i]))
 		var fid := int(_s_fid[i])
+		var tier := int(_s_tier[i])
 		_s_mutex.lock()
 		var tile = _s_result[i]
 		_s_result[i] = null
 		_s_mutex.unlock()
-		if _want.has(fid) and tile != null and not _tiles.has(fid):
+		if _want.has(fid) and int(_want[fid]) == tier and tile != null and not _tiles.has(fid):
 			var tb: int = FacetSmoothTier.tile_bytes(tile)
 			if _bytes + tb <= CubeSphere.SMOOTH_BYTES_MAX:
 				_tiles[fid] = tile
+				_tier_of[fid] = tier
 				_bytes += tb
-				_dirty = true
+				_dirty_tier[tier] = true
+				_changed = true
 		_s_fid[i] = -1
 		_s_task[i] = -1
 	for i in range(_sn):
@@ -269,14 +415,18 @@ func step() -> void:
 		var fid := _next_want()
 		if fid < 0:
 			break
+		var tier: int = int(_want[fid])
 		_s_fid[i] = fid
-		_s_cells[i] = int(_want[fid])
+		_s_tier[i] = tier
+		_s_snap[i] = _snap_plan.get(fid, PackedInt32Array())
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	if _dirty:
-		_rebuild_mesh()
-		_dirty = false
+	for t in [S3, S4, S5]:
+		if _dirty_tier[t]:
+			_rebuild_tier_mesh(t)
+			_dirty_tier[t] = false
+			break   # ≤ 1 tier rebuild/frame (P1 mesh-management requirement)
 
 func _next_want() -> int:
 	for fid in _want.keys():
@@ -294,14 +444,27 @@ func _inflight(fid: int) -> bool:
 
 func _build_worker(i: int) -> void:
 	var fid := int(_s_fid[i])
-	var cells := int(_s_cells[i])
-	var tile := FacetSmoothTier.build_tile(fid, cells, _lift, true)   # curved sphere placement (kills the facet crease)
+	var tier := int(_s_tier[i])
+	var cells := FacetSmoothTier.cells_for_tier(tier)
+	var tile := FacetSmoothTier.build_tile(fid, cells, 0.0, true)   # curved sphere placement, lift retired to 0 (replacement law)
+	var plan: PackedInt32Array = _s_snap[i]
+	if plan.size() == 4:
+		var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
+		var r_datum := FacetAtlas.r_of(fid)
+		var pos: PackedVector3Array = tile["pos"]
+		for e in range(4):
+			FacetSmoothTier.snap_edge_to_pitch(pos, cells, corner_dirs, r_datum, int(plan[e]), e)
+		tile["pos"] = pos
+	FacetSmoothTier.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)   # law 5: always-on crack backstop
 	_s_mutex.lock()
 	_s_result[i] = tile
 	_s_mutex.unlock()
 
-## Concatenate every resident tile into ONE ArrayMesh surface (index-offset) → ≤ 1 extra draw for the whole smooth set.
-func _rebuild_mesh() -> void:
+## Concatenate this tier's resident tiles into ONE ArrayMesh surface (index-offset) — the ONLY tier touched this call.
+func _rebuild_tier_mesh(tier: int) -> void:
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null:
+		return
 	var P := PackedVector3Array()
 	var N := PackedVector3Array()
 	var C := PackedColorArray()
@@ -309,6 +472,8 @@ func _rebuild_mesh() -> void:
 	var U2 := PackedVector2Array()
 	var I := PackedInt32Array()
 	for fid in _tiles.keys():
+		if int(_tier_of[fid]) != tier:
+			continue
 		var t = _tiles[fid]
 		var base := P.size()
 		P.append_array(t["pos"])
@@ -331,7 +496,7 @@ func _rebuild_mesh() -> void:
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
 		if _material != null:
 			mesh.surface_set_material(0, _material)
-	_mi.mesh = mesh
+	mi.mesh = mesh
 
 func resident_count() -> int:
 	return _tiles.size()
@@ -339,6 +504,22 @@ func resident_count() -> int:
 func smooth_bytes() -> int:
 	return _bytes
 
-## The set of facets currently drawn smooth — the far-ring drops these from its heightfield emit (increment 2).
+## The set of facets currently drawn smooth (any tier) — the far-ring drops these from its heightfield/shell emit
+## (law 6, `visible_fids()`).
 func resident_fids() -> Array:
 	return _tiles.keys()
+
+## O(1) membership test for the exclusion law — is `fid` currently drawn by the smooth tier (any tier)?
+func is_resident(fid: int) -> bool:
+	return _tiles.has(int(fid))
+
+## The tier (S2..S5) `fid` is resident at, or -1 if not resident.
+func tier_of(fid: int) -> int:
+	return int(_tier_of.get(int(fid), -1))
+
+## Consume the "residency changed since last call" latch (single read-and-clear) — the driver uses this to know
+## when the shell must re-emit to honour the exclusion law (a facet just left/joined the smooth-resident set).
+func consume_changed() -> bool:
+	var c := _changed
+	_changed = false
+	return c

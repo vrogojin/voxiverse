@@ -49,12 +49,12 @@ var _noblack_unsink_fid := -1
 # (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
 var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
-# FP_FAR_SMOOTH (Item B2): a FacetSmoothTier overlay — worker-baked curved smooth tiles for the near facet ring,
-# sharing THIS ring's shell material (so the map skin + every per-frame uniform bind apply for free) and drawn a hair
-# above the flat heightfield. Removes the piecewise-flat facet-boundary creases + rounds relief. null off (inert).
+# FP_FAR_SMOOTH (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P1): a FacetSmoothTier REPLACEMENT tier — worker-baked curved
+# smooth tiles (S3/S4/S5 ladder) for the visible hemisphere, sharing THIS ring's shell material (so the map skin +
+# every per-frame uniform bind apply for free). A facet leaves the heightfield/shell emit the frame its smooth tile
+# commits (law 6, `visible_fids()`) — no overlay lift (P1 retires B2's `lift`; replacement, not overlay). null off (inert).
 var _smooth = null
-var _smooth_last_active := -1
-const SMOOTH_LIFT_BLOCKS := 0.5   # tiny extra radial lift so the curved smooth tile reliably occludes the inscribed heightfield
+var _smooth_assign: Dictionary = {}   # fid -> tier (S3/S4/S5): the driver's own hysteresis-held request state (P1)
 # COSMOS PLANET-LOD-CONFIG P0 (§2.4): the last-bound §2V skin textures, cached so set_skin_active can UNBIND them at
 # orbit (freeing the base map from the sampler → the shell falls back to the plain vertex-colour FarPalette backstop:
 # tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
@@ -317,7 +317,7 @@ func setup(active_fid: int) -> void:
 	# transform). Inert off (never constructed) ⇒ byte-identical.
 	if CubeSphere.FP_FAR_SMOOTH:
 		_smooth = FacetSmoothTier.new()
-		_smooth.setup_instance(self, _mi.material_override, SMOOTH_LIFT_BLOCKS)
+		_smooth.setup_instance(self, _mi.material_override)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:
@@ -408,34 +408,108 @@ func set_active(new_fid: int) -> void:
 	if not _shell_orbit():
 		_pending = true
 
-## FP_FAR_SMOOTH (B2): drive the smooth-tile overlay. Re-request the near facet ring when the active facet changes,
-## then pump the worker build/commit. The overlay shares this ring's material (all binds propagate) + is a child of
-## self (inherits the placement transform), so smooth tiles stay aligned across crossings/re-anchors.
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P1: drive the smooth-tile REPLACEMENT ladder. Re-ranks the visible hemisphere
+## nearest-first from the active facet EVERY call (cheap bounded BFS, §7.2 "worker starvation" precedent — the ranking
+## itself is main-thread and O(visible hemisphere), only the tile BUILD is off-thread), re-requests the hysteresis-held
+## {facet → tier} assignment, then pumps the worker build/commit/rebuild. Sets `_pending` the frame residency actually
+## changes so the shell's next emit honours the exclusion law (a facet just left/joined the smooth-resident set).
 func _smooth_drive() -> void:
-	if _active_fid != _smooth_last_active:
-		_smooth.request(_smooth_ring(_active_fid), CubeSphere.SMOOTH_S4_CELLS)
-		_smooth_last_active = _active_fid
+	var ranked := _smooth_ranked_fids(_active_fid)
+	var assign := _smooth_next_assignment(ranked)
+	_smooth.request(assign)
 	_smooth.step()
+	if _smooth.consume_changed():
+		_pending = true
 
-## The active facet + its in-face 3×3 neighbours (cross-face edges skipped for B2 increment 1 — corner facets that
-## straddle a cube edge stay heightfield; a rare thin seam, addressed with the full ring + weld in a later increment).
-func _smooth_ring(active: int) -> Array:
-	var kb := FacetAtlas.k_of(active)
-	var base := FacetAtlas.fid_base_of(active)
-	var lf := active - base
-	var face := int(lf / (kb * kb))
-	var rem := lf - face * kb * kb
-	var a := int(rem / kb)
-	var b := rem - a * kb
-	var out := []
-	for da in [-1, 0, 1]:
-		for db in [-1, 0, 1]:
-			var na: int = a + int(da)
-			var nb: int = b + int(db)
-			if na < 0 or na >= kb or nb < 0 or nb >= kb:
-				continue
-			out.append(base + face * kb * kb + na * kb + nb)
-	return out
+## The active facet's visible-hemisphere neighbours, NEAREST-FIRST by BFS hop count across `FacetAtlas.seam_neighbour`
+## (cross-face ring — NOT the retired in-face-only 3×3; that was a root cause of B2 being gated off, §1.3 defect 1).
+## Excludes the active facet itself and any backstop facet (near voxels own those — S2 collar is P3, out of scope here).
+## Bounded to a modest BFS-level overshoot past the hysteresis-widened total cap so a moving player's ranking always
+## covers every facet the assignment pass could possibly need, without ever walking the whole planet.
+func _smooth_ranked_fids(active: int) -> Array:
+	var p := _cull_params()
+	var nrm: Array = p[0]
+	var thresh: float = p[1]
+	var visited := {active: true}
+	var order := []
+	var frontier := [active]
+	var slots := [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]
+	var cap_total := CubeSphere.SMOOTH_S3_MAX + CubeSphere.SMOOTH_S4_MAX + CubeSphere.SMOOTH_S5_MAX
+	var hyst_total := int(float(cap_total) * CubeSphere.SSE_HYST) + 16
+	while not frontier.is_empty() and order.size() < hyst_total:
+		var next_frontier := []
+		for fid in frontier:
+			for slot in slots:
+				var nb := FacetAtlas.seam_neighbour(int(fid), slot)
+				if nb < 0 or visited.has(nb):
+					continue
+				visited[nb] = true
+				if not _front_visible(nb, nrm, thresh):
+					continue           # back-hemisphere — not part of the visible disc, don't traverse through it
+				next_frontier.append(nb)
+				if nb != active and not _is_backstop(nb):
+					order.append(nb)
+		frontier = next_frontier
+	return order
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P1: assign each ranked (nearest-first) candidate a tier (S3/S4/S5) under the
+## per-tier caps (25/64/200), PROMOTE strict / DEMOTE hysteresis-lagged (`SSE_HYST` precedent, `cube_sphere.gd:1039`
+## "a resident tier is only demoted past promote·SSE_HYST"): a facet already resident at tier T keeps T as long as its
+## CURRENT rank stays inside T's cumulative band widened ×SSE_HYST (pass 1); every facet still unassigned then fills
+## the remaining STRICT band slots nearest-first (pass 2, promotions + brand-new facets). Deterministic, no allocation
+## beyond the transient rank map — the driver's own `_smooth_assign` carries the hysteresis state frame to frame.
+func _smooth_next_assignment(ranked: Array) -> Dictionary:
+	var rank_of := {}
+	for i in range(ranked.size()):
+		rank_of[int(ranked[i])] = i
+	var b1 := CubeSphere.SMOOTH_S3_MAX
+	var b2 := b1 + CubeSphere.SMOOTH_S4_MAX
+	var b3 := b2 + CubeSphere.SMOOTH_S5_MAX
+	var d1 := int(float(b1) * CubeSphere.SSE_HYST)
+	var d2 := int(float(b2) * CubeSphere.SSE_HYST)
+	var d3 := int(float(b3) * CubeSphere.SSE_HYST)
+	var counts := {FacetSmoothTier.S3: 0, FacetSmoothTier.S4: 0, FacetSmoothTier.S5: 0}
+	var assign := {}
+	# Pass 1 — hysteresis hold: an already-resident facet keeps its tier while its rank stays inside the DEMOTE-widened band.
+	for fid in ranked:
+		var f := int(fid)
+		if not _smooth_assign.has(f):
+			continue
+		var t: int = int(_smooth_assign[f])
+		var r: int = int(rank_of[f])
+		var within := false
+		if t == FacetSmoothTier.S3:
+			within = r < d1
+		elif t == FacetSmoothTier.S4:
+			within = r < d2
+		else:
+			within = r < d3
+		if within and int(counts[t]) < FacetSmoothTier.residency_for_tier(t):
+			assign[f] = t
+			counts[t] = int(counts[t]) + 1
+	# Pass 2 — strict nearest-first fill of whatever cap room remains (promotions to a finer tier + brand-new facets).
+	for fid in ranked:
+		var f := int(fid)
+		if assign.has(f):
+			continue
+		var r: int = int(rank_of[f])
+		var t := -1
+		if r < b1 and int(counts[FacetSmoothTier.S3]) < CubeSphere.SMOOTH_S3_MAX:
+			t = FacetSmoothTier.S3
+		elif r < b2 and int(counts[FacetSmoothTier.S4]) < CubeSphere.SMOOTH_S4_MAX:
+			t = FacetSmoothTier.S4
+		elif r < b3 and int(counts[FacetSmoothTier.S5]) < CubeSphere.SMOOTH_S5_MAX:
+			t = FacetSmoothTier.S5
+		if t >= 0:
+			assign[f] = t
+			counts[t] = int(counts[t]) + 1
+	_smooth_assign = assign
+	return assign
+
+## Gate/telemetry accessor: is `fid` currently drawn by the smooth tier (any tier)? False (and never null-derefs)
+## with the flag off.
+func is_smooth_resident(fid: int) -> bool:
+	return _smooth != null and _smooth.is_resident(fid)
 
 ## FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §1.4/§2.2 step 8): the ring mesh is built in ABSOLUTE planet
 ## coords. When the fixed frame pins the scene @ the absolute frame (PlanetRoot @ identity) this node stays @
@@ -653,7 +727,7 @@ func set_pool_excluded(fids: Array) -> void:
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
 	if _smooth != null:
-		_smooth_drive()   # FP_FAR_SMOOTH (B2): worker-baked smooth overlay for the near facet ring (runs every frame)
+		_smooth_drive()   # FP_FAR_SMOOTH (P1): worker-baked smooth REPLACEMENT ladder for the visible hemisphere (runs every frame)
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -1805,6 +1879,13 @@ func visible_fids(cached_only := false) -> PackedInt32Array:
 				# S1b: the true-orbit progressive path emits only cache-ready facets (grows as the cache fills); every
 				# other caller passes cached_only=false ⇒ the shipped full front set (byte-identical).
 				if cached_only and not _emit_cache_ready(fid):
+					continue
+				# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 6 (P1 emit-exclusion): once a facet's smooth tile has
+				# COMMITTED, the shell/heightfield stops emitting it — "smooth-until-ready" (it keeps emitting until
+				# then, so there is never a frame with neither). Every consumer of `visible_fids()` (this rebuild, the
+				# async worker's fid set, the boot-warm proximity order, …) shares this ONE filter, so the exclusion is
+				# consistent everywhere. `_smooth` is null unless FP_FAR_SMOOTH ⇒ byte-identical off.
+				if _smooth != null and _smooth.is_resident(fid):
 					continue
 				out.append(fid)
 	return out

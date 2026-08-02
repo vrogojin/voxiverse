@@ -34,6 +34,7 @@ const BASE_TEXELS := 16              # stored texels per facet edge → ground p
 const BAKE_SRC := 32                 # fine sample columns per facet edge (2× BASE_TEXELS → exact 2×2 box average)
 const DOWNS := BAKE_SRC / BASE_TEXELS # box-average factor (2)
 const CPP_CHUNK_ROWS := 8            # FP_CPP_FINE_BAKE: sample_columns row-block per C++ call — balances lock-hold (fps) vs marshalling (rate)
+const WEB_BAKE_WORKERS := 1         # web GDScript bake worker cap: the column sampler convoys on WASM shared memory (7 workers = 0.3 facet/s < 1 clean at ~1/s)
 
 var _k := 0                          # FacetAtlas.K (24) — page = _k·BASE_TEXELS
 var _page := 0                       # per-face page edge in texels (384)
@@ -1601,10 +1602,13 @@ func _setup_parallel_band() -> void:
 	if not _pbm_on:
 		return
 	# Reserve one core for the main/render thread: on a 2-core browser, running 2 bake workers alongside main
-	# Worker count = (logical cores − 1), leave one for main. CRITICAL: on the web build Godot's OS.get_processor_count()
-	# under-reports (measured 2 on an 8-core host where navigator.hardwareConcurrency = 8) — so read hardwareConcurrency
-	# DIRECTLY via JavaScriptBridge. The 16-thread pool then hosts real parallel workers on the true cores. Capped at 8.
-	_pbm_n = clampi(_detect_cores() - 1, 1, 8)
+	# MEASURED (live, 8-core host): the GDScript column-sampling bake does NOT parallelise on WASM — 7 workers convoy to
+	# 0.3 facet/s (each ~23× slower) vs ~1/s with ONE clean worker, from shared-heap / SharedArrayBuffer memory-bandwidth
+	# saturation (the walk-perf convoy; NOT the profile memo — bypassing it changed nothing). So MORE workers make the
+	# bake SLOWER. Cap at min(cores−1, WEB_BAKE_WORKERS): 1 on web (the measured optimum). The clean multi-core fix is a
+	# LOCK-FREE C++ parallel sample_columns in the module (like the near-field voxel gen, which does scale) — engine work.
+	# _detect_cores() is kept for the (correct) 'cores' telemetry; the near-field voxel gen DOES use the 16-pool.
+	_pbm_n = clampi(mini(_detect_cores() - 1, WEB_BAKE_WORKERS if OS.has_feature("web") else 8), 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)

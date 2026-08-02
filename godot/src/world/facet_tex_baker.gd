@@ -1782,25 +1782,60 @@ func _pbm_compute(i: int) -> void:
 	var bytes := PackedByteArray()
 	bytes.resize(tex * tex)
 	bytes.fill(0)
-	for by in range(ny):
-		var t := (float(by) + 0.5) / float(ny)
-		var row_off := by * tex
-		for bx in range(nx):
-			var s := (float(bx) + 0.5) / float(nx)
-			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
-			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
-			# The flat band + whole-planet fine tiers store a frozen-palette index (0..13; +1, 0 = un-baked). An EDIT
-			# overlay cell is a real BLOCK id → its palette index via _block_idx; bare TERRAIN classifies its top
-			# COLOUR directly (top_far_index). This split fixes the colour bug where the terrain path fed a detail-
-			# PATTERN id into the block-id LUT (open water→mud, sand→stone). Shade-skipped ⇒ ~5-6× cheaper per column.
-			var fi := -1
-			if have_edits:
-				var eb := int(_edit_snap.get(Vector2i(lx, lz), -1))
-				if eb >= 0:
-					fi = FarPalette.far_color_index_of_block(eb)
-			if fi < 0:
-				fi = SurfaceShot.top_far_index(lx, lz, ctx)
-			bytes[row_off + bx] = fi + 1
+	# The flat band + whole-planet fine tiers store a frozen-palette index (0..13; +1, 0 = un-baked). Classification is
+	# the top_far_index split: EDIT cell → real block-id LUT; TREE → far_color_index(color_of); bare TERRAIN → the top
+	# COLOUR (far_color_index). FP_CPP_FINE_BAKE gets that terrain colour from ONE batched C++ sample_columns (~10×
+	# cheaper/column — the disc fills in ~30-40 s not minutes on a low-core browser); off ⇒ the GDScript path verbatim.
+	if CubeSphere.FP_CPP_FINE_BAKE and _sampler_obj != null:
+		var n := nx * ny
+		var packed := PackedInt64Array(); packed.resize(n)
+		var lxs := PackedInt32Array(); lxs.resize(n)
+		var lzs := PackedInt32Array(); lzs.resize(n)
+		for by in range(ny):
+			var t := (float(by) + 0.5) / float(ny)
+			var cbase := by * nx
+			for bx in range(nx):
+				var s := (float(bx) + 0.5) / float(nx)
+				var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+				lxs[cbase + bx] = lx
+				lzs[cbase + bx] = lz
+				packed[cbase + bx] = _pack_xz(lx, lz)
+		var res: Dictionary = _sampler.call(fid, packed)   # C++ terrain colours (fast; no trees/edits), byte-equal to color_for
+		var cols: PackedColorArray = res["colors"]
+		for by in range(ny):
+			var row_off := by * tex
+			var cbase := by * nx
+			for bx in range(nx):
+				var idx := cbase + bx
+				var fi := -1
+				if have_edits:
+					var eb := int(_edit_snap.get(Vector2i(lxs[idx], lzs[idx]), -1))
+					if eb >= 0:
+						fi = FarPalette.far_color_index_of_block(eb)
+				if fi < 0:
+					var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)   # cheap has_tree early-out
+					if deco != BlockCatalog.AIR:
+						fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))   # == top_far_index's tree branch
+				if fi < 0:
+					fi = FarPalette.far_color_index(cols[idx])
+				bytes[row_off + bx] = fi + 1
+	else:
+		for by in range(ny):
+			var t := (float(by) + 0.5) / float(ny)
+			var row_off := by * tex
+			for bx in range(nx):
+				var s := (float(bx) + 0.5) / float(nx)
+				var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+				var fi := -1
+				if have_edits:
+					var eb := int(_edit_snap.get(Vector2i(lx, lz), -1))
+					if eb >= 0:
+						fi = FarPalette.far_color_index_of_block(eb)
+				if fi < 0:
+					fi = SurfaceShot.top_far_index(lx, lz, ctx)
+				bytes[row_off + bx] = fi + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes
 	_pbm_mutex.unlock()

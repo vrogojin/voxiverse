@@ -1787,38 +1787,36 @@ func _pbm_compute(i: int) -> void:
 	# COLOUR (far_color_index). FP_CPP_FINE_BAKE gets that terrain colour from ONE batched C++ sample_columns (~10×
 	# cheaper/column — the disc fills in ~30-40 s not minutes on a low-core browser); off ⇒ the GDScript path verbatim.
 	if CubeSphere.FP_CPP_FINE_BAKE and _sampler_obj != null:
-		var n := nx * ny
-		var packed := PackedInt64Array(); packed.resize(n)
-		var lxs := PackedInt32Array(); lxs.resize(n)
-		var lzs := PackedInt32Array(); lzs.resize(n)
+		# The C++ generator serialises on a GLOBAL lock the NEAR-FIELD terrain also holds. One whole-facet batch would
+		# hold it for the entire facet and block the main thread's near gen (fps → ~1). Call sample_columns PER ROW so
+		# the lock is released between rows and the near field interleaves — the shipped slice path's discipline.
+		var rp := PackedInt64Array(); rp.resize(nx)
+		var rlx := PackedInt32Array(); rlx.resize(nx)
+		var rlz := PackedInt32Array(); rlz.resize(nx)
 		for by in range(ny):
 			var t := (float(by) + 0.5) / float(ny)
-			var cbase := by * nx
+			var row_off := by * tex
 			for bx in range(nx):
 				var s := (float(bx) + 0.5) / float(nx)
 				var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
 				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
-				lxs[cbase + bx] = lx
-				lzs[cbase + bx] = lz
-				packed[cbase + bx] = _pack_xz(lx, lz)
-		var res: Dictionary = _sampler.call(fid, packed)   # C++ terrain colours (fast; no trees/edits), byte-equal to color_for
-		var cols: PackedColorArray = res["colors"]
-		for by in range(ny):
-			var row_off := by * tex
-			var cbase := by * nx
+				rlx[bx] = lx
+				rlz[bx] = lz
+				rp[bx] = _pack_xz(lx, lz)
+			var res: Dictionary = _sampler.call(fid, rp)   # ONE ROW of C++ terrain colours (brief lock hold), byte-equal to color_for
+			var cols: PackedColorArray = res["colors"]
 			for bx in range(nx):
-				var idx := cbase + bx
 				var fi := -1
 				if have_edits:
-					var eb := int(_edit_snap.get(Vector2i(lxs[idx], lzs[idx]), -1))
+					var eb := int(_edit_snap.get(Vector2i(rlx[bx], rlz[bx]), -1))
 					if eb >= 0:
 						fi = FarPalette.far_color_index_of_block(eb)
 				if fi < 0:
-					var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)   # cheap has_tree early-out
+					var deco := TreeGen.top_decoration(rlx[bx], rlz[bx], ctx)   # cheap has_tree early-out
 					if deco != BlockCatalog.AIR:
 						fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))   # == top_far_index's tree branch
 				if fi < 0:
-					fi = FarPalette.far_color_index(cols[idx])
+					fi = FarPalette.far_color_index(cols[bx])
 				bytes[row_off + bx] = fi + 1
 	else:
 		for by in range(ny):

@@ -49,6 +49,12 @@ var _noblack_unsink_fid := -1
 # (identity − _anchor_offset) so its ABSOLUTE mesh rides the same re-anchor as PlanetRoot. ZERO with the flag off.
 var _anchor_offset: Vector3 = Vector3.ZERO
 var _mi: MeshInstance3D
+# FP_FAR_SMOOTH (Item B2): a FacetSmoothTier overlay — worker-baked curved smooth tiles for the near facet ring,
+# sharing THIS ring's shell material (so the map skin + every per-frame uniform bind apply for free) and drawn a hair
+# above the flat heightfield. Removes the piecewise-flat facet-boundary creases + rounds relief. null off (inert).
+var _smooth = null
+var _smooth_last_active := -1
+const SMOOTH_LIFT_BLOCKS := 0.5   # tiny extra radial lift so the curved smooth tile reliably occludes the inscribed heightfield
 # COSMOS PLANET-LOD-CONFIG P0 (§2.4): the last-bound §2V skin textures, cached so set_skin_active can UNBIND them at
 # orbit (freeing the base map from the sampler → the shell falls back to the plain vertex-colour FarPalette backstop:
 # tx.a≈0 ⇒ wt=0 ⇒ ALBEDO=v_col_raw·shade) and REBIND on descent. Untouched with FP_BLOCK_LOD_ORBIT off (never called).
@@ -307,6 +313,11 @@ func setup(active_fid: int) -> void:
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
 	add_child(_mi)
+	# FP_FAR_SMOOTH (B2): the smooth-tile overlay, sharing this ring's material (child of self ⇒ inherits the placement
+	# transform). Inert off (never constructed) ⇒ byte-identical.
+	if CubeSphere.FP_FAR_SMOOTH:
+		_smooth = FacetSmoothTier.new()
+		_smooth.setup_instance(self, _mi.material_override, SMOOTH_LIFT_BLOCKS)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:
@@ -396,6 +407,35 @@ func set_active(new_fid: int) -> void:
 	# surface / flag-off _shell_orbit() is false ⇒ the shipped deferred re-emit fires exactly as today (byte-identical).
 	if not _shell_orbit():
 		_pending = true
+
+## FP_FAR_SMOOTH (B2): drive the smooth-tile overlay. Re-request the near facet ring when the active facet changes,
+## then pump the worker build/commit. The overlay shares this ring's material (all binds propagate) + is a child of
+## self (inherits the placement transform), so smooth tiles stay aligned across crossings/re-anchors.
+func _smooth_drive() -> void:
+	if _active_fid != _smooth_last_active:
+		_smooth.request(_smooth_ring(_active_fid), CubeSphere.SMOOTH_S4_CELLS)
+		_smooth_last_active = _active_fid
+	_smooth.step()
+
+## The active facet + its in-face 3×3 neighbours (cross-face edges skipped for B2 increment 1 — corner facets that
+## straddle a cube edge stay heightfield; a rare thin seam, addressed with the full ring + weld in a later increment).
+func _smooth_ring(active: int) -> Array:
+	var kb := FacetAtlas.k_of(active)
+	var base := FacetAtlas.fid_base_of(active)
+	var lf := active - base
+	var face := int(lf / (kb * kb))
+	var rem := lf - face * kb * kb
+	var a := int(rem / kb)
+	var b := rem - a * kb
+	var out := []
+	for da in [-1, 0, 1]:
+		for db in [-1, 0, 1]:
+			var na: int = a + int(da)
+			var nb: int = b + int(db)
+			if na < 0 or na >= kb or nb < 0 or nb >= kb:
+				continue
+			out.append(base + face * kb * kb + na * kb + nb)
+	return out
 
 ## FP-FIXED-FRAME (docs/COSMOS-FIXED-FRAME-DESIGN.md §1.4/§2.2 step 8): the ring mesh is built in ABSOLUTE planet
 ## coords. When the fixed frame pins the scene @ the absolute frame (PlanetRoot @ identity) this node stays @
@@ -612,6 +652,8 @@ func set_pool_excluded(fids: Array) -> void:
 ## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
+	if _smooth != null:
+		_smooth_drive()   # FP_FAR_SMOOTH (B2): worker-baked smooth overlay for the near facet ring (runs every frame)
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches

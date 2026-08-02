@@ -674,6 +674,22 @@ const FP_FAR_SMOOTH := false
 ## FP_FAR_SMOOTH_OVERHANG — the edit-cluster occupancy patches (dug arches/overhangs via FarDensity.occ_at). Requires
 ## FP_FAR_SMOOTH. Item B4 — the designated cut if the night runs short. Default false.
 const FP_FAR_SMOOTH_OVERHANG := false
+## FP_SMOOTH_NORMAL_LIT — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2: relief LIGHTING for the smooth far tiles.
+## Requires FP_FAR_SMOOTH (no smooth tile exists to light otherwise). The shipped shell shades every vertex with the
+## exact planet-RADIAL normal n = normalize(wp − centre) — continuous and seam-free, but relief-BLIND (a mountain
+## flank facing away from the Sun shades identically to flat ground at the same latitude). Under this flag the
+## SMOOTH-TILE fragments shade with their OWN interpolated vertex NORMAL instead (P0's canon-welded
+## FarDensity.boundary_normal + facet_smooth_tier.gd's per-vertex relief-gradient interior stencil — already proven
+## seam-continuous across facet borders, G-FS-NRM-CONT) fed through the SAME VoxiLight.SHADE_GLSL/voxi_shade law
+## (FP_SHADE_UNIFIED) — so sunlit slopes brighten and lee slopes darken and the S-tier relief actually reads as
+## mountains from orbit. The shipped SHELL keeps the radial normal untouched: shell and smooth tiles share ONE
+## ShaderMaterial (facet_smooth_tier.gd "comes for free" reuse), so the discriminator is per-vertex, not per-material
+## — the vertex COLOR ALPHA channel (unread by every existing consumer of COLOR in this shader family — only `.rgb`
+## is ever taken): FacetSmoothTier.build_tile stamps alpha=0 on its own vertices only under this flag; the shell's
+## vertex colour (FarPalette.color_for) stays unconditionally alpha=1. Off ⇒ the marker is never stamped and the
+## shader anchor is left untouched (String.replace of the radial-normal line is a no-op splice) — byte-identical
+## (FLAT 6042/0). Gate: verify_far_smooth.gd (G-FS-LIT-*).
+const FP_SMOOTH_NORMAL_LIT := false
 ## Smooth tier ladder (§2.4): cells-per-facet-edge per tier. Facet edge ≈ 417 blocks (K=24) ⇒ ~4/8/16/32-block pitch.
 const SMOOTH_S2_CELLS := 104
 const SMOOTH_S3_CELLS := 52

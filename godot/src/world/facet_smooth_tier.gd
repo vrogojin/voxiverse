@@ -53,7 +53,11 @@ static func residency_for_tier(tier: int) -> int:
 ## Post-P0 (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2) `FarDensity.node_at`'s own `pos`/`planar` are ALREADY
 ## the canon-dir radial placement (`dir·r_datum` + relief), so both branches now agree to float-associativity
 ## rounding only — the parameter/branch stay (call-site compatibility; the B2 worker always passes `true`).
-static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false) -> Dictionary:
+## `normal_lit` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2, FP_SMOOTH_NORMAL_LIT): stamp alpha=0 on every
+## vertex colour as the "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch
+## keys off (`FacetFarRing._apply_smooth_normal_lit`). Defaults to the live flag (mirrors `_apply_shade_unified`'s
+## `unified := CubeSphere.FP_SHADE_UNIFIED` pattern) so callers/gates can force it without toggling the const.
+static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the SHARED canon corner DIRECTIONS, not the facet's own
@@ -96,7 +100,15 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 				pos[vi] = (node["pos"] as Vector3) + d * lift            # node_at's own radial pos (B1 gate parity)
 			dirs[vi] = d
 			var g := int(node["g"])
-			col[vi] = FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+			var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): stamp alpha=0 as the per-vertex
+			# "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch keys off
+			# (`FacetFarRing._apply_smooth_normal_lit`, COLOR.a is unread by every existing shader consumer of
+			# COLOR — only `.rgb` is ever taken). Off ⇒ alpha stays the FarPalette default (1.0), byte-identical
+			# to the pre-P2 tiles.
+			if normal_lit:
+				vc.a = 0.0
+			col[vi] = vc
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
 			uv2[vi] = Vector2(float(face), -1.0)
 

@@ -44,6 +44,26 @@ extends SceneTree
 ##                    residency, not a static estimate).
 ##   G-FS-OFF (P1)  — a FRESH `FacetFarRing.setup()` (the real construction site, flag untouched) never constructs a
 ##                    `FacetSmoothTier`; FLAT `verify_feature.gd` stays 6042/0 (checked separately, not in this file).
+##
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P2 (§3 P2, this stage) — `FP_SMOOTH_NORMAL_LIT`: relief lighting for the
+## smooth tiles, via `FacetFarRing._apply_smooth_normal_lit` (shell shader splice) + `FacetSmoothTier.build_tile`'s
+## `normal_lit` param (the COLOR.a=0 per-vertex discriminator the splice keys off):
+##   G-FS-LIT-OFF   — the F7 golden-string guard: with the flag off, `_apply_smooth_normal_lit` returns EVERY shell
+##                    shader source (`_SHELL_ABS_SHADER`, `_SHELL_ABS_TEX_LIGHT`, `_SHELL_ABS_TEX_CU_LIGHT`) BYTE-
+##                    IDENTICAL to the pre-P2 shipped const (identity splice) — proves the smooth-tile shader (shared
+##                    with the shell) is unchanged when off. Also: `build_tile(..., normal_lit=false)` leaves every
+##                    vertex colour alpha at the FarPalette default (1.0) — the marker is never stamped.
+##   G-FS-LIT-ON    — with the flag forced on (the gate forces the FUNCTION PARAMS, never the CubeSphere const — the
+##                    const is a compile-time literal, sed-toggled only for deploy): the spliced shader source (a)
+##                    DIFFERS from the golden off-string, (b) contains the COLOR.a branch + a NORMAL read, and (c)
+##                    still has EXACTLY ONE `shader_type` (zero new compiled programs — mirrors verify_shade_unified's
+##                    G-VL-SHADERTYPE). `build_tile(..., normal_lit=true)` stamps alpha=0 on every smooth-tile vertex
+##                    (the shell's own emit path is untouched — a separate code path entirely, never reads this flag).
+##   G-FS-LIT-NRM   — the smooth-tile mesh actually CARRIES usable per-vertex normals for the splice to read: the
+##                    built tile's `nrm` array is unit-length + outward (already proven non-degenerate by G-FS-DEGEN)
+##                    and, on a tile with real relief (not a flat facet), at least one interior vertex normal departs
+##                    measurably from the pure radial direction — i.e. there is real relief signal for the shader to
+##                    shade with, not just a relabelled radial normal.
 
 const TC := preload("res://src/world/terrain_config.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
@@ -96,6 +116,11 @@ func _initialize() -> void:
 	# --- P1 driver (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P1) ---
 	_gate_p1_off()
 	_gate_p1()
+
+	# --- P2 relief lighting (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2, FP_SMOOTH_NORMAL_LIT) ---
+	_gate_lit_off()
+	_gate_lit_on()
+	_gate_lit_nrm([fid, fid_edge, fid_int])
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -546,3 +571,101 @@ func _p1_edge_on_shell_chord(ring: FacetFarRing, cd: PackedFloat64Array, r_datum
 		if pos[vi].distance_to(chord) > eps:
 			ok = false
 	return ok
+
+# =====================================================================================================================
+# P2 relief lighting (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2, FP_SMOOTH_NORMAL_LIT) --------------------------------
+# =====================================================================================================================
+
+## G-FS-LIT-OFF — the F7 golden-string guard: with the flag off, `_apply_smooth_normal_lit` is the identity function
+## on every shell shader source that carries the "vec3 n = normalize(wp - centre);" anchor — byte-identical to the
+## pre-P2 shipped const (the "smooth-tile shader", since P1 shares the shell's material verbatim). Also covers the
+## anchor-absent case (`_SHELL_TINT_SHADER`, the legacy L3 shader with no `centre`-relative normal) staying untouched.
+func _gate_lit_off() -> void:
+	var srcs := [
+		["_SHELL_ABS_SHADER", FacetFarRing._SHELL_ABS_SHADER],
+		["_SHELL_ABS_TEX_LIGHT", FacetFarRing._SHELL_ABS_TEX_LIGHT],
+		["_SHELL_ABS_TEX_CU_LIGHT", FacetFarRing._SHELL_ABS_TEX_CU_LIGHT],
+		["_SHELL_TINT_SHADER (anchor-absent)", FacetFarRing._SHELL_TINT_SHADER],
+	]
+	for pair in srcs:
+		var out: String = FacetFarRing._apply_smooth_normal_lit(pair[1], false)
+		_ok(out == pair[1],
+			"G-FS-LIT-OFF: _apply_smooth_normal_lit(%s, false) is byte-identical to the shipped const (golden pin)" % pair[0])
+	_ok(not CubeSphere.FP_SMOOTH_NORMAL_LIT, "G-FS-LIT-OFF: FP_SMOOTH_NORMAL_LIT defaults false (byte-off)")
+
+	# build_tile's marker: off ⇒ every vertex colour keeps the FarPalette default alpha (1.0), byte-identical tiles.
+	var cells := FST.cells_for_tier(FST.S4)
+	var fid := FA.spawn_facet()
+	var tile_off := FST.build_tile(fid, cells, 0.0, true, false)
+	var col_off: PackedColorArray = tile_off["col"]
+	var alpha_untouched := true
+	for c in col_off:
+		if absf((c as Color).a - 1.0) > 1e-6:
+			alpha_untouched = false
+	_ok(alpha_untouched, "G-FS-LIT-OFF: build_tile(normal_lit=false) leaves every vertex colour alpha at the FarPalette default (1.0) — marker never stamped")
+
+## G-FS-LIT-ON — force the FUNCTION PARAM on (never the CubeSphere const — that is a compile-time literal, sed-toggled
+## only at deploy) and assert the splice actually fires: the spliced source differs from the golden off-string,
+## contains the COLOR.a discriminator branch + a NORMAL read, and still compiles to exactly ONE shader_type (zero new
+## programs, mirrors verify_shade_unified's G-VL-SHADERTYPE). Also: build_tile's marker DOES stamp alpha=0 when on.
+func _gate_lit_on() -> void:
+	var srcs := [
+		["_SHELL_ABS_SHADER", FacetFarRing._SHELL_ABS_SHADER],
+		["_SHELL_ABS_TEX_LIGHT", FacetFarRing._SHELL_ABS_TEX_LIGHT],
+		["_SHELL_ABS_TEX_CU_LIGHT", FacetFarRing._SHELL_ABS_TEX_CU_LIGHT],
+	]
+	for pair in srcs:
+		var name: String = pair[0]
+		var off_code: String = pair[1]
+		var on_code: String = FacetFarRing._apply_smooth_normal_lit(off_code, true)
+		_ok(on_code != off_code, "G-FS-LIT-ON: %s spliced source DIFFERS from the golden off-string (the branch actually fires)" % name)
+		_ok(on_code.contains("COLOR.a < 0.5") and on_code.contains("NORMAL"),
+			"G-FS-LIT-ON: %s spliced source contains the COLOR.a discriminator + a NORMAL read" % name)
+		_ok(on_code.count("shader_type") == off_code.count("shader_type"),
+			"G-FS-LIT-ON: %s spliced source has the SAME shader_type count as off (zero new compiled programs)" % name)
+		# The radial fallback branch (COLOR.a >= 0.5, the shell's own vertices) is PRESERVED verbatim in the splice —
+		# the shell keeps shading exactly as shipped.
+		_ok(on_code.contains("normalize(wp - centre)"),
+			"G-FS-LIT-ON: %s spliced source still contains the shell's own radial-normal fallback (shell untouched)" % name)
+
+	# The anchor-absent legacy shader is untouched even with the param forced on (no anchor to splice).
+	var tint_on: String = FacetFarRing._apply_smooth_normal_lit(FacetFarRing._SHELL_TINT_SHADER, true)
+	_ok(tint_on == FacetFarRing._SHELL_TINT_SHADER,
+		"G-FS-LIT-ON: _SHELL_TINT_SHADER (no centre-relative normal) is untouched even with the splice forced on")
+
+	# build_tile's marker: on ⇒ every vertex colour is stamped alpha=0 (the smooth-tile discriminator).
+	var cells := FST.cells_for_tier(FST.S4)
+	var fid := FA.spawn_facet()
+	var tile_on := FST.build_tile(fid, cells, 0.0, true, true)
+	var col_on: PackedColorArray = tile_on["col"]
+	var alpha_marked := true
+	for c in col_on:
+		if absf((c as Color).a - 0.0) > 1e-6:
+			alpha_marked = false
+	_ok(alpha_marked, "G-FS-LIT-ON: build_tile(normal_lit=true) stamps alpha=0 on every smooth-tile vertex")
+
+## G-FS-LIT-NRM — the smooth-tile mesh actually CARRIES usable per-vertex normals for the splice to read: unit +
+## outward (already proven non-degenerate by G-FS-DEGEN) on EVERY candidate facet, and — scanning several facets
+## (real terrain varies; a single facet could land on dead-flat ground) — at least one INTERIOR vertex normal
+## measurably departs from the pure radial direction on at least one of them: real relief signal, not a relabelled
+## radial (the case G-FS-DEGEN's flat-facet check already covers).
+func _gate_lit_nrm(fids: Array) -> void:
+	var cells := FST.cells_for_tier(FST.S4)
+	var stride := cells + 1
+	var unit_outward := true
+	var max_departure := 0.0
+	for fid in fids:
+		var tile := FST.build_tile(int(fid), cells, 0.0, true)
+		var nrm: PackedVector3Array = tile["nrm"]
+		var pos: PackedVector3Array = tile["pos"]
+		for gj in range(stride):
+			for gi in range(stride):
+				var vi := gj * stride + gi
+				var nv: Vector3 = nrm[vi]
+				if absf(nv.length() - 1.0) > 1e-3:
+					unit_outward = false
+				if gi > 0 and gi < cells and gj > 0 and gj < cells:   # interior only (boundary uses the canon boundary_normal law)
+					var radial := pos[vi].normalized()
+					max_departure = maxf(max_departure, nv.angle_to(radial))
+	_ok(unit_outward, "G-FS-LIT-NRM: every smooth-tile normal (across %d candidate facets) is unit-length (usable for lighting)" % fids.size())
+	_ok(max_departure > 1.0e-4, "G-FS-LIT-NRM: at least one interior normal measurably departs (%.6f rad) from the pure radial direction — real relief signal for the P2 splice to shade with" % max_departure)

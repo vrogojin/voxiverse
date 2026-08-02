@@ -3451,6 +3451,30 @@ static func _apply_shade_unified(code: String, unified := CubeSphere.FP_SHADE_UN
 	code = code.replace("	v_col = COLOR.rgb * shade * tint;\n", "	v_col = COLOR.rgb * voxi_shade(n, sun_dir);\n")
 	return code
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): relief LIGHTING for the smooth far tiles. The
+# shell (and the biased-tier TierPlace fallback) shade every vertex with the exact planet-RADIAL normal
+# n = normalize(wp - centre) — continuous and seam-free, but relief-BLIND (a mountain flank facing away from the Sun
+# shades identically to flat ground at the same latitude). The smooth tiles now carry a REAL per-vertex relief normal
+# (P0's canon-welded FarDensity.boundary_normal + facet_smooth_tier.gd's interior gradient stencil, already proven
+# seam-continuous across facet borders — G-FS-NRM-CONT) — this splice reads THAT normal instead, for smooth-tile
+# fragments only, so sunlit slopes brighten and lee slopes darken and the S-tier relief actually reads as mountains.
+# DISCRIMINATOR: the shell and the smooth tiles share ONE ShaderMaterial (setup_instance passes the ring's own
+# material_override straight through — facet_smooth_tier.gd:302-303 "comes for free"), so there is no per-draw-call
+# uniform to branch on; instead FacetSmoothTier.build_tile stamps COLOR.a = 0 on its OWN vertices only under this
+# flag (the shell's vertex colour, FarPalette.color_for, is unconditionally alpha=1 — COLOR.a is read NOWHERE else
+# in this shader family: every existing reader takes only `.rgb`). ONE string replacement of the shared
+# "vec3 n = normalize(wp - centre);" anchor — present, byte-identical, in every FP_SHELL_ABSOLUTE shell variant; no
+# new shader_type/compiled program, no new uniform. `on` is a param (defaults to the flag) so the gate builds both
+# without toggling CubeSphere. Off, or the anchor absent (SHELL_TERMINATOR_TINT's older `_SHELL_TINT_SHADER`, which
+# has no `centre`-relative normal to swap), ⇒ code returned VERBATIM — String.replace of an absent/off anchor is a
+# no-op (the F7 golden-string discipline).
+static func _apply_smooth_normal_lit(code: String, on := CubeSphere.FP_SMOOTH_NORMAL_LIT) -> String:
+	if not on:
+		return code
+	return code.replace(
+		"	vec3 n = normalize(wp - centre);\n",
+		"	vec3 n = (COLOR.a < 0.5) ? normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz) : normalize(wp - centre);\n")
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -3473,6 +3497,9 @@ func _make_material() -> Material:
 		# (adds the moonshine floor + one uniform set), so the far skin shades IDENTICALLY to the near blocks. Off ⇒ the
 		# shell code is returned verbatim (byte-identical). Applied outside _apply_block_detail — different string regions.
 		sh2.code = _apply_shade_unified(sh2.code)
+		# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): splice in the smooth-tile vertex-normal
+		# lighting branch (the COLOR.a<0.5 discriminator — see cube_sphere.gd). Off ⇒ code returned verbatim.
+		sh2.code = _apply_smooth_normal_lit(sh2.code)
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))

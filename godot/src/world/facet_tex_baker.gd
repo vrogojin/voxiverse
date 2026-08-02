@@ -184,6 +184,17 @@ var _main_bake_us := 0              # the bake work paid ON MAIN in the last upd
 
 # --- lifecycle -----------------------------------------------------------------------------------
 
+## The host's TRUE logical-core count. Godot's web OS.get_processor_count() under-reports (returned 2 on an 8-core
+## host), so on web read navigator.hardwareConcurrency directly via JavaScriptBridge; elsewhere OS.get_processor_count().
+static func _detect_cores() -> int:
+	var n := OS.get_processor_count()
+	if OS.has_feature("web"):
+		var hc = JavaScriptBridge.eval("navigator.hardwareConcurrency || 0", true)
+		var hn := int(hc) if (typeof(hc) == TYPE_FLOAT or typeof(hc) == TYPE_INT) else 0
+		if hn > 0:
+			n = hn
+	return n
+
 ## Build this epoch's sampler (compiled VoxelGeneratorCosmos frozen for `active_fid`, else the GDScript oracle
 ## — byte-equal by G-CG-COLUMNS) and allocate the 6 empty face pages. Mirrors FacetSkinTier.setup.
 func setup(active_fid: int) -> void:
@@ -1590,14 +1601,10 @@ func _setup_parallel_band() -> void:
 	if not _pbm_on:
 		return
 	# Reserve one core for the main/render thread: on a 2-core browser, running 2 bake workers alongside main
-	# THRASHED (each fine facet took ~2.5s of contended CPU ⇒ throughput FELL to 0.8 facet/s vs ~5 with 1 clean
-	# worker). The real speedups are the shade-skip (top_block_id) + the smaller fine texel + fine-priority, not more
-	# workers. Scales up automatically when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE and
-	# the browser reports more logical cores.
-	# Worker count = the browser-exposed logical cores − 1 (leave one for main). The 16-thread pool can host more, but
-	# on this browser navigator.hardwareConcurrency = 2, and forcing extra workers only oversubscribes 2 real cores and
-	# thrashes (measured: 2 workers = 0.8 facet/s < 1 clean). If a host genuinely exposes more cores this scales up here.
-	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)
+	# Worker count = (logical cores − 1), leave one for main. CRITICAL: on the web build Godot's OS.get_processor_count()
+	# under-reports (measured 2 on an 8-core host where navigator.hardwareConcurrency = 8) — so read hardwareConcurrency
+	# DIRECTLY via JavaScriptBridge. The 16-thread pool then hosts real parallel workers on the true cores. Capped at 8.
+	_pbm_n = clampi(_detect_cores() - 1, 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)
@@ -1917,7 +1924,8 @@ func tex_telemetry() -> Dictionary:
 		"pbm_busy": _pbm_busy_count(),
 		"offsurf": _offsurface,   # FP_CPP_FINE_BAKE diagnostic: C++ terrain path engages only when this is true
 		"cpp_on": (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null),
-		"cores": OS.get_processor_count(),   # web ⇒ navigator.hardwareConcurrency (the host logical cores the browser exposes)
+		"cores": _detect_cores(),   # TRUE cores (web: navigator.hardwareConcurrency via JS)
+		"os_cores": OS.get_processor_count(),      # what Godot's web build reports (under-reports — compare)
 
 		"bm_facsz": band_facet_map().size(),
 		"cu_on": _cu_on,

@@ -1579,7 +1579,7 @@ func set_job_lane(lane: JobLane) -> void:
 	_worker_on = CubeSphere.FP_TEX_BAKE_WORKER and lane != null
 	_setup_parallel_band()
 
-## FP_SKIN_FLATCOLOR: arm the multi-core band bake (needs the worker + SSE residency). Slot count = cores − 2 (leave
+## FP_SKIN_FLATCOLOR: arm the multi-core band bake (needs the worker + SSE residency). Slot count = cores − 1 (leave
 ## the main + render/gen threads headroom), capped at 8. Off ⇒ the shipped single-in-flight band path is used.
 func _setup_parallel_band() -> void:
 	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE

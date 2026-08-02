@@ -33,6 +33,7 @@ extends RefCounted
 const BASE_TEXELS := 16              # stored texels per facet edge → ground pitch ≈ 26 blocks (§1.2)
 const BAKE_SRC := 32                 # fine sample columns per facet edge (2× BASE_TEXELS → exact 2×2 box average)
 const DOWNS := BAKE_SRC / BASE_TEXELS # box-average factor (2)
+const CPP_CHUNK_ROWS := 8            # FP_CPP_FINE_BAKE: sample_columns row-block per C++ call — balances lock-hold (fps) vs marshalling (rate)
 
 var _k := 0                          # FacetAtlas.K (24) — page = _k·BASE_TEXELS
 var _page := 0                       # per-face page edge in texels (384)
@@ -1794,41 +1795,49 @@ func _pbm_compute(i: int) -> void:
 	# cheaper/column — the disc fills in ~30-40 s not minutes on a low-core browser); off ⇒ the GDScript path verbatim.
 	if int(_pbm_cpp[i]) == 1:
 		# C++ terrain sample — used ONLY off-surface (decided on main at dispatch), where the near-field gen (which shares
-		# the C++ generator's global lock) is FROZEN, so the lock is uncontended and ONE whole-facet batch is safe + fastest
-		# (per-row chunking here just paid 64 GDScript↔C++ marshalling round-trips/facet and erased the speedup).
-		var n := nx * ny
-		var packed := PackedInt64Array(); packed.resize(n)
-		var lxs := PackedInt32Array(); lxs.resize(n)
-		var lzs := PackedInt32Array(); lzs.resize(n)
-		for by in range(ny):
-			var t := (float(by) + 0.5) / float(ny)
-			var cbase := by * nx
-			for bx in range(nx):
-				var s := (float(bx) + 0.5) / float(nx)
-				var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
-				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
-				lxs[cbase + bx] = lx
-				lzs[cbase + bx] = lz
-				packed[cbase + bx] = _pack_xz(lx, lz)
-		var res: Dictionary = _sampler.call(fid, packed)   # ONE C++ call for the whole facet (byte-equal to color_for)
-		var cols: PackedColorArray = res["colors"]
-		for by in range(ny):
-			var row_off := by * tex
-			var cbase := by * nx
-			for bx in range(nx):
-				var idx := cbase + bx
-				var fi := -1
-				if have_edits:
-					var eb := int(_edit_snap.get(Vector2i(lxs[idx], lzs[idx]), -1))
-					if eb >= 0:
-						fi = FarPalette.far_color_index_of_block(eb)
-				if fi < 0:
-					var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)   # cheap has_tree early-out
-					if deco != BlockCatalog.AIR:
-						fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))   # == top_far_index's tree branch
-				if fi < 0:
-					fi = FarPalette.far_color_index(cols[idx])
-				bytes[row_off + bx] = fi + 1
+		# the C++ generator's GLOBAL lock) is FROZEN. Sampled in ROW-BLOCKS: a whole-facet batch holds the lock long enough
+		# to still hitch the main thread (~fps 15), while per-row pays 64 marshalling round-trips (rate → 1/s). A block of
+		# CPP_CHUNK_ROWS balances — few calls (rate kept) + short holds (fps kept). Byte-equal to color_for.
+		var chunk := CPP_CHUNK_ROWS
+		var cn := nx * chunk
+		var packed := PackedInt64Array(); packed.resize(cn)
+		var lxs := PackedInt32Array(); lxs.resize(cn)
+		var lzs := PackedInt32Array(); lzs.resize(cn)
+		var by0 := 0
+		while by0 < ny:
+			var rows := mini(chunk, ny - by0)
+			var m := nx * rows
+			for rj in range(rows):
+				var t := (float(by0 + rj) + 0.5) / float(ny)
+				var cbase := rj * nx
+				for bx in range(nx):
+					var s := (float(bx) + 0.5) / float(nx)
+					var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
+					var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
+					lxs[cbase + bx] = lx
+					lzs[cbase + bx] = lz
+					packed[cbase + bx] = _pack_xz(lx, lz)
+			var pslice: PackedInt64Array = packed if rows == chunk else packed.slice(0, m)
+			var res: Dictionary = _sampler.call(fid, pslice)
+			var cols: PackedColorArray = res["colors"]
+			for rj in range(rows):
+				var row_off := (by0 + rj) * tex
+				var cbase := rj * nx
+				for bx in range(nx):
+					var idx := cbase + bx
+					var fi := -1
+					if have_edits:
+						var eb := int(_edit_snap.get(Vector2i(lxs[idx], lzs[idx]), -1))
+						if eb >= 0:
+							fi = FarPalette.far_color_index_of_block(eb)
+					if fi < 0:
+						var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)
+						if deco != BlockCatalog.AIR:
+							fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))
+					if fi < 0:
+						fi = FarPalette.far_color_index(cols[idx])
+					bytes[row_off + bx] = fi + 1
+			by0 += rows
 	else:
 		for by in range(ny):
 			var t := (float(by) + 0.5) / float(ny)

@@ -1991,6 +1991,7 @@ func shell_telemetry() -> Dictionary:
 	var axdot: float = _emit_axis[0] * _dbg_true_dir[0] + _emit_axis[1] * _dbg_true_dir[1] + _emit_axis[2] * _dbg_true_dir[2]
 	return {
 		"sh_cam": _cam_set,
+		"smooth_res": (_smooth.resident_count() if _smooth != null else 0),   # FP_FAR_SMOOTH: committed smooth tiles
 		"sh_emit": _emitted.size(),
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,

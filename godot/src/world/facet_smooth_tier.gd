@@ -240,7 +240,9 @@ func step() -> void:
 			break
 		_s_fid[i] = fid
 		_s_cells[i] = int(_want[fid])
-		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), false, "smoothtile")
+		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
+		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
+		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
 	if _dirty:
 		_rebuild_mesh()
 		_dirty = false

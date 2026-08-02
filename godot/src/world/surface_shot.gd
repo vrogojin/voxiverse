@@ -36,21 +36,22 @@ const WATER_DEPTH_MAX := 0.55
 const CANOPY_SHADOW := 0.07        # ground-shadow darkening per cardinal neighbour that is a tree canopy / trunk
 const CANOPY_SHADOW_MAX := 0.28
 
-## The exposed top-block PATTERN id ONLY (no shade, no tint) for lattice column (x, z) — the SAME `block_id`
-## surface_shot returns, computed WITHOUT the sun-independent AO shade (which the L8 flat-colour band + fine
-## tiers discard anyway; they store only far_color_index_of_block(id)). Shade costs ~5 extra column_profile +
-## 4 TreeGen neighbour queries per column, so skipping it makes the whole-planet fine/band bake ~5-6× cheaper —
-## the decisive speedup on a low-core web browser (OS.get_processor_count() small ⇒ few bake workers). Byte-
-## identical id to surface_shot()["block_id"] by construction. Use for any tier that stores palette-index only.
-static func top_block_id(x: int, z: int, pcache = null) -> int:
-	FarPalette.ensure_detail_ready()
+## The exposed top column's FLAT-COLOUR palette index (into FarPalette.frozen_colors, 0..13) for lattice column
+## (x, z) — what the FP_SKIN_FLATCOLOR band + whole-planet fine tiers store. Classifies the top COLOUR directly
+## via far_color_index (the same nearest-palette rule the base/skin path at facet_tex_baker:1315 uses), NOT the
+## broken `far_color_index_of_block(detail_pattern(col)+1)` chain the fine bake used before — that fed a detail-
+## PATTERN id into a block-ID LUT, so open water classified to MUD, sand to STONE, etc. (grass matched only by
+## coincidence). Computed WITHOUT the sun-independent AO shade (the L8 tiers discard it), so ~5-6× cheaper than
+## surface_shot — the decisive speedup on a low-core browser. far_color_index must be prewarmed on main (the
+## baker does, ensure_far_index_ready) so this stays worker-safe (pure _fc_rgb read).
+static func top_far_index(x: int, z: int, pcache = null) -> int:
 	var prof := TerrainConfig.column_profile(x, z, pcache)   # Vector4(g, biome, continent, temperature)
 	var g := int(prof.x)
 	var clamped_sea := g < TerrainConfig.SEA_LEVEL
 	var terr_col := FarPalette.color_for(g, int(prof.y), prof.w, clamped_sea)
 	var tree_id := TreeGen.top_decoration(x, z, pcache)
 	var top_col: Color = BlockCatalog.color_of(tree_id) if tree_id != BlockCatalog.AIR else terr_col
-	return FarPalette.detail_pattern(top_col) + 1
+	return FarPalette.far_color_index(top_col)
 
 ## THE source record for lattice column (x, z) on facet `fid`. See the file header for the field contract.
 static func surface_shot(fid: int, x: int, z: int, pcache = null) -> Dictionary:

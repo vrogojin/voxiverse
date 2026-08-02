@@ -1789,16 +1789,18 @@ func _pbm_compute(i: int) -> void:
 			var s := (float(bx) + 0.5) / float(nx)
 			var lx := int(round(_bilerp(lc[0].x, lc[1].x, lc[2].x, lc[3].x, s, t)))
 			var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
-			var bid := -1
+			# The flat band + whole-planet fine tiers store a frozen-palette index (0..13; +1, 0 = un-baked). An EDIT
+			# overlay cell is a real BLOCK id → its palette index via _block_idx; bare TERRAIN classifies its top
+			# COLOUR directly (top_far_index). This split fixes the colour bug where the terrain path fed a detail-
+			# PATTERN id into the block-id LUT (open water→mud, sand→stone). Shade-skipped ⇒ ~5-6× cheaper per column.
+			var fi := -1
 			if have_edits:
-				bid = int(_edit_snap.get(Vector2i(lx, lz), -1))
-			if bid < 0:
-				# The flat-colour band + whole-planet fine tiers store ONLY far_color_index (L8 palette id) — the
-				# shade byte surface_shot also computes is discarded here. top_block_id yields the SAME block_id
-				# without the ~5-neighbour AO shade compute ⇒ ~5-6× fewer column_profile calls (the decisive bake
-				# speedup on a low-core browser). Byte-identical output to surface_shot()["block_id"].
-				bid = SurfaceShot.top_block_id(lx, lz, ctx)
-			bytes[row_off + bx] = FarPalette.far_color_index_of_block(bid) + 1
+				var eb := int(_edit_snap.get(Vector2i(lx, lz), -1))
+				if eb >= 0:
+					fi = FarPalette.far_color_index_of_block(eb)
+			if fi < 0:
+				fi = SurfaceShot.top_far_index(lx, lz, ctx)
+			bytes[row_off + bx] = fi + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes
 	_pbm_mutex.unlock()

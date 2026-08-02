@@ -33,7 +33,7 @@ extends RefCounted
 const BASE_TEXELS := 16              # stored texels per facet edge → ground pitch ≈ 26 blocks (§1.2)
 const BAKE_SRC := 32                 # fine sample columns per facet edge (2× BASE_TEXELS → exact 2×2 box average)
 const DOWNS := BAKE_SRC / BASE_TEXELS # box-average factor (2)
-const CPP_CHUNK_ROWS := 2            # FP_CPP_FINE_BAKE: sample_columns row-block per C++ call — balances lock-hold (fps) vs marshalling (rate)
+const CPP_CHUNK_ROWS := 8            # FP_CPP_FINE_BAKE: sample_columns row-block per C++ call — balances lock-hold (fps) vs marshalling (rate)
 
 var _k := 0                          # FacetAtlas.K (24) — page = _k·BASE_TEXELS
 var _page := 0                       # per-face page edge in texels (384)

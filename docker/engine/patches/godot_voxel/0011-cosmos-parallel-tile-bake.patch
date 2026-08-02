@@ -1,5 +1,109 @@
+diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
+index 45393ff..35e125a 100644
+--- a/generators/cosmos/cosmos_terrain.h
++++ b/generators/cosmos/cosmos_terrain.h
+@@ -88,6 +88,10 @@ constexpr int B_FOREST = 7;
+ constexpr int B_PLAINS = 8;
+ constexpr int B_MOUNTAINS = 9;
+ constexpr int B_PILLAR = 10;
++// COSMOS CLIMATE-BIOMES B1 (terrain_config.gd:276-277) -- Whittaker-only biomes, gated on
++// Parameters::climate_biomes. Never returned unless the flag is set (see whittaker_biome/biome_of below).
++constexpr int B_SAVANNA = 11;
++constexpr int B_JUNGLE = 12;
+ 
+ constexpr double LAT_GAIN = 0.80;
+ constexpr double LAT_NOISE_GAIN = 0.30;
+@@ -105,6 +109,26 @@ constexpr int SP_NONE = 0;
+ constexpr int SP_OAK = 1;
+ constexpr int SP_BIRCH = 2;
+ constexpr int SP_SPRUCE = 3;
++// COSMOS CLIMATE-BIOMES B1 species (tree_gen.gd:35-43) -- only ever selected under
++// Parameters::climate_biomes (tree_gen.gd:117-125).
++constexpr int SP_ACACIA = 4;
++constexpr int SP_JUNGLE = 5;
++constexpr int SP_CACTUS = 6;
++
++// B1 climate-biome tree trunk-height ranges (tree_gen.gd:46-49).
++constexpr int JUNGLE_TRUNK_MIN = 8;
++constexpr int JUNGLE_TRUNK_MAX = 11;
++constexpr int ACACIA_TRUNK_MIN = 4;
++constexpr int ACACIA_TRUNK_MAX = 6;
++// Fraction of eligible savanna cells that host an acacia (tree_gen.gd:52); the hash salt (124) lives at
++// the call site, matching how the existing oak/spruce salts (55/66/88) are inline literals, not consts.
++constexpr double ACACIA_DENSITY = 0.5;
++
++// Cactus (desert, tree_gen.gd:50-53): a 1x1 column, height CACTUS_MIN..CACTUS_MAX (salt 123), placed on
++// only CACTUS_DENSITY of eligible desert cells (salt 125) -- the sparsest of the B1 species.
++constexpr int CACTUS_MIN = 1;
++constexpr int CACTUS_MAX = 3;
++constexpr double CACTUS_DENSITY = 0.3;
+ 
+ constexpr int WORLD_BOTTOM_Y_C = WORLD_BOTTOM_Y;
+ 
+@@ -285,8 +309,50 @@ inline double continent_offset(double c) {
+ 	return 11.0;
+ }
+ 
++// COSMOS CLIMATE-BIOMES B1 (design §6.1) -- verbatim port of TerrainConfig._whittaker_biome
++// (terrain_config.gd:688-709). `t` is the latitude-anchored annual-mean temperature, `h` is the static
++// humidity noise. Pure/deterministic; the ocean/beach/mountain guards are applied by the caller
++// (biome_of), never here -- same division of labour as the GDScript twin.
++inline int whittaker_biome(double t, double h) {
++	if (t > 0.45) { // hot (equatorial / low latitude)
++		if (h < -0.45) {
++			return B_BADLANDS;
++		}
++		if (h < 0.0) {
++			return B_DESERT;
++		}
++		if (h < 0.4) {
++			return B_SAVANNA;
++		}
++		return B_JUNGLE;
++	}
++	if (t > 0.15) { // warm (subtropical)
++		if (h < -0.45) {
++			return B_DESERT;
++		}
++		if (h < 0.0) {
++			return B_SAVANNA;
++		}
++		if (h <= 0.5) {
++			return B_FOREST;
++		}
++		return B_SWAMP;
++	}
++	if (t > -0.15) { // temperate (mid-latitude)
++		return h >= 0.0 ? B_FOREST : B_PLAINS;
++	}
++	if (t > -0.55) { // cold (subpolar)
++		return B_TAIGA;
++	}
++	return B_SNOWY; // frozen (polar) -- always snowy regardless of moisture
++}
++
+ // `h` is HUMIDITY despite the name -- kept as-is to match the GDScript signature it ports.
+-inline int biome_of(double c, double t, double h, int g, double mountain) {
++// `climate_biomes` mirrors CubeSphere.FP_CLIMATE_BIOMES (terrain_config.gd:662-679): when false the
++// legacy first-match chain runs verbatim (byte-identical to pre-B1 shipped); when true the Whittaker
++// classifier (above) runs AFTER the ocean/beach/mountain guards, exactly where the GDScript `_biome`
++// inserts it. Defaulted to false so any caller that has not been updated to pass it stays byte-identical.
++inline int biome_of(double c, double t, double h, int g, double mountain, bool climate_biomes = false) {
+ 	if (c < -0.32) {
+ 		return B_OCEAN;
+ 	}
+@@ -296,6 +362,9 @@ inline int biome_of(double c, double t, double h, int g, double mountain) {
+ 	if (mountain > MOUNTAIN_BIOME_T) {
+ 		return B_MOUNTAINS;
+ 	}
++	if (climate_biomes) {
++		return whittaker_biome(t, h);
++	}
+ 	if (t > 0.45 && h < -0.45) {
+ 		return B_BADLANDS;
+ 	}
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
-index aff1f00..093280a 100644
+index aff1f00..f60107c 100644
 --- a/generators/cosmos/voxel_generator_cosmos.cpp
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
 @@ -5,6 +5,7 @@
@@ -53,7 +157,7 @@ index aff1f00..093280a 100644
  } // namespace
  
  VoxelGeneratorCosmos::VoxelGeneratorCosmos() {}
-@@ -88,6 +125,29 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+@@ -88,9 +125,38 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
  	// leaves sample_columns' colours black; the S3/skin gates supply it. NOT validated as required.
  	p.far_colors = PackedColorArray(config.get("far_colors", PackedColorArray()));
  
@@ -83,7 +187,179 @@ index aff1f00..093280a 100644
  	p.faceted = bool(config.get("faceted", false));
  	p.m5c_corner = bool(config.get("m5c_corner", false));
  
-@@ -493,6 +553,43 @@ int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int
++	// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md P1 §5): mirror CubeSphere.
++	// FP_CLIMATE_BIOMES / FP_SKIN_BLOCK_EXACT. Both default false -- an old config that never supplies
++	// them reproduces today's shipped biome_of/tree_species_for/far_color/far_index branches byte-for-byte.
++	p.climate_biomes = bool(config.get("climate_biomes", false));
++	p.skin_block_exact = bool(config.get("skin_block_exact", false));
++
+ 	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
+ 	p.facet_off = get_i32_param(config, "facet_off");
+ 	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
+@@ -103,6 +169,12 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 	p.id_spruce_leaf = int(config.get("id_spruce_leaf", 0));
+ 	p.id_birch_log = int(config.get("id_birch_log", 0));
+ 	p.id_birch_leaf = int(config.get("id_birch_leaf", 0));
++	// COSMOS CLIMATE-BIOMES B1 species ids -- -1 (not 0 = AIR) when absent, matching Parameters' sentinel.
++	p.id_acacia_log = int(config.get("id_acacia_log", -1));
++	p.id_acacia_leaf = int(config.get("id_acacia_leaf", -1));
++	p.id_jungle_log = int(config.get("id_jungle_log", -1));
++	p.id_jungle_leaf = int(config.get("id_jungle_leaf", -1));
++	p.id_cactus = int(config.get("id_cactus", -1));
+ 
+ 	p.id_bedrock = int(config.get("id_bedrock", 0));
+ 	p.id_deepslate = int(config.get("id_deepslate", 0));
+@@ -344,7 +416,7 @@ Vector4 VoxelGeneratorCosmos::profile_at_dir(
+ 	const double hh = double(p.humidity->get_noise_3d(px, py, pz));
+ 	const double mtn = mountain_factor3(p, c, px, py, pz);
+ 	const int g = height_c3(p, c, px, py, pz, mtn);
+-	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn)), float(c), float(t));
++	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn, p.climate_biomes)), float(c), float(t));
+ }
+ 
+ // THE column profile. Ports TerrainConfig.column_profile's worker-path branches:
+@@ -372,7 +444,7 @@ Vector4 VoxelGeneratorCosmos::column_profile_core(const Parameters &p, int fid,
+ 	const double hh = double(p.humidity->get_noise_2d(fx, fz));
+ 	const int g = height_c(p, c, fx, fz);
+ 	const double mtn = mountain_factor(p, c, fx, fz);
+-	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn)), float(c), float(t));
++	return Vector4(float(g), float(cosmos::biome_of(c, t, hh, g, mtn, p.climate_biomes)), float(c), float(t));
+ }
+ 
+ // TerrainConfig._col_h on the worker path (pcache non-null) == int(column_profile(...).x).
+@@ -389,7 +461,7 @@ void VoxelGeneratorCosmos::tree_base_pos(int gx, int gz, int &out_bx, int &out_b
+ 	out_bz = gz * cosmos::TREE_G + 2 + int(cosmos::tree_hash01(gx, gz, 44) * double(cosmos::TREE_G - 4));
+ }
+ 
+-int VoxelGeneratorCosmos::tree_species_for(int biome, int gx, int gz) {
++int VoxelGeneratorCosmos::tree_species_for(const Parameters &p, int biome, int gx, int gz) {
+ 	switch (biome) {
+ 		case cosmos::B_FOREST:
+ 			return cosmos::tree_hash01(gx, gz, 88) < 0.70 ? cosmos::SP_OAK : cosmos::SP_BIRCH;
+@@ -400,8 +472,27 @@ int VoxelGeneratorCosmos::tree_species_for(int biome, int gx, int gz) {
+ 		case cosmos::B_PLAINS:
+ 			return cosmos::SP_OAK;
+ 		default:
+-			return cosmos::SP_NONE;
++			break;
++	}
++	// COSMOS CLIMATE-BIOMES B1 (tree_gen.gd:113-125): the new species are FLAG-GATED, mirroring the
++	// GDScript `if CubeSphere.FP_CLIMATE_BIOMES:` guard placed AFTER the legacy match (B_DESERT already
++	// exists pre-flag and must stay tree-free when it is off; jungle/savanna/desert-cactus only exist
++	// under the flag at all).
++	if (p.climate_biomes) {
++		if (biome == cosmos::B_JUNGLE) {
++			return cosmos::SP_JUNGLE;
++		}
++		if (biome == cosmos::B_SAVANNA) {
++			// Salt 124, exactly TreeGen.ACACIA_DENSITY's hash (tree_gen.gd:122) -- thins savanna acacias
++			// so the biome reads sparse/open rather than forested.
++			return cosmos::tree_hash01(gx, gz, 124) < cosmos::ACACIA_DENSITY ? cosmos::SP_ACACIA : cosmos::SP_NONE;
++		}
++		if (biome == cosmos::B_DESERT) {
++			// Salt 125, exactly TreeGen.CACTUS_DENSITY's hash (tree_gen.gd:124) -- very sparse placement.
++			return cosmos::tree_hash01(gx, gz, 125) < cosmos::CACTUS_DENSITY ? cosmos::SP_CACTUS : cosmos::SP_NONE;
++		}
+ 	}
++	return cosmos::SP_NONE;
+ }
+ 
+ bool VoxelGeneratorCosmos::tree_has_tree(const Parameters &p, int fid, int gx, int gz) {
+@@ -418,7 +509,7 @@ bool VoxelGeneratorCosmos::tree_has_tree(const Parameters &p, int fid, int gx, i
+ 	int bx, bz;
+ 	tree_base_pos(gx, gz, bx, bz);
+ 	const int biome = int(column_profile_core(p, fid, bx, bz).y);
+-	return tree_species_for(biome, gx, gz) != cosmos::SP_NONE;
++	return tree_species_for(p, biome, gx, gz) != cosmos::SP_NONE;
+ }
+ 
+ int VoxelGeneratorCosmos::tree_oak_block(
+@@ -466,6 +557,64 @@ int VoxelGeneratorCosmos::tree_spruce_block(const Parameters &p, int gx, int gz,
+ 	return cosmos::ID_AIR;
+ }
+ 
++// COSMOS CLIMATE-BIOMES B1: verbatim port of TreeGen._jungle_block (tree_gen.gd:289-307). A tall
++// (8-11, salt 121) jungle_log trunk under a dense two-tier canopy -- a wide radius-2 (5x5) square on the
++// top two trunk layers, narrowing to a radius-1 plus cap.
++int VoxelGeneratorCosmos::tree_jungle_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy) {
++	const int t = cosmos::JUNGLE_TRUNK_MIN +
++			int(cosmos::tree_hash01(gx, gz, 121) * double(cosmos::JUNGLE_TRUNK_MAX - cosmos::JUNGLE_TRUNK_MIN + 1));
++	const int top = gy + t;
++	if (dx == 0 && dz == 0 && y >= gy + 1 && y <= top) {
++		return p.id_jungle_log;
++	}
++	if (y == top || y == top - 1) {
++		if (Math::abs(dx) <= 2 && Math::abs(dz) <= 2 && !(dx == 0 && dz == 0)) {
++			return p.id_jungle_leaf;
++		}
++		return cosmos::ID_AIR;
++	}
++	if (y == top + 1 && Math::abs(dx) + Math::abs(dz) <= 1) {
++		return p.id_jungle_leaf;
++	}
++	return cosmos::ID_AIR;
++}
++
++// COSMOS CLIMATE-BIOMES B1: verbatim port of TreeGen._acacia_block (tree_gen.gd:309-329). A short (4-6,
++// salt 122) acacia_log trunk under a FLAT radius-2 canopy disc (the savanna umbrella look) with a plus
++// cap one layer above -- deliberately thin foliage so savanna reads open, not forested.
++int VoxelGeneratorCosmos::tree_acacia_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy) {
++	const int t = cosmos::ACACIA_TRUNK_MIN +
++			int(cosmos::tree_hash01(gx, gz, 122) * double(cosmos::ACACIA_TRUNK_MAX - cosmos::ACACIA_TRUNK_MIN + 1));
++	const int top = gy + t;
++	if (dx == 0 && dz == 0 && y >= gy + 1 && y <= top) {
++		return p.id_acacia_log;
++	}
++	if (y == top) {
++		if (Math::abs(dx) <= 2 && Math::abs(dz) <= 2 && !(dx == 0 && dz == 0)) {
++			return p.id_acacia_leaf;
++		}
++		return cosmos::ID_AIR;
++	}
++	if (y == top + 1 && Math::abs(dx) + Math::abs(dz) <= 1) {
++		return p.id_acacia_leaf;
++	}
++	return cosmos::ID_AIR;
++}
++
++// COSMOS CLIMATE-BIOMES B1: verbatim port of TreeGen._cactus_block (tree_gen.gd:332-338). A 1x1 cactus
++// column, height CACTUS_MIN..CACTUS_MAX (salt 123) -- no canopy, the cheapest possible "tree".
++int VoxelGeneratorCosmos::tree_cactus_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy) {
++	if (dx != 0 || dz != 0) {
++		return cosmos::ID_AIR;
++	}
++	const int h = cosmos::CACTUS_MIN +
++			int(cosmos::tree_hash01(gx, gz, 123) * double(cosmos::CACTUS_MAX - cosmos::CACTUS_MIN + 1));
++	if (y >= gy + 1 && y <= gy + h) {
++		return p.id_cactus;
++	}
++	return cosmos::ID_AIR;
++}
++
+ int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int y, int z) {
+ 	const int gx = int(cosmos::floori(double(x) / double(cosmos::TREE_G)));
+ 	const int gz = int(cosmos::floori(double(z) / double(cosmos::TREE_G)));
+@@ -478,7 +627,7 @@ int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int
+ 	if (gy <= cosmos::SEA_LEVEL) {
+ 		return cosmos::ID_AIR; // no submerged half-trees
+ 	}
+-	const int species = tree_species_for(int(column_profile_core(p, fid, bx, bz).y), gx, gz);
++	const int species = tree_species_for(p, int(column_profile_core(p, fid, bx, bz).y), gx, gz);
+ 	const int dx = x - bx;
+ 	const int dz = z - bz;
+ 	switch (species) {
+@@ -488,11 +637,54 @@ int VoxelGeneratorCosmos::tree_block_at(const Parameters &p, int fid, int x, int
+ 			return tree_oak_block(gx, gz, dx, y, dz, gy, p.id_birch_log, p.id_birch_leaf);
+ 		case cosmos::SP_SPRUCE:
+ 			return tree_spruce_block(p, gx, gz, dx, y, dz, gy);
++		case cosmos::SP_JUNGLE:
++			return tree_jungle_block(p, gx, gz, dx, y, dz, gy);
++		case cosmos::SP_ACACIA:
++			return tree_acacia_block(p, gx, gz, dx, y, dz, gy);
++		case cosmos::SP_CACTUS:
++			return tree_cactus_block(p, gx, gz, dx, y, dz, gy);
+ 		default:
+ 			return cosmos::ID_AIR;
  	}
  }
  
@@ -127,7 +403,40 @@ index aff1f00..093280a 100644
  // --- SHARP-SLOPE -------------------------------------------------------------------------------
  // Port of TerrainConfig._corner_targets. Vector4 (real_t) return is the GDScript type and its f32
  // rounding is load-bearing: _slope_fires_only reads these back and rounds them on a quarter grid.
-@@ -1698,13 +1795,8 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+@@ -869,6 +1061,32 @@ int VoxelGeneratorCosmos::biome_top(const Parameters &p, int biome, int x, int z
+ 	}
+ }
+ 
++// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md): the ACTUAL top block id a column's
++// surface resolves to -- what the near voxel world shows there -- for the far-skin bake path ONLY. This
++// is the coordinator's corrected law (terrain_config.gd TerrainConfig.top_block_id, right after
++// _biome_top), NOT the design doc's earlier sketch: submerged mirrors _sea_block's surface material
++// exactly (ice literal-gated on t < -0.55, then lava/water via sea_liquid_kind); on land the base
++// material is bedrock only for the (currently unreachable, M5C-only) B_PILLAR override, otherwise
++// biome_top; and the snow cap is CAPPABILITY-GATED -- it only overrides the base with id_snow when the
++// base material actually carries STATE_SNOW_CAPPED in its state mask (so non-cappable red_sand/mud/
++// snow_block stay bare) AND surface_temperature(g, t) < 0, the EXACT predicate with_snow_state applies
++// to the near world's resolve_cell path. Reuses sea_liquid_kind/biome_top/state_mask_of/
++// surface_temperature/id_bedrock verbatim -- no re-derivation, so a snow-capped column bakes to snow on
++// BOTH paths and a non-cappable one never does.
++int VoxelGeneratorCosmos::top_block_id(const Parameters &p, int g, int biome, double t, int x, int z) {
++	if (g < SEA_LEVEL) {
++		if (t < -0.55) {
++			return p.id_ice;
++		}
++		return sea_liquid_kind(t) == LIQ_LAVA ? p.id_lava : p.id_water;
++	}
++	const int base = (biome == B_PILLAR) ? p.id_bedrock : biome_top(p, biome, x, z);
++	if ((state_mask_of(p, base) & STATE_SNOW_CAPPED) != 0 && surface_temperature(g, t) < 0.0) {
++		return p.id_snow;
++	}
++	return base;
++}
++
+ int VoxelGeneratorCosmos::underwater_floor(const Parameters &p, int biome, int x, int z, double t) {
+ 	switch (biome) {
+ 		case B_OCEAN:
+@@ -1698,22 +1916,30 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
  
  // SEAMLESS-SCALES §7.2 item 2: the frozen cheap-tier palette indices. GDScript's FarPalette.frozen_colors()
  // (verify_cppgen / module_world) hands the 14 colours over in EXACTLY this order; a mismatch would be
@@ -143,7 +452,30 @@ index aff1f00..093280a 100644
  
  // A byte-equal port of FarPalette.color_for's BRANCH LOGIC (far_palette.gd:62-107). The RGB values are
  // the catalog's, frozen in `far_colors`; only the selection is here. B_PILLAR's grey is a literal in
-@@ -1755,6 +1847,67 @@ Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, dou
+ // FarPalette (not a catalog colour) and is mirrored as a literal here. Returns opaque black if the
+ // palette was not supplied (the pre-skin voxel path never calls this) -- never a plausible tint.
+-Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, double t, bool water) {
++Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, double t, bool water, int x, int z) {
+ 	if (p.far_colors.size() < FC_COUNT) {
+ 		return Color(0, 0, 0, 1);
+ 	}
++	// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md): under the flag, the colour IS the
++	// real top block's palette colour (deco_far_idx[top_block_id(...)]) rather than a synthetic biome
++	// tint -- so sample_columns' "colors" agree with bake_far_tile's texel classification, which agrees
++	// with the near voxel world. `water` is intentionally IGNORED here: top_block_id derives sea/land
++	// from `g` itself. Degrades to the legacy branch logic below (never a wrong-but-plausible colour) if
++	// deco_far_idx was not actually frozen alongside the flag.
++	if (p.skin_block_exact && p.deco_far_idx.size() > 0) {
++		const int id = top_block_id(p, g, biome, t, x, z);
++		const int idx = (id >= 0 && id < p.deco_far_idx.size()) ? p.deco_far_idx[id] : 0;
++		if (idx >= 0 && idx < p.far_colors.size()) {
++			return p.far_colors[idx];
++		}
++	}
+ 	if (water) {
+ 		// sea_color(t): frozen -> ice, molten -> lava, else water.
+ 		if (t < cosmos::CLIMATE_FROZEN) {
+@@ -1755,6 +1981,75 @@ Color VoxelGeneratorCosmos::far_color(const Parameters &p, int g, int biome, dou
  	}
  }
  
@@ -163,9 +495,17 @@ index aff1f00..093280a 100644
 +// palette index, which is exactly canon_idx[FC_PILLAR]. Keeping the two functions independent, side by
 +// side, line-for-line diffable against far_palette.gd/facet_tex_baker.gd, is what makes that one
 +// intentional divergence visible instead of buried in a conditional.
-+int VoxelGeneratorCosmos::far_index(const Parameters &p, int g, int biome, double t, bool water) {
++int VoxelGeneratorCosmos::far_index(const Parameters &p, int g, int biome, double t, bool water, int x, int z) {
 +	if (p.canon_idx.size() < FC_CANON_SIZE) {
 +		return -1; // no palette frozen; bake_far_tile already refuses before this is ever called
++	}
++	// COSMOS SKIN-BLOCK-EXACT: bake_far_tile's bare-terrain texel classification under the flag becomes
++	// deco_far_idx[top_block_id(...)] (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md, coordinator-corrected law)
++	// -- see far_color's twin comment above for the full rationale; `water` is ignored, top_block_id
++	// derives sea/land from `g`. Falls through to the legacy branches if deco_far_idx is not frozen.
++	if (p.skin_block_exact && p.deco_far_idx.size() > 0) {
++		const int id = top_block_id(p, g, biome, t, x, z);
++		return (id >= 0 && id < p.deco_far_idx.size()) ? p.deco_far_idx[id] : 0;
 +	}
 +	if (water) {
 +		// sea_color(t): frozen -> ice, molten -> lava, else water.
@@ -211,7 +551,16 @@ index aff1f00..093280a 100644
  Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells) const {
  	// ENTRY POINT 2 (S2/S3 — LIVE). A thin loop over the ONE core (column_profile_core), never a second
  	// sampler: heights/biomes are exactly the voxel path's, so a skin tile and the voxels it overdraws
-@@ -1825,6 +1978,161 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
+@@ -1814,7 +2109,7 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
+ 		hw[i] = float(g);
+ 		bw[i] = biome;
+ 		ww[i] = w ? 1 : 0;
+-		cw[i] = far_color(_params, g, biome, t, w);
++		cw[i] = far_color(_params, g, biome, t, w, x, z);
+ 		tw[i] = float(t);
+ 	}
+ 	d["heights"] = heights;
+@@ -1825,6 +2120,161 @@ Dictionary VoxelGeneratorCosmos::sample_columns(int fid, PackedInt64Array cells)
  	return d;
  }
  
@@ -362,7 +711,7 @@ index aff1f00..093280a 100644
 +				const int g = int(pr.x);
 +				const int biome = int(pr.y);
 +				const double temp = double(pr.w);
-+				fi = far_index(p, g, biome, temp, g < cosmos::SEA_LEVEL);
++				fi = far_index(p, g, biome, temp, g < cosmos::SEA_LEVEL, lx, lz);
 +			}
 +			w[row_off + bx] = uint8_t(fi + 1);
 +		}
@@ -373,7 +722,7 @@ index aff1f00..093280a 100644
  // A facet id the frozen atlas actually covers. cell_dir indexes facet_frame directly, so an
  // unchecked fid from script would read out of bounds -- checked once at the entry point rather than
  // per core call, keeping the hot path clean while the boundary stays safe.
-@@ -1882,6 +2190,9 @@ void VoxelGeneratorCosmos::_bind_methods() {
+@@ -1882,6 +2332,9 @@ void VoxelGeneratorCosmos::_bind_methods() {
  	// S1 -- while they are staged inert -- so the boundary shape is pinned by the gate from the start
  	// and S2/S3 fill in bodies rather than re-architecting an interface under deadline.
  	ClassDB::bind_method(D_METHOD("sample_columns", "fid", "cells"), &VoxelGeneratorCosmos::sample_columns);
@@ -384,7 +733,7 @@ index aff1f00..093280a 100644
  	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
  	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
-index 7aa3e67..d252abd 100644
+index 7aa3e67..dbe9f04 100644
 --- a/generators/cosmos/voxel_generator_cosmos.h
 +++ b/generators/cosmos/voxel_generator_cosmos.h
 @@ -152,6 +152,31 @@ public:
@@ -419,9 +768,22 @@ index 7aa3e67..d252abd 100644
  	// Harness alias: some GDScript gates drive the generator by the VoxelGeneratorScript override name
  	// `_generate_block(buffer, origin, lod)` rather than the base virtual. Bind it so those gates run
  	// against the C++ generator identically -- the LIVE game path (VoxelTerrain -> generate_block) is
-@@ -208,6 +233,9 @@ private:
+@@ -203,11 +228,21 @@ private:
+ 	static bool fid_ok(const Parameters &p, int fid);
+ 
+ 	static void tree_base_pos(int gx, int gz, int &out_bx, int &out_bz);
+-	static int tree_species_for(int biome, int gx, int gz);
++	// COSMOS CLIMATE-BIOMES B1: needs `p` (p.climate_biomes) to decide whether B_JUNGLE/B_SAVANNA can
++	// ever be selected -- tree_gen.gd's _species_for gates the new species on the same flag.
++	static int tree_species_for(const Parameters &p, int biome, int gx, int gz);
+ 	static bool tree_has_tree(const Parameters &p, int fid, int gx, int gz);
  	static int tree_oak_block(int gx, int gz, int dx, int y, int dz, int gy, int log_id, int leaf_id);
  	static int tree_spruce_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
++	// B1 climate-biome canopy shapes (tree_gen.gd:289-329), same calling convention as tree_spruce_block.
++	static int tree_jungle_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
++	static int tree_acacia_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
++	// B1 desert cactus (tree_gen.gd:332-338): a 1x1 column, no canopy -- the cheapest possible "tree".
++	static int tree_cactus_block(const Parameters &p, int gx, int gz, int dx, int y, int dz, int gy);
  	static int tree_block_at(const Parameters &p, int fid, int x, int y, int z);
 +	// FP_CPP_TILE_BAKE (F1): port of TreeGen.top_decoration (tree_gen.gd:208-224), built entirely from
 +	// the primitives above -- see bake_far_tile.
@@ -429,10 +791,32 @@ index 7aa3e67..d252abd 100644
  
  	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
  	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
-@@ -230,6 +258,15 @@ private:
+@@ -221,6 +256,16 @@ private:
+ 	static int64_t sea_block(const Parameters &p, double t, int y);
+ 	static int surface_rule(const Parameters &p, int x, int y, int z, int g, int biome, double c, double t);
+ 	static int biome_top(const Parameters &p, int biome, int x, int z);
++	// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md): the actual TOP block id a column's
++	// surface resolves to (what the near voxel world shows there), for the far-skin bake path ONLY
++	// (bake_far_tile / far_color / far_index under p.skin_block_exact). Verbatim port of the coordinator's
++	// corrected law (terrain_config.gd TerrainConfig.top_block_id, just after _biome_top): submerged ->
++	// the sea_block surface material (ice / lava / water); else base = bedrock iff B_PILLAR, else
++	// biome_top(biome,x,z); base gets snow-capped (returns id_snow) iff STATE_SNOW_CAPPED is in its state
++	// mask AND surface_temperature(g,t) < 0 -- the SAME cappability gate with_snow_state applies to the
++	// near world, so a snow-capped column bakes to snow on BOTH paths. Reuses sea_liquid_kind/biome_top/
++	// state_mask_of/surface_temperature/id_bedrock verbatim -- no re-derivation.
++	static int top_block_id(const Parameters &p, int g, int biome, double t, int x, int z);
+ 	static int underwater_floor(const Parameters &p, int biome, int x, int z, double t);
+ 	static int filler_depth(int biome);
+ 	static int biome_filler(const Parameters &p, int biome, int x, int y, int z, int depth, double t);
+@@ -229,7 +274,19 @@ private:
+ 	// SEAMLESS-SCALES §7.2 item 2: the cheap-tier per-column colour. A byte-equal port of
  	// FarPalette.color_for's BRANCH LOGIC over the frozen `far_colors` (the RGB values are the
  	// catalog's, handed over once at setup). Pure over `p`; used only by sample_columns.
- 	static Color far_color(const Parameters &p, int g, int biome, double t, bool water);
+-	static Color far_color(const Parameters &p, int g, int biome, double t, bool water);
++	// `x, z` are ADDITIONAL to the original signature (COSMOS SKIN-BLOCK-EXACT): needed only under
++	// p.skin_block_exact (top_block_id's biome_top hash and cappability lookup are per-column);
++	// unused on the legacy branch below, so every existing call site just gains two arguments.
++	static Color far_color(const Parameters &p, int g, int biome, double t, bool water, int x, int z);
 +	// FP_CPP_TILE_BAKE (F1): far_color's SAME branch logic, returning the CANONICAL PALETTE INDEX (via
 +	// Parameters::canon_idx, precomputed once in setup()) instead of a Color -- the byte-equality
 +	// construction bake_far_tile's terrain branch relies on. See far_color's/far_index's definitions:
@@ -441,11 +825,40 @@ index 7aa3e67..d252abd 100644
 +	// on exactly one leaf (B_PILLAR: far_color returns FarPalette's grey LITERAL; far_index returns that
 +	// literal's nearest-palette-index, matching what GDScript's
 +	// `far_color_index(color_for(...))` actually computes for the bake path).
-+	static int far_index(const Parameters &p, int g, int biome, double t, bool water);
++	static int far_index(const Parameters &p, int g, int biome, double t, bool water, int x, int z);
  	static int deep_family(const Parameters &p, int x, int y, int z);
  	static int strata_at(const Parameters &p, int x, int y, int z);
  	static int strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy);
-@@ -384,6 +421,26 @@ private:
+@@ -323,6 +380,13 @@ private:
+ 		bool faceted = false;
+ 		bool m5c_corner = false;
+ 
++		// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md): the two P1 flags, mirroring
++		// CubeSphere.FP_CLIMATE_BIOMES / FP_SKIN_BLOCK_EXACT. Both default false so an old config (that
++		// never supplies them) reproduces today's shipped biome_of/tree_species_for/far_color/far_index
++		// branches byte-for-byte.
++		bool climate_biomes = false;
++		bool skin_block_exact = false;
++
+ 		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
+ 		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is
+ 		// FacetAtlas._off (2 ints per facet); together they make cell_dir() pure arithmetic. This
+@@ -348,6 +412,14 @@ private:
+ 		int id_spruce_leaf = 0;
+ 		int id_birch_log = 0;
+ 		int id_birch_leaf = 0;
++		// COSMOS CLIMATE-BIOMES B1 species ids, frozen exactly like the ids above. -1 (not 0 = AIR) is
++		// the "not supplied" sentinel: a config that omits them (climate_biomes/skin_block_exact off)
++		// never places acacia/jungle canopy, so an unresolved id never gets emitted.
++		int id_acacia_log = -1;
++		int id_acacia_leaf = -1;
++		int id_jungle_log = -1;
++		int id_jungle_leaf = -1;
++		int id_cactus = -1;
+ 
+ 		// Frozen appearance tables (baked main-thread by the loader). Cross once, read-only after.
+ 		PackedInt32Array cube_arid;
+@@ -384,6 +456,26 @@ private:
  		// (S1 gate) omitted them; far_color then returns opaque black, which the colour gate ignores.
  		PackedColorArray far_colors;
  

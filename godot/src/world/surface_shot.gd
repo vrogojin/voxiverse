@@ -47,9 +47,13 @@ const CANOPY_SHADOW_MAX := 0.28
 static func top_far_index(x: int, z: int, pcache = null) -> int:
 	var prof := TerrainConfig.column_profile(x, z, pcache)   # Vector4(g, biome, continent, temperature)
 	var g := int(prof.x)
+	var tree_id := TreeGen.top_decoration(x, z, pcache)
+	if CubeSphere.FP_SKIN_BLOCK_EXACT:
+		# far colour = the ACTUAL top block's texture mean (tree block, else the surface block) — matches the near field.
+		var bid := tree_id if tree_id != BlockCatalog.AIR else TerrainConfig.top_block_id(g, int(prof.y), prof.w, x, z)
+		return FarPalette.far_color_index_of_block(bid)
 	var clamped_sea := g < TerrainConfig.SEA_LEVEL
 	var terr_col := FarPalette.color_for(g, int(prof.y), prof.w, clamped_sea)
-	var tree_id := TreeGen.top_decoration(x, z, pcache)
 	var top_col: Color = BlockCatalog.color_of(tree_id) if tree_id != BlockCatalog.AIR else terr_col
 	return FarPalette.far_color_index(top_col)
 

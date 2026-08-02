@@ -523,6 +523,17 @@ const FP_FACET_TEX := false
 ## Tile-less ids (water/lava) fall back to the swatch. Default FALSE ⇒ byte-identical. Requires FP_FACET_TEX.
 const FP_SKIN_TEXTURE_MEAN := false
 
+## FP_SKIN_BLOCK_EXACT — the far skin classifies a surface column by the ACTUAL top BLOCK worldgen places there,
+## via far_color_index_of_block(top_block_id(...)), instead of FarPalette.color_for's SYNTHETIC biome-blend colours
+## (_savanna/_jungle/_forest/_taiga). User directive: "colors MUST correspond exactly to the original block
+## textures only; biomes define block textures, block textures define pixel colors for FAR skin." Both the GDScript
+## bake and the C++ bake_far_tile route through the SAME frozen deco_far_idx LUT ⇒ byte-equal by construction AND
+## texture-exact (savanna/jungle ground = grass texture mean; biomes differentiate via acacia/jungle TREES). Requires
+## the biome-exact C++ (Whittaker classifier + acacia/jungle tree species, patch 0011) to stay byte-equal under
+## FP_CLIMATE_BIOMES. NOT byte-identical to the shipped color_for look even flags-off (taiga speckle, forest→grass,
+## pillar, dry-ocean-floor) ⇒ its own flag; default FALSE. See docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md.
+const FP_SKIN_BLOCK_EXACT := false
+
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
 ## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async

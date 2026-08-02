@@ -36,11 +36,14 @@ func _gd_ref(fid: int, lc: PackedVector2Array, nx: int, ny: int, tex: int, edits
 			if fi < 0:
 				var deco := TreeGen.top_decoration(lx, lz, ctx)
 				if deco != BlockCatalog.AIR:
-					fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))
+					fi = FarPalette.far_color_index_of_block(deco) if CubeSphere.FP_SKIN_BLOCK_EXACT else FarPalette.far_color_index(BlockCatalog.color_of(deco))
 				else:
 					var prof := TerrainConfig.facet_profile(fid, lx, lz)
 					var g := int(prof.x)
-					fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+					if CubeSphere.FP_SKIN_BLOCK_EXACT:
+						fi = FarPalette.far_color_index_of_block(TerrainConfig.top_block_id(g, int(prof.y), prof.w, lx, lz))
+					else:
+						fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
 			out[row_off + bx] = fi + 1
 	return out
 

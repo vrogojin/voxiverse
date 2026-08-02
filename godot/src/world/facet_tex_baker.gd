@@ -1614,11 +1614,11 @@ func _setup_parallel_band() -> void:
 	# thread runs pure C++ compute and the web WorkerThreadPool (now given >1 thread via project.godot worker_pool.web=5)
 	# genuinely parallelises. THIS is the lock-free path the note below asked for. Off (or old engine w/o the method): the
 	# GDScript convoy still holds → keep the 1-worker web optimum.
-	# The C++ far_index switch does NOT model the FP_CLIMATE_BIOMES Whittaker savanna/jungle blend, and deco_far_idx is
-	# built from mean_color_of under FP_SKIN_TEXTURE_MEAN (≠ the tree branch's color_of) — either flag would byte-diverge
-	# the tile bake from the GDScript path. Fall back to the GDScript bake while either is on (both default false).
+	# FP_SKIN_BLOCK_EXACT routes BOTH paths through far_color_index_of_block(top_block_id) + the biome-exact C++ (Whittaker
+	# + acacia/jungle species), so the tile bake is byte-equal under FP_CLIMATE_BIOMES/FP_SKIN_TEXTURE_MEAN. WITHOUT it the
+	# old color_for path diverges under those flags, so fall back to the GDScript bake there.
 	_pbm_tile_ok = CubeSphere.FP_CPP_TILE_BAKE and _sampler_obj != null and _sampler_obj.has_method("bake_far_tile") \
-		and not CubeSphere.FP_CLIMATE_BIOMES and not CubeSphere.FP_SKIN_TEXTURE_MEAN
+		and (CubeSphere.FP_SKIN_BLOCK_EXACT or (not CubeSphere.FP_CLIMATE_BIOMES and not CubeSphere.FP_SKIN_TEXTURE_MEAN))
 	if _pbm_tile_ok:
 		_pbm_n = clampi(mini(_detect_cores() - 2, 4), 1, 4)   # leave 2 cores for main + near-field voxel gen; cap 4 bake threads
 	else:
@@ -1914,7 +1914,9 @@ func _pbm_compute(i: int) -> void:
 				if fi < 0:
 					var deco := TreeGen.top_decoration(lx, lz, ctx)   # cheap has_tree early-out on non-tree columns
 					if deco != BlockCatalog.AIR:
-						fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))   # == top_far_index tree branch
+						# FP_SKIN_BLOCK_EXACT: the far colour is the tree block's TEXTURE MEAN (far_color_index_of_block),
+						# matching the near field, not the flat swatch. Flag off ⇒ the shipped color_of swatch (== top_far_index).
+						fi = FarPalette.far_color_index_of_block(deco) if CubeSphere.FP_SKIN_BLOCK_EXACT else FarPalette.far_color_index(BlockCatalog.color_of(deco))
 					else:
 						# NO-MEMO terrain (byte-equal to top_far_index): facet_profile directly, NOT column_profile. The
 						# per-facet memo NEVER hits on the fine bake's distinct columns — it only GROWS (≈4096 dict inserts
@@ -1922,7 +1924,11 @@ func _pbm_compute(i: int) -> void:
 						# vs 1 clean at ~1). Skipping it should let the workers actually parallelise.
 						var prof := TerrainConfig.facet_profile(fid, lx, lz)
 						var g := int(prof.x)
-						fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+						if CubeSphere.FP_SKIN_BLOCK_EXACT:
+							# the ACTUAL surface block's texture mean — the far skin's single source of truth (directive)
+							fi = FarPalette.far_color_index_of_block(TerrainConfig.top_block_id(g, int(prof.y), prof.w, lx, lz))
+						else:
+							fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
 				bytes[row_off + bx] = fi + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes

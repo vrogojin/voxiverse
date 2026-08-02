@@ -1585,11 +1585,12 @@ func _setup_parallel_band() -> void:
 	_pbm_on = _bm_flat and _worker_on and CubeSphere.FP_SKIN_SSE
 	if not _pbm_on:
 		return
-	# Use EVERY reported core for the background bake (the user asked for it). The −1 "reserve a core for main" left
-	# a 2-core browser with a SINGLE bake worker (pbm_busy=1 ⇒ whole-planet fine crawled at ~0.24 facet/s). The bake
-	# is off-thread WorkerThreadPool work + the tiles yield, so oversubscribing the main core by 1 is fine for a
-	# background task. Scales further when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE.
-	_pbm_n = clampi(OS.get_processor_count(), 1, 8)
+	# Reserve one core for the main/render thread: on a 2-core browser, running 2 bake workers alongside main
+	# THRASHED (each fine facet took ~2.5s of contended CPU ⇒ throughput FELL to 0.8 facet/s vs ~5 with 1 clean
+	# worker). The real speedups are the shade-skip (top_block_id) + the smaller fine texel + fine-priority, not more
+	# workers. Scales up automatically when the web engine is rebuilt with a larger emscripten PTHREAD_POOL_SIZE and
+	# the browser reports more logical cores.
+	_pbm_n = clampi(OS.get_processor_count() - 1, 1, 8)
 	_pbm_fid.resize(_pbm_n); _pbm_layer.resize(_pbm_n); _pbm_task.resize(_pbm_n)
 	_pbm_bytes.resize(_pbm_n); _pbm_lc.resize(_pbm_n); _pbm_nx.resize(_pbm_n); _pbm_ny.resize(_pbm_n)
 	_pbm_mode.resize(_pbm_n)

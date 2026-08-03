@@ -843,6 +843,30 @@ const FP_SLOT_INDIRECT := false
 ##   with it the boundary re-coincides), G-FS-QUIESCE/G-FS-NOHOLE re-run unaffected.
 const FP_SMOOTH_WELD_REFRESH := false
 
+## FP_RING_QUIESCE (REVISION 4 Stage B, docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R4.2): ring quiescence at rest.
+##   `visible_fids()` permanently EXCLUDES a smooth-resident facet from the shell's emit set (§2 law 6) — but two
+##   OTHER drivers never adopted that exclusion, so the composition has no fixpoint: (1) `_noblack_guarantee` re-arms
+##   `_pending = true` EVERY frame on `not _emitted.has(fid)` — under FP_SMOOTH_RIM the ACTIVE facet is smooth-resident
+##   ⇒ permanently excluded from `_emitted` ⇒ this re-arms forever (a continuous `_begin_rebuild` train — the sh_reemit
+##   climb / 60-100ms frames / hitch counter); (2) `_count_uncached_visible`/`_count_uncovered_visible` have NO smooth
+##   exclusion, so `remaining` never reaches 0 and the env convergence latches (`_srf_converged`/`_orbit_converged`)
+##   never engage. This flag factors the exclusion test into ONE predicate, `FacetFarRing._smooth_covered(fid)`
+##   (`_smooth != null and _smooth.is_resident(fid) and not _smooth_leaving.has(fid)` — visible_fids':2236 own check,
+##   unconditionally extracted so both callers below share the SAME definition), and wires it into: (a)
+##   `_noblack_guarantee` — a smooth-covered active facet counts as DRAWN (its committed S2 tile IS the opaque
+##   never-black cover, strictly better than the sunk shell backstop), so the re-arm condition becomes `built_now or
+##   new_unsink != _noblack_unsink_fid or (not _emitted.has(fid) and not _smooth_covered(fid))`; the chord build and
+##   the unsink probe are ALSO skipped while covered (nothing there needs the shell's own backstop while the tile
+##   covers); (b) `_count_uncached_visible`/`_count_uncovered_visible` — `continue` on `_smooth_covered(fid)`, so the
+##   counter counts exactly what the shell's emit can serve, nothing else. At rest: `remaining` reaches 0, the env
+##   latches engage, `_pending` stays false — the REAL invariant holds: zero `_rebuild_full`/`_dispatch_async_rebuild`/
+##   `_pending=true` after settle. Off ⇒ every touched site keeps checking the shipped `not _emitted.has(fid)` /
+##   unconditional counting — byte-identical (FLAT 6042/0); `_smooth_covered` itself is still extracted and used by
+##   `visible_fids()` unconditionally (a pure refactor of already-shipped logic, not gated — behaviourally identical
+##   either way). Gate: verify_far_smooth.gd G-FS-QUIESCE-RING (falsifies: forcing this off on the identical scripted
+##   scenario makes the rebuild/re-emit counters CLIMB — the shipped bug reproduces).
+const FP_RING_QUIESCE := false
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

@@ -1215,8 +1215,12 @@ func _surface_converge_emit(p: Array) -> void:
 ## emit UN-SUNK (true surface); (c) set _pending on any state change / when it is not currently drawn so the emit path
 ## re-draws it once (then the idle short-circuits hold — no churn). Off / off-surface / no active facet ⇒ inert (byte-
 ## identical). NEVER-OOM: one facet's existing dense cache + one int, no per-frame alloc, no growth with walk distance.
-func _noblack_guarantee(p: Array) -> void:
-	if not (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER):
+## `noblack_on`/`quiesce_on` override FP_FARRING_ACTIVE_NOBLACK∧FP_FARRING_FULL_COVER / FP_RING_QUIESCE (mirrors the
+## codebase's gate-forcing convention) so a headless gate can drive the REAL never-black re-arm logic without a
+## compile-time sed of either flag pair. Every real caller (`_process`) passes no override ⇒ both compile-time
+## consts govern exactly as shipped (byte-identical).
+func _noblack_guarantee(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE, noblack_on := CubeSphere.FP_FARRING_ACTIVE_NOBLACK and CubeSphere.FP_FARRING_FULL_COVER) -> void:
+	if not noblack_on:
 		return
 	if _shell_orbit() or _active_fid < 0:
 		_noblack_unsink_fid = -1
@@ -1227,18 +1231,29 @@ func _noblack_guarantee(p: Array) -> void:
 		_noblack_unsink_fid = -1
 		return
 	var fid := _active_fid
+	# REVISION 4 Stage B (FP_RING_QUIESCE, R4.2): a smooth-covered active facet is drawn by its OWN committed S2
+	# tile — that IS the never-black cover (strictly better than the sunk shell backstop this guarantee otherwise
+	# builds). It is PERMANENTLY excluded from the shell's emit set (`visible_fids()`'s `_smooth_covered` check), so
+	# `_emitted.has(fid)` can never become true for it — the shipped `not _emitted.has(fid)` disjunct below re-arms
+	# `_pending` EVERY frame for as long as it stays smooth-covered (the endless re-emit train R4.2 root-caused).
+	# Skip the chord build + the unsink probe too (neither is needed while the tile covers). Off ⇒ `covered` is
+	# always false (byte-identical to the shipped guarantee).
+	var covered := quiesce_on and _smooth_covered(fid)
 	# (a) IMMEDIATE cache — never wait for the per-frame warm to reach the sub-camera facet. A missing cache is dropped
 	# from the cache-filtered emit set (visible_fids(true) / _emit_cache_ready) → the initial BLACK. A dense chord is
 	# cheap (~289 profile samples, one facet) and gives full coverage NOW; the normal warm upgrades it to the envelope.
 	var built_now := false
-	if not _bpos_cache.has(fid):
+	if not covered and not _bpos_cache.has(fid):
 		_ensure_backstop_chord_cached(fid)
 		built_now = true
 	# (b) un-sink WHERE the near field is genuinely absent under the camera (probe the SAME coverage callable U2 uses).
-	var uncovered := not _noblack_near_meshed(fid)
-	var new_unsink := fid if uncovered else -1
-	# (c) re-emit once on any change or if the active facet is not currently drawn; then the idle short-circuits hold.
-	if built_now or new_unsink != _noblack_unsink_fid or not _emitted.has(fid):
+	var new_unsink := _noblack_unsink_fid
+	if not covered:
+		var uncovered := not _noblack_near_meshed(fid)
+		new_unsink = fid if uncovered else -1
+	# (c) re-emit once on any change or if the active facet is not currently drawn (and not smooth-covered); then the
+	# idle short-circuits hold.
+	if built_now or new_unsink != _noblack_unsink_fid or (not _emitted.has(fid) and not covered):
 		_pending = true
 	_noblack_unsink_fid = new_unsink
 
@@ -1309,16 +1324,20 @@ func _env_async_any() -> bool:
 ## a worker dispatch warms a bounded batch + emits the ready subset. Re-dispatched each idle frame until the front is
 ## fully cached (`remaining == 0`), then idles like the shipped `_orbit_converged` short-circuit. The reveal grows
 ## ENV_WARM_BATCH facets per worker cycle — same total work as the shipped warm, but entirely off the frame budget.
-func _orbit_warm_async(p: Array) -> void:
+## `quiesce_on` overrides FP_RING_QUIESCE (mirrors the codebase's gate-forcing convention — `on := CubeSphere.FLAG`
+## params on `_apply_slot_indirect`/`build_tile`/etc.) so a headless gate can drive the fix without a compile-time
+## sed; every real caller passes no override ⇒ the compile-time const governs (byte-identical, this param exists
+## purely for G-FS-QUIESCE-RING's falsify/fix scenarios in ONE gate run).
+func _orbit_warm_async(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE) -> void:
 	_emit_cached_only = true
-	var remaining := _count_uncached_visible(p)
+	var remaining := _count_uncached_visible(p, quiesce_on)
 	# Dispatch when: a fresh drift/engage (`_pending`), any facet still to warm (progressive reveal), or the mesh has
 	# never been emitted this engage (fill it even at 0 growth). Each dispatch's worker warms the next batch off-thread.
 	# FP_ENV_FALL_HOLD: falling fast ⇒ chord-only, dispatch only when COVERAGE changes (uncovered visible facet), never
 	# for env upgrade — calms the >384 band's worst frames while chords keep coverage. Off ⇒ shipped remaining>0.
 	var want := _pending or not _orbit_emitted_once
 	if CubeSphere.FP_ENV_FALL_HOLD and _fall_hold:
-		if _count_uncovered_visible(p) > 0: want = true
+		if _count_uncovered_visible(p, quiesce_on) > 0: want = true
 	elif remaining > 0:
 		want = true
 	if want:
@@ -1329,7 +1348,9 @@ func _orbit_warm_async(p: Array) -> void:
 
 ## FP_ENV_WARM_ASYNC: how many front-hemisphere facets still lack their emit cache. Cheap (front-cull dot + a dict
 ## `has()` per fid — NO profile sampling), so it is safe to run every idle frame. Mirrors visible_fids' cull + role.
-func _count_uncached_visible(p: Array) -> int:
+## `quiesce_on` overrides FP_RING_QUIESCE — see `_orbit_warm_async`'s note (gate-forcing param, byte-identical for
+## every real caller, which passes no override).
+func _count_uncached_visible(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE) -> int:
 	var nrm: Array = p[0]
 	var thresh: float = p[1]
 	var k := FacetAtlas.K
@@ -1339,6 +1360,11 @@ func _count_uncached_visible(p: Array) -> int:
 			for b in range(k):
 				var fid := (face * k + a) * k + b
 				if not _front_visible(fid, nrm, thresh):
+					continue
+				# REVISION 4 Stage B (FP_RING_QUIESCE, R4.2): a smooth-covered facet is never in the shell's emit set
+				# (visible_fids' `_smooth_covered` exclusion) — counting it here as "still needs a cache" is exactly
+				# why `remaining` never reached 0 and the env convergence latch never engaged. Off ⇒ counted as shipped.
+				if quiesce_on and _smooth_covered(fid):
 					continue
 				if _dense_warm(fid):   # FP_MID_DENSE: a mid-dense target still needs its dense cache (keeps orbit dispatching)
 					# FP_ENV_FLOORED_ASYNC: a dense CHORD present but not yet enveloped still needs warming — count by
@@ -1355,7 +1381,8 @@ func _count_uncached_visible(p: Array) -> int:
 ## opposed to _count_uncached_visible's "not yet ENVELOPED". While the fall-hold is active the driver dispatches
 ## (chord-only) exactly when this is > 0, so the transition reveal is chord-filled (hole=0) without the continuous
 ## env re-emit churn. A chord counts as covered. Same cheap dot-cull + dict-has as _count_uncached_visible.
-func _count_uncovered_visible(p: Array) -> int:
+## `quiesce_on` overrides FP_RING_QUIESCE — see `_orbit_warm_async`'s note.
+func _count_uncovered_visible(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE) -> int:
 	var nrm: Array = p[0]
 	var thresh: float = p[1]
 	var k := FacetAtlas.K
@@ -1365,6 +1392,10 @@ func _count_uncovered_visible(p: Array) -> int:
 			for b in range(k):
 				var fid := (face * k + a) * k + b
 				if not _front_visible(fid, nrm, thresh):
+					continue
+				# REVISION 4 Stage B (FP_RING_QUIESCE, R4.2): mirrors _count_uncached_visible's exclusion above — a
+				# smooth-covered facet is served by its tile, not the shell, so it must not hold `remaining` above 0.
+				if quiesce_on and _smooth_covered(fid):
 					continue
 				if _dense_warm(fid):
 					if not _bpos_cache.has(fid):
@@ -2205,6 +2236,18 @@ func _rebuild_full() -> void:
 	_push_event("sync", build_us, swap_us, tris * 3)   # T2e: verts = 3·tris (cheap; no surface read-back on the crossing frame)
 	print("[FP2] facet far ring: %d triangles around facet %d (%d facets cached, %d backstop)" % [tris, _active_fid, _pos_cache.size(), _bpos_cache.size()])
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 4 Stage B (FP_RING_QUIESCE, R4.2): the ONE emit-exclusion predicate
+## — factored out of the inline check `visible_fids()` used below (§2 law 6) so every OTHER caller that needs to know
+## "is this facet's coverage already handled by the smooth tile, not the shell" shares the identical definition
+## (`_noblack_guarantee` + both uncached/uncovered counters — see FP_RING_QUIESCE below). A facet is smooth-covered
+## when its S2 tile is RESIDENT and NOT mid-leaving-handshake (`_smooth_leaving` — REVISION 2 LAW R-B make-before-
+## break: a leaving facet must re-appear in the shell's emit BEFORE the tile actually drops, so it is not "covered"
+## during that window either). `_smooth` is null unless FP_FAR_SMOOTH ⇒ always false off. This extraction itself is
+## an unconditional refactor of already-shipped logic (not flag-gated) — `visible_fids()`'s behaviour is unchanged
+## either way; FP_RING_QUIESCE only gates whether the OTHER two call sites also honour it.
+func _smooth_covered(fid: int) -> bool:
+	return _smooth != null and _smooth.is_resident(fid) and not _smooth_leaving.has(fid)
+
 ## The front-hemisphere visible fid set (front-facing, non-active, non-excluded), in canonical face/a/b order. Both
 ## mesh assemblers + the equivalence gate consume this so their vertex/color/normal arrays are index-aligned.
 func visible_fids(cached_only := false) -> PackedInt32Array:
@@ -2233,7 +2276,9 @@ func visible_fids(cached_only := false) -> PackedInt32Array:
 				# (the tile stays drawn — make-before-break) but must start appearing in the shell's emit again RIGHT
 				# NOW, so the next shell commit re-includes it BEFORE the smooth tile is actually dropped (never a
 				# frame where neither system draws it). Off ⇒ `_smooth_leaving` is always empty (byte-identical).
-				if _smooth != null and _smooth.is_resident(fid) and not _smooth_leaving.has(fid):
+				# REVISION 4 Stage B: this check is now the shared `_smooth_covered(fid)` predicate (identical logic,
+				# extracted so `_noblack_guarantee`/the uncached/uncovered counters can reuse it under FP_RING_QUIESCE).
+				if _smooth_covered(fid):
 					continue
 				out.append(fid)
 	return out
@@ -3947,15 +3992,33 @@ static func _apply_smooth_normal_lit(code: String, on := CubeSphere.FP_SMOOTH_NO
 # never declares `v_slot` or `v_bslot` (the plain vertex-colour shell, or the base tex shader with neither close-up
 # nor band on) has NOTHING for Q2 to resolve — the anchor is simply absent, so the code returns UNTOUCHED (the F7
 # golden-string discipline: String.replace of an absent anchor is a no-op). Off ⇒ code returned VERBATIM always.
+# REVISION 4 Stage A (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R4.1, Q2'): rounded, integer-exact decode. The
+# ORIGINAL Q2 decode (`mod(fid, w)`/`floor(fid / w)` on an un-rounded float) has NO defence against the barycentric
+# reconstruction dropping a constant-across-the-triangle varying a few ulp under its true integer value (fid≈3455
+# reconstructed as 3454.9997 flips BOTH `mod` and the row) — every OTHER decoder already shipped in this family
+# rounds first (`int(v_bslot + 0.5)`, ~3698/3722). `fid < 0.0` (the "no slot") guard returns the same −1 sentinel the
+# fragment paths already treat as "no slot" everywhere else in this shader family.
 const _SLOT_INDIRECT_UNIFORMS := "uniform sampler2D slot_map : filter_nearest;
 uniform float slot_map_w = 64.0;
 float _slot_indirect(float fid) {
-	float w = slot_map_w;
-	float fx = mod(fid, w);
-	float fy = floor(fid / w);
-	return texelFetch(slot_map, ivec2(int(fx), int(fy)), 0).r;
+	if (fid < 0.0) { return -1.0; }
+	int f = int(fid + 0.5);
+	int w = int(slot_map_w + 0.5);
+	return texelFetch(slot_map, ivec2(f % w, f / w), 0).r;
 }
 "
+# REVISION 4 Stage A (R4.1, Q2'): resolve in the VERTEX stage, where assigning the varying is legal (the ORIGINAL
+# splice injected `v_slot = _slot_indirect(v_slot);` / `v_bslot = _slot_indirect(v_bslot);` at the TOP of
+# `fragment()` — but `v_slot`/`v_bslot` are varyings ALREADY ASSIGNED in `vertex()` a few lines above, and Godot's
+# shader compiler hard-rejects reassigning a vertex-assigned varying in fragment/light (engine source,
+# `servers/rendering/shader_language.cpp` `_validate_varying_assign`) — the WHOLE far-ring shader fails to parse on
+# any real renderer and falls back to the engine's default white material; headless gates never caught it because
+# the dummy RenderingServer stores `shader_code` without ever parsing it). Fix: splice the VERTEX-stage assignment
+# itself — `v_slot = UV2.y;` → `v_slot = _slot_indirect(UV2.y);` (and the `v_bslot` twin(s); `_apply_block_detail`/
+# `_apply_flatcolor` inject the identical `\tv_bslot = UV2.y;\n` literal at up to 3 call sites, all already collapsed
+# into the SAME string by the time this runs on the fully-assembled code, so ONE replace covers all of them). The
+# fragment body is UNTOUCHED — it already decodes with `int(x + 0.5)` (~3698/3722), so a varying now carrying the
+# resolved (small-magnitude) slot instead of the raw fid needs no fragment-side change at all.
 static func _apply_slot_indirect(code: String, on := CubeSphere.FP_SLOT_INDIRECT) -> String:
 	if not on:
 		return code
@@ -3966,16 +4029,68 @@ static func _apply_slot_indirect(code: String, on := CubeSphere.FP_SLOT_INDIRECT
 	code = code.replace(
 		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
 		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + _SLOT_INDIRECT_UNIFORMS)
-	var resolve := ""
-	if has_slot and has_bslot:
-		# Both varyings were fed the SAME UV2.y (a shared fid) — resolve once, feed both.
-		resolve = "\tfloat _rs = _slot_indirect(v_slot);\n\tv_slot = _rs;\n\tv_bslot = _rs;\n"
-	elif has_slot:
-		resolve = "\tv_slot = _slot_indirect(v_slot);\n"
-	else:
-		resolve = "\tv_bslot = _slot_indirect(v_bslot);\n"
-	code = code.replace("void fragment() {\n", "void fragment() {\n" + resolve)
+	if has_slot:
+		code = code.replace("\tv_slot = UV2.y;\n", "\tv_slot = _slot_indirect(UV2.y);\n")
+	if has_bslot:
+		code = code.replace("\tv_bslot = UV2.y;\n", "\tv_bslot = _slot_indirect(UV2.y);\n")
 	return code
+
+# REVISION 4 G-FS-VARY-STAGE: pure string lint, no shader compiler involved — extract the `vertex()` and
+# `fragment()`/`light()` function bodies from an assembled shader string (brace-matched) and report every DECLARED
+# `varying` that is ASSIGNED (an `ident =` NOT `ident ==`) in the vertex body AND ALSO in the fragment/light body.
+# That reassignment is exactly the illegal pattern Godot's shader compiler rejects (a vertex-assigned varying may
+# not be reassigned in fragment/light) — this is the headless PROXY for a real GLSL parse (the dummy RenderingServer
+# never parses `shader_set_code`, so nothing shorter than an actual GPU context can confirm compilation; this lints
+# the RULE the parser enforces). Returns the OFFENDING varying names; empty ⇒ no cross-stage reassignment found.
+static func lint_varying_stage_conflicts(code: String) -> PackedStringArray:
+	var violations := PackedStringArray()
+	var varying_re := RegEx.new()
+	varying_re.compile("varying\\s+\\w+\\s+(\\w+)\\s*;")
+	var names: Dictionary = {}
+	for m in varying_re.search_all(code):
+		names[m.get_string(1)] = true
+	var vert_body := _extract_fn_body(code, "vertex")
+	var non_vert_body := _extract_fn_body(code, "fragment") + "\n" + _extract_fn_body(code, "light")
+	for vname in names.keys():
+		var assign_re := RegEx.new()
+		assign_re.compile("\\b" + String(vname) + "\\s*=(?!=)")
+		if assign_re.search(vert_body) != null and assign_re.search(non_vert_body) != null:
+			violations.append(vname)
+	return violations
+
+## Brace-matched extraction of `void <fn_name>() { ... }`'s body from a shader source string. Empty string if the
+## function isn't declared at all (a variant with no `light()`, say) — never an error, just nothing to scan.
+static func _extract_fn_body(code: String, fn_name: String) -> String:
+	var idx := code.find("void " + fn_name + "()")
+	if idx < 0:
+		return ""
+	var brace_start := code.find("{", idx)
+	if brace_start < 0:
+		return ""
+	var depth := 0
+	var i := brace_start
+	while i < code.length():
+		var c := code[i]
+		if c == "{":
+			depth += 1
+		elif c == "}":
+			depth -= 1
+			if depth == 0:
+				return code.substr(brace_start + 1, i - brace_start - 1)
+		i += 1
+	return code.substr(brace_start + 1)
+
+# REVISION 4 G-SLOT-DECODE: pure-GDScript mirrors of the GLSL `_slot_indirect` decode — the headless proxy for a
+# fragment-side `texelFetch` address (no GPU context runs headless). `slot_indirect_decode` mirrors the FIXED,
+# rounded decode (`int(fid + 0.5)` then `%`/`/`); `slot_indirect_decode_naive` mirrors the ORIGINAL, un-rounded Q2
+# decode (`mod`/`floor` straight off the float) so a gate can demonstrate the truncation defect it replaces.
+static func slot_indirect_decode(fid: float, w: int) -> Vector2i:
+	var f := int(fid + 0.5)
+	return Vector2i(f % w, int(f / w))
+static func slot_indirect_decode_naive(fid: float, w: int) -> Vector2i:
+	var fx: float = fmod(fid, float(w))
+	var fy: float = floor(fid / float(w))
+	return Vector2i(int(fx), int(fy))
 
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —

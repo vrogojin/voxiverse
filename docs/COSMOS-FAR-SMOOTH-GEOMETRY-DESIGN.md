@@ -725,3 +725,186 @@ this revision — T1 removes its mesh-concat half only; the bake half stays on �
 (ENV_FINE_MULT 4→2, crescent-incremental, C++ port). And the whole-planet skin sweeps mean the
 planet repaints for minutes regardless — Q2 makes that cheap and Q3 makes it bounded and visible in
 telemetry, but only the C++ fine bake makes it short.
+
+---
+
+# REVISION 4 — live triage: white far (Q2 shader parse-kill), no rest fixpoint, night lighting (2026-08-04, Fable)
+
+Three live failures against the REV3 ship, all root-caused to exact lines. All file refs are
+`godot/src/world/…` in worktree `deploy-cheats` unless stated.
+
+## R4.1 Problem 0 (TOP): far terrain renders solid WHITE — Q2's splice KILLS the whole far shader
+
+**Root cause — the Q2 fragment splice is ILLEGAL Godot shader language; the entire assembled
+far-ring shader fails to PARSE on any real renderer, and the far ring falls back to the engine's
+default (white, unshaded-by-our-law) material.**
+
+- `_apply_slot_indirect` (facet_far_ring.gd:3959-3978) inserts, at the top of `void fragment()`,
+  `v_slot = _slot_indirect(v_slot);` / `v_bslot = _slot_indirect(v_bslot);` (lines 3972-3976).
+- `v_slot` and `v_bslot` are **varyings assigned in `vertex()`**: `v_slot = UV2.y;`
+  (facet_far_ring.gd:3636) and `v_bslot = UV2.y;` (3755, 3868, 3874).
+- Godot forbids exactly this. Engine source (the custom 4.4.1 tree we ship,
+  `docker/engine/cache/godot/servers/rendering/shader_language.cpp:5365-5369`,
+  `_validate_varying_assign`): a varying with `STAGE_VERTEX` assigned in `fragment` is a hard
+  parse error — *"Varyings which assigned in 'vertex' function may not be reassigned in
+  'fragment' or 'light'."*
+- Consequence live (GL compatibility/ANGLE): `shader_set_code` parse fails → the ShaderMaterial is
+  invalid → the MeshInstance renders with the renderer's default fallback material — **white
+  albedo, vertex COLOR ignored, and every in-shader law dead**: the `v_st` day/night/terminator
+  shade, FP_SHADE_UNIFIED/voxi_shade, FP_SMOOTH_NORMAL_LIT, the band/fine/flat-colour skin
+  sampling. That is the observed picture in one stroke: far = uniform light-grey/white on
+  non-snow terrain, in daylight AND at night, while the near (its own separate materials) stays
+  correct. The smooth tiles share this ONE material (`setup_instance` passes
+  `_mi.material_override` through), so they are equally white.
+- **Why every gate was green:** headless runs the DUMMY RenderingServer — `shader_set_code`
+  stores the string and never parses. The Q2 gate (`verify_far_smooth.gd`
+  `_gate_slot_indirect_shader`) is a golden-STRING pin; string equality can never see a
+  stage-rule violation. On a live browser the error IS printed to the JS console — nobody was
+  looking for it.
+
+Secondary latent defects in the same splice (fix while in there):
+- **Truncation decode:** `_SLOT_INDIRECT_UNIFORMS` (3950-3957) computes
+  `int(mod(fid, w))`/`int(floor(fid / w))` with NO rounding. A varying, even one constant across
+  a triangle, is reconstructed per-fragment by barycentric interpolation — at fid≈3455 a
+  few-ulp undershoot (3454.9997) flips both the `mod` and the row → wrong texel. Every shipped
+  decoder in this family already rounds (`int(v_bslot + 0.5)`, 3698/3722); Q2's doesn't.
+- The comment's fear of vertex-stage texture fetch (3942-3944) is unfounded on our target:
+  WebGL2/GLES3.0 mandates `MAX_VERTEX_TEXTURE_IMAGE_UNITS ≥ 16`. There is no reason to resolve
+  in fragment at all.
+
+**Fix (Q2', flag-gated same FP_SLOT_INDIRECT — replaces the broken splice):** resolve in the
+**vertex stage**, where assigning the varying is legal and the fid is exact:
+- Splice targets the VERTEX assignments instead of `fragment()`:
+  `v_slot = UV2.y;` → `v_slot = _slot_indirect(UV2.y);` (and the `v_bslot` twins; when both
+  exist they share one fetch). Fragment code is untouched — the varying now carries the
+  *resolved slot* (small magnitude, and downstream already decodes with `int(x + 0.5)`).
+- Integer-exact decode with rounding:
+  `int f = int(fid + 0.5); int w = int(slot_map_w + 0.5); texelFetch(slot_map, ivec2(f % w, f / w), 0).r;`
+  plus a defensive `if (fid < 0.0) return -1.0;`.
+- LAW S is preserved: a slot-map change still touches only the lookup texture
+  (`_push_slot_indirect`), and the vertex stage re-reads it every frame — no re-emit, ever.
+- Rollback lever (if anything still looks off live): export with FP_SLOT_INDIRECT **off** —
+  UV2.y carries the REV2 baked slot again (correct colours at the cost of slot-change re-emits).
+
+## R4.2 Problem 1: the far ring never quiesces at rest (sh_reemit climbs, sh_build true, ~30 fps)
+
+**Root cause — two convergence predicates disagree with the ONE emit predicate, so the "settled"
+fixpoint does not EXIST; the ring re-emits forever.** The emit law excludes smooth-resident
+facets (`visible_fids()`, facet_far_ring.gd:2236: skip when
+`_smooth.is_resident(fid) and not _smooth_leaving.has(fid)`). Two drivers never adopted that law:
+
+1. **`_noblack_guarantee` — a `_pending = true` EVERY frame.** facet_far_ring.gd:1241:
+   `if built_now or new_unsink != _noblack_unsink_fid or not _emitted.has(fid): _pending = true`.
+   Under FP_SMOOTH_RIM the ACTIVE facet is S2 smooth-resident → permanently excluded from every
+   emit → `_emitted.has(fid)` is false after every commit → `_pending` re-arms each frame → a
+   continuous `_begin_rebuild` train (`sh_reemit` climbing, `sh_build` true, one whole-front
+   worker build + main-thread `_swap_in_arrays` mesh upload per cycle = the 60-100 ms frames and
+   the ~10/s hitch counter). Two subsystems each enforce a private invariant — never-black says
+   "active must be in the emitted set", the exclusion law says "a smooth-resident facet never
+   is" — and the composition has no fixpoint.
+2. **`_surface_converge_emit`'s env loop — a dispatch every ENV_RESUME_MS (300 ms) forever.**
+   facet_far_ring.gd:1179-1189: `remaining = _count_uncached_visible(p)`; converged only at
+   `remaining == 0`. But `_count_uncached_visible` (1332-1352) has NO smooth exclusion, while
+   the worker only warms fids in `_async_fids = visible_fids(...)` (1416) — which excludes them
+   (2236). Worse, the smooth hop-ring (S3 = hops 1-2) coincides with the FP_MID_DENSE ring-2
+   disc (`_recompute_mid_dense`, 2083-2108), so those facets are DENSE targets
+   (`_dense_warm`, 1696-1699) counted by `_benv_done` — which can never be set for them.
+   `remaining > 0` forever → `_srf_converged` never latches → the idle short-circuit (1167,
+   1191) never engages.
+
+**`setpoint_ms: 31.5` is a misread, not a cost.** stream_load_controller.gd:136-139: the
+telemetry field is the ADAPTIVE overload *threshold* = `floor_p10 × CTRL_ADAPTIVE_MARGIN (2.0)`.
+31.5 means the churn degraded the client's own p10 frame floor to ~15.7 ms and the adaptive law
+then legitimized ~31 ms frames (never flags overload, never sheds). The controller's per-tick
+cost is a bounded window sort — trivial. It is a *symptom amplifier* (it chases the degraded
+floor), and it recovers by itself once the ring quiesces. No controller change.
+
+**Fix (FP_RING_QUIESCE, default off = byte-identical): ONE emit-role predicate, used by
+everything that reasons about the emitted set.**
+- Factor `_smooth_covered(fid) := _smooth != null and _smooth.is_resident(fid)
+  and not _smooth_leaving.has(fid)` out of visible_fids:2236 (single definition).
+- `_noblack_guarantee`: a smooth-covered active facet counts as DRAWN — the committed S2 tile IS
+  the opaque cover, strictly better than the sunk backstop. Condition becomes
+  `… or (not _emitted.has(fid) and not _smooth_covered(fid))`; also skip the chord build and
+  the unsink probe while covered. (The never-black invariant is *"active facet is covered by
+  shell OR smooth"*, not "by shell".)
+- `_count_uncached_visible` / `_count_uncovered_visible`: `continue` on `_smooth_covered(fid)` —
+  the counter counts exactly what the emit can serve, nothing else.
+- Result at rest: `remaining` reaches 0, `_srf_converged`/`_orbit_converged` latch, `_pending`
+  stays false, per-frame far-ring cost = the Q1 idle-signature check + two dict probes ≈ 0.
+  The REAL invariant of the brief holds: zero `_rebuild_full`/`_dispatch_async_rebuild`/
+  `set_pending(true)` calls after settle.
+
+## R4.3 Problem 2: far bright at night while near goes dark
+
+Layered — fix in this order:
+- **C-1 (dominant, live): identical root cause to R4.1.** With the shader parse-dead, the far
+  ring ignores `sun_dir`/`night_floor` entirely (the default fallback material knows nothing of
+  our sun) → white AND full-bright at night. Fixing R4.1 restores `voxi_shade` (voxi_light.gd:
+  50-55) whose near/far parity at the same world point is already proven by construction
+  (G-VL-EQ) — the far snow goes dark exactly as the near does, and the orbit view keeps the lit
+  hemisphere + terminator (same radial law at every altitude; the regime needs NO altitude
+  switch — FP_SHELL_ABSOLUTE's in-shader law is correct at the surface too, that was V1's
+  whole point).
+- **C-2 (residual, only if FP_SMOOTH_NORMAL_LIT is in the live export):**
+  `_apply_smooth_normal_lit` (facet_far_ring.gd:3927-3932) substitutes the RELIEF normal into
+  the ONE `mu = dot(n, sun_dir)` that voxi_shade uses for BOTH the day/night/terminator gate AND
+  slope shading. At night the sun is below the *radial* horizon (near blocks: dark, they key off
+  the planet-radial normal via `planet_centre`), but a smooth-tile slope tilted toward the sun's
+  azimuth still gets `mu > 0` → day-lit patches at night, and a shifted terminator on relief.
+  **Fix: a two-normal law** `voxi_shade_rel(up, n_rel, sd)`: shade/tint/night-floor from
+  `mu_up = dot(up, sd)` (byte-identical to the near law), relief only as a bounded, DAY-GATED
+  modulation `rel = mix(1.0, clamp(dot(n_rel,sd)/max(mu_up,ε), REL_MIN, REL_MAX), _day(mu_up))`
+  multiplied into the result. At night `rel → 1` ⇒ far ≡ near exactly; from orbit the
+  terminator is untouched (radial gate unchanged) — the altitude-dependence the brief asks for
+  falls out with zero regime switch. Splice change: keep `n` radial always; pass the relief
+  normal as the SECOND argument in the COLOR.a branch instead of replacing `n`.
+
+## R4.4 Gates — what would have caught each of these headless
+
+- **G-FS-VARY-STAGE (new, headless, catches R4.1's whole class).** For EVERY shader string the
+  material factory can assemble (all flag combinations of `_make_material`'s splice chain),
+  brace-scan the `vertex()` and `fragment()` bodies and assert **no declared varying is assigned
+  in both**. Pure GDScript string analysis — runs on the dummy renderer. Golden-string equality
+  pins content; this pins LEGALITY.
+- **G-FS-SHADER-COMPILE (Tier A, native).** Instantiate every assembled material under the real
+  GL renderer (the Xvfb+llvmpipe harness, memory `voxiverse-gpu-headless-testing`) and assert
+  zero shader errors in the engine log. `--headless` can NEVER do this (dummy RS does not
+  parse) — that is exactly how Q2 shipped gate-green. Until Tier A is wired, the cheap live
+  check is: open the browser console; the parse error is printed verbatim.
+- **G-SLOT-DECODE (headless).** GDScript twin of the GLSL decode: for fid 0..3455 AND fid±0.49
+  perturbations, assert `round-then-%/÷` returns (fid % 64, fid ∕ 64) exactly, and the texel
+  round-trips `_live_slot_of(fid)` through `_slot_img`.
+- **G-FS-QUIESCE-RING (new, replaces G-FS-QUIESCE's blind spot).** REV3's gate counted the
+  SMOOTH DRIVER's counters (request()/_snap_plan, baker wants) — the shell emit path and the
+  noblack/env counters were out of scope, which is precisely where the loop lived. New gate, on
+  a real FacetFarRing at a fixed active facet with forced S2+S3 smooth residency and env caches
+  driven to the fixpoint: settle, then over N=240 frames assert **zero delta** on
+  `_begin_rebuild_count`, `_reemit_count`, `_shell_gen`, `sh_pend == false` every frame, AND
+  `_count_uncached_visible(p) == 0` (the fixpoint EXISTS — this single assert was the missing
+  one). Falsification: force FP_RING_QUIESCE off and assert `_begin_rebuild_count` CLIMBS under
+  the identical scenario (the shipped bug reproduces — non-vacuous). Headless measures CALL
+  COUNTS, never fps — per the brief. Standing live check: `sh_reemit` delta/minute ≈ 0 at rest
+  in the remote-bridge telemetry.
+- **G-FS-NIGHT-PARITY (headless, for C-2).** Numeric sweep on the GDScript twins: for all
+  `mu_up ≤ −term_mu` and a fan of relief normals (incl. steep sun-azimuth-facing),
+  `shade_tint_rel(up, n_rel, sd) == shade_tint(up, sd)` exactly; plus a shader-string assert
+  that the `_day(`/night gate consumes the RADIAL-derived mu (the `normalize(wp - centre)` term
+  must remain voxi_shade's first argument in the spliced smooth branch).
+
+## R4.5 Staged plan + verdict
+
+| Stage | Content | Flag | Gate |
+|---|---|---|---|
+| A (ship first) | Q2' vertex-stage slot resolve + rounded decode | FP_SLOT_INDIRECT (fixed impl) | G-FS-VARY-STAGE + G-SLOT-DECODE (+ live console check) |
+| B | ring quiescence: `_smooth_covered` predicate into noblack + the two counters | FP_RING_QUIESCE | G-FS-QUIESCE-RING (falsified both ways) |
+| C (only if night-glow persists after A is live-verified and FP_SMOOTH_NORMAL_LIT is on) | two-normal `voxi_shade_rel` | FP_SMOOTH_NORMAL_LIT (fixed impl) | G-FS-NIGHT-PARITY |
+
+**Verdict: GREEN for A and B, YELLOW for C.** A is proven from engine source (a parse-rule
+violation, deterministic); B is a structural predicate mismatch whose fix re-uses the already-
+shipped idle machinery (`_srf_converged`/Q1) — both are surgical, no redesign. C is conditional:
+C-1 is expected to vanish with A (verify live at night BEFORE writing C's code); C-2's fix is
+designed and orbit-safe by construction but should not ship blind. Meta-lesson, stated once: a
+quiescence gate must assert that the **fixpoint exists** (the convergence counter reaches zero
+under the same predicate the emitter uses) and a shader gate must assert **legality on a real
+parser**, not string identity — both failures were gate-shaped, not code-shaped.

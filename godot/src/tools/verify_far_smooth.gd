@@ -160,6 +160,15 @@ func _initialize() -> void:
 	_gate_fs_quiesce_weld_refresh()
 	_gate_fs_nohole_weld_refresh()
 
+	# --- REVISION 4 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 4 — live triage: white far (Q2 shader
+	# parse-kill), no rest fixpoint, night lighting"). Stage A: Q2' vertex-stage slot resolve (fixes the shader PARSE
+	# ERROR the old fragment splice caused) + rounded decode. Stage B: FP_RING_QUIESCE (the shell's own emit/count
+	# fixpoint at rest). Stage C (night-lighting residual) is NOT in scope here — conditional on a live re-check.
+	_ok(not CubeSphere.FP_RING_QUIESCE, "G-R4-OFF: FP_RING_QUIESCE defaults false (byte-off; _noblack_guarantee/the two counters keep the shipped un-excluded checks)")
+	_gate_vary_stage()
+	_gate_slot_decode()
+	_gate_quiesce_ring()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1971,3 +1980,217 @@ func _gate_fs_nohole_weld_refresh() -> void:
 				break
 	_ok(fid_c_rebuilt, "G-FS-NOHOLE (T1+T3): fid_c's queued reweld actually commits (its geometry changes) by the end of the churn")
 	parent.free()
+
+# =====================================================================================================================
+# REVISION 4 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 4" — live triage: white far (Q2 shader parse-kill),
+# no rest fixpoint, night lighting). Stage A ships Q2' (vertex-stage slot resolve, fixes the shader PARSE ERROR the
+# old fragment splice caused) + the rounded decode. Stage B ships FP_RING_QUIESCE (the shell's own emit/count
+# fixpoint at rest). Stage C (night-lighting residual, FP_SMOOTH_NORMAL_LIT's two-normal law) is NOT in this scope —
+# conditional on a live re-check after Stage A ships, per R4.5.
+# =====================================================================================================================
+
+## The ORIGINAL (broken) Q2 fragment splice, reproduced INLINE here for G-FS-VARY-STAGE's falsification half only —
+## it is NOT restored to shipped source (facet_far_ring.gd's `_apply_slot_indirect` is the FIXED Q2' vertex-stage
+## splice now). Mirrors the pre-fix code exactly: injects `v_slot = _slot_indirect(v_slot);` / `v_bslot = ...` (or
+## the shared-fetch form when both exist) at the TOP of `void fragment() {` — reassigning a varying `vertex()`
+## already assigned, the exact pattern Godot's shader compiler rejects (R4.1).
+func _broken_splice_for_gate(code: String) -> String:
+	var has_slot := code.find("varying float v_slot;") >= 0
+	var has_bslot := code.find("varying float v_bslot;") >= 0
+	if not has_slot and not has_bslot:
+		return code
+	code = code.replace(
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + FacetFarRing._SLOT_INDIRECT_UNIFORMS)
+	var resolve := ""
+	if has_slot and has_bslot:
+		resolve = "\tfloat _rs = _slot_indirect(v_slot);\n\tv_slot = _rs;\n\tv_bslot = _rs;\n"
+	elif has_slot:
+		resolve = "\tv_slot = _slot_indirect(v_slot);\n"
+	else:
+		resolve = "\tv_bslot = _slot_indirect(v_bslot);\n"
+	return code.replace("void fragment() {\n", "void fragment() {\n" + resolve)
+
+## G-FS-VARY-STAGE (Stage A, catches R4.1's whole class): assemble the far-ring shader string for every reachable
+## flag-combination variant (the same base fixtures `_gate_slot_indirect_shader` uses — the only ones this harness
+## can produce a genuine v_slot/v_bslot fixture for without a compile-time sed, per that gate's own note — crossed
+## with FP_SHADE_UNIFIED/FP_SMOOTH_NORMAL_LIT each forced on/off, since both accept the SAME gate-forcing override
+## params `_apply_slot_indirect` itself uses) and LINT it: no declared varying may be assigned in both `vertex()`
+## and `fragment()`/`light()` (Godot's own parse rule, R4.1). Non-vacuous: the ORIGINAL (pre-fix) fragment splice,
+## reproduced inline above, DOES violate this on every variant that actually declares v_slot/v_bslot — proving the
+## lint has teeth. This is the headless PROXY for a real GLSL parse (the dummy RenderingServer never parses
+## `shader_set_code` — see G-FS-SHADER-COMPILE / R4.4's note; only a live browser or a real GPU context confirms
+## compilation).
+func _gate_vary_stage() -> void:
+	print("  --- REVISION 4 G-FS-VARY-STAGE (Stage A): no varying assigned in both vertex() and fragment()/light() ---")
+	var base_variants := [
+		["_SHELL_ABS_SHADER (no UV2 at all)", FacetFarRing._SHELL_ABS_SHADER],
+		["base tex, no CU/no band", FacetFarRing.gate_tex_shader_raw(false)],
+		["CU tex (v_slot only)", FacetFarRing.gate_tex_shader_raw(true)],
+		["flatcolor on base tex (v_bslot only)", FacetFarRing._apply_flatcolor(FacetFarRing._SHELL_ABS_TEX_SHADER)],
+		["flatcolor on CU tex (v_slot + v_bslot)", FacetFarRing._apply_flatcolor(FacetFarRing._SHELL_ABS_TEX_CU_SHADER)],
+	]
+	# Broaden to "every flag combination" as far as this harness can force without a compile-time sed: cross each
+	# base variant with FP_SHADE_UNIFIED / FP_SMOOTH_NORMAL_LIT each forced on/off.
+	var variants := []
+	for pair in base_variants:
+		var name0: String = pair[0]
+		var code0: String = pair[1]
+		for unified in [false, true]:
+			for lit in [false, true]:
+				var code := FacetFarRing._apply_shade_unified(code0, unified)
+				code = FacetFarRing._apply_smooth_normal_lit(code, lit)
+				variants.append(["%s [shade_unified=%s, normal_lit=%s]" % [name0, unified, lit], code])
+
+	var checked := 0
+	for pair in variants:
+		var name: String = pair[0]
+		var code: String = pair[1]
+		checked += 1
+		var fixed_code := FacetFarRing._apply_slot_indirect(code, true)
+		var viol := FacetFarRing.lint_varying_stage_conflicts(fixed_code)
+		_ok(viol.is_empty(), "G-FS-VARY-STAGE: %s — the FIXED Q2' splice has NO varying assigned in both vertex() and fragment()/light() (found: %s)" % [name, str(viol)])
+	_ok(checked > 0, "G-FS-VARY-STAGE: checked a non-empty variant set (%d variants)" % checked)
+
+	# --- Non-vacuous: the ORIGINAL (pre-fix) fragment splice DOES violate the rule on every variant that actually
+	# declares v_slot/v_bslot (variants with neither are an inert no-op splice either way — nothing to violate). ---
+	var saw_violation := false
+	var slot_variant_count := 0
+	for pair in variants:
+		var name: String = pair[0]
+		var code: String = pair[1]
+		if code.find("varying float v_slot;") < 0 and code.find("varying float v_bslot;") < 0:
+			continue
+		slot_variant_count += 1
+		var broken_code := _broken_splice_for_gate(code)
+		var viol := FacetFarRing.lint_varying_stage_conflicts(broken_code)
+		if not viol.is_empty():
+			saw_violation = true
+		_ok(not viol.is_empty(), "G-FS-VARY-STAGE-FALSIFY: %s — the ORIGINAL (pre-fix) fragment splice DOES reassign a vertex-assigned varying (%s) — the lint has teeth" % [name, str(viol)])
+	_ok(slot_variant_count > 0, "G-FS-VARY-STAGE-FALSIFY: at least one variant actually declares v_slot/v_bslot (non-vacuous fixture)")
+	_ok(saw_violation, "G-FS-VARY-STAGE-FALSIFY: the pre-fix defect reproduces on at least one real variant")
+
+	# Flag-off byte-identity: the lint finds nothing wrong in the shipped (flag-off, un-spliced) shader sources either.
+	for pair in base_variants:
+		var name: String = pair[0]
+		var code: String = pair[1]
+		var viol := FacetFarRing.lint_varying_stage_conflicts(code)
+		_ok(viol.is_empty(), "G-FS-VARY-STAGE: %s — the shipped (flag-off) shader source has no cross-stage varying conflict on its own" % name)
+
+## G-SLOT-DECODE (Stage A secondary defect): pure-GDScript sweep of the FIXED `_slot_indirect` decode (the headless
+## mirror — no GLSL runs headless) across fid 0..facet_count()-1, perturbed by ±0.49 (the worst-case barycentric
+## drift a constant-across-the-triangle varying could show), asserting it maps to the EXACT (fid % w, fid / w) texel
+## `_push_slot_indirect` wrote that fid's slot at — no rounding-boundary off-by-one. Non-vacuous: the ORIGINAL
+## (un-rounded `mod`/`floor`) decode gets a row-boundary fid WRONG under a downward perturbation — the exact
+## truncation defect R4.1 root-caused in `_SLOT_INDIRECT_UNIFORMS`.
+func _gate_slot_decode() -> void:
+	print("  --- REVISION 4 G-SLOT-DECODE: rounded, integer-exact _slot_indirect decode (headless GLSL mirror) ---")
+	var w := FacetFarRing.SLOT_TEX_W
+	var n := FA.facet_count()
+	var checked := 0
+	var all_ok := true
+	for fid in range(n):
+		for delta in [0.0, 0.49, -0.49]:
+			var raw: float = float(fid) + float(delta)
+			if raw < 0.0:
+				continue   # the sentinel domain (fid < 0 ⇒ "no slot") — not the col/row decode this gate scopes to
+			var got := FacetFarRing.slot_indirect_decode(raw, w)
+			var want := Vector2i(fid % w, fid / w)
+			checked += 1
+			if got != want:
+				all_ok = false
+	_ok(checked > 0, "G-SLOT-DECODE: swept a non-empty fid × perturbation range (%d checks, facet_count=%d)" % [checked, n])
+	_ok(all_ok, "G-SLOT-DECODE: the FIXED rounded decode maps every fid±0.49 in 0..%d to its exact (fid %% %d, fid / %d) texel — no boundary off-by-one" % [n - 1, w, w])
+
+	# Non-vacuous: the ORIGINAL un-rounded decode gets a ROW-BOUNDARY fid wrong under a downward perturbation.
+	var boundary_fid := w   # fid = SLOT_TEX_W (=64 at K=24) — the first row boundary; well inside facet_count for any real K
+	_ok(boundary_fid < n, "G-SLOT-DECODE fixture: SLOT_TEX_W(%d) < facet_count()(%d) — the boundary fixture is in-range" % [boundary_fid, n])
+	if boundary_fid < n:
+		var want_boundary := Vector2i(boundary_fid % w, boundary_fid / w)
+		var naive_at_boundary := FacetFarRing.slot_indirect_decode_naive(float(boundary_fid) - 0.49, w)
+		_ok(naive_at_boundary != want_boundary, "G-SLOT-DECODE-FALSIFY: the ORIGINAL un-rounded decode (mod/floor, no +0.5) gets fid=%d-0.49 WRONG (%s, expected %s) — the truncation defect this fix replaces" % [boundary_fid, str(naive_at_boundary), str(want_boundary)])
+		var fixed_at_boundary := FacetFarRing.slot_indirect_decode(float(boundary_fid) - 0.49, w)
+		_ok(fixed_at_boundary == want_boundary, "G-SLOT-DECODE: the FIXED decode gets the SAME boundary fixture exactly right (%s)" % str(fixed_at_boundary))
+
+## G-FS-QUIESCE-RING (Stage B, catches R4.2's whole class — the fixpoint REV3's G-FS-QUIESCE gate missed: it only
+## counted the SMOOTH DRIVER's own counters, never the shell's emit/count path where the loop actually lived). Drives
+## a REAL FacetFarRing to the exact live scenario: the ACTIVE facet forced S2-smooth-resident (what FP_SMOOTH_RIM
+## does live) while `FacetFarRing.setup()`'s OWN initial synchronous `_rebuild_full()` has already warmed every
+## OTHER front-visible facet's shell cache — the active facet's cache is the ONE thing nothing in shipped code ever
+## builds (the near voxel world owns it on the plain surface regime). Switches the ring into the camera-set/orbit
+## cull regime (`_cam_set`, same axis+threshold `setup()`'s own build used) so the active facet is actually counted
+## by `_front_visible`/the two counters — on the plain surface regime with FP_FARRING_FULL_COVER off it is
+## unconditionally excluded from the far ring's bookkeeping altogether, which would make this scenario unreachable
+## without a compile-time sed of FULL_COVER (this harness runs with FACETED only, matching every other gate in this
+## file). Falsifies FP_RING_QUIESCE off (the counter never reaches 0; `_begin_rebuild_count` climbs over 240 frames
+## — the shipped endless re-emit train reproduces) THEN proves the fix (the counter reaches 0 — the fixpoint EXISTS
+## under the emit predicate — and a real 240-frame settle window does ZERO further rebuild/re-emit/pending work).
+func _gate_quiesce_ring() -> void:
+	print("  --- REVISION 4 G-FS-QUIESCE-RING (Stage B, FP_RING_QUIESCE): the shell's own emit/count fixpoint at rest ---")
+	var fid_a := _fid_of(2, 10, 10)
+	var ring := FacetFarRing.new()
+	ring.setup(fid_a)   # ALSO runs the initial synchronous _rebuild_full() — warms every front-visible facet's cache
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+
+	# Switch to the camera-set/orbit cull regime with the SAME axis+threshold setup()'s own build used, so the
+	# already-warmed cache set is unaffected by the switch — only the active facet's own front-visibility changes.
+	ring._emit_axis = FA.facet_normal64(fid_a)
+	ring._emit_cos = FacetFarRing.BACK_CULL
+	ring._cam_set = true
+	ring._emit_floored_last = false
+	var p := ring._cull_params()
+
+	# Warm-up: converge the P1 smooth driver so the ACTIVE facet becomes S2-smooth-resident. `rim_on` (the 3rd arg)
+	# MUST be forced true here — the sticky hop ladder (`_smooth_hop_assignment`) never assigns the active facet a
+	# tier at all (it starts the BFS FROM active, tiering only its NEIGHBOURS); the active facet's OWN S2 residency
+	# comes exclusively from `_rim_assign` (FP_SMOOTH_RIM, P3's near-collar), which is what reproduces the exact
+	# live R4.2 scenario ("under FP_SMOOTH_RIM the ACTIVE facet is S2 smooth-resident").
+	var iters := 0
+	while iters < 20000 and not ring._smooth.is_settled():
+		ring._smooth_drive(true, true, true, true, false)
+		iters += 1
+	_ok(ring._smooth.is_settled(), "G-FS-QUIESCE-RING warm-up: the smooth driver reaches settled (%d iterations)" % iters)
+	_ok(ring._smooth.is_resident(fid_a), "G-FS-QUIESCE-RING warm-up: the ACTIVE facet is S2-smooth-resident (the exact R4.2 live scenario, non-vacuous)")
+	_ok(ring._smooth.resident_count() > 1, "G-FS-QUIESCE-RING warm-up: at least one OTHER facet is also smooth-resident (a real S2+S3-scale ladder, non-vacuous)")
+	_ok(ring._smooth_covered(fid_a), "G-FS-QUIESCE-RING warm-up: the shared `_smooth_covered` predicate agrees the active facet is covered")
+	_ok(not ring._pos_cache.has(fid_a), "G-FS-QUIESCE-RING warm-up: the active facet's shell cache was never warmed (nothing in shipped code ever builds it) — the exact gap the OLD counting law never excluded")
+
+	# --- (A) FALSIFY: FP_RING_QUIESCE forced OFF — the shipped counting/re-arm law reproduces: no fixpoint. ---
+	var remaining_off := ring._count_uncached_visible(p, false)
+	_ok(remaining_off > 0, "G-FS-QUIESCE-RING-FALSIFY: WITHOUT the fix, _count_uncached_visible(p) counts the smooth-covered active facet as still needing a cache (remaining=%d) — never reaches 0" % remaining_off)
+	var begin_before_off: int = ring._begin_rebuild_count
+	for i in range(240):
+		ring._noblack_guarantee(p, false, true)   # noblack_on forced true — reproduces the live FP_FARRING_ACTIVE_NOBLACK+FULL_COVER deploy config
+		ring._orbit_warm_async(p, false)
+	var begin_after_off: int = ring._begin_rebuild_count
+	_ok(begin_after_off > begin_before_off, "G-FS-QUIESCE-RING-FALSIFY: WITHOUT the fix, the IDENTICAL smooth-covered scenario CLIMBS _begin_rebuild_count over 240 frames (%d -> %d) — the shipped endless re-emit train reproduces" % [begin_before_off, begin_after_off])
+
+	# --- (B) WITH the fix: the counter reaches 0 (the fixpoint EXISTS under the emit predicate), THEN a real
+	# 240-frame settle window does ZERO further rebuild/re-emit/pending work. ---
+	var remaining_on := ring._count_uncached_visible(p, true)
+	_ok(remaining_on == 0, "G-FS-QUIESCE-RING: _count_uncached_visible(p) reaches 0 under FP_RING_QUIESCE with the active facet smooth-covered (the fixpoint EXISTS under the emit predicate)")
+	_ok(ring._count_uncovered_visible(p, true) == 0, "G-FS-QUIESCE-RING: _count_uncovered_visible(p) also reaches 0 under FP_RING_QUIESCE")
+
+	# Prime once (drains any leftover pending/first-engage transient left over from the (A) falsify run above), then
+	# measure a REAL 240-frame settle window from a clean baseline.
+	ring._noblack_guarantee(p, true, true)
+	ring._orbit_warm_async(p, true)
+	var begin0: int = ring._begin_rebuild_count
+	var reemit0: int = ring._reemit_count
+	var gen0: int = ring._shell_gen
+	var pend_ever_true := false
+	for i in range(240):
+		ring._noblack_guarantee(p, true, true)
+		ring._orbit_warm_async(p, true)
+		if ring._pending:
+			pend_ever_true = true
+	var begin1: int = ring._begin_rebuild_count
+	var reemit1: int = ring._reemit_count
+	var gen1: int = ring._shell_gen
+	_ok(begin1 == begin0, "G-FS-QUIESCE-RING: ZERO _begin_rebuild_count delta over 240 settled frames (%d -> %d)" % [begin0, begin1])
+	_ok(reemit1 == reemit0, "G-FS-QUIESCE-RING: ZERO _reemit_count delta over 240 settled frames (%d -> %d)" % [reemit0, reemit1])
+	_ok(gen1 == gen0, "G-FS-QUIESCE-RING: ZERO _shell_gen delta over 240 settled frames (%d -> %d)" % [gen0, gen1])
+	_ok(not pend_ever_true, "G-FS-QUIESCE-RING: `_pending` (sh_pend) never flips true across any of the 240 settled frames")
+	_ok(ring._count_uncached_visible(p, true) == 0, "G-FS-QUIESCE-RING: _count_uncached_visible(p) still 0 after the settle window (the fixpoint holds)")
+	ring.free()

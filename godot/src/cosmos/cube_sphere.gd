@@ -772,6 +772,25 @@ const FP_SMOOTH_IDLE := false
 ##   drop test even though it still bumps `_shell_gen` on commit. Off ⇒ `_snap_gen`/`_last_committed_snap_gen` stay
 ##   unused and `_mesh_inc_gate` runs the shipped `_shell_gen`-at-mark law verbatim (byte-identical).
 const FP_SHELL_SNAP_GEN := false
+## FP_SMOOTH_TXN (LAW T, R3.4 T1): transactional tier-mesh commits. The shipped `FacetSmoothTier.step()` dirties
+##   BOTH tier meshes of a tier-change commit in the SAME call (`request`/reap-commit) but rebuilds AT MOST ONE dirty
+##   tier per call, in fixed order [S2,S3,S4,S5] (`facet_smooth_tier.gd` step()'s tail loop) — a demote's OLD (lower-
+##   index) tier rebuilds first, dropping the facet from a drawn mesh ≥1 frame before its NEW tier gains it (a hole
+##   straight through to the sunk backstop); a promote's NEW (lower-index) tier rebuilds first, ADDING the facet
+##   ≥1 frame before its OLD tier loses it (two different-pitch surfaces drawn at once — z-fight). This flag moves the
+##   per-element index-append concatenation (`_rebuild_tier_mesh`'s O(tier resident count) main-thread loop) onto a
+##   WorkerThreadPool task per dirty tier (`_concat_tier_worker`, mirrors the `_build_worker`/`_s_result` single-writer
+##   discipline) and batches every tier dirtied by the SAME commit event into ONE transaction (`_step_tier_txn`):
+##   the OLD `mi.mesh` for every tier in the transaction is left untouched until ALL of that transaction's worker tasks
+##   have finished, then every affected `mi.mesh` is reassigned in the SAME `step()` call — never a call that swaps
+##   only some of a transaction's tiers. A tier re-dirtied while its transaction's job is still in flight (an unrelated
+##   build lands on the same tier mid-flight) is detected via `_tier_change_seq`/`_tier_dispatch_seq` and re-queued into
+##   the NEXT transaction rather than silently accepted stale. Off ⇒ `step()` takes the shipped ≤1-tier/frame main-
+##   thread `_rebuild_tier_mesh` path verbatim (byte-identical, FLAT 6042/0). Gate: verify_far_smooth.gd (G-FS-NOHOLE
+##   strengthened, G-FS-TXN-THREAD). NEVER-OOM: the in-flight per-tier concat buffer duplicates at most that tier's
+##   ALREADY-resident bytes (already bounded under `SMOOTH_BYTES_MAX`) — freed the instant `_apply_tier_mesh` assigns
+##   it, never a new high-water mark.
+const FP_SMOOTH_TXN := false
 
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing

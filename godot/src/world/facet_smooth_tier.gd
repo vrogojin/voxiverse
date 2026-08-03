@@ -479,6 +479,34 @@ var _s_rim_col: Array = []           # per-slot frozen player-column Vector3 (S2
 var _s_slot: PackedFloat32Array = PackedFloat32Array()   # R-C (FP_SMOOTH_SKIN_SLOT): per-slot frozen UV2.y skin slot
 var _s_mutex: Mutex = null
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): the tier-mesh COMMIT transaction. Off ⇒
+# `step()`'s tail loop rebuilds ≤1 dirty tier per call on MAIN (the shipped `_rebuild_tier_mesh`, R3.2.a's hole/
+# z-fight window). On ⇒ concatenation moves OFF-THREAD (`_concat_tier_worker`, mirrors `_build_worker`/`_s_result`'s
+# single-writer discipline) and EVERY tier dirtied by the same commit event is batched into ONE transaction, applied
+# to every affected MeshInstance in the SAME `step()` call once ALL its worker tasks finish — never a call that swaps
+# only some of a transaction's tiers (LAW T: "if it cannot be afforded this frame, the swap is deferred WHOLE").
+var _txn_active := false
+var _txn_tiers: Array = []                         # tier indices in the in-flight transaction
+var _tier_task: Array = [-1, -1, -1, -1]           # per-tier WorkerThreadPool task id (in-flight concat job), or -1
+var _tier_snapshot: Array = [[], [], [], []]       # per-tier frozen Array[Dictionary] of tile dicts, single-writer:
+                                                    # main writes it once at dispatch, never touches it again until reaped
+var _tier_snapshot_fids: Array = [[], [], [], []]  # per-tier frozen Array[int] of fids, parallel to `_tier_snapshot`
+                                                    # (gate introspection: which fids this tier's in-flight job covers)
+var _tier_result: Array = [null, null, null, null] # worker output (pos/nrm/col/uv/uv2/idx dict), `_tier_mutex`-guarded
+var _tier_mutex: Mutex = null
+var _tier_change_seq: Array = [0, 0, 0, 0]         # bumped whenever a tier is (re-)dirtied — detects a stale in-flight
+                                                    # snapshot (an unrelated commit touched this SAME tier mid-flight)
+var _tier_dispatch_seq: Array = [-1, -1, -1, -1]   # `_tier_change_seq` value snapshotted at this tier's dispatch time
+# Gate introspection (G-FS-NOHOLE strengthened): per-tier fid -> true for exactly what's baked into the CURRENTLY
+# assigned mi.mesh right now — maintained at every actual mesh commit (both the legacy main-thread `_rebuild_tier_mesh`
+# and the T1 off-thread `_apply_tier_mesh`), so a gate can tell a "resident but not yet drawn" (hole) or "drawn by two
+# tiers at once" (z-fight) window apart from mere `_tiles`/`is_resident` bookkeeping (which flips atomically on main
+# already and was never the bug — the DRAWN MESH lagging it across frames was).
+var _committed_fids: Array = [{}, {}, {}, {}]
+var _main_concat_count := 0    # G-FS-TXN-THREAD telemetry: `_rebuild_tier_mesh` (main-thread concat) calls
+var _worker_concat_count := 0  # G-FS-TXN-THREAD telemetry: `_concat_tier_worker` (off-thread concat) calls
+var _txn_apply_count := 0      # G-FS-NOHOLE telemetry: atomic (possibly multi-tier) mesh applies committed
+
 ## Create one MeshInstance3D per ladder tier (S2/S3/S4/S5) under `parent` (inherits the ring's placement transform),
 ## sharing `material`; prewarm the worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one
 ## profile_at_dir) so `build_tile`/`build_tile_rim` are worker-safe. An empty tier's MeshInstance3D carries a
@@ -505,6 +533,7 @@ func setup_instance(parent: Node3D, material: Material) -> void:
 	_s_rim_col.resize(_sn)
 	_s_slot.resize(_sn); _s_slot.fill(-1.0)
 	_s_mutex = Mutex.new()
+	_tier_mutex = Mutex.new()   # REVISION 3 T1 (FP_SMOOTH_TXN): guards `_tier_result`/`_worker_concat_count` writes
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): set the frozen player-column snapshot (ABSOLUTE world
 ## coords) the NEXT `step()` dispatch batch will bake S2 collar tiles against. Called once per frame by the ring's
@@ -568,6 +597,7 @@ func _evict(fid: int) -> void:
 	_tier_of.erase(fid)
 	_refresh.erase(fid)
 	_dirty_tier[t] = true
+	_tier_change_seq[t] = int(_tier_change_seq[t]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 	_changed = true
 	_settled = false   # REVISION 3 Q1: an eviction is state change — step() must scan (and rebuild the dirty tier) again
 
@@ -593,9 +623,10 @@ func request_refresh(fid: int) -> void:
 		_settled = false   # REVISION 3 Q1: a fresh in-place rebake is now wanted — step() must dispatch it
 
 ## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
-## facets, then rebuild AT MOST ONE dirty tier's ArrayMesh this call (the P1 perf fix — replaces the shipped B2
-## O(everything) merged rebuild with an O(that tier's resident set) rebuild, ≤ 3 tier meshes total ⇒ ≤ +3 draws).
-func step(idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
+## facets, then commit dirty tier ArrayMesh(es) — either the shipped ≤1-tier/frame main-thread rebuild, or (REVISION 3
+## T1, FP_SMOOTH_TXN) an atomic off-thread transaction over every tier the reap loop above just dirtied together
+## (`_step_tier_txn`, LAW T: never a call that swaps only some of a multi-tier commit).
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN) -> void:
 	if _sn == 0:
 		return
 	if idle_on and _settled:
@@ -634,6 +665,7 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 				_tier_of[fid] = tier
 				_bytes += tb
 				_dirty_tier[tier] = true
+				_tier_change_seq[tier] = int(_tier_change_seq[tier]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 				_changed = true
 		_s_fid[i] = -1
 		_s_task[i] = -1
@@ -653,11 +685,16 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	for t in [S2, S3, S4, S5]:
-		if _dirty_tier[t]:
-			_rebuild_tier_mesh(t)
-			_dirty_tier[t] = false
-			break   # ≤ 1 tier rebuild/frame (P1 mesh-management requirement)
+	if txn_on:
+		# REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): off-thread, ALL-dirty-tiers-together transactional commit — supersedes
+		# the ≤1-tier/frame main-thread loop below (kept, byte-identical, for the flag-off path).
+		_step_tier_txn()
+	else:
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				_rebuild_tier_mesh(t)
+				_dirty_tier[t] = false
+				break   # ≤ 1 tier rebuild/frame (shipped legacy path — R3.2.a's hole/z-fight window)
 	if idle_on:
 		# REVISION 3 Q1: settled iff no dirty tier remains (this call rebuilds at most one — a 2nd+ dirty tier stays
 		# true), no worker slot is busy (an in-flight build will need reaping later), and nothing wanted-not-resident
@@ -724,7 +761,9 @@ func _build_worker(i: int) -> void:
 	_s_mutex.unlock()
 
 ## Concatenate this tier's resident tiles into ONE ArrayMesh surface (index-offset) — the ONLY tier touched this call.
+## SHIPPED (legacy) MAIN-THREAD path — the R3.2.a hole/z-fight window (kept, byte-identical, for FP_SMOOTH_TXN-off).
 func _rebuild_tier_mesh(tier: int) -> void:
+	_main_concat_count += 1   # REVISION 3 T1 G-FS-TXN-THREAD telemetry: this IS the main-thread concat path
 	var mi: MeshInstance3D = _mi[tier]
 	if mi == null:
 		return
@@ -734,9 +773,11 @@ func _rebuild_tier_mesh(tier: int) -> void:
 	var U := PackedVector2Array()
 	var U2 := PackedVector2Array()
 	var I := PackedInt32Array()
+	var committed := {}
 	for fid in _tiles.keys():
 		if int(_tier_of[fid]) != tier:
 			continue
+		committed[int(fid)] = true
 		var t = _tiles[fid]
 		var base := P.size()
 		P.append_array(t["pos"])
@@ -760,6 +801,125 @@ func _rebuild_tier_mesh(tier: int) -> void:
 		if _material != null:
 			mesh.surface_set_material(0, _material)
 	mi.mesh = mesh
+	_committed_fids[tier] = committed   # gate introspection: exactly what THIS call just baked into mi.mesh
+
+# =====================================================================================================================
+# REVISION 3 T1 (FP_SMOOTH_TXN, LAW T) — the off-thread, atomic multi-tier commit transaction. Supersedes
+# `_rebuild_tier_mesh` above (kept for the flag-off path). Two-phase per `step()` call:
+#   (1) poll an in-flight transaction: only once EVERY tier in it has a finished worker task does ANY of them get
+#       applied — applied together, in this SAME call (LAW T: "if it cannot be afforded this frame, the swap is
+#       deferred whole"). A tier re-dirtied while its job was in flight (an unrelated commit landed on the SAME tier
+#       mid-flight, detected via `_tier_change_seq`/`_tier_dispatch_seq`) stays dirty afterward — picked up fresh by
+#       the next transaction below, rather than silently accepting stale content as final.
+#   (2) if no transaction is in flight and any tier is dirty, snapshot ALL currently-dirty tiers together and dispatch
+#       one WorkerThreadPool concat job per tier — a single commit event's OLD and NEW tiers are always dirtied in the
+#       SAME reap-loop pass above, so they land in the SAME transaction and therefore swap in the SAME later call.
+# =====================================================================================================================
+func _step_tier_txn() -> void:
+	if _txn_active:
+		for t in _txn_tiers:
+			var task: int = int(_tier_task[t])
+			if task < 0 or not WorkerThreadPool.is_task_completed(task):
+				return   # LAW T: not every tier in this transaction is ready yet — apply NONE of them this call
+		for t in _txn_tiers:
+			WorkerThreadPool.wait_for_task_completion(int(_tier_task[t]))
+			_tier_mutex.lock()
+			var result = _tier_result[t]
+			_tier_result[t] = null
+			_tier_mutex.unlock()
+			_tier_task[t] = -1
+			if result != null:
+				_apply_tier_mesh(t, result)
+				_txn_apply_count += 1
+			if int(_tier_change_seq[t]) == int(_tier_dispatch_seq[t]):
+				_dirty_tier[t] = false   # nothing re-dirtied this tier since the snapshot — fully caught up
+			# else: a NEW change landed on this SAME tier while the job was in flight — stays dirty, re-queued below
+		_txn_active = false
+		_txn_tiers = []
+	if not _txn_active:
+		var tiers_to_build := []
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				tiers_to_build.append(t)
+		if tiers_to_build.is_empty():
+			return
+		for t in tiers_to_build:
+			var snap := _snapshot_tier_tiles(t)
+			_tier_snapshot[t] = snap[0]
+			_tier_snapshot_fids[t] = snap[1]
+			_tier_dispatch_seq[t] = int(_tier_change_seq[t])
+			_tier_task[t] = WorkerThreadPool.add_task(Callable(self, "_concat_tier_worker").bind(t), true, "smoothtierconcat")
+		_txn_tiers = tiers_to_build
+		_txn_active = true
+
+## Frozen (main-thread, pre-dispatch) snapshot of tier `tier`'s CURRENT resident tiles — [Array[Dictionary] tiles,
+## Array[int] fids], parallel indices. Committed tile Dictionaries are never mutated in place once stored in `_tiles`
+## (only ever wholesale-reassigned or erased), so handing worker threads references to them is race-safe.
+func _snapshot_tier_tiles(tier: int) -> Array:
+	var tiles := []
+	var fids := []
+	for fid in _tiles.keys():
+		if int(_tier_of[fid]) == tier:
+			tiles.append(_tiles[fid])
+			fids.append(int(fid))
+	return [tiles, fids]
+
+## WorkerThreadPool-dispatched (off MAIN): concatenate `_tier_snapshot[tier]` into the merged pos/nrm/col/uv/uv2/idx
+## arrays — identical index-offset math to `_rebuild_tier_mesh`'s loop (bit-identical output for the same tile set),
+## just off-thread. Reads only `_tier_snapshot[tier]` (single-writer: main writes it once at dispatch, never touches it
+## again until this task is reaped) — PURE except for the mutex-guarded `_tier_result`/`_worker_concat_count` write
+## (mirrors `_build_worker`'s `_s_result` discipline).
+func _concat_tier_worker(tier: int) -> void:
+	var tiles: Array = _tier_snapshot[tier]
+	var P := PackedVector3Array()
+	var N := PackedVector3Array()
+	var C := PackedColorArray()
+	var U := PackedVector2Array()
+	var U2 := PackedVector2Array()
+	var I := PackedInt32Array()
+	for t in tiles:
+		var td: Dictionary = t
+		var base := P.size()
+		P.append_array(td["pos"])
+		N.append_array(td["nrm"])
+		C.append_array(td["col"])
+		U.append_array(td["uv"])
+		U2.append_array(td["uv2"])
+		for idx in (td["idx"] as PackedInt32Array):
+			I.append(base + idx)
+	var result := {"pos": P, "nrm": N, "col": C, "uv": U, "uv2": U2, "idx": I}
+	_tier_mutex.lock()
+	_tier_result[tier] = result
+	_worker_concat_count += 1   # REVISION 3 T1 G-FS-TXN-THREAD telemetry: the off-thread concat path ran
+	_tier_mutex.unlock()
+
+## The CHEAP main-thread half of a T1 tier-mesh commit — assign the already-concatenated arrays (built off-thread by
+## `_concat_tier_worker`) to the tier's MeshInstance. Mirrors `_rebuild_tier_mesh`'s tail exactly (same ArrayMesh/
+## material setup), so the two paths are bit-identical for the same tile set. Also updates `_committed_fids` (gate
+## introspection) from `_tier_snapshot_fids[tier]` — exactly the fid set THIS dispatch's job concatenated.
+func _apply_tier_mesh(tier: int, result: Dictionary) -> void:
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null:
+		return
+	var P: PackedVector3Array = result["pos"]
+	var mesh := ArrayMesh.new()
+	if P.size() > 0:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = P
+		arr[Mesh.ARRAY_NORMAL] = result["nrm"]
+		arr[Mesh.ARRAY_COLOR] = result["col"]
+		arr[Mesh.ARRAY_TEX_UV] = result["uv"]
+		arr[Mesh.ARRAY_TEX_UV2] = result["uv2"]
+		arr[Mesh.ARRAY_INDEX] = result["idx"]
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		if _material != null:
+			mesh.surface_set_material(0, _material)
+	mi.mesh = mesh
+	var committed := {}
+	for fid in _tier_snapshot_fids[tier]:
+		committed[int(fid)] = true
+	_committed_fids[tier] = committed
 
 func resident_count() -> int:
 	return _tiles.size()
@@ -803,3 +963,27 @@ func request_rebuild_count() -> int:
 ## REVISION 3 G-FS-QUIESCE telemetry / Q1 introspection: is step() currently latched settled (FP_SMOOTH_IDLE)?
 func is_settled() -> bool:
 	return _settled
+
+## REVISION 3 T1 gate introspection (G-FS-NOHOLE strengthened): a COPY of the 4 per-tier `_committed_fids`
+## dictionaries (fid -> true), i.e. exactly what's baked into each tier's CURRENTLY assigned mi.mesh right now —
+## maintained at every actual mesh commit (both the legacy `_rebuild_tier_mesh` and the T1 `_apply_tier_mesh` path).
+## A gate sums, per fid, how many of these 4 dicts contain it: 0 = a hole (drawn nowhere), >=2 = a z-fight (drawn by
+## two different-pitch tier surfaces at once) — `_tiles`/`is_resident()` alone can't see either, since residency
+## flips atomically on main and was never the bug; the DRAWN MESH lagging it across frames was (R3.2.a).
+func committed_fids_snapshot() -> Array:
+	var out := []
+	for t in [S2, S3, S4, S5]:
+		out.append((_committed_fids[t] as Dictionary).duplicate())
+	return out
+
+## G-FS-TXN-THREAD telemetry: `_rebuild_tier_mesh` (MAIN-thread concat) calls so far.
+func main_concat_count() -> int:
+	return _main_concat_count
+
+## G-FS-TXN-THREAD telemetry: `_concat_tier_worker` (off-thread concat) calls so far.
+func worker_concat_count() -> int:
+	return _worker_concat_count
+
+## G-FS-NOHOLE telemetry: atomic (possibly multi-tier) `_step_tier_txn` applies committed so far.
+func txn_apply_count() -> int:
+	return _txn_apply_count

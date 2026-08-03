@@ -140,12 +140,16 @@ func _initialize() -> void:
 	_gate_fs_churn()
 
 	# --- REVISION 3 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3 — quiescence + no-hole commit model") ---
-	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake) ONLY. T1 (off-thread mesh) and Q2 (slot
-	# indirection) are LATER stages — not gated here.
+	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake). Stage 2 scope (this stage): T1 (off-thread,
+	# atomic tier-mesh commits). Q2 (slot indirection) and T3 (neighbour-aware weld refresh) are LATER stages — not
+	# gated here.
 	_ok(not CubeSphere.FP_SMOOTH_IDLE, "G-R3-OFF: FP_SMOOTH_IDLE defaults false (byte-off)")
 	_ok(not CubeSphere.FP_SHELL_SNAP_GEN, "G-R3-OFF: FP_SHELL_SNAP_GEN defaults false (byte-off)")
+	_ok(not CubeSphere.FP_SMOOTH_TXN, "G-R3-OFF: FP_SMOOTH_TXN defaults false (byte-off; step() takes the shipped ≤1-tier/frame main-thread path)")
 	_gate_fs_quiesce()
 	_gate_fs_nohole()
+	_gate_fs_nohole_txn()
+	_gate_fs_txn_thread()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -1413,3 +1417,167 @@ func _gate_fs_nohole() -> void:
 	var out2b := ring._mesh_inc_gate(empty_assign, false)
 	_ok(not out2b.has(int(f)), "G-FS-NOHOLE-FALSIFY: WITHOUT the fix (snap_gen_on off), the exact SAME stale commit DOES evict the facet prematurely — proving the race is real and this gate has teeth")
 	ring.free()
+
+# =====================================================================================================================
+# REVISION 3 STAGE 2 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3" R3.4 T1, FP_SMOOTH_TXN) — the
+# tier-mesh COMMIT transaction. G-FS-NOHOLE strengthened (below) proves the ATOMIC swap at the committed-MESH level
+# (not merely `_tiles`/`is_resident`, which already flipped atomically pre-T1 and was never the bug); G-FS-TXN-THREAD
+# proves the heavy per-element concatenation actually left MAIN. Both drive `FacetSmoothTier` directly (the same
+# "poke a flag-gated internal / call the function with the flag forced" pattern this whole file uses), since
+# `FP_SMOOTH_TXN`'s dispatch/residency DECISION (FP_SMOOTH_MESH_INC, REV2 R-B — whether a tier-change swap holds the
+# OLD tile resident instead of evicting it up front) is a separate, already-shipped/gated concern; T1's own scope is
+# strictly the tier-mesh APPLY half once both old+new tiers are ALREADY dirtied by the same commit event — so the
+# churn script below reproduces exactly that moment directly (`_simulate_tier_commit`, mirroring step()'s own
+# reap-commit bookkeeping) rather than re-deriving it through the MESH_INC-gated dispatch path.
+# =====================================================================================================================
+
+## Directly reproduce step()'s own reap-commit bookkeeping (facet_smooth_tier.gd ~:655-669) for a fid that is ALREADY
+## resident at a DIFFERENT tier — i.e. exactly the state right after a real worker tile finishes for a tier-change:
+## the OLD tier's tile is dropped (`_evict`, which dirties+bumps the OLD tier) and the NEW tile lands (dirtying+
+## bumping the NEW tier) in the SAME call — reproducing "a commit that moves a facet between tiers dirties BOTH tier
+## meshes" (R3.2.a) without needing FP_SMOOTH_MESH_INC's dispatch decision (a separate, already-shipped concern).
+func _simulate_tier_commit(ft: FacetSmoothTier, fid: int, new_tier: int, tile: Dictionary) -> void:
+	if ft._tiles.has(fid):
+		if int(ft._tier_of[fid]) != new_tier:
+			ft._evict(fid)
+		else:
+			ft._bytes -= FST.tile_bytes(ft._tiles[fid])
+			ft._tiles.erase(fid)
+	var tb := FST.tile_bytes(tile)
+	ft._tiles[fid] = tile
+	ft._tier_of[fid] = new_tier
+	ft._bytes += tb
+	ft._dirty_tier[new_tier] = true
+	ft._tier_change_seq[new_tier] = int(ft._tier_change_seq[new_tier]) + 1
+	ft._changed = true
+
+## Drive `FacetSmoothTier.step()` (`idle_on` forced false — Q1 is orthogonal to T1) until residency stops growing —
+## the T1-scoped equivalent of `_p1_converge`, operating on a bare instance rather than a full `FacetFarRing`. The
+## `OS.delay_msec` between polls gives the background WorkerThreadPool task REAL wall-clock time to finish (mirrors
+## `_gate_fs_churn`'s note above: a tight zero-delay poll loop over a nearly-free `step()` call can spin thousands of
+## times before the OS ever schedules the worker thread at all).
+func _converge_ft(ft: FacetSmoothTier, txn_on: bool, max_iters := 2000) -> int:
+	var iters := 0
+	var stable := 0
+	var last := -1
+	while iters < max_iters and stable < 30:
+		OS.delay_msec(2)
+		ft.step(false, txn_on)
+		iters += 1
+		var n := ft.resident_count()
+		if n == last:
+			stable += 1
+		else:
+			stable = 0
+			last = n
+	return iters
+
+## G-FS-NOHOLE (strengthened, T1): drive a churn script with BOTH a promote and a demote landing in ONE commit event
+## (fid_a S4->S5, fid_b S5->S4 — a compound swap across the SAME two tiers, so the failure mode below hits both
+## classes at once) plus an in-place REFRESH (fid_c, same tier), then assert on EVERY subsequent `step()` call that
+## every resident fid is baked into EXACTLY ONE tier's CURRENTLY COMMITTED mesh (`committed_fids_snapshot()`):
+## found==0 is a HOLE (drawn nowhere — mid-swap, see-through to the backstop); found>=2 is a Z-FIGHT (two different-
+## pitch tier surfaces drawn for the same facet at once). found==1 at the facet's PREVIOUS (not-yet-updated) tier is
+## explicitly NOT a violation — LAW T mandates the OLD surface keeps drawing until the NEW one commits, which is
+## exactly what a legitimate in-flight transaction looks like.
+func _run_nohole_churn(txn_on: bool) -> Dictionary:
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var fid_a := _fid_of(4, 6, 9)
+	var fid_b := _fid_of(4, 6, 10)
+	var fid_c := _fid_of(4, 6, 11)
+
+	# Initial population: fid_a@S4, fid_b@S5, fid_c@S3 — converge FULLY first, so the churn below tests a real
+	# TRANSITION (an already-committed facet moving/refreshing), never the (legitimate) initial-ramp gap before a
+	# facet's first-ever commit.
+	ft.request({fid_a: FST.S4, fid_b: FST.S5, fid_c: FST.S3})
+	_converge_ft(ft, txn_on)
+	var warm_ok := ft.is_resident(fid_a) and ft.is_resident(fid_b) and ft.is_resident(fid_c)
+	var warm_committed := ft.committed_fids_snapshot()
+	for fid in [fid_a, fid_b, fid_c]:
+		var found := 0
+		for t in range(4):
+			if (warm_committed[t] as Dictionary).has(int(fid)):
+				found += 1
+		if found != 1:
+			warm_ok = false
+
+	# The churn: fid_a S4->S5 (demote), fid_b S5->S4 (promote) — ONE compound commit across the SAME 2 tiers — plus
+	# an in-place refresh of fid_c at its current tier (S3).
+	var tile_a := FST.build_tile(fid_a, FST.cells_for_tier(FST.S5), 0.0, true, false, -1.0)
+	var tile_b := FST.build_tile(fid_b, FST.cells_for_tier(FST.S4), 0.0, true, false, -1.0)
+	var tile_c := FST.build_tile(fid_c, FST.cells_for_tier(FST.S3), 0.0, true, false, -1.0)
+	_simulate_tier_commit(ft, fid_a, FST.S5, tile_a)
+	_simulate_tier_commit(ft, fid_b, FST.S4, tile_b)
+	_simulate_tier_commit(ft, fid_c, FST.S3, tile_c)   # same-tier "refresh"
+
+	var hole := false
+	var zfight := false
+	var steps := 0
+	for i in range(400):
+		OS.delay_msec(2)   # real wall-clock time for the WorkerThreadPool concat task(s) to actually run — see _converge_ft
+		ft.step(false, txn_on)
+		steps += 1
+		var snap := ft.committed_fids_snapshot()
+		for fid in [fid_a, fid_b, fid_c]:
+			if not ft.is_resident(fid):
+				continue
+			var found := 0
+			for t in range(4):
+				if (snap[t] as Dictionary).has(int(fid)):
+					found += 1
+			if found == 0:
+				hole = true
+			elif found > 1:
+				zfight = true
+		if hole or zfight:
+			break
+
+	parent.free()
+	return {"warm_ok": warm_ok, "hole": hole, "zfight": zfight, "steps": steps}
+
+func _gate_fs_nohole_txn() -> void:
+	print("  --- REVISION 3 G-FS-NOHOLE (strengthened, T1): tier-mesh commits are ATOMIC at the COMMITTED-MESH level — no hole, no z-fight ---")
+
+	# --- (A) WITH the fix: FP_SMOOTH_TXN forced on ---
+	var on := _run_nohole_churn(true)
+	_ok(bool(on["warm_ok"]), "G-FS-NOHOLE (T1) warm-up: initial population converges to exactly-one-committed-tier coverage for every facet (non-vacuous baseline)")
+	_ok(int(on["steps"]) > 0, "G-FS-NOHOLE (T1): drove %d churn steps (compound promote+demote+refresh)" % int(on["steps"]))
+	_ok(not bool(on["hole"]), "G-FS-NOHOLE (T1): FP_SMOOTH_TXN on — NEVER a step where a resident facet is baked into ZERO committed tier meshes (no hole)")
+	_ok(not bool(on["zfight"]), "G-FS-NOHOLE (T1): FP_SMOOTH_TXN on — NEVER a step where a resident facet is baked into TWO committed tier meshes at once (no z-fight)")
+
+	# --- (B) FALSIFY: the IDENTICAL churn script with FP_SMOOTH_TXN forced OFF (the shipped ≤1-tier/frame path) ---
+	var off := _run_nohole_churn(false)
+	_ok(bool(off["warm_ok"]), "G-FS-NOHOLE-FALSIFY (T1) warm-up: initial population converges the same way with the flag off (non-vacuous baseline)")
+	_ok(bool(off["hole"]) or bool(off["zfight"]), "G-FS-NOHOLE-FALSIFY (T1): WITHOUT the fix (txn_on false), the IDENTICAL compound promote+demote churn DOES produce a hole and/or a z-fight — the shipped ≤1-tier/frame commit loop has exactly the R3.2.a window this gate is built to catch")
+
+## G-FS-TXN-THREAD (T1): the heavy per-element tier-mesh concatenation (`_rebuild_tier_mesh`'s O(tier resident count)
+## append loop, ~:707-708 pre-T1) must run on the WORKER, not MAIN, once FP_SMOOTH_TXN is on. Drives a real multi-tier
+## build burst (3 facets across 3 different tiers, converged from empty) and checks the two telemetry counters
+## directly. FALSIFY: the identical script with the flag off DOES run the main-thread concat path.
+func _gate_fs_txn_thread() -> void:
+	print("  --- REVISION 3 G-FS-TXN-THREAD (T1): the heavy tier-mesh concat runs on the WORKER, never MAIN ---")
+	var parent := Node3D.new()
+	var fid_a := _fid_of(5, 3, 3)
+	var fid_b := _fid_of(5, 3, 4)
+	var fid_c := _fid_of(5, 3, 5)
+
+	# --- (A) WITH T1: FP_SMOOTH_TXN forced on ---
+	var ft_on := FST.new()
+	ft_on.setup_instance(parent, null)
+	ft_on.request({fid_a: FST.S4, fid_b: FST.S5, fid_c: FST.S3})
+	_converge_ft(ft_on, true)
+	_ok(ft_on.resident_count() == 3, "G-FS-TXN-THREAD warm-up: the driven 3-facet/3-tier burst actually converged (non-vacuous, %d resident)" % ft_on.resident_count())
+	_ok(ft_on.worker_concat_count() > 0, "G-FS-TXN-THREAD: with FP_SMOOTH_TXN on, the off-thread `_concat_tier_worker` ran (%d times)" % ft_on.worker_concat_count())
+	_ok(ft_on.main_concat_count() == 0, "G-FS-TXN-THREAD: with FP_SMOOTH_TXN on, the main-thread `_rebuild_tier_mesh` NEVER ran (0 calls) — the O(res) per-element append loop stayed off MAIN")
+
+	# --- (B) FALSIFY: the IDENTICAL script with FP_SMOOTH_TXN forced OFF (the shipped main-thread path) ---
+	var ft_off := FST.new()
+	ft_off.setup_instance(parent, null)
+	ft_off.request({fid_a: FST.S4, fid_b: FST.S5, fid_c: FST.S3})
+	_converge_ft(ft_off, false)
+	_ok(ft_off.resident_count() == 3, "G-FS-TXN-THREAD-FALSIFY warm-up: the SAME 3-facet/3-tier burst converges with the flag off (non-vacuous, %d resident)" % ft_off.resident_count())
+	_ok(ft_off.main_concat_count() > 0, "G-FS-TXN-THREAD-FALSIFY: WITHOUT the fix (txn_on false), the IDENTICAL driven scenario runs the main-thread concat %d times — proving the counter has teeth, not a vacuous 0-vs-0" % ft_off.main_concat_count())
+	_ok(ft_off.worker_concat_count() == 0, "G-FS-TXN-THREAD-FALSIFY: WITHOUT the fix, the off-thread concat path never ran (0 calls)")
+	parent.free()

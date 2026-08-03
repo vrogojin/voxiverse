@@ -741,6 +741,38 @@ const SMOOTH_STICKY_S4_HOP := 5
 const SMOOTH_STICKY_S5_HOP := 10
 const SMOOTH_STICKY_DWELL_MS := 5000
 
+## docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 (2026-08-03, Fable) — cheap, immediate laws Q1 + T2. REV2
+## stabilized WHO is resident (`smooth_res` constant at rest) but left the DRIVER running unconditional per-frame O(res)
+## work (churn at rest, R3.1.c) and a commit-generation handshake race that can premature-evict a leaving facet before
+## the shell has actually proven the re-inclusion (a hole, R3.2.b). Both fixed here; T1 (off-thread tier-mesh assembly)
+## and Q2 (slot-indirection, kills the mesh-baked-skin staleness R3.1.d) are LATER stages, not this flag pair.
+## FP_SMOOTH_IDLE (LAW Q, R3.4 Q1): the smooth driver reaches a fixpoint at rest. `_smooth_drive` hashes a cheap
+##   (active_fid, excluded-set) signature and reuses last frame's fully-merged assignment — skipping the hop-ring
+##   dwell scan, `_mesh_inc_gate`, the R-C per-facet slot loop, and `FacetSmoothTier.request()`'s `_want`/`_snap_plan`
+##   rebuild — whenever the signature repeats AND no leaving/dwell handshake is outstanding (those always force a
+##   re-check so the timed state still resolves). `request()` ALSO independently no-ops when the requested set is
+##   bit-identical to what's already committed (defence in depth). `FacetSmoothTier.step()` carries its own `_settled`
+##   latch (reap + dispatch + dirty tier all empty ⇒ skip the O(_sn) reap scan / O(res) `_next_want` scan / O(4) dirty
+##   loop entirely), cleared by any real request change, eviction, or `request_refresh`. The S2 near-collar's staggered
+##   rebake keeps its OWN independent ≥1-block player-drift gate (real movement must still reach it even while
+##   active_fid/excluded hold). `_recompute_want_sse`/`_recompute_band_want_sse` (facet_tex_baker.gd) get the SAME
+##   axis-hold gate the angular `_recompute_want` already has (:835) — the SSE path scanned + sorted all 3456 facets
+##   every update with no hold at all; now held while axis ≥ hold_cos AND |Δcam_dist| < half a facet width. Off ⇒
+##   every driver/baker/tier function takes its shipped unconditional-work path (byte-identical, FLAT 6042/0).
+const FP_SMOOTH_IDLE := false
+## FP_SHELL_SNAP_GEN (LAW T handshake fix, R3.4 T2): `_shell_gen` (REVISION 2 LAW R-B) bumps on EVERY shell mesh
+##   commit, including a commit whose `visible_fids()` exclusion snapshot was taken BEFORE a facet was marked leaving
+##   — a mesh that EXCLUDES the facet "proves" nothing about its re-inclusion, yet the shipped `_shell_gen <= mark`
+##   check treats any later commit as sufficient proof → premature evict → a hole until the NEXT re-emit actually
+##   lands. This flag bumps a separate `_snap_gen` at the exact instant `visible_fids()` is snapshotted for a build
+##   (`_dispatch_async_rebuild` / `_rebuild_full`) and records the snap-gen each COMMITTED build actually used
+##   (`_last_committed_snap_gen`). `_mesh_inc_gate` marks a newly-leaving facet with `_snap_gen + 1` — the earliest
+##   snapshot generation that can possibly include the re-inclusion — and drops it only once
+##   `_last_committed_snap_gen >= mark`, so a stale in-flight build (dispatched before the mark) can never satisfy the
+##   drop test even though it still bumps `_shell_gen` on commit. Off ⇒ `_snap_gen`/`_last_committed_snap_gen` stay
+##   unused and `_mesh_inc_gate` runs the shipped `_shell_gen`-at-mark law verbatim (byte-identical).
+const FP_SHELL_SNAP_GEN := false
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

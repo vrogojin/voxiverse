@@ -522,3 +522,206 @@ whole feature exists to satisfy.** If R4's S2 cost still can't hold walking pace
 the fallback is not a model change but a baseline change: raise the always-resident far baseline to
 true-height 8-block pitch for the rim band only (bytes ≈ +1.5 MB), so the resting state is
 height-true without any bake-on-move at all.
+
+---
+
+# REVISION 3 — quiescence + no-hole commit model (2026-08-03, Fable)
+
+REV2 (2c5b31c) shipped and held its own laws: `smooth_res` is CONSTANT at 209 at rest — the sticky
+residency SET is stable. Two live failures remain: (1) the far terrain **keeps changing while the
+player is stationary** (identical frozen pose, 12 s apart, different relief/grey patches, changed
+extent; `hitches` +~10/s), and (2) **facet misalignment + render-through**. Both are root-caused
+below. The finding in one line: **REV2 stabilized WHO is resident but gave neither the drivers an
+idle state nor the commits a single-frame transaction — the far stack has no terminal state, and its
+transient windows draw wrong or draw nothing.**
+
+## R3.1 Root cause A — churn-at-rest: five engines run with zero player input
+
+### R3.1.a The skin-convergence sweeps repaint the disc for the whole session
+The whole-planet fine bake runs until ALL `6·K² = 3456` facets are baked
+(`facet_tex_baker.gd:1755` `fine_pending = _fine_baked.size() < _base_all`, dispatch :1782-1804);
+each commit blits a tile into an L8 sub-page and a throttled **full-layer `update_layer` of the
+768² page fires every ≤ 15 frames** (:1806-1809 — the "2.36 MB" comment is stale; at
+`PLANET_MAP_TEXELS=64` it is ~0.6 MB, still a recurring main-thread upload). In parallel the g0
+base-coverage + g1 shot-upgrade sweeps (`_select_worker_unit` :653-661) rewrite base pages across
+the whole planet. At measured web rates this is **minutes-to-an-hour of continuous repainting**.
+The geometry under it is stable — but at orbit ALL relief cues are baked shading in the skin, so
+this alone IS "relief/grey patches in different places" between two screenshots 12 s apart. It is
+monotone convergence, not a loop — but with no disc-done terminal signal and no bound the user can
+perceive, it is indistinguishable from churn.
+
+### R3.1.b Every close-up/band commit forces a FULL shell re-emit (the hitch engine)
+`_cu_commit_slice` bumps `_slots_epoch` (`facet_tex_baker.gd:1039`; evict :1055); WorldManager
+pushes it (`world_manager.gd:1169-1178`) → `set_closeup_slots` → **`_pending = true`**
+(`facet_far_ring.gd:3924`; band :3962) → a full-front shell re-emit (`_rebuild_full` /
+`_dispatch_async_rebuild`), *because the skin slot is baked into mesh vertices* (UV2.y via
+`_slot_of`, :3228-3231). At alt 427, `CLOSEUP_FAR = 4000` (`cube_sphere.gd:1075`) admits ~285
+candidates capped to `CLOSEUP_MAX = 64` (:1071) → **up to 64 close-up commits after arrival, each
+one full re-emit + `_shell_gen++`**. On top: the orbit warm-front progressive reveal re-emits every
+`SHELL_REEMIT_GROWTH = 64` newly-cached facets (`facet_far_ring.gd:1007-1017`) while the ~1700-facet
+front warms — the shell's emitted set literally grows = **"terrain extent changed"**. Each re-emit
+is the known full tri-soup rebuild → the ~10/s hitch cadence at rest.
+
+### R3.1.c The smooth driver has no idle state
+`_smooth_drive()` runs every frame (`facet_far_ring.gd:949`) and unconditionally executes: the
+dwell scan (O(res), :532-548), `_mesh_inc_gate` (O(res), :558-573), the R-C slot loop (O(res),
+:474-479), and `_smooth.request()` — which **rebuilds `_want` + the full `_snap_plan` (209 × 4
+`seam_neighbour` + fresh dicts) every frame** (`facet_smooth_tier.gd:520-545`) even when the
+assignment is bit-identical to the previous frame. In the baker, `_recompute_want_sse`
+(`facet_tex_baker.gd:863-899`) scans + sorts all 3456 facets **every update with no hold gate** —
+the non-SSE `_recompute_want` HAS the axis-hold gate (:835); the SSE path omitted it. None of this
+commits anything at fixpoint, but it is unconditional per-frame main-thread work — and it means
+there is **no "settled" signal anywhere** to gate on or to assert in a test.
+
+### R3.1.d Smooth tiles go skin-stale, then skin-WRONG (the moving grey/misplaced patches)
+LAW R-C froze `_slot_of(fid)` into tile vertices at build time — but **nothing ever refreshes a
+committed tile when the slot map moves** (`request_refresh` exists; its only caller is the rim
+drift check, `facet_far_ring.gd:612`). The shell re-emits on every epoch bump; the 209 smooth
+meshes never do. So smooth-resident facets carry **launch-time slots forever**: −1/base (grey
+wash) at first, and — worse — when a close-up/band LAYER is evicted and REUSED for another facet,
+the stale UV2.y now points at **another facet's texture** (`_evict_closeup`'s comment,
+`facet_tex_baker.gd:1043-1055`, explicitly assumes a "≤ 1-frame window before the re-emit" — true
+for the shell, FALSE for smooth meshes, which never re-emit). Terrain patches that are grey or
+belong elsewhere, moving whenever the layer carousel reassigns — **with `smooth_res` constant and
+zero mesh rebuilds**. This is the exact "residency stable, content churns" signature.
+
+### R3.1.e (plausible, unconfirmed live) S2↔S3 role oscillation
+`_sticky_target` snapshots `_is_backstop` at crossing time (`facet_far_ring.gd:509`) but
+`_rim_assign` reads `_excluded` LIVE every frame (:594). A pool-membership flap without a crossing
+flips a facet S3↔S2 indefinitely: tier-swap builds, both tier meshes dirtied, resident count
+unchanged. Not required to explain the capture; the Q1 idle gate + role hysteresis below covers it.
+
+## R3.2 Root cause B — render-through / misalignment: two commit windows + one stale weld
+
+### R3.2.a The tier-mesh transaction is split across frames (hole OR double-draw)
+A commit that moves a facet between tiers dirties BOTH tier meshes
+(`facet_smooth_tier.gd:601-612`) but `step()` rebuilds **at most ONE tier per frame**
+(:632-636 `break`), in fixed order [S2,S3,S4,S5]. Demote S4→S5: S4 rebuilds first — the tile is
+REMOVED from the drawn S4 mesh ≥ 1 frame before it appears in S5. The facet is still
+`is_resident`, so the shell keeps excluding it (`facet_far_ring.gd:2113`) → **a hole straight
+through to the sunk backstop** for ≥ 1 frame (more when several tiers are dirty). Promote S5→S4:
+add lands first → ≥ 1 frame of **double-draw of two different-pitch surfaces** → z-fight /
+interpenetration = "facets misaligned, rendering through". REV2's make-before-break held at the
+residency level and leaked at the committed-mesh level — inside `step()`'s own commit path.
+
+### R3.2.b The `_shell_gen` handshake race — a commit can "prove" a re-inclusion it never drew
+`_mesh_inc_gate` marks a leaving facet with the CURRENT `_shell_gen` (`facet_far_ring.gd:566`) and
+drops it once the gen advances (:569-572). But `_shell_gen` bumps at **every** commit (:1423 async,
+:2069 sync) — including a commit of an async build whose `visible_fids` snapshot (:1302) was taken
+BEFORE the marking, i.e. a mesh that **excludes** the facet. Sequence: build dispatched (facet
+excluded) → facet marked leaving at gen G (`_pending` set, :567) → in-flight build commits →
+gen G+1 > G → facet evicted → the drawn shell does not contain it → **hole until the next re-emit
+lands** (the `_pending` from the marking is only served after the current build finishes —
+`_async_building` gate). Window = up to a full async build round; and because re-emits are constant
+during convergence (R3.1.b), leavings routinely coincide with in-flight builds.
+
+### R3.2.c Frozen snap plans go stale → mixed-pitch cracks at tier boundaries
+A tile's edge weld is frozen at request() and applied once at build
+(`facet_smooth_tier.gd:525-537`, worker :673-680). When a NEIGHBOUR's committed tier later
+changes, nothing refreshes this tile — its edge stays snapped to the old pitch → a T-junction
+crack at the shared border. The only seal is the 4-block skirt (`SMOOTH_SKIRT_BLOCKS`,
+`cube_sphere.gd:704`); relief steps across a 32-block-pitch S5 cell routinely exceed 4 blocks →
+**see-through slivers** at tier frontiers. Combined with R3.2.a/b's double-draw of non-coincident
+surfaces (CELLS=4 shell heightfield vs curved smooth tile), this is the full "misaligned +
+rendering through" picture.
+
+## R3.3 REVISION 3 laws (these are the acceptance criteria)
+
+- **LAW Q (fixpoint-at-rest).** Every far subsystem exposes a terminal state and reaches it in
+  bounded time with zero input. When terminal: O(1) per-frame checks, zero allocations, zero
+  dispatches, zero commits, zero uploads, zero re-emits. Convergence work (skin bakes) must be
+  monotone, disc-first, and **decoupled from geometry** — a skin commit may never force a mesh
+  re-emit.
+- **LAW T (transactional visual commits).** Any change to who-draws-a-facet lands atomically in
+  ONE frame across every committed mesh involved (both tier meshes; tier mesh + shell). If it
+  cannot be afforded this frame, the **swap is deferred whole** — never half-applied. Old surface
+  stays until the new one commits, for refreshes and tier changes alike.
+- **LAW S (stable mesh, live skin).** Geometry carries only STABLE keys (facet identity); volatile
+  skin residency (slots) resolves per-fragment through a baker-updated indirection texture. A slot
+  change costs one tiny texture update — never a re-emit — and can never go stale on ANY mesh.
+
+## R3.4 Fixes (staged, flag-gated)
+
+- **Q1 `FP_SMOOTH_IDLE` — driver idle-gating.** Assignment signature = (active_fid, excluded-set
+  hash, leaving/dwell/refresh state). `_smooth_drive` skips dwell/gate/slot/request work when the
+  signature is unchanged; `request()` early-outs (no `_snap_plan` rebuild) on an unchanged `_want`;
+  `step()` keeps a `_settled` latch (set when reap + dispatch + dirty are all empty; cleared by any
+  request-change/refresh/evict) and returns immediately when settled; the rim scan gates on
+  `_player_col_abs` having moved ≥ 1 block; `_recompute_want_sse`/`_recompute_band_want_sse` get
+  the same hold gate the angular path has (:835): axis ≥ hold_cos AND |Δcam_dist| < half a facet.
+  Adds S2-role hysteresis (a facet's rim role changes only after N frames of stable pool
+  membership) closing R3.1.e.
+- **Q2 `FP_SLOT_INDIRECT` — kill mesh-baked slots (LAW S).** UV2.y carries the stable facet key; a
+  6·K² (3456-texel) fid→(closeup slot, band slot) RG8 lookup texture is the ONLY thing epoch bumps
+  update. `set_closeup_slots`/`set_band_slots` stop setting `_pending` (:3924/:3962). One additive
+  texelFetch in the shell shader (ANGLE-safe, shared by smooth tiles via the shared material).
+  This kills the biggest at-rest re-emit engine (R3.1.b) AND the stale/wrong smooth skin (R3.1.d)
+  in one move — R-C's frozen-slot plumbing retires.
+- **T1 `FP_SMOOTH_TXN` — transactional tier commits (LAW T).** (a) Tier-mesh concatenation moves
+  OFF-THREAD: committed tiles are immutable, so a worker builds the merged tier arrays (with
+  per-tile indices pre-offset — the R2 promise that never shipped; kills the per-element append
+  loop `facet_smooth_tier.gd:707-708`), main pays only `add_surface_from_arrays` + assign — the
+  proven `_async_build_worker`/`_swap_in_arrays` pattern. (b) A tier-change commit is HELD until
+  both affected tier meshes' new arrays are ready, then both `mi.mesh` assignments land the same
+  frame. Removes both the R3.2.a hole/double-draw and the O(tier)-on-main hitch (an S2 collar
+  rebake today re-concatenates ~335k indices on main — the §7.1 cost's mesh half).
+- **T2 `FP_SHELL_SNAP_GEN` — fix the handshake race.** Bump a `_snap_gen` where `visible_fids` is
+  snapshotted (:1302 dispatch, :2049 sync); every commit records its build's snap gen.
+  `_mesh_inc_gate` marks leaving with `mark = _snap_gen + 1` (the earliest snapshot that CAN
+  include the facet) and drops only when `last_committed_snap_gen >= mark`. Tightening (with T1):
+  perform the smooth evict + tier-mesh swap on the SAME frame as the shell commit that re-includes
+  the facet — both commit points are main-thread in the same `_process`.
+- **T3 neighbour-aware weld refresh.** When a facet's COMMITTED tier changes, any committed
+  neighbour whose frozen snap pitch for the shared edge now differs gets a staggered
+  `request_refresh` (≤ 4 per commit, bounded). The skirt returns to being the sub-pixel backstop,
+  not the primary seal (closes R3.2.c).
+- **Q3 skin-convergence bounding (honest scope).** Q2 stops skin commits forcing mesh work, but
+  texture CONTENT still changes at rest until the sweeps converge — that is inherent. Bound it:
+  disc-first ordering already exists (`_next_fine_fid` axis-nearest); add a `fine_disc_done` /
+  `shot_disc_done` latch + telemetry, pause the fine `update_layer` cadence when no baked-visible
+  content changed, and ride the planned C++ `sample_columns` fine bake (~10×) for wall-clock. Live
+  criterion: **geometry bit-static immediately; skin monotone, visible-disc converged ≤ ~2 min,
+  then bit-static.**
+
+Ship order: **Q1 + T2** (cheap, immediate: idle driver + race fix) → **T1** (the hitch killer +
+no-hole transaction) → **Q2** (re-emit killer + stale-skin fix; touches the shader, biggest test
+surface) → **T3**; Q3 rides the existing C++-bake roadmap. Each stage independently gateable and
+FLAT-verified.
+
+## R3.5 The two new gates (non-vacuous, headless)
+
+- **G-FS-QUIESCE (fixpoint-at-rest).** Small-K harness body (convergence reachable headless).
+  Script: teleport to a LOW_ORBIT pose, freeze; pump frames until settle or a frame cap; then run
+  N = 600 frames asserting **zero delta** on ALL of: smooth `dispatch_count` sum, a new tier-mesh
+  rebuild counter, `_begin_rebuild_count`, `_shell_gen`, `_slots_epoch`, `band_epoch`, a new
+  fine-upload counter, and a new `request()`-rebuilt-snap-plan counter. **Non-vacuity:** (a) assert
+  every counter was > 0 during warm-up (the machinery demonstrably runs); (b) perturb — cross one
+  facet — assert the counters move, re-settle, re-assert all-zero. Any future regression that
+  re-introduces per-frame work fails the delta, not a heuristic.
+- **G-FS-NOHOLE (strengthens G-FS-COVER to committed meshes + boundaries).** Scripted churn path
+  designed to provoke every window: tier promotes AND demotes, dwell-expiry leavings, rim
+  refreshes, and a slot-epoch bump injected mid-async-build (the T2 race). Every frame assert:
+  (1) **coverage** — every front facet ∈ (the shell's last COMMITTED emit set) ∪ (fids present in
+  the CURRENT committed tier ArrayMeshes, via a new `gate_meshed_fids()` maintained exactly at
+  `_rebuild_tier_mesh` commit) — residency dicts are explicitly NOT evidence; (2) **exclusivity** —
+  the intersection is empty except facets inside a `_smooth_leaving` window bounded by T2;
+  (3) **boundary** — sampled committed-tile edge verts vs the committed neighbour (tile or shell
+  chord) differ ≤ ε radially. **Non-vacuity:** run the same script with T1/T2 forced OFF and assert
+  the gate FAILS — the hole and the race are deterministic under the script, proving the gate sees
+  them.
+
+## R3.6 Verdict
+
+**YELLOW, converging GREEN — the REV2 per-tier incremental model CAN reach quiescence; no new
+rendering model is needed.** The residency law works (constant 209 proves it). What fails is
+(1) slot-in-vertex coupling that welds the skin pipeline to mesh re-emits, (2) drivers with no idle
+state, and (3) a commit model whose transactions span frames plus a gen-counter race — all fixable
+inside the model. **One structural change is non-negotiable: tier-mesh assembly must leave the main
+thread (T1).** Without it LAW T is unaffordable and the model degenerates to choosing between holes
+and hitches; the per-facet-MeshInstance alternative is rejected (≈ +289 draws against the ~204-draw
+GL-compat ceiling). Separately and bluntly: even fully quiesced, the S2 collar's §7.1 BAKE cost
+(~174k `profile_at_dir` at 104 cells per facet, re-baked per 24 blocks of walk) is untouched by
+this revision — T1 removes its mesh-concat half only; the bake half stays on §7.1's own plan
+(ENV_FINE_MULT 4→2, crescent-incremental, C++ port). And the whole-planet skin sweeps mean the
+planet repaints for minutes regardless — Q2 makes that cheap and Q3 makes it bounded and visible in
+telemetry, but only the C++ fine bake makes it short.

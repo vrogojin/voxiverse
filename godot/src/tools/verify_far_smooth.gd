@@ -139,6 +139,14 @@ func _initialize() -> void:
 	_gate_nf_height()
 	_gate_fs_churn()
 
+	# --- REVISION 3 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3 — quiescence + no-hole commit model") ---
+	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake) ONLY. T1 (off-thread mesh) and Q2 (slot
+	# indirection) are LATER stages — not gated here.
+	_ok(not CubeSphere.FP_SMOOTH_IDLE, "G-R3-OFF: FP_SMOOTH_IDLE defaults false (byte-off)")
+	_ok(not CubeSphere.FP_SHELL_SNAP_GEN, "G-R3-OFF: FP_SHELL_SNAP_GEN defaults false (byte-off)")
+	_gate_fs_quiesce()
+	_gate_fs_nohole()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -1199,3 +1207,209 @@ func _gate_fs_churn() -> void:
 	_ok(ring2._smooth.discarded_count() == 0, "G-FS-CHURN: ZERO discarded builds over the sticky+mesh-inc driven path (make-before-break never throws away a finished tile)")
 	ring.free()
 	ring2.free()
+
+# =====================================================================================================================
+# REVISION 3 STAGE 1 gates (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3 — quiescence + no-hole commit
+# model", laws Q1 `FP_SMOOTH_IDLE` + T2 `FP_SHELL_SNAP_GEN` ONLY — T1/Q2/Q3 are LATER stages, not gated here). Both
+# flags are poked via defaulted function PARAMETERS (`_smooth_drive`/`request`/`step`/`_mesh_inc_gate`/
+# `_recompute_want_sse`/`_recompute_band_want_sse` all take an `..._on := CubeSphere.FP_..._FLAG` param) — the SAME
+# "poke a flag-gated internal directly" pattern this file already relies on throughout (the consts themselves stay
+# compile-time false, so FLAT `verify_feature` is unaffected by anything in this section).
+# =====================================================================================================================
+
+## G-FS-QUIESCE (partial — the Q1 DRIVER's contribution only; scope per the stage brief). Three independent,
+## non-vacuous sub-checks, each: (a) prove the counter actually does real work during warm-up/perturbation (not a
+## vacuous always-0 counter), (b) prove it goes FLAT (zero further mutation) once nothing changes, (c) perturb and
+## prove it moves again then re-settles. The skin/shell re-emit engines (R3.1.a/b) and the mesh-baked skin-slot
+## staleness (R3.1.d) are Q2/T1/Q3's job — NOT asserted zero here; those subsystems still churn at rest until those
+## LATER stages ship (an honest scope note, not a gap in THIS gate).
+func _gate_fs_quiesce() -> void:
+	print("  --- REVISION 3 G-FS-QUIESCE (partial, Q1 driver): zero-work fixpoint at rest ---")
+	_gate_fs_quiesce_driver()
+	_gate_fs_quiesce_dwell()
+	_gate_fs_quiesce_baker()
+	print("  NOTE (G-FS-QUIESCE scope): asserts 0 delta on request()/_snap_plan rebuilds, step()'s own settle latch, the")
+	print("  dwell-scan mutation counter, and the baker's SSE want-recompute counters — the Q1 driver counters this")
+	print("  stage controls. The shell's OWN full re-emit engine (R3.1.a/b: skin-convergence sweeps + close-up/band")
+	print("  commits forcing a full shell rebuild) and the mesh-baked skin-slot staleness (R3.1.d) are Q2/T1/Q3 — a")
+	print("  live/real session still shows unrelated texture-driven shell re-emits + _shell_gen churn until those ship.")
+
+## G-FS-QUIESCE (driver): `FacetSmoothTier.request()`/`_snap_plan` + `step()`'s own settle latch reach a zero-work
+## fixpoint at a FIXED active facet (dwell deliberately kept empty here — the isolated dwell-mutation counter is
+## covered by `_gate_fs_quiesce_dwell` below, so this scenario cleanly isolates the request/step counters).
+func _gate_fs_quiesce_driver() -> void:
+	var fid_a := _fid_of(1, 5, 12)
+	var ring := FacetFarRing.new()
+	ring.setup(fid_a)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	ring._active_fid = fid_a
+
+	# Warm-up + converge (idle_on, sticky_on, mesh_inc_on all forced true via params; rim/skin-slot left off — this
+	# gate is scoped to the hop-ring/request/step counters, not the S2 collar or skin parity). Drive until
+	# FacetSmoothTier.step() itself reports settled (bounded — the shared global WorkerThreadPool may be contended by
+	# earlier gates in this same run, so a fixed iteration count isn't reliable; a stability POLL is).
+	var iters := 0
+	while iters < 20000 and not ring._smooth.is_settled():
+		ring._smooth_drive(true, true, false, true, false)
+		iters += 1
+	_ok(ring._smooth.is_settled(), "G-FS-QUIESCE warm-up (driver): the driven pipeline actually reaches settled (%d iterations) — a precondition for the rest of this gate" % iters)
+	var req_warm: int = ring._smooth.request_rebuild_count()
+	_ok(req_warm > 0, "G-FS-QUIESCE warm-up (driver): request()/_snap_plan actually rebuilt (%d times) while converging — non-vacuous baseline" % req_warm)
+
+	# Settle: N more frames, nothing changes. The driver must do ZERO further request()/_snap_plan work, and
+	# FacetSmoothTier.step() itself must latch settled (its own O(_sn) reap / O(res) _next_want / O(4) dirty scan skip).
+	for i in range(600):
+		ring._smooth_drive(true, true, false, true, false)
+	var req_settled: int = ring._smooth.request_rebuild_count()
+	_ok(req_settled == req_warm, "G-FS-QUIESCE: ZERO request()/_snap_plan rebuilds over 600 settled frames at a fixed active facet (%d -> %d)" % [req_warm, req_settled])
+	_ok(ring._smooth.is_settled(), "G-FS-QUIESCE: FacetSmoothTier.step() itself latches _settled (its own reap/dispatch/dirty scan skips too)")
+
+	# Perturb: a REAL facet crossing must re-trigger request() work, then re-settle.
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_EAST)
+	ring._active_fid = fid_b
+	ring._smooth_drive(true, true, false, true, false)
+	var req_mid: int = ring._smooth.request_rebuild_count()
+	_ok(req_mid > req_settled, "G-FS-QUIESCE perturb (driver): a facet crossing re-triggers request() work (%d -> %d) — the idle gate is not permanently stuck" % [req_settled, req_mid])
+	for i in range(600):
+		ring._smooth_drive(true, true, false, true, false)
+	var req_final: int = ring._smooth.request_rebuild_count()
+	_ok(req_final == req_mid, "G-FS-QUIESCE: re-settles to ZERO further request() work after the perturbation (%d -> %d)" % [req_mid, req_final])
+	ring.free()
+
+## G-FS-QUIESCE (dwell): `_sticky_apply_dwell`'s `_dwell_mutation_count` in isolation — a facet falling out of target
+## starts its dwell timer (a mutation), holding steady mutates NO further, re-entering target cancels it (a mutation),
+## and holding steady again mutates no further. Pokes `_smooth._tiles`/`_tier_of` directly (bypassing the real async
+## build) so `resident_fids()` has something to iterate — deterministic, no wall-clock wait needed (the dwell TIMEOUT
+## itself is exercised by the shipped REV2 gates; this one is scoped to the MUTATION COUNTER's own fixpoint).
+func _gate_fs_quiesce_dwell() -> void:
+	var fid := _fid_of(0, 14, 3)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	var f := FA.seam_neighbour(fid, FA.S_EAST)
+	ring._smooth._tiles[int(f)] = {}
+	ring._smooth._tier_of[int(f)] = FST.S3
+
+	var before := ring._dwell_mutation_count
+	var empty_target := {}   # `f` is resident but NOT in target — the fall-out scenario
+	ring._sticky_apply_dwell(empty_target)
+	var after_fallout := ring._dwell_mutation_count
+	_ok(after_fallout > before, "G-FS-QUIESCE warm-up (dwell): a facet falling out of target starts its dwell timer (mutation counted, %d -> %d) — non-vacuous baseline" % [before, after_fallout])
+
+	for i in range(50):
+		ring._sticky_apply_dwell(empty_target)
+	var after_hold := ring._dwell_mutation_count
+	_ok(after_hold == after_fallout, "G-FS-QUIESCE: ZERO further dwell mutations while the SAME facet just holds (not yet elapsed, not re-entering target) over 50 calls (%d -> %d)" % [after_fallout, after_hold])
+
+	# Perturb: the facet RE-ENTERS target (e.g. a crossing brought it back into range) — cancels the stale timer.
+	var target_with_f := {int(f): FST.S3}
+	ring._sticky_apply_dwell(target_with_f)
+	var after_reenter := ring._dwell_mutation_count
+	_ok(after_reenter > after_hold, "G-FS-QUIESCE perturb (dwell): re-entering target cancels the stale timer (mutation counted, %d -> %d)" % [after_hold, after_reenter])
+	for i in range(50):
+		ring._sticky_apply_dwell(target_with_f)
+	var after_settle := ring._dwell_mutation_count
+	_ok(after_settle == after_reenter, "G-FS-QUIESCE: re-settles to ZERO further dwell mutations once back in target over 50 calls (%d -> %d)" % [after_reenter, after_settle])
+	ring.free()
+
+## G-FS-QUIESCE (baker): `_recompute_want_sse`/`_recompute_band_want_sse`'s NEW axis+cam_dist hold gate (mirrors the
+## angular `_recompute_want`'s hold at facet_tex_baker.gd:835 — the SSE path had NO hold at all). Held at an
+## unchanged (axis, cam_dist): zero further recomputes; perturbed past half a facet's width: re-triggers, then
+## re-settles. Calls the baker methods directly (no FP_SKIN_SSE/FP_FACET_TEX_CLOSEUP/FP_BAND_BLOCK_MAP wiring needed
+## — `setup()` initializes `_k`/`_base_all`/`_centre_pack` unconditionally).
+func _gate_fs_quiesce_baker() -> void:
+	var fid := FA.spawn_facet()
+	var axis := _centre_dir(fid)
+	var axis_arr := [axis.x, axis.y, axis.z]
+	var cam_dist := FA.R_BLOCKS + 3000.0
+	var facet_ang := (PI * 0.5) / float(FA.K)
+	var half_width := FA.R_BLOCKS * facet_ang * 0.5
+
+	# --- close-up SSE want (_recompute_want_sse) ---
+	var baker := FacetTexBaker.new()
+	baker.setup(fid)
+	baker._recompute_want_sse(axis_arr, cam_dist, true)   # first call — always real work (empty _cu_want, no hold possible)
+	var cu_before := baker.recompute_want_count()
+	_ok(cu_before > 0, "G-FS-QUIESCE warm-up (baker close-up): _recompute_want_sse did real work on the first call — non-vacuous baseline (%d)" % cu_before)
+	for i in range(50):
+		baker._recompute_want_sse(axis_arr, cam_dist, true)   # IDENTICAL axis/cam_dist every call — held throughout
+	var cu_after := baker.recompute_want_count()
+	_ok(cu_after == cu_before, "G-FS-QUIESCE: ZERO further _recompute_want_sse work over 50 calls with an unchanged axis/cam_dist (%d -> %d)" % [cu_before, cu_after])
+	baker._recompute_want_sse(axis_arr, cam_dist - half_width - 1.0, true)   # perturb: cam_dist moves past half a facet width
+	var cu_mid := baker.recompute_want_count()
+	_ok(cu_mid > cu_after, "G-FS-QUIESCE perturb (baker close-up): a cam_dist move past half a facet width re-triggers _recompute_want_sse (%d -> %d)" % [cu_after, cu_mid])
+	for i in range(50):
+		baker._recompute_want_sse(axis_arr, cam_dist - half_width - 1.0, true)
+	var cu_final := baker.recompute_want_count()
+	_ok(cu_final == cu_mid, "G-FS-QUIESCE: re-settles to ZERO further _recompute_want_sse work after the perturbation (%d -> %d)" % [cu_mid, cu_final])
+
+	# --- band SSE want (_recompute_band_want_sse) — the SAME hold gate, briefer check. Uses a CLOSE cam_dist (well
+	# inside CLOSEUP_NEAR/BAND_PROMOTE_DIST) so the fixture facet is actually a non-empty band candidate — otherwise
+	# `_bm_want` stays permanently empty and the `not _bm_want.is_empty()` hold-gate guard would never engage
+	# (a real trap this test hit during development: cam_dist=3000 is well past the band's much shorter promote
+	# range, unlike the close-up test above whose CLOSEUP_FAR=4000 threshold DOES reach that far).
+	var band_cam_dist := FA.R_BLOCKS + 500.0
+	var baker2 := FacetTexBaker.new()
+	baker2.setup(fid)
+	baker2._recompute_band_want_sse(fid, axis_arr, band_cam_dist, true)
+	var bm_before := baker2.recompute_band_want_count()
+	_ok(bm_before > 0, "G-FS-QUIESCE warm-up (baker band): _recompute_band_want_sse did real work on the first call — non-vacuous baseline (%d)" % bm_before)
+	for i in range(50):
+		baker2._recompute_band_want_sse(fid, axis_arr, band_cam_dist, true)
+	var bm_after := baker2.recompute_band_want_count()
+	_ok(bm_after == bm_before, "G-FS-QUIESCE: ZERO further _recompute_band_want_sse work over 50 calls with an unchanged axis/cam_dist (%d -> %d)" % [bm_before, bm_after])
+	baker2._recompute_band_want_sse(fid, axis_arr, band_cam_dist - half_width - 1.0, true)
+	var bm_mid := baker2.recompute_band_want_count()
+	_ok(bm_mid > bm_after, "G-FS-QUIESCE perturb (baker band): a cam_dist move past half a facet width re-triggers _recompute_band_want_sse (%d -> %d)" % [bm_after, bm_mid])
+
+## G-FS-NOHOLE (partial — the T2 commit-generation handshake). Directly pokes the snap-gen bookkeeping (the same
+## "poke a flag-gated internal directly" pattern used throughout this file) to reproduce the EXACT race R3.2.b
+## describes: a facet is marked leaving, then a STALE build — one whose `visible_fids()` snapshot was taken BEFORE
+## the mark — commits (every commit bumps `_shell_gen`, but this one's `_last_committed_snap_gen` stays behind the
+## mark since its OWN snapshot predates it). Asserts the facet stays resident (no premature evict / hole) until a
+## build whose snapshot POSTDATES the mark actually commits. FALSIFY: the identical script with `snap_gen_on` forced
+## false (the shipped `_shell_gen`-at-mark law) DOES evict on the stale commit — proving the race is real and this
+## gate has teeth, not merely a restatement of the fix.
+func _gate_fs_nohole() -> void:
+	print("  --- REVISION 3 G-FS-NOHOLE (partial, T2): a STALE in-flight commit must NOT prematurely evict a leaving facet ---")
+	var fid := _fid_of(2, 11, 4)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	var f := FA.seam_neighbour(fid, FA.S_EAST)
+	ring._smooth._tiles[int(f)] = {}
+	ring._smooth._tier_of[int(f)] = FST.S3   # poke `f` smooth-resident directly — _mesh_inc_gate only reads resident_fids()/tier_of()
+	var empty_assign := {}   # `f` is NOT in the driver's current want — the leaving scenario
+
+	# --- (A) the FIX: snap_gen_on forced true ---
+	ring._snap_gen = 5
+	ring._last_committed_snap_gen = 5
+	var out1 := ring._mesh_inc_gate(empty_assign, true)   # marks leaving: mark = _snap_gen + 1 = 6
+	_ok(out1.has(int(f)), "G-FS-NOHOLE: the facet is held resident the instant it's marked leaving (make-before-break, unchanged from REV2)")
+	_ok(int(ring._smooth_leaving[int(f)]) == 6, "G-FS-NOHOLE: marked with mark = _snap_gen+1 = 6 — the earliest snapshot generation that CAN include the re-inclusion")
+
+	# A STALE build commits: dispatched BEFORE the mark (its own frozen snapshot used gen 5), only NOW finishes and
+	# commits — every commit bumps _shell_gen (the OLD law's only signal), but _last_committed_snap_gen stays at 5
+	# (its snapshot never advanced) since this build's OWN gen was 5, not >= the mark.
+	ring._shell_gen += 1
+	var out2 := ring._mesh_inc_gate(empty_assign, true)
+	_ok(out2.has(int(f)), "G-FS-NOHOLE: a STALE commit (_shell_gen advanced, but _last_committed_snap_gen(5) < mark(6)) does NOT evict — no premature hole")
+
+	# A genuinely POST-mark build now dispatches (bumps _snap_gen to the mark value) and commits.
+	ring._snap_gen = 6
+	ring._last_committed_snap_gen = 6
+	var out3 := ring._mesh_inc_gate(empty_assign, true)
+	_ok(not out3.has(int(f)), "G-FS-NOHOLE: once a build whose snapshot POSTDATES the mark actually commits (_last_committed_snap_gen(6) >= mark(6)), the facet is finally safe to drop")
+
+	# --- (B) FALSIFY: the identical script with snap_gen_on forced FALSE (the shipped _shell_gen-at-mark law) ---
+	ring._smooth_leaving.clear()
+	ring._shell_gen = 5
+	var out1b := ring._mesh_inc_gate(empty_assign, false)   # marked at _shell_gen = 5 (the OLD law)
+	_ok(out1b.has(int(f)), "G-FS-NOHOLE-FALSIFY setup: the facet is held resident the instant it's marked (same make-before-break)")
+	ring._shell_gen += 1   # the SAME stale commit as (A) above
+	var out2b := ring._mesh_inc_gate(empty_assign, false)
+	_ok(not out2b.has(int(f)), "G-FS-NOHOLE-FALSIFY: WITHOUT the fix (snap_gen_on off), the exact SAME stale commit DOES evict the facet prematurely — proving the race is real and this gate has teeth")
+	ring.free()

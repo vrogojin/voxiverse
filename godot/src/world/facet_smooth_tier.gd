@@ -447,6 +447,14 @@ var _refresh: Dictionary = {}         # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REV
 var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
 var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
 var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): `step()`'s own fixpoint-at-rest latch —
+# true once a call's reap/dispatch/dirty-rebuild work was ALL empty (nothing reaped, nothing new dispatched, no dirty
+# tier left to rebuild). While true, `step()` returns immediately: skips the O(_sn) reap scan, the O(res) `_next_want`
+# scan inside the dispatch loop, and the O(4) dirty-tier check. Cleared by `request()` (an actual `_want` change),
+# `_evict()` (any eviction), and `request_refresh()` (a fresh in-place rebake request) — i.e. anything that could
+# possibly need attention next call. Always false / never read with the flag off (byte-identical unconditional scan).
+var _settled := false
+var _request_rebuild_count := 0      # REVISION 3 G-FS-QUIESCE telemetry: request() calls that actually rebuilt _want/_snap_plan
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 gate telemetry (G-FS-CHURN) — read-only counters, zero behaviour
 # change: `_dispatch_count[fid]` increments once per worker dispatch for that facet (builds-per-facet); `_discarded`
 # increments whenever a FINISHED worker tile is thrown away because `_want` moved while it built (the R.1.a.4 churn
@@ -517,10 +525,17 @@ const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 ## Evicts residents no longer wanted. LAW R-B (FP_SMOOTH_MESH_INC): a resident whose TIER changed is NOT evicted here
 ## — it stays resident+drawn at its OLD tier; `_next_want`/`step()` build the NEW tier's tile and swap it in on
 ## commit (make-before-break at the mesh level). Off ⇒ the shipped immediate evict-on-tier-change runs verbatim.
-func request(assignments: Dictionary, slots: Dictionary = {}) -> void:
+func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 	var w := {}
 	for fid in assignments.keys():
 		w[int(fid)] = int(assignments[fid])
+	if idle_on and w == _want:
+		# REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): the requested resident set is BIT-IDENTICAL to what's already
+		# committed — rebuilding `_snap_plan`/`_slot_plan` (209 × 4 `seam_neighbour` scans + fresh dicts) would produce
+		# a byte-identical result, and the eviction scan below would find nothing to evict. Skip it all. Off ⇒ the
+		# shipped unconditional rebuild runs every call.
+		return
+	_request_rebuild_count += 1   # REVISION 3 G-FS-QUIESCE telemetry: a real _want/_snap_plan rebuild happened
 	_want = w
 	_snap_plan = {}
 	_slot_plan = {}
@@ -543,6 +558,8 @@ func request(assignments: Dictionary, slots: Dictionary = {}) -> void:
 			_evict(f)
 		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
 			_evict(f)   # shipped break-before-make (flag off) — byte-identical
+	if idle_on:
+		_settled = false   # REVISION 3 Q1: the assignment actually changed — step() must scan again next call
 
 func _evict(fid: int) -> void:
 	var t: int = int(_tier_of[fid])
@@ -552,6 +569,7 @@ func _evict(fid: int) -> void:
 	_refresh.erase(fid)
 	_dirty_tier[t] = true
 	_changed = true
+	_settled = false   # REVISION 3 Q1: an eviction is state change — step() must scan (and rebuild the dirty tier) again
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM, §2.1 rebuild cadence): force a currently-resident tile
 ## to be dropped so the NEXT `request()`/`step()` re-bakes it fresh (reuses `_evict`'s ledger/dirty-tier/changed
@@ -572,12 +590,18 @@ func force_rebake(fid: int) -> void:
 func request_refresh(fid: int) -> void:
 	if _tiles.has(int(fid)):
 		_refresh[int(fid)] = true
+		_settled = false   # REVISION 3 Q1: a fresh in-place rebake is now wanted — step() must dispatch it
 
 ## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
 ## facets, then rebuild AT MOST ONE dirty tier's ArrayMesh this call (the P1 perf fix — replaces the shipped B2
 ## O(everything) merged rebuild with an O(that tier's resident set) rebuild, ≤ 3 tier meshes total ⇒ ≤ +3 draws).
-func step() -> void:
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 	if _sn == 0:
+		return
+	if idle_on and _settled:
+		# REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): nothing was reaped, nothing was dispatched, and no dirty tier was left
+		# to rebuild last call — the O(_sn) reap scan, the O(res) `_next_want` scan, and the O(4) dirty-tier check would
+		# all find the SAME nothing again. Skip the whole call. Off ⇒ the shipped unconditional scan below.
 		return
 	for i in range(_sn):
 		if int(_s_task[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
@@ -634,6 +658,22 @@ func step() -> void:
 			_rebuild_tier_mesh(t)
 			_dirty_tier[t] = false
 			break   # ≤ 1 tier rebuild/frame (P1 mesh-management requirement)
+	if idle_on:
+		# REVISION 3 Q1: settled iff no dirty tier remains (this call rebuilds at most one — a 2nd+ dirty tier stays
+		# true), no worker slot is busy (an in-flight build will need reaping later), and nothing wanted-not-resident
+		# remains (`_next_want`, the same O(res) scan the dispatch loop above already pays for each idle slot — one
+		# more call here, only on a call that DIDN'T already return early, is not a new order of cost).
+		var any_dirty := false
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				any_dirty = true
+				break
+		var any_slot_busy := false
+		for i in range(_sn):
+			if int(_s_fid[i]) >= 0:
+				any_slot_busy = true
+				break
+		_settled = not any_dirty and not any_slot_busy and _next_want() < 0
 
 ## A wanted facet still needing a build dispatch: not yet resident at all, OR (LAW R-B/R-D, FP_SMOOTH_MESH_INC) already
 ## resident but its wanted TIER differs (a tier-change swap candidate) or it carries a live `_refresh` request (an
@@ -754,3 +794,12 @@ func dispatch_count(fid: int) -> int:
 ## G-FS-CHURN gate telemetry: finished worker tiles thrown away (never committed) because `_want` moved mid-build.
 func discarded_count() -> int:
 	return _discarded
+
+## REVISION 3 G-FS-QUIESCE telemetry: request() calls that actually rebuilt `_want`/`_snap_plan` (i.e. did NOT hit the
+## FP_SMOOTH_IDLE unchanged-`_want` early-out). Stays flat while the driver is settled.
+func request_rebuild_count() -> int:
+	return _request_rebuild_count
+
+## REVISION 3 G-FS-QUIESCE telemetry / Q1 introspection: is step() currently latched settled (FP_SMOOTH_IDLE)?
+func is_settled() -> bool:
+	return _settled

@@ -105,6 +105,17 @@ static func backstop_sink_level() -> float:
 	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
 	return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D: the INTERIM floor sink for a rim-eligible (active ∪
+## live-pool) facet that has not yet had its first FP_SMOOTH_RIM S2 tile commit. The plain `backstop_sink()` dip
+## (BACKSTOP_SINK_FRAC-scaled, ≈13 blocks at R=6371) is what R.1.d root-caused as the visible "FAR renders below
+## NEAR" during streaming; this collapses it to the same small ε-guard the min-envelope law already proves safe
+## (max(ENV_EPS_G, ENV_EPS_FRAC·cell) ≈ 1.5-5.2 blocks — sub-cell, not the full sink). Scoped by the CALLER to
+## FP_SMOOTH_RIM ∧ rim-eligible ∧ pre-first-S2-commit only (byte-identical off / once S2 has committed, since the
+## facet is then drawn by the S2 tile, not this plain backstop plane, via the shared law-6 emit-exclusion).
+static func backstop_sink_rim() -> float:
+	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)
+
 ## FP_ENV_FLOORED_ASYNC: the FULL radial sink for a CHORD fallback vertex — the exact pre-envelope BACKSTOP_SINK
 ## (BACKSTOP_SINK_FRAC × cell, ≈13 at R=6371), regardless of env_all. A chord is the raw profile sample, NOT the
 ## min-envelope, so it needs the full sink (not the ε) to sit ≤ the near surface — byte-for-byte the FULL_COVER

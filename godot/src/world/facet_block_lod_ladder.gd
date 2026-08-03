@@ -32,6 +32,19 @@ var _centre_cache: Dictionary = {}     # fid -> Vector3 world facet centre (datu
 var _dispatch_rounds := 0
 var _wholesale_clears := 0             # cross-level coarsening sweeps that emptied a whole ladder ring (breach guard)
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-E (one-look arbitration in code): see the identical field on
+# FacetBlockLodRing. Wired up by WorldManager ONLY when FP_FAR_SMOOTH is on; unset ⇒ byte-identical to shipped.
+var _smooth_query: Callable = Callable()
+
+## REVISION 2 LAW R-E: wire the smooth-residency arbitration query into this ladder AND every ring it owns.
+func set_smooth_query(cb: Callable) -> void:
+	_smooth_query = cb
+	for n in _rings:
+		(_rings[n] as FacetBlockLodRing).set_smooth_query(cb)
+
+func _smooth_owns(fid: int) -> bool:
+	return _smooth_query.is_valid() and bool(_smooth_query.call(fid))
+
 
 # ---- the on-screen block-size LAW (§4) -------------------------------------------------------------------------
 
@@ -138,7 +151,10 @@ func assign_levels(active_fid: int) -> Dictionary:
 				visited[nb] = true
 				var dist := (_facet_centre(nb) - centre0).length()
 				if dist <= reach:
-					candidates.append([nb, dist])
+					# REVISION 2 LAW R-E: a facet the smooth tier already draws is NEVER classified into a ladder
+					# level — code-level mutual exclusion (still traversed for BFS connectivity, just not banded).
+					if not _smooth_owns(nb):
+						candidates.append([nb, dist])
 					next.append(nb)
 				if visited.size() >= CubeSphere.BLOCK_LOD_LADDER_MAX_FACETS:
 					break

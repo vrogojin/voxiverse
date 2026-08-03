@@ -383,6 +383,12 @@ func _ready() -> void:
 			_block_lod.set_job_lane(_job_lane)
 			_block_lod.setup(TerrainConfig.active_facet())
 			_block_lod.place(_facet_ring.transform)
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-E: wire the code-level arbitration so the L1
+			# megablock ring never renders a facet the smooth tier already draws — a code invariant, never a
+			# deploy-sed convention. Only wired when FP_FAR_SMOOTH is actually on (else the Callable stays unset
+			# ⇒ `_smooth_owns` short-circuits false everywhere ⇒ byte-identical).
+			if CubeSphere.FP_FAR_SMOOTH:
+				_block_lod.set_smooth_query(Callable(_facet_ring, "is_smooth_resident"))
 			# COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5): the L2..L4 streamed ladder + the L5 GLOBAL
 			# always-resident tier — blocky relief to the horizon with a power-of-2 fall-off. Both gated + default OFF ⇒
 			# byte-identical. The ladder governs the SHARED NEVER-OOM ceiling (P1 L1 + L2..L4 + global mesh coarsened
@@ -404,6 +410,9 @@ func _ready() -> void:
 					_block_lod_ladder.set_global(_block_lod_global)
 				_block_lod_ladder.setup(TerrainConfig.active_facet())
 				_block_lod_ladder.place(_facet_ring.transform)
+				# REVISION 2 LAW R-E: same code-level arbitration for the L2..L4 ladder tiers.
+				if CubeSphere.FP_FAR_SMOOTH:
+					_block_lod_ladder.set_smooth_query(Callable(_facet_ring, "is_smooth_resident"))
 			# COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): the crisp orbit megablock
 			# disc — above the swap altitude it meshes the whole visible disc as an L4-nadir→L5-limb distance ladder
 			# and retires the smooth §2V skin. Gated + default OFF ⇒ byte-identical (node never created). Placed each

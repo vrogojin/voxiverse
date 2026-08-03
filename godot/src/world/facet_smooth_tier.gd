@@ -57,7 +57,11 @@ static func residency_for_tier(tier: int) -> int:
 ## vertex colour as the "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch
 ## keys off (`FacetFarRing._apply_smooth_normal_lit`). Defaults to the live flag (mirrors `_apply_shade_unified`'s
 ## `unified := CubeSphere.FP_SHADE_UNIFIED` pattern) so callers/gates can force it without toggling the const.
-static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT) -> Dictionary:
+## `slot` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C, FP_SMOOTH_SKIN_SLOT): the UV2.y slot to stamp on
+## every vertex instead of the hard-coded -1 — a frozen `FacetFarRing._slot_of(fid)` snapshot the caller threads
+## through (worker-safe: a plain float, no live object read). Defaults to -1.0 (the shipped base-map fallback) so
+## every existing call site (and the flag-off path) is byte-identical.
+static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the SHARED canon corner DIRECTIONS, not the facet's own
@@ -110,7 +114,7 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 				vc.a = 0.0
 			col[vi] = vc
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
-			uv2[vi] = Vector2(float(face), -1.0)
+			uv2[vi] = Vector2(float(face), slot)
 
 	# Per-vertex normal. INTERIOR (§2.5): normalized cross of the world-space tangents (central differences of the
 	# displaced grid = the density gradient on a heightfield), oriented outward (dot with the radial dir). On a
@@ -171,7 +175,8 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 ## an S2 tile's facet-edge boundary (almost always beyond R_env+feather in practice — the disc is ≤ ~160 blocks,
 ## the facet edge ~417) therefore already agrees with a neighbouring S3 tile's plain boundary before the frontier
 ## snap even runs (belt-and-suspenders on top of `snap_edge_to_pitch`).
-static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT) -> Dictionary:
+## `slot` — see `build_tile`'s R-C doc above; same frozen-snapshot discipline, same -1.0 default (byte-identical off).
+static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
@@ -224,7 +229,7 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 				vc.a = 0.0
 			col[vi] = vc
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
-			uv2[vi] = Vector2(float(face), -1.0)
+			uv2[vi] = Vector2(float(face), slot)
 
 	# Normals: identical law to `build_tile` — boundary via the canon `FarDensity.boundary_normal` (a pure function of
 	# `d` alone), interior via the central-difference cross of the FINAL (blended) grid tangents, so a normal-lit
@@ -430,9 +435,25 @@ var _want: Dictionary = {}           # fid -> tier (the driver's requested resid
 var _snap_plan: Dictionary = {}      # fid -> PackedInt32Array[4] (EDGE_WEST..NORTH → neighbour's pitch, or
                                       # FacetFarRing.CELLS if that neighbour isn't in `_want` this batch) — frozen at
                                       # request() time so the worker never reads live `_want` (single-writer discipline).
+var _slot_plan: Dictionary = {}       # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C (FP_SMOOTH_SKIN_SLOT):
+                                      # fid -> frozen UV2.y slot (FacetFarRing._slot_of snapshot at request() time,
+                                      # single-writer discipline mirrors `_snap_plan`). Empty ⇒ every fid defaults to
+                                      # -1.0 in `_build_worker` — byte-identical off.
+var _refresh: Dictionary = {}         # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC):
+                                      # fid -> true, requested via `request_refresh()` — an in-place rebuild of an
+                                      # ALREADY-resident tile at its CURRENT tier (S2 rim rebake), swapped in atomically
+                                      # on commit instead of evict-then-rebuild. Empty ⇒ `request_refresh` is the only
+                                      # writer and nothing calls it unless FP_SMOOTH_MESH_INC ⇒ byte-identical off.
 var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
 var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
 var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 gate telemetry (G-FS-CHURN) — read-only counters, zero behaviour
+# change: `_dispatch_count[fid]` increments once per worker dispatch for that facet (builds-per-facet); `_discarded`
+# increments whenever a FINISHED worker tile is thrown away because `_want` moved while it built (the R.1.a.4 churn
+# amplifier under the shipped per-frame re-ranked driver — the gate proves this is 0 under the REVISION 2 sticky +
+# mesh-inc driven path, and non-vacuously >0 in a contrived want-moved scenario).
+var _dispatch_count: Dictionary = {}  # fid -> int
+var _discarded := 0
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): the driver's LIVE player-column snapshot (absolute
 # world coords), written by `set_rim_params` on the main thread each frame BEFORE `step()` dispatches. `step()`
 # copies this into the per-slot frozen `_s_rim_col` at dispatch time (single-writer discipline, mirrors
@@ -447,6 +468,7 @@ var _s_task: PackedInt32Array
 var _s_result: Array = []
 var _s_snap: Array = []              # per-slot frozen snap plan (PackedInt32Array[4] or empty), single-writer pre-dispatch
 var _s_rim_col: Array = []           # per-slot frozen player-column Vector3 (S2 builds only), single-writer pre-dispatch
+var _s_slot: PackedFloat32Array = PackedFloat32Array()   # R-C (FP_SMOOTH_SKIN_SLOT): per-slot frozen UV2.y skin slot
 var _s_mutex: Mutex = null
 
 ## Create one MeshInstance3D per ladder tier (S2/S3/S4/S5) under `parent` (inherits the ring's placement transform),
@@ -473,6 +495,7 @@ func setup_instance(parent: Node3D, material: Material) -> void:
 	_s_result.resize(_sn)
 	_s_snap.resize(_sn)
 	_s_rim_col.resize(_sn)
+	_s_slot.resize(_sn); _s_slot.fill(-1.0)
 	_s_mutex = Mutex.new()
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): set the frozen player-column snapshot (ABSOLUTE world
@@ -489,13 +512,18 @@ const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 ## plan from THIS batch's assignment (law 4: an edge whose neighbour is in `assignments` snaps to that neighbour's
 ## pitch if coarser; an edge whose neighbour is ABSENT this batch — still shell, or a transient convergence gap —
 ## snaps to the shipped CELLS=4 shell pitch; a same-or-finer neighbour is a no-op via `snap_edge_to_pitch`'s own
-## guard). Evicts residents no longer wanted OR whose tier changed (frees the byte ledger, marks the OLD tier dirty).
-func request(assignments: Dictionary) -> void:
+## guard). `slots` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C, FP_SMOOTH_SKIN_SLOT): optional fid ->
+## UV2.y skin-slot snapshot, frozen the SAME way as the snap plan; a fid absent from `slots` gets -1.0 (shipped).
+## Evicts residents no longer wanted. LAW R-B (FP_SMOOTH_MESH_INC): a resident whose TIER changed is NOT evicted here
+## — it stays resident+drawn at its OLD tier; `_next_want`/`step()` build the NEW tier's tile and swap it in on
+## commit (make-before-break at the mesh level). Off ⇒ the shipped immediate evict-on-tier-change runs verbatim.
+func request(assignments: Dictionary, slots: Dictionary = {}) -> void:
 	var w := {}
 	for fid in assignments.keys():
 		w[int(fid)] = int(assignments[fid])
 	_want = w
 	_snap_plan = {}
+	_slot_plan = {}
 	for fid in w.keys():
 		var f := int(fid)
 		var plan := PackedInt32Array()
@@ -507,16 +535,21 @@ func request(assignments: Dictionary) -> void:
 			else:
 				plan[e] = FacetFarRing.CELLS   # the shipped shell's pitch (always the coarsest — every ladder tier snaps toward it)
 		_snap_plan[f] = plan
+		if slots.has(f):
+			_slot_plan[f] = float(slots[f])
 	for fid in _tiles.keys():
 		var f := int(fid)
-		if not _want.has(f) or int(_want[f]) != int(_tier_of[f]):
+		if not _want.has(f):
 			_evict(f)
+		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
+			_evict(f)   # shipped break-before-make (flag off) — byte-identical
 
 func _evict(fid: int) -> void:
 	var t: int = int(_tier_of[fid])
 	_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])
 	_tiles.erase(fid)
 	_tier_of.erase(fid)
+	_refresh.erase(fid)
 	_dirty_tier[t] = true
 	_changed = true
 
@@ -525,9 +558,20 @@ func _evict(fid: int) -> void:
 ## bookkeeping verbatim). The facet's role falls straight back to whatever its emit-exclusion law resolves to while
 ## no smooth tile is resident for it (for an S2/backstop-role facet: the still-warm sunk backstop quad) until the
 ## fresh tile re-commits — never a frame with neither. No-op if `fid` isn't currently resident.
+## SHIPPED (legacy) rebake path — kept for FP_SMOOTH_MESH_INC-off callers (byte-identical). REVISION 2 LAW R-D/R-B
+## (FP_SMOOTH_MESH_INC on) callers use `request_refresh` instead (below), which never evicts the collar at all.
 func force_rebake(fid: int) -> void:
 	if _tiles.has(int(fid)):
 		_evict(int(fid))
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC): request an IN-PLACE rebuild of
+## an already-resident tile at its CURRENT tier — never evicts. `_next_want`/`step()` dispatch a fresh build for
+## `fid` at its resident tier; on commit the OLD tile's bytes are swapped for the NEW ones atomically (same frame the
+## new content lands), so the facet is drawn continuously throughout — "permanently sticky, only swap-rebuilt" (R-D).
+## No-op if `fid` isn't currently resident (nothing to refresh yet — the initial build already carries fresh data).
+func request_refresh(fid: int) -> void:
+	if _tiles.has(int(fid)):
+		_refresh[int(fid)] = true
 
 ## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
 ## facets, then rebuild AT MOST ONE dirty tier's ArrayMesh this call (the P1 perf fix — replaces the shipped B2
@@ -545,7 +589,21 @@ func step() -> void:
 		var tile = _s_result[i]
 		_s_result[i] = null
 		_s_mutex.unlock()
-		if _want.has(fid) and int(_want[fid]) == tier and tile != null and not _tiles.has(fid):
+		if tile != null and not (_want.has(fid) and int(_want[fid]) == tier):
+			_discarded += 1   # G-FS-CHURN telemetry: a finished tile thrown away because `_want` moved while it built
+		if _want.has(fid) and int(_want[fid]) == tier and tile != null:
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-B/R-D: a resident tile for THIS SAME fid means
+			# either (a) a tier-change swap (FP_SMOOTH_MESH_INC: `_tier_of[fid] != tier`, the OLD tier's tile was kept
+			# resident+drawn by `request()` above instead of evicted) or (b) an in-place refresh at the SAME tier
+			# (`_refresh`, e.g. an S2 rim rebake). Either way the swap is ATOMIC on the byte ledger — the old bytes are
+			# freed and the new ones added in the SAME statement, so there is never a frame with neither tile resident.
+			if _tiles.has(fid):
+				if int(_tier_of[fid]) != tier:
+					_evict(fid)                                        # tier-change swap: drop the OLD tier's tile now
+				else:
+					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
+					_tiles.erase(fid)
+					_refresh.erase(fid)
 			var tb: int = FacetSmoothTier.tile_bytes(tile)
 			if _bytes + tb <= CubeSphere.SMOOTH_BYTES_MAX:
 				_tiles[fid] = tile
@@ -566,6 +624,8 @@ func step() -> void:
 		_s_tier[i] = tier
 		_s_snap[i] = _snap_plan.get(fid, PackedInt32Array())
 		_s_rim_col[i] = _rim_col   # §3 P3: freeze THIS batch's player column for the S2 branch (single-writer, mirrors _s_snap)
+		_s_slot[i] = float(_slot_plan.get(fid, -1.0))   # R-C (FP_SMOOTH_SKIN_SLOT): freeze THIS batch's skin slot
+		_dispatch_count[fid] = int(_dispatch_count.get(fid, 0)) + 1   # G-FS-CHURN telemetry: builds-per-facet
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
@@ -575,10 +635,17 @@ func step() -> void:
 			_dirty_tier[t] = false
 			break   # ≤ 1 tier rebuild/frame (P1 mesh-management requirement)
 
+## A wanted facet still needing a build dispatch: not yet resident at all, OR (LAW R-B/R-D, FP_SMOOTH_MESH_INC) already
+## resident but its wanted TIER differs (a tier-change swap candidate) or it carries a live `_refresh` request (an
+## in-place rebake, e.g. the S2 collar) — either way the OLD tile stays resident+drawn until the new build commits.
 func _next_want() -> int:
 	for fid in _want.keys():
 		var f := int(fid)
-		if _tiles.has(f) or _inflight(f):
+		if _inflight(f):
+			continue
+		if _tiles.has(f):
+			if CubeSphere.FP_SMOOTH_MESH_INC and (int(_tier_of[f]) != int(_want[f]) or _refresh.has(f)):
+				return f
 			continue
 		return f
 	return -1
@@ -594,14 +661,15 @@ func _build_worker(i: int) -> void:
 	var tier := int(_s_tier[i])
 	var cells := FacetSmoothTier.cells_for_tier(tier)
 	var tile: Dictionary
+	var slot: float = float(_s_slot[i]) if _s_slot.size() > i else -1.0   # R-C (FP_SMOOTH_SKIN_SLOT): frozen snapshot
 	if tier == S2 and CubeSphere.FP_SMOOTH_RIM:
 		# §3 P3: the S2 near-collar — envelope-inside-disc + feather + ε sink, against THIS batch's frozen player
 		# column (never `_rim_col` live — the worker only reads its own slot's snapshot, taken pre-dispatch).
 		var col: Vector3 = _s_rim_col[i]
 		var r_env := FacetFarRing.rim_r_env()
-		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink())
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot)
 	else:
-		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true)   # curved sphere placement, lift retired to 0 (replacement law)
+		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot)   # curved sphere placement, lift retired to 0 (replacement law)
 	var plan: PackedInt32Array = _s_snap[i]
 	if plan.size() == 4:
 		var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
@@ -678,3 +746,11 @@ func consume_changed() -> bool:
 	var c := _changed
 	_changed = false
 	return c
+
+## G-FS-CHURN gate telemetry: worker dispatches issued for `fid` so far (builds-per-facet).
+func dispatch_count(fid: int) -> int:
+	return int(_dispatch_count.get(int(fid), 0))
+
+## G-FS-CHURN gate telemetry: finished worker tiles thrown away (never committed) because `_want` moved mid-build.
+func discarded_count() -> int:
+	return _discarded

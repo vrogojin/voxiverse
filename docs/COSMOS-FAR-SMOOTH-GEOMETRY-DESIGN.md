@@ -329,3 +329,196 @@ P3 ships only if (i)/(ii) hold a full walk-rebuild under ~1.5 s worker time on t
 4. Ledger reproduced by runtime accounting + live `heap_mb` before/after each deploy.
 5. Live eyeball (deferred to the user): mountains readable from mid-altitude/orbit; no straight-line
    facet stitching anywhere; walking toward the rim shows blocky→smooth with no dip/cliff/pop.
+
+---
+
+# REVISION 2 — live-failure root-cause + fix (2026-08-03, Fable)
+
+P0-P3 shipped (4aae152 → ef68dba), passed 86/0 headless + FLAT 6042/0, deployed live — and looked
+broken: patchwork of smooth/flat/megablock facets, a grey relief lump, facets flicking skin↔smooth,
+sunk facets, fps 19-33 (proc 186 ms, hitches 4238, vox gen backlog 191), plus **the user's #1: the FAR
+terrain visibly BELOW the adjacent NEAR terrain during streaming**. Rolled back. Every failure is
+root-caused below to file:line. **The geometry substrate (P0 weld/mesher) is sound and stays; the
+residency DRIVER model and three unwired couplings are the failure.**
+
+## R.1 Root causes (confirmed in code)
+
+### R.1.a Flicker — break-before-make everywhere + camera-coupled residency (THE big one)
+1. **Evict-on-request**: `FacetSmoothTier.request()` evicts any resident whose wanted tier changed
+   (`facet_smooth_tier.gd:510-513`) — a promote/demote **destroys the tile first**, rebuilds later.
+   During the gap the facet has neither tile nor (see 3) shell coverage.
+2. **Camera-coupled ranking**: `_smooth_ranked_fids` runs a fresh BFS **every frame**
+   (`facet_far_ring.gd:431-432, 498-522`) and drops any facet failing `_front_visible(nb, nrm, thresh)`
+   (`:516`), where the cull axis is the **camera emit axis** when `_cam_set`
+   (`_cull_params`, `facet_far_ring.gd:1015-1018`). Turning the head removes facets from `ranked` →
+   they leave `_want` → `request()` evicts them **instantly**; turning back re-requests them.
+   Look-around = mass evict + rebuild = skin↔smooth flicker. The rank-BAND hysteresis
+   (`:537-557`, d1/d2/d3 = caps×1.25) only damps in-band drift; it cannot survive a rank shuffle
+   from a heading change or a facet crossing (rank is recomputed from a new BFS root).
+3. **Stale-shell hole window**: emit-exclusion is a filter on `visible_fids()`
+   (`facet_far_ring.gd:1959-1960`), but the shell mesh only honours it at its next **full async
+   re-emit** (`consume_changed()` → `_pending`, `:438-439` — the known 300-700 ms re-emit bomb).
+   On evict, `is_resident` flips false immediately and the tier mesh drops the tile within a frame
+   (`step()`/`_rebuild_tier_mesh`), but the drawn shell mesh was built with that facet **excluded**
+   → a HOLE (see-through to the sunk backstop / nothing) until the shell rebuild lands — seconds
+   under load. G-FS-EXCL asserted the *sets*, not the *committed meshes*, so this was invisible headless.
+4. **Discarded builds amplify churn**: a finished worker tile is thrown away if `_want` moved while
+   it built (`facet_smooth_tier.gd:548`) — under per-frame re-ranking the driver builds → discards →
+   rebuilds, which is why `smooth_res` hovered at 209 (< the 289 cap) while workers ran flat out.
+5. **Rim rebake is an evict**: every `RIM_REBUILD_BLOCKS=24` of walk, ALL resident S2 collar tiles
+   are `force_rebake`d **simultaneously** (`facet_far_ring.gd:468-474` → `facet_smooth_tier.gd:528-530`,
+   a plain `_evict`) — the collar drops to the ε-sunk backstop for the multi-second S2 rebuild
+   (R.1.e), then pops back. Periodic whole-collar flicker + sunk band by design.
+
+### R.1.b Patchwork (smooth / flat / HUGE BLOCKS side-by-side)
+- The ladder's resident set is capped at 25+64+200 = 289 facets (`cube_sphere.gd:700-703`) of a
+  ~1700-facet visible hemisphere — everything past rank 289 stays flat far-map skin **by
+  construction**, and during (slow, churning) convergence the boundary between the classes is
+  arbitrary and moving.
+- **The megablocks are the FP_BLOCK_LOD family / FP_BLOCKY_FARRING blocky emits still live in the
+  deployed build.** §3 P1's "deploy config: sed block-LOD rings OFF with smooth ON" made mutual
+  exclusion a *deploy-script* responsibility; nothing in code arbitrates
+  (no `is_smooth_resident` check anywhere in `facet_block_lod_*.gd` — verified by grep). Wherever the
+  smooth tile wasn't committed yet, the megablock tier showed = "some mountains are huge blocks".
+  S5 itself (13 cells = 32-block pitch, `cube_sphere.gd:697`) is per-VERTEX-interpolated
+  (`facet_smooth_tier.gd:98`, smooth-shaded quads, not per-cell-flat) — low-poly but not "blocks";
+  the literal huge blocks are the megablock tiers.
+- Mutual-exclusion-by-deploy-sed is an architecture smell: **arbitration must live in code** (one
+  authority says which system draws a facet), or every deploy is one sed away from this patchwork.
+
+### R.1.c Grey mis-colour — smooth tiles hard-code the coarsest skin tier
+`build_tile`/`build_tile_rim` write `uv2[vi] = Vector2(float(face), -1.0)`
+(`facet_smooth_tier.gd:113, 227`) — slot **hard-coded −1**. The shell emit feeds UV2.y through
+`_slot_of` (`facet_far_ring.gd:3037`): band facets carry 64+layer (block-exact id-map skin,
+FP_BAND_BLOCK_MAP), close-up facets a closeup slot. Slot −1 ⇒ the fragment falls to the **6-layer
+whole-face base map** (`facet_far_ring.gd:3262` `texture(base_map, vec3(v_uv, v_face))`) — tens of
+blocks per texel, a washed-out average (mountain ≈ stone grey), or **black when the page isn't bound
+yet** (`:3166` "null until then → black texels"). So a smooth tile paints grey-average while its flat
+neighbours paint crisp block-exact sand — the grey lump. The design's §2 law 8 claim ("skin:
+unchanged — resolves identically") was simply not implemented: the tiles never consult the band/fine
+slot snapshot. No colour gate existed to catch it.
+
+### R.1.d Sunk facets + the NEAR/FAR height misalignment (user's #1)
+Every fallback the smooth system exposes during a transient is **constructed ≤ truth**:
+- backstop = min-envelope − ε sink at 26-block cells (`_env_weld_grid` + `_sunk_positions`,
+  `facet_far_ring.gd:2700-2730`) — up to a full cell's relief below the near surface;
+- coarse shell CELLS=4 = relief sampled at 5×5 nodes/facet — a mountain between nodes **does not
+  exist** in the far mesh (the far skin sits at valley height under a near mountain);
+- block-LOD megablock top = MIN over its footprint (containment law) — below truth by the relief
+  variation over the footprint.
+The no-protrusion law makes all of these correct **only while hidden behind committed near voxels**.
+During streaming the near field hasn't filled its rim, so the ≤-truth fallback is *exposed* — "FAR
+renders below NEAR". Add R.1.a's evict windows (facet falls from true-height smooth back to the sunk
+fallback) and R.1.a.5's periodic whole-collar rebake, and sunk facets/steps were guaranteed visible.
+**Design gap named: no-protrusion needs a complement — an EQUAL-HEIGHT law at every exposed
+near↔far boundary.** ≤-truth is only licensed where committed voxels cover it; the exposed band must
+carry the same per-column `g` the near VoxelTerrain builds from (one `TerrainConfig` chain — same
+number, by construction), at all times including mid-stream.
+
+### R.1.e Perf collapse
+1. **Per-frame driver churn**: BFS + `_smooth_next_assignment` + `request()` rebuild `_snap_plan`
+   (a Dictionary + 4-slot PackedInt32Array per wanted facet, ~289 of them) **every frame**
+   (`facet_far_ring.gd:431-437`, `facet_smooth_tier.gd:493-513`).
+2. **Tier-mesh rebuild is O(tier) in GDScript per commit**: `_rebuild_tier_mesh` concatenates every
+   resident tile of the tier with a **per-element index loop** (`facet_smooth_tier.gd:639-640`,
+   `for idx in …: I.append(base+idx)`) — S3 = 25×~19k idx ≈ 480k, S5 = 200×~1.2k ≈ 240k GDScript
+   iterations, re-run near-every frame during convergence (each commit re-dirties the tier). This is
+   the proc 186 ms.
+3. **Shell re-emit bomb per residency change**: `consume_changed()` → `_pending` full-hemisphere
+   re-emit (`:438-439`) fired continuously while 289 tiles converged/churned — hitches 4238.
+4. **S2 collar cost, §7.1 fallbacks unwired**: `build_tile_rim` calls `_env_weld_grid(fid, 104)`
+   (`facet_smooth_tier.gd:189`) = ~174k `profile_at_dir`/facet at ENV_FINE_MULT=4 — the known
+   ~1 facet/s wall — ×5 facets, re-baked every 24 blocks of walk. None of §7.1's mitigations
+   (FINE_MULT 2, crescent-incremental) were implemented.
+5. **Worker starvation of the game**: smooth builds dispatch HIGH priority
+   (`facet_smooth_tier.gd:571`) with up to `SMOOTH_BUILD_SLOTS=8` slots on detected true cores —
+   on a 2-4 core browser the churning smooth/rim builds crowd out voxel generation → vox gen
+   backlog 191 → the near field streams even slower → the exposed ≤-truth fallback (R.1.d) shows
+   *longer*. The perf failure and the height failure compound each other.
+
+## R.2 Verdict on the model
+The **mesher/weld substrate (P0) is right and gate-proven** — keep it. The **tier-LADDER as a
+rank-banded, camera-coupled, re-ranked-per-frame residency model is the wrong stability model** —
+it optimizes byte budgets, not the user-visible invariant ("one or the other, never switching").
+Replace the driver's laws, not the rendering machinery:
+
+- **LAW R-A (sticky-monotonic residency).** Assignment is a pure function of `(active_fid)` via
+  **hop-ring bands** (ring 1-2 → S3, ring ≤5 → S4, ring ≤10 → S5): geometric, camera-independent,
+  changes only at a facet **crossing** — never while walking within a facet, never on look-around.
+  Drop `_front_visible` from ranking (hop radius already bounds the set; back-hemisphere facets cost
+  resident bytes but buy total stability — the ledger holds: same 289-facet worst case). Eviction
+  only when hop distance exceeds band + 2 **and** has for ≥ 5 s (dwell), LRU under the byte cap.
+- **LAW R-B (make-before-break, both directions, at the MESH level).** Tier change = build the new
+  tile, swap on commit; `request()` never evicts a resident for a tier change (kill
+  `facet_smooth_tier.gd:512` tier-mismatch evict). Rim rebake = build-then-swap (retire
+  `force_rebake`-as-evict); stagger S2 rebakes one facet at a time. Exclusion decouples from
+  correctness: **smooth-over-shell double-draw is safe** (smooth ≥ shell by no-protrusion + ε sink),
+  so a facet joins the shell-exclusion list lazily/batched (≥ N changes or 2 s debounce), and
+  LEAVING smooth requires the shell re-emit to **commit first** (facet re-included) before the tile
+  is dropped. Gate on committed meshes, not sets.
+- **LAW R-C (skin parity).** Smooth tiles carry the SAME UV2 slot law as the shell emit (route the
+  frozen `_slot_of` snapshot into the build; refresh via the tier-mesh rebuild when slots move).
+  Kill the hard-coded `(face, -1)`.
+- **LAW R-D (equal-height at the exposed rim — the user's #1).** The surface drawn immediately
+  outside the committed near field carries the per-column true `g` (the shared
+  `TerrainConfig` chain) at ≤ 4-block pitch AT ALL TIMES: S2 collar facets are **permanently
+  sticky** while backstop-role (never evicted, only swap-rebuilt); until the FIRST S2 commit the
+  fallback must not read sunk — cut the ε sink to sub-block at the exposed rim band and raise
+  `BACKSTOP_CELLS` 16→32 (§7.1 iv) as the interim floor. ≤-truth is licensed only under committed
+  voxels.
+- **LAW R-E (one-look arbitration in code).** `FP_FAR_SMOOTH` at runtime suppresses the block-LOD
+  ring/blocky-farring emission for any facet in the smooth-eligible disc — mutual exclusion is a
+  code invariant, never a deploy-sed convention.
+- Coarse floor: S5 stays (it is vertex-interpolated, not the "huge blocks") but P2 normal-lit is
+  **required with** P1 (geometry-only relief barely reads); if the live eyeball still reads faceted,
+  floor S5 13→26 cells (bytes ×4 on the S5 set ≈ +9 MB, still under ledger).
+
+## R.3 The missing gates (name the invariants the 86/0 never tested)
+1. **G-FS-STABLE (temporal stability)** — drive the real driver along a scripted path (walk 200
+   blocks, two facet crossings, four 90° camera turns, 600 steps): assert **no facet transitions
+   smooth→shell more than once**, and never within N=100 steps of becoming smooth; assert zero
+   evictions caused by camera turns.
+2. **G-FS-COVER (rendered coverage, committed-mesh level)** — every step: each front facet is drawn
+   by ≥ 1 committed mesh (shell surface actually containing its verts, OR resident tile in the
+   actually-rebuilt tier mesh) — the set-level G-FS-EXCL missed the stale-shell hole window.
+3. **G-FS-TIER-ADJ (consistency)** — adjacent smooth facets differ by ≤ 1 tier; no shell facet
+   strictly inside the smooth disc radius (no patchwork holes at steady state AND at every step of
+   the driven path).
+4. **G-FS-COLOUR (skin parity)** — for sampled columns: the smooth tile's UV2 slot == the slot the
+   shell emit would carry for that facet (`_slot_of` snapshot), and vertex colour == FarPalette of
+   that column (catches R.1.c exactly).
+5. **G-NF-HEIGHT (equal-height rim, THE acceptance gate)** — for every column of the near-field
+   boundary ring, in converged AND every unconverged driver state of the driven path: the topmost
+   drawn far-tier vertex height == near `g` (≤ 1 block ε). A flat-at-datum/env-sunk surface exposed
+   at the rim FAILS this gate.
+6. **G-FS-CHURN (work budget)** — over the driven path: builds-per-facet ≤ 2, discarded builds = 0,
+   main-thread driver+rebuild time ≤ budget/frame (catches R.1.e.1-3).
+
+## R.4 Staged fix plan (each flag-gated + headless-gateable, new gates included)
+- **R1 `FP_SMOOTH_STICKY`** — driver rewrite: hop-ring assignment (crossing-triggered), dwell+LRU
+  eviction, no camera coupling, build-then-swap tier changes, commit-even-if-want-moved (no
+  discards). Gates: G-FS-STABLE, G-FS-TIER-ADJ, G-FS-CHURN, byte ledger re-assert.
+- **R2 `FP_SMOOTH_MESH_INC`** — perf: per-tile index arrays pre-offset in the worker (main-thread
+  rebuild = `append_array` only), tier rebuild debounced (≥ 250 ms), shell exclusion re-emit batched
+  (≥ 16 changes or 2 s), driver re-rank only on crossing. Gate: G-FS-CHURN main-thread budget.
+- **R3 `FP_SMOOTH_SKIN_SLOT`** — UV2 slot parity (LAW R-C). Gate: G-FS-COLOUR.
+- **R4 `FP_SMOOTH_RIM` rev 2** — sticky S2 collar, staggered swap-rebakes, ENV_FINE_MULT 4→2 +
+  crescent-incremental envelope (§7.1 i-ii wired), web build slots ≤ 2, normal priority for ladder
+  tiles (HIGH only for the ≤ 5 collar tiles), interim `BACKSTOP_CELLS` 32 + rim ε-sink cut.
+  Gates: **G-NF-HEIGHT**, G-RIM-ENV, G-RIM-MBB re-pointed at committed meshes.
+- **R5 `FP_FAR_SMOOTH` re-arm** — code-level block-LOD/blocky-farring arbitration (LAW R-E), P2
+  normal-lit required-on, live A/B. Gate: G-FS-COVER + full suite + FLAT.
+Ship order: R1+R2 together (stability is meaningless at 19 fps), then R3, then R4 (the user's #1
+gate), then R5 live.
+
+## R.5 Verdict
+**YELLOW — fixable forward, no new rendering model needed.** The weld/mesher substrate and byte
+ledger survived contact intact; what failed is the residency policy (camera-coupled, break-before-
+make), two unwired design claims (skin parity §2 law 8, §7.1 perf fallbacks), and a deploy-sed
+arbitration that belonged in code. All are bounded driver/wiring work gateable by R.3. The one
+architectural addition this revision makes permanent: **the equal-height law at the exposed near↔far
+rim (LAW R-D / G-NF-HEIGHT) outranks the tier-ladder mechanics — it is the acceptance criterion the
+whole feature exists to satisfy.** If R4's S2 cost still can't hold walking pace after §7.1 i-ii,
+the fallback is not a model change but a baseline change: raise the always-resident far baseline to
+true-height 8-block pitch for the rim band only (bytes ≈ +1.5 MB), so the resting state is
+height-true without any bake-on-move at all.

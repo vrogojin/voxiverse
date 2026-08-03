@@ -128,6 +128,17 @@ func _initialize() -> void:
 	_gate_rim_weld(fid_int)
 	_gate_rim_mbb()
 
+	# --- REVISION 2 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 2 — live-failure root-cause + fix") ---
+	_ok(not CubeSphere.FP_SMOOTH_STICKY, "G-R2-OFF: FP_SMOOTH_STICKY defaults false (byte-off)")
+	_ok(not CubeSphere.FP_SMOOTH_MESH_INC, "G-R2-OFF: FP_SMOOTH_MESH_INC defaults false (byte-off)")
+	_ok(not CubeSphere.FP_SMOOTH_SKIN_SLOT, "G-R2-OFF: FP_SMOOTH_SKIN_SLOT defaults false (byte-off)")
+	_gate_fs_stable()
+	_gate_fs_cover()
+	_gate_fs_tier_adj()
+	_gate_fs_colour()
+	_gate_nf_height()
+	_gate_fs_churn()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -840,3 +851,351 @@ func _gate_rim_mbb() -> void:
 	_ok(never_neither, "G-RIM-MBB: every backstop-role facet is drawn every step (ring emit or resident S2) — never neither (no hole)")
 	_ok(never_both, "G-RIM-MBB: never both the ring emit AND a resident S2 tile simultaneously (no z-fight)")
 	ring.free()
+
+# =====================================================================================================================
+# REVISION 2 gates (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 2 — live-failure root-cause + fix") ----------
+# These encode what the P0-P3 gates above MISSED (§ R.3): camera-coupled residency (G-FS-STABLE), the stale-shell
+# hole window (G-FS-COVER, replacing the weak set-level G-FS-EXCL with a COMMITTED-mesh check), skin parity
+# (G-FS-COLOUR), the equal-height rim (G-NF-HEIGHT — THE acceptance gate), tier-ladder adjacency + code arbitration
+# (G-FS-TIER-ADJ), and build/discard churn (G-FS-CHURN). All new flags (FP_SMOOTH_STICKY/MESH_INC/SKIN_SLOT) are
+# poked as INTERNAL functions directly (the same "poke a flag-gated internal directly" pattern G-FS-LIT-ON /
+# G-RIM-MBB already use above), since GDScript consts are compile-time and this file runs with every REVISION 2 flag
+# at its shipped default (false) — the const-off byte-identity is asserted separately (G-R2-OFF above / FLAT run).
+# =====================================================================================================================
+
+## Manual-orchestration equivalent of `FacetFarRing._smooth_drive()` under FP_SMOOTH_STICKY (always) and, optionally,
+## FP_SMOOTH_RIM / FP_SMOOTH_MESH_INC — bypasses the compile-time const guards by calling the same private helpers
+## `_smooth_drive` itself would call (mirrors `_gate_rim_mbb`'s existing inline orchestration of the LEGACY driver).
+func _sticky_drive_step(ring: FacetFarRing, use_rim: bool, use_mesh_inc: bool) -> void:
+	if ring._active_fid != ring._sticky_active_fid:
+		ring._sticky_target = ring._smooth_hop_assignment(ring._active_fid)
+		ring._sticky_active_fid = ring._active_fid
+	var assign := ring._sticky_apply_dwell(ring._sticky_target)
+	if use_rim:
+		assign = ring._rim_assign(assign)
+	if use_mesh_inc:
+		assign = ring._mesh_inc_gate(assign)
+	ring._smooth.request(assign)
+	ring._smooth.step()
+	ring._smooth.consume_changed()
+
+func _dict_eq(a: Dictionary, b: Dictionary) -> bool:
+	if a.size() != b.size():
+		return false
+	for k in a.keys():
+		if not b.has(k) or b[k] != a[k]:
+			return false
+	return true
+
+## G-FS-STABLE (LAW R-A, the user's #1 ask) — drive the driver over a scripted path (facet crossings + camera/heading
+## turns at a FIXED position); assert NO facet flips more than the crossings warrant, and ZERO evictions caused by a
+## camera turn alone. First FALSIFIES the failure mode being fixed (the LEGACY camera-culled ranking genuinely
+## changes under a pure axis turn), then proves the NEW hop-ring assignment does not.
+func _gate_fs_stable() -> void:
+	print("  --- REVISION 2 G-FS-STABLE: hop-ring residency is camera-independent; changes ONLY at a facet crossing ---")
+	var fid_a := _fid_of(1, 8, 8)
+	var ring := FacetFarRing.new()
+	ring.setup(fid_a)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+
+	# (1) FALSIFY the failure this law replaces: the LEGACY per-frame camera-culled ranking DOES change on a pure
+	# camera-axis turn (no crossing, no player movement) — establishes the contrast is real, not a strawman.
+	ring.shell_set_camera_abs([1.0, 0.0, 0.0], FA.R_BLOCKS + 50.0, true)
+	var ranked1 := ring._smooth_ranked_fids(fid_a)
+	ring.shell_set_camera_abs([0.0, 1.0, 0.0], FA.R_BLOCKS + 50.0, true)
+	var ranked2 := ring._smooth_ranked_fids(fid_a)
+	_ok(ranked1 != ranked2,
+		"G-FS-STABLE-FALSIFY: the LEGACY camera-culled _smooth_ranked_fids result CHANGES on a pure camera turn — the exact root cause (R.1.a.2) R-A replaces, not a strawman")
+
+	# (2) R-A: the hop-ring target is IDENTICAL across the SAME camera turns (no _front_visible/cull-axis dependency
+	# anywhere in `_smooth_hop_assignment`).
+	var target1 := ring._smooth_hop_assignment(fid_a)
+	ring.shell_set_camera_abs([1.0, 0.0, 0.0], FA.R_BLOCKS + 50.0, true)
+	var target2 := ring._smooth_hop_assignment(fid_a)
+	ring.shell_set_camera_abs([0.0, 0.0, 1.0], FA.R_BLOCKS + 50.0, true)
+	var target3 := ring._smooth_hop_assignment(fid_a)
+	ring.shell_set_camera_abs([0.7071, 0.7071, 0.0], FA.R_BLOCKS + 50.0, true)
+	var target4 := ring._smooth_hop_assignment(fid_a)
+	_ok(target1.size() > 3, "G-FS-STABLE: hop assignment is non-trivial (%d facets, non-vacuous)" % target1.size())
+	_ok(_dict_eq(target1, target2) and _dict_eq(target2, target3) and _dict_eq(target3, target4),
+		"G-FS-STABLE: the hop-ring assignment is BIT-IDENTICAL across 4 different camera axes at the same active facet (R-A: camera-independent by construction)")
+
+	# (3) drive the full sticky (+ mesh-inc) pipeline through repeated camera turns at a FIXED active facet; assert
+	# the converged resident set is unchanged by a further sweep of turns (zero turn-caused churn end-to-end).
+	var axes := [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.7071, 0.7071, 0.0]]
+	var snap_after: Dictionary = {}
+	for pass_i in range(2):
+		for axis in axes:
+			ring.shell_set_camera_abs(axis, FA.R_BLOCKS + 50.0, true)
+			for k in range(300):
+				_sticky_drive_step(ring, false, true)
+		var snap := {}
+		for f in ring._smooth.resident_fids():
+			snap[int(f)] = int(ring._smooth.tier_of(f))
+		if pass_i == 0:
+			snap_after = snap
+		else:
+			_ok(snap.size() > 0, "G-FS-STABLE: the driven resident set is non-empty (non-vacuous end-to-end drive)")
+			_ok(_dict_eq(snap_after, snap),
+				"G-FS-STABLE: the FULL driven resident set is UNCHANGED after a second complete sweep of camera turns at the same active facet (zero turn-caused evictions end-to-end)")
+
+	# (4) a REAL crossing DOES change the target (the mechanism is not frozen forever — it tracks the active facet).
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_EAST)
+	ring._active_fid = fid_b
+	var target_b := ring._smooth_hop_assignment(fid_b)
+	_ok(not _dict_eq(target1, target_b),
+		"G-FS-STABLE: the hop-ring target DOES change across a real facet crossing (residency tracks the active facet, not frozen)")
+	ring.free()
+
+## G-FS-COVER (rendered coverage, COMMITTED-mesh level — replaces the weak set-level G-FS-EXCL, R.1.a.3's stale-
+## shell hole window). Drives real crossings through the sticky+mesh-inc pipeline with periodic REAL shell commits
+## (`force_rebuild`, mirroring the batched/debounced cadence); every facet the driver has ever targeted must, at
+## EVERY subsequent step, be drawn by >=1 COMMITTED mesh: `is_emitted` (the shell's LAST ACTUAL commit, not a live
+## recompute of `visible_fids()`) OR a currently-resident smooth tile. A stale-shell/evicted-tile hole fails this.
+func _gate_fs_cover() -> void:
+	print("  --- REVISION 2 G-FS-COVER: every facet ever targeted is drawn by >=1 COMMITTED mesh (not merely 'in a set') ---")
+	var fid_a := _fid_of(2, 6, 6)
+	var ring := FacetFarRing.new()
+	ring.setup(fid_a)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	ring.force_rebuild()
+
+	var watch := {}
+	var cover_ok := true
+	var checked_steps := 0
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_EAST)
+	var fid_c := FA.seam_neighbour(fid_b, FA.S_NORTH)
+	var crossings := [fid_a, fid_b, fid_c]
+	for c in crossings:
+		ring._active_fid = int(c)
+		for step in range(150):
+			_sticky_drive_step(ring, false, true)
+			for f in ring._sticky_target.keys():
+				watch[int(f)] = true
+			if step % 4 == 0:
+				ring.force_rebuild()   # a real, periodic shell commit (mirrors the batched re-emit cadence)
+			checked_steps += 1
+			for f in watch.keys():
+				var committed: bool = ring.is_emitted(int(f)) or ring._smooth.is_resident(int(f))
+				if not committed:
+					cover_ok = false
+	_ok(watch.size() > 3, "G-FS-COVER: exercised a meaningful watch-set across %d crossings (%d facets ever targeted)" % [crossings.size(), watch.size()])
+	_ok(checked_steps > 0, "G-FS-COVER: drove %d steps" % checked_steps)
+	_ok(cover_ok, "G-FS-COVER: every facet ever targeted by the sticky driver is, at EVERY subsequent step, drawn by >=1 COMMITTED mesh — never a stale-shell hole during the leaving handshake")
+	ring.free()
+
+## G-FS-TIER-ADJ — adjacent resident facets differ by <=1 tier (no patchwork holes); no shell/blocky facet strictly
+## inside the smooth disc (LAW R-E: `FacetBlockLodLadder.assign_levels` never classifies a smooth-owned facet).
+func _gate_fs_tier_adj() -> void:
+	print("  --- REVISION 2 G-FS-TIER-ADJ: adjacent hop-ring tiers differ by <=1; no blocky-LOD facet inside the smooth disc ---")
+	var fid := _fid_of(0, 10, 10)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	var target := ring._smooth_hop_assignment(fid)
+	var adj_ok := true
+	var pairs_tested := 0
+	var slots := [FA.S_EAST, FA.S_WEST, FA.S_NORTH, FA.S_SOUTH]
+	for f in target.keys():
+		var t: int = int(target[f])
+		for slot in slots:
+			var nb := FA.seam_neighbour(int(f), slot)
+			if not target.has(nb):
+				continue
+			pairs_tested += 1
+			if absi(t - int(target[nb])) > 1:
+				adj_ok = false
+	_ok(pairs_tested > 0, "G-FS-TIER-ADJ: tested %d adjacent hop-ring-assigned pairs (non-vacuous)" % pairs_tested)
+	_ok(adj_ok, "G-FS-TIER-ADJ: every adjacent pair of hop-ring-assigned facets differs by <=1 tier")
+
+	# R-E code arbitration: FacetBlockLodLadder.assign_levels must never classify a facet the smooth tier owns. Use
+	# only the NEAR S3 ring (hop<=2) as the "smooth-owned" set for this check — the full hop<=10 `target` would
+	# swallow the ladder's ENTIRE (much closer-in) BFS reach and make "classified a non-empty set" vacuously true
+	# for the wrong reason (nothing left to classify at all, not "arbitration correctly excluded it").
+	var near_owned := {}
+	for f in target.keys():
+		if int(target[f]) == FST.S3:
+			near_owned[int(f)] = true
+	var ladder := FacetBlockLodLadder.new()
+	ladder.set_smooth_query(func(f): return near_owned.has(int(f)))
+	var by_level := ladder.assign_levels(fid)
+	var leaked := false
+	var total_classified := 0
+	for lvl in by_level:
+		for f in by_level[lvl]:
+			total_classified += 1
+			if near_owned.has(int(f)):
+				leaked = true
+	_ok(total_classified > 0, "G-FS-TIER-ADJ: the ladder classified a non-empty set (the arbitration check isn't vacuous)")
+	_ok(not leaked, "G-FS-TIER-ADJ (LAW R-E): FacetBlockLodLadder.assign_levels NEVER classifies a smooth-resident facet into a blocky level — code-level arbitration, not deploy-sed")
+	# FALSIFY: without the query wired (the pre-R-E state), the SAME smooth-owned facets DO get classified —
+	# proving the check is not vacuously true regardless of wiring.
+	var ladder_unwired := FacetBlockLodLadder.new()
+	var by_level_unwired := ladder_unwired.assign_levels(fid)
+	var leaked_unwired := false
+	for lvl in by_level_unwired:
+		for f in by_level_unwired[lvl]:
+			if near_owned.has(int(f)):
+				leaked_unwired = true
+	_ok(leaked_unwired, "G-FS-TIER-ADJ-FALSIFY: WITHOUT the R-E query wired, the ladder DOES classify smooth-owned facets — proves set_smooth_query is the thing actually preventing the leak above")
+	ladder.free()
+	ladder_unwired.free()
+	ring.free()
+
+## G-FS-COLOUR (LAW R-C, skin parity) — a smooth tile's per-vertex UV2 skin slot equals the shell's `_slot_of` slot
+## for that column; a hard-coded `(face,-1)` tile (the pre-R-C defect — the grey lump) FAILS this.
+func _gate_fs_colour() -> void:
+	print("  --- REVISION 2 G-FS-COLOUR: smooth tile skin slot == shell skin slot for that column (kills the grey lump) ---")
+	var fid := _fid_of(1, 3, 3)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._band_slot_snapshot[fid] = 7   # force a nonzero (real, non-default) band slot so parity is a meaningful test
+	var slot: float = ring._slot_of(fid)
+	_ok(absf(slot - float(64 + 7)) < 1e-6, "G-FS-COLOUR: fixture band slot resolves to the expected UV2.y (%.1f)" % slot)
+
+	var cells := FST.cells_for_tier(FST.S4)
+	var tile_parity := FST.build_tile(fid, cells, 0.0, true, false, slot)
+	var uv2: PackedVector2Array = tile_parity["uv2"]
+	var parity_ok := true
+	for v in uv2:
+		if absf((v as Vector2).y - slot) > 1e-6:
+			parity_ok = false
+	_ok(parity_ok, "G-FS-COLOUR: build_tile(slot=%.1f) stamps the SAME slot on every vertex — parity with the shell's _slot_of for this column" % slot)
+
+	# FALSIFY: the pre-R-C hard-coded default (-1, no slot arg) must NOT match the real band slot.
+	var tile_default := FST.build_tile(fid, cells, 0.0, true, false)
+	var uv2_default: PackedVector2Array = tile_default["uv2"]
+	var mismatch := false
+	for v in uv2_default:
+		if absf((v as Vector2).y - slot) > 1e-6:
+			mismatch = true
+	_ok(mismatch, "G-FS-COLOUR-FALSIFY: the pre-R-C hard-coded (face,-1) tile does NOT match the real band slot (%.1f) — exactly the grey-lump defect this gate must catch" % slot)
+
+	# build_tile_rim (the S2 collar) carries the SAME parity.
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var tile_rim := FST.build_tile_rim(fid, FST.cells_for_tier(FST.S2), centre_node["pos"], 80.0, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), false, slot)
+	var uv2_rim: PackedVector2Array = tile_rim["uv2"]
+	var rim_parity_ok := true
+	for v in uv2_rim:
+		if absf((v as Vector2).y - slot) > 1e-6:
+			rim_parity_ok = false
+	_ok(rim_parity_ok, "G-FS-COLOUR: build_tile_rim(slot=%.1f) ALSO carries the same skin-slot parity on the S2 collar" % slot)
+	ring.free()
+
+## G-NF-HEIGHT (LAW R-D — THE acceptance gate): the far tier's boundary-ring vertex height == the near ground truth
+## `g` for that column. Three parts: (a) FALSIFY — quantify the LEGACY interim gap (the plain full sink, R.1.d's
+## "FAR renders below NEAR"); (b) R-D's reduced interim ε-sink (pre-first-S2-commit) is a measured, wired-through
+## improvement; (c) once an S2 tile exists — a PURE function of its frozen inputs, so this holds at EVERY call,
+## "including every not-yet-converged" driver state by construction — every vertex beyond the feather (the boundary
+## ring, where near voxels do NOT occupy the column) equals TRUE height EXACTLY. Strictly INSIDE R_env (under the
+## player's own near voxels) height is intentionally <= true (no-protrusion), never claimed equal — see the report.
+func _gate_nf_height() -> void:
+	print("  --- REVISION 2 G-NF-HEIGHT (the acceptance gate): far boundary-ring height == near truth, incl. mid-stream ---")
+	var fid := _fid_of(2, 9, 9)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+
+	# (a)/(b): compare the LEGACY full-sink emit against the R-D reduced-interim-sink emit for the SAME (uncommitted)
+	# facet — both are radial pushes of the SAME underlying `_bpos_cache[fid]` truth reference, so their difference
+	# is EXACTLY the sink amount (no confounders).
+	_ok(int(ring._smooth.tier_of(fid)) != FST.S2, "G-NF-HEIGHT fixture: no S2 tile resident yet (testing the pre-commit interim floor)")
+	var legacy_positions := ring.backstop_rendered_positions(fid)        # plain full sink (pre-R-D)
+	var interim_positions := ring.backstop_rendered_positions_live(fid, true)  # R-D reduced ε-sink (rim_on forced — poke the internal, not the const)
+	_ok(TierPlace.backstop_sink_rim() < TierPlace.backstop_sink(),
+		"G-NF-HEIGHT: R-D's interim ε-sink (%.2f blk) is strictly smaller than the legacy full sink (%.2f blk) — a real, quantified improvement" % [TierPlace.backstop_sink_rim(), TierPlace.backstop_sink()])
+	var expect_gap := TierPlace.backstop_sink() - TierPlace.backstop_sink_rim()
+	var wired_ok := true
+	for i in range(legacy_positions.size()):
+		var gap: float = legacy_positions[i].distance_to(interim_positions[i])
+		if absf(gap - expect_gap) > 1e-3:
+			wired_ok = false
+	_ok(wired_ok, "G-NF-HEIGHT: the LIVE emit actually narrows the pre-commit interim gap by exactly (legacy_sink - rim_sink) = %.2f blocks, end-to-end (not just at the formula level)" % expect_gap)
+
+	# (c) THE hard equality: once an S2 tile is built (a pure function — holds unconditionally, i.e. at every driver
+	# state including not-yet-converged), every vertex beyond R_env+feather equals TRUE height EXACTLY.
+	var cells := FST.cells_for_tier(FST.S2)
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var player_col: Vector3 = centre_node["pos"]
+	var r_env := 60.0
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+	var rim_tile := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink)
+	var true_tile := FST.build_tile(fid, cells, 0.0, true)
+	var rim_pos: PackedVector3Array = rim_tile["pos"]
+	var true_pos: PackedVector3Array = true_tile["pos"]
+	var beyond_checked := 0
+	var equal_ok := true
+	var inside_never_above := true
+	for i in range(rim_pos.size()):
+		var dist := true_pos[i].distance_to(player_col)
+		if dist > r_env + feather:
+			beyond_checked += 1
+			if rim_pos[i].distance_to(true_pos[i]) > 1.0e-4:
+				equal_ok = false
+		elif dist <= r_env:
+			# inside the disc: intentionally <= true (no-protrusion), never above it — the complementary law, not
+			# claimed equal (near voxels occupy this column; see the report's disclosed scope of this gate).
+			var d: Vector3 = true_pos[i].normalized()
+			if (rim_pos[i] - true_pos[i]).dot(d) > 1.0e-3:
+				inside_never_above = false
+	_ok(beyond_checked > 0, "G-NF-HEIGHT: %d vertices sampled beyond the feather (the boundary-ring claim is non-vacuous)" % beyond_checked)
+	_ok(equal_ok, "G-NF-HEIGHT: EVERY committed-S2-tile vertex beyond R_env+feather equals TRUE near-ground height EXACTLY (<=1e-4 blk) — far == near at the boundary ring, by construction, at any driver state")
+	_ok(inside_never_above, "G-NF-HEIGHT: strictly inside R_env the S2 vertex NEVER rises above true height (the complementary no-protrusion law — not claimed equal, since near voxels occupy that column)")
+	ring.free()
+
+## G-FS-CHURN (work budget) — over a driven path: builds-per-facet <=2 for every currently-resident facet, 0
+## discarded builds. First falsifies non-vacuously (a contrived want-moved-mid-flight scenario DOES discard).
+func _gate_fs_churn() -> void:
+	print("  --- REVISION 2 G-FS-CHURN: builds-per-facet <=2, 0 discarded builds, over a driven sticky+mesh-inc path ---")
+	var fid_a := _fid_of(0, 8, 8)
+	var ring := FacetFarRing.new()
+	ring.setup(fid_a)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+
+	# (1) FALSIFY non-vacuous: a want-moved-mid-flight scenario DOES increment discarded_count. `OS.delay_msec`
+	# between polls gives the background WorkerThreadPool task REAL wall-clock time to finish (a tight zero-delay
+	# poll loop can spin thousands of times before the OS thread gets scheduled at all, which is what starved the
+	# very first version of this check) — never touches WorkerThreadPool directly (that stays FacetSmoothTier's job).
+	var probe_fid := FA.seam_neighbour(fid_a, FA.S_EAST)
+	ring._smooth.request({int(probe_fid): FST.S3})
+	ring._smooth.step()          # dispatches the build (worker task now in flight)
+	ring._smooth.request({})     # `_want` no longer includes probe_fid WHILE its build is still in flight
+	var waited_ms := 0
+	while ring._smooth.discarded_count() == 0 and waited_ms < 4000:
+		OS.delay_msec(2)
+		ring._smooth.step()
+		waited_ms += 2
+	_ok(ring._smooth.discarded_count() >= 1, "G-FS-CHURN-FALSIFY: a want-moved-mid-flight scenario DOES increment discarded_count (%d) — the counter is not dead code" % ring._smooth.discarded_count())
+
+	# (2) drive the REAL sticky+mesh-inc path across a crossing and assert the budget.
+	var ring2 := FacetFarRing.new()
+	ring2.setup(fid_a)
+	ring2._smooth = FST.new()
+	ring2._smooth.setup_instance(ring2, null)
+	for step in range(2000):
+		_sticky_drive_step(ring2, false, true)
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_WEST)
+	ring2._active_fid = fid_b
+	for step in range(2000):
+		_sticky_drive_step(ring2, false, true)
+	var over_budget := false
+	var max_dispatch := 0
+	var resident_n: int = ring2._smooth.resident_fids().size()
+	for f in ring2._smooth.resident_fids():
+		var dc: int = ring2._smooth.dispatch_count(int(f))
+		max_dispatch = maxi(max_dispatch, dc)
+		if dc > 2:
+			over_budget = true
+	_ok(resident_n > 0, "G-FS-CHURN: the driven path converged a non-empty resident set (%d tiles)" % resident_n)
+	_ok(not over_budget, "G-FS-CHURN: every currently-resident facet was built <=2 times across the driven crossing (max observed: %d)" % max_dispatch)
+	_ok(ring2._smooth.discarded_count() == 0, "G-FS-CHURN: ZERO discarded builds over the sticky+mesh-inc driven path (make-before-break never throws away a finished tile)")
+	ring.free()
+	ring2.free()

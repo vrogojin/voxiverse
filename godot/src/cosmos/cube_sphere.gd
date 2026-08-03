@@ -723,6 +723,24 @@ const SMOOTH_BUILD_SLOTS := 8               # WorkerThreadPool tiles in flight (
 ## (G-RIM-ENV/WELD/MBB). YELLOW stage — §7.1 perf-risk fallback ladder (ENV_FINE_MULT step-down, incremental rebuild,
 ## BACKSTOP_CELLS 16→32) applies if the S2 envelope bake can't keep up with a walking player on a 2-core browser.
 const FP_SMOOTH_RIM := false
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 — the live-failure fix flags (re-added after a deploy-checkout
+## wiped the uncommitted originals; commit BEFORE deploying). All default false → byte-off.
+## FP_SMOOTH_STICKY (R-A): residency = pure hop-ring function of the active facet, changes ONLY at facet crossings,
+##   never on camera/heading turns; dwell-held on fall-out. Kills the camera-coupled flicker.
+const FP_SMOOTH_STICKY := false
+## FP_SMOOTH_MESH_INC (R-B): mesh-level make-before-break — build the new tier tile then swap; a facet leaving smooth
+##   stays drawn until the shell re-emit COMMITS its replacement. No 1-frame hole / see-through-to-sunk-backstop.
+const FP_SMOOTH_MESH_INC := false
+## FP_SMOOTH_SKIN_SLOT (R-C): smooth tiles carry the shell's _slot_of band-skin UV2 slot instead of the hard-coded
+##   (face,-1) that dropped them to the grey 6-face base map. Kills the grey lump.
+const FP_SMOOTH_SKIN_SLOT := false
+## R-A hop-ring bands (S3/S4/S5 by BFS hop-distance from the active facet) + the fall-out dwell hold (ms).
+const SMOOTH_STICKY_S3_HOP := 2
+const SMOOTH_STICKY_S4_HOP := 5
+const SMOOTH_STICKY_S5_HOP := 10
+const SMOOTH_STICKY_DWELL_MS := 5000
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

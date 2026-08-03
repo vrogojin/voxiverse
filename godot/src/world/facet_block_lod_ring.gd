@@ -78,6 +78,21 @@ var _sun_dir := Vector3(1.0, 0.0, 0.0)
 var _effective_rim := CubeSphere.BLOCK_LOD_L1_RIM_BLOCKS
 var _wholesale_clears := 0             # diagnostics: ledger-breach wholesale clears (gate reads to prove it fired)
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-E (one-look arbitration in code): an optional Callable(fid)->bool
+# — "is this facet currently drawn by the smooth tier?" — wired up by WorldManager ONLY when FP_FAR_SMOOTH is on
+# (`FacetFarRing.is_smooth_resident`). When set, `band_fids()` excludes any smooth-resident facet from this ring's
+# own band so the blocky L1 megablock tier never co-renders with a smooth tile for the SAME facet — a code invariant
+# instead of the deploy-sed convention R.1.b named ("mutual exclusion is a code invariant, never a deploy-sed
+# convention"). An invalid (unset) Callable ⇒ every check short-circuits false ⇒ byte-identical to shipped.
+var _smooth_query: Callable = Callable()
+
+## REVISION 2 LAW R-E: wire the smooth-residency arbitration query. No-op call (never invoked) unless FP_FAR_SMOOTH.
+func set_smooth_query(cb: Callable) -> void:
+	_smooth_query = cb
+
+func _smooth_owns(fid: int) -> bool:
+	return _smooth_query.is_valid() and bool(_smooth_query.call(fid))
+
 # COSMOS MAIN-THREAD ORCHESTRATION TH4 (docs/COSMOS-MAINTHREAD-ORCHESTRATION-DESIGN.md §2 — same worker/commit split
 # the §2V FacetTexBaker proved): the ~1 s analytic L0 bake + greedy mesh (_build_facet_arrays, PURE) runs on the TH0
 # JobLane WORKER; MAIN pays ONLY the commit (ArrayMesh + add_child + ledger). CONVERGENCE: the whole band (≤5) is
@@ -167,11 +182,14 @@ func _prewarm_statics(active_fid: int) -> void:
 
 ## The L1 band for `active_fid`: the active facet ∪ its 4 ridge (seam) neighbours. Bounded (§5/§7) so the streamed
 ## set is O(1) per crossing. Deterministic order (active first) so the active facet is always the protected member.
+## REVISION 2 LAW R-E: a ridge neighbour currently owned by the smooth tier (`_smooth_owns`) is excluded from the
+## band — the smooth tile draws it instead, so this ring never megablock-renders a facet the smooth system already
+## covers. The active facet itself is never smooth-resident (near voxels own it) so this never strips it.
 func band_fids(active_fid: int) -> Array:
 	var out: Array = [active_fid]
 	for slot in range(4):
 		var nb := FacetAtlas.seam_neighbour(active_fid, slot)
-		if nb >= 0 and not out.has(nb):
+		if nb >= 0 and not out.has(nb) and not _smooth_owns(nb):
 			out.append(nb)
 	return out
 

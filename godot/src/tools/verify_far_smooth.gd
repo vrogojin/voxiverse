@@ -141,17 +141,24 @@ func _initialize() -> void:
 
 	# --- REVISION 3 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3 — quiescence + no-hole commit model") ---
 	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake). Stage 2 scope: T1 (off-thread, atomic tier-mesh
-	# commits). Stage 3 scope (this stage): Q2 (slot indirection — kills the shell's re-emit-on-slot-change engine
-	# AND the mesh-baked smooth-tile staleness). T3 (neighbour-aware weld refresh) is the LATER stage — not gated here.
+	# commits). Stage 3 scope: Q2 (slot indirection — kills the shell's re-emit-on-slot-change engine AND the
+	# mesh-baked smooth-tile staleness). Stage 4 scope (this stage, the LAST one): T3 (neighbour-aware weld refresh).
 	_ok(not CubeSphere.FP_SMOOTH_IDLE, "G-R3-OFF: FP_SMOOTH_IDLE defaults false (byte-off)")
 	_ok(not CubeSphere.FP_SHELL_SNAP_GEN, "G-R3-OFF: FP_SHELL_SNAP_GEN defaults false (byte-off)")
 	_ok(not CubeSphere.FP_SMOOTH_TXN, "G-R3-OFF: FP_SMOOTH_TXN defaults false (byte-off; step() takes the shipped ≤1-tier/frame main-thread path)")
 	_ok(not CubeSphere.FP_SLOT_INDIRECT, "G-R3-OFF: FP_SLOT_INDIRECT defaults false (byte-off; UV2.y still carries the shipped _slot_of bake)")
+	_ok(not CubeSphere.FP_SMOOTH_WELD_REFRESH, "G-R3-OFF: FP_SMOOTH_WELD_REFRESH defaults false (byte-off; _weld_refresh_neighbours is never called)")
 	_gate_fs_quiesce()
 	_gate_fs_nohole()
 	_gate_fs_nohole_txn()
 	_gate_fs_txn_thread()
 	_gate_slot_indirect_shader()
+	# fid_a=(4,7,8) picked by direct measurement (not fid_int) — a facet whose S3/S5 boundary-vs-chord gap at the
+	# EAST edge is large (real mountainous relief, ~12.5 blocks measured), so the WITHOUT-fix crack assertion
+	# (> the 4-block skirt) is robust rather than terrain-location-luck; fid_int's own gap there was only ~1 block.
+	_gate_fs_weld_neighbour(_fid_of(4, 7, 8), FA.S_EAST)
+	_gate_fs_quiesce_weld_refresh()
+	_gate_fs_nohole_weld_refresh()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -1707,3 +1714,260 @@ func _gate_slot_indirect_shader() -> void:
 		_ok(on_code.count("shader_type") == off_code.count("shader_type"),
 			"G-SLOT-ON: %s spliced source has the SAME shader_type count as off (zero new compiled programs)" % name)
 	_ok(not CubeSphere.FP_SLOT_INDIRECT, "G-SLOT-OFF: FP_SLOT_INDIRECT defaults false (byte-off)")
+
+# =====================================================================================================================
+# REVISION 3 STAGE 4 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3" R3.4 T3, FP_SMOOTH_WELD_REFRESH) — THE
+# LAST STAGE. Neighbour-aware weld refresh closes R3.2.c: a tile's 4-edge boundary snap is FROZEN at request()/build
+# time (`_snap_plan` at request(), applied once in `_build_worker`). `request()` keeps `_snap_plan`'s VALUE
+# forward-fresh on every call (recomputed for everyone in `_want`), but nothing ever revisits an ALREADY-BUILT
+# neighbour's geometry when that value changes — its edge stays snapped to whatever pitch was current when IT was
+# last built, opening a T-junction crack the 4-block skirt can't always cover. G-FS-WELD-NEIGHBOUR drives TWO bare
+# `FacetSmoothTier` instances directly (mirrors T1's "poke internals / force flags via function params" gates): two
+# adjacent facets commit at the SAME pitch (S3, welded — G-FS-WELD-EDGE style), then ONE promotes to S5 (a real tier
+# CHANGE, the biggest jump the ladder has besides S2, cstride=4 — a wide sampling gap so the crack is unmistakable).
+# WITHOUT the fix the neighbour's tile is provably NEVER rebuilt and the post-promote boundary gap is shown to
+# exceed the skirt (non-vacuous — the crack is demonstrated, not asserted by fiat); WITH the fix the neighbour gets
+# a staggered, build-then-swap `request_refresh` (via the T1 atomic path when `FP_SMOOTH_TXN` is also on) and the
+# boundary re-coincides on the NEW (S5) chord. G-FS-QUIESCE/G-FS-NOHOLE are re-run (forcing weld_refresh_on too) to
+# prove T3 composes with the Q1 idle latch (zero refreshes at rest) and doesn't reopen the T1 no-hole proof.
+# =====================================================================================================================
+
+## Reverse-edge lookup: which of `nb`'s 4 tile-local edges (FacetSmoothTier.EDGE_WEST..NORTH convention) borders
+## `fid`? Independently reimplemented here (not calling `FacetSmoothTier`'s own private helper) so the gate doesn't
+## just retest the same code path it's trying to falsify.
+func _tile_edge_facing(nb: int, fid: int) -> int:
+	for e2 in range(4):
+		if FA.seam_neighbour(nb, FST._EDGE_SEAM_SLOT[e2]) == fid:
+			return e2
+	return -1
+
+func _opposite_fa_slot(slot: int) -> int:
+	match slot:
+		FA.S_EAST: return FA.S_WEST
+		FA.S_WEST: return FA.S_EAST
+		FA.S_NORTH: return FA.S_SOUTH
+		_: return FA.S_NORTH
+
+## Run the WITHOUT/WITH T3 scenario on a bare `FacetSmoothTier`. `weld_on` forces `FP_SMOOTH_WELD_REFRESH` via the
+## function params (never the compile-time const, matching every other force-tested flag in this file). Both
+## fixtures converge fully at S3/S3 first (a real TRANSITION is tested below, never the legitimate initial-ramp
+## gap), then `fid_a` promotes to S5 while `nb` stays put at S3 — exactly the R3.2.c scenario.
+func _run_weld_neighbour(fid_a: int, nb: int, weld_on: bool) -> Dictionary:
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+
+	ft.request({fid_a: FST.S3, nb: FST.S3}, {}, false, weld_on)
+	_converge_ft(ft, false)
+	var warm_ok := ft.is_resident(fid_a) and ft.is_resident(nb) \
+		and int(ft.tier_of(fid_a)) == FST.S3 and int(ft.tier_of(nb)) == FST.S3
+	var nb_pos_before: PackedVector3Array = (ft._tiles[nb]["pos"] as PackedVector3Array).duplicate()
+
+	# The churn: fid_a promotes S3 -> S5 (a real tier CHANGE). nb's OWN request stays S3 — untouched except for
+	# whatever T3 does to it.
+	ft.request({fid_a: FST.S5, nb: FST.S3}, {}, false, weld_on)
+	for i in range(500):
+		OS.delay_msec(2)
+		ft.step(false, false, weld_on)
+
+	var tier_a := int(ft.tier_of(fid_a)) if ft.is_resident(fid_a) else -1
+	var tier_nb := int(ft.tier_of(nb)) if ft.is_resident(nb) else -1
+	var nb_pos_after: PackedVector3Array = (ft._tiles[nb]["pos"] as PackedVector3Array).duplicate() if ft.is_resident(nb) else PackedVector3Array()
+	var fid_a_pos_after: PackedVector3Array = (ft._tiles[fid_a]["pos"] as PackedVector3Array).duplicate() if ft.is_resident(fid_a) else PackedVector3Array()
+	var rebuilt := nb_pos_before.size() != nb_pos_after.size()
+	if not rebuilt:
+		for k in range(nb_pos_before.size()):
+			if nb_pos_before[k].distance_to(nb_pos_after[k]) > 1.0e-9:
+				rebuilt = true
+				break
+
+	parent.free()
+	return {"warm_ok": warm_ok, "nb_after": nb_pos_after, "fid_a_after": fid_a_pos_after,
+		"rebuilt": rebuilt, "tier_a": tier_a, "tier_nb": tier_nb}
+
+## G-FS-WELD-NEIGHBOUR (REVISION 3 T3, FP_SMOOTH_WELD_REFRESH): see the file-header block comment above for the
+## full scenario. `fid_a`/`slot` mirror `_gate_weld_mixed`'s fixture convention (`slot` = fid_a's OWN edge facing
+## its neighbour; an IN-FACE pair gives direct gi/gj index correspondence, no nearest-match needed).
+func _gate_fs_weld_neighbour(fid_a: int, slot: int) -> void:
+	print("  --- REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH): neighbour-aware weld refresh closes the stale-snap-plan crack (R3.2.c) ---")
+	var nb := FA.seam_neighbour(fid_a, slot)
+	_ok(_face_of(nb) == _face_of(fid_a), "G-FS-WELD-NEIGHBOUR: fixture neighbour is in-face (direct index correspondence)")
+
+	var fine_cells := FST.cells_for_tier(FST.S3)     # nb stays S3 throughout — the FINE side once fid_a promotes
+	var coarse_cells := FST.cells_for_tier(FST.S5)   # fid_a's post-promote tier — the COARSE side (coarse-owns-edge)
+	var cstride := fine_cells / coarse_cells
+	var fine_stride := fine_cells + 1
+	var coarse_stride := coarse_cells + 1
+	var opp := _opposite_fa_slot(slot)
+	var nb_edge_idx := _edge_indices(opp, fine_cells, fine_stride)
+	var fid_a_edge_idx := _edge_indices(slot, coarse_cells, coarse_stride)
+
+	# --- (A) WITHOUT the fix ---
+	var off := _run_weld_neighbour(fid_a, nb, false)
+	_ok(bool(off["warm_ok"]), "G-FS-WELD-NEIGHBOUR warm-up (off): initial S3/S3 residency converges (non-vacuous baseline)")
+	_ok(int(off["tier_a"]) == FST.S5, "G-FS-WELD-NEIGHBOUR (off): fid_a actually promoted to S5 after the churn")
+	_ok(int(off["tier_nb"]) == FST.S3, "G-FS-WELD-NEIGHBOUR (off): nb stays at S3 throughout (never itself re-tiered)")
+	_ok(not bool(off["rebuilt"]), "G-FS-WELD-NEIGHBOUR-FALSIFY: WITHOUT the fix, the neighbour's tile is NEVER rebuilt after fid_a's tier change (the frozen boundary geometry — R3.2.c's exact staleness)")
+
+	var nb_pos_off: PackedVector3Array = off["nb_after"]
+	var fid_a_pos_off: PackedVector3Array = off["fid_a_after"]
+	var max_gap_off := 0.0
+	for gj in range(1, fine_cells):
+		if gj % cstride == 0:
+			continue
+		var j0 := gj / cstride
+		var j1 := mini(j0 + 1, coarse_cells)
+		var lo := float(gj - j0 * cstride) / float(cstride)
+		var chord: Vector3 = fid_a_pos_off[fid_a_edge_idx[j0]].lerp(fid_a_pos_off[fid_a_edge_idx[j1]], lo)
+		var d: float = nb_pos_off[nb_edge_idx[gj]].distance_to(chord)
+		if d > max_gap_off:
+			max_gap_off = d
+	_ok(max_gap_off > float(CubeSphere.SMOOTH_SKIRT_BLOCKS),
+		"G-FS-WELD-NEIGHBOUR-FALSIFY: WITHOUT the fix, the post-promote boundary gap (%.3f blocks) EXCEEDS the %d-block skirt — the crack is real, non-vacuous" % [max_gap_off, CubeSphere.SMOOTH_SKIRT_BLOCKS])
+
+	# --- (B) WITH the fix ---
+	var on := _run_weld_neighbour(fid_a, nb, true)
+	_ok(bool(on["warm_ok"]), "G-FS-WELD-NEIGHBOUR warm-up (on): the SAME initial S3/S3 residency converges (non-vacuous baseline)")
+	_ok(int(on["tier_a"]) == FST.S5, "G-FS-WELD-NEIGHBOUR (on): fid_a actually promoted to S5 after the churn")
+	_ok(int(on["tier_nb"]) == FST.S3, "G-FS-WELD-NEIGHBOUR (on): nb is REFRESHED in place, never re-tiered/evicted (residency untouched)")
+	_ok(bool(on["rebuilt"]), "G-FS-WELD-NEIGHBOUR: WITH the fix, the neighbour's tile GETS rebuilt (request_refresh dispatched, build-then-swap)")
+
+	var nb_pos_on: PackedVector3Array = on["nb_after"]
+	var fid_a_pos_on: PackedVector3Array = on["fid_a_after"]
+	var on_chord := true
+	var coarse_exact := true
+	var eps_pos := 1.0e-9 * FA.R_BLOCKS
+	for gj in range(0, fine_cells + 1):
+		var j0 := gj / cstride
+		var j1 := mini(j0 + 1, coarse_cells)
+		var lo := float(gj - j0 * cstride) / float(cstride)
+		var chord: Vector3 = fid_a_pos_on[fid_a_edge_idx[j0]].lerp(fid_a_pos_on[fid_a_edge_idx[j1]], lo)
+		if nb_pos_on[nb_edge_idx[gj]].distance_to(chord) > 1.0e-6:
+			on_chord = false
+		if gj % cstride == 0:
+			if nb_pos_on[nb_edge_idx[gj]].distance_to(fid_a_pos_on[fid_a_edge_idx[j0]]) > eps_pos:
+				coarse_exact = false
+	_ok(on_chord, "G-FS-WELD-NEIGHBOUR: WITH the fix, the refreshed neighbour boundary lies exactly on fid_a's NEW (S5) chord — the crack closes")
+	_ok(coarse_exact, "G-FS-WELD-NEIGHBOUR: the neighbour's coarse-index vertices bit-match fid_a's actual S5 tile there (≤1e-9·R — the P0 canon weld, not just the snap lerp)")
+
+## G-FS-QUIESCE re-run (T3): a stationary scene (no tier changes) must trigger ZERO weld refreshes even with
+## FP_SMOOTH_WELD_REFRESH forced on — `_weld_refresh_neighbours` is only ever reached from a real commit/eviction,
+## so simply holding a converged residency steady must never call `request_refresh` again. Perturb (a real
+## promote) must cause exactly the neighbour reweld count to move, then re-settle to zero further churn.
+func _gate_fs_quiesce_weld_refresh() -> void:
+	print("  --- REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH) composes with the Q1 idle latch — zero refreshes at rest ---")
+	var fid_a := _fid_of(3, 9, 2)
+	var nb := FA.seam_neighbour(fid_a, FA.S_EAST)
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+
+	ft.request({fid_a: FST.S3, nb: FST.S3}, {}, false, true)
+	_converge_ft(ft, false)
+	_ok(ft.is_resident(fid_a) and ft.is_resident(nb), "G-FS-QUIESCE (T3) warm-up: initial S3/S3 residency converges (non-vacuous baseline)")
+
+	# Settle: re-issue the IDENTICAL request (idle_on forced true this time) + step for many frames — nothing
+	# changed, so `_weld_refresh_neighbours` must never fire (no commit/eviction event occurs at all).
+	for i in range(600):
+		ft.request({fid_a: FST.S3, nb: FST.S3}, {}, true, true)
+		ft.step(true, false, true)
+	var refresh_before_perturb := ft._refresh.size()
+	_ok(refresh_before_perturb == 0, "G-FS-QUIESCE (T3): ZERO queued weld refreshes over 600 settled frames at unchanged residency (%d)" % refresh_before_perturb)
+
+	# Perturb: a real tier change on fid_a — nb MUST get a queued refresh, then (once dispatched+committed) the
+	# refresh queue drains back to empty and stays there.
+	ft.request({fid_a: FST.S5, nb: FST.S3}, {}, true, true)
+	var saw_refresh := ft._refresh.has(nb)
+	for i in range(500):
+		OS.delay_msec(2)
+		ft.request({fid_a: FST.S5, nb: FST.S3}, {}, true, true)
+		ft.step(true, false, true)
+		if ft._refresh.has(nb):
+			saw_refresh = true
+	_ok(saw_refresh, "G-FS-QUIESCE perturb (T3): a real neighbour tier change DOES queue a weld refresh (not permanently stuck at zero)")
+	_ok(ft._refresh.is_empty(), "G-FS-QUIESCE (T3): the refresh queue drains back to empty once the reweld actually commits")
+
+	# Re-settle: hold the post-promote state steady — zero further refreshes.
+	for i in range(300):
+		ft.request({fid_a: FST.S5, nb: FST.S3}, {}, true, true)
+		ft.step(true, false, true)
+	_ok(ft._refresh.is_empty(), "G-FS-QUIESCE (T3): re-settles to ZERO further weld refreshes once the promote is fully absorbed")
+	parent.free()
+
+## G-FS-NOHOLE re-run (T3): the SAME strengthened churn script as `_gate_fs_nohole_txn` (`_simulate_tier_commit` —
+## NOT the real `request()`/`step()` dispatch path: under the shipped `FP_SMOOTH_MESH_INC`-off "break-before-make"
+## law a tier change evicts IMMEDIATELY at `request()` time, long before its replacement build lands — an existing,
+## orthogonal characteristic of that path, not something T3 introduces or is responsible for fixing; the ORIGINAL
+## T1 gate already tests the "both tiers dirty together" moment this way for exactly that reason), but with T3's
+## own hook (`ft._weld_refresh_neighbours`) invoked exactly as `step()`'s post-commit path would, plus a THIRD
+## facet (`fid_c`) adjacent to the churning pair to prove the neighbour reweld itself composes safely with T1's
+## atomic transaction — never a hole/z-fight, and the reweld actually lands (content changes, no evict).
+func _gate_fs_nohole_weld_refresh() -> void:
+	print("  --- REVISION 3 T3 composes with T1's no-hole guarantee (FP_SMOOTH_TXN + FP_SMOOTH_WELD_REFRESH both on) ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var fid_a := _fid_of(2, 8, 4)
+	var fid_b := _fid_of(2, 8, 5)
+	var fid_c := _fid_of(2, 8, 6)   # adjacent to fid_b — the neighbour T3 should reweld once fid_b's tier moves
+
+	ft.request({fid_a: FST.S4, fid_b: FST.S5, fid_c: FST.S3}, {}, false, true)
+	_converge_ft(ft, true)
+	var warm_committed := ft.committed_fids_snapshot()
+	var warm_ok := true
+	for fid in [fid_a, fid_b, fid_c]:
+		var found := 0
+		for t in range(4):
+			if (warm_committed[t] as Dictionary).has(int(fid)):
+				found += 1
+		if found != 1:
+			warm_ok = false
+	_ok(warm_ok, "G-FS-NOHOLE (T1+T3) warm-up: initial population still converges to exactly-one-committed-tier coverage per facet")
+	var fid_c_pos_before: PackedVector3Array = (ft._tiles[fid_c]["pos"] as PackedVector3Array).duplicate()
+
+	# The churn: fid_a demotes S4->S5, fid_b promotes S5->S4 (compound, same 2 tiers, simulated together exactly as
+	# a real FP_SMOOTH_MESH_INC-on commit would land) — then T3's own post-commit hook, exactly as `step()` invokes it.
+	ft.request({fid_a: FST.S5, fid_b: FST.S4, fid_c: FST.S3}, {}, false, true)   # refreshes _snap_plan/_want only
+	var tile_a := FST.build_tile(fid_a, FST.cells_for_tier(FST.S5), 0.0, true, false, -1.0)
+	var tile_b := FST.build_tile(fid_b, FST.cells_for_tier(FST.S4), 0.0, true, false, -1.0)
+	_simulate_tier_commit(ft, fid_a, FST.S5, tile_a)
+	ft._weld_refresh_neighbours(fid_a)
+	_simulate_tier_commit(ft, fid_b, FST.S4, tile_b)
+	ft._weld_refresh_neighbours(fid_b)
+	var queued_refresh := ft._refresh.has(fid_c)
+	_ok(queued_refresh, "G-FS-NOHOLE (T1+T3): fid_b's tier change queues a `request_refresh` on its neighbour fid_c (T3 fires)")
+
+	var hole := false
+	var zfight := false
+	var steps := 0
+	for i in range(600):
+		OS.delay_msec(2)
+		ft.step(false, true, true)
+		steps += 1
+		var snap := ft.committed_fids_snapshot()
+		for fid in [fid_a, fid_b, fid_c]:
+			if not ft.is_resident(fid):
+				continue
+			var found := 0
+			for t in range(4):
+				if (snap[t] as Dictionary).has(int(fid)):
+					found += 1
+			if found == 0:
+				hole = true
+			elif found > 1:
+				zfight = true
+		if hole or zfight:
+			break
+	_ok(steps > 0, "G-FS-NOHOLE (T1+T3): drove %d churn steps (promote+demote+neighbour reweld, weld refresh live)" % steps)
+	_ok(not hole, "G-FS-NOHOLE (T1+T3): FP_SMOOTH_TXN+FP_SMOOTH_WELD_REFRESH both on — NEVER a step where a resident facet is baked into ZERO committed tier meshes")
+	_ok(not zfight, "G-FS-NOHOLE (T1+T3): NEVER a step where a resident facet is baked into TWO committed tier meshes at once")
+	_ok(ft.is_resident(fid_c) and int(ft.tier_of(fid_c)) == FST.S3, "G-FS-NOHOLE (T1+T3): fid_c is REFRESHED in place (still S3, never evicted/re-tiered) while its boundary rewelds")
+	var fid_c_pos_after: PackedVector3Array = (ft._tiles[fid_c]["pos"] as PackedVector3Array).duplicate()
+	var fid_c_rebuilt := fid_c_pos_before.size() != fid_c_pos_after.size()
+	if not fid_c_rebuilt:
+		for k in range(fid_c_pos_before.size()):
+			if fid_c_pos_before[k].distance_to(fid_c_pos_after[k]) > 1.0e-9:
+				fid_c_rebuilt = true
+				break
+	_ok(fid_c_rebuilt, "G-FS-NOHOLE (T1+T3): fid_c's queued reweld actually commits (its geometry changes) by the end of the churn")
+	parent.free()

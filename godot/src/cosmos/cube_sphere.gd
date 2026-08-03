@@ -817,6 +817,32 @@ const FP_SMOOTH_TXN := false
 ##   (G-FS-QUIESCE, completed; golden shader-string pin).
 const FP_SLOT_INDIRECT := false
 
+## FP_SMOOTH_WELD_REFRESH (R3.4 T3, closes R3.2.c): neighbour-aware weld refresh. A tile's 4-edge boundary snap is
+##   FROZEN at `FacetSmoothTier.request()` time (`_snap_plan`, `facet_smooth_tier.gd:525-537`, applied once at build
+##   `:673-680` / worker `:757-764`) against whichever pitch its neighbours held AT THAT MOMENT. When a NEIGHBOUR's
+##   COMMITTED tier later changes — promotes, demotes, joins smooth residency for the first time, or leaves it back
+##   to the shipped shell — nothing ever revisits the already-built tile's frozen plan: its edge stays snapped to the
+##   STALE pitch, opening a T-junction crack the `SMOOTH_SKIRT_BLOCKS=4` skirt can't always cover (a 32-block-pitch
+##   S5 cell's relief step routinely exceeds 4 blocks). This flag closes that gap: whenever a facet's COMMITTED tier
+##   actually changes (`FacetSmoothTier._evict`, and the reap-commit path in `step()` when the NEW state differs from
+##   the OLD), `_weld_refresh_neighbours` walks that facet's ≤4 seam neighbours (`FacetAtlas.seam_neighbour`, the
+##   SAME `_EDGE_SEAM_SLOT` convention `request()` uses) and, for each that is CURRENTLY smooth-resident with a stale
+##   `_snap_plan` entry for the shared edge, rewrites that one entry to the facet's NEW effective pitch (its
+##   `cells_for_tier` if still resident, else the shipped shell's `FacetFarRing.CELLS` if it left smooth residency
+##   entirely) and queues a `request_refresh` (REVISION 2 LAW R-D's existing in-place-rebuild primitive — never an
+##   evict) for that neighbour — bounded by construction to ≤4 neighbours per commit event, never unbounded. Because
+##   `request_refresh`'s dispatch previously required `FP_SMOOTH_MESH_INC` (`_next_want`'s gate), this flag also ORs
+##   itself into that gate (`step()`'s `refresh_dispatch_on := FP_SMOOTH_MESH_INC or weld_refresh_on`) so a weld
+##   refresh dispatches even with MESH_INC off; the dispatched rebuild reuses `snap_edge_to_pitch`/
+##   `snap_edges_to_coarse` against the CORRECTED plan and, under `FP_SMOOTH_TXN`, commits through T1's atomic
+##   off-thread transaction (LAW T) — so the reweld itself is hole-free. Re-snapping to an already-correct pitch is a
+##   no-op (the plan-entry comparison short-circuits before ever calling `request_refresh`), so a stationary scene
+##   with no tier changes triggers ZERO refreshes (composes with the Q1 idle latch). Off ⇒ `_weld_refresh_neighbours`
+##   is never called, `_next_want`'s gate reduces to the shipped `FP_SMOOTH_MESH_INC`-only check — byte-identical,
+##   FLAT 6042/0. Gate: verify_far_smooth.gd G-FS-WELD-NEIGHBOUR (falsifies: without the flag the crack is shown;
+##   with it the boundary re-coincides), G-FS-QUIESCE/G-FS-NOHOLE re-run unaffected.
+const FP_SMOOTH_WELD_REFRESH := false
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

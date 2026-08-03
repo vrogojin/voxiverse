@@ -444,6 +444,18 @@ var _refresh: Dictionary = {}         # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REV
                                       # ALREADY-resident tile at its CURRENT tier (S2 rim rebake), swapped in atomically
                                       # on commit instead of evict-then-rebuild. Empty ⇒ `request_refresh` is the only
                                       # writer and nothing calls it unless FP_SMOOTH_MESH_INC ⇒ byte-identical off.
+var _built_snap: Dictionary = {}      # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH):
+                                      # fid -> PackedInt32Array[4], the `_snap_plan[fid]` a resident tile was ACTUALLY
+                                      # built with (recorded at commit time). `_snap_plan[fid]` itself is always kept
+                                      # forward-fresh by `request()` (recomputed for everyone in `_want` on every call)
+                                      # — the staleness T3 closes is that a tile's OWN GEOMETRY doesn't consume a new
+                                      # `_snap_plan` value until it is actually rebuilt, so `_weld_refresh_neighbours`
+                                      # compares THIS (what's baked in) against the current `_snap_plan` (what's wanted)
+                                      # to decide whether a neighbour needs a reweld — never derives a pitch itself.
+                                      # Maintained unconditionally (mirrors `_dispatch_count`'s always-on telemetry
+                                      # discipline — a few ints per resident fid, no behaviour change) but only ever
+                                      # CONSULTED from `_weld_refresh_neighbours`, itself only called under
+                                      # FP_SMOOTH_WELD_REFRESH ⇒ byte-identical off.
 var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
 var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
 var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
@@ -554,7 +566,14 @@ const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 ## Evicts residents no longer wanted. LAW R-B (FP_SMOOTH_MESH_INC): a resident whose TIER changed is NOT evicted here
 ## — it stays resident+drawn at its OLD tier; `_next_want`/`step()` build the NEW tier's tile and swap it in on
 ## commit (make-before-break at the mesh level). Off ⇒ the shipped immediate evict-on-tier-change runs verbatim.
-func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
+## `weld_refresh_on` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3, FP_SMOOTH_WELD_REFRESH): after evicting a
+## facet that left `_want` ENTIRELY (falls back to the shipped shell for good — no replacement tile is coming this
+## cycle), re-check its still-resident neighbours' frozen snap plans (`_weld_refresh_neighbours`) against its new
+## "gone, shell pitch" state. Deliberately NOT applied to the tier-CHANGE eviction branch just below (the shipped
+## MESH_INC-off break-before-make): that facet's own imminent re-commit (once its new-tier build lands) already
+## fires the SAME check with the FINAL, correct new pitch (`step()`'s post-commit hook) — checking here too would
+## use the transiently-wrong "not resident yet" pitch and could bounce a neighbour's refresh twice for no reason.
+func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH) -> void:
 	var w := {}
 	for fid in assignments.keys():
 		w[int(fid)] = int(assignments[fid])
@@ -585,8 +604,10 @@ func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSph
 		var f := int(fid)
 		if not _want.has(f):
 			_evict(f)
+			if weld_refresh_on:
+				_weld_refresh_neighbours(f)   # REVISION 3 T3: gone for good — its neighbours' frozen plans can finalize now
 		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
-			_evict(f)   # shipped break-before-make (flag off) — byte-identical
+			_evict(f)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
 	if idle_on:
 		_settled = false   # REVISION 3 Q1: the assignment actually changed — step() must scan again next call
 
@@ -596,6 +617,7 @@ func _evict(fid: int) -> void:
 	_tiles.erase(fid)
 	_tier_of.erase(fid)
 	_refresh.erase(fid)
+	_built_snap.erase(fid)
 	_dirty_tier[t] = true
 	_tier_change_seq[t] = int(_tier_change_seq[t]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 	_changed = true
@@ -622,11 +644,58 @@ func request_refresh(fid: int) -> void:
 		_refresh[int(fid)] = true
 		_settled = false   # REVISION 3 Q1: a fresh in-place rebake is now wanted — step() must dispatch it
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH, closes R3.2.c): `fid`'s COMMITTED
+## residency just changed (a tier promote/demote landed, a first commit joined smooth residency, or an eviction
+## dropped it back to the shipped shell) — walk `fid`'s ≤4 seam neighbours (the SAME `_EDGE_SEAM_SLOT` convention
+## `request()` uses to build a facet's OWN plan). `request()` ALREADY keeps `_snap_plan` forward-fresh for everyone
+## in `_want` on every call (recomputed from scratch whenever `w` changes at all) — so the staleness here is NEVER
+## in the plan VALUE, it's in whether a resident neighbour's ACTUAL BUILT GEOMETRY has caught up to it. For each
+## neighbour that is CURRENTLY smooth-resident, compare what it was ACTUALLY built with (`_built_snap`, frozen at
+## its own last commit) against its CURRENT `_snap_plan` entry for the shared edge (already updated by whichever
+## `request()` call changed `fid`'s tier, which necessarily ran before `fid`'s build could even be dispatched). A
+## mismatch means the neighbour's committed tile is snapped to a PITCH THAT NO LONGER EXISTS — a T-junction crack
+## (R3.2.c) the 4-block skirt alone can't always cover. Fix: queue a `request_refresh` (REVISION 2 LAW R-D's
+## in-place-rebuild primitive — never an evict, so the neighbour keeps drawing its OLD boundary until the corrected
+## rebuild commits); under FP_SMOOTH_TXN the commit itself lands through T1's atomic off-thread transaction (LAW T),
+## so the reweld is hole-free. Bounded by construction: a facet has at most 4 seam neighbours, so this is ≤4
+## neighbour checks (each an O(4) reverse-edge scan to find WHICH of the neighbour's edges borders `fid` — robust to
+## cross-face rotation, no assumed opposite-index mapping) per commit/evict event — never unbounded, never
+## per-frame (only ever called from a real commit/evict). Re-snapping to an ALREADY-consumed plan is a no-op (the
+## comparison below short-circuits before `request_refresh` is ever called) — a stationary scene with no tier
+## changes triggers ZERO refreshes here (composes with the Q1 idle latch: this function is only ever reached from
+## `request()`'s "gone for good" eviction or `step()`'s post-commit hook, neither of which fires at rest). A
+## neighbour that ISN'T currently smooth-resident (still shell, or mid-convergence with no `_snap_plan` entry yet)
+## is skipped — its OWN future `request()`/build computes a fresh, correct plan against whatever is resident then,
+## so there is nothing here to pre-empt.
+func _weld_refresh_neighbours(fid: int) -> void:
+	for e in range(4):
+		var nb := FacetAtlas.seam_neighbour(fid, _EDGE_SEAM_SLOT[e])
+		if nb < 0 or not _tiles.has(nb) or not _snap_plan.has(nb):
+			continue
+		var nb_edge := -1
+		for e2 in range(4):
+			if FacetAtlas.seam_neighbour(nb, _EDGE_SEAM_SLOT[e2]) == fid:
+				nb_edge = e2
+				break
+		if nb_edge < 0:
+			continue
+		var current: PackedInt32Array = _snap_plan[nb]
+		var built: PackedInt32Array = _built_snap.get(nb, PackedInt32Array())
+		if built.size() != 4 or int(built[nb_edge]) != int(current[nb_edge]):
+			request_refresh(nb)
+
 ## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
 ## facets, then commit dirty tier ArrayMesh(es) — either the shipped ≤1-tier/frame main-thread rebuild, or (REVISION 3
 ## T1, FP_SMOOTH_TXN) an atomic off-thread transaction over every tier the reap loop above just dirtied together
 ## (`_step_tier_txn`, LAW T: never a call that swaps only some of a multi-tier commit).
-func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN) -> void:
+## `weld_refresh_on` (REVISION 3 T3, FP_SMOOTH_WELD_REFRESH): (a) after a fresh commit lands, if it represents a
+## genuine tier ASSIGNMENT change (not merely a same-tier in-place refresh) triggers `_weld_refresh_neighbours(fid)`
+## against `fid`'s now-final committed state (deliberately NOT at the tier-swap `_evict()` a few lines above — that
+## intermediate "not resident yet" state would compute the WRONG pitch; only the FINAL post-commit state is checked);
+## (b) ORs into the `_next_want` refresh-dispatch gate (`refresh_dispatch_on`) so a queued `request_refresh` actually
+## dispatches even with `FP_SMOOTH_MESH_INC` off — REVISION 2's rim rebake and T3's weld reweld share the SAME
+## in-place-rebuild primitive (`_refresh`/`request_refresh`), gated by whichever feature needs it.
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH) -> void:
 	if _sn == 0:
 		return
 	if idle_on and _settled:
@@ -634,6 +703,7 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 		# to rebuild last call — the O(_sn) reap scan, the O(res) `_next_want` scan, and the O(4) dirty-tier check would
 		# all find the SAME nothing again. Skip the whole call. Off ⇒ the shipped unconditional scan below.
 		return
+	var refresh_dispatch_on := CubeSphere.FP_SMOOTH_MESH_INC or weld_refresh_on
 	for i in range(_sn):
 		if int(_s_task[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
@@ -652,9 +722,11 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 			# resident+drawn by `request()` above instead of evicted) or (b) an in-place refresh at the SAME tier
 			# (`_refresh`, e.g. an S2 rim rebake). Either way the swap is ATOMIC on the byte ledger — the old bytes are
 			# freed and the new ones added in the SAME statement, so there is never a frame with neither tile resident.
-			if _tiles.has(fid):
-				if int(_tier_of[fid]) != tier:
-					_evict(fid)                                        # tier-change swap: drop the OLD tier's tile now
+			var was_resident := _tiles.has(fid)
+			var prev_tier := int(_tier_of.get(fid, -1))   # REVISION 3 T3: captured BEFORE any evict/erase below mutates it
+			if was_resident:
+				if prev_tier != tier:
+					_evict(fid)                       # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
 				else:
 					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
 					_tiles.erase(fid)
@@ -667,12 +739,20 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 				_dirty_tier[tier] = true
 				_tier_change_seq[tier] = int(_tier_change_seq[tier]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 				_changed = true
+				var snap_used: PackedInt32Array = _s_snap[i]   # REVISION 3 T3: record what THIS commit was actually built with
+				_built_snap[fid] = snap_used.duplicate() if snap_used.size() == 4 else PackedInt32Array()
+				if weld_refresh_on and (not was_resident or prev_tier != tier):
+					# REVISION 3 T3: `fid`'s COMMITTED tier genuinely changed (first commit, promote, or demote) — its
+					# NEW pitch may now mismatch a resident neighbour's frozen boundary snap (R3.2.c). A same-tier
+					# in-place refresh (was_resident and prev_tier == tier) presents the SAME pitch, so neighbours
+					# stay correctly welded already — nothing to recheck there.
+					_weld_refresh_neighbours(fid)
 		_s_fid[i] = -1
 		_s_task[i] = -1
 	for i in range(_sn):
 		if int(_s_fid[i]) >= 0:
 			continue
-		var fid := _next_want()
+		var fid := _next_want(refresh_dispatch_on)
 		if fid < 0:
 			break
 		var tier: int = int(_want[fid])
@@ -710,18 +790,22 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 			if int(_s_fid[i]) >= 0:
 				any_slot_busy = true
 				break
-		_settled = not any_dirty and not any_slot_busy and _next_want() < 0
+		_settled = not any_dirty and not any_slot_busy and _next_want(refresh_dispatch_on) < 0
 
-## A wanted facet still needing a build dispatch: not yet resident at all, OR (LAW R-B/R-D, FP_SMOOTH_MESH_INC) already
+## A wanted facet still needing a build dispatch: not yet resident at all, OR (`refresh_on` — LAW R-B/R-D under
+## FP_SMOOTH_MESH_INC, or REVISION 3 T3 under FP_SMOOTH_WELD_REFRESH, either of which sets `refresh_on`) already
 ## resident but its wanted TIER differs (a tier-change swap candidate) or it carries a live `_refresh` request (an
-## in-place rebake, e.g. the S2 collar) — either way the OLD tile stays resident+drawn until the new build commits.
-func _next_want() -> int:
+## in-place rebake, e.g. the S2 collar OR a T3 neighbour weld reweld) — either way the OLD tile stays resident+drawn
+## until the new build commits. `refresh_on` defaults to the shipped `FP_SMOOTH_MESH_INC`-only check (byte-identical
+## call sites unaffected); `step()` passes `refresh_dispatch_on` (`FP_SMOOTH_MESH_INC or weld_refresh_on`) so a T3
+## refresh dispatches even with MESH_INC off.
+func _next_want(refresh_on := CubeSphere.FP_SMOOTH_MESH_INC) -> int:
 	for fid in _want.keys():
 		var f := int(fid)
 		if _inflight(f):
 			continue
 		if _tiles.has(f):
-			if CubeSphere.FP_SMOOTH_MESH_INC and (int(_tier_of[f]) != int(_want[f]) or _refresh.has(f)):
+			if refresh_on and (int(_tier_of[f]) != int(_want[f]) or _refresh.has(f)):
 				return f
 			continue
 		return f

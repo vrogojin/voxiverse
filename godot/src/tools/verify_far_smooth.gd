@@ -140,16 +140,18 @@ func _initialize() -> void:
 	_gate_fs_churn()
 
 	# --- REVISION 3 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3 — quiescence + no-hole commit model") ---
-	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake). Stage 2 scope (this stage): T1 (off-thread,
-	# atomic tier-mesh commits). Q2 (slot indirection) and T3 (neighbour-aware weld refresh) are LATER stages — not
-	# gated here.
+	# Stage 1 scope: Q1 (idle driver) + T2 (snapshot-gen handshake). Stage 2 scope: T1 (off-thread, atomic tier-mesh
+	# commits). Stage 3 scope (this stage): Q2 (slot indirection — kills the shell's re-emit-on-slot-change engine
+	# AND the mesh-baked smooth-tile staleness). T3 (neighbour-aware weld refresh) is the LATER stage — not gated here.
 	_ok(not CubeSphere.FP_SMOOTH_IDLE, "G-R3-OFF: FP_SMOOTH_IDLE defaults false (byte-off)")
 	_ok(not CubeSphere.FP_SHELL_SNAP_GEN, "G-R3-OFF: FP_SHELL_SNAP_GEN defaults false (byte-off)")
 	_ok(not CubeSphere.FP_SMOOTH_TXN, "G-R3-OFF: FP_SMOOTH_TXN defaults false (byte-off; step() takes the shipped ≤1-tier/frame main-thread path)")
+	_ok(not CubeSphere.FP_SLOT_INDIRECT, "G-R3-OFF: FP_SLOT_INDIRECT defaults false (byte-off; UV2.y still carries the shipped _slot_of bake)")
 	_gate_fs_quiesce()
 	_gate_fs_nohole()
 	_gate_fs_nohole_txn()
 	_gate_fs_txn_thread()
+	_gate_slot_indirect_shader()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -1221,22 +1223,24 @@ func _gate_fs_churn() -> void:
 # compile-time false, so FLAT `verify_feature` is unaffected by anything in this section).
 # =====================================================================================================================
 
-## G-FS-QUIESCE (partial — the Q1 DRIVER's contribution only; scope per the stage brief). Three independent,
-## non-vacuous sub-checks, each: (a) prove the counter actually does real work during warm-up/perturbation (not a
-## vacuous always-0 counter), (b) prove it goes FLAT (zero further mutation) once nothing changes, (c) perturb and
-## prove it moves again then re-settles. The skin/shell re-emit engines (R3.1.a/b) and the mesh-baked skin-slot
-## staleness (R3.1.d) are Q2/T1/Q3's job — NOT asserted zero here; those subsystems still churn at rest until those
-## LATER stages ship (an honest scope note, not a gap in THIS gate).
+## G-FS-QUIESCE (COMPLETE as of Q2 — the Q1 driver's own fixpoint counters PLUS the shell's slot-triggered re-emit
+## engine, R3.1.b, AND the mesh-baked skin-slot staleness, R3.1.d). Four independent, non-vacuous sub-checks, each:
+## (a) prove the counter/behaviour actually does real work during warm-up/perturbation (not a vacuous always-0
+## counter or an always-true assertion), (b) prove it goes FLAT (zero further mutation, or zero re-emit) once
+## nothing changes, (c) perturb and prove it moves again then re-settles (or, for the slot sub-gate, falsify with
+## the flag off to prove the harness has teeth). REMAINING scope note (honest, not a gap): Q3's skin-CONTENT
+## convergence bound (the whole-planet fine/band bake sweeps still repaint the visible disc for real wall-clock
+## time even under Q2 — Q2 only stops that repainting from forcing MESH work) and T3's neighbour-aware weld
+## refresh are LATER stages, not asserted here.
 func _gate_fs_quiesce() -> void:
-	print("  --- REVISION 3 G-FS-QUIESCE (partial, Q1 driver): zero-work fixpoint at rest ---")
+	print("  --- REVISION 3 G-FS-QUIESCE (complete, Q1+Q2): zero-work fixpoint at rest, slot changes never re-emit ---")
 	_gate_fs_quiesce_driver()
 	_gate_fs_quiesce_dwell()
 	_gate_fs_quiesce_baker()
-	print("  NOTE (G-FS-QUIESCE scope): asserts 0 delta on request()/_snap_plan rebuilds, step()'s own settle latch, the")
-	print("  dwell-scan mutation counter, and the baker's SSE want-recompute counters — the Q1 driver counters this")
-	print("  stage controls. The shell's OWN full re-emit engine (R3.1.a/b: skin-convergence sweeps + close-up/band")
-	print("  commits forcing a full shell rebuild) and the mesh-baked skin-slot staleness (R3.1.d) are Q2/T1/Q3 — a")
-	print("  live/real session still shows unrelated texture-driven shell re-emits + _shell_gen churn until those ship.")
+	_gate_fs_quiesce_slot()
+	print("  NOTE (G-FS-QUIESCE remaining scope): Q3's skin-CONTENT convergence bound (the fine/band bake sweeps still")
+	print("  repaint the visible disc for real wall-clock time — Q2 only stops that repaint from forcing MESH work) and")
+	print("  T3's neighbour-aware weld refresh are LATER stages, not asserted here.")
 
 ## G-FS-QUIESCE (driver): `FacetSmoothTier.request()`/`_snap_plan` + `step()`'s own settle latch reach a zero-work
 ## fixpoint at a FIXED active facet (dwell deliberately kept empty here — the isolated dwell-mutation counter is
@@ -1367,6 +1371,71 @@ func _gate_fs_quiesce_baker() -> void:
 	baker2._recompute_band_want_sse(fid, axis_arr, band_cam_dist - half_width - 1.0, true)
 	var bm_mid := baker2.recompute_band_want_count()
 	_ok(bm_mid > bm_after, "G-FS-QUIESCE perturb (baker band): a cam_dist move past half a facet width re-triggers _recompute_band_want_sse (%d -> %d)" % [bm_after, bm_mid])
+
+## G-FS-QUIESCE (Q2, completes the gate): a close-up/band slot-map change must NOT force a front re-emit under
+## FP_SLOT_INDIRECT (LAW S) — it only updates the tiny fid→slot lookup texture, never `_pending`/`_shell_gen`.
+## Falsified WITHOUT the fix: the identical change DOES set `_pending` (the shipped R3.1.b re-emit engine). Also
+## proves (b) the lookup texture tracks the LIVE map — never stale, even as the SAME fid's slot moves — and (c) a
+## smooth tile's UV2.y payload is INVARIANT to a slot-map move once it carries the stable fid, CONTRASTED against
+## the OLD frozen-slot payload, which DOES change per build call (the exact staleness class R3.1.d describes: a
+## committed tile has no mechanism to pick up a new slot without an unrelated rebuild).
+func _gate_fs_quiesce_slot() -> void:
+	var fid := _fid_of(1, 8, 9)
+	var other := FA.seam_neighbour(fid, FA.S_EAST)
+
+	# (a) Non-vacuous baseline + falsification: WITHOUT the fix, a slot-map change DOES set `_pending`.
+	var ring_off := FacetFarRing.new()
+	ring_off.setup(fid)
+	ring_off._pending = false
+	ring_off._closeup_slots = {fid: 3}
+	ring_off._on_slot_map_changed(false)
+	_ok(ring_off._pending, "G-FS-QUIESCE-FALSIFY (Q2): WITHOUT the fix, a slot-map change DOES set `_pending` (forces a front re-emit) — proving the harness has teeth")
+	ring_off.free()
+
+	# (b) The fix: WITH FP_SLOT_INDIRECT forced on, the IDENTICAL slot-map change touches ONLY the lookup texture —
+	# `_pending` stays false and `_shell_gen` (the commit tally) is untouched.
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._pending = false
+	var gen_before: int = ring._shell_gen
+	ring._closeup_slots = {fid: 3}
+	ring._on_slot_map_changed(true)
+	_ok(not ring._pending, "G-FS-QUIESCE (Q2): a close-up slot-map change does NOT set `_pending` under FP_SLOT_INDIRECT — no front re-emit")
+	_ok(ring._shell_gen == gen_before, "G-FS-QUIESCE (Q2): `_shell_gen` is untouched by a slot-only change (never bumps for this)")
+
+	# (c) The lookup texture reflects the LIVE map, non-vacuously (several distinct values, all read back correctly),
+	# including the SAME fid's slot MOVING (the exact case that used to go stale on a committed smooth tile).
+	var dims: Vector2i = ring._slot_indirect_dims()
+	var w: int = dims.x
+	var px1: Color = ring._slot_img.get_pixel(fid % w, int(fid / w))
+	_ok(absf(px1.r - 3.0) < 1e-5, "G-FS-QUIESCE (Q2): the lookup texture holds the CURRENT slot (3) right after the push")
+	ring._closeup_slots = {fid: 3, other: 9}   # a second, independent facet promoted (the close-up/band carousel moving on)
+	ring._on_slot_map_changed(true)
+	var px2: Color = ring._slot_img.get_pixel(other % w, int(other / w))
+	_ok(absf(px2.r - 9.0) < 1e-5, "G-FS-QUIESCE (Q2): a NEW facet's slot reaches the texture on the next push (still live)")
+	ring._closeup_slots = {fid: 11, other: 9}   # THIS fid's own slot moves (3 -> 11) — no rebuild anywhere, just a texture push
+	ring._on_slot_map_changed(true)
+	var px3: Color = ring._slot_img.get_pixel(fid % w, int(fid / w))
+	_ok(absf(px3.r - 11.0) < 1e-5, "G-FS-QUIESCE (Q2): the SAME fid's slot MOVING (3 -> 11) is reflected on the next push — never stale")
+	ring.free()
+
+	# (d) The smooth-tile PAYLOAD itself: under Q2 the call site always stamps the stable fid (`FacetSmoothTier.
+	# _build_worker`'s override) — INVARIANT no matter how many times the slot map moves in between. Contrast the
+	# OLD frozen-slot payload (`_slot_of` baked in at build time): built once at slot=3, "rebuilt" later (a tier
+	# change, a refresh — ANYTHING except the slot move itself) at slot=11 — DIFFERENT payload, but nothing in the
+	# shipped driver re-triggers that rebuild purely because a slot moved, so a resident tile is stuck at whichever
+	# slot happened to be live the last time it was (re)built for an unrelated reason — exactly R3.1.d.
+	var cells := FST.cells_for_tier(FST.S4)
+	var tile_q2_a := FST.build_tile(fid, cells, 0.0, true, false, float(fid))
+	var tile_q2_b := FST.build_tile(fid, cells, 0.0, true, false, float(fid))
+	var uv2_q2_a: PackedVector2Array = tile_q2_a["uv2"]
+	var uv2_q2_b: PackedVector2Array = tile_q2_b["uv2"]
+	_ok(uv2_q2_a[0].y == uv2_q2_b[0].y, "G-FS-QUIESCE (Q2): the smooth-tile UV2.y payload is INVARIANT (the stable fid) across any slot-map move")
+	var tile_old_a := FST.build_tile(fid, cells, 0.0, true, false, 3.0)
+	var tile_old_b := FST.build_tile(fid, cells, 0.0, true, false, 11.0)
+	var uv2_old_a: PackedVector2Array = tile_old_a["uv2"]
+	var uv2_old_b: PackedVector2Array = tile_old_b["uv2"]
+	_ok(uv2_old_a[0].y != uv2_old_b[0].y, "G-FS-QUIESCE-FALSIFY (Q2): the OLD frozen-slot payload DOES differ once the slot moves — a committed tile built at the OLD value has no way to become 11 without an unrelated rebuild, proving Q2's stable-fid payload is the actual fix")
 
 ## G-FS-NOHOLE (partial — the T2 commit-generation handshake). Directly pokes the snap-gen bookkeeping (the same
 ## "poke a flag-gated internal directly" pattern used throughout this file) to reproduce the EXACT race R3.2.b
@@ -1581,3 +1650,60 @@ func _gate_fs_txn_thread() -> void:
 	_ok(ft_off.main_concat_count() > 0, "G-FS-TXN-THREAD-FALSIFY: WITHOUT the fix (txn_on false), the IDENTICAL driven scenario runs the main-thread concat %d times — proving the counter has teeth, not a vacuous 0-vs-0" % ft_off.main_concat_count())
 	_ok(ft_off.worker_concat_count() == 0, "G-FS-TXN-THREAD-FALSIFY: WITHOUT the fix, the off-thread concat path never ran (0 calls)")
 	parent.free()
+
+# =====================================================================================================================
+# REVISION 3 STAGE 3 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 3" R3.4 Q2, FP_SLOT_INDIRECT) — LAW S:
+# kill mesh-baked band/close-up skin slots. `_gate_fs_quiesce_slot` (folded into `_gate_fs_quiesce` above, completing
+# it) proves a slot-map change never re-emits and the lookup texture never goes stale; `_gate_slot_indirect_shader`
+# below is the golden-string pin on the shell/smooth shader splice. T3 (neighbour-aware weld refresh) and Q3 (skin-
+# convergence bounding) are LATER stages, not gated here.
+# =====================================================================================================================
+
+## Golden shader-string pin (Q2, FP_SLOT_INDIRECT — the F7 lesson). With the flag off, `_apply_slot_indirect` is the
+## identity function on EVERY assembled shell/smooth shader variant — including variants that never declare
+## `v_slot`/`v_bslot` at all (the plain vertex-colour shell, the base tex shader with neither close-up nor band on):
+## byte-identical to the committed Stage-2 string, PROVING the splice is inert off even when forced (String.replace
+## of an absent anchor is a no-op). With it forced on, variants that DO declare `v_slot` and/or `v_bslot` gain the
+## `slot_map` uniform + the `_slot_indirect` resolve call (spliced source DIFFERS from the golden off-string) while
+## still compiling to exactly ONE `shader_type` (zero new compiled programs — mirrors G-FS-LIT-ON/G-VL-SHADERTYPE);
+## variants WITHOUT those varyings stay untouched even with the flag forced on (nothing for Q2 to resolve there).
+## NOTE: this is a STRING-LEVEL gate (matches every other golden-pin gate in this file) — actual GLSL compilation
+## needs a real GPU context and is NOT exercised headless; flagged in the stage report as the one gl_compat-risk
+## item that could not be fully verified without a live browser.
+func _gate_slot_indirect_shader() -> void:
+	print("  --- REVISION 3 Q2 golden shader-string pin (FP_SLOT_INDIRECT) ---")
+	var no_slot_srcs := [
+		["_SHELL_ABS_SHADER (no UV2 at all)", FacetFarRing._SHELL_ABS_SHADER],
+		["base tex, no CU/no band", FacetFarRing.gate_tex_shader_raw(false)],
+	]
+	for pair in no_slot_srcs:
+		var name: String = pair[0]
+		var src: String = pair[1]
+		var off: String = FacetFarRing._apply_slot_indirect(src, false)
+		var on: String = FacetFarRing._apply_slot_indirect(src, true)
+		_ok(off == src, "G-SLOT-OFF: %s is byte-identical off (golden pin)" % name)
+		_ok(on == src, "G-SLOT-ON: %s has no v_slot/v_bslot — untouched even with the flag forced on (nothing to resolve, still a no-op splice)" % name)
+
+	# NOTE: `gate_band_shader`'s band injection is itself gated behind the COMPILE-TIME-ONLY `FP_BLOCK_DETAIL` const
+	# inside `_apply_block_detail` (no override param exists for it, unlike `band`/`shot`) — under this file's default
+	# consts it is a no-op regardless of `band`, so it cannot supply a genuine v_bslot fixture here. `_apply_flatcolor`
+	# has no such outer gate (the caller in `_make_material` decides whether to invoke it; the function itself always
+	# does the splice when called) — applying it to BOTH the base and CU tex variants gives genuine v_bslot-only and
+	# v_slot+v_bslot fixtures without needing to flip any compile-time const.
+	var slot_srcs := [
+		["CU tex (v_slot only)", FacetFarRing.gate_tex_shader_raw(true)],
+		["flatcolor on base tex (v_bslot only)", FacetFarRing._apply_flatcolor(FacetFarRing._SHELL_ABS_TEX_SHADER)],
+		["flatcolor on CU tex (v_slot + v_bslot)", FacetFarRing._apply_flatcolor(FacetFarRing._SHELL_ABS_TEX_CU_SHADER)],
+	]
+	for pair in slot_srcs:
+		var name: String = pair[0]
+		var off_code: String = pair[1]
+		var off_result: String = FacetFarRing._apply_slot_indirect(off_code, false)
+		_ok(off_result == off_code, "G-SLOT-OFF: %s is byte-identical off (golden pin)" % name)
+		var on_code: String = FacetFarRing._apply_slot_indirect(off_code, true)
+		_ok(on_code != off_code, "G-SLOT-ON: %s spliced source DIFFERS from the golden off-string (the branch actually fires)" % name)
+		_ok(on_code.contains("uniform sampler2D slot_map") and on_code.contains("_slot_indirect("),
+			"G-SLOT-ON: %s spliced source declares the lookup sampler + the resolve function/call" % name)
+		_ok(on_code.count("shader_type") == off_code.count("shader_type"),
+			"G-SLOT-ON: %s spliced source has the SAME shader_type count as off (zero new compiled programs)" % name)
+	_ok(not CubeSphere.FP_SLOT_INDIRECT, "G-SLOT-OFF: FP_SLOT_INDIRECT defaults false (byte-off)")

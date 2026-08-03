@@ -792,6 +792,31 @@ const FP_SHELL_SNAP_GEN := false
 ##   it, never a new high-water mark.
 const FP_SMOOTH_TXN := false
 
+## FP_SLOT_INDIRECT (LAW S, R3.4 Q2): kill mesh-baked band/close-up skin slots. Today the shell AND the smooth tiles
+##   bake `_slot_of(fid)` (the current band/close-up UV2.y payload) directly into VERTEX data at build time — so every
+##   time the baker's slot map moves (a close-up promotion/eviction, a band commit) the ONLY way to get the new value
+##   onto the mesh is a full re-emit: `set_closeup_slots`/`set_band_slots` unconditionally set `_pending = true`
+##   (`facet_far_ring.gd`, R3.1.b's hitch engine — up to 64 close-up commits after arrival, each a full front tri-soup
+##   rebuild + `_shell_gen++`), AND a committed smooth tile's frozen slot NEVER refreshes at all once built
+##   (R3.1.d — a stale slot silently starts pointing at ANOTHER facet's texture once its close-up/band layer is
+##   evicted and reused for someone else). This flag reverses the direction: UV2.y carries the STABLE FID instead of
+##   the volatile slot (`FacetFarRing._uv2_y`, `FacetSmoothTier._build_worker`'s slot override) — geometry never needs
+##   to change when a slot moves. The CURRENT slot for every fid lives in ONE small lookup texture instead
+##   (`FacetFarRing._push_slot_indirect`, an R-channel-used RGBAF `ImageTexture` sized to the home body's fid space,
+##   `FacetAtlas.facet_count()` texels — 3456 at K=24 — mirroring the proven `_band_meta_tex` data-texture pattern);
+##   a slot-map change now updates ONLY that texture (`.update()`, ~3456 dictionary reads, no vertex/GPU-mesh work at
+##   all) — `set_closeup_slots`/`set_band_slots` no longer set `_pending`, so a slot change never re-emits and never
+##   bumps `_shell_gen`. The shell/smooth shader resolves the live slot per-fragment with one additive `texelFetch`
+##   (`FacetFarRing._apply_slot_indirect`, gl_compat-safe — `sampler2D` + `texelFetch` is the SAME pattern already
+##   shipped for `band_meta`/`band_map`/`id_map`/`fine_map`), so a smooth tile can NEVER go stale (it never encoded a
+##   slot in the first place). Off ⇒ `_uv2_y`/the smooth-tile slot override take the shipped `_slot_of` path verbatim,
+##   `_push_slot_indirect`/`_apply_slot_indirect` are never called, and the shader anchor is left untouched (String.
+##   replace of an absent/off anchor is a no-op splice) — byte-identical (FLAT 6042/0). Retires REV2 LAW R-C
+##   (FP_SMOOTH_SKIN_SLOT)'s frozen-slot plumbing (still present, byte-off, but superseded whenever this flag is on —
+##   both write the SAME "slot" float, this one just always resolves to `float(fid)` first). Gate: verify_far_smooth.gd
+##   (G-FS-QUIESCE, completed; golden shader-string pin).
+const FP_SLOT_INDIRECT := false
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

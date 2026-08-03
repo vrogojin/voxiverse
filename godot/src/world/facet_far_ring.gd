@@ -33,6 +33,10 @@ const WARM_BUDGET_MS := 3.0          # FP-S1(d): per-frame cache-warm budget for
 const ENV_WARM_BATCH := 12           # FP_ENV_WARM_ASYNC: max uncached env facets ONE worker dispatch builds before it
                                      # emits the ready subset. Off-thread ⇒ never touches the frame budget; bounded ⇒
                                      # NEVER-OOM. The orbit reveal grows ~ENV_WARM_BATCH facets per worker cycle.
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): width (texels) of the fid→slot lookup
+# texture; height is derived from `FacetAtlas.facet_count()` (`_slot_indirect_dims`) so the layout always covers the
+# home body's whole fid space with no wasted row (64×54 = 3456 at K=24). Well under any gl_compat texture-size floor.
+const SLOT_TEX_W := 64
 
 # FP_ENV_WARM_ASYNC instrumentation (telemetry-only, env_all path). Counts _env_weld_grid builds by the thread they
 # ran on, so the perf fix is provable: OFF ⇒ all builds on MAIN; ON ⇒ builds on the WORKER, main count frozen.
@@ -118,6 +122,14 @@ var _skin_band_tex: Texture = null
 var _band_meta_tex: ImageTexture = null   # FP_BAND_META_TEX: 512×1 RGBA32F reverse-map (a,b,Nx,Ny) per band layer (texelFetch, no uniform-vec cap)
 var _band_meta_img: Image = null          # CPU staging for _band_meta_tex.update()
 var _skin_cu_tex: Texture = null
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): the fid→slot LOOKUP texture — one
+# R-channel-used RGBAF ImageTexture (mirrors the proven `_band_meta_tex` data-texture pattern above) sized to the
+# home body's fid space (`FacetAtlas.facet_count()` texels, `_SLOT_TEX_W` wide). Texel (fid % w, fid / w) holds
+# `_live_slot_of(fid)` — the CURRENT band/close-up combined slot, the same value `_slot_of` bakes into vertices on
+# the shipped path. `_push_slot_indirect` is the ONLY writer (main-thread, called from `set_closeup_slots`/
+# `set_band_slots` instead of `_pending = true`). null / never allocated with the flag off (zero bytes).
+var _slot_img: Image = null
+var _slot_tex: ImageTexture = null
 var _skin_active := true              # §2V skin currently bound (true = shipped); set false while the orbit tier owns the disc
 var _pos_cache: Dictionary = {}      # fid -> PackedVector3Array (ABSOLUTE planet coords; built once per facet)
 var _col_cache: Dictionary = {}      # fid -> PackedColorArray
@@ -368,6 +380,10 @@ func setup(active_fid: int) -> void:
 	_mi.name = "FacetFarRingMesh"
 	_mi.material_override = _make_material()
 	add_child(_mi)
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): bind the (initially all -1) lookup
+	# texture right away so the shader's sampler is never left unbound before the first real slot-map push. No-op
+	# with the flag off (byte-identical).
+	_push_slot_indirect()
 	# FP_FAR_SMOOTH (B2): the smooth-tile overlay, sharing this ring's material (child of self ⇒ inherits the placement
 	# transform). Inert off (never constructed) ⇒ byte-identical.
 	if CubeSphere.FP_FAR_SMOOTH:
@@ -528,12 +544,15 @@ func _smooth_drive(idle_on := CubeSphere.FP_SMOOTH_IDLE, sticky_on := CubeSphere
 		# it again (see `visible_fids()`'s `_smooth_leaving` check above). `_mesh_inc_gate` implements that handshake.
 		assign = _mesh_inc_gate(assign)
 	var slots := {}
-	if skin_slot_on and not reuse:
+	if skin_slot_on and not reuse and not CubeSphere.FP_SLOT_INDIRECT:
 		# REVISION 2 LAW R-C: freeze THIS batch's skin slot for every requested facet (main-thread only — `_slot_of`
 		# reads the frozen `_band_slot_snapshot`/`_slot_snapshot`, refreshed on main by `_refresh_slot_snapshot`).
 		# Q1: skipped while reusing — `request()` early-outs on an unchanged `_want` regardless of `slots`, so a
 		# freshly-recomputed-but-unused slot map would be wasted work (the mesh-baked slot staleness this implies is
 		# Q2's fix — R3.1.d, already true today independent of this gate).
+		# Q2 (FP_SLOT_INDIRECT): this whole per-facet `_slot_of` loop retires — `FacetSmoothTier._build_worker`
+		# stamps `float(fid)` onto every tile's UV2.y regardless of `slots` (LAW S: geometry carries only the stable
+		# fid; the shader resolves the live slot itself), so freezing a slot snapshot here would be dead work.
 		for fid in assign.keys():
 			slots[int(fid)] = _slot_of(int(fid))
 	_smooth.request(assign, slots, idle_on)
@@ -1815,7 +1834,7 @@ func _append_limb_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
 	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
 	for gj in range(cells):
@@ -2272,7 +2291,11 @@ func _build_fast(fids: PackedInt32Array) -> Mesh:
 				# cannot ride the permanent (face,-1) uv2 cache once FP_FACET_TEX_CLOSEUP is on — rebuild the 96 uv2s
 				# inline with this rebuild's slot (face is stable, .y = current layer or -1). Off ⇒ the cached (face,-1)
 				# append verbatim (byte-identical to Phase 1). Cheap: 96 pushes/facet, only under the close-up flag.
-				if _cu_on():
+				# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): the whole per-rebuild
+				# override retires — `_ensure_tri_cached` already baked the STABLE fid into `_tri_uv2_cache[fid]`
+				# forever (LAW S: geometry never needs to change when a slot moves), so the permanent cache is always
+				# correct and the CU-specific rebuild above would just recompute the identical value at a cost.
+				if _cu_on() and not CubeSphere.FP_SLOT_INDIRECT:
 					var face: int = _tex_decode(fid)[0]
 					var sv := Vector2(float(face), _slot_of(fid))
 					var cu2: PackedVector2Array = _tri_uv2_cache[fid].duplicate()
@@ -2982,7 +3005,7 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 	var fuv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(cells)
 	# U2: cull confirmed-covered cells on the fast (memcpy) backstop path too — not appended at all (byte-identical off).
@@ -3045,7 +3068,7 @@ func _emit_blocky(st: SurfaceTool, pos: PackedVector3Array, col: PackedColorArra
 	var fuv2 := Vector2.ZERO; var t_a := 0; var t_b := 0; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		fuv2 = Vector2(float(d[0]), _slot_of(fid))
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
 		t_a = d[1]; t_b = d[2]
 		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
 	# skirt = one coarse block's radial pitch (the block's own height scale) — facet edges never see through.
@@ -3197,7 +3220,7 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 	var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		uv2 = Vector2(float(d[0]), _slot_of(fid))   # (face, close-up slot: -1 unless FP_FACET_TEX_CLOSEUP promoted it)
+		uv2 = Vector2(float(d[0]), _uv2_y(fid))   # (face, close-up slot -1..243, OR the stable fid under Q2/FP_SLOT_INDIRECT)
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k)
 		inv_c = 1.0 / float(cells)
@@ -3261,7 +3284,11 @@ func _ensure_tri_cached(fid: int) -> void:
 	var uv2 := Vector2.ZERO; var inv_k := 0.0; var inv_c := 0.0
 	if tex:
 		var d := _tex_decode(fid)
-		uv2 = Vector2(float(d[0]), -1.0)
+		# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): this cache is built ONCE per fid,
+		# ever (the `_tri_pos_cache.has(fid): return` guard above), so baking the STABLE fid here (instead of the
+		# volatile -1/slot) is permanently correct — no per-rebuild override is needed downstream (`_build_fast`
+		# skips its close-up override entirely under this flag, see below). Off ⇒ the shipped -1.0 (byte-identical).
+		uv2 = Vector2(float(d[0]), float(fid) if CubeSphere.FP_SLOT_INDIRECT else -1.0)
 		t_a = d[1]; t_b = d[2]; t_k = d[3]
 		inv_k = 1.0 / float(t_k); inv_c = 1.0 / float(CELLS)
 	for gj in range(CELLS):
@@ -3333,6 +3360,66 @@ func _slot_of(fid: int) -> float:
 	if _band_slot_snapshot.has(fid):
 		return float(64 + int(_band_slot_snapshot[fid]))
 	return float(_slot_snapshot.get(fid, -1))
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): the value UV2.y actually carries at
+## emit time. On ⇒ the STABLE fid (geometry never needs to change when a slot moves — the shader resolves the live
+## slot itself via `_push_slot_indirect`'s lookup texture). Off ⇒ the shipped `_slot_of` bake (byte-identical). `on`
+## is a param (mirrors `build_tile`'s `normal_lit`/`_apply_smooth_normal_lit`'s `on` pattern) so a gate can force it
+## without flipping the compile-time const.
+func _uv2_y(fid: int, on := CubeSphere.FP_SLOT_INDIRECT) -> float:
+	return float(fid) if on else _slot_of(fid)
+
+## Q2: the LIVE (non-frozen) combined band/close-up slot for `fid` — the exact `_slot_of` encoding (band 64+layer
+## wins, else close-up 0..63, else −1) but read from the LIVE `_band_slots`/`_closeup_slots` maps instead of the
+## frozen worker-safe snapshots. Safe: `_push_slot_indirect` runs synchronously on the main thread the instant a
+## slot map changes (no async build ever reads these dicts), so there is no race to guard against here.
+func _live_slot_of(fid: int) -> float:
+	if _band_slots.has(fid):
+		return float(64 + int(_band_slots[fid]))
+	return float(_closeup_slots.get(fid, -1))
+
+## Q2: the lookup texture's (width, height) — `_SLOT_TEX_W` wide, tall enough to cover the home body's whole fid
+## space (`FacetAtlas.facet_count()`, 3456 at K=24) with no wasted row. Recomputed cheaply each call (two int ops);
+## not cached, since `facet_count()` itself is O(1) and this never runs per-frame (only on an actual slot-map push).
+func _slot_indirect_dims() -> Vector2i:
+	var n := FacetAtlas.facet_count()
+	return Vector2i(SLOT_TEX_W, (n + SLOT_TEX_W - 1) / SLOT_TEX_W)
+
+## Q2: rebuild the fid→slot lookup texture from the LIVE slot maps — the ONLY thing a slot-map change touches under
+## the flag (no mesh re-emit, no `_shell_gen` bump). One `Image.set_pixel` scan over the home body's fid space
+## (≤3456 texels, dictionary reads only — no `profile_at_dir`/vertex work) + one `ImageTexture.update()` (a single
+## small GPU upload, ~55 KB at K=24 RGBAF) — dramatically cheaper than the full front tri-soup re-emit it replaces.
+## `on` is a param (mirrors the codebase's gate-forcing convention) so a headless gate can drive it without
+## flipping the compile-time const; real callers always get the const's value. No-op (and no allocation) off.
+func _push_slot_indirect(on := CubeSphere.FP_SLOT_INDIRECT) -> void:
+	if not on or _mi == null:
+		return
+	var dims := _slot_indirect_dims()
+	var w := dims.x
+	var h := dims.y
+	if _slot_img == null:
+		_slot_img = Image.create(w, h, false, Image.FORMAT_RGBAF)
+	var n := FacetAtlas.facet_count()
+	for fid in range(n):
+		_slot_img.set_pixel(fid % w, int(fid / w), Color(_live_slot_of(fid), 0.0, 0.0, 0.0))
+	if _slot_tex == null:
+		_slot_tex = ImageTexture.create_from_image(_slot_img)
+	else:
+		_slot_tex.update(_slot_img)
+	var mat := _mi.material_override
+	if mat is ShaderMaterial:
+		(mat as ShaderMaterial).set_shader_parameter("slot_map", _slot_tex)
+		(mat as ShaderMaterial).set_shader_parameter("slot_map_w", float(w))
+
+## Q2: react to a close-up/band slot-map change — the ONE decision `set_closeup_slots`/`set_band_slots` used to make
+## unconditionally (`_pending = true`, a full front re-emit). `on` mirrors the flag; extracted into its own function
+## (rather than inlined at both call sites) so a headless gate can drive EXACTLY this branch directly — bypassing
+## the unrelated `_cu_on()`/`_bm_on()` outer guards those setters carry (a pre-existing, separately-gated concern).
+func _on_slot_map_changed(on := CubeSphere.FP_SLOT_INDIRECT) -> void:
+	if on:
+		_push_slot_indirect(true)   # LAW S: update the lookup texture ONLY — no re-emit, no _shell_gen bump
+	else:
+		_pending = true             # shipped: re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
 
 ## COSMOS LOD-TEXTURE Phase 4 / U1: refresh the frozen slot snapshots the mesh emit reads. MAIN thread only (both build
 ## entries call it before any worker dispatch), so the async worker's _emit_cached reads maps stable for its run.
@@ -3844,6 +3931,52 @@ static func _apply_smooth_normal_lit(code: String, on := CubeSphere.FP_SMOOTH_NO
 		"	vec3 n = normalize(wp - centre);\n",
 		"	vec3 n = (COLOR.a < 0.5) ? normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz) : normalize(wp - centre);\n")
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): resolve the band/close-up skin slot
+# through a fid-indexed LOOKUP TEXTURE instead of trusting it baked into UV2.y directly. `v_slot` (the CU variant)
+# and/or `v_bslot` (band injections, `_apply_block_detail`/`_apply_flatcolor`) are assigned `= UV2.y` at the vertex
+# stage EXACTLY as shipped — under this flag the GDScript emit side (`_uv2_y`) feeds UV2.y the STABLE FID instead of
+# the volatile slot, so at this point `v_slot`/`v_bslot` (whichever exist in THIS variant) simply CONTAIN the fid.
+# One additive texelFetch resolves it to the CURRENT slot, right at the top of fragment() before anything reads it —
+# gl_compat-SAFE: `sampler2D` + `texelFetch(..., ivec2, 0)` is the EXACT pattern already shipped for `band_meta`
+# (`facet_far_ring.gd` `_push_band_meta`) and `band_map`/`id_map`/`fine_map` (all `filter_nearest` sampler2DArrays) —
+# proven to compile/run on WebGL2/ANGLE across several prior stages. No vertex-stage texture fetch is used (some
+# gl_compat/ANGLE stacks limit vertex texture image units), and no integer vertex ATTRIBUTE is required (the fid
+# rides the SAME float UV2.y attribute the slot always did — only its meaning changes).
+# Applied to the FULLY ASSEMBLED shader string (after `_apply_block_detail`/`_apply_flatcolor`/`_apply_shade_unified`/
+# `_apply_smooth_normal_lit` have already run) — a single anchor-based splice covers every variant. A variant that
+# never declares `v_slot` or `v_bslot` (the plain vertex-colour shell, or the base tex shader with neither close-up
+# nor band on) has NOTHING for Q2 to resolve — the anchor is simply absent, so the code returns UNTOUCHED (the F7
+# golden-string discipline: String.replace of an absent anchor is a no-op). Off ⇒ code returned VERBATIM always.
+const _SLOT_INDIRECT_UNIFORMS := "uniform sampler2D slot_map : filter_nearest;
+uniform float slot_map_w = 64.0;
+float _slot_indirect(float fid) {
+	float w = slot_map_w;
+	float fx = mod(fid, w);
+	float fy = floor(fid / w);
+	return texelFetch(slot_map, ivec2(int(fx), int(fy)), 0).r;
+}
+"
+static func _apply_slot_indirect(code: String, on := CubeSphere.FP_SLOT_INDIRECT) -> String:
+	if not on:
+		return code
+	var has_slot := code.find("varying float v_slot;") >= 0
+	var has_bslot := code.find("varying float v_bslot;") >= 0
+	if not has_slot and not has_bslot:
+		return code   # this variant never reads UV2.y as a slot at all — nothing for Q2 to resolve
+	code = code.replace(
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n",
+		"uniform sampler2DArray base_map : source_color, filter_linear_mipmap;\n" + _SLOT_INDIRECT_UNIFORMS)
+	var resolve := ""
+	if has_slot and has_bslot:
+		# Both varyings were fed the SAME UV2.y (a shared fid) — resolve once, feed both.
+		resolve = "\tfloat _rs = _slot_indirect(v_slot);\n\tv_slot = _rs;\n\tv_bslot = _rs;\n"
+	elif has_slot:
+		resolve = "\tv_slot = _slot_indirect(v_slot);\n"
+	else:
+		resolve = "\tv_bslot = _slot_indirect(v_bslot);\n"
+	code = code.replace("void fragment() {\n", "void fragment() {\n" + resolve)
+	return code
+
 func _make_material() -> Material:
 	# COSMOS ATMO-SKY A5: the absolute self-shaded globe shell v2 wins (supersedes the L3 terminator tint v1) —
 	# sun_dir fed each frame via set_shell_absolute_sun_dir; the centre comes from MODEL_MATRIX (exact under scale).
@@ -3869,6 +4002,10 @@ func _make_material() -> Material:
 		# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): splice in the smooth-tile vertex-normal
 		# lighting branch (the COLOR.a<0.5 discriminator — see cube_sphere.gd). Off ⇒ code returned verbatim.
 		sh2.code = _apply_smooth_normal_lit(sh2.code)
+		# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): resolve the live band/close-up
+		# slot from the lookup texture instead of trusting UV2.y directly (which now carries the stable fid). Off ⇒
+		# code returned verbatim (no anchor touched when v_slot/v_bslot don't even exist in this variant).
+		sh2.code = _apply_slot_indirect(sh2.code)
 		var sm2 := ShaderMaterial.new()
 		sm2.shader = sh2
 		sm2.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
@@ -4017,6 +4154,10 @@ func set_facet_detail(detail_tex: Texture, id_tex: Texture) -> void:
 ## only (WorldManager, when the baker's epoch bumps). Updates the live `_closeup_slots` (frozen into the mesh at the
 ## next build) and the `cu_facet` shader uniform (read live per fragment). Requests a re-emit so the new slots reach
 ## the mesh's UV2.y. No-op with the flag off.
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): the re-emit above is exactly R3.1.b's
+## hitch engine — every close-up commit forcing a full front tri-soup rebuild purely to re-bake a UV2.y byte. Under
+## the flag `_on_slot_map_changed` updates ONLY the tiny lookup texture instead (`_pending` never sets, `_shell_gen`
+## never bumps for a slot-only change).
 func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void:
 	if not _cu_on():
 		return
@@ -4025,7 +4166,7 @@ func set_closeup_slots(slots: Dictionary, facet_map: PackedVector2Array) -> void
 		var mat := _mi.material_override
 		if mat is ShaderMaterial and facet_map.size() == CubeSphere.CLOSEUP_MAX:
 			(mat as ShaderMaterial).set_shader_parameter("cu_facet", facet_map)
-	_pending = true                  # re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
+	_on_slot_map_changed()
 
 ## COSMOS TEXTURED-LOD U1 (§2U.1): bind the baker's band id map into the shell shader's `band_map` uniform. No-op unless
 ## the band tier is live and the material is the textured shader ⇒ flag-off is byte-identical (never wired). Called by
@@ -4051,6 +4192,8 @@ func set_fine_map(tex) -> void:
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("fine_map", tex)
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): same fix as `set_closeup_slots` — a band
+## commit updates only the lookup texture under the flag, never re-emits.
 func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: PackedVector2Array) -> void:
 	if not _bm_on():
 		return
@@ -4063,7 +4206,7 @@ func set_band_slots(slots: Dictionary, facet_map: PackedVector2Array, n_map: Pac
 			else:
 				(mat as ShaderMaterial).set_shader_parameter("band_facet", facet_map)
 				(mat as ShaderMaterial).set_shader_parameter("band_n", n_map)
-	_pending = true
+	_on_slot_map_changed()
 
 ## FP_BAND_META_TEX: pack (a,b,Nx,Ny) per band layer into the 512×1 RGBA32F reverse-map texture (one tiny update()),
 ## replacing the band_facet[]/band_n[] uniform arrays (which cap out at ~400 layers on ANGLE's fragment-uniform budget).
@@ -4094,14 +4237,15 @@ static func gate_band_shader(cu: bool, band: bool, shot := CubeSphere.FP_BAND_SH
 	return _apply_block_detail(_SHELL_ABS_TEX_CU_SHADER if cu else _SHELL_ABS_TEX_SHADER, band, shot)
 
 ## COSMOS LOD-TEXTURE Phase 4 gate (G-FT-SLOT): the emitted UV2 (face, slot) for facet `fid` in _emit_cached order.
-## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild).
+## Empty unless FP_FACET_TEX is on. Reflects the CURRENT slot snapshot (call after a build/force_rebuild). Under
+## Q2 (FP_SLOT_INDIRECT) this reflects the stable-fid payload instead (`_uv2_y`) — what the mesh ACTUALLY carries.
 func gate_facet_uv2(fid: int) -> PackedVector2Array:
 	if not _tex_on():
 		return PackedVector2Array()
 	# Build the per-facet uv2 the same way the emit does (face, current slot) so the gate reads the live mapping.
 	var out := PackedVector2Array()
 	var face: int = _tex_decode(fid)[0]
-	var sv := Vector2(float(face), _slot_of(fid))
+	var sv := Vector2(float(face), _uv2_y(fid))
 	out.resize(96)
 	for i in range(96):
 		out[i] = sv

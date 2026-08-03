@@ -739,6 +739,13 @@ func _build_worker(i: int) -> void:
 	var cells := FacetSmoothTier.cells_for_tier(tier)
 	var tile: Dictionary
 	var slot: float = float(_s_slot[i]) if _s_slot.size() > i else -1.0   # R-C (FP_SMOOTH_SKIN_SLOT): frozen snapshot
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): stamp the STABLE fid onto
+	# UV2.y instead of any slot snapshot — a smooth tile never needs rebuilding when the band/close-up slot map
+	# moves; the shared shell shader resolves the CURRENT slot live via `FacetFarRing._push_slot_indirect`'s lookup
+	# texture (`_apply_slot_indirect`). Overrides R-C's frozen `slot` unconditionally when on (R-C's own plumbing
+	# stays wired, byte-off, for when this flag is off).
+	if CubeSphere.FP_SLOT_INDIRECT:
+		slot = float(fid)
 	if tier == S2 and CubeSphere.FP_SMOOTH_RIM:
 		# §3 P3: the S2 near-collar — envelope-inside-disc + feather + ε sink, against THIS batch's frozen player
 		# column (never `_rim_col` live — the worker only reads its own slot's snapshot, taken pre-dispatch).

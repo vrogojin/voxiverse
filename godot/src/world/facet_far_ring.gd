@@ -426,7 +426,7 @@ func setup(active_fid: int) -> void:
 	# transform). Inert off (never constructed) ⇒ byte-identical.
 	if CubeSphere.FP_FAR_SMOOTH:
 		_smooth = FacetSmoothTier.new()
-		_smooth.setup_instance(self, _mi.material_override)
+		_smooth.setup_instance(self, _mi.material_override, active_fid)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:

@@ -61,7 +61,7 @@ static func residency_for_tier(tier: int) -> int:
 ## every vertex instead of the hard-coded -1 — a frozen `FacetFarRing._slot_of(fid)` snapshot the caller threads
 ## through (worker-safe: a plain float, no live object read). Defaults to -1.0 (the shipped base-map fallback) so
 ## every existing call site (and the flag-off path) is byte-identical.
-static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0) -> Dictionary:
+static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, gen: Object = null) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the SHARED canon corner DIRECTIONS, not the facet's own
@@ -90,21 +90,50 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 	var dirs := PackedVector3Array()
 	dirs.resize(n)
 
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): ONE native VoxelGeneratorCosmos.bake_smooth_tile() replaces the per-node
+	# FarDensity.node_at → TerrainConfig.profile_at_dir chain (the ~2700-sample/tile WASM-allocator convoy that
+	# stalled warmup). Byte-equal by construction (§ the C++ mirrors node_at term-for-term). A refusal — engine
+	# lacks the method, generator not ready, or malformed request — returns an empty dict, so `use_baked` stays
+	# false and the GDScript node_at path below runs VERBATIM (byte-identical to the pre-flag build).
+	var b_dir: PackedVector3Array
+	var b_g: PackedInt32Array
+	var b_biome: PackedInt32Array
+	var b_temp: PackedFloat32Array
+	var b_pos: PackedVector3Array
+	var b_relief: PackedFloat32Array
+	var b_bnrm := PackedVector3Array()
+	var use_baked := false
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and gen != null:
+		var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+		if baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == n:
+			use_baked = true
+			b_dir = baked["dir"]; b_g = baked["g"]; b_biome = baked["biome"]; b_temp = baked["temp"]
+			b_pos = baked["pos"]; b_relief = baked["relief"]; b_bnrm = baked["bnrm"]
 	var inv := 1.0 / float(cells)
 	for gj in range(stride):
 		var t := float(gj) * inv
 		for gi in range(stride):
 			var s := float(gi) * inv
-			var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
 			var vi := gj * stride + gi
-			var d: Vector3 = node["dir"]
-			if curved:
-				pos[vi] = d * (r_datum + float(node["relief"]) + lift)   # on the sphere → no dihedral crease across facets
+			var d: Vector3
+			var g: int
+			var biome: int
+			var temp: float
+			var relief: float
+			var npos: Vector3
+			if use_baked:
+				d = b_dir[vi]; g = b_g[vi]; biome = b_biome[vi]; temp = b_temp[vi]
+				relief = b_relief[vi]; npos = b_pos[vi]
 			else:
-				pos[vi] = (node["pos"] as Vector3) + d * lift            # node_at's own radial pos (B1 gate parity)
+				var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+				d = node["dir"]; g = int(node["g"]); biome = int(node["biome"]); temp = float(node["temp"])
+				relief = float(node["relief"]); npos = node["pos"]
+			if curved:
+				pos[vi] = d * (r_datum + relief + lift)   # on the sphere → no dihedral crease across facets
+			else:
+				pos[vi] = npos + d * lift            # node_at's own radial pos (B1 gate parity)
 			dirs[vi] = d
-			var g := int(node["g"])
-			var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+			var vc := FarPalette.color_for(g, biome, temp, g < TerrainConfig.SEA_LEVEL)
 			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): stamp alpha=0 as the per-vertex
 			# "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch keys off
 			# (`FacetFarRing._apply_smooth_normal_lit`, COLOR.a is unread by every existing shader consumer of
@@ -129,7 +158,7 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 			var vi := gj * stride + gi
 			var nv: Vector3
 			if gi == 0 or gi == cells or gj == 0 or gj == cells:
-				nv = FarDensity.boundary_normal(dirs[vi], r_datum)
+				nv = b_bnrm[vi] if use_baked else FarDensity.boundary_normal(dirs[vi], r_datum)
 			else:
 				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
 				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
@@ -207,7 +236,7 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 ## (Dictionary key simply present).
 static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float,
 		normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, cheap_on := CubeSphere.FP_RIM_CHEAP,
-		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO) -> Dictionary:
+		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO, gen: Object = null) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
@@ -264,6 +293,24 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 		hi = r_env + feather + drift + pad
 
 	var feather_safe := maxf(feather, 0.001)
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): the S2 collar's INITIAL full bake (`not have_cache` — the 11025-node
+	# biggest-tile convoy) reads its per-node dir/g/biome/temp/relief + boundary normals from ONE native
+	# bake_smooth_tile() call instead of 11025 GDScript node_at → profile_at_dir samples. The crescent path
+	# (`have_cache`, FP_RIM_CHEAP) touches only a few fresh nodes so it stays on the GDScript node_at path.
+	# Refusal / engine-lacks-method / have_cache ⇒ use_baked stays false, node_at path runs verbatim.
+	var b_dir: PackedVector3Array
+	var b_g: PackedInt32Array
+	var b_biome: PackedInt32Array
+	var b_temp: PackedFloat32Array
+	var b_relief: PackedFloat32Array
+	var b_bnrm := PackedVector3Array()
+	var use_baked := false
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and gen != null and not have_cache:
+		var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+		if baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == n:
+			use_baked = true
+			b_dir = baked["dir"]; b_g = baked["g"]; b_biome = baked["biome"]
+			b_temp = baked["temp"]; b_relief = baked["relief"]; b_bnrm = baked["bnrm"]
 	var inv := 1.0 / float(cells)
 	for gj in range(stride):
 		var t := float(gj) * inv
@@ -285,9 +332,16 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 				col[vi] = prev_col[vi]
 				rim_env_pos[vi] = prev_env_pos[vi]
 			else:
-				var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
-				d = node["dir"]
-				var true_pos: Vector3 = d * (r_datum + float(node["relief"]))
+				var relief_v: float
+				var g: int
+				var biome: int
+				var temp: float
+				if use_baked:
+					d = b_dir[vi]; relief_v = b_relief[vi]; g = b_g[vi]; biome = b_biome[vi]; temp = b_temp[vi]
+				else:
+					var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+					d = node["dir"]; relief_v = float(node["relief"]); g = int(node["g"]); biome = int(node["biome"]); temp = float(node["temp"])
+				var true_pos: Vector3 = d * (r_datum + relief_v)
 				var env_p: Vector3
 				if have_cache:
 					env_p = prev_env_pos[vi]   # terrain-invariant, cached VERBATIM — no reconstruction, bit-exact
@@ -300,8 +354,7 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 				var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
 				var blended: Vector3 = env_p.lerp(true_pos, w)
 				pos[vi] = blended - d * (sink * (1.0 - w))
-				var g := int(node["g"])
-				var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+				var vc := FarPalette.color_for(g, biome, temp, g < TerrainConfig.SEA_LEVEL)
 				if normal_lit:
 					vc.a = 0.0
 				col[vi] = vc
@@ -318,7 +371,7 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 			var vi := gj * stride + gi
 			var nv: Vector3
 			if gi == 0 or gi == cells or gj == 0 or gj == cells:
-				nv = FarDensity.boundary_normal(dirs[vi], r_datum)
+				nv = b_bnrm[vi] if use_baked else FarDensity.boundary_normal(dirs[vi], r_datum)
 			else:
 				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
 				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
@@ -508,6 +561,10 @@ static func _decode(fid: int) -> Array:
 
 var _material: Material = null
 var _mi: Array = [null, null, null, null]     # per-tier MeshInstance3D, indexed by the S2..S5 enum
+# FP_CPP_SMOOTH_BAKE (REVISION 6): a frozen-config VoxelGeneratorCosmos for the native smooth-tile-height bake,
+# built ONCE in setup_instance on main and read-only in the workers (bake_smooth_tile takes a per-call
+# RWLockRead ⇒ worker-safe). Null with the flag off / module absent / no active_fid ⇒ GDScript node_at path.
+var _cpp_gen: Object = null
 var _tiles: Dictionary = {}          # fid -> build_tile Dictionary (resident, committed on main)
 var _tier_of: Dictionary = {}        # fid -> tier (S2..S5) of each resident tile
 var _want: Dictionary = {}           # fid -> tier (the driver's requested resident set)
@@ -624,11 +681,16 @@ var _txn_apply_count := 0      # G-FS-NOHOLE telemetry: atomic (possibly multi-t
 ## profile_at_dir) so `build_tile`/`build_tile_rim` are worker-safe. An empty tier's MeshInstance3D carries a
 ## 0-surface mesh (0 draws) — S2 stays empty (and its MeshInstance3D a harmless no-op node) unless FP_SMOOTH_RIM
 ## actually assigns it (§3 P3).
-func setup_instance(parent: Node3D, material: Material) -> void:
+func setup_instance(parent: Node3D, material: Material, active_fid: int = -1) -> void:
 	FarPalette.ensure_ready()
 	BlockCatalog.ensure_ready()
 	TerrainConfig.profile_at_dir(0.0, 1.0, 0.0, FacetAtlas.R_BLOCKS)   # warm _ensure_noise on main
 	_material = material
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): build the native tile-height generator ONCE here on main (same frozen-config
+	# plumbing as the skin tier's sampler; the per-facet corner_dirs are passed per-call, so one instance bakes any
+	# facet). Read-only in the workers thereafter. Off / module absent / no fid ⇒ stays null → GDScript node_at path.
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and active_fid >= 0:
+		_cpp_gen = FacetSkinTier._build_cpp_gen(active_fid)
 	for t in [S2, S3, S4, S5]:
 		var mi := MeshInstance3D.new()
 		mi.name = "FacetSmoothMesh_T%d" % t
@@ -964,9 +1026,9 @@ func _build_worker(i: int) -> void:
 		var prev_env_pos: PackedVector3Array = _s_prev_env_pos[i] if _s_prev_env_pos.size() > i else PackedVector3Array()
 		var prev_tile: Dictionary = _s_prev_tile[i] if _s_prev_tile.size() > i else {}
 		var old_col: Vector3 = _s_old_col[i] if _s_old_col.size() > i else Vector3.ZERO
-		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col)
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col, _cpp_gen)
 	else:
-		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot)   # curved sphere placement, lift retired to 0 (replacement law)
+		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, _cpp_gen)   # curved sphere placement, lift retired to 0 (replacement law)
 	var plan: PackedInt32Array = _s_snap[i]
 	if plan.size() == 4:
 		var corner_dirs := FacetAtlas.facet_corner_dirs(fid)

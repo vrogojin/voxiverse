@@ -664,6 +664,17 @@ static func band_bytes_max() -> int:
 ## (byte-off unaffected). Belt-and-suspenders: the shader also falls an un-baked/evicted band texel to fine (F1 ii/iii).
 const BAND_PROMOTE_DIST := 1500.0
 
+## FP_CPP_SMOOTH_BAKE — the smooth-tile HEIGHTS (per-node dir/g/biome/temp + boundary normals) come from ONE native
+## VoxelGeneratorCosmos.bake_smooth_tile() call per tile instead of the per-node GDScript FarDensity.node_at →
+## TerrainConfig.profile_at_dir chain (~2700 worldgen samples/tile). REVISION 6 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md):
+## the GDScript per-node profile sample + Dictionary alloc is what CONVOYS the WASM dlmalloc lock with the main thread
+## during warmup (the SAME wall FP_CPPGEN / FP_CPP_TILE_BAKE cleared for the near-gen + far-skin). Byte-equal to node_at
+## by construction (f64 bilerp+normalize → the already-byte-equal C++ profile_at_dir → identical g/relief/pos term order;
+## Vector3 real_t boundary_normal mirror). Requires FP_FAR_SMOOTH + the engine rebuild (patch 0012). Off ⇒ the GDScript
+## node_at loop; if the engine lacks bake_smooth_tile the dispatch falls through to GDScript. Gate: verify_far_smooth
+## G-CSB-EQ. Bake ON at export alongside the smooth stack.
+const FP_CPP_SMOOTH_BAKE := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

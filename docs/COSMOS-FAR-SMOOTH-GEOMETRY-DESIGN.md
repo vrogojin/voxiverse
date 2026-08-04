@@ -1090,3 +1090,176 @@ convergence gate must run the **live flag configuration's** predicate (gate-forc
 every flag the predicate branches on) and must bound **time-to-latch from the cold state**,
 not just verify the warm fixpoint; and every background sweep needs a telemetry field — a
 worker that is busy with work no counter names is invisible until it costs 30 fps.
+
+---
+
+# REVISION 6 — C++ smooth-tile-height bake (`FP_CPP_SMOOTH_BAKE`) (2026-08-04, Fable)
+
+The tier is **correct and quiescent at rest** (R2–R5), but the WARMUP is unplayable: every
+smooth tile's per-node heights are computed in GDScript — `FacetSmoothTier.build_tile`'s
+node loop calls `FarDensity.node_at` once per node (`(cells+1)²` = 2 809 at S3, 11 025 at
+S2), each `node_at` = one interpreted `TerrainConfig.profile_at_dir` (5 noise samples + the
+height/mountain math) **plus a per-node Dictionary alloc**, and the boundary-normal pass adds
+`4 · (4·cells)` more `profile_at_dir` calls (832 at S3). On web that per-node allocation
+traffic convoys the WASM dlmalloc against the main thread ([[voxiverse-walk-perf-root-cause]])
+— the exact wall only the C++ port (`FP_CPPGEN`, patch 0007) ever solved for the voxel path,
+and that `bake_far_tile` (patch 0011, `FP_CPP_TILE_BAKE`) solved for the far SKIN this
+session. REVISION 6 applies the SAME proven pattern to the smooth tier's HEIGHTS: **one
+marshalled native call per tile**, byte-equal to the GDScript, behind `FP_CPP_SMOOTH_BAKE`.
+This is a perf port of an already-correct computation — no geometry law changes.
+
+## R6.1 The native method (patch 0012, `VoxelGeneratorCosmos`)
+
+ENTRY POINT 5, alongside `sample_columns`/`bake_far_tile` (const, one `RWLockRead` per call,
+thread-safe from WorkerThreadPool exactly like both):
+
+```cpp
+// The whole FarDensity.node_at grid for one tile in ONE call. Pure function of its
+// arguments + the frozen noise Parameters — no fid, no atlas lookup: the caller passes
+// FacetAtlas.facet_corner_dirs(fid) (12 f64, canon corners 00,10,11,01) and r_of(fid)
+// verbatim, so the P0 canon-dir weld law is inherited, not re-derived.
+Dictionary bake_smooth_tile(PackedFloat64Array corner_dirs, double r_datum, int cells) const;
+```
+
+Returns (all sized `n = (cells+1)²`, row-major `vi = gj·stride + gi`, `stride = cells+1`,
+node params `s = gi·inv`, `t = gj·inv` with `inv = 1.0/double(cells)` — the EXACT GDScript
+grid law, never `gi/cells`):
+
+| key | type | content (byte-equality construction vs `far_density.gd`) |
+|---|---|---|
+| `"dir"` | PackedVector3Array | `node_at`'s `dir`: f64 bilerp of the canon corner dirs (same term order `v00(1-s)(1-t)+v10·s(1-t)+v11·s·t+v01(1-s)t`, indices 0/3/6/9), `ln = sqrt(ex²+ey²+ez²)` f64, degenerate guard `ln <= 0 → (0,1,0)`, divisions f64, THEN `Vector3(dx,dy,dz)` f32-narrow at construction — identical to GDScript's narrow point |
+| `"g"` | PackedInt32Array | `int(prof.x)` of `profile_at_dir(p, dx, dy, dz, r_datum)` called with the **f64 pre-narrow** dx/dy/dz (as GDScript does) — the C++ `profile_at_dir` is the already-gated 0007 port, byte-equal by construction |
+| `"biome"` | PackedInt32Array | `int(prof.y)` |
+| `"temp"` | PackedFloat32Array | `prof.w` (the f32 component verbatim; GDScript's f64 widen on read reproduces the same value) |
+| `"bnrm"` | PackedVector3Array | `FarDensity.boundary_normal(dir[vi], r_datum)` for **perimeter** vi only (interior = Vector3()); see R6.2 |
+
+**Refusal (0008 inert-but-well-formed pattern):** empty Dictionary when `!_params.ready`,
+`corner_dirs.size() < 12`, `cells <= 0`, or `cells > 512` (S2=104 is the real max; the cap
+blocks a bogus giant alloc). The generator stays fully functional for voxels either way.
+
+**Fields native vs GDScript-finished.** Native = exactly the convoy: the bilerp+normalize,
+the `profile_at_dir` sample, and the boundary-normal stencil (each a per-node interpreted
+worldgen chain + Variant/Dictionary churn today). GDScript cheaply finishes everything that
+is pure arithmetic over the returned arrays, **verbatim from today's code** so it cannot
+diverge: `relief = maxf(0.0, float(g − SEA_LEVEL)) * RELIEF` (f64, exact — small-int inputs),
+`planar = dir·r_datum`, both `pos` branches (`curved`/`node_at`-pos), `uv`/`uv2`, the
+interior central-difference normals over the FINAL pos grid, and the colour
+(`FarPalette.color_for(g, biome, temp, g < SEA_LEVEL)` — kept GDScript **deliberately**: the
+native `far_color` now carries the `skin_block_exact` per-column branch, which needs integer
+(x,z) columns that smooth (s,t) nodes don't have; routing colour through it would be a
+divergence trap, and 2 809 branch-only `color_for` calls allocate nothing).
+
+Private statics inside the module (mirroring 0011's structure): `smooth_node(p, cd, r_datum,
+s, t, …)` (= `node_at` minus the Dictionary) and `smooth_boundary_normal(p, d, r_datum)`
+(= `boundary_normal` + `_radial_at`, see R6.2). Mirrored constants: `SMOOTH_RELIEF = 1.0`
+(`FarDensity.RELIEF`), `SMOOTH_BNORM_STEP = 1.0` (`BOUNDARY_NORMAL_STEP`).
+
+## R6.2 Boundary normals — yes, native (they are a third of the cost)
+
+`boundary_normal` is 4 extra `profile_at_dir` per perimeter node — at S3 that is 832 calls
+vs the grid's 2 809 (~30 % of the tile's worldgen cost), at S2 1 664. It goes native inside
+the SAME call (the `"bnrm"` array), not as a second entry point. Byte-equality construction —
+the f32/f64 split is the load-bearing part and is mirrored op-for-op:
+
+- ref pick: `absf` compares on the f32 components (f64-widened, identical predicate);
+- `u = (ref − d·(ref.dot(d))).normalized()`, `v = d.cross(u).normalized()` — **all
+  Vector3 real_t (f32) core ops** (GDScript Vector3 math IS these same core functions);
+- `scale = 1.0 / r_datum` **f64**; `tangent * scale` → Godot narrows the scalar to real_t
+  first (`tangent * real_t(scale)`), f32×f32;
+- `_radial_at`: `sd = (d + tangent·scale).normalized()` f32; `profile_at_dir` at the
+  **f32-widened** `sd.x/y/z` (unlike the grid nodes' f64 — mirror exactly); relief f64;
+  `sd * real_t(r_datum + relief)`;
+- cross/normalize/orient: f32 core ops, `length_squared() <= 0 → d`, `dot < 0 → −nv`.
+
+## R6.3 Integration (`facet_smooth_tier.gd`), flag `FP_CPP_SMOOTH_BAKE`
+
+New `const FP_CPP_SMOOTH_BAKE := false` in `cube_sphere.gd` (deploy sed flips it alongside
+`FP_FAR_SMOOTH`). **No off-surface gate** — the native bake is cheap enough to run
+on-surface, which is exactly where the warmup floods.
+
+1. **Generator instance (design question 5):** the P1 `FacetSmoothTier` instance OWNS one,
+   built in `setup_instance` via the existing frozen-config plumbing —
+   `_cpp_gen = FacetSkinTier._build_cpp_gen(active_fid)` — when the flag is on and the class
+   exists. NOT shared with the skin tier's live instance: `FP_SKIN_TIER` can be off/absent
+   independently, and a second instance costs ~nothing (the Parameters struct holds Refs to
+   the SAME noise Resources). Held as a strong member ref (the `_sampler_obj` lesson);
+   written once at setup, read-only ever after ⇒ worker-safe without new locking
+   (`bake_smooth_tile` is const + RWLockRead, the `_pbm` concurrency pattern).
+   **Config rider (required for byte-equality):** `_build_cpp_gen`'s cfg gains
+   `"climate_biomes": CubeSphere.FP_CLIMATE_BIOMES`. Today it omits the key ⇒ `p.climate_biomes`
+   defaults false while GDScript `TerrainConfig._biome` reads the live flag — a latent
+   biome/colour divergence for the SKIN too whenever `FP_CLIMATE_BIOMES` ships on. Fixing it
+   is byte-identical with the flag off and gate-covered by G-CG-COLUMNS with it on.
+2. **`build_tile(fid, cells, lift, curved, normal_lit, slot, gen: Object = null)`:** when
+   `gen != null`, ONE `gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)` replaces the
+   node_at loop; validate the four grid arrays are size `n` (else fall through — loud
+   refusal, never a wrong tile); the fill loop derives relief/pos/planar/uv/uv2/colour/alpha
+   verbatim (R6.1 table); the normal pass reads `bnrm[vi]` at the perimeter instead of
+   calling `FarDensity.boundary_normal`, interior central-diff unchanged. `gen == null`
+   (flag off, module absent, malformed return) ⇒ the current loop, byte-identical.
+3. **`build_tile_rim(…, gen)` — yes, the rim routes through the native bake too, but only on
+   its FULL-bake path:** the `not have_cache` branch (initial S2 bake — at 11 025 nodes the
+   single biggest tile in the system) consumes the same baked arrays for every node's
+   dir/g/relief/biome/temp, then blends env/feather/sink in GDScript exactly as today. The
+   FP_RIM_CHEAP **crescent** rebake path is left untouched: it resamples only a small fresh
+   annulus (a batched full-grid bake would waste 11 025 native nodes to feed ~hundreds), and
+   it is already measured-acceptable (R5.3). `_env_weld_grid` (the rim's OTHER warmup cost)
+   stays GDScript at its Stage-D coarsened mult — separate, already-shipped mitigation; noted
+   as the residual S2 cost, not this revision's scope.
+4. **Worker glue:** `_build_worker` passes the frozen `_cpp_gen` into both builders (one
+   added argument; single-writer discipline unchanged — the member never mutates after
+   setup). `snap_edge_to_pitch`/`_pitch_node_pos` stay GDScript (≤ ~20 `node_at` per tile —
+   noise, not signal).
+
+Earth-only parity note: `FarDensity.node_at` calls `TerrainConfig.profile_at_dir` (never the
+Moon dispatch) — the native bake mirrors that verbatim. Same scope, not a regression.
+
+## R6.4 The gate (G-CSB-EQ, extend `tools/verify_far_smooth.gd`)
+
+1. **Per-node bit-equality:** for a facet sample spanning all 6 faces, a cross-face-edge
+   pair, and a cube-corner facet, at S5/S4/S3 (+S2 on one facet): native `bake_smooth_tile`
+   vs the GDScript `node_at` loop — `g`/`biome` `==`, `dir`/`temp`/`bnrm` bit-equal
+   per component. 0 mismatches over ~10⁴ nodes.
+2. **Whole-tile:** `build_tile` (and rim full-bake) with `gen` vs without —
+   pos/nrm/col/uv/uv2/idx byte-equal.
+3. **Weld survives the port (law 2):** a shared cross-face edge node computed through the
+   NATIVE path from BOTH facets' `corner_dirs` ⇒ bit-identical.
+4. **Falsify:** re-run (1) against a native call with `cells+1` and with a rotated corner
+   order — the comparison MUST fail (non-vacuous gate).
+5. Regressions: `verify_far_smooth` 27/0 with the flag ON; FLAT 6042/0 flag OFF
+   (byte-identical — default false); G-CG-COLUMNS both states of the climate_biomes rider.
+
+## R6.5 Patch / rebuild plan
+
+- **New patch `docker/engine/patches/godot_voxel/0012-cosmos-smooth-tile-bake.patch`** — do
+  NOT extend 0011 (one feature per patch, and 0011 is shipped). Touches only
+  `generators/cosmos/voxel_generator_cosmos.{h,cpp}` (+ the ClassDB bind). Generate from the
+  prepared tree at `scratchpad/voxel-src` (base commit = 0001-0010, working diff = 0011):
+  commit the 0011 state locally, implement, `git diff HEAD > 0012…patch` ⇒ applies cleanly
+  after 0011 in `scripts/build.sh`'s patch ladder.
+- **Rebuild:** `scripts/build.sh` — Linux editor first (`SKIP_WEB=1`, minutes warm) for the
+  headless gates, then the web templates for deploy. GDScript lands in the same PR with the
+  flag default-false (byte-identical until the sed).
+
+## R6.6 Verdict — **GREEN**, with one named unknown
+
+This is the third instance of an already-twice-proven pattern (0007 voxels, 0011 skin): port
+a pure, gate-pinned computation behind a batched const entry point, keep the GDScript twin as
+the byte-oracle and the fallback. Bounded memory: the per-call return is `36·n` bytes
+(~397 KB at S2, ~101 KB at S3), ≤ `SMOOTH_BUILD_SLOTS`(8) in flight ≈ ≤ 3.2 MB transient,
+freed at commit — no new resident state, NEVER-OOM ledger unchanged.
+
+**Warmup speedup estimate:** a 289-facet cold engage is ~4–5·10⁵ interpreted
+`profile_at_dir` chains + as many Dictionary allocs today. Native: the same sample count
+compiled (the skin bake measured ~10–40× per tile on this exact chain) ⇒ worker-side bake
+time from minutes to ~5–15 s — and, the part that actually restores playability, the
+per-node allocation traffic vanishes (one marshalled call + packed arrays), so the WASM
+allocator convoy stops stalling the MAIN thread during warmup. Composes with
+FP_SMOOTH_GROW_PACE (fewer, cheaper builds) rather than replacing it.
+
+**Single riskiest byte-equality unknown:** the compiler's floating-point contraction (FMA)
+in the f64 bilerp/normalize chain vs GDScript's op-by-op VM — plus the enumerated f32-narrow
+points in `boundary_normal` (R6.2). Precedent says the shipped flags don't contract (0007's
+`height_c3` is the same `a*b+c` style and is bit-equal on BOTH Linux and web), and G-CSB-EQ
+item 1 falsifies it per-node; if web codegen ever contracts, the fix is `-ffp-contract=off`
+on the cosmos TU. Everything else is mirrored construction, not hope.

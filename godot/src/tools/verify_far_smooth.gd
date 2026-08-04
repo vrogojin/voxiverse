@@ -69,6 +69,7 @@ const TC := preload("res://src/world/terrain_config.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FD := preload("res://src/world/far/far_density.gd")
 const FST := preload("res://src/world/facet_smooth_tier.gd")
+const FSK := preload("res://src/world/facet_skin_tier.gd")   # REVISION 6 (G-CSB-EQ): _build_cpp_gen for the native bake
 
 var _pass := 0
 var _fail := 0
@@ -189,6 +190,16 @@ func _initialize() -> void:
 	# collar; the bigger flood is the ladder's own cold-engage hop-ring target, up to 289 facets in one call) ---
 	_ok(not CubeSphere.FP_SMOOTH_GROW_PACE, "G-R5-OFF: FP_SMOOTH_GROW_PACE defaults false (byte-off; the sticky_on branch hands the FULL hop-ring target to request() in one call)")
 	_gate_grow_pace()
+
+	# --- REVISION 6 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 6 — C++ smooth-tile-height bake") ---
+	# FP_CPP_SMOOTH_BAKE: the smooth-tile per-node dir/g/biome/temp/relief/pos + boundary normals come from the
+	# native VoxelGeneratorCosmos.bake_smooth_tile() instead of the GDScript FarDensity.node_at → profile_at_dir
+	# convoy. build_tile/_rim read the baked arrays VERBATIM, so field-for-field bit-equality of the native bake
+	# vs node_at ⇒ an IDENTICAL mesh by construction. (Needs the built module; skips with a clear FAIL if absent.)
+	_ok(not CubeSphere.FP_CPP_SMOOTH_BAKE, "G-R6-OFF: FP_CPP_SMOOTH_BAKE defaults false (byte-off; build_tile/_rim take the GDScript node_at path, `gen` ignored)")
+	_gate_cpp_smooth_bake(fid)          # interior facet — every tier of the ladder
+	_gate_cpp_smooth_bake(fid_edge)     # a cross-face-boundary facet — native path exercised at a cube seam
+	_gate_cpp_smooth_bake_weld(fid_edge, FA.S_WEST)   # law-2 survival: shared cross-face edge, native both sides
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -2720,3 +2731,138 @@ func _gate_grow_pace() -> void:
 			all_ring1_in = false
 	_ok(all_ring1_in, "G-FS-GROW-PACE: every ring-1 (active's direct seam-neighbour) facet is granted on the VERY FIRST call -- the near<->far seam is covered promptly, never paced")
 	ring_fast.free()
+
+## G-CSB-EQ (REVISION 6, FP_CPP_SMOOTH_BAKE): the native VoxelGeneratorCosmos.bake_smooth_tile() is bit-equal to
+## FarDensity.node_at, FIELD FOR FIELD, over every tier of the ladder. build_tile/build_tile_rim read the baked
+## arrays VERBATIM, so this node-level equality IS the whole proof: an identical mesh follows by construction.
+## Falsified two ways (rotated corner order diverges; cells+1 changes the grid) + the refusal contract. Runs
+## flag-independent (calls the method directly with an explicit gen — never the CubeSphere const, which is a
+## compile-time literal). Needs the built module: a clear FAIL if bake_smooth_tile is absent.
+func _gate_cpp_smooth_bake(fid: int) -> void:
+	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
+		_ok(false, "G-CSB-EQ[fid%d]: VoxelGeneratorCosmos module ABSENT — the native bake cannot be gated (rebuild the module engine with patch 0012)" % fid)
+		return
+	var gen: Object = FSK._build_cpp_gen(fid)
+	_ok(gen != null, "G-CSB-EQ[fid%d]: native generator built + setup" % fid)
+	if gen == null:
+		return
+	_ok(gen.has_method("bake_smooth_tile"), "G-CSB-EQ[fid%d]: generator exposes bake_smooth_tile (patch 0012 present)" % fid)
+	if not gen.has_method("bake_smooth_tile"):
+		return
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var r_datum := FA.r_of(fid)
+	for tier in [FST.S2, FST.S3, FST.S4, FST.S5]:
+		_cmp_bake_tier(gen, fid, corner_dirs, r_datum, FST.cells_for_tier(tier), tier)
+	# Falsify 1: a rotated corner order must DIVERGE somewhere (the equality check is discriminating, not vacuous).
+	var rot := PackedFloat64Array([
+		corner_dirs[3], corner_dirs[4], corner_dirs[5], corner_dirs[6], corner_dirs[7], corner_dirs[8],
+		corner_dirs[9], corner_dirs[10], corner_dirs[11], corner_dirs[0], corner_dirs[1], corner_dirs[2]])
+	var cells5 := FST.cells_for_tier(FST.S5)
+	var stride5 := cells5 + 1
+	var brot: Dictionary = gen.call("bake_smooth_tile", rot, r_datum, cells5)
+	var br_dir: PackedVector3Array = brot["dir"]
+	var diff := false
+	var inv5 := 1.0 / float(cells5)
+	for gj in range(stride5):
+		for gi in range(stride5):
+			var node := FD.node_at(corner_dirs, r_datum, float(gi) * inv5, float(gj) * inv5)
+			if br_dir[gj * stride5 + gi] != (node["dir"] as Vector3):
+				diff = true
+	_ok(diff, "G-CSB-EQ[fid%d falsify]: a ROTATED corner order yields a DIFFERENT bake" % fid)
+	# Falsify 2: cells+1 changes the grid → (cells+2)^2 nodes (the grid law is honoured, not a fixed count).
+	var bplus: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells5 + 1)
+	_ok((bplus["dir"] as PackedVector3Array).size() == (cells5 + 2) * (cells5 + 2),
+		"G-CSB-EQ[fid%d falsify]: cells+1 → (cells+2)^2 grid" % fid)
+	# Refusal contract (an empty dict → the caller falls back to the GDScript node_at loop).
+	_ok((gen.call("bake_smooth_tile", corner_dirs, r_datum, 0) as Dictionary).is_empty(),
+		"G-CSB-EQ[fid%d]: cells<=0 refuses (empty dict → node_at fallback)" % fid)
+	_ok((gen.call("bake_smooth_tile", PackedFloat64Array([0.0, 0.0]), r_datum, cells5) as Dictionary).is_empty(),
+		"G-CSB-EQ[fid%d]: corner_dirs.size()<12 refuses (empty dict)" % fid)
+
+func _cmp_bake_tier(gen: Object, fid: int, corner_dirs: PackedFloat64Array, r_datum: float, cells: int, tier: int) -> void:
+	var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+	var stride := cells + 1
+	var n := stride * stride
+	_ok(baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == n,
+		"G-CSB-EQ[t%d fid%d]: bake returns (cells+1)^2 = %d nodes" % [tier, fid, n])
+	if not baked.has("dir"):
+		return
+	var b_dir: PackedVector3Array = baked["dir"]
+	var b_g: PackedInt32Array = baked["g"]
+	var b_biome: PackedInt32Array = baked["biome"]
+	var b_temp: PackedFloat32Array = baked["temp"]
+	var b_relief: PackedFloat32Array = baked["relief"]
+	var b_pos: PackedVector3Array = baked["pos"]
+	var b_planar: PackedVector3Array = baked["planar"]
+	var b_bnrm: PackedVector3Array = baked["bnrm"]
+	var inv := 1.0 / float(cells)
+	var dir_ok := true
+	var g_ok := true
+	var biome_ok := true
+	var temp_ok := true
+	var relief_ok := true
+	var pos_ok := true
+	var planar_ok := true
+	var bnrm_ok := true
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var vi := gj * stride + gi
+			var node := FD.node_at(corner_dirs, r_datum, s, t)
+			if b_dir[vi] != (node["dir"] as Vector3): dir_ok = false
+			if b_g[vi] != int(node["g"]): g_ok = false
+			if b_biome[vi] != int(node["biome"]): biome_ok = false
+			if b_temp[vi] != float(node["temp"]): temp_ok = false
+			if b_relief[vi] != float(node["relief"]): relief_ok = false
+			if b_pos[vi] != (node["pos"] as Vector3): pos_ok = false
+			if b_planar[vi] != (node["planar"] as Vector3): planar_ok = false
+			if gi == 0 or gi == cells or gj == 0 or gj == cells:
+				if b_bnrm[vi] != FD.boundary_normal(node["dir"], r_datum): bnrm_ok = false
+	_ok(dir_ok, "G-CSB-EQ[t%d fid%d]: native dir == node_at dir (bit-equal, all %d nodes)" % [tier, fid, n])
+	_ok(g_ok, "G-CSB-EQ[t%d fid%d]: native g == node_at g" % [tier, fid])
+	_ok(biome_ok, "G-CSB-EQ[t%d fid%d]: native biome == node_at biome" % [tier, fid])
+	_ok(temp_ok, "G-CSB-EQ[t%d fid%d]: native temp == node_at temp (bit-equal)" % [tier, fid])
+	_ok(relief_ok, "G-CSB-EQ[t%d fid%d]: native relief == node_at relief (bit-equal)" % [tier, fid])
+	_ok(pos_ok, "G-CSB-EQ[t%d fid%d]: native pos == node_at pos (bit-equal — the flat-path vertex)" % [tier, fid])
+	_ok(planar_ok, "G-CSB-EQ[t%d fid%d]: native planar == node_at planar (bit-equal)" % [tier, fid])
+	_ok(bnrm_ok, "G-CSB-EQ[t%d fid%d]: native boundary normal == FarDensity.boundary_normal (perimeter, bit-equal)" % [tier, fid])
+
+## G-CSB-EQ-WELD (law-2 survival): two facets sharing a CROSS-FACE edge, BOTH baked through the NATIVE path, weld
+## on their shared boundary vertices (≤1e-9·R). bake_smooth_tile is a pure function of the canon corner dirs and
+## G-FS-CANON proves both facets pass the SAME canon dirs on the shared edge, so the native boundary nodes weld
+## exactly as node_at's do (which G-FS-WELD-EDGE already passes at this tolerance). Nearest-match, order-agnostic.
+func _gate_cpp_smooth_bake_weld(fid: int, slot: int) -> void:
+	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
+		return   # the ABSENT case is already FAIL-reported by _gate_cpp_smooth_bake
+	var gen: Object = FSK._build_cpp_gen(fid)
+	if gen == null or not gen.has_method("bake_smooth_tile"):
+		return
+	var nb := FA.seam_neighbour(fid, slot)
+	var cells := FST.cells_for_tier(FST.S4)
+	var stride := cells + 1
+	var ba: Dictionary = gen.call("bake_smooth_tile", FA.facet_corner_dirs(fid), FA.r_of(fid), cells)
+	var bb: Dictionary = gen.call("bake_smooth_tile", FA.facet_corner_dirs(nb), FA.r_of(nb), cells)
+	if not (ba.has("pos") and bb.has("pos")):
+		_ok(false, "G-CSB-EQ-WELD: native bake produced pos arrays for both facets")
+		return
+	var pa: PackedVector3Array = ba["pos"]
+	var pb: PackedVector3Array = bb["pos"]
+	var edge_a := _edge_indices(slot, cells, stride)
+	var nb_boundary := _all_boundary_indices(cells, stride)
+	var cross_face := _face_of(nb) != _face_of(fid)
+	var eps := (1.0e-9 * FA.R_BLOCKS) if cross_face else 0.0
+	var weld_ok := true
+	var max_gap := 0.0
+	for ia in edge_a:
+		var va: Vector3 = pa[ia]
+		var best := 1.0e30
+		for ib in nb_boundary:
+			var d: float = va.distance_to(pb[ib])
+			if d < best:
+				best = d
+		max_gap = maxf(max_gap, best)
+		if best > eps:
+			weld_ok = false
+	_ok(cross_face, "G-CSB-EQ-WELD: fixture slot %d neighbour (fid %d) is a CROSS-FACE pair" % [slot, nb])
+	_ok(weld_ok, "G-CSB-EQ-WELD: every native shared-edge vertex welds to the neighbour's native bake (≤1e-9·R, max gap %.3e)" % max_gap)

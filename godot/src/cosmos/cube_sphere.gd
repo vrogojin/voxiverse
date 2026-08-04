@@ -867,6 +867,79 @@ const FP_SMOOTH_WELD_REFRESH := false
 ##   scenario makes the rebuild/re-emit counters CLIMB — the shipped bug reproduces).
 const FP_RING_QUIESCE := false
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage A (FP_ENV_DEMAND_DISC, R5.1 residual 1 fix, part 1): bound
+##   the floored env-convergence SET. `_count_uncached_visible`'s min-envelope demand previously ran across the WHOLE
+##   visible hemisphere (~1500 coarse facets at the floored θ_emit=90° cap) — but the envelope is a no-protrusion
+##   LOWER BOUND against the NEAR field, and near meshes only ever exist within `near_render_radius() +
+##   RIM_STREAM_MARGIN` of the player (backstop ∪ mid-dense ∪ a couple of rings). A facet with no near field over it
+##   has nothing to protrude through — its exact (pre-envelope) chord IS its correct terminal state, needing NO
+##   envelope upgrade at all. This flag demands the envelope ONLY for `_dense_warm(fid)` (backstop ∪ mid-dense) or a
+##   facet within `ENV_DEMAND_RINGS` facet-edges of the current emit axis (`FacetFarRing._in_env_demand_disc`, the
+##   SAME angular-disc test FP_MID_DENSE already uses, just a wider radius); every other visible facet counts DONE
+##   the instant its CHEAP chord exists (`_pos_cache.has`), in both `_count_uncached_visible` (`remaining`, R5.1's
+##   residual driver) and the async worker's warm loop (`FacetFarRing._env_have`/`_env_build_one`) — so it is built
+##   via the cheap `_ensure_chord_cached` path, never the ~300×-heavier `_env_weld_grid`. Floored `remaining` drops
+##   from ~1500 to ≤ ~40 (backstop ∪ mid-dense ∪ the demand disc), so a cold floored engage latches in a handful of
+##   ENV_WARM_BATCH(12) dispatch cycles instead of ~125. Strictly LESS work + a strictly SMALLER `_env_done`/
+##   `_pos_cache` footprint ⇒ NEVER-OOM by construction; no-protrusion is preserved because the excluded facets are
+##   exactly the ones with no near field to protrude through (the design's own invariant, not a new approximation).
+##   ORBIT is UNCHANGED: the orbit driver (`_orbit_warm_async`) explicitly forces its own demand test off (there is
+##   no "near field on the ground" concept off-surface — the whole coarse hemisphere IS the drawn surface there), so
+##   this flag is a pure FLOORED/descent fix. Off ⇒ every counter/worker call passes `demand_on=false` (the shipped
+##   test) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-FS-QUIESCE-SURF (falsifies: forced off, the
+##   cold-engage dispatch count blows the `ceil(demand/ENV_WARM_BATCH)+2` bound — the live ~125-cycle stall
+##   reproduces).
+const FP_ENV_DEMAND_DISC := false
+## ENV_DEMAND_RINGS: the demand-disc radius in facet-edge angles (mirrors MID_DENSE_RINGS's units) — MID_DENSE_RINGS
+##   (the dense-promotion disc) + 2, so the envelope demand strictly ENCLOSES the dense-promotion set (no facet is
+##   ever mid-dense-promoted without ALSO sitting inside its own envelope-demand disc).
+const ENV_DEMAND_RINGS := MID_DENSE_RINGS + 2.0
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage B (FP_WARM_EMIT_SPLIT, R5.1 residual 1 fix, part 2): warm
+##   and emit were FUSED — the only way to warm ENV_WARM_BATCH env caches was `_begin_rebuild` → a full front-
+##   hemisphere SurfaceTool re-emit + `generate_normals` + a main-thread `_swap_in_arrays` GPU upload, EVERY warm
+##   cycle (the sh_begin/sh_reemit ~0.75/s climb + the whole-hemisphere re-upload R5.1 measured at rest). This flag
+##   splits the two: when `_surface_converge_emit`'s FLOORED branch has NOTHING to dispatch but a non-coverage env
+##   upgrade (`remaining>0`, no fresh `_pending`, already emitted once), it dispatches a WARM-ONLY worker task
+##   (`FacetFarRing._dispatch_warm_only` / `_run_env_warm_pass`, an `_async_warm_only` mode of the existing
+##   `_async_build_worker` that fills caches and returns — no SurfaceTool, no arrays; `_poll_async_rebuild` skips the
+##   mesh swap for it) instead of a real emit; the shell re-emits for real only on a genuine coverage event
+##   (`_pending` / first engage) or ONCE more when the envelope fully converges (`remaining` hits 0 — `_srf_env_dirty`
+##   latches this), so a floored engage does AT MOST 2 real `_reemit_count` bumps (one initial coverage emit, one
+##   final env-converged emit) no matter how many warm cycles it took. Sub-pixel at these distances — an un-reemitted
+##   envelope upgrade only nudges already-drawn chord heights, held meanwhile by the ε sink + skirts (the same "safe
+##   to lag a frame" argument REV3's T1/T2 already rely on). Also carries the hygiene fix Fable found tracing this:
+##   the worker's per-facet cache upgrade used to `erase()` the stale chord THEN rebuild it (a momentary MISSING key
+##   a concurrent main-thread reader — `_cull_update`'s `_bpos_cache.keys()` scan — could observe mid-task); the
+##   shared `_env_build_one`/`_ensure_cached`/`_ensure_backstop_cached` now take a `force` parameter that REPLACES via
+##   a single in-place dictionary assignment instead (never erases), so a reader can no longer see a momentarily-
+##   absent key — inert whenever nothing would have erased in the first place (identical resulting cache values
+##   either way). Off ⇒ `_surface_converge_emit` always dispatches a REAL `_begin_rebuild()` for every env-upgrade
+##   cycle (the shipped fused cadence) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-FS-QUIESCE-SURF
+##   (falsifies: forced off, `_reemit_count` climbs once per warm batch instead of latching at ≤2).
+const FP_WARM_EMIT_SPLIT := false
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage C (FP_FINE_BAKE_SURFACE_PAUSE, R5.2, ship first — biggest
+##   instant win, trivial): pause the FP_PLANET_MAP whole-planet FINE-tier dispatch loop
+##   (`FacetTexBaker._update_band_parallel`, the `if _fm_on:` new-task loop) while ON-SURFACE. On the ground
+##   `_offsurface` is false, which forces `_pbm_cpp`/`_pbm_tile` to 0 (both `_offsurface`-gated) — the fine bake
+##   falls to the per-texel GDScript path (PLANET_MAP_TEXELS=64 ⇒ 4096 `facet_profile` samples/facet, ~1-2 s/facet
+##   on a web worker) across up to 3456 facets — hours of continuous work on the ONE on-surface bake slot
+##   (`active=1`), the observed perpetual `pbm_busy 1` + a first-order suspect for the erratic web `proc_ms` (a
+##   per-texel GDScript allocation convoy with the main thread). On-surface, everything in view is ALREADY covered
+##   by band/skin/smooth at higher fidelity than the fine tier's 6.5 blocks/texel — the fine tier is an orbit/far
+##   feature only, so pausing its dispatch here removes pure waste. Coverage resumes on the next off-surface
+##   excursion, where `_pbm_tile_ok and _offsurface` unlocks the native C++ tile path (~10× faster) across all
+##   `_pbm_n` slots. The REAP of any already-in-flight task and the throttled dirty-page upload are BOTH left
+##   unconditional (an off-surface-dispatched bake still commits after landing; already-baked pages still flush) —
+##   only NEW task dispatch is gated. An un-fine-baked on-surface facet renders exactly the pre-Item-A shipped look
+##   (the base-page colour, via the existing alpha-coverage "un-baked = shipped, never black" law) — no visual
+##   regression, purely a scheduling change. Also adds `fm_baked`/`fm_want`/`fm_dirty` to `tex_telemetry()` — the
+##   fine tier had NO telemetry at all (the blind spot that let this hide). Off ⇒ dispatch unconditional (shipped) —
+##   byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-TEX-SURF-PAUSE (falsifies: forced off, a fine task
+##   DISPATCHES even on-surface — the shipped perpetual-bake bug reproduces).
+const FP_FINE_BAKE_SURFACE_PAUSE := false
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

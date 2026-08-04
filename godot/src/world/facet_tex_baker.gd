@@ -1764,7 +1764,10 @@ func _next_band_parallel() -> int:
 
 ## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
 ## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
-func _update_band_parallel(emit_axis: Array = []) -> void:
+## REVISION 5 Stage C: `fine_pause_on` overrides FP_FINE_BAKE_SURFACE_PAUSE (gate-forcing convention) so a headless
+## gate can prove the on-surface dispatch pause / off-surface resume without a compile-time sed. The real caller
+## (`update()`) passes no override ⇒ the compile const governs (byte-identical).
+func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE) -> void:
 	# NEW-TASK slot cap (the REAP below always scans all _pbm_n so orbit-dispatched bakes still commit after we descend):
 	# only the parallel C++ tile bake OFF-SURFACE uses all _pbm_n slots — that's where the near-field gen is frozen so the
 	# cores are free AND where the whole-planet fill latency matters. On the surface the far skin is close-up sugar over a
@@ -1830,28 +1833,38 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
 	if _fm_on:
-		for i in range(active):
-			if int(_pbm_fid[i]) >= 0:
-				continue
-			var ff := _next_fine_fid(emit_axis)
-			if ff < 0:
-				break
-			var flc := PackedVector2Array()
-			flc.resize(4)
-			for ci in range(4):
-				var w := FacetAtlas.facet_planar_corner(ff, ci)
-				var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
-				flc[ci] = Vector2(float(l[0]), float(l[2]))
-			_pbm_fid[i] = ff
-			_pbm_mode[i] = 1
-			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
-			_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
-			_pbm_layer[i] = -1
-			_pbm_lc[i] = flc
-			_pbm_nx[i] = _fm_texels
-			_pbm_ny[i] = _fm_texels
-			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
-		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads)
+		# REVISION 5 Stage C (FP_FINE_BAKE_SURFACE_PAUSE): do NOT dispatch NEW fine-tier tasks while ON-SURFACE — band/
+		# skin/smooth already cover everything in view there at higher fidelity, and on-surface forces the slow per-
+		# texel GDScript path below (`_pbm_cpp`/`_pbm_tile` are both `_offsurface`-gated) — 4096 samples/facet across
+		# up to 3456 facets, the perpetual `pbm_busy 1` + a WASM-allocator-convoy suspect. Off ⇒ dispatch unconditional
+		# (shipped, byte-identical). The REAP above (which scans ALL `_pbm_n` slots unconditionally) still drains any
+		# already-in-flight task regardless of this gate — an off-surface-dispatched bake still commits after landing
+		# back on the ground — and the upload-throttle below still flushes any already-baked dirty page; only the NEW
+		# task dispatch is paused.
+		if not fine_pause_on or _offsurface:
+			for i in range(active):
+				if int(_pbm_fid[i]) >= 0:
+					continue
+				var ff := _next_fine_fid(emit_axis)
+				if ff < 0:
+					break
+				var flc := PackedVector2Array()
+				flc.resize(4)
+				for ci in range(4):
+					var w := FacetAtlas.facet_planar_corner(ff, ci)
+					var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
+					flc[ci] = Vector2(float(l[0]), float(l[2]))
+				_pbm_fid[i] = ff
+				_pbm_mode[i] = 1
+				_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
+				_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
+				_pbm_layer[i] = -1
+				_pbm_lc[i] = flc
+				_pbm_nx[i] = _fm_texels
+				_pbm_ny[i] = _fm_texels
+				_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
+		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads).
+		# Unconditional: flushes whatever is already baked even while the dispatch above is paused.
 		_fm_upload_cd -= 1
 		if _fm_upload_cd <= 0 and not _fm_dirty.is_empty():
 			var lyr := int(_fm_dirty.keys()[0])
@@ -2050,6 +2063,13 @@ func tex_telemetry() -> Dictionary:
 		"cu_epoch": _slots_epoch,
 		"shot_on": _shot_on,
 		"shot_baked": _shot_baked.size(),
+
+		# REVISION 5 Stage C: the FP_PLANET_MAP fine-tier sweep had NO telemetry at all (the blind spot that let the
+		# perpetual on-surface bake hide). fm_baked = facets actually fine-baked; fm_want = total facets wanted (the
+		# whole planet, `_base_all`, once `_fm_on`); fm_dirty = sub-pages awaiting their throttled GPU upload.
+		"fm_baked": _fine_baked.size(),
+		"fm_want": _base_all if _fm_on else 0,
+		"fm_dirty": _fm_dirty.size(),
 	}
 
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under

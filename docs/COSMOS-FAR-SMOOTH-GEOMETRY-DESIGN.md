@@ -908,3 +908,185 @@ designed and orbit-safe by construction but should not ship blind. Meta-lesson, 
 quiescence gate must assert that the **fixpoint exists** (the convergence counter reaches zero
 under the same predicate the emitter uses) and a shader gate must assert **legality on a real
 parser**, not string identity — both failures were gate-shaped, not code-shaped.
+
+# REVISION 5 — rest quiescence COMPLETION: the residual re-emit train + the perpetual bake worker (2026-08-04, Fable)
+
+Live post-REV4 rest signals (player frozen, alt ~105, skin baked, daylight): `sh_pend False`
+(Stage B's noblack fix WORKS — the per-frame `_pending` re-arm is dead) but `sh_begin`/`sh_reemit`
+still climb ~0.75/s, `sh_build True` persistently, `pbm_busy 1` continuously, `proc_ms 76-106`,
+fps 30-44. Colour/lighting correct (REV4 Stage A verified) — this revision is pure work-shedding.
+
+## R5.1 Residual 1 — the remaining `_begin_rebuild` caller at rest
+
+**The caller is `facet_far_ring.gd:1187` — `_surface_converge_emit`'s FP_ENV_FLOORED_ASYNC
+branch (`:1166-1189`), dispatching on `remaining > 0` (`:1179-1185`).** `sh_pend False` +
+climbing `sh_begin` uniquely identifies it: it is the ONLY floored-regime dispatch that fires
+with `_pending` false. The ENV_RESUME_MS(300)/`ENV_RESUME_PACED` throttle never binds — each
+dispatch's worker task (`_async_build_worker`) takes ~1.3 s on web, and `_process` early-returns
+while `_async_building` (`:1077`), so the cadence IS the build time: ~0.75/s. `sh_build True`
+persistently is the same fact.
+
+**Why the convergence predicate never latches (in a practical session).** At the floored
+surface the emit cap is floored to θ_emit = 90° (`shell_set_camera_abs`, `:927-928`) →
+`_front_visible` admits the FULL hemisphere: **~1728 facets** (minus ~200 smooth-covered ≈
+1500). Under the live flag set (FP_ENV_FALLBACK_EMIT + FP_ENV_FLOORED_ASYNC),
+`_count_uncached_visible` (`:1353-1378`) counts every one of them until it is **fully
+min-enveloped** — `_env_done` (set only in `_ensure_cached`'s env_all branch, `:2565-2571`,
+via `_env_weld_grid(fid, 4)` ≈ 289 fine samples + boundary canon ≈ 10-40 ms/facet on a web
+worker) or `_benv_done` for dense targets (`:2655-2659`, `_env_weld_grid(fid,16)` ≈ 4k samples
+— "can eat a whole frame's budget by itself", cube_sphere.gd:421). Supply is
+`ENV_WARM_BATCH := 12` per dispatch (facet_far_ring.gd:33). So convergence needs
+**~125 dispatch cycles**, and — the structural flaw — **warm and emit are FUSED**: the ONLY way
+to warm 12 env caches is `_begin_rebuild` → a full ~1500-facet SurfaceTool re-emit +
+`generate_normals` on the worker + a main-thread `_swap_in_arrays` upload (`:1560+`) per cycle.
+Each cycle ALSO contends with the perpetual fine-map bake (R5.2) on the SAME 1-2-thread web
+WorkerThreadPool (both `add_task(..., false)` = low priority, FIFO). Net: the latch is
+mathematically reachable but its horizon is **many minutes per floored engage** (and every
+descent/teleport/regime flip replays it), during which the ring re-emits ~0.75/s and the main
+thread pays a whole-hemisphere mesh upload per cycle. That IS the live residual.
+
+**Fix — two flags, independently shippable:**
+- **R5.A `FP_ENV_DEMAND_DISC` — bound the convergence SET.** The min-envelope is a
+  no-protrusion lower bound **against the NEAR field**; a facet with no near field over it has
+  nothing to protrude through — its exact chord (already ε-sunk / skirted, the pre-env shipped
+  surface) is its correct TERMINAL state. Near meshes exist only within
+  `near_render_radius + RIM_STREAM_MARGIN` of the player (the §2.1 invariant), i.e. inside
+  backstop ∪ mid-dense ∪ a couple of rings. So: in `_count_uncached_visible` /
+  `_count_uncovered_visible` and the worker's warm loop, demand env ONLY for
+  `_dense_warm(fid) or hop(fid, active) <= ENV_DEMAND_RINGS` (const := MID_DENSE_RINGS + 2);
+  every other front facet counts DONE once `_pos_cache.has(fid)` (chord). Floored `remaining`
+  drops ~1500 → ≤ ~40 ⇒ **≤ 4 dispatches to latch**. Strictly less work + smaller `_env_done`
+  ⇒ NEVER-OOM by construction. (ORBIT keeps its existing law — off-surface there is no near
+  field at the ground, envelopes there are only used AS the drawn surface; unchanged.)
+- **R5.B `FP_WARM_EMIT_SPLIT` — decouple warm from emit.** When the only dispatch reason is
+  env upgrade (`remaining > 0`, `_pending` false), dispatch a **warm-only** worker task: same
+  `_async_building` single-writer gate, same task/poll machinery, but skip the SurfaceTool
+  emit / `commit_to_arrays` / `_swap_in_arrays` entirely (an `_async_warm_only` mode in
+  `_async_build_worker`). Re-emit the mesh only on `_pending` or when env progress crosses
+  `ENV_REEMIT_GROWTH` (default: once, at `remaining == 0`) — env upgrades only adjust heights
+  of already-drawn chords (sub-pixel at those distances; ε sink + skirts hold meanwhile).
+  Kills the per-cycle whole-hemisphere rebuild + GPU upload even where demand is legitimately
+  large (orbit env warm benefits too).
+
+**Hygiene (found while tracing, fix in R5.B's commit):** `_cull_update()` runs at `:1062`,
+BEFORE the `_async_building` early-return (`:1077`), while the floored worker **erases**
+`_bpos_cache`/`_benv_done` mid-task (`:1521-1523`, `:1528-1530`) — a main/worker Dictionary
+race (`_cull_cell_aabb` reads `_bpos_cache[fid]`, `:2033+`). Fix: the worker builds into
+locals and REPLACES via single assignment (pass a `force` flag instead of the transient
+erase), and/or move the cull probe behind the `_async_building` gate like every other
+cache-touching driver already is (`_noblack_guarantee` at `:1090` is past it; the cull is not).
+
+## R5.2 Residual 2 — the perpetually-busy bake worker (`pbm_busy 1`)
+
+**The source is the FP_PLANET_MAP whole-planet FINE-tier dispatch loop,
+`facet_tex_baker.gd:1832-1849`.** `tex_baked 3456/3456` is `_baked` (the g0 BASE pages,
+`tex_telemetry`, `:2027`) — it says NOTHING about `_fine_baked`, which has **no telemetry
+field at all** (the blind spot). On-surface, `:1846-1848` force `_pbm_cpp = 0` and
+`_pbm_tile = 0` (both gated on `_offsurface`) → `_pbm_compute` falls to the per-texel
+GDScript path (`:1953-1983`): PLANET_MAP_TEXELS=64 → 4096 `facet_profile` samples/facet ≈
+1-2 s/facet on a web worker × up to 3456 facets ≈ **hours**. The on-surface slot cap
+(`active = 1`, `:1773`) makes it exactly ONE continuously-busy slot = the observed
+`pbm_busy 1`. It never drains at rest because the dispatch loop refills the slot the frame
+the reap empties it. Beyond occupancy, the worker's per-texel GDScript allocation convoys
+the WASM allocator with the main thread (the measured walk-perf mechanism, memory
+`voxiverse-walk-perf-root-cause`) — a first-order suspect for the erratic 76-106 ms
+`proc_ms` at rest — plus the `_fm_tex.update_layer` page upload every ≤15 frames (`:1855-1861`)
+and the per-commit `blit_rect` land on main.
+
+**Fix — R5.C `FP_FINE_BAKE_SURFACE_PAUSE`.** Gate the fine dispatch loop (`:1832`) on
+`_offsurface` (or: `_offsurface or (near-streamer settled and _pbm_tile_ok)` if we later want
+opportunistic native on-surface baking; ship the simple form first). Rationale: the fine tier
+is 6.5 blocks/texel — an orbit/far feature; on-surface everything in sight is covered by
+band/skin/smooth at higher fidelity, and the on-surface path is BOTH 10× slower (GDScript)
+AND the allocator-convoy worst case. Coverage resumes on the next off-surface excursion at
+the C++ tile path's ~10× rate on all 4 slots. Un-fine facets on-surface render exactly the
+pre-Item-A shipped look (base-page colour) — the alpha-coverage law already handles un-baked
+= shipped, never black. Add `fm_baked`/`fm_want`(=`_base_all`)/`fm_dirty` to
+`tex_telemetry()` so this class of "invisible background sweep" can never hide again.
+
+## R5.3 §7.1 wired — the S2 collar cost (warmup 405 ms spike + walk rebake expense)
+
+`build_tile_rim` → `_env_weld_grid(fid, 104)` at ENV_FINE_MULT=4 = 417² ≈ **174k
+`profile_at_dir`/facet** on the worker (facet_smooth_tier.gd:194). Wire the §7.1 ladder as
+**R5.D `FP_RIM_CHEAP`**:
+- **(i) `RIM_FINE_MULT := 2` (web: 1)** for the S2 call only: 174k → 43k (11k web) samples.
+  The envelope stays a PROVEN lower bound by compensation: a coarser fine grid can only MISS
+  low columns (env too HIGH = protrusion risk), so subtract `RIM_ENV_RESID` — the measured
+  node-wise max of `env@mult4 − env@mult2` over a facet fan + 1 block — from the S2 heights.
+  `dil = ceil(skew/fine_pitch)` (`:2875`) already rescales with the coarser pitch. Gate
+  G-RIM-MULT asserts `env@mult_low − RIM_ENV_RESID ≤ env@mult4` node-wise (falsified by
+  setting RIM_ENV_RESID = 0 on a mountain facet).
+- **(ii) crescent-only rebake.** Cache each S2 tile's node-height array
+  (`_rim_nodes[fid]`: 105² f32 ≈ 44 KB × ≤ SMOOTH_S2_MAX(9) ≈ 0.4 MB — fixed, NEVER-OOM).
+  On a drift-triggered `request_refresh` (player moved > RIM_REBUILD_BLOCKS), recompute
+  `_env_node_min` ONLY for nodes whose distance-to-column crossed the
+  `[R_env − feather − drift, R_env + feather + drift]` annulus between the old and new baked
+  columns (membership can't change outside it — the blend weight is a pure function of that
+  distance); reuse cached heights elsewhere; ALWAYS recompute boundary nodes (cheap 1-D
+  canon) so the cross-facet weld stays bit-equal. Worst case at drift 24 ≈ 10-15 % of nodes.
+  Gate G-RIM-CRESCENT: crescent rebake ≡ full rebake at the same column, node-array
+  byte-equal (run at cells=24 for speed — the law is resolution-independent).
+- **(iii) escape hatch (unchanged §7.1 iv):** if the live A/B still can't hold walking pace,
+  FP_SMOOTH_RIM off + `BACKSTOP_CELLS 16→32` — shipped machinery, one const, ~70 % of the
+  visual win at 4k samples/facet.
+
+## R5.4 Gates — why G-FS-QUIESCE-RING missed the live loop, and the replacement
+
+REV4's gate (verify_far_smooth.gd `_gate_quiesce_ring`, `:2128`) missed for three reasons:
+1. **Wrong regime:** it drove `_orbit_warm_async` with `_emit_floored_last = false`; the live
+   rest loop is `_surface_converge_emit`'s FLOORED env branch (`:1166-1189`), which it never
+   called.
+2. **Wrong counting law:** it ran under the repo's default consts (FP_ENV_FALLBACK_EMIT /
+   FP_ENV_FLOORED_ASYNC / FP_ENV_ALL false — the ENV flags have no gate-forcing params in the
+   counters), so `_count_uncached_visible` degraded to `_pos_cache.has()` — pre-satisfied by
+   `setup()`'s synchronous `_rebuild_full()`. The live `_env_done`/`_benv_done` demand never
+   executed headless: `remaining == 0` held by construction.
+3. **Fixpoint-existence only:** it asserted zero-delta AT the fixpoint, never the
+   **reachability bound** from a cold floored engage (empty env dicts, chords only) — which
+   is the state every live descent lands in.
+
+**G-FS-QUIESCE-SURF (new; keep -RING for orbit):**
+- Add gate-forcing params (`fallback_on`, `floored_async_on`) to the two counters +
+  `_surface_converge_emit` + the worker's `have` test, mirroring the existing `quiesce_on`
+  convention, so the LIVE counting law runs headless without a const sed.
+- Cold floored engage on a real ring (`_cam_set`, `_emit_floored_last = true`, empty
+  `_env_done`/`_benv_done`): pump `_surface_converge_emit` + a synchronous stand-in for the
+  worker cycle; assert `remaining` latches to 0 within `ceil(demand/ENV_WARM_BATCH) + 2`
+  dispatches, `_begin_rebuild_count` delta ≤ that bound, and `_reemit_count` delta ≤ 2
+  (R5.B: one initial + one final emit).
+- Then the 240-frame zero-delta window on the counters that actually climbed live:
+  `_begin_rebuild_count`, `_reemit_count`, `_shell_gen`, `sh_pend` false every frame,
+  `remaining == 0` stable.
+- **Falsify both ways:** demand-disc forced off → the cold-engage dispatch count exceeds the
+  bound (~`ceil(1500/12)`) — the live bug reproduces; split forced off → `_reemit_count`
+  climbs with every warm batch.
+- **G-TEX-SURF-PAUSE:** baker `update()` on-surface with `_fine_baked` incomplete dispatches
+  ZERO fine tasks (slot drains after the in-flight reap; `_pbm_busy_count()` → 0) and
+  resumes off-surface; falsified with the flag off. Assert `fm_baked` present in
+  `tex_telemetry()`.
+- **Standing live check (remote bridge):** over 60 s at rest — Δ`sh_begin` = Δ`sh_reemit` = 0,
+  `pbm_busy` = 0, `sh_build` false ≥ 95 % of samples, `sh_envN`/`sh_benvN` static.
+
+## R5.5 Staged plan + verdict
+
+| Stage | Content | Flag | Gate |
+|---|---|---|---|
+| C (ship first — biggest instant win, trivial) | fine-bake surface pause + fm telemetry | FP_FINE_BAKE_SURFACE_PAUSE | G-TEX-SURF-PAUSE |
+| A | env demand disc (floored convergence set ≤ ~40) | FP_ENV_DEMAND_DISC | G-FS-QUIESCE-SURF (+falsify) |
+| B | warm-only dispatch, emit decoupled (+ cull/worker cache-race hygiene) | FP_WARM_EMIT_SPLIT | G-FS-QUIESCE-SURF reemit bound |
+| D | S2 collar: RIM_FINE_MULT + crescent rebake (escape hatch: §7.1 iv) | FP_RIM_CHEAP | G-RIM-MULT + G-RIM-CRESCENT |
+
+**Verdict: GREEN for C, A, B; YELLOW for D.** C is a dispatch gate on a background sweep whose
+on-surface value is nil and whose cost is measured (the fine-bake perf wall + the WASM
+allocator convoy are both memory-documented). A is a counting-law change justified by the
+envelope's own purpose (a lower bound needs a near field to bound against) — strictly less
+work, falsifiable, flag-gated. B reuses the existing task/poll/single-writer machinery minus
+the emit — surgical. D(i) is YELLOW until G-RIM-MULT pins RIM_ENV_RESID on real terrain;
+D(ii) is YELLOW on implementation care at the annulus boundary but its gate is byte-
+equivalence (the strong form). Acceptance = the brief's invariant verbatim: at rest with skin
+baked — ZERO shell re-emits, ZERO bake-worker tasks, `proc_ms` ≈ the pre-smooth baseline, and
+the warmup S2 bake paced/coarsened so fps stays > ~30 throughout. Meta-lesson this round: a
+convergence gate must run the **live flag configuration's** predicate (gate-forcing params on
+every flag the predicate branches on) and must bound **time-to-latch from the cold state**,
+not just verify the warm fixpoint; and every background sweep needs a telemetry field — a
+worker that is busy with work no counter names is invisible until it costs 30 fps.

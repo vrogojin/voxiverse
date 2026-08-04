@@ -169,6 +169,17 @@ func _initialize() -> void:
 	_gate_slot_decode()
 	_gate_quiesce_ring()
 
+	# --- REVISION 5 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 5 — rest quiescence COMPLETION: the
+	# residual re-emit train + the perpetual bake worker"). Stage C (ship first): FP_FINE_BAKE_SURFACE_PAUSE — pause
+	# the whole-planet fine-tier dispatch on-surface. Stage A: FP_ENV_DEMAND_DISC — bound the floored env-convergence
+	# set. Stage B: FP_WARM_EMIT_SPLIT — decouple env-warm from mesh re-emit (+ the cache-race hygiene fix). Stage D
+	# (FP_RIM_CHEAP) is OUT OF SCOPE here (separate, YELLOW).
+	_ok(not CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE, "G-R5-OFF: FP_FINE_BAKE_SURFACE_PAUSE defaults false (byte-off; the fine-tier dispatch loop is unconditional)")
+	_ok(not CubeSphere.FP_ENV_DEMAND_DISC, "G-R5-OFF: FP_ENV_DEMAND_DISC defaults false (byte-off; the two counters + worker 'have' test keep the shipped un-bounded env demand)")
+	_ok(not CubeSphere.FP_WARM_EMIT_SPLIT, "G-R5-OFF: FP_WARM_EMIT_SPLIT defaults false (byte-off; _surface_converge_emit always dispatches a real _begin_rebuild for every env-upgrade cycle)")
+	_gate_tex_surf_pause()
+	_gate_quiesce_surf()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -2194,3 +2205,210 @@ func _gate_quiesce_ring() -> void:
 	_ok(not pend_ever_true, "G-FS-QUIESCE-RING: `_pending` (sh_pend) never flips true across any of the 240 settled frames")
 	_ok(ring._count_uncached_visible(p, true) == 0, "G-FS-QUIESCE-RING: _count_uncached_visible(p) still 0 after the settle window (the fixpoint holds)")
 	ring.free()
+
+# =====================================================================================================
+# REVISION 5 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 5 — rest quiescence COMPLETION")
+# =====================================================================================================
+
+## Fixture: a FacetFarRing switched into the FLOORED camera-set regime (θ_emit = 90° at the ground — R5.1's actual
+## live residual regime), with the SAME axis+threshold `setup()`'s own initial synchronous rebuild used (so the
+## already-warmed chord set is unaffected by the switch — mirrors `_gate_quiesce_ring`'s identical trick one section
+## up, just floored instead of orbit).
+func _mk_floored_ring(fid: int) -> FacetFarRing:
+	var r := FacetFarRing.new()
+	r.setup(fid)   # ALSO runs its own synchronous _rebuild_full() — warms every front-visible facet's CHORD cache
+	r._emit_axis = FA.facet_normal64(fid)
+	r._emit_cos = FacetFarRing.BACK_CULL
+	r._cam_set = true
+	r._emit_floored_last = true
+	return r
+
+## G-FS-QUIESCE-SURF (REVISION 5, replaces the orbit-only gap G-FS-QUIESCE-RING left): drives the LIVE FLOORED
+## env-convergence loop — `_surface_converge_emit`'s FP_ENV_FLOORED_ASYNC branch (R5.1's ACTUAL residual driver,
+## NOT the orbit branch G-FS-QUIESCE-RING exercises) — with every prerequisite forced via gate-forcing params
+## (`fallback_on`, `floored_async_on`, `force_async`, `env_on`) so the REAL `_count_uncached_visible`/`_env_have`/
+## `_ensure_cached` env-envelope law executes headless, with NO compile-time sed of FP_ENV_FALLBACK_EMIT/
+## FP_ENV_FLOORED_ASYNC or the three consts `TierPlace.env_all_on()` folds together (FP_ENV_ALL/FP_FARRING_FULL_COVER/
+## FP_SHELL_WELD). A cold floored engage (fresh `FacetFarRing.setup()` — chords already warmed by its own initial
+## sync rebuild, but `_env_done`/`_benv_done` are EMPTY, exactly the state every live descent lands in) must latch
+## within `ceil(demand/ENV_WARM_BATCH)+2` dispatches (demand = the FP_ENV_DEMAND_DISC-bounded set) with
+## `_reemit_count` delta ≤ 2 (FP_WARM_EMIT_SPLIT: one initial coverage emit + one final env-converged emit), THEN
+## holds a REAL 240-frame zero-delta settle window on `_begin_rebuild_count`/`_reemit_count`/`_shell_gen`/`_pending`.
+## Falsifies BOTH ways: demand-disc forced off ⇒ the SAME dispatch budget that fully converges the fixed case
+## leaves the cold engage UNCONVERGED (the live ~125-cycle stall reproduces, `_count_uncached_visible` degrading to
+## the shipped un-bounded ~1500-facet demand); warm-split forced off ⇒ `_reemit_count` climbs with every warm batch
+## instead of latching at ≤2 (the shipped fused warm+emit cadence).
+func _gate_quiesce_surf() -> void:
+	print("  --- REVISION 5 G-FS-QUIESCE-SURF (Stage A FP_ENV_DEMAND_DISC + Stage B FP_WARM_EMIT_SPLIT): the LIVE FLOORED env-convergence fixpoint at rest ---")
+	var fid_a := _fid_of(2, 10, 10)
+	var quiesce_on := true
+	var fallback_on := true
+	var floored_async_on := true
+	var demand_on := true
+	var warm_split_on := true
+	var env_on := true
+
+	var ring := _mk_floored_ring(fid_a)
+	var p := ring._cull_params()
+	_ok(ring._env_done.is_empty() and ring._benv_done.is_empty(), "G-FS-QUIESCE-SURF warm-up: a cold floored engage starts with EMPTY env dicts (chords only, from setup()'s own sync rebuild) — non-vacuous baseline")
+	_ok(ring._env_async_floored_on(fallback_on, floored_async_on, true, env_on), "G-FS-QUIESCE-SURF warm-up: the forced params select the REAL floored-async branch (no const sed needed)")
+
+	# --- (A) the FIXED case: cold-engage dispatch bound + reemit bound ------------------------------------------
+	ring._surface_converge_emit(p, quiesce_on, demand_on, fallback_on, floored_async_on, warm_split_on, true, env_on)   # dispatch #1: coverage
+	var begin0: int = ring._begin_rebuild_count
+	var reemit0: int = ring._reemit_count
+	var demand := ring._count_uncached_visible(p, quiesce_on, demand_on, fallback_on, floored_async_on)
+	_ok(demand > 0, "G-FS-QUIESCE-SURF warm-up: the demand-bounded env set is non-empty after the coverage dispatch (demand=%d) — non-vacuous" % demand)
+	var bound := int(ceil(float(demand) / float(FacetFarRing.ENV_WARM_BATCH))) + 2
+	var dispatches := 1
+	while ring._count_uncached_visible(p, quiesce_on, demand_on, fallback_on, floored_async_on) > 0 and dispatches < bound + 20:
+		ring._surface_converge_emit(p, quiesce_on, demand_on, fallback_on, floored_async_on, warm_split_on, true, env_on)
+		dispatches += 1
+	ring._surface_converge_emit(p, quiesce_on, demand_on, fallback_on, floored_async_on, warm_split_on, true, env_on)   # the final env-converged re-emit (R5.B)
+	dispatches += 1
+	var remaining_final := ring._count_uncached_visible(p, quiesce_on, demand_on, fallback_on, floored_async_on)
+	_ok(remaining_final == 0, "G-FS-QUIESCE-SURF: remaining latches to 0 (demand=%d, took %d dispatches)" % [demand, dispatches])
+	_ok(dispatches <= bound, "G-FS-QUIESCE-SURF: cold floored engage latches within ceil(demand/ENV_WARM_BATCH)+2=%d dispatches (took %d)" % [bound, dispatches])
+	var begin1: int = ring._begin_rebuild_count
+	var reemit1: int = ring._reemit_count
+	_ok(begin1 - begin0 <= bound, "G-FS-QUIESCE-SURF: _begin_rebuild_count delta <= bound (%d <= %d)" % [begin1 - begin0, bound])
+	_ok(reemit1 - reemit0 <= 2, "G-FS-QUIESCE-SURF: _reemit_count delta <= 2 -- one initial coverage emit + one final env-converged emit (got %d)" % (reemit1 - reemit0))
+
+	# --- settle window: 240 REAL frames of zero further work ----------------------------------------------------
+	var begin_s0: int = ring._begin_rebuild_count
+	var reemit_s0: int = ring._reemit_count
+	var gen_s0: int = ring._shell_gen
+	var pend_ever := false
+	for i in range(240):
+		ring._surface_converge_emit(p, quiesce_on, demand_on, fallback_on, floored_async_on, warm_split_on, true, env_on)
+		if ring._pending:
+			pend_ever = true
+	_ok(ring._begin_rebuild_count == begin_s0, "G-FS-QUIESCE-SURF: ZERO _begin_rebuild_count delta over 240 settled frames (%d -> %d)" % [begin_s0, ring._begin_rebuild_count])
+	_ok(ring._reemit_count == reemit_s0, "G-FS-QUIESCE-SURF: ZERO _reemit_count delta over 240 settled frames (%d -> %d)" % [reemit_s0, ring._reemit_count])
+	_ok(ring._shell_gen == gen_s0, "G-FS-QUIESCE-SURF: ZERO _shell_gen delta over 240 settled frames (%d -> %d)" % [gen_s0, ring._shell_gen])
+	_ok(not pend_ever, "G-FS-QUIESCE-SURF: `_pending` (sh_pend) never flips true across any of the 240 settled frames")
+	_ok(ring._count_uncached_visible(p, quiesce_on, demand_on, fallback_on, floored_async_on) == 0, "G-FS-QUIESCE-SURF: remaining stays 0 after the settle window (the fixpoint holds)")
+	ring.free()
+
+	# --- (B) FALSIFY demand-disc off: the SAME dispatch budget leaves the cold engage UNCONVERGED -----------------
+	var ring_nd := _mk_floored_ring(fid_a)
+	var p_nd := ring_nd._cull_params()
+	for i in range(bound):
+		ring_nd._surface_converge_emit(p_nd, quiesce_on, false, fallback_on, floored_async_on, warm_split_on, true, env_on)
+	var remaining_nd := ring_nd._count_uncached_visible(p_nd, quiesce_on, false, fallback_on, floored_async_on)
+	_ok(remaining_nd > 0, "G-FS-QUIESCE-SURF-FALSIFY (FP_ENV_DEMAND_DISC off): the SAME %d-dispatch budget that fully converges the fixed case leaves the cold engage UNCONVERGED (remaining=%d) -- the live ~125-cycle stall reproduces" % [bound, remaining_nd])
+	ring_nd.free()
+
+	# --- (C) FALSIFY warm-split off: _reemit_count climbs with every warm batch instead of latching at <=2 --------
+	var ring_ws := _mk_floored_ring(fid_a)
+	var p_ws := ring_ws._cull_params()
+	ring_ws._surface_converge_emit(p_ws, quiesce_on, demand_on, fallback_on, floored_async_on, false, true, env_on)
+	var reemit_ws0: int = ring_ws._reemit_count
+	var cycles := 0
+	while ring_ws._count_uncached_visible(p_ws, quiesce_on, demand_on, fallback_on, floored_async_on) > 0 and cycles < bound + 10:
+		ring_ws._surface_converge_emit(p_ws, quiesce_on, demand_on, fallback_on, floored_async_on, false, true, env_on)
+		cycles += 1
+	var reemit_ws1: int = ring_ws._reemit_count
+	_ok(reemit_ws1 - reemit_ws0 > 2, "G-FS-QUIESCE-SURF-FALSIFY (FP_WARM_EMIT_SPLIT off): _reemit_count CLIMBS with every warm batch instead of latching at <=2 (delta=%d over %d cycles)" % [reemit_ws1 - reemit_ws0, cycles])
+	ring_ws.free()
+
+## REVISION 5 Stage C fixture helper: prime a FRESH FacetTexBaker's fine-map + single-slot parallel-bake state
+## directly (bypassing the long `_pbm_on`/`_worker_on`/FP_SKIN_SSE/FP_CPP_TILE_BAKE prerequisite chain
+## `_setup_parallel_band` normally requires — the same "poke flag-gated internals directly" technique used
+## throughout this file for FacetFarRing) so `_update_band_parallel`'s fine-tier dispatch loop can be driven
+## headless with a single slot (`_pbm_n = 1`).
+func _prime_fine_map(b: FacetTexBaker) -> void:
+	FarPalette.ensure_far_index_ready()
+	b._fm_on = true
+	b._fm_texels = CubeSphere.PLANET_MAP_TEXELS
+	b._fm_quad = CubeSphere.PLANET_MAP_QUAD
+	b._fm_page = b._fm_quad * b._fm_texels
+	# Mirrors _setup_fine_map()'s own init: 24 L8 sub-page staging Images (_fine_commit's blit_rect target) + the
+	# matching GPU array. Without this, _fine_commit indexes an EMPTY _fm_pages and the upload-throttle in
+	# _update_band_parallel calls update_layer on a null _fm_tex.
+	var imgs: Array[Image] = []
+	for l in range(6 * 4):
+		var im := Image.create(b._fm_page, b._fm_page, false, Image.FORMAT_L8)
+		im.fill(Color(0.0, 0.0, 0.0, 1.0))
+		b._fm_pages.append(im)
+		imgs.append(im)
+	b._fm_tex = Texture2DArray.new()
+	b._fm_tex.create_from_images(imgs)
+	b._pbm_n = 1
+	b._pbm_fid = [-1]
+	b._pbm_layer = [-1]
+	b._pbm_task = [-1]
+	b._pbm_bytes = [PackedByteArray()]
+	b._pbm_lc = [PackedVector2Array()]
+	b._pbm_nx = [0]
+	b._pbm_ny = [0]
+	b._pbm_mode = [0]
+	b._pbm_cpp = [0]
+	b._pbm_tile = [0]
+
+## G-TEX-SURF-PAUSE (REVISION 5 Stage C, FP_FINE_BAKE_SURFACE_PAUSE): the FP_PLANET_MAP fine-tier dispatch loop
+## (`FacetTexBaker._update_band_parallel`) must drain to ZERO new tasks while ON-SURFACE and RESUME off-surface.
+## Falsifies: pause forced OFF ⇒ a fine task DISPATCHES even on-surface (the shipped perpetual-bake bug this
+## revision fixes); pause forced ON ⇒ the slot drains to zero and STAYS there across many on-surface calls, resumes
+## the instant `_offsurface` flips true, and an already-in-flight (off-surface-dispatched) task still COMMITS after
+## landing back on-surface (the REAP is unconditional — only NEW dispatch is gated, matching R5.2's design). Also
+## asserts `fm_baked`/`fm_want`/`fm_dirty` now exist in `tex_telemetry()` (the fine tier had NO telemetry at all —
+## the blind spot that let the perpetual bake hide in the first place).
+func _gate_tex_surf_pause() -> void:
+	print("  --- REVISION 5 G-TEX-SURF-PAUSE (Stage C FP_FINE_BAKE_SURFACE_PAUSE): fine-tier dispatch pauses on-surface, resumes off-surface ---")
+	var fid := FA.spawn_facet()
+	var axis_v := _centre_dir(fid)
+	var axis := [axis_v.x, axis_v.y, axis_v.z]
+
+	# --- (A) FALSIFY: pause forced OFF -- a fine task dispatches even ON-SURFACE (the shipped perpetual-bake bug). ---
+	var b_off := FacetTexBaker.new()
+	b_off.setup(fid)
+	_prime_fine_map(b_off)
+	b_off._offsurface = false
+	b_off._update_band_parallel(axis, false)
+	_ok(b_off._pbm_busy_count() > 0, "G-TEX-SURF-PAUSE-FALSIFY: WITHOUT the fix, a fine-tier task DISPATCHES on-surface (busy=%d) -- the shipped perpetual bake reproduces" % b_off._pbm_busy_count())
+	if int(b_off._pbm_task[0]) >= 0:
+		WorkerThreadPool.wait_for_task_completion(int(b_off._pbm_task[0]))
+	# FacetTexBaker extends RefCounted — no manual .free() (unlike FacetFarRing/Node3D elsewhere in this file);
+	# it is collected automatically once `b_off` goes out of scope.
+
+	# --- (B) WITH the fix: on-surface, the slot drains to 0 and STAYS 0 over repeated calls. ---
+	var b := FacetTexBaker.new()
+	b.setup(fid)
+	_prime_fine_map(b)
+	b._offsurface = false
+	var stayed_drained := true
+	for i in range(10):
+		b._update_band_parallel(axis, true)
+		if b._pbm_busy_count() != 0:
+			stayed_drained = false
+	_ok(stayed_drained, "G-TEX-SURF-PAUSE: on-surface, the fine-tier dispatch slot stays drained to 0 across 10 calls")
+	_ok(b._fine_baked.is_empty(), "G-TEX-SURF-PAUSE: nothing got fine-baked on-surface under the pause")
+
+	# --- (C) off-surface: dispatch resumes. ---
+	b._offsurface = true
+	b._update_band_parallel(axis, true)
+	_ok(int(b._pbm_task[0]) >= 0, "G-TEX-SURF-PAUSE: off-surface, the fine-tier dispatch RESUMES (a task is queued)")
+	# Poll completion WITHOUT reclaiming (`is_task_completed` only) -- `wait_for_task_completion` reclaims the task
+	# ID, and calling it here THEN AGAIN inside (D)'s own reap (which also calls wait_for_task_completion once it
+	# sees is_task_completed==true) double-reclaims the SAME id -> "ERROR: Invalid Task ID" and the second (real)
+	# reap silently no-ops, leaving the slot stuck busy and nothing committed. Only the production reap loop may
+	# ever reclaim a task id; the gate just waits for the flag.
+	var task_id := int(b._pbm_task[0])
+	var waited_ms := 0
+	while task_id >= 0 and not WorkerThreadPool.is_task_completed(task_id) and waited_ms < 5000:
+		OS.delay_msec(2)
+		waited_ms += 2
+	_ok(task_id < 0 or WorkerThreadPool.is_task_completed(task_id), "G-TEX-SURF-PAUSE warm-up: the off-surface fine-tier task completes (waited %d ms)" % waited_ms)
+
+	# --- (D) flip BACK on-surface WHILE the (already-completed, un-reclaimed) task is pending reap -- the reap
+	# still commits it; only NEW dispatch is gated, in-flight work always drains exactly once. ---
+	b._offsurface = false
+	b._update_band_parallel(axis, true)   # THIS call's reap loop is the ONLY wait_for_task_completion on this id
+	_ok(b._fine_baked.size() > 0, "G-TEX-SURF-PAUSE: an off-surface-dispatched fine task still COMMITS after landing back on-surface (the reap is unconditional) -- %d baked" % b._fine_baked.size())
+	_ok(b._pbm_busy_count() == 0, "G-TEX-SURF-PAUSE: back on-surface, no NEW task re-dispatches after the reap (%d busy)" % b._pbm_busy_count())
+
+	var tel := b.tex_telemetry()
+	_ok(tel.has("fm_baked") and tel.has("fm_want") and tel.has("fm_dirty"), "G-TEX-SURF-PAUSE: tex_telemetry() exposes fm_baked/fm_want/fm_dirty (the previously-invisible fine-tier sweep)")
+	_ok(int(tel["fm_baked"]) == b._fine_baked.size(), "G-TEX-SURF-PAUSE: fm_baked matches _fine_baked.size() (%d)" % b._fine_baked.size())
+	# FacetTexBaker extends RefCounted — no manual .free() needed.

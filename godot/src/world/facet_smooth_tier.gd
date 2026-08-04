@@ -953,7 +953,7 @@ func _weld_refresh_neighbours(fid: int) -> void:
 ## (b) ORs into the `_next_want` refresh-dispatch gate (`refresh_dispatch_on`) so a queued `request_refresh` actually
 ## dispatches even with `FP_SMOOTH_MESH_INC` off — REVISION 2's rim rebake and T3's weld reweld share the SAME
 ## in-place-rebuild primitive (`_refresh`/`request_refresh`), gated by whichever feature needs it.
-func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF, selfheal_on := CubeSphere.FP_SMOOTH_SNAP_SELFHEAL) -> void:
 	if _sn == 0:
 		return
 	if idle_on and _settled:
@@ -1007,6 +1007,17 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 				_changed = true
 				var snap_used: PackedInt32Array = _s_snap[i]   # REVISION 3 T3: record what THIS commit was actually built with
 				_built_snap[fid] = snap_used.duplicate() if snap_used.size() == 4 else PackedInt32Array()
+				if selfheal_on:
+					# REVISION 7-VISUAL (#28, FP_SMOOTH_SNAP_SELFHEAL): the SUNK-FACET DISCONNECT fix. T3's neighbour-event heal
+					# has two race holes (H1: this commit lands after the neighbour's T3 pass; H2: `_refresh` was erased by this
+					# very stale-in-flight commit above) that leave `_built_snap != _snap_plan` FOREVER — a resident edge chord-
+					# snapped to a pitch that no longer exists, dipping below the neighbour's true relief = the exposed-skirt
+					# disconnect line. HERE both the committed geometry AND the current plan are known, so compare + re-queue on
+					# mismatch (closes H1: no neighbour event needed; closes H2: re-requests what the erase ate). Bounded +
+					# converges (a rebuild dispatched after the last plan change commits clean and matches).
+					var cur_plan: PackedInt32Array = _snap_plan.get(fid, PackedInt32Array())
+					if cur_plan.size() == 4 and _built_snap[fid] != cur_plan:
+						request_refresh(fid)
 				if rim_env_pos_out.size() > 0:
 					# REVISION 5 Stage D (FP_RIM_CHEAP): this commit's env array + the column it was baked against
 					# become the cache the NEXT rebake's crescent test reads — single in-place assignment (never an

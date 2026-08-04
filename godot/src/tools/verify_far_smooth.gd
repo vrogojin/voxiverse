@@ -211,6 +211,10 @@ func _initialize() -> void:
 	_ok(not CubeSphere.FP_SMOOTH_HORIZON_COVER, "G-SMOOTH-HORIZON-OFF: FP_SMOOTH_HORIZON_COVER defaults false (byte-off; smooth_s5_max()/hop() return the shipped 200/10)")
 	_gate_smooth_horizon()
 
+	# FP_SMOOTH_SNAP_SELFHEAL (#28): the sunk-facet disconnect fix — a stale-plan commit must re-queue a refresh.
+	_ok(not CubeSphere.FP_SMOOTH_SNAP_SELFHEAL, "G-FS-SELFHEAL-OFF: FP_SMOOTH_SNAP_SELFHEAL defaults false (byte-off; step()'s commit self-check never runs)")
+	_gate_snap_selfheal()
+
 	# --- REVISION 7 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") ---
 	# FP_SMOOTH_SLOT_MESH: kills the O(N²) whole-tier re-pack/re-upload commit hitch — per-tier fixed-capacity
 	# slotted ArrayMesh + `RenderingServer.mesh_surface_update_vertex_region`/`_attribute_region` GPU region writes
@@ -3411,3 +3415,51 @@ func _gate_smooth_horizon() -> void:
 	var worst := CubeSphere.SMOOTH_S5_MAX_HORIZON * per_tile
 	_ok(worst <= CubeSphere.SMOOTH_BYTES_MAX,
 		"G-SMOOTH-HORIZON: worst-case bumped S5 (%d tiles × ≤%d B = %.1f MB) ≤ SMOOTH_BYTES_MAX (%.0f MB) — NEVER-OOM" % [CubeSphere.SMOOTH_S5_MAX_HORIZON, per_tile, worst / 1048576.0, CubeSphere.SMOOTH_BYTES_MAX / 1048576.0])
+
+func _gate_noop() -> void:
+	pass
+
+## G-FS-SELFHEAL (REVISION 7-VISUAL #28, FP_SMOOTH_SNAP_SELFHEAL): the SUNK-FACET DISCONNECT fix. Deterministically
+## INJECTS the race RESULT (not its timing): a settled facet A is re-committed via a completed worker slot whose
+## frozen snap (`_s_snap`) is STALE while `_snap_plan[A]` has moved — exactly Fable's H1/H2. With the flag ON the
+## commit self-check (built != plan) MUST re-queue `request_refresh(A)`; with it OFF (current code) it does NOT — so
+## `_built_snap != _snap_plan` persists with no pending refresh = the eternal stale edge = the disconnect line. The
+## OFF assertion IS the falsify (proves the gate catches the real bug).
+func _gate_snap_selfheal() -> void:
+	print("  --- G-FS-SELFHEAL: a stale-plan commit re-queues a refresh (closes the sunk-facet disconnect race) ---")
+	for flag_on in [false, true]:
+		var parent := Node3D.new()
+		var ft := FST.new()
+		ft.setup_instance(parent, null)
+		var A := FA.spawn_facet()
+		ft.request({A: FST.S4}, {}, false, false)
+		_converge_ft(ft, false)
+		if not ft.is_resident(A) or int(ft.tier_of(A)) != FST.S4:
+			_ok(false, "G-FS-SELFHEAL[on=%s]: fixture A resident at S4" % str(flag_on)); parent.free(); continue
+		var built: PackedInt32Array = (ft._built_snap.get(A, PackedInt32Array()) as PackedInt32Array).duplicate()
+		if built.size() != 4:
+			_ok(false, "G-FS-SELFHEAL[on=%s]: A has a 4-edge built snap to work from" % str(flag_on)); parent.free(); continue
+		# The MOVED plan: identical to what A was built with EXCEPT one edge pitch — i.e. a neighbour changed tier
+		# after A's build was dispatched, so `_snap_plan[A]` != `_built_snap[A]`.
+		var moved := built.duplicate()
+		moved[0] = int(moved[0]) + 1
+		# Inject a completed worker slot that re-commits A with the STALE frozen snap (`built`, NOT `moved`).
+		var tile_a: Dictionary = FST.build_tile(A, FST.cells_for_tier(FST.S4), 0.0, true)
+		var task := WorkerThreadPool.add_task(Callable(self, "_gate_noop"))
+		OS.delay_msec(25)   # let the no-op finish so the reap's is_task_completed(task) is true
+		ft._s_fid[0] = A
+		ft._s_tier[0] = FST.S4
+		ft._s_result[0] = tile_a
+		ft._s_snap[0] = built            # STALE dispatch plan
+		ft._s_task[0] = task
+		ft._want[A] = FST.S4
+		ft._snap_plan[A] = moved         # the plan has moved on since A was dispatched
+		ft._refresh.erase(A)             # H2: nothing pending (or it was eaten)
+		# One step reaps the injected slot → commits A (built_snap := stale) → the self-check (flag on) fires.
+		ft.step(false, false, false, false, CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, false, flag_on)
+		var requeued: bool = ft._refresh.has(A)
+		if flag_on:
+			_ok(requeued, "G-FS-SELFHEAL[on]: a stale commit (built != plan) RE-QUEUES request_refresh(A) — the disconnect self-heals")
+		else:
+			_ok(not requeued, "G-FS-SELFHEAL[off/falsify]: WITHOUT the flag the stale commit leaves NO pending refresh — the eternal stale edge the user saw (proves the gate catches the real bug)")
+		parent.free()

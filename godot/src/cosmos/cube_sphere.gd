@@ -878,6 +878,20 @@ const FP_SLOT_INDIRECT := false
 ##   FLAT 6042/0. Gate: verify_far_smooth.gd G-FS-WELD-NEIGHBOUR (falsifies: without the flag the crack is shown;
 ##   with it the boundary re-coincides), G-FS-QUIESCE/G-FS-NOHOLE re-run unaffected.
 const FP_SMOOTH_WELD_REFRESH := false
+## FP_SMOOTH_SNAP_SELFHEAL — REVISION 7-VISUAL (issue #28): the SUNK-FACET DISCONNECT fix. FP_SMOOTH_WELD_REFRESH's
+## T3 heal is event-driven (checks only committed NEIGHBOUR state on a tier change) and has two ordering holes under
+## concurrent web-worker builds: (H1) a tile commits with a snap-plan frozen at dispatch that `request()` has since
+## rewritten, and the neighbour's T3 pass already ran before this commit ⇒ `_built_snap != _snap_plan` FOREVER; (H2)
+## a corrective `request_refresh` is erased by a stale in-flight build's commit (`_refresh.erase`) ⇒ the rebuild never
+## dispatches. Either way a resident tile's edge stays chord-snapped to a pitch that no longer exists (e.g. a pitch-4
+## ~104-block chord against a neighbour now rendering native 13/26-cell relief) → it dips tens of blocks below true
+## relief mid-segment → the neighbour's exposed edge+skirt (water/dirt/stone colours) shows as the disconnect line.
+## Worsened by FP_SMOOTH_HORIZON_COVER (cap-bound S5 frontier reshuffles every crossing ⇒ far more tier-change races).
+## The fix is one COMMIT-TIME invariant: after recording `_built_snap[fid]`, if it != the CURRENT `_snap_plan[fid]`,
+## re-queue `request_refresh(fid)` — needs no neighbour event (closes H1) + re-queues what H2 ate. Bounded (≤1 extra
+## rebuild/stale commit; converges — a rebuild dispatched after the last plan change commits clean). Default false ⇒
+## the self-check never runs (byte-off). Gate G-FS-SNAP-STALE-COMMIT (falsify: red on current code, green with flag).
+const FP_SMOOTH_SNAP_SELFHEAL := false
 
 ## FP_RING_QUIESCE (REVISION 4 Stage B, docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R4.2): ring quiescence at rest.
 ##   `visible_fids()` permanently EXCLUDES a smooth-resident facet from the shell's emit set (§2 law 6) — but two

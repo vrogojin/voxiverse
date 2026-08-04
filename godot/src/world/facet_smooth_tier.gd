@@ -176,7 +176,38 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 ## the facet edge ~417) therefore already agrees with a neighbouring S3 tile's plain boundary before the frontier
 ## snap even runs (belt-and-suspenders on top of `snap_edge_to_pitch`).
 ## `slot` — see `build_tile`'s R-C doc above; same frozen-snapshot discipline, same -1.0 default (byte-identical off).
-static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0) -> Dictionary:
+## `cheap_on` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP, §7.1 (i)): sample the S2
+## envelope at `TierPlace.rim_fine_mult()` instead of the shipped `TierPlace.ENV_FINE_MULT` (~174k → ~43k desktop /
+## ~11k web `profile_at_dir` samples/facet — the warmup allocator-convoy cost, R5.3), then subtract
+## `TierPlace.rim_env_resid()` from the coarsened envelope before it enters the blend. A coarser fine grid can only
+## MISS a low column (env can only go UP, never down, vs the reference mult) — env_coarse − resid ≤ env_fine ≤
+## true_pos BY CONSTRUCTION (G-RIM-MULT proves the inequality; RIM_ENV_RESID's own derivation proves the bound),
+## so no-protrusion survives the coarsening exactly the way it survives the min-envelope's own dilated footprint.
+## Off ⇒ `_env_weld_grid` runs at the shipped ENV_FINE_MULT with zero compensation — byte-identical.
+## `prev_env_pos`/`prev_tile`/`old_col` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP,
+## §7.1 (ii) crescent-only rebake): the LAST bake's per-node env-position array (`prev_env_pos`, the EXACT
+## `_env_weld_grid` output vertex, resid-compensated already — cached verbatim, not a scalar reconstruction, so
+## reuse is bit-exact with zero re-derivation rounding), the last COMMITTED tile (for verbatim vertex reuse), and
+## the player column that bake was taken against. Env is TERRAIN-only — it never depends on `player_col` — so once
+## cached it is NEVER recomputed on a later rebake at all (`env` reuse is unconditional when the cache is valid,
+## not merely "for non-crescent nodes"): the crescent restricts the (comparatively cheaper, but still real)
+## per-node `FarDensity.node_at` TRUE-relief resample instead. A node's world position (`FarDensity.node_dir(...) *
+## r_datum`, no noise sample) is tested against the OLD and NEW column at a CONSERVATIVELY padded annulus
+## (`r_env ± feather`, expanded by both the column drift AND `TierPlace.rim_crescent_pad()` — the SAME measured
+## min-envelope-vs-true bound `ENV_ALL_EPS_FRAC` already establishes elsewhere in this codebase, reused rather than
+## the theoretical global max relief — see tier_place.gd's derivation): a node outside the padded band at BOTH
+## columns is PROVABLY unreachable from the transition this bake
+## could have moved it into, so its previous vertex (pos/col, already correct — terrain-invariant) is reused
+## byte-for-byte; every other node (plus EVERY boundary node, unconditionally, for the weld canon) gets a fresh
+## `node_at` sample. Normals are ALWAYS recomputed from the FINAL (possibly-mixed reused/fresh) position array in
+## the second pass below — never reused per-vertex — since a central-difference stencil at a reused node can
+## still touch a freshly-moved neighbour. No cache (initial bake, or an invalidated one) ⇒ every node takes the
+## fresh branch — identical to a from-scratch build. Returns an EXTRA `"rim_env_pos"` key (the per-node env array
+## this build actually used) for the caller to cache for the NEXT rebake — absent needs no caller change
+## (Dictionary key simply present).
+static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float,
+		normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, cheap_on := CubeSphere.FP_RIM_CHEAP,
+		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
@@ -188,11 +219,20 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 	var stride := cells + 1
 	var n := stride * stride
 
-	# Reuse the shipped no-protrusion envelope law verbatim (§3 P3: "don't reinvent it") — the SAME cells-parametrized
-	# min-envelope grid the coarse-horizon/dense-backstop caches build, made static so it is callable with no ring
-	# instance (facet_far_ring.gd `_env_weld_grid`).
-	var env := FacetFarRing._env_weld_grid(fid, cells)
-	var env_pos: PackedVector3Array = env[0]
+	var prev_pos: PackedVector3Array = prev_tile.get("pos", PackedVector3Array())
+	var prev_col: PackedColorArray = prev_tile.get("col", PackedColorArray())
+	var have_cache := cheap_on and prev_env_pos.size() == n and prev_pos.size() == n and prev_col.size() == n
+
+	# Only a CACHE MISS (initial bake, or a caller that never supplies one) ever touches `_env_weld_grid` — the
+	# S2-only coarser mult (§7.1 (i)) applies here exactly as before. A cache hit skips the fine-grid entirely
+	# (env is terrain-invariant — a fresh sample would reproduce the SAME numbers, just expensively).
+	var env_pos: PackedVector3Array
+	var resid := 0.0
+	if not have_cache:
+		var env := FacetFarRing._env_weld_grid(fid, cells, TierPlace.rim_fine_mult() if cheap_on else -1)
+		env_pos = env[0]
+		if cheap_on:
+			resid = TierPlace.rim_env_resid()
 
 	var pos := PackedVector3Array()
 	var nrm := PackedVector3Array()
@@ -206,6 +246,22 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 	uv2.resize(n)
 	var dirs := PackedVector3Array()
 	dirs.resize(n)
+	var rim_env_pos := PackedVector3Array()
+	rim_env_pos.resize(n)
+
+	# Crescent annulus (have_cache only): a node's CHEAP planar position (no noise) is compared to `r_env ± feather`,
+	# padded by the column drift (the disc itself moved) AND `TierPlace.rim_crescent_pad()` (the measured, already-
+	# gate-proven min-envelope-vs-true bound, ~11.7 blocks at R=6371 — NOT the theoretical global max relief, which
+	# would swamp this test almost everywhere near a modest S2 disc) — a node outside this band at BOTH the old and
+	# new column can PROVABLY not have crossed the real (relief-exact) transition band either. Over-inclusive only
+	# ever means a few extra (still-correct) fresh samples, never a wrongly-stale reuse.
+	var lo := 0.0
+	var hi := 1.0e30
+	if have_cache:
+		var drift := old_col.distance_to(player_col)
+		var pad := TierPlace.rim_crescent_pad()
+		lo = maxf(0.0, r_env - feather - drift - pad)
+		hi = r_env + feather + drift + pad
 
 	var feather_safe := maxf(feather, 0.001)
 	var inv := 1.0 / float(cells)
@@ -213,27 +269,50 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 		var t := float(gj) * inv
 		for gi in range(stride):
 			var s := float(gi) * inv
-			var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
 			var vi := gj * stride + gi
-			var d: Vector3 = node["dir"]
-			var true_pos: Vector3 = d * (r_datum + float(node["relief"]))
-			var env_p: Vector3 = env_pos[vi]
-			var dist := true_pos.distance_to(player_col)
-			var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
-			var blended: Vector3 = env_p.lerp(true_pos, w)
-			pos[vi] = blended - d * (sink * (1.0 - w))
+			var boundary := gi == 0 or gi == cells or gj == 0 or gj == cells
+			var reuse := false
+			var d: Vector3
+			if have_cache and not boundary:
+				d = FarDensity.node_dir(corner_dirs, s, t)
+				var planar := d * r_datum
+				var d_old := planar.distance_to(old_col)
+				var d_new := planar.distance_to(player_col)
+				if (d_old < lo or d_old > hi) and (d_new < lo or d_new > hi):
+					reuse = true
+			if reuse:
+				pos[vi] = prev_pos[vi]
+				col[vi] = prev_col[vi]
+				rim_env_pos[vi] = prev_env_pos[vi]
+			else:
+				var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+				d = node["dir"]
+				var true_pos: Vector3 = d * (r_datum + float(node["relief"]))
+				var env_p: Vector3
+				if have_cache:
+					env_p = prev_env_pos[vi]   # terrain-invariant, cached VERBATIM — no reconstruction, bit-exact
+				else:
+					env_p = env_pos[vi]
+					if resid > 0.0:
+						env_p -= d * resid   # Stage D no-protrusion compensation: env_coarse − resid ≤ env_fine ≤ true_pos
+				rim_env_pos[vi] = env_p
+				var dist := true_pos.distance_to(player_col)
+				var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+				var blended: Vector3 = env_p.lerp(true_pos, w)
+				pos[vi] = blended - d * (sink * (1.0 - w))
+				var g := int(node["g"])
+				var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+				if normal_lit:
+					vc.a = 0.0
+				col[vi] = vc
 			dirs[vi] = d
-			var g := int(node["g"])
-			var vc := FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
-			if normal_lit:
-				vc.a = 0.0
-			col[vi] = vc
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
 			uv2[vi] = Vector2(float(face), slot)
 
 	# Normals: identical law to `build_tile` — boundary via the canon `FarDensity.boundary_normal` (a pure function of
-	# `d` alone), interior via the central-difference cross of the FINAL (blended) grid tangents, so a normal-lit
-	# shade reads the ACTUAL collar surface (including the blend), not the unblended true relief.
+	# `d` alone), interior via the central-difference cross of the FINAL (blended, possibly reuse-mixed) grid
+	# tangents, so a normal-lit shade reads the ACTUAL collar surface, and a crescent rebuild's normals are bit-equal
+	# to a from-scratch rebuild's (never reused per-vertex — see the doc comment above).
 	for gj in range(stride):
 		for gi in range(stride):
 			var vi := gj * stride + gi
@@ -264,7 +343,7 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 			idx[ii + 3] = v00; idx[ii + 4] = v11; idx[ii + 5] = v01
 			ii += 6
 
-	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx}
+	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx, "rim_env_pos": rim_env_pos}
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P0, mixed pitch) — the COARSE-OWNS-EDGE chord-snap, generalized
 ## from the shipped `FacetFarRing._weld_snap_edges` (`facet_far_ring.gd:2939`, CELLS=4-only) to any tier pair on
@@ -456,6 +535,19 @@ var _built_snap: Dictionary = {}      # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REV
                                       # discipline — a few ints per resident fid, no behaviour change) but only ever
                                       # CONSULTED from `_weld_refresh_neighbours`, itself only called under
                                       # FP_SMOOTH_WELD_REFRESH ⇒ byte-identical off.
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (ii) crescent rebake): the S2
+# collar's per-node ENV-POSITION cache. fid -> PackedVector3Array, (cells+1)² entries (~129 KB at S2's 105²
+# stride) — the EXACT `_env_weld_grid` output vertex (resid-compensated already), cached VERBATIM (not a scalar
+# reconstruction — avoids any re-derivation rounding, so a crescent rebake is bit-exact vs a full rebuild). Env is
+# terrain-only (never depends on player_col) and hence NEVER needs recomputing after a tile's first bake. Bounded
+# by construction: only ever holds entries for currently-or-recently-S2-resident fids, erased on eviction
+# (`_evict`) — ≤ SMOOTH_S2_MAX(9) entries × ~129 KB ≈ 1.2 MB, fixed, NEVER-OOM (well under SMOOTH_BYTES_MAX
+# headroom). `_rim_col_baked` is the player column the cached array (and the paired `_tiles[fid]`) was actually
+# baked against — the "old_col" `build_tile_rim`'s crescent annulus test needs. Both empty / never read with
+# FP_RIM_CHEAP off (`build_tile_rim` is only ever called with `cheap_on=false`'s default arguments then, taking
+# the shipped full-rebuild path).
+var _rim_env_pos: Dictionary = {}     # fid -> PackedVector3Array
+var _rim_col_baked: Dictionary = {}   # fid -> Vector3
 var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
 var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
 var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
@@ -489,6 +581,14 @@ var _s_result: Array = []
 var _s_snap: Array = []              # per-slot frozen snap plan (PackedInt32Array[4] or empty), single-writer pre-dispatch
 var _s_rim_col: Array = []           # per-slot frozen player-column Vector3 (S2 builds only), single-writer pre-dispatch
 var _s_slot: PackedFloat32Array = PackedFloat32Array()   # R-C (FP_SMOOTH_SKIN_SLOT): per-slot frozen UV2.y skin slot
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP): per-slot frozen crescent-rebake inputs,
+# single-writer pre-dispatch (mirrors `_s_snap`/`_s_rim_col` exactly) — `_rim_env_pos`/`_tiles`/`_rim_col_baked` are
+# main-thread state; the worker only ever reads whatever was snapshotted into these BEFORE dispatch, never the
+# live dictionaries. Empty PackedVector3Array / empty Dictionary / Vector3.ZERO (⇒ `have_cache` false in
+# `build_tile_rim`) whenever `fid` has no cached bake yet — the initial-bake case, handled identically either way.
+var _s_prev_env_pos: Array = []      # per-slot frozen PackedVector3Array (or empty)
+var _s_prev_tile: Array = []         # per-slot frozen Dictionary reference (or empty {})
+var _s_old_col: Array = []           # per-slot frozen Vector3
 var _s_mutex: Mutex = null
 
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): the tier-mesh COMMIT transaction. Off ⇒
@@ -543,6 +643,9 @@ func setup_instance(parent: Node3D, material: Material) -> void:
 	_s_result.resize(_sn)
 	_s_snap.resize(_sn)
 	_s_rim_col.resize(_sn)
+	_s_prev_env_pos.resize(_sn)
+	_s_prev_tile.resize(_sn)
+	_s_old_col.resize(_sn)
 	_s_slot.resize(_sn); _s_slot.fill(-1.0)
 	_s_mutex = Mutex.new()
 	_tier_mutex = Mutex.new()   # REVISION 3 T1 (FP_SMOOTH_TXN): guards `_tier_result`/`_worker_concat_count` writes
@@ -618,6 +721,8 @@ func _evict(fid: int) -> void:
 	_tier_of.erase(fid)
 	_refresh.erase(fid)
 	_built_snap.erase(fid)
+	_rim_env_pos.erase(fid)     # REVISION 5 Stage D (FP_RIM_CHEAP): the crescent cache dies with the tile it was
+	_rim_col_baked.erase(fid)   # baked for — the NEXT bake (evict-then-rebuild) starts fresh, exactly like today.
 	_dirty_tier[t] = true
 	_tier_change_seq[t] = int(_tier_change_seq[t]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 	_changed = true
@@ -731,6 +836,14 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
 					_tiles.erase(fid)
 					_refresh.erase(fid)
+			# REVISION 5 Stage D (FP_RIM_CHEAP): lift the crescent cache OUT of the tile dict before it becomes the
+			# resident `_tiles[fid]` — `tile_bytes()`/the mesh-assembly code only ever read pos/nrm/col/uv/uv2/idx,
+			# so leaving "rim_env_pos" embedded would silently double-store the same ~129 KB array (once here, once
+			# in `_rim_env_pos`) OUTSIDE the `_bytes`/SMOOTH_BYTES_MAX ledger's count — strip it so `_tiles[fid]`
+			# stays byte-identical to the pre-Stage-D shape and the ledger keeps counting the true resident bytes.
+			var rim_env_pos_out: PackedVector3Array = tile.get("rim_env_pos", PackedVector3Array())
+			if tile.has("rim_env_pos"):
+				tile.erase("rim_env_pos")
 			var tb: int = FacetSmoothTier.tile_bytes(tile)
 			if _bytes + tb <= CubeSphere.SMOOTH_BYTES_MAX:
 				_tiles[fid] = tile
@@ -741,6 +854,12 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 				_changed = true
 				var snap_used: PackedInt32Array = _s_snap[i]   # REVISION 3 T3: record what THIS commit was actually built with
 				_built_snap[fid] = snap_used.duplicate() if snap_used.size() == 4 else PackedInt32Array()
+				if rim_env_pos_out.size() > 0:
+					# REVISION 5 Stage D (FP_RIM_CHEAP): this commit's env array + the column it was baked against
+					# become the cache the NEXT rebake's crescent test reads — single in-place assignment (never an
+					# erase-then-reinsert), so a concurrent reader of a DIFFERENT fid's entry is unaffected.
+					_rim_env_pos[fid] = rim_env_pos_out
+					_rim_col_baked[fid] = _s_rim_col[i]
 				if weld_refresh_on and (not was_resident or prev_tier != tier):
 					# REVISION 3 T3: `fid`'s COMMITTED tier genuinely changed (first commit, promote, or demote) — its
 					# NEW pitch may now mismatch a resident neighbour's frozen boundary snap (R3.2.c). A same-tier
@@ -761,6 +880,11 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 		_s_snap[i] = _snap_plan.get(fid, PackedInt32Array())
 		_s_rim_col[i] = _rim_col   # §3 P3: freeze THIS batch's player column for the S2 branch (single-writer, mirrors _s_snap)
 		_s_slot[i] = float(_slot_plan.get(fid, -1.0))   # R-C (FP_SMOOTH_SKIN_SLOT): freeze THIS batch's skin slot
+		# REVISION 5 Stage D (FP_RIM_CHEAP): freeze THIS batch's crescent-rebake inputs (single-writer, mirrors
+		# `_s_snap`/`_s_rim_col` exactly) — empty when `fid` has no cached bake yet (the initial-bake case).
+		_s_prev_env_pos[i] = _rim_env_pos.get(fid, PackedVector3Array())
+		_s_prev_tile[i] = _tiles.get(fid, {})
+		_s_old_col[i] = _rim_col_baked.get(fid, Vector3.ZERO)
 		_dispatch_count[fid] = int(_dispatch_count.get(fid, 0)) + 1   # G-FS-CHURN telemetry: builds-per-facet
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
@@ -835,7 +959,12 @@ func _build_worker(i: int) -> void:
 		# column (never `_rim_col` live — the worker only reads its own slot's snapshot, taken pre-dispatch).
 		var col: Vector3 = _s_rim_col[i]
 		var r_env := FacetFarRing.rim_r_env()
-		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot)
+		# REVISION 5 Stage D (FP_RIM_CHEAP): thread this slot's frozen crescent-rebake inputs through — empty/zero
+		# whenever `fid` has no cached bake yet, which `build_tile_rim` treats identically to the initial-bake path.
+		var prev_env_pos: PackedVector3Array = _s_prev_env_pos[i] if _s_prev_env_pos.size() > i else PackedVector3Array()
+		var prev_tile: Dictionary = _s_prev_tile[i] if _s_prev_tile.size() > i else {}
+		var old_col: Vector3 = _s_old_col[i] if _s_old_col.size() > i else Vector3.ZERO
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col)
 	else:
 		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot)   # curved sphere placement, lift retired to 0 (replacement law)
 	var plan: PackedInt32Array = _s_snap[i]

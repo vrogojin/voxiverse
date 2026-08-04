@@ -67,6 +67,22 @@ static func node_at(corner_dirs: PackedFloat64Array, r_datum: float, s: float, t
 		"relief": relief,
 	}
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (ii) crescent rebake): the node
+## DIRECTION only — the SAME bilerp+normalize+degenerate-guard as `node_at`'s first half, but WITHOUT the
+## `TerrainConfig.profile_at_dir` noise sample (`node_at`'s actual cost). `FacetSmoothTier.build_tile_rim`'s
+## crescent path uses this to test a node's world position (`dir * r_datum`, the un-relieved planar point) against
+## the old/new player-column annulus BEFORE deciding whether the node needs a fresh (expensive) `node_at` call at
+## all — a genuinely free-ish membership test, not a shortcut that skips real terrain sampling for a node that
+## still needs it.
+static func node_dir(corner_dirs: PackedFloat64Array, s: float, t: float) -> Vector3:
+	var ex := _bilerp(corner_dirs[0], corner_dirs[3], corner_dirs[6], corner_dirs[9], s, t)
+	var ey := _bilerp(corner_dirs[1], corner_dirs[4], corner_dirs[7], corner_dirs[10], s, t)
+	var ez := _bilerp(corner_dirs[2], corner_dirs[5], corner_dirs[8], corner_dirs[11], s, t)
+	var ln := sqrt(ex * ex + ey * ey + ez * ez)
+	if ln <= 0.0:
+		return Vector3(0.0, 1.0, 0.0)
+	return Vector3(ex / ln, ey / ln, ez / ln)
+
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 3 (P0) — the facet-agnostic BOUNDARY normal: central differences
 ## of `profile_at_dir` in the CANONICAL tangent frame of `d` (a pure function of `d` alone — mirrors
 ## `FacetFarRing._env_corner_min`'s u/v construction, `facet_far_ring.gd:2456-2461`: pick the world axis LEAST

@@ -953,6 +953,44 @@ const RIM_STREAM_MARGIN := 32.0
 ## spanning the disc compute IDENTICAL boundary values ⇒ the weld canon survives the blend (G-RIM-WELD).
 const RIM_FEATHER_BLOCKS := 16.0
 
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (R5.3 §7.1, FP_RIM_CHEAP): the S2 near-collar's warmup
+## cost fix. Live: `FacetSmoothTier.build_tile_rim` → `_env_weld_grid(fid, 104)` at the shipped ENV_FINE_MULT(4) ≈
+## 417² ≈ 174k `profile_at_dir` samples/facet on a worker — the confirmed warmup allocator-convoy source (a
+## per-texel GDScript allocation convoys the WASM allocator with the main thread, the SAME mechanism
+## `voxiverse-walk-perf-root-cause` names) — up to SMOOTH_S2_MAX(9) tiles at a cold engage: the observed
+## proc≈861ms/fps≈1.3 spike for ~60s. Three parts, all gated by this ONE flag (§7.1 i/ii/iii):
+##  (i)   `TierPlace.rim_fine_mult()` — the S2 collar's OWN coarser fine-grid multiplier (RIM_FINE_MULT=2 desktop /
+##        RIM_FINE_MULT_WEB=1 web; see tier_place.gd) passed to `_env_weld_grid`'s new `mult_override` param —
+##        174k → ~43k (desktop) / ~11k (web) samples/facet. A coarser fine grid can only RAISE the sampled
+##        envelope (fewer candidate columns ⇒ the per-node min can only go up, never down, vs the reference
+##        mult) — `TierPlace.rim_env_resid()` (measured, see tier_place.gd) is subtracted from the coarsened
+##        envelope in `build_tile_rim` so it stays ≤ the mult=4 reference ≤ true (no-protrusion preserved by
+##        construction — G-RIM-MULT).
+##  (ii)  Crescent-only rebake: `FacetSmoothTier`'s per-S2-tile cached env-position array (`_rim_env_pos`, ≤
+##        SMOOTH_S2_MAX(9) × 105² Vector3 ≈ 1.2 MB fixed, NEVER-OOM) caches the ONE quantity that is terrain-only
+##        (never depends on player_col) — env is never recomputed after a tile's first bake at all. A drift-
+##        triggered re-bake (RIM_REBUILD_BLOCKS, via `request_refresh`) then recomputes the (comparatively
+##        cheaper) per-node TRUE-relief sample ONLY for nodes whose CHEAP planar-position proxy crosses a
+##        conservatively-padded `r_env±feather` annulus between the old and new baked column (boundary nodes
+##        ALWAYS recomputed, so the weld canon stays bit-equal — G-RIM-CRESCENT); every other node reuses its
+##        previous committed vertex verbatim. The INITIAL bake of a tile is still full (no prior cache to reuse).
+##  (iii) Escape hatch (unchanged, not gated by this flag — always available): FP_SMOOTH_RIM off + raise
+##        BACKSTOP_CELLS 16→32 — shipped machinery, one const, if the live A/B still can't hold walking pace.
+## Also paces the INITIAL S2 assignment itself (`FacetFarRing._rim_assign`'s `cheap_on` branch, RIM_PACE_FRAMES
+## below) so a cold engage never dispatches more than one brand-new S2 build per pacing window — the convoy is
+## driven by ANY continuously-in-flight build, not by concurrency, so time-slicing the DISPATCHES (not just
+## shrinking each one) is required to hold a playable frame budget throughout the whole warmup, not just per-tile.
+## Off ⇒ `_env_weld_grid` runs at the shipped ENV_FINE_MULT with zero compensation, every rim-role fid is merged
+## unconditionally in the same `_rim_assign` call, and a re-bake always recomputes every node — byte-identical
+## (FLAT 6042/0). Gate: verify_far_smooth.gd (G-RIM-MULT, G-RIM-CRESCENT, G-RIM-PACE).
+const FP_RIM_CHEAP := false
+## `_rim_assign` calls (≈1/frame while FP_SMOOTH_RIM is engaging fresh assignments — see `_smooth_drive`) that must
+## elapse between two brand-new S2 grants at a cold engage. Frame-COUNT (not wall-clock) pacing deliberately: the
+## warmup builds themselves are what slow the frame, so a time-based gate would self-defeat (a single slow frame
+## could already exceed a wall-clock window) — counting calls instead spreads dispatches out independent of how
+## slow any one of them makes the frame.
+const RIM_PACE_FRAMES := 8
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

@@ -173,12 +173,17 @@ func _initialize() -> void:
 	# residual re-emit train + the perpetual bake worker"). Stage C (ship first): FP_FINE_BAKE_SURFACE_PAUSE — pause
 	# the whole-planet fine-tier dispatch on-surface. Stage A: FP_ENV_DEMAND_DISC — bound the floored env-convergence
 	# set. Stage B: FP_WARM_EMIT_SPLIT — decouple env-warm from mesh re-emit (+ the cache-race hygiene fix). Stage D
-	# (FP_RIM_CHEAP) is OUT OF SCOPE here (separate, YELLOW).
+	# (FP_RIM_CHEAP, §7.1) — the S2 collar warmup fix: RIM_FINE_MULT + RIM_ENV_RESID compensation, crescent-only
+	# rebake, and warmup dispatch pacing.
 	_ok(not CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE, "G-R5-OFF: FP_FINE_BAKE_SURFACE_PAUSE defaults false (byte-off; the fine-tier dispatch loop is unconditional)")
 	_ok(not CubeSphere.FP_ENV_DEMAND_DISC, "G-R5-OFF: FP_ENV_DEMAND_DISC defaults false (byte-off; the two counters + worker 'have' test keep the shipped un-bounded env demand)")
 	_ok(not CubeSphere.FP_WARM_EMIT_SPLIT, "G-R5-OFF: FP_WARM_EMIT_SPLIT defaults false (byte-off; _surface_converge_emit always dispatches a real _begin_rebuild for every env-upgrade cycle)")
+	_ok(not CubeSphere.FP_RIM_CHEAP, "G-R5-OFF: FP_RIM_CHEAP defaults false (byte-off; build_tile_rim/_rim_assign take the shipped full-rebuild/unpaced path)")
 	_gate_tex_surf_pause()
 	_gate_quiesce_surf()
+	_gate_rim_mult()
+	_gate_rim_crescent(fid_int)
+	_gate_rim_pace()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -2412,3 +2417,208 @@ func _gate_tex_surf_pause() -> void:
 	_ok(tel.has("fm_baked") and tel.has("fm_want") and tel.has("fm_dirty"), "G-TEX-SURF-PAUSE: tex_telemetry() exposes fm_baked/fm_want/fm_dirty (the previously-invisible fine-tier sweep)")
 	_ok(int(tel["fm_baked"]) == b._fine_baked.size(), "G-TEX-SURF-PAUSE: fm_baked matches _fine_baked.size() (%d)" % b._fine_baked.size())
 	# FacetTexBaker extends RefCounted — no manual .free() needed.
+
+## G-RIM-MULT (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, §7.1 (i), FP_RIM_CHEAP): the coarsened S2
+## envelope (`TierPlace.rim_fine_mult()`) stays a valid no-protrusion lower bound after `TierPlace.rim_env_resid()`
+## is subtracted — proven the way the design instructs: the node-wise coarse-vs-fine (ENV_FINE_MULT=4 reference)
+## delta is measured directly on a mountainous fixture, and RIM_ENV_RESID must cover its worst value. Since the
+## mult=4 reference is ITSELF already proven ≤ true (the shipped G-RIM-ENV / G-NPT-* gates), coarse−resid ≤ fine
+## ≤ true is a transitive, sufficient proof. Also exercises the FULL `build_tile_rim(cheap_on=true)` path end-to-
+## end (mirroring `_gate_rim_env`'s existing style) to prove the integrated builder — not just the raw envelope
+## function — carries the same margin. FALSIFY: the same coarse-vs-fine delta WITHOUT subtracting RIM_ENV_RESID
+## (resid forced to 0) DOES exceed the fine reference — the check is not vacuously satisfied by construction.
+func _gate_rim_mult() -> void:
+	print("  --- G-RIM-MULT: FP_RIM_CHEAP coarsened S2 envelope stays no-protrusion after RIM_ENV_RESID compensation ---")
+	var fid := _fid_of(4, 7, 8)   # the codebase's own "mountainous" fixture (verify_far_smooth.gd:159's own note)
+	var cells := FST.cells_for_tier(FST.S2)
+
+	# (A) raw envelope comparison: coarse (rim_fine_mult) vs the shipped ENV_FINE_MULT=4 reference.
+	var env_fine := FacetFarRing._env_weld_grid(fid, cells, TierPlace.ENV_FINE_MULT)
+	var pos_fine: PackedVector3Array = env_fine[0]
+	var mult := TierPlace.rim_fine_mult()
+	var env_coarse := FacetFarRing._env_weld_grid(fid, cells, mult)
+	var pos_coarse: PackedVector3Array = env_coarse[0]
+	var resid := TierPlace.rim_env_resid()
+	var max_delta := -1.0e30
+	var ok_after_resid := true
+	var protrudes_without_resid := false
+	for i in range(pos_fine.size()):
+		var d: Vector3 = pos_fine[i].normalized()
+		var delta: float = (pos_coarse[i] - pos_fine[i]).dot(d)   # +ve: coarse sits ABOVE the fine reference
+		max_delta = maxf(max_delta, delta)
+		if delta - resid > 1.0e-4:
+			ok_after_resid = false
+		if delta > 1.0e-4:
+			protrudes_without_resid = true
+	_ok(max_delta > 0.0, "G-RIM-MULT: measured a real coarse(mult=%d)-vs-fine(mult=4) envelope gap on the mountain fixture (max %.4f blocks) — non-trivial fixture" % [mult, max_delta])
+	_ok(ok_after_resid, "G-RIM-MULT: (coarse − RIM_ENV_RESID=%.2f) <= the mult=4 reference at EVERY S2 node (worst residual %.4f) — no-protrusion preserved by construction" % [resid, max_delta])
+	_ok(protrudes_without_resid, "G-RIM-MULT-FALSIFY: WITHOUT the RESID subtraction the coarse envelope DOES exceed the fine reference (max %.4f > 0) — the compensation is load-bearing, not vacuous" % max_delta)
+
+	# (B) end-to-end: build_tile_rim(cheap_on=true) itself, mirroring _gate_rim_env's own no-protrusion check.
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var player_col: Vector3 = centre_node["pos"]
+	var r_env := 80.0
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+	var tile := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true)
+	var pos: PackedVector3Array = tile["pos"]
+	var stride := cells + 1
+	var inv := 1.0 / float(cells)
+	var inside_checked := 0
+	var min_margin := 1.0e30
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var node := FD.node_at(corner_dirs, r_datum, s, t)
+			var true_pos: Vector3 = node["pos"]
+			if true_pos.distance_to(player_col) > r_env:
+				continue
+			inside_checked += 1
+			var vi := gj * stride + gi
+			var dd: Vector3 = node["dir"]
+			var true_relief := float(node["relief"])
+			var rendered_relief := (pos[vi] - dd * r_datum).dot(dd)
+			min_margin = minf(min_margin, true_relief - rendered_relief)
+	_ok(inside_checked > 0, "G-RIM-MULT: %d end-to-end S2 vertices fall inside R_env=%.0f under cheap_on=true (exercises the disc branch)" % [inside_checked, r_env])
+	_ok(min_margin >= -1.0e-3, "G-RIM-MULT: build_tile_rim(cheap_on=true) end-to-end never protrudes inside the disc (worst margin %.4f)" % min_margin)
+
+## G-RIM-CRESCENT (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, §7.1 (ii), FP_RIM_CHEAP): a crescent
+## rebake (cached env + a prior committed tile, drift-tested reuse) reproduces a from-scratch full rebake AT THE
+## SAME new column bit-for-bit (<=1e-4 blocks — the weld canon survives). Non-vacuous TWICE: (1) corrupting a
+## deep-inside-the-disc node (guaranteed reuse-eligible — `dist==0` at the tile's own centre, the frozen
+## `player_col`) in the cached tile shows up VERBATIM in the crescent output (proves reuse actually happens, not a
+## dead code path) while the independent full rebake is unaffected (proves the two builds are compared honestly,
+## not coincidentally equal); (2) corrupting a BOUNDARY node shows the crescent output is UNAFFECTED by the
+## corruption (boundary nodes are ALWAYS freshly recomputed, guaranteeing the cross-facet weld can never go stale).
+func _gate_rim_crescent(fid: int) -> void:
+	print("  --- G-RIM-CRESCENT: crescent rebake == full rebake at the new column (bit-equal); stale-reuse falsified both ways ---")
+	var cells := FST.cells_for_tier(FST.S2)
+	var stride := cells + 1
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var old_col: Vector3 = centre_node["pos"]
+	var r_env := 80.0
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+
+	# Initial (cache-less) bake at old_col, cheap_on=true — this IS the cache a real re-bake would consume.
+	var tile0 := FST.build_tile_rim(fid, cells, old_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true)
+	var prev_env_pos: PackedVector3Array = tile0["rim_env_pos"]
+	_ok(prev_env_pos.size() == stride * stride, "G-RIM-CRESCENT: build_tile_rim(cheap_on=true) returns a rim_env_pos cache of the right size (%d)" % prev_env_pos.size())
+
+	# A representative drift (RIM_REBUILD_BLOCKS-scale — the real cadence gate's own trigger threshold).
+	var new_col := old_col + Vector3(CubeSphere.RIM_REBUILD_BLOCKS, 0.0, 0.0)
+
+	# (A) crescent rebake vs (B) an independent from-scratch full rebake AT new_col — must be bit-equal.
+	var tile_crescent := FST.build_tile_rim(fid, cells, new_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true, prev_env_pos, tile0, old_col)
+	var tile_full := FST.build_tile_rim(fid, cells, new_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true)
+	var pos_c: PackedVector3Array = tile_crescent["pos"]
+	var pos_f: PackedVector3Array = tile_full["pos"]
+	var bit_equal := true
+	var max_diff := 0.0
+	for i in range(pos_c.size()):
+		var dd: float = pos_c[i].distance_to(pos_f[i])
+		max_diff = maxf(max_diff, dd)
+		if dd > 1.0e-4:
+			bit_equal = false
+	_ok(bit_equal, "G-RIM-CRESCENT: crescent rebake position array is bit-equal (<=1e-4 blocks) to a from-scratch full rebake at the new column (max diff %.6f)" % max_diff)
+
+	# (1) NON-VACUOUS reuse proof: corrupt the CENTRE node (dist-to-old_col == 0 -- deep inside, unconditionally
+	# reuse-eligible) in a COPY of the cached tile, and show the crescent build reuses it VERBATIM while the
+	# independent full rebake (unaffected) computes the correct value -- the two diverge exactly at that node.
+	var centre_vi := (cells / 2) * stride + (cells / 2)
+	var pos0: PackedVector3Array = tile0["pos"]
+	var pos0_corrupt := pos0.duplicate()
+	pos0_corrupt[centre_vi] += Vector3(1000.0, 0.0, 0.0)
+	var tile0_corrupt := tile0.duplicate()
+	tile0_corrupt["pos"] = pos0_corrupt
+	var tile_reuse_check := FST.build_tile_rim(fid, cells, new_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true, prev_env_pos, tile0_corrupt, old_col)
+	var pos_rc: PackedVector3Array = tile_reuse_check["pos"]
+	_ok(pos_rc[centre_vi].distance_to(pos0_corrupt[centre_vi]) < 1.0e-6,
+		"G-RIM-CRESCENT-FALSIFY(reuse): the centre node's corrupted stale value IS reused verbatim by the crescent path (proves reuse genuinely happens, not a dead branch)")
+	_ok(pos_rc[centre_vi].distance_to(pos_f[centre_vi]) > 500.0,
+		"G-RIM-CRESCENT-FALSIFY(reuse): that reused-corrupted centre node DIFFERS from the correct full-rebake value by >500 blocks (a real divergence, not a coincidental match)")
+
+	# (2) NON-VACUOUS boundary-safety proof: corrupt a BOUNDARY node (gi=0) the SAME way; the crescent build must
+	# NOT reuse it (boundary nodes are unconditionally fresh every rebake) — the weld canon can never go stale.
+	var boundary_vi := (cells / 2) * stride + 0
+	var pos0_corrupt_b := pos0.duplicate()
+	pos0_corrupt_b[boundary_vi] += Vector3(1000.0, 0.0, 0.0)
+	var tile0_corrupt_b := tile0.duplicate()
+	tile0_corrupt_b["pos"] = pos0_corrupt_b
+	var tile_boundary_check := FST.build_tile_rim(fid, cells, new_col, r_env, feather, sink, CubeSphere.FP_SMOOTH_NORMAL_LIT, -1.0, true, prev_env_pos, tile0_corrupt_b, old_col)
+	var pos_bc: PackedVector3Array = tile_boundary_check["pos"]
+	_ok(pos_bc[boundary_vi].distance_to(pos0_corrupt_b[boundary_vi]) > 500.0,
+		"G-RIM-CRESCENT: a corrupted BOUNDARY node is NOT reused (crescent output differs from the stale value by >500 blocks)")
+	_ok(pos_bc[boundary_vi].distance_to(pos_f[boundary_vi]) < 1.0e-4,
+		"G-RIM-CRESCENT: the (always-fresh) boundary node still matches the correct full-rebake value (<=1e-4) — the cross-facet weld canon survives corruption")
+
+## G-RIM-PACE (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, warmup pacing, FP_RIM_CHEAP): a cold
+## engage's `_rim_assign` grants AT MOST ONE brand-new S2 slot per call under `cheap_on=true` (never the whole
+## backstop-role set at once), and the stagger still converges to covering every rim-role facet within a bounded
+## number of calls. FALSIFY: `cheap_on=false` (the shipped path) floods EVERY rim-role facet's S2 grant in the
+## SAME single call — the exact warmup flood this flag exists to fix.
+func _gate_rim_pace() -> void:
+	print("  --- G-RIM-PACE: FP_RIM_CHEAP warmup S2 dispatch is staggered (<=1 new grant per RIM_PACE_FRAMES calls) ---")
+	var fid := _fid_of(2, 6, 7)
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	var pool := PackedInt32Array()
+	for slot in range(4):
+		var nb := FA.seam_neighbour(fid, slot)
+		if nb >= 0 and not pool.has(nb):
+			pool.append(nb)
+	ring.set_pool_excluded(pool)
+	var rim_role_count := 1 + pool.size()   # active + live-pool
+	_ok(rim_role_count >= 3, "G-RIM-PACE: fixture has %d rim-role facets (a real cold-engage flood scenario)" % rim_role_count)
+
+	# (A) first call, cheap_on=true: exactly ONE brand-new S2 grant.
+	var merged: Dictionary = ring._rim_assign({}, true)
+	var s2_count := 0
+	for f in merged.keys():
+		if int(merged[f]) == FST.S2:
+			s2_count += 1
+	_ok(s2_count == 1, "G-RIM-PACE: cold-engage first call grants S2 to exactly 1 of %d rim-role facets (got %d)" % [rim_role_count, s2_count])
+
+	# (B) FALSIFY: cheap_on=false floods every rim-role facet in the SAME single call (an independent ring instance
+	# so its own pacing counters don't interfere with (A)'s).
+	var ring2 := FacetFarRing.new()
+	ring2.setup(fid)
+	ring2._smooth = FST.new()
+	ring2._smooth.setup_instance(ring2, null)
+	ring2.set_pool_excluded(pool)
+	var merged_off: Dictionary = ring2._rim_assign({}, false)
+	var s2_count_off := 0
+	for f in merged_off.keys():
+		if int(merged_off[f]) == FST.S2:
+			s2_count_off += 1
+	_ok(s2_count_off == rim_role_count, "G-RIM-PACE-FALSIFY: cheap_on=false (shipped) grants ALL %d rim-role facets S2 in the SAME call (got %d) -- the flood this flag fixes" % [rim_role_count, s2_count_off])
+
+	# (C) advance RIM_PACE_FRAMES more calls (repeating the identical request -- no other driver state moves): the
+	# 2nd facet's grant should land, never more than 1 NEW grant per pacing window.
+	for _i in range(CubeSphere.RIM_PACE_FRAMES):
+		merged = ring._rim_assign({}, true)
+	var granted_after_2 := 0
+	for f in merged.keys():
+		if int(merged[f]) == FST.S2:
+			granted_after_2 += 1
+	_ok(granted_after_2 == 2, "G-RIM-PACE: after RIM_PACE_FRAMES(%d) more calls exactly 2 facets are S2-granted (staggered, got %d)" % [CubeSphere.RIM_PACE_FRAMES, granted_after_2])
+
+	# (D) keep advancing until every rim-role facet is granted -- the stagger converges, never stalls forever.
+	var total_calls := CubeSphere.RIM_PACE_FRAMES
+	var granted_final := granted_after_2
+	var budget := CubeSphere.RIM_PACE_FRAMES * (rim_role_count + 2)
+	while granted_final < rim_role_count and total_calls < budget:
+		merged = ring._rim_assign({}, true)
+		granted_final = 0
+		for f in merged.keys():
+			if int(merged[f]) == FST.S2:
+				granted_final += 1
+		total_calls += 1
+	_ok(granted_final == rim_role_count, "G-RIM-PACE: the stagger eventually grants ALL %d rim-role facets S2 (got %d after %d calls) -- never stalls" % [rim_role_count, granted_final, total_calls])

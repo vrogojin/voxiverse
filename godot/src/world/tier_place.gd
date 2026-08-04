@@ -25,6 +25,33 @@ const ENV_FINE_MULT := 4          # fine-sample density = ENV_FINE_MULT × BACKS
 const ENV_DILATE_BLOCKS := 6.0    # footprint dilation (blocks) for the radial-vs-normal skew reach (relief·sin α_max
                                   # ≤ ~5-6 at K=24): the far vertex lands displaced ≤ this from its footprint b.
 
+# --- COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (§7.1, FP_RIM_CHEAP) — the S2 collar's OWN, cheaper
+# fine-grid multiplier + its no-protrusion compensation. The shipped `_env_weld_grid` always samples at
+# ENV_FINE_MULT(4) × cells — for S2 (cells=104) that is 417² ≈ 174k `profile_at_dir` calls/facet, the confirmed
+# warmup allocator-convoy source (R5.3: per-texel GDScript allocation convoys the WASM allocator with the main
+# thread — the SAME mechanism `voxiverse-walk-perf-root-cause` names). RIM_FINE_MULT=2 cuts that to ~43k (~4×);
+# the web build goes one step further to RIM_FINE_MULT_WEB=1 (~11k, ~16×) since a 2-core browser main thread is
+# the most convoy-sensitive. -----------------------------------------------------------------------------------
+const RIM_FINE_MULT := 2          # S2-ONLY fine-sample density override (desktop/native): coarser than the
+                                  # shipped ENV_FINE_MULT(4), used ONLY by `FacetSmoothTier.build_tile_rim`'s
+                                  # `_env_weld_grid` call under FP_RIM_CHEAP — every other envelope caller
+                                  # (coarse horizon / dense backstop) is untouched.
+const RIM_FINE_MULT_WEB := 1      # web build: the coarsest still-covered mult (see RIM_ENV_RESID below) — web is
+                                  # the 2-core convoy-sensitive target the whole flag exists for.
+## RIM_ENV_RESID: the no-protrusion compensation. A coarser fine grid can only MISS a low column (fewer candidate
+## samples ⇒ the per-node minimum can only stay the same or go UP vs the ENV_FINE_MULT(4) reference — never down),
+## so `build_tile_rim` subtracts this from the coarsened envelope before it ever reaches the blend, restoring
+## env_coarse − RIM_ENV_RESID ≤ env_fine ≤ true (no-protrusion preserved by construction, not a tuned visual fudge).
+## MEASURED (2026-08-04, throwaway harness driving `FacetFarRing._env_weld_grid(fid, 104, mult)` at the real S2
+## cells=104 against 58 facets spanning all 6 faces incl. the mountain biome — MOUNTAIN_AMPLITUDE=92 but its mask
+## is low-frequency (wavelength ≈1250 blocks ≈3 facet-edges) so it is locally near-flat at S2's ~4-block scale;
+## the sampled residual is dominated by HILLS(freq 0.008, amp 3)/DETAIL(freq 0.05, amp 1) noise instead): node-wise
+## max(env@mult2 − env@mult4) and max(env@mult1 − env@mult4) both converged to ≈1.0006 blocks (consistent to 4
+## decimal places across every facet sampled — bounded by the int `g` quantization, not by terrain roughness) — a
+## SINGLE constant safely covers both RIM_FINE_MULT and RIM_FINE_MULT_WEB. +≈2 blocks of margin (facets the sparse
+## scan didn't hit) ⇒ 3.0. G-RIM-MULT re-derives this bound live (falsified by forcing RIM_ENV_RESID=0).
+const RIM_ENV_RESID := 3.0
+
 # --- NO-PROTRUSION (FP_ENV_ALL, §0.3/§0.4) — the GLOBAL envelope ε, sized to the MEASURED inherent residual --------
 const ENV_ALL_EPS_FRAC := 0.45    # the FP_ENV_ALL ε guard SCALES with the facet cell like ENV_EPS_FRAC, but larger:
                                   # even after the min-envelope removes the terrain-curvature over-estimate, a residual
@@ -115,6 +142,34 @@ static func backstop_sink_level() -> float:
 static func backstop_sink_rim() -> float:
 	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
 	return maxf(ENV_EPS_G, ENV_EPS_FRAC * cell)
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (i)): the S2 collar's fine-sample
+## multiplier — RIM_FINE_MULT_WEB on a web export (OS.has_feature("web"), the convoy-sensitive target), else
+## RIM_FINE_MULT. Off (FP_RIM_CHEAP false) ⇒ callers pass -1 to `_env_weld_grid` (the shipped ENV_FINE_MULT),
+## never calling this at all — byte-identical.
+static func rim_fine_mult() -> int:
+	return RIM_FINE_MULT_WEB if OS.has_feature("web") else RIM_FINE_MULT
+
+## The no-protrusion compensation paired with `rim_fine_mult()` — see RIM_ENV_RESID's derivation above. One
+## constant covers both the desktop and web mult (measured equal to 4 decimal places on the sampled fixture set).
+static func rim_env_resid() -> float:
+	return RIM_ENV_RESID
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (ii) crescent rebake): the padding
+## `build_tile_rim`'s crescent annulus test adds (beyond feather+drift) to cover the gap between a node's CHEAP
+## planar proxy position (`FarDensity.node_dir(...) * r_datum`, no noise sample — used to decide "safe to reuse
+## without a fresh node_at call") and its TRUE relieved position. Reuses the SAME bound `ENV_ALL_EPS_FRAC` already
+## derives for the conceptually IDENTICAL question elsewhere in this file ("how far can the min-envelope's own
+## dilated-footprint construction differ from the true surface" — `backstop_sink()`'s env_all branch, G-NPT-BOUND
+## measured) rather than the theoretical GLOBAL max relief (`TerrainConfig.MAX_SURFACE_Y`, ~116 blocks at R=6371):
+## the global bound is RIGOROUS but would swamp the annulus test almost everywhere near a modest S2 disc (r_env ≈
+## 160), defeating the crescent's purpose; this measured, already-gate-proven bound (≈11.7 at R=6371) is the
+## established precedent for exactly this class of claim in this codebase. A node whose planar-proxy distance to
+## BOTH the old and new column stays outside `[r_env−feather−drift−pad, r_env+feather+drift+pad]` is therefore
+## reuse-eligible — see `build_tile_rim`'s doc comment for the full argument.
+static func rim_crescent_pad() -> float:
+	var cell := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(CubeSphere.BACKSTOP_CELLS)
+	return maxf(ENV_EPS_G, ENV_ALL_EPS_FRAC * cell)
 
 ## FP_ENV_FLOORED_ASYNC: the FULL radial sink for a CHORD fallback vertex — the exact pre-envelope BACKSTOP_SINK
 ## (BACKSTOP_SINK_FRAC × cell, ≈13 at R=6371), regardless of env_all. A chord is the raw profile sample, NOT the

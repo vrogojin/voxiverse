@@ -84,6 +84,19 @@ var _rim_have_baked := false
 # Empty / unused with the flag off (the legacy whole-collar `_rim_baked_col` above is used instead).
 var _rim_baked_col_of: Dictionary = {}   # fid -> Vector3 (this facet's own last-baked player column)
 
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 warmup pacing): stagger the INITIAL
+# S2 assignment itself (not just the RIM_REBUILD_BLOCKS re-bake cadence above) so a cold engage never floods
+# SMOOTH_S2_MAX(9) brand-new S2 builds into `_want`/the worker slots in the SAME call — the allocator-convoy spike
+# (R5.3) is driven by ANY continuously-in-flight S2 build, not by how many run concurrently, so pacing must hold
+# even at SMOOTH_BUILD_SLOTS=1. `_rim_pace_calls` counts `_rim_assign` invocations (≈1/frame under FP_SMOOTH_RIM,
+# `_smooth_drive` runs every frame); `_rim_pace_last_call` is the count at the last NEWLY-granted S2 slot;
+# `_rim_paced` records every fid that has ALREADY been granted its first S2 slot (so it keeps its place in
+# `merged` every subsequent call regardless of residency — pacing gates the FIRST grant only, never un-grants).
+# All unused / always-0 with the flag off (every rim-role fid is merged unconditionally, the shipped behaviour).
+var _rim_pace_calls := 0
+var _rim_pace_last_call := -1000000
+var _rim_paced: Dictionary = {}   # fid -> true once granted its first S2 slot (paced or not)
+
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-A (FP_SMOOTH_STICKY): the hop-ring assignment target, a PURE
 # function of the active facet alone (no cull axis), recomputed ONLY when `_active_fid` actually changes (a facet
 # crossing) — never per-frame, never on a camera turn. `_sticky_stale_since` implements the dwell (§ R-A): a resident
@@ -709,17 +722,34 @@ func _mesh_inc_gate(assign: Dictionary, snap_gen_on := CubeSphere.FP_SHELL_SNAP_
 ## its (still cached, still-warm) sunk backstop quad the instant it drops out of `_smooth`'s resident set (the SAME
 ## law-6 `visible_fids()` exclusion check, run in reverse) and stays there until the freshly-baked S2 tile re-commits
 ## — so there is NEVER a frame with neither the backstop nor an S2 tile resident for a pool facet (G-RIM-MBB).
-func _rim_assign(assign: Dictionary) -> Dictionary:
+##
+## `cheap_on` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP, §7.1 warmup pacing): a
+## brand-new (never-yet-`_rim_paced`) facet is only granted its FIRST S2 slot once `RIM_PACE_FRAMES` `_rim_assign`
+## calls have elapsed since the last new grant — a cold engage (e.g. up to 5 backstop-role facets at once) never
+## dispatches more than one fresh S2 build into `_want`/the worker slots per pacing window, however many facets
+## the driver would otherwise assign simultaneously. A facet ALREADY paced (or already resident) is unaffected —
+## pacing gates only the first grant, never removes a facet already in flight or built (never a hole: an unpaced
+## fid simply keeps whatever role it already had — shell/backstop — until its turn, the same ≤-truth fallback
+## `_rim_assign` already relies on before ANY S2 tile has committed). Off ⇒ every rim-role fid is merged
+## unconditionally in the SAME call — the shipped flood, byte-identical.
+func _rim_assign(assign: Dictionary, cheap_on := CubeSphere.FP_RIM_CHEAP) -> Dictionary:
 	var merged := assign.duplicate()
 	var rim := {}
 	rim[_active_fid] = true
 	for f in _excluded.keys():
 		rim[int(f)] = true
+	_rim_pace_calls += 1
 	var count := 0
 	for f in rim.keys():
 		if count >= CubeSphere.SMOOTH_S2_MAX:
 			break
-		merged[int(f)] = FacetSmoothTier.S2
+		var fi := int(f)
+		if cheap_on and not _rim_paced.has(fi) and not _smooth.is_resident(fi):
+			if _rim_pace_calls - _rim_pace_last_call < CubeSphere.RIM_PACE_FRAMES:
+				continue   # not this fid's turn yet — stays on its current (shell/backstop) role meanwhile
+			_rim_pace_last_call = _rim_pace_calls
+		_rim_paced[fi] = true
+		merged[fi] = FacetSmoothTier.S2
 		count += 1
 	_smooth.set_rim_params(_player_col_abs)
 	if CubeSphere.FP_SMOOTH_MESH_INC:
@@ -3018,7 +3048,13 @@ func _ensure_backstop_cached_env_weld(fid: int) -> void:
 # (unqualified within this class, `ring._env_weld_grid(...)` from the gate) are unaffected: GDScript resolves a
 # static method through an instance reference identically to an instance method call.
 # =====================================================================================================
-static func _env_weld_grid(fid: int, cells: int) -> Array:
+## `mult_override` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP): when > 0, use THIS fine-
+## sample multiplier instead of the shipped `TierPlace.ENV_FINE_MULT` — the S2 near-collar builder's ONLY caller
+## (`FacetSmoothTier.build_tile_rim`) passes `TierPlace.rim_fine_mult()` under the flag to cut the ~174k
+## `profile_at_dir` samples/facet that drive the warmup allocator-convoy spike (R5.3). Every other call site (the
+## coarse-horizon/dense-backstop caches) omits it — default -1 reproduces the shipped `TierPlace.ENV_FINE_MULT`
+## verbatim, byte-identical.
+static func _env_weld_grid(fid: int, cells: int, mult_override: int = -1) -> Array:
 	# FP_ENV_WARM_ASYNC telemetry: attribute this (heavy) build to its thread, so the relocation is provable — OFF the
 	# builds land on MAIN; ON they land on the far-ring worker while env_build_main stays frozen. Cheap thread-id compare.
 	if OS.get_thread_caller_id() == OS.get_main_thread_id():
@@ -3028,7 +3064,7 @@ static func _env_weld_grid(fid: int, cells: int) -> Array:
 	var cd := FacetAtlas.facet_corner_dirs(fid)
 	var stride := cells + 1
 	var cstride := cells / CELLS                       # 1 for the coarse facet, BACKSTOP_CELLS/CELLS for the dense one
-	var mult := TierPlace.ENV_FINE_MULT
+	var mult := mult_override if mult_override > 0 else TierPlace.ENV_FINE_MULT
 	var fine := cells * mult
 	var fstride := fine + 1
 	# Pre-sample the fine near-g grid along the SHARED corner dirs (interior 2-D footprint source; one profile per node).

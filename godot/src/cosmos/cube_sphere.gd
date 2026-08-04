@@ -1007,6 +1007,34 @@ const FP_SMOOTH_SLOT_MESH := false
 ## param defaults to this const so a gate can force a tiny budget to deterministically exercise the deferral path.
 const SMOOTH_COMMIT_BUDGET_BYTES := 2 * 1024 * 1024
 
+## FP_SMOOTH_TILE_SURF — SAFE replacement for FP_SMOOTH_SLOT_MESH above: that fix's `RenderingServer.mesh_surface_
+## update_vertex_region`/`_attribute_region` GPU region-writes HARD-CRASHED the live web tab (those calls abort
+## ANGLE/WebGL2 outside the exact byte/format contract they expect; the abort is uncatchable from GDScript, and the
+## headless dummy RenderingServer no-ops the very same calls — `servers/rendering/dummy/storage/mesh_storage.h` — so
+## every gate passed green while the live path aborted). This kills the SAME O(N²) whole-tier re-pack/re-upload
+## warmup hitch (`FacetSmoothTier._rebuild_tier_mesh`/`_apply_tier_mesh` re-upload the ENTIRE tier's ArrayMesh on
+## EVERY tile it gains — a full S2 tier ≈ 8 MB re-uploaded on each of its ≤9 tile adds) using ONLY the high-level API
+## the rest of the codebase already relies on: `MeshInstance3D`/`ArrayMesh.new()`/`add_surface_from_arrays`/
+## `mi.mesh =`/`add_child`/`queue_free` — never a RenderingServer region/RID call. Per-tile phase: a committing tile
+## gets its OWN child `MeshInstance3D` (an O(1) upload — the tier's other resident tiles' meshes are untouched).
+## Consolidate-at-settle: once a tier has gone `SMOOTH_TILE_CONSOLIDATE_FRAMES` `step()` calls without an add/evict,
+## its per-tile nodes fold back into ONE merged mesh (`_rebuild_tier_mesh`, reused verbatim — the one whole-tier
+## upload, now amortized to once per settle instead of once per tile) and are freed, bounding steady-state draw calls
+## back down to ~4 (one per tier). Invariant enforced by construction: a tier draws EITHER via its merged
+## `_mi[tier].mesh` XOR via per-tile `_tile_mi` nodes, NEVER both (`FacetSmoothTier._tile_surf_active[tier]`; the
+## split/consolidate transitions each clear the other representation before returning) — no double-draw. `step()`/
+## `request()`/`_evict()`/`force_rebake()` all default their new `tile_surf_on` param to this const, mirroring the
+## existing `slot_on`/`txn_on`/`idle_on` convention. Off ⇒ every new code path in `facet_smooth_tier.gd` is unreached
+## — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-TILESURF-COVER, G-TILESURF-XOR, G-TILESURF-
+## CONSOLIDATE, G-TILESURF-OFF). Live-only unknown: steady-state fps/draw-call cost of the per-tile phase during a
+## real warmup (headless has no GPU pixels) — the orchestrator watches `FacetSmoothTier.tile_surf_stats()`.
+const FP_SMOOTH_TILE_SURF := false
+## `step()` calls a tier must go without an add/evict before FP_SMOOTH_TILE_SURF folds its per-tile nodes back into
+## one merged mesh (`_tile_surf_consolidate`). ~45 calls at 60fps is < 1s of true rest — long enough that a facet
+## mid-warmup-fill (still gaining tiles every call) never consolidates mid-flood, short enough that steady-state
+## draws settle back down promptly once a tier stops changing.
+const SMOOTH_TILE_CONSOLIDATE_FRAMES := 45
+
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (R5.3 §7.1, FP_RIM_CHEAP): the S2 near-collar's warmup
 ## cost fix. Live: `FacetSmoothTier.build_tile_rim` → `_env_weld_grid(fid, 104)` at the shipped ENV_FINE_MULT(4) ≈
 ## 417² ≈ 174k `profile_at_dir` samples/facet on a worker — the confirmed warmup allocator-convoy source (a

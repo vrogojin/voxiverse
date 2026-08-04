@@ -703,6 +703,19 @@ var _worker_concat_count := 0  # G-FS-TXN-THREAD telemetry: `_concat_tier_worker
 var _txn_apply_count := 0      # G-FS-NOHOLE telemetry: atomic (possibly multi-tier) mesh applies committed
 
 # =====================================================================================================================
+# FP_SMOOTH_TILE_SURF — SAFE per-tile-node replacement for FP_SMOOTH_SLOT_MESH below (which HARD-CRASHED the live web
+# tab: RenderingServer.mesh_surface_update_vertex_region/_attribute_region abort ANGLE/WebGL2, uncatchable from
+# GDScript, and no-op on the headless dummy RenderingServer, so gates passed green while the live path aborted). Kills
+# the SAME O(N²) whole-tier re-pack/re-upload warmup hitch using ONLY the high-level MeshInstance3D/ArrayMesh API this
+# file already relies on elsewhere (`_rebuild_tier_mesh`/`_apply_tier_mesh` above) — never a RenderingServer region/RID
+# call. See cube_sphere.gd's FP_SMOOTH_TILE_SURF doc comment for the full design.
+# =====================================================================================================================
+var _tile_mi: Dictionary = {}      # fid -> per-tile MeshInstance3D (child of _mi[tier]), while that tier is "split"
+var _tile_surf_active: Array = [false, false, false, false]   # per-tier: drawing via per-tile nodes right now (merged mesh cleared)?
+var _tile_surf_stable: Array = [0, 0, 0, 0]                    # per-tier: step() calls since the last add/evict touched it
+var _tile_surf_commit_count := 0   # telemetry: tile_surf_stats() "path active" signal — bumped by any per-tile add
+
+# =====================================================================================================================
 # REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — per-tier fixed-capacity
 # slotted mesh + GPU region-write commits. Supersedes `_rebuild_tier_mesh`/`_step_tier_txn` (both kept, byte-
 # identical, for the flag-off / refused path) as the tier-mesh COMMIT mechanism; `_tiles`/`_tier_of`/`_bytes`
@@ -804,7 +817,7 @@ const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 ## MESH_INC-off break-before-make): that facet's own imminent re-commit (once its new-tier build lands) already
 ## fires the SAME check with the FINAL, correct new pitch (`step()`'s post-commit hook) — checking here too would
 ## use the transiently-wrong "not resident yet" pitch and could bounce a neighbour's refresh twice for no reason.
-func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
+func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
 	var w := {}
 	for fid in assignments.keys():
 		w[int(fid)] = int(assignments[fid])
@@ -834,17 +847,17 @@ func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSph
 	for fid in _tiles.keys():
 		var f := int(fid)
 		if not _want.has(f):
-			_evict(f, slot_on)
+			_evict(f, slot_on, tile_surf_on)
 			_slot_flush_event()   # REVISION 7: this fid is gone for good — its (possible) slot-zero-blit is its own whole event
 			if weld_refresh_on:
 				_weld_refresh_neighbours(f)   # REVISION 3 T3: gone for good — its neighbours' frozen plans can finalize now
 		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
-			_evict(f, slot_on)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
+			_evict(f, slot_on, tile_surf_on)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
 			_slot_flush_event()
 	if idle_on:
 		_settled = false   # REVISION 3 Q1: the assignment actually changed — step() must scan again next call
 
-func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
+func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
 	var t: int = int(_tier_of[fid])
 	_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])
 	_tiles.erase(fid)
@@ -853,7 +866,11 @@ func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
 	_built_snap.erase(fid)
 	_rim_env_pos.erase(fid)     # REVISION 5 Stage D (FP_RIM_CHEAP): the crescent cache dies with the tile it was
 	_rim_col_baked.erase(fid)   # baked for — the NEXT bake (evict-then-rebuild) starts fresh, exactly like today.
-	if slot_on and not _slot_mesh_failed:
+	if tile_surf_on:
+		# FP_SMOOTH_TILE_SURF: free `fid`'s per-tile node (O(1)) if the tier is currently split, or trigger a one-time
+		# re-split of `t`'s remaining residents (still consolidated) — see `_tile_surf_touch` below.
+		_tile_surf_touch(t, fid, true)
+	elif slot_on and not _slot_mesh_failed:
 		# REVISION 7: free `fid`'s slot (if it had one) and stage a degenerate-blit for it — the caller flushes this
 		# as its own event (a standalone eviction) or bundles it with an accompanying new-tier commit (a promote),
 		# via `_slot_flush_event` called once the WHOLE transition for this fid is known.
@@ -870,9 +887,9 @@ func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
 ## fresh tile re-commits — never a frame with neither. No-op if `fid` isn't currently resident.
 ## SHIPPED (legacy) rebake path — kept for FP_SMOOTH_MESH_INC-off callers (byte-identical). REVISION 2 LAW R-D/R-B
 ## (FP_SMOOTH_MESH_INC on) callers use `request_refresh` instead (below), which never evicts the collar at all.
-func force_rebake(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
+func force_rebake(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
 	if _tiles.has(int(fid)):
-		_evict(int(fid), slot_on)
+		_evict(int(fid), slot_on, tile_surf_on)
 		_slot_flush_event()
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC): request an IN-PLACE rebuild of
@@ -936,7 +953,7 @@ func _weld_refresh_neighbours(fid: int) -> void:
 ## (b) ORs into the `_next_want` refresh-dispatch gate (`refresh_dispatch_on`) so a queued `request_refresh` actually
 ## dispatches even with `FP_SMOOTH_MESH_INC` off — REVISION 2's rim rebake and T3's weld reweld share the SAME
 ## in-place-rebuild primitive (`_refresh`/`request_refresh`), gated by whichever feature needs it.
-func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES) -> void:
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
 	if _sn == 0:
 		return
 	if idle_on and _settled:
@@ -967,7 +984,7 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 			var prev_tier := int(_tier_of.get(fid, -1))   # REVISION 3 T3: captured BEFORE any evict/erase below mutates it
 			if was_resident:
 				if prev_tier != tier:
-					_evict(fid, slot_on)               # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
+					_evict(fid, slot_on, tile_surf_on)               # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
 				else:
 					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
 					_tiles.erase(fid)
@@ -1002,7 +1019,12 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 					# in-place refresh (was_resident and prev_tier == tier) presents the SAME pitch, so neighbours
 					# stay correctly welded already — nothing to recheck there.
 					_weld_refresh_neighbours(fid)
-				if slot_on and not _slot_mesh_failed:
+				if tile_surf_on:
+					# FP_SMOOTH_TILE_SURF: O(1) per-tile add/refresh (or the one-time O(resident) re-split if `tier`
+					# was still consolidated) — the SAFE replacement for the slot-mesh branch below. Runs regardless of
+					# `weld_refresh_on` (that block above is an independent, orthogonal concern).
+					_tile_surf_touch(tier, fid, false)
+				elif slot_on and not _slot_mesh_failed:
 					# REVISION 7: stage this fid's new-slot write — bundled with the tier-change evict's slot-zero (staged
 					# above, same `_slot_cur_event`) into ONE atomic event by the flush just below. Runs regardless of
 					# `weld_refresh_on` (that block above is an independent, orthogonal concern).
@@ -1031,7 +1053,11 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	if slot_on and not _slot_mesh_failed:
+	if tile_surf_on:
+		# FP_SMOOTH_TILE_SURF: per-tile adds/evicts already landed O(1) in the reap loop above — this is just the
+		# paced settle pass (age every split tier, fold AT MOST ONE consolidated-eligible tier back to a merged mesh).
+		_tile_surf_consolidate_step()
+	elif slot_on and not _slot_mesh_failed:
 		# REVISION 7 (FP_SMOOTH_SLOT_MESH): drain the queued whole commit-events under the byte budget — supersedes
 		# BOTH the T1 transaction and the legacy loop below (kept, byte-identical, for the off/refused path). A
 		# refusal raised INSIDE this same call's reap loop above (`_slot_commit_fid`/`_ensure_slot_capacity` failing
@@ -1289,6 +1315,135 @@ func _apply_tier_mesh(tier: int, result: Dictionary) -> void:
 	for fid in _tier_snapshot_fids[tier]:
 		committed[int(fid)] = true
 	_committed_fids[tier] = committed
+
+# =====================================================================================================================
+# FP_SMOOTH_TILE_SURF — SAFE per-tile-node commit path (see the instance-var block above, near `_tile_mi`, and the
+# doc comment on `CubeSphere.FP_SMOOTH_TILE_SURF`). Per-tile phase: each committing tile gets its OWN child
+# MeshInstance3D (O(1) upload). Consolidate-at-settle: a tier that has gone `SMOOTH_TILE_CONSOLIDATE_FRAMES` `step()`
+# calls without an add/evict folds its per-tile nodes back into ONE merged mesh (`_rebuild_tier_mesh`, reused
+# verbatim) and frees them. Invariant (merged XOR per-tile, never both): `_tile_surf_active[tier]` is the single
+# source of truth for which representation is live; `_tile_surf_split_tier`/`_tile_surf_consolidate` are the only two
+# transitions and each one builds the NEW representation before tearing down the OLD one, so there is never a frame
+# with neither, and the merged mesh is always explicitly nulled the instant per-tile nodes exist (never both drawing
+# at once). ONLY the high-level MeshInstance3D/ArrayMesh API is used here — never RenderingServer.
+# =====================================================================================================================
+
+## Pack ONE tile's own arrays (no index-offset — a tile is entirely self-contained) into a fresh 1-surface ArrayMesh
+## — the exact same per-tile arrays/`add_surface_from_arrays` call/material setup `_rebuild_tier_mesh`'s loop body
+## already uses, just for a single tile instead of the whole tier's concatenation, so the geometry is bit-identical
+## to the shipped whole-tier path.
+func _tile_surf_pack(tile: Dictionary) -> ArrayMesh:
+	var mesh := ArrayMesh.new()
+	var pos: PackedVector3Array = tile.get("pos", PackedVector3Array())
+	if pos.size() > 0:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = pos
+		arr[Mesh.ARRAY_NORMAL] = tile.get("nrm", PackedVector3Array())
+		arr[Mesh.ARRAY_COLOR] = tile.get("col", PackedColorArray())
+		arr[Mesh.ARRAY_TEX_UV] = tile.get("uv", PackedVector2Array())
+		arr[Mesh.ARRAY_TEX_UV2] = tile.get("uv2", PackedVector2Array())
+		arr[Mesh.ARRAY_INDEX] = tile.get("idx", PackedInt32Array())
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		if _material != null:
+			mesh.surface_set_material(0, _material)
+	return mesh
+
+## O(1): create (or, if it already exists, refresh) `fid`'s own per-tile MeshInstance3D child of `_mi[tier]`, packed
+## from its CURRENT `_tiles[fid]` content. Graceful no-op if `_mi[tier]` was never set up (`setup_instance` not
+## called) or `fid` isn't actually resident (should not happen from the call sites below, but never a hard failure).
+func _tile_surf_set_node(tier: int, fid: int) -> void:
+	var parent_mi: MeshInstance3D = _mi[tier]
+	if parent_mi == null or not _tiles.has(fid):
+		return
+	var mesh := _tile_surf_pack(_tiles[fid])
+	if _tile_mi.has(fid):
+		var existing: MeshInstance3D = _tile_mi[fid]
+		if existing != null and is_instance_valid(existing):
+			existing.mesh = mesh
+			return
+	var node := MeshInstance3D.new()
+	node.name = "FacetSmoothTileMesh_%d" % fid
+	if _material != null:
+		node.material_override = _material
+	parent_mi.add_child(node)
+	node.mesh = mesh
+	_tile_mi[fid] = node
+
+## Free `fid`'s per-tile node (an eviction while its tier is split) — a no-op if it never had one (e.g. the tier was
+## still consolidated when the eviction landed; `_tile_surf_touch` routes that case through `_tile_surf_split_tier`
+## instead, which naturally excludes the just-evicted fid since `_tiles`/`_tier_of` are already updated by the caller).
+func _tile_surf_free_node(fid: int) -> void:
+	if not _tile_mi.has(fid):
+		return
+	var node: MeshInstance3D = _tile_mi[fid]
+	_tile_mi.erase(fid)
+	if node != null and is_instance_valid(node):
+		node.queue_free()
+
+## `tier` is (re-)entering the per-tile phase — build a node for EVERY tile CURRENTLY resident at `tier` (covers both
+## "a new/changed tile just committed" and "a tile was just evicted": `_tiles`/`_tier_of` already reflect the
+## post-mutation resident set by the time this runs) and clear the merged mesh so the two representations never
+## co-exist — the merged-XOR-per-tile invariant, enforced by construction (build new, THEN clear old).
+func _tile_surf_split_tier(tier: int) -> void:
+	for fid in _tiles.keys():
+		if int(_tier_of[fid]) == tier:
+			_tile_surf_set_node(tier, int(fid))
+	var mi: MeshInstance3D = _mi[tier]
+	if mi != null:
+		mi.mesh = null
+	_tile_surf_active[tier] = true
+
+## Entry point for a single fid's add (`is_evict=false`) or evict (`is_evict=true`) under FP_SMOOTH_TILE_SURF —
+## called from `step()`'s reap-loop commit block and from `_evict()`. Resets `tier`'s stable-frame counter (a real
+## residency change just happened — the tier must not consolidate mid-change) and either takes the O(1) per-tile
+## delta (already split) or triggers the one-time O(resident) re-split (still consolidated, or empty).
+func _tile_surf_touch(tier: int, fid: int, is_evict: bool) -> void:
+	_tile_surf_stable[tier] = 0
+	if not _tile_surf_active[tier]:
+		_tile_surf_split_tier(tier)
+	elif is_evict:
+		_tile_surf_free_node(fid)
+	else:
+		_tile_surf_set_node(tier, fid)
+	if not is_evict:
+		_tile_surf_commit_count += 1   # telemetry: the per-tile path has genuinely run at least once
+
+## Paced settle: age every currently-split tier by one `step()` call, then fold AT MOST ONE tier that has gone
+## `SMOOTH_TILE_CONSOLIDATE_FRAMES` calls without a touch back into a single merged mesh — pacing so 4 simultaneously
+## eligible tiers don't all re-upload in the same frame.
+func _tile_surf_consolidate_step() -> void:
+	for t in [S2, S3, S4, S5]:
+		if _tile_surf_active[t]:
+			_tile_surf_stable[t] = int(_tile_surf_stable[t]) + 1
+	for t in [S2, S3, S4, S5]:
+		if _tile_surf_active[t] and int(_tile_surf_stable[t]) >= CubeSphere.SMOOTH_TILE_CONSOLIDATE_FRAMES:
+			_tile_surf_consolidate(t)
+			break   # at most one tier consolidated per call
+
+## Fold `tier` back to ONE merged mesh + free every per-tile node — the inverse of `_tile_surf_split_tier`, keeping
+## the SAME invariant (the merged mesh is rebuilt from `_tiles` BEFORE the per-tile nodes are torn down, so there is
+## never a frame drawing neither). Reuses `_rebuild_tier_mesh` verbatim — the ONE whole-tier upload this design
+## amortizes to once per settle instead of once per tile.
+func _tile_surf_consolidate(tier: int) -> void:
+	_rebuild_tier_mesh(tier)
+	for fid in _tile_mi.keys():
+		if int(_tier_of.get(fid, -1)) == tier:
+			var node: MeshInstance3D = _tile_mi[fid]
+			_tile_mi.erase(fid)
+			if node != null and is_instance_valid(node):
+				node.queue_free()
+	_tile_surf_active[tier] = false
+	_tile_surf_stable[tier] = 0
+
+## Telemetry (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md FP_SMOOTH_TILE_SURF): the live per-tile draw-call impact the
+## orchestrator watches alongside fps — `smooth_tile_nodes` too high for too long means the consolidate-at-settle
+## pacing isn't bounding steady-state draw calls the way headless node-count gates (which can't see GPU cost) assume.
+func tile_surf_stats() -> Dictionary:
+	return {
+		"smooth_tile_nodes": _tile_mi.size(),
+		"smooth_tile_surf_path": 1 if _tile_surf_commit_count > 0 else 0,
+	}
 
 # =====================================================================================================================
 # REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — fixed-capacity slotted

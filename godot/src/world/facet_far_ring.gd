@@ -2745,6 +2745,10 @@ func shell_telemetry() -> Dictionary:
 	# ACTIVE (smooth_slot_path=1, not refused-to-fallback) and the per-frame commit cost (smooth_commit_ms) replaced
 	# the O(N²) whole-tier upload spike. Empty dict (0/absent) with the flag off or _smooth unbuilt.
 	var _sms: Dictionary = (_smooth.slot_mesh_stats() if (_smooth != null and _smooth.has_method("slot_mesh_stats")) else {})
+	# FP_SMOOTH_TILE_SURF: per-tile draw-call impact — smooth_tile_nodes is the live draw count from per-tile
+	# MeshInstances during the warmup fill (peaks then settles to ~0 as tiers consolidate); the KEY live signal for
+	# whether the consolidate-at-settle pacing keeps steady-state draws bounded on gl_compat.
+	var _tss: Dictionary = (_smooth.tile_surf_stats() if (_smooth != null and _smooth.has_method("tile_surf_stats")) else {})
 	return {
 		"sh_cam": _cam_set,
 		"smooth_res": (_smooth.resident_count() if _smooth != null else 0),   # FP_FAR_SMOOTH: committed smooth tiles
@@ -2752,6 +2756,8 @@ func shell_telemetry() -> Dictionary:
 		"smooth_commit_ms": float(_sms.get("smooth_commit_ms", 0.0)),         # main-thread ms in slot commits this frame
 		"smooth_upload_kb": float(_sms.get("smooth_upload_kb", 0.0)),         # KB region-written this frame
 		"smooth_commit_defer": int(_sms.get("smooth_commit_defer", 0)),       # whole commit-events still queued (budget deferral)
+		"smooth_tile_nodes": int(_tss.get("smooth_tile_nodes", 0)),           # FP_SMOOTH_TILE_SURF: live per-tile MeshInstance draw count
+		"smooth_tile_surf_path": int(_tss.get("smooth_tile_surf_path", 0)),   # 1=per-tile path has run this session
 		"sh_emit": _emitted.size(),
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,

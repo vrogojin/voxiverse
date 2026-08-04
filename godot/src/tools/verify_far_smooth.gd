@@ -220,6 +220,14 @@ func _initialize() -> void:
 	_gate_slot_nohole()
 	_gate_slot_budget()
 
+	# --- FP_SMOOTH_TILE_SURF (SAFE replacement for FP_SMOOTH_SLOT_MESH — that path's RenderingServer region-write
+	# calls hard-crashed the live web tab; per-tile MeshInstance3D/ArrayMesh nodes + consolidate-at-settle instead) ---
+	_ok(not CubeSphere.FP_SMOOTH_TILE_SURF, "G-TILESURF-OFF: FP_SMOOTH_TILE_SURF defaults false (byte-off; step()/request()/_evict()/force_rebake() all default their new tile_surf_on param to this const)")
+	_gate_tilesurf_cover()
+	_gate_tilesurf_xor()
+	_gate_tilesurf_consolidate()
+	_gate_tilesurf_off()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -3185,4 +3193,194 @@ func _gate_slot_budget() -> void:
 		_simulate_tier_commit_slot(ft2, fid, tier, tile, true)
 	ft2.step(false, false, false, true, per_event_bytes * 4 + 1)
 	_ok((ft2._slot_write_queue as Array).is_empty(), "G-SLOT-BUDGET-FALSIFY: a budget covering all 4 events' bytes applies them ALL in one step() call (0 remaining) — the small-budget deferral above isn't a vacuous fixed per-call cap")
+	parent.free()
+
+# =====================================================================================================================
+# FP_SMOOTH_TILE_SURF (SAFE replacement for FP_SMOOTH_SLOT_MESH — that path's RenderingServer region-write calls
+# HARD-CRASHED the live web tab; see cube_sphere.gd's doc comment). Per-tile phase: each committed tile gets its OWN
+# child MeshInstance3D under `_mi[tier]` (O(1) upload). Consolidate-at-settle: a tier unchanged for
+# SMOOTH_TILE_CONSOLIDATE_FRAMES `step()` calls folds back into ONE merged mesh + frees its per-tile nodes. HEADLESS
+# NOTE (unlike the slot-mesh gates above): this uses ONLY high-level MeshInstance3D/ArrayMesh — node tree membership,
+# surface counts, and `.mesh` assignment are all REAL even on the dummy headless RenderingServer (only actual GPU
+# pixels aren't), so these gates validate node counts, the merged-XOR-per-tile invariant, and consolidation timing
+# directly — not just packing/offset math. Live-only unknown: steady-state fps/draw-call cost of the per-tile phase.
+# =====================================================================================================================
+
+## Mirrors `_simulate_tier_commit`/`_simulate_tier_commit_slot` (the existing direct-poke helpers) but routes the
+## transition through the FP_SMOOTH_TILE_SURF hooks (`_evict(..., true)` + `_tile_surf_touch`) exactly the way
+## `step()`'s own reap loop does — so a gate can inject a tier-swap/first-commit/refresh without waiting on the real
+## WorkerThreadPool build, while still exercising the REAL per-tile-node bookkeeping (not a shortcut around it).
+func _simulate_tier_commit_tile_surf(ft: FacetSmoothTier, fid: int, new_tier: int, tile: Dictionary) -> void:
+	if ft._tiles.has(fid):
+		if int(ft._tier_of[fid]) != new_tier:
+			ft._evict(fid, false, true)   # tile_surf_on path: drops the OLD tier's per-tile node (or triggers its re-split)
+		else:
+			ft._bytes -= FST.tile_bytes(ft._tiles[fid])
+			ft._tiles.erase(fid)
+	var tb := FST.tile_bytes(tile)
+	ft._tiles[fid] = tile
+	ft._tier_of[fid] = new_tier
+	ft._bytes += tb
+	ft._dirty_tier[new_tier] = true
+	ft._tier_change_seq[new_tier] = int(ft._tier_change_seq[new_tier]) + 1
+	ft._changed = true
+	ft._tile_surf_touch(new_tier, fid, false)   # mirrors step()'s reap-loop commit branch under tile_surf_on
+
+## The merged-XOR-per-tile invariant, checked directly against live instance state: `tier` must NEVER be drawing via
+## BOTH its merged `_mi[tier].mesh` (non-empty) AND >=1 per-tile `_tile_mi` node at once (a double-draw / z-fight).
+func _tile_surf_invariant_ok(ft: FacetSmoothTier, tier: int) -> bool:
+	var mi: MeshInstance3D = ft._mi[tier]
+	var merged_nonempty := mi != null and mi.mesh != null and mi.mesh.get_surface_count() > 0
+	var per_tile_count := 0
+	for fid in (ft._tile_mi as Dictionary).keys():
+		if int(ft._tier_of.get(fid, -1)) == tier:
+			per_tile_count += 1
+	return not (merged_nonempty and per_tile_count > 0)
+
+## G-TILESURF-COVER: after committing a set of tiles under the flag, the per-tile node count for that tier == its
+## resident count (every resident tile is drawn exactly once, as a node) — and an evicted fid's node disappears
+## (count drops), never leaking a stale draw.
+func _gate_tilesurf_cover() -> void:
+	print("  --- FP_SMOOTH_TILE_SURF G-TILESURF-COVER: per-tile node count == tier resident count; eviction frees the node ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var tier := FST.S4
+	var cells := FST.cells_for_tier(tier)
+	var fids := []
+	for i in range(5):
+		fids.append(_fid_of(4, 1, i))
+	for fid in fids:
+		var tile := FST.build_tile(fid, cells, 0.0, true, false, -1.0)
+		FST.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+		_simulate_tier_commit_tile_surf(ft, fid, tier, tile)
+
+	var resident_n := 0
+	for fid in fids:
+		if ft.is_resident(fid):
+			resident_n += 1
+	_ok(resident_n == fids.size(), "G-TILESURF-COVER setup: all %d committed tiles are resident (non-vacuous)" % fids.size())
+
+	var node_count := 0
+	for fid in (ft._tile_mi as Dictionary).keys():
+		if int(ft._tier_of.get(fid, -1)) == tier:
+			node_count += 1
+	_ok(node_count == fids.size(), "G-TILESURF-COVER: per-tile node count (%d) == resident count (%d) for tier %d" % [node_count, fids.size(), tier])
+	for fid in fids:
+		_ok((ft._tile_mi as Dictionary).has(fid) and is_instance_valid(ft._tile_mi[fid]), "G-TILESURF-COVER: fid %d has its OWN valid per-tile MeshInstance3D" % fid)
+
+	# --- FALSIFY-by-eviction: drop one fid — its node must be freed and the count must drop by exactly 1 ---
+	var evicted: int = fids[0]
+	ft._evict(evicted, false, true)
+	_ok(not ft.is_resident(evicted), "G-TILESURF-COVER: the evicted fid is no longer resident")
+	_ok(not (ft._tile_mi as Dictionary).has(evicted), "G-TILESURF-COVER: the evicted fid's per-tile node entry is gone from `_tile_mi`")
+	var node_count_after := 0
+	for fid in (ft._tile_mi as Dictionary).keys():
+		if int(ft._tier_of.get(fid, -1)) == tier:
+			node_count_after += 1
+	_ok(node_count_after == fids.size() - 1, "G-TILESURF-COVER: per-tile node count dropped by exactly 1 after the eviction (%d -> %d)" % [fids.size(), node_count_after])
+	parent.free()
+
+## G-TILESURF-XOR: a tier draws its tiles EITHER via the merged mesh XOR via per-tile nodes, never both. Checked
+## live through the whole per-tile-phase-then-committed flow above (never violated by construction), THEN falsified
+## by deliberately forcing both representations non-empty at once — the invariant checker must catch it.
+func _gate_tilesurf_xor() -> void:
+	print("  --- FP_SMOOTH_TILE_SURF G-TILESURF-XOR: merged mesh XOR per-tile nodes, never both (no double-draw) ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var tier := FST.S3
+	var cells := FST.cells_for_tier(tier)
+	var fids := []
+	for i in range(3):
+		fids.append(_fid_of(5, 2, i))
+	for fid in fids:
+		var tile := FST.build_tile(fid, cells, 0.0, true, false, -1.0)
+		FST.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+		_simulate_tier_commit_tile_surf(ft, fid, tier, tile)
+	_ok(ft._tile_surf_active[tier], "G-TILESURF-XOR setup: the tier is in the per-tile (split) phase after 3 fresh commits")
+	_ok(_tile_surf_invariant_ok(ft, tier), "G-TILESURF-XOR: per-tile phase — merged mesh is null/empty, per-tile nodes carry the draw (invariant holds)")
+
+	# Consolidate it (folds to ONE merged mesh + frees the per-tile nodes) and re-check.
+	ft._tile_surf_consolidate(tier)
+	_ok(not ft._tile_surf_active[tier], "G-TILESURF-XOR: consolidation flips the tier out of the split phase")
+	var mi: MeshInstance3D = ft._mi[tier]
+	_ok(mi != null and mi.mesh != null and mi.mesh.get_surface_count() > 0, "G-TILESURF-XOR: the consolidated merged mesh actually carries geometry (non-vacuous)")
+	_ok(_tile_surf_invariant_ok(ft, tier), "G-TILESURF-XOR: consolidated phase — per-tile nodes are gone, merged mesh carries the draw (invariant still holds)")
+
+	# --- FALSIFY: deliberately break the invariant (force BOTH representations non-empty) and prove the checker catches it ---
+	var bad_fid: int = fids[0]
+	ft._tile_surf_set_node(tier, bad_fid)   # re-creates a per-tile node WITHOUT clearing the merged mesh first
+	_ok(not _tile_surf_invariant_ok(ft, tier), "G-TILESURF-XOR-FALSIFY: a deliberately-broken state (merged mesh non-empty AND a per-tile node present) IS flagged by the invariant checker — it has teeth")
+	parent.free()
+
+## G-TILESURF-CONSOLIDATE: a tier stays in the per-tile (split) phase for as long as it keeps getting touched, and
+## only folds to the merged mesh (0 per-tile nodes) once `SMOOTH_TILE_CONSOLIDATE_FRAMES` step() calls pass with NO
+## further add/evict. FALSIFY: one call short of the threshold, it must still be split.
+func _gate_tilesurf_consolidate() -> void:
+	print("  --- FP_SMOOTH_TILE_SURF G-TILESURF-CONSOLIDATE: settle-consolidate folds per-tile nodes back to ONE merged mesh after the stable-frame threshold ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var tier := FST.S5
+	var cells := FST.cells_for_tier(tier)
+	var fids := []
+	for i in range(4):
+		fids.append(_fid_of(2, 3, i))
+	for fid in fids:
+		var tile := FST.build_tile(fid, cells, 0.0, true, false, -1.0)
+		FST.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+		_simulate_tier_commit_tile_surf(ft, fid, tier, tile)
+	_ok(ft._tile_surf_active[tier], "G-TILESURF-CONSOLIDATE setup: the tier starts split (per-tile phase) right after the commits")
+
+	var threshold := int(CubeSphere.SMOOTH_TILE_CONSOLIDATE_FRAMES)
+	# One call short of the threshold: still split (never consolidates early).
+	for i in range(threshold - 1):
+		ft.step(false, false, false, false, CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, true)
+	_ok(ft._tile_surf_active[tier], "G-TILESURF-CONSOLIDATE-FALSIFY: %d calls (one short of the %d-call threshold) — tier is STILL split, not consolidated early" % [threshold - 1, threshold])
+	var still_nodes := 0
+	for fid in fids:
+		if (ft._tile_mi as Dictionary).has(fid):
+			still_nodes += 1
+	_ok(still_nodes == fids.size(), "G-TILESURF-CONSOLIDATE-FALSIFY: all %d per-tile nodes are still present one call short of the threshold" % fids.size())
+
+	# The one more call that crosses the threshold: folds to the merged mesh, frees every per-tile node.
+	ft.step(false, false, false, false, CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, true)
+	_ok(not ft._tile_surf_active[tier], "G-TILESURF-CONSOLIDATE: at the threshold, the tier folds OUT of the split phase")
+	var nodes_after := 0
+	for fid in fids:
+		if (ft._tile_mi as Dictionary).has(fid):
+			nodes_after += 1
+	_ok(nodes_after == 0, "G-TILESURF-CONSOLIDATE: 0 per-tile nodes remain for this tier after consolidation (%d freed)" % fids.size())
+	var mi: MeshInstance3D = ft._mi[tier]
+	_ok(mi != null and mi.mesh != null and mi.mesh.get_surface_count() > 0, "G-TILESURF-CONSOLIDATE: the folded merged mesh carries real geometry (non-vacuous — all %d tiles' worth)" % fids.size())
+	_ok(_tile_surf_invariant_ok(ft, tier), "G-TILESURF-CONSOLIDATE: merged-XOR-per-tile invariant holds post-consolidation")
+	parent.free()
+
+## G-TILESURF-OFF: with the flag off (the shipped default args — no gate ever forces `tile_surf_on` true on these
+## call sites), the per-tile path never runs at all: a normal commit/evict/step() cycle leaves `_tile_mi` completely
+## empty and `tile_surf_stats()` reports the path never fired — byte-identical to the pre-existing behaviour (the
+## OTHER G-FS-*/G-SLOT-* gates above already exercise the legacy/txn/slot paths end-to-end with this flag off).
+func _gate_tilesurf_off() -> void:
+	print("  --- FP_SMOOTH_TILE_SURF G-TILESURF-OFF: flag off => the per-tile path never runs ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var tier := FST.S4
+	var cells := FST.cells_for_tier(tier)
+	var fid_a := _fid_of(3, 4, 5)
+	var fid_b := _fid_of(3, 4, 6)
+	var tile_a := FST.build_tile(fid_a, cells, 0.0, true, false, -1.0)
+	FST.append_skirt(tile_a, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var tile_b := FST.build_tile(fid_b, cells, 0.0, true, false, -1.0)
+	FST.append_skirt(tile_b, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	# Drive the SHIPPED default-args commit path (mirrors `_simulate_tier_commit` — no tile_surf hook engaged).
+	_simulate_tier_commit(ft, fid_a, tier, tile_a)
+	_simulate_tier_commit(ft, fid_b, tier, tile_b)
+	ft._evict(fid_a)   # default args: slot_on/tile_surf_on both default false
+	for i in range(5):
+		ft.step()   # default args: tile_surf_on defaults to CubeSphere.FP_SMOOTH_TILE_SURF (false)
+	_ok((ft._tile_mi as Dictionary).is_empty(), "G-TILESURF-OFF: `_tile_mi` stays completely empty across a real commit/evict/step() cycle with the flag off")
+	_ok(int(ft.tile_surf_stats()["smooth_tile_nodes"]) == 0, "G-TILESURF-OFF: tile_surf_stats() reports 0 per-tile nodes")
+	_ok(int(ft.tile_surf_stats()["smooth_tile_surf_path"]) == 0, "G-TILESURF-OFF: tile_surf_stats() reports the per-tile path never fired")
 	parent.free()

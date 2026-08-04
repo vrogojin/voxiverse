@@ -702,6 +702,46 @@ var _main_concat_count := 0    # G-FS-TXN-THREAD telemetry: `_rebuild_tier_mesh`
 var _worker_concat_count := 0  # G-FS-TXN-THREAD telemetry: `_concat_tier_worker` (off-thread concat) calls
 var _txn_apply_count := 0      # G-FS-NOHOLE telemetry: atomic (possibly multi-tier) mesh applies committed
 
+# =====================================================================================================================
+# REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — per-tier fixed-capacity
+# slotted mesh + GPU region-write commits. Supersedes `_rebuild_tier_mesh`/`_step_tier_txn` (both kept, byte-
+# identical, for the flag-off / refused path) as the tier-mesh COMMIT mechanism; `_tiles`/`_tier_of`/`_bytes`
+# (CPU-side residency bookkeeping) is completely unaffected — only HOW a tier's `mi.mesh` gets updated changes.
+# =====================================================================================================================
+var _slot_mesh_failed := false          # MANDATORY refusal latch (per-instance, sticky for the rest of the session)
+var _slot_cap_built: Array = [false, false, false, false]      # per-tier: has its fixed-capacity ArrayMesh been built
+var _slot_of: Array = [{}, {}, {}, {}]                          # per-tier Dictionary: fid -> assigned slot index
+var _slot_free: Array = [[], [], [], []]                        # per-tier Array[int]: free slot indices
+var _slot_verts_per_tile: Array = [0, 0, 0, 0]                  # per-tier: vertices in ONE tile (incl. skirt)
+# The engine's "vertex_data" surface buffer is STRUCT-OF-ARRAYS, not one interleaved per-vertex stride: ALL
+# positions come first (`total_verts * pos_stride` bytes), THEN all normal+tangent data (`total_verts * nt_stride`
+# bytes) — confirmed in the engine source (`mesh_surface_make_offsets_from_format`,
+# `servers/rendering_server.cpp:1146-1153`: the `+= r_vertex_element_size * p_vertex_len` offset bump applies ONLY
+# to ARRAY_NORMAL/ARRAY_TANGENT). A slot's region write therefore needs TWO separate
+# `mesh_surface_update_vertex_region` calls (position sub-block + normal/tangent sub-block) at DIFFERENT base
+# offsets, each scaled by the CAPACITY surface's TOTAL vertex count (`_slot_total_verts`), never one combined
+# "vertex stride". The "attribute_data" buffer (COLOR/TEX_UV/TEX_UV2), by contrast, genuinely IS one interleaved
+# per-vertex stride (confirmed the same way — COLOR/TEX_UV/TEX_UV2 write cases index `i * p_attrib_stride` with no
+# such vertex_len-scaled offset bump) — `_slot_attr_stride` + one `mesh_surface_update_attribute_region` call stays
+# correct as a single region write.
+var _slot_pos_stride: Array = [0, 0, 0, 0]                      # per-tier: bytes/vertex in the POSITION sub-block
+var _slot_nt_stride: Array = [0, 0, 0, 0]                       # per-tier: bytes/vertex in the NORMAL+TANGENT sub-block
+var _slot_attr_stride: Array = [0, 0, 0, 0]                     # per-tier: bytes/vertex in the (interleaved) attribute_data stream
+var _slot_total_verts: Array = [0, 0, 0, 0]                     # per-tier: cap * verts_per_tile (the position sub-block's own length in vertices — needed to find the normal/tangent sub-block's base offset)
+var _slot_format: Array = [0, 0, 0, 0]                          # per-tier: the packed ArrayFormat bitmask
+var _slot_degenerate_pos: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_degenerate_nt: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_degenerate_attr: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_cur_event: Array = []         # writes accumulated for the fid CURRENTLY being processed (evict+commit) —
+                                         # flushed as ONE atomic event by `_slot_flush_event` (LAW T: old-slot-zero +
+                                         # new-slot-write of the SAME promote always travel together)
+var _slot_write_queue: Array = []       # Array[Array[Dictionary]]: queued whole commit-events awaiting GPU write,
+                                         # drained in order by `_slot_drain` under the per-frame byte budget
+var _slot_commit_ms := 0.0              # telemetry: main-thread ms spent packing+region-writing THIS step() call
+var _slot_upload_bytes := 0             # telemetry: bytes region-written THIS step() call
+var _slot_upload_total_bytes := 0       # telemetry: cumulative bytes region-written this session
+var _slot_commit_defer := 0             # telemetry: whole commit-events still queued after THIS step() call
+
 ## Create one MeshInstance3D per ladder tier (S2/S3/S4/S5) under `parent` (inherits the ring's placement transform),
 ## sharing `material`; prewarm the worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one
 ## profile_at_dir) so `build_tile`/`build_tile_rim` are worker-safe. An empty tier's MeshInstance3D carries a
@@ -764,7 +804,7 @@ const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
 ## MESH_INC-off break-before-make): that facet's own imminent re-commit (once its new-tier build lands) already
 ## fires the SAME check with the FINAL, correct new pitch (`step()`'s post-commit hook) — checking here too would
 ## use the transiently-wrong "not resident yet" pitch and could bounce a neighbour's refresh twice for no reason.
-func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH) -> void:
+func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
 	var w := {}
 	for fid in assignments.keys():
 		w[int(fid)] = int(assignments[fid])
@@ -794,15 +834,17 @@ func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSph
 	for fid in _tiles.keys():
 		var f := int(fid)
 		if not _want.has(f):
-			_evict(f)
+			_evict(f, slot_on)
+			_slot_flush_event()   # REVISION 7: this fid is gone for good — its (possible) slot-zero-blit is its own whole event
 			if weld_refresh_on:
 				_weld_refresh_neighbours(f)   # REVISION 3 T3: gone for good — its neighbours' frozen plans can finalize now
 		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
-			_evict(f)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
+			_evict(f, slot_on)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
+			_slot_flush_event()
 	if idle_on:
 		_settled = false   # REVISION 3 Q1: the assignment actually changed — step() must scan again next call
 
-func _evict(fid: int) -> void:
+func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
 	var t: int = int(_tier_of[fid])
 	_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])
 	_tiles.erase(fid)
@@ -811,6 +853,11 @@ func _evict(fid: int) -> void:
 	_built_snap.erase(fid)
 	_rim_env_pos.erase(fid)     # REVISION 5 Stage D (FP_RIM_CHEAP): the crescent cache dies with the tile it was
 	_rim_col_baked.erase(fid)   # baked for — the NEXT bake (evict-then-rebuild) starts fresh, exactly like today.
+	if slot_on and not _slot_mesh_failed:
+		# REVISION 7: free `fid`'s slot (if it had one) and stage a degenerate-blit for it — the caller flushes this
+		# as its own event (a standalone eviction) or bundles it with an accompanying new-tier commit (a promote),
+		# via `_slot_flush_event` called once the WHOLE transition for this fid is known.
+		_slot_free_fid(t, fid)
 	_dirty_tier[t] = true
 	_tier_change_seq[t] = int(_tier_change_seq[t]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
 	_changed = true
@@ -823,9 +870,10 @@ func _evict(fid: int) -> void:
 ## fresh tile re-commits — never a frame with neither. No-op if `fid` isn't currently resident.
 ## SHIPPED (legacy) rebake path — kept for FP_SMOOTH_MESH_INC-off callers (byte-identical). REVISION 2 LAW R-D/R-B
 ## (FP_SMOOTH_MESH_INC on) callers use `request_refresh` instead (below), which never evicts the collar at all.
-func force_rebake(fid: int) -> void:
+func force_rebake(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH) -> void:
 	if _tiles.has(int(fid)):
-		_evict(int(fid))
+		_evict(int(fid), slot_on)
+		_slot_flush_event()
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC): request an IN-PLACE rebuild of
 ## an already-resident tile at its CURRENT tier — never evicts. `_next_want`/`step()` dispatch a fresh build for
@@ -888,7 +936,7 @@ func _weld_refresh_neighbours(fid: int) -> void:
 ## (b) ORs into the `_next_want` refresh-dispatch gate (`refresh_dispatch_on`) so a queued `request_refresh` actually
 ## dispatches even with `FP_SMOOTH_MESH_INC` off — REVISION 2's rim rebake and T3's weld reweld share the SAME
 ## in-place-rebuild primitive (`_refresh`/`request_refresh`), gated by whichever feature needs it.
-func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH) -> void:
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES) -> void:
 	if _sn == 0:
 		return
 	if idle_on and _settled:
@@ -919,7 +967,7 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 			var prev_tier := int(_tier_of.get(fid, -1))   # REVISION 3 T3: captured BEFORE any evict/erase below mutates it
 			if was_resident:
 				if prev_tier != tier:
-					_evict(fid)                       # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
+					_evict(fid, slot_on)               # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
 				else:
 					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
 					_tiles.erase(fid)
@@ -954,6 +1002,12 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 					# in-place refresh (was_resident and prev_tier == tier) presents the SAME pitch, so neighbours
 					# stay correctly welded already — nothing to recheck there.
 					_weld_refresh_neighbours(fid)
+				if slot_on and not _slot_mesh_failed:
+					# REVISION 7: stage this fid's new-slot write — bundled with the tier-change evict's slot-zero (staged
+					# above, same `_slot_cur_event`) into ONE atomic event by the flush just below. Runs regardless of
+					# `weld_refresh_on` (that block above is an independent, orthogonal concern).
+					_slot_commit_fid(tier, fid, tile)
+		_slot_flush_event()   # REVISION 7: flush whatever this fid's full transition staged (evict, commit, both, or nothing)
 		_s_fid[i] = -1
 		_s_task[i] = -1
 	for i in range(_sn):
@@ -977,7 +1031,14 @@ func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_T
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	if txn_on:
+	if slot_on and not _slot_mesh_failed:
+		# REVISION 7 (FP_SMOOTH_SLOT_MESH): drain the queued whole commit-events under the byte budget — supersedes
+		# BOTH the T1 transaction and the legacy loop below (kept, byte-identical, for the off/refused path). A
+		# refusal raised INSIDE this same call's reap loop above (`_slot_commit_fid`/`_ensure_slot_capacity` failing
+		# mid-way) already re-marked every tier dirty (`_slot_refuse_resync`) and cleared the queue, so the `slot_on
+		# and not _slot_mesh_failed` re-check here correctly falls through to the legacy/txn path THIS SAME CALL.
+		_slot_drain(budget_bytes)
+	elif txn_on:
 		# REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): off-thread, ALL-dirty-tiers-together transactional commit — supersedes
 		# the ≤1-tier/frame main-thread loop below (kept, byte-identical, for the flag-off path).
 		_step_tier_txn()
@@ -1228,6 +1289,345 @@ func _apply_tier_mesh(tier: int, result: Dictionary) -> void:
 	for fid in _tier_snapshot_fids[tier]:
 		committed[int(fid)] = true
 	_committed_fids[tier] = committed
+
+# =====================================================================================================================
+# REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — fixed-capacity slotted
+# tier mesh + GPU region-write commits. See the instance-var block above (near `_txn_apply_count`) for the state
+# this section owns. Every function here is only ever CALLED under `slot_on and not _slot_mesh_failed` (checked by
+# the caller — `_evict`/`step()`), so internal `CubeSphere.FP_SMOOTH_SLOT_MESH` re-checks are unnecessary; the
+# refusal latch `_slot_mesh_failed` itself IS checked internally (a refusal can be raised mid-sequence here).
+# =====================================================================================================================
+
+## Pack ONE tile's arrays into the engine's own GPU vertex format via a THROWAWAY `ArrayMesh` + `RenderingServer.
+## mesh_get_surface` readback. `RenderingServer.mesh_create_surface_data_from_arrays` (the actual C++ packer) is not
+## itself script-bound (it takes a `SurfaceData*` out-param), but `ArrayMesh.add_surface_from_arrays` calls exactly
+## that function internally (`mesh_add_surface_from_arrays` → `mesh_create_surface_data_from_arrays` →
+## `mesh_add_surface`, `servers/rendering_server.cpp:1377-1384`) before storing the result, so reading it back via
+## `mesh_get_surface` yields BIT-IDENTICAL packed bytes — this is the engine-is-the-packer contract, never a hand-
+## rolled vertex format. `flags=0` (the `add_surface_from_arrays` 5th arg, `compress_format`) keeps positions
+## absolute f32 (no AABB-relative quantization), which is mandatory: a compressed tile's bytes would be relative to
+## THAT tile's own tiny bounding box and non-transplantable into a capacity surface sized for the WHOLE planet.
+## Returns `{}` if the pack failed for any reason (should not happen with valid tile arrays; the caller treats an
+## empty/keyless result as a refusal trigger, never a silent no-op).
+static func _pack_tile_bytes(tile: Dictionary) -> Dictionary:
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = tile["pos"]
+	arr[Mesh.ARRAY_NORMAL] = tile["nrm"]
+	arr[Mesh.ARRAY_COLOR] = tile["col"]
+	arr[Mesh.ARRAY_TEX_UV] = tile["uv"]
+	arr[Mesh.ARRAY_TEX_UV2] = tile["uv2"]
+	arr[Mesh.ARRAY_INDEX] = tile["idx"]
+	var packer := ArrayMesh.new()
+	packer.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, 0)
+	if packer.get_surface_count() == 0:
+		return {}
+	return RenderingServer.mesh_get_surface(packer.get_rid(), 0)
+
+## Force every tier dirty and drop all queued/in-flight slot-mesh state — called the instant `_slot_mesh_failed`
+## latches. `_tiles`/`_tier_of` (CPU residency bookkeeping) is untouched by any slot-mesh failure, so the next
+## `step()` call's legacy/T1 branch (`_rebuild_tier_mesh`/`_step_tier_txn`, both byte-identical, unconditionally
+## available) reconstructs each tier's `mi.mesh` correctly FROM SCRATCH — a full resync, never a corrupt draw.
+func _slot_refuse_resync() -> void:
+	for t in [S2, S3, S4, S5]:
+		_dirty_tier[t] = true
+	_slot_write_queue = []
+	_slot_cur_event = []
+	_settled = false
+
+## Lazily build tier `tier`'s fixed-capacity ArrayMesh — ONCE, the first time this tier actually needs to host a
+## slot-mesh commit (mirrors the shipped "S2 stays a 0-surface mesh until FP_SMOOTH_RIM assigns it" NEVER-OOM
+## discipline — a tier nobody ever commits into never gets a capacity surface at all). `ref_tile` is the tile
+## Dictionary CURRENTLY being committed (real production data, not a synthetic probe): every tile of a tier shares
+## IDENTICAL topology (same `cells` ⇒ same vertex count + index pattern, REVISION 7's enabling property), so this
+## first real tile doubles as both the CAPACITY-SIZING reference and the FORMAT/STRIDE self-check reference — no
+## separate throwaway build needed. Returns false (and latches `_slot_mesh_failed`) on ANY of: a missing
+## RenderingServer method, a malformed/undersized reference tile, a packed-size mismatch against the format's own
+## stride math, or the capacity surface's own format disagreeing with the reference pack.
+func _ensure_slot_capacity(tier: int, ref_tile: Dictionary) -> bool:
+	if _slot_mesh_failed:
+		return false
+	if _slot_cap_built[tier]:
+		return true
+	if not (RenderingServer.has_method("mesh_surface_update_vertex_region")
+			and RenderingServer.has_method("mesh_surface_update_attribute_region")
+			and RenderingServer.has_method("mesh_get_surface")
+			and RenderingServer.has_method("mesh_surface_get_format_vertex_stride")
+			and RenderingServer.has_method("mesh_surface_get_format_normal_tangent_stride")
+			and RenderingServer.has_method("mesh_surface_get_format_attribute_stride")):
+		_slot_mesh_failed = true   # refusal latch: this engine build doesn't expose the region-update API at all
+		_slot_refuse_resync()
+		return false
+	var cap := FacetSmoothTier.residency_for_tier(tier)
+	if cap <= 0:
+		return false   # tier genuinely unused this session (e.g. S2 without FP_SMOOTH_RIM) — not a failure, nothing to build
+
+	var ref_pos: PackedVector3Array = ref_tile.get("pos", PackedVector3Array())
+	var ref_idx: PackedInt32Array = ref_tile.get("idx", PackedInt32Array())
+	var verts_per_tile := ref_pos.size()
+	if verts_per_tile <= 0 or ref_idx.size() <= 0:
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	var sd := FacetSmoothTier._pack_tile_bytes(ref_tile)
+	if not sd.has("vertex_data") or not sd.has("format"):
+		_slot_mesh_failed = true   # refusal latch: the engine packer didn't return the expected keys
+		_slot_refuse_resync()
+		return false
+	var format: int = int(sd["format"])
+	var vcount: int = int(sd.get("vertex_count", verts_per_tile))
+	# `mesh_surface_get_format_vertex_stride`/`_normal_tangent_stride` are the PER-SUB-BLOCK strides — the
+	# "vertex_data" buffer is struct-of-arrays (see the instance-var block's note above), NOT one interleaved
+	# per-vertex row, so these stay SEPARATE (never summed). `mesh_surface_get_format_attribute_stride`
+	# (COLOR+UV+UV2+CUSTOM) IS the complete interleaved attribute_data per-vertex stride.
+	var pstride := int(RenderingServer.mesh_surface_get_format_vertex_stride(format, vcount))
+	var ntstride := int(RenderingServer.mesh_surface_get_format_normal_tangent_stride(format, vcount))
+	var astride := int(RenderingServer.mesh_surface_get_format_attribute_stride(format, vcount))
+	var vtx_bytes: PackedByteArray = sd["vertex_data"]
+	var attr_bytes: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	# FIRST-COMMIT SELF-CHECK (REVISION 7 design step 3): the packed byte length must equal
+	# verts×(pos_stride+nt_stride) EXACTLY — any mismatch means this build's vertex format doesn't match what the
+	# region-write offset math below assumes.
+	if vcount != verts_per_tile or pstride <= 0 or vtx_bytes.size() != verts_per_tile * (pstride + ntstride) \
+			or (astride > 0 and attr_bytes.size() != verts_per_tile * astride):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	# Build the capacity arrays ONCE: `cap` uniform slots, zeroed pos/nrm/col/uv/uv2 (an all-zero-position tri is
+	# degenerate — zero area, at the planet centre, rasterizes nothing), an IMMUTABLE index buffer (`cap` copies of
+	# the reference tile's own index pattern, each pre-offset by `slot * verts_per_tile`).
+	var total_verts := cap * verts_per_tile
+	var P := PackedVector3Array(); P.resize(total_verts)
+	var N := PackedVector3Array(); N.resize(total_verts)
+	var C := PackedColorArray(); C.resize(total_verts)
+	var U := PackedVector2Array(); U.resize(total_verts)
+	var U2 := PackedVector2Array(); U2.resize(total_verts)
+	var I := PackedInt32Array(); I.resize(cap * ref_idx.size())
+	var ii := 0
+	for slot in range(cap):
+		var base := slot * verts_per_tile
+		for k in range(ref_idx.size()):
+			I[ii] = base + int(ref_idx[k])
+			ii += 1
+	var cap_mesh := ArrayMesh.new()
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = P
+	arr[Mesh.ARRAY_NORMAL] = N
+	arr[Mesh.ARRAY_COLOR] = C
+	arr[Mesh.ARRAY_TEX_UV] = U
+	arr[Mesh.ARRAY_TEX_UV2] = U2
+	arr[Mesh.ARRAY_INDEX] = I
+	cap_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, 0)
+	if _material != null:
+		cap_mesh.surface_set_material(0, _material)
+	var r := FacetAtlas.R_BLOCKS
+	var mi: MeshInstance3D = _mi[tier]
+	mi.mesh = cap_mesh
+	# The auto-AABB of an all-zero-position mesh would cull it outright — set an explicit planet-sized bound
+	# (mirrors the design's "set mi.custom_aabb to the planet bound" step).
+	mi.custom_aabb = AABB(Vector3(-r, -r, -r) * 1.05, Vector3.ONE * (r * 2.1))
+
+	# Defensive re-check: the capacity surface's OWN packed format (same array set, same flags=0) must equal the
+	# reference tile's format — should be true by construction, guards against an unforeseen engine-side surprise.
+	var cap_sd: Dictionary = RenderingServer.mesh_get_surface(cap_mesh.get_rid(), 0)
+	if int(cap_sd.get("format", -1)) != format:
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	_slot_verts_per_tile[tier] = verts_per_tile
+	_slot_pos_stride[tier] = pstride
+	_slot_nt_stride[tier] = ntstride
+	_slot_attr_stride[tier] = astride
+	_slot_total_verts[tier] = total_verts
+	_slot_format[tier] = format
+	var dpos := PackedByteArray(); dpos.resize(verts_per_tile * pstride)     # all-zero — the precomputed eviction blobs
+	var dnt := PackedByteArray()
+	if ntstride > 0:
+		dnt.resize(verts_per_tile * ntstride)
+	var dattr := PackedByteArray()
+	if astride > 0:
+		dattr.resize(verts_per_tile * astride)
+	_slot_degenerate_pos[tier] = dpos
+	_slot_degenerate_nt[tier] = dnt
+	_slot_degenerate_attr[tier] = dattr
+	var free_list := []
+	for slot in range(cap):
+		free_list.append(slot)
+	_slot_free[tier] = free_list
+	_slot_of[tier] = {}
+	_slot_cap_built[tier] = true
+	return true
+
+## Free `fid`'s slot in tier `tier` (if it has one) back onto the free-list and stage a degenerate-blit write for
+## it. Called from `_evict()` only. A no-op if this tier's capacity mesh was never built or `fid` never held a slot
+## there (e.g. it was never actually committed through the slot path before this eviction — nothing to free).
+func _slot_free_fid(tier: int, fid: int) -> void:
+	if not _slot_cap_built[tier]:
+		return
+	var slots: Dictionary = _slot_of[tier]
+	if not slots.has(fid):
+		return
+	var slot: int = int(slots[fid])
+	slots.erase(fid)
+	(_slot_free[tier] as Array).append(slot)
+	_slot_cur_event.append({"tier": tier, "slot": slot, "fid": fid, "degenerate": true})
+
+## Commit `fid`'s freshly-built `tile` into tier `tier`'s slot mesh: lazily build the capacity surface if this is
+## the first commit into this tier this session, reuse `fid`'s EXISTING slot if it already has one (an in-place
+## same-tier refresh — no free-list churn), else allocate a fresh slot (latching to refusal if the free-list is
+## unexpectedly empty — a NEVER-OOM safety net against residency exceeding the pre-sized cap), pack the tile's
+## bytes via the engine, validate the packed size against this tier's known stride (every commit, not merely the
+## very first — a cheap size compare, strictly more defensive than the design's stated minimum), and stage the
+## write. Staged, not applied — `_slot_flush_event`/`_slot_drain` apply it under the byte budget.
+func _slot_commit_fid(tier: int, fid: int, tile: Dictionary) -> void:
+	if _slot_mesh_failed:
+		return
+	if not _slot_cap_built[tier]:
+		if not _ensure_slot_capacity(tier, tile):
+			return   # `_ensure_slot_capacity` already latched `_slot_mesh_failed` on a genuine refusal (cap<=0 is not one)
+	var slots: Dictionary = _slot_of[tier]
+	var slot: int
+	if slots.has(fid):
+		slot = int(slots[fid])           # in-place refresh: same tier, same slot, fresh bytes
+	else:
+		var free_list: Array = _slot_free[tier]
+		if free_list.is_empty():
+			_slot_mesh_failed = true      # safety net: residency exceeded the pre-sized cap — refuse, never corrupt a slot
+			_slot_refuse_resync()
+			return
+		slot = int(free_list.pop_back())
+		slots[fid] = slot
+	var sd := FacetSmoothTier._pack_tile_bytes(tile)
+	if not sd.has("vertex_data"):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return
+	var vtx: PackedByteArray = sd["vertex_data"]
+	var attr: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	var vpt := int(_slot_verts_per_tile[tier])
+	var pstride := int(_slot_pos_stride[tier])
+	var ntstride := int(_slot_nt_stride[tier])
+	var astride := int(_slot_attr_stride[tier])
+	# SELF-CHECK (every commit): this tile's packed size disagrees with the tier's established strides — the
+	# region-write offset math below would be wrong. Refuse rather than blit a misaligned/truncated region.
+	if vtx.size() != vpt * (pstride + ntstride) or (astride > 0 and attr.size() != vpt * astride):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return
+	# Split "vertex_data" into its two struct-of-arrays sub-blocks (position, then normal+tangent — see the
+	# instance-var block's note) BEFORE staging, so `_apply_slot_write` only ever does a plain byte blit at a
+	# precomputed offset, never its own slicing.
+	var vtx_pos := vtx.slice(0, vpt * pstride)
+	var vtx_nt := vtx.slice(vpt * pstride, vpt * (pstride + ntstride))
+	_slot_cur_event.append({"tier": tier, "slot": slot, "fid": fid, "vtx_pos": vtx_pos, "vtx_nt": vtx_nt, "attr": attr})
+
+## Flush whatever `_slot_cur_event` accumulated for the fid just fully processed (an eviction, a commit, or — for a
+## tier-change promote — both, staged together by `_evict` then `_slot_commit_fid` within the SAME reap-loop
+## iteration) as ONE atomic whole event onto the drain queue. A no-op if nothing was staged (the flag is off, the
+## fid's transition didn't touch the slot path, or a refusal already cleared it via `_slot_refuse_resync`).
+func _slot_flush_event() -> void:
+	if _slot_cur_event.is_empty():
+		return
+	_slot_write_queue.append(_slot_cur_event)
+	_slot_cur_event = []
+
+## Apply queued whole commit-events (never a partial tile) up to `budget_bytes` of region-writes this call,
+## deferring the rest — in order, whole events only (LAW T: a promote's old-slot-zero + new-slot-write always
+## land in the SAME applied event). The FIRST event of a call always applies regardless of size (forward-progress
+## guarantee — an oversized single event must never queue forever); only the 2nd+ event in the SAME call is subject
+## to the budget check. Clears every tier's `_dirty_tier` bit once the queue is fully drained (safe: a fresh
+## refusal always re-marks all four via `_slot_refuse_resync`, so this never masks a legitimate legacy-resync need).
+func _slot_drain(budget_bytes: int) -> void:
+	_slot_commit_ms = 0.0
+	_slot_upload_bytes = 0
+	if _slot_write_queue.is_empty():
+		_slot_commit_defer = 0
+		return
+	var t0 := Time.get_ticks_usec()
+	var applied_any := false
+	var used := 0
+	while not _slot_write_queue.is_empty():
+		var event: Array = _slot_write_queue[0]
+		var event_bytes := 0
+		for w in event:
+			var d: Dictionary = w
+			var tier: int = int(d["tier"])
+			if bool(d.get("degenerate", false)):
+				event_bytes += (_slot_degenerate_pos[tier] as PackedByteArray).size() + (_slot_degenerate_nt[tier] as PackedByteArray).size() + (_slot_degenerate_attr[tier] as PackedByteArray).size()
+			else:
+				event_bytes += (d["vtx_pos"] as PackedByteArray).size() + (d["vtx_nt"] as PackedByteArray).size() + (d["attr"] as PackedByteArray).size()
+		if applied_any and used + event_bytes > budget_bytes:
+			break   # G-SLOT-BUDGET: the whole remaining event(s) defer to a later step() — never a partial tile
+		_slot_write_queue.pop_front()
+		for w in event:
+			_apply_slot_write(w)
+		used += event_bytes
+		applied_any = true
+	_slot_upload_bytes = used
+	_slot_upload_total_bytes += used
+	_slot_commit_defer = _slot_write_queue.size()
+	if _slot_write_queue.is_empty():
+		for t in [S2, S3, S4, S5]:
+			_dirty_tier[t] = false
+	_slot_commit_ms = (Time.get_ticks_usec() - t0) / 1000.0
+
+## The actual GPU region write(s) for one staged descriptor. THREE `RenderingServer` calls per slot: the position
+## sub-block and the normal+tangent sub-block are two DISJOINT ranges within the same "vertex_data" buffer (struct-
+## of-arrays — see the instance-var block's note), each its own `mesh_surface_update_vertex_region` call at
+## `slot * verts_per_tile * sub_stride` offset BY its own sub-block's base (`0` for position, `total_verts *
+## pos_stride` for normal+tangent); the interleaved "attribute_data" buffer stays a single
+## `mesh_surface_update_attribute_region` call at `slot * verts_per_tile * attr_stride`. All three are a plain
+## `glBufferSubData` on GLES3/compat (verified in this engine build,
+## `drivers/gles3/storage/mesh_storage.cpp:536-564`). Also keeps `_committed_fids[tier]` accurate under the slot
+## path (mirrors the legacy/T1 commit hooks) so the existing G-FS-NOHOLE gate machinery (hole = found in 0 tiers,
+## z-fight = found in ≥2) works unchanged. NOTE (headless): the dummy RenderingServer's
+## `mesh_surface_update_vertex_region`/`_attribute_region` are no-ops (`drivers/.../dummy/storage/mesh_storage.h` —
+## no GPU, nothing to write to) — this call is therefore unverifiable headless; only a live tab can confirm the
+## bytes actually landed and rendered (see the report's live-verify note).
+func _apply_slot_write(w: Dictionary) -> void:
+	var tier: int = int(w["tier"])
+	var slot: int = int(w["slot"])
+	var fid: int = int(w["fid"])
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null or mi.mesh == null:
+		return
+	var rid := mi.mesh.get_rid()
+	var vpt := int(_slot_verts_per_tile[tier])
+	var pstride := int(_slot_pos_stride[tier])
+	var ntstride := int(_slot_nt_stride[tier])
+	var astride := int(_slot_attr_stride[tier])
+	var total_verts := int(_slot_total_verts[tier])
+	var degenerate: bool = bool(w.get("degenerate", false))
+	var vtx_pos: PackedByteArray = _slot_degenerate_pos[tier] if degenerate else w["vtx_pos"]
+	var vtx_nt: PackedByteArray = _slot_degenerate_nt[tier] if degenerate else w["vtx_nt"]
+	var attr: PackedByteArray = _slot_degenerate_attr[tier] if degenerate else w["attr"]
+	RenderingServer.mesh_surface_update_vertex_region(rid, 0, slot * vpt * pstride, vtx_pos)
+	if ntstride > 0 and vtx_nt.size() > 0:
+		RenderingServer.mesh_surface_update_vertex_region(rid, 0, total_verts * pstride + slot * vpt * ntstride, vtx_nt)
+	if astride > 0 and attr.size() > 0:
+		RenderingServer.mesh_surface_update_attribute_region(rid, 0, slot * vpt * astride, attr)
+	var committed: Dictionary = _committed_fids[tier]
+	if degenerate:
+		committed.erase(fid)
+	else:
+		committed[fid] = true
+
+## Live telemetry (REVISION 7 §R7.3): main-thread ms spent packing+region-writing THIS step() call, KB written THIS
+## call, cumulative KB written this session, whole commit-events still queued after THIS call, and 1/0 for whether
+## the slot path is actually active (vs. off or refused-to-fallback). The ring/remote_bridge should merge these into
+## the smooth telemetry it already emits (see the report for the exact field names expected in telemetry.jsonl).
+func slot_mesh_stats() -> Dictionary:
+	return {
+		"smooth_commit_ms": _slot_commit_ms,
+		"smooth_upload_kb": _slot_upload_bytes / 1024.0,
+		"smooth_upload_total_kb": _slot_upload_total_bytes / 1024.0,
+		"smooth_commit_defer": _slot_commit_defer,
+		"smooth_slot_path": 1 if (CubeSphere.FP_SMOOTH_SLOT_MESH and not _slot_mesh_failed) else 0,
+	}
 
 func resident_count() -> int:
 	return _tiles.size()

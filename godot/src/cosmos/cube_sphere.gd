@@ -979,6 +979,34 @@ const FP_RIM_NEAR_WELD := false
 const RIM_WELD_BAND := 16.0    ## blocks: the ramp width just inside r_near over which env−sink → block-top (zone B ramp)
 const RIM_WELD_EPS := 1.0      ## blocks: the block-top is dropped this far so the rim never protrudes above near (near wins the coplanar tie); G-RIM-WELD-BOUND may raise it up to 2.0
 
+## FP_SMOOTH_SLOT_MESH — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 7: kills the residual O(N²) warmup hitch —
+## the shipped commit (`FacetSmoothTier._rebuild_tier_mesh` / `_apply_tier_mesh`) re-packs and re-uploads the
+## ENTIRE tier's ArrayMesh on EVERY single tile commit (a full S2 tier ≈ 8 MB re-uploaded once per new tile it
+## gains), so a fill of N tiles uploads O(N²) bytes total (measured: ~150–300 MB over a 23 s warmup fill where
+## ~16 MB is necessary). The fix: since every tile of a tier shares IDENTICAL topology, each tier gets ONE
+## pre-allocated fixed-capacity ArrayMesh (`residency_cap` uniform slots, an IMMUTABLE index buffer built once), and
+## a commit becomes a byte-region write into that fid's slot — `RenderingServer.mesh_surface_update_vertex_region`/
+## `_attribute_region`, a plain `glBufferSubData` (verified in this engine build,
+## `drivers/gles3/storage/mesh_storage.cpp:536-564`). A tile's bytes are packed by the ENGINE itself (a throwaway
+## `ArrayMesh.add_surface_from_arrays` + `RenderingServer.mesh_get_surface` readback — `mesh_create_surface_data_
+## from_arrays` is the real packer underneath but isn't itself script-bound, so this readback is the script-level
+## equivalent, byte-identical since `ArrayMesh.add_surface_from_arrays` calls the very same C++ function) — never a
+## hand-rolled vertex format. Eviction blits a precomputed degenerate (all-zero) blob into the freed slot instead of
+## rebuilding anything. MANDATORY refusal latch (`FacetSmoothTier._slot_mesh_failed`): a missing RenderingServer
+## method, a packed-size/format mismatch against the capacity surface, or an exhausted per-tier slot free-list
+## latches this instance to the shipped whole-tier path (`_rebuild_tier_mesh`/`_step_tier_txn`, both kept verbatim)
+## for the rest of the session — never a corrupt draw. Off ⇒ every new code path in `facet_smooth_tier.gd` is
+## unreached (`step()`/`request()`/`_evict()`/`force_rebake()` all default their new `slot_on` param to this const,
+## mirroring the existing `idle_on`/`txn_on`/`weld_refresh_on` pattern so gates can force it per-call without
+## sed-toggling) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-SLOT-EQ, G-SLOT-NOHOLE, G-SLOT-BUDGET).
+const FP_SMOOTH_SLOT_MESH := false
+## Main-thread slot-write commit budget (bytes/`step()` call) once `FP_SMOOTH_SLOT_MESH` is on —
+## `FacetSmoothTier._slot_drain` applies queued whole commit-events (an event is one fid's full old-slot-zero +
+## new-slot-write transition — LAW T, never split) up to this many bytes, deferring the rest to later calls. ~2 MB
+## covers an 8-worker-slot S2 burst (≈4 MB) in 2 frames per the design's acceptance figure. `step()`'s `budget_bytes`
+## param defaults to this const so a gate can force a tiny budget to deterministically exercise the deferral path.
+const SMOOTH_COMMIT_BUDGET_BYTES := 2 * 1024 * 1024
+
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (R5.3 §7.1, FP_RIM_CHEAP): the S2 near-collar's warmup
 ## cost fix. Live: `FacetSmoothTier.build_tile_rim` → `_env_weld_grid(fid, 104)` at the shipped ENV_FINE_MULT(4) ≈
 ## 417² ≈ 174k `profile_at_dir` samples/facet on a worker — the confirmed warmup allocator-convoy source (a

@@ -207,6 +207,19 @@ func _initialize() -> void:
 	_ok(not CubeSphere.FP_RIM_NEAR_WELD, "G-RNW-OFF: FP_RIM_NEAR_WELD defaults false (byte-off; build_tile_rim takes the shipped env−sink law — the other G-RIM-* gates exercise it)")
 	_gate_rim_near_weld(fid_int)
 
+	# --- REVISION 7 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") ---
+	# FP_SMOOTH_SLOT_MESH: kills the O(N²) whole-tier re-pack/re-upload commit hitch — per-tier fixed-capacity
+	# slotted ArrayMesh + `RenderingServer.mesh_surface_update_vertex_region`/`_attribute_region` GPU region writes
+	# instead of a from-scratch `add_surface_from_arrays` on every single tile commit. NOTE: the headless
+	# RenderingServer is a DUMMY (no real GPU) — `mesh_surface_update_vertex_region`/`_attribute_region` are literal
+	# no-ops there (`servers/rendering/dummy/storage/mesh_storage.h`), so these gates validate the PACKING/OFFSET
+	# MATH, the refusal latch, and the commit-event SCHEDULING (all headless-checkable), but CANNOT confirm the
+	# actual glBufferSubData upload lands/renders correctly on a real GPU — that is a live-only check.
+	_ok(not CubeSphere.FP_SMOOTH_SLOT_MESH, "G-SLOT-OFF: FP_SMOOTH_SLOT_MESH defaults false (byte-off; step()/request()/_evict() all default their new slot_on param to this const)")
+	_gate_slot_eq()
+	_gate_slot_nohole()
+	_gate_slot_budget()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -2922,3 +2935,254 @@ func _gate_rim_near_weld(fid: int) -> void:
 	_ok(worst_weld_drop <= CubeSphere.RIM_WELD_EPS + 1.0 + 1.0e-3, "G-RNW-STEP: welded rim sits ≤ ε+1 below the near block-top across the annulus (worst drop %.2f ≤ %.2f) — no exposed wall" % [worst_weld_drop, CubeSphere.RIM_WELD_EPS + 1.0])
 	_ok(worst_protrude <= 1.0e-3, "G-RNW-NOPOKE: welded rim never rises above its column's near block-top (worst protrusion %.4f) — no z-fight/poke-through" % worst_protrude)
 	_ok(worst_ship_drop >= 4.0, "G-RNW-STEP[falsify]: the SHIPPED env−sink law shows a ≥4-block drop in the SAME annulus (worst %.2f) — the gate sees the wall the user reported" % worst_ship_drop)
+
+
+# =====================================================================================================================
+# REVISION 7 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — FP_SMOOTH_SLOT_MESH gates. Every helper
+# below drives a bare `FacetSmoothTier` (mirrors `_run_nohole_churn`/`_gate_fs_txn_thread`'s existing style) and
+# forces `slot_on`/`budget_bytes` PER-CALL via the new trailing params on `step()`/`request()`/`_evict()` — never
+# the `CubeSphere.FP_SMOOTH_SLOT_MESH` const itself (that stays sed-only, matching every other REVISION 3+ flag
+# here). HEADLESS LIMIT (all three gates): the dummy RenderingServer's `mesh_surface_update_vertex_region`/
+# `_attribute_region` are no-ops (no real GPU) — these gates prove the PACKING bytes, the OFFSET/slot math, the
+# refusal latch, and the commit-event SCHEDULING are all correct; they cannot observe the actual uploaded pixels.
+# =====================================================================================================================
+
+## Mirrors `_simulate_tier_commit` (the existing REVISION 3 direct-poke helper) but additionally routes the
+## transition through the REVISION 7 slot-mesh hooks (`_evict`'s slot-free + `_slot_commit_fid` + `_slot_flush_event`)
+## exactly the way `step()`'s own reap loop does — so a gate can inject a tier-swap/refresh WITHOUT waiting on the
+## real WorkerThreadPool build, while still exercising the real slot bookkeeping (not a shortcut around it).
+func _simulate_tier_commit_slot(ft: FacetSmoothTier, fid: int, new_tier: int, tile: Dictionary, slot_on: bool) -> void:
+	if ft._tiles.has(fid):
+		if int(ft._tier_of[fid]) != new_tier:
+			ft._evict(fid, slot_on)
+		else:
+			ft._bytes -= FST.tile_bytes(ft._tiles[fid])
+			ft._tiles.erase(fid)
+	var tb := FST.tile_bytes(tile)
+	ft._tiles[fid] = tile
+	ft._tier_of[fid] = new_tier
+	ft._bytes += tb
+	ft._dirty_tier[new_tier] = true
+	ft._tier_change_seq[new_tier] = int(ft._tier_change_seq[new_tier]) + 1
+	ft._changed = true
+	if slot_on and not ft._slot_mesh_failed:
+		ft._slot_commit_fid(new_tier, fid, tile)
+	ft._slot_flush_event()
+
+## G-SLOT-EQ: the slot path's PER-TILE pack (what `_slot_commit_fid` blits into a slot) is byte-equal to that same
+## tile's own byte range within the SHIPPED whole-tier concatenation (`_rebuild_tier_mesh`'s append order), packed
+## through the identical engine packer. This is the enabling REVISION 7 property made concrete: every tile of a
+## tier shares identical topology, so per-vertex packing (no cross-vertex coupling for our uncompressed flags=0
+## format: VERTEX/NORMAL/COLOR/TEX_UV/TEX_UV2) commutes with "pack alone" vs. "pack as part of a bigger concat".
+## FALSIFY: corrupting one tile's own data changes ITS packed bytes vs. the (uncorrupted) shipped reference slice —
+## proves the comparison has real teeth, not a vacuous self-agreement.
+func _gate_slot_eq() -> void:
+	print("  --- REVISION 7 G-SLOT-EQ: slot-packed tile bytes == the shipped whole-tier packed bytes for the SAME tile (headless: packing/offset math only — see the file-header note on the dummy RS) ---")
+	var tier := FST.S4
+	var cells := FST.cells_for_tier(tier)
+	var fid_a := _fid_of(2, 4, 4)
+	var fid_b := _fid_of(2, 4, 5)   # a second, distinct tile — proves the slice-out-of-a-bigger-blob math, not just a 1-tile trivial case
+	var tile_a := FST.build_tile(fid_a, cells, 0.0, true, false, -1.0)
+	FST.append_skirt(tile_a, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var tile_b := FST.build_tile(fid_b, cells, 0.0, true, false, -1.0)
+	FST.append_skirt(tile_b, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+
+	# (A) the SLOT path's own per-tile pack — exactly what `_slot_commit_fid` would blit for each tile individually.
+	var sd_a := FST._pack_tile_bytes(tile_a)
+	var sd_b := FST._pack_tile_bytes(tile_b)
+	_ok(sd_a.has("vertex_data") and sd_b.has("vertex_data"), "G-SLOT-EQ: both tiles pack cleanly (engine-side, no hand-rolled format)")
+
+	# (B) the SHIPPED whole-tier concatenation (mirrors `_rebuild_tier_mesh`'s own append-with-index-offset loop),
+	# packed as ONE surface — the reference this gate compares against.
+	var P := PackedVector3Array(); var N := PackedVector3Array(); var C := PackedColorArray()
+	var U := PackedVector2Array(); var U2 := PackedVector2Array(); var I := PackedInt32Array()
+	for t in [tile_a, tile_b]:
+		var base := P.size()
+		P.append_array(t["pos"]); N.append_array(t["nrm"]); C.append_array(t["col"])
+		U.append_array(t["uv"]); U2.append_array(t["uv2"])
+		for idx in (t["idx"] as PackedInt32Array):
+			I.append(base + idx)
+	var shipped := {"pos": P, "nrm": N, "col": C, "uv": U, "uv2": U2, "idx": I}
+	var sd_shipped := FST._pack_tile_bytes(shipped)
+	_ok(sd_shipped.has("vertex_data"), "G-SLOT-EQ: the shipped whole-tier concatenation packs the same way")
+
+	var format_match := int(sd_a.get("format", -1)) == int(sd_shipped.get("format", -2))
+	_ok(format_match, "G-SLOT-EQ: per-tile pack format == whole-tier pack format (same array set + flags=0 ⇒ a slot's capacity surface can host either)")
+
+	var vcount_shipped := int(sd_shipped.get("vertex_count", 0))
+	# The "vertex_data" buffer is STRUCT-OF-ARRAYS, not one interleaved per-vertex row (confirmed in the engine
+	# source, `mesh_surface_make_offsets_from_format`: the `+= r_vertex_element_size * p_vertex_len` offset bump
+	# applies ONLY to ARRAY_NORMAL/ARRAY_TANGENT) — ALL positions come first (`total_verts * pos_stride` bytes),
+	# THEN all normal+tangent data (`total_verts * nt_stride` bytes). A tile's OWN packed bytes are therefore two
+	# separate sub-blocks too, and comparing against the shipped buffer means slicing EACH sub-block out of its
+	# OWN region of the bigger buffer — never one contiguous "tile N's bytes" range. Mirrors
+	# `FacetSmoothTier._ensure_slot_capacity`/`_slot_commit_fid`'s own split exactly.
+	var pstride := int(RenderingServer.mesh_surface_get_format_vertex_stride(int(sd_shipped["format"]), vcount_shipped))
+	var ntstride := int(RenderingServer.mesh_surface_get_format_normal_tangent_stride(int(sd_shipped["format"]), vcount_shipped))
+	var n_a: int = (tile_a["pos"] as PackedVector3Array).size()
+	var n_b: int = (tile_b["pos"] as PackedVector3Array).size()
+	_ok(vcount_shipped == n_a + n_b, "G-SLOT-EQ: the shipped pack's vertex_count == tile A + tile B vertex counts (non-vacuous sizing, %d == %d+%d)" % [vcount_shipped, n_a, n_b])
+
+	var vtx_shipped: PackedByteArray = sd_shipped["vertex_data"]
+	var vtx_a: PackedByteArray = sd_a["vertex_data"]
+	var vtx_b: PackedByteArray = sd_b["vertex_data"]
+	# Position sub-block: contiguous [0, (n_a+n_b)*pstride) at the FRONT of the buffer.
+	var pos_slice_a := vtx_shipped.slice(0, n_a * pstride)
+	var pos_slice_b := vtx_shipped.slice(n_a * pstride, (n_a + n_b) * pstride)
+	# Normal+tangent sub-block: contiguous [(n_a+n_b)*pstride, (n_a+n_b)*(pstride+ntstride)) at the BACK.
+	var nt_base := (n_a + n_b) * pstride
+	var nt_slice_a := vtx_shipped.slice(nt_base, nt_base + n_a * ntstride)
+	var nt_slice_b := vtx_shipped.slice(nt_base + n_a * ntstride, nt_base + (n_a + n_b) * ntstride)
+	# Tile A/B's OWN packed buffers carry the SAME two-sub-block shape at their own (smaller) vertex count.
+	var pos_a := vtx_a.slice(0, n_a * pstride)
+	var nt_a := vtx_a.slice(n_a * pstride, n_a * (pstride + ntstride))
+	var pos_b := vtx_b.slice(0, n_b * pstride)
+	var nt_b := vtx_b.slice(n_b * pstride, n_b * (pstride + ntstride))
+	_ok(pos_slice_a.size() == pos_a.size() and pos_slice_a == pos_a, "G-SLOT-EQ: tile A's slot-packed POSITION sub-block is BYTE-EQUAL to its slice of the shipped whole-tier position sub-block")
+	_ok(nt_slice_a.size() == nt_a.size() and nt_slice_a == nt_a, "G-SLOT-EQ: tile A's slot-packed NORMAL+TANGENT sub-block is BYTE-EQUAL to its slice of the shipped whole-tier normal+tangent sub-block")
+	_ok(pos_slice_b.size() == pos_b.size() and pos_slice_b == pos_b, "G-SLOT-EQ: tile B's slot-packed POSITION sub-block is BYTE-EQUAL to its slice of the shipped whole-tier position sub-block")
+	_ok(nt_slice_b.size() == nt_b.size() and nt_slice_b == nt_b, "G-SLOT-EQ: tile B's slot-packed NORMAL+TANGENT sub-block is BYTE-EQUAL to its slice of the shipped whole-tier normal+tangent sub-block")
+
+	# --- FALSIFY: corrupt tile B's data and prove the comparison NOW differs (not a vacuous always-equal pass) ---
+	var tile_b_bad := tile_b.duplicate(true)
+	var pos_bad: PackedVector3Array = tile_b_bad["pos"]
+	pos_bad[0] = pos_bad[0] + Vector3(37.0, 0.0, 0.0)   # a real, detectable corruption — not rounding noise
+	tile_b_bad["pos"] = pos_bad
+	var sd_b_bad := FST._pack_tile_bytes(tile_b_bad)
+	var vtx_b_bad: PackedByteArray = sd_b_bad.get("vertex_data", PackedByteArray())
+	var pos_b_bad := vtx_b_bad.slice(0, n_b * pstride) if vtx_b_bad.size() >= n_b * pstride else PackedByteArray()
+	_ok(pos_b_bad.size() == 0 or pos_b_bad != pos_slice_b, "G-SLOT-EQ-FALSIFY: corrupting tile B's own position data changes its packed POSITION bytes vs. the (uncorrupted) shipped slice — the byte-equal check has teeth")
+
+## G-SLOT-NOHOLE: replay the R3.2.a promote scenario THROUGH THE SLOT PATH — a tier-change swap (fid_a S4->S5,
+## fid_b S5->S4, same 2 tiers, compound) plus an in-place refresh (fid_c, same tier) — and assert
+## `committed_fids_snapshot()` never shows a resident fid in 0 tiers (a hole) or ≥2 tiers (a z-fight) across the
+## whole churn. LAW T: the old-tier zero-blit and the new-tier write of ONE promote are staged into the SAME
+## `_slot_cur_event` (by `_evict`'s slot-free then `step()`'s `_slot_commit_fid`, both before the `_slot_flush_event`
+## that ends this fid's reap-loop iteration) and therefore always land in the SAME applied drain — never split.
+func _run_nohole_churn_slot() -> Dictionary:
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var fid_a := _fid_of(3, 6, 9)
+	var fid_b := _fid_of(3, 6, 10)
+	var fid_c := _fid_of(3, 6, 11)
+
+	# Initial population (converged first — the churn below must be a real TRANSITION, not the initial-ramp gap).
+	var t_a0 := FST.build_tile(fid_a, FST.cells_for_tier(FST.S4), 0.0, true, false, -1.0)
+	FST.append_skirt(t_a0, FST.cells_for_tier(FST.S4), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var t_b0 := FST.build_tile(fid_b, FST.cells_for_tier(FST.S5), 0.0, true, false, -1.0)
+	FST.append_skirt(t_b0, FST.cells_for_tier(FST.S5), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var t_c0 := FST.build_tile(fid_c, FST.cells_for_tier(FST.S3), 0.0, true, false, -1.0)
+	FST.append_skirt(t_c0, FST.cells_for_tier(FST.S3), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	_simulate_tier_commit_slot(ft, fid_a, FST.S4, t_a0, true)
+	_simulate_tier_commit_slot(ft, fid_b, FST.S5, t_b0, true)
+	_simulate_tier_commit_slot(ft, fid_c, FST.S3, t_c0, true)
+	for i in range(10):
+		ft.step(false, false, false, true)   # drain any budget-deferred backlog from the initial population
+
+	var warm_ok := not ft._slot_mesh_failed and ft.is_resident(fid_a) and ft.is_resident(fid_b) and ft.is_resident(fid_c)
+	var warm_committed := ft.committed_fids_snapshot()
+	for fid in [fid_a, fid_b, fid_c]:
+		var found := 0
+		for t in range(4):
+			if (warm_committed[t] as Dictionary).has(int(fid)):
+				found += 1
+		if found != 1:
+			warm_ok = false
+
+	# The churn: fid_a S4->S5 (demote), fid_b S5->S4 (promote) — ONE compound commit across the SAME 2 tiers — plus
+	# an in-place refresh of fid_c at its current tier (S3).
+	var tile_a := FST.build_tile(fid_a, FST.cells_for_tier(FST.S5), 0.0, true, false, -1.0)
+	FST.append_skirt(tile_a, FST.cells_for_tier(FST.S5), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var tile_b := FST.build_tile(fid_b, FST.cells_for_tier(FST.S4), 0.0, true, false, -1.0)
+	FST.append_skirt(tile_b, FST.cells_for_tier(FST.S4), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	var tile_c := FST.build_tile(fid_c, FST.cells_for_tier(FST.S3), 0.0, true, false, -1.0)
+	FST.append_skirt(tile_c, FST.cells_for_tier(FST.S3), CubeSphere.SMOOTH_SKIRT_BLOCKS)
+	_simulate_tier_commit_slot(ft, fid_a, FST.S5, tile_a, true)
+	_simulate_tier_commit_slot(ft, fid_b, FST.S4, tile_b, true)
+	_simulate_tier_commit_slot(ft, fid_c, FST.S3, tile_c, true)
+
+	var hole := false
+	var zfight := false
+	var steps := 0
+	for i in range(50):
+		ft.step(false, false, false, true)
+		steps += 1
+		var snap := ft.committed_fids_snapshot()
+		for fid in [fid_a, fid_b, fid_c]:
+			if not ft.is_resident(fid):
+				continue
+			var found := 0
+			for t in range(4):
+				if (snap[t] as Dictionary).has(int(fid)):
+					found += 1
+			if found == 0:
+				hole = true
+			elif found > 1:
+				zfight = true
+		if hole or zfight:
+			break
+
+	var refused := ft._slot_mesh_failed
+	parent.free()
+	return {"warm_ok": warm_ok, "hole": hole, "zfight": zfight, "steps": steps, "refused": refused}
+
+func _gate_slot_nohole() -> void:
+	print("  --- REVISION 7 G-SLOT-NOHOLE: a promote's old-slot-zero + new-slot-write land in the SAME step() call — no hole, no z-fight (headless: CPU/queue-level atomicity + committed_fids bookkeeping, not GPU pixels) ---")
+	var r := _run_nohole_churn_slot()
+	_ok(not bool(r["refused"]), "G-SLOT-NOHOLE: the slot path never hit the refusal latch on this scenario (packing/format validated clean end-to-end, headless)")
+	_ok(bool(r["warm_ok"]), "G-SLOT-NOHOLE warm-up: initial population converges to exactly-one-committed-tier coverage per facet (non-vacuous baseline)")
+	_ok(int(r["steps"]) > 0, "G-SLOT-NOHOLE: drove %d churn steps (compound promote+demote+refresh through the slot path)" % int(r["steps"]))
+	_ok(not bool(r["hole"]), "G-SLOT-NOHOLE: NEVER a step where a resident facet is committed into ZERO tiers (no hole)")
+	_ok(not bool(r["zfight"]), "G-SLOT-NOHOLE: NEVER a step where a resident facet is committed into TWO tiers at once (no z-fight)")
+
+## G-SLOT-BUDGET: 4 independent whole commit-events queued before any drain; a budget sized for exactly ONE event's
+## bytes applies exactly 1 per `step()` call, deferring the other 3 WHOLE (never a partial tile — the deferred
+## count is always an INTEGER number of events, and the queue drains in exactly the remaining calls, proving no
+## event was ever split or skipped). FALSIFY: a budget covering all 4 events applies them ALL in a single call —
+## proves the small-budget deferral above is the BUDGET's doing, not some unrelated fixed per-call cap.
+func _gate_slot_budget() -> void:
+	print("  --- REVISION 7 G-SLOT-BUDGET: a multi-event commit exceeding the byte budget defers the OVERFLOW as WHOLE events, never a partial tile ---")
+	var parent := Node3D.new()
+	var ft := FST.new()
+	ft.setup_instance(parent, null)
+	var tier := FST.S4
+	var cells := FST.cells_for_tier(tier)
+	var fids := []
+	for i in range(4):
+		fids.append(_fid_of(1, 2, i))
+	for fid in fids:
+		var tile := FST.build_tile(fid, cells, 0.0, true, false, -1.0)
+		FST.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+		_simulate_tier_commit_slot(ft, fid, tier, tile, true)   # queue 4 independent whole events, nothing drained yet
+	_ok(not ft._slot_mesh_failed, "G-SLOT-BUDGET setup: 4 independent commits packed clean (no refusal)")
+	_ok((ft._slot_write_queue as Array).size() == 4, "G-SLOT-BUDGET setup: 4 queued whole commit-events, one per fid (non-vacuous — nothing auto-drained yet)")
+	var per_event_bytes := 0
+	var ev0: Array = ft._slot_write_queue[0]
+	for w in ev0:
+		var d: Dictionary = w
+		per_event_bytes += (d["vtx_pos"] as PackedByteArray).size() + (d["vtx_nt"] as PackedByteArray).size() + (d.get("attr", PackedByteArray()) as PackedByteArray).size()
+	_ok(per_event_bytes > 0, "G-SLOT-BUDGET setup: a single commit-event carries real packed bytes (%d)" % per_event_bytes)
+
+	# --- (A) budget == exactly one event's size: 1 of 4 applies this call, 3 remain queued WHOLE ---
+	ft.step(false, false, false, true, per_event_bytes)
+	_ok(int(ft.slot_mesh_stats()["smooth_commit_defer"]) == 3, "G-SLOT-BUDGET: with budget == one event's size, exactly 1 of 4 events applied this step() — 3 deferred WHOLE (never 3.x partially-applied tiles)")
+
+	# --- drain the rest: each subsequent 1-event-budget call frees exactly one more queued event ---
+	var calls := 0
+	while (ft._slot_write_queue as Array).size() > 0 and calls < 10:
+		ft.step(false, false, false, true, per_event_bytes)
+		calls += 1
+	_ok((ft._slot_write_queue as Array).size() == 0, "G-SLOT-BUDGET: the backlog fully drains (%d further step() calls at a 1-event budget)" % calls)
+	_ok(calls == 3, "G-SLOT-BUDGET: drained in EXACTLY the remaining 3 calls (4 events total, 1 already applied, 1/call thereafter) — no event split, none skipped")
+
+	# --- FALSIFY: a budget covering all 4 events applies them ALL in ONE call (proves the small-budget deferral above is the BUDGET's doing) ---
+	var ft2 := FST.new()
+	ft2.setup_instance(parent, null)
+	for fid in fids:
+		var tile := FST.build_tile(fid, cells, 0.0, true, false, -1.0)
+		FST.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)
+		_simulate_tier_commit_slot(ft2, fid, tier, tile, true)
+	ft2.step(false, false, false, true, per_event_bytes * 4 + 1)
+	_ok((ft2._slot_write_queue as Array).is_empty(), "G-SLOT-BUDGET-FALSIFY: a budget covering all 4 events' bytes applies them ALL in one step() call (0 remaining) — the small-budget deferral above isn't a vacuous fixed per-call cap")
+	parent.free()

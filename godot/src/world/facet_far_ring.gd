@@ -2741,9 +2741,17 @@ func shell_telemetry() -> Dictionary:
 					if _emit_cache_ready(fid):
 						cachedN += 1
 	var axdot: float = _emit_axis[0] * _dbg_true_dir[0] + _emit_axis[1] * _dbg_true_dir[1] + _emit_axis[2] * _dbg_true_dir[2]
+	# REVISION 7 (FP_SMOOTH_SLOT_MESH): surface the slot-mesh commit stats so a live A/B can confirm the path is
+	# ACTIVE (smooth_slot_path=1, not refused-to-fallback) and the per-frame commit cost (smooth_commit_ms) replaced
+	# the O(N²) whole-tier upload spike. Empty dict (0/absent) with the flag off or _smooth unbuilt.
+	var _sms: Dictionary = (_smooth.slot_mesh_stats() if (_smooth != null and _smooth.has_method("slot_mesh_stats")) else {})
 	return {
 		"sh_cam": _cam_set,
 		"smooth_res": (_smooth.resident_count() if _smooth != null else 0),   # FP_FAR_SMOOTH: committed smooth tiles
+		"smooth_slot_path": int(_sms.get("smooth_slot_path", 0)),             # 1=slot-mesh region-writes active, 0=off/refused-fallback
+		"smooth_commit_ms": float(_sms.get("smooth_commit_ms", 0.0)),         # main-thread ms in slot commits this frame
+		"smooth_upload_kb": float(_sms.get("smooth_upload_kb", 0.0)),         # KB region-written this frame
+		"smooth_commit_defer": int(_sms.get("smooth_commit_defer", 0)),       # whole commit-events still queued (budget deferral)
 		"sh_emit": _emitted.size(),
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,

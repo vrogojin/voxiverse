@@ -236,7 +236,8 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 ## (Dictionary key simply present).
 static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float,
 		normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, cheap_on := CubeSphere.FP_RIM_CHEAP,
-		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO, gen: Object = null) -> Dictionary:
+		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO, gen: Object = null,
+		near_weld_on := CubeSphere.FP_RIM_NEAR_WELD, r_near: float = -1.0) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
 	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
@@ -351,9 +352,34 @@ static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: flo
 						env_p -= d * resid   # Stage D no-protrusion compensation: env_coarse − resid ≤ env_fine ≤ true_pos
 				rim_env_pos[vi] = env_p
 				var dist := true_pos.distance_to(player_col)
-				var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
-				var blended: Vector3 = env_p.lerp(true_pos, w)
-				pos[vi] = blended - d * (sink * (1.0 - w))
+				if near_weld_on and r_near >= 0.0:
+					# REVISION 7-VISUAL (§R7.2, FP_RIM_NEAR_WELD): the near↔far height-wall fix. The shipped law below
+					# sinks the WHOLE disc interior to env−sink (5–20 blocks), and since the disc (r_env=160+feather)
+					# extends ~48–64 blocks past the near voxel edge (~112–128), that sunk annulus is the VISIBLE ground
+					# and the near cut-edge shows as a block-face wall. Here the visible annulus welds to the near
+					# mesher's block-quantised top: `true_pos − ε` — true_pos = d·(r_datum + max(0,g)) is EXACTLY the
+					# near block-top for land / sea level for water (block-quantised, relief is integer), so the step is
+					# ≤ ε and seamless in BOTH near-streamed states (this is the ground the near mesher will build). The
+					# height is terrain-invariant (position-independent) ⇒ crescent-reuse stays valid. The r_env
+					# true-height frontier is unchanged, so §2.1's stream-in-can't-protrude invariant survives verbatim.
+					var welded: Vector3 = true_pos - d * CubeSphere.RIM_WELD_EPS
+					var hidden_pos: Vector3 = env_p - d * sink   # the shipped w=0 interior law (≤-truth, hidden under near voxels)
+					if dist < r_near - CubeSphere.RIM_WELD_BAND:
+						pos[vi] = hidden_pos                                  # zone H: under committed near voxels — never seen
+					elif dist < r_near:
+						var rw := clampf((dist - (r_near - CubeSphere.RIM_WELD_BAND)) / CubeSphere.RIM_WELD_BAND, 0.0, 1.0)
+						pos[vi] = hidden_pos.lerp(welded, rw)                 # zone B ramp: env−sink → block-top (across/under the near edge)
+					elif dist < r_env:
+						pos[vi] = welded                                      # zone B hold: block-top − ε (the visible annulus)
+					elif dist < r_env + feather_safe:
+						var wf := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+						pos[vi] = welded.lerp(true_pos, wf)                   # zone F: block-top → true relief (past max near reach)
+					else:
+						pos[vi] = true_pos
+				else:
+					var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+					var blended: Vector3 = env_p.lerp(true_pos, w)
+					pos[vi] = blended - d * (sink * (1.0 - w))
 				var vc := FarPalette.color_for(g, biome, temp, g < TerrainConfig.SEA_LEVEL)
 				if normal_lit:
 					vc.a = 0.0
@@ -1026,7 +1052,7 @@ func _build_worker(i: int) -> void:
 		var prev_env_pos: PackedVector3Array = _s_prev_env_pos[i] if _s_prev_env_pos.size() > i else PackedVector3Array()
 		var prev_tile: Dictionary = _s_prev_tile[i] if _s_prev_tile.size() > i else {}
 		var old_col: Vector3 = _s_old_col[i] if _s_old_col.size() > i else Vector3.ZERO
-		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col, _cpp_gen)
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col, _cpp_gen, CubeSphere.FP_RIM_NEAR_WELD, float(TerrainConfig.near_render_radius()))
 	else:
 		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, _cpp_gen)   # curved sphere placement, lift retired to 0 (replacement law)
 	var plan: PackedInt32Array = _s_snap[i]

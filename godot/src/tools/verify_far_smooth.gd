@@ -201,6 +201,12 @@ func _initialize() -> void:
 	_gate_cpp_smooth_bake(fid_edge)     # a cross-face-boundary facet — native path exercised at a cube seam
 	_gate_cpp_smooth_bake_weld(fid_edge, FA.S_WEST)   # law-2 survival: shared cross-face edge, native both sides
 
+	# --- REVISION 7-VISUAL (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7-VISUAL") ---
+	# FP_RIM_NEAR_WELD: the S2 collar's visible annulus welds to the near block-top instead of the mis-scaled
+	# env−sink that exposed an 8–20-block wall at the near cut-edge (the user's #1 immersion complaint).
+	_ok(not CubeSphere.FP_RIM_NEAR_WELD, "G-RNW-OFF: FP_RIM_NEAR_WELD defaults false (byte-off; build_tile_rim takes the shipped env−sink law — the other G-RIM-* gates exercise it)")
+	_gate_rim_near_weld(fid_int)
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -2866,3 +2872,53 @@ func _gate_cpp_smooth_bake_weld(fid: int, slot: int) -> void:
 			weld_ok = false
 	_ok(cross_face, "G-CSB-EQ-WELD: fixture slot %d neighbour (fid %d) is a CROSS-FACE pair" % [slot, nb])
 	_ok(weld_ok, "G-CSB-EQ-WELD: every native shared-edge vertex welds to the neighbour's native bake (≤1e-9·R, max gap %.3e)" % max_gap)
+
+## G-RNW-STEP / G-RNW-NOPOKE (REVISION 7-VISUAL §R7.5, FP_RIM_NEAR_WELD): the S2 collar's VISIBLE annulus
+## [r_near .. r_env] must weld to the near block-top (true − ε) instead of the shipped env−sink, so the near
+## cut-edge wall collapses to ≤ ε. Uses the LIVE r_near/r_env (128/160) so the fixture exercises the exact band
+## the user sees. FALSIFY: the SAME probe on the shipped law (weld off) reports the multi-block wall (≥4) — proves
+## the gate can see the defect. NOPOKE: welded rim never rises above its column's near top (no z-fight).
+func _gate_rim_near_weld(fid: int) -> void:
+	print("  --- G-RNW-STEP: S2 near-collar visible annulus welds to the near block-top (no exposed height wall) ---")
+	var cells := FST.cells_for_tier(FST.S2)
+	var stride := cells + 1
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var centre_node := FD.node_at(corner_dirs, r_datum, 0.5, 0.5)
+	var player_col: Vector3 = centre_node["pos"]
+	var r_env := float(TC.near_render_radius()) + CubeSphere.RIM_STREAM_MARGIN   # 160 — the live disc radius
+	var r_near := float(TC.near_render_radius())                                 # 128 — near coverage edge
+	var feather := CubeSphere.RIM_FEATHER_BLOCKS
+	var sink := TierPlace.backstop_sink()
+	var inv := 1.0 / float(cells)
+	# weld ON vs the shipped law (weld off), identical inputs, initial full bake (no cache).
+	var weld := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink, false, -1.0, false, PackedVector3Array(), {}, Vector3.ZERO, null, true, r_near)
+	var ship := FST.build_tile_rim(fid, cells, player_col, r_env, feather, sink, false, -1.0, false, PackedVector3Array(), {}, Vector3.ZERO, null, false, r_near)
+	var wpos: PackedVector3Array = weld["pos"]
+	var spos: PackedVector3Array = ship["pos"]
+	var samples := 0
+	var worst_weld_drop := 0.0
+	var worst_protrude := -1.0e30
+	var worst_ship_drop := 0.0
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var node := FD.node_at(corner_dirs, r_datum, s, t)
+			var d: Vector3 = node["dir"]
+			var true_pos: Vector3 = node["pos"]
+			var dist := true_pos.distance_to(player_col)
+			if dist < r_near or dist > r_env:
+				continue          # only the VISIBLE annulus (near edge .. disc frontier)
+			samples += 1
+			var vi := gj * stride + gi
+			var true_relief := float(node["relief"])
+			var weld_relief := (wpos[vi] - d * r_datum).dot(d)
+			worst_weld_drop = maxf(worst_weld_drop, true_relief - weld_relief)          # below near top (want ≤ ε)
+			worst_protrude = maxf(worst_protrude, weld_relief - true_relief)             # above near top (want ≤ 0)
+			var ship_relief := (spos[vi] - d * r_datum).dot(d)
+			worst_ship_drop = maxf(worst_ship_drop, true_relief - ship_relief)           # the shipped wall
+	_ok(samples >= 100, "G-RNW-STEP: %d S2 nodes fall in the visible annulus [%.0f..%.0f] (fixture exercises the wall band)" % [samples, r_near, r_env])
+	_ok(worst_weld_drop <= CubeSphere.RIM_WELD_EPS + 1.0 + 1.0e-3, "G-RNW-STEP: welded rim sits ≤ ε+1 below the near block-top across the annulus (worst drop %.2f ≤ %.2f) — no exposed wall" % [worst_weld_drop, CubeSphere.RIM_WELD_EPS + 1.0])
+	_ok(worst_protrude <= 1.0e-3, "G-RNW-NOPOKE: welded rim never rises above its column's near block-top (worst protrusion %.4f) — no z-fight/poke-through" % worst_protrude)
+	_ok(worst_ship_drop >= 4.0, "G-RNW-STEP[falsify]: the SHIPPED env−sink law shows a ≥4-block drop in the SAME annulus (worst %.2f) — the gate sees the wall the user reported" % worst_ship_drop)

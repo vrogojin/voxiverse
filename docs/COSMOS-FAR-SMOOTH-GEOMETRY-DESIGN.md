@@ -1263,3 +1263,287 @@ points in `boundary_normal` (R6.2). Precedent says the shipped flags don't contr
 `height_c3` is the same `a*b+c` style and is bit-equal on BOTH Linux and web), and G-CSB-EQ
 item 1 falsifies it per-node; if web codegen ever contracts, the fix is `-ffp-contract=off`
 on the cosmos TU. Everything else is mirrored construction, not hope.
+
+# =====================================================================================================================
+# REVISION 7 — the residual warmup hitch: whole-tier re-pack/re-upload per commit → slotted
+# fixed-topology tier mesh + GPU region updates (`FP_SMOOTH_SLOT_MESH`) (2026-08-04, Fable)
+
+REVISION 6 moved the height COMPUTE off-main (native bake, warmup 60s→23s) — but during the
+active fill proc_ms still spikes 300–700 ms, and a set_alt re-warm holds 77–127 ms for
+seconds. The residual is the MESH COMMIT, and it is O(N²) by construction.
+
+## R7.1 Verified mechanism (this is not a hypothesis — it's the code path)
+
+Every committed tile marks its whole tier dirty (`step()` reap: `_dirty_tier[tier] = true`).
+Under FP_SMOOTH_TXN, `_step_tier_txn` then snapshots **ALL resident tiles of that tier**
+(`_snapshot_tier_tiles`: `for fid in _tiles: if _tier_of[fid]==tier`), `_concat_tier_worker`
+merges the ENTIRE tier off-thread, and `_apply_tier_mesh` on MAIN rebuilds the full surface
+from scratch: `mesh.add_surface_from_arrays(...)` + `mi.mesh = mesh`. There is no incremental
+path — a tier that has N tiles re-packs and re-uploads all N on every commit event, so the
+fill uploads O(N²) bytes total. Sizes (ledger 56 B/vert + 4 B/idx, incl. skirt):
+S2 tile ≈ 0.91 MB (11 445 v), S3 ≈ 0.24 MB, S4 ≈ 66 KB, S5 ≈ 19 KB; full tiers ≈ 8.2 / 6.0 /
+4.2 / 3.8 MB. A near-fill multi-tier apply (LAW T applies every dirtied tier in the SAME
+call) is 8–14 MB of main-thread `add_surface_from_arrays` format-pack + alloc + full
+glBufferData — the measured 300–700 ms at WASM's ~40–60 ms/MB pack+upload rate. Over a 23 s
+fill (36→182 tiles) that is ~150–300 MB packed/uploaded where ~16 MB is necessary. Three
+secondary contributors, same root: (i) `_concat_tier_worker`'s per-element
+`I.append(base+idx)` (~600 k appends per S2 concat) + multi-MB transient merged arrays feed
+the shared WASM allocator convoy that throttles MAIN; (ii) each commit fires
+`consume_changed() → _pending = true` → a shell re-emit train during fill (off-thread build,
+cheap swap — noise, not the spike); (iii) the set_alt re-warm is the SAME mechanism at
+mid-fill tier sizes: residency reshuffles, partially-full tiers (~2–3 MB) re-apply
+back-to-back ⇒ sustained 77–127 ms rather than one big spike.
+
+## R7.2 The fix — `FP_SMOOTH_SLOT_MESH`: per-tier fixed-capacity slotted surface, region-updated
+
+The enabling property: **every tile of a tier has IDENTICAL topology** — (cells+1)² + 4·stride
+skirt verts, cells²·6 + 4·(stride−1)·6 skirt indices. So a tier can be ONE pre-allocated
+surface of `residency_cap` uniform slots whose index buffer never changes, and a tile commit
+is a **byte-region write into its slot**, not a rebuild. GLES3/compat implements exactly this:
+`mesh_surface_update_vertex_region`/`_attribute_region` are a plain `glBufferSubData`
+(verified in our shipped engine source, `drivers/gles3/storage/mesh_storage.cpp:536-564`).
+
+1. **Setup (flag on):** per tier, build capacity arrays ONCE (zeroed pos/nrm/col/uv/uv2 sized
+   cap×verts_per_tile; idx built with per-slot offsets), one `add_surface_from_arrays`
+   (**flags=0 — no ARRAY_FLAG_COMPRESS_ATTRIBUTES**: compressed positions are AABB-relative-
+   quantized and would make packed tile bytes non-transplantable; flags=0 keeps positions
+   absolute f32), assign `mi.mesh` once, set `mi.custom_aabb` to the planet bound (the
+   auto-AABB of a zeroed mesh would cull everything), free the CPU capacity arrays. Empty
+   slots = all-zero verts ⇒ zero-area tris at the planet centre, rasterize nothing.
+   GPU cost FIXED at creation ≈ 10.2 MB vertex+attr + 5.3 MB idx ≈ 15.5 MB — the same order
+   as today's full-residency merged meshes, minus the transient concat copies (heap A/B still
+   required per NEVER-OOM before flip-on).
+2. **Commit (main, per reaped tile):** pack via
+   `RenderingServer.mesh_create_surface_data_from_arrays(PRIMITIVE_TRIANGLES, tile_arrays)` —
+   the ENGINE is the packer (pure CPU utility, C++-speed, ~sub-ms for an S2 tile; no
+   hand-rolled octahedral/RGBA8 format coupling), called on MAIN (no worker→RS thread
+   question at all) — then two region updates on `mi.mesh.get_rid()` at
+   `slot × verts_per_tile × stride_{vertex,attr}`. ~0.5 MB worst (S2) ≈ 1–3 ms. **Evict** =
+   blit a precomputed per-tier degenerate blob (packed once at setup). **LAW T preserved by
+   construction:** all region writes of one commit event (old-tier zero + new-tier write on a
+   promote) land in the same `step()` call — they are cheap enough that atomicity costs
+   nothing. `_committed_fids` bookkeeping updates per write (gate introspection unchanged).
+3. **Format guard (runtime refusal, 0008 pattern):** at setup, pack one reference tile and
+   assert `vertex_data.size() == verts×stride` and format/stride equality against the
+   capacity surface (`RS.mesh_surface_get_format_*`). Mismatch (a future engine format
+   change) ⇒ latch `_slot_refused`, run the shipped TXN path verbatim, telemetry flags it.
+4. **Commit budget (the (c)+(d) scheduler, kept INSIDE the design):**
+   `SMOOTH_COMMIT_BUDGET_BYTES` (~2 MB/frame). Reaped-but-unapplied commit events queue
+   WHOLE (never split — LAW T) and drain in order; binds only when many workers land in one
+   frame (8 × S2 ≈ 4 MB packed → 2 frames). Bounded queue: ≤ SMOOTH_BUILD_SLOTS events.
+5. **Retired while on:** `_concat_tier_worker`/`_step_tier_txn` never dispatch (the 600 k-
+   append concat and its transient arrays vanish — allocator-convoy relief on main), and
+   `consume_changed()` still fires per commit (the shell exclusion re-emit is untouched —
+   separate, already-paced machinery).
+
+Draw calls: **unchanged, 4** (one surface per tier — the reason per-tile MeshInstances, up to
+9+25+64+200 = 298 draws against the ~200-draw vsync ladder, and surface-per-tile (a draw per
+surface in compat) are both rejected; batching/byte-budget alone are rejected because the
+indivisible `mi.mesh` swap still eventually uploads a full tier in one frame — they reduce
+spike COUNT, not worst-frame magnitude). Fill latency: improves (a tile is visible the frame
+it is reaped; no concat round-trip). Upload over a full fill: O(N) ≈ 16 MB total.
+
+## R7.3 The gate (extend `tools/verify_far_smooth.gd`) + live signal
+
+- **G-SLOT-FORMAT:** capacity-surface stride/format == packed-reference-tile stride/format;
+  packed size == verts×stride. (The runtime refusal latch must be FALSE on the build engine.)
+- **G-SLOT-EQ:** commit a resident set spanning 2 tiers + a cross-face neighbour pair via the
+  slot path; `RS.mesh_get_surface` readback ⇒ every occupied slot region byte-equal that
+  tile's own packed bytes, every empty slot byte-equal the degenerate blob. **Falsify:**
+  corrupt one tile's arrays → must mismatch (non-vacuous).
+- **G-SLOT-NOHOLE:** replay the R3.2.a promote scenario — old-tier zero-blit and new-tier
+  write in the SAME step() call; `committed_fids_snapshot()` never shows a fid in 0 or ≥2
+  tiers across the swap.
+- **G-SLOT-BUDGET:** enqueue > budget in one frame ⇒ deferral is whole-event, ordered, drains
+  in ≤ ⌈bytes/budget⌉ frames.
+- Regressions: `verify_far_smooth` full suite green flag ON; FLAT `verify_feature` 6042/0
+  flag OFF (`const FP_SMOOTH_SLOT_MESH := false`, all new code behind it — byte-identical).
+- **Live telemetry (the spike-is-gone signal):** new fields in the ring's stats →
+  telemetry.jsonl: `smooth_commit_ms` (main-thread pack+region-update time this frame),
+  `smooth_upload_kb` / `smooth_upload_total_kb`, `smooth_commit_defer`. Acceptance on the 8-core
+  warmup reload: fill 36→182 with `smooth_commit_ms ≤ 8` every frame, no proc_ms spike > ~120 ms
+  attributable to smooth, `smooth_upload_total_kb` ≈ 16–20 MB (vs today's O(N²) hundreds);
+  set_alt re-warm proc_ms stays ≤ ~60 ms.
+
+## R7.4 Scope notes (design questions 3–4)
+
+- **Spawn-coincident 1264 ms / phys 34 ms:** phys rules out the collider/settle as the bulk.
+  It is a superposition: first-use gl_compat shader/program link + spawn near-field build +
+  (in-scope part) a coincident multi-tier apply. R7 removes the smooth share;
+  `smooth_commit_ms` on that frame attributes the remainder (boot/shader warm — out of scope).
+- **set_alt re-warm:** same mechanism (R7.1 (iii)), fully covered by the fix.
+
+## R7.5 Verdict — **YELLOW→GREEN**, one named unknown
+
+Mechanism GREEN (read from the code + shipped engine source, sizes self-consistent with the
+live numbers). The single riskiest unknown: **ANGLE/WebGL2 `glBufferSubData` behaviour on a
+buffer drawn the same frame** — some drivers ghost/stall on sub-updates to in-use buffers.
+Probe FIRST (native editor + one live web frame with the telemetry fields) before building
+the full driver; if a stall shows, the fallback ladder is (1) budget=1 update/frame, (2)
+double-slot ping-pong writes (still fixed memory), (3) the shipped TXN path via the refusal
+latch. Everything else is engine-packed bytes + a byte-exact gate, not hope.
+
+# REVISION 7-VISUAL — the exposed near↔far height WALL + the low-res skin patch (2026-08-04, Fable)
+
+The user is looking at the LIVE full-stack build (17 smooth flags + FP_CPP_SMOOTH_BAKE) and
+reports three boundary defects. This revision root-causes all three from source (file:line) and
+designs the fix. **Priority order is the user's: the height wall (D1) outranks everything.**
+
+## R7.1 DEFECT 1 root cause (VERIFIED in code): the S2 collar's VISIBLE annulus is sunk 8–20 blocks
+
+What draws immediately outside the near blocky region at surface alt is the **committed S2 rim
+tile itself** — not the skin, not the pre-commit backstop. Coverage is NOT the problem
+(`_rim_assign` covers active ∪ live-pool unconditionally, `facet_far_ring.gd:813-853`; law-6
+exclusion keeps the shell out). The problem is the rim's HEIGHT LAW in the band the near mesh
+does not cover:
+
+`build_tile_rim` (`facet_smooth_tier.gd:353-356`):
+```
+w        = clamp((dist - r_env)/feather, 0, 1)        # 0 everywhere inside the disc
+blended  = env_p.lerp(true_pos, w)
+pos      = blended - d * (sink * (1 - w))             # full sink over the WHOLE disc interior
+```
+with the geometry (all live numbers at R=6371, K=24):
+1. **Disc ≫ near coverage.** `r_env = near_render_radius() + RIM_STREAM_MARGIN = 128 + 32 = 160`
+   (`facet_far_ring.gd:860`), feather 16 → the rim reaches TRUE height only at **176 blocks**
+   from the player. The near voxel field ends at the controller-settled ~112–128
+   (FP_PREFILL_112 / closed-loop). ⇒ a **48–64-block-wide annulus** of rim surface is the
+   visible ground, at `env − sink` height.
+2. **Mis-scaled sink.** `sink = TierPlace.backstop_sink()` (`facet_smooth_tier.gd:1029`) derives
+   its ε from the BACKSTOP cell (26.06 blocks): 5.21 (envelope branch), 11.73 (env_all branch),
+   13.0 (plain). The S2 grid cell is **~4.0 blocks** — its between-sample residual needs
+   ε ≈ max(1.5, 0.2·4.0) = **1.5**. The rim inherits a guard sized for a grid 6.5× coarser.
+   (`backstop_sink_rim()` exists but is only used for the PRE-commit interim backstop — R-D's
+   fix never applied to the committed S2 tile itself.)
+3. **REV 5 stacked another −3.0.** FP_RIM_CHEAP subtracts `RIM_ENV_RESID = 3.0` on every
+   cache-miss bake (web mult=1) — correct for no-protrusion, but additive to the visible drop.
+4. **env itself is below the local top on slopes** (min over the ~6-block-dilated footprint):
+   +0–5 blocks more wherever the boundary crosses relief.
+
+Total exposed step at the near cut edge: **sink(5.2–13) + resid(3) + env-vs-true(0–5) ≈ 8–20
+blocks** — the observed multi-strata wall (grass-over-dirt/stone/sand cross-sections, water and
+snow column sides at lakes/cold columns), and the "flatter, lower" far ground beyond it.
+
+**Why the gates passed (the meta-failure): G-NF-HEIGHT as implemented is NOT LAW R-D.**
+`verify_far_smooth.gd:1157-1211` asserts (a) interim ε-sink < legacy sink (a *relative* claim)
+and (b) vertex == true height **beyond R_env+feather** (≥176 blocks out). The band
+`[near_edge .. 176]` — the only part the user can see — is never sampled. Every rim gate is
+one-sided (far ≤ true); nothing bounds `true − far` where the rim is exposed. LAW R-D's
+"per-column true g at ALL times immediately outside the committed near field" was silently
+narrowed during R4's implementation to "true height beyond the feather".
+
+## R7.2 The fix — FP_RIM_NEAR_WELD (block-top weld in the visible annulus)
+
+The load-bearing choice: in the annulus, the rim's height is the **block-quantized surface
+height** — `d · (r_datum + g_top)` from the SAME per-node `g` the bake already fetches
+(`node["g"]` / `b_g[vi]`, `facet_smooth_tier.gd:340-343` — zero extra sampling; the C++ bake
+returns it too). That height is *by the one-chain law* exactly what the near mesher builds, so
+it is simultaneously correct in BOTH states of the annulus: where near voxels have streamed in
+(equal height, coplanar → the existing FAR_BIAS_K depth bias orders the tie; near wins) and
+where they haven't (the ground shown is the ground that will arrive — the stream-in is
+invisible by construction). §2.1's safety invariant is untouched: the true-smooth-height
+frontier stays at `r_env=160 ≥ 128` = max near reach, so near voxels still can never appear
+outside the welded zone between rebakes.
+
+Three-zone height law inside `build_tile_rim` (one new frozen input `r_near`, the live near
+coverage radius snapshotted per batch like `player_col`; `W := RIM_WELD_BAND = 16`,
+`ε_blk := RIM_WELD_EPS = 1.0`):
+
+| zone | dist range | height | why safe |
+|---|---|---|---|
+| H (hidden) | `< r_near − W` | `env − sink` (today's law, unchanged) | under committed near voxels — ≤-truth licensed |
+| B (weld) | `r_near − W .. r_env` | ramp `env−sink → d·(r_datum+g_top) − d·ε_blk` over the first W, then hold block-top − ε_blk | equals near top −1; ties depth-biased; near-edge wall collapses to ≤ ~1 block |
+| F (feather) | `r_env .. r_env+16` | blend block-top−ε_blk → `true_pos` (today's w) | outside max near reach — protrusion impossible |
+
+- `r_near` source: the controller/viewer's committed near view radius (WorldManager already
+  calls `set_player_column` per streaming tick — piggyback the radius on the same call),
+  clamped to `[64 .. near_render_radius()]`; conservative LOW (a too-small r_near only widens
+  zone B, which is valid under near mesh too — anisotropic/ragged near edges are therefore
+  safe by construction, not by tuning).
+- Rebake trigger: existing drift cadence + `|r_near − baked r_near| > 8` → `request_refresh`
+  (staggered path, unchanged). FP_RIM_CHEAP crescent: zone-B nodes join the always-fresh set
+  only when `r_near` moved (else cache-reuse as today; `g` is terrain-invariant so the cached
+  vertex is already block-top-exact).
+- Mid-cell chord-over-dip (S2 lerps between 4-block nodes; a 1-cell dip is bridged): bounded by
+  relief variation within one S2 cell; where near mesh covers the dip the bridge would poke its
+  walls — covered by ε_blk=1 + measured bound (gate G-RIM-WELD-BOUND below re-derives it the
+  way RIM_ENV_RESID was derived; if the fixture bound exceeds 1.0, raise ε_blk to it, never
+  above 2.0 — past that prefer min-of-cell g).
+- The `backstop_sink()`-vs-`backstop_sink_rim()` mis-constant at `facet_smooth_tier.gd:1029`
+  is SUPERSEDED in zones B/F (sink no longer appears there) and irrelevant in zone H (hidden);
+  do not touch the argument with the flag off (byte-identity).
+
+**Byte-off:** `const FP_RIM_NEAR_WELD := false` in `cube_sphere.gd`; `build_tile_rim` gains
+`near_weld_on := CubeSphere.FP_RIM_NEAR_WELD` + `r_near := -1.0` defaulted args; every new
+branch is `if near_weld_on` — off ⇒ the exact shipped expression sequence (G-RNW-OFF asserts
+output-array byte-equality against the pre-change law).
+
+## R7.3 DEFECT 2 — flat pixelated skin patch
+
+Root cause (two cooperating, both by-design visible): a facet outside the smooth-resident set
+draws the **skin** (~6 blk/texel, zero relief), and at surface alts **FP_FINE_BAKE_SURFACE_PAUSE
+keeps that skin at its coarse mip** — so any skin inside the surface horizon is maximally ugly
+exactly where the player can compare it against relieved smooth tiles. Whether a given patch is
+(i) warmup-transient (FP_SMOOTH_GROW_PACE / RIM_PACE paced ladder still converging —
+`smooth_res` climbing) or (ii) steady-state reach (hop-band/cap frontier inside the alt-157
+horizon ≈ 3–4 facet hops) must be settled by ONE live observation (below) before coding.
+- If (i): no fix — verify convergence time is acceptable (<~2 min) and stop.
+- If (ii): **FP_SMOOTH_HORIZON_COVER** — extend the S5 band so the smooth frontier lies beyond
+  the surface-alt horizon (hop ≤ 10 → hop ≤ 13; `SMOOTH_S5_MAX` 200 → 360; S5 tile ≈ 8.6 KB ⇒
+  +~1.4 MB, inside the 96 MB ledger). At orbit the frontier stays inside the disc by design —
+  skin at range is ACCEPTED (it foreshortens toward the limb; fine bake resumes off-surface),
+  per the acceptance rule "no flat-skin facet adjacent to the near region, skin allowed at
+  range". Gate G-SMOOTH-HORIZON: at a fixture surface alt, no skin-drawn facet within the
+  computed horizon hop count (falsify: force cap 20 → must fail).
+
+## R7.4 DEFECT 3 — the visible line where heights DO match
+
+Collapses into D1 for the height/step component (the annulus boundary IS the line). What
+remains after R7.2 is the colour/relief texture contrast: near = block textures + VoxiLight
+faces; rim = FarPalette/skin-slot vertex colour + smooth normals. FP_SHADE_UNIFIED +
+FP_SKIN_BLOCK_EXACT already align the colour LAWS, so the residual is detail-frequency only.
+**No code now** — re-eyeball after R7.2 ships; contingency (only if still flagged): a
+detail-noise band in the smooth material within ~16 blocks of `r_near` (shader-only,
+FP_RIM_DETAIL_BAND, zero mesh/bytes).
+
+## R7.5 Gates (verify_far_smooth additions — each with a falsify)
+
+1. **G-RNW-STEP (the REAL LAW R-D acceptance gate).** Flag ON: build a rim tile against a
+   fixture player column; for ≥ 200 sampled boundary columns at dist ∈ [r_near−2 .. r_near+8],
+   assert `near_top(g) − rim_height ≤ ε_blk + 1.0` AND ≥ 0 (no protrusion). Falsify: rebuild
+   with the shipped law (near_weld_on=false) and assert the SAME probe reports a step ≥ 4
+   blocks — proves the gate can see the wall the user saw.
+2. **G-RNW-NOPOKE.** Flag ON: at every fine sample (mult 4 reference) in zone B, rim ≤
+   near-law block-top. Falsify: ε_blk = −1 → must fail.
+3. **G-RIM-WELD-BOUND.** Measure max mid-cell chord-over-dip vs the fine reference across the
+   58-facet fixture set (same harness as RIM_ENV_RESID's derivation); assert ≤ ε_blk. Records
+   the constant's provenance. Falsify: ε_blk = 0.
+4. **G-RNW-OFF.** Flag OFF: `build_tile_rim` output arrays byte-equal to the pre-change
+   reference for 3 fixture facets (and FLAT 6042/0 as always).
+5. **Re-point G-NF-HEIGHT** to sample the annulus (it currently starts at R_env+feather —
+   the gate gap named in R7.1); keep the old beyond-feather assertion too.
+6. **G-SMOOTH-HORIZON** (only with FP_SMOOTH_HORIZON_COVER, see R7.3).
+
+## R7.6 Verdict
+
+**YELLOW.** D1's mechanism is code-verified end-to-end (annulus geometry + the three additive
+sink terms + the gate gap) and the fix is surgical, byte-off, and two-sided-gated; what keeps
+it from GREEN: (a) the exact live wall height depends on which `backstop_sink()` branch the
+deployed flag set takes (env_all 11.7 vs envelope 5.2) — prediction-only, not fix-blocking;
+(b) D2's transient-vs-steady split needs one live observation. **Single riskiest unknown:**
+the fidelity of `r_near` (a scalar) against a ragged/anisotropic real near-mesh edge — the
+design neutralizes it by making zone B's block-top law valid on BOTH sides of the edge, but
+that argument leans on the depth bias ordering coplanar ties on WebGL2's 24-bit buffer at
+~100-block eye distances (FP_TIER_DEPTH_BIAS's own analysis says quanta ≫ needed there;
+G-RNW-NOPOKE plus one live boundary walk confirms).
+
+**Live re-checks requested (driver: main session):** (1) dwell 3–5 min at the D2 patch, read
+`smooth_res` — climbing ⇒ transient (R7.3-i), pinned ⇒ reach (R7.3-ii), then screenshot;
+(2) confirm the deployed flag set includes FP_ENV_ALL / FP_TIER_ENVELOPE / FP_FARRING_FULL_COVER
+(fixes the wall-height prediction); (3) post-R7.2: noon boundary walk at the same spot — the
+wall must read ≤ ~1 block.
+
+**Ship order:** FP_RIM_NEAR_WELD (D1+D3) → live re-check → FP_SMOOTH_HORIZON_COVER only if
+D2 is steady-state. The equal-height law at the exposed rim remains the acceptance criterion
+that outranks tier mechanics (R.5) — this revision is the first time a gate actually measures
+it where the user stands.

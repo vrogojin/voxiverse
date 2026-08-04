@@ -964,6 +964,21 @@ const RIM_STREAM_MARGIN := 32.0
 ## spanning the disc compute IDENTICAL boundary values ⇒ the weld canon survives the blend (G-RIM-WELD).
 const RIM_FEATHER_BLOCKS := 16.0
 
+## FP_RIM_NEAR_WELD — REVISION 7-VISUAL (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §R7.2): the near↔far HEIGHT-WALL
+## fix. The S2 collar's shipped law sinks its WHOLE disc interior to `env − sink` (`build_tile_rim` w=0), and the
+## sink (5–13 blocks, derived from the 26-block BACKSTOP cell — mis-scaled for the ~4-block S2 cell) + REV5's −3.0
+## resid + the env footprint-min stack to an 8–20-block drop. The near voxel field ends at ~112–128 but the disc's
+## true-height frontier is at R_env(160)+feather(176), so a 48–64-block annulus of that sunk rim is the VISIBLE
+## ground beyond the near blocks → the near region's cut edge shows as a multi-strata block-face wall. The fix welds
+## that visible annulus to the near mesher's own block-quantised top (`true_pos − ε`, where true_pos = d·(r_datum +
+## max(0,g)) is exactly the near block-top for land / sea level for water, block-quantised because relief is integer)
+## so the step collapses to ≤ ~1 block, seamless whether or not near voxels have streamed in (block-top is what the
+## near mesher WILL build). The R_env true-height frontier does NOT move (§2.1 stream-in invariant survives). Height
+## is terrain-invariant (crescent-reuse safe). Default false ⇒ the shipped env−sink law verbatim (G-RNW-OFF byte-eq).
+const FP_RIM_NEAR_WELD := false
+const RIM_WELD_BAND := 16.0    ## blocks: the ramp width just inside r_near over which env−sink → block-top (zone B ramp)
+const RIM_WELD_EPS := 1.0      ## blocks: the block-top is dropped this far so the rim never protrudes above near (near wins the coplanar tie); G-RIM-WELD-BOUND may raise it up to 2.0
+
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (R5.3 §7.1, FP_RIM_CHEAP): the S2 near-collar's warmup
 ## cost fix. Live: `FacetSmoothTier.build_tile_rim` → `_env_weld_grid(fid, 104)` at the shipped ENV_FINE_MULT(4) ≈
 ## 417² ≈ 174k `profile_at_dir` samples/facet on a worker — the confirmed warmup allocator-convoy source (a

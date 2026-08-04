@@ -761,11 +761,19 @@ const SMOOTH_STICKY_DWELL_MS := 5000
 ## real bytes ⇒ NEVER-OOM). Skin at ORBIT range stays (foreshortens at the limb; fine bake resumes off-surface).
 ## Default false ⇒ smooth_s5_max()/smooth_s5_hop() return the shipped 200/10 ⇒ byte-identical. Gate G-SMOOTH-HORIZON.
 const FP_SMOOTH_HORIZON_COVER := false
-const SMOOTH_S5_MAX_HORIZON := 360        ## S5 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S5_MAX=200)
-const SMOOTH_STICKY_S5_HOP_HORIZON := 13  ## S5 hop-ring reach when FP_SMOOTH_HORIZON_COVER (else SMOOTH_STICKY_S5_HOP=10)
-## Effective S5 residency cap / hop reach — flag-gated so the OFF path is the shipped const verbatim (byte-off).
+## REV7-VISUAL "push smooth relief much further out" (user directive after the smooth↔block-LOD frontier was
+## identified — issue #28): extend the smooth reach so the coarse block-LOD tier is pushed toward the limb / out of
+## normal view. S5 (coarse frontier) hop 10→20 + cap 200→600, AND S4 (finer) cap 64→130 so the pushed-out region
+## isn't only the coarsest tier. Bounded by SMOOTH_BYTES_MAX (96 MB ledger caps real bytes ⇒ NEVER-OOM); worst-case
+## ≈ 25·S3 + 130·S4 + 600·S5 tiles ≈ ~24 MB, well under the ceiling. Off ⇒ shipped 200/10/64 (byte-off).
+const SMOOTH_S5_MAX_HORIZON := 600        ## S5 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S5_MAX=200)
+const SMOOTH_STICKY_S5_HOP_HORIZON := 20  ## S5 hop-ring reach when FP_SMOOTH_HORIZON_COVER (else SMOOTH_STICKY_S5_HOP=10)
+const SMOOTH_S4_MAX_HORIZON := 130        ## S4 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S4_MAX=64)
+## Effective S4/S5 residency caps / hop reach — flag-gated so the OFF path is the shipped const verbatim (byte-off).
 static func smooth_s5_max() -> int:
 	return SMOOTH_S5_MAX_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_S5_MAX
+static func smooth_s4_max() -> int:
+	return SMOOTH_S4_MAX_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_S4_MAX
 static func smooth_s5_hop() -> int:
 	return SMOOTH_STICKY_S5_HOP_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_STICKY_S5_HOP
 

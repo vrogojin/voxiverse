@@ -106,6 +106,17 @@ var _sticky_active_fid := -2             # -2 (never equal to a real fid or -1) 
 var _sticky_target: Dictionary = {}      # fid -> tier (S3/S4/S5), the current hop-ring assignment
 var _sticky_stale_since: Dictionary = {} # fid -> Time.get_ticks_msec() when this resident facet first fell out of target
 
+## FP_SMOOTH_GROW_PACE (warmup pacing extension, see the flag doc in cube_sphere.gd): the driver's own gradual-
+## unlock gate over the hop-ring target, so a cold engage never hands `FacetSmoothTier.request()` the whole ~289-
+## facet target in one call. `_grow_added`/`_grow_queued` only ever GROW (a fid unlocked once stays unlocked — the
+## same "sticky, once resident stays" law, just reached gradually) — bounded by the total facet count, NEVER-OOM.
+## `_grow_pending`/`_grow_idx` is an append-only queue + an O(1) forward cursor (never rescanned, never shifted) in
+## the SAME nearest-first BFS order `_smooth_hop_assignment` produces. All empty/0/unused with the flag off.
+var _grow_added: Dictionary = {}    # fid -> true, unlocked (may be requested) — monotonic, never un-set
+var _grow_queued: Dictionary = {}   # fid -> true, already enqueued-or-unlocked once (dedupes repeated appends)
+var _grow_pending: Array = []       # fid queue awaiting its pacing turn, nearest-first (append-only)
+var _grow_idx := 0                  # cursor into _grow_pending: entries before this index have been unlocked
+
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-B (FP_SMOOTH_MESH_INC): the shell-commit generation handshake
 # for a facet LEAVING the smooth-resident set entirely. `_shell_gen` increments every time the shell mesh actually
 # COMMITS a rebuild (`_swap_in_arrays` / `_rebuild_full`); `_smooth_leaving[fid]` records the generation the facet was
@@ -533,10 +544,16 @@ func set_active(new_fid: int) -> void:
 ## every branch below behaves exactly as REV2 shipped it (byte-identical). The REV2 flags are ALSO exposed as
 ## defaulted params (mirroring `idle_on`) purely so a headless gate can force the FULL REV2+REV3 pipeline on without
 ## flipping the compile-time consts — every real caller (`_process`) still gets the shipped const values.
+## `grow_on` (FP_SMOOTH_GROW_PACE, see the flag doc in cube_sphere.gd): gradually unlocks the hop-ring target into
+## `_want` instead of handing the whole ~289-facet result to `request()` in one call — the warmup flood fix. Folded
+## into `pending_handshake` (growth still draining ⇒ the Q1 idle-reuse fixpoint must NOT latch early, or `_want`
+## would freeze at whatever partial subset the first call granted) and applied ONLY inside the `sticky_on` branch
+## (the legacy camera-ranked `else` path predates R-A and is not paced — REV2+ callers always pass sticky_on=true).
 func _smooth_drive(idle_on := CubeSphere.FP_SMOOTH_IDLE, sticky_on := CubeSphere.FP_SMOOTH_STICKY,
 		rim_on := CubeSphere.FP_SMOOTH_RIM, mesh_inc_on := CubeSphere.FP_SMOOTH_MESH_INC,
-		skin_slot_on := CubeSphere.FP_SMOOTH_SKIN_SLOT) -> void:
-	var pending_handshake := idle_on and (not _smooth_leaving.is_empty() or not _sticky_stale_since.is_empty())
+		skin_slot_on := CubeSphere.FP_SMOOTH_SKIN_SLOT, grow_on := CubeSphere.FP_SMOOTH_GROW_PACE) -> void:
+	var growing := grow_on and _grow_idx < _grow_pending.size()
+	var pending_handshake := idle_on and (not _smooth_leaving.is_empty() or not _sticky_stale_since.is_empty() or growing)
 	var sig := ""
 	var reuse := false
 	if idle_on:
@@ -552,7 +569,12 @@ func _smooth_drive(idle_on := CubeSphere.FP_SMOOTH_IDLE, sticky_on := CubeSphere
 		if _active_fid != _sticky_active_fid:
 			_sticky_target = _smooth_hop_assignment(_active_fid)   # a crossing — the ONLY time this recomputes
 			_sticky_active_fid = _active_fid
+			if grow_on:
+				_grow_note_new_target(_sticky_target, _active_fid)
 		assign = _sticky_apply_dwell(_sticky_target)
+		if grow_on:
+			_grow_advance(CubeSphere.SMOOTH_GROW_PER_FRAME)
+			assign = _grow_filter(assign)
 	else:
 		var ranked := _smooth_ranked_fids(_active_fid)
 		assign = _smooth_next_assignment(ranked)
@@ -642,6 +664,62 @@ func _smooth_hop_assignment(active: int) -> Dictionary:
 				counts[tier] = int(counts[tier]) + 1
 		frontier = next_frontier
 	return assign
+
+## FP_SMOOTH_GROW_PACE warmup pacing (see the flag doc in cube_sphere.gd): `active`'s direct, non-backstop seam
+## neighbours — exactly the hop=1 frontier `_smooth_hop_assignment`'s BFS visits first. These are unlocked
+## IMMEDIATELY (never queued/paced) so the near↔far seam is covered on the very first `_smooth_drive` call of a
+## cold engage — the pacing only trickles the OUTER hemisphere (hop ≥ 2). Pure, O(4).
+func _smooth_ring1_fids(active: int) -> Array:
+	var out := []
+	for slot in [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]:
+		var nb := FacetAtlas.seam_neighbour(active, slot)
+		if nb >= 0 and not _is_backstop(nb):
+			out.append(nb)
+	return out
+
+## FP_SMOOTH_GROW_PACE: called only when `target` was FRESHLY (re)computed (a cold engage or a real crossing).
+## Ring-1 fids (see `_smooth_ring1_fids`) are unlocked into `_grow_added` right away; every OTHER fid in `target`
+## not already seen (`_grow_queued`) is appended to `_grow_pending` in `target`'s own nearest-first BFS key order
+## (Dictionary preserves insertion order — the same order `_smooth_hop_assignment` built it in). Fids already
+## unlocked/queued from an EARLIER target (a facet that stayed in range across a crossing) are left exactly where
+## they are — this queue is append-only and never rebuilt from scratch, so an in-progress pace is never restarted.
+func _grow_note_new_target(target: Dictionary, active: int) -> void:
+	var ring1 := {}
+	for f in _smooth_ring1_fids(active):
+		ring1[int(f)] = true
+	for fid in target.keys():
+		var f := int(fid)
+		if _grow_queued.has(f):
+			continue
+		_grow_queued[f] = true
+		if ring1.has(f):
+			_grow_added[f] = true   # hop=1 fast path — never paced
+		else:
+			_grow_pending.append(f)
+
+## FP_SMOOTH_GROW_PACE: unlock at most `cap` more fids from the front of `_grow_pending` (an O(1) index cursor —
+## never re-scanned, never shifted). A no-op (O(1)) once `_grow_idx` has reached the end — the fully-grown steady
+## state does zero further work here.
+func _grow_advance(cap: int) -> void:
+	var n := 0
+	while n < cap and _grow_idx < _grow_pending.size():
+		var f := int(_grow_pending[_grow_idx])
+		_grow_idx += 1
+		_grow_added[f] = true
+		n += 1
+
+## FP_SMOOTH_GROW_PACE: filter `assign` down to only fids already unlocked (`_grow_added`) — the driver's actual
+## request to `FacetSmoothTier.request()`/`_rim_assign`/`_mesh_inc_gate` this call. A fid present in `assign` but
+## not yet unlocked simply stays on whatever role it already had (shell/backstop) until its pacing turn — never a
+## hole (the shipped emit-exclusion/make-before-break laws only ever exclude a fid once ITS OWN smooth tile is
+## actually resident, which can't happen before it's unlocked).
+func _grow_filter(assign: Dictionary) -> Dictionary:
+	var out := {}
+	for fid in assign.keys():
+		var f := int(fid)
+		if _grow_added.has(f):
+			out[f] = assign[fid]
+	return out
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-A (dwell): a currently-resident facet that fell out of
 ## `target` is NOT immediately handed to `FacetSmoothTier.request()` for eviction — it stays in the returned dict at

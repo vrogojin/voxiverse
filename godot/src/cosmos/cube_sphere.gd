@@ -991,6 +991,45 @@ const FP_RIM_CHEAP := false
 ## slow any one of them makes the frame.
 const RIM_PACE_FRAMES := 8
 
+## FP_SMOOTH_GROW_PACE (warmup pacing, extends R5.3 §7.1 to the S3/S4/S5 LADDER — Stage D/FP_RIM_CHEAP only paced
+## the S2 collar's cold-engage grants; this flag is the analogous fix for the OTHER, bigger flood: a cold engage
+## (load/descent) hands `_smooth_hop_assignment`'s WHOLE hop-ring result — up to 289 facets (SMOOTH_S3_MAX(25) +
+## SMOOTH_S4_MAX(64) + SMOOTH_S5_MAX(200)) — to `FacetSmoothTier.request()` in the SAME `_smooth_drive` call, so the
+## tier tries to build all 289 tiles as fast as `SMOOTH_BUILD_SLOTS` worker slots + the main-thread mesh-apply allow
+## — the measured proc≈234ms / fps 1.3–15 spike for ~60s (`smooth_res` climbing 109→159 mid-spike). The steady
+## state (all 289 built) is fine — it's the initial GROWTH that floods. Fix: grow the driver's REQUESTED (`_want`)
+## set gradually. `FacetFarRing._smooth_drive`'s `sticky_on` branch, after computing/reusing `_sticky_target` and
+## applying dwell (`_sticky_apply_dwell`, unchanged), filters the result down to only fids already "unlocked"
+## (`_grow_added`) before handing it to `request()`/`_rim_assign`/`_mesh_inc_gate`: `_grow_note_new_target` enqueues
+## every NEWLY-seen target fid (first cold engage, or the handful a later crossing adds) onto `_grow_pending` in the
+## SAME nearest-first BFS order `_smooth_hop_assignment` already produces (Dictionary preserves insertion order) —
+## except `_smooth_ring1_fids(active)` (active's direct, non-backstop seam neighbours — exactly hop=1) which are
+## unlocked IMMEDIATELY, never queued, so the near↔far seam is covered on the VERY FIRST call, before any pacing
+## wait. `_grow_advance` then unlocks ≤ `SMOOTH_GROW_PER_FRAME` more fids per `_smooth_drive` call (an O(1) index
+## cursor into `_grow_pending`, never re-scanned or shifted) — a cold 289-facet engage trickles in over
+## ~ceil(285/SMOOTH_GROW_PER_FRAME) calls (seconds, not one flooded frame). `_grow_added`/`_grow_queued` only ever
+## GROW (a fid unlocked once stays unlocked — matches R-A's "once resident, stays" sticky law, just reached
+## gradually) and are bounded by the total facet count (`FacetAtlas.facet_count()`, a few KB worst case — NEVER-OOM,
+## the same bound `_rim_paced` already relies on). Composes with FP_SMOOTH_IDLE: `pending_handshake` (the gate that
+## blocks the Q1 idle-reuse fixpoint from latching prematurely) now ALSO includes "grow still draining"
+## (`grow_on and _grow_idx < _grow_pending.size()`) — without this, the (active_fid, excluded) signature can repeat
+## every frame WHILE growth is mid-flight (no crossing, no pool change) and Q1's reuse would freeze `_want` at
+## whatever partial subset the FIRST call granted, forever; with it, the driver keeps taking the full recompute path
+## until growth actually finishes, THEN the existing Q1 fixpoint engages (grown + stationary ⇒ zero further work,
+## the idle latch is not re-triggered by this flag). The main-thread mesh-APPLY side needs no new cap: `step()`'s
+## shipped `for t in [S2,S3,S4,S5]: if _dirty_tier[t]: _rebuild_tier_mesh(t); break` already rebuilds AT MOST ONE
+## tier's ArrayMesh per call (the FP_SMOOTH_TXN-off path, the shipped default) — this flag only slows how fast NEW
+## facets enter `_want` in the first place, which is what was driving that already-bounded apply continuously.
+## Off ⇒ `_grow_note_new_target`/`_grow_advance` are never called and the sticky_on branch hands `_sticky_apply_dwell`'s
+## FULL result straight through — byte-identical to the shipped flood (FLAT 6042/0). Gate: verify_far_smooth.gd
+## (G-FS-GROW-PACE; falsifies: forced off, the whole hop-ring target lands in `_want` in the SAME first call).
+const FP_SMOOTH_GROW_PACE := false
+## New facets the driver unlocks into the grow-pace queue per `_smooth_drive` call (beyond the immediate ring-1
+## fast path, which is never paced). Frame-COUNT pacing (mirrors RIM_PACE_FRAMES's rationale): the S3/S4/S5 builds
+## themselves are what slow the frame, so counting calls (not wall-clock) spreads the flood out regardless of how
+## slow any one call runs.
+const SMOOTH_GROW_PER_FRAME := 2
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

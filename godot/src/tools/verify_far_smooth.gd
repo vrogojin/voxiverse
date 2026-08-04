@@ -185,6 +185,11 @@ func _initialize() -> void:
 	_gate_rim_crescent(fid_int)
 	_gate_rim_pace()
 
+	# --- REVISION 5 extension (warmup pacing for the S3/S4/S5 LADDER — Stage D/FP_RIM_CHEAP only paced the S2
+	# collar; the bigger flood is the ladder's own cold-engage hop-ring target, up to 289 facets in one call) ---
+	_ok(not CubeSphere.FP_SMOOTH_GROW_PACE, "G-R5-OFF: FP_SMOOTH_GROW_PACE defaults false (byte-off; the sticky_on branch hands the FULL hop-ring target to request() in one call)")
+	_gate_grow_pace()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -2622,3 +2627,96 @@ func _gate_rim_pace() -> void:
 				granted_final += 1
 		total_calls += 1
 	_ok(granted_final == rim_role_count, "G-RIM-PACE: the stagger eventually grants ALL %d rim-role facets S2 (got %d after %d calls) -- never stalls" % [rim_role_count, granted_final, total_calls])
+
+## G-FS-GROW-PACE (REVISION 5 extension, warmup pacing for the S3/S4/S5 LADDER, FP_SMOOTH_GROW_PACE): a cold engage
+## (empty resident set) grows the driver's REQUESTED set (`FacetSmoothTier._want`, what `_smooth_drive` actually
+## hands to `request()`) gradually -- at most SMOOTH_GROW_PER_FRAME NEW facets per call, ring-1 (the near<->far seam)
+## excepted, which is granted on the very first call -- instead of flooding the whole ~289-facet hop-ring target in
+## one call. Proves: (A) FALSIFY -- grow_on=false floods the FULL target into `_want` in the SAME first call (the
+## shipped warmup flood). (B)/(C) grow_on=true's first call is a small partial subset, and no single subsequent call
+## ever grows `_want` by more than SMOOTH_GROW_PER_FRAME. (D) the grow reaches the FULL target within a bounded
+## number of calls -- never stalls. (E) once fully grown it converges to REAL committed tiles, and composes with
+## FP_SMOOTH_IDLE: zero further request() rebuilds over many settled frames while stationary (the idle latch is not
+## permanently blocked by, nor prematurely triggered ahead of, the grow-pace queue). (F) ring-1 is never paced.
+func _gate_grow_pace() -> void:
+	print("  --- G-FS-GROW-PACE: FP_SMOOTH_GROW_PACE grows the driver's requested set gradually (<= SMOOTH_GROW_PER_FRAME new/call) ---")
+	var fid := _fid_of(1, 11, 11)
+
+	var probe := FacetFarRing.new()
+	probe.setup(fid)
+	var target: Dictionary = probe._smooth_hop_assignment(fid)
+	probe.free()
+	_ok(target.size() > CubeSphere.SMOOTH_GROW_PER_FRAME * 4, "G-FS-GROW-PACE: fixture's cold hop-ring target (%d facets) is well beyond a few pacing windows (non-vacuous flood scenario)" % target.size())
+
+	# (A) FALSIFY: grow_on=false (shipped) floods the WHOLE target into `_want` in the SAME first call.
+	var ring_off := FacetFarRing.new()
+	ring_off.setup(fid)
+	ring_off._smooth = FST.new()
+	ring_off._smooth.setup_instance(ring_off, null)
+	ring_off._active_fid = fid
+	ring_off._smooth_drive(true, true, false, false, false, false)
+	_ok(ring_off._smooth._want.size() == target.size(), "G-FS-GROW-PACE-FALSIFY: grow_on=false floods the FULL %d-facet target into _want in the SAME first call (got %d) -- the shipped warmup flood this flag fixes" % [target.size(), ring_off._smooth._want.size()])
+	ring_off.free()
+
+	# (B) first call, grow_on=true: `_want` is a small partial subset of the full target, never the flood.
+	var ring := FacetFarRing.new()
+	ring.setup(fid)
+	ring._smooth = FST.new()
+	ring._smooth.setup_instance(ring, null)
+	ring._active_fid = fid
+	ring._smooth_drive(true, true, false, false, false, true)
+	var want1: int = ring._smooth._want.size()
+	_ok(want1 > 0 and want1 < target.size(), "G-FS-GROW-PACE: first call under grow_on grants a partial subset of the %d-facet target (got %d) -- no flood" % [target.size(), want1])
+
+	# (C) per-call growth is bounded: over the next many calls, `_want` never grows by more than
+	# SMOOTH_GROW_PER_FRAME in any single subsequent call.
+	var prev := want1
+	var max_step := 0
+	for i in range(400):
+		ring._smooth_drive(true, true, false, false, false, true)
+		var now: int = ring._smooth._want.size()
+		max_step = maxi(max_step, now - prev)
+		prev = now
+		if now >= target.size():
+			break
+	_ok(max_step <= CubeSphere.SMOOTH_GROW_PER_FRAME, "G-FS-GROW-PACE: no single call ever grows _want by more than SMOOTH_GROW_PER_FRAME(%d) (observed max step %d)" % [CubeSphere.SMOOTH_GROW_PER_FRAME, max_step])
+
+	# (D) the grow eventually reaches the FULL target -- never stalls.
+	var budget := target.size() * 4 + 200
+	var calls := 0
+	while ring._smooth._want.size() < target.size() and calls < budget:
+		ring._smooth_drive(true, true, false, false, false, true)
+		calls += 1
+	_ok(ring._smooth._want.size() == target.size(), "G-FS-GROW-PACE: the gradual grow reaches the FULL %d-facet target within a bounded number of calls (got %d after %d extra calls)" % [target.size(), ring._smooth._want.size(), calls])
+
+	# (E) drive FacetSmoothTier.step() to REAL settle (worker builds actually commit against the fully-grown want),
+	# then confirm ZERO further request()/_snap_plan rebuilds while stationary -- composes with FP_SMOOTH_IDLE
+	# (mirrors G-FS-QUIESCE's driver check) -- the grow-pace queue neither blocks nor re-triggers the idle latch.
+	var settle_iters := 0
+	while settle_iters < 20000 and not ring._smooth.is_settled():
+		ring._smooth_drive(true, true, false, false, false, true)
+		settle_iters += 1
+	_ok(ring._smooth.is_settled(), "G-FS-GROW-PACE warm-up: the fully-grown target actually converges to REAL committed tiles (%d iterations)" % settle_iters)
+	var req_after_grow: int = ring._smooth.request_rebuild_count()
+	for i in range(300):
+		ring._smooth_drive(true, true, false, false, false, true)
+	_ok(ring._smooth.request_rebuild_count() == req_after_grow, "G-FS-GROW-PACE: ZERO further request() rebuilds over 300 settled frames once fully grown + stationary (idle latch holds, %d -> %d)" % [req_after_grow, ring._smooth.request_rebuild_count()])
+	_ok(ring._smooth.is_settled(), "G-FS-GROW-PACE: FacetSmoothTier stays settled at rest post-grow")
+	ring.free()
+
+	# (F) ring-1 fast path: active's direct (non-backstop) seam neighbours are granted on the VERY FIRST call, never
+	# waiting on the pacing queue.
+	var ring_fast := FacetFarRing.new()
+	ring_fast.setup(fid)
+	var ring1: Array = ring_fast._smooth_ring1_fids(fid)
+	_ok(ring1.size() > 0, "G-FS-GROW-PACE: fixture has a non-empty ring-1 (non-vacuous fast-path check)")
+	ring_fast._smooth = FST.new()
+	ring_fast._smooth.setup_instance(ring_fast, null)
+	ring_fast._active_fid = fid
+	ring_fast._smooth_drive(true, true, false, false, false, true)
+	var all_ring1_in := true
+	for f in ring1:
+		if not ring_fast._smooth._want.has(int(f)):
+			all_ring1_in = false
+	_ok(all_ring1_in, "G-FS-GROW-PACE: every ring-1 (active's direct seam-neighbour) facet is granted on the VERY FIRST call -- the near<->far seam is covered promptly, never paced")
+	ring_fast.free()

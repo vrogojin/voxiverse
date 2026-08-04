@@ -605,7 +605,9 @@ func _smooth_drive(idle_on := CubeSphere.FP_SMOOTH_IDLE, sticky_on := CubeSphere
 		for fid in assign.keys():
 			slots[int(fid)] = _slot_of(int(fid))
 	_smooth.request(assign, slots, idle_on)
+	var _t_step := Time.get_ticks_usec()
 	_smooth.step(idle_on)
+	_dbg_step_ms = (Time.get_ticks_usec() - _t_step) / 1000.0
 	if idle_on:
 		_smooth_last_assign = assign
 		_smooth_idle_sig = sig
@@ -1173,10 +1175,19 @@ func set_pool_excluded(fids: Array) -> void:
 ## COSMOS-PERF STEP 2: first drain any finished off-thread build (swap it in on the main thread). A new crossing that
 ## arrives while a build is in flight keeps _pending set but does NOT re-dispatch (_async_building gate) — it is served
 ## once the in-flight build lands, so the worker's read-only cache snapshot is never mutated under it.
+# REVISION 7 warmup diagnosis: per-frame ms in the smooth DRIVER (_smooth_drive incl. request+step), the smooth
+# tier's step() alone, and the env converge-emit — the three uninstrumented main-thread costs the warmup proc
+# breakdown (vt/tex/commit/phys all 0 during fill) points at. Surfaced in telemetry to pinpoint the real bottleneck.
+var _dbg_drive_ms := 0.0
+var _dbg_step_ms := 0.0
+var _dbg_env_ms := 0.0
+
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
 	if _smooth != null:
+		var _t_drv := Time.get_ticks_usec()
 		_smooth_drive()   # FP_FAR_SMOOTH (P1): worker-baked smooth REPLACEMENT ladder for the visible hemisphere (runs every frame)
+		_dbg_drive_ms = (Time.get_ticks_usec() - _t_drv) / 1000.0
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -1256,7 +1267,9 @@ func _process(_dt: float) -> void:
 	elif TierPlace.warm_converge_on():
 		# TIER-DEPTH warm-converge: the SURFACE path adopts the progressive discipline so a stale un-sunk backstop quad
 		# never lingers over live near meshes while the dense caches warm (the over-near strip / sh_wfail thrash).
+		var _t_env := Time.get_ticks_usec()
 		_surface_converge_emit(p)
+		_dbg_env_ms = (Time.get_ticks_usec() - _t_env) / 1000.0
 	else:
 		# SURFACE (floored) / shipped: the all-or-nothing warm gate (byte-identical; the worker never sees an uncached facet).
 		if not _pending:
@@ -2758,6 +2771,9 @@ func shell_telemetry() -> Dictionary:
 		"smooth_commit_defer": int(_sms.get("smooth_commit_defer", 0)),       # whole commit-events still queued (budget deferral)
 		"smooth_tile_nodes": int(_tss.get("smooth_tile_nodes", 0)),           # FP_SMOOTH_TILE_SURF: live per-tile MeshInstance draw count
 		"smooth_tile_surf_path": int(_tss.get("smooth_tile_surf_path", 0)),   # 1=per-tile path has run this session
+		"smooth_drive_ms": _dbg_drive_ms,                                     # REV7 diag: ms/frame in _smooth_drive (rank+request+step)
+		"smooth_step_ms": _dbg_step_ms,                                       # REV7 diag: ms/frame in _smooth.step() alone (mesh commit)
+		"env_converge_ms": _dbg_env_ms,                                       # REV7 diag: ms/frame in _surface_converge_emit
 		"sh_emit": _emitted.size(),
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,

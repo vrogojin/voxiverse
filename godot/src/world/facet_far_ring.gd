@@ -639,7 +639,7 @@ func _smooth_hop_assignment(active: int) -> Dictionary:
 	var slots := [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]
 	var counts := {FacetSmoothTier.S3: 0, FacetSmoothTier.S4: 0, FacetSmoothTier.S5: 0}
 	var hop := 0
-	while not frontier.is_empty() and hop < CubeSphere.SMOOTH_STICKY_S5_HOP:
+	while not frontier.is_empty() and hop < CubeSphere.smooth_s5_hop():
 		hop += 1
 		var next_frontier := []
 		for fid in frontier:
@@ -656,7 +656,7 @@ func _smooth_hop_assignment(active: int) -> Dictionary:
 					tier = FacetSmoothTier.S3
 				elif hop <= CubeSphere.SMOOTH_STICKY_S4_HOP:
 					tier = FacetSmoothTier.S4
-				elif hop <= CubeSphere.SMOOTH_STICKY_S5_HOP:
+				elif hop <= CubeSphere.smooth_s5_hop():
 					tier = FacetSmoothTier.S5
 				if tier < 0:
 					continue
@@ -883,7 +883,7 @@ func _smooth_ranked_fids(active: int) -> Array:
 	var order := []
 	var frontier := [active]
 	var slots := [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]
-	var cap_total := CubeSphere.SMOOTH_S3_MAX + CubeSphere.SMOOTH_S4_MAX + CubeSphere.SMOOTH_S5_MAX
+	var cap_total := CubeSphere.SMOOTH_S3_MAX + CubeSphere.SMOOTH_S4_MAX + CubeSphere.smooth_s5_max()
 	var hyst_total := int(float(cap_total) * CubeSphere.SSE_HYST) + 16
 	while not frontier.is_empty() and order.size() < hyst_total:
 		var next_frontier := []
@@ -913,7 +913,7 @@ func _smooth_next_assignment(ranked: Array) -> Dictionary:
 		rank_of[int(ranked[i])] = i
 	var b1 := CubeSphere.SMOOTH_S3_MAX
 	var b2 := b1 + CubeSphere.SMOOTH_S4_MAX
-	var b3 := b2 + CubeSphere.SMOOTH_S5_MAX
+	var b3 := b2 + CubeSphere.smooth_s5_max()
 	var d1 := int(float(b1) * CubeSphere.SSE_HYST)
 	var d2 := int(float(b2) * CubeSphere.SSE_HYST)
 	var d3 := int(float(b3) * CubeSphere.SSE_HYST)
@@ -949,7 +949,7 @@ func _smooth_next_assignment(ranked: Array) -> Dictionary:
 			t = FacetSmoothTier.S3
 		elif r < b2 and int(counts[FacetSmoothTier.S4]) < CubeSphere.SMOOTH_S4_MAX:
 			t = FacetSmoothTier.S4
-		elif r < b3 and int(counts[FacetSmoothTier.S5]) < CubeSphere.SMOOTH_S5_MAX:
+		elif r < b3 and int(counts[FacetSmoothTier.S5]) < CubeSphere.smooth_s5_max():
 			t = FacetSmoothTier.S5
 		if t >= 0:
 			assign[f] = t

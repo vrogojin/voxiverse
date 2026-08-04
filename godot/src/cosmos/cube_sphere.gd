@@ -752,6 +752,23 @@ const SMOOTH_STICKY_S4_HOP := 5
 const SMOOTH_STICKY_S5_HOP := 10
 const SMOOTH_STICKY_DWELL_MS := 5000
 
+## FP_SMOOTH_HORIZON_COVER — REVISION 7-VISUAL §R7.3 (DEFECT 2): the "ugly low-res patch" is the flat far SKIN
+## (~6 blk/texel, zero relief) drawn at facets OUTSIDE the smooth-resident set that sit INSIDE the surface-alt
+## horizon — jarring next to relieved smooth tiles (and FP_FINE_BAKE_SURFACE_PAUSE freezes that skin at its coarse
+## mip on-surface, maximally ugly). `smooth_res` is steady-state PINNED (≈182), i.e. a reach gap, not a warmup
+## transient. The fix extends the S5 band so the smooth frontier lies BEYOND the surface horizon: hop 10→13 +
+## SMOOTH_S5_MAX 200→360 (S5 tile ≈ 8.6 KB ⇒ +~1.4 MB, inside the SMOOTH_BYTES_MAX 96 MB ledger which still caps
+## real bytes ⇒ NEVER-OOM). Skin at ORBIT range stays (foreshortens at the limb; fine bake resumes off-surface).
+## Default false ⇒ smooth_s5_max()/smooth_s5_hop() return the shipped 200/10 ⇒ byte-identical. Gate G-SMOOTH-HORIZON.
+const FP_SMOOTH_HORIZON_COVER := false
+const SMOOTH_S5_MAX_HORIZON := 360        ## S5 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S5_MAX=200)
+const SMOOTH_STICKY_S5_HOP_HORIZON := 13  ## S5 hop-ring reach when FP_SMOOTH_HORIZON_COVER (else SMOOTH_STICKY_S5_HOP=10)
+## Effective S5 residency cap / hop reach — flag-gated so the OFF path is the shipped const verbatim (byte-off).
+static func smooth_s5_max() -> int:
+	return SMOOTH_S5_MAX_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_S5_MAX
+static func smooth_s5_hop() -> int:
+	return SMOOTH_STICKY_S5_HOP_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_STICKY_S5_HOP
+
 ## docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 (2026-08-03, Fable) — cheap, immediate laws Q1 + T2. REV2
 ## stabilized WHO is resident (`smooth_res` constant at rest) but left the DRIVER running unconditional per-frame O(res)
 ## work (churn at rest, R3.1.c) and a commit-generation handshake race that can premature-evict a leaving facet before

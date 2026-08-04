@@ -207,6 +207,10 @@ func _initialize() -> void:
 	_ok(not CubeSphere.FP_RIM_NEAR_WELD, "G-RNW-OFF: FP_RIM_NEAR_WELD defaults false (byte-off; build_tile_rim takes the shipped env−sink law — the other G-RIM-* gates exercise it)")
 	_gate_rim_near_weld(fid_int)
 
+	# DEFECT 2 (FP_SMOOTH_HORIZON_COVER, §R7.3): extend the S5 reach so flat skin doesn't show inside the surface horizon.
+	_ok(not CubeSphere.FP_SMOOTH_HORIZON_COVER, "G-SMOOTH-HORIZON-OFF: FP_SMOOTH_HORIZON_COVER defaults false (byte-off; smooth_s5_max()/hop() return the shipped 200/10)")
+	_gate_smooth_horizon()
+
 	# --- REVISION 7 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") ---
 	# FP_SMOOTH_SLOT_MESH: kills the O(N²) whole-tier re-pack/re-upload commit hitch — per-tier fixed-capacity
 	# slotted ArrayMesh + `RenderingServer.mesh_surface_update_vertex_region`/`_attribute_region` GPU region writes
@@ -3384,3 +3388,26 @@ func _gate_tilesurf_off() -> void:
 	_ok(int(ft.tile_surf_stats()["smooth_tile_nodes"]) == 0, "G-TILESURF-OFF: tile_surf_stats() reports 0 per-tile nodes")
 	_ok(int(ft.tile_surf_stats()["smooth_tile_surf_path"]) == 0, "G-TILESURF-OFF: tile_surf_stats() reports the per-tile path never fired")
 	parent.free()
+
+## G-SMOOTH-HORIZON (REVISION 7-VISUAL §R7.3, FP_SMOOTH_HORIZON_COVER): the S5 reach extension that covers the
+## surface horizon so flat low-res skin doesn't show through. Byte-off (the effective cap/hop == the shipped consts
+## with the flag off) + the horizon consts genuinely extend reach + NEVER-OOM (even the bumped cap fits the ledger).
+## The actual "no skin inside the horizon" is a LIVE eyeball (headless can't render the skin/smooth frontier).
+func _gate_smooth_horizon() -> void:
+	print("  --- G-SMOOTH-HORIZON: S5 reach extension (DEFECT 2 low-res skin patch) — byte-off + extends-reach + NEVER-OOM ---")
+	_ok(CubeSphere.smooth_s5_max() == CubeSphere.SMOOTH_S5_MAX,
+		"G-SMOOTH-HORIZON-OFF: smooth_s5_max()==SMOOTH_S5_MAX(%d) with the flag off (byte-off)" % CubeSphere.SMOOTH_S5_MAX)
+	_ok(CubeSphere.smooth_s5_hop() == CubeSphere.SMOOTH_STICKY_S5_HOP,
+		"G-SMOOTH-HORIZON-OFF: smooth_s5_hop()==SMOOTH_STICKY_S5_HOP(%d) with the flag off (byte-off)" % CubeSphere.SMOOTH_STICKY_S5_HOP)
+	_ok(CubeSphere.SMOOTH_S5_MAX_HORIZON > CubeSphere.SMOOTH_S5_MAX,
+		"G-SMOOTH-HORIZON: SMOOTH_S5_MAX_HORIZON(%d) > SMOOTH_S5_MAX(%d) — the flag genuinely extends coverage (not a no-op)" % [CubeSphere.SMOOTH_S5_MAX_HORIZON, CubeSphere.SMOOTH_S5_MAX])
+	_ok(CubeSphere.SMOOTH_STICKY_S5_HOP_HORIZON > CubeSphere.SMOOTH_STICKY_S5_HOP,
+		"G-SMOOTH-HORIZON: hop reach HORIZON(%d) > shipped(%d)" % [CubeSphere.SMOOTH_STICKY_S5_HOP_HORIZON, CubeSphere.SMOOTH_STICKY_S5_HOP])
+	# NEVER-OOM: even the BUMPED S5 residency's worst-case bytes stay within the SMOOTH_BYTES_MAX ledger that caps
+	# real memory at runtime (so the cap bump can never OOM — the ledger refuses tiles past the byte ceiling).
+	var s5_cells := FST.cells_for_tier(FST.S5)
+	var verts := (s5_cells + 1) * (s5_cells + 1)
+	var per_tile := verts * 60   # generous upper bound B/vert (pos+nrm+col+uv+uv2 + idx amortized); real ledger tile_bytes ≤ this
+	var worst := CubeSphere.SMOOTH_S5_MAX_HORIZON * per_tile
+	_ok(worst <= CubeSphere.SMOOTH_BYTES_MAX,
+		"G-SMOOTH-HORIZON: worst-case bumped S5 (%d tiles × ≤%d B = %.1f MB) ≤ SMOOTH_BYTES_MAX (%.0f MB) — NEVER-OOM" % [CubeSphere.SMOOTH_S5_MAX_HORIZON, per_tile, worst / 1048576.0, CubeSphere.SMOOTH_BYTES_MAX / 1048576.0])

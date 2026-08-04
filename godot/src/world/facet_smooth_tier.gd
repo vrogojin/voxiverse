@@ -36,7 +36,7 @@ static func residency_for_tier(tier: int) -> int:
 		S2: return CubeSphere.SMOOTH_S2_MAX
 		S3: return CubeSphere.SMOOTH_S3_MAX
 		S4: return CubeSphere.SMOOTH_S4_MAX
-		_: return CubeSphere.SMOOTH_S5_MAX
+		_: return CubeSphere.smooth_s5_max()
 
 ## Build the smooth-tier surface for facet `fid` at `cells` cells-per-edge. Returns the packed arrays an ArrayMesh
 ## surface wants, all in ABSOLUTE planet-block coords (the far ring's frame — parented under its node so

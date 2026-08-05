@@ -70,6 +70,7 @@ const FA := preload("res://src/cosmos/facet_atlas.gd")
 const FD := preload("res://src/world/far/far_density.gd")
 const FST := preload("res://src/world/facet_smooth_tier.gd")
 const FSK := preload("res://src/world/facet_skin_tier.gd")   # REVISION 6 (G-CSB-EQ): _build_cpp_gen for the native bake
+const FSV2 := preload("res://src/world/facet_smooth_v2.gd")  # docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1
 
 var _pass := 0
 var _fail := 0
@@ -235,6 +236,18 @@ func _initialize() -> void:
 	_gate_tilesurf_xor()
 	_gate_tilesurf_consolidate()
 	_gate_tilesurf_off()
+
+	# --- docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2) — the clean-slate uniform-pitch annulus ---
+	# G-V2-WELD: the coherence theorem, tested on THREE fixtures — an INTERIOR facet (all 4 neighbours in-face),
+	# a cube-EDGE facet (one cross-face neighbour), and a cube-CORNER facet (TWO cross-face neighbours, West AND
+	# South) — a shared-edge boundary vertex is a pure function of static canon data alone, so it must weld
+	# bit-identically (≤1e-9·R) regardless of which/how-many neighbours cross a cube face.
+	_ok(not CubeSphere.FP_SMOOTH_V2, "G-V2-OFF: FP_SMOOTH_V2 defaults false (byte-off; FacetFarRing.setup() never constructs a FacetSmoothV2)")
+	_gate_v2_weld(fid_int, "interior (all 4 neighbours in-face)")
+	_gate_v2_weld(fid_edge, "cube-edge (West neighbour cross-face)")
+	_gate_v2_weld(_fid_of(0, 0, 0), "cube-corner (West AND South neighbours cross-face)")
+	_gate_v2_colour(fid)
+	_gate_v2_pure(fid)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -3463,3 +3476,179 @@ func _gate_snap_selfheal() -> void:
 		else:
 			_ok(not requeued, "G-FS-SELFHEAL[off/falsify]: WITHOUT the flag the stale commit leaves NO pending refresh — the eternal stale edge the user saw (proves the gate catches the real bug)")
 		parent.free()
+
+# =========================================================================================================
+# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2) — clean-slate uniform-pitch smooth annulus gates.
+# These call `FacetSmoothV2`'s PURE static functions directly (no instance, no scene tree) — mirrors how the
+# P0 gates above call `FacetSmoothTier.build_tile` directly.
+# =========================================================================================================
+
+## G-V2-WELD: the coherence theorem. Build `fid`'s tile and every one of its 4 seam-neighbours' tiles (all off the
+## SAME frozen native generator, exactly like the shipped instance shares ONE `_cpp_gen` across every resident
+## fid), then assert `fid`'s boundary-facing edge vertices are bit-equal (≤1e-9·R) to SOME vertex on the
+## neighbour's own full boundary (nearest-match, order/orientation-agnostic — robust to any cross-face reindexing,
+## same technique as `_gate_weld_edge_nrm` above). Skips (reports a genuine FAIL, matching this file's existing
+## convention for `_gate_cpp_smooth_bake`) if the native module isn't compiled into this engine build.
+func _gate_v2_weld(fid: int, label: String) -> void:
+	var cells := CubeSphere.V2_CELLS
+	var stride := cells + 1
+	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
+		_ok(false, "G-V2-WELD[%s]: VoxelGeneratorCosmos module ABSENT — the native bake cannot be gated" % label)
+		return
+	var gen: Object = FSK._build_cpp_gen(fid)
+	_ok(gen != null, "G-V2-WELD[%s]: native generator built + setup" % label)
+	if gen == null:
+		return
+	var tile_a := FSV2.build_tile(fid, cells, gen)
+	_ok(not tile_a.is_empty(), "G-V2-WELD[%s]: build_tile succeeds (fid=%d)" % [label, fid])
+	if tile_a.is_empty():
+		return
+	var pos_a: PackedVector3Array = tile_a["pos"]
+	var slots := [FA.S_EAST, FA.S_WEST, FA.S_NORTH, FA.S_SOUTH]
+	var edge_ok := true
+	var pairs_tested := 0
+	var eps_pos := 1.0e-9 * FA.R_BLOCKS
+	for slot in slots:
+		var nb := FA.seam_neighbour(fid, slot)
+		var tile_b := FSV2.build_tile(nb, cells, gen)
+		if tile_b.is_empty():
+			_ok(false, "G-V2-WELD[%s]: build_tile succeeds for neighbour slot %d (fid=%d)" % [label, slot, nb])
+			continue
+		var pos_b: PackedVector3Array = tile_b["pos"]
+		var edge_a := _edge_indices(slot, cells, stride)
+		var boundary_b := _all_boundary_indices(cells, stride)
+		for ia in edge_a:
+			var pa: Vector3 = pos_a[ia]
+			var best_d := 1.0e18
+			for ib in boundary_b:
+				var d: float = pa.distance_squared_to(pos_b[ib])
+				if d < best_d:
+					best_d = d
+			pairs_tested += 1
+			if sqrt(best_d) > eps_pos:
+				edge_ok = false
+	_ok(edge_ok, "G-V2-WELD[%s]: fid=%d (cells=%d) shares bit-equal boundary vertices with all 4 neighbours (≤1e-9·R)" % [label, fid, cells])
+	_ok(pairs_tested == stride * 4, "G-V2-WELD[%s]: tested all %d boundary vertices" % [label, stride * 4])
+
+## G-V2-COLOUR: every provoking node's COLOR equals `FarPalette.color_for` of that SAME node's own baked
+## (g, biome, temp) — the per-cell flat-colour law (§2.3). Also asserts the INDEX BUFFER structure directly (both
+## triangles of cell (gi,gj) end at node(gi+1,gj+1) — the provoking-vertex trick itself), and a non-vacuous
+## falsify: a node that is NOT the provoking vertex for any cell generally carries a DIFFERENT colour than the
+## true provoking node — proving the assertion above actually discriminates (a rotated/wrong index order that put
+## cell (gi,gj)'s colour on, say, node(gi,gj) instead would be caught).
+func _gate_v2_colour(fid: int) -> void:
+	var cells := CubeSphere.V2_CELLS
+	var stride := cells + 1
+	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
+		_ok(false, "G-V2-COLOUR: VoxelGeneratorCosmos module ABSENT — the native bake cannot be gated")
+		return
+	var gen: Object = FSK._build_cpp_gen(fid)
+	if gen == null:
+		_ok(false, "G-V2-COLOUR: native generator built + setup")
+		return
+	var r_datum := FA.r_of(fid)
+	var corner_dirs := FA.facet_corner_dirs(fid)
+	var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+	var have_baked: bool = baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == stride * stride
+	_ok(have_baked, "G-V2-COLOUR: native bake_smooth_tile returns a full (cells+1)² node set")
+	if not have_baked:
+		return
+	var b_g: PackedInt32Array = baked["g"]
+	var b_biome: PackedInt32Array = baked["biome"]
+	var b_temp: PackedFloat32Array = baked["temp"]
+	var tile := FSV2.build_tile(fid, cells, gen)
+	_ok(not tile.is_empty(), "G-V2-COLOUR: build_tile succeeds")
+	if tile.is_empty():
+		return
+	var col: PackedColorArray = tile["col"]
+	var idx: PackedInt32Array = tile["idx"]
+
+	# (a) the index-buffer structural check: both triangles of every cell end at node(gi+1,gj+1).
+	var winding_ok := true
+	var ii := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			var v11 := (gj + 1) * stride + (gi + 1)
+			if int(idx[ii + 2]) != v11 or int(idx[ii + 5]) != v11:
+				winding_ok = false
+			ii += 6
+	_ok(winding_ok, "G-V2-COLOUR: every cell's BOTH triangles end at node(gi+1,gj+1) in the index buffer (last-vertex provoking law)")
+
+	# (b) the colour-value check: every provoking node's COLOR == FarPalette.color_for of ITS OWN baked values.
+	var colour_ok := true
+	var checked := 0
+	for gj in range(1, stride):
+		for gi in range(1, stride):
+			var vi := gj * stride + gi
+			var g := int(b_g[vi])
+			var expect := FarPalette.color_for(g, int(b_biome[vi]), float(b_temp[vi]), g < TerrainConfig.SEA_LEVEL)
+			checked += 1
+			if col[vi] != expect:
+				colour_ok = false
+	_ok(colour_ok, "G-V2-COLOUR: every provoking node's COLOR == FarPalette.color_for of its OWN baked (g,biome,temp) (%d nodes)" % checked)
+	_ok(checked == cells * cells, "G-V2-COLOUR: checked exactly cells² = %d provoking nodes" % (cells * cells))
+
+	# (c) falsify: a node that is NEVER a provoking vertex (e.g. (gi,gj) itself, cell (gi,gj)'s OWN grid corner —
+	# the old non-provoking-consistent split's tri-B endpoint) generally carries a DIFFERENT colour than the true
+	# provoking node(gi+1,gj+1) — real terrain varies cell to cell, so this is non-vacuous almost everywhere.
+	var mismatch_found := false
+	for gj in range(cells):
+		for gi in range(cells):
+			var vi_self := gj * stride + gi
+			var vi_prov := (gj + 1) * stride + (gi + 1)
+			if vi_self == vi_prov:
+				continue
+			if col[vi_self] != col[vi_prov]:
+				mismatch_found = true
+	_ok(mismatch_found, "G-V2-COLOUR falsify: provoking vs. non-provoking node colours actually differ somewhere (the assertion above is non-vacuous)")
+
+## G-V2-PURE: race-freedom by construction, asserted as byte-equality. Build the FULL hop-[V2_HOP_B..V2_HOP_H]
+## annulus TWICE, inserting tiles into the resident dict in two DIFFERENT orders (forward BFS order vs. reversed —
+## simulating two different worker-completion permutations), then merge each via `FacetSmoothV2.merge_tiles`
+## (canonical ascending-fid concatenation) — the two merged vertex/index/colour arrays must be byte-equal. Falsify:
+## perturbing ONE facet's shared canon corner dir must change ITS baked positions (proves the underlying bake is
+## actually sensitive to real corruption, so the byte-equality above is a meaningful theorem, not a vacuous one).
+func _gate_v2_pure(fid: int) -> void:
+	var cells := CubeSphere.V2_CELLS
+	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
+		_ok(false, "G-V2-PURE: VoxelGeneratorCosmos module ABSENT — the native bake cannot be gated")
+		return
+	var gen: Object = FSK._build_cpp_gen(fid)
+	if gen == null:
+		_ok(false, "G-V2-PURE: native generator built + setup")
+		return
+	var order := FSV2.hop_annulus(fid, CubeSphere.V2_HOP_B, CubeSphere.V2_HOP_H)
+	_ok(order.size() > 0, "G-V2-PURE: hop_annulus(%d, %d..%d) is non-empty (%d facets)" % [fid, CubeSphere.V2_HOP_B, CubeSphere.V2_HOP_H, order.size()])
+	var forward: Array = order.duplicate()
+	var reversed_o: Array = order.duplicate()
+	reversed_o.reverse()
+	var tiles_a := {}
+	for f in forward:
+		tiles_a[int(f)] = FSV2.build_tile(int(f), cells, gen)
+	var tiles_b := {}
+	for f in reversed_o:
+		tiles_b[int(f)] = FSV2.build_tile(int(f), cells, gen)
+	var merged_a := FSV2.merge_tiles(tiles_a)
+	var merged_b := FSV2.merge_tiles(tiles_b)
+	var pos_a: PackedVector3Array = merged_a["pos"]
+	var pos_b: PackedVector3Array = merged_b["pos"]
+	var idx_a: PackedInt32Array = merged_a["idx"]
+	var idx_b: PackedInt32Array = merged_b["idx"]
+	var col_a: PackedColorArray = merged_a["col"]
+	var col_b: PackedColorArray = merged_b["col"]
+	_ok(pos_a.size() > 0 and pos_a == pos_b, "G-V2-PURE: merged vertex positions are byte-equal under two different (simulated) worker-completion/insertion orders")
+	_ok(idx_a == idx_b, "G-V2-PURE: merged indices are byte-equal under two different insertion orders")
+	_ok(col_a == col_b, "G-V2-PURE: merged colours are byte-equal under two different insertion orders")
+
+	# Falsify: perturb ONE facet's shared canon corner dir — its baked positions must then differ.
+	var victim := int(order[0])
+	var corner_dirs := FA.facet_corner_dirs(victim)
+	var perturbed := corner_dirs.duplicate()
+	perturbed[0] = perturbed[0] + 1.0e-3
+	var r_datum := FA.r_of(victim)
+	var baked_ok: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+	var baked_bad: Dictionary = gen.call("bake_smooth_tile", perturbed, r_datum, cells)
+	var pos_ok: PackedVector3Array = baked_ok.get("pos", PackedVector3Array())
+	var pos_bad: PackedVector3Array = baked_bad.get("pos", PackedVector3Array())
+	_ok(pos_ok.size() > 0 and pos_bad.size() > 0 and pos_ok != pos_bad,
+		"G-V2-PURE falsify: perturbing one facet's canon corner dir changes its baked positions (the gate is sensitive to real corruption)")

@@ -1151,6 +1151,24 @@ const FP_SMOOTH_GROW_PACE := false
 ## slow any one call runs.
 const SMOOTH_GROW_PER_FRAME := 2
 
+## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2) — clean-slate reset of the smooth far-terrain
+## machinery above (`FacetSmoothTier`/`FP_FAR_SMOOTH` and its whole S2..S5 ladder are left byte-for-byte
+## untouched, still available behind their own flag). A NEW, separate, uniform-pitch smooth annulus
+## (`FacetSmoothV2`, godot/src/world/facet_smooth_v2.gd): ONE pitch (`V2_CELLS`, 8-block chords over a 417-block
+## facet edge), residency a PURE function of the active facet (hop-BFS over `FacetAtlas.seam_neighbour`, hop ∈
+## [`V2_HOP_B`..`V2_HOP_H`]) — NO tiers, NO snap plans, NO emit-exclusion, NO near-collar rim. Every mesh commit
+## is a whole-surface `ArrayMesh` rebuild via ONLY the safe high-level API (`ArrayMesh.new()` +
+## `add_surface_from_arrays` + `mi.mesh = mesh`) — NEVER `RenderingServer.mesh_surface_update_vertex_region`/
+## `_attribute_region` (those hard-crash ANGLE/WebGL2 — the REV-7 slot-mesh lesson this reset does not repeat).
+## Colour is per-cell flat-shaded (provoking-vertex convention, no baked skin texture ever touches this geometry).
+## Draws OVER the shipped shell (no exclusion handshake to race). Off ⇒ `FacetFarRing.setup()` never constructs a
+## `FacetSmoothV2` — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-V2-WELD/G-V2-PURE/G-V2-COLOUR/
+## G-V2-OFF).
+const FP_SMOOTH_V2 := false
+const V2_CELLS := 52   ## cells/facet edge (53×53 node grid + 4-edge skirt) — the ONE global pitch, no ladder.
+const V2_HOP_B := 2     ## inner hop bound (inclusive) of the resident annulus around the active facet.
+const V2_HOP_H := 3     ## outer hop bound (inclusive) — V2-1 scope; V2-3 raises this to 4 behind its own flag.
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

@@ -3050,6 +3050,13 @@ func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 	if _block_lod_orbit != null:
 		_block_lod_orbit.set_sun_dir(sun_dir)
 
+## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): forward the current Sun direction to the smooth-v2
+## annulus's own material. No-op with no faceted ring / no smooth-v2 instance (the ring setter self-guards) ⇒
+## byte-identical.
+func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_smooth_v2_sun_dir(sun_dir)
+
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
 ## + the atlas setter both self-guard) ⇒ byte-identical.

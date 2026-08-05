@@ -58,6 +58,10 @@ var _mi: MeshInstance3D
 # every per-frame uniform bind apply for free). A facet leaves the heightfield/shell emit the frame its smooth tile
 # commits (law 6, `visible_fids()`) — no overlay lift (P1 retires B2's `lift`; replacement, not overlay). null off (inert).
 var _smooth = null
+# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): the NEW, separate, uniform-pitch smooth annulus —
+# does NOT replace/interact with `_smooth` above (the old ladder is left untouched). A second small MeshInstance3D
+# child of this ring, sharing its placement transform, drawing OVER the shell (no exclusion). null off (inert).
+var _smooth_v2 = null
 var _smooth_assign: Dictionary = {}   # fid -> tier (S3/S4/S5): the driver's own hysteresis-held request state (P1)
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q1 (FP_SMOOTH_IDLE): the driver's own fixpoint-at-rest cache.
 # `_smooth_idle_sig` is the (active_fid, excluded-set) signature `_smooth_drive` computed LAST call; when a fresh call
@@ -427,6 +431,12 @@ func setup(active_fid: int) -> void:
 	if CubeSphere.FP_FAR_SMOOTH:
 		_smooth = FacetSmoothTier.new()
 		_smooth.setup_instance(self, _mi.material_override, active_fid)
+	# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): the NEW clean-slate smooth annulus — a SEPARATE
+	# instance/mesh from `_smooth` above (never both interacting); own ShaderMaterial (not the shell's), own child
+	# MeshInstance3D. Inert off (never constructed) ⇒ byte-identical.
+	if CubeSphere.FP_SMOOTH_V2:
+		_smooth_v2 = FacetSmoothV2.new()
+		_smooth_v2.setup_instance(self, active_fid)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:
@@ -509,6 +519,10 @@ func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
 	transform = _placement_xform()   # rigid re-place (cheap); identity under FP-FIXED-FRAME (no re-place)
 	_recompute_sticky()              # TIER-DEPTH P1: grow the sticky set to the NEW active's ring-1 (no-op with the flag off)
+	# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): residency is a PURE function of the active facet —
+	# recomputed ONLY here, on a real crossing. No-op / null with the flag off.
+	if _smooth_v2 != null:
+		_smooth_v2.set_active(new_fid)
 	# COSMOS-ORBITAL-SHELL live fix: in orbit the emitted set is CAMERA-axis-driven (not active-facet-driven), and the
 	# mesh is absolute (the transform re-place above already follows the new active facet), so a facet crossing does
 	# NOT change the emitted set — its _pending would force a redundant full rebuild every ~3 frames as the active
@@ -1188,6 +1202,10 @@ func _process(_dt: float) -> void:
 		var _t_drv := Time.get_ticks_usec()
 		_smooth_drive()   # FP_FAR_SMOOTH (P1): worker-baked smooth REPLACEMENT ladder for the visible hemisphere (runs every frame)
 		_dbg_drive_ms = (Time.get_ticks_usec() - _t_drv) / 1000.0
+	# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): reap builds/evictions + commit the ONE annulus
+	# mesh if anything changed. Cheap at rest (fast no-op scans). No-op / null with the flag off.
+	if _smooth_v2 != null:
+		_smooth_v2.step()
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -2764,6 +2782,8 @@ func shell_telemetry() -> Dictionary:
 	var _tss: Dictionary = (_smooth.tile_surf_stats() if (_smooth != null and _smooth.has_method("tile_surf_stats")) else {})
 	return {
 		"sh_cam": _cam_set,
+		"smooth_v2_res": (_smooth_v2.resident_count() if _smooth_v2 != null else 0),        # FP_SMOOTH_V2: resident annulus tiles
+		"smooth_v2_commit_ms": (_smooth_v2.commit_ms() if _smooth_v2 != null else 0.0),      # FP_SMOOTH_V2: last whole-surface ArrayMesh rebuild ms
 		"smooth_res": (_smooth.resident_count() if _smooth != null else 0),   # FP_FAR_SMOOTH: committed smooth tiles
 		"smooth_slot_path": int(_sms.get("smooth_slot_path", 0)),             # 1=slot-mesh region-writes active, 0=off/refused-fallback
 		"smooth_commit_ms": float(_sms.get("smooth_commit_ms", 0.0)),         # main-thread ms in slot commits this frame
@@ -4529,6 +4549,13 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 	var mat := _mi.material_override
 	if mat is ShaderMaterial:
 		(mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
+
+## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): feed the current Sun direction into the smooth-v2
+## annulus's OWN ShaderMaterial (a separate material from the shell's — see facet_smooth_v2.gd's shader doc) so
+## its day/night/terminator shade tracks live time. No-op with no smooth-v2 instance ⇒ byte-identical off.
+func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
+	if _smooth_v2 != null:
+		_smooth_v2.set_sun_dir(sun_dir)
 
 ## COSMOS LOD-TEXTURE Phase 1 (§1.3): bind the baker's 6-layer base map into the shell shader's `base_map`
 ## uniform. No-op unless FP_FACET_TEX is on and the material is the textured shader ⇒ flag-off is byte-identical

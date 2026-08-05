@@ -1303,6 +1303,35 @@ const FP_FARRING_ACTIVE_NOBLACK := false
 const NOBLACK_PROBE_HALF := 10.0    # fid-lattice half-extent (blocks) of the under-camera coverage probe column — TIGHT so it reads meshed under the player near spawn but absent at a cruise gap
 const NOBLACK_PROBE_YHALF := 96.0   # radial half-extent (blocks) of the probe column — spans surface relief so a meshed near column reads as covered
 
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (RECOMMENDED fix, A′) — per-VERTEX analytic un-sink of the dense
+## backstop wherever the near voxel field is PROVABLY unreachable (outside the streamed VoxelViewer ellipsoid,
+## inflated by a safety margin). Generalizes FP_FARRING_ACTIVE_NOBLACK from "1 facet × whole-facet × camera-
+## column probe" to "every backstop facet × per-vertex × analytic coverage". Root cause: on a steep mountain the
+## near field is vertically guillotined (the A2 viewer reach is only −40 blocks below the feet, §1.1) while the
+## dense backstop is drawn SUNK + at ENVELOPE-MINIMUM height (a provable near-surface lower bound, deliberately
+## tens of blocks low, §1.2) — so the down-slope foreground the near mesh can never reach reads as a flat pale
+## well (and, hovering off-surface, every neighbouring backstop facet reads as a pale plate with visible steps
+## at facet borders, §1.3). A dense-backstop vertex whose TRUE (welded, un-sunk) chord position lies OUTSIDE the
+## streamed ellipsoid — centre = player column + radial·O, horizontal semi-axis r = near_render_radius(),
+## vertical semi-axis H = TerrainConfig.streamed_ellipsoid_params().z, inflated by UNSINK_MARGIN_BLOCKS on every
+## axis — emits at that TRUE height, un-sunk: no near mesh can ever coexist there, so there is nothing to
+## z-fight, PROVEN by construction rather than by probe-and-hope. A vertex inside the (inflated) ellipsoid keeps
+## the shipped envelope+sink law byte-identically — the proven no-protrusion regime keeps governing exactly the
+## region where near/far can actually coexist. Under FP_BLOCKY_FARRING a mixed covered/uncovered cell's flat top
+## is the corner MIN, so it automatically takes the conservative (sunk) height — the frontier can never
+## protrude. Supersedes the whole-facet FP_FARRING_ACTIVE_NOBLACK pick when both are on (one un-sink law); that
+## flag's OTHER jobs (immediate chord-cache build, re-emit arming) are untouched. Off ⇒ every new path below is
+## inert → FLAT byte-identical (6042/0). Gate: verify_pale_backstop.gd (G-PB-*). Requires FP_FARRING_FULL_COVER
+## (the dense backstop cache this law un-sinks only exists there).
+const FP_FARRING_UNCOVERED_TRUE := false
+## Ellipsoid inflation (blocks), applied on every axis: one 16-block mesh block's reach past the viewer boundary
+## + slack, so the coverage test never mis-classifies a vertex the near mesher could still legitimately reach.
+const UNSINK_MARGIN_BLOCKS := 24
+## Player-column drift (blocks) that re-arms `_pending` for a fresh un-sink emit. The un-sink PATTERN depends
+## only on the player's column (not on time, not on warm state), so it need not re-run every frame — only once
+## the column has actually moved this far since the last emit (≤ 1 extra rebuild per this many blocks walked).
+const UNSINK_DRIFT_BLOCKS := 16
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

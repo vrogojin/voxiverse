@@ -79,6 +79,24 @@ var _rim_last_gate_col: Vector3 = Vector3.ZERO
 # per frame by WorldManager.update_streaming (`set_player_column`) — the centre of the S2 near-collar disc (§2.1).
 # Vector3.ZERO / never read (no S2 assignment ever fires) with the flag off.
 var _player_col_abs: Vector3 = Vector3.ZERO
+# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4 (FP_FARRING_UNCOVERED_TRUE): has `set_player_column` ever been called with
+# a real column? Guards the coverage test so the ZERO default (before the first push lands) never spuriously
+# un-sinks the whole ring. Shares the same push as `_player_col_abs` above (world_manager.gd pushes it under
+# FP_SMOOTH_RIM OR this flag) — a second reader of an existing write, not a new plumbing path.
+var _unsink_have_col := false
+# The FROZEN copy of (_player_col_abs, _unsink_have_col), snapshotted on MAIN in `_dispatch_async_rebuild` — the
+# SAME `_async_backstop` freeze contract (:294-300): the worker's `_emit_cached(..., from_worker=true)` reads ONLY
+# these, never the live main-thread-mutated pair, so it can never race a concurrent `set_player_column` call. The
+# main-thread SYNC path (`_rebuild_full` / `_build_surfacetool` / `_build_fast`) reads the LIVE pair instead (safe —
+# same thread). Zero / false with the flag off (never read).
+var _async_unsink_col: Vector3 = Vector3.ZERO
+var _async_unsink_have_col := false
+# The column the last un-sink pass ARMED `_pending` against, + whether one has armed yet — the drift re-arm gate
+# (`_unsink_drift_check`, called from `_process` near `_noblack_guarantee`): the un-sink pattern depends only on
+# the player's column, so `_pending` is re-set only once it has drifted ≥ UNSINK_DRIFT_BLOCKS since this snapshot,
+# not every frame. Unused with the flag off.
+var _unsink_armed_col: Vector3 = Vector3.ZERO
+var _unsink_armed := false
 # §3 P3: the player column the CURRENTLY RESIDENT S2 tiles were last baked against + whether a baseline exists yet
 # (`_rim_assign`'s RIM_REBUILD_BLOCKS cadence gate). Unused with the flag off.
 var _rim_baked_col: Vector3 = Vector3.ZERO
@@ -178,6 +196,12 @@ var _benv_done: Dictionary = {}      # fid -> true (dense env envelope built, no
 # sink automatically on the next rebuild (the cache is role-agnostic). NEVER populated with the flag off (zero cost).
 var _bpos_cache: Dictionary = {}     # fid -> PackedVector3Array (dense, ABSOLUTE, un-sunk)
 var _bcol_cache: Dictionary = {}
+# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (FP_FARRING_UNCOVERED_TRUE): the plain welded TRUE chord for a backstop
+# facet — the SAME construction as `_ensure_backstop_chord_cached` (:2995), but kept in its OWN cache because under
+# env_all `_bpos_cache` holds the ENVELOPE-MIN heights (a deliberate lower bound), not the true surface — the two
+# must never be conflated. Built lazily (on demand, per backstop fid) by `_ensure_backstop_true_cached`; colour is
+# unneeded (reuses `_bcol_cache`). Reaped alongside `_bpos_cache` in `_reap_mid_dense`. Empty with the flag off.
+var _btrue_cache: Dictionary = {}    # fid -> PackedVector3Array (dense, ABSOLUTE, TRUE height, never sunk)
 # COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. `_limb_set` is the FROZEN silhouette-ring set (fid -> true) for the
 # CURRENT mesh build — facets straddling the horizon tangent, emitted at LIMB_DENSE_CELLS instead of CELLS=4. It is
 # recomputed on the MAIN thread at each rebuild / async dispatch (freeze contract like `_async_backstop`) so the worker
@@ -890,6 +914,7 @@ static func rim_r_env() -> float:
 ## with the flag off (nothing ever reads `_player_col_abs` then).
 func set_player_column(col_abs: Vector3) -> void:
 	_player_col_abs = col_abs
+	_unsink_have_col = true   # FP_FARRING_UNCOVERED_TRUE: a real column now exists (see the field's own doc comment)
 
 ## The active facet's visible-hemisphere neighbours, NEAREST-FIRST by BFS hop count across `FacetAtlas.seam_neighbour`
 ## (cross-face ring — NOT the retired in-face-only 3×3; that was a root cause of B2 being gated off, §1.3 defect 1).
@@ -1247,6 +1272,10 @@ func _process(_dt: float) -> void:
 	# black and NO sunk well where the near field is absent. Past the _async_building guard (safe to touch caches), before
 	# the regime branches so THIS frame's emit honours it. No-op with the flag off / off-surface (byte-identical).
 	_noblack_guarantee(p)
+	# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (FP_FARRING_UNCOVERED_TRUE): the un-sink PATTERN depends only on the
+	# player's column, so re-arm `_pending` only once it has drifted ≥ UNSINK_DRIFT_BLOCKS since the last arm — not
+	# every frame (the idle short-circuits below still hold in between). No-op with the flag off (byte-identical).
+	_unsink_drift_check()
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -1470,6 +1499,19 @@ func _noblack_near_meshed(fid: int) -> bool:
 	var aabb := AABB(Vector3(float(l[0]) - h, float(l[1]) - yh, float(l[2]) - h), Vector3(2.0 * h, 2.0 * yh, 2.0 * h))
 	return bool(_cull_cover_query.call(fid, aabb))
 
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1/§4 (FP_FARRING_UNCOVERED_TRUE): re-arm `_pending` once the player's
+## column has drifted ≥ UNSINK_DRIFT_BLOCKS since the last arm (or on the very first real column) — the un-sink
+## PATTERN is a pure function of the column alone, so it need not re-run every frame. `on` overrides the compile
+## const (mirrors `_noblack_guarantee`'s `noblack_on` param) so a headless gate can drive the real re-arm law
+## without sed. Off / no real column yet ⇒ inert (byte-identical).
+func _unsink_drift_check(on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> void:
+	if not on or not _unsink_have_col:
+		return
+	if not _unsink_armed or _player_col_abs.distance_to(_unsink_armed_col) >= CubeSphere.UNSINK_DRIFT_BLOCKS:
+		_unsink_armed_col = _player_col_abs
+		_unsink_armed = true
+		_pending = true
+
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
 ## BACK_CULL] — so with the flag off the emitted set is computed exactly as today (byte-identical), and on the
@@ -1647,6 +1689,12 @@ func _dispatch_async_rebuild() -> void:
 	_async_env_warm = _env_async_any()
 	_async_floored = _env_async_floored_on()   # FP_ENV_FLOORED_ASYNC: frozen regime — floored dense targets emit sunk
 	_async_chord_only = CubeSphere.FP_ENV_FALL_HOLD and _fall_hold   # chord-only while falling fast (coverage, no env)
+	# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4 (FP_FARRING_UNCOVERED_TRUE): freeze the player column the worker's
+	# `_emit_cached(..., from_worker=true)` un-sink test reads — the SAME `_async_backstop` freeze contract (never
+	# read the live, main-thread-mutated `_player_col_abs`/`_unsink_have_col` off-thread). Cheap unconditional copy
+	# (a Vector3 + a bool); with the flag off it is frozen but never read (byte-identical).
+	_async_unsink_col = _player_col_abs
+	_async_unsink_have_col = _unsink_have_col
 	# REVISION 5 Stage A (FP_ENV_DEMAND_DISC): frozen for the worker's "have" test. ORBIT keeps its existing law
 	# unchanged (no near field to bound the envelope demand against off-surface), so force it off there.
 	_async_demand_on = CubeSphere.FP_ENV_DEMAND_DISC and not _shell_orbit()
@@ -2486,6 +2534,7 @@ func _reap_mid_dense(keep: Dictionary) -> void:
 		_benv_done.erase(f)   # FP_ENV_FLOORED_ASYNC: drop the "dense-enveloped" flag with the cache it describes, else a
 		                      # later re-promotion rebuilds a cheap chord but _emit_cached still reads the ε sink (protrusion)
 		                      # and the warm/count paths think it is converged (stale coverage).
+		_btrue_cache.erase(f)   # FP_FARRING_UNCOVERED_TRUE: reap the true chord alongside the departing dense cache
 
 ## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded
 ## / setup). Make-before-break: the TARGET = active ∪ ring-1 neighbours (the design's set; a facet the player can cross into
@@ -3007,6 +3056,73 @@ func _ensure_backstop_chord_cached(fid: int) -> void:
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
 
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (FP_FARRING_UNCOVERED_TRUE): backstop facet `fid`'s plain welded TRUE
+## chord — the height source for the per-vertex analytic un-sink. Construction is a byte-for-byte mirror of
+## `_ensure_backstop_chord_cached` above (SAME shared corner dirs, SAME weld + edge-snap), kept in the SEPARATE
+## `_btrue_cache` because under env_all `_bpos_cache` holds the ENVELOPE-MIN heights (a deliberate lower bound),
+## not the true surface — conflating the two would poison the no-protrusion proof elsewhere in this file. Pure
+## CPU + const reads only (facet geometry + worldgen profile) — safe to call from the async worker exactly like
+## `_ensure_backstop_chord_cached` already is (via `_env_build_one`). Built lazily, once per fid; never forced —
+## the true chord is terrain-invariant so it can never go stale.
+func _ensure_backstop_true_cached(fid: int) -> void:
+	if _btrue_cache.has(fid):
+		return
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()   # discarded — _btrue_cache carries no colour, _bcol_cache is reused at emit
+	for gj in range(stride):
+		for gi in range(stride):
+			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+	_weld_snap_edges(pos, cells)
+	_btrue_cache[fid] = pos
+
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 — is the ABSOLUTE surface point `surface_pt` OUTSIDE the streamed
+## VoxelViewer ellipsoid (inflated by UNSINK_MARGIN_BLOCKS on every axis)? `params` = (r, O, H) from
+## TerrainConfig.streamed_ellipsoid_params() by default — a PARAMETER (not a direct read) so a headless gate can
+## drive the real law against a SYNTHETIC ellipsoid without sed-toggling FACETED (mirrors this file's existing
+## "force via function param" convention, e.g. `_sunk_positions`'s `rim_on`). `have_col=false` (no real column
+## pushed yet) ⇒ always covered — a not-yet-known player position must never spuriously un-sink the whole ring.
+## Pure: reads only its arguments + the UNSINK_MARGIN_BLOCKS const — safe on the async worker.
+## Ellipsoid test: centre = col + up·O (up = col's own radial direction — the planet centre is the ABSOLUTE
+## origin, so "up" at the player IS col.normalized()); decompose (surface_pt − centre) into its radial component
+## (along up) and tangential component (the remainder); OUTSIDE iff (radial/(H+margin))² + (tangential/(r+margin))² > 1.
+func _uncovered(surface_pt: Vector3, col: Vector3, have_col: bool, params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> bool:
+	if not have_col:
+		return false
+	var r := params.x + CubeSphere.UNSINK_MARGIN_BLOCKS
+	var h := params.z + CubeSphere.UNSINK_MARGIN_BLOCKS
+	if r <= 0.0 or h <= 0.0:
+		return true   # a degenerate ellipsoid covers nothing — never divide by zero
+	var cl := col.length()
+	var up := (col / cl) if cl > 0.001 else Vector3.UP
+	var delta := surface_pt - (col + up * params.y)
+	var radial := delta.dot(up)
+	var tangential := (delta - up * radial).length()
+	var nr := radial / h
+	var nt := tangential / r
+	return (nr * nr + nt * nt) > 1.0
+
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 — blend the per-vertex analytic un-sink over `covered_pos` (whichever
+## envelope+sink / noblack law the caller already resolved for facet `fid`): an UNCOVERED vertex (its TRUE chord
+## point lies outside the inflated ellipsoid — near mesh can never reach it) takes the TRUE height; a COVERED
+## vertex keeps `covered_pos` BYTE-IDENTICALLY (the proven no-protrusion regime is untouched wherever near/far can
+## actually coexist). Frontier continuity: every vertex is a full grid slot taking ONE of the two heights (never
+## interpolated) — a mixed cell simply spans them, and under FP_BLOCKY_FARRING the cell top is the corner MIN, so
+## a mixed frontier cell automatically takes the conservative (covered/sunk) height. Pure w.r.t. its arguments
+## (`col`/`have_col` already resolved by the caller from the correct live-vs-frozen source) — safe on the worker.
+func _blend_uncovered(covered_pos: PackedVector3Array, fid: int, col: Vector3, have_col: bool,
+		params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> PackedVector3Array:
+	_ensure_backstop_true_cached(fid)
+	var tp: PackedVector3Array = _btrue_cache[fid]
+	var out := PackedVector3Array()
+	out.resize(covered_pos.size())
+	for i in range(covered_pos.size()):
+		var t: Vector3 = tp[i]
+		out[i] = t if _uncovered(t, col, have_col, params) else covered_pos[i]
+	return out
+
 # REVISION 5 Stage B: `force` skips the "already cached" early-return and REPLACES `_bpos_cache[fid]`/`_bcol_cache[fid]`
 # via a single in-place assignment (never erases first — see `_ensure_cached`'s matching note). `env_on`/`floored_on`
 # override `TierPlace.envelope_on() or TierPlace.env_all_on()`/`CubeSphere.FP_ENV_FLOORED_ASYNC`; every real caller
@@ -3405,11 +3521,21 @@ func _sunk_positions_amt(p: PackedVector3Array, sink: float) -> PackedVector3Arr
 ## per cell, same winding, same per-vertex colours as _emit_cached) and append it to the fast path's packed arrays. Used
 ## only by _build_fast under FULL_COVER for the handful of backstop facets that cannot ride the pre-triangulated memcpy.
 func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
-		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array()) -> void:
+		uv: PackedVector2Array = PackedVector2Array(), uv2: PackedVector2Array = PackedVector2Array(),
+		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> void:
 	_ensure_backstop_cached(fid)
 	# COSMOS FAR-CRUISE NEVER-BLACK: un-sink the sub-camera facet where the near field is absent (true surface, not a
 	# sunk well). Off / covered ⇒ the shipped sunk positions (byte-identical).
-	var gp: PackedVector3Array = _bpos_cache[fid] if (CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid) else _sunk_positions(_bpos_cache[fid], fid)
+	var gp: PackedVector3Array
+	if uncovered_true_on:
+		# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1: SUPERSEDES the whole-facet noblack pick with the per-vertex
+		# analytic law. This fast (memcpy) path is only ever reached from `_build_fast` — main-thread/synchronous
+		# always (never dispatched to the async worker) — so the LIVE column is always the correct source here.
+		gp = _blend_uncovered(_sunk_positions(_bpos_cache[fid], fid), fid, _player_col_abs, _unsink_have_col)
+	elif CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid:
+		gp = _bpos_cache[fid]
+	else:
+		gp = _sunk_positions(_bpos_cache[fid], fid)
 	var gc: PackedColorArray = _bcol_cache[fid]
 	var cells := CubeSphere.BACKSTOP_CELLS
 	var stride := cells + 1
@@ -3581,7 +3707,8 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 ## emit path; the async worker keeps the plain full sink unconditionally (byte-identical to pre-R-D there). R-D's
 ## target — the near-field rim — is a surface/near-voxel concern the async whole-planet path doesn't serve anyway
 ## (`_shell_orbit()` is true exactly when there is no near voxel field to rim against).
-func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = false) -> int:
+func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = false,
+		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
 	var cells := CELLS
@@ -3589,7 +3716,11 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 		# COSMOS FAR-CRUISE NEVER-BLACK: the sub-camera facet where the near field is genuinely absent emits UN-SUNK — at
 		# the TRUE radial surface, so it reads as a seamless coarse backstop (never a sunk well). No near voxels exist here
 		# to hide behind, so there is nothing to z-fight. Off / covered ⇒ the shipped sink below (byte-identical).
-		if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid:
+		# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (FP_FARRING_UNCOVERED_TRUE): this whole-facet pick is SUPERSEDED by
+		# the per-vertex analytic law below when the new flag is on — skip it here so `_noblack_guarantee`'s OTHER
+		# jobs (immediate chord-cache build, re-emit arming) keep running verbatim while the actual position choice
+		# comes from `_blend_uncovered`.
+		if CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid and not uncovered_true_on:
 			pos = _bpos_cache[fid]
 		# FP_ENV_FLOORED_ASYNC: a dense CHORD fallback (not yet enveloped) uses the FULL sink so it stays ≤ the near
 		# surface; an enveloped dense cache uses the ε sink (the envelope already carries the lower bound). Off ⇒ the
@@ -3600,6 +3731,14 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 			pos = _sunk_positions(_bpos_cache[fid])   # async worker — plain sink, never touches main-thread-owned R-D state
 		else:
 			pos = _sunk_positions(_bpos_cache[fid], fid)   # REVISION 2 LAW R-D: fid-aware interim ε-sink (rim-eligible only)
+		# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1: blend the per-vertex analytic un-sink over whichever covered law
+		# just picked `pos` above — an uncovered vertex (outside the streamed near ellipsoid) takes the TRUE chord
+		# height; a covered vertex keeps `pos` byte-identically. `from_worker` selects the FROZEN column (the worker
+		# never reads the live, main-thread-mutated one — the `_async_backstop` freeze contract). Off ⇒ never runs.
+		if uncovered_true_on:
+			var pcol: Vector3 = _async_unsink_col if from_worker else _player_col_abs
+			var have_pcol: bool = _async_unsink_have_col if from_worker else _unsink_have_col
+			pos = _blend_uncovered(pos, fid, pcol, have_pcol)
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
 	elif _is_limb_dense(fid):

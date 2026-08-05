@@ -235,6 +235,23 @@ static func clamped_viewer_vertical_ratio() -> float:
 		return VIEWER_VERTICAL_RATIO
 	return ((u + d) * 0.5) / vd
 
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4 — the streamed VoxelViewer ellipsoid's params, in ONE place, so
+## attach_viewer() (module_world.gd) AND the far ring's per-vertex analytic un-sink coverage law
+## (FP_FARRING_UNCOVERED_TRUE) share a SINGLE derivation site — they can never quietly disagree about what the
+## near voxel field actually streams. Returns (r, O, H) packed into a Vector3 (value type, zero allocation — the
+## same convention column_profile's Vector4 uses): r = horizontal semi-axis (near_render_radius()), O = the +Y
+## radial offset the A2 downward-reach clamp applies to the viewer node (0 when FACETED or the clamp itself is
+## off — the un-clamped symmetric slab), H = the vertical half-height of the streamed ellipsoid
+## (view_distance · view_distance_vertical_ratio, i.e. clamped_viewer_vertical_ratio() · r when clamped, else
+## VIEWER_VERTICAL_RATIO · r). Read-only: computes from the SAME consts/helpers attach_viewer already used —
+## no new behaviour, no new state.
+static func streamed_ellipsoid_params() -> Vector3:
+	var r := float(near_render_radius())
+	var use_clamp := CubeSphere.FACETED and DOWNWARD_REACH_CLAMP_ENABLED
+	var o := clamped_viewer_offset_y() if use_clamp else 0.0
+	var ratio := clamped_viewer_vertical_ratio() if use_clamp else VIEWER_VERTICAL_RATIO
+	return Vector3(r, o, ratio * r)
+
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
 ## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +

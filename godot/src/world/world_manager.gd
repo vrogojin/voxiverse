@@ -1131,7 +1131,10 @@ func update_streaming(player_pos: Vector3) -> void:
 	# world coords, the far ring's own frame) so the S2 near-collar disc is centred on the ACTUAL player, not the
 	# active facet centre. `player_pos` is in the active facet's LATTICE frame (same convention `_radial_altitude_
 	# lattice` already converts) — mirror that conversion here. No-op / byte-identical unless FP_SMOOTH_RIM.
-	if CubeSphere.FP_SMOOTH_RIM and _facet_ring != null and _facet_ring.has_method("set_player_column"):
+	# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4: FP_FARRING_UNCOVERED_TRUE's per-vertex un-sink coverage law needs this
+	# SAME ABSOLUTE column too (it is exactly the S2 rim disc's own centre) — pushed unconditionally alongside
+	# FP_SMOOTH_RIM rather than adding a second plumbing path. Off (both flags) ⇒ byte-identical (never called).
+	if (CubeSphere.FP_SMOOTH_RIM or CubeSphere.FP_FARRING_UNCOVERED_TRUE) and _facet_ring != null and _facet_ring.has_method("set_player_column"):
 		var _rim_afid := TerrainConfig.active_facet()
 		if _rim_afid >= 0:
 			var _rim_w := FacetAtlas.lattice_to_world64(_rim_afid, player_pos.x, player_pos.y, player_pos.z)

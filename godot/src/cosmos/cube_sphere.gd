@@ -1169,6 +1169,29 @@ const V2_CELLS := 52   ## cells/facet edge (53×53 node grid + 4-edge skirt) —
 const V2_HOP_B := 2     ## inner hop bound (inclusive) of the resident annulus around the active facet.
 const V2_HOP_H := 3     ## outer hop bound (inclusive) — V2-1 scope; V2-3 raises this to 4 behind its own flag.
 
+## V2-2 (docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4, relief/slope lighting): shade far tiles by their REAL per-cell
+## surface-slope face normal instead of the radial-only V2-1 shade, so mountains read as 3D. The interior-node
+## normal is computed in GDScript from the already-baked `pos` (the native bake's `bnrm` is perimeter-only — never
+## usable for interior lighting); the shader picks a LIT vertex body that derives `n` from the NORMAL attribute in
+## world space instead of `wp - centre`. Off ⇒ `build_tile`'s `nrm` stays the shipped radial `b_dir` verbatim and
+## `shader_code()` emits the exact shipped V2-1 string (byte-identical, FLAT 6042/0). LIVE-PROBE-REQUIRED (the
+## headless dummy RenderingServer never parses shader source). Gate: verify_far_smooth.gd (G-V2-LIT-NRM, a PURE
+## unit check of the face-normal math — the const itself can't be flipped headless).
+const FP_SMOOTH_V2_LIT := false
+
+## V2-3a (§4, extended reach): the smooth annulus reaches one hop further (`V2_HOP_H_REACH` instead of `V2_HOP_H`)
+## so more of the far field is real relief rather than flat skin. Off ⇒ `setup_instance` keeps `_hop_h = V2_HOP_H`
+## (byte-identical). Gate: verify_far_smooth.gd (G-V2-REACH — pure `hop_annulus` superset check, no flag needed).
+const FP_SMOOTH_V2_REACH := false
+const V2_HOP_H_REACH := 4
+
+## V2-3b (§4, block-LOD arbitration): where a V2 smooth tile is RESIDENT (committed), suppress the blocky far-ring
+## megablock emission for that facet, so the coarse blocks don't z-fight / poke through the smooth relief.
+## Make-before-break safe — only suppresses a facet's blocky emit when `FacetSmoothV2.is_resident(fid)` is
+## already true; a facet still building/leaving V2 residency keeps its blocky emit (no hole). Off ⇒ the shipped
+## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
+const FP_SMOOTH_V2_EXCL_BLKLOD := false
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

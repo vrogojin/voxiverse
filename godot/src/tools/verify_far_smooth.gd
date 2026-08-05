@@ -249,6 +249,19 @@ func _initialize() -> void:
 	_gate_v2_colour(fid)
 	_gate_v2_pure(fid)
 
+	# --- V2-2/V2-3 (docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 extensions): relief lighting, extended reach, block-LOD
+	# arbitration. All three flags default false (byte-off); their gates are PURE checks that don't need the const
+	# flipped (the shader/normal-overwrite/hop-reach paths are exercised via forced function params or the
+	# already-pure static methods, mirroring G-FS-LIT-ON's "force the FUNCTION PARAMS, never the CubeSphere const"
+	# convention above).
+	_ok(not CubeSphere.FP_SMOOTH_V2_LIT, "G-V2-LIT-OFF: FP_SMOOTH_V2_LIT defaults false (byte-off; build_tile's nrm stays the shipped radial b_dir, shader_code() emits the shipped V2-1 tail verbatim)")
+	_gate_v2_lit_nrm()
+	_ok(not CubeSphere.FP_SMOOTH_V2_REACH, "G-V2-REACH-OFF: FP_SMOOTH_V2_REACH defaults false (byte-off; setup_instance keeps _hop_h = V2_HOP_H)")
+	_gate_v2_reach(fid)
+	_gate_v2_reach(fid_int)
+	_ok(not CubeSphere.FP_SMOOTH_V2_EXCL_BLKLOD, "G-V2-EXCL-OFF: FP_SMOOTH_V2_EXCL_BLKLOD defaults false (byte-off; the blocky far-ring emit is unconditional)")
+	_gate_v2_excl(fid)
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -3652,3 +3665,106 @@ func _gate_v2_pure(fid: int) -> void:
 	var pos_bad: PackedVector3Array = baked_bad.get("pos", PackedVector3Array())
 	_ok(pos_ok.size() > 0 and pos_bad.size() > 0 and pos_ok != pos_bad,
 		"G-V2-PURE falsify: perturbing one facet's canon corner dir changes its baked positions (the gate is sensitive to real corruption)")
+
+# =========================================================================================================
+# V2-2/V2-3 extension gates (docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 — relief lighting, extended reach,
+# block-LOD arbitration). All PURE — no engine-flag flip needed (FP_SMOOTH_V2_LIT/_REACH/_EXCL_BLKLOD are all
+# compile-time consts; these gates reproduce/exercise the underlying math and predicates directly).
+# =========================================================================================================
+
+## G-V2-LIT-NRM: reproduces `FacetSmoothV2.build_tile`'s V2-2 face-normal law (fn = (v10-v00) x (v01-v00),
+## normalized, oriented outward via v11) on a tiny SYNTHETIC pos grid — no `bake_smooth_tile`/module dependency.
+## (a) a FLAT quad (all 4 corners coplanar, perpendicular to the radial `d`) gives a face normal that is unit
+## length, outward (dot with `d` > 0), and measurably ~radial (angle to `d` ≈ 0). (b) a SLOPED quad (v10 raised
+## along `d` by a `relief` amount, simulating a real slope) gives a face normal that is STILL unit length +
+## outward, but tilts measurably AWAY from `d` — falsifiable: a bug that always returns the radial direction
+## (ignoring the actual cell geometry) would leave this angle ~0, indistinguishable from the flat case.
+func _gate_v2_lit_nrm() -> void:
+	var d := Vector3(0.0, 0.0, 1.0)      # the radial direction this synthetic patch sits at
+	var right := Vector3(1.0, 0.0, 0.0)
+	var up := Vector3(0.0, 1.0, 0.0)
+	var r := 1000.0
+	var h := 8.0                          # cell edge length (blocks) — matches the V2 8-block chord order of magnitude
+
+	# (a) FLAT quad.
+	var f00 := d * r
+	var f10 := f00 + right * h
+	var f01 := f00 + up * h
+	var f11 := f00 + right * h + up * h
+	var fn_flat := (f10 - f00).cross(f01 - f00)
+	var flat_nondegenerate := fn_flat.length() > 0.0
+	_ok(flat_nondegenerate, "G-V2-LIT-NRM: flat-quad face normal is non-degenerate")
+	if flat_nondegenerate:
+		fn_flat = fn_flat.normalized()
+		if fn_flat.dot(f11.normalized()) < 0.0:
+			fn_flat = -fn_flat
+		_ok(absf(fn_flat.length() - 1.0) < 1.0e-6, "G-V2-LIT-NRM: flat-quad face normal is unit length")
+		_ok(fn_flat.dot(d) > 0.0, "G-V2-LIT-NRM: flat-quad face normal points outward (dot with radial > 0)")
+		var flat_angle := fn_flat.angle_to(d)
+		_ok(flat_angle < 0.01, "G-V2-LIT-NRM: a FLAT quad's face normal is ~radial (%.5f rad from d)" % flat_angle)
+
+	# (b) SLOPED quad: v10 raised radially by `relief` — a real slope.
+	var relief := 4.0
+	var s10 := f00 + right * h + d * relief
+	var s01 := f01
+	var s11 := f11 + d * relief
+	var fn_slope := (s10 - f00).cross(s01 - f00)
+	var slope_nondegenerate := fn_slope.length() > 0.0
+	_ok(slope_nondegenerate, "G-V2-LIT-NRM: sloped-quad face normal is non-degenerate")
+	if slope_nondegenerate:
+		fn_slope = fn_slope.normalized()
+		if fn_slope.dot(s11.normalized()) < 0.0:
+			fn_slope = -fn_slope
+		_ok(absf(fn_slope.length() - 1.0) < 1.0e-6, "G-V2-LIT-NRM: sloped-quad face normal is unit length")
+		_ok(fn_slope.dot(d) > 0.0, "G-V2-LIT-NRM: sloped-quad face normal still points outward (dot with radial > 0)")
+		var slope_angle := fn_slope.angle_to(d)
+		_ok(slope_angle > 0.05,
+			"G-V2-LIT-NRM falsify: a SLOPED quad's face normal tilts measurably off-radial (%.4f rad, vs the flat case's ~0) — the relief signal is real, not a relabelled radial" % slope_angle)
+
+## G-V2-REACH: `hop_annulus(active, V2_HOP_B, V2_HOP_H_REACH)` is a strict SUPERSET of
+## `hop_annulus(active, V2_HOP_B, V2_HOP_H)` and contains strictly more facets — pure, no flag flip needed
+## (both hop bounds are read directly; the gate never reads `FP_SMOOTH_V2_REACH`, only exercises what it would
+## select).
+func _gate_v2_reach(fid: int) -> void:
+	var small := FSV2.hop_annulus(fid, CubeSphere.V2_HOP_B, CubeSphere.V2_HOP_H)
+	var big := FSV2.hop_annulus(fid, CubeSphere.V2_HOP_B, CubeSphere.V2_HOP_H_REACH)
+	var small_set := {}
+	for f in small:
+		small_set[int(f)] = true
+	var big_set := {}
+	for f in big:
+		big_set[int(f)] = true
+	var superset_ok := true
+	for f in small_set.keys():
+		if not big_set.has(f):
+			superset_ok = false
+	_ok(superset_ok, "G-V2-REACH[fid=%d]: hop_annulus(.., V2_HOP_H_REACH=%d) is a SUPERSET of hop_annulus(.., V2_HOP_H=%d)" % [fid, CubeSphere.V2_HOP_H_REACH, CubeSphere.V2_HOP_H])
+	_ok(big_set.size() > small_set.size(), "G-V2-REACH[fid=%d]: the reach annulus contains STRICTLY MORE facets (%d vs %d)" % [fid, big_set.size(), small_set.size()])
+
+## Mirrors the exact call-site boolean (`facet_far_ring.gd`'s `_build_surfacetool`/`_async_build_worker` guards):
+## `flag_on and v2 != null and v2.is_resident(fid)`. Parameterized by `flag_on` (never the CubeSphere const, which
+## is a compile-time false literal) so the gate can force the "flag on" branch and exercise the null-safety of the
+## SHORT-CIRCUIT ordering itself (v2 != null is checked BEFORE is_resident is called — a null v2 never crashes).
+func _v2_excl_predicate(flag_on: bool, v2, fid: int) -> bool:
+	return flag_on and v2 != null and v2.is_resident(fid)
+
+## G-V2-EXCL: a pure logic check of the arbitration predicate. (a) v2 == null ⇒ always false, and — because `and`
+## short-circuits — `is_resident` is never called on a null reference (no crash). (b) a real (but empty)
+## FacetSmoothV2 instance ⇒ predicate matches `is_resident()==false`. (c) poking one tile directly into `_tiles`
+## (this file's existing "poke a flag-gated internal directly" pattern, e.g. `ring._smooth = FST.new()` in
+## `_gate_p1` above) ⇒ predicate matches `is_resident()==true`.
+func _gate_v2_excl(fid: int) -> void:
+	_ok(_v2_excl_predicate(true, null, fid) == false,
+		"G-V2-EXCL: predicate is false when v2 is null, even with the flag forced on (short-circuit — no crash, no suppression)")
+
+	var dummy_ring := Node3D.new()
+	var v2 := FSV2.new()
+	v2.setup_instance(dummy_ring, fid)
+	_ok(not v2.is_resident(fid), "G-V2-EXCL: a freshly-set-up V2 instance has no resident tiles yet")
+	_ok(_v2_excl_predicate(true, v2, fid) == false, "G-V2-EXCL: predicate matches is_resident()==false before any tile commits")
+
+	v2._tiles[fid] = {}   # poke a tile directly resident — no need to run the real async build/commit machinery here
+	_ok(v2.is_resident(fid), "G-V2-EXCL: is_resident() reflects a committed tile")
+	_ok(_v2_excl_predicate(true, v2, fid) == true, "G-V2-EXCL: predicate matches is_resident()==true after a tile commits")
+	_ok(_v2_excl_predicate(false, v2, fid) == false, "G-V2-EXCL: predicate is false when the flag itself is off, even with a resident tile")
+	dummy_ring.free()

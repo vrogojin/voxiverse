@@ -105,6 +105,20 @@ static func build_tile(fid: int, cells: int, gen: Object) -> Dictionary:
 			idx[ii] = v00; idx[ii + 1] = v10; idx[ii + 2] = v11
 			idx[ii + 3] = v01; idx[ii + 4] = v00; idx[ii + 5] = v11
 			ii += 6
+			# V2-2 (FP_SMOOTH_V2_LIT): overwrite the PROVOKING node's normal with this cell's own geometric face
+			# normal — the same provoking-vertex convention COLOR already uses, so the `flat`-interpolated shade a
+			# cell's fragment reads matches the FLAT colour it's painted (one shade value per 8-block cell, real
+			# relief instead of the radial-only V2-1 shade). `bnrm` from the native bake is perimeter-only (interior
+			# = zero) so it is NEVER used here — this is derived purely from the already-baked `pos`. Off ⇒ this
+			# whole block never runs; `nrm` stays the shipped radial `b_dir` set above (byte-identical).
+			if CubeSphere.FP_SMOOTH_V2_LIT:
+				var fn: Vector3 = (pos[v10] - pos[v00]).cross(pos[v01] - pos[v00])
+				if fn.length() > 0.0:
+					fn = fn.normalized()
+					if fn.dot(pos[v11].normalized()) < 0.0:
+						fn = -fn
+					nrm[v11] = fn
+				# else: a degenerate cell (zero-area) — leave v11's normal at its shipped radial value.
 
 	var tile := {"pos": pos, "nrm": nrm, "col": col, "idx": idx}
 	_append_skirt(tile, cells, SKIRT_DROP_BLOCKS)
@@ -249,13 +263,35 @@ void fragment() {
 }
 "
 
+## V2-2 (FP_SMOOTH_V2_LIT) — LIVE-PROBE-REQUIRED: the ONLY difference from `_V2_SHADER_TAIL` is where the vertex
+## body derives its shading normal `n` FROM — the shipped body re-derives the TRUE planet-radial direction
+## (`wp - centre`), ignoring whatever the mesh's own NORMAL attribute carries; this LIT body instead reads the
+## mesh NORMAL (the per-cell face normal `build_tile` stamps onto each provoking node under the flag) transformed
+## into world space, so a sloped cell's `flat`-interpolated shade reflects its REAL relief instead of the radial
+## direction. Everything else — `shader_type`/`render_mode`, the `VoxiLight.shade_glsl()` include, the `varying
+## flat vec4 v_col;` declaration, and `fragment()` — is byte-identical to the OFF tail. GLSL ES 3.0 legal: NORMAL
+## is a plain vertex-stage input (vec3), `MODEL_MATRIX * vec4(NORMAL, 0.0)` is the standard direction-only
+## transform (w=0 drops translation), matching the convention Godot's own spatial shaders use for normals.
+const _V2_SHADER_TAIL_LIT := "varying flat vec4 v_col;
+void vertex() {
+	vec3 n = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
+	v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir), 1.0);
+}
+void fragment() {
+	ALBEDO = v_col.rgb;
+}
+"
+
 ## The full shader source: HEAD (shader_type/render_mode) + the shared `VoxiLight.shade_glsl()` snippet (declares
 ## sun_dir/night_floor/term_mu/moonshine + voxi_shade — string-composed exactly like `TierPlace`/`facet_far_ring.gd`
 ## already do under FP_SHADE_UNIFIED) + TAIL (the flat COLOR varying + vertex/fragment). Composed in a FUNCTION
 ## (not a top-level `const` concatenation) so it always reads `VoxiLight`'s CURRENT snippet — e.g. picks up
-## `FP_TWILIGHT_AMBIENT`'s ambient-floor splice for free, with zero duplicated lighting law.
+## `FP_TWILIGHT_AMBIENT`'s ambient-floor splice for free, with zero duplicated lighting law. V2-2
+## (FP_SMOOTH_V2_LIT): swaps in `_V2_SHADER_TAIL_LIT` (relief-normal shading) — off ⇒ `_V2_SHADER_TAIL` verbatim,
+## the exact shipped V2-1 string (byte-identical shader source when the flag is off).
 static func shader_code() -> String:
-	return _V2_SHADER_HEAD + VoxiLight.shade_glsl() + _V2_SHADER_TAIL
+	var tail := _V2_SHADER_TAIL_LIT if CubeSphere.FP_SMOOTH_V2_LIT else _V2_SHADER_TAIL
+	return _V2_SHADER_HEAD + VoxiLight.shade_glsl() + tail
 
 static func _make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -309,6 +345,9 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_mi.mesh = ArrayMesh.new()
 	ring.add_child(_mi)
 	_cpp_gen = FacetSkinTier._build_cpp_gen(active_fid)
+	# V2-3a (FP_SMOOTH_V2_REACH): reach one hop further so more of the far field is real relief, not flat skin.
+	# Off ⇒ `_hop_h` stays `CubeSphere.V2_HOP_H` (byte-identical). `_hop_b` is untouched either way.
+	_hop_h = CubeSphere.V2_HOP_H_REACH if CubeSphere.FP_SMOOTH_V2_REACH else CubeSphere.V2_HOP_H
 	_sn = clampi(OS.get_processor_count() - 1, 1, CubeSphere.SMOOTH_BUILD_SLOTS)
 	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)

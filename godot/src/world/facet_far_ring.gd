@@ -298,6 +298,14 @@ var _async_arrays: Array = []           # worker → main: the committed surface
 # FP_MID_DENSE: this dict is now the frozen DENSE-TARGET set (backstop ∪ mid-dense disc) — every facet the worker must
 # warm + emit from the dense cache. With FP_MID_DENSE off it is exactly the shipped backstop set (byte-identical).
 var _async_backstop: Dictionary = {}
+# V2-3b (FP_SMOOTH_V2_EXCL_BLKLOD, docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4): the FROZEN set of facets `_smooth_v2`
+# has COMMITTED resident (`FacetSmoothV2.is_resident`) at dispatch time, so a worker-thread build never touches
+# `_smooth_v2._tiles` live — that Dictionary is main-thread-owned (mutated by `_smooth_v2.step()`/`_commit()`),
+# exactly the same hazard class `_async_backstop` itself exists to avoid for `_excluded`. Snapshotted on MAIN in
+# `_dispatch_async_rebuild()`, read-only for the worker's lifetime. The main-thread SYNC path (`_build_surfacetool`)
+# reads `_smooth_v2.is_resident()` LIVE instead (safe — same-thread, mirrors `_is_backstop`'s live-on-sync-path/
+# frozen-on-async-path precedent at `_emit_cached`'s doc comment). Off / no `_smooth_v2` ⇒ always empty.
+var _async_v2_resident: Dictionary = {}
 # FP_MID_DENSE: the frozen mid-dense subset of the dense-target set (promoted, NOT a live backstop). Lets the worker /
 # swap book-keeping tell a mid-distance promotion (which draws COARSE as a fallback until its dense cache is warmed —
 # it is NOT under a near mesh, so a hole would flicker) apart from a true backstop (covered by near voxels; filtered).
@@ -1666,6 +1674,14 @@ func _dispatch_async_rebuild() -> void:
 				_async_backstop[fid] = true
 				if _is_mid_dense(fid):
 					_async_mid[fid] = true
+	# V2-3b (FP_SMOOTH_V2_EXCL_BLKLOD): freeze which of THIS build's facets `_smooth_v2` already has resident, on
+	# MAIN, before the worker reads it — `is_resident()` is a plain Dictionary lookup, safe to call here (main
+	# thread) but never off-thread. Off / no `_smooth_v2` ⇒ stays empty (byte-identical worker emit).
+	_async_v2_resident = {}
+	if CubeSphere.FP_SMOOTH_V2_EXCL_BLKLOD and CubeSphere.FP_BLOCKY_FARRING and _smooth_v2 != null:
+		for fid in _async_fids:
+			if _smooth_v2.is_resident(int(fid)):
+				_async_v2_resident[int(fid)] = true
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -1793,6 +1809,11 @@ func _async_build_worker() -> void:
 	for fid in _async_fids:
 		# DENSE-TARGET role read from the FROZEN snapshot (never `_excluded` live) — the const read is thread-safe.
 		var target := CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid)
+		# V2-3b (FP_SMOOTH_V2_EXCL_BLKLOD): this facet's blocky geometry is already covered by a COMMITTED V2
+		# smooth tile (the FROZEN `_async_v2_resident` snapshot, never `_smooth_v2` live off-thread) — suppress
+		# only the emit below, NOT the env-warm/cache bookkeeping above/below, so the shell's own cache stays warm
+		# and ready the moment V2 evicts the facet (make-before-break). Off / not resident ⇒ always false.
+		var v2_excl: bool = CubeSphere.FP_SMOOTH_V2_EXCL_BLKLOD and _async_v2_resident.has(fid)
 		# FP_ENV_WARM_ASYNC / FP_MID_DENSE: build this facet's cache HERE (off-thread) if it is missing, up to
 		# ENV_WARM_BATCH per dispatch. A DENSE TARGET (backstop ∪ mid-dense) warms its dense _bpos_cache; every other
 		# facet its coarse _pos_cache — so a promoted mid-dense facet's ~16 ms env build runs OFF-THREAD too, never on
@@ -1806,18 +1827,20 @@ func _async_build_worker() -> void:
 				_env_build_one(fid, target, _async_floored, CubeSphere.FP_ENV_FALLBACK_EMIT, _async_demand_on, _async_demand_axis, env_on, not batch_left)
 				if not batch_left:
 					# Batch spent this cycle — the chord fallback above draws it NOW (never a hole); its upgrade lands later.
-					if target and _bpos_cache.has(fid):
-						_emit_cached(st, fid, true, true)
-					elif _pos_cache.has(fid):
-						_emit_cached(st, fid, false)
+					if not v2_excl:
+						if target and _bpos_cache.has(fid):
+							_emit_cached(st, fid, true, true)
+						elif _pos_cache.has(fid):
+							_emit_cached(st, fid, false)
 					continue
 				warmed += 1
 		# Emit by cache PRESENCE (never sunk-read a missing dense cache): a warmed/ready dense target → dense sunk; a
 		# mid-dense target whose dense cache is still pending → its coarse fallback; every other facet → coarse (shipped).
-		if target and _bpos_cache.has(fid):
-			_emit_cached(st, fid, true, true)
-		elif _pos_cache.has(fid):
-			_emit_cached(st, fid, false)
+		if not v2_excl:
+			if target and _bpos_cache.has(fid):
+				_emit_cached(st, fid, true, true)
+			elif _pos_cache.has(fid):
+				_emit_cached(st, fid, false)
 	st.generate_normals()
 	_async_arrays = st.commit_to_arrays()
 	_async_build_us = Time.get_ticks_usec() - t0
@@ -2605,6 +2628,14 @@ func _build_surfacetool(fids: PackedInt32Array) -> Mesh:
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for fid in fids:
 		_ensure_emit_cached(fid)
+		# V2-3b (FP_SMOOTH_V2_EXCL_BLKLOD): this is the MAIN-THREAD sync path (`_rebuild_full`, never called
+		# synchronously from a crossing), so `_smooth_v2.is_resident()` is read LIVE (safe, same-thread) — mirrors
+		# `_is_backstop`'s own live-on-sync-path / frozen-on-async-path split (see `_emit_cached`'s doc comment).
+		# Cache warming above still runs unconditionally (make-before-break: the shell's cache stays ready for the
+		# instant V2 evicts this facet); only the geometry actually added to `st` is suppressed. Off / no
+		# `_smooth_v2` / not resident ⇒ the shipped unconditional emit (byte-identical).
+		if CubeSphere.FP_SMOOTH_V2_EXCL_BLKLOD and CubeSphere.FP_BLOCKY_FARRING and _smooth_v2 != null and _smooth_v2.is_resident(int(fid)):
+			continue
 		_emit_cached(st, fid, _emit_dense(fid))   # main thread — live role is safe; _ensure_emit_cached built the dense cache
 	st.generate_normals()
 	return st.commit()

@@ -220,6 +220,11 @@ static func viewer_vertical_reach() -> float:
 static func clamped_viewer_offset_y() -> float:
 	var u := viewer_vertical_reach()
 	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	# FP_VIEWER_RELIEF_REACH (task #86): EXTEND the meshed down reach to VIEWER_RELIEF_REACH_BLOCKS so the visible
+	# down-slope meshes as real voxels. This D may exceed u, so the "never extend" guard below is intentionally
+	# bypassed — offset goes negative (the viewer node shifts radial-DOWN), keeping u up while reaching D down.
+	if CubeSphere.FP_VIEWER_RELIEF_REACH:
+		return (u - float(CubeSphere.VIEWER_RELIEF_REACH_BLOCKS)) * 0.5
 	if d >= u:
 		return 0.0
 	return (u - d) * 0.5
@@ -231,6 +236,10 @@ static func clamped_viewer_vertical_ratio() -> float:
 	var vd := float(near_render_radius())
 	var u := viewer_vertical_reach()
 	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	# FP_VIEWER_RELIEF_REACH (task #86): half-height (u + relief_D)/2 over the horizontal view_distance, so the
+	# ellipsoid reaches u up and VIEWER_RELIEF_REACH_BLOCKS down — the whole visible slope meshes.
+	if CubeSphere.FP_VIEWER_RELIEF_REACH and vd > 0.0:
+		return ((u + float(CubeSphere.VIEWER_RELIEF_REACH_BLOCKS)) * 0.5) / vd
 	if d >= u or vd <= 0.0:
 		return VIEWER_VERTICAL_RATIO
 	return ((u + d) * 0.5) / vd

@@ -1192,6 +1192,20 @@ const V2_HOP_H_REACH := 4
 ## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
 const FP_SMOOTH_V2_EXCL_BLKLOD := false
 
+## VIEWER RELIEF REACH (task #86, user directive: "render anything unlimited in the altitude"): the near VoxelTerrain
+## streamer's A2 downward-reach clamp keeps only VIEWER_DOWNWARD_REACH_BLOCKS=40 blocks meshed BELOW the player's
+## feet (a surface-player perf trim). On a steep peak the down-slope drops out of that band inside the 128-block
+## horizontal radius, so the near MESH just ends (collision is unaffected — it reads TerrainConfig analytically —
+## but nothing renders) and the coarse far backstop shows through. This flag EXTENDS the meshed downward reach to
+## VIEWER_RELIEF_REACH_BLOCKS so the whole visible slope (peak→sea→bedrock within the render disc) meshes as real
+## voxels. NOT truly unlimited (NEVER-OOM: streaming to the planet core would OOM) — 128 (= the horizontal radius)
+## makes the near field a full downward sphere covering every slope within view distance; anything deeper stays
+## analytic-solid/breakable, just not meshed (it is underground/hidden). Off ⇒ the shipped 40-block clamp
+## (byte-identical). Perf: the down slab grows 40→128 (~2.2× the interior-stone stream, faces culled; the newly
+## MESHED surface is exactly the down-slope the user wants) — LIVE heap/fps A/B gates this on the 2-core web target.
+const FP_VIEWER_RELIEF_REACH := false
+const VIEWER_RELIEF_REACH_BLOCKS := 128
+
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
 ## and the photographic depth cues a real shot has (the user reads it as an id×tiles trick, not "a REAL SHOT of the

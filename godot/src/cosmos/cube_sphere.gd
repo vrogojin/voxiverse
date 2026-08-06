@@ -1361,6 +1361,26 @@ const UNSINK_MARGIN_BLOCKS := 24
 ## the column has actually moved this far since the last emit (≤ 1 extra rebuild per this many blocks walked).
 const UNSINK_DRIFT_BLOCKS := 16
 
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3 (FP_FARRING_APPLIED_COVER) — REFINES FP_FARRING_UNCOVERED_TRUE: that
+## deployed un-sink proves a vertex unreachable by near mesh only OUTSIDE the *streamed-target* ellipsoid (128 +
+## the 24-block margin), but the near mesh's ACTUALLY-APPLIED extent stops well short of that — godot_voxel emits
+## no faces against unloaded neighbours, so the honest meshed edge sits ~112 blocks out, not 128+24=152 (§1.1). The
+## 40-block annulus between them was classified "covered" and kept the sunk envelope-minimum height with NOTHING
+## near ever drawn over it: a permanent trench ringing the near bubble, wherever the player stands. This flag
+## splits the deployed law's "covered" territory into a THIRD zone: inside the streamed+margin ellipsoid but
+## outside a PROBED "applied" radius (§3.2 below — the largest quantized box around the player column PROVEN
+## fully meshed), emit the TRUE chord minus a small z-guard (equal-altitude far, not the ~12-block sunk well) —
+## the trench collapses to ≲2 blocks. Effective only WITH FP_FARRING_UNCOVERED_TRUE
+## (`TierPlace.applied_cover_on()`): it REFINES that law's covered branch, never replaces the zone-A un-sink. Off
+## ⇒ every new path below is inert → FLAT byte-identical (6042/0). Gate: verify_near_far_height.gd (G-NFH-*).
+const FP_FARRING_APPLIED_COVER := false
+## Ladder step (blocks) the probed "applied" radius grows/shrinks by per cadence tick — one mesh-block pitch,
+## matching the honest meshed-edge granularity (module_world.gd's NEAR_COVER_MESHED_HALF / mesh-block size).
+const APPLIED_PROBE_STEP := 16
+## Ladder ceiling (blocks) — the honest meshed bound the near mesher can actually deliver (module_world.gd's
+## ~112 note; NOT the 128 streamed target). The probe never claims more than this.
+const APPLIED_PROBE_MAX := 112
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

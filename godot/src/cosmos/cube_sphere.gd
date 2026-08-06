@@ -534,6 +534,21 @@ const FP_SKIN_TEXTURE_MEAN := false
 ## pillar, dry-ocean-floor) ⇒ its own flag; default FALSE. See docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md.
 const FP_SKIN_BLOCK_EXACT := false
 
+## FP_FAR_COLOR_UNIFIED (docs/COSMOS-FACET-COLOUR-SEAM-DESIGN.md §3.1) — kills the facet-aligned COLOUR SEAM where a
+## FarPalette.color_for tier (FacetSmoothV2 / block-LOD rings / the shell's own vertex colour) borders a
+## FP_SKIN_BLOCK_EXACT fine-map facet: today color_for's biome tints are hand-tuned lerps (savanna 40% sand, forest
+## 35% leaf, jungle 55% jungle-leaves) while the fine map paints the ACTUAL top block (grass, sparsely dotted with
+## tree canopy) — savanna reads whole-facet TAN next to a whole-facet GREEN fine facet, day and night, hue-level.
+## This flag makes color_for's biome tints equal, by construction, the EXPECTED (mean) colour of the block-exact
+## law: grass blended toward the biome's canopy colour by its ACTUAL tree-canopy coverage fraction (derived from
+## TreeGen's own density constants next to FarPalette's *_TREE_COVER consts — see far_palette.gd), not an eyeballed
+## blend. TAIGA is left untouched (its existing 20% podzol hash already matches the fine map's mean within
+## tolerance — no canopy term needed, see far_palette.gd comment). One place (far_palette.gd `ensure_ready`), zero
+## per-vertex cost, fixes every color_for consumer simultaneously. Default false ⇒ ensure_ready recomputes the
+## shipped lerps VERBATIM (byte-identical; FLAT verify_feature.gd stays 6042/0 — color_for is exercised there).
+## NEVER-OOM: a handful of extra Color values, zero allocation. Gate: verify_far_color_unified.gd (G-FCU).
+const FP_FAR_COLOR_UNIFIED := false
+
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
 ## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async

@@ -384,8 +384,15 @@ func _s3_cell_gates(gen: Object, faceted: bool, fid: int) -> void:
 				saw_snow += 1
 			if y > g and y <= TerrainConfig.SEA_LEVEL and gd != 0 and mat != snow_id:
 				saw_sea += 1
+			# COSMOS-TREE-BUGS G-TB-COVER: count the B1-climate-biome species too (acacia/jungle/cactus), so a
+			# future flag-ON byte-equality run can never be vacuous on savanna/jungle trees the way the
+			# original Bug-1 sweep was (verify_cppgen never sampled savanna facets, and this counter only
+			# tallied the legacy species — a flag-ON run could pass without ever touching an acacia/jungle cell).
 			if y > g + 1 and (mat == BlockCatalog.WOOD or mat == BlockCatalog.LEAF \
-					or mat == BlockCatalog.id_of(&"birch_log") or mat == BlockCatalog.id_of(&"spruce_log")):
+					or mat == BlockCatalog.id_of(&"birch_log") or mat == BlockCatalog.id_of(&"spruce_log") \
+					or mat == BlockCatalog.id_of(&"acacia_log") or mat == BlockCatalog.id_of(&"acacia_leaves") \
+					or mat == BlockCatalog.id_of(&"jungle_log") or mat == BlockCatalog.id_of(&"jungle_leaves") \
+					or mat == BlockCatalog.id_of(&"cactus")):
 				saw_tree += 1
 			if y == g and CellCodec.modifier(gd) != 0:
 				saw_surface_shaped += 1

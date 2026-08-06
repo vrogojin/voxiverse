@@ -307,9 +307,32 @@ const B_JUNGLE := 12     # hot + wet tropical rainforest (deep-green grass, dens
 # routed by resolve_cell to a dedicated moon strata branch (_moon_cell) that emits regolith/basalt/anorthosite
 # over the shared deepslate+bedrock bones — NO sea, NO snow, NO trees, NO atmosphere. Values start ABOVE every
 # Earth biome so the enum spaces never collide; Earth columns never carry these, moon columns only these.
+# COSMOS-TREE-BUGS Bug 1 (docs/COSMOS-TREE-BUGS-DESIGN.md): that "never collide" claim was FALSIFIED the same
+# overnight by the sibling B1-climate-biomes commit appending B_SAVANNA/B_JUNGLE at these SAME raw values (11/12,
+# below) — resolve_cell's moon interception then hijacks Earth savanna/jungle columns into the airless moon
+# branch on the analytic path. `B_MOON_MARIA`/`_HIGHLANDS`/`_POLAR` below are the RAW (flag-off) ids; every
+# comparison/emission now goes through `moon_biome_id`/`is_moon_biome` instead of reading these consts directly,
+# so the collision can be resolved (FP_BIOME_SPACE_FIX renumbers to 21/22/23) without touching the consts' own
+# shipped values (kept for the off-path and as the base of the +slot arithmetic below).
 const B_MOON_MARIA := 11       # dark basalt plains (broad, lower, smoother)
 const B_MOON_HIGHLANDS := 12   # bright anorthosite highlands (rougher, higher)
 const B_MOON_POLAR := 13       # polar slot (content hook for later ice; v1 routes as highlands strata)
+
+## COSMOS-TREE-BUGS Bug 1 fix (FP_BIOME_SPACE_FIX) — the single source of truth for the moon biome id block.
+## slot 0=maria 1=highlands 2=polar. Off ⇒ 11/12/13 (== B_MOON_MARIA/_HIGHLANDS/_POLAR, byte-identical shipped
+## ids — every Earth/moon comparison in the codebase is unchanged bit-for-bit). On ⇒ 21/22/23, clear of every
+## Earth biome id (B_SAVANNA=11/B_JUNGLE=12 and everything below B_PILLAR=10), so resolve_cell's moon
+## interception can never again hijack an Earth column. GDScript `const` can't be flag-conditional, which is
+## why this is a function — every touch-point (resolve_cell's interception, _moon_profile's emission, _moon_cell's
+## internal maria/highlands split, far_palette's colour lookup, verify_moonring's gate) calls this instead of
+## reading B_MOON_* directly.
+static func moon_biome_id(slot: int) -> int:
+	return (21 + slot) if CubeSphere.FP_BIOME_SPACE_FIX else (11 + slot)
+
+## COSMOS-TREE-BUGS Bug 1 fix — true iff `b` is one of the (possibly renumbered) moon biome ids. The single
+## predicate resolve_cell's interception uses; keeps the 3-way `or` chain in one place.
+static func is_moon_biome(b: int) -> bool:
+	return b >= moon_biome_id(0) and b <= moon_biome_id(2)
 
 # --- salt registry (WGC §7.1 — one place, no collisions) ----------------------
 # TreeGen owns 11/22/33/44/55/66/88 + 121-125 (B1 climate-biome species: jungle/acacia/cactus
@@ -1046,7 +1069,7 @@ static func moon_profile_at_dir(dx: float, dy: float, dz: float, rr: float) -> V
 	var h := MOON_BASE_HEIGHT + roll + detail - maria * MOON_MARIA_DROP
 	h += _moon_crater_height(dx, dy, dz, rr)
 	var g := clampi(int(floor(h)), MOON_FLOOR_Y, MOON_CEIL_Y)
-	var biome := B_MOON_MARIA if maria >= 0.5 else B_MOON_HIGHLANDS
+	var biome := moon_biome_id(0) if maria >= 0.5 else moon_biome_id(1)   # COSMOS-TREE-BUGS: routed via the helper
 	var t := clampf(1.0 - 2.0 * absf(dz), -1.0, 1.0)     # latitude hook (harsh airless day/night swing, data)
 	return Vector4(float(g), float(biome), maria * 2.0 - 1.0, t)
 
@@ -1102,7 +1125,7 @@ static func _moon_crater_profile(s: float, rc: float) -> float:
 static func _moon_cell(x: int, y: int, z: int, g: int, biome: int) -> int:
 	if y > g:
 		return BlockCatalog.AIR                          # airless — no sea, snow, tree, atmosphere
-	var host := _ID_BASALT if biome == B_MOON_MARIA else _ID_ANORTHOSITE
+	var host := _ID_BASALT if biome == moon_biome_id(0) else _ID_ANORTHOSITE   # COSMOS-TREE-BUGS: routed via the helper
 	if g - y < MOON_REGOLITH_DEPTH:
 		return _ID_REGOLITH                              # top regolith blanket
 	if y <= DEEPSLATE_FULL_Y:
@@ -1305,8 +1328,12 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 	# COSMOS-ORBITAL-O1O4 §3.2 — the airless Moon strata branch, taken BEFORE any Earth machinery (slope/snow/
 	# sea/cap/tree). A moon column emits ONLY the moon strata ladder over the shared bedrock (handled above);
 	# it NEVER reaches _sea_block/_snow_stack/TreeGen, so the moon is guaranteed liquid-/snow-/tree-free and
-	# Earth columns (which never carry a B_MOON_* biome) are byte-identical (this branch is never taken for them).
-	if biome == B_MOON_MARIA or biome == B_MOON_HIGHLANDS or biome == B_MOON_POLAR:
+	# Earth columns (which never carry a moon biome id) are byte-identical (this branch is never taken for them).
+	# COSMOS-TREE-BUGS Bug 1 fix: `is_moon_biome` routes through the (possibly FP_BIOME_SPACE_FIX-renumbered)
+	# id block instead of the raw B_MOON_* consts — with the flag off this is the SAME 11/12/13 three-way `or`,
+	# byte-identical; with it on, Earth's B_SAVANNA=11/B_JUNGLE=12 (which collided with the shipped ids) can no
+	# longer match, so a savanna/jungle column falls through to the normal Earth machinery below (TreeGen included).
+	if is_moon_biome(biome):
 		return _moon_cell(x, y, z, g, biome)
 	# COSMOS M5c (docs/COSMOS-M5C-CORNER.md §2.2): the bedrock PILLAR column — full bedrock cubes from the
 	# world floor to the one flat top `g`, air above. Bypasses strata, ore, trees, snow, sea fill, and all

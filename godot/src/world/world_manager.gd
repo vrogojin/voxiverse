@@ -3671,7 +3671,16 @@ func reinforce_joint(a: Vector3i, b: Vector3i, reinf_id: int) -> bool:
 ## (up to the facet-centre sagitta, ~5-7 @ R=6371) BELOW the visible ground — a set_alt(5)/spawn that sinks.
 ## s ≡ 0.0 with FP_DATUM_BAKE off (and in flat/curved mode, where _active_facet < 0) ⇒ byte-identical; this
 ## rides FP_DATUM_BAKE's own gate. Mirrors floor_under's no-floor fallback (float(effective_height+1) + s).
-func surface_y(x: float, z: float) -> float:
+## COSMOS FALL-THROUGH ROOT (FP_QUERY_FRAME_GUARD §2.1): `pos_fid`, the caller's pose stamp; a trailing y is not
+## part of this query's contract (surface_y is a pure COLUMN lookup), so the reframe uses y = 0.0 — the facet's
+## own tangent-plane datum — as the canonical height for identifying the SAME physical column in the active
+## facet's frame (a judgment call: floor_under/blocked/ceiling_scan reframe the caller's REAL y because they also
+## need a correct feet/head height back; surface_y only ever needs the resulting x/z). Default (-1) or a matching
+## facet ⇒ byte-identical.
+func surface_y(x: float, z: float, pos_fid: int = -1) -> float:
+	if CubeSphere.FP_QUERY_FRAME_GUARD and pos_fid >= 0:
+		var g := _guard_reframe(x, 0.0, z, pos_fid)
+		x = g.x; z = g.z
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	return float(effective_height(xi, zi) + 1) + _datum_lift(xi, zi)
@@ -3696,7 +3705,28 @@ func _datum_lift(xi: int, zi: int) -> float:
 		return 0.0
 	return FacetAtlas.datum_lift(fid, float(xi) + 0.5, float(zi) + 0.5)
 
-func floor_under(x: float, z: float, feet_y: float) -> float:
+## FP_QUERY_FRAME_GUARD helper (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §2.1) — re-express (x,y,z),
+## stamped in facet `pos_fid`, into `TerrainConfig.active_facet()`'s lattice via the f64-exact
+## `FacetAtlas.reframe_position64`, the SAME math `_heal_frame_desync` uses to keep the player's own pose
+## continuous across a crossing. Called only from behind `CubeSphere.FP_QUERY_FRAME_GUARD and pos_fid >= 0` in
+## each of the four physics funnels below, so the flag-off / default (`pos_fid == -1`) path never reaches this
+## function at all (one compare, no call). `pos_fid == active facet` is also a no-op (still no reframe).
+func _guard_reframe(x: float, y: float, z: float, pos_fid: int) -> Vector3:
+	var active := TerrainConfig.active_facet()
+	if pos_fid == active:
+		return Vector3(x, y, z)
+	var w: Array = FacetAtlas.reframe_position64(pos_fid, active, x, y, z)
+	return Vector3(w[0], w[1], w[2])
+
+func floor_under(x: float, z: float, feet_y: float, pos_fid: int = -1) -> float:
+	# COSMOS FALL-THROUGH ROOT (FP_QUERY_FRAME_GUARD, docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §2.1): the
+	# caller's pose stamp `pos_fid` may have drifted from the active facet (a crossing committed set_active_facet
+	# but the caller hasn't re-expressed its pose yet this frame). Re-express the query point ONCE so the scan
+	# below reads the SAME physical column the caller means, never a decorrelated neighbour's. Default (-1) or a
+	# matching facet ⇒ byte-identical (one compare).
+	if CubeSphere.FP_QUERY_FRAME_GUARD and pos_fid >= 0:
+		var g := _guard_reframe(x, feet_y, z, pos_fid)
+		x = g.x; feet_y = g.y; z = g.z
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)   # in-cell footprint (ignored by full cubes; used by P5 shapes)
@@ -3704,6 +3734,13 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 	# COSMOS FS2′: convert the PLAY feet to CELL space for the (content) scan, report the found top back in PLAY
 	# space (+ s). s ≡ 0.0 with FP_DATUM_BAKE off ⇒ byte-identical.
 	var s := _datum_lift(xi, zi)
+	# COSMOS FALL-THROUGH GUARD (FP_FLOOR_SURFACE_WELD, docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §2.2): the
+	# column's analytic surface in PLAY space — the SAME expression `surface_y` returns for (xi, zi). Computed once
+	# (O(1), `effective_height` is the memoized column read the scan below already warms) so both weld sites can
+	# reuse it. Off ⇒ left at 0.0 and never read (the weld clauses below are themselves flag-gated).
+	var surface_play_y := 0.0
+	if CubeSphere.FP_FLOOR_SURFACE_WELD:
+		surface_play_y = float(effective_height(xi, zi) + 1) + s
 	var cell_feet := feet_y - s
 	# Start at the feet directly (NO clamp to the noise top): players stand on trees
 	# and placed towers ABOVE the heightmap, and clamping down would teleport them
@@ -3734,7 +3771,17 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 				_floor_scan_iters += 1
 				var hp := _occ_span(cell_value_at(Vector3i(xi, y, zi)), fx, fz)
 				if hp != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
-					return float(y) + hp.y + s
+					var probe_play_y := float(y) + hp.y + s
+					# COSMOS FALL-THROUGH GUARD (FP_FLOOR_SURFACE_WELD §2.2): an un-edited column's true floor never
+					# sits MORE THAN FLOOR_WELD_EPS below the analytic surface (no-caves law; the epsilon covers the
+					# legitimate in-cell deficit of shaped/slope/snow cells and the water-seafloor smoothing span —
+					# FablePhys hardening #1, verify_floor_weld's no-fire arm pins it) — a found floor meaningfully
+					# below it is a stale-frame lie (§1.2), so weld up to the surface. `_edit_columns` exempts dug
+					# shafts/tunnels (a real below-surface stand), preserving shipped behaviour there exactly. Off
+					# ⇒ dead code.
+					if CubeSphere.FP_FLOOR_SURFACE_WELD and probe_play_y < surface_play_y - CubeSphere.FLOOR_WELD_EPS and not _edit_columns.has(Vector2i(xi, zi)):
+						return surface_play_y
+					return probe_play_y
 				y -= 1
 			# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
 			# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
@@ -3769,7 +3816,12 @@ func floor_under(x: float, z: float, feet_y: float) -> float:
 		if here != Vector2.ZERO and _occ_span(cell_value_at(Vector3i(xi, y + 1, zi)), fx, fz) == Vector2.ZERO:
 			if populate and memo_safe and _span_indep_full(v_here):
 				_floor_memo_put(Vector2i(xi, zi), y)
-			return float(y) + here.y + s
+			var tail_play_y := float(y) + here.y + s
+			# COSMOS FALL-THROUGH GUARD (FP_FLOOR_SURFACE_WELD §2.2): same epsilon-gated weld as the probe-loop
+			# return above — see that comment. Off ⇒ dead code.
+			if CubeSphere.FP_FLOOR_SURFACE_WELD and tail_play_y < surface_play_y - CubeSphere.FLOOR_WELD_EPS and not _edit_columns.has(Vector2i(xi, zi)):
+				return surface_play_y
+			return tail_play_y
 		if populate and not _span_indep_empty(v_here):
 			memo_safe = false          # a footprint-DEPENDENT cell sits above the floor → unsafe to cache this column
 		y -= 1
@@ -3812,7 +3864,12 @@ const _EPS := 1e-6
 ## all-full-cube world: a full cube ahead raises the standable surface 1.0 m (> STEP_MAX
 ## → wall), a body span overlapping the ground finds its surface far above the buried
 ## feet (→ wall), and open air raises nothing (→ not blocked).
-func blocked(x: float, z: float, feet_y: float) -> bool:
+func blocked(x: float, z: float, feet_y: float, pos_fid: int = -1) -> bool:
+	# COSMOS FALL-THROUGH ROOT (FP_QUERY_FRAME_GUARD §2.1): see floor_under's preamble comment. The internal
+	# floor_under call below inherits the (already reframed) x/z/feet_y and needs no `pos_fid` of its own.
+	if CubeSphere.FP_QUERY_FRAME_GUARD and pos_fid >= 0:
+		var g0 := _guard_reframe(x, feet_y, z, pos_fid)
+		x = g0.x; feet_y = g0.y; z = g0.z
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	# COSMOS FS2′: this column's play↔cell lift (0.0 unless FP_DATUM_BAKE). The ridge-wall own_dist test is a
@@ -3867,7 +3924,17 @@ func _headroom_clear(xi: int, zi: int, fx: float, fz: float, top: float) -> bool
 ## cell whose occupancy starts at/below where the head already is (occ_lo < from_head_y)
 ## is ignored: the head is already clear there, only NEW occupancy overhead constrains
 ## the move. BYTE-IDENTICAL to a single full-cube point test for the current world.
-func ceiling_scan(x: float, z: float, from_head_y: float, to_head_y: float) -> float:
+func ceiling_scan(x: float, z: float, from_head_y: float, to_head_y: float, pos_fid: int = -1) -> float:
+	# COSMOS FALL-THROUGH ROOT (FP_QUERY_FRAME_GUARD §2.1): see floor_under's preamble comment. Two bounds ⇒ two
+	# reframes (the reframe is affine but not y-independent — a facet-tilt shear can carry a small in-plane drift
+	# with height — so from_head_y and to_head_y are each re-expressed exactly; both share the same x/z column,
+	# which the first reframe fixes for the whole scan).
+	if CubeSphere.FP_QUERY_FRAME_GUARD and pos_fid >= 0:
+		var g0 := _guard_reframe(x, from_head_y, z, pos_fid)
+		var g1 := _guard_reframe(x, to_head_y, z, pos_fid)
+		x = g0.x; z = g0.z
+		from_head_y = g0.y
+		to_head_y = g1.y
 	var xi := int(floor(x))
 	var zi := int(floor(z))
 	var fx := x - float(xi)

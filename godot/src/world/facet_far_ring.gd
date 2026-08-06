@@ -97,6 +97,15 @@ var _async_unsink_have_col := false
 # not every frame. Unused with the flag off.
 var _unsink_armed_col: Vector3 = Vector3.ZERO
 var _unsink_armed := false
+# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): the probed scalar radius (blocks, quantized
+# to APPLIED_PROBE_STEP) to which the near voxel field is ACTUALLY APPLIED around the player column — the
+# coverage signal `_blend_uncovered`'s zone-C territory shrinks to (§3.1). Grown ≤1 ladder step/cadence tick on a
+# passing probe, dropped to 0 instantly on a failing re-verify (`_applied_probe_step`); 0 while unprobed / on an
+# invalid coverage callable (never a false claim). LIVE (main-thread-mutated) — read by the synchronous emit path.
+var _applied_r := 0.0
+# The FROZEN copy snapshotted in `_dispatch_async_rebuild` (mirrors `_async_unsink_col`) — the worker's
+# `_emit_cached(..., from_worker=true)` reads ONLY this, never the live scalar. 0.0 with the flag off (never read).
+var _async_applied_r := 0.0
 # §3 P3: the player column the CURRENTLY RESIDENT S2 tiles were last baked against + whether a baseline exists yet
 # (`_rim_assign`'s RIM_REBUILD_BLOCKS cadence gate). Unused with the flag off.
 var _rim_baked_col: Vector3 = Vector3.ZERO
@@ -1276,6 +1285,9 @@ func _process(_dt: float) -> void:
 	# player's column, so re-arm `_pending` only once it has drifted ≥ UNSINK_DRIFT_BLOCKS since the last arm — not
 	# every frame (the idle short-circuits below still hold in between). No-op with the flag off (byte-identical).
 	_unsink_drift_check()
+	# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2: advance the applied-cover ladder probe on the same cadence, right
+	# beside the un-sink drift re-arm above. No-op with the flag off (byte-identical).
+	_applied_probe_step()
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -1512,6 +1524,50 @@ func _unsink_drift_check(on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> void:
 		_unsink_armed = true
 		_pending = true
 
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): is a box of horizontal half-extent `r`,
+## vertical half-extent `h`, centred on world point `col`, fully meshed by the near voxel field? Mirrors
+## `_noblack_near_meshed`'s (fid, fid-lattice AABB) -> module_world.skin_near_meshed probe, but mapped into the
+## ACTIVE facet's lattice (the near mesh is always centred under the player, who stands on the active facet) —
+## the applied radius is a player-centred scalar, not a per-backstop-facet one. Invalid callable (GDScript
+## fallback / no module) ⇒ false (never claim a covered box that cannot be proven, same convention as
+## `_cull_probe_cell`). Pure read; main thread only (reads the live `_active_fid` / `_cull_cover_query`).
+func _applied_box_meshed(r: float, h: float, col: Vector3) -> bool:
+	if not _cull_cover_query.is_valid():
+		return false
+	var l: Array = FacetAtlas.world_to_lattice64(_active_fid, col.x, col.y, col.z)
+	var aabb := AABB(Vector3(float(l[0]) - r, float(l[1]) - h, float(l[2]) - r), Vector3(2.0 * r, 2.0 * h, 2.0 * r))
+	return bool(_cull_cover_query.call(_active_fid, aabb))
+
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2/§3.3: advance `_applied_r`, the probed scalar radius the near voxel
+## field is ACTUALLY APPLIED to around the player column — the coverage signal `_blend_uncovered`'s zone-C
+## territory (§3.1) shrinks to. Runs on the same per-frame cadence as `_unsink_drift_check` (past the
+## `_async_building` guard, called right beside it from `_process`). Bounded to AT MOST 2 `is_area_meshed` probes
+## per call: (1) re-verify the CURRENTLY-claimed radius still holds — a failing re-verify drops `_applied_r` to 0
+## IN THIS SAME TICK (the "shrink instantly" law — a retreating near mesh converts its cells to zone B,
+## equal-altitude, within one cadence + one rebuild, never a stale over-claim); (2) attempt exactly ONE ladder
+## step of growth past the (possibly just-dropped) radius — a pass extends by exactly APPLIED_PROBE_STEP, never
+## more (the "grow ≤1 step/tick" law), capped at APPLIED_PROBE_MAX. No real column yet, or an invalid coverage
+## callable (GDScript / no-module path), ⇒ `_applied_r = 0` unconditionally — degraded to all-zone-B inside the
+## streamed ellipsoid, never a sunk trench (§3.2). `on` overrides the compile-derived gate (mirrors this file's
+## existing "force via function param" convention, e.g. `_unsink_drift_check`'s `on`) so a headless gate can
+## drive the real ladder law without sed; every real caller passes no override ⇒ `TierPlace.applied_cover_on()`
+## governs. Sets `_pending` when the quantized radius CHANGES (§3.3) — rides the existing single-flight pipeline.
+func _applied_probe_step(on := TierPlace.applied_cover_on(), params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> void:
+	var before := _applied_r
+	if not on or not _unsink_have_col or not _cull_cover_query.is_valid():
+		_applied_r = 0.0
+	else:
+		var step := float(CubeSphere.APPLIED_PROBE_STEP)
+		var max_r := float(CubeSphere.APPLIED_PROBE_MAX)
+		var h := params.z
+		if _applied_r > 0.0 and not _applied_box_meshed(_applied_r, h, _player_col_abs):
+			_applied_r = 0.0                              # shrink instantly — the claimed radius no longer holds
+		var next_r := _applied_r + step
+		if next_r <= max_r + 0.001 and _applied_box_meshed(next_r, h, _player_col_abs):
+			_applied_r = next_r                           # grow exactly one step
+	if _applied_r != before:
+		_pending = true
+
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
 ## BACK_CULL] — so with the flag off the emitted set is computed exactly as today (byte-identical), and on the
@@ -1695,6 +1751,10 @@ func _dispatch_async_rebuild() -> void:
 	# (a Vector3 + a bool); with the flag off it is frozen but never read (byte-identical).
 	_async_unsink_col = _player_col_abs
 	_async_unsink_have_col = _unsink_have_col
+	# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): freeze the probed applied-cover radius —
+	# SAME freeze contract as the pair above (a Vector3+bool/float triple, cheap unconditional copy). 0.0 with the
+	# flag off (never read).
+	_async_applied_r = _applied_r
 	# REVISION 5 Stage A (FP_ENV_DEMAND_DISC): frozen for the worker's "have" test. ORBIT keeps its existing law
 	# unchanged (no near field to bound the envelope demand against off-surface), so force it off there.
 	_async_demand_on = CubeSphere.FP_ENV_DEMAND_DISC and not _shell_orbit()
@@ -3104,6 +3164,26 @@ func _uncovered(surface_pt: Vector3, col: Vector3, have_col: bool, params: Vecto
 	var nt := tangential / r
 	return (nr * nr + nt * nt) > 1.0
 
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.1/§3.4 — params-only twin of `_uncovered`, but for the APPLIED ellipsoid
+## (zone C, §3.1): is `surface_pt` INSIDE the ellipsoid centred the SAME way as the streamed one (`col + up·O`,
+## `params.y`) but with horizontal semi-axis `applied_r` — the PROBED §3.2 radius, not the streamed target — and
+## vertical semi-axis `params.z` (the streamed H; only the horizontal reach is under-delivered by the mesher, the
+## vertical reach does not shrink independently)? `applied_r <= 0` (unprobed / invalid coverage query) ⇒ always
+## false — zone C is empty, so every vertex the shipped law would call "covered" instead resolves through zone B.
+## Pure: reads only its arguments — safe on the async worker thread (mirrors `_uncovered`'s purity contract).
+func _applied_covered(surface_pt: Vector3, col: Vector3, applied_r: float, params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> bool:
+	var h := params.z
+	if applied_r <= 0.0 or h <= 0.0:
+		return false
+	var cl := col.length()
+	var up := (col / cl) if cl > 0.001 else Vector3.UP
+	var delta := surface_pt - (col + up * params.y)
+	var radial := delta.dot(up)
+	var tangential := (delta - up * radial).length()
+	var nr := radial / h
+	var nt := tangential / applied_r
+	return (nr * nr + nt * nt) <= 1.0
+
 ## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 — blend the per-vertex analytic un-sink over `covered_pos` (whichever
 ## envelope+sink / noblack law the caller already resolved for facet `fid`): an UNCOVERED vertex (its TRUE chord
 ## point lies outside the inflated ellipsoid — near mesh can never reach it) takes the TRUE height; a COVERED
@@ -3112,15 +3192,31 @@ func _uncovered(surface_pt: Vector3, col: Vector3, have_col: bool, params: Vecto
 ## interpolated) — a mixed cell simply spans them, and under FP_BLOCKY_FARRING the cell top is the corner MIN, so
 ## a mixed frontier cell automatically takes the conservative (covered/sunk) height. Pure w.r.t. its arguments
 ## (`col`/`have_col` already resolved by the caller from the correct live-vs-frozen source) — safe on the worker.
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.1 (FP_FARRING_APPLIED_COVER): REFINES the two-way pick above into three
+## zones. `applied_on`/`applied_r` are the applied-cover gate + the PROBED radius (§3.2), already resolved by the
+## caller from the correct live-vs-frozen source (mirrors `col`/`have_col`) — this function stays pure w.r.t. its
+## arguments, safe on the worker. A vertex the shipped test calls "covered" (inside the streamed+margin ellipsoid)
+## now splits further: inside the (smaller) APPLIED ellipsoid it keeps `covered_pos` verbatim (zone C — real near
+## mesh actually hides it); outside it but still inside the streamed one, it takes the TRUE chord minus
+## `TierPlace.ENV_EPS_G` (zone B — equal-altitude far, z-guarded so a mesh block landing mid-probe-window never
+## coplanar-fights it). `applied_on` false (or `have_col` false) ⇒ the elif is never taken ⇒ byte-identical to
+## the deployed two-zone blend. `applied_r <= 0` (unprobed / invalid query) ⇒ `_applied_covered` is always false
+## ⇒ zone B everywhere inside the streamed ellipsoid — degraded but correct, never the sunk trench (§3.2).
 func _blend_uncovered(covered_pos: PackedVector3Array, fid: int, col: Vector3, have_col: bool,
-		params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> PackedVector3Array:
+		params: Vector3 = TerrainConfig.streamed_ellipsoid_params(),
+		applied_on := TierPlace.applied_cover_on(), applied_r := 0.0) -> PackedVector3Array:
 	_ensure_backstop_true_cached(fid)
 	var tp: PackedVector3Array = _btrue_cache[fid]
 	var out := PackedVector3Array()
 	out.resize(covered_pos.size())
 	for i in range(covered_pos.size()):
 		var t: Vector3 = tp[i]
-		out[i] = t if _uncovered(t, col, have_col, params) else covered_pos[i]
+		if _uncovered(t, col, have_col, params):
+			out[i] = t                                                # zone A — unchanged, byte-preserved
+		elif applied_on and have_col and not _applied_covered(t, col, applied_r, params):
+			out[i] = t - t.normalized() * TierPlace.ENV_EPS_G          # zone B — TRUE chord minus the z-guard
+		else:
+			out[i] = covered_pos[i]                                   # zone C (or applied_on off) — unchanged
 	return out
 
 # REVISION 5 Stage B: `force` skips the "already cached" early-return and REPLACES `_bpos_cache[fid]`/`_bcol_cache[fid]`
@@ -3530,8 +3626,10 @@ func _append_backstop_tris(pos: PackedVector3Array, col: PackedColorArray, fid: 
 	if uncovered_true_on:
 		# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1: SUPERSEDES the whole-facet noblack pick with the per-vertex
 		# analytic law. This fast (memcpy) path is only ever reached from `_build_fast` — main-thread/synchronous
-		# always (never dispatched to the async worker) — so the LIVE column is always the correct source here.
-		gp = _blend_uncovered(_sunk_positions(_bpos_cache[fid], fid), fid, _player_col_abs, _unsink_have_col)
+		# always (never dispatched to the async worker) — so the LIVE column (and LIVE applied radius, §3.2 of
+		# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md) is always the correct source here.
+		gp = _blend_uncovered(_sunk_positions(_bpos_cache[fid], fid), fid, _player_col_abs, _unsink_have_col,
+			TerrainConfig.streamed_ellipsoid_params(), TierPlace.applied_cover_on(), _applied_r)
 	elif CubeSphere.FP_FARRING_ACTIVE_NOBLACK and fid == _noblack_unsink_fid:
 		gp = _bpos_cache[fid]
 	else:
@@ -3738,7 +3836,11 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 		if uncovered_true_on:
 			var pcol: Vector3 = _async_unsink_col if from_worker else _player_col_abs
 			var have_pcol: bool = _async_unsink_have_col if from_worker else _unsink_have_col
-			pos = _blend_uncovered(pos, fid, pcol, have_pcol)
+			# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2: the applied-cover radius follows the SAME live/frozen split
+			# as pcol/have_pcol above (the worker reads ONLY the value frozen at dispatch).
+			var papplied: float = _async_applied_r if from_worker else _applied_r
+			pos = _blend_uncovered(pos, fid, pcol, have_pcol, TerrainConfig.streamed_ellipsoid_params(),
+				TierPlace.applied_cover_on(), papplied)
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
 	elif _is_limb_dense(fid):

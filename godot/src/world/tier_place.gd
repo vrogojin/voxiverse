@@ -122,6 +122,13 @@ static func backstop_sink() -> float:
 static func level_on() -> bool:
 	return CubeSphere.FP_FARRING_LEVEL and CubeSphere.FP_FARRING_CULL_COVERED
 
+## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3 (FP_FARRING_APPLIED_COVER): is the near↔far height-step fix active at the
+## FLAG level? REFINES FP_FARRING_UNCOVERED_TRUE (never fires without it — the applied-cover law only splits
+## territory that law's zone-A/covered test already governs). Off ⇒ byte-identical (the deployed two-zone blend
+## runs verbatim).
+static func applied_cover_on() -> bool:
+	return CubeSphere.FP_FARRING_APPLIED_COVER and CubeSphere.FP_FARRING_UNCOVERED_TRUE
+
 ## COSMOS TEXTURED-LOD U3: the far ring's radial sink COLLAPSED to the ENV_EPS_G correctness guard only — the backstop
 ## sits at essentially the near surface radius (a tiny ε below, never the ~13-block visual displacement). Same ε guard
 ## the min-envelope uses (max(ENV_EPS_G, ENV_EPS_FRAC×cell); ≈1.5 floor at R=3072, ≈5.2 at R=6371) — it covers the

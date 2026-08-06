@@ -97,6 +97,14 @@ const FACET_CORNER_SLACK := 2.0       # COSMOS FS-W (§3): a corner-commit landi
                                       # destination's ridges (a genuine 3-facet corner) and still commit — kept < |WALL_EPS|
                                       # (3) so the player is always placed clear of the −3 ridge wall (never stranded).
 
+# COSMOS UP-VECTOR FACET-DESYNC FIX (FP_UPVECTOR_FACET_HEAL, docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md
+# §2): the strip's own guards. MAX_SPEED (b/s) — the strip is only a trap for a near-stationary player; a walker
+# crosses it in one physics step, so gating on speed means normal walking never even evaluates the mask check.
+# NEAR_RIDGE — derived: max seam-plane |B| (0.0332) × (the live FP_DATUM_BAKE lift ceiling 6.9 + 1) ≈ 0.26,
+# rounded up for margin — beyond this no crossing-law/mask disagreement is geometrically possible (doc §1.2).
+const UPVECTOR_HEAL_MAX_SPEED := 0.5
+const UPVECTOR_HEAL_NEAR_RIDGE := 0.3
+
 # FP-M1c Planet Assembly pool policy (docs/COSMOS-FP-M1-DESIGN.md §4.3). Amortization throttle (≤1 spawn AND ≤1
 # retire per POOL_SPAWN_INTERVAL_S) + the pool-miss counter (a re-designation crossing whose destination was not
 # yet pooled falls back to the FP-S1 teardown — must be ~0 in a normal walk; the gate asserts it). All dormant
@@ -2391,7 +2399,10 @@ func _corner_commit(fid: int, pos: Vector3) -> Dictionary:
 ## facet and return the f64-EXACT reframed position + the dihedral yaw twist for Player.apply_reframe. FP3a: the
 ## reframe + active-facet switch (the correctness core, gated by cross-and-return byte-identity). FP3b adds the
 ## module restream (M4 cover), the far-ring re-placement (rigid, no regen), and debris re-frame. {} = no crossing.
-func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
+## `h_speed`/`grounded` (docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md §2): optional hints for
+## FP_UPVECTOR_FACET_HEAL's strip resolver (§below). Defaults (0.0 / false) are the conservative "never heal"
+## case, so an omitted-hint caller is unaffected even if the flag is on; flag off ⇒ never consulted at all.
+func maybe_cross_facet(player_pos: Vector3, h_speed: float = 0.0, grounded: bool = false) -> Dictionary:
 	if not CubeSphere.FACETED:
 		return {}
 	var fid := TerrainConfig.active_facet()
@@ -2453,7 +2464,61 @@ func maybe_cross_facet(player_pos: Vector3) -> Dictionary:
 				to = int(cc["to"])
 				np = cc["np"]
 			return _commit_facet_change(fid, to, np, slot)
+	# COSMOS UP-VECTOR FACET-DESYNC FIX (FP_UPVECTOR_FACET_HEAL, docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md
+	# §2): the shipped scan above found nothing to commit (no slot triggered, or every triggered slot deferred) —
+	# try the soil-ownership resolver for a near-stationary grounded player sitting in the sub-hysteresis strip.
+	# Inside the SAME cooldown gate as the scan above, so it can never re-fire faster than a normal crossing. Off
+	# ⇒ unreached (one flag compare) ⇒ byte-identical.
+	if CubeSphere.FP_UPVECTOR_FACET_HEAL:
+		var heal := _upvector_strip_heal(fid, player_pos, h_speed, grounded)
+		if not heal.is_empty():
+			return heal
 	return {}
+
+## COSMOS UP-VECTOR FACET-DESYNC FIX (FP_UPVECTOR_FACET_HEAL, docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md
+## §2) — re-own the facet you stand on. Called only from `maybe_cross_facet`'s tail, after its own crossing-law
+## slot scan found nothing to commit. A near-stationary, grounded player sitting in the sub-hysteresis strip
+## (§1.2) has the SOIL cell under their feet junction-masked to a neighbour that renders it at its own
+## orientation — commit the crossing the soil law already implies, through the same blessed
+## `_commit_facet_change` path (ActiveFrame/up + pool/far-ring/gravity flip together, the SAME commit
+## `_alt_reentry_restore` above uses). Returns the same dict shape a normal crossing does (consumed by the
+## caller's `apply_reframe`), or {} (no heal — deferred exactly like a normal corner defer). Read-only w.r.t.
+## position/`_pos_fid` — the crossing dict is the only output; `apply_reframe` remains the sole pose writer.
+func _upvector_strip_heal(fid: int, pos: Vector3, h_speed: float, grounded: bool) -> Dictionary:
+	# Cost-ordered guards (§2): a walking/airborne player can never be trapped (crosses the ≤0.33-block strip in
+	# one physics step) — reject before touching the atlas at all.
+	if not grounded or h_speed >= UPVECTOR_HEAL_MAX_SPEED:
+		return {}
+	# The SAME plane-dot math the shipped slot scan above already ran (one compare per slot); beyond NEAR_RIDGE
+	# no crossing-law/mask disagreement is geometrically possible (§1.2's derived bound).
+	var own_min := INF
+	for slot in 4:
+		own_min = minf(own_min, FacetAtlas.own_dist(fid, slot, pos.x, pos.y, pos.z))
+	if own_min >= UPVECTOR_HEAL_NEAR_RIDGE:
+		return {}
+	# Authoritative check: is the soil cell under the feet actually junction-masked for the ACTIVE facet? The
+	# same cell derivation the render/floor-scan junction path uses (effective_height's column top) — not a
+	# re-invented probe.
+	var xi := int(floor(pos.x))
+	var zi := int(floor(pos.z))
+	var yi := effective_height(xi, zi)
+	if not bool(FacetAtlas.cell_seam_state(fid, xi, yi, zi)["air"]):
+		return {}                                         # the soil is ours here — no strip, nothing to heal
+	# The facet_of_dir classifier oracle names the true owner (also correct at a 3-facet corner diagonal).
+	var w := FacetAtlas.lattice_to_world64(fid, pos.x, pos.y, pos.z)
+	var to := FacetAtlas.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	if to < 0 or to == fid:
+		return {}
+	var np := FacetAtlas.reframe_position64(fid, to, pos.x, pos.y, pos.z)
+	# Accept only under the SAME corner-wall bound `_corner_commit` already uses — never place the player past
+	# the −3 ridge wall. A rejection here just defers (the far ring still draws, the floor still carries them —
+	# measured 0 corner-deferral tilt occurrences, §1.3 P2).
+	var best := INF
+	for bslot in 4:
+		best = minf(best, FacetAtlas.own_dist(to, bslot, np[0], np[1], np[2]))
+	if best < -(FACET_CROSS_HYST + FACET_CORNER_SLACK):
+		return {}
+	return _commit_facet_change(fid, to, np, -1)
 
 ## COSMOS FALL-THROUGH FIX (FP_DESCENT_FACET_RESYNC) — the GENERAL descent facet resync. A fast/high flight over a FAR
 ## region drifts the true sub-camera facet many facets away from the active facet while adjacent crossings are cooldown/

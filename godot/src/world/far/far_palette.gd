@@ -42,6 +42,53 @@ static func _top_color(id: int) -> Color:
 		return BlockTextures.mean_color_of(id)
 	return BlockCatalog.color_of(id)
 
+## FP_FAR_COLOR_UNIFIED (docs/COSMOS-FACET-COLOUR-SEAM-DESIGN.md §3.1) — the fraction of a biome's columns a
+## TreeGen tree's TOP-DOWN canopy decoration covers, derived from TreeGen's OWN density constants (not eyeballed):
+##   coverage = PATCH_CHANCE · TREE_CHANCE · [species-select gate] · canopy_footprint_columns / G²
+## PATCH_CHANCE(0.30)/TREE_CHANCE(0.45) gate whether a tree-grid cell hosts ANY tree at all (tree_gen.gd
+## has_tree); G²=100 is the column count of one grid cell (tree_gen.gd G=10). FOREST (oak/birch) and JUNGLE
+## species are never gated to SP_NONE for their biome (tree_gen.gd _species_for), so they omit the bracketed
+## term; SAVANNA's acacia is additionally thinned by ACACIA_DENSITY (TreeGen's own "sparse savanna" factor).
+## canopy_footprint_columns is the union of the shape function's top-down-visible columns (tree_gen.gd
+## _oak_block/_jungle_block/_acacia_block): oak/birch's 3×3-ring + diamond cap covers the FULL 3×3 = 9 columns;
+## jungle's and acacia's 5×5-wide-square + diamond cap both cover the FULL 5×5 = 25 columns. TAIGA is NOT listed
+## here — its existing tint (below) is already the exact mean of the 20% podzol hash _biome_top stamps; adding a
+## spruce-canopy term (≈13/100 footprint × 0.135 existence ≈ 1.8% coverage) moves it by ≈2/255, inside the gate's
+## 4/255 tolerance, so the design leaves it untouched.
+const _FOREST_CANOPY_COLS := 9.0
+const _JUNGLE_CANOPY_COLS := 25.0
+const _SAVANNA_CANOPY_COLS := 25.0
+const _GRID_COLUMNS := float(TreeGen.G * TreeGen.G)
+const FOREST_TREE_COVER := TreeGen.PATCH_CHANCE * TreeGen.TREE_CHANCE * _FOREST_CANOPY_COLS / _GRID_COLUMNS
+const JUNGLE_TREE_COVER := TreeGen.PATCH_CHANCE * TreeGen.TREE_CHANCE * _JUNGLE_CANOPY_COLS / _GRID_COLUMNS
+const SAVANNA_TREE_COVER := TreeGen.PATCH_CHANCE * TreeGen.TREE_CHANCE * TreeGen.ACACIA_DENSITY * _SAVANNA_CANOPY_COLS / _GRID_COLUMNS
+
+## The four biome blend tints, factored out of `ensure_ready` as a pure function of the `unified` flag (instead of
+## reading `CubeSphere.FP_FAR_COLOR_UNIFIED` directly) so verify_far_color_unified.gd can drive BOTH branches in one
+## run without sed-toggling the compile-time const. `ensure_ready` below calls this with the real flag. Returns
+## [taiga, forest, savanna, jungle] — TAIGA is identical on both branches (see the coverage-const comment above).
+static func _biome_tints(unified: bool) -> Array[Color]:
+	var taiga := _grass.lerp(_podzol, 0.20)          # TAIGA-DESIGN §2.3.3: 20% podzol / 80% grass hash mean; unchanged by the flag
+	if unified:
+		# The EXPECTED colour of the block-exact fine-map law (§3.1): grass blended toward the biome's REAL canopy
+		# colour by its REAL tree-canopy coverage — not a hand-tuned lerp factor. Forest's canopy mixes oak (70%)
+		# and birch (30%) leaf colour, mirroring TreeGen._species_for's own oak/birch split (tree_gen.gd:108),
+		# so the derived tint matches the fine map's true species mix, not just the oak-only swatch.
+		var oak_leaf := _leaf                          # BlockCatalog.LEAF == the oak leaf tile (tree_gen.gd SP_OAK)
+		var birch_leaf := _top_color(BlockCatalog.id_of(&"birch_leaves"))
+		var forest_canopy := oak_leaf.lerp(birch_leaf, 0.30)
+		var acacia_leaf := _top_color(BlockCatalog.id_of(&"acacia_leaves"))
+		var jungle_leaf := _top_color(BlockCatalog.id_of(&"jungle_leaves"))
+		var forest := _grass.lerp(forest_canopy, FOREST_TREE_COVER)
+		var savanna := _grass.lerp(acacia_leaf, SAVANNA_TREE_COVER)
+		var jungle := _grass.lerp(jungle_leaf, JUNGLE_TREE_COVER)
+		return [taiga, forest, savanna, jungle]
+	# Shipped hand-tuned lerps, verbatim (byte-identical when the flag is off).
+	var forest_off := _grass.lerp(_leaf, 0.35)
+	var savanna_off := _grass.lerp(_sand, 0.40)
+	var jungle_off := _grass.lerp(_top_color(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
+	return [taiga, forest_off, savanna_off, jungle_off]
+
 static func ensure_ready() -> void:
 	if _ready:
 		return
@@ -61,14 +108,16 @@ static func ensure_ready() -> void:
 	# Deterministic biome-mean tints (LOD-DESIGN §2.3.3): TAIGA is the 20% podzol / 80%
 	# grass mean of _biome_top's hash; FOREST tints grass toward leaf to stand in for the
 	# canopy the far field cannot draw as individual trees.
-	_taiga = _grass.lerp(_podzol, 0.20)
-	_forest = _grass.lerp(_leaf, 0.35)
-	# B1 climate-biome bands (design §6.5): savanna reads as tan dry grassland (grass toward sand),
-	# jungle as a deep saturated green (grass toward jungle_leaves). Both derive from catalog tints so
-	# they follow a recolour, exactly like every other far colour. Shown on the GDScript far path; the
-	# C++ skin path (frozen_colors, 14 entries) maps them to grass via its default until the enum extends.
-	_savanna = _grass.lerp(_sand, 0.40)
-	_jungle = _grass.lerp(_top_color(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
+	# B1 climate-biome bands (design §6.5): savanna/forest/jungle/taiga tints (see _biome_tints).
+	# FP_FAR_COLOR_UNIFIED (COLOUR-SEAM-DESIGN §3.1): off ⇒ the shipped hand-tuned lerps verbatim;
+	# on ⇒ the block-exact fine-map law's expected colour, killing the tier-frontier colour seam.
+	# Shown on the GDScript far path; the C++ skin path (frozen_colors, 14 entries) maps
+	# savanna/jungle to grass via its default until the enum extends.
+	var tints := _biome_tints(CubeSphere.FP_FAR_COLOR_UNIFIED)
+	_taiga = tints[0]
+	_forest = tints[1]
+	_savanna = tints[2]
+	_jungle = tints[3]
 	_ready = true
 
 ## The sea-surface colour for a clamped (open-water) vertex of climate temperature `t`

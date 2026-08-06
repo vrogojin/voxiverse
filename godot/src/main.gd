@@ -315,6 +315,11 @@ func _process(_delta: float) -> void:
 		# daylight twin — clouds read moonlit/dark at night like the ground. Self-guards ⇒ flag-off byte-identical.
 		if _clouds != null:
 			_clouds.set_near_daylight_sun_dir(_cosmos_sky.current_sun_dir())
+	# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): forward the Sun direction into the smooth-v2
+	# annulus's own (separate-from-the-shell) material each frame. No-op with no faceted ring / flag off
+	# (the WorldManager/ring setters self-guard) ⇒ byte-identical.
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_SMOOTH_V2 and CubeSphere.FACETED:
+		_player.world.set_smooth_v2_sun_dir(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
 	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
 	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),

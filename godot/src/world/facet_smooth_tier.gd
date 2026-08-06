@@ -35,8 +35,8 @@ static func residency_for_tier(tier: int) -> int:
 	match tier:
 		S2: return CubeSphere.SMOOTH_S2_MAX
 		S3: return CubeSphere.SMOOTH_S3_MAX
-		S4: return CubeSphere.SMOOTH_S4_MAX
-		_: return CubeSphere.SMOOTH_S5_MAX
+		S4: return CubeSphere.smooth_s4_max()
+		_: return CubeSphere.smooth_s5_max()
 
 ## Build the smooth-tier surface for facet `fid` at `cells` cells-per-edge. Returns the packed arrays an ArrayMesh
 ## surface wants, all in ABSOLUTE planet-block coords (the far ring's frame — parented under its node so
@@ -47,19 +47,27 @@ static func residency_for_tier(tier: int) -> int:
 ## `slot` is written −1 here (B2 overlay: UV2.y=-1 ⇒ the shell shader's fine/base branch paints it — no band).
 ## `lift` (blocks) nudges every vertex radially outward: the B2 overlay draws the smooth mesh a hair ABOVE the
 ## flat heightfield so it occludes it (sub-pixel at far distance) until the emit-exclusion path lands (increment 2).
-## `curved` places vertices on the CURVED SPHERE `dir·(R + relief)` instead of on the flat inscribed facet quad — the
-## piecewise-flat quads ARE the facet-boundary crease (adjacent flat tangent planes meet at a dihedral angle even at
-## sea level), so curving the base is what removes the "straight lines stitching facets"; it also sits the tile above
-## the inscribed heightfield (occlusion for free). Off (B1 gate) ⇒ the flat planar+relief placement node_at returns.
-static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false) -> Dictionary:
+## `curved` places vertices on the CURVED SPHERE `dir·(R + relief)`. Historically (pre-P0) this differed from the
+## `curved=false` branch, which placed vertices on the flat inscribed facet quad instead — the piecewise-flat
+## quads ARE the facet-boundary crease (adjacent flat tangent planes meet at a dihedral angle even at sea level).
+## Post-P0 (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2) `FarDensity.node_at`'s own `pos`/`planar` are ALREADY
+## the canon-dir radial placement (`dir·r_datum` + relief), so both branches now agree to float-associativity
+## rounding only — the parameter/branch stay (call-site compatibility; the B2 worker always passes `true`).
+## `normal_lit` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2, FP_SMOOTH_NORMAL_LIT): stamp alpha=0 on every
+## vertex colour as the "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch
+## keys off (`FacetFarRing._apply_smooth_normal_lit`). Defaults to the live flag (mirrors `_apply_shade_unified`'s
+## `unified := CubeSphere.FP_SHADE_UNIFIED` pattern) so callers/gates can force it without toggling the const.
+## `slot` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C, FP_SMOOTH_SKIN_SLOT): the UV2.y slot to stamp on
+## every vertex instead of the hard-coded -1 — a frozen `FacetFarRing._slot_of(fid)` snapshot the caller threads
+## through (worker-safe: a plain float, no live object read). Defaults to -1.0 (the shipped base-map fallback) so
+## every existing call site (and the flag-off path) is byte-identical.
+static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = false, normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, gen: Object = null) -> Dictionary:
 	FarPalette.ensure_ready()
 	var r_datum := FacetAtlas.r_of(fid)
-	var corners := [
-		FacetAtlas.facet_planar_corner(fid, 0),
-		FacetAtlas.facet_planar_corner(fid, 1),
-		FacetAtlas.facet_planar_corner(fid, 2),
-		FacetAtlas.facet_planar_corner(fid, 3),
-	]
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the SHARED canon corner DIRECTIONS, not the facet's own
+	# planarized corner points — `FarDensity.node_at` bilerps these so a boundary node welds bit-identically to
+	# whichever facet is on the other side of the shared edge (`FacetAtlas.facet_corner_dirs`, `facet_atlas.gd:425`).
+	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
 	var dec := _decode(fid)
 	var face := int(dec[0])
 	var a := int(dec[1])
@@ -82,42 +90,84 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 	var dirs := PackedVector3Array()
 	dirs.resize(n)
 
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): ONE native VoxelGeneratorCosmos.bake_smooth_tile() replaces the per-node
+	# FarDensity.node_at → TerrainConfig.profile_at_dir chain (the ~2700-sample/tile WASM-allocator convoy that
+	# stalled warmup). Byte-equal by construction (§ the C++ mirrors node_at term-for-term). A refusal — engine
+	# lacks the method, generator not ready, or malformed request — returns an empty dict, so `use_baked` stays
+	# false and the GDScript node_at path below runs VERBATIM (byte-identical to the pre-flag build).
+	var b_dir: PackedVector3Array
+	var b_g: PackedInt32Array
+	var b_biome: PackedInt32Array
+	var b_temp: PackedFloat32Array
+	var b_pos: PackedVector3Array
+	var b_relief: PackedFloat32Array
+	var b_bnrm := PackedVector3Array()
+	var use_baked := false
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and gen != null:
+		var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+		if baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == n:
+			use_baked = true
+			b_dir = baked["dir"]; b_g = baked["g"]; b_biome = baked["biome"]; b_temp = baked["temp"]
+			b_pos = baked["pos"]; b_relief = baked["relief"]; b_bnrm = baked["bnrm"]
 	var inv := 1.0 / float(cells)
 	for gj in range(stride):
 		var t := float(gj) * inv
 		for gi in range(stride):
 			var s := float(gi) * inv
-			var node := FarDensity.node_at(corners, s, t)
 			var vi := gj * stride + gi
-			var d: Vector3 = node["dir"]
-			if curved:
-				pos[vi] = d * (r_datum + float(node["relief"]) + lift)   # on the sphere → no dihedral crease across facets
+			var d: Vector3
+			var g: int
+			var biome: int
+			var temp: float
+			var relief: float
+			var npos: Vector3
+			if use_baked:
+				d = b_dir[vi]; g = b_g[vi]; biome = b_biome[vi]; temp = b_temp[vi]
+				relief = b_relief[vi]; npos = b_pos[vi]
 			else:
-				pos[vi] = (node["pos"] as Vector3) + d * lift            # flat planar+relief (B1 gate parity)
+				var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+				d = node["dir"]; g = int(node["g"]); biome = int(node["biome"]); temp = float(node["temp"])
+				relief = float(node["relief"]); npos = node["pos"]
+			if curved:
+				pos[vi] = d * (r_datum + relief + lift)   # on the sphere → no dihedral crease across facets
+			else:
+				pos[vi] = npos + d * lift            # node_at's own radial pos (B1 gate parity)
 			dirs[vi] = d
-			var g := int(node["g"])
-			col[vi] = FarPalette.color_for(g, int(node["biome"]), float(node["temp"]), g < TerrainConfig.SEA_LEVEL)
+			var vc := FarPalette.color_for(g, biome, temp, g < TerrainConfig.SEA_LEVEL)
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2 (FP_SMOOTH_NORMAL_LIT): stamp alpha=0 as the per-vertex
+			# "this is a SMOOTH-TILE vertex" marker the shared shell shader's normal-lit branch keys off
+			# (`FacetFarRing._apply_smooth_normal_lit`, COLOR.a is unread by every existing shader consumer of
+			# COLOR — only `.rgb` is ever taken). Off ⇒ alpha stays the FarPalette default (1.0), byte-identical
+			# to the pre-P2 tiles.
+			if normal_lit:
+				vc.a = 0.0
+			col[vi] = vc
 			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
-			uv2[vi] = Vector2(float(face), -1.0)
+			uv2[vi] = Vector2(float(face), slot)
 
-	# Per-vertex normal = normalized cross of the world-space tangents (central differences of the displaced grid
-	# = the density gradient on a heightfield, §2.5), oriented outward (dot with the radial dir). On a flat facet
-	# the tangents are the facet plane ⇒ the normal is radial (G-FS-DEGEN).
+	# Per-vertex normal. INTERIOR (§2.5): normalized cross of the world-space tangents (central differences of the
+	# displaced grid = the density gradient on a heightfield), oriented outward (dot with the radial dir). On a
+	# flat facet the tangents are the facet plane ⇒ the normal is radial (G-FS-DEGEN). BOUNDARY (s or t ∈ {0,1},
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 3, P0): the OLD clamped-stencil here (`i0=gi` at gi==0, etc.)
+	# is a one-sided in-tile difference — two facets sharing an edge would each clamp toward THEIR OWN interior
+	# and generally compute DIFFERENT normals there (a shading seam once P2 lights by normal). Route boundary
+	# nodes through `FarDensity.boundary_normal` instead — a pure function of the (already-welded, canon) `d`, so
+	# both sides get the bit-identical value.
 	for gj in range(stride):
 		for gi in range(stride):
 			var vi := gj * stride + gi
-			var i0 := gi - 1 if gi > 0 else gi
-			var i1 := gi + 1 if gi < cells else gi
-			var j0 := gj - 1 if gj > 0 else gj
-			var j1 := gj + 1 if gj < cells else gj
-			var ts := pos[gj * stride + i1] - pos[gj * stride + i0]
-			var tt := pos[j1 * stride + gi] - pos[j0 * stride + gi]
-			var nv := ts.cross(tt)
-			if nv.length_squared() <= 0.0:
-				nv = dirs[vi]
-			nv = nv.normalized()
-			if nv.dot(dirs[vi]) < 0.0:
-				nv = -nv
+			var nv: Vector3
+			if gi == 0 or gi == cells or gj == 0 or gj == cells:
+				nv = b_bnrm[vi] if use_baked else FarDensity.boundary_normal(dirs[vi], r_datum)
+			else:
+				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
+				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
+				nv = ts.cross(tt)
+				if nv.length_squared() <= 0.0:
+					nv = dirs[vi]
+				nv = nv.normalized()
+				if nv.dot(dirs[vi]) < 0.0:
+					nv = -nv
 			nrm[vi] = nv
 
 	var idx := PackedInt32Array()
@@ -135,6 +185,377 @@ static func build_tile(fid: int, cells: int, lift: float = 0.0, curved: bool = f
 			ii += 6
 
 	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx}
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 / §2.1 (FP_SMOOTH_RIM) — the S2 NEAR-COLLAR builder. Same (cells+1)²
+## grid / index winding / UV-UV2 skin law as `build_tile` above, but every vertex HEIGHT is envelope-inside-disc +
+## feather + ε-sink instead of the plain true relief:
+##   w    = clamp((|vertex − player_col| − r_env) / feather, 0, 1)     -- 0 strictly inside the disc, 1 past the feather
+##   h(v) = lerp(env_pos(v), true_pos(v), w) − dir(v)·(sink · (1 − w))  -- the sink fades out exactly where w → 1
+## `env_pos` is the SAME min-envelope lower bound the shipped backstop/coarse-horizon caches use
+## (`FacetFarRing._env_weld_grid(fid, cells)`, reused verbatim — "don't reinvent it"): env_pos(v) ≤ true_pos(v)
+## radially, by the SAME dilated-footprint-minimum construction proof the backstop already carries. A convex blend
+## of two quantities that are both ≤ true, minus a non-negative sink, is still ≤ true — so the no-protrusion
+## invariant holds BY CONSTRUCTION inside the disc (never by a tuned constant), which is what G-RIM-ENV proves.
+## `player_col`/`r_env`/`feather`/`sink` are FROZEN inputs — the caller (`FacetSmoothTier`'s P1-instance worker glue)
+## snapshots them ONCE per build batch (the same single-writer discipline `_snap_plan` already uses), so this is a
+## PURE function of world position + these frozen scalars: two S2 tiles built in the SAME batch compute BIT-IDENTICAL
+## values at any shared boundary vertex (already bit-identical there by the P0 canon weld) ⇒ the weld canon survives
+## the blend (G-RIM-WELD). Past the feather (w=1, sink=0) this is EXACTLY `build_tile`'s plain true-height placement —
+## an S2 tile's facet-edge boundary (almost always beyond R_env+feather in practice — the disc is ≤ ~160 blocks,
+## the facet edge ~417) therefore already agrees with a neighbouring S3 tile's plain boundary before the frontier
+## snap even runs (belt-and-suspenders on top of `snap_edge_to_pitch`).
+## `slot` — see `build_tile`'s R-C doc above; same frozen-snapshot discipline, same -1.0 default (byte-identical off).
+## `cheap_on` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP, §7.1 (i)): sample the S2
+## envelope at `TierPlace.rim_fine_mult()` instead of the shipped `TierPlace.ENV_FINE_MULT` (~174k → ~43k desktop /
+## ~11k web `profile_at_dir` samples/facet — the warmup allocator-convoy cost, R5.3), then subtract
+## `TierPlace.rim_env_resid()` from the coarsened envelope before it enters the blend. A coarser fine grid can only
+## MISS a low column (env can only go UP, never down, vs the reference mult) — env_coarse − resid ≤ env_fine ≤
+## true_pos BY CONSTRUCTION (G-RIM-MULT proves the inequality; RIM_ENV_RESID's own derivation proves the bound),
+## so no-protrusion survives the coarsening exactly the way it survives the min-envelope's own dilated footprint.
+## Off ⇒ `_env_weld_grid` runs at the shipped ENV_FINE_MULT with zero compensation — byte-identical.
+## `prev_env_pos`/`prev_tile`/`old_col` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D, FP_RIM_CHEAP,
+## §7.1 (ii) crescent-only rebake): the LAST bake's per-node env-position array (`prev_env_pos`, the EXACT
+## `_env_weld_grid` output vertex, resid-compensated already — cached verbatim, not a scalar reconstruction, so
+## reuse is bit-exact with zero re-derivation rounding), the last COMMITTED tile (for verbatim vertex reuse), and
+## the player column that bake was taken against. Env is TERRAIN-only — it never depends on `player_col` — so once
+## cached it is NEVER recomputed on a later rebake at all (`env` reuse is unconditional when the cache is valid,
+## not merely "for non-crescent nodes"): the crescent restricts the (comparatively cheaper, but still real)
+## per-node `FarDensity.node_at` TRUE-relief resample instead. A node's world position (`FarDensity.node_dir(...) *
+## r_datum`, no noise sample) is tested against the OLD and NEW column at a CONSERVATIVELY padded annulus
+## (`r_env ± feather`, expanded by both the column drift AND `TierPlace.rim_crescent_pad()` — the SAME measured
+## min-envelope-vs-true bound `ENV_ALL_EPS_FRAC` already establishes elsewhere in this codebase, reused rather than
+## the theoretical global max relief — see tier_place.gd's derivation): a node outside the padded band at BOTH
+## columns is PROVABLY unreachable from the transition this bake
+## could have moved it into, so its previous vertex (pos/col, already correct — terrain-invariant) is reused
+## byte-for-byte; every other node (plus EVERY boundary node, unconditionally, for the weld canon) gets a fresh
+## `node_at` sample. Normals are ALWAYS recomputed from the FINAL (possibly-mixed reused/fresh) position array in
+## the second pass below — never reused per-vertex — since a central-difference stencil at a reused node can
+## still touch a freshly-moved neighbour. No cache (initial bake, or an invalidated one) ⇒ every node takes the
+## fresh branch — identical to a from-scratch build. Returns an EXTRA `"rim_env_pos"` key (the per-node env array
+## this build actually used) for the caller to cache for the NEXT rebake — absent needs no caller change
+## (Dictionary key simply present).
+static func build_tile_rim(fid: int, cells: int, player_col: Vector3, r_env: float, feather: float, sink: float,
+		normal_lit := CubeSphere.FP_SMOOTH_NORMAL_LIT, slot: float = -1.0, cheap_on := CubeSphere.FP_RIM_CHEAP,
+		prev_env_pos: PackedVector3Array = PackedVector3Array(), prev_tile: Dictionary = {}, old_col: Vector3 = Vector3.ZERO, gen: Object = null,
+		near_weld_on := CubeSphere.FP_RIM_NEAR_WELD, r_near: float = -1.0) -> Dictionary:
+	FarPalette.ensure_ready()
+	var r_datum := FacetAtlas.r_of(fid)
+	var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
+	var dec := _decode(fid)
+	var face := int(dec[0])
+	var a := int(dec[1])
+	var b := int(dec[2])
+	var kb := int(dec[3])
+	var stride := cells + 1
+	var n := stride * stride
+
+	var prev_pos: PackedVector3Array = prev_tile.get("pos", PackedVector3Array())
+	var prev_col: PackedColorArray = prev_tile.get("col", PackedColorArray())
+	var have_cache := cheap_on and prev_env_pos.size() == n and prev_pos.size() == n and prev_col.size() == n
+
+	# Only a CACHE MISS (initial bake, or a caller that never supplies one) ever touches `_env_weld_grid` — the
+	# S2-only coarser mult (§7.1 (i)) applies here exactly as before. A cache hit skips the fine-grid entirely
+	# (env is terrain-invariant — a fresh sample would reproduce the SAME numbers, just expensively).
+	var env_pos: PackedVector3Array
+	var resid := 0.0
+	if not have_cache:
+		var env := FacetFarRing._env_weld_grid(fid, cells, TierPlace.rim_fine_mult() if cheap_on else -1)
+		env_pos = env[0]
+		if cheap_on:
+			resid = TierPlace.rim_env_resid()
+
+	var pos := PackedVector3Array()
+	var nrm := PackedVector3Array()
+	var col := PackedColorArray()
+	var uv := PackedVector2Array()
+	var uv2 := PackedVector2Array()
+	pos.resize(n)
+	nrm.resize(n)
+	col.resize(n)
+	uv.resize(n)
+	uv2.resize(n)
+	var dirs := PackedVector3Array()
+	dirs.resize(n)
+	var rim_env_pos := PackedVector3Array()
+	rim_env_pos.resize(n)
+
+	# Crescent annulus (have_cache only): a node's CHEAP planar position (no noise) is compared to `r_env ± feather`,
+	# padded by the column drift (the disc itself moved) AND `TierPlace.rim_crescent_pad()` (the measured, already-
+	# gate-proven min-envelope-vs-true bound, ~11.7 blocks at R=6371 — NOT the theoretical global max relief, which
+	# would swamp this test almost everywhere near a modest S2 disc) — a node outside this band at BOTH the old and
+	# new column can PROVABLY not have crossed the real (relief-exact) transition band either. Over-inclusive only
+	# ever means a few extra (still-correct) fresh samples, never a wrongly-stale reuse.
+	var lo := 0.0
+	var hi := 1.0e30
+	if have_cache:
+		var drift := old_col.distance_to(player_col)
+		var pad := TierPlace.rim_crescent_pad()
+		lo = maxf(0.0, r_env - feather - drift - pad)
+		hi = r_env + feather + drift + pad
+
+	var feather_safe := maxf(feather, 0.001)
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): the S2 collar's INITIAL full bake (`not have_cache` — the 11025-node
+	# biggest-tile convoy) reads its per-node dir/g/biome/temp/relief + boundary normals from ONE native
+	# bake_smooth_tile() call instead of 11025 GDScript node_at → profile_at_dir samples. The crescent path
+	# (`have_cache`, FP_RIM_CHEAP) touches only a few fresh nodes so it stays on the GDScript node_at path.
+	# Refusal / engine-lacks-method / have_cache ⇒ use_baked stays false, node_at path runs verbatim.
+	var b_dir: PackedVector3Array
+	var b_g: PackedInt32Array
+	var b_biome: PackedInt32Array
+	var b_temp: PackedFloat32Array
+	var b_relief: PackedFloat32Array
+	var b_bnrm := PackedVector3Array()
+	var use_baked := false
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and gen != null and not have_cache:
+		var baked: Dictionary = gen.call("bake_smooth_tile", corner_dirs, r_datum, cells)
+		if baked.has("dir") and (baked["dir"] as PackedVector3Array).size() == n:
+			use_baked = true
+			b_dir = baked["dir"]; b_g = baked["g"]; b_biome = baked["biome"]
+			b_temp = baked["temp"]; b_relief = baked["relief"]; b_bnrm = baked["bnrm"]
+	var inv := 1.0 / float(cells)
+	for gj in range(stride):
+		var t := float(gj) * inv
+		for gi in range(stride):
+			var s := float(gi) * inv
+			var vi := gj * stride + gi
+			var boundary := gi == 0 or gi == cells or gj == 0 or gj == cells
+			var reuse := false
+			var d: Vector3
+			if have_cache and not boundary:
+				d = FarDensity.node_dir(corner_dirs, s, t)
+				var planar := d * r_datum
+				var d_old := planar.distance_to(old_col)
+				var d_new := planar.distance_to(player_col)
+				if (d_old < lo or d_old > hi) and (d_new < lo or d_new > hi):
+					reuse = true
+			if reuse:
+				pos[vi] = prev_pos[vi]
+				col[vi] = prev_col[vi]
+				rim_env_pos[vi] = prev_env_pos[vi]
+			else:
+				var relief_v: float
+				var g: int
+				var biome: int
+				var temp: float
+				if use_baked:
+					d = b_dir[vi]; relief_v = b_relief[vi]; g = b_g[vi]; biome = b_biome[vi]; temp = b_temp[vi]
+				else:
+					var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+					d = node["dir"]; relief_v = float(node["relief"]); g = int(node["g"]); biome = int(node["biome"]); temp = float(node["temp"])
+				var true_pos: Vector3 = d * (r_datum + relief_v)
+				var env_p: Vector3
+				if have_cache:
+					env_p = prev_env_pos[vi]   # terrain-invariant, cached VERBATIM — no reconstruction, bit-exact
+				else:
+					env_p = env_pos[vi]
+					if resid > 0.0:
+						env_p -= d * resid   # Stage D no-protrusion compensation: env_coarse − resid ≤ env_fine ≤ true_pos
+				rim_env_pos[vi] = env_p
+				var dist := true_pos.distance_to(player_col)
+				if near_weld_on and r_near >= 0.0:
+					# REVISION 7-VISUAL (§R7.2, FP_RIM_NEAR_WELD): the near↔far height-wall fix. The shipped law below
+					# sinks the WHOLE disc interior to env−sink (5–20 blocks), and since the disc (r_env=160+feather)
+					# extends ~48–64 blocks past the near voxel edge (~112–128), that sunk annulus is the VISIBLE ground
+					# and the near cut-edge shows as a block-face wall. Here the visible annulus welds to the near
+					# mesher's block-quantised top: `true_pos − ε` — true_pos = d·(r_datum + max(0,g)) is EXACTLY the
+					# near block-top for land / sea level for water (block-quantised, relief is integer), so the step is
+					# ≤ ε and seamless in BOTH near-streamed states (this is the ground the near mesher will build). The
+					# height is terrain-invariant (position-independent) ⇒ crescent-reuse stays valid. The r_env
+					# true-height frontier is unchanged, so §2.1's stream-in-can't-protrude invariant survives verbatim.
+					var welded: Vector3 = true_pos - d * CubeSphere.RIM_WELD_EPS
+					var hidden_pos: Vector3 = env_p - d * sink   # the shipped w=0 interior law (≤-truth, hidden under near voxels)
+					if dist < r_near - CubeSphere.RIM_WELD_BAND:
+						pos[vi] = hidden_pos                                  # zone H: under committed near voxels — never seen
+					elif dist < r_near:
+						var rw := clampf((dist - (r_near - CubeSphere.RIM_WELD_BAND)) / CubeSphere.RIM_WELD_BAND, 0.0, 1.0)
+						pos[vi] = hidden_pos.lerp(welded, rw)                 # zone B ramp: env−sink → block-top (across/under the near edge)
+					elif dist < r_env:
+						pos[vi] = welded                                      # zone B hold: block-top − ε (the visible annulus)
+					elif dist < r_env + feather_safe:
+						var wf := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+						pos[vi] = welded.lerp(true_pos, wf)                   # zone F: block-top → true relief (past max near reach)
+					else:
+						pos[vi] = true_pos
+				else:
+					var w := clampf((dist - r_env) / feather_safe, 0.0, 1.0)
+					var blended: Vector3 = env_p.lerp(true_pos, w)
+					pos[vi] = blended - d * (sink * (1.0 - w))
+				var vc := FarPalette.color_for(g, biome, temp, g < TerrainConfig.SEA_LEVEL)
+				if normal_lit:
+					vc.a = 0.0
+				col[vi] = vc
+			dirs[vi] = d
+			uv[vi] = Vector2((float(a) + s) / float(kb), (float(b) + t) / float(kb))
+			uv2[vi] = Vector2(float(face), slot)
+
+	# Normals: identical law to `build_tile` — boundary via the canon `FarDensity.boundary_normal` (a pure function of
+	# `d` alone), interior via the central-difference cross of the FINAL (blended, possibly reuse-mixed) grid
+	# tangents, so a normal-lit shade reads the ACTUAL collar surface, and a crescent rebuild's normals are bit-equal
+	# to a from-scratch rebuild's (never reused per-vertex — see the doc comment above).
+	for gj in range(stride):
+		for gi in range(stride):
+			var vi := gj * stride + gi
+			var nv: Vector3
+			if gi == 0 or gi == cells or gj == 0 or gj == cells:
+				nv = b_bnrm[vi] if use_baked else FarDensity.boundary_normal(dirs[vi], r_datum)
+			else:
+				var ts := pos[gj * stride + gi + 1] - pos[gj * stride + gi - 1]
+				var tt := pos[(gj + 1) * stride + gi] - pos[(gj - 1) * stride + gi]
+				nv = ts.cross(tt)
+				if nv.length_squared() <= 0.0:
+					nv = dirs[vi]
+				nv = nv.normalized()
+				if nv.dot(dirs[vi]) < 0.0:
+					nv = -nv
+			nrm[vi] = nv
+
+	var idx := PackedInt32Array()
+	idx.resize(cells * cells * 6)
+	var ii := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			var v00 := gj * stride + gi
+			var v10 := v00 + 1
+			var v01 := v00 + stride
+			var v11 := v01 + 1
+			idx[ii] = v00; idx[ii + 1] = v10; idx[ii + 2] = v11
+			idx[ii + 3] = v00; idx[ii + 4] = v11; idx[ii + 5] = v01
+			ii += 6
+
+	return {"pos": pos, "nrm": nrm, "col": col, "uv": uv, "uv2": uv2, "idx": idx, "rim_env_pos": rim_env_pos}
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P0, mixed pitch) — the COARSE-OWNS-EDGE chord-snap, generalized
+## from the shipped `FacetFarRing._weld_snap_edges` (`facet_far_ring.gd:2939`, CELLS=4-only) to any tier pair on
+## the ladder (S2/S3/S4/S5, and the S5→shipped-CELLS=4-shell frontier): a fine tile at `cells` sitting next to a
+## coarser tile at `coarse_cells` (`cells` a whole multiple of `coarse_cells` — the ladder's node-superset property,
+## 104=2·52=4·26=8·13) snaps every boundary vertex NOT already on the coarse lattice onto a straight-line lerp of
+## its OWN coarse-index neighbours along that edge. Those coarse-index vertices already bit-match the coarse
+## neighbour's own vertices there (law 2's canon-dir weld — same (canon dirs, r_datum, s, t) ⇒ same `node_at`), so
+## the lerp reproduces the coarse tile's OWN straight polygon edge exactly ⇒ no crack at the mixed-pitch frontier.
+## Mutates `pos` in place (mirrors the shipped in-place `_weld_snap_edges`). No-op if `coarse_cells` doesn't evenly
+## divide `cells` or isn't strictly coarser (caller error guard — the ladder never calls it otherwise).
+static func snap_edges_to_coarse(pos: PackedVector3Array, cells: int, coarse_cells: int) -> void:
+	if coarse_cells <= 0 or coarse_cells >= cells or cells % coarse_cells != 0:
+		return
+	var cstride := cells / coarse_cells
+	var stride := cells + 1
+	for i in range(1, cells):
+		if i % cstride == 0:
+			continue                                     # already a coarse-index vertex — leave it exact
+		var c0 := (i / cstride) * cstride                # lower coarse index on the edge
+		var c1 := mini(c0 + cstride, cells)              # upper coarse index
+		var lo := float(i - c0) / float(cstride)
+		pos[i * stride + 0] = pos[c0 * stride + 0].lerp(pos[c1 * stride + 0], lo)             # West (gi=0)
+		pos[i * stride + cells] = pos[c0 * stride + cells].lerp(pos[c1 * stride + cells], lo)  # East (gi=cells)
+		pos[0 * stride + i] = pos[0 * stride + c0].lerp(pos[0 * stride + c1], lo)              # South (gj=0)
+		pos[cells * stride + i] = pos[cells * stride + c0].lerp(pos[cells * stride + c1], lo)  # North (gj=cells)
+
+# Tile-local edge selector (gi/gj grid sense — matches verify_far_smooth.gd's `_edge_indices` FA.slot convention:
+# WEST=gi=0 ↔ FacetAtlas.S_WEST, EAST=gi=cells ↔ S_EAST, SOUTH=gj=0 ↔ S_SOUTH, NORTH=gj=cells ↔ S_NORTH).
+enum { EDGE_WEST = 0, EDGE_EAST = 1, EDGE_SOUTH = 2, EDGE_NORTH = 3 }
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 4 (P1 generalization of the P0 `snap_edges_to_coarse` above) — snap
+## ONE edge of a `cells`-resolution tile onto an ARBITRARY coarser reference pitch `pitch_cells` that need NOT
+## evenly divide `cells`. This is the S5(13)→shipped-CELLS(4)-shell frontier case (13 isn't a multiple of 4, so the
+## integer-ratio helper above no-ops there) — and, defensively, ANY tier tile whose neighbour is momentarily absent
+## from the smooth-resident set (still shell) during ladder convergence (make-before-break window). Re-evaluates
+## `FarDensity.node_at` at the reference pitch's OWN breakpoints — bit-consistent with what a tile actually built at
+## that pitch (or the shipped shell, `_weld_place`/`_weld_unit`, same bilerp + same add-then-multiply order, P0
+## canon) would place there — then piecewise-linearly interpolates this tile's non-breakpoint boundary nodes within
+## their enclosing reference segment (same COARSE-OWNS-EDGE law, generalized off the integer-ratio assumption).
+## No-op if `pitch_cells` isn't strictly coarser (the caller may call this unconditionally for all 4 edges; a
+## same-or-finer neighbour is a no-op here — coarse-owns-edge means THAT side snaps toward `cells`, not vice versa).
+static func snap_edge_to_pitch(pos: PackedVector3Array, cells: int, corner_dirs: PackedFloat64Array, r_datum: float, pitch_cells: int, edge: int) -> void:
+	if pitch_cells <= 0 or pitch_cells >= cells:
+		return
+	var stride := cells + 1
+	for i in range(1, cells):
+		var u := float(i) / float(cells)
+		var seg := clampi(int(floor(u * float(pitch_cells))), 0, pitch_cells - 1)
+		var u0 := float(seg) / float(pitch_cells)
+		var u1 := float(seg + 1) / float(pitch_cells)
+		var lo := (u - u0) / (u1 - u0)
+		var p0: Vector3
+		var p1: Vector3
+		var vi: int
+		match edge:
+			EDGE_WEST:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, 0.0, u0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, 0.0, u1)
+				vi = i * stride + 0
+			EDGE_EAST:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, 1.0, u0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, 1.0, u1)
+				vi = i * stride + cells
+			EDGE_SOUTH:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, u0, 0.0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, u1, 0.0)
+				vi = 0 * stride + i
+			_:
+				p0 = _pitch_node_pos(corner_dirs, r_datum, u0, 1.0)
+				p1 = _pitch_node_pos(corner_dirs, r_datum, u1, 1.0)
+				vi = cells * stride + i
+		pos[vi] = p0.lerp(p1, lo)
+
+## The CURVED radial placement at facet-param (s,t) — matches `build_tile`'s curved branch (`d·(r_datum+relief)`,
+## lift=0, P1 retires the overlay lift) exactly, so a reference breakpoint here is bit-consistent with what a tile
+## actually built AT that pitch would place there.
+static func _pitch_node_pos(corner_dirs: PackedFloat64Array, r_datum: float, s: float, t: float) -> Vector3:
+	var node := FarDensity.node_at(corner_dirs, r_datum, s, t)
+	var d: Vector3 = node["dir"]
+	return d * (r_datum + float(node["relief"]))
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 5 — the always-on crack backstop. Appends a thin radially-INWARD
+## "curtain" of degenerate geometry along all 4 edges of an already-built tile, dropped `drop` blocks below the true
+## surface (planet-centred coords ⇒ `pos.normalized()` IS the outward radial, no separate dir array needed). Any
+## residual sub-pixel gap at a tile boundary (weld rounding, a neighbour mid-convergence) reveals this skirt, never
+## a see-through hole. Mutates `tile`'s packed arrays IN PLACE (worker-safe: only touches this tile's own arrays,
+## called AFTER any edge snap so the skirt hangs from the FINAL boundary position).
+static func append_skirt(tile: Dictionary, cells: int, drop: float) -> void:
+	var pos: PackedVector3Array = tile["pos"]
+	var nrm: PackedVector3Array = tile["nrm"]
+	var col: PackedColorArray = tile["col"]
+	var uv: PackedVector2Array = tile["uv"]
+	var uv2: PackedVector2Array = tile["uv2"]
+	var idx: PackedInt32Array = tile["idx"]
+	var stride := cells + 1
+	for edge in range(4):
+		var e := _edge_indices_list(edge, cells, stride)
+		var base := pos.size()
+		for vi in e:
+			var p: Vector3 = pos[vi]
+			var d := p.normalized()
+			pos.append(p - d * drop)
+			nrm.append(nrm[vi])
+			col.append(col[vi])
+			uv.append(uv[vi])
+			uv2.append(uv2[vi])
+		for k in range(e.size() - 1):
+			var a0: int = e[k]
+			var a1: int = e[k + 1]
+			var b0 := base + k
+			var b1 := base + k + 1
+			idx.append(a0); idx.append(a1); idx.append(b1)
+			idx.append(a0); idx.append(b1); idx.append(b0)
+	tile["pos"] = pos
+	tile["nrm"] = nrm
+	tile["col"] = col
+	tile["uv"] = uv
+	tile["uv2"] = uv2
+	tile["idx"] = idx
+
+static func _edge_indices_list(edge: int, cells: int, stride: int) -> Array:
+	var out := []
+	match edge:
+		EDGE_WEST:
+			for gj in range(stride): out.append(gj * stride + 0)
+		EDGE_EAST:
+			for gj in range(stride): out.append(gj * stride + cells)
+		EDGE_SOUTH:
+			for gi in range(stride): out.append(0 * stride + gi)
+		_:
+			for gi in range(stride): out.append(cells * stride + gi)
+	return out
 
 ## Resident byte cost of a built tile (§2.7 ledger, `SMOOTH_BYTES_MAX`). pos/nrm 12 B each, col 16 B, uv/uv2 8 B
 ## each, idx 4 B — the ArrayMesh vertex-buffer footprint the LRU accounts against the NEVER-OOM cap.
@@ -155,102 +576,547 @@ static func _decode(fid: int) -> Array:
 	return [face, a, b, kb]
 
 # =====================================================================================================================
-# B2 INSTANCE — the worker-baked smooth-tile MeshInstance (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2.7). A
-# FacetFarRing owns ONE of these under FP_FAR_SMOOTH: it builds `build_tile` for a requested set of facets on
-# WorkerThreadPool slots (cloned from the baker's _pbm pattern), merges the resident tiles into ONE ArrayMesh surface,
-# and shares the ring's shell material so the map skin + every per-frame uniform bind come for free. Increment 1 draws
-# it as an overlay (a small radial `lift`) — the emit-exclusion + normal-lit relief variant + skirts land in B2 inc-2.
-# NEVER-OOM: resident tiles bounded by the requested set (≤ tier cap) + SMOOTH_BYTES_MAX ledger, fixed at creation.
+# P1 INSTANCE (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P1) — the worker-baked smooth-tile MeshInstance set. A
+# FacetFarRing owns ONE of these under FP_FAR_SMOOTH: it builds `build_tile` for a requested {facet → tier}
+# assignment on WorkerThreadPool slots (cloned from the baker's _pbm pattern), snaps mixed-pitch/frontier edges
+# (law 4) + appends the always-on skirt (law 5), and rebuilds ONE PER-TIER ArrayMesh surface (S3/S4/S5 — never a
+# single O(everything) merge) so a commit only touches the ONE tier that changed. `lift` is RETIRED to 0 — P1 is a
+# REPLACEMENT tier (law 6: a facet is drawn by exactly one of {shell, smooth}), not a B2-style overlay. Shares the
+# ring's shell material so the map skin + every per-frame uniform bind come for free. NEVER-OOM: resident tiles
+# bounded by the per-tier residency cap + SMOOTH_BYTES_MAX ledger, fixed at creation.
 
-var _mi: MeshInstance3D = null
 var _material: Material = null
-var _lift: float = 0.0
+var _mi: Array = [null, null, null, null]     # per-tier MeshInstance3D, indexed by the S2..S5 enum
+# FP_CPP_SMOOTH_BAKE (REVISION 6): a frozen-config VoxelGeneratorCosmos for the native smooth-tile-height bake,
+# built ONCE in setup_instance on main and read-only in the workers (bake_smooth_tile takes a per-call
+# RWLockRead ⇒ worker-safe). Null with the flag off / module absent / no active_fid ⇒ GDScript node_at path.
+var _cpp_gen: Object = null
 var _tiles: Dictionary = {}          # fid -> build_tile Dictionary (resident, committed on main)
-var _want: Dictionary = {}           # fid -> cells (the requested resident set; the driver refreshes it)
-var _bytes: int = 0                  # resident tile bytes (ledger)
-var _dirty: bool = false             # a commit/evict happened → rebuild the merged mesh this step
+var _tier_of: Dictionary = {}        # fid -> tier (S2..S5) of each resident tile
+var _want: Dictionary = {}           # fid -> tier (the driver's requested resident set)
+var _snap_plan: Dictionary = {}      # fid -> PackedInt32Array[4] (EDGE_WEST..NORTH → neighbour's pitch, or
+                                      # FacetFarRing.CELLS if that neighbour isn't in `_want` this batch) — frozen at
+                                      # request() time so the worker never reads live `_want` (single-writer discipline).
+var _slot_plan: Dictionary = {}       # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C (FP_SMOOTH_SKIN_SLOT):
+                                      # fid -> frozen UV2.y slot (FacetFarRing._slot_of snapshot at request() time,
+                                      # single-writer discipline mirrors `_snap_plan`). Empty ⇒ every fid defaults to
+                                      # -1.0 in `_build_worker` — byte-identical off.
+var _refresh: Dictionary = {}         # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC):
+                                      # fid -> true, requested via `request_refresh()` — an in-place rebuild of an
+                                      # ALREADY-resident tile at its CURRENT tier (S2 rim rebake), swapped in atomically
+                                      # on commit instead of evict-then-rebuild. Empty ⇒ `request_refresh` is the only
+                                      # writer and nothing calls it unless FP_SMOOTH_MESH_INC ⇒ byte-identical off.
+var _built_snap: Dictionary = {}      # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH):
+                                      # fid -> PackedInt32Array[4], the `_snap_plan[fid]` a resident tile was ACTUALLY
+                                      # built with (recorded at commit time). `_snap_plan[fid]` itself is always kept
+                                      # forward-fresh by `request()` (recomputed for everyone in `_want` on every call)
+                                      # — the staleness T3 closes is that a tile's OWN GEOMETRY doesn't consume a new
+                                      # `_snap_plan` value until it is actually rebuilt, so `_weld_refresh_neighbours`
+                                      # compares THIS (what's baked in) against the current `_snap_plan` (what's wanted)
+                                      # to decide whether a neighbour needs a reweld — never derives a pitch itself.
+                                      # Maintained unconditionally (mirrors `_dispatch_count`'s always-on telemetry
+                                      # discipline — a few ints per resident fid, no behaviour change) but only ever
+                                      # CONSULTED from `_weld_refresh_neighbours`, itself only called under
+                                      # FP_SMOOTH_WELD_REFRESH ⇒ byte-identical off.
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (ii) crescent rebake): the S2
+# collar's per-node ENV-POSITION cache. fid -> PackedVector3Array, (cells+1)² entries (~129 KB at S2's 105²
+# stride) — the EXACT `_env_weld_grid` output vertex (resid-compensated already), cached VERBATIM (not a scalar
+# reconstruction — avoids any re-derivation rounding, so a crescent rebake is bit-exact vs a full rebuild). Env is
+# terrain-only (never depends on player_col) and hence NEVER needs recomputing after a tile's first bake. Bounded
+# by construction: only ever holds entries for currently-or-recently-S2-resident fids, erased on eviction
+# (`_evict`) — ≤ SMOOTH_S2_MAX(9) entries × ~129 KB ≈ 1.2 MB, fixed, NEVER-OOM (well under SMOOTH_BYTES_MAX
+# headroom). `_rim_col_baked` is the player column the cached array (and the paired `_tiles[fid]`) was actually
+# baked against — the "old_col" `build_tile_rim`'s crescent annulus test needs. Both empty / never read with
+# FP_RIM_CHEAP off (`build_tile_rim` is only ever called with `cheap_on=false`'s default arguments then, taking
+# the shipped full-rebuild path).
+var _rim_env_pos: Dictionary = {}     # fid -> PackedVector3Array
+var _rim_col_baked: Dictionary = {}   # fid -> Vector3
+var _bytes: int = 0                  # resident tile bytes (ledger, summed across all tiers)
+var _dirty_tier: Array = [false, false, false, false]   # per-tier: a commit/evict touched this tier since its last rebuild
+var _changed := false                # residency changed since the last consume_changed() — drives the ring's `_pending`
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): `step()`'s own fixpoint-at-rest latch —
+# true once a call's reap/dispatch/dirty-rebuild work was ALL empty (nothing reaped, nothing new dispatched, no dirty
+# tier left to rebuild). While true, `step()` returns immediately: skips the O(_sn) reap scan, the O(res) `_next_want`
+# scan inside the dispatch loop, and the O(4) dirty-tier check. Cleared by `request()` (an actual `_want` change),
+# `_evict()` (any eviction), and `request_refresh()` (a fresh in-place rebake request) — i.e. anything that could
+# possibly need attention next call. Always false / never read with the flag off (byte-identical unconditional scan).
+var _settled := false
+var _request_rebuild_count := 0      # REVISION 3 G-FS-QUIESCE telemetry: request() calls that actually rebuilt _want/_snap_plan
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 gate telemetry (G-FS-CHURN) — read-only counters, zero behaviour
+# change: `_dispatch_count[fid]` increments once per worker dispatch for that facet (builds-per-facet); `_discarded`
+# increments whenever a FINISHED worker tile is thrown away because `_want` moved while it built (the R.1.a.4 churn
+# amplifier under the shipped per-frame re-ranked driver — the gate proves this is 0 under the REVISION 2 sticky +
+# mesh-inc driven path, and non-vacuously >0 in a contrived want-moved scenario).
+var _dispatch_count: Dictionary = {}  # fid -> int
+var _discarded := 0
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): the driver's LIVE player-column snapshot (absolute
+# world coords), written by `set_rim_params` on the main thread each frame BEFORE `step()` dispatches. `step()`
+# copies this into the per-slot frozen `_s_rim_col` at dispatch time (single-writer discipline, mirrors
+# `_snap_plan`/`_s_snap`) so an in-flight S2 worker never races a later frame's write. Vector3.ZERO / never read
+# with the flag off (S2 is never assigned ⇒ `_build_worker` never takes the rim branch).
+var _rim_col: Vector3 = Vector3.ZERO
 # worker slots (single-writer of _s_* on main pre-dispatch; the worker writes only _s_result[i] under the mutex)
 var _sn: int = 0
 var _s_fid: PackedInt32Array
-var _s_cells: PackedInt32Array
+var _s_tier: PackedInt32Array
 var _s_task: PackedInt32Array
 var _s_result: Array = []
+var _s_snap: Array = []              # per-slot frozen snap plan (PackedInt32Array[4] or empty), single-writer pre-dispatch
+var _s_rim_col: Array = []           # per-slot frozen player-column Vector3 (S2 builds only), single-writer pre-dispatch
+var _s_slot: PackedFloat32Array = PackedFloat32Array()   # R-C (FP_SMOOTH_SKIN_SLOT): per-slot frozen UV2.y skin slot
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP): per-slot frozen crescent-rebake inputs,
+# single-writer pre-dispatch (mirrors `_s_snap`/`_s_rim_col` exactly) — `_rim_env_pos`/`_tiles`/`_rim_col_baked` are
+# main-thread state; the worker only ever reads whatever was snapshotted into these BEFORE dispatch, never the
+# live dictionaries. Empty PackedVector3Array / empty Dictionary / Vector3.ZERO (⇒ `have_cache` false in
+# `build_tile_rim`) whenever `fid` has no cached bake yet — the initial-bake case, handled identically either way.
+var _s_prev_env_pos: Array = []      # per-slot frozen PackedVector3Array (or empty)
+var _s_prev_tile: Array = []         # per-slot frozen Dictionary reference (or empty {})
+var _s_old_col: Array = []           # per-slot frozen Vector3
 var _s_mutex: Mutex = null
 
-## Create the MeshInstance under `parent` (inherits the ring's placement transform), share `material`, prewarm the
-## worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one profile_at_dir) so `build_tile` is
-## worker-safe. `lift` (blocks) is the overlay nudge.
-func setup_instance(parent: Node3D, material: Material, lift: float) -> void:
+# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): the tier-mesh COMMIT transaction. Off ⇒
+# `step()`'s tail loop rebuilds ≤1 dirty tier per call on MAIN (the shipped `_rebuild_tier_mesh`, R3.2.a's hole/
+# z-fight window). On ⇒ concatenation moves OFF-THREAD (`_concat_tier_worker`, mirrors `_build_worker`/`_s_result`'s
+# single-writer discipline) and EVERY tier dirtied by the same commit event is batched into ONE transaction, applied
+# to every affected MeshInstance in the SAME `step()` call once ALL its worker tasks finish — never a call that swaps
+# only some of a transaction's tiers (LAW T: "if it cannot be afforded this frame, the swap is deferred WHOLE").
+var _txn_active := false
+var _txn_tiers: Array = []                         # tier indices in the in-flight transaction
+var _tier_task: Array = [-1, -1, -1, -1]           # per-tier WorkerThreadPool task id (in-flight concat job), or -1
+var _tier_snapshot: Array = [[], [], [], []]       # per-tier frozen Array[Dictionary] of tile dicts, single-writer:
+                                                    # main writes it once at dispatch, never touches it again until reaped
+var _tier_snapshot_fids: Array = [[], [], [], []]  # per-tier frozen Array[int] of fids, parallel to `_tier_snapshot`
+                                                    # (gate introspection: which fids this tier's in-flight job covers)
+var _tier_result: Array = [null, null, null, null] # worker output (pos/nrm/col/uv/uv2/idx dict), `_tier_mutex`-guarded
+var _tier_mutex: Mutex = null
+var _tier_change_seq: Array = [0, 0, 0, 0]         # bumped whenever a tier is (re-)dirtied — detects a stale in-flight
+                                                    # snapshot (an unrelated commit touched this SAME tier mid-flight)
+var _tier_dispatch_seq: Array = [-1, -1, -1, -1]   # `_tier_change_seq` value snapshotted at this tier's dispatch time
+# Gate introspection (G-FS-NOHOLE strengthened): per-tier fid -> true for exactly what's baked into the CURRENTLY
+# assigned mi.mesh right now — maintained at every actual mesh commit (both the legacy main-thread `_rebuild_tier_mesh`
+# and the T1 off-thread `_apply_tier_mesh`), so a gate can tell a "resident but not yet drawn" (hole) or "drawn by two
+# tiers at once" (z-fight) window apart from mere `_tiles`/`is_resident` bookkeeping (which flips atomically on main
+# already and was never the bug — the DRAWN MESH lagging it across frames was).
+var _committed_fids: Array = [{}, {}, {}, {}]
+var _main_concat_count := 0    # G-FS-TXN-THREAD telemetry: `_rebuild_tier_mesh` (main-thread concat) calls
+var _worker_concat_count := 0  # G-FS-TXN-THREAD telemetry: `_concat_tier_worker` (off-thread concat) calls
+var _txn_apply_count := 0      # G-FS-NOHOLE telemetry: atomic (possibly multi-tier) mesh applies committed
+
+# =====================================================================================================================
+# FP_SMOOTH_TILE_SURF — SAFE per-tile-node replacement for FP_SMOOTH_SLOT_MESH below (which HARD-CRASHED the live web
+# tab: RenderingServer.mesh_surface_update_vertex_region/_attribute_region abort ANGLE/WebGL2, uncatchable from
+# GDScript, and no-op on the headless dummy RenderingServer, so gates passed green while the live path aborted). Kills
+# the SAME O(N²) whole-tier re-pack/re-upload warmup hitch using ONLY the high-level MeshInstance3D/ArrayMesh API this
+# file already relies on elsewhere (`_rebuild_tier_mesh`/`_apply_tier_mesh` above) — never a RenderingServer region/RID
+# call. See cube_sphere.gd's FP_SMOOTH_TILE_SURF doc comment for the full design.
+# =====================================================================================================================
+var _tile_mi: Dictionary = {}      # fid -> per-tile MeshInstance3D (child of _mi[tier]), while that tier is "split"
+var _tile_surf_active: Array = [false, false, false, false]   # per-tier: drawing via per-tile nodes right now (merged mesh cleared)?
+var _tile_surf_stable: Array = [0, 0, 0, 0]                    # per-tier: step() calls since the last add/evict touched it
+var _tile_surf_commit_count := 0   # telemetry: tile_surf_stats() "path active" signal — bumped by any per-tile add
+
+# =====================================================================================================================
+# REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — per-tier fixed-capacity
+# slotted mesh + GPU region-write commits. Supersedes `_rebuild_tier_mesh`/`_step_tier_txn` (both kept, byte-
+# identical, for the flag-off / refused path) as the tier-mesh COMMIT mechanism; `_tiles`/`_tier_of`/`_bytes`
+# (CPU-side residency bookkeeping) is completely unaffected — only HOW a tier's `mi.mesh` gets updated changes.
+# =====================================================================================================================
+var _slot_mesh_failed := false          # MANDATORY refusal latch (per-instance, sticky for the rest of the session)
+var _slot_cap_built: Array = [false, false, false, false]      # per-tier: has its fixed-capacity ArrayMesh been built
+var _slot_of: Array = [{}, {}, {}, {}]                          # per-tier Dictionary: fid -> assigned slot index
+var _slot_free: Array = [[], [], [], []]                        # per-tier Array[int]: free slot indices
+var _slot_verts_per_tile: Array = [0, 0, 0, 0]                  # per-tier: vertices in ONE tile (incl. skirt)
+# The engine's "vertex_data" surface buffer is STRUCT-OF-ARRAYS, not one interleaved per-vertex stride: ALL
+# positions come first (`total_verts * pos_stride` bytes), THEN all normal+tangent data (`total_verts * nt_stride`
+# bytes) — confirmed in the engine source (`mesh_surface_make_offsets_from_format`,
+# `servers/rendering_server.cpp:1146-1153`: the `+= r_vertex_element_size * p_vertex_len` offset bump applies ONLY
+# to ARRAY_NORMAL/ARRAY_TANGENT). A slot's region write therefore needs TWO separate
+# `mesh_surface_update_vertex_region` calls (position sub-block + normal/tangent sub-block) at DIFFERENT base
+# offsets, each scaled by the CAPACITY surface's TOTAL vertex count (`_slot_total_verts`), never one combined
+# "vertex stride". The "attribute_data" buffer (COLOR/TEX_UV/TEX_UV2), by contrast, genuinely IS one interleaved
+# per-vertex stride (confirmed the same way — COLOR/TEX_UV/TEX_UV2 write cases index `i * p_attrib_stride` with no
+# such vertex_len-scaled offset bump) — `_slot_attr_stride` + one `mesh_surface_update_attribute_region` call stays
+# correct as a single region write.
+var _slot_pos_stride: Array = [0, 0, 0, 0]                      # per-tier: bytes/vertex in the POSITION sub-block
+var _slot_nt_stride: Array = [0, 0, 0, 0]                       # per-tier: bytes/vertex in the NORMAL+TANGENT sub-block
+var _slot_attr_stride: Array = [0, 0, 0, 0]                     # per-tier: bytes/vertex in the (interleaved) attribute_data stream
+var _slot_total_verts: Array = [0, 0, 0, 0]                     # per-tier: cap * verts_per_tile (the position sub-block's own length in vertices — needed to find the normal/tangent sub-block's base offset)
+var _slot_format: Array = [0, 0, 0, 0]                          # per-tier: the packed ArrayFormat bitmask
+var _slot_degenerate_pos: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_degenerate_nt: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_degenerate_attr: Array = [PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray()]
+var _slot_cur_event: Array = []         # writes accumulated for the fid CURRENTLY being processed (evict+commit) —
+                                         # flushed as ONE atomic event by `_slot_flush_event` (LAW T: old-slot-zero +
+                                         # new-slot-write of the SAME promote always travel together)
+var _slot_write_queue: Array = []       # Array[Array[Dictionary]]: queued whole commit-events awaiting GPU write,
+                                         # drained in order by `_slot_drain` under the per-frame byte budget
+var _slot_commit_ms := 0.0              # telemetry: main-thread ms spent packing+region-writing THIS step() call
+var _slot_upload_bytes := 0             # telemetry: bytes region-written THIS step() call
+var _slot_upload_total_bytes := 0       # telemetry: cumulative bytes region-written this session
+var _slot_commit_defer := 0             # telemetry: whole commit-events still queued after THIS step() call
+
+## Create one MeshInstance3D per ladder tier (S2/S3/S4/S5) under `parent` (inherits the ring's placement transform),
+## sharing `material`; prewarm the worker-touched statics on MAIN (FarPalette / BlockCatalog / the noise via one
+## profile_at_dir) so `build_tile`/`build_tile_rim` are worker-safe. An empty tier's MeshInstance3D carries a
+## 0-surface mesh (0 draws) — S2 stays empty (and its MeshInstance3D a harmless no-op node) unless FP_SMOOTH_RIM
+## actually assigns it (§3 P3).
+func setup_instance(parent: Node3D, material: Material, active_fid: int = -1) -> void:
 	FarPalette.ensure_ready()
 	BlockCatalog.ensure_ready()
 	TerrainConfig.profile_at_dir(0.0, 1.0, 0.0, FacetAtlas.R_BLOCKS)   # warm _ensure_noise on main
 	_material = material
-	_lift = lift
-	_mi = MeshInstance3D.new()
-	_mi.name = "FacetSmoothMesh"
-	if material != null:
-		_mi.material_override = material
-	parent.add_child(_mi)
-	_sn = clampi(OS.get_processor_count() - 1, 1, 4)
+	# FP_CPP_SMOOTH_BAKE (REVISION 6): build the native tile-height generator ONCE here on main (same frozen-config
+	# plumbing as the skin tier's sampler; the per-facet corner_dirs are passed per-call, so one instance bakes any
+	# facet). Read-only in the workers thereafter. Off / module absent / no fid ⇒ stays null → GDScript node_at path.
+	if CubeSphere.FP_CPP_SMOOTH_BAKE and active_fid >= 0:
+		_cpp_gen = FacetSkinTier._build_cpp_gen(active_fid)
+	for t in [S2, S3, S4, S5]:
+		var mi := MeshInstance3D.new()
+		mi.name = "FacetSmoothMesh_T%d" % t
+		if material != null:
+			mi.material_override = material
+		parent.add_child(mi)
+		_mi[t] = mi
+	_sn = clampi(OS.get_processor_count() - 1, 1, CubeSphere.SMOOTH_BUILD_SLOTS)
 	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
-	_s_cells = PackedInt32Array(); _s_cells.resize(_sn)
+	_s_tier = PackedInt32Array(); _s_tier.resize(_sn)
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_result.resize(_sn)
+	_s_snap.resize(_sn)
+	_s_rim_col.resize(_sn)
+	_s_prev_env_pos.resize(_sn)
+	_s_prev_tile.resize(_sn)
+	_s_old_col.resize(_sn)
+	_s_slot.resize(_sn); _s_slot.fill(-1.0)
 	_s_mutex = Mutex.new()
+	_tier_mutex = Mutex.new()   # REVISION 3 T1 (FP_SMOOTH_TXN): guards `_tier_result`/`_worker_concat_count` writes
 
-## The driver's requested resident set: facets → cells (tier pitch). Evicts tiles that fell out of the set.
-func request(fids: Array, cells: int) -> void:
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): set the frozen player-column snapshot (ABSOLUTE world
+## coords) the NEXT `step()` dispatch batch will bake S2 collar tiles against. Called once per frame by the ring's
+## `_smooth_drive` BEFORE `step()` — main-thread-only write (matches the `_snap_plan`/`request()` single-writer
+## contract). A no-op call with the flag off (nothing ever reads `_rim_col` then).
+func set_rim_params(col: Vector3) -> void:
+	_rim_col = col
+
+# gi/gj tile-edge index → the FacetAtlas seam slot that borders it (EDGE_WEST..NORTH order, facet_atlas.gd:57-60).
+const _EDGE_SEAM_SLOT := [1, 0, 3, 2]   # [S_WEST, S_EAST, S_SOUTH, S_NORTH]
+
+## The driver's requested resident set: fid → tier (S3/S4/S5 only in P1). Freezes each wanted facet's per-edge snap
+## plan from THIS batch's assignment (law 4: an edge whose neighbour is in `assignments` snaps to that neighbour's
+## pitch if coarser; an edge whose neighbour is ABSENT this batch — still shell, or a transient convergence gap —
+## snaps to the shipped CELLS=4 shell pitch; a same-or-finer neighbour is a no-op via `snap_edge_to_pitch`'s own
+## guard). `slots` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-C, FP_SMOOTH_SKIN_SLOT): optional fid ->
+## UV2.y skin-slot snapshot, frozen the SAME way as the snap plan; a fid absent from `slots` gets -1.0 (shipped).
+## Evicts residents no longer wanted. LAW R-B (FP_SMOOTH_MESH_INC): a resident whose TIER changed is NOT evicted here
+## — it stays resident+drawn at its OLD tier; `_next_want`/`step()` build the NEW tier's tile and swap it in on
+## commit (make-before-break at the mesh level). Off ⇒ the shipped immediate evict-on-tier-change runs verbatim.
+## `weld_refresh_on` (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3, FP_SMOOTH_WELD_REFRESH): after evicting a
+## facet that left `_want` ENTIRELY (falls back to the shipped shell for good — no replacement tile is coming this
+## cycle), re-check its still-resident neighbours' frozen snap plans (`_weld_refresh_neighbours`) against its new
+## "gone, shell pitch" state. Deliberately NOT applied to the tier-CHANGE eviction branch just below (the shipped
+## MESH_INC-off break-before-make): that facet's own imminent re-commit (once its new-tier build lands) already
+## fires the SAME check with the FINAL, correct new pitch (`step()`'s post-commit hook) — checking here too would
+## use the transiently-wrong "not resident yet" pitch and could bounce a neighbour's refresh twice for no reason.
+func request(assignments: Dictionary, slots: Dictionary = {}, idle_on := CubeSphere.FP_SMOOTH_IDLE, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
 	var w := {}
-	for f in fids:
-		w[int(f)] = cells
-	_want = w
-	for fid in _tiles.keys():
-		if not _want.has(int(fid)):
-			_bytes -= FacetSmoothTier.tile_bytes(_tiles[int(fid)])
-			_tiles.erase(int(fid))
-			_dirty = true
-
-## Per-frame: reap finished worker tiles (commit on main), dispatch idle slots to wanted-not-resident facets, and
-## rebuild the merged mesh once if anything changed. Bounded per call.
-func step() -> void:
-	if _mi == null:
+	for fid in assignments.keys():
+		w[int(fid)] = int(assignments[fid])
+	if idle_on and w == _want:
+		# REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): the requested resident set is BIT-IDENTICAL to what's already
+		# committed — rebuilding `_snap_plan`/`_slot_plan` (209 × 4 `seam_neighbour` scans + fresh dicts) would produce
+		# a byte-identical result, and the eviction scan below would find nothing to evict. Skip it all. Off ⇒ the
+		# shipped unconditional rebuild runs every call.
 		return
+	_request_rebuild_count += 1   # REVISION 3 G-FS-QUIESCE telemetry: a real _want/_snap_plan rebuild happened
+	_want = w
+	_snap_plan = {}
+	_slot_plan = {}
+	for fid in w.keys():
+		var f := int(fid)
+		var plan := PackedInt32Array()
+		plan.resize(4)
+		for e in range(4):
+			var nb := FacetAtlas.seam_neighbour(f, _EDGE_SEAM_SLOT[e])
+			if w.has(nb):
+				plan[e] = FacetSmoothTier.cells_for_tier(int(w[nb]))
+			else:
+				plan[e] = FacetFarRing.CELLS   # the shipped shell's pitch (always the coarsest — every ladder tier snaps toward it)
+		_snap_plan[f] = plan
+		if slots.has(f):
+			_slot_plan[f] = float(slots[f])
+	for fid in _tiles.keys():
+		var f := int(fid)
+		if not _want.has(f):
+			_evict(f, slot_on, tile_surf_on)
+			_slot_flush_event()   # REVISION 7: this fid is gone for good — its (possible) slot-zero-blit is its own whole event
+			if weld_refresh_on:
+				_weld_refresh_neighbours(f)   # REVISION 3 T3: gone for good — its neighbours' frozen plans can finalize now
+		elif not CubeSphere.FP_SMOOTH_MESH_INC and int(_want[f]) != int(_tier_of[f]):
+			_evict(f, slot_on, tile_surf_on)   # shipped break-before-make (flag off) — byte-identical; T3 recheck happens on the RE-commit, not here
+			_slot_flush_event()
+	if idle_on:
+		_settled = false   # REVISION 3 Q1: the assignment actually changed — step() must scan again next call
+
+func _evict(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
+	var t: int = int(_tier_of[fid])
+	_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])
+	_tiles.erase(fid)
+	_tier_of.erase(fid)
+	_refresh.erase(fid)
+	_built_snap.erase(fid)
+	_rim_env_pos.erase(fid)     # REVISION 5 Stage D (FP_RIM_CHEAP): the crescent cache dies with the tile it was
+	_rim_col_baked.erase(fid)   # baked for — the NEXT bake (evict-then-rebuild) starts fresh, exactly like today.
+	if tile_surf_on:
+		# FP_SMOOTH_TILE_SURF: free `fid`'s per-tile node (O(1)) if the tier is currently split, or trigger a one-time
+		# re-split of `t`'s remaining residents (still consolidated) — see `_tile_surf_touch` below.
+		_tile_surf_touch(t, fid, true)
+	elif slot_on and not _slot_mesh_failed:
+		# REVISION 7: free `fid`'s slot (if it had one) and stage a degenerate-blit for it — the caller flushes this
+		# as its own event (a standalone eviction) or bundles it with an accompanying new-tier commit (a promote),
+		# via `_slot_flush_event` called once the WHOLE transition for this fid is known.
+		_slot_free_fid(t, fid)
+	_dirty_tier[t] = true
+	_tier_change_seq[t] = int(_tier_change_seq[t]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
+	_changed = true
+	_settled = false   # REVISION 3 Q1: an eviction is state change — step() must scan (and rebuild the dirty tier) again
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM, §2.1 rebuild cadence): force a currently-resident tile
+## to be dropped so the NEXT `request()`/`step()` re-bakes it fresh (reuses `_evict`'s ledger/dirty-tier/changed
+## bookkeeping verbatim). The facet's role falls straight back to whatever its emit-exclusion law resolves to while
+## no smooth tile is resident for it (for an S2/backstop-role facet: the still-warm sunk backstop quad) until the
+## fresh tile re-commits — never a frame with neither. No-op if `fid` isn't currently resident.
+## SHIPPED (legacy) rebake path — kept for FP_SMOOTH_MESH_INC-off callers (byte-identical). REVISION 2 LAW R-D/R-B
+## (FP_SMOOTH_MESH_INC on) callers use `request_refresh` instead (below), which never evicts the collar at all.
+func force_rebake(fid: int, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF) -> void:
+	if _tiles.has(int(fid)):
+		_evict(int(fid), slot_on, tile_surf_on)
+		_slot_flush_event()
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-D/R-B (FP_SMOOTH_MESH_INC): request an IN-PLACE rebuild of
+## an already-resident tile at its CURRENT tier — never evicts. `_next_want`/`step()` dispatch a fresh build for
+## `fid` at its resident tier; on commit the OLD tile's bytes are swapped for the NEW ones atomically (same frame the
+## new content lands), so the facet is drawn continuously throughout — "permanently sticky, only swap-rebuilt" (R-D).
+## No-op if `fid` isn't currently resident (nothing to refresh yet — the initial build already carries fresh data).
+func request_refresh(fid: int) -> void:
+	if _tiles.has(int(fid)):
+		_refresh[int(fid)] = true
+		_settled = false   # REVISION 3 Q1: a fresh in-place rebake is now wanted — step() must dispatch it
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 T3 (FP_SMOOTH_WELD_REFRESH, closes R3.2.c): `fid`'s COMMITTED
+## residency just changed (a tier promote/demote landed, a first commit joined smooth residency, or an eviction
+## dropped it back to the shipped shell) — walk `fid`'s ≤4 seam neighbours (the SAME `_EDGE_SEAM_SLOT` convention
+## `request()` uses to build a facet's OWN plan). `request()` ALREADY keeps `_snap_plan` forward-fresh for everyone
+## in `_want` on every call (recomputed from scratch whenever `w` changes at all) — so the staleness here is NEVER
+## in the plan VALUE, it's in whether a resident neighbour's ACTUAL BUILT GEOMETRY has caught up to it. For each
+## neighbour that is CURRENTLY smooth-resident, compare what it was ACTUALLY built with (`_built_snap`, frozen at
+## its own last commit) against its CURRENT `_snap_plan` entry for the shared edge (already updated by whichever
+## `request()` call changed `fid`'s tier, which necessarily ran before `fid`'s build could even be dispatched). A
+## mismatch means the neighbour's committed tile is snapped to a PITCH THAT NO LONGER EXISTS — a T-junction crack
+## (R3.2.c) the 4-block skirt alone can't always cover. Fix: queue a `request_refresh` (REVISION 2 LAW R-D's
+## in-place-rebuild primitive — never an evict, so the neighbour keeps drawing its OLD boundary until the corrected
+## rebuild commits); under FP_SMOOTH_TXN the commit itself lands through T1's atomic off-thread transaction (LAW T),
+## so the reweld is hole-free. Bounded by construction: a facet has at most 4 seam neighbours, so this is ≤4
+## neighbour checks (each an O(4) reverse-edge scan to find WHICH of the neighbour's edges borders `fid` — robust to
+## cross-face rotation, no assumed opposite-index mapping) per commit/evict event — never unbounded, never
+## per-frame (only ever called from a real commit/evict). Re-snapping to an ALREADY-consumed plan is a no-op (the
+## comparison below short-circuits before `request_refresh` is ever called) — a stationary scene with no tier
+## changes triggers ZERO refreshes here (composes with the Q1 idle latch: this function is only ever reached from
+## `request()`'s "gone for good" eviction or `step()`'s post-commit hook, neither of which fires at rest). A
+## neighbour that ISN'T currently smooth-resident (still shell, or mid-convergence with no `_snap_plan` entry yet)
+## is skipped — its OWN future `request()`/build computes a fresh, correct plan against whatever is resident then,
+## so there is nothing here to pre-empt.
+func _weld_refresh_neighbours(fid: int) -> void:
+	for e in range(4):
+		var nb := FacetAtlas.seam_neighbour(fid, _EDGE_SEAM_SLOT[e])
+		if nb < 0 or not _tiles.has(nb) or not _snap_plan.has(nb):
+			continue
+		var nb_edge := -1
+		for e2 in range(4):
+			if FacetAtlas.seam_neighbour(nb, _EDGE_SEAM_SLOT[e2]) == fid:
+				nb_edge = e2
+				break
+		if nb_edge < 0:
+			continue
+		var current: PackedInt32Array = _snap_plan[nb]
+		var built: PackedInt32Array = _built_snap.get(nb, PackedInt32Array())
+		if built.size() != 4 or int(built[nb_edge]) != int(current[nb_edge]):
+			request_refresh(nb)
+
+## Per-frame: reap finished worker tiles (commit on main, ≤1 tile/slot), dispatch idle slots to wanted-not-resident
+## facets, then commit dirty tier ArrayMesh(es) — either the shipped ≤1-tier/frame main-thread rebuild, or (REVISION 3
+## T1, FP_SMOOTH_TXN) an atomic off-thread transaction over every tier the reap loop above just dirtied together
+## (`_step_tier_txn`, LAW T: never a call that swaps only some of a multi-tier commit).
+## `weld_refresh_on` (REVISION 3 T3, FP_SMOOTH_WELD_REFRESH): (a) after a fresh commit lands, if it represents a
+## genuine tier ASSIGNMENT change (not merely a same-tier in-place refresh) triggers `_weld_refresh_neighbours(fid)`
+## against `fid`'s now-final committed state (deliberately NOT at the tier-swap `_evict()` a few lines above — that
+## intermediate "not resident yet" state would compute the WRONG pitch; only the FINAL post-commit state is checked);
+## (b) ORs into the `_next_want` refresh-dispatch gate (`refresh_dispatch_on`) so a queued `request_refresh` actually
+## dispatches even with `FP_SMOOTH_MESH_INC` off — REVISION 2's rim rebake and T3's weld reweld share the SAME
+## in-place-rebuild primitive (`_refresh`/`request_refresh`), gated by whichever feature needs it.
+func step(idle_on := CubeSphere.FP_SMOOTH_IDLE, txn_on := CubeSphere.FP_SMOOTH_TXN, weld_refresh_on := CubeSphere.FP_SMOOTH_WELD_REFRESH, slot_on := CubeSphere.FP_SMOOTH_SLOT_MESH, budget_bytes := CubeSphere.SMOOTH_COMMIT_BUDGET_BYTES, tile_surf_on := CubeSphere.FP_SMOOTH_TILE_SURF, selfheal_on := CubeSphere.FP_SMOOTH_SNAP_SELFHEAL) -> void:
+	if _sn == 0:
+		return
+	if idle_on and _settled:
+		# REVISION 3 Q1 (FP_SMOOTH_IDLE, LAW Q): nothing was reaped, nothing was dispatched, and no dirty tier was left
+		# to rebuild last call — the O(_sn) reap scan, the O(res) `_next_want` scan, and the O(4) dirty-tier check would
+		# all find the SAME nothing again. Skip the whole call. Off ⇒ the shipped unconditional scan below.
+		return
+	var refresh_dispatch_on := CubeSphere.FP_SMOOTH_MESH_INC or weld_refresh_on
 	for i in range(_sn):
 		if int(_s_task[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
 		WorkerThreadPool.wait_for_task_completion(int(_s_task[i]))
 		var fid := int(_s_fid[i])
+		var tier := int(_s_tier[i])
 		_s_mutex.lock()
 		var tile = _s_result[i]
 		_s_result[i] = null
 		_s_mutex.unlock()
-		if _want.has(fid) and tile != null and not _tiles.has(fid):
+		if tile != null and not (_want.has(fid) and int(_want[fid]) == tier):
+			_discarded += 1   # G-FS-CHURN telemetry: a finished tile thrown away because `_want` moved while it built
+		if _want.has(fid) and int(_want[fid]) == tier and tile != null:
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-B/R-D: a resident tile for THIS SAME fid means
+			# either (a) a tier-change swap (FP_SMOOTH_MESH_INC: `_tier_of[fid] != tier`, the OLD tier's tile was kept
+			# resident+drawn by `request()` above instead of evicted) or (b) an in-place refresh at the SAME tier
+			# (`_refresh`, e.g. an S2 rim rebake). Either way the swap is ATOMIC on the byte ledger — the old bytes are
+			# freed and the new ones added in the SAME statement, so there is never a frame with neither tile resident.
+			var was_resident := _tiles.has(fid)
+			var prev_tier := int(_tier_of.get(fid, -1))   # REVISION 3 T3: captured BEFORE any evict/erase below mutates it
+			if was_resident:
+				if prev_tier != tier:
+					_evict(fid, slot_on, tile_surf_on)               # tier-change swap: drop the OLD tier's tile now (T3 recheck below, with the FINAL new tier)
+				else:
+					_bytes -= FacetSmoothTier.tile_bytes(_tiles[fid])   # in-place refresh: same tier, fresh content
+					_tiles.erase(fid)
+					_refresh.erase(fid)
+			# REVISION 5 Stage D (FP_RIM_CHEAP): lift the crescent cache OUT of the tile dict before it becomes the
+			# resident `_tiles[fid]` — `tile_bytes()`/the mesh-assembly code only ever read pos/nrm/col/uv/uv2/idx,
+			# so leaving "rim_env_pos" embedded would silently double-store the same ~129 KB array (once here, once
+			# in `_rim_env_pos`) OUTSIDE the `_bytes`/SMOOTH_BYTES_MAX ledger's count — strip it so `_tiles[fid]`
+			# stays byte-identical to the pre-Stage-D shape and the ledger keeps counting the true resident bytes.
+			var rim_env_pos_out: PackedVector3Array = tile.get("rim_env_pos", PackedVector3Array())
+			if tile.has("rim_env_pos"):
+				tile.erase("rim_env_pos")
 			var tb: int = FacetSmoothTier.tile_bytes(tile)
 			if _bytes + tb <= CubeSphere.SMOOTH_BYTES_MAX:
 				_tiles[fid] = tile
+				_tier_of[fid] = tier
 				_bytes += tb
-				_dirty = true
+				_dirty_tier[tier] = true
+				_tier_change_seq[tier] = int(_tier_change_seq[tier]) + 1   # REVISION 3 T1: this tier's committed-mesh snapshot is now stale
+				_changed = true
+				var snap_used: PackedInt32Array = _s_snap[i]   # REVISION 3 T3: record what THIS commit was actually built with
+				_built_snap[fid] = snap_used.duplicate() if snap_used.size() == 4 else PackedInt32Array()
+				if selfheal_on:
+					# REVISION 7-VISUAL (#28, FP_SMOOTH_SNAP_SELFHEAL): the SUNK-FACET DISCONNECT fix. T3's neighbour-event heal
+					# has two race holes (H1: this commit lands after the neighbour's T3 pass; H2: `_refresh` was erased by this
+					# very stale-in-flight commit above) that leave `_built_snap != _snap_plan` FOREVER — a resident edge chord-
+					# snapped to a pitch that no longer exists, dipping below the neighbour's true relief = the exposed-skirt
+					# disconnect line. HERE both the committed geometry AND the current plan are known, so compare + re-queue on
+					# mismatch (closes H1: no neighbour event needed; closes H2: re-requests what the erase ate). Bounded +
+					# converges (a rebuild dispatched after the last plan change commits clean and matches).
+					var cur_plan: PackedInt32Array = _snap_plan.get(fid, PackedInt32Array())
+					if cur_plan.size() == 4 and _built_snap[fid] != cur_plan:
+						request_refresh(fid)
+				if rim_env_pos_out.size() > 0:
+					# REVISION 5 Stage D (FP_RIM_CHEAP): this commit's env array + the column it was baked against
+					# become the cache the NEXT rebake's crescent test reads — single in-place assignment (never an
+					# erase-then-reinsert), so a concurrent reader of a DIFFERENT fid's entry is unaffected.
+					_rim_env_pos[fid] = rim_env_pos_out
+					_rim_col_baked[fid] = _s_rim_col[i]
+				if weld_refresh_on and (not was_resident or prev_tier != tier):
+					# REVISION 3 T3: `fid`'s COMMITTED tier genuinely changed (first commit, promote, or demote) — its
+					# NEW pitch may now mismatch a resident neighbour's frozen boundary snap (R3.2.c). A same-tier
+					# in-place refresh (was_resident and prev_tier == tier) presents the SAME pitch, so neighbours
+					# stay correctly welded already — nothing to recheck there.
+					_weld_refresh_neighbours(fid)
+				if tile_surf_on:
+					# FP_SMOOTH_TILE_SURF: O(1) per-tile add/refresh (or the one-time O(resident) re-split if `tier`
+					# was still consolidated) — the SAFE replacement for the slot-mesh branch below. Runs regardless of
+					# `weld_refresh_on` (that block above is an independent, orthogonal concern).
+					_tile_surf_touch(tier, fid, false)
+				elif slot_on and not _slot_mesh_failed:
+					# REVISION 7: stage this fid's new-slot write — bundled with the tier-change evict's slot-zero (staged
+					# above, same `_slot_cur_event`) into ONE atomic event by the flush just below. Runs regardless of
+					# `weld_refresh_on` (that block above is an independent, orthogonal concern).
+					_slot_commit_fid(tier, fid, tile)
+		_slot_flush_event()   # REVISION 7: flush whatever this fid's full transition staged (evict, commit, both, or nothing)
 		_s_fid[i] = -1
 		_s_task[i] = -1
 	for i in range(_sn):
 		if int(_s_fid[i]) >= 0:
 			continue
-		var fid := _next_want()
+		var fid := _next_want(refresh_dispatch_on)
 		if fid < 0:
 			break
+		var tier: int = int(_want[fid])
 		_s_fid[i] = fid
-		_s_cells[i] = int(_want[fid])
+		_s_tier[i] = tier
+		_s_snap[i] = _snap_plan.get(fid, PackedInt32Array())
+		_s_rim_col[i] = _rim_col   # §3 P3: freeze THIS batch's player column for the S2 branch (single-writer, mirrors _s_snap)
+		_s_slot[i] = float(_slot_plan.get(fid, -1.0))   # R-C (FP_SMOOTH_SKIN_SLOT): freeze THIS batch's skin slot
+		# REVISION 5 Stage D (FP_RIM_CHEAP): freeze THIS batch's crescent-rebake inputs (single-writer, mirrors
+		# `_s_snap`/`_s_rim_col` exactly) — empty when `fid` has no cached bake yet (the initial-bake case).
+		_s_prev_env_pos[i] = _rim_env_pos.get(fid, PackedVector3Array())
+		_s_prev_tile[i] = _tiles.get(fid, {})
+		_s_old_col[i] = _rim_col_baked.get(fid, Vector3.ZERO)
+		_dispatch_count[fid] = int(_dispatch_count.get(fid, 0)) + 1   # G-FS-CHURN telemetry: builds-per-facet
 		# HIGH priority: the near smooth ring is a small, user-visible bounded set — it must preempt the background
 		# whole-planet fine bake (low-priority _pbm tasks) or it starves behind it on a single-worker browser.
 		_s_task[i] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(i), true, "smoothtile")
-	if _dirty:
-		_rebuild_mesh()
-		_dirty = false
+	if tile_surf_on:
+		# FP_SMOOTH_TILE_SURF: per-tile adds/evicts already landed O(1) in the reap loop above — this is just the
+		# paced settle pass (age every split tier, fold AT MOST ONE consolidated-eligible tier back to a merged mesh).
+		_tile_surf_consolidate_step()
+	elif slot_on and not _slot_mesh_failed:
+		# REVISION 7 (FP_SMOOTH_SLOT_MESH): drain the queued whole commit-events under the byte budget — supersedes
+		# BOTH the T1 transaction and the legacy loop below (kept, byte-identical, for the off/refused path). A
+		# refusal raised INSIDE this same call's reap loop above (`_slot_commit_fid`/`_ensure_slot_capacity` failing
+		# mid-way) already re-marked every tier dirty (`_slot_refuse_resync`) and cleared the queue, so the `slot_on
+		# and not _slot_mesh_failed` re-check here correctly falls through to the legacy/txn path THIS SAME CALL.
+		_slot_drain(budget_bytes)
+	elif txn_on:
+		# REVISION 3 T1 (FP_SMOOTH_TXN, LAW T): off-thread, ALL-dirty-tiers-together transactional commit — supersedes
+		# the ≤1-tier/frame main-thread loop below (kept, byte-identical, for the flag-off path).
+		_step_tier_txn()
+	else:
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				_rebuild_tier_mesh(t)
+				_dirty_tier[t] = false
+				break   # ≤ 1 tier rebuild/frame (shipped legacy path — R3.2.a's hole/z-fight window)
+	if idle_on:
+		# REVISION 3 Q1: settled iff no dirty tier remains (this call rebuilds at most one — a 2nd+ dirty tier stays
+		# true), no worker slot is busy (an in-flight build will need reaping later), and nothing wanted-not-resident
+		# remains (`_next_want`, the same O(res) scan the dispatch loop above already pays for each idle slot — one
+		# more call here, only on a call that DIDN'T already return early, is not a new order of cost).
+		var any_dirty := false
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				any_dirty = true
+				break
+		var any_slot_busy := false
+		for i in range(_sn):
+			if int(_s_fid[i]) >= 0:
+				any_slot_busy = true
+				break
+		_settled = not any_dirty and not any_slot_busy and _next_want(refresh_dispatch_on) < 0
 
-func _next_want() -> int:
+## A wanted facet still needing a build dispatch: not yet resident at all, OR (`refresh_on` — LAW R-B/R-D under
+## FP_SMOOTH_MESH_INC, or REVISION 3 T3 under FP_SMOOTH_WELD_REFRESH, either of which sets `refresh_on`) already
+## resident but its wanted TIER differs (a tier-change swap candidate) or it carries a live `_refresh` request (an
+## in-place rebake, e.g. the S2 collar OR a T3 neighbour weld reweld) — either way the OLD tile stays resident+drawn
+## until the new build commits. `refresh_on` defaults to the shipped `FP_SMOOTH_MESH_INC`-only check (byte-identical
+## call sites unaffected); `step()` passes `refresh_dispatch_on` (`FP_SMOOTH_MESH_INC or weld_refresh_on`) so a T3
+## refresh dispatches even with MESH_INC off.
+func _next_want(refresh_on := CubeSphere.FP_SMOOTH_MESH_INC) -> int:
 	for fid in _want.keys():
 		var f := int(fid)
-		if _tiles.has(f) or _inflight(f):
+		if _inflight(f):
+			continue
+		if _tiles.has(f):
+			if refresh_on and (int(_tier_of[f]) != int(_want[f]) or _refresh.has(f)):
+				return f
 			continue
 		return f
 	return -1
@@ -263,21 +1129,61 @@ func _inflight(fid: int) -> bool:
 
 func _build_worker(i: int) -> void:
 	var fid := int(_s_fid[i])
-	var cells := int(_s_cells[i])
-	var tile := FacetSmoothTier.build_tile(fid, cells, _lift, true)   # curved sphere placement (kills the facet crease)
+	var tier := int(_s_tier[i])
+	var cells := FacetSmoothTier.cells_for_tier(tier)
+	var tile: Dictionary
+	var slot: float = float(_s_slot[i]) if _s_slot.size() > i else -1.0   # R-C (FP_SMOOTH_SKIN_SLOT): frozen snapshot
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT, LAW S): stamp the STABLE fid onto
+	# UV2.y instead of any slot snapshot — a smooth tile never needs rebuilding when the band/close-up slot map
+	# moves; the shared shell shader resolves the CURRENT slot live via `FacetFarRing._push_slot_indirect`'s lookup
+	# texture (`_apply_slot_indirect`). Overrides R-C's frozen `slot` unconditionally when on (R-C's own plumbing
+	# stays wired, byte-off, for when this flag is off).
+	if CubeSphere.FP_SLOT_INDIRECT:
+		slot = float(fid)
+	if tier == S2 and CubeSphere.FP_SMOOTH_RIM:
+		# §3 P3: the S2 near-collar — envelope-inside-disc + feather + ε sink, against THIS batch's frozen player
+		# column (never `_rim_col` live — the worker only reads its own slot's snapshot, taken pre-dispatch).
+		var col: Vector3 = _s_rim_col[i]
+		var r_env := FacetFarRing.rim_r_env()
+		# REVISION 5 Stage D (FP_RIM_CHEAP): thread this slot's frozen crescent-rebake inputs through — empty/zero
+		# whenever `fid` has no cached bake yet, which `build_tile_rim` treats identically to the initial-bake path.
+		var prev_env_pos: PackedVector3Array = _s_prev_env_pos[i] if _s_prev_env_pos.size() > i else PackedVector3Array()
+		var prev_tile: Dictionary = _s_prev_tile[i] if _s_prev_tile.size() > i else {}
+		var old_col: Vector3 = _s_old_col[i] if _s_old_col.size() > i else Vector3.ZERO
+		tile = FacetSmoothTier.build_tile_rim(fid, cells, col, r_env, CubeSphere.RIM_FEATHER_BLOCKS, TierPlace.backstop_sink(), CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, CubeSphere.FP_RIM_CHEAP, prev_env_pos, prev_tile, old_col, _cpp_gen, CubeSphere.FP_RIM_NEAR_WELD, float(TerrainConfig.near_render_radius()))
+	else:
+		tile = FacetSmoothTier.build_tile(fid, cells, 0.0, true, CubeSphere.FP_SMOOTH_NORMAL_LIT, slot, _cpp_gen)   # curved sphere placement, lift retired to 0 (replacement law)
+	var plan: PackedInt32Array = _s_snap[i]
+	if plan.size() == 4:
+		var corner_dirs := FacetAtlas.facet_corner_dirs(fid)
+		var r_datum := FacetAtlas.r_of(fid)
+		var pos: PackedVector3Array = tile["pos"]
+		for e in range(4):
+			FacetSmoothTier.snap_edge_to_pitch(pos, cells, corner_dirs, r_datum, int(plan[e]), e)
+		tile["pos"] = pos
+	FacetSmoothTier.append_skirt(tile, cells, CubeSphere.SMOOTH_SKIRT_BLOCKS)   # law 5: always-on crack backstop
 	_s_mutex.lock()
 	_s_result[i] = tile
 	_s_mutex.unlock()
 
-## Concatenate every resident tile into ONE ArrayMesh surface (index-offset) → ≤ 1 extra draw for the whole smooth set.
-func _rebuild_mesh() -> void:
+## Concatenate this tier's resident tiles into ONE ArrayMesh surface (index-offset) — the ONLY tier touched this call.
+## SHIPPED (legacy) MAIN-THREAD path — the R3.2.a hole/z-fight window (kept, byte-identical, for FP_SMOOTH_TXN-off).
+func _rebuild_tier_mesh(tier: int) -> void:
+	_main_concat_count += 1   # REVISION 3 T1 G-FS-TXN-THREAD telemetry: this IS the main-thread concat path
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null:
+		return
 	var P := PackedVector3Array()
 	var N := PackedVector3Array()
 	var C := PackedColorArray()
 	var U := PackedVector2Array()
 	var U2 := PackedVector2Array()
 	var I := PackedInt32Array()
+	var committed := {}
 	for fid in _tiles.keys():
+		if int(_tier_of[fid]) != tier:
+			continue
+		committed[int(fid)] = true
 		var t = _tiles[fid]
 		var base := P.size()
 		P.append_array(t["pos"])
@@ -300,7 +1206,594 @@ func _rebuild_mesh() -> void:
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
 		if _material != null:
 			mesh.surface_set_material(0, _material)
-	_mi.mesh = mesh
+	mi.mesh = mesh
+	_committed_fids[tier] = committed   # gate introspection: exactly what THIS call just baked into mi.mesh
+
+# =====================================================================================================================
+# REVISION 3 T1 (FP_SMOOTH_TXN, LAW T) — the off-thread, atomic multi-tier commit transaction. Supersedes
+# `_rebuild_tier_mesh` above (kept for the flag-off path). Two-phase per `step()` call:
+#   (1) poll an in-flight transaction: only once EVERY tier in it has a finished worker task does ANY of them get
+#       applied — applied together, in this SAME call (LAW T: "if it cannot be afforded this frame, the swap is
+#       deferred whole"). A tier re-dirtied while its job was in flight (an unrelated commit landed on the SAME tier
+#       mid-flight, detected via `_tier_change_seq`/`_tier_dispatch_seq`) stays dirty afterward — picked up fresh by
+#       the next transaction below, rather than silently accepting stale content as final.
+#   (2) if no transaction is in flight and any tier is dirty, snapshot ALL currently-dirty tiers together and dispatch
+#       one WorkerThreadPool concat job per tier — a single commit event's OLD and NEW tiers are always dirtied in the
+#       SAME reap-loop pass above, so they land in the SAME transaction and therefore swap in the SAME later call.
+# =====================================================================================================================
+func _step_tier_txn() -> void:
+	if _txn_active:
+		for t in _txn_tiers:
+			var task: int = int(_tier_task[t])
+			if task < 0 or not WorkerThreadPool.is_task_completed(task):
+				return   # LAW T: not every tier in this transaction is ready yet — apply NONE of them this call
+		for t in _txn_tiers:
+			WorkerThreadPool.wait_for_task_completion(int(_tier_task[t]))
+			_tier_mutex.lock()
+			var result = _tier_result[t]
+			_tier_result[t] = null
+			_tier_mutex.unlock()
+			_tier_task[t] = -1
+			if result != null:
+				_apply_tier_mesh(t, result)
+				_txn_apply_count += 1
+			if int(_tier_change_seq[t]) == int(_tier_dispatch_seq[t]):
+				_dirty_tier[t] = false   # nothing re-dirtied this tier since the snapshot — fully caught up
+			# else: a NEW change landed on this SAME tier while the job was in flight — stays dirty, re-queued below
+		_txn_active = false
+		_txn_tiers = []
+	if not _txn_active:
+		var tiers_to_build := []
+		for t in [S2, S3, S4, S5]:
+			if _dirty_tier[t]:
+				tiers_to_build.append(t)
+		if tiers_to_build.is_empty():
+			return
+		for t in tiers_to_build:
+			var snap := _snapshot_tier_tiles(t)
+			_tier_snapshot[t] = snap[0]
+			_tier_snapshot_fids[t] = snap[1]
+			_tier_dispatch_seq[t] = int(_tier_change_seq[t])
+			_tier_task[t] = WorkerThreadPool.add_task(Callable(self, "_concat_tier_worker").bind(t), true, "smoothtierconcat")
+		_txn_tiers = tiers_to_build
+		_txn_active = true
+
+## Frozen (main-thread, pre-dispatch) snapshot of tier `tier`'s CURRENT resident tiles — [Array[Dictionary] tiles,
+## Array[int] fids], parallel indices. Committed tile Dictionaries are never mutated in place once stored in `_tiles`
+## (only ever wholesale-reassigned or erased), so handing worker threads references to them is race-safe.
+func _snapshot_tier_tiles(tier: int) -> Array:
+	var tiles := []
+	var fids := []
+	for fid in _tiles.keys():
+		if int(_tier_of[fid]) == tier:
+			tiles.append(_tiles[fid])
+			fids.append(int(fid))
+	return [tiles, fids]
+
+## WorkerThreadPool-dispatched (off MAIN): concatenate `_tier_snapshot[tier]` into the merged pos/nrm/col/uv/uv2/idx
+## arrays — identical index-offset math to `_rebuild_tier_mesh`'s loop (bit-identical output for the same tile set),
+## just off-thread. Reads only `_tier_snapshot[tier]` (single-writer: main writes it once at dispatch, never touches it
+## again until this task is reaped) — PURE except for the mutex-guarded `_tier_result`/`_worker_concat_count` write
+## (mirrors `_build_worker`'s `_s_result` discipline).
+func _concat_tier_worker(tier: int) -> void:
+	var tiles: Array = _tier_snapshot[tier]
+	var P := PackedVector3Array()
+	var N := PackedVector3Array()
+	var C := PackedColorArray()
+	var U := PackedVector2Array()
+	var U2 := PackedVector2Array()
+	var I := PackedInt32Array()
+	for t in tiles:
+		var td: Dictionary = t
+		var base := P.size()
+		P.append_array(td["pos"])
+		N.append_array(td["nrm"])
+		C.append_array(td["col"])
+		U.append_array(td["uv"])
+		U2.append_array(td["uv2"])
+		for idx in (td["idx"] as PackedInt32Array):
+			I.append(base + idx)
+	var result := {"pos": P, "nrm": N, "col": C, "uv": U, "uv2": U2, "idx": I}
+	_tier_mutex.lock()
+	_tier_result[tier] = result
+	_worker_concat_count += 1   # REVISION 3 T1 G-FS-TXN-THREAD telemetry: the off-thread concat path ran
+	_tier_mutex.unlock()
+
+## The CHEAP main-thread half of a T1 tier-mesh commit — assign the already-concatenated arrays (built off-thread by
+## `_concat_tier_worker`) to the tier's MeshInstance. Mirrors `_rebuild_tier_mesh`'s tail exactly (same ArrayMesh/
+## material setup), so the two paths are bit-identical for the same tile set. Also updates `_committed_fids` (gate
+## introspection) from `_tier_snapshot_fids[tier]` — exactly the fid set THIS dispatch's job concatenated.
+func _apply_tier_mesh(tier: int, result: Dictionary) -> void:
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null:
+		return
+	var P: PackedVector3Array = result["pos"]
+	var mesh := ArrayMesh.new()
+	if P.size() > 0:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = P
+		arr[Mesh.ARRAY_NORMAL] = result["nrm"]
+		arr[Mesh.ARRAY_COLOR] = result["col"]
+		arr[Mesh.ARRAY_TEX_UV] = result["uv"]
+		arr[Mesh.ARRAY_TEX_UV2] = result["uv2"]
+		arr[Mesh.ARRAY_INDEX] = result["idx"]
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		if _material != null:
+			mesh.surface_set_material(0, _material)
+	mi.mesh = mesh
+	var committed := {}
+	for fid in _tier_snapshot_fids[tier]:
+		committed[int(fid)] = true
+	_committed_fids[tier] = committed
+
+# =====================================================================================================================
+# FP_SMOOTH_TILE_SURF — SAFE per-tile-node commit path (see the instance-var block above, near `_tile_mi`, and the
+# doc comment on `CubeSphere.FP_SMOOTH_TILE_SURF`). Per-tile phase: each committing tile gets its OWN child
+# MeshInstance3D (O(1) upload). Consolidate-at-settle: a tier that has gone `SMOOTH_TILE_CONSOLIDATE_FRAMES` `step()`
+# calls without an add/evict folds its per-tile nodes back into ONE merged mesh (`_rebuild_tier_mesh`, reused
+# verbatim) and frees them. Invariant (merged XOR per-tile, never both): `_tile_surf_active[tier]` is the single
+# source of truth for which representation is live; `_tile_surf_split_tier`/`_tile_surf_consolidate` are the only two
+# transitions and each one builds the NEW representation before tearing down the OLD one, so there is never a frame
+# with neither, and the merged mesh is always explicitly nulled the instant per-tile nodes exist (never both drawing
+# at once). ONLY the high-level MeshInstance3D/ArrayMesh API is used here — never RenderingServer.
+# =====================================================================================================================
+
+## Pack ONE tile's own arrays (no index-offset — a tile is entirely self-contained) into a fresh 1-surface ArrayMesh
+## — the exact same per-tile arrays/`add_surface_from_arrays` call/material setup `_rebuild_tier_mesh`'s loop body
+## already uses, just for a single tile instead of the whole tier's concatenation, so the geometry is bit-identical
+## to the shipped whole-tier path.
+func _tile_surf_pack(tile: Dictionary) -> ArrayMesh:
+	var mesh := ArrayMesh.new()
+	var pos: PackedVector3Array = tile.get("pos", PackedVector3Array())
+	if pos.size() > 0:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = pos
+		arr[Mesh.ARRAY_NORMAL] = tile.get("nrm", PackedVector3Array())
+		arr[Mesh.ARRAY_COLOR] = tile.get("col", PackedColorArray())
+		arr[Mesh.ARRAY_TEX_UV] = tile.get("uv", PackedVector2Array())
+		arr[Mesh.ARRAY_TEX_UV2] = tile.get("uv2", PackedVector2Array())
+		arr[Mesh.ARRAY_INDEX] = tile.get("idx", PackedInt32Array())
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		if _material != null:
+			mesh.surface_set_material(0, _material)
+	return mesh
+
+## O(1): create (or, if it already exists, refresh) `fid`'s own per-tile MeshInstance3D child of `_mi[tier]`, packed
+## from its CURRENT `_tiles[fid]` content. Graceful no-op if `_mi[tier]` was never set up (`setup_instance` not
+## called) or `fid` isn't actually resident (should not happen from the call sites below, but never a hard failure).
+func _tile_surf_set_node(tier: int, fid: int) -> void:
+	var parent_mi: MeshInstance3D = _mi[tier]
+	if parent_mi == null or not _tiles.has(fid):
+		return
+	var mesh := _tile_surf_pack(_tiles[fid])
+	if _tile_mi.has(fid):
+		var existing: MeshInstance3D = _tile_mi[fid]
+		if existing != null and is_instance_valid(existing):
+			existing.mesh = mesh
+			return
+	var node := MeshInstance3D.new()
+	node.name = "FacetSmoothTileMesh_%d" % fid
+	if _material != null:
+		node.material_override = _material
+	parent_mi.add_child(node)
+	node.mesh = mesh
+	_tile_mi[fid] = node
+
+## Free `fid`'s per-tile node (an eviction while its tier is split) — a no-op if it never had one (e.g. the tier was
+## still consolidated when the eviction landed; `_tile_surf_touch` routes that case through `_tile_surf_split_tier`
+## instead, which naturally excludes the just-evicted fid since `_tiles`/`_tier_of` are already updated by the caller).
+func _tile_surf_free_node(fid: int) -> void:
+	if not _tile_mi.has(fid):
+		return
+	var node: MeshInstance3D = _tile_mi[fid]
+	_tile_mi.erase(fid)
+	if node != null and is_instance_valid(node):
+		node.queue_free()
+
+## `tier` is (re-)entering the per-tile phase — build a node for EVERY tile CURRENTLY resident at `tier` (covers both
+## "a new/changed tile just committed" and "a tile was just evicted": `_tiles`/`_tier_of` already reflect the
+## post-mutation resident set by the time this runs) and clear the merged mesh so the two representations never
+## co-exist — the merged-XOR-per-tile invariant, enforced by construction (build new, THEN clear old).
+func _tile_surf_split_tier(tier: int) -> void:
+	for fid in _tiles.keys():
+		if int(_tier_of[fid]) == tier:
+			_tile_surf_set_node(tier, int(fid))
+	var mi: MeshInstance3D = _mi[tier]
+	if mi != null:
+		mi.mesh = null
+	_tile_surf_active[tier] = true
+
+## Entry point for a single fid's add (`is_evict=false`) or evict (`is_evict=true`) under FP_SMOOTH_TILE_SURF —
+## called from `step()`'s reap-loop commit block and from `_evict()`. Resets `tier`'s stable-frame counter (a real
+## residency change just happened — the tier must not consolidate mid-change) and either takes the O(1) per-tile
+## delta (already split) or triggers the one-time O(resident) re-split (still consolidated, or empty).
+func _tile_surf_touch(tier: int, fid: int, is_evict: bool) -> void:
+	_tile_surf_stable[tier] = 0
+	if not _tile_surf_active[tier]:
+		_tile_surf_split_tier(tier)
+	elif is_evict:
+		_tile_surf_free_node(fid)
+	else:
+		_tile_surf_set_node(tier, fid)
+	if not is_evict:
+		_tile_surf_commit_count += 1   # telemetry: the per-tile path has genuinely run at least once
+
+## Paced settle: age every currently-split tier by one `step()` call, then fold AT MOST ONE tier that has gone
+## `SMOOTH_TILE_CONSOLIDATE_FRAMES` calls without a touch back into a single merged mesh — pacing so 4 simultaneously
+## eligible tiers don't all re-upload in the same frame.
+func _tile_surf_consolidate_step() -> void:
+	for t in [S2, S3, S4, S5]:
+		if _tile_surf_active[t]:
+			_tile_surf_stable[t] = int(_tile_surf_stable[t]) + 1
+	for t in [S2, S3, S4, S5]:
+		if _tile_surf_active[t] and int(_tile_surf_stable[t]) >= CubeSphere.SMOOTH_TILE_CONSOLIDATE_FRAMES:
+			_tile_surf_consolidate(t)
+			break   # at most one tier consolidated per call
+
+## Fold `tier` back to ONE merged mesh + free every per-tile node — the inverse of `_tile_surf_split_tier`, keeping
+## the SAME invariant (the merged mesh is rebuilt from `_tiles` BEFORE the per-tile nodes are torn down, so there is
+## never a frame drawing neither). Reuses `_rebuild_tier_mesh` verbatim — the ONE whole-tier upload this design
+## amortizes to once per settle instead of once per tile.
+func _tile_surf_consolidate(tier: int) -> void:
+	_rebuild_tier_mesh(tier)
+	for fid in _tile_mi.keys():
+		if int(_tier_of.get(fid, -1)) == tier:
+			var node: MeshInstance3D = _tile_mi[fid]
+			_tile_mi.erase(fid)
+			if node != null and is_instance_valid(node):
+				node.queue_free()
+	_tile_surf_active[tier] = false
+	_tile_surf_stable[tier] = 0
+
+## Telemetry (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md FP_SMOOTH_TILE_SURF): the live per-tile draw-call impact the
+## orchestrator watches alongside fps — `smooth_tile_nodes` too high for too long means the consolidate-at-settle
+## pacing isn't bounding steady-state draw calls the way headless node-count gates (which can't see GPU cost) assume.
+func tile_surf_stats() -> Dictionary:
+	return {
+		"smooth_tile_nodes": _tile_mi.size(),
+		"smooth_tile_surf_path": 1 if _tile_surf_commit_count > 0 else 0,
+	}
+
+# =====================================================================================================================
+# REVISION 7 (FP_SMOOTH_SLOT_MESH, COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md "REVISION 7") — fixed-capacity slotted
+# tier mesh + GPU region-write commits. See the instance-var block above (near `_txn_apply_count`) for the state
+# this section owns. Every function here is only ever CALLED under `slot_on and not _slot_mesh_failed` (checked by
+# the caller — `_evict`/`step()`), so internal `CubeSphere.FP_SMOOTH_SLOT_MESH` re-checks are unnecessary; the
+# refusal latch `_slot_mesh_failed` itself IS checked internally (a refusal can be raised mid-sequence here).
+# =====================================================================================================================
+
+## Pack ONE tile's arrays into the engine's own GPU vertex format via a THROWAWAY `ArrayMesh` + `RenderingServer.
+## mesh_get_surface` readback. `RenderingServer.mesh_create_surface_data_from_arrays` (the actual C++ packer) is not
+## itself script-bound (it takes a `SurfaceData*` out-param), but `ArrayMesh.add_surface_from_arrays` calls exactly
+## that function internally (`mesh_add_surface_from_arrays` → `mesh_create_surface_data_from_arrays` →
+## `mesh_add_surface`, `servers/rendering_server.cpp:1377-1384`) before storing the result, so reading it back via
+## `mesh_get_surface` yields BIT-IDENTICAL packed bytes — this is the engine-is-the-packer contract, never a hand-
+## rolled vertex format. `flags=0` (the `add_surface_from_arrays` 5th arg, `compress_format`) keeps positions
+## absolute f32 (no AABB-relative quantization), which is mandatory: a compressed tile's bytes would be relative to
+## THAT tile's own tiny bounding box and non-transplantable into a capacity surface sized for the WHOLE planet.
+## Returns `{}` if the pack failed for any reason (should not happen with valid tile arrays; the caller treats an
+## empty/keyless result as a refusal trigger, never a silent no-op).
+static func _pack_tile_bytes(tile: Dictionary) -> Dictionary:
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = tile["pos"]
+	arr[Mesh.ARRAY_NORMAL] = tile["nrm"]
+	arr[Mesh.ARRAY_COLOR] = tile["col"]
+	arr[Mesh.ARRAY_TEX_UV] = tile["uv"]
+	arr[Mesh.ARRAY_TEX_UV2] = tile["uv2"]
+	arr[Mesh.ARRAY_INDEX] = tile["idx"]
+	var packer := ArrayMesh.new()
+	packer.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, 0)
+	if packer.get_surface_count() == 0:
+		return {}
+	return RenderingServer.mesh_get_surface(packer.get_rid(), 0)
+
+## Force every tier dirty and drop all queued/in-flight slot-mesh state — called the instant `_slot_mesh_failed`
+## latches. `_tiles`/`_tier_of` (CPU residency bookkeeping) is untouched by any slot-mesh failure, so the next
+## `step()` call's legacy/T1 branch (`_rebuild_tier_mesh`/`_step_tier_txn`, both byte-identical, unconditionally
+## available) reconstructs each tier's `mi.mesh` correctly FROM SCRATCH — a full resync, never a corrupt draw.
+func _slot_refuse_resync() -> void:
+	for t in [S2, S3, S4, S5]:
+		_dirty_tier[t] = true
+	_slot_write_queue = []
+	_slot_cur_event = []
+	_settled = false
+
+## Lazily build tier `tier`'s fixed-capacity ArrayMesh — ONCE, the first time this tier actually needs to host a
+## slot-mesh commit (mirrors the shipped "S2 stays a 0-surface mesh until FP_SMOOTH_RIM assigns it" NEVER-OOM
+## discipline — a tier nobody ever commits into never gets a capacity surface at all). `ref_tile` is the tile
+## Dictionary CURRENTLY being committed (real production data, not a synthetic probe): every tile of a tier shares
+## IDENTICAL topology (same `cells` ⇒ same vertex count + index pattern, REVISION 7's enabling property), so this
+## first real tile doubles as both the CAPACITY-SIZING reference and the FORMAT/STRIDE self-check reference — no
+## separate throwaway build needed. Returns false (and latches `_slot_mesh_failed`) on ANY of: a missing
+## RenderingServer method, a malformed/undersized reference tile, a packed-size mismatch against the format's own
+## stride math, or the capacity surface's own format disagreeing with the reference pack.
+func _ensure_slot_capacity(tier: int, ref_tile: Dictionary) -> bool:
+	if _slot_mesh_failed:
+		return false
+	if _slot_cap_built[tier]:
+		return true
+	if not (RenderingServer.has_method("mesh_surface_update_vertex_region")
+			and RenderingServer.has_method("mesh_surface_update_attribute_region")
+			and RenderingServer.has_method("mesh_get_surface")
+			and RenderingServer.has_method("mesh_surface_get_format_vertex_stride")
+			and RenderingServer.has_method("mesh_surface_get_format_normal_tangent_stride")
+			and RenderingServer.has_method("mesh_surface_get_format_attribute_stride")):
+		_slot_mesh_failed = true   # refusal latch: this engine build doesn't expose the region-update API at all
+		_slot_refuse_resync()
+		return false
+	var cap := FacetSmoothTier.residency_for_tier(tier)
+	if cap <= 0:
+		return false   # tier genuinely unused this session (e.g. S2 without FP_SMOOTH_RIM) — not a failure, nothing to build
+
+	var ref_pos: PackedVector3Array = ref_tile.get("pos", PackedVector3Array())
+	var ref_idx: PackedInt32Array = ref_tile.get("idx", PackedInt32Array())
+	var verts_per_tile := ref_pos.size()
+	if verts_per_tile <= 0 or ref_idx.size() <= 0:
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	var sd := FacetSmoothTier._pack_tile_bytes(ref_tile)
+	if not sd.has("vertex_data") or not sd.has("format"):
+		_slot_mesh_failed = true   # refusal latch: the engine packer didn't return the expected keys
+		_slot_refuse_resync()
+		return false
+	var format: int = int(sd["format"])
+	var vcount: int = int(sd.get("vertex_count", verts_per_tile))
+	# `mesh_surface_get_format_vertex_stride`/`_normal_tangent_stride` are the PER-SUB-BLOCK strides — the
+	# "vertex_data" buffer is struct-of-arrays (see the instance-var block's note above), NOT one interleaved
+	# per-vertex row, so these stay SEPARATE (never summed). `mesh_surface_get_format_attribute_stride`
+	# (COLOR+UV+UV2+CUSTOM) IS the complete interleaved attribute_data per-vertex stride.
+	var pstride := int(RenderingServer.mesh_surface_get_format_vertex_stride(format, vcount))
+	var ntstride := int(RenderingServer.mesh_surface_get_format_normal_tangent_stride(format, vcount))
+	var astride := int(RenderingServer.mesh_surface_get_format_attribute_stride(format, vcount))
+	var vtx_bytes: PackedByteArray = sd["vertex_data"]
+	var attr_bytes: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	# FIRST-COMMIT SELF-CHECK (REVISION 7 design step 3): the packed byte length must equal
+	# verts×(pos_stride+nt_stride) EXACTLY — any mismatch means this build's vertex format doesn't match what the
+	# region-write offset math below assumes.
+	if vcount != verts_per_tile or pstride <= 0 or vtx_bytes.size() != verts_per_tile * (pstride + ntstride) \
+			or (astride > 0 and attr_bytes.size() != verts_per_tile * astride):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	# Build the capacity arrays ONCE: `cap` uniform slots, zeroed pos/nrm/col/uv/uv2 (an all-zero-position tri is
+	# degenerate — zero area, at the planet centre, rasterizes nothing), an IMMUTABLE index buffer (`cap` copies of
+	# the reference tile's own index pattern, each pre-offset by `slot * verts_per_tile`).
+	var total_verts := cap * verts_per_tile
+	var P := PackedVector3Array(); P.resize(total_verts)
+	var N := PackedVector3Array(); N.resize(total_verts)
+	var C := PackedColorArray(); C.resize(total_verts)
+	var U := PackedVector2Array(); U.resize(total_verts)
+	var U2 := PackedVector2Array(); U2.resize(total_verts)
+	var I := PackedInt32Array(); I.resize(cap * ref_idx.size())
+	var ii := 0
+	for slot in range(cap):
+		var base := slot * verts_per_tile
+		for k in range(ref_idx.size()):
+			I[ii] = base + int(ref_idx[k])
+			ii += 1
+	var cap_mesh := ArrayMesh.new()
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = P
+	arr[Mesh.ARRAY_NORMAL] = N
+	arr[Mesh.ARRAY_COLOR] = C
+	arr[Mesh.ARRAY_TEX_UV] = U
+	arr[Mesh.ARRAY_TEX_UV2] = U2
+	arr[Mesh.ARRAY_INDEX] = I
+	cap_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, 0)
+	if _material != null:
+		cap_mesh.surface_set_material(0, _material)
+	var r := FacetAtlas.R_BLOCKS
+	var mi: MeshInstance3D = _mi[tier]
+	mi.mesh = cap_mesh
+	# The auto-AABB of an all-zero-position mesh would cull it outright — set an explicit planet-sized bound
+	# (mirrors the design's "set mi.custom_aabb to the planet bound" step).
+	mi.custom_aabb = AABB(Vector3(-r, -r, -r) * 1.05, Vector3.ONE * (r * 2.1))
+
+	# Defensive re-check: the capacity surface's OWN packed format (same array set, same flags=0) must equal the
+	# reference tile's format — should be true by construction, guards against an unforeseen engine-side surprise.
+	var cap_sd: Dictionary = RenderingServer.mesh_get_surface(cap_mesh.get_rid(), 0)
+	if int(cap_sd.get("format", -1)) != format:
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return false
+
+	_slot_verts_per_tile[tier] = verts_per_tile
+	_slot_pos_stride[tier] = pstride
+	_slot_nt_stride[tier] = ntstride
+	_slot_attr_stride[tier] = astride
+	_slot_total_verts[tier] = total_verts
+	_slot_format[tier] = format
+	var dpos := PackedByteArray(); dpos.resize(verts_per_tile * pstride)     # all-zero — the precomputed eviction blobs
+	var dnt := PackedByteArray()
+	if ntstride > 0:
+		dnt.resize(verts_per_tile * ntstride)
+	var dattr := PackedByteArray()
+	if astride > 0:
+		dattr.resize(verts_per_tile * astride)
+	_slot_degenerate_pos[tier] = dpos
+	_slot_degenerate_nt[tier] = dnt
+	_slot_degenerate_attr[tier] = dattr
+	var free_list := []
+	for slot in range(cap):
+		free_list.append(slot)
+	_slot_free[tier] = free_list
+	_slot_of[tier] = {}
+	_slot_cap_built[tier] = true
+	return true
+
+## Free `fid`'s slot in tier `tier` (if it has one) back onto the free-list and stage a degenerate-blit write for
+## it. Called from `_evict()` only. A no-op if this tier's capacity mesh was never built or `fid` never held a slot
+## there (e.g. it was never actually committed through the slot path before this eviction — nothing to free).
+func _slot_free_fid(tier: int, fid: int) -> void:
+	if not _slot_cap_built[tier]:
+		return
+	var slots: Dictionary = _slot_of[tier]
+	if not slots.has(fid):
+		return
+	var slot: int = int(slots[fid])
+	slots.erase(fid)
+	(_slot_free[tier] as Array).append(slot)
+	_slot_cur_event.append({"tier": tier, "slot": slot, "fid": fid, "degenerate": true})
+
+## Commit `fid`'s freshly-built `tile` into tier `tier`'s slot mesh: lazily build the capacity surface if this is
+## the first commit into this tier this session, reuse `fid`'s EXISTING slot if it already has one (an in-place
+## same-tier refresh — no free-list churn), else allocate a fresh slot (latching to refusal if the free-list is
+## unexpectedly empty — a NEVER-OOM safety net against residency exceeding the pre-sized cap), pack the tile's
+## bytes via the engine, validate the packed size against this tier's known stride (every commit, not merely the
+## very first — a cheap size compare, strictly more defensive than the design's stated minimum), and stage the
+## write. Staged, not applied — `_slot_flush_event`/`_slot_drain` apply it under the byte budget.
+func _slot_commit_fid(tier: int, fid: int, tile: Dictionary) -> void:
+	if _slot_mesh_failed:
+		return
+	if not _slot_cap_built[tier]:
+		if not _ensure_slot_capacity(tier, tile):
+			return   # `_ensure_slot_capacity` already latched `_slot_mesh_failed` on a genuine refusal (cap<=0 is not one)
+	var slots: Dictionary = _slot_of[tier]
+	var slot: int
+	if slots.has(fid):
+		slot = int(slots[fid])           # in-place refresh: same tier, same slot, fresh bytes
+	else:
+		var free_list: Array = _slot_free[tier]
+		if free_list.is_empty():
+			_slot_mesh_failed = true      # safety net: residency exceeded the pre-sized cap — refuse, never corrupt a slot
+			_slot_refuse_resync()
+			return
+		slot = int(free_list.pop_back())
+		slots[fid] = slot
+	var sd := FacetSmoothTier._pack_tile_bytes(tile)
+	if not sd.has("vertex_data"):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return
+	var vtx: PackedByteArray = sd["vertex_data"]
+	var attr: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	var vpt := int(_slot_verts_per_tile[tier])
+	var pstride := int(_slot_pos_stride[tier])
+	var ntstride := int(_slot_nt_stride[tier])
+	var astride := int(_slot_attr_stride[tier])
+	# SELF-CHECK (every commit): this tile's packed size disagrees with the tier's established strides — the
+	# region-write offset math below would be wrong. Refuse rather than blit a misaligned/truncated region.
+	if vtx.size() != vpt * (pstride + ntstride) or (astride > 0 and attr.size() != vpt * astride):
+		_slot_mesh_failed = true
+		_slot_refuse_resync()
+		return
+	# Split "vertex_data" into its two struct-of-arrays sub-blocks (position, then normal+tangent — see the
+	# instance-var block's note) BEFORE staging, so `_apply_slot_write` only ever does a plain byte blit at a
+	# precomputed offset, never its own slicing.
+	var vtx_pos := vtx.slice(0, vpt * pstride)
+	var vtx_nt := vtx.slice(vpt * pstride, vpt * (pstride + ntstride))
+	_slot_cur_event.append({"tier": tier, "slot": slot, "fid": fid, "vtx_pos": vtx_pos, "vtx_nt": vtx_nt, "attr": attr})
+
+## Flush whatever `_slot_cur_event` accumulated for the fid just fully processed (an eviction, a commit, or — for a
+## tier-change promote — both, staged together by `_evict` then `_slot_commit_fid` within the SAME reap-loop
+## iteration) as ONE atomic whole event onto the drain queue. A no-op if nothing was staged (the flag is off, the
+## fid's transition didn't touch the slot path, or a refusal already cleared it via `_slot_refuse_resync`).
+func _slot_flush_event() -> void:
+	if _slot_cur_event.is_empty():
+		return
+	_slot_write_queue.append(_slot_cur_event)
+	_slot_cur_event = []
+
+## Apply queued whole commit-events (never a partial tile) up to `budget_bytes` of region-writes this call,
+## deferring the rest — in order, whole events only (LAW T: a promote's old-slot-zero + new-slot-write always
+## land in the SAME applied event). The FIRST event of a call always applies regardless of size (forward-progress
+## guarantee — an oversized single event must never queue forever); only the 2nd+ event in the SAME call is subject
+## to the budget check. Clears every tier's `_dirty_tier` bit once the queue is fully drained (safe: a fresh
+## refusal always re-marks all four via `_slot_refuse_resync`, so this never masks a legitimate legacy-resync need).
+func _slot_drain(budget_bytes: int) -> void:
+	_slot_commit_ms = 0.0
+	_slot_upload_bytes = 0
+	if _slot_write_queue.is_empty():
+		_slot_commit_defer = 0
+		return
+	var t0 := Time.get_ticks_usec()
+	var applied_any := false
+	var used := 0
+	while not _slot_write_queue.is_empty():
+		var event: Array = _slot_write_queue[0]
+		var event_bytes := 0
+		for w in event:
+			var d: Dictionary = w
+			var tier: int = int(d["tier"])
+			if bool(d.get("degenerate", false)):
+				event_bytes += (_slot_degenerate_pos[tier] as PackedByteArray).size() + (_slot_degenerate_nt[tier] as PackedByteArray).size() + (_slot_degenerate_attr[tier] as PackedByteArray).size()
+			else:
+				event_bytes += (d["vtx_pos"] as PackedByteArray).size() + (d["vtx_nt"] as PackedByteArray).size() + (d["attr"] as PackedByteArray).size()
+		if applied_any and used + event_bytes > budget_bytes:
+			break   # G-SLOT-BUDGET: the whole remaining event(s) defer to a later step() — never a partial tile
+		_slot_write_queue.pop_front()
+		for w in event:
+			_apply_slot_write(w)
+		used += event_bytes
+		applied_any = true
+	_slot_upload_bytes = used
+	_slot_upload_total_bytes += used
+	_slot_commit_defer = _slot_write_queue.size()
+	if _slot_write_queue.is_empty():
+		for t in [S2, S3, S4, S5]:
+			_dirty_tier[t] = false
+	_slot_commit_ms = (Time.get_ticks_usec() - t0) / 1000.0
+
+## The actual GPU region write(s) for one staged descriptor. THREE `RenderingServer` calls per slot: the position
+## sub-block and the normal+tangent sub-block are two DISJOINT ranges within the same "vertex_data" buffer (struct-
+## of-arrays — see the instance-var block's note), each its own `mesh_surface_update_vertex_region` call at
+## `slot * verts_per_tile * sub_stride` offset BY its own sub-block's base (`0` for position, `total_verts *
+## pos_stride` for normal+tangent); the interleaved "attribute_data" buffer stays a single
+## `mesh_surface_update_attribute_region` call at `slot * verts_per_tile * attr_stride`. All three are a plain
+## `glBufferSubData` on GLES3/compat (verified in this engine build,
+## `drivers/gles3/storage/mesh_storage.cpp:536-564`). Also keeps `_committed_fids[tier]` accurate under the slot
+## path (mirrors the legacy/T1 commit hooks) so the existing G-FS-NOHOLE gate machinery (hole = found in 0 tiers,
+## z-fight = found in ≥2) works unchanged. NOTE (headless): the dummy RenderingServer's
+## `mesh_surface_update_vertex_region`/`_attribute_region` are no-ops (`drivers/.../dummy/storage/mesh_storage.h` —
+## no GPU, nothing to write to) — this call is therefore unverifiable headless; only a live tab can confirm the
+## bytes actually landed and rendered (see the report's live-verify note).
+func _apply_slot_write(w: Dictionary) -> void:
+	var tier: int = int(w["tier"])
+	var slot: int = int(w["slot"])
+	var fid: int = int(w["fid"])
+	var mi: MeshInstance3D = _mi[tier]
+	if mi == null or mi.mesh == null:
+		return
+	var rid := mi.mesh.get_rid()
+	var vpt := int(_slot_verts_per_tile[tier])
+	var pstride := int(_slot_pos_stride[tier])
+	var ntstride := int(_slot_nt_stride[tier])
+	var astride := int(_slot_attr_stride[tier])
+	var total_verts := int(_slot_total_verts[tier])
+	var degenerate: bool = bool(w.get("degenerate", false))
+	var vtx_pos: PackedByteArray = _slot_degenerate_pos[tier] if degenerate else w["vtx_pos"]
+	var vtx_nt: PackedByteArray = _slot_degenerate_nt[tier] if degenerate else w["vtx_nt"]
+	var attr: PackedByteArray = _slot_degenerate_attr[tier] if degenerate else w["attr"]
+	RenderingServer.mesh_surface_update_vertex_region(rid, 0, slot * vpt * pstride, vtx_pos)
+	if ntstride > 0 and vtx_nt.size() > 0:
+		RenderingServer.mesh_surface_update_vertex_region(rid, 0, total_verts * pstride + slot * vpt * ntstride, vtx_nt)
+	if astride > 0 and attr.size() > 0:
+		RenderingServer.mesh_surface_update_attribute_region(rid, 0, slot * vpt * astride, attr)
+	var committed: Dictionary = _committed_fids[tier]
+	if degenerate:
+		committed.erase(fid)
+	else:
+		committed[fid] = true
+
+## Live telemetry (REVISION 7 §R7.3): main-thread ms spent packing+region-writing THIS step() call, KB written THIS
+## call, cumulative KB written this session, whole commit-events still queued after THIS call, and 1/0 for whether
+## the slot path is actually active (vs. off or refused-to-fallback). The ring/remote_bridge should merge these into
+## the smooth telemetry it already emits (see the report for the exact field names expected in telemetry.jsonl).
+func slot_mesh_stats() -> Dictionary:
+	return {
+		"smooth_commit_ms": _slot_commit_ms,
+		"smooth_upload_kb": _slot_upload_bytes / 1024.0,
+		"smooth_upload_total_kb": _slot_upload_total_bytes / 1024.0,
+		"smooth_commit_defer": _slot_commit_defer,
+		"smooth_slot_path": 1 if (CubeSphere.FP_SMOOTH_SLOT_MESH and not _slot_mesh_failed) else 0,
+	}
 
 func resident_count() -> int:
 	return _tiles.size()
@@ -308,6 +1801,63 @@ func resident_count() -> int:
 func smooth_bytes() -> int:
 	return _bytes
 
-## The set of facets currently drawn smooth — the far-ring drops these from its heightfield emit (increment 2).
+## The set of facets currently drawn smooth (any tier) — the far-ring drops these from its heightfield/shell emit
+## (law 6, `visible_fids()`).
 func resident_fids() -> Array:
 	return _tiles.keys()
+
+## O(1) membership test for the exclusion law — is `fid` currently drawn by the smooth tier (any tier)?
+func is_resident(fid: int) -> bool:
+	return _tiles.has(int(fid))
+
+## The tier (S2..S5) `fid` is resident at, or -1 if not resident.
+func tier_of(fid: int) -> int:
+	return int(_tier_of.get(int(fid), -1))
+
+## Consume the "residency changed since last call" latch (single read-and-clear) — the driver uses this to know
+## when the shell must re-emit to honour the exclusion law (a facet just left/joined the smooth-resident set).
+func consume_changed() -> bool:
+	var c := _changed
+	_changed = false
+	return c
+
+## G-FS-CHURN gate telemetry: worker dispatches issued for `fid` so far (builds-per-facet).
+func dispatch_count(fid: int) -> int:
+	return int(_dispatch_count.get(int(fid), 0))
+
+## G-FS-CHURN gate telemetry: finished worker tiles thrown away (never committed) because `_want` moved mid-build.
+func discarded_count() -> int:
+	return _discarded
+
+## REVISION 3 G-FS-QUIESCE telemetry: request() calls that actually rebuilt `_want`/`_snap_plan` (i.e. did NOT hit the
+## FP_SMOOTH_IDLE unchanged-`_want` early-out). Stays flat while the driver is settled.
+func request_rebuild_count() -> int:
+	return _request_rebuild_count
+
+## REVISION 3 G-FS-QUIESCE telemetry / Q1 introspection: is step() currently latched settled (FP_SMOOTH_IDLE)?
+func is_settled() -> bool:
+	return _settled
+
+## REVISION 3 T1 gate introspection (G-FS-NOHOLE strengthened): a COPY of the 4 per-tier `_committed_fids`
+## dictionaries (fid -> true), i.e. exactly what's baked into each tier's CURRENTLY assigned mi.mesh right now —
+## maintained at every actual mesh commit (both the legacy `_rebuild_tier_mesh` and the T1 `_apply_tier_mesh` path).
+## A gate sums, per fid, how many of these 4 dicts contain it: 0 = a hole (drawn nowhere), >=2 = a z-fight (drawn by
+## two different-pitch tier surfaces at once) — `_tiles`/`is_resident()` alone can't see either, since residency
+## flips atomically on main and was never the bug; the DRAWN MESH lagging it across frames was (R3.2.a).
+func committed_fids_snapshot() -> Array:
+	var out := []
+	for t in [S2, S3, S4, S5]:
+		out.append((_committed_fids[t] as Dictionary).duplicate())
+	return out
+
+## G-FS-TXN-THREAD telemetry: `_rebuild_tier_mesh` (MAIN-thread concat) calls so far.
+func main_concat_count() -> int:
+	return _main_concat_count
+
+## G-FS-TXN-THREAD telemetry: `_concat_tier_worker` (off-thread concat) calls so far.
+func worker_concat_count() -> int:
+	return _worker_concat_count
+
+## G-FS-NOHOLE telemetry: atomic (possibly multi-tier) `_step_tier_txn` applies committed so far.
+func txn_apply_count() -> int:
+	return _txn_apply_count

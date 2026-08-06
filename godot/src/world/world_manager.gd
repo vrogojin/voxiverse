@@ -383,6 +383,12 @@ func _ready() -> void:
 			_block_lod.set_job_lane(_job_lane)
 			_block_lod.setup(TerrainConfig.active_facet())
 			_block_lod.place(_facet_ring.transform)
+			# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 LAW R-E: wire the code-level arbitration so the L1
+			# megablock ring never renders a facet the smooth tier already draws — a code invariant, never a
+			# deploy-sed convention. Only wired when FP_FAR_SMOOTH is actually on (else the Callable stays unset
+			# ⇒ `_smooth_owns` short-circuits false everywhere ⇒ byte-identical).
+			if CubeSphere.FP_FAR_SMOOTH:
+				_block_lod.set_smooth_query(Callable(_facet_ring, "is_smooth_resident"))
 			# COSMOS BLOCK-LOD P2 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4/§5): the L2..L4 streamed ladder + the L5 GLOBAL
 			# always-resident tier — blocky relief to the horizon with a power-of-2 fall-off. Both gated + default OFF ⇒
 			# byte-identical. The ladder governs the SHARED NEVER-OOM ceiling (P1 L1 + L2..L4 + global mesh coarsened
@@ -404,6 +410,9 @@ func _ready() -> void:
 					_block_lod_ladder.set_global(_block_lod_global)
 				_block_lod_ladder.setup(TerrainConfig.active_facet())
 				_block_lod_ladder.place(_facet_ring.transform)
+				# REVISION 2 LAW R-E: same code-level arbitration for the L2..L4 ladder tiers.
+				if CubeSphere.FP_FAR_SMOOTH:
+					_block_lod_ladder.set_smooth_query(Callable(_facet_ring, "is_smooth_resident"))
 			# COSMOS PLANET-LOD-CONFIG P0 (docs/COSMOS-PLANET-LOD-CONFIG-DESIGN.md §2): the crisp orbit megablock
 			# disc — above the swap altitude it meshes the whole visible disc as an L4-nadir→L5-limb distance ladder
 			# and retires the smooth §2V skin. Gated + default OFF ⇒ byte-identical (node never created). Placed each
@@ -1118,6 +1127,18 @@ func update_streaming(player_pos: Vector3) -> void:
 	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
 	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
 		_facet_ring.set_cover_query(cover_query)
+	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): feed the frozen player-column snapshot (ABSOLUTE
+	# world coords, the far ring's own frame) so the S2 near-collar disc is centred on the ACTUAL player, not the
+	# active facet centre. `player_pos` is in the active facet's LATTICE frame (same convention `_radial_altitude_
+	# lattice` already converts) — mirror that conversion here. No-op / byte-identical unless FP_SMOOTH_RIM.
+	# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4: FP_FARRING_UNCOVERED_TRUE's per-vertex un-sink coverage law needs this
+	# SAME ABSOLUTE column too (it is exactly the S2 rim disc's own centre) — pushed unconditionally alongside
+	# FP_SMOOTH_RIM rather than adding a second plumbing path. Off (both flags) ⇒ byte-identical (never called).
+	if (CubeSphere.FP_SMOOTH_RIM or CubeSphere.FP_FARRING_UNCOVERED_TRUE) and _facet_ring != null and _facet_ring.has_method("set_player_column"):
+		var _rim_afid := TerrainConfig.active_facet()
+		if _rim_afid >= 0:
+			var _rim_w := FacetAtlas.lattice_to_world64(_rim_afid, player_pos.x, player_pos.y, player_pos.z)
+			_facet_ring.set_player_column(Vector3(_rim_w[0], _rim_w[1], _rim_w[2]))
 	# COSMOS BLOCK-LOD P1: keep the L1 rim ring in the far ring's frame (its mesh is absolute planet coords, placed by
 	# the SAME node transform so L1 and the far skin overlap exactly). No-op / byte-identical unless FP_BLOCK_LOD.
 	if _block_lod != null and _facet_ring != null:
@@ -3031,6 +3052,13 @@ func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 		_block_lod_global.set_sun_dir(sun_dir)
 	if _block_lod_orbit != null:
 		_block_lod_orbit.set_sun_dir(sun_dir)
+
+## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): forward the current Sun direction to the smooth-v2
+## annulus's own material. No-op with no faceted ring / no smooth-v2 instance (the ring setter self-guards) ⇒
+## byte-identical.
+func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_smooth_v2_sun_dir(sun_dir)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

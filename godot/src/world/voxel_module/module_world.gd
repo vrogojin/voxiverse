@@ -2885,7 +2885,13 @@ func attach_viewer(player: Node3D) -> void:
 	_viewer = ClassDB.instantiate("VoxelViewer") as Node
 	if _viewer == null:
 		return
-	_set_if(_viewer, "view_distance", TerrainConfig.near_render_radius())
+	# COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4 — pull (r, O, H) from TerrainConfig's ONE shared derivation site so
+	# this viewer and the far ring's per-vertex un-sink coverage law (FP_FARRING_UNCOVERED_TRUE) can never
+	# disagree about what the near voxel field streams. VALUE-IDENTICAL to the pre-refactor inline computation
+	# below (same consts, same helpers, just fetched through one Vector3 instead of three separate calls).
+	var params := TerrainConfig.streamed_ellipsoid_params()
+	var r := params.x
+	_set_if(_viewer, "view_distance", int(r))
 	# A2 UNDERGROUND DOWNWARD-REACH CLAMP. VoxelViewer has NO asymmetric up/down extent — only a single
 	# view_distance_vertical_ratio, a SYMMETRIC world-Y ellipsoid centred on the viewer node. To keep the
 	# full UPWARD reach (mountains) while trimming the DOWNWARD reach to a modest band, offset the viewer
@@ -2894,7 +2900,7 @@ func attach_viewer(player: Node3D) -> void:
 	# +O in world. FACETED-gated + toggle-gated so the FLAT world keeps its byte-identical symmetric slab.
 	var use_clamp := CubeSphere.FACETED and TerrainConfig.DOWNWARD_REACH_CLAMP_ENABLED
 	if use_clamp:
-		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.clamped_viewer_vertical_ratio())
+		_set_if(_viewer, "view_distance_vertical_ratio", (params.z / r) if r > 0.0 else TerrainConfig.VIEWER_VERTICAL_RATIO)
 	else:
 		# Un-clamped vertical stream ratio (byte-identical to the pre-A2 viewer).
 		_set_if(_viewer, "view_distance_vertical_ratio", TerrainConfig.VIEWER_VERTICAL_RATIO)
@@ -2902,7 +2908,7 @@ func attach_viewer(player: Node3D) -> void:
 	player.add_child(_viewer)
 	if use_clamp:
 		# LOCAL offset (child of the player) → radial +O on the active facet; unaffected by yaw.
-		(_viewer as Node3D).position = Vector3(0.0, TerrainConfig.clamped_viewer_offset_y(), 0.0)
+		(_viewer as Node3D).position = Vector3(0.0, params.y, 0.0)
 
 ## True once every mesh block intersecting the axis-aligned box of half-extents `half` around world
 ## point `center` has been MESHED (its surface applied to the scene, so it renders next frame). Used by

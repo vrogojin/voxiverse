@@ -91,6 +91,12 @@ var _cu_facet := PackedVector2Array() # layer -> (a,b) reverse map for the shade
 var _cu_free: Array = []             # currently free layer indices (LRU reuse pool)
 var _cu_want: Dictionary = {}        # fid -> cos(angle to emit axis): facets currently inside the promotion cap
 var _cu_want_axis: Array = [2.0, 0.0, 0.0]  # emit axis the want-set was last computed for (>1 sentinel ⇒ force first)
+# REVISION 3 Q1 (FP_SMOOTH_IDLE, docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R3.1.c/R3.4): `_recompute_want_sse` had NO
+# hold gate at all (unlike the angular `_recompute_want`'s axis-hold at :835) — it rescanned + sorted all 3456 facets
+# every single update, even sitting still. `_cu_want_cam_dist` pairs with `_cu_want_axis` for the axis+cam_dist hold
+# below. -1 sentinel ⇒ force the first real compute (mirrors `_cu_want_axis`'s >1 sentinel).
+var _cu_want_cam_dist := -1.0
+var _recompute_want_count := 0       # REVISION 3 G-FS-QUIESCE telemetry: _recompute_want_sse calls that did REAL work (not the hold-gate early return)
 var _cu_bake_fid := -1               # facet whose 128² bake is in progress (row-sliced across frames); -1 = idle
 var _cu_bake_layer := -1             # the layer that in-progress bake will occupy
 var _cu_bake_row := 0                # next fine row to sample for the in-progress bake (0..CLOSEUP_TEXELS)
@@ -124,6 +130,12 @@ var _bm_n := PackedVector2Array()      # layer -> (Nx,Ny) block-count reverse ma
 var _bm_free: Array = []             # free layer indices (reuse pool)
 var _bm_want: Dictionary = {}        # fid -> true: the current band set (active ∪ ring-1, capped to BAND_LAYERS)
 var _bm_want_active := -1            # the active fid the want-set was last computed for (skip the recompute when unchanged)
+# REVISION 3 Q1 (FP_SMOOTH_IDLE): the SAME axis+cam_dist hold gate as `_cu_want_axis`/`_cu_want_cam_dist` above, for
+# the band SSE want (`_recompute_band_want_sse`) — it had no hold at all either (a second unconditional 3456-facet
+# rescan+sort every update).
+var _bm_want_axis: Array = [2.0, 0.0, 0.0]
+var _bm_want_cam_dist := -1.0
+var _recompute_band_want_count := 0  # REVISION 3 G-FS-QUIESCE telemetry: _recompute_band_want_sse calls that did REAL work
 var _bm_bake_fid := -1              # facet whose band bake is in progress (row-sliced across frames); -1 = idle
 var _bm_bake_layer := -1           # the layer that in-progress bake will occupy
 var _bm_bake_row := 0              # next block row (by) to sample for the in-progress bake (0..Ny)
@@ -860,10 +872,24 @@ func _recompute_want(axis: Array) -> void:
 ## HYSTERESIS: a facet already RESIDENT is held to the wider CLOSEUP_FAR·SSE_HYST release distance, so one the player is
 ## approaching never churns at the boundary. NO regime gate, NO evict-all → as cam_dist shrinks the want only GROWS toward
 ## the camera and the nearest (nadir) facet is never the LRU victim ⇒ its resolved tier is monotone non-decreasing.
-func _recompute_want_sse(axis: Array, cam_dist: float) -> void:
+func _recompute_want_sse(axis: Array, cam_dist: float, idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
 	if ax * ax + ay * ay + az * az < 0.5:
 		return                                  # degenerate axis (camera at centre) — hold the last want-set
+	# REVISION 3 Q1 (FP_SMOOTH_IDLE): mirror `_recompute_want`'s axis-hold gate (:835) — this SSE path scanned + sorted
+	# ALL 3456 facets every update with NO hold whatsoever (the biggest at-rest churn source after the shell re-emit
+	# itself, docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R3.1.c). Skip the rescan when the axis hasn't swept past a
+	# tight fraction of the facet half-angle AND cam_dist hasn't moved half a facet's width. Off ⇒ the shipped
+	# unconditional rescan below.
+	if idle_on and not _cu_want.is_empty():
+		var facet_ang := (PI * 0.5) / float(_k)
+		var hold_cos := cos(0.25 * facet_ang)
+		var axis_held: bool = _cu_want_axis[0] * ax + _cu_want_axis[1] * ay + _cu_want_axis[2] * az >= hold_cos
+		var half_width := FacetAtlas.R_BLOCKS * facet_ang * 0.5
+		var dist_held := absf(cam_dist - _cu_want_cam_dist) < half_width
+		if axis_held and dist_held:
+			return
+	_recompute_want_count += 1   # REVISION 3 G-FS-QUIESCE telemetry: a real (non-held) want recompute
 	var r := FacetAtlas.R_BLOCKS
 	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
 	var promote := CubeSphere.CLOSEUP_FAR
@@ -897,6 +923,7 @@ func _recompute_want_sse(axis: Array, cam_dist: float) -> void:
 		_cu_bake_fid = -1; _cu_bake_layer = -1; _cu_bake_img = null
 	_cu_want = want
 	_cu_want_axis = [ax, ay, az]
+	_cu_want_cam_dist = cam_dist
 
 ## Bake promoted-but-not-resident facets (nearest the axis first), ROW-SLICED, until the budget line. Continues an
 ## in-progress facet across updates. A facet needs a free/evictable layer to start; if all layers are in-cap
@@ -1114,11 +1141,22 @@ func _recompute_band_want(active_fid: int) -> void:
 ## SMALLEST distance so it always wins a band slot (no special-case floor needed); at orbit its blocks are < 2 px so it
 ## stays base. HYSTERESIS via CLOSEUP_NEAR·SSE_HYST for residents; evict-only-when-farther (never the nearest/nadir facet)
 ## ⇒ as cam_dist shrinks the nadir facet's band residency is monotone. `active_fid` only tie-breaks the bake order.
-func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> void:
+func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float, idle_on := CubeSphere.FP_SMOOTH_IDLE) -> void:
 	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
 	if ax * ax + ay * ay + az * az < 0.5:
 		_recompute_band_want(active_fid)        # degenerate axis — fall back to the ring residency (safe)
 		return
+	# REVISION 3 Q1 (FP_SMOOTH_IDLE): the SAME axis+cam_dist hold gate as `_recompute_want_sse` above — this band path
+	# also scanned + sorted all 3456 facets every update with no hold. Off ⇒ the shipped unconditional rescan below.
+	if idle_on and not _bm_want.is_empty():
+		var facet_ang := (PI * 0.5) / float(_k)
+		var hold_cos := cos(0.25 * facet_ang)
+		var axis_held: bool = _bm_want_axis[0] * ax + _bm_want_axis[1] * ay + _bm_want_axis[2] * az >= hold_cos
+		var half_width := FacetAtlas.R_BLOCKS * facet_ang * 0.5
+		var dist_held := absf(cam_dist - _bm_want_cam_dist) < half_width
+		if axis_held and dist_held:
+			return
+	_recompute_band_want_count += 1   # REVISION 3 G-FS-QUIESCE telemetry: a real (non-held) band want recompute
 	var r := FacetAtlas.R_BLOCKS
 	var camx := ax * cam_dist; var camy := ay * cam_dist; var camz := az * cam_dist
 	# FP_SKIN_FLATCOLOR wants the per-block map out to the visible disc (up to BAND_LAYERS nearest); the shipped
@@ -1156,6 +1194,8 @@ func _recompute_band_want_sse(active_fid: int, axis: Array, cam_dist: float) -> 
 		_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
 	_bm_want = want
 	_bm_want_active = active_fid
+	_bm_want_axis = [ax, ay, az]
+	_bm_want_cam_dist = cam_dist
 
 ## Bake band-but-not-resident facets (active first, then ring order), ROW-SLICED, until the budget line. Continues an
 ## in-progress facet across updates. A facet needs a free layer to start; if none is free (all in-ring residents) it is
@@ -1487,6 +1527,15 @@ func closeup_facet_map() -> PackedVector2Array:
 func slots_epoch() -> int:
 	return _slots_epoch
 
+## REVISION 3 G-FS-QUIESCE telemetry: _recompute_want_sse calls that did REAL work (not the FP_SMOOTH_IDLE hold-gate
+## early return). Stays flat at rest once the axis+cam_dist hold gate is satisfied.
+func recompute_want_count() -> int:
+	return _recompute_want_count
+
+## REVISION 3 G-FS-QUIESCE telemetry: the band-SSE counterpart of recompute_want_count() above.
+func recompute_band_want_count() -> int:
+	return _recompute_band_want_count
+
 func closeup_resident_count() -> int:
 	return _cu_slots.size()
 
@@ -1715,7 +1764,10 @@ func _next_band_parallel() -> int:
 
 ## MAIN per-frame: reap finished parallel band slots (commit → resident) then dispatch idle slots. Called from update()
 ## when _pbm_on. The residency want (_bm_want) is refreshed by the SSE recompute on main before this.
-func _update_band_parallel(emit_axis: Array = []) -> void:
+## REVISION 5 Stage C: `fine_pause_on` overrides FP_FINE_BAKE_SURFACE_PAUSE (gate-forcing convention) so a headless
+## gate can prove the on-surface dispatch pause / off-surface resume without a compile-time sed. The real caller
+## (`update()`) passes no override ⇒ the compile const governs (byte-identical).
+func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE) -> void:
 	# NEW-TASK slot cap (the REAP below always scans all _pbm_n so orbit-dispatched bakes still commit after we descend):
 	# only the parallel C++ tile bake OFF-SURFACE uses all _pbm_n slots — that's where the near-field gen is frozen so the
 	# cores are free AND where the whole-planet fill latency matters. On the surface the far skin is close-up sugar over a
@@ -1781,28 +1833,38 @@ func _update_band_parallel(emit_axis: Array = []) -> void:
 			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
 	if _fm_on:
-		for i in range(active):
-			if int(_pbm_fid[i]) >= 0:
-				continue
-			var ff := _next_fine_fid(emit_axis)
-			if ff < 0:
-				break
-			var flc := PackedVector2Array()
-			flc.resize(4)
-			for ci in range(4):
-				var w := FacetAtlas.facet_planar_corner(ff, ci)
-				var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
-				flc[ci] = Vector2(float(l[0]), float(l[2]))
-			_pbm_fid[i] = ff
-			_pbm_mode[i] = 1
-			_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
-			_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
-			_pbm_layer[i] = -1
-			_pbm_lc[i] = flc
-			_pbm_nx[i] = _fm_texels
-			_pbm_ny[i] = _fm_texels
-			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
-		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads)
+		# REVISION 5 Stage C (FP_FINE_BAKE_SURFACE_PAUSE): do NOT dispatch NEW fine-tier tasks while ON-SURFACE — band/
+		# skin/smooth already cover everything in view there at higher fidelity, and on-surface forces the slow per-
+		# texel GDScript path below (`_pbm_cpp`/`_pbm_tile` are both `_offsurface`-gated) — 4096 samples/facet across
+		# up to 3456 facets, the perpetual `pbm_busy 1` + a WASM-allocator-convoy suspect. Off ⇒ dispatch unconditional
+		# (shipped, byte-identical). The REAP above (which scans ALL `_pbm_n` slots unconditionally) still drains any
+		# already-in-flight task regardless of this gate — an off-surface-dispatched bake still commits after landing
+		# back on the ground — and the upload-throttle below still flushes any already-baked dirty page; only the NEW
+		# task dispatch is paused.
+		if not fine_pause_on or _offsurface:
+			for i in range(active):
+				if int(_pbm_fid[i]) >= 0:
+					continue
+				var ff := _next_fine_fid(emit_axis)
+				if ff < 0:
+					break
+				var flc := PackedVector2Array()
+				flc.resize(4)
+				for ci in range(4):
+					var w := FacetAtlas.facet_planar_corner(ff, ci)
+					var l := FacetAtlas.world_to_lattice64(ff, w[0], w[1], w[2])
+					flc[ci] = Vector2(float(l[0]), float(l[2]))
+				_pbm_fid[i] = ff
+				_pbm_mode[i] = 1
+				_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
+				_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
+				_pbm_layer[i] = -1
+				_pbm_lc[i] = flc
+				_pbm_nx[i] = _fm_texels
+				_pbm_ny[i] = _fm_texels
+				_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
+		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads).
+		# Unconditional: flushes whatever is already baked even while the dispatch above is paused.
 		_fm_upload_cd -= 1
 		if _fm_upload_cd <= 0 and not _fm_dirty.is_empty():
 			var lyr := int(_fm_dirty.keys()[0])
@@ -2001,6 +2063,13 @@ func tex_telemetry() -> Dictionary:
 		"cu_epoch": _slots_epoch,
 		"shot_on": _shot_on,
 		"shot_baked": _shot_baked.size(),
+
+		# REVISION 5 Stage C: the FP_PLANET_MAP fine-tier sweep had NO telemetry at all (the blind spot that let the
+		# perpetual on-surface bake hide). fm_baked = facets actually fine-baked; fm_want = total facets wanted (the
+		# whole planet, `_base_all`, once `_fm_on`); fm_dirty = sub-pages awaiting their throttled GPU upload.
+		"fm_baked": _fine_baked.size(),
+		"fm_want": _base_all if _fm_on else 0,
+		"fm_dirty": _fm_dirty.size(),
 	}
 
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under

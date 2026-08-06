@@ -664,6 +664,17 @@ static func band_bytes_max() -> int:
 ## (byte-off unaffected). Belt-and-suspenders: the shader also falls an un-baked/evicted band texel to fine (F1 ii/iii).
 const BAND_PROMOTE_DIST := 1500.0
 
+## FP_CPP_SMOOTH_BAKE — the smooth-tile HEIGHTS (per-node dir/g/biome/temp + boundary normals) come from ONE native
+## VoxelGeneratorCosmos.bake_smooth_tile() call per tile instead of the per-node GDScript FarDensity.node_at →
+## TerrainConfig.profile_at_dir chain (~2700 worldgen samples/tile). REVISION 6 (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md):
+## the GDScript per-node profile sample + Dictionary alloc is what CONVOYS the WASM dlmalloc lock with the main thread
+## during warmup (the SAME wall FP_CPPGEN / FP_CPP_TILE_BAKE cleared for the near-gen + far-skin). Byte-equal to node_at
+## by construction (f64 bilerp+normalize → the already-byte-equal C++ profile_at_dir → identical g/relief/pos term order;
+## Vector3 real_t boundary_normal mirror). Requires FP_FAR_SMOOTH + the engine rebuild (patch 0012). Off ⇒ the GDScript
+## node_at loop; if the engine lacks bake_smooth_tile the dispatch falls through to GDScript. Gate: verify_far_smooth
+## G-CSB-EQ. Bake ON at export alongside the smooth stack.
+const FP_CPP_SMOOTH_BAKE := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted
@@ -674,6 +685,22 @@ const FP_FAR_SMOOTH := false
 ## FP_FAR_SMOOTH_OVERHANG — the edit-cluster occupancy patches (dug arches/overhangs via FarDensity.occ_at). Requires
 ## FP_FAR_SMOOTH. Item B4 — the designated cut if the night runs short. Default false.
 const FP_FAR_SMOOTH_OVERHANG := false
+## FP_SMOOTH_NORMAL_LIT — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P2: relief LIGHTING for the smooth far tiles.
+## Requires FP_FAR_SMOOTH (no smooth tile exists to light otherwise). The shipped shell shades every vertex with the
+## exact planet-RADIAL normal n = normalize(wp − centre) — continuous and seam-free, but relief-BLIND (a mountain
+## flank facing away from the Sun shades identically to flat ground at the same latitude). Under this flag the
+## SMOOTH-TILE fragments shade with their OWN interpolated vertex NORMAL instead (P0's canon-welded
+## FarDensity.boundary_normal + facet_smooth_tier.gd's per-vertex relief-gradient interior stencil — already proven
+## seam-continuous across facet borders, G-FS-NRM-CONT) fed through the SAME VoxiLight.SHADE_GLSL/voxi_shade law
+## (FP_SHADE_UNIFIED) — so sunlit slopes brighten and lee slopes darken and the S-tier relief actually reads as
+## mountains from orbit. The shipped SHELL keeps the radial normal untouched: shell and smooth tiles share ONE
+## ShaderMaterial (facet_smooth_tier.gd "comes for free" reuse), so the discriminator is per-vertex, not per-material
+## — the vertex COLOR ALPHA channel (unread by every existing consumer of COLOR in this shader family — only `.rgb`
+## is ever taken): FacetSmoothTier.build_tile stamps alpha=0 on its own vertices only under this flag; the shell's
+## vertex colour (FarPalette.color_for) stays unconditionally alpha=1. Off ⇒ the marker is never stamped and the
+## shader anchor is left untouched (String.replace of the radial-normal line is a no-op splice) — byte-identical
+## (FLAT 6042/0). Gate: verify_far_smooth.gd (G-FS-LIT-*).
+const FP_SMOOTH_NORMAL_LIT := false
 ## Smooth tier ladder (§2.4): cells-per-facet-edge per tier. Facet edge ≈ 417 blocks (K=24) ⇒ ~4/8/16/32-block pitch.
 const SMOOTH_S2_CELLS := 104
 const SMOOTH_S3_CELLS := 52
@@ -688,6 +715,496 @@ const SMOOTH_S5_MAX := 200
 const SMOOTH_SKIRT_BLOCKS := 4.0            # always-on radial skirt along every facet-tile border (§2.4 crack backstop)
 const SMOOTH_BYTES_MAX := 96 * 1024 * 1024  # smooth mesh cache ceiling (worst ≈ 40MB + edit-patch headroom) — fixed
 const SMOOTH_BUILD_SLOTS := 8               # WorkerThreadPool tiles in flight (B2/B3 driver) — cores−1 ≤ 8
+
+## FP_SMOOTH_RIM — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3: the S2 NEAR-COLLAR, the near↔far SEAM KILL. Requires
+## FP_FAR_SMOOTH (no S2 tier exists to assign otherwise). Today the visible NEAR↔FAR transition is blocky voxels →
+## the FP_FARRING_FULL_COVER dense sunk backstop (BACKSTOP_CELLS=16, ~26-block cells): a resolution+sink discontinuity
+## (§1.6 — "the dip becomes sub-block-scale" only once the far surface samples at S2's ~4-block pitch). This flag
+## assigns the S2 tier (SMOOTH_S2_CELLS=104, SMOOTH_S2_MAX=9 cap) to the active ∪ live-pool ("backstop-role") facets,
+## built with the §2.1 envelope-inside-disc + feather + ε-sink law (`FacetSmoothTier.build_tile_rim`): every vertex
+## inside R_env (near view distance + RIM_STREAM_MARGIN) sits at the min-envelope height − ε (never protrudes through
+## the near blocky terrain — the same `_env_weld_grid`/`_env_corner_min` no-protrusion law the backstop already
+## proves), blending to the TRUE relief height across a RIM_FEATHER_BLOCKS feather band, reading as ordinary S2
+## far-relief beyond it. The shared law-6 emit-exclusion (`visible_fids()`) already gives MAKE-BEFORE-BREAK for free:
+## a backstop-role facet keeps drawing its sunk `_bpos_cache` quad (unmodified) until the frame its S2 tile actually
+## COMMITS into `_smooth`'s resident set, at which point `visible_fids()` drops it from the backstop emit exactly as
+## it already does for S3-S5 (never a frame with neither). Sticky ring-1 facets (in `_sticky` but not live pool) are
+## NOT S2-assigned — they stay on the shipped S3 ladder path. Default false ⇒ `_rim_assign` is never called and no S2
+## tile is ever requested for a backstop-role facet — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd
+## (G-RIM-ENV/WELD/MBB). YELLOW stage — §7.1 perf-risk fallback ladder (ENV_FINE_MULT step-down, incremental rebuild,
+## BACKSTOP_CELLS 16→32) applies if the S2 envelope bake can't keep up with a walking player on a 2-core browser.
+const FP_SMOOTH_RIM := false
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 2 — the live-failure fix flags (re-added after a deploy-checkout
+## wiped the uncommitted originals; commit BEFORE deploying). All default false → byte-off.
+## FP_SMOOTH_STICKY (R-A): residency = pure hop-ring function of the active facet, changes ONLY at facet crossings,
+##   never on camera/heading turns; dwell-held on fall-out. Kills the camera-coupled flicker.
+const FP_SMOOTH_STICKY := false
+## FP_SMOOTH_MESH_INC (R-B): mesh-level make-before-break — build the new tier tile then swap; a facet leaving smooth
+##   stays drawn until the shell re-emit COMMITS its replacement. No 1-frame hole / see-through-to-sunk-backstop.
+const FP_SMOOTH_MESH_INC := false
+## FP_SMOOTH_SKIN_SLOT (R-C): smooth tiles carry the shell's _slot_of band-skin UV2 slot instead of the hard-coded
+##   (face,-1) that dropped them to the grey 6-face base map. Kills the grey lump.
+const FP_SMOOTH_SKIN_SLOT := false
+## R-A hop-ring bands (S3/S4/S5 by BFS hop-distance from the active facet) + the fall-out dwell hold (ms).
+const SMOOTH_STICKY_S3_HOP := 2
+const SMOOTH_STICKY_S4_HOP := 5
+const SMOOTH_STICKY_S5_HOP := 10
+const SMOOTH_STICKY_DWELL_MS := 5000
+
+## FP_SMOOTH_HORIZON_COVER — REVISION 7-VISUAL §R7.3 (DEFECT 2): the "ugly low-res patch" is the flat far SKIN
+## (~6 blk/texel, zero relief) drawn at facets OUTSIDE the smooth-resident set that sit INSIDE the surface-alt
+## horizon — jarring next to relieved smooth tiles (and FP_FINE_BAKE_SURFACE_PAUSE freezes that skin at its coarse
+## mip on-surface, maximally ugly). `smooth_res` is steady-state PINNED (≈182), i.e. a reach gap, not a warmup
+## transient. The fix extends the S5 band so the smooth frontier lies BEYOND the surface horizon: hop 10→13 +
+## SMOOTH_S5_MAX 200→360 (S5 tile ≈ 8.6 KB ⇒ +~1.4 MB, inside the SMOOTH_BYTES_MAX 96 MB ledger which still caps
+## real bytes ⇒ NEVER-OOM). Skin at ORBIT range stays (foreshortens at the limb; fine bake resumes off-surface).
+## Default false ⇒ smooth_s5_max()/smooth_s5_hop() return the shipped 200/10 ⇒ byte-identical. Gate G-SMOOTH-HORIZON.
+const FP_SMOOTH_HORIZON_COVER := false
+## REV7-VISUAL "push smooth relief much further out" (user directive after the smooth↔block-LOD frontier was
+## identified — issue #28): extend the smooth reach so the coarse block-LOD tier is pushed toward the limb / out of
+## normal view. S5 (coarse frontier) hop 10→20 + cap 200→600, AND S4 (finer) cap 64→130 so the pushed-out region
+## isn't only the coarsest tier. Bounded by SMOOTH_BYTES_MAX (96 MB ledger caps real bytes ⇒ NEVER-OOM); worst-case
+## ≈ 25·S3 + 130·S4 + 600·S5 tiles ≈ ~24 MB, well under the ceiling. Off ⇒ shipped 200/10/64 (byte-off).
+const SMOOTH_S5_MAX_HORIZON := 600        ## S5 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S5_MAX=200)
+const SMOOTH_STICKY_S5_HOP_HORIZON := 20  ## S5 hop-ring reach when FP_SMOOTH_HORIZON_COVER (else SMOOTH_STICKY_S5_HOP=10)
+const SMOOTH_S4_MAX_HORIZON := 130        ## S4 residency cap when FP_SMOOTH_HORIZON_COVER (else SMOOTH_S4_MAX=64)
+## Effective S4/S5 residency caps / hop reach — flag-gated so the OFF path is the shipped const verbatim (byte-off).
+static func smooth_s5_max() -> int:
+	return SMOOTH_S5_MAX_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_S5_MAX
+static func smooth_s4_max() -> int:
+	return SMOOTH_S4_MAX_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_S4_MAX
+static func smooth_s5_hop() -> int:
+	return SMOOTH_STICKY_S5_HOP_HORIZON if FP_SMOOTH_HORIZON_COVER else SMOOTH_STICKY_S5_HOP
+
+## docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 (2026-08-03, Fable) — cheap, immediate laws Q1 + T2. REV2
+## stabilized WHO is resident (`smooth_res` constant at rest) but left the DRIVER running unconditional per-frame O(res)
+## work (churn at rest, R3.1.c) and a commit-generation handshake race that can premature-evict a leaving facet before
+## the shell has actually proven the re-inclusion (a hole, R3.2.b). Both fixed here; T1 (off-thread tier-mesh assembly)
+## and Q2 (slot-indirection, kills the mesh-baked-skin staleness R3.1.d) are LATER stages, not this flag pair.
+## FP_SMOOTH_IDLE (LAW Q, R3.4 Q1): the smooth driver reaches a fixpoint at rest. `_smooth_drive` hashes a cheap
+##   (active_fid, excluded-set) signature and reuses last frame's fully-merged assignment — skipping the hop-ring
+##   dwell scan, `_mesh_inc_gate`, the R-C per-facet slot loop, and `FacetSmoothTier.request()`'s `_want`/`_snap_plan`
+##   rebuild — whenever the signature repeats AND no leaving/dwell handshake is outstanding (those always force a
+##   re-check so the timed state still resolves). `request()` ALSO independently no-ops when the requested set is
+##   bit-identical to what's already committed (defence in depth). `FacetSmoothTier.step()` carries its own `_settled`
+##   latch (reap + dispatch + dirty tier all empty ⇒ skip the O(_sn) reap scan / O(res) `_next_want` scan / O(4) dirty
+##   loop entirely), cleared by any real request change, eviction, or `request_refresh`. The S2 near-collar's staggered
+##   rebake keeps its OWN independent ≥1-block player-drift gate (real movement must still reach it even while
+##   active_fid/excluded hold). `_recompute_want_sse`/`_recompute_band_want_sse` (facet_tex_baker.gd) get the SAME
+##   axis-hold gate the angular `_recompute_want` already has (:835) — the SSE path scanned + sorted all 3456 facets
+##   every update with no hold at all; now held while axis ≥ hold_cos AND |Δcam_dist| < half a facet width. Off ⇒
+##   every driver/baker/tier function takes its shipped unconditional-work path (byte-identical, FLAT 6042/0).
+const FP_SMOOTH_IDLE := false
+## FP_SHELL_SNAP_GEN (LAW T handshake fix, R3.4 T2): `_shell_gen` (REVISION 2 LAW R-B) bumps on EVERY shell mesh
+##   commit, including a commit whose `visible_fids()` exclusion snapshot was taken BEFORE a facet was marked leaving
+##   — a mesh that EXCLUDES the facet "proves" nothing about its re-inclusion, yet the shipped `_shell_gen <= mark`
+##   check treats any later commit as sufficient proof → premature evict → a hole until the NEXT re-emit actually
+##   lands. This flag bumps a separate `_snap_gen` at the exact instant `visible_fids()` is snapshotted for a build
+##   (`_dispatch_async_rebuild` / `_rebuild_full`) and records the snap-gen each COMMITTED build actually used
+##   (`_last_committed_snap_gen`). `_mesh_inc_gate` marks a newly-leaving facet with `_snap_gen + 1` — the earliest
+##   snapshot generation that can possibly include the re-inclusion — and drops it only once
+##   `_last_committed_snap_gen >= mark`, so a stale in-flight build (dispatched before the mark) can never satisfy the
+##   drop test even though it still bumps `_shell_gen` on commit. Off ⇒ `_snap_gen`/`_last_committed_snap_gen` stay
+##   unused and `_mesh_inc_gate` runs the shipped `_shell_gen`-at-mark law verbatim (byte-identical).
+const FP_SHELL_SNAP_GEN := false
+## FP_SMOOTH_TXN (LAW T, R3.4 T1): transactional tier-mesh commits. The shipped `FacetSmoothTier.step()` dirties
+##   BOTH tier meshes of a tier-change commit in the SAME call (`request`/reap-commit) but rebuilds AT MOST ONE dirty
+##   tier per call, in fixed order [S2,S3,S4,S5] (`facet_smooth_tier.gd` step()'s tail loop) — a demote's OLD (lower-
+##   index) tier rebuilds first, dropping the facet from a drawn mesh ≥1 frame before its NEW tier gains it (a hole
+##   straight through to the sunk backstop); a promote's NEW (lower-index) tier rebuilds first, ADDING the facet
+##   ≥1 frame before its OLD tier loses it (two different-pitch surfaces drawn at once — z-fight). This flag moves the
+##   per-element index-append concatenation (`_rebuild_tier_mesh`'s O(tier resident count) main-thread loop) onto a
+##   WorkerThreadPool task per dirty tier (`_concat_tier_worker`, mirrors the `_build_worker`/`_s_result` single-writer
+##   discipline) and batches every tier dirtied by the SAME commit event into ONE transaction (`_step_tier_txn`):
+##   the OLD `mi.mesh` for every tier in the transaction is left untouched until ALL of that transaction's worker tasks
+##   have finished, then every affected `mi.mesh` is reassigned in the SAME `step()` call — never a call that swaps
+##   only some of a transaction's tiers. A tier re-dirtied while its transaction's job is still in flight (an unrelated
+##   build lands on the same tier mid-flight) is detected via `_tier_change_seq`/`_tier_dispatch_seq` and re-queued into
+##   the NEXT transaction rather than silently accepted stale. Off ⇒ `step()` takes the shipped ≤1-tier/frame main-
+##   thread `_rebuild_tier_mesh` path verbatim (byte-identical, FLAT 6042/0). Gate: verify_far_smooth.gd (G-FS-NOHOLE
+##   strengthened, G-FS-TXN-THREAD). NEVER-OOM: the in-flight per-tier concat buffer duplicates at most that tier's
+##   ALREADY-resident bytes (already bounded under `SMOOTH_BYTES_MAX`) — freed the instant `_apply_tier_mesh` assigns
+##   it, never a new high-water mark.
+const FP_SMOOTH_TXN := false
+
+## FP_SLOT_INDIRECT (LAW S, R3.4 Q2): kill mesh-baked band/close-up skin slots. Today the shell AND the smooth tiles
+##   bake `_slot_of(fid)` (the current band/close-up UV2.y payload) directly into VERTEX data at build time — so every
+##   time the baker's slot map moves (a close-up promotion/eviction, a band commit) the ONLY way to get the new value
+##   onto the mesh is a full re-emit: `set_closeup_slots`/`set_band_slots` unconditionally set `_pending = true`
+##   (`facet_far_ring.gd`, R3.1.b's hitch engine — up to 64 close-up commits after arrival, each a full front tri-soup
+##   rebuild + `_shell_gen++`), AND a committed smooth tile's frozen slot NEVER refreshes at all once built
+##   (R3.1.d — a stale slot silently starts pointing at ANOTHER facet's texture once its close-up/band layer is
+##   evicted and reused for someone else). This flag reverses the direction: UV2.y carries the STABLE FID instead of
+##   the volatile slot (`FacetFarRing._uv2_y`, `FacetSmoothTier._build_worker`'s slot override) — geometry never needs
+##   to change when a slot moves. The CURRENT slot for every fid lives in ONE small lookup texture instead
+##   (`FacetFarRing._push_slot_indirect`, an R-channel-used RGBAF `ImageTexture` sized to the home body's fid space,
+##   `FacetAtlas.facet_count()` texels — 3456 at K=24 — mirroring the proven `_band_meta_tex` data-texture pattern);
+##   a slot-map change now updates ONLY that texture (`.update()`, ~3456 dictionary reads, no vertex/GPU-mesh work at
+##   all) — `set_closeup_slots`/`set_band_slots` no longer set `_pending`, so a slot change never re-emits and never
+##   bumps `_shell_gen`. The shell/smooth shader resolves the live slot per-fragment with one additive `texelFetch`
+##   (`FacetFarRing._apply_slot_indirect`, gl_compat-safe — `sampler2D` + `texelFetch` is the SAME pattern already
+##   shipped for `band_meta`/`band_map`/`id_map`/`fine_map`), so a smooth tile can NEVER go stale (it never encoded a
+##   slot in the first place). Off ⇒ `_uv2_y`/the smooth-tile slot override take the shipped `_slot_of` path verbatim,
+##   `_push_slot_indirect`/`_apply_slot_indirect` are never called, and the shader anchor is left untouched (String.
+##   replace of an absent/off anchor is a no-op splice) — byte-identical (FLAT 6042/0). Retires REV2 LAW R-C
+##   (FP_SMOOTH_SKIN_SLOT)'s frozen-slot plumbing (still present, byte-off, but superseded whenever this flag is on —
+##   both write the SAME "slot" float, this one just always resolves to `float(fid)` first). Gate: verify_far_smooth.gd
+##   (G-FS-QUIESCE, completed; golden shader-string pin).
+const FP_SLOT_INDIRECT := false
+
+## FP_SMOOTH_WELD_REFRESH (R3.4 T3, closes R3.2.c): neighbour-aware weld refresh. A tile's 4-edge boundary snap is
+##   FROZEN at `FacetSmoothTier.request()` time (`_snap_plan`, `facet_smooth_tier.gd:525-537`, applied once at build
+##   `:673-680` / worker `:757-764`) against whichever pitch its neighbours held AT THAT MOMENT. When a NEIGHBOUR's
+##   COMMITTED tier later changes — promotes, demotes, joins smooth residency for the first time, or leaves it back
+##   to the shipped shell — nothing ever revisits the already-built tile's frozen plan: its edge stays snapped to the
+##   STALE pitch, opening a T-junction crack the `SMOOTH_SKIRT_BLOCKS=4` skirt can't always cover (a 32-block-pitch
+##   S5 cell's relief step routinely exceeds 4 blocks). This flag closes that gap: whenever a facet's COMMITTED tier
+##   actually changes (`FacetSmoothTier._evict`, and the reap-commit path in `step()` when the NEW state differs from
+##   the OLD), `_weld_refresh_neighbours` walks that facet's ≤4 seam neighbours (`FacetAtlas.seam_neighbour`, the
+##   SAME `_EDGE_SEAM_SLOT` convention `request()` uses) and, for each that is CURRENTLY smooth-resident with a stale
+##   `_snap_plan` entry for the shared edge, rewrites that one entry to the facet's NEW effective pitch (its
+##   `cells_for_tier` if still resident, else the shipped shell's `FacetFarRing.CELLS` if it left smooth residency
+##   entirely) and queues a `request_refresh` (REVISION 2 LAW R-D's existing in-place-rebuild primitive — never an
+##   evict) for that neighbour — bounded by construction to ≤4 neighbours per commit event, never unbounded. Because
+##   `request_refresh`'s dispatch previously required `FP_SMOOTH_MESH_INC` (`_next_want`'s gate), this flag also ORs
+##   itself into that gate (`step()`'s `refresh_dispatch_on := FP_SMOOTH_MESH_INC or weld_refresh_on`) so a weld
+##   refresh dispatches even with MESH_INC off; the dispatched rebuild reuses `snap_edge_to_pitch`/
+##   `snap_edges_to_coarse` against the CORRECTED plan and, under `FP_SMOOTH_TXN`, commits through T1's atomic
+##   off-thread transaction (LAW T) — so the reweld itself is hole-free. Re-snapping to an already-correct pitch is a
+##   no-op (the plan-entry comparison short-circuits before ever calling `request_refresh`), so a stationary scene
+##   with no tier changes triggers ZERO refreshes (composes with the Q1 idle latch). Off ⇒ `_weld_refresh_neighbours`
+##   is never called, `_next_want`'s gate reduces to the shipped `FP_SMOOTH_MESH_INC`-only check — byte-identical,
+##   FLAT 6042/0. Gate: verify_far_smooth.gd G-FS-WELD-NEIGHBOUR (falsifies: without the flag the crack is shown;
+##   with it the boundary re-coincides), G-FS-QUIESCE/G-FS-NOHOLE re-run unaffected.
+const FP_SMOOTH_WELD_REFRESH := false
+## FP_SMOOTH_SNAP_SELFHEAL — REVISION 7-VISUAL (issue #28): the SUNK-FACET DISCONNECT fix. FP_SMOOTH_WELD_REFRESH's
+## T3 heal is event-driven (checks only committed NEIGHBOUR state on a tier change) and has two ordering holes under
+## concurrent web-worker builds: (H1) a tile commits with a snap-plan frozen at dispatch that `request()` has since
+## rewritten, and the neighbour's T3 pass already ran before this commit ⇒ `_built_snap != _snap_plan` FOREVER; (H2)
+## a corrective `request_refresh` is erased by a stale in-flight build's commit (`_refresh.erase`) ⇒ the rebuild never
+## dispatches. Either way a resident tile's edge stays chord-snapped to a pitch that no longer exists (e.g. a pitch-4
+## ~104-block chord against a neighbour now rendering native 13/26-cell relief) → it dips tens of blocks below true
+## relief mid-segment → the neighbour's exposed edge+skirt (water/dirt/stone colours) shows as the disconnect line.
+## Worsened by FP_SMOOTH_HORIZON_COVER (cap-bound S5 frontier reshuffles every crossing ⇒ far more tier-change races).
+## The fix is one COMMIT-TIME invariant: after recording `_built_snap[fid]`, if it != the CURRENT `_snap_plan[fid]`,
+## re-queue `request_refresh(fid)` — needs no neighbour event (closes H1) + re-queues what H2 ate. Bounded (≤1 extra
+## rebuild/stale commit; converges — a rebuild dispatched after the last plan change commits clean). Default false ⇒
+## the self-check never runs (byte-off). Gate G-FS-SNAP-STALE-COMMIT (falsify: red on current code, green with flag).
+const FP_SMOOTH_SNAP_SELFHEAL := false
+
+## FP_RING_QUIESCE (REVISION 4 Stage B, docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md R4.2): ring quiescence at rest.
+##   `visible_fids()` permanently EXCLUDES a smooth-resident facet from the shell's emit set (§2 law 6) — but two
+##   OTHER drivers never adopted that exclusion, so the composition has no fixpoint: (1) `_noblack_guarantee` re-arms
+##   `_pending = true` EVERY frame on `not _emitted.has(fid)` — under FP_SMOOTH_RIM the ACTIVE facet is smooth-resident
+##   ⇒ permanently excluded from `_emitted` ⇒ this re-arms forever (a continuous `_begin_rebuild` train — the sh_reemit
+##   climb / 60-100ms frames / hitch counter); (2) `_count_uncached_visible`/`_count_uncovered_visible` have NO smooth
+##   exclusion, so `remaining` never reaches 0 and the env convergence latches (`_srf_converged`/`_orbit_converged`)
+##   never engage. This flag factors the exclusion test into ONE predicate, `FacetFarRing._smooth_covered(fid)`
+##   (`_smooth != null and _smooth.is_resident(fid) and not _smooth_leaving.has(fid)` — visible_fids':2236 own check,
+##   unconditionally extracted so both callers below share the SAME definition), and wires it into: (a)
+##   `_noblack_guarantee` — a smooth-covered active facet counts as DRAWN (its committed S2 tile IS the opaque
+##   never-black cover, strictly better than the sunk shell backstop), so the re-arm condition becomes `built_now or
+##   new_unsink != _noblack_unsink_fid or (not _emitted.has(fid) and not _smooth_covered(fid))`; the chord build and
+##   the unsink probe are ALSO skipped while covered (nothing there needs the shell's own backstop while the tile
+##   covers); (b) `_count_uncached_visible`/`_count_uncovered_visible` — `continue` on `_smooth_covered(fid)`, so the
+##   counter counts exactly what the shell's emit can serve, nothing else. At rest: `remaining` reaches 0, the env
+##   latches engage, `_pending` stays false — the REAL invariant holds: zero `_rebuild_full`/`_dispatch_async_rebuild`/
+##   `_pending=true` after settle. Off ⇒ every touched site keeps checking the shipped `not _emitted.has(fid)` /
+##   unconditional counting — byte-identical (FLAT 6042/0); `_smooth_covered` itself is still extracted and used by
+##   `visible_fids()` unconditionally (a pure refactor of already-shipped logic, not gated — behaviourally identical
+##   either way). Gate: verify_far_smooth.gd G-FS-QUIESCE-RING (falsifies: forcing this off on the identical scripted
+##   scenario makes the rebuild/re-emit counters CLIMB — the shipped bug reproduces).
+const FP_RING_QUIESCE := false
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage A (FP_ENV_DEMAND_DISC, R5.1 residual 1 fix, part 1): bound
+##   the floored env-convergence SET. `_count_uncached_visible`'s min-envelope demand previously ran across the WHOLE
+##   visible hemisphere (~1500 coarse facets at the floored θ_emit=90° cap) — but the envelope is a no-protrusion
+##   LOWER BOUND against the NEAR field, and near meshes only ever exist within `near_render_radius() +
+##   RIM_STREAM_MARGIN` of the player (backstop ∪ mid-dense ∪ a couple of rings). A facet with no near field over it
+##   has nothing to protrude through — its exact (pre-envelope) chord IS its correct terminal state, needing NO
+##   envelope upgrade at all. This flag demands the envelope ONLY for `_dense_warm(fid)` (backstop ∪ mid-dense) or a
+##   facet within `ENV_DEMAND_RINGS` facet-edges of the current emit axis (`FacetFarRing._in_env_demand_disc`, the
+##   SAME angular-disc test FP_MID_DENSE already uses, just a wider radius); every other visible facet counts DONE
+##   the instant its CHEAP chord exists (`_pos_cache.has`), in both `_count_uncached_visible` (`remaining`, R5.1's
+##   residual driver) and the async worker's warm loop (`FacetFarRing._env_have`/`_env_build_one`) — so it is built
+##   via the cheap `_ensure_chord_cached` path, never the ~300×-heavier `_env_weld_grid`. Floored `remaining` drops
+##   from ~1500 to ≤ ~40 (backstop ∪ mid-dense ∪ the demand disc), so a cold floored engage latches in a handful of
+##   ENV_WARM_BATCH(12) dispatch cycles instead of ~125. Strictly LESS work + a strictly SMALLER `_env_done`/
+##   `_pos_cache` footprint ⇒ NEVER-OOM by construction; no-protrusion is preserved because the excluded facets are
+##   exactly the ones with no near field to protrude through (the design's own invariant, not a new approximation).
+##   ORBIT is UNCHANGED: the orbit driver (`_orbit_warm_async`) explicitly forces its own demand test off (there is
+##   no "near field on the ground" concept off-surface — the whole coarse hemisphere IS the drawn surface there), so
+##   this flag is a pure FLOORED/descent fix. Off ⇒ every counter/worker call passes `demand_on=false` (the shipped
+##   test) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-FS-QUIESCE-SURF (falsifies: forced off, the
+##   cold-engage dispatch count blows the `ceil(demand/ENV_WARM_BATCH)+2` bound — the live ~125-cycle stall
+##   reproduces).
+const FP_ENV_DEMAND_DISC := false
+## ENV_DEMAND_RINGS: the demand-disc radius in facet-edge angles (mirrors MID_DENSE_RINGS's units) — MID_DENSE_RINGS
+##   (the dense-promotion disc) + 2, so the envelope demand strictly ENCLOSES the dense-promotion set (no facet is
+##   ever mid-dense-promoted without ALSO sitting inside its own envelope-demand disc).
+const ENV_DEMAND_RINGS := MID_DENSE_RINGS + 2.0
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage B (FP_WARM_EMIT_SPLIT, R5.1 residual 1 fix, part 2): warm
+##   and emit were FUSED — the only way to warm ENV_WARM_BATCH env caches was `_begin_rebuild` → a full front-
+##   hemisphere SurfaceTool re-emit + `generate_normals` + a main-thread `_swap_in_arrays` GPU upload, EVERY warm
+##   cycle (the sh_begin/sh_reemit ~0.75/s climb + the whole-hemisphere re-upload R5.1 measured at rest). This flag
+##   splits the two: when `_surface_converge_emit`'s FLOORED branch has NOTHING to dispatch but a non-coverage env
+##   upgrade (`remaining>0`, no fresh `_pending`, already emitted once), it dispatches a WARM-ONLY worker task
+##   (`FacetFarRing._dispatch_warm_only` / `_run_env_warm_pass`, an `_async_warm_only` mode of the existing
+##   `_async_build_worker` that fills caches and returns — no SurfaceTool, no arrays; `_poll_async_rebuild` skips the
+##   mesh swap for it) instead of a real emit; the shell re-emits for real only on a genuine coverage event
+##   (`_pending` / first engage) or ONCE more when the envelope fully converges (`remaining` hits 0 — `_srf_env_dirty`
+##   latches this), so a floored engage does AT MOST 2 real `_reemit_count` bumps (one initial coverage emit, one
+##   final env-converged emit) no matter how many warm cycles it took. Sub-pixel at these distances — an un-reemitted
+##   envelope upgrade only nudges already-drawn chord heights, held meanwhile by the ε sink + skirts (the same "safe
+##   to lag a frame" argument REV3's T1/T2 already rely on). Also carries the hygiene fix Fable found tracing this:
+##   the worker's per-facet cache upgrade used to `erase()` the stale chord THEN rebuild it (a momentary MISSING key
+##   a concurrent main-thread reader — `_cull_update`'s `_bpos_cache.keys()` scan — could observe mid-task); the
+##   shared `_env_build_one`/`_ensure_cached`/`_ensure_backstop_cached` now take a `force` parameter that REPLACES via
+##   a single in-place dictionary assignment instead (never erases), so a reader can no longer see a momentarily-
+##   absent key — inert whenever nothing would have erased in the first place (identical resulting cache values
+##   either way). Off ⇒ `_surface_converge_emit` always dispatches a REAL `_begin_rebuild()` for every env-upgrade
+##   cycle (the shipped fused cadence) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-FS-QUIESCE-SURF
+##   (falsifies: forced off, `_reemit_count` climbs once per warm batch instead of latching at ≤2).
+const FP_WARM_EMIT_SPLIT := false
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage C (FP_FINE_BAKE_SURFACE_PAUSE, R5.2, ship first — biggest
+##   instant win, trivial): pause the FP_PLANET_MAP whole-planet FINE-tier dispatch loop
+##   (`FacetTexBaker._update_band_parallel`, the `if _fm_on:` new-task loop) while ON-SURFACE. On the ground
+##   `_offsurface` is false, which forces `_pbm_cpp`/`_pbm_tile` to 0 (both `_offsurface`-gated) — the fine bake
+##   falls to the per-texel GDScript path (PLANET_MAP_TEXELS=64 ⇒ 4096 `facet_profile` samples/facet, ~1-2 s/facet
+##   on a web worker) across up to 3456 facets — hours of continuous work on the ONE on-surface bake slot
+##   (`active=1`), the observed perpetual `pbm_busy 1` + a first-order suspect for the erratic web `proc_ms` (a
+##   per-texel GDScript allocation convoy with the main thread). On-surface, everything in view is ALREADY covered
+##   by band/skin/smooth at higher fidelity than the fine tier's 6.5 blocks/texel — the fine tier is an orbit/far
+##   feature only, so pausing its dispatch here removes pure waste. Coverage resumes on the next off-surface
+##   excursion, where `_pbm_tile_ok and _offsurface` unlocks the native C++ tile path (~10× faster) across all
+##   `_pbm_n` slots. The REAP of any already-in-flight task and the throttled dirty-page upload are BOTH left
+##   unconditional (an off-surface-dispatched bake still commits after landing; already-baked pages still flush) —
+##   only NEW task dispatch is gated. An un-fine-baked on-surface facet renders exactly the pre-Item-A shipped look
+##   (the base-page colour, via the existing alpha-coverage "un-baked = shipped, never black" law) — no visual
+##   regression, purely a scheduling change. Also adds `fm_baked`/`fm_want`/`fm_dirty` to `tex_telemetry()` — the
+##   fine tier had NO telemetry at all (the blind spot that let this hide). Off ⇒ dispatch unconditional (shipped) —
+##   byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd G-TEX-SURF-PAUSE (falsifies: forced off, a fine task
+##   DISPATCHES even on-surface — the shipped perpetual-bake bug reproduces).
+const FP_FINE_BAKE_SURFACE_PAUSE := false
+
+## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
+## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
+## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).
+const RIM_REBUILD_BLOCKS := 24
+## §2.1: R_env = near view distance (TerrainConfig.near_render_radius(), 128 faceted) + this margin (blocks). Must
+## exceed RIM_REBUILD_BLOCKS so near voxels can never stream in outside the envelope zone BETWEEN two rim rebuilds
+## (the §2.1 invariant the design cites — 32 > 24 clears it with an 8-block guard band).
+const RIM_STREAM_MARGIN := 32.0
+## §2.1: the feather-band width (blocks) beyond R_env over which S2 vertex height blends min-envelope → true relief.
+## Position-keyed (a pure function of world position + the frozen player-column snapshot), so two adjacent S2 tiles
+## spanning the disc compute IDENTICAL boundary values ⇒ the weld canon survives the blend (G-RIM-WELD).
+const RIM_FEATHER_BLOCKS := 16.0
+
+## FP_RIM_NEAR_WELD — REVISION 7-VISUAL (docs/COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §R7.2): the near↔far HEIGHT-WALL
+## fix. The S2 collar's shipped law sinks its WHOLE disc interior to `env − sink` (`build_tile_rim` w=0), and the
+## sink (5–13 blocks, derived from the 26-block BACKSTOP cell — mis-scaled for the ~4-block S2 cell) + REV5's −3.0
+## resid + the env footprint-min stack to an 8–20-block drop. The near voxel field ends at ~112–128 but the disc's
+## true-height frontier is at R_env(160)+feather(176), so a 48–64-block annulus of that sunk rim is the VISIBLE
+## ground beyond the near blocks → the near region's cut edge shows as a multi-strata block-face wall. The fix welds
+## that visible annulus to the near mesher's own block-quantised top (`true_pos − ε`, where true_pos = d·(r_datum +
+## max(0,g)) is exactly the near block-top for land / sea level for water, block-quantised because relief is integer)
+## so the step collapses to ≤ ~1 block, seamless whether or not near voxels have streamed in (block-top is what the
+## near mesher WILL build). The R_env true-height frontier does NOT move (§2.1 stream-in invariant survives). Height
+## is terrain-invariant (crescent-reuse safe). Default false ⇒ the shipped env−sink law verbatim (G-RNW-OFF byte-eq).
+const FP_RIM_NEAR_WELD := false
+const RIM_WELD_BAND := 16.0    ## blocks: the ramp width just inside r_near over which env−sink → block-top (zone B ramp)
+const RIM_WELD_EPS := 1.0      ## blocks: the block-top is dropped this far so the rim never protrudes above near (near wins the coplanar tie); G-RIM-WELD-BOUND may raise it up to 2.0
+
+## FP_SMOOTH_SLOT_MESH — COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 7: kills the residual O(N²) warmup hitch —
+## the shipped commit (`FacetSmoothTier._rebuild_tier_mesh` / `_apply_tier_mesh`) re-packs and re-uploads the
+## ENTIRE tier's ArrayMesh on EVERY single tile commit (a full S2 tier ≈ 8 MB re-uploaded once per new tile it
+## gains), so a fill of N tiles uploads O(N²) bytes total (measured: ~150–300 MB over a 23 s warmup fill where
+## ~16 MB is necessary). The fix: since every tile of a tier shares IDENTICAL topology, each tier gets ONE
+## pre-allocated fixed-capacity ArrayMesh (`residency_cap` uniform slots, an IMMUTABLE index buffer built once), and
+## a commit becomes a byte-region write into that fid's slot — `RenderingServer.mesh_surface_update_vertex_region`/
+## `_attribute_region`, a plain `glBufferSubData` (verified in this engine build,
+## `drivers/gles3/storage/mesh_storage.cpp:536-564`). A tile's bytes are packed by the ENGINE itself (a throwaway
+## `ArrayMesh.add_surface_from_arrays` + `RenderingServer.mesh_get_surface` readback — `mesh_create_surface_data_
+## from_arrays` is the real packer underneath but isn't itself script-bound, so this readback is the script-level
+## equivalent, byte-identical since `ArrayMesh.add_surface_from_arrays` calls the very same C++ function) — never a
+## hand-rolled vertex format. Eviction blits a precomputed degenerate (all-zero) blob into the freed slot instead of
+## rebuilding anything. MANDATORY refusal latch (`FacetSmoothTier._slot_mesh_failed`): a missing RenderingServer
+## method, a packed-size/format mismatch against the capacity surface, or an exhausted per-tier slot free-list
+## latches this instance to the shipped whole-tier path (`_rebuild_tier_mesh`/`_step_tier_txn`, both kept verbatim)
+## for the rest of the session — never a corrupt draw. Off ⇒ every new code path in `facet_smooth_tier.gd` is
+## unreached (`step()`/`request()`/`_evict()`/`force_rebake()` all default their new `slot_on` param to this const,
+## mirroring the existing `idle_on`/`txn_on`/`weld_refresh_on` pattern so gates can force it per-call without
+## sed-toggling) — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-SLOT-EQ, G-SLOT-NOHOLE, G-SLOT-BUDGET).
+const FP_SMOOTH_SLOT_MESH := false
+## Main-thread slot-write commit budget (bytes/`step()` call) once `FP_SMOOTH_SLOT_MESH` is on —
+## `FacetSmoothTier._slot_drain` applies queued whole commit-events (an event is one fid's full old-slot-zero +
+## new-slot-write transition — LAW T, never split) up to this many bytes, deferring the rest to later calls. ~2 MB
+## covers an 8-worker-slot S2 burst (≈4 MB) in 2 frames per the design's acceptance figure. `step()`'s `budget_bytes`
+## param defaults to this const so a gate can force a tiny budget to deterministically exercise the deferral path.
+const SMOOTH_COMMIT_BUDGET_BYTES := 2 * 1024 * 1024
+
+## FP_SMOOTH_TILE_SURF — SAFE replacement for FP_SMOOTH_SLOT_MESH above: that fix's `RenderingServer.mesh_surface_
+## update_vertex_region`/`_attribute_region` GPU region-writes HARD-CRASHED the live web tab (those calls abort
+## ANGLE/WebGL2 outside the exact byte/format contract they expect; the abort is uncatchable from GDScript, and the
+## headless dummy RenderingServer no-ops the very same calls — `servers/rendering/dummy/storage/mesh_storage.h` — so
+## every gate passed green while the live path aborted). This kills the SAME O(N²) whole-tier re-pack/re-upload
+## warmup hitch (`FacetSmoothTier._rebuild_tier_mesh`/`_apply_tier_mesh` re-upload the ENTIRE tier's ArrayMesh on
+## EVERY tile it gains — a full S2 tier ≈ 8 MB re-uploaded on each of its ≤9 tile adds) using ONLY the high-level API
+## the rest of the codebase already relies on: `MeshInstance3D`/`ArrayMesh.new()`/`add_surface_from_arrays`/
+## `mi.mesh =`/`add_child`/`queue_free` — never a RenderingServer region/RID call. Per-tile phase: a committing tile
+## gets its OWN child `MeshInstance3D` (an O(1) upload — the tier's other resident tiles' meshes are untouched).
+## Consolidate-at-settle: once a tier has gone `SMOOTH_TILE_CONSOLIDATE_FRAMES` `step()` calls without an add/evict,
+## its per-tile nodes fold back into ONE merged mesh (`_rebuild_tier_mesh`, reused verbatim — the one whole-tier
+## upload, now amortized to once per settle instead of once per tile) and are freed, bounding steady-state draw calls
+## back down to ~4 (one per tier). Invariant enforced by construction: a tier draws EITHER via its merged
+## `_mi[tier].mesh` XOR via per-tile `_tile_mi` nodes, NEVER both (`FacetSmoothTier._tile_surf_active[tier]`; the
+## split/consolidate transitions each clear the other representation before returning) — no double-draw. `step()`/
+## `request()`/`_evict()`/`force_rebake()` all default their new `tile_surf_on` param to this const, mirroring the
+## existing `slot_on`/`txn_on`/`idle_on` convention. Off ⇒ every new code path in `facet_smooth_tier.gd` is unreached
+## — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-TILESURF-COVER, G-TILESURF-XOR, G-TILESURF-
+## CONSOLIDATE, G-TILESURF-OFF). Live-only unknown: steady-state fps/draw-call cost of the per-tile phase during a
+## real warmup (headless has no GPU pixels) — the orchestrator watches `FacetSmoothTier.tile_surf_stats()`.
+const FP_SMOOTH_TILE_SURF := false
+## `step()` calls a tier must go without an add/evict before FP_SMOOTH_TILE_SURF folds its per-tile nodes back into
+## one merged mesh (`_tile_surf_consolidate`). ~45 calls at 60fps is < 1s of true rest — long enough that a facet
+## mid-warmup-fill (still gaining tiles every call) never consolidates mid-flood, short enough that steady-state
+## draws settle back down promptly once a tier stops changing.
+const SMOOTH_TILE_CONSOLIDATE_FRAMES := 45
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (R5.3 §7.1, FP_RIM_CHEAP): the S2 near-collar's warmup
+## cost fix. Live: `FacetSmoothTier.build_tile_rim` → `_env_weld_grid(fid, 104)` at the shipped ENV_FINE_MULT(4) ≈
+## 417² ≈ 174k `profile_at_dir` samples/facet on a worker — the confirmed warmup allocator-convoy source (a
+## per-texel GDScript allocation convoys the WASM allocator with the main thread, the SAME mechanism
+## `voxiverse-walk-perf-root-cause` names) — up to SMOOTH_S2_MAX(9) tiles at a cold engage: the observed
+## proc≈861ms/fps≈1.3 spike for ~60s. Three parts, all gated by this ONE flag (§7.1 i/ii/iii):
+##  (i)   `TierPlace.rim_fine_mult()` — the S2 collar's OWN coarser fine-grid multiplier (RIM_FINE_MULT=2 desktop /
+##        RIM_FINE_MULT_WEB=1 web; see tier_place.gd) passed to `_env_weld_grid`'s new `mult_override` param —
+##        174k → ~43k (desktop) / ~11k (web) samples/facet. A coarser fine grid can only RAISE the sampled
+##        envelope (fewer candidate columns ⇒ the per-node min can only go up, never down, vs the reference
+##        mult) — `TierPlace.rim_env_resid()` (measured, see tier_place.gd) is subtracted from the coarsened
+##        envelope in `build_tile_rim` so it stays ≤ the mult=4 reference ≤ true (no-protrusion preserved by
+##        construction — G-RIM-MULT).
+##  (ii)  Crescent-only rebake: `FacetSmoothTier`'s per-S2-tile cached env-position array (`_rim_env_pos`, ≤
+##        SMOOTH_S2_MAX(9) × 105² Vector3 ≈ 1.2 MB fixed, NEVER-OOM) caches the ONE quantity that is terrain-only
+##        (never depends on player_col) — env is never recomputed after a tile's first bake at all. A drift-
+##        triggered re-bake (RIM_REBUILD_BLOCKS, via `request_refresh`) then recomputes the (comparatively
+##        cheaper) per-node TRUE-relief sample ONLY for nodes whose CHEAP planar-position proxy crosses a
+##        conservatively-padded `r_env±feather` annulus between the old and new baked column (boundary nodes
+##        ALWAYS recomputed, so the weld canon stays bit-equal — G-RIM-CRESCENT); every other node reuses its
+##        previous committed vertex verbatim. The INITIAL bake of a tile is still full (no prior cache to reuse).
+##  (iii) Escape hatch (unchanged, not gated by this flag — always available): FP_SMOOTH_RIM off + raise
+##        BACKSTOP_CELLS 16→32 — shipped machinery, one const, if the live A/B still can't hold walking pace.
+## Also paces the INITIAL S2 assignment itself (`FacetFarRing._rim_assign`'s `cheap_on` branch, RIM_PACE_FRAMES
+## below) so a cold engage never dispatches more than one brand-new S2 build per pacing window — the convoy is
+## driven by ANY continuously-in-flight build, not by concurrency, so time-slicing the DISPATCHES (not just
+## shrinking each one) is required to hold a playable frame budget throughout the whole warmup, not just per-tile.
+## Off ⇒ `_env_weld_grid` runs at the shipped ENV_FINE_MULT with zero compensation, every rim-role fid is merged
+## unconditionally in the same `_rim_assign` call, and a re-bake always recomputes every node — byte-identical
+## (FLAT 6042/0). Gate: verify_far_smooth.gd (G-RIM-MULT, G-RIM-CRESCENT, G-RIM-PACE).
+const FP_RIM_CHEAP := false
+## `_rim_assign` calls (≈1/frame while FP_SMOOTH_RIM is engaging fresh assignments — see `_smooth_drive`) that must
+## elapse between two brand-new S2 grants at a cold engage. Frame-COUNT (not wall-clock) pacing deliberately: the
+## warmup builds themselves are what slow the frame, so a time-based gate would self-defeat (a single slow frame
+## could already exceed a wall-clock window) — counting calls instead spreads dispatches out independent of how
+## slow any one of them makes the frame.
+const RIM_PACE_FRAMES := 8
+
+## FP_SMOOTH_GROW_PACE (warmup pacing, extends R5.3 §7.1 to the S3/S4/S5 LADDER — Stage D/FP_RIM_CHEAP only paced
+## the S2 collar's cold-engage grants; this flag is the analogous fix for the OTHER, bigger flood: a cold engage
+## (load/descent) hands `_smooth_hop_assignment`'s WHOLE hop-ring result — up to 289 facets (SMOOTH_S3_MAX(25) +
+## SMOOTH_S4_MAX(64) + SMOOTH_S5_MAX(200)) — to `FacetSmoothTier.request()` in the SAME `_smooth_drive` call, so the
+## tier tries to build all 289 tiles as fast as `SMOOTH_BUILD_SLOTS` worker slots + the main-thread mesh-apply allow
+## — the measured proc≈234ms / fps 1.3–15 spike for ~60s (`smooth_res` climbing 109→159 mid-spike). The steady
+## state (all 289 built) is fine — it's the initial GROWTH that floods. Fix: grow the driver's REQUESTED (`_want`)
+## set gradually. `FacetFarRing._smooth_drive`'s `sticky_on` branch, after computing/reusing `_sticky_target` and
+## applying dwell (`_sticky_apply_dwell`, unchanged), filters the result down to only fids already "unlocked"
+## (`_grow_added`) before handing it to `request()`/`_rim_assign`/`_mesh_inc_gate`: `_grow_note_new_target` enqueues
+## every NEWLY-seen target fid (first cold engage, or the handful a later crossing adds) onto `_grow_pending` in the
+## SAME nearest-first BFS order `_smooth_hop_assignment` already produces (Dictionary preserves insertion order) —
+## except `_smooth_ring1_fids(active)` (active's direct, non-backstop seam neighbours — exactly hop=1) which are
+## unlocked IMMEDIATELY, never queued, so the near↔far seam is covered on the VERY FIRST call, before any pacing
+## wait. `_grow_advance` then unlocks ≤ `SMOOTH_GROW_PER_FRAME` more fids per `_smooth_drive` call (an O(1) index
+## cursor into `_grow_pending`, never re-scanned or shifted) — a cold 289-facet engage trickles in over
+## ~ceil(285/SMOOTH_GROW_PER_FRAME) calls (seconds, not one flooded frame). `_grow_added`/`_grow_queued` only ever
+## GROW (a fid unlocked once stays unlocked — matches R-A's "once resident, stays" sticky law, just reached
+## gradually) and are bounded by the total facet count (`FacetAtlas.facet_count()`, a few KB worst case — NEVER-OOM,
+## the same bound `_rim_paced` already relies on). Composes with FP_SMOOTH_IDLE: `pending_handshake` (the gate that
+## blocks the Q1 idle-reuse fixpoint from latching prematurely) now ALSO includes "grow still draining"
+## (`grow_on and _grow_idx < _grow_pending.size()`) — without this, the (active_fid, excluded) signature can repeat
+## every frame WHILE growth is mid-flight (no crossing, no pool change) and Q1's reuse would freeze `_want` at
+## whatever partial subset the FIRST call granted, forever; with it, the driver keeps taking the full recompute path
+## until growth actually finishes, THEN the existing Q1 fixpoint engages (grown + stationary ⇒ zero further work,
+## the idle latch is not re-triggered by this flag). The main-thread mesh-APPLY side needs no new cap: `step()`'s
+## shipped `for t in [S2,S3,S4,S5]: if _dirty_tier[t]: _rebuild_tier_mesh(t); break` already rebuilds AT MOST ONE
+## tier's ArrayMesh per call (the FP_SMOOTH_TXN-off path, the shipped default) — this flag only slows how fast NEW
+## facets enter `_want` in the first place, which is what was driving that already-bounded apply continuously.
+## Off ⇒ `_grow_note_new_target`/`_grow_advance` are never called and the sticky_on branch hands `_sticky_apply_dwell`'s
+## FULL result straight through — byte-identical to the shipped flood (FLAT 6042/0). Gate: verify_far_smooth.gd
+## (G-FS-GROW-PACE; falsifies: forced off, the whole hop-ring target lands in `_want` in the SAME first call).
+const FP_SMOOTH_GROW_PACE := false
+## New facets the driver unlocks into the grow-pace queue per `_smooth_drive` call (beyond the immediate ring-1
+## fast path, which is never paced). Frame-COUNT pacing (mirrors RIM_PACE_FRAMES's rationale): the S3/S4/S5 builds
+## themselves are what slow the frame, so counting calls (not wall-clock) spreads the flood out regardless of how
+## slow any one call runs.
+const SMOOTH_GROW_PER_FRAME := 2
+
+## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2) — clean-slate reset of the smooth far-terrain
+## machinery above (`FacetSmoothTier`/`FP_FAR_SMOOTH` and its whole S2..S5 ladder are left byte-for-byte
+## untouched, still available behind their own flag). A NEW, separate, uniform-pitch smooth annulus
+## (`FacetSmoothV2`, godot/src/world/facet_smooth_v2.gd): ONE pitch (`V2_CELLS`, 8-block chords over a 417-block
+## facet edge), residency a PURE function of the active facet (hop-BFS over `FacetAtlas.seam_neighbour`, hop ∈
+## [`V2_HOP_B`..`V2_HOP_H`]) — NO tiers, NO snap plans, NO emit-exclusion, NO near-collar rim. Every mesh commit
+## is a whole-surface `ArrayMesh` rebuild via ONLY the safe high-level API (`ArrayMesh.new()` +
+## `add_surface_from_arrays` + `mi.mesh = mesh`) — NEVER `RenderingServer.mesh_surface_update_vertex_region`/
+## `_attribute_region` (those hard-crash ANGLE/WebGL2 — the REV-7 slot-mesh lesson this reset does not repeat).
+## Colour is per-cell flat-shaded (provoking-vertex convention, no baked skin texture ever touches this geometry).
+## Draws OVER the shipped shell (no exclusion handshake to race). Off ⇒ `FacetFarRing.setup()` never constructs a
+## `FacetSmoothV2` — byte-identical (FLAT 6042/0). Gate: verify_far_smooth.gd (G-V2-WELD/G-V2-PURE/G-V2-COLOUR/
+## G-V2-OFF).
+const FP_SMOOTH_V2 := false
+const V2_CELLS := 52   ## cells/facet edge (53×53 node grid + 4-edge skirt) — the ONE global pitch, no ladder.
+const V2_HOP_B := 2     ## inner hop bound (inclusive) of the resident annulus around the active facet.
+const V2_HOP_H := 3     ## outer hop bound (inclusive) — V2-1 scope; V2-3 raises this to 4 behind its own flag.
+
+## V2-2 (docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4, relief/slope lighting): shade far tiles by their REAL per-cell
+## surface-slope face normal instead of the radial-only V2-1 shade, so mountains read as 3D. The interior-node
+## normal is computed in GDScript from the already-baked `pos` (the native bake's `bnrm` is perimeter-only — never
+## usable for interior lighting); the shader picks a LIT vertex body that derives `n` from the NORMAL attribute in
+## world space instead of `wp - centre`. Off ⇒ `build_tile`'s `nrm` stays the shipped radial `b_dir` verbatim and
+## `shader_code()` emits the exact shipped V2-1 string (byte-identical, FLAT 6042/0). LIVE-PROBE-REQUIRED (the
+## headless dummy RenderingServer never parses shader source). Gate: verify_far_smooth.gd (G-V2-LIT-NRM, a PURE
+## unit check of the face-normal math — the const itself can't be flipped headless).
+const FP_SMOOTH_V2_LIT := false
+
+## V2-3a (§4, extended reach): the smooth annulus reaches one hop further (`V2_HOP_H_REACH` instead of `V2_HOP_H`)
+## so more of the far field is real relief rather than flat skin. Off ⇒ `setup_instance` keeps `_hop_h = V2_HOP_H`
+## (byte-identical). Gate: verify_far_smooth.gd (G-V2-REACH — pure `hop_annulus` superset check, no flag needed).
+const FP_SMOOTH_V2_REACH := false
+const V2_HOP_H_REACH := 4
+
+## V2-3b (§4, block-LOD arbitration): where a V2 smooth tile is RESIDENT (committed), suppress the blocky far-ring
+## megablock emission for that facet, so the coarse blocks don't z-fight / poke through the smooth relief.
+## Make-before-break safe — only suppresses a facet's blocky emit when `FacetSmoothV2.is_resident(fid)` is
+## already true; a facet still building/leaving V2 residency keeps its blocky emit (no hole). Off ⇒ the shipped
+## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
+const FP_SMOOTH_V2_EXCL_BLKLOD := false
+
+## VIEWER RELIEF REACH (task #86, user directive: "render anything unlimited in the altitude"): the near VoxelTerrain
+## streamer's A2 downward-reach clamp keeps only VIEWER_DOWNWARD_REACH_BLOCKS=40 blocks meshed BELOW the player's
+## feet (a surface-player perf trim). On a steep peak the down-slope drops out of that band inside the 128-block
+## horizontal radius, so the near MESH just ends (collision is unaffected — it reads TerrainConfig analytically —
+## but nothing renders) and the coarse far backstop shows through. This flag EXTENDS the meshed downward reach to
+## VIEWER_RELIEF_REACH_BLOCKS so the whole visible slope (peak→sea→bedrock within the render disc) meshes as real
+## voxels. NOT truly unlimited (NEVER-OOM: streaming to the planet core would OOM) — 128 (= the horizontal radius)
+## makes the near field a full downward sphere covering every slope within view distance; anything deeper stays
+## analytic-solid/breakable, just not meshed (it is underground/hidden). Off ⇒ the shipped 40-block clamp
+## (byte-identical). Perf: the down slab grows 40→128 (~2.2× the interior-stone stream, faces culled; the newly
+## MESHED surface is exactly the down-slope the user wants) — LIVE heap/fps A/B gates this on the 2-core web target.
+const FP_VIEWER_RELIEF_REACH := false
+const VIEWER_RELIEF_REACH_BLOCKS := 128
 
 ## COSMOS TEXTURED-LOD §2V V2 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.1 — the REAL top-down shot). FP_BAND_BLOCK_MAP's
 ## L8 band stores only the top-terrain material id — a reconstruction that misses the on-surface decorations (TREES)
@@ -799,6 +1316,35 @@ const FP_FARRING_LEVEL := false
 const FP_FARRING_ACTIVE_NOBLACK := false
 const NOBLACK_PROBE_HALF := 10.0    # fid-lattice half-extent (blocks) of the under-camera coverage probe column — TIGHT so it reads meshed under the player near spawn but absent at a cruise gap
 const NOBLACK_PROBE_YHALF := 96.0   # radial half-extent (blocks) of the probe column — spans surface relief so a meshed near column reads as covered
+
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 (RECOMMENDED fix, A′) — per-VERTEX analytic un-sink of the dense
+## backstop wherever the near voxel field is PROVABLY unreachable (outside the streamed VoxelViewer ellipsoid,
+## inflated by a safety margin). Generalizes FP_FARRING_ACTIVE_NOBLACK from "1 facet × whole-facet × camera-
+## column probe" to "every backstop facet × per-vertex × analytic coverage". Root cause: on a steep mountain the
+## near field is vertically guillotined (the A2 viewer reach is only −40 blocks below the feet, §1.1) while the
+## dense backstop is drawn SUNK + at ENVELOPE-MINIMUM height (a provable near-surface lower bound, deliberately
+## tens of blocks low, §1.2) — so the down-slope foreground the near mesh can never reach reads as a flat pale
+## well (and, hovering off-surface, every neighbouring backstop facet reads as a pale plate with visible steps
+## at facet borders, §1.3). A dense-backstop vertex whose TRUE (welded, un-sunk) chord position lies OUTSIDE the
+## streamed ellipsoid — centre = player column + radial·O, horizontal semi-axis r = near_render_radius(),
+## vertical semi-axis H = TerrainConfig.streamed_ellipsoid_params().z, inflated by UNSINK_MARGIN_BLOCKS on every
+## axis — emits at that TRUE height, un-sunk: no near mesh can ever coexist there, so there is nothing to
+## z-fight, PROVEN by construction rather than by probe-and-hope. A vertex inside the (inflated) ellipsoid keeps
+## the shipped envelope+sink law byte-identically — the proven no-protrusion regime keeps governing exactly the
+## region where near/far can actually coexist. Under FP_BLOCKY_FARRING a mixed covered/uncovered cell's flat top
+## is the corner MIN, so it automatically takes the conservative (sunk) height — the frontier can never
+## protrude. Supersedes the whole-facet FP_FARRING_ACTIVE_NOBLACK pick when both are on (one un-sink law); that
+## flag's OTHER jobs (immediate chord-cache build, re-emit arming) are untouched. Off ⇒ every new path below is
+## inert → FLAT byte-identical (6042/0). Gate: verify_pale_backstop.gd (G-PB-*). Requires FP_FARRING_FULL_COVER
+## (the dense backstop cache this law un-sinks only exists there).
+const FP_FARRING_UNCOVERED_TRUE := false
+## Ellipsoid inflation (blocks), applied on every axis: one 16-block mesh block's reach past the viewer boundary
+## + slack, so the coverage test never mis-classifies a vertex the near mesher could still legitimately reach.
+const UNSINK_MARGIN_BLOCKS := 24
+## Player-column drift (blocks) that re-arms `_pending` for a fresh un-sink emit. The un-sink PATTERN depends
+## only on the player's column (not on time, not on warm state), so it need not re-run every frame — only once
+## the column has actually moved this far since the last emit (≤ 1 extra rebuild per this many blocks walked).
+const UNSINK_DRIFT_BLOCKS := 16
 
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the

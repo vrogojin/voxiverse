@@ -1,0 +1,263 @@
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index f60107c..f6df2f0 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -2275,6 +2275,181 @@ PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array
+ 	return out;
+ }
+ 
++// FarDensity constants (far_density.gd:1-2) -- both 1.0, kept named so the arithmetic below reads the
++// same as the GDScript.
++namespace {
++constexpr double SMOOTH_RELIEF = 1.0;
++constexpr double SMOOTH_BOUNDARY_NORMAL_STEP = 1.0;
++} // namespace
++
++// Port of FarDensity._radial_at (far_density.gd). `d`/`tangent` are Vector3 (real_t/f32) -- the SAME
++// class GDScript's Vector3 params are, so `.normalized()`/component ops round identically. `scale` is
++// f64 (the caller's `scale`/`-scale` local); GDScript's `tangent * scale` narrows `scale` to real_t
++// only at the multiply itself (a Vector3-times-float built-in), mirrored here by the explicit
++// `real_t(scale)` cast at the same point -- not any earlier. `sd.x/y/z` are then WIDENED back to
++// double to call profile_at_dir, exactly as GDScript passing a Vector3's real_t components into a
++// function whose parameters are (always-double) GDScript floats.
++Vector3 VoxelGeneratorCosmos::smooth_radial_at(
++		const Parameters &p, const Vector3 &d, const Vector3 &tangent, double scale, double r_datum) {
++	const Vector3 sd = (d + tangent * real_t(scale)).normalized();
++	const Vector4 prof = profile_at_dir(p, double(sd.x), double(sd.y), double(sd.z), r_datum);
++	const int g = int(prof.x);
++	const double relief = MAX(0.0, double(g - cosmos::SEA_LEVEL)) * SMOOTH_RELIEF;
++	// `sd * (r_datum + relief)`: the f64 sum narrows to real_t only at this final Vector3-times-float
++	// multiply, matching GDScript's `sd * (r_datum + relief)` term order exactly.
++	return sd * real_t(r_datum + relief);
++}
++
++// Port of FarDensity.boundary_normal (far_density.gd). `d` is Vector3 (real_t/f32); every op below
++// (dot/cross/normalized/unary-minus) is Godot's own Vector3 method, so this rounds bit-identically to
++// the GDScript Vector3 built-ins it mirrors. `scale = BOUNDARY_NORMAL_STEP / r_datum` is a plain f64
++// divide (both operands double), matching the GDScript local exactly.
++Vector3 VoxelGeneratorCosmos::smooth_boundary_normal(const Parameters &p, const Vector3 &d, double r_datum) {
++	Vector3 ref(0.0, 1.0, 0.0);
++	if (Math::abs(d.y) >= Math::abs(d.x) && Math::abs(d.y) >= Math::abs(d.z)) {
++		ref = Vector3(1.0, 0.0, 0.0);
++	}
++	const Vector3 u = (ref - d * ref.dot(d)).normalized();
++	const Vector3 v = d.cross(u).normalized();
++	const double scale = SMOOTH_BOUNDARY_NORMAL_STEP / r_datum;
++	const Vector3 pu = smooth_radial_at(p, d, u, scale, r_datum);
++	const Vector3 mu = smooth_radial_at(p, d, u, -scale, r_datum);
++	const Vector3 pv = smooth_radial_at(p, d, v, scale, r_datum);
++	const Vector3 mv = smooth_radial_at(p, d, v, -scale, r_datum);
++	Vector3 nv = (pu - mu).cross(pv - mv);
++	if (nv.length_squared() <= 0.0) {
++		return d;
++	}
++	nv = nv.normalized();
++	if (nv.dot(d) < 0.0) {
++		nv = -nv;
++	}
++	return nv;
++}
++
++// FP_SMOOTH_TILE_BAKE (perf port of far_density.gd / facet_smooth_tier.gd's node loop): ENTRY POINT 5.
++// One RWLockRead per call (bake_far_tile's idiom). Refuses (empty Dictionary) rather than emit a
++// plausible-but-wrong tile when not ready or the request is malformed -- the 0008 inert-but-well-formed
++// pattern; the caller falls back to its own FarDensity.node_at loop on refusal.
++Dictionary VoxelGeneratorCosmos::bake_smooth_tile(PackedFloat64Array corner_dirs, double r_datum, int cells) const {
++	RWLockRead rlock(_params_lock);
++	Dictionary out;
++	if (!_params.ready || corner_dirs.size() < 12 || cells <= 0 || cells > 512) {
++		return out;
++	}
++	const Parameters &p = _params;
++
++	const int stride = cells + 1;
++	const int n = stride * stride;
++
++	PackedVector3Array dir_arr;
++	PackedInt32Array g_arr;
++	PackedInt32Array biome_arr;
++	PackedFloat32Array temp_arr;
++	PackedVector3Array bnrm_arr;
++	PackedVector3Array pos_arr;
++	PackedVector3Array planar_arr;
++	PackedFloat32Array relief_arr;
++	dir_arr.resize(n);
++	g_arr.resize(n);
++	biome_arr.resize(n);
++	temp_arr.resize(n);
++	bnrm_arr.resize(n);
++	pos_arr.resize(n);
++	planar_arr.resize(n);
++	relief_arr.resize(n);
++
++	// Corner directions: v00, v10, v11, v01 (xyz each), the SAME order/indices FarDensity.node_at
++	// bilerps (corner_dirs[0,3,6,9]=x, [1,4,7,10]=y, [2,5,8,11]=z).
++	const double c0x = corner_dirs[0], c0y = corner_dirs[1], c0z = corner_dirs[2];
++	const double c1x = corner_dirs[3], c1y = corner_dirs[4], c1z = corner_dirs[5];
++	const double c2x = corner_dirs[6], c2y = corner_dirs[7], c2z = corner_dirs[8];
++	const double c3x = corner_dirs[9], c3y = corner_dirs[10], c3z = corner_dirs[11];
++
++	const double inv = 1.0 / double(cells);
++
++	Vector3 *dir_w = dir_arr.ptrw();
++	int32_t *g_w = g_arr.ptrw();
++	int32_t *biome_w = biome_arr.ptrw();
++	float *temp_w = temp_arr.ptrw();
++	Vector3 *pos_w = pos_arr.ptrw();
++	Vector3 *planar_w = planar_arr.ptrw();
++	float *relief_w = relief_arr.ptrw();
++
++	// NODE ITERATION ORDER -- matches facet_smooth_tier.gd's build_tile exactly: outer gj (t), inner gi
++	// (s), vi = gj*stride+gi, s=gi*inv, t=gj*inv, inv=1/cells.
++	for (int gj = 0; gj < stride; ++gj) {
++		const double t = double(gj) * inv;
++		for (int gi = 0; gi < stride; ++gi) {
++			const double s = double(gi) * inv;
++			const int vi = gj * stride + gi;
++
++			// FarDensity._bilerp, verbatim (same term order as the file-local `bilerp` above, which is
++			// already a byte-equal port of the sibling facet_tex_baker.gd `_bilerp`).
++			const double ex = bilerp(c0x, c1x, c2x, c3x, s, t);
++			const double ey = bilerp(c0y, c1y, c2y, c3y, s, t);
++			const double ez = bilerp(c0z, c1z, c2z, c3z, s, t);
++			const double ln = Math::sqrt(ex * ex + ey * ey + ez * ez);
++			// Default (ln <= 0.0): dx=0, dy=1, dz=0 -- FarDensity.node_at's own degenerate default.
++			double dx = 0.0, dy = 1.0, dz = 0.0;
++			if (ln > 0.0) {
++				dx = ex / ln;
++				dy = ey / ln;
++				dz = ez / ln;
++			}
++			// profile_at_dir samples the F64 dx/dy/dz -- BEFORE the Vector3(f32) narrow below, exactly
++			// as GDScript's node_at calls TerrainConfig.profile_at_dir(dx, dy, dz, r_datum) prior to
++			// constructing `var dir := Vector3(dx, dy, dz)`.
++			const Vector4 prof = profile_at_dir(p, dx, dy, dz, r_datum);
++			const int g = int(prof.x);
++			const int biome = int(prof.y);
++			const double temp = double(prof.w);
++			const double relief = MAX(0.0, double(g - cosmos::SEA_LEVEL)) * SMOOTH_RELIEF;
++
++			// THE f32 narrow point: GDScript's `Vector3(dx, dy, dz)` constructor.
++			const Vector3 dir = Vector3(real_t(dx), real_t(dy), real_t(dz));   // NOT `Vector3 dir(real_t(dx)...)` — most-vexing-parse (reads as a function decl)
++			const Vector3 planar = dir * real_t(r_datum);
++			// `planar + dir*relief`, NOT `dir*(r_datum+relief)` -- matches node_at's own term order
++			// (`planar+dir*relief`) to avoid a rounding divergence.
++			const Vector3 pos = planar + dir * real_t(relief);
++
++			dir_w[vi] = dir;
++			g_w[vi] = g;
++			biome_w[vi] = biome;
++			temp_w[vi] = float(temp);
++			pos_w[vi] = pos;
++			planar_w[vi] = planar;
++			relief_w[vi] = float(relief);
++		}
++	}
++
++	// Boundary normals: PERIMETER nodes only (gi==0 || gi==cells || gj==0 || gj==cells, i.e. s or t in
++	// {0,1}) -- matches build_tile's own boundary-vs-interior split. Interior nodes get Vector3(0,0,0);
++	// the caller (build_tile) only ever reads bnrm at the boundary, same as it only calls
++	// FarDensity.boundary_normal there.
++	Vector3 *bnrm_w = bnrm_arr.ptrw();
++	for (int gj = 0; gj < stride; ++gj) {
++		for (int gi = 0; gi < stride; ++gi) {
++			const int vi = gj * stride + gi;
++			if (gi == 0 || gi == cells || gj == 0 || gj == cells) {
++				bnrm_w[vi] = smooth_boundary_normal(p, dir_w[vi], r_datum);
++			} else {
++				bnrm_w[vi] = Vector3(0.0, 0.0, 0.0);
++			}
++		}
++	}
++
++	out["dir"] = dir_arr;
++	out["g"] = g_arr;
++	out["biome"] = biome_arr;
++	out["temp"] = temp_arr;
++	out["bnrm"] = bnrm_arr;
++	out["pos"] = pos_arr;
++	out["planar"] = planar_arr;
++	out["relief"] = relief_arr;
++	return out;
++}
++
+ // A facet id the frozen atlas actually covers. cell_dir indexes facet_frame directly, so an
+ // unchecked fid from script would read out of bounds -- checked once at the entry point rather than
+ // per core call, keeping the hot path clean while the boundary stays safe.
+@@ -2335,6 +2510,8 @@ void VoxelGeneratorCosmos::_bind_methods() {
+ 	// FP_CPP_TILE_BAKE (F1): the full-tile far-map bake entry point (ENTRY POINT 4 above).
+ 	ClassDB::bind_method(D_METHOD("bake_far_tile", "fid", "lat_corners", "nx", "ny", "tex", "edit_cells", "edit_far_idx"),
+ 			&VoxelGeneratorCosmos::bake_far_tile);
++	// Perf port of far_density.gd's FarDensity.node_at + boundary_normal (ENTRY POINT 5 above).
++	ClassDB::bind_method(D_METHOD("bake_smooth_tile", "corner_dirs", "r_datum", "cells"), &VoxelGeneratorCosmos::bake_smooth_tile);
+ 	ClassDB::bind_method(D_METHOD("_generate_block", "out_buffer", "origin_in_voxels", "lod"), &VoxelGeneratorCosmos::gd_generate_block);
+ 	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
+ 	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index dbe9f04..4e1282d 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -93,6 +93,7 @@
+ #include "../../storage/voxel_buffer_gd.h"
+ 
+ #include <core/math/color.h>
++#include <core/math/vector3.h>
+ #include <core/math/vector4i.h>
+ #include <core/variant/typed_array.h>
+ 
+@@ -177,6 +178,38 @@ public:
+ 	PackedByteArray bake_far_tile(int fid, PackedVector2Array lat_corners, int nx, int ny, int tex,
+ 			PackedInt64Array edit_cells, PackedInt32Array edit_far_idx) const;
+ 
++	// --- ENTRY POINT 5: smooth-tile far-geometry bake (perf port of far_density.gd) ----------------
++	//
++	// Byte-equal port of `FarDensity.node_at` (the grid-node bilerp+direction+profile sample) plus
++	// `FarDensity.boundary_normal`/`_radial_at` (the perimeter-only central-difference normal) --
++	// see far_density.gd for the reference this must match term-for-term (REV6). `corner_dirs` is the
++	// facet's 12 canon corner-direction doubles (`FacetAtlas.facet_corner_dirs(fid)`, v00/v10/v11/v01
++	// order, xyz each) exactly as GDScript's `node_at` receives them; `r_datum` is `FacetAtlas.r_of(fid)`;
++	// `cells` is the tile's grid subdivision (stride = cells+1 per side, matching `build_tile`).
++	//
++	// Refuses (returns an EMPTY Dictionary) when not ready, `corner_dirs.size() < 12`, `cells <= 0`, or
++	// `cells > 512` -- the 0008 inert-but-well-formed pattern (same idiom as bake_far_tile); the caller
++	// falls back to its own per-node `FarDensity.node_at` loop on refusal.
++	//
++	// NODE ITERATION ORDER (must match facet_smooth_tier.gd's `build_tile`, facet_smooth_tier.gd:93-98:
++	// outer `for gj in range(stride)`, inner `for gi in range(stride)`, `s = float(gi)*inv`,
++	// `t = float(gj)*inv`, `inv = 1.0/float(cells)`, `vi = gj*stride+gi`) so every returned array lines
++	// up index-for-index with the caller's own vertex buffer. Used here verbatim: outer gj/t, inner
++	// gi/s, vi = gj*stride+gi.
++	//
++	// Returns a Dictionary, every value length (cells+1)^2 in the order above:
++	//   "dir"    PackedVector3Array  -- f32 grid-node direction (node_at's `dir`)
++	//   "g"      PackedInt32Array    -- integer terrain height (node_at's `g`)
++	//   "biome"  PackedInt32Array
++	//   "temp"   PackedFloat32Array
++	//   "bnrm"   PackedVector3Array  -- FarDensity.boundary_normal(dir, r_datum) on perimeter nodes
++	//                                  (gi==0 || gi==cells || gj==0 || gj==cells); Vector3(0,0,0) on
++	//                                  interior nodes (the caller only ever reads bnrm at the boundary,
++	//                                  same as build_tile's own boundary-only override above)
++	//   "pos"/"planar"/"relief"      -- node_at's own radial pos / planar term / relief scalar, included
++	//                                  as a convenience so a caller need not re-derive them from dir+g.
++	Dictionary bake_smooth_tile(PackedFloat64Array corner_dirs, double r_datum, int cells) const;
++
+ 	// Harness alias: some GDScript gates drive the generator by the VoxelGeneratorScript override name
+ 	// `_generate_block(buffer, origin, lod)` rather than the base virtual. Bind it so those gates run
+ 	// against the C++ generator identically -- the LIVE game path (VoxelTerrain -> generate_block) is
+@@ -227,6 +260,16 @@ private:
+ 	static int col_h(const Parameters &p, int fid, int x, int z);
+ 	static bool fid_ok(const Parameters &p, int fid);
+ 
++	// --- FarDensity.boundary_normal / _radial_at ports (bake_smooth_tile) -------------------------
++	// `d`/`tangent` are Vector3 (real_t/f32) exactly as GDScript's Vector3 params -- see far_density.gd's
++	// own comment on why these stay in real_t rather than being widened: Vector3's ops (cross/dot/
++	// normalized) must round identically to the GDScript Vector3 built-ins. `scale`/`r_datum` are f64,
++	// matching the GDScript locals of the same name; each narrows to real_t only at the point a GDScript
++	// `Vector3 * float` expression would narrow it (see the two call sites in the .cpp).
++	static Vector3 smooth_radial_at(
++			const Parameters &p, const Vector3 &d, const Vector3 &tangent, double scale, double r_datum);
++	static Vector3 smooth_boundary_normal(const Parameters &p, const Vector3 &d, double r_datum);
++
+ 	static void tree_base_pos(int gx, int gz, int &out_bx, int &out_bz);
+ 	// COSMOS CLIMATE-BIOMES B1: needs `p` (p.climate_biomes) to decide whether B_JUNGLE/B_SAVANNA can
+ 	// ever be selected -- tree_gen.gd's _species_for gates the new species on the same flag.

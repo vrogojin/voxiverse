@@ -220,6 +220,11 @@ static func viewer_vertical_reach() -> float:
 static func clamped_viewer_offset_y() -> float:
 	var u := viewer_vertical_reach()
 	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	# FP_VIEWER_RELIEF_REACH (task #86): SYMMETRIC full-sphere reach — mesh VIEWER_RELIEF_REACH_BLOCKS in BOTH
+	# directions (up AND down) so terrain renders at any height within view distance (user: "render at any height").
+	# A symmetric ellipsoid centred on the player ⇒ zero offset; the half-height carries the reach (ratio helper).
+	if CubeSphere.FP_VIEWER_RELIEF_REACH:
+		return 0.0
 	if d >= u:
 		return 0.0
 	return (u - d) * 0.5
@@ -231,9 +236,31 @@ static func clamped_viewer_vertical_ratio() -> float:
 	var vd := float(near_render_radius())
 	var u := viewer_vertical_reach()
 	var d := float(VIEWER_DOWNWARD_REACH_BLOCKS)
+	# FP_VIEWER_RELIEF_REACH (task #86): SYMMETRIC full-sphere — half-height = VIEWER_RELIEF_REACH_BLOCKS over the
+	# horizontal view_distance, so the ellipsoid reaches the SAME reach up and down (with zero offset above) — the
+	# whole visible slope AND any peak above the player mesh as real voxels. Up is mostly air (cheap early-out).
+	if CubeSphere.FP_VIEWER_RELIEF_REACH and vd > 0.0:
+		return float(CubeSphere.VIEWER_RELIEF_REACH_BLOCKS) / vd
 	if d >= u or vd <= 0.0:
 		return VIEWER_VERTICAL_RATIO
 	return ((u + d) * 0.5) / vd
+
+## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §4 — the streamed VoxelViewer ellipsoid's params, in ONE place, so
+## attach_viewer() (module_world.gd) AND the far ring's per-vertex analytic un-sink coverage law
+## (FP_FARRING_UNCOVERED_TRUE) share a SINGLE derivation site — they can never quietly disagree about what the
+## near voxel field actually streams. Returns (r, O, H) packed into a Vector3 (value type, zero allocation — the
+## same convention column_profile's Vector4 uses): r = horizontal semi-axis (near_render_radius()), O = the +Y
+## radial offset the A2 downward-reach clamp applies to the viewer node (0 when FACETED or the clamp itself is
+## off — the un-clamped symmetric slab), H = the vertical half-height of the streamed ellipsoid
+## (view_distance · view_distance_vertical_ratio, i.e. clamped_viewer_vertical_ratio() · r when clamped, else
+## VIEWER_VERTICAL_RATIO · r). Read-only: computes from the SAME consts/helpers attach_viewer already used —
+## no new behaviour, no new state.
+static func streamed_ellipsoid_params() -> Vector3:
+	var r := float(near_render_radius())
+	var use_clamp := CubeSphere.FACETED and DOWNWARD_REACH_CLAMP_ENABLED
+	var o := clamped_viewer_offset_y() if use_clamp else 0.0
+	var ratio := clamped_viewer_vertical_ratio() if use_clamp else VIEWER_VERTICAL_RATIO
+	return Vector3(r, o, ratio * r)
 
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.

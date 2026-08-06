@@ -8,10 +8,13 @@ extends RefCounted
 ## TWO paths, one surface class (Naive Surface Nets, §2.2):
 ##   • SIMPLE (heightfield, the 99.99 % case): the far surface is the GRAPH of the column height over the facet
 ##     plane, so the "isosurface" is one vertex per column placed radially at the relief height. `node_at`
-##     returns that vertex + its shading inputs, sampled through the EXACT chain the shipped far-ring emit uses
-##     (`facet_far_ring.gd:1363`: bilerp planar corners → normalize → `profile_at_dir` at R_BLOCKS → relief), so
-##     a smooth-tier vertex COINCIDES with the heightfield vertex at any shared node ⇒ welds to the shipped shell
-##     and to same-pitch neighbours by construction (§2.4).
+##     returns that vertex + its shading inputs, sampled through the EXACT chain FS1 welds with
+##     (`facet_far_ring.gd:2914` `_weld_unit` precedent): bilerp the SHARED canon corner DIRECTIONS
+##     (`FacetAtlas.facet_corner_dirs`) → normalize → `profile_at_dir` at the datum radius → relief. Unlike the
+##     pre-P0 defect (bilerp the facet's OWN `facet_planar_corner` points then normalize — adjacent facets
+##     disagree at a shared edge by the ∝R datum step, `facet_atlas.gd:420`), a boundary node's direction is now
+##     a bilerp of the TWO shared canon corners only ⇒ two facets meeting at that edge compute the bit-identical
+##     direction, hence the identical `g`/relief/pos there (COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2).
 ##   • COMPLEX (edit-cluster occupancy, Item B4 `FP_FAR_SMOOTH_OVERHANG`): `occ_at` — solid fraction of a cell's
 ##     underlying blocks (terrain + edit overlay, EXCLUDING TreeGen). STUB here (B1 ships the simple path only);
 ##     the mesher's vertical edge-scan plugs into it unchanged when B4 lands.
@@ -23,45 +26,101 @@ extends RefCounted
 ## vertices on the SAME radial law as the heightfield emit, or the two would not weld at the tier hand-off.
 const RELIEF := 1.0
 
-## The simple-path node record for facet-param (s, t) ∈ [0,1]² over the tile whose 4 planar corners are `corners`
-## (each an `[x,y,z]` Array from `FacetAtlas.facet_planar_corner`, ABSOLUTE planet-block coords — the far ring's
-## own frame). Returns:
-##   pos    : Vector3 world vertex = planar + dir·relief  (the radial surface point — identical to the emit)
+## The simple-path node record for facet-param (s, t) ∈ [0,1]² over a tile whose 4 corners' SHARED canon
+## directions are `corner_dirs` (`FacetAtlas.facet_corner_dirs(fid)` verbatim — 12 f64, CCW 00,10,11,01) at
+## datum radius `r_datum` (`FacetAtlas.r_of(fid)`). COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 2 (P0): the node
+## DIRECTION is the bilerp of these CANON corner dirs — NOT a normalize of bilerp'd `facet_planar_corner` points
+## (the defect) — so a boundary node (s or t ∈ {0,1}) is a pure function of the two SHARED corner dirs on that
+## edge, bit-identical regardless of which facet computed it. Returns:
+##   pos    : Vector3 world vertex = planar + dir·relief = dir·(r_datum + relief)  (the radial surface point)
 ##   dir    : Vector3 outward unit radial at this node    (for the ε-sink, normal orientation, skirt drop)
-##   planar : Vector3 the un-relieved plane point         (skirt/weld reference)
+##   planar : Vector3 the un-relieved base ALONG the canon dir (dir·r_datum)       (skirt/weld reference)
 ##   g      : int  ground cell height (blocks)            (G-FS-BOUND range check, LOD chord-snap)
 ##   biome  : int  · temp : float                         (skin colour via FarPalette.color_for)
 ##   relief : float radial displacement (blocks)          (degeneracy check, chord-snap)
-static func node_at(corners: Array, s: float, t: float) -> Dictionary:
-	var c0: Array = corners[0]
-	var c1: Array = corners[1]
-	var c2: Array = corners[2]
-	var c3: Array = corners[3]
-	var bx := _bilerp(c0[0], c1[0], c2[0], c3[0], s, t)
-	var by := _bilerp(c0[1], c1[1], c2[1], c3[1], s, t)
-	var bz := _bilerp(c0[2], c1[2], c2[2], c3[2], s, t)
-	var ln := sqrt(bx * bx + by * by + bz * bz)
+static func node_at(corner_dirs: PackedFloat64Array, r_datum: float, s: float, t: float) -> Dictionary:
+	var ex := _bilerp(corner_dirs[0], corner_dirs[3], corner_dirs[6], corner_dirs[9], s, t)
+	var ey := _bilerp(corner_dirs[1], corner_dirs[4], corner_dirs[7], corner_dirs[10], s, t)
+	var ez := _bilerp(corner_dirs[2], corner_dirs[5], corner_dirs[8], corner_dirs[11], s, t)
+	var ln := sqrt(ex * ex + ey * ey + ez * ez)
 	# Degenerate guard (a corner exactly at the planet centre is impossible, but keep the mesher total): a zero-
 	# length node has no radial ⇒ treat as up +Y so the tile still tessellates rather than emitting NaNs.
 	var dx := 0.0
 	var dy := 1.0
 	var dz := 0.0
 	if ln > 0.0:
-		dx = bx / ln
-		dy = by / ln
-		dz = bz / ln
-	var prof := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
+		dx = ex / ln
+		dy = ey / ln
+		dz = ez / ln
+	var prof := TerrainConfig.profile_at_dir(dx, dy, dz, r_datum)
 	var g := int(prof.x)
 	var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+	var dir := Vector3(dx, dy, dz)
+	var planar := dir * r_datum
 	return {
-		"pos": Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief),
-		"dir": Vector3(dx, dy, dz),
-		"planar": Vector3(bx, by, bz),
+		"pos": planar + dir * relief,
+		"dir": dir,
+		"planar": planar,
 		"g": g,
 		"biome": int(prof.y),
 		"temp": prof.w,
 		"relief": relief,
 	}
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 5 Stage D (FP_RIM_CHEAP, §7.1 (ii) crescent rebake): the node
+## DIRECTION only — the SAME bilerp+normalize+degenerate-guard as `node_at`'s first half, but WITHOUT the
+## `TerrainConfig.profile_at_dir` noise sample (`node_at`'s actual cost). `FacetSmoothTier.build_tile_rim`'s
+## crescent path uses this to test a node's world position (`dir * r_datum`, the un-relieved planar point) against
+## the old/new player-column annulus BEFORE deciding whether the node needs a fresh (expensive) `node_at` call at
+## all — a genuinely free-ish membership test, not a shortcut that skips real terrain sampling for a node that
+## still needs it.
+static func node_dir(corner_dirs: PackedFloat64Array, s: float, t: float) -> Vector3:
+	var ex := _bilerp(corner_dirs[0], corner_dirs[3], corner_dirs[6], corner_dirs[9], s, t)
+	var ey := _bilerp(corner_dirs[1], corner_dirs[4], corner_dirs[7], corner_dirs[10], s, t)
+	var ez := _bilerp(corner_dirs[2], corner_dirs[5], corner_dirs[8], corner_dirs[11], s, t)
+	var ln := sqrt(ex * ex + ey * ey + ez * ez)
+	if ln <= 0.0:
+		return Vector3(0.0, 1.0, 0.0)
+	return Vector3(ex / ln, ey / ln, ez / ln)
+
+## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §2 law 3 (P0) — the facet-agnostic BOUNDARY normal: central differences
+## of `profile_at_dir` in the CANONICAL tangent frame of `d` (a pure function of `d` alone — mirrors
+## `FacetFarRing._env_corner_min`'s u/v construction, `facet_far_ring.gd:2456-2461`: pick the world axis LEAST
+## aligned with `d`, Gram-Schmidt it off `d`, cross for the second tangent). Two facets sharing a boundary node
+## have the identical canon `d` there (law 2) ⇒ this computes the IDENTICAL normal on both sides — no grid-index
+## / facet-frame dependency, so the interior (grid cross-tangent stencil) / boundary (this) blend is invisible.
+## Cost: 4 extra `profile_at_dir` calls (±tangent1, ±tangent2) — matches the design's stated budget.
+const BOUNDARY_NORMAL_STEP := 1.0   # blocks — arc-length step for the central-difference tangent stencil
+static func boundary_normal(d: Vector3, r_datum: float) -> Vector3:
+	var ref := Vector3(0.0, 1.0, 0.0)
+	if absf(d.y) >= absf(d.x) and absf(d.y) >= absf(d.z):
+		ref = Vector3(1.0, 0.0, 0.0)                    # d ~ ±Y → use X so the cross stays well-conditioned
+	var u := (ref - d * ref.dot(d)).normalized()
+	var v := d.cross(u).normalized()
+	var scale := BOUNDARY_NORMAL_STEP / r_datum          # angular offset ≈ tan θ for the small arc-length step
+	var pu := _radial_at(d, u, scale, r_datum)
+	var mu := _radial_at(d, u, -scale, r_datum)
+	var pv := _radial_at(d, v, scale, r_datum)
+	var mv := _radial_at(d, v, -scale, r_datum)
+	var ts := pu - mu
+	var tt := pv - mv
+	var nv := ts.cross(tt)
+	if nv.length_squared() <= 0.0:
+		return d
+	nv = nv.normalized()
+	if nv.dot(d) < 0.0:
+		nv = -nv
+	return nv
+
+## The radial surface point at direction `d` nudged toward `tangent` by `scale` (radians-ish, small-angle),
+## renormalized onto the unit sphere then placed at its own true relief — one sample of the central-difference
+## stencil `boundary_normal` uses.
+static func _radial_at(d: Vector3, tangent: Vector3, scale: float, r_datum: float) -> Vector3:
+	var sd := (d + tangent * scale).normalized()
+	var prof := TerrainConfig.profile_at_dir(sd.x, sd.y, sd.z, r_datum)
+	var g := int(prof.x)
+	var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
+	return sd * (r_datum + relief)
 
 ## COMPLEX path (Item B4) — solid fraction of the 2^level³ blocks under lattice cell `cell` on facet `fid`,
 ## from terrain + edit overlay, EXCLUDING TreeGen (trees are Item C). `d = 0.5 − occ` is the occupancy density

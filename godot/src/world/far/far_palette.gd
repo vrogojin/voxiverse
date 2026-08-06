@@ -268,7 +268,9 @@ static func ensure_moon_ready() -> void:
 ## bright anorthosite — a desaturated grey scale that matches the near voxel world's regolith/basalt/anorthosite.
 static func moon_color_for(biome: int) -> Color:
 	ensure_moon_ready()
-	if biome == TerrainConfig.B_MOON_MARIA:
+	# COSMOS-TREE-BUGS Bug 1 fix: routed through moon_biome_id (not the raw B_MOON_MARIA const) so this still
+	# matches the ids TerrainConfig actually emits under FP_BIOME_SPACE_FIX (11 off / 21 on). Byte-identical off.
+	if biome == TerrainConfig.moon_biome_id(0):
 		return _regolith.lerp(_basalt, 0.55)      # dark maria plains
 	return _regolith.lerp(_anorthosite, 0.45)     # bright highlands / polar
 

@@ -135,9 +135,11 @@ func _gate_ring() -> void:
 		i += 337                                     # coprime stride — samples spread across facets
 	_ok(max_sat < 0.12, "G-MOON-RING: all sampled colours desaturated (max channel spread %.3f < 0.12 — grey moon)" % max_sat)
 
-	# Distinct maria vs highlands (the palette actually varies with biome, not one flat grey).
-	var m_col := FarPalette.moon_color_for(TerrainConfig.B_MOON_MARIA)
-	var h_col := FarPalette.moon_color_for(TerrainConfig.B_MOON_HIGHLANDS)
+	# Distinct maria vs highlands (the palette actually varies with biome, not one flat grey). Routed through
+	# moon_biome_id (COSMOS-TREE-BUGS Bug 1 fix) so this still matches under FP_BIOME_SPACE_FIX; byte-identical
+	# off (moon_biome_id(0/1) == B_MOON_MARIA/_HIGHLANDS == 11/12 there).
+	var m_col := FarPalette.moon_color_for(TerrainConfig.moon_biome_id(0))
+	var h_col := FarPalette.moon_color_for(TerrainConfig.moon_biome_id(1))
 	_ok(h_col.r - m_col.r > 0.05, "G-MOON-RING: highlands (%.2f) brighter than maria (%.2f) — biome palette varies" % [h_col.r, m_col.r])
 
 # ---------- G-MOON-RING-BUDGET: real bytes ≤ budget + freed to zero on evict ----------

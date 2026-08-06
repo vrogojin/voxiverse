@@ -103,6 +103,14 @@ var _live := -1                               # index of the live body; -1 = not
 # Per-body shape pools (reused across rebuilds → no steady-state allocation, only re-attach).
 var _pool: Array = [[], []]                   # per-body Array[BoxShape3D]
 var _cpool: Array = [[], []]                  # per-body Array[ConvexPolygonShape3D]
+# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE) — per-body COLUMN → shape-slot-range bookkeeping
+# (Vector2i(x,z) -> Vector2i(start_slot, end_slot), half-open), populated in _emit_column (both call sites
+# process one column at a time, so every slot claimed between that column's entry and exit is contiguous and
+# exclusively its own). carve_cells() uses it to disable exactly the LIVE body's slots for the carved
+# columns; _attach() re-enables a slot's `disabled` state on every (re)point, so a later rebuild that reuses a
+# carved slot for different content is never left stuck disabled. Only ever populated/read under the flag —
+# off ⇒ the dict stays empty, zero cost.
+var _col_slots: Array = [{}, {}]              # per-body Dictionary[Vector2i, Vector2i]
 
 var _live_center := Vector2i(0x7fffffff, 0)   # centre of the LIVE shape set (sentinel = none)
 var _target := Vector2i(0x7fffffff, 0)        # latest requested centre (player's column)
@@ -227,6 +235,59 @@ func rebuild_now() -> void:
 		_edit_age = 0                       # first edit of a burst: start the max-latency clock
 	_dirty = true
 	_edit_idle = 0                          # every new edit resets the debounce window
+
+## COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE) — synchronously RE-EMIT the LIVE body's geometry for
+## every column touched by a just-collapsed component `comp`, so a VoxelBody about to spawn_loose() into
+## those exact cells doesn't start fully overlapping stale collider geometry (rebuild_now() only marks the
+## rebuild dirty — it lands DEBOUNCE_FRAMES..MAX_LATENCY_FRAMES later, long after the body has already been
+## depenetrated/torqued by the stale shapes).
+##
+## NOT a blanket disable of the column's old slot range: a tree sits directly on unbroken ground, so
+## ground+trunk+canopy are ONE contiguous solid run → ONE box per column in the common case. Disabling that
+## whole slot wholesale (the first cut of this fix) removed the GROUND under the tree too — the canopy fell
+## straight through into an infinite freefall, worse than the bug it fixed. Instead: reuse `_emit_column`
+## (the exact function the real build uses) to recompute this column's geometry FROM THE JUST-EDITED WORLD
+## (`_write_cell` already ran — the component is air, the ground beneath is untouched and still solid), and
+## re-point the column's OLD slot range to the new boxes: fewer boxes → the leftover reused slots are
+## disabled (`_attach`'s disabled=false reset un-does that once a REAL rebuild reuses them); more boxes → the
+## excess is appended fresh (`_col_slots` widens to cover them, so a later carve of this same column still
+## finds the right range). `_build_ylo` here is a per-column DEPTH-deep floor (not the region's shared min —
+## cheaper and always at least as deep as this column needs; the debounced full rebuild replaces it with the
+## official geometry shortly after). The shared build-state vars are used only transiently and saved/restored
+## around the call so an amortized STAGING build in progress on the OTHER body index is never disturbed.
+## No-op if nothing has been built yet (_live < 0) or a touched column was never tracked by the live body
+## (outside its region, or built before FP_CHOP_COLLIDER_CARVE existed). Off ⇒ early-return, zero cost.
+func carve_cells(comp: Array) -> void:
+	if not CubeSphere.FP_CHOP_COLLIDER_CARVE or _live < 0:
+		return
+	var rid := _body[_live].get_rid()
+	var cols: Dictionary = {}                   # de-dupe columns touched by comp (Vector2i(x,z) -> true)
+	for c: Vector3i in comp:
+		cols[Vector2i(c.x, c.z)] = true
+	var saved_slot := _build_slot
+	var saved_prev := _build_prev_count
+	var saved_ylo := _build_ylo
+	var saved_pc := _build_pc
+	var saved_lift := _emit_lift
+	var pc := {}
+	for col in cols.keys():
+		var slot_range: Vector2i = _col_slots[_live].get(col, Vector2i(-1, -1))
+		if slot_range.x < 0:
+			continue                            # column never tracked by the live body — nothing to patch
+		var h := int(world.col_profile(col.x, col.y, pc).x)
+		_build_ylo = h - DEPTH
+		_build_pc = pc
+		_build_slot = slot_range.x
+		_build_prev_count = slot_range.y        # reuse [start, old_end) via body_set_shape; beyond it, body_add_shape
+		_emit_column(_live, col.x, col.y, h)
+		for slot in range(_build_slot, slot_range.y):
+			PhysicsServer3D.body_set_shape_disabled(rid, slot, true)   # fewer boxes than before → retire the surplus
+		_col_slots[_live][col] = Vector2i(slot_range.x, maxi(_build_slot, slot_range.y))
+	_build_slot = saved_slot
+	_build_prev_count = saved_prev
+	_build_ylo = saved_ylo
+	_build_pc = saved_pc
+	_emit_lift = saved_lift
 
 ## COSMOS FP-FIXED-FRAME (§2.2 step 8): a facet crossing flipped the play frame (ActiveFrame T_from→T_to), so
 ## every live box shape — placed in the OLD active lattice — now resolves to a STALE absolute pose. Invalidate the
@@ -419,6 +480,10 @@ func _finish_build() -> void:
 ## is always "absent" there), collapsing the region's ~30k Vector3i lookups to the handful of
 ## genuinely-edited columns. The queries below are the LIGHT surface/cap ones (no generated_cell).
 func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
+	# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE): capture this column's shape-slot range. Both call sites
+	# (_build_core / _advance_build) process one column per call with no interleaving, so every slot claimed
+	# between entry and exit belongs exclusively to (x, z). Off ⇒ skipped, zero cost.
+	var _cc_slot0 := _build_slot if CubeSphere.FP_CHOP_COLLIDER_CARVE else 0
 	var edited := world.is_edited_column(x, z)
 	# COSMOS FS2 (docs/COSMOS-FACET-SEAMS-DESIGN.md §3.2): thread the per-column datum shift S so the collider
 	# matches the datum-shifted render (generated_cell / the surface funnel). The whole column raises by S:
@@ -565,6 +630,11 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		y += 1
 	if run_start != 0x7fffffff:
 		_add_box(bidx, x, z, run_start, y_top + 1)   # top run (surface / tree / tower)
+	# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE): record the column's [start, end) slot range (half-open;
+	# empty when the column emitted nothing — e.g. a fully-dug shaft — which carve_cells treats as "nothing to
+	# disable", correctly). Off ⇒ skipped, zero cost.
+	if CubeSphere.FP_CHOP_COLLIDER_CARVE:
+		_col_slots[bidx][Vector2i(x, z)] = Vector2i(_cc_slot0, _build_slot)
 
 ## Attach one box covering the solid cells [y_bottom, y_top-1] of column (x, z) to body `bidx`,
 ## from that body's pool (resized in place → no allocation). Translation-only transform.
@@ -591,6 +661,13 @@ func _attach(bidx: int, shape_rid: RID, t: Transform3D) -> void:
 	if _build_slot < _build_prev_count:
 		PhysicsServer3D.body_set_shape(rid, _build_slot, shape_rid)
 		PhysicsServer3D.body_set_shape_transform(rid, _build_slot, t)
+		# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE): a REUSED slot may have been left `disabled` by an
+		# earlier carve_cells() call on this body — always re-enable on repoint, so a rebuild that reuses a
+		# carved slot for different (or the same, now-settled) content is never left stuck disabled. A brand
+		# NEW slot (the `else` branch) is never disabled in the first place (PhysicsServer default), so it
+		# needs no reset. Off ⇒ skipped — zero extra PhysicsServer op, byte-identical op-budget pacing.
+		if CubeSphere.FP_CHOP_COLLIDER_CARVE:
+			PhysicsServer3D.body_set_shape_disabled(rid, _build_slot, false)
 	else:
 		PhysicsServer3D.body_add_shape(rid, shape_rid, t)
 	_build_slot += 1

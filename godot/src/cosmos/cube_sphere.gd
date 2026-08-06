@@ -2852,6 +2852,46 @@ const CAM_RL_ALT_HI := 96.0
 ## (which can land at w≈1) doesn't pop the roll in on the very next frame. Eyeball-tunable.
 const CAM_RL_EASE_S := 0.5
 
+## COSMOS-TREE-BUGS (docs/COSMOS-TREE-BUGS-DESIGN.md, Bug 1) — the biome-id space collision fix. `B_SAVANNA
+## := 11` / `B_JUNGLE := 12` (terrain_config.gd) collide with `B_MOON_MARIA := 11` / `B_MOON_HIGHLANDS := 12`;
+## `resolve_cell` routes moon biomes BEFORE any Earth machinery, so an Earth savanna/jungle column reaching the
+## ANALYTIC path (`block_id_at`/`generated_cell`) is hijacked into `_moon_cell` (airless, no TreeGen) while the
+## C++ mesh (which has no moon branch) draws the correct acacia/jungle — the mesh shows trees the analytic side
+## reports as AIR: no aim, no break, no collision, walk-through. Renumbers the moon biome ids to 21/22/23
+## (clear of every Earth id) via `TerrainConfig.moon_biome_id`/`is_moon_biome` — GDScript consts can't be
+## flag-conditional, so every comparison/emission routes through the one helper pair instead. The C++
+## generator needs no change (it has no moon branch at all); biome ids are never serialized (edits store packed
+## material values, biome is derived per column) so renumbering has zero save/compat surface. Default FALSE ⇒
+## the helpers return 11/12/13 (the shipped ids) ⇒ byte-identical. Gate: verify_tree_biomes.gd.
+const FP_BIOME_SPACE_FIX := false
+
+## COSMOS-TREE-BUGS (Bug 2a) — per-facet gravity box coverage. `GRAV_BOX_TANGENTIAL := 320` (world_manager.gd)
+## was sized 2026-07-15 for a ~200-block-wide facet; the 2026-07-19 natural-Earth R=6371 rescale grew facets to
+## ~500-590×350-400 blocks (measured, probe_gravbox.gd), so the outer ~60% of every facet's domain sits outside
+## its ±160 gravity Area3D — any VoxelBody out there falls back to Godot's project-default global (0,−9.8,0),
+## an arbitrary oblique pull once expressed in the planet-fixed frame (measured gdot −0.605 vs the correct
+## 1.000). When true, `_build_facet_gravity_area` sizes + centres each facet's box from its OWN measured domain
+## (`FacetAtlas.dom_min/dom_max` + `GRAV_BOX_MARGIN`) instead of the fixed ±160 box centred on `centre_cell` (the
+## domains are asymmetric about that centre too). Same area count ⇒ zero memory delta (NEVER-OOM safe); box
+## DIRECTION is unchanged (−T_fid.basis.y), so the existing fixed-frame gravity lemmas hold as-is. Default FALSE
+## ⇒ the shipped 320×2048×320 box @ centre_cell, byte-identical. Gate: verify_treechop.gd (G-TC-COVER/G-TC-GRAV).
+const FP_GRAV_BOX_COVER := false
+## Half-extent margin (blocks) added to the measured domain span before the box floor `GRAV_BOX_TANGENTIAL/2` —
+## covers the ridge band + a chopped body's detach-kick drift. Only consulted under FP_GRAV_BOX_COVER.
+const GRAV_BOX_MARGIN := 24.0
+
+## COSMOS-TREE-BUGS (Bug 2b) — the spawn-overlap fix. A collapse-detached canopy (`VoxelBody.spawn_loose`)
+## places its 20-30 box shapes at IDENTITY in the exact lattice cells the tree just occupied — but
+## `GroundCollider.rebuild_now()` is debounced (0.25-1.0 s, non-blocking), so the canopy spawns 100% inside its
+## OWN stale collider tree boxes; the physics solver's depenetration ejects + torques it (measured: updot
+## 1.000 → −0.609 in 4 s, a ~127° over-rotation "flip"; combined with Bug 2a's oblique gravity, NaN in the
+## first physics step). When true, `_structural_update` synchronously carves the live collider shapes at
+## exactly the carved cells (`GroundCollider.carve_cells`, O(component) targeted `PhysicsServer3D` shape frees)
+## BEFORE `spawn_loose`, so the new body never starts inside a collider box it should no longer be inside; the
+## debounced full rebuild still proceeds afterward as shipped. Default FALSE ⇒ the shipped debounced-only path,
+## byte-identical. Gate: verify_treechop.gd (G-TC-SETTLE).
+const FP_CHOP_COLLIDER_CARVE := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

@@ -2811,6 +2811,47 @@ const FLOOR_WELD_EPS := 2.0
 ## the probe is never evaluated (one flag compare inside the existing landing-query branch) ⇒ byte-identical.
 const FP_FALLTHRU_PROBE := false
 
+## COSMOS UP-VECTOR FACET-DESYNC FIX (docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md §2, task #91) — re-own
+## the facet you stand on. The player's up is never "set" and can never be stale on its own — it IS the active
+## facet's ActiveFrame transform (yaw-only body, no roll DOF exists to corrupt). The STALE thing is the active
+## facet ITSELF: along every seam there is a narrow strip (own_dist up to ~0.3, live-widened by the FP_DATUM_BAKE
+## lift vs the crossing law's lattice-y check) where the crossing law never fires (own_dist ≥ −HYST) yet the soil
+## cell under the feet has already been junction-masked to the neighbour, which renders it at ITS orientation. A
+## de-orbit landing can deposit a STATIONARY player in that strip — the fixed point never self-corrects (measured
+## 3.13–3.75° cant, 244 equilibria / 11,808 near-ridge stations sampled, docs §1.3). When true, `maybe_cross_facet`
+## tries one more resolver after its normal slot scan finds nothing: if the player is grounded, near-stationary,
+## near a ridge, AND the soil cell under their feet is masked for the active facet, commit the crossing the soil
+## law already implies — through the SAME blessed `_commit_facet_change` path (ActiveFrame/up, pose via the
+## caller's `apply_reframe`, pool/far-ring/gravity all flip together), using the SAME corner-wall acceptance bound
+## `_corner_commit` already uses. Never fires for a walking player (h_speed guard) or off the strip (own_dist
+## guard) ⇒ normal crossings, hysteresis, cooldown, containment and corner-commit are all untouched. Default FALSE
+## ⇒ the new call is unreached (one flag compare) ⇒ byte-identical. Gate: verify_upvector_heal.gd.
+const FP_UPVECTOR_FACET_HEAL := false
+
+## COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5 (docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md, Class C) —
+## visual-only radial-horizon leveling. `FP_UPVECTOR_FACET_HEAL` (above) fixes the STRIP class (a stationary
+## player re-owns the wrong facet, a full facet-step cant); this is the SEPARATE, always-present geometric
+## residual (§1.6): the player's up is the piecewise-CONSTANT active-facet normal while the far horizon (ring
+## limb/sky/ocean) is CONTINUOUS (radially symmetric) — they disagree by up to 2.60° at a facet corner, and the
+## disagreement SIGN-FLIPS at every crossing (the "tilt changes at borders, frequently a bit off" live signal).
+## When true, `Player._move`'s tail rolls the DISPLAYED camera about the view-FORWARD axis only (`-basis.z`
+## invariant ⇒ aim/dig/wish untouched by construction) so the far horizon reads level, blended by altitude
+## (`CAM_RL_ALT_LO`..`CAM_RL_ALT_HI` — ground stays exactly the shipped image, w=0) and by pitch (`cos²`, kills
+## the mid-altitude floor-cant objection and the atan2 near-±90° ill-conditioning). Camera-display only: never
+## touches the body basis (`apply_reframe`), position/velocity/gravity, or the ActiveFrame — composes strictly
+## downstream of FP_UPVECTOR_FACET_HEAL/FP_QUERY_FRAME_GUARD/FP_FLOOR_SURFACE_WELD without reading/writing
+## anything they own. Default FALSE ⇒ no per-frame camera write exists at all (the shipped event-driven pitch
+## writes, player.gd, remain the only camera-local writers) ⇒ byte-identical. Gate: verify_camera_radial_level.gd.
+const FP_CAMERA_RADIAL_LEVEL := false
+## §5.2 blend consts (eyeball-tunable — the live A/B decision, not asserted beyond "0 at/below LO, 1 at/above
+## HI, C1 between"). LO=16 sits above trees/builds (the near floor stops filling the lower view below it); HI=96
+## is roughly the near view radius (beyond it the far tiers are the only horizontal reference).
+const CAM_RL_ALT_LO := 16.0
+const CAM_RL_ALT_HI := 96.0
+## §5.2 post-`_attitude_handback` ease: `_cam_rl_ease` ramps 0→1 over this many seconds so a de-orbit handback
+## (which can land at w≈1) doesn't pop the roll in on the very next frame. Eyeball-tunable.
+const CAM_RL_EASE_S := 0.5
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

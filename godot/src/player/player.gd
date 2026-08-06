@@ -191,6 +191,11 @@ var _dev_orbital_commit := false
 # (the fall's radial velocity is handed to velocity.y for continuity). DEAD with the flag off.
 var _fall_v_bci := PackedFloat64Array()
 var _fall_have_v := false
+# COSMOS UP-VECTOR FACET-DESYNC FIX (FP_UPVECTOR_FACET_HEAL, docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-DESIGN.md
+# §2): captured each `_move` tick from the SAME landing-clamp test already computed there (`position.y <=
+# floor_y`) — zero extra cost. Consumed once per physics frame as the `grounded` hint into `maybe_cross_facet`'s
+# strip resolver; unread (dead) with the flag off.
+var _grounded := false
 # COSMOS-PERF FALL-COLLAPSE FIX (FP_FREEFALL_RAILS) — the carried BCI fall POSITION for the closed-form (RAILS)
 # free-fall coast. Like the orbit coast's `_coast_p_bci`, the closed-form path carries [p,v] in the BCI frame
 # across frames (advanced by ONE universal-variable step/frame) instead of reconstructing p from the f32 lattice
@@ -245,6 +250,16 @@ var _body_shape: CollisionShape3D        # the player's capsule collider (disabl
 var _pitch := 0.0
 var _aimed: Dictionary = {}
 var _horiz_vel := Vector3.ZERO            # this frame's horizontal move velocity
+
+# COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5.2 (FP_CAMERA_RADIAL_LEVEL) — the post-`_attitude_handback` ease
+# ramp (0→1 over CAM_RL_EASE_S s). Starts at 1.0 (no ramp needed at boot/spawn — already in ATT_SURFACE with no
+# prior space attitude to hand back from); reset to 0.0 by `_attitude_handback`, advanced in `_move`'s roll
+# write. Unread with the flag off.
+var _cam_rl_ease := 1.0
+# §5.3 — the last-applied SIGNED roll angle (rad, `_CAM_RL_SIGN * phi`), cached so `window_camera_transform()`
+# can mirror the displayed pose without paying a second floor query every call (it has no access to `_move`'s
+# `terrain_floor` local). 0.0 (no roll) until the first `_move` tick under the flag; stays 0.0 forever off-flag.
+var _cam_rl_last_phi := 0.0
 
 # COSMOS-PERF FALL-ALTRATE (FP_FALL_CAMFAR_HOLD): throttle state for the altitude-ramped camera near/far planes.
 # _camfar_prev_d/_usec derive the radial speed; _camfar_apply_msec throttles the re-apply to ≤ 1/FALL_THROTTLE_MS
@@ -467,6 +482,38 @@ func camera_global_transform() -> Transform3D:
 func planet_render_centre() -> Vector3:
 	return world.planet_render_centre() if world != null else Vector3.ZERO
 
+# --- COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5.1/§5.2 (FP_CAMERA_RADIAL_LEVEL) — pure roll math ---------------
+
+## §5.1 — the fixed sign that makes `Basis(local +Z, s·phi)` (applied IN THE PRE-ROLL BASIS'S OWN LOCAL FRAME,
+## i.e. B0 * Basis(ẑ, θ)) satisfy the post-condition `r̂'·u_r == 0 ∧ û'·u_r > 0` — derived, not tuned. Basis(axis,
+## angle) is right-handed: rotating B0 by θ about its own local +Z gives r̂' = cosθ·r̂0 + sinθ·û0,
+## û' = cosθ·û0 − sinθ·r̂0. With a = u_r·r̂0, b = u_r·û0 (so phi_raw = atan2(a,b)), solving cosθ·a + sinθ·b = 0
+## for θ = −phi_raw gives r̂'·u_r = 0 exactly, and û'·u_r = sqrt(a²+b²) > 0 (the OTHER root, θ = −phi_raw + π,
+## flips û'·u_r negative — excluded). So s = −1. Pinned by verify_camera_radial_level.gd's analytic arm — do not
+## flip without re-deriving (the derivation is the comment above, not a magic number).
+const _CAM_RL_SIGN := -1.0
+
+## §5.1 — the RAW (unblended) screen-space lean of the radial up relative to the pre-roll camera basis:
+## atan2(u_r·r̂0, u_r·û0). Pure; independently re-derivable via the projection-form construction
+## (û' = normalize(u_r − (u_r·f̂)f̂), r̂' = û' × f̂) — see `_CAM_RL_SIGN`'s derivation.
+static func cam_rl_phi_raw(u_r: Vector3, r0: Vector3, u0: Vector3) -> float:
+	return atan2(u_r.dot(r0), u_r.dot(u0))
+
+## §5.2 — altitude blend w(alt): C1 (smoothstep), exact 0 at/below CAM_RL_ALT_LO (ground reads true — the
+## near-floor bound the heal's domain relies on), exact 1 at/above CAM_RL_ALT_HI.
+static func cam_rl_w(alt: float) -> float:
+	return smoothstep(CubeSphere.CAM_RL_ALT_LO, CubeSphere.CAM_RL_ALT_HI, alt)
+
+## §5.2 — pitch blend v(pitch) = cos²(pitch): 1 looking level (full leveling), → ~0.005 near the ±1.5 rad pitch
+## clamp — kills both the mid-altitude floor-cant objection looking down and the atan2 near-±90° ill-conditioning.
+static func cam_rl_v(pitch: float) -> float:
+	return cos(pitch) * cos(pitch)
+
+## §5.1/§5.2 — the full blended, UNSIGNED-direction roll magnitude (the caller applies `_CAM_RL_SIGN`):
+## w(alt)·v(pitch)·ease·phi_raw. Pure; `ease` folds in the §5.2 post-`_attitude_handback` ramp.
+static func cam_rl_phi(u_r: Vector3, r0: Vector3, u0: Vector3, alt: float, pitch: float, ease: float) -> float:
+	return cam_rl_w(alt) * cam_rl_v(pitch) * ease * cam_rl_phi_raw(u_r, r0, u0)
+
 ## COSMOS R2.2 (Design Z): the WINDOW-space camera transform (what the camera is in pre-COSMOS window space)
 ## — body yaw+position × the pitch+eye camera-local. Main maps this into the static epoch render frame via
 ## WorldManager.m5_epoch_camera and writes it back with set_render_camera. Computed from the input state
@@ -479,6 +526,12 @@ func window_camera_transform() -> Transform3D:
 	if CubeSphere.ORBIT_ATTITUDE and _att_mode != ATT_SURFACE:
 		return Transform3D(_attitude_scene_basis(), global_transform * Vector3(0, eye_height, 0))
 	var cam_local := Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
+	# COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5.3 (FP_CAMERA_RADIAL_LEVEL): mirror the SAME roll `_move`'s tail
+	# applies, from the CACHED value (this function has no access to `_move`'s `terrain_floor` local, and must
+	# not pay a second floor query on every call — prewarm/dev-look consumers only read the forward axis anyway,
+	# which the roll never touches). 0.0 off-flag / non-SURFACE ⇒ the shipped cam_local exactly.
+	if CubeSphere.FP_CAMERA_RADIAL_LEVEL and _att_mode == ATT_SURFACE:
+		cam_local = Transform3D(cam_local.basis * Basis(Vector3(0, 0, 1), _cam_rl_last_phi), cam_local.origin)
 	return global_transform * cam_local
 
 ## COSMOS ORBIT-FRAME (§3.2/§3.5): the current DISPLAYED scene (render) basis. SPACE composes R_z(−θ)·Basis(q_bci);
@@ -571,6 +624,11 @@ func _attitude_handback(yaw: float, pitch: float) -> void:
 	_camera.top_level = false
 	_camera.transform = Transform3D(Basis(Vector3(1, 0, 0), _pitch), Vector3(0, eye_height, 0))
 	_att_mode = ATT_SURFACE
+	# COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5.2 (FP_CAMERA_RADIAL_LEVEL): a handback can land at high altitude
+	# (w≈1) where the roll would otherwise apply up to 2.6° on the very next frame — ease it in instead of
+	# popping. This function only ever runs under CubeSphere.ORBIT_ATTITUDE (the sole driver of `_att_mode`
+	# leaving ATT_SURFACE), so the write is already naturally gated; harmless (unread) with the roll flag off.
+	_cam_rl_ease = 0.0
 
 ## Write the emancipated camera's global transform to the current SPACE/RECOVER pose (the M5_REAL top_level
 ## mechanism). The pose (basis + eye origin) is exactly window_camera_transform() in these modes, so aim + any
@@ -785,7 +843,13 @@ func _physics_process(delta: float) -> void:
 			if not resync.is_empty():
 				apply_reframe(resync["new_pos"], resync["yaw_delta"])
 		# FP-FIXED-FRAME (§2.3): own_dist/ridge detection is active-lattice math → pass the LATTICE (local) position.
-		var cross := world.maybe_cross_facet(position)
+		# COSMOS UP-VECTOR FACET-DESYNC FIX (FP_UPVECTOR_FACET_HEAL, docs/COSMOS-PLAYER-UPVECTOR-FACET-DESYNC-
+		# DESIGN.md §2): hint args for the strip resolver — h_speed from the already-integrated lattice velocity
+		# (free), grounded from `_move`'s own landing-clamp capture, additionally gated `not flying and not
+		# _dev_nav` (the flying branch never updates `_grounded`, so it could read stale-true otherwise). Unread
+		# by `maybe_cross_facet` unless FP_UPVECTOR_FACET_HEAL is on.
+		var h_speed := Vector2(velocity.x, velocity.z).length()
+		var cross := world.maybe_cross_facet(position, h_speed, _grounded and not flying and not _dev_nav)
 		if not cross.is_empty():
 			apply_reframe(cross["new_pos"], cross["yaw_delta"])
 			# REMOTE-DRIVE (§4.4): forward the seam's yaw twist so the executor rotates its along-heading
@@ -1802,7 +1866,8 @@ func _move(delta: float) -> void:
 			piece_point = rhit["position"]
 			floor_y = maxf(terrain_floor, piece_top)
 
-	if position.y <= floor_y:
+	_grounded = position.y <= floor_y   # FP_UPVECTOR_FACET_HEAL hint capture (see the var's own doc); unread off-flag
+	if _grounded:
 		position.y = floor_y
 		velocity.y = 0.0
 		# REMOTE-DRIVE SEAM (§4.6): the one-shot remote_jump latch is consumed exactly as KEY_SPACE the
@@ -1819,6 +1884,25 @@ func _move(delta: float) -> void:
 	if piece != null and position.y <= floor_y + 0.05 and velocity.y <= 0.0:
 		piece.apply_force(_frame.l2g_dir(Vector3(0, -PLAYER_WEIGHT, 0)),
 			piece_point - piece.global_transform.origin)
+
+	# COSMOS PLAYER-UPVECTOR-FACET-DESYNC FIX §5.3 (FP_CAMERA_RADIAL_LEVEL, docs/COSMOS-PLAYER-UPVECTOR-FACET-
+	# DESYNC-DESIGN.md) — the ONE flag-gated per-frame camera-display write. Placed AFTER the crossing/resync/
+	# heal block above (§5.5: the active facet is post-commit/post-heal, so phi reads the healed basis — never
+	# the full facet-step error) and AFTER `terrain_floor` above (this frame's terrain-relative altitude
+	# reference, §5.2 — NOT radial altitude, so a mountaintop stand reads w≈0). Rebuilds the pre-roll basis from
+	# the INPUT STATE, never from `_camera` (the same feedback-loop guard `window_camera_transform` documents).
+	# Off ⇒ this whole block does not exist; the shipped event-driven camera writes (set_initial_look, the mouse
+	# handler, _attitude_handback) remain the only camera-local writers ⇒ byte-identical.
+	if CubeSphere.FP_CAMERA_RADIAL_LEVEL and _att_mode == ATT_SURFACE and _camera != null:
+		_cam_rl_ease = minf(1.0, _cam_rl_ease + delta / CubeSphere.CAM_RL_EASE_S)
+		var _rl_b0 := global_transform.basis * Basis(Vector3(1, 0, 0), _pitch)
+		var _rl_ur := (global_position - planet_render_centre()).normalized()
+		var _rl_alt := position.y - terrain_floor
+		var _rl_phi := cam_rl_phi(_rl_ur, _rl_b0.x, _rl_b0.y, _rl_alt, _pitch, _cam_rl_ease)
+		_cam_rl_last_phi = _CAM_RL_SIGN * _rl_phi
+		_camera.transform = Transform3D(
+			Basis(Vector3(1, 0, 0), _pitch) * Basis(Vector3(0, 0, 1), _cam_rl_last_phi),
+			Vector3(0, eye_height, 0))
 
 ## Move horizontally against the wooden blocks with a single slide, so pillars are
 ## solid obstacles. Uses move_and_collide (not move_and_slide) to keep the vertical

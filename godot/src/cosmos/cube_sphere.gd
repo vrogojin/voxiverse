@@ -2756,6 +2756,61 @@ const FP_TP_FLOOR_WELD := false
 ## Gate: verify_descent_facet_resync (a far non-adjacent desync settles at/above the true surface, with a falsifier).
 const FP_DESCENT_FACET_RESYNC := false
 
+## COSMOS FALL-THROUGH ROOT FIX (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §2.1) — the FRAME reconciler.
+## FP_TP_FLOOR_WELD/FP_DESCENT_FACET_RESYNC band-aid specific entrances; this kills the underlying MECHANISM: the
+## crossing protocol is two-phase (world_manager.maybe_cross_facet commits TerrainConfig.set_active_facet, only
+## AFTERWARDS does the caller re-express its pose via apply_reframe/_heal_frame_desync), so any query made in that
+## window — or after any aborted/rogue set_active_facet — interprets the caller's STALE lattice (x,z) numbers in
+## the NEW facet's decorrelated frame (offsets diverge by up to ±32768 blocks): both funnels agree-and-answer for
+## a DIFFERENT physical column (root-caused: the live −12.1/+11.9 floor/surface pair was the neighbour's real
+## seafloor, not a math bug). The caller now threads its own pose stamp (`_pos_fid`, player.gd) into
+## `floor_under`/`surface_y`/`blocked`/`ceiling_scan` as a trailing `pos_fid` arg; when true and `pos_fid >= 0`
+## and it has drifted from `TerrainConfig.active_facet()`, the query point is re-expressed ONCE via
+## `FacetAtlas.reframe_position64` before scanning, so a wrong-phase call reads the SAME physical column instead
+## of aliasing a neighbour's. `pos_fid == -1` (the default) or a matching facet ⇒ byte-identical (one compare, no
+## reframe). Pairs with FP_FLOOR_SURFACE_WELD (§2.2, belt-and-suspenders for any entrance this doesn't cover) —
+## see that flag for composition. Gate: verify_floor_weld.gd.
+const FP_QUERY_FRAME_GUARD := false
+
+## COSMOS FALL-THROUGH GUARD FIX (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §2.2) — the GENERALIZED surface
+## weld. Promotes FP_TP_FLOOR_WELD (dev-teleport-only, 3-block proximity) to EVERY `floor_under` landing: when the
+## scan finds a floor BELOW the column's analytic `surface_y` by more than FLOOR_WELD_EPS in an UN-EDITED column,
+## it clamps up to `surface_y` instead. Correctness: the world is heightmap-only, so in an un-edited column the
+## topmost solid IS the surface (or higher, via trees/placements — never lower BY MORE THAN THE EPSILON; the
+## clamp only ever fires when the scan found something meaningfully BELOW it, which for an un-edited column can
+## only mean a wrong-phase/stale-frame read, never a legitimate result). A legitimate below-surface stand exists
+## only inside a dug shaft/tunnel, which the `_edit_columns` check (the existing O(1) per-column edit index)
+## exempts, preserving shipped behaviour there exactly. Water/shaped/snow cells are no-ops (FLOOR_WELD_EPS below
+## covers the whole legitimate-deficit set). Converts any UNKNOWN entrance to this bug class (future
+## crossing-pipeline abort, rogue `set_active_facet`, a case FP_QUERY_FRAME_GUARD's caller didn't stamp) into a
+## safe landing — "stand on the surface" — rather than a burial; it is a no-op wherever the floor and surface
+## both read the same (right or wrong) column, so it never fights FP_DESCENT_FACET_RESYNC's class. Default FALSE
+## ⇒ the two `floor_under` return paths are byte-identical (no extra read, no branch beyond the flag test). Gate:
+## verify_floor_weld.gd.
+const FP_FLOOR_SURFACE_WELD := false
+## FP_FLOOR_SURFACE_WELD's clamp threshold (FablePhys hardening #1, BLOCKING — a bare `<` is wrong). On an
+## un-edited column `floor_under` legitimately sits FRACTIONALLY below `surface_y`: a shaped/slope surface cell
+## returns its in-cell span top (< 1.0 at some footprints, SUB-VOXEL-SMOOTHING), snow fill composes a partial
+## span (SNOW-ACCUMULATION), and an open-water column wades to the smoothed seafloor while `surface_y` is
+## `effective_height + 1` (the verify_feature water contract). A bare `found < surface` fires on every smoothed
+## slope and every swim — worse than the bug it fixes. 2.0 = one full-cell span + smoothing/snow headroom,
+## comfortably under the fall-through class's real gaps (10-70 blocks live) so nothing legitimate ever slips
+## under it. Only consulted when FP_FLOOR_SURFACE_WELD is on. Gate: verify_floor_weld.gd's no-fire arm (slope,
+## snow, water).
+const FLOOR_WELD_EPS := 2.0
+
+## COSMOS FALL-THROUGH INCIDENT PROBE (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §4, FablePhys design,
+## adopted) — live proof-of-mechanism telemetry, NOT a fix. In player.gd `_move`, immediately after the landing
+## floor query, when `terrain_floor < surface_y − 3` fires (a genuine fall-through in progress), push a
+## rate-limited (1/s) diagnostic record: column, `TerrainConfig.active_facet()`, the player's own `_pos_fid`
+## stamp, the true `facet_of_dir` owner of that direction, `own_dist` to all 4 seam slots under BOTH active_fid
+## and _pos_fid, floor, surface_y, feet_y, vy, the crossing-cooldown counter, and teleport/flight markers. Each
+## record is self-diagnosing per this design: active_fid ≠ _pos_fid (or oscillation across records) with the
+## column interior under the pose-consistent fid and garbage/far under the stale one names the entry class
+## (race / cooldown / corner / teleport) from one live fall — or falsifies the theory outright. Default FALSE ⇒
+## the probe is never evaluated (one flag compare inside the existing landing-query branch) ⇒ byte-identical.
+const FP_FALLTHRU_PROBE := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

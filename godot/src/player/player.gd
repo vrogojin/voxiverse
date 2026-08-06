@@ -143,6 +143,15 @@ var _nav_last_v_bci := PackedFloat64Array()   # last derived BCI velocity (seeds
 # an INVARIANT: every physics frame starts by re-expressing the pose if the active facet changed without us.
 var _pos_fid := -1
 
+# COSMOS FALL-THROUGH INCIDENT PROBE (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §4, FP_FALLTHRU_PROBE,
+# FablePhys design) — live proof-of-mechanism telemetry, not a fix. `_fallthru_tele` is the additive dict the
+# probe fills on a live incident, merged into `nav_telemetry()`'s return (the SAME RemoteBridge additive-merge
+# point `_nav_tele` uses) so a live fall self-diagnoses without any remote_bridge.gd change. `_fallthru_probe_last_ms`
+# rate-limits recording to 1/s so a persistent stuck fall can't spam the bridge/console. Both inert (empty dict /
+# unread) unless CubeSphere.FP_FALLTHRU_PROBE.
+var _fallthru_tele: Dictionary = {}
+var _fallthru_probe_last_ms := -1000000
+
 # COSMOS-ORBITAL-O1O4 O4c (docs/COSMOS-ORBITAL-O1O4-DESIGN.md §3.5 / SPACE-NAV §8): the SOI dominant body — the
 # body whose local dynamics (spin frame, GM_dyn, feel-gravity, drag, terrain) the player reads. `_dominant_body()`
 # is THE single accessor and returns this; it is "earth" always with CubeSphere.SOI_SWAP off (byte-identical), and
@@ -589,7 +598,7 @@ func _attitude_ground_contact() -> bool:
 	if CubeSphere.FP_FALL_ATT_GATE and position.y > CubeSphere.FALL_ATT_GATE_Y \
 			and position.y > float(world.placed_top(int(floor(position.x)), int(floor(position.z)))) + CubeSphere.FALL_ATT_GATE_Y:
 		return false
-	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
+	return position.y <= world.floor_under(position.x, position.z, position.y, _pos_fid) + 0.05
 
 ## COSMOS R2.2: place the DISPLAYED camera at the given (epoch-frame) transform. Physics/aim stay window.
 func set_render_camera(t: Transform3D) -> void:
@@ -897,8 +906,12 @@ func _nav_tick(delta: float) -> void:
 
 ## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
 ## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
+## FP_FALLTHRU_PROBE (§4) additively merges its own incident record on top when one is live — `_fallthru_tele`
+## is empty (the common/flag-off case), so this is a single `is_empty()` check + the shipped return.
 func nav_telemetry() -> Dictionary:
-	return _nav_tele
+	if _fallthru_tele.is_empty():
+		return _nav_tele
+	return _nav_tele.merged(_fallthru_tele)
 
 ## SN-FIX #1 (SN_HUD_NAV): the current nav-mode NAME for the HUD — the SAME string the RemoteBridge nav_mode
 ## telemetry uses. "—" when the nav machine is off (SN_NAV_MODES false ⇒ `_nav` is null). Pure read.
@@ -1676,15 +1689,15 @@ func _move(delta: float) -> void:
 	# diagonal move) still stops us instead of letting the capsule clip through it.
 	if delta_move.x != 0.0:
 		var lead_x := position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x
-		if world.blocked(lead_x, position.z, feet_y) \
-				or world.blocked(lead_x, position.z - PLAYER_RADIUS, feet_y) \
-				or world.blocked(lead_x, position.z + PLAYER_RADIUS, feet_y):
+		if world.blocked(lead_x, position.z, feet_y, _pos_fid) \
+				or world.blocked(lead_x, position.z - PLAYER_RADIUS, feet_y, _pos_fid) \
+				or world.blocked(lead_x, position.z + PLAYER_RADIUS, feet_y, _pos_fid):
 			delta_move.x = 0.0
 	if delta_move.z != 0.0:
 		var lead_z := position.z + signf(delta_move.z) * PLAYER_RADIUS + delta_move.z
-		if world.blocked(position.x, lead_z, feet_y) \
-				or world.blocked(position.x - PLAYER_RADIUS, lead_z, feet_y) \
-				or world.blocked(position.x + PLAYER_RADIUS, lead_z, feet_y):
+		if world.blocked(position.x, lead_z, feet_y, _pos_fid) \
+				or world.blocked(position.x - PLAYER_RADIUS, lead_z, feet_y, _pos_fid) \
+				or world.blocked(position.x + PLAYER_RADIUS, lead_z, feet_y, _pos_fid):
 			delta_move.z = 0.0
 	# The surviving delta goes THROUGH the physics engine so we still collide with the
 	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces also
@@ -1745,8 +1758,11 @@ func _move(delta: float) -> void:
 	var _ft_on2 := CubeSphere.FP_FALL_TIMING
 	var _ft_t2 := 0
 	if _ft_on2: _ft_t2 = Time.get_ticks_usec()
-	var terrain_floor := world.floor_under(position.x, position.z, position.y)
+	var terrain_floor := world.floor_under(position.x, position.z, position.y, _pos_fid)
 	if _ft_on2: _ft_max("t_floor_us", Time.get_ticks_usec() - _ft_t2)
+	# COSMOS FALL-THROUGH INCIDENT PROBE (FP_FALLTHRU_PROBE, §4): diagnostic-only, right after the landing query
+	# so it observes exactly what this frame's landing decision saw. Off ⇒ one flag compare (byte-identical).
+	_fallthru_probe_check(terrain_floor)
 	# COSMOS FALL-THROUGH FIX (FP_TP_FLOOR_WELD): after a dev geo-teleport, the analytic column scan floor_under
 	# can disagree with the analytic surface_y at the SAME facet/column (measured: floor_under −12.1 vs surface_y
 	# +11.9 at lat8/lon2 — a datum/column-scan mismatch), so the falling player tunnels the true grass surface and
@@ -1755,7 +1771,7 @@ func _move(delta: float) -> void:
 	# the teleport lands ON the surface. Dev-only (_tp_land_frames armed solely by _dev_teleport_geo); off-flag ⇒ skip.
 	if CubeSphere.FP_TP_FLOOR_WELD and _tp_land_frames > 0:
 		if absf(position.x - _tp_land_x) <= 3.0 and absf(position.z - _tp_land_z) <= 3.0:
-			terrain_floor = maxf(terrain_floor, world.surface_y(position.x, position.z))
+			terrain_floor = maxf(terrain_floor, world.surface_y(position.x, position.z, _pos_fid))
 		else:
 			_tp_land_frames = 0   # walked away from the teleport column — release (floor_under is correct there)
 	var floor_y := terrain_floor
@@ -2410,6 +2426,60 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 				and world.has_method("near_coverage_available") and world.near_coverage_available():
 			_settle_begin(sy)
 
+## COSMOS FALL-THROUGH INCIDENT PROBE (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §4, FP_FALLTHRU_PROBE) —
+## live proof-of-mechanism telemetry, NOT a fix: fires when this frame's landing floor sits far (> 3 blocks) below
+## the RAW (unguarded — the same numbers a wrong-phase caller would see) analytic surface, the fall-through
+## signature. Rate-limited to 1/s (a stuck/persistent fall would otherwise spam every physics tick). Records
+## exactly the diagnostic set §4 asks for: the column, the active facet, the player's own pose stamp, the true
+## facet_of_dir owner of that world direction, own_dist to all 4 seam slots under BOTH candidate facets (using the
+## SAME raw lattice numbers — no reframe, this is a diagnostic dump of what the funnels actually saw), and the
+## surrounding motion/mode state. Self-diagnosing per the design: active_fid != _pos_fid (or oscillation across
+## records) with the column interior under the pose-consistent fid and garbage/far under the stale one NAMES the
+## entry class from one live fall. Merged into `nav_telemetry()` (no remote_bridge.gd change needed). Off ⇒ the
+## flag test is the only added work (byte-identical; called from `_move` right after the landing floor query).
+func _fallthru_probe_check(terrain_floor: float) -> void:
+	if not CubeSphere.FP_FALLTHRU_PROBE or world == null:
+		return
+	var raw_surface := world.surface_y(position.x, position.z)   # deliberately unguarded: what a live wrong-phase caller sees
+	if terrain_floor >= raw_surface - 3.0:
+		return
+	var now_ms := Time.get_ticks_msec()
+	if now_ms - _fallthru_probe_last_ms < 1000:
+		return
+	_fallthru_probe_last_ms = now_ms
+	var active_fid := TerrainConfig.active_facet()
+	var xi := int(floor(position.x))
+	var zi := int(floor(position.z))
+	var owner := -1
+	if active_fid >= 0:
+		var w: Array = _FacetAtlasCls.lattice_to_world64(active_fid, position.x, position.y, position.z)
+		owner = _FacetAtlasCls.facet_of_dir(CubeSphere.DVec3.new(w[0], w[1], w[2]))
+	var od_active := PackedFloat64Array()
+	var od_posfid := PackedFloat64Array()
+	for slot in 4:
+		od_active.append(_FacetAtlasCls.own_dist(active_fid, slot, position.x, position.y, position.z) if active_fid >= 0 else 0.0)
+		od_posfid.append(_FacetAtlasCls.own_dist(_pos_fid, slot, position.x, position.y, position.z) if _pos_fid >= 0 else 0.0)
+	_fallthru_tele = {
+		"ft_col": Vector2i(xi, zi),
+		"ft_active_fid": active_fid,
+		"ft_pos_fid": _pos_fid,
+		"ft_owner_fid": owner,
+		"ft_own_dist_active": od_active,
+		"ft_own_dist_posfid": od_posfid,
+		"ft_floor": terrain_floor,
+		"ft_surface": raw_surface,
+		"ft_feet_y": position.y,
+		"ft_vy": velocity.y,
+		"ft_cross_cooldown": world._cross_cooldown,
+		"ft_flying": flying,
+		"ft_dev_nav": _dev_nav,
+		"ft_tp_land_active": _tp_land_active,
+		"ft_settle_active": _settle_active,
+	}
+	print("[FP_FALLTHRU_PROBE] col=(%d,%d) active=%d pos_fid=%d owner=%d floor=%.2f surface=%.2f Δ=%.2f feet_y=%.2f vy=%.2f cooldown=%d flying=%s dev_nav=%s tp_land=%s settle=%s" % [
+		xi, zi, active_fid, _pos_fid, owner, terrain_floor, raw_surface, terrain_floor - raw_surface,
+		position.y, velocity.y, world._cross_cooldown, str(flying), str(_dev_nav), str(_tp_land_active), str(_settle_active)])
+
 ## DEV/TEST fall-through guard — clamp the player up onto the FRESH analytic surface when a dev teleport / freeze
 ## drop left the feet below it. Uses world.surface_y (the shared heightmap analytic law, NEVER the voxel buffer)
 ## so it is immune to the stale fast-regime-crossing floor_under that buried the player live. Inert while flying /
@@ -2418,7 +2488,11 @@ func _dev_reposition(fid: int, lattice_pos: Vector3) -> void:
 func _dev_land_clamp() -> void:
 	if world == null or flying or _dev_nav or _dev_freeze_player:
 		return                                              # inert while flying / dev-flying / held (freeze stays invariant)
-	var sy := world.surface_y(position.x, position.z)
+	# COSMOS FALL-THROUGH ROOT (FP_QUERY_FRAME_GUARD §2.1): this runs AFTER this frame's crossing attempt
+	# (maybe_cross_facet / FP_TP_FLOOR_WELD / FP_DESCENT_FACET_RESYNC), so an aborted/rogue set_active_facet this
+	# frame can leave TerrainConfig.active_facet() ahead of `_pos_fid` until next frame's _heal_frame_desync — the
+	# exact cross-frame window §1.2 identifies. Pass the stamp so a wrong-phase call still reads the true column.
+	var sy := world.surface_y(position.x, position.z, _pos_fid)
 	if position.y < sy - DEV_LAND_EPS:
 		position.y = sy                                     # snap the feet onto the true surface top
 		if velocity.y < 0.0:
@@ -2609,7 +2683,7 @@ func is_on_surface() -> bool:
 func _space_on_ground() -> bool:
 	if flying or world == null:
 		return false
-	return position.y <= world.floor_under(position.x, position.z, position.y) + 0.05
+	return position.y <= world.floor_under(position.x, position.z, position.y, _pos_fid) + 0.05
 
 ## The attitude-machine state name for telemetry (surface | space | recover). "surface" when ORBIT_ATTITUDE is off.
 func _space_att_name() -> String:

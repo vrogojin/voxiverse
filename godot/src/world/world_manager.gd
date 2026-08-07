@@ -69,6 +69,9 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
+# COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): last update_streaming call's Time.get_ticks_usec(), for the
+# real measured wall-clock frame-ms passed to _facet_tex.update() (see that call site's doc comment).
+var _bg_last_frame_usec := 0
 var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
 var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
 var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
@@ -1189,7 +1192,17 @@ func update_streaming(player_pos: Vector3) -> void:
 		var cam_dist: float = _facet_ring.shell_cam_dist() if _facet_ring.has_method("shell_cam_dist") else -1.0
 		# COSMOS TEXTURED-LOD U1 (§2U.1): pass the active facet so the baker drives the near-far BAND (residency = active ∪
 		# ring-1) alongside the base/close-up tiers. -1 (no active facet) ⇒ band idle; band code is inert off the flag.
-		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist)
+		# COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): the baker's governor input, in ms — a REAL measured wall-clock
+		# delta between successive update_streaming calls (this function has no `delta` parameter of its own to
+		# thread through, and this call site is reached from several callers/gates), computed the SAME way
+		# StreamLoadController.LiveSource already does (never Performance.TIME_PROCESS, invalid on threaded web —
+		# see that class's own doc comment). Only ever consulted under the flag; harmless to always compute/pass.
+		var _bg_now_usec := Time.get_ticks_usec()
+		var _bg_frame_ms := 0.0
+		if _bg_last_frame_usec > 0:
+			_bg_frame_ms = minf(float(_bg_now_usec - _bg_last_frame_usec) / 1000.0, CubeSphere.CTRL_FRAME_SAMPLE_CLAMP_MS)
+		_bg_last_frame_usec = _bg_now_usec
+		_facet_tex.update(eaxis, offs, CubeSphere.FACET_TEX_BAKE_BUDGET_MS, TerrainConfig.active_facet(), cam_dist, _bg_frame_ms)
 		if CubeSphere.FP_PLANET_MAP:
 			_facet_ring.set_fine_map(_facet_tex.fine_texture())   # bind the whole-planet fine tier (survives re-emit)
 		if _facet_tex.slots_epoch() != _tex_slots_epoch:

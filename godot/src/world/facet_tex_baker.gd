@@ -519,7 +519,11 @@ var _frozen := false
 func set_frozen(frozen: bool) -> void:
 	_frozen = frozen
 
-func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0) -> void:
+## COSMOS-BACKGROUND-PREBAKE: `frame_ms` is the caller's last-frame wall-clock cost (WorldManager._process's own
+## real `delta`, never a Performance monitor — see the flag's doc comment) — threaded through to the governor
+## unconditionally; it is only ever CONSULTED under FP_BG_PREBAKE, so passing 0.0 (the default) is byte-identical
+## to never having the parameter.
+func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := -1, cam_dist := -1.0, frame_ms := 0.0) -> void:
 	if _frozen:
 		return
 	_offsurface = offsurface   # gates the C++ fine-bake path: only off-surface is the near-field gen (⇒ the shared C++ lock) idle
@@ -528,7 +532,7 @@ func update(emit_axis: Array, offsurface: bool, budget_ms: float, active_fid := 
 	if _pbm_on:
 		if CubeSphere.FP_SKIN_SSE and cam_dist > 0.0 and _bm_on and active_fid >= 0:
 			_recompute_band_want_sse(active_fid, emit_axis, cam_dist)
-		_update_band_parallel(emit_axis)
+		_update_band_parallel(emit_axis, CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE, frame_ms)
 	if _worker_on:
 		_update_worker(emit_axis, offsurface, budget_ms, active_fid, cam_dist)
 	else:
@@ -1752,6 +1756,26 @@ func _pbm_inflight(fid: int) -> bool:
 			return true
 	return false
 
+## COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): count of fine-mode (_pbm_mode==1) tasks currently in flight
+## across all slots — the governor's inflight cap. Off-surface this can legitimately be up to _pbm_n (full
+## parallelism, unchanged); on-surface under the flag it caps NEW dispatch to BG_MAX_INFLIGHT_SURFACE. Only
+## ever consulted under the flag (elsewhere dead-cheap: one pass over the small fixed _pbm_n slot array).
+func _bg_inflight() -> int:
+	var n := 0
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) >= 0 and int(_pbm_mode[i]) == 1:
+			n += 1
+	return n
+
+## True iff any currently in-flight fine-mode task is routed through the C++ tile path — the `bg_cpp_on`
+## telemetry field (doc §5): unlike `cpp_on` (which tracks the shelved FP_CPP_FINE_BAKE), this reports whether
+## FP_BG_PREBAKE_CPP is actually engaging the tile baker right now, on- or off-surface.
+func _bg_tile_inflight() -> bool:
+	for i in range(_pbm_n):
+		if int(_pbm_fid[i]) >= 0 and int(_pbm_mode[i]) == 1 and int(_pbm_tile[i]) == 1:
+			return true
+	return false
+
 ## Nearest wanted band facet not resident and not already in-flight (active first, then any).
 func _next_band_parallel() -> int:
 	if _bm_want.has(_bm_want_active) and not _bm_slots.has(_bm_want_active) and not _pbm_inflight(_bm_want_active):
@@ -1767,7 +1791,10 @@ func _next_band_parallel() -> int:
 ## REVISION 5 Stage C: `fine_pause_on` overrides FP_FINE_BAKE_SURFACE_PAUSE (gate-forcing convention) so a headless
 ## gate can prove the on-surface dispatch pause / off-surface resume without a compile-time sed. The real caller
 ## (`update()`) passes no override ⇒ the compile const governs (byte-identical).
-func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE) -> void:
+## COSMOS-BACKGROUND-PREBAKE: `bg_frame_ms` is the governor's frame-time input (see update()'s doc comment) —
+## a plain runtime parameter (not a compile-time override), so a headless gate can simulate a "hot" vs "healthy"
+## frame directly by varying it, with no sed needed.
+func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP_FINE_BAKE_SURFACE_PAUSE, bg_frame_ms := 0.0) -> void:
 	# NEW-TASK slot cap (the REAP below always scans all _pbm_n so orbit-dispatched bakes still commit after we descend):
 	# only the parallel C++ tile bake OFF-SURFACE uses all _pbm_n slots — that's where the near-field gen is frozen so the
 	# cores are free AND where the whole-planet fill latency matters. On the surface the far skin is close-up sugar over a
@@ -1841,10 +1868,27 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 		# already-in-flight task regardless of this gate — an off-surface-dispatched bake still commits after landing
 		# back on the ground — and the upload-throttle below still flushes any already-baked dirty page; only the NEW
 		# task dispatch is paused.
-		if not fine_pause_on or _offsurface:
+		# COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): a GOVERNED on-surface exception to the pause above. Dispatch
+		# background fine bakes on-surface only when the last frame had headroom (bg_frame_ms < the budget); the
+		# BG_MAX_INFLIGHT_SURFACE cap is enforced PER SLOT INSIDE the loop below (not once here) — on native,
+		# `active` can be _pbm_n > 1 (the band's own multi-core allowance), and checking the cap only once before
+		# the loop let a single call burst past it and dispatch one task per free slot, reintroducing the exact
+		# convoy REV5 avoided. `_next_fine_fid` below is UNCHANGED — it already sweeps nearest-to-emit_axis first
+		# (the existing "front-most" scan used off-surface and for the base tier), so lifting the pause here gets
+		# VIEW-CONE-FIRST ordering for free. Off ⇒ bg_surface_pass is always false, the outer condition reduces
+		# to exactly the shipped `not fine_pause_on or _offsurface`, and the per-slot cap check never applies
+		# (both `else` branches below are unconstrained, matching shipped behaviour) — byte-identical.
+		var bg_surface_pass := CubeSphere.FP_BG_PREBAKE and bg_frame_ms < CubeSphere.BG_FRAME_BUDGET_MS
+		if not fine_pause_on or _offsurface or bg_surface_pass:
+			var bg_new := 0   # NEW dispatches this call, under the on-surface background path only
 			for i in range(active):
 				if int(_pbm_fid[i]) >= 0:
 					continue
+				if fine_pause_on and not _offsurface:
+					# On-surface background path: stop once already-inflight + this call's new dispatches hits
+					# the cap, regardless of how many `active` slots are still free.
+					if _bg_inflight() + bg_new >= CubeSphere.BG_MAX_INFLIGHT_SURFACE:
+						break
 				var ff := _next_fine_fid(emit_axis)
 				if ff < 0:
 					break
@@ -1857,12 +1901,21 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 				_pbm_fid[i] = ff
 				_pbm_mode[i] = 1
 				_pbm_cpp[i] = 1 if (CubeSphere.FP_CPP_FINE_BAKE and _offsurface and _sampler_obj != null) else 0
-				_pbm_tile[i] = 1 if (_pbm_tile_ok and _offsurface) else 0
+				# COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE_CPP): allow the C++ tile path in the single governed
+				# on-surface background slot too — the tile baker holds its OWN generator instance (reader-parallel
+				# RWLockRead), unlike the shelved fine baker that serialises on the shared lock. `_pbm_tile_ok` is
+				# the existing setup-time refusal latch (module absent / no bake_far_tile()) — when it is false this
+				# stays 0 regardless, and _pbm_compute's existing tiled → cpp → GDScript fallback chain (unchanged)
+				# bakes it anyway, just slower. Off (either flag) ⇒ the background slot always uses that same
+				# GDScript-fallback path — a safe degrade, never a stall or crash.
+				_pbm_tile[i] = 1 if (_pbm_tile_ok and (_offsurface or (CubeSphere.FP_BG_PREBAKE and CubeSphere.FP_BG_PREBAKE_CPP and bg_surface_pass))) else 0
 				_pbm_layer[i] = -1
 				_pbm_lc[i] = flc
 				_pbm_nx[i] = _fm_texels
 				_pbm_ny[i] = _fm_texels
 				_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
+				if fine_pause_on and not _offsurface:
+					bg_new += 1
 		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads).
 		# Unconditional: flushes whatever is already baked even while the dispatch above is paused.
 		_fm_upload_cd -= 1
@@ -2070,6 +2123,14 @@ func tex_telemetry() -> Dictionary:
 		"fm_baked": _fine_baked.size(),
 		"fm_want": _base_all if _fm_on else 0,
 		"fm_dirty": _fm_dirty.size(),
+
+		# COSMOS-BACKGROUND-PREBAKE: `cpp_on` above tracks the shelved FP_CPP_FINE_BAKE and is a red herring for
+		# this feature (doc §2.3/§5) — these report the ACTUAL background-prebake state so a live A/B can confirm
+		# the tile path is engaging on-surface: bg_inflight = fine tasks in flight (the BG_MAX_INFLIGHT_SURFACE
+		# cap made visible); bg_cpp_on = at least one of those in-flight fine tasks is routed through the C++
+		# tile path right now.
+		"bg_inflight": _bg_inflight(),
+		"bg_cpp_on": _bg_tile_inflight(),
 	}
 
 ## The TRUE NEVER-OOM footprint (§4): 6 CPU base pages + the base GPU array (+mips ≈ ×1.33) ≈ 8.2 MB; plus, under

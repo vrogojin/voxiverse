@@ -2892,6 +2892,25 @@ const GRAV_BOX_MARGIN := 24.0
 ## byte-identical. Gate: verify_treechop.gd (G-TC-SETTLE).
 const FP_CHOP_COLLIDER_CARVE := false
 
+## COSMOS-TREE-BUGS CHOP-LAG addendum (docs/COSMOS-TREE-BUGS-DESIGN.md, "Addendum 2026-08-07") — bounds how
+## long a chopped canopy stays AWAKE, so the (pre-existing) per-awake-frame costs FP_GRAV_BOX_COVER /
+## FP_CHOP_COLLIDER_CARVE exposed by making debris correctly STAY instead of flying away in ~2 s can't run
+## for dozens of seconds. Two pieces:
+##  1. `VoxelBody._wood_calm_step` — wood never auto-freezes (§12: stays sandbox-pushable forever), so
+##     `_refresh_dormancy` disabling `_physics_process` for it meant FP_TREEPHYS_BOUND's 8 s deadline
+##     (`TREEPHYS_MAX_ACTIVE_SEC`) never fired for wood at all. On, an ACTIVE wood body keeps
+##     `_physics_process` running just the calm/deadline check → SLEEPS (never freezes) once calm or past
+##     the deadline; any contact/push auto-wakes it (Godot's own mechanism), same as before.
+##  2. `WorldManager.sim_ground_rebuild` (the snowfall sim's collider-dirty step, every 0.5 s) routes to
+##     `GroundCollider.rebuild_now_lazy()` instead of the fast player-edit `rebuild_now()` — a long debounce
+##     (`GroundCollider.LAZY_DEBOUNCE_FRAMES`) with NO max-latency escalation, so background sim writes stop
+##     re-pointing shapes under a settling body every ~0.25-1.0 s and jolting it back awake (the measured
+##     rebuild⇄wake feedback loop: gc.update 2.0-4.7 ms/frame native for 8 s straight). Player-edit rebuilds
+##     keep their existing fast debounce untouched.
+## Default FALSE ⇒ both pieces are dead code (wood's _physics_process branch is unreachable off;
+## sim_ground_rebuild calls the shipped rebuild_now()), byte-identical. Gate: verify_choplag.gd.
+const FP_CHOP_DEBRIS_CALM := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

@@ -1828,8 +1828,17 @@ func sim_revert_cell(cell: Vector3i) -> void:
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
 ## The collider's own debounce coalesces further, and its loose-body gate means it does zero work unless a
 ## body is actually nearby — a settled pile near the player costs nothing.
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): routed to the collider's LAZY channel instead of the
+## fast player-edit one — this call fires every 0.5s of writing sim steps regardless of whether the player
+## touched anything, and feeding the fast 15/60 debounce turned "background dirt happened somewhere" into a
+## rebuild every ~0.25-1.0s for as long as any body sat nearby, jolting a settling body back awake (the
+## rebuild⇄wake loop measured in probe_choplag S6). Off ⇒ the shipped fast rebuild_now(), byte-identical.
 func sim_ground_rebuild() -> void:
-	if _ground != null:
+	if _ground == null:
+		return
+	if CubeSphere.FP_CHOP_DEBRIS_CALM:
+		_ground.rebuild_now_lazy()
+	else:
 		_ground.rebuild_now()
 
 # --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------

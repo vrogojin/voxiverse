@@ -324,3 +324,102 @@ Both pieces byte-off (flag false ⇒ shipped behaviour); NEVER-OOM neutral.
 - **G-CL-FELL** — S5 flow (a break every 2 s ×4): every body dormant ≤ 10 s after the LAST break
   (falsifier: 15.7 s today).
 - **Byte-off** — flag false ⇒ FLAT `verify_feature` 6042/0 and `verify_treechop` 36/0 unchanged.
+
+---
+
+## Addendum 2 (2026-08-07) — INTERMITTENT sink still occurs (~15-25% of chops)
+
+Live after the Bug-2 fixes: chopping 3 spawn-area oaks, tree 2 sank while 1 and 3 rested.
+Reproduced headlessly with `godot/src/tools/probe_sink.gd` (12 round-canopy oak/birch on the spawn
+facet 2, chopped the live way — gate CLOSED until the chop's own canopy opens it): **2-3 of 12 sink**,
+with IDENTICAL geometry to the survivors (trunk_dist 2.5, canopy 24-26 cells, footprint ±1). So the
+sink is **state/timing-dependent, not geometric** — matching "some trees sink".
+
+### Root cause: the GroundCollider is the ONLY physical rest surface, and it has coverage/timing gaps
+
+The terrain has no collision mesh (analytic physics, CLAUDE.md). A loose `VoxelBody` therefore rests
+**only** on `GroundCollider`'s box shapes. But the collider is (ground_collider.gd:36-38, 81, 174-235):
+R=14 columns, **player-centred**, **double-buffered**, and **debounce-rebuilt** (15/60 frames). When a
+canopy is dropped while the live shape set does not cover its fall column — because a rebuild is
+mid-flight or the live centre is stale from the approach — the body **free-falls through the
+analytic-only terrain** and tunnels below the surface before any box exists there.
+
+Measured trace (probe_sink, depth = surface_y − body_centre.y; negative = resting above surface):
+
+| tree | PRE-CHOP collider | fall trace | outcome |
+|---|---|---|---|
+| #2 OK | `_phase=0` (idle), live centre 198 blocks away | chop triggers a FRESH core+build (`_phase=1` @ t=0) → ground appears → settles −3.14 | rests |
+| #3 SANK | `_phase=2` (mid-build, SHAPES) | t=0.5 depth −2 → **t=1.0 depth +1.26 v=8.81 (accelerating = no collision)** → tunnels +6.7; build finishes `_phase=0` @ t=1.5 too late → rests +4.6 **below** surface | **sinks** |
+| #7 SANK | `_phase=2` | identical free-fall to +6.7 | **sinks** |
+
+The v≈8.8 accelerating descent through depth 0 is the proof: no box was ever under the falling canopy.
+
+**Carve is exonerated** (answers hypothesis 2): A/B with `FP_CHOP_COLLIDER_CARVE` OFF (grav ON) still
+sinks 3/12 — the carve one-shot at break time is not the cause. Hypotheses 1/3/4 (distance, drift,
+size) are all falsified by the identical-geometry survivors; the discriminator is purely the collider's
+build phase / live-centre coverage at the instant of the drop. Pre-fix this never surfaced because the
+old bug flung the canopy away in ~2 s (Addendum 1) — the body left before the coverage gap could bite.
+
+### Why verify_treechop 36/0 missed it
+
+The gate (a) builds the collider FULLY before chopping (no mid-rebuild window ever exists at the drop),
+and (b) parameterises only by DISTANCE (inside-ring <140, outside-ring 170-220), never by collider build
+STATE. The sink requires the collider to be mid-rebuild / stale-centred AT the drop — a temporal
+condition the gate never constructs. This is the exact blind spot; the new gate must drop into an
+un-built / mid-build collider.
+
+### Flagged fix design — `FP_LOOSE_BODY_ANALYTIC_FLOOR := false`
+
+Give every loose `VoxelBody` a terrain-exact rest that does NOT depend on collider boxes — the same
+analytic surface the body already reads for its settle decision (`_grounded` →
+`world.surface_y`/`cell_solid`, voxel_body.gd:444-474). Implement as a hard floor clamp in a new
+`_integrate_forces(state)` override (Godot calls it for every active rigidbody regardless of
+`_physics_process`, so it covers wood AND non-wood, immune to the collider's timing):
+
+```gdscript
+func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+    if not CubeSphere.FP_LOOSE_BODY_ANALYTIC_FLOOR or world == null or freeze:
+        return
+    # Deepest penetration of any cell's base below the analytic surface under it (body LATTICE frame,
+    # matching _grounded's transform contract). One surface_y per distinct column of the body.
+    var worst := 0.0
+    for c: Vector3i in cells.keys():
+        if cells.has(Vector3i(c.x, c.y - 1, c.z)):
+            continue                                   # not an exposed underside cell
+        var b := transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)   # cell base point
+        var pen := world.surface_y(b.x, b.z) - b.y     # >0 ⇒ below the surface
+        worst = maxf(worst, pen)
+    if worst > 0.0:
+        var t := state.transform
+        t.origin += -world.gravity_vector().normalized() * worst   # lift along facet-up, back to the surface
+        state.transform = t
+        var v := state.linear_velocity
+        var up := -world.gravity_vector().normalized()
+        var into := v.dot(up)
+        if into < 0.0:
+            state.linear_velocity = v - up * into      # kill only the into-ground component (keep slide)
+```
+
+Terrain-exact (rests where the survivors do, depth ≤ 0), collider-independent (immune to build timing),
+radial-gravity-correct (lifts along the facet up, composes with FP_GRAV_BOX_COVER), and cheap (one
+`surface_y` per exposed-underside column of a ~10-column body per active frame; bodies sleep in ≤ a few
+s per Addendum 1, then `_integrate_forces` stops). Off ⇒ no override effect, byte-identical. The
+GroundCollider stays (it still handles body-on-body stacks and gives the player something to stand on);
+this is a floor of last resort so a coverage gap can never let a body pass the ground.
+
+*(Rejected alternatives: (a) widen R / body-follow collider — still has debounce/build windows, and a
+second collider centred on debris re-introduces the rebuild churn Addendum 1 just fixed; (b) force a
+synchronous full build on every chop — the ~100 ms stall the debounce exists to avoid. The analytic
+clamp sidesteps the collider-timing problem entirely instead of racing it.)*
+
+### Gate spec — extend `verify_treechop.gd` with the coverage-gap condition
+
+- **G-TC-SINK-MIDBUILD** — the load-bearing new pin: chop a worldgen tree while the collider is
+  deliberately mid-rebuild / stale-centred (drive the exact probe_sink sequence: gate closed on
+  approach, chop immediately, no pre-build). For a spread of ≥12 trees on facet 2, EVERY canopy ends at
+  depth ≤ +0.5 (rests at/above surface); **falsifier: flag OFF reproduces 2-3/12 at depth +4…+9**
+  (this doc's measurement).
+- **G-TC-SINK-FREEFALL** — assert no body's downward speed exceeds a threshold (e.g. 6 b/s) below
+  surface−1 for more than N frames (catches the free-fall signature directly).
+- Keep the existing 36 assertions (inside/outside ring, first-frame gravity, 20 s settle) green.
+- **Byte-off** — flag false ⇒ FLAT `verify_feature` 6042/0 + existing `verify_treechop` 36/0 unchanged.

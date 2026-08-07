@@ -16,6 +16,14 @@ extends SceneTree
 ##                 finite (no NaN — was NaN in <=1 frame with both defects live), settles with the
 ##                 canopy centre within its own half-height of surface_y, upright (updot >= 0.9 — was
 ##                 -0.609 tumble), and frozen/sleeping at the end.
+##   G-TC-SINK-MIDBUILD / G-TC-SINK-FREEFALL (COSMOS-TREE-BUGS Addendum 2, FP_LOOSE_BODY_ANALYTIC_FLOOR):
+##                 the blind spot the gates above have — they open the collider gate with a marker and let
+##                 the region build FULLY before chopping, so a mid-build/stale-centred drop never happens.
+##                 This mirrors probe_sink.gd's live-approach sequence instead (gate CLOSED until the
+##                 chop's own canopy is the first body) across >=12 trees: every canopy must end at depth
+##                 <= +0.5 (at/above surface — was 2/12 chops sinking to +4.6/+6.7 unfixed, an ACCELERATING
+##                 v~8.8 b/s free-fall through the analytic-only terrain, proving no collider box was ever
+##                 under the falling canopy), and no body may exceed 6 b/s downward while below surface-1.
 ##
 ## Each sub-gate runs in its OWN fresh WorldManager (matching how the doc's individual probes each run in
 ## their own process) — an earlier combined-instance version cross-contaminated: a residual marker body /
@@ -23,11 +31,16 @@ extends SceneTree
 ## self-contained (found empirically: identical code, same site, passed standalone / failed when run second
 ## in a shared instance). Isolation costs one extra ~3s module-manifest bake per sub-gate — cheap insurance.
 ##
-## RUN (sed FACETED + FP_M1_POOL + FP_FIXED_FRAME + FP_GRAV_BOX_COVER + FP_CHOP_COLLIDER_CARVE all ON):
+## RUN (sed FACETED + FP_M1_POOL + FP_FIXED_FRAME + FP_GRAV_BOX_COVER + FP_CHOP_COLLIDER_CARVE +
+##      FP_LOOSE_BODY_ANALYTIC_FLOOR all ON):
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
 ##       --script res://src/tools/verify_treechop.gd 2>/dev/null | grep VERIFY
-## Falsifier: re-run with ONLY the two fix flags sed'd back OFF (FACETED/FP_M1_POOL/FP_FIXED_FRAME still
-## ON) — must go RED on G-TC-GRAV and G-TC-SETTLE (probe_treechop/2/3 already proved it measurably does).
+## Falsifier (G-TC-GRAV/-SETTLE): re-run with ONLY FP_GRAV_BOX_COVER + FP_CHOP_COLLIDER_CARVE sed'd back
+## OFF (FACETED/FP_M1_POOL/FP_FIXED_FRAME still ON) — must go RED (probe_treechop/2/3 already proved it
+## measurably does).
+## Falsifier (G-TC-SINK-*): re-run with ONLY FP_LOOSE_BODY_ANALYTIC_FLOOR sed'd back OFF (the other four
+## still ON) — must go RED, some chops sinking to depth +4..+9 (probe_sink.gd already proved it measurably
+## does: 2/12 in this session's own run).
 ## Exits 0 all-pass / 1 on any failure.
 
 var _pass := 0
@@ -39,9 +52,9 @@ func _ok(c: bool, m: String) -> void:
 		print("  FAIL: ", m)
 
 func _initialize() -> void:
-	print("=== verify_treechop (COSMOS-TREE-BUGS Bug 2) — FACETED=%s FP_M1_POOL=%s FP_FIXED_FRAME=%s FP_GRAV_BOX_COVER=%s FP_CHOP_COLLIDER_CARVE=%s ===" % [
+	print("=== verify_treechop (COSMOS-TREE-BUGS Bug 2) — FACETED=%s FP_M1_POOL=%s FP_FIXED_FRAME=%s FP_GRAV_BOX_COVER=%s FP_CHOP_COLLIDER_CARVE=%s FP_LOOSE_BODY_ANALYTIC_FLOOR=%s ===" % [
 		str(CubeSphere.FACETED), str(CubeSphere.FP_M1_POOL), str(CubeSphere.FP_FIXED_FRAME),
-		str(CubeSphere.FP_GRAV_BOX_COVER), str(CubeSphere.FP_CHOP_COLLIDER_CARVE)])
+		str(CubeSphere.FP_GRAV_BOX_COVER), str(CubeSphere.FP_CHOP_COLLIDER_CARVE), str(CubeSphere.FP_LOOSE_BODY_ANALYTIC_FLOOR)])
 	TerrainConfig.warm_up()
 	TreeGen.warm_up()
 	FacetAtlas.warm_up()
@@ -51,6 +64,7 @@ func _initialize() -> void:
 	await _gate_grav_and_settle(fid, false)   # outside the old ±160 core (the live-bug site class)
 	await _gate_grav_and_settle(fid, true)    # inside the ring (must ALSO settle cleanly)
 	await _gate_cover(fid)
+	await _gate_sink(fid)
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -269,3 +283,125 @@ func _gate_grav_and_settle(fid: int, inside_ring: bool) -> void:
 		_ok(body.freeze or body.sleeping, "G-TC-SETTLE (%s): frozen/sleeping at the end" % tag)
 		await _free_world(w)
 		return
+
+## The trunk id as the WORLD sees it (block_id_at: datum shift + snow interception + junction), or 0 —
+## matches probe_sink.gd's own trunk-id query exactly.
+func _sink_trunk_id(w: WorldManager, tb: Vector3i) -> int:
+	var sy := int(w.surface_y(float(tb.x) + 0.5, float(tb.z) + 0.5))
+	for y in range(sy - 4, sy + 12):
+		var id := w.block_id_at(Vector3i(tb.x, y, tb.z))
+		if id == BlockCatalog.WOOD or id == BlockCatalog.id_of(&"birch_log"):
+			return id
+	return 0
+
+## G-TC-SINK-MIDBUILD + G-TC-SINK-FREEFALL (COSMOS-TREE-BUGS Addendum 2, FP_LOOSE_BODY_ANALYTIC_FLOOR):
+## the blind spot G-TC-GRAV/-SETTLE above have. Both open the collider gate with a marker body and let
+## the region build FULLY BEFORE chopping — a mid-build / stale-centred drop never happens there. This
+## instead mirrors probe_sink.gd's exact live-approach sequence: the collider gate stays CLOSED (idle,
+## whatever shapes/centre it last had) until the chop's own canopy becomes the FIRST body near the
+## player, so the drop can land while a fresh core+build is still in flight or the live centre is stale
+## from a PREVIOUS chop elsewhere on the facet — precisely the state/timing race the doc's probe_sink.gd
+## isolated (2-3/12 chops sink, IDENTICAL geometry to the survivors; carve/distance/drift/size all
+## exonerated). Runs >=12 round-canopy oak/birch chops in ONE shared WorldManager (matching probe_sink.gd,
+## which reproduces the same sink count deterministically across repeated runs — the earlier
+## cross-contamination lesson in this file was about a DIFFERENT gate's stray Area3D probes and an
+## edge-of-domain site, neither of which applies here).
+func _gate_sink(fid: int) -> void:
+	var ctx := await _new_world(fid, "TreeChopGateWM_sink")
+	var w: WorldManager = ctx["w"]
+	var host: Node = ctx["host"]
+	var gc: Node = ctx["gc"]
+	var cc := FacetAtlas.centre_cell(fid)
+
+	# Collect >=12 round-canopy oak/birch trees near the centre — probe_sink.gd's exact spawn-area class.
+	var trees: Array = []
+	for gx in range(floori(float(cc.x - 120) / 10.0), floori(float(cc.x + 120) / 10.0)):
+		if trees.size() >= 12:
+			break
+		for gz in range(floori(float(cc.y - 120) / 10.0), floori(float(cc.y + 120) / 10.0)):
+			var tb := TreeGen.tree_base(gx, gz)
+			if tb.y <= TerrainConfig.SEA_LEVEL:
+				continue
+			if absi(tb.x - cc.x) > 120 or absi(tb.z - cc.y) > 120:
+				continue
+			var tid := _sink_trunk_id(w, tb)
+			if tid == BlockCatalog.WOOD or tid == BlockCatalog.id_of(&"birch_log"):
+				trees.append(tb)
+			if trees.size() >= 12:
+				break
+	_ok(trees.size() >= 12, "G-TC-SINK: found >=12 round-canopy trees near centre (got %d)" % trees.size())
+	if trees.is_empty():
+		await _free_world(w)
+		return
+
+	var sank := 0
+	var freefall_violations := 0
+	for i in trees.size():
+		var r := await _sink_chop(w, host, gc, trees[i])
+		if r["sank"]:
+			sank += 1
+		if r["freefall_violation"]:
+			freefall_violations += 1
+	_ok(sank == 0, "G-TC-SINK-MIDBUILD: 0/%d chops sink (end depth > +0.5 below surface) — got %d" % [trees.size(), sank])
+	_ok(freefall_violations == 0,
+		"G-TC-SINK-FREEFALL: no body exceeds 6 b/s downward while below surface-1 — got %d violation(s)" % freefall_violations)
+	await _free_world(w)
+
+## One probe_sink.gd-style chop: gate CLOSED (idle) until the canopy itself opens it, chop immediately (no
+## pre-build settle), then track depth-below-surface + downward speed for 8s. Returns
+## {sank, freefall_violation} (sank = end depth > +0.5; freefall_violation = downward speed > 6 b/s while
+## more than 1 below the surface, the free-fall signature measured in probe_sink.gd — v~8.8 b/s
+## ACCELERATING through depth 0 with no collider box ever underneath).
+func _sink_chop(w: WorldManager, host: Node, gc: Node, base: Vector3i) -> Dictionary:
+	for ch in host.get_children():
+		if ch is VoxelBody:
+			ch.queue_free()
+	await physics_frame
+	await physics_frame
+	var player_pos := Vector3(float(base.x) + 2.5, w.surface_y(float(base.x) + 2.5, float(base.z) + 0.5), float(base.z) + 0.5)
+	# Walk the collider up to the tree with the gate CLOSED (no debris nearby yet) — a few idle frames,
+	# exactly like a live approach; the gate only opens once a body is actually near.
+	for i in range(10):
+		if gc != null:
+			gc.call("update", player_pos)
+		await physics_frame
+	var ty0 := -0x40000000
+	var sy := int(w.surface_y(float(base.x) + 0.5, float(base.z) + 0.5))
+	for y in range(sy - 4, sy + 12):
+		var id := w.block_id_at(Vector3i(base.x, y, base.z))
+		if id == BlockCatalog.WOOD or id == BlockCatalog.id_of(&"birch_log"):
+			ty0 = y
+			break
+	if ty0 == -0x40000000:
+		return {"sank": false, "freefall_violation": false}   # no trunk in world view — not a failure, just skip
+	w.break_terrain(Vector3i(base.x, ty0, base.z), player_pos)
+	w.break_terrain(Vector3i(base.x, ty0 + 1, base.z), player_pos)
+	await physics_frame
+	var body: VoxelBody = null
+	for ch in host.get_children():
+		if ch is VoxelBody and (body == null or (ch as VoxelBody).block_count() > body.block_count()):
+			body = ch
+	if body == null:
+		return {"sank": false, "freefall_violation": false}   # no canopy spawned — not a failure, just skip
+
+	var up: Vector3 = -w.gravity_vector().normalized()
+	var freefall_violation := false
+	for step in range(8 * 60):
+		if gc != null:
+			gc.call("update", player_pos)
+		await physics_frame
+		if not is_instance_valid(body):
+			break
+		var cl: Vector3 = body.transform * body._cells_center()
+		var surf := w.surface_y(cl.x, cl.z)
+		var depth := surf - cl.y
+		if depth > 1.0:
+			var down_speed := -body.linear_velocity.dot(up)   # positive = moving INTO the ground
+			if down_speed > 6.0:
+				freefall_violation = true
+	var sank := false
+	if is_instance_valid(body):
+		var cl2: Vector3 = body.transform * body._cells_center()
+		var end_depth := w.surface_y(cl2.x, cl2.z) - cl2.y
+		sank = end_depth > 0.5
+	return {"sank": sank, "freefall_violation": freefall_violation}

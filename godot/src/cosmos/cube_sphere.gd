@@ -2911,6 +2911,25 @@ const FP_CHOP_COLLIDER_CARVE := false
 ## sim_ground_rebuild calls the shipped rebuild_now()), byte-identical. Gate: verify_choplag.gd.
 const FP_CHOP_DEBRIS_CALM := false
 
+## COSMOS-TREE-BUGS Addendum 2 (docs/COSMOS-TREE-BUGS-DESIGN.md, "Addendum 2 2026-08-07") — the
+## INTERMITTENT sink fix (~15-25% of chops, live). Root cause: the terrain has NO collision mesh
+## (CLAUDE.md) — a loose VoxelBody's only physical rest surface is GroundCollider's box shapes, which are
+## player-centred, R=14, double-buffered, and debounce-rebuilt. A canopy dropped while the collider is
+## mid-build or stale-centred at the drop free-falls through the analytic-only terrain and tunnels below
+## the surface before any box exists there (measured with probe_sink.gd: 2-3/12 chops, IDENTICAL geometry
+## to the survivors — a v≈8.8 b/s ACCELERATING descent through depth 0 proves no box was ever under the
+## falling canopy; carve/distance/drift/size are all exonerated by the identical-geometry survivors).
+## `VoxelBody._integrate_forces` (Godot calls it for every active rigidbody regardless of
+## `_physics_process`, so it covers wood AND non-wood, immune to the collider's build timing) clamps the
+## body so no exposed-underside cell's base can descend below `world.surface_y` — the SAME analytic
+## surface `_grounded` already trusts, never the collider — lifting along the facet's own up
+## (`-gravity_vector()`, composes with FP_GRAV_BOX_COVER's radial gravity) and killing only the
+## into-ground velocity component (tangential slide/spin survive). A floor of LAST RESORT: the
+## GroundCollider stays and still handles body-on-body stacks + the player: this only closes the coverage
+## gap a collider timing race can leave open. Default FALSE ⇒ `_integrate_forces` early-returns,
+## byte-identical (no override effect). Gate: verify_treechop.gd (G-TC-SINK-MIDBUILD/-FREEFALL).
+const FP_LOOSE_BODY_ANALYTIC_FLOOR := false
+
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while
 ## in space: on the committed nav mode leaving PLANETARY it seeds q_bci from the current displayed basis (C0,

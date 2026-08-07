@@ -1,0 +1,425 @@
+# COSMOS-TREE-BUGS — acacia no-collision + cut-canopy flip/sink: root causes, verdicts, flagged fixes
+
+2026-08-06 · analysis + design (no production code in this change) · author: tree-bugs root-cause agent
+
+Both bugs were reproduced **headlessly**, root-caused to exact lines, and adjudicated against the four
+flags this session shipped (`FP_QUERY_FRAME_GUARD`, `FP_FLOOR_SURFACE_WELD`, `FP_UPVECTOR_FACET_HEAL`,
+`FP_CAMERA_RADIAL_LEVEL`). **Verdict for both: PRE-EXISTING, not a regression** — every reproduction below
+ran with all four flags at their committed defaults (`false`), and neither bug's code path touches the
+queries those flags changed. Both bugs date to the 2026-07-19 overnight batch, three weeks before the flags.
+
+Evidence probes (kept, untracked, in `godot/src/tools/`): `probe_acacia.gd` (facet-wide mesh-vs-analytic
+sweep), `probe_acacia2.gd` (vertical column dumps), `probe_acacia3.gd` (resolve_cell decomposition),
+`probe_treedrop.gd` (synthetic canopy drop — clean baseline), `probe_treechop.gd` (+`2`/`3` controls —
+real `break_terrain` chop), `probe_gravbox.gd` (facet-domain vs gravity-box geometry). All run as:
+
+```
+docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/<probe>.gd
+```
+
+with `FACETED` + `FP_CLIMATE_BIOMES` (+ for Bug 2: `FP_M1_POOL` + `FP_FIXED_FRAME`) sed'd ON, mirroring live.
+
+---
+
+## Bug 1 — acacia (and jungle) trees have no collision, cannot be broken, player walks through
+
+### Root cause: biome-id collision — savanna/jungle ARE the Moon on the analytic path
+
+Two features landed the same overnight (2026-07-19) from parallel agents, each "appending after the end
+of the biome enum":
+
+- `27ff862` (B1 climate biomes): `B_SAVANNA := 11`, `B_JUNGLE := 12` — `godot/src/world/terrain_config.gd:303-304`
+- `318dd2a` (O4b walkable Moon): `B_MOON_MARIA := 11`, `B_MOON_HIGHLANDS := 12`, `B_MOON_POLAR := 13` —
+  `godot/src/world/terrain_config.gd:310-312`, whose comment ("Values start ABOVE every Earth biome so the
+  enum spaces never collide", :308-309) was true when written and silently falsified by the sibling commit.
+
+`TerrainConfig.resolve_cell` routes moon biomes **before any Earth machinery**
+(`godot/src/world/terrain_config.gd:1309-1310`):
+
+```gdscript
+if biome == B_MOON_MARIA or biome == B_MOON_HIGHLANDS or biome == B_MOON_POLAR:
+    return _moon_cell(x, y, z, g, biome)
+```
+
+With `FP_CLIMATE_BIOMES` ON (live), every Earth **savanna (11) / jungle (12)** column entering the ANALYTIC
+path is treated as an **airless Moon column**: `_moon_cell` emits moon strata below ground and **never calls
+TreeGen** (moon = "NO trees", :1305-1310 comment) — so above ground the analytic column is pure AIR.
+
+Meanwhile the **C++ mesh generator has no moon branch at all** (`docker/engine/cache/godot/modules/voxel/
+generators/cosmos/voxel_generator_cosmos.cpp` — zero `B_MOON` references) and its climate-biome port is
+faithful (`tree_species_for` salt-124 acacia thinning at :486-488, `tree_acacia_block` at :585-599), so the
+**mesh draws the correct savanna ground + acacia trees**. Result: visible trees the analytic
+`WorldManager.block_id_at` (→ `cell_value_at` → `TerrainConfig.generated_cell`,
+`godot/src/world/world_manager.gd:1257-1269`) reports as AIR — no aim, no break DDA hit, no player
+collision, walk-through. `TreeGen` itself is NOT at fault: `TreeGen.block_at` returns the correct acacia
+cells (`godot/src/world/tree_gen.gd:311-329`) — it is simply never reached for biome 11/12 columns.
+
+### Measured evidence
+
+- `probe_acacia` (6 savanna + 2 forest facets, 1,889 tree sites, all four session flags OFF):
+  **9,406 mesh-only acacia cells** (1,387 `acacia_log`=56 + 8,019 `acacia_leaves`=57), **2,334 mesh-only
+  jungle cells** (ids 54/55), **0 analytic-only cells**, **0 column-profile (g/biome) mismatches** — the
+  two sides agree perfectly on WHERE savanna is; only resolve_cell's moon hijack diverges.
+- `probe_acacia2` vertical dump at a savanna acacia site (fid 20, base (−12143,−10557), g=3, biome=11
+  both sides, `TreeGen.block_at` = [56,56,56,56,56,57]): GD `generated_cell` = **−1 (mat 0xFFFF)** for
+  y≤g and **AIR** for y>g; C++ `resolve_cell` = dirt/grass/acacia stack. The −1 is `_moon_cell` emitting
+  unregistered moon material ids (`_ID_REGOLITH`… = `id_of` miss = −1 when `MULTI_BODY` is off,
+  `terrain_config.gd:536-543`); with `MULTI_BODY` on the ground would be regolith/basalt — differently
+  wrong, still tree-free.
+- `probe_acacia3`: `_surface_rule` returns grass (1) and `_biome_top(B_SAVANNA)` = grass via the `_:`
+  default (`terrain_config.gd:2254-2255`) — confirming the miss is the interception at :1309, not the
+  material tables.
+
+Collateral of the same collision (worth fixing in one stroke): **jungle trees are equally uncollidable**
+(confirmed by the 2,334-cell delta; live report said "acacia-only" because jungle wasn't visited);
+savanna/jungle **underground is analytically moon strata** (wrong `block_id_at` for digging); any Earth-
+reachable `== B_MOON_*` comparison is a latent hazard (today only `far_palette.gd:271` compares, on a
+moon-only path).
+
+### Why the gates missed it
+
+`verify_cppgen`'s faceted sweep picks slope-firing + cold + stride facets (`verify_cppgen.gd:280-311`) —
+savanna facets were never sampled; its tree coverage counter only tallies **legacy** species
+(`verify_cppgen.gd:389-391`: WOOD/LEAF/birch/spruce), so a flag-ON run could pass without touching a B1
+tree; and byte-equality runs at committed flag defaults (`FP_CLIMATE_BIOMES=false`) never produce biome
+11/12 at all. `verify_climate` gated classification + species selection, not `resolve_cell` output on
+savanna columns.
+
+### Regression verdict: PRE-EXISTING
+
+Reproduced with all four session flags at committed `false` defaults. The four flags touch
+`floor_under/surface_y/blocked/ceiling_scan` (`world_manager.gd:3745,3786`), player facet healing, and
+camera roll — none are in the `block_id_at → generated_cell → resolve_cell` chain. Introduced 2026-07-19
+by `27ff862` ∥ `318dd2a`.
+
+### Flagged fix design — `FP_BIOME_SPACE_FIX := false`
+
+**Source of truth: the C++ mesh is correct; the analytic side converges to it** by removing the hijack.
+(Justification: TreeGen + `_biome_top` defaults already author exactly what the mesher draws — proven by
+the 0-profile-mismatch sweep — so no new authoring is needed; only the moon interception is wrong.)
+
+Renumber the moon biome ids out of the Earth space **behind the flag**, via one helper (GDScript `const`
+can't be flag-conditional):
+
+```gdscript
+## TerrainConfig — single source for the moon biome id block (fix: 21/22/23, clear of every Earth id).
+static func moon_biome_id(slot: int) -> int:   # slot 0=maria 1=highlands 2=polar
+    return (21 + slot) if CubeSphere.FP_BIOME_SPACE_FIX else (11 + slot)
+static func is_moon_biome(b: int) -> bool:
+    return b >= moon_biome_id(0) and b <= moon_biome_id(2)
+```
+
+Touch-points (all comparisons/emissions route through the helper; flag OFF ⇒ returns 11/12/13 ⇒
+byte-identical shipped behaviour):
+
+1. `terrain_config.gd:1309` — `if is_moon_biome(biome): return _moon_cell(...)`.
+2. `terrain_config.gd:1049` — `_moon_profile` emits `moon_biome_id(0/1)` (and the polar slot wherever set).
+3. `_moon_cell`'s internal maria/highlands comparisons — same helper.
+4. `godot/src/world/far/far_palette.gd:271` — compare via `TerrainConfig.is_moon_biome`/`moon_biome_id`.
+5. `godot/src/tools/verify_multibody.gd` — read ids through the helper.
+
+Biome ids are **never serialized** (edits store packed material values; biome is derived per column), so
+renumbering under the flag has no save/compat surface. The C++ generator needs **no change** (it has no
+moon branch; Earth facets never carry moon biomes). NEVER-OOM: zero memory delta.
+
+### Gate spec
+
+`verify_tree_biomes.gd` (new; sed `FACETED`+`FP_CLIMATE_BIOMES`+`FP_BIOME_SPACE_FIX` ON):
+
+- **G-TB-EQUAL** — probe_acacia promoted: ≥5 savanna + ≥2 jungle facets, every tree site's full column
+  y∈[g−4, g+`TreeGen.MAX_ABOVE_SURFACE`] over the 5×5 canopy footprint: `TerrainConfig.generated_cell`
+  == C++ `resolve_cell` cell-for-cell, **0 mismatches** (was 11,740+ before the fix — the falsifier is
+  running the same sweep with the fix flag sed'd OFF and asserting it FAILS).
+- **G-TB-SOLID** — at ≥20 acacia + ≥10 jungle sites: analytic trunk cell (base, g+1) has
+  `block_id_at == acacia_log/jungle_log` and `cell_solid == true` (the collision/DDA truth the player feels).
+- **G-TB-MOON** — `verify_multibody` suite re-run green under the fix (moon columns still emit moon strata
+  through the renumbered ids), both `MULTI_BODY` on and off.
+- **G-TB-COVER** — extend `verify_cppgen.gd:389-391` `saw_tree` to count acacia/jungle/cactus ids so a
+  future flag-ON byte-equality run can never be vacuous on B1 species again.
+- **Byte-off** — all fix flags false ⇒ FLAT `verify_feature` 6042/0 unchanged (FLAT never reaches
+  Whittaker or moon branches; the helper returns shipped ids).
+
+---
+
+## Bug 2 — cut-tree canopy turns upside down and slowly sinks under the ground
+
+### Root cause: TWO cooperating defects, each isolated headlessly
+
+**B2a (primary — the wrong-gravity "sink"/drift): the per-facet gravity boxes stopped covering their
+facets after the R=6371 planet rescale.** `GRAV_BOX_TANGENTIAL := 320` (±160,
+`godot/src/world/world_manager.gd:915`) was sized on 2026-07-15 (`0316b21`) for "a facet's ~100-block
+half-width" (:911-914). The 2026-07-19 natural-Earth rescale made facets **~500-590 × ~350-400 blocks**
+(measured, `probe_gravbox`: fid 0/2/20/100 spans 593×364, 570×353, 543×354, 495×398; offsets from
+`centre_cell` up to **298×202**) — so the **outer ~60% of every facet lies outside its gravity Area3D**
+(`_build_facet_gravity_area`, world_manager.gd:948-969, centres the ±160 box on `centre_cell`; the
+domains are also asymmetric about `centre_cell`, so even the centring is wrong). A `VoxelBody` outside
+every box gets the **project-default gravity — global (0,−9.8,0)** (no gravity override in
+`godot/project.godot`), which in the planet-ABSOLUTE fixed frame (`FP_FIXED_FRAME` live) is an arbitrary
+oblique direction relative to the local surface.
+
+Measured (`probe_treechop2`, real `break_terrain` chop at a tree 273 blocks from facet centre, no
+collider): the canopy's `total_gravity` is global from frame 1 (gdot vs facet-down = **−0.605**,
+exactly (0,−1,0)·(−facet-up) for that facet) and the body **flies away obliquely** at ~49 b/s terminal.
+Control (`probe_treedrop`, synthetic canopy at the facet CENTRE, inside the box): gdot = **1.000**,
+clean fall, settle, freeze. Live, in contact with the ground collider, an oblique 9.8 pull produces
+exactly the reported phenomenology: sustained torque against the contact (slow roll to inverted under
+`angular_damp` 24, `voxel_body.gd:71-73`) plus a slow grind through/along the collider box seams —
+"turns upside down and slowly sinks under the ground".
+
+**B2b (the spawn "flip"): the canopy spawns 100% inside its own stale GroundCollider tree boxes.**
+The collider emits boxes for TREE cells (`godot/src/physics/ground_collider.gd:517,546,550` via
+`tree_block_at`), and `rebuild_now()` after a break is **debounced, non-blocking**
+(`ground_collider.gd:223-229`; ~0.25-1.0 s, :88). Its own comment argues staleness is safe because
+"VoxelBody settling confirms support analytically, never trusting the collider" — true for settling,
+**false for spawn**: `_structural_update` (world_manager.gd:3699) → `VoxelBody.spawn_loose`
+(`godot/src/physics/voxel_body.gd:114-134`) places the body at identity in the SAME lattice cells the
+tree occupied, i.e. every one of its 20-30 box shapes starts fully overlapping a static collider box.
+The solver's depenetration ejects and torques it.
+
+Measured (`probe_treechop3`, chop INSIDE the gravity box, collider prebuilt, gravity CORRECT
+gdot=1.000): the canopy tumbles from updot 1.000 → **−0.609** (~127° over-rotation) within 4 s and
+settles lying on its side (updot −0.003). With B2a also active (`probe_treechop`, the same chop outside
+the box) the combination **blows up to NaN** position/velocity in the very first physics step —
+headless severity of the same live flip+sink. (Once NaN, the body exits every area, which is why its
+gravity also reads global.)
+
+Interaction with Bug 1: an acacia can't be chopped at all (no DDA hit), so Bug 2 was only ever
+observable on non-acacia trees — consistent with the live report.
+
+### Regression verdict: PRE-EXISTING
+
+- **Empirical**: every probe above ran with the four session flags at committed `false` defaults; both
+  defects reproduce fully.
+- **Code-path**: `VoxelBody._grounded` reads `world.surface_y(x, z)` two-arg (`voxel_body.gd:452` —
+  `pos_fid` defaults to −1 ⇒ `FP_QUERY_FRAME_GUARD` no-op, `world_manager.gd:3745-3754`) and
+  `world.cell_solid` (:467, untouched). The `FP_FLOOR_SURFACE_WELD` weld lives **only in
+  `floor_under`** (`world_manager.gd:3786`+), which neither `VoxelBody` nor `GroundCollider` calls —
+  the collider builds from `col_profile`/`tree_block_at`/`overlay_at`
+  (`ground_collider.gd:295,357,443-550`). Byte-identical flags-on/off for every Bug-2 path.
+- **Introduced**: B2a = `0316b21` (2026-07-15 box sizing) invalidated by the 2026-07-19 R=6371 rescale;
+  B2b = latent since the collider gained tree boxes + the debounced rebuild (P2), exposed by the
+  faceted/fixed-frame era. The fixed-frame gates never dropped a live body — `verify_fixed_frame.gd:311`
+  freezes its debris marker ("no fall between the two reads"), so no gate ever exercised canopy settling.
+
+### Flagged fix design
+
+**`FP_GRAV_BOX_COVER := false`** — size + centre each facet's gravity box from its OWN measured domain
+(`_build_facet_gravity_area`, world_manager.gd:948-969):
+
+```gdscript
+var lo := FacetAtlas.dom_min(fid); var hi := FacetAtlas.dom_max(fid)
+if CubeSphere.FP_GRAV_BOX_COVER:
+    var half_x := maxf(float(hi.x - lo.x) * 0.5 + GRAV_BOX_MARGIN, GRAV_BOX_TANGENTIAL * 0.5)
+    var half_z := maxf(float(hi.y - lo.y) * 0.5 + GRAV_BOX_MARGIN, GRAV_BOX_TANGENTIAL * 0.5)
+    box.size = Vector3(half_x * 2.0, GRAV_BOX_VERTICAL, half_z * 2.0)
+    cs.position = Vector3((lo.x + hi.x) * 0.5, 0.0, (lo.y + hi.y) * 0.5)   # domain centre, not centre_cell
+else:  # shipped: 320×2048×320 @ centre_cell — byte-identical
+```
+
+`GRAV_BOX_MARGIN := 24.0` (covers the ridge band + detach-kick drift). Ridge overlap between neighbours
+grows; the existing active-priority stamping (`_stamp_active_gravity`, world_manager.gd:974-981) already
+arbitrates it. Same area count, bigger boxes ⇒ zero memory delta (NEVER-OOM safe); direction unchanged
+(−T_fid.basis.y), so `verify_fixed_frame` G-P2/P3 gravity lemmas hold as-is.
+
+**`FP_CHOP_COLLIDER_CARVE := false`** — kill the spawn overlap at the source: in `_structural_update`,
+after `_write_cell(c, 0)` for the component and **before** `spawn_loose` (world_manager.gd:3693-3699),
+synchronously remove the live collider shapes at exactly the carved cells: `GroundCollider.carve_cells
+(comp: Array[Vector3i])` — it owns per-column shape bookkeeping, so this is O(component) targeted
+`PhysicsServer3D` shape frees (a few dozen), not a rebuild; the debounced full rebuild then proceeds as
+today. Off ⇒ shipped debounced path byte-identical. *(Rejected interim: masking the new body off the
+terrain layer for N frames — it lets a low chop fall INTO the ground; the carve is the correct minimal.
+Rejected large fix: real per-body analytic terrain contact — not needed once gravity + overlap are fixed,
+as the clean baseline (`probe_treedrop`) already settles perfectly on the existing collider.)*
+
+### Gate spec
+
+`verify_treechop.gd` (new; sed `FACETED`+`FP_M1_POOL`+`FP_FIXED_FRAME`+both fix flags ON):
+
+- **G-TC-COVER** (numeric lemma, no physics): for a stride of fids, the flag-ON box (position ± half
+  extents in area-local frame) contains `[dom_min − 8, dom_max + 8]`; flag OFF ⇒ box byte-equals the
+  shipped 320×2048×320 @ `centre_cell` (byte-off proof).
+- **G-TC-GRAV** — real `break_terrain` chop of a worldgen tree at a site **>160 blocks from
+  `centre_cell`** (the probe_treechop site class): from the first physics frame, canopy
+  `total_gravity`·(−facet-up) ≥ 0.999 (was −0.605).
+- **G-TC-SETTLE** — for both an inside-ring and an outside-ring chop, within 20 s sim: body state finite
+  (no NaN — was NaN in ≤1 frame), settles with canopy centre within its own half-height of
+  `surface_y`, **updot ≥ 0.9** (uprightness — was −0.609 tumble), and frozen/sleeping at the end.
+- **Falsifier** — the gate re-run with the two fix flags sed'd OFF must go RED on G-TC-GRAV and
+  G-TC-SETTLE (this doc's probes prove it measurably does).
+- **Byte-off** — flags false ⇒ FLAT `verify_feature` 6042/0 unchanged (flat mode has no gravity areas
+  and `rebuild_now` semantics untouched when the carve flag is off).
+
+---
+
+## Summary table
+
+| | Bug 1 (acacia/jungle no-collision) | Bug 2 (canopy flip + sink) |
+|---|---|---|
+| Root cause | `B_SAVANNA/B_JUNGLE` (11/12, terrain_config.gd:303-304) collide with `B_MOON_MARIA/HIGHLANDS` (11/12, :310-311); resolve_cell:1309 hijacks Earth savanna/jungle into `_moon_cell` (no trees) on the analytic path only | B2a: gravity box ±160 (world_manager.gd:915) vs post-rescale facets ~500-590 wide → outer ~60% gets global (0,−9.8,0); B2b: canopy spawns inside its own stale debounced collider tree boxes (ground_collider.gd:223-229, 517) |
+| Verdict | Pre-existing (2026-07-19, `27ff862`∥`318dd2a`); repro with session flags OFF | Pre-existing (`0316b21` 07-15 sizing vs 07-19 R=6371 rescale; collider debounce older); repro with session flags OFF; no Bug-2 path reads the welded/guarded queries |
+| Fix flag | `FP_BIOME_SPACE_FIX` — renumber moon biome ids to 21/22/23 via one helper | `FP_GRAV_BOX_COVER` (domain-derived boxes) + `FP_CHOP_COLLIDER_CARVE` (synchronous shape carve at collapse spawn) |
+| Headless repro | Yes — probe_acacia/2/3 (9,406 acacia + 2,334 jungle mesh-only cells; 0 profile mismatches) | Yes — probe_treechop/2/3 (gdot −0.605 fly-away; updot → −0.609 tumble; NaN combined) + probe_gravbox geometry |
+
+---
+
+## Addendum 2026-08-07 — CHOP-LAG: sustained lag while chop debris is awake
+
+Live report after the Bug-2 fixes shipped: chopping a tree lags the game badly for a few dozen seconds,
+correlated with the loose canopy body being alive (live phys_ms 5-11, no NaN), clearing when it settles.
+Measured headlessly with `godot/src/tools/probe_choplag.gd` (scenarios S1/S2/S5/S6 + a fix-flags-OFF A/B).
+
+### Measured per-frame cost profile over the body lifetime (native; wasm ≈ ×5-20)
+
+| scenario | awake window | pairs (awake) | native cost while awake |
+|---|---|---|---|
+| S1 single wood chop, quiet | **2.4 s** | ~154 | gc.update ~15 µs/f; phys ~0.1-0.5 ms/f |
+| S2 single birch chop, quiet | 1.1 s | ~535 | same class |
+| S5 full FELLING (break every 2 s ×4) | **23.7 s** (15.7 s past last break) | 500-800 | phys 0.5-0.7 ms/f sustained → wasm ≈ the live 5-11 phys_ms |
+| S6 chop + background dirt (sim_ground_rebuild each 0.5 s, the snowfall cadence) | **30 s** | up to **1884** | **gc.update 2.0-4.7 ms/frame native for 8 s straight** (region rebuilds back-to-back, build active 39-55 of every 60 frames) — the wasm-dominant term (10-50 ms/f class) |
+| A/B: fix flags OFF, single wood chop | **never sleeps** — flies away at ~48 b/s (the old bug), pairs drop to 25 by t=4 s | 25 | ~0.3 ms/f, far from player |
+
+Two feedback terms make the window "dozens of seconds":
+1. **Rebuild⇄wake loop (S6):** background dirt (`WorldManager.sim_ground_rebuild`, world_manager.gd:1828-1833
+   — the snowfall sim marks the collider dirty every writing 0.5 s step, relying on the loose-body gate for
+   "zero cost") triggers back-to-back full-region rebuilds while an awake body holds the gate open
+   (ground_collider.gd:174-235); each rebuild re-points the shapes under the resting body and jolts it
+   (v spikes to 5.9 measured) → it can't sleep → the gate stays open → more rebuilds. 30 s awake vs 2.4 s quiet.
+2. **Felling interaction (S5):** every subsequent trunk break calls `wake_bodies_near` (world_manager.gd:1675)
+   + kicks pieces → the pile stays awake for the whole action + a 15.7 s settle tail.
+3. **FP_TREEPHYS_BOUND's 8 s deadline NEVER fires for wood bodies** — the deadline lives in
+   `VoxelBody._physics_process` (voxel_body.gd:247-251) and `_refresh_dormancy` disables `_physics_process`
+   for wood (voxel_body.gd:302-303). An oak canopy has no awake bound at all (pre-existing gap, now load-bearing).
+
+### Regression verdict: pre-existing costs, EXPOSED by the fixes (which add no per-frame cost)
+
+- `FP_GRAV_BOX_COVER`'s big Area3D costs ~24-26 broadphase pairs for a 25-shape body (pairs after sleep:
+  exactly the area pairs) — negligible; per-frame A/B shows no added cost.
+- `FP_CHOP_COLLIDER_CARVE` is a one-shot at break time; no per-frame term.
+- The A/B proves the mechanism: pre-fix the canopy left the scene in ~2 s (fly-away/NaN/sink), so the
+  pre-existing awake-body machinery (GodotPhysics pair costs, the gate-open collider rebuild churn, the
+  missing wood deadline) never ran long enough to be felt. The fixes made debris stay — correctly — and the
+  old costs now bill for the full lifetime. Do NOT narrow the two fix flags; bound the lifetime costs instead.
+
+### Flagged fix design — `FP_CHOP_DEBRIS_CALM := false`
+
+1. **Wood awake-deadline** (voxel_body.gd): under the flag, an ACTIVE wood body keeps `_physics_process`
+   enabled (only while active — dormant wood still costs zero) running just the deadline/coarse-calm logic:
+   sustained `linear_velocity < SETTLE_COARSE_LINEAR` for `SETTLE_COARSE`-style dwell, OR
+   `_active_age >= CubeSphere.TREEPHYS_MAX_ACTIVE_SEC` with `lin < 1.0`, ⇒ `sleeping = true` + zero
+   velocities (NOT freeze — wood stays sandbox-pushable; any contact/push auto-wakes it). Composes with
+   FP_TREEPHYS_BOUND: same `_active_age` clock, same reset-on-wake; closes the wood gap that defeats it.
+2. **Sim-dirt lazy debounce** (world_manager.gd:1831 + ground_collider.gd): `sim_ground_rebuild` routes to
+   a `rebuild_now_lazy()` — same dirty mark with a LONG debounce (e.g. 180 frames ≈ 3 s) and no 60-frame
+   max-latency escalation. Kills the back-to-back rebuild churn AND the rebuild-jolt wake loop while debris
+   settles; player-edit rebuilds keep the fast 15/60 debounce untouched. (The collider's own contract
+   already declares sim staleness safe — settling is analytic.)
+
+Both pieces byte-off (flag false ⇒ shipped behaviour); NEVER-OOM neutral.
+
+### Gate spec — `verify_choplag.gd` (promote the probe)
+
+- **G-CL-QUIET** — single wood chop, quiet world: body dormant ≤ 4 s (pins today's healthy S1).
+- **G-CL-DIRT** — chop + `sim_ground_rebuild` every 30 frames: body dormant ≤ TREEPHYS_MAX_ACTIVE_SEC + 4 s
+  (falsifier: fix OFF measured 30 s), and post-dormant `gc.update()` cost < 100 µs summed per second.
+- **G-CL-FELL** — S5 flow (a break every 2 s ×4): every body dormant ≤ 10 s after the LAST break
+  (falsifier: 15.7 s today).
+- **Byte-off** — flag false ⇒ FLAT `verify_feature` 6042/0 and `verify_treechop` 36/0 unchanged.
+
+---
+
+## Addendum 2 (2026-08-07) — INTERMITTENT sink still occurs (~15-25% of chops)
+
+Live after the Bug-2 fixes: chopping 3 spawn-area oaks, tree 2 sank while 1 and 3 rested.
+Reproduced headlessly with `godot/src/tools/probe_sink.gd` (12 round-canopy oak/birch on the spawn
+facet 2, chopped the live way — gate CLOSED until the chop's own canopy opens it): **2-3 of 12 sink**,
+with IDENTICAL geometry to the survivors (trunk_dist 2.5, canopy 24-26 cells, footprint ±1). So the
+sink is **state/timing-dependent, not geometric** — matching "some trees sink".
+
+### Root cause: the GroundCollider is the ONLY physical rest surface, and it has coverage/timing gaps
+
+The terrain has no collision mesh (analytic physics, CLAUDE.md). A loose `VoxelBody` therefore rests
+**only** on `GroundCollider`'s box shapes. But the collider is (ground_collider.gd:36-38, 81, 174-235):
+R=14 columns, **player-centred**, **double-buffered**, and **debounce-rebuilt** (15/60 frames). When a
+canopy is dropped while the live shape set does not cover its fall column — because a rebuild is
+mid-flight or the live centre is stale from the approach — the body **free-falls through the
+analytic-only terrain** and tunnels below the surface before any box exists there.
+
+Measured trace (probe_sink, depth = surface_y − body_centre.y; negative = resting above surface):
+
+| tree | PRE-CHOP collider | fall trace | outcome |
+|---|---|---|---|
+| #2 OK | `_phase=0` (idle), live centre 198 blocks away | chop triggers a FRESH core+build (`_phase=1` @ t=0) → ground appears → settles −3.14 | rests |
+| #3 SANK | `_phase=2` (mid-build, SHAPES) | t=0.5 depth −2 → **t=1.0 depth +1.26 v=8.81 (accelerating = no collision)** → tunnels +6.7; build finishes `_phase=0` @ t=1.5 too late → rests +4.6 **below** surface | **sinks** |
+| #7 SANK | `_phase=2` | identical free-fall to +6.7 | **sinks** |
+
+The v≈8.8 accelerating descent through depth 0 is the proof: no box was ever under the falling canopy.
+
+**Carve is exonerated** (answers hypothesis 2): A/B with `FP_CHOP_COLLIDER_CARVE` OFF (grav ON) still
+sinks 3/12 — the carve one-shot at break time is not the cause. Hypotheses 1/3/4 (distance, drift,
+size) are all falsified by the identical-geometry survivors; the discriminator is purely the collider's
+build phase / live-centre coverage at the instant of the drop. Pre-fix this never surfaced because the
+old bug flung the canopy away in ~2 s (Addendum 1) — the body left before the coverage gap could bite.
+
+### Why verify_treechop 36/0 missed it
+
+The gate (a) builds the collider FULLY before chopping (no mid-rebuild window ever exists at the drop),
+and (b) parameterises only by DISTANCE (inside-ring <140, outside-ring 170-220), never by collider build
+STATE. The sink requires the collider to be mid-rebuild / stale-centred AT the drop — a temporal
+condition the gate never constructs. This is the exact blind spot; the new gate must drop into an
+un-built / mid-build collider.
+
+### Flagged fix design — `FP_LOOSE_BODY_ANALYTIC_FLOOR := false`
+
+Give every loose `VoxelBody` a terrain-exact rest that does NOT depend on collider boxes — the same
+analytic surface the body already reads for its settle decision (`_grounded` →
+`world.surface_y`/`cell_solid`, voxel_body.gd:444-474). Implement as a hard floor clamp in a new
+`_integrate_forces(state)` override (Godot calls it for every active rigidbody regardless of
+`_physics_process`, so it covers wood AND non-wood, immune to the collider's timing):
+
+```gdscript
+func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+    if not CubeSphere.FP_LOOSE_BODY_ANALYTIC_FLOOR or world == null or freeze:
+        return
+    # Deepest penetration of any cell's base below the analytic surface under it (body LATTICE frame,
+    # matching _grounded's transform contract). One surface_y per distinct column of the body.
+    var worst := 0.0
+    for c: Vector3i in cells.keys():
+        if cells.has(Vector3i(c.x, c.y - 1, c.z)):
+            continue                                   # not an exposed underside cell
+        var b := transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)   # cell base point
+        var pen := world.surface_y(b.x, b.z) - b.y     # >0 ⇒ below the surface
+        worst = maxf(worst, pen)
+    if worst > 0.0:
+        var t := state.transform
+        t.origin += -world.gravity_vector().normalized() * worst   # lift along facet-up, back to the surface
+        state.transform = t
+        var v := state.linear_velocity
+        var up := -world.gravity_vector().normalized()
+        var into := v.dot(up)
+        if into < 0.0:
+            state.linear_velocity = v - up * into      # kill only the into-ground component (keep slide)
+```
+
+Terrain-exact (rests where the survivors do, depth ≤ 0), collider-independent (immune to build timing),
+radial-gravity-correct (lifts along the facet up, composes with FP_GRAV_BOX_COVER), and cheap (one
+`surface_y` per exposed-underside column of a ~10-column body per active frame; bodies sleep in ≤ a few
+s per Addendum 1, then `_integrate_forces` stops). Off ⇒ no override effect, byte-identical. The
+GroundCollider stays (it still handles body-on-body stacks and gives the player something to stand on);
+this is a floor of last resort so a coverage gap can never let a body pass the ground.
+
+*(Rejected alternatives: (a) widen R / body-follow collider — still has debounce/build windows, and a
+second collider centred on debris re-introduces the rebuild churn Addendum 1 just fixed; (b) force a
+synchronous full build on every chop — the ~100 ms stall the debounce exists to avoid. The analytic
+clamp sidesteps the collider-timing problem entirely instead of racing it.)*
+
+### Gate spec — extend `verify_treechop.gd` with the coverage-gap condition
+
+- **G-TC-SINK-MIDBUILD** — the load-bearing new pin: chop a worldgen tree while the collider is
+  deliberately mid-rebuild / stale-centred (drive the exact probe_sink sequence: gate closed on
+  approach, chop immediately, no pre-build). For a spread of ≥12 trees on facet 2, EVERY canopy ends at
+  depth ≤ +0.5 (rests at/above surface); **falsifier: flag OFF reproduces 2-3/12 at depth +4…+9**
+  (this doc's measurement).
+- **G-TC-SINK-FREEFALL** — assert no body's downward speed exceeds a threshold (e.g. 6 b/s) below
+  surface−1 for more than N frames (catches the free-fall signature directly).
+- Keep the existing 36 assertions (inside/outside ring, first-frame gravity, 20 s settle) green.
+- **Byte-off** — flag false ⇒ FLAT `verify_feature` 6042/0 + existing `verify_treechop` 36/0 unchanged.

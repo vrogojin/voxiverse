@@ -61,6 +61,13 @@ const SETTLE_RETRY_SEC := 0.25         # calm-but-unsupported: re-check support 
 const SETTLE_COARSE_LINEAR := 0.30     # m/s: the "coarsely calm" band
 const SETTLE_COARSE_SEC := 10.0        # s of coarse-calm after which we force-freeze
 
+# COSMOS-TREE-BUGS Addendum 2 (FP_LOOSE_BODY_ANALYTIC_FLOOR) — the analytic-floor clamp's deadband: a
+# genuinely resting body has normal, near-zero penetration under `world.surface_y` every frame (contact
+# noise / a sloped column's collider top not being bit-identical to the analytic surface); only a
+# penetration past this is treated as the real coverage-gap sink. Well below the bug's own signature
+# (+4..+9, accelerating) and inside the doc's +0.5 "not sunk" acceptance bound.
+const SINK_DEADBAND := 0.5
+
 # Dynamics for detached (activated) pieces — see _apply_dynamic_props().
 # Angular damping scales with block count so a heavier cluster resists flipping far
 # more than a light one: the player leans ~700 N down on a piece it stands on, which
@@ -239,8 +246,15 @@ func block_count() -> int:
 ## freezing in the air. A coarse-calm escape prevents a corner-jittering body from holding
 ## the collider gate on forever.
 func _physics_process(delta: float) -> void:
-	if not activated or _is_wood or freeze:
+	if not activated or freeze:
 		return                                       # defensive; _physics_process is off in these states
+	if _is_wood:
+		# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): off, _refresh_dormancy() never re-enables
+		# _physics_process for an activated wood body in the first place, so this branch is unreachable —
+		# byte-identical dead code.
+		if CubeSphere.FP_CHOP_DEBRIS_CALM:
+			_wood_calm_step(delta)
+		return
 	# TREE-PHYS BOUND hard deadline: a dynamic body that has not reached rest within TREEPHYS_MAX_ACTIVE_SEC freezes to
 	# STATIC where it is, REGARDLESS of _grounded — so a body whose support query never confirms (far/faceted staleness)
 	# can no longer churn the physics server forever. Off ⇒ never trips (deadline never accrues to the threshold).
@@ -268,6 +282,54 @@ func _physics_process(delta: float) -> void:
 		return
 	_freeze_dormant()
 
+## COSMOS-TREE-BUGS Addendum 2 (FP_LOOSE_BODY_ANALYTIC_FLOOR) — a floor of LAST RESORT, independent of
+## the GroundCollider entirely. The terrain has no collision mesh (CLAUDE.md): a loose body's ONLY
+## physical rest surface is GroundCollider's box shapes, and that collider is player-centred, R=14,
+## double-buffered, and debounce-rebuilt — a canopy dropped while it is mid-build or stale-centred at
+## the drop free-falls straight through the analytic-only terrain and tunnels below the surface before
+## any box ever exists there (measured: 2-3/12 chops, IDENTICAL geometry to the survivors — purely a
+## collider build-state/timing race, not distance/size/carve). `_integrate_forces` is called by Godot for
+## EVERY active RigidBody3D every physics step regardless of `_physics_process` (which is OFF for wood
+## unless FP_CHOP_DEBRIS_CALM is also on) — so this single override covers wood AND non-wood alike and is
+## immune to the collider's timing entirely.
+##
+## Reads the SAME analytic surface `_grounded` already trusts (`world.surface_y`) — never the collider —
+## so a body can never sink past where a covered body would have rested. Only lifts (never pushes down),
+## along the facet's own up (`-world.gravity_vector()`, so it composes with FP_GRAV_BOX_COVER's radial
+## gravity on a tilted facet) and kills only the INTO-ground component of velocity (tangential slide/spin
+## survive), so this never fights a body sliding or settling normally. The GroundCollider is untouched and
+## still does its job (body-on-body stacks, the player's real collision) — this is purely a backstop for
+## the coverage gap. Off ⇒ early return, byte-identical (no override effect).
+func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+	if not CubeSphere.FP_LOOSE_BODY_ANALYTIC_FLOOR or world == null or freeze:
+		return
+	# Deepest penetration of any EXPOSED-UNDERSIDE cell's base below the analytic surface under it (one
+	# surface_y per distinct column, same lattice-transform contract _grounded uses — see its comment).
+	var worst := 0.0
+	for c: Vector3i in cells.keys():
+		if cells.has(Vector3i(c.x, c.y - 1, c.z)):
+			continue                                   # not an exposed underside cell
+		var b := transform * Vector3(c.x + 0.5, float(c.y), c.z + 0.5)
+		var pen := world.surface_y(b.x, b.z) - b.y      # > 0 ⇒ this cell's base is below the surface
+		worst = maxf(worst, pen)
+	# DEADBAND: a body genuinely resting on the GroundCollider is normal, near-zero penetration EVERY
+	# frame (contact-solver noise / the collider's box top not being bit-identical to surface_y on
+	# sloped ground) — clamping on that reintroduces a lift→refall micro-oscillation every physics step
+	# that never lets linear_velocity settle below SETTLE_LINEAR, so the body never freezes (found via
+	# G-TC-SETTLE regressing to "never settles / tumbles" once this override went in). SINK_DEADBAND is
+	# well below the real bug's signature (measured +4..+9 with an ACCELERATING free-fall) and still
+	# comfortably inside the doc's own +0.5 "not sunk" bound, so it never masks the actual coverage gap.
+	if worst <= SINK_DEADBAND:
+		return
+	var up := -world.gravity_vector().normalized()
+	var t := state.transform
+	t.origin += up * worst                              # lift along the facet's own up, back to the surface
+	state.transform = t
+	var v := state.linear_velocity
+	var into := v.dot(up)
+	if into < 0.0:
+		state.linear_velocity = v - up * into           # kill only the into-ground component; keep the slide
+
 ## Land the body: zero its motion, freeze to STATIC, and stop per-frame script work → DORMANT
 ## (zero cost). Extracted so P1 can hook AABB caching / dormant-grid registration here.
 func _freeze_dormant() -> void:
@@ -277,12 +339,60 @@ func _freeze_dormant() -> void:
 	freeze = true
 	set_physics_process(false)                       # DORMANT: no more per-frame script work
 
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM) — the wood-only awake bound. Wood is sandbox-dynamic and
+## must stay pushable FOREVER (§12: never auto-freezes), so this puts a calm body to SLEEP instead — not
+## freeze — which `is_awake()` (freeze-or-sleeping) already reports as dormant, closing the GroundCollider
+## gate (it counts only awake bodies), while Godot's own contact/push physics transparently wakes a
+## sleeping RigidBody3D on any real disturbance; wake() (below) handles the explicit break/wake_bodies_near
+## path, restarting these clocks. Two independent trips, checked every active-wood frame:
+##   1. the SAME anti-livelock coarse-calm dwell ground bodies use (SETTLE_COARSE_LINEAR for
+##      SETTLE_COARSE_SEC) — the general backstop. Godot's own native sleep threshold usually gets a calm
+##      body to sleep well before this (measured: a quiet single chop is dormant in ~2.4 s, untouched by
+##      this timer) — this exists for wood that stays "coarsely" calm without ever crossing Godot's own
+##      (tighter) native threshold.
+##   2. the FP_TREEPHYS_BOUND hard deadline (_active_age >= TREEPHYS_MAX_ACTIVE_SEC, gated at a loose
+##      lin < 1.0 so a body still genuinely flying isn't force-slept mid-air) — this is the "close the wood
+##      gap" piece for that flag specifically: pre-fix, _is_wood short-circuited _physics_process entirely,
+##      so wood had NO awake bound at all even with FP_TREEPHYS_BOUND on. Only accrues/binds when
+##      FP_TREEPHYS_BOUND is ALSO on (shares its _active_age clock and TREEPHYS_MAX_ACTIVE_SEC constant —
+##      not a second, independently-invented deadline).
+func _wood_calm_step(delta: float) -> void:
+	var lin := linear_velocity.length()
+	if CubeSphere.FP_TREEPHYS_BOUND:
+		_active_age += delta
+		if _active_age >= CubeSphere.TREEPHYS_MAX_ACTIVE_SEC and lin < 1.0:
+			_calm_wood()
+			return
+	if lin < SETTLE_COARSE_LINEAR:
+		_coarse_timer += delta
+		if _coarse_timer >= SETTLE_COARSE_SEC:
+			_calm_wood()
+			return
+	else:
+		_coarse_timer = 0.0
+
+## Put a calm wood body to SLEEP (not freeze — stays sandbox-pushable) and stop the per-frame calm-check
+## work until wake() restarts it.
+func _calm_wood() -> void:
+	linear_velocity = Vector3.ZERO
+	angular_velocity = Vector3.ZERO
+	sleeping = true
+	set_physics_process(false)
+
 ## Reactivate a dormant body on disturbance: unfreeze → dynamic → re-enable the settle loop, so it
 ## falls if it lost support or re-settles (+re-freezes) if still supported. Wood just clears the
 ## Godot sleep. Idempotent and cheap. Called by WorldManager.wake_bodies_near / break_cell.
 func wake() -> void:
 	if _is_wood:
 		sleeping = false
+		# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): mirror the ground-body reactivation below —
+		# restart the deadline/coarse-calm clocks and re-enable _physics_process (_calm_wood() disabled it)
+		# so a body woken by an explicit break/wake_bodies_near call resumes being bounded. Off ⇒
+		# byte-identical (the early return above is unchanged).
+		if CubeSphere.FP_CHOP_DEBRIS_CALM:
+			_active_age = 0.0
+			_coarse_timer = 0.0
+			set_physics_process(activated)
 		return
 	activated = true
 	freeze = false
@@ -299,7 +409,13 @@ func is_awake() -> bool:
 
 ## Enable per-frame settle logic ONLY for a dynamic (dropping) ground body; wood, a frozen
 ## (dormant) ground body, and a pristine cluster do ZERO per-frame script work.
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): under the flag, an ACTIVE (not frozen — wood never
+## freezes) wood body ALSO keeps _physics_process running, so _wood_calm_step can bound its awake time; a
+## dormant (sleeping) or not-yet-activated wood body still costs zero either way. Off ⇒ byte-identical.
 func _refresh_dormancy() -> void:
+	if CubeSphere.FP_CHOP_DEBRIS_CALM and _is_wood:
+		set_physics_process(activated and not freeze)
+		return
 	set_physics_process(activated and not _is_wood and not freeze)
 
 ## True iff this cluster contains at least one WOOD cell -> sandbox-dynamic (never auto-freezes).

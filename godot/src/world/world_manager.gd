@@ -958,12 +958,27 @@ func _build_facet_gravity_area(fid: int) -> Area3D:
 	area.transform = _anchored(FacetAtlas.facet_transform(fid))
 	var cs := CollisionShape3D.new()
 	var box := BoxShape3D.new()
-	box.size = Vector3(GRAV_BOX_TANGENTIAL, GRAV_BOX_VERTICAL, GRAV_BOX_TANGENTIAL)
-	cs.shape = box
 	# Offset the box over the facet's PATCH: the facet-centre lattice cell (T_fid's origin is the lattice ORIGIN, far
 	# from the patch via the decorrelation offset O). In the Area's local (lattice) frame +Y is the facet up.
 	var centre := FacetAtlas.centre_cell(fid)
-	cs.position = Vector3(float(centre.x), 0.0, float(centre.y))
+	# COSMOS-TREE-BUGS Bug 2a fix (FP_GRAV_BOX_COVER): the fixed ±160 box (sized 2026-07-15 for a ~200-block-wide
+	# facet) no longer covers the facet after the 2026-07-19 R=6371 rescale grew facets to ~500-590×350-400 —
+	# the outer ~60% of the domain got NO gravity Area3D (falls back to Godot's project-default global
+	# (0,-9.8,0)). Size + CENTRE the box from the facet's OWN measured domain instead of the fixed half-extent
+	# @ centre_cell (the domains are asymmetric about centre_cell too, so the shipped centring is also wrong).
+	# `maxf` with the shipped half-extent means a genuinely tiny/degenerate domain never SHRINKS the box below
+	# the old floor. Off ⇒ the shipped 320×2048×320 box @ centre_cell, byte-identical.
+	if CubeSphere.FP_GRAV_BOX_COVER:
+		var lo := FacetAtlas.dom_min(fid)
+		var hi := FacetAtlas.dom_max(fid)
+		var half_x := maxf(float(hi.x - lo.x) * 0.5 + CubeSphere.GRAV_BOX_MARGIN, GRAV_BOX_TANGENTIAL * 0.5)
+		var half_z := maxf(float(hi.y - lo.y) * 0.5 + CubeSphere.GRAV_BOX_MARGIN, GRAV_BOX_TANGENTIAL * 0.5)
+		box.size = Vector3(half_x * 2.0, GRAV_BOX_VERTICAL, half_z * 2.0)
+		cs.position = Vector3((float(lo.x) + float(hi.x)) * 0.5, 0.0, (float(lo.y) + float(hi.y)) * 0.5)   # domain centre, not centre_cell
+	else:
+		box.size = Vector3(GRAV_BOX_TANGENTIAL, GRAV_BOX_VERTICAL, GRAV_BOX_TANGENTIAL)
+		cs.position = Vector3(float(centre.x), 0.0, float(centre.y))
+	cs.shape = box
 	area.add_child(cs)
 	add_child(area)
 	return area
@@ -1813,8 +1828,17 @@ func sim_revert_cell(cell: Vector3i) -> void:
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
 ## The collider's own debounce coalesces further, and its loose-body gate means it does zero work unless a
 ## body is actually nearby — a settled pile near the player costs nothing.
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): routed to the collider's LAZY channel instead of the
+## fast player-edit one — this call fires every 0.5s of writing sim steps regardless of whether the player
+## touched anything, and feeding the fast 15/60 debounce turned "background dirt happened somewhere" into a
+## rebuild every ~0.25-1.0s for as long as any body sat nearby, jolting a settling body back awake (the
+## rebuild⇄wake loop measured in probe_choplag S6). Off ⇒ the shipped fast rebuild_now(), byte-identical.
 func sim_ground_rebuild() -> void:
-	if _ground != null:
+	if _ground == null:
+		return
+	if CubeSphere.FP_CHOP_DEBRIS_CALM:
+		_ground.rebuild_now_lazy()
+	else:
 		_ground.rebuild_now()
 
 # --- per-cell metadata + state axis (VOXEL-DATA-STRUCTURE §7.2 / §3.1) -----------
@@ -3692,6 +3716,12 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 			comp_ids[c] = CellCodec.with_state(cv, CellCodec.state(cv) & ~CellCodec.STATE_SNOW_CAPPED)
 		for c: Vector3i in comp:
 			_write_cell(c, 0)
+		# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE): disable the LIVE GroundCollider's shapes at the
+		# just-carved cells BEFORE spawn_loose, so the new body doesn't spawn fully overlapping stale collider
+		# geometry (rebuild_now() below only marks the rebuild dirty — it lands debounced, long after this
+		# frame). Off ⇒ no-op inside carve_cells; _ground can be null pre-setup, same guard as elsewhere.
+		if CubeSphere.FP_CHOP_COLLIDER_CARVE and _ground != null:
+			_ground.carve_cells(comp)
 		# FP-FIXED-FRAME (§5): parent collapse debris under the ActiveFrame host (else self, @ identity) so it rides
 		# the play frame; the world_ref stays this WorldManager. Phase 2: spawn_loose sets the body's LOCAL transform
 		# to identity (cells stay lattice), so its GLOBAL comes out T_active·cell — the block's true absolute pose,

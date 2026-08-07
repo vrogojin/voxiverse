@@ -259,3 +259,68 @@ as the clean baseline (`probe_treedrop`) already settles perfectly on the existi
 | Verdict | Pre-existing (2026-07-19, `27ff862`∥`318dd2a`); repro with session flags OFF | Pre-existing (`0316b21` 07-15 sizing vs 07-19 R=6371 rescale; collider debounce older); repro with session flags OFF; no Bug-2 path reads the welded/guarded queries |
 | Fix flag | `FP_BIOME_SPACE_FIX` — renumber moon biome ids to 21/22/23 via one helper | `FP_GRAV_BOX_COVER` (domain-derived boxes) + `FP_CHOP_COLLIDER_CARVE` (synchronous shape carve at collapse spawn) |
 | Headless repro | Yes — probe_acacia/2/3 (9,406 acacia + 2,334 jungle mesh-only cells; 0 profile mismatches) | Yes — probe_treechop/2/3 (gdot −0.605 fly-away; updot → −0.609 tumble; NaN combined) + probe_gravbox geometry |
+
+---
+
+## Addendum 2026-08-07 — CHOP-LAG: sustained lag while chop debris is awake
+
+Live report after the Bug-2 fixes shipped: chopping a tree lags the game badly for a few dozen seconds,
+correlated with the loose canopy body being alive (live phys_ms 5-11, no NaN), clearing when it settles.
+Measured headlessly with `godot/src/tools/probe_choplag.gd` (scenarios S1/S2/S5/S6 + a fix-flags-OFF A/B).
+
+### Measured per-frame cost profile over the body lifetime (native; wasm ≈ ×5-20)
+
+| scenario | awake window | pairs (awake) | native cost while awake |
+|---|---|---|---|
+| S1 single wood chop, quiet | **2.4 s** | ~154 | gc.update ~15 µs/f; phys ~0.1-0.5 ms/f |
+| S2 single birch chop, quiet | 1.1 s | ~535 | same class |
+| S5 full FELLING (break every 2 s ×4) | **23.7 s** (15.7 s past last break) | 500-800 | phys 0.5-0.7 ms/f sustained → wasm ≈ the live 5-11 phys_ms |
+| S6 chop + background dirt (sim_ground_rebuild each 0.5 s, the snowfall cadence) | **30 s** | up to **1884** | **gc.update 2.0-4.7 ms/frame native for 8 s straight** (region rebuilds back-to-back, build active 39-55 of every 60 frames) — the wasm-dominant term (10-50 ms/f class) |
+| A/B: fix flags OFF, single wood chop | **never sleeps** — flies away at ~48 b/s (the old bug), pairs drop to 25 by t=4 s | 25 | ~0.3 ms/f, far from player |
+
+Two feedback terms make the window "dozens of seconds":
+1. **Rebuild⇄wake loop (S6):** background dirt (`WorldManager.sim_ground_rebuild`, world_manager.gd:1828-1833
+   — the snowfall sim marks the collider dirty every writing 0.5 s step, relying on the loose-body gate for
+   "zero cost") triggers back-to-back full-region rebuilds while an awake body holds the gate open
+   (ground_collider.gd:174-235); each rebuild re-points the shapes under the resting body and jolts it
+   (v spikes to 5.9 measured) → it can't sleep → the gate stays open → more rebuilds. 30 s awake vs 2.4 s quiet.
+2. **Felling interaction (S5):** every subsequent trunk break calls `wake_bodies_near` (world_manager.gd:1675)
+   + kicks pieces → the pile stays awake for the whole action + a 15.7 s settle tail.
+3. **FP_TREEPHYS_BOUND's 8 s deadline NEVER fires for wood bodies** — the deadline lives in
+   `VoxelBody._physics_process` (voxel_body.gd:247-251) and `_refresh_dormancy` disables `_physics_process`
+   for wood (voxel_body.gd:302-303). An oak canopy has no awake bound at all (pre-existing gap, now load-bearing).
+
+### Regression verdict: pre-existing costs, EXPOSED by the fixes (which add no per-frame cost)
+
+- `FP_GRAV_BOX_COVER`'s big Area3D costs ~24-26 broadphase pairs for a 25-shape body (pairs after sleep:
+  exactly the area pairs) — negligible; per-frame A/B shows no added cost.
+- `FP_CHOP_COLLIDER_CARVE` is a one-shot at break time; no per-frame term.
+- The A/B proves the mechanism: pre-fix the canopy left the scene in ~2 s (fly-away/NaN/sink), so the
+  pre-existing awake-body machinery (GodotPhysics pair costs, the gate-open collider rebuild churn, the
+  missing wood deadline) never ran long enough to be felt. The fixes made debris stay — correctly — and the
+  old costs now bill for the full lifetime. Do NOT narrow the two fix flags; bound the lifetime costs instead.
+
+### Flagged fix design — `FP_CHOP_DEBRIS_CALM := false`
+
+1. **Wood awake-deadline** (voxel_body.gd): under the flag, an ACTIVE wood body keeps `_physics_process`
+   enabled (only while active — dormant wood still costs zero) running just the deadline/coarse-calm logic:
+   sustained `linear_velocity < SETTLE_COARSE_LINEAR` for `SETTLE_COARSE`-style dwell, OR
+   `_active_age >= CubeSphere.TREEPHYS_MAX_ACTIVE_SEC` with `lin < 1.0`, ⇒ `sleeping = true` + zero
+   velocities (NOT freeze — wood stays sandbox-pushable; any contact/push auto-wakes it). Composes with
+   FP_TREEPHYS_BOUND: same `_active_age` clock, same reset-on-wake; closes the wood gap that defeats it.
+2. **Sim-dirt lazy debounce** (world_manager.gd:1831 + ground_collider.gd): `sim_ground_rebuild` routes to
+   a `rebuild_now_lazy()` — same dirty mark with a LONG debounce (e.g. 180 frames ≈ 3 s) and no 60-frame
+   max-latency escalation. Kills the back-to-back rebuild churn AND the rebuild-jolt wake loop while debris
+   settles; player-edit rebuilds keep the fast 15/60 debounce untouched. (The collider's own contract
+   already declares sim staleness safe — settling is analytic.)
+
+Both pieces byte-off (flag false ⇒ shipped behaviour); NEVER-OOM neutral.
+
+### Gate spec — `verify_choplag.gd` (promote the probe)
+
+- **G-CL-QUIET** — single wood chop, quiet world: body dormant ≤ 4 s (pins today's healthy S1).
+- **G-CL-DIRT** — chop + `sim_ground_rebuild` every 30 frames: body dormant ≤ TREEPHYS_MAX_ACTIVE_SEC + 4 s
+  (falsifier: fix OFF measured 30 s), and post-dormant `gc.update()` cost < 100 µs summed per second.
+- **G-CL-FELL** — S5 flow (a break every 2 s ×4): every body dormant ≤ 10 s after the LAST break
+  (falsifier: 15.7 s today).
+- **Byte-off** — flag false ⇒ FLAT `verify_feature` 6042/0 and `verify_treechop` 36/0 unchanged.

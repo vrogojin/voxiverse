@@ -90,6 +90,18 @@ const _GATE_RADIUS := R + REBUILD_DIST
 const DEBOUNCE_FRAMES := 15
 const MAX_LATENCY_FRAMES := 60
 
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM) — the LAZY debounce for the sim/snowfall-cadence
+## rebuild (world_manager.gd's sim_ground_rebuild, fired every 0.5 s of writing steps). Routing that
+## through the FAST 15/60 debounce above turned "one write happened somewhere" into a rebuild every
+## ~0.25-1.0 s for as long as any body was awake nearby — re-pointing shapes under a settling body and
+## jolting it back awake (measured: gc.update 2.0-4.7 ms/frame native for 8 s straight, the
+## rebuild⇄wake feedback loop). LAZY_DEBOUNCE_FRAMES is deliberately long and has NO max-latency
+## escalation counterpart (sim staleness is already declared safe by this file's own contract —
+## settling confirms support ANALYTICALLY, never trusting the collider) — the sim's dirt can wait ~3 s
+## to show up in collision geometry. Player-edit rebuilds keep DEBOUNCE_FRAMES/MAX_LATENCY_FRAMES
+## above, completely untouched.
+const LAZY_DEBOUNCE_FRAMES := 180
+
 # Build phases: idle, sampling column heights (region floor), emitting shapes, trimming the
 # staging body's surplus leftover shapes (when the new set is smaller than the previous one).
 enum { PHASE_IDLE, PHASE_HEIGHTS, PHASE_SHAPES, PHASE_TRIM }
@@ -118,6 +130,11 @@ var _dirty := false                           # an edit asked for a rebuild at t
 var _gated := false                           # true while the active-body gate is OFF (idle; shapes RETAINED)
 var _edit_age := 0                            # frames since the FIRST pending edit of the current burst
 var _edit_idle := 0                           # frames since the LAST edit (resets to 0 on every rebuild_now)
+# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM) — the sim/snowfall-cadence rebuild's own dirty flag +
+# debounce counter, entirely separate from _dirty/_edit_age/_edit_idle above (the player-edit path, left
+# untouched). Only ever set/read under the flag — off ⇒ always false/0, dead state.
+var _dirty_lazy := false
+var _lazy_idle := 0
 
 # Incremental build state (valid while _phase != PHASE_IDLE).
 var _phase := PHASE_IDLE
@@ -222,6 +239,16 @@ func update(player_pos: Vector3) -> void:
 		if _edit_idle >= DEBOUNCE_FRAMES or _edit_age >= MAX_LATENCY_FRAMES:
 			_begin_build(_target)
 			_advance_build(false)
+			return
+	# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): the LAZY channel, checked only once the fast channel
+	# above didn't already start a build this frame (only one build session can be in flight). Off ⇒
+	# _dirty_lazy never gets set (rebuild_now_lazy is the only setter, and its only caller branches on the
+	# flag), so this is dead code — byte-identical zero cost.
+	if CubeSphere.FP_CHOP_DEBRIS_CALM and _dirty_lazy:
+		_lazy_idle += 1
+		if _lazy_idle >= LAZY_DEBOUNCE_FRAMES:
+			_begin_build(_target)
+			_advance_build(false)
 
 ## Ask for a rebuild at the current centre (called after a terrain edit). Non-blocking and
 ## DEBOUNCED (P2): merely marks dirty and resets the "edits paused" counter, so a burst of breaks
@@ -235,6 +262,17 @@ func rebuild_now() -> void:
 		_edit_age = 0                       # first edit of a burst: start the max-latency clock
 	_dirty = true
 	_edit_idle = 0                          # every new edit resets the debounce window
+
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM) — the LAZY counterpart of rebuild_now(), for the
+## sim/snowfall-cadence rebuild ONLY (world_manager.gd's sim_ground_rebuild). Same non-blocking
+## dirty-mark contract, but on the SEPARATE _dirty_lazy flag with a much longer debounce
+## (LAZY_DEBOUNCE_FRAMES) and no max-latency escalation — see the const's doc comment. Never called
+## off the flag (world_manager branches at the call site), but self-contained regardless.
+func rebuild_now_lazy() -> void:
+	if _live_center.x == 0x7fffffff:
+		return                              # nothing built yet; the first update() builds it
+	_dirty_lazy = true
+	_lazy_idle = 0
 
 ## COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE) — synchronously RE-EMIT the LIVE body's geometry for
 ## every column touched by a just-collapsed component `comp`, so a VoxelBody about to spawn_loose() into
@@ -298,6 +336,8 @@ func note_facet_crossing() -> void:
 	_live_center = Vector2i(0x7fffffff, 0)   # "nothing built" → next update() bootstraps a fresh core at the new column
 	_phase = PHASE_IDLE                       # drop any in-progress (old-lattice) build
 	_dirty = false
+	if CubeSphere.FP_CHOP_DEBRIS_CALM:
+		_dirty_lazy = false
 
 ## Gate OFF (no loose body near): stop doing rebuild work but RETAIN the live shape set and all
 ## build state (P2 — the anti-stall change). The player is analytic and frozen debris never consults
@@ -389,6 +429,11 @@ func _begin_build(center: Vector2i) -> void:
 	_build_min_h = 0x7fffffff
 	_build_pc.clear()
 	_dirty = false
+	# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): a build starting for ANY reason (fast edit, drift,
+	# lazy sim-dirt, core bootstrap) reads the CURRENT world state, so it satisfies a pending lazy request
+	# too — clear it here rather than only at its own trigger site, so it can never double-fire stale.
+	if CubeSphere.FP_CHOP_DEBRIS_CALM:
+		_dirty_lazy = false
 
 ## Advance the current build by one slice. PHASE_HEIGHTS samples every column's surface (to find the
 ## region floor y_lo); PHASE_SHAPES re-points the staging body's shape slots in place (reuse, no

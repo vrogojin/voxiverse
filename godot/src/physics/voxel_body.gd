@@ -239,8 +239,15 @@ func block_count() -> int:
 ## freezing in the air. A coarse-calm escape prevents a corner-jittering body from holding
 ## the collider gate on forever.
 func _physics_process(delta: float) -> void:
-	if not activated or _is_wood or freeze:
+	if not activated or freeze:
 		return                                       # defensive; _physics_process is off in these states
+	if _is_wood:
+		# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): off, _refresh_dormancy() never re-enables
+		# _physics_process for an activated wood body in the first place, so this branch is unreachable —
+		# byte-identical dead code.
+		if CubeSphere.FP_CHOP_DEBRIS_CALM:
+			_wood_calm_step(delta)
+		return
 	# TREE-PHYS BOUND hard deadline: a dynamic body that has not reached rest within TREEPHYS_MAX_ACTIVE_SEC freezes to
 	# STATIC where it is, REGARDLESS of _grounded — so a body whose support query never confirms (far/faceted staleness)
 	# can no longer churn the physics server forever. Off ⇒ never trips (deadline never accrues to the threshold).
@@ -277,12 +284,60 @@ func _freeze_dormant() -> void:
 	freeze = true
 	set_physics_process(false)                       # DORMANT: no more per-frame script work
 
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM) — the wood-only awake bound. Wood is sandbox-dynamic and
+## must stay pushable FOREVER (§12: never auto-freezes), so this puts a calm body to SLEEP instead — not
+## freeze — which `is_awake()` (freeze-or-sleeping) already reports as dormant, closing the GroundCollider
+## gate (it counts only awake bodies), while Godot's own contact/push physics transparently wakes a
+## sleeping RigidBody3D on any real disturbance; wake() (below) handles the explicit break/wake_bodies_near
+## path, restarting these clocks. Two independent trips, checked every active-wood frame:
+##   1. the SAME anti-livelock coarse-calm dwell ground bodies use (SETTLE_COARSE_LINEAR for
+##      SETTLE_COARSE_SEC) — the general backstop. Godot's own native sleep threshold usually gets a calm
+##      body to sleep well before this (measured: a quiet single chop is dormant in ~2.4 s, untouched by
+##      this timer) — this exists for wood that stays "coarsely" calm without ever crossing Godot's own
+##      (tighter) native threshold.
+##   2. the FP_TREEPHYS_BOUND hard deadline (_active_age >= TREEPHYS_MAX_ACTIVE_SEC, gated at a loose
+##      lin < 1.0 so a body still genuinely flying isn't force-slept mid-air) — this is the "close the wood
+##      gap" piece for that flag specifically: pre-fix, _is_wood short-circuited _physics_process entirely,
+##      so wood had NO awake bound at all even with FP_TREEPHYS_BOUND on. Only accrues/binds when
+##      FP_TREEPHYS_BOUND is ALSO on (shares its _active_age clock and TREEPHYS_MAX_ACTIVE_SEC constant —
+##      not a second, independently-invented deadline).
+func _wood_calm_step(delta: float) -> void:
+	var lin := linear_velocity.length()
+	if CubeSphere.FP_TREEPHYS_BOUND:
+		_active_age += delta
+		if _active_age >= CubeSphere.TREEPHYS_MAX_ACTIVE_SEC and lin < 1.0:
+			_calm_wood()
+			return
+	if lin < SETTLE_COARSE_LINEAR:
+		_coarse_timer += delta
+		if _coarse_timer >= SETTLE_COARSE_SEC:
+			_calm_wood()
+			return
+	else:
+		_coarse_timer = 0.0
+
+## Put a calm wood body to SLEEP (not freeze — stays sandbox-pushable) and stop the per-frame calm-check
+## work until wake() restarts it.
+func _calm_wood() -> void:
+	linear_velocity = Vector3.ZERO
+	angular_velocity = Vector3.ZERO
+	sleeping = true
+	set_physics_process(false)
+
 ## Reactivate a dormant body on disturbance: unfreeze → dynamic → re-enable the settle loop, so it
 ## falls if it lost support or re-settles (+re-freezes) if still supported. Wood just clears the
 ## Godot sleep. Idempotent and cheap. Called by WorldManager.wake_bodies_near / break_cell.
 func wake() -> void:
 	if _is_wood:
 		sleeping = false
+		# COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): mirror the ground-body reactivation below —
+		# restart the deadline/coarse-calm clocks and re-enable _physics_process (_calm_wood() disabled it)
+		# so a body woken by an explicit break/wake_bodies_near call resumes being bounded. Off ⇒
+		# byte-identical (the early return above is unchanged).
+		if CubeSphere.FP_CHOP_DEBRIS_CALM:
+			_active_age = 0.0
+			_coarse_timer = 0.0
+			set_physics_process(activated)
 		return
 	activated = true
 	freeze = false
@@ -299,7 +354,13 @@ func is_awake() -> bool:
 
 ## Enable per-frame settle logic ONLY for a dynamic (dropping) ground body; wood, a frozen
 ## (dormant) ground body, and a pristine cluster do ZERO per-frame script work.
+## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): under the flag, an ACTIVE (not frozen — wood never
+## freezes) wood body ALSO keeps _physics_process running, so _wood_calm_step can bound its awake time; a
+## dormant (sleeping) or not-yet-activated wood body still costs zero either way. Off ⇒ byte-identical.
 func _refresh_dormancy() -> void:
+	if CubeSphere.FP_CHOP_DEBRIS_CALM and _is_wood:
+		set_physics_process(activated and not freeze)
+		return
 	set_physics_process(activated and not _is_wood and not freeze)
 
 ## True iff this cluster contains at least one WOOD cell -> sandbox-dynamic (never auto-freezes).

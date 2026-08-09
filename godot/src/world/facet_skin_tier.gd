@@ -140,6 +140,23 @@ func set_active(new_fid: int) -> void:
 	_active_fid = new_fid
 	transform = _placement_xform()
 
+## FP_FAR_TERMINATOR_WELD (docs/COSMOS-FAR-TERMINATOR-DESIGN.md §1/§4.1): `_mat` is built ONCE in `setup()` and
+## had NO refresh path at all — under FP_TIER_DEPTH_BIAS + FP_SHADE_UNIFIED it stays at TierPlace's hardcoded
+## seed forever (the "TierPlace biased" gap). `_mat` is shared BY REFERENCE across every live facet's
+## MeshInstance3D (`_remerge_facet`, below), so one `set_shader_parameter` here reaches all of them — no
+## re-merge needed. No-op unless the flag is on and `_mat` is actually the biased ShaderMaterial (StandardMaterial3D
+## path is untouched) ⇒ byte-identical off.
+func set_sun_dir(sun_dir: Vector3) -> void:
+	if not CubeSphere.FP_FAR_TERMINATOR_WELD:
+		return
+	if _mat is ShaderMaterial:
+		(_mat as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
+
+## FP_FAR_TERMINATOR_WELD telemetry: this tier's live `sun_dir` uniform (folds into `sd_near`-adjacent live A/B
+## checks if ever needed). (1,0,0) sentinel if `_mat` isn't the biased ShaderMaterial.
+func sun_dir_telemetry() -> Vector3:
+	return (_mat.get_shader_parameter("sun_dir") if _mat is ShaderMaterial else Vector3(1.0, 0.0, 0.0))
+
 ## Fixed-frame re-anchor: slide the absolute skin mesh by −A in lockstep with PlanetRoot + the far ring.
 func shift_anchor(a: Vector3) -> void:
 	if not _fixed_frame_on():

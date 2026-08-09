@@ -293,12 +293,22 @@ static func shader_code() -> String:
 	var tail := _V2_SHADER_TAIL_LIT if CubeSphere.FP_SMOOTH_V2_LIT else _V2_SHADER_TAIL
 	return _V2_SHADER_HEAD + VoxiLight.shade_glsl() + tail
 
+## FP_FAR_TERMINATOR_WELD: the last live Sun direction any FacetSmoothV2 instance was fed via `set_sun_dir`
+## (a class-level static — the annulus is rebuilt on facet crossings, so this outlives any one instance).
+## Read by `_make_material` to seed a REBUILT material with the live Sun instead of the hardcoded (1,0,0)
+## fake-noon default. Off ⇒ never written, `_make_material` never reads it ⇒ byte-identical.
+static var _last_sun_dir := Vector3(1.0, 0.0, 0.0)
+
 static func _make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
 	var sh := Shader.new()
 	sh.code = shader_code()
 	sm.shader = sh
-	sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	# FP_FAR_TERMINATOR_WELD (docs/COSMOS-FAR-TERMINATOR-DESIGN.md §4.1): seed from the last live Sun this class
+	# was told about, not the hardcoded default — kills the "frozen fake-noon" gap on a facet-crossing rebuild.
+	# Off ⇒ the shipped hardcoded seed verbatim (byte-identical; _last_sun_dir stays at its own (1,0,0) default).
+	var seed := _last_sun_dir if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
+	sm.set_shader_parameter("sun_dir", seed)
 	return sm
 
 # =====================================================================================================================
@@ -483,3 +493,13 @@ func is_resident(fid: int) -> bool:
 func set_sun_dir(sun_dir: Vector3) -> void:
 	if _material != null:
 		_material.set_shader_parameter("sun_dir", sun_dir)
+	# FP_FAR_TERMINATOR_WELD: also record the live value in the class-level cache so the NEXT rebuilt instance
+	# (facet crossing) seeds from it in `_make_material` instead of the hardcoded default. Off ⇒ no-op write to
+	# a var `_make_material` never reads ⇒ byte-identical.
+	if CubeSphere.FP_FAR_TERMINATOR_WELD:
+		_last_sun_dir = sun_dir
+
+## FP_FAR_TERMINATOR_WELD telemetry: THIS instance's live `sun_dir` uniform (the sun-echo, `sd_v2`) — lets a live
+## A/B confirm the smooth-v2 annulus tracks the same Sun as the shell/near field. (1,0,0) sentinel if unbuilt.
+func sun_dir_telemetry() -> Vector3:
+	return (_material.get_shader_parameter("sun_dir") if _material != null else Vector3(1.0, 0.0, 0.0))

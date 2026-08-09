@@ -255,6 +255,15 @@ static func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 		if m != null:
 			m.set_shader_parameter("sun_dir", sun_dir)
 
+## FP_FAR_TERMINATOR_WELD telemetry: ONE representative near-field daylight twin's live `sun_dir` uniform (the
+## sun-echo, `sd_near`) — every twin is fed the SAME value each frame by `set_near_daylight_sun_dir` above, so the
+## first registered twin stands in for all of them. (1,0,0) sentinel if none are registered (flag off / no twins).
+static func daylight_sun_dir_telemetry() -> Vector3:
+	for m in _daylight_twins:
+		if m != null:
+			return m.get_shader_parameter("sun_dir")
+	return Vector3(1.0, 0.0, 0.0)
+
 ## COSMOS NIGHT-TERRAIN-CENTRE (fix/voxiverse-night-terrain-lit): feed the TRUE planet centre (in the current render
 ## frame) into EVERY near-field daylight twin each frame, so their radial normal n = normalize(v_wp − planet_centre)
 ## matches the far shell's MODEL·0 normal and can NEVER go stale across a facet crossing / floating-origin re-anchor

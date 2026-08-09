@@ -2920,7 +2920,7 @@ func shell_telemetry() -> Dictionary:
 	# MeshInstances during the warmup fill (peaks then settles to ~0 as tiers consolidate); the KEY live signal for
 	# whether the consolidate-at-settle pacing keeps steady-state draws bounded on gl_compat.
 	var _tss: Dictionary = (_smooth.tile_surf_stats() if (_smooth != null and _smooth.has_method("tile_surf_stats")) else {})
-	return {
+	var out := {
 		"sh_cam": _cam_set,
 		"smooth_v2_res": (_smooth_v2.resident_count() if _smooth_v2 != null else 0),        # FP_SMOOTH_V2: resident annulus tiles
 		"smooth_v2_commit_ms": (_smooth_v2.commit_ms() if _smooth_v2 != null else 0.0),      # FP_SMOOTH_V2: last whole-surface ArrayMesh rebuild ms
@@ -2956,6 +2956,13 @@ func shell_telemetry() -> Dictionary:
 		"sh_h": snappedf(_dbg_h, 0.1),
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
+	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
+	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
+	# the keys are never added to the dict => byte-identical for any telemetry consumer.
+	if CubeSphere.FP_FAR_TERMINATOR_WELD:
+		out["sd_shell"] = _shell_sun_dir_telemetry()
+		out["sd_v2"] = (_smooth_v2.sun_dir_telemetry() if _smooth_v2 != null else Vector3(1.0, 0.0, 0.0))
+	return out
 
 ## COSMOS FS1 gate (G-SHELL-WELD): the horizon (CELLS) ABSOLUTE positions for facet `fid` — warms + returns the cache.
 func horizon_positions(fid: int) -> PackedVector3Array:
@@ -4814,6 +4821,10 @@ func set_terminator_sun_dir(sun_dir: Vector3) -> void:
 ## reads it from MODEL_MATRIX so it is exact under the scaled placement. No-op unless the flag is on and the
 ## material is the v2 shader ⇒ flag-off is byte-identical (never wired; the StandardMaterial path is untouched).
 func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
+	# FP_FAR_TERMINATOR_WELD: record the live push regardless of which material is active — `TierPlace`'s cache
+	# is shared by every biased-material consumer (this shell AND FacetSkinTier), so a REBUILT instance anywhere
+	# seeds from the freshest known Sun. Self-guards on the flag ⇒ byte-identical when off.
+	TierPlace.note_sun_dir(sun_dir)
 	# COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED): also feed the sun when the biased-tier fallback material carries the far
 	# ring (FP_SHELL_ABSOLUTE off, tier path) so its unified self-shade tracks the Sun. Off both flags ⇒ byte-identical.
 	if not (CubeSphere.FP_SHELL_ABSOLUTE or CubeSphere.FP_SHADE_UNIFIED) or _mi == null:
@@ -4828,6 +4839,15 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _smooth_v2 != null:
 		_smooth_v2.set_sun_dir(sun_dir)
+
+## FP_FAR_TERMINATOR_WELD telemetry: the shell material's OWN live `sun_dir` uniform (the sun-echo, `sd_shell`),
+## whichever shader is currently on `_mi.material_override` (v2-absolute / tint / biased-tier). (1,0,0) sentinel
+## if there's no shell mesh or the active material carries no such uniform.
+func _shell_sun_dir_telemetry() -> Vector3:
+	if _mi == null:
+		return Vector3(1.0, 0.0, 0.0)
+	var mat := _mi.material_override
+	return (mat.get_shader_parameter("sun_dir") if mat is ShaderMaterial else Vector3(1.0, 0.0, 0.0))
 
 ## COSMOS LOD-TEXTURE Phase 1 (§1.3): bind the baker's 6-layer base map into the shell shader's `base_map`
 ## uniform. No-op unless FP_FACET_TEX is on and the material is the textured shader ⇒ flag-off is byte-identical

@@ -3154,6 +3154,13 @@ func set_far_ring_shell_absolute(sun_dir: Vector3) -> void:
 		_block_lod_global.set_sun_dir(sun_dir)
 	if _block_lod_orbit != null:
 		_block_lod_orbit.set_sun_dir(sun_dir)
+	# FP_FAR_TERMINATOR_WELD (docs/COSMOS-FAR-TERMINATOR-DESIGN.md §4.1): the SAME unconditional backstop as the
+	# block-LOD fan-out above — FacetSkinTier's biased material had NO refresh path at all before this flag (built
+	# once in setup(), never touched again). Feed it here too, at the SAME broad condition (FP_SHELL_ABSOLUTE OR
+	# FP_SHADE_UNIFIED OR FP_NIGHT_TERRAIN_CENTRE, main.gd:307-308) so it can never freeze at the hardcoded seed
+	# while the shell/block-LOD tiers track live time. `_skin.set_sun_dir` self-guards on the flag ⇒ byte-identical.
+	if _skin != null and _skin.has_method("set_sun_dir"):
+		_skin.call("set_sun_dir", sun_dir)
 
 ## docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): forward the current Sun direction to the smooth-v2
 ## annulus's own material. No-op with no faceted ring / no smooth-v2 instance (the ring setter self-guards) ⇒
@@ -3200,7 +3207,13 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 func shell_telemetry() -> Dictionary:
 	if _facet_ring == null or not _facet_ring.has_method("shell_telemetry"):
 		return {}
-	return _facet_ring.shell_telemetry()
+	var t: Dictionary = _facet_ring.shell_telemetry()
+	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: fold in the near-field's live sun_dir (`sd_near`) alongside the
+	# far-ring's own sd_shell/sd_v2 (added inside shell_telemetry above) so a live A/B can confirm ALL tiers track
+	# the same Sun. Off ⇒ the key is never added ⇒ byte-identical for any telemetry consumer.
+	if CubeSphere.FP_FAR_TERMINATOR_WELD and not t.is_empty():
+		t["sd_near"] = BlockMaterials.daylight_sun_dir_telemetry()
+	return t
 
 ## COSMOS LOD-TEXTURE Phase 2 telemetry: the far-texture bake ledger (coverage, close-up residency, per-frame bake ms,
 ## byte ledger) streamed via the remote bridge next to shell_telemetry(). {} when the baker is absent (flag off).

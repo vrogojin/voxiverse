@@ -1241,6 +1241,24 @@ const V2_HOP_H_REACH := 4
 ## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
 const FP_SMOOTH_V2_EXCL_BLKLOD := false
 
+## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
+## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),
+## centre-relative normal). The live bug is a RUNTIME sun_dir STALENESS gap: three far materials seed their
+## `sun_dir` uniform to a hardcoded default (1,0,0) — fake noon — at the moment they are (re)built, and nothing
+## re-asserts the live Sun until the NEXT per-frame push cycle reaches that exact instance:
+##   - `FacetSmoothV2._make_material()` (facet_smooth_v2.gd) — rebuilt on facet crossings.
+##   - `TierPlace.make_biased_material()` (tier_place.gd) as consumed by `FacetSkinTier._make_material()`
+##     (facet_skin_tier.gd) — built once at skin-tier setup, NEVER refreshed afterward (no push site existed).
+## Fix: a single-authority REBUILD-SAFE re-assert, mirroring the ALREADY-SHIPPED block-LOD backstop
+## (main.gd's FP_SHELL_ABSOLUTE/FP_SHADE_UNIFIED/FP_NIGHT_TERRAIN_CENTRE block, world_manager.gd
+## `set_far_ring_shell_absolute`'s unconditional `_block_lod*.set_sun_dir` fan-out): each vulnerable class caches
+## the last live `sun_dir` it was told (a static var, updated by its own `set_sun_dir`) and SEEDS new instances
+## from that cache instead of the hardcoded default; `FacetSkinTier` gains a `set_sun_dir` pushed every frame
+## from the same unconditional fan-out site. Terminator axis ONLY — does not enable/alter relief slope-shading
+## (FP_SMOOTH_V2_LIT stays independent). Off ⇒ every seed/push site keeps the shipped hardcoded (1,0,0)
+## verbatim — byte-identical (FLAT 6042/0). Gate: verify_far_terminator.gd (G-FT-FRESH/G-FT-EQ/G-FT-NIGHT/G-FT-OFF).
+const FP_FAR_TERMINATOR_WELD := false
+
 ## VIEWER RELIEF REACH (task #86, user directive: "render anything unlimited in the altitude"): the near VoxelTerrain
 ## streamer's A2 downward-reach clamp keeps only VIEWER_DOWNWARD_REACH_BLOCKS=40 blocks meshed BELOW the player's
 ## feet (a surface-player perf trim). On a steep peak the down-slope drops out of that band inside the 128-block

@@ -1005,6 +1005,40 @@ const FP_WARM_EMIT_SPLIT := false
 ##   DISPATCHES even on-surface — the shipped perpetual-bake bug reproduces).
 const FP_FINE_BAKE_SURFACE_PAUSE := false
 
+## COSMOS-BACKGROUND-PREBAKE (docs/COSMOS-BACKGROUND-PREBAKE-DESIGN.md) — the "ugly facet-in-front" fix. Root
+## cause (proven, not guessed): `FP_FINE_BAKE_SURFACE_PAUSE` above stops ALL new whole-planet FINE dispatch
+## on-surface, so a facet never visited off-surface (orbit/descent) has NO fine texel and the shader falls all
+## the way to the coarse BASE page (~26 blk/texel, linear-mipmap-blurred) — the blur/tone-jump/diagonal-line the
+## user sees is one resolution discontinuity, not a seam or colour-law bug. The FINE tier is already
+## whole-planet-resident and fixed-size (~27 MB, `FP_PLANET_MAP` — already on the NEVER-OOM ledger): this is a
+## SCHEDULER change, not a new data structure. Zero new resident bytes.
+##
+## `FP_BG_PREBAKE` (master): a GOVERNED exception to the on-surface pause — `facet_tex_baker.gd`'s
+## `_update_band_parallel` dispatches a background fine bake on-surface too, but ONLY when the last frame had
+## headroom (`frame_ms < BG_FRAME_BUDGET_MS`) AND fewer than `BG_MAX_INFLIGHT_SURFACE` are already in flight —
+## so it never competes with a hitch (crossing/chop/phys-settle), it just spends idle main-thread headroom.
+## `_next_fine_fid`'s existing nearest-to-`emit_axis` sweep (already used for the off-surface path and the base
+## tier) gives VIEW-CONE-FIRST ordering for free — no new plumbing — so the facet-in-front sharpens first, then
+## the sweep radiates to the rest of the planet over idle time. Frame-time signal: a REAL measured per-frame
+## delta (the same "not TIME_PROCESS on threaded web" discipline `StreamLoadController.LiveSource` already
+## uses), passed in from `WorldManager._process`'s own `delta` — never a Performance monitor.
+##
+## `FP_BG_PREBAKE_CPP` (sub-flag): also allow the C++ tile bake (`FP_CPP_TILE_BAKE`) in that single governed
+## on-surface slot — the tile baker holds its OWN generator instance (reader-parallel `RWLockRead`), unlike the
+## shelved fine baker that serialised on the shared lock and froze the game; this is the one live-A/B unknown,
+## so it is isolated behind its own flag with the EXISTING `_pbm_tile_ok`-refusal → GDScript-fallback chain as
+## the safe degrade (no new fallback code needed — off ⇒ the background slot just bakes via GDScript, slower
+## but correct).
+##
+## Default FALSE (both) ⇒ `bg_ok` is always false, the dispatch condition reduces to exactly `not
+## fine_pause_on or _offsurface` (the shipped expression) — byte-identical, FLAT `verify_feature` 6042/0. Gate:
+## verify_bg_prebake.gd.
+const FP_BG_PREBAKE := false
+const FP_BG_PREBAKE_CPP := false
+const BG_FRAME_BUDGET_MS := 22.0      # ms: dispatch only when the last frame had this much headroom (~45 fps floor)
+const BG_MAX_INFLIGHT_SURFACE := 1    # at most one background fine-tier bake task in flight while on-surface
+const BG_VIEWFIRST := true            # documents the (already-free) _next_fine_fid(emit_axis) view-cone-first order
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).
@@ -1206,6 +1240,24 @@ const V2_HOP_H_REACH := 4
 ## already true; a facet still building/leaving V2 residency keeps its blocky emit (no hole). Off ⇒ the shipped
 ## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
 const FP_SMOOTH_V2_EXCL_BLKLOD := false
+
+## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
+## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),
+## centre-relative normal). The live bug is a RUNTIME sun_dir STALENESS gap: three far materials seed their
+## `sun_dir` uniform to a hardcoded default (1,0,0) — fake noon — at the moment they are (re)built, and nothing
+## re-asserts the live Sun until the NEXT per-frame push cycle reaches that exact instance:
+##   - `FacetSmoothV2._make_material()` (facet_smooth_v2.gd) — rebuilt on facet crossings.
+##   - `TierPlace.make_biased_material()` (tier_place.gd) as consumed by `FacetSkinTier._make_material()`
+##     (facet_skin_tier.gd) — built once at skin-tier setup, NEVER refreshed afterward (no push site existed).
+## Fix: a single-authority REBUILD-SAFE re-assert, mirroring the ALREADY-SHIPPED block-LOD backstop
+## (main.gd's FP_SHELL_ABSOLUTE/FP_SHADE_UNIFIED/FP_NIGHT_TERRAIN_CENTRE block, world_manager.gd
+## `set_far_ring_shell_absolute`'s unconditional `_block_lod*.set_sun_dir` fan-out): each vulnerable class caches
+## the last live `sun_dir` it was told (a static var, updated by its own `set_sun_dir`) and SEEDS new instances
+## from that cache instead of the hardcoded default; `FacetSkinTier` gains a `set_sun_dir` pushed every frame
+## from the same unconditional fan-out site. Terminator axis ONLY — does not enable/alter relief slope-shading
+## (FP_SMOOTH_V2_LIT stays independent). Off ⇒ every seed/push site keeps the shipped hardcoded (1,0,0)
+## verbatim — byte-identical (FLAT 6042/0). Gate: verify_far_terminator.gd (G-FT-FRESH/G-FT-EQ/G-FT-NIGHT/G-FT-OFF).
+const FP_FAR_TERMINATOR_WELD := false
 
 ## VIEWER RELIEF REACH (task #86, user directive: "render anything unlimited in the altitude"): the near VoxelTerrain
 ## streamer's A2 downward-reach clamp keeps only VIEWER_DOWNWARD_REACH_BLOCKS=40 blocks meshed BELOW the player's

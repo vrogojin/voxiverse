@@ -273,6 +273,19 @@ static func tier_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED) -> String:
 		return _TIER_UNIFIED_HEAD + VoxiLight.shade_glsl() + _TIER_UNIFIED_TAIL
 	return _TIER_SHADER
 
+## FP_FAR_TERMINATOR_WELD: the last live Sun direction ANY caller pushed via `note_sun_dir` (shared by every
+## consumer of `make_biased_material` — the far-ring shell AND `FacetSkinTier`). Read by `make_biased_material`
+## to seed a NEW instance with the live Sun instead of the hardcoded (1,0,0) fake-noon default. This is the
+## "TierPlace biased" gap from docs/COSMOS-FAR-TERMINATOR-DESIGN.md §1: `FacetSkinTier`'s biased material is
+## built ONCE at setup and had NO refresh path at all before this flag. Off ⇒ never written/read ⇒ byte-identical.
+static var _last_sun_dir := Vector3(1.0, 0.0, 0.0)
+
+## FP_FAR_TERMINATOR_WELD: record a live Sun push so the NEXT `make_biased_material` call seeds from it. Callers:
+## `FacetFarRing.set_shell_absolute_sun_dir` and `FacetSkinTier.set_sun_dir`. Off ⇒ no-op (byte-identical).
+static func note_sun_dir(sun_dir: Vector3) -> void:
+	if CubeSphere.FP_FAR_TERMINATOR_WELD:
+		_last_sun_dir = sun_dir
+
 static func make_biased_material(bias: float) -> ShaderMaterial:
 	var sh := Shader.new()
 	sh.code = tier_shader_code()
@@ -281,7 +294,11 @@ static func make_biased_material(bias: float) -> ShaderMaterial:
 	m.set_shader_parameter("tier_bias", bias)
 	# Unified: seed the ONE uniform set so the tier material shades identically to near/far (sun_dir fed each frame).
 	if CubeSphere.FP_SHADE_UNIFIED:
-		m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+		# FP_FAR_TERMINATOR_WELD: seed from the last live Sun any biased-material consumer was told about, not the
+		# hardcoded default — kills FacetSkinTier's build-once-never-refreshed fake-noon freeze. Off ⇒ the shipped
+		# hardcoded seed verbatim (byte-identical; _last_sun_dir stays at its own (1,0,0) default when unwritten).
+		var seed := _last_sun_dir if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
+		m.set_shader_parameter("sun_dir", seed)
 		m.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
 		m.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
 		m.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)

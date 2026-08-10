@@ -72,6 +72,11 @@ var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet ba
 # COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): last update_streaming call's Time.get_ticks_usec(), for the
 # real measured wall-clock frame-ms passed to _facet_tex.update() (see that call site's doc comment).
 var _bg_last_frame_usec := 0
+var _relief_data: GlobalReliefData = null   # COSMOS-FAR-GEOMETRY-PREBAKE (task #99): whole-planet coarse height DEM
+                                             # + sun-agnostic hillshade; null unless FP_GLOBAL_RELIEF_DATA
+# Independent of _bg_last_frame_usec (same measurement discipline, own clock — G2 must pace even when _facet_tex
+# doesn't exist, e.g. FP_GLOBAL_RELIEF_DATA on without FP_FACET_TEX/FP_SHELL_ABSOLUTE).
+var _g2_last_frame_usec := 0
 var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
 var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
 var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
@@ -478,6 +483,17 @@ func _ready() -> void:
 			# detail gate now. No-op off FP_BAND_BLOCK_MAP (set_facet_band is _bm_on()-guarded).
 			if CubeSphere.FP_BAND_BLOCK_MAP and (CubeSphere.FP_BLOCK_DETAIL or CubeSphere.FP_SKIN_FLATCOLOR):
 				_facet_ring.set_facet_band(_facet_tex.band_texture())
+			# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, G2): the whole-planet coarse height DEM —
+			# a RefCounted (not a scene node — pure data, same discipline as _facet_tex above), independent of
+			# FP_FACET_TEX/FP_SHELL_ABSOLUTE (it has its own governed pacer call site in update_streaming()).
+			# No-op with the flag off (setup() never allocates) ⇒ byte-identical.
+			if CubeSphere.FP_GLOBAL_RELIEF_DATA:
+				_relief_data = GlobalReliefData.new()
+				_relief_data.setup()
+				# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b): push the shared instance into the
+				# ring's ORBIT-VISIBLE base-grid colour bake. No-op (never called) unless FP_GLOBAL_RELIEF_DATA — the
+				# ring's own FP_SKIN_RELIEF_SHADE check is the second, independent guard on the actual composite.
+				_facet_ring.set_relief_data(_relief_data)
 	elif FarTerrain.ENABLED and not CubeSphere.FACETED:
 		_far = FarTerrain.new()
 		_far.name = "FarTerrain"
@@ -1215,6 +1231,22 @@ func update_streaming(player_pos: Vector3) -> void:
 		if _facet_tex.band_epoch() != _tex_band_epoch:
 			_tex_band_epoch = _facet_tex.band_epoch()
 			_facet_ring.set_band_slots(_facet_tex.band_slots(), _facet_tex.band_facet_map(), _facet_tex.band_n_map())
+	# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, G2): the SAME governed-pacer discipline as the
+	# texture prebake above, but its OWN frame-time measurement (independent of _facet_tex's existence -- G2
+	# must pace even when FP_FACET_TEX/FP_SHELL_ABSOLUTE are off). At most one facet bakes per call, nearest
+	# the view axis first, only when the last frame had headroom; step() self-guards on the flag => off is a
+	# single cheap null-check, byte-identical.
+	if _relief_data != null and _facet_ring != null:
+		var _g2_now_usec := Time.get_ticks_usec()
+		var _g2_frame_ms := 0.0
+		if _g2_last_frame_usec > 0:
+			_g2_frame_ms = minf(float(_g2_now_usec - _g2_last_frame_usec) / 1000.0, CubeSphere.CTRL_FRAME_SAMPLE_CLAMP_MS)
+		_g2_last_frame_usec = _g2_now_usec
+		# FP_RELIEF_REEMIT (task #99 follow-up): step() returns the fid it just baked (or -1) — forward it so the
+		# ring can catch up any ALREADY-cached facet whose shade multiply ran before its DEM was ready. The ring's
+		# own relief_baked() no-ops under the flag/off-cache, so this is a single cheap call either way.
+		var _g2_baked_fid := _relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms)
+		_facet_ring.relief_baked(_g2_baked_fid)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
@@ -3169,6 +3201,12 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_smooth_v2_sun_dir(sun_dir)
 
+## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): forward the current Sun direction to G3's own
+## material. No-op with no faceted ring / no orbit-relief instance (the ring setter self-guards) ⇒ byte-identical.
+func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_orbit_relief_sun_dir(sun_dir)
+
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
 ## + the atlas setter both self-guard) ⇒ byte-identical.
@@ -3221,6 +3259,18 @@ func tex_telemetry() -> Dictionary:
 	if _facet_tex == null:
 		return {}
 	return _facet_tex.tex_telemetry()
+
+## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99): G2/G1a bake-progress + NEVER-OOM ledger telemetry for
+## the live A/B ("mountains READ from orbit"). {} with the flag off / not yet set up ⇒ byte-identical for any
+## telemetry consumer (no new keys ever appear).
+func relief_data_telemetry() -> Dictionary:
+	if _relief_data == null or not _relief_data.is_ready():
+		return {}
+	return {
+		"g2_baked": _relief_data.baked_count(),
+		"g2_total": _relief_data.facet_count(),
+		"g2_bytes": _relief_data.resident_bytes(),
+	}
 
 ## T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution for the telemetry window. Returns
 ## the MAX single-frame cost (ms) of the snowfall fixed step + the load-controller tick since the last call, then resets

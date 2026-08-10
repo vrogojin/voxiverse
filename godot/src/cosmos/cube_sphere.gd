@@ -705,6 +705,128 @@ const BAND_PROMOTE_DIST := 1500.0
 ## G-CSB-EQ. Bake ON at export alongside the smooth stack.
 const FP_CPP_SMOOTH_BAKE := false
 
+## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, STAGE 1) — "mountains flat from orbit" fix. Root cause
+## (analysed, not guessed): the FacetFarRing shell shades every fragment by the planet-RADIAL normal ONLY (zero
+## slope contrast) and its own CELLS=4 node grid (~104-block cells) under-samples the ~1250-block mountain
+## wavelength — real relief geometry exists only in the view-local `FP_SMOOTH_V2` annulus (hop 2..4 around the
+## active facet), gone beyond ~4 facets. See `godot/src/world/global_relief_data.gd` for the full mechanism.
+##
+## `FP_GLOBAL_RELIEF_DATA` ("G2"): a bounded whole-planet i16 height DEM (CELLS(32)²/facet nodes, ~7.5 MB,
+## always CPU-resident once baked), filled facet-by-facet via `bake_smooth_tile` (patch 0012, resolution-agnostic,
+## already engine-resident) under the SAME governed pacer discipline as `FP_BG_PREBAKE` (≤1 facet/frame, only on
+## healthy frames, view-cone-first). This is the shared DATA source both G1 (shading, this pass) and the later
+## G3 (a view-dependent relief mesh, LATER PASS) read from. Off ⇒ `GlobalReliefData.setup()` never allocates the
+## arrays, `step()`/`bake_facet()` are no-ops ⇒ byte-identical.
+##
+## `FP_SKIN_RELIEF_SHADE` ("G1a"): a SUN-AGNOSTIC hillshade/AO layer derived from G2's height gradients (slope
+## magnitude only — no `sun_dir` term anywhere in its signature, so it is structurally incapable of the
+## `FP_SMOOTH_V2_LIT` wrong-sun-shadow failure class). Baked in the SAME pass as G2 (near-zero extra cost — the
+## height samples are already resident). Requires FP_GLOBAL_RELIEF_DATA (reads its heights). STAGE-1 SCOPING: the
+## GPU-texture/shader-ALBEDO compositing this pass stores the shade DATA at G2's own 33²/facet resolution
+## (~+3.6 MB, not yet spliced into the live shell shader — see `global_relief_data.gd`'s doc comment for the
+## disclosed scoping decision + follow-up path). `FP_SMOOTH_V2_LIT` (relief SLOPE-shadow lighting) is a wholly
+## separate, still-off flag — this fix does not touch it.
+##
+## Both default FALSE ⇒ byte-identical, FLAT verify_feature 6042/0. Gate: verify_far_geometry.gd
+## (G-GP-OFF/G-GP-DATA-EQ/G-GP-BYTES/G-GP-PACE + the G1a sun-agnostic invariant).
+const FP_GLOBAL_RELIEF_DATA := false
+const FP_SKIN_RELIEF_SHADE := false
+
+## `FP_RELIEF_REEMIT` (docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md, task #99 follow-up) — fixes the reason
+## `FP_SKIN_RELIEF_SHADE` never visibly darkens mountains on a static/orbiting camera: `FacetFarRing._ensure_cached`
+## applies the G1a hillshade multiply ONCE, when a facet's `_col_cache` is first built; `GlobalReliefData.step()`
+## bakes AT MOST ONE facet's DEM per frame (the governed pacer), so most facets are cached (shade=1.0, un-baked
+## default) LONG BEFORE their own DEM finishes — and with no player motion nothing else ever re-runs `_ensure_cached`
+## for them, so the multiply-by-1.0 colour is permanent. This flag closes that gap WITHOUT a re-emit storm
+## (the REV7 lesson: never invalidate the whole shell at once): `GlobalReliefData.step()` already RETURNS the fid
+## it just baked (or -1) — `WorldManager` forwards that fid to `FacetFarRing.relief_baked(fid)`, which marks it
+## dirty ONLY if it is already resident in `_col_cache` (an uncached facet needs nothing — it bakes WITH shade the
+## first time it's ever built). Dirty fids drain in `_process`, capped to `RELIEF_REEMIT_MAX_PER_DRAIN` per drain
+## and drains themselves rate-limited to ≥ `CULL_REBUILD_MS` apart (the SAME 250 ms interval the existing cull
+## re-emit throttle uses) — so even a pathological all-3456-complete-at-once burst re-emits a bounded handful of
+## facets, never the whole shell, and the actual mesh commit reuses the EXISTING throttled `_pending` re-emit
+## pipeline (just sets `_pending = true`) rather than a new synchronous rebuild call. Off ⇒ `relief_baked` is a
+## single cheap flag check (byte-identical; FLAT verify_feature.gd unmoved). Gate: verify_relief_reemit.gd (G-RR).
+const FP_RELIEF_REEMIT := false
+
+## FP_ORBIT_RELIEF ("G3", docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md) — real far-terrain 3D relief GEOMETRY from
+## orbit: mountains rise, valleys/cliffs drop, visible in silhouette on the limb and on descent. SUPERSEDES the
+## rejected shading-only fix (FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT above — user verdict after the live A/B:
+## "still looks flat, no sense in shaded relief"). A new `FacetOrbitRelief` tier (facet_orbit_relief.gd),
+## architecturally a sibling of FacetSmoothV2 (reuses its `hop_annulus`/`merge_tiles` statics verbatim) but
+## reading heights PURELY from the already-baked `GlobalReliefData` DEM (`height_grid`) — ZERO live worldgen
+## sampling at G3 build time, the structural fix for the shelved S-ladder's warmup-convoy failure class. Requires
+## FP_GLOBAL_RELIEF_DATA (reads its heights); independent of FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT (neither
+## required nor conflicting).
+##
+## COVERAGE (§2 of the design doc): `FacetOrbitRelief.want_set` ranks every candidate facet by
+## `min(distance-from-nadir, distance-from-the-horizon-ring)` — ONE law, no altitude branch — so BOTH the near-
+## nadir foreground AND the visible silhouette (the limb the orbit camera actually holds on screen) rank
+## highest, truncated to `ORBIT_RELIEF_MAX_TILES`; only the visually least-interesting MIDDLE band gets trimmed
+## first when the candidate set exceeds the cap. Excludes `active_fid`'s own V2 hop≤4 footprint (finer pitch
+## already covers that ground). Recomputed on facet crossings + a throttled `ORBIT_RELIEF_AXIS_MS` timer while
+## the view axis drifts without a crossing (bounds mesh CHURN, not raw compute — the O(facet_count) ranking scan
+## itself is cheap, a few thousand dot products).
+##
+## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × 72,492 B/tile (`FacetOrbitRelief.tile_bytes`: 33²=1089 verts ×
+## (pos 12 + col 16 — WS3, NO per-vertex normal — + uv 8 + uv2 8 — WS2, the fine-map sample) + 32²·6 indices × 4B)
+## ≈ 26.55 MB — comfortably above the ~330-facet whole-visible-cap estimate at the design doc's reference
+## altitude (alt≈1500, θ_h≈36°: (1-cos36°)/2 × 3456 ≈ 330), so no truncation is needed there; at higher altitudes
+## the priority law truncates gracefully, keeping both nadir and limb dense. A hard cap enforced at `want_set`
+## selection time, before dispatch — the tier can never grow past it regardless of the nominal candidate count.
+##
+## PERF FIX #1 (live A/B regression #1): the FIRST shipped cut of this flag committed via
+## `SurfaceTool.create_from + generate_normals()` over the WHOLE merged mesh on every commit — live telemetry
+## measured ≈250ms/commit on ~384 tiles (≈418K verts), ALL ON THE MAIN THREAD (proc_ms 127-158, frame_worst_ema
+## 250ms, fps 8-29 during build-up) — an unshippable stall. Fixed by dropping SurfaceTool entirely — `_commit`
+## uploads via the SAFE high-level `add_surface_from_arrays` only, BATCH-CAPPED (`ORBIT_RELIEF_COMMIT_TILES`
+## newly-built tiles per commit, so even an all-at-once burst fills the mesh gradually).
+##
+## PERF FIX #2 (live A/B regression #2 — WS1+WS4, `facet_orbit_relief.gd`'s class doc has the full account):
+## (a) WS1a SUSPENDS the whole tier on-surface (`step()` performs zero recompute/dispatch/commit past the reap —
+## G3 has nothing to show there, and this alone was the dominant ground-level stall, proc_ms ≈240 live); (b) WS1b
+## replaced the per-commit `FacetSmoothV2.merge_tiles` O(resident-set) re-merge with a FIXED-SLOT PERSISTENT
+## ARENA — a commit only (re)writes the ≤`ORBIT_RELIEF_COMMIT_TILES` CHANGED tiles' slots (index-remap baked in
+## at BUILD time, worker-side); (c) two per-facet computations (`centre_dir`, `GlobalReliefData.height_grid`)
+## are now memoized instead of redone on every recompute/dispatch of an already-baked, therefore immutable,
+## input. WS4 moved the no-protrusion edge sink to COMMIT time against the ACTUAL committed set (not the
+## aspirational want-set) — AND, critically, a commit re-sinks not only the newly-admitted tile but every one of
+## its already-committed neighbours too (their sink mask may have just changed) — so both sides of every
+## committed edge agree BY CONSTRUCTION after every commit, self-healing at the commit cadence with no rebuild
+## (`verify_orbit_relief.gd`'s G-OR-SEAM). A related bug found alongside it — a shared CORNER node (on two
+## cardinal edges at once) was being sunk TWICE the intended amount — is fixed in `sunk_positions`.
+##
+## WS3 (live A/B follow-up #3 — user verdict: "no slope shades, it just looks ugly"): G3's mesh carries NO normal
+## attribute at all. `FacetOrbitRelief.make_material` is G3's OWN independent material (never derived from
+## `FacetSmoothV2`'s, so it can never accidentally couple to `FP_SMOOTH_V2_LIT`) hardcoding the SAME radial-
+## normal terminator-ONLY law V2's own default tail already uses (`n = normalize(wp − centre)` recomputed
+## in-shader from VERTEX position, `voxi_shade(n, sun_dir)` — the flat skin's day/night/terminator law, nothing
+## else). The 3-D read comes from GEOMETRY (silhouette/profile/parallax against the flat skin), never from
+## per-slope brightness. Live sun tracking mirrors V2's (`set_sun_dir`, wired every frame in main.gd alongside
+## V2's). Gate: `verify_orbit_relief.gd`'s G-OR-LIGHT (static source checks: calls voxi_shade, derives its normal
+## from position not a mesh attribute, never reads NORMAL, no lam/relief term, never touches FacetSmoothV2).
+##
+## WS2 (fixes the user's #1 complaint — coarse "large coloured squares"): the mesh ALSO carries a UV/UV2 pair
+## landing on the SAME whole-planet `FP_PLANET_MAP` fine-map parametrisation the flat skin already samples
+## (`FacetTexBaker._fine_commit`'s own `layer = face·4 + (b/quad)·2 + (a/quad)` placement — G3's UV, decoded
+## through the identical quadrant math, provably lands on that SAME layer + inside that SAME facet's placed
+## texel region, `verify_orbit_relief.gd`'s G-OR-TEXTURE). `FacetOrbitRelief.make_material`'s shader samples
+## `fine_map` (`sampler2DArray`) at that UV; a `far_lut[14]` palette (seeded ONCE from `FarPalette.frozen_
+## colors()`) resolves the fetched id to a colour. Texel id 0 (unbaked node, or `FP_PLANET_MAP` off — the
+## uniform is then never bound, so Godot's default sampler reads 0) falls back to the SAME vertex `coarse_color`
+## this tier already painted pre-WS2 — byte-visually identical whenever the fine map has nothing to say.
+## `ALBEDO = fine_albedo × v_st` (v_st = the WS3 terminator, UNCHANGED — no slope term re-enters here). Requires
+## `FP_PLANET_MAP` for the texture to actually be resident/bound; off ⇒ G3 renders exactly as WS3 shipped it.
+##
+## Off ⇒ `FacetOrbitRelief` never constructed, byte-identical (FLAT verify_feature.gd unmoved).
+## Gate: verify_orbit_relief.gd (G-OR-OFF/LIGHT/TEXTURE/DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND).
+const FP_ORBIT_RELIEF := false
+const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈26.55 MB at 72,492 B/tile (see doc above)
+const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
+const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
+const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
+const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

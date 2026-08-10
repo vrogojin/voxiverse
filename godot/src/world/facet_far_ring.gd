@@ -5061,11 +5061,17 @@ func set_facet_band(tex: Texture) -> void:
 ## FP_PLANET_MAP: bind the always-resident whole-planet fine tier array as the shell shader's fine_map. Called
 ## per-frame by WorldManager (cheap) so it survives far-ring material re-emits. No-op off the flag / no material.
 func set_fine_map(tex) -> void:
-	if not CubeSphere.FP_PLANET_MAP or _mi == null or tex == null:
+	if not CubeSphere.FP_PLANET_MAP or tex == null:
 		return
-	var mat := _mi.material_override
-	if mat is ShaderMaterial:
-		(mat as ShaderMaterial).set_shader_parameter("fine_map", tex)
+	if _mi != null:
+		var mat := _mi.material_override
+		if mat is ShaderMaterial:
+			(mat as ShaderMaterial).set_shader_parameter("fine_map", tex)
+	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS2 (task #99 G3): G3 carries its OWN separate material (see
+	# facet_orbit_relief.gd's shader doc) — feed it the SAME whole-planet fine_map so its texture matches the
+	# flat skin's exactly. No-op with no orbit-relief instance ⇒ byte-identical off.
+	if _orbit_relief != null:
+		_orbit_relief.set_fine_map(tex)
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q2 (FP_SLOT_INDIRECT): same fix as `set_closeup_slots` — a band
 ## commit updates only the lookup texture under the flag, never re-emits.

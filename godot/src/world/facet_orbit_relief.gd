@@ -48,6 +48,18 @@ extends RefCounted
 ## ever changes. The 3-D read comes from GEOMETRY (silhouette/profile/parallax against the flat skin), not from
 ## per-slope brightness — dropping the per-vertex normal entirely also removes the analytic-normal compute
 ## (`_fill_analytic_normals`, now deleted) and 12 B/vertex of resident bytes (see `tile_bytes`/`arena_bytes`).
+##
+## WS2 (fixes the user's #1 complaint — coarse "large coloured squares"): the mesh ALSO carries a UV/UV2 pair
+## landing on the SAME whole-planet `FP_PLANET_MAP` fine-map parametrisation the flat skin already samples
+## (`facet_far_ring.gd`'s `_FLAT_ALBEDO_META_FINE`/`_tex_decode`) — `UV = ((a + i/cells)/k, (b + j/cells)/k)`,
+## `UV2 = (face, 0.0)`, where `[face,a,b,k]` is `fid`'s decode (see `_tex_decode` below, a small pure duplicate of
+## `FacetFarRing._tex_decode` — write-once `FacetAtlas` data, decoded MAIN-THREAD once per facet and passed as
+## plain int args, matching every other worker-bound value here). `make_material`'s shader samples `fine_map`
+## (`sampler2DArray`) at that UV; a `far_lut[14]` palette (seeded ONCE from `FarPalette.frozen_colors()`) resolves
+## the fetched id to a colour. Texel id 0 (unbaked / `FP_PLANET_MAP` off) falls back to the SAME vertex colour
+## (`coarse_color`, never-black) this tier already painted before WS2 — byte-visually identical whenever the fine
+## map has nothing to say. `ALBEDO = fine_albedo × v_st` (v_st = the WS3 terminator, UNCHANGED — no slope term
+## re-enters here).
 
 const ORBIT_RELIEF_CELLS := 32   # == GlobalReliefData.CELLS; kept as its own const so this file has no hard
                                   # compile-time dependency on GlobalReliefData's internals beyond height_grid()'s shape
@@ -183,6 +195,20 @@ static func coarse_color(coarse_col: PackedColorArray, i: int, j: int, scale: in
 	var cj := clampi(int(round(float(j) / float(scale))), 0, shell_cells)
 	return coarse_col[cj * stride + ci]
 
+## WS2 `fid`'s [face, a, b, k] decode — a small pure duplicate of `FacetFarRing._tex_decode` (write-once
+## `FacetAtlas` data, so it's safe to call from a worker too, but the caller decodes it MAIN-THREAD once per
+## facet and passes plain ints — matching every other worker-bound value in this file's convention). `face` is
+## the cube face (0..5), `(a,b)` this facet's cell within that face's k×k grid, `k` the grid edge count — the
+## SAME parametrisation `FacetFarRing`'s fine-map sampling already uses, so G3's UV lands on identical texels.
+static func _tex_decode(fid: int) -> Array:
+	var kb := FacetAtlas.k_of(fid)
+	var lf := fid - FacetAtlas.fid_base_of(fid)
+	var face := int(lf / (kb * kb))
+	var rem := lf - face * kb * kb
+	var a := int(rem / kb)
+	var b := rem - a * kb
+	return [face, a, b, kb]
+
 ## THE per-tile build. `heights` is a `height_grid(fid)` snapshot (row-major, `NODES_PER_EDGE`² == 33²=1089
 ## ints); `coarse_col` is a `_col_cache[fid]` snapshot (§ above). `vert_base` is this tile's PERSISTENT arena
 ## vertex offset (WS1b, its own `PERSISTENT SLOT ARENA` section below) — baked directly into the returned `idx`
@@ -194,8 +220,11 @@ static func coarse_color(coarse_col: PackedColorArray, i: int, j: int, scale: in
 ## never commit an empty tile as resident (mirrors V2's refusal contract exactly). WS3 (user verdict: "no slope
 ## shades"): NO normal is computed here at all — `make_material`'s shader recomputes its own radial normal from
 ## VERTEX/MODEL_MATRIX in-shader (the SAME law `FacetSmoothV2`'s default tail already uses), so a per-vertex
-## ARRAY_NORMAL would be dead weight the active shader never reads.
-static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int) -> Dictionary:
+## ARRAY_NORMAL would be dead weight the active shader never reads. WS2 `face`/`a`/`b`/`k` are `fid`'s `_tex_decode`
+## (the caller resolves it once, main-thread, and passes it here so `build_tile` stays a plain worker-safe
+## function of value-type args): every node's UV lands on the SAME whole-planet fine-map parametrisation the flat
+## skin already samples (`UV = ((a+i/cells)/k, (b+j/cells)/k)`, `UV2 = (face, 0.0)`, constant across the tile).
+static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int, face: int, a: int, b: int, k: int) -> Dictionary:
 	var cells := ORBIT_RELIEF_CELLS
 	var stride := cells + 1
 	var n := stride * stride
@@ -206,20 +235,26 @@ static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedCo
 	var scale := cells / FacetFarRing.CELLS          # == 8, exact (ORBIT_RELIEF_CELLS(32) / shell CELLS(4))
 	var pos := PackedVector3Array(); pos.resize(n)
 	var col := PackedColorArray(); col.resize(n)
+	var uv := PackedVector2Array(); uv.resize(n)
+	var uv2 := PackedVector2Array(); uv2.resize(n)
 	var g := PackedInt32Array(); g.resize(n)          # kept for G-OR-DATA-EQ / no-protrusion verification
+	var kf := float(maxi(k, 1))
+	var uv2_face := Vector2(float(face), 0.0)
 	for j in range(stride):
 		for i in range(stride):
-			var k := j * stride + i
+			var k2 := j * stride + i
 			var d := _weld_unit(cd, float(i) / float(cells), float(j) / float(cells))
-			var h := heights[k]
-			g[k] = h
+			var h := heights[k2]
+			g[k2] = h
 			var relief := maxf(0.0, float(h - TerrainConfig.SEA_LEVEL)) * FacetFarRing.RELIEF
-			pos[k] = d * (r_datum + relief)
-			col[k] = coarse_color(coarse_col, i, j, scale, FacetFarRing.CELLS)
+			pos[k2] = d * (r_datum + relief)
+			col[k2] = coarse_color(coarse_col, i, j, scale, FacetFarRing.CELLS)
+			uv[k2] = Vector2((float(a) + float(i) / float(cells)) / kf, (float(b) + float(j) / float(cells)) / kf)
+			uv2[k2] = uv2_face
 	var idx := _grid_indices(cells, stride)
-	for k in range(idx.size()):
-		idx[k] += vert_base   # WS1b: bake the arena offset in HERE (worker-side) — commit never remaps an index
-	return {"pos": pos, "col": col, "g": g, "idx": idx}
+	for k2 in range(idx.size()):
+		idx[k2] += vert_base   # WS1b: bake the arena offset in HERE (worker-side) — commit never remaps an index
+	return {"pos": pos, "col": col, "uv": uv, "uv2": uv2, "g": g, "idx": idx}
 
 ## Plain 2-tri/cell quad grid — smooth (per-vertex, not `flat`) colour, so no provoking-vertex convention is
 ## needed (unlike V2's per-CELL flat paint): G3's colour already varies smoothly node-to-node (§ coarse_color).
@@ -304,16 +339,15 @@ static func _edge_indices(edge: int, cells: int, stride: int) -> Array:
 static func should_commit(dirty: bool, now_ms: int, last_commit_ms: int, commit_interval_ms: int) -> bool:
 	return dirty and now_ms - last_commit_ms >= commit_interval_ms
 
-## Per-tile byte cost (WS3: pos 12B, col 16B, idx 4B — NO nrm; the mesh carries no normal attribute at all, see
-## the class doc's WS3 note). Used by `G-OR-BYTES` to check the per-component arithmetic; the LIVE resident
-## ledger is `arena_bytes()` below (the arena, WS1b, is allocated ONCE at full capacity, so its cost is a FIXED
-## constant, not a per-tile sum).
+## Per-tile byte cost (WS3: pos 12B + col 16B — NO nrm; WS2: + uv 8B + uv2 8B; idx 4B). Used by `G-OR-BYTES` to
+## check the per-component arithmetic; the LIVE resident ledger is `arena_bytes()` below (the arena, WS1b, is
+## allocated ONCE at full capacity, so its cost is a FIXED constant, not a per-tile sum).
 static func tile_bytes(tile: Dictionary) -> int:
 	if tile.is_empty():
 		return 0
 	var nv: int = (tile["pos"] as PackedVector3Array).size()
 	var ni: int = (tile["idx"] as PackedInt32Array).size()
-	return nv * (12 + 16) + ni * 4
+	return nv * (12 + 16 + 8 + 8) + ni * 4
 
 ## WS1b PERSISTENT SLOT ARENA sizing — every tile has an IDENTICAL vertex/index count (no skirt, fixed
 ## `ORBIT_RELIEF_CELLS` grid), so a fixed-slot arena is exact, not approximate.
@@ -323,7 +357,7 @@ const IDX_PER_TILE := ORBIT_RELIEF_CELLS * ORBIT_RELIEF_CELLS * 6              #
 ## The FULL arena's fixed resident byte cost — `ORBIT_RELIEF_MAX_TILES` slots' worth, always, regardless of how
 ## many are actually occupied (matches `GlobalReliefData.resident_bytes()`'s "allocated upfront" convention).
 static func arena_bytes() -> int:
-	return CubeSphere.ORBIT_RELIEF_MAX_TILES * (VERTS_PER_TILE * (12 + 16) + IDX_PER_TILE * 4)
+	return CubeSphere.ORBIT_RELIEF_MAX_TILES * (VERTS_PER_TILE * (12 + 16 + 8 + 8) + IDX_PER_TILE * 4)
 
 # =====================================================================================================================
 # WS3 THE SHADER — G3's OWN material (deliberately NOT `FacetSmoothV2.make_material()`): hardcodes the SAME
@@ -333,33 +367,62 @@ static func arena_bytes() -> int:
 # ever changes — G3 must NEVER show per-slope shading (user verdict: "no slope shades, it just looks ugly"). The
 # 3-D read comes from GEOMETRY (silhouette/profile/parallax), not from brightness. Uses the SAME shared
 # `VoxiLight.shade_glsl()` snippet every other far/near material already includes (one lighting law, no drift).
+#
+# WS2 the FINE-MAP texture: samples the SAME whole-planet `fine_map` (`FP_PLANET_MAP`) Texture2DArray the flat
+# skin's own `_FLAT_ALBEDO_META_FINE` decodes (facet_far_ring.gd) — quadrant = floor(v_uv·2) picks the 768×768
+# sub-page (`face·4 + qy·2 + qx`), `texelFetch` at `fract(v_uv·2)·768` resolves the palette id, `far_lut[id-1]`
+# gives the colour. `far_lut`/the texel-resolution constant are BAKED into the source string at compose time
+# (`shader_code()`) from `FarPalette.frozen_colors().size()`/`CubeSphere.PLANET_MAP_QUAD·PLANET_MAP_TEXELS` — never
+# hardcoded — so a change to either constant can't silently desync G3 from the fine-map's real layout/palette
+# size. id==0 (unbaked node, or `FP_PLANET_MAP` off ⇒ the uniform is never bound ⇒ Godot's default sampler reads
+# 0) falls back to `v_col_raw` — the SAME vertex `coarse_color` this tier painted before WS2 (never black).
 # =====================================================================================================================
 
 const _OR_SHADER_HEAD := "shader_type spatial;
 render_mode unshaded, cull_disabled;
 "
-const _OR_SHADER_TAIL := "varying vec4 v_col;
+const _OR_SHADER_TAIL := "uniform sampler2DArray fine_map : source_color, filter_nearest;
+uniform vec3 far_lut[%d];
+varying vec3 v_col_raw;
+varying vec3 v_st;
+varying vec2 v_uv;
+varying float v_face;
 void vertex() {
 	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
 	vec3 nr = normalize(wp - centre);
-	v_col = vec4(COLOR.rgb * voxi_shade(nr, sun_dir), 1.0);
+	v_col_raw = COLOR.rgb;
+	v_st = voxi_shade(nr, sun_dir);
+	v_uv = UV;
+	v_face = UV2.x;
 }
 void fragment() {
-	ALBEDO = v_col.rgb;
+	vec2 _q = clamp(floor(v_uv * 2.0), 0.0, 1.0);
+	int _fl = int(v_face + 0.5) * 4 + int(_q.y) * 2 + int(_q.x);
+	ivec2 _fi = clamp(ivec2(fract(v_uv * 2.0) * %d.0), ivec2(0), ivec2(%d));
+	int _f8 = int(texelFetch(fine_map, ivec3(_fi, _fl), 0).r * 255.0 + 0.5);
+	vec3 fine_albedo = (_f8 > 0) ? far_lut[_f8 - 1] : v_col_raw;
+	ALBEDO = fine_albedo * v_st;
 }
 "
 
 ## The full shader source: HEAD + the shared `VoxiLight.shade_glsl()` snippet (declares sun_dir/night_floor/
 ## term_mu/moonshine + voxi_shade — picks up e.g. `FP_TWILIGHT_AMBIENT`'s splice for free, zero duplicated
-## lighting law) + TAIL. A function (not a top-level const) so it always reads VoxiLight's CURRENT snippet.
+## lighting law) + TAIL (WS2: `%d` filled with the far_lut size + the fine-map sub-page edge/clamp, from the SAME
+## `PLANET_MAP_QUAD·PLANET_MAP_TEXELS` the flat skin's own fine decode derives its `pg`/`pg-1` from). A function
+## (not a top-level const) so it always reads VoxiLight's CURRENT snippet.
 static func shader_code() -> String:
-	return _OR_SHADER_HEAD + VoxiLight.shade_glsl() + _OR_SHADER_TAIL
+	var nlut := FarPalette.frozen_colors().size()
+	var pg := CubeSphere.PLANET_MAP_QUAD * CubeSphere.PLANET_MAP_TEXELS
+	return _OR_SHADER_HEAD + VoxiLight.shade_glsl() + (_OR_SHADER_TAIL % [nlut, pg, pg - 1])
 
 ## FP_FAR_TERMINATOR_WELD (mirrors `FacetSmoothV2.make_material`): seed sun_dir from the last live Sun G3 itself
-## was told (`set_sun_dir`, WS2/WS3 wiring), not the hardcoded default — kills a "frozen fake-noon" gap on rebuild.
+## was told (`set_sun_dir`, WS3 wiring), not the hardcoded default — kills a "frozen fake-noon" gap on rebuild.
 static var _last_sun_dir := Vector3(1.0, 0.0, 0.0)
 
+## WS2: `far_lut` is seeded ONCE here, at material creation, from `FarPalette.frozen_colors()` — the SAME 14-entry
+## palette `_FLAT_ALBEDO_META_FINE`'s fine decode indexes (`far_lut[id-1]`), so a fine-map texel id resolves to
+## the identical colour on G3 and on the flat skin.
 static func make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
 	var sh := Shader.new()
@@ -367,6 +430,7 @@ static func make_material() -> ShaderMaterial:
 	sm.shader = sh
 	var seed := _last_sun_dir if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
 	sm.set_shader_parameter("sun_dir", seed)
+	sm.set_shader_parameter("far_lut", FarPalette.frozen_colors())
 	return sm
 
 # =====================================================================================================================
@@ -402,17 +466,19 @@ var _s_task: PackedInt32Array = PackedInt32Array()
 var _s_result: Array = []
 var _s_mutex: Mutex = null
 
-# WS1b PERSISTENT SLOT ARENA (live A/B perf follow-up #2): fixed-size pos/col/idx arrays (WS3: NO nrm — the mesh
-# carries no normal attribute, see the class doc), allocated ONCE at ORBIT_RELIEF_MAX_TILES slots' worth — a
-# commit never re-processes an already-resident tile's data, only writes the ≤ORBIT_RELIEF_COMMIT_TILES NEW ones
-# into their reserved slot range, then uploads the WHOLE (fixed-size, unchanged-elsewhere) arena in ONE
-# add_surface_from_arrays call. This replaces the prior design's per-commit `FacetSmoothV2.merge_tiles` over the
-# WHOLE committed subset — THAT re-did the O(committed-tiles × 6144) index remap loop every single commit
-# (measured ≈100-300ms at 384 tiles, the root cause the arena eliminates: index remapping now happens ONCE per
-# tile, at BUILD time, worker-side — see build_tile's `vert_base` param).
+# WS1b PERSISTENT SLOT ARENA (live A/B perf follow-up #2): fixed-size pos/col/uv/uv2/idx arrays (WS3: NO nrm — the
+# mesh carries no normal attribute; WS2: + uv/uv2 for the fine-map sample, see the class doc), allocated ONCE at
+# ORBIT_RELIEF_MAX_TILES slots' worth — a commit never re-processes an already-resident tile's data, only writes
+# the ≤ORBIT_RELIEF_COMMIT_TILES NEW ones into their reserved slot range, then uploads the WHOLE (fixed-size,
+# unchanged-elsewhere) arena in ONE add_surface_from_arrays call. This replaces the prior design's per-commit
+# `FacetSmoothV2.merge_tiles` over the WHOLE committed subset — THAT re-did the O(committed-tiles × 6144) index
+# remap loop every single commit (measured ≈100-300ms at 384 tiles, the root cause the arena eliminates: index
+# remapping now happens ONCE per tile, at BUILD time, worker-side — see build_tile's `vert_base` param).
 var _arena_ready := false
 var _arena_pos: PackedVector3Array = PackedVector3Array()
 var _arena_col: PackedColorArray = PackedColorArray()
+var _arena_uv: PackedVector2Array = PackedVector2Array()
+var _arena_uv2: PackedVector2Array = PackedVector2Array()
 var _arena_idx: PackedInt32Array = PackedInt32Array()
 var _fid_slot: Dictionary = {}          ## fid -> arena slot (reserved from DISPATCH time through eviction)
 var _slot_fid: PackedInt32Array = PackedInt32Array()   ## arena slot -> fid, -1 if free
@@ -458,6 +524,8 @@ func _ensure_arena() -> void:
 	var cap := CubeSphere.ORBIT_RELIEF_MAX_TILES
 	_arena_pos = PackedVector3Array(); _arena_pos.resize(cap * VERTS_PER_TILE)
 	_arena_col = PackedColorArray(); _arena_col.resize(cap * VERTS_PER_TILE)
+	_arena_uv = PackedVector2Array(); _arena_uv.resize(cap * VERTS_PER_TILE)
+	_arena_uv2 = PackedVector2Array(); _arena_uv2.resize(cap * VERTS_PER_TILE)
 	_arena_idx = PackedInt32Array(); _arena_idx.resize(cap * IDX_PER_TILE)
 	_arena_idx.fill(0)
 	_slot_fid = PackedInt32Array(); _slot_fid.resize(cap); _slot_fid.fill(-1)
@@ -603,8 +671,10 @@ func step() -> void:
 		var heights := _relief_data.height_grid(f)      # main-thread snapshot — safe hand-off (§0, WS1d-cached)
 		var coarse_col := _col_cache_for(f)              # main-thread snapshot — safe hand-off (§0)
 		var vert_base := arena_slot * VERTS_PER_TILE     # WS1b: baked into the worker's own idx output
+		var tex := _tex_decode(f)                        # WS2: [face,a,b,k] — main-thread decode, plain ints to the worker
 		_s_fid[slot] = f
-		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot, f, heights, coarse_col, vert_base), true, "orbitrelieftile")
+		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(
+			slot, f, heights, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
 	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
 		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
@@ -630,8 +700,8 @@ func _inflight(fid: int) -> bool:
 ## the class doc's thread-safety note. `vert_base` (WS1b) is baked into the tile's own `idx` array here, off-
 ## thread — the main thread NEVER remaps an index. Writes ONLY `_s_result[slot]` under the mutex; never touches
 ## `_want`/`_tiles`/any other instance field (single-writer discipline, mirrors `FacetSmoothV2._build_worker`).
-func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int) -> void:
-	var tile := build_tile(fid, heights, coarse_col, vert_base)
+func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int, face: int, a: int, b: int, k: int) -> void:
+	var tile := build_tile(fid, heights, coarse_col, vert_base, face, a, b, k)
 	_s_mutex.lock()
 	_s_result[slot] = tile
 	_s_mutex.unlock()
@@ -681,6 +751,8 @@ func _commit() -> void:
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = _arena_pos
 	arr[Mesh.ARRAY_COLOR] = _arena_col
+	arr[Mesh.ARRAY_TEX_UV] = _arena_uv
+	arr[Mesh.ARRAY_TEX_UV2] = _arena_uv2
 	arr[Mesh.ARRAY_INDEX] = _arena_idx
 	var m := ArrayMesh.new()
 	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
@@ -689,16 +761,22 @@ func _commit() -> void:
 
 ## Write ONE tile's (sink-masked) data into its reserved arena slot. `tile["idx"]` is already offset by this
 ## slot's `vert_base` (baked in at `build_tile`, worker-side) — this is a plain per-index COPY, no arithmetic. WS3:
-## no `nrm` slot — the mesh carries no normal attribute (`make_material`'s shader derives its own in-shader).
+## no `nrm` slot — the mesh carries no normal attribute (`make_material`'s shader derives its own in-shader). WS2:
+## `uv`/`uv2` are copied unchanged (the no-protrusion sink only moves POSITION radially — the fine-map texel a
+## node samples never changes when its edge sinks).
 func _write_arena_slot(slot: int, tile: Dictionary, sink_edges: int) -> void:
 	var vbase := slot * VERTS_PER_TILE
 	var ibase := slot * IDX_PER_TILE
 	var spos := sunk_positions(tile["pos"], ORBIT_RELIEF_CELLS, ORBIT_RELIEF_CELLS + 1, sink_edges)
 	var tcol: PackedColorArray = tile["col"]
+	var tuv: PackedVector2Array = tile["uv"]
+	var tuv2: PackedVector2Array = tile["uv2"]
 	var tidx: PackedInt32Array = tile["idx"]
 	for k in range(VERTS_PER_TILE):
 		_arena_pos[vbase + k] = spos[k]
 		_arena_col[vbase + k] = tcol[k]
+		_arena_uv[vbase + k] = tuv[k]
+		_arena_uv2[vbase + k] = tuv2[k]
 	for k in range(IDX_PER_TILE):
 		_arena_idx[ibase + k] = tidx[k]
 
@@ -722,3 +800,10 @@ func set_sun_dir(sun_dir: Vector3) -> void:
 	# Off ⇒ a no-op write to a var `make_material` never reads ⇒ byte-identical.
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		_last_sun_dir = sun_dir
+
+## WS2: feed the whole-planet fine_map texture into THIS instance's OWN material (`FacetFarRing.set_fine_map`
+## forwards here — see its doc). No-op if the material isn't built yet; a null `tex` is a no-op too (mirrors the
+## caller's own guard, so this stays safe to call directly from a gate as well).
+func set_fine_map(tex) -> void:
+	if _material != null and tex != null:
+		_material.set_shader_parameter("fine_map", tex)

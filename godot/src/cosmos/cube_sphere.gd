@@ -768,12 +768,12 @@ const FP_RELIEF_REEMIT := false
 ## the view axis drifts without a crossing (bounds mesh CHURN, not raw compute — the O(facet_count) ranking scan
 ## itself is cheap, a few thousand dot products).
 ##
-## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × 55,068 B/tile (`FacetOrbitRelief.tile_bytes`: 33²=1089 verts ×
-## (pos 12 + col 16 — WS3, NO per-vertex normal) + 32²·6 indices × 4B) ≈ 20.17 MB — comfortably above the ~330-
-## facet whole-visible-cap estimate at the design doc's reference altitude (alt≈1500, θ_h≈36°: (1-cos36°)/2 ×
-## 3456 ≈ 330), so no truncation is needed there; at higher altitudes the priority law truncates gracefully,
-## keeping both nadir and limb dense. A hard cap enforced at `want_set` selection time, before dispatch — the
-## tier can never grow past it regardless of the nominal candidate count.
+## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × 72,492 B/tile (`FacetOrbitRelief.tile_bytes`: 33²=1089 verts ×
+## (pos 12 + col 16 — WS3, NO per-vertex normal — + uv 8 + uv2 8 — WS2, the fine-map sample) + 32²·6 indices × 4B)
+## ≈ 26.55 MB — comfortably above the ~330-facet whole-visible-cap estimate at the design doc's reference
+## altitude (alt≈1500, θ_h≈36°: (1-cos36°)/2 × 3456 ≈ 330), so no truncation is needed there; at higher altitudes
+## the priority law truncates gracefully, keeping both nadir and limb dense. A hard cap enforced at `want_set`
+## selection time, before dispatch — the tier can never grow past it regardless of the nominal candidate count.
 ##
 ## PERF FIX #1 (live A/B regression #1): the FIRST shipped cut of this flag committed via
 ## `SurfaceTool.create_from + generate_normals()` over the WHOLE merged mesh on every commit — live telemetry
@@ -806,15 +806,22 @@ const FP_RELIEF_REEMIT := false
 ## V2's). Gate: `verify_orbit_relief.gd`'s G-OR-LIGHT (static source checks: calls voxi_shade, derives its normal
 ## from position not a mesh attribute, never reads NORMAL, no lam/relief term, never touches FacetSmoothV2).
 ##
-## KNOWN LIMITATION (disclosed, not fixed this round): the far §2V skin's existing texture (fine-map UV/UV2) is
-## NOT yet bound onto G3's mesh — G3 paints the same coarse-cell-quantized COLOR the flat skin's tier uses
-## (`coarse_color`), so at very high zoom the two can show a faint shimmer/mismatch at the coarse-cell boundary.
-## Deferred (WS2, texture parity) — no gate or shader work landed for it in this pass.
+## WS2 (fixes the user's #1 complaint — coarse "large coloured squares"): the mesh ALSO carries a UV/UV2 pair
+## landing on the SAME whole-planet `FP_PLANET_MAP` fine-map parametrisation the flat skin already samples
+## (`FacetTexBaker._fine_commit`'s own `layer = face·4 + (b/quad)·2 + (a/quad)` placement — G3's UV, decoded
+## through the identical quadrant math, provably lands on that SAME layer + inside that SAME facet's placed
+## texel region, `verify_orbit_relief.gd`'s G-OR-TEXTURE). `FacetOrbitRelief.make_material`'s shader samples
+## `fine_map` (`sampler2DArray`) at that UV; a `far_lut[14]` palette (seeded ONCE from `FarPalette.frozen_
+## colors()`) resolves the fetched id to a colour. Texel id 0 (unbaked node, or `FP_PLANET_MAP` off — the
+## uniform is then never bound, so Godot's default sampler reads 0) falls back to the SAME vertex `coarse_color`
+## this tier already painted pre-WS2 — byte-visually identical whenever the fine map has nothing to say.
+## `ALBEDO = fine_albedo × v_st` (v_st = the WS3 terminator, UNCHANGED — no slope term re-enters here). Requires
+## `FP_PLANET_MAP` for the texture to actually be resident/bound; off ⇒ G3 renders exactly as WS3 shipped it.
 ##
 ## Off ⇒ `FacetOrbitRelief` never constructed, byte-identical (FLAT verify_feature.gd unmoved).
-## Gate: verify_orbit_relief.gd (G-OR-OFF/LIGHT/DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND).
+## Gate: verify_orbit_relief.gd (G-OR-OFF/LIGHT/TEXTURE/DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND).
 const FP_ORBIT_RELIEF := false
-const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈20.17 MB at 55,068 B/tile (see doc above)
+const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈26.55 MB at 72,492 B/tile (see doc above)
 const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
 const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)

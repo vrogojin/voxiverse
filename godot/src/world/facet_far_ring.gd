@@ -2238,7 +2238,7 @@ func _weld_chord_arrays_n(fid: int, cells: int) -> Array:
 	var stride := cells + 1
 	for gj in range(stride):
 		for gi in range(stride):
-			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+			_weld_node(fid, cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
 	return [pos, col]
 
 ## COSMOS PLANET-VIEW §3 (B): the `cells`-parametrized twin of `_ensure_cached`'s shipped planar-corner path. Same bilerp +
@@ -2264,7 +2264,7 @@ func _planar_grid_arrays(fid: int, cells: int) -> Array:
 			var g := int(prof.x)
 			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
 			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))
-			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, bx, by, bz, g, int(prof.y), prof.w))
 	return [pos, col]
 
 ## COSMOS PLANET-VIEW §3 (B): expand a limb facet's dense grid into the fast-path tri soup (same two tris/cell, same winding,
@@ -3012,7 +3012,7 @@ func _weld_chord_arrays(fid: int) -> Array:
 	var stride := CELLS + 1
 	for gj in range(stride):
 		for gi in range(stride):
-			_weld_node(cd, float(gi) / float(CELLS), float(gj) / float(CELLS), pos, col)
+			_weld_node(fid, cd, float(gi) / float(CELLS), float(gj) / float(CELLS), pos, col)
 	return [pos, col]
 
 # FP_ENV_FALLBACK_EMIT: ensure facet `fid` has SOME coarse cache to emit — the cheap exact-chord weld — WITHOUT
@@ -3078,7 +3078,7 @@ func _ensure_cached(fid: int, force := false, env_on := TierPlace.env_all_on(), 
 			# far water iff g < SEA_LEVEL — STRICT, matching near's sea fill (g < y <= SEA_LEVEL, so g==SEA_LEVEL is DRY
 			# beach/shelf sand, not water). `<=` painted the flattened beach shelf (a wide band quantized to g==SEA_LEVEL)
 			# as water over near's sand. Matches the already-correct far_mesh_builder.gd classifier.
-			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, bx, by, bz, g, int(prof.y), prof.w))
 	_pos_cache[fid] = pos
 	_col_cache[fid] = col
 
@@ -3118,7 +3118,7 @@ func _ensure_backstop_chord_cached(fid: int) -> void:
 	var col := PackedColorArray()
 	for gj in range(stride):
 		for gi in range(stride):
-			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+			_weld_node(fid, cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
 	_weld_snap_edges(pos, cells)
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
@@ -3141,7 +3141,7 @@ func _ensure_backstop_true_cached(fid: int) -> void:
 	var col := PackedColorArray()   # discarded — _btrue_cache carries no colour, _bcol_cache is reused at emit
 	for gj in range(stride):
 		for gi in range(stride):
-			_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+			_weld_node(fid, cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
 	_weld_snap_edges(pos, cells)
 	_btrue_cache[fid] = pos
 
@@ -3251,7 +3251,7 @@ func _ensure_backstop_cached(fid: int, force := false, env_on := TierPlace.envel
 		var cd := FacetAtlas.facet_corner_dirs(fid)
 		for gj in range(stride):
 			for gi in range(stride):
-				_weld_node(cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
+				_weld_node(fid, cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
 		_weld_snap_edges(pos, cells)
 		_bpos_cache[fid] = pos
 		_bcol_cache[fid] = col
@@ -3273,7 +3273,7 @@ func _ensure_backstop_cached(fid: int, force := false, env_on := TierPlace.envel
 			var g := int(prof.x)
 			var relief := maxf(0.0, float(g - TerrainConfig.SEA_LEVEL)) * RELIEF
 			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))   # ABSOLUTE, un-sunk
-			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, bx, by, bz, g, int(prof.y), prof.w))
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
 
@@ -3349,7 +3349,7 @@ func _ensure_backstop_cached_env(fid: int) -> void:
 			pos.append(Vector3(bx + dx * relief, by + dy * relief, bz + dz * relief))   # ABSOLUTE, envelope height, un-sunk
 			var vp := TerrainConfig.profile_at_dir(dx, dy, dz, FacetAtlas.R_BLOCKS)
 			var vg := int(vp.x)
-			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, bx, by, bz, vg, int(vp.y), vp.w))
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
 
@@ -3404,7 +3404,7 @@ func _ensure_backstop_cached_env_weld(fid: int) -> void:
 			pos.append(_weld_place(d, gmin))                     # ABSOLUTE, radial, envelope height, un-sunk
 			var vp := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
 			var vg := int(vp.x)
-			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, d.x * FacetAtlas.R_BLOCKS, d.y * FacetAtlas.R_BLOCKS, d.z * FacetAtlas.R_BLOCKS, vg, int(vp.y), vp.w))
 	_weld_snap_edges(pos, cells)
 	_bpos_cache[fid] = pos
 	_bcol_cache[fid] = col
@@ -3481,7 +3481,7 @@ static func _env_weld_grid(fid: int, cells: int, mult_override: int = -1) -> Arr
 			pos.append(_weld_place(d, gmin))            # ABSOLUTE, radial, envelope height, un-sunk (ε applied at emit)
 			var vp := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
 			var vg := int(vp.x)
-			col.append(FarPalette.color_for(vg, int(vp.y), vp.w, vg < TerrainConfig.SEA_LEVEL))
+			col.append(FarPalette.skin_color(fid, d.x * FacetAtlas.R_BLOCKS, d.y * FacetAtlas.R_BLOCKS, d.z * FacetAtlas.R_BLOCKS, vg, int(vp.y), vp.w))
 	_weld_snap_edges(pos, cells)                        # dense: snap fine edge verts onto the EDGE-CANON coarse chord (no-op at CELLS)
 	return [pos, col]
 
@@ -4125,12 +4125,14 @@ static func _weld_place(d: Vector3, g: int) -> Vector3:
 	return d * (FacetAtlas.R_BLOCKS + relief)
 
 ## COSMOS FS1 (§4.1): emit grid node (s,t)'s welded radial position + far-palette colour into pos/col.
-func _weld_node(cd: PackedFloat64Array, s: float, t: float, pos: PackedVector3Array, col: PackedColorArray) -> void:
+## `fid` (FP_SKIN_BLOCK_COLOR, §1.3): the caller's own facet id, needed only to resolve a representative
+## lattice (x,z) for the block-exact colour law; the weld/placement law itself is unchanged.
+func _weld_node(fid: int, cd: PackedFloat64Array, s: float, t: float, pos: PackedVector3Array, col: PackedColorArray) -> void:
 	var d := _weld_unit(cd, s, t)
 	var prof := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
 	var g := int(prof.x)
 	pos.append(_weld_place(d, g))
-	col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+	col.append(FarPalette.skin_color(fid, d.x * FacetAtlas.R_BLOCKS, d.y * FacetAtlas.R_BLOCKS, d.z * FacetAtlas.R_BLOCKS, g, int(prof.y), prof.w))
 
 ## COSMOS FS1 (§4.2): the COARSE-OWNS-EDGE T-junction rule. A dense facet (cells > CELLS) snaps each outer-ring
 ## INTERIOR vertex onto the CELLS=4 coarse chord (a straight-line interp of the ring's own coarse-index vertices),

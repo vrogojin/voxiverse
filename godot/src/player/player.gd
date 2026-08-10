@@ -804,6 +804,10 @@ func _nav_tick(delta: float) -> void:
 			var fwd := _dev_dir_to_bci(fid, _nav_clock, -window_camera_transform().basis.z)
 			var heading := _DevNavOverlayCls.compass_heading(_DVCls.v(0.0, 0.0, 1.0), rhat, fwd)
 			_dev_overlay.update_hud(heading, _CosmosNavCls.NAV_NAMES[int(_nav.mode)])
+		# FP_DEVNAV_GUIDE_FRAME: ride the guide root on the planet's live render placement (floating-origin +
+		# scaled-body), so the axis/equator/facet-border guides sit ON the rendered planet instead of the origin.
+		if CubeSphere.FP_DEVNAV_GUIDE_FRAME and world != null and _dev_overlay.has_method("set_guides_transform"):
+			_dev_overlay.set_guides_transform(world.planet_render_transform())
 
 ## COSMOS SPACE-NAV SN2: the additive nav telemetry (nav_mode/frame_v/|v_bci|/nav_frame) for the RemoteBridge.
 ## Empty dict when the machine is off (flag-off) ⇒ the guarded bridge merge adds nothing (byte-identical).
@@ -1474,11 +1478,13 @@ func _move(delta: float) -> void:
 		if CubeSphere.CRUISE_MODE and not remote_drive:
 			var cruise_alt := radial_altitude()
 			if CubeSphere.cruise_engaged(true, cruise_alt > CubeSphere.ATMO_TOP, Input.is_key_pressed(KEY_C)):
-				# Look direction in the LATTICE frame (matches the shipped F-fly): yaw basis · pitch-included forward.
-				var look_local := Basis(Vector3(1, 0, 0), _pitch) * Vector3(0.0, 0.0, -1.0)
-				var look_dir := (transform.basis * look_local)
-				if look_dir.length() > 0.0:
-					look_dir = look_dir.normalized()
+				# Look direction. SHIPPED: LATTICE-frame yaw basis · pitch-included forward (matches F-fly). BUG in
+				# ATT_SPACE: the camera is emancipated (6DOF attitude), so transform.basis (surface/lattice) does NOT
+				# point where the pilot looks ⇒ cruise flies a wrong direction. FP_CRUISE_LOOKDIR ⇒ use the TRUE
+				# displayed camera forward (window_camera_transform basis · −Z), correct in every attitude mode.
+				# Routed through the pure CubeSphere.cruise_look_dir selector (verify_cruise gate G-CRUISE-LOOKDIR).
+				var look_dir := CubeSphere.cruise_look_dir(
+					CubeSphere.FP_CRUISE_LOOKDIR, window_camera_transform().basis, transform.basis, _pitch)
 				var cruise_v := CubeSphere.cruise_speed(cruise_alt)
 				position += look_dir * cruise_v * delta
 				_horiz_vel = Vector3(look_dir.x, 0.0, look_dir.z) * cruise_v

@@ -515,6 +515,14 @@ const FP_SKIN_TIER := false
 ## NEVER-OOM: fixed-size pages (base-tier-only ≈ 8.2 MB ceiling, FacetTexBaker.total_bytes()). Flipped ON at
 ## export after the live A/B. Truth gate: verify_facet_tex.gd (G-FT-OFF/BAKE/UV/PALETTE).
 const FP_FACET_TEX := false
+## FP_SKIN_TEXTURE_MEAN — the far §2V skin's per-block colour = the block's TEXTURE-TILE MEAN (what the near
+## textured block averages to on screen) instead of the flat BlockCatalog swatch. Root cause of "far land pixels
+## don't match near blocks at all": near renders the real CC0 tile (grass.png…), far paints the blocks.json
+## swatch — two unrelated colour sources. FarPalette._top_color routes every surface colour through
+## BlockTextures.mean_color_of when on; the C++ skin path inherits it automatically via frozen_colors() (NO module
+## rebuild). Tile-less ids (water/lava) fall back to the swatch. Default FALSE ⇒ byte-identical (the shipped
+## color_of palette). Requires FP_FACET_TEX to be visible. LIVE-tuned; palette resolves once at bake init.
+const FP_SKIN_TEXTURE_MEAN := false
 
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
@@ -1262,6 +1270,15 @@ const SN_NAV_MODES := false
 ## LIVE-ONLY (morning validation); the controller MATH + mode-transition trajectory are headless-gated
 ## (verify_dev_flight — G-SN-DEVFLIGHT). Flipped ON at export after the AM live pilot pass.
 const SN_DEVNAV := false
+## FP_DEVNAV_GUIDE_FRAME — anchor the dev-nav 3-D overlay GUIDES (spin-axis, equator ring, facet borders) to the
+## planet's LIVE render placement instead of the world origin. The guides are built in the body-centred ABSOLUTE
+## frame (planet centre = 0); the shipped overlay leaves their top_level root at the origin, but under the
+## floating-origin / scaled-body render the planet is offset+oriented+scaled to WorldManager.planet_render_transform()
+## (= the FacetFarRing node's global_transform) — so origin-anchored guides float away from the planet ("guides
+## totally off"). With this on, the guide root rides that exact transform each frame, so the equator/axis/borders
+## sit ON the rendered planet at every altitude. Default FALSE ⇒ byte-identical (guides stay at origin). Requires
+## SN_DEVNAV. LIVE-ONLY legibility; the transform plumbing is trivial (one global_transform copy).
+const FP_DEVNAV_GUIDE_FRAME := false
 
 ## COSMOS SPACE-NAV SN4a (docs/COSMOS-SPACE-NAV-DESIGN.md §6.2) — the ALTITUDE ATMOSPHERE RAMP. When true,
 ## CosmosSky._ramp_environment composes altitude terms (all C¹ in radial altitude h = |cam| − R_vox) onto
@@ -1737,6 +1754,13 @@ const ATMO_BRAKE_TERMINAL := 20.0
 ## entered, the shipped fly/walk paths are byte-for-byte. Gate G-CRUISE (verify_cruise): the pure speed law +
 ## engage predicate. LIVE-ONLY: the actual supercruise feel.
 const CRUISE_MODE := false
+## FP_CRUISE_LOOKDIR — cruise flies along the TRUE displayed camera forward (window_camera_transform basis),
+## not `transform.basis`. In ATT_SPACE the camera is emancipated (6DOF attitude quaternion) so `transform.basis`
+## (the surface/lattice orientation) points somewhere unrelated to where the pilot looks — cruise then flies "a
+## totally wrong direction". With this on, cruise supercruises exactly where the camera aims in EVERY attitude
+## mode (SURFACE/SPACE/RECOVER), since window_camera_transform() is the single displayed-pose seam. Default FALSE
+## ⇒ byte-identical (the old transform.basis path). Only meaningful when CRUISE_MODE is also on.
+const FP_CRUISE_LOOKDIR := false
 ## Cruise speed law consts (blocks/s; the model is 1 block = 1 km, R_BLOCKS 6371, Earth→Moon 384400 blocks).
 ##   speed(alt) = clamp(MIN · 2^(alt/BAND), MIN, MAX), alt = dist(camera → nearest body centre) − body radius.
 ##   • MIN 200 — a brisk-but-controllable crawl just above ATMO_TOP (~ the natural LEO v_circ ≈ 260 b/s), so
@@ -1761,6 +1785,21 @@ static func cruise_speed(alt: float) -> float:
 ## The live call ANDs this with CRUISE_MODE (flag off ⇒ never engaged). Flag-independent for the gate.
 static func cruise_engaged(dev_fly: bool, in_space: bool, c_held: bool) -> bool:
 	return dev_fly and in_space and c_held
+
+## Pure LOOK-DIRECTION selector for cruise (FP_CRUISE_LOOKDIR — see the flag doc above). `use_new` mirrors the
+## flag; `cam_basis` is the TRUE displayed camera basis (Player.window_camera_transform().basis); `lattice_basis`
+## is the surface/lattice `transform.basis` the shipped path used; `pitch` is the shipped path's stored pitch
+## angle. Pure Vector3/Basis math — no scene/node access — so both branches are headless-testable independent of
+## the Player/camera plumbing. Never returns a non-normalized non-zero vector (matches the shipped normalize-if-
+## nonzero guard).
+static func cruise_look_dir(use_new: bool, cam_basis: Basis, lattice_basis: Basis, pitch: float) -> Vector3:
+	var d: Vector3
+	if use_new:
+		d = cam_basis * Vector3(0.0, 0.0, -1.0)
+	else:
+		var look_local := Basis(Vector3(1, 0, 0), pitch) * Vector3(0.0, 0.0, -1.0)
+		d = lattice_basis * look_local
+	return d.normalized() if d.length() > 0.0 else d
 
 ## COSMOS ORBIT-FRAME Phase A (docs/COSMOS-ORBIT-FRAME-DESIGN.md §3 / §8) — the INERTIAL ATTITUDE machine
 ## master flag. When true, the player holds its camera ORIENTATION as a BCI quaternion (CosmosAttitude) while

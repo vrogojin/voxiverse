@@ -33,22 +33,31 @@ static var _jungle: Color     # B1: deep-green rainforest canopy (grass↔jungle
 
 ## Resolve every far-field colour from the catalog once. Idempotent; call before any
 ## lookup (FarTerrain warms it, but every accessor guards too).
+# FP_SKIN_TEXTURE_MEAN: resolve a surface colour from the block's TEXTURE-TILE MEAN (what the near textured
+# block averages to) instead of the flat catalog swatch, so the far skin's land colours match the near field.
+# Tile-less ids (water/lava/red_sand) fall back to the swatch inside mean_color_of ⇒ unchanged. Flag off ⇒ the
+# shipped color_of path exactly (byte-identical).
+static func _top_color(id: int) -> Color:
+	if CubeSphere.FP_SKIN_TEXTURE_MEAN:
+		return BlockTextures.mean_color_of(id)
+	return BlockCatalog.color_of(id)
+
 static func ensure_ready() -> void:
 	if _ready:
 		return
 	BlockCatalog.ensure_ready()
-	_water = BlockCatalog.color_of(BlockCatalog.id_of(&"water"))
-	_ice = BlockCatalog.color_of(BlockCatalog.id_of(&"ice"))
-	_lava = BlockCatalog.color_of(BlockCatalog.id_of(&"lava"))
-	_snow = BlockCatalog.color_of(BlockCatalog.id_of(&"snow_block"))
-	_sand = BlockCatalog.color_of(BlockCatalog.id_of(&"sand"))
-	_gravel = BlockCatalog.color_of(BlockCatalog.id_of(&"gravel"))
-	_red_sand = BlockCatalog.color_of(BlockCatalog.id_of(&"red_sand"))
-	_mud = BlockCatalog.color_of(BlockCatalog.id_of(&"mud"))
-	_podzol = BlockCatalog.color_of(BlockCatalog.id_of(&"podzol"))
-	_grass = BlockCatalog.color_of(BlockCatalog.GRASS)
-	_leaf = BlockCatalog.color_of(BlockCatalog.LEAF)
-	_stone = BlockCatalog.color_of(BlockCatalog.STONE)
+	_water = _top_color(BlockCatalog.id_of(&"water"))
+	_ice = _top_color(BlockCatalog.id_of(&"ice"))
+	_lava = _top_color(BlockCatalog.id_of(&"lava"))
+	_snow = _top_color(BlockCatalog.id_of(&"snow_block"))
+	_sand = _top_color(BlockCatalog.id_of(&"sand"))
+	_gravel = _top_color(BlockCatalog.id_of(&"gravel"))
+	_red_sand = _top_color(BlockCatalog.id_of(&"red_sand"))
+	_mud = _top_color(BlockCatalog.id_of(&"mud"))
+	_podzol = _top_color(BlockCatalog.id_of(&"podzol"))
+	_grass = _top_color(BlockCatalog.GRASS)
+	_leaf = _top_color(BlockCatalog.LEAF)
+	_stone = _top_color(BlockCatalog.STONE)
 	# Deterministic biome-mean tints (LOD-DESIGN §2.3.3): TAIGA is the 20% podzol / 80%
 	# grass mean of _biome_top's hash; FOREST tints grass toward leaf to stand in for the
 	# canopy the far field cannot draw as individual trees.
@@ -59,7 +68,7 @@ static func ensure_ready() -> void:
 	# they follow a recolour, exactly like every other far colour. Shown on the GDScript far path; the
 	# C++ skin path (frozen_colors, 14 entries) maps them to grass via its default until the enum extends.
 	_savanna = _grass.lerp(_sand, 0.40)
-	_jungle = _grass.lerp(BlockCatalog.color_of(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
+	_jungle = _grass.lerp(_top_color(BlockCatalog.id_of(&"jungle_leaves")), 0.55)
 	_ready = true
 
 ## The sea-surface colour for a clamped (open-water) vertex of climate temperature `t`

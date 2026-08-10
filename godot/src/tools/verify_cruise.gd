@@ -6,8 +6,11 @@ extends SceneTree
 ##                    increasing, clamped to [MIN, MAX], MAX sized so the Earth→Moon gap crosses in ~1–3 min.
 ##   (B) ENGAGE     — CubeSphere.cruise_engaged(dev_fly, in_space, c_held) is TRUE only with all three, FALSE if any
 ##                    input is false (so C on the surface / when not dev-flying / not-in-space is a no-op).
-## Both kernels are flag-INDEPENDENT statics (CRUISE_MODE gates only the player's C poll), so this runs green on
-## any build.
+##   (C) LOOKDIR    — CubeSphere.cruise_look_dir(use_new, cam_basis, lattice_basis, pitch) (FP_CRUISE_LOOKDIR):
+##                    OFF reproduces the shipped lattice-yaw·pitch composition; ON picks the true camera forward
+##                    (cam_basis · −Z) REGARDLESS of lattice_basis/pitch — the ATT_SPACE bug fix. Always unit length.
+## All three kernels are flag-INDEPENDENT statics (CRUISE_MODE/FP_CRUISE_LOOKDIR gate only the player's poll), so
+## this runs green on any build.
 ##
 ## RUN:
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
@@ -31,9 +34,10 @@ func _rel(a: float, b: float) -> float:
 	return absf(a - b) / d
 
 func _initialize() -> void:
-	print("=== verify_cruise (DEV-FLIGHT CRUISE: G-CRUISE — pure speed law + engage predicate) ===")
+	print("=== verify_cruise (DEV-FLIGHT CRUISE: G-CRUISE — pure speed law + engage predicate + lookdir) ===")
 	_gate_speed_law()
 	_gate_engage()
+	_gate_lookdir()
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -78,3 +82,33 @@ func _gate_engage() -> void:
 	_ok(not CS.cruise_engaged(true, false, true), "(B) NOT engaged when not in space (on surface / in atmosphere)")
 	_ok(not CS.cruise_engaged(true, true, false), "(B) NOT engaged when C is not held")
 	_ok(not CS.cruise_engaged(false, false, false), "(B) NOT engaged when nothing is true")
+
+# ---------- (C) FP_CRUISE_LOOKDIR: pure look-direction selector ----------
+func _gate_lookdir() -> void:
+	print("  --- (C) LOOKDIR: OFF = shipped lattice·pitch (ignores camera); ON = true camera forward (ignores lattice/pitch) ---")
+	var lattice := Basis(Vector3(0, 1, 0), deg_to_rad(40.0))                                    # arbitrary yawed lattice frame
+	var pitch := deg_to_rad(-15.0)
+	var cam := Basis(Vector3(1, 0, 0), deg_to_rad(70.0)).rotated(Vector3(0, 1, 0), deg_to_rad(160.0))  # a very different look
+
+	# OFF: exactly the shipped lattice·pitch composition, and IGNORES cam_basis entirely.
+	var off_expected := (lattice * (Basis(Vector3(1, 0, 0), pitch) * Vector3(0.0, 0.0, -1.0))).normalized()
+	var off_got := CS.cruise_look_dir(false, cam, lattice, pitch)
+	_ok(off_got.distance_to(off_expected) < 1.0e-6, "(C) OFF reproduces the shipped lattice·pitch composition")
+	var off_got_other_cam := CS.cruise_look_dir(false, Basis.IDENTITY, lattice, pitch)
+	_ok(off_got.distance_to(off_got_other_cam) < 1.0e-6, "(C) OFF ignores cam_basis entirely")
+
+	# ON: exactly cam_basis · −Z, and IGNORES lattice_basis/pitch entirely.
+	var on_expected := (cam * Vector3(0.0, 0.0, -1.0)).normalized()
+	var on_got := CS.cruise_look_dir(true, cam, lattice, pitch)
+	_ok(on_got.distance_to(on_expected) < 1.0e-6, "(C) ON reproduces the true camera forward")
+	var on_got_other_lattice := CS.cruise_look_dir(true, cam, Basis.IDENTITY, 0.0)
+	_ok(on_got.distance_to(on_got_other_lattice) < 1.0e-6, "(C) ON ignores lattice_basis/pitch entirely")
+
+	# Falsifier: with a camera aimed away from the lattice frame, ON and OFF fly DIFFERENT directions — proves the
+	# fix actually changes the flown direction (not a vacuous no-op in ATT_SPACE, the bug's exact scenario).
+	_ok(on_got.distance_to(off_got) > 0.5,
+		"(C) ON and OFF diverge for a camera aimed away from the lattice frame (Δ=%.3f)" % on_got.distance_to(off_got))
+
+	# Both are always unit length.
+	_ok(absf(off_got.length() - 1.0) < 1.0e-6, "(C) OFF result is unit length")
+	_ok(absf(on_got.length() - 1.0) < 1.0e-6, "(C) ON result is unit length")

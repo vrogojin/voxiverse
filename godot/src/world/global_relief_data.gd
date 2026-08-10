@@ -66,6 +66,15 @@ var _baked_count := 0
 var _cursor := 0                                      # linear-sweep fallback cursor (once the view cone empties)
 var _cpp_gen: Object = null                            # frozen VoxelGeneratorCosmos (any fid — facet-independent); null ⇒ GDScript fallback
 
+## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A) — the fresh-reload fix. All three stay EMPTY/false with
+## the flag off (setup() only builds them under FP_DEM_DEFER), so the shipped gated pacer below is byte-identical.
+var _centre_dirs: PackedVector3Array = PackedVector3Array()   # setup-time per-facet centre dirs (n × 12 B ≈ 41 KB): the
+                                                              # alloc-free basis for the nearest-first scan, replacing the
+                                                              # per-call allocating `_centre_dir(fid)` used by `_next_unbaked`.
+var _want: Dictionary = {}            # fid -> true: the DEMAND want-list the far ring's shade pull registers (post-settle,
+                                       # on-surface) — served instead of a blind O(3456) whole-planet sweep.
+var _settled := false                 # has the near view meshed? until WorldManager latches mark_settled(), step() bakes nothing.
+
 ## Allocate the always-resident arrays (facet_count() from FacetAtlas — MULTI_BODY-aware, matches every other
 ## whole-planet ledger in this codebase). No-op with the flag off ⇒ every array stays empty ⇒ every accessor
 ## below degrades to its "not ready" default ⇒ byte-identical.
@@ -79,6 +88,15 @@ func setup() -> void:
 	_cursor = 0
 	if CubeSphere.FP_SKIN_RELIEF_SHADE:
 		_shade = PackedByteArray(); _shade.resize(n * NODES_PER_FACET); _shade.fill(255)
+	if CubeSphere.FP_DEM_DEFER:
+		# FP_DEM_DEFER: precompute every facet's centre dir ONCE (the allocating `_centre_dir` scan the shipped
+		# `_next_unbaked` runs per admitted step is the main-thread cost this kills). Built only under the flag ⇒
+		# no new resident bytes with it off (byte-off). _want/_settled reset for a fresh load.
+		_centre_dirs = PackedVector3Array(); _centre_dirs.resize(n)
+		for fid in range(n):
+			_centre_dirs[fid] = _centre_dir(fid)
+		_want = {}
+		_settled = false
 	if ClassDB.class_exists("VoxelGeneratorCosmos"):
 		_cpp_gen = FacetSkinTier._build_cpp_gen(0)   # facet-independent config; any fid bakes any facet's tile
 
@@ -239,22 +257,127 @@ func _next_unbaked(emit_axis: Array) -> int:
 			return fid
 	return -1
 
+## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A): WorldManager latches this ON once the near view has
+## MESHED (`initial_view_meshed`). Until then `step()` bakes NOTHING under the flag — the whole-planet DEM is
+## deferred out of the fresh-reload window (its only on-surface consumer, the far-ring shade multiply, self-degrades
+## to 1.0 while unbaked, so this is visually free). No-op / irrelevant with the flag off.
+func mark_settled() -> void:
+	_settled = true
+
+func is_settled() -> bool:
+	return _settled
+
+## FP_DEM_DEFER: the far ring's colour bake registers a DEMAND here (`facet_far_ring.gd`'s shade-multiply pull site)
+## whenever it builds a facet's cache while that facet's DEM isn't baked yet — so the deferred pacer serves exactly
+## the view-touched facets nearest-first instead of a blind whole-planet sweep. No-op off the flag / already baked /
+## out of range (byte-off: `_want` never populates with the flag off, so `_next_wanted` is unreachable).
+func request(fid: int) -> void:
+	if not CubeSphere.FP_DEM_DEFER:
+		return
+	if fid < 0 or fid >= _baked.size() or _baked[fid] == 1:
+		return
+	_want[fid] = true
+
+## FP_DEM_DEFER telemetry/gate: how many demanded facets are still pending (unbaked).
+func want_count() -> int:
+	return _want.size()
+
+## FP_DEM_DEFER: the demanded, still-unbaked facet nearest `emit_axis` (alloc-free — reads the setup-time centre-dir
+## table, never `_centre_dir(fid)`). Purges already-baked/stale demands as it scans. -1 when the want-list is empty.
+func _next_wanted(emit_axis: Array) -> int:
+	if _want.is_empty():
+		return -1
+	var have_axis := false
+	var ax := 0.0; var ay := 0.0; var az := 0.0
+	if emit_axis.size() == 3 and _centre_dirs.size() == _baked.size():
+		ax = float(emit_axis[0]); ay = float(emit_axis[1]); az = float(emit_axis[2])
+		have_axis = ax * ax + ay * ay + az * az > 0.5
+	var best := -1
+	var best_d := -2.0
+	var fallback := -1
+	for fid in _want.keys():                       # .keys() is a snapshot Array ⇒ safe to erase during the loop
+		if fid < 0 or fid >= _baked.size() or _baked[fid] == 1:
+			_want.erase(fid)                       # already baked / invalid — drop the demand
+			continue
+		if fallback < 0:
+			fallback = fid
+		if have_axis:
+			var cd := _centre_dirs[fid]
+			var dt := cd.x * ax + cd.y * ay + cd.z * az
+			if dt > best_d:
+				best_d = dt; best = fid
+	return best if best >= 0 else fallback
+
+## FP_DEM_DEFER: alloc-free variant of `_next_unbaked` for the OFF-SURFACE whole-planet sweep — reads the setup-time
+## `_centre_dirs` table instead of allocating a fresh `_centre_dir(fid)` per facet (the per-call cost the shipped
+## scan pays). Same nearest-`emit_axis`-first-then-linear-cursor ordering. -1 once every facet is baked.
+func _next_unbaked_fast(emit_axis: Array) -> int:
+	var n := _baked.size()
+	if emit_axis.size() == 3 and _centre_dirs.size() == n:
+		var ax := float(emit_axis[0]); var ay := float(emit_axis[1]); var az := float(emit_axis[2])
+		if ax * ax + ay * ay + az * az > 0.5:
+			var best := -1
+			var best_d := -2.0
+			for fid in range(n):
+				if _baked[fid] == 1:
+					continue
+				var cd := _centre_dirs[fid]
+				var dt := cd.x * ax + cd.y * ay + cd.z * az
+				if dt > best_d:
+					best_d = dt; best = fid
+			if best >= 0:
+				return best
+	for k in range(n):
+		var fid := (_cursor + k) % n
+		if _baked[fid] == 0:
+			_cursor = (fid + 1) % n
+			return fid
+	return -1
+
 ## Governed pacer step (mirrors `FP_BG_PREBAKE`'s `_update_band_parallel` discipline): bakes AT MOST ONE
 ## not-yet-baked facet, nearest-`emit_axis` first, ONLY when `frame_ms` shows the last frame had headroom.
 ## `frame_ms` is a REAL measured wall-clock delta from the caller (never `Performance.TIME_PROCESS` — the same
 ## "invalid on threaded web" discipline `FP_BG_PREBAKE`/`StreamLoadController.LiveSource` already use). Returns
 ## the fid baked this call, or -1 (nothing dispatched: complete / hot frame / not set up).
-func step(emit_axis: Array, frame_ms: float) -> int:
+## `offsurface` (default true) is consulted ONLY under FP_DEM_DEFER — see `_step_deferred`.
+func step(emit_axis: Array, frame_ms: float, offsurface := true) -> int:
 	if not CubeSphere.FP_GLOBAL_RELIEF_DATA or _heights.is_empty():
 		return -1
 	if _baked_count >= _baked.size():
 		return -1
+	if CubeSphere.FP_DEM_DEFER:
+		return _step_deferred(emit_axis, frame_ms, offsurface)
 	if frame_ms >= CubeSphere.BG_FRAME_BUDGET_MS:
 		return -1
 	var fid := _next_unbaked(emit_axis)
 	if fid < 0:
 		return -1
 	return fid if bake_facet(fid) else -1
+
+## FP_DEM_DEFER's step (Phase A, docs/COSMOS-STREAM-PARALLEL-DESIGN.md §4.2): defer + demand-drive + first-call fix.
+func _step_deferred(emit_axis: Array, frame_ms: float, offsurface: bool) -> int:
+	# FIRST-CALL FIX: require ≥1 real inter-frame sample. `frame_ms == 0` happens ONLY on the boot frame (the
+	# `_g2_last_frame_usec == 0` loophole) — the single busiest frame of the load; a real delta is always > 0.
+	if frame_ms <= 0.0:
+		return -1
+	if frame_ms >= CubeSphere.BG_FRAME_BUDGET_MS:
+		return -1
+	# DEFER: bake nothing until the near view has settled (the fresh-reload window WorldManager gates on).
+	if not _settled:
+		return -1
+	# DEMAND-DRIVEN: serve the fids the far ring's shade pull actually asked for (nearest-first), NOT a blind sweep.
+	var fid := _next_wanted(emit_axis)
+	if fid < 0 and offsurface:
+		# Off-surface the near field is frozen (FP_ALT_REGIME) ⇒ real headroom to fill the rest of the planet for
+		# the G3 relief mesh. Alloc-free sweep via the setup-time centre-dir table (never on-surface — no blind sweep
+		# competes with the near-field load).
+		fid = _next_unbaked_fast(emit_axis)
+	if fid < 0:
+		return -1
+	if bake_facet(fid):
+		_want.erase(fid)   # served — clear the demand (harmless no-op if it came from the off-surface sweep)
+		return fid
+	return -1
 
 ## NEVER-OOM ledger: bytes actually resident right now (0 while off/not set up). i16 heights (2B/node) + the
 ## baked-flag byte array + (under FP_SKIN_RELIEF_SHADE) the L8 shade layer (1B/node).

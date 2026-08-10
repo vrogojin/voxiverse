@@ -827,6 +827,22 @@ const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-con
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
 
+## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
+## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
+## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =
+## 20-60 ms/admitted frame), so the 22 ms gate makes a duty-cycle sawtooth that re-spikes every recovering frame —
+## the 2-3 min, 4-28 fps fresh-reload window. But on-surface the DEM's ONLY consumer is the far-ring shade multiply,
+## which self-degrades to 1.0 for unbaked facets — so deferring it during the near-field load is VISUALLY FREE.
+## Under this flag `GlobalReliefData.step` (a) bakes NOTHING until the near view has meshed (`WorldManager` latches
+## `mark_settled()` off `initial_view_meshed`); (b) after settle, on-surface, serves ONLY the demand want-list the
+## far ring's colour bake registers (`request(fid)` at the shade-multiply pull site) — no blind whole-planet sweep;
+## (c) off-surface (near field frozen) sweeps the remaining planet nearest-first via a SETUP-TIME centre-dir table
+## (kills the per-call allocating `_centre_dir` scan) for the G3 relief mesh; (d) closes the first-call `frame_ms==0`
+## loophole (require ≥1 real inter-frame sample). Off ⇒ the shipped gated pacer is byte-identical (the whole deferred
+## branch, the centre-dir table, the want-list, and the settle latch are all inert). Gate: verify_stream_parallel.gd
+## (G-SP-OFF / G-SP-DEM-DEFER).
+const FP_DEM_DEFER := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

@@ -3107,6 +3107,12 @@ func _ensure_cached(fid: int, force := false, env_on := TierPlace.env_all_on(), 
 	var stride := CELLS + 1
 	var pos := PackedVector3Array()
 	var col := PackedColorArray()
+	# FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A): this planar path's per-node shade multiply (below)
+	# is the DEM's ONLY on-surface consumer — so when we build this facet's colour cache and its G2 DEM isn't baked
+	# yet, REGISTER the demand once (not per-node) so the deferred DEM pacer serves exactly these view-touched facets,
+	# nearest-first, instead of a blind whole-planet sweep. `request` no-ops off the flag / already baked ⇒ byte-identical.
+	if CubeSphere.FP_DEM_DEFER and CubeSphere.FP_SKIN_RELIEF_SHADE and _relief_shade != null and not _relief_shade.is_baked(fid):
+		_relief_shade.request(fid)
 	for gj in range(stride):
 		for gi in range(stride):
 			var s := float(gi) / float(CELLS)

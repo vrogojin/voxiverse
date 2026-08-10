@@ -77,6 +77,8 @@ var _relief_data: GlobalReliefData = null   # COSMOS-FAR-GEOMETRY-PREBAKE (task 
 # Independent of _bg_last_frame_usec (same measurement discipline, own clock — G2 must pace even when _facet_tex
 # doesn't exist, e.g. FP_GLOBAL_RELIEF_DATA on without FP_FACET_TEX/FP_SHELL_ABSOLUTE).
 var _g2_last_frame_usec := 0
+var _relief_settled := false                 # FP_DEM_DEFER (COSMOS-STREAM-PARALLEL Phase A): latched once the near view
+                                             # meshes (mark_settled fired) — before then the DEM bake is deferred.
 var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
 var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
 var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
@@ -1237,6 +1239,14 @@ func update_streaming(player_pos: Vector3) -> void:
 	# the view axis first, only when the last frame had headroom; step() self-guards on the flag => off is a
 	# single cheap null-check, byte-identical.
 	if _relief_data != null and _facet_ring != null:
+		# FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix): defer the whole-planet
+		# DEM bake until the near view has MESHED. During the load window the DEM's only on-surface consumer (the
+		# far-ring shade multiply) self-degrades to 1.0 for unbaked facets, so baking it early buys zero visible value
+		# for its 20-60 ms/frame cost. The latch flips ONCE (short-circuit ⇒ `initial_view_meshed` is never even
+		# queried after settle, or at all with the flag off ⇒ byte-identical).
+		if CubeSphere.FP_DEM_DEFER and not _relief_settled and initial_view_meshed(player_pos):
+			_relief_settled = true
+			_relief_data.mark_settled()
 		var _g2_now_usec := Time.get_ticks_usec()
 		var _g2_frame_ms := 0.0
 		if _g2_last_frame_usec > 0:
@@ -1245,7 +1255,9 @@ func update_streaming(player_pos: Vector3) -> void:
 		# FP_RELIEF_REEMIT (task #99 follow-up): step() returns the fid it just baked (or -1) — forward it so the
 		# ring can catch up any ALREADY-cached facet whose shade multiply ran before its DEM was ready. The ring's
 		# own relief_baked() no-ops under the flag/off-cache, so this is a single cheap call either way.
-		var _g2_baked_fid := _relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms)
+		# FP_DEM_DEFER: pass off-surface state — on-surface the deferred pacer serves only the demand want-list, off-
+		# surface it sweeps the rest of the planet (the near field is frozen, so there is headroom). Ignored off the flag.
+		var _g2_baked_fid := _relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms, _facet_ring.shell_offsurface())
 		_facet_ring.relief_baked(_g2_baked_fid)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.

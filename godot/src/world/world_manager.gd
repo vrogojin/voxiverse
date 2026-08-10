@@ -122,6 +122,22 @@ const UPVECTOR_HEAL_NEAR_RIDGE := 0.3
 var _last_pool_spawn_ms := -100000
 var _last_pool_retire_ms := -100000
 var _pool_miss_count := 0             # re-designation POOL-MISS fallbacks (gate: 0 in a normal walk)
+# FP_NB_FULLRES (docs/COSMOS-NB-FULLRES-DESIGN.md §2) — the widened-pool state. All inert (false / -1 / empty) with
+# CubeSphere.FP_NB_FULLRES off ⇒ byte-identical to the shipped FP-M2d residency law. `_nb_settled` latches the first
+# time the near view is meshed (initial_view_meshed) — widening never begins during the fresh-load window. `_nb_b0_bytes`
+# is the measured post-settle byte baseline (voxel_used + static heap) snapshotted at that latch; the ledger enforces a
+# GROWTH budget over it (NEVER-OOM, measured counters only). `_nb_breached` is the ledger-breach hysteresis latch (set at
+# the cap, cleared below cap − REHYST). `_nb_excl_latch` (fid→true) records which live neighbour's seam BAND has meshed —
+# only those (plus the imminent) are excluded from the far ring (band-conditional exclusion, §2.4 CORRECTION 2), so a
+# live-but-empty neighbour keeps its far tile (no see-through hole). `_nb_imminent_fid` is the last-known imminent (the
+# exclusion reads it outside the pool pass). `_last_nb_retire_ms` paces the breach-ladder LRU/farthest retire.
+var _nb_settled := false
+var _nb_b0_bytes := -1
+var _nb_breached := false
+var _nb_excl_latch := {}
+var _nb_imminent_fid := -1
+var _last_nb_retire_ms := -100000
+var _nb_fullres_active := false       # last pool pass's nb_fullres_on() decision (drives the band-conditional exclusion + skin outside the pass)
 # COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME, §0-W3/§5): the altitude regime latch. `_alt_orbital` is true while the
 # player is above the ATMO_TOP gate (ORBITAL — the near field is frozen: no per-tick redesignation / pool-manage /
 # snow / shrink-snap); it flips with ALT_REGIME_HYST hysteresis in _update_alt_regime (driven from update_streaming).
@@ -2810,12 +2826,47 @@ func _alt_reentry_restore(fid: int, player_pos: Vector3) -> Dictionary:
 func _near_lod_on() -> bool:
 	return CubeSphere.FP_M2_LOD and not CubeSphere.FP_NO_NEAR_LOD
 
+## FP_NB_FULLRES (§2) — the effective enable: the flag, AND the near view has settled (the fresh-load window stays
+## Phase-A's — widening never competes with the initial reveal), AND we are on-surface (off-surface freezes the pool,
+## §2.1). Off the flag → always false ⇒ every widened branch below is inert (byte-identical to shipped FP-M2d).
+func nb_fullres_on(off_surface: bool) -> bool:
+	return CubeSphere.FP_NB_FULLRES and _nb_settled and not off_surface
+
+## FP_NB_FULLRES (§2.1) — the effective live-neighbour cap: the full 4 edges under FULLRES, else the shipped FP2_LIVE_CAP
+## (1 imminent + 1 corner-second). POOL_MAX_NEIGHBOURS (4) is the geometric ceiling either way (asserted by G-M1-POOL).
+func _z1_live_cap(fullres: bool) -> int:
+	return CubeSphere.POOL_MAX_NEIGHBOURS if fullres else CubeSphere.FP2_LIVE_CAP
+
+## FP_NB_FULLRES (§2.5, CORRECTION 1) — the ledger's MEASURED byte reading: engine-wide resident voxel-data bytes
+## (VoxelEngine.get_stats().memory_pools.voxel_used, via the module's cached singleton) + the WASM static heap
+## (OS.get_static_memory_usage(), the same reading G-M1-MEM uses). Both are real counters — no estimates. The static-heap
+## term captures meshes/nodes/everything; the voxel_used term captures the data-block pool the static reading may not.
+func _nb_measured_bytes() -> int:
+	var voxel_used := 0
+	if _module_world != null and _module_world.has_method("nb_voxel_used_bytes"):
+		voxel_used = int(_module_world.call("nb_voxel_used_bytes"))
+	return voxel_used + int(OS.get_static_memory_usage())
+
+## FP_NB_FULLRES (§2 / §2.5) — latch `_nb_settled` the first time the near view is meshed, and snapshot the measured
+## byte baseline B0 at that instant (BEFORE any widened spawn). The ledger enforces a GROWTH budget over B0 (§2.5); it
+## re-snapshots whenever the widened pool is empty (drift honesty). No-op once settled + snapped. Flag-off → never
+## called (guarded by FP_NB_FULLRES at the caller), so `_nb_settled` stays false ⇒ nb_fullres_on() stays false.
+func _nb_settle_latch(player_pos: Vector3) -> void:
+	if not _nb_settled:
+		if initial_view_meshed(player_pos):
+			_nb_settled = true
+			_nb_b0_bytes = _nb_measured_bytes()
+	elif _nb_b0_bytes < 0:
+		_nb_b0_bytes = _nb_measured_bytes()
+
 func _manage_facet_pool(player_pos: Vector3) -> void:
 	if not _module_world.has_method("pool_spawn"):
 		return
 	var active := TerrainConfig.active_facet()
 	if active < 0:
 		return
+	if CubeSphere.FP_NB_FULLRES:
+		_nb_settle_latch(player_pos)                 # §2: latch settled + snapshot the measured byte baseline B0
 	# Own-side ridge distance per EDGE neighbour (nearest slot wins). The diagonal is never a seam_neighbour, so it
 	# never enters `want` → never live (Z1-hybrid §3.2 "the diagonal facet is never live"). Shared with both policies.
 	var want := {}
@@ -2873,11 +2924,22 @@ func _manage_pool_fp1c(want: Dictionary) -> bool:
 func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -> bool:
 	var live_now: Array = (_module_world.call("pool_neighbour_fids") as Array)
 	var off_surface := _pool_off_surface(active, player_pos)
+	# FP_NB_FULLRES (§2): under the flag (settled + on-surface) the selector targets ALL 4 edges (nearest-first tail) and
+	# the live cap widens to POOL_MAX_NEIGHBOURS; off the flag `fullres` is false ⇒ every widened branch is inert (shipped).
+	var fullres := nb_fullres_on(off_surface)
+	_nb_fullres_active = fullres
 	# CROSSING-FASTGEN obs-2 fix (3): pass the measured player speed so the imminent-select D_WARM shell leads with
 	# velocity (vel_lead ≡ 0 with FP_VEL_PREDICT off → the shell is exactly POOL_D_WARM, byte-identical).
-	var targets := z1_live_targets(want, off_surface, live_now, _player_speed)
+	var targets := z1_live_targets(want, off_surface, live_now, _player_speed, fullres)
+	# FP_NB_FULLRES (§2.4): maintain the band-conditional far-ring exclusion latch — probe ≤1 live neighbour/tick for its
+	# seam band, clear geometrically past NB_EXCL_RELEASE / on retire. Inert off the flag (keeps `_nb_excl_latch` empty).
+	if fullres:
+		_nb_update_excl_latch(live_now, want, player_pos)
+	elif not _nb_excl_latch.is_empty():
+		_nb_excl_latch.clear()                       # flag flipped off / went off-surface → drop stale latches
 	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
 	# so its pool-ramp slot is pace-floored, its LOD stays budgeted through relief mode, and demote never coarsens it.
+	_nb_imminent_fid = int(targets[0]) if targets.size() > 0 else -1   # FP_NB_FULLRES (§2.4): the band-conditional exclusion reads this outside the pool pass
 	if _module_world != null and _module_world.has_method("set_imminent_fid"):
 		var imm_fid: int = int(targets[0]) if targets.size() > 0 else -1
 		# CROSSING-JERKINESS FIX: mark the imminent COMMITTED once its ridge is within POOL_D_COMMIT (the same geometric
@@ -2890,6 +2952,16 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	var now := Time.get_ticks_msec()
 	var interval_ms := int(CubeSphere.POOL_SPAWN_INTERVAL_S * 1000.0)
 	var changed := false
+	var live_cap := _z1_live_cap(fullres)
+	# FP_NB_FULLRES (§2.5): the MEASURED-byte growth ledger (NEVER-OOM). `admit_widened` gates every NON-imminent spawn on
+	# growth + NB_SPAWN_EST <= NB_POOL_BYTES_CAP; a breach latches `_nb_breached` (freeze non-imminent grows now, LRU/
+	# farthest retire in the retire block), cleared only below cap − NB_BYTES_REHYST (hysteresis). The imminent keeps its
+	# shipped path (the crossing invariant, cap-2-safe today). admit_widened ≡ true off the flag (byte-identical).
+	var admit_widened := true
+	if fullres:
+		admit_widened = _nb_ledger_admit()
+		if _nb_breached and _module_world.has_method("nb_freeze_grows"):
+			_module_world.call("nb_freeze_grows")           # breach ladder step 2: freeze non-imminent grows
 	# SPAWN (promote LOD → live): the highest-priority target not yet live, iff the controller admits it AND we are below
 	# the Z1 live cap. One spawn per SPAWN_INTERVAL_S (amortized). W1 — targets[0] is the IMMINENT ridge (the one we are
 	# committed to crossing); it is EXEMPT from the raw vox_gen backlog gate (while walking vox_gen naturally sits
@@ -2897,13 +2969,25 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	# It still needs sustained frame HEADROOM (promote_admit_imminent). The 2nd/corner target keeps the FULL backlog gate
 	# — the feed-forward throttle applies to that EXTRA generation volume, and its view-ramp pace is throttled regardless.
 	if now - _last_pool_spawn_ms >= interval_ms:
+		# FP_NB_FULLRES (§2.2): imminent-priority SAME-TICK eviction — if the crossing target (targets[0]) is not yet live
+		# and the widened pool is at the cap, retire the farthest NON-target live neighbour immediately (bypassing the
+		# retire interval; MIN_LIVE_S still honored) so the imminent always finds a slot (no post-crossing pool-miss).
+		if fullres and targets.size() > 0 and not bool(_module_world.call("pool_has", int(targets[0]))) \
+				and int(_module_world.call("pool_neighbour_count")) >= live_cap:
+			var ev := _nb_farthest_retirable(live_now, targets, want, true, -1.0)
+			if ev >= 0 and bool(_module_world.call("pool_retire", ev)):
+				live_now.erase(ev)
+				_nb_excl_latch.erase(ev)
+				changed = true
 		for idx in range(targets.size()):
 			var t: int = int(targets[idx])
 			if bool(_module_world.call("pool_has", t)):
 				continue
-			if int(_module_world.call("pool_neighbour_count")) >= CubeSphere.FP2_LIVE_CAP:
+			if int(_module_world.call("pool_neighbour_count")) >= live_cap:
 				break
 			var admitted: bool = promote_admit_imminent(_load_ctrl, float(want.get(t, 1.0e30)), _player_speed) if idx == 0 else promote_admit(_load_ctrl)
+			if idx > 0 and fullres and not admit_widened:
+				admitted = false                             # ledger breach ladder step 1: refuse further widened spawns
 			if not admitted:
 				continue
 			if bool(_module_world.call("pool_spawn", t)):       # module on_promote() HOLDS t's LOD cover (no gap, §9.1)
@@ -2926,19 +3010,99 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	# forbids (request()/_recompute_wants exclude pool facets) — a non-trivial new demote-build path + gate, deferred to
 	# a follow-up. The W1/W10 controller fixes shrink the trigger (retire happens later / the promote holds longer).
 	if now - _last_pool_retire_ms >= interval_ms:
-		for nb in live_now:
-			if targets.has(nb):
-				continue
-			var d: float = want.get(nb, 1.0e30)
-			if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
-				if bool(_module_world.call("pool_retire", nb)):
-					_last_pool_retire_ms = now
-					# C4: do NOT erase _promote_pending here — retire alone would leave the mesher's promote-HOLD set
-					# (on_promote) forever, PINNING the held LOD mesh in the cache (no idle/LRU path frees it). Instead let
-					# THIS tick's _lod_promote_pass see `not pool_has(nb)` → lod_end_promote(nb) → lift the hold → erase.
-					changed = true
+		var retire_fid := -1
+		if fullres:
+			# FP_NB_FULLRES (§2.2): FARTHEST-first — the most useless facet frees its slot first (post-crossing the far-side
+			# neighbours + old active retire nearest-last). Distance-retire self-disables for edge TARGETS (they stay live),
+			# so this fires only on facets that LEFT the want-set past D_RETIRE (the crossing-rebalance path).
+			retire_fid = _nb_farthest_retirable(live_now, targets, want, true, CubeSphere.POOL_D_RETIRE)
+			# breach ladder step 3: still over the measured budget → shed the farthest NON-imminent live neighbour, even a
+			# band target (NEVER-OOM outranks the seam cover). Re-admission is gated below cap − REHYST (no thrash).
+			if retire_fid < 0 and _nb_breached:
+				retire_fid = _nb_farthest_retirable(live_now, targets, want, false, -1.0)
+		else:
+			for nb in live_now:
+				if targets.has(nb):
+					continue
+				var d: float = want.get(nb, 1.0e30)
+				if d > CubeSphere.POOL_D_RETIRE and float(_module_world.call("pool_age_s", nb)) >= CubeSphere.POOL_MIN_LIVE_S:
+					retire_fid = int(nb)
 					break
+		if retire_fid >= 0 and bool(_module_world.call("pool_retire", retire_fid)):
+			_last_pool_retire_ms = now
+			_nb_excl_latch.erase(retire_fid)
+			# C4: do NOT erase _promote_pending here — retire alone would leave the mesher's promote-HOLD set
+			# (on_promote) forever, PINNING the held LOD mesh in the cache (no idle/LRU path frees it). Instead let
+			# THIS tick's _lod_promote_pass see `not pool_has(nb)` → lod_end_promote(nb) → lift the hold → erase.
+			changed = true
 	return changed
+
+## FP_NB_FULLRES (§2.5) — the measured-byte growth-ledger admission. Returns whether a NEW non-imminent widened spawn is
+## admitted, and maintains `_nb_breached` with cap/rehyst hysteresis. Growth = (voxel_used + static heap) − B0 (measured
+## counters only, §1.3 CORRECTION 1). Over the cap (or above the absolute static-heap backstop) latches breach; below
+## cap − REHYST clears it. B0 re-snapshots when the widened pool is empty (drift honesty — foreign growth then can't
+## permanently poison the budget). Static so a future gate could drive it; here it reads live module + OS counters.
+func _nb_ledger_admit() -> bool:
+	if _nb_b0_bytes < 0:
+		return true
+	if int(_module_world.call("pool_neighbour_count")) == 0:
+		_nb_b0_bytes = _nb_measured_bytes()          # empty pool → re-baseline; nothing to attribute NB growth to
+		_nb_breached = false
+		return true
+	var growth := _nb_measured_bytes() - _nb_b0_bytes
+	var over := growth + CubeSphere.NB_SPAWN_EST > CubeSphere.NB_POOL_BYTES_CAP \
+		or int(OS.get_static_memory_usage()) > CubeSphere.NB_ABS_HEAP_MB * 1048576
+	if over:
+		_nb_breached = true
+	elif growth < CubeSphere.NB_POOL_BYTES_CAP - CubeSphere.NB_BYTES_REHYST:
+		_nb_breached = false
+	return not _nb_breached
+
+## FP_NB_FULLRES (§2.2) — the FARTHEST retirable live neighbour: max own-side ridge distance among live neighbours,
+## never the imminent, honoring MIN_LIVE_S. `respect_targets` skips current targets (distance-retire + same-tick
+## eviction of non-targets); false lets a band target be shed (breach ladder). `min_d` is the distance floor a candidate
+## must EXCEED (POOL_D_RETIRE for the geometric retire; −1 = any, for breach/eviction). −1 return when none qualifies.
+func _nb_farthest_retirable(live_now: Array, targets: Array, want: Dictionary, respect_targets: bool, min_d: float) -> int:
+	var best := -1
+	var best_d := min_d
+	for nb in live_now:
+		if int(nb) == _nb_imminent_fid:
+			continue
+		if respect_targets and targets.has(nb):
+			continue
+		if float(_module_world.call("pool_age_s", nb)) < CubeSphere.POOL_MIN_LIVE_S:
+			continue
+		var d: float = want.get(nb, 1.0e30)
+		if d > best_d:
+			best = int(nb)
+			best_d = d
+	return best
+
+## FP_NB_FULLRES (§2.4) — maintain the band-conditional far-ring exclusion latch. CLEAR (geometric, no probe): a fid no
+## longer live, or whose ridge walked past NB_EXCL_RELEASE (the player left → its band unloads → the far tile must return).
+## SET (≤1 probe/tick, the nearest un-latched live neighbour): its seam band is meshed near the player (pool_seam_meshed).
+## Keeps the far ring covering a live-but-empty neighbour until its band actually meshes (the cover-until-meshed contract).
+func _nb_update_excl_latch(live_now: Array, want: Dictionary, player_pos: Vector3) -> void:
+	for fid in _nb_excl_latch.keys():
+		if not live_now.has(fid) or float(want.get(fid, 1.0e30)) > CubeSphere.NB_EXCL_RELEASE:
+			_nb_excl_latch.erase(fid)
+	var cand := -1
+	var cand_d := 1.0e30
+	for nb in live_now:
+		if int(nb) == _nb_imminent_fid or _nb_excl_latch.has(nb):
+			continue                                 # the imminent is excluded via _nb_excluded_neighbour regardless — don't waste the probe on it
+		var d := float(want.get(nb, 1.0e30))
+		if d < cand_d:
+			cand = int(nb)
+			cand_d = d
+	if cand >= 0 and bool(_module_world.call("pool_seam_meshed", cand, player_pos)):
+		_nb_excl_latch[cand] = true
+
+## FP_NB_FULLRES (§2.4) — is live neighbour `nb` far-ring-EXCLUDED under the widened pool? Only when it is the imminent/
+## committed crossing target (shipped cover-until-meshed) or its seam band has latched. A live-but-empty neighbour is NOT
+## excluded → it keeps its far tile (no see-through hole). Shared by the far-ring exclusion and the skin candidate set.
+func _nb_excluded_neighbour(nb: int) -> bool:
+	return nb == _nb_imminent_fid or _nb_excl_latch.has(nb)
 
 ## FP-M2d (§3.2) — the PURE Z1-hybrid target selector (static so G-M2-POLICY drives it directly). Given each edge
 ## neighbour's own-side ridge distance `want[fid]`, the off-surface freeze flag, and the currently-live neighbour set,
@@ -2950,7 +3114,10 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 ## fast player selects the crossing-target facet earlier. Default 0 + FP_VEL_PREDICT off ⇒ vel_lead ≡ 0 ⇒ shell is exactly
 ## POOL_D_WARM, byte-identical, and the headless gates (which pass 3 args) are unaffected. The corner-second D_WARM2 shell
 ## is deliberately NOT led — the extra corner volume stays gated on the tighter shipped shell (conservative, NEVER-OOM).
-static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array, speed: float = 0.0) -> Array:
+## FP_NB_FULLRES (§2.1): `fullres` grows ONE flag-gated tail — after the imminent, append every remaining edge in `want`
+## nearest-first (up to POOL_MAX_NEIGHBOURS) instead of the single corner-second. Default false ⇒ byte-identical shipped
+## output (the corner-second branch), so G-M2-POLICY / G-SP-NB-OFF stay green and the static gate drives both directly.
+static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array, speed: float = 0.0, fullres: bool = false) -> Array:
 	var out: Array = []
 	if off_surface:
 		return out
@@ -2973,6 +3140,17 @@ static func z1_live_targets(want: Dictionary, off_surface: bool, live_now: Array
 	if inc >= 0 and imm != inc and imm_d > inc_d - CubeSphere.POOL_SWITCH_MARGIN:
 		imm = inc; imm_d = inc_d                              # challenger did not beat the incumbent by the margin — hold
 	out.append(imm)
+	if fullres:
+		# FP_NB_FULLRES (§2.1): the FULL-COVERAGE tail — every remaining edge of `want`, nearest-first (arr is sorted
+		# ascending), up to POOL_MAX_NEIGHBOURS. No D_WARM2 shell gate: all 4 edges become targets so the seam see-through
+		# closes on every side. Spawn PACING is unchanged (the caller still admits ≤1/interval through the full AIMD gate),
+		# so this only changes HOW MANY facets may eventually hold a band, not how fast anything fills.
+		for c in arr:
+			if out.size() >= CubeSphere.POOL_MAX_NEIGHBOURS:
+				break
+			if int(c[1]) != imm:
+				out.append(int(c[1]))
+		return out
 	# corner-second: the nearest OTHER ridge inside the tighter D_WARM2 shell, up to the live cap.
 	for c in arr:
 		if out.size() >= CubeSphere.FP2_LIVE_CAP:
@@ -3056,7 +3234,19 @@ func _facet_ring_sync_exclusion() -> void:
 	# FP-M2b (§5.5): the ring's excluded set = live pool neighbours ∪ the facets whose LOD mesh is APPLIED, merged
 	# into ONE deferred/budgeted set_pool_excluded (no synchronous ring regen). With FP_M2_LOD off lod_covered_fids
 	# is [] → this reduces to the shipped FP-M1c pool-neighbour exclusion, byte-identical.
-	var excluded: Array = (_module_world.call("pool_neighbour_fids") as Array).duplicate()
+	var neigh: Array = (_module_world.call("pool_neighbour_fids") as Array)
+	var excluded: Array = []
+	if _nb_fullres_active:
+		# FP_NB_FULLRES (§2.4 CORRECTION 2): BAND-CONDITIONAL exclusion. Under the widened pool a live neighbour is
+		# excluded from the far ring ONLY when it is the imminent/committed crossing target (shipped cover-until-meshed via
+		# the promote-HOLD) or its seam band has meshed (_nb_excl_latch). A live-but-EMPTY neighbour (player mid-facet, its
+		# localized viewer out of reach) stays far-ring-COVERED → no see-through hole (the whole-facet binary exclusion,
+		# applied the instant a neighbour went live, was the regression this fixes).
+		for nb in neigh:
+			if _nb_excluded_neighbour(int(nb)):
+				excluded.append(nb)
+	else:
+		excluded = neigh.duplicate()
 	# RENDER-SIMPLIFY §2.4: under FP_NO_NEAR_LOD there is no LOD cover, so the excluded set collapses to live pool
 	# neighbours only — every ex-LOD facet then shows its far-ring quad. _near_lod_on() short-circuits the merge.
 	if _near_lod_on() and _module_world.has_method("lod_covered_fids"):
@@ -3072,6 +3262,10 @@ func _skin_candidate_fids() -> PackedInt32Array:
 	var out := PackedInt32Array([TerrainConfig.active_facet()])
 	if _module_world != null and _module_world.has_method("pool_neighbour_fids"):
 		for f in (_module_world.call("pool_neighbour_fids") as Array):
+			# FP_NB_FULLRES (§2.4): mirror the far-ring's band-conditional set — the skin covers a widened neighbour only
+			# when the far ring also excludes it (imminent/band-meshed), so skin + far-ring + near stay one coherent cover.
+			if _nb_fullres_active and not _nb_excluded_neighbour(int(f)):
+				continue
 			if not out.has(int(f)):
 				out.append(int(f))
 	return out

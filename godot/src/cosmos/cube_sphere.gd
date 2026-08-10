@@ -76,6 +76,24 @@ const POOL_SPAWN_INTERVAL_S := 1.0
 const POOL_MEM_BUDGET_MB := 128
 const POOL_SINGULAR_EXCLUDE := 4
 
+## COSMOS FP_NB_FULLRES (docs/COSMOS-NB-FULLRES-DESIGN.md §2) — full-res near blocks on ALL 4 edge neighbours of the
+## active facet (not just 1 imminent + 1 corner-second, FP2_LIVE_CAP). Byte-off (false) → the shipped FP-M2d residency
+## law verbatim. Live-enabled via the export sed, AFTER the near view settles (`_nb_settled`) and only on-surface. The
+## widened pool is bounded by a MEASURED-bytes post-settle growth budget (NEVER-OOM: enforcement reads real counters,
+## VoxelEngine.get_stats().memory_pools.voxel_used + OS.get_static_memory_usage(), never estimates). NB_BAND_BLOCKS: the
+## view target for the 3 NON-imminent edges — a shallow cross-ridge band (volume ~cubic; 64→48 ≈ ×0.42), the perf knob.
+## NB_POOL_BYTES_CAP: the measured post-settle growth cap for the widened pool. NB_BYTES_REHYST: re-admission hysteresis
+## below the cap (no thrash). NB_EXCL_RELEASE: ridge distance past which a band facet re-enters the far ring (geometric
+## latch-clear, no mesh probe). NB_SPAWN_EST: the per-spawn headroom the admission predicate reserves. NB_ABS_HEAP_MB:
+## the absolute static-heap backstop (ladder step 3 fires immediately above it, independent of B0 drift).
+const FP_NB_FULLRES := false
+const NB_BAND_BLOCKS := 64.0
+const NB_POOL_BYTES_CAP := 32 * 1048576
+const NB_BYTES_REHYST := 8 * 1048576
+const NB_EXCL_RELEASE := 96.0
+const NB_SPAWN_EST := 4 * 1048576
+const NB_ABS_HEAP_MB := 1600
+
 ## COSMOS FP-M2d (docs/COSMOS-FP-M2-DESIGN.md §3.2 / §9) — the Z1-hybrid pool-policy consts (beside the POOL_* family,
 ## §3.2). CONSULTED ONLY under FP_M2_LOD; with the flag off the pool reverts to the shipped FP-M1c policy verbatim
 ## (POOL_MAX_NEIGHBOURS = 4 stays the hard backstop, asserted by G-M1-POOL). D_WARM2: a SECOND live neighbour spawns

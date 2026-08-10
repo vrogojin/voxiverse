@@ -29,7 +29,7 @@ func _ok(c: bool, m: String) -> void:
 		print("  FAIL: ", m)
 
 func _initialize() -> void:
-	print("=== verify_stream_parallel (task #102 Phase A — FP_DEM_DEFER) ===")
+	print("=== verify_stream_parallel (task #102 Phase A — FP_DEM_DEFER + Phase C — FP_NB_FULLRES) ===")
 	if not CubeSphere.FACETED:
 		print("  FAIL: this gate must run with FACETED = true (sed-toggled).")
 		print("==== VERIFY: 0 passed, 1 failed ====")
@@ -47,8 +47,162 @@ func _initialize() -> void:
 	else:
 		_gate_off()
 
+	# Phase C — FP_NB_FULLRES. These run ALWAYS (independent of the DEM flags): the selector gates drive the STATIC
+	# z1_live_targets directly (both fullres modes, so they hold regardless of the compiled FP_NB_FULLRES value), and the
+	# policy gates drive the REAL WorldManager ledger/retire/exclusion helpers against a lightweight module stub.
+	print("--- Phase C: FP_NB_FULLRES (compiled FP_NB_FULLRES=%s) ---" % str(CubeSphere.FP_NB_FULLRES))
+	_gate_nb_off()
+	_gate_nb_cover()
+	_gate_nb_prio()
+	_gate_nb_rebalance()
+	_gate_nb_cap()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# ============================ Phase C — FP_NB_FULLRES gates =====================================================
+# A lightweight stand-in for module_world: only the few methods the WorldManager NB helpers call, all test-controllable.
+# WorldManager._module_world is typed Node3D, so the stub extends Node3D and is assigned directly (no scene / no setup()).
+class _NBModStub extends Node3D:
+	var count := 3
+	var voxel_bytes := 0
+	var ages := {}       # fid → live seconds (default 999 ⇒ past MIN_LIVE_S)
+	var meshed := {}     # fid → bool (pool_seam_meshed)
+	func pool_neighbour_count() -> int: return count
+	func nb_voxel_used_bytes() -> int: return voxel_bytes
+	func pool_age_s(fid: int) -> float: return float(ages.get(int(fid), 999.0))
+	func pool_seam_meshed(fid, _pos) -> bool: return bool(meshed.get(int(fid), false))
+
+func _new_wm(stub) -> WorldManager:
+	var wm := WorldManager.new()
+	wm._module_world = stub
+	return wm
+
+# --- G-SP-NB-OFF: fullres=false ⇒ the selector is byte-identical to the shipped FP-M2d output ------------------------
+func _gate_nb_off() -> void:
+	# Matrix of want/live/off-surface inputs; every fullres=false output must equal the DEFAULT-param output (proving the
+	# added `fullres` tail is inert by default) AND obey the shipped residency law (≤ FP2_LIVE_CAP; imminent + corner-second).
+	var cases := [
+		{"want": {10: 20.0, 11: 40.0, 12: 60.0, 13: 80.0}, "live": [], "off": false},
+		{"want": {10: 20.0, 11: 44.0}, "live": [11], "off": false},          # incumbent hysteresis
+		{"want": {10: 20.0, 11: 90.0}, "live": [], "off": false},            # corner-second beyond D_WARM2 ⇒ dropped
+		{"want": {10: 20.0, 11: 40.0}, "live": [], "off": true},             # off-surface freeze ⇒ []
+	]
+	for c in cases:
+		var d := WorldManager.z1_live_targets(c["want"], c["off"], c["live"], 0.0, false)
+		var dflt := WorldManager.z1_live_targets(c["want"], c["off"], c["live"], 0.0)
+		_ok(d == dflt, "G-SP-NB-OFF: fullres=false == default-param output (added tail inert) — %s" % str(d))
+		_ok(d.size() <= CubeSphere.FP2_LIVE_CAP, "G-SP-NB-OFF: output within FP2_LIVE_CAP(%d) — %s" % [CubeSphere.FP2_LIVE_CAP, str(d)])
+	# The off-surface case is empty (freeze) both modes.
+	_ok(WorldManager.z1_live_targets({10: 20.0}, true, [], 0.0, true).is_empty(), "G-SP-NB-OFF: off-surface freezes even under fullres (=[])")
+
+# --- G-SP-NB-COVER: fullres=true ⇒ imminent-first + ALL remaining edges nearest-first; band-conditional exclusion -----
+func _gate_nb_cover() -> void:
+	# Four edges all inside D_WARM ⇒ the fullres tail returns all 4, imminent-first then ascending ridge distance.
+	var want := {10: 60.0, 11: 20.0, 12: 40.0, 13: 80.0}
+	var t := WorldManager.z1_live_targets(want, false, [], 0.0, true)
+	_ok(t.size() == 4, "G-SP-NB-COVER: all 4 edge neighbours become targets under fullres — %s" % str(t))
+	_ok(int(t[0]) == 11, "G-SP-NB-COVER: index-0 is the imminent (nearest ridge, fid 11)")
+	_ok(t == [11, 12, 10, 13], "G-SP-NB-COVER: tail is nearest-first after the imminent (%s)" % str(t))
+	_ok(t.size() <= CubeSphere.POOL_MAX_NEIGHBOURS, "G-SP-NB-COVER: capped at POOL_MAX_NEIGHBOURS(%d)" % CubeSphere.POOL_MAX_NEIGHBOURS)
+
+	# Band-conditional far-ring exclusion (§2.4 CORRECTION 2) via the REAL WorldManager helpers + a module stub.
+	var stub := _NBModStub.new()
+	var wm := _new_wm(stub)
+	wm._nb_imminent_fid = 11
+	wm._nb_excl_latch = {}
+	stub.meshed = {12: true, 13: false}          # 12's band is up; 13's is not
+	var live := [11, 12, 13]
+	_ok(wm._nb_excluded_neighbour(11), "G-SP-NB-COVER: the imminent is always far-ring-excluded (cover-until-meshed)")
+	_ok(not wm._nb_excluded_neighbour(12), "G-SP-NB-COVER: a live-but-unlatched neighbour is NOT excluded (keeps its far tile — no see-through hole)")
+	wm._nb_update_excl_latch(live, {11: 20.0, 12: 40.0, 13: 60.0}, Vector3.ZERO)   # probes nearest non-imminent = 12 (meshed)
+	_ok(wm._nb_excl_latch.has(12), "G-SP-NB-COVER: band-meshed neighbour latches (<=1 probe/tick, nearest non-imminent first)")
+	_ok(wm._nb_excluded_neighbour(12), "G-SP-NB-COVER: a latched (band-up) neighbour IS excluded (far tile drops, band covers)")
+	_ok(not wm._nb_excl_latch.has(13), "G-SP-NB-COVER: the farther un-probed neighbour is not yet latched (paced probe)")
+	wm._nb_update_excl_latch(live, {11: 20.0, 12: 40.0, 13: 60.0}, Vector3.ZERO)   # next tick probes 13 (not meshed)
+	_ok(not wm._nb_excl_latch.has(13), "G-SP-NB-COVER: an un-meshed band does not latch (stays far-ring-covered)")
+	# Geometric release: 12 walks past NB_EXCL_RELEASE ⇒ its band unloads ⇒ latch clears ⇒ the far tile returns.
+	wm._nb_update_excl_latch(live, {11: 20.0, 12: CubeSphere.NB_EXCL_RELEASE + 10.0, 13: 60.0}, Vector3.ZERO)
+	_ok(not wm._nb_excl_latch.has(12), "G-SP-NB-COVER: latch clears geometrically past NB_EXCL_RELEASE (band gone → far tile back)")
+	wm.free()
+
+# --- G-SP-NB-PRIO: imminent never starved; farthest eviction; imminent never evicted; one viewer (construction) -------
+func _gate_nb_prio() -> void:
+	# The selector always yields the imminent at index 0 — in BOTH modes, and regardless of live incumbency.
+	var want := {10: 30.0, 11: 15.0, 12: 55.0, 13: 70.0}
+	_ok(int(WorldManager.z1_live_targets(want, false, [], 0.0, false)[0]) == 11, "G-SP-NB-PRIO: index-0 = nearest imminent (shipped)")
+	_ok(int(WorldManager.z1_live_targets(want, false, [], 0.0, true)[0]) == 11, "G-SP-NB-PRIO: index-0 = nearest imminent (fullres)")
+
+	var stub := _NBModStub.new()
+	var wm := _new_wm(stub)
+	wm._nb_imminent_fid = 11
+	stub.ages = {10: 999.0, 11: 999.0, 12: 999.0, 13: 5.0}   # 13 younger than MIN_LIVE_S
+	var live := [10, 11, 12, 13]
+	# Same-tick imminent-priority eviction picks the FARTHEST NON-target, never the imminent, honoring MIN_LIVE_S.
+	# targets = {11}; non-targets 10(30),12(55),13(70) but 13 is too young ⇒ farthest eligible = 12.
+	var ev := wm._nb_farthest_retirable(live, [11], want, true, -1.0)
+	_ok(ev == 12, "G-SP-NB-PRIO: same-tick eviction sheds the farthest eligible non-target (fid 12) — got %d" % ev)
+	_ok(ev != 11, "G-SP-NB-PRIO: the index-0 imminent is NEVER evicted (never starved)")
+	_ok(ev != 13, "G-SP-NB-PRIO: a < MIN_LIVE_S neighbour is spared by the eviction (anti-thrash)")
+	# Construction fact: the NB widening adds NO viewer — pool_spawn never attaches one (§1.3). Asserted live-side by
+	# verify_faceted G-M1-POOL (exactly 1 VoxelViewer); nothing in the WorldManager NB policy creates a viewer either.
+	_ok(true, "G-SP-NB-PRIO: one-viewer construction — the NB policy adds no viewer (live authority: verify_faceted G-M1-POOL)")
+	wm.free()
+
+# --- G-SP-NB-REBALANCE: crossing flips the want-set to the new active's 4 edges; paced farthest retire of the far side -
+func _gate_nb_rebalance() -> void:
+	# After a crossing the selector recomputes from the NEW active's want — the old far-side fids simply aren't in it.
+	var new_want := {20: 25.0, 21: 45.0, 22: 65.0, 23: 85.0}
+	var t := WorldManager.z1_live_targets(new_want, false, [10, 11, 12, 13], 0.0, true)   # live = OLD neighbours
+	_ok(t == [20, 21, 22, 23], "G-SP-NB-REBALANCE: targets become the NEW active's 4 edges, nearest-first — %s" % str(t))
+	for old in [10, 11, 12, 13]:
+		_ok(not t.has(old), "G-SP-NB-REBALANCE: old far-side fid %d left the target set" % old)
+
+	# Farthest-first retire order + MIN_LIVE_S anti-thrash on the REAL helper: old neighbours are non-targets (want=1e30
+	# for them), farthest retires first; a just-crossed-back young one is spared.
+	var stub := _NBModStub.new()
+	var wm := _new_wm(stub)
+	wm._nb_imminent_fid = 20
+	stub.ages = {10: 999.0, 11: 999.0, 12: 3.0, 13: 999.0}   # 12 just re-spawned (young) → spared
+	var live := [10, 11, 12, 13, 20]
+	# want has no entry for the old fids ⇒ 1e30 each; the imminent 20 has want 25. farthest-first over the retirable
+	# (non-target, non-imminent, aged) → any of {10,11,13} (all 1e30, tie → last max wins deterministically = 13).
+	var r := wm._nb_farthest_retirable(live, [20, 21, 22, 23], new_want, true, CubeSphere.POOL_D_RETIRE)
+	_ok(r == 10 or r == 11 or r == 13, "G-SP-NB-REBALANCE: a far-side old neighbour is retired first (fid %d, past D_RETIRE)" % r)
+	_ok(r != 12, "G-SP-NB-REBALANCE: the young (< MIN_LIVE_S) neighbour is spared (anti-thrash)")
+	_ok(r != 20, "G-SP-NB-REBALANCE: the imminent is never retired")
+	wm.free()
+
+# --- G-SP-NB-CAP: measured-byte ledger falsifier — breach ⇒ refuse, hysteresis re-admit, never OOM --------------------
+func _gate_nb_cap() -> void:
+	var stub := _NBModStub.new()
+	var wm := _new_wm(stub)
+	stub.count = 3
+	stub.voxel_bytes = 0
+	wm._nb_b0_bytes = wm._nb_measured_bytes()     # snapshot B0 with zero NB voxel bytes (static-heap term ~cancels in growth)
+	wm._nb_breached = false
+	print("  [G-SP-NB-CAP] measured B0 = %.2f MB (voxel_used + static heap); cap = %d MB, rehyst = %d MB" % [
+		wm._nb_b0_bytes / 1048576.0, CubeSphere.NB_POOL_BYTES_CAP / 1048576, CubeSphere.NB_BYTES_REHYST / 1048576])
+	_ok(wm._nb_ledger_admit(), "G-SP-NB-CAP: admits a widened spawn under budget (growth ~0)")
+	_ok(not wm._nb_breached, "G-SP-NB-CAP: not breached under budget")
+	# Push simulated NB voxel growth over the cap ⇒ refuse + breach latched.
+	stub.voxel_bytes = CubeSphere.NB_POOL_BYTES_CAP + CubeSphere.NB_SPAWN_EST + 2 * 1048576
+	_ok(not wm._nb_ledger_admit(), "G-SP-NB-CAP: over-cap growth ⇒ widened spawn REFUSED (breach ladder step 1)")
+	_ok(wm._nb_breached, "G-SP-NB-CAP: breach latched")
+	# In the hysteresis band (below cap but above cap − REHYST) it stays breached (no thrash).
+	stub.voxel_bytes = CubeSphere.NB_POOL_BYTES_CAP - int(CubeSphere.NB_BYTES_REHYST / 2)
+	_ok(not wm._nb_ledger_admit(), "G-SP-NB-CAP: still refused inside the hysteresis band (no thrash)")
+	_ok(wm._nb_breached, "G-SP-NB-CAP: breach held in the hysteresis band")
+	# Below cap − REHYST ⇒ re-admission, breach cleared.
+	stub.voxel_bytes = CubeSphere.NB_POOL_BYTES_CAP - CubeSphere.NB_BYTES_REHYST - 3 * 1048576
+	_ok(wm._nb_ledger_admit(), "G-SP-NB-CAP: re-admits only below cap − REHYST (hysteresis)")
+	_ok(not wm._nb_breached, "G-SP-NB-CAP: breach cleared below cap − REHYST")
+	# Empty widened pool ⇒ B0 re-baselines (drift honesty), never a stuck breach.
+	stub.count = 0
+	stub.voxel_bytes = CubeSphere.NB_POOL_BYTES_CAP * 4     # even absurd foreign bytes: empty pool re-baselines
+	_ok(wm._nb_ledger_admit() and not wm._nb_breached, "G-SP-NB-CAP: empty widened pool re-baselines B0 (never a stuck breach)")
+	print("  [G-SP-NB-CAP] NOTE: live per-neighbour resident bytes are the verify_faceted G-M1-MEM authority (real spawn); this gate falsifies the ENFORCEMENT logic on measured counters.")
+	wm.free()
 
 # --- G-SP-OFF: FP_DEM_DEFER off ⇒ DEM byte-identical to today --------------------------------------------------------
 func _gate_off() -> void:

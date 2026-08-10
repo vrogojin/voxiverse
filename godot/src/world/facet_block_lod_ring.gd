@@ -478,7 +478,7 @@ func _build_facet_arrays(fid: int, lvl_override: Dictionary = {}) -> Dictionary:
 			# Temperature for the palette (snow-cap / frozen-or-lava sea) — sampled once per emitted coarse column,
 			# the SAME profile the far ring reads. id/water come from the decimated pyramid (majority / OR).
 			var t: float = TerrainConfig.facet_profile(fid, lx, lz).w
-			var c := FarPalette.color_for(top[ci], int(idb[ci]), t, wat[ci] != 0)
+			var c := FarPalette.skin_color_at(fid, lx, lz, top[ci], int(idb[ci]), t)
 			cols[ci] = c
 			col32[ci] = _rgba8(c)
 

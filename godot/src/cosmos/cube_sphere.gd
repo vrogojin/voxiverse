@@ -549,6 +549,21 @@ const FP_SKIN_BLOCK_EXACT := false
 ## NEVER-OOM: a handful of extra Color values, zero allocation. Gate: verify_far_color_unified.gd (G-FCU).
 const FP_FAR_COLOR_UNIFIED := false
 
+## FP_SKIN_BLOCK_COLOR (docs/COSMOS-SKIN-BLOCK-COLOR-DESIGN.md) — extends FP_SKIN_BLOCK_EXACT's block-exact
+## colour law (far_color_index_of_block(top_block_id(...))) to the THREE color_for consumer groups
+## FP_FAR_COLOR_UNIFIED could only approximate: the far-ring shell/backstop/envelope tiers (facet_far_ring.gd,
+## 7 call sites), the FacetSmoothV2 relief annulus (facet_smooth_v2.gd), and block-LOD (facet_block_lod_ring.gd,
+## shared by the orbit/global tiers). Pure GDScript — no engine rebuild; the C++ block-exact machinery
+## (skin_block_exact / deco_far_idx, patch 0011) already covers the one tier that computes colour in C++ (the
+## fine map) and needs no change. Per-column x,z for the taiga-podzol hash speckle resolved via
+## FacetAtlas.world_to_lattice64 (the SAME inverse-lattice tool facet_tex_baker.gd already uses) from each
+## site's existing world-space sample point; colour resolved via FarPalette.color_for_block, the WORKER-SAFE
+## quantised sibling of _top_color (these builders all run on WorkerThreadPool — _top_color/mean_color_of is
+## not safe there, see far_palette.gd's ensure_far_index_ready comment). Default false ⇒ every site's else
+## branch calls color_for exactly as shipped (byte-identical; FLAT verify_feature.gd unmoved). NEVER-OOM: zero
+## new bytes (reuses _block_idx / _fc_rgb, already resident). Gate: verify_skin_block_color.gd (G-SBC).
+const FP_SKIN_BLOCK_COLOR := false
+
 ## COSMOS BLOCK-LOD Phase 1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §A2) — the far ring EMITS BLOCKS instead of the smooth
 ## welded surface. Per existing grid cell: a FLAT top at height = MIN(the cell's 4 corner radii) + vertical side walls
 ## on every internal height step (watertight) + a facet-edge skirt. Reuses every existing far-ring cache/warm/async

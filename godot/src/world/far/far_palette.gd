@@ -237,6 +237,47 @@ static func far_color_index_of_block(block_id: int) -> int:
 		return _block_idx[block_id]
 	return 0                                        # AIR / out of range → index 0 (no texture load on the worker)
 
+## FP_SKIN_BLOCK_COLOR (docs/COSMOS-SKIN-BLOCK-COLOR-DESIGN.md): the worker-safe block-exact Color for a
+## block id — quantised to the SAME frozen 14-entry palette the fine map / tile-bake tier already draws
+## from, via far_color_index_of_block's precomputed LUT. Deliberately NOT _top_color()/mean_color_of()
+## (that path load()s a texture on first touch — unsafe on the WorkerThreadPool tasks facet_far_ring.gd /
+## facet_smooth_v2.gd / facet_block_lod_ring.gd build on, per the CRITICAL comment on ensure_far_index_ready
+## above). Pure array reads only.
+static func color_for_block(block_id: int) -> Color:
+	var idx := far_color_index_of_block(block_id)
+	var j := idx * 3
+	return Color(_fc_rgb[j], _fc_rgb[j + 1], _fc_rgb[j + 2])
+
+## FP_SKIN_BLOCK_COLOR (docs/COSMOS-SKIN-BLOCK-COLOR-DESIGN.md §1.3): THE per-vertex colour law swap, the single
+## home shared by every color_for consumer this flag reaches (facet_far_ring.gd's 7 sites incl. _weld_node,
+## facet_smooth_v2.gd's build_tile, facet_block_lod_ring.gd's _build_facet_arrays). Off (shipped) ⇒ color_for's
+## biome-blend verbatim — byte-identical. On ⇒ resolve the ACTUAL top block at lattice column (lx,lz):
+## TerrainConfig.top_block_id resolves the block (already subsumes sea/snow — no separate clamped_sea branch
+## needed) and color_for_block above supplies the WORKER-SAFE quantised colour (never _top_color/mean_color_of —
+## every one of this flag's consumers builds on WorkerThreadPool). `g/biome/t` are the SAME profile values the
+## shipped color_for call already consumes. Use this overload directly when the caller already has an integer
+## lattice column (e.g. facet_block_lod_ring.gd's decimated-pyramid loop); use `skin_color` below when the
+## caller only has a world-space sample point. `on` defaults to the compiled const so every production call
+## site is unaffected; it is an explicit param (not read internally) ONLY so verify_skin_block_color.gd can
+## drive both branches in one run without sed-toggling the compile-time flag — the SAME idiom
+## FarPalette._biome_tints(unified: bool) already established for FP_FAR_COLOR_UNIFIED's gate.
+static func skin_color_at(fid: int, lx: int, lz: int, g: int, biome: int, t: float, on := CubeSphere.FP_SKIN_BLOCK_COLOR) -> Color:
+	if on:
+		var top_id := TerrainConfig.top_block_id(g, biome, t, lx, lz)
+		return color_for_block(top_id)
+	return color_for(g, biome, t, g < TerrainConfig.SEA_LEVEL)
+
+## As `skin_color_at`, for callers that only have a world-space sample point (`wx,wy,wz`, any point on the sample
+## ray at radius ~R_BLOCKS — a planar bilerp's bx,by,bz, or a welded direction's d*R) instead of an integer
+## lattice column. The taiga-podzol hash speckle (`_biome_top`'s only per-column dependency) needs a
+## representative (x,z), not sub-block precision, so the round-trip through FacetAtlas.world_to_lattice64 (the
+## SAME inverse-lattice tool facet_tex_baker.gd already uses for its fine-map bake) is exact enough.
+static func skin_color(fid: int, wx: float, wy: float, wz: float, g: int, biome: int, t: float, on := CubeSphere.FP_SKIN_BLOCK_COLOR) -> Color:
+	if not on:
+		return color_for(g, biome, t, g < TerrainConfig.SEA_LEVEL)
+	var l := FacetAtlas.world_to_lattice64(fid, wx, wy, wz)
+	return skin_color_at(fid, int(round(l[0])), int(round(l[2])), g, biome, t, on)
+
 ## The whole block_id → far-palette-index LUT (== _block_idx). FP_CPP_TILE_BAKE hands this frozen to the C++
 ## generator (config "deco_far_idx") so bake_far_tile's tree branch resolves a decoration id → palette index in C++
 ## with zero GDScript, byte-equal to far_color_index_of_block. Built main-thread by ensure_far_index_ready.

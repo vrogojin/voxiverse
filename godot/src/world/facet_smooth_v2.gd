@@ -52,8 +52,10 @@ enum { EDGE_WEST = 0, EDGE_EAST = 1, EDGE_SOUTH = 2, EDGE_NORTH = 3 }
 ##                                          radial placement — no re-derivation, no rounding beyond the native bake).
 ##   nrm : PackedVector3Array              RADIAL direction (`dir`) at every node — V2-1 is radial-shade-only
 ##                                          near-parity (§2.2); a real per-cell relief normal is V2-2 (FP_SMOOTH_V2_LIT).
-##   col : PackedColorArray                `FarPalette.color_for(g, biome, temp, water)` of THIS node's own baked
-##                                          values — becomes the per-CELL flat colour by construction (§2.3 below).
+##   col : PackedColorArray                `FarPalette.skin_color(...)` (FP_SKIN_BLOCK_COLOR-aware; shipped ⇒
+##                                          FarPalette.color_for(g, biome, temp, water) verbatim) of THIS node's
+##                                          own baked values — becomes the per-CELL flat colour by construction
+##                                          (§2.3 below).
 ##   idx : PackedInt32Array 2 tris/cell     BOTH triangles of cell (gi,gj) end at node (gi+1,gj+1) — see the winding
 ##                                          comment in the loop below (the whole provoking-vertex trick).
 static func build_tile(fid: int, cells: int, gen: Object) -> Dictionary:
@@ -83,7 +85,8 @@ static func build_tile(fid: int, cells: int, gen: Object) -> Dictionary:
 		pos[vi] = b_pos[vi]
 		nrm[vi] = b_dir[vi]
 		var g := int(b_g[vi])
-		col[vi] = FarPalette.color_for(g, int(b_biome[vi]), float(b_temp[vi]), g < TerrainConfig.SEA_LEVEL)
+		var d := b_dir[vi]
+		col[vi] = FarPalette.skin_color(fid, d.x * r_datum, d.y * r_datum, d.z * r_datum, g, int(b_biome[vi]), float(b_temp[vi]))
 
 	var idx := PackedInt32Array()
 	idx.resize(cells * cells * 6)

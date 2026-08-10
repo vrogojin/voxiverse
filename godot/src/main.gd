@@ -320,6 +320,10 @@ func _process(_delta: float) -> void:
 	# (the WorldManager/ring setters self-guard) ⇒ byte-identical.
 	if _player != null and _cosmos_sky != null and CubeSphere.FP_SMOOTH_V2 and CubeSphere.FACETED:
 		_player.world.set_smooth_v2_sun_dir(_cosmos_sky.current_sun_dir())
+	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): forward the Sun direction into G3's own
+	# (separate-from-V2's/the-shell's) material each frame. No-op with no faceted ring / flag off ⇒ byte-identical.
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_ORBIT_RELIEF and CubeSphere.FACETED:
+		_player.world.set_orbit_relief_sun_dir(_cosmos_sky.current_sun_dir())
 	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
 	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
 	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),

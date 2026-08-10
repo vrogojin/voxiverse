@@ -861,6 +861,14 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var tx = world.call("tex_telemetry")
 			if tx is Dictionary and not (tx as Dictionary).is_empty():
 				msg.merge(tx as Dictionary)
+			# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99): the G2 whole-planet relief DEM bake ledger
+			# (g2_baked/g2_total/g2_bytes), so a live session shows the coarse-DEM sweep converging (and, with
+			# FP_RELIEF_REEMIT on, explains any late mountain-shade pop-in). ADDITIVE + empty-dict-guarded: {} with
+			# FP_GLOBAL_RELIEF_DATA off / _relief_data null ⇒ nothing stamped (byte-identical stream).
+			if world.has_method("relief_data_telemetry"):
+				var rt = world.call("relief_data_telemetry")
+				if rt is Dictionary and not (rt as Dictionary).is_empty():
+					msg.merge(rt as Dictionary)
 
 
 ## Capture the game canvas and send it as a binary JPEG frame, unless a capture is already inflight

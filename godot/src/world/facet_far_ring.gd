@@ -68,6 +68,14 @@ var _smooth_v2 = null
 # is on; every other tier (dense backstop, weld, env variants) is UNTOUCHED this pass (Stage-1b scope: base grid
 # only — the tier a player actually sees from orbit with default flags).
 var _relief_shade: GlobalReliefData = null
+# FP_RELIEF_REEMIT (task #99 follow-up, docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md): fids whose G2 DEM just
+# finished baking AFTER their `_col_cache` entry was already built (so the shade multiply above was 1.0 —
+# stale). `relief_baked` (below) is the only writer; `_drain_relief_dirty` (below, called from `_process`) is
+# the only reader — drains a bounded batch, rate-capped, and re-derives just those fids' cache via
+# `_ensure_cached(fid, true)`. Empty + inert with the flag off (byte-identical).
+var _relief_dirty: Dictionary = {}      # fid -> true
+var _relief_last_reemit_ms := 0         # last drain wall-ms (rate-limited to >= CubeSphere.CULL_REBUILD_MS apart)
+const RELIEF_REEMIT_MAX_PER_DRAIN := 8  # churn-safe cap: a burst of completions re-emits at most this many per drain
 var _smooth_assign: Dictionary = {}   # fid -> tier (S3/S4/S5): the driver's own hysteresis-held request state (P1)
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q1 (FP_SMOOTH_IDLE): the driver's own fixpoint-at-rest cache.
 # `_smooth_idle_sig` is the (active_fid, excluded-set) signature `_smooth_drive` computed LAST call; when a fresh call
@@ -1246,6 +1254,11 @@ var _dbg_env_ms := 0.0
 
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
+	# FP_RELIEF_REEMIT (task #99 follow-up): cheap no-op when nothing is dirty; otherwise rate-capped internally
+	# (see _drain_relief_dirty). Placed before every early-return branch below so a dirty batch always gets its
+	# throttled chance to drain regardless of which regime (boot warm / async / orbit idle / surface) the rest of
+	# this frame takes — it only flips _pending, never dispatches a rebuild itself, so it cannot race those paths.
+	_drain_relief_dirty()
 	if _smooth != null:
 		var _t_drv := Time.get_ticks_usec()
 		_smooth_drive()   # FP_FAR_SMOOTH (P1): worker-baked smooth REPLACEMENT ladder for the visible hemisphere (runs every frame)
@@ -4869,6 +4882,45 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 ## identical off (the flag itself is a second independent guard on top of this).
 func set_relief_data(rd: GlobalReliefData) -> void:
 	_relief_shade = rd
+
+## FP_RELIEF_REEMIT (task #99 follow-up): `WorldManager` calls this once per `GlobalReliefData.step()` call with
+## the fid it just finished baking (or never, if step() returned -1 — nothing to do). Marks `fid` dirty ONLY if
+## it is already resident in `_col_cache` (an uncached facet needs no correction — it will bake WITH the now-
+## ready shade the first time `_ensure_cached` ever builds it). Pure bookkeeping — no rebuild happens here; the
+## actual re-derive is rate-capped in `_drain_relief_dirty` below. Off ⇒ a single cheap flag check, byte-identical.
+func relief_baked(fid: int) -> void:
+	if not CubeSphere.FP_RELIEF_REEMIT:
+		return
+	if fid < 0 or not _col_cache.has(fid):
+		return
+	_relief_dirty[fid] = true
+
+## FP_RELIEF_REEMIT: drain a bounded batch of `_relief_dirty` fids, re-deriving their `_col_cache` (and, harmlessly,
+## `_pos_cache` — the shade multiply never touches position) via `_ensure_cached(fid, true)` now that their G2 DEM
+## has landed. CHURN-SAFE by construction: at most `RELIEF_REEMIT_MAX_PER_DRAIN` fids drained, and drains
+## themselves are rate-limited to >= `CubeSphere.CULL_REBUILD_MS` apart (reusing the SAME interval the cull
+## re-emit throttle already uses) — so even every one of 3456 facets completing in the same frame only ever
+## re-emits a bounded handful before the next throttled pass picks up more. Never calls `force_rebuild()` itself
+## (that is a heavy synchronous whole-mesh rebuild reserved for gates/crossings) — it only flips `_pending`, the
+## SAME "a rebuild is owed" signal every other re-emit trigger in this file already sets, so the actual commit
+## rides the EXISTING throttled emit pipeline (`_process`'s warm/emit branches below). Called once per `_process`
+## (cheap no-op when `_relief_dirty` is empty). Off ⇒ `_relief_dirty` never gets populated (relief_baked no-ops)
+## ⇒ this is an unreachable empty-check every frame, byte-identical.
+func _drain_relief_dirty() -> void:
+	if _relief_dirty.is_empty():
+		return
+	var now_ms := Time.get_ticks_msec()
+	if now_ms - _relief_last_reemit_ms < CubeSphere.CULL_REBUILD_MS:
+		return
+	var n := 0
+	for fid in _relief_dirty.keys():
+		if n >= RELIEF_REEMIT_MAX_PER_DRAIN:
+			break
+		_relief_dirty.erase(fid)
+		_ensure_cached(fid, true)
+		n += 1
+	_relief_last_reemit_ms = now_ms
+	_pending = true
 
 ## FP_FAR_TERMINATOR_WELD telemetry: the shell material's OWN live `sun_dir` uniform (the sun-echo, `sd_shell`),
 ## whichever shader is currently on `_mi.material_override` (v2-absolute / tint / biased-tier). (1,0,0) sentinel

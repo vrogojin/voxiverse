@@ -732,6 +732,23 @@ const FP_CPP_SMOOTH_BAKE := false
 const FP_GLOBAL_RELIEF_DATA := false
 const FP_SKIN_RELIEF_SHADE := false
 
+## `FP_RELIEF_REEMIT` (docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md, task #99 follow-up) — fixes the reason
+## `FP_SKIN_RELIEF_SHADE` never visibly darkens mountains on a static/orbiting camera: `FacetFarRing._ensure_cached`
+## applies the G1a hillshade multiply ONCE, when a facet's `_col_cache` is first built; `GlobalReliefData.step()`
+## bakes AT MOST ONE facet's DEM per frame (the governed pacer), so most facets are cached (shade=1.0, un-baked
+## default) LONG BEFORE their own DEM finishes — and with no player motion nothing else ever re-runs `_ensure_cached`
+## for them, so the multiply-by-1.0 colour is permanent. This flag closes that gap WITHOUT a re-emit storm
+## (the REV7 lesson: never invalidate the whole shell at once): `GlobalReliefData.step()` already RETURNS the fid
+## it just baked (or -1) — `WorldManager` forwards that fid to `FacetFarRing.relief_baked(fid)`, which marks it
+## dirty ONLY if it is already resident in `_col_cache` (an uncached facet needs nothing — it bakes WITH shade the
+## first time it's ever built). Dirty fids drain in `_process`, capped to `RELIEF_REEMIT_MAX_PER_DRAIN` per drain
+## and drains themselves rate-limited to ≥ `CULL_REBUILD_MS` apart (the SAME 250 ms interval the existing cull
+## re-emit throttle uses) — so even a pathological all-3456-complete-at-once burst re-emits a bounded handful of
+## facets, never the whole shell, and the actual mesh commit reuses the EXISTING throttled `_pending` re-emit
+## pipeline (just sets `_pending = true`) rather than a new synchronous rebuild call. Off ⇒ `relief_baked` is a
+## single cheap flag check (byte-identical; FLAT verify_feature.gd unmoved). Gate: verify_relief_reemit.gd (G-RR).
+const FP_RELIEF_REEMIT := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

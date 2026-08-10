@@ -1242,7 +1242,11 @@ func update_streaming(player_pos: Vector3) -> void:
 		if _g2_last_frame_usec > 0:
 			_g2_frame_ms = minf(float(_g2_now_usec - _g2_last_frame_usec) / 1000.0, CubeSphere.CTRL_FRAME_SAMPLE_CLAMP_MS)
 		_g2_last_frame_usec = _g2_now_usec
-		_relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms)
+		# FP_RELIEF_REEMIT (task #99 follow-up): step() returns the fid it just baked (or -1) — forward it so the
+		# ring can catch up any ALREADY-cached facet whose shade multiply ran before its DEM was ready. The ring's
+		# own relief_baked() no-ops under the flag/off-cache, so this is a single cheap call either way.
+		var _g2_baked_fid := _relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms)
+		_facet_ring.relief_baked(_g2_baked_fid)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync

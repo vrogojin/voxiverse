@@ -100,6 +100,21 @@ func height_at(fid: int, i: int, j: int) -> int:
 		return 0
 	return _heights.decode_s16((fid * NODES_PER_FACET + j * NODES_PER_EDGE + i) * 2)
 
+## FP_ORBIT_RELIEF (docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md §1.2): a facet's WHOLE height grid as one flat,
+## immutable snapshot (row-major j*NODES_PER_EDGE+i), for the caller to hand to a WorkerThreadPool tile build.
+## MUST be called on the MAIN THREAD, before dispatch — `_heights` is an ONGOING-write array (`bake_facet` keeps
+## filling it live during gameplay, unlike `FacetAtlas`'s write-once-then-read-only atlas tables), so a worker
+## reading it directly would be a data race; this copies the one facet's 1089 values into a private
+## `PackedInt32Array` the worker can safely own. All-zero (the same neutral default `height_at` returns) if the
+## facet isn't baked yet. Cheap: 1089 `decode_s16` reads, once per dispatch, not per frame.
+func height_grid(fid: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	out.resize(NODES_PER_FACET)
+	for j in range(NODES_PER_EDGE):
+		for i in range(NODES_PER_EDGE):
+			out[j * NODES_PER_EDGE + i] = height_at(fid, i, j)
+	return out
+
 ## G1a shade [0,1] at the same node grid. 1.0 (no darkening) if not ready/baked/flag-off — a safe neutral default,
 ## never a black hole where data hasn't landed yet.
 func shade_at(fid: int, i: int, j: int) -> float:

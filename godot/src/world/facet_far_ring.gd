@@ -68,6 +68,10 @@ var _smooth_v2 = null
 # is on; every other tier (dense backstop, weld, env variants) is UNTOUCHED this pass (Stage-1b scope: base grid
 # only — the tier a player actually sees from orbit with default flags).
 var _relief_shade: GlobalReliefData = null
+# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3, FP_ORBIT_RELIEF): the real relief-geometry tier —
+# constructed lazily in `set_relief_data` (the same hand-off point, since it needs the SAME GlobalReliefData
+# instance). null off (inert). Independent of `_smooth_v2`/`_relief_shade` — a separate MeshInstance3D child.
+var _orbit_relief = null
 # FP_RELIEF_REEMIT (task #99 follow-up, docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md): fids whose G2 DEM just
 # finished baking AFTER their `_col_cache` entry was already built (so the shade multiply above was 1.0 —
 # stale). `relief_baked` (below) is the only writer; `_drain_relief_dirty` (below, called from `_process`) is
@@ -578,6 +582,10 @@ func set_active(new_fid: int) -> void:
 	# recomputed ONLY here, on a real crossing. No-op / null with the flag off.
 	if _smooth_v2 != null:
 		_smooth_v2.set_active(new_fid)
+	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3): the relief-mesh tier's want-set ALSO depends on
+	# active_fid (V2's excluded footprint moves with it) — force a recompute on every crossing, same as V2.
+	if _orbit_relief != null:
+		_orbit_relief.set_active(new_fid)
 	# COSMOS-ORBITAL-SHELL live fix: in orbit the emitted set is CAMERA-axis-driven (not active-facet-driven), and the
 	# mesh is absolute (the transform re-place above already follows the new active facet), so a facet crossing does
 	# NOT change the emitted set — its _pending would force a redundant full rebuild every ~3 frames as the active
@@ -1267,6 +1275,11 @@ func _process(_dt: float) -> void:
 	# mesh if anything changed. Cheap at rest (fast no-op scans). No-op / null with the flag off.
 	if _smooth_v2 != null:
 		_smooth_v2.step()
+	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3): reap builds/evictions + rate-capped whole-surface
+	# commit for the relief-mesh tier. Cheap at rest (no dirty tiles, no in-flight slots ⇒ fast no-op scans).
+	# No-op / null with the flag off (byte-identical).
+	if _orbit_relief != null:
+		_orbit_relief.step()
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -2898,6 +2911,19 @@ func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
 ## facet's on-screen blocks. 0 until the camera-set driver has run ⇒ the baker's SSE law falls back to the regime path.
 func shell_cam_dist() -> float: return _dbg_d
 func shell_emit_cos() -> float: return _emit_cos                # cos(θ_emit): the current emit threshold
+## FP_ORBIT_RELIEF (docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md §2): the TRUE horizon-tangent angle θ_h at the last
+## snapshot (distinct from θ_emit above, which is θ_h PLUS the relief/slack margin) — the SAME value
+## `_refresh_limb_set`'s silhouette-ring test already reads. -1.0 (sentinel: no snapshot yet / on-surface) until
+## the camera-set law has engaged at least once.
+func shell_emit_thetah() -> float: return _emit_thetah_last
+## FP_ORBIT_RELIEF (docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md §1.4): a SAFE cross-thread snapshot of the shell's
+## own `_col_cache[fid]` (the CELLS=4 coarse colour grid) — `.duplicate()`, never the live reference, so a
+## `FacetOrbitRelief` worker can safely own a copy (see that class's thread-safety note). Empty if the shell
+## hasn't cached `fid` yet.
+func col_cache_for(fid: int) -> PackedColorArray:
+	if not _col_cache.has(fid):
+		return PackedColorArray()
+	return (_col_cache[fid] as PackedColorArray).duplicate()
 func coarse_cache_size() -> int: return _pos_cache.size()       # S2: how many facets' coarse caches are warmed (prewarm ≤ 6·K²)
 func prewarm_cursor() -> int: return _prewarm_cursor            # S2: prewarm progress (≥ 6·K² ⇒ one-shot complete)
 
@@ -4882,6 +4908,13 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 ## identical off (the flag itself is a second independent guard on top of this).
 func set_relief_data(rd: GlobalReliefData) -> void:
 	_relief_shade = rd
+	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3): construct the relief-mesh tier here — the first (and
+	# only) point the ring is handed the shared GlobalReliefData instance it needs. Off ⇒ never constructed
+	# (byte-identical); a rd==null push (e.g. FP_GLOBAL_RELIEF_DATA off) also leaves it uninstantiated (the tier
+	# is meaningless without real DEM data to read).
+	if CubeSphere.FP_ORBIT_RELIEF and rd != null and _orbit_relief == null:
+		_orbit_relief = FacetOrbitRelief.new()
+		_orbit_relief.setup_instance(self, _active_fid, rd)
 
 ## FP_RELIEF_REEMIT (task #99 follow-up): `WorldManager` calls this once per `GlobalReliefData.step()` call with
 ## the fid it just finished baking (or never, if step() returned -1 — nothing to do). Marks `fid` dirty ONLY if

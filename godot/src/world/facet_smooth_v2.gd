@@ -298,11 +298,15 @@ static func shader_code() -> String:
 
 ## FP_FAR_TERMINATOR_WELD: the last live Sun direction any FacetSmoothV2 instance was fed via `set_sun_dir`
 ## (a class-level static — the annulus is rebuilt on facet crossings, so this outlives any one instance).
-## Read by `_make_material` to seed a REBUILT material with the live Sun instead of the hardcoded (1,0,0)
-## fake-noon default. Off ⇒ never written, `_make_material` never reads it ⇒ byte-identical.
+## Read by `make_material` to seed a REBUILT material with the live Sun instead of the hardcoded (1,0,0)
+## fake-noon default. Off ⇒ never written, `make_material` never reads it ⇒ byte-identical.
 static var _last_sun_dir := Vector3(1.0, 0.0, 0.0)
 
-static func _make_material() -> ShaderMaterial:
+## Public (not `_`-prefixed): `FacetOrbitRelief` (docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md §1.6) reuses this
+## verbatim for its own material — G3's mesh carries real per-vertex relief normals (unlike V2's flat/radial
+## shading), so the LIT shader family this already builds is exactly where that information gets used, with
+## zero new shader source.
+static func make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
 	var sh := Shader.new()
 	sh.code = shader_code()
@@ -352,7 +356,7 @@ var _last_commit_ms := 0.0
 ## `ring` is the owning FacetFarRing (any Node3D works — only `add_child`/transform inheritance is used).
 func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_active_fid = active_fid
-	_material = _make_material()
+	_material = make_material()
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetSmoothV2Mesh"
 	_mi.mesh = ArrayMesh.new()
@@ -497,8 +501,8 @@ func set_sun_dir(sun_dir: Vector3) -> void:
 	if _material != null:
 		_material.set_shader_parameter("sun_dir", sun_dir)
 	# FP_FAR_TERMINATOR_WELD: also record the live value in the class-level cache so the NEXT rebuilt instance
-	# (facet crossing) seeds from it in `_make_material` instead of the hardcoded default. Off ⇒ no-op write to
-	# a var `_make_material` never reads ⇒ byte-identical.
+	# (facet crossing) seeds from it in `make_material` instead of the hardcoded default. Off ⇒ no-op write to
+	# a var `make_material` never reads ⇒ byte-identical.
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		_last_sun_dir = sun_dir
 

@@ -749,6 +749,45 @@ const FP_SKIN_RELIEF_SHADE := false
 ## single cheap flag check (byte-identical; FLAT verify_feature.gd unmoved). Gate: verify_relief_reemit.gd (G-RR).
 const FP_RELIEF_REEMIT := false
 
+## FP_ORBIT_RELIEF ("G3", docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md) — real far-terrain 3D relief GEOMETRY from
+## orbit: mountains rise, valleys/cliffs drop, visible in silhouette on the limb and on descent. SUPERSEDES the
+## rejected shading-only fix (FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT above — user verdict after the live A/B:
+## "still looks flat, no sense in shaded relief"). A new `FacetOrbitRelief` tier (facet_orbit_relief.gd),
+## architecturally a sibling of FacetSmoothV2 (reuses its `hop_annulus`/`merge_tiles` statics verbatim, and its
+## `make_material` — G3's mesh carries real per-vertex relief normals, unlike V2's flat/radial shading, so the
+## SAME lit shader family is exactly where that information gets used) but reading heights PURELY from the
+## already-baked `GlobalReliefData` DEM (`height_grid`) — ZERO live worldgen sampling at G3 build time, the
+## structural fix for the shelved S-ladder's warmup-convoy failure class. Requires FP_GLOBAL_RELIEF_DATA (reads
+## its heights); independent of FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT (neither required nor conflicting).
+##
+## COVERAGE (§2 of the design doc): `FacetOrbitRelief.want_set` ranks every candidate facet by
+## `min(distance-from-nadir, distance-from-the-horizon-ring)` — ONE law, no altitude branch — so BOTH the near-
+## nadir foreground AND the visible silhouette (the limb the orbit camera actually holds on screen) rank
+## highest, truncated to `ORBIT_RELIEF_MAX_TILES`; only the visually least-interesting MIDDLE band gets trimmed
+## first when the candidate set exceeds the cap. Excludes `active_fid`'s own V2 hop≤4 footprint (finer pitch
+## already covers that ground). Recomputed on facet crossings + a throttled `ORBIT_RELIEF_AXIS_MS` timer while
+## the view axis drifts without a crossing (bounds mesh CHURN, not raw compute — the O(facet_count) ranking scan
+## itself is cheap, a few thousand dot products).
+##
+## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × ≈76,488 B/tile (`FacetOrbitRelief.tile_bytes`'s own accounting:
+## 33²=1089 verts × (pos 12 + col 16 + nrm 12) + 32²·2·3 core indices ×4B + a 4-edge skirt ≈ 33×4 verts + indices
+## — mirrors `FacetSmoothV2.tile_bytes`'s exact per-component pricing) ≈ 29.4 MB — comfortably above the ~330-
+## facet whole-visible-cap estimate at the design doc's reference altitude (alt≈1500, θ_h≈36°: (1-cos36°)/2 ×
+## 3456 ≈ 330), so no truncation is needed there; at higher altitudes the priority law truncates gracefully,
+## keeping both nadir and limb dense. A hard cap enforced at `want_set` selection time, before dispatch — the
+## tier can never grow past it regardless of the nominal candidate count. Memory is not the binding constraint
+## here (well inside the 2048 MB ceiling); the real cost is the whole-surface `generate_normals()` commit, rate-
+## capped to `ORBIT_RELIEF_COMMIT_MS` apart (the REV7 apply-bound lesson, applied to the commit specifically —
+## dispatch itself is bounded by free worker slots, not rate-limited separately).
+##
+## Off ⇒ `FacetOrbitRelief` never constructed, byte-identical (FLAT verify_feature.gd unmoved).
+## Gate: verify_orbit_relief.gd (G-OR-OFF/DATA-EQ/BYTES/WELD/PACE).
+const FP_ORBIT_RELIEF := false
+const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈29.4 MB at ≈76,488 B/tile (see doc above)
+const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
+const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between whole-surface generate_normals() commits
+const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

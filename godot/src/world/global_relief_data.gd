@@ -106,13 +106,23 @@ func height_at(fid: int, i: int, j: int) -> int:
 ## filling it live during gameplay, unlike `FacetAtlas`'s write-once-then-read-only atlas tables), so a worker
 ## reading it directly would be a data race; this copies the one facet's 1089 values into a private
 ## `PackedInt32Array` the worker can safely own. All-zero (the same neutral default `height_at` returns) if the
-## facet isn't baked yet. Cheap: 1089 `decode_s16` reads, once per dispatch, not per frame.
+## facet isn't baked yet. Cheap: 1089 `decode_s16` reads — but `FacetOrbitRelief` was calling this on EVERY
+## dispatch even for an already-baked (therefore IMMUTABLE) facet, redoing the same 1089 reads repeatedly.
+## PERF FIX WS1d (live A/B follow-up): cache the snapshot PER FID once the facet is truly baked (`bake_facet`
+## never re-bakes an already-baked facet — idempotent no-op — so a baked facet's heights can never change again,
+## making this cache permanently valid; a call BEFORE baking is deliberately left uncached, so a LATER real bake
+## is still correctly picked up next call). Main-thread only (matches every other caller of this function).
+var _height_grid_cache: Dictionary = {}   # fid -> PackedInt32Array, lazily cached once baked
 func height_grid(fid: int) -> PackedInt32Array:
+	if _height_grid_cache.has(fid):
+		return _height_grid_cache[fid]
 	var out := PackedInt32Array()
 	out.resize(NODES_PER_FACET)
 	for j in range(NODES_PER_EDGE):
 		for i in range(NODES_PER_EDGE):
 			out[j * NODES_PER_EDGE + i] = height_at(fid, i, j)
+	if is_baked(fid):
+		_height_grid_cache[fid] = out
 	return out
 
 ## G1a shade [0,1] at the same node grid. 1.0 (no darkening) if not ready/baked/flag-off — a safe neutral default,

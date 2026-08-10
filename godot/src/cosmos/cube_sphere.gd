@@ -753,12 +753,11 @@ const FP_RELIEF_REEMIT := false
 ## orbit: mountains rise, valleys/cliffs drop, visible in silhouette on the limb and on descent. SUPERSEDES the
 ## rejected shading-only fix (FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT above — user verdict after the live A/B:
 ## "still looks flat, no sense in shaded relief"). A new `FacetOrbitRelief` tier (facet_orbit_relief.gd),
-## architecturally a sibling of FacetSmoothV2 (reuses its `hop_annulus`/`merge_tiles` statics verbatim, and its
-## `make_material` — G3's mesh carries real per-vertex relief normals, unlike V2's flat/radial shading, so the
-## SAME lit shader family is exactly where that information gets used) but reading heights PURELY from the
-## already-baked `GlobalReliefData` DEM (`height_grid`) — ZERO live worldgen sampling at G3 build time, the
-## structural fix for the shelved S-ladder's warmup-convoy failure class. Requires FP_GLOBAL_RELIEF_DATA (reads
-## its heights); independent of FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT (neither required nor conflicting).
+## architecturally a sibling of FacetSmoothV2 (reuses its `hop_annulus`/`merge_tiles` statics verbatim) but
+## reading heights PURELY from the already-baked `GlobalReliefData` DEM (`height_grid`) — ZERO live worldgen
+## sampling at G3 build time, the structural fix for the shelved S-ladder's warmup-convoy failure class. Requires
+## FP_GLOBAL_RELIEF_DATA (reads its heights); independent of FP_SKIN_RELIEF_SHADE/FP_RELIEF_REEMIT (neither
+## required nor conflicting).
 ##
 ## COVERAGE (§2 of the design doc): `FacetOrbitRelief.want_set` ranks every candidate facet by
 ## `min(distance-from-nadir, distance-from-the-horizon-ring)` — ONE law, no altitude branch — so BOTH the near-
@@ -769,38 +768,53 @@ const FP_RELIEF_REEMIT := false
 ## the view axis drifts without a crossing (bounds mesh CHURN, not raw compute — the O(facet_count) ranking scan
 ## itself is cheap, a few thousand dot products).
 ##
-## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × ≈76,488 B/tile (`FacetOrbitRelief.tile_bytes`'s own accounting:
-## 33²=1089 verts × (pos 12 + col 16 + nrm 12) + 32²·2·3 core indices ×4B + a 4-edge skirt ≈ 33×4 verts + indices
-## — mirrors `FacetSmoothV2.tile_bytes`'s exact per-component pricing) ≈ 29.4 MB — comfortably above the ~330-
+## NEVER-OOM: `ORBIT_RELIEF_MAX_TILES := 384` × 55,068 B/tile (`FacetOrbitRelief.tile_bytes`: 33²=1089 verts ×
+## (pos 12 + col 16 — WS3, NO per-vertex normal) + 32²·6 indices × 4B) ≈ 20.17 MB — comfortably above the ~330-
 ## facet whole-visible-cap estimate at the design doc's reference altitude (alt≈1500, θ_h≈36°: (1-cos36°)/2 ×
 ## 3456 ≈ 330), so no truncation is needed there; at higher altitudes the priority law truncates gracefully,
 ## keeping both nadir and limb dense. A hard cap enforced at `want_set` selection time, before dispatch — the
-## tier can never grow past it regardless of the nominal candidate count. Memory is not the binding constraint
-## here (well inside the 2048 MB ceiling); the real cost is the whole-surface `generate_normals()` commit, rate-
-## capped to `ORBIT_RELIEF_COMMIT_MS` apart (the REV7 apply-bound lesson, applied to the commit specifically —
-## dispatch itself is bounded by free worker slots, not rate-limited separately).
+## tier can never grow past it regardless of the nominal candidate count.
 ##
-## PERF FIX (live A/B regression, task #99 G3 follow-up): the FIRST shipped cut of this flag committed via
+## PERF FIX #1 (live A/B regression #1): the FIRST shipped cut of this flag committed via
 ## `SurfaceTool.create_from + generate_normals()` over the WHOLE merged mesh on every commit — live telemetry
 ## measured ≈250ms/commit on ~384 tiles (≈418K verts), ALL ON THE MAIN THREAD (proc_ms 127-158, frame_worst_ema
-## 250ms, fps 8-29 during build-up), repeated every `ORBIT_RELIEF_COMMIT_MS` through the whole build-up — an
-## unshippable stall the `G-OR-PACE` gate's rate/count checks didn't catch because they never measured per-
-## commit DURATION. Fixed by moving normal computation OFF the main thread entirely: each tile's `build_tile`
-## (worker-dispatched) now derives a real per-vertex analytic normal from its own already-computed position
-## grid (central-difference tangents, cross-producted, oriented outward — `FacetOrbitRelief._fill_analytic_
-## normals`); `_commit()` no longer touches `SurfaceTool` at all — it is a plain array-concatenation
-## (`merge_tiles`, reused) + ONE `ArrayMesh.add_surface_from_arrays` upload. Also BATCH-CAPPED
-## (`ORBIT_RELIEF_COMMIT_TILES`): a commit adds at most this many newly-built tiles to the live mesh, so even a
-## burst where the whole want-set completes at once fills the mesh gradually across many rate-capped commits,
-## never one 384-tile upload in a single frame. Trade-off, disclosed: per-tile normals are a one-sided estimate
-## at a tile's own boundary (no cross-tile smoothing) — a faint normal kink is possible at a G3-G3 tile seam
-## under grazing light, invisible at G3's own orbital viewing distance, and a strictly better trade than the
-## measured main-thread stall.
+## 250ms, fps 8-29 during build-up) — an unshippable stall. Fixed by dropping SurfaceTool entirely — `_commit`
+## uploads via the SAFE high-level `add_surface_from_arrays` only, BATCH-CAPPED (`ORBIT_RELIEF_COMMIT_TILES`
+## newly-built tiles per commit, so even an all-at-once burst fills the mesh gradually).
+##
+## PERF FIX #2 (live A/B regression #2 — WS1+WS4, `facet_orbit_relief.gd`'s class doc has the full account):
+## (a) WS1a SUSPENDS the whole tier on-surface (`step()` performs zero recompute/dispatch/commit past the reap —
+## G3 has nothing to show there, and this alone was the dominant ground-level stall, proc_ms ≈240 live); (b) WS1b
+## replaced the per-commit `FacetSmoothV2.merge_tiles` O(resident-set) re-merge with a FIXED-SLOT PERSISTENT
+## ARENA — a commit only (re)writes the ≤`ORBIT_RELIEF_COMMIT_TILES` CHANGED tiles' slots (index-remap baked in
+## at BUILD time, worker-side); (c) two per-facet computations (`centre_dir`, `GlobalReliefData.height_grid`)
+## are now memoized instead of redone on every recompute/dispatch of an already-baked, therefore immutable,
+## input. WS4 moved the no-protrusion edge sink to COMMIT time against the ACTUAL committed set (not the
+## aspirational want-set) — AND, critically, a commit re-sinks not only the newly-admitted tile but every one of
+## its already-committed neighbours too (their sink mask may have just changed) — so both sides of every
+## committed edge agree BY CONSTRUCTION after every commit, self-healing at the commit cadence with no rebuild
+## (`verify_orbit_relief.gd`'s G-OR-SEAM). A related bug found alongside it — a shared CORNER node (on two
+## cardinal edges at once) was being sunk TWICE the intended amount — is fixed in `sunk_positions`.
+##
+## WS3 (live A/B follow-up #3 — user verdict: "no slope shades, it just looks ugly"): G3's mesh carries NO normal
+## attribute at all. `FacetOrbitRelief.make_material` is G3's OWN independent material (never derived from
+## `FacetSmoothV2`'s, so it can never accidentally couple to `FP_SMOOTH_V2_LIT`) hardcoding the SAME radial-
+## normal terminator-ONLY law V2's own default tail already uses (`n = normalize(wp − centre)` recomputed
+## in-shader from VERTEX position, `voxi_shade(n, sun_dir)` — the flat skin's day/night/terminator law, nothing
+## else). The 3-D read comes from GEOMETRY (silhouette/profile/parallax against the flat skin), never from
+## per-slope brightness. Live sun tracking mirrors V2's (`set_sun_dir`, wired every frame in main.gd alongside
+## V2's). Gate: `verify_orbit_relief.gd`'s G-OR-LIGHT (static source checks: calls voxi_shade, derives its normal
+## from position not a mesh attribute, never reads NORMAL, no lam/relief term, never touches FacetSmoothV2).
+##
+## KNOWN LIMITATION (disclosed, not fixed this round): the far §2V skin's existing texture (fine-map UV/UV2) is
+## NOT yet bound onto G3's mesh — G3 paints the same coarse-cell-quantized COLOR the flat skin's tier uses
+## (`coarse_color`), so at very high zoom the two can show a faint shimmer/mismatch at the coarse-cell boundary.
+## Deferred (WS2, texture parity) — no gate or shader work landed for it in this pass.
 ##
 ## Off ⇒ `FacetOrbitRelief` never constructed, byte-identical (FLAT verify_feature.gd unmoved).
-## Gate: verify_orbit_relief.gd (G-OR-OFF/DATA-EQ/BYTES/WELD/PACE).
+## Gate: verify_orbit_relief.gd (G-OR-OFF/LIGHT/DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND).
 const FP_ORBIT_RELIEF := false
-const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈29.4 MB at ≈76,488 B/tile (see doc above)
+const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈20.17 MB at 55,068 B/tile (see doc above)
 const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
 const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)

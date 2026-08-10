@@ -4902,6 +4902,13 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _smooth_v2 != null:
 		_smooth_v2.set_sun_dir(sun_dir)
 
+## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): feed the current Sun direction into G3's OWN
+## ShaderMaterial (a separate material from V2's/the shell's — see facet_orbit_relief.gd's shader doc) so its
+## terminator tracks live time. No-op with no orbit-relief instance ⇒ byte-identical off.
+func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
+	if _orbit_relief != null:
+		_orbit_relief.set_sun_dir(sun_dir)
+
 ## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b): push the WorldManager-owned G1a hillshade data
 ## in once at construction (mirrors how other cross-cutting singletons are handed to the ring). Called with null
 ## OR never called at all ⇒ `_relief_shade` stays null ⇒ `_ensure_cached`'s shade multiply never engages ⇒ byte-

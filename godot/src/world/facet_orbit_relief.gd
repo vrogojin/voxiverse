@@ -21,12 +21,33 @@ extends RefCounted
 ## Tile pitch is literally G2's own grid — `ORBIT_RELIEF_CELLS == GlobalReliefData.CELLS` (32) — a 1:1 read, no
 ## rescale, no interpolation.
 ##
-## PERF FIX (live A/B regression, task #99 G3 follow-up — see `cube_sphere.gd`'s `FP_ORBIT_RELIEF` doc for the
-## measured numbers): normals are computed ANALYTICALLY per tile, off-thread, in `build_tile`
-## (`_fill_analytic_normals`) — NOT via a whole-merged-mesh `SurfaceTool.generate_normals()` pass on commit,
-## which is what the first shipped cut of this flag did and which stalled the main thread ≈250ms/commit. `_commit`
-## is now a plain array-concatenation (`FacetSmoothV2.merge_tiles`) + ONE `add_surface_from_arrays` upload,
-## batch-capped to `ORBIT_RELIEF_COMMIT_TILES` newly-added tiles per call.
+## PERF FIX #1 (live A/B regression #1 — SurfaceTool): the FIRST shipped cut ran `SurfaceTool.generate_normals()`
+## over the whole merged mesh on every commit, stalling the main thread ≈250ms/commit. Fixed by dropping
+## SurfaceTool entirely — `_commit` uploads via the SAFE high-level `add_surface_from_arrays` only.
+##
+## PERF FIX #2 (live A/B regression #2 — WS1/WS4, see `cube_sphere.gd`'s `FP_ORBIT_RELIEF` doc): (a) WS1a
+## SUSPENDS the whole tier on-surface (`step()`, zero recompute/dispatch/commit past the reap — G3 has nothing to
+## show there); (b) WS1b replaced the per-commit `FacetSmoothV2.merge_tiles` O(resident-set) re-merge with a
+## FIXED-SLOT PERSISTENT ARENA (`_arena_pos`/`_arena_col`/`_arena_idx`, `ORBIT_RELIEF_MAX_TILES` slots, allocated
+## once) — a commit only (re)writes the ≤`ORBIT_RELIEF_COMMIT_TILES` CHANGED tiles' slots, index-remap baked in at
+## BUILD time (worker-side, `vert_base`), never re-processing the whole resident set; (c) `_centre_dir_cache`/
+## `GlobalReliefData._height_grid_cache` memoize two per-facet computations that were being redone on every
+## recompute/dispatch for an already-baked, therefore immutable, input.
+##
+## WS4 the no-protrusion EDGE SINK moved to COMMIT time (`edge_sink_mask` + `sunk_positions`), computed against the
+## ACTUAL `_committed_tiles` set (not the aspirational want-set) — and, critically, a commit re-sinks not only the
+## newly-admitted tile but every one of its ALREADY-committed neighbours too (their sink mask may have just
+## changed now that this neighbour is real). Both sides of every committed edge therefore agree BY CONSTRUCTION
+## after every commit — no rebuild, self-healing at the commit cadence (`verify_orbit_relief.gd`'s G-OR-SEAM).
+##
+## WS3 (user verdict: "no slope shades, it just looks ugly" — DROP real-normal relief shading entirely): the mesh
+## carries NO normal attribute at all — `make_material` below hardcodes the SAME radial-normal law
+## `FacetSmoothV2`'s own DEFAULT (non-LIT) tail already uses (`n = normalize(wp − centre)`, `voxi_shade(n, sun_dir)`
+## — the flat skin's day/night/terminator law, nothing else), as its OWN independent material so G3's lighting can
+## NEVER accidentally couple to `FP_SMOOTH_V2_LIT` (V2's own, unrelated, slope-shaded variant) if that flag's value
+## ever changes. The 3-D read comes from GEOMETRY (silhouette/profile/parallax against the flat skin), not from
+## per-slope brightness — dropping the per-vertex normal entirely also removes the analytic-normal compute
+## (`_fill_analytic_normals`, now deleted) and 12 B/vertex of resident bytes (see `tile_bytes`/`arena_bytes`).
 
 const ORBIT_RELIEF_CELLS := 32   # == GlobalReliefData.CELLS; kept as its own const so this file has no hard
                                   # compile-time dependency on GlobalReliefData's internals beyond height_grid()'s shape
@@ -54,6 +75,30 @@ static func centre_dir(fid: int) -> Vector3:
 	for ci in range(4):
 		s += Vector3(cd[ci * 3], cd[ci * 3 + 1], cd[ci * 3 + 2])
 	return s.normalized()
+
+## PERF FIX WS1c (live A/B follow-up): `_recompute_want` calls `centre_dir` for EVERY candidate facet (up to
+## `FacetAtlas.facet_count()`, ~3456) on every throttled recompute — each call was allocating a fresh
+## `PackedFloat64Array` + 4 `CosmosFacet.vertex_dir` calls. Precompute the WHOLE table ONCE (lazily, main thread
+## only — `_recompute_want` never runs on a worker) and reuse it forever after; `FacetAtlas`'s corner-dir tables
+## are write-once-then-read-only (built at `warm_up()`, never mutated during gameplay — §0), so this cache can
+## never go stale. A class-level static cache (not per-instance) — shared across every `FacetOrbitRelief` and
+## gate call, matching `FarPalette`'s `_block_idx`/`_fc_rgb` "built main-thread once" convention.
+static var _centre_dir_cache: PackedVector3Array = PackedVector3Array()
+static func _ensure_centre_dir_cache() -> void:
+	if not _centre_dir_cache.is_empty():
+		return
+	var n := FacetAtlas.facet_count()
+	var out := PackedVector3Array()
+	out.resize(n)
+	for fid in range(n):
+		out[fid] = centre_dir(fid)
+	_centre_dir_cache = out
+
+static func centre_dir_cached(fid: int) -> Vector3:
+	_ensure_centre_dir_cache()
+	if fid < 0 or fid >= _centre_dir_cache.size():
+		return centre_dir(fid)   # bounds-safe fallback (never garbage / never a crash)
+	return _centre_dir_cache[fid]
 
 ## §2 the COVERAGE PRIORITY LAW: smaller = higher priority. `phi` = angle from the current emit axis (nadir-ish
 ## off-surface, the player's forward direction on the surface); `theta_h` = the true horizon-tangent angle
@@ -85,7 +130,7 @@ static func want_set(active_fid: int, emit_axis: Vector3, theta_h: float, v2_hop
 		var f := int(fid)
 		if excluded.has(f):
 			continue
-		var cd := centre_dir(f)
+		var cd := centre_dir_cached(f)
 		var dot := clampf(cd.dot(emit_axis), -1.0, 1.0)
 		var phi := acos(dot)
 		if phi > reach:
@@ -100,13 +145,17 @@ static func want_set(active_fid: int, emit_axis: Vector3, theta_h: float, v2_hop
 		out[i] = int((picked[i] as Array)[1])
 	return out
 
-## §1.5/3 the no-protrusion EDGE MASK for `fid`, given the CURRENT resident want-set (`want`, a fid->true
-## Dictionary — O(1) membership, built by the caller from `want_set`'s ordered result). For each of the 4
-## cardinal `FacetAtlas` slots, if the neighbour across that edge is NOT in `want`, that edge is a frontier
-## (bordering V2/near/unclaimed territory) and gets flagged for sinking; a neighbour that IS in `want` means
-## both tiles will render that edge at the true DEM height, so it is left un-sunk (no crack). Bit layout matches
-## `FacetSmoothV2.EDGE_WEST/EAST/SOUTH/NORTH` via the verified `S_WEST↔EDGE_WEST` etc correspondence documented
-## on `_edge_indices` above. Pure — a gate can call this directly with a synthetic `want` Dictionary.
+## §1.5/WS4 the no-protrusion EDGE MASK for `fid`, given the ACTUAL committed/uploaded set (`want`, a fid->true
+## Dictionary — O(1) membership). **WS4 REVISED**: the caller now passes `_committed_tiles` (what is ACTUALLY
+## drawn right now), not the aspirational `_want` — a neighbour that is merely QUEUED (in `_want`/`_tiles` but
+## not yet uploaded) must still be treated as "not there" for sink purposes, or a tile could assume an
+## about-to-be-built neighbour already covers its edge and render a temporary crack. For each of the 4 cardinal
+## `FacetAtlas` slots, if the neighbour across that edge is NOT in `want`, that edge is a frontier (bordering
+## V2/near/unclaimed territory or a not-yet-committed G3 tile) and gets flagged for sinking; a neighbour that IS
+## in `want` means both tiles render that edge at the true DEM height, so it is left un-sunk (no crack). Bit
+## layout matches `FacetSmoothV2.EDGE_WEST/EAST/SOUTH/NORTH` via the verified `S_WEST↔EDGE_WEST` etc
+## correspondence documented on `_edge_indices` above. Pure — a gate can call this directly with a synthetic
+## `want` Dictionary.
 static func edge_sink_mask(fid: int, want: Dictionary) -> int:
 	var mask := 0
 	if not want.has(FacetAtlas.seam_neighbour(fid, FacetAtlas.S_WEST)):
@@ -135,14 +184,18 @@ static func coarse_color(coarse_col: PackedColorArray, i: int, j: int, scale: in
 	return coarse_col[cj * stride + ci]
 
 ## THE per-tile build. `heights` is a `height_grid(fid)` snapshot (row-major, `NODES_PER_EDGE`² == 33²=1089
-## ints); `coarse_col` is a `_col_cache[fid]` snapshot (§ above). `sink_edges` is a 4-bit mask
-## (`FacetSmoothV2.EDGE_WEST/EAST/SOUTH/NORTH`) of which of THIS tile's edges border a facet NOT also resident
-## in G3 this build (computed by the caller from the CURRENT want-set, main thread, §1.5/3) — those edges get
-## the no-protrusion sink (§1.5); an edge shared with another resident G3 tile is left un-sunk so the two tiles'
-## shared boundary stays at the true DEM height on both sides (preserving the weld — sinking one side and not
-## the other would open a crack). `{}` (refusal) if `heights` is empty/wrong-size (facet not baked / malformed
-## request) — the caller must never commit an empty tile as resident (mirrors V2's refusal contract exactly).
-static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, sink_edges: int) -> Dictionary:
+## ints); `coarse_col` is a `_col_cache[fid]` snapshot (§ above). `vert_base` is this tile's PERSISTENT arena
+## vertex offset (WS1b, its own `PERSISTENT SLOT ARENA` section below) — baked directly into the returned `idx`
+## array here (worker-side, zero main-thread index-remap work at commit time). Tiles are built UN-SUNK — the
+## no-protrusion edge sink (§1.5) moved to COMMIT time (WS4, see `sunk_positions` + `_write_arena_slot` below):
+## baking the sink in at BUILD time froze it against the ASPIRATIONAL want-set, so a tile could keep an edge
+## sunk for a neighbour that never actually got drawn (or vice versa) — a one-sided radial cliff at the true
+## seam. `{}` (refusal) if `heights` is empty/wrong-size (facet not baked / malformed request) — the caller must
+## never commit an empty tile as resident (mirrors V2's refusal contract exactly). WS3 (user verdict: "no slope
+## shades"): NO normal is computed here at all — `make_material`'s shader recomputes its own radial normal from
+## VERTEX/MODEL_MATRIX in-shader (the SAME law `FacetSmoothV2`'s default tail already uses), so a per-vertex
+## ARRAY_NORMAL would be dead weight the active shader never reads.
+static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int) -> Dictionary:
 	var cells := ORBIT_RELIEF_CELLS
 	var stride := cells + 1
 	var n := stride * stride
@@ -152,7 +205,6 @@ static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedCo
 	var r_datum := FacetAtlas.r_of(fid)
 	var scale := cells / FacetFarRing.CELLS          # == 8, exact (ORBIT_RELIEF_CELLS(32) / shell CELLS(4))
 	var pos := PackedVector3Array(); pos.resize(n)
-	var nrm := PackedVector3Array(); nrm.resize(n)
 	var col := PackedColorArray(); col.resize(n)
 	var g := PackedInt32Array(); g.resize(n)          # kept for G-OR-DATA-EQ / no-protrusion verification
 	for j in range(stride):
@@ -164,42 +216,10 @@ static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedCo
 			var relief := maxf(0.0, float(h - TerrainConfig.SEA_LEVEL)) * FacetFarRing.RELIEF
 			pos[k] = d * (r_datum + relief)
 			col[k] = coarse_color(coarse_col, i, j, scale, FacetFarRing.CELLS)
-	_fill_analytic_normals(pos, nrm, cells, stride)   # §1.6 REVISED — see the class doc's perf-fix note
 	var idx := _grid_indices(cells, stride)
-	var tile := {"pos": pos, "nrm": nrm, "col": col, "g": g, "idx": idx}
-	_append_edge_sink(tile, cells, stride, sink_edges)   # touches pos only; normals already derived from the raw relief
-	return tile
-
-## PERF FIX (live A/B regression, task #99 G3 follow-up): a per-tile ANALYTIC normal from the tile's own already-
-## computed position grid — central-difference tangents at interior nodes, one-sided at the tile's own boundary
-## (no neighbour-tile data available here) — cross-producted and oriented outward against the local radial
-## direction. Mirrors `FacetSmoothV2`'s V2-2 (`FP_SMOOTH_V2_LIT`) provoking-vertex normal law exactly (same
-## cross-product + "flip if it points inward" convention), just applied to EVERY node instead of one per cell
-## (G3's colour is already smooth/per-vertex, §1.4, so there is no provoking-vertex constraint to respect here).
-## Runs entirely inside `build_tile` (worker-side) — this REPLACES the original design's "compute nothing per
-## tile, let SurfaceTool.generate_normals() do a whole-merged-mesh pass at commit" plan: live telemetry showed
-## that whole-mesh pass costing ~250ms/commit on ~384 tiles (≈418K verts) ON THE MAIN THREAD (proc_ms 127-158,
-## frame_worst_ema 250ms, fps 8-29 during build-up) — the exact REV7-class stall this codebase's own "never do
-## expensive per-frame work on main" discipline exists to prevent. Trade-off, disclosed: a tile's OWN boundary
-## normal is a one-sided estimate (no cross-tile smoothing), so a shared G3-G3 tile edge may show a faint normal
-## kink under grazing light — cosmetic only, invisible at G3's own orbital viewing distance, and a strictly
-## better trade than a ~250ms main-thread stall every ORBIT_RELIEF_COMMIT_MS.
-static func _fill_analytic_normals(pos: PackedVector3Array, nrm: PackedVector3Array, cells: int, stride: int) -> void:
-	for j in range(stride):
-		for i in range(stride):
-			var k := j * stride + i
-			var il := maxi(i - 1, 0); var ir := mini(i + 1, cells)
-			var jd := maxi(j - 1, 0); var ju := mini(j + 1, cells)
-			var pu: Vector3 = pos[j * stride + ir] - pos[j * stride + il]    # tangent along i (west->east)
-			var pv: Vector3 = pos[ju * stride + i] - pos[jd * stride + i]    # tangent along j (south->north)
-			var n := pu.cross(pv)
-			if n.length() > 0.0:
-				n = n.normalized()
-				if n.dot(pos[k].normalized()) < 0.0:
-					n = -n
-				nrm[k] = n
-			else:
-				nrm[k] = pos[k].normalized()   # degenerate (zero-area) fallback: radial, never a zero vector
+	for k in range(idx.size()):
+		idx[k] += vert_base   # WS1b: bake the arena offset in HERE (worker-side) — commit never remaps an index
+	return {"pos": pos, "col": col, "g": g, "idx": idx}
 
 ## Plain 2-tri/cell quad grid — smooth (per-vertex, not `flat`) colour, so no provoking-vertex convention is
 ## needed (unlike V2's per-CELL flat paint): G3's colour already varies smoothly node-to-node (§ coarse_color).
@@ -218,31 +238,43 @@ static func _grid_indices(cells: int, stride: int) -> PackedInt32Array:
 			ii += 6
 	return idx
 
-## §1.5 the NO-PROTRUSION guard at the V2/near boundary. G2's heights are exact `profile_at_dir` samples at the
+## §1.5/WS4 the NO-PROTRUSION guard at the V2/near (or not-yet-committed-G3) boundary — REVISED to run at
+## COMMIT time, not build time (see `build_tile`'s doc). G2's heights are exact `profile_at_dir` samples at the
 ## DEM's own coarse (13-block) pitch, not a min-envelope — between two samples on a steep slope the true near
 ## surface can rise above the mesh's straight-line interpolation (the SAME class of bug `FP_ENV_ALL` fixed for
 ## the shell's own coarser CELLS=4 grid). Sinking the WHOLE tile would hide relief that is otherwise correct, so
-## only edges flagged in `sink_edges` (the caller-computed "this edge's neighbour is NOT also a resident G3
-## tile" mask, §3) get sunk — reuses `FacetSmoothV2._edge_indices` to enumerate each flagged edge's node
-## indices, then `FacetFarRing._sunk_positions_amt`'s exact law (`p - p̂·sink`, inlined here since that method is
-## an INSTANCE method and this must stay static/worker-safe), amount `TierPlace.backstop_sink()`. An edge shared
-## with another resident G3 tile is left UNTOUCHED — sinking one tile's copy of a shared edge and not the
-## neighbour's would open a visible crack (both sides must agree on that edge's height). Interior nodes (and any
-## edge bordering another G3 tile) are accepted at face value — the same fidelity tradeoff the shell's own
-## un-enveloped tiers already accept elsewhere, disclosed in the design doc as bounded-not-eliminated.
-static func _append_edge_sink(tile: Dictionary, cells: int, stride: int, sink_edges: int) -> void:
+## only edges flagged in `sink_edges` (`edge_sink_mask`, computed by the caller from the CURRENT `_committed_
+## tiles` set) get sunk. Returns a NEW copy of `pos` — never mutates its input — because `_tiles[fid]["pos"]`
+## must stay canonical/un-sunk (a later commit may need to re-derive a DIFFERENT sink mask for the same tile as
+## its neighbours' committed status changes, WS4's "self-heals at the commit cadence" property). Reuses
+## `TierPlace.backstop_sink()`'s exact law (`p - p̂·sink`, inlined here since that method is an INSTANCE method
+## and this must stay static/pure). An edge shared with another COMMITTED G3 tile is left UNTOUCHED — sinking
+## one tile's copy of a shared edge and not the neighbour's would open a visible crack (both sides must agree on
+## that edge's height). Interior nodes (and any edge bordering another committed G3 tile) are accepted at face
+## value — the same fidelity tradeoff the shell's own un-enveloped tiers already accept elsewhere, disclosed in
+## the design doc as bounded-not-eliminated.
+## BUG FIX (live A/B follow-up, G-OR-SEAM root-cause): a CORNER node sits on TWO cardinal edges at once (e.g.
+## (i=cells,j=0) is on both EAST and SOUTH). The original loop read/wrote `out[k]` per edge, so a corner shared by
+## two FLAGGED edges got sunk TWICE (2×`backstop_sink()`) — the amount every OTHER touched node gets is exactly
+## `backstop_sink()` once. Fixed by first collecting the UNION of touched indices across all flagged edges, then
+## applying the sink exactly ONCE per index, always measured from the PRISTINE input `pos` (never the partially-
+## mutated `out`) — a node on N flagged edges now sinks by the same single `sink` as a node on 1.
+static func sunk_positions(pos: PackedVector3Array, cells: int, stride: int, sink_edges: int) -> PackedVector3Array:
+	var out := pos.duplicate()
 	var sink := TierPlace.backstop_sink()
 	if sink <= 0.0 or sink_edges == 0:
-		return
-	var pos: PackedVector3Array = tile["pos"]
+		return out
+	var touched := {}
 	for edge in [FacetSmoothV2.EDGE_WEST, FacetSmoothV2.EDGE_EAST, FacetSmoothV2.EDGE_SOUTH, FacetSmoothV2.EDGE_NORTH]:
 		if (sink_edges & (1 << edge)) == 0:
 			continue
 		for k in _edge_indices(edge, cells, stride):
-			var p: Vector3 = pos[k]
-			var d := p.normalized()
-			pos[k] = p - d * sink
-	tile["pos"] = pos
+			touched[k] = true
+	for k in touched.keys():
+		var p: Vector3 = pos[k]   # ALWAYS the pristine input — a corner on 2 flagged edges sinks exactly once
+		var d := p.normalized()
+		out[k] = p - d * sink
+	return out
 
 ## Node indices along one cardinal edge of a `stride`×`stride` grid — mirrors `FacetSmoothV2._edge_indices`
 ## (a small pure helper each tier file keeps its own copy of, same convention `centre_dir` above follows,
@@ -272,23 +304,79 @@ static func _edge_indices(edge: int, cells: int, stride: int) -> Array:
 static func should_commit(dirty: bool, now_ms: int, last_commit_ms: int, commit_interval_ms: int) -> bool:
 	return dirty and now_ms - last_commit_ms >= commit_interval_ms
 
-## NEVER-OOM ledger (mirrors `FacetSmoothV2.tile_bytes`'s accounting: pos/nrm 12B each, col 16B, idx 4B — normals
-## are NOT stored per tile, computed once at commit over the merged mesh, §1.6 of the design doc; charged here at
-## the steady-state 12B/vert so the ledger reflects the RESIDENT cost once committed, not the transient pre-normal
-## state).
+## Per-tile byte cost (WS3: pos 12B, col 16B, idx 4B — NO nrm; the mesh carries no normal attribute at all, see
+## the class doc's WS3 note). Used by `G-OR-BYTES` to check the per-component arithmetic; the LIVE resident
+## ledger is `arena_bytes()` below (the arena, WS1b, is allocated ONCE at full capacity, so its cost is a FIXED
+## constant, not a per-tile sum).
 static func tile_bytes(tile: Dictionary) -> int:
 	if tile.is_empty():
 		return 0
 	var nv: int = (tile["pos"] as PackedVector3Array).size()
 	var ni: int = (tile["idx"] as PackedInt32Array).size()
-	return nv * (12 + 12 + 16) + ni * 4
+	return nv * (12 + 16) + ni * 4
+
+## WS1b PERSISTENT SLOT ARENA sizing — every tile has an IDENTICAL vertex/index count (no skirt, fixed
+## `ORBIT_RELIEF_CELLS` grid), so a fixed-slot arena is exact, not approximate.
+const VERTS_PER_TILE := (ORBIT_RELIEF_CELLS + 1) * (ORBIT_RELIEF_CELLS + 1)   # 33² = 1089
+const IDX_PER_TILE := ORBIT_RELIEF_CELLS * ORBIT_RELIEF_CELLS * 6              # 32²·6 = 6144
+
+## The FULL arena's fixed resident byte cost — `ORBIT_RELIEF_MAX_TILES` slots' worth, always, regardless of how
+## many are actually occupied (matches `GlobalReliefData.resident_bytes()`'s "allocated upfront" convention).
+static func arena_bytes() -> int:
+	return CubeSphere.ORBIT_RELIEF_MAX_TILES * (VERTS_PER_TILE * (12 + 16) + IDX_PER_TILE * 4)
+
+# =====================================================================================================================
+# WS3 THE SHADER — G3's OWN material (deliberately NOT `FacetSmoothV2.make_material()`): hardcodes the SAME
+# radial-normal-only law V2's DEFAULT (non-LIT) tail already uses (`n = normalize(wp − centre)`,
+# `voxi_shade(n, sun_dir)` — the flat skin's day/night/terminator law, nothing else) as an INDEPENDENT material, so
+# G3's lighting can never accidentally inherit V2's `FP_SMOOTH_V2_LIT` slope-shaded variant if that flag's value
+# ever changes — G3 must NEVER show per-slope shading (user verdict: "no slope shades, it just looks ugly"). The
+# 3-D read comes from GEOMETRY (silhouette/profile/parallax), not from brightness. Uses the SAME shared
+# `VoxiLight.shade_glsl()` snippet every other far/near material already includes (one lighting law, no drift).
+# =====================================================================================================================
+
+const _OR_SHADER_HEAD := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+"
+const _OR_SHADER_TAIL := "varying vec4 v_col;
+void vertex() {
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 nr = normalize(wp - centre);
+	v_col = vec4(COLOR.rgb * voxi_shade(nr, sun_dir), 1.0);
+}
+void fragment() {
+	ALBEDO = v_col.rgb;
+}
+"
+
+## The full shader source: HEAD + the shared `VoxiLight.shade_glsl()` snippet (declares sun_dir/night_floor/
+## term_mu/moonshine + voxi_shade — picks up e.g. `FP_TWILIGHT_AMBIENT`'s splice for free, zero duplicated
+## lighting law) + TAIL. A function (not a top-level const) so it always reads VoxiLight's CURRENT snippet.
+static func shader_code() -> String:
+	return _OR_SHADER_HEAD + VoxiLight.shade_glsl() + _OR_SHADER_TAIL
+
+## FP_FAR_TERMINATOR_WELD (mirrors `FacetSmoothV2.make_material`): seed sun_dir from the last live Sun G3 itself
+## was told (`set_sun_dir`, WS2/WS3 wiring), not the hardcoded default — kills a "frozen fake-noon" gap on rebuild.
+static var _last_sun_dir := Vector3(1.0, 0.0, 0.0)
+
+static func make_material() -> ShaderMaterial:
+	var sm := ShaderMaterial.new()
+	var sh := Shader.new()
+	sh.code = shader_code()
+	sm.shader = sh
+	var seed := _last_sun_dir if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
+	sm.set_shader_parameter("sun_dir", seed)
+	return sm
 
 # =====================================================================================================================
 # THE INSTANCE — owned by ONE FacetFarRing under FP_ORBIT_RELIEF. ONE MeshInstance3D, ONE material, ONE draw.
-# Mirrors FacetSmoothV2's worker-slot-pool / dwell-eviction / rate-capped-whole-surface-commit shape exactly —
-# the only structural differences are (a) no `_cpp_gen` at all (build_tile never touches the module, §0), (b) the
-# want-set law is `want_set`/§2 (nearest-nadir-or-limb, not a fixed hop annulus), and (c) the commit is rate-
-# capped to a LONGER interval (ORBIT_RELIEF_COMMIT_MS) because the resident vertex count is far larger than V2's.
+# Mirrors FacetSmoothV2's worker-slot-pool / dwell-eviction shape; the commit itself is a FIXED-SLOT ARENA
+# (WS1b, live A/B perf follow-up #2 — see the class doc) rather than a per-commit re-merge of the whole resident
+# set. Structural differences from V2: (a) no `_cpp_gen` at all (build_tile never touches the module, §0), (b)
+# the want-set law is `want_set`/§2 (nearest-nadir-or-limb, not a fixed hop annulus), (c) the whole tier is
+# SUSPENDED on-surface (WS1a — see `step()`), and (d) the commit writes a persistent arena instead of
+# re-concatenating every resident tile every call.
 # =====================================================================================================================
 
 const EVICT_DWELL_STEPS := 20        ## mirrors FacetSmoothV2's own dwell — absorbs want-set boundary wobble
@@ -298,11 +386,11 @@ var _material: ShaderMaterial = null
 
 var _active_fid := -1
 var _relief_data: GlobalReliefData = null
-var _ring: Node3D = null              ## owning FacetFarRing — read-only accessors only (shell_emit_axis/_col_cache), never mutated
+var _ring: Node3D = null              ## owning FacetFarRing — read-only accessors only (shell_offsurface/shell_emit_axis/_col_cache), never mutated
 
 var _want: Dictionary = {}            ## fid -> true (current residency target)
 var _want_order: Array = []           ## the SAME fids, priority order (dispatch priority)
-var _tiles: Dictionary = {}           ## fid -> tile dict (BUILT, off-thread — not necessarily uploaded yet, see _committed_tiles)
+var _tiles: Dictionary = {}           ## fid -> tile dict (BUILT, off-thread, UN-SUNK — not necessarily uploaded yet, see _committed_tiles)
 var _leaving: Dictionary = {}         ## fid -> dwell steps remaining before eviction
 
 var _last_axis_recompute_ms := 0
@@ -314,26 +402,41 @@ var _s_task: PackedInt32Array = PackedInt32Array()
 var _s_result: Array = []
 var _s_mutex: Mutex = null
 
-# PERF FIX (§3 REVISED): `_committed_tiles` is the SUBSET of `_tiles` currently reflected in the live `_mi.mesh`
-# — commits add at most `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles per call, so the resident set fills the
-# visible mesh gradually across many commits rather than one whole-set upload. `_commit_dirty` is a PERSISTENT
-# (not per-step-call) flag: true whenever `_tiles` has diverged from `_committed_tiles` (a fresh build landed,
-# or an eviction happened) and NOT yet fully caught up — so a rate-cap-blocked commit is not silently dropped,
-# it just waits for the next eligible `step()` call.
-var _committed_tiles: Dictionary = {}   ## fid -> true (already uploaded into _mi.mesh)
+# WS1b PERSISTENT SLOT ARENA (live A/B perf follow-up #2): fixed-size pos/col/idx arrays (WS3: NO nrm — the mesh
+# carries no normal attribute, see the class doc), allocated ONCE at ORBIT_RELIEF_MAX_TILES slots' worth — a
+# commit never re-processes an already-resident tile's data, only writes the ≤ORBIT_RELIEF_COMMIT_TILES NEW ones
+# into their reserved slot range, then uploads the WHOLE (fixed-size, unchanged-elsewhere) arena in ONE
+# add_surface_from_arrays call. This replaces the prior design's per-commit `FacetSmoothV2.merge_tiles` over the
+# WHOLE committed subset — THAT re-did the O(committed-tiles × 6144) index remap loop every single commit
+# (measured ≈100-300ms at 384 tiles, the root cause the arena eliminates: index remapping now happens ONCE per
+# tile, at BUILD time, worker-side — see build_tile's `vert_base` param).
+var _arena_ready := false
+var _arena_pos: PackedVector3Array = PackedVector3Array()
+var _arena_col: PackedColorArray = PackedColorArray()
+var _arena_idx: PackedInt32Array = PackedInt32Array()
+var _fid_slot: Dictionary = {}          ## fid -> arena slot (reserved from DISPATCH time through eviction)
+var _slot_fid: PackedInt32Array = PackedInt32Array()   ## arena slot -> fid, -1 if free
+var _free_arena_slots: Array = []       ## stack of free arena slot indices
+
+# `_committed_tiles` is the SUBSET of `_tiles` currently WRITTEN into the arena (and therefore actually drawn).
+# `_commit_dirty` is a PERSISTENT (not per-step-call) flag: true whenever `_tiles` has diverged from
+# `_committed_tiles` and NOT yet fully caught up — so a rate-cap-blocked commit is never silently dropped, it
+# just waits for the next eligible `step()` call.
+var _committed_tiles: Dictionary = {}   ## fid -> true (already written into the arena)
 var _commit_dirty := false
 var _last_commit_ms := 0
 
 ## Construct the ONE MeshInstance3D (child of `ring`, sharing its placement transform), the worker slot pool,
-## and seed `_want`/`_want_order`. `ring` is the owning FacetFarRing (needs `shell_emit_axis()`/`shell_emit_cos()`/
-## `shell_emit_thetah()` and its `_col_cache` — see `_col_cache_for` below); `rd` is the SAME GlobalReliefData
-## instance WorldManager already owns and pushes into the ring via `set_relief_data` (no new WorldManager-level
-## plumbing — this instance is threaded through the ring, not constructed independently).
+## the persistent arena, and seed `_want`/`_want_order`. `ring` is the owning FacetFarRing (needs
+## `shell_offsurface()`/`shell_emit_axis()`/`shell_emit_thetah()` and its `_col_cache` — see `_col_cache_for`
+## below); `rd` is the SAME GlobalReliefData instance WorldManager already owns and pushes into the ring via
+## `set_relief_data` (no new WorldManager-level plumbing — this instance is threaded through the ring, not
+## constructed independently).
 func setup_instance(ring: Node3D, active_fid: int, rd: GlobalReliefData) -> void:
 	_ring = ring
 	_relief_data = rd
 	_active_fid = active_fid
-	_material = FacetSmoothV2.make_material()   # reuse V2's lit-normal shader family (§1.6) — no new shader source
+	_material = make_material()   # WS3: G3's OWN radial-terminator-only material — never shares V2's material/flag
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetOrbitReliefMesh"
 	_mi.mesh = ArrayMesh.new()
@@ -344,7 +447,53 @@ func setup_instance(ring: Node3D, active_fid: int, rd: GlobalReliefData) -> void
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_result.resize(_sn)
 	_s_mutex = Mutex.new()
+	_ensure_arena()
 	_recompute_want(active_fid, true)
+
+## WS1b: allocate the fixed-size arena (once). Every triangle starts DEGENERATE (all 3 indices point at vertex
+## 0) so an un-written slot never renders garbage.
+func _ensure_arena() -> void:
+	if _arena_ready:
+		return
+	var cap := CubeSphere.ORBIT_RELIEF_MAX_TILES
+	_arena_pos = PackedVector3Array(); _arena_pos.resize(cap * VERTS_PER_TILE)
+	_arena_col = PackedColorArray(); _arena_col.resize(cap * VERTS_PER_TILE)
+	_arena_idx = PackedInt32Array(); _arena_idx.resize(cap * IDX_PER_TILE)
+	_arena_idx.fill(0)
+	_slot_fid = PackedInt32Array(); _slot_fid.resize(cap); _slot_fid.fill(-1)
+	_free_arena_slots = range(cap)
+	_arena_ready = true
+
+## Reserve (or return the already-reserved) arena slot for `fid`. -1 if the arena is momentarily full (a
+## transient dwell-eviction overlap, not a hard error — the caller's dispatch loop simply waits for a later
+## `step()` once a slot frees; `want_set` already truncates to `ORBIT_RELIEF_MAX_TILES`, so steady-state demand
+## never exceeds capacity).
+func _alloc_arena_slot(fid: int) -> int:
+	if _fid_slot.has(fid):
+		return _fid_slot[fid]
+	if _free_arena_slots.is_empty():
+		return -1
+	var slot: int = _free_arena_slots.pop_back()
+	_fid_slot[fid] = slot
+	_slot_fid[slot] = fid
+	return slot
+
+## Release `fid`'s arena slot (eviction, or a build refusal that never needed one — a no-op if `fid` never held
+## a slot). Degenerates the slot's indices FIRST so nothing stale keeps rendering after release.
+func _free_arena_slot(fid: int) -> void:
+	if not _fid_slot.has(fid):
+		return
+	var slot: int = _fid_slot[fid]
+	_fid_slot.erase(fid)
+	_slot_fid[slot] = -1
+	_degenerate_slot(slot)
+	_free_arena_slots.append(slot)
+
+func _degenerate_slot(slot: int) -> void:
+	var vbase := slot * VERTS_PER_TILE
+	var ibase := slot * IDX_PER_TILE
+	for k in range(IDX_PER_TILE):
+		_arena_idx[ibase + k] = vbase   # every triangle collapses to one point — zero area, invisible
 
 ## §2.1 recompute the want-set from the CURRENT emit axis/horizon. `force` bypasses the axis-drift throttle
 ## (always called on a genuine facet crossing, mirrors V2's crossing-only `set_active`); the throttled path is
@@ -356,7 +505,7 @@ func _recompute_want(active: int, force: bool) -> void:
 	_last_axis_recompute_ms = now_ms
 	var ring := _ring as FacetFarRing
 	var axis_a: Array = ring.shell_emit_axis()
-	var axis := Vector3(axis_a[0], axis_a[1], axis_a[2]) if axis_a.size() == 3 and (axis_a[0] != 0.0 or axis_a[1] != 0.0 or axis_a[2] != 0.0) else centre_dir(active)
+	var axis := Vector3(axis_a[0], axis_a[1], axis_a[2]) if axis_a.size() == 3 and (axis_a[0] != 0.0 or axis_a[1] != 0.0 or axis_a[2] != 0.0) else centre_dir_cached(active)
 	var theta_h: float = ring.shell_emit_thetah()
 	var v2_hop_h := CubeSphere.V2_HOP_H_REACH if CubeSphere.FP_SMOOTH_V2_REACH else CubeSphere.V2_HOP_H
 	var n := FacetAtlas.facet_count()
@@ -376,13 +525,16 @@ func _recompute_want(active: int, force: bool) -> void:
 	_want = new_want
 	_want_order = order
 
-## §2.1: the ONLY force-recompute trigger besides the axis-drift throttle — a facet crossing. No-op if the active
-## facet didn't actually change (mirrors V2's `set_active` exactly).
+## §2.1/WS1a: the ONLY force-recompute trigger besides the axis-drift throttle — a facet crossing. On-surface,
+## this ONLY records the new active fid — no recompute, no eviction, no dispatch: the resident mesh stays frozen
+## exactly as it was (§ `step()`'s WS1a note), warm and ready for the next ascent. Off-surface, behaves exactly
+## as before (force-recompute, mirrors V2's `set_active`).
 func set_active(new_fid: int) -> void:
 	if new_fid == _active_fid:
 		return
 	_active_fid = new_fid
-	_recompute_want(new_fid, true)
+	if (_ring as FacetFarRing).shell_offsurface():
+		_recompute_want(new_fid, true)
 
 ## Snapshot the shell's `_col_cache[fid]` for a safe cross-thread hand-off (§0's thread-safety note), via
 ## `FacetFarRing.col_cache_for` (a real getter — `.duplicate()`, never a live reference). Empty if the shell
@@ -390,14 +542,18 @@ func set_active(new_fid: int) -> void:
 func _col_cache_for(fid: int) -> PackedColorArray:
 	return (_ring as FacetFarRing).col_cache_for(fid)
 
-## Reap finished builds, advance dwell evictions, dispatch new builds into free slots (want-order = priority
-## order), throttle-recompute the want-set on axis drift, then commit ONE whole-surface ArrayMesh rebuild if
-## anything changed AND the commit rate-cap has elapsed. Cheap at rest (no dirty tiles, no in-flight slots ⇒ every
-## loop below is a fast no-op scan) — called once per `FacetFarRing._process`, alongside `_smooth_v2.step()`.
+## WS1a (live A/B perf follow-up #1) — SUSPEND ON-SURFACE. G3 is an orbit/high-altitude feature; on the surface
+## it has nothing useful to show (the near field + V2 own that view) but its full recompute+dispatch+commit
+## cycle was running every frame regardless, at real cost (this alone was the dominant ground-level stall,
+## proc_ms ≈240 live). Reaping ALWAYS runs first (cheap; frees any in-flight worker slot so nothing dangles
+## across a freeze — a tile that finishes building while on-surface still lands in `_tiles`/marks
+## `_commit_dirty`, it simply isn't committed until the ring goes back off-surface: "warm for next ascent").
+## Everything past the reap — recompute, dwell-eviction, dispatch, commit — is skipped while `shell_offsurface()`
+## is false: the resident mesh is a frozen, static draw, exactly as `set_active` above already promises.
+## Called once per `FacetFarRing._process`, alongside `_smooth_v2.step()`.
 func step() -> void:
 	if _sn == 0 or _relief_data == null:
 		return
-	_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
 	for i in range(_sn):
 		if int(_s_fid[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
@@ -412,9 +568,14 @@ func step() -> void:
 		if tile != null and not (tile as Dictionary).is_empty() and _want.has(fid):
 			_tiles[fid] = tile
 			_leaving.erase(fid)
-			_commit_dirty = true      # PERF FIX §3: persistent — survives across step() calls until fully caught up
-		# else: a refusal (G2 not baked yet) or `_want` moved while it built — discard silently; the fid stays in
-		# `_want_order` so a later step() call simply re-dispatches it once its DEM lands.
+			_commit_dirty = true
+		else:
+			_free_arena_slot(fid)   # refusal / no longer wanted — release its reserved slot immediately
+		# a genuine completion with `_want.has(fid)` KEEPS its slot (still reserved, about to be committed).
+	var ring := _ring as FacetFarRing
+	if not ring.shell_offsurface():
+		return   # WS1a: on-surface — no recompute, no dwell-eviction, no dispatch, no commit. Frozen.
+	_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
 	if not _leaving.is_empty():
 		var to_evict := []
 		for fid in _leaving.keys():
@@ -428,6 +589,7 @@ func step() -> void:
 			if _tiles.has(fid):
 				_tiles.erase(fid)
 				_commit_dirty = true
+			_free_arena_slot(fid)
 	for fid in _want_order:
 		var f := int(fid)
 		if _tiles.has(f) or _inflight(f):
@@ -435,18 +597,21 @@ func step() -> void:
 		var slot := _free_slot()
 		if slot < 0:
 			break   # no free worker slot this call — the remainder waits for a later step()
-		var heights := _relief_data.height_grid(f)      # main-thread snapshot — safe hand-off (§0)
+		var arena_slot := _alloc_arena_slot(f)
+		if arena_slot < 0:
+			break   # arena momentarily full (transient dwell overlap) — the remainder waits too
+		var heights := _relief_data.height_grid(f)      # main-thread snapshot — safe hand-off (§0, WS1d-cached)
 		var coarse_col := _col_cache_for(f)              # main-thread snapshot — safe hand-off (§0)
-		var sink_edges := edge_sink_mask(f, _want)       # pure, main-thread, cheap (4 seam_neighbour lookups)
+		var vert_base := arena_slot * VERTS_PER_TILE     # WS1b: baked into the worker's own idx output
 		_s_fid[slot] = f
-		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot, f, heights, coarse_col, sink_edges), true, "orbitrelieftile")
+		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot, f, heights, coarse_col, vert_base), true, "orbitrelieftile")
 	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
 		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
 			_commit()
 			_last_commit_ms = now_ms
 		# else: _commit_dirty stays true (rate-cap window not yet open) — the NEXT eligible step() call retries;
-		# nothing is silently dropped (§3 PERF FIX).
+		# nothing is silently dropped.
 
 func _free_slot() -> int:
 	for i in range(_sn):
@@ -462,64 +627,98 @@ func _inflight(fid: int) -> bool:
 
 ## WorkerThreadPool-dispatched (off MAIN): build one tile. Reads only its own bound args (`heights`/`coarse_col`
 ## are private snapshots, never the live `GlobalReliefData`/`_col_cache`) + write-once `FacetAtlas` statics — see
-## the class doc's thread-safety note. Writes ONLY `_s_result[slot]` under the mutex; never touches `_want`/
-## `_tiles`/any other instance field (single-writer discipline, mirrors `FacetSmoothV2._build_worker`).
-func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, sink_edges: int) -> void:
-	var tile := build_tile(fid, heights, coarse_col, sink_edges)
+## the class doc's thread-safety note. `vert_base` (WS1b) is baked into the tile's own `idx` array here, off-
+## thread — the main thread NEVER remaps an index. Writes ONLY `_s_result[slot]` under the mutex; never touches
+## `_want`/`_tiles`/any other instance field (single-writer discipline, mirrors `FacetSmoothV2._build_worker`).
+func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int) -> void:
+	var tile := build_tile(fid, heights, coarse_col, vert_base)
 	_s_mutex.lock()
 	_s_result[slot] = tile
 	_s_mutex.unlock()
 
-## PERF FIX (§3 REVISED, live A/B regression): NO `SurfaceTool`/`generate_normals()` at all — every tile's
-## `nrm` is already a real analytic normal (`_fill_analytic_normals`, computed off-thread in `build_tile`). This
-## replaces the original whole-merged-mesh `SurfaceTool.create_from + generate_normals` pass (measured ~250ms
-## on ~384 tiles / ≈418K verts, ON THE MAIN THREAD, live) with a single `add_surface_from_arrays` call over
-## already-complete POSITION/NORMAL/COLOR/INDEX arrays — array concatenation (`FacetSmoothV2.merge_tiles`,
-## reused verbatim, race-free ascending-fid order) plus a GPU buffer upload, no CPU-side geometry analysis.
-##
-## BATCH-CAPPED (§3): evicts any `_committed_tiles` entry no longer in `_tiles` first, then adds AT MOST
-## `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles from `_tiles` this call — so even a burst where the whole
-## want-set becomes ready at once fills the LIVE mesh gradually across many rate-capped commits, never one
-## upload of the whole resident set in a single frame. `_commit_dirty` (set by `step()`) is cleared only once
-## `_committed_tiles` fully matches `_tiles` (checking sizes is sufficient: `_committed_tiles` is always a
-## subset of `_tiles`'s key domain by construction, since eviction sync runs first every call).
+## WS1b/WS4 (live A/B perf follow-up) — the ARENA commit. NO whole-set re-merge: (1) sync evictions (a freed
+## arena slot was ALREADY degenerated by `_free_arena_slot` when the fid left `_tiles` — this just drops the
+## bookkeeping entry); (2) admit up to `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles into `_committed_tiles`
+## (their arena slot was already reserved at DISPATCH time, §`_alloc_arena_slot`); (3) WS4 — recompute
+## `edge_sink_mask` against the ACTUAL `_committed_tiles` set (not the aspirational `_want`) for every newly-
+## admitted tile AND any of its ALREADY-committed neighbours (whose own mask may have just changed now that this
+## neighbour is real) — write each affected tile's SUNK position copy (`sunk_positions`, canonical `_tiles[fid]`
+## stays un-sunk) into its arena slot; (4) upload the WHOLE persistent (fixed-size) arena in ONE
+## `add_surface_from_arrays` call. Steps (2)+(3) together cost O(≤ORBIT_RELIEF_COMMIT_TILES × 5) tile writes,
+## NEVER O(resident-set) — the perf bug this replaces re-merged the ENTIRE committed subset (up to 384 tiles'
+## index remap) every single commit.
 func _commit() -> void:
+	_ensure_arena()
 	for fid in _committed_tiles.keys():
 		if not _tiles.has(fid):
 			_committed_tiles.erase(fid)
+	var newly_added: Array = []
 	var added := 0
 	for fid in _tiles.keys():
 		if added >= CubeSphere.ORBIT_RELIEF_COMMIT_TILES:
 			break
-		if not _committed_tiles.has(fid):
-			_committed_tiles[fid] = true
-			added += 1
-	var subset := {}
-	for fid in _committed_tiles.keys():
-		subset[fid] = _tiles[fid]
-	var merged := FacetSmoothV2.merge_tiles(subset)
-	var pos: PackedVector3Array = merged["pos"]
-	if pos.is_empty():
-		_mi.mesh = ArrayMesh.new()
-	else:
-		var arr := []
-		arr.resize(Mesh.ARRAY_MAX)
-		arr[Mesh.ARRAY_VERTEX] = pos
-		arr[Mesh.ARRAY_NORMAL] = merged["nrm"]
-		arr[Mesh.ARRAY_COLOR] = merged["col"]
-		arr[Mesh.ARRAY_INDEX] = merged["idx"]
-		var m := ArrayMesh.new()
-		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-		_mi.mesh = m
+		var f := int(fid)
+		if _committed_tiles.has(f):
+			continue
+		_committed_tiles[f] = true
+		newly_added.append(f)
+		added += 1
+	var to_write := {}
+	for f in newly_added:
+		to_write[f] = true
+		for slot_dir in [FacetAtlas.S_WEST, FacetAtlas.S_EAST, FacetAtlas.S_SOUTH, FacetAtlas.S_NORTH]:
+			var nb := FacetAtlas.seam_neighbour(f, slot_dir)
+			if _committed_tiles.has(nb):
+				to_write[nb] = true   # an already-committed neighbour's sink mask may have just changed
+	for fid in to_write.keys():
+		var f := int(fid)
+		var slot: int = _fid_slot.get(f, -1)
+		if slot < 0 or not _tiles.has(f):
+			continue
+		var mask := edge_sink_mask(f, _committed_tiles)
+		_write_arena_slot(slot, _tiles[f], mask)
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = _arena_pos
+	arr[Mesh.ARRAY_COLOR] = _arena_col
+	arr[Mesh.ARRAY_INDEX] = _arena_idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	_mi.mesh = m
 	_commit_dirty = _committed_tiles.size() != _tiles.size()
 
-## NEVER-OOM telemetry: actual resident bytes right now (sum of live tiles' `tile_bytes()`, not the theoretical
-## cap) — mirrors `GlobalReliefData.resident_bytes()`'s ledger convention.
-func resident_bytes() -> int:
-	var b := 0
-	for fid in _tiles.keys():
-		b += tile_bytes(_tiles[fid])
-	return b
+## Write ONE tile's (sink-masked) data into its reserved arena slot. `tile["idx"]` is already offset by this
+## slot's `vert_base` (baked in at `build_tile`, worker-side) — this is a plain per-index COPY, no arithmetic. WS3:
+## no `nrm` slot — the mesh carries no normal attribute (`make_material`'s shader derives its own in-shader).
+func _write_arena_slot(slot: int, tile: Dictionary, sink_edges: int) -> void:
+	var vbase := slot * VERTS_PER_TILE
+	var ibase := slot * IDX_PER_TILE
+	var spos := sunk_positions(tile["pos"], ORBIT_RELIEF_CELLS, ORBIT_RELIEF_CELLS + 1, sink_edges)
+	var tcol: PackedColorArray = tile["col"]
+	var tidx: PackedInt32Array = tile["idx"]
+	for k in range(VERTS_PER_TILE):
+		_arena_pos[vbase + k] = spos[k]
+		_arena_col[vbase + k] = tcol[k]
+	for k in range(IDX_PER_TILE):
+		_arena_idx[ibase + k] = tidx[k]
 
+## NEVER-OOM telemetry: the arena's FIXED resident byte cost (allocated once at full capacity, §`arena_bytes`)
+## — 0 until `setup_instance` has run.
+func resident_bytes() -> int:
+	return arena_bytes() if _arena_ready else 0
+
+## How many facets are ACTUALLY drawn right now (not merely built/queued — `_tiles.size()` for that).
 func tile_count() -> int:
-	return _tiles.size()
+	return _committed_tiles.size()
+
+## WS3 live sun wiring (mirrors `FacetSmoothV2.set_sun_dir`): feed the current Sun direction into THIS instance's
+## OWN material (a separate ShaderMaterial from V2's/the shell's) so its terminator tracks live time. No-op if the
+## material isn't built yet (mirrors V2's guard).
+func set_sun_dir(sun_dir: Vector3) -> void:
+	if _material != null:
+		_material.set_shader_parameter("sun_dir", sun_dir)
+	# FP_FAR_TERMINATOR_WELD: record the live value so the NEXT rebuilt instance (a facet crossing frees and
+	# reconstructs this whole object) seeds from it in `make_material` instead of the hardcoded fake-noon default.
+	# Off ⇒ a no-op write to a var `make_material` never reads ⇒ byte-identical.
+	if CubeSphere.FP_FAR_TERMINATOR_WELD:
+		_last_sun_dir = sun_dir

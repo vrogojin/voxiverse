@@ -3201,6 +3201,12 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_smooth_v2_sun_dir(sun_dir)
 
+## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): forward the current Sun direction to G3's own
+## material. No-op with no faceted ring / no orbit-relief instance (the ring setter self-guards) ⇒ byte-identical.
+func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_orbit_relief_sun_dir(sun_dir)
+
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
 ## + the atlas setter both self-guard) ⇒ byte-identical.

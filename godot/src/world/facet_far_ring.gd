@@ -62,6 +62,12 @@ var _smooth = null
 # does NOT replace/interact with `_smooth` above (the old ladder is left untouched). A second small MeshInstance3D
 # child of this ring, sharing its placement transform, drawing OVER the shell (no exclusion). null off (inert).
 var _smooth_v2 = null
+# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b, FP_SKIN_RELIEF_SHADE): the shared whole-planet
+# G1a hillshade data (owned/baked by WorldManager, pushed here once via set_relief_data). null off (inert) — the
+# ORBIT-VISIBLE base CELLS=4 grid's own colour bake (`_ensure_cached`, below) samples it if non-null AND the flag
+# is on; every other tier (dense backstop, weld, env variants) is UNTOUCHED this pass (Stage-1b scope: base grid
+# only — the tier a player actually sees from orbit with default flags).
+var _relief_shade: GlobalReliefData = null
 var _smooth_assign: Dictionary = {}   # fid -> tier (S3/S4/S5): the driver's own hysteresis-held request state (P1)
 # COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md REVISION 3 Q1 (FP_SMOOTH_IDLE): the driver's own fixpoint-at-rest cache.
 # `_smooth_idle_sig` is the (active_fid, excluded-set) signature `_smooth_drive` computed LAST call; when a fresh call
@@ -3078,7 +3084,22 @@ func _ensure_cached(fid: int, force := false, env_on := TierPlace.env_all_on(), 
 			# far water iff g < SEA_LEVEL — STRICT, matching near's sea fill (g < y <= SEA_LEVEL, so g==SEA_LEVEL is DRY
 			# beach/shelf sand, not water). `<=` painted the flattened beach shelf (a wide band quantized to g==SEA_LEVEL)
 			# as water over near's sand. Matches the already-correct far_mesh_builder.gd classifier.
-			col.append(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
+			var node_col := FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL)
+			# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b, FP_SKIN_RELIEF_SHADE): multiply the
+			# SUN-AGNOSTIC G1a hillshade into the vertex COLOUR itself — no shader change, no new uniform/sampler;
+			# the existing v_st (live sun/day-night, applied in the fragment shader) still multiplies on TOP of this
+			# baked value, so the composition is (base_colour × hillshade) × v_st — multiplicative, never fighting
+			# FP_FAR_TERMINATOR_WELD's day/night term (§4). CELLS(shell)=4 maps EXACTLY onto GlobalReliefData's own
+			# CELLS=32 node grid (32/4=8, integer — no interpolation/rounding needed): this shell's node (gi,gj) IS
+			# G2's node (gi·8, gj·8) in the SAME (s,t) parametrisation. `shade_at` degrades to 1.0 (no darkening) for
+			# a facet G2 hasn't baked yet — the SAME "un-baked = shipped look, never black, sharpens later" law the
+			# colour-skin prebake already uses; a re-emit after G2 finishes catches up. Off (flag or no `_relief_shade`
+			# pushed) ⇒ node_col is untouched ⇒ byte-identical.
+			if CubeSphere.FP_SKIN_RELIEF_SHADE and _relief_shade != null:
+				var g2_scale := GlobalReliefData.CELLS / CELLS   # == 8, exact
+				var shade := _relief_shade.shade_at(fid, gi * g2_scale, gj * g2_scale)
+				node_col = Color(node_col.r * shade, node_col.g * shade, node_col.b * shade, node_col.a)
+			col.append(node_col)
 	_pos_cache[fid] = pos
 	_col_cache[fid] = col
 
@@ -4839,6 +4860,13 @@ func set_shell_absolute_sun_dir(sun_dir: Vector3) -> void:
 func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _smooth_v2 != null:
 		_smooth_v2.set_sun_dir(sun_dir)
+
+## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b): push the WorldManager-owned G1a hillshade data
+## in once at construction (mirrors how other cross-cutting singletons are handed to the ring). Called with null
+## OR never called at all ⇒ `_relief_shade` stays null ⇒ `_ensure_cached`'s shade multiply never engages ⇒ byte-
+## identical off (the flag itself is a second independent guard on top of this).
+func set_relief_data(rd: GlobalReliefData) -> void:
+	_relief_shade = rd
 
 ## FP_FAR_TERMINATOR_WELD telemetry: the shell material's OWN live `sun_dir` uniform (the sun-echo, `sd_shell`),
 ## whichever shader is currently on `_mi.material_override` (v2-absolute / tint / biased-tier). (1,0,0) sentinel

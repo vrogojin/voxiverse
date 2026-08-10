@@ -690,6 +690,33 @@ const BAND_PROMOTE_DIST := 1500.0
 ## G-CSB-EQ. Bake ON at export alongside the smooth stack.
 const FP_CPP_SMOOTH_BAKE := false
 
+## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, STAGE 1) — "mountains flat from orbit" fix. Root cause
+## (analysed, not guessed): the FacetFarRing shell shades every fragment by the planet-RADIAL normal ONLY (zero
+## slope contrast) and its own CELLS=4 node grid (~104-block cells) under-samples the ~1250-block mountain
+## wavelength — real relief geometry exists only in the view-local `FP_SMOOTH_V2` annulus (hop 2..4 around the
+## active facet), gone beyond ~4 facets. See `godot/src/world/global_relief_data.gd` for the full mechanism.
+##
+## `FP_GLOBAL_RELIEF_DATA` ("G2"): a bounded whole-planet i16 height DEM (CELLS(32)²/facet nodes, ~7.5 MB,
+## always CPU-resident once baked), filled facet-by-facet via `bake_smooth_tile` (patch 0012, resolution-agnostic,
+## already engine-resident) under the SAME governed pacer discipline as `FP_BG_PREBAKE` (≤1 facet/frame, only on
+## healthy frames, view-cone-first). This is the shared DATA source both G1 (shading, this pass) and the later
+## G3 (a view-dependent relief mesh, LATER PASS) read from. Off ⇒ `GlobalReliefData.setup()` never allocates the
+## arrays, `step()`/`bake_facet()` are no-ops ⇒ byte-identical.
+##
+## `FP_SKIN_RELIEF_SHADE` ("G1a"): a SUN-AGNOSTIC hillshade/AO layer derived from G2's height gradients (slope
+## magnitude only — no `sun_dir` term anywhere in its signature, so it is structurally incapable of the
+## `FP_SMOOTH_V2_LIT` wrong-sun-shadow failure class). Baked in the SAME pass as G2 (near-zero extra cost — the
+## height samples are already resident). Requires FP_GLOBAL_RELIEF_DATA (reads its heights). STAGE-1 SCOPING: the
+## GPU-texture/shader-ALBEDO compositing this pass stores the shade DATA at G2's own 33²/facet resolution
+## (~+3.6 MB, not yet spliced into the live shell shader — see `global_relief_data.gd`'s doc comment for the
+## disclosed scoping decision + follow-up path). `FP_SMOOTH_V2_LIT` (relief SLOPE-shadow lighting) is a wholly
+## separate, still-off flag — this fix does not touch it.
+##
+## Both default FALSE ⇒ byte-identical, FLAT verify_feature 6042/0. Gate: verify_far_geometry.gd
+## (G-GP-OFF/G-GP-DATA-EQ/G-GP-BYTES/G-GP-PACE + the G1a sun-agnostic invariant).
+const FP_GLOBAL_RELIEF_DATA := false
+const FP_SKIN_RELIEF_SHADE := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

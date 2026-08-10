@@ -20,6 +20,13 @@ extends RefCounted
 ##
 ## Tile pitch is literally G2's own grid — `ORBIT_RELIEF_CELLS == GlobalReliefData.CELLS` (32) — a 1:1 read, no
 ## rescale, no interpolation.
+##
+## PERF FIX (live A/B regression, task #99 G3 follow-up — see `cube_sphere.gd`'s `FP_ORBIT_RELIEF` doc for the
+## measured numbers): normals are computed ANALYTICALLY per tile, off-thread, in `build_tile`
+## (`_fill_analytic_normals`) — NOT via a whole-merged-mesh `SurfaceTool.generate_normals()` pass on commit,
+## which is what the first shipped cut of this flag did and which stalled the main thread ≈250ms/commit. `_commit`
+## is now a plain array-concatenation (`FacetSmoothV2.merge_tiles`) + ONE `add_surface_from_arrays` upload,
+## batch-capped to `ORBIT_RELIEF_COMMIT_TILES` newly-added tiles per call.
 
 const ORBIT_RELIEF_CELLS := 32   # == GlobalReliefData.CELLS; kept as its own const so this file has no hard
                                   # compile-time dependency on GlobalReliefData's internals beyond height_grid()'s shape
@@ -145,9 +152,7 @@ static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedCo
 	var r_datum := FacetAtlas.r_of(fid)
 	var scale := cells / FacetFarRing.CELLS          # == 8, exact (ORBIT_RELIEF_CELLS(32) / shell CELLS(4))
 	var pos := PackedVector3Array(); pos.resize(n)
-	var nrm := PackedVector3Array(); nrm.resize(n)    # placeholder (== outward radial dir); merge_tiles expects the
-	                                                    # key, and _commit() overwrites every normal via generate_normals
-	                                                    # right after merging — see §1.6, no per-tile normal law needed
+	var nrm := PackedVector3Array(); nrm.resize(n)
 	var col := PackedColorArray(); col.resize(n)
 	var g := PackedInt32Array(); g.resize(n)          # kept for G-OR-DATA-EQ / no-protrusion verification
 	for j in range(stride):
@@ -158,12 +163,43 @@ static func build_tile(fid: int, heights: PackedInt32Array, coarse_col: PackedCo
 			g[k] = h
 			var relief := maxf(0.0, float(h - TerrainConfig.SEA_LEVEL)) * FacetFarRing.RELIEF
 			pos[k] = d * (r_datum + relief)
-			nrm[k] = d
 			col[k] = coarse_color(coarse_col, i, j, scale, FacetFarRing.CELLS)
+	_fill_analytic_normals(pos, nrm, cells, stride)   # §1.6 REVISED — see the class doc's perf-fix note
 	var idx := _grid_indices(cells, stride)
 	var tile := {"pos": pos, "nrm": nrm, "col": col, "g": g, "idx": idx}
-	_append_edge_sink(tile, cells, stride, sink_edges)
+	_append_edge_sink(tile, cells, stride, sink_edges)   # touches pos only; normals already derived from the raw relief
 	return tile
+
+## PERF FIX (live A/B regression, task #99 G3 follow-up): a per-tile ANALYTIC normal from the tile's own already-
+## computed position grid — central-difference tangents at interior nodes, one-sided at the tile's own boundary
+## (no neighbour-tile data available here) — cross-producted and oriented outward against the local radial
+## direction. Mirrors `FacetSmoothV2`'s V2-2 (`FP_SMOOTH_V2_LIT`) provoking-vertex normal law exactly (same
+## cross-product + "flip if it points inward" convention), just applied to EVERY node instead of one per cell
+## (G3's colour is already smooth/per-vertex, §1.4, so there is no provoking-vertex constraint to respect here).
+## Runs entirely inside `build_tile` (worker-side) — this REPLACES the original design's "compute nothing per
+## tile, let SurfaceTool.generate_normals() do a whole-merged-mesh pass at commit" plan: live telemetry showed
+## that whole-mesh pass costing ~250ms/commit on ~384 tiles (≈418K verts) ON THE MAIN THREAD (proc_ms 127-158,
+## frame_worst_ema 250ms, fps 8-29 during build-up) — the exact REV7-class stall this codebase's own "never do
+## expensive per-frame work on main" discipline exists to prevent. Trade-off, disclosed: a tile's OWN boundary
+## normal is a one-sided estimate (no cross-tile smoothing), so a shared G3-G3 tile edge may show a faint normal
+## kink under grazing light — cosmetic only, invisible at G3's own orbital viewing distance, and a strictly
+## better trade than a ~250ms main-thread stall every ORBIT_RELIEF_COMMIT_MS.
+static func _fill_analytic_normals(pos: PackedVector3Array, nrm: PackedVector3Array, cells: int, stride: int) -> void:
+	for j in range(stride):
+		for i in range(stride):
+			var k := j * stride + i
+			var il := maxi(i - 1, 0); var ir := mini(i + 1, cells)
+			var jd := maxi(j - 1, 0); var ju := mini(j + 1, cells)
+			var pu: Vector3 = pos[j * stride + ir] - pos[j * stride + il]    # tangent along i (west->east)
+			var pv: Vector3 = pos[ju * stride + i] - pos[jd * stride + i]    # tangent along j (south->north)
+			var n := pu.cross(pv)
+			if n.length() > 0.0:
+				n = n.normalized()
+				if n.dot(pos[k].normalized()) < 0.0:
+					n = -n
+				nrm[k] = n
+			else:
+				nrm[k] = pos[k].normalized()   # degenerate (zero-area) fallback: radial, never a zero vector
 
 ## Plain 2-tri/cell quad grid — smooth (per-vertex, not `flat`) colour, so no provoking-vertex convention is
 ## needed (unlike V2's per-CELL flat paint): G3's colour already varies smoothly node-to-node (§ coarse_color).
@@ -266,7 +302,7 @@ var _ring: Node3D = null              ## owning FacetFarRing — read-only acces
 
 var _want: Dictionary = {}            ## fid -> true (current residency target)
 var _want_order: Array = []           ## the SAME fids, priority order (dispatch priority)
-var _tiles: Dictionary = {}           ## fid -> tile dict (resident, committed on main)
+var _tiles: Dictionary = {}           ## fid -> tile dict (BUILT, off-thread — not necessarily uploaded yet, see _committed_tiles)
 var _leaving: Dictionary = {}         ## fid -> dwell steps remaining before eviction
 
 var _last_axis_recompute_ms := 0
@@ -278,6 +314,14 @@ var _s_task: PackedInt32Array = PackedInt32Array()
 var _s_result: Array = []
 var _s_mutex: Mutex = null
 
+# PERF FIX (§3 REVISED): `_committed_tiles` is the SUBSET of `_tiles` currently reflected in the live `_mi.mesh`
+# — commits add at most `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles per call, so the resident set fills the
+# visible mesh gradually across many commits rather than one whole-set upload. `_commit_dirty` is a PERSISTENT
+# (not per-step-call) flag: true whenever `_tiles` has diverged from `_committed_tiles` (a fresh build landed,
+# or an eviction happened) and NOT yet fully caught up — so a rate-cap-blocked commit is not silently dropped,
+# it just waits for the next eligible `step()` call.
+var _committed_tiles: Dictionary = {}   ## fid -> true (already uploaded into _mi.mesh)
+var _commit_dirty := false
 var _last_commit_ms := 0
 
 ## Construct the ONE MeshInstance3D (child of `ring`, sharing its placement transform), the worker slot pool,
@@ -354,7 +398,6 @@ func step() -> void:
 	if _sn == 0 or _relief_data == null:
 		return
 	_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
-	var dirty := false
 	for i in range(_sn):
 		if int(_s_fid[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
@@ -369,7 +412,7 @@ func step() -> void:
 		if tile != null and not (tile as Dictionary).is_empty() and _want.has(fid):
 			_tiles[fid] = tile
 			_leaving.erase(fid)
-			dirty = true
+			_commit_dirty = true      # PERF FIX §3: persistent — survives across step() calls until fully caught up
 		# else: a refusal (G2 not baked yet) or `_want` moved while it built — discard silently; the fid stays in
 		# `_want_order` so a later step() call simply re-dispatches it once its DEM lands.
 	if not _leaving.is_empty():
@@ -384,7 +427,7 @@ func step() -> void:
 			_leaving.erase(fid)
 			if _tiles.has(fid):
 				_tiles.erase(fid)
-				dirty = true
+				_commit_dirty = true
 	for fid in _want_order:
 		var f := int(fid)
 		if _tiles.has(f) or _inflight(f):
@@ -397,14 +440,13 @@ func step() -> void:
 		var sink_edges := edge_sink_mask(f, _want)       # pure, main-thread, cheap (4 seam_neighbour lookups)
 		_s_fid[slot] = f
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot, f, heights, coarse_col, sink_edges), true, "orbitrelieftile")
-	if dirty:
+	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
-		if should_commit(dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
+		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
 			_commit()
 			_last_commit_ms = now_ms
-		# else: stays dirty implicitly (the NEXT step() call re-checks _leaving/_tiles state and will still find
-		# a reason to commit once the rate-cap window opens — no separate "pending" flag needed since `_tiles`
-		# itself already reflects the latest state; the commit merely hasn't been pushed to the RenderingServer yet)
+		# else: _commit_dirty stays true (rate-cap window not yet open) — the NEXT eligible step() call retries;
+		# nothing is silently dropped (§3 PERF FIX).
 
 func _free_slot() -> int:
 	for i in range(_sn):
@@ -428,28 +470,48 @@ func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: P
 	_s_result[slot] = tile
 	_s_mutex.unlock()
 
-## Whole-surface commit (§3/§1.6): merge the resident tiles (race-free ascending-fid order, `FacetSmoothV2.
-## merge_tiles` reused verbatim), build the raw ArrayMesh, then ONE `SurfaceTool.generate_normals()` pass over
-## the WHOLE merged mesh — the SAME create_from+generate_normals+commit pattern `FacetFarRing._build_fast`
-## already uses for the shell, so cross-facet-boundary normal smoothing applies here too (the shared-vertex
-## positions are bit-equal by the weld argument in §0, so SurfaceTool's global smoothing merges them correctly).
+## PERF FIX (§3 REVISED, live A/B regression): NO `SurfaceTool`/`generate_normals()` at all — every tile's
+## `nrm` is already a real analytic normal (`_fill_analytic_normals`, computed off-thread in `build_tile`). This
+## replaces the original whole-merged-mesh `SurfaceTool.create_from + generate_normals` pass (measured ~250ms
+## on ~384 tiles / ≈418K verts, ON THE MAIN THREAD, live) with a single `add_surface_from_arrays` call over
+## already-complete POSITION/NORMAL/COLOR/INDEX arrays — array concatenation (`FacetSmoothV2.merge_tiles`,
+## reused verbatim, race-free ascending-fid order) plus a GPU buffer upload, no CPU-side geometry analysis.
+##
+## BATCH-CAPPED (§3): evicts any `_committed_tiles` entry no longer in `_tiles` first, then adds AT MOST
+## `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles from `_tiles` this call — so even a burst where the whole
+## want-set becomes ready at once fills the LIVE mesh gradually across many rate-capped commits, never one
+## upload of the whole resident set in a single frame. `_commit_dirty` (set by `step()`) is cleared only once
+## `_committed_tiles` fully matches `_tiles` (checking sizes is sufficient: `_committed_tiles` is always a
+## subset of `_tiles`'s key domain by construction, since eviction sync runs first every call).
 func _commit() -> void:
-	var merged := FacetSmoothV2.merge_tiles(_tiles)
+	for fid in _committed_tiles.keys():
+		if not _tiles.has(fid):
+			_committed_tiles.erase(fid)
+	var added := 0
+	for fid in _tiles.keys():
+		if added >= CubeSphere.ORBIT_RELIEF_COMMIT_TILES:
+			break
+		if not _committed_tiles.has(fid):
+			_committed_tiles[fid] = true
+			added += 1
+	var subset := {}
+	for fid in _committed_tiles.keys():
+		subset[fid] = _tiles[fid]
+	var merged := FacetSmoothV2.merge_tiles(subset)
 	var pos: PackedVector3Array = merged["pos"]
 	if pos.is_empty():
 		_mi.mesh = ArrayMesh.new()
-		return
-	var arr := []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = pos
-	arr[Mesh.ARRAY_COLOR] = merged["col"]
-	arr[Mesh.ARRAY_INDEX] = merged["idx"]
-	var flat := ArrayMesh.new()
-	flat.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-	var st := SurfaceTool.new()
-	st.create_from(flat, 0)
-	st.generate_normals()
-	_mi.mesh = st.commit()
+	else:
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = pos
+		arr[Mesh.ARRAY_NORMAL] = merged["nrm"]
+		arr[Mesh.ARRAY_COLOR] = merged["col"]
+		arr[Mesh.ARRAY_INDEX] = merged["idx"]
+		var m := ArrayMesh.new()
+		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		_mi.mesh = m
+	_commit_dirty = _committed_tiles.size() != _tiles.size()
 
 ## NEVER-OOM telemetry: actual resident bytes right now (sum of live tiles' `tile_bytes()`, not the theoretical
 ## cap) — mirrors `GlobalReliefData.resident_bytes()`'s ledger convention.

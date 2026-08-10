@@ -22,6 +22,15 @@ extends SceneTree
 ##   G-OR-PACE    — a pathological "every facet on the planet wants a tile" burst still dispatches at most one
 ##                  build per free worker slot in ONE `step()` call (never a storm); the commit rate-cap
 ##                  (`should_commit`, pure) blocks a second commit inside the same window, allows one outside it.
+##   G-OR-COMMIT-COST — the PERF FIX (live A/B regression, root-caused to a ≈250ms/commit main-thread
+##                  `SurfaceTool.generate_normals()` pass over the whole merged mesh): (a) a real facet's
+##                  `build_tile` normals are NOT the degenerate placeholder (pure radial) — real slope-informed
+##                  analytic normals actually reach the tile, computed off-thread; (b) `_commit()`'s source
+##                  contains no `SurfaceTool`/`generate_normals` call at all (static, grep-asserted — the fix
+##                  removed the whole-mesh CPU pass, not just made it cheaper); (c) ONE `step()` + `_commit()`
+##                  call folds AT MOST `ORBIT_RELIEF_COMMIT_TILES` newly-built tiles into the live mesh, even
+##                  when the ENTIRE 384-tile want-set is ready at once (falsifier: mark all resident ⇒ still
+##                  ≤ORBIT_RELIEF_COMMIT_TILES newly added this commit, not all 384).
 ##
 ## RUN (needs FACETED + FP_GLOBAL_RELIEF_DATA sed-toggled true for the ON-path gates, per the design's
 ## dependency on G2):
@@ -57,8 +66,9 @@ func _initialize() -> void:
 		_gate_bytes()
 		_gate_weld()
 		_gate_pace()
+		_gate_commit_cost()
 	else:
-		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/PACE: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
+		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/PACE/COMMIT-COST: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -240,3 +250,61 @@ func _gate_pace() -> void:
 	_ok(not FOR_.should_commit(true, 1100, 1000, 500), "G-OR-PACE: an IMMEDIATE second commit-worthy event (1000->1100ms, only 100ms later) is BLOCKED by the rate-cap")
 	_ok(FOR_.should_commit(true, 1600, 1000, 500), "G-OR-PACE: a commit-worthy event AFTER the window (1000->1600ms, 600ms later) is allowed")
 	_ok(not FOR_.should_commit(false, 5000, 0, 500), "G-OR-PACE: should_commit never fires when nothing is dirty, regardless of elapsed time")
+
+# --- G-OR-COMMIT-COST: the PERF FIX — real off-thread normals, no SurfaceTool in _commit(), batch-capped upload ------
+func _gate_commit_cost() -> void:
+	var fid := 12   # real terrain, the same facet every other gate above already uses
+	var rd := GlobalReliefData.new()
+	rd.setup()
+	rd.bake_facet(fid)
+	var heights := rd.height_grid(fid)
+	var tile := FOR_.build_tile(fid, heights, PackedColorArray(), 0)
+	var nrm: PackedVector3Array = tile["nrm"]
+	var pos: PackedVector3Array = tile["pos"]
+	var any_off_radial := false
+	for k in range(nrm.size()):
+		if nrm[k].distance_to(pos[k].normalized()) > EPS:
+			any_off_radial = true
+			break
+	_ok(any_off_radial, "G-OR-COMMIT-COST: build_tile's normals are REAL analytic slope normals, not the degenerate pure-radial placeholder (computed off-thread)")
+
+	# Static source check: _commit()'s body — NOT the whole file (the class/flag doc comments legitimately mention
+	# SurfaceTool/generate_normals when describing what was REMOVED) — contains no SurfaceTool/generate_normals call.
+	var f := FileAccess.open("res://src/world/facet_orbit_relief.gd", FileAccess.READ)
+	_ok(f != null, "G-OR-COMMIT-COST: opened facet_orbit_relief.gd for the static source check")
+	if f != null:
+		var text := f.get_as_text()
+		var start := text.find("func _commit()")
+		_ok(start >= 0, "G-OR-COMMIT-COST: found _commit()'s definition")
+		if start >= 0:
+			var next_func := text.find("\nfunc ", start + 1)
+			var body := text.substr(start, (next_func - start) if next_func >= 0 else -1)
+			_ok(body.find("SurfaceTool") == -1, "G-OR-COMMIT-COST: _commit()'s body never references SurfaceTool")
+			_ok(body.find("generate_normals") == -1, "G-OR-COMMIT-COST: _commit()'s body never calls generate_normals")
+			_ok(body.find("add_surface_from_arrays") != -1, "G-OR-COMMIT-COST: _commit() still commits via the SAFE high-level add_surface_from_arrays API")
+
+	# The batch cap: mark the WHOLE 384-tile want-set as already BUILT (bypassing real dispatch — this gate only
+	# needs to prove the COMMIT-time batching, not re-prove dispatch pacing, already covered by G-OR-PACE) and
+	# confirm ONE _commit() call folds at most ORBIT_RELIEF_COMMIT_TILES of them into the live mesh.
+	var ring := FacetFarRing.new()
+	ring._active_fid = fid
+	var relief := FacetOrbitRelief.new()
+	relief.setup_instance(ring, fid, rd)
+	var n := CubeSphere.ORBIT_RELIEF_MAX_TILES
+	for i in range(n):
+		relief._tiles[i] = tile   # any valid tile dict works — this gate is about COUNT, not per-fid content
+	relief._commit_dirty = true
+	relief._commit()
+	_ok(relief._committed_tiles.size() <= CubeSphere.ORBIT_RELIEF_COMMIT_TILES,
+		"G-OR-COMMIT-COST: ONE _commit() call folds at most ORBIT_RELIEF_COMMIT_TILES(%d) of the %d-tile burst into the live mesh (got %d)" % [CubeSphere.ORBIT_RELIEF_COMMIT_TILES, n, relief._committed_tiles.size()])
+	_ok(relief._committed_tiles.size() == CubeSphere.ORBIT_RELIEF_COMMIT_TILES,
+		"G-OR-COMMIT-COST: the burst actually SATURATES the batch cap (proves this isn't a vacuous pass)")
+	_ok(relief._commit_dirty, "G-OR-COMMIT-COST: still dirty after one capped commit — the rest of the burst is NOT silently dropped")
+	# Drain the remaining batches (mirrors real steady-state operation) and confirm full convergence.
+	var iterations := 0
+	while relief._commit_dirty and iterations < n:
+		relief._commit()
+		iterations += 1
+	_ok(not relief._commit_dirty and relief._committed_tiles.size() == n,
+		"G-OR-COMMIT-COST: repeated capped commits eventually converge to the full %d-tile resident set (took %d more commits)" % [n, iterations])
+	ring.free()

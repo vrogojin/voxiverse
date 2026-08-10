@@ -158,21 +158,37 @@ distance sub-node protrusion is cosmetic, not gameplay-relevant (no collision, n
 asserts both halves: the flagged edge sinks by exactly `backstop_sink()`, and every non-flagged node is
 byte-identical to the unsunk build.
 
-### 1.6 Normals — ONE `generate_normals()` pass over the WHOLE merged mesh, at commit time only
+### 1.6 Normals — REVISED after a live perf regression: per-tile analytic, off-thread, NO SurfaceTool
 
-Per-tile builds emit NO normals (workers only compute pos/col/g/idx). The commit step (§3, main thread, already
-whole-surface by construction) does exactly what the shell's own `_build_fast` already does
-(`facet_far_ring.gd:2812-2817`, `ArrayMesh.add_surface_from_arrays` → `SurfaceTool.create_from` →
-`st.generate_normals()` → `st.commit()`): build the merged relief mesh's raw position/colour/index arrays, then
-ONE C++ `generate_normals()` call. This is not a new normal law — it is the literal existing shell pattern,
-reused so the SAME "GLOBAL smoothing merges shared vertices across facet seams" property (already proven
-bit-identical/seamless for the shell) applies to G3's cross-facet boundaries too, since G3's vertices at a
-shared edge are bit-identical positions by the weld argument in §0. Material: reuse `FacetSmoothV2`'s `FP_SMOOTH_V2_LIT`
-shader family (real per-vertex `NORMAL`-driven shading) rather than the shell's own radial-only
-`_SHELL_ABS_SHADER` — G3's normals carry genuine slope information (unlike the flat shell), so a real-normal
-shader is where that information actually gets used. This is a shading/material follow-up, not gated here (no
-`verify_atmo_sky`-class live-probe gate exists for shader source in this repo — same disclosed limitation V2's
-own doc already carries).
+**The original plan below was shipped, A/B'd live, and rolled back** ("extremely laggy, can't do much" — root-
+caused to `SurfaceTool.create_from + generate_normals()` over the whole merged mesh costing ≈250-367ms/commit
+on ~384 tiles/≈418K verts, ON THE MAIN THREAD, repeated every `ORBIT_RELIEF_COMMIT_MS` through the whole
+build-up). `G-OR-PACE`'s rate/count checks didn't catch it because they measured commit *frequency*, not commit
+*duration* — `G-OR-COMMIT-COST` (§5) now covers that gap.
+
+**IMPLEMENTED fix:** each tile's `build_tile` (already worker-dispatched) computes a REAL per-vertex analytic
+normal from its own completed position grid — central-difference tangents (`pos[i+1,j]-pos[i-1,j]`,
+`pos[i,j+1]-pos[i,j-1]`, one-sided at the tile's own boundary), cross-producted, oriented outward against the
+local radial direction. This is the SAME cross-product + outward-orientation convention `FacetSmoothV2`'s V2-2
+(`FP_SMOOTH_V2_LIT`) provoking-vertex normal already uses, just applied to every node (G3's colour is already
+smooth/per-vertex, so there is no provoking-vertex constraint to respect). The commit step no longer touches
+`SurfaceTool` at all: `FacetSmoothV2.merge_tiles` (reused, race-free ascending-fid order) concatenates the
+already-complete pos/nrm/col/idx arrays, and ONE `ArrayMesh.add_surface_from_arrays` call uploads them — no
+CPU-side geometry analysis on the main thread. Measured (headless, real 384-tile-equivalent merge): the OLD
+path cost 367ms; the NEW path (whole set, unbatched) costs 15ms; the NEW path AS ACTUALLY CALLED (§3's
+`ORBIT_RELIEF_COMMIT_TILES`-batched commit, 24 tiles/≈26K verts) costs **<1ms**.
+
+**Disclosed trade-off:** a tile's own boundary normal is a one-sided estimate (no cross-tile smoothing, unlike
+`generate_normals`'s "GLOBAL smoothing merges shared vertices across facet seams" property) — a faint normal
+kink is possible at a G3-G3 tile edge under grazing light. Cosmetic only, invisible at G3's own orbital viewing
+distance, and a strictly better trade than the measured main-thread stall. Positions/heights are UNCHANGED by
+this fix — only where normals are computed and how the mesh is assembled moved.
+
+Material: reuse `FacetSmoothV2`'s `FP_SMOOTH_V2_LIT` shader family (real per-vertex `NORMAL`-driven shading,
+via the now-public `FacetSmoothV2.make_material()`) rather than the shell's own radial-only `_SHELL_ABS_SHADER`
+— G3's normals carry genuine slope information (unlike the flat shell), so a real-normal shader is where that
+information actually gets used. This is a shading/material follow-up, not gated here (no `verify_atmo_sky`-
+class live-probe gate exists for shader source in this repo — same disclosed limitation V2's own doc carries).
 
 ## 2. Coverage / residency — ONE pure law, now covering BOTH the nadir foreground AND the visible silhouette
 
@@ -232,35 +248,46 @@ exists to bound MESH CHURN (new tile dispatches / evictions as the boundary of t
 compute. Facets leaving `want` go through the SAME `EVICT_DWELL_STEPS`-style dwell V2 already uses before actual
 eviction, absorbing small want-set boundary jitter without thrashing.
 
-## 3. Build/commit pipeline — reuses V2's worker-slot-pool + rate-capped whole-mesh commit
+## 3. Build/commit pipeline — REVISED after the perf fix (§1.6): batch-capped incremental commit
 
 ```
-_want: Dictionary          # fid -> true (recomputed per §2.1)
-_want_order: Array         # nearest-emit_axis-first (dispatch priority)
-_tiles: Dictionary         # fid -> tile dict (resident)
-_leaving: Dictionary        # fid -> dwell steps remaining (V2's EVICT_DWELL_STEPS pattern, verbatim)
+_want: Dictionary            # fid -> true (recomputed per §2.1)
+_want_order: Array           # nearest-priority-first (dispatch priority)
+_tiles: Dictionary           # fid -> tile dict (BUILT off-thread — not necessarily uploaded yet)
+_committed_tiles: Dictionary  # fid -> true: the SUBSET of _tiles already reflected in the live _mi.mesh
+_commit_dirty: bool           # PERSISTENT across step() calls — true while _tiles has diverged from _committed_tiles
+_leaving: Dictionary          # fid -> dwell steps remaining (V2's EVICT_DWELL_STEPS pattern, verbatim)
 _sn / _s_fid / _s_task / _s_result / _s_mutex     # THE SAME worker-slot-pool shape as FacetSmoothV2
 ```
 
 Per-`step()` (called from `FacetFarRing._process`, alongside `_smooth_v2.step()`):
 1. Reap completed worker slots exactly like V2's `step()` (`WorkerThreadPool.is_task_completed` →
-   `wait_for_task_completion` → commit into `_tiles` if still wanted → `_dirty = true`).
-2. Advance dwell evictions exactly like V2.
-3. Dispatch new builds into free slots, `_want_order` (nearest-axis-first) order, `WorkerThreadPool.add_task`
-   bound to `_build_worker` — **`RELIEF_BUILD_SLOTS`** (proposed = `SMOOTH_BUILD_SLOTS`, i.e. shares the SAME
-   `OS.get_processor_count()-1` budget reasoning V2 already uses; the two tiers' worker dispatches interleave on
-   the SAME `WorkerThreadPool`, so no double-booking of cores — Godot's pool itself arbitrates).
-4. **Commit, rate-capped**: only if `_dirty` AND `now_ms - _last_commit_ms >= ORBIT_RELIEF_COMMIT_MS` (proposed
-   500ms — longer than the 250ms `CULL_REBUILD_MS`/relief-shade interval, because G3's commit is heavier: up to
-   ~200 tiles × 1089 verts ≈ 218K vertices through ONE `generate_normals()` call, vs a single facet's worth
-   elsewhere). This is the REV7 "apply-bound warmup mesh-commit fix" lesson applied directly: rate-cap the
-   COMMIT, not just the per-tile dispatch — dispatch can happen every step() (bounded by free slots anyway); the
-   expensive whole-mesh reassembly must not.
-5. Commit body: `FacetSmoothV2.merge_tiles(_tiles)` (reused verbatim — race-free, ascending-fid canonical order)
-   → build an `ArrayMesh` from the merged pos/col/idx → `SurfaceTool.create_from` + `generate_normals()` + `commit()`
-   (§1.6) → assign to the ONE `MeshInstance3D`. Whole-surface commit only — **never**
-   `mesh_surface_update_vertex_region`/`_attribute_region` (the ANGLE/WebGL2 uncatchable-crash lesson
-   `facet_smooth_v2.gd`'s own doc already states as non-negotiable; G3 inherits the same constraint, same reason).
+   `wait_for_task_completion` → commit into `_tiles` if still wanted → `_commit_dirty = true`, a persistent
+   flag, not a per-call local — a rate-cap-blocked commit is never silently dropped, §3.2).
+2. Advance dwell evictions exactly like V2 (an eviction also sets `_commit_dirty = true`).
+3. Dispatch new builds into free slots, `_want_order` (priority) order, `WorkerThreadPool.add_task` bound to
+   `_build_worker` — **`RELIEF_BUILD_SLOTS`** (= `SMOOTH_BUILD_SLOTS`, sharing V2's `OS.get_processor_count()-1`
+   budget reasoning; the two tiers' dispatches interleave on the SAME `WorkerThreadPool`, no double-booking).
+4. **Commit, rate-capped**: only if `_commit_dirty` AND `now_ms - _last_commit_ms >= ORBIT_RELIEF_COMMIT_MS`
+   (500ms). This is the REV7 "apply-bound warmup mesh-commit fix" lesson applied directly: rate-cap the COMMIT,
+   not just the per-tile dispatch.
+
+### 3.2 Commit body — batch-capped, no SurfaceTool (the §1.6 perf fix)
+
+`_commit()`: (a) drop any `_committed_tiles` entry no longer in `_tiles` (an eviction synced into the live
+mesh); (b) add up to `ORBIT_RELIEF_COMMIT_TILES`(24) newly-built tiles from `_tiles` not yet in
+`_committed_tiles`; (c) `FacetSmoothV2.merge_tiles` over the resulting `_committed_tiles` subset (reused
+verbatim — race-free, ascending-fid canonical order; each tile's pos/nrm/col/idx were already fully built
+off-thread, §1.6 — commit does zero per-tile recomputation, only concatenation); (d) ONE
+`ArrayMesh.add_surface_from_arrays(PRIMITIVE_TRIANGLES, arr)` with `arr[ARRAY_NORMAL]` populated from the
+already-real per-tile normals — **no `SurfaceTool`, no `generate_normals()`**. Whole-surface commit only —
+**never** `mesh_surface_update_vertex_region`/`_attribute_region` (the ANGLE/WebGL2 uncatchable-crash lesson
+`facet_smooth_v2.gd`'s own doc states as non-negotiable; G3 inherits the same constraint). `_commit_dirty` is
+cleared only once `_committed_tiles.size() == _tiles.size()` (sufficient because `_committed_tiles` is always a
+subset of `_tiles`'s key domain by construction, post-eviction-sync) — so a large want-set fills the LIVE mesh
+gradually across many rate-capped commits, never one whole-set upload in a single frame. Measured (headless,
+§1.6): a real `ORBIT_RELIEF_COMMIT_TILES`-sized commit costs **<1ms**, vs 367ms for the original whole-384-tile
+`SurfaceTool` path.
 
 ### 3.1 Why build off-thread even though each tile is "cheap"
 

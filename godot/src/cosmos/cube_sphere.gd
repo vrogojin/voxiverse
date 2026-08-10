@@ -780,12 +780,30 @@ const FP_RELIEF_REEMIT := false
 ## capped to `ORBIT_RELIEF_COMMIT_MS` apart (the REV7 apply-bound lesson, applied to the commit specifically —
 ## dispatch itself is bounded by free worker slots, not rate-limited separately).
 ##
+## PERF FIX (live A/B regression, task #99 G3 follow-up): the FIRST shipped cut of this flag committed via
+## `SurfaceTool.create_from + generate_normals()` over the WHOLE merged mesh on every commit — live telemetry
+## measured ≈250ms/commit on ~384 tiles (≈418K verts), ALL ON THE MAIN THREAD (proc_ms 127-158, frame_worst_ema
+## 250ms, fps 8-29 during build-up), repeated every `ORBIT_RELIEF_COMMIT_MS` through the whole build-up — an
+## unshippable stall the `G-OR-PACE` gate's rate/count checks didn't catch because they never measured per-
+## commit DURATION. Fixed by moving normal computation OFF the main thread entirely: each tile's `build_tile`
+## (worker-dispatched) now derives a real per-vertex analytic normal from its own already-computed position
+## grid (central-difference tangents, cross-producted, oriented outward — `FacetOrbitRelief._fill_analytic_
+## normals`); `_commit()` no longer touches `SurfaceTool` at all — it is a plain array-concatenation
+## (`merge_tiles`, reused) + ONE `ArrayMesh.add_surface_from_arrays` upload. Also BATCH-CAPPED
+## (`ORBIT_RELIEF_COMMIT_TILES`): a commit adds at most this many newly-built tiles to the live mesh, so even a
+## burst where the whole want-set completes at once fills the mesh gradually across many rate-capped commits,
+## never one 384-tile upload in a single frame. Trade-off, disclosed: per-tile normals are a one-sided estimate
+## at a tile's own boundary (no cross-tile smoothing) — a faint normal kink is possible at a G3-G3 tile seam
+## under grazing light, invisible at G3's own orbital viewing distance, and a strictly better trade than the
+## measured main-thread stall.
+##
 ## Off ⇒ `FacetOrbitRelief` never constructed, byte-identical (FLAT verify_feature.gd unmoved).
 ## Gate: verify_orbit_relief.gd (G-OR-OFF/DATA-EQ/BYTES/WELD/PACE).
 const FP_ORBIT_RELIEF := false
 const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈29.4 MB at ≈76,488 B/tile (see doc above)
 const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
-const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between whole-surface generate_normals() commits
+const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
+const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
 
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the

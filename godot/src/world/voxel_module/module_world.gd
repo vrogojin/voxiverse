@@ -611,6 +611,40 @@ func _inflight_main_q() -> int:
 	var st: Dictionary = _voxel_engine.call("get_stats")
 	return int((st.get("tasks", {}) as Dictionary).get("main_thread", 0))
 
+## FP_NB_FULLRES (§2.5, CORRECTION 1) — the ENGINE-WIDE resident voxel-DATA bytes (VoxelMemoryPool), a REAL measured
+## counter (VoxelEngine.get_stats().memory_pools.voxel_used), reusing the cached singleton from _inflight_main_q. This
+## is one of the two ledger sources (the other is OS.get_static_memory_usage(), read by WorldManager). Returns 0 when
+## the engine/stat is unavailable → the ledger falls back to the static-heap term alone (conservative). get_statistics()
+## on a VoxelTerrain has NO memory counters (only event/time counters), so this VoxelEngine pool read is the only
+## engine-exposed resident-bytes figure. Cheap (one get_stats dict read); called ≤1/pool pass under the flag.
+func nb_voxel_used_bytes() -> int:
+	if _voxel_engine == null:
+		if Engine.has_singleton("VoxelEngine"):
+			_voxel_engine = Engine.get_singleton("VoxelEngine")
+		else:
+			return 0
+	if not _voxel_engine.has_method("get_stats"):
+		return 0
+	var st: Dictionary = _voxel_engine.call("get_stats")
+	var mp = st.get("memory_pools", {})
+	if not (mp is Dictionary):
+		return 0
+	return int((mp as Dictionary).get("voxel_used", 0))
+
+## FP_NB_FULLRES (§2.5 breach ladder step 2) — FREEZE the grow leg of every NON-imminent, non-active pool slot by
+## clamping its view_target down to its current view_f (already-loaded blocks stay; no further growth requested). The
+## imminent (the crossing invariant) and the active are untouched. Idempotent; a later re-admission (below the cap −
+## hysteresis) restores the band target via the ordinary spawn/promote path. No-op when the pool has no widened slots.
+func nb_freeze_grows() -> void:
+	for fid in _pool.keys():
+		if fid == _pool_active or fid == _imminent_fid:
+			continue
+		var s: Dictionary = _pool[fid]
+		var vf := float(s["view_f"])
+		if float(s["view_target"]) > vf:
+			s["view_target"] = vf
+			s["ramp_from"] = vf
+
 ## COSMOS R1 DEV (DEV_HIDE_NEAR): hide/show the near render by collapsing the module's streaming radius.
 ## Node visibility can't hide godot_voxel's RID mesh blocks, so we shrink max_view_distance instead — the
 ## module unloads the near field, leaving only a tiny platform under the player so the baked far layer can
@@ -1985,8 +2019,11 @@ func set_imminent_fid(fid: int, committed: bool = false) -> void:
 	# Demote the OUTGOING imminent (if it is a live non-active neighbour) back to the neighbour radius.
 	if prev >= 0 and prev != _pool_active and _pool.has(prev):
 		var ps: Dictionary = _pool[prev]
-		if float(ps["view_target"]) > 96.0:
-			ps["view_target"] = 96.0
+		# FP_NB_FULLRES (§2.3): a demoted outgoing imminent that is still a widened band edge drops to the band radius
+		# (NB_BAND_BLOCKS), not 96 — off the flag it demotes to 96 (shipped). Shrink leg either way (cheap unload).
+		var demote_to := CubeSphere.NB_BAND_BLOCKS if CubeSphere.FP_NB_FULLRES else 96.0
+		if float(ps["view_target"]) > demote_to:
+			ps["view_target"] = demote_to
 			ps["ramp_from"] = float(ps["view_f"])       # shrink leg → snapped by the next _ramp_pool_step (cheap unload)
 			_pool_ramp_kick()
 	# Promote the INCOMING imminent (if already spawned; a fresh spawn is handled in pool_spawn) to the active radius.
@@ -2078,6 +2115,12 @@ func pool_spawn(fid: int) -> bool:
 	var nb_target := 96.0
 	if CubeSphere.POOL_CROSSING_PREGEN and _fixed_frame_on() and fid == _imminent_fid:
 		nb_target = minf(CubeSphere.imminent_prefill_blocks(), float(TerrainConfig.near_render_radius()))
+	elif CubeSphere.FP_NB_FULLRES and fid != _imminent_fid:
+		# FP_NB_FULLRES (§2.3): a NON-imminent widened edge neighbour meshes only a shallow cross-ridge BAND
+		# (NB_BAND_BLOCKS) — the one shared player viewer localises into this slot, so with a 64-block max view it
+		# streams nothing until the player is within ~64 of its ridge, then fills exactly the band nearest the player
+		# (nearest-first globally, bytes ∝ proximity). The imminent keeps its shipped 96 (or the prefill above).
+		nb_target = CubeSphere.NB_BAND_BLOCKS
 	s["view_target"] = nb_target
 	s["ramp_from"] = float(start)
 	_pool[fid] = s
@@ -2135,20 +2178,24 @@ func redesignate(to: int) -> bool:
 	_pool[to]["ramp_from"] = float(_pool[to]["view_f"])   # ramp from wherever `to` sits now (96 warm, or mid-ramp)
 	_pool[to]["editable"] = true
 	if _pool.has(from):
+		# FP_NB_FULLRES (§2.3): the old active is now a widened EDGE neighbour of `to` — shrink it to the band radius
+		# (NB_BAND_BLOCKS), not 96. Off the flag → 96 (shipped). The far ring / band-conditional exclusion covers it
+		# until its band re-meshes near the player.
+		var from_to := CubeSphere.NB_BAND_BLOCKS if CubeSphere.FP_NB_FULLRES else 96.0
 		if CubeSphere.FP_SHRINK_PACED:
 			# COSMOS-PERF UNATTENDED R4: PACE the 128→96 unload. Set the target to 96 but LEAVE view_f/view at the
 			# current (larger) radius so _ramp_pool_step steps it down ≤SHRINK_STEP_BLOCKS/frame — the FROM slot holds
 			# its larger (already-allocated) view for a bounded handful of frames instead of freeing both shells in ONE
 			# frame (the dlmalloc convoy). Same end state (view_f → 96). editable flips immediately (identity unchanged).
-			_pool[from]["view_target"] = 96.0
+			_pool[from]["view_target"] = from_to
 			_pool[from]["ramp_from"] = float(_pool[from]["view_f"])
 			_pool[from]["editable"] = false
 		else:
-			_set_if(_pool[from]["terrain"], "max_view_distance", 96)
-			_pool[from]["view"] = 96
-			_pool[from]["view_f"] = 96.0
-			_pool[from]["view_target"] = 96.0
-			_pool[from]["ramp_from"] = 96.0
+			_set_if(_pool[from]["terrain"], "max_view_distance", int(from_to))
+			_pool[from]["view"] = int(from_to)
+			_pool[from]["view_f"] = from_to
+			_pool[from]["view_target"] = from_to
+			_pool[from]["ramp_from"] = from_to
 			_pool[from]["editable"] = false
 	_pool_ramp_kick()
 	# Designate edits + statistics + set_cell onto `to` (edit keys are (fid,cell)-global — nothing migrates, §5.1.d).
@@ -2181,10 +2228,12 @@ func take_last_redesignate() -> Dictionary:
 	_last_redesignate = {}
 	return out
 
-## Sum the loaded mesh-block counters across every LIVE pool terrain (active + neighbours) via godot_voxel's
-## get_statistics() — this is the block population the ONE PlanetRoot transform write re-places. get_statistics
-## exposes a flat dict of counters; we sum the int entries whose key mentions "block" (the same shape the cosmos
-## gates read). Called once per crossing only, so the per-terrain stat probe never costs a per-frame anything.
+## CORRECTION (FP_NB_FULLRES §1.3): MISLABEL FIX. This sums godot_voxel get_statistics() int entries whose key mentions
+## "block" across every live pool terrain — but those are EVENT COUNTERS (dropped_block_loads / dropped_block_meshs /
+## updated_blocks, voxel_terrain.cpp:599-613), NOT the resident mesh-block population. It is therefore a rough
+## crossing-activity proxy, not the true "blocks_replaced" count the ONE PlanetRoot transform write re-places (the engine
+## exposes no resident-block counter per terrain). Kept as-is for telemetry continuity (RemoteBridge reads the key), but
+## do NOT treat the number as resident blocks. Called once per crossing only — the per-terrain stat probe is free.
 func _pool_block_sum() -> int:
 	var total := 0
 	for fid in _pool.keys():

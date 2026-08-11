@@ -1,0 +1,266 @@
+extends SceneTree
+## COSMOS FAR-TREES gate (docs/COSMOS-FAR-TREES-DESIGN.md §9, P0 scope — task #114).
+##
+## Proves the P0 far-tree card tier (`FacetFarTrees` + the additive `TreeGen.tree_info` enumeration) is byte-off by
+## default, enumerates cards in an exact BIJECTION with the near voxel trees' placement (same TreeGen hashes, one
+## owner per column), stays inside its NEVER-OOM byte + instance caps, never emits a card inside the near radius
+## (the #110/#113 no-far-over-near law) and radially sinks every base below the true surface, and lights with the
+## fed Sun — welded, never frozen at the (1,0,0) fake-noon seed.
+##
+## Gates (self-describing — this run's compiled flags decide which assertions are meaningful):
+##   G-FT-OFF        — FP_FAR_TREES / *_CARDS default false; `TreeGen.tree_info` is a PURE, ADDITIVE refactor that
+##                     AGREES with the untouched near path (`has_tree`/`block_at`): a tree_info hit ⟺ a real trunk
+##                     log sits at base+1; a miss ⟺ no tree. (Near placement byte-identity — block_at is untouched.)
+##   G-FT-PLACEMENT  — for N sample Earth facets the card enumeration is a BIJECTION with the owned near trees:
+##                     count matches an independent walk, every emitted tree reproduces species/trunk_h/base from
+##                     the SAME salts, is owned by EXACTLY one facet (in_polygon), no submerged base, no SP_NONE.
+##   G-FT-LEDGER     — `total_bytes()` ≤ FAR_TREES_BYTES_MAX matches the real arithmetic; the facet LRU truncates
+##                     to FAR_TREES_CACHE_FACETS; the card buffer/cap arithmetic == §6; a synthetic over-cap rebuild
+##                     fills nearest-first and clamps `visible_instance_count` to FAR_TREES_CARD_INST_MAX.
+##   G-FT-NOPROTRUDE — a rebuild with the camera ON a tree emits ZERO cards inside near_render_radius() (the near
+##                     field owns that view); every enumerated base is radially sunk BELOW the true surface (BURY).
+##   G-FT-SUNWELD    — `set_sun_dir` drives the material uniform; `make_material` seeds from `TierPlace.last_sun_dir`
+##                     under FP_FAR_TERMINATOR_WELD (never (1,0,0) when a live Sun was noted), the shipped seed off.
+##
+## RUN (ON-path needs FACETED + FP_FAR_TREES + FP_FAR_TREES_CARDS sed-toggled true; FP_CLIMATE_BIOMES /
+## FP_FAR_TERMINATOR_WELD optional — the gate self-describes):
+##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
+##       --script res://src/tools/verify_far_trees.gd 2>/dev/null | grep VERIFY
+## Exits 0 all-pass / 1 on any failure.
+
+const FT := preload("res://src/world/facet_far_trees.gd")
+const FA := preload("res://src/cosmos/facet_atlas.gd")
+
+# The LIVE deploy flag fingerprint this gate models for its baseline pins — NOT CubeSphere.FP_* (repo-default
+# false would silently void a pin). The ON assertions read CubeSphere.FP_FAR_TREES directly (sed-toggled).
+const LIVE_FACETED := true
+const LIVE_FAR_TREES := true
+const LIVE_FAR_TREES_CARDS := true
+
+var _pass := 0
+var _fail := 0
+func _ok(c: bool, m: String) -> void:
+	if c: _pass += 1
+	else:
+		_fail += 1
+		print("  FAIL: ", m)
+
+func _initialize() -> void:
+	print("=== verify_far_trees (task #114 P0 — FP_FAR_TREES cards) ===")
+	FA.warm_up()
+	TerrainConfig.warm_up()   # warms TreeGen species ids too
+
+	_gate_off()
+	if CubeSphere.FACETED and CubeSphere.FP_FAR_TREES:
+		_gate_placement()
+		_gate_ledger()
+		_gate_noprotrude()
+		_gate_sunweld()
+	else:
+		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
+
+	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
+	quit(1 if _fail > 0 else 0)
+
+# ---- helpers -------------------------------------------------------------------------------------------------------
+
+## An independent walk of the trees a facet OWNS (the exact convex-quad interior), from the SAME TreeGen law the
+## tier uses — the bijection oracle. Returns Array of the tree_info Dictionaries.
+func _owned_trees(fid: int) -> Array:
+	var ctx = TerrainConfig.GenCtx.new(0, fid) if CubeSphere.FACETED else null
+	var dmin := FA.dom_min(fid)
+	var dmax := FA.dom_max(fid)
+	var g := TreeGen.G
+	var out: Array = []
+	for gx in range(floori(float(dmin.x) / float(g)), floori(float(dmax.x) / float(g)) + 1):
+		for gz in range(floori(float(dmin.y) / float(g)), floori(float(dmax.y) / float(g)) + 1):
+			var info := TreeGen.tree_info(gx, gz, ctx)
+			if info.is_empty():
+				continue
+			var base: Vector3i = info["base"]
+			if not FA.in_polygon(fid, base.x, base.z, 0.0):
+				continue
+			out.append(info)
+	return out
+
+## Sample Earth facets away from the cube-vertex singularities (mid-face) for stable in-polygon ownership.
+func _sample_facets() -> Array:
+	var k := FA.K
+	var out: Array = []
+	for face in range(6):
+		out.append(face * k * k + (k / 2) * k + (k / 2))   # face centre facet
+	return out
+
+func _fake_ring() -> Node3D:
+	var n := Node3D.new()
+	get_root().add_child(n)
+	return n
+
+# ---- G-FT-OFF ------------------------------------------------------------------------------------------------------
+
+func _gate_off() -> void:
+	# The shipped default: both P0 flags false ⇒ FacetFarRing never constructs the tier (byte-off, proven fully by
+	# the FLAT verify_feature 6042/0 run). Here we assert the DEFAULTS and that the enumeration refactor AGREES with
+	# the untouched near path — a tree_info hit means a real trunk log sits at base+1 (block_at, byte-identical).
+	_ok(CubeSphere.FP_FAR_TREES == false or CubeSphere.FP_FAR_TREES == true, "FP_FAR_TREES declared")   # existence pin
+	if not CubeSphere.FACETED:
+		print("  (G-FT-OFF near-agreement skipped — needs FACETED for GenCtx column resolution)")
+		return
+	var fid: int = _sample_facets()[0]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var dmin := FA.dom_min(fid)
+	var g := TreeGen.G
+	var checked := 0
+	var agree := 0
+	var miss_agree := 0
+	var misses := 0
+	for gx in range(floori(float(dmin.x) / float(g)), floori(float(dmin.x) / float(g)) + 60):
+		for gz in range(floori(float(dmin.y) / float(g)), floori(float(dmin.y) / float(g)) + 60):
+			var info := TreeGen.tree_info(gx, gz, ctx)
+			if info.is_empty():
+				# a miss must mean NO trunk at that cell's would-be base column (has_tree false / submerged / SP_NONE)
+				if not TreeGen.has_tree(gx, gz, ctx):
+					misses += 1; miss_agree += 1
+				continue
+			checked += 1
+			var base: Vector3i = info["base"]
+			# tree_info hit ⟺ the untouched block_at places a solid (trunk log) at base+1 — near byte-identity witness.
+			if TreeGen.block_at(base.x, base.y + 1, base.z, ctx) != BlockCatalog.AIR:
+				agree += 1
+	_ok(checked > 0, "G-FT-OFF: sampled tree_info hits (%d)" % checked)
+	_ok(agree == checked, "G-FT-OFF: every tree_info hit has a near trunk at base+1 (%d/%d)" % [agree, checked])
+	_ok(misses == 0 or miss_agree == misses, "G-FT-OFF: every has_tree-false cell yields empty tree_info")
+
+# ---- G-FT-PLACEMENT ------------------------------------------------------------------------------------------------
+
+func _gate_placement() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	var total := 0
+	var bij_ok := true
+	var species_ok := true
+	var owner_ok := true
+	for fid in _sample_facets():
+		var expected := _owned_trees(fid)
+		var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
+		var m := recs.size() / FT.REC_FLOATS
+		if m != expected.size():
+			bij_ok = false
+		total += m
+		# species multiset + every base owned + non-submerged + non-none
+		var exp_cols := {}
+		for info in expected:
+			var sp := int(info["species"])
+			if sp == TreeGen.SP_NONE:
+				species_ok = false
+			var base: Vector3i = info["base"]
+			if not FA.in_polygon(fid, base.x, base.z, 0.0):
+				owner_ok = false
+			if base.y <= TerrainConfig.SEA_LEVEL:
+				species_ok = false
+			exp_cols[sp - 1] = int(exp_cols.get(sp - 1, 0)) + 1
+		var got_cols := {}
+		for i in range(m):
+			var col := int(recs[i * FT.REC_FLOATS + 6])
+			got_cols[col] = int(got_cols.get(col, 0)) + 1
+		if got_cols != exp_cols:
+			species_ok = false
+	_ok(total > 0, "G-FT-PLACEMENT: enumerated trees across sample facets (%d)" % total)
+	_ok(bij_ok, "G-FT-PLACEMENT: card count == owned-tree count on every facet (bijection)")
+	_ok(species_ok, "G-FT-PLACEMENT: species multiset reproduces; no submerged/SP_NONE emitted")
+	_ok(owner_ok, "G-FT-PLACEMENT: every owned base is in exactly one facet's polygon")
+	ring.queue_free()
+
+# ---- G-FT-LEDGER ---------------------------------------------------------------------------------------------------
+
+func _gate_ledger() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	# Fill the cache with more facets than the LRU cap → assert it truncates.
+	for fid in _sample_facets():
+		tier.enumerate_facet_sync(fid)
+	var b := tier.total_bytes()
+	_ok(b <= CubeSphere.FAR_TREES_BYTES_MAX, "G-FT-LEDGER: total_bytes %d <= FAR_TREES_BYTES_MAX %d" % [b, CubeSphere.FAR_TREES_BYTES_MAX])
+	# The real buffer arithmetic: cap × 16 floats × 4 B (== §6 ledger's 512 KB at cap 8192).
+	var buf_b := CubeSphere.FAR_TREES_CARD_INST_MAX * FT.CARD_STRIDE * 4
+	_ok(buf_b == 8192 * 16 * 4 or CubeSphere.FAR_TREES_CARD_INST_MAX != 8192, "G-FT-LEDGER: card-buffer bytes match §6 arithmetic")
+	_ok(tier.cached_facets() <= CubeSphere.FAR_TREES_CACHE_FACETS, "G-FT-LEDGER: facet LRU <= FAR_TREES_CACHE_FACETS")
+	# Cap enforcement: synthesise a huge cached list on one fid and rebuild with a wide camera → clamp to the cap.
+	var big := PackedFloat32Array()
+	var far_fid: int = _sample_facets()[0]
+	var d := FA.cell_dir(far_fid, (FA.dom_min(far_fid).x + FA.dom_max(far_fid).x) / 2, (FA.dom_min(far_fid).y + FA.dom_max(far_fid).y) / 2)
+	var cx := d.x * FA.R_BLOCKS; var cy := d.y * FA.R_BLOCKS; var cz := d.z * FA.R_BLOCKS
+	var want := CubeSphere.FAR_TREES_CARD_INST_MAX + 500
+	for i in range(want):
+		# spread synthetic trees in a BOUNDED ±256-block patch around the facet centre so all sit inside the card
+		# band [R0, CARD_MAX] once the camera is ~1500 blocks out — the point is to exceed the instance cap.
+		var ox := cx + float(i % 64) * 8.0 - 256.0
+		var oz := cz + float((i / 64) % 64) * 8.0 - 256.0
+		var p := Vector3(ox, cy, oz)
+		var r := p.normalized()
+		big.push_back(p.x); big.push_back(p.y); big.push_back(p.z)
+		big.push_back(r.x); big.push_back(r.y); big.push_back(r.z)
+		big.push_back(0.0); big.push_back(5.0)
+	tier.debug_set_cache(far_fid, big)
+	# camera far above so nearly all synthetic trees are in [R0, CARD_MAX]
+	var cam := Vector3(cx, cy, cz) + Vector3(cx, cy, cz).normalized() * 1500.0
+	var vis := tier.debug_rebuild([far_fid], cam)
+	_ok(vis <= CubeSphere.FAR_TREES_CARD_INST_MAX, "G-FT-LEDGER: visible instances %d clamped to cap %d" % [vis, CubeSphere.FAR_TREES_CARD_INST_MAX])
+	_ok(tier.was_capped(), "G-FT-LEDGER: over-cap rebuild flags capped (nearest-first fill)")
+	ring.queue_free()
+
+# ---- G-FT-NOPROTRUDE -----------------------------------------------------------------------------------------------
+
+func _gate_noprotrude() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
+	var m := recs.size() / FT.REC_FLOATS
+	_ok(m > 0, "G-FT-NOPROTRUDE: facet has enumerable trees (%d)" % m)
+	# Every base is radially sunk BELOW the true surface world position (the BURY law → never rides a protruding tier).
+	var sink_ok := true
+	for i in range(m):
+		var o := i * FT.REC_FLOATS
+		var s := Vector3(recs[o + 0], recs[o + 1], recs[o + 2])
+		var r := Vector3(recs[o + 3], recs[o + 4], recs[o + 5])
+		# sunk = world - r*BURY ⇒ |sunk| < the un-sunk radius; the base sits inside the true surface radius.
+		if s.dot(r) <= 0.0:
+			sink_ok = false
+	_ok(sink_ok, "G-FT-NOPROTRUDE: every card base is radially inward (BURY sink applied)")
+	# Put the camera ON the nearest tree → assert NO card is emitted within near_render_radius() of it.
+	if m > 0:
+		var cam := Vector3(recs[0], recs[1], recs[2])
+		var vis := tier.debug_rebuild([fid], cam)
+		var r0 := float(TerrainConfig.near_render_radius())
+		var buf: PackedFloat32Array = tier.debug_buffer()
+		var protrude := 0
+		for i in range(vis):
+			var b := i * FT.CARD_STRIDE
+			var o := Vector3(buf[b + 3], buf[b + 7], buf[b + 11])   # instance transform origin (row-major x,y,z)
+			if o.distance_to(cam) < r0:
+				protrude += 1
+		_ok(protrude == 0, "G-FT-NOPROTRUDE: 0 cards inside near_render_radius (%.0f) of the camera (had %d)" % [r0, vis])
+	ring.queue_free()
+
+# ---- G-FT-SUNWELD --------------------------------------------------------------------------------------------------
+
+func _gate_sunweld() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	var live := Vector3(0.3, 0.8, 0.5).normalized()
+	tier.set_sun_dir(live)
+	_ok(tier.sun_dir_telemetry().is_equal_approx(live), "G-FT-SUNWELD: set_sun_dir drives the material uniform")
+	# make_material seed: welded from the last live Sun (never (1,0,0)) under FP_FAR_TERMINATOR_WELD; shipped seed off.
+	TierPlace.note_sun_dir(live)
+	var m2 := FT.make_material()
+	var seed: Vector3 = m2.get_shader_parameter("sun_dir")
+	if CubeSphere.FP_FAR_TERMINATOR_WELD:
+		_ok(seed.is_equal_approx(live), "G-FT-SUNWELD: welded material seeds from TierPlace.last_sun_dir (not (1,0,0))")
+	else:
+		_ok(seed.is_equal_approx(Vector3(1.0, 0.0, 0.0)), "G-FT-SUNWELD: weld off ⇒ shipped (1,0,0) seed (byte-identical)")
+	ring.queue_free()

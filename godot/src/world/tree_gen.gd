@@ -223,6 +223,104 @@ static func top_decoration(x: int, z: int, pcache = null) -> int:
 			return id
 	return BlockCatalog.AIR
 
+## COSMOS FAR-TREES §5.1 (docs/COSMOS-FAR-TREES-DESIGN.md) — the ENUMERATION hook. Per-tree info (base column,
+## species, trunk height) for grid cell (gx, gz), as a PURE, ADDITIVE refactor over the EXISTING placement law
+## (has_tree / _base_pos / column_top / _species_for + the same trunk-height salts) — adds NO new placement logic,
+## so the far cards it drives align with the near voxel world by construction (the byte-identity of block_at is
+## untouched). Returns {} when the grid cell hosts no VISIBLE tree — mirrors block_at's own output: the two hash
+## gates + biome gate (has_tree), then the submerged-base suppression (gy <= SEA_LEVEL → block_at returns AIR, no
+## near voxels), then SP_NONE (savanna/desert thin their patches with an extra hash). Otherwise
+## {base: Vector3i(bx, gy, bz), species: int, trunk_h: int}. Threads `pcache` so terrain + trees resolve on the
+## SAME facet (a GenCtx scoped to a facet), exactly the contract top_decoration / block_at document.
+static func tree_info(gx: int, gz: int, pcache = null) -> Dictionary:
+	if not has_tree(gx, gz, pcache):
+		return {}
+	var b := _base_pos(gx, gz)
+	var gy := TerrainConfig.column_top(b.x, b.y, pcache)
+	if gy <= TerrainConfig.SEA_LEVEL:
+		return {}                                       # submerged base — block_at suppresses it too (no near voxels)
+	var species := _species_for(TerrainConfig.biome_at(b.x, b.y, pcache), gx, gz)
+	if species == SP_NONE:
+		return {}                                       # savanna/desert thinning hash rolled empty — no tree here
+	return {"base": Vector3i(b.x, gy, b.y), "species": species, "trunk_h": _trunk_h_for(species, gx, gz)}
+
+## The trunk height (blocks) of `species` at grid cell (gx, gz), dispatching to the SAME per-species salt used by
+## block_at's shape functions (55 oak/birch, 66 spruce, 121 jungle, 122 acacia, 123 cactus) — so the enumerated
+## height reproduces the near tree's exactly. Pure position hashes.
+static func _trunk_h_for(species: int, gx: int, gz: int) -> int:
+	match species:
+		SP_OAK, SP_BIRCH:
+			return _trunk_height(gx, gz)
+		SP_SPRUCE:
+			return _spruce_trunk_height(gx, gz)
+		SP_JUNGLE:
+			return _jungle_trunk_height(gx, gz)
+		SP_ACACIA:
+			return _acacia_trunk_height(gx, gz)
+		SP_CACTUS:
+			return CACTUS_MIN + int(_hash01(gx, gz, 123) * float(CACTUS_MAX - CACTUS_MIN + 1))
+	return 0
+
+## COSMOS FAR-TREES §5.4 — the canonical LOCAL cube set of a `species` archetype (base at gy=0, a MEDIAN-height
+## trunk), as an Array of Vector4i(dx, dy, dz, block_id) for every non-AIR cell in the tree's bounded local box.
+## Reuses the SAME private shape functions block_at dispatches to (`_oak_block`/`_spruce_block`/…), so the CPU-
+## rasterised card silhouette is the near tree's silhouette by construction. `gx`/`gz` are the shape hash seeds:
+## picked so `_trunk_h_for` lands on (or near) the species' median trunk height — a fixed archetype, not a world
+## placement (never gated by has_tree/biome). Main-thread, one-time (called at first flag-on setup).
+static func archetype_cells(species: int) -> Array:
+	if not _sp_ready:
+		warm_up()
+	var log_id := BlockCatalog.WOOD
+	var leaf_id := BlockCatalog.LEAF
+	match species:
+		SP_BIRCH: log_id = _BIRCH_LOG; leaf_id = _BIRCH_LEAF
+		SP_SPRUCE: log_id = _SPRUCE_LOG; leaf_id = _SPRUCE_LEAF
+		SP_JUNGLE: log_id = _JUNGLE_LOG; leaf_id = _JUNGLE_LEAF
+		SP_ACACIA: log_id = _ACACIA_LOG; leaf_id = _ACACIA_LEAF
+		SP_CACTUS: log_id = _CACTUS; leaf_id = _CACTUS
+	# A hash seed whose _trunk_h_for lands on the species median (scan a few cells; deterministic, tiny).
+	var seed := _median_seed(species)
+	var out: Array = []
+	for dx in range(-2, 3):
+		for dz in range(-2, 3):
+			for y in range(1, MAX_ABOVE_SURFACE + 2):
+				var id := _shape_block(species, seed.x, seed.y, dx, y, dz, 0, log_id, leaf_id)
+				if id != BlockCatalog.AIR:
+					out.append(Vector4i(dx, y, dz, id))
+	return out
+
+## Pick a (gx, gz) hash seed whose species trunk height is the MEDIAN of the species' range (so the archetype is
+## representative, not an extreme). Scans a small window; falls back to (0,0) if none hits exactly.
+static func _median_seed(species: int) -> Vector2i:
+	var lo := TRUNK_MIN; var hi := TRUNK_MAX
+	match species:
+		SP_SPRUCE: lo = SPRUCE_TRUNK_MIN; hi = SPRUCE_TRUNK_MAX
+		SP_JUNGLE: lo = JUNGLE_TRUNK_MIN; hi = JUNGLE_TRUNK_MAX
+		SP_ACACIA: lo = ACACIA_TRUNK_MIN; hi = ACACIA_TRUNK_MAX
+		SP_CACTUS: lo = CACTUS_MIN; hi = CACTUS_MAX
+	var want := (lo + hi) / 2
+	for gx in range(0, 32):
+		for gz in range(0, 32):
+			if _trunk_h_for(species, gx, gz) == want:
+				return Vector2i(gx, gz)
+	return Vector2i(0, 0)
+
+## Dispatch to the species' block-shape function (the SAME ones block_at uses), for the archetype raster. Kept
+## private + additive — introduces no new shape logic.
+static func _shape_block(species: int, gx: int, gz: int, dx: int, y: int, dz: int, gy: int, log_id: int, leaf_id: int) -> int:
+	match species:
+		SP_OAK, SP_BIRCH:
+			return _oak_block(gx, gz, dx, y, dz, gy, log_id, leaf_id)
+		SP_SPRUCE:
+			return _spruce_block(gx, gz, dx, y, dz, gy)
+		SP_JUNGLE:
+			return _jungle_block(gx, gz, dx, y, dz, gy)
+		SP_ACACIA:
+			return _acacia_block(gx, gz, dx, y, dz, gy)
+		SP_CACTUS:
+			return _cactus_block(gx, gz, dx, y, dz, gy)
+	return BlockCatalog.AIR
+
 ## Oak-shaped tree (also used, with birch ids, for birch): a WOOD trunk column,
 ## a 3x3-minus-centre canopy ring on the top two trunk layers, and a plus-shaped
 ## cap one layer above. Byte-identical to the pre-species oak when (log_id,

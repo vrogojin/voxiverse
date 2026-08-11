@@ -324,6 +324,12 @@ func _process(_delta: float) -> void:
 	# (separate-from-V2's/the-shell's) material each frame. No-op with no faceted ring / flag off ⇒ byte-identical.
 	if _player != null and _cosmos_sky != null and CubeSphere.FP_ORBIT_RELIEF and CubeSphere.FACETED:
 		_player.world.set_orbit_relief_sun_dir(_cosmos_sky.current_sun_dir())
+	# docs/COSMOS-FAR-TREES-DESIGN.md (P0, FP_FAR_TREES): forward the Sun + the live camera into the far-tree card
+	# tier each frame (the tier's radial voxi_shade + camera-distance band membership). No-op with no faceted ring /
+	# flag off (the WorldManager/ring setters self-guard) ⇒ byte-identical.
+	if _player != null and _cosmos_sky != null and CubeSphere.FP_FAR_TREES and CubeSphere.FACETED:
+		_player.world.set_far_trees_sun_dir(_cosmos_sky.current_sun_dir())
+		_player.world.set_far_trees_camera(_player.camera_global_transform().origin)
 	# COSMOS ATMO-SKY A0 (docs/COSMOS-ATMO-SKY-DESIGN.md §2.0/§4): the SN3 scaled-body driver, MOVED ABOVE the
 	# FLAT_WORLD early-return so FP_SCALED_BODY actually RUNS in the faceted production game (FLAT_WORLD=true) —
 	# the shipped block below the return is DEAD in faceted (FACETED ⇒ FLAT_WORLD ⇒ we already returned by 206),

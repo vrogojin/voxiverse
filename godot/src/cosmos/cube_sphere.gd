@@ -872,6 +872,30 @@ const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0)
 ## control flow verbatim (byte-identical). Gate: verify_far_near_coverage.gd (G-FNC-OFF / G-FNC-HIDE / G-FNC-LAW).
 const FP_ORBIT_RELIEF_SURFACE_HIDE := false
 
+## COSMOS FAR-TREES (docs/COSMOS-FAR-TREES-DESIGN.md) — far-terrain tree rendering, ground → orbit. The 3-rung
+## hybrid: rung-1 voxel-archetype mini-meshes (P1, FP_FAR_TREES_MESH), rung-2 cross+cap CARD impostors (P0,
+## FP_FAR_TREES_CARDS), rung-3 the existing fine-map canopy texels (ships today, no flag). All bounded by a hard
+## byte ledger (`FAR_TREES_BYTES_MAX`) and instance caps, gl_compatibility-safe (MultiMesh + alpha-scissor, no
+## compute). Every rung is driven by the SAME `TreeGen` placement hashes (via the additive `TreeGen.tree_info`
+## enumeration), so far cards align 1:1 with the near voxel trees by construction, not by synchronisation.
+##
+## `FP_FAR_TREES` is the master (constructs + steps `FacetFarTrees` at all); each rung is a second guard on top.
+## Off ⇒ `FacetFarRing.setup` never constructs the object, no node exists, no step runs, `TreeGen.tree_info` is
+## never called from any hot path ⇒ byte-identical (FLAT verify_feature 6042/0). Gate: verify_far_trees.gd
+## (G-FT-OFF / G-FT-PLACEMENT / G-FT-LEDGER / G-FT-NOPROTRUDE / G-FT-SUNWELD).
+const FP_FAR_TREES := false                  # master: FacetFarTrees constructed + stepped at all
+const FP_FAR_TREES_CARDS := false            # rung 2 (P0): the cross+cap card impostor band
+const FP_FAR_TREES_MESH := false             # rung 1 (P1): the archetype mini-mesh band — declared, unused in P0
+const FP_FAR_TREES_FADE := false             # (P2): dither cross-fades + keep(d) hash-thinning — declared, unused in P0
+const FP_FAR_TREES_SNOW := false             # (P3): snow-dusted spruce atlas variant — declared, unused in P0
+const FAR_TREES_MESH_MAX := 448.0            # rung-1 outer edge (blocks) — the archetype-mesh band cap (P1)
+const FAR_TREES_CARD_MAX := 2400.0           # rung-2 outer edge (blocks) — ≥ FOG_BEGIN(2200) so fog dissolves the last rung
+const FAR_TREES_MESH_INST_MAX := 512         # per-species rung-1 MultiMesh instance cap (P1)
+const FAR_TREES_CARD_INST_MAX := 8192        # rung-2 card MultiMesh instance cap (nearest-first fill under this)
+const FAR_TREES_CACHE_FACETS := 64           # per-facet tree-list LRU capacity (dwell-evicted)
+const FAR_TREES_STEP_MS := 250               # min ms between FacetFarTrees instance-set rebuilds (rate cap)
+const FAR_TREES_BYTES_MAX := 4 << 20         # NEVER-OOM hard ledger ceiling (4 MB, 2× headroom over the ~2 MB design budget)
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

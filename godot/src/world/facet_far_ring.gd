@@ -72,6 +72,11 @@ var _relief_shade: GlobalReliefData = null
 # constructed lazily in `set_relief_data` (the same hand-off point, since it needs the SAME GlobalReliefData
 # instance). null off (inert). Independent of `_smooth_v2`/`_relief_shade` — a separate MeshInstance3D child.
 var _orbit_relief = null
+# docs/COSMOS-FAR-TREES-DESIGN.md (P0, FP_FAR_TREES): the far-terrain tree tier (rung-2 cross+cap cards) — a
+# MultiMeshInstance3D child of this ring, driven by the SAME TreeGen placement hashes. Constructed in setup()
+# under FP_FAR_TREES; stepped from _process alongside _smooth_v2/_orbit_relief. null off (inert) ⇒ byte-identical.
+var _far_trees = null
+var _ft_cam := Vector3.ZERO             # latest camera position (render frame), fed each frame by main.gd for far-trees band membership
 # FP_RELIEF_REEMIT (task #99 follow-up, docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md): fids whose G2 DEM just
 # finished baking AFTER their `_col_cache` entry was already built (so the shade multiply above was 1.0 —
 # stale). `relief_baked` (below) is the only writer; `_drain_relief_dirty` (below, called from `_process`) is
@@ -510,6 +515,11 @@ func setup(active_fid: int) -> void:
 	if CubeSphere.FP_SMOOTH_V2:
 		_smooth_v2 = FacetSmoothV2.new()
 		_smooth_v2.setup_instance(self, active_fid)
+	# docs/COSMOS-FAR-TREES-DESIGN.md (P0): the far-tree card tier — own MultiMeshInstance3D child (inherits this
+	# ring's placement transform). Inert off (never constructed) ⇒ byte-identical.
+	if CubeSphere.FP_FAR_TREES:
+		_far_trees = FacetFarTrees.new()
+		_far_trees.setup_instance(self, active_fid)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:
@@ -600,6 +610,10 @@ func set_active(new_fid: int) -> void:
 	# active_fid (V2's excluded footprint moves with it) — force a recompute on every crossing, same as V2.
 	if _orbit_relief != null:
 		_orbit_relief.set_active(new_fid)
+	# docs/COSMOS-FAR-TREES-DESIGN.md (P0): re-seed the centre facet (residency is camera-distance driven, rebuilt
+	# each step, so this is just a book-keeping update). No-op / null with the flag off.
+	if _far_trees != null:
+		_far_trees.set_active(new_fid)
 	# COSMOS-ORBITAL-SHELL live fix: in orbit the emitted set is CAMERA-axis-driven (not active-facet-driven), and the
 	# mesh is absolute (the transform re-place above already follows the new active facet), so a facet crossing does
 	# NOT change the emitted set — its _pending would force a redundant full rebuild every ~3 frames as the active
@@ -1296,6 +1310,11 @@ func _process(_dt: float) -> void:
 	# No-op / null with the flag off (byte-identical).
 	if _orbit_relief != null:
 		_orbit_relief.step()
+	# docs/COSMOS-FAR-TREES-DESIGN.md (P0): reap enumeration + rate-capped card-buffer rebuild. Suspends on-surface↔
+	# off-surface inverted (trees show ON-surface only). Respects the FP_LOAD_DEFER settle gate + stream credit like
+	# every other far tier. No-op / null with the flag off (byte-identical).
+	if _far_trees != null:
+		_far_trees.step(_load_settled, _stream_credit_ok, _ft_cam)
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -5008,6 +5027,21 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
 	if _orbit_relief != null:
 		_orbit_relief.set_sun_dir(sun_dir)
+
+## docs/COSMOS-FAR-TREES-DESIGN.md (P0, §5.3): feed the current Sun into the card tier's OWN ShaderMaterial (its
+## own radial voxi_shade). No-op with no far-trees instance ⇒ byte-identical off.
+func set_far_trees_sun_dir(sun_dir: Vector3) -> void:
+	if _far_trees != null:
+		_far_trees.set_sun_dir(sun_dir)
+
+## docs/COSMOS-FAR-TREES-DESIGN.md (P0): cache the live camera (render frame) so the far-trees step can compute
+## camera-distance band membership. Cheap state write; no-op consumer with the flag off.
+func set_far_trees_camera(cam: Vector3) -> void:
+	_ft_cam = cam
+
+## docs/COSMOS-FAR-TREES-DESIGN.md — far-trees telemetry accessor for the shell telemetry / gate (null-safe).
+func far_trees() -> Object:
+	return _far_trees
 
 ## docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, Stage 1b): push the WorldManager-owned G1a hillshade data
 ## in once at construction (mirrors how other cross-cutting singletons are handed to the ring). Called with null

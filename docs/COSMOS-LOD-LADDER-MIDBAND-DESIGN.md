@@ -2,7 +2,8 @@
 
 Task #107 root-cause + fix design (Fable, 2026-08-11). Repro: facet 772, NAV `-30970,50,7161`, alt 47, surface;
 shots `lod-0.jpg`/`lod-1.jpg`. Companion: COSMOS-FAR-SMOOTH-V2-DESIGN.md, COSMOS-NEAR-FAR-HEIGHT-DESIGN.md,
-COSMOS-BLOCK-LOD-DESIGN.md, COSMOS-NB-FULLRES-DESIGN.md.
+COSMOS-BLOCK-LOD-DESIGN.md, COSMOS-NB-FULLRES-DESIGN.md; twin investigation (summit attribution, C1/C2):
+COSMOS-LOD-LADDER-SMOOTH-DESIGN.md (deploy-cheats worktree).
 
 ## 0. Premise correction (measured, not assumed)
 
@@ -19,14 +20,21 @@ FP_SMOOTH_V2_EXCL_BLKLOD=false, FP_SKIN_TIER=false, FP_MID_DENSE=false`.
 Headless probe (`src/tools/probe_lod_ladder.gd`, this branch) from the exact repro pose — player world
 `(-5606.9, 1395.7, -2794.4)` matches the user's BCI `[-5606.58, 1395.19, -2794.76]`:
 
-- Nearest mountain (the crosshair hill): **d ≈ 430–436 blocks**, g 55–62, biome 9 (B_MOUNTAINS → grey stone
-  palette), and it **straddles fid 748 and fid 797**.
-- fid **748** = an EDGE neighbour of active 772 (`seam_neighbour` slots → 796, 748, 773, 771) ⇒ a **live pool
-  facet** under FP_NB_FULLRES.
-- fid **797** = hop-2 ⇒ inside the FacetSmoothV2 annulus (hop ∈ [2..4]).
+- Nearest mountain (the crosshair hill): **d ≈ 430–457 blocks**, biome 9 (B_MOUNTAINS → grey stone palette),
+  and it **straddles fid 748 and fid 797** — two DIFFERENT rungs in the same view:
+  - the **shoulder** (g 55–62, d≈430) sits on fid **748** = an EDGE neighbour of active 772 (`seam_neighbour`
+    slots → 796, 748, 773, 771) ⇒ a **live pool facet** under FP_NB_FULLRES;
+  - the **summit** (g 66–72, d≈457, the probe's g≥66 cut) sits entirely on fid **797** = hop-2, NON-pool,
+    inside the FacetSmoothV2 annulus (hop ∈ [2..4]) — the backstop NEVER emits there (797 is not
+    active/excluded/sticky) and the 104-blk horizon quad is min-contained below the smooth tile.
 
-On-screen block size: `px = P·vh/(2·d·tan(fov/2))`; at fov 75°/vh 1080, a **26-block cell at d=430 ≈ 42 px** —
-the "giant blocks" in the shots. An 8-block cell would be ≈13 px; full-res 1-block ≈1.6 px.
+Cross-checked by the parallel investigation (COSMOS-LOD-LADDER-SMOOTH-DESIGN.md, deploy-cheats worktree,
+`probe_lod_band.gd`): the measured summit silhouette (grey-mask column-top scan of `lod-0.jpg`, risers 2–8 px /
+benches 6–15 px at the 960×540 capture ≈ 4–11-blk risers / 8–20-blk benches at d≈474) is **too fine to be
+26-blk backstop cells (~19–21 px benches at that capture scale) and matches M2 ℓ2/ℓ3 (4/8-blk) megablocks**.
+
+On-screen block size: `px = P·vh/(2·d·tan(fov/2))`; at fov 75°/vh 1080, a **26-block cell at d=430 ≈ 42 px**;
+an 8-block cell ≈ 13 px (≈6 px at the 960 capture); full-res 1-block ≈1.6 px.
 
 ## 2. Root cause — the ladder has a NON-MONOTONE rung on live-pool facets
 
@@ -53,6 +61,16 @@ relief (hop 2..4) → coarser far tiers.** The middle rung is 3× COARSER than t
 mountain looks smooth at hop-2 and explodes into 26-block grey ziggurat steps exactly when the player gets
 CLOSER. That inversion is the user's report, and B_MOUNTAINS' stone palette + terraced TRUE-height quantization
 makes it maximally visible.
+
+**2b. Second mechanism — M2 megablocks protrude OVER resident smooth tiles (the SUMMIT).** FacetLodMesher is
+smooth-blind: `_recompute_wants` stamps a want on every front-facing in-frustum non-live facet with no check of
+SmoothV2 residency (zero references to smooth anywhere in `facet_lod_mesher.gd`), so hop-2..N facets carry BOTH
+a smooth tile and an M2 megablock mesh. The M2 mesh is true-height 2^ℓ-quantized blocks; the smooth TIN
+underestimates peaks between its 8-blk nodes ⇒ at relief maxima the M2 blocks stick out ABOVE the smooth
+surface. Worse, the budgeter's progressive first-cover admits a meshless facet at **max(target, ℓ3)** and
+refines finer **only while the build queue is idle** (`facet_lod_mesher.gd:333-338`), and the SSE distance is
+the facet CENTRE (`:297-313`) — so mid-field facets sit at ℓ2/ℓ3 (4/8-blk) far longer and coarser than the
+τ=3 px law intends. That is the measured 4–11-blk summit stepping on fid 797.
 
 ## 3. The fix — FP_SMOOTH_V2_NEARCOVER (extend the smooth annulus down to hop 0)
 
@@ -83,18 +101,41 @@ the far ring suppresses its 26-block blocky emission under every COMMITTED resid
   (FP_SMOOTH_V2_PACE + _ASYNC_MERGE); +5 tiles per crossing is ~12% of the ~40-tile annulus. The blocky-emit
   suppression REDUCES far-ring tris/upload.
 
+## 3b. Companion fixes for the SUMMIT mechanism (merged from COSMOS-LOD-LADDER-SMOOTH-DESIGN.md C1/C2)
+
+NEARCOVER + EXCL_BLKLOD fix the shoulder/hop-0/1 band only — EXCL_BLKLOD suppresses the far-ring blocky emit,
+not M2. Two more flags close the summit:
+
+- **`FP_M2_SMOOTH_DEFER` (C1)**: FacetLodMesher defers to a resident smooth tile. Wire a `set_smooth_query`
+  Callable → `FacetFarRing.is_smooth_resident` (accessor exists, `facet_far_ring.gd:1047`; Callable pattern
+  precedent `facet_block_lod_ladder.gd:40-46`; unset ⇒ shipped verbatim). In `_recompute_wants`, a
+  smooth-resident facet gets **no M2 want at all** (v1 deviation from the SMOOTH doc's "ℓ1 still allowed":
+  any want on a MESHLESS facet materializes through the budgeter's `max(target, ℓ3)` first-cover
+  (`facet_lod_mesher.gd:333-338`) with idle-only refinement — i.e. ℓ1-over-smooth transits through exactly the
+  ℓ3 summit steps this fix removes, indefinitely under load. Either gate the first-cover floor too, or — v1 —
+  skip wants entirely; the smooth tile IS the cover, and ℓ1-over-smooth returns as a measured A/B later).
+  `_idle_sweep` then reclaims the ℓ2/ℓ3 bytes.
+- **`FP_M2_EDGE_DIST` (C2)**: feed `sse_lc` the distance to the NEAREST point of the facet's planar quad
+  (reuse `_facet_render_corners`) instead of the centre (`facet_lod_mesher.gd:313`) — removes the ~300-blk
+  coarse bias on edge-on facets (e.g. 771: centre 608 vs nearest edge ~380 ⇒ tier 2 vs 1). Composes with the
+  existing hysteresis; A2's pin becomes a special case it mostly subsumes.
+
 ## 4. Flags + gates + phases
 
 | Flag | Gates | OFF ⇒ |
 |---|---|---|
 | `FP_SMOOTH_V2_NEARCOVER` | hop_b 2→0 residency + uniform `V2_NEAR_SINK` + enabling the existing EXCL_BLKLOD suppression path for resident tiles | annulus/emission byte-identical (hop_b=2 verbatim, sink term absent, EXCL_BLKLOD stays dead) |
+| `FP_M2_SMOOTH_DEFER` | smooth-residency query + want-skip in `_recompute_wants` + idle-sweep reclaim | Callable never wired ⇒ want loop byte-identical |
+| `FP_M2_EDGE_DIST` | nearest-quad-point distance into `sse_lc` | centre distance verbatim |
 
 - **N0 (gate-first)**: `verify_lod_ladder.gd` — G-LAD-MONO: reconstruct the as-rendered cover pitch along the
-  player→peak ray at the repro pose; assert pitch is monotone non-increasing toward the camera. Pins TODAY's
-  26-blk inversion as the failing baseline.
-- **N1**: residency + sink + suppression. Exit: G-LAD-MONO green; G-V2-WELD/G-V2-PURE unchanged; sink ≤ true −
-  chord-residual assertion (G-V2-NEAR-SINK); byte-off FLAT 6042/0; live A/B at the repro pose (screenshot vs
-  `lod-0.jpg`).
+  player→peak ray at the repro pose, **with the M2 tier included in the frontmost-cover computation** (so the
+  baseline pin fails on BOTH the 748 shoulder [backstop-26] and the 797 summit [M2 ℓ2/ℓ3]); assert pitch is
+  monotone non-increasing toward the camera. Pins TODAY's inversion as the failing baseline.
+- **N1**: NEARCOVER residency + sink + suppression. Exit: shoulder rows of G-LAD-MONO green; G-V2-WELD/
+  G-V2-PURE unchanged; sink ≤ true − chord-residual assertion (G-V2-NEAR-SINK); byte-off FLAT 6042/0.
+- **N1b**: `FP_M2_SMOOTH_DEFER` + `FP_M2_EDGE_DIST`. Exit: summit rows green; G-M2-SEL sweep unchanged off;
+  M2 ledger shows the ℓ2/ℓ3 reclaim; byte-off FLAT 6042/0. Then live A/B at the repro pose vs `lod-0.jpg`.
 - **N2 (optional polish)**: distance-graded V2 commit priority so hop-0/1 tiles build FIRST after a crossing
   (they are the visually nearest); reuse the pace queue's nearest-first order.
 
@@ -111,9 +152,8 @@ the far ring suppresses its 26-block blocky emission under every COMMITTED resid
 
 ## 6. Also noted (separate, pre-existing)
 
-- The SSE-by-facet-CENTRE-distance law (`facet_lod_mesher.gd:266-316`) still under-resolves the near portion of
-  a far-centred facet outside the pool; A2 covers only edge neighbours. Not the reported symptom's cause (M2
-  never covers the offending facets here), but the same non-monotone class — worth folding into G-LAD-MONO.
+- The SSE-by-facet-CENTRE-distance law (`facet_lod_mesher.gd:266-316`) under-resolves the near portion of a
+  far-centred facet — now addressed directly by `FP_M2_EDGE_DIST` (§3b C2).
 - Task #72 ("far terrain too low") is the twin symptom of the same rung: env-flattened/sunk backstop where a
   finer tier should be. FP_SMOOTH_V2_NEARCOVER shrinks its visible surface too (true-height ε-sunk relief
   replaces env terraces in the mid band).

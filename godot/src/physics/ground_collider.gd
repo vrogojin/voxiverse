@@ -675,6 +675,18 @@ func _emit_column(bidx: int, x: int, z: int, h: int) -> void:
 		y += 1
 	if run_start != 0x7fffffff:
 		_add_box(bidx, x, z, run_start, y_top + 1)   # top run (surface / tree / tower)
+	# COSMOS SEAM-SLOPE WELD (docs/COSMOS-SEAM-SLOPE-WELD-DESIGN.md §3.2, FP_SEAM_SLOPE_WELD): a seam-band column
+	# whose NEIGHBOUR facet renders a higher junction-ladder surface gets a full cap box up to that welded surface,
+	# so a loose body rests on the SAME cross-frame surface `floor_under` welds the player to (both call the WM's
+	# seam_weld_cap_playy / _ssw_weld — one weld height). Additive + band-gated: −INF (no cap) when the weld does
+	# not apply, so flag-off / interior / dug columns emit zero extra geometry ⇒ byte-identical. The cap starts at
+	# the heightmap top `h` (solid ground below) and the box's centre re-adds this column's `_emit_lift` (FS2′).
+	if CubeSphere.FP_SEAM_SLOPE_WELD:
+		var wcap := world.seam_weld_cap_playy(x, z)
+		if wcap > -1e29:
+			var cap_top := int(ceil(wcap - _emit_lift))
+			if cap_top > h:
+				_add_box(bidx, x, z, h, cap_top)
 	# COSMOS-TREE-BUGS Bug 2b (FP_CHOP_COLLIDER_CARVE): record the column's [start, end) slot range (half-open;
 	# empty when the column emitted nothing — e.g. a fully-dug shaft — which carve_cells treats as "nothing to
 	# disable", correctly). Off ⇒ skipped, zero cost.

@@ -519,8 +519,12 @@ func _ramp_pool_step(delta: float) -> bool:
 	# in-flight work). The active near field then never grows and issues zero load requests. Repair a collapsed
 	# view_target (a churned crossing may have left the active slot below the full near radius) so the pace floor
 	# below has a real goal to reach. NEVER-OOM: target is capped at near_render_radius (the existing active cap).
+	# COSMOS SUMMIT-STREAM S2 (FP_SUMMIT_STREAM): the `_imminent_fid` guard turns the active-slot repair off across the
+	# whole 96-block ridge warm band (≈ ⅔ of every facet), stranding the player's own footprint facet at a collapsed
+	# view_target while they climb near a ridge. Under the flag the RESIDENT active slot's target is always repaired
+	# (`_pool_active` is the only guard left). Off ⇒ the shipped condition verbatim (byte-identical).
 	if CubeSphere.FP_LANDING_STREAM_KICK and _pool_active >= 0 and _pool.has(_pool_active) \
-			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+			and (CubeSphere.FP_SUMMIT_STREAM or _imminent_fid < 0 or _imminent_fid == _pool_active):
 		var a: Dictionary = _pool[_pool_active]
 		var full := float(TerrainConfig.near_render_radius())
 		if float(a["view_target"]) < full - 0.5 and float(a["view_f"]) < full - 0.5:
@@ -590,8 +594,12 @@ func _ramp_pool_step(delta: float) -> bool:
 	# AFTER the FP_INFLIGHT_GATE cut, so a load gate held at 0 (backlog/apply/shell thrash) can never freeze the near
 	# field. The committed-imminent slot keeps its own floor above; this closes the ONLY remaining unfloored grow path
 	# (the settled/landed active). Bounded: RAMP_SECONDS/0.25 ≈ 6 s to fill, view_target already capped (NEVER-OOM).
+	# COSMOS SUMMIT-STREAM S2 (FP_SUMMIT_STREAM): drop the `_imminent_fid` guard so the RESIDENT active slot is ALWAYS
+	# floored — the guard was dead across the 96-block ridge warm band, letting the active slot win the single grow
+	# channel yet advance at pace 0 (freezing every ramping slot). `maxf` composes with the imminent floor above, so the
+	# imminent slot's own priority is untouched. Off ⇒ the shipped condition verbatim (byte-identical). Bounded ~6 s.
 	if CubeSphere.FP_LANDING_STREAM_KICK and up_fid == _pool_active \
-			and (_imminent_fid < 0 or _imminent_fid == _pool_active):
+			and (CubeSphere.FP_SUMMIT_STREAM or _imminent_fid < 0 or _imminent_fid == _pool_active):
 		pace = maxf(pace, CubeSphere.CTRL_RELIEF_FLOOR)
 	sc["view_f"] = minf(float(sc["view_f"]) + span * delta * pace / RAMP_SECONDS, sc_tgt)   # FP_LAND_RAMP_HOLD: ceiling = clamped tgt
 	sc["view"] = int(round(float(sc["view_f"])))

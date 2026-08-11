@@ -2222,6 +2222,25 @@ const ANCHOR_HYST := 1.15             # descent hysteresis: fully resident again
 const ANCHOR_WRITE_DEBOUNCE_MS := 100 # min ms between viewer offset/view writes (anti re-mesh churn; FP-M1c precedent)
 const ANCHOR_MARGIN := 4.0            # safety floor (blocks): the viewer never sinks below datum+ANCHOR_MARGIN
 
+## COSMOS SUMMIT-STREAM (docs/COSMOS-SUMMIT-STREAM-PRIORITY-DESIGN.md — FP_SUMMIT_STREAM). Symptom: standing on a
+## mountain SUMMIT the near-field voxel blocks arrive tens of seconds late while the flat surface under the player
+## on a plain streams immediately. ROOT (§3): the approach-anchor viewer is pinned to the DATUM (O_base, world radial
+## altitude) not to the ground under the player, so on a 66-block summit the streaming VoxelViewer sits ~62 blocks
+## BELOW the player's feet, inside the mountain — and godot_voxel prioritises strictly by 3D distance to the viewer
+## (priority_dependency.cpp), so the invisible mountain INTERIOR drains first and the visible summit surface LAST;
+## compounded by the active-slot pace floors going dead across the ridge warm band while the client sits credit-0.
+## Fix (pure priority REORDER — NO supply increase, NEVER-OOM untouched):
+##   S1 (WorldManager._apply_approach_anchor): feed the anchor/release the height above the sub-player GROUND
+##       (h_eff = max(h − ground_h, 0)) instead of radial-above-datum h, re-centring the ellipsoid on the player so
+##       the surface is nearest-first — identical on a summit and a plain. Airborne, h_eff is the true camera-to-ground
+##       distance the release law always meant, so the fly-up/de-orbit law is preserved by construction.
+##   S2 (module_world._ramp_pool_step): drop the `_imminent_fid` guard on the RESIDENT ACTIVE slot's pace floor +
+##       view-target repair so the player's own footprint facet is never pace-zero (the guard was dead across the
+##       96-block ridge warm band ≈ ⅔ of every facet). Bounded ~6 s fill; composes (maxf) with the imminent floor.
+## Default OFF ⇒ h_eff == h and the guards are the shipped FP_LANDING_STREAM_KICK conditions (byte-identical; FLAT
+## 6042/0). Requires FACETED. Gate: verify_summit_stream.gd (G-SS-OFF / -ANCHOR / -FLOOR / -ORDER / -BUDGET).
+const FP_SUMMIT_STREAM := false
+
 ## S1 (a) — the anchor offset law (§3.1), pure/static so the gate asserts the identical formula the driver applies.
 ## Returns the viewer LOCAL +Y so its WORLD radial altitude == o_base (the sub-player ground the player left) for any
 ## player altitude h ≥ 0. Bounds = the design's clamp [−h+ANCHOR_MARGIN, o_base], but applied FLOOR-AFTER-CAP (not

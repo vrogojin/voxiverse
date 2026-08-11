@@ -58,7 +58,13 @@ enum { EDGE_WEST = 0, EDGE_EAST = 1, EDGE_SOUTH = 2, EDGE_NORTH = 3 }
 ##                                          (§2.3 below).
 ##   idx : PackedInt32Array 2 tris/cell     BOTH triangles of cell (gi,gj) end at node (gi+1,gj+1) — see the winding
 ##                                          comment in the loop below (the whole provoking-vertex trick).
-static func build_tile(fid: int, cells: int, gen: Object) -> Dictionary:
+## `sink` (C3 FP_SMOOTH_V2_NEARFILL, docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): a uniform radial DROP (blocks)
+## applied to every node position (`p - normalize(p)·sink`) — the near-fill (hop ≤ 1) tiles use `V2_NEARFILL_SINK`
+## so they sit just UNDER the near full-res blocks (no protrusion) while riding above the min-decimated backstop.
+## The sink is a pure function of the welded vertex (radial), so two facets' shared edge vertices sink bit-identically
+## (weld preserved). Default 0.0 ⇒ the `p` term is untouched and the tile is byte-identical to shipped (every gate /
+## far-tier caller that passes 3 args is unaffected). Colour/normal read `b_dir` (radial), unaffected by the sink.
+static func build_tile(fid: int, cells: int, gen: Object, sink: float = 0.0) -> Dictionary:
 	if gen == null:
 		return {}
 	FarPalette.ensure_ready()
@@ -82,7 +88,10 @@ static func build_tile(fid: int, cells: int, gen: Object) -> Dictionary:
 	var nrm := PackedVector3Array(); nrm.resize(n)
 	var col := PackedColorArray(); col.resize(n)
 	for vi in range(n):
-		pos[vi] = b_pos[vi]
+		var p := b_pos[vi]
+		if sink != 0.0:
+			p = p - p.normalized() * sink   # C3: uniform radial drop (welded-vertex pure ⇒ shared edges sink identically)
+		pos[vi] = p
 		nrm[vi] = b_dir[vi]
 		var g := int(b_g[vi])
 		var d := b_dir[vi]
@@ -180,6 +189,10 @@ static func hop_annulus(active: int, hop_b: int, hop_h: int) -> Array:
 	var frontier := [active]
 	var slots := [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]
 	var out := []
+	# C3 FP_SMOOTH_V2_NEARFILL: hop 0 = the active facet itself is IN the annulus when hop_b == 0 (the BFS below
+	# only ever emits hop ≥ 1 neighbours). Fires only for hop_b ≤ 0 ⇒ every shipped caller (hop_b ≥ 1) is unaffected.
+	if hop_b <= 0:
+		out.append(active)
 	var hop := 0
 	while not frontier.is_empty() and hop < hop_h:
 		hop += 1
@@ -195,6 +208,27 @@ static func hop_annulus(active: int, hop_b: int, hop_h: int) -> Array:
 					out.append(nb)
 		frontier = next_frontier
 	return out
+
+## C3 FP_SMOOTH_V2_NEARFILL: BFS hop distance of each facet from `active`, `{fid -> hop}` (active → 0). PURE — the
+## same seam-neighbour graph `hop_annulus` walks. Used to pick the per-tile radial sink (hop ≤ 1 tiles sink to sit
+## under the near blocks; hop ≥ 2 stay un-sunk). Only built when the flag is on ⇒ zero cost / no state off.
+static func hop_map(active: int, hop_h: int) -> Dictionary:
+	var visited := {active: 0}
+	var frontier := [active]
+	var slots := [FacetAtlas.S_EAST, FacetAtlas.S_WEST, FacetAtlas.S_NORTH, FacetAtlas.S_SOUTH]
+	var hop := 0
+	while not frontier.is_empty() and hop < hop_h:
+		hop += 1
+		var next_frontier := []
+		for fid in frontier:
+			for slot in slots:
+				var nb := FacetAtlas.seam_neighbour(int(fid), slot)
+				if nb < 0 or visited.has(nb):
+					continue
+				visited[nb] = hop
+				next_frontier.append(nb)
+		frontier = next_frontier
+	return visited
 
 ## §1.1 the RACE-FREEDOM theorem, made mechanical: merge an ARBITRARY `{fid -> tile}` resident dict into ONE set of
 ## surface arrays, concatenating tiles in ASCENDING fid order — a fixed canonical order that depends on the SET of
@@ -338,6 +372,7 @@ var _hop_h: int = CubeSphere.V2_HOP_H
 var _active_fid := -1
 var _want: Dictionary = {}            ## fid -> true (the current residency target)
 var _want_order: Array = []           ## the SAME fids, nearest-first BFS order (dispatch priority)
+var _hop_of: Dictionary = {}          ## C3 FP_SMOOTH_V2_NEARFILL: fid -> BFS hop from active (sink selection). Empty off.
 var _tiles: Dictionary = {}           ## fid -> tile dict (resident, committed on main)
 var _leaving: Dictionary = {}         ## fid -> dwell steps remaining before eviction (fid no longer in `_want`)
 var _dirty := false                   ## a commit/evict landed since the last mesh rebuild
@@ -346,6 +381,7 @@ var _dirty := false                   ## a commit/evict landed since the last me
 var _sn := 0
 var _s_fid: PackedInt32Array = PackedInt32Array()
 var _s_task: PackedInt32Array = PackedInt32Array()
+var _s_sink: PackedFloat32Array = PackedFloat32Array()   ## C3: per-slot radial sink (blocks) for the in-flight tile build
 var _s_result: Array = []
 var _s_mutex: Mutex = null
 
@@ -382,9 +418,14 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	# V2-3a (FP_SMOOTH_V2_REACH): reach one hop further so more of the far field is real relief, not flat skin.
 	# Off ⇒ `_hop_h` stays `CubeSphere.V2_HOP_H` (byte-identical). `_hop_b` is untouched either way.
 	_hop_h = CubeSphere.V2_HOP_H_REACH if CubeSphere.FP_SMOOTH_V2_REACH else CubeSphere.V2_HOP_H
+	# C3 FP_SMOOTH_V2_NEARFILL: reach DOWN to hop 0 (active facet + 4 edge neighbours) so the hop-0/1 near band
+	# carries smooth relief too — closing the non-monotone backstop hole. Off ⇒ `_hop_b` stays `CubeSphere.V2_HOP_B`
+	# (byte-identical residency). Set BEFORE `_recompute_want` below, which reads it.
+	_hop_b = 0 if CubeSphere.FP_SMOOTH_V2_NEARFILL else CubeSphere.V2_HOP_B
 	_sn = clampi(OS.get_processor_count() - 1, 1, CubeSphere.SMOOTH_BUILD_SLOTS)
 	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
+	_s_sink = PackedFloat32Array(); _s_sink.resize(_sn); _s_sink.fill(0.0)   # C3: default no sink (byte-off)
 	_s_result.resize(_sn)
 	_s_mutex = Mutex.new()
 	_merge_mutex = Mutex.new()   # FP_SMOOTH_V2_ASYNC_MERGE: guards the single off-thread merge slot (idle off the flag)
@@ -392,6 +433,8 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 
 func _recompute_want(active: int) -> void:
 	var order := hop_annulus(active, _hop_b, _hop_h)
+	# C3 FP_SMOOTH_V2_NEARFILL: refresh the hop map so dispatch can pick the per-tile sink. Empty off ⇒ sink 0 ⇒ byte-off.
+	_hop_of = hop_map(active, _hop_h) if CubeSphere.FP_SMOOTH_V2_NEARFILL else {}
 	var new_want := {}
 	for fid in order:
 		new_want[int(fid)] = true
@@ -489,6 +532,9 @@ func step(settled := true, credit_ok := true) -> void:
 		if slot < 0:
 			break   # no free worker slot this call — the remainder waits for a later step()
 		_s_fid[slot] = f
+		# C3 FP_SMOOTH_V2_NEARFILL: hop ≤ 1 (active + edge neighbours) tiles sink so they sit UNDER the near blocks;
+		# hop ≥ 2 stay un-sunk. Written on MAIN before dispatch (same single-writer discipline as `_s_fid`). Off ⇒ 0.
+		_s_sink[slot] = CubeSphere.V2_NEARFILL_SINK if (CubeSphere.FP_SMOOTH_V2_NEARFILL and int(_hop_of.get(f, 99)) <= 1) else 0.0
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot), true, "smoothv2tile")
 		_dispatch_count += 1
 	if _dirty:
@@ -537,7 +583,7 @@ func _inflight(fid: int) -> bool:
 ## any other main-thread-owned state. Writes only `_s_result[i]`, mutex-guarded (mirrors `FacetSmoothTier._build_worker`).
 func _build_worker(i: int) -> void:
 	var fid := int(_s_fid[i])
-	var tile := build_tile(fid, _cells, _cpp_gen)
+	var tile := build_tile(fid, _cells, _cpp_gen, _s_sink[i])   # C3: per-slot sink (0.0 off ⇒ byte-identical)
 	_s_mutex.lock()
 	_s_result[i] = tile
 	_s_mutex.unlock()

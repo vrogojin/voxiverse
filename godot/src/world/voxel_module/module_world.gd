@@ -75,6 +75,8 @@ var _lod_mesher = null
 var _stream_pace := 1.0
 var _voxel_engine: Object = null              # FP_INFLIGHT_GATE (P1): lazily-cached VoxelEngine singleton for the main-thread apply-queue read
 var _load_ctrl = null                         # the StreamLoadController (stored; forwarded to _lod_mesher, §6.5)
+var _smooth_query = null                       # C1 FP_M2_SMOOTH_DEFER: the smooth-residency Callable (→ FacetFarRing.
+                                              # is_smooth_resident); stored + re-forwarded to _lod_mesher on each _lod_setup rebuild
 var _imminent_fid := -1                       # CONTROLLER-FIX §P3c: the committed imminent-ridge fid — its pool ramp slot
                                               # is paced at maxf(_stream_pace, RELIEF_FLOOR) so a geometric-commit spawn
                                               # still streams when surface-3 pace is held at 0; forwarded to _lod_mesher
@@ -1927,6 +1929,8 @@ func _lod_setup() -> void:
 	_lod_mesher.call("set_active_facet", _pool_active)
 	if _load_ctrl != null:                            # FP-M2c: a pool_reset rebuild re-forwards the controller (§6.5)
 		_lod_mesher.call("set_load_controller", _load_ctrl)
+	if _smooth_query != null and _lod_mesher.has_method("set_smooth_query"):
+		_lod_mesher.call("set_smooth_query", _smooth_query)   # C1: a rebuild re-forwards the smooth-residency query
 	set_process(true)
 
 ## FP-M2b: join the builder Thread before the node tree tears down (a bare free would leak the running Thread).
@@ -2055,6 +2059,14 @@ func set_load_controller(c) -> void:
 	_load_ctrl = c
 	if _lod_mesher != null:
 		_lod_mesher.call("set_load_controller", c)
+
+## C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): store the smooth-residency Callable (WorldManager
+## hands down `Callable(_facet_ring, "is_smooth_resident")`) and forward it to the FacetLodMesher so its want loop defers
+## to a resident smooth tile. Stored so each _lod_setup rebuild re-forwards it. No-op if the mesher is absent (flag off).
+func set_smooth_query(cb) -> void:
+	_smooth_query = cb
+	if _lod_mesher != null and _lod_mesher.has_method("set_smooth_query"):
+		_lod_mesher.call("set_smooth_query", cb)
 
 ## CONTROLLER-FIX §P3c: WorldManager forwards the committed imminent-ridge fid each pool pass (−1 = none). Stored here to
 ## floor THAT slot's view-ramp pace in _ramp_pool_step, and forwarded to the mesher (relief-mode budgeter + demote sparing).

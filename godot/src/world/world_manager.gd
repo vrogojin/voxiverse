@@ -4237,8 +4237,8 @@ func floor_under(x: float, z: float, feet_y: float, pos_fid: int = -1) -> float:
 					# shafts/tunnels (a real below-surface stand), preserving shipped behaviour there exactly. Off
 					# ⇒ dead code.
 					if CubeSphere.FP_FLOOR_SURFACE_WELD and probe_play_y < surface_play_y - CubeSphere.FLOOR_WELD_EPS and not _edit_columns.has(Vector2i(xi, zi)):
-						return surface_play_y
-					return probe_play_y
+						return _ssw_weld(xi, zi, x, z, surface_play_y)
+					return _ssw_weld(xi, zi, x, z, probe_play_y)
 				y -= 1
 			# Nothing solid within MARGIN of the feet. Compute a cheap CEILING on the highest solid cell in the
 			# column — the greater of (a) `col_height + MARGIN`: `col_height` is the procedural heightmap TOP, a
@@ -4277,12 +4277,118 @@ func floor_under(x: float, z: float, feet_y: float, pos_fid: int = -1) -> float:
 			# COSMOS FALL-THROUGH GUARD (FP_FLOOR_SURFACE_WELD §2.2): same epsilon-gated weld as the probe-loop
 			# return above — see that comment. Off ⇒ dead code.
 			if CubeSphere.FP_FLOOR_SURFACE_WELD and tail_play_y < surface_play_y - CubeSphere.FLOOR_WELD_EPS and not _edit_columns.has(Vector2i(xi, zi)):
-				return surface_play_y
-			return tail_play_y
+				return _ssw_weld(xi, zi, x, z, surface_play_y)
+			return _ssw_weld(xi, zi, x, z, tail_play_y)
 		if populate and not _span_indep_empty(v_here):
 			memo_safe = false          # a footprint-DEPENDENT cell sits above the floor → unsafe to cache this column
 		y -= 1
-	return float(effective_height(xi, zi) + 1) + s
+	return _ssw_weld(xi, zi, x, z, float(effective_height(xi, zi) + 1) + s)
+
+## COSMOS SEAM-SLOPE WELD (docs/COSMOS-SEAM-SLOPE-WELD-DESIGN.md §3, FP_SEAM_SLOPE_WELD) — clamp the just-computed
+## collision floor `base_play_y` (in the ACTIVE facet's play space at continuous column (x, z)) UP to the NEIGHBOUR
+## facet's junction-aware band surface, but ONLY inside the seam band |own_dist| ≤ SEAM_WELD_BAND. Off / non-faceted
+## / no active facet ⇒ returns `base_play_y` unchanged after ONE flag compare (every floor_under return is byte-
+## identical). A dug column (`_edit_columns`) is EXEMPT — the same shaft exemption FP_FLOOR_SURFACE_WELD uses, so a
+## seam shaft the player dug is never welded shut. `max(base, neighbour)` never lowers the floor and never sits below
+## either side's rendered slope; symmetric across the crossing (see design §3.1). Band-gated ⇒ the facet interior is
+## byte-identical (the min-slot own_dist exceeds the band there, so the branch returns early — #111 untouched).
+func _ssw_weld(xi: int, zi: int, x: float, z: float, base_play_y: float) -> float:
+	if not (CubeSphere.FP_SEAM_SLOPE_WELD and CubeSphere.FACETED):
+		return base_play_y
+	var A := TerrainConfig.active_facet()
+	if A < 0 or _edit_columns.has(Vector2i(xi, zi)):
+		return base_play_y
+	# Nearest seam slot's |own_dist| at the query column (base surface feet). One plane dot per ≤ 4 slots — the
+	# same cost class as the FACETED ridge-wall test in `blocked`. Outside the band ⇒ no weld (interior byte-exact).
+	var pl := FacetAtlas.seam_planes_f64(A)
+	var slot := -1
+	var best := 1e30
+	for s in 4:
+		var a := pl[s * 4]; var b := pl[s * 4 + 1]; var c := pl[s * 4 + 2]; var d := pl[s * 4 + 3]
+		var gl := sqrt(a * a + b * b + c * c)
+		if gl <= 1e-12:
+			continue
+		var v: float = absf(a * x + b * base_play_y + c * z + d) / gl
+		if v < best:
+			best = v; slot = s
+	if slot < 0 or best > CubeSphere.SEAM_WELD_BAND:
+		return base_play_y
+	var B := FacetAtlas.seam_neighbour(A, slot)
+	if B < 0:
+		return base_play_y
+	# This column's base surface as a WORLD point in A, and its radius. The neighbour's band surface at the SAME
+	# physical point is a world radius too (frame-pure, GenCtx(B) — no set_active_facet), so `max` is frame-free.
+	var wA := FacetAtlas.lattice_to_world64(A, x, base_play_y, z)
+	var r_base: float = sqrt(wA[0] * wA[0] + wA[1] * wA[1] + wA[2] * wA[2])
+	var r_nb := _facet_band_surface_r(B, wA[0], wA[1], wA[2])
+	if r_nb <= r_base:
+		return base_play_y
+	# Convert the (higher) neighbour radius back to a play-y in A: r is ~affine in play-y along the column, so one
+	# extra world sample gives the local dr/dy (≈ 1). The clamp only ever RAISES the floor (max), never lowers it.
+	var wA1 := FacetAtlas.lattice_to_world64(A, x, base_play_y + 1.0, z)
+	var r_base1: float = sqrt(wA1[0] * wA1[0] + wA1[1] * wA1[1] + wA1[2] * wA1[2])
+	var drdy := r_base1 - r_base
+	if drdy <= 1e-6:
+		return base_play_y
+	return base_play_y + (r_nb - r_base) / drdy
+
+## FP_SEAM_SLOPE_WELD — facet F's FRAME-PURE junction-aware band surface at world point (wx,wy,wz), returned as a
+## WORLD RADIUS. Mirrors probe_seam_slope's `_frame_floor` MINUS the scan: a GenCtx(0, F) worker-path context feeds
+## the pure static column funnels (no `set_active_facet`, no `_chart`, no memo churn), so it is safe to evaluate for
+## the NEIGHBOUR facet while A is active. The band top follows the design §3.1 branch — the FAM_JUNCTION run-top
+## `hi` (the clipped-cube ladder) ONLY where the top run cell STRADDLES a seam (so both facets present the same `hi`
+## in the junction strip → the `max` welds continuously across the commit), the CONTINUOUS carve plane (bilerp of
+## the whole corner targets) where a slope fires OUTSIDE the strip (so entering the band from the facet interior
+## adds ~nothing — the carve planes agree there), else the plain surface g+S+1. Datum shift S and the FP_DATUM_BAKE
+## continuous lift are the same terms `surface_y`/`_datum_lift` add.
+func _facet_band_surface_r(F: int, wx: float, wy: float, wz: float) -> float:
+	var l := FacetAtlas.world_to_lattice64(F, wx, wy, wz)
+	var xi := int(floor(l[0]))
+	var zi := int(floor(l[2]))
+	var fx: float = l[0] - float(xi)
+	var fz: float = l[2] - float(zi)
+	var ctx := TerrainConfig.GenCtx.new(0, F)
+	var g: int = TerrainConfig.column_top(xi, zi, ctx)
+	var S: int = FacetAtlas.datum_shift(F, xi, zi)
+	var lift := 0.0
+	if CubeSphere.FP_DATUM_BAKE:
+		lift = FacetAtlas.datum_lift(F, l[0], l[2])
+	var srun: int = TerrainConfig.slope_run_of(xi, zi, ctx)
+	var top_play: float
+	if TerrainConfig.slope_run_fires(srun):
+		var rng: Vector2i = TerrainConfig.slope_run_range(srun, g + S)   # run [lo, hi−1] in datum space; hi = ladder top
+		var st := FacetAtlas.cell_seam_state(F, xi, rng.y - 1, zi)       # does the top run cell straddle a ridge?
+		var straddles: PackedInt32Array = st["straddle"]
+		if not bool(st["air"]) and not straddles.is_empty():
+			top_play = float(rng.y) + lift                              # junction strip → the clipped-cube ladder top hi
+		else:
+			# The carve plane: bilerp the four WHOLE corner targets Tw over the in-cell footprint (crack-free, §3.1).
+			var m: int = TerrainConfig.slope_run_modifier_at(srun, g + S, rng.x)
+			var d: Vector4i = CellCodec.slope_deltas(m)
+			var t00 := float(rng.x + d.x); var t10 := float(rng.x + d.y)
+			var t11 := float(rng.x + d.z); var t01 := float(rng.x + d.w)
+			top_play = t00 * (1.0 - fx) * (1.0 - fz) + t10 * fx * (1.0 - fz) + t11 * fx * fz + t01 * (1.0 - fx) * fz + lift
+	else:
+		top_play = float(g + S + 1) + lift
+	var w := FacetAtlas.lattice_to_world64(F, l[0], top_play, l[2])
+	return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
+
+## FP_SEAM_SLOPE_WELD — the welded surface play-y for active-facet column (xi, zi) at its OWN plain surface, for the
+## GroundCollider seam cap (`_emit_column`). Returns −INF when the weld does not apply (flag off / not faceted / no
+## active facet / dug column / outside the band / neighbour not higher), so the collider adds NO extra geometry then.
+const _SSW_NO_CAP := -1e30
+func seam_weld_cap_playy(xi: int, zi: int) -> float:
+	if not (CubeSphere.FP_SEAM_SLOPE_WELD and CubeSphere.FACETED):
+		return _SSW_NO_CAP
+	var A := TerrainConfig.active_facet()
+	if A < 0 or _edit_columns.has(Vector2i(xi, zi)):
+		return _SSW_NO_CAP
+	# The column's OWN plain surface play-y (effective_height + 1 + datum lift) — the same base floor_under welds.
+	var base := float(effective_height(xi, zi) + 1) + _datum_lift(xi, zi)
+	var welded := _ssw_weld(xi, zi, float(xi) + 0.5, float(zi) + 0.5, base)
+	if welded <= base + 1e-4:
+		return _SSW_NO_CAP
+	return welded
 
 ## FP_FLOOR_MEMO: store column `col`'s topmost-standable CELL y. NEVER-OOM — past FLOOR_MEMO_CAP columns the whole
 ## memo is dropped (a clear only forces a recompute, which is bit-identical), so the dict can never grow unbounded.

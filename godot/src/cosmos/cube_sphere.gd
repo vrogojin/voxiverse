@@ -3175,6 +3175,27 @@ const FP_FLOOR_SURFACE_WELD := false
 ## snow, water).
 const FLOOR_WELD_EPS := 2.0
 
+## COSMOS SEAM-SLOPE WELD (docs/COSMOS-SEAM-SLOPE-WELD-DESIGN.md §3, task #112) — the CROSS-FRAME surface weld.
+## FP_FLOOR_SURFACE_WELD (above) welds the collision floor up to the ACTIVE facet's OWN `surface_y`; it cannot
+## cover a fall-through at a facet BORDER on a slope, where the two adjacent facets' junction-banded slope
+## surfaces disagree by 1.5–3 blocks at the shared ridge (each frame's own datum + per-frame carve stencil +
+## FAM_JUNCTION run-top ladder — see design §2). When true, `floor_under` (and GroundCollider._emit_column)
+## clamp the collision floor UP, inside the narrow seam band |own_dist| ≤ SEAM_WELD_BAND only, to the NEIGHBOUR
+## facet's frame-pure junction-aware band surface (computed via a GenCtx(facet=B) worker-path context — no
+## `set_active_facet`, no memo churn — reframed into the active frame as a world radius). `max(own, neighbour)`
+## is symmetric, so the two facets agree by construction: the collision floor is continuous across the crossing
+## commit and can never sit below either side's rendered slope (kills both the pre-commit hysteresis-strip sink
+## and the commit-instant drop; the residual render step stays a sealed, walk-over ledge — cosmetics unchanged).
+## `_edit_columns` (a player-dug shaft) is EXEMPT — a dug column is never welded up. The weld fires ONLY in the
+## band (one plane dot per ≤4 slots), so the facet INTERIOR (#111 FP_SLOPE_MANIFEST_HEAL's domain) is byte-
+## identical. Default FALSE ⇒ the weld branch is unreached (one flag compare in each funnel) ⇒ byte-identical.
+## Gate: verify_seam_slope_weld.gd.
+const FP_SEAM_SLOPE_WELD := false
+## FP_SEAM_SLOPE_WELD's band half-width (blocks of seam-plane distance): the FAM_JUNCTION strip width — inside it
+## both facets render/collide the junction cube ladder, so the neighbour's band surface is the run-top `hi` and
+## the weld is the max of the two ladders. Only consulted when FP_SEAM_SLOPE_WELD is on.
+const SEAM_WELD_BAND := 1.5
+
 ## COSMOS FALL-THROUGH INCIDENT PROBE (docs/COSMOS-FLOOR-SURFACE-FALLTHROUGH-DESIGN.md §4, FablePhys design,
 ## adopted) — live proof-of-mechanism telemetry, NOT a fix. In player.gd `_move`, immediately after the landing
 ## floor query, when `terrain_floor < surface_y − 3` fires (a genuine fall-through in progress), push a

@@ -46,6 +46,10 @@ var _builder = null                        # the ONE FacetLodBuilder this mesher
 var _active_fid := -1
 var _cam: Camera3D = null                   # M2c selector input (stored, unused in M2b)
 var _controller = null                      # M2c/d StreamLoadController (stored, unused in M2b)
+var _smooth_query: Callable = Callable()     # C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): the
+                                             # smooth-residency arbitration query (→ FacetFarRing.is_smooth_resident).
+                                             # Unset (flag off / never wired) ⇒ `_smooth_owns` short-circuits false ⇒
+                                             # the want loop is byte-identical to shipped (mirrors FacetBlockLodLadder).
 var _imminent_fid := -1                      # CONTROLLER-FIX §P3: the committed imminent-ridge fid — floored through
                                              # relief mode (budgeter §P3a) and spared by demote (§P3d); −1 = none
 var _apron_mat: StandardMaterial3D = null
@@ -117,6 +121,18 @@ func set_camera(cam: Camera3D) -> void:
 ## M2c/d admission controller. Stored now; the credit that scales apply-ms + grants is M2c.
 func set_load_controller(c) -> void:
 	_controller = c
+
+## C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): wire the smooth-residency arbitration query
+## (→ FacetFarRing.is_smooth_resident). Mirrors FacetBlockLodLadder.set_smooth_query — WorldManager forwards
+## `Callable(_facet_ring, "is_smooth_resident")` through module_world on setup (re-applied on each pool-reset rebuild).
+## Unset (flag off) ⇒ `_smooth_owns` is always false ⇒ `_recompute_wants` is byte-identical to shipped.
+func set_smooth_query(cb: Callable) -> void:
+	_smooth_query = cb
+
+## True when the smooth tier currently draws a committed relief tile over `fid` (so a coarse M2 megablock over it
+## would only protrude/waste — C1 skips wanting ≥ℓ2 there). Short-circuits false when the Callable is unset.
+func _smooth_owns(fid: int) -> bool:
+	return _smooth_query.is_valid() and bool(_smooth_query.call(fid))
 
 ## CONTROLLER-FIX §P3: the committed imminent-ridge fid (WorldManager forwards it each pool pass via module_world).
 ## In relief mode the budgeter keeps granting toward this fid at any tier; demote_pressure_relief never coarsens it.
@@ -310,15 +326,28 @@ func _recompute_wants() -> void:
 					break
 		if not visible:
 			continue                                            # off-screen — the far-ring quad covers it
-		var d := maxf(to_cam.length(), 1.0)
+		# C2 FP_M2_EDGE_DIST (§3.2): the SSE law reads the distance to the NEAREST point of the facet's planar quad,
+		# not the centre — a mountain on the near edge of a 436-block facet is otherwise judged up to ~300 blocks
+		# farther than it is, coarsening it a whole tier. Off ⇒ the shipped centre distance verbatim.
+		var d := maxf(_nearest_quad_dist(fid, gt, cam_pos), 1.0) if CubeSphere.FP_M2_EDGE_DIST else maxf(to_cam.length(), 1.0)
 		var lc := sse_lc(d, fov_v, vh)
 		var cur := int(_cache[fid]["lod"]) if _cache.has(fid) else -1
+		# C1 FP_M2_SMOOTH_DEFER (§4, RESOLVED 2026-08-11): where the smooth tier is RESIDENT, skip stamping ANY M2
+		# want for this facet — the resident smooth relief IS the cover. Skip-ALL (not just ≥ℓ2): the budgeter's
+		# max(target,3) first-cover would re-materialize the ℓ3 megablock steps from an "allow-ℓ1" want, and no band
+		# exists where ℓ1-over-smooth is both visible and not already finer-covered by the near/pool field. An
+		# already-built mesh is freed on the residency transition itself (_defer_evict_smooth_covered), not the
+		# 30 s idle timer; the far ring backstops it min-contained (never a hole). Off ⇒ shipped stamp verbatim.
+		if CubeSphere.FP_M2_SMOOTH_DEFER and _smooth_owns(fid):
+			continue
 		_want[fid] = hyst_tier(lc, cur)
 	# A2 (FP-NEIGHBOUR-SEAM-POLISH §7.6): pin the active facet's near edge-neighbours to ℓ1 (the finest tier) so the
 	# ridges the player looks across are 2-block megablocks. Stamped UNCONDITIONALLY (bypassing the hemisphere/frustum
 	# cull above) so a quick turn never lands on a coarse/absent near ridge; ℓ1 ≈ 4.6 MB each (≈18 MB for 4) sits well
 	# inside the 96 MB LOD ledger, and the NEVER-OOM caps still bound the total regardless (a genuine over-cap degrades).
 	for nb in _active_seam_neighbours():
+		if CubeSphere.FP_M2_SMOOTH_DEFER and _smooth_owns(nb):
+			continue                                            # C1 skip-ALL: a smooth-resident near ridge is covered by the smooth tile, not an ℓ1 megablock
 		_want[nb] = 1
 
 # ---- the request-grant BUDGETER (§6.4): the selector REQUESTS, only this ALLOCATES ----
@@ -379,6 +408,25 @@ func _run_budgeter() -> void:
 			break
 		request(int(c["fid"]), int(c["lod"]))
 		made += 1
+
+## C1 FP_M2_SMOOTH_DEFER hardening (§4 EVICTION-LATENCY CAVEAT): the want-skip alone leaves an ALREADY-BUILT ℓ2/ℓ3
+## mesh protruding through the newly-resident smooth tile for up to LOD_IDLE_DEMOTE_S (30 s, :35) — unacceptable.
+## So on every tick, the instant the smooth query reports it owns a covered/building facet, free it right then (the
+## resident-set transition itself, not the idle timer). `evict` frees the applied node + cancels any in-flight build
+## + returns the ledger bytes; the far ring backstops the facet (min-contained below smooth — never a hole). A held
+## promote is spared (its live terrain is streaming under the held cover). Off / Callable unset ⇒ a no-op (byte-identical).
+func _defer_evict_smooth_covered() -> void:
+	if not CubeSphere.FP_M2_SMOOTH_DEFER or not _smooth_query.is_valid():
+		return
+	var drop := {}
+	for fid in _cache.keys():
+		if not _promoting.has(fid) and _smooth_owns(fid):
+			drop[fid] = true
+	for fid in _building.keys():
+		if not _promoting.has(fid) and _smooth_owns(fid):
+			drop[fid] = true
+	for fid in drop.keys():
+		evict(fid)                                            # frees cache node + cancels in-flight build + subtracts the ledger
 
 ## Idle demote / eviction (§5.1 / LOD_IDLE_DEMOTE_S): a covered facet the selector stopped wanting (off-screen /
 ## behind the horizon) is freed once it has been unwanted for LOD_IDLE_DEMOTE_S — memory returns WITHOUT pressure,
@@ -517,6 +565,7 @@ func tick() -> void:
 			if Time.get_ticks_usec() - t0 > budget_us:
 				break
 	_recompute_wants()                                        # SSE selector: refresh target rungs (live-only, §6.1/§6.3)
+	_defer_evict_smooth_covered()                             # C1: free a pre-existing mesh the moment the smooth tier owns its facet (no 30 s wait)
 	_run_budgeter()                                           # request-grant: allocate a few grants, credit-scaled (§6.4)
 	_idle_sweep()                                             # free facets the selector stopped wanting (§5.1)
 	_apron_pass()
@@ -744,6 +793,48 @@ func _facet_render_corners(fid: int, gt: Transform3D) -> Array:
 	for c in [Vector2i(dmn.x, dmn.y), Vector2i(dmx.x, dmn.y), Vector2i(dmx.x, dmx.y), Vector2i(dmn.x, dmx.y)]:
 		out.append(gt * (tf * Vector3(float(c.x), 0.0, float(c.y))))
 	return out
+
+## C2 FP_M2_EDGE_DIST: the distance from `cam_pos` (render space) to the NEAREST point of facet `fid`'s planar
+## quad (the 4 render-space domain corners, split into 2 triangles). Monotone: d_edge ≤ d_centre by construction
+## (the centre is one interior point of the quad; the true nearest point can only be closer). Bounded — called
+## only for the few visible facets each recompute. Only reached under the flag (byte-off otherwise).
+func _nearest_quad_dist(fid: int, gt: Transform3D, cam_pos: Vector3) -> float:
+	var c := _facet_render_corners(fid, gt)   # [c0=(min,min), c1=(max,min), c2=(max,max), c3=(min,max)]
+	var d0 := _closest_point_on_tri(cam_pos, c[0], c[1], c[2]).distance_to(cam_pos)
+	var d1 := _closest_point_on_tri(cam_pos, c[0], c[2], c[3]).distance_to(cam_pos)
+	return minf(d0, d1)
+
+## Closest point on triangle (a,b,c) to p — the standard Voronoi-region clamp (Ericson, Real-Time Collision
+## Detection §5.1.5). PURE; used only by C2's nearest-quad distance.
+static func _closest_point_on_tri(p: Vector3, a: Vector3, b: Vector3, c: Vector3) -> Vector3:
+	var ab := b - a
+	var ac := c - a
+	var ap := p - a
+	var d1 := ab.dot(ap)
+	var d2 := ac.dot(ap)
+	if d1 <= 0.0 and d2 <= 0.0:
+		return a
+	var bp := p - b
+	var d3 := ab.dot(bp)
+	var d4 := ac.dot(bp)
+	if d3 >= 0.0 and d4 <= d3:
+		return b
+	var vc := d1 * d4 - d3 * d2
+	if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+		return a + ab * (d1 / (d1 - d3))
+	var cp := p - c
+	var d5 := ab.dot(cp)
+	var d6 := ac.dot(cp)
+	if d6 >= 0.0 and d5 <= d6:
+		return c
+	var vb := d5 * d2 - d1 * d6
+	if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+		return a + ac * (d2 / (d2 - d6))
+	var va := d3 * d6 - d5 * d4
+	if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+		return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)))
+	var denom := 1.0 / (va + vb + vc)
+	return a + ab * (vb * denom) + ac * (vc * denom)
 
 ## A2 (FP-NEIGHBOUR-SEAM-POLISH §7.6): the ≤4 genuine-LOD facets sharing an edge with the ACTIVE facet — the near
 ## ridges the player looks across. These are pinned to ℓ1 (their want is floored at the finest tier) and spared from

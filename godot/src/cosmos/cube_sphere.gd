@@ -1468,6 +1468,36 @@ const V2_HOP_H_REACH := 4
 ## unconditional blocky emit (byte-identical). Gate: verify_far_smooth.gd (G-V2-EXCL — pure predicate check).
 const FP_SMOOTH_V2_EXCL_BLKLOD := false
 
+## docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4 — the FP_LOD_SMOOTH_LADDER family (task #107). Three independent
+## byte-off sub-flags that make the mid-band approach ladder monotone: the mountain that reads smooth from far
+## no longer explodes into giant megablocks on approach. Each is `const := false` and byte-identical off.
+##
+## C1 FP_M2_SMOOTH_DEFER (facet_lod_mesher.gd): where the smooth tier is RESIDENT for a facet, the M2 selector
+## stops wanting ANY M2 megablock over it (skip-ALL, incl. ℓ1 — RESOLVED 2026-08-11): the budgeter first-covers
+## a meshless facet at max(target,ℓ3), so allowing ℓ1 would re-materialize the ℓ3 summit steps under load. The
+## resident smooth relief IS the cover, so the M2 mesh that used to protrude over it (no blocky↔smooth arbitration
+## existed, §3.1) is never built; AND an already-built mesh is EVICTED on the residency transition itself
+## (_defer_evict_smooth_covered) — not left to the 30 s idle timer. Wired via a `set_smooth_query` Callable →
+## `FacetFarRing.is_smooth_resident` (mirrors the block-LOD ladder's own `set_smooth_query`, world_manager.gd:429);
+## Callable unset (flag off) ⇒ the shipped want loop verbatim.
+const FP_M2_SMOOTH_DEFER := false
+
+## C2 FP_M2_EDGE_DIST (facet_lod_mesher.gd): feed the SSE tier law the distance to the NEAREST point of the
+## facet's planar quad (clamp the camera onto the 4-corner quad `_facet_render_corners` already computes)
+## instead of the facet CENTRE — kills the ~300-block coarse bias for a mountain on the near edge of a
+## 436-block facet (§3.2; fid 771: centre 608 ⇒ ℓ2, near edge ~380 ⇒ ℓ1). Off ⇒ centre distance verbatim.
+const FP_M2_EDGE_DIST := false
+
+## C3 FP_SMOOTH_V2_NEARFILL (facet_smooth_v2.gd): extend the smooth residency annulus DOWN over the hop-0/1
+## band (`_hop_b = 0` instead of `V2_HOP_B`) so the active facet + 4 edge neighbours carry smooth relief tiles
+## too, closing the non-monotone hop-0/1 hole (§3.3, today only the 27-block backstop covers it). Their tiles
+## (hop ≤ 1) are emitted UNIFORMLY sunk by `V2_NEARFILL_SINK` blocks radially so they sit just under the near
+## blocks (no protrusion) while still riding ABOVE the min-decimated backstop tops (no see-through). The
+## residency set is a SUPERSET of today's ⇒ a facet approaching hop 2→1→0 never sheds its smooth tile (kills
+## the unload-on-approach cliff). Off ⇒ `_hop_b = V2_HOP_B` verbatim and `build_tile(sink=0)` byte-identical.
+const FP_SMOOTH_V2_NEARFILL := false
+const V2_NEARFILL_SINK := 6.0   ## = BACKSTOP_SINK: radial sink (blocks) for the hop ≤ 1 near-fill smooth tiles.
+
 ## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
 ## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),
 ## centre-relative normal). The live bug is a RUNTIME sun_dir STALENESS gap: three far materials seed their

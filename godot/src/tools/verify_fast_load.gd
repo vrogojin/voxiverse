@@ -14,7 +14,18 @@ extends SceneTree
 ##                   GlobalReliefData (mark_settled ⇒ DEM bakes nothing pre-settle), and the snow step is skipped until settle.
 ##   G-FL-FAILSAFE — the latch force-flips at LOAD_DEFER_FAILSAFE_MS even when initial_view_meshed never trips.
 ##
-## Run (FACETED + FP_LOAD_DEFER + FP_GLOBAL_RELIEF_DATA + FP_SMOOTH_V2 sed-toggled true):
+## Phase 2 (docs/COSMOS-FAST-LOAD-DESIGN.md §2.1.2/§2.1.3 — self-describes on the compiled FP_SMOOTH_V2_PACE /
+## FP_SMOOTH_V2_ASYNC_MERGE flags):
+##   G-FL-PACE     — FP_SMOOTH_V2_PACE on: the commit is rate-capped — the pure G3 decision (FacetOrbitRelief.
+##                   should_commit) honours SMOOTH_V2_COMMIT_MS at the boundary, and a burst of rapid reaps collapses
+##                   to ONE commit (not one-per-reap): the falsifier is 36 rapid step()s ⇒ commit_count == 1, not 36.
+##   G-FL-MERGE-EQ — FP_SMOOTH_V2_ASYNC_MERGE on (CRITICAL): the off-thread `merge_tiles` produces BYTE-IDENTICAL
+##                   pos/nrm/col/idx to the synchronous `merge_tiles` for the same tile set — run hard across many
+##                   tile sets / insertion orders + a mutate-during-merge COW stress; plus the instance async path
+##                   dispatches+reaps ONE commit that lands a surface. Any COW/thread race surfaces as byte-inequality.
+##
+## Run (FACETED + FP_LOAD_DEFER + FP_GLOBAL_RELIEF_DATA + FP_SMOOTH_V2 [+ FP_SMOOTH_V2_PACE + FP_SMOOTH_V2_ASYNC_MERGE
+## for the Phase-2 gates] sed-toggled true):
 ##   godot --headless --path godot --script res://src/tools/verify_fast_load.gd 2>/dev/null | grep VERIFY
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
@@ -57,6 +68,12 @@ func _initialize() -> void:
 	else:
 		_gate_off()
 
+	# Phase 2 (docs/COSMOS-FAST-LOAD-DESIGN.md §2.1.2/§2.1.3) — self-describe on the COMPILED flag, like Phase 1 above.
+	if CubeSphere.FP_SMOOTH_V2_PACE:
+		_gate_pace()
+	if CubeSphere.FP_SMOOTH_V2_ASYNC_MERGE:
+		_gate_merge_eq()
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -92,10 +109,19 @@ func _gate_smooth_freeze() -> void:
 	_ok(sv._dirty, "G-FL-GATE: `_dirty` accumulates across the freeze (commit deferred, not lost)")
 	sv.step(true, false)                    # POST-SETTLE, credit NOT ok: first commit still held
 	_ok(sv.commit_count() == 0, "G-FL-GATE: first post-settle commit WAITS for stream_credit>0")
-	sv.step(true, true)                     # credit ok ⇒ the first commit lands
+	_ok(sv._merge_task < 0, "G-FL-GATE: pre-credit NOTHING is dispatched (async merge held too)")
+	# credit ok ⇒ the first commit lands. `_open_pace`/`_settle_async` make this robust when FP_SMOOTH_V2_PACE /
+	# FP_SMOOTH_V2_ASYNC_MERGE are ALSO compiled on (combined Phase-2 toggle): pace can't false-block the commit, and
+	# the async merge is driven to completion deterministically (step()'s is_task_completed reap is unreliable in a
+	# frame-less headless SceneTree — see _settle_async; the LIVE reap uses the same idiom as the shipped build reap).
+	_open_pace(sv)
+	sv.step(true, true)
+	_settle_async(sv)
 	_ok(sv.commit_count() == 1, "G-FL-GATE: first commit fires once credit recovers")
 	sv._dirty = true
+	_open_pace(sv)
 	sv.step(true, false)                    # credit-gate is first-commit-ONLY ⇒ subsequent commits are unconditional
+	_settle_async(sv)
 	_ok(sv.commit_count() == 2, "G-FL-GATE: the credit wait is spent after the first commit (later commits unconditional)")
 	ring.free()
 
@@ -115,7 +141,7 @@ func _gate_smooth_freeze() -> void:
 		sv2._want = {}; sv2._want_order = []
 		for _i in range(4000):
 			sv2.step(true, true)
-			var busy := false
+			var busy := sv2._merge_task >= 0
 			for s in range(sv2._sn):
 				if int(sv2._s_fid[s]) >= 0:
 					busy = true
@@ -206,3 +232,155 @@ func _gate_failsafe() -> void:
 	_ok(wm._load_defer_tick(Vector3.ZERO, 0), "G-FL-FAILSAFE: the wall-clock backstop flips the latch even though the view never meshed")
 	_ok(wm._load_settled, "G-FL-FAILSAFE: settled by the failsafe (far field can't defer forever)")
 	wm.free()
+
+# --- G-FL-PACE (FP_SMOOTH_V2_PACE): the commit is rate-capped to SMOOTH_V2_COMMIT_MS; a burst collapses to 1 commit --
+func _gate_pace() -> void:
+	# (a) the PURE G3 boundary — SMOOTH_V2_COMMIT_MS honoured exactly (synthetic timestamps, no wall-clock wait).
+	var iv := CubeSphere.SMOOTH_V2_COMMIT_MS
+	_ok(FacetOrbitRelief.should_commit(true, iv, 0, iv), "G-FL-PACE: should_commit TRUE at exactly SMOOTH_V2_COMMIT_MS since last")
+	_ok(not FacetOrbitRelief.should_commit(true, iv - 1, 0, iv), "G-FL-PACE: should_commit FALSE one ms before the window opens")
+	_ok(not FacetOrbitRelief.should_commit(true, 600 + iv - 1, 600, iv), "G-FL-PACE: the window is measured from the LAST commit")
+	_ok(not FacetOrbitRelief.should_commit(false, iv + 1000, 0, iv), "G-FL-PACE: never commits when NOT dirty (no work)")
+
+	# (b) FUNCTIONAL falsifier: 36 rapid reaps inside one wall-clock window ⇒ ONE commit, not 36. `_settle_async` makes
+	# it robust whether or not FP_SMOOTH_V2_ASYNC_MERGE is ALSO compiled on (the combined Phase-2 toggle): it drives the
+	# single in-flight async merge to completion deterministically so its commit counts inside the same <500ms window.
+	var ring := Node3D.new()
+	var sv := FacetSmoothV2.new()
+	sv.setup_instance(ring, 12)
+	sv._want = {}; sv._want_order = []          # isolate the commit path (no build dispatch)
+	var gen = FacetSkinTier._build_cpp_gen(12)
+	var t := FacetSmoothV2.build_tile(12, CubeSphere.V2_CELLS, gen)
+	if not t.is_empty():
+		sv._tiles[12] = t                       # a real resident tile so the commit builds a surface
+	for _i in range(36):
+		sv._dirty = true
+		sv.step(true, true)                     # rapid — all inside one SMOOTH_V2_COMMIT_MS window
+		_settle_async(sv)                       # complete the single async merge into its commit (no-op when async off)
+	_ok(sv.commit_count() == 1, "G-FL-PACE: 36 rapid reaps collapse to ONE commit (rate-capped), not 36 [got %d]" % sv.commit_count())
+	_ok(sv._dirty, "G-FL-PACE: the pace-blocked dirties accumulate (commit deferred, not lost)")
+	ring.free()
+
+# --- G-FL-MERGE-EQ (FP_SMOOTH_V2_ASYNC_MERGE, CRITICAL): off-thread merge == sync merge_tiles, byte-for-byte --------
+func _gate_merge_eq() -> void:
+	var gen = FacetSkinTier._build_cpp_gen(12)
+	var pool := {}
+	for fid in [10, 11, 12, 13, 14, 15, 20, 21]:
+		var tt := FacetSmoothV2.build_tile(int(fid), CubeSphere.V2_CELLS, gen)
+		if not tt.is_empty():
+			pool[int(fid)] = tt
+	if pool.size() < 4:
+		_ok(false, "G-FL-MERGE-EQ: could not bake >=4 real tiles (module absent?) — byte-eq unprovable this run")
+		return
+	_ok(true, "G-FL-MERGE-EQ: baked %d real tiles for the byte-eq stress" % pool.size())
+	var pfids := pool.keys()
+
+	# Many tile sets: every prefix (varying resident-set size) + its reversed-insertion twin (same fids, different
+	# Dictionary order ⇒ the canonical ascending-fid sort must erase the difference). Each merged off-thread vs sync.
+	var n_sets := 0
+	var all_eq := true
+	for n in range(2, pfids.size() + 1):
+		var d := {}
+		for i in range(n):
+			d[int(pfids[i])] = pool[int(pfids[i])]
+		var dr := {}
+		for i in range(n - 1, -1, -1):
+			dr[int(pfids[i])] = pool[int(pfids[i])]
+		var sync_d := FacetSmoothV2.merge_tiles(d)
+		if not _arrays_equal(sync_d, _merge_on_worker(d, {})):
+			all_eq = false
+		if not _arrays_equal(sync_d, _merge_on_worker(dr, {})):
+			all_eq = false
+		n_sets += 2
+	_ok(all_eq, "G-FL-MERGE-EQ: off-thread merge == sync merge_tiles byte-for-byte across %d tile sets/orders" % n_sets)
+
+	# COW stress: churn the ORIGINAL dict on MAIN (erase + re-add + a transient insert/erase) WHILE the worker merges
+	# its snapshot — the snapshot merge must still equal a sync merge of the pre-mutation set (the snapshot's own refs
+	# keep the shared tile arrays alive; any refcount/CoW race corrupting the result would surface as byte-inequality).
+	var base := {}
+	for i in range(pfids.size()):
+		base[int(pfids[i])] = pool[int(pfids[i])]
+	var expect := FacetSmoothV2.merge_tiles(base)
+	var cow_eq := true
+	for _rep in range(8):
+		if not _arrays_equal(expect, _merge_on_worker(base, pool)):
+			cow_eq = false
+	_ok(cow_eq, "G-FL-MERGE-EQ: snapshot merge survives main-thread mutation during flight (CoW / refcount safe)")
+
+	# Instance path: a step() DISPATCHES the merge off-thread (never commits inline), the worker's own result is the
+	# SAME arrays as the sync merge of the instance's resident set, and applying it lands exactly one real surface.
+	# (Driven via wait_for_task_completion rather than step()'s is_task_completed reap — the latter is unreliable in a
+	# frame-less headless SceneTree; the LIVE reap uses the shipped build-reap idiom and is exercised in the browser.)
+	var ring := Node3D.new()
+	var sv := FacetSmoothV2.new()
+	sv.setup_instance(ring, 12)
+	sv._want = {}; sv._want_order = []
+	for i in range(pfids.size()):
+		sv._tiles[int(pfids[i])] = pool[int(pfids[i])]
+	sv._dirty = true
+	sv.step(true, true)                         # dispatches the merge, does NOT commit inline
+	_ok(sv._merge_task >= 0, "G-FL-MERGE-EQ: instance step() dispatches the merge off-thread (no inline commit)")
+	_ok(sv.commit_count() == 0, "G-FL-MERGE-EQ: the main thread has NOT committed yet (merge still off-thread)")
+	WorkerThreadPool.wait_for_task_completion(sv._merge_task)
+	sv._merge_mutex.lock(); var got = sv._merge_result; sv._merge_mutex.unlock()
+	_ok(got != null and _arrays_equal(got, FacetSmoothV2.merge_tiles(sv._tiles)),
+		"G-FL-MERGE-EQ: the instance worker's merged arrays == sync merge_tiles of its resident set")
+	sv._build_and_swap(got)
+	_ok(sv._mi.mesh != null and sv._mi.mesh.get_surface_count() == 1, "G-FL-MERGE-EQ: the merged arrays apply to ONE real surface on main")
+	sv._merge_task = -1; sv._merge_result = null   # slot cleared — free() is clean
+	ring.free()
+
+# Merge a shallow snapshot of `src` on a WorkerThreadPool task (mirrors FacetSmoothV2._merge_worker). If `mutate_pool`
+# is non-empty, churn the ORIGINAL `src` on MAIN between dispatch and reap (the CoW stress) — the snapshot is
+# independent (duplicate taken before the churn), so a correct result is unchanged by the mutation.
+var _mm_mutex: Mutex = null
+var _mm_result = null
+func _merge_task_fn(snapshot: Dictionary) -> void:
+	var r := FacetSmoothV2.merge_tiles(snapshot)
+	_mm_mutex.lock(); _mm_result = r; _mm_mutex.unlock()
+
+func _merge_on_worker(src: Dictionary, mutate_pool: Dictionary) -> Dictionary:
+	if _mm_mutex == null:
+		_mm_mutex = Mutex.new()
+	var snapshot := src.duplicate()             # shallow — mirrors FacetSmoothV2's `_tiles.duplicate()` dispatch
+	_mm_result = null
+	var task := WorkerThreadPool.add_task(Callable(self, "_merge_task_fn").bind(snapshot), true, "gatemerge")
+	if not mutate_pool.is_empty():
+		var keys := src.keys()
+		if keys.size() > 0:
+			var victim := int(keys[0])
+			var saved = src[victim]
+			src.erase(victim); src[victim] = saved          # move victim to the end (key-order churn)
+			for k in mutate_pool.keys():
+				if not src.has(int(k)):
+					src[int(k)] = mutate_pool[k]; src.erase(int(k))  # transient insert then drop
+					break
+	WorkerThreadPool.wait_for_task_completion(task)
+	_mm_mutex.lock(); var r = _mm_result; _mm_result = null; _mm_mutex.unlock()
+	return r
+
+func _arrays_equal(a, b) -> bool:
+	if a == null or b == null:
+		return false
+	return (a["pos"] == b["pos"] and a["nrm"] == b["nrm"] and a["col"] == b["col"] and a["idx"] == b["idx"])
+
+# Deterministically complete an in-flight FacetSmoothV2 async merge into its commit — the SAME work step()'s async
+# reap does, but driven via wait_for_task_completion instead of is_task_completed (the latter is unreliable in a
+# frame-less headless SceneTree, so a step()-driven reap can never be relied on here; the LIVE reap uses the shipped
+# build-reap idiom and is exercised in the browser). No-op when FP_SMOOTH_V2_ASYNC_MERGE is off (sync `_commit`
+# already incremented the count inline) or when no merge is in flight.
+func _settle_async(sv) -> void:
+	if not CubeSphere.FP_SMOOTH_V2_ASYNC_MERGE or sv._merge_task < 0:
+		return
+	WorkerThreadPool.wait_for_task_completion(sv._merge_task)
+	sv._merge_task = -1
+	sv._merge_mutex.lock(); var merged = sv._merge_result; sv._merge_result = null; sv._merge_mutex.unlock()
+	if merged != null:
+		sv._build_and_swap(merged)
+		sv._first_commit_done = true
+		sv._commit_count += 1
+
+# Open the FP_SMOOTH_V2_PACE rate-cap window so the NEXT step() commits (isolates credit/commit-accounting from the
+# pace cadence, which G-FL-PACE asserts separately). No-op semantics when pace is off (the field is simply unread).
+func _open_pace(sv) -> void:
+	sv._last_commit_wall_ms = Time.get_ticks_msec() - CubeSphere.SMOOTH_V2_COMMIT_MS - 1

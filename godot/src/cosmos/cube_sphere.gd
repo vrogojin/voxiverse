@@ -879,6 +879,28 @@ const FP_DEM_DEFER := false
 const FP_LOAD_DEFER := false
 const LOAD_DEFER_FAILSAFE_MS := 45000   # wall-clock cap (ms): force the settle latch even if the near view never meshes
 
+## FP_SMOOTH_V2_PACE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2, §2.1.2) — commit RATE-CAP for FacetSmoothV2. Post-settle
+## the annulus fill lands ~36 tiles across ~36 step()s, and `step()` commits on EVERY reap ⇒ ~36 whole-surface
+## ArrayMesh rebuilds (each re-merges the FULL resident set ⇒ O(N²) work over the fill, ~185 ms/commit on web). This
+## flag adopts the EXACT G3 rate-cap (`FacetOrbitRelief.should_commit` + `ORBIT_RELIEF_COMMIT_MS`, cube_sphere.gd:844):
+## at most one commit per `SMOOTH_V2_COMMIT_MS`; dirty tiles simply accumulate and one commit folds all ready tiles
+## (dispatch-first / commit-later). Converts the fill from ~36 commits to ~5-8 and removes the per-facet-crossing /
+## view-change play hitch. Applies ALWAYS (not just during load). Off ⇒ commit-every-reap verbatim (byte-identical,
+## FLAT 6042/0). Gate: verify_fast_load.gd (G-FL-PACE).
+const FP_SMOOTH_V2_PACE := false
+const SMOOTH_V2_COMMIT_MS := 500        # min ms between FacetSmoothV2 commits (mirrors ORBIT_RELIEF_COMMIT_MS)
+
+## FP_SMOOTH_V2_ASYNC_MERGE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2, §2.1.3) — move `FacetSmoothV2.merge_tiles` (the
+## ~630k-index concat/remap, the whole main-thread commit cost) OFF the main thread. `merge_tiles` is a PURE static
+## over immutable-once-landed tiles; the commit dispatches it as ONE WorkerThreadPool task on a SHALLOW `_tiles`
+## snapshot (the worker reads only its bound copy — the FP_ORBIT_RELIEF worker-safety pattern), reaps the merged
+## arrays a later step(), and the main thread pays only `add_surface_from_arrays` + `_mi.mesh =` (the SAFE high-level
+## API — no RenderingServer region calls, the REV-7 ANGLE/WebGL2 law intact). Single-slot (never stacked): while a
+## merge is in flight the dirty flag simply holds and retries. The canonical ascending-fid merge order is preserved
+## ⇒ byte-identical to the sync merge (G-V2-PURE's equality law, now proven across the thread hop by G-FL-MERGE-EQ).
+## Off ⇒ synchronous merge on main verbatim (byte-identical). Gate: verify_fast_load.gd (G-FL-MERGE-EQ).
+const FP_SMOOTH_V2_ASYNC_MERGE := false
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

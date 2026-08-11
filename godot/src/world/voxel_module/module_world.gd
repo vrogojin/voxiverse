@@ -1968,10 +1968,19 @@ func lod_stats() -> Dictionary:
 	return _lod_mesher.call("stats") if _lod_mesher != null else {}
 
 ## FP-M2d (§9.1): has PROMOTING neighbour `fid`'s seam-side band (the strip of `fid` nearest the player) finished
-## MESHING? The player's ACTIVE-facet-lattice position is reframed into `fid`'s lattice (= `fid`'s terrain LOCAL space,
-## since the slot applies facet_transform(fid) over fid-lattice geometry) and probed with is_area_meshed. Returns true
-## when `fid` is not live / the terrain lacks is_area_meshed (never block a promote's completion on a missing probe).
+## MESHING? FP_NB_WELD dispatches to the seam-anchored strip probe; off-flag ⇒ the shipped ±(32,40,32) box (DEAD by
+## construction, §2 — the box always exceeds `fid`'s bounds-clamped domain). BOTH bodies stay exposed as named methods so
+## the G-NB-WELD-PROBE discriminator can drive them side-by-side in ONE binary (the shipped box provably false where the
+## weld strip is true). Returns true when `fid` is not live / lacks is_area_meshed (never block a promote on a missing probe).
 func pool_seam_meshed(fid: int, player_active_pos: Vector3) -> bool:
+	if CubeSphere.FP_NB_WELD:
+		return pool_seam_meshed_weld(fid, player_active_pos)
+	return pool_seam_meshed_shipped(fid, player_active_pos)
+
+## SHIPPED (dead-by-construction) probe: reframe the player's ACTIVE-lattice position into `fid`'s lattice and ask
+## is_area_meshed on a ±(32,40,32) box. Retained VERBATIM so FP_NB_WELD-off === shipped bytes, and so the discriminator can
+## prove it never returns true for a neighbour (≥22 of its cells lie past `fid`'s domain slab, which is_area_meshed never clips).
+func pool_seam_meshed_shipped(fid: int, player_active_pos: Vector3) -> bool:
 	if not _pool.has(fid):
 		return true
 	var t: Object = _pool[fid]["terrain"]
@@ -1982,6 +1991,57 @@ func pool_seam_meshed(fid: int, player_active_pos: Vector3) -> bool:
 	var c := Vector3(float(lp[0]), float(lp[1]), float(lp[2]))
 	var half := Vector3(32.0, 40.0, 32.0)
 	return bool(t.call("is_area_meshed", AABB(c - half, half * 2.0)))
+
+## FP_NB_WELD W1 (§3.1): the seam-anchored, bounds-safe strip probe. Reframe the player into B(=`fid`)'s lattice, then
+## project NB_PROBE_DEPTH cells INSIDE B along B's own-side inward ridge normal — measured FROM the ridge (own_dist), not
+## from the player, so the foot lands at a fixed depth inside B's domain slab REGARDLESS of how far outside B the player
+## stands (the shipped box's fatal flaw). Probe three SINGLE mesh cells strung ±NB_PROBE_SPAN along the ridge tangent, each
+## at the player's y. All three loaded ⇒ B's seam-side strip nearest the player has meshed. Single in-bounds cells never
+## touch B's forbidden domain, so (unlike the shipped box) they CAN return true. Corner-safe: if no bounds-safe foot exists
+## (the depth-anchored centre falls outside B's polygon) it returns FALSE — keep the far cover, never a see-through hole.
+func pool_seam_meshed_weld(fid: int, player_active_pos: Vector3) -> bool:
+	if not _pool.has(fid):
+		return true
+	var t: Object = _pool[fid]["terrain"]
+	if t == null or not t.has_method("is_area_meshed"):
+		return true
+	# The shared slot: B's ridge that faces the ACTIVE facet (exact via seam_neighbour, not nearest-plane — risk #3 kill).
+	var slot_b := -1
+	for s in 4:
+		if FacetAtlas.seam_neighbour(fid, s) == _pool_active:
+			slot_b = s
+			break
+	if slot_b < 0:
+		return false                                    # not an edge neighbour of active — no seam to weld; keep the cover
+	var lp := FacetAtlas.reframe_position64(_pool_active, fid,
+		player_active_pos.x, player_active_pos.y, player_active_pos.z)
+	var lpx := float(lp[0]); var lpy := float(lp[1]); var lpz := float(lp[2])
+	# B's own-side ridge plane in B's lattice: own(x,y,z)=A·x+B·y+C·z+D≥0 interior; (A,B,C) is a UNIT vector (§2 build).
+	var sp := FacetAtlas.seam_plane(fid, slot_b)
+	var mhat := Vector3(sp.x, sp.y, sp.z)
+	if mhat.length() < 0.5:
+		return false
+	mhat = mhat.normalized()
+	# depth from the RIDGE: step the player foot to own_dist = NB_PROBE_DEPTH inside B (|(A,B,C)|=1 ⇒ 1 unit step = 1 cell).
+	var own_d := FacetAtlas.own_dist(fid, slot_b, lpx, lpy, lpz)
+	var p := Vector3(lpx, lpy, lpz) + mhat * (CubeSphere.NB_PROBE_DEPTH - own_d)
+	# ridge tangent (horizontal, in B's facet plane): ⟂ to both the inward normal and lattice-up (the facet-lattice y axis).
+	var tang := Vector3(0.0, 1.0, 0.0).cross(mhat)
+	if tang.length() < 1.0e-4:
+		tang = Vector3(1.0, 0.0, 0.0)                   # degenerate (near-vertical normal) — any horizontal tangent will do
+	tang = tang.normalized()
+	# the depth-anchored centre must itself be inside B's polygon (a corner can push it past an ADJACENT edge); if not, no
+	# bounds-safe probe exists ⇒ keep the cover.
+	if not FacetAtlas.in_polygon(fid, int(floor(p.x)), int(floor(p.z)), -2.0):
+		return false
+	for k in [0.0, CubeSphere.NB_PROBE_SPAN, -CubeSphere.NB_PROBE_SPAN]:
+		var q: Vector3 = p + tang * float(k)
+		if not FacetAtlas.in_polygon(fid, int(floor(q.x)), int(floor(q.z)), -2.0):
+			q = p                                       # retreat a ±span foot that left B's polygon back to the in-bounds centre
+		# a size-1 box downscales to exactly the ONE mesh cell containing (q.x, player-y, q.z) — bounds-safe by construction.
+		if not bool(t.call("is_area_meshed", AABB(Vector3(floor(q.x), floor(lpy), floor(q.z)), Vector3.ONE))):
+			return false
+	return true
 
 ## FP-M2c (§6.5.3 surface 3): set the pool view-ramp pace ∈ [0,1] from the StreamLoadController. The GROW leg of every
 ## view ramp is stretched by `f` (RAMP_SECONDS the min duration; f=0 holds it). Clamped; default 1.0 → the shipped

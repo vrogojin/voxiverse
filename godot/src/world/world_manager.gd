@@ -1216,6 +1216,15 @@ func update_streaming(player_pos: Vector3) -> void:
 	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
 	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
 		_facet_ring.set_cover_query(cover_query)
+	# COSMOS-FAR-NEAR-GRASSBASE §2.2 (FP_APPLIED_PROBE_SLAB): hand the far ring the bounds-safe W1 seam-strip probe
+	# (module_world.pool_seam_meshed_weld) so the applied-cover box can prove its cross-border remainder on pool
+	# neighbours (the flank is full-res since FP_NB_FULLRES). Invalid on the fallback / no-module path ⇒ the remainder
+	# is unprovable and the box that overflows the active domain returns false — inert / byte-identical off the flag.
+	if _facet_ring != null and _facet_ring.has_method("set_seam_cover_query"):
+		var seam_query := Callable()
+		if using_module and _module_world != null and _module_world.has_method("pool_seam_meshed_weld"):
+			seam_query = Callable(_module_world, "pool_seam_meshed_weld")
+		_facet_ring.set_seam_cover_query(seam_query)
 	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): feed the frozen player-column snapshot (ABSOLUTE
 	# world coords, the far ring's own frame) so the S2 near-collar disc is centred on the ACTUAL player, not the
 	# active facet centre. `player_pos` is in the active facet's LATTICE frame (same convention `_radial_altitude_

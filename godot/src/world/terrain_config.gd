@@ -262,6 +262,14 @@ static func streamed_ellipsoid_params() -> Vector3:
 	var ratio := clamped_viewer_vertical_ratio() if use_clamp else VIEWER_VERTICAL_RATIO
 	return Vector3(r, o, ratio * r)
 
+## COSMOS-FAR-NEAR-GRASSBASE §2.1 (FP_APPLIED_PROBE_SLAB): the VERTICAL slab [y_min, y_max] every voxel terrain is
+## bounds-clamped to — the lowest solid cell (BEDROCK_FLOOR) up to the highest any generator+decoration can reach
+## (MAX_SURFACE_Y + the taller of a tree or a snow stack). ONE derivation site, the streamed_ellipsoid_params
+## pattern, so module_world._apply_bounds (the mesher's clamp) and facet_far_ring's applied-cover probe can never
+## quietly disagree about what CAN be meshed. Pure function of the compile consts; returns (−64, 130) today.
+static func meshed_slab_y() -> Vector2:
+	return Vector2(float(BEDROCK_FLOOR), float(MAX_SURFACE_Y + max(TreeGen.MAX_ABOVE_SURFACE, SNOW_FILL_MAX_CELLS)))
+
 ## PROVEN upper bound on height_at(x,z) over the whole (infinite) domain — the module generator
 ## uses it to CHEAPLY skip all-air blocks far above the terrain BEFORE the column-profile pass.
 ## Analytic max height_at = BASE_HEIGHT(5) + max _continent_offset(11) + HILLS_AMPLITUDE(3) +

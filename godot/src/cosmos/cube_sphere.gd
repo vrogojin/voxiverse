@@ -1701,6 +1701,20 @@ const APPLIED_PROBE_STEP := 16
 ## ~112 note; NOT the 128 streamed target). The probe never claims more than this.
 const APPLIED_PROBE_MAX := 112
 
+## COSMOS-FAR-NEAR-GRASSBASE §2 (FP_APPLIED_PROBE_SLAB) — REFINES FP_FARRING_APPLIED_COVER's dead INPUT, not its
+## (correct, #89-proven) three-zone height law. The applied-cover ladder was pinned at 0 everywhere because
+## `_applied_box_meshed` probed an AABB y ∈ [player−128, player+128] that can NEVER fit the voxel terrain's
+## bounds-clamped slab y ∈ [−64, 130] (module_world._apply_bounds), and godot_voxel's is_area_meshed never clips to
+## bounds (the FP_NB_WELD fact) — so zone C (the sunk cover) was empty and the un-sunk 26-block dense backstop
+## protruded OVER near blocks on CONCAVE relief (a mountain grass base: worst +9.08 blk). This flag makes the probe
+## SATISFIABLE: clamp the box to what a terrain CAN mesh — TerrainConfig.meshed_slab_y() vertically, the active
+## facet's domain ±2 horizontally — and prove the cross-border remainder (columns on a pool-neighbour facet, since
+## FP_NB_FULLRES) via the EXISTING bounds-safe W1 seam-strip probe (module_world.pool_seam_meshed_weld). The height
+## /sink law and the grow≤1-step / shrink-instantly ladder discipline are UNTOUCHED. Off ⇒ `_applied_box_meshed`
+## is the shipped 5-line body verbatim (byte-identical; `_applied_r` stays 0 exactly as today) → FLAT 6042/0. Gate:
+## verify_applied_slab.gd (G-ACS-*). Effective only where FP_FARRING_APPLIED_COVER already governs.
+const FP_APPLIED_PROBE_SLAB := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

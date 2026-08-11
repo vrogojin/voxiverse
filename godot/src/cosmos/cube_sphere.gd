@@ -861,6 +861,24 @@ const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0)
 ## (G-SP-OFF / G-SP-DEM-DEFER).
 const FP_DEM_DEFER := false
 
+## FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1 — the fresh-load pile-up fix) — a fresh reload takes 2-3 min
+## because the MAIN thread piles up DEFERRABLE far-tier / background work while the near view is not up yet: the
+## FacetSmoothV2 whole-annulus commit (~185 ms/commit, once per reap during the fill), the far-ring env warm-converge
+## (~25 ms), and the snowfall step (~20-25 ms) all run unconditionally from boot while the near field is cheap
+## (vox_main≈0) and the workers idle — a priority inversion (StreamLoadController throttles the NEAR field it sees
+## stalling, never the far work causing the stall). This flag adds ONE settle latch (`WorldManager._load_settled`),
+## flipped ONCE off the existing `initial_view_meshed` 64³ probe (the exact FP_DEM_DEFER shape) with a
+## `LOAD_DEFER_FAILSAFE_MS` wall-clock backstop, boot-once (NO re-arm on crossings). Pre-settle it broadcasts:
+## (a) `FacetSmoothV2.step()` REAPS ONLY — free the worker slot, land the tile, mark dirty, but NO dispatch and NO
+## commit (the WS1a suspend pattern `FacetOrbitRelief.step()` proves); post-settle it resumes paced — dispatch-first,
+## commit-later, and the FIRST commit waits for `stream_credit > 0` so the backlog cannot fire on one frame.
+## (b) the far ring's surface env warm-converge reuses the existing FP_ENV_FALL_HOLD chord-only branch as a load-hold
+## (coverage YES, convergence NO). (c) the main-thread snow step is skipped (dormant-by-default, persists via _edits).
+## Off ⇒ the latch never gates anything: every path is the shipped behaviour verbatim (FLAT 6042/0). Gate:
+## verify_fast_load.gd (G-FL-OFF / G-FL-GATE / G-FL-FAILSAFE).
+const FP_LOAD_DEFER := false
+const LOAD_DEFER_FAILSAFE_MS := 45000   # wall-clock cap (ms): force the settle latch even if the near view never meshes
+
 ## FP_FAR_SMOOTH — SMOOTH far-terrain geometry (docs/COSMOS-FAR-RENDER-OVERHAUL-DESIGN.md §2, Item B). Replaces the
 ## flat 26-104-block heightfield far-ring cells (and the blocky FP_BLOCK_LOD megablocks) with a Naive Surface Nets
 ## isosurface over FarDensity — rounded mountains, and (with FP_FAR_SMOOTH_OVERHANG) dug arches/tunnel mouths. Painted

@@ -376,6 +376,13 @@ var _async_chord_only := false
 # FP_ENV_FALL_HOLD: set true by WorldManager while the player is descending fast — pauses the env-upgrade dispatch
 # (chords keep coverage) so the worker's allocation firehose stops stalling the shared WASM allocator / physics tick.
 var _fall_hold := false
+# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1): the fresh-load settle latch, mirrored here from
+# WorldManager (set_load_settled). While false the ring holds the surface env warm-converge in the FP_ENV_FALL_HOLD
+# chord-only mode AND passes `settled=false` to `_smooth_v2.step()` (reap-only, no dispatch/commit). `_stream_credit_ok`
+# (set_stream_credit_ok, forwarded from StreamLoadController) gates the FIRST post-settle smooth-v2 commit. Both inert
+# with FP_LOAD_DEFER off (never written by WorldManager, and every read is gated on the flag).
+var _load_settled := false
+var _stream_credit_ok := false
 # FP_ENV_RESUME_PACED: ms of the last floored ENV-upgrade dispatch — throttles the touchdown resume burst.
 var _last_env_dispatch_ms := 0
 # T2e (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-rebuild build/swap timing records, drained by WorldManager →
@@ -1274,7 +1281,9 @@ func _process(_dt: float) -> void:
 	# docs/COSMOS-FAR-SMOOTH-V2-DESIGN.md §4 V2-1 (FP_SMOOTH_V2): reap builds/evictions + commit the ONE annulus
 	# mesh if anything changed. Cheap at rest (fast no-op scans). No-op / null with the flag off.
 	if _smooth_v2 != null:
-		_smooth_v2.step()
+		# FP_LOAD_DEFER: pre-settle (`_load_settled` false) step() reaps only — no dispatch/commit (WS1a freeze); post-
+		# settle the FIRST commit waits on `_stream_credit_ok`. Both args are inert with the flag off (step self-gates).
+		_smooth_v2.step(_load_settled, _stream_credit_ok)
 	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3): reap builds/evictions + rate-capped whole-surface
 	# commit for the relief-mesh tier. Cheap at rest (no dirty tiles, no in-flight slots ⇒ fast no-op scans).
 	# No-op / null with the flag off (byte-identical).
@@ -1392,6 +1401,18 @@ func _process(_dt: float) -> void:
 func set_fall_hold(v: bool) -> void:
 	_fall_hold = v
 
+## FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1): WorldManager flips this ONCE when the near view meshes
+## (or the failsafe trips). Releases the surface env load-hold (the `hold` OR term above) and unfreezes the smooth-v2
+## annulus (`_smooth_v2.step()` resumes dispatch+paced commit). Plain state write; never re-armed. No-op semantics off
+## the flag (WorldManager only calls it under FP_LOAD_DEFER; every read of `_load_settled` is itself flag-gated).
+func set_load_settled(v: bool) -> void:
+	_load_settled = v
+
+## FP_LOAD_DEFER: forward `stream_credit > 0` (from StreamLoadController) so smooth-v2's FIRST post-settle commit can
+## wait until the near field is no longer starving. Plain state write; read only under the flag (byte-identical off).
+func set_stream_credit_ok(v: bool) -> void:
+	_stream_credit_ok = v
+
 ## REVISION 5 (G-FS-QUIESCE-SURF): `quiesce_on`/`demand_on`/`fallback_on`/`floored_async_on`/`warm_split_on` override
 ## FP_RING_QUIESCE/FP_ENV_DEMAND_DISC/FP_ENV_FALLBACK_EMIT/FP_ENV_FLOORED_ASYNC/FP_WARM_EMIT_SPLIT (the codebase's
 ## gate-forcing convention) and `force_async`/`env_on` are threaded straight into `_env_async_floored_on` so a
@@ -1407,7 +1428,11 @@ func _surface_converge_emit(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE, 
 		if not _pending and _srf_converged:
 			return
 		_emit_cached_only = true
-		var hold := CubeSphere.FP_ENV_FALL_HOLD and _fall_hold
+		# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md §2.2): reuse this chord-only hold as the fresh-load env-hold —
+		# pre-settle (`not _load_settled`) coverage keeps first-cover chords but convergence stops, exactly as the
+		# fall-hold intends. Released when WorldManager flips the settle latch (set_load_settled). Off ⇒ the OR term is
+		# false (byte-identical).
+		var hold := (CubeSphere.FP_ENV_FALL_HOLD and _fall_hold) or (CubeSphere.FP_LOAD_DEFER and not _load_settled)
 		var want := _pending or not _orbit_emitted_once
 		var converged := false
 		if hold:

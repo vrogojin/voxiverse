@@ -79,6 +79,10 @@ var _relief_data: GlobalReliefData = null   # COSMOS-FAR-GEOMETRY-PREBAKE (task 
 var _g2_last_frame_usec := 0
 var _relief_settled := false                 # FP_DEM_DEFER (COSMOS-STREAM-PARALLEL Phase A): latched once the near view
                                              # meshes (mark_settled fired) — before then the DEM bake is deferred.
+var _load_settled := false                   # FP_LOAD_DEFER (COSMOS-FAST-LOAD Phase 1): the ONE fresh-load settle latch.
+                                             # Flipped once off initial_view_meshed (or the failsafe) — before then the
+                                             # far-ring smooth-v2 commits, env warm-converge, and snow step are deferred.
+var _load_defer_start_ms := -1               # FP_LOAD_DEFER: wall-clock anchor for LOAD_DEFER_FAILSAFE_MS (set on first update_streaming).
 var _block_lod: FacetBlockLodRing = null  # COSMOS BLOCK-LOD P1: L1 megablock rim ring; null unless FP_BLOCK_LOD
 var _block_lod_ladder: FacetBlockLodLadder = null   # COSMOS BLOCK-LOD P2: L2..L4 streamed ladder; null unless FP_BLOCK_LOD_RINGS
 var _block_lod_global: FacetBlockLodGlobal = null   # COSMOS BLOCK-LOD P2: L5 GLOBAL always-resident tier; null unless FP_BLOCK_LOD_GLOBAL
@@ -760,7 +764,11 @@ func near_coverage_available() -> bool:
 func _process(delta: float) -> void:
 	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
 	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
-	if _snowfall != null and _have_player_pos and not _snow_skip_airborne() and not _alt_frozen():
+	# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md §2.3): a third suppressor — skip the ~20-25 ms/frame snow step while
+	# the fresh load hasn't settled. Snow is invisible to a player staring at a loading near field, dormant-by-default,
+	# and persists via _edits, so a delayed start is semantically free. `not FP_LOAD_DEFER or _load_settled` ⇒ byte-off.
+	if _snowfall != null and _have_player_pos and not _snow_skip_airborne() and not _alt_frozen() \
+			and (not CubeSphere.FP_LOAD_DEFER or _load_settled):
 		var t_snow := Time.get_ticks_usec()   # T2f: attribute the snowfall fixed-step spike
 		_snowfall.process(delta, _last_player_pos)
 		_snow_us_max = maxi(_snow_us_max, Time.get_ticks_usec() - t_snow)
@@ -1254,6 +1262,12 @@ func update_streaming(player_pos: Vector3) -> void:
 	# must pace even when FP_FACET_TEX/FP_SHELL_ABSOLUTE are off). At most one facet bakes per call, nearest
 	# the view axis first, only when the last frame had headroom; step() self-guards on the flag => off is a
 	# single cheap null-check, byte-identical.
+	# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1 — the fresh-load pile-up fix): advance the ONE settle latch
+	# (flipped once off the near-view mesh probe or a wall-clock backstop; boot-once), then per-frame forward the
+	# controller credit so smooth-v2's first post-settle commit can wait for the near field. Both no-op off the flag.
+	_load_defer_tick(player_pos)
+	if CubeSphere.FP_LOAD_DEFER and _facet_ring != null and _facet_ring.has_method("set_stream_credit_ok"):
+		_facet_ring.set_stream_credit_ok(stream_load_credit() > 0.0)
 	if _relief_data != null and _facet_ring != null:
 		# FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix): defer the whole-planet
 		# DEM bake until the near view has MESHED. During the load window the DEM's only on-surface consumer (the
@@ -1316,6 +1330,31 @@ func initial_view_meshed(center: Vector3) -> bool:
 		var half := Vector3(64.0, 32.0, 64.0) if CubeSphere.FP_LOAD_RAMP else Vector3(40.0, 32.0, 40.0)
 		return bool(_module_world.call("area_meshed", center, half))
 	return true                                     # fallback path / no module → no terrain-format hold
+
+## FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1): advance the ONE fresh-load settle latch. Flips `_load_settled`
+## exactly once — when the near view has meshed (`initial_view_meshed`) OR the `LOAD_DEFER_FAILSAFE_MS` wall-clock cap
+## trips (so a view that never meshes, e.g. a fallback-path quirk, cannot defer the far field forever) — and broadcasts
+## the flip: the far ring (set_load_settled → smooth-v2 unfreeze + env load-hold release), and GlobalReliefData
+## (mark_settled — the DEM defer latch settles off the SAME event; harmless when FP_DEM_DEFER is off, its step() ignores
+## `_settled`). Boot-once, NO re-arm on crossings; short-circuit ⇒ the probe is never queried after settle, or at all
+## with the flag off (byte-identical: `_load_settled` stays false forever and gates nothing). Returns the flip frame.
+## Factored out of update_streaming so verify_fast_load.gd can drive it with a controllable `initial_view_meshed`.
+## `failsafe_ms` overrides the wall-clock cap so the gate can exercise the failsafe branch without a 45 s clock wait
+## (the codebase's gate-override convention). The one real caller (update_streaming) passes no override ⇒ the const.
+func _load_defer_tick(center: Vector3, failsafe_ms := CubeSphere.LOAD_DEFER_FAILSAFE_MS) -> bool:
+	if not CubeSphere.FP_LOAD_DEFER or _load_settled:
+		return false
+	if _load_defer_start_ms < 0:
+		_load_defer_start_ms = Time.get_ticks_msec()
+	if not (initial_view_meshed(center) or (Time.get_ticks_msec() - _load_defer_start_ms >= failsafe_ms)):
+		return false
+	_load_settled = true
+	if _facet_ring != null and _facet_ring.has_method("set_load_settled"):
+		_facet_ring.set_load_settled(true)
+	if _relief_data != null:
+		_relief_settled = true                          # the DEM defer latch reads the same settle event
+		_relief_data.mark_settled()
+	return true
 
 ## BOOT-LOAD PROFILE (perf/voxiverse-load-profile): read-only "is this arbitrary box meshed?" accessor used by
 ## main.gd's post-splash "world_settled" timer to measure how long the bulk near view (much larger than the tiny

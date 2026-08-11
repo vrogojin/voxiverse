@@ -3502,6 +3502,16 @@ func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_orbit_relief_sun_dir(sun_dir)
 
+## docs/COSMOS-FAR-TREES-DESIGN.md (P0): forward the current Sun direction + the live camera into the far-tree
+## card tier each frame. No-op with no faceted ring (the ring setters self-guard) ⇒ byte-identical off.
+func set_far_trees_sun_dir(sun_dir: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_far_trees_sun_dir(sun_dir)
+
+func set_far_trees_camera(cam: Vector3) -> void:
+	if _facet_ring != null:
+		_facet_ring.set_far_trees_camera(cam)
+
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter
 ## + the atlas setter both self-guard) ⇒ byte-identical.

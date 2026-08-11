@@ -286,6 +286,12 @@ static func note_sun_dir(sun_dir: Vector3) -> void:
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		_last_sun_dir = sun_dir
 
+## FP_FAR_TERMINATOR_WELD: the last live Sun any biased-material consumer was told about — the shared cross-tier
+## weld cache. COSMOS FAR-TREES §5.3 reads this to seed `FacetFarTrees`'s card material on build so a late-built
+## tile never freezes at the (1,0,0) fake-noon default. (1,0,0) until the first `note_sun_dir` write.
+static func last_sun_dir() -> Vector3:
+	return _last_sun_dir
+
 static func make_biased_material(bias: float) -> ShaderMaterial:
 	var sh := Shader.new()
 	sh.code = tier_shader_code()

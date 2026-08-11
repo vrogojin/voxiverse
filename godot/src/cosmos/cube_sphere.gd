@@ -861,6 +861,17 @@ const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-con
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
 
+## FP_ORBIT_RELIEF_SURFACE_HIDE (docs/COSMOS-FAR-NEAR-COVERAGE-DESIGN.md §3.1 — kills the far-over-near mountain
+## protrusion) — G3's on-surface SUSPEND (`FacetOrbitRelief.step()` WS1a) freezes recompute/commit below
+## OFFSURFACE_Y but leaves the last committed mesh VISIBLE and UN-SUNK at its coarse 13-block DEM pitch, so on a
+## steep summit ~35 % of it rides ABOVE the fine near block tops (the grey blob-with-fingers). On-surface the mesh
+## is redundant by construction — the near field + V2 annulus + #107 near-fill + FARRING_FULL_COVER backstop already
+## own that view — so hiding it removes an overdrawn duplicate, never coverage. Under this flag `step()` sets the ONE
+## MeshInstance's `.visible` to `ring.shell_offsurface()` (hidden on-surface, shown off-surface); the frozen tiles /
+## arena / bytes are UNTOUCHED (warm for the next ascent, 0 new bytes). Off ⇒ `.visible` is never written, `step()`
+## control flow verbatim (byte-identical). Gate: verify_far_near_coverage.gd (G-FNC-OFF / G-FNC-HIDE / G-FNC-LAW).
+const FP_ORBIT_RELIEF_SURFACE_HIDE := false
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

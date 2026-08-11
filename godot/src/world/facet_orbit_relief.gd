@@ -641,7 +641,15 @@ func step() -> void:
 			_free_arena_slot(fid)   # refusal / no longer wanted — release its reserved slot immediately
 		# a genuine completion with `_want.has(fid)` KEEPS its slot (still reserved, about to be committed).
 	var ring := _ring as FacetFarRing
-	if not ring.shell_offsurface():
+	var offsurf := ring.shell_offsurface()
+	# FP_ORBIT_RELIEF_SURFACE_HIDE (COSMOS-FAR-NEAR-COVERAGE-DESIGN §3.1): the frozen on-surface mesh rides
+	# above the fine near block tops on steep summits (un-sunk 13-block DEM pitch). On-surface the near field +
+	# V2 + #107 near-fill + FARRING_FULL_COVER already own the view, so hiding the mesh removes an overdrawn
+	# duplicate, never coverage. Render-only: `_tiles`/arena/bytes stay warm for the next ascent. Off ⇒ never
+	# written, byte-identical. Composes with the WS1a suspend below (hidden AND frozen on-surface).
+	if CubeSphere.FP_ORBIT_RELIEF_SURFACE_HIDE and _mi != null:
+		_mi.visible = offsurf   # on-surface: hidden; off-surface: shown (frozen tiles intact)
+	if not offsurf:
 		return   # WS1a: on-surface — no recompute, no dwell-eviction, no dispatch, no commit. Frozen.
 	_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
 	if not _leaving.is_empty():

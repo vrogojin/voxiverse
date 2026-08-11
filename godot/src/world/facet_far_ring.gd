@@ -325,6 +325,13 @@ var _emitted_backstop: Dictionary = {}   # fid -> true (drawn sunk in the commit
 # consecutive no-change probes; `_cull_last_ms` throttles the probe to CULL_REAP_MS; `_cull_last_reemit_ms` rate-limits
 # the APPLY rebuild; `_cull_reemit_count` is the rebuild tally the cost gate asserts is bounded.
 var _cull_cover_query: Callable = Callable()
+# COSMOS-FAR-NEAR-GRASSBASE §2.2 (FP_APPLIED_PROBE_SLAB): the bounds-safe cross-border seam probe, routed by
+# WorldManager to module_world.pool_seam_meshed_weld (the FP_NB_WELD W1 strip probe). Signature (fid, player_active_pos)
+# -> bool: has pool-neighbour `fid`'s seam-side strip nearest the player meshed? Consulted ONLY when the applied-cover
+# box overflows the active facet's domain (the flank column sits on a pool neighbour). INVALID (no module / fallback)
+# ⇒ the remainder cannot be proven ⇒ `_applied_box_meshed` returns false (shipped no-over-claim convention). Off ⇒
+# unused (the flag-off body never reaches the remainder branch) → byte-identical.
+var _seam_cover_query: Callable = Callable()
 var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): LIVE 1 = culled (confirmed covered)
 var _committed_cull: Dictionary = {}     # fid -> PackedByteArray(BACKSTOP_CELLS²): what the CURRENT mesh emits (read by is_cell_culled)
 var _cull_streak: Dictionary = {}        # fid -> PackedByteArray(BACKSTOP_CELLS²): consecutive covered-read count
@@ -1592,8 +1599,62 @@ func _applied_box_meshed(r: float, h: float, col: Vector3) -> bool:
 	if not _cull_cover_query.is_valid():
 		return false
 	var l: Array = FacetAtlas.world_to_lattice64(_active_fid, col.x, col.y, col.z)
-	var aabb := AABB(Vector3(float(l[0]) - r, float(l[1]) - h, float(l[2]) - r), Vector3(2.0 * r, 2.0 * h, 2.0 * r))
-	return bool(_cull_cover_query.call(_active_fid, aabb))
+	if not CubeSphere.FP_APPLIED_PROBE_SLAB:
+		# SHIPPED (dead-by-construction) body: the ±h box spans y∈[l1−128, l1+128], which can NEVER fit the terrain's
+		# bounds-clamped slab y∈[−64,130], and is_area_meshed never clips to bounds ⇒ false for every r, always.
+		var aabb := AABB(Vector3(float(l[0]) - r, float(l[1]) - h, float(l[2]) - r), Vector3(2.0 * r, 2.0 * h, 2.0 * r))
+		return bool(_cull_cover_query.call(_active_fid, aabb))
+	return _applied_box_meshed_slab(r, h, float(l[0]), float(l[1]), float(l[2]))
+
+## COSMOS-FAR-NEAR-GRASSBASE §2.2 (FP_APPLIED_PROBE_SLAB): the SATISFIABLE applied-cover probe. Probe only what a
+## terrain CAN mesh — clamp the box VERTICALLY to TerrainConfig.meshed_slab_y() and HORIZONTALLY to the active
+## facet's domain ±2 (the _apply_bounds seam strip), so `_cull_cover_query` (→ is_area_meshed) can actually return
+## true when the near field is meshed under the player. The cross-border REMAINDER — the part of the un-clamped box
+## that reaches past the active domain onto a pool NEIGHBOUR facet (its flank is full-res since FP_NB_FULLRES) — is
+## proven separately via the bounds-safe W1 seam-strip probe (`_seam_cover_query` → pool_seam_meshed_weld): every
+## ridge neighbour the box overflows into must have its seam-side strip meshed. Any overflow with no seam probe
+## wired, or any overflowed neighbour failing ⇒ false (the shipped no-over-claim convention; the shrink-instantly
+## ladder then keeps zone C from over-reaching). (lx,ly,lz) is the player column in the ACTIVE facet lattice.
+func _applied_box_meshed_slab(r: float, h: float, lx: float, ly: float, lz: float) -> bool:
+	# (1) Vertical: intersect [ly−h, ly+h] with the meshable slab (always non-empty — the player is inside the slab).
+	var slab: Vector2 = TerrainConfig.meshed_slab_y()
+	var ylo := maxf(ly - h, slab.x)
+	var yhi := minf(ly + h, slab.y)
+	if yhi <= ylo:
+		return false
+	# (2) Horizontal: intersect [l±r] with the active facet's domain ±2 (what this terrain is bounds-clamped to).
+	var dmin: Vector2i = FacetAtlas.dom_min(_active_fid)
+	var dmax: Vector2i = FacetAtlas.dom_max(_active_fid)
+	var xmin := float(dmin.x) - 2.0
+	var xmax := float(dmax.x) + 2.0
+	var zmin := float(dmin.y) - 2.0
+	var zmax := float(dmax.y) + 2.0
+	var xlo := maxf(lx - r, xmin)
+	var xhi := minf(lx + r, xmax)
+	var zlo := maxf(lz - r, zmin)
+	var zhi := minf(lz + r, zmax)
+	if xhi <= xlo or zhi <= zlo:
+		return false
+	var aabb := AABB(Vector3(xlo, ylo, zlo), Vector3(xhi - xlo, yhi - ylo, zhi - zlo))
+	if not bool(_cull_cover_query.call(_active_fid, aabb)):
+		return false
+	# (3) Cross-border remainder: does the un-clamped box reach past the active domain onto a ridge neighbour?
+	var over := (lx - r) < xmin or (lx + r) > xmax or (lz - r) < zmin or (lz + r) > zmax
+	if not over:
+		return true
+	if not _seam_cover_query.is_valid():
+		return false                                    # remainder unprovable (no module) ⇒ never claim it
+	var pap := Vector3(lx, ly, lz)                       # player position in the ACTIVE facet lattice (W1's frame)
+	for s in 4:
+		var nb: int = FacetAtlas.seam_neighbour(_active_fid, s)
+		if nb < 0:
+			continue
+		# own_dist = the player column's signed inset INSIDE the active facet from ridge s; the box of half-extent r
+		# reaches past that ridge exactly when r exceeds the inset — only then is neighbour `nb` under the box.
+		if FacetAtlas.own_dist(_active_fid, s, lx, ly, lz) < r:
+			if not bool(_seam_cover_query.call(nb, pap)):
+				return false
+	return true
 
 ## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2/§3.3: advance `_applied_r`, the probed scalar radius the near voxel
 ## field is ACTUALLY APPLIED to around the player column — the coverage signal `_blend_uncovered`'s zone-C
@@ -2370,6 +2431,13 @@ func _append_limb_tris(pos: PackedVector3Array, col: PackedColorArray, fid: int,
 func set_cover_query(q: Callable) -> void:
 	_cull_cover_query = q
 
+## COSMOS-FAR-NEAR-GRASSBASE §2.2 (FP_APPLIED_PROBE_SLAB): wire the bounds-safe cross-border seam probe — routed by
+## WorldManager to module_world.pool_seam_meshed_weld (the FP_NB_WELD W1 strip probe). Signature
+## (fid, player_active_pos) -> bool. An INVALID callable (no module / GDScript fallback) leaves the applied-cover
+## remainder unprovable ⇒ the box that overflows the active domain returns false (no over-claim). No-op off the flag.
+func set_seam_cover_query(q: Callable) -> void:
+	_seam_cover_query = q
+
 ## Is the U2 cull active this run? Requires the flag AND a valid coverage callable (module path). Off / no query ⇒ no
 ## cell is ever suppressed and no state is allocated → byte-identical.
 func _cull_on() -> bool:
@@ -3005,6 +3073,7 @@ func shell_telemetry() -> Dictionary:
 		"smooth_step_ms": _dbg_step_ms,                                       # REV7 diag: ms/frame in _smooth.step() alone (mesh commit)
 		"env_converge_ms": _dbg_env_ms,                                       # REV7 diag: ms/frame in _surface_converge_emit
 		"sh_emit": _emitted.size(),
+		"sh_applied_r": _applied_r,    # FP_FARRING_APPLIED_COVER ladder radius (0 = dead/degraded zone-B; grows to APPLIED_PROBE_MAX when live)
 		"sh_visN": visN,
 		"sh_cachedN": cachedN,
 		"sh_cached": _pos_cache.size(),

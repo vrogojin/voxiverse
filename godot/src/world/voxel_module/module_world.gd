@@ -1944,8 +1944,12 @@ func _apply_bounds(terrain: Object, fid: int) -> void:
 		return
 	var dmin: Vector2i = FacetAtlas.dom_min(fid)    # facet-lattice (x,z); domain already includes MARGIN_CELLS
 	var dmax: Vector2i = FacetAtlas.dom_max(fid)
-	var y_min := float(TerrainConfig.BEDROCK_FLOOR)
-	var y_max := float(TerrainConfig.MAX_SURFACE_Y + max(TreeGen.MAX_ABOVE_SURFACE, TerrainConfig.SNOW_FILL_MAX_CELLS))
+	# FP_APPLIED_PROBE_SLAB (§2.1): the vertical slab is derived ONCE in TerrainConfig.meshed_slab_y() (value-
+	# identical to the prior literal (−64, MAX_SURFACE_Y + max(tree, snow)) = (−64, 130)) so the mesher's clamp and
+	# the far-ring applied-cover probe share ONE law — the ring can never probe a box outside what this clamps.
+	var slab: Vector2 = TerrainConfig.meshed_slab_y()
+	var y_min := slab.x
+	var y_max := slab.y
 	var pos := Vector3(float(dmin.x) - 2.0, y_min, float(dmin.y) - 2.0)   # +2 seam strip (§3.2)
 	var size := Vector3(float(dmax.x - dmin.x) + 4.0, y_max - y_min, float(dmax.y - dmin.y) + 4.0)
 	_set_if(terrain, "bounds", AABB(pos, size))

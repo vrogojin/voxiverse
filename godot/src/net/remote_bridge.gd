@@ -798,6 +798,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 	if is_instance_valid(player):
 		var p := player.global_position
 		msg["pos"] = [snappedf(p.x, 0.01), snappedf(p.y, 0.01), snappedf(p.z, 0.01)]
+		# COSMOS REMOTE VIEW-STATE (dev-instrument): the surface camera facing (cam_yaw_deg/cam_pitch_deg + the
+		# world-space look_world forward), so a view can be REMEMBERED and restored exactly (teleport yaw_deg/pitch_deg).
+		# ADDITIVE + empty-dict-guarded — view_telemetry() returns {} without a camera rig, so the stream is byte-identical.
+		if player.has_method("view_telemetry"):
+			var vw = player.call("view_telemetry")
+			if vw is Dictionary and not (vw as Dictionary).is_empty():
+				msg.merge(vw as Dictionary)
 		# COSMOS SPACE-NAV SN2 (§7.5): the nav-frame machine telemetry (nav_mode/frame_v/|v_bci|/nav_frame),
 		# ADDITIVE + GUARDED — an empty dict (flag-off, or the method absent) merges nothing, so a build with
 		# SN_NAV_MODES=false stamps exactly the shipped fields (byte-identical telemetry).

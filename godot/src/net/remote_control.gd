@@ -519,6 +519,11 @@ func _start_step() -> void:
 				else:
 					okk = bool(player.call("remote_teleport", "xyz",
 						float(_cur.get("x", 0.0)), float(_cur.get("y", 0.0)), float(_cur.get("z", 0.0))))
+			# DEV/TEST VIEW-STATE restore: optional ABSOLUTE facing (yaw_deg + pitch_deg, the view_telemetry inverse)
+			# applied AFTER the safe reposition. Both required together (a lone value would silently zero the other);
+			# omit both to leave the heading the reposition produced.
+			if okk and _cur.has("yaw_deg") and _cur.has("pitch_deg") and player.has_method("remote_set_view"):
+				player.call("remote_set_view", float(_cur.get("yaw_deg", 0.0)), float(_cur.get("pitch_deg", 0.0)))
 			_finish_step("ok" if okk else "blocked")
 		"set_alt":
 			# DEV/TEST INSTRUMENT: teleport straight to `alt` above the CURRENT sub-player surface (zero horizontal

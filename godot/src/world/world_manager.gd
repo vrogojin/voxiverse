@@ -407,6 +407,12 @@ func _ready() -> void:
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
+		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
+		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
+		# re-forwards on each pool-reset rebuild. Only wired under the flag ⇒ the Callable stays unset off (byte-identical).
+		if CubeSphere.FP_M2_SMOOTH_DEFER and _module_world != null and _module_world.has_method("set_smooth_query"):
+			_module_world.call("set_smooth_query", Callable(_facet_ring, "is_smooth_resident"))
 		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4): the L1 (2-block-pitch) megablock rim ring — real
 		# greedy-meshed blocky relief OVER the far skin, engaging at the near rim (~128) out to the ridge-1 band
 		# (~700). Sibling of the far ring, gated on FP_BLOCK_LOD (default OFF → node never created → byte-identical).

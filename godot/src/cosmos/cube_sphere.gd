@@ -94,6 +94,22 @@ const NB_EXCL_RELEASE := 96.0
 const NB_SPAWN_EST := 4 * 1048576
 const NB_ABS_HEAP_MB := 1600
 
+## COSMOS FP_NB_WELD (docs/COSMOS-NB-JUNCTION-WELD-DESIGN.md) — fixes the FP_NB_FULLRES "floating tilted slab" at a facet
+## junction: the neighbour's far-tier COVER TILE that never releases because the CORRECTION-2 band-meshed exclusion latch
+## is DEAD BY CONSTRUCTION (its pool_seam_meshed ±(32,40,32) box always exceeds the neighbour's bounds-clamped domain, and
+## is_area_meshed requires EVERY cell loaded without clipping to bounds ⇒ ≥22 cells lie in unloadable space ⇒ false
+## forever). Off (false) ⇒ the shipped dead-latch behaviour VERBATIM (byte-identical). Extends FP_NB_FULLRES; live-enabled
+## via the export sed alongside it. NO transform code is touched — placement was always correct (§1). Three parts: W1 a
+## seam-anchored bounds-safe strip probe (replaces the dead box), W2 latch-change → same-tick far-ring re-sync, W3 crossing
+## seeds the old active's latch (its near field is definitionally meshed). NB_PROBE_DEPTH: cells INSIDE B measured FROM the
+## shared ridge to anchor the probe (comfortably in-bounds + inside the streamed band). NB_PROBE_SPAN: the ±ridge-tangent
+## offset of the 3-cell strip. NB_PROBE_RIDGE_MAX: only probe when the player's own-side ridge distance is under this
+## (inside the band's certain reach; the probe foot then sits ≤ NB_PROBE_RIDGE_MAX + NB_PROBE_DEPTH = 60 < the 64 band).
+const FP_NB_WELD := false
+const NB_PROBE_DEPTH := 12.0
+const NB_PROBE_SPAN := 24.0
+const NB_PROBE_RIDGE_MAX := 48.0
+
 ## COSMOS FP-M2d (docs/COSMOS-FP-M2-DESIGN.md §3.2 / §9) — the Z1-hybrid pool-policy consts (beside the POOL_* family,
 ## §3.2). CONSULTED ONLY under FP_M2_LOD; with the flag off the pool reverts to the shipped FP-M1c policy verbatim
 ## (POOL_MAX_NEIGHBOURS = 4 stays the hard backstop, asserted by G-M1-POOL). D_WARM2: a SECOND live neighbour spawns

@@ -2734,6 +2734,13 @@ func _commit_facet_change(fid: int, to: int, np: Array, slot: int) -> Dictionary
 				redesignated = bool(_module_world.call("pool_reset", to))
 	_redesig_us = Time.get_ticks_usec() - _redesig_t0
 	if redesignated:
+		# FP_NB_WELD W3 (§3.3): the OLD active (`fid`) is now a widened band neighbour of `to` with its near field ALREADY
+		# fully meshed — SEED its exclusion latch so its far cover tile never pops IN over the real blocky ground for the
+		# post-crossing window (dead-probe: forever; welded probe: until the next successful probe). Seeded here, AFTER the
+		# redesignate commit + BEFORE the ring sync below, so the SAME tick excludes it (two-phase safe; transforms untouched).
+		# Flag-off ⇒ never seeded ⇒ shipped (a stale entry, were one somehow present, is cleared next pool pass, §z1hybrid).
+		if CubeSphere.FP_NB_WELD and fid != to:
+			_nb_excl_latch[fid] = true
 		# FP-M1c: RE-DESIGNATION crossing -- ONE PlanetRoot transform write + view rebalance inside redesignate(),
 		# NO teardown/restream/new generator. The old active field persists rotated (no removed frame). Re-place
 		# the far ring + refresh its live-pool exclusion (deferred/rigid; no synchronous regen).
@@ -2972,8 +2979,11 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 	var targets := z1_live_targets(want, off_surface, live_now, _player_speed, fullres)
 	# FP_NB_FULLRES (§2.4): maintain the band-conditional far-ring exclusion latch — probe ≤1 live neighbour/tick for its
 	# seam band, clear geometrically past NB_EXCL_RELEASE / on retire. Inert off the flag (keeps `_nb_excl_latch` empty).
+	var latch_changed := false
 	if fullres:
-		_nb_update_excl_latch(live_now, want, player_pos)
+		var lc := _nb_update_excl_latch(live_now, want, player_pos)
+		if CubeSphere.FP_NB_WELD:
+			latch_changed = lc                       # W2: a latch set/clear must re-sync the far ring THIS tick (not the 0.5s throttle)
 	elif not _nb_excl_latch.is_empty():
 		_nb_excl_latch.clear()                       # flag flipped off / went off-surface → drop stale latches
 	# CONTROLLER-FIX §P3c/§P3d: publish the imminent-ridge fid (targets[0], the incumbent-hysteresis winner) to the module
@@ -3074,7 +3084,7 @@ func _manage_pool_z1hybrid(active: int, player_pos: Vector3, want: Dictionary) -
 			# (on_promote) forever, PINNING the held LOD mesh in the cache (no idle/LRU path frees it). Instead let
 			# THIS tick's _lod_promote_pass see `not pool_has(nb)` → lod_end_promote(nb) → lift the hold → erase.
 			changed = true
-	return changed
+	return changed or latch_changed                  # W2: fold in the FP_NB_WELD latch flip (byte-off: latch_changed ≡ false)
 
 ## FP_NB_FULLRES (§2.5) — the measured-byte growth-ledger admission. Returns whether a NEW non-imminent widened spawn is
 ## admitted, and maintains `_nb_breached` with cap/rehyst hysteresis. Growth = (voxel_used + static heap) − B0 (measured
@@ -3121,10 +3131,12 @@ func _nb_farthest_retirable(live_now: Array, targets: Array, want: Dictionary, r
 ## longer live, or whose ridge walked past NB_EXCL_RELEASE (the player left → its band unloads → the far tile must return).
 ## SET (≤1 probe/tick, the nearest un-latched live neighbour): its seam band is meshed near the player (pool_seam_meshed).
 ## Keeps the far ring covering a live-but-empty neighbour until its band actually meshes (the cover-until-meshed contract).
-func _nb_update_excl_latch(live_now: Array, want: Dictionary, player_pos: Vector3) -> void:
+func _nb_update_excl_latch(live_now: Array, want: Dictionary, player_pos: Vector3) -> bool:
+	var changed := false                             # W2: report set/clear so _manage_pool_z1hybrid re-syncs the ring SAME-TICK
 	for fid in _nb_excl_latch.keys():
 		if not live_now.has(fid) or float(want.get(fid, 1.0e30)) > CubeSphere.NB_EXCL_RELEASE:
 			_nb_excl_latch.erase(fid)
+			changed = true
 	var cand := -1
 	var cand_d := 1.0e30
 	for nb in live_now:
@@ -3134,8 +3146,16 @@ func _nb_update_excl_latch(live_now: Array, want: Dictionary, player_pos: Vector
 		if d < cand_d:
 			cand = int(nb)
 			cand_d = d
-	if cand >= 0 and bool(_module_world.call("pool_seam_meshed", cand, player_pos)):
+	# FP_NB_WELD W1: only probe inside the band's CERTAIN reach — the strip foot then sits ≤ NB_PROBE_RIDGE_MAX +
+	# NB_PROBE_DEPTH (60) < the 64-block band, so a `true` is real evidence. Off-flag the gate is absent (shipped: probe at
+	# any distance — harmless, the shipped box is dead anyway), preserving byte-off. Farther out the tile SHOULD cover (§3.1).
+	var gate_ok := true
+	if CubeSphere.FP_NB_WELD:
+		gate_ok = cand_d < CubeSphere.NB_PROBE_RIDGE_MAX
+	if cand >= 0 and gate_ok and bool(_module_world.call("pool_seam_meshed", cand, player_pos)):
 		_nb_excl_latch[cand] = true
+		changed = true
+	return changed
 
 ## FP_NB_FULLRES (§2.4) — is live neighbour `nb` far-ring-EXCLUDED under the widened pool? Only when it is the imminent/
 ## committed crossing target (shipped cover-until-meshed) or its seam band has latched. A live-but-empty neighbour is NOT

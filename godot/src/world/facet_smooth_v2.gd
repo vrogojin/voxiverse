@@ -351,6 +351,13 @@ var _s_mutex: Mutex = null
 
 var _last_commit_ms := 0.0
 
+# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1): settle-freeze bookkeeping. `_first_commit_done` gates the
+# FIRST post-settle commit on stream_credit (so the deferred backlog can't fire on one frame). `_dispatch_count` /
+# `_commit_count` are gate counters (G-FL-GATE asserts both == 0 while deferred). All inert with the flag off.
+var _first_commit_done := false
+var _dispatch_count := 0
+var _commit_count := 0
+
 ## Construct the ONE MeshInstance3D (child of `ring`, sharing its placement transform — like the old ladder's
 ## `_smooth`), the frozen native generator, and the worker slot pool; seed `_want`/`_want_order` for `active_fid`.
 ## `ring` is the owning FacetFarRing (any Node3D works — only `add_child`/transform inheritance is used).
@@ -397,9 +404,19 @@ func set_active(new_fid: int) -> void:
 ## Reap finished builds, advance dwell evictions, dispatch new builds into free worker slots (nearest-first from
 ## `_want_order`), then commit ONE whole-surface ArrayMesh rebuild if anything changed this call. Cheap at rest
 ## (no dirty tiles, no in-flight slots, no wanted-not-resident fid ⇒ every loop below is a fast no-op scan).
-func step() -> void:
+##
+## FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 1): pre-settle (`settled == false`) this is the WS1a
+## suspend the `FacetOrbitRelief.step()` already proves — the reap loop ALWAYS runs (free the worker slot, land
+## the tile, mark dirty so nothing dangles across the freeze), then it returns BEFORE eviction/dispatch/commit:
+## the resident mesh stays frozen and the worker seats belong to the near field's load window. Post-settle it
+## resumes paced: dispatch runs immediately (workers are free by then) but the FIRST commit waits until
+## `credit_ok` (`stream_credit > 0`) so the deferred backlog cannot fire on one frame. Both args default true ⇒
+## the sole caller with the flag off (and any no-arg caller) runs the shipped path verbatim, and the freeze
+## itself is gated on `CubeSphere.FP_LOAD_DEFER` so a `settled == false` passed with the flag off is inert.
+func step(settled := true, credit_ok := true) -> void:
 	if _sn == 0:
 		return
+	var deferred := CubeSphere.FP_LOAD_DEFER and not settled
 	for i in range(_sn):
 		if int(_s_fid[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
@@ -417,6 +434,8 @@ func step() -> void:
 			_dirty = true
 		# else: a refusal (module absent/not ready) or `_want` moved while it built — discard silently; the
 		# fid stays in `_want_order` so a later step() call will simply re-dispatch it.
+	if deferred:
+		return   # WS1a: pre-settle — no eviction, no dispatch, no commit. Frozen; `_dirty` accumulates for the settle resume.
 	if not _leaving.is_empty():
 		var to_evict := []
 		for fid in _leaving.keys():
@@ -439,9 +458,17 @@ func step() -> void:
 			break   # no free worker slot this call — the remainder waits for a later step()
 		_s_fid[slot] = f
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot), true, "smoothv2tile")
+		_dispatch_count += 1
 	if _dirty:
+		# FP_LOAD_DEFER: the FIRST commit after the settle-freeze lifts waits for the near field to stop starving
+		# (`credit_ok` = stream_credit > 0) so the accumulated backlog can't fire on one frame. Gated on the flag ⇒
+		# off, this is `false` and the commit is unconditional (byte-identical); once one commit lands the gate is spent.
+		if CubeSphere.FP_LOAD_DEFER and not _first_commit_done and not credit_ok:
+			return
 		_commit()
 		_dirty = false
+		_first_commit_done = true
+		_commit_count += 1
 
 func _free_slot() -> int:
 	for i in range(_sn):
@@ -491,6 +518,13 @@ func resident_count() -> int:
 
 func commit_ms() -> float:
 	return _last_commit_ms
+
+## FP_LOAD_DEFER gate counters (verify_fast_load.gd G-FL-GATE asserts both stay 0 while the settle latch is held false).
+func dispatch_count() -> int:
+	return _dispatch_count
+
+func commit_count() -> int:
+	return _commit_count
 
 func is_resident(fid: int) -> bool:
 	return _tiles.has(fid)

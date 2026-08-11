@@ -393,6 +393,25 @@ func set_initial_look(yaw: float, pitch: float) -> void:
 	if _camera != null:
 		_camera.rotation.x = _pitch
 
+## COSMOS REMOTE VIEW-STATE (dev-instrument): report the SURFACE camera facing so a view can be remembered + restored
+## exactly — body yaw + camera pitch (deg, the set_initial_look parametrization) plus the world-space forward vector.
+## Returns {} when the camera rig is absent so the telemetry stream stays byte-identical without it.
+func view_telemetry() -> Dictionary:
+	if _camera == null:
+		return {}
+	var fwd := (-_camera.global_transform.basis.z).normalized()
+	return {
+		"cam_yaw_deg": snappedf(rad_to_deg(rotation.y), 0.01),
+		"cam_pitch_deg": snappedf(rad_to_deg(_pitch), 0.01),
+		"look_world": "(%f, %f, %f)" % [fwd.x, fwd.y, fwd.z],
+	}
+
+## COSMOS REMOTE VIEW-STATE restore (dev-instrument): set the SURFACE facing to an ABSOLUTE (yaw,pitch) in degrees —
+## the exact inverse of view_telemetry's cam_yaw_deg/cam_pitch_deg. Reuses the shipped set_initial_look param path.
+## Reached only via the CONTROL_ENABLED-gated teleport op (yaw_deg/pitch_deg), so it is inert in normal play.
+func remote_set_view(yaw_deg: float, pitch_deg: float) -> void:
+	set_initial_look(deg_to_rad(yaw_deg), deg_to_rad(pitch_deg))
+
 ## COSMOS FACETED §6.1 — re-frame the player across a seam onto the neighbour facet. `new_pos` is the f64-exact
 ## reframed position (WM computes it via FacetAtlas.reframe_position64); `yaw_delta` is the horizontal twist of
 ## the dihedral. The player stays UPRIGHT (+Y up in both flat facet frames) — physics snaps the yaw; the visual

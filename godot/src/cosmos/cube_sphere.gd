@@ -2184,6 +2184,24 @@ const BOOT_SEED_FACETS := 48
 ## play (3 hitches) — acceptable vs +16s to essential-ready, and A/B-gated. Finer intra-helper slicing is a follow-up.
 const FP_MANIFEST_SLICE := false
 
+## SLOPE MANIFEST HEAL (fix/voxiverse-sharp-slope; docs/COSMOS-SHARP-SLOPE-FACET-PARITY-DESIGN.md) — FP_SLOPE_MANIFEST_HEAL.
+## Symptom (live, faceted mountains): slopes render as full-cube LADDERS and the player sinks ≤2–3 blocks UNDER the visible
+## slope. Root cause (measured): FP_MANIFEST_SLICE (ON live) defers _build_slope_manifest past generator construction, so
+## every generator FREEZES the still-EMPTY slope ARID tables (C++ VoxelGeneratorCosmos copies them into immutable
+## Parameters; the GDScript twin holds the COW ref). The deferred cold bake later reassigns the module's _slope_arid /
+## _snow_slope_arid members (COW ⇒ live generators keep the old empty tables), so every generated SLOPE cell takes the
+## "unbaked → full cube" fallback in the RENDER while the ANALYTIC collision (always exact) carves the true plane — render
+## sits 1–3 blocks ABOVE physics. Nothing refreshes a live generator's frozen tables. When ON, the deferred cold bake's
+## stage 3 (AFTER library.bake(), BEFORE the near re-ramp) REBUILDS + SWAPS the whole generator on the active terrain AND
+## every spawned pool slot via _make_generator (reading the NOW-FILLED members) — the epoch-safe whole-generator-swap the
+## restream()/pool-spawn paths already use (pushing tables into a live generator is rejected: worker data-race + immutable
+## C++ Parameters + a stale model_count OOB fence). The existing stage-3 re-ramp then regenerates slope cells as their true
+## carved shape. One-time swap at cold-bake completion (post essential-ready) — off the boot critical path; the old
+## generators free (NEVER-OOM). Also heals the deferred WET + SNOW-FILL COMPOSITE staleness for free (same mechanism).
+## Default OFF ⇒ the heal branch never runs; the shipped stale-table behaviour bit-for-bit (FLAT stays 6042/0). Flip ON at
+## export after the live A/B. Gate: verify_slope_heal.gd.
+const FP_SLOPE_MANIFEST_HEAL := false
+
 ## NEAR-FIELD LANDING STREAM WEDGE fix (fix/voxiverse-landing-stream) — FP_LANDING_STREAM_KICK. Symptom: after a
 ## de-orbit LAND (flight off, on_ground true) that follows hundreds of rapid orbital facet redesignations, the near
 ## voxel field never streams in — the player stands on the correct analytic floor with only the far ring drawn and

@@ -66,6 +66,23 @@ echo "==> Exporting project -> ${OUT_DIR} using preset '${PRESET}' (templates ${
 # to build-engine.sh, which then tries to mkdir the root-owned /work caches and
 # aborts. EM_CACHE/SCONS_CACHE are also pointed at the writable tmpfs so nothing
 # in the toolchain env can touch the root-owned /work during export.
+# Ensure the PATCHED-godot toolchain image exists — auto-rebuild it if pruned.
+# The patched godot editor binary + web export templates (godot_voxel compiled to
+# WASM) are already on disk (bin/, templates/) and are MOUNTED into the container
+# below, so this only rebuilds the ENV image (docker build of the emsdk Dockerfile,
+# minutes) — NOT the full engine recompile (that is build.sh's second stage). If
+# the binary/templates themselves are missing, run scripts/build.sh (full compile).
+if ! docker image inspect "${ENGINE_IMAGE}" >/dev/null 2>&1; then
+  echo "==> toolchain image ${ENGINE_IMAGE} absent — auto-rebuilding it (docker build; emsdk ${EMSDK_VERSION}) ..."
+  if [ ! -x "${BIN}" ] || [ ! -f "${TEMPLATES_DIR}/web_release.zip" ]; then
+    echo "!! patched binary/templates missing under ${ENGINE_DIR} — run scripts/build.sh first (full compile)"; exit 1
+  fi
+  docker build \
+    --build-arg "EMSDK_VERSION=${EMSDK_VERSION}" \
+    -t "${ENGINE_IMAGE}" \
+    -f "${ENGINE_DIR}/Dockerfile" \
+    "${ENGINE_DIR}"
+fi
 docker run --rm \
   -u "$(id -u):$(id -g)" \
   -e HOME=/gdhome \

@@ -1178,6 +1178,14 @@ func _manifest_cold_step() -> void:
 		3:
 			if _manifest_library.has_method("bake"):
 				_manifest_library.call("bake")           # one re-bake now that the cold models are appended
+			# FP_SLOPE_MANIFEST_HEAL: the cold bake just FILLED the slope/wet/composite MEMBER tables, but every
+			# generator built earlier (setup() + pool-slot spawns) FROZE the still-empty tables. Rebuild + swap the
+			# whole generator on the active terrain AND every pool slot from the NOW-FILLED members so the render
+			# finally emits the carved slope shapes instead of the cube fallback (the ladder). This runs exactly
+			# ONCE — stage 3 is reached a single time (it clears the pending flag below), so the tables have already
+			# transitioned empty→filled (stage 2 baked slopes) and there is no per-frame cost. See the flag doc.
+			if CubeSphere.FP_SLOPE_MANIFEST_HEAL:
+				_heal_generators_post_cold_bake()
 			_manifest_remesh_near()                      # remesh so cube-fallback cold cells upgrade
 			_manifest_cold_pending = false
 			_manifest_defer_go = false
@@ -1205,6 +1213,39 @@ func _manifest_remesh_near() -> void:
 		_ramp_active = _ramp_target > RAMP_START_BLOCKS
 		_set_if(_terrain, "max_view_distance", int(RAMP_START_BLOCKS))
 		set_process(true)
+
+## FP_SLOPE_MANIFEST_HEAL (docs/COSMOS-SHARP-SLOPE-FACET-PARITY-DESIGN.md §3): after the deferred cold bake FILLED the
+## slope/wet/composite MEMBER tables, REBUILD + SWAP the whole generator on the active terrain and every spawned pool slot
+## so the live workers finally read the filled tables (a generator freezes an IMMUTABLE copy at construction — C++
+## Parameters / GDScript COW — so pushing the new tables into the existing generator is impossible AND unsafe: the workers
+## read it concurrently and its stale model_count fence would clamp the new ARIDs). Whole-generator swap is the epoch-safe
+## pattern restream()/pool-spawn already use; _make_generator reads the NOW-FILLED members + current model_count and, under
+## FP_CPPGEN, builds a fresh compiled generator with the correct frozen tables — one call heals GDScript and C++ alike.
+## The old generators free (NEVER-OOM: a generator is a parameter holder, no new caches). Called ONCE from stage 3.
+func _heal_generators_post_cold_bake() -> void:
+	# Pooled facets (FP_M1_POOL / FP_NB_FULLRES): each slot froze its OWN generator on its fid at spawn — rebuild each
+	# from that SAME fid so the healed generator stays on the identical facet epoch (same call as the spawn path). The
+	# active slot's terrain/generator alias into _terrain/_generator, so updating the slot heals them too.
+	if not _pool.is_empty():
+		for fid in _pool.keys():
+			var s: Dictionary = _pool[fid]
+			var g: Object = _make_generator(int(s["fid"]))
+			if g == null:
+				continue
+			s["generator"] = g
+			_set_if(s["terrain"], "generator", g)
+			if int(fid) == _pool_active:
+				_generator = g
+		print("[module_world] FP_SLOPE_MANIFEST_HEAL: swapped %d pooled generators from the filled cold tables" % _pool.size())
+		return
+	# Single-terrain path (non-pool FLAT/faceted): swap the one active generator, keeping _generator in sync.
+	if _terrain != null:
+		var g2: Object = _make_generator()
+		if g2 == null:
+			return
+		_set_if(_terrain, "generator", g2)
+		_generator = g2
+		print("[module_world] FP_SLOPE_MANIFEST_HEAL: swapped the active generator from the filled cold tables")
 
 ## FP_MANIFEST_SLICE introspection for verify_manifest_slice.gd — read-only.
 func manifest_cold_pending() -> bool:

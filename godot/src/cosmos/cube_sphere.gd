@@ -94,6 +94,22 @@ const NB_EXCL_RELEASE := 96.0
 const NB_SPAWN_EST := 4 * 1048576
 const NB_ABS_HEAP_MB := 1600
 
+## COSMOS FP_NB_WELD (docs/COSMOS-NB-JUNCTION-WELD-DESIGN.md) — fixes the FP_NB_FULLRES "floating tilted slab" at a facet
+## junction: the neighbour's far-tier COVER TILE that never releases because the CORRECTION-2 band-meshed exclusion latch
+## is DEAD BY CONSTRUCTION (its pool_seam_meshed ±(32,40,32) box always exceeds the neighbour's bounds-clamped domain, and
+## is_area_meshed requires EVERY cell loaded without clipping to bounds ⇒ ≥22 cells lie in unloadable space ⇒ false
+## forever). Off (false) ⇒ the shipped dead-latch behaviour VERBATIM (byte-identical). Extends FP_NB_FULLRES; live-enabled
+## via the export sed alongside it. NO transform code is touched — placement was always correct (§1). Three parts: W1 a
+## seam-anchored bounds-safe strip probe (replaces the dead box), W2 latch-change → same-tick far-ring re-sync, W3 crossing
+## seeds the old active's latch (its near field is definitionally meshed). NB_PROBE_DEPTH: cells INSIDE B measured FROM the
+## shared ridge to anchor the probe (comfortably in-bounds + inside the streamed band). NB_PROBE_SPAN: the ±ridge-tangent
+## offset of the 3-cell strip. NB_PROBE_RIDGE_MAX: only probe when the player's own-side ridge distance is under this
+## (inside the band's certain reach; the probe foot then sits ≤ NB_PROBE_RIDGE_MAX + NB_PROBE_DEPTH = 60 < the 64 band).
+const FP_NB_WELD := false
+const NB_PROBE_DEPTH := 12.0
+const NB_PROBE_SPAN := 24.0
+const NB_PROBE_RIDGE_MAX := 48.0
+
 ## COSMOS FP-M2d (docs/COSMOS-FP-M2-DESIGN.md §3.2 / §9) — the Z1-hybrid pool-policy consts (beside the POOL_* family,
 ## §3.2). CONSULTED ONLY under FP_M2_LOD; with the flag off the pool reverts to the shipped FP-M1c policy verbatim
 ## (POOL_MAX_NEIGHBOURS = 4 stays the hard backstop, asserted by G-M1-POOL). D_WARM2: a SECOND live neighbour spawns
@@ -2802,6 +2818,25 @@ const FP_NIGHT_TERRAIN_CENTRE := false
 ## set) and WorldManager (per-frame centre push). Off ⇒ false everywhere ⇒ byte-identical.
 static func near_centre_fix_on() -> bool:
 	return FP_NEAR_DAYLIGHT and (FP_SHADE_UNIFIED or FP_NIGHT_TERRAIN_CENTRE)
+
+## COSMOS BORDER-SHADE WELD (docs/COSMOS-BORDER-SHADE-WELD-DESIGN.md — the bright interfacet border strip). The
+## FP-CARVE seam-junction carve-sentinel cubes (drawn ONLY along the facet ridge) still carry the PRE-UNIFICATION
+## BlockMaterials daylight twin (night_floor 0.10, NO scatter tint) while every neighbouring cube adopted the
+## FP_SHADE_UNIFIED VoxiLight law — so the ridge strip glares bright at dawn/night. This flag unifies the three
+## BlockMaterials daylight twins (_daylight_opaque + both _daylight_translucent) onto the SAME VoxiLight.shade_glsl()
+## law via a pure string transform at the ONE choke point block_materials.gd::near_daylight_code(), and seeds their
+## floor/term_mu/moonshine from the VoxiLight constants (0.06/0.12/0.0) instead of NEAR_NIGHT_FLOOR(0.10)/TERMINATOR_MU.
+## Same uniform NAMES ⇒ the per-frame sun_dir/planet_centre feed hub is unchanged. Recolour only — zero new resident
+## bytes, zero new compiled programs (the snippet already ships on web in the atlas shader). Off ⇒ the shipped twin
+## strings + seeds verbatim ⇒ byte-identical. Gate verify_border_shade.gd.
+const FP_BORDER_SHADE_WELD := false
+
+## True iff the BlockMaterials daylight twins must be welded onto the unified VoxiLight law. Needs the twins to exist
+## (FP_NEAR_DAYLIGHT) AND the unified law to be the neighbour reference (FP_SHADE_UNIFIED) — without unification there
+## is no law split to weld. Read by block_materials.gd (near_daylight_code transform + builder seeds). Off ⇒ false ⇒
+## byte-identical.
+static func border_shade_weld_on() -> bool:
+	return FP_BORDER_SHADE_WELD and FP_NEAR_DAYLIGHT and FP_SHADE_UNIFIED
 
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell

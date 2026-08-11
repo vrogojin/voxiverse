@@ -82,6 +82,17 @@ func _init() -> void:
 	print("summit: smoothV2_resident=%s tin_g=%.2f m2_l3_top_g=%.2f (true g=%d)" % [str(v2_res), tin, m2top, summit[4]])
 	_check("G-LAD-SUMMIT-PIN smooth tile resident on the summit facet", v2_res)
 	_check("G-LAD-SUMMIT-PIN M2 l3 top protrudes >=2 blk above the smooth TIN", m2top >= tin + 2.0)
+	# VIEWPORT INDEPENDENCE (twin review): the DESIRED SSE tier flips with the canvas (vh 540 vs 1080 gives
+	# lc ~2.1 vs ~1.1 at the summit distance), but the PINNED granted law is max(desired, l3) — the budgeter's
+	# first-cover floor — which dominates both. Assert that explicitly for BOTH capture geometries so the pin
+	# can never silently depend on one canvas size; the N1 flag-on rows (where desired matters) must keep
+	# testing both vh values.
+	for vh in [540.0, 1080.0]:
+		var lc := _sse_lc(summit[3], deg_to_rad(75.0), vh)
+		var granted := maxi(clampi(int(floor(lc)), 1, 3), M2_FIRST_COVER_TIER)
+		print("summit sse @vh=%d: lc=%.2f desired=l%d granted=l%d" % [int(vh), lc, clampi(int(floor(lc)), 1, 3), granted])
+		_check("G-LAD-SUMMIT-PIN granted tier is l3 under vh=%d (first-cover floor dominates)" % int(vh),
+				granted == M2_FIRST_COVER_TIER)
 	_finish()
 
 # --- the per-distance rung law (today's tiers; frontmost = highest rendered surface) --------------------------
@@ -215,6 +226,11 @@ func _find_summit(ppos: Vector3) -> Array:
 				best_d = d
 				best = [w[0], w[1], w[2], d, g, PX + dx, PZ + dz]
 	return best
+
+## Pure copy of FacetLodMesher.sse_lc (facet_lod_mesher.gd:230-233) — the M2 continuous SSE tier law.
+func _sse_lc(d: float, fov_v_rad: float, viewport_h: float) -> float:
+	var coeff := 2.0 * maxf(d, 1.0) * tan(fov_v_rad * 0.5) / maxf(viewport_h, 1.0)
+	return log(CubeSphere.LOD_TAU_PX * coeff) / log(2.0)
 
 static func _bilerp(v00: float, v10: float, v11: float, v01: float, s: float, t: float) -> float:
 	return v00 * (1.0 - s) * (1.0 - t) + v10 * s * (1.0 - t) + v11 * s * t + v01 * (1.0 - s) * t

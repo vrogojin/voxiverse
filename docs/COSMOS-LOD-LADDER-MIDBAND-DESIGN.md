@@ -106,15 +106,23 @@ the far ring suppresses its 26-block blocky emission under every COMMITTED resid
 NEARCOVER + EXCL_BLKLOD fix the shoulder/hop-0/1 band only — EXCL_BLKLOD suppresses the far-ring blocky emit,
 not M2. Two more flags close the summit:
 
-- **`FP_M2_SMOOTH_DEFER` (C1)**: FacetLodMesher defers to a resident smooth tile. Wire a `set_smooth_query`
-  Callable → `FacetFarRing.is_smooth_resident` (accessor exists, `facet_far_ring.gd:1047`; Callable pattern
-  precedent `facet_block_lod_ladder.gd:40-46`; unset ⇒ shipped verbatim). In `_recompute_wants`, a
-  smooth-resident facet gets **no M2 want at all** (v1 deviation from the SMOOTH doc's "ℓ1 still allowed":
-  any want on a MESHLESS facet materializes through the budgeter's `max(target, ℓ3)` first-cover
-  (`facet_lod_mesher.gd:333-338`) with idle-only refinement — i.e. ℓ1-over-smooth transits through exactly the
-  ℓ3 summit steps this fix removes, indefinitely under load. Either gate the first-cover floor too, or — v1 —
-  skip wants entirely; the smooth tile IS the cover, and ℓ1-over-smooth returns as a measured A/B later).
-  `_idle_sweep` then reclaims the ℓ2/ℓ3 bytes.
+- **`FP_M2_SMOOTH_DEFER` (C1, LOCKED v1 = skip-ALL)**: FacetLodMesher defers to a resident smooth tile. Wire a
+  `set_smooth_query` Callable → `FacetFarRing.is_smooth_resident` (accessor exists, `facet_far_ring.gd:1047`;
+  Callable pattern precedent `facet_block_lod_ladder.gd:40-46`; unset ⇒ shipped verbatim). In
+  `_recompute_wants`, a smooth-resident facet gets **no M2 want at all** — both investigators converged here:
+  the SMOOTH doc's original "ℓ1 still allowed" is unsound because any want on a MESHLESS facet materializes
+  through the budgeter's `max(target, ℓ3)` first-cover (`facet_lod_mesher.gd:333-338`) with idle-only
+  refinement (the ℓ3 summit steps return under load), AND there is no band where ℓ1-over-smooth is both
+  visible and not already covered finer (smooth-resident today ⇒ hop≥2 ⇒ nearest point ≳290 blk ⇒ 2-blk cells
+  ≈1 px; under NEARCOVER the hop-0/1 close portion is the near/pool full-res band). Skip-ALL also retires the
+  ℓ1 ledger exposure for the whole annulus (no ~4.6 MB ℓ1 meshes grantable over smooth) ⇒ the gate's M2-ledger
+  assertion is strict monotone non-increase, no carve-outs. The ℓ3-floor-bypass variant stays a documented
+  fallback ONLY if a live A/B shows the 8-blk flat-colour smooth band reads too soft just before a crossing.
+- **C1 eviction clause (REQUIRED)**: the want-skip alone leaves an already-granted ℓ≥2 mesh protruding through
+  the smooth tile until the idle sweep demotes it — and `LOD_IDLE_DEMOTE_S = 30.0` (`facet_lod_mesher.gd:35`)
+  is far past the ~10 s acceptability line. So the resident-set transition (facet becomes smooth-resident,
+  flag on) must **immediately evict (or demote-to-quad) the facet's existing M2 mesh**; `_idle_sweep` remains
+  the backstop for races.
 - **`FP_M2_EDGE_DIST` (C2)**: feed `sse_lc` the distance to the NEAREST point of the facet's planar quad
   (reuse `_facet_render_corners`) instead of the centre (`facet_lod_mesher.gd:313`) — removes the ~300-blk
   coarse bias on edge-on facets (e.g. 771: centre 608 vs nearest edge ~380 ⇒ tier 2 vs 1). Composes with the
@@ -134,8 +142,13 @@ not M2. Two more flags close the summit:
   monotone non-increasing toward the camera. Pins TODAY's inversion as the failing baseline.
 - **N1**: NEARCOVER residency + sink + suppression. Exit: shoulder rows of G-LAD-MONO green; G-V2-WELD/
   G-V2-PURE unchanged; sink ≤ true − chord-residual assertion (G-V2-NEAR-SINK); byte-off FLAT 6042/0.
-- **N1b**: `FP_M2_SMOOTH_DEFER` + `FP_M2_EDGE_DIST`. Exit: summit rows green; G-M2-SEL sweep unchanged off;
-  M2 ledger shows the ℓ2/ℓ3 reclaim; byte-off FLAT 6042/0. Then live A/B at the repro pose vs `lod-0.jpg`.
+- **N1b**: `FP_M2_SMOOTH_DEFER` + `FP_M2_EDGE_DIST`. Exit: summit rows green; **G-LAD-DEFER-EVICT** —
+  simulate resident-set arrival on a facet already holding an ℓ3 mesh: assert the mesh is freed and its bytes
+  return on the transition itself (NOT after `LOD_IDLE_DEMOTE_S`); M2 ledger strict monotone non-increase under
+  DEFER (no ℓ1 carve-out — skip-ALL); G-M2-SEL sweep unchanged off; byte-off FLAT 6042/0.
+- **Acceptance evidence (live)**: the protrusion claim is not headless-gateable end-to-end — the accepted
+  protocol is an approach-capture A/B toward the fid-797 summit at **800 / 470 / 250 / 130 blocks**, flags
+  off vs on, compared against `lod-0.jpg`/`lod-1.jpg`.
 - **N2 (optional polish)**: distance-graded V2 commit priority so hop-0/1 tiles build FIRST after a crossing
   (they are the visually nearest); reuse the pace queue's nearest-first order.
 

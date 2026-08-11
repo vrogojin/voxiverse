@@ -195,10 +195,66 @@ static func _centre_fix_code(src: String) -> String:
 		"uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\nuniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);\n")
 	return out.replace("normalize(v_wp)", "normalize(v_wp - planet_centre)")
 
-## The near-daylight shader source for a shipped variant, centre-corrected under FP_NIGHT_TERRAIN_CENTRE. Exposed so
-## the gate can build BOTH variants without toggling the const. Off ⇒ the shipped string verbatim (byte-identical).
-static func near_daylight_code(src: String, centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
-	return _centre_fix_code(src) if centre_fix else src
+## COSMOS BORDER-SHADE WELD (FP_BORDER_SHADE_WELD, docs/COSMOS-BORDER-SHADE-WELD-DESIGN.md): weld a near-daylight twin
+## onto the SAME unified VoxiLight law the atlas + far shell already use — a PURE STRING TRANSFORM applied AFTER
+## _centre_fix_code (its anchors are the shipped strings). The ridge FP-CARVE carve-sentinel cubes carry this twin
+## (module_world.gd _build_carve_manifest → BlockMaterials.get_for → _daylight_opaque/_daylight_translucent), so on the
+## PRE-UNIFICATION law they glare bright at dawn/night (night_floor 0.10, NO scatter tint) while every neighbour cube
+## adopted VoxiLight. This transform strips the twin's inline uniform block (night_floor/term_mu/moonshine) + its `_day`
+## helper + its fragment mu/shade computation, splices VoxiLight.shade_glsl() in place of the sun_dir uniform (which
+## re-declares the SAME uniform names + the helpers + voxi_shade — one shader_type, gl_compat-safe; the identical
+## snippet already ships on web in the atlas shader), and routes the diffuse sink through voxi_shade(nrm, sun_dir).
+## `planet_centre` (added by _centre_fix_code) is preserved, so the radial normal nrm = normalize(v_wp − planet_centre)
+## is unchanged. Off ⇒ never runs ⇒ byte-identical. Common to all three twins (_daylight_opaque + both translucent).
+static func _unified_law_code(src: String) -> String:
+	var out := src
+	# 1) Drop the twin's own copies of what VoxiLight.shade_glsl() re-declares — BEFORE the splice, so the freshly
+	#    spliced snippet's identical lines (term_mu/moonshine/_day) are never caught. night_floor here is the twin's
+	#    0.10 (the deliberate un-unification); the snippet re-adds the unified 0.06.
+	out = out.replace("float _day(float mu) { return smoothstep(-term_mu, term_mu, mu); }\n", "")
+	out = out.replace("uniform float night_floor = 0.10;\n", "")
+	out = out.replace("uniform float term_mu = 0.12;\n", "")
+	out = out.replace("uniform float moonshine = 0.0;\n", "")
+	# 2) Drop the fragment's inline day/night law (nrm is kept; voxi_shade recomputes mu·shade·tint from it).
+	out = out.replace(
+		"\tfloat mu = dot(nrm, normalize(sun_dir));\n\tfloat shade = max(night_floor + (1.0 - night_floor) * _day(mu), moonshine);\n",
+		"")
+	# 3) Route the diffuse sink through the unified law (EMISSION / ALPHA lines untouched — post-shade glow + alpha).
+	out = out.replace("ALBEDO = base.rgb * shade;", "ALBEDO = base.rgb * voxi_shade(nrm, sun_dir);")
+	# 4) Splice the unified snippet in place of the twin's sun_dir uniform (LAST, so its own uniform/helper/shade lines
+	#    are not re-stripped). It re-declares sun_dir + night_floor(0.06) + term_mu + moonshine + helpers + voxi_shade —
+	#    exactly ONE of each, and carries NO shader_type (a pure body ⇒ zero new compiled programs).
+	out = out.replace("uniform vec3 sun_dir = vec3(1.0, 0.0, 0.0);\n", VoxiLight.shade_glsl())
+	return out
+
+## The near-daylight shader source for a shipped variant, centre-corrected under FP_NIGHT_TERRAIN_CENTRE and (under
+## FP_BORDER_SHADE_WELD) welded onto the unified VoxiLight law. Exposed so the gate can build ALL variants without
+## toggling a const. Both `centre_fix` and `weld` default to their live-flag state; off ⇒ the shipped string verbatim
+## (byte-identical). Order: centre-fix FIRST (shipped anchors), then the weld transform.
+static func near_daylight_code(src: String, centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE,
+		weld := CubeSphere.border_shade_weld_on()) -> String:
+	var out := _centre_fix_code(src) if centre_fix else src
+	if weld:
+		out = _unified_law_code(out)
+	return out
+
+## Seed the shade-law uniforms (night_floor / term_mu / sun_dir) shared by both near-daylight twins. Off (shipped) ⇒
+## the ATMO2-B3 values (NEAR_NIGHT_FLOOR 0.10 / TERMINATOR_MU) + the (1,0,0) sun default ⇒ byte-identical seeding.
+## Under FP_BORDER_SHADE_WELD ⇒ the UNIFIED VoxiLight constants (0.06 / 0.12 / moonshine 0.0) — the SAME uniform NAMES
+## the per-frame feed hub (set_near_daylight_sun_dir / _planet_centre) already drives, so the feed is unchanged — plus
+## a build-time sun_dir seeded from TierPlace's live Sun cache (the FP_FAR_TERMINATOR_WELD hub, _last_sun_dir) instead
+## of the (1,0,0) fake-noon literal, so a twin built lazily BETWEEN per-frame feeds shows the live Sun, not a one-frame
+## bright flash (the cache is (1,0,0) until first written, == the shipped default, so this is safe even standalone).
+static func _seed_shade_uniforms(m: ShaderMaterial) -> void:
+	if CubeSphere.border_shade_weld_on():
+		m.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+		m.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+		m.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+		m.set_shader_parameter("sun_dir", TierPlace._last_sun_dir)
+	else:
+		m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
+		m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
+		m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
 
 ## Build one OPAQUE near-daylight twin (_textured / _solid look). `tex` null ⇒ flat swatch (no texture).
 ## `albedo` is the base albedo_color (white for a textured block, the swatch colour for a no-tile block).
@@ -215,9 +271,7 @@ static func _daylight_opaque(tex: Texture2D, albedo: Color, use_vertex_color: bo
 		m.set_shader_parameter("use_texture", false)
 	m.set_shader_parameter("albedo_color", albedo)
 	m.set_shader_parameter("use_vertex_color", use_vertex_color)
-	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
-	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
-	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	_seed_shade_uniforms(m)
 	if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
 		m.set_shader_parameter("planet_centre", Vector3.ZERO)   # seeded 0 (== shipped); fed the true centre per frame
 	_daylight_twins.append(m)
@@ -237,9 +291,7 @@ static func _daylight_translucent(tex: Texture2D, color: Color, double_sided: bo
 	else:
 		m.set_shader_parameter("use_texture", false)
 	m.set_shader_parameter("albedo_color", color)
-	m.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
-	m.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
-	m.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
+	_seed_shade_uniforms(m)
 	if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
 		m.set_shader_parameter("planet_centre", Vector3.ZERO)   # seeded 0 (== shipped); fed the true centre per frame
 	_daylight_twins.append(m)

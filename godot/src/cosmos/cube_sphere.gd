@@ -2819,6 +2819,25 @@ const FP_NIGHT_TERRAIN_CENTRE := false
 static func near_centre_fix_on() -> bool:
 	return FP_NEAR_DAYLIGHT and (FP_SHADE_UNIFIED or FP_NIGHT_TERRAIN_CENTRE)
 
+## COSMOS BORDER-SHADE WELD (docs/COSMOS-BORDER-SHADE-WELD-DESIGN.md — the bright interfacet border strip). The
+## FP-CARVE seam-junction carve-sentinel cubes (drawn ONLY along the facet ridge) still carry the PRE-UNIFICATION
+## BlockMaterials daylight twin (night_floor 0.10, NO scatter tint) while every neighbouring cube adopted the
+## FP_SHADE_UNIFIED VoxiLight law — so the ridge strip glares bright at dawn/night. This flag unifies the three
+## BlockMaterials daylight twins (_daylight_opaque + both _daylight_translucent) onto the SAME VoxiLight.shade_glsl()
+## law via a pure string transform at the ONE choke point block_materials.gd::near_daylight_code(), and seeds their
+## floor/term_mu/moonshine from the VoxiLight constants (0.06/0.12/0.0) instead of NEAR_NIGHT_FLOOR(0.10)/TERMINATOR_MU.
+## Same uniform NAMES ⇒ the per-frame sun_dir/planet_centre feed hub is unchanged. Recolour only — zero new resident
+## bytes, zero new compiled programs (the snippet already ships on web in the atlas shader). Off ⇒ the shipped twin
+## strings + seeds verbatim ⇒ byte-identical. Gate verify_border_shade.gd.
+const FP_BORDER_SHADE_WELD := false
+
+## True iff the BlockMaterials daylight twins must be welded onto the unified VoxiLight law. Needs the twins to exist
+## (FP_NEAR_DAYLIGHT) AND the unified law to be the neighbour reference (FP_SHADE_UNIFIED) — without unification there
+## is no law split to weld. Read by block_materials.gd (near_daylight_code transform + builder seeds). Off ⇒ false ⇒
+## byte-identical.
+static func border_shade_weld_on() -> bool:
+	return FP_BORDER_SHADE_WELD and FP_NEAR_DAYLIGHT and FP_SHADE_UNIFIED
+
 ## COSMOS CLIMATE W1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §1 / §7) — the ONE coarse prognostic weather
 ## grid (WeatherSystem). 6 faces × 32×32 = 6144 cells, 8 f32 fields double-buffered (384 KiB) + a 44 B/cell
 ## static basis (264 KiB), allocated ONCE, exploration-independent, ZERO growth paths (SnowfallSystem

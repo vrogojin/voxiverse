@@ -687,10 +687,25 @@ func _update_approach_anchor(player_pos: Vector3) -> void:
 ## both to the single player VoxelViewer. Pure w.r.t. gameplay — it only mutates the viewer node (render/streaming).
 func _apply_approach_anchor(player_pos: Vector3) -> void:
 	var h := _radial_altitude_lattice(player_pos)   # the regime-ladder altitude (analytic; never the voxel buffer)
+	# COSMOS SUMMIT-STREAM S1 (FP_SUMMIT_STREAM, docs/COSMOS-SUMMIT-STREAM-PRIORITY-DESIGN.md §S1): the anchor/release
+	# input must be height above the LOCAL GROUND under the player, not radial altitude above the datum sphere. Shipped
+	# `h` (|world| − R) drags the anchored viewer O_base BELOW the datum by the full ground relief — on a 66-block
+	# summit the VoxelViewer sits ~62 blocks inside the mountain, so godot_voxel's distance-priority serves the invisible
+	# interior first and the visible surface last. `ground_h` = the analytic surface's radial altitude directly below the
+	# player, read through the SAME memoized column the physics already queries every tick (surface_y → effective_height;
+	# zero new cost). Grounded on ANY terrain ⇒ h_eff ≈ 0 ⇒ offset ≈ O_base ⇒ the ellipsoid re-centres on the player and
+	# the surface under/around them is nearest-first — identical on a summit and a plain. Airborne, h_eff is the true
+	# camera-to-ground distance the S1 release law always meant, so the fly-up/de-orbit law is preserved by construction.
+	# Off ⇒ h_eff == h (byte-identical inputs to both the offset and the release below).
+	var h_eff := h
+	if CubeSphere.FP_SUMMIT_STREAM:
+		var surf_lat_y := surface_y(player_pos.x, player_pos.z)
+		var ground_h := _radial_altitude_lattice(Vector3(player_pos.x, surf_lat_y, player_pos.z))
+		h_eff = maxf(h - ground_h, 0.0)
 	var o_base := TerrainConfig.clamped_viewer_offset_y()
-	var offset_y := CubeSphere.approach_offset_y(h, o_base)
+	var offset_y := CubeSphere.approach_offset_y(h_eff, o_base)
 	# Advance the hysteresis latch (Schmitt on the FULL-resident knee), then pick the ramp's lower knee from it.
-	var d := maxf(h, 0.0)                            # camera-to-plate distance ≈ altitude above the anchored ground
+	var d := maxf(h_eff, 0.0)                        # camera-to-plate distance ≈ altitude above the anchored ground
 	if d >= CubeSphere.ANCHOR_REL_HI:
 		_anchor_released = true
 	elif d <= CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST:

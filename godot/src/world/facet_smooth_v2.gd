@@ -358,6 +358,16 @@ var _first_commit_done := false
 var _dispatch_count := 0
 var _commit_count := 0
 
+# FP_SMOOTH_V2_PACE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2): wall-clock ms of the last commit — the G3 rate-cap
+# anchor (distinct from `_last_commit_ms`, which is the last commit's COST/duration). Inert with the flag off.
+var _last_commit_wall_ms := 0
+# FP_SMOOTH_V2_ASYNC_MERGE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2): a SINGLE off-thread merge slot. `_merge_task`
+# is the in-flight WTP task id (-1 = idle); the worker writes `_merge_result` (the merged array dict) under
+# `_merge_mutex`; main reaps it next step(). Never stacked (one merge at a time). All inert with the flag off.
+var _merge_task := -1
+var _merge_result = null
+var _merge_mutex: Mutex = null
+
 ## Construct the ONE MeshInstance3D (child of `ring`, sharing its placement transform — like the old ladder's
 ## `_smooth`), the frozen native generator, and the worker slot pool; seed `_want`/`_want_order` for `active_fid`.
 ## `ring` is the owning FacetFarRing (any Node3D works — only `add_child`/transform inheritance is used).
@@ -377,6 +387,7 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_result.resize(_sn)
 	_s_mutex = Mutex.new()
+	_merge_mutex = Mutex.new()   # FP_SMOOTH_V2_ASYNC_MERGE: guards the single off-thread merge slot (idle off the flag)
 	_recompute_want(active_fid)
 
 func _recompute_want(active: int) -> void:
@@ -413,6 +424,11 @@ func set_active(new_fid: int) -> void:
 ## `credit_ok` (`stream_credit > 0`) so the deferred backlog cannot fire on one frame. Both args default true ⇒
 ## the sole caller with the flag off (and any no-arg caller) runs the shipped path verbatim, and the freeze
 ## itself is gated on `CubeSphere.FP_LOAD_DEFER` so a `settled == false` passed with the flag off is inert.
+##
+## FP_SMOOTH_V2_PACE / FP_SMOOTH_V2_ASYNC_MERGE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2): the commit is (a) rate-
+## capped to `SMOOTH_V2_COMMIT_MS` apart (dirty accumulates — the G3 pattern), and (b) its ~630k-index merge runs
+## off-thread on a snapshot, the main thread paying only the GPU upload at reap. Both self-gate off their flags ⇒
+## commit-every-reap, synchronous merge on main (byte-identical) when off.
 func step(settled := true, credit_ok := true) -> void:
 	if _sn == 0:
 		return
@@ -434,6 +450,22 @@ func step(settled := true, credit_ok := true) -> void:
 			_dirty = true
 		# else: a refusal (module absent/not ready) or `_want` moved while it built — discard silently; the
 		# fid stays in `_want_order` so a later step() call will simply re-dispatch it.
+	# FP_SMOOTH_V2_ASYNC_MERGE: reap a completed off-thread merge — the main thread pays ONLY the GPU upload here
+	# (`add_surface_from_arrays` + `_mi.mesh =`), never the ~630k-index concat. Reaped like any build (always, even
+	# when deferred/frozen — but pre-settle no merge is ever dispatched, so this is a fast no-op then). Off ⇒ inert.
+	if CubeSphere.FP_SMOOTH_V2_ASYNC_MERGE and _merge_task >= 0 and WorkerThreadPool.is_task_completed(_merge_task):
+		WorkerThreadPool.wait_for_task_completion(_merge_task)
+		_merge_task = -1
+		_merge_mutex.lock()
+		var merged = _merge_result
+		_merge_result = null
+		_merge_mutex.unlock()
+		if merged != null:
+			var t0 := Time.get_ticks_usec()
+			_build_and_swap(merged)
+			_last_commit_ms = (Time.get_ticks_usec() - t0) / 1000.0   # main pays ONLY the apply, not the merge
+			_first_commit_done = true
+			_commit_count += 1
 	if deferred:
 		return   # WS1a: pre-settle — no eviction, no dispatch, no commit. Frozen; `_dirty` accumulates for the settle resume.
 	if not _leaving.is_empty():
@@ -465,10 +497,28 @@ func step(settled := true, credit_ok := true) -> void:
 		# off, this is `false` and the commit is unconditional (byte-identical); once one commit lands the gate is spent.
 		if CubeSphere.FP_LOAD_DEFER and not _first_commit_done and not credit_ok:
 			return
-		_commit()
-		_dirty = false
-		_first_commit_done = true
-		_commit_count += 1
+		# FP_SMOOTH_V2_ASYNC_MERGE: single-slot — if a merge is already in flight, hold (do NOT consume the pace
+		# window below); `_dirty` stays set and a later step() dispatches once the in-flight merge reaps. Off ⇒ inert.
+		if CubeSphere.FP_SMOOTH_V2_ASYNC_MERGE and _merge_task >= 0:
+			return
+		# FP_SMOOTH_V2_PACE: rate-cap commits to SMOOTH_V2_COMMIT_MS apart (the EXACT G3 pattern — FacetOrbitRelief.
+		# should_commit). Dirty accumulates; a later step() retries once the window opens. Off ⇒ commit-every-reap.
+		if CubeSphere.FP_SMOOTH_V2_PACE:
+			var now_ms := Time.get_ticks_msec()
+			if not FacetOrbitRelief.should_commit(_dirty, now_ms, _last_commit_wall_ms, CubeSphere.SMOOTH_V2_COMMIT_MS):
+				return
+			_last_commit_wall_ms = now_ms
+		if CubeSphere.FP_SMOOTH_V2_ASYNC_MERGE:
+			# Dispatch the merge off-thread on a SHALLOW snapshot (immutable-once-landed tiles; the worker reads only
+			# its bound copy). `_commit_count`/`_first_commit_done` advance at the REAP above, when the upload lands.
+			var snapshot := _tiles.duplicate()
+			_merge_task = WorkerThreadPool.add_task(Callable(self, "_merge_worker").bind(snapshot), true, "smoothv2merge")
+			_dirty = false
+		else:
+			_commit()
+			_dirty = false
+			_first_commit_done = true
+			_commit_count += 1
 
 func _free_slot() -> int:
 	for i in range(_sn):
@@ -499,6 +549,15 @@ func _build_worker(i: int) -> void:
 func _commit() -> void:
 	var t0 := Time.get_ticks_usec()
 	var merged := merge_tiles(_tiles)
+	_build_and_swap(merged)
+	_last_commit_ms = (Time.get_ticks_usec() - t0) / 1000.0
+
+## Build ONE ArrayMesh surface from already-merged arrays and swap it onto `_mi` — the SAFE high-level API
+## (`ArrayMesh.new()` + `add_surface_from_arrays` + `mi.mesh =`), NEVER a RenderingServer region/RID call (the REV-7
+## ANGLE/WebGL2 law). Split out of `_commit` so the FP_SMOOTH_V2_ASYNC_MERGE reap can pay JUST this apply on main
+## (the merge having run off-thread) — the sync `_commit` wraps merge+apply and times the whole thing exactly as
+## shipped. MAIN-only (touches `_mi`, a Node).
+func _build_and_swap(merged: Dictionary) -> void:
 	var mesh := ArrayMesh.new()
 	var pos: PackedVector3Array = merged["pos"]
 	if pos.size() > 0:
@@ -511,7 +570,17 @@ func _commit() -> void:
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 		mesh.surface_set_material(0, _material)
 	_mi.mesh = mesh
-	_last_commit_ms = (Time.get_ticks_usec() - t0) / 1000.0
+
+## FP_SMOOTH_V2_ASYNC_MERGE (WorkerThreadPool-dispatched, off MAIN): merge the bound `snapshot` (a shallow duplicate
+## of `_tiles` taken on main pre-dispatch — the worker reads only its own copy; the tile arrays are immutable once
+## landed) into one set of surface arrays via the PURE static `merge_tiles`, then hand the result back under the
+## mutex. Never touches `_mi`/`_tiles`/`_want` or any other main-thread state (single-writer discipline, mirrors
+## `_build_worker`). Byte-identical to the sync `merge_tiles(_tiles)` for the same resident set (G-FL-MERGE-EQ).
+func _merge_worker(snapshot: Dictionary) -> void:
+	var merged := merge_tiles(snapshot)
+	_merge_mutex.lock()
+	_merge_result = merged
+	_merge_mutex.unlock()
 
 func resident_count() -> int:
 	return _tiles.size()

@@ -583,6 +583,16 @@ static func class_of(block_id: int) -> StringName:
 	var s := state_of(block_id)
 	return s.structural_class if s != null else &""
 
+## True iff `block_id` is a TREE LEAF material — the 7-id family the NEAR-LEAF-CUTOUT feature (COSMOS-NEAR-LEAF-CUTOUT,
+## CubeSphere.FP_LEAF_CUTOUT) gives a see-through alpha-tested look: LEAF (5, alias oak_leaves) + every `*_leaves`
+## species (spruce/birch/jungle/acacia/dark_oak/cherry). DELIBERATELY an explicit leaf predicate, NOT
+## `class_of(id) == &"foliage"` — moss_block (43) and cactus (77) are foliage too but must stay SOLID (design §2).
+## Pure predicate (nothing calls it when the flag is off ⇒ byte-identical). AIR / out of range → false.
+static func is_leaf_id(block_id: int) -> bool:
+	if block_id == LEAF:
+		return true
+	return name_of(block_id).ends_with("_leaves")
+
 ## True iff `block_id` may carry per-cell METADATA (VDS §3.1). AIR / out of range →
 ## false (null state). The GATE of `WorldManager.set_metadata`: writing metadata to a
 ## material that returns false here is a validation error. Default false for every

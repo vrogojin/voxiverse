@@ -121,7 +121,13 @@ func _gate_cover(atlas, opaque: PackedInt32Array) -> void:
 		else:
 			var c := BlockCatalog.color_of(id)
 			want = Color(c.r, c.g, c.b, 1.0)
-		if not _color_close(got, want):
+		# COSMOS NEAR-LEAF-CUTOUT: under FP_LEAF_CUTOUT the leaf cells' alpha plane is stipple-punched, so a leaf cell's
+		# centre texel may be transparent (alpha 0, RGB kept — §5). Compare RGB-only for leaf ids under the flag (the
+		# transparency FRACTION is the job of verify_leaf_cutout G-LEAF-CELL); every non-leaf cell stays min-alpha 255.
+		var ok_col := _color_close(got, want)
+		if not ok_col and CubeSphere.FP_LEAF_CUTOUT and BlockCatalog.is_leaf_id(id):
+			ok_col = _rgb_close(got, want)
+		if not ok_col:
 			wrong += 1
 			if first_wrong < 0: first_wrong = id
 			print("    id %d (%s) cell (%d,%d): atlas=%s want=%s" % [id, BlockCatalog.name_of(id), cell.x, cell.y, str(got), str(want)])
@@ -170,6 +176,11 @@ func _gate_uv(mod: Node3D, atlas, opaque: PackedInt32Array) -> void:
 func _gate_mat(mod: Node3D, atlas, opaque: PackedInt32Array, translucent: PackedInt32Array) -> void:
 	print("  --- G-ATLAS-MAT: all opaque cubes share the ONE atlas material instance (mesher merges them) ---")
 	var shared: Object = atlas.material
+	# COSMOS NEAR-LEAF-CUTOUT flag-aware (§7 gate drift): under FP_LEAF_CUTOUT the 7 leaf ids split onto the atlas's
+	# transparent-cutout TWIN (atlas.leaf_material), NOT the shared instance — assert each id onto its EXPECTED material
+	# (leaf twin for leaf ids, shared for the rest). Flag off ⇒ leaf_material null + every id expects `shared` (verbatim).
+	var leaf_cut: bool = CubeSphere.FP_LEAF_CUTOUT
+	var leaf_mat: Object = atlas.leaf_material if leaf_cut else null
 	var not_shared := 0
 	var first_bad := -1
 	var on_atlas := 0
@@ -179,13 +190,14 @@ func _gate_mat(mod: Node3D, atlas, opaque: PackedInt32Array, translucent: Packed
 		if model == null or not model.has_method("get_material_override"):
 			continue
 		var mo: Object = model.call("get_material_override", 0)
-		if is_same(mo, shared):
+		var want_mat: Object = leaf_mat if (leaf_cut and BlockCatalog.is_leaf_id(id)) else shared
+		if is_same(mo, want_mat):
 			on_atlas += 1
 		else:
 			not_shared += 1
 			if first_bad < 0: first_bad = id
 	_ok(not_shared == 0 and on_atlas == opaque.size(),
-		"G-ATLAS-MAT: all %d opaque cubes are on the SAME atlas material instance (%d not shared%s)" % [
+		"G-ATLAS-MAT: all %d opaque cubes are on their expected atlas material instance (%d wrong%s)" % [
 			opaque.size(), not_shared, "" if first_bad < 0 else ", first id=%d" % first_bad])
 	# a translucent control (glass/ice/…) must NOT be on the atlas material (kept per-id — Stage 3).
 	var control_off_atlas := true
@@ -327,3 +339,8 @@ func _gate_shaped(mod: Node3D, atlas) -> void:
 func _color_close(a: Color, b: Color) -> bool:
 	var tol := 3.0 / 255.0
 	return absf(a.r - b.r) <= tol and absf(a.g - b.g) <= tol and absf(a.b - b.b) <= tol and absf(a.a - b.a) <= tol
+
+## RGB-only closeness (ignores alpha) — the NEAR-LEAF-CUTOUT stipple zeros a punched texel's alpha but keeps its RGB.
+func _rgb_close(a: Color, b: Color) -> bool:
+	var tol := 3.0 / 255.0
+	return absf(a.r - b.r) <= tol and absf(a.g - b.g) <= tol and absf(a.b - b.b) <= tol

@@ -363,6 +363,16 @@ var _cull_stable_probes := 0             # consecutive probes with NO live-mask 
 var _cull_last_ms := 0                   # throttle clock for the coverage re-probe (CULL_REAP_MS)
 var _cull_last_reemit_ms := 0            # last APPLY rebuild wall-ms (rate-limit ≥ CULL_REBUILD_MS)
 var _cull_reemit_count := 0              # far-ring rebuilds this cull has triggered (bounded — G-CV-NOCHURN-COST)
+# COSMOS-APPLIED-PROBE-CALM §2.2/§2.3 (FP_APPLIED_PROBE_CALM): calm-only state — allocated/read ONLY under the flag, so
+# the flag-off path never touches it (byte-identical). `_cull_flap`: fid -> PackedByteArray(BACKSTOP_CELLS²) saturating
+# covered↔uncovered read-flip counts; a cell reaching CALM_FLAP_N is PINNED DRAWN (mask forced 0, excluded from culling)
+# until its facet's mask is pruned — ends a boundary cell's FLUSH↔APPLY oscillation (drawing is always safe, G-CV-SAFE).
+# `_cull_slice_cursor`: fid -> O(1) round-robin cursor so each reap probes only CALM_PROBE_SLICE cells (full grid ≤ 4
+# reaps). `_cull_last_delta`: live∖committed cell count at the last decide (telemetry sh_cull_delta). All pruned with the
+# masks in `_cull_update` (bounded, NEVER-OOM). Empty / never read with the flag off.
+var _cull_flap: Dictionary = {}         # fid -> PackedByteArray(BACKSTOP_CELLS²): saturating read-flip count (pin at CALM_FLAP_N)
+var _cull_slice_cursor: Dictionary = {} # fid -> int: round-robin start index for the CALM_PROBE_SLICE probe window
+var _cull_last_delta := 0               # live∖committed cell delta at the last decide pass (telemetry sh_cull_delta)
 # COSMOS-PERF STEP 2 (FP_FARRING_ASYNC_REBUILD): off-main-thread rebuild state. The worker assembles the mesh DATA
 # (per-vertex emit + generate_normals + commit_to_arrays — pure CPU, NO RenderingServer) on the WARMED, read-only
 # per-facet caches; the main thread swaps the finished ArrayMesh in (the only RenderingServer touch). Single-flight
@@ -1719,19 +1729,31 @@ func _applied_box_meshed_slab(r: float, h: float, lx: float, ly: float, lz: floa
 ## governs. Sets `_pending` when the quantized radius CHANGES (§3.3) — rides the existing single-flight pipeline.
 func _applied_probe_step(on := TierPlace.applied_cover_on(), params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> void:
 	var before := _applied_r
-	if not on or not _unsink_have_col or not _cull_cover_query.is_valid():
+	var h := params.z
+	var can_probe := on and _unsink_have_col and _cull_cover_query.is_valid()
+	if not can_probe:
 		_applied_r = 0.0
 	else:
 		var step := float(CubeSphere.APPLIED_PROBE_STEP)
 		var max_r := float(CubeSphere.APPLIED_PROBE_MAX)
-		var h := params.z
 		if _applied_r > 0.0 and not _applied_box_meshed(_applied_r, h, _player_col_abs):
 			_applied_r = 0.0                              # shrink instantly — the claimed radius no longer holds
 		var next_r := _applied_r + step
 		if next_r <= max_r + 0.001 and _applied_box_meshed(next_r, h, _player_col_abs):
 			_applied_r = next_r                           # grow exactly one step
 	if _applied_r != before:
-		_pending = true
+		# COSMOS-APPLIED-PROBE-CALM §2.4 (FP_APPLIED_PROBE_CALM): coalesce the GROW climb. A shrink (safety — the coverage
+		# claim broke, sunk cells may now be wrongly hidden) still sets `_pending` immediately. A grow sets `_pending` only at
+		# the climb FIXPOINT (the next +STEP step can no longer grow — capped at APPLIED_PROBE_MAX or the box no longer meshes),
+		# so a 0→112 climb re-emits ONCE, not per +16 step. Off ⇒ every radius change sets `_pending` verbatim (byte-identical).
+		if CubeSphere.FP_APPLIED_PROBE_CALM and _applied_r > before:
+			var nr := _applied_r + float(CubeSphere.APPLIED_PROBE_STEP)
+			var can_grow := can_probe and nr <= float(CubeSphere.APPLIED_PROBE_MAX) + 0.001 \
+					and _applied_box_meshed(nr, h, _player_col_abs)
+			if not can_grow:
+				_pending = true                           # terminal grow step — one re-emit at the fixpoint
+		else:
+			_pending = true                               # shrink, or flag off — immediate
 	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): record the loadable row band that let the ladder live — the
 	# zone-C height gate (§3.3) may sink only vertices whose TRUE surface ≤ band top−1, and telemetry (§3.4) reads it.
 	# A LIVE ladder (`_applied_r > 0`) with a valid band query snapshots the real band at the player row; otherwise
@@ -2533,6 +2555,27 @@ func cull_feed(fid: int, ci: int, covered: bool) -> bool:
 		mask = PackedByteArray(); mask.resize(ncell)   # zero-filled: nothing culled
 		streak = PackedByteArray(); streak.resize(ncell)
 	var was: int = mask[ci]
+	# COSMOS-APPLIED-PROBE-CALM §2.3 (FP_APPLIED_PROBE_CALM): flap pin. A boundary cell whose coverage read flips ≥
+	# CALM_FLAP_N times is PINNED DRAWN (kept out of the cull) — drawing is always safe (culled ⊆ covered only strengthens,
+	# G-CV-SAFE) and it ends any FLUSH↔APPLY oscillation the cell could sustain. `streak[ci] > 0` ⟺ last read was covered
+	# (covered raises streak ≥1, uncovered resets it to 0), so a flip is `covered != (streak_before > 0)`. State is pruned
+	# with the mask in `_cull_update`. Off ⇒ this whole block is skipped and no `_cull_flap` entry is ever allocated.
+	var calm := CubeSphere.FP_APPLIED_PROBE_CALM
+	if calm:
+		var flap: PackedByteArray = _cull_flap.get(fid, PackedByteArray())
+		if flap.size() != ncell:
+			flap = PackedByteArray(); flap.resize(ncell)
+		if flap[ci] >= CubeSphere.CALM_FLAP_N:
+			streak[ci] = 0
+			mask[ci] = 0                                 # PINNED DRAWN — always safe, no further culling from this cell
+			if mask[ci] != was:
+				_cull_changed = true
+			_cull_mask[fid] = mask; _cull_streak[fid] = streak; _cull_flap[fid] = flap
+			return false
+		var prev_covered := streak[ci] > 0
+		if covered != prev_covered and flap[ci] < 255:
+			flap[ci] += 1
+		_cull_flap[fid] = flap
 	if covered:
 		var s: int = streak[ci]
 		if s < CubeSphere.CULL_CONFIRM:
@@ -2582,6 +2625,29 @@ func _cull_mask_differs() -> bool:
 	return false
 
 ## Bit-wise cull difference between two per-facet arrays, treating an out-of-range index as 0.
+## COSMOS-APPLIED-PROBE-CALM §2.2 (FP_APPLIED_PROBE_CALM): the COUNT of cells whose LIVE cull bit differs from committed —
+## the deadband the calm APPLY admits on (≥ CALM_MIN_CELLS) and the sh_cull_delta telemetry. Mirrors `_cull_mask_differs`
+## exactly (an absent facet == an all-zero facet), summing instead of early-returning. Called only under the flag.
+func _cull_mask_delta_count() -> int:
+	var n := 0
+	var seen := {}
+	for fid in _cull_mask.keys():
+		var a: PackedByteArray = _cull_mask[fid]
+		var b: PackedByteArray = _committed_cull.get(fid, PackedByteArray())
+		var m := maxi(a.size(), b.size())
+		for ci in range(m):
+			var av: int = a[ci] if ci < a.size() else 0
+			var bv: int = b[ci] if ci < b.size() else 0
+			if av != bv:
+				n += 1
+		seen[fid] = true
+	for fid in _committed_cull.keys():
+		if not seen.has(fid):
+			for v in _committed_cull[fid]:
+				if v == 1:
+					n += 1
+	return n
+
 func _facet_cull_differs(a: PackedByteArray, b: PackedByteArray) -> bool:
 	var n := maxi(a.size(), b.size())
 	for ci in range(n):
@@ -2618,10 +2684,31 @@ func _cull_commit_flush() -> void:
 ##   else   — no rebuild (committed unchanged) → during sustained streaming the churning live mask triggers NOTHING.
 func _cull_decide_reemit(changed: bool, now_ms: int) -> bool:
 	_cull_stable_probes = 0 if changed else _cull_stable_probes + 1
+	# FLUSH (safety — cull LESS / draw MORE) is NEVER gated or delayed, flag on or off. Holes are worse than overdraw.
 	if _cull_committed_unsafe():
 		_cull_commit_flush()
 		_cull_reemit_count += 1
 		return true
+	# COSMOS-APPLIED-PROBE-CALM §2.1/§2.2 (FP_APPLIED_PROBE_CALM): the APPLY-luxury path (cull MORE / SHRINK the shell).
+	# Credit-gate it (breaks the pinned-credit feedback trap: no APPLY spikes ⇒ frame_worst_ema falls ⇒ credit recovers ⇒
+	# near converges ⇒ trap unwinds), then admit only on a REAL plateau: quiet ≥ CALM_SETTLE_PROBES AND ≥ CALM_APPLY_MIN_MS
+	# since the last APPLY AND (delta ≥ CALM_MIN_CELLS OR a CALM_HARVEST_PROBES final-harvest of a small settled remainder).
+	# One APPLY per settled plateau instead of one per ~11 cells. Deferring only leaves cells DRAWN (pre-cull shipped visual).
+	if CubeSphere.FP_APPLIED_PROBE_CALM:
+		var delta := _cull_mask_delta_count()
+		_cull_last_delta = delta                            # telemetry, current every decide (sh_cull_delta)
+		if not _stream_credit_ok:
+			return false
+		if delta <= 0:
+			return false
+		if _cull_stable_probes >= CubeSphere.CALM_SETTLE_PROBES \
+				and now_ms - _cull_last_reemit_ms >= CubeSphere.CALM_APPLY_MIN_MS \
+				and (delta >= CubeSphere.CALM_MIN_CELLS or _cull_stable_probes >= CubeSphere.CALM_HARVEST_PROBES):
+			_cull_commit_apply()
+			_cull_last_reemit_ms = now_ms
+			_cull_reemit_count += 1
+			return true
+		return false
 	if _cull_stable_probes >= CubeSphere.CULL_SETTLE_PROBES and _cull_mask_differs() \
 			and now_ms - _cull_last_reemit_ms >= CubeSphere.CULL_REBUILD_MS:
 		_cull_commit_apply()
@@ -2668,10 +2755,24 @@ func _cull_probe_cell(fid: int, gi: int, gj: int) -> bool:
 ## the current backstop set (NEVER-OOM). Then the DECOUPLED decision (`_cull_decide_reemit`) fires a far-ring rebuild ONLY
 ## on a settle (APPLY) or a safety (FLUSH) transition — NOT per probe — so the ~1 s sync rebuild can no longer run every
 ## frame as coverage churns under live streaming (the round-2 regression). No-op unless the cull is active.
+## COSMOS-APPLIED-PROBE-CALM §2.3 (FP_APPLIED_PROBE_CALM): the round-robin probe-slice window for facet `fid` this reap —
+## CALM_PROBE_SLICE consecutive cell indices from an O(1) per-facet cursor (wrapping), advancing the cursor by the slice so
+## the full grid is swept every ceil(ncell/slice) reaps. Called ONLY under the flag (the flag-off `_cull_update` branch keeps
+## the shipped full nested-loop probe, allocation-free). Headlessly testable (G-APC-6).
+func _cull_probe_indices(fid: int, ncell: int) -> PackedInt32Array:
+	var slice: int = mini(CubeSphere.CALM_PROBE_SLICE, ncell)
+	var cur := int(_cull_slice_cursor.get(fid, 0)) % ncell
+	var out := PackedInt32Array()
+	for n in range(slice):
+		out.append((cur + n) % ncell)
+	_cull_slice_cursor[fid] = (cur + slice) % ncell
+	return out
+
 func _cull_update() -> void:
 	if not _cull_on():
 		if not _cull_mask.is_empty() or not _committed_cull.is_empty():
 			_cull_mask.clear(); _cull_streak.clear(); _committed_cull.clear()   # flag flipped off mid-run — drop all state
+			_cull_flap.clear(); _cull_slice_cursor.clear()
 		return
 	var now := Time.get_ticks_msec()
 	if now - _cull_last_ms < CubeSphere.CULL_REAP_MS:
@@ -2679,19 +2780,28 @@ func _cull_update() -> void:
 	_cull_last_ms = now
 	_cull_changed = false                                # per-pass live-mask-change latch (settle detector)
 	var cells := CubeSphere.BACKSTOP_CELLS
+	var ncell := cells * cells
 	# The set of facets that CAN be near-covered = live backstop facets with a dense cache (near meshes only around them).
 	var live := {}
 	for fid in _bpos_cache.keys():
 		if _is_backstop(fid):
 			live[fid] = true
-			for gj in range(cells):
-				for gi in range(cells):
-					cull_feed(fid, gj * cells + gi, _cull_probe_cell(fid, gi, gj))
+			if not CubeSphere.FP_APPLIED_PROBE_CALM:
+				for gj in range(cells):
+					for gi in range(cells):
+						cull_feed(fid, gj * cells + gi, _cull_probe_cell(fid, gi, gj))
+			else:
+				# COSMOS-APPLIED-PROBE-CALM §2.3: probe only CALM_PROBE_SLICE cells this reap (round-robin, full grid ≤ 4
+				# reaps ≈ 0.4 s). Un-cover detection stays prompt — the probe AABB is +CULL_DILATE dilated, a >5 s motion
+				# margin, so a ≤0.4 s slice lag keeps FLUSH firing well before an actual hole. Cuts steady probe load ~4×.
+				for ci in _cull_probe_indices(fid, ncell):
+					cull_feed(fid, ci, _cull_probe_cell(fid, ci % cells, ci / cells))
 	# Prune LIVE + streak state for facets no longer backstop (bounded footprint); a committed facet that left the set is
 	# dropped too, and that counts as a live-mask change so the settle counter restarts (the committed emit is stale).
 	for fid in _cull_mask.keys():
 		if not live.has(fid):
 			_cull_mask.erase(fid); _cull_streak.erase(fid)
+			_cull_flap.erase(fid); _cull_slice_cursor.erase(fid)   # calm state pruned with the mask (no-op / empty off flag)
 			_cull_changed = true
 	for fid in _committed_cull.keys():
 		if not live.has(fid):
@@ -3175,6 +3285,12 @@ func shell_telemetry() -> Dictionary:
 	# costing a third investigation. Off ⇒ the key is never added ⇒ byte-identical for any telemetry consumer.
 	if CubeSphere.FP_APPLIED_VIEW_BAND:
 		out["sh_applied_band"] = _applied_band.y
+	# COSMOS-APPLIED-PROBE-CALM §2.5 (FP_APPLIED_PROBE_CALM): the live A/B discriminator — `sh_cull_reemits` (this run's
+	# far-ring cull rebuild tally, was 182/session; target < 10) and `sh_cull_delta` (live∖committed overdraw cells still
+	# awaiting a settled APPLY). Off ⇒ the keys are never added ⇒ byte-identical for any telemetry consumer.
+	if CubeSphere.FP_APPLIED_PROBE_CALM:
+		out["sh_cull_reemits"] = _cull_reemit_count
+		out["sh_cull_delta"] = _cull_last_delta
 	return out
 
 ## COSMOS FS1 gate (G-SHELL-WELD): the horizon (CELLS) ABSOLUTE positions for facet `fid` — warms + returns the cache.

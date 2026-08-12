@@ -1674,6 +1674,27 @@ const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches
 const CULL_SETTLE_PROBES := 3               # consecutive no-change probes (≈300 ms) before a settled cull is APPLIED to the mesh
 const CULL_REBUILD_MS := 250               # min wall-ms between APPLY rebuilds (the FLUSH safety path is un-rate-limited)
 
+## COSMOS-APPLIED-PROBE-CALM §2 (FP_APPLIED_PROBE_CALM, task #123): the round-2 coalescing constants above (300 ms settle
+## / 250 ms rate-limit) were tuned to protect a single rebuild, NOT a minutes-long coverage TRICKLE — under a stationary
+## warm forest the covered-cull APPLY fired 182× (each a 60–94 ms MAIN-THREAD swap of the ~480k-vert FULL_COVER shell) to
+## harvest ~11 more covered cells per event, pinning stream_credit at 0 and capping forest fps at 10–27 (a credit-immune
+## feedback trap: each APPLY's spike keeps credit=0, which floors near-field grants, which trickles coverage, which earns
+## the next APPLY). This flag calms ONLY the APPLY-luxury (culling MORE cells to SHRINK the shell): the FLUSH safety path
+## (un-cull / cull LESS / draw MORE) stays instant and un-rate-limited — deferring an APPLY only leaves cells DRAWN behind
+## opaque near voxels, i.e. the pre-cull shipped visual (zero correctness debt; culled ⊆ covered can only STRENGTHEN, so
+## #113/#117's applied-cover zones are byte-untouched — only the grow-re-emit CADENCE changes). Four measures: (1) the
+## APPLY is credit-gated on the far ring's existing _stream_credit_ok (breaks the trap); (2) a real settle/rate/deadband;
+## (3) a probe-slice + flap-pin; (4) applied-ladder grow-climb coalescing. Off ⇒ every guarded decision runs the shipped
+## CULL_SETTLE_PROBES/CULL_REBUILD_MS / per-step-_pending body verbatim; no calm state is allocated → FLAT byte-identical.
+## Gate: verify_applied_calm.gd (G-APC-*). Effective only where FP_FARRING_CULL_COVERED already governs (cull active).
+const FP_APPLIED_PROBE_CALM := false
+const CALM_SETTLE_PROBES := 20             # live-mask quiet probes (~2 s) before an APPLY is considered (shipped 3)
+const CALM_APPLY_MIN_MS := 10000           # min wall-ms between APPLY re-emits (shipped 250)
+const CALM_MIN_CELLS := 24                 # min live∖committed cell delta to justify a full-shell APPLY ...
+const CALM_HARVEST_PROBES := 300           # ... unless quiet this long (~30 s) — final overdraw harvest of a small remainder
+const CALM_PROBE_SLICE := 64               # cull cells probed per facet per reap, round-robin (full grid ≤ 4 reaps ≈ 0.4 s)
+const CALM_FLAP_N := 4                      # covered↔uncovered read flips that pin a cell DRAWN (safety direction, ends oscillation)
+
 ## COSMOS TEXTURED-LOD U3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3b: same level, not sink). The
 ## far ring is emitted radially SUNK below the near surface: TierPlace.backstop_sink() ≈ 13 blocks at R=6371 — the
 ## sink's TWO jobs were (i) hide far poke-through where near+far coexist and (ii) win the z-order for near. The user

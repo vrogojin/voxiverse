@@ -2936,6 +2936,29 @@ const FP_NIGHT_TERRAIN_CENTRE := false
 static func near_centre_fix_on() -> bool:
 	return FP_NEAR_DAYLIGHT and (FP_SHADE_UNIFIED or FP_NIGHT_TERRAIN_CENTRE)
 
+## COSMOS NEAR-LEAF-CUTOUT (docs/COSMOS-NEAR-LEAF-CUTOUT-DESIGN.md, task #116) — see-through (alpha-tested) NEAR tree
+## leaf blocks, matching the far card impostors' stippled foliage. The 7 leaf ids (LEAF 5 + *_leaves 51/53/55/57/59/61,
+## by BlockCatalog.is_leaf_id — NOT structural_class foliage, which also holds solid moss_block/cactus) split OFF the
+## ONE shared opaque atlas material onto a SEPARATE transparent-cutout twin (the atlas material + a single
+## `if (t.a < LEAF_SCISSOR) discard;`) — approach (b): the discard cost stays confined to leaf surfaces, so the terrain
+## pass keeps early-Z (alpha_scissor on the shared material would kill early-Z scene-wide). A deterministic 2×2-cluster
+## STIPPLE hole-punch (~HOLE_P transparent, same integer-mix hash as the far cards) is written into the leaf atlas cells'
+## EXISTING alpha plane at build (zero new resident bytes). Alpha-TEST stays in the OPAQUE queue (no blend, no sort) —
+## the exact recipe the far card ships (facet_far_trees.gd:132-137), already proven live on gl_compat. Leaf models keep
+## transparency_index 0 so leaf-leaf interior faces stay mesher-culled (~2-layer overdraw cap). Off ⇒ no hole-punch (atlas
+## image byte-identical), leaf ids on the ONE atlas material, no twin ⇒ byte-identical. Requires FP_ATLAS_MATERIAL (the
+## twin rides the atlas). Gate verify_leaf_cutout.gd + flag-aware verify_atlas touch-up. Bake ON only after a live
+## dense-forest fps A/B (≤ 10 % in-forest frame-time regression, ~0 on open terrain).
+const FP_LEAF_CUTOUT := false
+
+## Fraction of each leaf atlas cell punched transparent (2×2-px clusters, hashed). 0.30 ≈ the far card's interior gap
+## read; fallback 0.20 (fewer holes = cheaper + more solid) if the live A/B regresses on low-end hardware.
+const LEAF_HOLE_P := 0.30
+
+## Alpha-test threshold for the leaf cutout twin (opaque-queue discard / StandardMaterial ALPHA_SCISSOR). Drop 0.5 → 0.4
+## if the live A/B shows leaves thinning as mip alpha erodes toward solid (design §7 mip note).
+const LEAF_SCISSOR := 0.5
+
 ## COSMOS BORDER-SHADE WELD (docs/COSMOS-BORDER-SHADE-WELD-DESIGN.md — the bright interfacet border strip). The
 ## FP-CARVE seam-junction carve-sentinel cubes (drawn ONLY along the facet ridge) still carry the PRE-UNIFICATION
 ## BlockMaterials daylight twin (night_floor 0.10, NO scatter tint) while every neighbouring cube adopted the

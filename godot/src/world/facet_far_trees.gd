@@ -438,9 +438,9 @@ func _evict_lru_overflow() -> void:
 ## base camera distance is in [R0, FAR_TREES_CARD_MAX] (R0 = near voxel edge — the near field owns closer trees →
 ## no far-over-near), emit a card transform + custom data, up to FAR_TREES_CARD_INST_MAX. One `set_buffer` upload.
 func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
-	# When rung-1 meshes are live they own [R0, FAR_TREES_MESH_MAX); the cards start at FAR_TREES_MESH_MAX (exclusive
-	# handoff at 448, no double-render). Off ⇒ the P0 full [R0, CARD_MAX] band. The mesh band's own lower bound is R0.
-	var r0 := CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
+	# The card-band INNER radius is the ONE source of truth `card_inner_radius()`: FAR_TREES_MESH_MAX when rung-1
+	# meshes own [R0, 448) (exclusive handoff at 448, no double-render), else the P0 full [R0, CARD_MAX] band.
+	var r0 := card_inner_radius()
 	var d2 := CubeSphere.FAR_TREES_CARD_MAX
 	var cap := CubeSphere.FAR_TREES_CARD_INST_MAX
 	var buf := PackedFloat32Array()
@@ -775,6 +775,12 @@ func total_bytes() -> int:
 	for fid in _cache.keys():
 		lru_b += (_cache[fid] as PackedFloat32Array).size() * 4
 	return buf_b + atlas_b + mesh_b + mesh_buf_b + lru_b
+
+## The card-band INNER radius (ONE source of truth). FAR_TREES_MESH_MAX (448) when rung-1 meshes are live so the
+## cards retreat past the exclusive handoff; else near_render_radius() — the P0 [128, CARD_MAX] band, BYTE-IDENTICAL
+## with FP_FAR_TREES_MESH off (what's merged). Gate G-FT-MESH-HANDOFF asserts this in BOTH flag states.
+func card_inner_radius() -> float:
+	return CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
 
 func live_instances() -> int: return _live_instances
 func was_capped() -> bool: return _capped

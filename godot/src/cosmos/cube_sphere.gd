@@ -1707,6 +1707,24 @@ const CULL_REAP_MS := 100                   # coverage re-probe cadence (matches
 const CULL_SETTLE_PROBES := 3               # consecutive no-change probes (≈300 ms) before a settled cull is APPLIED to the mesh
 const CULL_REBUILD_MS := 250               # min wall-ms between APPLY rebuilds (the FLUSH safety path is un-rate-limited)
 
+## COSMOS-APPLIED-PROBE-CALM §R2.5 (FP_APPLIED_PROBE_CALM) — sink-side coalescer for the far-ring `_pending` arms.
+## Every literal `_pending = true` in facet_far_ring.gd routes through `_arm_pending(src, luxury)`. Flag OFF ⇒ that
+## helper's first line is the shipped `_pending = true` (byte-identical; no counter, no latch, no rail; `_pending_src`
+## never allocated). Flag ON ⇒ (a) a per-source arm sensor exposed as `sh_pending_src` (definitive live attribution —
+## this bug has mis-pinned twice); (b) the 3 transient-prone SAFETY arms (NB_UNCOVER/NB_RESINK/LADDER_SHRINK) are
+## net-zero debounced by TIME (a remesh `is_area_meshed` excursion that reverts within CALM_NETZERO_HOLD_MS never
+## commits its state change nor arms ⇒ 0 rebuilds — pixel-identical); (c) the applied-ladder GROW is coalesced to ONE
+## immediate arm at the climb FIXPOINT (≤7 arms/climb → 1) yet stays same-frame so the #113/#117 far-over-near grey
+## still clears at the shipped cadence; (d) a forward LUXURY rail (SMOOTH_CHG/CULL_APPLY/RELIEF — all dead on the
+## deployed set) credit-gated + settle/rate coalesced for when those flags ship. FLUSH / all other SAFETY arms stay
+## instant + un-rate-limited (no see-through / never-black / stale-slot regression). Kills the 182 far-ring full-shell
+## re-emit forest spikes (#123). gl_compat untouched (removes GPU re-uploads); NEVER-OOM: +~60 B sensor + 2 latches.
+## Gate: verify_probe_calm.gd (G-APC-1..8) + byte-off parity. Bake ON at export once the live A/B confirms.
+const FP_APPLIED_PROBE_CALM := false
+const CALM_NETZERO_HOLD_MS := 250          # transient-cancellation hold on the 3 debounced SAFETY arms (async build 1.5-2.1s ⇒ ≤17% add)
+const CALM_SETTLE_MS := 2000               # luxury rail: min quiet (ms) since the last luxury arm before a promotion
+const CALM_APPLY_MIN_MS := 10000           # luxury rail: min wall-ms between luxury-promoted rebuilds
+
 ## COSMOS TEXTURED-LOD U3 (docs/COSMOS-TEXTURED-LOD-DESIGN.md §2U.3 — live correction 3b: same level, not sink). The
 ## far ring is emitted radially SUNK below the near surface: TierPlace.backstop_sink() ≈ 13 blocks at R=6371 — the
 ## sink's TWO jobs were (i) hide far poke-through where near+far coexist and (ii) win the z-order for near. The user

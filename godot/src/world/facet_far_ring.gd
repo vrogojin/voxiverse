@@ -310,6 +310,42 @@ var _band_slot_snapshot: Dictionary = {}  # fid -> band layer (frozen at build e
 var _centre_cache: Dictionary = {}   # FP-S1(d): fid -> Array[3] cached centre dir (cheap; no planar-corner recompute per rebuild)
 # FP-S1(d) deferred-rebuild state
 var _pending := false                # a crossing requested a rebuild; _process (or force_rebuild) completes it off-frame
+# COSMOS-APPLIED-PROBE-CALM §R2.5 (FP_APPLIED_PROBE_CALM): sink-side `_pending` classification state. Every literal
+# `_pending = true` in this file routes through `_arm_pending(src, luxury)`. All of the state below is zero/inert and
+# never touched with the flag off (byte-identical). Source tags — index = position in the `sh_pending_src` sensor,
+# fixed enum order per the design (never reorder: live telemetry parses by position).
+const SRC_BOOT := 0            # :602 boot-warm completion (SAFETY, one-shot)
+const SRC_CROSS := 1           # :641 facet-crossing deferred re-emit (SAFETY)
+const SRC_SMOOTH_CHG := 2      # :739 _smooth.consume_changed() (LUXURY — dead unless FP_FAR_SMOOTH)
+const SRC_SMOOTH_INC := 3      # :892 _mesh_inc_gate re-inclusion (SAFETY — make-before-break; dead unless FP_FAR_SMOOTH)
+const SRC_CAM := 4             # :1226 _shell_snapshot camera drift (SAFETY)
+const SRC_POOL := 5            # :1295 set_pool_excluded (SAFETY)
+const SRC_NB_BUILT := 6        # :1591 noblack fresh chord (SAFETY)
+const SRC_NB_UNCOVER := 7      # :1591 noblack unsink flip → fid (SAFETY, net-zero debounced)
+const SRC_NB_RESINK := 8       # :1591 noblack unsink flip → -1 (SAFETY, net-zero debounced)
+const SRC_NB_NOTEMIT := 9      # :1591 active facet not drawn (SAFETY)
+const SRC_UNSINK := 10         # :1626 _unsink_drift_check (SAFETY)
+const SRC_LADDER_SHRINK := 11  # :1734 applied-ladder shrink (SAFETY, net-zero debounced)
+const SRC_LADDER_GROW := 12    # :1734 applied-ladder grow (SAFETY at FIXPOINT — one arm/climb)
+const SRC_CULL_FLUSH := 13     # :2702 cull FLUSH (SAFETY — dead, cull not deployed)
+const SRC_CULL_APPLY := 14     # :2702 cull APPLY (LUXURY — dead, cull not deployed)
+const SRC_SLOTS := 15          # :4371 band/close-up slot pushes (SAFETY)
+const SRC_RELIEF := 16         # :5222 _drain_relief_dirty (LUXURY — dead unless FP_RELIEF_REEMIT)
+const SRC_FORCE := 17          # force_rebuild() synchronous path (reserved; no _pending arm)
+const SRC_COUNT := 18
+var _pending_src := PackedInt32Array()   # per-source arm counts (sensor); sized SRC_COUNT in setup() ONLY under the flag
+var _pending_luxury := false             # a LUXURY arm is parked, waiting on the credit/settle rail (_process consumes)
+var _calm_last_lux_arm_ms := 0           # ticks of the last luxury arm (settle clock)
+var _calm_last_lux_promote_ms := 0       # ticks of the last luxury→pending promotion (rate clock)
+# net-zero debounce latches — the noblack unsink FLIP and the ladder SHRINK each hold their state change + arm for
+# CALM_NETZERO_HOLD_MS; a probe REVERT within the hold cancels everything (0 rebuilds), a stand past it commits + arms.
+var _calm_nb_hold_active := false
+var _calm_nb_hold_target := -1           # the raw unsink verdict being held (fid, or -1)
+var _calm_nb_hold_deadline := 0
+var _calm_ladder_shrink_active := false
+var _calm_ladder_shrink_deadline := 0
+var _calm_ladder_emitted_r := 0.0        # the _applied_r the last ladder arm was emitted for (fixpoint dedup)
+var _cull_last_decision := 0             # cull attribution: 0=none, 1=FLUSH, 2=APPLY (set in _cull_decide_reemit)
 var _emitted: Dictionary = {}        # fid -> true: the facets in the CURRENTLY committed mesh (visible-set gate check)
 var _reemit_count := 0               # diagnostics: full re-emits done (gate: set_active does NOT re-emit synchronously)
 # COSMOS FP-R0 SPIKE: facets rendered as REAL rotated voxel terrains (WorldManager fills this behind
@@ -513,6 +549,10 @@ func open_boot_gate() -> void:
 
 func setup(active_fid: int) -> void:
 	_active_fid = active_fid
+	# FP_APPLIED_PROBE_CALM §R2.5.1: allocate the per-source arm sensor ONLY under the flag (byte-off ⇒ stays empty,
+	# never read, ~0 bytes). Zero-filled by resize.
+	if CubeSphere.FP_APPLIED_PROBE_CALM:
+		_pending_src.resize(SRC_COUNT)
 	_recompute_sticky()              # TIER-DEPTH P1: seed the sticky backstop set so ring-1 is sunk from the first build (no-op with the flag off)
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetFarRingMesh"
@@ -599,7 +639,7 @@ func _boot_warm_step() -> void:
 	if done:
 		_boot_warm = false
 		_emit_cached_only = false     # everything cached → restore the shipped full-emit for later crossings/re-emits
-		_pending = true               # one clean full rebuild next frame (all cached ⇒ identical to the shipped mesh)
+		_arm_pending(SRC_BOOT)        # one clean full rebuild next frame (all cached ⇒ identical to the shipped mesh)
 
 ## FP_BOOT_ASYNC introspection for verify_boot_async.gd — read-only. Facets whose emit cache is built so far.
 func boot_cached_count() -> int:
@@ -638,7 +678,7 @@ func set_active(new_fid: int) -> void:
 	# facet churns under the orbit ground-track. Skip it off-surface; the camera driver re-emits on real drift. On the
 	# surface / flag-off _shell_orbit() is false ⇒ the shipped deferred re-emit fires exactly as today (byte-identical).
 	if not _shell_orbit():
-		_pending = true
+		_arm_pending(SRC_CROSS)
 
 ## COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md P1: drive the smooth-tile REPLACEMENT ladder. Re-ranks the visible hemisphere
 ## nearest-first from the active facet EVERY call (cheap bounded BFS, §7.2 "worker starvation" precedent — the ranking
@@ -736,7 +776,7 @@ func _smooth_drive(idle_on := CubeSphere.FP_SMOOTH_IDLE, sticky_on := CubeSphere
 		_smooth_idle_sig = sig
 		_smooth_idle_primed = true
 	if _smooth.consume_changed():
-		_pending = true
+		_arm_pending(SRC_SMOOTH_CHG, true)   # LUXURY: tile takeover ⇒ facet double-drawn until re-emit (overdraw, not a hole)
 
 ## REVISION 3 Q1: the cheap assignment-driving-input signature — (active_fid, sorted excluded-set keys). Stringified
 ## so comparison is a plain `==` (no Array-of-Array equality assumption needed) and the excluded set is tiny
@@ -889,7 +929,7 @@ func _mesh_inc_gate(assign: Dictionary, snap_gen_on := CubeSphere.FP_SHELL_SNAP_
 			_smooth_leaving.erase(f)
 			continue
 		if not _smooth_leaving.has(f):
-			_pending = true                       # ask for a shell rebuild so the re-inclusion actually lands
+			_arm_pending(SRC_SMOOTH_INC)          # SAFETY (make-before-break): ask for a shell rebuild so the re-inclusion actually lands
 			out[f] = int(_smooth.tier_of(f))
 			if snap_gen_on:
 				# REVISION 3 T2 (FP_SHELL_SNAP_GEN): mark with the EARLIEST snapshot generation that can possibly
@@ -1223,7 +1263,7 @@ func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool) 
 	_emit_dir_last = dir
 	_emit_thetah_last = theta_h
 	_emit_floored_last = floored
-	_pending = true
+	_arm_pending(SRC_CAM)
 	_snapshot_count += 1                                       # FIX A2 diagnostic: a scheduled re-emit (flat during a held fall)
 
 ## COSMOS-ORBITAL-SHELL S2 (§4): the one-shot whole-planet coarse-cache warm. After SHELL_PREWARM_DWELL_S sustained
@@ -1292,7 +1332,7 @@ func set_pool_excluded(fids: Array) -> void:
 		return
 	_excluded = next
 	_recompute_sticky()   # TIER-DEPTH P1: fold the new pool set into the sticky backstop (no-op with the flag off)
-	_pending = true   # deferred rebuild (the crossing's set_active already re-placed the mesh rigidly)
+	_arm_pending(SRC_POOL)   # SAFETY: deferred rebuild (the crossing's set_active already re-placed the mesh rigidly)
 
 ## FP-S1(d): drive the deferred rebuild off the crossing frame. Cache-warm the newly-front-hemisphere facets under a
 ## per-frame ms budget; once they are all cached, do the single re-emit. Only active while a crossing is pending.
@@ -1305,6 +1345,39 @@ func set_pool_excluded(fids: Array) -> void:
 var _dbg_drive_ms := 0.0
 var _dbg_step_ms := 0.0
 var _dbg_env_ms := 0.0
+
+## FP_APPLIED_PROBE_CALM §R2.5.1 choke point — every literal `_pending = true` in this file routes here with a source
+## tag. Flag OFF ⇒ the shipped write verbatim (byte-identical: no counter, no latch, no rail). Flag ON ⇒ bump the
+## per-source sensor and, for a LUXURY arm, park it on the forward rail (`_process` promotes it under credit/settle/
+## rate); a SAFETY arm (the default) sets `_pending` immediately, exactly as shipped. The net-zero debounce for the 3
+## transient-prone SAFETY arms lives at their call sites (they only REACH here on a confirmed change), not in here.
+func _arm_pending(src: int, luxury := false) -> void:
+	if not CubeSphere.FP_APPLIED_PROBE_CALM:
+		_pending = true
+		return
+	if src >= 0 and src < _pending_src.size():
+		_pending_src[src] += 1
+	if luxury:
+		_pending_luxury = true
+		_calm_last_lux_arm_ms = Time.get_ticks_msec()
+	else:
+		_pending = true
+
+## FP_APPLIED_PROBE_CALM §R2.5.4 — the luxury coalescer: promote a parked luxury arm to a real `_pending` ONLY when
+## the stream is healthy (`_stream_credit_ok`) AND settled (≥ CALM_SETTLE_MS since the last luxury arm) AND rate-
+## limited (≥ CALM_APPLY_MIN_MS since the last promotion). `now_ms` is injectable so the gate can drive the settle/
+## rate law deterministically. Returns true iff it promoted. No-op / false with the flag off or nothing parked.
+func _calm_try_promote_luxury(now_ms := Time.get_ticks_msec()) -> bool:
+	if not CubeSphere.FP_APPLIED_PROBE_CALM or not _pending_luxury:
+		return false
+	if _stream_credit_ok \
+			and now_ms - _calm_last_lux_arm_ms >= CubeSphere.CALM_SETTLE_MS \
+			and now_ms - _calm_last_lux_promote_ms >= CubeSphere.CALM_APPLY_MIN_MS:
+		_pending_luxury = false
+		_calm_last_lux_promote_ms = now_ms
+		_pending = true
+		return true
+	return false
 
 func _process(_dt: float) -> void:
 	_poll_async_rebuild()
@@ -1373,6 +1446,13 @@ func _process(_dt: float) -> void:
 	# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2: advance the applied-cover ladder probe on the same cadence, right
 	# beside the un-sink drift re-arm above. No-op with the flag off (byte-identical).
 	_applied_probe_step()
+	# FP_APPLIED_PROBE_CALM §R2.5.4: the forward LUXURY rail — promote a parked luxury arm to a real `_pending` ONLY
+	# when the stream is healthy (`_stream_credit_ok`) AND settled (≥ CALM_SETTLE_MS since the last luxury arm) AND
+	# rate-limited (≥ CALM_APPLY_MIN_MS since the last promotion). Idle under the deployed set (every LIVE arm is
+	# SAFETY, so `_pending_luxury` never sets); exists so SMOOTH_CHG / CULL_APPLY / RELIEF arrive calm when those
+	# flags ship. Never entered / no allocation with the flag off (byte-identical).
+	if CubeSphere.FP_APPLIED_PROBE_CALM and _pending_luxury:
+		_calm_try_promote_luxury()
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -1586,10 +1666,31 @@ func _noblack_guarantee(p: Array, quiesce_on := CubeSphere.FP_RING_QUIESCE, nobl
 		var uncovered := not _noblack_near_meshed(fid)
 		new_unsink = fid if uncovered else -1
 	# (c) re-emit once on any change or if the active facet is not currently drawn (and not smooth-covered); then the
-	# idle short-circuits hold.
-	if built_now or new_unsink != _noblack_unsink_fid or (not _emitted.has(fid) and not covered):
-		_pending = true
-	_noblack_unsink_fid = new_unsink
+	# idle short-circuits hold. FP_APPLIED_PROBE_CALM §R2.5.2/.3: `built_now` + not-emitted stay SAFETY-immediate; the
+	# unsink FLIP (UNCOVER→fid / RESINK→-1) is net-zero debounced — a remesh `is_area_meshed` transient that reverts
+	# within CALM_NETZERO_HOLD_MS never commits the flip nor arms (0 rebuilds, pixel-identical), only a stand past the
+	# hold does. The held FLIP keeps `_noblack_unsink_fid` at its committed value meanwhile (the emit stays stable).
+	if not CubeSphere.FP_APPLIED_PROBE_CALM:
+		if built_now or new_unsink != _noblack_unsink_fid or (not _emitted.has(fid) and not covered):
+			_pending = true
+		_noblack_unsink_fid = new_unsink
+	else:
+		if built_now:
+			_arm_pending(SRC_NB_BUILT)
+		if not _emitted.has(fid) and not covered:
+			_arm_pending(SRC_NB_NOTEMIT)
+		if new_unsink == _noblack_unsink_fid:
+			_calm_nb_hold_active = false            # raw verdict agrees with committed ⇒ cancel any excursion hold
+		else:
+			var nowms := Time.get_ticks_msec()
+			if not _calm_nb_hold_active or _calm_nb_hold_target != new_unsink:
+				_calm_nb_hold_active = true         # begin (or retarget) the hold — do NOT commit the flip yet
+				_calm_nb_hold_target = new_unsink
+				_calm_nb_hold_deadline = nowms + CubeSphere.CALM_NETZERO_HOLD_MS
+			elif nowms >= _calm_nb_hold_deadline:
+				_noblack_unsink_fid = new_unsink    # verdict stood past the hold ⇒ commit + arm safety
+				_arm_pending(SRC_NB_UNCOVER if new_unsink == fid else SRC_NB_RESINK)
+				_calm_nb_hold_active = false
 
 ## COSMOS FAR-CRUISE NEVER-BLACK: is the near voxel field actually meshed in a TIGHT column UNDER THE CAMERA on the
 ## active facet? Uses the SAME (fid, fid-lattice AABB) → module_world.skin_near_meshed (godot_voxel is_area_meshed)
@@ -1623,7 +1724,7 @@ func _unsink_drift_check(on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> void:
 	if not _unsink_armed or _player_col_abs.distance_to(_unsink_armed_col) >= CubeSphere.UNSINK_DRIFT_BLOCKS:
 		_unsink_armed_col = _player_col_abs
 		_unsink_armed = true
-		_pending = true
+		_arm_pending(SRC_UNSINK)   # SAFETY: already ≥ UNSINK_DRIFT_BLOCKS drift-gated (rare)
 
 ## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): is a box of horizontal half-extent `r`,
 ## vertical half-extent `h`, centred on world point `col`, fully meshed by the near voxel field? Mirrors
@@ -1718,20 +1819,23 @@ func _applied_box_meshed_slab(r: float, h: float, lx: float, ly: float, lz: floa
 ## drive the real ladder law without sed; every real caller passes no override ⇒ `TierPlace.applied_cover_on()`
 ## governs. Sets `_pending` when the quantized radius CHANGES (§3.3) — rides the existing single-flight pipeline.
 func _applied_probe_step(on := TierPlace.applied_cover_on(), params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> void:
-	var before := _applied_r
-	if not on or not _unsink_have_col or not _cull_cover_query.is_valid():
-		_applied_r = 0.0
+	if not CubeSphere.FP_APPLIED_PROBE_CALM:
+		var before := _applied_r
+		if not on or not _unsink_have_col or not _cull_cover_query.is_valid():
+			_applied_r = 0.0
+		else:
+			var step := float(CubeSphere.APPLIED_PROBE_STEP)
+			var max_r := float(CubeSphere.APPLIED_PROBE_MAX)
+			var h := params.z
+			if _applied_r > 0.0 and not _applied_box_meshed(_applied_r, h, _player_col_abs):
+				_applied_r = 0.0                              # shrink instantly — the claimed radius no longer holds
+			var next_r := _applied_r + step
+			if next_r <= max_r + 0.001 and _applied_box_meshed(next_r, h, _player_col_abs):
+				_applied_r = next_r                           # grow exactly one step
+		if _applied_r != before:
+			_pending = true
 	else:
-		var step := float(CubeSphere.APPLIED_PROBE_STEP)
-		var max_r := float(CubeSphere.APPLIED_PROBE_MAX)
-		var h := params.z
-		if _applied_r > 0.0 and not _applied_box_meshed(_applied_r, h, _player_col_abs):
-			_applied_r = 0.0                              # shrink instantly — the claimed radius no longer holds
-		var next_r := _applied_r + step
-		if next_r <= max_r + 0.001 and _applied_box_meshed(next_r, h, _player_col_abs):
-			_applied_r = next_r                           # grow exactly one step
-	if _applied_r != before:
-		_pending = true
+		_applied_probe_step_calm(on, params)
 	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): record the loadable row band that let the ladder live — the
 	# zone-C height gate (§3.3) may sink only vertices whose TRUE surface ≤ band top−1, and telemetry (§3.4) reads it.
 	# A LIVE ladder (`_applied_r > 0`) with a valid band query snapshots the real band at the player row; otherwise
@@ -1742,6 +1846,47 @@ func _applied_probe_step(on := TierPlace.applied_cover_on(), params: Vector3 = T
 		_applied_band = _band_query.call(float(l[1]))
 	else:
 		_applied_band = Vector2(0.0, 1.0e9)
+
+## FP_APPLIED_PROBE_CALM §R2.5.3 — the applied-cover ladder under the sink-side coalescer (only reached under the
+## flag; the shipped body runs verbatim otherwise). SHRINK is net-zero debounced: a failed re-verify HOLDS `_applied_r`
+## for CALM_NETZERO_HOLD_MS instead of dropping it instantly, so a remesh `is_area_meshed` transient that re-proves
+## within the hold never drops the radius nor arms (0 rebuilds, pixel-identical). GROW climbs SILENTLY (+STEP/frame, no
+## arm per step) and arms SRC_LADDER_GROW exactly ONCE at the fixpoint (the frame growth stalls), and only if the
+## radius actually ROSE since the last emit (`_calm_ladder_emitted_r`) — so a net-zero excursion that never dropped
+## arms nothing, while a real shrink→regrow arms once. GROW stays IMMEDIATE (same-frame at fixpoint) because it REMOVES
+## the #113/#117 far-over-near grey — visual correctness, not luxury (so no coalesced-grey regression at spawn/crossing).
+func _applied_probe_step_calm(on: bool, params: Vector3) -> void:
+	if not on or not _unsink_have_col or not _cull_cover_query.is_valid():
+		# Degraded to all-zone-B (invalid callable / no real column) — a real state, not a transient: drop + arm now.
+		_calm_ladder_shrink_active = false
+		if _applied_r != 0.0:
+			_applied_r = 0.0
+			_calm_ladder_emitted_r = 0.0
+			_arm_pending(SRC_LADDER_SHRINK)
+		return
+	var step := float(CubeSphere.APPLIED_PROBE_STEP)
+	var max_r := float(CubeSphere.APPLIED_PROBE_MAX)
+	var h := params.z
+	var nowms := Time.get_ticks_msec()
+	# (1) SHRINK re-verify, net-zero debounced — hold, don't drop, until the failure stands past CALM_NETZERO_HOLD_MS.
+	if _applied_r > 0.0 and not _applied_box_meshed(_applied_r, h, _player_col_abs):
+		if not _calm_ladder_shrink_active:
+			_calm_ladder_shrink_active = true
+			_calm_ladder_shrink_deadline = nowms + CubeSphere.CALM_NETZERO_HOLD_MS
+		elif nowms >= _calm_ladder_shrink_deadline:
+			_applied_r = 0.0                              # sustained failure ⇒ commit the shrink + arm safety
+			_calm_ladder_emitted_r = 0.0
+			_arm_pending(SRC_LADDER_SHRINK)
+			_calm_ladder_shrink_active = false
+	else:
+		_calm_ladder_shrink_active = false               # re-verify passed (or r==0) ⇒ cancel any excursion hold
+	# (2) GROW one step, silent; arm ONCE at the fixpoint (growth stalls) iff the radius rose since the last emit.
+	var next_r := _applied_r + step
+	if next_r <= max_r + 0.001 and _applied_box_meshed(next_r, h, _player_col_abs):
+		_applied_r = next_r                              # grow exactly one step (no arm — the climb runs silently)
+	elif _applied_r > _calm_ladder_emitted_r:
+		_arm_pending(SRC_LADDER_GROW)                   # fixpoint reached with a real net rise ⇒ single grow arm
+		_calm_ladder_emitted_r = _applied_r
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
@@ -2621,12 +2766,14 @@ func _cull_decide_reemit(changed: bool, now_ms: int) -> bool:
 	if _cull_committed_unsafe():
 		_cull_commit_flush()
 		_cull_reemit_count += 1
+		_cull_last_decision = 1                          # FP_APPLIED_PROBE_CALM attribution: FLUSH (SAFETY)
 		return true
 	if _cull_stable_probes >= CubeSphere.CULL_SETTLE_PROBES and _cull_mask_differs() \
 			and now_ms - _cull_last_reemit_ms >= CubeSphere.CULL_REBUILD_MS:
 		_cull_commit_apply()
 		_cull_last_reemit_ms = now_ms
 		_cull_reemit_count += 1
+		_cull_last_decision = 2                          # FP_APPLIED_PROBE_CALM attribution: APPLY (LUXURY)
 		return true
 	return false
 
@@ -2697,9 +2844,13 @@ func _cull_update() -> void:
 		if not live.has(fid):
 			_committed_cull.erase(fid)
 			_cull_changed = true
-	# DECOUPLED: rebuild only on a settle/safety transition — never per probe.
+	# DECOUPLED: rebuild only on a settle/safety transition — never per probe. FP_APPLIED_PROBE_CALM: FLUSH is SAFETY-
+	# immediate, APPLY is LUXURY (subsumed by the luxury coalescer). Dead on the deployed set (cull not served).
 	if _cull_decide_reemit(_cull_changed, now):
-		_pending = true                                 # re-emit through whichever _process path is active
+		if _cull_last_decision == 1:
+			_arm_pending(SRC_CULL_FLUSH)                # re-emit through whichever _process path is active
+		else:
+			_arm_pending(SRC_CULL_APPLY, true)
 
 ## FP_MID_DENSE gate visibility: does facet `fid` emit from the dense cache right now? (public accessor for
 ## verify_no_protrusion's mid-dense reconstruction tier.)
@@ -3175,6 +3326,14 @@ func shell_telemetry() -> Dictionary:
 	# costing a third investigation. Off ⇒ the key is never added ⇒ byte-identical for any telemetry consumer.
 	if CubeSphere.FP_APPLIED_VIEW_BAND:
 		out["sh_applied_band"] = _applied_band.y
+	# FP_APPLIED_PROBE_CALM §R2.5.1: the per-source `_pending` arm sensor, comma-joined in the FIXED SRC_* enum order
+	# (SRC_BOOT..SRC_FORCE) — the definitive live attribution/verification telemetry (this bug has mis-pinned twice).
+	# Off ⇒ the key is never added ⇒ byte-identical for any telemetry consumer.
+	if CubeSphere.FP_APPLIED_PROBE_CALM:
+		var _src_parts := PackedStringArray()
+		for _v in _pending_src:
+			_src_parts.append(str(_v))
+		out["sh_pending_src"] = ",".join(_src_parts)
 	return out
 
 ## COSMOS FS1 gate (G-SHELL-WELD): the horizon (CELLS) ABSOLUTE positions for facet `fid` — warms + returns the cache.
@@ -4368,7 +4527,7 @@ func _on_slot_map_changed(on := CubeSphere.FP_SLOT_INDIRECT) -> void:
 	if on:
 		_push_slot_indirect(true)   # LAW S: update the lookup texture ONLY — no re-emit, no _shell_gen bump
 	else:
-		_pending = true             # shipped: re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
+		_arm_pending(SRC_SLOTS)     # SAFETY: re-emit so UV2.y carries the new slots (rides the existing deferred pipeline)
 
 ## COSMOS LOD-TEXTURE Phase 4 / U1: refresh the frozen slot snapshots the mesh emit reads. MAIN thread only (both build
 ## entries call it before any worker dispatch), so the async worker's _emit_cached reads maps stable for its run.
@@ -5219,7 +5378,7 @@ func _drain_relief_dirty() -> void:
 		_ensure_cached(fid, true)
 		n += 1
 	_relief_last_reemit_ms = now_ms
-	_pending = true
+	_arm_pending(SRC_RELIEF, true)   # LUXURY: DEM shade-multiply catch-up (cosmetic; dead unless FP_RELIEF_REEMIT)
 
 ## FP_FAR_TERMINATOR_WELD telemetry: the shell material's OWN live `sun_dir` uniform (the sun-echo, `sd_shell`),
 ## whichever shader is currently on `_mi.material_override` (v2-absolute / tint / biased-tier). (1,0,0) sentinel

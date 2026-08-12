@@ -5157,6 +5157,13 @@ func set_far_trees_edits_rev_query(q: Callable) -> void:
 	if _far_trees != null:
 		_far_trees.set_edits_rev_query(q)
 
+## docs/COSMOS-FARTREE-ALIGN-DESIGN.md (§5.5, FP_FAR_TREES_NEARCULL): forward the shared near-mesh-presence query
+## (WorldManager → NearPresence.covered) so the tier culls the far impostor exactly where the near blocky tree renders.
+## No-op with no instance; only read under the flag (byte-identical off).
+func set_far_trees_near_query(q: Callable) -> void:
+	if _far_trees != null:
+		_far_trees.set_near_query(q)
+
 ## docs/COSMOS-FAR-TREES-DESIGN.md — far-trees telemetry accessor for the shell telemetry / gate (null-safe).
 func far_trees() -> Object:
 	return _far_trees

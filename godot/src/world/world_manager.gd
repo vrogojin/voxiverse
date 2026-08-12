@@ -416,6 +416,10 @@ func _ready() -> void:
 			# fresh chop re-arms its rebuild-on-change gate within one step. Stored like the chop query; only read
 			# under the flag ⇒ byte-identical with FP_FAR_TREES_DELTA off.
 			_facet_ring.set_far_trees_edits_rev_query(Callable(self, "edit_count"))
+			# docs/COSMOS-FARTREE-ALIGN-DESIGN.md (§5.5, FP_FAR_TREES_NEARCULL): hand the tier the shared near-presence
+			# query (NearPresence.covered, bound to the module world) so the far impostor is culled exactly where the
+			# near blocky tree renders. Stored like the chop query; only read under FP_FAR_TREES_NEARCULL ⇒ byte-off.
+			_facet_ring.set_far_trees_near_query(Callable(self, "far_tree_near_presence"))
 		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
@@ -3537,6 +3541,13 @@ func far_tree_chopped(fid: int, cell: Vector3i) -> bool:
 	if _edits.is_empty() or _chart != null or not CubeSphere.FACETED:
 		return false
 	return _edits.has(FacetAtlas.edit_key(fid, cell))
+
+## docs/COSMOS-FARTREE-ALIGN-DESIGN.md (§5, FP_FAR_TREES_NEARCULL): the shared near-mesh-presence predicate bound to
+## the module world — is facet `fid`'s NEAR voxel field actually meshed over the fid-lattice `box`? Tri-state
+## (NearPresence.COVERED|NOT_COVERED|UNKNOWABLE). A null / fallback module world ⇒ UNKNOWABLE (the tier degrades to
+## today's distance band). Pure read (is_area_meshed + the live view-band); no streaming/apply cost.
+func far_tree_near_presence(fid: int, box: AABB) -> int:
+	return NearPresence.covered(_module_world, fid, box)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

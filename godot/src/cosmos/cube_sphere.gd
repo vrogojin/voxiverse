@@ -930,6 +930,39 @@ const FP_FAR_TREES_DELTA := false            # far-trees rebuild-on-change gate 
 const FT_DELTA_MIN_MOVE := 2.0               # blocks of camera motion that re-arm a far-trees rebuild
 const FT_DELTA_WANTED_MOVE := 64.0           # blocks of camera motion that re-compute the wanted-facet scan
 
+## FP_SLOPE_ALL_MATERIALS (docs/COSMOS-SLOPE-MATERIAL-DESIGN.md, task #122) — widen the 45° smooth-slope carve band
+## from B_MOUNTAINS-only to ALL Earth land biomes except B_BADLANDS. Default false ⇒ the shipped predicate verbatim
+## (byte-off). NOTE: the const definition was accidentally omitted from commit a223805 (which added every
+## `CubeSphere.FP_SLOPE_ALL_MATERIALS` reference in terrain_config/module_world/verify_slope_material but not the flag
+## itself), leaving the project uncompilable; this restores it at the intended default. Gate: verify_slope_material.gd.
+const FP_SLOPE_ALL_MATERIALS := false
+
+## FP_FAR_TREES_ALIGN + FP_FAR_TREES_NEARCULL (docs/COSMOS-FARTREE-ALIGN-DESIGN.md, task #120) — the FAR tree renders
+## a few blocks BELOW its NEAR blocky twin, and in the transition band BOTH render at once (a sunken ghost). Two
+## independent fixes that compose:
+##  - FP_FAR_TREES_ALIGN (§4): weld the far base to the NEAR trunk-bottom-face centre. The enum worker anchors at
+##    lattice_to_world64(fid, bx+0.5, gy+1, bz+0.5) (== the near trunk-bottom, same W_fid map + column_top, f64 both
+##    sides — kills the −1 ground-cell-vs-trunk-base + the ½-block corner-vs-centre lateral skew) and stores it
+##    UNSUNK; the rung-1 archetype mesh shifts −0.5 Y (the centred-cube +0.5 that rode the trunk high); and the flat
+##    BURY=1.0 radial sink becomes a DISTANCE ramp sink(d)=FT_SINK_MAX·smoothstep(FT_SINK_R0,FT_SINK_R1,d) applied at
+##    rebuild (exact at the near boundary, buried only deep in the band where the visible ground is the sunk V2 tier).
+##  - FP_FAR_TREES_NEARCULL (§5): a per-tree ACTUAL-near-presence cull (shared NearPresence predicate) so the far
+##    impostor turns off exactly where the near blocky tree renders — no overlap, no gap. Probe the trunk-base cell
+##    over the uncertainty annulus [FT_CULL_MIN, near_render_radius()+40] (the near field never streams past
+##    near_render_radius() — pool_view is capped there); probed-COVERED ⇒ cull (also gap-fills a ramped-down view),
+##    HIDE immediately, RESTORE only after FT_CULL_DWELL consecutive NOT_COVERED, UNKNOWABLE never flips state. The
+##    probe fingerprint folds into FP_FAR_TREES_DELTA's changed-inputs so a mesh landing under a still camera re-arms.
+## Both default false, byte-off: ALIGN off ⇒ `_enum_worker` emits the shipped floats verbatim + `_build_archetype_mesh`
+## the shipped geometry (single-site guards); NEARCULL off ⇒ no probe, no fingerprint, the shipped `dist < r0` skip.
+## The cull STRICTLY REDUCES instances (0 added draws). Gate: verify_far_trees.gd (G-FTA-1..3, G-FTC-1..4, G-NP-*).
+const FP_FAR_TREES_ALIGN := false            # §4: exact near-anchor weld (enum anchor + archetype −0.5 + sink ramp)
+const FP_FAR_TREES_NEARCULL := false         # §5: near-mesh-presence handoff cull (probe-keyed inner boundary)
+const FT_SINK_MAX := 1.0                      # §4.3 deep-band bury (the old BURY)
+const FT_SINK_R0 := 208.0                     # sink ramp start (≈ near_render_radius()+80; sink==0 at/inside this)
+const FT_SINK_R1 := 288.0                     # sink ramp full (deep-band bury == FT_SINK_MAX beyond this)
+const FT_CULL_MIN := 64.0                     # §5.2 never-emit-far floor (a close-up card reads worse than a beat of absence)
+const FT_CULL_DWELL := 2                      # §5.3 consecutive NOT_COVERED probes before a culled far tree is restored
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

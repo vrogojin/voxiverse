@@ -50,6 +50,15 @@ var _fail := 0
 var _fake_edits_rev := 0
 func _fake_edit_count() -> int:
 	return _fake_edits_rev
+
+## G-NP fake module world: a hermetic stand-in for module_world's near-presence probes (skin_near_meshed +
+## meshed_band_y) so the NearPresence tri-state logic is proven WITHOUT a live godot_voxel pool. `meshed` drives the
+## is_area_meshed answer; `band` drives the live streamable vertical band.
+class FakeWorld extends RefCounted:
+	var meshed := false
+	var band := Vector2(-64.0, 130.0)
+	func skin_near_meshed(_fid: int, _box: AABB) -> bool: return meshed
+	func meshed_band_y(_ly: float) -> Vector2: return band
 func _ok(c: bool, m: String) -> void:
 	if c: _pass += 1
 	else:
@@ -100,8 +109,15 @@ func _initialize() -> void:
 			print("  (G-FT-CFIX-SNOW-WARM skipped — needs FP_FAR_TREES_SNOW sed-toggled true)")
 		# G-FTD (FP_FAR_TREES_DELTA): the rebuild-on-change gate. Runs in BOTH flag states (self-describes off vs on).
 		_gate_delta()
+		# G-FTA (FP_FAR_TREES_ALIGN) + G-FTC (FP_FAR_TREES_NEARCULL) — the #120 weld + handoff cull. Two-state,
+		# self-describing (off ⇒ shipped anchor/sink/no-cull; on ⇒ welded + probe-culled).
+		_gate_align()
+		_gate_cull()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
+
+	# G-NP (NearPresence tri-state) — pure predicate logic, independent of the far-trees flags (shared #120/#121).
+	_gate_np()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -793,3 +809,175 @@ func _gate_delta() -> void:
 	else:
 		print("  (G-FTD-3 chop-ghost check skipped — needs FP_FAR_TREES_FADE for the chop filter)")
 	ring.queue_free()
+
+# ---- G-FTA (FP_FAR_TREES_ALIGN — the height weld) -------------------------------------------------------------------
+
+## Two-state, self-describing. ON ⇒ the enum anchor is the NEAR trunk-bottom-face centre (bx+0.5, gy+1, bz+0.5)
+## (world→lattice round-trip), the archetype min vertex Y == 0.0 (the −0.5 shift), and the far sink is the distance
+## ramp (0 at FT_SINK_R0, buried deep). OFF ⇒ the shipped raw-corner+BURY anchor and archetype min Y == 0.5 (byte-off).
+func _gate_align() -> void:
+	var align := CubeSphere.FP_FAR_TREES_ALIGN
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
+	var m := recs.size() / FT.REC_FLOATS
+	var anchor_ok := true
+	var conv_ok := true
+	var checked := 0
+	for i in range(m):
+		var o := i * FT.REC_FLOATS
+		var sp := Vector3(recs[o + 0], recs[o + 1], recs[o + 2])
+		var bx := int(recs[o + 8]); var gy := int(recs[o + 9]); var bz := int(recs[o + 10])
+		if TreeGen.block_at(bx, gy + 1, bz, ctx) == BlockCatalog.AIR:
+			conv_ok = false                              # the near trunk log sits at gy+1 — the +1-convention witness
+		if align:
+			var latt = FA.world_to_lattice64(fid, sp.x, sp.y, sp.z)
+			if absf(float(latt[0]) - (float(bx) + 0.5)) > 2.0e-2 or absf(float(latt[1]) - (float(gy) + 1.0)) > 2.0e-2 \
+					or absf(float(latt[2]) - (float(bz) + 0.5)) > 2.0e-2:
+				anchor_ok = false
+		else:
+			var w = FA.lattice_to_world64(fid, float(bx), float(gy), float(bz))
+			var ws := Vector3(float(w[0]), float(w[1]), float(w[2]))
+			var expct := ws - ws.normalized() * FT.BURY
+			if sp.distance_to(expct) > 2.0e-2:
+				anchor_ok = false
+		checked += 1
+	_ok(checked > 0, "G-FTA-1: anchor sample non-empty (%d)" % checked)
+	_ok(conv_ok, "G-FTA-1: every far tree's ground cell gy solid + trunk cell gy+1 a log (near +1 convention)")
+	if align:
+		_ok(anchor_ok, "G-FTA-1: far anchor world→lattice == (bx+0.5, gy+1, bz+0.5) — welded to the near trunk-bottom face")
+	else:
+		_ok(anchor_ok, "G-FTA-1(off): far anchor == shipped lattice_to_world64(bx,gy,bz) − BURY·r̂ (byte-identical)")
+	if CubeSphere.FP_FAR_TREES_MESH:
+		var minok := true
+		var exp_min := 0.0 if align else 0.5
+		for col in range(6):
+			var my := tier.mesh_min_vertex_y(col)
+			if is_nan(my) or absf(my - exp_min) > 1.0e-3:
+				minok = false
+		_ok(minok, "G-FTA-2: archetype min vertex Y == %.1f (%s)" % [exp_min, "ALIGN −0.5 shift" if align else "shipped"])
+	else:
+		print("  (G-FTA-2 skipped — needs FP_FAR_TREES_MESH sed-toggled true)")
+	_ok(is_equal_approx(FT.sink_ramp(CubeSphere.FT_SINK_R0), 0.0), "G-FTA-3: sink_ramp(FT_SINK_R0) == 0 (exact base at the near boundary)")
+	_ok(FT.sink_ramp(CubeSphere.FT_SINK_R1 + 40.0) > FT.sink_ramp(CubeSphere.FT_SINK_R0), "G-FTA-3: sink_ramp buries deeper with distance")
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var dtest := 500.0
+	var pp := centre + tangent * dtest
+	var rr := pp.normalized()
+	var syn := PackedFloat32Array()
+	syn.push_back(pp.x); syn.push_back(pp.y); syn.push_back(pp.z)
+	syn.push_back(rr.x); syn.push_back(rr.y); syn.push_back(rr.z)
+	syn.push_back(0.0); syn.push_back(5.0)
+	syn.push_back(0.0); syn.push_back(0.0); syn.push_back(0.0)
+	tier.debug_set_cache(fid, syn)
+	tier.debug_rebuild([fid], centre)
+	var cbuf: PackedFloat32Array = tier.debug_buffer()
+	if tier.live_instances() >= 1:
+		var org := Vector3(cbuf[3], cbuf[7], cbuf[11])
+		var sk: float = FT.sink_ramp(dtest) if align else 0.0
+		var exp_org := pp - rr * sk
+		_ok(org.distance_to(exp_org) < 2.0e-1, "G-FTA-3: card origin == anchor − r̂·sink_ramp(d) (%s, sink=%.2f)" % ["ALIGN" if align else "off", sk])
+	else:
+		_ok(true, "G-FTA-3: (no card at d=500 — skipped)")
+	ring.queue_free()
+
+# ---- G-FTC (FP_FAR_TREES_NEARCULL — the handoff cull) ---------------------------------------------------------------
+
+func _gate_cull() -> void:
+	if not CubeSphere.FP_FAR_TREES_MESH:
+		print("  (G-FTC skipped — needs FP_FAR_TREES_MESH, the near-frontier rung)")
+		return
+	var nearcull := CubeSphere.FP_FAR_TREES_NEARCULL
+	var ring := _fake_ring()
+	var fid: int = _sample_facets()[0]
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var dists := [50.0, 100.0, 140.0, 300.0]
+	var syn := PackedFloat32Array()
+	for dv in dists:
+		var pp := centre + tangent * float(dv)
+		var rr := pp.normalized()
+		syn.push_back(pp.x); syn.push_back(pp.y); syn.push_back(pp.z)
+		syn.push_back(rr.x); syn.push_back(rr.y); syn.push_back(rr.z)
+		syn.push_back(0.0); syn.push_back(5.0)
+		syn.push_back(float(int(dv))); syn.push_back(10.0); syn.push_back(0.0)
+	if not nearcull:
+		var ti = FT.new(); ti.setup_instance(ring, fid); ti.debug_set_cache(fid, syn)
+		ti.set_near_query(func(_f, _b): return NearPresence.COVERED)
+		ti.debug_rebuild([fid], centre)
+		var wv := ti.mesh_live_instances()
+		var tj = FT.new(); tj.setup_instance(ring, fid); tj.debug_set_cache(fid, syn)
+		tj.debug_rebuild([fid], centre)
+		var uv := tj.mesh_live_instances()
+		_ok(wv == uv, "G-FTC(off): the near-query is inert — wired == unwired shipped band (%d==%d)" % [wv, uv])
+		ring.queue_free()
+		return
+	var ta = FT.new(); ta.setup_instance(ring, fid); ta.debug_set_cache(fid, syn)
+	ta.set_near_query(func(_f, _b): return NearPresence.COVERED)
+	ta.debug_rebuild([fid], centre)
+	var cov := ta.mesh_live_instances()
+	_ok(cov == 1, "G-FTC-1: probed-COVERED trees culled — only the beyond-probe tree survives (%d==1)" % cov)
+	_ok(ta.cull_probe_count() <= 256, "G-FTC-1: probes bounded (%d <= 256/rebuild)" % ta.cull_probe_count())
+	ta.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+	ta.debug_rebuild([fid], centre)
+	var after1 := ta.mesh_live_instances()
+	for _k in range(CubeSphere.FT_CULL_DWELL):
+		ta.debug_rebuild([fid], centre)
+	var restored := ta.mesh_live_instances()
+	_ok(restored == 3, "G-FTC-1: NOT_COVERED draws all incl the d<128 gap-fill (%d==3 after dwell)" % restored)
+	_ok(after1 < restored, "G-FTC-2: dwell holds the restore for FT_CULL_DWELL rebuilds (%d then %d)" % [after1, restored])
+	var t2 = FT.new(); t2.setup_instance(ring, fid); t2.debug_set_cache(fid, syn)
+	t2.set_near_query(func(_f, _b): return NearPresence.COVERED)
+	t2.debug_rebuild([fid], centre)
+	var hid := t2.mesh_live_instances()
+	t2.set_near_query(func(_f, _b): return NearPresence.UNKNOWABLE)
+	t2.debug_rebuild([fid], centre)
+	var still := t2.mesh_live_instances()
+	_ok(hid == 1 and still == 1, "G-FTC-1: UNKNOWABLE never flips state (hidden stays hidden: %d==%d==1)" % [hid, still])
+	var tb = FT.new(); tb.setup_instance(ring, fid); tb.debug_set_cache(fid, syn)
+	tb.debug_rebuild([fid], centre)
+	var off_n := tb.mesh_live_instances()
+	_ok(cov <= off_n, "G-FTC-4: cull strictly reduces instances (cull %d <= shipped %d)" % [cov, off_n])
+	if CubeSphere.FP_FAR_TREES_DELTA:
+		var t3 = FT.new(); t3.setup_instance(ring, fid); t3.debug_set_cache(fid, syn)
+		t3.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+		t3.debug_step([fid], centre)
+		var c0 := t3.rebuild_count()
+		t3.debug_step([fid], centre)
+		_ok(t3.rebuild_count() == c0, "G-FTC-3: static camera + stable presence ⇒ rebuild skipped")
+		t3.set_near_query(func(_f, _b): return NearPresence.COVERED)
+		t3.debug_step([fid], centre)
+		_ok(t3.rebuild_count() == c0 + 1, "G-FTC-3: a presence change re-arms the DELTA rebuild under a still camera")
+	else:
+		print("  (G-FTC-3 re-arm check skipped — needs FP_FAR_TREES_DELTA sed-toggled true)")
+	ring.queue_free()
+
+# ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
+
+func _gate_np() -> void:
+	var slab := TerrainConfig.meshed_slab_y()
+	var inbox := AABB(Vector3(10.0, 20.0, 10.0), Vector3.ONE)
+	_ok(NearPresence.covered(null, 0, inbox) == NearPresence.UNKNOWABLE, "G-NP-1: null world ⇒ UNKNOWABLE")
+	var w := FakeWorld.new()
+	var outbox := AABB(Vector3(10.0, slab.x - 50.0, 10.0), Vector3.ONE)
+	_ok(NearPresence.covered(w, 0, outbox) == NearPresence.NOT_COVERED, "G-NP-2: box outside the bounds slab ⇒ NOT_COVERED (never meshable)")
+	w.meshed = true
+	_ok(NearPresence.covered(w, 0, inbox) == NearPresence.COVERED, "G-NP-3: a genuinely meshed box ⇒ COVERED (positive reachability)")
+	w.meshed = false
+	w.band = Vector2(-64.0, 130.0)
+	_ok(NearPresence.covered(w, 0, inbox) == NearPresence.NOT_COVERED, "G-NP-4: not meshed but inside the live band ⇒ NOT_COVERED (a real no)")
+	w.band = Vector2(60.0, 100.0)
+	_ok(NearPresence.covered(w, 0, inbox) == NearPresence.UNKNOWABLE, "G-NP-5: not meshed + outside the live band ⇒ UNKNOWABLE")
+	_ok(NearPresence.covered(RefCounted.new(), 0, inbox) == NearPresence.UNKNOWABLE, "G-NP-6: world lacking skin_near_meshed ⇒ UNKNOWABLE (never a silent false)")

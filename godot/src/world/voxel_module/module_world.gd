@@ -3183,21 +3183,15 @@ func _configure_library(library: Object) -> bool:
 		var use_atlas: bool = _atlas != null and bool(_atlas.has_cell(block_id))
 		var cube_mat: Material = _atlas.material if use_atlas else BlockMaterials.get_for(block_id)
 		var atlas_cell: Vector2i = _atlas.cell_of(block_id) if use_atlas else Vector2i(-1, -1)
-		# COSMOS NEAR-LEAF-CUTOUT (§6.6): route the 7 leaf ids onto the atlas's transparent-cutout twin (same cell, same
-		# atlas texture, +discard) so their punched cells read see-through. Non-leaf ids + flag-off ⇒ null ⇒ the shipped
-		# shared-atlas force in _add_cube (byte-identical). Leaf models keep transparency_index 0 (the §4 overdraw cap).
-		var leaf_mat: Material = null
-		if CubeSphere.FP_LEAF_CUTOUT and use_atlas and _atlas.leaf_material != null and BlockCatalog.is_leaf_id(block_id):
-			leaf_mat = _atlas.leaf_material
 		if _waterlog_enabled and lk != CellCodec.LIQ_NONE and _fluids[lk] != null:
 			# A liquid LRID renders as a PURE FLUID model (WATERLOGGING §4.2 / MULTI-LIQUID §2.2.2),
 			# not a cube — so deep liquid culls internally and every cell of that kind shares its one
 			# fluid_index. Falls back to a cube if the fluid model can't be built, preserving the
 			# index==LRID invariant either way. (Liquids are never opaque, so use_atlas is false here.)
 			var fluid_model: Object = _make_fluid_model(block_id, lk)
-			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, cube_mat, cull_group, atlas_cell, leaf_mat)
+			got = _add_model(library, fluid_model) if fluid_model != null else _add_cube(library, cube_mat, cull_group, atlas_cell)
 		else:
-			got = _add_cube(library, cube_mat, cull_group, atlas_cell, leaf_mat)
+			got = _add_cube(library, cube_mat, cull_group, atlas_cell)
 		if got != block_id:
 			push_warning("[module_world] library order broke: model %d != id %d" % [got, block_id])
 			return false
@@ -3218,8 +3212,7 @@ func _configure_library(library: Object) -> bool:
 ## culls a face against a neighbour whose index is <= this model's, so glass-behind-
 ## glass culls but stone-behind-glass draws. The alpha blend itself lives on the
 ## material; the index only governs face culling.
-func _add_cube(library: Object, material: Material, cull_group: int = 0, atlas_cell := Vector2i(-1, -1),
-		atlas_material: Material = null) -> int:
+func _add_cube(library: Object, material: Material, cull_group: int = 0, atlas_cell := Vector2i(-1, -1)) -> int:
 	var cube: Object = ClassDB.instantiate("VoxelBlockyModelCube")
 	if cube == null:
 		return -1
@@ -3235,17 +3228,10 @@ func _add_cube(library: Object, material: Material, cull_group: int = 0, atlas_c
 		for side in 6:  # VoxelBlockyModel.SIDE_* : 0..5 (all cube faces)
 			cube.call("set_tile", side, atlas_cell if use_atlas else Vector2i(0, 0))
 	if cube.has_method("set_material_override"):
-		# A valid atlas cell ALWAYS means an atlas material (the tile samples the atlas). Stage-1 callers already pass
-		# _atlas.material; Stage-2 snow-cap-cube callers pass the per-id snow material — force the atlas material here so
+		# A valid atlas cell ALWAYS means the shared atlas material (the tile samples the atlas). Stage-1 callers
+		# already pass _atlas.material; Stage-2 snow-cap-cube callers pass the per-id snow material — force it here so
 		# the tile+material agree (else the face would sample the atlas cell through the wrong per-id texture / not merge).
-		# COSMOS NEAR-LEAF-CUTOUT: an explicit `atlas_material` (the leaf twin) overrides the shared one — same atlas
-		# texture, same cell, +discard — so a leaf cube samples its punched cell through the cutout program. Default null
-		# ⇒ the shipped `_atlas.material` force verbatim (byte-identical off). Computed ONLY inside use_atlas so the
-		# `_atlas.material` deref never runs when _atlas is null (FP_ATLAS_MATERIAL off) — the original ternary's short-circuit.
-		var chosen: Material = material
-		if use_atlas:
-			chosen = atlas_material if atlas_material != null else _atlas.material
-		cube.call("set_material_override", 0, chosen)
+		cube.call("set_material_override", 0, _atlas.material if use_atlas else material)
 	# Transparency index for face culling (WGC §5.1). Opaque (0) is the godot_voxel
 	# default, so only translucent models need it; guarded so the call is harmless if
 	# the module drops the setter between versions.

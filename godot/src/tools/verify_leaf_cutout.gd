@@ -1,14 +1,17 @@
 extends SceneTree
-## COSMOS NEAR-LEAF-CUTOUT gate (docs/COSMOS-NEAR-LEAF-CUTOUT-DESIGN.md §8, task #116) — the see-through (alpha-tested)
-## NEAR leaf blocks. Proves, on the ACTUAL built module library (not by eye), that the 7 leaf ids (BlockCatalog.is_leaf_id)
-## split off the shared opaque atlas material onto a transparent-cutout twin, that the leaf atlas cells carry the stipple
-## hole-punch, and that flag-off is byte-identical.
+## COSMOS LEAF-CUTOUT-PERF gate (docs/COSMOS-LEAF-CUTOUT-PERF-DESIGN.md §6.6, task #116) — the see-through (alpha-tested)
+## NEAR leaf blocks, V2: the 7 leaf ids (BlockCatalog.is_leaf_id) STAY on the ONE shared opaque atlas material (NO twin,
+## NO draw-call split); the shared near-daylight shader gains EXACTLY one `if (t.a < LEAF_SCISSOR) discard;` and the leaf
+## atlas cells carry the stipple hole-punch (only leaf cells drop below alpha 255, so only leaf texels can ever discard).
+## Proves, on the ACTUAL built module library (not by eye), that NO separate leaf material exists, that the punch is
+## confined to leaf cells, that the shared shader carries exactly one discard, and that flag-off is byte-identical.
 ##
 ## Runs in TWO modes, selected by the sed state of CubeSphere.FP_LEAF_CUTOUT (FP_ATLAS_MATERIAL must be on in BOTH to
 ## build the atlas at all):
 ##   OFF  → G-LEAF-OFF: the atlas leaf cells hold NO transparency (hole-punch never ran ⇒ atlas image byte-identical),
-##          no leaf twin exists, every leaf id is on the ONE shared atlas material. (Run with only FP_ATLAS_MATERIAL on.)
-##   ON   → G-LEAF-CELL / G-LEAF-MAT / G-LEAF-SHADE. The live bake fingerprint (FP_ATLAS_MATERIAL + FP_NEAR_DAYLIGHT +
+##          near_daylight_shader_code() has ZERO discard lines, every leaf id is on the ONE shared atlas material.
+##          (Run with only FP_ATLAS_MATERIAL on.)
+##   ON   → G-LEAF-CELL / G-LEAF-SHARED / G-LEAF-SHADE. The live bake fingerprint (FP_ATLAS_MATERIAL + FP_NEAR_DAYLIGHT +
 ##          FP_SHADE_UNIFIED + FP_LEAF_CUTOUT) must ALL be sed-on — pinned via LIVE_* below so a forgotten sed fails
 ##          LOUDLY rather than vacuously (a repo-default-false CubeSphere.FP_* would void the pin).
 ##
@@ -71,7 +74,7 @@ func _initialize() -> void:
 			and CubeSphere.FP_SHADE_UNIFIED == LIVE_SHADE_UNIFIED and CubeSphere.FP_LEAF_CUTOUT == LIVE_LEAF,
 			"fingerprint: live bake flags all sed-on (ATLAS/NEAR_DAYLIGHT/SHADE_UNIFIED/LEAF_CUTOUT) — else the ON pins are vacuous")
 		_gate_cell(mod, atlas)
-		_gate_mat(mod, atlas)
+		_gate_shared(mod, atlas)
 		_gate_shade(mod, atlas)
 	else:
 		_gate_off(mod, atlas)
@@ -99,10 +102,17 @@ func _gate_predicate() -> void:
 	_ok(not BlockCatalog.is_leaf_id(43) and not BlockCatalog.is_leaf_id(77),
 		"predicate: foliage moss_block(43)/cactus(77) are NOT leaves (class-foliage != leaf)")
 
-# ---------- G-LEAF-OFF (byte-identity): no hole-punch, no twin, leaves on the ONE shared atlas material ----------
+# ---------- G-LEAF-OFF (byte-identity): no hole-punch, no discard, leaves on the ONE shared atlas material ----------
 func _gate_off(mod: Node3D, atlas) -> void:
-	print("  --- G-LEAF-OFF: flag off ⇒ atlas leaf cells un-punched (byte-identical) + leaves on the shared material ---")
-	_ok(atlas.leaf_material == null, "G-LEAF-OFF: no leaf twin material was built (flag off)")
+	print("  --- G-LEAF-OFF: flag off ⇒ atlas leaf cells un-punched (byte-identical) + shared shader has ZERO discard ---")
+	# V2: there is NO leaf twin at all — the shared near-daylight shader source (cutout defaults to FP_LEAF_CUTOUT=false)
+	# must be byte-identical to the shipped strings, i.e. contain ZERO discard lines.
+	_ok(BA.near_daylight_shader_code().count("discard") == 0,
+		"G-LEAF-OFF: near_daylight_shader_code() has ZERO discard (byte-identical to the shipped shader)")
+	# The shipped StandardMaterial (this OFF run has FP_NEAR_DAYLIGHT off) keeps TRANSPARENCY_DISABLED.
+	if atlas.material is StandardMaterial3D:
+		_ok((atlas.material as StandardMaterial3D).transparency == BaseMaterial3D.TRANSPARENCY_DISABLED,
+			"G-LEAF-OFF: shared StandardMaterial keeps TRANSPARENCY_DISABLED (no alpha-scissor)")
 	var shared: Object = atlas.material
 	var min_alpha := 255
 	var on_shared := 0
@@ -156,65 +166,77 @@ func _gate_cell(mod: Node3D, atlas) -> void:
 		"G-LEAF-CELL: no non-leaf opaque id shares a leaf cell (%d checked, %d shared%s)" % [
 			non_leaf_opaque, shared_cell, "" if first_share < 0 else ", first id=%d" % first_share])
 
-# ---------- G-LEAF-MAT: the 7 leaf ids on ONE twin instance; shader == atlas shader + EXACTLY the discard; tx-index 0 ----------
-func _gate_mat(mod: Node3D, atlas) -> void:
-	print("  --- G-LEAF-MAT: leaf ids on ONE cutout twin; shader == near-daylight source + exactly one discard; tx-index 0 ---")
-	var twin: Object = atlas.leaf_material
-	_ok(twin != null, "G-LEAF-MAT: the leaf twin material exists under the flag")
-	if twin == null:
-		return
+# ---------- G-LEAF-SHARED: leaves + non-leaves ALL on the ONE shared material; shared shader == base + EXACTLY one discard ----------
+func _gate_shared(mod: Node3D, atlas) -> void:
+	print("  --- G-LEAF-SHARED: every opaque cube (leaf + non-leaf) on the ONE shared atlas material; shader has one discard ---")
 	var shared: Object = atlas.material
-	_ok(not is_same(twin, shared), "G-LEAF-MAT: the leaf twin is a DISTINCT instance from the shared atlas material")
-	# All 7 leaf ids point at the SAME twin instance; every non-leaf opaque id stays on the shared atlas material.
-	var on_twin := 0
-	var same_instance := true
-	for id in LEAF_IDS:
+	# Every opaque cube id — INCLUDING the 7 leaves — points at the SAME shared instance (V2: no draw-call split, so no
+	# separate leaf material is ever created; the mesher merges leaves into the same per-chunk surface as stone).
+	var on_shared := 0
+	var opaque_total := 0
+	var first_bad := -1
+	for id in range(1, BlockCatalog.count()):
+		if not BA.is_opaque_cube(id) or not atlas.has_cell(id):
+			continue
+		opaque_total += 1
 		var model: Object = mod.call("library_model", mod.call("cube_arid_of", id))
 		if model == null or not model.has_method("get_material_override"):
 			continue
-		if is_same(model.call("get_material_override", 0), twin):
-			on_twin += 1
-		# transparency_index stays 0 (the overdraw cap is load-bearing): the source is cull_group 0, and if the model
-		# exposes the getter, it must read 0 too.
-		_ok(BlockCatalog.cull_group_of(id) == 0, "G-LEAF-MAT: leaf id %d cull_group is 0 (transparency_index source)" % id)
-		if model.has_method("get_transparency_index"):
-			_ok(int(model.call("get_transparency_index")) == 0, "G-LEAF-MAT: leaf id %d model transparency_index is 0" % id)
-	_ok(on_twin == LEAF_IDS.size(), "G-LEAF-MAT: all %d leaf ids are on the ONE cutout twin (%d)" % [LEAF_IDS.size(), on_twin])
-	# String-diff: the twin's shader source is EXACTLY near_daylight_shader_code() + one `if (t.a < LEAF_SCISSOR) discard;`.
-	if twin is ShaderMaterial:
-		var got_code: String = ((twin as ShaderMaterial).shader as Shader).code
-		var base := BA.near_daylight_shader_code()
-		var expected := BA.leaf_shader_code()
+		if is_same(model.call("get_material_override", 0), shared):
+			on_shared += 1
+		elif first_bad < 0:
+			first_bad = id
+	_ok(on_shared == opaque_total and opaque_total > 0,
+		"G-LEAF-SHARED: all %d opaque cubes (incl. leaves) are on the ONE shared atlas material (%d on-shared%s)" % [
+			opaque_total, on_shared, "" if first_bad < 0 else ", first off id=%d" % first_bad])
+	# Every leaf id specifically resolves to the shared instance (the explicit "no twin" assertion).
+	var leaf_on_shared := 0
+	for id in LEAF_IDS:
+		var model: Object = mod.call("library_model", mod.call("cube_arid_of", id))
+		if model != null and model.has_method("get_material_override") and is_same(model.call("get_material_override", 0), shared):
+			leaf_on_shared += 1
+		# transparency_index stays 0 (the overdraw cap is load-bearing): source cull_group 0, and the model reads 0 too.
+		_ok(BlockCatalog.cull_group_of(id) == 0, "G-LEAF-SHARED: leaf id %d cull_group is 0 (transparency_index source)" % id)
+		if model != null and model.has_method("get_transparency_index"):
+			_ok(int(model.call("get_transparency_index")) == 0, "G-LEAF-SHARED: leaf id %d model transparency_index is 0" % id)
+	_ok(leaf_on_shared == LEAF_IDS.size(),
+		"G-LEAF-SHARED: all %d leaf ids on the ONE shared atlas material — NO separate leaf material (%d)" % [LEAF_IDS.size(), leaf_on_shared])
+	# String-diff: the shared shader source is EXACTLY near_daylight_shader_code() with one `if (t.a < LEAF_SCISSOR) discard;`.
+	if shared is ShaderMaterial:
+		var got_code: String = ((shared as ShaderMaterial).shader as Shader).code
+		var expected := BA.near_daylight_shader_code()               # cutout defaults to FP_LEAF_CUTOUT (on here)
+		var base := BA.near_daylight_shader_code(CubeSphere.FP_SHADE_UNIFIED, CubeSphere.FP_NIGHT_TERRAIN_CENTRE, false)
 		var discard_line := "\tif (t.a < %s) discard;\n" % String.num(CubeSphere.LEAF_SCISSOR, 3)
-		_ok(got_code == expected, "G-LEAF-MAT: twin shader source == BlockAtlas.leaf_shader_code()")
+		_ok(got_code == expected, "G-LEAF-SHARED: shared shader source == BlockAtlas.near_daylight_shader_code() (cutout on)")
 		_ok(expected != base and expected.count(discard_line) == 1 and expected.replace(discard_line, "") == base,
-			"G-LEAF-MAT: twin shader == atlas near-daylight shader + EXACTLY one discard line (string-diff)")
+			"G-LEAF-SHARED: shared shader == near-daylight base + EXACTLY one discard line (string-diff)")
+		_ok(got_code.count("discard") == 1, "G-LEAF-SHARED: shared shader contains EXACTLY one discard line")
 	else:
-		# Shader-off path: the StandardMaterial cutout clone (alpha-scissor in the opaque queue).
-		var sm := twin as StandardMaterial3D
+		# Shader-off path: the shared StandardMaterial carries the opaque-queue alpha-test (headless/FLAT parity).
+		var sm := shared as StandardMaterial3D
 		_ok(sm != null and sm.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
 			and is_equal_approx(sm.alpha_scissor_threshold, CubeSphere.LEAF_SCISSOR),
-			"G-LEAF-MAT: shader-off twin is a StandardMaterial ALPHA_SCISSOR clone at LEAF_SCISSOR")
+			"G-LEAF-SHARED: shader-off shared material is ALPHA_SCISSOR at LEAF_SCISSOR")
 
-# ---------- G-LEAF-SHADE: the twin shades through voxi_shade + the sun_dir/planet_centre feed reaches it ----------
+# ---------- G-LEAF-SHADE: the shared material shades through voxi_shade + the sun_dir/planet_centre feed reaches it ----------
 func _gate_shade(mod: Node3D, atlas) -> void:
-	print("  --- G-LEAF-SHADE: the twin carries voxi_shade + the sun_dir/planet_centre uniform feed reaches it ---")
-	var twin: Object = atlas.leaf_material
-	if not (twin is ShaderMaterial):
-		_ok(false, "G-LEAF-SHADE: twin is not a ShaderMaterial (needs FP_NEAR_DAYLIGHT for the shaded path)")
+	print("  --- G-LEAF-SHADE: the shared material carries voxi_shade + the sun_dir/planet_centre uniform feed reaches it ---")
+	var shared: Object = atlas.material
+	if not (shared is ShaderMaterial):
+		_ok(false, "G-LEAF-SHADE: shared material is not a ShaderMaterial (needs FP_NEAR_DAYLIGHT for the shaded path)")
 		return
-	var sm := twin as ShaderMaterial
+	var sm := shared as ShaderMaterial
 	_ok(((sm.shader as Shader).code).contains("voxi_shade"),
-		"G-LEAF-SHADE: the twin shader contains voxi_shade (FP_SHADE_UNIFIED terminator composition)")
-	# Push a distinctive Sun + planet centre through the SAME module→atlas feed the live frame uses; read it back off the twin.
+		"G-LEAF-SHADE: the shared shader contains voxi_shade (FP_SHADE_UNIFIED terminator composition)")
+	# Push a distinctive Sun + planet centre through the SAME module→atlas feed the live frame uses; read it back off it.
 	var sun := Vector3(0.0, 1.0, 0.0)
 	var centre := Vector3(12.0, -34.0, 56.0)
 	mod.call("set_near_daylight_sun_dir", sun)
 	mod.call("set_near_daylight_planet_centre", centre)
 	_ok(_vec_close(sm.get_shader_parameter("sun_dir"), sun),
-		"G-LEAF-SHADE: set_near_daylight_sun_dir reaches the twin's sun_dir uniform")
+		"G-LEAF-SHADE: set_near_daylight_sun_dir reaches the shared sun_dir uniform")
 	_ok(_vec_close(sm.get_shader_parameter("planet_centre"), centre),
-		"G-LEAF-SHADE: set_near_daylight_planet_centre reaches the twin's planet_centre uniform")
+		"G-LEAF-SHADE: set_near_daylight_planet_centre reaches the shared planet_centre uniform")
 
 # ---------- helpers ----------
 func _cell_min_alpha(atlas, cell: Vector2i) -> int:

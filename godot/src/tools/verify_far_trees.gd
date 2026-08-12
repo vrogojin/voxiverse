@@ -56,6 +56,21 @@ func _initialize() -> void:
 		_gate_ledger()
 		_gate_noprotrude()
 		_gate_sunweld()
+		# G-FT-FADE-OFF (two-state, runs in EVERY ON invocation): the dither DISCARD is spliced into the shaders IFF
+		# FP_FAR_TREES_FADE — so with FADE off the card/mesh shaders are the merged P0/P1 strings verbatim (byte-
+		# identical), and the P0/P1 gates below stay 28/28. The complement (present under FADE) is the P2 splice.
+		_ok(FT.shader_code().contains("_ft_dither") == CubeSphere.FP_FAR_TREES_FADE
+			and FT.mesh_shader_code().contains("_ft_dither") == CubeSphere.FP_FAR_TREES_FADE,
+			"G-FT-FADE-OFF: shader dither present IFF FP_FAR_TREES_FADE (off ⇒ P0/P1 shaders byte-identical)")
+		# G-FT-SNOW-OFF (two-state): the snow-tint splice is present in both shaders IFF FP_FAR_TREES_SNOW, so with
+		# SNOW off the shaders (and record col field) are the merged P0/P1/P2 forms verbatim (byte-identical).
+		_ok(FT.shader_code().contains("snow_tint") == CubeSphere.FP_FAR_TREES_SNOW
+			and FT.mesh_shader_code().contains("snow_tint") == CubeSphere.FP_FAR_TREES_SNOW,
+			"G-FT-SNOW-OFF: shader snow-tint present IFF FP_FAR_TREES_SNOW (off ⇒ P0/P1/P2 shaders byte-identical)")
+		if CubeSphere.FP_FAR_TREES_SNOW:
+			_gate_snow()
+		else:
+			print("  (P3 snow gates skipped — need FP_FAR_TREES_SNOW sed-toggled true)")
 		if CubeSphere.FP_FAR_TREES_MESH:
 			_gate_mesh()                                  # P1 assertions (bijection/ledger/handoff/noprotrude)
 		else:
@@ -170,7 +185,7 @@ func _gate_placement() -> void:
 			exp_cols[sp - 1] = int(exp_cols.get(sp - 1, 0)) + 1
 		var got_cols := {}
 		for i in range(m):
-			var col := int(recs[i * FT.REC_FLOATS + 6])
+			var col := int(recs[i * FT.REC_FLOATS + 6]) & 7   # mask the P3 snow bit (bit 3) — species is the low 3 bits
 			got_cols[col] = int(got_cols.get(col, 0)) + 1
 		if got_cols != exp_cols:
 			species_ok = false
@@ -489,4 +504,44 @@ func _gate_fade() -> void:
 	var c_one: int = tier.live_instances() + tier.mesh_live_instances()
 	_ok((not found) or c_one < c_none, "G-FT-FADE-CHOP: chopping ONE tree removes exactly that far instance (%d → %d)" % [c_none, c_one])
 	tier.set_chop_query(Callable())
+	ring.queue_free()
+
+# ---- G-FT-SNOW (P3) ------------------------------------------------------------------------------------------------
+
+func _gate_snow() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	var k := FA.K
+	# Scan a spread across all 6 faces (incl. the polar faces) to catch BOTH cold (snow) + warm columns.
+	var scan: Array = []
+	for face in range(6):
+		for a in [k / 4, k / 2, 3 * k / 4]:
+			for b in [k / 4, k / 2, 3 * k / 4]:
+				scan.append(face * k * k + a * k + b)
+	var eq_ok := true
+	var snow_found := 0
+	var bare_found := 0
+	for fid in scan:
+		var ctx = TerrainConfig.GenCtx.new(0, int(fid))
+		var recs: PackedFloat32Array = tier.enumerate_facet_sync(int(fid))
+		var m := recs.size() / FT.REC_FLOATS
+		for i in range(m):
+			var o := i * FT.REC_FLOATS
+			var snow_flag := (int(recs[o + 6]) & 8) != 0
+			var bx := int(recs[o + 8]); var gy := int(recs[o + 9]); var bz := int(recs[o + 10])
+			# The independent FarPalette snow-line predicate (the SAME columns the near/far skin snow-caps).
+			var t_col: float = TerrainConfig.column_profile(bx, bz, ctx).w
+			var pred := gy >= TerrainConfig.SEA_LEVEL and ClimateModel.surface_temperature(gy, t_col) < 0.0
+			if snow_flag != pred:
+				eq_ok = false
+			if snow_flag: snow_found += 1
+			else: bare_found += 1
+	_ok(eq_ok, "G-FT-SNOW-FIRES: snow flag == FarPalette snow-line predicate for EVERY far tree (same columns as near)")
+	_ok(snow_found > 0, "G-FT-SNOW-FIRES: cold-column far trees ARE snow-dusted (%d found)" % snow_found)
+	_ok(bare_found > 0, "G-FT-SNOW-FIRES: warm-column far trees are NOT snow-dusted (%d found)" % bare_found)
+	# G-FT-SNOW-LEDGER: the snow variant is a per-instance shader lerp (no snow atlas region) → ~0 added resident
+	# bytes; total_bytes stays under the 4 MB ledger.
+	var b := tier.total_bytes()
+	_ok(b <= CubeSphere.FAR_TREES_BYTES_MAX, "G-FT-SNOW-LEDGER: total_bytes %d <= FAR_TREES_BYTES_MAX %d (snow adds ~0 — shader lerp, no atlas region)" % [b, CubeSphere.FAR_TREES_BYTES_MAX])
 	ring.queue_free()

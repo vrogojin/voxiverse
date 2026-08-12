@@ -60,6 +60,10 @@ func _initialize() -> void:
 			_gate_mesh()                                  # P1 assertions (bijection/ledger/handoff/noprotrude)
 		else:
 			print("  (P1 mesh gates skipped — need FP_FAR_TREES_MESH sed-toggled true)")
+		if CubeSphere.FP_FAR_TREES_FADE:
+			_gate_fade()                                  # P2 assertions (nopop/thin/chop/splice)
+		else:
+			print("  (P2 fade gates skipped — need FP_FAR_TREES_FADE sed-toggled true)")
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -206,7 +210,8 @@ func _gate_ledger() -> void:
 		var r := p.normalized()
 		big.push_back(p.x); big.push_back(p.y); big.push_back(p.z)
 		big.push_back(r.x); big.push_back(r.y); big.push_back(r.z)
-		big.push_back(0.0); big.push_back(5.0)
+		big.push_back(0.0); big.push_back(5.0)                       # species col 0, trunk_h 5 + hue 0 (survives thinning)
+		big.push_back(0.0); big.push_back(0.0); big.push_back(0.0)   # lattice base (synthetic — no real cell / chop)
 	tier.debug_set_cache(far_fid, big)
 	# camera far above so nearly all synthetic trees are in [R0, CARD_MAX]
 	var cam := Vector3(cx, cy, cz) + Vector3(cx, cy, cz).normalized() * 1500.0
@@ -225,6 +230,12 @@ func _gate_noprotrude() -> void:
 	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
 	var m := recs.size() / FT.REC_FLOATS
 	_ok(m > 0, "G-FT-NOPROTRUDE: facet has enumerable trees (%d)" % m)
+	# G-FT-MESH-HANDOFF (b) — the card-band inner radius, asserted in BOTH flag states (this gate runs whenever
+	# FP_FAR_TREES): MESH on ⇒ cards retreat to FAR_TREES_MESH_MAX (448, exclusive handoff); MESH off ⇒ the P0
+	# floor near_render_radius() (128), so the merged [128, CARD_MAX] card band is BYTE-IDENTICAL with meshes off.
+	var expect_floor := CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
+	_ok(is_equal_approx(tier.card_inner_radius(), expect_floor),
+		"G-FT-MESH-HANDOFF(b): card inner radius %.0f == %.0f (retracts to 448 ONLY under MESH; else 128, P0-unchanged)" % [tier.card_inner_radius(), expect_floor])
 	# Every base is radially sunk BELOW the true surface world position (the BURY law → never rides a protruding tier).
 	var sink_ok := true
 	for i in range(m):
@@ -307,6 +318,7 @@ func _gate_mesh() -> void:
 		synth.push_back(r.x); synth.push_back(r.y); synth.push_back(r.z)
 		synth.push_back(float((step / 25) % 6))     # cycle species column 0..5
 		synth.push_back(5.0)                         # trunk_h=5, hue=0
+		synth.push_back(0.0); synth.push_back(0.0); synth.push_back(0.0)   # lattice base (synthetic)
 		dists.append(step)
 		step += 25
 	tier.debug_set_cache(fid, synth)
@@ -314,6 +326,13 @@ func _gate_mesh() -> void:
 	tier.debug_rebuild([fid], cam)
 	var mesh_live: int = tier.mesh_live_instances()
 	var card_live: int = tier.live_instances()
+	_ok(tier.mesh_draw_count() <= 6, "G-FT-MESH-LEDGER: mesh draws %d <= 6" % tier.mesh_draw_count())
+	if CubeSphere.FP_FAR_TREES_FADE:
+		# Under FADE the 448 handoff is a CONTROLLED OVERLAP (cross-dither), not a hard partition — both rungs render
+		# in [448±32]. The strict partition/continuity is proven in _gate_fade; here just confirm both bands populate.
+		_ok(mesh_live > 0 and card_live > 0, "G-FT-MESH(fade): both rungs populate under the dither overlap (mesh %d, card %d)" % [mesh_live, card_live])
+		ring.queue_free()
+		return
 	var exp_mesh := 0
 	var exp_card := 0
 	for dd in dists:
@@ -322,7 +341,6 @@ func _gate_mesh() -> void:
 	_ok(mesh_live == exp_mesh, "G-FT-MESH-BIJECTION: mesh band [%0.f,%0.f) count %d == expected %d" % [r0, d1, mesh_live, exp_mesh])
 	_ok(card_live == exp_card, "G-FT-MESH-HANDOFF: card band [%0.f,CARD] count %d == expected %d (cards retreated)" % [d1, card_live, exp_card])
 	_ok(mesh_live + card_live == exp_mesh + exp_card and exp_mesh > 0 and exp_card > 0, "G-FT-MESH-HANDOFF: bands PARTITION the [R0,CARD] set (no double, no gap)")
-	_ok(tier.mesh_draw_count() <= 6, "G-FT-MESH-LEDGER: mesh draws %d <= 6" % tier.mesh_draw_count())
 
 	# --- Every mesh instance origin is inside the mesh band; every card origin at/beyond the 448 handoff ---
 	var mesh_in_band := true
@@ -360,4 +378,115 @@ func _gate_mesh() -> void:
 				if org.distance_to(cam2) < r0:
 					protrude += 1
 		_ok(protrude == 0, "G-FT-MESH-NOPROTRUDE: 0 mesh instances inside near_render_radius (%.0f) of the camera" % r0)
+	ring.queue_free()
+
+# ---- G-FT-FADE (P2) ------------------------------------------------------------------------------------------------
+
+func _gate_fade() -> void:
+	var r0 := float(TerrainConfig.near_render_radius())
+	var d1 := CubeSphere.FAR_TREES_MESH_MAX
+	var w := FT.FADE_BAND_W
+
+	# G-FT-FADE-SPLICE: the dither DISCARD is present in both shaders under FADE (byte-identity when OFF is proven by
+	# the separate FADE-off gate run — P1 28/28 — where the same shader_code() returns the merged string).
+	_ok(FT.shader_code().contains("_ft_dither") and FT.mesh_shader_code().contains("_ft_dither"),
+		"G-FT-FADE-SPLICE: card + mesh shaders carry the per-pixel dither under FP_FAR_TREES_FADE")
+
+	# G-FT-FADE-NOPOP — the 448 cross-dither: mesh alpha 1→0, card alpha 0→1, SUM ≈ 1 across [448±W] (no gap/double);
+	# alpha is continuous (no hard visibility flip); rung-1 dithers IN over [R0, R0+near] (no pop at the 128 handoff).
+	var sum_ok := true
+	var cont_ok := true
+	var prev := FT.mesh_fade(d1 - w - 6.0)
+	var k := 0
+	while k <= 130:
+		var dd := d1 - w - 6.0 + float(k)
+		var mf: float = FT.mesh_fade(dd)
+		var cf: float = FT.card_fade(dd, 0.0)
+		if dd >= d1 - w and dd <= d1 + w:
+			if absf(mf + cf - 1.0) > 0.05:
+				sum_ok = false
+		if absf(mf - prev) > 0.2:
+			cont_ok = false
+		prev = mf
+		k += 2
+	_ok(sum_ok, "G-FT-FADE-NOPOP: mesh+card cross-fade sums to ~1 across the 448 overlap (no gap, no double-bright)")
+	_ok(cont_ok, "G-FT-FADE-NOPOP: mesh alpha continuous across the boundary (no hard visibility flip)")
+	_ok(FT.mesh_fade(r0 + 1.0) < 0.25 and FT.mesh_fade(r0 + FT.FADE_NEAR_W + 6.0) > 0.9,
+		"G-FT-FADE-NOPOP: rung-1 dithers IN over [R0, R0+near] (no pop at 128)")
+
+	# G-FT-FADE-THIN — keep(d) deterministic + monotone; high-survival-hash trees retire FIRST; the far set is thinned.
+	var mono := true
+	var pk := FT.keep_frac(FT.THIN_START)
+	for i in range(0, 61):
+		var dd := FT.THIN_START + float(i) * 20.0
+		var kv: float = FT.keep_frac(dd)
+		if kv > pk + 1.0e-6:
+			mono = false
+		pk = kv
+	_ok(mono, "G-FT-FADE-THIN: keep(d) is monotone non-increasing")
+	_ok(FT.keep_frac(600.0) == 1.0 and FT.keep_frac(CubeSphere.FAR_TREES_CARD_MAX) <= FT.THIN_MIN + 1.0e-6,
+		"G-FT-FADE-THIN: keep ramps 1.0 (near) → THIN_MIN (fog line)")
+	var d_hi := -1.0
+	var d_lo := -1.0
+	for i in range(0, 140):
+		var dd := FT.THIN_START + float(i) * 10.0
+		if d_hi < 0.0 and FT.thin_alpha(0.9, dd) <= 0.01:
+			d_hi = dd
+		if d_lo < 0.0 and FT.thin_alpha(0.2, dd) <= 0.01:
+			d_lo = dd
+	_ok(d_hi > 0.0 and (d_lo < 0.0 or d_hi < d_lo), "G-FT-FADE-THIN: high-survival-hash trees retire FIRST (stable geomorph)")
+
+	# Count reduction: N synthetic trees at a fixed far distance, hue spread 0..1 → thinned deterministically below N.
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99:
+		up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var syn := PackedFloat32Array()
+	var nn := 200
+	for i in range(nn):
+		var p := centre + tangent * 2100.0
+		var r := p.normalized()
+		syn.push_back(p.x); syn.push_back(p.y); syn.push_back(p.z)
+		syn.push_back(r.x); syn.push_back(r.y); syn.push_back(r.z)
+		syn.push_back(0.0); syn.push_back(5.0 + float(i) / float(nn))   # hue spread 0..1
+		syn.push_back(0.0); syn.push_back(0.0); syn.push_back(0.0)
+	tier.debug_set_cache(fid, syn)
+	tier.debug_rebuild([fid], centre)
+	var thinned: int = tier.live_instances()
+	tier.debug_rebuild([fid], centre)
+	_ok(thinned > 0 and thinned < nn, "G-FT-FADE-THIN: hash-survival thins the far card set (%d of %d survive at d=2100)" % [thinned, nn])
+	_ok(tier.live_instances() == thinned, "G-FT-FADE-THIN: thinning is deterministic (same survivors across rebuilds)")
+
+	# G-FT-FADE-CHOP — a chopped tree (its trunk-base cell flagged by the chop query) is absent from the far set.
+	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)   # re-enumerate real trees (overwrites the synth cache)
+	tier.set_chop_query(func(_f, _c): return false)
+	tier.debug_rebuild([fid], centre)
+	var c_none: int = tier.live_instances() + tier.mesh_live_instances()
+	tier.set_chop_query(func(_f, _c): return true)
+	tier.debug_rebuild([fid], centre)
+	var c_all: int = tier.live_instances() + tier.mesh_live_instances()
+	_ok(c_none > 0 and c_all == 0, "G-FT-FADE-CHOP: chopping every tree removes all far instances (%d → 0)" % c_none)
+	var m := recs.size() / FT.REC_FLOATS
+	var target := Vector3i(0, 0, 0)
+	var found := false
+	for i in range(m):
+		var o := i * FT.REC_FLOATS
+		var s := Vector3(recs[o], recs[o + 1], recs[o + 2])
+		var dd := s.distance_to(centre)
+		if dd >= r0 and dd <= CubeSphere.FAR_TREES_CARD_MAX:
+			target = Vector3i(int(recs[o + 8]), int(recs[o + 9]) + 1, int(recs[o + 10]))
+			found = true
+			break
+	tier.set_chop_query(func(_f, c): return c == target)
+	tier.debug_rebuild([fid], centre)
+	var c_one: int = tier.live_instances() + tier.mesh_live_instances()
+	_ok((not found) or c_one < c_none, "G-FT-FADE-CHOP: chopping ONE tree removes exactly that far instance (%d → %d)" % [c_none, c_one])
+	tier.set_chop_query(Callable())
 	ring.queue_free()

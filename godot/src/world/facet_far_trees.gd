@@ -163,9 +163,24 @@ void fragment() {
 }
 "
 
+## P3 (FP_FAR_TREES_SNOW) snow-tint header — a `snow_tint` uniform (the far-skin snow colour) the SNOW splice lerps
+## the canopy toward. Injected only under the flag (byte-identical off).
+const _SNOW_HEAD := "uniform vec3 snow_tint = vec3(0.90, 0.93, 0.97);
+uniform float snow_amt = 0.6;
+"
+
 static func shader_code() -> String:
 	var tail := _CARD_TAIL_FADE if CubeSphere.FP_FAR_TREES_FADE else _CARD_TAIL
-	return _CARD_HEAD + VoxiLight.shade_glsl() + tail
+	var head := _CARD_HEAD
+	if CubeSphere.FP_FAR_TREES_SNOW:
+		# Cards are ≤ a few px at their band; the trunk is sub-pixel, so lerp the whole card texel toward snow_tint
+		# by the per-instance snow flag (INSTANCE_CUSTOM.z). Off ⇒ no snow uniform / no lerp (byte-identical).
+		head += _SNOW_HEAD
+		tail = tail.replace("varying float v_hue;", "varying float v_hue;\nvarying float v_snow;")
+		tail = tail.replace("v_hue = INSTANCE_CUSTOM.y;", "v_hue = INSTANCE_CUSTOM.y;\n\tv_snow = INSTANCE_CUSTOM.z;")
+		tail = tail.replace("ALBEDO = t.rgb * voxi_shade(v_n, sun_dir) * jit;",
+			"ALBEDO = mix(t.rgb, snow_tint, v_snow * snow_amt) * voxi_shade(v_n, sun_dir) * jit;")
+	return head + VoxiLight.shade_glsl() + tail
 
 static func make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -177,6 +192,9 @@ static func make_material() -> ShaderMaterial:
 	sm.set_shader_parameter("sun_dir", seed)
 	sm.set_shader_parameter("atlas_cols", float(ATLAS_COLS))
 	sm.set_shader_parameter("atlas_rows", float(ATLAS_ROWS))
+	if CubeSphere.FP_FAR_TREES_SNOW:
+		var sc := BlockCatalog.color_of(BlockCatalog.id_of(&"snow_block"))
+		sm.set_shader_parameter("snow_tint", Vector3(sc.r, sc.g, sc.b))
 	# Unified: the ONE uniform set (values from VoxiLight — night_floor 0.06 == SHELL_NIGHT_FLOOR, moonshine floor).
 	if CubeSphere.FP_SHADE_UNIFIED:
 		sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
@@ -239,7 +257,16 @@ void fragment() {
 
 static func mesh_shader_code() -> String:
 	var tail := _MESH_TAIL_FADE if CubeSphere.FP_FAR_TREES_FADE else _MESH_TAIL
-	return _MESH_HEAD + VoxiLight.shade_glsl() + tail
+	var head := _MESH_HEAD
+	if CubeSphere.FP_FAR_TREES_SNOW:
+		# The snow flag packs into the hue slot (INSTANCE_CUSTOM.y = hue + 2·snow); decode it, then lerp ONLY the
+		# canopy verts (UV2.x flag == 1) toward snow_tint — snow dusts the leaves, not the trunk. Off ⇒ verbatim.
+		head += _SNOW_HEAD
+		tail = tail.replace("float jit = 1.0 + (INSTANCE_CUSTOM.y - 0.5) * 0.08;",
+			"float _sn = step(1.5, INSTANCE_CUSTOM.y);\n\tfloat _hue = fract(INSTANCE_CUSTOM.y);\n\tfloat jit = 1.0 + (_hue - 0.5) * 0.08;")
+		tail = tail.replace("v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir) * jit, 1.0);",
+			"vec3 _alb = mix(COLOR.rgb, snow_tint, _sn * snow_amt * flag);\n\tv_col = vec4(_alb * voxi_shade(n, sun_dir) * jit, 1.0);")
+	return head + VoxiLight.shade_glsl() + tail
 
 static func make_mesh_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -252,6 +279,9 @@ static func make_mesh_material() -> ShaderMaterial:
 		sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
 		sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
 		sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+	if CubeSphere.FP_FAR_TREES_SNOW:
+		var sc := BlockCatalog.color_of(BlockCatalog.id_of(&"snow_block"))
+		sm.set_shader_parameter("snow_tint", Vector3(sc.r, sc.g, sc.b))
 	return sm
 
 # =====================================================================================================================
@@ -478,9 +508,18 @@ func _enum_worker(fid: int) -> void:
 			var species := int(info["species"])
 			var trunk_h := int(info["trunk_h"])
 			var hue := _hue01(gx, gz)
+			# P3 (FP_FAR_TREES_SNOW): the snow-dusted canopy fires on the EXACT far-skin snow-line predicate
+			# (FarPalette.color_for / _snow_depth: g >= SEA_LEVEL AND ClimateModel.surface_temperature(g, t) < 0),
+			# t = the column's climate temperature (column_profile.w) — so the far snow variant selects the SAME
+			# columns the near voxel trees + terrain snow-cap. Gated on the flag ⇒ 0 with SNOW off (byte-identical).
+			var snow := 0
+			if CubeSphere.FP_FAR_TREES_SNOW and base.y >= TerrainConfig.SEA_LEVEL:
+				var t_col := TerrainConfig.column_profile(base.x, base.z, ctx).w
+				if ClimateModel.surface_temperature(base.y, t_col) < 0.0:
+					snow = 1
 			recs.push_back(sx); recs.push_back(sy); recs.push_back(sz)
 			recs.push_back(rx); recs.push_back(ry); recs.push_back(rz)
-			recs.push_back(float(species - 1))                     # species enum 1..6 → atlas column 0..5
+			recs.push_back(float((species - 1) | (snow << 3)))     # low 3 bits = atlas column 0..5; bit 3 = snow flag
 			recs.push_back(float(trunk_h) + hue)                    # floor = trunk_h, frac = hue jitter phase
 			# Lattice base cell (bx, gy, bz) — the P2 edit-overlay chop filter matches the trunk-base cell (bx, gy+1, bz)
 			# against WorldManager._edits via FacetAtlas.edit_key(fid, cell) at rebuild time (current edits, main thread).
@@ -596,9 +635,11 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
 				continue
 			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
-			var col: float = recs[o + 6]
-			# .w carries the dither alpha under FADE; 0.0 (byte-identical with the merged P0/P1) when off.
-			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0)
+			var raw := int(recs[o + 6])
+			var col := float(raw & 7)                     # low 3 bits = species atlas column
+			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
+			# .w carries the dither alpha under FADE (0.0 off); .z carries the snow flag (0.0 off) — byte-identical.
+			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow)
 			n += 1
 	_mm.set_buffer(buf)
 	_mm.visible_instance_count = n
@@ -612,7 +653,7 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 ## origin at the sunk base; custom data = (species_col, hue, 0, fade). `fade` is the dither alpha (1.0 = fully in;
 ## always 1.0 with FP_FAR_TREES_FADE off → byte-identical). Buffer = TRANSFORM_3D's 12 floats + the 4 custom floats.
 func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float, fade := 1.0) -> void:
+		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float, fade := 1.0, snow := 0.0) -> void:
 	var r := Vector3(rx, ry, rz)
 	# stable tangent basis from the radial (avoid the world-up degeneracy near the poles)
 	var up := Vector3(0.0, 1.0, 0.0)
@@ -629,7 +670,7 @@ func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: f
 	buf[base + 0] = bx.x; buf[base + 1] = by.x; buf[base + 2] = bz.x; buf[base + 3] = sx
 	buf[base + 4] = bx.y; buf[base + 5] = by.y; buf[base + 6] = bz.y; buf[base + 7] = sy
 	buf[base + 8] = bx.z; buf[base + 9] = by.z; buf[base + 10] = bz.z; buf[base + 11] = sz
-	buf[base + 12] = col; buf[base + 13] = hue; buf[base + 14] = 0.0; buf[base + 15] = fade
+	buf[base + 12] = col; buf[base + 13] = hue; buf[base + 14] = snow; buf[base + 15] = fade
 
 # --- P1 rung-1 mesh band rebuild ------------------------------------------------------------------------------------
 
@@ -677,7 +718,9 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 					continue                  # fully faded out past the 448 cross-dither → drop
 			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
 				continue                      # chopped tree never reappears as a far mesh
-			var col := int(recs[o + 6])
+			var raw := int(recs[o + 6])
+			var col := raw & 7                # low 3 bits = species; bit 3 = P3 snow flag
+			var snow := 1.0 if (raw & 8) != 0 else 0.0
 			if col < 0 or col >= N_SPECIES:
 				continue
 			if counts[col] >= per_cap:
@@ -688,7 +731,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
 			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
-			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0)
+			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow)
 			counts[col] += 1
 			total += 1
 	for c in range(N_SPECIES):
@@ -705,7 +748,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 ## the mesh is authored in blocks), origin at the sunk base; custom = (delta=trunk_h−arch, hue, arch_trunk, 0) for
 ## the shader's per-tree trunk-stretch. Same 12-transform-then-4-custom buffer layout as the cards.
 func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float, fade := 0.0) -> void:
+		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float, fade := 0.0, snow := 0.0) -> void:
 	var r := Vector3(rx, ry, rz)
 	var up := Vector3(0.0, 1.0, 0.0)
 	if absf(r.dot(up)) > 0.99:
@@ -715,8 +758,10 @@ func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, 
 	buf[base + 0] = t1.x; buf[base + 1] = r.x; buf[base + 2] = t2.x; buf[base + 3] = sx
 	buf[base + 4] = t1.y; buf[base + 5] = r.y; buf[base + 6] = t2.y; buf[base + 7] = sy
 	buf[base + 8] = t1.z; buf[base + 9] = r.z; buf[base + 10] = t2.z; buf[base + 11] = sz
-	# .w carries the dither alpha under FADE; 0.0 (byte-identical with the merged P1) when off.
-	buf[base + 12] = delta; buf[base + 13] = hue; buf[base + 14] = arch; buf[base + 15] = fade
+	# .w carries the dither alpha under FADE (0.0 off). The snow flag (P3) has no spare custom slot, so it packs into
+	# the hue slot: y = hue + 2·snow (hue ∈ [0,1) so the SNOW shader reads snow = step(1.5,y), hue = fract(y)). SNOW
+	# off ⇒ snow 0 ⇒ y = hue (byte-identical with the merged P1/P2).
+	buf[base + 12] = delta; buf[base + 13] = hue + 2.0 * snow; buf[base + 14] = arch; buf[base + 15] = fade
 
 ## Build ONE species' archetype ArrayMesh from its `TreeGen.archetype_cells` cube set: exposed-face voxel meshing
 ## (internal faces between two solid cells culled). Per-vertex COLOR from BlockCatalog.color_of; UV2.x flag = 0 for

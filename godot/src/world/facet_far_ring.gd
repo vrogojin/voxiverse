@@ -129,6 +129,13 @@ var _applied_r := 0.0
 # The FROZEN copy snapshotted in `_dispatch_async_rebuild` (mirrors `_async_unsink_col`) — the worker's
 # `_emit_cached(..., from_worker=true)` reads ONLY this, never the live scalar. 0.0 with the flag off (never read).
 var _async_applied_r := 0.0
+# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): the LOADABLE row band (meshed_band_y) that let the applied ladder
+# live. `.y` = band top — a backstop vertex is zone-C-eligible (sunk cover) ONLY if its TRUE surface ≤ band_top−1
+# (above that the engine genuinely hasn't loaded near blocks, so sinking would reopen see-through ⇒ it stays zone B).
+# Default (0, 1e9) ⇒ applied_top 1e9 ⇒ the height gate is vacuous (byte-identical off the flag). `_async_*` is the
+# FROZEN worker copy (mirrors `_async_applied_r`), snapshotted in `_dispatch_async_rebuild`.
+var _applied_band: Vector2 = Vector2(0.0, 1.0e9)
+var _async_applied_band: Vector2 = Vector2(0.0, 1.0e9)
 # §3 P3: the player column the CURRENTLY RESIDENT S2 tiles were last baked against + whether a baseline exists yet
 # (`_rim_assign`'s RIM_REBUILD_BLOCKS cadence gate). Unused with the flag off.
 var _rim_baked_col: Vector3 = Vector3.ZERO
@@ -234,6 +241,11 @@ var _bcol_cache: Dictionary = {}
 # must never be conflated. Built lazily (on demand, per backstop fid) by `_ensure_backstop_true_cached`; colour is
 # unneeded (reuses `_bcol_cache`). Reaped alongside `_bpos_cache` in `_reap_mid_dense`. Empty with the flag off.
 var _btrue_cache: Dictionary = {}    # fid -> PackedVector3Array (dense, ABSOLUTE, TRUE height, never sunk)
+# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): fid -> PackedFloat32Array, the per-node TRUE surface lattice
+# height (g = profile.x) paired 1:1 with `_btrue_cache[fid]`'s positions — the height-band zone-C gate reads it to
+# decide whether a vertex's near mesh is loaded (surface ≤ band top) before it may sink. Built lazily by
+# `_ensure_btrue_h_cached`, ONLY under the flag; reaped alongside `_btrue_cache`. Empty with the flag off. ~1.2 KB/fid.
+var _btrue_h_cache: Dictionary = {}
 # COSMOS PLANET-VIEW §3 (B) — FP_FARRING_LIMB_DENSE. `_limb_set` is the FROZEN silhouette-ring set (fid -> true) for the
 # CURRENT mesh build — facets straddling the horizon tangent, emitted at LIMB_DENSE_CELLS instead of CELLS=4. It is
 # recomputed on the MAIN thread at each rebuild / async dispatch (freeze contract like `_async_backstop`) so the worker
@@ -337,6 +349,12 @@ var _cull_cover_query: Callable = Callable()
 # ⇒ the remainder cannot be proven ⇒ `_applied_box_meshed` returns false (shipped no-over-claim convention). Off ⇒
 # unused (the flag-off body never reaches the remainder branch) → byte-identical.
 var _seam_cover_query: Callable = Callable()
+# COSMOS-FAR-NEAR-MESA §3.1 (FP_APPLIED_VIEW_BAND): the loadable-row-band query, routed by WorldManager to
+# module_world.meshed_band_y. Signature (ly: float) -> Vector2 (voxel band [lo, hi) the engine can stream around the
+# viewer's row). Consulted ONLY under the flag, in `_applied_box_meshed_slab` (vertical band clamp) + `_applied_probe_
+# step` (record the band for the zone-C height gate). INVALID (no module / fallback) ⇒ the band clamp is skipped ⇒ the
+# flag path is inert (shipped #113 probe). Off ⇒ never read → byte-identical.
+var _band_query: Callable = Callable()
 var _cull_mask: Dictionary = {}          # fid -> PackedByteArray(BACKSTOP_CELLS²): LIVE 1 = culled (confirmed covered)
 var _committed_cull: Dictionary = {}     # fid -> PackedByteArray(BACKSTOP_CELLS²): what the CURRENT mesh emits (read by is_cell_culled)
 var _cull_streak: Dictionary = {}        # fid -> PackedByteArray(BACKSTOP_CELLS²): consecutive covered-read count
@@ -1639,6 +1657,16 @@ func _applied_box_meshed_slab(r: float, h: float, lx: float, ly: float, lz: floa
 	var slab: Vector2 = TerrainConfig.meshed_slab_y()
 	var ylo := maxf(ly - h, slab.x)
 	var yhi := minf(ly + h, slab.y)
+	# COSMOS-FAR-NEAR-MESA §3.2 (FP_APPLIED_VIEW_BAND): the slab is what a terrain CAN mesh, but the engine only streams
+	# the mesh-block rows [c−4, c+3] around the viewer's row — the FULL slab loads only for player y∈[32,95]. Clamp the
+	# vertical probe ALSO to the viewer row window (meshed_band_y) so the ladder is SATISFIABLE at any player height /
+	# view distance (fixing the mesa c=0 dead-latch). Horizontal is deliberately NOT band-clamped (that would over-claim
+	# under an unclamped radius); the height-banded zone C (§3.3) compensates the un-probed band. Invalid query ⇒ skip
+	# (inert). Off ⇒ this block is never reached ⇒ byte-identical #113 probe.
+	if CubeSphere.FP_APPLIED_VIEW_BAND and _band_query.is_valid():
+		var band: Vector2 = _band_query.call(ly)
+		ylo = maxf(ylo, band.x)
+		yhi = minf(yhi, band.y)
 	if yhi <= ylo:
 		return false
 	# (2) Horizontal: intersect [l±r] with the active facet's domain ±2 (what this terrain is bounds-clamped to).
@@ -1704,6 +1732,16 @@ func _applied_probe_step(on := TierPlace.applied_cover_on(), params: Vector3 = T
 			_applied_r = next_r                           # grow exactly one step
 	if _applied_r != before:
 		_pending = true
+	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): record the loadable row band that let the ladder live — the
+	# zone-C height gate (§3.3) may sink only vertices whose TRUE surface ≤ band top−1, and telemetry (§3.4) reads it.
+	# A LIVE ladder (`_applied_r > 0`) with a valid band query snapshots the real band at the player row; otherwise
+	# fall back to (0, 1e9) so applied_top is vacuous (zone C is empty anyway when `_applied_r`==0). Off ⇒ stays the
+	# (0, 1e9) default ⇒ byte-identical.
+	if CubeSphere.FP_APPLIED_VIEW_BAND and _applied_r > 0.0 and _unsink_have_col and _band_query.is_valid():
+		var l: Array = FacetAtlas.world_to_lattice64(_active_fid, _player_col_abs.x, _player_col_abs.y, _player_col_abs.z)
+		_applied_band = _band_query.call(float(l[1]))
+	else:
+		_applied_band = Vector2(0.0, 1.0e9)
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): the current emit cull axis + cos-threshold. With the camera-set law engaged
 ## (FP_SHELL_CAMERA_SET, driver called) it is [ĉ_abs, cos(θ_emit)]; otherwise the SHIPPED [active-facet normal,
@@ -1892,6 +1930,10 @@ func _dispatch_async_rebuild() -> void:
 	# SAME freeze contract as the pair above (a Vector3+bool/float triple, cheap unconditional copy). 0.0 with the
 	# flag off (never read).
 	_async_applied_r = _applied_r
+	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): freeze the applied band top alongside the radius (SAME freeze
+	# contract) so the worker's `_blend_uncovered` height-gates against the band that was live at dispatch. (0, 1e9)
+	# with the flag off (never read).
+	_async_applied_band = _applied_band
 	# REVISION 5 Stage A (FP_ENV_DEMAND_DISC): frozen for the worker's "have" test. ORBIT keeps its existing law
 	# unchanged (no near field to bound the envelope demand against off-surface), so force it off there.
 	_async_demand_on = CubeSphere.FP_ENV_DEMAND_DISC and not _shell_orbit()
@@ -2457,6 +2499,13 @@ func set_cover_query(q: Callable) -> void:
 func set_seam_cover_query(q: Callable) -> void:
 	_seam_cover_query = q
 
+## COSMOS-FAR-NEAR-MESA §3.1 (FP_APPLIED_VIEW_BAND): wire the loadable-row-band query — routed by WorldManager to
+## module_world.meshed_band_y (the engine viewer-row-window law). Signature (ly: float) -> Vector2. An INVALID callable
+## (no module / GDScript fallback) leaves the applied-cover probe's band clamp skipped ⇒ the flag path is inert. No-op
+## off the flag.
+func set_band_query(q: Callable) -> void:
+	_band_query = q
+
 ## Is the U2 cull active this run? Requires the flag AND a valid coverage callable (module path). Off / no query ⇒ no
 ## cell is ever suppressed and no state is allocated → byte-identical.
 func _cull_on() -> bool:
@@ -2739,6 +2788,7 @@ func _reap_mid_dense(keep: Dictionary) -> void:
 		                      # later re-promotion rebuilds a cheap chord but _emit_cached still reads the ε sink (protrusion)
 		                      # and the warm/count paths think it is converged (stale coverage).
 		_btrue_cache.erase(f)   # FP_FARRING_UNCOVERED_TRUE: reap the true chord alongside the departing dense cache
+		_btrue_h_cache.erase(f)   # FP_APPLIED_VIEW_BAND: reap the paired per-node height cache too (no-op with the flag off)
 
 ## COSMOS TIER-DEPTH-PRIORITY P1 (§5.3): recompute the sticky backstop set on a role-event (set_active / set_pool_excluded
 ## / setup). Make-before-break: the TARGET = active ∪ ring-1 neighbours (the design's set; a facet the player can cross into
@@ -3120,6 +3170,11 @@ func shell_telemetry() -> Dictionary:
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		out["sd_shell"] = _shell_sun_dir_telemetry()
 		out["sd_v2"] = (_smooth_v2.sun_dir_telemetry() if _smooth_v2 != null else Vector3(1.0, 0.0, 0.0))
+	# COSMOS-FAR-NEAR-MESA §3.4 (FP_APPLIED_VIEW_BAND): the loadable band top that let the applied ladder live —
+	# so the next silent re-death of the ladder is readable off live telemetry (alongside sh_applied_r) instead of
+	# costing a third investigation. Off ⇒ the key is never added ⇒ byte-identical for any telemetry consumer.
+	if CubeSphere.FP_APPLIED_VIEW_BAND:
+		out["sh_applied_band"] = _applied_band.y
 	return out
 
 ## COSMOS FS1 gate (G-SHELL-WELD): the horizon (CELLS) ABSOLUTE positions for facet `fid` — warms + returns the cache.
@@ -3312,6 +3367,10 @@ func _ensure_backstop_chord_cached(fid: int) -> void:
 ## the true chord is terrain-invariant so it can never go stale.
 func _ensure_backstop_true_cached(fid: int) -> void:
 	if _btrue_cache.has(fid):
+		# FP_APPLIED_VIEW_BAND: the position cache may have been built before the flag path first ran — ensure the
+		# parallel height cache exists too (byte-off: not called with the flag off).
+		if CubeSphere.FP_APPLIED_VIEW_BAND:
+			_ensure_btrue_h_cached(fid)
 		return
 	var cd := FacetAtlas.facet_corner_dirs(fid)
 	var cells := CubeSphere.BACKSTOP_CELLS
@@ -3323,6 +3382,35 @@ func _ensure_backstop_true_cached(fid: int) -> void:
 			_weld_node(fid, cd, float(gi) / float(cells), float(gj) / float(cells), pos, col)
 	_weld_snap_edges(pos, cells)
 	_btrue_cache[fid] = pos
+	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): build the paired per-node TRUE surface height cache for the
+	# height-banded zone-C gate. Only under the flag (byte-off otherwise).
+	if CubeSphere.FP_APPLIED_VIEW_BAND:
+		_ensure_btrue_h_cached(fid)
+
+## COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): backstop facet `fid`'s per-node TRUE surface lattice height
+## (g = int(profile.x)), paired 1:1 with `_btrue_cache[fid]`'s positions — the height-band zone-C gate reads it to
+## keep a vertex whose surface exceeds the loaded band top in zone B (its near mesh isn't loaded ⇒ sinking would
+## reopen see-through). Byte-for-byte the same weld DIRECTIONS as `_ensure_backstop_true_cached` above (shared corner
+## dirs, same s,t, same profile) so height[i] pairs with position[i]. NOT edge-snapped: an un-snapped (slightly
+## higher) outer-ring height can only push a node OUT of zone C into zone B — draws MORE, never a hole (the
+## never-draws-less invariant, §3.3). Pure CPU + const reads (facet geometry + worldgen profile) ⇒ worker-safe,
+## exactly like `_ensure_backstop_true_cached`. Built lazily, once per fid; ~1.2 KB/fid; reaped with `_btrue_cache`.
+func _ensure_btrue_h_cached(fid: int) -> void:
+	if _btrue_h_cache.has(fid):
+		return
+	var cd := FacetAtlas.facet_corner_dirs(fid)
+	var cells := CubeSphere.BACKSTOP_CELLS
+	var stride := cells + 1
+	var h := PackedFloat32Array()
+	h.resize(stride * stride)
+	var n := 0
+	for gj in range(stride):
+		for gi in range(stride):
+			var d := _weld_unit(cd, float(gi) / float(cells), float(gj) / float(cells))
+			var prof := TerrainConfig.profile_at_dir(d.x, d.y, d.z, FacetAtlas.R_BLOCKS)
+			h[n] = float(int(prof.x))
+			n += 1
+	_btrue_h_cache[fid] = h
 
 ## COSMOS-PALE-BACKSTOP-FIX-DESIGN.md §3.1 — is the ABSOLUTE surface point `surface_pt` OUTSIDE the streamed
 ## VoxelViewer ellipsoid (inflated by UNSINK_MARGIN_BLOCKS on every axis)? `params` = (r, O, H) from
@@ -3357,10 +3445,17 @@ func _uncovered(surface_pt: Vector3, col: Vector3, have_col: bool, params: Vecto
 ## vertical reach does not shrink independently)? `applied_r <= 0` (unprobed / invalid coverage query) ⇒ always
 ## false — zone C is empty, so every vertex the shipped law would call "covered" instead resolves through zone B.
 ## Pure: reads only its arguments — safe on the async worker thread (mirrors `_uncovered`'s purity contract).
-func _applied_covered(surface_pt: Vector3, col: Vector3, applied_r: float, params: Vector3 = TerrainConfig.streamed_ellipsoid_params()) -> bool:
+## COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): `true_h`/`applied_top` add the HEIGHT-BAND soundness gate. The
+## applied ladder now proves coverage only up to the viewer row window's top (band top), not the whole slab — so a
+## vertex whose TRUE surface lattice height exceeds `applied_top − 1` (its near mesh genuinely isn't loaded) is NOT
+## zone-C-eligible and must stay zone B (at-height chord), else sinking it would reopen see-through over a tall wall.
+## Defaults (`true_h = −1e9`, `applied_top = 1e9`) ⇒ the guard is vacuously satisfied ⇒ byte-identical off the flag.
+func _applied_covered(surface_pt: Vector3, col: Vector3, applied_r: float, params: Vector3 = TerrainConfig.streamed_ellipsoid_params(), true_h: float = -1.0e9, applied_top: float = 1.0e9) -> bool:
 	var h := params.z
 	if applied_r <= 0.0 or h <= 0.0:
 		return false
+	if true_h > applied_top - 1.0:
+		return false   # above the loaded band ⇒ near mesh not there ⇒ keep zone B (never sink into an unloaded wall)
 	var cl := col.length()
 	var up := (col / cl) if cl > 0.001 else Vector3.UP
 	var delta := surface_pt - (col + up * params.y)
@@ -3390,16 +3485,22 @@ func _applied_covered(surface_pt: Vector3, col: Vector3, applied_r: float, param
 ## ⇒ zone B everywhere inside the streamed ellipsoid — degraded but correct, never the sunk trench (§3.2).
 func _blend_uncovered(covered_pos: PackedVector3Array, fid: int, col: Vector3, have_col: bool,
 		params: Vector3 = TerrainConfig.streamed_ellipsoid_params(),
-		applied_on := TierPlace.applied_cover_on(), applied_r := 0.0) -> PackedVector3Array:
+		applied_on := TierPlace.applied_cover_on(), applied_r := 0.0, applied_top := 1.0e9) -> PackedVector3Array:
 	_ensure_backstop_true_cached(fid)
 	var tp: PackedVector3Array = _btrue_cache[fid]
+	# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): the paired per-node TRUE surface height for the zone-C height
+	# gate. Empty (flag off / cache not yet built) ⇒ `true_h = −1e9` per vertex ⇒ with the default `applied_top = 1e9`
+	# the gate is vacuous ⇒ byte-identical two/three-zone blend. `_ensure_backstop_true_cached` above already built it
+	# under the flag, so a non-empty `th` pairs 1:1 with `tp`.
+	var th: PackedFloat32Array = _btrue_h_cache.get(fid, PackedFloat32Array())
 	var out := PackedVector3Array()
 	out.resize(covered_pos.size())
 	for i in range(covered_pos.size()):
 		var t: Vector3 = tp[i]
 		if _uncovered(t, col, have_col, params):
 			out[i] = t                                                # zone A — unchanged, byte-preserved
-		elif applied_on and have_col and not _applied_covered(t, col, applied_r, params):
+		elif applied_on and have_col and not _applied_covered(t, col, applied_r, params,
+				(th[i] if i < th.size() else -1.0e9), applied_top):
 			out[i] = t - t.normalized() * TierPlace.ENV_EPS_G          # zone B — TRUE chord minus the z-guard
 		else:
 			out[i] = covered_pos[i]                                   # zone C (or applied_on off) — unchanged
@@ -4025,8 +4126,14 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 			# COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2: the applied-cover radius follows the SAME live/frozen split
 			# as pcol/have_pcol above (the worker reads ONLY the value frozen at dispatch).
 			var papplied: float = _async_applied_r if from_worker else _applied_r
+			# COSMOS-FAR-NEAR-MESA §3.3 (FP_APPLIED_VIEW_BAND): the band top rides the SAME live/frozen split as
+			# papplied/pcol (the worker reads ONLY the value frozen at dispatch). Off ⇒ 1e9 ⇒ the height gate is
+			# vacuous ⇒ byte-identical.
+			var pband_top := 1.0e9
+			if CubeSphere.FP_APPLIED_VIEW_BAND:
+				pband_top = (_async_applied_band.y if from_worker else _applied_band.y)
 			pos = _blend_uncovered(pos, fid, pcol, have_pcol, TerrainConfig.streamed_ellipsoid_params(),
-				TierPlace.applied_cover_on(), papplied)
+				TierPlace.applied_cover_on(), papplied, pband_top)
 		col = _bcol_cache[fid]
 		cells = CubeSphere.BACKSTOP_CELLS
 	elif _is_limb_dense(fid):

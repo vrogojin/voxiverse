@@ -43,7 +43,14 @@ const ATLAS_TILE := 32                 # texels per tile → atlas 256×64 RGBA8
 const CARD_CUSTOM_FLOATS := 4          # MultiMesh custom-data floats/instance (use_colors=false)
 const CARD_XFORM_FLOATS := 12          # TRANSFORM_3D floats/instance
 const CARD_STRIDE := CARD_XFORM_FLOATS + CARD_CUSTOM_FLOATS   # 16 floats/instance (== §6 ledger)
-const REC_FLOATS := 8                  # per-tree cache record: sunk-base(3) radial(3) species_col(1) trunk+hash(1)
+const REC_FLOATS := 11                 # per-tree record: sunk-base(3) radial(3) species_col(1) trunk+hash(1) lattice-base(3)
+# P2 (FP_FAR_TREES_FADE) tuning — all tier-local (no cube_sphere change). Off ⇒ none of these are consulted.
+const FADE_NEAR_W := 24.0              # near→rung1 dither-in width (blocks) over [R0, R0+24] (design §4.2)
+const FADE_BAND_W := 32.0             # rung1↔rung2 cross-dither half-width over [448±32] (design §4.2)
+const THIN_START := 1200.0            # hash-survival thinning begins (blocks) — keep(d) ramps 1.0→THIN_MIN to CARD_MAX
+const THIN_MIN := 0.15                # keep-fraction at the fog line (design §4.2)
+const THIN_FADE := 0.06               # dithered-retirement half-width in the survival-hash domain (no pop as keep(d) crosses hue)
+const FADE_EPS := 0.004               # below this the instance is dropped (fully faded / retired) — bounds the transient count
 const BURY := 1.0                      # radial sink (blocks): trunk base buried so trees sit on the tier datum (§4.3)
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
@@ -78,6 +85,11 @@ var _arch_meshes: Array = []           # 6 ArrayMesh archetypes
 var _arch_trunk: PackedFloat32Array = PackedFloat32Array()   # 6 canonical archetype trunk heights (blocks)
 var _mesh_live := 0                    # last rebuild's total live mesh instances (across species)
 var _mesh_capped := false              # last rebuild hit FAR_TREES_MESH_TOTAL_MAX or a per-species alloc
+
+# P2 (FP_FAR_TREES_FADE) edit-overlay chop filter: a main-thread Callable (fid:int, cell:Vector3i)->bool that returns
+# true iff the player has an edit at that cell (chopped). Fed once by WorldManager; unset ⇒ no filter (P0/P1). Only
+# consulted under FP_FAR_TREES_FADE, at rebuild (main thread), so reading WorldManager._edits is race-free.
+var _chop_query: Callable = Callable()
 
 # per-facet tree-list LRU (fid -> PackedFloat32Array of REC_FLOATS-stride records), dwell-evicted
 var _cache: Dictionary = {}
@@ -125,8 +137,35 @@ void fragment() {
 }
 "
 
+## P2 (FP_FAR_TREES_FADE) card tail: adds a per-pixel dither DISCARD against the per-instance fade alpha
+## (INSTANCE_CUSTOM.w) — a screen-space dissolve (no alpha-sort, gl_compat-safe) for the no-pop band cross-fades +
+## hash-survival thinning. Everything else byte-identical to `_CARD_TAIL`. Off ⇒ `_CARD_TAIL` verbatim.
+const _CARD_TAIL_FADE := "varying vec2 v_uv;
+varying vec3 v_n;
+varying float v_hue;
+varying flat float v_fade;
+float _ft_dither(vec2 fc) { return fract(sin(dot(floor(fc), vec2(12.9898, 78.233))) * 43758.5453); }
+void vertex() {
+	float col = INSTANCE_CUSTOM.x;
+	float row = UV2.x;
+	v_uv = vec2((col + UV.x) / atlas_cols, (row + UV.y) / atlas_rows);
+	v_hue = INSTANCE_CUSTOM.y;
+	v_fade = INSTANCE_CUSTOM.w;
+	vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	v_n = normalize(wp - planet_centre);
+}
+void fragment() {
+	vec4 t = texture(tree_atlas, v_uv);
+	if (t.a < 0.5) discard;
+	if (_ft_dither(FRAGCOORD.xy) > v_fade) discard;
+	float jit = 1.0 + (v_hue - 0.5) * 0.08;
+	ALBEDO = t.rgb * voxi_shade(v_n, sun_dir) * jit;
+}
+"
+
 static func shader_code() -> String:
-	return _CARD_HEAD + VoxiLight.shade_glsl() + _CARD_TAIL
+	var tail := _CARD_TAIL_FADE if CubeSphere.FP_FAR_TREES_FADE else _CARD_TAIL
+	return _CARD_HEAD + VoxiLight.shade_glsl() + tail
 
 static func make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -174,8 +213,33 @@ void fragment() {
 }
 "
 
+## P2 (FP_FAR_TREES_FADE) mesh tail: same per-pixel dither DISCARD against INSTANCE_CUSTOM.w. Byte-identical to
+## `_MESH_TAIL` except the varying + discard. Off ⇒ `_MESH_TAIL` verbatim.
+const _MESH_TAIL_FADE := "varying flat vec4 v_col;
+varying flat float v_fade;
+float _ft_dither(vec2 fc) { return fract(sin(dot(floor(fc), vec2(12.9898, 78.233))) * 43758.5453); }
+void vertex() {
+	float flag = UV2.x;
+	float delta = INSTANCE_CUSTOM.x;
+	float arch = max(INSTANCE_CUSTOM.z, 1.0);
+	vec3 v = VERTEX;
+	if (flag < 0.5) { v.y += delta * clamp(v.y / arch, 0.0, 1.0); } else { v.y += delta; }
+	VERTEX = v;
+	vec3 wp = (MODEL_MATRIX * vec4(v, 1.0)).xyz;
+	vec3 n = normalize(wp - planet_centre);
+	float jit = 1.0 + (INSTANCE_CUSTOM.y - 0.5) * 0.08;
+	v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir) * jit, 1.0);
+	v_fade = INSTANCE_CUSTOM.w;
+}
+void fragment() {
+	if (_ft_dither(FRAGCOORD.xy) > v_fade) discard;
+	ALBEDO = v_col.rgb;
+}
+"
+
 static func mesh_shader_code() -> String:
-	return _MESH_HEAD + VoxiLight.shade_glsl() + _MESH_TAIL
+	var tail := _MESH_TAIL_FADE if CubeSphere.FP_FAR_TREES_FADE else _MESH_TAIL
+	return _MESH_HEAD + VoxiLight.shade_glsl() + tail
 
 static func make_mesh_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -189,6 +253,43 @@ static func make_mesh_material() -> ShaderMaterial:
 		sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
 		sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
 	return sm
+
+# =====================================================================================================================
+# P2 (FP_FAR_TREES_FADE) — the no-pop fade LAW, as pure static functions (ONE source of truth: `_rebuild_*` compute
+# the per-instance alpha the dither shader dissolves against, and the gate asserts these same functions' properties).
+# All distances are camera distance (blocks). Only consulted under FP_FAR_TREES_FADE.
+# =====================================================================================================================
+
+## Rung-1 mesh alpha: dither-IN over [R0, R0+FADE_NEAR_W] (near→mesh), cross-dither OUT over [448±FADE_BAND_W]
+## (mesh→card). 1.0 in the fully-owned middle, tapering to 0 at both handoffs.
+static func mesh_fade(d: float) -> float:
+	var r0 := float(TerrainConfig.near_render_radius())
+	var d1 := CubeSphere.FAR_TREES_MESH_MAX
+	var fin := smoothstep(r0, r0 + FADE_NEAR_W, d)
+	var fout := 1.0 - smoothstep(d1 - FADE_BAND_W, d1 + FADE_BAND_W, d)
+	return clampf(fin * fout, 0.0, 1.0)
+
+## keep-fraction keep(d): 1.0 until THIN_START, ramping to THIN_MIN at CARD_MAX (monotone non-increasing).
+static func keep_frac(d: float) -> float:
+	if d <= THIN_START:
+		return 1.0
+	var t := clampf((d - THIN_START) / (CubeSphere.FAR_TREES_CARD_MAX - THIN_START), 0.0, 1.0)
+	return lerpf(1.0, THIN_MIN, t)
+
+## Deterministic hash-survival alpha: a tree with survival hash `hue` stays lit while keep(d) > hue and DITHER-fades
+## out as keep(d) crosses hue (no popping wave — the SAME high-hue trees always retire first, monotone in d).
+static func thin_alpha(hue: float, d: float) -> float:
+	return smoothstep(hue - THIN_FADE, hue + THIN_FADE, keep_frac(d))
+
+## Rung-2 card alpha: dither-IN at the active handoff (cross-dither at 448 when rung-1 meshes are live, else the
+## near-voxel handoff at R0) × the hash-survival thinning toward the fog line.
+static func card_fade(d: float, hue: float) -> float:
+	var fin: float
+	if CubeSphere.FP_FAR_TREES_MESH:
+		fin = smoothstep(CubeSphere.FAR_TREES_MESH_MAX - FADE_BAND_W, CubeSphere.FAR_TREES_MESH_MAX + FADE_BAND_W, d)
+	else:
+		fin = smoothstep(float(TerrainConfig.near_render_radius()), float(TerrainConfig.near_render_radius()) + FADE_NEAR_W, d)
+	return clampf(fin * thin_alpha(hue, d), 0.0, 1.0)
 
 # =====================================================================================================================
 # Construction — one MultiMeshInstance3D child of the ring, one card material, the CPU-rasterised atlas, the shared
@@ -263,6 +364,17 @@ func set_sun_dir(sun_dir: Vector3) -> void:
 
 func sun_dir_telemetry() -> Vector3:
 	return (_material.get_shader_parameter("sun_dir") if _material != null else Vector3(1.0, 0.0, 0.0))
+
+## P2: wire the edit-overlay chop query (a WorldManager main-thread predicate). Off ⇒ never called (no filter).
+func set_chop_query(q: Callable) -> void:
+	_chop_query = q
+
+## True iff the tree with lattice base (bx, gy, bz) in `fid` is chopped (its trunk-base cell edited). Only under
+## FP_FAR_TREES_FADE with a live query; else false (P0/P1 — no filter). Main-thread (rebuild) call, race-free.
+func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
+	if not CubeSphere.FP_FAR_TREES_FADE or not _chop_query.is_valid():
+		return false
+	return bool(_chop_query.call(fid, Vector3i(int(bx), int(gy) + 1, int(bz))))
 
 # =====================================================================================================================
 # Step — reap the enumeration worker, advance dwell eviction, suspend on-surface↔off-surface (inverted like G3),
@@ -370,6 +482,9 @@ func _enum_worker(fid: int) -> void:
 			recs.push_back(rx); recs.push_back(ry); recs.push_back(rz)
 			recs.push_back(float(species - 1))                     # species enum 1..6 → atlas column 0..5
 			recs.push_back(float(trunk_h) + hue)                    # floor = trunk_h, frac = hue jitter phase
+			# Lattice base cell (bx, gy, bz) — the P2 edit-overlay chop filter matches the trunk-base cell (bx, gy+1, bz)
+			# against WorldManager._edits via FacetAtlas.edit_key(fid, cell) at rebuild time (current edits, main thread).
+			recs.push_back(float(base.x)); recs.push_back(float(base.y)); recs.push_back(float(base.z))
 	_last_enum_ms = float(Time.get_ticks_usec() - t0) / 1000.0
 	_enum_mutex.lock()
 	_enum_result = recs
@@ -439,8 +554,10 @@ func _evict_lru_overflow() -> void:
 ## no far-over-near), emit a card transform + custom data, up to FAR_TREES_CARD_INST_MAX. One `set_buffer` upload.
 func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 	# The card-band INNER radius is the ONE source of truth `card_inner_radius()`: FAR_TREES_MESH_MAX when rung-1
-	# meshes own [R0, 448) (exclusive handoff at 448, no double-render), else the P0 full [R0, CARD_MAX] band.
-	var r0 := card_inner_radius()
+	# meshes own [R0, 448) (exclusive handoff at 448, no double-render), else the P0 full [R0, CARD_MAX] band. Under
+	# FP_FAR_TREES_FADE the floor drops by FADE_BAND_W so the cards OVERLAP the mesh fade-out for the cross-dither.
+	var fade := CubeSphere.FP_FAR_TREES_FADE
+	var r0 := card_inner_radius() - (FADE_BAND_W if (fade and CubeSphere.FP_FAR_TREES_MESH) else 0.0)
 	var d2 := CubeSphere.FAR_TREES_CARD_MAX
 	var cap := CubeSphere.FAR_TREES_CARD_INST_MAX
 	var buf := PackedFloat32Array()
@@ -465,12 +582,23 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			var dist := sqrt(dx * dx + dy * dy + dz * dz)
 			if dist < r0 or dist > d2:
 				continue
-			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
-			var col: float = recs[o + 6]
 			var packed: float = recs[o + 7]
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
-			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue)
+			# P2 fade/thin: per-instance alpha the dither shader dissolves against; drop fully-faded/retired trees
+			# (bounds the transient overlap count + far card count). FADE off ⇒ alpha 1.0 (no dither, hard band).
+			var alpha := 1.0
+			if fade:
+				alpha = card_fade(dist, hue)
+				if alpha <= FADE_EPS:
+					continue
+			# P2 chop filter: a chopped tree (trunk-base cell edited) never reappears far. No-op when FADE off / no query.
+			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
+				continue
+			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
+			var col: float = recs[o + 6]
+			# .w carries the dither alpha under FADE; 0.0 (byte-identical with the merged P0/P1) when off.
+			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0)
 			n += 1
 	_mm.set_buffer(buf)
 	_mm.visible_instance_count = n
@@ -481,10 +609,10 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 		print("  FacetFarTrees: card cap ", cap, " hit (nearest-first fill) — increase FAR_TREES_CARD_INST_MAX or start thinning")
 
 ## Write ONE card instance: a radial-up basis (Y=radial, X/Z=stable tangents) scaled by canopy width + tree height,
-## origin at the sunk base; custom data = (species_col, hue, 0, 0). Buffer layout is TRANSFORM_3D's 12 floats
-## (3 rows of the 3×4 augmented matrix) followed by the 4 custom-data floats.
+## origin at the sunk base; custom data = (species_col, hue, 0, fade). `fade` is the dither alpha (1.0 = fully in;
+## always 1.0 with FP_FAR_TREES_FADE off → byte-identical). Buffer = TRANSFORM_3D's 12 floats + the 4 custom floats.
 func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float) -> void:
+		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float, fade := 1.0) -> void:
 	var r := Vector3(rx, ry, rz)
 	# stable tangent basis from the radial (avoid the world-up degeneracy near the poles)
 	var up := Vector3(0.0, 1.0, 0.0)
@@ -501,7 +629,7 @@ func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: f
 	buf[base + 0] = bx.x; buf[base + 1] = by.x; buf[base + 2] = bz.x; buf[base + 3] = sx
 	buf[base + 4] = bx.y; buf[base + 5] = by.y; buf[base + 6] = bz.y; buf[base + 7] = sy
 	buf[base + 8] = bx.z; buf[base + 9] = by.z; buf[base + 10] = bz.z; buf[base + 11] = sz
-	buf[base + 12] = col; buf[base + 13] = hue; buf[base + 14] = 0.0; buf[base + 15] = 0.0
+	buf[base + 12] = col; buf[base + 13] = hue; buf[base + 14] = 0.0; buf[base + 15] = fade
 
 # --- P1 rung-1 mesh band rebuild ------------------------------------------------------------------------------------
 
@@ -513,6 +641,9 @@ var _last_mesh_bufs: Array = []        # per-species last mesh buffers (gate rea
 func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 	var r0 := float(TerrainConfig.near_render_radius())
 	var d1 := CubeSphere.FAR_TREES_MESH_MAX
+	# Under FADE the mesh band extends UP by FADE_BAND_W so it overlaps the card fade-in for the 448 cross-dither.
+	var fade := CubeSphere.FP_FAR_TREES_FADE
+	var d1_hi := (d1 + FADE_BAND_W) if fade else d1
 	var per_cap := CubeSphere.FAR_TREES_MESH_INST_MAX
 	var total_cap := CubeSphere.FAR_TREES_MESH_TOTAL_MAX
 	var bufs: Array = []
@@ -537,8 +668,15 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var sx: float = recs[o + 0]; var sy: float = recs[o + 1]; var sz: float = recs[o + 2]
 			var dx := sx - cam_abs.x; var dy := sy - cam_abs.y; var dz := sz - cam_abs.z
 			var dist := sqrt(dx * dx + dy * dy + dz * dz)
-			if dist < r0 or dist >= d1:
-				continue                      # outside the mesh band (near field owns <R0; cards own ≥MESH_MAX)
+			if dist < r0 or dist >= d1_hi:
+				continue                      # outside the mesh band (near field owns <R0; cards own the far side)
+			var alpha := 1.0
+			if fade:
+				alpha = mesh_fade(dist)
+				if alpha <= FADE_EPS:
+					continue                  # fully faded out past the 448 cross-dither → drop
+			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
+				continue                      # chopped tree never reappears as a far mesh
 			var col := int(recs[o + 6])
 			if col < 0 or col >= N_SPECIES:
 				continue
@@ -550,7 +688,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
 			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
-			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch)
+			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0)
 			counts[col] += 1
 			total += 1
 	for c in range(N_SPECIES):
@@ -567,7 +705,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 ## the mesh is authored in blocks), origin at the sunk base; custom = (delta=trunk_h−arch, hue, arch_trunk, 0) for
 ## the shader's per-tree trunk-stretch. Same 12-transform-then-4-custom buffer layout as the cards.
 func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float) -> void:
+		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float, fade := 0.0) -> void:
 	var r := Vector3(rx, ry, rz)
 	var up := Vector3(0.0, 1.0, 0.0)
 	if absf(r.dot(up)) > 0.99:
@@ -577,7 +715,8 @@ func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, 
 	buf[base + 0] = t1.x; buf[base + 1] = r.x; buf[base + 2] = t2.x; buf[base + 3] = sx
 	buf[base + 4] = t1.y; buf[base + 5] = r.y; buf[base + 6] = t2.y; buf[base + 7] = sy
 	buf[base + 8] = t1.z; buf[base + 9] = r.z; buf[base + 10] = t2.z; buf[base + 11] = sz
-	buf[base + 12] = delta; buf[base + 13] = hue; buf[base + 14] = arch; buf[base + 15] = 0.0
+	# .w carries the dither alpha under FADE; 0.0 (byte-identical with the merged P1) when off.
+	buf[base + 12] = delta; buf[base + 13] = hue; buf[base + 14] = arch; buf[base + 15] = fade
 
 ## Build ONE species' archetype ArrayMesh from its `TreeGen.archetype_cells` cube set: exposed-face voxel meshing
 ## (internal faces between two solid cells culled). Per-vertex COLOR from BlockCatalog.color_of; UV2.x flag = 0 for

@@ -56,6 +56,12 @@ func _initialize() -> void:
 		_gate_ledger()
 		_gate_noprotrude()
 		_gate_sunweld()
+		# G-FT-FADE-OFF (two-state, runs in EVERY ON invocation): the dither DISCARD is spliced into the shaders IFF
+		# FP_FAR_TREES_FADE — so with FADE off the card/mesh shaders are the merged P0/P1 strings verbatim (byte-
+		# identical), and the P0/P1 gates below stay 28/28. The complement (present under FADE) is the P2 splice.
+		_ok(FT.shader_code().contains("_ft_dither") == CubeSphere.FP_FAR_TREES_FADE
+			and FT.mesh_shader_code().contains("_ft_dither") == CubeSphere.FP_FAR_TREES_FADE,
+			"G-FT-FADE-OFF: shader dither present IFF FP_FAR_TREES_FADE (off ⇒ P0/P1 shaders byte-identical)")
 		if CubeSphere.FP_FAR_TREES_MESH:
 			_gate_mesh()                                  # P1 assertions (bijection/ledger/handoff/noprotrude)
 		else:

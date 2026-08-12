@@ -114,6 +114,26 @@ var _live_instances := 0               # last rebuild's visible instance count (
 var _capped := false                   # last rebuild hit FAR_TREES_CARD_INST_MAX
 var _last_enum_ms := 0.0               # last enumeration wall cost (ms/facet — P0 gate records this)
 
+## FP_FAR_TREES_DELTA (docs/COSMOS-FOREST-FPS-DESIGN.md §4): rebuild-on-change state. `_cache_epoch` is a monotone
+## int bumped on EVERY `_cache` mutation (a facet landed in `_reap_enum`, a dwell / LRU eviction) — the "record cache
+## changed" signal. `_edits_rev_query` returns WorldManager.edit_count() (plumbed like the chop query); a chop bumps
+## it so a freshly-cut tree invalidates within one step. `_rebuild_inputs_changed` latches (cam, epoch, edits-rev) at
+## each real rebuild and returns true when any drifts (or the COLORFIX `_stale` flip, or no rebuild yet). The wanted
+## scan is cached and recomputed only past FT_DELTA_WANTED_MOVE. All READ only under the flag ⇒ byte-identical off
+## (the epoch bump is a bare int increment off the hot rebuild path; it never alters any output). `_dbg_rebuild_count`
+## counts real `_rebuild_cards` runs (gate read-back for G-FTD-1..5).
+var _edits_rev_query: Callable = Callable()
+var _cache_epoch := 0                   # bumped on every _cache add/evict (the "records changed" signal)
+var _have_rebuilt := false              # a rebuild has completed at least once (first step always rebuilds)
+var _last_rebuild_cam := Vector3.ZERO   # camera pos (absolute) at the last real rebuild
+var _last_rebuild_cache_epoch := -1     # _cache_epoch at the last real rebuild
+var _last_rebuild_edits_rev := -1       # edit revision at the last real rebuild
+var _have_wanted := false               # the wanted-facet scan has been computed at least once
+var _last_wanted: Array = []            # cached wanted-facet set (reused until FT_DELTA_WANTED_MOVE / epoch change)
+var _last_wanted_cam := Vector3.ZERO    # camera pos at the last wanted-scan recompute
+var _last_wanted_epoch := -1            # _cache_epoch at the last wanted-scan recompute
+var _dbg_rebuild_count := 0             # real card rebuilds run (gate read-back)
+
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
 # cross is double-sided). ALBEDO = atlas.rgb · voxi_shade(radial_n, sun_dir). planet_centre + sun_dir are uniforms.
@@ -415,6 +435,15 @@ func sun_dir_telemetry() -> Vector3:
 func set_chop_query(q: Callable) -> void:
 	_chop_query = q
 
+## FP_FAR_TREES_DELTA: wire the edit-revision query (WorldManager.edit_count) — the "edits changed" signal so a fresh
+## chop re-arms the rebuild within one step. Stored like the chop query; only read under the flag (byte-identical off).
+func set_edits_rev_query(q: Callable) -> void:
+	_edits_rev_query = q
+
+## Current edit revision (edit-overlay size), or 0 if no query wired. Only consulted under FP_FAR_TREES_DELTA.
+func _current_edits_rev() -> int:
+	return int(_edits_rev_query.call()) if _edits_rev_query.is_valid() else 0
+
 ## True iff the tree with lattice base (bx, gy, bz) in `fid` is chopped (its trunk-base cell edited). Only under
 ## FP_FAR_TREES_FADE with a live query; else false (P0/P1 — no filter). Main-thread (rebuild) call, race-free.
 func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
@@ -462,10 +491,16 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if _mesh_material != null:
 		_mesh_material.set_shader_parameter("planet_centre", centre)
 	var cam_abs := _cam_to_absolute(cam_render)
-	var wanted := _wanted_facets(cam_abs)                  # Earth facets within the card band, nearest-first
+	var wanted := _wanted_facets_for(cam_abs)              # Earth facets within the card band, nearest-first (cached under DELTA)
 	_advance_dwell(wanted)
 	if _enum_fid < 0:
-		_dispatch_nearest_missing(wanted)                 # one facet / job (paced under the settle gate)
+		_dispatch_nearest_missing(wanted)                 # one facet / job (paced under the settle gate) — runs every step
+	# FP_FAR_TREES_DELTA (docs/COSMOS-FOREST-FPS-DESIGN.md §4): skip the (unconditionally re-run today) full instance-set
+	# rebuild when NOTHING it reads has changed — camera still, cache epoch unchanged, edits unchanged, no offsurf flip.
+	# The output buffers would be BIT-IDENTICAL, so skipping is pixel-identical. Dispatch + dwell above still ran, so
+	# streaming-in of missing facets is untouched. Off ⇒ the `and` short-circuits and both rebuilds run verbatim.
+	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
+		return
 	# Rung-1 meshes [R0, FAR_TREES_MESH_MAX) FIRST, so the cards can retreat to [FAR_TREES_MESH_MAX, CARD_MAX] — the
 	# 448 handoff is EXCLUSIVE (a tree renders in exactly one band, no double). Off ⇒ cards keep the full [R0, CARD_MAX].
 	if CubeSphere.FP_FAR_TREES_MESH:
@@ -495,6 +530,7 @@ func _reap_enum() -> void:
 		_leaving.erase(fid)
 		_touch_lru(fid)
 		_evict_lru_overflow()
+		_cache_epoch += 1          # FP_FAR_TREES_DELTA: a facet landed → the record cache changed (rebuild re-arms)
 
 func _dispatch_nearest_missing(wanted: Array) -> void:
 	for fid in wanted:
@@ -585,6 +621,41 @@ func _wanted_facets(cam_abs: Vector3) -> Array:
 		out.append(int(cand[i][1]))
 	return out
 
+## FP_FAR_TREES_DELTA: the wanted-facet set, cached. Off ⇒ `_wanted_facets` verbatim every step (byte-identical). On ⇒
+## the 3,456-facet scan + lambda sort recompute ONLY when the camera moved ≥ FT_DELTA_WANTED_MOVE OR the record cache
+## epoch changed since it was last computed; otherwise the previously-computed set is reused (it is a pure function of
+## camera position + fixed facet geometry, so a still camera ⇒ the identical set). Dispatch + dwell still consume it
+## every step, so streaming-in of missing facets is untouched.
+func _wanted_facets_for(cam_abs: Vector3) -> Array:
+	if not CubeSphere.FP_FAR_TREES_DELTA:
+		return _wanted_facets(cam_abs)
+	if _have_wanted and _cache_epoch == _last_wanted_epoch \
+			and cam_abs.distance_to(_last_wanted_cam) < CubeSphere.FT_DELTA_WANTED_MOVE:
+		return _last_wanted
+	_last_wanted = _wanted_facets(cam_abs)
+	_last_wanted_cam = cam_abs
+	_last_wanted_epoch = _cache_epoch
+	_have_wanted = true
+	return _last_wanted
+
+## FP_FAR_TREES_DELTA: true (and re-latch the reference state) iff ANY rebuild input drifted since the last real
+## rebuild — camera ≥ FT_DELTA_MIN_MOVE, record-cache epoch, edit revision, the COLORFIX offsurf→onsurf `_stale`
+## flip, or no rebuild has ever completed. When it returns false the rebuild output is BIT-IDENTICAL to last time
+## (the buffers are a pure function of exactly these inputs — fades are dist(cam,tree)-only, sun_dir/planet_centre
+## are in-shader uniforms), so `step` skips the rebuild. Only called under the flag (short-circuited off).
+func _rebuild_inputs_changed(cam_abs: Vector3) -> bool:
+	var changed := (not _have_rebuilt) \
+		or cam_abs.distance_to(_last_rebuild_cam) >= CubeSphere.FT_DELTA_MIN_MOVE \
+		or _cache_epoch != _last_rebuild_cache_epoch \
+		or _current_edits_rev() != _last_rebuild_edits_rev \
+		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+	if changed:
+		_have_rebuilt = true
+		_last_rebuild_cam = cam_abs
+		_last_rebuild_cache_epoch = _cache_epoch
+		_last_rebuild_edits_rev = _current_edits_rev()
+	return changed
+
 func _advance_dwell(wanted: Array) -> void:
 	var wset := {}
 	for fid in wanted:
@@ -604,6 +675,7 @@ func _advance_dwell(wanted: Array) -> void:
 		_leaving.erase(fid)
 		_cache.erase(fid)
 		_lru.erase(fid)
+		_cache_epoch += 1          # FP_FAR_TREES_DELTA: a dwell eviction changed the record cache (rebuild re-arms)
 
 func _touch_lru(fid: int) -> void:
 	_lru.erase(fid)
@@ -615,6 +687,7 @@ func _evict_lru_overflow() -> void:
 		_lru.remove_at(0)
 		_cache.erase(old)
 		_leaving.erase(old)
+		_cache_epoch += 1          # FP_FAR_TREES_DELTA: an LRU-overflow eviction changed the record cache
 
 # --- card buffer rebuild (nearest-first, capped) --------------------------------------------------------------------
 
@@ -622,6 +695,7 @@ func _evict_lru_overflow() -> void:
 ## base camera distance is in [R0, FAR_TREES_CARD_MAX] (R0 = near voxel edge — the near field owns closer trees →
 ## no far-over-near), emit a card transform + custom data, up to FAR_TREES_CARD_INST_MAX. One `set_buffer` upload.
 func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
+	_dbg_rebuild_count += 1   # FP_FAR_TREES_DELTA gate read-back: counts REAL rebuilds (a skipped step never gets here)
 	# The card-band INNER radius is the ONE source of truth `card_inner_radius()`: FAR_TREES_MESH_MAX when rung-1
 	# meshes own [R0, 448) (exclusive handoff at 448, no double-render), else the P0 full [R0, CARD_MAX] band. Under
 	# FP_FAR_TREES_FADE the floor drops by FADE_BAND_W so the cards OVERLAP the mesh fade-out for the cross-dither.
@@ -1032,6 +1106,7 @@ var _last_buf: PackedFloat32Array = PackedFloat32Array()   # last rebuilt card b
 func debug_set_cache(fid: int, recs: PackedFloat32Array) -> void:
 	_cache[int(fid)] = recs
 	_touch_lru(int(fid))
+	_cache_epoch += 1                         # mirror _reap_enum: a cache add bumps the DELTA epoch
 
 func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 	if CubeSphere.FP_FAR_TREES_MESH:
@@ -1040,6 +1115,24 @@ func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false                        # mirror step(): the first completed rebuild clears the hide latch
 	return _live_instances
+
+## FP_FAR_TREES_DELTA gate hook (G-FTD-1..5): drive the DELTA-gated rebuild path with an explicit wanted set + camera
+## (no live FacetFarRing / no worker). Mirrors `step`'s post-rate-cap tail: the DELTA gate skips both rebuilds when
+## `_rebuild_inputs_changed` is false, else rebuilds (and clears the COLORFIX latch). Dispatch/dwell are omitted so the
+## gate stays hermetic (no threads). Returns true iff this call actually rebuilt.
+func debug_step(wanted: Array, cam_abs: Vector3) -> bool:
+	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
+		return false
+	if CubeSphere.FP_FAR_TREES_MESH:
+		_rebuild_meshes(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_CARDS:
+		_rebuild_cards(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_COLORFIX:
+		_stale = false
+	return true
+
+func rebuild_count() -> int:
+	return _dbg_rebuild_count
 
 ## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
 func debug_apply_visibility(offsurf: bool) -> void:
@@ -1064,4 +1157,5 @@ func enumerate_facet_sync(fid: int) -> PackedFloat32Array:
 	if recs is PackedFloat32Array:
 		_cache[fid] = recs
 		_touch_lru(fid)
+		_cache_epoch += 1                     # mirror _reap_enum: a cache add bumps the DELTA epoch
 	return recs if recs is PackedFloat32Array else PackedFloat32Array()

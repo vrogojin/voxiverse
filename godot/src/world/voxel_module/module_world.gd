@@ -2542,6 +2542,35 @@ func skin_near_meshed(fid: int, aabb: AABB) -> bool:
 	if t == null or not t.has_method("is_area_meshed"):
 		return false
 	return bool(t.call("is_area_meshed", aabb))
+## COSMOS-FAR-NEAR-MESA §3.1 (FP_APPLIED_VIEW_BAND): the ACTUALLY-LOADABLE vertical voxel band around player lattice
+## y `ly` — the ONE derivation site of godot_voxel's viewer row window law, mirrored so the far-ring's applied-cover
+## probe and the engine's streamer can never quietly disagree (the streamed_ellipsoid_params pattern). The engine
+## meshes mesh-block rows [c−e, c+e−1] around the viewer's row c=floordiv(ly, 32) (voxel_terrain.cpp:1288-1296 +
+## box3i.h:26 Box3i::from_center_extents(c,e)=Box3i(c−e,2e) — one block SHORT on the + side), with
+## e=ceildiv(min(viewer_view_distance, engine-applied max_view_distance), 32) — mesh_block_size is 32 (this file,
+## :393). ⇒ voxel band [(c−e)·32, (c+e)·32), intersected with the bounds slab meshed_slab_y(). Folds in the LIVE
+## view distance so a forced-96 view (e=3) narrows the band exactly as the arithmetic predicts. Pure read (const +
+## live viewer/terrain view distances); returns the full slab if no live view distance is readable (fallback/no
+## module) so the flag path stays inert there. `active` = the pool's active fid (the near field is under the player).
+func meshed_band_y(ly: float) -> Vector2:
+	var slab: Vector2 = TerrainConfig.meshed_slab_y()
+	var bs := 32                                   # mesh_block_size this file sets on every terrain (:393)
+	var vv := viewer_view_distance()               # the global player VoxelViewer's view_distance (-1 if absent)
+	var pv := pool_view(_pool_active)              # the engine-applied max_view_distance on the active slot (-1 if absent)
+	var reach := 0
+	if vv > 0 and pv > 0:
+		reach = mini(vv, pv)
+	elif vv > 0:
+		reach = vv
+	elif pv > 0:
+		reach = pv
+	else:
+		return slab                                # no live view distance ⇒ don't narrow (shipped #113 slab)
+	var e := int(ceil(float(reach) / float(bs)))
+	var c := int(floor(ly / float(bs)))
+	var lo := float((c - e) * bs)
+	var hi := float((c + e) * bs)                  # rows [c−e, c+e−1] ⇒ voxel top (c+e)·bs (exclusive)
+	return Vector2(maxf(lo, slab.x), minf(hi, slab.y))
 ## FP-M1c view-ramp introspection (§5). pool_view: the LIVE engine-applied max_view_distance (read off the terrain,
 ## not the bookkeeping int — the honest value the ramp gate asserts). pool_view_target: the ramp goal. -1 if absent.
 func pool_view(fid: int) -> int:

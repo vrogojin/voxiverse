@@ -1230,6 +1230,15 @@ func update_streaming(player_pos: Vector3) -> void:
 		if using_module and _module_world != null and _module_world.has_method("pool_seam_meshed_weld"):
 			seam_query = Callable(_module_world, "pool_seam_meshed_weld")
 		_facet_ring.set_seam_cover_query(seam_query)
+	# COSMOS-FAR-NEAR-MESA §3.1 (FP_APPLIED_VIEW_BAND): hand the far ring the loadable-row-band query
+	# (module_world.meshed_band_y) so the applied-cover probe demands only the vertical band the engine can actually
+	# stream around the viewer's row (fixing the mesa c=0 dead-latch). Invalid on the fallback / no-module path ⇒ the
+	# far ring's band clamp is skipped ⇒ inert / byte-identical off the flag (the shipped #113 probe).
+	if _facet_ring != null and _facet_ring.has_method("set_band_query"):
+		var band_query := Callable()
+		if using_module and _module_world != null and _module_world.has_method("meshed_band_y"):
+			band_query = Callable(_module_world, "meshed_band_y")
+		_facet_ring.set_band_query(band_query)
 	# COSMOS-FAR-SMOOTH-GEOMETRY-DESIGN.md §3 P3 (FP_SMOOTH_RIM): feed the frozen player-column snapshot (ABSOLUTE
 	# world coords, the far ring's own frame) so the S2 near-collar disc is centred on the ACTUAL player, not the
 	# active facet centre. `player_pos` is in the active facet's LATTICE frame (same convention `_radial_altitude_

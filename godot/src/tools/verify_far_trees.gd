@@ -56,6 +56,10 @@ func _initialize() -> void:
 		_gate_ledger()
 		_gate_noprotrude()
 		_gate_sunweld()
+		if CubeSphere.FP_FAR_TREES_MESH:
+			_gate_mesh()                                  # P1 assertions (bijection/ledger/handoff/noprotrude)
+		else:
+			print("  (P1 mesh gates skipped — need FP_FAR_TREES_MESH sed-toggled true)")
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -263,4 +267,97 @@ func _gate_sunweld() -> void:
 		_ok(seed.is_equal_approx(live), "G-FT-SUNWELD: welded material seeds from TierPlace.last_sun_dir (not (1,0,0))")
 	else:
 		_ok(seed.is_equal_approx(Vector3(1.0, 0.0, 0.0)), "G-FT-SUNWELD: weld off ⇒ shipped (1,0,0) seed (byte-identical)")
+	ring.queue_free()
+
+# ---- G-FT-MESH (P1) ------------------------------------------------------------------------------------------------
+
+func _gate_mesh() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	var r0 := float(TerrainConfig.near_render_radius())
+	var d1 := CubeSphere.FAR_TREES_MESH_MAX
+
+	# --- G-FT-MESH-LEDGER: 6 archetype meshes exist, bounded tris, ≤6 draws, total_bytes under cap ---
+	var tri_ok := true
+	for col in range(6):
+		var tc := tier.mesh_tri_count(col)
+		if tc <= 0 or tc > 1400:               # ~180 ideal; exposed-face cubes → allow headroom, but bounded
+			tri_ok = false
+	_ok(tri_ok, "G-FT-MESH-LEDGER: every species archetype mesh has bounded tris (1..1400)")
+	var b := tier.total_bytes()
+	_ok(b <= CubeSphere.FAR_TREES_BYTES_MAX, "G-FT-MESH-LEDGER: total_bytes %d <= FAR_TREES_BYTES_MAX %d" % [b, CubeSphere.FAR_TREES_BYTES_MAX])
+
+	# --- Build a controlled radial spread of synthetic trees so distances span both bands, then rebuild both ---
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99:
+		up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var synth := PackedFloat32Array()
+	var dists := []
+	var step := 100
+	while step <= 2575:
+		var p := centre + tangent * float(step)
+		var r := p.normalized()
+		synth.push_back(p.x); synth.push_back(p.y); synth.push_back(p.z)
+		synth.push_back(r.x); synth.push_back(r.y); synth.push_back(r.z)
+		synth.push_back(float((step / 25) % 6))     # cycle species column 0..5
+		synth.push_back(5.0)                         # trunk_h=5, hue=0
+		dists.append(step)
+		step += 25
+	tier.debug_set_cache(fid, synth)
+	var cam := centre                                # camera on the surface at facet centre → dist(cam,p)=step
+	tier.debug_rebuild([fid], cam)
+	var mesh_live: int = tier.mesh_live_instances()
+	var card_live: int = tier.live_instances()
+	var exp_mesh := 0
+	var exp_card := 0
+	for dd in dists:
+		if dd >= r0 and dd < d1: exp_mesh += 1
+		elif dd >= d1 and dd <= CubeSphere.FAR_TREES_CARD_MAX: exp_card += 1
+	_ok(mesh_live == exp_mesh, "G-FT-MESH-BIJECTION: mesh band [%0.f,%0.f) count %d == expected %d" % [r0, d1, mesh_live, exp_mesh])
+	_ok(card_live == exp_card, "G-FT-MESH-HANDOFF: card band [%0.f,CARD] count %d == expected %d (cards retreated)" % [d1, card_live, exp_card])
+	_ok(mesh_live + card_live == exp_mesh + exp_card and exp_mesh > 0 and exp_card > 0, "G-FT-MESH-HANDOFF: bands PARTITION the [R0,CARD] set (no double, no gap)")
+	_ok(tier.mesh_draw_count() <= 6, "G-FT-MESH-LEDGER: mesh draws %d <= 6" % tier.mesh_draw_count())
+
+	# --- Every mesh instance origin is inside the mesh band; every card origin at/beyond the 448 handoff ---
+	var mesh_in_band := true
+	for col in range(6):
+		var buf: PackedFloat32Array = tier.mesh_buffer(col)
+		var vis := tier.mesh_visible(col)
+		for i in range(vis):
+			var o := i * FT.MESH_STRIDE
+			var org := Vector3(buf[o + 3], buf[o + 7], buf[o + 11])
+			var dist := org.distance_to(cam)
+			if dist < r0 or dist >= d1:
+				mesh_in_band = false
+	_ok(mesh_in_band, "G-FT-MESH-HANDOFF: every mesh instance origin is within [R0, MESH_MAX) (exclusive 448 handoff)")
+	var cbuf: PackedFloat32Array = tier.debug_buffer()
+	var card_beyond := true
+	for i in range(card_live):
+		var o := i * FT.CARD_STRIDE
+		var org := Vector3(cbuf[o + 3], cbuf[o + 7], cbuf[o + 11])
+		if org.distance_to(cam) < d1:
+			card_beyond = false
+	_ok(card_beyond, "G-FT-MESH-HANDOFF: every card instance origin is >= MESH_MAX (no tree in both bands)")
+
+	# --- G-FT-MESH-NOPROTRUDE: camera ON a real tree ⇒ 0 mesh instances inside near_render_radius ---
+	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
+	if recs.size() >= FT.REC_FLOATS:
+		var cam2 := Vector3(recs[0], recs[1], recs[2])
+		tier.debug_rebuild([fid], cam2)
+		var protrude := 0
+		for col in range(6):
+			var buf2: PackedFloat32Array = tier.mesh_buffer(col)
+			var vis2 := tier.mesh_visible(col)
+			for i in range(vis2):
+				var o := i * FT.MESH_STRIDE
+				var org := Vector3(buf2[o + 3], buf2[o + 7], buf2[o + 11])
+				if org.distance_to(cam2) < r0:
+					protrude += 1
+		_ok(protrude == 0, "G-FT-MESH-NOPROTRUDE: 0 mesh instances inside near_render_radius (%.0f) of the camera" % r0)
 	ring.queue_free()

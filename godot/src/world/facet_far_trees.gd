@@ -1,9 +1,12 @@
 class_name FacetFarTrees
 extends RefCounted
 ## COSMOS FAR-TREES (docs/COSMOS-FAR-TREES-DESIGN.md) — the far-terrain tree tier, owned/stepped by ONE
-## `FacetFarRing` exactly like `FacetSmoothV2` / `FacetOrbitRelief`. P0 ships RUNG 2 only: the cross+cap CARD
-## impostor band over camera-distance [near_render_radius(), FAR_TREES_CARD_MAX] (rung 1 archetype meshes are P1;
-## rung 3 is the existing fine-map canopy texels, no code here). Everything is driven by the SAME `TreeGen`
+## `FacetFarRing` exactly like `FacetSmoothV2` / `FacetOrbitRelief`. RUNG 2 (P0, FP_FAR_TREES_CARDS): cross+cap CARD
+## impostors. RUNG 1 (P1, FP_FAR_TREES_MESH): per-species face-merged voxel-archetype mini-meshes over
+## [near_render_radius(), FAR_TREES_MESH_MAX) — cards then retreat to [FAR_TREES_MESH_MAX, FAR_TREES_CARD_MAX] with
+## an EXCLUSIVE handoff at 448 (a tree renders in exactly one band). RUNG 3 (orbit) is the existing fine-map canopy
+## texels (no code here). The ladder: near voxel (0-128) → archetype mesh (128-448) → cards (448-2400) → fine-map
+## speckle. Everything is driven by the SAME `TreeGen`
 ## placement hashes through the additive `TreeGen.tree_info` enumeration, so far cards align 1:1 with the near
 ## voxel trees by construction (the #1 correctness gate) — never by synchronisation.
 ##
@@ -45,6 +48,8 @@ const BURY := 1.0                      # radial sink (blocks): trunk base buried
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
 const EVICT_DWELL_STEPS := 20          # dwell before an unwanted facet's cached list is evicted (V2 convention)
+const MESH_STRIDE := 16                # rung-1 mesh MultiMesh buffer floats/instance (12 transform + 4 custom)
+const N_SPECIES := 6                   # OAK/BIRCH/SPRUCE/ACACIA/JUNGLE/CACTUS → atlas/mesh column = species-1
 
 # The shared card mesh (unit archetype: 2 vertical crossed quads + 1 horizontal cap quad; local Y∈[0,1], half-
 # width 0.5). Built once; scaled/oriented per instance. UV = local tile coords [0,1]; UV2.x = 0 side / 1 top.
@@ -61,6 +66,18 @@ var _mm: MultiMesh = null
 var _material: ShaderMaterial = null
 var _active_fid := -1
 var _atlas: ImageTexture = null
+
+# --- P1 rung-1: per-species voxel-archetype mini-mesh band [R0, FAR_TREES_MESH_MAX) (FP_FAR_TREES_MESH) ---
+# One MultiMeshInstance3D per species (≤6 draws), all sharing ONE material; per-species face-merged archetype mesh
+# (from TreeGen.archetype_cells) with a UV2 trunk/canopy flag the shader uses for per-tree trunk-stretch. null / empty
+# off (never constructed) ⇒ byte-identical.
+var _mesh_material: ShaderMaterial = null
+var _mesh_mmis: Array = []             # 6 MultiMeshInstance3D (one per species column)
+var _mesh_mms: Array = []              # 6 MultiMesh
+var _arch_meshes: Array = []           # 6 ArrayMesh archetypes
+var _arch_trunk: PackedFloat32Array = PackedFloat32Array()   # 6 canonical archetype trunk heights (blocks)
+var _mesh_live := 0                    # last rebuild's total live mesh instances (across species)
+var _mesh_capped := false              # last rebuild hit FAR_TREES_MESH_TOTAL_MAX or a per-species alloc
 
 # per-facet tree-list LRU (fid -> PackedFloat32Array of REC_FLOATS-stride records), dwell-evicted
 var _cache: Dictionary = {}
@@ -129,6 +146,51 @@ static func make_material() -> ShaderMaterial:
 	return sm
 
 # =====================================================================================================================
+# Rung-1 mesh shader (P1) — flat radial voxi_shade over the archetype's own vertex COLOR (no atlas). §5.3 trunk-stretch:
+# each archetype vertex carries a UV2.x flag (0 = trunk column, 1 = canopy); the vertex shader stretches trunk verts
+# and rigidly lifts canopy verts by INSTANCE_CUSTOM.x = (trunk_h − archetype_trunk_h), so ONE per-species mesh renders
+# EXACT per-tree heights. INSTANCE_CUSTOM.y = hue jitter, .z = archetype_trunk_h (the stretch denominator). Radial
+# normal via the planet_centre uniform (same MultiMesh-forced deviation as the cards — see the class doc).
+# =====================================================================================================================
+const _MESH_HEAD := "shader_type spatial;
+render_mode cull_disabled;
+uniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);
+"
+const _MESH_TAIL := "varying flat vec4 v_col;
+void vertex() {
+	float flag = UV2.x;
+	float delta = INSTANCE_CUSTOM.x;
+	float arch = max(INSTANCE_CUSTOM.z, 1.0);
+	vec3 v = VERTEX;
+	if (flag < 0.5) { v.y += delta * clamp(v.y / arch, 0.0, 1.0); } else { v.y += delta; }
+	VERTEX = v;
+	vec3 wp = (MODEL_MATRIX * vec4(v, 1.0)).xyz;
+	vec3 n = normalize(wp - planet_centre);
+	float jit = 1.0 + (INSTANCE_CUSTOM.y - 0.5) * 0.08;
+	v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir) * jit, 1.0);
+}
+void fragment() {
+	ALBEDO = v_col.rgb;
+}
+"
+
+static func mesh_shader_code() -> String:
+	return _MESH_HEAD + VoxiLight.shade_glsl() + _MESH_TAIL
+
+static func make_mesh_material() -> ShaderMaterial:
+	var sm := ShaderMaterial.new()
+	var sh := Shader.new()
+	sh.code = mesh_shader_code()
+	sm.shader = sh
+	var seed := TierPlace.last_sun_dir() if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
+	sm.set_shader_parameter("sun_dir", seed)
+	if CubeSphere.FP_SHADE_UNIFIED:
+		sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
+		sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
+		sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
+	return sm
+
+# =====================================================================================================================
 # Construction — one MultiMeshInstance3D child of the ring, one card material, the CPU-rasterised atlas, the shared
 # unit card mesh. Called from FacetFarRing.setup under FP_FAR_TREES.
 # =====================================================================================================================
@@ -156,6 +218,36 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	# the CPU-side AABB can't predict them — pin a huge custom AABB so the node is never wrongly frustum-culled.
 	_mmi.custom_aabb = AABB(Vector3(-12000.0, -12000.0, -12000.0), Vector3(24000.0, 24000.0, 24000.0))
 	ring.add_child(_mmi)
+	if CubeSphere.FP_FAR_TREES_MESH:
+		_setup_mesh_band(ring)
+
+## P1: build the 6 per-species archetype ArrayMeshes (from TreeGen.archetype_cells) + their MultiMeshInstance3D
+## children (one draw each) sharing one material. Instance allocation FAR_TREES_MESH_INST_MAX/species; the live set
+## is bounded FAR_TREES_MESH_TOTAL_MAX across species (nearest-first). Off ⇒ never called (byte-identical).
+func _setup_mesh_band(ring: Node3D) -> void:
+	_mesh_material = make_mesh_material()
+	_arch_trunk.resize(N_SPECIES)
+	var species := [TreeGen.SP_OAK, TreeGen.SP_BIRCH, TreeGen.SP_SPRUCE, TreeGen.SP_ACACIA, TreeGen.SP_JUNGLE, TreeGen.SP_CACTUS]
+	for col in range(N_SPECIES):
+		var built := _build_archetype_mesh(int(species[col]))
+		var mesh: ArrayMesh = built["mesh"]
+		_arch_trunk[col] = float(built["arch_trunk"])
+		_arch_meshes.append(mesh)
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_colors = false
+		mm.use_custom_data = true
+		mm.mesh = mesh
+		mm.instance_count = CubeSphere.FAR_TREES_MESH_INST_MAX
+		mm.visible_instance_count = 0
+		var mmi := MultiMeshInstance3D.new()
+		mmi.name = "FacetFarTreesMesh%d" % col
+		mmi.multimesh = mm
+		mmi.material_override = _mesh_material
+		mmi.custom_aabb = AABB(Vector3(-12000.0, -12000.0, -12000.0), Vector3(24000.0, 24000.0, 24000.0))
+		ring.add_child(mmi)
+		_mesh_mms.append(mm)
+		_mesh_mmis.append(mmi)
 
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid   # residency is camera-distance driven (rebuilt each step); crossing only re-seeds the centre facet
@@ -164,6 +256,8 @@ func set_active(new_fid: int) -> void:
 func set_sun_dir(sun_dir: Vector3) -> void:
 	if _material != null:
 		_material.set_shader_parameter("sun_dir", sun_dir)
+	if _mesh_material != null:
+		_mesh_material.set_shader_parameter("sun_dir", sun_dir)
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		_last_sun_dir = sun_dir
 
@@ -181,6 +275,8 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
 	if _mmi != null:
 		_mmi.visible = not offsurf
+	for mmi in _mesh_mmis:
+		(mmi as MultiMeshInstance3D).visible = not offsurf
 	if offsurf:
 		return
 	# FP_LOAD_DEFER settle gate: pre-settle we only reaped (a finished build still lands in the LRU); no dispatch,
@@ -192,13 +288,20 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		return
 	_last_step_ms = now
 	# Push the live body centre (render frame) so the radial normal can't go stale across a crossing / re-anchor.
+	var centre := (_ring as FacetFarRing).render_centre()
 	if _material != null:
-		_material.set_shader_parameter("planet_centre", (_ring as FacetFarRing).render_centre())
+		_material.set_shader_parameter("planet_centre", centre)
+	if _mesh_material != null:
+		_mesh_material.set_shader_parameter("planet_centre", centre)
 	var cam_abs := _cam_to_absolute(cam_render)
 	var wanted := _wanted_facets(cam_abs)                  # Earth facets within the card band, nearest-first
 	_advance_dwell(wanted)
 	if _enum_fid < 0:
 		_dispatch_nearest_missing(wanted)                 # one facet / job (paced under the settle gate)
+	# Rung-1 meshes [R0, FAR_TREES_MESH_MAX) FIRST, so the cards can retreat to [FAR_TREES_MESH_MAX, CARD_MAX] — the
+	# 448 handoff is EXCLUSIVE (a tree renders in exactly one band, no double). Off ⇒ cards keep the full [R0, CARD_MAX].
+	if CubeSphere.FP_FAR_TREES_MESH:
+		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
 		_rebuild_cards(cam_abs, wanted)
 
@@ -335,7 +438,9 @@ func _evict_lru_overflow() -> void:
 ## base camera distance is in [R0, FAR_TREES_CARD_MAX] (R0 = near voxel edge — the near field owns closer trees →
 ## no far-over-near), emit a card transform + custom data, up to FAR_TREES_CARD_INST_MAX. One `set_buffer` upload.
 func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
-	var r0 := float(TerrainConfig.near_render_radius())
+	# When rung-1 meshes are live they own [R0, FAR_TREES_MESH_MAX); the cards start at FAR_TREES_MESH_MAX (exclusive
+	# handoff at 448, no double-render). Off ⇒ the P0 full [R0, CARD_MAX] band. The mesh band's own lower bound is R0.
+	var r0 := CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
 	var d2 := CubeSphere.FAR_TREES_CARD_MAX
 	var cap := CubeSphere.FAR_TREES_CARD_INST_MAX
 	var buf := PackedFloat32Array()
@@ -397,6 +502,142 @@ func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: f
 	buf[base + 4] = bx.y; buf[base + 5] = by.y; buf[base + 6] = bz.y; buf[base + 7] = sy
 	buf[base + 8] = bx.z; buf[base + 9] = by.z; buf[base + 10] = bz.z; buf[base + 11] = sz
 	buf[base + 12] = col; buf[base + 13] = hue; buf[base + 14] = 0.0; buf[base + 15] = 0.0
+
+# --- P1 rung-1 mesh band rebuild ------------------------------------------------------------------------------------
+
+var _last_mesh_bufs: Array = []        # per-species last mesh buffers (gate read-back only)
+
+## Rebuild the 6 per-species mesh MultiMesh buffers: walk the wanted facets nearest-first, keep trees whose base
+## camera distance is in [R0, FAR_TREES_MESH_MAX) (the mesh band — cards own [MESH_MAX, CARD_MAX]), bucket by
+## species, fill nearest-first under the per-species allocation AND the FAR_TREES_MESH_TOTAL_MAX global live cap.
+func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
+	var r0 := float(TerrainConfig.near_render_radius())
+	var d1 := CubeSphere.FAR_TREES_MESH_MAX
+	var per_cap := CubeSphere.FAR_TREES_MESH_INST_MAX
+	var total_cap := CubeSphere.FAR_TREES_MESH_TOTAL_MAX
+	var bufs: Array = []
+	var counts := PackedInt32Array(); counts.resize(N_SPECIES); counts.fill(0)
+	for c in range(N_SPECIES):
+		var b := PackedFloat32Array(); b.resize(per_cap * MESH_STRIDE); bufs.append(b)
+	var total := 0
+	var capped := false
+	for fid in wanted:
+		if total >= total_cap:
+			capped = true
+			break
+		if not _cache.has(int(fid)):
+			continue
+		var recs: PackedFloat32Array = _cache[int(fid)]
+		var m := recs.size() / REC_FLOATS
+		for i in range(m):
+			if total >= total_cap:
+				capped = true
+				break
+			var o := i * REC_FLOATS
+			var sx: float = recs[o + 0]; var sy: float = recs[o + 1]; var sz: float = recs[o + 2]
+			var dx := sx - cam_abs.x; var dy := sy - cam_abs.y; var dz := sz - cam_abs.z
+			var dist := sqrt(dx * dx + dy * dy + dz * dz)
+			if dist < r0 or dist >= d1:
+				continue                      # outside the mesh band (near field owns <R0; cards own ≥MESH_MAX)
+			var col := int(recs[o + 6])
+			if col < 0 or col >= N_SPECIES:
+				continue
+			if counts[col] >= per_cap:
+				capped = true
+				continue                      # this species' alloc is full; other species may still fill
+			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
+			var packed: float = recs[o + 7]
+			var trunk_h := floorf(packed)
+			var hue := packed - trunk_h
+			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
+			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch)
+			counts[col] += 1
+			total += 1
+	for c in range(N_SPECIES):
+		var mm: MultiMesh = _mesh_mms[c]
+		mm.set_buffer(bufs[c])
+		mm.visible_instance_count = counts[c]
+	_last_mesh_bufs = bufs
+	_mesh_live = total
+	_mesh_capped = capped
+	if capped:
+		print("  FacetFarTrees: mesh cap (", total_cap, " total / ", per_cap, " per-species) hit (nearest-first)")
+
+## Write ONE archetype mesh instance: a UNIT radial-up basis (Y=radial, X/Z=tangents — block units, NO extra scale,
+## the mesh is authored in blocks), origin at the sunk base; custom = (delta=trunk_h−arch, hue, arch_trunk, 0) for
+## the shader's per-tree trunk-stretch. Same 12-transform-then-4-custom buffer layout as the cards.
+func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
+		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float) -> void:
+	var r := Vector3(rx, ry, rz)
+	var up := Vector3(0.0, 1.0, 0.0)
+	if absf(r.dot(up)) > 0.99:
+		up = Vector3(1.0, 0.0, 0.0)
+	var t1 := r.cross(up).normalized()
+	var t2 := r.cross(t1).normalized()
+	buf[base + 0] = t1.x; buf[base + 1] = r.x; buf[base + 2] = t2.x; buf[base + 3] = sx
+	buf[base + 4] = t1.y; buf[base + 5] = r.y; buf[base + 6] = t2.y; buf[base + 7] = sy
+	buf[base + 8] = t1.z; buf[base + 9] = r.z; buf[base + 10] = t2.z; buf[base + 11] = sz
+	buf[base + 12] = delta; buf[base + 13] = hue; buf[base + 14] = arch; buf[base + 15] = 0.0
+
+## Build ONE species' archetype ArrayMesh from its `TreeGen.archetype_cells` cube set: exposed-face voxel meshing
+## (internal faces between two solid cells culled). Per-vertex COLOR from BlockCatalog.color_of; UV2.x flag = 0 for
+## trunk (log/cactus) cells, 1 for canopy (leaf) cells — the shader's trunk-stretch selector. `arch_trunk` = the
+## tallest trunk-column cell (the stretch denominator). Returns {mesh, arch_trunk}.
+func _build_archetype_mesh(species: int) -> Dictionary:
+	var cells := TreeGen.archetype_cells(species)
+	var trunk_ids := {BlockCatalog.WOOD: true}
+	for nm in [&"birch_log", &"spruce_log", &"jungle_log", &"acacia_log", &"cactus"]:
+		trunk_ids[BlockCatalog.id_of(nm)] = true
+	var solid := {}
+	var arch_trunk := 1
+	for c in cells:
+		var cv: Vector4i = c
+		solid[Vector3i(cv.x, cv.y, cv.z)] = cv.w
+		if trunk_ids.has(cv.w) and cv.x == 0 and cv.z == 0:
+			arch_trunk = maxi(arch_trunk, cv.y)
+	var verts := PackedVector3Array()
+	var cols := PackedColorArray()
+	var uv2 := PackedVector2Array()
+	var idx := PackedInt32Array()
+	var dirs := [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]
+	for key in solid.keys():
+		var p: Vector3i = key
+		var id := int(solid[key])
+		var flag := 0.0 if trunk_ids.has(id) else 1.0
+		var colr := BlockCatalog.color_of(id); colr.a = 1.0
+		for d in dirs:
+			if solid.has(p + d):
+				continue                       # internal face — culled
+			_mesh_face(verts, cols, uv2, idx, Vector3(p.x, p.y, p.z), d, colr, flag)
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_COLOR] = cols
+	arr[Mesh.ARRAY_TEX_UV2] = uv2
+	arr[Mesh.ARRAY_INDEX] = idx
+	var mesh := ArrayMesh.new()
+	if verts.size() > 0:
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	return {"mesh": mesh, "arch_trunk": arch_trunk}
+
+## Emit one cube face (2 tris, 4 verts) for the cube centred at `c` (spans ±0.5), facing unit axis `dir`.
+func _mesh_face(verts: PackedVector3Array, cols: PackedColorArray, uv2: PackedVector2Array, idx: PackedInt32Array,
+		c: Vector3, dir: Vector3i, colr: Color, flag: float) -> void:
+	var dv := Vector3(dir.x, dir.y, dir.z)
+	var u := Vector3(0, 1, 0) if dir.x != 0 else Vector3(1, 0, 0)
+	var v := Vector3(0, 0, 1) if dir.y != 0 else (Vector3(0, 0, 1) if dir.x != 0 else Vector3(0, 1, 0))
+	var fc := c + dv * 0.5
+	var a := fc - u * 0.5 - v * 0.5
+	var b := fc + u * 0.5 - v * 0.5
+	var e := fc + u * 0.5 + v * 0.5
+	var f := fc - u * 0.5 + v * 0.5
+	var base := verts.size()
+	verts.push_back(a); verts.push_back(b); verts.push_back(e); verts.push_back(f)
+	for _k in range(4):
+		cols.push_back(colr)
+		uv2.push_back(Vector2(flag, 0.0))
+	idx.push_back(base + 0); idx.push_back(base + 1); idx.push_back(base + 2)
+	idx.push_back(base + 0); idx.push_back(base + 2); idx.push_back(base + 3)
 
 # --- geometry / atlas (one-time) ------------------------------------------------------------------------------------
 
@@ -520,15 +761,41 @@ func total_bytes() -> int:
 	var buf_b := CubeSphere.FAR_TREES_CARD_INST_MAX * CARD_STRIDE * 4
 	var atlas_b := ATLAS_COLS * ATLAS_TILE * ATLAS_ROWS * ATLAS_TILE * 4
 	var mesh_b := 12 * (3 * 4 + 2 * 4 + 2 * 4) + 18 * 4    # 12 verts × (pos+uv+uv2) + 18 indices — tiny
+	# P1 rung-1: 6 per-species mesh MultiMesh buffers (allocated at FAR_TREES_MESH_INST_MAX each) + the archetype
+	# ArrayMeshes. Zero when the mesh band isn't built (FP_FAR_TREES_MESH off).
+	var mesh_buf_b := 0
+	if not _mesh_mms.is_empty():
+		mesh_buf_b = N_SPECIES * CubeSphere.FAR_TREES_MESH_INST_MAX * MESH_STRIDE * 4
+		for am in _arch_meshes:
+			var mm := am as ArrayMesh
+			if mm.get_surface_count() > 0:
+				var a := mm.surface_get_arrays(0)
+				mesh_buf_b += (a[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() * (3 + 4 + 2) * 4
 	var lru_b := 0
 	for fid in _cache.keys():
 		lru_b += (_cache[fid] as PackedFloat32Array).size() * 4
-	return buf_b + atlas_b + mesh_b + lru_b
+	return buf_b + atlas_b + mesh_b + mesh_buf_b + lru_b
 
 func live_instances() -> int: return _live_instances
 func was_capped() -> bool: return _capped
 func last_enum_ms() -> float: return _last_enum_ms
 func cached_facets() -> int: return _cache.size()
+func mesh_live_instances() -> int: return _mesh_live
+func mesh_was_capped() -> bool: return _mesh_capped
+func mesh_visible(col: int) -> int: return (_mesh_mms[col] as MultiMesh).visible_instance_count if col < _mesh_mms.size() else 0
+func mesh_draw_count() -> int:
+	var d := 0
+	for c in range(_mesh_mms.size()):
+		if (_mesh_mms[c] as MultiMesh).visible_instance_count > 0: d += 1
+	return d
+func mesh_arch_trunk(col: int) -> float: return _arch_trunk[col] if col < _arch_trunk.size() else 0.0
+func mesh_tri_count(col: int) -> int:
+	if col >= _arch_meshes.size(): return 0
+	var mm := _arch_meshes[col] as ArrayMesh
+	if mm.get_surface_count() == 0: return 0
+	return (mm.surface_get_arrays(0)[Mesh.ARRAY_INDEX] as PackedInt32Array).size() / 3
+func mesh_buffer(col: int) -> PackedFloat32Array:
+	return _last_mesh_bufs[col] if col < _last_mesh_bufs.size() else PackedFloat32Array()
 
 var _last_buf: PackedFloat32Array = PackedFloat32Array()   # last rebuilt card buffer (gate read-back only)
 
@@ -538,6 +805,8 @@ func debug_set_cache(fid: int, recs: PackedFloat32Array) -> void:
 	_touch_lru(int(fid))
 
 func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
+	if CubeSphere.FP_FAR_TREES_MESH:
+		_rebuild_meshes(cam_abs, wanted)
 	_rebuild_cards(cam_abs, wanted)
 	return _live_instances
 

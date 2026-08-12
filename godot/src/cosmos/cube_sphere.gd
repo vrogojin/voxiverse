@@ -1756,6 +1756,22 @@ const APPLIED_PROBE_MAX := 112
 ## verify_applied_slab.gd (G-ACS-*). Effective only where FP_FARRING_APPLIED_COVER already governs.
 const FP_APPLIED_PROBE_SLAB := false
 
+## COSMOS-FAR-NEAR-MESA §3 (FP_APPLIED_VIEW_BAND) — REFINES FP_APPLIED_PROBE_SLAB's still-unsatisfiable conjunct.
+## #113's slab clamp made the applied-cover probe fit the terrain's bounds slab y∈[−64,130), but godot_voxel only
+## ever streams the mesh-block rows [c−4, c+3] around the viewer's row c=floordiv(player_y,32) (view 128 ⇒ e=4;
+## Box3i::from_center_extents is one block short upward), so the FULL slab is loadable ONLY for c∈{1,2} (player
+## y∈[32,95]). A mesa/badlands valley floor puts the player at c=0 ⇒ row 4 (y128..159) never loads ⇒ the probe's
+## first step is false forever ⇒ `_applied_r` pinned 0 ⇒ the un-sunk 26-block dense backstop protrudes over the
+## concave near tops = the grey oval (#117). This flag makes the probe demand exactly the engine's LOADABLE set:
+## it clamps the probe box vertically to module_world.meshed_band_y(player_ly) (the viewer row window, folding in
+## the live view distance) ON TOP of the slab, so the ladder is SATISFIABLE at any player height and view distance.
+## Soundness: since the un-probed band above the window is genuinely unloaded, zone C (sunk cover) is HEIGHT-BANDED
+## — a vertex whose TRUE surface exceeds the band top STAYS zone B (at-height chord), so the fix NEVER draws less
+## geometry than today (no new see-through). Off ⇒ `_applied_box_meshed_slab` keeps the #113 body verbatim, the
+## height gate is vacuous (applied_top=1e9), the height cache/telemetry key are never built (byte-identical) →
+## FLAT 6042/0. Gate: verify_applied_band.gd (G-VB-*). Effective only where FP_APPLIED_PROBE_SLAB already governs.
+const FP_APPLIED_VIEW_BAND := false
+
 ## COSMOS BLOCK-LOD Phase 0/P0 (docs/COSMOS-BLOCK-LOD-DESIGN.md §2/§3/§9) — MASTER flag anchoring the decimated-block
 ## terrain LOD pyramid chain (successor to FP_BLOCKY_FARRING's single ring). P0 ships ONLY the data model: the
 ## `FacetBlockLod` per-facet column pyramid (L0..L5, pitch 2^n) + its 2× downscale decimator (MIN top-height /

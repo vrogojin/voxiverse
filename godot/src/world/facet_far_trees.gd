@@ -52,6 +52,7 @@ const THIN_MIN := 0.15                # keep-fraction at the fog line (design §
 const THIN_FADE := 0.06               # dithered-retirement half-width in the survival-hash domain (no pop as keep(d) crosses hue)
 const FADE_EPS := 0.004               # below this the instance is dropped (fully faded / retired) — bounds the transient count
 const BURY := 1.0                      # radial sink (blocks): trunk base buried so trees sit on the tier datum (§4.3)
+const CULL_PROBE_CAP := 256            # FP_FAR_TREES_NEARCULL §5.2/R1: max is_area_meshed probes / rebuild pass — beyond it, emit (degrade to shipped, never a gap)
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
 const EVICT_DWELL_STEPS := 20          # dwell before an unwanted facet's cached list is evicted (V2 convention)
@@ -133,6 +134,22 @@ var _last_wanted: Array = []            # cached wanted-facet set (reused until 
 var _last_wanted_cam := Vector3.ZERO    # camera pos at the last wanted-scan recompute
 var _last_wanted_epoch := -1            # _cache_epoch at the last wanted-scan recompute
 var _dbg_rebuild_count := 0             # real card rebuilds run (gate read-back)
+
+## FP_FAR_TREES_NEARCULL (docs/COSMOS-FARTREE-ALIGN-DESIGN.md §5): the near-mesh-presence handoff cull. `_near_query` is
+## the SHARED NearPresence.covered Callable (fid, fid-lattice AABB)->COVERED|NOT_COVERED|UNKNOWABLE (plumbed like the
+## chop query; unset ⇒ UNKNOWABLE everywhere ⇒ today's distance band, never worse than shipped). `_cull_dwell` keys a
+## tree Vector3i(fid, bx, bz) to its cull state: ABSENT ⇒ far SHOWN (default); PRESENT ⇒ far HIDDEN, value = consecutive
+## NOT_COVERED probes toward the FT_CULL_DWELL restore. `_cull_touched` marks trees probed this rebuild pass so untouched
+## dwell entries drop (bounded ~annulus, ~5 KB). `_pending_nearcull_fp` is the §5.4 change fingerprint (XOR of stable
+## per-tree hashes over currently-COVERED trees) folded into the DELTA gate so a mesh landing under a still camera
+## re-arms the cull. All read only under the flag ⇒ byte-identical off (no probe, no fingerprint, no dwell).
+var _near_query: Callable = Callable()
+var _cull_dwell: Dictionary = {}
+var _cull_touched: Dictionary = {}
+var _cull_probes := 0                   # probes issued this rebuild pass (capped at CULL_PROBE_CAP)
+var _dbg_cull_probes := 0               # last rebuild pass's probe count (gate read-back)
+var _pending_nearcull_fp := 0           # §5.4 fingerprint computed in step()/debug_step before the DELTA check
+var _last_rebuild_nearcull_fp := 0      # fingerprint latched at the last real rebuild
 
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
@@ -354,6 +371,20 @@ static func card_fade(d: float, hue: float) -> float:
 		fin = smoothstep(float(TerrainConfig.near_render_radius()), float(TerrainConfig.near_render_radius()) + FADE_NEAR_W, d)
 	return clampf(fin * thin_alpha(hue, d), 0.0, 1.0)
 
+## FP_FAR_TREES_ALIGN §4.3: the far radial sink as a DISTANCE ramp — 0 at/inside FT_SINK_R0 (the near boundary, where the
+## visible ground is the near mesh at TRUE height so the exact-height base must hold), ramping to FT_SINK_MAX past
+## FT_SINK_R1 (deep in the band the visible ground is the sunk V2/far tier, where a buried trunk base reads right). ONE
+## source of truth; the gate asserts sink_ramp(FT_SINK_R0)==0 and the emitted origin == anchor − r̂·sink_ramp(d).
+static func sink_ramp(d: float) -> float:
+	return CubeSphere.FT_SINK_MAX * smoothstep(CubeSphere.FT_SINK_R0, CubeSphere.FT_SINK_R1, d)
+
+## FP_FAR_TREES_NEARCULL §5.4: a stable per-tree hash (fid, lattice base bx, bz) for the change fingerprint (order-
+## independent XOR over COVERED trees). Not a placement hash — only needs determinism + good spread.
+static func _cull_hash(fid: int, bx: int, bz: int) -> int:
+	var n := (fid * 374761393 + bx * 668265263 + bz * 2246822519) & 0x7FFFFFFF
+	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF
+	return n ^ (n >> 16)
+
 # =====================================================================================================================
 # Construction — one MultiMeshInstance3D child of the ring, one card material, the CPU-rasterised atlas, the shared
 # unit card mesh. Called from FacetFarRing.setup under FP_FAR_TREES.
@@ -444,6 +475,97 @@ func set_edits_rev_query(q: Callable) -> void:
 func _current_edits_rev() -> int:
 	return int(_edits_rev_query.call()) if _edits_rev_query.is_valid() else 0
 
+## FP_FAR_TREES_NEARCULL §5.5: wire the shared near-presence query (WorldManager → NearPresence.covered). Stored like the
+## chop query; only read under the flag (byte-identical off).
+func set_near_query(q: Callable) -> void:
+	_near_query = q
+
+## FP_FAR_TREES_NEARCULL §5.2-§5.3: should this tree's FAR impostor be EMITTED, given the NEAR field's ACTUAL mesh
+## presence? Only the uncertainty annulus [FT_CULL_MIN, near_render_radius()+40] is probed (below ⇒ never emit — the near
+## field owns it, no gap; above the max near-mesh extent ⇒ emit, no probe — near can't reach there; the near field never
+## streams past near_render_radius(), pool_view is capped there). COVERED ⇒ cull immediately (HIDE_STREAK 1 — a positive
+## is_area_meshed is a fact); NOT_COVERED ⇒ restore only after FT_CULL_DWELL consecutive (SHOW_STREAK hysteresis vs
+## mesh-block churn at the receding edge); UNKNOWABLE ⇒ never change state. Unwired query ⇒ the shipped `dist < r0` band
+## (no gap-fill, no cull) so byte-off + every existing gate holds. Updates `_cull_dwell` + marks `_cull_touched`.
+func _nearcull_emit(fid: int, dist: float, bx: float, gy: float, bz: float) -> bool:
+	if not _near_query.is_valid():
+		return dist >= float(TerrainConfig.near_render_radius())   # unwired ⇒ shipped distance band (degrade, never worse)
+	if dist < CubeSphere.FT_CULL_MIN:
+		return false                                               # near field owns it — never emit far (no gap: near present)
+	var probe_hi := float(TerrainConfig.near_render_radius()) + 32.0 + 8.0
+	if dist > probe_hi:
+		return true                                                # beyond the max near-mesh extent — emit, no probe
+	var key := Vector3i(fid, int(bx), int(bz))
+	_cull_touched[key] = true
+	var st := NearPresence.UNKNOWABLE
+	if _cull_probes < CULL_PROBE_CAP:
+		_cull_probes += 1
+		st = int(_near_query.call(fid, AABB(Vector3(bx, gy + 1.0, bz), Vector3.ONE)))
+	# else: over the probe cap ⇒ treat as UNKNOWABLE (emit unless already hidden) — bounded cost, never a gap.
+	if st == NearPresence.COVERED:
+		_cull_dwell[key] = 0                                       # hidden; reset the restore streak
+		return false
+	elif st == NearPresence.NOT_COVERED:
+		if not _cull_dwell.has(key):
+			return true                                            # already SHOWN — stay shown
+		var streak := int(_cull_dwell[key]) + 1                    # currently HIDDEN — advance toward restore
+		if streak >= CubeSphere.FT_CULL_DWELL:
+			_cull_dwell.erase(key)
+			return true                                            # restored (dwell satisfied)
+		_cull_dwell[key] = streak
+		return false                                              # still hidden (dwell)
+	else:
+		return not _cull_dwell.has(key)                            # UNKNOWABLE: never change state
+
+## FP_FAR_TREES_NEARCULL §5.4: the change fingerprint — XOR of `_cull_hash` over every annulus tree currently probed
+## COVERED. A mesh landing flips a tree to COVERED ⇒ the fingerprint drifts ⇒ `_rebuild_inputs_changed` re-arms the
+## (otherwise DELTA-skipped) rebuild. PURE READ: no dwell mutation (dwell advances only in the real rebuild, so the
+## FT_CULL_DWELL count stays 'consecutive rebuilds'). Probes are capped at CULL_PROBE_CAP. Only called under the flag.
+func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
+	if not _near_query.is_valid():
+		return 0
+	var probe_hi := float(TerrainConfig.near_render_radius()) + 32.0 + 8.0
+	var fp := 0
+	var probes := 0
+	for fid in wanted:
+		if not _cache.has(int(fid)):
+			continue
+		var recs: PackedFloat32Array = _cache[int(fid)]
+		var m := recs.size() / REC_FLOATS
+		for i in range(m):
+			if probes >= CULL_PROBE_CAP:
+				return fp
+			var o := i * REC_FLOATS
+			var sx: float = recs[o + 0]; var sy: float = recs[o + 1]; var sz: float = recs[o + 2]
+			var dx := sx - cam_abs.x; var dy := sy - cam_abs.y; var dz := sz - cam_abs.z
+			var dist := sqrt(dx * dx + dy * dy + dz * dz)
+			if dist < CubeSphere.FT_CULL_MIN or dist > probe_hi:
+				continue
+			probes += 1
+			var bx := recs[o + 8]; var gy := recs[o + 9]; var bz := recs[o + 10]
+			if int(_near_query.call(int(fid), AABB(Vector3(bx, gy + 1.0, bz), Vector3.ONE))) == NearPresence.COVERED:
+				fp ^= _cull_hash(int(fid), int(bx), int(bz))
+	return fp
+
+## FP_FAR_TREES_NEARCULL: reset the per-rebuild probe budget + touched set before a rebuild pass (wraps the mesh+card
+## rebuild pair in step()/debug_rebuild/debug_step). No-op off.
+func _nearcull_begin() -> void:
+	_cull_probes = 0
+	_cull_touched.clear()
+
+## FP_FAR_TREES_NEARCULL: after a rebuild pass, drop dwell entries for trees not probed this pass (bounds the dict to the
+## live probe annulus). No-op off.
+func _nearcull_end() -> void:
+	_dbg_cull_probes = _cull_probes
+	if _cull_dwell.is_empty():
+		return
+	var drop: Array = []
+	for k in _cull_dwell.keys():
+		if not _cull_touched.has(k):
+			drop.append(k)
+	for k in drop:
+		_cull_dwell.erase(k)
+
 ## True iff the tree with lattice base (bx, gy, bz) in `fid` is chopped (its trunk-base cell edited). Only under
 ## FP_FAR_TREES_FADE with a live query; else false (P0/P1 — no filter). Main-thread (rebuild) call, race-free.
 func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
@@ -499,14 +621,23 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# rebuild when NOTHING it reads has changed — camera still, cache epoch unchanged, edits unchanged, no offsurf flip.
 	# The output buffers would be BIT-IDENTICAL, so skipping is pixel-identical. Dispatch + dwell above still ran, so
 	# streaming-in of missing facets is untouched. Off ⇒ the `and` short-circuits and both rebuilds run verbatim.
+	# FP_FAR_TREES_NEARCULL §5.4: compute the near-presence change fingerprint BEFORE the DELTA gate so a mesh landing
+	# under a still camera (which changes nothing else the gate reads) re-arms the rebuild that culls the far tree. Pure
+	# read (no dwell mutation); only when both flags are live.
+	if CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
+		_pending_nearcull_fp = _compute_nearcull_fp(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
 		return
 	# Rung-1 meshes [R0, FAR_TREES_MESH_MAX) FIRST, so the cards can retreat to [FAR_TREES_MESH_MAX, CARD_MAX] — the
 	# 448 handoff is EXCLUSIVE (a tree renders in exactly one band, no double). Off ⇒ cards keep the full [R0, CARD_MAX].
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_begin()
 	if CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
 		_rebuild_cards(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_end()
 	# FP_FAR_TREES_COLORFIX §4.2: the first completed rebuild after an offsurf flip clears the hide latch — the next
 	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
@@ -563,14 +694,27 @@ func _enum_worker(fid: int) -> void:
 			# what guarantees the placement bijection (no double-trees at a shared facet border).
 			if not FacetAtlas.in_polygon(fid, base.x, base.z, 0.0):
 				continue
-			var w := FacetAtlas.lattice_to_world64(fid, float(base.x), float(base.y), float(base.z))
+			# FP_FAR_TREES_ALIGN §4.1: anchor at the NEAR trunk-bottom-face centre (bx+0.5, gy+1, bz+0.5) — the SAME
+			# W_fid map + column_top the near mesher uses, evaluated in f64 both sides, so the far base COINCIDES with
+			# the near trunk base by construction (kills the −1 ground-cell-vs-trunk-base + the ½-block corner-vs-centre
+			# lateral skew). Off ⇒ the shipped raw corner (bx, gy) verbatim (byte-identical record floats).
+			var ax := float(base.x); var ay := float(base.y); var az := float(base.z)
+			if CubeSphere.FP_FAR_TREES_ALIGN:
+				ax += 0.5; ay += 1.0; az += 0.5
+			var w := FacetAtlas.lattice_to_world64(fid, ax, ay, az)
 			var wx := float(w[0]); var wy := float(w[1]); var wz := float(w[2])
 			var rlen := sqrt(wx * wx + wy * wy + wz * wz)
 			if rlen < 1.0e-6:
 				continue
 			var rx := wx / rlen; var ry := wy / rlen; var rz := wz / rlen
 			# Radial sink by BURY so the trunk base sits on the tier datum (never rides a tier that protrudes, §4.3).
-			var sx := wx - rx * BURY; var sy := wy - ry * BURY; var sz := wz - rz * BURY
+			# Under FP_FAR_TREES_ALIGN the sink becomes a DISTANCE ramp applied at rebuild (exact at the near boundary),
+			# so the enum record stores the UNSUNK anchor; off ⇒ the shipped flat BURY sink here (byte-identical record).
+			var sx: float; var sy: float; var sz: float
+			if CubeSphere.FP_FAR_TREES_ALIGN:
+				sx = wx; sy = wy; sz = wz
+			else:
+				sx = wx - rx * BURY; sy = wy - ry * BURY; sz = wz - rz * BURY
 			var species := int(info["species"])
 			var trunk_h := int(info["trunk_h"])
 			var hue := _hue01(gx, gz)
@@ -648,12 +792,14 @@ func _rebuild_inputs_changed(cam_abs: Vector3) -> bool:
 		or cam_abs.distance_to(_last_rebuild_cam) >= CubeSphere.FT_DELTA_MIN_MOVE \
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
-		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale) \
+		or (CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp)
 	if changed:
 		_have_rebuilt = true
 		_last_rebuild_cam = cam_abs
 		_last_rebuild_cache_epoch = _cache_epoch
 		_last_rebuild_edits_rev = _current_edits_rev()
+		_last_rebuild_nearcull_fp = _pending_nearcull_fp
 	return changed
 
 func _advance_dwell(wanted: Array) -> void:
@@ -723,7 +869,15 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			var sx: float = recs[o + 0]; var sy: float = recs[o + 1]; var sz: float = recs[o + 2]
 			var dx := sx - cam_abs.x; var dy := sy - cam_abs.y; var dz := sz - cam_abs.z
 			var dist := sqrt(dx * dx + dy * dy + dz * dz)
-			if dist < r0 or dist > d2:
+			if dist > d2:
+				continue
+			# FP_FAR_TREES_NEARCULL §5.2: when the mesh rung is OFF the cards own the near frontier — the probe REPLACES the
+			# `dist < r0` skip (gap-fills a ramped-down view, culls the overlap band exactly where the near tree renders).
+			# When meshes are ON r0 is the 448 handoff (the mesh rung owns the frontier + does the cull) → keep the skip.
+			if CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH:
+				if not _nearcull_emit(int(fid), dist, recs[o + 8], recs[o + 9], recs[o + 10]):
+					continue
+			elif dist < r0:
 				continue
 			var packed: float = recs[o + 7]
 			var trunk_h := floorf(packed)
@@ -732,13 +886,24 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			# (bounds the transient overlap count + far card count). FADE off ⇒ alpha 1.0 (no dither, hard band).
 			var alpha := 1.0
 			if fade:
-				alpha = card_fade(dist, hue)
+				# FP_FAR_TREES_NEARCULL §5.2: when the cards own the near frontier (mesh off) the probe REPLACES the near
+				# dither-in — keep only the survival thinning so gap-fill trees show. Mesh on ⇒ card_fade's fin is the 448
+				# cross-dither (kept). Off ⇒ card_fade verbatim.
+				if CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH:
+					alpha = thin_alpha(hue, dist)
+				else:
+					alpha = card_fade(dist, hue)
 				if alpha <= FADE_EPS:
 					continue
 			# P2 chop filter: a chopped tree (trunk-base cell edited) never reappears far. No-op when FADE off / no query.
 			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
 				continue
 			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
+			# FP_FAR_TREES_ALIGN §4.3: sink the exact (unsunk) anchor by the distance ramp — 0 at the near boundary (exact
+			# base), buried FT_SINK_MAX deep. Off ⇒ no adjust (the enum record is already BURY-sunk, byte-identical).
+			if CubeSphere.FP_FAR_TREES_ALIGN:
+				var sk := sink_ramp(dist)
+				sx -= rx * sk; sy -= ry * sk; sz -= rz * sk
 			var raw := int(recs[o + 6])
 			var col := float(raw & 7)                     # low 3 bits = species atlas column
 			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
@@ -814,11 +979,23 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var sx: float = recs[o + 0]; var sy: float = recs[o + 1]; var sz: float = recs[o + 2]
 			var dx := sx - cam_abs.x; var dy := sy - cam_abs.y; var dz := sz - cam_abs.z
 			var dist := sqrt(dx * dx + dy * dy + dz * dz)
-			if dist < r0 or dist >= d1_hi:
-				continue                      # outside the mesh band (near field owns <R0; cards own the far side)
+			if dist >= d1_hi:
+				continue                      # cards own the far side
+			# FP_FAR_TREES_NEARCULL §5.2: the mesh rung owns the near frontier [R0, 448) — the probe REPLACES the `dist < R0`
+			# skip, culling the far mesh exactly where the near blocky tree renders (and gap-filling a ramped-down view).
+			if CubeSphere.FP_FAR_TREES_NEARCULL:
+				if not _nearcull_emit(int(fid), dist, recs[o + 8], recs[o + 9], recs[o + 10]):
+					continue
+			elif dist < r0:
+				continue                      # near field owns <R0 (shipped)
 			var alpha := 1.0
 			if fade:
-				alpha = mesh_fade(dist)
+				# FP_FAR_TREES_NEARCULL §5.2: the near-frontier dither-IN is REPLACED by the probe (a hard swap the §4 weld
+				# makes invisible) — keep only the 448 cross-dither (fout) so gap-fill trees (d<R0) aren't faded to nothing.
+				if CubeSphere.FP_FAR_TREES_NEARCULL:
+					alpha = 1.0 - smoothstep(d1 - FADE_BAND_W, d1 + FADE_BAND_W, dist)
+				else:
+					alpha = mesh_fade(dist)
 				if alpha <= FADE_EPS:
 					continue                  # fully faded out past the 448 cross-dither → drop
 			if _is_chopped(int(fid), recs[o + 8], recs[o + 9], recs[o + 10]):
@@ -832,6 +1009,11 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 				capped = true
 				continue                      # this species' alloc is full; other species may still fill
 			var rx: float = recs[o + 3]; var ry: float = recs[o + 4]; var rz: float = recs[o + 5]
+			# FP_FAR_TREES_ALIGN §4.3: sink the exact (unsunk) anchor by the distance ramp before writing (0 at the near
+			# boundary, buried deep). Off ⇒ no adjust (the enum record is already BURY-sunk).
+			if CubeSphere.FP_FAR_TREES_ALIGN:
+				var sk := sink_ramp(dist)
+				sx -= rx * sk; sy -= ry * sk; sz -= rz * sk
 			var packed: float = recs[o + 7]
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
@@ -897,6 +1079,13 @@ func _build_archetype_mesh(species: int) -> Dictionary:
 	var uv2 := PackedVector2Array()
 	var idx := PackedInt32Array()
 	var dirs := [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]
+	# FP_FAR_TREES_ALIGN §4.2 (E3): the archetype's cells are emitted CENTRED at integer cell y (cube spans y±0.5),
+	# so the trunk-bottom cell (y=1) sits at local [0.5,1.5] — +0.5 high against an origin meant to be the trunk-
+	# bottom face. With the enum origin now at the trunk-bottom-face centre (bx+0.5, gy+1, bz+0.5), shift ALL faces
+	# −0.5 Y ⇒ each cube spans [y−1, y], the lowest trunk cell's bottom lands at local 0 (the anchor), and the mesh's
+	# min vertex Y == 0. The trunk-stretch shader is unaffected (bottom still at local 0; clamp(v.y/arch) unchanged).
+	# Built once at setup ⇒ the flag is consulted once; off ⇒ shipped geometry bytes (yoff 0).
+	var yoff := 0.5 if CubeSphere.FP_FAR_TREES_ALIGN else 0.0
 	for key in solid.keys():
 		var p: Vector3i = key
 		var id := int(solid[key])
@@ -905,7 +1094,7 @@ func _build_archetype_mesh(species: int) -> Dictionary:
 		for d in dirs:
 			if solid.has(p + d):
 				continue                       # internal face — culled
-			_mesh_face(verts, cols, uv2, idx, Vector3(p.x, p.y, p.z), d, colr, flag)
+			_mesh_face(verts, cols, uv2, idx, Vector3(p.x, float(p.y) - yoff, p.z), d, colr, flag)
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = verts
@@ -1109,9 +1298,13 @@ func debug_set_cache(fid: int, recs: PackedFloat32Array) -> void:
 	_cache_epoch += 1                         # mirror _reap_enum: a cache add bumps the DELTA epoch
 
 func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_begin()
 	if CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	_rebuild_cards(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false                        # mirror step(): the first completed rebuild clears the hide latch
 	return _live_instances
@@ -1121,18 +1314,42 @@ func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 ## `_rebuild_inputs_changed` is false, else rebuilds (and clears the COLORFIX latch). Dispatch/dwell are omitted so the
 ## gate stays hermetic (no threads). Returns true iff this call actually rebuilt.
 func debug_step(wanted: Array, cam_abs: Vector3) -> bool:
+	if CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
+		_pending_nearcull_fp = _compute_nearcull_fp(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
 		return false
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_begin()
 	if CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
 		_rebuild_cards(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
 	return true
 
 func rebuild_count() -> int:
 	return _dbg_rebuild_count
+
+## FP_FAR_TREES_NEARCULL gate read-backs (G-FTC-*): probes issued in the last rebuild pass, live dwell-dict size, and
+## the min archetype-mesh vertex Y (G-FTA-2: 0.0 under ALIGN via the −0.5 shift, 0.5 off).
+func cull_probe_count() -> int:
+	return _dbg_cull_probes
+func cull_dwell_size() -> int:
+	return _cull_dwell.size()
+func mesh_min_vertex_y(col: int) -> float:
+	if col >= _arch_meshes.size():
+		return NAN
+	var mm := _arch_meshes[col] as ArrayMesh
+	if mm.get_surface_count() == 0:
+		return NAN
+	var verts := mm.surface_get_arrays(0)[Mesh.ARRAY_VERTEX] as PackedVector3Array
+	var mn := INF
+	for v in verts:
+		mn = minf(mn, v.y)
+	return mn
 
 ## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
 func debug_apply_visibility(offsurf: bool) -> void:

@@ -350,7 +350,7 @@ new file mode 100644
 index 0000000..0d461a9
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -0,0 +1,1773 @@
+@@ -0,0 +1,1777 @@
 +#include "voxel_generator_cosmos.h"
 +#include "../../util/godot/classes/noise.h"
 +#include "cosmos_terrain.h"
@@ -438,6 +438,7 @@ index 0000000..0d461a9
 +
 +	p.faceted = bool(config.get("faceted", false));
 +	p.m5c_corner = bool(config.get("m5c_corner", false));
++	p.slope_all_biomes = bool(config.get("slope_all_biomes", false)); // FP_SLOPE_ALL_MATERIALS (#122)
 +
 +	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
 +	p.facet_off = get_i32_param(config, "facet_off");
@@ -885,7 +886,10 @@ index 0000000..0d461a9
 +		if (lo_r >= int64_t(g) * 4 && hi_r <= int64_t(g + 1) * 4) {
 +			return false; // within [g, g+1] -> today's smoothing, all biomes
 +		}
-+		if (int(column_profile_core(p, fid, x, z).y) != cosmos::B_MOUNTAINS) {
++		const int b = int(column_profile_core(p, fid, x, z).y);
++		// FP_SLOPE_ALL_MATERIALS (#122): mirror of TerrainConfig — widen the 45-deg band to all Earth
++		// land biomes except B_BADLANDS when p.slope_all_biomes. Off -> shipped B_MOUNTAINS-only branch.
++		if (b != cosmos::B_MOUNTAINS && !(p.slope_all_biomes && b != cosmos::B_BADLANDS)) {
 +			return false; // the 1-2 block/cell band off the mountains -> leave hills alone
 +		}
 +	}
@@ -2129,7 +2133,7 @@ new file mode 100644
 index 0000000..d4a1d0e
 --- /dev/null
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,396 @@
 +#ifndef VOXEL_GENERATOR_COSMOS_H
 +#define VOXEL_GENERATOR_COSMOS_H
 +
@@ -2448,6 +2452,7 @@ index 0000000..d4a1d0e
 +		// here, because a `const` there is a runtime value to us.
 +		bool faceted = false;
 +		bool m5c_corner = false;
++		bool slope_all_biomes = false; // FP_SLOPE_ALL_MATERIALS (#122): widen the 45-deg slope band to all non-badlands land biomes
 +
 +		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
 +		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is

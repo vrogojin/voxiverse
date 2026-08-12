@@ -4069,6 +4069,7 @@ func _generate_block(buffer, origin_in_voxels, lod):
 	gen.set("gen_facet", facet_override if facet_override != -999 else (TerrainConfig.active_facet() if CubeSphere.FACETED else -1))   # FACETED §3.3: frozen facet epoch (FP-R0 override)
 	gen.set("gen_lod_probe", lod_probe)                  # FP-R0 §B: lod>0 stride sampling (default false → shipped early-out)
 	gen.set("radial_datum", CubeSphere.FP_RADIAL_DATUM)  # COSMOS FS2 §3.2: the C++ mirror resolves each cell at true y − S
+	gen.set("slope_all_biomes", CubeSphere.FP_SLOPE_ALL_MATERIALS)  # #122: widen the 45° slope band to all non-badlands land biomes
 	# GEN-EFFICIENCY Fix A: freeze the bulk-underground flag + the two fill ARIDs (the cube ARID a plain deep STONE /
 	# DEEPSLATE cell writes — modifier-0 cube, so exposed non-ore walls match byte-for-byte). Read off the SAME baked
 	# cube_arid table the per-cell path uses; -1 when a material isn't baked → that branch never fills (per-cell).
@@ -4124,6 +4125,7 @@ func _make_cpp_generator(src_gen: Object) -> Object:
 	cfg["faceted"] = CubeSphere.FACETED
 	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
 	cfg["radial_datum"] = CubeSphere.FP_RADIAL_DATUM     # COSMOS FS2 §3.2
+	cfg["slope_all_biomes"] = CubeSphere.FP_SLOPE_ALL_MATERIALS  # #122: mirror the widened 45° slope band into the C++ generator
 	cfg["model_count"] = src_gen.get("model_count")
 	cfg["waterlog"] = src_gen.get("waterlog")
 	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set

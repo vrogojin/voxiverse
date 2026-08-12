@@ -1746,7 +1746,11 @@ static func _slope_fires_only(x: int, z: int, g: int, pcache) -> bool:
 		# within the two-cell window → NOT a >2 block/cell face.
 		if lo_r >= g * 4 and hi_r <= (g + 1) * 4:
 			return false                              # within [g, g+1] → today's smoothing (all biomes)
-		if int(column_profile(x, z, pcache).y) != B_MOUNTAINS:
+		var b := int(column_profile(x, z, pcache).y)
+		# FP_SLOPE_ALL_MATERIALS (#122): widen the 45°-band gate from B_MOUNTAINS-only to ALL Earth land biomes
+		# except B_BADLANDS (its sub-g terracotta/sandstone carve bands are deliberately unbaked → would cube-fall-
+		# back, the #111 render-above-physics sink). The C++ port mirrors this on p.slope_all_biomes. Off ⇒ shipped.
+		if b != B_MOUNTAINS and not (CubeSphere.FP_SLOPE_ALL_MATERIALS and b != B_BADLANDS):
 			return false                              # 1–2 block/cell band off the mountains → leave hills alone
 	var tw0 := roundi(raw.x)
 	var tw1 := roundi(raw.y)

@@ -56,6 +56,7 @@ const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radi
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
 const EVICT_DWELL_STEPS := 20          # dwell before an unwanted facet's cached list is evicted (V2 convention)
 const MESH_STRIDE := 16                # rung-1 mesh MultiMesh buffer floats/instance (12 transform + 4 custom)
+const MESH_STRIDE_CFIX := 20           # FP_FAR_TREES_COLORFIX: 12 transform + 4 COLOR (white) + 4 custom (RS layout)
 const N_SPECIES := 6                   # OAK/BIRCH/SPRUCE/ACACIA/JUNGLE/CACTUS → atlas/mesh column = species-1
 
 # The shared card mesh (unit archetype: 2 vertical crossed quads + 1 horizontal cap quad; local Y∈[0,1], half-
@@ -85,6 +86,12 @@ var _arch_meshes: Array = []           # 6 ArrayMesh archetypes
 var _arch_trunk: PackedFloat32Array = PackedFloat32Array()   # 6 canonical archetype trunk heights (blocks)
 var _mesh_live := 0                    # last rebuild's total live mesh instances (across species)
 var _mesh_capped := false              # last rebuild hit FAR_TREES_MESH_TOTAL_MAX or a per-species alloc
+
+## FP_FAR_TREES_COLORFIX §4.2: hide-until-first-rebuild-after-offsurf. On de-orbit `step()` sets visibility from
+## `shell_offsurface()` BEFORE the settle gate, so the tier re-appears instantly with the PRE-ORBIT (frozen) instance
+## set + stale band membership until FP_LOAD_DEFER settles. Latched true on any offsurf frame; cleared at the end of
+## the first completed rebuild → visibility is `not offsurf and not _stale` (correct-or-nothing). Off ⇒ never consulted.
+var _stale := false
 
 # P2 (FP_FAR_TREES_FADE) edit-overlay chop filter: a main-thread Callable (fid:int, cell:Vector3i)->bool that returns
 # true iff the player has an edit at that cell (chopped). Fed once by WorldManager; unset ⇒ no filter (P0/P1). Only
@@ -284,6 +291,12 @@ static func make_mesh_material() -> ShaderMaterial:
 		sm.set_shader_parameter("snow_tint", Vector3(sc.r, sc.g, sc.b))
 	return sm
 
+## FP_FAR_TREES_COLORFIX: the rung-1 mesh MultiMesh buffer stride (floats/instance). With the flag the MultiMesh is
+## `use_colors=true, use_custom_data=true` → the RS layout is 12 xform + 4 COLOR + 4 CUSTOM = 20; off ⇒ the shipped
+## 12 xform + 4 CUSTOM = 16 (byte-identical). ONE source of truth for every buffer size / write-base / ledger site.
+static func mesh_stride() -> int:
+	return MESH_STRIDE_CFIX if CubeSphere.FP_FAR_TREES_COLORFIX else MESH_STRIDE
+
 # =====================================================================================================================
 # P2 (FP_FAR_TREES_FADE) — the no-pop fade LAW, as pure static functions (ONE source of truth: `_rebuild_*` compute
 # the per-instance alpha the dither shader dissolves against, and the gate asserts these same functions' properties).
@@ -366,7 +379,10 @@ func _setup_mesh_band(ring: Node3D) -> void:
 		_arch_meshes.append(mesh)
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
-		mm.use_colors = false
+		# FP_FAR_TREES_COLORFIX: enable the instance color slot (before instance_count, like use_custom_data) so the
+		# gl_compat engine PACKS the color halves properly (from the explicit white quad `_write_mesh_inst` writes)
+		# instead of leaving them holding repack garbage that the ungated `COLOR *= instance_color` multiplies in.
+		mm.use_colors = CubeSphere.FP_FAR_TREES_COLORFIX
 		mm.use_custom_data = true
 		mm.mesh = mesh
 		mm.instance_count = CubeSphere.FAR_TREES_MESH_INST_MAX
@@ -410,15 +426,25 @@ func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
 # Step — reap the enumeration worker, advance dwell eviction, suspend on-surface↔off-surface (inverted like G3),
 # then (rate-capped, settled) dispatch the nearest missing facet's enumeration and rebuild the card buffer.
 # =====================================================================================================================
+## Set the tier's node visibility from the off-surface state. Off ⇒ EXACTLY `not offsurf` (byte-identical shipped
+## behaviour). Under FP_FAR_TREES_COLORFIX (§4.2): any offsurf frame latches `_stale`, and the tier stays hidden
+## on the offsurf→onsurf flip until the first completed rebuild clears the latch (correct-or-nothing, no stale-band
+## garbage frame). Cleared by `_rebuild_*`'s caller (step / debug_rebuild) after the first real rebuild.
+func _apply_visibility(offsurf: bool) -> void:
+	if CubeSphere.FP_FAR_TREES_COLORFIX and offsurf:
+		_stale = true
+	var show := (not offsurf) and not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+	if _mmi != null:
+		_mmi.visible = show
+	for mmi in _mesh_mmis:
+		(mmi as MultiMeshInstance3D).visible = show
+
 func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> void:
 	_reap_enum()
 	# NO far-over-near / orbit suspend (§4.2): trees show ON-surface only; off-surface the whole node is hidden and
 	# the instance set is frozen (mirror of G3's off-surface-only visibility, inverted).
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
-	if _mmi != null:
-		_mmi.visible = not offsurf
-	for mmi in _mesh_mmis:
-		(mmi as MultiMeshInstance3D).visible = not offsurf
+	_apply_visibility(offsurf)
 	if offsurf:
 		return
 	# FP_LOAD_DEFER settle gate: pre-settle we only reaped (a finished build still lands in the LRU); no dispatch,
@@ -446,6 +472,10 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
 		_rebuild_cards(cam_abs, wanted)
+	# FP_FAR_TREES_COLORFIX §4.2: the first completed rebuild after an offsurf flip clears the hide latch — the next
+	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
+	if CubeSphere.FP_FAR_TREES_COLORFIX:
+		_stale = false
 
 # --- enumeration worker (one facet / job) ---------------------------------------------------------------------------
 
@@ -689,8 +719,9 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 	var total_cap := CubeSphere.FAR_TREES_MESH_TOTAL_MAX
 	var bufs: Array = []
 	var counts := PackedInt32Array(); counts.resize(N_SPECIES); counts.fill(0)
+	var stride := mesh_stride()
 	for c in range(N_SPECIES):
-		var b := PackedFloat32Array(); b.resize(per_cap * MESH_STRIDE); bufs.append(b)
+		var b := PackedFloat32Array(); b.resize(per_cap * stride); bufs.append(b)
 	var total := 0
 	var capped := false
 	for fid in wanted:
@@ -731,7 +762,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
 			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
-			_write_mesh_inst(bufs[col], counts[col] * MESH_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow)
+			_write_mesh_inst(bufs[col], counts[col] * stride, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow)
 			counts[col] += 1
 			total += 1
 	for c in range(N_SPECIES):
@@ -758,10 +789,18 @@ func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, 
 	buf[base + 0] = t1.x; buf[base + 1] = r.x; buf[base + 2] = t2.x; buf[base + 3] = sx
 	buf[base + 4] = t1.y; buf[base + 5] = r.y; buf[base + 6] = t2.y; buf[base + 7] = sy
 	buf[base + 8] = t1.z; buf[base + 9] = r.z; buf[base + 10] = t2.z; buf[base + 11] = sz
-	# .w carries the dither alpha under FADE (0.0 off). The snow flag (P3) has no spare custom slot, so it packs into
-	# the hue slot: y = hue + 2·snow (hue ∈ [0,1) so the SNOW shader reads snow = step(1.5,y), hue = fract(y)). SNOW
-	# off ⇒ snow 0 ⇒ y = hue (byte-identical with the merged P1/P2).
-	buf[base + 12] = delta; buf[base + 13] = hue + 2.0 * snow; buf[base + 14] = arch; buf[base + 15] = fade
+	# FP_FAR_TREES_COLORFIX: write an explicit WHITE (1,1,1,1) instance color at floats [12..15] so the gl_compat
+	# engine packs the color slot to half(1,1,1,1) — the ungated `COLOR *= instance_color` (scene.glsl) then becomes
+	# an identity ×1 instead of multiplying albedo by the repack garbage. Custom shifts to [16..19]. Off ⇒ custom at
+	# [12..15] (the shipped 16-float layout, byte-identical) — no color slot exists.
+	var co := base + 12
+	if CubeSphere.FP_FAR_TREES_COLORFIX:
+		buf[base + 12] = 1.0; buf[base + 13] = 1.0; buf[base + 14] = 1.0; buf[base + 15] = 1.0
+		co = base + 16
+	# custom .w carries the dither alpha under FADE (0.0 off). The snow flag (P3) has no spare custom slot, so it packs
+	# into the hue slot: y = hue + 2·snow (hue ∈ [0,1) so the SNOW shader reads snow = step(1.5,y), hue = fract(y)).
+	# SNOW off ⇒ snow 0 ⇒ y = hue. INSTANCE_CUSTOM still decodes from this (properly-packed) slot with use_colors=true.
+	buf[co + 0] = delta; buf[co + 1] = hue + 2.0 * snow; buf[co + 2] = arch; buf[co + 3] = fade
 
 ## Build ONE species' archetype ArrayMesh from its `TreeGen.archetype_cells` cube set: exposed-face voxel meshing
 ## (internal faces between two solid cells culled). Per-vertex COLOR from BlockCatalog.color_of; UV2.x flag = 0 for
@@ -949,7 +988,7 @@ func total_bytes() -> int:
 	# ArrayMeshes. Zero when the mesh band isn't built (FP_FAR_TREES_MESH off).
 	var mesh_buf_b := 0
 	if not _mesh_mms.is_empty():
-		mesh_buf_b = N_SPECIES * CubeSphere.FAR_TREES_MESH_INST_MAX * MESH_STRIDE * 4
+		mesh_buf_b = N_SPECIES * CubeSphere.FAR_TREES_MESH_INST_MAX * mesh_stride() * 4  # +48 KB under COLORFIX (stride 20)
 		for am in _arch_meshes:
 			var mm := am as ArrayMesh
 			if mm.get_surface_count() > 0:
@@ -998,7 +1037,19 @@ func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 	if CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	_rebuild_cards(cam_abs, wanted)
+	if CubeSphere.FP_FAR_TREES_COLORFIX:
+		_stale = false                        # mirror step(): the first completed rebuild clears the hide latch
 	return _live_instances
+
+## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
+func debug_apply_visibility(offsurf: bool) -> void:
+	_apply_visibility(offsurf)
+func mmi_visible() -> bool:
+	return _mmi != null and _mmi.visible
+func is_stale() -> bool:
+	return _stale
+func mesh_uses_colors() -> bool:
+	return (not _mesh_mms.is_empty()) and (_mesh_mms[0] as MultiMesh).use_colors
 
 func debug_buffer() -> PackedFloat32Array:
 	return _last_buf

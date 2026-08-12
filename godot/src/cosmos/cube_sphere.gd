@@ -897,6 +897,22 @@ const FAR_TREES_CACHE_FACETS := 64           # per-facet tree-list LRU capacity 
 const FAR_TREES_STEP_MS := 250               # min ms between FacetFarTrees instance-set rebuilds (rate cap)
 const FAR_TREES_BYTES_MAX := 4 << 20         # NEVER-OOM hard ledger ceiling (4 MB, 2× headroom over the ~2 MB design budget)
 
+## FP_FAR_TREES_COLORFIX (docs/COSMOS-FAR-TREES-COLORFIX-DESIGN.md) — the rung-1 far-tree MESH trees render
+## BLACK/CYAN/oversaturated-GREEN in [128,448) on WEB (gl_compatibility). Root cause: the 6 mesh MultiMeshes are
+## `use_custom_data=true, use_colors=false`, and the mesh shader is the ONLY far-tree shader reading per-vertex
+## COLOR. On GLES3 the engine allocates the color+custom slot pair together but `_multimesh_set_buffer` never writes
+## the color halves (uses_colors false), which keep the raw float bits of custom.x/.y; scene.glsl then does the
+## UNGATED `COLOR *= unpackHalf2x16(colorslot)` → albedo × garbage. Cards (no COLOR read) + near voxel trees are
+## unaffected → band-limited to the mesh. RD (Forward+/headless) keeps separate gated paths → web-only, no gate/desktop
+## run hit it. Under this flag: (§4.1) the 6 mesh MultiMeshes get `use_colors = true` + an explicit WHITE (1,1,1,1)
+## instance color quad so the engine packs the color slot properly and the ungated multiply becomes identity ×1
+## (mesh stride 16→20 = 12 xform + 4 COLOR + 4 CUSTOM; shaders UNCHANGED — INSTANCE_CUSTOM still decodes from the
+## properly-packed custom slot). (§4.2) On the de-orbit offsurf→onsurf visibility flip, a `_stale` latch hides the
+## tier until the first completed rebuild (no stale-band garbage frame). Cards UNTOUCHED (byte-identical). +48 KB
+## (the color quads) ≤ FAR_TREES_BYTES_MAX. Off ⇒ use_colors false, stride 16, no white quad, no hide latch —
+## byte-identical. Gate: verify_far_trees.gd (G-FT-CFIX-OFF / -WHITE / -SNOW-WARM / -FRESH).
+const FP_FAR_TREES_COLORFIX := false         # rung-1 mesh COLOR-slot fix (gl_compat white-color pack) + de-orbit hide latch
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

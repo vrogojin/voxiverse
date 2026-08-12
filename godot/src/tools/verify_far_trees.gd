@@ -36,6 +36,10 @@ const FA := preload("res://src/cosmos/facet_atlas.gd")
 const LIVE_FACETED := true
 const LIVE_FAR_TREES := true
 const LIVE_FAR_TREES_CARDS := true
+const LIVE_FAR_TREES_MESH := true             # rung-1 archetype meshes ship ON (P1)
+const LIVE_FAR_TREES_FADE := true             # dither cross-fades ship ON (P2)
+const LIVE_FAR_TREES_SNOW := true             # snow-dusted variant ships ON (P3)
+const LIVE_FAR_TREES_COLORFIX := true         # the mesh COLOR-slot fix ships ON (this change)
 
 var _pass := 0
 var _fail := 0
@@ -79,6 +83,14 @@ func _initialize() -> void:
 			_gate_fade()                                  # P2 assertions (nopop/thin/chop/splice)
 		else:
 			print("  (P2 fade gates skipped — need FP_FAR_TREES_FADE sed-toggled true)")
+		# G-FT-CFIX (colour-slot fix): two-state stride/use_colors, white-quad + custom-decode parity, snow-not-the-
+		# cause regression pin, and the de-orbit hide latch. Runs in BOTH flag states (self-describes off vs on).
+		_gate_cfix()
+		_gate_cfix_fresh()
+		if CubeSphere.FP_FAR_TREES_SNOW:
+			_gate_cfix_snow()
+		else:
+			print("  (G-FT-CFIX-SNOW-WARM skipped — needs FP_FAR_TREES_SNOW sed-toggled true)")
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -388,7 +400,7 @@ func _gate_mesh() -> void:
 			var buf2: PackedFloat32Array = tier.mesh_buffer(col)
 			var vis2 := tier.mesh_visible(col)
 			for i in range(vis2):
-				var o := i * FT.MESH_STRIDE
+				var o := i * FT.mesh_stride()   # stride 20 under FP_FAR_TREES_COLORFIX, else 16
 				var org := Vector3(buf2[o + 3], buf2[o + 7], buf2[o + 11])
 				if org.distance_to(cam2) < r0:
 					protrude += 1
@@ -544,4 +556,145 @@ func _gate_snow() -> void:
 	# bytes; total_bytes stays under the 4 MB ledger.
 	var b := tier.total_bytes()
 	_ok(b <= CubeSphere.FAR_TREES_BYTES_MAX, "G-FT-SNOW-LEDGER: total_bytes %d <= FAR_TREES_BYTES_MAX %d (snow adds ~0 — shader lerp, no atlas region)" % [b, CubeSphere.FAR_TREES_BYTES_MAX])
+	ring.queue_free()
+
+# ---- G-FT-CFIX (FP_FAR_TREES_COLORFIX — the mesh COLOR-slot fix) ----------------------------------------------------
+
+## G-FT-CFIX-OFF / -WHITE. Two-state, self-describing: mesh_stride()/use_colors track the flag; OFF ⇒ 16-float stride
+## + use_colors false (byte-identical shipped layout), ON ⇒ 20-float stride + use_colors true with an explicit WHITE
+## (1,1,1,1) instance color at [12..15] and the custom quad shifted to [16..19] — proving both that the colour slot is
+## an identity multiplier (kills the gl_compat repack-garbage aliasing) AND that the CUSTOM decode
+## (delta/hue+2snow/arch/fade the shader's trunk-stretch reads) is intact at its shifted offset (decode parity).
+func _gate_cfix() -> void:
+	var cfix := CubeSphere.FP_FAR_TREES_COLORFIX
+	var want_stride := 20 if cfix else 16
+	_ok(FT.mesh_stride() == want_stride,
+		"G-FT-CFIX-%s: mesh_stride() == %d (12 xform %s 4 custom)" % ["ON" if cfix else "OFF", want_stride, "+ 4 COLOR +" if cfix else "+"])
+	if not CubeSphere.FP_FAR_TREES_MESH:
+		print("  (G-FT-CFIX buffer gates skipped — need FP_FAR_TREES_MESH sed-toggled true)")
+		return
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	# The live mesh MultiMesh use_colors flag tracks FP_FAR_TREES_COLORFIX exactly (the root-cause: use_colors=false +
+	# a COLOR-reading shader is the aliasing bug; the fix is enabling it so the engine packs the slot properly).
+	_ok(tier.mesh_uses_colors() == cfix, "G-FT-CFIX-%s: mesh MultiMesh.use_colors == %s" % ["ON" if cfix else "OFF", str(cfix)])
+	# Controlled radial spread INSIDE the mesh band [R0, MESH_MAX) so every species buffer has live instances.
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var r0 := float(TerrainConfig.near_render_radius())
+	var synth := PackedFloat32Array()
+	var stepd := int(r0) + 20
+	while stepd < int(CubeSphere.FAR_TREES_MESH_MAX) - 40:
+		var p := centre + tangent * float(stepd)
+		var r := p.normalized()
+		synth.push_back(p.x); synth.push_back(p.y); synth.push_back(p.z)
+		synth.push_back(r.x); synth.push_back(r.y); synth.push_back(r.z)
+		synth.push_back(float((stepd / 20) % 6))     # species col 0..5 (snow bit 3 unset)
+		synth.push_back(5.0)                          # trunk_h 5, hue 0
+		synth.push_back(0.0); synth.push_back(0.0); synth.push_back(0.0)   # lattice base (synthetic)
+		stepd += 20
+	tier.debug_set_cache(fid, synth)
+	tier.debug_rebuild([fid], centre)
+	var stride: int = FT.mesh_stride()
+	var white_ok := true
+	var custom_ok := true
+	var any := 0
+	for col in range(6):
+		var buf: PackedFloat32Array = tier.mesh_buffer(col)
+		var vis := tier.mesh_visible(col)
+		var arch := tier.mesh_arch_trunk(col)
+		var exp_delta := 5.0 - arch                    # delta = trunk_h(5) − arch  (the shader's trunk-stretch source)
+		for i in range(vis):
+			any += 1
+			var base := i * stride
+			if cfix:
+				# COLOR slot [12..15] is an explicit identity white — the whole fix (no repack garbage the ungated
+				# `COLOR *= instance_color` would multiply into albedo).
+				if not (is_equal_approx(buf[base + 12], 1.0) and is_equal_approx(buf[base + 13], 1.0)
+						and is_equal_approx(buf[base + 14], 1.0) and is_equal_approx(buf[base + 15], 1.0)):
+					white_ok = false
+			# CUSTOM decode parity: custom is at [12..15] OFF / [16..19] ON, and STILL carries (delta, hue+2·snow,
+			# arch, fade). trunk_h 5, hue 0, snow 0 ⇒ (5−arch, 0, arch, *). The colour add did NOT corrupt custom.
+			var co := base + (16 if cfix else 12)
+			if not (is_equal_approx(buf[co + 0], exp_delta) and is_equal_approx(buf[co + 1], 0.0)
+					and is_equal_approx(buf[co + 2], arch)):
+				custom_ok = false
+	_ok(any > 0, "G-FT-CFIX: mesh band populated for the decode-parity scan (%d instances)" % any)
+	if cfix:
+		_ok(white_ok, "G-FT-CFIX-WHITE: every live mesh instance COLOR slot == (1,1,1,1) identity")
+	_ok(custom_ok, "G-FT-CFIX-WHITE: CUSTOM (delta,hue+2snow,arch) intact at %s (decode parity — colour add didn't corrupt it)"
+		% ("[16..19]" if cfix else "[12..15]"))
+	ring.queue_free()
+
+## G-FT-CFIX-SNOW-WARM (refuted-lead regression pin, needs FP_FAR_TREES_SNOW): snow packs into custom.y (= hue+2·snow)
+## and is decided by the FarPalette snow-line predicate — NOT the colour aliasing. Warm facet 1754 (design §1) ⇒ every
+## record snow=0 and packed custom.y < 1.5; a cold facet ⇒ ≥1 record snow=1 (packed y ≥ 2.0). Confirms snow is correct
+## and stays correct under COLORFIX (the packing is unchanged; only the slot's byte offset moved).
+func _gate_cfix_snow() -> void:
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	var earth_n := 6 * FA.K * FA.K
+	var warm_checked := 0
+	var warm_all_bare := true
+	if 1754 < earth_n:
+		var recs: PackedFloat32Array = tier.enumerate_facet_sync(1754)
+		var m := recs.size() / FT.REC_FLOATS
+		for i in range(m):
+			var o := i * FT.REC_FLOATS
+			var snow_bit := (int(recs[o + 6]) & 8) != 0
+			var packed_y := (recs[o + 7] - floorf(recs[o + 7])) + (2.0 if snow_bit else 0.0)   # the mesh custom.y pack
+			if snow_bit or packed_y >= 1.5:
+				warm_all_bare = false
+			warm_checked += 1
+	_ok(warm_checked == 0 or warm_all_bare,
+		"G-FT-CFIX-SNOW-WARM: warm facet 1754 — every far tree snow=0, custom.y<1.5 (%d recs)" % warm_checked)
+	# Cold pin: scan the faces (incl. poles) for a facet that yields a snow-dusted far tree (bit 1, custom.y ≥ 2.0).
+	var k := FA.K
+	var cold_found := false
+	for face in range(6):
+		if cold_found: break
+		for a in [k / 4, k / 2, 3 * k / 4]:
+			if cold_found: break
+			for bb in [k / 4, k / 2, 3 * k / 4]:
+				var fid: int = face * k * k + a * k + bb
+				var recs2: PackedFloat32Array = tier.enumerate_facet_sync(int(fid))
+				var m2 := recs2.size() / FT.REC_FLOATS
+				for i in range(m2):
+					if (int(recs2[i * FT.REC_FLOATS + 6]) & 8) != 0:
+						cold_found = true
+						break
+				if cold_found: break
+	_ok(cold_found, "G-FT-CFIX-SNOW-WARM: a cold facet yields ≥1 snow far tree (custom.y ≥ 2.0) — snow correct, not the cause")
+	ring.queue_free()
+
+## G-FT-CFIX-FRESH (§4.2 de-orbit hide latch). OFF ⇒ visibility is EXACTLY `not offsurf` (byte-identical). ON ⇒ after
+## an offsurf→onsurf flip the tier stays invisible until the first completed rebuild clears the latch (correct-or-
+## nothing, no stale pre-orbit band frame). Driven via the visibility/rebuild test hooks (no live FacetFarRing).
+func _gate_cfix_fresh() -> void:
+	var cfix := CubeSphere.FP_FAR_TREES_COLORFIX
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.debug_apply_visibility(true)      # off-surface: hidden (both states); latches _stale under the flag
+	var hid_off := not tier.mmi_visible()
+	tier.debug_apply_visibility(false)     # back on-surface, BEFORE any rebuild
+	if cfix:
+		_ok(hid_off and not tier.mmi_visible(),
+			"G-FT-CFIX-FRESH: tier stays invisible after offsurf→onsurf until the first rebuild (no stale-band frame)")
+		tier.enumerate_facet_sync(fid)
+		tier.debug_rebuild([fid], Vector3.ZERO)   # first completed rebuild clears the latch
+		tier.debug_apply_visibility(false)
+		_ok(tier.mmi_visible() and not tier.is_stale(),
+			"G-FT-CFIX-FRESH: visible again after the first completed rebuild (latch cleared)")
+	else:
+		_ok(hid_off and tier.mmi_visible(),
+			"G-FT-CFIX-FRESH(off): visibility == not offsurf, no stale latch (byte-identical)")
 	ring.queue_free()

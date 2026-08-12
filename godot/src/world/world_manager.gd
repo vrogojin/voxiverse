@@ -407,6 +407,11 @@ func _ready() -> void:
 		_facet_ring.name = "FacetFarRing"
 		add_child(_facet_ring)
 		_facet_ring.setup(TerrainConfig.active_facet())
+		# docs/COSMOS-FAR-TREES-DESIGN.md (P2, FP_FAR_TREES_FADE §5.5): hand the far-tree tier the edit-overlay chop
+		# query so a chopped tree never reappears as a far card/mesh. Self-guards (no far-trees instance / flag off ⇒
+		# the Callable is stored but never consulted) ⇒ byte-identical off.
+		if CubeSphere.FP_FAR_TREES:
+			_facet_ring.set_far_trees_chop_query(Callable(self, "far_tree_chopped"))
 		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
@@ -3511,6 +3516,14 @@ func set_far_trees_sun_dir(sun_dir: Vector3) -> void:
 func set_far_trees_camera(cam: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_far_trees_camera(cam)
+
+## docs/COSMOS-FAR-TREES-DESIGN.md (P2 §5.5): true iff the player has an edit at (fid, cell) — the far-tree chop
+## filter's predicate. Faceted (no chart) keys by FacetAtlas.edit_key(fid, cell) — a pure/O(1) `_edits.has`. Empty
+## overlay / non-faceted-chart ⇒ false (no filter). Main-thread only (called from the far-trees rebuild).
+func far_tree_chopped(fid: int, cell: Vector3i) -> bool:
+	if _edits.is_empty() or _chart != null or not CubeSphere.FACETED:
+		return false
+	return _edits.has(FacetAtlas.edit_key(fid, cell))
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

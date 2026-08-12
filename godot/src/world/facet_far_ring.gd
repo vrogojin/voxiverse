@@ -5039,6 +5039,11 @@ func set_far_trees_sun_dir(sun_dir: Vector3) -> void:
 func set_far_trees_camera(cam: Vector3) -> void:
 	_ft_cam = cam
 
+## docs/COSMOS-FAR-TREES-DESIGN.md (P2): forward the edit-overlay chop query to the tier. No-op with no instance.
+func set_far_trees_chop_query(q: Callable) -> void:
+	if _far_trees != null:
+		_far_trees.set_chop_query(q)
+
 ## docs/COSMOS-FAR-TREES-DESIGN.md — far-trees telemetry accessor for the shell telemetry / gate (null-safe).
 func far_trees() -> Object:
 	return _far_trees

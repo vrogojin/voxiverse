@@ -2506,6 +2506,19 @@ const FP_WARM_TRUE_BUDGET := false
 ## edit-index scan (W4) without bound (NEVER-OOM: a hard cap; existing snow still evolves). Default FALSE ⇒
 ## `process` uses the shipped burst accumulator verbatim ⇒ BYTE-IDENTICAL. Gate G-SNOW-SLICED (verify_snow_sliced.gd).
 const FP_SNOW_SLICED := false
+## COSMOS-FOREST-SNOW-PROC (docs/COSMOS-FOREST-SNOW-PROC-DESIGN.md) — the FREEZING-PRECIPITATION WHITELIST.
+## The SnowfallSystem 0.5 s step runs its full per-column cost (2× unmemoized column_profile + generated_cell
+## resolves + the M1 evaluator + an env sample) in EVERY biome, warm or cold, storm or clear — then in a warm
+## snow-free forest writes NOTHING (measured 6.4 ms native / 18-44 ms live snow_ms of pure waste). FP_SNOW_PRECIP_GATE
+## makes SnowfallSystem._process_column a physical whitelist: a bare (unedited) column is processed ONLY when it is
+## actively precipitating there AND its surface temperature is < SNOW_T0 (the ONE freeze authority, terrain_config.gd:82).
+## Every skipped column is a PROVEN shipped no-op (§3.3), so the _edits overlay / snow_cells / step_counter and every
+## rendered cell stay BYTE-IDENTICAL — only wasted CPU is removed. Columns that HOLD snow (snow_stack_at != 0) or carry
+## an overlay edit at the surface / g+1 keep the shipped path so melt + stale-state-clear still run (§3.4 option a).
+## Under the same flag the ts source is rerouted from the unmemoized column_profile(x,z).w to the persistent
+## analytic_column_profile(x,z).w (identical value — the datum shift touches only .x — served from the memo). Default
+## FALSE ⇒ _process_column runs the shipped code verbatim ⇒ BYTE-IDENTICAL. Gate: verify_snow_precip_gate.gd.
+const FP_SNOW_PRECIP_GATE := false
 ## COSMOS-PERF UNATTENDED R3 (docs/COSMOS-PERF-UNATTENDED-DESIGN.md §0-W3 / §5 R3) — the ALTITUDE REGIME GATE.
 ## In orbit/fall (draws ≈ 30 = only the shell + sky on screen) the whole near-field active-facet machinery still
 ## churns every physics tick: the ground track sweeps facets, so maybe_cross_facet commits redesignations (up to

@@ -50,11 +50,22 @@ var step_counter: int = 0           ## monotonic fixed-step index — drives BOT
 var snow_cells: int = 0             ## number of snow-authored `_edits` cells (the budget counter)
 var last_writes: int = 0            ## cell writes performed in the most recent step (verify pin)
 var last_step_cells: Array[Vector3i] = []   ## the cells written/reverted in the most recent step (verify: block count)
+var cols_full_total: int = 0        ## COSMOS-FOREST-SNOW-PROC gate telemetry: cumulative count of columns that ran the
+                                    ## FULL shipped body (were NOT elided by FP_SNOW_PRECIP_GATE). Byte-NEUTRAL — it never
+                                    ## touches _edits / snow_cells / step_counter / any rendered cell, so world evolution is
+                                    ## unaffected; verify_snow_precip_gate reads its delta to prove the skip actually engages.
 
 var _snow_id: int = -1
 var _weather: FastNoiseLite
 var _accum: float = 0.0
 var _budget_logged: bool = false
+
+# --- COSMOS-FOREST-SNOW-PROC (FP_SNOW_PRECIP_GATE): the freezing-precipitation whitelist ------------
+## Snapshotted from the flag as an instance var so the gate suite can drive BOTH states directly (the same
+## direct-drive pattern process_sliced uses). When true, _process_column processes a bare column ONLY under
+## active snowfall AND ts < SNOW_T0; every skipped column is a proven shipped no-op (design §3.3), so world
+## evolution stays byte-identical. Default reads CubeSphere.FP_SNOW_PRECIP_GATE (false ⇒ shipped path verbatim).
+var _gate_enabled: bool = CubeSphere.FP_SNOW_PRECIP_GATE
 
 # --- FP_SNOW_SLICED drain state (a step in progress, spread across frames) ---------------------------
 var _slice_active: bool = false          ## a fixed step is mid-drain (its columns not all processed yet)
@@ -232,7 +243,11 @@ func step_now(player_col: Vector2i) -> void:
 func _process_column(x: int, z: int, player_col: Vector2i) -> int:
 	var writes := 0
 	var g := TerrainConfig.height_at(x, z)
-	var t := TerrainConfig.column_profile(x, z).w
+	# COSMOS-FOREST-SNOW-PROC (FP_SNOW_PRECIP_GATE, design §3.1): serve the climate temp from the PERSISTENT
+	# analytic memo instead of the pcache-less column_profile (recomputed every call on the faceted build). The
+	# value is IDENTICAL — analytic_column_profile shifts only .x (the datum), never .w — so ts is unchanged; only
+	# the ×2 profile recompute is killed. Flag-off ⇒ the shipped unmemoized read verbatim.
+	var t := TerrainConfig.analytic_column_profile(x, z).w if _gate_enabled else TerrainConfig.column_profile(x, z).w
 	var ts := ClimateModel.surface_temperature(g, t)
 	# CLIMATE W0 (§3.4): the seasonal snow line. The offset shifts this column's freeze test with the
 	# subsolar latitude — snow advances in the winter hemisphere and retreats in summer, entirely inside
@@ -240,6 +255,28 @@ func _process_column(x: int, z: int, player_col: Vector2i) -> int:
 	# ⇒ byte-identical to the shipped snow sim. The signed latitude comes from the env's chart (0 when flat).
 	if CubeSphere.FP_SEASONS and world.environment != null:
 		ts += ClimateModel.season_offset(world.environment.signed_sinlat(x, z), ClimateModel.current_sin_delta)
+
+	# COSMOS-FOREST-SNOW-PROC (FP_SNOW_PRECIP_GATE, design §3.2): the freezing-precipitation WHITELIST. A bare
+	# generated column outside (active snowfall AND ts < SNOW_T0) is a PROVEN no-op for this entire method (§3.3) —
+	# skip it before the evaluator / depth machinery ever run. Flag-off ⇒ this whole block is dead and the shipped
+	# path below runs verbatim (byte-identical). Decision table (bare columns): (cold,precip)=full path;
+	# (cold,dry)=skip; (warm,*)=skip — all three skipped outcomes equal the shipped 0-write result exactly.
+	if _gate_enabled:
+		# MELT / STATE-CLEAR ESCAPE (design §3.4 option a) — the two easily-removable escape checks. Columns that
+		# HOLD an overlay edit at the surface or g+1 (dynamic snow, dug/placed cells, stale snow_capped state bits)
+		# or hold BASELINE snow (seasonal thaw fringe) keep the shipped path so melt + state-clear still run. For the
+		# literal "all-disable" reading (design §3.4 option b, a behaviour change), delete the outer has_edit guard
+		# and the inner `snow_stack_at == 0` guard — leaving just the strict (warm OR dry) → return 0.
+		if not world.has_edit(Vector3i(x, g, z)) and not world.has_edit(Vector3i(x, g + 1, z)):
+			if ts >= TerrainConfig.SNOW_T0:
+				if TerrainConfig.snow_stack_at(x, z) == 0:
+					return 0        # warm, no snow anywhere → skip (rain or clear alike; is_snowing not even consulted)
+				# warm WITH baseline snow (seasonal thaw fringe) → fall through: the shipped MELT branch must run
+			elif not is_snowing(x, z):
+				return 0            # sub-zero but DRY → skip (MELT unreachable at ts < 0; ACCUMULATE would 0-write)
+			# sub-zero AND precipitating → fall through: the whitelist case, the shipped ACCUMULATE branch runs
+
+	cols_full_total += 1   # reached the full shipped body (not gate-elided) — byte-neutral gate telemetry only
 
 	# (1) Piggyback the M1 melt/freeze EVALUATOR on the exposed surface cell (§4.3.4): bounded (one call
 	# per processed column), main-thread, and its SET (freeze) edge stays self-gated to the generated

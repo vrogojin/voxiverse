@@ -412,6 +412,10 @@ func _ready() -> void:
 		# the Callable is stored but never consulted) ⇒ byte-identical off.
 		if CubeSphere.FP_FAR_TREES:
 			_facet_ring.set_far_trees_chop_query(Callable(self, "far_tree_chopped"))
+			# docs/COSMOS-FOREST-FPS-DESIGN.md (§4, FP_FAR_TREES_DELTA): hand the tier the edit-revision query so a
+			# fresh chop re-arms its rebuild-on-change gate within one step. Stored like the chop query; only read
+			# under the flag ⇒ byte-identical with FP_FAR_TREES_DELTA off.
+			_facet_ring.set_far_trees_edits_rev_query(Callable(self, "edit_count"))
 		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and

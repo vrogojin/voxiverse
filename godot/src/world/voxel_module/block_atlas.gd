@@ -48,12 +48,6 @@ var texture: Texture2D = null                 # the baked atlas (ImageTexture)
 var image: Image = null                       # the source Image (kept so the verify gate can sample cells)
 var material: Material = null                 # the ONE shared opaque atlas material (StandardMaterial3D, or the B3 ShaderMaterial twin under FP_NEAR_DAYLIGHT; identity-checked by G-ATLAS-MAT)
 
-# COSMOS NEAR-LEAF-CUTOUT (CubeSphere.FP_LEAF_CUTOUT): the transparent-cutout TWIN of `material`, shared by the 7 leaf
-# ids (BlockCatalog.is_leaf_id). Same atlas texture + same near-daylight shade law, plus ONE `if (t.a < LEAF_SCISSOR)
-# discard;` — opaque-queue alpha-test (no blend, no sort), the far-card recipe. null unless FP_LEAF_CUTOUT (so flag-off
-# is byte-identical: never built, never routed, uniform feeds no-op). Identity-checked by verify_leaf_cutout G-LEAF-MAT.
-var leaf_material: Material = null
-
 # COSMOS ATMO2 B3 (docs/COSMOS-ATMO2-DESIGN.md §2.3/§3.3): the near-field daylight TWIN of the shared atlas
 # material. Keeps vertex-colour×texture EXACTLY (UNSHADED base, white albedo, double-sided, nearest-mipmap +
 # CLAMP) and multiplies an absolute day/night shade(μ), μ = normalize(world_pos)·ŝ (planet centre = scene origin
@@ -129,32 +123,33 @@ void fragment() {
 }
 "
 
-## The near-field daylight shader source. `unified` off (default = the flag) ⇒ the shipped _NEAR_DAYLIGHT_SHADER
-## VERBATIM (byte-identical); on ⇒ the same look with the shared VoxiLight law + true planet-radial normal string-
-## included. `centre_fix` (FP_NIGHT_TERRAIN_CENTRE, unified off) ⇒ the shipped shade law with ONLY the true-radial
-## normal correction (_NEAR_DAYLIGHT_CENTRE_SHADER). Exposed static so gates can build every variant without toggling.
-static func near_daylight_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED,
-		centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
-	if unified:
-		return _NEAR_UNIFIED_HEAD + VoxiLight.shade_glsl() + _NEAR_UNIFIED_TAIL
-	if centre_fix:
-		return _NEAR_DAYLIGHT_CENTRE_SHADER
-	return _NEAR_DAYLIGHT_SHADER
-
-# COSMOS NEAR-LEAF-CUTOUT: the single texture insertion the leaf twin adds to whichever near-daylight variant is live.
-# Every variant fragment() has this exact line (leading tab) immediately before its ALBEDO write, so the discard is
-# spliced in right after the texture fetch — cutout happens BEFORE the shade multiply (kept texels take the identical
+# COSMOS LEAF-CUTOUT-PERF: the atlas fetch line the cutout discard is spliced AFTER. Every near-daylight variant's
+# fragment() has this exact line (leading tab) immediately before its ALBEDO write, so `if (t.a < LEAF_SCISSOR) discard;`
+# lands right after the texture fetch — cutout happens BEFORE the shade multiply (kept texels take the identical
 # voxi_shade / shipped shade-law path; discarded ones never reach ALBEDO). The exact far-card recipe (facet_far_trees.gd:134).
 const _LEAF_FETCH_LINE := "\tvec4 t = texture(atlas_tex, UV);\n"
 
-## The leaf cutout twin's shader source: `near_daylight_shader_code(...)` (the same live variant) with EXACTLY one
-## `if (t.a < LEAF_SCISSOR) discard;` inserted after the atlas fetch. Exposed static (mirrors near_daylight_shader_code)
-## so the gate can reconstruct the expected source for every variant without toggling consts (G-LEAF-MAT string-diff).
-static func leaf_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED,
-		centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE) -> String:
-	var base := near_daylight_shader_code(unified, centre_fix)
-	var discard_line := "\tif (t.a < %s) discard;\n" % String.num(CubeSphere.LEAF_SCISSOR, 3)
-	return base.replace(_LEAF_FETCH_LINE, _LEAF_FETCH_LINE + discard_line)
+## The near-field daylight shader source. `unified` off (default = the flag) ⇒ the shipped _NEAR_DAYLIGHT_SHADER
+## VERBATIM (byte-identical); on ⇒ the same look with the shared VoxiLight law + true planet-radial normal string-
+## included. `centre_fix` (FP_NIGHT_TERRAIN_CENTRE, unified off) ⇒ the shipped shade law with ONLY the true-radial
+## normal correction (_NEAR_DAYLIGHT_CENTRE_SHADER). `cutout` (FP_LEAF_CUTOUT, COSMOS LEAF-CUTOUT-PERF §5) splices
+## EXACTLY one `if (t.a < LEAF_SCISSOR) discard;` after the atlas fetch: leaves stay on THIS one shared material — only
+## punched leaf texels can ever discard (non-leaf cells are min-alpha 255 by construction), so it costs +1 compare and
+## ZERO extra draws. Off ⇒ the shipped strings verbatim (byte-identical). Exposed static so gates build every variant.
+static func near_daylight_shader_code(unified := CubeSphere.FP_SHADE_UNIFIED,
+		centre_fix := CubeSphere.FP_NIGHT_TERRAIN_CENTRE,
+		cutout := CubeSphere.FP_LEAF_CUTOUT) -> String:
+	var base: String
+	if unified:
+		base = _NEAR_UNIFIED_HEAD + VoxiLight.shade_glsl() + _NEAR_UNIFIED_TAIL
+	elif centre_fix:
+		base = _NEAR_DAYLIGHT_CENTRE_SHADER
+	else:
+		base = _NEAR_DAYLIGHT_SHADER
+	if cutout:
+		var discard_line := "\tif (t.a < %s) discard;\n" % String.num(CubeSphere.LEAF_SCISSOR, 3)
+		return base.replace(_LEAF_FETCH_LINE, _LEAF_FETCH_LINE + discard_line)
+	return base
 
 var grid := Vector2i(GRID, GRID)              # atlas_size_in_tiles the cube models are configured with
 var _cell_of: Dictionary = {}                 # block_id -> Vector2i(col, row); only opaque cubes that got a cell
@@ -305,9 +300,6 @@ func build() -> bool:
 	image.generate_mipmaps()
 	texture = ImageTexture.create_from_image(image)
 	material = _make_material(texture)
-	# The transparent-cutout leaf twin (same atlas texture + shade law + one discard). null unless the flag ⇒ byte-off.
-	if CubeSphere.FP_LEAF_CUTOUT:
-		leaf_material = _make_leaf_material(texture)
 	_built = true
 	print("[block_atlas] built %d×%d atlas: %d opaque cube ids + %d snow-cap variants → %d cells (%d free) at %d² px" % [
 		GRID, GRID, _cell_of.size(), _snow_cap_cell.size(), next, GRID * GRID - next, ATLAS_PX])
@@ -398,44 +390,12 @@ func _make_material(tex: Texture2D) -> Material:
 	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
 	mat.texture_repeat = false                      # CLAMP (§4.3)
 	mat.vertex_color_use_as_albedo = true
-	return mat
-
-## COSMOS NEAR-LEAF-CUTOUT (§6.4): the transparent-cutout leaf TWIN of `_make_material` — the SAME atlas texture, the
-## SAME near-daylight shade law + uniforms, plus ONE opaque-queue alpha-test. Under FP_NEAR_DAYLIGHT it is the
-## ShaderMaterial `leaf_shader_code()` (near_daylight_shader_code + the discard) with the identical uniform feed, so the
-## leaf twin shades through the same FP_SHADE_UNIFIED / FP_NEAR_DAYLIGHT terminator (voxi_shade) as the terrain — discard
-## runs BEFORE the shade, so kept texels keep lit albedo. On the shader-off path it is the StandardMaterial clone with
-## TRANSPARENCY_ALPHA_SCISSOR (cutout in the opaque queue, works headless + FLAT). Called only under FP_LEAF_CUTOUT.
-func _make_leaf_material(tex: Texture2D) -> Material:
-	if CubeSphere.FP_NEAR_DAYLIGHT:
-		var sh := Shader.new()
-		sh.code = leaf_shader_code()
-		var sm := ShaderMaterial.new()
-		sm.shader = sh
-		sm.set_shader_parameter("atlas_tex", tex)
-		# Same uniform seeding as `_make_material` (the twin shares the terminator feed verbatim).
-		if CubeSphere.FP_SHADE_UNIFIED:
-			sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
-			sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
-			sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
-			sm.set_shader_parameter("planet_centre", Vector3.ZERO)
-		else:
-			sm.set_shader_parameter("night_floor", CosmosSky.NEAR_NIGHT_FLOOR)
-			sm.set_shader_parameter("term_mu", CosmosSky.TERMINATOR_MU)
-			if CubeSphere.FP_NIGHT_TERRAIN_CENTRE:
-				sm.set_shader_parameter("planet_centre", Vector3.ZERO)
-		sm.set_shader_parameter("sun_dir", Vector3(1.0, 0.0, 0.0))
-		return sm
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_color = Color(1, 1, 1)
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	mat.albedo_texture = tex
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS
-	mat.texture_repeat = false                      # CLAMP (§4.3)
-	mat.vertex_color_use_as_albedo = true
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR   # opaque-queue cutout (no blend, no sort)
-	mat.alpha_scissor_threshold = CubeSphere.LEAF_SCISSOR
+	# COSMOS LEAF-CUTOUT-PERF (§6.2): leaves ride THIS one shared material now, so the headless/FLAT StandardMaterial
+	# path needs the opaque-queue alpha-test (only punched leaf cells are < 255 alpha; the live ShaderMaterial path gets
+	# the discard spliced into near_daylight_shader_code instead). Off ⇒ untouched (TRANSPARENCY_DISABLED) ⇒ byte-identical.
+	if CubeSphere.FP_LEAF_CUTOUT:
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR   # opaque-queue cutout (no blend, no sort)
+		mat.alpha_scissor_threshold = CubeSphere.LEAF_SCISSOR
 	return mat
 
 ## COSMOS NEAR-LEAF-CUTOUT (§5): punch the deterministic stipple into ONE leaf cell's alpha plane. The 64×64 cell is
@@ -474,9 +434,6 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 		return
 	if material is ShaderMaterial:
 		(material as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
-	# COSMOS NEAR-LEAF-CUTOUT: feed the twin the same Sun so leaves take the identical terminator (null off ⇒ no-op).
-	if leaf_material is ShaderMaterial:
-		(leaf_material as ShaderMaterial).set_shader_parameter("sun_dir", sun_dir)
 
 ## COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, §2V.6 F1): feed the TRUE planet centre (in the current render frame) into
 ## the near daylight twin so its radial normal n = normalize(v_wp − planet_centre) matches the far shell's at every
@@ -489,6 +446,3 @@ func set_near_daylight_planet_centre(centre: Vector3) -> void:
 		return
 	if material is ShaderMaterial:
 		(material as ShaderMaterial).set_shader_parameter("planet_centre", centre)
-	# COSMOS NEAR-LEAF-CUTOUT: keep the twin's radial normal fresh across crossings too (null off ⇒ no-op).
-	if leaf_material is ShaderMaterial:
-		(leaf_material as ShaderMaterial).set_shader_parameter("planet_centre", centre)

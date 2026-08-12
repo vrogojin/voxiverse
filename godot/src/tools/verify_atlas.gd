@@ -176,11 +176,6 @@ func _gate_uv(mod: Node3D, atlas, opaque: PackedInt32Array) -> void:
 func _gate_mat(mod: Node3D, atlas, opaque: PackedInt32Array, translucent: PackedInt32Array) -> void:
 	print("  --- G-ATLAS-MAT: all opaque cubes share the ONE atlas material instance (mesher merges them) ---")
 	var shared: Object = atlas.material
-	# COSMOS NEAR-LEAF-CUTOUT flag-aware (§7 gate drift): under FP_LEAF_CUTOUT the 7 leaf ids split onto the atlas's
-	# transparent-cutout TWIN (atlas.leaf_material), NOT the shared instance — assert each id onto its EXPECTED material
-	# (leaf twin for leaf ids, shared for the rest). Flag off ⇒ leaf_material null + every id expects `shared` (verbatim).
-	var leaf_cut: bool = CubeSphere.FP_LEAF_CUTOUT
-	var leaf_mat: Object = atlas.leaf_material if leaf_cut else null
 	var not_shared := 0
 	var first_bad := -1
 	var on_atlas := 0
@@ -190,14 +185,13 @@ func _gate_mat(mod: Node3D, atlas, opaque: PackedInt32Array, translucent: Packed
 		if model == null or not model.has_method("get_material_override"):
 			continue
 		var mo: Object = model.call("get_material_override", 0)
-		var want_mat: Object = leaf_mat if (leaf_cut and BlockCatalog.is_leaf_id(id)) else shared
-		if is_same(mo, want_mat):
+		if is_same(mo, shared):
 			on_atlas += 1
 		else:
 			not_shared += 1
 			if first_bad < 0: first_bad = id
 	_ok(not_shared == 0 and on_atlas == opaque.size(),
-		"G-ATLAS-MAT: all %d opaque cubes are on their expected atlas material instance (%d wrong%s)" % [
+		"G-ATLAS-MAT: all %d opaque cubes are on the SAME atlas material instance (%d not shared%s)" % [
 			opaque.size(), not_shared, "" if first_bad < 0 else ", first id=%d" % first_bad])
 	# a translucent control (glass/ice/…) must NOT be on the atlas material (kept per-id — Stage 3).
 	var control_off_atlas := true

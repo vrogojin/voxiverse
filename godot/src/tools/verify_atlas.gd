@@ -121,7 +121,13 @@ func _gate_cover(atlas, opaque: PackedInt32Array) -> void:
 		else:
 			var c := BlockCatalog.color_of(id)
 			want = Color(c.r, c.g, c.b, 1.0)
-		if not _color_close(got, want):
+		# COSMOS NEAR-LEAF-CUTOUT: under FP_LEAF_CUTOUT the leaf cells' alpha plane is stipple-punched, so a leaf cell's
+		# centre texel may be transparent (alpha 0, RGB kept — §5). Compare RGB-only for leaf ids under the flag (the
+		# transparency FRACTION is the job of verify_leaf_cutout G-LEAF-CELL); every non-leaf cell stays min-alpha 255.
+		var ok_col := _color_close(got, want)
+		if not ok_col and CubeSphere.FP_LEAF_CUTOUT and BlockCatalog.is_leaf_id(id):
+			ok_col = _rgb_close(got, want)
+		if not ok_col:
 			wrong += 1
 			if first_wrong < 0: first_wrong = id
 			print("    id %d (%s) cell (%d,%d): atlas=%s want=%s" % [id, BlockCatalog.name_of(id), cell.x, cell.y, str(got), str(want)])
@@ -327,3 +333,8 @@ func _gate_shaped(mod: Node3D, atlas) -> void:
 func _color_close(a: Color, b: Color) -> bool:
 	var tol := 3.0 / 255.0
 	return absf(a.r - b.r) <= tol and absf(a.g - b.g) <= tol and absf(a.b - b.b) <= tol and absf(a.a - b.a) <= tol
+
+## RGB-only closeness (ignores alpha) — the NEAR-LEAF-CUTOUT stipple zeros a punched texel's alpha but keeps its RGB.
+func _rgb_close(a: Color, b: Color) -> bool:
+	var tol := 3.0 / 255.0
+	return absf(a.r - b.r) <= tol and absf(a.g - b.g) <= tol and absf(a.b - b.b) <= tol

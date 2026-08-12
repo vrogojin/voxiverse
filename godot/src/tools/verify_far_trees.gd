@@ -225,6 +225,12 @@ func _gate_noprotrude() -> void:
 	var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
 	var m := recs.size() / FT.REC_FLOATS
 	_ok(m > 0, "G-FT-NOPROTRUDE: facet has enumerable trees (%d)" % m)
+	# G-FT-MESH-HANDOFF (b) — the card-band inner radius, asserted in BOTH flag states (this gate runs whenever
+	# FP_FAR_TREES): MESH on ⇒ cards retreat to FAR_TREES_MESH_MAX (448, exclusive handoff); MESH off ⇒ the P0
+	# floor near_render_radius() (128), so the merged [128, CARD_MAX] card band is BYTE-IDENTICAL with meshes off.
+	var expect_floor := CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
+	_ok(is_equal_approx(tier.card_inner_radius(), expect_floor),
+		"G-FT-MESH-HANDOFF(b): card inner radius %.0f == %.0f (retracts to 448 ONLY under MESH; else 128, P0-unchanged)" % [tier.card_inner_radius(), expect_floor])
 	# Every base is radially sunk BELOW the true surface world position (the BURY law → never rides a protruding tier).
 	var sink_ok := true
 	for i in range(m):

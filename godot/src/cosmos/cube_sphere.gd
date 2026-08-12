@@ -913,6 +913,23 @@ const FAR_TREES_BYTES_MAX := 4 << 20         # NEVER-OOM hard ledger ceiling (4 
 ## byte-identical. Gate: verify_far_trees.gd (G-FT-CFIX-OFF / -WHITE / -SNOW-WARM / -FRESH).
 const FP_FAR_TREES_COLORFIX := false         # rung-1 mesh COLOR-slot fix (gl_compat white-color pack) + de-orbit hide latch
 
+## FP_FAR_TREES_DELTA (docs/COSMOS-FOREST-FPS-DESIGN.md §4, task #119) — rebuild-on-change gate for the far-trees
+## tier. Today `FacetFarTrees.step` re-runs `_rebuild_meshes` + `_rebuild_cards` UNCONDITIONALLY every 250 ms, even
+## with a perfectly static camera — ~57 ms of WASM main-thread churn (walk 40-75 k tree records ×2 rungs, realloc
+## ~0.76 MB buffers, re-`set_buffer`) producing a BIT-IDENTICAL result, which the stream controller then PWM-gates
+## into a 22↔45 fps limit cycle (P(stall|credit>0)=0.96). Every input to the rebuild is a pure function of (camera
+## pos, tree-record cache, edit overlay, offsurf latch); when NONE changed the output buffers are bit-identical, so
+## skipping the rebuild is pixel-identical BY CONSTRUCTION (fades are dist(cam,tree)-only; sun_dir/planet_centre are
+## in-shader uniforms, not in the buffer). Under the flag: after the 250 ms rate cap, `step` skips both rebuilds
+## unless the camera moved ≥ FT_DELTA_MIN_MOVE, the record-cache epoch changed (a facet landed / was evicted), the
+## edit revision changed (a chop), or the COLORFIX offsurf→onsurf `_stale` latch is set; the 3,456-facet wanted scan
+## is likewise recomputed only past FT_DELTA_WANTED_MOVE (dispatch + dwell keep running off the cached set, so
+## streaming-in is untouched). Off ⇒ the `and` short-circuits on the const and every shipped line runs verbatim
+## (byte-identical). Gate: verify_far_trees.gd (G-FTD-1..5).
+const FP_FAR_TREES_DELTA := false            # far-trees rebuild-on-change gate (skip bit-identical static-camera rebuilds)
+const FT_DELTA_MIN_MOVE := 2.0               # blocks of camera motion that re-arm a far-trees rebuild
+const FT_DELTA_WANTED_MOVE := 64.0           # blocks of camera motion that re-compute the wanted-facet scan
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

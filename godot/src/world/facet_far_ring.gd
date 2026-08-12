@@ -5151,6 +5151,12 @@ func set_far_trees_chop_query(q: Callable) -> void:
 	if _far_trees != null:
 		_far_trees.set_chop_query(q)
 
+## docs/COSMOS-FOREST-FPS-DESIGN.md (§4, FP_FAR_TREES_DELTA): forward the edit-revision query (WorldManager.edit_count)
+## so a fresh chop re-arms the rebuild-on-change gate within one step. No-op with no instance; only read under the flag.
+func set_far_trees_edits_rev_query(q: Callable) -> void:
+	if _far_trees != null:
+		_far_trees.set_edits_rev_query(q)
+
 ## docs/COSMOS-FAR-TREES-DESIGN.md — far-trees telemetry accessor for the shell telemetry / gate (null-safe).
 func far_trees() -> Object:
 	return _far_trees

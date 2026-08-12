@@ -40,9 +40,16 @@ const LIVE_FAR_TREES_MESH := true             # rung-1 archetype meshes ship ON 
 const LIVE_FAR_TREES_FADE := true             # dither cross-fades ship ON (P2)
 const LIVE_FAR_TREES_SNOW := true             # snow-dusted variant ships ON (P3)
 const LIVE_FAR_TREES_COLORFIX := true         # the mesh COLOR-slot fix ships ON (this change)
+const LIVE_FAR_TREES_DELTA := true            # the rebuild-on-change gate ships ON (task #119)
 
 var _pass := 0
 var _fail := 0
+## G-FTD edit-revision stub: the DELTA gate mutates this and hands the tier a Callable that returns it — a fresh chop
+## bumps it, mirroring WorldManager.edit_count(). A method (not a captured local) so the lambda-capture-by-value trap
+## ([[voxiverse-gdscript-closure-trap]]) can't freeze it.
+var _fake_edits_rev := 0
+func _fake_edit_count() -> int:
+	return _fake_edits_rev
 func _ok(c: bool, m: String) -> void:
 	if c: _pass += 1
 	else:
@@ -91,6 +98,8 @@ func _initialize() -> void:
 			_gate_cfix_snow()
 		else:
 			print("  (G-FT-CFIX-SNOW-WARM skipped — needs FP_FAR_TREES_SNOW sed-toggled true)")
+		# G-FTD (FP_FAR_TREES_DELTA): the rebuild-on-change gate. Runs in BOTH flag states (self-describes off vs on).
+		_gate_delta()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -697,4 +706,90 @@ func _gate_cfix_fresh() -> void:
 	else:
 		_ok(hid_off and tier.mmi_visible(),
 			"G-FT-CFIX-FRESH(off): visibility == not offsurf, no stale latch (byte-identical)")
+	ring.queue_free()
+
+# ---- G-FTD (FP_FAR_TREES_DELTA — rebuild-on-change) -----------------------------------------------------------------
+
+## docs/COSMOS-FOREST-FPS-DESIGN.md §5 (task #119). Two-state, self-describing. OFF ⇒ every step rebuilds (shipped
+## behaviour): rebuild count == step count (G-FTD-5). ON ⇒ a static-camera step SKIPS the rebuild and the skipped
+## buffer is BIT-IDENTICAL to a forced rebuild (G-FTD-1), and the rebuild RE-ARMS on camera motion ≥ FT_DELTA_MIN_MOVE
+## (G-FTD-2), an edit-revision change / chop (G-FTD-3), and a record-cache epoch bump (G-FTD-4). Driven via the DELTA
+## test hook `debug_step` (mirrors step()'s post-rate-cap tail; no live FacetFarRing / no worker).
+func _gate_delta() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-FTD skipped — needs FP_FAR_TREES_CARDS sed-toggled true, the rebuild proxy)")
+		return
+	var delta := CubeSphere.FP_FAR_TREES_DELTA
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+	_fake_edits_rev = 0
+	# Warm the cache with the facet's real trees (bumps the DELTA epoch); camera on the facet surface centre so a
+	# healthy slice of trees falls inside the card band [R0, CARD_MAX] (near field owns < R0).
+	tier.enumerate_facet_sync(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var cam := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var wanted := [fid]
+
+	if not delta:
+		# G-FTD-5 (flag off): every step rebuilds — the shipped unconditional behaviour (byte-identical hot path).
+		var c0 := tier.rebuild_count()
+		var r1 := tier.debug_step(wanted, cam)
+		var r2 := tier.debug_step(wanted, cam)
+		var r3 := tier.debug_step(wanted, cam)
+		_ok(r1 and r2 and r3 and tier.rebuild_count() - c0 == 3,
+			"G-FTD-5: DELTA off ⇒ every step rebuilds (3 steps → %d rebuilds), shipped behaviour" % (tier.rebuild_count() - c0))
+		ring.queue_free()
+		return
+
+	# --- flag ON ---
+	# G-FTD-1: first step rebuilds; a second identical step SKIPS; the skipped buffer is bit-identical to a forced rebuild.
+	var c0 := tier.rebuild_count()
+	var did1 := tier.debug_step(wanted, cam)          # first-ever rebuild
+	var buf1 := tier.debug_buffer()                    # COW snapshot of the rebuilt card buffer
+	var did2 := tier.debug_step(wanted, cam)          # nothing changed → SKIP
+	_ok(did1 and not did2 and tier.rebuild_count() - c0 == 1,
+		"G-FTD-1: static camera ⇒ 2nd step skips the rebuild (1 rebuild for 2 steps)")
+	tier.debug_rebuild(wanted, cam)                    # force a rebuild (bypasses the gate) with the SAME inputs
+	var buf3 := tier.debug_buffer()
+	_ok(buf1 == buf3, "G-FTD-1: skipped-frame card buffer BIT-IDENTICAL to a forced rebuild (%d floats) — skip is pixel-safe" % buf1.size())
+
+	# G-FTD-2: camera moved ≥ FT_DELTA_MIN_MOVE (2.0) ⇒ the next step rebuilds; then static again ⇒ skips.
+	var cam2 := cam + Vector3(3.0, 0.0, 0.0)          # +3 blocks ≥ 2.0
+	var cA := tier.rebuild_count()
+	var didm := tier.debug_step(wanted, cam2)
+	var didm2 := tier.debug_step(wanted, cam2)
+	_ok(didm and not didm2 and tier.rebuild_count() - cA == 1,
+		"G-FTD-2: camera moved ≥%.1f blk ⇒ rebuild re-arms once, then static ⇒ skips" % CubeSphere.FT_DELTA_MIN_MOVE)
+
+	# G-FTD-4: a record-cache epoch bump (a facet landed / was evicted) ⇒ the next step rebuilds.
+	tier.debug_step(wanted, cam2)                      # ensure latched (static skip)
+	var cC := tier.rebuild_count()
+	tier.debug_set_cache(fid + 100000, PackedFloat32Array())   # bump the epoch (a "facet landed"); not in `wanted` so output is unchanged
+	var didc := tier.debug_step(wanted, cam2)
+	_ok(didc and tier.rebuild_count() - cC == 1, "G-FTD-4: record-cache epoch change (facet land/evict) ⇒ rebuild re-arms")
+
+	# G-FTD-3: an edit-revision change (a chop) ⇒ the next step rebuilds within one step.
+	tier.debug_step(wanted, cam2)                      # latch (static skip)
+	var cD := tier.rebuild_count()
+	_fake_edits_rev += 1                               # a chop bumped WorldManager.edit_count()
+	var dide := tier.debug_step(wanted, cam2)
+	_ok(dide and tier.rebuild_count() - cD == 1, "G-FTD-3: edit-revision change (chop) ⇒ rebuild re-arms within one step")
+	# Chop-ghost check (needs the FADE chop filter): chopping every tree empties the far set on the re-armed step.
+	if CubeSphere.FP_FAR_TREES_FADE:
+		_fake_edits_rev += 1
+		tier.set_chop_query(func(_f, _c): return false)
+		tier.debug_step(wanted, cam2)                  # re-armed rebuild, nothing chopped
+		var live_before := tier.live_instances() + tier.mesh_live_instances()
+		tier.set_chop_query(func(_f, _c): return true)
+		_fake_edits_rev += 1
+		tier.debug_step(wanted, cam2)                  # re-armed rebuild, everything chopped
+		var live_after := tier.live_instances() + tier.mesh_live_instances()
+		_ok(live_before > 0 and live_after == 0,
+			"G-FTD-3: chopping every tree empties the far set on the re-armed step (%d → 0, no ghost)" % live_before)
+		tier.set_chop_query(Callable())
+	else:
+		print("  (G-FTD-3 chop-ghost check skipped — needs FP_FAR_TREES_FADE for the chop filter)")
 	ring.queue_free()

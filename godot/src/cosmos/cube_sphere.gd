@@ -957,6 +957,16 @@ const FP_SLOPE_ALL_MATERIALS := false
 ## The cull STRICTLY REDUCES instances (0 added draws). Gate: verify_far_trees.gd (G-FTA-1..3, G-FTC-1..4, G-NP-*).
 const FP_FAR_TREES_ALIGN := false            # §4: exact near-anchor weld (enum anchor + archetype −0.5 + sink ramp)
 const FP_FAR_TREES_NEARCULL := false         # §5: near-mesh-presence handoff cull (probe-keyed inner boundary)
+## FP_FT_FRAME_WELD (docs/COSMOS-FARTREE-FRAME-DESIGN.md, task #131) — the FAR tree impostors were placed on the facet
+## PLANE (missing the FS2′ datum lift every near-mesh vertex gets → ±5.5 blk altitude error) AND oriented with a
+## world-axis tangent frame (r×ŷ instead of the owner facet's lattice basis → up-to-45° yaw error, ~36° across a
+## cube-face fold). This flag welds both to the OWNER facet's near law: (A) the enum anchor adds
+## FacetAtlas.datum_lift(fid, ax, az) — returns 0 unless FP_DATUM_BAKE, so it tracks the near-mesh +s bake by
+## construction (the skin tier does exactly this, facet_skin_tier.gd:560); (B) the card/mesh instance basis becomes
+## FacetAtlas.frame_basis(owner_fid) = (ê_u, n̂, ê_w) — the same axes the near cubes align to (right-handed det=+1).
+## Rides FP_FAR_TREES_ALIGN (part A) — the stored radial r̂ still serves the ALIGN sink ramp. Off ⇒ the shipped plane
+## anchor + (r×ŷ,r) basis verbatim (bit-identical enum records + card/mesh buffers). No shader/draw/memory change.
+const FP_FT_FRAME_WELD := false              # §3: owner-facet frame weld — anchor +datum_lift (A) + lattice-basis orientation (B)
 ## FP_FT_XFADE_COMPL (docs/COSMOS-FARTREE-SHIFT-RESIDUAL-DESIGN.md §3 P0-b): make the 448 mesh↔card cross-dither
 ## COMPLEMENTARY. The shipped dither is IN-PHASE — card + mesh both keep iff the SAME `_ft_dither(FRAGCOORD) ≤ fade`,
 ## so at the handoff the keep-sets NEST (union coverage = max(f_mesh,f_card), ~50% at the midpoint) and thin trunks

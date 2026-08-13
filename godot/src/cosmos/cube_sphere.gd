@@ -957,7 +957,16 @@ const FP_SLOPE_ALL_MATERIALS := false
 ## The cull STRICTLY REDUCES instances (0 added draws). Gate: verify_far_trees.gd (G-FTA-1..3, G-FTC-1..4, G-NP-*).
 const FP_FAR_TREES_ALIGN := false            # §4: exact near-anchor weld (enum anchor + archetype −0.5 + sink ramp)
 const FP_FAR_TREES_NEARCULL := false         # §5: near-mesh-presence handoff cull (probe-keyed inner boundary)
-const FT_SINK_MAX := 1.0                      # §4.3 deep-band bury (the old BURY)
+## FP_FT_XFADE_COMPL (docs/COSMOS-FARTREE-SHIFT-RESIDUAL-DESIGN.md §3 P0-b): make the 448 mesh↔card cross-dither
+## COMPLEMENTARY. The shipped dither is IN-PHASE — card + mesh both keep iff the SAME `_ft_dither(FRAGCOORD) ≤ fade`,
+## so at the handoff the keep-sets NEST (union coverage = max(f_mesh,f_card), ~50% at the midpoint) and thin trunks
+## dissolve. Under the flag the CARD dither sample is inverted (`1.0 - _ft_dither ≤ v_fade`) so card-keep == the mesh-
+## DISCARD set (f_card = 1 − f_mesh) → union coverage 1.0 across the handoff (mesh unchanged). Card-only, one shader-
+## string edit; default false ⇒ the shipped in-phase string verbatim (byte-identical, gl_compat-safe, 0 added draws).
+const FP_FT_XFADE_COMPL := false             # §3 P0-b: complementary 448 cross-dither (card dither sample inverted)
+const FT_SINK_MAX := 0.15                     # §4.3 deep-band bury — was 1.0; §3 P0-a un-buries the far trunk (deep-band
+                                              # visible ground welds to TRUE height now, so a 1-block bury read as a
+                                              # trunkless canopy on the grass; 0.15 keeps a hair of anti-shimmer bias)
 const FT_SINK_R0 := 208.0                     # sink ramp start (≈ near_render_radius()+80; sink==0 at/inside this)
 const FT_SINK_R1 := 288.0                     # sink ramp full (deep-band bury == FT_SINK_MAX beyond this)
 const FT_CULL_MIN := 64.0                     # §5.2 never-emit-far floor (a close-up card reads worse than a beat of absence)

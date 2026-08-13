@@ -53,7 +53,7 @@ index 0d461a9..aff1f00 100644
 +
  	p.faceted = bool(config.get("faceted", false));
  	p.m5c_corner = bool(config.get("m5c_corner", false));
- 
+ 	p.slope_all_biomes = bool(config.get("slope_all_biomes", false)); // FP_SLOPE_ALL_MATERIALS (#122)
 @@ -1691,19 +1696,132 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
  	return result;
  }

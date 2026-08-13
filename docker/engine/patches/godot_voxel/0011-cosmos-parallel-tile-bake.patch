@@ -157,7 +157,7 @@ index aff1f00..f60107c 100644
  } // namespace
  
  VoxelGeneratorCosmos::VoxelGeneratorCosmos() {}
-@@ -88,9 +125,38 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+@@ -88,10 +125,39 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
  	// leaves sample_columns' colours black; the S3/skin gates supply it. NOT validated as required.
  	p.far_colors = PackedColorArray(config.get("far_colors", PackedColorArray()));
  
@@ -186,6 +186,7 @@ index aff1f00..f60107c 100644
 +
  	p.faceted = bool(config.get("faceted", false));
  	p.m5c_corner = bool(config.get("m5c_corner", false));
+ 	p.slope_all_biomes = bool(config.get("slope_all_biomes", false)); // FP_SLOPE_ALL_MATERIALS (#122)
  
 +	// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md P1 §5): mirror CubeSphere.
 +	// FP_CLIMATE_BIOMES / FP_SKIN_BLOCK_EXACT. Both default false -- an old config that never supplies
@@ -829,9 +830,10 @@ index 7aa3e67..dbe9f04 100644
  	static int deep_family(const Parameters &p, int x, int y, int z);
  	static int strata_at(const Parameters &p, int x, int y, int z);
  	static int strata_variant_of(const Parameters &p, int lx, int ly, int lz, int cy);
-@@ -323,6 +380,13 @@ private:
+@@ -323,7 +380,14 @@ private:
  		bool faceted = false;
  		bool m5c_corner = false;
+ 		bool slope_all_biomes = false; // FP_SLOPE_ALL_MATERIALS (#122): widen the 45-deg slope band to all non-badlands land biomes
  
 +		// COSMOS SKIN-BLOCK-EXACT (docs/COSMOS-SKIN-BLOCK-EXACT-DESIGN.md): the two P1 flags, mirroring
 +		// CubeSphere.FP_CLIMATE_BIOMES / FP_SKIN_BLOCK_EXACT. Both default false so an old config (that

@@ -53,6 +53,7 @@ const THIN_FADE := 0.06               # dithered-retirement half-width in the su
 const FADE_EPS := 0.004               # below this the instance is dropped (fully faded / retired) — bounds the transient count
 const BURY := 1.0                      # radial sink (blocks): trunk base buried so trees sit on the tier datum (§4.3)
 const CULL_PROBE_CAP := 256            # FP_FAR_TREES_NEARCULL §5.2/R1: max is_area_meshed probes / rebuild pass — beyond it, emit (degrade to shipped, never a gap)
+const FT_CULL_SALT_U := 0x5F356495     # §5.2 (#130): salt differentiating a mid-restore UNKNOWABLE term from NOT_COVERED so the U→NOT_COVERED flip drifts the fp (else the stall returns through the UNKNOWABLE door)
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
 const EVICT_DWELL_STEPS := 20          # dwell before an unwanted facet's cached list is evicted (V2 convention)
@@ -216,6 +217,12 @@ uniform float snow_amt = 0.6;
 static func shader_code() -> String:
 	var tail := _CARD_TAIL_FADE if CubeSphere.FP_FAR_TREES_FADE else _CARD_TAIL
 	var head := _CARD_HEAD
+	# FP_FT_XFADE_COMPL (§3 P0-b): invert the CARD dither sample so its keep-set is the COMPLEMENT of the mesh's — at the
+	# 448 handoff (f_card = 1 − f_mesh) the union coverage becomes 1.0 (no trunk-dissolve). CARD only; the mesh tail is
+	# untouched. Off (or FADE off ⇒ no dither line) ⇒ the shipped `_CARD_TAIL_FADE` string verbatim (byte-identical).
+	if CubeSphere.FP_FAR_TREES_FADE and CubeSphere.FP_FT_XFADE_COMPL:
+		tail = tail.replace("if (_ft_dither(FRAGCOORD.xy) > v_fade) discard;",
+			"if (1.0 - _ft_dither(FRAGCOORD.xy) > v_fade) discard;")
 	if CubeSphere.FP_FAR_TREES_SNOW:
 		# Cards are ≤ a few px at their band; the trunk is sub-pixel, so lerp the whole card texel toward snow_tint
 		# by the per-instance snow flag (INSTANCE_CUSTOM.z). Off ⇒ no snow uniform / no lerp (byte-identical).
@@ -385,6 +392,13 @@ static func _cull_hash(fid: int, bx: int, bz: int) -> int:
 	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF
 	return n ^ (n >> 16)
 
+## §5.2 (#130): one more avalanche round mixing a restore-streak `s` into `_cull_hash` `h` (same arithmetic family as
+## `_cull_hash`), so the fingerprint DRIFTS each rebuild the streak advances. `s+1` so streak 0 already differs from `h`.
+static func _cull_mix(h: int, s: int) -> int:
+	var n := (h + (s + 1) * 0x9E3779B9) & 0x7FFFFFFF
+	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF
+	return n ^ (n >> 16)
+
 # =====================================================================================================================
 # Construction — one MultiMeshInstance3D child of the ring, one card material, the CPU-rasterised atlas, the shared
 # unit card mesh. Called from FacetFarRing.setup under FP_FAR_TREES.
@@ -543,8 +557,32 @@ func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
 				continue
 			probes += 1
 			var bx := recs[o + 8]; var gy := recs[o + 9]; var bz := recs[o + 10]
-			if int(_near_query.call(int(fid), AABB(Vector3(bx, gy + 1.0, bz), Vector3.ONE))) == NearPresence.COVERED:
-				fp ^= _cull_hash(int(fid), int(bx), int(bz))
+			# §5.2 state-fold (#130 dwell-stall): make the fingerprint SEE cull-machine progress so the DELTA gate re-arms
+			# EXACTLY while the restore streak can advance and goes quiet the instant it cannot. Per probed annulus tree
+			# (h = stable hash, st = probe result, dw = its dwell streak or −1 = shown/none):
+			#   COVERED                               → fp ^= h                    (the shipped term, unchanged)
+			#   NOT_COVERED and dw >= 0 (mid-restore) → fp ^= _cull_mix(h, dw)     (drifts as the streak advances)
+			#   UNKNOWABLE  and dw >= 1 (mid-restore) → fp ^= _cull_mix(h,dw)^SALT (CONSTANT while frozen — no churn)
+			#   anything else                         → no term                    (shipped behaviour)
+			# Kills the stall: the shipped COVERED-only fp drifted ONCE on the COVERED→NOT_COVERED edge, armed ONE rebuild
+			# (streak→1), then a still camera never re-armed the 2nd..FT_CULL_DWELL probes → streak frozen at 1 → the far
+			# tree stayed culled forever. The NOT_COVERED term now drifts each rebuild the streak advances, so the follow-up
+			# rebuilds fire until restore (dwell key erases ⇒ its term vanishes ⇒ fp settles STABLE; FT_CULL_DWELL+1 rebuilds
+			# per restore event, then quiescent). SALT_U differentiates a mid-streak UNKNOWABLE (view ramp-down / module gap)
+			# from NOT_COVERED so the frozen term is CONSTANT (zero rebuilds while frozen — the DELTA promise kept), yet the
+			# U→NOT_COVERED flip DROPS SALT_U ⇒ drift ⇒ progress resumes (without the salt that transition is invisible and
+			# the stall returns through the UNKNOWABLE door). Steady state (no restore in progress) ⇒ every term is the
+			# shipped COVERED-only term ⇒ byte-identical fp/cadence/perf. PURE READ (dwell advances only in the real rebuild).
+			var key := Vector3i(int(fid), int(bx), int(bz))
+			var st := int(_near_query.call(int(fid), AABB(Vector3(bx, gy + 1.0, bz), Vector3.ONE)))
+			var h := _cull_hash(int(fid), int(bx), int(bz))
+			var dw := int(_cull_dwell.get(key, -1))
+			if st == NearPresence.COVERED:
+				fp ^= h
+			elif st == NearPresence.NOT_COVERED and dw >= 0:
+				fp ^= _cull_mix(h, dw)
+			elif st == NearPresence.UNKNOWABLE and dw >= 1:
+				fp ^= _cull_mix(h, dw) ^ FT_CULL_SALT_U
 	return fp
 
 ## FP_FAR_TREES_NEARCULL: reset the per-rebuild probe budget + touched set before a rebuild pass (wraps the mesh+card

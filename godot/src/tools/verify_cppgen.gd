@@ -117,6 +117,10 @@ func _initialize() -> void:
 		"flat_world": true,
 		"faceted": faceted,
 		"m5c_corner": CubeSphere.M5C_CORNER,
+		# FP_SLOPE_ALL_MATERIALS (#122): mirror module_world's loader (module_world.gd:4128) so the epoch
+		# this gate freezes matches what ships. Flag OFF ⇒ false both sides (byte-identical baseline); flag
+		# ON ⇒ the C++ slope_run_of widens with the GDScript twin, so G-CG-SLOPE tests the WIDENED parity.
+		"slope_all_biomes": CubeSphere.FP_SLOPE_ALL_MATERIALS,
 		"cube_arid": cube_arid,
 		"block_ids": block_ids,
 		"model_count": 8,

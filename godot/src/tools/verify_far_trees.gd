@@ -113,6 +113,11 @@ func _initialize() -> void:
 		# self-describing (off ⇒ shipped anchor/sink/no-cull; on ⇒ welded + probe-culled).
 		_gate_align()
 		_gate_cull()
+		# G-FTF (FP_FT_FRAME_WELD, #131) — the owner-facet frame weld: anchor datum lift (altitude) + lattice-basis
+		# orientation (rotation). Two-state, self-describing (off ⇒ shipped plane anchor + (t1,r,t2) basis).
+		_gate_frame_anchor()   # G-FTF-1: anchor + datum
+		_gate_frame_basis()    # G-FTF-2: instance basis bit-compare
+		_gate_frame_fold()     # G-FTF-3: cross-fold position + rotation weld (+ shipped-yaw>30° bug pin)
 		# G-XDC-1 (FP_FT_XFADE_COMPL, #120 residual P0-b): the 448 cross-dither complementary-coverage fix. Two-state
 		# shader-string parity + a flag-independent CPU coverage sim that pins BOTH the fix (union 1.0) and the shipped
 		# in-phase defect (union max(f) < 1) every run.
@@ -839,7 +844,10 @@ func _gate_align() -> void:
 			conv_ok = false                              # the near trunk log sits at gy+1 — the +1-convention witness
 		if align:
 			var latt = FA.world_to_lattice64(fid, sp.x, sp.y, sp.z)
-			if absf(float(latt[0]) - (float(bx) + 0.5)) > 2.0e-2 or absf(float(latt[1]) - (float(gy) + 1.0)) > 2.0e-2 \
+			# FP_FT_FRAME_WELD (#131): the anchor now carries the FS2′ datum lift (0 unless the weld+FP_DATUM_BAKE);
+			# G-FTF-1 owns the dedicated datum coverage, this just keeps G-FTA-1 consistent across both weld states.
+			var lift := FA.datum_lift(fid, float(bx) + 0.5, float(bz) + 0.5) if CubeSphere.FP_FT_FRAME_WELD else 0.0
+			if absf(float(latt[0]) - (float(bx) + 0.5)) > 2.0e-2 or absf(float(latt[1]) - (float(gy) + 1.0 + lift)) > 2.0e-2 \
 					or absf(float(latt[2]) - (float(bz) + 0.5)) > 2.0e-2:
 				anchor_ok = false
 		else:
@@ -1041,6 +1049,233 @@ func _gate_cull() -> void:
 		# (debug_rebuild forces a rebuild every step ⇒ restore in FT_CULL_DWELL) and the standing G-OFF/FLAT byte suites.
 	else:
 		print("  (G-FTC-3 / G-FTC-5 re-arm checks skipped — need FP_FAR_TREES_DELTA sed-toggled true)")
+	ring.queue_free()
+
+# ---- G-FTF (FP_FT_FRAME_WELD — the owner-facet frame weld, task #131) -----------------------------------------------
+
+## The SHIPPED stable-tangent card/mesh basis first column: t1 = (r × ŷ_world).normalized() (ŷ = world up, swapped to
+## world +X near the ±ŷ degeneracy) — replicated EXACTLY from _write_card/_write_mesh_inst so the off-state assertions
+## are a true bit-compare against what the shipped code emits.
+func _shipped_t1(r: Vector3) -> Vector3:
+	var up := Vector3(0.0, 1.0, 0.0)
+	if absf(r.dot(up)) > 0.99:
+		up = Vector3(1.0, 0.0, 0.0)
+	return r.cross(up).normalized()
+
+## The VISIBLE yaw error (blocky cubes are 90°-symmetric, so orientation only matters mod 90°): the min angle from t1
+## to any of ±ê_u / ±ê_w. 0° ⇒ perfectly axis-aligned to the lattice; up to 45°.
+func _visible_yaw_err(t1: Vector3, eu: Vector3, ew: Vector3) -> float:
+	var best := 180.0
+	for axis in [eu, -eu, ew, -ew]:
+		best = minf(best, rad_to_deg(t1.angle_to(axis)))
+	return best
+
+## G-FTF-1 (§3.1 anchor + datum). Two-state, self-describing. The enum record stores the UNSUNK anchor under ALIGN;
+## its world→lattice round-trip must equal (bx+0.5, gy+1 + datum_lift(fid,bx+0.5,bz+0.5), bz+0.5) with the weld on, and
+## the #120 plane law (gy+1, no lift) off. datum_lift returns 0 unless FP_DATUM_BAKE, so weld-on/BAKE-off COINCIDES with
+## the plane law (the tracking property). With BAKE on, ≥1 sampled MID-FACET column must have |lift| > 2 — the #120 gate
+## only pinned the plane law (s≈0), so this is the missing coverage.
+func _gate_frame_anchor() -> void:
+	if not CubeSphere.FP_FAR_TREES_ALIGN:
+		print("  (G-FTF-1 skipped — Part A composes with FP_FAR_TREES_ALIGN; sed it true)")
+		return
+	var weld := CubeSphere.FP_FT_FRAME_WELD
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, _sample_facets()[0])
+	var anchor_ok := true
+	var checked := 0
+	var max_lift := 0.0
+	var facets_used := 0
+	for fid in _sample_facets():
+		var recs: PackedFloat32Array = tier.enumerate_facet_sync(fid)
+		var m := recs.size() / FT.REC_FLOATS
+		if m > 0:
+			facets_used += 1
+		for i in range(m):
+			var o := i * FT.REC_FLOATS
+			var sp := Vector3(recs[o + 0], recs[o + 1], recs[o + 2])   # ALIGN stores the UNSUNK anchor
+			var bx := int(recs[o + 8]); var gy := int(recs[o + 9]); var bz := int(recs[o + 10])
+			var lift := FA.datum_lift(fid, float(bx) + 0.5, float(bz) + 0.5)   # 0 unless FP_DATUM_BAKE
+			max_lift = maxf(max_lift, absf(lift))
+			var exp_y := float(gy) + 1.0 + (lift if weld else 0.0)
+			var latt = FA.world_to_lattice64(fid, sp.x, sp.y, sp.z)
+			if absf(float(latt[0]) - (float(bx) + 0.5)) > 2.0e-2 \
+					or absf(float(latt[1]) - exp_y) > 2.0e-2 \
+					or absf(float(latt[2]) - (float(bz) + 0.5)) > 2.0e-2:
+				anchor_ok = false
+			checked += 1
+	_ok(facets_used >= 2, "G-FTF-1: sampled trees on ≥2 facets (%d)" % facets_used)
+	_ok(checked > 0, "G-FTF-1: anchor sample non-empty (%d)" % checked)
+	if weld:
+		_ok(anchor_ok, "G-FTF-1: far anchor world→lattice == (bx+0.5, gy+1+datum_lift, bz+0.5) — welded to the near datum-lifted trunk base")
+		if CubeSphere.FP_DATUM_BAKE:
+			_ok(max_lift > 2.0, "G-FTF-1: a sampled mid-facet column has |datum_lift| > 2 (max %.2f) — the lift is EXERCISED (not s≈0)" % max_lift)
+		else:
+			_ok(is_equal_approx(max_lift, 0.0), "G-FTF-1: FP_DATUM_BAKE off ⇒ datum_lift 0 ⇒ weld coincides with the #120 plane law (tracking property)")
+	else:
+		_ok(anchor_ok, "G-FTF-1(off): far anchor == (bx+0.5, gy+1, bz+0.5) — the shipped #120 plane law (byte-identical)")
+	ring.queue_free()
+
+## G-FTF-2 (§3.2 instance basis). Two-state. Inject synthetic trees whose STORED radial is a common value (so the off
+## basis is deterministic and the same for every instance), spread so the card band (and, under MESH, the mesh band)
+## populate. Under the weld the emitted basis columns == the OWNER facet's lattice (ê_u, n̂, ê_w); off == the shipped
+## (t1, r, t2) computed from the stored radial (bit-compare).
+func _gate_frame_basis() -> void:
+	var weld := CubeSphere.FP_FT_FRAME_WELD
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	var fb := FA.frame_basis(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var r_common := centre.normalized()
+	var tangent := r_common.cross(Vector3(0, 1, 0))
+	if tangent.length() < 0.1: tangent = r_common.cross(Vector3(1, 0, 0))
+	tangent = tangent.normalized()
+	# One tree at 520 (card band [448,CARD_MAX]) and one at 200 (mesh band [128,448) under MESH; else a 2nd card).
+	# Position drives band selection; the stored radial is r_common for both, decoupling the off-basis from position.
+	var synth := PackedFloat32Array()
+	for dv in [520.0, 200.0]:
+		var p := centre + tangent * float(dv)
+		synth.push_back(p.x); synth.push_back(p.y); synth.push_back(p.z)
+		synth.push_back(r_common.x); synth.push_back(r_common.y); synth.push_back(r_common.z)
+		synth.push_back(0.0); synth.push_back(5.0)                       # species col 0, trunk_h 5, hue 0
+		synth.push_back(0.0); synth.push_back(0.0); synth.push_back(0.0)
+	tier.debug_set_cache(fid, synth)
+	tier.debug_rebuild([fid], centre)
+	# --- Cards ---
+	var cbuf: PackedFloat32Array = tier.debug_buffer()
+	var cvis := tier.live_instances()
+	var t1e := _shipped_t1(r_common)
+	var t2e := r_common.cross(t1e).normalized()
+	var card_ok := cvis > 0
+	for i in range(cvis):
+		var b := i * FT.CARD_STRIDE
+		var col0 := Vector3(cbuf[b + 0], cbuf[b + 4], cbuf[b + 8])
+		var col1 := Vector3(cbuf[b + 1], cbuf[b + 5], cbuf[b + 9])
+		var col2 := Vector3(cbuf[b + 2], cbuf[b + 6], cbuf[b + 10])
+		if weld:
+			if col0.normalized().distance_to(fb.x) > 1.0e-3 or col1.normalized().distance_to(fb.y) > 1.0e-3 \
+					or col2.normalized().distance_to(fb.z) > 1.0e-3:
+				card_ok = false
+		else:
+			# bit-compare against the shipped (t1·hs, r·vs, t2·hs)
+			if not (col0.is_equal_approx(t1e * FT.CANOPY_DIAM) and col2.is_equal_approx(t2e * FT.CANOPY_DIAM)
+					and col1.normalized().distance_to(r_common) < 1.0e-3):
+				card_ok = false
+	if weld:
+		_ok(card_ok, "G-FTF-2: card basis columns == (ê_u·hs, n̂·vs, ê_w·hs) of the OWNER facet (rotation welded)")
+	else:
+		_ok(card_ok, "G-FTF-2(off): card basis == shipped (t1·hs, r·vs, t2·hs) from the stored radial (bit-compare)")
+	# --- Meshes (only when MESH on — else the 200 tree is a card, covered above) ---
+	if CubeSphere.FP_FAR_TREES_MESH:
+		var stride: int = FT.mesh_stride()
+		var mbuf: PackedFloat32Array = tier.mesh_buffer(0)
+		var mvis := tier.mesh_visible(0)
+		var mesh_ok := mvis > 0
+		for i in range(mvis):
+			var b := i * stride
+			var col0 := Vector3(mbuf[b + 0], mbuf[b + 4], mbuf[b + 8])
+			var col1 := Vector3(mbuf[b + 1], mbuf[b + 5], mbuf[b + 9])
+			var col2 := Vector3(mbuf[b + 2], mbuf[b + 6], mbuf[b + 10])
+			if weld:
+				if col0.distance_to(fb.x) > 1.0e-3 or col1.distance_to(fb.y) > 1.0e-3 or col2.distance_to(fb.z) > 1.0e-3:
+					mesh_ok = false
+			else:
+				if not (col0.is_equal_approx(t1e) and col1.is_equal_approx(r_common) and col2.is_equal_approx(t2e)):
+					mesh_ok = false
+		if weld:
+			_ok(mesh_ok, "G-FTF-2: mesh basis columns == unit (ê_u, n̂, ê_w) of the OWNER facet (archetype cubes axis-aligned to near)")
+		else:
+			_ok(mesh_ok, "G-FTF-2(off): mesh basis == shipped unit (t1, r, t2) (bit-compare)")
+	else:
+		print("  (G-FTF-2 mesh sub-check skipped — needs FP_FAR_TREES_MESH)")
+	ring.queue_free()
+
+## G-FTF-3 (§6 the task gate — cross-fold weld). Derive (not hardcode) a facet whose SHIPPED (r×ŷ) basis is > 30°
+## mis-yawed vs its own lattice ê_u — a cube-face fold. Part (b) is a FLAG-INDEPENDENT pin that this facet exhibits the
+## live bug (so the gate provably catches it: pre-fix the emitted basis IS the shipped one → the weld assertion fails).
+## Part (a): a real owned tree's far anchor == the near datum-lifted base (position) AND the emitted basis == the owner
+## lattice (rotation) under the weld; == the shipped mis-yawed basis off.
+func _gate_frame_fold() -> void:
+	var weld := CubeSphere.FP_FT_FRAME_WELD
+	var earth_n := 6 * FA.K * FA.K
+	var ffid := -1
+	for fid in range(earth_n):
+		var dmn := FA.dom_min(fid); var dmx := FA.dom_max(fid)
+		var dc := FA.cell_dir(fid, (dmn.x + dmx.x) / 2, (dmn.y + dmx.y) / 2)
+		var rc := Vector3(dc.x, dc.y, dc.z).normalized()
+		var fbk := FA.frame_basis(fid)
+		if _visible_yaw_err(_shipped_t1(rc), fbk.x, fbk.z) > 30.0:
+			ffid = fid
+			break
+	_ok(ffid >= 0, "G-FTF-3: derived a cross-fold facet with shipped-basis yaw error > 30° (fid %d)" % ffid)
+	if ffid < 0:
+		return
+	var fb := FA.frame_basis(ffid)
+	var dmn := FA.dom_min(ffid); var dmx := FA.dom_max(ffid)
+	var dc := FA.cell_dir(ffid, (dmn.x + dmx.x) / 2, (dmn.y + dmx.y) / 2)
+	var r_common := Vector3(dc.x, dc.y, dc.z).normalized()
+	# Part (b): the flag-independent bug pin.
+	var yaw_err := _visible_yaw_err(_shipped_t1(r_common), fb.x, fb.z)
+	_ok(yaw_err > 30.0, "G-FTF-3: shipped (r×ŷ) basis is %.1f° mis-yawed vs ê_u at the fold (the live #131 bug this gate catches)" % yaw_err)
+	var ring := _fake_ring()
+	var tier = FT.new()
+	tier.setup_instance(ring, ffid)
+	# Part (a) position weld — a real owned tree on the fold facet (needs ALIGN, which Part A composes with).
+	if CubeSphere.FP_FAR_TREES_ALIGN:
+		var recs: PackedFloat32Array = tier.enumerate_facet_sync(ffid)
+		var m := recs.size() / FT.REC_FLOATS
+		var pos_ok := true
+		var pchecked := 0
+		for i in range(m):
+			var o := i * FT.REC_FLOATS
+			var sp := Vector3(recs[o + 0], recs[o + 1], recs[o + 2])
+			var bx := int(recs[o + 8]); var gy := int(recs[o + 9]); var bz := int(recs[o + 10])
+			var lift := FA.datum_lift(ffid, float(bx) + 0.5, float(bz) + 0.5)
+			var exp_y := float(gy) + 1.0 + (lift if weld else 0.0)
+			var latt = FA.world_to_lattice64(ffid, sp.x, sp.y, sp.z)
+			if absf(float(latt[0]) - (float(bx) + 0.5)) > 2.0e-2 or absf(float(latt[1]) - exp_y) > 2.0e-2 \
+					or absf(float(latt[2]) - (float(bz) + 0.5)) > 2.0e-2:
+				pos_ok = false
+			pchecked += 1
+		_ok(pchecked == 0 or pos_ok, "G-FTF-3: fold-facet far anchor == near datum-lifted trunk base (position weld, %d trees)" % pchecked)
+	else:
+		print("  (G-FTF-3 position-weld sub-check skipped — needs FP_FAR_TREES_ALIGN)")
+	# Part (a) rotation weld — inject a synthetic card on the fold facet (stored radial = facet-centre radial so the off
+	# basis exhibits the > 30° error), rebuild, compare the emitted basis.
+	var centre := r_common * FA.R_BLOCKS
+	var tangent := r_common.cross(Vector3(0, 1, 0))
+	if tangent.length() < 0.1: tangent = r_common.cross(Vector3(1, 0, 0))
+	tangent = tangent.normalized()
+	var p := centre + tangent * 520.0
+	var synth := PackedFloat32Array()
+	synth.push_back(p.x); synth.push_back(p.y); synth.push_back(p.z)
+	synth.push_back(r_common.x); synth.push_back(r_common.y); synth.push_back(r_common.z)
+	synth.push_back(0.0); synth.push_back(5.0)
+	synth.push_back(0.0); synth.push_back(0.0); synth.push_back(0.0)
+	tier.debug_set_cache(ffid, synth)
+	tier.debug_rebuild([ffid], centre)
+	var cbuf: PackedFloat32Array = tier.debug_buffer()
+	var cvis := tier.live_instances()
+	var t1e := _shipped_t1(r_common)
+	var rot_ok := cvis > 0
+	for i in range(cvis):
+		var b := i * FT.CARD_STRIDE
+		var col0 := Vector3(cbuf[b + 0], cbuf[b + 4], cbuf[b + 8]).normalized()
+		var col1 := Vector3(cbuf[b + 1], cbuf[b + 5], cbuf[b + 9]).normalized()
+		if weld:
+			if col0.distance_to(fb.x) > 1.0e-3 or col1.distance_to(fb.y) > 1.0e-3:
+				rot_ok = false
+		else:
+			if col0.distance_to(t1e) > 1.0e-3 or col1.distance_to(r_common) > 1.0e-3:
+				rot_ok = false
+	if weld:
+		_ok(rot_ok, "G-FTF-3: fold-facet far basis == frame_basis(owner) — rotation weld (yaw error → 0 across the fold)")
+	else:
+		_ok(rot_ok, "G-FTF-3(off): fold-facet far basis == shipped (r×ŷ, r) — byte-identical (the mis-yawed live basis)")
 	ring.queue_free()
 
 # ---- G-XDC (FP_FT_XFADE_COMPL — the 448 complementary cross-dither) -------------------------------------------------

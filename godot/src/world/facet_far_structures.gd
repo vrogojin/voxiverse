@@ -263,6 +263,10 @@ func _structure_centre(rec: Dictionary) -> Vector3:
 	var cx := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
 	var cy := (float(bmin.y) + float(bmax.y) + 1.0) * 0.5
 	var cz := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
+	# FP_FT_FRAME_WELD §7: lift the distance-cull centre onto the sphere too, so it tracks the lifted model (datum_lift 0
+	# unless FP_DATUM_BAKE → byte-identical off). Keeps the distance banding consistent with the welded verts above.
+	if CubeSphere.FP_FT_FRAME_WELD:
+		cy += FacetAtlas.datum_lift(int(rec["fid"]), cx, cz)
 	var w := FacetAtlas.lattice_to_world64(int(rec["fid"]), cx, cy, cz)
 	return Vector3(float(w[0]), float(w[1]), float(w[2]))
 
@@ -347,7 +351,14 @@ func _ensure_bake(rec: Dictionary) -> Dictionary:
 	wverts.resize(lverts.size())
 	for i in range(lverts.size()):
 		var v := lverts[i]
-		var w := FacetAtlas.lattice_to_world64(fid, v.x, v.y, v.z)
+		# FP_FT_FRAME_WELD §7 (task #131): the far structure model was baked on the facet PLANE (no FS2′ datum lift), so it
+		# floated/buried up to ±5.5 blk vs the near voxel build — the identical omission the far trees had. datum_lift
+		# returns 0 unless FP_DATUM_BAKE (byte-identical off). Lift is along n̂; the lattice basis is already carried by
+		# lattice_to_world64, so — unlike the trees — there is no separate orientation defect (each vert is placed directly).
+		var vy := v.y
+		if CubeSphere.FP_FT_FRAME_WELD:
+			vy += FacetAtlas.datum_lift(fid, v.x, v.z)
+		var w := FacetAtlas.lattice_to_world64(fid, v.x, vy, v.z)
 		wverts[i] = Vector3(float(w[0]), float(w[1]), float(w[2]))
 	var tris: int = int(lat["tris"])
 	var bytes := wverts.size() * (3 * 4 + 4 * 4)   # pos (3 f32) + colour (4 f32) per vertex

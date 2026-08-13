@@ -739,6 +739,12 @@ func _enum_worker(fid: int) -> void:
 			var ax := float(base.x); var ay := float(base.y); var az := float(base.z)
 			if CubeSphere.FP_FAR_TREES_ALIGN:
 				ax += 0.5; ay += 1.0; az += 0.5
+			# FP_FT_FRAME_WELD §3.1 (task #131): the anchor was the ONLY placement left on the facet PLANE — every near-mesh
+			# vertex is lifted y += s(fid,x,z) (FS2′ datum bake, C++ patch 0010), so the plane anchor floated/buried ±5.5 blk.
+			# datum_lift returns 0 unless FP_DATUM_BAKE, so this tracks the live near-mesh law by construction (the skin tier
+			# does exactly this, facet_skin_tier.gd:560). Lift is along n̂ (lattice_to_world64's y axis) — no lateral term.
+			if CubeSphere.FP_FAR_TREES_ALIGN and CubeSphere.FP_FT_FRAME_WELD:
+				ay += FacetAtlas.datum_lift(fid, ax, az)
 			var w := FacetAtlas.lattice_to_world64(fid, ax, ay, az)
 			var wx := float(w[0]); var wy := float(w[1]); var wz := float(w[2])
 			var rlen := sqrt(wx * wx + wy * wy + wz * wz)
@@ -898,6 +904,8 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 		if not _cache.has(int(fid)):
 			continue
 		var recs: PackedFloat32Array = _cache[int(fid)]
+		# FP_FT_FRAME_WELD §3.2: hoist the owner facet's lattice basis once per facet (Basis() no-op when off).
+		var fb := FacetAtlas.frame_basis(int(fid)) if CubeSphere.FP_FT_FRAME_WELD else Basis()
 		var m := recs.size() / REC_FLOATS
 		for i in range(m):
 			if n >= cap:
@@ -946,7 +954,7 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			var col := float(raw & 7)                     # low 3 bits = species atlas column
 			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
 			# .w carries the dither alpha under FADE (0.0 off); .z carries the snow flag (0.0 off) — byte-identical.
-			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow)
+			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow, fb)
 			n += 1
 	_mm.set_buffer(buf)
 	_mm.visible_instance_count = n
@@ -960,18 +968,25 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 ## origin at the sunk base; custom data = (species_col, hue, 0, fade). `fade` is the dither alpha (1.0 = fully in;
 ## always 1.0 with FP_FAR_TREES_FADE off → byte-identical). Buffer = TRANSFORM_3D's 12 floats + the 4 custom floats.
 func _write_card(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float, fade := 1.0, snow := 0.0) -> void:
+		rx: float, ry: float, rz: float, trunk_h: float, col: float, hue: float, fade := 1.0, snow := 0.0,
+		fb := Basis()) -> void:
 	var r := Vector3(rx, ry, rz)
 	# stable tangent basis from the radial (avoid the world-up degeneracy near the poles)
 	var up := Vector3(0.0, 1.0, 0.0)
 	if absf(r.dot(up)) > 0.99:
 		up = Vector3(1.0, 0.0, 0.0)
 	var t1 := r.cross(up).normalized()
+	var uy := r                # local +Y column axis (radial-up)
 	var t2 := r.cross(t1).normalized()
+	# FP_FT_FRAME_WELD §3.2 (task #131): orient to the OWNER facet's lattice basis (ê_u, n̂, ê_w) — the axes the near
+	# cubes are aligned to — instead of the world-axis r×ŷ tangent frame (0-45° yaw error, ~36° across a cube-face
+	# fold). Right-handed det=+1 (ê_w = ê_u × n̂). Off ⇒ the shipped (t1, r, t2) verbatim (byte-identical buffer).
+	if CubeSphere.FP_FT_FRAME_WELD:
+		t1 = fb.x; uy = fb.y; t2 = fb.z
 	var hs := CANOPY_DIAM
 	var vs := trunk_h + CANOPY_EXTRA
 	var bx := t1 * hs          # local +X column (scaled)
-	var by := r * vs           # local +Y column (radial-up, scaled)
+	var by := uy * vs          # local +Y column (up-axis, scaled)
 	var bz := t2 * hs          # local +Z column (scaled)
 	# 3 rows of [bx by bz | origin]
 	buf[base + 0] = bx.x; buf[base + 1] = by.x; buf[base + 2] = bz.x; buf[base + 3] = sx
@@ -1008,6 +1023,8 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 		if not _cache.has(int(fid)):
 			continue
 		var recs: PackedFloat32Array = _cache[int(fid)]
+		# FP_FT_FRAME_WELD §3.2: hoist the owner facet's lattice basis once per facet (Basis() no-op when off).
+		var fb := FacetAtlas.frame_basis(int(fid)) if CubeSphere.FP_FT_FRAME_WELD else Basis()
 		var m := recs.size() / REC_FLOATS
 		for i in range(m):
 			if total >= total_cap:
@@ -1056,7 +1073,7 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var trunk_h := floorf(packed)
 			var hue := packed - trunk_h
 			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
-			_write_mesh_inst(bufs[col], counts[col] * stride, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow)
+			_write_mesh_inst(bufs[col], counts[col] * stride, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow, fb)
 			counts[col] += 1
 			total += 1
 	for c in range(N_SPECIES):
@@ -1073,16 +1090,23 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 ## the mesh is authored in blocks), origin at the sunk base; custom = (delta=trunk_h−arch, hue, arch_trunk, 0) for
 ## the shader's per-tree trunk-stretch. Same 12-transform-then-4-custom buffer layout as the cards.
 func _write_mesh_inst(buf: PackedFloat32Array, base: int, sx: float, sy: float, sz: float,
-		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float, fade := 0.0, snow := 0.0) -> void:
+		rx: float, ry: float, rz: float, delta: float, hue: float, arch: float, fade := 0.0, snow := 0.0,
+		fb := Basis()) -> void:
 	var r := Vector3(rx, ry, rz)
 	var up := Vector3(0.0, 1.0, 0.0)
 	if absf(r.dot(up)) > 0.99:
 		up = Vector3(1.0, 0.0, 0.0)
 	var t1 := r.cross(up).normalized()
+	var uy := r                # local +Y (column) axis
 	var t2 := r.cross(t1).normalized()
-	buf[base + 0] = t1.x; buf[base + 1] = r.x; buf[base + 2] = t2.x; buf[base + 3] = sx
-	buf[base + 4] = t1.y; buf[base + 5] = r.y; buf[base + 6] = t2.y; buf[base + 7] = sy
-	buf[base + 8] = t1.z; buf[base + 9] = r.z; buf[base + 10] = t2.z; buf[base + 11] = sz
+	# FP_FT_FRAME_WELD §3.2 (task #131): orient the archetype cubes to the OWNER facet's lattice basis (ê_u, n̂, ê_w) —
+	# axis-aligned to the near voxel tree — instead of the world-axis r×ŷ frame (the ~36° cross-fold yaw / diamond
+	# canopies). Right-handed det=+1. Off ⇒ the shipped (t1, r, t2) verbatim (byte-identical buffer).
+	if CubeSphere.FP_FT_FRAME_WELD:
+		t1 = fb.x; uy = fb.y; t2 = fb.z
+	buf[base + 0] = t1.x; buf[base + 1] = uy.x; buf[base + 2] = t2.x; buf[base + 3] = sx
+	buf[base + 4] = t1.y; buf[base + 5] = uy.y; buf[base + 6] = t2.y; buf[base + 7] = sy
+	buf[base + 8] = t1.z; buf[base + 9] = uy.z; buf[base + 10] = t2.z; buf[base + 11] = sz
 	# FP_FAR_TREES_COLORFIX: write an explicit WHITE (1,1,1,1) instance color at floats [12..15] so the gl_compat
 	# engine packs the color slot to half(1,1,1,1) — the ungated `COLOR *= instance_color` (scene.glsl) then becomes
 	# an identity ×1 instead of multiplying albedo by the repack garbage. Custom shifts to [16..19]. Off ⇒ custom at

@@ -258,6 +258,10 @@ var _edit_columns: Dictionary = {}    # Vector2i(x, z) -> true
 # dict (O(all edits) — up to ~200 k snow cells). A byte-exact subset of `_edits` (same choke points). Empty + unused
 # with the flag off (byte-identical) or under FLAT/curved (non-int keys carry no fid — those paths keep the full scan).
 var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> true)
+# docs/COSMOS-STRUCTURES-DESIGN.md (P0, FP_STRUCT_DETECT): incremental player-structure detection over PLACED overlay
+# cells, driven from the two write choke points (_write_cell / sim_revert_cell). Constructed in setup() under the
+# flag; null off (the choke-point hooks are one null test) ⇒ byte-identical. See structure_tracker.gd.
+var _structure_tracker = null
 # The number of edit keys the LAST `_rebuild_window_indices` iterated (the O() the crossing paid): == the active
 # facet's edit count with FP_EDIT_FID_INDEX on, == the total edit count with it off. Read by verify_edit_fid_index.gd.
 var _rebuild_scanned: int = 0
@@ -402,6 +406,11 @@ func _ready() -> void:
 	# sheet under a single facet) with the facet far ring: the whole planet rendered around the active facet.
 	# BOOT-LOAD PROFILE: the collider/snow/weather setup between the manifest and the far ring.
 	_wb_mark("wb_setup_mid")
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0, FP_STRUCT_DETECT): the player-structure tracker is WorldManager-owned and
+	# driven from the two write choke points — independent of the far ring (detection works even if rendering is off).
+	# Only under FACETED with no chart (the edit keys are the (fid, cell) ints the tracker keys on). Off ⇒ null (byte-off).
+	if CubeSphere.FP_STRUCT_DETECT and CubeSphere.FACETED and _chart == null:
+		_structure_tracker = StructureTracker.new()
 	if CubeSphere.FACETED and FacetFarRing.ENABLED:
 		_facet_ring = FacetFarRing.new()
 		_facet_ring.name = "FacetFarRing"
@@ -420,6 +429,15 @@ func _ready() -> void:
 			# query (NearPresence.covered, bound to the module world) so the far impostor is culled exactly where the
 			# near blocky tree renders. Stored like the chop query; only read under FP_FAR_TREES_NEARCULL ⇒ byte-off.
 			_facet_ring.set_far_trees_near_query(Callable(self, "far_tree_near_presence"))
+			# docs/COSMOS-STRUCTURES-DESIGN.md (P0, FP_STRUCT_FAR): hand the far-structure tier the registry (the
+			# StructureTracker), the PLACED-overlay sampler (structure_cell_at — the structure alone, no terrain slab),
+			# the edit-revision query, and the SHARED near-presence predicate (reused verbatim from the far-trees cull).
+			# Stored like the tree queries; only consumed under the flag ⇒ byte-off.
+			if CubeSphere.FP_STRUCT_FAR:
+				_facet_ring.set_far_structures_registry_query(Callable(self, "structure_registry"))
+				_facet_ring.set_far_structures_sampler(Callable(self, "structure_cell_at"))
+				_facet_ring.set_far_structures_edits_rev_query(Callable(self, "edit_count"))
+				_facet_ring.set_far_structures_near_query(Callable(self, "far_tree_near_presence"))
 		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
@@ -796,6 +814,10 @@ func near_coverage_available() -> bool:
 ## no-op with no player (headless verify drives the system directly) or while the prewarm keeps the player
 ## frozen (update_streaming — the only thing that sets _have_player_pos — is not called until unfrozen).
 func _process(delta: float) -> void:
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0, §4.2): advance the structure tracker's debounced recluster (a removal-
+	# dirtied cluster re-floods once the removal burst settles). Cheap no-op when nothing is dirty; null off (byte-off).
+	if _structure_tracker != null:
+		_structure_tracker.tick(Time.get_ticks_msec())
 	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
 	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
 	# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md §2.3): a third suppressor — skip the ~20-25 ms/frame snow step while
@@ -1951,6 +1973,12 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	# COSMOS-FRAME-ORIENTATION §6.4: store the directional modifier in its CANONICAL (true-face) frame so
 	# it survives a flip; PAINT the window-frame value (the current render). No-op for a full cube.
 	_edits[ek] = _overlay_canon_modifier(cell, packed)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0, §4.2): the ONE place a placed cell enters/changes — feed the structure
+	# tracker so it maintains its 6-connected components incrementally (place / material-swap / overwrite-to-air). The
+	# tracker itself filters non-qualifying (dug air, snow-family) materials. FACETED-only (ek is the (fid,cell) int);
+	# null tracker (flag off) ⇒ one branch skip (byte-identical).
+	if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
+		_structure_tracker.note_cell(ek, packed)
 	if paint:
 		_paint_cell(cell, packed)
 
@@ -1987,6 +2015,10 @@ func sim_revert_cell(cell: Vector3i) -> void:
 				(_bucket as Dictionary).erase(ek)
 				if (_bucket as Dictionary).is_empty():
 					_edits_by_fid.erase(_fid)
+		# docs/COSMOS-STRUCTURES-DESIGN.md (P0, §4.2): a reverted cell is no longer a placed structure cell — mark it
+		# removed so the tracker debounces a bounded recluster (a removal can split a component). FACETED ⇒ ek is int.
+		if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
+			_structure_tracker.note_removed(int(ek))
 		_paint_cell(cell, cell_value_at(cell))
 
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
@@ -3548,6 +3580,22 @@ func far_tree_chopped(fid: int, cell: Vector3i) -> bool:
 ## today's distance band). Pure read (is_area_meshed + the live view-band); no streaming/apply cost.
 func far_tree_near_presence(fid: int, box: AABB) -> int:
 	return NearPresence.covered(_module_world, fid, box)
+
+## docs/COSMOS-STRUCTURES-DESIGN.md (P0, §7): the registered player structures (StructureTracker.registry) — the
+## far-structure tier walks THIS, never the world. Empty with no tracker (FP_STRUCT_DETECT off) ⇒ the tier renders
+## nothing (byte-identical). Each call returns fresh record dicts the tier snapshots.
+func structure_registry() -> Array:
+	return _structure_tracker.registry() if _structure_tracker != null else []
+
+## docs/COSMOS-STRUCTURES-DESIGN.md (P0, §6.1): the decimator's cell sampler — the PLACED overlay material at
+## (fid, cell), or 0 for air / non-placed. Reads the overlay DIRECTLY by (fid, cell) edit key (fid-agnostic, unlike
+## block_id_at which assumes the active facet) so a far structure on any facet decimates; and it is placed-ONLY (the
+## structure alone, no adjacent terrain slab). A dug placed cell reads air ⇒ damage shows in the far model for free.
+func structure_cell_at(fid: int, cell: Vector3i) -> int:
+	var v: int = _edits.get(FacetAtlas.edit_key(fid, cell), -1)
+	if v <= 0:
+		return 0
+	return CellCodec.mat(v)
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

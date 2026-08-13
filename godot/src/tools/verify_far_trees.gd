@@ -113,6 +113,10 @@ func _initialize() -> void:
 		# self-describing (off ⇒ shipped anchor/sink/no-cull; on ⇒ welded + probe-culled).
 		_gate_align()
 		_gate_cull()
+		# G-XDC-1 (FP_FT_XFADE_COMPL, #120 residual P0-b): the 448 cross-dither complementary-coverage fix. Two-state
+		# shader-string parity + a flag-independent CPU coverage sim that pins BOTH the fix (union 1.0) and the shipped
+		# in-phase defect (union max(f) < 1) every run.
+		_gate_xfade()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -863,6 +867,11 @@ func _gate_align() -> void:
 		print("  (G-FTA-2 skipped — needs FP_FAR_TREES_MESH sed-toggled true)")
 	_ok(is_equal_approx(FT.sink_ramp(CubeSphere.FT_SINK_R0), 0.0), "G-FTA-3: sink_ramp(FT_SINK_R0) == 0 (exact base at the near boundary)")
 	_ok(FT.sink_ramp(CubeSphere.FT_SINK_R1 + 40.0) > FT.sink_ramp(CubeSphere.FT_SINK_R0), "G-FTA-3: sink_ramp buries deeper with distance")
+	# G-FTR-1 (#120 residual P0-a): the deep-band sink is now a HAIR (FT_SINK_MAX 0.15, was 1.0) so a far tree at the deep
+	# band sits ≤0.2 blk below the near trunk base (was ~1 blk — the over-buried "trunkless canopy on the grass" residual).
+	# Pure sink_ramp property (flag-independent), and the saturated value equals FT_SINK_MAX exactly.
+	_ok(FT.sink_ramp(CubeSphere.FT_SINK_R1 + 40.0) <= 0.2 and is_equal_approx(FT.sink_ramp(CubeSphere.FT_SINK_R1 + 40.0), CubeSphere.FT_SINK_MAX),
+		"G-FTR-1: deep-band sink == FT_SINK_MAX %.2f ≤ 0.2 blk (P0-a un-buries the far trunk; was 1.0)" % CubeSphere.FT_SINK_MAX)
 	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
 	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
 	var radial := centre.normalized()
@@ -960,9 +969,119 @@ func _gate_cull() -> void:
 		t3.set_near_query(func(_f, _b): return NearPresence.COVERED)
 		t3.debug_step([fid], centre)
 		_ok(t3.rebuild_count() == c0 + 1, "G-FTC-3: a presence change re-arms the DELTA rebuild under a still camera")
+		# G-FTC-5 (§5.3, #130 dwell-stall — the missing NEARCULL-through-DELTA composition coverage): drives debug_step
+		# (the REAL DELTA-gated path, NOT debug_rebuild which bypasses the gate), both flags on, static camera, stubbed
+		# near-query. ONE annulus tree at d=140 so the live count is a clean 0 (culled) → 1 (restored). Case 2/3 FAIL on
+		# the shipped COVERED-only fingerprint (the restore streak freezes at 1 forever) and PASS with the §5.2 state-fold.
+		var one := PackedFloat32Array()
+		var pdel := centre + tangent * 140.0
+		var rdel := pdel.normalized()
+		one.push_back(pdel.x); one.push_back(pdel.y); one.push_back(pdel.z)
+		one.push_back(rdel.x); one.push_back(rdel.y); one.push_back(rdel.z)
+		one.push_back(0.0); one.push_back(5.0)
+		one.push_back(140.0); one.push_back(10.0); one.push_back(0.0)
+
+		# Case 1 — COVERED steady ⇒ the tree is culled and extra static steps rebuild ZERO times (steady-state quiet: the
+		# fp is the shipped COVERED-only term, no restore in progress).
+		var c1 = FT.new(); c1.setup_instance(ring, fid); c1.debug_set_cache(fid, one)
+		c1.set_near_query(func(_f, _b): return NearPresence.COVERED)
+		c1.debug_step([fid], centre)                    # first rebuild: COVERED ⇒ hidden
+		var c1_hidden := c1.mesh_live_instances() == 0
+		var c1_rc := c1.rebuild_count()
+		c1.debug_step([fid], centre); c1.debug_step([fid], centre); c1.debug_step([fid], centre)
+		_ok(c1_hidden and c1.rebuild_count() == c1_rc and c1.mesh_live_instances() == 0,
+			"G-FTC-5(1): COVERED steady ⇒ tree culled + 0 extra rebuilds over 3 static steps (steady-state quiet)")
+
+		# Case 2 — COVERED→NOT_COVERED ⇒ restore within FT_CULL_DWELL rebuild-steps, ≤ FT_CULL_DWELL+1 total rebuilds, then
+		# QUIESCENT (further static steps rebuild zero). This is the core #130 stall (FAILS pre-fix: restore never fires).
+		var c2 = FT.new(); c2.setup_instance(ring, fid); c2.debug_set_cache(fid, one)
+		var s2 := {"v": NearPresence.COVERED}
+		c2.set_near_query(func(_f, _b): return s2["v"])
+		c2.debug_step([fid], centre)                    # cull
+		var c2_hidden := c2.mesh_live_instances() == 0
+		s2["v"] = NearPresence.NOT_COVERED              # near mesh recedes; camera DEAD STILL from here
+		var rc_flip := c2.rebuild_count()
+		var restored_at := -1
+		for i in range(CubeSphere.FT_CULL_DWELL + 5):
+			c2.debug_step([fid], centre)
+			if restored_at < 0 and c2.mesh_live_instances() == 1:
+				restored_at = i + 1
+		var total_rebuilds := c2.rebuild_count() - rc_flip
+		var rc_tail := c2.rebuild_count()
+		c2.debug_step([fid], centre); c2.debug_step([fid], centre)
+		var tail_rebuilds := c2.rebuild_count() - rc_tail
+		_ok(c2_hidden and c2.mesh_live_instances() == 1 and restored_at > 0 and restored_at <= CubeSphere.FT_CULL_DWELL + 1
+				and total_rebuilds <= CubeSphere.FT_CULL_DWELL + 1 and tail_rebuilds == 0,
+			"G-FTC-5(2): COVERED→NOT_COVERED restores at step %d ≤ DWELL+1, %d total rebuilds ≤ DWELL+1, then QUIESCENT (tail %d) — #130 fix" % [restored_at, total_rebuilds, tail_rebuilds])
+
+		# Case 3 — mid-streak UNKNOWABLE freeze ⇒ ZERO rebuilds while frozen + still hidden (the DELTA promise: a permanently-
+		# UNKNOWABLE mid-restore tree must NOT churn); then U→NOT_COVERED ⇒ restore resumes. Pins SALT_U (without it the
+		# U→NOT_COVERED flip is invisible to the fp and the stall returns through the UNKNOWABLE door).
+		var c3 = FT.new(); c3.setup_instance(ring, fid); c3.debug_set_cache(fid, one)
+		var s3 := {"v": NearPresence.COVERED}
+		c3.set_near_query(func(_f, _b): return s3["v"])
+		c3.debug_step([fid], centre)                    # cull
+		s3["v"] = NearPresence.NOT_COVERED
+		c3.debug_step([fid], centre)                    # streak → 1 (mid-restore), still hidden
+		var c3_mid_hidden := c3.mesh_live_instances() == 0
+		s3["v"] = NearPresence.UNKNOWABLE
+		c3.debug_step([fid], centre)                    # transition into UNKNOWABLE settles the fp (one rebuild), hidden
+		var rc_frozen := c3.rebuild_count()
+		for _j in range(4):
+			c3.debug_step([fid], centre)                # sustained UNKNOWABLE
+		var c3_froze := c3.rebuild_count() == rc_frozen and c3.mesh_live_instances() == 0
+		s3["v"] = NearPresence.NOT_COVERED              # the probe becomes decidable again
+		var steps3 := 0
+		while steps3 < CubeSphere.FT_CULL_DWELL + 3 and c3.mesh_live_instances() == 0:
+			c3.debug_step([fid], centre)
+			steps3 += 1
+		_ok(c3_mid_hidden and c3_froze and c3.mesh_live_instances() == 1,
+			"G-FTC-5(3): mid-streak UNKNOWABLE freeze ⇒ 0 rebuilds + still hidden; U→NOT_COVERED resumes restore (SALT_U)")
+		# Case 4 (per-step restore under NEARCULL-on/DELTA-off, + both-off byte parity) is covered by the existing G-FTC-1/2
+		# (debug_rebuild forces a rebuild every step ⇒ restore in FT_CULL_DWELL) and the standing G-OFF/FLAT byte suites.
 	else:
-		print("  (G-FTC-3 re-arm check skipped — needs FP_FAR_TREES_DELTA sed-toggled true)")
+		print("  (G-FTC-3 / G-FTC-5 re-arm checks skipped — need FP_FAR_TREES_DELTA sed-toggled true)")
 	ring.queue_free()
+
+# ---- G-XDC (FP_FT_XFADE_COMPL — the 448 complementary cross-dither) -------------------------------------------------
+
+## The card fragment dither (matches `_ft_dither` in the card shader): fract(sin(dot(floor(fc), (12.9898,78.233)))·43758.5453).
+func _ft_dither_cpu(fx: float, fy: float) -> float:
+	var d := sin(floor(fx) * 12.9898 + floor(fy) * 78.233) * 43758.5453
+	return d - floor(d)
+
+## G-XDC-1 (#120 residual P0-b). Two parts, both self-describing:
+##  (a) shader-string parity — the CARD dither sample is inverted (`1.0 - _ft_dither`) IFF FP_FT_XFADE_COMPL (with FADE);
+##      the MESH sample is NEVER inverted (card-only fix); off ⇒ the shipped in-phase string verbatim.
+##  (b) a FLAG-INDEPENDENT CPU coverage sim over a 64×64 FRAGCOORD grid at fades {0.25,0.5,0.75} with f_card = 1 − f_mesh
+##      (the 448 cross-dither). COMPLEMENTARY (card keeps iff 1−dither ≤ f_card = the mesh-DISCARD set) ⇒ union == 1.0.
+##      IN-PHASE (both keep iff dither ≤ f — the shipped defect) ⇒ union == max(f_mesh,f_card) < 1 (thin trunks lose ~half
+##      their pixels at the midpoint). Pins BOTH classes every run so neither can silently return.
+func _gate_xfade() -> void:
+	var compl := CubeSphere.FP_FT_XFADE_COMPL and CubeSphere.FP_FAR_TREES_FADE
+	_ok(FT.shader_code().contains("1.0 - _ft_dither") == compl,
+		"G-XDC-1: card shader inverts the dither sample IFF FP_FT_XFADE_COMPL (%s)" % ("on" if compl else "off — shipped in-phase"))
+	_ok(not FT.mesh_shader_code().contains("1.0 - _ft_dither"),
+		"G-XDC-1: mesh shader dither sample is NEVER inverted (card-only fix)")
+	for f in [0.25, 0.5, 0.75]:
+		var fm := float(f)
+		var fc := 1.0 - fm
+		var cov_compl := 0
+		var cov_inphase := 0
+		var total := 0
+		for gx in range(64):
+			for gy in range(64):
+				var dth := _ft_dither_cpu(float(gx), float(gy))
+				var mesh_keep := dth <= fm
+				if mesh_keep or ((1.0 - dth) <= fc): cov_compl += 1     # complementary card sample
+				if mesh_keep or (dth <= fc): cov_inphase += 1           # shipped in-phase card sample
+				total += 1
+		_ok(cov_compl == total,
+			"G-XDC-1: complementary dither union == 1.0 at f=%.2f (%d/%d — no trunk-dissolve hole)" % [fm, cov_compl, total])
+		var frac := float(cov_inphase) / float(total)
+		var expect := maxf(fm, fc)
+		_ok(absf(frac - expect) < 0.05 and frac < 0.999,
+			"G-XDC-1: in-phase dither union == max(f)=%.2f (measured %.3f) < 1 — the shipped 50%%-coverage defect pinned" % [expect, frac])
 
 # ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
 

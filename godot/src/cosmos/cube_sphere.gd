@@ -963,6 +963,48 @@ const FT_SINK_R1 := 288.0                     # sink ramp full (deep-band bury =
 const FT_CULL_MIN := 64.0                     # §5.2 never-emit-far floor (a close-up card reads worse than a beat of absence)
 const FT_CULL_DWELL := 2                      # §5.3 consecutive NOT_COVERED probes before a culled far tree is restored
 
+## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
+## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel
+## field meshes in. P0 (this change) is entirely testable with player builds — no generator:
+##  - FP_STRUCT_DETECT (§4): a `StructureTracker` (WorldManager-owned) maintains 6-connected components over PLACED
+##    overlay cells, driven from the TWO overlay write choke points `_write_cell` / `sim_revert_cell` so no mutation
+##    is missed. A cluster is a STRUCTURE at ≥ STRUCT_MIN_BLOCKS placed blocks AND bbox extent ≥ STRUCT_MIN_EXTENT on
+##    ≥ 2 axes. SNOW-family materials (the snowfall sim writes real overlay edits through the SAME choke, wm:1953)
+##    are EXCLUDED by material — else a blizzard becomes a "structure". Placement is incremental union-find (O(α));
+##    a removal marks the cluster dirty + a debounced (STRUCT_RECLUSTER_MS) bounded re-flood re-registers the split
+##    components. NEVER-OOM: STRUCT_TRACK_MAX tracked cells / STRUCT_REG_MAX registry entries (largest-first),
+##    telemetry-degrade past cap.
+##  - FP_STRUCT_FAR (§6/§7, needs _DETECT): a `StructDecimator` bakes a per-structure OR-occupancy + MAJORITY-colour
+##    decimated model (the FacetBlockLod majority law verbatim, but OR-occupancy NOT MIN — MIN erases 1-block walls
+##    and roofs = the silhouette), reading the placed overlay so a damaged build decimates damaged for free. A
+##    `FacetFarStructures` tier (FacetFarTrees-shape, owned/stepped/sun-fed by the ONE FacetFarRing) renders the
+##    wanted models as ONE MERGED ArrayMesh per LOD band (unique geometries ⇒ NOT MultiMesh), radial voxi_shade lit +
+##    terminator-welded, rebuild-on-change delta-gated, near-handoff-culled via the SHARED `NearPresence` predicate
+##    (§7.3) — the SAME "near meshed here ⇒ hide the far impostor" law the far-trees cull uses. Ledger: ≤ +2 draws,
+##    STRUCT_FAR_TRIS_MAX tris, STRUCT_BYTES_MAX hard byte cap (never-OOM).
+##  - FP_STRUCT_GEN (§5, P1 — declared, unused in P0): the procedural village GENERATOR (worldgen, not edits).
+##  - FP_STRUCT_LOD (§7.4/§10, P2 — declared, unused in P0): LOD-B band + orbit exception + fine-map roof texels.
+## All default false, byte-identical off: the choke-point hook is one flag test, `FacetFarRing.setup` never
+## constructs the tier (the FP_ORBIT_RELIEF pattern), `resolve_cell` never calls the generator. Gate:
+## verify_structures.gd (G-ST-OFF/CLUSTER/DECIM/HANDOFF/BYTES/DRAWS/DELTA + the shared G-NP-*), full suite byte-off.
+const FP_STRUCT_DETECT := false              # P0: StructureTracker at the write choke points + registry
+const FP_STRUCT_FAR := false                 # P0: StructDecimator + FacetFarStructures + NearPresence cull (needs _DETECT)
+const FP_STRUCT_GEN := false                 # P1: StructureGen worldgen (declared, unused in P0)
+const FP_STRUCT_LOD := false                 # P2: LOD-B band + orbit exception + roof texels (declared, unused in P0)
+const STRUCT_MIN_BLOCKS := 16               # §4.1 a cluster is a structure at ≥ this many placed blocks
+const STRUCT_MIN_EXTENT := 3                 # §4.1 AND bbox extent ≥ this on at least two axes (filters pillars/floors)
+const STRUCT_TRACK_MAX := 65536             # §4.3 NEVER-OOM: max tracked placed cells (degrade past, never grow)
+const STRUCT_REG_MAX := 256                  # §4.3 NEVER-OOM: max registry entries (largest-first retention)
+const STRUCT_RECLUSTER_MS := 1000           # §4.2 debounce before a removal-dirtied recluster re-floods (bounded)
+const STRUCT_TARGET_RES := 16               # §6.1 decimator coarse-cell target resolution (auto pitch from size)
+const STRUCT_FAR_MAX := 2400.0              # §7.1 far-structure outer band edge (blocks) — shares the far-trees fog line
+const STRUCT_STEP_MS := 250                  # §7.1 min ms between FacetFarStructures rebuilds (rate cap)
+const STRUCT_FAR_TRIS_MAX := 80000          # §8 NEVER-OOM: merged-band triangle cap
+const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (tracker + registry + bakes + meshes)
+const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
+const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
+const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

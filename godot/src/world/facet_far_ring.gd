@@ -76,6 +76,10 @@ var _orbit_relief = null
 # MultiMeshInstance3D child of this ring, driven by the SAME TreeGen placement hashes. Constructed in setup()
 # under FP_FAR_TREES; stepped from _process alongside _smooth_v2/_orbit_relief. null off (inert) ⇒ byte-identical.
 var _far_trees = null
+# docs/COSMOS-STRUCTURES-DESIGN.md (P0, FP_STRUCT_FAR): the far-terrain STRUCTURE tier — a MeshInstance3D child of
+# this ring rendering decimated player-build models as ONE MERGED ArrayMesh. Constructed in setup() under
+# FP_STRUCT_FAR; stepped/sun-fed beside _far_trees. Reuses _ft_cam (same camera). null off (inert) ⇒ byte-identical.
+var _far_structures = null
 var _ft_cam := Vector3.ZERO             # latest camera position (render frame), fed each frame by main.gd for far-trees band membership
 # FP_RELIEF_REEMIT (task #99 follow-up, docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md): fids whose G2 DEM just
 # finished baking AFTER their `_col_cache` entry was already built (so the shade multiply above was 1.0 —
@@ -578,6 +582,11 @@ func setup(active_fid: int) -> void:
 	if CubeSphere.FP_FAR_TREES:
 		_far_trees = FacetFarTrees.new()
 		_far_trees.setup_instance(self, active_fid)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0): the far-structure tier — own MeshInstance3D child (inherits this ring's
+	# placement transform). Inert off (never constructed) ⇒ byte-identical.
+	if CubeSphere.FP_STRUCT_FAR:
+		_far_structures = FacetFarStructures.new()
+		_far_structures.setup_instance(self, active_fid)
 	# FP_BOOT_ASYNC: cache only a bounded proximity seed synchronously, then warm the rest across frames (see _boot_begin
 	# / _boot_warm_step). Off ⇒ the shipped synchronous full build (spawn masked by the ShaderPrewarm hold), byte-identical.
 	if CubeSphere.FP_BOOT_ASYNC:
@@ -672,6 +681,9 @@ func set_active(new_fid: int) -> void:
 	# each step, so this is just a book-keeping update). No-op / null with the flag off.
 	if _far_trees != null:
 		_far_trees.set_active(new_fid)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0): re-seed the centre facet (residency is camera-distance driven).
+	if _far_structures != null:
+		_far_structures.set_active(new_fid)
 	# COSMOS-ORBITAL-SHELL live fix: in orbit the emitted set is CAMERA-axis-driven (not active-facet-driven), and the
 	# mesh is absolute (the transform re-place above already follows the new active facet), so a facet crossing does
 	# NOT change the emitted set — its _pending would force a redundant full rebuild every ~3 frames as the active
@@ -1406,6 +1418,10 @@ func _process(_dt: float) -> void:
 	# every other far tier. No-op / null with the flag off (byte-identical).
 	if _far_trees != null:
 		_far_trees.step(_load_settled, _stream_credit_ok, _ft_cam)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0): rebuild the merged far-structure band (delta-gated, settle+credit-gated,
+	# near-handoff-culled). Reuses _ft_cam. No-op / null with FP_STRUCT_FAR off (byte-identical).
+	if _far_structures != null:
+		_far_structures.step(_load_settled, _stream_credit_ok, _ft_cam)
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): re-probe near-coverage on the CULL_REAP_MS cadence and advance the
 	# per-cell cull hysteresis; a mask flip sets `_pending` so the active emit path below re-draws (culled cells dropped,
 	# uncovered cells restored). No-op / no allocation with the flag off (byte-identical) — runs before the emit branches
@@ -5299,6 +5315,33 @@ func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
 func set_far_trees_sun_dir(sun_dir: Vector3) -> void:
 	if _far_trees != null:
 		_far_trees.set_sun_dir(sun_dir)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P0, §7.1): the far-tier sun hub also feeds the structure tier's OWN material
+	# (same radial voxi_shade law). No-op with no instance ⇒ byte-identical off.
+	if _far_structures != null:
+		_far_structures.set_sun_dir(sun_dir)
+
+## docs/COSMOS-STRUCTURES-DESIGN.md (P0): wire the far-structure tier's queries — the registry (StructureTracker),
+## the placed-overlay sampler (structure_cell_at), the edit-revision query (edit_count), and the SHARED near-mesh-
+## presence predicate (NearPresence.covered). No-op with no instance; only consumed under FP_STRUCT_FAR.
+func set_far_structures_registry_query(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_registry_query(q)
+
+func set_far_structures_sampler(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_sampler(q)
+
+func set_far_structures_near_query(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_near_query(q)
+
+func set_far_structures_edits_rev_query(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_edits_rev_query(q)
+
+## Far-structure telemetry accessor for the gate (null-safe).
+func far_structures() -> Object:
+	return _far_structures
 
 ## docs/COSMOS-FAR-TREES-DESIGN.md (P0): cache the live camera (render frame) so the far-trees step can compute
 ## camera-distance band membership. Cheap state write; no-op consumer with the flag off.

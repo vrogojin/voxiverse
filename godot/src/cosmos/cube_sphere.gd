@@ -1037,6 +1037,17 @@ const FP_FT_STALE_REBUILD := false           # §4.1: ≤0.5Hz staleness floor �
 ## verify_structures.gd (G-ST-OFF/CLUSTER/DECIM/HANDOFF/BYTES/DRAWS/DELTA + the shared G-NP-*), full suite byte-off.
 const FP_STRUCT_DETECT := false              # P0: StructureTracker at the write choke points + registry
 const FP_STRUCT_FAR := false                 # P0: StructDecimator + FacetFarStructures + NearPresence cull (needs _DETECT)
+## FP_STRUCT_NEAR_GUARD (docs/COSMOS-FARTREE-POLISH-DESIGN.md §4.2, task #132) — the structures analogue of
+## FP_FT_NEAR_GUARD + FP_FT_STALE_REBUILD. FacetFarStructures shares the trees' FP_LOAD_DEFER credit-0 freeze
+## (facet_far_structures.gd `if not settled or not credit_ok: return`): a ~30fps client pins credit 0, so the merged
+## far-structure mesh freezes stale — a far decimated model renders OVER the near-built structure (double-render), and
+## missing / dwell-restored structures never appear while walking. Unlike the trees' MultiMesh (a cheap per-instance
+## zero-scale hide), structures are ONE merged ArrayMesh, so the cull IS a re-bake — but the structures step is ALREADY
+## rate-capped (STRUCT_STEP_MS) + delta-gated (rebuilds only on move ≥ STRUCT_DELTA_MOVE / cover-fingerprint drift /
+## cull-pending) with per-rev cached bakes, so running it at credit 0 is bounded + cheap and its `_cull_emit` pass fixes
+## BOTH the hide and show sides at once. The guard therefore just relaxes the credit gate (the SETTLE gate still holds —
+## no work during fresh-load pile-up). Off ⇒ the shipped credit gate verbatim (byte-identical). Needs FP_STRUCT_FAR.
+const FP_STRUCT_NEAR_GUARD := false          # §4.2: credit-independent bounded structures step (double-render + missing/restore)
 const FP_STRUCT_GEN := false                 # P1: StructureGen worldgen (declared, unused in P0)
 const FP_STRUCT_LOD := false                 # P2: LOD-B band + orbit exception + roof texels (declared, unused in P0)
 const STRUCT_MIN_BLOCKS := 16               # §4.1 a cluster is a structure at ≥ this many placed blocks

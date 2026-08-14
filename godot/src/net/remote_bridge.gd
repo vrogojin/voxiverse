@@ -147,6 +147,20 @@ var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
 var _win_had_capture := false       # T2f: this window initiated an ambient frame capture (~35 ms readback) — stamp cap=1 so analysis can exclude it
 
+# FP_TELEM_FRAME_DECOMP (§5, #129): observer self-instrumentation. `_telem_interval` is the snapshot period (0.25s, or
+# 1.0s under ?telem=1hz — the A/B discriminator). `_fh` is the per-window frame-period histogram over bins
+# [<14,14-20,20-25,25-33,33-50,≥50] ms. `_telem_ms` is the LAST snapshot's own build cost (emitted the next window —
+# self-measurement lag). `_win_eval_ms`/`_win_cap_ms` are window-maxima of the sync JS-bridge eval + the viewport readback.
+# `_win_unattr` counts frames >25ms that no bracketed segment (eval/cap) owns. All fixed-size; read/written only under the
+# flag ⇒ byte-off (message keys unchanged, no brackets). Bridge only runs when a remote session is connected.
+var _telem_interval := TELEMETRY_INTERVAL
+var _fh := PackedInt32Array([0, 0, 0, 0, 0, 0])
+var _telem_ms := 0.0
+var _win_eval_ms := 0.0
+var _win_cap_ms := 0.0
+var _win_unattr := 0
+var _telem_1hz := false
+
 # MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
 # godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
 # WHY MAXIMA, POLLED EVERY FRAME: a telemetry window is 250 ms ≈ 15 frames and the hitch is BURSTY —
@@ -235,6 +249,7 @@ func _set_link(open: bool) -> void:
 static func dial_config() -> Dictionary:
 	var token := ""
 	var frames := true                       # L2: ambient frame stream on unless explicitly disabled (re-baseline knob)
+	var telem_1hz := false                   # §5.2: ?telem=1hz throttles the 4Hz snapshot to 1Hz (observer A/B discriminator)
 	if OS.has_feature("web"):
 		# location.search is inherent to the page; a single boot-time eval decides whether to dial.
 		# No param → empty token → {} → dead. This is the whole activation gate on the public site.
@@ -244,14 +259,22 @@ static func dial_config() -> Dictionary:
 			qs = str(raw)
 		token = _parse_query_token(qs)
 		frames = _parse_frames_flag(qs)
+		telem_1hz = _parse_telem_1hz(qs)
 	else:
 		token = OS.get_environment("VOXIVERSE_REMOTE_TOKEN")
 		var fenv := OS.get_environment("VOXIVERSE_REMOTE_FRAMES").strip_edges()
 		frames = not (fenv == "0" or fenv.to_lower() == "false" or fenv.to_lower() == "off")
+		telem_1hz = OS.get_environment("VOXIVERSE_REMOTE_TELEM").strip_edges().to_lower() == "1hz"
 	token = token.strip_edges()
 	if token == "":
 		return {}
-	return {"token": token, "url": resolve_url(), "frames": frames}
+	return {"token": token, "url": resolve_url(), "frames": frames, "telem_1hz": telem_1hz}
+
+## FP_TELEM_FRAME_DECOMP §5.2: the `?telem=1hz` measurement-hygiene knob — throttle the 4Hz snapshot to 1Hz so its own
+## clocked cost stops aliasing the frame timing (the A/B discriminator for "is the observer the ~5Hz stall?"). Like
+## `?frames`, it only affects an OBSERVED session; the played game never runs the bridge.
+static func _parse_telem_1hz(query: String) -> bool:
+	return _parse_query_value(query, "telem").to_lower() == "1hz"
 
 
 ## The relay URL is FIXED to our host — resolved from VOXIVERSE_REMOTE_URL (native/dev only) else the
@@ -326,6 +349,10 @@ func configure(cfg: Dictionary) -> void:
 	_token = str(cfg.get("token", ""))
 	_url = str(cfg.get("url", DEFAULT_URL))
 	_auto_frames_enabled = bool(cfg.get("frames", true))   # L2: honor ?frames=0 / VOXIVERSE_REMOTE_FRAMES=0
+	# FP_TELEM_FRAME_DECOMP §5.2: ?telem=1hz slows the snapshot to 1Hz. Only applied under the flag (byte-off ⇒ always 0.25s).
+	_telem_1hz = bool(cfg.get("telem_1hz", false))
+	if CubeSphere.FP_TELEM_FRAME_DECOMP and _telem_1hz:
+		_telem_interval = 1.0
 
 
 ## L2 runtime kill switch for the AMBIENT auto-capture (the commanded screenshot path is never affected). Lets the
@@ -382,6 +409,19 @@ func _process(delta: float) -> void:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
+	# FP_TELEM_FRAME_DECOMP §5.1: per-window frame-period histogram [<14,14-20,20-25,25-33,33-50,≥50] ms — makes the
+	# worst/EMA reconstruction exact instead of max-censored, and `_win_unattr` counts the ≥25ms stall frames. Byte-off.
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		var _ms := real_delta * 1000.0
+		var _bin := 0
+		if _ms >= 50.0: _bin = 5
+		elif _ms >= 33.0: _bin = 4
+		elif _ms >= 25.0: _bin = 3
+		elif _ms >= 20.0: _bin = 2
+		elif _ms >= 14.0: _bin = 1
+		_fh[_bin] += 1
+		if _ms > 25.0:
+			_win_unattr += 1
 	_poll_voxel_main_thread_stats()
 	# A1-REFINE (#114): fold this frame's true delta into any open post-crossing attribution window.
 	if not _post_cross.is_empty():
@@ -454,7 +494,8 @@ func _process(delta: float) -> void:
 	_drain_farring_events()
 
 	# ── Telemetry tick ────────────────────────────────────────────────────────────────────────
-	if _win_acc >= TELEMETRY_INTERVAL:
+	# FP_TELEM_FRAME_DECOMP §5.2: `_telem_interval` is TELEMETRY_INTERVAL, or 1.0s under ?telem=1hz (byte-off ⇒ always 0.25s).
+	if _win_acc >= _telem_interval:
 		_send_telemetry()
 
 	# ── Frame tick ────────────────────────────────────────────────────────────────────────────
@@ -533,7 +574,10 @@ func _wasm_heap_mb() -> float:
 	# voxel module installs `self.__voxHeapSize()` at init (register_types.cpp, __EMSCRIPTEN__) — inside the module
 	# `wasmMemory` IS in scope, so its `.buffer.byteLength` (the true sbrk linear memory that OOMs a tab) is now reachable
 	# from page scope. Synchronous, trivial (a byteLength read), one eval per telemetry window (4 Hz).
+	var _ev0 := Time.get_ticks_usec() if CubeSphere.FP_TELEM_FRAME_DECOMP else 0
 	var v = JavaScriptBridge.eval("(typeof self.__voxHeapSize==='function')?self.__voxHeapSize():-5", true)
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		_win_eval_ms = maxf(_win_eval_ms, float(Time.get_ticks_usec() - _ev0) / 1000.0)   # §5.1 sync JS-bridge round-trip cost
 	if v == null:
 		return -1.0
 	var b := float(v)
@@ -542,11 +586,25 @@ func _wasm_heap_mb() -> float:
 
 
 func _send_telemetry() -> void:
+	# FP_TELEM_FRAME_DECOMP §5.1: self-time the snapshot's OWN cost (the missing timer — the observer never measured itself).
+	var _dc_t0 := Time.get_ticks_usec() if CubeSphere.FP_TELEM_FRAME_DECOMP else 0
 	# Window stats (fps + worst frame over the just-elapsed window), then reset the window.
 	var fps := (float(_win_frames) / _win_acc) if _win_acc > 0.0 else 0.0
 	var worst_ms := _win_worst * 1000.0
 	var min_fps := 1000.0 / maxf(worst_ms, 0.001)
 	_last_window_worst_ms = worst_ms          # L2: the threshold gate reads this before scheduling the next auto-capture
+	# FP_TELEM_FRAME_DECOMP §5.1: snapshot the decomp accumulators into locals, then reset alongside the window.
+	var _dc_fh := _fh.duplicate()
+	var _dc_eval := _win_eval_ms
+	var _dc_cap := _win_cap_ms
+	var _dc_unattr := _win_unattr
+	var _dc_telem := _telem_ms                # the PREVIOUS window's own cost (self-measurement lag)
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		for _i in range(6):
+			_fh[_i] = 0
+		_win_eval_ms = 0.0
+		_win_cap_ms = 0.0
+		_win_unattr = 0
 	_win_acc = 0.0
 	_win_frames = 0
 	_win_worst = 0.0
@@ -675,6 +733,16 @@ func _send_telemetry() -> void:
 			_gen_prev_ct[i] = c
 			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
+	# FP_TELEM_FRAME_DECOMP §5.1: the observer self-decomposition fields (byte-off ⇒ absent, keys unchanged). `telem_ms`
+	# is the PREVIOUS window's snapshot cost; `fh` the frame-period histogram; `eval_ms`/`cap_ms` the JS-eval + readback
+	# window-maxima; `unattr` the ≥25ms stall-frame count. `telem_hz` echoes the ?telem knob so the analysis knows the rate.
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		msg["fh"] = _dc_fh
+		msg["telem_ms"] = snappedf(_dc_telem, 0.01)
+		msg["eval_ms"] = snappedf(_dc_eval, 0.01)
+		msg["cap_ms"] = snappedf(_dc_cap, 0.01)
+		msg["unattr"] = _dc_unattr
+		msg["telem_hz"] = (1 if _telem_1hz else 4)
 
 	# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer attribution + the capture-window marker. snow_ms/ctrl_ms
 	# are this window's WORST single-frame snowfall-step / controller-tick cost (WorldManager accumulates the max, resets on
@@ -713,6 +781,10 @@ func _send_telemetry() -> void:
 	if _ws.get_ready_state() == WebSocketPeer.STATE_OPEN \
 			and _ws.get_current_outbound_buffered_amount() < OUTBOUND_BUFFER_BYTES - 65536:
 		_ws.send_text(JSON.stringify(msg))
+	# FP_TELEM_FRAME_DECOMP §5.1: latch THIS snapshot's own build+send cost (incl. the JSON.stringify + the JS-bridge
+	# eval that _wasm_heap_mb ran) for the NEXT window's `telem_ms` — the observer finally measuring itself.
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		_telem_ms = float(Time.get_ticks_usec() - _dc_t0) / 1000.0
 
 
 ## A1 CROSSING INSTRUMENTATION (#114): drain WorldManager's per-crossing attribution queue and send each record as a
@@ -907,10 +979,13 @@ func _capture_frame_async() -> void:
 		return
 	var vp := get_viewport()
 	var img: Image = null
+	var _cap0 := Time.get_ticks_usec() if CubeSphere.FP_TELEM_FRAME_DECOMP else 0
 	if vp != null:
 		var tex := vp.get_texture()
 		if tex != null:
 			img = tex.get_image()
+	if CubeSphere.FP_TELEM_FRAME_DECOMP:
+		_win_cap_ms = maxf(_win_cap_ms, float(Time.get_ticks_usec() - _cap0) / 1000.0)   # §5.1 viewport readback (glReadPixels) cost
 	if img == null:
 		_capturing = false
 		return

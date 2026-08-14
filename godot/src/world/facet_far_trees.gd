@@ -55,6 +55,8 @@ const BURY := 1.0                      # radial sink (blocks): trunk base buried
 const CULL_PROBE_CAP := 256            # FP_FAR_TREES_NEARCULL §5.2/R1: max is_area_meshed probes / rebuild pass — beyond it, emit (degrade to shipped, never a gap)
 const GUARD_REC := 9                   # FP_FT_NEAR_GUARD §1: per-live-impostor metadata floats [fid, bx, gy, bz, sx, sy, sz, mm_sel, slot]
 const FT_GUARD_PROBE_CAP := 64         # FP_FT_NEAR_GUARD §1: max NearPresence probes / guard pass (annulus worst 144 → full sweep ≤3 steps ≈0.75s via the round-robin cursor)
+const FT_STALE_MS := 2000              # FP_FT_STALE_REBUILD §4.1: min ms between credit-0 forced rebuilds (the ≤0.5Hz floor)
+const FT_STALE_MOVE := 32.0            # FP_FT_STALE_REBUILD §4.1: min cam move (blocks) since the last rebuild to force one at credit 0
 const FT_CULL_SALT_U := 0x5F356495     # §5.2 (#130): salt differentiating a mid-restore UNKNOWABLE term from NOT_COVERED so the U→NOT_COVERED flip drifts the fp (else the stall returns through the UNKNOWABLE door)
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
@@ -168,6 +170,12 @@ var _last_guard_ms := 0
 var _dbg_guard_hides := 0               # cumulative instances hidden by the guard (telemetry / gate read-back)
 var _guard_dirty_mesh: Dictionary = {}  # species buffers zeroed this guard pass → re-uploaded once at _guard_flush
 var _guard_dirty_card := false          # card buffer zeroed this guard pass (cards-own-frontier mode)
+
+## FP_FT_STALE_REBUILD (§4.1): the wall-clock ms + absolute camera position of the LAST real rebuild — the staleness floor
+## forces a credit-0 rebuild only when the camera has moved > FT_STALE_MOVE from `_stale_ref_cam` AND ≥ FT_STALE_MS since
+## `_last_rebuild_wall_ms`. Both updated on every real rebuild (any path). Read only under the flag ⇒ byte-identical off.
+var _last_rebuild_wall_ms := 0
+var _stale_ref_cam := Vector3.ZERO
 
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
@@ -760,6 +768,7 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	_apply_visibility(offsurf)
 	if offsurf:
 		return
+	var cam_abs := _cam_to_absolute(cam_render)            # one absolute-frame camera — guard, staleness floor + rebuild all reuse it
 	# FP_FT_NEAR_GUARD §1 (task #132): the bounded cull-only double-render guard runs BEFORE the settle/credit return, so it
 	# heals far-over-near even while the client sits at stream credit 0 (the ~30fps regime where the rebuild — and thus the
 	# NEARCULL — is starved and the impostor set freezes minutes-stale). Own 250 ms rate cap; ≤0.5 ms by construction.
@@ -767,10 +776,14 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		var gnow := Time.get_ticks_msec()
 		if gnow - _last_guard_ms >= CubeSphere.FAR_TREES_STEP_MS:
 			_last_guard_ms = gnow
-			_near_guard(_cam_to_absolute(cam_render))
+			_near_guard(cam_abs)
 	# FP_LOAD_DEFER settle gate: pre-settle we only reaped (a finished build still lands in the LRU); no dispatch,
 	# no rebuild — no tree work during fresh-load pile-up. Post-settle the first rebuild waits on stream credit.
-	if not settled or not credit_ok:
+	# FP_FT_STALE_REBUILD §4.1 (task #132 P1): the CONVERSE of the guard — even at credit 0, permit ONE real rebuild when the
+	# player has MOVED far enough that the frozen far set is stale (gap-fill / #130 dwell-restore / new-terrain the cull-only
+	# guard can't do). Hard ≤0.5 Hz floor: settled ∧ moved > FT_STALE_MOVE since last rebuild ∧ ≥ FT_STALE_MS since it. Off ⇒
+	# never overrides (byte-identical credit gate). The 250 ms rate cap + DELTA gate below still apply.
+	if not settled or (not credit_ok and not _stale_override(settled, credit_ok, cam_abs)):
 		return
 	var now := Time.get_ticks_msec()
 	if now - _last_step_ms < CubeSphere.FAR_TREES_STEP_MS:
@@ -782,7 +795,6 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		_material.set_shader_parameter("planet_centre", centre)
 	if _mesh_material != null:
 		_mesh_material.set_shader_parameter("planet_centre", centre)
-	var cam_abs := _cam_to_absolute(cam_render)
 	var wanted := _wanted_facets_for(cam_abs)              # Earth facets within the card band, nearest-first (cached under DELTA)
 	_advance_dwell(wanted)
 	if _enum_fid < 0:
@@ -812,6 +824,22 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	_note_rebuilt(now, cam_abs)   # FP_FT_STALE_REBUILD §4.1: reset the staleness floor's reference (no-op read off)
+
+## FP_FT_STALE_REBUILD §4.1: should the credit gate be overridden to let ONE real rebuild through at credit 0? True only
+## under the flag, settled, credit 0, and the camera moved > FT_STALE_MOVE from the last rebuild AND ≥ FT_STALE_MS since it
+## — a hard ≤0.5 Hz floor. Off ⇒ always false (byte-identical credit gate). Extracted so the gate can drive it directly.
+func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
+	if not (CubeSphere.FP_FT_STALE_REBUILD and settled and not credit_ok):
+		return false
+	return Time.get_ticks_msec() - _last_rebuild_wall_ms >= FT_STALE_MS and cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE
+
+## FP_FT_STALE_REBUILD §4.1: record that a real rebuild just ran — resets the staleness floor (time + reference camera) so
+## a still camera never re-triggers and a moving one rebuilds at most every FT_STALE_MS. Cheap unconditional write; the
+## values are only READ under the flag, so this is byte-identical when off.
+func _note_rebuilt(now_ms: int, cam_abs: Vector3) -> void:
+	_last_rebuild_wall_ms = now_ms
+	_stale_ref_cam = cam_abs
 
 # --- enumeration worker (one facet / job) ---------------------------------------------------------------------------
 
@@ -1514,6 +1542,7 @@ func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false                        # mirror step(): the first completed rebuild clears the hide latch
+	_note_rebuilt(Time.get_ticks_msec(), cam_abs)
 	return _live_instances
 
 ## FP_FAR_TREES_DELTA gate hook (G-FTD-1..5): drive the DELTA-gated rebuild path with an explicit wanted set + camera
@@ -1535,10 +1564,21 @@ func debug_step(wanted: Array, cam_abs: Vector3) -> bool:
 		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	_note_rebuilt(Time.get_ticks_msec(), cam_abs)
 	return true
 
 func rebuild_count() -> int:
 	return _dbg_rebuild_count
+
+## FP_FT_STALE_REBUILD gate hooks (G-FTS-*): drive the staleness-override decision directly + manipulate/read its
+## reference, so the ≤0.5 Hz floor logic is provable without a live FacetFarRing / a 2 s wall wait.
+func debug_stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
+	return _stale_override(settled, credit_ok, cam_abs)
+func debug_set_stale_ref(cam_abs: Vector3, wall_ms: int) -> void:
+	_stale_ref_cam = cam_abs
+	_last_rebuild_wall_ms = wall_ms
+func debug_stale_ref_cam() -> Vector3:
+	return _stale_ref_cam
 
 ## FP_FT_NEAR_GUARD gate read-backs (G-FTG-*): captured live-impostor metadata rows, rows the guard has zero-scaled this
 ## epoch, and the world-space X-axis length of a mesh instance's live transform (≈0 once the guard has collapsed it — the

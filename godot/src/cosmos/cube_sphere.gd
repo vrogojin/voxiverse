@@ -1001,6 +1001,15 @@ const FP_FT_NEAR_GUARD := false              # §1: bounded credit-independent c
 ## sites run once at setup (archetype meshes + card atlas), so the mean cache cost is boot-only. Off ⇒ both sites resolve
 ## the shipped swatch (mesh arrays + atlas bytes byte-identical). No new allocations (reuses BlockTextures' mean cache).
 const FP_FT_TEXMEAN_COLOR := false           # §3: far-tree leaf/trunk colour = texture-mean (match near blocks + far skin)
+## FP_FT_STALE_REBUILD (docs/COSMOS-FARTREE-POLISH-DESIGN.md §4.1, task #132 P1) — the CONVERSE of FP_FT_NEAR_GUARD. The
+## same FP_LOAD_DEFER credit-0 freeze that left stale far impostors over near trees (the guard's job) ALSO starves the
+## paths the cull-only guard cannot do: gap-fill of a ramped-down view, #130-class dwell RESTORES, and new-terrain card/
+## mesh fill while the player walks — all of which need a REAL rebuild (a show, not a hide). This flag adds a hard ≤0.5 Hz
+## staleness FLOOR: even at credit 0, permit one real rebuild when settled AND the camera has moved > FT_STALE_MOVE since
+## the last rebuild AND ≥ FT_STALE_MS have elapsed since it. The 250 ms rate cap + the DELTA gate still apply, so a still
+## camera never triggers it and a moving one rebuilds at most every FT_STALE_MS. This re-admits full rebuild cost on an
+## overloaded client — hence a live perf A/B before default-on; ship byte-off (credit gate exactly as shipped when off).
+const FP_FT_STALE_REBUILD := false           # §4.1: ≤0.5Hz staleness floor — rebuild-while-moving despite credit 0 (converse of the guard)
 
 ## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
 ## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel

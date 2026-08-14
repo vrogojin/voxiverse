@@ -127,6 +127,8 @@ func _initialize() -> void:
 		_gate_guard()
 		# G-FTM-COLOR (FP_FT_TEXMEAN_COLOR, #132 defect-3): far-tree leaf/trunk colour = texture-mean. Two-state.
 		_gate_texmean()
+		# G-FTS (FP_FT_STALE_REBUILD, #132 P1): the ≤0.5Hz staleness floor — credit-0 rebuild-while-moving. Two-state.
+		_gate_stale()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -1440,6 +1442,52 @@ func _gate_texmean() -> void:
 			"G-FTM-COLOR: the leaf mean differs from the flat swatch where a tile exists (the fix is non-trivial)")
 	else:
 		_ok(got.is_equal_approx(swatch), "G-FTM-COLOR(off): _ft_color_of(LEAF) == flat BlockCatalog swatch (byte-identical)")
+
+# ---- G-FTS (FP_FT_STALE_REBUILD — the ≤0.5Hz staleness floor, #132 P1) ---------------------------------------------
+
+## docs/COSMOS-FARTREE-POLISH-DESIGN.md §4.1. Two-state, self-describing. The floor overrides the credit-0 return for ONE
+## rebuild only when settled ∧ credit 0 ∧ moved > FT_STALE_MOVE since the last rebuild ∧ ≥ FT_STALE_MS since it. Drives the
+## `_stale_override` decision directly (debug_stale_override) with a manipulable reference (debug_set_stale_ref) so the full
+## logic — flag gating, both thresholds, the ≤0.5Hz reset — is provable without a live ring or a 2 s wall wait.
+func _gate_stale() -> void:
+	var stale := CubeSphere.FP_FT_STALE_REBUILD
+	var ring := _fake_ring()
+	var fid: int = _sample_facets()[0]
+	var tier = FT.new()
+	tier.setup_instance(ring, fid)
+	var cam0 := Vector3(1000.0, 2000.0, 3000.0)
+	var moved := cam0 + Vector3(FT.FT_STALE_MOVE + 8.0, 0.0, 0.0)     # moved PAST the threshold
+	var near := cam0 + Vector3(FT.FT_STALE_MOVE - 8.0, 0.0, 0.0)      # moved but UNDER the threshold
+	var now := Time.get_ticks_msec()
+	if not stale:
+		tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+		_ok(not tier.debug_stale_override(true, false, moved),
+			"G-FTS-OFF: staleness override inert when the flag is off (credit gate byte-identical)")
+		ring.queue_free()
+		return
+	# --- flag ON --- time-stale reference (last rebuild FT_STALE_MS+1s ago)
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+	_ok(not tier.debug_stale_override(true, false, cam0),
+		"G-FTS-1: still camera ⇒ no override (moved 0 ≤ FT_STALE_MOVE)")
+	_ok(not tier.debug_stale_override(true, false, near),
+		"G-FTS-1: sub-threshold move ⇒ no override (< FT_STALE_MOVE)")
+	_ok(tier.debug_stale_override(true, false, moved),
+		"G-FTS-2: moved > FT_STALE_MOVE AND ≥ FT_STALE_MS ⇒ override (credit-0 rebuild admitted — the converse fix)")
+	_ok(not tier.debug_stale_override(true, true, moved),
+		"G-FTS-3: credit OK ⇒ no override (the normal path already rebuilds)")
+	_ok(not tier.debug_stale_override(false, false, moved),
+		"G-FTS-3: not settled ⇒ never overrides (fresh-load pile-up stays protected)")
+	# fresh reference (just rebuilt) ⇒ the ≤0.5Hz floor blocks a second rebuild even though the camera moved
+	tier.debug_set_stale_ref(cam0, now)
+	_ok(not tier.debug_stale_override(true, false, moved),
+		"G-FTS-4: < FT_STALE_MS since the last rebuild ⇒ no override (the ≤0.5Hz floor holds)")
+	# a real rebuild resets the reference camera so the floor re-arms from the new position
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+	tier.enumerate_facet_sync(fid)
+	tier.debug_rebuild([fid], moved)
+	_ok(tier.debug_stale_ref_cam().is_equal_approx(moved),
+		"G-FTS-4: a real rebuild resets the staleness reference camera (floor re-arms from the new pos)")
+	ring.queue_free()
 
 # ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
 

@@ -146,7 +146,11 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if offsurf:
 		return
 	# FP_LOAD_DEFER settle gate + stream credit — no structure work during fresh-load pile-up (mirror of the trees).
-	if not settled or not credit_ok:
+	# FP_STRUCT_NEAR_GUARD §4.2 (#132): at credit 0 the same freeze leaves a far structure over its arrived near build
+	# (double-render) and starves missing/dwell-restored structures. The guard relaxes ONLY the credit gate; the settle
+	# gate, the STRUCT_STEP_MS rate cap and the delta gate below still bound the (cheap, per-rev-cached) rebuild, and its
+	# _cull_emit pass fixes both sides. Off ⇒ the shipped `not credit_ok` return verbatim (byte-identical).
+	if not _credit_gate_open(settled, credit_ok):
 		return
 	var now := Time.get_ticks_msec()
 	if now - _last_step_ms < CubeSphere.STRUCT_STEP_MS:
@@ -172,6 +176,13 @@ func _cam_to_absolute(cam_render: Vector3) -> Vector3:
 	if _ring == null:
 		return cam_render
 	return (_ring as Node3D).global_transform.affine_inverse() * cam_render
+
+## FP_STRUCT_NEAR_GUARD §4.2: may the step proceed past the settle/credit gate? The SETTLE gate always holds (no work
+## during fresh-load pile-up). The credit gate holds too — UNLESS the guard is on, which admits the (rate-capped +
+## delta-gated + per-rev-cached) structures step at credit 0 so the near-handoff cull + gap-fill can re-run. Off ⇒
+## exactly `settled and credit_ok` (the shipped gate, byte-identical). Extracted so the gate can drive it directly.
+func _credit_gate_open(settled: bool, credit_ok: bool) -> bool:
+	return settled and (credit_ok or CubeSphere.FP_STRUCT_NEAR_GUARD)
 
 ## True (and re-latch) iff any rebuild input drifted since the last real rebuild, OR a near-handoff cull is mid-
 ## transition (a probe disagrees with the committed visibility — the streak still needs to advance, and a stable

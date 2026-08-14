@@ -44,6 +44,7 @@ func _initialize() -> void:
 	_gate_decim()
 	_gate_handoff()
 	_gate_delta()
+	_gate_guard()
 	_gate_ledger()
 	_gate_np()
 	_gate_shader()
@@ -195,6 +196,27 @@ func _gate_delta() -> void:
 	_ok(tier._inputs_changed(cam, 2, 101, 0), "G-ST-DELTA: rev-sum bump (a structure changed) ⇒ rebuild re-arms")
 	_ok(tier._inputs_changed(cam + Vector3(5, 0, 0), 2, 101, 0), "G-ST-DELTA: camera motion ≥ threshold ⇒ rebuild")
 	_ok(tier._inputs_changed(cam + Vector3(5, 0, 0), 2, 101, 99), "G-ST-DELTA: near-cull fingerprint drift ⇒ rebuild")
+
+# =====================================================================================================================
+# G-ST-GUARD (FP_STRUCT_NEAR_GUARD, #132 §4.2) — the credit-0 freeze fix: relaxes ONLY the credit gate, not the settle
+# gate. Two-state, self-describing. The actual cull/gap-fill work the open gate admits is already proven by G-ST-HANDOFF
+# (_cull_emit hide/restore) + G-ST-DELTA (_cull_pending / cover-fp / move re-arms the rebuild); this pins the gate itself.
+# =====================================================================================================================
+func _gate_guard() -> void:
+	var guard := CubeSphere.FP_STRUCT_NEAR_GUARD
+	var tier = FS.new()
+	# The SETTLE gate always holds (no structure work during fresh-load pile-up), in BOTH flag states.
+	_ok(not tier._credit_gate_open(false, true), "G-ST-GUARD: not settled ⇒ gate closed (fresh-load pile-up protected)")
+	_ok(not tier._credit_gate_open(false, false), "G-ST-GUARD: not settled + credit 0 ⇒ gate closed")
+	# Credit OK ⇒ open regardless of the flag (the normal shipped path).
+	_ok(tier._credit_gate_open(true, true), "G-ST-GUARD: settled + credit OK ⇒ gate open (normal path)")
+	# The flag ONLY changes the settled + credit-0 case (the freeze).
+	if guard:
+		_ok(tier._credit_gate_open(true, false),
+			"G-ST-GUARD(on): settled + credit 0 ⇒ gate OPEN — the bounded structures step runs (double-render + missing/restore fix)")
+	else:
+		_ok(not tier._credit_gate_open(true, false),
+			"G-ST-GUARD(off): settled + credit 0 ⇒ gate CLOSED (shipped credit gate, byte-identical)")
 
 # =====================================================================================================================
 # G-ST-BYTES / G-ST-DRAWS — the NEVER-OOM ledger + draw budget.

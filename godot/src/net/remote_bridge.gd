@@ -909,6 +909,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			msg["facet_neighbours"] = int(world.call("facet_pool_neighbour_count"))
 		if world.has_method("stream_load_credit"):
 			msg["stream_credit"] = snappedf(float(world.call("stream_load_credit")), 0.001)
+		# COSMOS-MOTION-PHYS §6.5 (FP_MOVE_PROBE_CACHE): the generated-value cache hit-rate readback (n_probe_hit /
+		# n_probe_cva is the ≥0.5 accept ratio; gen_cache_sz confirms the never-OOM bound). Empty-dict-guarded — a
+		# shipped (flag-off) build stamps NO gen-cache keys → byte-identical telemetry.
+		if world.has_method("gen_cache_stats"):
+			var gc = world.call("gen_cache_stats")
+			if gc is Dictionary and not (gc as Dictionary).is_empty():
+				msg.merge(gc as Dictionary)
 		# CROSSING-FASTGEN obs-2 fix (4): the controller setpoint/floor/overload trace, so "adaptive off" vs "on but
 		# genuinely over setpoint" is directly readable alongside the credit. Guarded + empty-dict-guarded so a
 		# flag/render-path combination without a live controller simply omits these (never crashes the bridge).

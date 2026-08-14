@@ -306,6 +306,10 @@ NEVER-OOM byte budget (delta over shipped):
   background off-surface. Gates G-SP-DEM-EQ/G-SP-TOKEN.
 * **Phase C — `FP_NB_FULLRES` (+ colbulk for neighbours)**: want-set widening, retire policy,
   ledger. Headless G-SP-NB first, then live eyeball at a ridge + corner.
+  **Concrete impl spec: `docs/COSMOS-NB-FULLRES-DESIGN.md`** — supersedes §3.2/§3.3 where they
+  differ (notably: far-ring exclusion must become band-conditional, and the ledger's memory
+  counters are `VoxelEngine.get_stats().memory_pools.voxel_used` + static heap, NOT per-terrain
+  `get_statistics`, which has no resident counters).
 * **Phase D — residue**: crossing transform-spike interaction (redesignate now re-places more live
   mesh blocks — measure `redesig_ms`; the structural fix remains the ActiveFrame/fixed-frame
   design, `docs/COSMOS-FIXED-FRAME-DESIGN.md`), corner-wedge eyeball, optional neighbour view

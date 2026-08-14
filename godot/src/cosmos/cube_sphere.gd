@@ -2264,6 +2264,16 @@ const POOL_D_COMMIT := 64.0
 ## Flipped ON at export after the browser A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true live.
 const FP_CTRL_ADAPTIVE := false
 const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
+## FP_TELEM_FRAME_DECOMP (docs/COSMOS-FOREST-FPS-LIMITER-DESIGN.md §5, task #129) — measurement-in-the-loop decomposition.
+## The forest ~5Hz ≥33ms rest stall is CLOCKED (under-dispersed hitches, every instrumented subsystem zero); the prime
+## suspect is the OBSERVER itself — the 4Hz RemoteBridge telemetry snapshot (JavaScriptBridge.eval + the JSON build) which
+## never had a self-timer, so it is invisible in every measurement we've ever taken. This flag adds byte-off, bridge-
+## connected-only self-instrumentation to the 4Hz message: a frame-period histogram (`fh`), `telem_ms` (the snapshot's own
+## cost, latched + emitted next window), `eval_ms` (the sync JS bridge round-trip), `cap_ms` (the viewport readback) and an
+## `unattr` verdict counter. Paired with the `?telem=1hz` query knob (snapshot period 0.25→1s) — the primary A/B
+## discriminator: if the ≥33ms hitch rate falls ~5/s → ~1.2/s under 1Hz, the observer IS the attacker. All fixed-size
+## ints/floats (never-OOM). Off ⇒ the telemetry message keys are byte-identical (no fields, no brackets, no knob effect).
+const FP_TELEM_FRAME_DECOMP := false     # §5: byte-off observer self-instrumentation (fh/telem_ms/eval_ms/cap_ms/unattr) + ?telem=1hz
 const CTRL_FLOOR_PCTL := 0.1             # p10 — the client's achievable floor (robust to short hitch trains)
 # CROSSING-FASTGEN obs-2 fix (1) — UN-PIN THE CONTROLLER. The margin was 1.3 → setpoint ≈ floor_p10×1.3 ≈ 22.8 ms, which
 # the client's own frame exceeds in 52% of windows → credit stays pinned 0 → the imminent promotes only via the geometric

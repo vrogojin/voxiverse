@@ -122,6 +122,11 @@ func _initialize() -> void:
 		# shader-string parity + a flag-independent CPU coverage sim that pins BOTH the fix (union 1.0) and the shipped
 		# in-phase defect (union max(f) < 1) every run.
 		_gate_xfade()
+		# G-FTG (FP_FT_NEAR_GUARD, #132 defect-2): the bounded credit-independent double-render guard. Two-state,
+		# self-describing (off ⇒ no metadata captured, guard inert, buffers byte-identical).
+		_gate_guard()
+		# G-FTM-COLOR (FP_FT_TEXMEAN_COLOR, #132 defect-3): far-tree leaf/trunk colour = texture-mean. Two-state.
+		_gate_texmean()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -1317,6 +1322,124 @@ func _gate_xfade() -> void:
 		var expect := maxf(fm, fc)
 		_ok(absf(frac - expect) < 0.05 and frac < 0.999,
 			"G-XDC-1: in-phase dither union == max(f)=%.2f (measured %.3f) < 1 — the shipped 50%%-coverage defect pinned" % [expect, frac])
+
+# ---- G-FTG (FP_FT_NEAR_GUARD — the bounded credit-independent double-render guard, #132) ----------------------------
+
+## docs/COSMOS-FARTREE-POLISH-DESIGN.md §1. Two-state, self-describing. OFF ⇒ no metadata captured, debug_guard inert,
+## buffers byte-identical. ON ⇒ a stale far impostor that the frozen instance set left standing over an arrived near mesh
+## is culled by the guard EVEN with no rebuild (the credit-0 regime): dist<FT_CULL_MIN ⇒ hidden unconditionally, annulus
+## COVERED ⇒ hidden, probes bounded by FT_GUARD_PROBE_CAP with a round-robin cursor, a real rebuild resets the hidden-set.
+## The observable is the live MultiMesh instance transform collapsing to zero-scale (set_instance_transform, not the CPU
+## buffer snapshot) + the guard_hides()/hidden-set counters; rebuild_count() proves the guard never itself rebuilds.
+func _gate_guard() -> void:
+	if not CubeSphere.FP_FAR_TREES_MESH or not CubeSphere.FP_FAR_TREES_NEARCULL:
+		print("  (G-FTG skipped — needs FP_FAR_TREES_MESH + FP_FAR_TREES_NEARCULL sed-toggled true)")
+		return
+	var guard := CubeSphere.FP_FT_NEAR_GUARD
+	var ring := _fake_ring()
+	var fid: int = _sample_facets()[0]
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+
+	if not guard:
+		# G-FTG-OFF: with the flag off, a rebuild captures ZERO guard metadata and debug_guard is a no-op (byte-identical).
+		var t = FT.new(); t.setup_instance(ring, fid)
+		var p := centre + tangent * 200.0
+		var r := p.normalized()
+		var syn := PackedFloat32Array([p.x, p.y, p.z, r.x, r.y, r.z, 0.0, 5.0, 0.0, 0.0, 0.0])
+		t.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+		t.debug_set_cache(fid, syn)
+		t.debug_rebuild([fid], centre)
+		_ok(t.debug_guard_meta_count() == 0, "G-FTG-OFF: no guard metadata captured (flag off ⇒ no alloc, byte-identical)")
+		t.debug_guard(p - tangent * 30.0)
+		_ok(t.guard_hides() == 0 and t.debug_guard_hidden_count() == 0, "G-FTG-OFF: debug_guard inert (0 hides)")
+		ring.queue_free()
+		return
+
+	# --- flag ON ---
+	# G-FTG-1: a tree emitted FAR (d=200, NOT_COVERED) is captured; when the camera walks up so it's now inside
+	# FT_CULL_MIN, the guard hides it UNCONDITIONALLY (no probe) — even with no intervening rebuild (rebuild_count fixed).
+	var t1 = FT.new(); t1.setup_instance(ring, fid)
+	var p1 := centre + tangent * 200.0
+	var r1 := p1.normalized()
+	t1.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+	t1.debug_set_cache(fid, PackedFloat32Array([p1.x, p1.y, p1.z, r1.x, r1.y, r1.z, 0.0, 5.0, 0.0, 0.0, 0.0]))
+	t1.debug_rebuild([fid], centre)
+	_ok(t1.mesh_live_instances() == 1 and t1.debug_guard_meta_count() == 1, "G-FTG-1: one far impostor emitted + captured for the guard")
+	var rc1 := t1.rebuild_count()
+	t1.debug_guard(p1 - tangent * 30.0)          # camera 30 blk from the tree ⇒ dist < FT_CULL_MIN (64)
+	_ok(t1.guard_hides() == 1, "G-FTG-1: tree now inside FT_CULL_MIN hidden unconditionally (near field owns it)")
+	_ok(t1.debug_mesh_inst_axis_len(0, 0) < 1.0e-3, "G-FTG-1: the hidden instance transform is zero-scaled (collapsed → invisible)")
+	_ok(t1.rebuild_count() == rc1, "G-FTG-1: the guard did NOT rebuild (cull-only, credit-independent)")
+
+	# G-FTG-2: an annulus tree (d=100) emitted while NOT_COVERED is left shown by the guard; when the near mesh arrives
+	# (probe flips COVERED) the guard hides it — at credit 0, with no rebuild (the exact frozen double-render heal).
+	var t2 = FT.new(); t2.setup_instance(ring, fid)
+	var p2 := centre + tangent * 100.0
+	var r2 := p2.normalized()
+	var s2 := {"v": NearPresence.NOT_COVERED}
+	t2.set_near_query(func(_f, _b): return s2["v"])
+	t2.debug_set_cache(fid, PackedFloat32Array([p2.x, p2.y, p2.z, r2.x, r2.y, r2.z, 0.0, 5.0, 0.0, 0.0, 0.0]))
+	t2.debug_rebuild([fid], centre)
+	_ok(t2.mesh_live_instances() == 1, "G-FTG-2: annulus tree emitted while NOT_COVERED")
+	t2.debug_guard(centre)
+	_ok(t2.guard_hides() == 0, "G-FTG-2: NOT_COVERED annulus tree left shown by the guard (no over-cull)")
+	s2["v"] = NearPresence.COVERED
+	t2.debug_guard(centre)
+	_ok(t2.guard_hides() == 1 and t2.debug_mesh_inst_axis_len(0, 0) < 1.0e-3,
+		"G-FTG-2: COVERED annulus tree hidden by the guard (double-render healed at credit 0, no rebuild)")
+
+	# G-FTG-3: FT_GUARD_PROBE_CAP bounds probes/pass; the round-robin cursor drains the rest over subsequent passes.
+	var t3 = FT.new(); t3.setup_instance(ring, fid)
+	var s3 := {"v": NearPresence.NOT_COVERED}
+	t3.set_near_query(func(_f, _b): return s3["v"])
+	var N := 80
+	var syn3 := PackedFloat32Array()
+	for i in range(N):
+		var pv := centre + tangent * (80.0 + float(i))     # 80..159 blocks — all inside the annulus [64,168]
+		var rv := pv.normalized()
+		syn3.append_array(PackedFloat32Array([pv.x, pv.y, pv.z, rv.x, rv.y, rv.z, 0.0, 5.0, 0.0, 0.0, 0.0]))
+	t3.debug_set_cache(fid, syn3)
+	t3.debug_rebuild([fid], centre)
+	_ok(t3.mesh_live_instances() == N and t3.debug_guard_meta_count() == N, "G-FTG-3: %d annulus trees emitted + captured" % N)
+	s3["v"] = NearPresence.COVERED
+	t3.debug_guard(centre)
+	var after1 := t3.guard_hides()
+	_ok(after1 > 0 and after1 <= FT.FT_GUARD_PROBE_CAP, "G-FTG-3: one guard pass hides ≤ FT_GUARD_PROBE_CAP (%d ≤ %d)" % [after1, FT.FT_GUARD_PROBE_CAP])
+	t3.debug_guard(centre); t3.debug_guard(centre)
+	_ok(t3.guard_hides() == N, "G-FTG-3: the round-robin cursor drains all %d over multiple passes (%d hidden)" % [N, t3.guard_hides()])
+
+	# G-FTG-4: a REAL rebuild rewrites the whole buffer ⇒ the hidden-set clears, metadata is re-captured, and the
+	# previously-collapsed instances are re-emitted at full scale (guard state cannot leak across rebuilds).
+	s3["v"] = NearPresence.NOT_COVERED
+	t3.debug_rebuild([fid], centre)
+	_ok(t3.debug_guard_hidden_count() == 0 and t3.mesh_live_instances() == N and t3.debug_guard_meta_count() == N,
+		"G-FTG-4: a real rebuild clears the hidden-set + re-captures metadata (buffer rewritten)")
+	_ok(t3.debug_mesh_inst_axis_len(0, 0) > 0.1, "G-FTG-4: re-emitted instance transform restored to full scale (not zero-scaled)")
+	ring.queue_free()
+
+# ---- G-FTM-COLOR (FP_FT_TEXMEAN_COLOR — far-tree leaf/trunk colour = texture-mean, #132) ----------------------------
+
+## docs/COSMOS-FARTREE-POLISH-DESIGN.md §3. Two-state, self-describing. `_ft_color_of` is the SINGLE resolver both far-
+## tree colour sites (archetype-mesh vertex colours :1155 + card-atlas raster :1272) call, so testing it proves both.
+## ON ⇒ it returns BlockTextures.mean_color_of (the exact far-skin FP_SKIN_TEXTURE_MEAN law — far leaves now match the
+## near TEXTURED blocks); OFF ⇒ the shipped flat BlockCatalog swatch (byte-identical mesh arrays + atlas).
+func _gate_texmean() -> void:
+	var tm := CubeSphere.FP_FT_TEXMEAN_COLOR
+	var leaf := BlockCatalog.LEAF
+	var got := FT._ft_color_of(leaf)
+	var swatch := BlockCatalog.color_of(leaf)
+	if tm:
+		var mean := BlockTextures.mean_color_of(leaf)
+		_ok(got.is_equal_approx(mean), "G-FTM-COLOR: _ft_color_of(LEAF) == BlockTextures.mean_color_of (the far-skin texture-mean law, both sites)")
+		_ok((not got.is_equal_approx(swatch)) or mean.is_equal_approx(swatch),
+			"G-FTM-COLOR: the leaf mean differs from the flat swatch where a tile exists (the fix is non-trivial)")
+	else:
+		_ok(got.is_equal_approx(swatch), "G-FTM-COLOR(off): _ft_color_of(LEAF) == flat BlockCatalog swatch (byte-identical)")
 
 # ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
 

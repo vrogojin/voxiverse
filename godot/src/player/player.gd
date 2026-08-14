@@ -1770,6 +1770,11 @@ func _move(delta: float) -> void:
 	# Test each axis at the leading edge, AND at both perpendicular corners of the
 	# capsule (± radius), so a wall touching only one corner (or reached by a
 	# diagonal move) still stops us instead of letting the capsule clip through it.
+	# FP_FALL_TIMING P0 (docs/COSMOS-MOTION-PHYS-DESIGN.md §6, task #129 P2b): bracket JUST the 6 blocked() wall probes so
+	# t_probe_us splits the walking t_move cost between the block_id_at/cell_value_at probes (cacheable — FP_MOVE_PROBE_CACHE)
+	# and move_and_collide/depenetration (not). Decision rule §6.4: probe ≥5ms ⇒ ship the cache; <3ms ⇒ the cost is the
+	# physics call, cache can't reach the bar. Byte-off (only under _ft_on).
+	var _pt := Time.get_ticks_usec() if CubeSphere.FP_FALL_TIMING else 0
 	if delta_move.x != 0.0:
 		var lead_x := position.x + signf(delta_move.x) * PLAYER_RADIUS + delta_move.x
 		if world.blocked(lead_x, position.z, feet_y, _pos_fid) \
@@ -1782,6 +1787,8 @@ func _move(delta: float) -> void:
 				or world.blocked(position.x - PLAYER_RADIUS, lead_z, feet_y, _pos_fid) \
 				or world.blocked(position.x + PLAYER_RADIUS, lead_z, feet_y, _pos_fid):
 			delta_move.z = 0.0
+	if CubeSphere.FP_FALL_TIMING:
+		_ft_max("t_probe_us", Time.get_ticks_usec() - _pt)
 	# The surviving delta goes THROUGH the physics engine so we still collide with the
 	# wooden blocks (walk into a standing pillar and you're blocked; loose pieces also
 	# block us, but _push_bodies shoves them aside so we advance). One slide pass lets

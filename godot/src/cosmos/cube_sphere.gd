@@ -1107,6 +1107,16 @@ const FP_DEM_DEFER := false
 ## verify_fast_load.gd (G-FL-OFF / G-FL-GATE / G-FL-FAILSAFE).
 const FP_LOAD_DEFER := false
 const LOAD_DEFER_FAILSAFE_MS := 45000   # wall-clock cap (ms): force the settle latch even if the near view never meshes
+## FP_STREAM_TICK_ONCE (docs/COSMOS-MOTION-PHYS-DESIGN.md §4, task #129 motion) — the walking phys_ms fix.
+## WorldManager.update_streaming runs EVERY physics tick (Player._physics_process → update_streaming), and a slow render
+## frame runs 2 physics steps (project.godot max_physics_steps_per_frame=2), so the ~200-line render-facing orchestration
+## TAIL (_update_alt_regime down: anchor, tex baker, DEM, pool, far ring, flip-settle) executes TWICE on exactly the frames
+## already slow — identical work (same player_pos regime, same demand), and it corrupts the _bg/_g2 headroom governors with
+## a ~0ms inter-call delta on the 2nd catch-up step (reads as headroom precisely when overloaded). This flag runs the tail
+## at most once per RENDER frame (both catch-up steps share one Engine.get_process_frames(), which increments after the
+## physics loop). The SAFETY HEAD (streamer, GroundCollider update, pos latch, floor/blocked funnels) stays per-tick →
+## ZERO fall-through risk (the tail writes no collision state). Off ⇒ no early return ⇒ byte-identical.
+const FP_STREAM_TICK_ONCE := false      # §4: run the streaming orchestration tail once per render frame, not per physics tick
 
 ## FP_SMOOTH_V2_PACE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2, §2.1.2) — commit RATE-CAP for FacetSmoothV2. Post-settle
 ## the annulus fill lands ~36 tiles across ~36 step()s, and `step()` commits on EVERY reap ⇒ ~36 whole-surface

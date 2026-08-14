@@ -221,6 +221,10 @@ var _cosmos_clock: CosmosEphemeris.CosmosClock = null
 var _weather_us_max := 0
 var _last_player_pos: Vector3 = Vector3.ZERO
 var _have_player_pos: bool = false
+var _stream_tail_frame := -1            # FP_STREAM_TICK_ONCE: the last Engine.get_process_frames() the orchestration tail ran
+var _dbg_tail_runs := 0                 # FP_STREAM_TICK_ONCE gate: cumulative orchestration-tail executions (read-back)
+func debug_tail_runs() -> int: return _dbg_tail_runs
+func debug_set_tail_frame(f: int) -> void: _stream_tail_frame = f   # gate-only: simulate a render-frame change (get_process_frames advances)
 # FP_ENV_FALL_HOLD: position-based downward-speed estimate (blocks/s, EMA) to pause the far-ring env-warm during a
 # fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
 var _fall_last_usec: int = -1
@@ -1225,6 +1229,19 @@ func update_streaming(player_pos: Vector3) -> void:
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos
 	_have_player_pos = true
+	# FP_STREAM_TICK_ONCE (docs/COSMOS-MOTION-PHYS-DESIGN.md §4, #129 motion): the render-facing orchestration TAIL below
+	# (_update_alt_regime → anchor → tex baker → DEM → pool → far ring → flip-settle) is identical work on both physics
+	# steps of a slow 2-step frame — running it twice doubles its cost on exactly the already-slow frames AND corrupts the
+	# _bg/_g2 headroom governors with a ~0ms inter-call delta on the 2nd catch-up step. Both catch-up steps share one
+	# Engine.get_process_frames() (it increments AFTER the physics loop), so this runs the tail exactly once per RENDER
+	# frame. The SAFETY HEAD above (streamer, GroundCollider update, pos latch) already ran per-tick → zero fall-through
+	# risk (the tail writes no collision state). Off ⇒ no early return ⇒ byte-identical.
+	if CubeSphere.FP_STREAM_TICK_ONCE:
+		var _pf := Engine.get_process_frames()
+		if _pf == _stream_tail_frame:
+			return
+		_stream_tail_frame = _pf
+	_dbg_tail_runs += 1                     # FP_STREAM_TICK_ONCE gate read-back: tail executions (advances once/frame under the flag)
 	# COSMOS-PERF UNATTENDED R3 (FP_ALT_REGIME): advance the altitude regime latch FIRST (before the pool-manage /
 	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
 	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.

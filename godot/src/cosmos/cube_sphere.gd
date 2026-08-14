@@ -2588,6 +2588,17 @@ const FP_SHELL_CAMERA_SET := false
 const SHELL_RELIEF_DEG := 8.0     # relief margin: terrain of height h pokes past the limb by ≈ √(2h/R); 8° covers ≥ 30-block relief
 const SHELL_SLACK_DEG := 15.0     # drift slack: re-emits are scheduled (fired at SLACK − 2° = 13°), not reactive, so the old set still contains the visible cap until the new build lands
 const SHELL_CAP_MAX_DEG := 96.0   # emit cap ceiling (facet-centre test grants ~half-facet slop like BACK_CULL = 0); 105° is the pre-approved limb fallback
+## FP_SHELL_SURF_CAP (docs/COSMOS-BACKSTOP-DIET-DESIGN.md, task #129 — the forest-fps MEDIAN unlock) — on the surface the
+## shell floors θ_emit to 90° (a full front hemisphere), but from eye height on R=6371 nothing beyond ~θ_h+11° (the max
+## 116-block relief limb-poke) is geometrically visible, so ~85% of that hemisphere — the coarse CELLS=4 blocky front
+## shell, wall-expanded ×3.5 by FP_BLOCKY_FARRING — is submitted every frame BELOW the horizon (the 489k-vert steady-state
+## render floor). This flag replaces the 90° surface floor with a horizon-relative cap θ_h + SHELL_SURF_CAP_DEG (analytic
+## visibility bound + slack), cutting the emitted shell ~−72% (489k → ~135k verts) with NO see-through-gap regression (the
+## cap provably exceeds θ_h + horizon-relief at every altitude; the sticky backstop roles all sit in ring-1 ⊂ the cap, so
+## no see-through frame at a crossing). Rides all existing drift/Δθ_h re-emit + async machinery. Off ⇒ the shipped 90°
+## floor verbatim (byte-identical). One draw call, so the win is GPU-vertex + upload (−20MB), not submit.
+const FP_SHELL_SURF_CAP := false  # §diet: surface emitted-set cap = horizon + relief, not the 90° hemisphere
+const SHELL_SURF_CAP_DEG := 29.0  # √(2·116/R)≈11° max-relief limb poke + 15° drift slack + ~3° facet-centre slop
 
 ## COSMOS ORBITAL-SHELL S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §4/§9) — a ONE-SHOT background whole-planet warm of
 ## the far-ring COARSE cache (all 6·K² facets) once sustained off-surface, so passing over a never-visited longitude

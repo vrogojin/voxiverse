@@ -1214,7 +1214,7 @@ func apply_camera_set(cam: Vector3) -> void:
 ## 90° below OFFSURFACE_Y so the on-foot regime is byte-VISUALLY identical to shipped (the facets that then differ
 ## from the active-facet law all sit behind the limb). Pure state update + a possible _pending flag; the actual
 ## warm + rebuild + swap ride the EXISTING _process/async pipeline. Split out so headless gates drive it directly.
-func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
+func shell_set_camera_abs(dir: Array, d: float, floored: bool, surf_cap_override_deg := -1.0) -> void:
 	var r := FacetAtlas.R_BLOCKS
 	var theta_h := acos(clampf(r / maxf(d, r), -1.0, 1.0))   # visible-cap angular radius (0 at/below the surface, < 90° always)
 	# COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD): off-surface (airborne) carry a GENEROUS extra margin so a
@@ -1225,7 +1225,18 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool) -> void:
 	var theta_emit := minf(theta_h + deg_to_rad(CubeSphere.SHELL_RELIEF_DEG + CubeSphere.SHELL_SLACK_DEG) + extra,
 			deg_to_rad(CubeSphere.SHELL_CAP_MAX_DEG))
 	if floored:
-		theta_emit = maxf(theta_emit, deg_to_rad(90.0))       # surface floor: keep the shipped hemisphere while near tiers are live
+		# FP_SHELL_SURF_CAP (§diet, #129): cap the surface emitted set to the horizon + relief (θ_h + 29°) instead of the
+		# shipped 90° hemisphere — ~85% of that hemisphere is submitted below the visible horizon (the 489k-vert render
+		# floor). The cap provably contains every geometrically visible facet at all standing altitudes; the |Δθ_h| > 5°
+		# trigger re-emits on large standing-height changes. Off ⇒ the shipped 90° floor verbatim (byte-identical).
+		# `surf_cap_override_deg` >= 0 is a GATE-ONLY hook: an absolute θ_emit floor (deg) that bypasses the flag so one
+		# headless run can measure BOTH the capped and the shipped-hemisphere emitted sets. Default -1 ⇒ the flag logic.
+		if surf_cap_override_deg >= 0.0:
+			theta_emit = maxf(theta_emit, deg_to_rad(surf_cap_override_deg))
+		elif CubeSphere.FP_SHELL_SURF_CAP:
+			theta_emit = maxf(theta_emit, theta_h + deg_to_rad(CubeSphere.SHELL_SURF_CAP_DEG))
+		else:
+			theta_emit = maxf(theta_emit, deg_to_rad(90.0))   # surface floor: keep the shipped hemisphere while near tiers are live
 	_dbg_theta_emit_deg = rad_to_deg(theta_emit)
 	var new_cos := cos(theta_emit)
 	if not _cam_set:

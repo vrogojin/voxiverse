@@ -69,6 +69,7 @@ func _initialize() -> void:
 	_gate_nopop(active)
 	_gate_byteoff(active)
 	_gate_limb(active)
+	_gate_diet(active)
 	if CubeSphere.FP_SHELL_PREWARM:
 		_gate_prewarm(active)
 	else:
@@ -133,6 +134,103 @@ func _emit_set(ring: Node3D, c: Vector3, d: float, floored: bool) -> Dictionary:
 	for f in vis:
 		s[int(f)] = true
 	return s
+
+## FP_SHELL_SURF_CAP §diet gate hook: on a FRESH ring (a re-used ring won't re-snapshot when only the cap changes at a
+## fixed direction), drive the emit with an ABSOLUTE surface θ_emit floor (deg) that bypasses the flag, so one headless
+## run measures BOTH the capped and the shipped-hemisphere sets. Returns [emitted-set {fid:true}, ring] (ring for roles).
+func _fresh_emit_cap(active: int, c: Vector3, d: float, floored: bool, cap_deg: float) -> Array:
+	var ring: Node3D = FFR.new()
+	ring.call("setup", active)
+	ring.call("shell_set_camera_abs", [c.x, c.y, c.z], d, floored, cap_deg)
+	ring.call("force_rebuild")
+	var vis: PackedInt32Array = ring.call("visible_fids")
+	var s := {}
+	for f in vis:
+		s[int(f)] = true
+	return [s, ring]
+
+## The facet's angular RADIUS: the max angle from its centre dir to any of its 4 corners (the "half diagonal" the
+## soundness bound subtracts so a facet is safely excludable only when its NEAREST point is below the horizon).
+func _facet_ang_radius(fid: int) -> float:
+	var c: Vector3 = _centres[fid]
+	var m := 0.0
+	for ci in range(4):
+		var corner := FA.facet_planar_corner(fid, ci)
+		m = maxf(m, c.angle_to(Vector3(corner[0], corner[1], corner[2]).normalized()))
+	return m
+
+func _same_set(a: Dictionary, b: Dictionary) -> bool:
+	if a.size() != b.size():
+		return false
+	for k in a.keys():
+		if not b.has(k):
+			return false
+	return true
+
+# ---------------- G-DIET (FP_SHELL_SURF_CAP — the surface horizon-cap emitted set, task #129) ----------------
+## docs/COSMOS-BACKSTOP-DIET-DESIGN.md §5. The surface floors θ_emit to the full 90° hemisphere, but from eye height on
+## R=6371 nothing beyond θ_h + ~11° (the 116-block max-relief limb poke) is visible — so ~85% of that hemisphere is
+## submitted below the horizon (the 489k-vert render floor). This gate drives shell_set_camera_abs with the absolute-cap
+## override so ONE run compares the capped set to the shipped hemisphere, proves the cut, and exhaustively verifies the
+## no-see-through invariant + the make-before-break role safety — independent of the compiled flag (the LIVE truth is the
+## served-pck dump). Self-describing: G-DIET-OFF matches whichever branch the compiled flag selects.
+func _gate_diet(active: int) -> void:
+	var c: Vector3 = _centres[active]            # ĉ = a real standing-pose sub-camera direction (over the active facet)
+	var d := _R + 2.0                            # floored, sea level (the design's G-DIET-VERTS pose)
+	var th := _theta_h(d)
+	var cap_deg := rad_to_deg(th) + CubeSphere.SHELL_SURF_CAP_DEG   # reproduces the flag's θ_h + 29° exactly
+	var hemr: Array = _fresh_emit_cap(active, c, d, true, 90.0)                     # shipped 90° hemisphere (+ ring for roles)
+	var hemi: Dictionary = hemr[0]
+	var hem_ring: Node3D = hemr[1]
+	var capr: Array = _fresh_emit_cap(active, c, d, true, cap_deg)                  # the θ_h+29° cap
+	var capd: Dictionary = capr[0]
+
+	# G-DIET-VERTS — the cap cuts the emitted set hard (emitted-facet count ∝ submitted verts; the shell is ONE draw).
+	_ok(capd.size() > 0 and float(capd.size()) <= 0.35 * float(hemi.size()),
+		"G-DIET-VERTS: surface cap emits ≤ 0.35× the 90° hemisphere (%d ≤ 0.35·%d facets)" % [capd.size(), hemi.size()])
+
+	# G-DIET-OFF — the LIVE floored emit set (compiled-flag path, no override) matches the branch the flag selects.
+	var live: Dictionary = _fresh_emit_cap(active, c, d, true, -1.0)[0]
+	if CubeSphere.FP_SHELL_SURF_CAP:
+		_ok(_same_set(live, capd), "G-DIET-OFF(on): flag routes the floored set to the θ_h+29° cap (%d facets)" % live.size())
+	else:
+		_ok(_same_set(live, hemi), "G-DIET-OFF(off): flag off ⇒ floored set == shipped 90° hemisphere (byte-identical, %d)" % live.size())
+
+	# G-DIET-SOUND — exhaustive no-see-through (PURE geometry, independent of the emit): at every altitude, every facet
+	# the CAP excludes (centre angle > θ_h + 29°) has its NEAREST point (centre angle − angular radius) strictly beyond
+	# the visible horizon θ_h + acos(R/(R+116)). Facets within the cap that the near field owns are NOT the cap's cut, so
+	# they are excluded from this check (cang ≤ cap_angle).
+	var relief := acos(clampf(_R / (_R + 116.0), -1.0, 1.0))   # 116-block max-relief limb angle
+	var sound_ok := true
+	var worst := ""
+	var nfac := 6 * FA.K * FA.K
+	for dr in [2.0, 64.0, 112.0, 255.0]:
+		var dd: float = float(_R) + float(dr)
+		var thh := _theta_h(dd)
+		var horizon := thh + relief
+		var cap_angle := thh + deg_to_rad(CubeSphere.SHELL_SURF_CAP_DEG)
+		for fid in range(nfac):
+			var cang: float = (_centres[fid] as Vector3).angle_to(c)
+			if cang <= cap_angle:
+				continue                                       # inside the cap — not a cap-exclusion (emitted or near-owned)
+			var nearest: float = cang - _facet_ang_radius(fid)
+			if nearest <= horizon:
+				sound_ok = false
+				worst = "fid %d nearest %.1f° ≤ horizon %.1f° (dr=%.0f)" % [fid, rad_to_deg(nearest), rad_to_deg(horizon), dr]
+				break
+		if not sound_ok:
+			break
+	_ok(sound_ok, "G-DIET-SOUND: every cap-excluded facet is below the visible horizon at all 4 altitudes (no see-through) [%s]" % (worst if worst != "" else "clean"))
+
+	# G-DIET-ROLES — make-before-break safety: capping never DROPS a facet the shipped hemisphere would emit as a backstop
+	# role (active ∪ _excluded ∪ _sticky are all ring-1 ⊂ the cap). So: every hemisphere-emitted backstop facet is also in
+	# the capped set. (Near-field-owned facets aren't emitted in EITHER, so they don't false-fail.)
+	var roles_ok := true
+	for fid in hemi.keys():
+		if bool(hem_ring.call("is_backstop", int(fid))) and not capd.has(int(fid)):
+			roles_ok = false
+			break
+	_ok(roles_ok, "G-DIET-ROLES: the cap never drops a hemisphere-emitted backstop facet (roles ⊆ cap — no see-through at crossings)")
 
 ## The six well-separated test longitudes: the spawn normal, its ANTIPODE, and ±the two perpendiculars.
 func _test_axes(active: int) -> Array:

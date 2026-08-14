@@ -53,6 +53,8 @@ const THIN_FADE := 0.06               # dithered-retirement half-width in the su
 const FADE_EPS := 0.004               # below this the instance is dropped (fully faded / retired) — bounds the transient count
 const BURY := 1.0                      # radial sink (blocks): trunk base buried so trees sit on the tier datum (§4.3)
 const CULL_PROBE_CAP := 256            # FP_FAR_TREES_NEARCULL §5.2/R1: max is_area_meshed probes / rebuild pass — beyond it, emit (degrade to shipped, never a gap)
+const GUARD_REC := 9                   # FP_FT_NEAR_GUARD §1: per-live-impostor metadata floats [fid, bx, gy, bz, sx, sy, sz, mm_sel, slot]
+const FT_GUARD_PROBE_CAP := 64         # FP_FT_NEAR_GUARD §1: max NearPresence probes / guard pass (annulus worst 144 → full sweep ≤3 steps ≈0.75s via the round-robin cursor)
 const FT_CULL_SALT_U := 0x5F356495     # §5.2 (#130): salt differentiating a mid-restore UNKNOWABLE term from NOT_COVERED so the U→NOT_COVERED flip drifts the fp (else the stall returns through the UNKNOWABLE door)
 const CANOPY_DIAM := 5.0               # horizontal card scale (blocks) — radius-2 canopy → ~5-block diameter
 const CANOPY_EXTRA := 3.0              # blocks added over trunk_h for the total card height (canopy layers + cap)
@@ -151,6 +153,21 @@ var _cull_probes := 0                   # probes issued this rebuild pass (cappe
 var _dbg_cull_probes := 0               # last rebuild pass's probe count (gate read-back)
 var _pending_nearcull_fp := 0           # §5.4 fingerprint computed in step()/debug_step before the DELTA check
 var _last_rebuild_nearcull_fp := 0      # fingerprint latched at the last real rebuild
+
+## FP_FT_NEAR_GUARD (docs/COSMOS-FARTREE-POLISH-DESIGN.md §1, task #132): bounded, credit-independent, cull-only guard.
+## `_guard_meta` is a flat PackedFloat32Array of GUARD_REC-stride rows [fid, bx, gy, bz, sx, sy, sz, mm_sel, slot], one per
+## LIVE impostor written this rebuild (mm_sel = species column for the mesh rung, −1 for the card rung; slot = the instance
+## index in that MultiMesh). Rebuilt each REAL rebuild (which also rewrites the whole MultiMesh buffer, so all hidden
+## transforms reset). `_guard_hidden` marks metadata rows already zero-scaled this rebuild (never un-hidden — restore stays
+## rebuild-owned). `_guard_cursor` is the round-robin scan start so the FT_GUARD_PROBE_CAP budget rotates over the whole set
+## across steps. All read/written only under the flag ⇒ byte-identical off (no alloc, no guard pass, buffers untouched).
+var _guard_meta: PackedFloat32Array = PackedFloat32Array()
+var _guard_hidden: Dictionary = {}
+var _guard_cursor := 0
+var _last_guard_ms := 0
+var _dbg_guard_hides := 0               # cumulative instances hidden by the guard (telemetry / gate read-back)
+var _guard_dirty_mesh: Dictionary = {}  # species buffers zeroed this guard pass → re-uploaded once at _guard_flush
+var _guard_dirty_card := false          # card buffer zeroed this guard pass (cards-own-frontier mode)
 
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
@@ -340,6 +357,15 @@ static func make_mesh_material() -> ShaderMaterial:
 ## 12 xform + 4 CUSTOM = 16 (byte-identical). ONE source of truth for every buffer size / write-base / ledger site.
 static func mesh_stride() -> int:
 	return MESH_STRIDE_CFIX if CubeSphere.FP_FAR_TREES_COLORFIX else MESH_STRIDE
+
+## FP_FT_TEXMEAN_COLOR (§3, task #132): resolve a far-tree cell's colour. On ⇒ the texture MEAN
+## (BlockTextures.mean_color_of — the same law the far TERRAIN skin uses under FP_SKIN_TEXTURE_MEAN, so far leaves/trunks
+## match the near TEXTURED blocks at the handoff). Off ⇒ the shipped flat BlockCatalog swatch (byte-identical mesh arrays
+## + atlas). mean_color_of falls back to the swatch for tile-less ids and caches per stem, so this is boot-cost only.
+static func _ft_color_of(id: int) -> Color:
+	if CubeSphere.FP_FT_TEXMEAN_COLOR:
+		return BlockTextures.mean_color_of(id)
+	return BlockCatalog.color_of(id)
 
 # =====================================================================================================================
 # P2 (FP_FAR_TREES_FADE) — the no-pop fade LAW, as pure static functions (ONE source of truth: `_rebuild_*` compute
@@ -590,6 +616,13 @@ func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
 func _nearcull_begin() -> void:
 	_cull_probes = 0
 	_cull_touched.clear()
+	# FP_FT_NEAR_GUARD §1: a real rebuild rewrites every MultiMesh buffer (all instance transforms reset), so the guard's
+	# hidden-set + metadata must reset here and be re-captured by _rebuild_meshes/_rebuild_cards. Cursor resets so the new
+	# instance set is swept from the top. No-op / no alloc off.
+	if CubeSphere.FP_FT_NEAR_GUARD:
+		_guard_meta = PackedFloat32Array()
+		_guard_hidden.clear()
+		_guard_cursor = 0
 
 ## FP_FAR_TREES_NEARCULL: after a rebuild pass, drop dwell entries for trees not probed this pass (bounds the dict to the
 ## live probe annulus). No-op off.
@@ -603,6 +636,97 @@ func _nearcull_end() -> void:
 			drop.append(k)
 	for k in drop:
 		_cull_dwell.erase(k)
+
+## FP_FT_NEAR_GUARD §1: the bounded, credit-independent, CULL-ONLY guard pass. Runs even when stream credit is 0 (unlike
+## the rebuild — which the FP_LOAD_DEFER frame-time gate starves on a chronically-overloaded client), so far impostors that
+## the frozen instance set leaves standing over an arrived near mesh get hidden. Per live impostor within the near-mesh
+## reach: dist < FT_CULL_MIN ⇒ hide unconditionally (near owns it — the rebuild-time rule at :507-508, live); in the
+## annulus ⇒ probe NearPresence, COVERED ⇒ hide. Bounded: ≤ n distance checks + ≤ FT_GUARD_PROBE_CAP probes/pass, a
+## round-robin cursor so the budget rotates over the whole set across passes. NEVER un-hides (restore stays rebuild-owned
+## → no #130 dwell re-entry). Hidden state resets every real rebuild (which rewrites the whole buffer). Only called under
+## the flag; the hidden-set makes it idempotent within a rebuild epoch (a hidden row is skipped, never re-probed).
+func _near_guard(cam_abs: Vector3) -> void:
+	var n := _guard_meta.size() / GUARD_REC
+	if n <= 0:
+		return
+	var r_hi := float(TerrainConfig.near_render_radius()) + 32.0 + 8.0   # same annulus top as _nearcull_emit (near never streams past)
+	var probes := 0
+	var scanned := 0
+	var i := _guard_cursor % n
+	while scanned < n:
+		scanned += 1
+		var idx := i
+		i = (i + 1) % n
+		if _guard_hidden.has(idx):
+			continue
+		var o := idx * GUARD_REC
+		var dx := _guard_meta[o + 4] - cam_abs.x
+		var dy := _guard_meta[o + 5] - cam_abs.y
+		var dz := _guard_meta[o + 6] - cam_abs.z
+		var dist := sqrt(dx * dx + dy * dy + dz * dz)
+		if dist >= r_hi:
+			continue                                            # beyond the near-mesh reach — near can't cover it, stay shown
+		if dist < CubeSphere.FT_CULL_MIN:
+			_guard_hide_instance(idx)                           # near field owns <FT_CULL_MIN unconditionally (no probe)
+			continue
+		if probes >= FT_GUARD_PROBE_CAP:
+			i = idx                                             # probe budget spent — resume AT this un-probed row next pass
+			break
+		probes += 1
+		var st := int(_near_query.call(int(_guard_meta[o + 0]),
+			AABB(Vector3(_guard_meta[o + 1], _guard_meta[o + 2] + 1.0, _guard_meta[o + 3]), Vector3.ONE)))
+		if st == NearPresence.COVERED:
+			_guard_hide_instance(idx)                           # near blocky tree present here — cull the far twin
+	_guard_cursor = i
+	_guard_flush()                                              # one set_buffer per rung buffer that changed this pass
+
+## FP_FT_NEAR_GUARD §1: hide one live impostor by ZEROING its 12 transform floats in the CPU buffer snapshot the tier
+## already keeps (the collapsed zero basis renders no geometry). We do NOT use set_instance_transform: on a set_buffer-
+## backed MultiMesh it is a no-op (the buffer is authoritative). The zeroed buffer is uploaded once per pass by
+## _guard_flush (a single set_buffer of an already-computed array — the cheap upload, NOT the expensive rebuild recompute;
+## colours/custom in the buffer are untouched). mm_sel = species column (mesh rung) or −1 (shared card rung).
+func _guard_hide_instance(idx: int) -> void:
+	var o := idx * GUARD_REC
+	var sel := int(_guard_meta[o + 7])
+	var slot := int(_guard_meta[o + 8])
+	if sel < 0:
+		var base := slot * CARD_STRIDE
+		if slot < 0 or base + 11 >= _last_buf.size():
+			return
+		for k in range(12):
+			_last_buf[base + k] = 0.0
+		_guard_dirty_card = true
+	else:
+		if sel >= _last_mesh_bufs.size():
+			return
+		var b: PackedFloat32Array = _last_mesh_bufs[sel]
+		var base := slot * mesh_stride()
+		if slot < 0 or base + 11 >= b.size():
+			return
+		for k in range(12):
+			b[base + k] = 0.0
+		_last_mesh_bufs[sel] = b
+		_guard_dirty_mesh[sel] = true
+	_guard_hidden[idx] = true
+	_dbg_guard_hides += 1
+
+## FP_FT_NEAR_GUARD §1: upload the buffers zeroed this pass — one set_buffer each (bounded: ≤ N_SPECIES mesh + 1 card),
+## only when something was actually hidden. Off the guard entirely when no hides occurred (no upload).
+func _guard_flush() -> void:
+	for sel in _guard_dirty_mesh.keys():
+		if int(sel) < _mesh_mms.size():
+			(_mesh_mms[int(sel)] as MultiMesh).set_buffer(_last_mesh_bufs[int(sel)])
+	_guard_dirty_mesh.clear()
+	if _guard_dirty_card and _mm != null:
+		_mm.set_buffer(_last_buf)
+	_guard_dirty_card = false
+
+## Gate/telemetry read-back: cumulative instances the guard has hidden since load; and a headless driver that runs one
+## guard pass at a given absolute camera (verify_far_trees.gd G-FTG-*). No-op unless the flag is live.
+func guard_hides() -> int: return _dbg_guard_hides
+func debug_guard(cam_abs: Vector3) -> void:
+	if CubeSphere.FP_FT_NEAR_GUARD and CubeSphere.FP_FAR_TREES_NEARCULL and _near_query.is_valid():
+		_near_guard(cam_abs)
 
 ## True iff the tree with lattice base (bx, gy, bz) in `fid` is chopped (its trunk-base cell edited). Only under
 ## FP_FAR_TREES_FADE with a live query; else false (P0/P1 — no filter). Main-thread (rebuild) call, race-free.
@@ -636,6 +760,14 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	_apply_visibility(offsurf)
 	if offsurf:
 		return
+	# FP_FT_NEAR_GUARD §1 (task #132): the bounded cull-only double-render guard runs BEFORE the settle/credit return, so it
+	# heals far-over-near even while the client sits at stream credit 0 (the ~30fps regime where the rebuild — and thus the
+	# NEARCULL — is starved and the impostor set freezes minutes-stale). Own 250 ms rate cap; ≤0.5 ms by construction.
+	if CubeSphere.FP_FT_NEAR_GUARD and CubeSphere.FP_FAR_TREES_NEARCULL and _near_query.is_valid():
+		var gnow := Time.get_ticks_msec()
+		if gnow - _last_guard_ms >= CubeSphere.FAR_TREES_STEP_MS:
+			_last_guard_ms = gnow
+			_near_guard(_cam_to_absolute(cam_render))
 	# FP_LOAD_DEFER settle gate: pre-settle we only reaped (a finished build still lands in the LRU); no dispatch,
 	# no rebuild — no tree work during fresh-load pile-up. Post-settle the first rebuild waits on stream credit.
 	if not settled or not credit_ok:
@@ -955,6 +1087,11 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
 			# .w carries the dither alpha under FADE (0.0 off); .z carries the snow flag (0.0 off) — byte-identical.
 			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow, fb)
+			# FP_FT_NEAR_GUARD §1: when the mesh rung is OFF the cards own the near frontier, so record card impostors for the
+			# guard (mm_sel = −1 → the shared card MultiMesh; slot = n). With meshes ON, cards live ≥448 (never guard-relevant)
+			# so they're not recorded — the mesh capture owns the frontier. Only under the flag ⇒ byte-identical off.
+			if CubeSphere.FP_FT_NEAR_GUARD and not CubeSphere.FP_FAR_TREES_MESH:
+				_guard_meta.append_array(PackedFloat32Array([float(int(fid)), recs[o + 8], recs[o + 9], recs[o + 10], sx, sy, sz, -1.0, float(n)]))
 			n += 1
 	_mm.set_buffer(buf)
 	_mm.visible_instance_count = n
@@ -1074,6 +1211,10 @@ func _rebuild_meshes(cam_abs: Vector3, wanted: Array) -> void:
 			var hue := packed - trunk_h
 			var arch := _arch_trunk[col] if col < _arch_trunk.size() else 4.0
 			_write_mesh_inst(bufs[col], counts[col] * stride, sx, sy, sz, rx, ry, rz, trunk_h - arch, hue, arch, alpha if fade else 0.0, snow, fb)
+			# FP_FT_NEAR_GUARD §1: record this live impostor so the credit-independent guard can cull it (mm_sel = species
+			# column, slot = its instance index in _mesh_mms[col]). Only under the flag ⇒ no alloc / byte-identical off.
+			if CubeSphere.FP_FT_NEAR_GUARD:
+				_guard_meta.append_array(PackedFloat32Array([float(int(fid)), recs[o + 8], recs[o + 9], recs[o + 10], sx, sy, sz, float(col), float(counts[col])]))
 			counts[col] += 1
 			total += 1
 	for c in range(N_SPECIES):
@@ -1152,7 +1293,7 @@ func _build_archetype_mesh(species: int) -> Dictionary:
 		var p: Vector3i = key
 		var id := int(solid[key])
 		var flag := 0.0 if trunk_ids.has(id) else 1.0
-		var colr := BlockCatalog.color_of(id); colr.a = 1.0
+		var colr := _ft_color_of(id); colr.a = 1.0                # FP_FT_TEXMEAN_COLOR §3: texture-mean on / shipped swatch off
 		for d in dirs:
 			if solid.has(p + d):
 				continue                       # internal face — culled
@@ -1269,7 +1410,7 @@ func _raster_tile(img: Image, ox: int, oy: int, cells: Array, top: bool) -> void
 		var px := int(pad + fu * span)
 		# side view: ground (min y) at tile BOTTOM (higher pixel row); flip v
 		var py := int(pad + (1.0 - fv) * span) if not top else int(pad + fv * span)
-		var colr := BlockCatalog.color_of(cv.w)
+		var colr := _ft_color_of(cv.w)                  # FP_FT_TEXMEAN_COLOR §3: texture-mean on / shipped swatch off
 		colr.a = 1.0
 		_fill_rect(img, ox + px, oy + py, blk, colr)
 
@@ -1322,7 +1463,11 @@ func total_bytes() -> int:
 	var lru_b := 0
 	for fid in _cache.keys():
 		lru_b += (_cache[fid] as PackedFloat32Array).size() * 4
-	return buf_b + atlas_b + mesh_b + mesh_buf_b + lru_b
+	# FP_FT_NEAR_GUARD §1: per-live-impostor metadata (≤ FAR_TREES_MESH_TOTAL_MAX × GUARD_REC × 4 ≈ 36 KB) + the hidden-set
+	# dict (bounded by the same live count). Zero when the flag is off (arrays never allocated). Ledgered — stays far under
+	# FAR_TREES_BYTES_MAX.
+	var guard_b := _guard_meta.size() * 4 + _guard_hidden.size() * 16
+	return buf_b + atlas_b + mesh_b + mesh_buf_b + lru_b + guard_b
 
 ## The card-band INNER radius (ONE source of truth). FAR_TREES_MESH_MAX (448) when rung-1 meshes are live so the
 ## cards retreat past the exclusive handoff; else near_render_radius() — the P0 [128, CARD_MAX] band, BYTE-IDENTICAL
@@ -1394,6 +1539,23 @@ func debug_step(wanted: Array, cam_abs: Vector3) -> bool:
 
 func rebuild_count() -> int:
 	return _dbg_rebuild_count
+
+## FP_FT_NEAR_GUARD gate read-backs (G-FTG-*): captured live-impostor metadata rows, rows the guard has zero-scaled this
+## epoch, and the world-space X-axis length of a mesh instance's live transform (≈0 once the guard has collapsed it — the
+## observable that proves the hide without reading the CPU buffer snapshot, which set_instance_transform bypasses).
+func debug_guard_meta_count() -> int: return _guard_meta.size() / GUARD_REC
+func debug_guard_hidden_count() -> int: return _guard_hidden.size()
+## The X-basis-column length of a mesh instance in the CPU buffer snapshot (basis col-0 = floats [base+0,+4,+8]). ≈0
+## once the guard has zeroed that instance's transform block (headless-safe: reads the tier's own array, not the
+## RenderingServer, which does not store MultiMesh data under --headless).
+func debug_mesh_inst_axis_len(col: int, slot: int) -> float:
+	if col < 0 or col >= _last_mesh_bufs.size():
+		return -1.0
+	var b: PackedFloat32Array = _last_mesh_bufs[col]
+	var base := slot * mesh_stride()
+	if slot < 0 or base + 8 >= b.size():
+		return -1.0
+	return Vector3(b[base + 0], b[base + 4], b[base + 8]).length()
 
 ## FP_FAR_TREES_NEARCULL gate read-backs (G-FTC-*): probes issued in the last rebuild pass, live dwell-dict size, and
 ## the min archetype-mesh vertex Y (G-FTA-2: 0.0 under ALIGN via the −0.5 shift, 0.5 off).

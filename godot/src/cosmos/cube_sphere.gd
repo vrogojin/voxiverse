@@ -981,6 +981,26 @@ const FT_SINK_R0 := 208.0                     # sink ramp start (≈ near_render
 const FT_SINK_R1 := 288.0                     # sink ramp full (deep-band bury == FT_SINK_MAX beyond this)
 const FT_CULL_MIN := 64.0                     # §5.2 never-emit-far floor (a close-up card reads worse than a beat of absence)
 const FT_CULL_DWELL := 2                      # §5.3 consecutive NOT_COVERED probes before a culled far tree is restored
+## FP_FT_NEAR_GUARD (docs/COSMOS-FARTREE-POLISH-DESIGN.md §1, task #132) — the double-render fix. The NEARCULL emit/cull
+## decision only re-runs inside a real rebuild, but `FacetFarTrees.step()` returns before every rebuild whenever stream
+## credit is 0 (FP_LOAD_DEFER frame-time AIMD gate) — a chronically-overloaded ~30fps client sits at credit 0 for ~91%
+## of frames even standing still, so the far-tree set freezes minutes-stale: the player walks INTO far-emitted trees, the
+## near voxel mesh lands underneath, and the cull never re-runs ⇒ far impostor + near blocky tree render together. This
+## flag adds a BOUNDED, CULL-ONLY guard pass that runs even at credit 0 (placed before the settle/credit return): per live
+## impostor, `dist < FT_CULL_MIN` ⇒ hide unconditionally (near owns it); `[FT_CULL_MIN, near_render_radius()+40]` ⇒ probe
+## NearPresence, COVERED ⇒ hide. Hide = zero-scale the instance transform (per-instance write, no set_buffer, gl_compat-
+## safe); probes capped FT_GUARD_PROBE_CAP/step (round-robin cursor); never un-hides (restore stays rebuild-owned, no #130
+## re-entry). Hidden state + metadata are cleared by every REAL rebuild (which rewrites the whole buffer). Off ⇒ no
+## metadata alloc, no guard pass, buffers byte-identical. Requires FP_FAR_TREES_NEARCULL (shares its probe query).
+const FP_FT_NEAR_GUARD := false              # §1: bounded credit-independent cull-only double-render guard
+## FP_FT_TEXMEAN_COLOR (docs/COSMOS-FARTREE-POLISH-DESIGN.md §3, task #132) — far tree leaf/trunk colours don't match the
+## near field: the far-tree tier resolves the FLAT BlockCatalog swatch at both colour sites (archetype-mesh vertex colours
+## + card-atlas raster), while the NEAR leaf blocks render the actual texture tile (whose eye-average is the texture MEAN)
+## and the far TERRAIN skin already uses the mean law (FP_SKIN_TEXTURE_MEAN → BlockTextures.mean_color_of). This flag routes
+## both far-tree colour sites through the SAME mean law, so far leaf/trunk colour == near block mean at the handoff. Both
+## sites run once at setup (archetype meshes + card atlas), so the mean cache cost is boot-only. Off ⇒ both sites resolve
+## the shipped swatch (mesh arrays + atlas bytes byte-identical). No new allocations (reuses BlockTextures' mean cache).
+const FP_FT_TEXMEAN_COLOR := false           # §3: far-tree leaf/trunk colour = texture-mean (match near blocks + far skin)
 
 ## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
 ## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel

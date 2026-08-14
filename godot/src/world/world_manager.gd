@@ -225,6 +225,18 @@ var _stream_tail_frame := -1            # FP_STREAM_TICK_ONCE: the last Engine.g
 var _dbg_tail_runs := 0                 # FP_STREAM_TICK_ONCE gate: cumulative orchestration-tail executions (read-back)
 func debug_tail_runs() -> int: return _dbg_tail_runs
 func debug_set_tail_frame(f: int) -> void: _stream_tail_frame = f   # gate-only: simulate a render-frame change (get_process_frames advances)
+
+## COSMOS-MOTION-PHYS §6.5 (FP_MOVE_PROBE_CACHE) A/B readback: since-last-read window counts of generated-branch
+## queries and cache hits (the §6.5 accept ratio n_probe_hit/n_probe_cva ≥ 0.5), plus current epoch size. Reading
+## resets the window so the telemetry sample reflects the last snapshot interval (motion vs rest read distinctly).
+## Returns {} with the flag off (never written) → byte-identical telemetry, exactly like fall_timing().
+func gen_cache_stats() -> Dictionary:
+	if not CubeSphere.FP_MOVE_PROBE_CACHE:
+		return {}
+	var out := {"n_probe_cva": _gen_cache_cva, "n_probe_hit": _gen_cache_hit, "gen_cache_sz": _gen_cache.size()}
+	_gen_cache_cva = 0
+	_gen_cache_hit = 0
+	return out
 # FP_ENV_FALL_HOLD: position-based downward-speed estimate (blocks/s, EMA) to pause the far-ring env-warm during a
 # fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
 var _fall_last_usec: int = -1
@@ -291,6 +303,14 @@ var _placed_top: Dictionary = {}      # Vector2i(x, z) -> int
 # FLOOR_MEMO_CAP and cleared wholesale on overflow (NEVER-OOM). Empty + unread with FP_FLOOR_MEMO off (byte-identical).
 var _floor_top: Dictionary = {}       # Vector2i(x, z) -> int (topmost standable CELL y)
 const _FLOOR_MEMO_NONE := -0x40000000 # sentinel: no memo for this column (never a real floor cell)
+# COSMOS-MOTION-PHYS §6.3 (FP_MOVE_PROBE_CACHE): per-physics-tick generated-value cache under cell_value_at, keyed by
+# the Vector3i window cell → packed generated value (≥ 0, so -1 is a safe miss sentinel). Consulted only AFTER the live
+# edit-overlay get and only on the main thread; self-clears when the physics frame advances (_gen_cache_tick), and is
+# cleared wholesale at the two remap choke points FP_FLOOR_MEMO patrols. Empty + untouched with the flag off.
+var _gen_cache: Dictionary = {}        # Vector3i cell -> int packed generated value (this epoch only)
+var _gen_cache_tick: int = -1          # Engine.get_physics_frames() the cache is stamped for (transient epoch)
+var _gen_cache_cva: int = 0            # generated-branch queries this window (main-thread, flag-on) — A/B readback
+var _gen_cache_hit: int = 0            # of those, cache hits — n_probe_hit/n_probe_cva is the §6.5 accept ratio
 # Sparse per-joint reinforcement (glue/weld/cement; STRUCTURAL-INTEGRITY §4.2/§7):
 # canonical key Vector4i(min_cell.x, .y, .z, axis) -> reinforcement id. Lives
 # OUTSIDE the four cell axes (it is per-FACE, not per-cell). The structural solver
@@ -1476,6 +1496,32 @@ func cell_value_at(cell: Vector3i) -> int:
 	var e: int = _edits.get(_edit_key(cell), -1)
 	if e >= 0:
 		return _overlay_window_modifier(cell, e)    # overlay: de-canon the directional modifier into the window frame (§6.4)
+	# COSMOS-MOTION-PHYS §6.3 (FP_MOVE_PROBE_CACHE): the overlay get above stays LIVE on every query, so an edited cell
+	# can never be served from the cache — this cache wraps only the generated branch (choice B, clip-through impossible
+	# by construction). Main-thread only (the fallback mesher + SnowfallSystem call this off-main → they bypass, no
+	# locks). Per-physics-tick transient epoch: a frame advance self-clears (the choke points also clear wholesale).
+	if CubeSphere.FP_MOVE_PROBE_CACHE and TerrainConfig._on_main_thread():
+		var tick := Engine.get_physics_frames()
+		if tick != _gen_cache_tick:
+			_gen_cache.clear()
+			_gen_cache_tick = tick
+		_gen_cache_cva += 1
+		var cached: int = _gen_cache.get(cell, -1)
+		if cached >= 0:
+			_gen_cache_hit += 1
+			return cached
+		var gv := _cell_value_generated(cell)
+		if _gen_cache.size() < CubeSphere.MOVE_PROBE_CACHE_CAP:
+			_gen_cache[cell] = gv
+		return gv
+	return _cell_value_generated(cell)
+
+## COSMOS-MOTION-PHYS §6.3: the GENERATED half of cell_value_at (the branch AFTER the edit-overlay miss). Extracted
+## verbatim so FP_MOVE_PROBE_CACHE can memoize its return within a physics tick — a pure function of the cell whose only
+## implicit parameters (active_facet, datum, chart anchor, window indices) change solely at the choke points that clear
+## the cache. Called directly (cache-bypassed) off the main thread and with the flag off → byte-identical to the shipped
+## inline branch.
+func _cell_value_generated(cell: Vector3i) -> int:
 	if _chart == null:
 		var vf := TerrainConfig.generated_cell(cell.x, cell.y, cell.z)
 		# COSMOS FACETED §3.5.4/§5.3: the junction authority is the analytic window exit — it MASKS cells
@@ -3782,6 +3828,11 @@ func _rebuild_window_indices() -> void:
 	# window-keyed floor memo is stale — drop it wholesale (it re-populates lazily on the next fall). No-op off-flag.
 	if CubeSphere.FP_FLOOR_MEMO:
 		_floor_top = {}
+	# COSMOS-MOTION-PHYS §6.3 (FP_MOVE_PROBE_CACHE): a crossing/flip also changes active_facet/datum, so the generated-
+	# value cache (keyed by window cell) is stale — clear it here, the same choke point the floor memo patrols. No-op
+	# off-flag; a clear just forces recompute next query.
+	if CubeSphere.FP_MOVE_PROBE_CACHE:
+		_gen_cache.clear()
 	# FP-M1a: FACETED (no chart) — the active facet lattice IS the window, so keep this facet's edits and
 	# index them directly by their unpacked cell (x, z) / y high-water mark.
 	if CubeSphere.FACETED and _chart == null:
@@ -3878,6 +3929,11 @@ func _shift_window_bookkeeping(d: Vector2i) -> void:
 		for k: Vector2i in _floor_top.keys():
 			new_ft[k - d] = _floor_top[k]
 		_floor_top = new_ft
+	# COSMOS-MOTION-PHYS §6.3 (FP_MOVE_PROBE_CACHE): an origin shift re-keys window columns (the generated value is keyed
+	# by window cell, not global) — clear wholesale rather than re-key (a per-tick transient; it repopulates next query).
+	# No-op off-flag.
+	if CubeSphere.FP_MOVE_PROBE_CACHE:
+		_gen_cache.clear()
 	if not _joint_mods.is_empty():
 		var new_j := {}
 		for k: Vector4i in _joint_mods.keys():

@@ -3912,6 +3912,18 @@ const FLOOR_BOUNDED_MARGIN := 96   # cells scanned down from the feet before jum
 const FP_FLOOR_MEMO := false
 const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wholesale past this — a clear just recomputes)
 
+## COSMOS-MOTION-PHYS §6 (task #129 P2b) — FP_MOVE_PROBE_CACHE. The walking #1 residual after FP_STREAM_TICK_ONCE is
+## t_move (P0-measured LIVE: t_probe_us median 5.72 ms = 80 % of t_move) — the six blocked() wall probes, each a full
+## un-memoized worldgen resolve, with a 60-75 % intra-tick redundant query set (§6.1). Fix = a GENERATED-VALUE cell
+## cache in cell_value_at consulted AFTER the live edit-overlay get, so an edited cell can never be served from cache
+## (clip-through impossible by construction, §6.3 choice B). Vector3i cell → packed value; per-physics-tick transient
+## epoch (Engine.get_physics_frames() self-clear — no call-site wiring); MAIN-THREAD ONLY (the fallback mesher +
+## SnowfallSystem also call cell_value_at off-main → they bypass, no locks); wholesale clear at the two remap choke
+## points FP_FLOOR_MEMO already patrols (_rebuild_window_indices / _shift_window_bookkeeping). NEVER-OOM by double
+## bound: per-tick clear + MOVE_PROBE_CACHE_CAP. Off ⇒ one const test in the generated branch — byte-identical.
+const FP_MOVE_PROBE_CACHE := false
+const MOVE_PROBE_CACHE_CAP := 512  # max cells memoized per epoch (NEVER-OOM: stop inserting past this, hits still serve)
+
 ## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
 ## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
 ## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME

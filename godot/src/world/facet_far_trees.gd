@@ -992,8 +992,11 @@ func _wanted_facets_for(cam_abs: Vector3) -> Array:
 ## (the buffers are a pure function of exactly these inputs — fades are dist(cam,tree)-only, sun_dir/planet_centre
 ## are in-shader uniforms), so `step` skips the rebuild. Only called under the flag (short-circuited off).
 func _rebuild_inputs_changed(cam_abs: Vector3) -> bool:
+	# FP_FT_MOVE_HYST (F2a, #129): widen the rebuild move threshold to FT_DELTA_MOVE_HYST while credit flows (the F1
+	# interlock) so a walk re-arms the full rebuild 6× less often. Off ⇒ the shipped FT_DELTA_MIN_MOVE (byte-identical).
+	var move_thr: float = CubeSphere.FT_DELTA_MOVE_HYST if CubeSphere.FP_FT_MOVE_HYST else CubeSphere.FT_DELTA_MIN_MOVE
 	var changed := (not _have_rebuilt) \
-		or cam_abs.distance_to(_last_rebuild_cam) >= CubeSphere.FT_DELTA_MIN_MOVE \
+		or cam_abs.distance_to(_last_rebuild_cam) >= move_thr \
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
 		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale) \

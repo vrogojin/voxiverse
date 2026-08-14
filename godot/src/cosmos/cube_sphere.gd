@@ -928,6 +928,16 @@ const FP_FAR_TREES_COLORFIX := false         # rung-1 mesh COLOR-slot fix (gl_co
 ## (byte-identical). Gate: verify_far_trees.gd (G-FTD-1..5).
 const FP_FAR_TREES_DELTA := false            # far-trees rebuild-on-change gate (skip bit-identical static-camera rebuilds)
 const FT_DELTA_MIN_MOVE := 2.0               # blocks of camera motion that re-arm a far-trees rebuild
+## FP_FT_MOVE_HYST (docs/COSMOS-FOREST-FPS-LIMITER-DESIGN.md §4, task #129, "F2a") — the motion interlock for F1. Once
+## FP_CTRL_FLOOR_VSYNC lets stream credit flow while WALKING, the far-tree DELTA gate re-arms the FULL instance-set rebuild
+## every FT_DELTA_MIN_MOVE (2 blk); at a 5.5 blk/s walk that is ~2Hz, at a run ~4Hz, and each rebuild is the #119 ~50-60ms
+## main-thread cost → 10-23% duty (the #119 rebuild-PWM attacker returns through the door F1 opens). This flag widens the
+## rebuild move threshold to FT_DELTA_MOVE_HYST (12 blk → 6× fewer rebuilds while moving). 12 blk of handoff hysteresis at
+## the ≥128-blk far-tree band is sub-pixel (the near tree owns <128, the far impostor moves ≤12 blk before its rebuild —
+## invisible), and the NEARCULL guard (250ms, credit-independent) still culls double-renders every step. Off ⇒ the shipped
+## 2.0 threshold verbatim (byte-identical). Ships WITH FP_CTRL_FLOOR_VSYNC (F1) — neither alone is the fix.
+const FP_FT_MOVE_HYST := false               # F2a §4: widen the far-tree rebuild move threshold while credit flows (the F1 interlock)
+const FT_DELTA_MOVE_HYST := 12.0             # blocks of camera motion re-arming a far-trees rebuild under FP_FT_MOVE_HYST (6× the shipped 2.0)
 const FT_DELTA_WANTED_MOVE := 64.0           # blocks of camera motion that re-compute the wanted-facet scan
 
 ## FP_SLOPE_ALL_MATERIALS (docs/COSMOS-SLOPE-MATERIAL-DESIGN.md, task #122) — widen the 45° smooth-slope carve band
@@ -2264,6 +2274,18 @@ const POOL_D_COMMIT := 64.0
 ## Flipped ON at export after the browser A/B (the established sed-at-export pattern). Requires FP_M1_POOL = true live.
 const FP_CTRL_ADAPTIVE := false
 const CTRL_FLOOR_WINDOW_FRAMES := 1800   # the best-floor rolling window (~1 min at 30 fps); floor_p10 is taken over it
+## FP_CTRL_FLOOR_VSYNC (docs/COSMOS-FOREST-FPS-LIMITER-DESIGN.md §3, task #129, "F1") — the adaptive controller's
+## measurement-in-the-loop FLOOR-TRAP fix. The floor window samples frame PERIODS; after every slow frame the browser rAF
+## fires a ~12ms catch-up period, so floor_p10 reads ~12ms — physically impossible as a SUSTAINED period on a 60Hz display.
+## The adaptive setpoint = clamp(floor_p10 × margin, 18, 45) then lands ~24ms, JUST UNDER the p90 the spikes themselves
+## produce → overload latches → stream_credit pinned at 0 (the controller chases its own attacker downward). This flag
+## clamps the floor estimate to ≥ CTRL_FLOOR_MIN_MS (16ms ≈ vsync) so the setpoint floors at ~32ms — a genuine sustained-
+## 30fps overload (floor ≥ 33) still trips, but rAF catch-up periods can no longer poison it. Off ⇒ _floor_p_low verbatim
+## (byte-identical). NOTE: this is only OBSERVED-session-visible at rest (the observer's 13ms snapshot, [[voxiverse-forest-fps-
+## limiter]], is what produces the spikes there) but it protects REAL players from any genuine spike source pinning credit
+## during motion — so it MUST ship with FP_FT_MOVE_HYST (F2a) or unpinned credit re-arms the #119 far-tree rebuild PWM.
+const FP_CTRL_FLOOR_VSYNC := false       # F1 §3: clamp the adaptive floor estimate to ≥ vsync so rAF catch-up can't pin credit
+const CTRL_FLOOR_MIN_MS := 16.0          # the vsync-period floor for the adaptive setpoint's floor estimate (~60Hz)
 ## FP_TELEM_FRAME_DECOMP (docs/COSMOS-FOREST-FPS-LIMITER-DESIGN.md §5, task #129) — measurement-in-the-loop decomposition.
 ## The forest ~5Hz ≥33ms rest stall is CLOCKED (under-dispersed hitches, every instrumented subsystem zero); the prime
 ## suspect is the OBSERVER itself — the 4Hz RemoteBridge telemetry snapshot (JavaScriptBridge.eval + the JSON build) which

@@ -181,7 +181,14 @@ func _floor_p_low() -> float:
 		samp[i] = _floor[i]
 	samp.sort()
 	var idx := int(ceil(CubeSphere.CTRL_FLOOR_PCTL * float(_floor_fill))) - 1
-	return samp[clampi(idx, 0, _floor_fill - 1)]
+	var p := samp[clampi(idx, 0, _floor_fill - 1)]
+	# FP_CTRL_FLOOR_VSYNC (F1, #129): rAF fires a ~12ms catch-up period after every slow frame, so the raw floor p-low reads
+	# below the vsync period — physically impossible as a SUSTAINED cadence on a 60Hz display, yet it drags the adaptive
+	# setpoint down UNDER the very spikes it should suppress (the floor-trap). Clamp the estimate to ≥ vsync so the setpoint
+	# floors at ~32ms; a genuine sustained-30fps overload (floor ≥ 33) still trips. Off ⇒ the raw percentile (byte-identical).
+	if CubeSphere.FP_CTRL_FLOOR_VSYNC:
+		return maxf(p, CubeSphere.CTRL_FLOOR_MIN_MS)
+	return p
 
 # ---- the ONE credit + the four admission surfaces (§6.5.3) ----
 

@@ -788,13 +788,21 @@ func _gate_delta() -> void:
 	var buf3 := tier.debug_buffer()
 	_ok(buf1 == buf3, "G-FTD-1: skipped-frame card buffer BIT-IDENTICAL to a forced rebuild (%d floats) — skip is pixel-safe" % buf1.size())
 
-	# G-FTD-2: camera moved ≥ FT_DELTA_MIN_MOVE (2.0) ⇒ the next step rebuilds; then static again ⇒ skips.
-	var cam2 := cam + Vector3(3.0, 0.0, 0.0)          # +3 blocks ≥ 2.0
+	# G-FTD-2: camera moved ≥ the effective move threshold ⇒ the next step rebuilds; then static again ⇒ skips.
+	# FP_FT_MOVE_HYST (F2a, #129): the threshold is FT_DELTA_MOVE_HYST (12) under the flag, else FT_DELTA_MIN_MOVE (2).
+	var _move_thr: float = CubeSphere.FT_DELTA_MOVE_HYST if CubeSphere.FP_FT_MOVE_HYST else CubeSphere.FT_DELTA_MIN_MOVE
+	# G-FT-MOVEHYST: a move BELOW the threshold must NOT re-arm (proves the hysteresis widened), one AT/ABOVE must.
+	var cam_sub := cam + Vector3(_move_thr - 1.0, 0.0, 0.0)   # under the threshold
+	var cS := tier.rebuild_count()
+	var did_sub := tier.debug_step(wanted, cam_sub)
+	_ok(not did_sub and tier.rebuild_count() == cS,
+		"G-FT-MOVEHYST: a %0.f-blk move (< %0.f threshold) does NOT re-arm the rebuild (%s)" % [_move_thr - 1.0, _move_thr, "hyst on" if CubeSphere.FP_FT_MOVE_HYST else "shipped"])
+	var cam2 := cam + Vector3(_move_thr + 1.0, 0.0, 0.0)          # over the effective threshold
 	var cA := tier.rebuild_count()
 	var didm := tier.debug_step(wanted, cam2)
 	var didm2 := tier.debug_step(wanted, cam2)
 	_ok(didm and not didm2 and tier.rebuild_count() - cA == 1,
-		"G-FTD-2: camera moved ≥%.1f blk ⇒ rebuild re-arms once, then static ⇒ skips" % CubeSphere.FT_DELTA_MIN_MOVE)
+		"G-FTD-2: camera moved ≥%.1f blk (effective) ⇒ rebuild re-arms once, then static ⇒ skips" % _move_thr)
 
 	# G-FTD-4: a record-cache epoch bump (a facet landed / was evicted) ⇒ the next step rebuilds.
 	tier.debug_step(wanted, cam2)                      # ensure latched (static skip)

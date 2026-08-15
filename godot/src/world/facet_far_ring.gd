@@ -3353,6 +3353,13 @@ func shell_telemetry() -> Dictionary:
 		"sh_h": snappedf(_dbg_h, 0.1),
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
+	# FP_FT_SHELL_BAND A/B readback: merge the far-tree zone state (ft_zone 0=S/1=B/2=O, ft_cards/ft_mesh shown, ft_off,
+	# ft_h) so a live climb reads WHICH zone the tier computed at each altitude — confound-free (no visual/biome ambiguity).
+	# Empty dict with the flag off ⇒ no keys added ⇒ byte-identical telemetry.
+	if _far_trees != null:
+		var fb = _far_trees.shell_band_state()
+		if fb is Dictionary and not (fb as Dictionary).is_empty():
+			out.merge(fb as Dictionary)
 	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
 	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
 	# the keys are never added to the dict => byte-identical for any telemetry consumer.

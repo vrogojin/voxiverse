@@ -135,6 +135,9 @@ var _last_rebuild_cam := Vector3.ZERO   # camera pos (absolute) at the last real
 var _last_rebuild_cache_epoch := -1     # _cache_epoch at the last real rebuild
 var _last_rebuild_edits_rev := -1       # edit revision at the last real rebuild
 var _last_rebuild_shell := false        # FP_FT_SHELL_BAND: the zone (S vs B) of the last real rebuild — a zone flip re-arms exactly one
+var _dbg_shell_zone := -1               # FP_FT_SHELL_BAND A/B readback: last computed zone (0=S,1=B,2=O; -1 off)
+var _dbg_shell_h := 0.0                 # last camera radial altitude the zone law saw
+var _dbg_shell_offsurf := false         # last shell_offsurface() the zone law saw
 var _have_wanted := false               # the wanted-facet scan has been computed at least once
 var _last_wanted: Array = []            # cached wanted-facet set (reused until FT_DELTA_WANTED_MOVE / epoch change)
 var _last_wanted_cam := Vector3.ZERO    # camera pos at the last wanted-scan recompute
@@ -806,6 +809,11 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
 	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_FT_SHELL_BAND else -1.0
 	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	# FP_FT_SHELL_BAND A/B readback: latch the computed zone (0=S,1=B,2=O; -1 flag off) + offsurf/h for a confound-free
+	# live telemetry probe (shell_band_state()). Cheap unconditional writes; only READ under the flag → byte-identical off.
+	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)))
+	_dbg_shell_h = h
+	_dbg_shell_offsurf = offsurf
 	_apply_visibility(offsurf, h)
 	if offsurf and not shell_mode:
 		return
@@ -1701,6 +1709,20 @@ func mesh_mmi_visible() -> bool:
 		if (mmi as MultiMeshInstance3D).visible:
 			return true
 	return false
+
+## FP_FT_SHELL_BAND A/B readback: the confound-free live probe of the zone law (the shell-band telemetry). Returns {}
+## with the flag off (never merged → byte-identical telemetry). ft_zone: 0=S(surface),1=B(shell band, cards live),
+## 2=O(orbit, hidden); ft_cards = the card MMI is visible; ft_mesh = the mesh rung is visible; ft_h = altitude the law saw.
+func shell_band_state() -> Dictionary:
+	if not CubeSphere.FP_FT_SHELL_BAND:
+		return {}
+	return {
+		"ft_zone": _dbg_shell_zone,
+		"ft_cards": (_mmi != null and _mmi.visible),
+		"ft_mesh": mesh_mmi_visible(),
+		"ft_off": _dbg_shell_offsurf,
+		"ft_h": snappedf(_dbg_shell_h, 0.1),
+	}
 func is_stale() -> bool:
 	return _stale
 func mesh_uses_colors() -> bool:

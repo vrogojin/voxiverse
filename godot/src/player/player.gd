@@ -400,15 +400,114 @@ func view_telemetry() -> Dictionary:
 	if _camera == null:
 		return {}
 	var fwd := (-_camera.global_transform.basis.z).normalized()
-	return {
+	var out := {
 		"cam_yaw_deg": snappedf(rad_to_deg(rotation.y), 0.01),
 		"cam_pitch_deg": snappedf(rad_to_deg(_pitch), 0.01),
 		"look_world": "(%f, %f, %f)" % [fwd.x, fwd.y, fwd.z],
 	}
+	# COSMOS-AGENT-CONTROL §4.1 (FP_AGENT_POSE): the full SCENE-frame pose an agent needs — body basis
+	# (fwd/right/up), camera right/up (roll about forward is otherwise unknowable), velocity VECTOR +
+	# on_ground. Godot convention: fwd = -basis.z, right = basis.x, up = basis.y (RESEARCH-FPS-AWARENESS §5).
+	# ADDITIVE + flag-gated: off ⇒ exactly the three shipped keys (byte-identical telemetry stream).
+	if CubeSphere.FP_AGENT_POSE:
+		var b := global_transform.basis
+		var cb := _camera.global_transform.basis
+		out["body_fwd"] = _v3a(-b.z)
+		out["body_right"] = _v3a(b.x)
+		out["body_up"] = _v3a(b.y)
+		out["cam_right"] = _v3a(cb.x)
+		out["cam_up"] = _v3a(cb.y)
+		out["vel"] = _v3a(velocity)      # CharacterBody3D velocity, SCENE frame
+		out["on_ground"] = is_on_floor()
+	return out
+
+## COSMOS-AGENT-CONTROL §4.1 — [x,y,z] float array, snapped 0.001. THE vector telemetry format for the
+## new agent-pose keys (look_world keeps its legacy "(%f, %f, %f)" string form for restore-compat).
+func _v3a(v: Vector3) -> Array:
+	return [snappedf(v.x, 0.001), snappedf(v.y, 0.001), snappedf(v.z, 0.001)]
+
+## COSMOS-AGENT-CONTROL §4.2 (FP_AGENT_POSE) — planet-local orientation, ENTIRELY in BCI world (planet
+## centre = origin; every key suffixed _bci). up = radial (normalize P_bci); north = the spin axis (+Y BCI)
+## projected into the tangent plane; east = up × north (right-handed); heading = atan2(fwd·east, fwd·north),
+## 0 = north, +90 = east. The body forward maps SCENE → LATTICE (_frame.g2l_dir, identity when the fixed
+## frame is off) → BCI via an exact affine two-point difference through lattice_to_world64 (the rigid facet
+## placement makes this exact). Chosen over SCENE because BCI is the only frame stable across facet
+## crossings / fixed-frame re-anchors (the SCENE basis jumps by the dihedral at every crossing). Returns {}
+## off-faceted / flag-off / no active facet ⇒ byte-identical telemetry stream.
+func orientation_telemetry() -> Dictionary:
+	if not (CubeSphere.FP_AGENT_POSE and CubeSphere.FACETED):
+		return {}
+	var fid := TerrainConfig.active_facet()
+	if fid < 0:
+		return {}
+	var w: Array = _FacetAtlasCls.lattice_to_world64(fid, position.x, position.y, position.z)
+	var P := Vector3(w[0], w[1], w[2])
+	var up := P.normalized()
+	var y_dot := Vector3.UP.dot(up)
+	if absf(y_dot) > 0.9999:                       # at a pole north is undefined — omit heading + tangent basis
+		return {"up_bci": _v3a(up), "pos_bci": _v3a(P)}
+	var north := (Vector3.UP - y_dot * up).normalized()
+	var east := up.cross(north)
+	# Body forward: SCENE → LATTICE → BCI. Direction map = affine two-point difference (exact for a rigid facet).
+	var f_lat := _frame.g2l_dir(-global_transform.basis.z)
+	var w2: Array = _FacetAtlasCls.lattice_to_world64(fid,
+		position.x + f_lat.x, position.y + f_lat.y, position.z + f_lat.z)
+	var f_bci := Vector3(w2[0] - w[0], w2[1] - w[1], w2[2] - w[2]).normalized()
+	var f_t := (f_bci - f_bci.dot(up) * up)
+	var out := {"up_bci": _v3a(up), "north_bci": _v3a(north), "east_bci": _v3a(east),
+		"fwd_bci": _v3a(f_bci), "pos_bci": _v3a(P)}
+	if f_t.length() > 1e-4:                        # looking straight up/down ⇒ heading undefined
+		out["heading_deg"] = snappedf(rad_to_deg(atan2(f_t.dot(east), f_t.dot(north))), 0.1)
+	return out
 
 ## COSMOS REMOTE VIEW-STATE restore (dev-instrument): set the SURFACE facing to an ABSOLUTE (yaw,pitch) in degrees —
 ## the exact inverse of view_telemetry's cam_yaw_deg/cam_pitch_deg. Reuses the shipped set_initial_look param path.
 ## Reached only via the CONTROL_ENABLED-gated teleport op (yaw_deg/pitch_deg), so it is inert in normal play.
+## COSMOS-AGENT-CONTROL §5.3 (FP_AGENT_QUERY): the aim/arbitrary raycast — reuse the EXACT aim-DDA the
+## break/place path uses (world.aimed_voxel through the _frame lattice seam, _current_target §), so the
+## answer matches what a break would hit. Default origin = camera eye, dir = camera forward (the aim ray).
+## Returns lattice-frame cells/points (cells are frame-invariant; the agent addresses query_box/break/place
+## by cell). {} when world/camera absent. Only reached via the FP_AGENT_QUERY + CONTROL_ENABLED-gated executor.
+func remote_query_ray(spec: Dictionary) -> Dictionary:
+	if not is_instance_valid(world) or _camera == null:
+		return {}
+	var origin: Vector3
+	var o = spec.get("origin", "eye")
+	if o is Array and (o as Array).size() == 3:
+		origin = Vector3(o[0], o[1], o[2])
+	else:
+		origin = _camera.global_position
+	var dir: Vector3
+	var d = spec.get("dir", "look")
+	if d is Array and (d as Array).size() == 3:
+		dir = Vector3(d[0], d[1], d[2]).normalized()
+	else:
+		dir = (-_camera.global_transform.basis.z).normalized()
+	var max_dist := float(spec.get("max_dist", break_reach))
+	var origin_lat: Vector3 = _frame.g2l_point(origin)
+	var dir_lat: Vector3 = _frame.g2l_dir(dir)
+	var info: Dictionary = world.aimed_voxel(origin_lat, dir_lat, max_dist)
+	var hit := bool(info.get("hit", false))
+	var out := {"hit": hit}
+	if hit:
+		var cell: Vector3i = info["voxel"]
+		out["voxel"] = [cell.x, cell.y, cell.z]
+		var nrm: Vector3i = info.get("normal", Vector3i.ZERO)
+		out["normal"] = [nrm.x, nrm.y, nrm.z]
+		var pos: Vector3 = info.get("position", Vector3.ZERO)
+		out["position"] = [snappedf(pos.x, 0.001), snappedf(pos.y, 0.001), snappedf(pos.z, 0.001)]
+		out["block_id"] = int(world.block_id_at(cell))
+		var dist := origin_lat.distance_to(pos)
+		out["dist"] = snappedf(dist, 0.001)
+		out["in_range"] = dist <= break_reach          # Malmo-style: can the player actually reach it to break/place
+	return out
+
+
+## COSMOS-AGENT-CONTROL §5.3 (FP_AGENT_QUERY): the player's own LATTICE cell — the default query_box center.
+func remote_query_center_cell() -> Vector3i:
+	return Vector3i(floori(position.x), floori(position.y), floori(position.z))
+
+
 func remote_set_view(yaw_deg: float, pitch_deg: float) -> void:
 	set_initial_look(deg_to_rad(yaw_deg), deg_to_rad(pitch_deg))
 

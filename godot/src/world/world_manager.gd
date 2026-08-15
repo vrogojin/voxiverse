@@ -1628,6 +1628,44 @@ func _translate_active(src: Dictionary, keys: Variant = null) -> Dictionary:
 func block_id_at(cell: Vector3i) -> int:
 	return CellCodec.mat(cell_value_at(cell))
 
+## COSMOS-AGENT-CONTROL §5.3 (FP_AGENT_QUERY) — batched block_id_at over a box, THE agent neighbourhood query.
+## Composes the ONE authoritative cell query (edit-overlay-else-generated), so the returned grid matches
+## physics / render / DDA exactly (CLAUDE.md rule 1 — never a parallel "what's solid"). TIME-SLICED: fills at
+## most `budget` cells per call, carrying the cursor in `state` (§5.4), so a max 31³ box never hitches a frame.
+## NEVER-OOM: the caller (agent), relay validateStep, and rover _validate_cmd all cap; this asserts once more
+## (an over-cap box completes empty). `state` = {"ids": PackedByteArray, "i": int}. Layout is x-fastest, then z,
+## then y — i = (dy*dimz + dz)*dimx + dx — matching the header `order`. Returns true when the box is complete.
+func block_box_slice(center: Vector3i, half: Vector3i, state: Dictionary, budget: int) -> bool:
+	var hx := clampi(half.x, 0, CubeSphere.QUERY_HALF_MAX)
+	var hy := clampi(half.y, 0, CubeSphere.QUERY_HALF_MAX)
+	var hz := clampi(half.z, 0, CubeSphere.QUERY_HALF_MAX)
+	var dimx := 2 * hx + 1
+	var dimy := 2 * hy + 1
+	var dimz := 2 * hz + 1
+	var total := dimx * dimy * dimz
+	if total <= 0 or total > CubeSphere.QUERY_CELLS_MAX:
+		state["i"] = 0
+		state["ids"] = PackedByteArray()
+		return true                                   # over-cap ⇒ complete-empty (never-OOM backstop)
+	var ids: PackedByteArray = state.get("ids", PackedByteArray())
+	if ids.size() != total:
+		ids.resize(total)
+	var i := int(state.get("i", 0))
+	var done_this := 0
+	var plane := dimz * dimx
+	while i < total and done_this < budget:
+		var dy := i / plane
+		var rem := i % plane
+		var dz := rem / dimx
+		var dx := rem % dimx
+		var bid := block_id_at(center + Vector3i(dx - hx, dy - hy, dz - hz))
+		ids[i] = bid if (bid >= 0 and bid <= 255) else 255   # u8 (BlockCatalog ids fit u8 today; clamp is a never-truncate-silently backstop)
+		i += 1
+		done_this += 1
+	state["ids"] = ids                                # write back the CoW buffer
+	state["i"] = i
+	return i >= total
+
 ## Composed solidity — the MATERIAL half of the merged analytic-physics contract
 ## (INTEGRATION-DECISIONS §3): a cell is solid iff its material passes the solidity
 ## gate (`solidity_of(mat) >= 0.5`). Resolves the packed value ONCE, then gates on

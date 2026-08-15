@@ -3955,6 +3955,31 @@ const FLOOR_MEMO_CAP := 4096       # max memoized columns (NEVER-OOM: cleared wh
 const FP_MOVE_PROBE_CACHE := false
 const MOVE_PROBE_CACHE_CAP := 512  # max cells memoized per epoch (NEVER-OOM: stop inserting past this, hits still serve)
 
+## COSMOS-AGENT-CONTROL (docs/COSMOS-AGENT-CONTROL-DESIGN.md) — agent-grade remote control + situational
+## awareness for the AI that plays via tools/remote-bridge. THREE byte-off stages, each shippable alone.
+## Latency (P0) is relay-JS only (fs.watch outbox + agent awaits the correlated results) — no flag here.
+##
+## FP_TELEM_10HZ (P0-c) — compiles in the `?telem=10hz` URL-param branch that raises the ambient snapshot
+## period 0.25→0.1 s for an agent session (mirrors how FP_TELEM_FRAME_DECOMP gates `?telem=1hz`). The knob
+## is the URL param, never a default: no param ⇒ 0.25 s ⇒ the telemetry stream is wire-identical. Off ⇒ the
+## parse branch is dead ⇒ byte-identical.
+const FP_TELEM_10HZ := false
+## FP_AGENT_POSE (P1) — additive body-orientation telemetry. view_telemetry() gains the SCENE-frame body
+## basis (fwd/right/up), camera right/up, velocity VECTOR + on_ground; a new player.orientation_telemetry()
+## adds the BCI planet-local frame (up/north/east/fwd/pos + heading, keys suffixed _bci). Additive +
+## empty-dict-guarded: off ⇒ the accessors return exactly today's dicts ⇒ the merged telemetry is byte-identical.
+const FP_AGENT_POSE := false
+## FP_AGENT_QUERY (P2) — structured world reads over the existing correlated results substrate: query_box (a
+## bounded box of block ids via a batched, time-sliced WorldManager.block_box_slice → binary 0x03 downlink)
+## and query_ray (the aimed_voxel DDA; default = the aim ray). ALSO gated behind CONTROL_ENABLED + a live
+## grant like every op. Off ⇒ both ops nack `caps`, no 0x03 frame ever emitted ⇒ wire-identical. NEVER-OOM:
+## triple-capped (relay validateStep / rover _validate_cmd / block_box_slice), ≤ QUERY_CELLS_MAX cells.
+const FP_AGENT_QUERY := false
+const QUERY_HALF_MAX := 15          # per-axis half-extent (dim ≤ 31) — MIRRORS relay.mjs QUERY_HALF_MAX
+const QUERY_CELLS_MAX := 32768      # Π(2h+1) cap; u8 ids ⇒ ≤ 32 KiB payload — MIRRORS relay.mjs QUERY_CELLS_MAX
+const QUERY_RAY_MAX := 64.0         # raycast max distance (blocks) — MIRRORS relay.mjs QUERY_RAY_MAX
+const QUERY_CELLS_PER_FRAME := 4096 # time-slice budget: cells filled per frame (NEVER a frame hitch, §5.4)
+
 ## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
 ## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
 ## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME

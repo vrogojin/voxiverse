@@ -63,6 +63,7 @@ const PHASE_STATUS := "observing"
 const CONTROL_ENABLED := false
 
 const SHOT_TAG := 0x02                       # commanded screenshot: [0x02][u16 hlen BE][hdr json][jpeg] (design §3.3)
+const QUERY_TAG := 0x03                      # COSMOS-AGENT-CONTROL §5.2: query box [0x03][u16 hlen BE][hdr json][u8 ids] — must match relay QUERY_TAG
 const SHOT_JPG_QUALITY := 0.9               # commanded shots are FULL fidelity (resolved D4)…
 const MAX_SHOT_BYTES := (2 << 20) - 512     # …capped just under the relay's 2 MiB maxPayload (header slack)
 const SHOT_MAX_WAIT_MS := 9000              # backpressure retry budget for a commanded shot (< executor watchdog)
@@ -82,7 +83,10 @@ const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "se
 	# DEV/TEST INSTRUMENTATION (dev-instrument tooling) — precise camera placement + stable capture. Behind
 	# CONTROL_ENABLED like every op; the bridge cap-checks the ack against THIS list before the executor
 	# dispatches, so they MUST be here or the ack is nacked before it ever reaches remote_control.gd.
-	"teleport", "set_alt", "freeze_time", "freeze_player"]
+	"teleport", "set_alt", "freeze_time", "freeze_player",
+	# COSMOS-AGENT-CONTROL §5 (FP_AGENT_QUERY) — structured world reads. Behind CONTROL_ENABLED + FP_AGENT_QUERY
+	# like every op; _validate_cmd flag-gates + re-caps them (mirror of relay.mjs) before the executor dispatches.
+	"query_box", "query_ray"]
 const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
@@ -160,6 +164,7 @@ var _win_eval_ms := 0.0
 var _win_cap_ms := 0.0
 var _win_unattr := 0
 var _telem_1hz := false
+var _telem_10hz := false                    # COSMOS-AGENT-CONTROL §3.3 (FP_TELEM_10HZ): ?telem=10hz raises the snapshot to 10Hz
 
 # MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
 # godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
@@ -250,6 +255,7 @@ static func dial_config() -> Dictionary:
 	var token := ""
 	var frames := true                       # L2: ambient frame stream on unless explicitly disabled (re-baseline knob)
 	var telem_1hz := false                   # §5.2: ?telem=1hz throttles the 4Hz snapshot to 1Hz (observer A/B discriminator)
+	var telem_10hz := false                  # COSMOS-AGENT-CONTROL §3.3: ?telem=10hz RAISES the snapshot to 10Hz (agent session)
 	if OS.has_feature("web"):
 		# location.search is inherent to the page; a single boot-time eval decides whether to dial.
 		# No param → empty token → {} → dead. This is the whole activation gate on the public site.
@@ -260,21 +266,30 @@ static func dial_config() -> Dictionary:
 		token = _parse_query_token(qs)
 		frames = _parse_frames_flag(qs)
 		telem_1hz = _parse_telem_1hz(qs)
+		telem_10hz = _parse_telem_10hz(qs)
 	else:
 		token = OS.get_environment("VOXIVERSE_REMOTE_TOKEN")
 		var fenv := OS.get_environment("VOXIVERSE_REMOTE_FRAMES").strip_edges()
 		frames = not (fenv == "0" or fenv.to_lower() == "false" or fenv.to_lower() == "off")
-		telem_1hz = OS.get_environment("VOXIVERSE_REMOTE_TELEM").strip_edges().to_lower() == "1hz"
+		var tenv := OS.get_environment("VOXIVERSE_REMOTE_TELEM").strip_edges().to_lower()
+		telem_1hz = tenv == "1hz"
+		telem_10hz = tenv == "10hz"
 	token = token.strip_edges()
 	if token == "":
 		return {}
-	return {"token": token, "url": resolve_url(), "frames": frames, "telem_1hz": telem_1hz}
+	return {"token": token, "url": resolve_url(), "frames": frames, "telem_1hz": telem_1hz, "telem_10hz": telem_10hz}
 
 ## FP_TELEM_FRAME_DECOMP §5.2: the `?telem=1hz` measurement-hygiene knob — throttle the 4Hz snapshot to 1Hz so its own
 ## clocked cost stops aliasing the frame timing (the A/B discriminator for "is the observer the ~5Hz stall?"). Like
 ## `?frames`, it only affects an OBSERVED session; the played game never runs the bridge.
 static func _parse_telem_1hz(query: String) -> bool:
 	return _parse_query_value(query, "telem").to_lower() == "1hz"
+
+
+## COSMOS-AGENT-CONTROL §3.3 (FP_TELEM_10HZ): the `?telem=10hz` agent-session knob — RAISE the snapshot to 10Hz
+## (period 0.25→0.1s) so an agent gets fresher ambient pose. Same OBSERVED-session-only scope as ?telem=1hz.
+static func _parse_telem_10hz(query: String) -> bool:
+	return _parse_query_value(query, "telem").to_lower() == "10hz"
 
 
 ## The relay URL is FIXED to our host — resolved from VOXIVERSE_REMOTE_URL (native/dev only) else the
@@ -353,6 +368,11 @@ func configure(cfg: Dictionary) -> void:
 	_telem_1hz = bool(cfg.get("telem_1hz", false))
 	if CubeSphere.FP_TELEM_FRAME_DECOMP and _telem_1hz:
 		_telem_interval = 1.0
+	# COSMOS-AGENT-CONTROL §3.3: ?telem=10hz RAISES the snapshot to 10Hz. Only applied under FP_TELEM_10HZ
+	# (byte-off ⇒ the param is dead, interval stays 0.25s). Mutually exclusive with ?telem=1hz (same param value).
+	_telem_10hz = bool(cfg.get("telem_10hz", false))
+	if CubeSphere.FP_TELEM_10HZ and _telem_10hz:
+		_telem_interval = 0.1
 
 
 ## L2 runtime kill switch for the AMBIENT auto-capture (the commanded screenshot path is never affected). Lets the
@@ -880,6 +900,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 		# COSMOS SPACE-NAV SN2 (§7.5): the nav-frame machine telemetry (nav_mode/frame_v/|v_bci|/nav_frame),
 		# ADDITIVE + GUARDED — an empty dict (flag-off, or the method absent) merges nothing, so a build with
 		# SN_NAV_MODES=false stamps exactly the shipped fields (byte-identical telemetry).
+		# COSMOS-AGENT-CONTROL section 4.2 (FP_AGENT_POSE): BCI planet-local orientation (up/north/east/fwd/heading,
+		# keys suffixed _bci). ADDITIVE + empty-dict-guarded — {} when flag-off / non-faceted / no active facet
+		# so the telemetry stream is byte-identical.
+		if player.has_method("orientation_telemetry"):
+			var ot = player.call("orientation_telemetry")
+			if ot is Dictionary and not (ot as Dictionary).is_empty():
+				msg.merge(ot as Dictionary)
 		if player.has_method("nav_telemetry"):
 			var nt = player.call("nav_telemetry")
 			if nt is Dictionary and not (nt as Dictionary).is_empty():
@@ -1289,7 +1316,56 @@ func _validate_cmd(m: Dictionary) -> String:
 			var se = (st as Dictionary).get("sun_elev_deg", null)
 			if se != null and (not (se is float or se is int) or float(se) < -90.0 or float(se) > 90.0):
 				return "caps"
+		# COSMOS-AGENT-CONTROL section 5.3 — rover-side re-cap of the query ops (NEVER trust the relay). Flag
+		# off => caps-nack so the wire behaviour is identical to today (the ops never dispatch to the executor).
+		if op == "query_box" or op == "query_ray":
+			if not CubeSphere.FP_AGENT_QUERY:
+				return "caps"
+			var qerr := _validate_query_step(st as Dictionary, op)
+			if qerr != "":
+				return qerr
 	return ""
+
+
+## COSMOS-AGENT-CONTROL section 5.3 — mirror of relay.mjs validateStep for query_box/query_ray. NEVER-OOM
+## caps (QUERY_HALF_MAX / QUERY_CELLS_MAX / QUERY_RAY_MAX) re-enforced here; block_box_slice caps a third time.
+func _validate_query_step(st: Dictionary, op: String) -> String:
+	if op == "query_box":
+		var c = st.get("center", "player")
+		if not (c == "player" or _is_vec3_num(c)):
+			return "caps"
+		var h = st.get("half", null)
+		if not (h is Array and (h as Array).size() == 3):
+			return "caps"
+		var cells := 1
+		for v in (h as Array):
+			if not (v is float or v is int) or float(v) != floor(float(v)) or int(v) < 0 or int(v) > CubeSphere.QUERY_HALF_MAX:
+				return "caps"
+			cells *= (2 * int(v) + 1)
+		if cells > CubeSphere.QUERY_CELLS_MAX:
+			return "caps"
+		return ""
+	# query_ray
+	var o = st.get("origin", "eye")
+	if not (o == "eye" or _is_vec3_num(o)):
+		return "caps"
+	var d = st.get("dir", "look")
+	if not (d == "look" or _is_vec3_num(d)):
+		return "caps"
+	var md = st.get("max_dist", null)
+	if md != null and (not (md is float or md is int) or float(md) <= 0.0 or float(md) > CubeSphere.QUERY_RAY_MAX):
+		return "caps"
+	return ""
+
+
+## A finite [x,y,z] number array (query origin/dir/center literal).
+func _is_vec3_num(v) -> bool:
+	if not (v is Array) or (v as Array).size() != 3:
+		return false
+	for n in (v as Array):
+		if not (n is float or n is int) or not is_finite(float(n)):
+			return false
+	return true
 
 
 # ── Downlink send helpers (executor callbacks → WS text/binary frames) ──────────────────────────────
@@ -1417,6 +1493,102 @@ func _send_shot_frame(seq: String, id: int, label: String, jpg: PackedByteArray)
 	_ws.send(packet)
 
 
+# ── COSMOS-AGENT-CONTROL §5.3: structured world queries (bridge owns world + the player _frame seam) ──
+
+## Executor → bridge: fulfil a query_box / query_ray step. The bridge owns `world` and the player, so it
+## resolves defaults + runs the DDA / time-sliced box fill here, then answers on the correlated result sink.
+func _on_query_requested(seq: String, id: int, spec: Dictionary) -> void:
+	if str(spec.get("op", "")) == "query_ray":
+		_query_ray_answer(seq, id, spec)
+	else:
+		_query_box_async(seq, id, spec)
+
+
+## query_ray — reuse the player's aim-DDA (the SAME path break/place use) through the _frame seam. Default
+## origin = camera eye, dir = camera forward (the aim ray). Synchronous (one DDA); answer as a text result.
+func _query_ray_answer(seq: String, id: int, spec: Dictionary) -> void:
+	if not (is_instance_valid(player) and player.has_method("remote_query_ray")):
+		_notify_query(id, false); return
+	var reply = player.call("remote_query_ray", spec)
+	if not (reply is Dictionary):
+		_notify_query(id, false); return
+	var out: Dictionary = reply
+	out["type"] = "query_result"
+	out["seq"] = seq
+	out["id"] = id
+	out["kind"] = "ray"
+	out["t"] = Time.get_unix_time_from_system()
+	if not _send_text_guarded(out):
+		_notify_query(id, false); return
+	_notify_query(id, true)
+
+
+## query_box — a bounded box of block ids, filled by WorldManager.block_box_slice TIME-SLICED across frames
+## (§5.4 — never a frame hitch), then sent as a binary 0x03 frame. Triple-capped never-OOM.
+func _query_box_async(seq: String, id: int, spec: Dictionary) -> void:
+	if not (is_instance_valid(world) and world.has_method("block_box_slice") \
+			and is_instance_valid(player) and player.has_method("remote_query_center_cell")):
+		_notify_query(id, false); return
+	var half := _cell_from(spec.get("half", [4, 3, 4]))
+	half = Vector3i(clampi(half.x, 0, CubeSphere.QUERY_HALF_MAX),
+		clampi(half.y, 0, CubeSphere.QUERY_HALF_MAX), clampi(half.z, 0, CubeSphere.QUERY_HALF_MAX))
+	var center: Vector3i
+	var cspec = spec.get("center", "player")
+	if cspec is Array and (cspec as Array).size() == 3:
+		center = _cell_from(cspec)
+	else:
+		center = player.call("remote_query_center_cell")
+	var dims := Vector3i(2 * half.x + 1, 2 * half.y + 1, 2 * half.z + 1)
+	var total := dims.x * dims.y * dims.z
+	if total <= 0 or total > CubeSphere.QUERY_CELLS_MAX:
+		_notify_query(id, false); return
+	var state := {"ids": PackedByteArray(), "i": 0}   # block_box_slice resizes + writes back (CoW-safe)
+	var deadline := Time.get_ticks_msec() + int(SHOT_MAX_WAIT_MS)
+	while true:
+		var done: bool = world.call("block_box_slice", center, half, state, CubeSphere.QUERY_CELLS_PER_FRAME)
+		if done:
+			break
+		await RenderingServer.frame_post_draw
+		if _ws == null or not is_inside_tree() or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN \
+				or Time.get_ticks_msec() > deadline:
+			_notify_query(id, false); return
+	var origin := center - half
+	var hdr := {"seq": seq, "id": id, "kind": "box", "origin": [origin.x, origin.y, origin.z],
+		"dims": [dims.x, dims.y, dims.z], "order": "x-fastest,z,y", "fmt": "u8",
+		"t": Time.get_unix_time_from_system()}
+	if not _send_query_frame(seq, id, hdr, state["ids"]):
+		_notify_query(id, false); return
+	_notify_query(id, true)
+
+
+## A Vector3i from a [x,y,z] Array (truncating), else ZERO — the query center/half decode.
+func _cell_from(a) -> Vector3i:
+	if a is Array and (a as Array).size() == 3:
+		return Vector3i(int(a[0]), int(a[1]), int(a[2]))
+	return Vector3i.ZERO
+
+
+## Binary query result: [QUERY_TAG][u16 hlen BE][hdr json][u8 ids] — the handleShotFrame mirror on the wire.
+func _send_query_frame(seq: String, id: int, hdr: Dictionary, payload: PackedByteArray) -> bool:
+	if _ws == null or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return false
+	if _ws.get_current_outbound_buffered_amount() > OUTBOUND_BACKPRESSURE_BYTES:
+		return false
+	var hdr_bytes := JSON.stringify(hdr).to_utf8_buffer()
+	var hlen := hdr_bytes.size()
+	var packet := PackedByteArray([QUERY_TAG, (hlen >> 8) & 0xFF, hlen & 0xFF])
+	packet.append_array(hdr_bytes)
+	packet.append_array(payload)
+	_ws.send(packet)
+	return true
+
+
+## Executor watchdog latch: the query for `id` was answered (ok) or failed.
+func _notify_query(id: int, ok: bool) -> void:
+	if is_instance_valid(_exec):
+		_exec.notify_query(id, ok)
+
+
 func _notify_shot(id: int, ok: bool) -> void:
 	if is_instance_valid(_exec):
 		_exec.notify_shot(id, ok)
@@ -1434,6 +1606,7 @@ func _ensure_executor() -> void:
 	_exec.step_finished.connect(_on_step_finished)
 	_exec.sequence_finished.connect(_on_sequence_finished)
 	_exec.shot_requested.connect(_on_shot_requested)
+	_exec.query_requested.connect(_on_query_requested)
 	_exec.reload_requested.connect(_on_reload_requested)
 	_exec.progress.connect(_on_exec_progress)
 	_exec.override_triggered.connect(_on_exec_override)
@@ -1616,12 +1789,13 @@ func _send_cmd_nack(seq: String, reason: String) -> void:
 
 ## Send a JSON text frame only while the socket is OPEN with clear ring headroom (parity with
 ## _send_telemetry) — keeps ERR_OUT_OF_MEMORY out of the console under a stall.
-func _send_text_guarded(msg: Dictionary) -> void:
+func _send_text_guarded(msg: Dictionary) -> bool:
 	if _ws == null or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
-		return
+		return false
 	if _ws.get_current_outbound_buffered_amount() >= OUTBOUND_BUFFER_BYTES - 65536:
-		return
+		return false
 	_ws.send_text(JSON.stringify(msg))
+	return true
 
 
 func _exit_tree() -> void:

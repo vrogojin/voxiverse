@@ -35,6 +35,7 @@ signal step_started(rec: Dictionary)       # {type:"step_start", seq, id, op, po
 signal step_finished(rec: Dictionary)      # {type:"step_done", seq, id, op, status, …, t}
 signal sequence_finished(rec: Dictionary)  # {type:"seq_done", seq, status, completed, t}
 signal shot_requested(seq: String, id: int, label: String)   # bridge does the tagged 0x02 capture
+signal query_requested(seq: String, id: int, spec: Dictionary)  # COSMOS-AGENT-CONTROL §5.3: bridge fulfils query_box/query_ray (it owns world+_frame)
 signal reload_requested()                  # bridge does JavaScriptBridge.eval("location.reload()")
 signal progress(text: String)              # live badge readout ("" clears it)
 signal override_triggered()                # any local human input while granted (§6.4) — bridge decides grant fate
@@ -78,6 +79,14 @@ var _shot_deadline := 0                    # msec — `screenshot` watchdog
 var _shot_id := -1
 var _shot_done := false
 var _shot_ok := false
+
+# COSMOS-AGENT-CONTROL §5.3: query_box/query_ray are async ops the BRIDGE fulfils (it owns world+_frame),
+# latched exactly like the screenshot. QUERY_WATCHDOG_S bounds the time-sliced box fill (§5.4).
+const QUERY_WATCHDOG_S := 10.0
+var _query_deadline := 0                    # msec — query watchdog
+var _query_id := -1
+var _query_done := false
+var _query_ok := false
 
 # ── §4.4 move state (closed-loop displacement, robust to reanchor/reframe) ──────────────────────────
 var _move_target := 0.0                    # commanded blocks
@@ -141,6 +150,13 @@ func notify_shot(id: int, ok: bool) -> void:
 		_shot_ok = ok
 
 
+## COSMOS-AGENT-CONTROL §5.3: bridge → executor — the query result for `id` was sent (ok) or failed.
+func notify_query(id: int, ok: bool) -> void:
+	if id == _query_id and not _query_done:
+		_query_done = true
+		_query_ok = ok
+
+
 func _process(_delta: float) -> void:
 	# OVERRIDE is checked every tick regardless of run state — a granted-but-idle executor must still
 	# hand control back the instant the human touches anything (the badge promises exactly this).
@@ -163,6 +179,13 @@ func _process(_delta: float) -> void:
 			# every tick; here we only watch the clock and release it (via _zero_intent in _finish_step) at the deadline.
 			if Time.get_ticks_msec() >= _hold_deadline:
 				_finish_step("ok")
+		"query_box", "query_ray":
+			# COSMOS-AGENT-CONTROL §5.3: the bridge fulfils the query (time-sliced box fill / DDA ray) and
+			# latches _query_done. Mirror of the screenshot arm.
+			if _query_done:
+				_finish_step("ok" if _query_ok else "timeout")
+			elif Time.get_ticks_msec() >= _query_deadline:
+				_finish_step("timeout")
 		# move / turn / look / jump advance from physics_tick (below); stop / reload / set_fly / break /
 		# place / select_slot / dev_nav / nav resolve synchronously in _start_step; nothing else to poll here.
 
@@ -441,6 +464,14 @@ func _start_step() -> void:
 			_shot_ok = false
 			_shot_deadline = Time.get_ticks_msec() + int(SHOT_WATCHDOG_S * 1000.0)
 			shot_requested.emit(_seq, _shot_id, str(_cur.get("label", "shot")))
+		"query_box", "query_ray":
+			# COSMOS-AGENT-CONTROL §5.3: hand the whole step to the bridge (it owns world + the _frame seam),
+			# which fills/answers it and calls notify_query. Latch it like the screenshot; _process polls.
+			_query_id = int(_cur.get("id", -1))
+			_query_done = false
+			_query_ok = false
+			_query_deadline = Time.get_ticks_msec() + int(QUERY_WATCHDOG_S * 1000.0)
+			query_requested.emit(_seq, _query_id, _cur.duplicate(true))
 		"move":
 			_start_move()
 		"turn":

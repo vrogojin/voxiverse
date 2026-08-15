@@ -96,6 +96,12 @@ static func build_tile(fid: int, cells: int, gen: Object, sink: float = 0.0) -> 
 		var g := int(b_g[vi])
 		var d := b_dir[vi]
 		col[vi] = FarPalette.skin_color(fid, d.x * r_datum, d.y * r_datum, d.z * r_datum, g, int(b_biome[vi]), float(b_temp[vi]))
+		# FP_V2_NEARFILL_UNSINK (§3.1): stamp the per-vertex sink FLAG into the free COLOR.a — 1.0 for near-fill (sink>0),
+		# 0.0 for hop≥2 (sink 0). The un-sink shader reads it (`vsink = COLOR.a·u_ns_sink`) to know which vertices may
+		# un-sink; a 0-flag vertex is left byte-identical. Off ⇒ alpha untouched (skin_color's own) ⇒ byte-identical, and
+		# the shipped shader reads COLOR.rgb only so the alpha is inert even where set. rgb is never touched here.
+		if CubeSphere.FP_V2_NEARFILL_UNSINK:
+			col[vi].a = 1.0 if sink != 0.0 else 0.0
 
 	var idx := PackedInt32Array()
 	idx.resize(cells * cells * 6)
@@ -319,6 +325,130 @@ void fragment() {
 }
 "
 
+## FP_V2_NEARFILL_UNSINK (docs/COSMOS-FAR-HEIGHT-DESIGN.md §3.1) — the near-fill zone un-sink, in the VERTEX stage. The
+## per-vertex sink flag rides in COLOR.a (0 for hop≥2, 1 for the near-fill tiles — `build_tile` stamps it under the flag);
+## `vsink = COLOR.a * u_ns_sink` recovers the ACTUAL radial drop. A sink-0 vertex takes the `outp = p` fast path ⇒ VERTEX
+## byte-identical to the shipped sunk geometry (hop≥2 tiles untouched). A near-fill vertex recovers `p_true` (the un-sunk
+## radial position) and applies the SAME applied-cover ellipsoid law as `facet_far_ring.gd:_applied_covered` (mesh object
+## space IS planet-absolute-centred — b_pos are radial planet-abs positions — so `u_ns_col` is the player column absolute
+## and the test runs directly on VERTEX, no MODEL transform): inside the applied ellipsoid (real near mesh hides it) keep
+## the shipped sunk `p` (no-protrusion preserved verbatim); otherwise drop to TRUE − ENV_EPS_G (the backstop's own zone-B
+## height). `u_ns_applied_r <= 0` ⇒ covered=false everywhere ⇒ whole near-fill un-sinks to TRUE−1.5 (equal-altitude far,
+## never the 6-block trench, never see-through under terrain). Shading is the shipped RADIAL law (matches _V2_SHADER_TAIL;
+## un-sink takes precedence over LIT — LIT is a shading-normal choice, orthogonal, and off live). GLSL ES 3.0 legal: plain
+## vertex ALU + 7 uniforms, no textures/derivatives/discard — the web GLES3 vertex stage handles it trivially.
+const _V2_SHADER_TAIL_UNSINK := "varying flat vec4 v_col;
+uniform vec3 u_ns_col = vec3(0.0);
+uniform float u_ns_applied_r = 0.0;
+uniform vec3 u_ns_params = vec3(0.0, 0.0, 0.0);
+uniform float u_ns_band_top = 1000000000.0;
+uniform float u_ns_sink = 6.0;
+uniform float u_ns_eps = 1.5;
+uniform float u_ns_R = 6371.0;
+void vertex() {
+	vec3 p = VERTEX;
+	float vsink = COLOR.a * u_ns_sink;
+	vec3 outp = p;
+	if (vsink > 0.0001) {
+		vec3 rp = normalize(p);
+		vec3 p_true = p + rp * vsink;
+		float h = u_ns_params.z;
+		bool covered = true;
+		if (u_ns_applied_r <= 0.0 || h <= 0.0) {
+			covered = false;
+		} else {
+			float true_h = length(p_true) - u_ns_R;
+			if (true_h > u_ns_band_top - 1.0) {
+				covered = false;
+			} else {
+				float cl = length(u_ns_col);
+				vec3 up = cl > 0.001 ? u_ns_col / cl : vec3(0.0, 1.0, 0.0);
+				vec3 delta = p_true - (u_ns_col + up * u_ns_params.y);
+				float radial = dot(delta, up);
+				vec3 tang = delta - up * radial;
+				float nr = radial / h;
+				float nt = length(tang) / u_ns_applied_r;
+				covered = (nr * nr + nt * nt) <= 1.0;
+			}
+		}
+		outp = covered ? p : (p_true - normalize(p_true) * u_ns_eps);
+	}
+	VERTEX = outp;
+	vec3 wp = (MODEL_MATRIX * vec4(outp, 1.0)).xyz;
+	vec3 centre = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 n = normalize(wp - centre);
+	v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir), 1.0);
+}
+void fragment() {
+	ALBEDO = v_col.rgb;
+}
+"
+
+## FP_V2_NEARFILL_UNSINK: the un-sink shader source (HEAD + shared voxi_shade + the un-sink TAIL). SEPARATE from the
+## shared `shader_code()` so `FacetOrbitRelief` (which reuses `shader_code()`/`make_material()` verbatim) is untouched —
+## only the V2 instance's own `_material` swaps to this under the flag.
+static func shader_code_unsink() -> String:
+	return _V2_SHADER_HEAD + VoxiLight.shade_glsl() + _V2_SHADER_TAIL_UNSINK
+
+## FP_V2_NEARFILL_UNSINK: build the V2 instance material with the un-sink shader + seeded uniforms. Only ever used by the
+## V2 instance (`_material`), never by `FacetOrbitRelief`. Uniforms are refreshed each frame by `set_unsink_uniforms`; the
+## seeds here are the safe "no coverage claimed yet" defaults (applied_r 0 ⇒ un-sink to TRUE−eps everywhere until the first
+## live push). sun_dir seeded exactly like `make_material` (FP_FAR_TERMINATOR_WELD-aware).
+static func make_material_unsink() -> ShaderMaterial:
+	var sm := ShaderMaterial.new()
+	var sh := Shader.new()
+	sh.code = shader_code_unsink()
+	sm.shader = sh
+	var seed := _last_sun_dir if CubeSphere.FP_FAR_TERMINATOR_WELD else Vector3(1.0, 0.0, 0.0)
+	sm.set_shader_parameter("sun_dir", seed)
+	sm.set_shader_parameter("u_ns_sink", CubeSphere.V2_NEARFILL_SINK)
+	sm.set_shader_parameter("u_ns_eps", TierPlace.ENV_EPS_G)
+	sm.set_shader_parameter("u_ns_applied_r", 0.0)
+	return sm
+
+## FP_V2_NEARFILL_UNSINK: push the live applied-cover state into the un-sink material each frame (MAIN, called by the ring
+## alongside `step`). `col_abs` = player column absolute (planet-centred, same frame as the mesh's object space); `params`
+## = TerrainConfig.streamed_ellipsoid_params() (r, O, H); `band_top` = the ring's `_applied_band.y`; `r_datum` = the active
+## facet datum radius (the `true_h = |p_true| − R` band-gate proxy). No-op with no material / the flag off.
+func set_unsink_uniforms(col_abs: Vector3, applied_r: float, band_top: float, params: Vector3, r_datum: float) -> void:
+	if _material == null or not CubeSphere.FP_V2_NEARFILL_UNSINK:
+		return
+	_material.set_shader_parameter("u_ns_col", col_abs)
+	_material.set_shader_parameter("u_ns_applied_r", applied_r)
+	_material.set_shader_parameter("u_ns_params", params)
+	_material.set_shader_parameter("u_ns_band_top", band_top)
+	_material.set_shader_parameter("u_ns_R", r_datum)
+
+## FP_V2_NEARFILL_UNSINK — the CPU TWIN of `_V2_SHADER_TAIL_UNSINK`'s vertex position law (the headless dummy
+## RenderingServer never parses GLSL, so this GDScript mirror is what `verify_near_far_height.gd` gates; keep the two in
+## lock-step). `p` = the shipped SUNK vertex position (planet-centred); `vsink` = the recovered radial drop (COLOR.a·sink,
+## 0 ⇒ untouched); the rest mirror the uniforms. Returns the final vertex position: zone-C (inside the applied ellipsoid)
+## keeps `p`; else TRUE − `eps` (the backstop's zone-B height). Byte-for-byte the same arithmetic as the shader.
+static func unsink_pos_cpu(p: Vector3, vsink: float, col: Vector3, applied_r: float, params: Vector3,
+		band_top: float, r_datum: float, eps: float) -> Vector3:
+	if vsink <= 0.0001:
+		return p
+	var rp := p.normalized()
+	var p_true := p + rp * vsink
+	var h := params.z
+	var covered := true
+	if applied_r <= 0.0 or h <= 0.0:
+		covered = false
+	else:
+		var true_h := p_true.length() - r_datum
+		if true_h > band_top - 1.0:
+			covered = false
+		else:
+			var cl := col.length()
+			var up := (col / cl) if cl > 0.001 else Vector3(0.0, 1.0, 0.0)
+			var delta := p_true - (col + up * params.y)
+			var radial := delta.dot(up)
+			var tang := (delta - up * radial).length()
+			var nr := radial / h
+			var nt := tang / applied_r
+			covered = (nr * nr + nt * nt) <= 1.0
+	return p if covered else (p_true - p_true.normalized() * eps)
+
 ## The full shader source: HEAD (shader_type/render_mode) + the shared `VoxiLight.shade_glsl()` snippet (declares
 ## sun_dir/night_floor/term_mu/moonshine + voxi_shade — string-composed exactly like `TierPlace`/`facet_far_ring.gd`
 ## already do under FP_SHADE_UNIFIED) + TAIL (the flat COLOR varying + vertex/fragment). Composed in a FUNCTION
@@ -409,7 +539,9 @@ var _merge_mutex: Mutex = null
 ## `ring` is the owning FacetFarRing (any Node3D works — only `add_child`/transform inheritance is used).
 func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_active_fid = active_fid
-	_material = make_material()
+	# FP_V2_NEARFILL_UNSINK (§3.1): the V2 instance's OWN material swaps to the un-sink shader (FacetOrbitRelief's
+	# `make_material()` reuse is untouched). Off ⇒ the shipped material verbatim (byte-identical).
+	_material = make_material_unsink() if CubeSphere.FP_V2_NEARFILL_UNSINK else make_material()
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetSmoothV2Mesh"
 	_mi.mesh = ArrayMesh.new()

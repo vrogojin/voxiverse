@@ -35,6 +35,7 @@ extends SceneTree
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const TC := preload("res://src/world/terrain_config.gd")
 const FFR := preload("res://src/world/facet_far_ring.gd")
+const FSV2 := preload("res://src/world/facet_smooth_v2.gd")
 
 var _pass := 0
 var _fail := 0
@@ -58,6 +59,7 @@ func _initialize() -> void:
 	_gate_probe()
 	_gate_churn()
 	_gate_off(fid)
+	_gate_fh_unsink(fid)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -319,4 +321,91 @@ func _gate_off(fid: int) -> void:
 		if not is_equal_approx(float(ring.get("_applied_r")), 0.0) or bool(ring.get("_pending")):
 			inert_ok = false
 	_ok(inert_ok, "G-NFH-OFF: _applied_probe_step() with no override never moves _applied_r off 0 or sets _pending")
+	ring.free()
+
+# ---------- G-FH-UNSINK + G-FH-OFF (FP_V2_NEARFILL_UNSINK, docs/COSMOS-FAR-HEIGHT-DESIGN.md §3) ----------
+## The V2 near-fill un-sink is a VERTEX-shader zone law (the headless dummy RenderingServer never parses GLSL), so this
+## gate drives its CPU TWIN `FacetSmoothV2.unsink_pos_cpu` — kept byte-for-byte in lock-step with `_V2_SHADER_TAIL_UNSINK`
+## — over the SAME mountain fixture + forced ellipsoid the G-NFH suite uses. The un-sink recovers the TRUE radial position
+## from the shipped 6-block-sunk near-fill vertex and applies the ring's own `_applied_covered` ellipsoid: zone C keeps the
+## sunk pos byte-identical (no-protrusion preserved), zone B collapses to TRUE − ENV_EPS_G (the skirt 6→1.5). Flag-independent
+## (pure function), so it is all-pass at the byte-off default; G-FH-OFF pins that the SHARED shader (orbit-relief's) is untouched.
+func _gate_fh_unsink(fid: int) -> void:
+	print("  --- G-FH-UNSINK / G-FH-OFF: FP_V2_NEARFILL_UNSINK vertex zone law (CPU mirror) ---")
+	var ring: Node3D = FFR.new()
+	get_root().add_child(ring)
+	ring.call("_ensure_backstop_true_cached", fid)
+	var true_pos: PackedVector3Array = (ring.get("_btrue_cache") as Dictionary)[fid]
+	# Peak player column (same convention as G-NFH-STEP), the design's cited ellipsoid, a real ladder rung.
+	var peak_i := 0
+	var peak_r := -1.0
+	for i in range(true_pos.size()):
+		var l: float = (true_pos[i] as Vector3).length()
+		if l > peak_r:
+			peak_r = l; peak_i = i
+	var col: Vector3 = true_pos[peak_i]
+	var params := Vector3(128.0, 12.0, 52.0)
+	var applied_r := 96.0
+	var sink: float = CubeSphere.V2_NEARFILL_SINK
+	var eps: float = TierPlace.ENV_EPS_G
+	var r_datum: float = FA.r_of(fid)
+	var band_top := 1.0e9   # vacuous band gate — this gate exercises the ellipsoid, not the view-band (covered by G-NFH)
+
+	var n_c := 0
+	var n_b := 0
+	var zoneC_byte_ok := true
+	var zoneB_height_ok := true
+	for i in range(true_pos.size()):
+		var t: Vector3 = true_pos[i]
+		var p: Vector3 = t - t.normalized() * sink              # the shipped SUNK near-fill vertex (COLOR.a=1 ⇒ vsink=sink)
+		var outp: Vector3 = FSV2.unsink_pos_cpu(p, sink, col, applied_r, params, band_top, r_datum, eps)
+		var appl_cov: bool = ring.call("_applied_covered", t, col, applied_r, params)
+		if appl_cov:
+			n_c += 1
+			if outp != p:                                       # zone C: keep the shipped sunk pos byte-identical
+				zoneC_byte_ok = false
+		else:
+			n_b += 1
+			if absf(outp.length() - (t.length() - eps)) > 0.05:  # zone B: TRUE − ENV_EPS_G
+				zoneB_height_ok = false
+	_ok(n_c > 0 and n_b > 0, "G-FH-UNSINK: fixture straddles zone C (%d) and zone B (%d)" % [n_c, n_b])
+	_ok(zoneC_byte_ok, "G-FH-UNSINK: every zone-C vertex byte-identical to the shipped sunk position (no-protrusion preserved)")
+	_ok(zoneB_height_ok, "G-FH-UNSINK: every zone-B vertex lands at TRUE − ENV_EPS_G (the 6→1.5 skirt collapse)")
+
+	# FALSIFIER: the shipped sunk position sits a full `sink` below TRUE — the un-sink must LIFT every zone-B vertex.
+	var lifted_ok := true
+	for i in range(true_pos.size()):
+		var t: Vector3 = true_pos[i]
+		var p: Vector3 = t - t.normalized() * sink
+		var appl_cov: bool = ring.call("_applied_covered", t, col, applied_r, params)
+		if not appl_cov:
+			var outp: Vector3 = FSV2.unsink_pos_cpu(p, sink, col, applied_r, params, band_top, r_datum, eps)
+			if outp.length() - p.length() < (sink - eps) - 0.2:   # lifted by ≈(sink−eps)=4.5 blocks
+				lifted_ok = false
+	_ok(lifted_ok, "G-FH-UNSINK falsifier: zone-B vertices are LIFTED ≈(sink−eps) blocks above the shipped sunk trench")
+
+	# applied_r = 0 (degraded / no probe) ⇒ un-sink everywhere to TRUE − eps, never the 6-block trench.
+	var all_b := true
+	for i in range(true_pos.size()):
+		var t: Vector3 = true_pos[i]
+		var p: Vector3 = t - t.normalized() * sink
+		var outp: Vector3 = FSV2.unsink_pos_cpu(p, sink, col, 0.0, params, band_top, r_datum, eps)
+		if absf(outp.length() - (t.length() - eps)) > 0.05:
+			all_b = false
+	_ok(all_b, "G-FH-UNSINK: applied_r=0 (degraded) ⇒ whole near-fill un-sinks to TRUE−eps (never the sunk trench)")
+
+	# sink = 0 (hop≥2 tiles carry COLOR.a=0 ⇒ vsink=0) ⇒ VERTEX byte-identical (untouched).
+	var untouched := true
+	for i in range(mini(true_pos.size(), 64)):
+		var t: Vector3 = true_pos[i]
+		if FSV2.unsink_pos_cpu(t, 0.0, col, applied_r, params, band_top, r_datum, eps) != t:
+			untouched = false
+	_ok(untouched, "G-FH-UNSINK: sink=0 (hop≥2) vertices are byte-identical — VERTEX untouched (merged-mesh safety)")
+
+	# G-FH-OFF: the SHARED shader (which FacetOrbitRelief reuses) never carries the un-sink uniforms, regardless of flag —
+	# the un-sink lives ONLY in the separate un-sink source. This pins orbit-relief isolation.
+	var shared := FSV2.shader_code()
+	var unsink := FSV2.shader_code_unsink()
+	_ok(not ("u_ns_col" in shared), "G-FH-OFF: the shared shader_code() (orbit-relief reuse) has NO un-sink uniforms")
+	_ok(("u_ns_col" in unsink) and ("u_ns_applied_r" in unsink), "G-FH-OFF: shader_code_unsink() carries the un-sink uniforms")
 	ring.free()

@@ -129,6 +129,9 @@ func _initialize() -> void:
 		_gate_texmean()
 		# G-FTS (FP_FT_STALE_REBUILD, #132 P1): the ≤0.5Hz staleness floor — credit-0 rebuild-while-moving. Two-state.
 		_gate_stale()
+		# G-FTSB (FP_FT_SHELL_BAND, far-tree orbit dropout): the three-zone altitude visibility law + zone-B card-only
+		# rebuild + cadence + de-orbit latch. Two-state, self-describing (off ⇒ shipped binary offsurf⇒hide).
+		_gate_shell_band()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -1514,3 +1517,101 @@ func _gate_np() -> void:
 	w.band = Vector2(60.0, 100.0)
 	_ok(NearPresence.covered(w, 0, inbox) == NearPresence.UNKNOWABLE, "G-NP-5: not meshed + outside the live band ⇒ UNKNOWABLE")
 	_ok(NearPresence.covered(RefCounted.new(), 0, inbox) == NearPresence.UNKNOWABLE, "G-NP-6: world lacking skin_near_meshed ⇒ UNKNOWABLE (never a silent false)")
+
+# ---- G-FTSB (FP_FT_SHELL_BAND — the far-tree orbit-visibility fix) --------------------------------------------------
+## docs/COSMOS-FARTREE-ORBIT-DESIGN.md §8. The three-zone altitude law replaces the binary orbit suspend: ZONE S
+## (surface) shipped; ZONE B (offsurf, h < FT_SHELL_HIDE_ALT) renders CARDS live off-surface (mesh rung hidden, no
+## near-cull probe — §4.1 geometrically vacuous); ZONE O (h ≥ HIDE) hidden + frozen, _stale latched. Driven via the
+## debug hooks (debug_apply_visibility(offsurf, h) / debug_step(..., shell_mode, h)); no live FacetFarRing. Two-state.
+func _gate_shell_band() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-FTSB skipped — needs FP_FAR_TREES_CARDS sed-toggled true, the rebuild proxy)")
+		return
+	var on := CubeSphere.FP_FT_SHELL_BAND
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+	_fake_edits_rev = 0
+
+	# ---- G-FTSB-OFF / VIS: the visibility predicate at sampled altitudes (fresh tier ⇒ _stale false) ----
+	tier.debug_apply_visibility(false, 41.0)              # zone S
+	if on:
+		_ok(tier.mmi_visible() and tier.mesh_mmi_visible(), "G-FTSB-VIS: zone S (h=41) shows cards + meshes")
+		tier.debug_apply_visibility(true, 300.0)          # zone B
+		_ok(tier.mmi_visible() and not tier.mesh_mmi_visible() and not tier.is_stale(),
+			"G-FTSB-VIS: zone B (offsurf, h=300) shows cards, hides mesh rung, no stale latch")
+		var tf560 := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, 560.0)
+		var tf300 := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, 300.0)
+		_ok(tf300 == 1.0 and tf560 > 0.0 and tf560 < 1.0,
+			"G-FTSB-VIS: tier_fade law — 1.0 below 520, dissolving ∈(0,1) at 560 (%.2f)" % tf560)
+		tier.debug_apply_visibility(true, 650.0)          # zone O
+		_ok(not tier.mmi_visible() and not tier.mesh_mmi_visible() and tier.is_stale(),
+			"G-FTSB-VIS: zone O (h=650) hides all + latches _stale")
+	else:
+		tier.debug_apply_visibility(true, 300.0)          # h ignored off-flag ⇒ shipped binary offsurf⇒hide
+		_ok(not tier.mmi_visible(), "G-FTSB-OFF: flag off ⇒ any offsurf (h ignored) hides the node (byte-identical)")
+
+	# ---- G-FTSB-BAND / LEDGER: a zone-B card-only rebuild ----
+	tier.enumerate_facet_sync(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var h_b := 300.0
+	var cam := Vector3(d.x, d.y, d.z) * (FA.R_BLOCKS + h_b)   # camera h_b blocks radially above the facet centre
+	var wanted := [fid]
+	if on:
+		var did := tier.debug_step(wanted, cam, true, h_b)   # shell_mode rebuild
+		_ok(did, "G-FTSB-BAND: a zone-B step rebuilds (card-only)")
+		_ok(tier.cull_probe_count() == 0, "G-FTSB-BAND: zero near-cull probes in zone B (§4.1 vacuous, %d)" % tier.cull_probe_count())
+		_ok(tier.debug_guard_meta_count() == 0, "G-FTSB-BAND: zero guard metadata rows in zone B (%d)" % tier.debug_guard_meta_count())
+		_ok(tier.mesh_visible(0) == 0, "G-FTSB-BAND: zero mesh-rung instances in zone B (card-only, %d)" % tier.mesh_visible(0))
+		var buf := tier.debug_buffer()
+		var stride := 16
+		var minv := 1.0e9
+		var maxv := -1.0e9
+		var emitted := 0
+		for i in range(buf.size() / stride):
+			var o := i * stride
+			var org := Vector3(buf[o + 3], buf[o + 7], buf[o + 11])
+			if org.length_squared() < 1.0:
+				continue                                     # empty slot (zero transform)
+			emitted += 1
+			var dd := org.distance_to(cam)
+			minv = minf(minv, dd); maxv = maxf(maxv, dd)
+		_ok(emitted > 0, "G-FTSB-BAND: cards emitted in zone B (%d)" % emitted)
+		_ok(emitted == 0 or (minv >= h_b - 8.0 and maxv <= CubeSphere.FAR_TREES_CARD_MAX + 2.0),
+			"G-FTSB-BAND: every card dist ∈ [h(%.0f), CARD_MAX(%.0f)] (min %.0f max %.0f) — §4.1 min-dist ≥ h" % [h_b, CubeSphere.FAR_TREES_CARD_MAX, minv, maxv])
+		_ok(tier.total_bytes() <= CubeSphere.FAR_TREES_BYTES_MAX,
+			"G-FTSB-LEDGER: total_bytes %d ≤ MAX %d after a zone-B rebuild" % [tier.total_bytes(), CubeSphere.FAR_TREES_BYTES_MAX])
+
+		# ---- G-FTSB-CADENCE: move_thr(h=300) = max(12, 0.25·300) = 75 ; zone flip re-arms one ----
+		var far := cam + Vector3(90.0, 0.0, 0.0)
+		var near := cam + Vector3(30.0, 0.0, 0.0)
+		var did_small := tier.debug_step(wanted, near, true, h_b)
+		_ok(not did_small, "G-FTSB-CADENCE: 30-blk move at h=300 < thr(75) ⇒ no rebuild")
+		var did_big := tier.debug_step(wanted, far, true, h_b)
+		_ok(did_big, "G-FTSB-CADENCE: 90-blk move > thr(75) ⇒ rebuild")
+		var did_flip := tier.debug_step(wanted, far, false, 40.0)   # same cam, zone B→S ⇒ flip re-arm
+		_ok(did_flip, "G-FTSB-CADENCE: a zone flip (B→S) re-arms exactly one rebuild (still camera)")
+
+	# ---- G-FTSB-LATCH: climb + de-orbit, correct-or-nothing (fresh tier) ----
+	if on:
+		var t2 = FT.new()
+		t2.setup_instance(_fake_ring(), fid)
+		t2.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+		t2.enumerate_facet_sync(fid)
+		t2.debug_apply_visibility(false, 41.0)            # S
+		t2.debug_apply_visibility(true, 300.0)            # B
+		var b_vis := t2.mmi_visible()
+		t2.debug_apply_visibility(true, 650.0)            # O → latch
+		var o_hidden := (not t2.mmi_visible()) and t2.is_stale()
+		t2.debug_apply_visibility(true, 300.0)            # de-orbit O→B: hidden until a fresh rebuild
+		var deorbit_hidden := not t2.mmi_visible()
+		t2.debug_step(wanted, cam, true, 300.0)           # first zone-B rebuild clears _stale
+		t2.debug_apply_visibility(true, 300.0)
+		_ok(b_vis, "G-FTSB-LATCH: zone B visible on climb (no latch S→B)")
+		_ok(o_hidden, "G-FTSB-LATCH: zone O hides + latches _stale")
+		_ok(deorbit_hidden, "G-FTSB-LATCH: de-orbit O→B stays hidden until a fresh rebuild (correct-or-nothing, #115 safe)")
+		_ok(t2.mmi_visible() and not t2.is_stale(), "G-FTSB-LATCH: visible after the first zone-B rebuild clears the latch")
+
+	ring.queue_free()

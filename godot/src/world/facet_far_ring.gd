@@ -3253,6 +3253,10 @@ func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE):
 ## COSMOS LOD-TEXTURE Phase 4: the driver's off-surface decision (camera-set + not floored) — WorldManager gates the
 ## close-up promotion on this (the close-up tier is an off-surface / orbit-approach feature; on-surface it stays base map).
 func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
+## FP_FT_SHELL_BAND (docs/COSMOS-FARTREE-ORBIT-DESIGN.md §3): the camera radial altitude h = d − R, already computed each
+## frame by apply_camera_set (`_dbg_h`, FR:1200). Read-only accessor for FacetFarTrees' three-zone visibility law — no new
+## math. Returns the last latched h (0 before the first camera-set, which reads as zone S — the shipped floored default).
+func shell_cam_alt() -> float: return _dbg_h
 ## COSMOS TEXTURED-LOD V4 (FP_SKIN_SSE): the camera's scale-correct distance from the body centre (blocks), computed each
 ## frame by apply_camera_set. WorldManager forwards it to FacetTexBaker.update so the screen-space promotion law can size a
 ## facet's on-screen blocks. 0 until the camera-set driver has run ⇒ the baker's SSE law falls back to the regime path.

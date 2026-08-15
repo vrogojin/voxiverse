@@ -1721,6 +1721,20 @@ const FP_M2_EDGE_DIST := false
 const FP_SMOOTH_V2_NEARFILL := false
 const V2_NEARFILL_SINK := 6.0   ## = BACKSTOP_SINK: radial sink (blocks) for the hop ≤ 1 near-fill smooth tiles.
 
+## COSMOS-FAR-HEIGHT §3 (task #72) — FP_V2_NEARFILL_UNSINK. The near-fill tiles above sink UNIFORMLY V2_NEARFILL_SINK
+## (6.0) so they ride under near blocks; on RELIEF beyond the applied radius (where the corner-MIN backstop falls away)
+## that 6-block sunk skirt becomes the visible surface — near blocks standing proud (the residual #72). This refines it:
+## the tile GEOMETRY stays byte-identical (uniformly sunk), and a flag-gated VERTEX-shader variant of the V2 material
+## un-sinks per-vertex where the near mesh provably ISN'T — recovering the TRUE radial position and applying the SAME
+## applied-cover ellipsoid law the far-ring backstop's zone-B already uses (`facet_far_ring.gd:_applied_covered`): inside
+## the applied ellipsoid (real near mesh hides it) keep the shipped sunk pos (no-protrusion preserved); outside it drop to
+## TRUE − ENV_EPS_G (1.5) — skirt collapses 6→1.5. Per-vertex sink flag rides in the free COLOR.a (shipped shaders read
+## COLOR.rgb only; hop≥2 sink-0 vertices carry a=0 ⇒ VERTEX untouched ⇒ byte-identical position). 4 uniforms pushed on
+## MAIN each frame from the ring's live applied-cover state — no rebuild churn (re-tiling per ladder step would be the
+## CALM-class churn bomb). Effective only with FP_SMOOTH_V2_NEARFILL + TierPlace.applied_cover_on(). Render-only; physics
+## untouched (V2 is render-only). Off ⇒ shipped V2 material + shipped COLOR.a ⇒ byte-identical (no mesh/material change).
+const FP_V2_NEARFILL_UNSINK := false
+
 ## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
 ## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),
 ## centre-relative normal). The live bug is a RUNTIME sun_dir STALENESS gap: three far materials seed their

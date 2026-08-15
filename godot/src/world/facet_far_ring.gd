@@ -1419,6 +1419,13 @@ func _process(_dt: float) -> void:
 		# FP_LOAD_DEFER: pre-settle (`_load_settled` false) step() reaps only — no dispatch/commit (WS1a freeze); post-
 		# settle the FIRST commit waits on `_stream_credit_ok`. Both args are inert with the flag off (step self-gates).
 		_smooth_v2.step(_load_settled, _stream_credit_ok)
+		# FP_V2_NEARFILL_UNSINK (COSMOS-FAR-HEIGHT §3.1): push the LIVE applied-cover state into the V2 near-fill material
+		# each frame (MAIN) so its vertex-shader zone test tracks the SAME `_applied_r` + band top the backstop's zone-B
+		# uses. `_player_col_abs` is planet-absolute (= the mesh object space); r_of(active) is the band-gate datum proxy.
+		# No-op / no material with the flag off; skipped pre-active-fid (uniforms keep the safe applied_r=0 un-sink seed).
+		if CubeSphere.FP_V2_NEARFILL_UNSINK and _active_fid >= 0:
+			_smooth_v2.set_unsink_uniforms(_player_col_abs, _applied_r, _applied_band.y,
+				TerrainConfig.streamed_ellipsoid_params(), FacetAtlas.r_of(_active_fid))
 	# docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md (task #99 G3): reap builds/evictions + rate-capped whole-surface
 	# commit for the relief-mesh tier. Cheap at rest (no dirty tiles, no in-flight slots ⇒ fast no-op scans).
 	# No-op / null with the flag off (byte-identical).

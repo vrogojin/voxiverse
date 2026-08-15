@@ -1021,6 +1021,23 @@ const FP_FT_TEXMEAN_COLOR := false           # §3: far-tree leaf/trunk colour =
 ## overloaded client — hence a live perf A/B before default-on; ship byte-off (credit gate exactly as shipped when off).
 const FP_FT_STALE_REBUILD := false           # §4.1: ≤0.5Hz staleness floor — rebuild-while-moving despite credit 0 (converse of the guard)
 
+## FP_FT_SHELL_BAND (docs/COSMOS-FARTREE-ORBIT-DESIGN.md, far-tree orbit dropout) — the far trees hard-suspend the whole
+## tier above OFFSURFACE_Y (256) though the cards are built to FAR_TREES_CARD_MAX (2400): 3D trees vanish flying up ~350
+## blocks BELOW where a tree becomes sub-pixel (~600). Fix = a three-zone altitude law (h = camera radial altitude):
+##   S (h<256, floored) → shipped verbatim;  B (offsurf, 256≤h<FT_SHELL_HIDE_ALT) → CARDS-only visible+LIVE (mesh rung
+##   hidden, guard/NEARCULL geometrically dead since every tree dist ≥ h > probe_hi=168 → asserted not probed), calmed
+##   rebuilds (move_thr = max(FT_DELTA_MOVE_HYST, FT_SHELL_MOVE_FRAC·h), ≤FT_SHELL_REBUILD_MS cap, card-only ≈20-30ms);
+##   O (h≥FT_SHELL_HIDE_ALT) → hidden+frozen = today's orbit economics (rung-3 fine-map canopy speckle owns it). The §4.2
+## COLORFIX _stale latch moves from "any offsurf" to "any zone-O" (correct-or-nothing de-orbit preserved). 600 chosen:
+## card footprint ≈ fine-map texel footprint there (~7px), rung-3 takes over losslessly. Zero new allocations. Off ⇒
+## every read flag-gated, _apply_visibility keeps the shipped body → byte-identical (zone B collapses into O at 256).
+const FP_FT_SHELL_BAND := false              # far trees render in the off-surface shell band [OFFSURFACE_Y, FT_SHELL_HIDE_ALT)
+const FT_SHELL_HIDE_ALT := 600.0             # zone-O boundary: card footprint ≈ fine-map texel footprint (§2.1) — rung 3 owns above
+const FT_SHELL_FADE_ALT := 520.0             # tier_fade dissolve start (80-blk band into the hide)
+const FT_SHELL_MOVE_FRAC := 0.25             # zone-B DELTA move threshold = max(FT_DELTA_MOVE_HYST, frac·h)
+const FT_SHELL_REBUILD_MS := 500             # zone-B rebuild rate cap (≤2 Hz hard ceiling)
+const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the mesh↔card rung swap (256-boundary flap absorber)
+
 ## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
 ## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel
 ## field meshes in. P0 (this change) is entirely testable with player builds — no generator:

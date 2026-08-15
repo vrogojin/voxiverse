@@ -3253,6 +3253,10 @@ func shell_emit_axis() -> Array: return _emit_axis              # ĉ (ABSOLUTE):
 ## COSMOS LOD-TEXTURE Phase 4: the driver's off-surface decision (camera-set + not floored) — WorldManager gates the
 ## close-up promotion on this (the close-up tier is an off-surface / orbit-approach feature; on-surface it stays base map).
 func shell_offsurface() -> bool: return _cam_set and not _emit_floored_last
+## FP_FT_SHELL_BAND (docs/COSMOS-FARTREE-ORBIT-DESIGN.md §3): the camera radial altitude h = d − R, already computed each
+## frame by apply_camera_set (`_dbg_h`, FR:1200). Read-only accessor for FacetFarTrees' three-zone visibility law — no new
+## math. Returns the last latched h (0 before the first camera-set, which reads as zone S — the shipped floored default).
+func shell_cam_alt() -> float: return _dbg_h
 ## COSMOS TEXTURED-LOD V4 (FP_SKIN_SSE): the camera's scale-correct distance from the body centre (blocks), computed each
 ## frame by apply_camera_set. WorldManager forwards it to FacetTexBaker.update so the screen-space promotion law can size a
 ## facet's on-screen blocks. 0 until the camera-set driver has run ⇒ the baker's SSE law falls back to the regime path.
@@ -3349,6 +3353,13 @@ func shell_telemetry() -> Dictionary:
 		"sh_h": snappedf(_dbg_h, 0.1),
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
+	# FP_FT_SHELL_BAND A/B readback: merge the far-tree zone state (ft_zone 0=S/1=B/2=O, ft_cards/ft_mesh shown, ft_off,
+	# ft_h) so a live climb reads WHICH zone the tier computed at each altitude — confound-free (no visual/biome ambiguity).
+	# Empty dict with the flag off ⇒ no keys added ⇒ byte-identical telemetry.
+	if _far_trees != null:
+		var fb = _far_trees.shell_band_state()
+		if fb is Dictionary and not (fb as Dictionary).is_empty():
+			out.merge(fb as Dictionary)
 	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
 	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
 	# the keys are never added to the dict => byte-identical for any telemetry consumer.

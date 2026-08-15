@@ -134,6 +134,10 @@ var _have_rebuilt := false              # a rebuild has completed at least once 
 var _last_rebuild_cam := Vector3.ZERO   # camera pos (absolute) at the last real rebuild
 var _last_rebuild_cache_epoch := -1     # _cache_epoch at the last real rebuild
 var _last_rebuild_edits_rev := -1       # edit revision at the last real rebuild
+var _last_rebuild_shell := false        # FP_FT_SHELL_BAND: the zone (S vs B) of the last real rebuild — a zone flip re-arms exactly one
+var _dbg_shell_zone := -1               # FP_FT_SHELL_BAND A/B readback: last computed zone (0=S,1=B,2=O; -1 off)
+var _dbg_shell_h := 0.0                 # last camera radial altitude the zone law saw
+var _dbg_shell_offsurf := false         # last shell_offsurface() the zone law saw
 var _have_wanted := false               # the wanted-facet scan has been computed at least once
 var _last_wanted: Array = []            # cached wanted-facet set (reused until FT_DELTA_WANTED_MOVE / epoch change)
 var _last_wanted_cam := Vector3.ZERO    # camera pos at the last wanted-scan recompute
@@ -256,6 +260,14 @@ static func shader_code() -> String:
 		tail = tail.replace("v_hue = INSTANCE_CUSTOM.y;", "v_hue = INSTANCE_CUSTOM.y;\n\tv_snow = INSTANCE_CUSTOM.z;")
 		tail = tail.replace("ALBEDO = t.rgb * voxi_shade(v_n, sun_dir) * jit;",
 			"ALBEDO = mix(t.rgb, snow_tint, v_snow * snow_amt) * voxi_shade(v_n, sun_dir) * jit;")
+	# FP_FT_SHELL_BAND §3.3: a global `tier_fade` uniform (1.0 default) scales the per-instance fade alpha in the dither
+	# test, so the whole tier dither-DISSOLVES over [FT_SHELL_FADE_ALT, FT_SHELL_HIDE_ALT] as the camera climbs into orbit
+	# (handoff to the rung-3 canopy speckle), driven per step by one set_shader_parameter — NO rebuild. The `> v_fade)`
+	# token is present in BOTH dither variants (plain + XFADE_COMPL), so this composes with either. Requires the FADE
+	# dither (v_fade); off / no FADE ⇒ no uniform, no replace ⇒ shipped string verbatim (byte-identical).
+	if CubeSphere.FP_FT_SHELL_BAND and CubeSphere.FP_FAR_TREES_FADE:
+		head += "uniform float tier_fade = 1.0;\n"
+		tail = tail.replace("> v_fade)", "> v_fade * tier_fade)")
 	return head + VoxiLight.shade_glsl() + tail
 
 static func make_material() -> ShaderMaterial:
@@ -751,7 +763,34 @@ func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
 ## behaviour). Under FP_FAR_TREES_COLORFIX (§4.2): any offsurf frame latches `_stale`, and the tier stays hidden
 ## on the offsurf→onsurf flip until the first completed rebuild clears the latch (correct-or-nothing, no stale-band
 ## garbage frame). Cleared by `_rebuild_*`'s caller (step / debug_rebuild) after the first real rebuild.
-func _apply_visibility(offsurf: bool) -> void:
+func _apply_visibility(offsurf: bool, h := -1.0) -> void:
+	# FP_FT_SHELL_BAND §3: the three-zone altitude law. Off (or no `h` supplied — the default -1 keeps existing call
+	# sites/gates on the shipped path) ⇒ the binary offsurf⇒hide below, byte-identical.
+	if CubeSphere.FP_FT_SHELL_BAND and h >= 0.0:
+		if not offsurf:
+			# ZONE S (surface): cards + meshes shown unless the COLORFIX stale latch holds (shipped).
+			var show_s := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+			if _mmi != null:
+				_mmi.visible = show_s
+			for mmi in _mesh_mmis:
+				(mmi as MultiMeshInstance3D).visible = show_s
+		elif h < CubeSphere.FT_SHELL_HIDE_ALT:
+			# ZONE B (shell band): CARDS visible + LIVE (no _stale latch — the set stays live); mesh rung HIDDEN. A
+			# de-orbit O→B keeps _stale until the first zone-B rebuild clears it (correct-or-nothing, §4.2).
+			var show_b := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+			if _mmi != null:
+				_mmi.visible = show_b
+			for mmi in _mesh_mmis:
+				(mmi as MultiMeshInstance3D).visible = false
+		else:
+			# ZONE O (orbit): hidden + frozen; latch _stale so a later descent shows nothing until a fresh rebuild.
+			if CubeSphere.FP_FAR_TREES_COLORFIX:
+				_stale = true
+			if _mmi != null:
+				_mmi.visible = false
+			for mmi in _mesh_mmis:
+				(mmi as MultiMeshInstance3D).visible = false
+		return
 	if CubeSphere.FP_FAR_TREES_COLORFIX and offsurf:
 		_stale = true
 	var show := (not offsurf) and not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
@@ -762,17 +801,34 @@ func _apply_visibility(offsurf: bool) -> void:
 
 func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> void:
 	_reap_enum()
-	# NO far-over-near / orbit suspend (§4.2): trees show ON-surface only; off-surface the whole node is hidden and
-	# the instance set is frozen (mirror of G3's off-surface-only visibility, inverted).
+	# FP_FT_SHELL_BAND §3 (docs/COSMOS-FARTREE-ORBIT-DESIGN.md): a three-zone altitude law replaces the binary orbit
+	# suspend. h = camera radial altitude; ZONE B (offsurf, h < FT_SHELL_HIDE_ALT) renders CARDS live off-surface
+	# (card-only, calmed, near-cull vacuous — §4.1); ZONE O (offsurf, h ≥ HIDE) stays hidden+frozen = today's economics
+	# (rung-3 canopy speckle owns the view). Flag off ⇒ shell_mode false ⇒ the shipped "NO far-over-near / orbit suspend
+	# (§4.2): trees show ON-surface only" — the whole node hidden + the set frozen — verbatim below (byte-identical).
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
-	_apply_visibility(offsurf)
-	if offsurf:
+	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_FT_SHELL_BAND else -1.0
+	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	# FP_FT_SHELL_BAND A/B readback: latch the computed zone (0=S,1=B,2=O; -1 flag off) + offsurf/h for a confound-free
+	# live telemetry probe (shell_band_state()). Cheap unconditional writes; only READ under the flag → byte-identical off.
+	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)))
+	_dbg_shell_h = h
+	_dbg_shell_offsurf = offsurf
+	_apply_visibility(offsurf, h)
+	if offsurf and not shell_mode:
 		return
+	# FP_FT_SHELL_BAND §3.3: drive the tier dissolve uniform every frame (cheap, no rebuild) — 1.0 in zone S, ramping to 0
+	# over [FADE_ALT, HIDE_ALT] in zone B so the tier hands off to the rung-3 speckle. Off / no material ⇒ never set.
+	if CubeSphere.FP_FT_SHELL_BAND and _material != null:
+		var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
+		_material.set_shader_parameter("tier_fade", tf)
 	var cam_abs := _cam_to_absolute(cam_render)            # one absolute-frame camera — guard, staleness floor + rebuild all reuse it
 	# FP_FT_NEAR_GUARD §1 (task #132): the bounded cull-only double-render guard runs BEFORE the settle/credit return, so it
 	# heals far-over-near even while the client sits at stream credit 0 (the ~30fps regime where the rebuild — and thus the
 	# NEARCULL — is starved and the impostor set freezes minutes-stale). Own 250 ms rate cap; ≤0.5 ms by construction.
-	if CubeSphere.FP_FT_NEAR_GUARD and CubeSphere.FP_FAR_TREES_NEARCULL and _near_query.is_valid():
+	# FP_FT_SHELL_BAND §4.1: skipped in zone B — every tree is ≥ h > probe_hi off-surface, so the guard is geometrically
+	# vacuous (no near mesh to double-render over) and the near query is a surface-only construct.
+	if not shell_mode and CubeSphere.FP_FT_NEAR_GUARD and CubeSphere.FP_FAR_TREES_NEARCULL and _near_query.is_valid():
 		var gnow := Time.get_ticks_msec()
 		if gnow - _last_guard_ms >= CubeSphere.FAR_TREES_STEP_MS:
 			_last_guard_ms = gnow
@@ -786,7 +842,10 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if not settled or (not credit_ok and not _stale_override(settled, credit_ok, cam_abs)):
 		return
 	var now := Time.get_ticks_msec()
-	if now - _last_step_ms < CubeSphere.FAR_TREES_STEP_MS:
+	# FP_FT_SHELL_BAND §5.2: zone B caps the step (and thus the rebuild) at FT_SHELL_REBUILD_MS (≤2 Hz) — the altitude-
+	# scaled DELTA is the primary cadence lever, this is the hard ceiling. Zone S keeps the shipped 250 ms (byte-identical).
+	var step_cap := CubeSphere.FT_SHELL_REBUILD_MS if shell_mode else CubeSphere.FAR_TREES_STEP_MS
+	if now - _last_step_ms < step_cap:
 		return
 	_last_step_ms = now
 	# Push the live body centre (render frame) so the radial normal can't go stale across a crossing / re-anchor.
@@ -806,19 +865,22 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# FP_FAR_TREES_NEARCULL §5.4: compute the near-presence change fingerprint BEFORE the DELTA gate so a mesh landing
 	# under a still camera (which changes nothing else the gate reads) re-arms the rebuild that culls the far tree. Pure
 	# read (no dwell mutation); only when both flags are live.
-	if CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
+	# FP_FT_SHELL_BAND §4.1: zone B skips the near-cull fingerprint (it would issue 0 probes anyway — every tree ≥ h > probe_hi).
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
 		_pending_nearcull_fp = _compute_nearcull_fp(cam_abs, wanted)
-	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
+	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs, shell_mode, h):
 		return
 	# Rung-1 meshes [R0, FAR_TREES_MESH_MAX) FIRST, so the cards can retreat to [FAR_TREES_MESH_MAX, CARD_MAX] — the
 	# 448 handoff is EXCLUSIVE (a tree renders in exactly one band, no double). Off ⇒ cards keep the full [R0, CARD_MAX].
-	if CubeSphere.FP_FAR_TREES_NEARCULL:
+	# FP_FT_SHELL_BAND §3.1/§4.1: zone B is CARD-ONLY (mesh rung suspended, hidden) and skips the near-cull machinery
+	# entirely (geometrically vacuous off-surface) — the cards own [R0, CARD_MAX] via _rebuild_cards' shell_mode path.
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL:
 		_nearcull_begin()
-	if CubeSphere.FP_FAR_TREES_MESH:
+	if not shell_mode and CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
-		_rebuild_cards(cam_abs, wanted)
-	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_rebuild_cards(cam_abs, wanted, shell_mode)
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL:
 		_nearcull_end()
 	# FP_FAR_TREES_COLORFIX §4.2: the first completed rebuild after an offsurf flip clears the hide latch — the next
 	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
@@ -991,22 +1053,29 @@ func _wanted_facets_for(cam_abs: Vector3) -> Array:
 ## flip, or no rebuild has ever completed. When it returns false the rebuild output is BIT-IDENTICAL to last time
 ## (the buffers are a pure function of exactly these inputs — fades are dist(cam,tree)-only, sun_dir/planet_centre
 ## are in-shader uniforms), so `step` skips the rebuild. Only called under the flag (short-circuited off).
-func _rebuild_inputs_changed(cam_abs: Vector3) -> bool:
+func _rebuild_inputs_changed(cam_abs: Vector3, shell_mode := false, h := 0.0) -> bool:
 	# FP_FT_MOVE_HYST (F2a, #129): widen the rebuild move threshold to FT_DELTA_MOVE_HYST while credit flows (the F1
 	# interlock) so a walk re-arms the full rebuild 6× less often. Off ⇒ the shipped FT_DELTA_MIN_MOVE (byte-identical).
 	var move_thr: float = CubeSphere.FT_DELTA_MOVE_HYST if CubeSphere.FP_FT_MOVE_HYST else CubeSphere.FT_DELTA_MIN_MOVE
+	# FP_FT_SHELL_BAND §5.2: in zone B the buffer's visual sensitivity to camera motion scales with 1/h (band membership +
+	# thinning shift ∝ move/h), so WIDEN the move threshold with altitude — max(FT_DELTA_MOVE_HYST, FT_SHELL_MOVE_FRAC·h) —
+	# and re-arm exactly one rebuild on a zone (S↔B) flip. Off / zone S ⇒ the shipped threshold + no zone term (byte-identical).
+	if shell_mode:
+		move_thr = maxf(CubeSphere.FT_DELTA_MOVE_HYST, CubeSphere.FT_SHELL_MOVE_FRAC * h)
 	var changed := (not _have_rebuilt) \
+		or (CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell) \
 		or cam_abs.distance_to(_last_rebuild_cam) >= move_thr \
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
 		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale) \
-		or (CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp)
+		or (not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp)
 	if changed:
 		_have_rebuilt = true
 		_last_rebuild_cam = cam_abs
 		_last_rebuild_cache_epoch = _cache_epoch
 		_last_rebuild_edits_rev = _current_edits_rev()
 		_last_rebuild_nearcull_fp = _pending_nearcull_fp
+		_last_rebuild_shell = shell_mode
 	return changed
 
 func _advance_dwell(wanted: Array) -> void:
@@ -1047,13 +1116,15 @@ func _evict_lru_overflow() -> void:
 ## Rebuild the ONE MultiMesh buffer: for each wanted facet (nearest-first) walk its cached trees, keep those whose
 ## base camera distance is in [R0, FAR_TREES_CARD_MAX] (R0 = near voxel edge — the near field owns closer trees →
 ## no far-over-near), emit a card transform + custom data, up to FAR_TREES_CARD_INST_MAX. One `set_buffer` upload.
-func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
+func _rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := false) -> void:
 	_dbg_rebuild_count += 1   # FP_FAR_TREES_DELTA gate read-back: counts REAL rebuilds (a skipped step never gets here)
 	# The card-band INNER radius is the ONE source of truth `card_inner_radius()`: FAR_TREES_MESH_MAX when rung-1
 	# meshes own [R0, 448) (exclusive handoff at 448, no double-render), else the P0 full [R0, CARD_MAX] band. Under
 	# FP_FAR_TREES_FADE the floor drops by FADE_BAND_W so the cards OVERLAP the mesh fade-out for the cross-dither.
+	# FP_FT_SHELL_BAND §3.1: `shell_mode` forces the full [R0, CARD_MAX] band (mesh rung suspended off-surface) and the
+	# thin-only frontier alpha, with NO near-cull probe (every tree is ≥ h > probe_hi off-surface — §4.1, vacuous).
 	var fade := CubeSphere.FP_FAR_TREES_FADE
-	var r0 := card_inner_radius() - (FADE_BAND_W if (fade and CubeSphere.FP_FAR_TREES_MESH) else 0.0)
+	var r0 := card_inner_radius(shell_mode) - (FADE_BAND_W if (fade and CubeSphere.FP_FAR_TREES_MESH and not shell_mode) else 0.0)
 	var d2 := CubeSphere.FAR_TREES_CARD_MAX
 	var cap := CubeSphere.FAR_TREES_CARD_INST_MAX
 	var buf := PackedFloat32Array()
@@ -1083,7 +1154,11 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 			# FP_FAR_TREES_NEARCULL §5.2: when the mesh rung is OFF the cards own the near frontier — the probe REPLACES the
 			# `dist < r0` skip (gap-fills a ramped-down view, culls the overlap band exactly where the near tree renders).
 			# When meshes are ON r0 is the 448 handoff (the mesh rung owns the frontier + does the cull) → keep the skip.
-			if CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH:
+			if shell_mode:
+				# §4.1: off-surface there is NO near mesh to double-render over — r0 is moot (all trees ≥ h > r0), no probe.
+				if dist < r0:
+					continue
+			elif CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH:
 				if not _nearcull_emit(int(fid), dist, recs[o + 8], recs[o + 9], recs[o + 10]):
 					continue
 			elif dist < r0:
@@ -1098,7 +1173,7 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array) -> void:
 				# FP_FAR_TREES_NEARCULL §5.2: when the cards own the near frontier (mesh off) the probe REPLACES the near
 				# dither-in — keep only the survival thinning so gap-fill trees show. Mesh on ⇒ card_fade's fin is the 448
 				# cross-dither (kept). Off ⇒ card_fade verbatim.
-				if CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH:
+				if shell_mode or (CubeSphere.FP_FAR_TREES_NEARCULL and not CubeSphere.FP_FAR_TREES_MESH):
 					alpha = thin_alpha(hue, dist)
 				else:
 					alpha = card_fade(dist, hue)
@@ -1503,7 +1578,11 @@ func total_bytes() -> int:
 ## The card-band INNER radius (ONE source of truth). FAR_TREES_MESH_MAX (448) when rung-1 meshes are live so the
 ## cards retreat past the exclusive handoff; else near_render_radius() — the P0 [128, CARD_MAX] band, BYTE-IDENTICAL
 ## with FP_FAR_TREES_MESH off (what's merged). Gate G-FT-MESH-HANDOFF asserts this in BOTH flag states.
-func card_inner_radius() -> float:
+func card_inner_radius(shell_mode := false) -> float:
+	# FP_FT_SHELL_BAND §3.1: off-surface (zone B) the mesh rung suspends, so the cards own the WHOLE [R0, CARD_MAX] band
+	# (the 448 handoff is a surface-only concern). `shell_mode` forces that path even though FP_FAR_TREES_MESH is live.
+	if shell_mode:
+		return float(TerrainConfig.near_render_radius())
 	return CubeSphere.FAR_TREES_MESH_MAX if CubeSphere.FP_FAR_TREES_MESH else float(TerrainConfig.near_render_radius())
 
 func live_instances() -> int: return _live_instances
@@ -1552,18 +1631,19 @@ func debug_rebuild(wanted: Array, cam_abs: Vector3) -> int:
 ## (no live FacetFarRing / no worker). Mirrors `step`'s post-rate-cap tail: the DELTA gate skips both rebuilds when
 ## `_rebuild_inputs_changed` is false, else rebuilds (and clears the COLORFIX latch). Dispatch/dwell are omitted so the
 ## gate stays hermetic (no threads). Returns true iff this call actually rebuilt.
-func debug_step(wanted: Array, cam_abs: Vector3) -> bool:
-	if CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
+func debug_step(wanted: Array, cam_abs: Vector3, shell_mode := false, h := 0.0) -> bool:
+	# FP_FT_SHELL_BAND: mirrors step()'s rebuild block including the zone-B card-only / no-near-cull path (G-FTSB-*).
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA:
 		_pending_nearcull_fp = _compute_nearcull_fp(cam_abs, wanted)
-	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs):
+	if CubeSphere.FP_FAR_TREES_DELTA and not _rebuild_inputs_changed(cam_abs, shell_mode, h):
 		return false
-	if CubeSphere.FP_FAR_TREES_NEARCULL:
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL:
 		_nearcull_begin()
-	if CubeSphere.FP_FAR_TREES_MESH:
+	if not shell_mode and CubeSphere.FP_FAR_TREES_MESH:
 		_rebuild_meshes(cam_abs, wanted)
 	if CubeSphere.FP_FAR_TREES_CARDS:
-		_rebuild_cards(cam_abs, wanted)
-	if CubeSphere.FP_FAR_TREES_NEARCULL:
+		_rebuild_cards(cam_abs, wanted, shell_mode)
+	if not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL:
 		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
@@ -1619,10 +1699,30 @@ func mesh_min_vertex_y(col: int) -> float:
 	return mn
 
 ## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
-func debug_apply_visibility(offsurf: bool) -> void:
-	_apply_visibility(offsurf)
+func debug_apply_visibility(offsurf: bool, h := -1.0) -> void:
+	_apply_visibility(offsurf, h)
 func mmi_visible() -> bool:
 	return _mmi != null and _mmi.visible
+## FP_FT_SHELL_BAND gate read-back (G-FTSB-VIS): the mesh rung MMI visibility (hidden in zone B). True iff ANY mesh MMI shows.
+func mesh_mmi_visible() -> bool:
+	for mmi in _mesh_mmis:
+		if (mmi as MultiMeshInstance3D).visible:
+			return true
+	return false
+
+## FP_FT_SHELL_BAND A/B readback: the confound-free live probe of the zone law (the shell-band telemetry). Returns {}
+## with the flag off (never merged → byte-identical telemetry). ft_zone: 0=S(surface),1=B(shell band, cards live),
+## 2=O(orbit, hidden); ft_cards = the card MMI is visible; ft_mesh = the mesh rung is visible; ft_h = altitude the law saw.
+func shell_band_state() -> Dictionary:
+	if not CubeSphere.FP_FT_SHELL_BAND:
+		return {}
+	return {
+		"ft_zone": _dbg_shell_zone,
+		"ft_cards": (_mmi != null and _mmi.visible),
+		"ft_mesh": mesh_mmi_visible(),
+		"ft_off": _dbg_shell_offsurf,
+		"ft_h": snappedf(_dbg_shell_h, 0.1),
+	}
 func is_stale() -> bool:
 	return _stale
 func mesh_uses_colors() -> bool:

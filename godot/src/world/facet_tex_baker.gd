@@ -121,7 +121,17 @@ var _centre_pack := PackedVector3Array()
 var _bm_on := false                  # FP_BAND_BLOCK_MAP && _bd_on && the baker exists (set in setup)
 var _bm_shot := false                # COSMOS TEXTURED-LOD §2V V2: FP_BAND_SHOT && _bm_on ⇒ band is RG8 {id,shade} (real shot incl trees)
 var _bm_flat := false                # FP_SKIN_FLATCOLOR: band is L8 {far-colour-index+1} (Minecraft map skin, tile-mean colour incl trees/edits)
-var _edit_snap := {}                 # FP_SKIN_FLATCOLOR: main-thread snapshot of the bake facet's edits {Vector2i(lx,lz)->block_id}; empty until Stage-B wires it
+var _edit_snap := {}                 # FP_SKIN_FLATCOLOR: main-thread snapshot of the bake facet's edits {Vector2i(lx,lz)->block_id}; FP_FT_SKIN_CHOP wires the chop-scoped Stage-B writer (frozen per bake at _begin_band_bake)
+# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.4 (FP_FT_SKIN_CHOP, task #137) — the chop-scoped Stage-B edit snapshot.
+# `_edit_snap_query` (WorldManager.far_skin_edit_snap) is fetched ON MAIN and FROZEN per bake: into `_edit_snap`
+# at _begin_band_bake (single-worker band path) and into the PER-SLOT arrays below at each _pbm dispatch — exactly
+# the contract _pbm_compute's Stage-B note demands (a worker must never iterate a shared Dictionary). WorldManager
+# re-memos into a NEW dict on change, so a frozen reference is never mutated under a running bake.
+var _edit_snap_query: Callable = Callable()   # (fid) -> {Vector2i(lx,lz) -> post-chop top block id}; invalid ⇒ inert
+var _pbm_esnap: Array = []           # slot -> frozen Dictionary (the GDScript compute branches read this)
+var _pbm_ecells: Array = []          # slot -> PackedInt64Array packed columns (the C++ bake_far_tile edit_cells arg)
+var _pbm_efar: Array = []            # slot -> PackedInt32Array far indices (the C++ bake_far_tile edit_far_idx arg)
+var _skin_stale: Dictionary = {}     # fid -> true: chop toggled while fid's bake was in flight — re-invalidate at its commit
 var _bm_texels := 0                  # BAND_TEXELS (512)
 var _bm_tex: Texture2DArray = null   # the BAND_LAYERS-layer GPU band id map (bound into the ring's band_map uniform)
 var _bm_slots: Dictionary = {}       # fid -> layer (RESIDENT: baked + uploaded; the value fed to UV2.y as 64+layer)
@@ -1234,6 +1244,10 @@ func _begin_band_bake(fid: int) -> bool:
 	_bm_bake_fid = fid
 	_bm_bake_layer = layer
 	_bm_bake_row = 0
+	# FP_FT_SKIN_CHOP: freeze this facet's chop snapshot for the whole row-sliced bake (MAIN, at begin — the ONLY
+	# writer of `_edit_snap`, so the slices' worker reads honour the "main doesn't mutate during a bake" contract).
+	_edit_snap = (_edit_snap_query.call(fid)
+		if CubeSphere.FP_FT_SKIN_CHOP and _edit_snap_query.is_valid() else {})
 	var img: Image = Image.create(_bm_texels, _bm_texels, false, _band_img_format())
 	img.fill(Color(0.0, 0.0, 0.0, 1.0))     # id 0 = un-baked until rows fill in (RG8 under shot: shade 0 too, unread while id 0)
 	_bm_bake_img = img
@@ -1402,6 +1416,7 @@ func _bm_commit_slice() -> void:
 		_bm_active_img = img
 	_bm_epoch += 1
 	_bm_bake_fid = -1; _bm_bake_layer = -1; _bm_bake_img = null
+	_drain_skin_stale(fid)           # FP_FT_SKIN_CHOP: chopped mid-bake → evict the stale layer, re-bake fresh
 
 ## Evict band facet `fid`: free its layer, drop it from residency. The reverse-map (a,b)/(Nx,Ny) is left as-is until the
 ## layer is reused (a returning facet re-bakes it) so a mesh vertex carrying the stale 64+slot for the ≤1-frame window
@@ -1681,10 +1696,12 @@ func _setup_parallel_band() -> void:
 	_pbm_mode.resize(_pbm_n)
 	_pbm_cpp.resize(_pbm_n)
 	_pbm_tile.resize(_pbm_n)
+	_pbm_esnap.resize(_pbm_n); _pbm_ecells.resize(_pbm_n); _pbm_efar.resize(_pbm_n)   # FP_FT_SKIN_CHOP per-slot snapshot
 	for i in range(_pbm_n):
 		_pbm_fid[i] = -1; _pbm_layer[i] = -1; _pbm_task[i] = -1; _pbm_mode[i] = 0
 		_pbm_bytes[i] = PackedByteArray()
 		_pbm_cpp[i] = 0; _pbm_tile[i] = 0
+		_pbm_esnap[i] = {}; _pbm_ecells[i] = PackedInt64Array(); _pbm_efar[i] = PackedInt32Array()
 	_setup_fine_map()
 
 func _setup_fine_map() -> void:
@@ -1756,6 +1773,55 @@ func _pbm_inflight(fid: int) -> bool:
 			return true
 	return false
 
+# --- FP_FT_SKIN_CHOP (docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.4) --------------------------------------------------
+
+## Install the chop-snapshot query (WorldManager.far_skin_edit_snap). Never installed with the flag off ⇒ inert.
+func set_edit_snap_query(q: Callable) -> void:
+	_edit_snap_query = q
+
+## Freeze facet `fid`'s chop snapshot into slot `i` ON MAIN at dispatch: the frozen Dictionary for the GDScript
+## compute branches + the packed-array pair the C++ bake_far_tile edit branch takes. This is the per-slot Stage-B
+## contract _pbm_compute's note demands — a worker never touches the live overlay or a shared mutable dict.
+## Flag off / query invalid / empty snapshot ⇒ empty arrays ⇒ have_edits false ⇒ byte-identical bake. `force` is
+## the gate-forcing convention (no compile-time sed); real call sites pass no override ⇒ the compile const governs.
+func _snap_slot(i: int, fid: int, force := CubeSphere.FP_FT_SKIN_CHOP) -> void:
+	var esnap: Dictionary = {}
+	if force and _edit_snap_query.is_valid():
+		esnap = _edit_snap_query.call(fid)
+	_pbm_esnap[i] = esnap
+	var ec := PackedInt64Array()
+	var ef := PackedInt32Array()
+	for k in esnap:
+		ec.append(_pack_xz(int(k.x), int(k.y)))
+		ef.append(FarPalette.far_color_index_of_block(int(esnap[k])))
+	_pbm_ecells[i] = ec
+	_pbm_efar[i] = ef
+
+## A chop toggled on facet `fid` (WorldManager's trunk-base detect at the edit choke point): its baked band/fine
+## far-skin tiles are stale — drop them so they re-bake with the fresh snapshot. Fine: un-mark → the fine cursor
+## re-bakes it (the coverage size-sentinel re-opens) and _fine_commit re-blits + re-uploads. Band: evict → the fid
+## is still wanted, so the next want pass re-dispatches it. A bake currently IN FLIGHT for `fid` used the pre-toggle
+## snapshot and will commit stale once — latch `_skin_stale` so its commit re-runs this invalidation (the reap /
+## _bm_commit_slice drain the latch). The rung-3 analogue of FacetFarTrees' edits-rev rebuild re-arm. `force` is
+## the gate-forcing convention; real callers pass no override ⇒ the compile const governs (byte-identical off).
+func invalidate_far_skin(fid: int, force := CubeSphere.FP_FT_SKIN_CHOP) -> void:
+	if not force:
+		return
+	if _pbm_inflight(fid) or _bm_bake_fid == fid:
+		_skin_stale[fid] = true
+	_fine_baked.erase(fid)
+	if _bm_slots.has(fid):
+		_evict_band(fid)
+
+## Drain the in-flight staleness latch at a commit: the just-committed tile for `fid` was baked with a pre-chop
+## snapshot — invalidate again (now no longer in flight for this bake) so a fresh re-bake follows. Bounded: one
+## latch entry per chopped-while-baking facet, erased here. No flag check of its own: the latch can only be set by
+## an (flag- or gate-authorized) invalidate_far_skin, so its existence IS the authorization — re-invalidate forced.
+func _drain_skin_stale(fid: int) -> void:
+	if _skin_stale.has(fid):
+		_skin_stale.erase(fid)
+		invalidate_far_skin(fid, true)
+
 ## COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): count of fine-mode (_pbm_mode==1) tasks currently in flight
 ## across all slots — the governor's inflight cap. Off-surface this can legitimately be up to _pbm_n (full
 ## parallelism, unchanged); on-surface under the flag it caps NEW dispatch to BG_MAX_INFLIGHT_SURFACE. Only
@@ -1814,6 +1880,7 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 		if int(_pbm_mode[i]) == 1:
 			_fine_commit(fid, bytes)
 			_pbm_fid[i] = -1; _pbm_task[i] = -1
+			_drain_skin_stale(fid)   # FP_FT_SKIN_CHOP: chopped mid-bake → drop the stale commit, re-bake fresh
 			continue
 		if bytes.size() == _bm_texels * _bm_texels:
 			var img := Image.create_from_data(_bm_texels, _bm_texels, false, Image.FORMAT_L8, bytes)
@@ -1826,6 +1893,7 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 		else:
 			_bm_free.append(layer)                                    # compute failed → return the layer
 		_pbm_fid[i] = -1; _pbm_task[i] = -1
+		_drain_skin_stale(fid)       # FP_FT_SKIN_CHOP: chopped mid-bake → evict the stale layer, re-bake fresh
 	# The whole-planet FINE tier is the COVERAGE guarantee; the band is close-up SUGAR. While any facet is still
 	# un-fine-baked, the band yields ALL worker slots so the disc coverage fills fast (Fable F1 follow-up: the band's
 	# expensive 174k-shot/facet bakes at mid-orbit were hogging both workers, starving the fine tier → the washed
@@ -1857,6 +1925,7 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 			_pbm_lc[i] = lc
 			_pbm_nx[i] = clampi(int(round((lc[1] - lc[0]).length())), 1, _bm_texels)
 			_pbm_ny[i] = clampi(int(round((lc[3] - lc[0]).length())), 1, _bm_texels)
+			_snap_slot(i, fid)   # FP_FT_SKIN_CHOP: freeze the chop snapshot for this bake (MAIN, pre-dispatch)
 			_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "flatband")
 	# 3) FP_PLANET_MAP: dispatch the always-resident whole-planet fine bake into STILL-idle slots (band has priority)
 	if _fm_on:
@@ -1913,6 +1982,7 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 				_pbm_lc[i] = flc
 				_pbm_nx[i] = _fm_texels
 				_pbm_ny[i] = _fm_texels
+				_snap_slot(i, ff)   # FP_FT_SKIN_CHOP: freeze the chop snapshot for this bake (MAIN, pre-dispatch)
 				_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
 				if fine_pause_on and not _offsurface:
 					bg_new += 1
@@ -1938,7 +2008,10 @@ func _pbm_compute(i: int) -> void:
 	var nx := int(_pbm_nx[i])
 	var ny := int(_pbm_ny[i])
 	var lc: PackedVector2Array = _pbm_lc[i]
-	var have_edits: bool = not _edit_snap.is_empty()
+	# FP_FT_SKIN_CHOP: the PER-SLOT snapshot frozen main-thread at dispatch (_snap_slot) — never the shared live
+	# member (the Stage-B contract below). Empty (flag off / no chops) ⇒ have_edits false ⇒ shipped bytes verbatim.
+	var esnap: Dictionary = _pbm_esnap[i]
+	var have_edits: bool = not esnap.is_empty()
 	var ctx = TerrainConfig.GenCtx.new(0, fid)
 	var bytes := PackedByteArray()
 	bytes.resize(tex * tex)
@@ -1953,18 +2026,11 @@ func _pbm_compute(i: int) -> void:
 		# heap traffic — so the bake thread runs pure C++ compute and N threads genuinely parallelise on the (now
 		# multi-thread) web WorkerThreadPool. Byte-equal to the GDScript path below by integer-LUT construction
 		# (docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2). Empty/short return (deco LUT absent) ⇒ fall through untouched.
-		var edit_cells := PackedInt64Array()
-		var edit_far := PackedInt32Array()
-		if have_edits:
-			# DEAD PATH TODAY: _edit_snap has no writer in the repo (far-skin edits are Stage-B), so have_edits is always
-			# false and this never runs. The GDScript branch below reads _edit_snap.get() per texel on the worker under the
-			# same "main doesn't mutate during a bake" contract. STAGE-B MUST build this snapshot at the DISPATCH sites into
-			# per-slot arrays (not iterate the shared Dictionary on the worker) before it wires a writer — an in-place
-			# insert/erase concurrent with this iteration would corrupt the hash table.
-			for k in _edit_snap:
-				edit_cells.append(_pack_xz(int(k.x), int(k.y)))
-				edit_far.append(FarPalette.far_color_index_of_block(int(_edit_snap[k])))
-		var tb: PackedByteArray = _sampler_obj.call("bake_far_tile", fid, lc, nx, ny, tex, edit_cells, edit_far)
+		# FP_FT_SKIN_CHOP wired Stage-B exactly as the old dead-path note demanded: the snapshot is built at the
+		# DISPATCH sites into per-slot arrays (_snap_slot, main thread) — this worker only reads its own slot's
+		# frozen copies, so no shared Dictionary is ever iterated here. Empty arrays ⇒ the shipped no-edit bake.
+		var tb: PackedByteArray = _sampler_obj.call("bake_far_tile", fid, lc, nx, ny, tex,
+			_pbm_ecells[i], _pbm_efar[i])
 		if tb.size() == tex * tex:
 			bytes = tb
 			tiled = true
@@ -2002,7 +2068,7 @@ func _pbm_compute(i: int) -> void:
 					var idx := cbase + bx
 					var fi := -1
 					if have_edits:
-						var eb := int(_edit_snap.get(Vector2i(lxs[idx], lzs[idx]), -1))
+						var eb := int(esnap.get(Vector2i(lxs[idx], lzs[idx]), -1))
 						if eb >= 0:
 							fi = FarPalette.far_color_index_of_block(eb)
 					if fi < 0:
@@ -2023,7 +2089,7 @@ func _pbm_compute(i: int) -> void:
 				var lz := int(round(_bilerp(lc[0].y, lc[1].y, lc[2].y, lc[3].y, s, t)))
 				var fi := -1
 				if have_edits:
-					var eb := int(_edit_snap.get(Vector2i(lx, lz), -1))
+					var eb := int(esnap.get(Vector2i(lx, lz), -1))
 					if eb >= 0:
 						fi = FarPalette.far_color_index_of_block(eb)
 				if fi < 0:

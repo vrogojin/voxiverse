@@ -545,6 +545,9 @@ func _ready() -> void:
 		if CubeSphere.FP_FACET_TEX and CubeSphere.FP_SHELL_ABSOLUTE:
 			_facet_tex = FacetTexBaker.new()
 			_facet_tex.setup(TerrainConfig.active_facet())
+			# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): hand the baker the chop snapshot query —
+			# the rung-3 twin of the far-trees chop wiring below. The query self-guards on the flag ⇒ byte-identical off.
+			_facet_tex.set_edit_snap_query(Callable(self, "far_skin_edit_snap"))
 			# COSMOS MAIN-THREAD ORCHESTRATION TH1 (FP_TEX_BAKE_WORKER): hand the baker the TH0 job lane so its
 			# per-frame bake COMPUTE dispatches to the WorkerThreadPool worker (main pays only the update_layer).
 			# No-op unless FP_TEX_BAKE_WORKER && the lane exists (FP_JOB_LANE) — the prewarm below stays on main.
@@ -2080,6 +2083,13 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	# null tracker (flag off) ⇒ one branch skip (byte-identical).
 	if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 		_structure_tracker.note_cell(ek, packed)
+	# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): if this edit is the trunk-base cell of its column's
+	# procedural tree, the tree's chopped state just toggled — the facet's baked band/fine far-skin tiles are stale.
+	# O(1) detect (one tree_info); the rung-3 analogue of FacetFarTrees' edits-rev rebuild re-arm. Off / no baker ⇒ no-op.
+	if CubeSphere.FP_FT_SKIN_CHOP and _facet_tex != null and CubeSphere.FACETED and _chart == null:
+		var _cu: Array = FacetAtlas.edit_key_unpack(int(ek))
+		if _is_trunk_base_edit(int(_cu[0]), _cu[1]):
+			_facet_tex.invalidate_far_skin(int(_cu[0]))
 	if paint:
 		_paint_cell(cell, packed)
 
@@ -2120,6 +2130,12 @@ func sim_revert_cell(cell: Vector3i) -> void:
 		# removed so the tracker debounces a bounded recluster (a removal can split a component). FACETED ⇒ ek is int.
 		if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 			_structure_tracker.note_removed(int(ek))
+		# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): the ONLY `_edits` erase — an erased trunk-base
+		# edit UN-chops the tree; re-bake the facet's far skin so the tree returns (symmetric with _write_cell above).
+		if CubeSphere.FP_FT_SKIN_CHOP and _facet_tex != null and CubeSphere.FACETED and _chart == null:
+			var _cu: Array = FacetAtlas.edit_key_unpack(int(ek))
+			if _is_trunk_base_edit(int(_cu[0]), _cu[1]):
+				_facet_tex.invalidate_far_skin(int(_cu[0]))
 		_paint_cell(cell, cell_value_at(cell))
 
 ## ONE debounced ground rebuild for the snowfall sim, run at a step's end iff a write happened (§4.3.5).
@@ -3674,6 +3690,70 @@ func far_tree_chopped(fid: int, cell: Vector3i) -> bool:
 	if _edits.is_empty() or _chart != null or not CubeSphere.FACETED:
 		return false
 	return _edits.has(FacetAtlas.edit_key(fid, cell))
+
+# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.2 (FP_FT_SKIN_CHOP, task #137): the rung-3 far-skin chop snapshot.
+var _skin_chop_memo: Dictionary = {}   # fid -> {rev:int, snap:Dictionary(Vector2i(lx,lz) -> post-chop top block id)}
+
+## FP_FT_SKIN_CHOP: the far-skin edit snapshot for facet `fid` — {Vector2i(lx,lz) -> post-chop TOP BLOCK id} covering
+## every column whose procedural tree is CHOPPED (trunk-base cell (bx, gy+1, bz) edited — EXACTLY far_tree_chopped's
+## predicate above, so rung 3 flips with rungs 1/2 on the same edit). The bake's EDIT branch runs AHEAD of its TREE
+## branch (all three _pbm_compute paths + C++ bake_far_tile, patch 0011), so these columns bake the bare-terrain
+## index instead of the phantom canopy. Footprint = the tree's own G×G grid cell where TreeGen.top_decoration is
+## non-air (a column only ever carries its OWN grid cell's tree — tree_block_at homes on the column's cell — so the
+## footprint is exact and needs no canopy-radius or tile-boundary math). Value = TerrainConfig.top_block_id(...), the
+## IDENTICAL call the bare-terrain bake branch classifies, so a chopped column bakes bit-equal to a treeless one.
+## Memoized per (fid, edit_count()); {} when the flag is off / overlay empty / nothing chopped. Main-thread only —
+## the baker freezes the result into per-slot arrays at bake dispatch (never live-read off-thread). `force` is the
+## gate-forcing convention (verify_ft_skin_chop exercises the mechanism without a compile-time sed); every real
+## caller passes no override ⇒ the compile const governs (byte-identical off).
+func far_skin_edit_snap(fid: int, force := CubeSphere.FP_FT_SKIN_CHOP) -> Dictionary:
+	if not force or _edits.is_empty() or _chart != null or not CubeSphere.FACETED:
+		return {}
+	var rev := edit_count()
+	var memo: Dictionary = _skin_chop_memo.get(fid, {})
+	if not memo.is_empty() and int(memo["rev"]) == rev:
+		return memo["snap"]
+	var snap := {}
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var seen := {}                                          # grid cell (gx,gz) -> true (dedupe per tree)
+	# The R5 per-fid index gives this facet's edits in O(its edits); with the index flag off, fall back to a
+	# full-overlay scan filtered by edit_key_fid (gates run flag-off; chop counts are tiny either way).
+	var keys: Array = edits_for_fid(fid).keys() if CubeSphere.FP_EDIT_FID_INDEX else _edits.keys()
+	for ek in keys:
+		if not CubeSphere.FP_EDIT_FID_INDEX and FacetAtlas.edit_key_fid(int(ek)) != fid:
+			continue
+		var cell: Vector3i = FacetAtlas.edit_key_unpack(int(ek))[1]
+		var gx := floori(float(cell.x) / float(TreeGen.G))
+		var gz := floori(float(cell.z) / float(TreeGen.G))
+		var gk := Vector2i(gx, gz)
+		if seen.has(gk):
+			continue
+		seen[gk] = true
+		var info := TreeGen.tree_info(gx, gz, ctx)
+		if info.is_empty():
+			continue
+		var base: Vector3i = info["base"]
+		if not _edits.has(FacetAtlas.edit_key(fid, Vector3i(base.x, base.y + 1, base.z))):
+			continue                                        # tree present but not chopped
+		for lx in range(gx * TreeGen.G, (gx + 1) * TreeGen.G):
+			for lz in range(gz * TreeGen.G, (gz + 1) * TreeGen.G):
+				if TreeGen.top_decoration(lx, lz, ctx) != BlockCatalog.AIR:
+					var prof: Vector4 = TerrainConfig.facet_profile(fid, lx, lz)
+					snap[Vector2i(lx, lz)] = TerrainConfig.top_block_id(int(prof.x), int(prof.y), prof.w, lx, lz)
+	_skin_chop_memo[fid] = {"rev": rev, "snap": snap}
+	return snap
+
+## FP_FT_SKIN_CHOP: is `cell` (facet `fid` lattice) the trunk-base cell of its column's procedural tree? The O(1)
+## chop-toggle detect the write/erase choke points use to invalidate the facet's baked far-skin tiles — building a
+## house never fires it. Same cell law as far_tree_chopped's consumers: base + (0, 1, 0).
+func _is_trunk_base_edit(fid: int, cell: Vector3i) -> bool:
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var info := TreeGen.tree_info(
+		floori(float(cell.x) / float(TreeGen.G)), floori(float(cell.z) / float(TreeGen.G)), ctx)
+	if info.is_empty():
+		return false
+	var base: Vector3i = info["base"]
+	return cell == Vector3i(base.x, base.y + 1, base.z)
 
 ## docs/COSMOS-FARTREE-ALIGN-DESIGN.md (§5, FP_FAR_TREES_NEARCULL): the shared near-mesh-presence predicate bound to
 ## the module world — is facet `fid`'s NEAR voxel field actually meshed over the fid-lattice `box`? Tri-state

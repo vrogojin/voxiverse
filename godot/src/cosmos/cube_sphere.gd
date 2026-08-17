@@ -720,6 +720,17 @@ const FP_FT_SKIN_CHOP := false
 ## beacon floor); debris dither-fades below 0.5px. P0 is the LAW ONLY — no renderer touch, so OFF is byte-
 ## identical (nothing reads it yet). The renderer tiers land behind FP_OBJ_LOD_DEBRIS/_MESH/_SPACE (P1..P3).
 const FP_OBJ_LOD := false
+
+## FP_OBJ_LOD_DEBRIS (docs/COSMOS-OBJECT-LOD-DESIGN.md P1): the FIRST renderer tier consuming the P0 law
+## (object_lod.gd). Registers live VoxelBody debris in an ObjectRegistry, and a FacetFarObjects tier draws each
+## far object as either a camera-facing CARD or a beacon DOT (two MultiMeshes childed to the FacetFarRing so they
+## inherit its frame/scale — the #131 frame-weld). The full VoxelBody mesh (L0) is HIDDEN by the tier while a far
+## rep is shown, and RE-APPLIED after any _rebuild() (which recreates the mesh visible — must-fix #1) via the
+## `_obj_rev` counter. Budget-bounded (ObjectLod.budget_bytes / caps, priority = proj px). MESH-rung objects fall
+## back to CARD here (the StructDecimator mesh rung is P2 FP_OBJ_LOD_MESH); CLASS_SPACE beacons + planet occlusion
+## are P3 FP_OBJ_LOD_SPACE. OFF ⇒ no registry, no tier, the VoxelBody hook is inert (never registered, rev never
+## bumped, mesh never hidden) ⇒ BYTE-IDENTICAL (nothing constructs or reads any of it).
+const FP_OBJ_LOD_DEBRIS := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

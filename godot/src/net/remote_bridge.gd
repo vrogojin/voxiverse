@@ -86,7 +86,10 @@ const OP_WHITELIST := ["move", "turn", "look", "wait", "jump", "screenshot", "se
 	"teleport", "set_alt", "freeze_time", "freeze_player",
 	# COSMOS-AGENT-CONTROL §5 (FP_AGENT_QUERY) — structured world reads. Behind CONTROL_ENABLED + FP_AGENT_QUERY
 	# like every op; _validate_cmd flag-gates + re-caps them (mirror of relay.mjs) before the executor dispatches.
-	"query_box", "query_ray"]
+	"query_box", "query_ray",
+	# COSMOS-AGENT-AUTONOMY — actuation ops. Behind CONTROL_ENABLED + the FP_AGENT_ACT/NAV/SKILL flags;
+	# _validate_cmd flag-gates + shape-caps them (mirror of relay.mjs) before the executor dispatches.
+	"break_cell", "place_cell", "aim_cell", "goto", "chop_tree"]
 const MAX_HOLD_S := 120.0                    # SPACE-FLY: hard cap on a single thrust/roll HELD-input step (watchdog outer bound)
 
 const TELEMETRY_INTERVAL := 0.25    # s — one telemetry JSON per window (matches perf_hud WINDOW)
@@ -1324,7 +1327,41 @@ func _validate_cmd(m: Dictionary) -> String:
 			var qerr := _validate_query_step(st as Dictionary, op)
 			if qerr != "":
 				return qerr
+		# AGENT-AUTONOMY — rover flag + shape re-cap (NEVER trust the relay). Off => caps => wire-identical.
+		if op == "break_cell" or op == "place_cell" or op == "aim_cell":
+			if not CubeSphere.FP_AGENT_ACT:
+				return "caps"
+			if not _is_vec3_int((st as Dictionary).get("cell", null)):
+				return "caps"
+			if op == "place_cell":
+				var b = (st as Dictionary).get("block", 0)
+				if not (b is float or b is int or b is String):
+					return "caps"
+		if op == "goto":
+			if not CubeSphere.FP_AGENT_NAV:
+				return "caps"
+			if not _is_vec3_int((st as Dictionary).get("cell", null)):
+				return "caps"
+			var gg = str((st as Dictionary).get("goal", "stand"))
+			if gg != "stand" and gg != "adjacent":
+				return "caps"
+		if op == "chop_tree":
+			if not CubeSphere.FP_AGENT_SKILL:
+				return "caps"
+			var mr = (st as Dictionary).get("max_range", 48)
+			if not (mr is float or mr is int) or int(mr) < 8 or int(mr) > CubeSphere.NAV_RANGE_MAX:
+				return "caps"
 	return ""
+
+
+## A [x,y,z] array of finite INTEGERS (absolute lattice cell — the autonomy ops' frame).
+func _is_vec3_int(v) -> bool:
+	if not (v is Array) or (v as Array).size() != 3:
+		return false
+	for n in (v as Array):
+		if not (n is float or n is int) or not is_finite(float(n)) or float(n) != floor(float(n)):
+			return false
+	return true
 
 
 ## COSMOS-AGENT-CONTROL section 5.3 — mirror of relay.mjs validateStep for query_box/query_ray. NEVER-OOM

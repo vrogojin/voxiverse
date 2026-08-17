@@ -46,7 +46,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 // COSMOS-AGENT-CONTROL §5.2 — the query NEVER-OOM caps + validator live in a pure, ws-free module so the
 // caps matrix is unit-testable (validate_step.test.mjs) and the rover (remote_bridge.gd) mirrors ONE source.
-import { validateQueryStep, QUERY_HALF_MAX, QUERY_CELLS_MAX, QUERY_RAY_MAX } from './validate.mjs';
+import { validateQueryStep, QUERY_HALF_MAX, QUERY_CELLS_MAX, QUERY_RAY_MAX, validateActStep } from './validate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -114,7 +114,10 @@ const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screensho
   // COSMOS-AGENT-CONTROL §5 (FP_AGENT_QUERY) — structured world reads: a box of block ids over the
   // neighbourhood, and a DDA raycast (default = the aim ray). Consent- + control-token gated like every
   // op; the relay only ROUTES + bounds-checks (never-OOM caps below), the rover re-validates + executes.
-  'query_box', 'query_ray']);
+  'query_box', 'query_ray',
+  // COSMOS-AGENT-AUTONOMY — actuation ops. Consent- + FP_AGENT_ACT/NAV/SKILL gated like every op; the relay
+  // routes + shape-caps (validateActStep), the rover re-caps + flag-gates + executes behind the grant.
+  'break_cell', 'place_cell', 'aim_cell', 'goto', 'chop_tree']);
 const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
 const TELEPORT_ALT_MIN = -64;        // DEV: min altitude (blocks above the local surface) — allow a small underground peek
 const TELEPORT_ALT_MAX = 200000;     // DEV: max altitude (blocks) — deep space, but finite
@@ -273,8 +276,9 @@ function okEst(est) { return { ok: true, est }; }
 // that could be interpreted elsewhere (the relay only routes; the rover re-validates against reach).
 function validTarget(t) {
   if (typeof t === 'string') return t === 'aim' || t === 'look';
-  if (Array.isArray(t)) return t.length === 3 && t.every((n) => typeof n === 'number' && isFinite(n));
-  return typeof t === 'object' && t !== null;
+  // AGENT-AUTONOMY: [x,y,z] arrays are NO LONGER accepted here — they never broke by cell (silent aim-downgrade);
+  // absolute-cell mutation is break_cell/place_cell. The {dx,dy,dz} offset object stays valid.
+  return typeof t === 'object' && t !== null && !Array.isArray(t);
 }
 
 function validateStep(st) {
@@ -368,11 +372,15 @@ function validateStep(st) {
       return okEst(0.2);
     }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
+      // AGENT-AUTONOMY hardening: a [x,y,z] array target NEVER broke by cell (the executor silently downgraded
+      // it to "aim") — reject it loudly instead of validating a command with different semantics than sent.
+      if (Array.isArray(st.target)) return rej('caps', 'array target never breaks by cell — use break_cell');
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');
       return okEst(0.5);
     }
     case 'place': {
       if (st.block === undefined || (typeof st.block !== 'number' && typeof st.block !== 'string')) return rej('caps', 'place.block required');
+      if (Array.isArray(st.target)) return rej('caps', 'array target never places by cell — use place_cell');
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'place.target invalid');
       return okEst(0.5);
     }
@@ -387,6 +395,15 @@ function validateStep(st) {
     case 'query_ray': {
       const q = validateQueryStep(st);              // shared caps (validate.mjs), mirrored on the rover
       return q.ok ? okEst(q.est) : rej('caps', q.detail);
+    }
+    // COSMOS-AGENT-AUTONOMY — actuation ops. Shared shape-caps (validate.mjs); the rover flag-gates + re-caps.
+    case 'break_cell':
+    case 'place_cell':
+    case 'aim_cell':
+    case 'goto':
+    case 'chop_tree': {
+      const a = validateActStep(st);
+      return a.ok ? okEst(a.est) : rej('caps', a.detail);
     }
     default: return rej('caps', `unhandled op '${st.op}'`); // unreachable — whitelist checked in validateCmd
   }

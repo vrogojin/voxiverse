@@ -4437,6 +4437,14 @@ func surface_y(x: float, z: float, pos_fid: int = -1) -> float:
 	var zi := int(floor(z))
 	return float(effective_height(xi, zi) + 1) + _datum_lift(xi, zi)
 
+## COSMOS-AGENT-AUTONOMY — PLAY→CELL Y for a column. The player's pose (`player.position`) lives in PLAY space,
+## where `play y = cell y + s` and `s` is this column's continuous datum lift; `block_id_at`/`cell_solid` (and the
+## whole agent nav/query layer built on them) live in CELL space. X/Z carry NO lift on the facet plane, so only Y
+## is remapped. Called ONLY from the CONTROL_ENABLED + FP_AGENT_* gated executor (RemoteControl) ⇒ no normal-play
+## path reaches it and `s ≡ 0.0` with FP_DATUM_BAKE off ⇒ this is the identity (byte-identical) in the FLAT gate.
+func play_y_to_cell_y(x: float, z: float, play_y: float) -> float:
+	return play_y - _datum_lift(int(floor(x)), int(floor(z)))
+
 ## The y the player should stand at in column (x, z) given their current feet
 ## height. Plain, NO-CLIMB floor: scan DOWN from the feet for the first solid block
 ## that has AIR directly above it (the actual standable surface) and stand on its

@@ -704,6 +704,14 @@ const FP_CPP_FINE_BAKE := false
 ## in parallel. Byte-equal by integer-LUT construction. Requires the engine rebuild (patch 0011) + FP_CPP_FINE_BAKE's
 ## sampler. Off ⇒ GDScript path; if the engine lacks bake_far_tile the dispatch falls through to GDScript. Bake ON at export.
 const FP_CPP_TILE_BAKE := false
+## FP_FT_SKIN_CHOP (docs/COSMOS-FARTREE-CHOP-DESIGN.md, task #137): a chopped NEAR tree (trunk-base cell edited — the
+## SAME predicate as the rung-1/2 card/mesh `_is_chopped` filter) is recolored OUT of the rung-3 far-skin maps (the
+## FP_SKIN_FLATCOLOR band + FP_PLANET_MAP fine L8 index maps). WorldManager snapshots each chopped tree's canopy-
+## footprint columns → their bare-terrain top_block_id; the bake's EDIT branch (which runs AHEAD of the TREE branch in
+## all three _pbm_compute paths AND in C++ bake_far_tile — the patch-0011 edit_cells override, previously dead-wired)
+## overrides those columns; and the chop invalidates the facet's baked band/fine tiles so they re-bake. GDScript-only
+## (no engine change). Off ⇒ empty snapshots + no invalidation ⇒ byte-identical bakes.
+const FP_FT_SKIN_CHOP := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

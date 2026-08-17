@@ -119,13 +119,14 @@ func on_goto_done(status: String) -> Dictionary:
 	_aim_retry = 0
 	return {"act": "aim", "cell": _chop_start}
 
-## AIM done → CHOP (or re-aim one cell higher if occluded).
+## AIM done → CHOP. AIM is COSMETIC: remote_break_cell is REACH-gated, NOT line-of-sight (player.gd:2440), so an
+## occluded camera must NEVER abort the chop — a trunk base is routinely self-occluded by the logs above it from an
+## adjacent ground stance (the live `occluded`-every-time bug). Nudge the aim up the trunk (toward eye height, more
+## likely visible) up to twice for the look, then enter CHOP regardless; per-cell reach is enforced in on_chop_poll.
 func on_aim_done(status: String, _hit: Array, _in_range: bool) -> Dictionary:
-	if status != "ok":
-		if _aim_retry < 1:
-			_aim_retry += 1
-			return {"act": "aim", "cell": _chop_start + Vector3i(0, 1, 0)}   # base can be shadowed; try higher
-		return terminal("blocked", {"why": "occluded", "tree": [_tree_base.x, _tree_base.y, _tree_base.z]})
+	if status != "ok" and _aim_retry < 2:
+		_aim_retry += 1
+		return {"act": "aim", "cell": _chop_start + Vector3i(0, _aim_retry, 0)}
 	_phase = "chop"
 	_chop_cur = _chop_start
 	return {"act": "continue"}

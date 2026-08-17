@@ -50,11 +50,14 @@ func _test_fsm() -> void:
 	# GOTO ok → AIM
 	var d := s.on_goto_done("ok")
 	_ok(str(d.get("act", "")) == "aim" and s.phase() == "aim", "goto ok → aim phase")
-	# AIM occluded → re-aim higher, then occluded again → terminal
+	# AIM occluded → re-aim higher twice (toward eye height), then PROCEED to chop — AIM is cosmetic because
+	# remote_break_cell is reach-gated, not line-of-sight; an occluded camera must never abort the chop.
 	var d2 := s.on_aim_done("occluded", [], false)
 	_ok(str(d2.get("act", "")) == "aim" and (d2["cell"] as Vector3i).y == s._chop_start.y + 1, "aim occluded → re-aim one cell higher")
+	var d2b := s.on_aim_done("occluded", [], false)
+	_ok(str(d2b.get("act", "")) == "aim" and (d2b["cell"] as Vector3i).y == s._chop_start.y + 2, "aim occluded again → re-aim two cells higher")
 	var d3 := s.on_aim_done("occluded", [], false)
-	_ok(str(d3.get("act", "")) == "done" and str(d3.get("status", "")) == "blocked", "aim occluded twice → terminal blocked (occluded)")
+	_ok(str(d3.get("act", "")) == "continue" and s.phase() == "chop", "aim occluded thrice → proceed to chop (reach-gated, not LOS)")
 	# AIM ok → chop
 	var s2 := _mk_skill([])
 	s2.on_goto_done("ok")

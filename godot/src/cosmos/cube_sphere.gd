@@ -712,6 +712,14 @@ const FP_CPP_TILE_BAKE := false
 ## overrides those columns; and the chop invalidates the facet's baked band/fine tiles so they re-bake. GDScript-only
 ## (no engine change). Off ⇒ empty snapshots + no invalidation ⇒ byte-identical bakes.
 const FP_FT_SKIN_CHOP := false
+
+## FP_OBJ_LOD (docs/COSMOS-OBJECT-LOD-DESIGN.md): the physical-object far-render + LOD ladder. Discrete objects
+## (VoxelBody debris; ships/stations/asteroids later) get a size-derived ladder — full mesh → StructDecimator
+## mesh (pitch 2^k) → camera-facing cards → beacon dot — selected by the generalised BodyLod angular law
+## (cosmos/object_lod.gd, pure/gate-certified in verify_object_lod.gd). Space objects never hard-cull (2px
+## beacon floor); debris dither-fades below 0.5px. P0 is the LAW ONLY — no renderer touch, so OFF is byte-
+## identical (nothing reads it yet). The renderer tiers land behind FP_OBJ_LOD_DEBRIS/_MESH/_SPACE (P1..P3).
+const FP_OBJ_LOD := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

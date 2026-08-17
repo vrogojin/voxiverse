@@ -2420,6 +2420,66 @@ func remote_place(block_id: int, target) -> bool:
 	return false
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
+# COSMOS-AGENT-AUTONOMY (docs/COSMOS-AGENT-AUTONOMY-DESIGN.md) — the ABSOLUTE-LATTICE-CELL actuators the
+# autonomy ops drive. `remote_break`/`remote_place` above take a player-RELATIVE {dx,dy,dz} offset (or
+# "aim"); an agent holding a P2 query result has ABSOLUTE lattice cells, and the offset mode never was
+# reach-aware-by-absolute-cell. These take the absolute cell directly (zero agent-side frame math) and
+# route through the SAME break_terrain/place_block pipeline + inventory. Reachable only under the
+# CONTROL_ENABLED-gated executor with FP_AGENT_ACT ⇒ byte-identical in normal play.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+## §4 (FP_AGENT_ACT): break the ABSOLUTE lattice cell — reach-aware, via the SAME break_terrain pipeline
+## (rules + snow-first + collapse) + inventory credit. Returns {"why", "block_id", "dist"}: ok / out_of_reach
+## / air (already empty — chop-loop terminator) / protected (corner-lock / rules refusal).
+## AGENT-AUTONOMY: the live WorldManager, resolved from the player's own scope (the executor's Node3D-typed
+## `player.get("world")` proved unreliable). Pure accessor.
+func remote_world() -> WorldManager:
+	return world
+
+func remote_break_cell(cell: Vector3i) -> Dictionary:
+	var dist := head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
+	if dist > break_reach:
+		return {"why": "out_of_reach", "block_id": 0, "dist": snappedf(dist, 0.01)}
+	if not world.cell_solid(cell):
+		return {"why": "air", "block_id": 0, "dist": snappedf(dist, 0.01)}
+	var oid := world.break_terrain(cell, global_position)
+	if oid <= 0:
+		return {"why": "protected", "block_id": 0, "dist": snappedf(dist, 0.01)}
+	if inventory != null:
+		inventory.add(oid, 1)
+	return {"why": "ok", "block_id": oid, "dist": snappedf(dist, 0.01)}
+
+## §4 (FP_AGENT_ACT): place `block_id` (>0) at the ABSOLUTE lattice cell — reach = `reach`; same overlap
+## guard + place_block + selected-slot consume as remote_place's Vector3i branch. Returns {"why"}:
+## ok / out_of_reach / occupied (player-overlap or place refused).
+func remote_place_cell(cell: Vector3i, block_id: int) -> Dictionary:
+	if inventory == null or block_id <= 0:
+		return {"why": "occupied"}
+	var dist := head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
+	if dist > reach:
+		return {"why": "out_of_reach", "dist": snappedf(dist, 0.01)}
+	if _cell_intersects_player(cell):
+		return {"why": "occupied"}
+	if world.place_block(cell, block_id):
+		if inventory.selected_block_id() == block_id:
+			inventory.consume_selected(1)
+		return {"why": "ok"}
+	return {"why": "occupied"}
+
+## §5 (FP_AGENT_ACT): the absolute (yaw, pitch) that centres `cell` in the crosshair. Pure LATTICE:
+## position / rotation.y / _pitch are lattice-frame (the player rides the ActiveFrame) and the camera eye is
+## position + eye_height. Godot conventions: fwd = -Z; yaw about +Y maps -Z → (-sin ψ, 0, -cos ψ) ⇒
+## ψ = atan2(-d.x, -d.z); +_pitch looks UP (camera.rotation.x = _pitch) ⇒ θ = atan2(d.y, |d_h|). Returns
+## {"yaw", "pitch", "dist"} (radians).
+func remote_aim_solution(cell: Vector3i) -> Dictionary:
+	var eye := position + Vector3(0.0, eye_height, 0.0)
+	var d := Vector3(cell) + Vector3(0.5, 0.5, 0.5) - eye
+	var h := Vector2(d.x, d.z).length()
+	return {"yaw": atan2(-d.x, -d.z),
+		"pitch": clampf(atan2(d.y, h), deg_to_rad(-85.0), deg_to_rad(85.0)),
+		"dist": d.length()}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
 # COSMOS SPACE-FLY DEV/TEST ACTUATORS (docs/COSMOS-SPACEFLY-DESIGN.md). The scriptable-flight surface the
 # RemoteControl executor drives so the ORCHESTRATOR can fly test missions headlessly. Each ROUTES THROUGH
 # THE SAME gated space-nav path a human's F/O/G/R/Q/E keystrokes take (`_toggle_dev_nav`, `_dev_toggle_key`,

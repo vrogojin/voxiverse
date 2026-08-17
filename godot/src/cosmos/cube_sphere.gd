@@ -3988,6 +3988,28 @@ const QUERY_CELLS_MAX := 32768      # Π(2h+1) cap; u8 ids ⇒ ≤ 32 KiB payloa
 const QUERY_RAY_MAX := 64.0         # raycast max distance (blocks) — MIRRORS relay.mjs QUERY_RAY_MAX
 const QUERY_CELLS_PER_FRAME := 4096 # time-slice budget: cells filled per frame (NEVER a frame hitch, §5.4)
 
+## COSMOS-AGENT-AUTONOMY (docs/COSMOS-AGENT-AUTONOMY-DESIGN.md) — the actuation layer that turns
+## "find tree → goto → aim → chop" into reliable ops. All params/results are ABSOLUTE LATTICE cells
+## (the frame query_box/query_ray already answer in). Each op ALSO behind CONTROL_ENABLED + grant; off ⇒
+## nack `caps` ⇒ wire-identical to today. Staged A1(ACT)→A2(ACT)→A3(NAV)→A4(SKILL).
+## A1/A2 FP_AGENT_ACT: break_cell/place_cell (reach-aware absolute-cell mutate — the {dx,dy,dz} offset
+## mode never did this) + aim_cell (pure-lattice yaw/pitch, DDA-verified).
+const FP_AGENT_ACT := false
+## A3 FP_AGENT_NAV: goto — bounded time-sliced A* (agent_nav.gd) over the ONE cell query, jump-aware
+## follower (the ledge-stall fix). NEVER-OOM by the caps below.
+const FP_AGENT_NAV := false
+const NAV_RANGE_MAX := 64           # Chebyshev blocks start→goal (rover-checked)
+const NAV_NODE_CAP := 4096          # A* expansions ⇒ ≪ 1 MB state, freed on step end
+const NAV_EXPAND_PER_FRAME := 256   # planning slice budget (~1-2 ms/frame web)
+const NAV_PATH_MAX := 128           # waypoints
+const NAV_REPLANS := 3              # follower stall replans per goto
+const NAV_DROP_MAX := 3             # max step-down per move (no fall damage; Baritone default)
+## A4 FP_AGENT_SKILL: chop_tree — server-side FIND→GOTO→AIM→CHOP phase machine (agent_skills.gd), one call.
+const FP_AGENT_SKILL := false
+const CHOP_MAX := 12                # breaks per chop_tree (> max trunk 11)
+const SKILL_WATCHDOG_S := 120.0     # outer skill bound
+const SKILL_RETRY_MAX := 1          # per-skill re-pick/retry
+
 ## COSMOS DE-ORBIT PHYS FIX — the analytic main-thread generated_cell recomputes the column PROFILE (f64 dir math
 ## + 3-D noise, ~0.2 ms/WASM) with NO cache, so a vertical floor scan (floor_under's ~400 cells/frame once the
 ## de-orbit fall drops below ATMO_TOP and switches to the surface-feel path) pays that profile ~400× for the SAME

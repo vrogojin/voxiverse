@@ -37,3 +37,40 @@ export function validateQueryStep(st) {
   }
   return { ok: false, detail: `not a query op '${st.op}'` };
 }
+
+// ── COSMOS-AGENT-AUTONOMY — actuation op validators (shared relay ⇄ rover-mirrored) ─────────────────
+export const NAV_RANGE_MAX = 64;       // Chebyshev blocks start→goal (rover also re-checks against live pos)
+
+// A [x,y,z] array of finite INTEGERS — an absolute lattice cell.
+export function vec3int(v) {
+  return Array.isArray(v) && v.length === 3
+    && v.every((n) => typeof n === 'number' && isFinite(n) && Number.isInteger(n));
+}
+
+// Validate a break_cell / place_cell / aim_cell / goto / chop_tree step. {ok:true, est} | {ok:false, detail}.
+export function validateActStep(st) {
+  switch (st.op) {
+    case 'break_cell':
+    case 'aim_cell':
+      if (!vec3int(st.cell)) return { ok: false, detail: `${st.op}.cell must be an integer [x,y,z]` };
+      return { ok: true, est: st.op === 'aim_cell' ? 1.0 : 0.5 };
+    case 'place_cell':
+      if (!vec3int(st.cell)) return { ok: false, detail: 'place_cell.cell must be an integer [x,y,z]' };
+      if (st.block !== undefined && typeof st.block !== 'number' && typeof st.block !== 'string')
+        return { ok: false, detail: 'place_cell.block must be a number or name' };
+      return { ok: true, est: 0.5 };
+    case 'goto': {
+      if (!vec3int(st.cell)) return { ok: false, detail: 'goto.cell must be an integer [x,y,z]' };
+      const g = st.goal ?? 'stand';
+      if (g !== 'stand' && g !== 'adjacent') return { ok: false, detail: `bad goto.goal '${g}'` };
+      return { ok: true, est: NAV_RANGE_MAX / 5.5 * 3 };   // ≈35 s conservative (range/walk×3)
+    }
+    case 'chop_tree': {
+      const mr = st.max_range ?? 48;
+      if (typeof mr !== 'number' || !Number.isInteger(mr) || mr < 8 || mr > NAV_RANGE_MAX)
+        return { ok: false, detail: `chop_tree.max_range must be an int in [8,${NAV_RANGE_MAX}]` };
+      return { ok: true, est: 60 };                        // bounded by SKILL_WATCHDOG_S
+    }
+  }
+  return { ok: false, detail: `not an autonomy op '${st.op}'` };
+}

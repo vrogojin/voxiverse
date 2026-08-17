@@ -108,6 +108,34 @@ var _pitch_target := 0.0                     # absolute radians
 # ── §4.6 jump state ─────────────────────────────────────────────────────────────────────────────────
 var _jump_deadline := 0
 
+# ── AGENT-AUTONOMY A2 aim_cell (reuses the turn/look easing; on completion verifies with the aim DDA) ──
+var _aim_mode := false                        # _tick_turn_look branches to _finish_aim when set
+var _aim_cell := Vector3i.ZERO
+var _aim_verify := true
+var _aim_owner := ""                           # "" = standalone aim_cell op; "skill" = chop_tree phase
+var _aim_done := false                          # skill-mode latch
+var _aim_status := ""                           # skill-mode: ok | occluded | out_of_reach | no_hit
+var _aim_hit: Array = []
+var _aim_in_range := false
+# ── AGENT-AUTONOMY A3 goto: bounded A* (agent_nav) + jump-aware follower ──────────────────────────────
+var _nav: RefCounted = null                   # AgentNav instance (planner); null between goto steps
+var _nav_state: Dictionary = {}               # A* slice carry (open/closed/g/parent + result)
+var _nav_planning := false                    # true while slicing the plan (polled in _process)
+var _nav_path: Array = []                     # Array[Vector3i] waypoints (feet cells)
+var _nav_wp := 0                              # current waypoint index
+var _nav_goal := Vector3i.ZERO                # target cell
+var _nav_mode := "stand"                      # stand | adjacent
+var _nav_replans := 0
+var _nav_deadline := 0
+var _nav_owner := ""                          # "" = standalone goto op; "skill" = driven by chop_tree
+var _nav_done := false                        # skill-mode latch
+var _nav_status := ""                         # skill-mode result: ok | blocked | no_path | reframed | mode
+var _nav_stall_ref := Vector3.ZERO
+var _nav_stall_ms := 0
+# ── AGENT-AUTONOMY A4 chop_tree: server-side phase machine (agent_skills) ─────────────────────────────
+var _skill: RefCounted = null                 # AgentSkills instance; null unless a chop_tree runs
+var _skill_deadline := 0
+
 # Override arming: the consent CLICK that granted us may still be "pressed" for a frame — don't
 # self-trigger. Arm only after one fully-idle frame; then any local input takes over.
 var _override_armed := false
@@ -186,6 +214,13 @@ func _process(_delta: float) -> void:
 				_finish_step("ok" if _query_ok else "timeout")
 			elif Time.get_ticks_msec() >= _query_deadline:
 				_finish_step("timeout")
+		"aim_cell":
+			pass                                       # AGENT-AUTONOMY A2: easing + verify run in physics_tick
+		"goto":
+			if _nav_planning:                          # AGENT-AUTONOMY A3: advance the time-sliced A* plan
+				_tick_nav_plan()
+		"chop_tree":
+			_skill_process()                           # AGENT-AUTONOMY A4: drive the phase machine
 		# move / turn / look / jump advance from physics_tick (below); stop / reload / set_fly / break /
 		# place / select_slot / dev_nav / nav resolve synchronously in _start_step; nothing else to poll here.
 
@@ -202,8 +237,12 @@ func physics_tick(delta: float, tick_move_delta: Vector3, reframe_yaw: float) ->
 	match str(_cur.get("op", "")):
 		"move":
 			_tick_move(delta, tick_move_delta, reframe_yaw)
-		"turn", "look":
-			_tick_turn_look(delta)
+		"turn", "look", "aim_cell":
+			_tick_turn_look(delta)                     # AGENT-AUTONOMY A2: aim_cell reuses the easing (→ _finish_aim)
+		"goto":
+			_tick_nav_follow(delta)                    # AGENT-AUTONOMY A3: waypoint follower + auto-jump
+		"chop_tree":
+			_skill_physics(delta)                      # AGENT-AUTONOMY A4: drive the active phase's motion
 		"jump":
 			# The one-shot latch clears the first grounded tick (lift-off) — done when the player consumed it.
 			if not bool(_player_get("remote_jump", false)):
@@ -329,9 +368,18 @@ func _tick_turn_look(delta: float) -> void:
 			if is_instance_valid(player) and player.has_method("remote_set_pitch"):
 				player.call("remote_set_pitch", cur + pstep)
 	if done:
+		if _aim_mode:                                  # AGENT-AUTONOMY A2: verify + finish/latch instead of plain ok
+			_finish_aim()
+			return
 		_finish_step("ok", {"turned_deg": snappedf(rad_to_deg(absf(_turn_total - _turn_remaining)), 0.1)})
 		return
 	if Time.get_ticks_msec() >= _turn_deadline:
+		if _aim_mode:
+			_aim_mode = false
+			if _aim_owner == "skill":
+				_aim_done = true; _aim_status = "no_hit"; return
+			_finish_step("blocked", {"why": "timeout"})
+			return
 		_finish_step("timeout", {"turned_deg": snappedf(rad_to_deg(absf(_turn_total - _turn_remaining)), 0.1)})
 
 
@@ -432,6 +480,260 @@ func _block_arg(b: Variant) -> int:
 	return 0
 
 
+## AGENT-AUTONOMY §3: resolve a `cell` param — an ABSOLUTE [x,y,z] lattice cell (the frame query_* answers in).
+func _cell_arg(c: Variant) -> Vector3i:
+	if c is Array and (c as Array).size() == 3:
+		return Vector3i(int(c[0]), int(c[1]), int(c[2]))
+	return Vector3i.ZERO
+
+
+# ── AGENT-AUTONOMY A2: aim_cell — solve absolute yaw/pitch, ease via the turn/look machinery, DDA-verify ──
+func _start_aim() -> void:
+	if not (is_instance_valid(player) and player.has_method("remote_aim_solution")):
+		_finish_step("bad_op"); return
+	if bool(_player_get("flying", false)) and _in_space_regime():
+		_finish_step("blocked", {"why": "space"}); return
+	_aim_cell = _cell_arg(_cur.get("cell", [0, 0, 0]))
+	_aim_verify = bool(_cur.get("verify", true))
+	_aim_owner = ""
+	_aim_done = false
+	var sol: Dictionary = player.call("remote_aim_solution", _aim_cell)
+	_turn_total = 0.0
+	_turn_remaining = wrapf(float(sol["yaw"]) - player.rotation.y, -PI, PI)
+	_pitch_active = true
+	_pitch_target = float(sol["pitch"])
+	_aim_mode = true
+	_turn_deadline = Time.get_ticks_msec() + int(LOOK_WATCHDOG_S * 1000.0)
+	if _turn_remaining != 0.0:
+		player.set("remote_yaw_rate", signf(_turn_remaining) * deg_to_rad(TURN_RATE_DEG))
+
+## The camera is emancipated from rotation.y/_pitch in SPACE attitude regimes — aim_cell is surface-scope.
+func _in_space_regime() -> bool:
+	if not is_instance_valid(player):
+		return false
+	var m := str(_player_get("nav_mode", "planetary"))
+	return m != "planetary" and m != "—"
+
+## Called by _tick_turn_look on easing completion when _aim_mode: verify the crosshair with the real aim DDA,
+## then either _finish_step (standalone) or latch the result for the skill to poll.
+func _finish_aim() -> void:
+	_aim_mode = false
+	var why := "ok"
+	var v: Array = []
+	var in_range := false
+	if _aim_verify:
+		var info := {}
+		if is_instance_valid(player) and player.has_method("remote_query_ray"):
+			info = player.call("remote_query_ray", {})
+		if not bool(info.get("hit", false)):
+			why = "no_hit"
+		else:
+			v = info.get("voxel", [])
+			in_range = bool(info.get("in_range", false))
+			var hitc := Vector3i(int(v[0]), int(v[1]), int(v[2])) if v.size() == 3 else Vector3i.ZERO
+			if hitc != _aim_cell:
+				why = "occluded"
+			elif not in_range:
+				why = "out_of_reach"
+	if _aim_owner == "skill":
+		_aim_done = true
+		_aim_status = why
+		_aim_hit = v
+		_aim_in_range = in_range
+		return
+	if why == "ok":
+		_finish_step("ok", {"why": "ok", "hit": v, "in_range": in_range})
+	else:
+		_finish_step("blocked", {"why": why, "hit": v, "in_range": in_range})
+
+
+# ── AGENT-AUTONOMY A3: goto — bounded A* (AgentNav) + jump-aware follower ─────────────────────────────
+## owner "" = standalone goto op (completion → _finish_step); "skill" = chop_tree phase (completion → latch).
+func _start_goto(cell: Vector3i, mode: String, owner: String) -> void:
+	_nav_owner = owner
+	_nav_done = false
+	_nav_status = ""
+	if not is_instance_valid(player) or not is_instance_valid(_world_of()):
+		_nav_settle("blocked"); return
+	if bool(_player_get("flying", false)) or _in_space_regime():
+		_nav_settle("mode"); return
+	var from := Vector3i(floori(player.position.x), floori(player.position.y), floori(player.position.z))
+	if Vector3(cell - from).abs().length() > 0 and _cheb(from, cell) > CubeSphere.NAV_RANGE_MAX:
+		_nav_settle("no_path"); return
+	_nav = AgentNav.new()
+	_nav_goal = cell
+	_nav_mode = mode if mode == "adjacent" else "stand"
+	_nav_state = {}
+	_nav_planning = true
+	_nav_path = []
+	_nav_wp = 0
+	_nav_replans = 0
+	_nav_deadline = Time.get_ticks_msec() + 60000
+	_nav_stall_ms = Time.get_ticks_msec()
+
+func _world_of() -> Object:
+	# AGENT-AUTONOMY: resolve the live WorldManager. `player.get("world")` proved unreliable across the
+	# Node3D-typed reference; the player's own accessor returns its `world` from its own scope. Fallback to
+	# get() keeps the gate's mock-player path (no method) working.
+	if not is_instance_valid(player):
+		return null
+	var w: Object = null
+	if player.has_method("remote_world"):
+		w = player.call("remote_world")
+	if not is_instance_valid(w):
+		w = player.get("world")
+	return w if is_instance_valid(w) else null
+
+func _cheb(a: Vector3i, b: Vector3i) -> int:
+	return maxi(maxi(absi(a.x - b.x), absi(a.y - b.y)), absi(a.z - b.z))
+
+## Advance the A* plan by one time-slice (called from _process while planning).
+func _tick_nav_plan() -> void:
+	var from := Vector3i(floori(player.position.x), floori(player.position.y), floori(player.position.z))
+	var done: bool = _nav.plan_slice(_world_of(), from, _nav_goal, _nav_mode, _nav_state, CubeSphere.NAV_EXPAND_PER_FRAME)
+	if not done:
+		return
+	_nav_planning = false
+	var res := str(_nav_state.get("result", "no_path"))
+	if res != "ok":
+		_nav_settle("no_path"); return
+	_nav_path = _nav_state.get("path", [])
+	_nav_wp = 0
+	if _nav_path.is_empty():
+		_nav_settle("ok"); return                  # already at goal
+	_nav_stall_ref = player.position
+	_nav_stall_ms = Time.get_ticks_msec()
+
+## Follower — steer the intent seam toward the current waypoint; auto-jump the ledge; stall→replan (§6.4).
+func _tick_nav_follow(_delta: float) -> void:
+	if _nav_planning or _nav_path.is_empty():
+		return
+	var pos: Vector3 = player.position
+	var wp: Vector3i = _nav_path[_nav_wp]
+	var wc := Vector3(wp) + Vector3(0.5, 0.0, 0.5)
+	var flat := Vector2(wc.x - pos.x, wc.z - pos.z)
+	if flat.length() < 0.35 and absf(wc.y - pos.y) <= 1.2:
+		_nav_wp += 1
+		_nav_stall_ref = pos
+		_nav_stall_ms = Time.get_ticks_msec()
+		if _nav_wp >= _nav_path.size():
+			player.set("remote_drive", false); player.set("remote_input", Vector3.ZERO)
+			_nav_settle("ok"); return
+		wp = _nav_path[_nav_wp]
+		wc = Vector3(wp) + Vector3(0.5, 0.0, 0.5)
+	# body-local wish (re-read basis each tick → crossing self-correcting), no yaw change (aim owns facing).
+	var dir_lat := Vector3(wc.x - pos.x, 0.0, wc.z - pos.z)
+	var wish := player.transform.basis.inverse() * dir_lat
+	wish.y = 0.0
+	if wish.length() > 1e-5:
+		wish = wish.normalized()
+	player.set("remote_input", wish)
+	player.set("remote_run", false)
+	player.set("remote_drive", true)
+	# auto-jump: next waypoint is a step up AND grounded → latch a jump (THE ledge-stall fix).
+	if wp.y > floori(pos.y) and bool(_player_get("on_ground", false)):
+		player.set("remote_jump", true)
+	# stall → replan (bounded).
+	if pos.distance_to(_nav_stall_ref) >= 0.25:
+		_nav_stall_ref = pos
+		_nav_stall_ms = Time.get_ticks_msec()
+	elif Time.get_ticks_msec() - _nav_stall_ms > MOVE_STALL_MS:
+		if _nav_replans >= CubeSphere.NAV_REPLANS:
+			_nav_settle("blocked"); return
+		_nav_replans += 1
+		_nav_state = {}
+		_nav_planning = true
+		_nav_path = []
+		_nav_wp = 0
+	if Time.get_ticks_msec() >= _nav_deadline:
+		_nav_settle("timeout")
+
+## Resolve a goto: standalone → _finish_step; skill-owned → set the latch the skill polls.
+func _nav_settle(status: String) -> void:
+	if is_instance_valid(player):
+		player.set("remote_drive", false); player.set("remote_input", Vector3.ZERO)
+	_nav_planning = false
+	_nav_path = []
+	_nav = null
+	if _nav_owner == "skill":
+		_nav_done = true
+		_nav_status = status
+		return
+	var st := "ok" if status == "ok" else ("timeout" if status == "timeout" else "blocked")
+	_finish_step(st, {"why": status, "replans": _nav_replans})
+
+
+# ── AGENT-AUTONOMY A4: chop_tree — server-side FIND→GOTO→AIM→CHOP phase machine (AgentSkills) ─────────
+func _start_chop_tree() -> void:
+	if not is_instance_valid(player) or not is_instance_valid(_world_of()):
+		_finish_step("blocked", {"why": "no_world"}); return
+	_skill = AgentSkills.new()
+	_skill.setup(self, player, _world_of())
+	_skill_deadline = Time.get_ticks_msec() + int(CubeSphere.SKILL_WATCHDOG_S * 1000.0)
+	var maxr := int(_cur.get("max_range", 48))
+	var r: Dictionary = _skill.begin(clampi(maxr, 8, CubeSphere.NAV_RANGE_MAX))
+	_skill_apply(r)
+
+## Apply a skill directive: "goto"/"aim" arm the shared A2/A3 machinery in skill-owner mode; "done" terminates.
+func _skill_apply(r: Dictionary) -> void:
+	match str(r.get("act", "")):
+		"goto":
+			_start_goto(r["cell"], str(r.get("goal", "adjacent")), "skill")
+		"aim":
+			_aim_cell = r["cell"]
+			_aim_verify = true
+			_aim_owner = "skill"
+			_aim_done = false
+			var sol: Dictionary = player.call("remote_aim_solution", _aim_cell)
+			_turn_total = 0.0
+			_turn_remaining = wrapf(float(sol["yaw"]) - player.rotation.y, -PI, PI)
+			_pitch_active = true
+			_pitch_target = float(sol["pitch"])
+			_aim_mode = true
+			_turn_deadline = Time.get_ticks_msec() + int(LOOK_WATCHDOG_S * 1000.0)
+			if _turn_remaining != 0.0:
+				player.set("remote_yaw_rate", signf(_turn_remaining) * deg_to_rad(TURN_RATE_DEG))
+		"continue":
+			pass                                       # skill stays in its current phase (CHOP poll loop)
+		"done":
+			var status := str(r.get("status", "ok"))
+			_skill = null
+			_finish_step(status, r.get("extra", {}))
+
+## Poll the skill each frame: watchdog, then dispatch by phase (latches set by the physics-tick motion).
+func _skill_process() -> void:
+	if _skill == null:
+		return
+	if Time.get_ticks_msec() >= _skill_deadline:
+		_skill_apply(_skill.terminal("blocked", {"why": "timeout"}))
+		return
+	match str(_skill.phase()):
+		"goto":
+			if _nav_planning:
+				_tick_nav_plan()
+			if _nav_done:
+				_skill_apply(_skill.on_goto_done(_nav_status))
+		"aim":
+			if _aim_done:
+				_skill_apply(_skill.on_aim_done(_aim_status, _aim_hit, _aim_in_range))
+		"chop":
+			_skill_apply(_skill.on_chop_poll())
+		_:
+			pass
+
+## Drive the active phase's motion from the physics tick (follower for goto, easing for aim).
+func _skill_physics(delta: float) -> void:
+	if _skill == null:
+		return
+	match str(_skill.phase()):
+		"goto":
+			_tick_nav_follow(delta)
+		"aim":
+			_tick_turn_look(delta)
+		_:
+			pass
+
+
 func _next_step() -> void:
 	_idx += 1
 	if _idx >= _steps.size():
@@ -508,6 +810,24 @@ func _start_step() -> void:
 			if is_instance_valid(player) and player.has_method("remote_place"):
 				okk = bool(player.call("remote_place", _block_arg(_cur.get("block", 0)), _target_arg(_cur.get("target", "aim"))))
 			_finish_step("ok" if okk else "blocked")
+		"break_cell":
+			# AGENT-AUTONOMY A1 (FP_AGENT_ACT): reach-aware ABSOLUTE-cell break. Synchronous; the typed
+			# `why` (ok/out_of_reach/air/protected) rides step_done extra — out_of_reach is the "walk closer" signal.
+			var rb := {"why": "bad_op"}
+			if is_instance_valid(player) and player.has_method("remote_break_cell"):
+				rb = player.call("remote_break_cell", _cell_arg(_cur.get("cell", [0, 0, 0])))
+			_finish_step("ok" if str(rb.get("why", "")) == "ok" else "blocked", rb)
+		"place_cell":
+			var rp := {"why": "bad_op"}
+			if is_instance_valid(player) and player.has_method("remote_place_cell"):
+				rp = player.call("remote_place_cell", _cell_arg(_cur.get("cell", [0, 0, 0])), _block_arg(_cur.get("block", 0)))
+			_finish_step("ok" if str(rp.get("why", "")) == "ok" else "blocked", rp)
+		"aim_cell":
+			_start_aim()                               # AGENT-AUTONOMY A2 — eases (physics_tick) then DDA-verifies
+		"goto":
+			_start_goto(_cell_arg(_cur.get("cell", [0, 0, 0])), str(_cur.get("goal", "stand")), "")  # A3
+		"chop_tree":
+			_start_chop_tree()                         # AGENT-AUTONOMY A4 — server-side FIND→GOTO→AIM→CHOP
 		"dev_nav":
 			# SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): F — drive dev-nav to a definite state. `blocked` when the
 			# space-nav build is not running (SN_DEVNAV off), so a scripted flight fails loudly rather than flying blind.
@@ -621,6 +941,12 @@ func _end_sequence(status: String) -> void:
 		return
 	_running = false
 	_zero_intent()                                 # belt-and-braces: no lingering intent after the sequence ends
+	# AGENT-AUTONOMY: drop any in-flight planner/skill/aim state so nothing survives the sequence (never-OOM).
+	_skill = null
+	_nav = null
+	_nav_planning = false
+	_nav_path = []
+	_aim_mode = false
 	_cur = {}
 	_steps = []
 	sequence_finished.emit({

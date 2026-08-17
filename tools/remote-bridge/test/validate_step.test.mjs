@@ -7,7 +7,7 @@
 // (The fs.watch pickup latency — write→forward — is a relay-RUNTIME property measured in the live A/B,
 //  since the relay needs its ws dependency; this gate pins the caps logic that guards never-OOM.)
 
-import { validateQueryStep, QUERY_HALF_MAX, QUERY_CELLS_MAX, QUERY_RAY_MAX } from '../validate.mjs';
+import { validateQueryStep, QUERY_HALF_MAX, QUERY_CELLS_MAX, QUERY_RAY_MAX, validateActStep, vec3int, NAV_RANGE_MAX } from '../validate.mjs';
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.log('  FAIL:', msg); } }
@@ -51,6 +51,27 @@ rejects({ op: 'query_ray', origin: [1, Infinity, 3] }, 'ray: non-finite origin r
 // ── non-query op is not accepted by the query validator (defense-in-depth) ────────────────────
 rejects({ op: 'move', blocks: 4 }, 'non-query op not accepted by query validator');
 rejects({ op: 'query_sphere' }, 'unknown query-ish op rejected');
+
+// ── COSMOS-AGENT-AUTONOMY — actuation op caps (validateActStep) ──────────────────────────────────
+function accA(st, msg) { ok(validateActStep(st).ok === true, msg); }
+function rejA(st, msg) { ok(validateActStep(st).ok === false, msg); }
+accA({ op: 'break_cell', cell: [1, 2, 3] }, 'break_cell: integer [x,y,z] ok');
+rejA({ op: 'break_cell', cell: [1.5, 2, 3] }, 'break_cell: non-integer cell rejected');
+rejA({ op: 'break_cell', cell: [1, 2] }, 'break_cell: 2-vec cell rejected');
+rejA({ op: 'break_cell' }, 'break_cell: missing cell rejected');
+accA({ op: 'place_cell', cell: [1, 2, 3], block: 'oak_log' }, 'place_cell: name block ok');
+accA({ op: 'place_cell', cell: [1, 2, 3], block: 7 }, 'place_cell: id block ok');
+rejA({ op: 'place_cell', cell: [1, 2, 3], block: [1] }, 'place_cell: array block rejected');
+accA({ op: 'aim_cell', cell: [0, 0, 0] }, 'aim_cell: cell ok');
+accA({ op: 'goto', cell: [5, 6, 7] }, 'goto: default goal ok');
+accA({ op: 'goto', cell: [5, 6, 7], goal: 'adjacent' }, 'goto: adjacent goal ok');
+rejA({ op: 'goto', cell: [5, 6, 7], goal: 'onto' }, 'goto: bad goal rejected');
+rejA({ op: 'goto', cell: [1.1, 2, 3] }, 'goto: non-integer cell rejected');
+accA({ op: 'chop_tree' }, 'chop_tree: default max_range ok');
+accA({ op: 'chop_tree', max_range: 8 }, 'chop_tree: min max_range ok');
+rejA({ op: 'chop_tree', max_range: 7 }, 'chop_tree: max_range < 8 rejected');
+rejA({ op: 'chop_tree', max_range: NAV_RANGE_MAX + 1 }, `chop_tree: max_range > ${NAV_RANGE_MAX} rejected`);
+ok(vec3int([1, 2, 3]) && !vec3int([1, 2, 3.5]) && !vec3int([1, 2]), 'vec3int integer-triple predicate');
 
 console.log(`==== VALIDATE-STEP: ${pass} passed, ${fail} failed ====`);
 process.exit(fail > 0 ? 1 : 0);

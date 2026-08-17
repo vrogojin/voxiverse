@@ -2436,8 +2436,17 @@ func remote_place(block_id: int, target) -> bool:
 func remote_world() -> WorldManager:
 	return world
 
+## AGENT-AUTONOMY frame weld — the PLAY-space centre of a CONTENT cell. head_position()/position/eye are PLAY
+## space; block_id_at cells are CONTENT space (play y = cell y + datum lift s). X/Z carry no lift on the facet
+## plane. Used ONLY by the absolute-cell remote API (break/place/aim a query_box-sourced cell) so its reach and
+## aim geometry compare like-for-like. Identity when the world lacks the map (gate mocks) or FP_DATUM_BAKE off.
+func _cell_play_center(cell: Vector3i) -> Vector3:
+	if world != null and world.has_method("cell_y_to_play_y"):
+		return Vector3(float(cell.x) + 0.5, world.cell_y_to_play_y(float(cell.x), float(cell.z), float(cell.y) + 0.5), float(cell.z) + 0.5)
+	return Vector3(cell) + Vector3(0.5, 0.5, 0.5)
+
 func remote_break_cell(cell: Vector3i) -> Dictionary:
-	var dist := head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
+	var dist := head_position().distance_to(_cell_play_center(cell))
 	if dist > break_reach:
 		return {"why": "out_of_reach", "block_id": 0, "dist": snappedf(dist, 0.01)}
 	if not world.cell_solid(cell):
@@ -2455,7 +2464,7 @@ func remote_break_cell(cell: Vector3i) -> Dictionary:
 func remote_place_cell(cell: Vector3i, block_id: int) -> Dictionary:
 	if inventory == null or block_id <= 0:
 		return {"why": "occupied"}
-	var dist := head_position().distance_to(Vector3(cell) + Vector3(0.5, 0.5, 0.5))
+	var dist := head_position().distance_to(_cell_play_center(cell))
 	if dist > reach:
 		return {"why": "out_of_reach", "dist": snappedf(dist, 0.01)}
 	if _cell_intersects_player(cell):
@@ -2473,7 +2482,7 @@ func remote_place_cell(cell: Vector3i, block_id: int) -> Dictionary:
 ## {"yaw", "pitch", "dist"} (radians).
 func remote_aim_solution(cell: Vector3i) -> Dictionary:
 	var eye := position + Vector3(0.0, eye_height, 0.0)
-	var d := Vector3(cell) + Vector3(0.5, 0.5, 0.5) - eye
+	var d := _cell_play_center(cell) - eye
 	var h := Vector2(d.x, d.z).length()
 	return {"yaw": atan2(-d.x, -d.z),
 		"pitch": clampf(atan2(d.y, h), deg_to_rad(-85.0), deg_to_rad(85.0)),

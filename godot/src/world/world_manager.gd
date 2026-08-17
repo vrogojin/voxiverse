@@ -4445,6 +4445,11 @@ func surface_y(x: float, z: float, pos_fid: int = -1) -> float:
 func play_y_to_cell_y(x: float, z: float, play_y: float) -> float:
 	return play_y - _datum_lift(int(floor(x)), int(floor(z)))
 
+## COSMOS-AGENT-AUTONOMY — CELL→PLAY Y (the inverse of play_y_to_cell_y). Turns a `block_id_at` content-cell Y
+## into the PLAY-space Y the player's pose/reach/aim geometry uses. Executor-only; identity with FP_DATUM_BAKE off.
+func cell_y_to_play_y(x: float, z: float, cell_y: float) -> float:
+	return cell_y + _datum_lift(int(floor(x)), int(floor(z)))
+
 ## The y the player should stand at in column (x, z) given their current feet
 ## height. Plain, NO-CLIMB floor: scan DOWN from the feet for the first solid block
 ## that has AIR directly above it (the actual standable surface) and stand on its

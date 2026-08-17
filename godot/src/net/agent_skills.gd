@@ -99,7 +99,12 @@ func _find_and_go() -> Dictionary:
 	return {"act": "goto", "cell": _chop_start, "goal": "adjacent"}
 
 func _cheb_to_player(c: Vector3i) -> int:
-	var p := Vector3i(floori(_player.position.x), floori(_player.position.y), floori(_player.position.z))
+	# c is CELL space (block_id_at); the pose is PLAY space (play y = cell y + datum lift). Remap the player's Y
+	# so the Chebyshev range compares like-for-like — else a ~6-block datum lift inflates every tree's distance.
+	var py: float = _player.position.y
+	if is_instance_valid(_world) and _world.has_method("play_y_to_cell_y"):
+		py = _world.play_y_to_cell_y(_player.position.x, _player.position.z, _player.position.y)
+	var p := Vector3i(floori(_player.position.x), floori(py), floori(_player.position.z))
 	return maxi(maxi(absi(c.x - p.x), absi(c.y - p.y)), absi(c.z - p.z))
 
 ## GOTO done → AIM (or retry a fresh tree on unreachable).

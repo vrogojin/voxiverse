@@ -557,7 +557,7 @@ func _start_goto(cell: Vector3i, mode: String, owner: String) -> void:
 		_nav_settle("blocked"); return
 	if bool(_player_get("flying", false)) or _in_space_regime():
 		_nav_settle("mode"); return
-	var from := Vector3i(floori(player.position.x), floori(player.position.y), floori(player.position.z))
+	var from := _player_cell()
 	if Vector3(cell - from).abs().length() > 0 and _cheb(from, cell) > CubeSphere.NAV_RANGE_MAX:
 		_nav_settle("no_path"); return
 	_nav = AgentNav.new()
@@ -587,9 +587,48 @@ func _world_of() -> Object:
 func _cheb(a: Vector3i, b: Vector3i) -> int:
 	return maxi(maxi(absi(a.x - b.x), absi(a.y - b.y)), absi(a.z - b.z))
 
+## AGENT-AUTONOMY frame weld — the player's cell in the CELL frame the nav/query layer reads (block_id_at). The
+## pose is PLAY space (play y = cell y + per-column datum lift s); X/Z carry no lift on the facet plane. We remap Y
+## with the world's boundary map, then SNAP to the nearest standable feet cell — this absorbs the ±1 feet/surface
+## rounding, dug pits and placed blocks, so A* starts on real ground instead of floating s blocks up (THE goto
+## `no_path`-for-every-tree bug: the pose sat ~6 cells above the surface, past NAV_DROP_MAX, yielding zero moves).
+func _player_cell() -> Vector3i:
+	var w: Object = _world_of()
+	var p: Vector3 = player.position
+	var xi := floori(p.x)
+	var zi := floori(p.z)
+	var cy: float = p.y
+	if is_instance_valid(w) and w.has_method("play_y_to_cell_y"):
+		cy = w.play_y_to_cell_y(p.x, p.z, p.y)
+	return _snap_stand(w, Vector3i(xi, floori(cy), zi))
+
+## Nudge a cell to the nearest vertically-standable feet cell (AgentNav._stand), searching out to ±4. Keeps the
+## original if none qualifies (A* then reports no_path honestly rather than starting on a lie).
+func _snap_stand(w: Object, c: Vector3i) -> Vector3i:
+	if not is_instance_valid(w) or not w.has_method("cell_solid"):
+		return c
+	if AgentNav._stand(w, c):
+		return c
+	for d in range(1, 5):
+		var up := c + Vector3i(0, d, 0)
+		if AgentNav._stand(w, up):
+			return up
+		var dn := c - Vector3i(0, d, 0)
+		if AgentNav._stand(w, dn):
+			return dn
+	return c
+
+## AGENT-AUTONOMY — the player's CELL-frame feet Y under (x,z), for the follower's waypoint gates (waypoints are
+## cell-space; the live pose is PLAY-space). Identity when the world lacks the map (gate mocks) or datum is off.
+func _pos_cell_y(pos: Vector3) -> float:
+	var w: Object = _world_of()
+	if is_instance_valid(w) and w.has_method("play_y_to_cell_y"):
+		return w.play_y_to_cell_y(pos.x, pos.z, pos.y)
+	return pos.y
+
 ## Advance the A* plan by one time-slice (called from _process while planning).
 func _tick_nav_plan() -> void:
-	var from := Vector3i(floori(player.position.x), floori(player.position.y), floori(player.position.z))
+	var from := _player_cell()
 	var done: bool = _nav.plan_slice(_world_of(), from, _nav_goal, _nav_mode, _nav_state, CubeSphere.NAV_EXPAND_PER_FRAME)
 	if not done:
 		return
@@ -609,10 +648,11 @@ func _tick_nav_follow(_delta: float) -> void:
 	if _nav_planning or _nav_path.is_empty():
 		return
 	var pos: Vector3 = player.position
+	var pos_cy := _pos_cell_y(pos)                   # PLAY→CELL feet Y (waypoints are cell-space; the pose is PLAY)
 	var wp: Vector3i = _nav_path[_nav_wp]
 	var wc := Vector3(wp) + Vector3(0.5, 0.0, 0.5)
 	var flat := Vector2(wc.x - pos.x, wc.z - pos.z)
-	if flat.length() < 0.35 and absf(wc.y - pos.y) <= 1.2:
+	if flat.length() < 0.35 and absf(wc.y - pos_cy) <= 1.2:
 		_nav_wp += 1
 		_nav_stall_ref = pos
 		_nav_stall_ms = Time.get_ticks_msec()
